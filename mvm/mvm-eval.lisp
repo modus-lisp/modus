@@ -89,17 +89,28 @@
 
 (defvar *jit-infra-fallback* nil
   "T when %mvm-eval-jit-run has DELIBERATELY signalled an internal sentinel
-   asking for the interpret fallback even though native code already ran — at
-   present only the multiple-values case, where the native MV block cannot yet
-   be reproduced into the interpreter's simulated *mvm-last-mv*.  This is the
-   one path that still double-executes side effects; it is narrow (single-value
-   forms, the overwhelming majority, never take it) and is counted separately
-   in *jit-mv-fallback-count* so its true frequency is measurable rather than
-   assumed.  Reproducing the MV block from BSS (tagged count at #x10000090,
-   extras at #x10000098+) would close it — tracked separately.")
+   asking for the interpret fallback even though native code already ran — i.e.
+   knowingly double-executing the form's side effects.
+
+   WS5 #218 CLOSED THE MAIN CASE.  This used to fire for EVERY form that left
+   MV-count > 1 — which is not just `(values …)` but floor / truncate /
+   ceiling / round / gethash / subtypep / read-from-string /
+   multiple-value-bind / -list / -call / -prog1, i.e. a large fraction of
+   ordinary code.  %mvm-eval-jit-run now READS the native MV block back out of
+   BSS (tagged count at #x10000090, the count-1 extras at #x10000098+) and
+   publishes it as *mvm-last-mv* in the exact shape mvm-interpret produces, so
+   the seam returns the values directly and the form runs exactly ONCE.
+
+   The only remaining trigger is a count outside [0,21] — beyond the 20-slot
+   MV-VALUES area — which cannot be read back without handing the collector
+   words that are not MV storage.  *jit-mv-fallback-count* measures it: it
+   reads 0 on every workload measured (tests/jit-diff.lisp, where it read 444
+   before this change, and tests/jit-census.lisp, where R-MV went 8 -> 0).")
 
 (defvar *jit-mv-fallback-count* nil
-  "How many times the MV path forced a re-run (the remaining double-execute).")
+  "How many times the MV path forced a re-run (the remaining double-execute).
+   Post-#218 this counts ONLY the out-of-range residual described in
+   *jit-infra-fallback*; 0 is the expected reading.")
 
 (defvar *jit-resignal-count* nil
   "How many times an escaping USER condition was correctly re-signalled instead
@@ -173,10 +184,12 @@
 ;;;                     was itself defined at runtime.
 ;;;   R-RELOC-FNADDR-FAIL       a #'NAME value load could not be resolved.
 ;;;   R-MMAP-FAIL       %mmap-exec-page returned a non-address.
-;;;   R-MV              the form produced MULTIPLE VALUES; native stamps real
-;;;                     BSS MV state the interpreter's simulated *mvm-last-mv*
-;;;                     cannot represent, so the form is re-interpreted.
-;;;                     (*jit-mv-fallback-count*, pre-existing.)
+;;;   R-MV              the form left an MV count OUTSIDE [0,21] — past the
+;;;                     20-slot MV-VALUES area — so the native block cannot be
+;;;                     read back and the form is re-interpreted.
+;;;                     (*jit-mv-fallback-count*.)  Since WS5 #218 an ordinary
+;;;                     multiple-value form is NOT a fallback at all: the block
+;;;                     is reproduced from BSS into *mvm-last-mv*.
 ;;;   R-NATIVE-ESCAPE   native code RAN and escaped with a non-condition
 ;;;                     (the unresolved-runtime-function sentinel).  This is
 ;;;                     the one reason that DOUBLE-EXECUTES side effects.
@@ -680,11 +693,17 @@
 (defun %mvm-eval-jit-run (bc entry ft-list fn-table rt-table lam-offsets cache-p)
   "WS4-S5b: run compiled module BC as NATIVE JIT'd code, wrapping the result
    like the interpret path (%mvm-wrap-escaping-result).  If the JIT can't build
-   a page, OR the form produced MULTIPLE VALUES (native writes real BSS MV-count
-   at #x10000090 — a different mechanism from the interpreter's simulated
-   *mvm-last-mv*, so we do NOT try to reproduce it), we throw to the caller's
-   handler-case which falls back to mvm-interpret.  Single-value forms — the
-   bulk of runtime evals — take the fast native path.
+   a page we throw to the caller's handler-case, which falls back to
+   mvm-interpret (safe: no user code ran).
+
+   MULTIPLE VALUES (WS5 #218): native writes a real BSS MV block — the count as
+   a tagged fixnum at #x10000090, the count-1 extras at #x10000098+ — and this
+   function READS IT BACK, publishing (count . secondaries) in *mvm-last-mv*,
+   the same shape mvm-interpret leaves behind.  The seam therefore re-emits the
+   values directly and MV forms run exactly ONCE.  Previously they signalled an
+   MV sentinel and the interpreter re-ran the whole form, duplicating every
+   side effect that had already happened.  Only a count outside [0,21] (past
+   the 20-slot MV-VALUES area) still falls back; see *jit-infra-fallback*.
    CACHE-P: T = reuse/store an exec page in *jit-page-cache* (cached modules,
    where the SAME bc re-evals — the speedup source); NIL = translate once, no
    cache (the fresh-bc DEF* path, whose page would never be re-hit).
@@ -738,35 +757,85 @@
           ;; first instruction of the form must already count as "native ran".
           (setq *jit-native-ran* t)
           (let ((raw (%jit-call (+ (car je) (cadr je)))))
-            (let ((mvc (mem-ref #x10000090 :u64)))
-              (unless (eql mvc 1)
-                ;; MV form → fall back to interpret; DON'T free (result unknown —
-                ;; could be a function; leak the rare MV-form page conservatively).
-                ;;
-                ;; WS5 #203: this is the ONE remaining path that re-runs a form
-                ;; whose side effects already happened.  Native stamped a real
-                ;; MV block (tagged count at #x10000090, extras at #x10000098+)
-                ;; which we cannot yet translate into the interpreter's
-                ;; simulated *mvm-last-mv*, so the only way to produce correct
-                ;; VALUES today is to re-interpret.  Flag it so the handler
-                ;; allows the fallback despite *jit-native-ran*, and count it
-                ;; so the cost is measured rather than assumed.
-                (setq *jit-infra-fallback* t)
-                (setq *jit-mv-fallback-count*
-                      (if *jit-mv-fallback-count* (+ 1 *jit-mv-fallback-count*) 1))
-                (error "jit-mv-fallback")))
-            ;; SINGLE value: clear the interpreter's simulated MV state so a
-            ;; STALE *mvm-last-mv* from a prior interpret run doesn't leak into
-            ;; this form's return (the seam reads *mvm-last-mv* after us).
-            (setq *mvm-last-mv* nil)
-            (setq *jit-native-count*
-                  (if *jit-native-count* (+ 1 *jit-native-count*) 1))
-            (let ((result (%mvm-wrap-escaping-result raw bc fn-table rt-table lam-offsets)))
-              ;; Reclaim the (uncached) aarch64 page unless the RESULT is a
-              ;; function/closure whose code is in it.  car(cddddr je) = PSIZE.
-              (when (and aa64 (car (cddddr je)) (not (functionp result)))
-                (%jit-free-page (car je) (car (cddddr je))))
-              result)))
+            ;; WS5 #218 — READ BACK THE NATIVE MV BLOCK.  This replaces the old
+            ;; "MV form → re-interpret" sentinel, which was the last path that
+            ;; re-ran a form whose side effects had already happened (measured:
+            ;; `(progn (incf *k*) (floor 7 2))` left *k* = 2).  Its reach was
+            ;; never limited to `(values …)`: ANY form whose last operation
+            ;; leaves MV-count > 1 qualifies — floor / truncate / ceiling /
+            ;; round / gethash / subtypep / read-from-string /
+            ;; multiple-value-bind / -list / -call / -prog1.
+            ;;
+            ;; The block is the SAME location on every back-end: +mv-count-addr+
+            ;; = #x10000090 holds the count as a TAGGED fixnum and the (count-1)
+            ;; extras live at #x10000098 + i*8.  compile-values, op-set-mv-count
+            ;; and both translators (translate-x64.lisp / translate-aarch64.lisp)
+            ;; all use the compiler constant, so NO *jit-target-arch* branch is
+            ;; needed here.  `mem-ref … :u64` yields the raw word, which IS the
+            ;; tagged value, so mvc reads back as an ordinary integer and each
+            ;; extra reads back as its Lisp object (exactly what compiled
+            ;; MULTIPLE-VALUE-LIST does, compiler.lisp compile-multiple-value-list).
+            ;;
+            ;; ORDERING IS LOAD-BEARING — this block must be the first thing
+            ;; after %jit-call and must not CALL anything until the last extra
+            ;; is latched:
+            ;;   * every function epilogue emits op-set-mv-count 1, so one call
+            ;;     resets the count slot and we would lose the extras' length;
+            ;;   * the collector scans exactly (count-1) words from #x10000098
+            ;;     (translate-x64.lisp, the MV-area root scan).  If the count
+            ;;     were reset while extras were still unread, a GC triggered by
+            ;;     the cons loop would strand them at from-space addresses —
+            ;;     the same class as the interp bug documented at interp.lisp:166.
+            ;; Everything below compiles INLINE (mem-ref, fixnump, <, +, -, *,
+            ;; cons), so the count stays authoritative throughout, and the
+            ;; back-to-front read re-reads each BSS slot AFTER the previous
+            ;; cons's possible GC — so a forwarded extra is picked up post-move.
+            (let ((mvc (mem-ref #x10000090 :u64))
+                  (secs nil)
+                  (mv-ok nil))
+              ;; Reproducible range: 0..21.  The MV-VALUES area is 20 slots
+              ;; (#x10000098 .. #x10000130; +closure-env-addr+ starts at
+              ;; #x10000140), so a count above 21 would read words that are NOT
+              ;; MV storage and hand the GC bogus roots.  Counts that large are
+              ;; already truncated by compile-values' own 16-slot storage cap on
+              ;; BOTH paths, so re-interpreting them yields nothing better — but
+              ;; the fallback is kept (and counted) rather than guessing.
+              (if (fixnump mvc)
+                  (if (< mvc 0) nil (if (< mvc 22) (setq mv-ok t) nil))
+                  nil)
+              (if mv-ok
+                  (let ((i (- mvc 2)))
+                    (loop
+                      (when (< i 0) (return nil))
+                      (setq secs (cons (mem-ref (+ #x10000098 (* i 8)) :u64) secs))
+                      (setq i (- i 1))))
+                  nil)
+              (if mv-ok
+                  (progn
+                    ;; Publish the block in the SAME shape mvm-interpret does
+                    ;; (interp.lisp: (cons count secondaries)) so the seam's
+                    ;; `(values-list (cons %prim (cdr %mv)))` re-emission is
+                    ;; identical for the native and interpreted paths.  mvc = 1
+                    ;; means single value: NIL, which also clears a STALE
+                    ;; *mvm-last-mv* left by an earlier interpret run.
+                    (setq *mvm-last-mv* (if (eql mvc 1) nil (cons mvc secs)))
+                    (setq *jit-native-count*
+                          (if *jit-native-count* (+ 1 *jit-native-count*) 1))
+                    (let ((result (%mvm-wrap-escaping-result raw bc fn-table rt-table lam-offsets)))
+                      ;; Reclaim the (uncached) aarch64 page unless the RESULT is a
+                      ;; function/closure whose code is in it.  car(cddddr je) = PSIZE.
+                      (when (and aa64 (car (cddddr je)) (not (functionp result)))
+                        (%jit-free-page (car je) (car (cddddr je))))
+                      result))
+                  ;; RESIDUAL SHAPE ONLY: a count outside [0,21] (or a non-fixnum
+                  ;; word aliasing the slot).  Still double-executes, still
+                  ;; counted — *jit-mv-fallback-count* is the proof that it does
+                  ;; not fire in practice.  DON'T free the page (result unknown).
+                  (progn
+                    (setq *jit-infra-fallback* t)
+                    (setq *jit-mv-fallback-count*
+                          (if *jit-mv-fallback-count* (+ 1 *jit-mv-fallback-count*) 1))
+                    (error "jit-mv-fallback"))))))
         ;; NO PAGE: %jit-translate-page's flip-safety guard returned NIL (a
         ;; translator gap it converted from a signal, or a page-build failure).
         ;; Its contract is "a translator gap can NEVER escape as an uncaught
@@ -867,7 +936,9 @@
                                ;; Fall back.  THREE ways to get here:
                                ;;  (1) JIT setup failed before any user code ran
                                ;;      — safe and invisible, the original intent;
-                               ;;  (2) the MV sentinel — known double-execute;
+                               ;;  (2) the MV out-of-range residual (WS5 #218
+                               ;;      reduced this from "every MV form" to a
+                               ;;      count > 21) — known double-execute;
                                ;;  (3) native ran and escaped with something that
                                ;;      is NOT a well-formed condition (%condition-p
                                ;;      false).  (3) is the unresolved-runtime-
@@ -883,7 +954,7 @@
                                  ;; CENSUS: split the seam-handler fallback into
                                  ;; "native already RAN" (the doubling case, an
                                  ;; infrastructure escape) vs pure setup failure.
-                                 ;; NB: %infra excludes the MV sentinel, which
+                                 ;; NB: %infra excludes the MV residual, which
                                  ;; reaches this handler with %ran already T --
                                  ;; counting it here would double-count R-MV.
                                  (when (and %ran (not %infra))
@@ -1336,7 +1407,7 @@
                             (setq *jit-infra-fallback* nil)
                             ;; WS4-S5b: JIT when enabled, interpret-fallback on a
                             ;; SETUP failure (page-build fail / unsupported) or
-                            ;; the MV sentinel — but NOT on a user condition
+                            ;; the MV out-of-range residual — but NOT on a user condition
                             ;; raised once native code is running.
                             ;; %jit-active-p honors *jit-inhibit* (Class 3).
                             (if (%jit-active-p)

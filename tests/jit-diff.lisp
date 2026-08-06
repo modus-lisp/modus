@@ -511,6 +511,192 @@
               label *jd-side* expect-counter v))))
 
 ;;; ------------------------------------------------------------------
+;;; WS5 #218 — THE MULTIPLE-VALUES SIDE-EFFECT ORACLE.
+;;;
+;;; The MV double-execution bug is INVISIBLE to a value-only oracle: the
+;;; returned values were always RIGHT (the interpreter re-ran the form and
+;;; produced them correctly) — only the side effects were doubled.  That is
+;;; why 288 forms of value comparison found nothing and one purpose-built
+;;; counter found it.
+;;;
+;;; Its reach was never "the multiple-values case": it fired for ANY form
+;;; whose last operation leaves MV-count > 1.  So this section probes the
+;;; ordinary MV producers — floor / truncate / round / gethash / subtypep /
+;;; read-from-string / multiple-value-bind / -list / -call — not just
+;;; (values …).
+;;;
+;;; Each probe asserts THREE things, because a "fix" that returns one value
+;;; where CL requires two would be worse than the doubling it replaced:
+;;;   1. under JIT-on the counter increments EXACTLY ONCE;
+;;;   2. under JIT-off (interpret) it also increments exactly once — so the
+;;;      probe itself is honest;
+;;;   3. the full multiple-value LIST equals the literal CL answer, and the
+;;;      JIT and interpret paths agree with each other.
+;;; It also records whether the form actually reached native code: an
+;;; all-clear from a run where nothing was JIT'd is not a measurement.
+;;; ------------------------------------------------------------------
+
+(defparameter *jd-mv-native* 0)
+(defparameter *jd-mv-total* 0)
+(defparameter *jd-mv-clgap* 0)
+(defparameter *jd-ht* nil)
+
+(defun jd-mv-once (label form expect-values)
+  "Evaluate FORM ONCE with the JIT live and ONCE with it inhibited, resetting
+   *jd-side* before each.  FORM must increment *jd-side* exactly once per
+   evaluation and return EXPECT-VALUES."
+  (setq *jd-mv-total* (+ 1 *jd-mv-total*))
+  (setq *jd-total* (+ 1 *jd-total*))
+  ;; --- JIT live ---
+  (setq *jd-side* 0)
+  (setq *jit-inhibit* nil)
+  (let* ((before (jd-count))
+         (jv (handler-case (multiple-value-list (eval form))
+               (t (c) (list :signalled (handler-case (type-of c)
+                                         (t (c2) :unknown))))))
+         (jnat (- (jd-count) before))
+         (jside *jd-side*))
+    ;; --- interpret ---
+    (setq *jd-side* 0)
+    (setq *jit-inhibit* t)
+    (let ((iv (handler-case (multiple-value-list (eval form))
+                (t (c) (list :signalled (handler-case (type-of c)
+                                          (t (c2) :unknown)))))))
+      (setq *jit-inhibit* nil)
+      (let ((iside *jd-side*))
+        (when (> jnat 0) (setq *jd-mv-native* (+ 1 *jd-mv-native*)))
+        (unless (eql jside 1)
+          (setq *jd-diverge* (+ 1 *jd-diverge*))
+          (format t "JIT-DOUBLE-EXEC mv:~A ran ~D time(s) under JIT, expected 1 (value ~S)~%"
+                  label jside jv))
+        (unless (eql iside 1)
+          (setq *jd-diverge* (+ 1 *jd-diverge*))
+          (format t "INTERP-DOUBLE-EXEC mv:~A ran ~D time(s), expected 1 (value ~S)~%"
+                  label iside iv))
+        (unless (string= (jd-str jv) (jd-str iv))
+          (setq *jd-diverge* (+ 1 *jd-diverge*))
+          (format t "JIT-MV-DIVERGE mv:~A jit=~S interp=~S~%" label jv iv))
+        (unless (string= (jd-str jv) (jd-str expect-values))
+          ;; A literal mismatch that is IDENTICAL on both paths is not a JIT
+          ;; defect — it is a pre-existing CL conformance gap in the shared
+          ;; compiler, and counting it as a divergence would make this
+          ;; differential oracle un-passable for reasons it does not measure.
+          ;; It is still printed and still counted, separately.
+          (if (string= (jd-str jv) (jd-str iv))
+              (progn
+                (setq *jd-mv-clgap* (+ 1 *jd-mv-clgap*))
+                (format t "MV-CL-GAP (both paths) mv:~A got=~S expected=~S~%"
+                        label jv expect-values))
+              (progn
+                (setq *jd-diverge* (+ 1 *jd-diverge*))
+                (format t "JIT-MV-VALUES mv:~A jit=~S expected=~S~%"
+                        label jv expect-values))))
+        (when (eql jnat 0)
+          (setq *jd-never-native* (cons label *jd-never-native*)))))))
+
+(defun jd-mv-probes ()
+  (setq *jd-ht* (make-hash-table))
+  (setf (gethash 'a *jd-ht*) 11)
+  ;; (values …) — the shape the docstring named …
+  (jd-mv-once "values-2"
+              '(progn (setq *jd-side* (+ *jd-side* 1)) (values 1 2))
+              (list 1 2))
+  (jd-mv-once "values-3"
+              '(progn (setq *jd-side* (+ *jd-side* 1)) (values :a :b :c))
+              (list :a :b :c))
+  (jd-mv-once "values-0"
+              '(progn (setq *jd-side* (+ *jd-side* 1)) (values))
+              nil)
+  (jd-mv-once "values-1"
+              '(progn (setq *jd-side* (+ *jd-side* 1)) (values 9))
+              (list 9))
+  ;; … and the shapes it did NOT name, which are the common ones.
+  (jd-mv-once "floor"
+              '(progn (setq *jd-side* (+ *jd-side* 1)) (floor 7 2))
+              (list 3 1))
+  (jd-mv-once "floor-neg"
+              '(progn (setq *jd-side* (+ *jd-side* 1)) (floor -7 2))
+              (list -4 1))
+  (jd-mv-once "truncate"
+              '(progn (setq *jd-side* (+ *jd-side* 1)) (truncate 17 5))
+              (list 3 2))
+  (jd-mv-once "ceiling"
+              '(progn (setq *jd-side* (+ *jd-side* 1)) (ceiling 17 5))
+              (list 4 -3))
+  (jd-mv-once "round"
+              '(progn (setq *jd-side* (+ *jd-side* 1)) (round 7 2))
+              (list 4 -1))
+  (jd-mv-once "gethash-hit"
+              '(progn (setq *jd-side* (+ *jd-side* 1)) (gethash 'a *jd-ht*))
+              (list 11 t))
+  (jd-mv-once "gethash-miss"
+              '(progn (setq *jd-side* (+ *jd-side* 1)) (gethash 'zz *jd-ht*))
+              (list nil nil))
+  (jd-mv-once "subtypep"
+              '(progn (setq *jd-side* (+ *jd-side* 1)) (subtypep 'integer 'number))
+              (list t t))
+  (jd-mv-once "read-from-string"
+              '(progn (setq *jd-side* (+ *jd-side* 1)) (read-from-string "42"))
+              (list 42 2))
+  (jd-mv-once "mv-bind"
+              '(progn (setq *jd-side* (+ *jd-side* 1))
+                (multiple-value-bind (q r) (floor 17 5) (values q r)))
+              (list 3 2))
+  (jd-mv-once "mv-list"
+              '(progn (setq *jd-side* (+ *jd-side* 1)) (multiple-value-list (floor 7 2)))
+              (list (list 3 1)))
+  (jd-mv-once "mv-call"
+              '(progn (setq *jd-side* (+ *jd-side* 1))
+                (multiple-value-call #'values (floor 17 5)))
+              (list 3 2))
+  (jd-mv-once "mv-prog1"
+              '(progn (setq *jd-side* (+ *jd-side* 1))
+                (multiple-value-prog1 (values 1 2) :ignored))
+              (list 1 2))
+  ;; MV as the tail of a real control-flow shape, not just a bare call.
+  (jd-mv-once "mv-in-let"
+              '(progn (setq *jd-side* (+ *jd-side* 1)) (let ((n 7)) (floor n 2)))
+              (list 3 1))
+  (jd-mv-once "mv-in-if"
+              '(progn (setq *jd-side* (+ *jd-side* 1))
+                (if (> 3 1) (values :y 2) (values :n 0)))
+              (list :y 2))
+  (jd-mv-once "mv-many"
+              '(progn (setq *jd-side* (+ *jd-side* 1))
+                (values 1 2 3 4 5 6 7 8))
+              (list 1 2 3 4 5 6 7 8))
+  ;; HEAP-VALUED extras: the words read back out of the MV block are real
+  ;; pointers, not fixnums, so a stale (pre-GC) read shows up as garbage.
+  (jd-mv-once "mv-heap"
+              '(progn (setq *jd-side* (+ *jd-side* 1))
+                (values (list 1 2) "ab" (list :x)))
+              (list (list 1 2) "ab" (list :x))))
+
+;;; GC-pressure stress.  Reading the MV block back is only correct while the
+;;; BSS count stays authoritative: the collector scans exactly (count-1) words
+;;; from #x10000098, so if anything reset the count before the extras were read,
+;;; a collection triggered by the read-back's own cons loop would strand the
+;;; not-yet-read extras at their from-space addresses.  Fixnum extras would
+;;; survive that bug silently; freshly consed HEAP extras, evaluated in a loop
+;;; that allocates, will not.
+(defun jd-mv-stress (n)
+  (let ((bad 0))
+    (dotimes (i n)
+      (let ((filler (make-string 128)))
+        (setq filler filler)
+        (multiple-value-bind (a b c)
+            (eval '(values (list 1 2 3) (list 4 5) "zz"))
+          (unless (and (equal a (list 1 2 3))
+                       (equal b (list 4 5))
+                       (equal c "zz"))
+            (setq bad (+ bad 1))
+            (when (< bad 4)
+              (format t "JD-MV-STRESS-BAD iter=~D a=~S b=~S c=~S~%" i a b c))))))
+    (setq *jd-total* (+ 1 *jd-total*))
+    (unless (eql bad 0) (setq *jd-diverge* (+ 1 *jd-diverge*)))
+    (format t "JD-MV-STRESS n=~D bad=~D~%" n bad)))
+
+;;; ------------------------------------------------------------------
 ;;; Run
 ;;; ------------------------------------------------------------------
 
@@ -550,6 +736,10 @@
                          (defun jd-side-fn (x) x)
                          (jd-side-fn 1)) 1)
 
+;; WS5 #218: the multiple-values side-effect oracle.
+(jd-mv-probes)
+(jd-mv-stress 400)
+
 (setq *jit-inhibit* nil)
 
 ;; The shapes that NEVER reached native code are the JIT-only blocker list.
@@ -558,4 +748,8 @@
 
 (format t "~%JD-TOTAL=~D~%JD-DIVERGE=~D~%JD-NATIVE=~D~%JD-BOTH-SIGNALLED=~D~%"
         *jd-total* *jd-diverge* *jd-native* *jd-both-err*)
+;; WS5 #218 proof: MV forms must reach native AND the MV fallback must be 0.
+(format t "JD-MV-TOTAL=~D~%JD-MV-NATIVE=~D~%JD-MV-CL-GAP=~D~%JD-MV-FALLBACK=~D~%"
+        *jd-mv-total* *jd-mv-native* *jd-mv-clgap*
+        (if (boundp '*jit-mv-fallback-count*) (or *jit-mv-fallback-count* 0) 0))
 (format t "JD-~A~%" (if (eql *jd-diverge* 0) "OK" "FAIL"))

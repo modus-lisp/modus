@@ -209,7 +209,13 @@
         ;; Clear status
         (setf (mem-ref (+ desc-addr 12) :u32) 0)
         ;; Bump TX tail
-        (let ((next (mod (+ tx-cur 1) 64)))
+        ;; Ring wrap WITHOUT (mod …): compile-mod expands to
+        ;; (nth-value 1 (truncate …)) — a multiple-value return plus a
+        ;; runtime NTH, machinery a bare net image cannot rely on.  It
+        ;; produced 0 instead of 1 on aarch64, so TDT never advanced past
+        ;; TDH and NOTHING was ever transmitted.  A compare-and-reset is
+        ;; both correct and cheaper.  Task #219.
+        (let ((next (if (< (+ tx-cur 1) 64) (+ tx-cur 1) 0)))
           (setf (mem-ref (+ state #x14) :u32) next)
           (e1000-write-reg #x3818 next)
           ;; Wait for TX done: poll TDH register
@@ -236,7 +242,7 @@
           (let ((desc-addr (+ (e1000-rx-desc-base) (* rx-cur 16))))
             (let ((pkt-len (mem-ref (+ desc-addr 8) :u16)))
               ;; Advance cursor and update RDT
-              (let ((next (mod (+ rx-cur 1) 128)))
+              (let ((next (if (< (+ rx-cur 1) 128) (+ rx-cur 1) 0)))
                 (setf (mem-ref (+ state #x10) :u32) next)
                 (e1000-write-reg #x2818 rx-cur))
               pkt-len))))))
@@ -245,7 +251,7 @@
 (defun e1000-hw-rx-buf ()
   (let ((rx-cur (mem-ref (+ (e1000-state-base) #x10) :u32)))
     ;; Return previous cursor's buffer since we already advanced
-    (let ((prev (mod (+ rx-cur 127) 128)))
+    (let ((prev (if (zerop rx-cur) 127 (- rx-cur 1))))
       (+ (e1000-rx-buf-base) (* prev 2048)))))
 
 ;; Find E1000 and initialize. Main entry point.

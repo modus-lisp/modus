@@ -660,6 +660,30 @@
    calls (callee names that no defun resolved) at the end of compilation.
    Set to nil to silence this output for clean build logs.")
 
+(defparameter *compile-plain-arrays* nil
+  "When non-nil, AREF / ASET / ARRAY-LENGTH compile STRAIGHT to the
+   primitive word-slot opcodes instead of the wrapper/MDA-aware runtime
+   trampolines.
+
+   The trampolines (see compile-aref/compile-aset below) call
+   %MDA-P / %MDA-DATA / %MDA-DISPLACED / %ASET-STORE-VAL / %WRAPPER-ASET
+   / %AREF-MULTI / … , which live in cl-clos.lisp and ansi-bridge.lisp.
+   An image that does NOT link the CL array runtime — every bare-metal
+   net/ image (x64-ssh, aarch64-ssh/actors/isolated, i386-ssh, arm32-ssh,
+   rpi-*) is built from net/*.lisp only — therefore has NO definition for
+   any of them, and each call compiles to an UNRESOLVED call.  Unresolved
+   calls target bytecode offset 0 = the module's FIRST function, invoked
+   with the caller's arguments (see the :call arm of emit-bytecode-for-ir),
+   so the very first (aset buf i v) on the boot path recurses into
+   function #1 until the stack runs off its base.  That is task #219: the
+   SSH images wedge in dhcp-discover's fill loop.
+
+   These images only ever use flat, non-adjustable, non-displaced,
+   non-fill-pointer, word-slot arrays from (make-array N), so the whole
+   trampoline is dead weight there.  Default NIL: with the flag off the
+   emitted code is byte-identical to before, so the ANSI images are
+   untouched.")
+
 (defparameter *redefinition-log* nil
   "List of (name old-loc new-loc) triples, one per silently-redefined
    defun.  Pushed by mvm-compile-function.  Build scripts should print
@@ -14762,6 +14786,9 @@
   "Compile (aref array index) — the single-subscript fast path.
    Routes wrapper inputs through %wrapper-aref.  Multi-subscript
    forms go via compile-aref-form below."
+  (when *compile-plain-arrays*
+    ;; Image without the CL array runtime: flat word-slot arrays only.
+    (return-from compile-aref (compile-word-aref arr-form idx-form env dest)))
   (let ((g-arr (gensym "AREFA"))
         (g-idx (gensym "AREFI"))
         (g-raw (gensym "AREFR")))
@@ -14817,6 +14844,9 @@
   "Compile (aset array index value) — the single-subscript fast path.
    Routes wrapper inputs through %wrapper-aset.  Multi-subscript
    forms go via compile-aset-form below."
+  (when *compile-plain-arrays*
+    (return-from compile-aset
+      (compile-word-aset arr-form idx-form val-form env dest)))
   (let ((g-arr (gensym "ASETA"))
         (g-idx (gensym "ASETI"))
         (g-val (gensym "ASETV"))
@@ -14890,6 +14920,9 @@
    helper (returns fp if set, else array-length of data) — without this,
    %prim-array-length reads the 7-slot count from the MDA header, which
    breaks sequence ops that loop (dotimes i (array-length s) ...)."
+  (when *compile-plain-arrays*
+    (return-from compile-array-length
+      (compile-prim-array-length arr-form env dest)))
   (let ((g-arr (gensym "ALENA")))
     (compile-form
      `(let ((,g-arr ,arr-form))

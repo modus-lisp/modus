@@ -601,6 +601,57 @@
   t)
 ")
 
+;;; --- #210 RUNG-1 BLOCKER: cross.lisp's :into-buf special never binds ------
+;; THE bug that made the first cross-arch emit produce a SIGILL ELF.
+;;
+;; translate-module-to-native hands the unified a64-buffer to the translator
+;; through a DYNAMIC BINDING:
+;;
+;;   (let ((translator (target-translate-fn target))
+;;         (modus.mvm::*aarch64-translate-into-buf* into-buf))
+;;     … (funcall translator …) …)
+;;
+;; In-image that binding DOES NOT REACH THE CALLEE.  The image's compiler
+;; treats a LET of a special as an ordinary lexical binding, so the global
+;; keeps its old value for anything called from the body.  Demonstrated
+;; directly in the built image:
+;;
+;;   (let ((*aarch64-translate-into-buf* 42)) (%rd))   =>  NIL   (want 42)
+;;
+;; Consequence: translate-mvm-to-aarch64 sees NIL, decides it is NOT appending,
+;; allocates a FRESH buffer, translates the whole module into it — correctly —
+;; and returns it, while assemble-kernel-image goes on to slice the UNIFIED
+;; buffer, which only ever received the boot preamble.  The emitted ELF gets a
+;; byte-perfect 94-instruction boot stub, a correct symbol table, and ZERO
+;; bytes of function code.  Execution falls off the preamble into the constant
+;; pool → SIGILL.
+;;
+;; The tell that identifies this precisely (rather than "code went missing"):
+;; KERNEL-MAIN's recorded native offset was 8 — exactly the 2 alignment NOPs a
+;; translation starting at buffer index 0 emits under
+;; *aarch64-fn-align-offset* = 120 ((0*4+120) mod 16 = 8 → pad; 124 mod 16 = 12
+;; → pad; 128 mod 16 = 0 → stop).  The unified path starts at index 95 and
+;; would have recorded 12 (3 NOPs), which is what the SBCL reference emits.
+;; A fresh-buffer translation is the only thing that yields 8.
+;;
+;; Fix, applied to the BAKED COPY ONLY so no shared file changes semantics:
+;; assign the global with SETQ instead of LET-binding it.  Every call site sets
+;; it unconditionally (nil for non-AArch64 targets, which never read it), so
+;; dropping the restore is safe here.  Fixing this in cross.lisp itself would
+;; be the real repair, but cross.lisp is on the x64 ANSI-gate path and this
+;; rung does not need to touch it.
+(let ((needle "  (let ((translator (target-translate-fn target))
+        (modus.mvm::*aarch64-translate-into-buf* into-buf))")
+      (repl   "  (let ((translator (target-translate-fn target)))
+    (setq modus.mvm::*aarch64-translate-into-buf* into-buf)"))
+  (let ((p (search needle *cross-source*)))
+    (unless p
+      (error "#210: could not find translate-module-to-native :into-buf LET"))
+    (setf *cross-source*
+          (concatenate 'string
+                       (subseq *cross-source* 0 p) repl
+                       (subseq *cross-source* (+ p (length needle)))))))
+
 ;;; --- linux-aarch64 boot descriptor + ELF64-LE(EM_AARCH64) wrapper ---
 ;; get-boot-descriptor(:linux-aarch64) → linux-aarch64-boot-descriptor, which
 ;; names emit-linux-aarch64-entry + +linux-aarch64-load-addr+;

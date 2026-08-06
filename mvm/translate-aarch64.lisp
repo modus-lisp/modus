@@ -3321,27 +3321,46 @@
 
           ;; ---- CONSP Vd, Vs ----
           ;; (consp NIL) MUST return NIL even though NIL=#xDEAD0001 has
-          ;; cons-tag 1.  Pre-check Vs == x26 (NIL); if so force x16=0
-          ;; so the cons-tag (1) test downstream fails.  Then test low
+          ;; cons-tag 1.  Pre-check Vs == x26 (NIL); if so force the nibble
+          ;; to 0 so the cons-tag (1) test downstream fails.  Then test low
           ;; 4 bits for cons tag.  Mirrors x64's NIL pre-check.
+          ;;
+          ;; The nibble MUST NOT be computed into x16.  `ensure-src` returns
+          ;; the SCRATCH x16 whenever Vs is a spilled vreg (V9-V15), so `ps`
+          ;; IS x16 at those sites, and the old sequence
+          ;;     MOVZ x17,#xF / AND x16,ps,x17 / CMP ps,x26 / CSEL x16,...
+          ;; overwrote its own operand: by the CMP, `ps` and x16 named the
+          ;; same register, so the NIL pre-check compared the MASKED NIBBLE
+          ;; (1, for NIL) against #xDEAD0001.  That never matches, the CSEL
+          ;; left the nibble at 1, and `CMP x16,#1` then reported EQ —
+          ;; `(consp nil)` returned **T** at every such site.  Exactly task
+          ;; #220's `:mod` bug class (scratch clobbered, then a source that
+          ;; may BE that scratch is re-read).
+          ;;
+          ;; Fix: compute the nibble into x9 with the mask in x10.  Neither
+          ;; is in *a64-vreg-to-phys* and neither is an `ensure-src` scratch
+          ;; (those are x16 / x17), so they can alias neither `ps` nor `pd`
+          ;; — correct for every operand/dest combination.  Same register
+          ;; discipline as +op-mul-checked+ and #220's MSUB fix.  Instruction
+          ;; count is unchanged; only register numbers move.
           ((= op +op-consp+)
            (let* ((vd (vr 0))
                   (ps (ensure-src (vr 1) +a64-x16+))
                   (pd (or (a64-phys-reg vd) +a64-x17+)))
-             ;; x16 = ps & 0xF.
-             (a64-movz buf +a64-x17+ #xF 0)
-             (a64-and-reg buf +a64-x16+ ps +a64-x17+)
-             ;; CMP ps, x26; CSEL x16, XZR, x16, EQ.
-             ;; Encoding: Rd=Rn if cond else Rm.  Want: ps==x26 → x16=0,
-             ;; ps!=x26 → x16 unchanged.  Rn=XZR (selected when EQ),
-             ;; Rm=x16 (selected when NE).
+             ;; x9 = ps & 0xF.
+             (a64-movz buf +a64-x10+ #xF 0)
+             (a64-and-reg buf +a64-x9+ ps +a64-x10+)
+             ;; CMP ps, x26; CSEL x9, XZR, x9, EQ.
+             ;; Encoding: Rd=Rn if cond else Rm.  Want: ps==x26 → x9=0,
+             ;; ps!=x26 → x9 unchanged.  Rn=XZR (selected when EQ),
+             ;; Rm=x9 (selected when NE).
              (a64-cmp-reg buf ps +a64-x26+)
              (a64-emit buf (logior #x9A800000
-                                   (ash +a64-x16+ 16)        ; Rm = x16
+                                   (ash +a64-x9+ 16)         ; Rm = x9
                                    (ash +cc-eq+ 12)
                                    (ash 31 5)                ; Rn = XZR
-                                   +a64-x16+))               ; Rd = x16
-             (a64-cmp-imm buf +a64-x16+ 1)
+                                   +a64-x9+))                ; Rd = x9
+             (a64-cmp-imm buf +a64-x9+ 1)
              ;; x18 = T literal 0xDEAD1009
              (a64-movz buf +a64-x18+ #x1009 0)
              (a64-movk buf +a64-x18+ #xDEAD 1)
@@ -3357,23 +3376,30 @@
           ;; ---- ATOM Vd, Vs ----
           ;; NIL IS an atom — but NIL=#xDEAD0001 has cons-tag 1, so the
           ;; low-nibble test would mis-classify.  Same pre-check as
-          ;; consp: ps==NIL → x16=0 (not 1) so the NE-against-1 path
+          ;; consp: ps==NIL → nibble 0 (not 1) so the NE-against-1 path
           ;; below returns T (atom).
+          ;;
+          ;; Same scratch-clobber fix as +op-consp+ above (see that comment
+          ;; for the full mechanism): the nibble goes to x9, the mask to x10,
+          ;; so `AND` cannot destroy `ps` when `ps` IS the x16 scratch.  With
+          ;; the old x16 sequence the NIL pre-check was defeated and, because
+          ;; ATOM's final CSEL uses NE, `(atom nil)` returned **NIL** — the
+          ;; exact inverse of CONSP's failure, from the identical cause.
           ((= op +op-atom+)
            (let* ((vd (vr 0))
                   (ps (ensure-src (vr 1) +a64-x16+))
                   (pd (or (a64-phys-reg vd) +a64-x17+)))
-             (a64-movz buf +a64-x17+ #xF 0)
-             (a64-and-reg buf +a64-x16+ ps +a64-x17+)
-             ;; CMP ps, x26; CSEL x16, XZR, x16, EQ — Rn=XZR (EQ-path),
-             ;; Rm=x16 (NE-path).
+             (a64-movz buf +a64-x10+ #xF 0)
+             (a64-and-reg buf +a64-x9+ ps +a64-x10+)
+             ;; CMP ps, x26; CSEL x9, XZR, x9, EQ — Rn=XZR (EQ-path),
+             ;; Rm=x9 (NE-path).
              (a64-cmp-reg buf ps +a64-x26+)
              (a64-emit buf (logior #x9A800000
-                                   (ash +a64-x16+ 16)        ; Rm = x16
+                                   (ash +a64-x9+ 16)         ; Rm = x9
                                    (ash +cc-eq+ 12)
                                    (ash 31 5)                ; Rn = XZR
-                                   +a64-x16+))               ; Rd = x16
-             (a64-cmp-imm buf +a64-x16+ 1)
+                                   +a64-x9+))                ; Rd = x9
+             (a64-cmp-imm buf +a64-x9+ 1)
              (a64-movz buf +a64-x18+ #x1009 0)
              (a64-movk buf +a64-x18+ #xDEAD 1)
              ;; CSEL pd, x18, x26, NE  →  pd = T if not-EQ else NIL.
@@ -3457,14 +3483,25 @@
                          (a64-sub-imm buf +a64-x16+ +a64-x29+ (- offset))
                          (a64-stur buf ps +a64-x16+ 0))))
                  ;; Normal object slot store — tag=9 layout, slot N at +N*8+7.
+                 ;;
+                 ;; The large-offset address temp MUST NOT be x16.  `pobj` IS
+                 ;; the x16 scratch whenever Vobj is a spilled vreg (V9-V15),
+                 ;; so `load-imm64 x16, offset` destroyed the base and the
+                 ;; following ADD computed offset+offset — the store then went
+                 ;; to a WILD ADDRESS (2*offset, not object+offset).  Narrow
+                 ;; but silent: it fires only when idx*8+7 > 255, i.e. slot
+                 ;; index > 31.  Note `ps` already occupies x17, so with both
+                 ;; operands spilled the collision is guaranteed (ps=x17,
+                 ;; pobj=x16).  x9 is never a vreg and never an `ensure-src`
+                 ;; scratch.  Same class as #220's :mod.
                  (let* ((pobj (ensure-src vobj +a64-x16+))
                         (offset (+ (* idx 8) 7)))
                    (if (and (>= offset -256) (<= offset 255))
                        (a64-stur buf ps pobj offset)
                        (progn
-                         (a64-load-imm64 buf +a64-x16+ offset)
-                         (a64-add-reg buf +a64-x16+ pobj +a64-x16+ 0 0)
-                         (a64-stur buf ps +a64-x16+ 0)))))))
+                         (a64-load-imm64 buf +a64-x9+ offset)
+                         (a64-add-reg buf +a64-x9+ pobj +a64-x9+ 0 0)
+                         (a64-stur buf ps +a64-x9+ 0)))))))
 
           ;; ---- OBJ-TAG Vd, Vs ----
           ;; Extract low 4 bits, then fixnum-tag (SHL 1) — matches x64.
@@ -3762,7 +3799,18 @@
                                      (ash 0 5)))    ; placeholder offset
                (a64-add-fixup buf idx bad-label :bcond))
              ;; Valid tagged function pointer: strip the tag and BLR.
-             (a64-sub-imm buf ps ps 3)
+             ;;
+             ;; Strip into x16, NOT in place.  `ps` is whatever `ensure-src`
+             ;; returned, which for an unspilled Vs is a REAL vreg register
+             ;; (V0-V3 = x0-x3, V4-V8 = x19-x23).  `SUB ps, ps, #3` therefore
+             ;; permanently subtracted 3 from a live virtual register: any
+             ;; later use of that vreg saw a corrupt (untagged) function word.
+             ;; Writing the register `ensure-src` handed back is the same
+             ;; family as #220's :mod, just with the source as its own
+             ;; destination.  x16 is IP0 — caller-saved, never a vreg, and
+             ;; already this opcode's scratch — so the instruction count is
+             ;; unchanged and the ps==x16 case is byte-identical to before.
+             (a64-sub-imm buf +a64-x16+ ps 3)
              (let ((idx (a64-current-index buf)))
                (a64-b buf 0)
                (a64-add-fixup buf idx ok-label :b))
@@ -3774,7 +3822,7 @@
              (a64-set-label buf bad-label)
              (a64-svc buf #x0511)
              (a64-set-label buf ok-label)
-             (a64-blr buf ps)))
+             (a64-blr buf +a64-x16+)))
 
           ;; ---- RET ----
           ((= op +op-ret+)
@@ -3990,26 +4038,39 @@
           ;; ---- ATOMIC-XCHG Vd, Vaddr, Vs ----
           ;; LDXR/STXR loop for atomic exchange.
           ;; STXR Ws, Xt, [Xn] requires Ws ≠ Xt and Ws ≠ Xn (ARM spec).
-          ;; Pick status register that doesn't conflict with pa or ps.
+          ;;
+          ;; The loaded value MUST NOT go straight into `pd`.  Both `pd` and
+          ;; `pa` fall back to x16 (pd when Vd spills, pa when Vaddr spills
+          ;; — `ensure-src` hands back the scratch), and `pd == pa` also
+          ;; holds whenever Vd and Vaddr are the SAME vreg with a physical
+          ;; register.  In either case `LDXR pd,[pa]` overwrote the ADDRESS
+          ;; with the loaded value, so the STXR on the next line stored
+          ;; through a data word — a wild write inside the exclusive monitor
+          ;; loop.  Same class as #220's :mod.
+          ;;
+          ;; Fix: load into x9 and pick the status register as x10.  Neither
+          ;; is in *a64-vreg-to-phys* nor an `ensure-src` scratch, so the ARM
+          ;; Ws ≠ Xt / Ws ≠ Xn constraint holds by construction and the old
+          ;; three-way `status` cond (which could still pick x0 == a real
+          ;; vreg V0) goes away.  Costs one MOV.
           ((= op +op-atomic-xchg+)
            (let* ((vd (vr 0))
                   (pa (ensure-src (vr 1) +a64-x16+))
                   (ps (ensure-src (vr 2) +a64-x17+))
                   (pd (or (a64-phys-reg vd) +a64-x16+))
-                  ;; Status reg must differ from ps (Xt) and pa (Xn)
-                  (status (cond ((/= ps +a64-x17+) +a64-x17+)
-                                ((/= pa 15) 15)     ; x15
-                                (t +a64-x0+)))
+                  (status +a64-x10+)
                   (loop-idx (a64-current-index buf)))
-             ;; loop: LDXR Xd, [Vaddr]
-             (a64-ldxr buf pd pa)
-             ;; STXR Ws, Vs, [Vaddr]
+             ;; loop: LDXR x9, [Vaddr]
+             (a64-ldxr buf +a64-x9+ pa)
+             ;; STXR W10, Vs, [Vaddr]
              (a64-stxr buf status ps pa)
-             ;; CBNZ Ws, loop (32-bit variant, sf=0)
+             ;; CBNZ W10, loop (32-bit variant, sf=0)
              (let ((back-offset (- loop-idx (a64-current-index buf))))
                (a64-emit buf (logior #x35000000
                                      (ash (logand back-offset #x7FFFF) 5)
                                      status)))
+             ;; Old value -> Vd, after the loop is done with the address.
+             (a64-mov-reg buf pd +a64-x9+)
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 

@@ -3338,11 +3338,15 @@
           ;; may BE that scratch is re-read).
           ;;
           ;; Fix: compute the nibble into x9 with the mask in x10.  Neither
-          ;; is in *a64-vreg-to-phys* and neither is an `ensure-src` scratch
-          ;; (those are x16 / x17), so they can alias neither `ps` nor `pd`
-          ;; — correct for every operand/dest combination.  Same register
-          ;; discipline as +op-mul-checked+ and #220's MSUB fix.  Instruction
-          ;; count is unchanged; only register numbers move.
+          ;; is in *a64-vreg-to-phys*, and neither is an `ensure-src` scratch
+          ;; IN THIS OPCODE (here the only scratch is x16), so they can alias
+          ;; neither `ps` nor `pd` — correct for every operand/dest
+          ;; combination.  (x9 is NOT globally off-limits: +op-u8-set+ uses it
+          ;; as a third ensure-src scratch.  That is fine because register
+          ;; state never crosses an MVM instruction boundary — the claim that
+          ;; matters is per-opcode.)  Same discipline as +op-mul-checked+ and
+          ;; #220's MSUB fix.  Instruction count is unchanged; only register
+          ;; numbers move.
           ((= op +op-consp+)
            (let* ((vd (vr 0))
                   (ps (ensure-src (vr 1) +a64-x16+))
@@ -3492,8 +3496,8 @@
                  ;; but silent: it fires only when idx*8+7 > 255, i.e. slot
                  ;; index > 31.  Note `ps` already occupies x17, so with both
                  ;; operands spilled the collision is guaranteed (ps=x17,
-                 ;; pobj=x16).  x9 is never a vreg and never an `ensure-src`
-                 ;; scratch.  Same class as #220's :mod.
+                 ;; pobj=x16).  x9 is not a vreg and is not an `ensure-src`
+                 ;; scratch in THIS opcode.  Same class as #220's :mod.
                  (let* ((pobj (ensure-src vobj +a64-x16+))
                         (offset (+ (* idx 8) 7)))
                    (if (and (>= offset -256) (<= offset 255))
@@ -4049,10 +4053,10 @@
           ;; loop.  Same class as #220's :mod.
           ;;
           ;; Fix: load into x9 and pick the status register as x10.  Neither
-          ;; is in *a64-vreg-to-phys* nor an `ensure-src` scratch, so the ARM
-          ;; Ws ≠ Xt / Ws ≠ Xn constraint holds by construction and the old
-          ;; three-way `status` cond (which could still pick x0 == a real
-          ;; vreg V0) goes away.  Costs one MOV.
+          ;; is in *a64-vreg-to-phys* nor an `ensure-src` scratch in this
+          ;; opcode, so the ARM Ws ≠ Xt / Ws ≠ Xn constraint holds by
+          ;; construction and the old three-way `status` cond (which could
+          ;; still pick x0 == a real vreg V0) goes away.  Costs one MOV.
           ((= op +op-atomic-xchg+)
            (let* ((vd (vr 0))
                   (pa (ensure-src (vr 1) +a64-x16+))
@@ -4129,6 +4133,21 @@
                (store-dst pd vd))))
 
           ;; ---- PERCPU-SET offset:imm16, Vs ----
+          ;;
+          ;; The large-offset address temp MUST NOT be x17 — this opcode's
+          ;; `ensure-src` scratch IS x17, so `ps` is x17 whenever Vs is a
+          ;; spilled vreg (V9-V15).  `load-imm64 x17, offset` then destroyed
+          ;; the VALUE, and the STUR wrote the OFFSET into the per-CPU slot.
+          ;; Same class as #220's :mod; note the mirror opcode +op-percpu-ref+
+          ;; is safe only because its address temp is x17 while it has no
+          ;; x17-scratch source at all.
+          ;;
+          ;; UNREACHABLE in any current image, so this is hardening, not a
+          ;; caught bug: `compile-percpu-set` rejects a non-constant offset
+          ;; (compiler.lisp), and every first-party call site (net/actors.lisp)
+          ;; passes 8/24/32/40/48 — all 8-aligned and <= #xFFF*8 — so the
+          ;; `then` arm is taken every time and the emitted bytes of every
+          ;; existing image are UNCHANGED by this edit.
           ((= op +op-percpu-set+)
            (let ((offset (vr 0))
                  (ps (ensure-src (vr 1) +a64-x17+)))
@@ -4136,8 +4155,8 @@
              (if (and (zerop (mod offset 8)) (<= offset (* #xFFF 8)))
                  (a64-str-unsigned buf ps +a64-x16+ offset)
                  (progn
-                   (a64-load-imm64 buf +a64-x17+ offset)
-                   (a64-add-reg buf +a64-x16+ +a64-x16+ +a64-x17+ 0 0)
+                   (a64-load-imm64 buf +a64-x9+ offset)
+                   (a64-add-reg buf +a64-x16+ +a64-x16+ +a64-x9+ 0 0)
                    (a64-stur buf ps +a64-x16+ 0)))))
 
           ;; ---- FN-ADDR Vd, target:imm32 ----

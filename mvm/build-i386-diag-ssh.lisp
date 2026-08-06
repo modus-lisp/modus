@@ -57,7 +57,7 @@
 (load (merge-pathnames "boot/boot-direct-i386.lisp" *modus-base*))
 
 ;;; ============================================================
-;;; SSH networking source (same as build-i386-ssh.lisp but with e1000)
+;;; SSH networking source (same as build.lisp i386/bare/qemu/ssh but with e1000)
 ;;; ============================================================
 ;;; Source load order:
 ;;;   arch-i386 → e1000 → ip → crypto → crypto-32 → crypto-w32 → ssh →

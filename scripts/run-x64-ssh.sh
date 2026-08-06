@@ -21,9 +21,9 @@ cleanup() {
 trap cleanup INT TERM
 
 # Build kernel via MVM pipeline
-if [ ! -f "$BIN" ] || [ mvm/build-x64-ssh.lisp -nt "$BIN" ]; then
+if [ ! -f "$BIN" ] || [ mvm/build.lisp -nt "$BIN" ]; then
     echo "Building x64 SSH kernel..." >&2
-    sbcl --script mvm/build-x64-ssh.lisp >&2
+    sbcl --script mvm/build.lisp x64/bare/qemu/ssh >&2
 fi
 
 pkill -9 -f "qemu.*modus-x64-ssh" 2>/dev/null || true

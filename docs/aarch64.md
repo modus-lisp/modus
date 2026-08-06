@@ -57,7 +57,7 @@ Shared code calls these functions, defined per-architecture:
 Both x86 and AArch64 share the same source files. The build scripts differ only in which adapter is loaded first and which `build-image` target is used:
 
 - **x86**: `build-kernel-mvm` in `build.lisp` reads shared files as form lists via `read-source-forms`, appends to `*runtime-functions*`
-- **AArch64**: `build-aarch64-ssh.lisp` reads shared files as text via `read-file-text`, concatenates with REPL source, compiles with `(build-image :target :aarch64 :source-text combined)`
+- **AArch64**: the `aarch64/bare/qemu/ssh` cell in `mvm/build.lisp` reads shared files as text via `read-file-text`, concatenates with REPL source, compiles with `(build-image :target :aarch64 :source-text combined)`
 
 Source ordering matters: the last `defun` of a given name wins (NFN table). `kernel-main` is defined first (SSH entry point), then net source (function definitions), then REPL source (eval-sexp, etc.), then overrides.
 

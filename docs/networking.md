@@ -23,12 +23,12 @@ Three NIC driver classes cover all platforms: Intel E1000 (PCI Gigabit Ethernet)
 
 | Build | Script | Features |
 |---|---|---|
-| AArch64 SSH | `build-aarch64-ssh.lisp` | Single-threaded SSH |
-| AArch64 actors | `build-aarch64-actors.lisp` | Multi-connection SSH + HTTP, cooperative actors |
-| AArch64 isolated | `build-aarch64-isolated.lisp` | Qubes-like isolation, net-domain owns hardware |
+| AArch64 SSH | `build.lisp aarch64/bare/qemu/ssh` | Single-threaded SSH |
+| AArch64 actors | `build.lisp aarch64/bare/qemu/actors` | Multi-connection SSH + HTTP, cooperative actors |
+| AArch64 isolated | `build.lisp aarch64/bare/qemu/isolated` | Qubes-like isolation, net-domain owns hardware |
 | RPi 3B SSH | `build-rpi-ssh.lisp` | Single-threaded SSH over USB |
 | RPi 3B HID | `build-rpi-hid.lisp` | USB keyboard/mouse/tablet (no networking) |
-| i386 SSH | `build-i386-ssh.lisp` | Single-threaded SSH, 32-bit crypto |
+| i386 SSH | `build.lisp i386/bare/qemu/ssh` | Single-threaded SSH, 32-bit crypto |
 | ARM32 SSH | `build-arm32-ssh.lisp` | Single-threaded SSH, 32-bit crypto, USB |
 | Pi Zero 2W SSH | `build-pizero2w-ssh.lisp` | Single-threaded SSH, USB gadget |
 | Pi Zero 2W actors | `build-pizero2w-actors.lisp` | Multi-connection SSH, USB gadget |
@@ -432,7 +432,7 @@ Cooperative scheduling on a single core. Actors communicate via mailbox messages
 
 ```bash
 # Build
-sbcl --script mvm/build-aarch64-ssh.lisp
+sbcl --script mvm/build.lisp aarch64/bare/qemu/ssh
 
 # Run
 qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 512 \

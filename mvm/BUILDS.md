@@ -1,6 +1,7 @@
 # Modus build scripts — the matrix
 
-36 scripts, 30,387 lines. They are essentially **arch × (hosted | bare) × board**,
+28 scripts (was 36; 8 retired into `mvm/build.lisp`'s matrix). They are
+essentially **arch × (hosted | bare) × board**,
 plus a payload axis (repl / ssh / actors / CLI / ANSI-gate / self-host).
 
 ## Building them — one entry point
@@ -18,15 +19,30 @@ sbcl --script mvm/build.lisp build-x64-repl     # legacy name still resolves
 `build-*.lisp`, unchanged).  Cells migrate one at a time, each gated on
 producing a **byte-identical** image.
 
-Migrated so far (both verified byte-identical to the script they replace):
+Migrated so far (each verified byte-identical to the script it replaces —
+the script is then DELETED, so the count above really does go down):
 
-| cell | md5 legacy == native |
-|---|---|
-| `x64/bare/qemu/repl` | `269b461a764016eea6533c46798ad3e4` |
-| `aarch64/bare/qemu/repl` | `fd0d40b12e984e064f3713ce03ed21e8` |
+| cell | retired script | md5 legacy == native |
+|---|---|---|
+| `x64/bare/qemu/repl` | `build-x64-repl` | `269b461a764016eea6533c46798ad3e4` |
+| `aarch64/bare/qemu/repl` | `build-aarch64-repl` | `fd0d40b12e984e064f3713ce03ed21e8` |
+| `x64/bare/qemu/ssh` | `build-x64-ssh` | `782c7414cf3ad555c302500942004a8c` |
+| `aarch64/bare/qemu/ssh` | `build-aarch64-ssh` | `a168c3fe76e313cf9c644b7b5af0ac3d` |
+| `aarch64/bare/qemu/actors` | `build-aarch64-actors` | `98cc10becd7a7da404ba700d86fd6ce2` |
+| `aarch64/bare/qemu/isolated` | `build-aarch64-isolated` | `2083abab509dca80f930a36cffee9a5b` |
+| `i386/bare/qemu/ssh` | `build-i386-ssh` | `dcadafd144d94459e6aac9302998c5f9` |
 
 `aarch64/bare/rpi/repl` is also native and reproduces the known RPi
 `A64-BUFFER` build failure *identically* — the migration does not mask it.
+
+The five SSH/actors cells were NOT pure table data — each composes a per-arch
+list of `net/` files (order is semantic: last-defun-wins) plus an inline
+`kernel-main` in source strings.  `build.lisp` grew a `*COMPOSITES*` table for
+exactly that shape (`:net` / `:main` / `:extra` / `:parts` / `:flags`); the
+`:parts` order is load-bearing (single-threaded SSH puts kernel-main LAST so
+it wins the entry point; the actor builds put it FIRST).  `actors` and
+`isolated` share one verbatim kernel-main — they differ only by appending
+`isolated-net.lisp`.  Evidence: `GATE-RESULT-ssh-cells.md`.
 
 ## Running them — one entry point
 
@@ -82,10 +98,10 @@ concurrently). `BUILD` is that result — not a guess from file dates.
 |---|---|---|---|
 | `build-x64` | x64 | multiboot QEMU — **bare ANSI gate** | OK |
 | `build-x64-cl-repl` | x64 | multiboot QEMU — **bare metal running the REAL CL** (#204); boots, evaluates, one known gap (global var READ — see its header) | OK |
-| `x64/bare/qemu/repl` **(script RETIRED)** / `build-x64-ssh` / `-console-repl` | x64 | multiboot QEMU (second Lisp) | OK |
+| `x64/bare/qemu/repl` + `x64/bare/qemu/ssh` **(both scripts RETIRED)** / `build-x64-console-repl` | x64 | multiboot QEMU (second Lisp) | OK |
 | `build-aarch64` | aarch64 | QEMU virt — **bare ANSI gate** | OK |
-| `aarch64/bare/qemu/repl` **(script RETIRED)** / `build-aarch64-ssh` / `-actors` / `-isolated` | aarch64 | QEMU virt (E1000) | OK |
-| `build-i386-repl` / `-ssh` / `-diag-ssh` | i386 | QEMU + T420 | OK |
+| `aarch64/bare/qemu/` `repl` + `ssh` + `actors` + `isolated` **(all four scripts RETIRED)** | aarch64 | QEMU virt (E1000) | OK |
+| `build-i386-repl` / `-diag-ssh`, `i386/bare/qemu/ssh` **(script RETIRED)** | i386 | QEMU + T420 | OK |
 | `build-arm32-repl` / `-ssh` | arm32 | QEMU | OK |
 
 ### Real hardware
@@ -169,9 +185,11 @@ The 12 failures are NOT 12 atrophied scripts. By actual cause:
   is `generic∩aa64 64`, `generic∩i386 193`, `aa64∩i386 72`, **all three 35** —
   they are genuinely different bring-ups, and the shared parts were already
   hoisted to `lib/cli-toplevel.lisp` and `lib/runtime-backquote.lisp`.
-- **Don't**: delete the ~22-line wrappers (`*-repl`, `*-ssh`). They are thin by
-  design — a few defvars plus `build-image` — which is the right shape. The
-  bulk is in 13 files; the other 23 are ~4,000 lines total.
+- **DONE**: the `*-repl` and `*-ssh` wrappers ARE now table rows in
+  `mvm/build.lisp` (8 scripts retired, 36 -> 28).  The earlier "don't delete
+  them, they're thin by design" note was wrong about the payoff: thin is
+  exactly what makes them table data, and each retirement was gated on a
+  byte-identical image, so nothing was risked to get the count down.
 
 ## Reproducing this audit
 
@@ -182,6 +200,14 @@ for f in mvm/build-*.lisp; do
   while [ $(jobs -r | wc -l) -ge 12 ]; do sleep 5; done
 done; wait
 ```
+
+TRAP: a **comment-only** edit to any source file an image bakes DOES change
+that image's bytes. `build-image` calls `embed-source-blob` (`mvm/cross.lisp`),
+which bakes the entire combined source text verbatim, comments included. So
+byte-identity gates are exact tests of the source string — which is what makes
+them worth so much — and a stray comment tidy-up in `net/*.lisp` will
+legitimately break one. Measured: a 10-character comment edit in
+`net/arch-x86.lisp` moved `/tmp/modus-x64-ssh.bin` by exactly 8 bytes.
 
 TRAP: every build log contains a benign host-side
 `undefined variable: MODUS.MVM::*AARCH64-GC-NATIVE-MCGC*` warning. Grepping for

@@ -266,11 +266,11 @@ Two kinds of build:
 ### QEMU AArch64 (virt machine, E1000)
 ```bash
 # SSH server (single-threaded)
-sbcl --script mvm/build-aarch64-ssh.lisp
+sbcl --script mvm/build.lisp aarch64/bare/qemu/ssh
 # Actors (cooperative multi-connection SSH)
-sbcl --script mvm/build-aarch64-actors.lisp
+sbcl --script mvm/build.lisp aarch64/bare/qemu/actors
 # Isolated actors (Qubes-like, net-domain owns hardware)
-sbcl --script mvm/build-aarch64-isolated.lisp
+sbcl --script mvm/build.lisp aarch64/bare/qemu/isolated
 # REPL only (serial)
 sbcl --script mvm/build.lisp aarch64/bare/qemu/repl
 ```
@@ -356,7 +356,7 @@ second Lisp is its own workstream.
 
 ```bash
 sbcl --script mvm/build-i386-repl.lisp    # Serial REPL
-sbcl --script mvm/build-i386-ssh.lisp     # SSH (NE2000 ISA NIC)
+sbcl --script mvm/build.lisp i386/bare/qemu/ssh   # SSH (NE2000 ISA NIC)
 ```
 
 QEMU launch (REPL):

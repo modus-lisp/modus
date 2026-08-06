@@ -35,13 +35,13 @@ read -r -d '' TARGETS <<'EOF' || true
 x64-repl|repl|x64/bare/qemu/repl|/tmp/modus-x64.bin|qemu-system-x86_64|-m 512 -nographic -no-reboot|
 x64-console-repl|repl|build-x64-console-repl|/tmp/modus-x64-console.bin|qemu-system-x86_64|-m 512 -nographic -no-reboot|
 x64-cl-repl|repl|build-x64-cl-repl|/tmp/modus-x64-cl.bin|qemu-system-x86_64|-m 512 -nographic -no-reboot|
-x64-ssh|ssh|build-x64-ssh|/tmp/modus-x64-ssh.bin|qemu-system-x86_64|-m 512 -nographic -no-reboot|-device e1000,netdev=net0,romfile=,rombar=0
+x64-ssh|ssh|x64/bare/qemu/ssh|/tmp/modus-x64-ssh.bin|qemu-system-x86_64|-m 512 -nographic -no-reboot|-device e1000,netdev=net0,romfile=,rombar=0
 aarch64-repl|repl|aarch64/bare/qemu/repl|/tmp/modus-aarch64.bin|qemu-system-aarch64|-machine virt -cpu cortex-a57 -m 512 -nographic -semihosting|
-aarch64-ssh|ssh|build-aarch64-ssh|/tmp/modus-aarch64-ssh.bin|qemu-system-aarch64|-machine virt -cpu cortex-a57 -m 512 -nographic -semihosting|-device e1000,netdev=net0,romfile=,rombar=0
-aarch64-actors|ssh|build-aarch64-actors|/tmp/modus-aarch64-actors.bin|qemu-system-aarch64|-machine virt -cpu cortex-a57 -m 512 -nographic -semihosting|-device e1000,netdev=net0,romfile=,rombar=0
-aarch64-isolated|ssh|build-aarch64-isolated|/tmp/modus-aarch64-isolated.bin|qemu-system-aarch64|-machine virt -cpu cortex-a57 -m 512 -nographic -semihosting|-device e1000,netdev=net0,romfile=,rombar=0
+aarch64-ssh|ssh|aarch64/bare/qemu/ssh|/tmp/modus-aarch64-ssh.bin|qemu-system-aarch64|-machine virt -cpu cortex-a57 -m 512 -nographic -semihosting|-device e1000,netdev=net0,romfile=,rombar=0
+aarch64-actors|ssh|aarch64/bare/qemu/actors|/tmp/modus-aarch64-actors.bin|qemu-system-aarch64|-machine virt -cpu cortex-a57 -m 512 -nographic -semihosting|-device e1000,netdev=net0,romfile=,rombar=0
+aarch64-isolated|ssh|aarch64/bare/qemu/isolated|/tmp/modus-aarch64-isolated.bin|qemu-system-aarch64|-machine virt -cpu cortex-a57 -m 512 -nographic -semihosting|-device e1000,netdev=net0,romfile=,rombar=0
 i386-repl|repl|build-i386-repl|/tmp/modus-i386.bin|qemu-system-i386|-m 256 -display none -serial stdio -no-reboot|
-i386-ssh|ssh|build-i386-ssh|/tmp/modus-i386-ssh.bin|qemu-system-i386|-m 256 -nographic -no-reboot|-device ne2k_isa,netdev=net0,iobase=0x300,irq=9
+i386-ssh|ssh|i386/bare/qemu/ssh|/tmp/modus-i386-ssh.bin|qemu-system-i386|-m 256 -nographic -no-reboot|-device ne2k_isa,netdev=net0,iobase=0x300,irq=9
 arm32-repl|repl|build-arm32-repl|/tmp/modus-arm32.bin|qemu-system-arm|-M virt,highmem=off -cpu cortex-a15 -m 256 -nographic|
 arm32-ssh|ssh|build-arm32-ssh|/tmp/modus-arm32-ssh.bin|qemu-system-arm|-M raspi2b -m 1G -nographic|-device usb-net,netdev=net0
 rpi-repl|repl|aarch64/bare/rpi/repl|/tmp/kernel8.img|qemu-system-aarch64|-M raspi3b -m 1G -nographic|

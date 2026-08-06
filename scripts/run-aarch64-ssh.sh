@@ -22,7 +22,7 @@ trap cleanup INT TERM
 
 # Build kernel
 echo "Building AArch64 SSH kernel..."
-sbcl --script mvm/build-aarch64-ssh.lisp
+sbcl --script mvm/build.lisp aarch64/bare/qemu/ssh
 echo "Build complete."
 
 pkill -9 -f 'qemu-system-aarch64.*modus-aarch64-ssh' 2>/dev/null || true

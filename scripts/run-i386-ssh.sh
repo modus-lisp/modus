@@ -21,7 +21,7 @@ trap cleanup INT TERM
 
 # Build kernel
 echo "Building i386 SSH kernel..."
-sbcl --script mvm/build-i386-ssh.lisp
+sbcl --script mvm/build.lisp i386/bare/qemu/ssh
 echo "Build complete."
 
 pkill -9 -f 'qemu-system-i386.*modus-i386-ssh' 2>/dev/null || true

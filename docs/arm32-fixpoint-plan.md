@@ -25,7 +25,7 @@ Validate translator + boot before fixpoint work.
 - Target `:armv7`, install `armv7-translator`
 - Output `/tmp/modus-arm32.bin`
 
-**`scripts/run-arm32-repl.sh`**:
+**`scripts/run-arm32-repl.sh`** (historical — RETIRED; now `./scripts/run.sh arm32-repl`):
 ```bash
 qemu-system-arm -M virt -cpu cortex-a15 -m 256 -nographic \
   -kernel /tmp/modus-arm32.bin

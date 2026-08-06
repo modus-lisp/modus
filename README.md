@@ -96,21 +96,21 @@ All SSH scripts support batch mode — pass an expression as the second argument
 ### x86-64
 
 ```bash
-./scripts/run-x64-repl.sh      # boot to serial REPL
+./scripts/run.sh x64-repl      # boot to serial REPL
 ./scripts/run-x64-ssh.sh       # boot with SSH networking
 ```
 
 ### AArch64 (QEMU virt)
 
 ```bash
-./scripts/run-aarch64-repl.sh  # AArch64 REPL on QEMU virt
+./scripts/run.sh aarch64-repl  # AArch64 REPL on QEMU virt
 ./scripts/run-aarch64-ssh.sh   # AArch64 with SSH networking (E1000, port 2222)
 ```
 
 ### i386 (QEMU)
 
 ```bash
-./scripts/run-i386-repl.sh     # 32-bit x86 REPL on QEMU
+./scripts/run.sh i386-repl     # 32-bit x86 REPL on QEMU
 ./scripts/run-i386-ssh.sh      # i386 SSH over NE2000 NIC (port 2222)
 ```
 
@@ -118,7 +118,7 @@ All SSH scripts support batch mode — pass an expression as the second argument
 
 ```bash
 ./scripts/run-arm32-ssh.sh     # ARM32 SSH over DWC2 USB CDC (port 2222)
-./scripts/run-arm32-repl.sh    # ARM32 serial REPL
+./scripts/run.sh arm32-repl    # ARM32 serial REPL
 ```
 
 ### Raspberry Pi (QEMU raspi3b)

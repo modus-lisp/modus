@@ -5,7 +5,7 @@
 # cl-*.lisp bridge + the unforked net/crypto.lisp, compiled to native i386.
 # It is NOT the legacy mini-Lisp (mvm/build-i386-{repl,ssh,diag-ssh}.lisp run
 # mvm/repl-source.lisp, a separate 708-line toy Lisp with its own reader and
-# evaluator; those have their own scripts/run-i386-repl.sh and -ssh.sh).
+# evaluator; those are ./scripts/run.sh i386-repl and scripts/run-i386-ssh.sh).
 #
 # WHY THIS SCRIPT EXISTS: binfmt_misc is NOT registered for i386 here, so
 # running a 32-bit ELF directly does not fail loudly — it silently fails to

@@ -52,12 +52,30 @@ it wins the entry point; the actor builds put it FIRST).  `actors` and
 ./scripts/run.sh aarch64-ssh    # boot, wait for sshd, smoke test
 ```
 
-`scripts/run.sh` replaces ~14 near-identical `run-<arch>-<payload>.sh`
+`scripts/run.sh` replaces the near-identical `run-<arch>-<payload>.sh`
 launchers.  They were copy-paste siblings that had **drifted**, and the drift
 was the real cost: `run-aarch64-ssh` rebuilt the kernel on *every* invocation
 while `run-x64-ssh` checked staleness; x64/i386 wrapped QEMU in `no-thp-exec`
 to dodge THP-compaction hangs while aarch64/arm32 did not.  Every QEMU flag
 in `run.sh`'s table is transcribed verbatim from the script it replaces.
+
+**24 → 19 `run-*.sh`.**  Five REPL launchers (`run-{x64,x64-console,aarch64,
+i386,arm32}-repl.sh`) are RETIRED — each was demonstrated through `run.sh`
+first (boot to prompt, evaluate, right answer).  The six `*-ssh` launchers and
+the four `run-rpi-*` ones are **kept**: their targets could not be proven, and
+not for launcher reasons — the SSH payload wedges in `dhcp-discover` before
+printing `DHCP:D` (the scripts `run.sh` would replace fail *identically*, and
+the images are byte-identical to the md5s in this file), and the RPi family
+still dies on the `A64-BUFFER` build error.  Evidence: `GATE-RESULT-run-cells.md`.
+
+Proving `run.sh` also turned up three defects in it, now fixed: the ssh
+readiness test was a `/dev/tcp` probe, which QEMU satisfies the instant it
+binds `hostfwd` — so the smoke test always ran before the guest was up and
+still exited 0; the build shelled out to SBCL with the default heap, which
+heap-exhausts on `x64-cl-repl`; and the `x64-cl-repl` row named an image
+(`/tmp/modus-x64-cl.bin`) that build never writes — it writes
+`/tmp/modus-x64-cl-repl.bin`.  **`build.lisp`'s row for that cell still has
+the wrong path**; it is only printed by `--list`, but it should be fixed.
 
 **BUILD status is not RUN status.**  Every row below was *built*; that says
 nothing about whether the image evaluates.  Two verified examples:

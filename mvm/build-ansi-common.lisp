@@ -326,7 +326,20 @@
     (aset v 4 (quote rbx))  (aset v 5 (quote rcx))
     (aset v 6 (quote rdx))  (aset v 7 (quote r10))
     (aset v 8 (quote r11))
-    ;; V9..V15 spill (nil)
+    ;; V9..V15 SPILL to the stack and V22 (VPC) is unmapped, so VREG-PHYS must
+    ;; return NIL for them.  They MUST be written explicitly: make-array
+    ;; zero-inits unwritten slots to FIXNUM 0 (GC safety), NOT to NIL, and 0 is
+    ;; TRUE in CL -- so (vreg-phys 9) yielded 0, DEST-PHYS-OR-SCRATCH's
+    ;; `(or (vreg-phys v) +scratch-reg+)` picked 0 over the scratch register,
+    ;; and reg-info then signalled `Unknown register: 0`.  The JIT's flip-safety
+    ;; guard turned that signal into an interpret fallback, so every form that
+    ;; spills past V8 -- CLOS defclass/defmethod dispatch, nested LOOP -- was
+    ;; silently NEVER run native.  Measured on the CLI: it was the ONLY
+    ;; translator gap the fallback census found (R-TRANSLATE-ERR 3 -> 0).
+    ;; build-modus-selfhost.lisp has carried this fix and its explanation since
+    ;; the self-host work; the JIT co-inits were never brought to parity.
+    (aset v 9 nil)  (aset v 10 nil) (aset v 11 nil) (aset v 12 nil)
+    (aset v 13 nil) (aset v 14 nil) (aset v 15 nil) (aset v 22 nil)
     (aset v 16 (quote rax)) (aset v 17 (quote r12))
     (aset v 18 (quote r14)) (aset v 19 (quote r15))
     (aset v 20 (quote rsp)) (aset v 21 (quote rbp))

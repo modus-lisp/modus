@@ -128,12 +128,33 @@
    crypto on i386 genuinely REQUIRES a collector; the arena only buys the
    small-input cases.
 
-   THE CEILING, stated because i386 HAS NO COLLECTOR (see the note below).
-   Every allocation is permanent, so this offset IS the total lifetime
-   allocation budget of the process — 2032 MiB.  When VA reaches VL the
-   :gc-check calls a collector that does not exist and the process dies on
-   `int $0x31`.  Raised from 496 MiB because SHA-256 over 64 KiB exhausted
-   that; see WS5 notes for the measured input-size ceiling.
+   *** STALE AS OF #202 — READ THIS BEFORE BELIEVING THE PARAGRAPHS BELOW. ***
+   The text from here to the end of this docstring describes the PRE-#202
+   world, in which i386 had no collector at all.  That is no longer true for
+   the HOSTED Linux build:
+
+     translate-i386.lisp:4345
+       (setf *i386-gc-collect-label*
+             (and *i386-gc-enabled* *i386-linux-mode* (i386-make-label)))
+
+   so a hosted i386 image DOES wire a real collector — `build-i386-cli` at
+   layer 5 reports `GC: collector=T bitmap=T`.  BARE-METAL i386 still has
+   none (its global slot block at #x600 is zero, so the collector would run
+   with a null bitmap base and a garbage from-space); it keeps `int $0x31`
+   and stays byte-identical to a pre-collector build.
+
+   Consequence for debugging: on the hosted CLI a crash under sustained
+   allocation is NOT automatically "arena exhausted, no collector to call".
+   That inference is what this stale text invites, and it is wrong for the
+   very build most likely to be under test (see task #218).  VL is at the
+   semispace midpoint here, which is the GC-ON value, not the GC-OFF one.
+
+   THE CEILING, as it applied WITHOUT a collector (bare metal, still true
+   there).  Every allocation is permanent, so this offset IS the total
+   lifetime allocation budget of the process — 2032 MiB.  When VA reaches VL
+   the :gc-check calls a collector that does not exist and the process dies
+   on `int $0x31`.  Raised from 496 MiB because SHA-256 over 64 KiB
+   exhausted that; see WS5 notes for the measured input-size ceiling.
 
    WHY THERE IS NO COLLECTOR, and why wiring the existing Lisp-side
    %GC-COLLECT is NOT a small job on i386.  gc.lisp reads its metadata with

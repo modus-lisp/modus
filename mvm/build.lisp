@@ -774,48 +774,55 @@
      ;; mvm-ssh-fixes.  mvm-ssh-fixes MUST load last (last-defun-wins): it
      ;; carries the variable-index ASET/AREF workarounds and the arena-based
      ;; fe-pow-sqrt/ed-recover-x.
-     :net ("arch-x86.lisp" "e1000.lisp" "ip.lisp" "crypto.lisp" "ssh.lisp"
+     :net ("bare-runtime-stubs.lisp" "arch-x86.lisp" "e1000.lisp" "ip.lisp" "crypto.lisp" "ssh.lisp"
            "aarch64-overrides.lisp" "mvm-ssh-fixes.lisp")
      :parts (:net :repl :main)
+     ;; #219: no CL array runtime in a net/-only image — see
+     ;; *COMPILE-PLAIN-ARRAYS* in compiler.lisp.
+     :flags (("*COMPILE-PLAIN-ARRAYS*" . t))
      :main ,*x64-ssh-main*)
 
     ("aarch64/bare/qemu/ssh"
-     :net ("arch-aarch64.lisp" "e1000.lisp" "ip.lisp" "crypto.lisp"
+     :net ("bare-runtime-stubs.lisp" "arch-aarch64.lisp" "e1000.lisp" "ip.lisp" "crypto.lisp"
            "crypto-fast.lisp" "ssh.lisp" "ssh-profile.lisp"
            "aarch64-overrides.lisp")
      :parts (:net :repl :main)
      ;; GICv2 + virtual timer init for setup-irq
-     :flags (("*AARCH64-SETUP-IRQ-ENABLE*" . t))
+     :flags (("*AARCH64-SETUP-IRQ-ENABLE*" . t)
+             ("*COMPILE-PLAIN-ARRAYS*" . t))
      :main ,*aarch64-ssh-main*)
 
     ;; actors and isolated share ONE kernel-main verbatim; isolated differs
     ;; only by appending isolated-net.lisp (the Qubes-like overrides, LAST).
     ("aarch64/bare/qemu/actors"
-     :net ("arch-aarch64.lisp" "actors.lisp" "e1000.lisp" "ip.lisp"
+     :net ("bare-runtime-stubs.lisp" "arch-aarch64.lisp" "actors.lisp" "e1000.lisp" "ip.lisp"
            "crypto.lisp" "crypto-fast.lisp" "ssh.lisp" "http.lisp"
            "http-client.lisp" "aarch64-overrides.lisp"
            "actors-net-overrides.lisp")
      :parts (:main :net :repl)
-     :flags (("*AARCH64-SCHED-LOCK-ADDR*" . #x41200200))
+     :flags (("*AARCH64-SCHED-LOCK-ADDR*" . #x41200200)
+             ("*COMPILE-PLAIN-ARRAYS*" . t))
      :main ,*aarch64-actor-main*)
 
     ("aarch64/bare/qemu/isolated"
-     :net ("arch-aarch64.lisp" "actors.lisp" "e1000.lisp" "ip.lisp"
+     :net ("bare-runtime-stubs.lisp" "arch-aarch64.lisp" "actors.lisp" "e1000.lisp" "ip.lisp"
            "crypto.lisp" "crypto-fast.lisp" "ssh.lisp" "http.lisp"
            "http-client.lisp" "aarch64-overrides.lisp"
            "actors-net-overrides.lisp" "isolated-net.lisp")
      :parts (:main :net :repl)
-     :flags (("*AARCH64-SCHED-LOCK-ADDR*" . #x41200200))
+     :flags (("*AARCH64-SCHED-LOCK-ADDR*" . #x41200200)
+             ("*COMPILE-PLAIN-ARRAYS*" . t))
      :main ,*aarch64-actor-main*)
 
     ("i386/bare/qemu/ssh"
      ;; crypto-w32 MUST follow crypto + crypto-32: it overrides sha256 /
      ;; sha512 / chacha20 with (hi16 . lo16) pair arithmetic.
-     :net ("arch-i386.lisp" "ne2000.lisp" "ip.lisp" "crypto.lisp"
+     :net ("bare-runtime-stubs.lisp" "arch-i386.lisp" "ne2000.lisp" "ip.lisp" "crypto.lisp"
            "crypto-32.lisp" "crypto-w32.lisp" "ssh.lisp" "http.lisp"
            "aarch64-overrides.lisp" "32bit-overrides.lisp"
            "crypto-32-fast.lisp")
      :parts (:net :repl :main :extra)
+     :flags (("*COMPILE-PLAIN-ARRAYS*" . t))
      :main ,*i386-ssh-main*
      :extra ,*i386-ssh-overrides*)))
 

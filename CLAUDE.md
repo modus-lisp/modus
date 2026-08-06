@@ -60,6 +60,8 @@ net/            Networking, crypto, USB, actor system
   bcm2835-periph.lisp      BCM2835 GPIO, SPI, I2C, PWM
 
 scripts/        Deployment and boot scripts
+  run.sh               ONE entry point for every QEMU run config (`run.sh list`)
+  run-repl-eval.sh     shared helper: boot a REPL image, eval one expr, print
   boot-pizero2w.sh     Build + boot + network + SSH (USB or SD card)
   build-pizero2w.sh    Build kernel + SD card image
   fuse-pizero2w.sh     Program USB boot OTP fuse on Pi Zero 2 W

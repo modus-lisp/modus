@@ -23,6 +23,11 @@ qemu_args() {
         i386)    echo "-kernel $KERNEL -m 256 -display none -serial stdio -no-reboot" ;;
         aarch64) echo "-kernel $KERNEL -nographic -semihosting -machine virt -cpu cortex-a57 -m 512" ;;
         arm32)   echo "-kernel $KERNEL -nographic -M virt,highmem=off -cpu cortex-a15 -m 256" ;;
+        # Transcribed from run-rpi-repl.sh.  NOTE: rpi-hid / rpi-periph need
+        # extra devices (-device usb-kbd, the second serial + GTK display) that
+        # this batch harness has no way to express — they are interactive-device
+        # targets, so run them interactively via run.sh with no expression.
+        rpi)     echo "-kernel $KERNEL -machine raspi3b -display none -serial stdio -semihosting" ;;
         *)       echo "Unknown arch: $ARCH" >&2; exit 1 ;;
     esac
 }
@@ -33,6 +38,7 @@ qemu_bin() {
         i386)    echo "qemu-system-i386" ;;
         aarch64) echo "qemu-system-aarch64" ;;
         arm32)   echo "qemu-system-arm" ;;
+        rpi)     echo "qemu-system-aarch64" ;;
     esac
 }
 

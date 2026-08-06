@@ -8,7 +8,7 @@
 ;;;;   - Serial I/O (always active)
 ;;;;
 ;;;; Boot with QEMU:
-;;;;   ./scripts/run-x64-console-repl.sh
+;;;;   ./scripts/run.sh x64-console-repl
 ;;;;
 ;;;; Boot with GRUB on real hardware (ThinkPad T420 etc.):
 ;;;;   ./scripts/make-grub-usb.sh
@@ -47,4 +47,4 @@
     (format t "Image size: ~D~%" (length (kernel-image-image-bytes image)))
     (write-kernel-image image "/tmp/modus-x64-console.bin")
     (format t "Done. Boot with:~%")
-    (format t "  ./scripts/run-x64-console-repl.sh~%")))
+    (format t "  ./scripts/run.sh x64-console-repl~%")))

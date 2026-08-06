@@ -374,6 +374,140 @@
                             "(defun emit-bytes " "(defun %linux-boot-emit-bytes ")
                   "(emit-bytes " "(%linux-boot-emit-bytes ")))
 
+;;; ============================================================
+;;; #210 RUNG 1: bake the AARCH64 build tooling into the SAME image.
+;;;
+;;; Goal: a HOSTED x64 Modus image that emits a runnable Linux/AArch64 ELF
+;;; from source baked into itself — no SBCL in the loop for the foreign emit.
+;;; This replaces mvm/build-fixpoint.lisp's approach (a single multi-arch
+;;; binary selected by an *override-fns* runtime dispatch, which broke when
+;;; the image outgrew its layout) with the expected shape: boot a Modus
+;;; image → compile the foreign architecture's translator from embedded
+;;; source → emit a foreign image.
+;;;
+;;; Why x64 → aarch64 and not x64 → i386: +FRAME-SLOT-BASE+ is -96 in
+;;; translate-x64.lisp and -68 in translate-i386.lisp and BOTH are bare-named,
+;;; so an i386+x64 co-bake collides under the flat image namespace.  The
+;;; AArch64 translator prefixes its own (+A64-FRAME-SLOT-BASE+), and a
+;;; name-by-name comparison of every toplevel DEFUN/DEFMACRO/DEFSTRUCT in
+;;; translate-aarch64.lisp against translate-x64.lisp, x64-asm.lisp,
+;;; boot-linux-x64.lisp and the rest of the baked image finds ZERO
+;;; collisions — the x64 translator uses TRANSLATE-INSTRUCTION /
+;;; TRANSLATE-FUNCTION where the aarch64 one uses TRANSLATE-MVM-INSN /
+;;; TRANSLATE-MVM-FUNCTION.  So the co-bake needs no renaming at all.
+;;; ============================================================
+
+;;; --- MVM-bytecode → AArch64 translator (modus.mvm) ---
+(defvar *translate-aa64-source* (mvm-text "mvm/translate-aarch64.lisp"))
+;; Same code-buffer GC-corruption class as the x64/mvm-buffer shrinks above:
+;; a64-buffer's `code` slot defaults to 16M TAGGED slots (= 128 MB in-image,
+;; not 64 MB — these are boxed words, not a u8 vector) and A64-EMIT DOUBLES
+;; it on overflow, and each grow's replace-across-GC can move the buffer out
+;; from under a stale local.  Rung 1 emits a trivial program (a few hundred
+;; instructions), so 1M entries is a single up-front alloc that NEVER grows.
+(let ((needle "(code (make-array 16777216))")
+      (repl   "(code (make-array 1048576))"))
+  (let ((p (search needle *translate-aa64-source*)))
+    (unless p
+      (error "#210: could not find a64-buffer 16M code-array default to shrink"))
+    (setf *translate-aa64-source*
+          (concatenate 'string
+                       (subseq *translate-aa64-source* 0 p) repl
+                       (subseq *translate-aa64-source* (+ p (length needle)))))))
+;; Truncate at install-aarch64-translator, exactly as the x64 bake does: it
+;; mutates *TARGET-AARCH64*, whose DEFPARAMETER init-thunk does NOT run at
+;; boot (CLAUDE.md limitation #7), so in-image it would (setf (target-... NIL)).
+;; The target-slot wiring is reconstructed in *selfhost-target-coinit-source*.
+;; Only the three a64-disassemble/count/size diagnostics follow it in the file.
+(let ((marker "(defun install-aarch64-translator"))
+  (let ((pos (search marker *translate-aa64-source*)))
+    (unless pos
+      (error "#210: could not find install-aarch64-translator strip marker"))
+    (setf *translate-aa64-source*
+          ;; #211: re-append the package reset the trim just cut off.
+          (concatenate 'string (subseq *translate-aa64-source* 0 pos)
+                       modus.mvm::*build-package-reset-text*))))
+
+;;; --- The 4-function AArch64 encoder closure the Linux boot entry needs ---
+;; EMIT-LINUX-AARCH64-ENTRY calls EMIT-AARCH64-U32 and EMIT-AARCH64-LOAD-IMM64,
+;; which live in boot/boot-aarch64.lisp — a BARE-METAL boot file (MMU page
+;; tables, fixpoint re-entry guard, PSCI/GIC setup) that has no business in a
+;; hosted Linux image.  The transitive closure is exactly four tiny pure
+;; encoders: u32 → a64-emit, load-imm64 → movz + movk.  Extract them BY NAME
+;; from the real file (paren-balanced) rather than hand-copying, so an encoding
+;; change upstream cannot silently desync this bake.
+(defun %extract-toplevel-defuns (text names)
+  "Return the concatenated source of the toplevel (defun NAME …) forms in TEXT
+   whose names are in NAMES, in NAMES order.  Errors if any is missing."
+  (let ((out ""))
+    (dolist (name names out)
+      (let* ((needle (concatenate 'string "(defun " name " "))
+             (start (search needle text)))
+        (unless start
+          (error "#210: could not extract ~A from boot-aarch64.lisp" name))
+        (let ((depth 0) (i start) (end nil) (len (length text)) (in-str nil))
+          (loop while (< i len) do
+            (let ((ch (char text i)))
+              (cond ((and in-str (char= ch #\\)) (incf i))   ; skip escaped char
+                    ((char= ch #\") (setf in-str (not in-str)))
+                    (in-str)
+                    ((char= ch #\;)                            ; line comment
+                     (loop while (and (< i len) (char/= (char text i) #\Newline))
+                           do (incf i)))
+                    ((char= ch #\() (incf depth))
+                    ((char= ch #\)) (decf depth)
+                     (when (zerop depth) (setf end (1+ i)) (return)))))
+            (incf i))
+          (unless end (error "#210: unbalanced defun ~A" name))
+          (setf out (concatenate 'string out (subseq text start end)
+                                 (string #\Newline) (string #\Newline))))))))
+
+(defvar *aa64-boot-encoder-source*
+  (let ((text (let ((p (merge-pathnames "boot/boot-aarch64.lisp" *modus-base*)))
+                (modus.mvm::check-parses p)
+                (read-file-text p))))
+    (modus.mvm::%build-package-scoped-source
+     (concatenate 'string
+                  ";;; #210: extracted from boot/boot-aarch64.lisp (see build script)."
+                  (string #\Newline)
+                  (%extract-toplevel-defuns
+                   text '("emit-aarch64-u32" "emit-aarch64-movz"
+                          "emit-aarch64-movk" "emit-aarch64-load-imm64"))))))
+
+;;; --- linux-aarch64 boot descriptor + ELF64-LE(EM_AARCH64) wrapper ---
+;; get-boot-descriptor(:linux-aarch64) → linux-aarch64-boot-descriptor, which
+;; names emit-linux-aarch64-entry + +linux-aarch64-load-addr+;
+;; wrap-in-elf64-le-aa64 is called by assemble-kernel-image for that elf-format.
+;; No name collides with boot-linux-x64.lisp EXCEPT %SANITIZE-SYMBOL-NAME, and
+;; this file only defines that one under an (unless (fboundp …)) guard — a
+;; toplevel conditional wrapping a DEFUN, which is precisely the IR-drop bug
+;; class (nested defun compiles but its IR is dropped; the name links to a
+;; zero-length stub).  boot-linux-x64.lisp is baked BEFORE this and defines
+;; %SANITIZE-SYMBOL-NAME unconditionally, so strip the guarded copy entirely.
+;; NOTE: unlike boot-linux-x64.lisp this file has no EMIT-BYTES of its own
+;; (it emits through emit-aarch64-u32 / mvm-emit-*), so no rename is needed.
+(defvar *boot-linux-aa64-desc-source* (mvm-text "boot/boot-linux-aarch64.lisp"))
+(let ((start (search "(unless (fboundp '%sanitize-symbol-name)"
+                     *boot-linux-aa64-desc-source*)))
+  (unless start
+    (error "#210: could not find the %sanitize-symbol-name fboundp guard"))
+  (let ((depth 0) (i start) (end nil)
+        (len (length *boot-linux-aa64-desc-source*)) (in-str nil))
+    (loop while (< i len) do
+      (let ((ch (char *boot-linux-aa64-desc-source* i)))
+        (cond ((and in-str (char= ch #\\)) (incf i))
+              ((char= ch #\") (setf in-str (not in-str)))
+              (in-str)
+              ((char= ch #\() (incf depth))
+              ((char= ch #\)) (decf depth)
+               (when (zerop depth) (setf end (1+ i)) (return)))))
+      (incf i))
+    (unless end (error "#210: unbalanced fboundp guard block"))
+    (setf *boot-linux-aa64-desc-source*
+          (concatenate 'string
+                       (subseq *boot-linux-aa64-desc-source* 0 start)
+                       (subseq *boot-linux-aa64-desc-source* end)))))
+
 ;; The whole self-host tooling block, spliced into *full-source* after mvm-eval.
 ;; Order (from the task): x64-asm → translate-x64 → translator-coinit → target
 ;; → cross → boot-desc.  The target/translator target-slot coinit
@@ -418,9 +552,18 @@
     *x64-asm-source*                (string #\Newline)
     *translate-x64-source*          (string #\Newline)
     *x64-translator-coinit-source*  (string #\Newline)
+    ;; #210 rung 1: the aarch64 translator + its co-init go here, BEFORE
+    ;; target/cross/boot-desc, for the same reason the x64 pair does — the
+    ;; translator uses modus.mvm compiler symbols and must precede the
+    ;; sft-auto scan that registers translate-mvm-to-aarch64 et al.  The
+    ;; boot-encoder shim must follow the translator (emit-aarch64-u32 calls
+    ;; a64-emit) and precede the boot descriptor that calls it.
+    *translate-aa64-source*         (string #\Newline)
+    *aa64-boot-encoder-source*      (string #\Newline)
     *target-source*                 (string #\Newline)
     *cross-source*                  (string #\Newline)
     *boot-linux-desc-source*        (string #\Newline)
+    *boot-linux-aa64-desc-source*   (string #\Newline)
     *selfhost-target-coinit-source* (string #\Newline)))
 
 (defvar *stage2-test-source* "

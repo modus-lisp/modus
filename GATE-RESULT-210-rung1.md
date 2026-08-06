@@ -292,6 +292,13 @@ The image itself also still boots normally (`./modus --version` ->
 
 ## Caveat on scope
 
-Only the final tree was build-verified end to end. The commits are staged by
-concern for review; intermediate commits were not individually built (each
-`build-modus-selfhost` run is ~13 min).
+The branch HEAD was rebuilt from scratch and re-verified; the emitted AArch64
+ELF is **byte-identical** to the earlier run (10473 bytes), still prints
+`MODUS XARCH RUNG1 OK` and exits 42, and the x64 `--compile` output is still
+byte-identical to BASE. So the deliverable reproduces from the committed tree.
+
+The five commits are staged by recipe stage for review. Intermediate commits
+were **not** individually built (each `build-modus-selfhost` run is ~13 min);
+they were checked only for structural soundness (whole-file paren balance and
+balance of every generated source string). Treat stages 1-4 as a reviewable
+decomposition of the verified endpoint, not as independently gated states.

@@ -1077,6 +1077,20 @@
                         (ash rn 5)
                         rd)))
 
+(defun a64-msub (buf rd rn rm ra)
+  "MSUB Xd, Xn, Xm, Xa  →  Xd = Xa - Xn*Xm  (MADD with o0=1).
+   Encoding: 1|00|11011|000|Rm|1|Ra|Rn|Rd.
+   All three sources are read before Rd is written, so this is safe even
+   when Rd aliases Ra — which is what makes it the right instruction for
+   +op-mod+'s remainder (see the clobber note there)."
+  (a64-emit buf (logior (ash 1 31)            ; sf=1
+                        (ash #b0011011000 21)
+                        (ash rm 16)
+                        (ash 1 15)            ; o0=1 (MSUB)
+                        (ash ra 10)           ; Ra = minuend
+                        (ash rn 5)
+                        rd)))
+
 (defun a64-umulh (buf rd rn rm)
   "UMULH Xd, Xn, Xm — high 64 bits of unsigned Xn*Xm.
    Encoding: 1|00|11011|1|10|Rm|0|Ra(=11111)|Rn|Rd"
@@ -2966,18 +2980,42 @@
                (store-dst pd vd))))
 
           ;; ---- MOD Vd, Va, Vb ----
-          ;; Vd = Va - (Va/Vb)*Vb  (tagged)
+          ;; Vd = Va - (Va/Vb)*Vb  (tagged); the TRUNCATE remainder, i.e. the
+          ;; aarch64 stand-in for x64's IDIV→RDX.  Both operands are tagged
+          ;; (2A, 2B), so SDIV yields the untagged quotient Q and 2A - Q*2B =
+          ;; 2(A - QB) is the correctly tagged remainder.
+          ;;
+          ;; The quotient MUST NOT be computed into x16.  `ensure-src` returns
+          ;; the SCRATCH register x16 whenever Va is a spilled vreg (V9-V15),
+          ;; so `pa` IS x16 at those sites, and the old sequence
+          ;;     SDIV x16, pa, pb  /  MUL x16, x16, pb  /  SUB pd, pa, x16
+          ;; overwrote its own dividend: by the SUB, `pa` and x16 named the
+          ;; same register, making it `SUB pd, x16, x16` — a hard ZERO for
+          ;; every such site, whatever the operands.  That is task #220's
+          ;; `(mod 1 64)` => 0.  It is remainder-only (the quotient path
+          ;; +op-div+ reads pa and writes x16 in ONE instruction, so it was
+          ;; always correct) and it is codegen-only — the MVM interpreter and
+          ;; the x64 translator were never affected.  Measured incidence on
+          ;; the aarch64 CLI image: 9 sites, including %LEAP-YEAR-P (making
+          ;; EVERY year a leap year), %FMT-INTEGER, EXACT-DIVIDE,
+          ;; %GF-CHECK-KEYS, %CLOS-VALIDATE-INITARGS and two functions of the
+          ;; self-hosted compiler itself.
+          ;;
+          ;; Fix: compute the quotient into x9 — a caller-saved temp that is
+          ;; never in *a64-vreg-to-phys* and is never an `ensure-src` scratch,
+          ;; so it can alias neither pa nor pb (+op-mul-checked+ already uses
+          ;; x9/x10/x11 the same way) — then fold the multiply-subtract into
+          ;; MSUB, which reads pa, pb and x9 before writing pd.  Correct for
+          ;; every operand/dest combination, including pd == pa == x16.
           ((= op +op-mod+)
            (let* ((vd (vr 0))
                   (pa (ensure-src (vr 1) +a64-x16+))
                   (pb (ensure-src (vr 2) +a64-x17+))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
-             ;; SDIV x16, Va, Vb
-             (a64-sdiv buf +a64-x16+ pa pb)
-             ;; MUL x16, x16, Vb  (quotient * divisor)
-             (a64-mul buf +a64-x16+ +a64-x16+ pb)
-             ;; SUB Vd, Va, x16  (remainder = dividend - q*divisor)
-             (a64-sub-reg buf pd pa +a64-x16+ 0 0)
+             ;; SDIV x9, Va, Vb          (x9 = untagged quotient)
+             (a64-sdiv buf +a64-x9+ pa pb)
+             ;; MSUB Vd, x9, Vb, Va      (Vd = Va - x9*Vb)
+             (a64-msub buf pd +a64-x9+ pb pa)
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 

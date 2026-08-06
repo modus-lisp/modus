@@ -459,7 +459,13 @@
   (let ((pos (a64-buffer-position buf))
         (code (a64-buffer-code buf)))
     (when (>= pos (length code))
+      ;; STALE-LOCAL HAZARD (in-image only): (make-array ...) can collect, and a
+      ;; copying GC MOVES the old code array -- but CODE still points into
+      ;; from-space, so (replace new code) would copy abandoned memory and every
+      ;; instruction emitted so far would be silently lost.  Re-read the slot
+      ;; AFTER the allocation.  Harmless under SBCL (precise GC fixes locals up).
       (let ((new (make-array (* 2 (length code)))))
+        (setq code (a64-buffer-code buf))
         (replace new code)
         (setf (a64-buffer-code buf) new)
         (setf code new)))
@@ -657,10 +663,19 @@
                                (ash (logand offset #x7FFFF) 5))))))))))))
 
 (defun a64-buffer-to-bytes (buf)
-  "Convert the instruction buffer to a byte vector (little-endian)."
-  (let* ((code (a64-buffer-code buf))
-         (n (a64-buffer-position buf))
-         (bytes (make-array (* n 4))))
+  "Convert the instruction buffer to a byte vector (little-endian).
+
+   ORDER IS LOAD-BEARING: (make-array (* n 4)) must be evaluated BEFORE the
+   CODE slot is read, not after.  Binding CODE first and then allocating is a
+   stale-local-across-GC hazard -- harmless under SBCL (precise GC updates the
+   local) but corrupting in-image, where the collector MOVES the code array and
+   this local keeps pointing into from-space.  The loop below would then read
+   whatever has since been allocated over the abandoned copy.  After the
+   allocation the loop is allocation-free (fixnum logand/ash + aref), so one
+   re-ordering closes the window.  Found while landing #210 rung 1."
+  (let* ((n (a64-buffer-position buf))
+         (bytes (make-array (* n 4)))
+         (code (a64-buffer-code buf)))
     (dotimes (i n bytes)
       (let ((w (aref code i))
             (base (* i 4)))

@@ -12,9 +12,9 @@ cd "$(dirname "$0")/.."
 
 BIN=/tmp/modus-aarch64.bin
 
-if [ ! -f "$BIN" ] || [ mvm/build-aarch64-repl.lisp -nt "$BIN" ]; then
+if [ ! -f "$BIN" ] || [ mvm/build.lisp -nt "$BIN" ]; then
     echo "Building AArch64 REPL image..." >&2
-    sbcl --script mvm/build-aarch64-repl.lisp >&2
+    sbcl --script mvm/build.lisp aarch64/bare/qemu/repl >&2
 fi
 
 if [ -n "$1" ]; then

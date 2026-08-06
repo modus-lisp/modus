@@ -32,11 +32,11 @@ SCRIPTDIR="$(cd "$(dirname "$0")" && pwd)"
 # Machine flags are transcribed VERBATIM from the script each row replaces.
 # ---------------------------------------------------------------------------
 read -r -d '' TARGETS <<'EOF' || true
-x64-repl|repl|build-x64-repl|/tmp/modus-x64.bin|qemu-system-x86_64|-m 512 -nographic -no-reboot|
+x64-repl|repl|x64/bare/qemu/repl|/tmp/modus-x64.bin|qemu-system-x86_64|-m 512 -nographic -no-reboot|
 x64-console-repl|repl|build-x64-console-repl|/tmp/modus-x64-console.bin|qemu-system-x86_64|-m 512 -nographic -no-reboot|
 x64-cl-repl|repl|build-x64-cl-repl|/tmp/modus-x64-cl.bin|qemu-system-x86_64|-m 512 -nographic -no-reboot|
 x64-ssh|ssh|build-x64-ssh|/tmp/modus-x64-ssh.bin|qemu-system-x86_64|-m 512 -nographic -no-reboot|-device e1000,netdev=net0,romfile=,rombar=0
-aarch64-repl|repl|build-aarch64-repl|/tmp/modus-aarch64.bin|qemu-system-aarch64|-machine virt -cpu cortex-a57 -m 512 -nographic -semihosting|
+aarch64-repl|repl|aarch64/bare/qemu/repl|/tmp/modus-aarch64.bin|qemu-system-aarch64|-machine virt -cpu cortex-a57 -m 512 -nographic -semihosting|
 aarch64-ssh|ssh|build-aarch64-ssh|/tmp/modus-aarch64-ssh.bin|qemu-system-aarch64|-machine virt -cpu cortex-a57 -m 512 -nographic -semihosting|-device e1000,netdev=net0,romfile=,rombar=0
 aarch64-actors|ssh|build-aarch64-actors|/tmp/modus-aarch64-actors.bin|qemu-system-aarch64|-machine virt -cpu cortex-a57 -m 512 -nographic -semihosting|-device e1000,netdev=net0,romfile=,rombar=0
 aarch64-isolated|ssh|build-aarch64-isolated|/tmp/modus-aarch64-isolated.bin|qemu-system-aarch64|-machine virt -cpu cortex-a57 -m 512 -nographic -semihosting|-device e1000,netdev=net0,romfile=,rombar=0
@@ -44,7 +44,7 @@ i386-repl|repl|build-i386-repl|/tmp/modus-i386.bin|qemu-system-i386|-m 256 -disp
 i386-ssh|ssh|build-i386-ssh|/tmp/modus-i386-ssh.bin|qemu-system-i386|-m 256 -nographic -no-reboot|-device ne2k_isa,netdev=net0,iobase=0x300,irq=9
 arm32-repl|repl|build-arm32-repl|/tmp/modus-arm32.bin|qemu-system-arm|-M virt,highmem=off -cpu cortex-a15 -m 256 -nographic|
 arm32-ssh|ssh|build-arm32-ssh|/tmp/modus-arm32-ssh.bin|qemu-system-arm|-M raspi2b -m 1G -nographic|-device usb-net,netdev=net0
-rpi-repl|repl|build-rpi-repl|/tmp/kernel8.img|qemu-system-aarch64|-M raspi3b -m 1G -nographic|
+rpi-repl|repl|aarch64/bare/rpi/repl|/tmp/kernel8.img|qemu-system-aarch64|-M raspi3b -m 1G -nographic|
 rpi-ssh|ssh|build-rpi-ssh|/tmp/kernel8-ssh.img|qemu-system-aarch64|-M raspi3b -m 1G -nographic|
 rpi-hid|repl|build-rpi-hid|/tmp/kernel8-hid.img|qemu-system-aarch64|-M raspi3b -m 1G -nographic|
 rpi-periph|repl|build-rpi-periph|/tmp/kernel8.img|qemu-system-aarch64|-M raspi3b -m 1G -nographic|
@@ -109,9 +109,15 @@ esac
 
 # --- build if the image is missing or the build script is newer -------------
 # (Taken from run-x64-*.sh.  The aarch64/arm32 scripts rebuilt every time.)
-if [ ! -f "$BIN" ] || [ "mvm/$BUILD.lisp" -nt "$BIN" ]; then
+# Build through mvm/build.lisp, which OWNS the matrix — never by naming a
+# build-*.lisp here.  Two reasons: (a) it keeps one table instead of two that
+# can drift, which is the exact failure this script was written to end; and
+# (b) a cell whose script has been RETIRED (its build is now native to
+# build.lisp) has no build-*.lisp left to name.  The BUILD column is a
+# build.lisp CELL KEY, not a filename.
+if [ ! -f "$BIN" ] || [ mvm/build.lisp -nt "$BIN" ]; then
   echo "run.sh: building $TARGET ($BUILD)..." >&2
-  sbcl --script "mvm/$BUILD.lisp" >&2
+  sbcl --script mvm/build.lisp "$BUILD" >&2
 fi
 
 # --- THP wrapper: QEMU can hang in khugepaged compaction on this box --------

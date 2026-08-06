@@ -10,7 +10,7 @@ set -e
 cd "$(dirname "$0")/.."
 
 echo "Building RPi REPL image..."
-sbcl --script mvm/build-rpi-repl.lisp
+sbcl --script mvm/build.lisp aarch64/bare/rpi/repl
 echo "Build OK"
 
 exec qemu-system-aarch64 \

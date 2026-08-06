@@ -82,9 +82,9 @@ concurrently). `BUILD` is that result — not a guess from file dates.
 |---|---|---|---|
 | `build-x64` | x64 | multiboot QEMU — **bare ANSI gate** | OK |
 | `build-x64-cl-repl` | x64 | multiboot QEMU — **bare metal running the REAL CL** (#204); boots, evaluates, one known gap (global var READ — see its header) | OK |
-| `build-x64-repl` / `-ssh` / `-console-repl` | x64 | multiboot QEMU (second Lisp) | OK |
+| `x64/bare/qemu/repl` **(script RETIRED)** / `build-x64-ssh` / `-console-repl` | x64 | multiboot QEMU (second Lisp) | OK |
 | `build-aarch64` | aarch64 | QEMU virt — **bare ANSI gate** | OK |
-| `build-aarch64-repl` / `-ssh` / `-actors` / `-isolated` | aarch64 | QEMU virt (E1000) | OK |
+| `aarch64/bare/qemu/repl` **(script RETIRED)** / `build-aarch64-ssh` / `-actors` / `-isolated` | aarch64 | QEMU virt (E1000) | OK |
 | `build-i386-repl` / `-ssh` / `-diag-ssh` | i386 | QEMU + T420 | OK |
 | `build-arm32-repl` / `-ssh` | arm32 | QEMU | OK |
 
@@ -93,7 +93,7 @@ concurrently). `BUILD` is that result — not a guess from file dates.
 | script | arch | board | BUILD |
 |---|---|---|---|
 | `build-uefi-repl` | x64 | **T420** (PE32+ EFI app, GOP + PS/2) | OK |
-| `build-rpi-repl` / `-ssh` / `-hid` / `-periph` | aarch64 | RPi 3B (DWC2 USB) | **BROKEN** |
+| `aarch64/bare/rpi/repl` **(script RETIRED)** / `build-rpi-ssh` / `-hid` / `-periph` | aarch64 | RPi 3B (DWC2 USB) | **BROKEN** |
 | `build-pizero2w-ssh` / `-actors` / `-hdmi` | aarch64 | **Pi Zero 2 W** (USB gadget) | **BROKEN** |
 | `build-uart-bootloader` | aarch64 | Pi UART bootloader | **BROKEN** |
 

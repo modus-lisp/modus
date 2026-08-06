@@ -46,7 +46,12 @@
 ;;;   target     the BUILD-IMAGE :target keyword
 ;;;   translator :x64 | :aarch64 | :i386  (which install-*-translator to call)
 ;;;   output     image path
-;;;   legacy     the build-*.lisp this cell came from / delegates to
+;;;   legacy     for a :LEGACY cell, the build-*.lisp it delegates to.
+;;;              for a :NATIVE cell whose script has been RETIRED, the old
+;;;              filename is kept as a RESOLVABLE ALIAS (find-row matches it)
+;;;              so muscle memory and old docs keep working — but there is no
+;;;              such file on disk any more.  Retired so far:
+;;;              build-x64-repl, build-aarch64-repl, build-rpi-repl.
 ;;; ------------------------------------------------------------------
 (defparameter *matrix*
   '(;; ---------------- hosted (Linux ELF) ----------------
@@ -161,6 +166,15 @@
       ;; accept a legacy script name too, so muscle memory keeps working
       (find key *matrix* :key #'row-legacy :test #'string-equal)))
 
+(defun find-outside (key)
+  "An *OUTSIDE-MATRIX* entry, by its key or by its build-*.lisp name.
+   These are reachable from here so that EVERY build in the tree has one
+   entry point, even the ones outside the x64/aarch64/i386 matrix — a
+   caller (scripts/run.sh) should never have to know which table a build
+   lives in."
+  (or (find key *outside-matrix* :key #'first  :test #'string-equal)
+      (find key *outside-matrix* :key #'second :test #'string-equal)))
+
 ;;; Per-cell environment.  A legacy script may need env vars to build the
 ;;; REAL image rather than a bring-up rung — see the i386 entry, where the
 ;;; script's own default is MODUS_I386_LAYER=1 (prelude only, no CL bridge
@@ -229,9 +243,17 @@
      (let* ((key (first args))
             (row (find-row key)))
        (cond
-         ((null row)
+         (row
+          (if (eq (row-status row) :native)
+              (build-cell row)
+              (run-legacy (row-legacy row) (row-key row))))
+         ;; Outside the arch matrix (arm32, fixpoint, console-repl, …) but
+         ;; still reachable from the one entry point.
+         ((find-outside key)
+          (let ((e (find-outside key)))
+            (format t "~&build.lisp: ~A — ~A~%" (first e) (third e))
+            (run-legacy (second e))))
+         (t
           (format *error-output* "build.lisp: unknown cell '~A'~%~%" key)
           (print-matrix)
-          (sb-ext:exit :code 2))
-         ((eq (row-status row) :native) (build-cell row))
-         (t (run-legacy (row-legacy row) (row-key row))))))))
+          (sb-ext:exit :code 2)))))))

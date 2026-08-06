@@ -272,7 +272,7 @@ sbcl --script mvm/build-aarch64-actors.lisp
 # Isolated actors (Qubes-like, net-domain owns hardware)
 sbcl --script mvm/build-aarch64-isolated.lisp
 # REPL only (serial)
-sbcl --script mvm/build-aarch64-repl.lisp
+sbcl --script mvm/build.lisp aarch64/bare/qemu/repl
 ```
 
 QEMU launch (actors example):
@@ -287,7 +287,7 @@ qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 512 \
 ```bash
 sbcl --script mvm/build-rpi-ssh.lisp      # SSH
 sbcl --script mvm/build-rpi-hid.lisp      # USB keyboard REPL
-sbcl --script mvm/build-rpi-repl.lisp     # Serial REPL
+sbcl --script mvm/build.lisp aarch64/bare/rpi/repl   # Serial REPL
 sbcl --script mvm/build-rpi-periph.lisp   # GPIO/SPI/I2C peripherals
 ```
 

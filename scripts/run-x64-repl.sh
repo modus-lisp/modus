@@ -12,9 +12,9 @@ cd "$(dirname "$0")/.."
 
 BIN=/tmp/modus-x64.bin
 
-if [ ! -f "$BIN" ] || [ mvm/build-x64-repl.lisp -nt "$BIN" ]; then
+if [ ! -f "$BIN" ] || [ mvm/build.lisp -nt "$BIN" ]; then
     echo "Building x64 REPL..." >&2
-    sbcl --script mvm/build-x64-repl.lisp >&2
+    sbcl --script mvm/build.lisp x64/bare/qemu/repl >&2
 fi
 
 if [ -n "$1" ]; then

@@ -148,6 +148,93 @@
 (defvar *jit-fallback-count* 0
   "WS5 diag: number of mvm-eval forms that FELL BACK to mvm-interpret.")
 
+;;; ------------------------------------------------------------------
+;;; JIT FALLBACK CENSUS (WS4 differential coverage)
+;;; ------------------------------------------------------------------
+;;; *jit-fallback-count* answers "how often", never "why".  Every fallback in
+;;; the seam now ALSO bumps exactly one reason counter below, so native% can be
+;;; decomposed into a ranked list of blockers — the roadmap to JIT-only.
+;;;
+;;; The reasons are mutually exclusive and together they sum to
+;;; *jit-fallback-count* (modulo the double-counting the pre-existing
+;;; %jit-translate-page guard does: it bumps *jit-fallback-count* itself AND
+;;; the caller's je=NIL branch bumps it again; R-TRANSLATE-ERR records the
+;;; guard hit, R-PAGE-NIL the je=NIL branch, so the census reports both and the
+;;; report subtracts).
+;;;
+;;;   R-TRANSLATE-ERR   translate-mvm-to-<arch> SIGNALLED — a translator gap.
+;;;                     *jit-translate-err-count* (pre-existing) is this.
+;;;   R-RELOC-CALL-UNRESOLVED   an out-of-module CALL names a function that
+;;;                     %mvm-resolve-runtime-fn cannot find at all.
+;;;   R-RELOC-CALL-NONNATIVE    the callee resolved but is a HEAP closure
+;;;                     (tag 9, a runtime DEFUN) — no PROT_EXEC, so the
+;;;                     #206 guard refuses the patch.  THE structural blocker
+;;;                     for JIT-only: it fires for any form calling code that
+;;;                     was itself defined at runtime.
+;;;   R-RELOC-FNADDR-FAIL       a #'NAME value load could not be resolved.
+;;;   R-MMAP-FAIL       %mmap-exec-page returned a non-address.
+;;;   R-MV              the form produced MULTIPLE VALUES; native stamps real
+;;;                     BSS MV state the interpreter's simulated *mvm-last-mv*
+;;;                     cannot represent, so the form is re-interpreted.
+;;;                     (*jit-mv-fallback-count*, pre-existing.)
+;;;   R-NATIVE-ESCAPE   native code RAN and escaped with a non-condition
+;;;                     (the unresolved-runtime-function sentinel).  This is
+;;;                     the one reason that DOUBLE-EXECUTES side effects.
+;;;   R-PAGE-NIL        the page build returned NIL (the union of the RELOC/
+;;;                     MMAP reasons above, counted at the seam).
+(defvar *jit-r-reloc-call-unresolved* nil)
+(defvar *jit-r-reloc-call-nonnative* nil)
+(defvar *jit-r-reloc-fnaddr-fail* nil)
+(defvar *jit-r-mmap-fail* nil)
+(defvar *jit-r-page-nil* nil)
+(defvar *jit-r-native-escape* nil)
+
+(defvar *jit-census-on* nil
+  "When T the census ALSO records the NAMES/messages behind each blocked
+   relocation and translator gap (bounded lists below), not just the tallies.
+   Off by default so a production JIT run pays only fixnum increments.")
+
+(defvar *jit-blocked-callees* nil
+  "Census detail: bounded alist (NAME . COUNT) of out-of-module CALL targets
+   that failed relocation.  Ranked, this IS the JIT-only roadmap.")
+(defvar *jit-blocked-fnaddrs* nil
+  "Census detail: bounded alist (NAME . COUNT) for failed #'NAME relocations.")
+(defvar *jit-translate-err-msgs* nil
+  "Census detail: bounded alist (MESSAGE . COUNT) of translator-gap errors.")
+
+(defun %jit-census-note (name place)
+  "Bump NAME's count in the bounded alist held in the census PLACE list, and
+   return the (possibly extended) list.  Callers setq the special from this."
+  (let ((l place) (hit nil))
+    (loop
+      (when (null l) (return nil))
+      (when (and (stringp (car (car l))) (stringp name)
+                 (string= (car (car l)) name))
+        (setq hit (car l))
+        (return nil))
+      (setq l (cdr l)))
+    (cond (hit (rplacd hit (+ 1 (cdr hit))) place)
+          ((>= (length place) 96) place)          ; bounded — never unbounded growth
+          (t (cons (cons name 1) place)))))
+
+(defun %jit-err-tag (c)
+  "A short, groupable STRING for condition C — its simple-condition format
+   control when it has one, else a generic marker.  Never signals."
+  (handler-case
+      (let ((fc (simple-condition-format-control c))
+            (fa (handler-case (simple-condition-format-arguments c)
+                  (t (c3) nil))))
+        ;; The translator's own errors are all raised as
+        ;;   (error "~A (fn ~D '~A' mvm-pos ~D opcode ~D operands ~S)" msg ...)
+        ;; so the CONTROL string is the same for every gap and the first
+        ;; ARGUMENT is the actual message.  Group on control+first-arg.
+        (if (stringp fc)
+            (if (and (consp fa) (stringp (car fa)))
+                (concatenate 'string (car fa) " | " fc)
+                fc)
+            "<condition-no-string-control>"))
+    (t (c2) "<condition-unreportable>")))
+
 (defvar *jit-page-cache* nil
   "WS4-S5b per-module JIT cache.  EQ hash keyed by the compiled BC byte-array
    identity → a jit-entry list (base eoff cpatches gc-stamp).  A repeated mvm-eval
@@ -338,7 +425,24 @@
              (raw (if nativep (- word 3) 0)))
         (if (> raw 0)
             (%jit-write-imm64 base (car r) raw)
-            (setq ok nil))))
+            (progn
+              ;; CENSUS: distinguish "no such runtime function" from "resolved
+              ;; but it is a heap closure" — the latter is the #206 guard and
+              ;; the dominant structural blocker for JIT-only.
+              (if fn
+                  (setq *jit-r-reloc-call-nonnative*
+                        (if *jit-r-reloc-call-nonnative*
+                            (+ 1 *jit-r-reloc-call-nonnative*) 1))
+                  (setq *jit-r-reloc-call-unresolved*
+                        (if *jit-r-reloc-call-unresolved*
+                            (+ 1 *jit-r-reloc-call-unresolved*) 1)))
+              (when (and *jit-census-on* name)
+                (setq *jit-blocked-callees*
+                      (%jit-census-note
+                        (if fn (concatenate 'string name " [heap-closure]")
+                            (concatenate 'string name " [unresolved]"))
+                        *jit-blocked-callees*)))
+              (setq ok nil)))))
     ok))
 
 (defun %jit-reloc-fn-addrs (base relocs rt-table)
@@ -357,7 +461,14 @@
              (word (if fn (%val->word fn) 0)))
         (if (> word 0)
             (%jit-write-imm64 base (car r) word)
-            (setq ok nil))))
+            (progn
+              (setq *jit-r-reloc-fnaddr-fail*
+                    (if *jit-r-reloc-fnaddr-fail*
+                        (+ 1 *jit-r-reloc-fnaddr-fail*) 1))
+              (when (and *jit-census-on* name)
+                (setq *jit-blocked-fnaddrs*
+                      (%jit-census-note name *jit-blocked-fnaddrs*)))
+              (setq ok nil)))))
     ok))
 
 (defun %jit-translate-page-1 (bc ft-list rt-table)
@@ -386,6 +497,13 @@
            (psize (ash npages 12))
            (page (%mmap-exec-page psize))
            (base (sap-address (make-sap page))))
+      ;; SAFE-FLIP GUARD (x64 parity with the aarch64 sibling): mmap failure
+      ;; returns -errno, a small/negative integer.  Writing to it would fault;
+      ;; return NIL so the seam interprets this form.
+      (when (< base 4096)
+        (setq *jit-r-mmap-fail*
+              (if *jit-r-mmap-fail* (+ 1 *jit-r-mmap-fail*) 1))
+        (return-from %jit-translate-page-1 nil))
       ;; Copy native bytes into the exec page.
       (let ((k 0))
         (loop while (< k nlen)
@@ -529,6 +647,9 @@
              (if (boundp (quote *jit-translate-err-count*))
                  (+ 1 *jit-translate-err-count*) 1))
        (setq *jit-last-translate-err* c)
+       (when *jit-census-on*
+         (setq *jit-translate-err-msgs*
+               (%jit-census-note (%jit-err-tag c) *jit-translate-err-msgs*)))
        (setq *jit-fallback-count*
              (if *jit-fallback-count* (+ 1 *jit-fallback-count*) 1))
        nil)))
@@ -668,6 +789,8 @@
         ;; Interpreting here is exactly what the two callers' handlers already
         ;; do, so their behaviour is unchanged; they stay as belt-and-suspenders.
         (progn
+          (setq *jit-r-page-nil*
+                (if *jit-r-page-nil* (+ 1 *jit-r-page-nil*) 1))
           (setq *jit-fallback-count*
                 (if *jit-fallback-count* (+ 1 *jit-fallback-count*) 1))
           (%mvm-wrap-escaping-result
@@ -757,6 +880,16 @@
                                ;;      still fall back (and still double) until the
                                ;;      JIT can resolve runtime-defined functions.
                                (progn
+                                 ;; CENSUS: split the seam-handler fallback into
+                                 ;; "native already RAN" (the doubling case, an
+                                 ;; infrastructure escape) vs pure setup failure.
+                                 ;; NB: %infra excludes the MV sentinel, which
+                                 ;; reaches this handler with %ran already T --
+                                 ;; counting it here would double-count R-MV.
+                                 (when (and %ran (not %infra))
+                                   (setq *jit-r-native-escape*
+                                         (if *jit-r-native-escape*
+                                             (+ 1 *jit-r-native-escape*) 1)))
                                  (setq *jit-fallback-count*
                                        (if *jit-fallback-count*
                                            (+ 1 *jit-fallback-count*) 1))
@@ -1225,6 +1358,10 @@
                                                        (+ 1 *jit-resignal-count*) 1))
                                              (error c))
                                            (progn
+                                     (when (and %ran (not %infra))
+                                       (setq *jit-r-native-escape*
+                                             (if *jit-r-native-escape*
+                                                 (+ 1 *jit-r-native-escape*) 1)))
                                      (setq *jit-fallback-count*
                                            (if *jit-fallback-count* (+ 1 *jit-fallback-count*) 1))
                                      (%mvm-wrap-escaping-result

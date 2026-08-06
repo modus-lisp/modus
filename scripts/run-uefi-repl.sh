@@ -70,7 +70,12 @@ if [ -n "$1" ]; then
     fi
 
     sleep 0.3
-    printf '%s\n' "$1" >&3
+    # CR, not LF: the bare-metal serial line editor terminates a line on
+    # CR (0x0D) and ignores LF.  With "\n" the expression echoes at the
+    # prompt and is never evaluated, so this script produced NO output and
+    # exited 0 — a silent false pass that made OVMF look broken.  Same bug
+    # was fixed in run-repl-eval.sh; this script has its own inline copy.
+    printf '%s\r' "$1" >&3
     sleep 1
     exec 3>&-
     sleep 0.5

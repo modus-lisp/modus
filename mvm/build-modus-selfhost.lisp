@@ -474,6 +474,133 @@
                    text '("emit-aarch64-u32" "emit-aarch64-movz"
                           "emit-aarch64-movk" "emit-aarch64-load-imm64"))))))
 
+;;; --- AArch64 translator co-init ---
+;; Same limitation-#7 problem the x64 co-init above solves: DEFVAR/DEFPARAMETER
+;; init-thunks do NOT run at boot, so every translator table/knob reads NIL
+;; unless an explicit SETQ puts it there.  Three classes here:
+;;
+;;   (a) *A64-VREG-TO-PHYS* (translate-aarch64.lisp:392) — a DEFPARAMETER whose
+;;       init-thunk builds the vreg→phys map.  NIL in-image ⇒ A64-PHYS-REG's
+;;       (length NIL) faults on the very first instruction.  Rebuilt below.
+;;
+;;   (b) *AARCH64-SERIAL-WIDTH* (:65) and *AARCH64-FN-ALIGN-OFFSET* (:140) are
+;;       written `(defvar … 0)`.  The trap is that they do NOT read 0 — they
+;;       read NIL, and *AARCH64-FN-ALIGN-OFFSET* feeds ARITHMETIC in the
+;;       function-entry alignment loop, so leaving it is a latent NIL-arith
+;;       fault (and would mis-align every function entry even if it survived).
+;;
+;;   (c) The Linux-mode knobs build-aarch64-linux.lisp sets HOST-side at its
+;;       tail (:1410-1441).  Those setfs run in SBCL and do not persist into an
+;;       image, so the in-image emitter must set them itself.
+;;
+;; NO SYMBOL-IDENTITY TRAP HERE.  The x64 co-init carries a pointed warning
+;; that its *REGISTERS* replica must be read in :MODUS.ASM, because that table
+;; is an ALIST KEYED BY QUOTED SYMBOLS (MODUS.ASM::RBP ≠ MODUS.MVM::RBP under
+;; per-package interning, #211/CLHS 11.1.2) and REG-INFO's ASSOC silently
+;; missed, killing the JIT with "Unknown-register RBP".  The AArch64 map is a
+;; vector of RAW INTEGER register numbers (+A64-X19+ = 19) with no symbols in
+;; it at all, so no cross-package identity can be wrong.  What still matters is
+;; that the VARIABLE *A64-VREG-TO-PHYS* be the same symbol the translator
+;; reads: translate-aarch64.lisp declares (in-package :modus.mvm) and this
+;; string is read in :MODUS.MVM (the ambient package — *build-package-reset-text*
+;; restores it after every file), so it is.  Verified by the emit working at
+;; all: a mismatched replica leaves the real variable NIL and A64-PHYS-REG
+;; faults immediately rather than degrading silently.
+(defvar *aa64-translator-coinit-source* "
+(defun %a64-target-emit-prologue (target buf) (a64-emit-prologue buf))
+(defun %a64-target-emit-epilogue (target buf) (a64-emit-epilogue buf))
+;; #210 diagnostic: emit N known words into a fresh a64-buffer, read them back
+;; through a64-buffer-to-bytes, and report the FIRST index that fails to
+;; round-trip.  This is compiled code (struct accessors resolve), unlike the
+;; same expression typed at the REPL.  Run with a size below and above the
+;; initial code-array capacity to isolate the array-grow path specifically.
+(defun %a64-emit-roundtrip-check (n)
+  (let ((buf (make-a64-buffer)) (cap0 0) (bad -1) (i 0))
+    (setq cap0 (length (a64-buffer-code buf)))
+    (loop
+      (when (>= i n) (return nil))
+      ;; Distinct per-index word, kept inside 32 bits.
+      (a64-emit buf (logand (+ #xD5000000 i) #xFFFFFFFF))
+      (setq i (+ i 1)))
+    (let ((bytes (a64-buffer-to-bytes buf)))
+      (setq i 0)
+      (loop
+        (when (>= i n) (return nil))
+        (let ((want (logand (+ #xD5000000 i) #xFFFFFFFF))
+              (got (+ (aref bytes (* i 4))
+                      (* 256 (aref bytes (+ (* i 4) 1)))
+                      (* 65536 (aref bytes (+ (* i 4) 2)))
+                      (* 16777216 (aref bytes (+ (* i 4) 3))))))
+          (when (and (< bad 0) (not (= want got))) (setq bad i)))
+        (setq i (+ i 1)))
+      (write-string-serial \"a64-roundtrip n=\") (print-dec n)
+      (write-string-serial \" cap0=\") (print-dec cap0)
+      (write-string-serial \" endpos=\") (print-dec (a64-buffer-position buf))
+      (write-string-serial \" endcap=\") (print-dec (length (a64-buffer-code buf)))
+      (write-string-serial \" bytelen=\") (print-dec (length bytes))
+      (write-string-serial \" first-bad=\") (print-dec bad)
+      (write-char-serial 10))
+    bad))
+(defun %init-aarch64-translator ()
+  ;; (a) vreg -> AArch64 physical register number.  Mirrors the
+  ;; *a64-vreg-to-phys* defparameter AND *target-aarch64*'s :reg-map:
+  ;;   V0-V3 -> x0-x3, V4-V8 -> x19-x23, V9-V15 spill (NIL),
+  ;;   VR(16) -> x0, VA(17) -> x24, VL(18) -> x25, VN(19) -> x26,
+  ;;   VSP(20) -> sp(31), VFP(21) -> x29, VPC(22) unmapped (NIL).
+  ;; The spill/unmapped slots MUST be NIL, not 0: make-array zero-inits to
+  ;; FIXNUM 0 (GC safety) and 0 is a VALID register number (x0), so a left-
+  ;; zero slot would silently alias x0 instead of spilling.  Same class as the
+  ;; x64 co-init's explicit (aset v 9 nil) block.
+  (let ((v (make-array 23)))
+    (aset v 0 0)   (aset v 1 1)   (aset v 2 2)   (aset v 3 3)
+    (aset v 4 19)  (aset v 5 20)  (aset v 6 21)  (aset v 7 22)
+    (aset v 8 23)
+    (aset v 9 nil)  (aset v 10 nil) (aset v 11 nil) (aset v 12 nil)
+    (aset v 13 nil) (aset v 14 nil) (aset v 15 nil)
+    (aset v 16 0)  (aset v 17 24) (aset v 18 25) (aset v 19 26)
+    (aset v 20 31) (aset v 21 29) (aset v 22 nil)
+    (setq *a64-vreg-to-phys* v))
+  ;; (b) `(defvar … 0)` knobs that actually read NIL in-image.
+  (setq *aarch64-serial-width* 0)
+  ;; (c) Linux/AArch64 emitter config — the in-image equivalent of
+  ;; build-aarch64-linux.lisp:1410-1441.
+  (setq *aarch64-linux-mode* t)
+  ;; Linux EL0 SP-alignment (SCTLR.SA0) demands 16-byte aligned SP at every
+  ;; SP-based load/store; switch :push/:pop to the 16-byte aligned form.
+  (setq *aarch64-stack-align-16* t)
+  ;; The ELF wrap prepends 120 bytes of ehdr+phdr before the LOAD payload; the
+  ;; function-entry alignment loop must account for it so runtime VAs land on
+  ;; 16-byte boundaries and the OR-3 fn-pointer tag stays clean.
+  (setq *aarch64-fn-align-offset* 120)
+  ;; RUNG 1 emits a trivial, non-allocating program, so run it with the GC OFF
+  ;; (x25 = alloc limit = full heap end) — the smallest correct configuration.
+  ;; Turning the native MCGC on (metadata-shl / midpoint r25 / bitmap /
+  ;; native-mcgc / absolute in-module calls, per build-aarch64-linux.lisp) is
+  ;; rung 2's job, together with a real runtime payload to exercise it.
+  (setq *linux-aarch64-r25-offset* #x38000000)   ; +linux-aarch64-heap-size+
+  ;; SECOND NIL-ARITHMETIC TRAP, same class as *aarch64-fn-align-offset*:
+  ;; *linux-aarch64-gc-midpoint* is `(defvar … +linux-aarch64-gc-midpoint+)`,
+  ;; so it reads NIL in-image — and emit-linux-aarch64-entry does REAL
+  ;; ARITHMETIC on it (boot-linux-aarch64.lisp:312,
+  ;; `(- *linux-aarch64-gc-midpoint* +linux-aarch64-heap-alloc-start+)`) while
+  ;; emitting the boot preamble's GC-metadata block, which is emitted
+  ;; UNCONDITIONALLY — i.e. even with the collector off.  Left NIL the very
+  ;; first cross-arch emit faults inside the boot stub.  #x1C000000 is the
+  ;; +linux-aarch64-gc-midpoint+ constant, i.e. exactly what the SBCL-side
+  ;; build gets from the init-thunk it actually runs.
+  (setq *linux-aarch64-gc-midpoint* #x1C000000)
+  (setq *linux-aarch64-gc-metadata-shl* nil)
+  (setq *aarch64-gc-bitmap-enabled* nil)
+  (setq *aarch64-gc-native-mcgc* nil)
+  (setq *aarch64-force-absolute-inmodule-calls* nil)
+  ;; Bare-metal-only hooks that must stay off in a Linux image.
+  (setq *aarch64-sched-lock-addr* nil)
+  (setq *aarch64-setup-irq-enable* nil)
+  (setq *aarch64-jit-mode* nil)
+  (setq *aarch64-translate-into-buf* nil)
+  t)
+")
+
 ;;; --- linux-aarch64 boot descriptor + ELF64-LE(EM_AARCH64) wrapper ---
 ;; get-boot-descriptor(:linux-aarch64) → linux-aarch64-boot-descriptor, which
 ;; names emit-linux-aarch64-entry + +linux-aarch64-load-addr+;
@@ -559,6 +686,7 @@
     ;; boot-encoder shim must follow the translator (emit-aarch64-u32 calls
     ;; a64-emit) and precede the boot descriptor that calls it.
     *translate-aa64-source*         (string #\Newline)
+    *aa64-translator-coinit-source* (string #\Newline)
     *aa64-boot-encoder-source*      (string #\Newline)
     *target-source*                 (string #\Newline)
     *cross-source*                  (string #\Newline)
@@ -1243,6 +1371,11 @@
   ;; defparameter init-thunks don't run at boot (MVM Active Limitation 7), so
   ;; do it explicitly here.  Wrapped so a self-compile gap can't kill boot.
   (handler-case (%init-x64-translator) (t (c) nil))
+  ;; #210 rung 1: same for the AArch64 translator.  Ordered BEFORE
+  ;; %init-selfhost-targets (which registers both target descriptors) and
+  ;; wrapped the same way, so a gap here degrades the aarch64 emit rather
+  ;; than taking down boot / the x64 path.
+  (handler-case (%init-aarch64-translator) (t (c) nil))
   (handler-case (%init-selfhost-targets) (t (c) nil))
   ;; --- entry: the SHARED SBCL-faithful CLI toplevel ------------------------
   ;; cli-toplevel reads the FULL argv off the initial stack, parses SBCL-style

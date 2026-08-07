@@ -870,15 +870,51 @@
 (jd-assert "d222-mutrec-p1-e"  (eval '(jd-even 10)) t)
 (jd-assert "d222-mutrec-p1-o"  (eval '(jd-odd 10)) nil)
 (jd-assert "d222-mutrec-p1-e7" (eval '(jd-even 7)) nil)
-;; PASS 2: re-evaluate both.  Now each callee already exists, so jd-even
-;; relocates against jd-odd and both become native -- the forward-reference
-;; limitation is one pass deep, not permanent.
+;; PASS 2: re-evaluating both does NOT help, and this was MEASURED, not assumed
+;; -- the first draft of this file claimed "the limitation is one pass deep" and
+;; the probe disproved it.  Mutual recursion split across separate top-level
+;; forms can NEVER go native under this scheme: jd-even can only relocate if
+;; jd-odd is already native, and jd-odd can only relocate if jd-even is, so
+;; neither can go first.  Both keep their trampolines at pass 1, 2 and 3, and
+;; the answers stay correct via the interpret fallback.
 (eval '(defun jd-even (n) (if (= n 0) t (jd-odd (- n 1)))))
 (eval '(defun jd-odd  (n) (if (= n 0) nil (jd-even (- n 1)))))
 (jd-assert "d222-mutrec-p2-e"  (eval '(jd-even 10)) t)
 (jd-assert "d222-mutrec-p2-o"  (eval '(jd-odd 11)) t)
 (jd-assert "d222-mutrec-p2-e7" (eval '(jd-even 7)) nil)
+;; ...so this one is EXPECTED in JD-NEVER-NATIVE.  It is listed there as the
+;; measured boundary, not as an unexplained fallback.
 (jd-check  "d222-mutrec-call"  '(list (jd-even 20) (jd-odd 20)))
+
+;; The working shape: mutual recursion inside ONE top-level form.  Both bodies
+;; are then in the SAME module, so the calls are IN-module and need no
+;; relocation at all -- both install natively.  This is what a progn, a file
+;; compiler, or LABELS produces, so the limitation above is narrower than it
+;; looks.
+(eval '(progn (defun jd-seven (n) (if (= n 0) t (jd-sodd (- n 1))))
+              (defun jd-sodd  (n) (if (= n 0) nil (jd-seven (- n 1))))))
+(jd-assert "d222-mutrec-1form-e" (eval '(jd-seven 10)) t)
+(jd-assert "d222-mutrec-1form-o" (eval '(jd-sodd 11)) t)
+(jd-tag-into (symbol-function 'jd-seven))
+(jd-assert "d222-mutrec-1form-tag-e" *jd222-tag* 3)
+(jd-tag-into (symbol-function 'jd-sodd))
+(jd-assert "d222-mutrec-1form-tag-o" *jd222-tag* 3)
+(jd-check  "d222-mutrec-1form-call" '(list (jd-seven 20) (jd-sodd 20)))
+
+;; A plain FORWARD reference (not mutual) IS one pass deep: fwd-a defined while
+;; fwd-b does not exist keeps its trampoline, but re-evaluating fwd-a once
+;; fwd-b is native makes fwd-a native too -- the cascade, one definition at a
+;; time, which is how a loaded library links against itself.
+(eval '(defun jd-fwd-a (x) (jd-fwd-b x)))
+(eval '(defun jd-fwd-b (x) (* x 2)))
+(jd-tag-into (symbol-function 'jd-fwd-b))
+(jd-assert "d222-fwd-b-native"  *jd222-tag* 3)
+(jd-tag-into (symbol-function 'jd-fwd-a))
+(jd-assert "d222-fwd-a-tramp"   *jd222-tag* 9)
+(eval '(defun jd-fwd-a (x) (jd-fwd-b x)))
+(jd-tag-into (symbol-function 'jd-fwd-a))
+(jd-assert "d222-fwd-a-native"  *jd222-tag* 3)
+(jd-assert "d222-fwd-value"     (eval '(jd-fwd-a 5)) 10)
 
 ;; --- CONST-POOL-BEARING defuns keep their trampoline: still CORRECT --------
 ;; A function whose native range contains a const-pool patch site is NOT

@@ -484,11 +484,171 @@
               (setq ok nil)))))
     ok))
 
+;;; ============================================================
+;;; WS5 #222 — NATIVE INSTALLATION OF RUNTIME-DEFINED FUNCTIONS
+;;; ============================================================
+;;;
+;;; The last JIT fallback reason.  `mvm-eval` of `(defun f …)` installed F as
+;;; %mvm-make-trampoline — a HEAP CLOSURE (tag 9) that re-enters mvm-interpret.
+;;; A later top-level form calling F then failed the #206 native-callee
+;;; relocation in %jit-reloc-calls (which requires tag nibble 3) and the WHOLE
+;;; calling module interpreted.  That single gap was three blockers at once:
+;;;   1. it was the only remaining JIT fallback reason (R-RELOC-CALL-NONNATIVE);
+;;;   2. actor-spawn does `(actor-set id #x30 (untag fn))` and JUMPS there, and
+;;;      an untagged heap closure is a non-executable heap address, so no
+;;;      runtime-defined function could ever be an actor entry;
+;;;   3. a --load-able ANSI corpus is entirely runtime DEFUNs, so it would run
+;;;      100% interpreted.
+;;;
+;;; The mechanism: the module the JIT already translates for the top-level form
+;;; ALREADY CONTAINS native code for every function the form defines — the same
+;;; translate-mvm-to-x64 output, in the same exec page, with the same ABI as a
+;;; build-time-native function.  Nothing new needs to be compiled.  All that was
+;;; missing was to publish each defun's entry ADDRESS instead of a trampoline:
+;;; fn-map gives NAME → native label, label-position gives its byte offset, and
+;;; the exec page is 4096-aligned while the in-JIT *x64-native-code-offset* is 0
+;;; (build-generic-cli.lisp / build-ansi-common.lisp co-init), so every function
+;;; entry is 16-BYTE aligned inside the page and the OR-3 discipline of
+;;; translate-x64.lisp (mvm-fn-addr = LEA + OR-3) applies verbatim:
+;;; `(logior (+ base off) 3)` is a well-formed tag-3 native function word,
+;;; disjoint from cons(1)/char(5)/obj(9).  %word->val reinterprets it as the
+;;; function VALUE, which is exactly the object symbol-function returns for a
+;;; build-time function — so eq/funcall/symbol-function identity is preserved
+;;; and %jit-reloc-fn-addrs keeps patching the full TAGGED word.
+;;;
+;;; LIFETIME.  The exec page must outlive the compilation unit, and it does: it
+;;; is mmap'd memory OUTSIDE the GC heap, and x64 never munmaps (the
+;;; %jit-free-page reclamation is gated to *jit-target-arch* :aarch64 and is
+;;; further gated on the result not being a function).  It is never scanned or
+;;; moved by the collector, and a tag-3 word on the stack is not a pointer tag
+;;; so the conservative root scan ignores it.  The cost is that a REDEFINITION
+;;; leaks its predecessor's page (a few KB); see %jit-install-native-fns.
+;;;
+;;; THE CONST-POOL RESTRICTION (the reason this is per-FUNCTION, not per-page).
+;;; %jit-patch-consts bakes each const-pool object's CURRENT tagged heap address
+;;; into a movabs immediate.  Those objects MOVE under the Cheney collector, and
+;;; the existing re-bake (%jit-entry-for, keyed on %gc-count) only fires when a
+;;; page is re-entered THROUGH THE SEAM.  A persistently-installed function is
+;;; entered directly by native code, so nothing would re-bake it and a GC would
+;;; leave it holding a dangling from-space address.  There is no Lisp-visible
+;;; post-GC hook to fix this from here (gc_trampoline is emitted assembly and
+;;; never calls back into Lisp).  So a function is installed natively only when
+;;; NO const patch site falls inside ITS OWN native byte range — which is why
+;;; %jit-fn-native-offsets computes per-function ranges rather than gating the
+;;; whole page on (null cpatches).  A defun that closes over a quoted literal or
+;;; a string keeps its interpreter trampoline; it is correct, just not native.
+;;; Lifting that restriction needs an indirection through a GC-updated constant
+;;; vector (a translator + collector change) and is deliberately out of scope.
+
+(defun %jit-fn-native-offsets (ft-list fn-map nlen cpatches)
+  "Alist (NAME . NATIVE-BYTE-OFFSET) for every function of FT-LIST whose native
+   code range in the freshly translated page contains NO const-pool patch site.
+   FT-LIST entries are (name mvm-offset length) in EMISSION order, so a
+   function's native range ends at the next function's native start (or NLEN for
+   the last one — conservatively over-wide, since the GC trampoline and the
+   handler-stack helpers are emitted after the last function; over-wide can only
+   REJECT a function, never admit a dirty one).
+
+   A name appearing twice in FT-LIST is skipped entirely: fn-map is keyed by
+   NAME, so a duplicate resolves to the LAST label and the range attribution
+   would be wrong for the earlier one."
+  (let ((raw nil))
+    (dolist (e ft-list)
+      (let* ((nm (car e))
+             (dup nil))
+        ;; reject duplicate names (fn-map would alias them)
+        (let ((seen 0))
+          (dolist (e2 ft-list)
+            (when (string= (car e2) nm) (setq seen (+ seen 1))))
+          (when (> seen 1) (setq dup t)))
+        (unless dup
+          (let* ((lbl (gethash nm fn-map))
+                 (p (if lbl (label-position lbl) nil)))
+            (when (and p (integerp p))
+              (setq raw (cons (cons nm p) raw)))))))
+    ;; For each candidate, END = the smallest start strictly greater than its
+    ;; own (scan, not "next in list", so the result does not depend on FT-LIST
+    ;; being sorted by native offset).
+    (let ((out nil))
+      (dolist (c raw)
+        (let ((start (cdr c))
+              (end nlen)
+              (clean t))
+          (dolist (o raw)
+            (when (and (> (cdr o) start) (< (cdr o) end)) (setq end (cdr o))))
+          (dolist (cp cpatches)
+            (when (and (>= (car cp) start) (< (car cp) end)) (setq clean nil)))
+          (when clean (setq out (cons c out)))))
+      out)))
+
+(defun %jit-native-defuns-p ()
+  "Gate for native installation of runtime-defined functions.  A FUNCTION, not a
+   defvar: defvar init-thunks do not run in-image (CLAUDE.md limitation 7), so a
+   `(defvar *x* t)` would read NIL — the same reason %jit-enabled-p is a defun."
+  t)
+
+(defvar *jit-native-defun-count* nil
+  "DIAGNOSTIC: how many runtime-defined functions have been installed as real
+   native code by %jit-install-native-fns.  NIL on a JIT-off image.")
+
+(defun %jit-install-native-fns (base fnoffs names)
+  "Publish each function of FNOFFS whose NAME is in NAMES (the top-level DEFUNs
+   of this module) as a REAL NATIVE function at BASE+offset, in both global
+   function tables — *symbol-function-table* by name (the mvm-eval native-call
+   bridge / %mvm-resolve-runtime-fn key, hence %jit-reloc-calls) and
+   *native-sym-function-table* by name-hash (symbol-function / funcall).  This
+   OVERWRITES the interpreter trampoline mvm-eval-forms installed moments
+   earlier; puthash is last-write-wins, matching the last-defun-wins rule.
+   Returns the number installed.
+
+   The entry must be 16-BYTE aligned for the OR-3 tag to read back as 3; the
+   page is page-aligned and the translator aligns every function entry mod 16
+   against *x64-native-code-offset* (0 in JIT mode), so this holds — but it is
+   CHECKED, and a misaligned entry is skipped rather than published as a word
+   whose low nibble could collide with cons(1)/char(5)/obj(9).
+
+   REDEFINITION.  Publishing a new address does NOT retract addresses already
+   baked into previously built exec pages, so a page that baked the OLD native
+   address of NM keeps calling it — EARLY BINDING, the same semantics a
+   build-time native caller already has (CLAUDE.md active limitation 1,
+   last-defun-wins).  The CACHED-module half of that is handled, but NOT here:
+   it is handled in mvm-eval-forms' trampoline install loop, which is the only
+   place NM's PREVIOUS binding is still visible (this function runs after that
+   loop has already overwritten it).  See the WS5 #222 REDEFINITION
+   INVALIDATION comment there.  The residual — an already-installed native
+   function whose page baked a callee that is later redefined — is a real
+   divergence from the interpreter's late binding and is reported, not fixed;
+   see GATE-RESULT-jit-defun.md.
+
+   The superseded page is NOT unmapped (a live caller may hold its address), so
+   each redefinition leaks its predecessor's page — a few KB per redefinition,
+   bounded by redefinition count, not by call count."
+  (let ((n 0))
+    (dolist (e fnoffs)
+      (let ((nm (car e)))
+        (when (member nm names :test (function string=))
+          (let ((addr (+ base (cdr e))))
+            (when (eql (logand addr 15) 0)
+              (let ((fn (%word->val (logior addr 3))))
+                (when (boundp (quote *symbol-function-table*))
+                  (puthash nm *symbol-function-table* fn))
+                (when (boundp (quote *native-sym-function-table*))
+                  (puthash (compute-name-hash nm) *native-sym-function-table* fn))
+                (setq n (+ n 1))))))))
+    (setq *jit-native-defun-count*
+          (if *jit-native-defun-count* (+ *jit-native-defun-count* n) n))
+    n))
+
 (defun %jit-translate-page-1 (bc ft-list rt-table)
   "Inner: translate BC → native x64, mmap an exec page, copy bytes, relocate
    calls + patch consts.  Returns a jit-entry list (base eoff cpatches
-   gc-stamp) or NIL if RELOCATION failed.  MAY signal (translator gap) — the
-   guard wrapper %jit-translate-page turns any signal into NIL."
+   gc-stamp psize fn-native-offsets) or NIL if RELOCATION failed.  MAY signal
+   (translator gap) — the guard wrapper %jit-translate-page turns any signal
+   into NIL.
+
+   Element 6 (FN-NATIVE-OFFSETS) is the per-function (name . native-offset)
+   alist %jit-install-native-fns needs to publish this module's top-level
+   DEFUNs as real native functions; see the WS5 #222 block above."
   (setq *x64-jit-mode* t)
   (multiple-value-bind (nbuf fn-map) (translate-mvm-to-x64 bc ft-list)
     (let* ((nlen (code-buffer-position nbuf))
@@ -527,7 +687,11 @@
                (%jit-reloc-fn-addrs base fa-relocs rt-table))
           (progn
             (%jit-patch-consts base cpatches)
-            (list base eoff cpatches (%gc-count)))
+            ;; 5th = PSIZE (read only on the aarch64 reclaim path; harmless
+            ;; here).  6th = the per-function native-offset alist for WS5 #222
+            ;; native DEFUN installation.
+            (list base eoff cpatches (%gc-count) psize
+                  (%jit-fn-native-offsets ft-list fn-map nlen cpatches)))
           nil))))
 
 (defun %jit-translate-page-1-aarch64 (bc mvm-entry ft-list rt-table)
@@ -682,7 +846,8 @@
               ;; A GC moved the const-pool objects; re-bake immediates, then
               ;; re-store a fresh entry with the new stamp (avoid mutating a
               ;; nested list place — build + puthash is compiler-safe).
-              (let ((fresh (list (car hit) (cadr hit) (caddr hit) now)))
+              (let ((fresh (list (car hit) (cadr hit) (caddr hit) now
+                                 (car (cddddr hit)) (cadr (cddddr hit)))))
                 (%jit-patch-consts (car fresh) (caddr fresh))
                 (setf (gethash bc *jit-page-cache*) fresh)
                 fresh)))
@@ -690,7 +855,8 @@
           (when je (setf (gethash bc *jit-page-cache*) je))
           je))))
 
-(defun %mvm-eval-jit-run (bc entry ft-list fn-table rt-table lam-offsets cache-p)
+(defun %mvm-eval-jit-run (bc entry ft-list fn-table rt-table lam-offsets cache-p
+                          persist-names)
   "WS4-S5b: run compiled module BC as NATIVE JIT'd code, wrapping the result
    like the interpret path (%mvm-wrap-escaping-result).  If the JIT can't build
    a page we throw to the caller's handler-case, which falls back to
@@ -744,6 +910,16 @@
                  (%jit-translate-page bc entry ft-list rt-table))))
     (if je
         (progn
+          ;; WS5 #222: publish this module's top-level DEFUNs as REAL NATIVE
+          ;; functions, replacing the interpreter trampolines mvm-eval-forms
+          ;; installed a moment ago.  Done HERE — after every relocation and
+          ;; const patch succeeded, so the page is fully formed, and BEFORE
+          ;; %jit-call, so the thunk itself (and anything it calls) already
+          ;; sees the native definition, exactly as it saw the trampoline.
+          ;; On a page-build failure (je NIL) nothing is published and the
+          ;; trampolines stand — the interpret fallback is unchanged.
+          (when (and persist-names (cadr (cddddr je)) (%jit-native-defuns-p))
+            (%jit-install-native-fns (car je) (cadr (cddddr je)) persist-names))
           ;; Native code stamps MV-count into real BSS; seed it to 1 so a
           ;; single-value form reads back 1 (the thunk epilogue sets it, but
           ;; be defensive).  A form that sets it >1 falls back for correct MV.
@@ -913,7 +1089,12 @@
          (%ignore1 (setq *jit-native-ran* nil))
          (%ignore2 (setq *jit-infra-fallback* nil))
          (%prim (if (%jit-active-p)
-                    (handler-case (%mvm-eval-jit-run %bc %entry %ftl %fnt %rt %lam t)
+                    ;; PERSIST-NAMES = NIL on the CACHED-tuple path: this module
+                    ;; was already compiled and its DEFUNs already published by
+                    ;; the mvm-eval-forms call that built the tuple, so there is
+                    ;; nothing new to install (and the tuple does not carry the
+                    ;; name list).
+                    (handler-case (%mvm-eval-jit-run %bc %entry %ftl %fnt %rt %lam t nil)
                       (t (c)
                          (let ((%ran *jit-native-ran*)
                                (%infra *jit-infra-fallback*))
@@ -1355,6 +1536,34 @@
               (dolist (e all-ir)
                 (let ((pn (string (function-info-name (car e)))))
                   (when (member pn persist-names :test (function string=))
+                    ;; WS5 #222 REDEFINITION INVALIDATION.  This is the ONLY
+                    ;; point at which PN's PREVIOUS binding is still visible —
+                    ;; the puthash below overwrites it, and by the time
+                    ;; %jit-install-native-fns runs (after the page is built)
+                    ;; the old value is already gone.  If the previous binding
+                    ;; was NATIVE code (tag nibble 3 — either build-time or a
+                    ;; #222 install), some exec page in *jit-page-cache* may
+                    ;; have BAKED that address into a `movabs rax, imm64; call
+                    ;; rax` site, and re-running that cached page would silently
+                    ;; call the SUPERSEDED definition.  Drop the whole page
+                    ;; cache so every cached module re-translates and
+                    ;; re-relocates against the new definition.
+                    ;;
+                    ;; This must happen even when the NEW definition ends up
+                    ;; being only a trampoline (a const-bearing body, or a
+                    ;; module whose relocation failed): the stale cached page
+                    ;; still holds the OLD native address and would keep
+                    ;; calling it — the first redefinition bug this feature
+                    ;; produced (`(defun f …)` twice, then the SAME call form
+                    ;; text, returned the second definition's answer for the
+                    ;; third definition).  A FIRST definition never invalidates
+                    ;; anything: no page can have baked an address for a name
+                    ;; that did not previously resolve to native code, so
+                    ;; loading a library pays nothing here.
+                    (let ((%prev (%mvm-resolve-runtime-fn pn)))
+                      (when (and %prev *jit-page-cache*
+                                 (eql (logand (%val->word %prev) 15) 3))
+                        (clrhash *jit-page-cache*)))
                     (let ((tramp (%mvm-make-trampoline
                                    bc fn-table rt-table
                                    (function-info-bytecode-offset (car e))
@@ -1413,7 +1622,8 @@
                             (if (%jit-active-p)
                                 (handler-case
                                     (%mvm-eval-jit-run bc entry (reverse ft-list)
-                                                    fn-table rt-table lam-offsets nil)
+                                                    fn-table rt-table lam-offsets nil
+                                                    persist-names)
                                   (t (c)
                                      (let ((%ran *jit-native-ran*)
                                            (%infra *jit-infra-fallback*))

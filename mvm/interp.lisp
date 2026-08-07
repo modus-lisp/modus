@@ -146,7 +146,29 @@
   (stack   nil :type list)
   (flags   :eq :type keyword)
   (memory  (make-hash-table :test 'eql))
-  (heap    nil :type list)
+  ;; NO "HEAP" RETENTION LIST.  There used to be one: every op-cons /
+  ;; op-alloc-cons / op-alloc-obj / -array / -string / -u8 pushed its fresh
+  ;; object onto a `heap' list slot, commented "keep alive (anti-collection)".
+  ;; That list was WRITE-ONLY — nothing in the tree ever read, trimmed or reset
+  ;; it — so it retained every object an interpreted run ever allocated, for the
+  ;; life of the state.  An unbounded leak: 200K interpreted list/array
+  ;; allocations peaked at 490MB RSS with the list, 20MB without it.
+  ;;
+  ;; It was also INEFFECTIVE for the hazard it was written to cover.  That
+  ;; hazard is real: the MEMORY hash below stores simulated memory as split raw
+  ;; BYTES (mem-write-byte masks #xFF), so a heap pointer written to simulated
+  ;; memory is invisible to the collector.  But Cheney COPIES — retaining an
+  ;; object does not stop it moving, and the raw word reassembled out of MEMORY
+  ;; still names the stale from-space address.  Retention bought leak, not
+  ;; safety.  (The MV region already got the real fix: it is routed to the
+  ;; value-domain MV-VALS vector below, precisely so the GC traces it.)
+  ;;
+  ;; What makes dropping the list safe is that REGS is a simple-vector holding
+  ;; VALUES (reg-set = %word->val), so the collector traces registers directly
+  ;; and updates them across a move.  Anything an interpreted program can still
+  ;; reach is reachable from there or from the object graph.  If a future opcode
+  ;; needs to stash a heap value outside REGS, give it a value-domain slot like
+  ;; MV-VALS — do not bring back a retention list.
   (halted  nil :type boolean)
   (call-stack nil :type list)
   (percpu  (make-hash-table :test 'eql))
@@ -1414,9 +1436,11 @@
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (va npc2) (fetch-reg bc npc)
                (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
-                 (let ((cell (cons (svref regs va) (svref regs vb))))
-                   (push cell (mvm-heap state))      ; keep alive (anti-collection)
-                   (setf (svref regs vd) cell))
+                 ;; The cell is stored into REGS, a simple-vector the collector
+                 ;; traces — no retention list needed.  See the mvm-state HEAP
+                 ;; slot comment for why the old push was not just redundant but
+                 ;; ineffective for the case it was written to cover.
+                 (setf (svref regs vd) (cons (svref regs va) (svref regs vb)))
                  (setf pc npc3)))))
 
           (#.+op-setcar+
@@ -1460,9 +1484,7 @@
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (size npc2) (fetch-u16 bc npc)
                (multiple-value-bind (subtag npc3) (fetch-byte bc npc2)
-                 (let ((obj (%alloc-native size subtag)))
-                   (push obj (mvm-heap state))
-                   (reg-set regs vd (%val->word obj)))
+                 (reg-set regs vd (%val->word (%alloc-native size subtag)))
                  (setf pc npc3)))))
 
           ;; Arrays / strings / objects — REAL native CL objects.  Allocate via
@@ -1472,17 +1494,17 @@
           (#.+op-alloc-array+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vcount npc2) (fetch-reg bc npc)
-               (let ((obj (make-array (%word->val (reg-get regs vcount)) :initial-element nil)))
-                 (push obj (mvm-heap state))
-                 (reg-set regs vd (%val->word obj)))
+               (reg-set regs vd (%val->word
+                                 (make-array (%word->val (reg-get regs vcount))
+                                             :initial-element nil)))
                (setf pc npc2))))
 
           (#.+op-alloc-string+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
-               (let ((obj (make-string (%word->val (reg-get regs vs)) :initial-element #\Space)))
-                 (push obj (mvm-heap state))
-                 (reg-set regs vd (%val->word obj)))
+               (reg-set regs vd (%val->word
+                                 (make-string (%word->val (reg-get regs vs))
+                                              :initial-element #\Space)))
                (setf pc npc2))))
 
           ;; Byte-packed (unsigned-byte 8) vector.  In the in-image
@@ -1492,11 +1514,10 @@
           (#.+op-alloc-u8+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vcount npc2) (fetch-reg bc npc)
-               (let ((obj (make-array (%word->val (reg-get regs vcount))
-                                      :element-type '(unsigned-byte 8)
-                                      :initial-element 0)))
-                 (push obj (mvm-heap state))
-                 (reg-set regs vd (%val->word obj)))
+               (reg-set regs vd (%val->word
+                                 (make-array (%word->val (reg-get regs vcount))
+                                             :element-type '(unsigned-byte 8)
+                                             :initial-element 0)))
                (setf pc npc2))))
 
           (#.+op-u8-ref+
@@ -1944,9 +1965,7 @@
           ;; --- GC / Allocation ---
           (#.+op-alloc-cons+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
-             (let ((cell (cons nil nil)))
-               (push cell (mvm-heap state))
-               (reg-set regs vd (%val->word cell)))   ; store the cons's raw word
+             (reg-set regs vd (%val->word (cons nil nil)))  ; store the cons's raw word
              (setf pc npc)))
 
           (#.+op-gc-check+ nil) ; no-op in interpreter

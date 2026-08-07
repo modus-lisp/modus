@@ -2694,8 +2694,30 @@
                  ;; a call to NIL: every defstruct/CLOS (setf (NAME-slot s) v)
                  ;; silently no-op'd / PROGRAM-ERROR'd.  Same fallback pattern as
                  ;; cell-var-name.
+                 ;;
+                 ;; IN-IMAGE, *PACKAGE* IS THE WRONG FALLBACK.  Under mvm-eval
+                 ;; the current package is the LIBRARY's package (whatever its
+                 ;; `(in-package :foo)` left behind), so `(setf (documentation
+                 ;; …) …)` inside a library expanded to FOO::SET-DOCUMENTATION.
+                 ;; The function-table key folds the home package for every
+                 ;; runtime-born package (%FN-KEY-ANSI-PKG-P exempts only
+                 ;; COMMON-LISP / COMMON-LISP-USER / KEYWORD), so that name
+                 ;; cannot reach the image's SET-DOCUMENTATION and the form
+                 ;; signalled UNDEFINED-FUNCTION.  It only ever worked because
+                 ;; the REPL sits in CL-USER, which is exempt.
+                 ;;
+                 ;; The accessor symbol's OWN home package is the right answer:
+                 ;; CL:DOCUMENTATION / CL:CHAR intern their setter in COMMON-LISP
+                 ;; (exempt -> bare key -> the image's function), while a
+                 ;; library's own accessor keeps interning in the library's
+                 ;; package, exactly where its DEFSTRUCT/DEFCLASS setter went.
+                 ;; Ordered MODUS.MVM-first so the HOST build is unchanged (and
+                 ;; so SBCL is never asked to intern into its locked CL package).
                  (let ((setter (intern (format nil "SET-~A" (symbol-name (car place)))
-                                       (or (find-package "MODUS.MVM") *package*))))
+                                       (or (find-package "MODUS.MVM")
+                                           (and (symbolp (car place))
+                                                (symbol-package (car place)))
+                                           *package*))))
                    `(,setter ,@(cdr place) ,value)))))))))
 
   ;; DEFSETF — register a setf expander.

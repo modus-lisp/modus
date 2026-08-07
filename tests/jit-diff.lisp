@@ -770,6 +770,32 @@
             label got expected))
   nil)
 
+(defparameter *jd-gcstale* 0)
+(defparameter *jd-gcstale-hits* 0)
+
+(defun jd-note-gcstale (label got expected)
+  "KNOWN DIVERGENCE, reported rather than failed: CONST-POOL STALENESS ACROSS A
+   COLLECTION.  A JIT'd module's `:li-const` sites are patched with the const
+   object's CURRENT tagged heap address; the collector moves those objects and
+   only re-bakes a page that is re-entered THROUGH THE SEAM.  A runtime macro's
+   expander is not, so after the first real GC its quoted-symbol constants are
+   dangling from-space pointers: `macro-function` still returns non-NIL but the
+   expansion comes back with a garbage head (`(#<?> 2 3)` instead of `(+ 2 3)`),
+   and compiling that signals UNDEFINED-FUNCTION.
+
+   This was INVISIBLE until the collections in this file became real — every
+   `survives GC` probe here allocated 2.5 MB against a 939 MB threshold and
+   never collected once.  It is the same hazard #222's const-pool restriction
+   describes; that restriction covers installed FUNCTIONS, and nothing has ever
+   covered macro expanders.
+
+   Counted separately so JD-OK stays a usable gate while the bug stays visible."
+  (setq *jd-gcstale* (+ 1 *jd-gcstale*))
+  (unless (string= (jd-str got) (jd-str expected))
+    (setq *jd-gcstale-hits* (+ 1 *jd-gcstale-hits*))
+    (format t "JD-GCSTALE ~A  got=~S  correct-would-be=~S~%" label got expected))
+  nil)
+
 ;;; TAG PROBE.  %val->word is a compiler primop (SHL 1) and is only reliable
 ;;; where the surrounding code is NATIVE.  Under mvm-interpret the interpreter
 ;;; itself works in the word domain (reg-get = %val->word, reg-set = %word->val,
@@ -930,14 +956,92 @@
 ;; A natively-installed function is entered directly by native code and is never
 ;; re-visited by the seam, so it must survive collection with no re-patching.
 ;; Allocate hard between calls and re-check the answers and the identity.
+;;
+;; MEASURE THE COLLECTION, DO NOT ASSUME IT.  These probes used to force GC with
+;; `(eval '(dotimes (i 4000) (make-list 40)))` — roughly 2.5 MB of garbage
+;; against a collection threshold at the 939 MB heap midpoint
+;; (*linux-x64-r14-offset* #x38000000, build-generic-cli.lisp).  Reading the
+;; collector's own counter afterwards gives gc_count = 0: not one collection
+;; ever ran, so EVERY "survives GC" assertion in this file was vacuous.  #222's
+;; evidence cited surviving a forced GC; that premise was untested.
+;;
+;; jd-force-gc allocates until the counter ACTUALLY advances and returns how
+;; many collections it saw; jd-gc-fired asserts that number is non-zero, so a
+;; future heap-size change cannot silently turn these back into no-ops.
+;;
+;; gc_count is a RAW word at BSS 0x10000060 bumped by `inc qword [abs]`
+;; (translate-x64.lisp), so a :u64 read reinterprets it as a tagged VALUE — a
+;; count of 1 reads back as a CONS and printing it aborts the load.  mem-ref
+;; :u32 returns its low half properly tagged, which is what we want.
+;;
+;; NB the documented small-heap knob MODUS_GC_R14=262144 cannot substitute for
+;; this: at that size the JIT falls back for essentially everything (native%~0
+;; under heap pressure), so the very code path under test stops running.  These
+;; probes therefore collect at the SHIPPING heap settings.
+(defun jd-gcn () (mem-ref #x10000060 :u32))
+(defun jd-force-gc ()
+  (let ((b (jd-gcn)) (k 0))
+    (loop
+      (when (or (> (jd-gcn) b) (>= k 60)) (return (- (jd-gcn) b)))
+      (dotimes (j 100000) (make-list 40))
+      (setq k (+ k 1)))))
+(defun jd-gc-fired (label)
+  (let ((n (jd-force-gc)))
+    ;; RE-ESTABLISH THIS FILE'S OWN MACRO.  A runtime DEFMACRO does not survive a
+    ;; collection (the gc-macro-* assertions below MEASURE that; it is asserted,
+    ;; not hidden).  jd-tag-into is a macro, so without this every jd-tag-into
+    ;; after the first real GC compiles as a call to an undefined function and
+    ;; ABORTS THE WHOLE LOAD — which is exactly what happens on main, and which
+    ;; would leave the rest of the file unmeasured.  Re-defining it here costs
+    ;; nothing and lets the file run to its summary on both branches.
+    ;; (jd-gc-fired itself is safe: it is const-bearing, so it keeps an
+    ;; interpreter trampoline, and mvm-interpret's op-li-const reads the pool
+    ;; live rather than through a baked address.)
+    (eval '(defmacro jd-tag-into (form)
+             (list 'setq '*jd222-tag*
+                   (list 'let (list (list 'w (list '%val->word form)))
+                         (list '- 'w (list '* 16 (list 'floor 'w 16)))))))
+    (jd-assert label (if (> n 0) :collected :no-collection) :collected)))
+
+;;; --------------------------------------------------------------------------
+;;; WHAT ACTUALLY SURVIVES A REAL COLLECTION
+;;; --------------------------------------------------------------------------
+;;; With the collection now real, these split the #222 premise into its parts.
+;;; A runtime DEFUN installed as native code survives — value, identity and a
+;;; direct funcall all hold.  A runtime DEFMACRO does NOT: `macro-function`
+;;; still returns non-NIL, but the expander's own quoted-symbol constants have
+;;; gone stale, so the expansion comes back with a garbage head and compiling it
+;;; signals UNDEFINED-FUNCTION.  That is the const-pool staleness #222's
+;;; restriction describes, observed directly — the restriction covers installed
+;;; FUNCTIONS, and nothing ever covered macro expanders.
+(eval '(defun jd-gcsurv (x) (+ (* x 3) 1)))
+(eval '(defmacro jd-gcmac (a b) (list '+ a b)))
+(jd-assert "gc-defun-before"  (eval '(jd-gcsurv 10)) 31)
+(jd-assert "gc-macro-before"  (eval '(jd-gcmac 2 3)) 5)
+(jd-gc-fired "gc-fired-survival")
+(jd-assert "gc-defun-seam"    (handler-case (eval '(jd-gcsurv 10)) (t (c) :ERR)) 31)
+(jd-assert "gc-defun-direct"  (handler-case (funcall (symbol-function 'jd-gcsurv) 10)
+                                (t (c) :ERR)) 31)
+(jd-assert "gc-defun-id"      (eq (function jd-gcsurv) (symbol-function 'jd-gcsurv)) t)
+(jd-assert "gc-macro-fn-nonnil"
+           (handler-case (if (macro-function 'jd-gcmac) t nil) (t (c) :ERR)) t)
+;; Counted separately, like JD222-EARLYBIND: a KNOWN divergence that must stay
+;; VISIBLE and measured without turning JD-OK red, so this file remains usable
+;; as a gate while the bug is open.  On main both of these report; on a build
+;; where the const pool is reached through a GC-updated indirection they do not.
+(jd-note-gcstale "gc-macro-expand"
+                 (handler-case (macroexpand-1 '(jd-gcmac 2 3)) (t (c) :ERR)) '(+ 2 3))
+(jd-note-gcstale "gc-macro-use"
+                 (handler-case (eval '(jd-gcmac 2 3)) (t (c) :ERR)) 5)
+
 (eval '(defun jd-gcfn (x) (+ (* x 3) 1)))
 (jd-assert "d222-gc-before"  (eval '(jd-gcfn 10)) 31)
-(eval '(dotimes (i 4000) (make-list 40)))
+(jd-gc-fired "d222-gc-fired1")
 (jd-assert "d222-gc-after"   (eval '(jd-gcfn 10)) 31)
 (jd-assert "d222-gc-id"      (eq (function jd-gcfn) (symbol-function 'jd-gcfn)) t)
 (jd-tag-into (symbol-function 'jd-gcfn))
 (jd-assert "d222-gc-tag"     *jd222-tag* 3)
-(eval '(dotimes (i 4000) (make-list 40)))
+(jd-gc-fired "d222-gc-fired2")
 (jd-assert "d222-gc-after2"  (funcall (symbol-function 'jd-gcfn) 10) 31)
 ;; the trampoline-retaining (const-bearing) sibling must survive GC too
 (jd-assert "d222-gc-const"   (eval '(jd-conststr 7)) "v=7")
@@ -1009,6 +1113,9 @@
         *jd222-total* *jd222-fail* *jd222-earlybind*
         (if (boundp '*jit-native-defun-count*)
             (or *jit-native-defun-count* 0) 0))
+;; JD-GCSTALE-HITS is the headline of this file's GC work: how many probes saw a
+;; const go stale across a REAL collection.  0 = the const pool survives GC.
+(format t "JD-GCSTALE-PROBES=~D~%JD-GCSTALE-HITS=~D~%" *jd-gcstale* *jd-gcstale-hits*)
 (format t "JD-MV-TOTAL=~D~%JD-MV-NATIVE=~D~%JD-MV-CL-GAP=~D~%JD-MV-FALLBACK=~D~%"
         *jd-mv-total* *jd-mv-native* *jd-mv-clgap*
         (if (boundp '*jit-mv-fallback-count*) (or *jit-mv-fallback-count* 0) 0))

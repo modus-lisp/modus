@@ -1034,6 +1034,223 @@
 (jd-note-gcstale "gc-macro-use"
                  (handler-case (eval '(jd-gcmac 2 3)) (t (c) :ERR)) 5)
 
+;;; ==========================================================================
+;;; EXTENDED GC-SURVIVAL BATTERY
+;;; ==========================================================================
+;;; Two probes on one macro were thin evidence for "runtime macros work across
+;;; GC", and thinner still for the CLASS the macro bug turned out to belong to.
+;;; The defect is not about macros: %jit-patch-consts bakes each const-pool
+;;; object's CURRENT heap address into a `movabs` immediate, and the only
+;;; re-bake (%jit-entry-for) fires when a page is re-entered THROUGH THE SEAM.
+;;; ANYTHING that re-enters the page some other way keeps reading the address
+;;; the object had before the collection.  A macro expander is only the most
+;;; visible instance; a lambda in a global, a lambda inside a data structure,
+;;; a lambda returned by EVAL and a #222-installed DEFUN that CALLS a
+;;; const-bearing sibling are all the same bug, and all of them are below.
+;;;
+;;; Everything here goes through jd-note-gcstale, not jd-assert, for the reason
+;;; the two probes above do: the file must run to its summary on an image where
+;;; the bug is OPEN (on such an image a broken macro would otherwise abort the
+;;; load and leave the remaining ~250 assertions unmeasured).  JD-GCSTALE-HITS
+;;; is the single headline: 0 means every quoted constant reachable from
+;;; persisted code survived collection.
+;;;
+;;; Values are asserted, not liveness: each probe names the exact object it must
+;;; get back, so a garbage head (`(#<?> 2 3)`) or a stale string counts as a hit
+;;; rather than passing because nothing crashed.
+
+;; (1) EXPANSION CARRYING A STRING AND A QUOTED LIST, not just a symbol head.
+;; A symbol is the cheapest thing to notice going stale; strings and quoted
+;; sublists live in the same pool and take the same baked address.
+(eval '(defmacro jd-gcrich (x)
+         (list 'list "s-lit" (list 'quote (list 'q1 'q2)) x)))
+(jd-note-gcstale "gc-macro-rich-expand"
+                 (handler-case (macroexpand-1 '(jd-gcrich 7)) (t (c) :ERR))
+                 '(list "s-lit" '(q1 q2) 7))
+(jd-note-gcstale "gc-macro-rich-value"
+                 (handler-case (eval '(jd-gcrich 7)) (t (c) :ERR))
+                 '("s-lit" (q1 q2) 7))
+
+;; (2) A MACRO CALLING ANOTHER RUNTIME MACRO.  The outer expander's own consts
+;; must survive AND the inner expander must still be found and still work, so
+;; this fails if either page went stale.
+(eval '(defmacro jd-gcinner (a) (list '* a 2)))
+(eval '(defmacro jd-gcouter (a) (list 'jd-gcinner (list '+ a 1))))
+(jd-note-gcstale "gc-macro-nested-before"
+                 (handler-case (eval '(jd-gcouter 4)) (t (c) :ERR)) 10)
+
+;; (3) CLOSURES THAT OUTLIVE THEIR MODULE — the same hazard without a macro.
+(eval '(defparameter *jd-gcclo* (lambda () (list 'clo-sym "clo-str"))))
+(eval '(defparameter *jd-gctbl* (list (cons :k (lambda () (list 'tbl-sym "tbl-str"))))))
+(defparameter *jd-gcres* (eval '(function (lambda () (list 'res-sym "res-str")))))
+
+;; (4) A #222-INSTALLED NATIVE DEFUN THAT CALLS A CONST-BEARING SIBLING.
+;; jd-gcdirty holds the constants; jd-gcclean holds none, so the per-function
+;; const check admits IT for native installation — but an in-module call is a
+;; direct in-page branch straight into the dirty code.  The per-function check
+;; cannot see that; only a page-level rule can.
+(eval '(progn (defun jd-gcdirty () (list 'sib-sym "sib-str"))
+              (defun jd-gcclean () (jd-gcdirty))))
+(jd-note-gcstale "gc-sibling-before"
+                 (handler-case (list (jd-gcdirty) (jd-gcclean)) (t (c) :ERR))
+                 '((sib-sym "sib-str") (sib-sym "sib-str")))
+
+;; (5) `#'RUNTIME-DEFUN` AS A VALUE.  jd-gctramp is const-bearing, so #222
+;; leaves it an interpreter trampoline — a tag-9 HEAP closure.  The lambda
+;; below is itself const-free, so its page builds, and %jit-reloc-fn-addrs
+;; baked that heap address straight into a movabs (it had no tag-3 requirement,
+;; unlike the CALL reloc).  On the pre-fix image this returns correctly, then
+;; after one collection faults hard enough to escape its own handler-case —
+;; the load reports `UNHANDLED-ESCAPE … NIL`, swallows the form and carries on.
+;; Hence the two-step shape: the risky call is alone in its own top-level form,
+;; writing a global that the assertion reads afterwards, so a swallowed form
+;; still lands as a HIT and the probe COUNT is the same on both images.
+(eval '(defun jd-gctramp () (list 'fa-sym "fa-str")))
+(eval '(defparameter *jd-gcfa* (lambda () (funcall (function jd-gctramp)))))
+(jd-note-gcstale "gc-fnaddr-value-before"
+                 (handler-case (funcall *jd-gcfa*) (t (c) :ERR))
+                 '(fa-sym "fa-str"))
+(defparameter *jd-fa-res* :NOT-REACHED)
+
+;; ---- one collection, then re-check every one of them ----
+(jd-gc-fired "gc-ext-fired1")
+(setq *jd-fa-res* (handler-case (funcall *jd-gcfa*) (t (c) :ERR)))
+(jd-note-gcstale "gc-fnaddr-value-after" *jd-fa-res* '(fa-sym "fa-str"))
+(jd-note-gcstale "gc-macro-rich-expand-after"
+                 (handler-case (macroexpand-1 '(jd-gcrich 7)) (t (c) :ERR))
+                 '(list "s-lit" '(q1 q2) 7))
+(jd-note-gcstale "gc-macro-rich-value-after"
+                 (handler-case (eval '(jd-gcrich 7)) (t (c) :ERR))
+                 '("s-lit" (q1 q2) 7))
+(jd-note-gcstale "gc-macro-nested-after"
+                 (handler-case (eval '(jd-gcouter 4)) (t (c) :ERR)) 10)
+;; the raw expander object, reached the way a user reaches it
+(jd-note-gcstale "gc-macro-fn-funcall-after"
+                 (handler-case (funcall (macro-function 'jd-gcmac) '(jd-gcmac 2 3) nil)
+                   (t (c) :ERR))
+                 '(+ 2 3))
+(jd-note-gcstale "gc-closure-global-after"
+                 (handler-case (funcall *jd-gcclo*) (t (c) :ERR))
+                 '(clo-sym "clo-str"))
+(jd-note-gcstale "gc-closure-in-data-after"
+                 (handler-case (funcall (cdr (assoc :k *jd-gctbl*))) (t (c) :ERR))
+                 '(tbl-sym "tbl-str"))
+(jd-note-gcstale "gc-closure-eval-result-after"
+                 (handler-case (funcall *jd-gcres*) (t (c) :ERR))
+                 '(res-sym "res-str"))
+(jd-note-gcstale "gc-sibling-dirty-after"
+                 (handler-case (jd-gcdirty) (t (c) :ERR)) '(sib-sym "sib-str"))
+(jd-note-gcstale "gc-sibling-clean-after"
+                 (handler-case (jd-gcclean) (t (c) :ERR)) '(sib-sym "sib-str"))
+
+;; (5) MANY COLLECTIONS LATER.  One collection only proves the FIRST move was
+;; survived; a page whose address happens to be re-baked once, or a constant
+;; that happened not to move, would pass that.  Three more collections move the
+;; semispaces back and forth repeatedly.
+(jd-gc-fired "gc-ext-fired2")
+(jd-gc-fired "gc-ext-fired3")
+(jd-gc-fired "gc-ext-fired4")
+(jd-note-gcstale "gc-macro-many-gcs"
+                 (handler-case (eval '(jd-gcrich 7)) (t (c) :ERR))
+                 '("s-lit" (q1 q2) 7))
+(jd-note-gcstale "gc-macro-nested-many-gcs"
+                 (handler-case (eval '(jd-gcouter 4)) (t (c) :ERR)) 10)
+(jd-note-gcstale "gc-closure-many-gcs"
+                 (handler-case (funcall *jd-gcclo*) (t (c) :ERR))
+                 '(clo-sym "clo-str"))
+
+;; (6) REDEFINITION ACROSS A COLLECTION.  The NEW definition must win and must
+;; itself survive the NEXT collection — this is what catches a fix that merely
+;; re-bakes the page that happens to be cached, since a redefinition builds a
+;; different page while the old one is still reachable.
+;;
+;; NOTE THE CALL-SITE TEXT.  Each use below is a DIFFERENT form — (jd-gcredef 5),
+;; then 6, then 7 — deliberately, so this probe measures the GC question and
+;; only the GC question.  Re-using the SAME text would instead hit
+;; *mvm-eval-cache*, an unrelated and pre-existing defect measured separately
+;; by jd-note-macro-redef below.
+(eval '(defmacro jd-gcredef (a) (list 'list ''v1 a)))
+(jd-note-gcstale "gc-redef-v1" (handler-case (eval '(jd-gcredef 5)) (t (c) :ERR))
+                 '(v1 5))
+(jd-gc-fired "gc-ext-fired5")
+(eval '(defmacro jd-gcredef (a) (list 'list ''v2 a "r-str")))
+(jd-note-gcstale "gc-redef-v2-fresh"
+                 (handler-case (eval '(jd-gcredef 6)) (t (c) :ERR)) '(v2 6 "r-str"))
+(jd-gc-fired "gc-ext-fired6")
+(jd-note-gcstale "gc-redef-v2-after"
+                 (handler-case (eval '(jd-gcredef 7)) (t (c) :ERR)) '(v2 7 "r-str"))
+
+;;; ---- SECOND KNOWN-OPEN BUG, found by the probe above, counted separately ----
+;;; A runtime macro REDEFINITION is invisible to a call site whose form TEXT was
+;;; already evaluated once.  Nothing to do with GC — it reproduces with no
+;;; collection anywhere, and identically on the pre-fix image:
+;;;
+;;;   (eval '(defmacro rm (a) (list 'list ''v1 a)))   (eval '(rm 5)) => (V1 5)
+;;;   (eval '(defmacro rm (a) (list 'list ''v2 a)))   (eval '(rm 5)) => (V1 5)  ***
+;;;                                                   (eval '(rm 6)) => (V2 6)
+;;;                                                   (macroexpand-1 '(rm 5))
+;;;                                                                  => (LIST 'V2 5)
+;;;
+;;; *mvm-eval-cache* is keyed by EQUAL on the FORMS, so the second `(rm 5)`
+;;; replays the module compiled against the OLD expander — the macro was baked
+;;; into that module at compile time.  MACRO-FUNCTION and MACROEXPAND-1 are both
+;;; already correct, and a DEFUN redefinition is honoured (a compiled call
+;;; resolves its callee by name at call time, so it late-binds); it is only the
+;;; macro case that the cache freezes.  The parallel already exists for the
+;;; native side — mvm-eval-forms drops *jit-page-cache* when a DEFUN is
+;;; redefined — so the shape of the fix is known; it belongs in its own change
+;;; with its own gate, not smuggled into a GC fix.
+(defparameter *jd-macro-redef* 0)
+(defparameter *jd-macro-redef-hits* 0)
+(defun jd-note-macro-redef (label got expected)
+  (setq *jd-macro-redef* (+ 1 *jd-macro-redef*))
+  (unless (string= (jd-str got) (jd-str expected))
+    (setq *jd-macro-redef-hits* (+ 1 *jd-macro-redef-hits*))
+    (format t "JD-MACRO-REDEF ~A  got=~S  correct-would-be=~S~%" label got expected))
+  nil)
+(eval '(defmacro jd-cachemac (a) (list 'list ''c1 a)))
+(jd-note-macro-redef "redef-cache-v1"
+                     (handler-case (eval '(jd-cachemac 5)) (t (c) :ERR)) '(c1 5))
+(eval '(defmacro jd-cachemac (a) (list 'list ''c2 a)))
+(jd-note-macro-redef "redef-cache-same-form"
+                     (handler-case (eval '(jd-cachemac 5)) (t (c) :ERR)) '(c2 5))
+(jd-note-macro-redef "redef-cache-new-form"
+                     (handler-case (eval '(jd-cachemac 9)) (t (c) :ERR)) '(c2 9))
+(jd-note-macro-redef "redef-cache-expand"
+                     (handler-case (macroexpand-1 '(jd-cachemac 5)) (t (c) :ERR))
+                     '(list 'c2 5))
+
+;;; ---- KNOWN-OPEN RESIDUAL, counted on its own line ----
+;;; Not a macro and not a closure: ONE top-level form, JIT'd, that allocates
+;;; past the collection threshold DURING its own execution.  The seam re-bakes
+;;; const immediates at ENTRY (%jit-entry-for, keyed on %gc-count); a collection
+;;; that fires mid-flight has no second chance, so the form's own quoted
+;;; literals go stale for the remainder of that single execution and it returns
+;;; a silently wrong answer with no macro, no closure and no persistence
+;;; involved.  It is the same root cause as everything above and it is NOT
+;;; fixed by the page-level const gate — reaching it needs the const pool read
+;;; through a GC-updated indirection (the constant vector, task #226).
+;;; Reported on its own counter so it cannot be mistaken for the class that IS
+;;; closed, and so it stops reporting the day #226 lands.
+(defparameter *jd-gcresid* 0)
+(defparameter *jd-gcresid-hits* 0)
+(defun jd-note-gcresid (label got expected)
+  (setq *jd-gcresid* (+ 1 *jd-gcresid*))
+  (unless (string= (jd-str got) (jd-str expected))
+    (setq *jd-gcresid-hits* (+ 1 *jd-gcresid-hits*))
+    (format t "JD-GCRESID ~A  got=~S  correct-would-be=~S~%" label got expected))
+  nil)
+(jd-note-gcresid
+  "gc-midform-consts"
+  (handler-case
+      (eval '(let ((g0 (jd-gcn)))
+               (dotimes (i 60)
+                 (when (> (jd-gcn) g0) (return nil))
+                 (dotimes (j 100000) (make-list 40)))
+               (list 'mid-sym "mid-str")))
+    (t (c) :ERR))
+  '(mid-sym "mid-str"))
+
 (eval '(defun jd-gcfn (x) (+ (* x 3) 1)))
 (jd-assert "d222-gc-before"  (eval '(jd-gcfn 10)) 31)
 (jd-gc-fired "d222-gc-fired1")
@@ -1116,6 +1333,15 @@
 ;; JD-GCSTALE-HITS is the headline of this file's GC work: how many probes saw a
 ;; const go stale across a REAL collection.  0 = the const pool survives GC.
 (format t "JD-GCSTALE-PROBES=~D~%JD-GCSTALE-HITS=~D~%" *jd-gcstale* *jd-gcstale-hits*)
+;; The mid-form-collection residual (see jd-note-gcresid): same root cause,
+;; NOT covered by the page-level const gate, closed only by task #226.
+(format t "JD-GCRESID-PROBES=~D~%JD-GCRESID-HITS=~D~%"
+        *jd-gcresid* *jd-gcresid-hits*)
+;; Runtime macro REDEFINITION vs *mvm-eval-cache* (see jd-note-macro-redef):
+;; a separate, pre-existing, non-GC defect, reported so it is not confused
+;; with either of the two above.
+(format t "JD-MACRO-REDEF-PROBES=~D~%JD-MACRO-REDEF-HITS=~D~%"
+        *jd-macro-redef* *jd-macro-redef-hits*)
 (format t "JD-MV-TOTAL=~D~%JD-MV-NATIVE=~D~%JD-MV-CL-GAP=~D~%JD-MV-FALLBACK=~D~%"
         *jd-mv-total* *jd-mv-native* *jd-mv-clgap*
         (if (boundp '*jit-mv-fallback-count*) (or *jit-mv-fallback-count* 0) 0))

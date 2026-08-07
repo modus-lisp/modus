@@ -184,6 +184,11 @@
 ;;;                     was itself defined at runtime.
 ;;;   R-RELOC-FNADDR-FAIL       a #'NAME value load could not be resolved.
 ;;;   R-MMAP-FAIL       %mmap-exec-page returned a non-address.
+;;;   R-CONST-BAKED     a const-pool heap address would be baked into a
+;;;                     function that OUTLIVES the module (a persisted DEFUN,
+;;;                     a lambda body, an flet body) — where the next
+;;;                     collection makes it stale and nothing re-bakes it.
+;;;                     See the GC-SAFETY GATE in %jit-translate-page-1.
 ;;;   R-MV              the form left an MV count OUTSIDE [0,21] — past the
 ;;;                     20-slot MV-VALUES area — so the native block cannot be
 ;;;                     read back and the form is re-interpreted.
@@ -201,6 +206,12 @@
 (defvar *jit-r-mmap-fail* nil)
 (defvar *jit-r-page-nil* nil)
 (defvar *jit-r-native-escape* nil)
+(defvar *jit-r-const-baked* nil
+  "R-CONST-BAKED: the module's native code would contain BAKED const-pool heap
+   addresses (%jit-patch-consts movabs sites), which the next collection makes
+   stale with no way to re-bake.  See the GC-SAFETY GATE in
+   %jit-translate-page-1 — such a module is INTERPRETED, so every quoted
+   constant is read live out of *e2-const-pool* by op-LI-CONST.")
 
 (defvar *jit-census-on* nil
   "When T the census ALSO records the NAMES/messages behind each blocked
@@ -466,12 +477,28 @@
    object flows into eq / eql / funcall, so the imm must be the full tagged word
    (entry|3).  This makes `(eq #'eq (symbol-function 'eq))` T and
    `%ht-canonicalize-test`'s `(eql v (function %eq-fn))` succeed under JIT.
-   Returns T if every reloc resolved, NIL if any failed (→ caller falls back)."
+   Returns T if every reloc resolved, NIL if any failed (→ caller falls back).
+
+   TAG-3 REQUIRED, same rule %jit-reloc-calls has had since #206 — but here for
+   a GC reason rather than a PROT_EXEC one.  `#'NAME` of a RUNTIME-defined
+   function that kept its interpreter trampoline resolves to a HEAP closure
+   (tag 9), and baking a heap address into an immediate is exactly the hazard
+   the GC-SAFETY GATE in %jit-translate-page-1 exists to prevent: the collector
+   moves the closure and the immediate is never re-patched.  Measured on main —
+   a const-free lambda that merely mentions `(function tf)` for a const-bearing
+   runtime `tf` returns correctly, then after ONE collection faults hard enough
+   to escape its own handler-case (`UNHANDLED-ESCAPE … NIL`).  Const patches and
+   these two relocation classes are the ONLY places an immediate is baked, so
+   with this guard in place a built page provably holds no heap address at all
+   and is GC-immune by construction.  A non-tag-3 target now fails the reloc,
+   which fails the page build, which interprets the form once — correct, and
+   the trampoline is late-bound there anyway."
   (let ((ok t))
     (dolist (r relocs)
       (let* ((name (gethash (cdr r) rt-table))
              (fn (and name (%mvm-resolve-runtime-fn name)))
-             (word (if fn (%val->word fn) 0)))
+             (word0 (if fn (%val->word fn) 0))
+             (word (if (eql (logand word0 15) 3) word0 0)))
         (if (> word 0)
             (%jit-write-imm64 base (car r) word)
             (progn
@@ -651,6 +678,122 @@
    DEFUNs as real native functions; see the WS5 #222 block above."
   (setq *x64-jit-mode* t)
   (multiple-value-bind (nbuf fn-map) (translate-mvm-to-x64 bc ft-list)
+    ;; ============================================================
+    ;; GC-SAFETY GATE (R-CONST-BAKED) — a page that would bake const-pool
+    ;; HEAP addresses is not built at all; the module INTERPRETS instead.
+    ;; ============================================================
+    ;; %jit-patch-consts writes each const-pool object's CURRENT tagged heap
+    ;; address into a `movabs` immediate.  Those objects MOVE under the Cheney
+    ;; collector, and the only re-bake (%jit-entry-for, keyed on %gc-count)
+    ;; fires when a cached page is re-entered THROUGH THE SEAM.  Three ways
+    ;; native code with baked consts is reached WITHOUT crossing that seam —
+    ;; all three were live wrong-answer bugs on main, all measured:
+    ;;
+    ;;   1. A CLOSURE built by this page outlives it.  A runtime DEFMACRO's
+    ;;      expander (set-macro-function), a lambda stored in a global or in a
+    ;;      data structure, a lambda returned as the EVAL result: each is a
+    ;;      #x52 closure whose slot-0 points into this exec page.  It is
+    ;;      funcalled directly, never through the seam, so nothing re-bakes it.
+    ;;        (eval '(defmacro m (a b) (list '+ a b)))  … one GC …
+    ;;        (macroexpand-1 '(m 2 3))  =>  (#<?> 2 3)   [garbage head]
+    ;;      That is the bug this gate was written for.
+    ;;
+    ;;   2. A #222-installed native DEFUN reaches dirty code by CALLING it.
+    ;;      %jit-fn-native-offsets only checks a function's OWN byte range, but
+    ;;      an in-module call is a direct in-page branch, so a const-CLEAN
+    ;;      function installed natively can jump straight into a const-DIRTY
+    ;;      sibling:
+    ;;        (eval '(progn (defun h1 () (list 'aa "bb")) (defun h2 () (h1))))
+    ;;        … one GC …   (h1) => (AA "bb")   (h2) => (#<?> #<?>)
+    ;;      h1 kept its trampoline and is fine; h2 was published native and is
+    ;;      not.  The per-function check cannot see this; a page-level gate can.
+    ;;
+    ;;   3. A collection fires DURING this page's own execution.  The entry
+    ;;      re-bake happens at entry; a top-level form that allocates past the
+    ;;      threshold has every remaining const go stale mid-flight:
+    ;;        (eval '(progn <allocate until gc_count moves> (list 'ee "ff")))
+    ;;        => (#<?> #<?>)
+    ;;      No persistence and no closure involved — an ordinary form, silently
+    ;;      wrong.  Nothing short of a page-level gate covers this one.
+    ;;
+    ;;   4. `#'RUNTIME-DEFUN` as a VALUE.  %jit-reloc-fn-addrs baked whatever
+    ;;      word the name resolved to, and a runtime DEFUN that kept its
+    ;;      interpreter trampoline is a tag-9 HEAP closure.  A const-free lambda
+    ;;      that merely mentions `(function tf)` therefore held a heap address
+    ;;      too, and after one collection faulted hard enough to escape its own
+    ;;      handler-case.  Closed in %jit-reloc-fn-addrs itself (tag-3 required,
+    ;;      matching %jit-reloc-calls) rather than here, because the right answer
+    ;;      is to fail that reloc, not to inspect ranges.
+    ;;
+    ;; Rejecting the page is CORRECT-BY-CONSTRUCTION, in the same sense as the
+    ;; #206 tag-3 callee guard: with no const patch sites the page contains NO
+    ;; baked heap address at all.  The only other places an immediate is baked
+    ;; are the two relocation classes (%jit-reloc-calls / %jit-reloc-fn-addrs),
+    ;; and BOTH now require a tag-3 native word — build-time image code or a
+    ;; `%mmap-exec-page` page, neither of which the collector ever moves.  So
+    ;; `cpatches = NIL` implies GC-immune, with no post-GC hook needed anywhere.
+    ;;
+    ;; The interpreted module is immune for the reason the DEFUN trampolines
+    ;; already were: mvm-interpret's op-LI-CONST does
+    ;; `(gethash idx *e2-const-pool*)` at EXECUTION time, so it reads whatever
+    ;; the collector has updated the pool to hold.  Measured directly — inside
+    ;; ONE lambda body after a collection, an explicit `(gethash idx
+    ;; *e2-const-pool*)` returned the live object while the quoted literal
+    ;; beside it returned the stale one.
+    ;;
+    ;; SCOPE — why the gate is "outside the THUNK", not "any const at all".
+    ;; The blanket rule (reject on ANY cpatch) is sound but unaffordable: the
+    ;; top-level thunk of `(defun f …)` carries the NAME 'F as a const, so
+    ;; EVERY runtime defun form would be rejected and #222 would never install
+    ;; anything native again — a runtime DEFUN's body would go back to being
+    ;; interpreted.  Measured, not assumed: with the blanket rule the class
+    ;; probes' own `(dotimes (j 100000) (make-list 40))` allocation loop went
+    ;; from seconds to not finishing in two minutes.
+    ;;
+    ;; The thunk is the ONE function in the module that is entered only through
+    ;; the seam, exactly once, with %jit-entry-for's re-bake in front of it.
+    ;; Every OTHER function in the page — top-level defuns, lambda/closure
+    ;; bodies, flet/labels bodies — either persists past the module (installed,
+    ;; captured in a closure, stored) or is the in-page callee of something that
+    ;; does.  So: a const patch site inside ANY non-thunk function rejects the
+    ;; page; const sites confined to the thunk are allowed to bake.
+    ;;
+    ;; RESIDUAL, stated rather than hidden: hazard 3 above survives for the
+    ;; THUNK'S OWN consts — a single top-level form holding a quoted literal
+    ;; that itself allocates past the collection threshold still reads a stale
+    ;; address after that mid-flight GC.  Closing that too needs the const pool
+    ;; reached through a GC-UPDATED INDIRECTION (task #226's constant vector),
+    ;; after which this whole gate can be deleted.  *jit-r-const-baked* counts
+    ;; how often the gate fires.
+    (let ((%cpatches *x64-li-const-patches*))
+      (when %cpatches
+        (let* ((%tlbl (gethash "%MVM-EVAL-THUNK" fn-map))
+               (%tstart (if %tlbl (label-position %tlbl) nil)))
+          (if (not (integerp %tstart))
+              ;; No identifiable thunk range → cannot prove any const site is
+              ;; seam-guarded.  Reject.
+              (progn
+                (setq *jit-r-const-baked*
+                      (if *jit-r-const-baked* (+ 1 *jit-r-const-baked*) 1))
+                (return-from %jit-translate-page-1 nil))
+              ;; THUNK END = the smallest OTHER function start strictly greater
+              ;; than %TSTART, else the whole buffer.  Scanned (not "next in
+              ;; ft-list") so the answer does not depend on ft-list ordering.
+              ;; When the thunk is emitted LAST the range runs to the end of the
+              ;; buffer, which over-covers the translator's trailing GC/handler
+              ;; helpers — those are hand-emitted asm and carry no :li-const, so
+              ;; nothing dirty can hide there.
+              (let ((%tend (code-buffer-position nbuf)))
+                (dolist (%e ft-list)
+                  (let* ((%l (gethash (car %e) fn-map))
+                         (%p (if %l (label-position %l) nil)))
+                    (when (and (integerp %p) (> %p %tstart) (< %p %tend))
+                      (setq %tend %p))))
+                (dolist (%cp %cpatches)
+                  (when (or (< (car %cp) %tstart) (>= (car %cp) %tend))
+                    (setq *jit-r-const-baked*
+                          (if *jit-r-const-baked* (+ 1 *jit-r-const-baked*) 1))
+                    (return-from %jit-translate-page-1 nil))))))))
     (let* ((nlen (code-buffer-position nbuf))
            (nbytes (code-buffer-bytes nbuf))
            (relocs *x64-call-relocs*)

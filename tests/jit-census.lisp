@@ -88,6 +88,8 @@
                            (jc-n '*jit-r-reloc-fnaddr-fail*))
                      (cons "R-MMAP-FAIL             (exec page could not be mapped)"
                            (jc-n '*jit-r-mmap-fail*))
+                     (cons "R-CONST-BAKED           (a const-pool heap addr would bake into code that OUTLIVES the module)"
+                           (jc-n '*jit-r-const-baked*))
                      (cons "R-NATIVE-ESCAPE         (native RAN then escaped: DOUBLE-EXECUTES)"
                            (jc-n '*jit-r-native-escape*))
                      (cons "R-PAGE-NIL              (page build returned NIL; union of the RELOC/MMAP rows)"

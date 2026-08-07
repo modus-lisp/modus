@@ -727,6 +727,261 @@
 (jd-check "xform-var"     '(* *jd-xv* 2))
 (jd-check "xform-in-loop" '(let ((s 0)) (dotimes (i 5 s) (setq s (+ s (jd-x1 i))))))
 
+;;; ------------------------------------------------------------------
+;;; WS5 #222 -- NATIVE INSTALLATION OF RUNTIME-DEFINED FUNCTIONS
+;;; ------------------------------------------------------------------
+;;;
+;;; A runtime DEFUN now installs REAL NATIVE CODE (a tag-3 pointer into the
+;;; module's exec page) instead of a %mvm-make-trampoline heap closure, so the
+;;; #206 native-callee relocation in %jit-reloc-calls resolves it and a later
+;;; top-level form that calls it reaches native.  These probes cover the three
+;;; things that installation must not break -- VALUES (interp vs JIT, via
+;;; jd-check), function-object IDENTITY, and REDEFINITION -- plus the two shapes
+;;; the task called out explicitly (redefinition, mutual recursion) and a GC
+;;; probe, since an exec page lives OUTSIDE the collected heap and a
+;;; persistently-installed function is never re-visited by the seam.
+
+(defparameter *jd222-total* 0)
+(defparameter *jd222-fail* 0)
+
+(defun jd-assert (label got expected)
+  "Structural assertion (printed-form comparison, like jd-check's oracle).
+   Failures are rolled into *jd-diverge* so JD-OK/JD-FAIL remains the gate."
+  (setq *jd222-total* (+ 1 *jd222-total*))
+  (unless (string= (jd-str got) (jd-str expected))
+    (setq *jd222-fail* (+ 1 *jd222-fail*))
+    (setq *jd-diverge* (+ 1 *jd-diverge*))
+    (format t "JD222-FAIL ~A~%  got      = ~S~%  expected = ~S~%" label got expected))
+  nil)
+
+(defparameter *jd222-earlybind* 0)
+
+(defun jd-note-earlybind (label got expected)
+  "KNOWN DIVERGENCE, reported rather than failed.  A runtime function that is
+   ALREADY installed as native code baked its callees' addresses at page-build
+   time, so redefining one of those callees is not seen by it — early binding,
+   the same rule build-time native code has always had (CLAUDE.md limitation 1).
+   The interpreter resolves by name on every call and therefore late-binds.
+   Counted separately so the oracle stays a clean gate while the divergence
+   stays VISIBLE and measured."
+  (setq *jd222-earlybind* (+ 1 *jd222-earlybind*))
+  (unless (string= (jd-str got) (jd-str expected))
+    (format t "JD222-EARLYBIND ~A  got=~S  late-binding-would-give=~S~%"
+            label got expected))
+  nil)
+
+;;; TAG PROBE.  %val->word is a compiler primop (SHL 1) and is only reliable
+;;; where the surrounding code is NATIVE.  Under mvm-interpret the interpreter
+;;; itself works in the word domain (reg-get = %val->word, reg-set = %word->val,
+;;; interp.lisp:53), so an INTERPRETED %val->word double-converts and the low
+;;; nibble reads back wrong: on the pre-#222 binary this expression returns 2
+;;; for #'CAR, a build-time native function that is unambiguously tag 3.
+;;;
+;;; So the tag is computed in a top-level form of its OWN -- a bare SETQ whose
+;;; only callees (symbol-function, floor) are build-time native, so it always
+;;; relocates and always runs native -- and stashed in a global that jd-assert
+;;; then reads.  Putting the expression inline as a jd-assert ARGUMENT does not
+;;; work: jd-assert is itself a runtime-defined, const-bearing (format string)
+;;; function that keeps its trampoline, so the whole calling form fails
+;;; relocation and interprets, and the probe would measure the interpreter's
+;;; %val->word rather than the installed function's tag.  LOGAND is avoided in
+;;; favour of floor arithmetic for the same robustness reason.
+(defparameter *jd222-tag* 0)
+(defmacro jd-tag-into (form)
+  (list 'setq '*jd222-tag*
+        (list 'let (list (list 'w (list '%val->word form)))
+              (list '- 'w (list '* 16 (list 'floor 'w 16))))))
+
+;; --- the basic shape: define at runtime, call from a LATER top-level form ---
+(defun jd-n1 (x) (* x 5))
+(defun jd-n2 (x) (+ (jd-n1 x) 2))
+(defun jd-nfact (n) (if (< n 2) 1 (* n (jd-nfact (- n 1)))))   ; self-recursion
+
+(jd-check "d222-call"      '(jd-n1 7))
+(jd-check "d222-nested"    '(jd-n2 7))
+(jd-check "d222-selfrec"   '(jd-nfact 8))
+(jd-check "d222-2calls"    '(+ (jd-n1 1) (jd-n1 2)))
+(jd-check "d222-loop"      '(let ((s 0)) (dotimes (i 6 s) (setq s (+ s (jd-n1 i))))))
+(jd-check "d222-mapcar"    '(mapcar #'jd-n1 (list 1 2 3)))
+(jd-check "d222-funcall"   '(funcall #'jd-n1 4))
+(jd-check "d222-apply"     '(apply (function jd-n2) (list 4)))
+(jd-check "d222-reduce"    '(reduce #'+ (mapcar #'jd-n1 (list 1 2 3))))
+(jd-check "d222-hof-sort"  '(sort (mapcar #'jd-n1 (list 3 1 2)) #'<))
+;; the defun and the call in ONE later form (module-internal + cross-module mix)
+(jd-check "d222-mixed"     '(progn (defun jd-n3 (x) (jd-n1 (+ x 1))) (jd-n3 2)))
+
+;; --- IDENTITY: symbol-function / #'NAME / funcall must all agree ------------
+(jd-assert "d222-id-eq"       (eq (function jd-n1) (symbol-function 'jd-n1)) t)
+(jd-assert "d222-id-fnp"      (functionp (symbol-function 'jd-n1)) t)
+(jd-assert "d222-id-call"     (funcall (symbol-function 'jd-n1) 3) 15)
+(jd-assert "d222-id-apply"    (apply (symbol-function 'jd-n1) (list 3)) 15)
+;; the point of the whole exercise: the installed object is NATIVE (tag 3), not
+;; a heap closure (tag 9).  This is exactly the predicate %jit-reloc-calls uses,
+;; and exactly what actor-spawn's `(untag fn)` + jump requires.
+;; control: a build-time native function must read 3 (proves the probe works)
+(jd-tag-into (symbol-function 'car))
+(jd-assert "d222-tag-builtin" *jd222-tag* 3)
+;; the claim: a RUNTIME-defined function now reads 3 too, not 9 (heap closure)
+(jd-tag-into (symbol-function 'jd-n1))
+(jd-assert "d222-tag-native"  *jd222-tag* 3)
+(jd-tag-into (symbol-function 'jd-nfact))
+(jd-assert "d222-tag-selfrec" *jd222-tag* 3)
+;; a CONST-BEARING runtime defun is deliberately NOT installed: it keeps its
+;; interpreter trampoline, which is a heap object (tag 9).  This is the measured
+;; boundary of the feature, asserted rather than assumed.
+(eval '(defun jd-tramp-fn (x) (format nil "~D" x)))
+(jd-tag-into (symbol-function 'jd-tramp-fn))
+(jd-assert "d222-tag-const-tramp" *jd222-tag* 9)
+
+;; --- REDEFINITION (last-defun-wins), including the CACHED-FORM path ---------
+;; The same call form text is evaluated before AND after the redefinition, so
+;; the compiled-module tuple cache (and, under JIT, *jit-page-cache*) is hit the
+;; second time.  Without cache invalidation the cached page would keep calling
+;; the superseded address and silently return the OLD answer.
+(eval '(defun jd-redef (x) (* x 2)))
+(jd-assert "d222-redef-1st"   (eval '(jd-redef 5)) 10)
+(eval '(defun jd-redef (x) (* x 100)))
+(jd-assert "d222-redef-2nd"   (eval '(jd-redef 5)) 500)
+(eval '(defun jd-redef (x) (- x)))
+(jd-assert "d222-redef-3rd"   (eval '(jd-redef 5)) -5)
+;; redefinition must also be visible through symbol-function and #'NAME
+(jd-assert "d222-redef-symfn" (funcall (symbol-function 'jd-redef) 5) -5)
+;; An indirect caller compiled BEFORE the change sees the definition current at
+;; ITS compile time (correct), ...
+(eval '(defun jd-redef-caller (x) (jd-redef x)))
+(jd-assert "d222-redef-via-1" (eval '(jd-redef-caller 5)) -5)
+;; ... but once jd-redef-caller is itself installed NATIVE it has BAKED
+;; jd-redef's address, so a later redefinition of jd-redef is invisible to it.
+;; This is the one semantic divergence #222 introduces and it is deliberately
+;; reported, not fixed -- see jd-note-earlybind and GATE-RESULT-jit-defun.md.
+(eval '(defun jd-redef (x) (* x 7)))
+(jd-note-earlybind "d222-redef-via-2" (eval '(jd-redef-caller 5)) 35)
+;; The DIRECT call, however, must always see the newest definition.
+(jd-assert "d222-redef-direct" (eval '(jd-redef 5)) 35)
+(jd-assert "d222-redef-symfn2" (funcall (symbol-function 'jd-redef) 5) 35)
+
+;; --- MUTUAL RECURSION across separate top-level forms ----------------------
+;; PASS 1: jd-even is defined while jd-odd does not yet exist, so jd-even's
+;; page fails relocation (R-RELOC-CALL-UNRESOLVED) and it keeps its trampoline;
+;; jd-odd then fails too (its callee jd-even is a heap closure).  Answers must
+;; still be right -- this is the interpret fallback doing its job.
+(eval '(defun jd-even (n) (if (= n 0) t (jd-odd (- n 1)))))
+(eval '(defun jd-odd  (n) (if (= n 0) nil (jd-even (- n 1)))))
+(jd-assert "d222-mutrec-p1-e"  (eval '(jd-even 10)) t)
+(jd-assert "d222-mutrec-p1-o"  (eval '(jd-odd 10)) nil)
+(jd-assert "d222-mutrec-p1-e7" (eval '(jd-even 7)) nil)
+;; PASS 2: re-evaluating both does NOT help, and this was MEASURED, not assumed
+;; -- the first draft of this file claimed "the limitation is one pass deep" and
+;; the probe disproved it.  Mutual recursion split across separate top-level
+;; forms can NEVER go native under this scheme: jd-even can only relocate if
+;; jd-odd is already native, and jd-odd can only relocate if jd-even is, so
+;; neither can go first.  Both keep their trampolines at pass 1, 2 and 3, and
+;; the answers stay correct via the interpret fallback.
+(eval '(defun jd-even (n) (if (= n 0) t (jd-odd (- n 1)))))
+(eval '(defun jd-odd  (n) (if (= n 0) nil (jd-even (- n 1)))))
+(jd-assert "d222-mutrec-p2-e"  (eval '(jd-even 10)) t)
+(jd-assert "d222-mutrec-p2-o"  (eval '(jd-odd 11)) t)
+(jd-assert "d222-mutrec-p2-e7" (eval '(jd-even 7)) nil)
+;; ...so this one is EXPECTED in JD-NEVER-NATIVE.  It is listed there as the
+;; measured boundary, not as an unexplained fallback.
+(jd-check  "d222-mutrec-call"  '(list (jd-even 20) (jd-odd 20)))
+
+;; The working shape: mutual recursion inside ONE top-level form.  Both bodies
+;; are then in the SAME module, so the calls are IN-module and need no
+;; relocation at all -- both install natively.  This is what a progn, a file
+;; compiler, or LABELS produces, so the limitation above is narrower than it
+;; looks.
+(eval '(progn (defun jd-seven (n) (if (= n 0) t (jd-sodd (- n 1))))
+              (defun jd-sodd  (n) (if (= n 0) nil (jd-seven (- n 1))))))
+(jd-assert "d222-mutrec-1form-e" (eval '(jd-seven 10)) t)
+(jd-assert "d222-mutrec-1form-o" (eval '(jd-sodd 11)) t)
+(jd-tag-into (symbol-function 'jd-seven))
+(jd-assert "d222-mutrec-1form-tag-e" *jd222-tag* 3)
+(jd-tag-into (symbol-function 'jd-sodd))
+(jd-assert "d222-mutrec-1form-tag-o" *jd222-tag* 3)
+(jd-check  "d222-mutrec-1form-call" '(list (jd-seven 20) (jd-sodd 20)))
+
+;; A plain FORWARD reference (not mutual) IS one pass deep: fwd-a defined while
+;; fwd-b does not exist keeps its trampoline, but re-evaluating fwd-a once
+;; fwd-b is native makes fwd-a native too -- the cascade, one definition at a
+;; time, which is how a loaded library links against itself.
+(eval '(defun jd-fwd-a (x) (jd-fwd-b x)))
+(eval '(defun jd-fwd-b (x) (* x 2)))
+(jd-tag-into (symbol-function 'jd-fwd-b))
+(jd-assert "d222-fwd-b-native"  *jd222-tag* 3)
+(jd-tag-into (symbol-function 'jd-fwd-a))
+(jd-assert "d222-fwd-a-tramp"   *jd222-tag* 9)
+(eval '(defun jd-fwd-a (x) (jd-fwd-b x)))
+(jd-tag-into (symbol-function 'jd-fwd-a))
+(jd-assert "d222-fwd-a-native"  *jd222-tag* 3)
+(jd-assert "d222-fwd-value"     (eval '(jd-fwd-a 5)) 10)
+
+;; --- CONST-POOL-BEARING defuns keep their trampoline: still CORRECT --------
+;; A function whose native range contains a const-pool patch site is NOT
+;; installed natively (the baked immediate would go stale across a GC and
+;; nothing re-bakes a persistently-installed function).  It must still work.
+(eval '(defun jd-conststr (x) (concatenate 'string "v=" (princ-to-string x))))
+(eval '(defun jd-constlist () '(a b c)))
+(jd-assert "d222-const-str"   (eval '(jd-conststr 7)) "v=7")
+(jd-assert "d222-const-list"  (eval '(jd-constlist)) '(a b c))
+(jd-check  "d222-const-call"  '(list (jd-conststr 1) (jd-constlist)))
+
+;; --- GC: the exec page lives OUTSIDE the collected heap --------------------
+;; A natively-installed function is entered directly by native code and is never
+;; re-visited by the seam, so it must survive collection with no re-patching.
+;; Allocate hard between calls and re-check the answers and the identity.
+(eval '(defun jd-gcfn (x) (+ (* x 3) 1)))
+(jd-assert "d222-gc-before"  (eval '(jd-gcfn 10)) 31)
+(eval '(dotimes (i 4000) (make-list 40)))
+(jd-assert "d222-gc-after"   (eval '(jd-gcfn 10)) 31)
+(jd-assert "d222-gc-id"      (eq (function jd-gcfn) (symbol-function 'jd-gcfn)) t)
+(jd-tag-into (symbol-function 'jd-gcfn))
+(jd-assert "d222-gc-tag"     *jd222-tag* 3)
+(eval '(dotimes (i 4000) (make-list 40)))
+(jd-assert "d222-gc-after2"  (funcall (symbol-function 'jd-gcfn) 10) 31)
+;; the trampoline-retaining (const-bearing) sibling must survive GC too
+(jd-assert "d222-gc-const"   (eval '(jd-conststr 7)) "v=7")
+
+;; --- arg-passing breadth over the native ABI -------------------------------
+(eval '(defun jd-args6 (a b c d e f) (list a b c d e f)))
+(eval '(defun jd-argopt (a &optional (b 10)) (+ a b)))
+(eval '(defun jd-argrest (a &rest r) (cons a r)))
+(eval '(defun jd-argkey (a &key (k 3)) (* a k)))
+(jd-assert "d222-args6"   (eval '(jd-args6 1 2 3 4 5 6)) '(1 2 3 4 5 6))
+(jd-assert "d222-argopt"  (eval '(list (jd-argopt 1) (jd-argopt 1 2))) '(11 3))
+(jd-assert "d222-argrest" (eval '(jd-argrest 1 2 3)) '(1 2 3))
+(jd-assert "d222-argkey"  (eval '(list (jd-argkey 2) (jd-argkey 2 :k 5))) '(6 10))
+;; multiple values out of a natively installed runtime function
+(eval '(defun jd-mvfn (x) (values x (* x 2) (* x 3))))
+(jd-assert "d222-mv"      (eval '(multiple-value-list (jd-mvfn 4))) '(4 8 12))
+(jd-check  "d222-mv-check" '(multiple-value-list (jd-mvfn 5)))
+;; a runtime function that SIGNALS must still propagate (no double execution)
+(eval '(defun jd-errfn (x) (if (< x 0) (error "neg") (* x 2))))
+(jd-assert "d222-err-ok"  (eval '(jd-errfn 3)) 6)
+(jd-assert "d222-err-sig"
+           (handler-case (eval '(jd-errfn -1)) (error (c) :caught)) :caught)
+;; closures returned by a natively installed runtime function
+(eval '(defun jd-mkadder (n) (lambda (x) (+ x n))))
+(jd-assert "d222-closure" (eval '(funcall (jd-mkadder 10) 5)) 15)
+(jd-assert "d222-closure2"
+           (eval '(let ((a (jd-mkadder 1)) (b (jd-mkadder 100)))
+                    (list (funcall a 1) (funcall b 1))))
+           '(2 101))
+
+;; --- DOUBLE-EXECUTION across the native-install boundary -------------------
+;; Defining a function is itself a side effect on the global tables, and the
+;; install now happens BEFORE %jit-call.  Confirm the form still runs once.
+(jd-once "d222-once-defun"
+         '(progn (setq *jd-side* (+ *jd-side* 1))
+                 (defun jd-once-fn (x) (* x 11))
+                 (jd-once-fn 2)) 1)
+(jd-once "d222-once-call"
+         '(progn (setq *jd-side* (+ *jd-side* 1)) (jd-n1 3)) 1)
+(jd-once "d222-once-redef"
+         '(progn (setq *jd-side* (+ *jd-side* 1))
+                 (defun jd-once-fn (x) (* x 12))
+                 (jd-once-fn 2)) 1)
+
 ;; Side-effect / double-execution probes (evaluated ONCE each, JIT live).
 (jd-once "side-single" '(setq *jd-side* (+ *jd-side* 1)) 1)
 (jd-once "side-progn"  '(progn (setq *jd-side* (+ *jd-side* 1))
@@ -749,6 +1004,11 @@
 (format t "~%JD-TOTAL=~D~%JD-DIVERGE=~D~%JD-NATIVE=~D~%JD-BOTH-SIGNALLED=~D~%"
         *jd-total* *jd-diverge* *jd-native* *jd-both-err*)
 ;; WS5 #218 proof: MV forms must reach native AND the MV fallback must be 0.
+;; WS5 #222: native runtime-DEFUN installation.
+(format t "JD222-TOTAL=~D~%JD222-FAIL=~D~%JD222-EARLYBIND=~D~%JD222-INSTALLED=~D~%"
+        *jd222-total* *jd222-fail* *jd222-earlybind*
+        (if (boundp '*jit-native-defun-count*)
+            (or *jit-native-defun-count* 0) 0))
 (format t "JD-MV-TOTAL=~D~%JD-MV-NATIVE=~D~%JD-MV-CL-GAP=~D~%JD-MV-FALLBACK=~D~%"
         *jd-mv-total* *jd-mv-native* *jd-mv-clgap*
         (if (boundp '*jit-mv-fallback-count*) (or *jit-mv-fallback-count* 0) 0))

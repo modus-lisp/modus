@@ -440,8 +440,15 @@ function — now exists.
   had 1.2 GB free, so this worktree uses a `git sparse-checkout` that skips
   them (`gate-*`, `modus-ansi-*`, `modus-aa64-*`, `modus-206*`, `modus-fix*`,
   `modus-base`, `modus-p1`).  They are `skip-worktree`, so `git status` is
-  clean and the branch content is unaffected; all gate artifacts were written
-  to `/tmp/ws222*` (a different filesystem) rather than into `/home`.
+  clean and the branch content is unaffected — the commits still contain them
+  and any other checkout of this branch gets them normally.  All gate artifacts
+  were written to `/tmp/ws222*` (a different filesystem) rather than into
+  `/home`, and were deleted afterwards.  To materialise the binaries in this
+  worktree (needs ~900 MB free):
+
+  ```bash
+  cd /home/claude/ws-defun && git sparse-checkout disable
+  ```
 
 ## 9. Reproduce
 

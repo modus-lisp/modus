@@ -1117,15 +1117,88 @@
     (or (%clos-init-gf-allows-other-keys-p 'initialize-instance cpl-names)
         (%clos-init-gf-allows-other-keys-p 'shared-initialize cpl-names))))
 
+(defun %clos-initarg-key-string (key)
+  "Printable NAME of an initarg key, or NIL when it can't be recovered.
+   Native-MVM symbols whose hash isn't in the build-time name table
+   reverse-look-up to \"\" — treat that as unknown rather than letting
+   every such symbol collapse into one equivalence class (the trap
+   documented on %clos-sym-name-eq)."
+  (let ((n (cond
+             ((null key) nil)
+             ((%cl-sym-p key) (%cl-sym-name key))
+             ((symbolp key) (symbol-name key))
+             ((stringp key) key)
+             (t nil))))
+    (if (and (stringp n) (> (length n) 0)) n nil)))
+
+(defun %clos-init-gf-key-name-p (gf-name cpl-names key-name)
+  "True if some method of GF-NAME whose OBJECT specializer is a class in
+   CPL-NAMES declares a &KEY parameter named KEY-NAME (a string).
+
+   CLHS 7.1.2: the valid initargs of MAKE-INSTANCE are the UNION of the
+   slot :initarg names AND the keyword-parameter names of every applicable
+   method on INITIALIZE-INSTANCE / SHARED-INITIALIZE / ALLOCATE-INSTANCE.
+   Validating against slot :initargs alone rejects the extremely common
+   shape
+
+     (defclass character-encoding () (...no such slot...))
+     (defmethod initialize-instance :after ((enc character-encoding)
+                                            &key literal-char-code-limit) ...)
+     (make-instance 'ascii :literal-char-code-limit 128)
+
+   which is how babel (and many other libraries) pass configuration to an
+   :after method without a backing slot."
+  (when (null key-name) (return-from %clos-init-gf-key-name-p nil))
+  (let ((gf (%find-gf gf-name)))
+    (when gf
+      (let ((cur (%gf-methods gf)))
+        (loop
+          (when (null cur) (return nil))
+          (let* ((m (car cur))
+                 ;; The instance is always the FIRST required parameter of
+                 ;; initialize-instance / shared-initialize, so its
+                 ;; specializer is at index 0 (same convention as
+                 ;; %clos-init-gf-allows-other-keys-p).
+                 (obj-spec (car (%method-specializers m))))
+            (when (and obj-spec
+                       (%clos-cpl-name-member-p obj-spec cpl-names))
+              ;; %gf-record-method-meta stores
+              ;;   (has-key has-rest aok key-name-strings)
+              ;; so the &KEY parameter names are at index 3.
+              (let ((meta (%gf-method-meta-for gf m)))
+                (when meta
+                  (let ((kc (nth 3 meta)))
+                    (loop
+                      (when (null kc) (return nil))
+                      (let ((kn (car kc)))
+                        (when (and (stringp kn) (> (length kn) 0)
+                                   (string-equal kn key-name))
+                          (return-from %clos-init-gf-key-name-p t)))
+                      (setq kc (cdr kc))))))))
+          (setq cur (cdr cur)))))))
+
+(defun %clos-init-methods-declare-key-p (class-name key)
+  "CLHS 7.1.2 union term: KEY is a &KEY parameter of some applicable
+   INITIALIZE-INSTANCE / SHARED-INITIALIZE / ALLOCATE-INSTANCE method."
+  (let ((key-name (%clos-initarg-key-string key)))
+    (when key-name
+      (let ((cpl-names (%clos-class-cpl-names class-name)))
+        (or (%clos-init-gf-key-name-p 'initialize-instance cpl-names key-name)
+            (%clos-init-gf-key-name-p 'shared-initialize cpl-names key-name)
+            (%clos-init-gf-key-name-p 'allocate-instance cpl-names key-name))))))
+
 (defun %clos-initarg-key-valid-p (class-name key)
   "True if KEY is a declared :initarg for some slot of CLASS-NAME (walking
-   the CPL), or one of the always-accepted standard initargs.  Used to
-   reject unknown initargs in MAKE-INSTANCE per CLHS 7.1.2."
+   the CPL), a &KEY parameter of an applicable initialization method, or
+   one of the always-accepted standard initargs.  Used to reject unknown
+   initargs in MAKE-INSTANCE per CLHS 7.1.2."
   (cond
     ;; :allow-other-keys is always accepted (CLHS 7.1.2).
     ((%clos-sym-name-eq key :allow-other-keys) t)
     ;; Maps to at least one slot anywhere in the CPL → valid.
     ((%clos-initarg-to-slot class-name key) t)
+    ;; Declared &KEY by an applicable initialization method → valid.
+    ((%clos-init-methods-declare-key-p class-name key) t)
     (t nil)))
 
 (defun %clos-validate-initargs-d (class-or-name initargs)

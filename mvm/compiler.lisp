@@ -8909,6 +8909,36 @@
              (cl-loop-keyword-p (cadr rest)))
     (cons (car rest) (cdr rest))))
 
+(defun %loop-simple-type-spec-p (x)
+  "CLHS 6.1.1.7 simple-type-spec — the four type specs that may appear
+   BARE (no OF-TYPE) directly after a FOR/AS/WITH variable:
+
+     simple-type-spec ::= fixnum | float | t | nil
+
+   The pre-existing bare-type heuristic (%loop-try-bare-type / the inline
+   copy in the FOR handler) only fires when the token AFTER the type is
+   itself a CL-LOOP-KEYWORD-P — and the arithmetic sub-keywords FROM /
+   BELOW / TO / IN / ON / ACROSS / = are deliberately NOT in that list.
+   So `for i fixnum from start below end' parsed FIXNUM as the iteration
+   form and the loop variable was never bound: UNBOUND-VARIABLE FIXNUM,
+   and, one level up, UNBOUND-VARIABLE I inside the body.  That is the
+   shape every babel encoder/decoder is built from (enc-unicode.lisp's
+   utf-8 encoder, encodings.lisp's define-unibyte-encoder), so babel
+   loaded fine and then failed on the first STRING-TO-OCTETS.
+
+   Recognising the four standard specs by name is unambiguous here: the
+   grammar allows only a type-spec or an iteration keyword in this
+   position, and none of the four is a loop keyword."
+  (cond
+    ((null x) t)                       ; NIL
+    ((eq x t) t)                       ; T
+    ((not (symbolp x)) nil)
+    (t (let ((n (normalize-name x)))
+         (or (= n 56757342)            ; FIXNUM
+             (= n 334057727)           ; FLOAT
+             (= n 47238915)            ; T
+             (= n 185799964))))))      ; NIL
+
 (defun %loop-try-into (rest)
   "If REST starts with INTO var [type-or-OF-TYPE], return
    (var TYPE-SPEC . new-rest-after).  TYPE-SPEC is NIL if not given.
@@ -9262,13 +9292,24 @@
                         (= (normalize-name (car rest)) 490334619))  ; OF-TYPE
                (setf rest (cddr rest)))
              ;; Skip BARE type symbol (FIXNUM, T, FLOAT, STRING, ...) —
-             ;; CLHS bare-type shorthand for OF-TYPE.  Only when the
-             ;; FOLLOWING token IS a loop keyword (so we don't eat an
-             ;; iter form like `IN (foo)`).
-             (when (and rest (cdr rest) (symbolp (car rest))
-                        (not (cl-loop-keyword-p (car rest)))
-                        (symbolp (cadr rest))
-                        (cl-loop-keyword-p (cadr rest)))
+             ;; CLHS bare-type shorthand for OF-TYPE.  Two triggers:
+             ;;  (a) the token IS one of the four CLHS simple-type-specs
+             ;;      (FIXNUM / FLOAT / T / NIL).  Unambiguous: at this
+             ;;      position the grammar admits only a type-spec or an
+             ;;      iteration keyword, and none of the four is a keyword.
+             ;;      This is what `for i fixnum from start below end' needs
+             ;;      — FROM/BELOW/TO/IN/ON/= are NOT in cl-loop-keyword-p,
+             ;;      so trigger (b) never fired for it and the loop var was
+             ;;      left unbound (every babel encoder/decoder is this shape).
+             ;;  (b) the pre-existing heuristic: any non-keyword symbol whose
+             ;;      FOLLOWING token IS a loop keyword (so we don't eat an
+             ;;      iter form like `IN (foo)`).
+             (when (and rest (cdr rest)
+                        (or (%loop-simple-type-spec-p (car rest))
+                            (and (symbolp (car rest))
+                                 (not (cl-loop-keyword-p (car rest)))
+                                 (symbolp (cadr rest))
+                                 (cl-loop-keyword-p (cadr rest)))))
                (setf rest (cdr rest)))
              (when (and var (not (consp var)) rest)
              (let ((iter-kw (normalize-name (car rest))))

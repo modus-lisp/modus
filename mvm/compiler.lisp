@@ -2543,6 +2543,64 @@
             (body (cddr form)))
         `(if ,test nil (progn ,@body)))))
 
+  ;; ASSERT — CLHS 5.3 / macro ASSERT:
+  ;;   (assert test-form [({place}*) [datum-form {argument-form}*]])
+  ;; ASSERT IS A MACRO.  The PLACE LIST IS NOT EVALUATED — the places exist
+  ;; only so the correctable error can offer a STORE-VALUE restart per place
+  ;; that lets a handler alter them before the test is re-run.
+  ;;
+  ;; Before this, ASSERT was only `(defun assert (test-form &rest ignored) nil)`
+  ;; (mvm/cl-sequences.lisp).  As a FUNCTION its arguments were evaluated, so
+  ;;   (assert (typep docstring 'string) (docstring) "Docstring missing!")
+  ;; called `(DOCSTRING)` as a function → UNDEFINED-FUNCTION.  That is exactly
+  ;; named-readtables/src/cruft.lisp:12's DEFINE-CRUFT, whose expander runs
+  ;; ASSERT at macroexpansion time, so every DEFINE-CRUFT use died.
+  ;;
+  ;; Expansion: re-test in a loop, so CONTINUE (and any STORE-VALUE that
+  ;; changed a place) retries the assertion, per CLHS.  Returns NIL on success.
+  ;;
+  ;; The STORE-VALUE clause does NOT assign the place itself — it RETURNS
+  ;; (list place-index new-value) and the LOOP BODY performs the SETF.  A
+  ;; restart-case clause body is compiled into a dispatch LAMBDA by
+  ;; compile-restart-case AFTER compile-let has already chosen storage for the
+  ;; enclosing lexicals, so a `(setf outer-var v)` inside a clause body writes a
+  ;; by-value capture and is LOST (verified: a clause `(setf y v)` leaves y at
+  ;; its old value).  Assigning in the loop body — same frame as the ASSERT —
+  ;; both works and avoids the infinite retry loop a lost store would cause.
+  (mvm-define-macro "ASSERT"
+    (lambda (form)
+      (let* ((test (cadr form))
+             (tail (cddr form))
+             ;; TAIL non-empty ⇒ a place list was supplied (possibly `()`).
+             (places (if (and (consp tail) (listp (car tail))) (car tail) nil))
+             (datum-args (if (consp tail) (cdr tail) nil))
+             (rv (gensym "ASSERTR"))
+             (sv (gensym "ASSERTV"))
+             (err-form (if datum-args
+                           `(error ,@datum-args)
+                           `(error "Assertion failed: ~S" ',test))))
+        (if (null places)
+            ;; Common case (all of ANSI's assert.lsp): no places, no dispatch.
+            `(loop
+               (when ,test (return nil))
+               (restart-case ,err-form (continue () nil)))
+            (let ((clauses nil) (dispatch nil) (i 0) (ps places))
+              (loop
+                (when (null ps) (return nil))
+                (push `(store-value (,sv) (list ,i ,sv)) clauses)
+                (push `((eql (car ,rv) ,i) (setf ,(car ps) (cadr ,rv))) dispatch)
+                (setq i (+ i 1))
+                (setq ps (cdr ps)))
+              `(loop
+                 (when ,test (return nil))
+                 (let ((,rv (restart-case ,err-form
+                              (continue () nil)
+                              ,@(nreverse clauses))))
+                   ;; CONTINUE returns NIL; a STORE-VALUE returns (idx value).
+                   (when (consp ,rv)
+                     (cond ,@(nreverse dispatch) (t nil)))
+                   nil)))))))
+
   ;; DEFPACKAGE → %defpackage-impl (RUNTIME / mvm-eval only).
   ;; At BUILD time the package system is SBCL-side, so we must NOT register
   ;; this (the host build's DEFPACKAGE stays a no-op → byte-identical image).

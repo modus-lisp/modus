@@ -2821,10 +2821,16 @@
         (setq cur (cddr cur))))))
 
 (defun set-get (symbol indicator value)
-  "Set property INDICATOR on SYMBOL's property list."
+  "Set property INDICATOR on SYMBOL's property list.
+   PUTHASH's lambda list is (KEY HT VALUE) — mvm/prelude.lisp:1226.  Both
+   this function and REMPROP used to pass (KEY VALUE HT), so the plist was
+   handed to PUTHASH as the *table* and signalled a TYPE-ERROR: EVERY
+   `(setf (get sym ind) v)` failed.  cl-annot's set-annotation-options
+   goes through `(setf (annotation-real …) …)` → `(setf (get …) …)`, so
+   all 16 of its DEFANNOTATION forms died here."
   (let ((ht (%get-plist-ht)))
     (let ((plist (gethash symbol ht)))
-      (puthash symbol (%plist-set (if (null plist) nil plist) indicator value) ht)))
+      (puthash symbol ht (%plist-set (if (null plist) nil plist) indicator value))))
   value)
 
 (defun remprop (symbol indicator)
@@ -2834,7 +2840,7 @@
       (if (null plist) nil
           (multiple-value-bind (new-plist found)
               (%plist-remove plist indicator)
-            (puthash symbol new-plist ht)
+            (puthash symbol ht new-plist)
             found)))))
 
 (defun symbol-plist (symbol)

@@ -1537,14 +1537,16 @@
   (let ((r (find-restart 'use-value condition)))
     (when r (invoke-restart 'use-value value))))
 
-;;; ASSERT — left as the cl-sequences.lisp stub (silent NIL).  An
-;;; earlier attempt here wired a CONTINUE-restart shape but the
-;;; (multiple-value-list (apply rfn ()))-inside-closure path crashed
-;;; the assert.lsp chunk fork mid-run (no T:<id> marker, lost the rest
-;;; of the chunk).  Tests 3 / 3A / 7 would benefit from a real CONTINUE
-;;; restart but only by replicating the macro semantics the rewriter
-;;; doesn't emit — there's no safe runtime spot for it without compiler
-;;; help.
+;;; ASSERT — RESOLVED.  The old note here said "left as the cl-sequences.lisp
+;;; stub (silent NIL) … there's no safe runtime spot for it without compiler
+;;; help."  The compiler help is what it needed, and that is where it now
+;;; lives: `(mvm-define-macro "ASSERT" …)` in mvm/compiler.lisp
+;;; (register-mvm-bootstrap-macros).  ASSERT is a MACRO in CL, so no runtime
+;;; function could ever have been right — a function evaluates its arguments,
+;;; and ASSERT's PLACE LIST must not be evaluated.  assert.lsp's CONTINUE
+;;; tests (3/3a/7/8/9) pass via a `(loop … (restart-case (error …) (continue
+;;; () nil)))` expansion; the syntax tests (1/2/4/5/6) pass because the places
+;;; are only ever SETF targets.
 
 
 ;;; --- Updated find-class to support condition types ---

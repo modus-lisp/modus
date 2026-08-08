@@ -1,0 +1,76 @@
+### alexandria: errs 0 -> 0  exit 0->0  [SAME]
+### split-sequence: errs 0 -> 0  exit 0->0  [SAME]
+### cl-utilities: errs 0 -> 0  exit 0->0  [SAME]
+### trivial-features: errs 1 -> 1  exit 0->0  [SAME]
+### global-vars: errs 0 -> 0  exit 0->0  [SAME]
+### trivial-gray-streams: errs 2 -> 1  exit 0->0  [BETTER]
+    -ERR !! read error in /home/claude/quicklisp/dists/quicklisp/software/trivial-gray-streams-20241012-git/package.lisp: #(READER-ERROR ((STREAM)))
+    -ERR !! read error in /home/claude/quicklisp/dists/quicklisp/software/trivial-gray-streams-20241012-git/streams.lisp: #(READER-ERROR ((STREAM)))
+    +ERR !! form eval error in /home/claude/quicklisp/dists/quicklisp/software/trivial-gray-streams-20241012-git/streams.lisp: #(PROGRAM-ERROR NIL)
+    FILE trivial-gray-streams-20241012-git/package.lisp
+        A=1
+        B=3
+    FILE trivial-gray-streams-20241012-git/streams.lisp
+        A=1
+        B=21
+    PROBE P1.cls: A=(:ERR READER-ERROR)  B=1
+    PROBE P1.pkg: A=0  B=1
+    PROBE P2.cls: A=(:ERR READER-ERROR)  B=1
+    PROBE P2.pkg: A=0  B=1
+### trivial-indent: errs 2 -> 2  exit 0->0  [SAME]
+### documentation-utils: errs 3 -> 3  exit 0->0  [SAME]
+### named-readtables: errs 4 -> 4  exit 0->0  [SAME]
+### bordeaux-threads: errs 8 -> 4  exit 0->0  [BETTER]
+    -ERR !! form eval error in /home/claude/quicklisp/dists/quicklisp/software/bordeaux-threads-v0.9.4/apiv2/api-threads.lisp: #(SIMPLE-ERROR ((FORMAT-CONTROL . "Your Lisp does not support weak ~(~A~) hash-tables.") (FORMAT-ARGUMENTS KEY)))
+    -ERR !! form eval error in /home/claude/quicklisp/dists/quicklisp/software/bordeaux-threads-v0.9.4/apiv2/atomics.lisp: #(OPERATION-NOT-IMPLEMENTED ((OPERATION . ATOMIC-CAS)))
+    -ERR !! form eval error in /home/claude/quicklisp/dists/quicklisp/software/bordeaux-threads-v0.9.4/apiv2/atomics.lisp: #(OPERATION-NOT-IMPLEMENTED ((OPERATION . ATOMIC-DECF)))
+    -ERR !! form eval error in /home/claude/quicklisp/dists/quicklisp/software/bordeaux-threads-v0.9.4/apiv2/atomics.lisp: #(OPERATION-NOT-IMPLEMENTED ((OPERATION . ATOMIC-INCF)))
+    FILE bordeaux-threads-v0.9.4/apiv1/bordeaux-threads.lisp
+        A=18
+        B=17
+    FILE bordeaux-threads-v0.9.4/apiv2/api-threads.lisp
+        A=27
+        B=28
+    FILE bordeaux-threads-v0.9.4/apiv2/atomics.lisp
+        A=11
+        B=13
+    FILE bordeaux-threads-v0.9.4/apiv2/timeout-interrupt.lisp
+        A=3
+        B=1
+    FILE trivial-garbage-20231021-git/trivial-garbage.lisp
+        A=15
+        B=16
+### iterate: errs 1 -> 1  exit 0->0  [SAME]
+### cl-ppcre: errs 0 -> 0  exit 0->0  [SAME]
+### md5: errs 1 -> 1  exit 0->0  [SAME]
+### sha1: errs 0 -> 0  exit 0->0  [SAME]
+### cl-base64: errs 0 -> 0  exit 0->0  [SAME]
+### parse-float: errs 0 -> 0  exit 0->0  [SAME]
+### ieee-floats: errs 0 -> 0  exit 0->0  [SAME]
+### trivial-garbage: errs 0 -> 0  exit 0->0  [CHANGED]
+    FILE trivial-garbage-20231021-git/trivial-garbage.lisp
+        A=15
+        B=16
+    PROBE P1.wp: A=If @code{weak-pointer} is valid, returns its value. Otherwise,  B=5
+    PROBE P2.wp: A=If @code{weak-pointer} is valid, returns its value. Otherwise,  B=5
+### babel: errs 1 -> 1  exit 0->0  [SAME]
+### salza2: errs 3 -> 1  exit 0->0  [BETTER]
+    -ERR !! read error in /home/claude/quicklisp/dists/quicklisp/software/salza2-2.1/stream.lisp: #(READER-ERROR ((STREAM)))
+    -ERR !! read error in /home/claude/quicklisp/dists/quicklisp/software/trivial-gray-streams-20241012-git/package.lisp: #(READER-ERROR ((STREAM)))
+    -ERR !! read error in /home/claude/quicklisp/dists/quicklisp/software/trivial-gray-streams-20241012-git/streams.lisp: #(READER-ERROR ((STREAM)))
+    +ERR !! form eval error in /home/claude/quicklisp/dists/quicklisp/software/trivial-gray-streams-20241012-git/streams.lisp: #(PROGRAM-ERROR NIL)
+    FILE salza2-2.1/stream.lisp
+        A=2
+        B=10
+    FILE trivial-gray-streams-20241012-git/package.lisp
+        A=1
+        B=3
+    FILE trivial-gray-streams-20241012-git/streams.lisp
+        A=1
+        B=21
+### puri: errs 0 -> 0  exit 0->0  [SAME]
+### cl-annot: errs 0 -> 0  exit 0->0  [SAME]
+### alexandria-ql: errs 1 -> 1  exit 1->1  [SAME]
+### sha1-ql: errs 1 -> 1  exit 1->1  [SAME]
+
+TOTAL ERRORS: A=28  B=21

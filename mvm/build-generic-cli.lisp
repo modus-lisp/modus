@@ -810,6 +810,14 @@
   ;; table co-init + (setq *use-jit* t) when JIT is on.  Wrapped so a JIT-init
   ;; crash can never take down a normal boot.
   (handler-case (%jit-boot-init) (t (c) nil))
+  ;; :GENERA — install the Genera compatibility surface and push the feature.
+  ;; MUST come after %install-runtime-cl-macros (the compat source uses
+  ;; DOLIST / WHEN / UNLESS / SETF) and before cli-toplevel, so that
+  ;; ~/.modusrc, --load and --eval all already see :genera on *features*.
+  ;; Wrapped: a failure here must never take down a normal boot — it just
+  ;; leaves Modus unrecognised, which is the pre-#237 status quo.
+  ;; MODUS_NO_GENERA=1 skips it (see %install-genera-compat).
+  (handler-case (%install-genera-compat) (t (c) nil))
   ;; --- entry: the SHARED SBCL-faithful CLI toplevel ------------------------
   ;; cli-toplevel reads the FULL argv off the initial stack, parses SBCL-style
   ;; flags left-to-right (--eval/--load/--script/--quit/--version/--help/rc/
@@ -818,6 +826,70 @@
   ;; outer handler-case is belt-and-suspenders in case of a parse-path crash.
   (handler-case (cli-toplevel) (t (c) (sys-exit 1))))
 "))
+
+;;; ============================================================
+;;; :GENERA compatibility surface (task #237)
+;;;
+;;; Modus advertises :GENERA.  The rationale, the honest-degeneracy list and
+;;; the ladder measurement live in net/genera-compat.lisp's header.
+;;;
+;;; WHY THIS IS BAKED AS A SOURCE **STRING** EVALUATED AT BOOT, rather than
+;;; compiled into the image like every other file above:
+;;;
+;;;   The Genera surface is definitions of symbols in packages that do not
+;;;   exist outside a running Modus — `scl::locf', `sys::store-conditional',
+;;;   `process::atomic-incf'.  Every first-party build source is read by
+;;;   CHECK-PARSES with SBCL's reader, which rejects those with "Package SCL
+;;;   does not exist"; and the build blob itself is read host-side, so the
+;;;   same wall stands one layer down.  Making the MVM compiler able to
+;;;   compile non-CL package-qualified definitions from build source is real
+;;;   work and is NOT this change.  So the text is carried as a literal and
+;;;   handed to %IT-EVAL-SOURCE — the SAME code path a `--load' of the file
+;;;   takes, which is exactly how the ladder result was measured.
+;;;
+;;;   MEASURED COST: +386 ms on a 1143 ms boot (+34%), of which ~305 ms is
+;;;   genera-compat.lisp and ~81 ms is cooperative-atomics.lisp.  That is the
+;;;   honest current price of a runtime-evaluated prelude; the way to remove
+;;;   it is to teach the compiler the packages, not to trim the shim.
+;;;
+;;;   ESCAPE HATCH: MODUS_NO_GENERA=1 in the environment skips the install
+;;;   entirely — no :genera, no packages, boot cost back to baseline.  Same
+;;;   reversible-flip pattern as MODUS_NO_EVAL2.
+;;; ============================================================
+
+(defun %escape-lisp-string (text)
+  "Escape TEXT so it can be emitted as a Lisp string literal."
+  (with-output-to-string (out)
+    (loop for c across text
+          do (cond ((char= c #\\) (write-string "\\\\" out))
+                   ((char= c #\") (write-string "\\\"" out))
+                   (t (write-char c out))))))
+
+(defvar *genera-compat-text*
+  (concatenate 'string
+               (read-file-text (merge-pathnames "net/cooperative-atomics.lisp"
+                                                *modus-base*))
+               (string #\Newline)
+               (read-file-text (merge-pathnames "net/genera-compat.lisp"
+                                                *modus-base*))))
+
+(defvar *genera-source*
+  (concatenate 'string "
+(defun %genera-compat-source ()
+  \"" (%escape-lisp-string *genera-compat-text*) "\")
+
+(defun %install-genera-compat ()
+  ;; MODUS_NO_GENERA=1 => do not advertise :genera and do not create the
+  ;; Genera packages.  Everything downstream keys off the feature, so this
+  ;; one check is the whole rollback.
+  (let ((off (%cli-getenv \"MODUS_NO_GENERA\")))
+    (if (and off (> (length off) 0) (not (string= off \"0\")))
+        nil
+        (progn (%it-eval-source (%genera-compat-source) \"genera-compat\") t))))
+"))
+
+(format t "  genera:  ~D chars (compat source baked for boot-time eval)~%"
+        (length *genera-compat-text*))
 
 (defvar *all-runtime-source*
   (concatenate 'string *prelude-source*  (string #\Newline)
@@ -849,6 +921,21 @@
                        *rt-macros-source* (string #\Newline)
                        *bridge-source*   (string #\Newline)
                        *driver-source*))
+
+;;; NOTE: *genera-source* is deliberately NOT part of *all-runtime-source*.
+;;; That variable exists only to feed the SCANNERS (scan-defuns -> the
+;;; runtime symbol-function table, scan-symbol-names -> *sym-name-table*),
+;;; and %genera-compat-source's body is a 22 KB STRING LITERAL containing
+;;; the compat source — including its `(defun sys::store-conditional …)'
+;;; text.  scan-defuns is a textual scanner: it happily harvested those
+;;; names out of the string literal and emit-sft-auto then emitted
+;;; `#'sys::store-conditional', which does not exist, so the whole
+;;; 200-function sft-auto chunk failed to compile and the build reported
+;;; "1 × %INIT-SFT-AUTO-15" unresolved — silently dropping 200 functions
+;;; from runtime EVAL's reach.  The two genera defuns are only ever called
+;;; directly from kernel-main, so they need no SFT entry.
+
+
 
 (defvar *all-defun-names*
   ;; Filter to names that look like valid CL identifiers.
@@ -1095,6 +1182,14 @@
     *sym-name-auto-source*
     (string #\Newline)
     *runtime-macros-source*
+    (string #\Newline)
+    ;; :GENERA surface (task #237).  BEFORE *driver-source*, because
+    ;; kernel-main lives in the driver and calls %install-genera-compat:
+    ;; a forward reference across the blob does NOT resolve — the first
+    ;; attempt placed this after the driver and the build reported
+    ;; "WARN li-func: unresolved function %INSTALL-GENERA-COMPAT —
+    ;; emitting NIL sentinel", i.e. a silent no-op boot hook.
+    *genera-source*
     (string #\Newline)
     *driver-source*
     (string #\Newline)

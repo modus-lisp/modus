@@ -3236,7 +3236,18 @@
             (body (cdddr form)))
         (let ((vars (mapcar (lambda (b) (if (consp b) (car b) b)) bindings))
               (inits (mapcar (lambda (b) (if (consp b) (cadr b) nil)) bindings))
-              (steps (mapcar (lambda (b) (if (and (consp b) (cddr b)) (caddr b) nil)) bindings))
+              ;; Each entry is (PRESENT-P FORM).  Step PRESENCE must be carried
+              ;; separately from the step form's VALUE: `(x nil nil)` has a step
+              ;; form that is literally NIL and per CLHS must re-assign NIL to X
+              ;; every iteration, while `(x nil)` has NO step form and keeps
+              ;; whatever the body setq'd.  Testing the form for truth collapses
+              ;; those two cases (puri's IF* state machine depends on the
+              ;; difference).
+              (steps (mapcar (lambda (b)
+                               (if (and (consp b) (cddr b))
+                                   (list t (caddr b))
+                                   (list nil nil)))
+                             bindings))
               (test (car end-clause))
               (results (cdr end-clause))
               (tmpvars nil))
@@ -3254,8 +3265,8 @@
                ,@(let ((bind nil) (assign nil))
                    (dolist (pair (mapcar #'list vars steps tmpvars))
                      (let ((v (car pair)) (s (cadr pair)) (tv (caddr pair)))
-                       (when s
-                         (push `(,tv ,s) bind)
+                       (when (car s)
+                         (push `(,tv ,(cadr s)) bind)
                          (push `(setq ,v ,tv) assign))))
                    (when bind
                      (list `(let ,(nreverse bind)
@@ -3269,7 +3280,13 @@
             (body (cdddr form)))
         (let ((vars (mapcar (lambda (b) (if (consp b) (car b) b)) bindings))
               (inits (mapcar (lambda (b) (if (consp b) (cadr b) nil)) bindings))
-              (steps (mapcar (lambda (b) (if (and (consp b) (cddr b)) (caddr b) nil)) bindings))
+              ;; (PRESENT-P FORM) — see the DO macro above: a literal-NIL step
+              ;; form must still assign each iteration.
+              (steps (mapcar (lambda (b)
+                               (if (and (consp b) (cddr b))
+                                   (list t (caddr b))
+                                   (list nil nil)))
+                             bindings))
               (test (car end-clause))
               (results (cdr end-clause)))
           `(let* ,(mapcar #'list vars inits)
@@ -3277,7 +3294,7 @@
                (when ,test (return (progn ,@(or results '(nil)))))
                (tagbody ,@body)
                ,@(remove nil
-                   (mapcar (lambda (v s) (when s `(setq ,v ,s)))
+                   (mapcar (lambda (v s) (when (car s) `(setq ,v ,(cadr s))))
                            vars steps))))))))
 
   ;; DOLIST — (dolist (var list [result]) body...).  Per CLHS, the body

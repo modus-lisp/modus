@@ -830,6 +830,18 @@
 ;;; Missing CL functions needed by ANSI tests
 ;;; ============================================================
 
+;;; STALE — SUPERSEDED.  ASSERT is now a real MACRO: see the
+;;; (mvm-define-macro "ASSERT" …) in mvm/compiler.lisp's
+;;; register-mvm-bootstrap-macros.  Macro expansion precedes function-call
+;;; compilation (macroexpand-1-mvm), so no normal `(assert …)` call site reaches
+;;; this defun any more; it survives only as the value of `#'assert` (which CLHS
+;;; leaves undefined for a macro).  The docstring below records why the silent
+;;; stub existed and is kept for history — it no longer describes what ASSERT
+;;; does.  Its "-31 net regression" warning was real and REMAINS the cost of a
+;;; conforming ASSERT: 17 ANSI tests in files that use ASSERT for in-test
+;;; invariants (apropos, time, print-structure, read-from-string, the file
+;;; chapter) were passing on a FALSE premise and now fail honestly, against
+;;; +14 real gains.  Do NOT "fix" that by re-silencing ASSERT.
 (defun assert (test-form &rest ignored)
   "ANSI ASSERT returns NIL.  The fully-restartable error path on
    failure isn't implemented, so we degrade to a silent NIL — the

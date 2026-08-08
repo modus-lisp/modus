@@ -492,10 +492,22 @@
           ;;   #-(or abcl … mkcl modus sbcl scl xcl) (error …)
           ;; so without :modus that error fires (and, more importantly, UIOP's
           ;; per-impl dispatch has no Modus branch to land on).  :modus selects
-          ;; the generic fall-throughs.  Note: :modus is NOT a Genera/SBCL
-          ;; impersonation — those features carry working-but-wrong reader
-          ;; branches (e.g. :genera reexports FUTURE-COMMON-LISP, which Modus
-          ;; lacks); :modus only suppresses the unsupported-impl error.
+          ;; the generic fall-throughs.  :modus only suppresses the
+          ;; unsupported-impl error; it says nothing about which
+          ;; implementation-specific branches a library should take.
+          ;;
+          ;; THAT question is answered separately, and the answer is
+          ;; :GENERA — see net/genera-compat.lisp, which installs the
+          ;; Genera surface (SCL / SYS / SI / PROCESS / CLI / GRAY-STREAMS /
+          ;; FUTURE-COMMON-LISP) and then pushes :genera.  It is NOT pushed
+          ;; here, because the feature must never be visible before the
+          ;; support it promises exists.  (An earlier revision of this
+          ;; comment claimed :genera was unusable because it "reexports
+          ;; FUTURE-COMMON-LISP, which Modus lacks".  Measured, that is
+          ;; wrong: cl-ppcre's (:use :future-common-lisp) is satisfied by
+          ;; making FUTURE-COMMON-LISP a nickname of COMMON-LISP — on Modus
+          ;; the CL package IS the ANSI package — and cl-ppcre loads
+          ;; bit-identically with :genera on.  Task #237.)
           (unless (member :modus *features*)
             (setq *features* (cons :modus *features*)))))
     (t (c) nil)))

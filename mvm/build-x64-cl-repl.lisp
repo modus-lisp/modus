@@ -751,7 +751,7 @@
   (setq lambda-list-keywords    '(&allow-other-keys &aux &body &environment &key
                                    &optional &rest &whole))
   (setq multiple-values-limit   16)
-  (setq char-code-limit         256)
+  (setq char-code-limit         #x110000)   ; full Unicode codespace (21-bit char immediate)
   (setq internal-time-units-per-second 1000000)
   (setq most-positive-fixnum  4611686018427387903)
   (setq most-negative-fixnum -4611686018427387904)

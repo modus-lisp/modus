@@ -768,6 +768,19 @@
   (setq array-rank-limit        256)
   (setq call-arguments-limit    256)
   (setq lambda-parameters-limit 256)
+  ;; CHAR-CODE-LIMIT.  Modus characters are a 21-bit code field in the
+  ;; character immediate (runtime/tags.lisp), and CODE-CHAR/CHAR-CODE
+  ;; round-trip exactly across the whole Unicode range (65, 255, 256,
+  ;; 1000, 65535, 65536, 100000, 1114111 all verified), so the CLHS-
+  ;; conformant value is the full Unicode codespace: #x110000.  It was
+  ;; UNBOUND in the shipping image (limitation #7 — DEFCONSTANT init
+  ;; thunks don't run at boot), which broke babel src/strings.lisp:42:
+  ;; a CASE over (eval char-code-limit) that accepts EXACTLY #x100 /
+  ;; #x10000 / #x110000 and errors otherwise.  #x110000 selects babel's
+  ;; full-unicode string path.
+  ;; NOTE: this whole kernel-main is inside a Lisp STRING literal — never
+  ;; put a double-quote character in these comments.
+  (setq char-code-limit         #x110000)
   ;; lambda-list-keywords: a standard CL constant.  alexandria's macros.lisp
   ;; reads `#.(set-difference lambda-list-keywords '(...))' at READ time — if
   ;; unbound the whole form is silently dropped, cascading to undefined

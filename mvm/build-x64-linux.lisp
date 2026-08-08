@@ -1142,7 +1142,7 @@
   ;; the tests get NIL where they expect a number — (min 65536 NIL),
   ;; (random NIL), etc. — and the fork hangs or crashes inside the
   ;; aux helper before reaching the per-test handler.
-  (setq char-code-limit       256)
+  (setq char-code-limit       #x110000)   ; full Unicode codespace (21-bit char immediate)
   (setq call-arguments-limit  256)
   ;; Array-related limits (CLHS): bounds on array size/rank/dim.
   ;; Modus arrays are 49-bit element-count in header; pick conservative

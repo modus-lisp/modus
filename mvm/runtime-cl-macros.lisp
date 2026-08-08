@@ -463,6 +463,29 @@
             (setq *features* (cons :unix *features*)))
           (unless (member :linux *features*)
             (setq *features* (cons :linux *features*)))
+          ;; Byte order.  Real implementations advertise this directly
+          ;; (SBCL pushes :LITTLE-ENDIAN on x86/x86-64/arm64); the whole
+          ;; point of trivial-features is to normalise it, and its SBCL
+          ;; backend (tf-sbcl.lisp) is pure SB-ALIEN FFI that Modus cannot
+          ;; read — so Modus has to supply the feature itself.
+          ;;
+          ;; Without it, babel's define-character-encoding forms
+          ;;     :use-bom      #+big-endian :utf-16be #+little-endian :utf-16le
+          ;;     :bom-encoding #+big-endian #(#xfe #xff) #+little-endian #(#xff #xfe)
+          ;;     :ambiguous    #+little-endian t #+big-endian nil
+          ;; lose BOTH branches of each pair, so the MAKE-INSTANCE initarg
+          ;; plist ends up ODD-length and CLHS 7.1.2 validation signals
+          ;; PROGRAM-ERROR — killing all 9 UTF-16 / UTF-32 / UCS-2
+          ;; encodings.  (:utf-8 / :utf-8b have no reader conditionals and
+          ;; were the two that survived.)
+          ;;
+          ;; Every consumer of this file is little-endian: x86-64 (generic,
+          ;; generic-cli, x64-cl-repl, modus-selfhost) and i386 (i386-cli).
+          ;; A big-endian target (ppc/ppc32/68k) must push :BIG-ENDIAN in
+          ;; its own boot path instead of loading this default.
+          (unless (or (member :little-endian *features*)
+                      (member :big-endian *features*))
+            (setq *features* (cons :little-endian *features*)))
           ;; Advertise :modus so UIOP recognises this implementation.  The
           ;; vendored asdf.lisp guards its "ASDF is not supported on your
           ;; implementation" hard error with

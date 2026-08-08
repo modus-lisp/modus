@@ -562,6 +562,10 @@
   (setq array-rank-limit        256)
   (setq call-arguments-limit    256)
   (setq lambda-parameters-limit 256)
+  ;; Full Unicode codespace — Modus chars are a 21-bit code field and
+  ;; CODE-CHAR/CHAR-CODE round-trip across the whole range.  DEFCONSTANT
+  ;; init thunks do not run at boot (limitation #7), so set it explicitly.
+  (setq char-code-limit         #x110000)
   (setq pi 3.141592653589793d0)
   ;; AFTER init-all-globals — overrides defvar's init.  *write-object-
   ;; budget* defvars to 0 which immediately exhausts; we want a huge

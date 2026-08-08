@@ -242,7 +242,9 @@
       ;; registry.
       (when *macro-function-table*
         (let ((mkey (%macro-sym-key sym)))
-          (when mkey (remhash mkey *macro-function-table*))))))
+          (when mkey
+            (%macro-pkg-rem sym mkey)
+            (remhash mkey *macro-function-table*))))))
   sym)
 
 (defun fdefinition (sym)
@@ -378,6 +380,83 @@
        (if (and n (> (length n) 0)) n sym)))
     (t nil)))
 
+;;; ------------------------------------------------------------------
+;;; PER-PACKAGE macro expanders (the macro-side analogue of the #211
+;;; fn-key fold).
+;;;
+;;; %MACRO-SYM-KEY above is PACKAGE-BLIND — it keys by the bare name
+;;; string — so two DEFMACROs of the same name in different packages share
+;;; one *MACRO-FUNCTION-TABLE* entry and the last one silently wins.  That
+;;; is not merely a MACROEXPAND-1 conformance bug (expanding PA::FOO ran
+;;; PB::FOO's expander); it HANGS the compiler whenever one of the two
+;;; expands into the other — exactly the shape every portable threading
+;;; library uses.  bordeaux-threads' BORDEAUX-THREADS-2:ATOMIC-INCF
+;;; expands into its backend's ATOMIC-INCF (MP: / SB-EXT: / SYSTEM: /
+;;; PROCESS: depending on the implementation), which resolved back to
+;;; BORDEAUX-THREADS-2's own macro → unbounded macroexpansion.
+;;;
+;;; The scheme is deliberately ADDITIVE, so no lookup that worked before
+;;; can start failing.  *MACRO-FUNCTION-TABLE* keeps its exact previous
+;;; contents and meaning; we ADD a side table keyed by the SAME bare name
+;;; whose value is an alist of (package-name . expander).  Every lookup
+;;; consults the side table FIRST and falls back to the bare entry, so
+;;; writers with no symbol to qualify (string names, the defstruct
+;;; constructor registrations, build-time expanders that live in
+;;; *MACRO-TABLE* keyed by name-hash) resolve exactly as before.
+;;;
+;;; Keyed by the already-computed bare name so the hot path
+;;; (%RAW-MACRO-EXPANDER runs on every form the compiler sees) does NOT
+;;; allocate — an earlier "PKG:NAME" string-key version cost ~3% on a
+;;; library load.
+;;; ------------------------------------------------------------------
+
+(defvar *macro-pkg-table* nil
+  "macro-name-string → alist of (package-name-string . expander).")
+
+(defun %macro-sym-pkg-name (sym)
+  "Home package NAME of SYM, or NIL when SYM carries no package (strings,
+   uninterned symbols, native MVM hash-only syms)."
+  (and sym
+       (%cl-sym-p sym)
+       (let ((p (%cl-sym-package sym)))
+         (and p (let ((n (%pkg-name p)))
+                  (and n (stringp n) (> (length n) 0) n))))))
+
+(defun %macro-pkg-get (sym key)
+  "Expander registered for SYM's own package under name KEY, or NIL."
+  (let ((res nil))
+    (when (and *macro-pkg-table* (stringp key))
+      (let ((pn (%macro-sym-pkg-name sym)))
+        (when pn
+          (dolist (e (gethash key *macro-pkg-table*))
+            (when (and (null res) (string= (car e) pn))
+              (setq res (cdr e)))))))
+    res))
+
+(defun %macro-pkg-put (sym key fn)
+  "Register FN as the expander for SYM's own package under name KEY."
+  (let ((pn (%macro-sym-pkg-name sym)))
+    (when (and pn (stringp key))
+      (unless *macro-pkg-table*
+        (setq *macro-pkg-table* (make-hash-table)))
+      (let ((al (gethash key *macro-pkg-table*))
+            (hit nil))
+        (dolist (e al)
+          (when (string= (car e) pn) (setq hit e)))
+        (if hit
+            (setf (cdr hit) fn)
+            (puthash key *macro-pkg-table* (cons (cons pn fn) al)))))))
+
+(defun %macro-pkg-rem (sym key)
+  "Drop SYM's own-package expander under name KEY (fmakunbound)."
+  (let ((pn (%macro-sym-pkg-name sym)))
+    (when (and pn *macro-pkg-table* (stringp key))
+      (let ((al (gethash key *macro-pkg-table*))
+            (new nil))
+        (dolist (e al)
+          (unless (string= (car e) pn) (setq new (cons e new))))
+        (puthash key *macro-pkg-table* new)))))
+
 ;;; CLHS §3.1.2.1.2.2: a macro function takes 2 args (form, environment).
 ;;; Modus expanders use 1-arg `(lambda (form) ...)` internally, so the
 ;;; user-facing macro-function call needs an arity-checking shim that
@@ -475,6 +554,8 @@
   (let ((key (%macro-sym-key sym)))
     (cond
       ((null key) nil)
+      ;; SYM's own-package expander wins over the legacy bare-name entry.
+      ((%macro-pkg-get sym key))
       ((and *macro-function-table* (gethash key *macro-function-table*)))
       ((and (boundp '*macro-table*) *macro-table*
             (let ((h (cond ((stringp key) (compute-name-hash key))
@@ -512,6 +593,8 @@
     (let ((raw
            (cond
              ((null key) nil)
+             ;; SYM's own-package expander wins over the legacy bare entry.
+             ((%macro-pkg-get sym key))
              ((and *macro-function-table* (gethash key *macro-function-table*)))
              ((and (boundp '*macro-table*) *macro-table*
                    (let ((h (cond ((stringp key) (compute-name-hash key))
@@ -569,6 +652,9 @@
        (when key
          (unless *macro-function-table*
            (setq *macro-function-table* (make-hash-table)))
+         ;; Dual write: per-package entry for exact resolution, bare entry
+         ;; so every legacy bare-name lookup keeps working.
+         (%macro-pkg-put sym key real-fn)
          (puthash key *macro-function-table* real-fn)
          real-fn)))
     ;; 2-arg shape (sym, fn) — the original contract.
@@ -577,6 +663,7 @@
        (when key
          (unless *macro-function-table*
            (setq *macro-function-table* (make-hash-table)))
+         (%macro-pkg-put sym key fn)
          (puthash key *macro-function-table* fn)
          fn)))
     ;; 4+ args — illegal.

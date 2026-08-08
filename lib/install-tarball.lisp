@@ -52,12 +52,46 @@
     (if slash (subseq path (+ slash 1) (length path)) path)))
 
 (defun %it-string-designator (x)
-  "Coerce a component-name designator (string or symbol) to a string."
+  "Coerce an ASDF name designator to a string, ASDF's way (COERCE-NAME):
+   a STRING is taken verbatim, a SYMBOL is DOWNCASED.
+
+   The downcase is load-bearing, not cosmetic.  trivial-features declares
+   `(:module src ...)` with a bare symbol, which reads as SRC; without the
+   downcase every component resolved to \"SRC/tf-genera.lisp\" and the
+   tarball holds \"src/tf-genera.lisp\", so the whole module went
+   \"(missing: …)\".  Same rule makes `(defsystem :ieee-floats …)` match the
+   caller's \"ieee-floats\" in %IT-FIND-DEFSYSTEM."
   (cond ((stringp x) x)
-        ((symbolp x) (symbol-name x))
+        ((symbolp x) (string-downcase (symbol-name x)))
         (t (princ-to-string x))))
 
 ;;; --- reading forms from an in-memory source string --------------------------
+
+(defun %it-read-asd-forms (source-string)
+  "%IT-READ-FORMS for a SYSTEM DEFINITION, with the reader's lenient
+   missing-package mode ON (*READER-MISSING-PACKAGE-LENIENT*, cl-reader.lisp:25).
+
+   A .asd is not ordinary source: it is metadata about a system, and it
+   routinely names packages that only a running ASDF provides.  Because
+   %IT-READ-FORMS reads the WHOLE file before %IT-FIND-DEFSYSTEM picks a
+   form, ONE unreadable qualifier anywhere in the file lost the entire
+   system definition.  Measured on the ladder tarballs (probes/asd.lisp):
+   md5 / parse-float / documentation-utils / salza2 all begin
+   `(asdf:defsystem …)`, and ieee-floats / iterate read fine until their
+   TRAILING test-system form says `uiop:symbol-call` — six of 22 systems
+   lost to a qualifier in a form we never even use.
+
+   Lenient mode interns the bare name in *PACKAGE*, so `asdf:defsystem'
+   reads as DEFSYSTEM — which is exactly what %IT-FIND-DEFSYSTEM matches on
+   (by SYMBOL-NAME, already package-blind).  Scoped to the .asd read only:
+   library SOURCE keeps strict CLHS behaviour, and so does everything else
+   in the image (the flag defaults NIL; the ANSI gate never sees it set).
+   Restored escape-safely, like the *PACKAGE* bind above."
+  (let ((saved *reader-missing-package-lenient*))
+    (unwind-protect
+         (progn (setq *reader-missing-package-lenient* t)
+                (%it-read-forms source-string))
+      (setq *reader-missing-package-lenient* saved))))
 
 (defun %it-read-forms (source-string)
   "Read every top-level form from SOURCE-STRING; return them in a list.
@@ -174,15 +208,15 @@
     ((consp expr)
      (let ((op (car expr)) (args (cdr expr)))
        (cond
-         ((and (symbolp op) (string= (%it-string-designator op) "AND"))
+         ((and (symbolp op) (string= (%it-string-designator op) "and"))
           (let ((r t))
             (dolist (a args) (unless (%it-feature-true-p a) (setq r nil)))
             r))
-         ((and (symbolp op) (string= (%it-string-designator op) "OR"))
+         ((and (symbolp op) (string= (%it-string-designator op) "or"))
           (let ((r nil))
             (dolist (a args) (when (%it-feature-true-p a) (setq r t)))
             r))
-         ((and (symbolp op) (string= (%it-string-designator op) "NOT"))
+         ((and (symbolp op) (string= (%it-string-designator op) "not"))
           (not (%it-feature-true-p (car args))))
          ;; Unknown operator: be conservative and INCLUDE the component.
          (t t))))
@@ -395,7 +429,7 @@
                (asd-dir (let ((slash (%it-last-slash asd-path)))
                           (if slash (subseq asd-path 0 (+ slash 1)) "")))
                (asd-src (tar-bytes-to-string (cdr asd-entry)))
-               (asd-forms (%it-read-forms asd-src))
+               (asd-forms (%it-read-asd-forms asd-src))
                (ds (%it-find-defsystem asd-forms sysname)))
           (when (null ds)
             (error "install-tarball: no defsystem found in asd"))

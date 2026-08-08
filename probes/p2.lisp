@@ -1,0 +1,22 @@
+(defun say (k v) (princ (concatenate 'string k "=" (princ-to-string v))) (terpri) (finish-output))
+(defun pkgname () (package-name *package*))
+(defun reset () (setq *package* (find-package "COMMON-LISP-USER")))
+;; unwind-protect + setq: throw
+(defun esc2 () (let ((sv *package*)) (unwind-protect (progn (setq *package* (find-package "KEYWORD")) (throw 'lf-t2 2)) (setq *package* sv))))
+(say "P5.throw2" (catch 'lf-t2 (esc2)))
+(say "P6.after" (pkgname))
+(reset)
+;; unwind-protect + setq: error
+(defun esc3 () (let ((sv *package*)) (unwind-protect (progn (setq *package* (find-package "KEYWORD")) (error "boom")) (setq *package* sv))))
+(say "P7.err" (handler-case (esc3) (t (c) :CAUGHT)))
+(say "P8.after" (pkgname))
+(reset)
+;; unwind-protect + setq: undefined-function (the real alexandria failure mode)
+(defun esc4 () (let ((sv *package*)) (unwind-protect (progn (setq *package* (find-package "KEYWORD")) (no-such-fn-xyz 1)) (setq *package* sv))))
+(say "P9.undef" (handler-case (esc4) (t (c) :CAUGHT)))
+(say "P10.after" (pkgname))
+(reset)
+;; readtable too
+(say "P11.rt" (let ((sv *readtable*)) (unwind-protect (progn (setq *readtable* (copy-readtable nil)) :ok) (setq *readtable* sv))))
+(say "P12.rt-same" (if (eq *readtable* *readtable*) 1 0))
+(say "LF-END" "p2")

@@ -5457,6 +5457,27 @@
           (setq result val))))
     result))
 
+(defun %load-bind-pkg-rt-stream (stream verbose print)
+  "%LOAD-FROM-STREAM with *PACKAGE* and *READTABLE* BOUND around it, per
+   CLHS 24.2: \"load binds *readtable* and *package* to the values they held
+   before loading the file\".  Without this a loaded file's (in-package :foo)
+   escapes into the CALLER, whose next toplevel form is then READ in :foo —
+   every bare name becomes FOO::NAME and dies UNDEFINED-FUNCTION.
+
+   Hand-rolled rather than `(let ((*package* ...)) ...)` ON PURPOSE:
+   COMPILE-LET-WITH-SPECIALS emits save / set / body / restore with NO
+   unwind-protect, so a throw or an escaping error out of the body SKIPS the
+   restore (measured: probes/p1.lisp P4).  Lexical save + UNWIND-PROTECT +
+   setq restore is verified escape-safe for throw / ERROR / UNDEFINED-FUNCTION
+   (probes/p2.lisp P5-P10) — the same remedy 279f2cc used for the
+   %WITH-HANDLER-BIND frame leak."
+  (let ((saved-package *package*)
+        (saved-readtable *readtable*))
+    (unwind-protect
+         (%load-from-stream stream verbose print)
+      (setq *package* saved-package)
+      (setq *readtable* saved-readtable))))
+
 (defun load (&rest all-args)
   "Read and evaluate all forms from a file or stream.
    Accepts:
@@ -5486,7 +5507,7 @@
       (cond
         ;; --- Stream filespec ---
         ((%load-stream-p filespec)
-         (%load-from-stream filespec verbose print))
+         (%load-bind-pkg-rt-stream filespec verbose print))
         ;; --- Pathname / string filespec ---
         (t
          (let ((path (cond ((stringp filespec) filespec)
@@ -5514,7 +5535,7 @@
                          (write-string "; loading " *standard-output*)
                          (write-string path *standard-output*)
                          (write-char #\Newline *standard-output*))
-                       (%load-from-stream stream verbose print))
+                       (%load-bind-pkg-rt-stream stream verbose print))
                   (close stream)))))))))))
 
 ;;; ---- Initialization -----------------------------------------------

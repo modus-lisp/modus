@@ -276,6 +276,99 @@
           (return entry)))
       (setq cur (cdr cur)))))
 
+;;; --- O(1) symbol-table index (task #233) ---
+;;;
+;;; The internal/external symbol tables MUST stay alists: do-symbols,
+;;; package introspection, cl-printer's home-package check and the ANSI
+;;; bridge all `dolist' over them directly.  But %symtab-find above is a
+;;; LINEAR scan, so interning N symbols into one package is O(N^2).  That
+;;; is a real, measurable defect: reading 65536 distinct one-character
+;;; symbols (ANSI reader-test read-symbol.13, syntax.escaped.2/.5 —
+;;; `(loop for i below (min 65536 char-code-limit) ...)') costs minutes
+;;; and trips the harness's 45s per-file alarm, and it is the same
+;;; quadratic that makes loading a large library's package slow.
+;;;
+;;; Fix: each package carries a lazily-built INDEX in data slot 7
+;;; (mirroring internal, slot 2) and slot 8 (mirroring external, slot 3).
+;;; An index is a 2-slot array:
+;;;   [0] HEAD — the alist cons the index was last synced up to
+;;;   [1] HASH — hash table  (compute-name-hash NAME) -> list of entries
+;;;
+;;; The index is DERIVED, never authoritative.  %symtab-index-sync walks
+;;; the alist from its current head until it reaches HEAD, adding only
+;;; the entries pushed since the last sync — O(1) amortised, because
+;;; %symtab-add conses onto the FRONT.  If HEAD is not reachable (a
+;;; %symtab-remove rebuilt the list, or some other code replaced the
+;;; table wholesale via %pkg-set-internal/external) the index is thrown
+;;; away and rebuilt.  So a stale index cannot survive a table change,
+;;; and no call site outside this file needs to know the index exists.
+;;;
+;;; Bucket lists are ordered so the FRONTMOST alist entry comes first,
+;;; reproducing %symtab-find's first-match-wins semantics exactly when a
+;;; name has been added more than once.  compute-name-hash upcases, so
+;;; "a" and "A" share a bucket; the bucket scan is case-sensitive
+;;; string=, same as %symtab-find.
+
+(defun %symtab-index-sync (pkg slot)
+  "Return PKG's hash index for the alist in data SLOT (2=internal,
+   3=external), synced to that alist's current head."
+  (let ((data (%pkg-data pkg)))
+    (let ((table (aref data slot))
+          (islot (+ slot 5))
+          (idx (aref data (+ slot 5))))
+      (when (null idx)
+        (setq idx (make-array 2))
+        ;; 0 (a fixnum) is the "never synced" sentinel: it can never be
+        ;; EQ to a list head, so the first sync always rebuilds.  Using a
+        ;; fixnum (not a keyword) keeps this callable before the keyword
+        ;; intern table exists at boot.
+        (aset idx 0 0)
+        (aset idx 1 (make-hash-table))
+        (aset data islot idx))
+      (let ((head (aref idx 0)))
+        (unless (eq head table)
+          (let ((cur table) (new nil) (found nil))
+            (loop
+              (when (eq cur head) (setq found t) (return nil))
+              (when (null cur) (return nil))
+              (setq new (cons (car cur) new))
+              (setq cur (cdr cur)))
+            (unless found
+              (aset idx 1 (make-hash-table))
+              (setq new nil)
+              (let ((c table))
+                (loop
+                  (when (null c) (return nil))
+                  (setq new (cons (car c) new))
+                  (setq c (cdr c)))))
+            ;; NEW is oldest-first, so pushing in order leaves the
+            ;; frontmost (newest) entry at the head of its bucket.
+            (let ((ht (aref idx 1))
+                  (n new))
+              (loop
+                (when (null n) (return nil))
+                (let ((entry (car n)))
+                  (let ((k (compute-name-hash (car entry))))
+                    (puthash k ht (cons entry (gethash k ht)))))
+                (setq n (cdr n)))))
+          (aset idx 0 table)))
+      (aref idx 1))))
+
+(defun %symtab-find-in (pkg slot name-string)
+  "O(1) equivalent of (%symtab-find (aref (%pkg-data pkg) SLOT) NAME-STRING)."
+  (let ((table (aref (%pkg-data pkg) slot)))
+    (if (null table)
+        nil
+        (let ((ht (%symtab-index-sync pkg slot)))
+          (let ((cur (gethash (compute-name-hash name-string) ht))
+                (res nil))
+            (loop
+              (when (null cur) (return res))
+              (let ((entry (car cur)))
+                (when (string= (car entry) name-string)
+                  (return entry)))
+              (setq cur (cdr cur))))))))
+
 (defun %symtab-add (table name-string symbol)
   "Add SYMBOL to alist TABLE under NAME-STRING. Returns new table."
   (cons (cons name-string symbol) table))
@@ -432,7 +525,7 @@
 (defun %make-package-object (name-string)
   "Allocate and initialize an empty package object."
   (%mark-runtime-born-pkg name-string)
-  (let ((data (make-array 7)))
+  (let ((data (make-array 9)))
     (aset data 0 name-string) ; name
     (aset data 1 nil)         ; nicknames
     (aset data 2 nil)         ; internal-symbols (alist)
@@ -440,6 +533,8 @@
     (aset data 4 nil)         ; use-list
     (aset data 5 nil)         ; used-by-list
     (aset data 6 nil)         ; shadowing-symbols
+    (aset data 7 nil)         ; internal-symbols hash index (slot 2 + 5)
+    (aset data 8 nil)         ; external-symbols hash index (slot 3 + 5)
     (cons *pkg-tag* data)))
 
 (defun make-package (name &rest args)
@@ -683,7 +778,7 @@
     (if (null pkg)
         (values nil nil)
         ;; Check external symbols
-        (let ((ext-entry (%symtab-find (%pkg-external pkg) name-str)))
+        (let ((ext-entry (%symtab-find-in pkg 3 name-str)))
           (if ext-entry
               (values (cdr ext-entry) :external)
             ;; KEYWORD package: `:foo' literals from compiled code are
@@ -702,7 +797,7 @@
             (if kw-existing
                 (values kw-existing :external)
               ;; Check internal symbols
-              (let ((int-entry (%symtab-find (%pkg-internal pkg) name-str)))
+              (let ((int-entry (%symtab-find-in pkg 2 name-str)))
                 (if int-entry
                     (values (cdr int-entry) :internal)
                     ;; Check inherited (use-list external symbols)
@@ -710,7 +805,7 @@
                           (use (%pkg-use-list pkg)))
                       (loop
                         (when (null use) (return nil))
-                        (let ((uext (%symtab-find (%pkg-external (car use)) name-str)))
+                        (let ((uext (%symtab-find-in (car use) 3 name-str)))
                           (when uext
                             (setq found (cdr uext))
                             (return nil)))
@@ -731,10 +826,10 @@
     (if (null pkg)
         (values nil nil)
         ;; Check if already present
-        (let ((ext-entry (%symtab-find (%pkg-external pkg) name-str)))
+        (let ((ext-entry (%symtab-find-in pkg 3 name-str)))
           (if ext-entry
               (values (cdr ext-entry) :external)
-              (let ((int-entry (%symtab-find (%pkg-internal pkg) name-str)))
+              (let ((int-entry (%symtab-find-in pkg 2 name-str)))
                 (if int-entry
                     (values (cdr int-entry) :internal)
                     ;; Check inherited
@@ -742,7 +837,7 @@
                           (use (%pkg-use-list pkg)))
                       (loop
                         (when (null use) (return nil))
-                        (let ((uext (%symtab-find (%pkg-external (car use)) name-str)))
+                        (let ((uext (%symtab-find-in (car use) 3 name-str)))
                           (when uext
                             (setq found (cdr uext))
                             (return nil)))

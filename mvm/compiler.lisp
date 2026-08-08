@@ -7932,14 +7932,25 @@
    through %collect-free-vars' special-form dispatch (a template SETQ/LET
    head would skip its name/binding slots — see the backquote case in
    %collect-free-vars).  Nested backquotes are walked the same way
-   (over-collection is harmless; under-collection was the modus3 bug)."
+   (over-collection is harmless; under-collection was the modus3 bug).
+
+   A COMMA payload is BOTH an expression at this pass AND, for the nested
+   forms `,',x / `,,x, itself a template whose inner COMMA payloads are
+   ALSO live at this pass.  `,',x reads as (COMMA (QUOTE (COMMA X))), and
+   %collect-free-vars stops dead at (QUOTE …) — exactly where X hides — so
+   X was never collected, never captured, and the closure read an unwritten
+   frame slot (raw 0).  That is the babel define-utf-16 / define-ucs bug:
+   ``(if ,',swap-var …) inside a LABELS helper produced (QUOTE 0) instead
+   of (QUOTE #:SWAP123).  Walk the payload BOTH ways.  Over-collection is
+   harmless — %collect-free-vars only keeps symbols already in ENV."
   (cond
     ((atom template) acc)
     ((and (symbolp (car template))
           (or (eq (car template) 'comma)
               (eq (car template) 'comma-at)
               (eq (car template) 'comma-dot)))
-     (%collect-free-vars (cadr template) bound env acc))
+     (%collect-bq-free-vars (cadr template) bound env
+                            (%collect-free-vars (cadr template) bound env acc)))
     (t
      (let ((cur template))
        (loop

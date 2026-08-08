@@ -74,8 +74,35 @@
     (nreverse acc)))
 
 (defun %it-eval-source (source-string tag)
-  "Read+eval every top-level form in SOURCE-STRING (a .lisp file's text),
-   INTERLEAVING read and eval one form at a time from a single stream — this
+  "Read+eval every top-level form of SOURCE-STRING with *PACKAGE* and
+   *READTABLE* BOUND, per CLHS 24.2 (LOAD): \"load binds *readtable* and
+   *package* to the values they held before loading the file\".  A loaded
+   file's `(in-package :foo)` must NOT escape to the caller.
+
+   THIS IS A REAL, ESCAPE-SAFE BIND, deliberately hand-rolled:
+   `(let ((*package* ...)) ...)` compiles via COMPILE-LET-WITH-SPECIALS,
+   which emits save / set / body / restore with NO unwind-protect — a
+   throw or an escaping error out of the body SKIPS the restore (probe
+   /home/claude/ws-loader/probes/p1.lisp, P4: *package* stays KEYWORD after
+   a throw).  Same class of defect as the %WITH-HANDLER-BIND leak fixed in
+   279f2cc; same remedy: lexical save + UNWIND-PROTECT + setq restore,
+   which is verified escape-safe for throw, ERROR and UNDEFINED-FUNCTION
+   (probes p2.lisp P5-P10).
+
+   Before this, install-tarball loaded alexandria, whose last file does
+   `(in-package :alexandria-2)`, and returned with *PACKAGE* still
+   ALEXANDRIA-2 — so the CALLER's next form read `LF-GCN` as
+   ALEXANDRIA-2::LF-GCN and died UNDEFINED-FUNCTION."
+  (let ((saved-package *package*)
+        (saved-readtable *readtable*))
+    (unwind-protect
+         (%it-eval-source-1 source-string tag)
+      (setq *package* saved-package)
+      (setq *readtable* saved-readtable))))
+
+(defun %it-eval-source-1 (source-string tag)
+  "The read+eval loop itself (see %it-eval-source for the binding contract).
+   INTERLEAVES read and eval one form at a time from a single stream — this
    is essential: a leading `(in-package :foo)` must take effect (it side-
    effects *package* at eval time) BEFORE the file's remaining forms are READ,
    or those symbols intern in the wrong package.  Reading the whole file up
@@ -124,12 +151,79 @@
       (when (eq (car cur) key) (return (cadr cur)))
       (setq cur (cddr cur)))))
 
+(defun %it-feature-name-p (x)
+  "True when the feature-expression atom X is currently on *FEATURES*.
+   Compared by NAME, not identity: an .asd read in CL-USER interns
+   `:sbcl' as a keyword, and Modus's *FEATURES* holds keywords too, but
+   a designator may also arrive as an ordinary symbol."
+  (let ((want (%it-string-designator x)) (found nil))
+    (dolist (f *features*)
+      (when (and (not found)
+                 (symbolp f)
+                 (string= (%it-string-designator f) want))
+        (setq found t)))
+    found))
+
+(defun %it-feature-true-p (expr)
+  "Evaluate an ASDF :IF-FEATURE feature expression against *FEATURES*.
+   Grammar (ASDF 3 / CLHS 24.1.2.1 shape): an atom is a feature name, and
+   (:AND e*) / (:OR e*) / (:NOT e) combine.  NIL means \"no :if-feature\"
+   -> always true (the caller passes the plist value, absent = NIL)."
+  (cond
+    ((null expr) t)
+    ((consp expr)
+     (let ((op (car expr)) (args (cdr expr)))
+       (cond
+         ((and (symbolp op) (string= (%it-string-designator op) "AND"))
+          (let ((r t))
+            (dolist (a args) (unless (%it-feature-true-p a) (setq r nil)))
+            r))
+         ((and (symbolp op) (string= (%it-string-designator op) "OR"))
+          (let ((r nil))
+            (dolist (a args) (when (%it-feature-true-p a) (setq r t)))
+            r))
+         ((and (symbolp op) (string= (%it-string-designator op) "NOT"))
+          (not (%it-feature-true-p (car args))))
+         ;; Unknown operator: be conservative and INCLUDE the component.
+         (t t))))
+    (t (%it-feature-name-p expr))))
+
+(defun %it-dir-prefix (s)
+  "Normalise a component :PATHNAME designator to a directory prefix ending
+   in exactly one \"/\" (\"\" for an empty/NIL designator)."
+  (cond
+    ((null s) "")
+    (t (let ((str (%it-string-designator s)))
+         (cond ((= (length str) 0) "")
+               ((char= (char str (- (length str) 1)) #\/) str)
+               (t (concatenate 'string str "/")))))))
+
 (defun %it-collect-components (components prefix acc)
   "Recurse over a :components list, appending it-file structs to ACC (a
    reversed accumulator list) in declared order.  PREFIX is the current
-   module path prefix (\"\" at top level)."
+   module path prefix (\"\" at top level).
+
+   Honours two ASDF component options that the ladder's real (install-
+   tarball) path cannot be measured without:
+
+     :IF-FEATURE  — ASDF omits the component entirely when the feature
+                    expression is false.  Without this we unconditionally
+                    loaded every per-implementation file: bordeaux-threads
+                    apiv1 alone has 16 mutually exclusive impl-* files
+                    (impl-clisp, impl-allegro, …) and trivial-features has
+                    12 tf-* files.  Loading them all is not \"a stricter
+                    test\", it is loading code for a different Lisp.
+
+     :PATHNAME    — the directory a module (or the system) actually lives
+                    in, which is NOT always the module NAME: bordeaux-
+                    threads' module \"api-v1\" has :pathname \"apiv1/\",
+                    and named-readtables' whole system has :pathname
+                    \"src\".  Without it every component resolved to a
+                    path that is not in the tarball and the install
+                    reported \"(missing: …)\" for all of them."
   (dolist (comp components)
-    (when (consp comp)
+    (when (and (consp comp)
+               (%it-feature-true-p (%it-plist-get (cddr comp) :if-feature)))
       (let* ((kind (car comp))
              (name (%it-string-designator (cadr comp)))
              (plist (cddr comp)))
@@ -146,8 +240,11 @@
                           :deps deps)
                          acc))))
           ((eq kind :module)
-           (let ((sub (%it-plist-get plist :components))
-                 (new-prefix (concatenate 'string prefix name "/")))
+           (let* ((sub (%it-plist-get plist :components))
+                  (pn (%it-plist-get plist :pathname))
+                  (dir (if pn (%it-dir-prefix pn)
+                           (concatenate 'string name "/")))
+                  (new-prefix (concatenate 'string prefix dir)))
              (setq acc (%it-collect-components sub new-prefix acc))))
           ;; :static-file and anything else: ignore.
           (t nil)))))
@@ -253,6 +350,21 @@
   (%it-install-from-gz-bytes (%it-slurp-bytes path) sysname))
 
 (defun %it-install-from-gz-bytes (gz sysname)
+  "Install a system, with *PACKAGE* / *READTABLE* bound around the WHOLE
+   install (outer belt to %it-eval-source's per-file braces).  ASDF's
+   LOAD-SYSTEM does not change its caller's *PACKAGE* either, and the .asd
+   itself is READ here — so a .asd that switches packages, or an abort
+   between two component files, must not leak out.  Escape-safe by
+   construction (lexical save + unwind-protect + setq), NOT (let ((*package*
+   ...))) — see %it-eval-source's docstring for why that is not enough."
+  (let ((saved-package *package*)
+        (saved-readtable *readtable*))
+    (unwind-protect
+         (%it-install-from-gz-bytes-1 gz sysname)
+      (setq *package* saved-package)
+      (setq *readtable* saved-readtable))))
+
+(defun %it-install-from-gz-bytes-1 (gz sysname)
   "Core installer: GZ is a .tar.gz (or plain .tar) byte vector already in
    memory.  gunzip -> untar -> parse .asd -> load files in order."
   ;; 1. gunzip
@@ -289,13 +401,21 @@
             (error "install-tarball: no defsystem found in asd"))
           (let* ((this-sysname (%it-string-designator (cadr ds)))
                  (comps (%it-plist-get (cddr ds) :components))
+                 ;; System-level :PATHNAME — the subdirectory the components
+                 ;; live in relative to the .asd.  named-readtables declares
+                 ;; :pathname "src"; without honouring it every component
+                 ;; resolved to <asd-dir>/package.lisp, which is not in the
+                 ;; tarball, and the whole system loaded as 6 "(missing: …)".
+                 (sys-dir (concatenate 'string asd-dir
+                                       (%it-dir-prefix
+                                        (%it-plist-get (cddr ds) :pathname))))
                  (files (nreverse (%it-collect-components comps "" nil)))
                  (ordered (%it-toposort files)))
             (write-string-serial "  system: ") (write-string-serial this-sysname) (write-char-serial 10)
             (write-string-serial "  load order:") (write-char-serial 10)
             ;; 4. load each file's source, in order
             (dolist (f ordered)
-              (let* ((rel (concatenate 'string asd-dir (it-file-path f) ".lisp"))
+              (let* ((rel (concatenate 'string sys-dir (it-file-path f) ".lisp"))
                      (ent (assoc rel entries :test #'string=)))
                 (cond
                   ((null ent)

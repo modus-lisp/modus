@@ -1,56 +1,10 @@
-# Build artifacts
-*.img
-*.o
-*.fasl
-*.core
-/modus
-
-# IDE and editor files
-.vscode/
-.idea/
-*.swp
-*~
-
-# Quicklisp
-quicklisp.lisp
-quicklisp/
-
-# Local configuration
-*.local.lisp
-
-# Temp files
-tmp/
-temp/
-nohup.out
-
-# Logs
-*.log
-.claude
-tmp/
-
-/foo.*
-/tmp-*.lisp
-scratch/
-
-# --- Build outputs: NEVER commit these ---------------------------------
-# ~980 MB of gate/probe binaries were committed by accident (several by me,
-# via `git add -A` in a worktree where a gate image had just been built).
-# Each one materialises in EVERY worktree, so at ~1 GB per worktree this
-# filled the box to 100% three times in one session and forced an agent to
-# use `git sparse-checkout` to work at all.
-#
-# Build images belong in /tmp or under an ignored path — see mvm/BUILDS.md
-# and MODUS_ANSI_OUT (which exists precisely so gate builds land outside
-# the worktree).
-modus-ansi-*
-modus-aa64-*
-gate-off
-gate-jit
-gate-*.out
-modus-base
-modus-fix*
-modus-p[0-9]*
-modus-206*
-*.bin
-*.img
-*.efi
+modus
+ansi-net
+build-*.log
+g-ld.out*
+gate.out
+lost.txt
+gained.txt
+recheck.out
+probes/*.out
+alex-after.log

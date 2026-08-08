@@ -1445,6 +1445,100 @@
       (setf (gethash q *functions*) info)))
   info)
 
+;;; ------------------------------------------------------------------
+;;; (defun (setf NAME) …) — CLHS long-form setf FUNCTIONS
+;;; ------------------------------------------------------------------
+;;;
+;;; A DEFUN whose name is the list (SETF NAME) already compiles fine — under
+;;; the name "SETF-<NAME>", which is what `#'(setf NAME)` resolves to.  What
+;;; was missing is the link from that definition back to the PLACE: the SETF
+;;; macro's generic fallback emits `(SET-<NAME> args… value)`, a name real CL
+;;; libraries never define, because upstream writes its writer the standard
+;;; way:
+;;;
+;;;     (defun (setf get-abstract-mapping) (value encoding) …)   ; babel
+;;;     (setf (get-abstract-mapping encoding) mapping)           ; …and uses it
+;;;
+;;; so every such use signalled UNDEFINED-FUNCTION "PKG::SET-<NAME>" (134 of
+;;; the 243 library-ladder errors — babel, documentation-utils, cl-annot,
+;;; trivial-indent, puri, cl-base64, named-readtables).
+;;;
+;;; This registry is the link.  Both DEFUN clauses (the toplevel one in
+;;; MVM-COMPILE-TOPLEVEL and the expression-context one in COMPILE-COMPOUND)
+;;; record NAME here; the SETF macro consults it IMMEDIATELY BEFORE the
+;;; SET-<NAME> fallback, which is therefore untouched for every name that has
+;;; no setf function — and Modus's own internals (defstruct accessors, CLOS
+;;; :accessor writers, the MODUS.MVM SET-* helpers, cl-eval's
+;;; SET-SYMBOL-FUNCTION family) keep resolving exactly as before.
+;;;
+;;; ALIST + DEFVAR NIL ON PURPOSE.  Defvar init forms do not run at boot
+;;; (Active Limitation #7), so a `(make-hash-table)` initform reads NIL
+;;; in-image — which is precisely why compiler.lisp's *SETF-EXPANDERS* hash
+;;; is dead under mvm-eval.  cl-eval.lisp's *RUNTIME-SETF-EXPANDERS* has the
+;;; same shape for the same reason.  A plain global also SURVIVES across
+;;; mvm-eval calls, unlike *MACRO-TABLE* / *FUNCTIONS*, which MVM-COMPILE-ALL
+;;; rebinds fresh per compilation unit — the defun and its first use are
+;;; different toplevel forms, hence different units.
+(defvar *setf-function-registry* nil
+  "Alist (ACCESSOR-KEY-HASH . SETTER-SYMBOL) for names defined by
+   (defun (setf NAME) (value args…) …).  SETTER-SYMBOL names the compiled
+   \"SETF-<NAME>\" function, whose lambda list is (value args…) — CLHS
+   3.1.2.1.2.3 argument order, new value FIRST.")
+
+(defun %setf-fn-setter-symbol (name)
+  "The symbol to CALL for (defun (setf NAME) …).
+
+   THE PACKAGE IS NOT NAME'S — it must be one that does NOT fold into the
+   function key, because the DEFUN it refers to is registered under the BARE
+   string \"SETF-<NAME>\" (the DEFUN clauses normalise the (setf X) list to a
+   STRING name, and a string carries no home package to fold).  Interning
+   into NAME's own package instead makes %RT-FN-NAME hand back
+   \"PKG::SETF-<NAME>\" for a runtime-born library package, which misses the
+   bare registration and re-signals the very UNDEFINED-FUNCTION this exists
+   to fix — measured, not theorised.
+
+   MODUS.MVM host-side (%FN-KEY-PKG-OF folds it, but %FN-INFO-FOR-KEY's
+   bare-name fallback catches that, and *MVM-EVAL-RUNTIME-P* is NIL there so
+   %RT-FN-NAME is bare anyway), COMMON-LISP-USER in-image — one of the three
+   ANSI-mandated packages %FN-KEY-ANSI-PKG-P / %RUNTIME-BORN-PKG-P exempt
+   from folding on BOTH the compile-time and runtime sides."
+  (intern (concatenate 'string "SETF-" (symbol-name name))
+          (or (find-package "MODUS.MVM")
+              (find-package "COMMON-LISP-USER")
+              *package*)))
+
+(defun %setf-fn-key (name)
+  "Registry key for accessor symbol NAME: the hash of its package-folded
+   function key, so two libraries defining (setf FOO) do not collide in the
+   registry.  NIL when NAME is not a symbol."
+  (and name
+       (symbolp name)
+       (compute-name-hash (%fn-key-qualify name (symbol-name name)))))
+
+(defun %register-setf-function (name)
+  "Record that (defun (setf NAME) …) has been compiled.  Returns the setter
+   symbol, or NIL when NAME is not a symbol."
+  (let ((k (%setf-fn-key name)))
+    (when k
+      (let ((sym (%setf-fn-setter-symbol name)))
+        (setq *setf-function-registry*
+              (cons (cons k sym) *setf-function-registry*))
+        sym))))
+
+(defun %find-setf-function (name)
+  "SETTER-SYMBOL registered for accessor NAME by (defun (setf NAME) …), or
+   NIL.  Most-recent registration wins (entries are PUSHed), matching
+   last-defun-wins."
+  (let ((k (%setf-fn-key name)))
+    (and k
+         (let ((cur *setf-function-registry*)
+               (hit nil))
+           (loop
+             (when (or hit (null cur)) (return hit))
+             (when (eql (car (car cur)) k)
+               (setq hit (cdr (car cur))))
+             (setq cur (cdr cur)))))))
+
 (defun %init-thunk-store (name name-hash tmp-var)
   "The STORE half of a generated defvar/defparameter/defconstant init thunk:
    bind the global NAME (whose key is NAME-HASH) to the value already in
@@ -2681,6 +2775,40 @@
                 ;; These already work via the generic fallback because the
                 ;; SET-X defuns exist (cl-eval.lisp:200, 5088, 5090).  Keep
                 ;; the fallback path; no explicit intercept needed.
+                ;; CLHS long-form setf FUNCTION: somebody wrote
+                ;;   (defun (setf NAME) (value args…) …)
+                ;; which compiled under the name "SETF-<NAME>" and registered
+                ;; NAME in *SETF-FUNCTION-REGISTRY*.  Call it with the CLHS
+                ;; 3.1.2.1.2.3 argument order (new value FIRST).
+                ;;
+                ;; Deliberately the LAST clause before the SET-<NAME>
+                ;; fallback: every builtin place above (car/cdr/aref/gethash/
+                ;; getf/ldb/mask-field/mem-ref/nth/svref/the/values/
+                ;; symbol-value/row-major-aref) keeps its own expansion even
+                ;; if a library defines a setf function for that name, and
+                ;; any name WITHOUT a setf function still reaches the
+                ;; SET-<NAME> fallback that Modus's defstruct/CLOS/MODUS.MVM
+                ;; internals depend on.  So this is a strict superset: it only
+                ;; fires where the old expansion was UNDEFINED-FUNCTION.
+                ;;
+                ;; The let* is CLHS 5.1.1.1 evaluation order — place subforms
+                ;; left to right, then the value form — and the trailing GV
+                ;; makes SETF yield the NEW VALUE rather than whatever the
+                ;; setf function happened to return.
+                ((and (consp place)
+                      (symbolp (car place))
+                      (%find-setf-function (car place)))
+                 (let* ((setter (%find-setf-function (car place)))
+                        (pargs  (cdr place))
+                        (gargs  (mapcar (lambda (a)
+                                          (declare (ignore a))
+                                          (gensym "SFA"))
+                                        pargs))
+                        (gval   (gensym "SFV")))
+                   `(let* (,@(mapcar #'list gargs pargs)
+                           (,gval ,value))
+                      (,setter ,gval ,@gargs)
+                      ,gval)))
                 ;; Generic accessor: (setf (foo-bar a1 ... aN) v) → (set-foo-bar a1 ... aN v)
                 ;; Pass ALL place args plus the value (was only passing the
                 ;; first arg, which silently dropped the index in
@@ -4841,6 +4969,10 @@
                              (string= (symbol-name (car raw-name)) "SETF"))
                         (format nil "SETF-~A" (symbol-name (cadr raw-name)))
                         raw-name)))
+         ;; CLHS long-form setf function — link (setf (NAME …) v) to it.
+         ;; See *SETF-FUNCTION-REGISTRY*.
+         (when (and (stringp name) (consp raw-name) (symbolp (cadr raw-name)))
+           (%register-setf-function (cadr raw-name)))
          ;; In-image mvm-eval: a DEFUN is ALWAYS a global definition (CLHS) even
          ;; when it reaches compile-form nested — inside %mvm-eval-thunk (a bare
          ;; top-level expression), a top-level MACROLET/LET body, a deftest
@@ -16661,6 +16793,10 @@
                             (string= (symbol-name (car raw-name)) "SETF"))
                        (format nil "SETF-~A" (symbol-name (cadr raw-name)))
                        raw-name)))
+         ;; CLHS long-form setf function — link (setf (NAME …) v) to it.
+         ;; See *SETF-FUNCTION-REGISTRY*.
+         (when (and (stringp name) (consp raw-name) (symbolp (cadr raw-name)))
+           (%register-setf-function (cadr raw-name)))
          ;; In-image mvm-eval: record this toplevel-context defun NAME for the
          ;; trampoline-install (persistence) loop.  This handler runs POST-
          ;; macroexpansion, so macro-hidden defuns (with-upgradability →
@@ -17218,7 +17354,21 @@
                     ;; item-3 probes 311/312).  A defun persists across
                     ;; mvm-eval calls via *e2-persist-defuns*, closing the
                     ;; cross-call side for free.
-                    (push `(defun (setf ,(%defstruct-intern acc-name)) (val obj)
+                    ;;
+                    ;; NAMED BY THE STRING "SETF-<ACC>" RATHER THAN THE LIST
+                    ;; (setf ACC), which compiles to the identical function
+                    ;; (the DEFUN clauses normalise (setf X) to exactly this
+                    ;; string) but deliberately does NOT register ACC in
+                    ;; *SETF-FUNCTION-REGISTRY*.  A defstruct emits BOTH
+                    ;; writers, and they are semantically identical, so there
+                    ;; is nothing to gain from re-routing `(setf (ACC s) v)`
+                    ;; off the SET-<ACC> fallback it has always used — and a
+                    ;; lot of pointless churn (an extra let* and a different
+                    ;; callee at every struct-accessor SETF site in the image
+                    ;; and the ANSI corpus) to be had from doing so.  A user
+                    ;; who later writes their own `(defun (setf ACC) …)` DOES
+                    ;; register, and wins, which is correct.
+                    (push `(defun ,(format nil "SETF-~A" acc-name) (val obj)
                              (aset obj ,(+ 2 i) val)
                              val)
                           forms-to-compile)

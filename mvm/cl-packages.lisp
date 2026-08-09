@@ -514,6 +514,15 @@
       (setq *runtime-born-pkgs* (make-hash-table)))
     (puthash (compute-name-hash name-string) *runtime-born-pkgs* t)))
 
+(defun %any-runtime-born-pkg-p ()
+  "T once ANY runtime-born package exists in this image.  A zero-deref
+   pre-gate for the per-package key folds: while this is NIL — the whole ANSI
+   gate, every baked build, every image that has not yet loaded a library —
+   no fold can possibly apply, so the callers must not pay (nor risk) a
+   %PKG-NAME deref to find that out.  See the RE-ENTRANCY note on
+   %SYM-GLOBAL-PKG-KEY."
+  (if *runtime-born-pkgs* t nil))
+
 (defun %runtime-born-pkg-p (name-string)
   "T if package NAME-STRING was born at runtime (fold its symbols' fn
    keys), NIL for system / build-baked packages (bare keys)."
@@ -1467,31 +1476,65 @@
 ;;; worse than the bug (a compiled read would find a cell that BOUNDP says is
 ;;; unbound).  They are: the compiler's emitted key (%GLOBAL-NAME-KEY, both
 ;;; the host definition and the in-image override), SYMBOL-VALUE, BOUNDP,
-;;; %EVAL-SET-GLOBAL, and the (setf (symbol-value …)) place.  All five route
-;;; through %SYM-GLOBAL-KEY / %GLOBAL-VAR-PKG-KEY.
+;;; %EVAL-SET-GLOBAL, %PROGV-HASH, and the (setf (symbol-value …)) place.
+;;; All of them route through %SYM-GLOBAL-PKG-KEY.
+;;;
+;;; RE-ENTRANCY (the hazard that bit 0c00bd9): SYMBOL-VALUE and BOUNDP sit on
+;;; nearly every code path, including inside the compiler and the condition
+;;; system, and %PKG-NAME is (AREF (CDR P) 0) followed by STRINGP — runtime
+;;; functions that can themselves route back through TYPEP.  A guard that
+;;; called %PKG-NAME on a deep stack from %COND-REG-FIND closed exactly such a
+;;; loop and killed an ANSI fork with NO marker.  So %SYM-GLOBAL-PKG-KEY tests
+;;; *RUNTIME-BORN-PKGS* FIRST, before it touches the symbol at all: with no
+;;; runtime-born package in the image — the whole ANSI gate, every baked build
+;;; — the answer can only ever be "bare key", and it is answered without a
+;;; single package deref.  The folding path only ever runs once a runtime
+;;; library has actually created a package.
 ;;; ------------------------------------------------------------------
+
+(defun %sym-global-pkg-key (sym)
+  "Package-qualified global-value key for SYM, or NIL meaning 'use the
+   historic bare key'.  NIL — with no package deref at all — whenever the
+   image has no runtime-born packages.  The runtime-side twin of
+   compiler.lisp's %GLOBAL-VAR-PKG-KEY; the two must stay in lockstep."
+  (and *runtime-born-pkgs*
+       sym
+       (%cl-sym-p sym)
+       (let ((p (%cl-sym-package sym)))
+         (and p
+              (%pkg-p p)
+              (let ((pn (%pkg-name p)))
+                (and pn
+                     (stringp pn)
+                     (%runtime-born-pkg-p pn)
+                     (let ((nm (%cl-sym-name sym)))
+                       (and nm (stringp nm) (> (length nm) 0)
+                            (compute-name-hash
+                             (concatenate 'string pn "::" nm))))))))))
 
 (defun %sym-global-key (sym)
   "Global-value store KEY for SYM: the package-qualified name hash when SYM's
    home package is runtime-born, else the historic bare slot-0 hash.
-   Integers pass through (the compiler already emits a computed key)."
+   Integers pass through (the compiler already emits a computed key).
+
+   Every non-runtime-born branch answers EXACTLY what it answered before this
+   fix — that is the whole safety argument.  In particular the KEYWORD branch
+   is not decoration: keywords are subtag #x53, so %CL-SYM-P and
+   %NATIVE-MVM-SYM-P (both #x50) reject them, and dropping them to NIL would
+   silently change what prelude's SYMBOL-VALUE returned for a keyword
+   argument.  Same set of shapes, same order, as build-ansi-common's in-image
+   %GLOBAL-NAME-KEY."
   (cond
     ((null sym) nil)
     ((eq sym t) nil)
     ((integerp sym) sym)
-    ((or (consp sym) (characterp sym) (stringp sym)) nil)
+    ((or (consp sym) (characterp sym)) nil)
+    ((stringp sym) (compute-name-hash sym))
     ((%cl-sym-p sym)
-     (let ((p (%cl-sym-package sym)))
-       (if (and p (%pkg-p p))
-           (let ((pn (%pkg-name p)))
-             (if (and pn (stringp pn) (%runtime-born-pkg-p pn))
-                 (let ((nm (%cl-sym-name sym)))
-                   (if (and nm (stringp nm) (> (length nm) 0))
-                       (compute-name-hash (concatenate 'string pn "::" nm))
-                       (aref sym 0)))
-                 (aref sym 0)))
-           (aref sym 0))))
+     (let ((q (%sym-global-pkg-key sym)))
+       (if q q (aref sym 0))))
     ((%native-mvm-sym-p sym) (aref sym 0))
+    ((keywordp sym) (aref sym 0))
     (t nil)))
 
 (defun symbol-value (name-or-hash)
@@ -1797,10 +1840,20 @@
 ;;; so the same key is used in save and restore.
 
 (defun %progv-hash (sym)
-  "Canonicalize a symbol designator to a name-hash key."
+  "Canonicalize a symbol designator to a name-hash key.
+
+   PROGV is a SIXTH entry point into the same store, and although its own
+   save/set/restore triple is internally symmetric, an asymmetry against the
+   key a COMPILED read of the same variable uses would make a PROGV binding
+   of a runtime-born package's special invisible — the same defect shape the
+   LET save/restore had (battery row special.after-rebind).  So the
+   package-qualified key wins when there is one; everything else keeps the
+   historic bare hash exactly."
   (cond
     ((integerp sym) sym)
-    ((%cl-sym-p sym) (compute-name-hash (%cl-sym-name sym)))
+    ((%cl-sym-p sym)
+     (let ((q (%sym-global-pkg-key sym)))
+       (if q q (compute-name-hash (%cl-sym-name sym)))))
     ((stringp sym) (compute-name-hash sym))
     ;; Native MVM symbol: hash already lives in slot 0.
     ((and (not (consp sym)) (not (null sym)) (not (characterp sym))

@@ -319,6 +319,18 @@
        (list (da::read-u) (db::read-u))))
 (chk "special.after-rebind" (list (da::read-u) (db::read-u)))
 
+;; The store has more doors than SYMBOL-VALUE / BOUNDP / a compiled read, and
+;; a door that keeps a bare key while the others qualify writes a cell nobody
+;; reads.  Measure each one instead of reasoning about it: SET (the function),
+;; PROGV (its own save/set/restore key), and MAKUNBOUND.
+(chk "special.set-fn"
+     (progn (set 'da::*u* :U-VIA-SET)
+            (list (da::read-u) (db::read-u))))
+(chk "special.progv"
+     (progv (list 'da::*u*) (list :U-VIA-PROGV)
+       (list (da::read-u) (db::read-u))))
+(chk "special.after-progv" (list (da::read-u) (db::read-u)))
+
 ;;; ------------------------------------------------------------------
 ;;; 14. METHOD-COMBINATION registry.
 ;;;

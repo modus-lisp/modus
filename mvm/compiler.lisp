@@ -1704,9 +1704,16 @@
    bare key.  Non-NIL only when compiling IN-IMAGE (*MVM-EVAL-RUNTIME-P*) for
    a symbol whose home package is runtime-born — mirroring %RT-FN-NAME, whose
    identical gate is what makes the #211 fn-key fold safe.  Must stay in
-   lockstep with cl-packages' %SYM-GLOBAL-KEY, which is the same computation
-   on the runtime side."
+   lockstep with cl-packages' %SYM-GLOBAL-PKG-KEY, which is the same
+   computation on the runtime side.
+
+   %ANY-RUNTIME-BORN-PKG-P is tested BEFORE the symbol is touched, so that
+   in-image eval2 compilation — which runs with *MVM-EVAL-RUNTIME-P* set —
+   does not deref a package on every global variable reference just to
+   discover there are no runtime-born packages to fold into.  Same
+   re-entrancy reasoning as the runtime side (see cl-packages.lisp)."
   (and *mvm-eval-runtime-p*
+       (%any-runtime-born-pkg-p)
        sym
        (%cl-sym-p sym)
        (let ((p (%cl-sym-package sym)))

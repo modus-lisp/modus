@@ -1,0 +1,20 @@
+(defpackage "MA" (:use "CL"))
+(defpackage "MB" (:use "CL"))
+(defmacro try (form) `(handler-case ,form (t (c) (list :err (type-of c)))))
+(format t "~%m1 cl-sym-p a=~a b=~a~%" (try (%cl-sym-p 'ma::zz)) (try (%cl-sym-p 'mb::zz)))
+(format t "m2 slot0 a=~a b=~a~%" (try (%cl-sym-hash 'ma::zz)) (try (%cl-sym-hash 'mb::zz)))
+(format t "m3 array-length a=~a b=~a~%" (try (array-length 'ma::zz)) (try (array-length 'mb::zz)))
+(format t "m4 clos-sym-name-eq -> ~a~%" (try (%clos-sym-name-eq 'ma::zz 'mb::zz)))
+(format t "m5 sym-name a=~a b=~a~%" (try (%cl-sym-name 'ma::zz)) (try (%cl-sym-name 'mb::zz)))
+(format t "m6 pkgname a=~a b=~a~%" (try (%pkg-name (%cl-sym-package 'ma::zz)))
+        (try (%pkg-name (%cl-sym-package 'mb::zz))))
+(format t "m7 struct-name-hash a=~a b=~a~%" (try (%struct-name-hash 'ma::zz)) (try (%struct-name-hash 'mb::zz)))
+;; What flavour do GF registry keys have after an eval'd defgeneric?
+(eval '(defgeneric ma::qq (x)))
+(let ((k (car (car *generic-functions*))))
+  (format t "m8 top registry key: cl-sym-p=~a len=~a slot0=~a pkg=~a~%"
+          (try (%cl-sym-p k)) (try (array-length k)) (try (%cl-sym-hash k))
+          (try (%pkg-name (%cl-sym-package k)))))
+(format t "m9 clos-sym-name-eq(key,'mb::qq) -> ~a~%"
+        (try (%clos-sym-name-eq (car (car *generic-functions*)) 'mb::qq)))
+(format t "~%PROBE-MECH-DONE~%")

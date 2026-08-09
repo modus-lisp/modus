@@ -2260,6 +2260,62 @@
         (%gf-set-method-meta gf (cons (cons m meta)
                                       (%gf-method-meta gf)))))))
 
+;;; ------------------------------------------------------------------
+;;; PER-PACKAGE generic-function resolution (the CLOS-side analogue of
+;;; the #211 fn-key fold and the e513ab0 macro-table fold — this is the
+;;; THIRD name-keyed registry found package-blind).
+;;;
+;;; *GENERIC-FUNCTIONS* is an alist keyed by the name SYMBOL OBJECT, so
+;;; its PRIMARY lookup (pass 1 of %FIND-GF, plain EQ) was already
+;;; package-exact.  The package-blindness lived entirely in the SECONDARY
+;;; name-hash pass, which exists only to close the mvm-eval symbol-flavor
+;;; boundary (a GF stored as a native-MVM-sym vs the CL-sym-wrapper the
+;;; in-image %INTERN-SYMBOL produces for the same source literal).  That
+;;; pass compares the stored slot-0 name hash, which carries no package,
+;;; so GRAY-STREAMS:STREAM-READ-SEQUENCE resolved to TRIVIAL-GRAY-STREAMS'
+;;; own same-named GF.  Two observed consequences (probe-gf.lisp):
+;;;   - spurious PROGRAM-ERROR: a DEFMETHOD/DEFGENERIC in one package is
+;;;     congruence-checked against the OTHER package's lambda list;
+;;;   - SILENT MIS-DISPATCH: with matching arity the two packages share
+;;;     ONE GF object, so (PA::F 1) ran PB::F's method.
+;;;
+;;; The fix is a DISCRIMINATOR on the secondary pass rather than a new
+;;; side table: the side table's job (per-package resolution keyed by the
+;;; already-computed bare name) is already done by the existing alist +
+;;; EQ pass, and adding one would duplicate every registry walk
+;;; (METHOD-GENERIC-FUNCTION, %METHOD-META-ANYWHERE, ...).  It allocates
+;;; nothing.
+;;;
+;;; Deliberately CONSERVATIVE: a match is rejected ONLY when BOTH symbols
+;;; carry a resolvable home package and those packages differ.  An
+;;; unknown package on either side (native-MVM-syms, uninterned syms,
+;;; build-time-registered GFs) keeps the exact historical behaviour, so
+;;; the mvm-eval boundary the pass exists for is untouched.  Home-package
+;;; resolution already honours inheritance — (INTERN "CAR" "PQA") reports
+;;; COMMON-LISP — so no #211-style CL/CL-USER/KEYWORD exemption is needed
+;;; here: a library's inherited CL:PRINT-OBJECT and the CL:PRINT-OBJECT a
+;;; method was registered under agree on package by construction.
+;;; ------------------------------------------------------------------
+
+(defun %gf-sym-pkg-name (s)
+  "Home package NAME of symbol S as a string, or NIL when S carries no
+   package slot (native-MVM-sym, uninterned sym, non-symbol)."
+  (and s
+       (%cl-sym-p s)
+       (let ((p (%cl-sym-package s)))
+         (and p (let ((n (%pkg-name p)))
+                  (and n (stringp n) (> (length n) 0) n))))))
+
+(defun %gf-pkg-compatible (k name)
+  "NIL only when registry key K and lookup NAME both have a resolvable
+   home package and those packages DIFFER.  Unknown package on either
+   side => T (historic behaviour)."
+  (let ((pk (%gf-sym-pkg-name k)))
+    (if (null pk)
+        t
+        (let ((pn (%gf-sym-pkg-name name)))
+          (if (null pn) t (string= pk pn))))))
+
 (defun %find-gf (name)
   "Find generic function by name.  (setf X) function names are LISTS —
    each quoted occurrence is a distinct cons, so EQ never matches across
@@ -2294,7 +2350,13 @@
         (when (null cur) (return nil))
         (let ((k (car (car cur))))
           (when (and (not (consp k))
-                     (%clos-sym-name-eq k name))
+                     (%clos-sym-name-eq k name)
+                     ;; ... but never across two DIFFERENT home packages:
+                     ;; the slot-0 name hash carries no package, so this
+                     ;; pass used to collapse PA:FOO and PB:FOO into one
+                     ;; GF (spurious congruence PROGRAM-ERROR one way,
+                     ;; silent mis-dispatch the other).
+                     (%gf-pkg-compatible k name))
             (return-from %find-gf (cdr (car cur)))))
         (setq cur (cdr cur)))))
   nil)

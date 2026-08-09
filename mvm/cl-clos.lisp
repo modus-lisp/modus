@@ -2353,6 +2353,32 @@
               (let ((n (%pkg-name p)))
                 (and n (stringp n) (> (length n) 0) n))))))
 
+(defun %clos-pkg-obj-compatible (a b)
+  "%GF-PKG-COMPATIBLE for REENTRANT call sites: compares the package
+   OBJECTS with EQ and never touches %PKG-NAME.
+
+   %PKG-NAME is (AREF (CDR P) 0), and AREF / STRINGP / LENGTH / STRING= are
+   themselves runtime functions that can route back through TYPEP.  That is
+   harmless from %FIND-GF, but %COND-REG-FIND is reachable FROM TYPEP (via
+   %CONDITION-P and the condition-type-name branch), so putting a
+   %PKG-NAME-based guard there closes a TYPEP -> %COND-REG-FIND -> %PKG-NAME
+   -> ... -> TYPEP loop.  Measured, not theorised: with the %PKG-NAME guard
+   in %COND-REG-FIND, ANSI test 22141 (print.integers.base.various.2 -- 3500
+   bignum print/read round trips, i.e. a already-deep stack) killed its fork
+   outright, with no crash marker and no T: line; bisected to cl-conditions,
+   then to this one call.
+
+   Packages are interned by FIND-PACKAGE, so EQ on package objects is the
+   right identity test anyway.  Same conservative contract: NIL only when
+   BOTH sides carry a real package object and those differ."
+  (let ((pa (and a (%cl-sym-p a) (%cl-sym-package a))))
+    (if (or (null pa) (not (%pkg-p pa)))
+        t
+        (let ((pb (and b (%cl-sym-p b) (%cl-sym-package b))))
+          (if (or (null pb) (not (%pkg-p pb)))
+              t
+              (eq pa pb))))))
+
 (defun %gf-pkg-compatible (k name)
   "NIL only when registry key K and lookup NAME both have a resolvable
    home package and those packages DIFFER.  Unknown package on either

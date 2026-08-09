@@ -42,7 +42,7 @@
             (when (or (eq k name)
                       (and nhash (symbolp k) (not (null k)) (not (eq k t))
                            (= (aref k 0) nhash)
-                           (%gf-pkg-compatible k name)))
+                           (%clos-pkg-obj-compatible k name)))
               (return entry)))))
       (setq cur (cdr cur)))))
 

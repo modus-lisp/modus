@@ -58,9 +58,20 @@
 ;;; packages.  Nothing in them shadows a CL symbol.
 ;;; =====================================================================
 
+;;; SCL on a real Genera is Common Lisp PLUS the Symbolics extensions — every
+;;; CL symbol is accessible as `scl:foo'.  This stub is not that; it is the
+;;; three extension operators the portable corpus actually reaches for.  That
+;;; makes it the wrong SHAPE, and the shape shows: vendored ASDF's Genera
+;;; branch does `(:shadowing-import-from :scl :boolean)', and BOOLEAN is a CL
+;;; type that SCL would inherit for free on a real Genera.  Exported here as a
+;;; correctness fix — SCL:BOOLEAN now names CL:BOOLEAN, which is what it means
+;;; on the machine this package is imitating.  IMPORT before EXPORT: without
+;;; it, EXPORT would intern a fresh SCL::BOOLEAN and `scl:boolean' would name
+;;; a symbol with no type, which is worse than not exporting it at all.
 (defpackage "SCL"
   (:use)
-  (:export "LOCF" "LET-GLOBALLY" "MAKE-HASH-TABLE"))
+  (:import-from "COMMON-LISP" "BOOLEAN")
+  (:export "LOCF" "LET-GLOBALLY" "MAKE-HASH-TABLE" "BOOLEAN"))
 
 (defpackage "SYS"
   (:use)

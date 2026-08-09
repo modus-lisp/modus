@@ -4302,8 +4302,12 @@
    runtime-defmacro)."
   (declare (ignore env))
   (let ((key (%macro-sym-key name)))
-    (let ((raw (and key *compiler-macro-function-table*
-                    (gethash key *compiler-macro-function-table*))))
+    ;; NAME's OWN package's compiler macro wins over the bare last-writer
+    ;; entry (task #241); the bare entry stays as the fallback for names with
+    ;; no resolvable package.
+    (let ((raw (or (%compiler-macro-pkg-get name key)
+                   (and key *compiler-macro-function-table*
+                        (gethash key *compiler-macro-function-table*)))))
       (cond
         ((null raw) nil)
         ((%interp-closure-p raw)
@@ -5614,11 +5618,24 @@
 ;;; &optional/&key) to the *unevaluated* type arguments and evaluates the
 ;;; body to the expanded type specifier, which the caller re-checks.
 (defun %deftype-lookup (head)
-  "If HEAD names a user deftype, return its (params . body); else NIL."
+  "If HEAD names a user deftype, return its (params . body); else NIL.
+
+   PER-PACKAGE FIRST (task #241): HEAD's OWN package's registration wins
+   over the bare last-writer-wins entry, so DA::TY and DB::TY are different
+   types (CLHS 11.1) instead of aliases — and so a deftype that expands into
+   another package's same-named type terminates instead of recursing until
+   the stack is gone (probes/hang-deftype.lisp, rc 139).  The bare entry is
+   the FALLBACK, not deleted: heads with no resolvable package (native MVM
+   syms, build-time registrations) must resolve exactly as before.
+
+   This runs on the TYPEP path, so %DEFTYPE-PKG-GET compares package OBJECTS
+   with EQ and touches nothing re-entrant — see the 8efb421 note on
+   %CLOS-PKG-OBJ-COMPATIBLE."
   (and *%runtime-deftype-table*
        (symbolp head)
        (let ((nm (%eval-sym-name head)))
-         (and nm (gethash nm *%runtime-deftype-table*)))))
+         (and nm (or (%deftype-pkg-get head nm)
+                     (gethash nm *%runtime-deftype-table*))))))
 
 (defun %subtypep-deftype-head-p (type)
   "True iff TYPE's head (the symbol itself when atomic, or (car TYPE)

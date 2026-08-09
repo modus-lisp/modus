@@ -158,21 +158,40 @@
   "Hash table of accessor-name (hash integer) -> (lambda (place-args value-form) -> form).
    Populated by defsetf and define-setf-expander; consulted by SETF.")
 
+;; Per-package side table for *SETF-EXPANDERS* — see the block comment at
+;; *GLOBAL-SYMBOL-MACROS-PKG*.  (defsetf da::acc …) and (defsetf db::acc …)
+;; shared one entry, so (setf (da::acc x) 1) ran DB's setter.
+(defvar *setf-expanders-pkg* nil
+  "accessor name hash → alist of (package-OBJECT . expander).")
+
 (defun mvm-define-setf-expander (name expander)
-  "Register a setf expander for NAME (string, symbol, or hash)."
+  "Register a setf expander for NAME (string, symbol, or hash).
+   Dual write: NAME's own package plus the historic bare entry."
   (let ((h (cond ((integerp name) name)
                  ((stringp name) (compute-name-hash name))
                  ((symbolp name) (compute-name-hash (symbol-name name)))
                  (t (error "mvm-define-setf-expander: bad name ~S" name)))))
+    (let ((p (%reg-pkg-of name)))
+      (when p
+        (unless *setf-expanders-pkg*
+          (setq *setf-expanders-pkg* (make-hash-table :test 'eql)))
+        (setf (gethash h *setf-expanders-pkg*)
+              (%reg-pkg-alist-put (gethash h *setf-expanders-pkg*) p expander))))
     (setf (gethash h *setf-expanders*) expander)))
 
 (defun mvm-find-setf-expander (name)
-  "Look up setf expander for NAME (symbol or string). Returns nil if none."
+  "Look up setf expander for NAME (symbol or string). Returns nil if none.
+   NAME's OWN package's expander wins over the bare last-writer entry
+   (task #241); the bare entry stays as the fallback."
   (let ((h (cond ((integerp name) name)
                  ((stringp name) (compute-name-hash name))
                  ((symbolp name) (compute-name-hash (symbol-name name)))
                  (t nil))))
-    (and h (gethash h *setf-expanders*))))
+    (and h
+         (or (and *setf-expanders-pkg*
+                  (let ((p (%reg-pkg-of name)))
+                    (and p (%reg-pkg-alist-get (gethash h *setf-expanders-pkg*) p))))
+             (gethash h *setf-expanders*)))))
 
 ;; Place expansion for read-modify-write macros (INCF/DECF/PUSH/PUSHNEW).
 ;; CLHS 5.1.1.1: every subform of a place is evaluated exactly once, left
@@ -578,6 +597,56 @@
 ;; Needed by global-vars' define-global-var (bt2/bordeaux-threads).
 (defvar *global-symbol-macros* nil
   "Map from global symbol-macro name (hash) to its expansion form.")
+
+;;; ------------------------------------------------------------------
+;;; PER-PACKAGE side tables for the two compiler-owned registries
+;;; (*GLOBAL-SYMBOL-MACROS* and *SETF-EXPANDERS*) — task #241 batch 2.
+;;;
+;;; Both were keyed by a BARE name (NORMALIZE-NAME / COMPUTE-NAME-HASH of
+;;; SYMBOL-NAME), so DA::SM and DB::SM — or (defsetf da::acc …) and
+;;; (defsetf db::acc …) — collapsed onto one entry and the last writer
+;;; silently won for both.  For symbol macros that is also a HANG: with
+;;; (define-symbol-macro hf::sm he::sm), reading HE::SM expands to HE::SM
+;;; forever and COMPILE-VARIABLE-REF recurses until the stack is gone
+;;; (probes/hang-symbol-macro.lisp).
+;;;
+;;; ADDITIVE (see the block comment in cl-eval.lisp): the bare entry keeps
+;;; its exact contents and meaning and is the FALLBACK; the side entry is
+;;; consulted first and only ever exists for a symbol with a resolvable home
+;;; package.  RUNTIME-ONLY: %REG-PKG-OF answers NIL at build time, so the
+;;; host build and every baked native image are unaffected — build-baked
+;;; sources define each of these names in exactly one package.
+;;; ------------------------------------------------------------------
+
+(defun %reg-pkg-of (sym)
+  "Home package OBJECT of SYM for the compiler's per-package registries,
+   or NIL.  Always NIL at build time (*MVM-EVAL-RUNTIME-P* is NIL there),
+   which is what keeps the host compile byte-identical; in-image it defers
+   to cl-eval's %REG-SYM-PKG-OBJ, which compares nothing and allocates
+   nothing."
+  (and *mvm-eval-runtime-p* sym (%reg-sym-pkg-obj sym)))
+
+(defvar *global-symbol-macros-pkg* nil
+  "symbol-macro name hash → alist of (package-OBJECT . (expansion)).
+   The expansion is CONSed into a one-element list so that a legitimate NIL
+   expansion is still distinguishable from `no entry`.")
+
+(defun %gsm-pkg-get (sym key)
+  "One-element list holding SYM's own package's global symbol-macro
+   expansion under KEY, or NIL when there is none."
+  (and *global-symbol-macros-pkg*
+       (let ((p (%reg-pkg-of sym)))
+         (and p (%reg-pkg-alist-get (gethash key *global-symbol-macros-pkg*) p)))))
+
+(defun %gsm-pkg-put (sym key expansion)
+  "Register EXPANSION as SYM's own package's global symbol macro."
+  (let ((p (%reg-pkg-of sym)))
+    (when p
+      (unless *global-symbol-macros-pkg*
+        (setq *global-symbol-macros-pkg* (make-hash-table :test 'eql)))
+      (setf (gethash key *global-symbol-macros-pkg*)
+            (%reg-pkg-alist-put (gethash key *global-symbol-macros-pkg*)
+                                p (cons expansion nil))))))
 
 (defvar *init-thunk-names* nil
   "Names of auto-generated INIT-* thunks emitted by the DEFVAR /
@@ -1290,6 +1359,30 @@
             (symbol-name fn)))
       (symbol-name fn)))
 
+(defun %setf-fn-name (sym)
+  "Function-table KEY STRING for the CLHS function name (SETF SYM).
+
+   Modus compiles `(defun (setf X) …)` under the flat name \"SETF-<X>\", which
+   carries no package — so two libraries that each define (setf ACC), the
+   completely ordinary way of writing a writer, compiled to ONE function and
+   the last one silently won for both: `(setf (da::acc c) 1)` ran DB's setter
+   (task #241, battery row setf.da).  Qualify exactly as %RT-FN-NAME does —
+   \"PKG::SETF-<X>\" iff runtime mvm-eval AND X's home package is
+   runtime-born, bare otherwise — so build-time and native builds are
+   byte-identical and only runtime-loaded library packages get distinct cells.
+
+   Every producer of this name must agree: the two DEFUN clauses, the CALL
+   and #' sites, the FLET/LABELS local-name keys, and
+   %SETF-FN-SETTER-SYMBOL (which interns into X's own package for exactly the
+   runtime-born case, so %RT-FN-NAME of its result reproduces this string)."
+  (let ((base (concatenate 'string "SETF-" (symbol-name sym))))
+    (if (and *mvm-eval-runtime-p* (%cl-sym-p sym))
+        (let ((pkg (%cl-sym-package sym)))
+          (if (and pkg (%runtime-born-pkg-p (%pkg-name pkg)))
+              (concatenate 'string (%pkg-name pkg) "::" base)
+              base))
+        base)))
+
 ;;; ------------------------------------------------------------------
 ;;; #211 part 2 — fold (package, name) into the *FUNCTIONS* key
 ;;; ------------------------------------------------------------------
@@ -1501,11 +1594,26 @@
    bare-name fallback catches that, and *MVM-EVAL-RUNTIME-P* is NIL there so
    %RT-FN-NAME is bare anyway), COMMON-LISP-USER in-image — one of the three
    ANSI-mandated packages %FN-KEY-ANSI-PKG-P / %RUNTIME-BORN-PKG-P exempt
-   from folding on BOTH the compile-time and runtime sides."
-  (intern (concatenate 'string "SETF-" (symbol-name name))
-          (or (find-package "MODUS.MVM")
-              (find-package "COMMON-LISP-USER")
-              *package*)))
+   from folding on BOTH the compile-time and runtime sides.
+
+   TASK #241 AMENDMENT: that reasoning held only while the DEFUN registered
+   under the BARE string.  %SETF-FN-NAME now qualifies the compiled name to
+   \"PKG::SETF-<NAME>\" for a runtime-born package — precisely so two
+   libraries' (setf ACC) stop sharing one function — so for that case the
+   setter symbol must intern into NAME's OWN package, which is what makes
+   %RT-FN-NAME reproduce the same qualified key.  Every other case (build
+   time, system packages) keeps the historic MODUS.MVM / CL-USER intern and
+   the historic bare key, unchanged."
+  (if (and *mvm-eval-runtime-p*
+           (%cl-sym-p name)
+           (let ((p (%cl-sym-package name)))
+             (and p (%runtime-born-pkg-p (%pkg-name p)))))
+      (intern (concatenate 'string "SETF-" (symbol-name name))
+              (%cl-sym-package name))
+      (intern (concatenate 'string "SETF-" (symbol-name name))
+              (or (find-package "MODUS.MVM")
+                  (find-package "COMMON-LISP-USER")
+                  *package*))))
 
 (defun %setf-fn-key (name)
   "Registry key for accessor symbol NAME: the hash of its package-folded
@@ -2333,6 +2441,9 @@
             (expansion (caddr form)))
         (unless *global-symbol-macros*
           (setq *global-symbol-macros* (make-hash-table :test 'eql)))
+        ;; Dual write: per-package entry for exact resolution (task #241),
+        ;; bare entry so every package-less lookup behaves as before.
+        (%gsm-pkg-put name (normalize-name name) expansion)
         (setf (gethash (normalize-name name) *global-symbol-macros*) expansion)
         (list 'quote name))))
 
@@ -4681,6 +4792,10 @@
       ;; Global symbol-macro (DEFINE-SYMBOL-MACRO): expand the reference.
       ;; Checked after the lexical env (a local symbol-macrolet/let shadows it)
       ;; and before constants/globals.
+      ;; NAME's OWN package's symbol macro wins over the bare last-writer
+      ;; entry (task #241); the bare entry remains the fallback.
+      ((%gsm-pkg-get name (normalize-name name))
+       (compile-form (car (%gsm-pkg-get name (normalize-name name))) env dest))
       ((and *global-symbol-macros*
             (nth-value 1 (gethash (normalize-name name) *global-symbol-macros*)))
        (compile-form (gethash (normalize-name name) *global-symbol-macros*) env dest))
@@ -5042,7 +5157,7 @@
                              (= (length raw-name) 2)
                              (symbolp (car raw-name))
                              (string= (symbol-name (car raw-name)) "SETF"))
-                        (format nil "SETF-~A" (symbol-name (cadr raw-name)))
+                        (%setf-fn-name (cadr raw-name))
                         raw-name)))
          ;; CLHS long-form setf function — link (setf (NAME …) v) to it.
          ;; See *SETF-FUNCTION-REGISTRY*.
@@ -7925,6 +8040,11 @@
         (compile-form `(setf ,(binding-expansion sm-binding) ,val) env dest))))
   ;; Global symbol-macro (DEFINE-SYMBOL-MACRO): (setq name v) = (setf expansion v)
   ;; per CLHS 5.1.2.4 — only when NAME isn't lexically bound (checked above).
+  (when (and (not (env-lookup env var))
+             (%gsm-pkg-get var (normalize-name var)))
+    (return-from compile-setq
+      (compile-form `(setf ,(car (%gsm-pkg-get var (normalize-name var))) ,val)
+                    env dest)))
   (when (and *global-symbol-macros*
              (not (env-lookup env var))
              (nth-value 1 (gethash (normalize-name var) *global-symbol-macros*)))
@@ -8735,7 +8855,7 @@
           (let* ((name (car def))
                  (base-name (cond ((symbolp name) (%rt-fn-name name))
                                   ((and (consp name) (eq (car name) 'setf))
-                                   (format nil "SETF-~A" (symbol-name (cadr name))))
+                                   (%setf-fn-name (cadr name)))
                                   (t (format nil "~A" name))))
                  ;; In-image-safe package (same fallback as cell-var-name /
                  ;; %defstruct-intern): under mvm-eval the package table has no
@@ -8796,7 +8916,7 @@
         ;; Generate unique global name
         (let* ((base-name (cond ((symbolp name) (%rt-fn-name name))
                                 ((and (consp name) (eq (car name) 'setf))
-                                 (format nil "SETF-~A" (symbol-name (cadr name))))
+                                 (%setf-fn-name (cadr name)))
                                 (t (format nil "~A" name))))
                (unique-name (format nil "~A$$FLET~D" base-name (make-compiler-label)))
                (local-key base-name))
@@ -11216,7 +11336,7 @@
       (let* ((fn-name (cond
                         ((symbolp name) (%rt-fn-name name))
                         ((and (consp name) (eq (car name) 'setf))
-                         (format nil "SETF-~A" (symbol-name (cadr name))))
+                         (%setf-fn-name (cadr name)))
                         ((stringp name) name)
                         (t "UNKNOWN")))
              ;; Check if this name is a flet/labels local name — use the unique name
@@ -15449,7 +15569,7 @@
          (emit-ir :call resolved-name nargs)))
       ;; (setf name) function — emit as SETF-NAME call
       ((and (consp fn) (eq (car fn) 'setf) (symbolp (cadr fn)))
-       (let* ((base-name (format nil "SETF-~A" (symbol-name (cadr fn))))
+       (let* ((base-name (%setf-fn-name (cadr fn)))
               (unique-name (env-lookup-fn env base-name))
               (resolved-name (or unique-name base-name)))
          (emit-ir :call resolved-name nargs)))
@@ -16956,7 +17076,7 @@
                             (= (length raw-name) 2)
                             (symbolp (car raw-name))
                             (string= (symbol-name (car raw-name)) "SETF"))
-                       (format nil "SETF-~A" (symbol-name (cadr raw-name)))
+                       (%setf-fn-name (cadr raw-name))
                        raw-name)))
          ;; CLHS long-form setf function — link (setf (NAME …) v) to it.
          ;; See *SETF-FUNCTION-REGISTRY*.
@@ -17159,6 +17279,19 @@
             ;; Parse struct name and options
             (struct-name (if (consp name-and-options) (car name-and-options) name-and-options))
             (struct-str (symbol-name struct-name))
+            ;; PACKAGE-DISTINCT key for the INTERNAL names this expansion
+            ;; generates (the %%STRUCT-CTOR-<key> function and the
+            ;; compile-time effective-slot table).  STRUCT-STR is the BARE
+            ;; name and must stay bare wherever the generated name is
+            ;; USER-VISIBLE (the default conc-name and MAKE-<name>, which
+            ;; CLHS interns in *PACKAGE* — SBCL collides there too, verified),
+            ;; but the internal ctor is ours: keying it bare made
+            ;; (defstruct da::st …) and (defstruct db::st …) share ONE
+            ;; %%STRUCT-CTOR-ST, so DA's constructor built a DB struct
+            ;; (task #241 battery rows struct.own-typep / struct.own-slot).
+            ;; %RT-FN-NAME is bare at build time and for system packages, so
+            ;; this is a no-op everywhere except runtime-born library packages.
+            (struct-key (%rt-fn-name struct-name))
             (options (when (consp name-and-options) (cdr name-and-options)))
             ;; Parse options
             (conc-name-specified nil)
@@ -17213,7 +17346,7 @@
             ;; up in the compile-time table (populated when its own DEFSTRUCT
             ;; was compiled — source order guarantees parent-before-child).
             (parent-slots (when include-parent
-                            (%defstruct-eff-slots-get (symbol-name include-parent))))
+                            (%defstruct-eff-slots-get (%rt-fn-name include-parent))))
             (parent-slot-names (mapcar #'car parent-slots))
             (parent-slot-defaults (mapcar #'cdr parent-slots))
             ;; Effective (inherited then own) slot lists used everywhere.
@@ -17223,7 +17356,7 @@
             (forms-to-compile nil))
        ;; Register THIS struct's effective slots so its own children inherit.
        (%defstruct-eff-slots-put
-        struct-str
+        struct-key
         (let ((r nil) (ns slot-names) (ds slot-defaults))
           (loop
             (when (null ns) (return (nreverse r)))
@@ -17238,7 +17371,7 @@
        ;; slot 0 instead of the named slot).  The %% prefix is not a legal
        ;; user constructor name shape here, so no collision.
        (let ((ctor-name (format nil "MAKE-~A" struct-str))
-             (internal-ctor-name (format nil "%%STRUCT-CTOR-~A" struct-str))
+             (internal-ctor-name (format nil "%%STRUCT-CTOR-~A" struct-key))
              (ctor-params nil)
              (ctor-body nil))
          (setf ctor-params (loop for s in slot-names
@@ -17327,7 +17460,7 @@
              (cond
                ;; (:CONSTRUCTOR foo NIL) — 0-arg ctor using slot defaults
                ((null arg-spec)
-                (push `(defun ,(%defstruct-intern ctor-fn-name) ()
+                (push `(defun ,ctor-sym ()
                          (,internal-ctor-sym ,@slot-defaults))
                       forms-to-compile))
                ;; (:CONSTRUCTOR foo) with NO arglist = a KEYWORD constructor
@@ -17356,8 +17489,15 @@
                                       (setf cargs (cddr cargs)))
                              `(,ics ,@positional)))))
                   (mvm-define-macro ctor-fn-name expander)
+                  ;; CTOR-SYM, not (%DEFSTRUCT-INTERN CTOR-FN-NAME): the
+                  ;; user WROTE the constructor name as a symbol, so it must
+                  ;; be defined in ITS package.  Re-interning the bare string
+                  ;; in *PACKAGE* put (:constructor da::make-st) and
+                  ;; (:constructor db::make-st) in the SAME cell, and the
+                  ;; per-package macro table then had nothing to discriminate
+                  ;; on (task #241).
                   (when *mvm-eval-runtime-p*
-                    (set-macro-function (%defstruct-intern ctor-fn-name) expander))))
+                    (set-macro-function ctor-sym expander))))
                ;; (:CONSTRUCTOR foo (slot1 slot2 ...)) — BOA lambda-list.
                ;; The lambda-list variables ARE slot names (CLHS 3.4.6).  We
                ;; emit a defun whose parameter list IS the BOA arg-spec
@@ -17404,7 +17544,7 @@
                                 (let ((bv (find slot bound-vars
                                                 :test slot-name-eq2)))
                                   (if bv bv default)))))
-                    (push `(defun ,(%defstruct-intern ctor-fn-name) ,arg-spec
+                    (push `(defun ,ctor-sym ,arg-spec
                              (,internal-ctor-sym ,@call-args))
                           forms-to-compile))))
                ;; Old normalize path retained but unreachable (kept for ref).
@@ -17491,7 +17631,7 @@
                               (let ((pos (position slot arg-spec-slots
                                                    :test slot-name-eq)))
                                 (if pos (nth pos arg-spec-syms) default)))))
-                  (push `(defun ,(%defstruct-intern ctor-fn-name) ,params
+                  (push `(defun ,ctor-sym ,params
                            (,internal-ctor-sym ,@call-args))
                         forms-to-compile))))))
          )  ; close the (let ((ctor-name ...) ...)) ctor block

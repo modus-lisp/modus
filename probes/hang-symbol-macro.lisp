@@ -1,0 +1,7 @@
+(defpackage "HE" (:use "CL")) (defpackage "HF" (:use "CL"))
+(format t "H-SM-START~%") (finish-output)
+(eval '(define-symbol-macro he::sm 7))
+(eval '(define-symbol-macro hf::sm he::sm))
+(format t "H-SM-REGISTERED~%") (finish-output)
+(format t "H-SM-RESULT ~a~%" (handler-case (eval 'he::sm) (t (c) (list :err (type-of c)))))
+(format t "H-SM-DONE~%")

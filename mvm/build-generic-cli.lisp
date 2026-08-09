@@ -818,6 +818,14 @@
   ;; leaves Modus unrecognised, which is the pre-#237 status quo.
   ;; MODUS_NO_GENERA=1 skips it (see %install-genera-compat).
   (handler-case (%install-genera-compat) (t (c) nil))
+  ;; ASDF INTERFACE — the ASDF / UIOP / ASDF-USER packages and entry points
+  ;; over Modus's OWN loader (net/asdf-interface.lisp).  MUST come after
+  ;; %install-runtime-cl-macros (the source uses DOLIST/WHEN/UNLESS/DEFCLASS)
+  ;; and before cli-toplevel, so ~/.modusrc, --load and --eval all see the
+  ;; :asdf* features and can (install-tarball) a system whose .asd opens with
+  ;; a read-time `#.(version<= \"3.1\" (asdf-version))' guard.  Wrapped: a
+  ;; failure here must never take down a normal boot.  MODUS_NO_ASDF=1 skips.
+  (handler-case (%install-asdf-interface) (t (c) nil))
   ;; --- entry: the SHARED SBCL-faithful CLI toplevel ------------------------
   ;; cli-toplevel reads the FULL argv off the initial stack, parses SBCL-style
   ;; flags left-to-right (--eval/--load/--script/--quit/--version/--help/rc/
@@ -890,6 +898,41 @@
 
 (format t "  genera:  ~D chars (compat source baked for boot-time eval)~%"
         (length *genera-compat-text*))
+
+;;; ============================================================
+;;; ASDF INTERFACE over Modus's own loader
+;;;
+;;; net/asdf-interface.lisp's header has the rationale and the honest
+;;; degeneracy list.  Baked as a boot-evaluated SOURCE STRING for the SAME
+;;; reason the Genera surface above is: it defines `asdf::load-system' and
+;;; `uiop::version<=', and CHECK-PARSES reads first-party build source with
+;;; SBCL's reader, which has no ASDF package to resolve those against.  The
+;;; compiled half — version arithmetic, .asd reading, component ordering —
+;;; already lives in lib/install-tarball.lisp under `%it-' names, so what is
+;;; evaluated here is only the naming layer.
+;;;
+;;; ESCAPE HATCH: MODUS_NO_ASDF=1 skips the install entirely (no ASDF /
+;;; UIOP / ASDF-USER packages, no :asdf* features) — same reversible-flip
+;;; pattern as MODUS_NO_GENERA.
+;;; ============================================================
+
+(defvar *asdf-interface-text*
+  (read-file-text (merge-pathnames "net/asdf-interface.lisp" *modus-base*)))
+
+(defvar *asdf-source*
+  (concatenate 'string "
+(defun %asdf-interface-source ()
+  \"" (%escape-lisp-string *asdf-interface-text*) "\")
+
+(defun %install-asdf-interface ()
+  (let ((off (%cli-getenv \"MODUS_NO_ASDF\")))
+    (if (and off (> (length off) 0) (not (string= off \"0\")))
+        nil
+        (progn (%it-eval-source (%asdf-interface-source) \"asdf-interface\") t))))
+"))
+
+(format t "  asdf:    ~D chars (interface source baked for boot-time eval)~%"
+        (length *asdf-interface-text*))
 
 (defvar *all-runtime-source*
   (concatenate 'string *prelude-source*  (string #\Newline)
@@ -1190,6 +1233,17 @@
     ;; "WARN li-func: unresolved function %INSTALL-GENERA-COMPAT —
     ;; emitting NIL sentinel", i.e. a silent no-op boot hook.
     *genera-source*
+    (string #\Newline)
+    ;; ASDF interface (net/asdf-interface.lisp).  Same placement rule as
+    ;; *genera-source*: BEFORE *driver-source*, because kernel-main calls
+    ;; %install-asdf-interface and a forward reference across the blob does
+    ;; not resolve (it emits a NIL sentinel — a silent no-op boot hook).
+    ;; Also, like *genera-source*, deliberately NOT in *all-runtime-source*:
+    ;; that variable feeds the TEXTUAL scan-defuns scanner, which would
+    ;; harvest `asdf::load-system' & co. out of the string literal and emit
+    ;; `#'asdf::load-system' into a sft-auto chunk that cannot compile,
+    ;; silently dropping ~200 functions from runtime EVAL's reach.
+    *asdf-source*
     (string #\Newline)
     *driver-source*
     (string #\Newline)

@@ -29,6 +29,23 @@
            (if (= n len) buf (%tar-slice buf 0 n)))
       (close s))))
 
+(defun %it-slurp-text (path)
+  "Whole contents of PATH as a STRING.  The on-disk twin of the
+   TAR-BYTES-TO-STRING call the archive path makes on a tar entry, so the
+   directory-backed loader (ASDF:LOAD-SYSTEM) and the archive-backed loader
+   (INSTALL-TARBALL) hand IDENTICAL text to %IT-EVAL-SOURCE."
+  (tar-bytes-to-string (%it-slurp-bytes path)))
+
+(defun %it-file-exists-p (path)
+  "True when PATH can be opened for input.  OPEN-and-CLOSE rather than
+   PROBE-FILE: this is the same syscall the loader is about to make anyway,
+   so a file that probes but cannot be read never reaches %IT-EVAL-SOURCE."
+  (handler-case
+      (let ((s (open path :direction :input :element-type '(unsigned-byte 8))))
+        (close s)
+        t)
+    (t (c) nil)))
+
 ;;; --- string helpers ---------------------------------------------------------
 
 (defun %it-suffix-p (str suffix)
@@ -50,6 +67,63 @@
   "Last /-separated component of PATH."
   (let ((slash (%it-last-slash path)))
     (if slash (subseq path (+ slash 1) (length path)) path)))
+
+(defun %it-dirname (path)
+  "Directory part of PATH, INCLUDING the trailing \"/\" (\"\" if there is no
+   slash).  ASDF's SYSTEM-SOURCE-DIRECTORY of a .asd is exactly this."
+  (let ((slash (%it-last-slash path)))
+    (if slash (subseq path 0 (+ slash 1)) "")))
+
+;;; --- version arithmetic (UIOP's PARSE-VERSION / VERSION< / VERSION<=) -------
+;;;
+;;; Two ladder systems refuse to be READ without these: split-sequence and
+;;; bordeaux-threads both open with
+;;;   #.(unless (or #+asdf3.1 (version<= "3.1" (asdf-version)))
+;;;        (error "You need ASDF >= 3.1 …"))
+;;; — a READ-TIME call, so the functions must exist before their .asd can be
+;;; parsed at all.  Implemented here (compiled) and exposed under their ASDF /
+;;; UIOP names by net/asdf-interface.lisp.
+
+(defun %it-parse-version (s)
+  "UIOP:PARSE-VERSION — a dotted version STRING to a list of integers.
+   A component that is not a run of digits yields NIL for the whole version
+   (UIOP treats an unparsable version as \"no version\", and every caller
+   here already guards on NIL)."
+  (let ((n (length s)) (i 0) (acc nil) (cur 0) (digits 0) (bad nil))
+    (loop
+      (when (or bad (> i n)) (return nil))
+      (if (or (= i n) (char= (char s i) #\.))
+          (progn
+            (if (= digits 0) (setq bad t) (setq acc (cons cur acc)))
+            (setq cur 0) (setq digits 0))
+          (let ((d (digit-char-p (char s i))))
+            (if (null d)
+                (setq bad t)
+                (progn (setq cur (+ (* cur 10) d))
+                       (setq digits (+ digits 1))))))
+      (setq i (+ i 1)))
+    (if bad nil (nreverse acc))))
+
+(defun %it-lexicographic< (x y)
+  "UIOP:LEXICOGRAPHIC< specialised to integer lists: a strict prefix is LESS."
+  (cond ((null y) nil)
+        ((null x) t)
+        ((< (car x) (car y)) t)
+        ((< (car y) (car x)) nil)
+        (t (%it-lexicographic< (cdr x) (cdr y)))))
+
+(defun %it-version< (x y)
+  "UIOP:VERSION< on version STRINGS.  NIL (unparsable / absent) is never <."
+  (let ((px (and x (%it-parse-version x)))
+        (py (and y (%it-parse-version y))))
+    (and px py (%it-lexicographic< px py))))
+
+(defun %it-version<= (x y)
+  "UIOP:VERSION<= on version STRINGS — (not (version< y x)), UIOP's own
+   definition, so \"3.1\" <= \"3.3.7\" and \"3.1\" <= \"3.1\" both hold."
+  (let ((px (and x (%it-parse-version x)))
+        (py (and y (%it-parse-version y))))
+    (and px py (not (%it-lexicographic< py px)))))
 
 (defun %it-string-designator (x)
   "Coerce an ASDF name designator to a string, ASDF's way (COERCE-NAME):
@@ -86,12 +160,26 @@
    (by SYMBOL-NAME, already package-blind).  Scoped to the .asd read only:
    library SOURCE keeps strict CLHS behaviour, and so does everything else
    in the image (the flag defaults NIL; the ANSI gate never sees it set).
-   Restored escape-safely, like the *PACKAGE* bind above."
-  (let ((saved *reader-missing-package-lenient*))
+   Restored escape-safely, like the *PACKAGE* bind above.
+
+   *PACKAGE* IS BOUND TO ASDF-USER when that package exists.  This is what
+   real ASDF does — LOAD-ASD reads a system definition with *PACKAGE* bound
+   to ASDF-USER, which :USEs CL, ASDF and UIOP — and it is what makes the
+   read-time `#.(version<= \"3.1\" (asdf-version))' guard at the head of
+   split-sequence.asd and bordeaux-threads.asd resolve to real functions
+   instead of unbound symbols in whatever package the CALLER happened to be
+   in.  When net/asdf-interface.lisp has not been installed the package does
+   not exist and the read happens in the caller's package exactly as before,
+   so this is a no-op on images without the ASDF interface."
+  (let ((saved *reader-missing-package-lenient*)
+        (saved-package *package*)
+        (asdf-user (find-package "ASDF-USER")))
     (unwind-protect
          (progn (setq *reader-missing-package-lenient* t)
+                (when asdf-user (setq *package* asdf-user))
                 (%it-read-forms source-string))
-      (setq *reader-missing-package-lenient* saved))))
+      (setq *reader-missing-package-lenient* saved)
+      (setq *package* saved-package))))
 
 (defun %it-read-forms (source-string)
   "Read every top-level form from SOURCE-STRING; return them in a list.
@@ -353,6 +441,21 @@
       (setq *it-emitted* (cons f *it-emitted*))
       (setq *it-emitted-paths* (cons path *it-emitted-paths*)))))
 
+(defun %it-ordered-paths (ds)
+  "The component load order of DEFSYSTEM form DS: a list of module-prefixed
+   base names, no \".lisp\" extension, dependency-ordered.
+
+   Extracted so the ARCHIVE loader (INSTALL-TARBALL) and the DIRECTORY loader
+   (ASDF:LOAD-SYSTEM, net/asdf-interface.lisp) walk components through exactly
+   ONE implementation.  A second component walker is precisely the \"second
+   system loader in the image\" this work exists to avoid."
+  (let* ((comps (%it-plist-get (cddr ds) :components))
+         (files (nreverse (%it-collect-components comps "" nil)))
+         (acc nil))
+    (dolist (f (%it-toposort files))
+      (setq acc (cons (it-file-path f) acc)))
+    (nreverse acc)))
+
 (defun %it-remove-str (s list)
   "Remove the first occurrence of string S from LIST (string= compare)."
   (let ((acc nil) (cur list) (removed nil))
@@ -364,6 +467,14 @@
       (setq cur (cdr cur)))))
 
 ;;; --- driver -----------------------------------------------------------------
+
+;;; Called as (funcall hook NAME DEFSYSTEM-FORM SOURCE-FILE) after a system's
+;;; components have been loaded.  NIL = nobody is keeping a registry, which is
+;;; the state of every image that does not install net/asdf-interface.lisp.
+;;; MVM Active Limitation 7: this defvar's init-thunk does NOT run at boot, so
+;;; the quiescent value is NIL — which is the value we want — and the ASDF
+;;; interface SETQs it explicitly when it installs.
+(defvar *it-register-hook* nil)
 
 (defun install-tarball-from-bytes (gz &optional sysname)
   "Install a Common Lisp system from an in-memory .tar.gz byte vector GZ
@@ -434,7 +545,6 @@
           (when (null ds)
             (error "install-tarball: no defsystem found in asd"))
           (let* ((this-sysname (%it-string-designator (cadr ds)))
-                 (comps (%it-plist-get (cddr ds) :components))
                  ;; System-level :PATHNAME — the subdirectory the components
                  ;; live in relative to the .asd.  named-readtables declares
                  ;; :pathname "src"; without honouring it every component
@@ -443,13 +553,12 @@
                  (sys-dir (concatenate 'string asd-dir
                                        (%it-dir-prefix
                                         (%it-plist-get (cddr ds) :pathname))))
-                 (files (nreverse (%it-collect-components comps "" nil)))
-                 (ordered (%it-toposort files)))
+                 (ordered (%it-ordered-paths ds)))
             (write-string-serial "  system: ") (write-string-serial this-sysname) (write-char-serial 10)
             (write-string-serial "  load order:") (write-char-serial 10)
             ;; 4. load each file's source, in order
-            (dolist (f ordered)
-              (let* ((rel (concatenate 'string sys-dir (it-file-path f) ".lisp"))
+            (dolist (p ordered)
+              (let* ((rel (concatenate 'string sys-dir p ".lisp"))
                      (ent (assoc rel entries :test #'string=)))
                 (cond
                   ((null ent)
@@ -457,8 +566,18 @@
                    (write-string-serial rel) (write-string-serial ")") (write-char-serial 10))
                   (t
                    (write-string-serial "    ") (write-string-serial rel) (write-char-serial 10)
-                   (%it-eval-source (tar-bytes-to-string (cdr ent))
-                                    (it-file-path f))))))
+                   (%it-eval-source (tar-bytes-to-string (cdr ent)) p)))))
+            ;; 5. announce the system to whoever is keeping the registry.
+            ;;    ASDF's LOAD-SYSTEM leaves the system REGISTERED and marked
+            ;;    loaded, and mgl-pax's autoload stubs call ASDF:LOAD-SYSTEM
+            ;;    expecting exactly that.  The hook keeps the registry itself
+            ;;    in net/asdf-interface.lisp (whose symbols live in a package
+            ;;    this file cannot name at build time) while the fact "this
+            ;;    system is now loaded" originates HERE, where it is true.
+            ;;    SOURCE-FILE is NIL: an archive install has no on-disk .asd.
+            (when *it-register-hook*
+              (handler-case (funcall *it-register-hook* this-sysname ds nil)
+                (t (c) nil)))
             (write-string-serial "install-tarball: done, system=")
             (write-string-serial this-sysname) (write-char-serial 10)
             this-sysname))))))

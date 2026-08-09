@@ -1,0 +1,10 @@
+(defpackage "HC" (:use "CL")) (defpackage "HD" (:use "CL"))
+(format t "H-CM-START~%") (finish-output)
+(eval '(defun hc::cm (x) x))
+(eval '(define-compiler-macro hc::cm (x) x))
+(eval '(define-compiler-macro hd::cm (x) (list 'hc::cm x)))
+(format t "H-CM-REGISTERED~%") (finish-output)
+(format t "H-CM-RESULT ~a~%"
+  (handler-case (funcall (compiler-macro-function 'hc::cm) '(hc::cm 1) nil)
+    (t (c) (list :err (type-of c)))))
+(format t "H-CM-DONE~%")

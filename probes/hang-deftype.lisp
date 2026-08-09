@@ -1,0 +1,7 @@
+(defpackage "HA" (:use "CL")) (defpackage "HB" (:use "CL"))
+(format t "H-DEFTYPE-START~%") (finish-output)
+(eval '(deftype ha::tt () 'integer))
+(eval '(deftype hb::tt () 'ha::tt))
+(format t "H-DEFTYPE-REGISTERED~%") (finish-output)
+(format t "H-DEFTYPE-RESULT ~a~%" (handler-case (eval '(typep 5 'ha::tt)) (t (c) (list :err (type-of c)))))
+(format t "H-DEFTYPE-DONE~%")

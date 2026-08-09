@@ -410,6 +410,68 @@
 ;;; library load.
 ;;; ------------------------------------------------------------------
 
+;;; ------------------------------------------------------------------
+;;; SHARED per-package registry primitive (task #241 batch 2)
+;;;
+;;; Five more registries were found keyed by a BARE name (deftype,
+;;; define-symbol-macro, setf expanders, compiler-macros, and the
+;;; special-variable store), each repeating the e4d26a8 defect.  They all
+;;; want the same shape, so they all use the same two helpers below rather
+;;; than five hand-rolled copies.
+;;;
+;;; PACKAGE OBJECTS, COMPARED WITH EQ — not %PKG-NAME + STRING=.  The
+;;; %MACRO-PKG-* pair above resolves the package NAME because the macro
+;;; table predates %CLOS-PKG-OBJ-COMPATIBLE; that is safe there (the macro
+;;; table is consulted from the compiler, never from TYPEP) but it is NOT
+;;; safe here: %DEFTYPE-LOOKUP is reachable FROM TYPEP, and 8efb421 measured
+;;; a %PKG-NAME-based guard on a TYPEP-reachable path killing an ANSI fork
+;;; outright (test 22141, no marker) by closing a TYPEP re-entry loop.
+;;; %PKG-NAME is (AREF (CDR P) 0) plus STRINGP / LENGTH / STRING=, all of
+;;; which can route back through TYPEP.  Packages are interned by
+;;; FIND-PACKAGE, so EQ on the package object is both the correct identity
+;;; test and strictly cheaper.
+;;;
+;;; ADDITIVE, never subtractive: every registry keeps its existing bare-name
+;;; entry with its existing contents, and every lookup consults the
+;;; per-package side entry FIRST, falling back to the bare entry.  A writer
+;;; with no symbol to qualify (a string name, a build-time registration, a
+;;; native-MVM-sym) therefore resolves EXACTLY as it did before, and a name
+;;; defined in only one package behaves identically to before as well.
+;;; ------------------------------------------------------------------
+
+(defun %reg-sym-pkg-obj (sym)
+  "Home package OBJECT of SYM, or NIL when SYM carries no resolvable home
+   package (strings, native MVM hash-only syms, uninterned syms, or a
+   slot-1 that is not actually a package cons).
+
+   Calls NOTHING re-entrant — see the block comment above.  The %PKG-P test
+   is load-bearing for the same reason it is in %GF-SYM-PKG-NAME: slot 1 can
+   hold a non-package during half-initialised runtime interning."
+  (and sym
+       (%cl-sym-p sym)
+       (let ((p (%cl-sym-package sym)))
+         (and p (%pkg-p p) p))))
+
+(defun %reg-pkg-alist-get (al pkg)
+  "Value stored for package object PKG in per-package alist AL, or NIL."
+  (let ((res nil) (cur al))
+    (loop
+      (when (null cur) (return res))
+      (when (and (null res) (eq (car (car cur)) pkg))
+        (setq res (cdr (car cur))))
+      (setq cur (cdr cur)))))
+
+(defun %reg-pkg-alist-put (al pkg val)
+  "Return AL with PKG's entry set to VAL (replacing any existing one)."
+  (let ((hit nil) (cur al))
+    (loop
+      (when (null cur) (return nil))
+      (when (eq (car (car cur)) pkg) (setq hit (car cur)))
+      (setq cur (cdr cur)))
+    (if hit
+        (progn (setf (cdr hit) val) al)
+        (cons (cons pkg val) al))))
+
 (defvar *macro-pkg-table* nil
   "macro-name-string → alist of (package-name-string . expander).")
 
@@ -751,31 +813,94 @@
     ((= (obj-subtag sym) #x50) (aref sym 0))
     (t nil)))
 
+;;; DEFTYPE per-package side table.  *%RUNTIME-DEFTYPE-TABLE* is keyed by the
+;;; bare upcased name string, so (deftype DA::TY () 'integer) and
+;;; (deftype DB::TY () 'string) shared one entry and the last one silently won
+;;; for BOTH — (typep 5 'da::ty) answered NIL and (typep "x" 'da::ty) answered
+;;; T.  Worse than wrong: when one package's deftype expands into the other's
+;;; same-named type — (deftype hb::tt () 'ha::tt) — the collapsed entry makes
+;;; HA::TT expand to HA::TT forever, so TYPEP recurses until the stack is gone
+;;; and the process dies with rc 139 (probes/hang-deftype.lisp).  Same defect
+;;; and same shape as the e4d26a8 macro-table hang.
+(defvar *%runtime-deftype-pkg-table* nil
+  "deftype-name-string → alist of (package-OBJECT . (params . body)).")
+
+(defun %deftype-pkg-get (sym key)
+  "The deftype expander registered for SYM's OWN package under name KEY.
+   NIL when SYM has no resolvable package or that package registered none —
+   the caller then falls back to the bare *%RUNTIME-DEFTYPE-TABLE* entry."
+  (and *%runtime-deftype-pkg-table*
+       key
+       (let ((p (%reg-sym-pkg-obj sym)))
+         (and p (%reg-pkg-alist-get
+                 (gethash key *%runtime-deftype-pkg-table*) p)))))
+
+(defun %deftype-pkg-put (sym key val)
+  "Register VAL as the deftype expander for SYM's own package under KEY."
+  (let ((p (%reg-sym-pkg-obj sym)))
+    (when (and p key)
+      (unless *%runtime-deftype-pkg-table*
+        (setq *%runtime-deftype-pkg-table* (make-hash-table :test 'equal)))
+      (puthash key *%runtime-deftype-pkg-table*
+               (%reg-pkg-alist-put (gethash key *%runtime-deftype-pkg-table*)
+                                   p val)))))
+
 (defun %runtime-register-deftype (tname params body)
   "mvm-eval DEFTYPE expansion target (compiler.lisp, *mvm-eval-runtime-p* gated).
    Registers the expander in *%runtime-deftype-table* — the SAME registry
    the tree-walker's DEFTYPE handler (below, in %eval-in-env) writes and
    ansi-bridge.lisp's %deftype-lookup / %expand-deftype (typep/subtypep)
-   consult.  Returns TNAME per CLHS."
-  (let ((name-str (%eval-sym-name tname)))
+   consult.  Returns TNAME per CLHS.
+
+   DUAL WRITE: the per-package side entry for exact resolution, plus the
+   historic bare entry so every lookup that cannot name a package (native
+   MVM syms, string heads) keeps resolving exactly as before."
+  (let ((name-str (%eval-sym-name tname))
+        (entry (cons params body)))
     (when name-str
       (unless *%runtime-deftype-table*
         (setq *%runtime-deftype-table* (make-hash-table :test 'equal)))
-      (puthash name-str *%runtime-deftype-table*
-               (cons params body))))
+      (%deftype-pkg-put tname name-str entry)
+      (puthash name-str *%runtime-deftype-table* entry)))
   tname)
+
+;;; COMPILER-MACRO per-package side table — same defect, same shape:
+;;; *COMPILER-MACRO-FUNCTION-TABLE* is keyed by %MACRO-SYM-KEY, which is the
+;;; bare name string, so (define-compiler-macro da::cm …) and
+;;; (define-compiler-macro db::cm …) collapsed onto one entry.
+(defvar *compiler-macro-pkg-table* nil
+  "compiler-macro name key → alist of (package-OBJECT . expander).")
+
+(defun %compiler-macro-pkg-get (sym key)
+  "The compiler-macro expander registered for SYM's OWN package under KEY."
+  (and *compiler-macro-pkg-table*
+       key
+       (let ((p (%reg-sym-pkg-obj sym)))
+         (and p (%reg-pkg-alist-get
+                 (gethash key *compiler-macro-pkg-table*) p)))))
+
+(defun %compiler-macro-pkg-put (sym key val)
+  "Register VAL as the compiler-macro expander for SYM's own package."
+  (let ((p (%reg-sym-pkg-obj sym)))
+    (when (and p key)
+      (unless *compiler-macro-pkg-table*
+        (setq *compiler-macro-pkg-table* (make-hash-table)))
+      (puthash key *compiler-macro-pkg-table*
+               (%reg-pkg-alist-put (gethash key *compiler-macro-pkg-table*)
+                                   p val)))))
 
 (defun %runtime-register-compiler-macro (mname params body)
   "mvm-eval DEFINE-COMPILER-MACRO expansion target (compiler.lisp,
    *mvm-eval-runtime-p* gated).  Registers an %interp-closure expander in
    *compiler-macro-function-table* — the SAME registry the tree-walker's
    DEFINE-COMPILER-MACRO handler writes and COMPILER-MACRO-FUNCTION
-   consults.  Returns MNAME per CLHS."
+   consults.  Returns MNAME per CLHS.  Dual write, as %RUNTIME-REGISTER-DEFTYPE."
   (let ((expander (list '%interp-closure params body nil))
         (key (%macro-sym-key mname)))
     (when key
       (unless *compiler-macro-function-table*
         (setq *compiler-macro-function-table* (make-hash-table)))
+      (%compiler-macro-pkg-put mname key expander)
       (puthash key *compiler-macro-function-table* expander))
     mname))
 

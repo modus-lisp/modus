@@ -2738,7 +2738,25 @@
    combination slot may be a different object than the `'and`
    %init-method-combinations registered at build time.  Falling
    back to a name-equality probe makes the dispatch route to
-   %gf-dispatch-custom even when the two symbols are not EQ."
+   %gf-dispatch-custom even when the two symbols are not EQ.
+
+   TASK #241: that name-equality probe was PACKAGE-BLIND, making this the
+   last of the name-keyed registries.  Two libraries defining a combination
+   of the same name shared one, and the wrong one ran — probed on the
+   pre-fix CLI with MA::MC (:operator progn) and MB::MC (:operator list):
+
+     (defgeneric ma::g (x) (:method-combination ma::mc))   (ma::g 5)
+       SBCL  => 2          (progn 1 2)
+       Modus => (1 2)      MB::MC's LIST operator
+
+   Same guard as the class / condition registries: the probe is not deleted
+   (it exists to close a real symbol-identity boundary), it is DISCRIMINATED
+   — rejected only when BOTH symbols carry a resolvable home package and
+   those packages differ.  %CLOS-PKG-OBJ-COMPATIBLE, not %GF-PKG-COMPATIBLE:
+   compares package OBJECTS with EQ and calls nothing re-entrant (8efb421).
+   The registry keeps distinct entries per package by construction — the
+   dedup in %DEFINE-METHOD-COMBINATION is EQ on the name symbol, so DB's
+   registration never removed DA's; only the LOOKUP conflated them."
   (let ((cur *method-combinations*)
         (name-str (cond ((stringp name) name)
                         ((symbolp name) (symbol-name name))
@@ -2748,7 +2766,8 @@
       (let ((k (car (car cur))))
         (when (or (eq k name)
                   (and name-str (symbolp k)
-                       (string= (symbol-name k) name-str)))
+                       (string= (symbol-name k) name-str)
+                       (%clos-pkg-obj-compatible k name)))
           (return (cdr (car cur)))))
       (setq cur (cdr cur)))))
 

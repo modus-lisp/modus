@@ -7577,7 +7577,43 @@
    its stale lexical copy (dg-mc.N.1 *x* always read as NIL).  Each
    special binding's init is therefore bound to a gensym TEMP; the
    set-form reads the temp; the special name stays lexically unbound so
-   every body reference compiles as a global (dynamic) access."
+   every body reference compiles as a global (dynamic) access.
+
+   FREE DECLARATIONS (#240, 2026-08-08).  CLHS 3.3.4: a
+   (declare (special *x*)) whose variable is NOT among this form's
+   bindings is a FREE declaration — it only makes references to *x*
+   inside the body dynamic; it establishes NO binding, so there is
+   nothing to save and nothing to restore.  This function used to save
+   and restore those anyway, which silently reverted any SETQ the body
+   (or a callee) performed on the free-declared special.  It was masked
+   for years because the restore sat in straight-line code after the
+   body, so a RETURN / GO branching out of the LET jumped over it — and
+   real code came to depend on the skip: %format-impl's ~^ handler
+   (mvm/cl-printer.lisp, the `(let ((dir …)) (declare (special
+   *format-iter-escape*)) …)` dispatch LET) sets the escape flag and
+   RETURNs out, and only got away with it because the branch skipped the
+   bogus restore.  Once the restore moved into an unwind-protect cleanup
+   it stopped being skippable and ~^ broke (format-circumflex −149).
+   Filtering free declarations out here is the CLHS-correct fix and
+   makes both behaviours right."
+  (setq specials
+        (remove-if-not
+         (lambda (s)
+           (let ((sn (symbol-name s)))
+             (find sn bindings
+                   :key (lambda (b) (symbol-name (if (consp b) (car b) b)))
+                   :test #'string=)))
+         specials))
+  ;; Nothing is dynamically bound here after the filter — compile as an
+  ;; ordinary lexical LET/LET*.  (References to the free-declared specials
+  ;; already compile as global accesses: they are not let variables.)
+  (when (null specials)
+    (let ((*let-skip-implicit-specials* t))
+      (return-from compile-let-with-specials
+        (compile-form (if sequential
+                          `(let* ,bindings ,@(or (strip-declares body) (list nil)))
+                          `(let ,bindings ,@(or (strip-declares body) (list nil))))
+                      env dest))))
   (let* ((special-names (mapcar (lambda (s) (symbol-name s)) specials))
          (save-vars (mapcar (lambda (s) (gensym (concatenate 'string "SAVE-" (symbol-name s)))) specials))
          (special-bindings nil))
@@ -7616,24 +7652,29 @@
              (mapcar (lambda (sv spec)
                        `(set-symbol-value ,(normalize-name spec) ,sv))
                      save-vars specials))
-           (stripped-body (strip-declares body))
-           ;; Generate MV state save/restore to preserve multiple values across restore-forms.
-           ;; The body may return multiple values (via VALUES), and restore-forms call
-           ;; set-symbol-value which clobbers MV state.  Save count + 8 value slots.
-           (n-mv-slots 3)
-           (mv-count-save (gensym "MVCNT"))
-           (mv-save-vars (loop for i from 0 below n-mv-slots
-                               collect (gensym (format nil "MV~D" i))))
-           (mv-save-bindings
-             (cons (list mv-count-save `(mem-ref ,+mv-count-addr+ :u64))
-                   (loop for i from 0 below n-mv-slots
-                         for sv in mv-save-vars
-                         collect (list sv `(mem-ref ,(+ +mv-values-addr+ (* i 8)) :u64)))))
-           (mv-restore-forms
-             (cons `(setf (mem-ref ,+mv-count-addr+ :u64) ,mv-count-save)
-                   (loop for i from 0 below n-mv-slots
-                         for sv in mv-save-vars
-                         collect `(setf (mem-ref ,(+ +mv-values-addr+ (* i 8)) :u64) ,sv)))))
+           (stripped-body (strip-declares body)))
+      ;; NON-LOCAL EXIT (#240, 2026-08-08): the restore MUST run on every
+      ;; exit path, not just the normal one.  The old shape was
+      ;;   (let* saves+temps set-forms (let ((r body)) restore r))
+      ;; with NO unwind-protect: a THROW / ERROR / GO / RETURN-FROM out of
+      ;; the body skipped the restore and left the special poisoned for the
+      ;; remainder of the image (`*package*`, `*readtable*`, `*standard-
+      ;; output*`, every `*print-*` var, every library `with-FOO`).  Same
+      ;; shape as the handler-bind-stack leak (279f2cc) and the signal-state
+      ;; poison (3c034b8).
+      ;;
+      ;; Remedy = lexical-save + UNWIND-PROTECT + setq-restore, exactly the
+      ;; shape PROGV already compiles to (compile-form, PROGV branch): the
+      ;; saved values live in ordinary LEXICAL let* slots (SAVE-*) and the
+      ;; cleanup writes them back with SET-SYMBOL-VALUE.  The special is
+      ;; never dynamically re-bound in order to restore it (that recurses).
+      ;;
+      ;; CODE SIZE: this is not a source-expansion blow-up.  The explicit
+      ;; MV save/restore that used to bracket RESTORE-FORMS (a 4-slot
+      ;; let*/mem-ref pair, ~24 IR ops) is DELETED — compile-unwind-protect
+      ;; already preserves the primary value and 4 MV slots around its
+      ;; cleanup in native code.  Net cost is the setjmp/branch trio plus a
+      ;; second copy of the (1-per-special) restore call on the error path.
       ;; Rename each special binding (VAR INIT) to (SPECTMP-VAR INIT) so
       ;; the special name never becomes a lexical variable.  SET-FORMS
       ;; read the temps (paired positionally with SPECIALS).
@@ -7669,12 +7710,10 @@
                             bindings renamed-bindings)))
               (compile-form
                 `(let* ,save-bindings
-                   (let* ,seq-bindings
-                     (let ((%special-result (progn ,@stripped-body)))
-                       (let* ,mv-save-bindings
-                         ,@restore-forms
-                         ,@mv-restore-forms
-                         %special-result))))
+                   (unwind-protect
+                       (let* ,seq-bindings
+                         (progn ,@(or stripped-body (list nil))))
+                     ,@restore-forms))
                 env dest))
             ;; let context: combine renamed bindings + save bindings into a
             ;; single let* (inits can't see each other — temps are gensyms),
@@ -7683,12 +7722,11 @@
                   (*let-skip-implicit-specials* t))
               (compile-form
                 `(let* ,all-bindings
-                   ,@set-forms
-                   (let ((%special-result (progn ,@stripped-body)))
-                     (let* ,mv-save-bindings
-                       ,@restore-forms
-                       ,@mv-restore-forms
-                       %special-result)))
+                   ;; EMPTY BODY: the protected PROGN must still yield NIL, not
+                   ;; the last SET-SYMBOL-VALUE's value — (let ((*v* 1))) is NIL.
+                   (unwind-protect
+                       (progn ,@set-forms ,@(or stripped-body (list nil)))
+                     ,@restore-forms))
                 env dest)))))))
 
 (defun compile-let (bindings body env dest)

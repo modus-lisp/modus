@@ -608,6 +608,90 @@
   (declare (ignore args))
   (%signal-program-error))
 
+;;; ------------------------------------------------------------------
+;;; Compiler-internal inlining macros for standard CL FUNCTIONS.
+;;;
+;;; mvm/compiler.lisp registers ~85 names with MVM-DEFINE-MACRO.  Most are
+;;; genuine CL macros (WHEN / PUSH / DOLIST / SETF …), but 27 of them are
+;;; standard CL *functions* that the compiler open-codes: (LIST a b) →
+;;; (CONS a (CONS b NIL)), (FIRST x) → (CAR x), and so on.  That inlining is
+;;; legitimate — it happens inside MACROEXPAND-1-MVM, entirely within the
+;;; compiler — but the SAME table (*macro-table*) is what the user-facing
+;;; MACRO-FUNCTION / MACROEXPAND consult, so every one of those functions was
+;;; reported to user code as a MACRO:
+;;;
+;;;   (macro-function 'list)    ⇒ non-NIL          ; must be NIL
+;;;   (macroexpand '(list 1 2)) ⇒ (CONS 1 (CONS 2 NIL))
+;;;
+;;; CLHS 11.1.2.1.2 forbids it: a conforming program may not be given a macro
+;;; definition for a standard function, and a code walker that MACROEXPANDs
+;;; user forms before deciding what to do (iterate's #L reader, alexandria,
+;;; any `(if (macro-function op) …)` dispatch) sees forms the user never
+;;; wrote.  Ordinary calls were never affected, which is why it went unnoticed.
+;;;
+;;; Fix: the two USER-VISIBLE doors into *macro-table* (MACRO-FUNCTION and
+;;; %RAW-MACRO-EXPANDER, the latter behind MACROEXPAND-1) filter these names
+;;; out.  MACROEXPAND-1-MVM in mvm/compiler.lisp reads *macro-table* directly
+;;; via %MACRO-EXPANDER and is deliberately NOT filtered — the inlining is
+;;; kept in full, only its visibility is removed.
+;;;
+;;; A runtime *macro-function-table* entry (someone's own DEFMACRO) is checked
+;;; BEFORE this filter and still wins; only the compiler's inlining table is
+;;; masked.
+;;; ------------------------------------------------------------------
+
+(defvar *%std-fn-not-macro-hashes* nil
+  "Hash-set of name-hashes for standard CL FUNCTIONS that mvm/compiler.lisp
+   registers as compile-time inlining macros.  MACRO-FUNCTION and
+   %RAW-MACRO-EXPANDER must never report these as macros.  Built LAZILY by
+   %STD-FN-NOT-MACRO-SET — Active Limitation #7: a defvar initform does not
+   run at boot, so an eagerly-initialised table would read NIL forever.")
+
+(defun %std-fn-not-macro-set ()
+  "The *%STD-FN-NOT-MACRO-HASHES* set, building it on first use.
+   Keyed by COMPUTE-NAME-HASH so it works for CL symbols, native MVM
+   symbols (which carry only a hash) and raw strings alike.
+
+   Every name here is a standard CL function (or, for MAKE-INSTANCE, a
+   standard generic function) that mvm/compiler.lisp open-codes.  Verified
+   against SBCL: see probes/macro-function-differential.lisp, whose section 2
+   is the overreach guard — adding a genuine CL macro to this list would
+   silently delete that macro and is a far worse bug than the one being
+   fixed."
+  (if *%std-fn-not-macro-hashes*
+      *%std-fn-not-macro-hashes*
+      (let ((ht (make-hash-table :test 'eql)))
+        (dolist (n '("LIST" "VECTOR"
+                     "FIRST" "SECOND" "THIRD" "FOURTH" "FIFTH"
+                     "SIXTH" "SEVENTH" "EIGHTH" "NINTH" "TENTH"
+                     "REST" "CADDR" "CADDDR" "CDDDR"
+                     "ABS" "MIN" "MAX" "MINUSP" "PLUSP" "/=" "LOGNOT"
+                     "LDB" "MAPHASH" "MAKE-INSTANCE" "GET-SETF-EXPANSION"))
+          (puthash (compute-name-hash n) ht t))
+        (setq *%std-fn-not-macro-hashes* ht)
+        ht)))
+
+(defun %macro-key-name-hash (key)
+  "Name-hash for a %MACRO-SYM-KEY result: a string, a CL symbol wrapper, or a
+   native MVM symbol object (slot 0 is its hash).  0 when no hash applies."
+  (cond ((stringp key) (compute-name-hash key))
+        ((%cl-sym-p key) (compute-name-hash (%cl-sym-name key)))
+        ((and (not (consp key)) (not (fixnump key))
+              (not (characterp key)))
+         (aref key 0))
+        (t 0)))
+
+(defun %macro-table-visible-expander (key)
+  "The *MACRO-TABLE* expander for KEY as seen by USER code, or NIL.
+   Returns NIL for the compiler's inlining macros over standard CL functions
+   (see %STD-FN-NOT-MACRO-SET) — those stay in the table for the compiler,
+   but MACRO-FUNCTION / MACROEXPAND must not see them."
+  (and (boundp '*macro-table*) *macro-table*
+       (let ((h (%macro-key-name-hash key)))
+         (and (> h 0)
+              (not (gethash h (%std-fn-not-macro-set)))
+              (gethash h *macro-table*)))))
+
 (defun %raw-macro-expander (sym)
   "Internal-only: return the raw expander stored for SYM, or NIL.
    Bypasses the user-facing closure wrapping that macro-function
@@ -619,14 +703,7 @@
       ;; SYM's own-package expander wins over the legacy bare-name entry.
       ((%macro-pkg-get sym key))
       ((and *macro-function-table* (gethash key *macro-function-table*)))
-      ((and (boundp '*macro-table*) *macro-table*
-            (let ((h (cond ((stringp key) (compute-name-hash key))
-                           ((%cl-sym-p key) (compute-name-hash (%cl-sym-name key)))
-                           ((and (not (consp key)) (not (fixnump key))
-                                 (not (characterp key)))
-                            (aref key 0))
-                           (t 0))))
-              (and (> h 0) (gethash h *macro-table*)))))
+      ((%macro-table-visible-expander key))
       ((and (stringp key) (%compiler-macro-p key)) t)
       (t nil))))
 
@@ -658,14 +735,9 @@
              ;; SYM's own-package expander wins over the legacy bare entry.
              ((%macro-pkg-get sym key))
              ((and *macro-function-table* (gethash key *macro-function-table*)))
-             ((and (boundp '*macro-table*) *macro-table*
-                   (let ((h (cond ((stringp key) (compute-name-hash key))
-                                  ((%cl-sym-p key) (compute-name-hash (%cl-sym-name key)))
-                                  ((and (not (consp key)) (not (fixnump key))
-                                        (not (characterp key)))
-                                   (aref key 0))
-                                  (t 0))))
-                     (and (> h 0) (gethash h *macro-table*)))))
+             ;; Compiler inlining macros over standard CL FUNCTIONS are
+             ;; filtered here — see %MACRO-TABLE-VISIBLE-EXPANDER.
+             ((%macro-table-visible-expander key))
              ((and (stringp key) (%compiler-macro-p key)) t)
              ;; Build-time test-source defmacros (no runtime expander —
              ;; report T so MACRO-FUNCTION is truthful about macro-ness).

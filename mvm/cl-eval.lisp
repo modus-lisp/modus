@@ -914,7 +914,7 @@
    %SYM-GLOBAL-KEY, not %SYM-HASH: for a runtime-born package's special the
    store is keyed by the PACKAGE-QUALIFIED hash (task #241), and a runtime
    DEFVAR must write the same cell a compiled read of that variable reads."
-  (let ((h  (%sym-global-key sym))
+  (let ((h  (let ((q (%sym-global-pkg-key sym))) (if q q (%sym-hash sym))))
         (nm (%eval-sym-name sym)))
     (when h  (set-symbol-value h value))
     (when nm (%eval-global-set nm value))

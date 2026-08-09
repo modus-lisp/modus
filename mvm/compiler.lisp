@@ -1727,6 +1727,32 @@
                             (compute-name-hash
                              (concatenate 'string pn "::" nm))))))))))
 
+(defun %global-var-bind-key (sym)
+  "Store key for a global-variable WRITE site: DEFVAR/DEFPARAMETER's initform
+   store and the LET special save/set/restore triple.
+
+   NOT %GLOBAL-NAME-KEY, and the difference is the whole point.  In-image,
+   build-ansi-common overrides %GLOBAL-NAME-KEY to prefer the symbol object's
+   STORED slot-0 hash; that is right for a READ, but wrong for these writes,
+   because eval2 and the native compiler produce DIFFERENT symbol objects for
+   the same source symbol and those objects do not share a slot-0 hash.  They
+   do share a NAME, which is why the write sites have always keyed by
+   NORMALIZE-NAME.
+
+   Measured, not theorised: routing these sites through %GLOBAL-NAME-KEY cost
+   macrolet.44 (ANSI 12453) — a special bound by a build-baked LET and read
+   back inside an (EVAL `(MACROLET …)), i.e. exactly the two-symbol-objects
+   case.  The runtime-compiled binding wrote the eval2 object's slot-0 hash,
+   the baked closure read the native object's, the FUNCALL got NIL and the
+   fork took an unhandled MVM LONGJMP.  Bisected with the package fold forced
+   off, which did NOT recover it — so it was never the fold.
+
+   So: the package-qualified key when there is one (that key is name-derived
+   too, so it is stable across symbol objects), else the historic bare
+   NORMALIZE-NAME."
+  (let ((q (%global-var-pkg-key sym)))
+    (if q q (normalize-name sym))))
+
 (defun name-eq (sym name-string)
   "Check if SYM's name matches NAME-STRING via hash comparison"
   (and (symbolp sym)
@@ -2969,7 +2995,8 @@
                     (cond ((integerp ,(cadr place)) ,(cadr place))
                           ((stringp ,(cadr place))
                            (compute-name-hash ,(cadr place)))
-                          (t (%sym-global-key ,(cadr place))))
+                          (t (let ((%q (%sym-global-pkg-key ,(cadr place))))
+                               (if %q %q (compute-name-hash (symbol-name ,(cadr place)))))))
                     ,value))
                 ;; (setf (row-major-aref A I) V) → (aset A I V).  CLHS
                 ;; says row-major-aref accesses a flat 1-D view; Modus's
@@ -5403,7 +5430,7 @@
            ;; special is package-qualified).  NAME-HASH stays BARE for the
            ;; *GLOBALS* membership set and %NOTE-RUNTIME-SPECIAL, which only
            ;; answer "is this name a known global".
-           (compile-form `(set-symbol-value ,(%global-name-key var-name) ,value-form)
+           (compile-form `(set-symbol-value ,(%global-var-bind-key var-name) ,value-form)
                          env dest))
          (compile-quote var-name dest)))
       ;; FLET — compile local functions, bodies see only parent env (no mutual recursion)
@@ -7791,7 +7818,7 @@
                        ;; package's special saved NIL (nothing lives at the
                        ;; bare key) and then restored that NIL over the real
                        ;; value on exit — battery row special.after-rebind.
-                       (list sv `(symbol-value ,(%global-name-key spec))))
+                       (list sv `(symbol-value ,(%global-var-bind-key spec))))
                      save-vars specials))
            ;; Per-special TEMP names — carry the init value without
            ;; creating a lexical binding under the special's own name.
@@ -7810,13 +7837,13 @@
                                    :key (lambda (b)
                                           (symbol-name (if (consp b) (car b) b)))
                                    :test #'string=)
-                         (push `(set-symbol-value ,(%global-name-key spec) ,tmp)
+                         (push `(set-symbol-value ,(%global-var-bind-key spec) ,tmp)
                                acc)))
                      specials temp-vars)
                (nreverse acc)))
            (restore-forms
              (mapcar (lambda (sv spec)
-                       `(set-symbol-value ,(%global-name-key spec) ,sv))
+                       `(set-symbol-value ,(%global-var-bind-key spec) ,sv))
                      save-vars specials))
            (stripped-body (strip-declares body)))
       ;; NON-LOCAL EXIT (#240, 2026-08-08): the restore MUST run on every
@@ -7870,7 +7897,7 @@
                                       (list rb
                                             (list (gensym "SPECSET")
                                                   `(set-symbol-value
-                                                    ,(%global-name-key (nth pos specials))
+                                                    ,(%global-var-bind-key (nth pos specials))
                                                     ,(nth pos temp-vars))))
                                       (list rb)))))
                             bindings renamed-bindings)))

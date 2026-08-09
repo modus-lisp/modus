@@ -1528,8 +1528,13 @@
     ((null sym) nil)
     ((eq sym t) nil)
     ((integerp sym) sym)
-    ((or (consp sym) (characterp sym)) nil)
-    ((stringp sym) (compute-name-hash sym))
+    ;; A STRING answers NIL, not (COMPUTE-NAME-HASH s): prelude's
+    ;; SYMBOL-VALUE did (AREF s 0), i.e. read a CHARACTER and missed the
+    ;; table, so NIL is the observably-identical answer.  Keying strings by
+    ;; name-hash would be a real behaviour change, and this fix has already
+    ;; been bitten once by a "harmless" alignment of a key (see
+    ;; %GLOBAL-VAR-BIND-KEY).
+    ((or (consp sym) (characterp sym) (stringp sym)) nil)
     ((%cl-sym-p sym)
      (let ((q (%sym-global-pkg-key sym)))
        (if q q (aref sym 0))))

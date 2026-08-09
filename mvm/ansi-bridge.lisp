@@ -5762,27 +5762,33 @@
                    (loop
                      (when (null c) (return found))
                      (let ((cur (car c)))
-                       (when (cond
-                               ((eq cur tn) t)
-                               ((and (%native-mvm-sym-p cur)
-                                     (%native-mvm-sym-p tn))
-                                (= (%native-mvm-sym-hash cur)
-                                   (%native-mvm-sym-hash tn)))
-                               ;; Compare 3-slot CL syms by NAME-HASH
-                               ;; (slot 0), NOT by %cl-sym-name string —
-                               ;; names lazy-resolve through
-                               ;; *SYM-NAME-TABLE*, which only covers
-                               ;; symbols harvested from a few chapter
-                               ;; dirs.  For two class names absent from
-                               ;; the table (e.g. CHANGE-CLASS-CLASS-01A
-                               ;; vs -01B from objects/), %cl-sym-name
-                               ;; returned "" for BOTH sides and
-                               ;; (string-equal "" "") made TYPEP match
-                               ;; EVERY class — change-class.1.x failed
-                               ;; on (typep obj 'other-class) → T.
-                               ((and (%cl-sym-p cur) (%cl-sym-p tn))
-                                (= (%cl-sym-hash cur) (%cl-sym-hash tn)))
-                               (t nil))
+                       (when (and (cond
+                                    ((eq cur tn) t)
+                                    ((and (%native-mvm-sym-p cur)
+                                          (%native-mvm-sym-p tn))
+                                     (= (%native-mvm-sym-hash cur)
+                                        (%native-mvm-sym-hash tn)))
+                                    ;; Compare 3-slot CL syms by NAME-HASH
+                                    ;; (slot 0), NOT by %cl-sym-name string —
+                                    ;; names lazy-resolve through
+                                    ;; *SYM-NAME-TABLE*, which only covers
+                                    ;; symbols harvested from a few chapter
+                                    ;; dirs.  For two class names absent from
+                                    ;; the table (e.g. CHANGE-CLASS-CLASS-01A
+                                    ;; vs -01B from objects/), %cl-sym-name
+                                    ;; returned "" for BOTH sides and
+                                    ;; (string-equal "" "") made TYPEP match
+                                    ;; EVERY class — change-class.1.x failed
+                                    ;; on (typep obj 'other-class) → T.
+                                    ((and (%cl-sym-p cur) (%cl-sym-p tn))
+                                     (= (%cl-sym-hash cur) (%cl-sym-hash tn)))
+                                    (t nil))
+                                  ;; Package-discriminated (#241): the hash
+                                  ;; compares above carry no package, so TYPEP
+                                  ;; used to report a DA::CLS instance as a
+                                  ;; DB::CLS.  Guarded, not deleted -- see
+                                  ;; %CLOS-CLASS-NAME-EQ.
+                                  (or (eq cur tn) (%gf-pkg-compatible cur tn)))
                          (setq found t) (return found)))
                      (setq c (cdr c))))))
               ;; User DEFTYPE name used as an atomic type specifier —

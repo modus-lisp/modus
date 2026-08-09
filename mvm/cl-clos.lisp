@@ -353,7 +353,7 @@
   (let ((cur *clos-classes*))
     (loop
       (when (null cur) (return nil))
-      (when (%clos-sym-name-eq (car (car cur)) name)
+      (when (%clos-class-name-eq (car (car cur)) name)
         (return-from %find-clos-class (cdr (car cur))))
       (setq cur (cdr cur))))
   nil)
@@ -657,7 +657,7 @@
   (let ((cur *clos-class-slots*))
     (loop
       (when (null cur) (return nil))
-      (when (%clos-sym-name-eq (car (car cur)) class-name)
+      (when (%clos-class-name-eq (car (car cur)) class-name)
         (return-from %class-slots-for (cdr (car cur))))
       (setq cur (cdr cur))))
   nil)
@@ -696,7 +696,7 @@
   (let ((cur *clos-direct-slots*))
     (loop
       (when (null cur) (return nil))
-      (when (%clos-sym-name-eq (car (car cur)) class-name)
+      (when (%clos-class-name-eq (car (car cur)) class-name)
         (return-from %direct-slots-for (cdr (car cur))))
       (setq cur (cdr cur))))
   nil)
@@ -805,7 +805,7 @@
   (let ((cur *clos-slot-info*))
     (loop
       (when (null cur) (return nil))
-      (when (%clos-sym-name-eq (car (car cur)) class-name)
+      (when (%clos-class-name-eq (car (car cur)) class-name)
         (return-from %clos-slot-info-for (cdr (car cur))))
       (setq cur (cdr cur))))
   nil)
@@ -982,7 +982,7 @@
   (let ((cur *clos-default-initargs*))
     (loop
       (when (null cur) (return nil))
-      (when (%clos-sym-name-eq (car (car cur)) class-name)
+      (when (%clos-class-name-eq (car (car cur)) class-name)
         (return-from %clos-default-initargs-1 (cdr (car cur))))
       (setq cur (cdr cur))))
   nil)
@@ -1069,7 +1069,7 @@
     (loop
       (when (null cur) (return nil))
       (when (or (eq (car cur) class-name)
-                (%clos-sym-name-eq (car cur) class-name))
+                (%clos-class-name-eq (car cur) class-name))
         (return t))
       (setq cur (cdr cur)))))
 
@@ -1459,7 +1459,7 @@
       (loop
         (when (null cur) (return-from %cond-type-name-of nil))
         (let ((reg-name (car (car cur))))
-          (when (%clos-sym-name-eq reg-name tn)
+          (when (%clos-class-name-eq reg-name tn)
             (return-from %cond-type-name-of reg-name)))
         (setq cur (cdr cur))))))
 
@@ -1572,6 +1572,41 @@
      (= (aref a 0) (aref b 0)))
     (t nil)))
 
+(defun %clos-class-name-eq (a b)
+  "%CLOS-SYM-NAME-EQ for TYPE / CLASS / CONDITION-TYPE names, minus the
+   cross-package collapse.
+
+   The slot-0 name hash that %CLOS-SYM-NAME-EQ compares carries NO package,
+   so on its own it makes RA::CC and RB::CC the same class.  Probed on the
+   pre-fix CLI: (typep (make-instance 'ra::cc) 'rb::cc) => T, and — the
+   damaging one — a DEFINE-CONDITION of the same name in two packages made
+   (handler-case (error 'sa::ce) (sb::ce () :caught)) catch the WRONG
+   package's condition.  CLHS 11.1: symbols in different packages are
+   different symbols, and classes / condition types / types are named BY
+   SYMBOL, so this is simply wrong.  Same defect as the #211 fn table, the
+   e4d26a8 macro table and the 101c5eb GF registry.
+
+   The name-hash pass is NOT deleted, only DISCRIMINATED.  It exists to
+   close the mvm-eval symbol-flavor boundary — %defclass / define-condition
+   may store a class name as a native-MVM-sym while mvm-eval's in-image
+   %INTERN-SYMBOL hands back a non-eq CL-sym-wrapper for the same source
+   literal — and deleting it would make FIND-CLASS / SLOT-EXISTS-P /
+   MAKE-INSTANCE fail wholesale under mvm-eval.  %GF-PKG-COMPATIBLE rejects
+   a hash match ONLY when BOTH symbols carry a RESOLVABLE home package and
+   those packages differ; an unresolvable package on either side (native-
+   MVM-syms, uninterned syms, build-time-registered classes) keeps the exact
+   historic behaviour, so the boundary the pass exists for is untouched.
+
+   Applies to class-NAME keys only.  Slot names and initarg keywords keep
+   plain %CLOS-SYM-NAME-EQ / %INITARG-KEY-EQ — a separate question, and one
+   the registry differential battery (probes/registry-differential.lisp)
+   now covers explicitly."
+  (and (%clos-sym-name-eq a b)
+       ;; EQ short-circuit keeps the native fast path exactly as cheap as it
+       ;; was -- the package resolve only runs on a NON-eq hash match, which
+       ;; is precisely the mvm-eval-boundary case the guard is about.
+       (or (eq a b) (%gf-pkg-compatible a b))))
+
 (defun %dispatch-slot-missing (cls obj slot-name op new-val new-val-p)
   "Call the most-specific slot-missing method for OBJ's class.  When
    no user method is registered, fall through to the documented default
@@ -1594,7 +1629,7 @@
             ;; as well as eq so the user slot-missing method actually fires.
             (when (or (eq m-class t)
                       (eq m-class class-name)
-                      (%clos-sym-name-eq m-class class-name))
+                      (%clos-class-name-eq m-class class-name))
               ;; Honor eql-specializers on slot-name / operation.  :any =
               ;; no constraint; (VALUE) = must eql VALUE.
               (let ((slot-ok (or (eq m-slot-eql :any)
@@ -2299,12 +2334,50 @@
 
 (defun %gf-sym-pkg-name (s)
   "Home package NAME of symbol S as a string, or NIL when S carries no
-   package slot (native-MVM-sym, uninterned sym, non-symbol)."
+   RESOLVABLE package (native-MVM-sym, uninterned sym, non-symbol, or a
+   slot-1 that is not actually a package object).
+
+   The %PKG-P check is load-bearing, not belt-and-braces.  %PKG-NAME is a
+   raw (AREF (CDR P) 0) with no type test, so a slot 1 holding anything
+   other than a package cons -- a hash, a name string, a half-initialised
+   symbol from a runtime intern path -- makes it CDR a non-cons and AREF a
+   wild address.  While this helper was only reachable from %FIND-GF's
+   secondary pass that never bit; task #241 puts it on TYPEP's CPL walk and
+   on %COND-REG-FIND, i.e. on nearly every symbol the system ever compares,
+   and an unguarded wild read there killed an ANSI fork outright (test
+   22141, print.integers.base.various.2, died with no marker at all)."
   (and s
        (%cl-sym-p s)
        (let ((p (%cl-sym-package s)))
-         (and p (let ((n (%pkg-name p)))
-                  (and n (stringp n) (> (length n) 0) n))))))
+         (and p (%pkg-p p)
+              (let ((n (%pkg-name p)))
+                (and n (stringp n) (> (length n) 0) n))))))
+
+(defun %clos-pkg-obj-compatible (a b)
+  "%GF-PKG-COMPATIBLE for REENTRANT call sites: compares the package
+   OBJECTS with EQ and never touches %PKG-NAME.
+
+   %PKG-NAME is (AREF (CDR P) 0), and AREF / STRINGP / LENGTH / STRING= are
+   themselves runtime functions that can route back through TYPEP.  That is
+   harmless from %FIND-GF, but %COND-REG-FIND is reachable FROM TYPEP (via
+   %CONDITION-P and the condition-type-name branch), so putting a
+   %PKG-NAME-based guard there closes a TYPEP -> %COND-REG-FIND -> %PKG-NAME
+   -> ... -> TYPEP loop.  Measured, not theorised: with the %PKG-NAME guard
+   in %COND-REG-FIND, ANSI test 22141 (print.integers.base.various.2 -- 3500
+   bignum print/read round trips, i.e. a already-deep stack) killed its fork
+   outright, with no crash marker and no T: line; bisected to cl-conditions,
+   then to this one call.
+
+   Packages are interned by FIND-PACKAGE, so EQ on package objects is the
+   right identity test anyway.  Same conservative contract: NIL only when
+   BOTH sides carry a real package object and those differ."
+  (let ((pa (and a (%cl-sym-p a) (%cl-sym-package a))))
+    (if (or (null pa) (not (%pkg-p pa)))
+        t
+        (let ((pb (and b (%cl-sym-p b) (%cl-sym-package b))))
+          (if (or (null pb) (not (%pkg-p pb)))
+              t
+              (eq pa pb))))))
 
 (defun %gf-pkg-compatible (k name)
   "NIL only when registry key K and lookup NAME both have a resolvable

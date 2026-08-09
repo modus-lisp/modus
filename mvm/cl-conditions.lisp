@@ -21,7 +21,16 @@
    symbol-name-hash (slot-0 of the symbol object) so a cross-file native
    MVM symbol that drifted from the one used at DEFINE-CONDITION time still
    resolves.  Mirrors %condition-slot / %initarg-key-eq hash-robustness;
-   raw ASSOC missed drifted type names → all-NIL condition lookups."
+   raw ASSOC missed drifted type names → all-NIL condition lookups.
+
+   The name-hash pass is PACKAGE-DISCRIMINATED (%GF-PKG-COMPATIBLE, task
+   #241): the hash carries no package, so SA::CE and SB::CE used to share
+   one registry entry — (error 'sa::ce) built its condition from SB::CE's
+   descriptor, and every ancestor walk downstream agreed they were the same
+   type.  Only rejects a hash match when BOTH symbols have a resolvable home
+   package and those differ, so the symbol-flavor drift the pass exists for
+   (native-MVM-sym vs CL-sym-wrapper, either side package-less) still
+   resolves exactly as before."
   (let ((nhash (and (symbolp name) (not (null name)) (not (eq name t))
                     (aref name 0)))
         (cur *condition-type-registry*))
@@ -32,7 +41,8 @@
           (let ((k (car entry)))
             (when (or (eq k name)
                       (and nhash (symbolp k) (not (null k)) (not (eq k t))
-                           (= (aref k 0) nhash)))
+                           (= (aref k 0) nhash)
+                           (%gf-pkg-compatible k name)))
               (return entry)))))
       (setq cur (cdr cur)))))
 
@@ -120,7 +130,7 @@
         ;; compares by EQ then symbol-name-hash, like the rest of the
         ;; condition lookups, so the subtype check doesn't spuriously
         ;; return NIL under symbol drift.
-        (if (%initarg-in-list-p type-name ancestors) t nil)))))
+        (if (%cond-type-in-list-p type-name ancestors) t nil)))))
 
 (defun %collect-all-slots (name)
   "Collect all slot specs for a type including inherited slots.
@@ -181,6 +191,27 @@
     (loop
       (when (or found (null cur)) (return found))
       (when (%initarg-key-eq (car cur) key) (setq found t))
+      (setq cur (cdr cur)))
+    found))
+
+(defun %cond-type-in-list-p (name name-list)
+  "T iff condition TYPE-NAME appears in NAME-LIST (an ancestor list).
+
+   Like %INITARG-IN-LIST-P but package-aware.  Initarg keywords are all in
+   the KEYWORD package so a bare name hash is a sound key for them; TYPE
+   NAMES are not — comparing SA::CE and SB::CE by hash alone is what made
+   HANDLER-CASE catch the wrong package's condition (task #241).  The hash
+   pass is kept (it closes the native-MVM-sym vs CL-sym-wrapper boundary)
+   but discriminated by %GF-PKG-COMPATIBLE, which only rejects when BOTH
+   sides have a resolvable home package and those differ."
+  (let ((cur name-list)
+        (found nil))
+    (loop
+      (when (or found (null cur)) (return found))
+      (let ((a (car cur)))
+        (when (and (%initarg-key-eq a name)
+                   (or (eq a name) (%gf-pkg-compatible a name)))
+          (setq found t)))
       (setq cur (cdr cur)))
     found))
 
@@ -1855,7 +1886,10 @@
        ;; slot-0 hash, different object) — mirrors %find-clos-class's
        ;; two-pass order.
        (cons (if (or (member t2 cpl :test #'eq)
-                     (member t2 cpl :test #'%clos-sym-name-eq))
+                     ;; %CLOS-CLASS-NAME-EQ, not %CLOS-SYM-NAME-EQ: the
+                     ;; bare name hash made (subtypep 'da::cls 'db::cls)
+                     ;; answer (T T) for two unrelated classes (#241).
+                     (member t2 cpl :test #'%clos-class-name-eq))
                  t nil)
              t)))
     ;; t1 is a user CLOS class, t2 is built-in symbol — fall through to
@@ -2056,16 +2090,20 @@
                    (loop
                      (when (null c) (return found))
                      (let ((cur (car c)))
-                       (when (cond
-                               ((eq cur tn) t)
-                               ((and (%native-mvm-sym-p cur)
-                                     (%native-mvm-sym-p tn))
-                                (= (%native-mvm-sym-hash cur)
-                                   (%native-mvm-sym-hash tn)))
-                               ((and (%cl-sym-p cur) (%cl-sym-p tn))
-                                (string-equal (%cl-sym-name cur)
-                                              (%cl-sym-name tn)))
-                               (t nil))
+                       ;; Package-discriminated (#241): the hash / name
+                       ;; compares below carry no package, so TYPEP used
+                       ;; to report a DA::CLS instance as a DB::CLS.
+                       (when (and (cond
+                                    ((eq cur tn) t)
+                                    ((and (%native-mvm-sym-p cur)
+                                          (%native-mvm-sym-p tn))
+                                     (= (%native-mvm-sym-hash cur)
+                                        (%native-mvm-sym-hash tn)))
+                                    ((and (%cl-sym-p cur) (%cl-sym-p tn))
+                                     (string-equal (%cl-sym-name cur)
+                                                   (%cl-sym-name tn)))
+                                    (t nil))
+                                  (or (eq cur tn) (%gf-pkg-compatible cur tn)))
                          (setq found t) (return found)))
                      (setq c (cdr c))))))
               (t nil))))))

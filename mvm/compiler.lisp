@@ -7577,7 +7577,43 @@
    its stale lexical copy (dg-mc.N.1 *x* always read as NIL).  Each
    special binding's init is therefore bound to a gensym TEMP; the
    set-form reads the temp; the special name stays lexically unbound so
-   every body reference compiles as a global (dynamic) access."
+   every body reference compiles as a global (dynamic) access.
+
+   FREE DECLARATIONS (#240, 2026-08-08).  CLHS 3.3.4: a
+   (declare (special *x*)) whose variable is NOT among this form's
+   bindings is a FREE declaration — it only makes references to *x*
+   inside the body dynamic; it establishes NO binding, so there is
+   nothing to save and nothing to restore.  This function used to save
+   and restore those anyway, which silently reverted any SETQ the body
+   (or a callee) performed on the free-declared special.  It was masked
+   for years because the restore sat in straight-line code after the
+   body, so a RETURN / GO branching out of the LET jumped over it — and
+   real code came to depend on the skip: %format-impl's ~^ handler
+   (mvm/cl-printer.lisp, the `(let ((dir …)) (declare (special
+   *format-iter-escape*)) …)` dispatch LET) sets the escape flag and
+   RETURNs out, and only got away with it because the branch skipped the
+   bogus restore.  Once the restore moved into an unwind-protect cleanup
+   it stopped being skippable and ~^ broke (format-circumflex −149).
+   Filtering free declarations out here is the CLHS-correct fix and
+   makes both behaviours right."
+  (setq specials
+        (remove-if-not
+         (lambda (s)
+           (let ((sn (symbol-name s)))
+             (find sn bindings
+                   :key (lambda (b) (symbol-name (if (consp b) (car b) b)))
+                   :test #'string=)))
+         specials))
+  ;; Nothing is dynamically bound here after the filter — compile as an
+  ;; ordinary lexical LET/LET*.  (References to the free-declared specials
+  ;; already compile as global accesses: they are not let variables.)
+  (when (null specials)
+    (let ((*let-skip-implicit-specials* t))
+      (return-from compile-let-with-specials
+        (compile-form (if sequential
+                          `(let* ,bindings ,@(or (strip-declares body) (list nil)))
+                          `(let ,bindings ,@(or (strip-declares body) (list nil))))
+                      env dest))))
   (let* ((special-names (mapcar (lambda (s) (symbol-name s)) specials))
          (save-vars (mapcar (lambda (s) (gensym (concatenate 'string "SAVE-" (symbol-name s)))) specials))
          (special-bindings nil))

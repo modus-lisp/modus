@@ -2334,12 +2334,24 @@
 
 (defun %gf-sym-pkg-name (s)
   "Home package NAME of symbol S as a string, or NIL when S carries no
-   package slot (native-MVM-sym, uninterned sym, non-symbol)."
+   RESOLVABLE package (native-MVM-sym, uninterned sym, non-symbol, or a
+   slot-1 that is not actually a package object).
+
+   The %PKG-P check is load-bearing, not belt-and-braces.  %PKG-NAME is a
+   raw (AREF (CDR P) 0) with no type test, so a slot 1 holding anything
+   other than a package cons -- a hash, a name string, a half-initialised
+   symbol from a runtime intern path -- makes it CDR a non-cons and AREF a
+   wild address.  While this helper was only reachable from %FIND-GF's
+   secondary pass that never bit; task #241 puts it on TYPEP's CPL walk and
+   on %COND-REG-FIND, i.e. on nearly every symbol the system ever compares,
+   and an unguarded wild read there killed an ANSI fork outright (test
+   22141, print.integers.base.various.2, died with no marker at all)."
   (and s
        (%cl-sym-p s)
        (let ((p (%cl-sym-package s)))
-         (and p (let ((n (%pkg-name p)))
-                  (and n (stringp n) (> (length n) 0) n))))))
+         (and p (%pkg-p p)
+              (let ((n (%pkg-name p)))
+                (and n (stringp n) (> (length n) 0) n))))))
 
 (defun %gf-pkg-compatible (k name)
   "NIL only when registry key K and lookup NAME both have a resolvable

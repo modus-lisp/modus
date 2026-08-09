@@ -1448,6 +1448,76 @@
     ((or (integerp x) (consp x) (characterp x) (stringp x)) nil)
     (t (= (obj-subtag x) 83))))   ; #x53 keyword
 
+;;; ------------------------------------------------------------------
+;;; PER-PACKAGE special variables (task #241, registry 6 of 6)
+;;;
+;;; The global value store at #x10000080 is keyed by a symbol's BARE slot-0
+;;; name hash, so DA::*V* and DB::*V* are ONE cell: two libraries that each
+;;; define a special of the same name share storage and silently overwrite
+;;; each other.  CLHS 11.1 again — and the same defect as the #211 fn table.
+;;;
+;;; The fix mirrors #211 exactly rather than inventing a new scheme: fold the
+;;; package into the key ONLY for RUNTIME-BORN packages (a runtime-loaded
+;;; library's own package), leaving every system / build-baked package on the
+;;; bare key.  So every build-time-compiled reference, every CL special, and
+;;; every symbol without a resolvable package is byte-for-byte unchanged, and
+;;; a runtime-born package's specials get their own cells.
+;;;
+;;; EVERY entry point into the store must agree on the key or the fix is
+;;; worse than the bug (a compiled read would find a cell that BOUNDP says is
+;;; unbound).  They are: the compiler's emitted key (%GLOBAL-NAME-KEY, both
+;;; the host definition and the in-image override), SYMBOL-VALUE, BOUNDP,
+;;; %EVAL-SET-GLOBAL, and the (setf (symbol-value …)) place.  All five route
+;;; through %SYM-GLOBAL-KEY / %GLOBAL-VAR-PKG-KEY.
+;;; ------------------------------------------------------------------
+
+(defun %sym-global-key (sym)
+  "Global-value store KEY for SYM: the package-qualified name hash when SYM's
+   home package is runtime-born, else the historic bare slot-0 hash.
+   Integers pass through (the compiler already emits a computed key)."
+  (cond
+    ((null sym) nil)
+    ((eq sym t) nil)
+    ((integerp sym) sym)
+    ((or (consp sym) (characterp sym) (stringp sym)) nil)
+    ((%cl-sym-p sym)
+     (let ((p (%cl-sym-package sym)))
+       (if (and p (%pkg-p p))
+           (let ((pn (%pkg-name p)))
+             (if (and pn (stringp pn) (%runtime-born-pkg-p pn))
+                 (let ((nm (%cl-sym-name sym)))
+                   (if (and nm (stringp nm) (> (length nm) 0))
+                       (compute-name-hash (concatenate 'string pn "::" nm))
+                       (aref sym 0)))
+                 (aref sym 0)))
+           (aref sym 0))))
+    ((%native-mvm-sym-p sym) (aref sym 0))
+    (t nil)))
+
+(defun symbol-value (name-or-hash)
+  "OVERRIDE of prelude.lisp's SYMBOL-VALUE (last-defun-wins) that keys a
+   SYMBOL argument through %SYM-GLOBAL-KEY so a runtime-born package's
+   special resolves to its OWN cell (task #241).  An INTEGER argument — what
+   the compiler emits for every compiled global read, i.e. the hot path — is
+   passed through untouched, so this costs nothing there.
+
+   The override lives here rather than in prelude.lisp because prelude ships
+   in builds that have NO package system at all (build-mvm,
+   build-compiler-test, build-fixpoint); putting a %CL-SYM-P / %PKG-NAME call
+   there would leave an unresolved call in those images.  cl-packages.lisp
+   loads after prelude in every build that has one.
+
+   Keeps prelude's contract exactly: NIL/T self-evaluate, and the result is
+   truncated to ONE value with (VALUES …) — GETHASH's second value leaking
+   through a tail position corrupted BOOLE's MV count."
+  (when (null name-or-hash) (return-from symbol-value nil))
+  (when (eq name-or-hash t) (return-from symbol-value t))
+  (let ((key (if (integerp name-or-hash)
+                 name-or-hash
+                 (%sym-global-key name-or-hash)))
+        (tbl (%globals-table)))
+    (if (and tbl key) (values (gethash key tbl)) nil)))
+
 (defun boundp (sym)
   "True if SYM has a value in the global symbol-value alist (#x10000080).
    Walks the same alist that symbol-value/set-symbol-value use; finds
@@ -1466,8 +1536,12 @@
     ((null sym) t)                     ; NIL is bound to itself (CLHS)
     ((eq sym t) t)
     ((keywordp sym) t)
+    ;; %SYM-GLOBAL-KEY, not (aref sym 0): must agree with the key
+    ;; SYMBOL-VALUE and the compiler use, or BOUNDP would report a
+    ;; runtime-born package's special unbound while a compiled read of it
+    ;; returns a value (task #241).
     ((%cl-sym-p sym)
-     (%boundp-by-hash (aref sym 0)))
+     (%boundp-by-hash (%sym-global-key sym)))
     ((%native-mvm-sym-p sym)
      (%boundp-by-hash (aref sym 0)))
     ((integerp sym)

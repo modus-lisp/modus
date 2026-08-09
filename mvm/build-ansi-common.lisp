@@ -152,7 +152,15 @@
 ;; authoritative and always present.  SCOPE: global var read/write key ONLY;
 ;; compile-quote symbol interning still uses NORMALIZE-NAME, so quoted-symbol
 ;; identity (and the type-name registry it feeds) is untouched.
+;; TASK #241: a RUNTIME-BORN package's special gets a PACKAGE-QUALIFIED key
+;; so DA::*V* and DB::*V* stop sharing one cell in the store.  Must be the
+;; FIRST branch and must match cl-packages' %SYM-GLOBAL-KEY (the runtime side)
+;; and compiler.lisp's %GLOBAL-VAR-PKG-KEY (the host side) exactly.  NIL for
+;; every system package, so the stored-hash behaviour below -- which is why
+;; this override exists at all -- is untouched for everything else.
 (defun %global-name-key (sym)
+  (let ((%q (%global-var-pkg-key sym)))
+   (if %q %q
   (cond
     ((integerp sym) sym)
     ((symbolp sym)
@@ -164,7 +172,7 @@
                      (if (or (= st 80) (= st 83)) (aref sym 0) nil))))))
        (if h h (normalize-name sym))))
     ((stringp sym) (compute-name-hash sym))
-    (t 0)))
+    (t 0)))))
 "))
 ;; Generated boot-time populator for *opcode-table* (the host *opcode-table*
 ;; is populated when mvm.lisp/compiler.lisp load host-side for macro scanning).

@@ -1690,8 +1690,35 @@
    the tree-walker (which keys symbol-value by the stored hash) returned the
    value — the WS3 cxr/global cluster (cons.38-53).  Scoped to the GLOBAL
    variable read/write key only (NOT compile-quote symbol interning) so it
-   can't perturb quoted-symbol identity elsewhere."
-  (normalize-name sym))
+   can't perturb quoted-symbol identity elsewhere.
+
+   TASK #241: a RUNTIME-BORN package's special gets a package-qualified key
+   (%GLOBAL-VAR-PKG-KEY), so DA::*V* and DB::*V* stop sharing one cell.  NIL
+   at build time and for every system package, so the host compile and every
+   baked native image emit exactly the same key as before."
+  (let ((q (%global-var-pkg-key sym)))
+    (if q q (normalize-name sym))))
+
+(defun %global-var-pkg-key (sym)
+  "Package-qualified global-variable key for SYM, or NIL to use the historic
+   bare key.  Non-NIL only when compiling IN-IMAGE (*MVM-EVAL-RUNTIME-P*) for
+   a symbol whose home package is runtime-born — mirroring %RT-FN-NAME, whose
+   identical gate is what makes the #211 fn-key fold safe.  Must stay in
+   lockstep with cl-packages' %SYM-GLOBAL-KEY, which is the same computation
+   on the runtime side."
+  (and *mvm-eval-runtime-p*
+       sym
+       (%cl-sym-p sym)
+       (let ((p (%cl-sym-package sym)))
+         (and p
+              (%pkg-p p)
+              (let ((pn (%pkg-name p)))
+                (and pn
+                     (%runtime-born-pkg-p pn)
+                     (let ((nm (%cl-sym-name sym)))
+                       (and nm (> (length nm) 0)
+                            (compute-name-hash
+                             (concatenate 'string pn "::" nm))))))))))
 
 (defun name-eq (sym name-string)
   "Check if SYM's name matches NAME-STRING via hash comparison"
@@ -2926,11 +2953,16 @@
                 ;; making subsequent symbol-value lookups by name miss.
                 ;; Unlocks PSETF.29 and similar.
                 ((and (consp place) (name-eq (car place) "SYMBOL-VALUE"))
+                 ;; %SYM-GLOBAL-KEY (task #241) rather than a bare
+                 ;; (compute-name-hash (symbol-name …)): a runtime-born
+                 ;; package's special is stored under its qualified key, and
+                 ;; a SETF of (symbol-value sym) has to hit the same cell a
+                 ;; compiled read of that variable does.
                  `(set-symbol-value
                     (cond ((integerp ,(cadr place)) ,(cadr place))
                           ((stringp ,(cadr place))
                            (compute-name-hash ,(cadr place)))
-                          (t (compute-name-hash (symbol-name ,(cadr place)))))
+                          (t (%sym-global-key ,(cadr place))))
                     ,value))
                 ;; (setf (row-major-aref A I) V) → (aset A I V).  CLHS
                 ;; says row-major-aref accesses a flat 1-D view; Modus's
@@ -5359,7 +5391,13 @@
          (setf (gethash name-hash *globals*) t)
          (%note-runtime-special name-hash)
          (when has-initform
-           (compile-form `(set-symbol-value ,name-hash ,value-form) env dest))
+           ;; %GLOBAL-NAME-KEY, not NAME-HASH: the STORE key must match what
+           ;; a later read emits (task #241 -- a runtime-born package's
+           ;; special is package-qualified).  NAME-HASH stays BARE for the
+           ;; *GLOBALS* membership set and %NOTE-RUNTIME-SPECIAL, which only
+           ;; answer "is this name a known global".
+           (compile-form `(set-symbol-value ,(%global-name-key var-name) ,value-form)
+                         env dest))
          (compile-quote var-name dest)))
       ;; FLET — compile local functions, bodies see only parent env (no mutual recursion)
       ((= op-name 445617652)  ; FLET
@@ -7740,7 +7778,13 @@
     (setf special-bindings (nreverse special-bindings))
     (let* ((save-bindings
              (mapcar (lambda (sv spec)
-                       (list sv `(symbol-value ,(normalize-name spec))))
+                       ;; %GLOBAL-NAME-KEY, not NORMALIZE-NAME: the SAVE must
+                       ;; read the SAME cell the RESTORE writes.  With a bare
+                       ;; read and a qualified write, a LET of a runtime-born
+                       ;; package's special saved NIL (nothing lives at the
+                       ;; bare key) and then restored that NIL over the real
+                       ;; value on exit — battery row special.after-rebind.
+                       (list sv `(symbol-value ,(%global-name-key spec))))
                      save-vars specials))
            ;; Per-special TEMP names — carry the init value without
            ;; creating a lexical binding under the special's own name.
@@ -7759,13 +7803,13 @@
                                    :key (lambda (b)
                                           (symbol-name (if (consp b) (car b) b)))
                                    :test #'string=)
-                         (push `(set-symbol-value ,(normalize-name spec) ,tmp)
+                         (push `(set-symbol-value ,(%global-name-key spec) ,tmp)
                                acc)))
                      specials temp-vars)
                (nreverse acc)))
            (restore-forms
              (mapcar (lambda (sv spec)
-                       `(set-symbol-value ,(normalize-name spec) ,sv))
+                       `(set-symbol-value ,(%global-name-key spec) ,sv))
                      save-vars specials))
            (stripped-body (strip-declares body)))
       ;; NON-LOCAL EXIT (#240, 2026-08-08): the restore MUST run on every
@@ -7819,7 +7863,7 @@
                                       (list rb
                                             (list (gensym "SPECSET")
                                                   `(set-symbol-value
-                                                    ,(normalize-name (nth pos specials))
+                                                    ,(%global-name-key (nth pos specials))
                                                     ,(nth pos temp-vars))))
                                       (list rb)))))
                             bindings renamed-bindings)))

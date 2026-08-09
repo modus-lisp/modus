@@ -909,8 +909,12 @@
    AND the compiled-code globals alist (hash-keyed at #x10000080) so
    the binding is visible to both subsequent eval calls and any
    compiled reference (boundp, symbol-value, direct global load).
-   Used by eval's DEFVAR/DEFPARAMETER/DEFCONSTANT handlers."
-  (let ((h  (%sym-hash sym))
+   Used by eval's DEFVAR/DEFPARAMETER/DEFCONSTANT handlers.
+
+   %SYM-GLOBAL-KEY, not %SYM-HASH: for a runtime-born package's special the
+   store is keyed by the PACKAGE-QUALIFIED hash (task #241), and a runtime
+   DEFVAR must write the same cell a compiled read of that variable reads."
+  (let ((h  (%sym-global-key sym))
         (nm (%eval-sym-name sym)))
     (when h  (set-symbol-value h value))
     (when nm (%eval-global-set nm value))

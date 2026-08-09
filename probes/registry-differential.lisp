@@ -319,4 +319,22 @@
        (list (da::read-u) (db::read-u))))
 (chk "special.after-rebind" (list (da::read-u) (db::read-u)))
 
+;;; ------------------------------------------------------------------
+;;; 14. METHOD-COMBINATION registry.
+;;;
+;;;     Two combinations of the same name with DIFFERENT operators, so the
+;;;     answer says which one ran: PROGN with :identity-with-one-argument
+;;;     yields the LAST method's value, LIST yields a list of all of them.
+;;; ------------------------------------------------------------------
+(define-method-combination da::mc :identity-with-one-argument t :operator progn)
+(define-method-combination db::mc :identity-with-one-argument t :operator list)
+(defgeneric da::mcg (x) (:method-combination da::mc))
+(defmethod  da::mcg da::mc ((x integer)) 1)
+(defmethod  da::mcg da::mc ((x number))  2)
+(defgeneric db::mcg (x) (:method-combination db::mc))
+(defmethod  db::mcg db::mc ((x integer)) 1)
+(defmethod  db::mcg db::mc ((x number))  2)
+(chk "method-combination.da" (da::mcg 5))
+(chk "method-combination.db" (db::mcg 5))
+
 (format t "REGISTRY-DIFFERENTIAL-DONE~%")

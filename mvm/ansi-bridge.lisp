@@ -3378,8 +3378,16 @@
    (setf (symbol-value sym) value).  Per CLHS arity is exactly two —
    zero or one args signal program-error; three+ signal too.  The
    defun's required-count enforces both ends automatically."
+  ;; SET is a seventh entry point into the global value store (task #241):
+  ;; if it kept a bare key while a compiled read of the same variable uses
+  ;; the package-qualified one, (set 'lib::*v* x) would write a cell nobody
+  ;; reads.  The pkg-key wins where there is one; every other case keeps the
+  ;; historic hash byte-for-byte, so nothing outside a runtime-born package
+  ;; changes.
   (let ((hash (cond
-                ((%cl-sym-p symbol) (compute-name-hash (%cl-sym-name symbol)))
+                ((%cl-sym-p symbol)
+                 (let ((q (%sym-global-pkg-key symbol)))
+                   (if q q (compute-name-hash (%cl-sym-name symbol)))))
                 ((symbolp symbol) (aref symbol 0))
                 (t (%signal-type-error) 0))))
     (set-symbol-value hash value))

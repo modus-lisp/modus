@@ -800,6 +800,21 @@
   ;; macro source string fails to parse (the install fn itself doesn't
   ;; wrap — see %install-runtime-cl-macros docstring).
   (handler-case (%install-runtime-cl-macros) (t (c) nil))
+  ;; Compiler-macro NAME SET.  *%compiler-macro-hashes* is a DEFVAR whose
+  ;; init form does not run at boot (MVM Active Limitation 7) — in this
+  ;; image the variable read back UNBOUND, so %COMPILER-MACRO-P was
+  ;; always NIL and MACRO-FUNCTION reported the compiler-implemented CL
+  ;; macros that have NO runtime expander entry (LOOP DEFUN DEFMACRO
+  ;; DEFVAR DEFSTRUCT MULTIPLE-VALUE-BIND HANDLER-CASE HANDLER-BIND
+  ;; RESTART-CASE WITH-OPEN-FILE WITH-OUTPUT-TO-STRING
+  ;; WITH-INPUT-FROM-STRING LAMBDA) as ORDINARY FUNCTIONS.  A library
+  ;; code walker that dispatches on MACRO-FUNCTION then treats
+  ;; (handler-case …) as a call.  The x64-linux / x64 / aarch64* / i386
+  ;; images have called this in their own kernel-main all along; the
+  ;; generic images never did.  Same class as the char-code-limit and
+  ;; *gensym-counter* fixes above: an explicit call, not an init form.
+  ;; MUST come after init-all-globals (which would re-NIL the defvar).
+  (init-compiler-macro-set)
   ;; tar.lisp's *tar-block-size* defvar init-thunk doesn't run at boot (MVM
   ;; Active Limitation 7); set it so the baked tar reader works.  This is a
   ;; general library primitive, NOT ql wiring — the QL package + ql:quickload

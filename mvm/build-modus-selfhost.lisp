@@ -1505,6 +1505,11 @@
   ;; macro source string fails to parse (the install fn itself doesn't
   ;; wrap — see %install-runtime-cl-macros docstring).
   (handler-case (%install-runtime-cl-macros) (t (c) nil))
+  ;; Compiler-macro NAME SET — see build-generic-cli.lisp for the full
+  ;; note.  DEFVAR init forms do not run at boot (Active Limitation 7),
+  ;; so without this MACRO-FUNCTION reports LOOP/DEFUN/HANDLER-CASE/… as
+  ;; ordinary functions.  MUST come after init-all-globals.
+  (init-compiler-macro-set)
   ;; tar.lisp's *tar-block-size* defvar init-thunk doesn't run at boot (MVM
   ;; Active Limitation 7); set it so the baked tar reader works.  This is a
   ;; general library primitive, NOT ql wiring — the QL package + ql:quickload

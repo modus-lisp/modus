@@ -577,6 +577,11 @@
   ;; macro source string fails to parse (the install fn itself doesn't
   ;; wrap — see %install-runtime-cl-macros docstring).
   (handler-case (%install-runtime-cl-macros) (t (c) nil))
+  ;; Compiler-macro NAME SET — see build-generic-cli.lisp for the full
+  ;; note.  DEFVAR init forms do not run at boot (Active Limitation 7),
+  ;; so without this MACRO-FUNCTION reports LOOP/DEFUN/HANDLER-CASE/… as
+  ;; ordinary functions.  MUST come after init-all-globals.
+  (init-compiler-macro-set)
   (let ((path (%argv1)))
     (cond
       ((null path)

@@ -2348,14 +2348,46 @@
 (defvar *%sig-type-error-sym* nil)
 (defvar *%sig-program-error-sym* nil)
 (defvar *%sig-undefined-function-sym* nil)
+(defvar *%sig-simple-error-sym* nil)
 
 (defun %init-signal-symbols ()
-  "Pre-intern the TYPE-ERROR / PROGRAM-ERROR / UNDEFINED-FUNCTION
+  "Pre-intern the TYPE-ERROR / PROGRAM-ERROR / UNDEFINED-FUNCTION / SIMPLE-ERROR
    symbols into GC-rooted specials.  Must run after init-symbol-table,
    before any code can signal these conditions."
   (setq *%sig-type-error-sym* 'type-error)
   (setq *%sig-program-error-sym* 'program-error)
-  (setq *%sig-undefined-function-sym* 'undefined-function))
+  (setq *%sig-undefined-function-sym* 'undefined-function)
+  (setq *%sig-simple-error-sym* 'simple-error))
+
+(defun %interp-fault-condition ()
+  "Build and PUBLISH (as *CURRENT-CONDITION*) a condition standing for a
+   HARDWARE FAULT (SIGSEGV/SIGBUS/SIGFPE/SIGILL) that the boot signal stub
+   recovered by longjmp.
+
+   The stub (TRAP #x0520, translate-x64.lisp) runs in signal context and
+   cannot allocate, so by design it does NOT set *CURRENT-CONDITION* — it
+   restores RSP/RBP/IP from [#x10000180] and resumes at the nearest NATIVE
+   handler-case.  For interpreted (eval2) code that landing frame is
+   mvm-interpret's per-opcode handler-case, whose compiled dispatch tests
+   `(typep *CURRENT-CONDITION* 'ERROR)` / `'CONDITION`.  On a clean slate
+   *CURRENT-CONDITION* is NIL, so NEITHER clause matched, the dispatch tail
+   re-longjmped, and the fault flew past EVERY bytecode handler-case frame
+   (they live in (mvm-handlers state) and are only reachable through this
+   bridge) out to the toplevel LOAD swallow — the `!! UNHANDLED-ESCAPE
+   load-toplevel-form-swallowed: NIL' class (task #236).  When
+   *CURRENT-CONDITION* happened to be non-NIL the fault was instead
+   laundered into that STALE condition and reported as somebody else's
+   error.  Both are fixed by giving the fault an honest condition here.
+
+   Built in the %SIGNAL-* shape (2-slot array, type symbol in slot 0, read
+   from a GC-rooted special) rather than via MAKE-CONDITION: we are running
+   immediately after a fault, and make-condition's slot-collection path is
+   the flaky one those helpers were written to sidestep."
+  (let ((c (make-array 2)))
+    (aset c 0 *%sig-simple-error-sym*)
+    (aset c 1 nil)
+    (setq *current-condition* c)
+    c))
 
 (defun %signal-program-error ()
   "Runtime helper: signal a PROGRAM-ERROR condition for handler-case.

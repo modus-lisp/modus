@@ -2139,7 +2139,26 @@
           (condition (c)
             (if (mvm-handlers state)
                 (setf %lj c)
-                (error c))))
+                (error c)))
+          ;; HARDWARE FAULT (task #236).  The boot SIGSEGV/SIGBUS/SIGFPE/SIGILL
+          ;; stub recovers a fault by longjmp WITHOUT setting *CURRENT-CONDITION*
+          ;; (it runs in signal context and cannot allocate).  The landing frame
+          ;; for interpreted code is THIS handler-case; its compiled dispatch
+          ;; tests (typep *CURRENT-CONDITION* 'ERROR) / 'CONDITION, so with a NIL
+          ;; *CURRENT-CONDITION* neither clause above matched, the dispatch tail
+          ;; re-longjmped, and the fault flew past every bytecode handler-case
+          ;; frame to the toplevel LOAD swallow (`UNHANDLED-ESCAPE ... NIL').
+          ;; With a non-NIL *CURRENT-CONDITION* it was worse-but-quieter: the
+          ;; fault was reported as that STALE condition.  Give it an honest
+          ;; condition and bridge it exactly like the two clauses above.
+          ;; HOST-NEUTRAL BY CONSTRUCTION: on SBCL every signalled object is a
+          ;; CONDITION, so the clause above always matches first and this arm is
+          ;; unreachable at build time (C is never NIL there).
+          (t (c)
+            (let ((fc (or c (%interp-fault-condition))))
+              (if (mvm-handlers state)
+                  (setf %lj fc)
+                  (error fc)))))
         (when %lj
           (let ((rpc (%mvm-longjmp-restore state)))
             (when rpc

@@ -15704,6 +15704,199 @@
   "Counter for generating unique &key-rest catch-var names.")
 
 
+(defun %sp-marker-p (p)
+  "True when P is a lambda-list section marker (&OPTIONAL, &KEY, …).
+   Compares by NAME so a marker read into a different package still counts."
+  (and (symbolp p) p
+       (let ((n (symbol-name p)))
+         (and (> (length n) 0) (char= (char n 0) #\&)))))
+
+(defun %sp-name= (a b)
+  (and (symbolp a) (symbolp b) a b
+       (string= (symbol-name a) (symbol-name b))))
+
+(defun %sp-subst (form alist)
+  "Replace every symbol in FORM that is a KEY of ALIST with its value.
+   Used only on lambda-list INIT forms, and only for names this function
+   is about to rename out from under them.  QUOTE forms are left alone —
+   `(quote *x*)` is data, not a variable reference."
+  (cond
+    ((null alist) form)
+    ((symbolp form)
+     (let ((hit (assoc form alist :test #'%sp-name=)))
+       (if hit (cdr hit) form)))
+    ((not (consp form)) form)
+    ((and (symbolp (car form)) (car form)
+          (string= (symbol-name (car form)) "QUOTE"))
+     form)
+    (t (let ((a (%sp-subst (car form) alist))
+             (d (%sp-subst (cdr form) alist)))
+         (if (and (eq a (car form)) (eq d (cdr form)))
+             form
+             (cons a d))))))
+
+(defun %special-param-rewrite (params body)
+  "CLHS 3.3.4 / 3.4.1: a lambda-list PARAMETER named by a
+   (declare (special *V*)) in the body gets a DYNAMIC binding for the
+   duration of the call, not a lexical slot.  Returns (NEW-PARAMS . NEW-BODY)
+   when any parameter is so declared, else NIL (so the ordinary path stays
+   byte-identical for every function that does not use the feature).
+
+   EXTRACT-SPECIAL-VARS used to be consulted from exactly two places, LET and
+   LET*, so `(defun takes (*lv*) (declare (special *lv*)) (peek))` bound the
+   parameter lexically only and a callee reading *LV* got the GLOBAL — a wrong
+   ANSWER, silently, which is worse than an error.  Task #240 (a311671) made
+   the LET family escape-safe; this is the parameter half of the same rule.
+
+   SHAPE.  Rename each special-declared parameter to a gensym slot and wrap
+   the body in a LET that binds the real name from that slot:
+
+     (defun f (*v*) (declare (special *v*)) BODY)
+       => (defun f (G) (let ((*v* G)) (declare (special *v*)) BODY))
+
+   That is deliberate REUSE, not a second mechanism: the LET goes through
+   COMPILE-LET-WITH-SPECIALS, which already does lexical-save +
+   UNWIND-PROTECT + setq-restore, so a THROW / ERROR / RETURN-FROM out of the
+   function restores the outer value exactly as it does for LET.  Nothing here
+   saves or restores anything itself.
+
+   WHY THE PARAMETER MUST BE RENAMED.  Leaving the parameter's own name on the
+   slot would give the body a LEXICAL binding of that name, which shadows the
+   dynamic one — the same trap COMPILE-LET-WITH-SPECIALS documents (probe
+   9862): body reads would hit the stale lexical copy while callees and SETQ
+   went to the global.  With the slot gensym'd, the name is lexically unbound
+   at the point the LET is compiled, so every body reference compiles as a
+   dynamic access.
+
+   &KEY KEEPS ITS KEYWORD.  The keyword a caller passes is derived from the
+   parameter's NAME, so a bare rename of `(&key *v*)` to `(&key G)` would
+   change the protocol from :*V* to :G.  The rename therefore emits the
+   CLHS custom-keyword form `((:*V* G) …)`, which PREPROCESS-PARAMS's key
+   extraction already understands, keeping the caller's keyword fixed.
+
+   LATER INIT FORMS.  An &optional/&key default or an &aux init to the RIGHT
+   of a renamed parameter may reference it (CLHS: parameters to its left are
+   bound).  Those references are substituted to the gensym, which holds the
+   same value the dynamic binding would.
+
+   FREE DECLARATIONS ARE UNTOUCHED.  A (declare (special *x*)) naming
+   something that is not a parameter matches nothing here, so this function
+   returns NIL for it and the declaration stays free — no binding is
+   established, per CLHS 3.3.4 and the same rule a311671 enforced for LET."
+  ;; KNOWN RESIDUAL, measured by battery rows sp.init-form.{aux,opt,key}-callee:
+  ;; the dynamic binding is established around the BODY, which is AFTER the
+  ;; &optional/&key/&aux init forms have run.  A DIRECT reference in an init
+  ;; form is correct (substituted to the slot, above), but a CALLEE invoked
+  ;; from an init form still reads the outer value.  Hoisting the binding
+  ;; outside the whole prologue is NOT safe as a one-liner: the &optional/&key
+  ;; prologue must evaluate (%GET-NARGS) as the first thing in the function
+  ;; body, before any nested call overwrites the nargs convention slot (see
+  ;; compile-compound's %GET-NARGS branch), and a dynamic bind is a call.
+  ;; Separate ticket.
+  ;;
+  ;; Split BODY into [docstring] [declares] rest FIRST.  EXTRACT-SPECIAL-VARS
+  ;; on its own scans only LEADING declares, so `(defun f (*v*) \"doc\"
+  ;; (declare (special *v*)) …)` — legal CL — would not be seen at all.  The
+  ;; docstring is re-emitted OUTSIDE the wrapper LET, because a DECLARE may
+  ;; not follow a non-declare form inside the LET body.
+  (let ((doc nil)
+        (decls nil)
+        (rest body))
+    (flet ((take-declares ()
+             (loop while (and (consp rest) (consp (car rest)) (symbolp (caar rest))
+                              (= (compute-name-hash (symbol-name (caar rest)))
+                                 133791479))   ; DECLARE
+                   do (push (car rest) decls) (setq rest (cdr rest)))))
+      (take-declares)
+      (when (and (consp rest) (cdr rest) (stringp (car rest)))
+        (setq doc (car rest))
+        (setq rest (cdr rest))
+        (take-declares)))
+    (setq decls (nreverse decls))
+    (let ((specials (extract-special-vars decls)))
+    (when (null specials)
+      (return-from %special-param-rewrite nil))
+    (let ((mode :required)
+          (new-params nil)
+          (pairs nil))          ; (special-sym . gensym), in lambda-list order
+      (flet ((spec-p (v)
+               (and v (symbolp v)
+                    (find v specials :test #'%sp-name=))))
+        (dolist (p params)
+          (cond
+            ((%sp-marker-p p)
+             (let ((n (symbol-name p)))
+               (cond ((string= n "&OPTIONAL") (setq mode :optional))
+                     ((string= n "&KEY")      (setq mode :key))
+                     ((string= n "&REST")     (setq mode :rest))
+                     ((string= n "&BODY")     (setq mode :rest))
+                     ((string= n "&AUX")      (setq mode :aux))))
+             (push p new-params))
+            ;; --- required / &rest: a bare symbol ---
+            ((and (symbolp p) (or (eq mode :required) (eq mode :rest)))
+             (if (spec-p p)
+                 (let ((g (gensym (concatenate 'string "SPECPARM-"
+                                               (symbol-name p)))))
+                   (push (cons p g) pairs)
+                   (push g new-params))
+                 (push p new-params)))
+            ;; --- &optional / &key / &aux: symbol or (var init [sup]) ---
+            ((or (eq mode :optional) (eq mode :key) (eq mode :aux))
+             (let* ((keyform (and (consp p) (consp (car p))))   ; ((:kw var) …)
+                    (var  (cond (keyform (cadr (car p)))
+                                ((consp p) (car p))
+                                (t p)))
+                    (init (and (consp p) (cadr p)))
+                    (sup  (and (consp p) (caddr p)))
+                    ;; PAIRS holds every rename made so far (in reverse
+                    ;; lambda-list order — irrelevant, the names are
+                    ;; distinct), i.e. exactly the parameters to the LEFT
+                    ;; of this one.
+                    (init2 (%sp-subst init pairs))
+                    (newvar var)
+                    (newsup sup))
+               (when (spec-p var)
+                 (setq newvar (gensym (concatenate 'string "SPECPARM-"
+                                                   (symbol-name var))))
+                 (push (cons var newvar) pairs))
+               (when (spec-p sup)
+                 (setq newsup (gensym (concatenate 'string "SPECSUP-"
+                                                   (symbol-name sup))))
+                 (push (cons sup newsup) pairs))
+               (push
+                (cond
+                  ;; &KEY: keep the caller's keyword by switching to the
+                  ;; explicit ((:KW VAR) …) form whenever the variable moved.
+                  ((and (eq mode :key) (or keyform (not (eq newvar var))))
+                   (let ((kw (if keyform
+                                 (car (car p))
+                                 (intern (symbol-name var) :keyword))))
+                     (cond (newsup   (list (list kw newvar) init2 newsup))
+                           ((consp p) (list (list kw newvar) init2))
+                           (t         (list (list kw newvar))))))
+                  ((and (eq newvar var) (eq newsup sup) (eq init2 init)) p)
+                  (newsup      (list newvar init2 newsup))
+                  ((consp p)   (list newvar init2))
+                  (t           (list newvar nil)))
+                new-params)))
+            (t (push p new-params)))))
+      (when (null pairs)
+        (return-from %special-param-rewrite nil))
+      (setq new-params (nreverse new-params))
+      (setq pairs (nreverse pairs))
+      ;; The DECLARE forms are carried into the LET verbatim, so
+      ;; COMPILE-LET-WITH-SPECIALS sees the very same (special …) the user
+      ;; wrote — including any names that are NOT parameters, which it then
+      ;; filters out as free declarations.
+      (cons new-params
+            (append
+             (when doc (list doc))
+             (list (append (list 'let
+                                 (mapcar (lambda (pr) (list (car pr) (cdr pr)))
+                                         pairs))
+                           decls
+                           (or rest (list nil))))))))))
+
 (defun preprocess-params (params body &optional allow-key-transform)
   "Transform a CL parameter list with &optional/&key/&aux into simple
    required params.  Returns (list new-params new-body optional-start
@@ -15744,7 +15937,18 @@
    &aux is handled by wrapping the body in a let* — init forms execute
    inside the function's implicit block, so a (return-from FOO X) in
    an &aux init form exits FOO with X (used by ANSI tests like FLET.6
-   where a `:fail-not-array' branch returns from the function early)."
+   where a `:fail-not-array' branch returns from the function early).
+
+   SPECIAL-DECLARED PARAMETERS run FIRST, as a source-to-source rewrite (see
+   %SPECIAL-PARAM-REWRITE).  This is the single choke point for it: all five
+   callers — toplevel DEFUN, nested DEFUN, LAMBDA, FLET/LABELS — reach the
+   lambda list through here, so one hook covers every binding form that has a
+   parameter list.  It returns NIL unless a parameter is actually declared
+   special, so every other function compiles byte-identically."
+  (let ((sp (%special-param-rewrite params body)))
+    (when sp
+      (setq params (car sp))
+      (setq body (cdr sp))))
   (let ((mode :required)
         (required nil)
         (optional nil)
@@ -17379,7 +17583,22 @@
             ;; Each entry: (name . arg-spec) where arg-spec is
             ;; :default (use struct slot order), NIL (0-arg ctor), or
             ;; a list of slot-name symbols (positional in that order).
-            (named-constructors nil))
+            (named-constructors nil)
+            ;; (:PREDICATE …) / (:COPIER …) — CLHS 3.4.6.  Three states each:
+            ;;   :DEFAULT  option absent, or present with NO argument
+            ;;             (`(:predicate)`) — generate under the default name
+            ;;             (<NAME>-P / COPY-<NAME>).  Verified against SBCL.
+            ;;   NIL       `(:predicate nil)` — generate NOTHING.  This is a
+            ;;             real CLHS state, NOT "the name is NIL".
+            ;;   a SYMBOL  generate under THAT name and NOT under the default
+            ;;             (SBCL: `(defstruct (b3 (:predicate p3)) x)` leaves
+            ;;             B3-P fboundp NIL).
+            ;; The symbol is used VERBATIM — never re-interned through
+            ;; %DEFSTRUCT-INTERN — for the same reason the named-constructor
+            ;; path uses CTOR-SYM (task #241): the user wrote the name in a
+            ;; particular package and two packages' structs must not collide.
+            (predicate-name :default)
+            (copier-name :default))
        ;; Process options
        (dolist (opt options)
          (when (consp opt)
@@ -17406,7 +17625,15 @@
                       (arg-spec (if (cddr opt) (caddr opt) :default)))
                   (when (and ctor-sym (symbolp ctor-sym))
                     (push (cons ctor-sym arg-spec)
-                          named-constructors))))))))
+                          named-constructors))))
+               ;; (:PREDICATE), (:PREDICATE NIL), (:PREDICATE NAME).
+               ;; `(cdr opt)` — not `(cadr opt)` — is what distinguishes the
+               ;; no-argument form from the explicit-NIL suppression form;
+               ;; both have a NIL CADR.
+               ((name-eq opt-name "PREDICATE")
+                (setf predicate-name (if (cdr opt) (cadr opt) :default)))
+               ((name-eq opt-name "COPIER")
+                (setf copier-name (if (cdr opt) (cadr opt) :default)))))))
        ;; Default conc-name if not specified
        (unless conc-name-specified
          (setf conc-name (format nil "~A-" struct-str)))
@@ -17765,13 +17992,20 @@
                               setter-sym))))))
 
        ;; Copier — copy all slots including the 2-slot marker prefix.
-       (let ((copy-name (format nil "COPY-~A" struct-str)))
-         (push `(defun ,(%defstruct-intern copy-name) (obj)
-                  (let ((new (make-array ,(+ 2 nslots))))
-                    ,@(loop for i from 0 below (+ 2 nslots)
-                            collect `(aset new ,i (aref obj ,i)))
-                    new))
-               forms-to-compile))
+       ;; COPIER-NAME is :DEFAULT (emit COPY-<NAME>), NIL (emit nothing —
+       ;; `(:copier nil)`), or a user symbol (emit under THAT name only).
+       (let ((copy-sym (cond
+                         ((eq copier-name :default)
+                          (%defstruct-intern (format nil "COPY-~A" struct-str)))
+                         ((null copier-name) nil)
+                         (t copier-name))))
+         (when copy-sym
+           (push `(defun ,copy-sym (obj)
+                    (let ((new (make-array ,(+ 2 nslots))))
+                      ,@(loop for i from 0 below (+ 2 nslots)
+                              collect `(aset new ,i (aref obj ,i)))
+                      new))
+                 forms-to-compile)))
 
        ;; Type predicate — checks the slot-0 marker and that the instance's
        ;; slot-1 type-name is NAME (or, via the runtime registry, a subtype
@@ -17793,8 +18027,16 @@
        ;; %struct-instance-typep fallback is retained for the :include /
        ;; registry subtype case (registry-dependent; only matters when the
        ;; boot-time registration thunk DID run for an ancestor).
-       (let ((pred-name (format nil "~A-P" struct-str)))
-         (push `(defun ,(%defstruct-intern pred-name) (obj)
+       ;;
+       ;; PREDICATE-NAME is :DEFAULT (emit <NAME>-P), NIL (emit nothing —
+       ;; `(:predicate nil)`), or a user symbol (emit under THAT name only).
+       (let ((pred-sym (cond
+                         ((eq predicate-name :default)
+                          (%defstruct-intern (format nil "~A-P" struct-str)))
+                         ((null predicate-name) nil)
+                         (t predicate-name))))
+         (when pred-sym
+         (push `(defun ,pred-sym (obj)
                   (if (if (fixnump obj) nil
                         (if (consp obj) nil
                           (if (null obj) nil
@@ -17810,7 +18052,7 @@
                                 nil)
                               nil))))
                       t nil))
-               forms-to-compile))
+               forms-to-compile)))
 
        ;; Compile all generated forms
        (let ((results nil))

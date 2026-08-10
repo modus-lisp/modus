@@ -274,4 +274,29 @@
 (defun takes-mv (*lv*) (declare (special *lv*)) (values (peek) 2 3 4 5))
 (chk "sp.mv" (multiple-value-list (takes-mv :MV)))
 
+;;; --- B11. KNOWN RESIDUAL GAP, measured rather than remembered.
+;;;
+;;;   CLHS 3.4.1: an init form to the RIGHT of a parameter is evaluated with
+;;;   that parameter already bound — INCLUDING its dynamic binding.  Modus
+;;;   establishes the dynamic binding around the function BODY, which is after
+;;;   the &optional / &key / &aux init forms have run, so a DIRECT reference in
+;;;   an init form is correct (it is substituted to the parameter's slot — see
+;;;   sp.aux / sp.optional.defaulted above) but a CALLEE invoked from an init
+;;;   form still reads the OUTER value.  The second element of each row below
+;;;   — the same call made from the body — is correct.
+;;;
+;;;   Moving the binding outside the whole prologue is NOT a safe one-liner:
+;;;   the &optional/&key prologue must read (%GET-NARGS) as the first thing in
+;;;   the function body, before any nested call overwrites the nargs
+;;;   convention slot, and a dynamic bind is a call.  Left as a separate
+;;;   ticket; these rows are what will report it fixed.
+(defvar *lq* :q-outer)
+(defun peek-q () *lq*)
+(defun aux-callee (*lq* &aux (y (peek-q)))    (declare (special *lq*)) (list y (peek-q)))
+(defun opt-callee (*lq* &optional (y (peek-q))) (declare (special *lq*)) (list y (peek-q)))
+(defun key-callee (*lq* &key (y (peek-q)))      (declare (special *lq*)) (list y (peek-q)))
+(chk "sp.init-form.aux-callee" (aux-callee :ARG))
+(chk "sp.init-form.opt-callee" (opt-callee :ARG))
+(chk "sp.init-form.key-callee" (key-callee :ARG))
+
 (format t "BINDING-DIFFERENTIAL-DONE~%")

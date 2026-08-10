@@ -17379,7 +17379,22 @@
             ;; Each entry: (name . arg-spec) where arg-spec is
             ;; :default (use struct slot order), NIL (0-arg ctor), or
             ;; a list of slot-name symbols (positional in that order).
-            (named-constructors nil))
+            (named-constructors nil)
+            ;; (:PREDICATE …) / (:COPIER …) — CLHS 3.4.6.  Three states each:
+            ;;   :DEFAULT  option absent, or present with NO argument
+            ;;             (`(:predicate)`) — generate under the default name
+            ;;             (<NAME>-P / COPY-<NAME>).  Verified against SBCL.
+            ;;   NIL       `(:predicate nil)` — generate NOTHING.  This is a
+            ;;             real CLHS state, NOT "the name is NIL".
+            ;;   a SYMBOL  generate under THAT name and NOT under the default
+            ;;             (SBCL: `(defstruct (b3 (:predicate p3)) x)` leaves
+            ;;             B3-P fboundp NIL).
+            ;; The symbol is used VERBATIM — never re-interned through
+            ;; %DEFSTRUCT-INTERN — for the same reason the named-constructor
+            ;; path uses CTOR-SYM (task #241): the user wrote the name in a
+            ;; particular package and two packages' structs must not collide.
+            (predicate-name :default)
+            (copier-name :default))
        ;; Process options
        (dolist (opt options)
          (when (consp opt)
@@ -17406,7 +17421,15 @@
                       (arg-spec (if (cddr opt) (caddr opt) :default)))
                   (when (and ctor-sym (symbolp ctor-sym))
                     (push (cons ctor-sym arg-spec)
-                          named-constructors))))))))
+                          named-constructors))))
+               ;; (:PREDICATE), (:PREDICATE NIL), (:PREDICATE NAME).
+               ;; `(cdr opt)` — not `(cadr opt)` — is what distinguishes the
+               ;; no-argument form from the explicit-NIL suppression form;
+               ;; both have a NIL CADR.
+               ((name-eq opt-name "PREDICATE")
+                (setf predicate-name (if (cdr opt) (cadr opt) :default)))
+               ((name-eq opt-name "COPIER")
+                (setf copier-name (if (cdr opt) (cadr opt) :default)))))))
        ;; Default conc-name if not specified
        (unless conc-name-specified
          (setf conc-name (format nil "~A-" struct-str)))
@@ -17765,13 +17788,20 @@
                               setter-sym))))))
 
        ;; Copier — copy all slots including the 2-slot marker prefix.
-       (let ((copy-name (format nil "COPY-~A" struct-str)))
-         (push `(defun ,(%defstruct-intern copy-name) (obj)
-                  (let ((new (make-array ,(+ 2 nslots))))
-                    ,@(loop for i from 0 below (+ 2 nslots)
-                            collect `(aset new ,i (aref obj ,i)))
-                    new))
-               forms-to-compile))
+       ;; COPIER-NAME is :DEFAULT (emit COPY-<NAME>), NIL (emit nothing —
+       ;; `(:copier nil)`), or a user symbol (emit under THAT name only).
+       (let ((copy-sym (cond
+                         ((eq copier-name :default)
+                          (%defstruct-intern (format nil "COPY-~A" struct-str)))
+                         ((null copier-name) nil)
+                         (t copier-name))))
+         (when copy-sym
+           (push `(defun ,copy-sym (obj)
+                    (let ((new (make-array ,(+ 2 nslots))))
+                      ,@(loop for i from 0 below (+ 2 nslots)
+                              collect `(aset new ,i (aref obj ,i)))
+                      new))
+                 forms-to-compile)))
 
        ;; Type predicate — checks the slot-0 marker and that the instance's
        ;; slot-1 type-name is NAME (or, via the runtime registry, a subtype
@@ -17793,8 +17823,16 @@
        ;; %struct-instance-typep fallback is retained for the :include /
        ;; registry subtype case (registry-dependent; only matters when the
        ;; boot-time registration thunk DID run for an ancestor).
-       (let ((pred-name (format nil "~A-P" struct-str)))
-         (push `(defun ,(%defstruct-intern pred-name) (obj)
+       ;;
+       ;; PREDICATE-NAME is :DEFAULT (emit <NAME>-P), NIL (emit nothing —
+       ;; `(:predicate nil)`), or a user symbol (emit under THAT name only).
+       (let ((pred-sym (cond
+                         ((eq predicate-name :default)
+                          (%defstruct-intern (format nil "~A-P" struct-str)))
+                         ((null predicate-name) nil)
+                         (t predicate-name))))
+         (when pred-sym
+         (push `(defun ,pred-sym (obj)
                   (if (if (fixnump obj) nil
                         (if (consp obj) nil
                           (if (null obj) nil
@@ -17810,7 +17848,7 @@
                                 nil)
                               nil))))
                       t nil))
-               forms-to-compile))
+               forms-to-compile)))
 
        ;; Compile all generated forms
        (let ((results nil))

@@ -1,0 +1,5 @@
+(defun say (k v) (princ (concatenate (quote string) k "=" (princ-to-string v))) (terpri) (finish-output))
+(defun pr2 (name src) (say name (handler-case (eval (read-from-string src)) (t (c) (list :ERR c)))))
+(say "Z1" "before")
+(pr2 "Z2" "(+ 1 2)")
+(say "Z3" "after")

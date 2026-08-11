@@ -1,0 +1,8 @@
+(defun say (k v) (princ (concatenate (quote string) k "=" (princ-to-string v))) (terpri) (finish-output))
+(defun hx (n) (format nil "~X" n))
+(defun fslots () (list :rip (hx (mem-ref #x10000C30 :u64)) :site (hx (mem-ref #x10000C40 :u64))
+                       :rax (hx (mem-ref #x10000C48 :u64)) :addr (hx (mem-ref #x10000C50 :u64))))
+(defun badread (n) (mem-ref n :u64))
+(say "SEGV" (handler-case (badread (* 2 #x60000000000)) (t (c) (list :ERR c))))
+(say "f" (fslots))
+(say "END" "ok")

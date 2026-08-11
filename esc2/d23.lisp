@@ -1,0 +1,17 @@
+(defun say (k v) (princ (concatenate (quote string) k "=" (princ-to-string v))) (terpri) (finish-output))
+(defun hx (n) (format nil "~X" n))
+;; g1 references #'g2 (as a value) BEFORE g2 exists
+(say "D1" (handler-case (eval (read-from-string "(defun zg1 (lst) (sort lst (function <) :key (function zg2)))")) (t (c) (list :ERR c))))
+(say "D2" (handler-case (eval (read-from-string "(defun zg1b () (function zg2))")) (t (c) (list :ERR c))))
+(say "R1.before" (handler-case (eval (read-from-string "(zg1b)")) (t (c) (list :ERR c))))
+(say "D3" (handler-case (eval (read-from-string "(defun zg2 (x) (if (consp x) (car x) x))")) (t (c) (list :ERR c))))
+(say "R2.after" (handler-case (eval (read-from-string "(zg1b)")) (t (c) (list :ERR c))))
+(say "R3.fixnump" (handler-case (eval (read-from-string "(integerp (zg1b))")) (t (c) (list :ERR c))))
+(say "R4.asint" (handler-case (eval (read-from-string "(if (integerp (zg1b)) (zg1b) :notint)")) (t (c) (list :ERR c))))
+(say "R5.funcall" (handler-case (eval (read-from-string "(funcall (zg1b) 7)")) (t (c) (list :ERR c))))
+(say "R6.sortkey" (handler-case (eval (read-from-string "(zg1 (list 3 1 2))")) (t (c) (list :ERR c))))
+;; control: g3 references #'g4 AFTER g4 exists
+(say "D4" (handler-case (eval (read-from-string "(defun zg4 (x) x)")) (t (c) (list :ERR c))))
+(say "D5" (handler-case (eval (read-from-string "(defun zg3 () (function zg4))")) (t (c) (list :ERR c))))
+(say "R7.ctrl" (handler-case (eval (read-from-string "(funcall (zg3) 7)")) (t (c) (list :ERR c))))
+(say "END" "ok")

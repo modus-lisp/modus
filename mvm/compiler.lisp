@@ -138,6 +138,25 @@
 (defvar *current-function-name* nil
   "Name of the function currently being compiled")
 
+(defvar *e2-module-defuns* nil
+  "mvm-eval (in-image runtime compile) ONLY — task #244.  The names (strings,
+   keyed by %rt-fn-name exactly like FUNCTION-INFO-NAME) of every top-level
+   DEFUN in the module mvm-eval-forms is compiling RIGHT NOW, computed by its
+   %e2-scan-persist pre-scan BEFORE the compile loop starts.
+
+   *FUNCTION-TABLE* only ever holds the functions compiled so far, so it
+   cannot answer `is NAME part of this module?' for a name defined LATER in
+   it.  %e2-fn-in-module-p consults this list for exactly that case; without
+   it a forward `#'LATER-FN' escaped as a bare bytecode-offset fixnum and any
+   native higher-order caller (MAPCAR/SOME/SORT :key) funcalled the integer.
+
+   NIL at build time and outside mvm-eval-forms, which is the correct answer
+   there (native builds never set *MVM-EVAL-RUNTIME-P*, so the arm that reads
+   this is unreachable).  Set with SETQ + explicit save/restore for reentrancy
+   — a nested mvm-eval (macroexpander) must not clobber the outer module's
+   list; see *E2-PERSIST-DEFUNS* for the same pattern and why a compiled LET
+   of a special is not used in-image.")
+
 ;;; Set by compile-form's %NAMED-LOOP dispatch so the inner SIMPLE-LOOP
 ;;; doesn't establish an implicit (block nil …).  Per CLHS 6.1.2.2 a
 ;;; NAMED LOOP's implicit block IS the named block — RETURN in the body
@@ -11461,10 +11480,10 @@
         ;; mvm-eval-forms.  GATES: (symbolp name) keeps the internal
         ;; (function "NAME") string recursion from compile-make-closure on
         ;; the plain :li-func path (and skips (setf f) names), and
-        ;; %e2-fn-in-module-p limits this to names already compiled into
-        ;; this module (out-of-module #'CAR etc. keep the op-FN-ADDR native
-        ;; object resolution; forward references keep the raw offset —
-        ;; status quo).
+        ;; %e2-fn-in-module-p limits this to names belonging to this module —
+        ;; already compiled, being compiled right now, OR declared later in it
+        ;; (the forward-reference arm, task #244).  Out-of-module #'CAR etc.
+        ;; keep the op-FN-ADDR native object resolution.
         (if (and *mvm-eval-runtime-p*
                  (symbolp name)
                  (%e2-fn-in-module-p resolved-name))
@@ -11498,7 +11517,33 @@
             (when (and (not found)
                        (let ((n (string (function-info-name info))))
                          (or (string= n name) (string= n bare))))
-              (setq found t)))))))
+              (setq found t)))
+          ;; FORWARD reference (task #244).  *FUNCTION-TABLE* only holds the
+          ;; functions compiled SO FAR, so `#'LATER-FN' referenced from a
+          ;; function that appears EARLIER in the same module missed every
+          ;; test above and fell through to the bare `:li-func' raw-offset
+          ;; escape the whole predicate exists to prevent.  That is not a
+          ;; corner case: CLHS 3.2.3.1 makes each form in a top-level
+          ;; EVAL-WHEN/PROGN body top level, so ONE eval-when of N defuns is
+          ;; ONE module, and any use-before-definition inside it is a forward
+          ;; reference.  iterate's #L reader macro is exactly this shape —
+          ;; SHARPL-READER is the first defun in its eval-when and does
+          ;; (mapcar #'BANG-VAR-NUM ...) on the fifth, so #'BANG-VAR-NUM
+          ;; evaluated to the raw bytecode offset 177; native MAPCAR1 then
+          ;; funcalled the fixnum (sub $3 / call *rbx -> code offset 351 =
+          ;; *X64-NATIVE-CODE-OFFSET*) and took a SIGSEGV.
+          ;;
+          ;; *E2-MODULE-DEFUNS* is mvm-eval-forms' OWN pre-scan of the module's
+          ;; top-level defun names (%e2-scan-persist, keyed by %rt-fn-name —
+          ;; the same string function-info-name uses), so this arm recognises
+          ;; a name that IS in this module but has not been compiled yet.
+          (unless found
+            (dolist (pn *e2-module-defuns*)
+              (when (and (not found)
+                         (let ((n (string pn)))
+                           (or (string= n name) (string= n bare))))
+                (setq found t))))
+          found))))
 
 ;;; ============================================================
 ;;; Multiple Values

@@ -1,0 +1,5 @@
+(defun say (k v) (princ (concatenate (quote string) k "=" (princ-to-string v))) (terpri) (finish-output))
+(say "S2" (handler-case (install-tarball "/home/claude/lf/tars/iterate.tar" "iterate") (t (c) :abort)))
+(say "a.mbv"  (handler-case (eval (read-from-string "(iterate::make-bang-var 1)")) (t (c) (list :ERR c))))
+(say "b.bvp"  (handler-case (eval (read-from-string "(iterate::bang-var? (iterate::make-bang-var 1))")) (t (c) (list :ERR c))))
+(say "END" "ok")

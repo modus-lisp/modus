@@ -1,0 +1,13 @@
+(defun say (k v) (princ (concatenate (quote string) k "=" (princ-to-string v))) (terpri) (finish-output))
+(say "D" (handler-case (eval (read-from-string
+"(eval-when (:compile-toplevel :execute)
+   (defun zu1 (lst) (sort lst (function <) :key (function zu2)))
+   (defun zu1b () (function zu2))
+   (defun zu2 (x) (if (consp x) (car x) x)))")) (t (c) (list :ERR c))))
+(say "V1" (handler-case (eval (read-from-string "(zu1b)")) (t (c) (list :ERR c))))
+(say "V2" (handler-case (eval (read-from-string "(integerp (zu1b))")) (t (c) (list :ERR c))))
+(say "V3" (handler-case (eval (read-from-string "(if (integerp (zu1b)) (zu1b) :notint)")) (t (c) (list :ERR c))))
+(say "V4" (handler-case (eval (read-from-string "(funcall (zu1b) 7)")) (t (c) (list :ERR c))))
+(say "V5" (handler-case (eval (read-from-string "(zu1 (list 3 1 2))")) (t (c) (list :ERR c))))
+(say "V6.direct" (handler-case (eval (read-from-string "(zu2 5)")) (t (c) (list :ERR c))))
+(say "END" "ok")

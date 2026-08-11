@@ -46,23 +46,27 @@
 ;;;;    in an image whose KERNEL-MAIN does not reach INIT-ALL-GLOBALS, and
 ;;;;    where no reachable function assigns NAME.  Catches bugs 1, 2, 5.
 ;;;;
-;;;; B. ORPHANED-INITIALISER.  A defun named INIT-* / %INIT-* that is defined
-;;;;    in the blob but is not reachable from KERNEL-MAIN.  Catches bug 4 —
-;;;;    and note that bug 4's variable has a NIL initform, so check A cannot
-;;;;    see it; the signal is the dead initialiser, not the variable.
+;;;; B. ORPHANED-INITIALISER.  A defun named INIT-* / %INIT-* that ASSIGNS a
+;;;;    global this image declares and is not reachable from KERNEL-MAIN.
+;;;;    Catches bug 4 — and note that bug 4's variable has a NIL initform, so
+;;;;    check A is structurally blind to it; the signal is the dead
+;;;;    initialiser, not the variable.
 ;;;;
-;;;; Both are deliberately CRUDE and deliberately biased toward silence:
-;;;; the call graph over-approximates (any symbol appearing anywhere in a
-;;;; defun body that names a known defun counts as a call) and the assignment
-;;;; scan over-approximates (a LET binding of NAME counts as an assignment).
-;;;; Over-approximating both suppresses false positives at the cost of false
-;;;; negatives.  A check nobody enables is worth nothing.
+;;;; The call graph counts head position, #'NAME and 'NAME as calls, and does
+;;;; not propagate through the generated name registries (see
+;;;; *GLOBAL-CHECK-REGISTRY-PREFIXES*).  The assignment scan over-approximates
+;;;; on purpose — a LET binding of NAME counts as an assignment — because a
+;;;; missed assignment is a FALSE POSITIVE and those are what kill a check.
+;;;;
+;;;; Measured on the tree at a3e8767: 15 of the 17 buildable images report
+;;;; ZERO.  What it does report is in *GLOBAL-CHECK-BASELINE* below.
 ;;;;
 ;;;; ------------------------------------------------------------------
 ;;;; KNOBS
 ;;;; ------------------------------------------------------------------
 ;;;;   MODUS_GLOBAL_CHECK=0      disable entirely
 ;;;;   MODUS_GLOBAL_CHECK=warn   report but do not fail the build
+;;;;   MODUS_GLOBAL_CHECK=force  run even on a blob over the size cap
 ;;;;   MODUS_GLOBAL_CHECK=dump   write the blob to $MODUS_GLOBAL_CHECK_OUT and
 ;;;;                             exit before compiling (offline analysis aid)
 ;;;; Default: report and FAIL the build.
@@ -124,7 +128,24 @@
      "#243 FINDING 2 (unfixed, filed): the compiler smoke image bakes
       compiler.lisp but its KERNEL-MAIN never calls (INIT-ALL-GLOBALS), so
       *OPCODE-TABLE*, *UNRESOLVED-CALLS*, *SETF-EXPANDERS*, *LET-BINDING-LIMIT*
-      etc. are NIL in-image.  Diagnostic build, not shipped."))
+      etc. are NIL in-image.  Diagnostic build, not shipped.")
+    ;; The four ANSI GATE RUNNERS.  Over the size cap, so normally skipped
+    ;; outright; these entries make MODUS_GLOBAL_CHECK=force honest rather
+    ;; than a 57-line wall.  All four share build-ansi-common.lisp's harness
+    ;; and none of them calls INIT-ALL-GLOBALS -- deliberately ("init-all-
+    ;; globals not safe -- some thunks...", build-x64-linux.lisp ~1070) -- so
+    ;; they set what they need by hand instead.
+    ("build-x64-linux" :suppress-check-a
+     "#243 FINDING 3 (unfixed, filed): 57 check-A findings, 0 check-B.
+      MEASURED on this one.  Most are ANSI-corpus scaffolding (*UNIVERSE*,
+      *SEARCHED-LIST*, *MY-CLASSES*) which genuinely does not care, but
+      *MCGC-BITMAP-ENABLED* / *MCGC-COLLECTOR-ENABLED* /
+      *MCGC-KIND-CHECK-ENABLED* are bug 5 from the header list, still live in
+      the gate image, and *%TRIG-PI* / *%UNBOUND-SLOT* / *SETF-EXPANDERS*
+      deserve their own look.")
+    ("build-x64"          :suppress-check-a "#243 FINDING 3 — same harness as build-x64-linux (not separately measured).")
+    ("build-aarch64-linux" :suppress-check-a "#243 FINDING 3 — same harness as build-x64-linux (not separately measured).")
+    ("build-aarch64"      :suppress-check-a "#243 FINDING 3 — same harness as build-x64-linux (not separately measured)."))
   "Alist (build-script-basename . entries) of KNOWN, FILED, UNFIXED findings.")
 
 (defun %gck-baseline-entry (label)
@@ -381,11 +402,19 @@
 ;;; sub-second.  Measured on the 17.9 MB build-x64-linux blob: 1129 s to read,
 ;;; 0.7 s to analyse.  That blob is 17 MB of baked ANSI test corpus, and the
 ;;; four ANSI GATE RUNNERS are the only images anywhere near it (the largest
-;;; shipping blob is build-modus-selfhost at 5.0 MB).  They are also the images
-;;; with the least to say: all four call INIT-ALL-GLOBALS, so check A is off
-;;; there by construction — and #242's lesson is precisely that the gate image
-;;; was the one already fine.  So: skip above a threshold, loudly, with an
-;;; override.  MODUS_GLOBAL_CHECK=force runs it anyway.
+;;; shipping blob is build-modus-selfhost at 5.0 MB).  They are also not
+;;; shipped — #242's lesson is precisely that the gate image was the one
+;;; already fine.  So: skip above a threshold, loudly, with an override.
+;;;
+;;; DO NOT read the skip as "nothing to see there".  A forced run on
+;;; build-x64-linux reports 57 check-A findings (0 check-B): that image
+;;; deliberately does not call INIT-ALL-GLOBALS ("init-all-globals not safe —
+;;; some thunks...", build-x64-linux.lisp ~1070) and sets what it needs by
+;;; hand.  Most of the 57 are ANSI-corpus scaffolding (*UNIVERSE*,
+;;; *SEARCHED-LIST*, *MY-CLASSES*), but *MCGC-BITMAP-ENABLED* /
+;;; *MCGC-COLLECTOR-ENABLED* / *MCGC-KIND-CHECK-ENABLED* are bug 5 of the list
+;;; at the top of this file, still live.  Filed as #243 FINDING 3 and
+;;; baselined below, so =force is honest too.
 (defvar *global-check-max-blob-chars* (* 8 1024 1024))
 
 (defun %gck-build-label ()

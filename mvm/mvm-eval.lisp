@@ -1526,12 +1526,22 @@
            ;; restore it after the union below, so each nesting level sees only
            ;; its own recordings.  (Explicit save+setq+restore, NOT a let of
            ;; the special — compiled let of a special is unreliable in-image.)
-           (%e2pd-saved *e2-persist-defuns*))
+           (%e2pd-saved *e2-persist-defuns*)
+           ;; Task #244.  Same reentrancy discipline as %E2PD-SAVED: publish
+           ;; THIS module's pre-scanned defun names for compile-function-ref's
+           ;; forward-reference test (%e2-fn-in-module-p), and put the
+           ;; enclosing call's list back when the compile loop is done.
+           (%e2md-saved *e2-module-defuns*))
       ;; Compiler-recorded persistence: clear the global BEFORE the compile
       ;; loop; the toplevel DEFUN handler pushes every toplevel-context defun
       ;; name (post-macroexpansion) onto it.  setq, not let (compiled let of
       ;; a special is unreliable in-image — see *mvm-emit-halves*).
       (setq *e2-persist-defuns* nil)
+      ;; Task #244: publish the pre-scanned module defun names for the
+      ;; duration of the compile loop, so `#'LATER-FN' inside an EARLIER
+      ;; function of this same module is recognised as in-module and
+      ;; materialised as a closure instead of escaping as a raw offset.
+      (setq *e2-module-defuns* persist-names)
       (dolist (f toplevel)
         (let ((result (mvm-compile-toplevel f)))
           (cond
@@ -1565,7 +1575,8 @@
           (setq persist-names (cons pn persist-names))))
       ;; REENTRANCY: restore the enclosing mvm-eval-forms call's recordings
       ;; (see %e2pd-saved above).  Outermost call restores NIL — harmless.
-      (setq *e2-persist-defuns* %e2pd-saved))
+      (setq *e2-persist-defuns* %e2pd-saved)
+      (setq *e2-module-defuns* %e2md-saved))
     ;; Small buffer (the default 128MB byte array blows the in-image heap).
     ;; PERF: REUSE a persistent 64KB buffer instead of (make-array 65536) every
     ;; call.  mvm-buffer-used-bytes copies the bytecode out before the next call,

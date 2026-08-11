@@ -1,0 +1,25 @@
+(defun say (k v) (princ (concatenate (quote string) k "=" (princ-to-string v))) (terpri) (finish-output))
+(say "G1.def" (handler-case (eval (read-from-string
+  "(eval-when (:compile-toplevel :execute)
+     (defun ga1 (l) (list :fn (function ga2) :int (integerp (function ga2)) :fnp (functionp (function ga2))
+                          :res (mapcar (function ga2) l)))
+     (defun ga2 (x) (+ x 100)))")) (t (c) (list :ERR c))))
+(say "G1.run" (handler-case (eval (read-from-string "(ga1 (list 1 2))")) (t (c) (list :ERR c))))
+;; same but with 5 defuns and the ref from the FIRST to the FIFTH (iterate's shape)
+(say "G2.def" (handler-case (eval (read-from-string
+  "(eval-when (:compile-toplevel :execute)
+     (defun gb1 (l) (list :fn (function gb5) :int (integerp (function gb5))
+                          :res (mapcar (function gb5) l)))
+     (defun gb2 (x) x) (defun gb3 (x) x) (defun gb4 (x) x)
+     (defun gb5 (x) (+ x 100)))")) (t (c) (list :ERR c))))
+(say "G2.run" (handler-case (eval (read-from-string "(gb1 (list 1 2))")) (t (c) (list :ERR c))))
+;; iterate's actual shape: ref inside a LET* init form
+(say "G3.def" (handler-case (eval (read-from-string
+  "(eval-when (:compile-toplevel :execute)
+     (defun gc1 (l) (let* ((a (sort (copy-list l) (function <) :key (function gc3)))
+                           (b (mapcar (function gc3) a)))
+                      (list :fn (function gc3) :int (integerp (function gc3)) :a a :b b)))
+     (defun gc2 (x) x)
+     (defun gc3 (sym) (+ sym 1)))")) (t (c) (list :ERR c))))
+(say "G3.run" (handler-case (eval (read-from-string "(gc1 (list 2 1))")) (t (c) (list :ERR c))))
+(say "END" "ok")

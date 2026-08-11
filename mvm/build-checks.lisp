@@ -105,12 +105,15 @@
 ;;; SHRINK THIS TABLE.  It is a debt register, not a config knob.
 
 (defvar *global-check-baseline*
-  '(("build-aarch64-cli" :suppress-check-a
+  '(("build-aarch64-cli" :suppress-check-a :suppress-check-b
      "#243 FINDING 1 (unfixed, filed): the shipping AArch64 CLI's KERNEL-MAIN
       never calls (INIT-ALL-GLOBALS), while its x64 twin build-generic-cli
-      does.  62 defvars read back NIL there — including *SETF-EXPANDERS*,
+      does.  85 defvars read back NIL there — including *SETF-EXPANDERS*,
       *RANDOM-STATE*, INTERNAL-TIME-UNITS-PER-SECOND, the *%TRIG-* constants
-      and the whole MOST-POSITIVE-*-FLOAT family.  Exactly the #242 shape:
+      and the whole MOST-POSITIVE-*-FLOAT family — and the two belt-and-braces
+      initialisers that exist for exactly this case, %INIT-BOOLE-CONSTANTS and
+      %INIT-STANDARD-CHARS, are not called either, so BOOLE-AND and friends are
+      NIL too (check B).  One root cause, one fix.  Exactly the #242 shape:
       correct source, one build script that does not call the initialiser.")
     ("build-compiler-test" :suppress-check-a
      "#243 FINDING 2 (unfixed, filed): the compiler smoke image bakes
@@ -121,6 +124,32 @@
 
 (defun %gck-baseline-entry (label)
   (assoc label *global-check-baseline* :test #'equal))
+
+;;; ------------------------------------------------------------------
+;;; NAME REGISTRIES ARE NOT CALL SITES
+;;; ------------------------------------------------------------------
+;;; The CL images contain generated functions that stuff EVERY defun into a
+;;; name table:
+;;;   (defun %init-sft-auto-7 ()
+;;;     (puthash "FOO" *symbol-function-table* #'FOO) ...)
+;;; Following #'FOO out of one of those makes literally every function in the
+;;; image "reachable from kernel-main" — measured: 3109 of 3109 on the CLI
+;;; blob, with check B unable to fire on #242's own bug even with the call
+;;; deleted.  Being in the SFT means CALLABLE BY NAME at runtime; it does not
+;;; mean boot calls you, which is the whole question here.  So reachability
+;;; does not propagate THROUGH these (they stay reachable themselves).
+
+(defvar *global-check-registry-prefixes*
+  '("%INIT-SFT-AUTO" "%INIT-SYM-NAME-AUTO")
+  "Name prefixes of generated name-registry functions.  Reachability stops at
+   them.  If the generators in the build scripts are renamed, the saturation
+   warning printed by CHECK-GLOBAL-INITS is what tells you to update this.")
+
+(defun %gck-registry-p (name)
+  (dolist (p *global-check-registry-prefixes*)
+    (when (and (>= (length name) (length p))
+               (string= p name :end2 (length p)))
+      (return t))))
 
 ;;; ============================================================
 ;;; Tiny source walkers
@@ -187,6 +216,49 @@
            (%gck-scan-toplevel (cdr form) fns vars))))))
   (values fns vars))
 
+(defun %gck-collect-calls (form acc)
+  "Collect into ACC the name of every symbol FORM uses in a CALLEE position:
+   the head of a form, #'NAME, and a bare 'NAME (which is how a callee reaches
+   FUNCALL/APPLY/MAPCAR here).
+
+   The first cut of this counted ANY symbol anywhere in a body as a call.
+   That was measured to be useless, not merely loose: on the shipping CLI blob
+   it made 3109 of 3109 defuns \"reachable\", so check B could never fire on
+   the exact image class it exists for.  Head position is the tightening.
+
+   QUOTE is not descended into (quoted lists are data), but a quoted SYMBOL is
+   kept.  Backquote IS descended into — a macro template's calls are real
+   calls at every expansion site."
+  (cond
+    ((consp form)
+     (let* ((h (car form))
+            (n (and h (symbolp h) (symbol-name h))))
+       (cond
+         ((and n (equal n "QUOTE"))
+          (let ((q (and (consp (cdr form)) (cadr form))))
+            (when (and q (symbolp q) (not (keywordp q)))
+              (setf (gethash (symbol-name q) acc) t)))
+          (return-from %gck-collect-calls acc))
+         ((and n (equal n "FUNCTION"))
+          (let ((q (and (consp (cdr form)) (cadr form))))
+            (if (and q (symbolp q))
+                (setf (gethash (symbol-name q) acc) t)
+                (%gck-collect-calls q acc)))
+          (return-from %gck-collect-calls acc))
+         (n (setf (gethash n acc) t))))
+     ;; Descend into every element (heads of nested forms live there too).
+     (let ((tail form))
+       (loop while (consp tail)
+             do (%gck-collect-calls (car tail) acc)
+                (setf tail (cdr tail)))
+       (when tail (%gck-collect-calls tail acc))))
+    ((and (vectorp form) (not (stringp form)))
+     (loop for i from 0 below (length form)
+           do (%gck-collect-calls (aref form i) acc)))
+    (t (let ((inner (%gck-comma-expr form)))
+         (when inner (%gck-collect-calls inner acc)))))
+  acc)
+
 (defun %gck-reachable (fns roots)
   "Two values: (1) the set of defun names transitively reachable from ROOTS,
    (2) the set of ALL symbol names mentioned anywhere inside those bodies.
@@ -208,9 +280,16 @@
                (unless (gethash n seen)
                  (setf (gethash n seen) t)
                  (setf (gethash n mentioned) t)
-                 (let ((body (gethash n fns)))
+                 (let ((body (unless (%gck-registry-p n) (gethash n fns))))
                    (when body
-                     (let ((syms (%gck-collect-symbols body (make-hash-table :test 'equal))))
+                     ;; BODY is (ARGLIST . FORMS).  Calls come from the forms
+                     ;; (head position); the arglist is scanned loosely because
+                     ;; an &optional default may call an initialiser and a
+                     ;; missed call would be a FALSE POSITIVE.
+                     (let ((syms (%gck-collect-calls
+                                  (cdr body)
+                                  (%gck-collect-symbols (car body)
+                                                        (make-hash-table :test 'equal)))))
                        (maphash (lambda (s v)
                                   (declare (ignore v))
                                   (setf (gethash s mentioned) t)
@@ -332,14 +411,18 @@
            (vars (list :vars)))
       (%gck-scan-toplevel forms fns vars)
       (setf vars (nreverse (cdr vars)))
-      ;; No kernel-main => not a bootable image (compiler smoke builds); skip.
+      ;; No kernel-main => not a bootable image; nothing to be reachable FROM.
       (unless (gethash "KERNEL-MAIN" fns)
+        (format t "~&;; check-global-inits (~A): no KERNEL-MAIN in blob — skipped~%"
+                label)
+        (finish-output)
         (return-from check-global-inits nil))
       (multiple-value-bind (reach mentioned)
           (%gck-reachable fns (list "KERNEL-MAIN"))
        (let* ((inits-run-p (gethash "INIT-ALL-GLOBALS" mentioned))
              (baseline (%gck-baseline-entry label))
              (suppress-a (member :suppress-check-a baseline))
+             (suppress-b (member :suppress-check-b baseline))
              (assigned (make-hash-table :test 'equal))
              (baselined nil)
              (findings nil))
@@ -383,8 +466,21 @@ function assigns it, so it reads back NIL at runtime."
         ;; the name must look like an initialiser, AND the body must actually
         ;; assign a global this image declares.
         (let ((names nil)
-              (varset (make-hash-table :test 'equal)))
-          (dolist (v vars) (setf (gethash (first v) varset) t))
+              (varset (make-hash-table :test 'equal))
+              (covered (make-hash-table :test 'equal)))
+          (dolist (v vars)
+            (setf (gethash (first v) varset) t)
+            ;; A global is already COVERED if its own initform does the job in
+            ;; this image, or if some reachable function assigns it.  Several
+            ;; `%init-…' helpers exist purely as belt-and-braces for the images
+            ;; that skip INIT-ALL-GLOBALS (%INIT-BOOLE-CONSTANTS,
+            ;; %INIT-STANDARD-CHARS); where the initforms DO run they are
+            ;; legitimately redundant and must not be reported.  Verified
+            ;; against the real binary: BOOLE-AND reads 6 and (boole boole-and
+            ;; 12 10) = 8 in the shipping CLI.
+            (when (or (and inits-run-p (third v) (fourth v))
+                      (gethash (first v) assigned))
+              (setf (gethash (first v) covered) t)))
           (maphash (lambda (n v) (declare (ignore v)) (push n names)) fns)
           (dolist (n (sort names #'string<))
             (when (and (or (and (> (length n) 5) (string= "INIT-" n :end2 5))
@@ -392,17 +488,35 @@ function assigns it, so it reads back NIL at runtime."
                        (not (gethash n reach))
                        (not (member n *global-check-init-allowlist* :test #'equal)))
               (let ((written nil))
-                (maphash (lambda (k v) (declare (ignore v)) (push k written))
+                (maphash (lambda (k v) (declare (ignore v))
+                           (unless (gethash k covered) (push k written)))
                          (%gck-globals-written (gethash n fns) varset
                                                (make-hash-table :test 'equal)))
                 (when written
-                  (push (format nil "ORPHANED-INITIALISER ~A sets ~{~A~^, ~} — it is ~
+                  (let ((f (format nil "ORPHANED-INITIALISER ~A sets ~{~A~^, ~} — it is ~
 defined in this image but NOT reachable from its KERNEL-MAIN, so ~:[those ~
 variables keep~;that variable keeps~] the default.  Call it from kernel-main."
-                                n (sort written #'string<) (null (cdr written)))
-                        findings))))))
+                                   n (sort written #'string<) (null (cdr written)))))
+                    (if suppress-b (push f baselined) (push f findings))))))))
         (setf findings (nreverse findings))
         (setf baselined (nreverse baselined))
+        ;; Always leave a line in the build log, like check-parses does.  A
+        ;; check whose only output is silence cannot be distinguished from a
+        ;; check that never ran — which is how this class of bug hides.
+        (format t "~&;; check-global-inits (~A): ~D defuns, ~D reachable from ~
+KERNEL-MAIN, ~D globals, init-all-globals ~:[NOT called~;called~] at boot; ~
+~D finding~:P~@[ (+~D baselined)~]~%"
+                label (hash-table-count fns) (hash-table-count reach)
+                (length vars) inits-run-p (length findings)
+                (and baselined (length baselined)))
+        ;; A saturated call graph means check B is inert — say so rather than
+        ;; report a reassuring zero.  See *GLOBAL-CHECK-REGISTRY-PREFIXES*.
+        (when (and (> (hash-table-count fns) 200)
+                   (= (hash-table-count reach) (hash-table-count fns)))
+          (format t ";;   WARNING: call graph SATURATED (every defun reachable) — ~
+check B is inert here.~%;;   A name-registry function is probably being ~
+followed; add its prefix to *GLOBAL-CHECK-REGISTRY-PREFIXES*.~%"))
+        (finish-output)
         ;; Known-and-filed debt: always reported, never fatal.
         (when baselined
           (format t "~&~%;; check-global-inits (~A): ~D KNOWN finding~:P, ~

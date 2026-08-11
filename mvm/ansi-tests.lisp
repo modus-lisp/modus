@@ -2805,6 +2805,39 @@
   (setf *probe-sm-var*
         (list slot-name operation new-value (notnot new-value-p))))
 
+;;; #231 build-time DEFMETHOD key-metadata probe setup (probes 9300-9308,
+;;; in the smoke block).  These compile through compiler.lisp's DEFMETHOD
+;;; expansion — the BUILD-TIME arm — because ansi-tests.lisp is raw MVM
+;;; source: no .lsp rewriter, and *mvm-eval-runtime-p* is NIL.
+;;;
+;;; They live INSIDE a defun, not at top level, and that is load-bearing:
+;;; a top-level defclass/defmethod in first-party source compiles to a
+;;; TOPLEVEL-N thunk that never executes, so a top-level version registers
+;;; NOTHING at boot.  (Measured, not assumed: with the definitions at top
+;;; level, %FIND-CLOS-CLASS on the probe class returns NIL, %FIND-GF on
+;;; INITIALIZE-INSTANCE returns NIL, and MAKE-INSTANCE of the absent class
+;;; accepts every keyword — so all four "accepted" probes passed
+;;; VACUOUSLY, identically on the fixed and unfixed binaries.  That is the
+;;; shape of a probe measuring nothing.)
+;;;
+;;; Each class isolates one term of the CLHS 7.1.2 initarg union: a plain
+;;; &KEY name on initialize-instance, one on shared-initialize, an
+;;; &ALLOW-OTHER-KEYS method, and a class with a slot :initarg and NO
+;;; methods at all — the overreach control, since nothing another class's
+;;; methods declare may become valid for it.
+(defun %probe-231-setup ()
+  (defclass probe-ia-key () ((got :initform :none)))
+  (defmethod initialize-instance :after ((x probe-ia-key) &key ik1)
+    (setf (slot-value x 'got) ik1))
+  (defclass probe-ia-shared () ((got :initform :none)))
+  (defmethod shared-initialize :after ((x probe-ia-shared) sn &key sk1)
+    (progn sn (setf (slot-value x 'got) sk1)))
+  (defclass probe-ia-aok () ((got :initform :none)))
+  (defmethod initialize-instance :after ((x probe-ia-aok) &key aokk &allow-other-keys)
+    (setf (slot-value x 'got) aokk))
+  (defclass probe-ia-slot () ((s :initarg :s :initform :none)))
+  t)
+
 ;;; define-method-combination probes are registered INSIDE
 ;;; run-clos-diag-tests via the runtime EVAL path (IDs 9811-9820
 ;;; below).  Top-level defgeneric/defmethod/define-method-combination
@@ -4773,6 +4806,82 @@
   (rt-run-test 9168 (notnot (wild-pathname-p "a?b")) t)
   (rt-run-test 9169 (pathname-match-p "x" "*") t)
   ;; ==== end cl-fileio probes 9160-9169 ====
+
+  ;; ==== #231 probes 9300-9309: BUILD-TIME defmethod key metadata =========
+  ;; The classes and methods below are defined at TOP LEVEL in this file,
+  ;; which is raw MVM source (it bypasses the .lsp rewriter pipeline), so
+  ;; they compile through compiler.lisp's DEFMETHOD expansion — the arm
+  ;; that recorded NO key-acceptance metadata before #231.  Without that
+  ;; metadata %clos-init-gf-key-name-p sees "unknown lambda list" for
+  ;; every compiled method and the CLHS 7.1.2 union collapses to the slot
+  ;; :initarg names alone.
+  ;;
+  ;; Placed in the SMOKE block, not run-clos-diag-tests, whose body never
+  ;; executes on the tip (see the 9520-9539 note above).
+  ;;
+  ;; Read these in PAIRS.  Each "is accepted" probe is followed by an
+  ;; OVERREACH probe that must still be REJECTED: a validator that has
+  ;; been broken open to accept everything passes the first kind of probe
+  ;; and is a conformance REGRESSION, so the accept-side alone proves
+  ;; nothing.
+  ;; Register the probe classes/methods (see %probe-231-setup: top-level
+  ;; definitions in this file never execute).  9309 guards the setup itself
+  ;; — if it ever stops registering, every probe below goes vacuous.
+  (rt-run-test 9309
+    (handler-case (progn (%probe-231-setup)
+                         (if (%find-clos-class 'probe-ia-key) :registered :absent))
+      (t (c) (progn c :crashed)))
+    :registered)
+  ;; 9300: a &KEY parameter of an applicable INITIALIZE-INSTANCE method is
+  ;;       a valid initarg even though NO slot declares it (CLHS 7.1.2).
+  (rt-run-test 9300
+    (handler-case (progn (make-instance 'probe-ia-key :ik1 5) :accepted)
+      (t (c) (progn c :rejected)))
+    :accepted)
+  ;; 9301: OVERREACH — a name NO method and NO slot declares is still invalid.
+  (rt-run-test 9301
+    (handler-case (progn (make-instance 'probe-ia-key :ik-nope 5) :accepted)
+      (t (c) (progn c :rejected)))
+    :rejected)
+  ;; 9302: OVERREACH — the key is valid only for classes the method applies
+  ;;       to, never globally.
+  (rt-run-test 9302
+    (handler-case (progn (make-instance 'probe-ia-slot :ik1 5) :accepted)
+      (t (c) (progn c :rejected)))
+    :rejected)
+  ;; 9303/9304: same pair for SHARED-INITIALIZE.
+  (rt-run-test 9303
+    (handler-case (progn (make-instance 'probe-ia-shared :sk1 5) :accepted)
+      (t (c) (progn c :rejected)))
+    :accepted)
+  (rt-run-test 9304
+    (handler-case (progn (make-instance 'probe-ia-shared :sk-nope 5) :accepted)
+      (t (c) (progn c :rejected)))
+    :rejected)
+  ;; 9305: an applicable method with &ALLOW-OTHER-KEYS makes ANY keyword a
+  ;;       valid initarg for that class (the asdf plan-traversal shape).
+  (rt-run-test 9305
+    (handler-case (progn (make-instance 'probe-ia-aok :utterly-unknown 5) :accepted)
+      (t (c) (progn c :rejected)))
+    :accepted)
+  ;; 9306: OVERREACH — one class's &allow-other-keys method must not make
+  ;;       OTHER classes lenient.
+  (rt-run-test 9306
+    (handler-case (progn (make-instance 'probe-ia-slot :utterly-unknown 5) :accepted)
+      (t (c) (progn c :rejected)))
+    :rejected)
+  ;; 9307: the slot-:initarg term still works (baseline guard).
+  (rt-run-test 9307
+    (handler-case (progn (make-instance 'probe-ia-slot :s 5) :accepted)
+      (t (c) (progn c :rejected)))
+    :accepted)
+  ;; 9308: the metadata table for INITIALIZE-INSTANCE is non-empty — the
+  ;;       mechanism itself, independent of any validator.
+  (rt-run-test 9308
+    (let ((gf (%find-gf 'initialize-instance)))
+      (if (and gf (%gf-method-meta gf)) t nil))
+    t)
+  ;; ==== end #231 probes 9300-9309 ====
 
   ;; ==== diag: binary file-stream element-type + read-sequence (8880-8889) ==
   ;; 8880: stream-element-type reports the byte type OPEN was given.

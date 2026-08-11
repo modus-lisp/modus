@@ -114,7 +114,12 @@
       initialisers that exist for exactly this case, %INIT-BOOLE-CONSTANTS and
       %INIT-STANDARD-CHARS, are not called either, so BOOLE-AND and friends are
       NIL too (check B).  One root cause, one fix.  Exactly the #242 shape:
-      correct source, one build script that does not call the initialiser.")
+      correct source, one build script that does not call the initialiser.
+      VERIFIED ON THE BINARY, not inferred: under qemu-aarch64-static the
+      shipping /home/claude/modus-aa64-cli signals UNBOUND-VARIABLE for
+      BOOLE-AND, INTERNAL-TIME-UNITS-PER-SECOND, DOUBLE-FLOAT-EPSILON,
+      MOST-POSITIVE-DOUBLE-FLOAT and *RANDOM-STATE*, where the x64 CLI built
+      from the same sources returns 6 / 1000 / 2.22d-16 / ... correctly.")
     ("build-compiler-test" :suppress-check-a
      "#243 FINDING 2 (unfixed, filed): the compiler smoke image bakes
       compiler.lisp but its KERNEL-MAIN never calls (INIT-ALL-GLOBALS), so

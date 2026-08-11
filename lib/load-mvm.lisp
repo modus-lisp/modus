@@ -64,4 +64,11 @@
 ;; Cross-compilation pipeline
 (mvm-load "mvm/cross.lisp")
 
+;; HOST-ONLY build-time sanity checks (never baked into an image).  Installs
+;; an encapsulation around BUILD-IMAGE that audits the assembled blob for
+;; globals whose initialisation never runs in that particular image —
+;; CLAUDE.md Active Limitation #7.  Must load AFTER cross.lisp, which defines
+;; BUILD-IMAGE.  See mvm/build-checks.lisp.
+(mvm-load "mvm/build-checks.lisp")
+
 )  ; end with-compilation-unit

@@ -136035,7 +136035,8 @@ NIL
 (DEF-CPL-TEST #'CPL-EXAMPLE-GF
               (STANDARD-GENERIC-FUNCTION GENERIC-FUNCTION FUNCTION T))
 (DEF-CPL-TEST
- (%DEFMETHOD 'CPL-EXAMPLE-GF 'NIL (LIST 'T 'T) (LAMBDA (X Y) (LIST Y X)))
+ (%DEFMETHOD-META 'CPL-EXAMPLE-GF 'NIL (LIST 'T 'T) (LAMBDA (X Y) (LIST Y X))
+  '(X Y))
  (STANDARD-METHOD METHOD STANDARD-OBJECT T))
 (DEF-CPL-TEST
  (MAKE-ARRAY '(10) :ELEMENT-TYPE 'CHARACTER :INITIAL-ELEMENT #\a :FILL-POINTER
@@ -145283,11 +145284,12 @@ NIL
                                                       (T (C) NIL))
                                                      (%DG-GF-CALLABLE
                                                       'DISASSEMBLE-EXAMPLE-FN3))
-                                                    (%DEFMETHOD
+                                                    (%DEFMETHOD-META
                                                      'DISASSEMBLE-EXAMPLE-FN3
                                                      'NIL (LIST 'T 'T 'T)
                                                      (LAMBDA (X Y Z)
-                                                       (LIST X Y Z)))
+                                                       (LIST X Y Z))
+                                                     '(X Y Z))
                                                     (DISASSEMBLE-IT
                                                      'DISASSEMBLE-EXAMPLE-FN3)))) '(T
                                                                                     NIL)) (t (c) (%test-crash-fail-c 25999 c)))
@@ -146863,8 +146865,8 @@ NIL
                               (T (C) NIL))
                              (%DG-GF-CALLABLE 'GENERIC-FUNCTION-TO-TRACE))
                             (TRACE GENERIC-FUNCTION-TO-TRACE)
-                            (%DEFMETHOD 'GENERIC-FUNCTION-TO-TRACE 'NIL
-                             (LIST 'T 'T) (LAMBDA (X Y) NIL))
+                            (%DEFMETHOD-META 'GENERIC-FUNCTION-TO-TRACE 'NIL
+                             (LIST 'T 'T) (LAMBDA (X Y) NIL) '(X Y))
                             (PROG1 (TRACE) (UNTRACE)))) '(GENERIC-FUNCTION-TO-TRACE)) (t (c) (%test-crash-fail-c 26128 c)))
   (handler-case (run-test 26129 (lambda () (PROGN
                             (UNTRACE)
@@ -146882,8 +146884,8 @@ NIL
                               (T (C) NIL))
                              (%DG-GF-CALLABLE 'GENERIC-FUNCTION-TO-TRACE))
                             (TRACE GENERIC-FUNCTION-TO-TRACE)
-                            (%DEFMETHOD 'GENERIC-FUNCTION-TO-TRACE 'NIL
-                             (LIST 'T 'T) (LAMBDA (X Y) NIL))
+                            (%DEFMETHOD-META 'GENERIC-FUNCTION-TO-TRACE 'NIL
+                             (LIST 'T 'T) (LAMBDA (X Y) NIL) '(X Y))
                             (ASSERT
                              (NOT
                               (EQUAL
@@ -146917,11 +146919,13 @@ NIL
                                      (%DG-GF-CALLABLE
                                       'GENERIC-FUNCTION-TO-TRACE2)))
                                    (M
-                                    (%DEFMETHOD 'GENERIC-FUNCTION-TO-TRACE2
-                                     'NIL (LIST 'INTEGER 'INTEGER)
-                                     (LAMBDA (X Y) :FOO))))
-                              (%DEFMETHOD 'GENERIC-FUNCTION-TO-TRACE2 'NIL
-                               (LIST 'SYMBOL 'SYMBOL) (LAMBDA (X Y) :BAR))
+                                    (%DEFMETHOD-META
+                                     'GENERIC-FUNCTION-TO-TRACE2 'NIL
+                                     (LIST 'INTEGER 'INTEGER)
+                                     (LAMBDA (X Y) :FOO) '(X Y))))
+                              (%DEFMETHOD-META 'GENERIC-FUNCTION-TO-TRACE2 'NIL
+                               (LIST 'SYMBOL 'SYMBOL) (LAMBDA (X Y) :BAR)
+                               '(X Y))
                               (ASSERT
                                (EQL (GENERIC-FUNCTION-TO-TRACE2 1 2) :FOO))
                               (ASSERT
@@ -157253,12 +157257,13 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'CHANGE-CLASS-CLASS-05 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'CHANGE-CLASS-CLASS-05 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'CHANGE-CLASS-CLASS-05 NIL) (t (c) nil))
-  (handler-case (%DEFMETHOD 'CHANGE-CLASS 'NIL
+  (handler-case (%DEFMETHOD-META 'CHANGE-CLASS 'NIL
  (LIST 'CHANGE-CLASS-CLASS-05 (LIST 'EQL (FIND-CLASS 'CHANGE-CLASS-CLASS-05)))
  (LAMBDA (OBJ NEW-CLASS &REST INITARGS &KEY &ALLOW-OTHER-KEYS)
    (DECLARE (IGNORE INITARGS NEW-CLASS))
    (SETQ *CHANGED-CLASS-ON-CLASS-05* T)
-   OBJ)) (t (c) nil))
+   OBJ)
+ '(OBJ NEW-CLASS &REST INITARGS &KEY &ALLOW-OTHER-KEYS)) (t (c) nil))
   (handler-case (%DEFCLASS 'CHANGE-CLASS-CLASS-06 '(A B C) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'CHANGE-CLASS-CLASS-06
  (LIST (CONS ':C 'C) (CONS ':B 'B) (CONS ':A 'A)) (LIST)) (t (c) nil))
@@ -157266,11 +157271,13 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'CHANGE-CLASS-CLASS-06 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'CHANGE-CLASS-CLASS-06 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'CHANGE-CLASS-CLASS-06 NIL) (t (c) nil))
-  (handler-case (%DEFMETHOD 'CHANGE-CLASS 'NIL (LIST 'CHANGE-CLASS-CLASS-06 'STANDARD-CLASS)
+  (handler-case (%DEFMETHOD-META 'CHANGE-CLASS 'NIL
+ (LIST 'CHANGE-CLASS-CLASS-06 'STANDARD-CLASS)
  (LAMBDA (OBJ NEW-CLASS &REST INITARGS &KEY &ALLOW-OTHER-KEYS)
    (DECLARE (IGNORE INITARGS))
    (SET-SLOT-VALUE OBJ 'A 123)
-   (CALL-NEXT-METHOD))) (t (c) nil))
+   (CALL-NEXT-METHOD))
+ '(OBJ NEW-CLASS &REST INITARGS &KEY &ALLOW-OTHER-KEYS)) (t (c) nil))
   (handler-case (%DEFCLASS 'CHANGE-CLASS-CLASS-07 '(A B C) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'CHANGE-CLASS-CLASS-07
  (LIST (CONS ':C 'C) (CONS ':B 'B) (CONS ':A 'A))
@@ -157287,12 +157294,13 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'CHANGE-CLASS-CLASS-07B 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'CHANGE-CLASS-CLASS-07B (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'CHANGE-CLASS-CLASS-07B NIL) (t (c) nil))
-  (handler-case (%DEFMETHOD 'CHANGE-CLASS ':BEFORE
+  (handler-case (%DEFMETHOD-META 'CHANGE-CLASS ':BEFORE
  (LIST 'CHANGE-CLASS-CLASS-07 'STANDARD-CLASS)
  (LAMBDA (OBJ NEW-CLASS &REST INITARGS &KEY &ALLOW-OTHER-KEYS)
    (DECLARE (IGNORE INITARGS))
    (SET-SLOT-VALUE OBJ 'A 'Z)
-   OBJ)) (t (c) nil))
+   OBJ)
+ '(OBJ NEW-CLASS &REST INITARGS &KEY &ALLOW-OTHER-KEYS)) (t (c) nil))
   (handler-case (%DEFCLASS 'CHANGE-CLASS-CLASS-08 '(A B) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'CHANGE-CLASS-CLASS-08
  (LIST (CONS ':B 'B) (CONS ':A 'A)) (LIST)) (t (c) nil))
@@ -157300,12 +157308,13 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'CHANGE-CLASS-CLASS-08 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'CHANGE-CLASS-CLASS-08 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'CHANGE-CLASS-CLASS-08 NIL) (t (c) nil))
-  (handler-case (%DEFMETHOD 'CHANGE-CLASS ':AFTER
+  (handler-case (%DEFMETHOD-META 'CHANGE-CLASS ':AFTER
  (LIST 'CHANGE-CLASS-CLASS-08 (LIST 'EQL (FIND-CLASS 'CHANGE-CLASS-CLASS-08)))
  (LAMBDA (OBJ CLASS &REST INITARGS &KEY &ALLOW-OTHER-KEYS)
    (DECLARE (IGNORE INITARGS))
    (SET-SLOT-VALUE OBJ 'A 'Z)
-   OBJ)) (t (c) nil))
+   OBJ)
+ '(OBJ CLASS &REST INITARGS &KEY &ALLOW-OTHER-KEYS)) (t (c) nil))
 )
 (defun run-ansi-change-class-chunk-1 ()
   (handler-case (run-test-mv 26846 (lambda () (multiple-value-list (LET ((OBJ
@@ -158844,12 +158853,13 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'CHANGE-CLASS-CLASS-05 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'CHANGE-CLASS-CLASS-05 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'CHANGE-CLASS-CLASS-05 NIL) (t (c) nil))
-  (handler-case (%DEFMETHOD 'CHANGE-CLASS 'NIL
+  (handler-case (%DEFMETHOD-META 'CHANGE-CLASS 'NIL
  (LIST 'CHANGE-CLASS-CLASS-05 (LIST 'EQL (FIND-CLASS 'CHANGE-CLASS-CLASS-05)))
  (LAMBDA (OBJ NEW-CLASS &REST INITARGS &KEY &ALLOW-OTHER-KEYS)
    (DECLARE (IGNORE INITARGS NEW-CLASS))
    (SETQ *CHANGED-CLASS-ON-CLASS-05* T)
-   OBJ)) (t (c) nil))
+   OBJ)
+ '(OBJ NEW-CLASS &REST INITARGS &KEY &ALLOW-OTHER-KEYS)) (t (c) nil))
   (handler-case (%DEFCLASS 'CHANGE-CLASS-CLASS-06 '(A B C) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'CHANGE-CLASS-CLASS-06
  (LIST (CONS ':C 'C) (CONS ':B 'B) (CONS ':A 'A)) (LIST)) (t (c) nil))
@@ -158857,11 +158867,13 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'CHANGE-CLASS-CLASS-06 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'CHANGE-CLASS-CLASS-06 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'CHANGE-CLASS-CLASS-06 NIL) (t (c) nil))
-  (handler-case (%DEFMETHOD 'CHANGE-CLASS 'NIL (LIST 'CHANGE-CLASS-CLASS-06 'STANDARD-CLASS)
+  (handler-case (%DEFMETHOD-META 'CHANGE-CLASS 'NIL
+ (LIST 'CHANGE-CLASS-CLASS-06 'STANDARD-CLASS)
  (LAMBDA (OBJ NEW-CLASS &REST INITARGS &KEY &ALLOW-OTHER-KEYS)
    (DECLARE (IGNORE INITARGS))
    (SET-SLOT-VALUE OBJ 'A 123)
-   (CALL-NEXT-METHOD))) (t (c) nil))
+   (CALL-NEXT-METHOD))
+ '(OBJ NEW-CLASS &REST INITARGS &KEY &ALLOW-OTHER-KEYS)) (t (c) nil))
   (handler-case (%DEFCLASS 'CHANGE-CLASS-CLASS-07 '(A B C) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'CHANGE-CLASS-CLASS-07
  (LIST (CONS ':C 'C) (CONS ':B 'B) (CONS ':A 'A))
@@ -158878,12 +158890,13 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'CHANGE-CLASS-CLASS-07B 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'CHANGE-CLASS-CLASS-07B (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'CHANGE-CLASS-CLASS-07B NIL) (t (c) nil))
-  (handler-case (%DEFMETHOD 'CHANGE-CLASS ':BEFORE
+  (handler-case (%DEFMETHOD-META 'CHANGE-CLASS ':BEFORE
  (LIST 'CHANGE-CLASS-CLASS-07 'STANDARD-CLASS)
  (LAMBDA (OBJ NEW-CLASS &REST INITARGS &KEY &ALLOW-OTHER-KEYS)
    (DECLARE (IGNORE INITARGS))
    (SET-SLOT-VALUE OBJ 'A 'Z)
-   OBJ)) (t (c) nil))
+   OBJ)
+ '(OBJ NEW-CLASS &REST INITARGS &KEY &ALLOW-OTHER-KEYS)) (t (c) nil))
   (handler-case (%DEFCLASS 'CHANGE-CLASS-CLASS-08 '(A B) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'CHANGE-CLASS-CLASS-08
  (LIST (CONS ':B 'B) (CONS ':A 'A)) (LIST)) (t (c) nil))
@@ -158891,12 +158904,13 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'CHANGE-CLASS-CLASS-08 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'CHANGE-CLASS-CLASS-08 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'CHANGE-CLASS-CLASS-08 NIL) (t (c) nil))
-  (handler-case (%DEFMETHOD 'CHANGE-CLASS ':AFTER
+  (handler-case (%DEFMETHOD-META 'CHANGE-CLASS ':AFTER
  (LIST 'CHANGE-CLASS-CLASS-08 (LIST 'EQL (FIND-CLASS 'CHANGE-CLASS-CLASS-08)))
  (LAMBDA (OBJ CLASS &REST INITARGS &KEY &ALLOW-OTHER-KEYS)
    (DECLARE (IGNORE INITARGS))
    (SET-SLOT-VALUE OBJ 'A 'Z)
-   OBJ)) (t (c) nil))
+   OBJ)
+ '(OBJ CLASS &REST INITARGS &KEY &ALLOW-OTHER-KEYS)) (t (c) nil))
   (%try-chunk "change-class" 12719466 1 #'run-ansi-change-class-chunk-1)
   (%try-chunk "change-class" 12719466 2 #'run-ansi-change-class-chunk-2)
   (%try-chunk "change-class" 12719466 3 #'run-ansi-change-class-chunk-3)
@@ -158915,7 +158929,8 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'CLASS-NAME-CLASS-01 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'CLASS-NAME-CLASS-01 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'CLASS-NAME-CLASS-01 NIL) (t (c) nil))
-  (handler-case (%DEFMETHOD 'CLASS-NAME 'NIL (LIST 'CLASS-NAME-CLASS-01) (LAMBDA (X) 'SILLY)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'CLASS-NAME 'NIL (LIST 'CLASS-NAME-CLASS-01)
+ (LAMBDA (X) 'SILLY) '(X)) (t (c) nil))
 )
 (defun run-ansi-class-name-chunk-1 ()
   (handler-case (run-test 26886 (lambda () (CLASS-NAME (FIND-CLASS 'SYMBOL))) 'SYMBOL) (t (c) (%test-crash-fail-c 26886 c)))
@@ -158974,7 +158989,8 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'CLASS-NAME-CLASS-01 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'CLASS-NAME-CLASS-01 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'CLASS-NAME-CLASS-01 NIL) (t (c) nil))
-  (handler-case (%DEFMETHOD 'CLASS-NAME 'NIL (LIST 'CLASS-NAME-CLASS-01) (LAMBDA (X) 'SILLY)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'CLASS-NAME 'NIL (LIST 'CLASS-NAME-CLASS-01)
+ (LAMBDA (X) 'SILLY) '(X)) (t (c) nil))
   (%try-chunk "class-name" 12938379 1 #'run-ansi-class-name-chunk-1)
 )
 
@@ -159000,49 +159016,50 @@ NIL
 (in-package :modus.mvm)
 (DEFUN CAM-GF-01 (&REST %GF-ARGS) (%GF-DISPATCH 'CAM-GF-01 %GF-ARGS))
 (DEFPARAMETER *CAM-GF-01-METHOD1*
-  (%DEFMETHOD 'CAM-GF-01 'NIL (LIST 'INTEGER 'INTEGER) (LAMBDA (X Y) 1)))
+  (%DEFMETHOD-META 'CAM-GF-01 'NIL (LIST 'INTEGER 'INTEGER) (LAMBDA (X Y) 1)
+   '(X Y)))
 (DEFPARAMETER *CAM-GF-01-METHOD2*
-  (%DEFMETHOD 'CAM-GF-01 'NIL (LIST 'INTEGER 'T) (LAMBDA (X Y) 2)))
+  (%DEFMETHOD-META 'CAM-GF-01 'NIL (LIST 'INTEGER 'T) (LAMBDA (X Y) 2) '(X Y)))
 (DEFPARAMETER *CAM-GF-01-METHOD3*
-  (%DEFMETHOD 'CAM-GF-01 'NIL (LIST 'T 'INTEGER) (LAMBDA (X Y) 3)))
+  (%DEFMETHOD-META 'CAM-GF-01 'NIL (LIST 'T 'INTEGER) (LAMBDA (X Y) 3) '(X Y)))
 (DEFPARAMETER *CAM-GF-01-METHOD4*
-  (%DEFMETHOD 'CAM-GF-01 'NIL (LIST 'T 'T) (LAMBDA (X Y) 4)))
+  (%DEFMETHOD-META 'CAM-GF-01 'NIL (LIST 'T 'T) (LAMBDA (X Y) 4) '(X Y)))
 (DEFUN CAM-GF-02 (&REST %GF-ARGS) (%GF-DISPATCH 'CAM-GF-02 %GF-ARGS))
 (DEFUN CAM-GF-03 (&REST %GF-ARGS) (%GF-DISPATCH 'CAM-GF-03 %GF-ARGS))
 (DEFPARAMETER *CAM-GF-03-METHOD1*
-  (%DEFMETHOD 'CAM-GF-03 '+ (LIST 'INTEGER) (LAMBDA (X) 1)))
+  (%DEFMETHOD-META 'CAM-GF-03 '+ (LIST 'INTEGER) (LAMBDA (X) 1) '(X)))
 (DEFPARAMETER *CAM-GF-03-METHOD2*
-  (%DEFMETHOD 'CAM-GF-03 '+ (LIST 'RATIONAL) (LAMBDA (X) 2)))
+  (%DEFMETHOD-META 'CAM-GF-03 '+ (LIST 'RATIONAL) (LAMBDA (X) 2) '(X)))
 (DEFPARAMETER *CAM-GF-03-METHOD3*
-  (%DEFMETHOD 'CAM-GF-03 '+ (LIST 'REAL) (LAMBDA (X) 4)))
+  (%DEFMETHOD-META 'CAM-GF-03 '+ (LIST 'REAL) (LAMBDA (X) 4) '(X)))
 (DEFPARAMETER *CAM-GF-03-METHOD4*
-  (%DEFMETHOD 'CAM-GF-03 '+ (LIST 'NUMBER) (LAMBDA (X) 8)))
+  (%DEFMETHOD-META 'CAM-GF-03 '+ (LIST 'NUMBER) (LAMBDA (X) 8) '(X)))
 (DEFPARAMETER *CAM-GF-03-METHOD5*
-  (%DEFMETHOD 'CAM-GF-03 '+ (LIST 'T) (LAMBDA (X) 16)))
+  (%DEFMETHOD-META 'CAM-GF-03 '+ (LIST 'T) (LAMBDA (X) 16) '(X)))
 (DEFUN CAM-GF-04 (&REST %GF-ARGS) (%GF-DISPATCH 'CAM-GF-04 %GF-ARGS))
 (DEFPARAMETER *CAM-GF-04-METHOD1*
-  (%DEFMETHOD 'CAM-GF-04 '+ (LIST 'INTEGER) (LAMBDA (X) 1)))
+  (%DEFMETHOD-META 'CAM-GF-04 '+ (LIST 'INTEGER) (LAMBDA (X) 1) '(X)))
 (DEFPARAMETER *CAM-GF-04-METHOD2*
-  (%DEFMETHOD 'CAM-GF-04 '+ (LIST 'RATIONAL) (LAMBDA (X) 2)))
+  (%DEFMETHOD-META 'CAM-GF-04 '+ (LIST 'RATIONAL) (LAMBDA (X) 2) '(X)))
 (DEFPARAMETER *CAM-GF-04-METHOD3*
-  (%DEFMETHOD 'CAM-GF-04 '+ (LIST 'REAL) (LAMBDA (X) 4)))
+  (%DEFMETHOD-META 'CAM-GF-04 '+ (LIST 'REAL) (LAMBDA (X) 4) '(X)))
 (DEFPARAMETER *CAM-GF-04-METHOD4*
-  (%DEFMETHOD 'CAM-GF-04 '+ (LIST 'NUMBER) (LAMBDA (X) 8)))
+  (%DEFMETHOD-META 'CAM-GF-04 '+ (LIST 'NUMBER) (LAMBDA (X) 8) '(X)))
 (DEFPARAMETER *CAM-GF-04-METHOD5*
-  (%DEFMETHOD 'CAM-GF-04 '+ (LIST 'T) (LAMBDA (X) 16)))
+  (%DEFMETHOD-META 'CAM-GF-04 '+ (LIST 'T) (LAMBDA (X) 16) '(X)))
 (defun run-init-compute-applicable-methods ()
   (handler-case (%VALIDATE-DEFGENERIC-OPTIONS 'CAM-GF-01 '(X Y) 'NIL) (t (c) nil))
   (handler-case (%DEFGENERIC 'CAM-GF-01 '(X Y) 'NIL) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'CAM-GF-01 'CAM-GF-01) (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'CAM-GF-01) (t (c) nil))
-  (handler-case (setq *CAM-GF-01-METHOD1* (%DEFMETHOD 'CAM-GF-01 'NIL (LIST 'INTEGER 'INTEGER)
-                           (LAMBDA (X Y) 1))) (t (c) nil))
-  (handler-case (setq *CAM-GF-01-METHOD2* (%DEFMETHOD 'CAM-GF-01 'NIL (LIST 'INTEGER 'T)
-                           (LAMBDA (X Y) 2))) (t (c) nil))
-  (handler-case (setq *CAM-GF-01-METHOD3* (%DEFMETHOD 'CAM-GF-01 'NIL (LIST 'T 'INTEGER)
-                           (LAMBDA (X Y) 3))) (t (c) nil))
-  (handler-case (setq *CAM-GF-01-METHOD4* (%DEFMETHOD 'CAM-GF-01 'NIL (LIST 'T 'T)
-                           (LAMBDA (X Y) 4))) (t (c) nil))
+  (handler-case (setq *CAM-GF-01-METHOD1* (%DEFMETHOD-META 'CAM-GF-01 'NIL
+                           (LIST 'INTEGER 'INTEGER) (LAMBDA (X Y) 1) '(X Y))) (t (c) nil))
+  (handler-case (setq *CAM-GF-01-METHOD2* (%DEFMETHOD-META 'CAM-GF-01 'NIL (LIST 'INTEGER 'T)
+                           (LAMBDA (X Y) 2) '(X Y))) (t (c) nil))
+  (handler-case (setq *CAM-GF-01-METHOD3* (%DEFMETHOD-META 'CAM-GF-01 'NIL (LIST 'T 'INTEGER)
+                           (LAMBDA (X Y) 3) '(X Y))) (t (c) nil))
+  (handler-case (setq *CAM-GF-01-METHOD4* (%DEFMETHOD-META 'CAM-GF-01 'NIL (LIST 'T 'T)
+                           (LAMBDA (X Y) 4) '(X Y))) (t (c) nil))
   (handler-case (%VALIDATE-DEFGENERIC-OPTIONS 'CAM-GF-02 '(X) 'NIL) (t (c) nil))
   (handler-case (%DEFGENERIC 'CAM-GF-02 '(X) 'NIL) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'CAM-GF-02 'CAM-GF-02) (T (C) NIL)) (t (c) nil))
@@ -159052,27 +159069,31 @@ NIL
   (handler-case (%DEFGENERIC 'CAM-GF-03 '(X) '(+ :MOST-SPECIFIC-FIRST)) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'CAM-GF-03 'CAM-GF-03) (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'CAM-GF-03) (t (c) nil))
-  (handler-case (setq *CAM-GF-03-METHOD1* (%DEFMETHOD 'CAM-GF-03 '+ (LIST 'INTEGER)
-                           (LAMBDA (X) 1))) (t (c) nil))
-  (handler-case (setq *CAM-GF-03-METHOD2* (%DEFMETHOD 'CAM-GF-03 '+ (LIST 'RATIONAL)
-                           (LAMBDA (X) 2))) (t (c) nil))
-  (handler-case (setq *CAM-GF-03-METHOD3* (%DEFMETHOD 'CAM-GF-03 '+ (LIST 'REAL) (LAMBDA (X) 4))) (t (c) nil))
-  (handler-case (setq *CAM-GF-03-METHOD4* (%DEFMETHOD 'CAM-GF-03 '+ (LIST 'NUMBER)
-                           (LAMBDA (X) 8))) (t (c) nil))
-  (handler-case (setq *CAM-GF-03-METHOD5* (%DEFMETHOD 'CAM-GF-03 '+ (LIST 'T) (LAMBDA (X) 16))) (t (c) nil))
+  (handler-case (setq *CAM-GF-03-METHOD1* (%DEFMETHOD-META 'CAM-GF-03 '+ (LIST 'INTEGER)
+                           (LAMBDA (X) 1) '(X))) (t (c) nil))
+  (handler-case (setq *CAM-GF-03-METHOD2* (%DEFMETHOD-META 'CAM-GF-03 '+ (LIST 'RATIONAL)
+                           (LAMBDA (X) 2) '(X))) (t (c) nil))
+  (handler-case (setq *CAM-GF-03-METHOD3* (%DEFMETHOD-META 'CAM-GF-03 '+ (LIST 'REAL)
+                           (LAMBDA (X) 4) '(X))) (t (c) nil))
+  (handler-case (setq *CAM-GF-03-METHOD4* (%DEFMETHOD-META 'CAM-GF-03 '+ (LIST 'NUMBER)
+                           (LAMBDA (X) 8) '(X))) (t (c) nil))
+  (handler-case (setq *CAM-GF-03-METHOD5* (%DEFMETHOD-META 'CAM-GF-03 '+ (LIST 'T)
+                           (LAMBDA (X) 16) '(X))) (t (c) nil))
   (handler-case (%VALIDATE-DEFGENERIC-OPTIONS 'CAM-GF-04 '(X)
  '((:METHOD-COMBINATION + :MOST-SPECIFIC-LAST))) (t (c) nil))
   (handler-case (%DEFGENERIC 'CAM-GF-04 '(X) '(+ . :MOST-SPECIFIC-LAST)) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'CAM-GF-04 'CAM-GF-04) (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'CAM-GF-04) (t (c) nil))
-  (handler-case (setq *CAM-GF-04-METHOD1* (%DEFMETHOD 'CAM-GF-04 '+ (LIST 'INTEGER)
-                           (LAMBDA (X) 1))) (t (c) nil))
-  (handler-case (setq *CAM-GF-04-METHOD2* (%DEFMETHOD 'CAM-GF-04 '+ (LIST 'RATIONAL)
-                           (LAMBDA (X) 2))) (t (c) nil))
-  (handler-case (setq *CAM-GF-04-METHOD3* (%DEFMETHOD 'CAM-GF-04 '+ (LIST 'REAL) (LAMBDA (X) 4))) (t (c) nil))
-  (handler-case (setq *CAM-GF-04-METHOD4* (%DEFMETHOD 'CAM-GF-04 '+ (LIST 'NUMBER)
-                           (LAMBDA (X) 8))) (t (c) nil))
-  (handler-case (setq *CAM-GF-04-METHOD5* (%DEFMETHOD 'CAM-GF-04 '+ (LIST 'T) (LAMBDA (X) 16))) (t (c) nil))
+  (handler-case (setq *CAM-GF-04-METHOD1* (%DEFMETHOD-META 'CAM-GF-04 '+ (LIST 'INTEGER)
+                           (LAMBDA (X) 1) '(X))) (t (c) nil))
+  (handler-case (setq *CAM-GF-04-METHOD2* (%DEFMETHOD-META 'CAM-GF-04 '+ (LIST 'RATIONAL)
+                           (LAMBDA (X) 2) '(X))) (t (c) nil))
+  (handler-case (setq *CAM-GF-04-METHOD3* (%DEFMETHOD-META 'CAM-GF-04 '+ (LIST 'REAL)
+                           (LAMBDA (X) 4) '(X))) (t (c) nil))
+  (handler-case (setq *CAM-GF-04-METHOD4* (%DEFMETHOD-META 'CAM-GF-04 '+ (LIST 'NUMBER)
+                           (LAMBDA (X) 8) '(X))) (t (c) nil))
+  (handler-case (setq *CAM-GF-04-METHOD5* (%DEFMETHOD-META 'CAM-GF-04 '+ (LIST 'T)
+                           (LAMBDA (X) 16) '(X))) (t (c) nil))
 )
 (defun run-ansi-compute-applicable-methods-chunk-1 ()
   (handler-case (run-test 26894 (lambda () (LET ((METHODS
@@ -159128,14 +159149,14 @@ NIL
   (handler-case (%DEFGENERIC 'CAM-GF-01 '(X Y) 'NIL) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'CAM-GF-01 'CAM-GF-01) (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'CAM-GF-01) (t (c) nil))
-  (handler-case (setq *CAM-GF-01-METHOD1* (%DEFMETHOD 'CAM-GF-01 'NIL (LIST 'INTEGER 'INTEGER)
-                           (LAMBDA (X Y) 1))) (t (c) nil))
-  (handler-case (setq *CAM-GF-01-METHOD2* (%DEFMETHOD 'CAM-GF-01 'NIL (LIST 'INTEGER 'T)
-                           (LAMBDA (X Y) 2))) (t (c) nil))
-  (handler-case (setq *CAM-GF-01-METHOD3* (%DEFMETHOD 'CAM-GF-01 'NIL (LIST 'T 'INTEGER)
-                           (LAMBDA (X Y) 3))) (t (c) nil))
-  (handler-case (setq *CAM-GF-01-METHOD4* (%DEFMETHOD 'CAM-GF-01 'NIL (LIST 'T 'T)
-                           (LAMBDA (X Y) 4))) (t (c) nil))
+  (handler-case (setq *CAM-GF-01-METHOD1* (%DEFMETHOD-META 'CAM-GF-01 'NIL
+                           (LIST 'INTEGER 'INTEGER) (LAMBDA (X Y) 1) '(X Y))) (t (c) nil))
+  (handler-case (setq *CAM-GF-01-METHOD2* (%DEFMETHOD-META 'CAM-GF-01 'NIL (LIST 'INTEGER 'T)
+                           (LAMBDA (X Y) 2) '(X Y))) (t (c) nil))
+  (handler-case (setq *CAM-GF-01-METHOD3* (%DEFMETHOD-META 'CAM-GF-01 'NIL (LIST 'T 'INTEGER)
+                           (LAMBDA (X Y) 3) '(X Y))) (t (c) nil))
+  (handler-case (setq *CAM-GF-01-METHOD4* (%DEFMETHOD-META 'CAM-GF-01 'NIL (LIST 'T 'T)
+                           (LAMBDA (X Y) 4) '(X Y))) (t (c) nil))
   (handler-case (%VALIDATE-DEFGENERIC-OPTIONS 'CAM-GF-02 '(X) 'NIL) (t (c) nil))
   (handler-case (%DEFGENERIC 'CAM-GF-02 '(X) 'NIL) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'CAM-GF-02 'CAM-GF-02) (T (C) NIL)) (t (c) nil))
@@ -159145,27 +159166,31 @@ NIL
   (handler-case (%DEFGENERIC 'CAM-GF-03 '(X) '(+ :MOST-SPECIFIC-FIRST)) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'CAM-GF-03 'CAM-GF-03) (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'CAM-GF-03) (t (c) nil))
-  (handler-case (setq *CAM-GF-03-METHOD1* (%DEFMETHOD 'CAM-GF-03 '+ (LIST 'INTEGER)
-                           (LAMBDA (X) 1))) (t (c) nil))
-  (handler-case (setq *CAM-GF-03-METHOD2* (%DEFMETHOD 'CAM-GF-03 '+ (LIST 'RATIONAL)
-                           (LAMBDA (X) 2))) (t (c) nil))
-  (handler-case (setq *CAM-GF-03-METHOD3* (%DEFMETHOD 'CAM-GF-03 '+ (LIST 'REAL) (LAMBDA (X) 4))) (t (c) nil))
-  (handler-case (setq *CAM-GF-03-METHOD4* (%DEFMETHOD 'CAM-GF-03 '+ (LIST 'NUMBER)
-                           (LAMBDA (X) 8))) (t (c) nil))
-  (handler-case (setq *CAM-GF-03-METHOD5* (%DEFMETHOD 'CAM-GF-03 '+ (LIST 'T) (LAMBDA (X) 16))) (t (c) nil))
+  (handler-case (setq *CAM-GF-03-METHOD1* (%DEFMETHOD-META 'CAM-GF-03 '+ (LIST 'INTEGER)
+                           (LAMBDA (X) 1) '(X))) (t (c) nil))
+  (handler-case (setq *CAM-GF-03-METHOD2* (%DEFMETHOD-META 'CAM-GF-03 '+ (LIST 'RATIONAL)
+                           (LAMBDA (X) 2) '(X))) (t (c) nil))
+  (handler-case (setq *CAM-GF-03-METHOD3* (%DEFMETHOD-META 'CAM-GF-03 '+ (LIST 'REAL)
+                           (LAMBDA (X) 4) '(X))) (t (c) nil))
+  (handler-case (setq *CAM-GF-03-METHOD4* (%DEFMETHOD-META 'CAM-GF-03 '+ (LIST 'NUMBER)
+                           (LAMBDA (X) 8) '(X))) (t (c) nil))
+  (handler-case (setq *CAM-GF-03-METHOD5* (%DEFMETHOD-META 'CAM-GF-03 '+ (LIST 'T)
+                           (LAMBDA (X) 16) '(X))) (t (c) nil))
   (handler-case (%VALIDATE-DEFGENERIC-OPTIONS 'CAM-GF-04 '(X)
  '((:METHOD-COMBINATION + :MOST-SPECIFIC-LAST))) (t (c) nil))
   (handler-case (%DEFGENERIC 'CAM-GF-04 '(X) '(+ . :MOST-SPECIFIC-LAST)) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'CAM-GF-04 'CAM-GF-04) (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'CAM-GF-04) (t (c) nil))
-  (handler-case (setq *CAM-GF-04-METHOD1* (%DEFMETHOD 'CAM-GF-04 '+ (LIST 'INTEGER)
-                           (LAMBDA (X) 1))) (t (c) nil))
-  (handler-case (setq *CAM-GF-04-METHOD2* (%DEFMETHOD 'CAM-GF-04 '+ (LIST 'RATIONAL)
-                           (LAMBDA (X) 2))) (t (c) nil))
-  (handler-case (setq *CAM-GF-04-METHOD3* (%DEFMETHOD 'CAM-GF-04 '+ (LIST 'REAL) (LAMBDA (X) 4))) (t (c) nil))
-  (handler-case (setq *CAM-GF-04-METHOD4* (%DEFMETHOD 'CAM-GF-04 '+ (LIST 'NUMBER)
-                           (LAMBDA (X) 8))) (t (c) nil))
-  (handler-case (setq *CAM-GF-04-METHOD5* (%DEFMETHOD 'CAM-GF-04 '+ (LIST 'T) (LAMBDA (X) 16))) (t (c) nil))
+  (handler-case (setq *CAM-GF-04-METHOD1* (%DEFMETHOD-META 'CAM-GF-04 '+ (LIST 'INTEGER)
+                           (LAMBDA (X) 1) '(X))) (t (c) nil))
+  (handler-case (setq *CAM-GF-04-METHOD2* (%DEFMETHOD-META 'CAM-GF-04 '+ (LIST 'RATIONAL)
+                           (LAMBDA (X) 2) '(X))) (t (c) nil))
+  (handler-case (setq *CAM-GF-04-METHOD3* (%DEFMETHOD-META 'CAM-GF-04 '+ (LIST 'REAL)
+                           (LAMBDA (X) 4) '(X))) (t (c) nil))
+  (handler-case (setq *CAM-GF-04-METHOD4* (%DEFMETHOD-META 'CAM-GF-04 '+ (LIST 'NUMBER)
+                           (LAMBDA (X) 8) '(X))) (t (c) nil))
+  (handler-case (setq *CAM-GF-04-METHOD5* (%DEFMETHOD-META 'CAM-GF-04 '+ (LIST 'T)
+                           (LAMBDA (X) 16) '(X))) (t (c) nil))
   (%try-chunk "compute-applicable-methods" 9299539 1 #'run-ansi-compute-applicable-methods-chunk-1)
   (%try-chunk "compute-applicable-methods" 9299539 2 #'run-ansi-compute-applicable-methods-chunk-2)
 )
@@ -174250,8 +174275,8 @@ NIL
                                'DEFGENERIC-ERROR-FN.22)
                               (T (C) NIL))
                              (%DG-GF-CALLABLE 'DEFGENERIC-ERROR-FN.22))
-                            (%DEFMETHOD 'DEFGENERIC-ERROR-FN.22 'NIL (LIST 'T)
-                             (LAMBDA (X) NIL))
+                            (%DEFMETHOD-META 'DEFGENERIC-ERROR-FN.22 'NIL
+                             (LIST 'T) (LAMBDA (X) NIL) '(X))
                             (HANDLER-CASE
                              (PROGN
                               (%VALIDATE-DEFGENERIC-OPTIONS
@@ -176902,26 +176927,26 @@ NIL
 (defun run-ansi-define-method-combination-long-form-chunk-1 ()
   (handler-case (run-test 27248 (lambda () (EQT *DMC-LONG-01* 'MC-LONG-01)) 'T) (t (c) (%test-crash-fail-c 27248 c)))
   (handler-case (run-test 27249 (lambda () (PROGN
-                            (%DEFMETHOD 'DMC-LONG-GF-01 'NIL (LIST 'T 'T)
-                             (LAMBDA (X Y) :FOO))
+                            (%DEFMETHOD-META 'DMC-LONG-GF-01 'NIL (LIST 'T 'T)
+                             (LAMBDA (X Y) :FOO) '(X Y))
                             (HANDLER-CASE (DMC-LONG-GF-01 'A 'B)
                                           (ERROR NIL :CAUGHT)))) ':CAUGHT) (t (c) (%test-crash-fail-c 27249 c)))
   (handler-case (run-test 27250 (lambda () (EQT *DMC-LONG-02* 'MC-LONG-02)) 'T) (t (c) (%test-crash-fail-c 27250 c)))
   (handler-case (run-test-mv 27251 (lambda () (multiple-value-list (PROGN
-                                                    (%DEFMETHOD 'DMC-LONG-GF-02
-                                                     'NIL
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-02 'NIL
                                                      (LIST (LIST 'EQL 1)
                                                            'INTEGER)
-                                                     (LAMBDA (X Y) 'A))
-                                                    (%DEFMETHOD 'DMC-LONG-GF-02
-                                                     'NIL
+                                                     (LAMBDA (X Y) 'A) '(X Y))
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-02 'NIL
                                                      (LIST 'INTEGER
                                                            (LIST 'EQL 2))
-                                                     (LAMBDA (X Y) 'B))
-                                                    (%DEFMETHOD 'DMC-LONG-GF-02
-                                                     'NIL
+                                                     (LAMBDA (X Y) 'B) '(X Y))
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-02 'NIL
                                                      (LIST 'INTEGER 'INTEGER)
-                                                     (LAMBDA (X Y) 'Z))
+                                                     (LAMBDA (X Y) 'Z) '(X Y))
                                                     (VALUES
                                                      (DMC-LONG-GF-02 0 0)
                                                      (DMC-LONG-GF-02 1 0)
@@ -176938,20 +176963,20 @@ NIL
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 27252 c)))
   (handler-case (run-test 27253 (lambda () (EQT *DMC-LONG-03* 'MC-LONG-03)) 'T) (t (c) (%test-crash-fail-c 27253 c)))
   (handler-case (run-test-mv 27254 (lambda () (multiple-value-list (PROGN
-                                                    (%DEFMETHOD 'DMC-LONG-GF-03
-                                                     'NIL
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-03 'NIL
                                                      (LIST (LIST 'EQL 1)
                                                            'INTEGER)
-                                                     (LAMBDA (X Y) 'A))
-                                                    (%DEFMETHOD 'DMC-LONG-GF-03
-                                                     'NIL
+                                                     (LAMBDA (X Y) 'A) '(X Y))
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-03 'NIL
                                                      (LIST 'INTEGER
                                                            (LIST 'EQL 2))
-                                                     (LAMBDA (X Y) 'B))
-                                                    (%DEFMETHOD 'DMC-LONG-GF-03
-                                                     'NIL
+                                                     (LAMBDA (X Y) 'B) '(X Y))
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-03 'NIL
                                                      (LIST 'INTEGER 'INTEGER)
-                                                     (LAMBDA (X Y) 'Z))
+                                                     (LAMBDA (X Y) 'Z) '(X Y))
                                                     (VALUES
                                                      (DMC-LONG-GF-03 0 0)
                                                      (DMC-LONG-GF-03 1 0)
@@ -176970,20 +176995,20 @@ NIL
 (defun run-ansi-define-method-combination-long-form-chunk-2 ()
   (handler-case (run-test 27256 (lambda () (EQT *DMC-LONG-04* 'MC-LONG-04)) 'T) (t (c) (%test-crash-fail-c 27256 c)))
   (handler-case (run-test-mv 27257 (lambda () (multiple-value-list (PROGN
-                                                    (%DEFMETHOD 'DMC-LONG-GF-04
-                                                     'NIL
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-04 'NIL
                                                      (LIST (LIST 'EQL 1)
                                                            'INTEGER)
-                                                     (LAMBDA (X Y) 'A))
-                                                    (%DEFMETHOD 'DMC-LONG-GF-04
-                                                     'NIL
+                                                     (LAMBDA (X Y) 'A) '(X Y))
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-04 'NIL
                                                      (LIST 'INTEGER
                                                            (LIST 'EQL 2))
-                                                     (LAMBDA (X Y) 'B))
-                                                    (%DEFMETHOD 'DMC-LONG-GF-04
-                                                     'NIL
+                                                     (LAMBDA (X Y) 'B) '(X Y))
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-04 'NIL
                                                      (LIST 'INTEGER 'INTEGER)
-                                                     (LAMBDA (X Y) 'Z))
+                                                     (LAMBDA (X Y) 'Z) '(X Y))
                                                     (VALUES
                                                      (DMC-LONG-GF-04 0 0)
                                                      (DMC-LONG-GF-04 1 0)
@@ -177000,23 +177025,25 @@ NIL
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 27258 c)))
   (handler-case (run-test 27259 (lambda () (EQT *DMC-LONG-05* 'MC-LONG-05)) 'T) (t (c) (%test-crash-fail-c 27259 c)))
   (handler-case (run-test-mv 27260 (lambda () (multiple-value-list (PROGN
-                                                    (%DEFMETHOD 'DMC-LONG-GF-05
-                                                     'NIL
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-05 'NIL
                                                      (LIST (LIST 'EQL 1)
                                                            'INTEGER)
-                                                     (LAMBDA (X Y) 'A))
-                                                    (%DEFMETHOD 'DMC-LONG-GF-05
-                                                     'NIL
+                                                     (LAMBDA (X Y) 'A) '(X Y))
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-05 'NIL
                                                      (LIST 'INTEGER
                                                            (LIST 'EQL 2))
-                                                     (LAMBDA (X Y) 'B))
-                                                    (%DEFMETHOD 'DMC-LONG-GF-05
-                                                     'NIL
+                                                     (LAMBDA (X Y) 'B) '(X Y))
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-05 'NIL
                                                      (LIST 'INTEGER 'INTEGER)
-                                                     (LAMBDA (X Y) 'Z))
-                                                    (%DEFMETHOD 'DMC-LONG-GF-05
-                                                     'FOO (LIST 'T 'T)
-                                                     (LAMBDA (X Y) 'BAD))
+                                                     (LAMBDA (X Y) 'Z) '(X Y))
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-05 'FOO
+                                                     (LIST 'T 'T)
+                                                     (LAMBDA (X Y) 'BAD)
+                                                     '(X Y))
                                                     (VALUES
                                                      (DMC-LONG-GF-05 NIL NIL)
                                                      (DMC-LONG-GF-05 0 0)
@@ -177033,23 +177060,25 @@ NIL
                                                                                   Z))) (t (c) (%test-crash-fail-c 27260 c)))
   (handler-case (run-test 27261 (lambda () (EQT *DMC-LONG-06* 'MC-LONG-06)) 'T) (t (c) (%test-crash-fail-c 27261 c)))
   (handler-case (run-test-mv 27262 (lambda () (multiple-value-list (PROGN
-                                                    (%DEFMETHOD 'DMC-LONG-GF-06
-                                                     'NIL
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-06 'NIL
                                                      (LIST (LIST 'EQL 1)
                                                            'INTEGER)
-                                                     (LAMBDA (X Y) 'A))
-                                                    (%DEFMETHOD 'DMC-LONG-GF-06
-                                                     'NIL
+                                                     (LAMBDA (X Y) 'A) '(X Y))
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-06 'NIL
                                                      (LIST 'INTEGER
                                                            (LIST 'EQL 2))
-                                                     (LAMBDA (X Y) 'B))
-                                                    (%DEFMETHOD 'DMC-LONG-GF-06
-                                                     'NIL
+                                                     (LAMBDA (X Y) 'B) '(X Y))
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-06 'NIL
                                                      (LIST 'INTEGER 'INTEGER)
-                                                     (LAMBDA (X Y) 'Z))
-                                                    (%DEFMETHOD 'DMC-LONG-GF-06
-                                                     'FOO (LIST 'T 'T)
-                                                     (LAMBDA (X Y) 'BAD))
+                                                     (LAMBDA (X Y) 'Z) '(X Y))
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-06 'FOO
+                                                     (LIST 'T 'T)
+                                                     (LAMBDA (X Y) 'BAD)
+                                                     '(X Y))
                                                     (VALUES
                                                      (DMC-LONG-GF-06 0 0)
                                                      (DMC-LONG-GF-06 1 0)
@@ -177075,20 +177104,20 @@ NIL
 (defun run-ansi-define-method-combination-long-form-chunk-3 ()
   (handler-case (run-test 27264 (lambda () (EQT *DMC-LONG-07* 'MC-LONG-07)) 'T) (t (c) (%test-crash-fail-c 27264 c)))
   (handler-case (run-test-mv 27265 (lambda () (multiple-value-list (PROGN
-                                                    (%DEFMETHOD 'DMC-LONG-GF-07
-                                                     'NIL
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-07 'NIL
                                                      (LIST (LIST 'EQL 1)
                                                            'INTEGER)
-                                                     (LAMBDA (X Y) 'A))
-                                                    (%DEFMETHOD 'DMC-LONG-GF-07
-                                                     'NIL
+                                                     (LAMBDA (X Y) 'A) '(X Y))
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-07 'NIL
                                                      (LIST 'INTEGER
                                                            (LIST 'EQL 2))
-                                                     (LAMBDA (X Y) 'B))
-                                                    (%DEFMETHOD 'DMC-LONG-GF-07
-                                                     'NIL
+                                                     (LAMBDA (X Y) 'B) '(X Y))
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-07 'NIL
                                                      (LIST 'INTEGER 'INTEGER)
-                                                     (LAMBDA (X Y) 'Z))
+                                                     (LAMBDA (X Y) 'Z) '(X Y))
                                                     (VALUES
                                                      (DMC-LONG-GF-07 0 0)
                                                      (DMC-LONG-GF-07 1 0)
@@ -177113,20 +177142,20 @@ NIL
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 27266 c)))
   (handler-case (run-test 27267 (lambda () (EQT *DMC-LONG-08* 'MC-LONG-08)) 'T) (t (c) (%test-crash-fail-c 27267 c)))
   (handler-case (run-test-mv 27268 (lambda () (multiple-value-list (PROGN
-                                                    (%DEFMETHOD 'DMC-LONG-GF-08
-                                                     'NIL
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-08 'NIL
                                                      (LIST (LIST 'EQL 1)
                                                            'INTEGER)
-                                                     (LAMBDA (X Y) 'A))
-                                                    (%DEFMETHOD 'DMC-LONG-GF-08
-                                                     'NIL
+                                                     (LAMBDA (X Y) 'A) '(X Y))
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-08 'NIL
                                                      (LIST 'INTEGER
                                                            (LIST 'EQL 2))
-                                                     (LAMBDA (X Y) 'B))
-                                                    (%DEFMETHOD 'DMC-LONG-GF-08
-                                                     'NIL
+                                                     (LAMBDA (X Y) 'B) '(X Y))
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-08 'NIL
                                                      (LIST 'INTEGER 'INTEGER)
-                                                     (LAMBDA (X Y) 'Z))
+                                                     (LAMBDA (X Y) 'Z) '(X Y))
                                                     (VALUES
                                                      (DMC-LONG-GF-08 0 0)
                                                      (DMC-LONG-GF-08 1 0)
@@ -177155,20 +177184,20 @@ NIL
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 27269 c)))
   (handler-case (run-test 27270 (lambda () (EQT *DMC-LONG-09* 'MC-LONG-09)) 'T) (t (c) (%test-crash-fail-c 27270 c)))
   (handler-case (run-test-mv 27271 (lambda () (multiple-value-list (PROGN
-                                                    (%DEFMETHOD 'DMC-LONG-GF-09
-                                                     'NIL
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-09 'NIL
                                                      (LIST (LIST 'EQL 1)
                                                            'INTEGER)
-                                                     (LAMBDA (X Y) 'A))
-                                                    (%DEFMETHOD 'DMC-LONG-GF-09
-                                                     'NIL
+                                                     (LAMBDA (X Y) 'A) '(X Y))
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-09 'NIL
                                                      (LIST 'INTEGER
                                                            (LIST 'EQL 2))
-                                                     (LAMBDA (X Y) 'B))
-                                                    (%DEFMETHOD 'DMC-LONG-GF-09
-                                                     'NIL
+                                                     (LAMBDA (X Y) 'B) '(X Y))
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-09 'NIL
                                                      (LIST 'INTEGER 'INTEGER)
-                                                     (LAMBDA (X Y) 'Z))
+                                                     (LAMBDA (X Y) 'Z) '(X Y))
                                                     (VALUES
                                                      (DMC-LONG-GF-09 0 0)
                                                      (DMC-LONG-GF-09 1 0)
@@ -177199,20 +177228,20 @@ NIL
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 27272 c)))
   (handler-case (run-test 27273 (lambda () (EQT *DMC-LONG-10* 'MC-LONG-10)) 'T) (t (c) (%test-crash-fail-c 27273 c)))
   (handler-case (run-test-mv 27274 (lambda () (multiple-value-list (PROGN
-                                                    (%DEFMETHOD 'DMC-LONG-GF-10
-                                                     'NIL
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-10 'NIL
                                                      (LIST (LIST 'EQL 1)
                                                            'INTEGER)
-                                                     (LAMBDA (X Y) 'A))
-                                                    (%DEFMETHOD 'DMC-LONG-GF-10
-                                                     'NIL
+                                                     (LAMBDA (X Y) 'A) '(X Y))
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-10 'NIL
                                                      (LIST 'INTEGER
                                                            (LIST 'EQL 2))
-                                                     (LAMBDA (X Y) 'B))
-                                                    (%DEFMETHOD 'DMC-LONG-GF-10
-                                                     'NIL
+                                                     (LAMBDA (X Y) 'B) '(X Y))
+                                                    (%DEFMETHOD-META
+                                                     'DMC-LONG-GF-10 'NIL
                                                      (LIST 'INTEGER 'INTEGER)
-                                                     (LAMBDA (X Y) 'Z))
+                                                     (LAMBDA (X Y) 'Z) '(X Y))
                                                     (VALUES
                                                      (DMC-LONG-GF-10 0 0)
                                                      (DMC-LONG-GF-10 1 0)
@@ -177531,21 +177560,21 @@ NIL
   (handler-case (%DEFGENERIC 'DMC-GF-01 '(X) 'TIMES) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'DMC-GF-01 'DMC-GF-01) (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'DMC-GF-01) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-01 'TIMES (LIST 'INTEGER) (LAMBDA (X) 2)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-01 'TIMES (LIST 'RATIONAL) (LAMBDA (X) 3)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-01 'TIMES (LIST 'REAL) (LAMBDA (X) 5)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-01 'TIMES (LIST 'NUMBER) (LAMBDA (X) 7)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-01 'TIMES (LIST 'COMPLEX) (LAMBDA (X) 11)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-01 'TIMES (LIST 'INTEGER) (LAMBDA (X) 2) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-01 'TIMES (LIST 'RATIONAL) (LAMBDA (X) 3) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-01 'TIMES (LIST 'REAL) (LAMBDA (X) 5) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-01 'TIMES (LIST 'NUMBER) (LAMBDA (X) 7) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-01 'TIMES (LIST 'COMPLEX) (LAMBDA (X) 11) '(X)) (t (c) nil))
   (handler-case (%VALIDATE-DEFGENERIC-OPTIONS 'DMC-GF-02 '(X) '((:METHOD-COMBINATION TIMES))) (t (c) nil))
   (handler-case (%DEFGENERIC 'DMC-GF-02 '(X) 'TIMES) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'DMC-GF-02 'DMC-GF-02) (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'DMC-GF-02) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-02 'TIMES (LIST 'INTEGER) (LAMBDA (X) 2)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-02 ':AROUND (LIST 'RATIONAL)
- (LAMBDA (X) (1- (CALL-NEXT-METHOD)))) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-02 'TIMES (LIST 'REAL) (LAMBDA (X) 3)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-02 'TIMES (LIST 'NUMBER) (LAMBDA (X) 5)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-02 ':AROUND (LIST (LIST 'EQL 1.0)) (LAMBDA (X) 1)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-02 'TIMES (LIST 'INTEGER) (LAMBDA (X) 2) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-02 ':AROUND (LIST 'RATIONAL)
+ (LAMBDA (X) (1- (CALL-NEXT-METHOD))) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-02 'TIMES (LIST 'REAL) (LAMBDA (X) 3) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-02 'TIMES (LIST 'NUMBER) (LAMBDA (X) 5) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-02 ':AROUND (LIST (LIST 'EQL 1.0)) (LAMBDA (X) 1) '(X)) (t (c) nil))
   (handler-case (%VALIDATE-DEFGENERIC-OPTIONS 'DMC-GF-03 '(X) '((:METHOD-COMBINATION TIMES))) (t (c) nil))
   (handler-case (%DEFGENERIC 'DMC-GF-03 '(X) 'TIMES) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'DMC-GF-03 'DMC-GF-03) (T (C) NIL)) (t (c) nil))
@@ -177555,21 +177584,21 @@ NIL
   (handler-case (%DEFGENERIC 'DMC-GF-04 '(X) 'TIMES2) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'DMC-GF-04 'DMC-GF-04) (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'DMC-GF-04) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-04 'TIMES2 (LIST 'DMC-CLASS-01B) (LAMBDA (X) 2)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-04 'TIMES2 (LIST 'DMC-CLASS-01C) (LAMBDA (X) 3)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-04 'TIMES2 (LIST 'DMC-CLASS-01D) (LAMBDA (X) 5)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-04 'TIMES2 (LIST 'SYMBOL) (LAMBDA (X) NIL)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-04 'TIMES2 (LIST 'DMC-CLASS-01B) (LAMBDA (X) 2) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-04 'TIMES2 (LIST 'DMC-CLASS-01C) (LAMBDA (X) 3) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-04 'TIMES2 (LIST 'DMC-CLASS-01D) (LAMBDA (X) 5) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-04 'TIMES2 (LIST 'SYMBOL) (LAMBDA (X) NIL) '(X)) (t (c) nil))
   (handler-case (setq *DMC-TIMES-5* (%DEFINE-METHOD-COMBINATION 'TIMES-5 '* NIL)) (t (c) nil))
   (handler-case (setq *DMC-TIMES-7* (%DEFINE-METHOD-COMBINATION 'TIMES-7 'TIMES-7 NIL)) (t (c) nil))
   (handler-case (%VALIDATE-DEFGENERIC-OPTIONS 'DMC-GF-07 '(X) '((:METHOD-COMBINATION TIMES))) (t (c) nil))
   (handler-case (%DEFGENERIC 'DMC-GF-07 '(X) 'TIMES) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'DMC-GF-07 'DMC-GF-07) (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'DMC-GF-07) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-07 'TIMES (LIST 'INTEGER) (LAMBDA (X) 2)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-07 'TIMES (LIST 'RATIONAL) (LAMBDA (X) 3)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-07 'TIMES (LIST 'REAL) (LAMBDA (X) 5)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-07 'TIMES (LIST 'NUMBER) (LAMBDA (X) 7)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-07 'TIMES (LIST 'COMPLEX) (LAMBDA (X) 11)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-07 'TIMES (LIST 'INTEGER) (LAMBDA (X) 2) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-07 'TIMES (LIST 'RATIONAL) (LAMBDA (X) 3) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-07 'TIMES (LIST 'REAL) (LAMBDA (X) 5) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-07 'TIMES (LIST 'NUMBER) (LAMBDA (X) 7) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-07 'TIMES (LIST 'COMPLEX) (LAMBDA (X) 11) '(X)) (t (c) nil))
 )
 (defun run-ansi-define-method-combination-chunk-1 ()
   (handler-case (run-test-mv 27276 (lambda () (multiple-value-list (VALUES (DMC-GF-01 1)
@@ -177603,8 +177632,8 @@ NIL
   (handler-case (run-test 27281 (lambda () (PROG1
                                (HANDLER-CASE
                                 (PROGN
-                                 (%DEFMETHOD 'DMC-GF-03 'NIL (LIST 'INTEGER)
-                                  (LAMBDA (X) T))
+                                 (%DEFMETHOD-META 'DMC-GF-03 'NIL
+                                  (LIST 'INTEGER) (LAMBDA (X) T) '(X))
                                  (DMC-GF-03 1)
                                  :BAD)
                                 (ERROR NIL :GOOD))
@@ -177616,8 +177645,8 @@ NIL
   (handler-case (run-test 27282 (lambda () (PROG1
                                (HANDLER-CASE
                                 (PROGN
-                                 (%DEFMETHOD 'DMC-GF-03 ':BEFORE (LIST 'CONS)
-                                  (LAMBDA (X) T))
+                                 (%DEFMETHOD-META 'DMC-GF-03 ':BEFORE
+                                  (LIST 'CONS) (LAMBDA (X) T) '(X))
                                  (DMC-GF-03 (CONS 'A 'B))
                                  :BAD)
                                 (ERROR NIL :GOOD))
@@ -177629,8 +177658,8 @@ NIL
   (handler-case (run-test 27283 (lambda () (PROG1
                                (HANDLER-CASE
                                 (PROGN
-                                 (%DEFMETHOD 'DMC-GF-03 ':AFTER (LIST 'SYMBOL)
-                                  (LAMBDA (X) T))
+                                 (%DEFMETHOD-META 'DMC-GF-03 ':AFTER
+                                  (LIST 'SYMBOL) (LAMBDA (X) T) '(X))
                                  (DMC-GF-03 'A)
                                  :BAD)
                                 (ERROR NIL :GOOD))
@@ -177734,21 +177763,21 @@ NIL
   (handler-case (%DEFGENERIC 'DMC-GF-01 '(X) 'TIMES) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'DMC-GF-01 'DMC-GF-01) (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'DMC-GF-01) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-01 'TIMES (LIST 'INTEGER) (LAMBDA (X) 2)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-01 'TIMES (LIST 'RATIONAL) (LAMBDA (X) 3)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-01 'TIMES (LIST 'REAL) (LAMBDA (X) 5)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-01 'TIMES (LIST 'NUMBER) (LAMBDA (X) 7)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-01 'TIMES (LIST 'COMPLEX) (LAMBDA (X) 11)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-01 'TIMES (LIST 'INTEGER) (LAMBDA (X) 2) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-01 'TIMES (LIST 'RATIONAL) (LAMBDA (X) 3) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-01 'TIMES (LIST 'REAL) (LAMBDA (X) 5) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-01 'TIMES (LIST 'NUMBER) (LAMBDA (X) 7) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-01 'TIMES (LIST 'COMPLEX) (LAMBDA (X) 11) '(X)) (t (c) nil))
   (handler-case (%VALIDATE-DEFGENERIC-OPTIONS 'DMC-GF-02 '(X) '((:METHOD-COMBINATION TIMES))) (t (c) nil))
   (handler-case (%DEFGENERIC 'DMC-GF-02 '(X) 'TIMES) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'DMC-GF-02 'DMC-GF-02) (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'DMC-GF-02) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-02 'TIMES (LIST 'INTEGER) (LAMBDA (X) 2)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-02 ':AROUND (LIST 'RATIONAL)
- (LAMBDA (X) (1- (CALL-NEXT-METHOD)))) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-02 'TIMES (LIST 'REAL) (LAMBDA (X) 3)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-02 'TIMES (LIST 'NUMBER) (LAMBDA (X) 5)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-02 ':AROUND (LIST (LIST 'EQL 1.0)) (LAMBDA (X) 1)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-02 'TIMES (LIST 'INTEGER) (LAMBDA (X) 2) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-02 ':AROUND (LIST 'RATIONAL)
+ (LAMBDA (X) (1- (CALL-NEXT-METHOD))) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-02 'TIMES (LIST 'REAL) (LAMBDA (X) 3) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-02 'TIMES (LIST 'NUMBER) (LAMBDA (X) 5) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-02 ':AROUND (LIST (LIST 'EQL 1.0)) (LAMBDA (X) 1) '(X)) (t (c) nil))
   (handler-case (%VALIDATE-DEFGENERIC-OPTIONS 'DMC-GF-03 '(X) '((:METHOD-COMBINATION TIMES))) (t (c) nil))
   (handler-case (%DEFGENERIC 'DMC-GF-03 '(X) 'TIMES) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'DMC-GF-03 'DMC-GF-03) (T (C) NIL)) (t (c) nil))
@@ -177758,21 +177787,21 @@ NIL
   (handler-case (%DEFGENERIC 'DMC-GF-04 '(X) 'TIMES2) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'DMC-GF-04 'DMC-GF-04) (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'DMC-GF-04) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-04 'TIMES2 (LIST 'DMC-CLASS-01B) (LAMBDA (X) 2)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-04 'TIMES2 (LIST 'DMC-CLASS-01C) (LAMBDA (X) 3)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-04 'TIMES2 (LIST 'DMC-CLASS-01D) (LAMBDA (X) 5)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-04 'TIMES2 (LIST 'SYMBOL) (LAMBDA (X) NIL)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-04 'TIMES2 (LIST 'DMC-CLASS-01B) (LAMBDA (X) 2) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-04 'TIMES2 (LIST 'DMC-CLASS-01C) (LAMBDA (X) 3) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-04 'TIMES2 (LIST 'DMC-CLASS-01D) (LAMBDA (X) 5) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-04 'TIMES2 (LIST 'SYMBOL) (LAMBDA (X) NIL) '(X)) (t (c) nil))
   (handler-case (setq *DMC-TIMES-5* (%DEFINE-METHOD-COMBINATION 'TIMES-5 '* NIL)) (t (c) nil))
   (handler-case (setq *DMC-TIMES-7* (%DEFINE-METHOD-COMBINATION 'TIMES-7 'TIMES-7 NIL)) (t (c) nil))
   (handler-case (%VALIDATE-DEFGENERIC-OPTIONS 'DMC-GF-07 '(X) '((:METHOD-COMBINATION TIMES))) (t (c) nil))
   (handler-case (%DEFGENERIC 'DMC-GF-07 '(X) 'TIMES) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'DMC-GF-07 'DMC-GF-07) (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'DMC-GF-07) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-07 'TIMES (LIST 'INTEGER) (LAMBDA (X) 2)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-07 'TIMES (LIST 'RATIONAL) (LAMBDA (X) 3)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-07 'TIMES (LIST 'REAL) (LAMBDA (X) 5)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-07 'TIMES (LIST 'NUMBER) (LAMBDA (X) 7)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'DMC-GF-07 'TIMES (LIST 'COMPLEX) (LAMBDA (X) 11)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-07 'TIMES (LIST 'INTEGER) (LAMBDA (X) 2) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-07 'TIMES (LIST 'RATIONAL) (LAMBDA (X) 3) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-07 'TIMES (LIST 'REAL) (LAMBDA (X) 5) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-07 'TIMES (LIST 'NUMBER) (LAMBDA (X) 7) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'DMC-GF-07 'TIMES (LIST 'COMPLEX) (LAMBDA (X) 11) '(X)) (t (c) nil))
   (%try-chunk "define-method-combination" 16354828 1 #'run-ansi-define-method-combination-chunk-1)
   (%try-chunk "define-method-combination" 16354828 2 #'run-ansi-define-method-combination-chunk-2)
 )
@@ -177834,12 +177863,13 @@ NIL
   (handler-case (run-test-mv 27292 (lambda () (multiple-value-list (LET* ((SYM (GENSYM))
                                                           (METHOD
                                                            (EVAL
-                                                            `(%DEFMETHOD
+                                                            `(%DEFMETHOD-META
                                                               '(SETF ,SYM) 'NIL
                                                               (LIST 'T 'CONS)
                                                               (LAMBDA (X Y)
                                                                 (SETF (CAR Y)
-                                                                        X))))))
+                                                                        X))
+                                                              '(X Y)))))
                                                      (VALUES
                                                       (TYPEP* METHOD
                                                        'STANDARD-METHOD)
@@ -177876,14 +177906,15 @@ NIL
   (handler-case (run-test-mv 27294 (lambda () (multiple-value-list (LET* ((SYM (GENSYM))
                                                           (METHOD
                                                            (EVAL
-                                                            `(%DEFMETHOD
+                                                            `(%DEFMETHOD-META
                                                               '(SETF ,SYM) 'NIL
                                                               (LIST 'T 'CONS)
                                                               (LAMBDA (X Y)
                                                                 (RETURN-FROM
                                                                     ,SYM
                                                                   (SETF (CAR Y)
-                                                                          X)))))))
+                                                                          X)))
+                                                              '(X Y)))))
                                                      (VALUES
                                                       (TYPEP* METHOD
                                                        'STANDARD-METHOD)
@@ -179212,49 +179243,51 @@ NIL
 (DEFUN FIND-METHOD-GF-01 (&REST %GF-ARGS)
   (%GF-DISPATCH 'FIND-METHOD-GF-01 %GF-ARGS))
 (DEFPARAMETER *FIND-METHOD-GF-01-METHOD1*
-  (%DEFMETHOD 'FIND-METHOD-GF-01 'NIL (LIST 'INTEGER) (LAMBDA (X) 'A)))
+  (%DEFMETHOD-META 'FIND-METHOD-GF-01 'NIL (LIST 'INTEGER) (LAMBDA (X) 'A)
+   '(X)))
 (DEFPARAMETER *FIND-METHOD-GF-01-METHOD2*
-  (%DEFMETHOD 'FIND-METHOD-GF-01 'NIL (LIST 'RATIONAL) (LAMBDA (X) 'B)))
+  (%DEFMETHOD-META 'FIND-METHOD-GF-01 'NIL (LIST 'RATIONAL) (LAMBDA (X) 'B)
+   '(X)))
 (DEFPARAMETER *FIND-METHOD-GF-01-METHOD3*
-  (%DEFMETHOD 'FIND-METHOD-GF-01 'NIL (LIST 'REAL) (LAMBDA (X) 'C)))
+  (%DEFMETHOD-META 'FIND-METHOD-GF-01 'NIL (LIST 'REAL) (LAMBDA (X) 'C) '(X)))
 (DEFPARAMETER *FIND-METHOD-GF-01-METHOD4*
-  (%DEFMETHOD 'FIND-METHOD-GF-01 'NIL (LIST 'T) (LAMBDA (X) 'D)))
+  (%DEFMETHOD-META 'FIND-METHOD-GF-01 'NIL (LIST 'T) (LAMBDA (X) 'D) '(X)))
 (DEFUN FIND-METHOD-GF-02 (&REST %GF-ARGS)
   (%GF-DISPATCH 'FIND-METHOD-GF-02 %GF-ARGS))
 (DEFPARAMETER *FIND-METHOD-GF-02-METHOD1*
-  (%DEFMETHOD 'FIND-METHOD-GF-02 'NIL (LIST (LIST 'EQL 1234567890))
-   (LAMBDA (X) 'A)))
+  (%DEFMETHOD-META 'FIND-METHOD-GF-02 'NIL (LIST (LIST 'EQL 1234567890))
+   (LAMBDA (X) 'A) '(X)))
 (DEFPARAMETER *FIND-METHOD-02-METHOD2-VALUE* (LIST 'A))
 (DEFPARAMETER *FIND-METHOD-GF-02-METHOD2*
-  (%DEFMETHOD 'FIND-METHOD-GF-02 'NIL
-   (LIST (LIST 'EQL *FIND-METHOD-02-METHOD2-VALUE*)) (LAMBDA (X) 'B)))
+  (%DEFMETHOD-META 'FIND-METHOD-GF-02 'NIL
+   (LIST (LIST 'EQL *FIND-METHOD-02-METHOD2-VALUE*)) (LAMBDA (X) 'B) '(X)))
 (defun run-init-find-method ()
   (handler-case (%VALIDATE-DEFGENERIC-OPTIONS 'FIND-METHOD-GF-01 '(X) 'NIL) (t (c) nil))
   (handler-case (%DEFGENERIC 'FIND-METHOD-GF-01 '(X) 'NIL) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'FIND-METHOD-GF-01 'FIND-METHOD-GF-01)
               (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'FIND-METHOD-GF-01) (t (c) nil))
-  (handler-case (setq *FIND-METHOD-GF-01-METHOD1* (%DEFMETHOD 'FIND-METHOD-GF-01 'NIL
-                                   (LIST 'INTEGER) (LAMBDA (X) 'A))) (t (c) nil))
-  (handler-case (setq *FIND-METHOD-GF-01-METHOD2* (%DEFMETHOD 'FIND-METHOD-GF-01 'NIL
-                                   (LIST 'RATIONAL) (LAMBDA (X) 'B))) (t (c) nil))
-  (handler-case (setq *FIND-METHOD-GF-01-METHOD3* (%DEFMETHOD 'FIND-METHOD-GF-01 'NIL
-                                   (LIST 'REAL) (LAMBDA (X) 'C))) (t (c) nil))
-  (handler-case (setq *FIND-METHOD-GF-01-METHOD4* (%DEFMETHOD 'FIND-METHOD-GF-01 'NIL (LIST 'T)
-                                   (LAMBDA (X) 'D))) (t (c) nil))
+  (handler-case (setq *FIND-METHOD-GF-01-METHOD1* (%DEFMETHOD-META 'FIND-METHOD-GF-01 'NIL
+                                   (LIST 'INTEGER) (LAMBDA (X) 'A) '(X))) (t (c) nil))
+  (handler-case (setq *FIND-METHOD-GF-01-METHOD2* (%DEFMETHOD-META 'FIND-METHOD-GF-01 'NIL
+                                   (LIST 'RATIONAL) (LAMBDA (X) 'B) '(X))) (t (c) nil))
+  (handler-case (setq *FIND-METHOD-GF-01-METHOD3* (%DEFMETHOD-META 'FIND-METHOD-GF-01 'NIL
+                                   (LIST 'REAL) (LAMBDA (X) 'C) '(X))) (t (c) nil))
+  (handler-case (setq *FIND-METHOD-GF-01-METHOD4* (%DEFMETHOD-META 'FIND-METHOD-GF-01 'NIL
+                                   (LIST 'T) (LAMBDA (X) 'D) '(X))) (t (c) nil))
   (handler-case (%VALIDATE-DEFGENERIC-OPTIONS 'FIND-METHOD-GF-02 '(X) 'NIL) (t (c) nil))
   (handler-case (%DEFGENERIC 'FIND-METHOD-GF-02 '(X) 'NIL) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'FIND-METHOD-GF-02 'FIND-METHOD-GF-02)
               (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'FIND-METHOD-GF-02) (t (c) nil))
-  (handler-case (setq *FIND-METHOD-GF-02-METHOD1* (%DEFMETHOD 'FIND-METHOD-GF-02 'NIL
+  (handler-case (setq *FIND-METHOD-GF-02-METHOD1* (%DEFMETHOD-META 'FIND-METHOD-GF-02 'NIL
                                    (LIST (LIST 'EQL 1234567890))
-                                   (LAMBDA (X) 'A))) (t (c) nil))
+                                   (LAMBDA (X) 'A) '(X))) (t (c) nil))
   (handler-case (setq *FIND-METHOD-02-METHOD2-VALUE* (LIST 'A)) (t (c) nil))
-  (handler-case (setq *FIND-METHOD-GF-02-METHOD2* (%DEFMETHOD 'FIND-METHOD-GF-02 'NIL
+  (handler-case (setq *FIND-METHOD-GF-02-METHOD2* (%DEFMETHOD-META 'FIND-METHOD-GF-02 'NIL
                                    (LIST
                                     (LIST 'EQL *FIND-METHOD-02-METHOD2-VALUE*))
-                                   (LAMBDA (X) 'B))) (t (c) nil))
+                                   (LAMBDA (X) 'B) '(X))) (t (c) nil))
 )
 (defun run-ansi-find-method-chunk-1 ()
   (handler-case (run-test 27356 (lambda () (EQT
@@ -179339,27 +179372,27 @@ NIL
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'FIND-METHOD-GF-01 'FIND-METHOD-GF-01)
               (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'FIND-METHOD-GF-01) (t (c) nil))
-  (handler-case (setq *FIND-METHOD-GF-01-METHOD1* (%DEFMETHOD 'FIND-METHOD-GF-01 'NIL
-                                   (LIST 'INTEGER) (LAMBDA (X) 'A))) (t (c) nil))
-  (handler-case (setq *FIND-METHOD-GF-01-METHOD2* (%DEFMETHOD 'FIND-METHOD-GF-01 'NIL
-                                   (LIST 'RATIONAL) (LAMBDA (X) 'B))) (t (c) nil))
-  (handler-case (setq *FIND-METHOD-GF-01-METHOD3* (%DEFMETHOD 'FIND-METHOD-GF-01 'NIL
-                                   (LIST 'REAL) (LAMBDA (X) 'C))) (t (c) nil))
-  (handler-case (setq *FIND-METHOD-GF-01-METHOD4* (%DEFMETHOD 'FIND-METHOD-GF-01 'NIL (LIST 'T)
-                                   (LAMBDA (X) 'D))) (t (c) nil))
+  (handler-case (setq *FIND-METHOD-GF-01-METHOD1* (%DEFMETHOD-META 'FIND-METHOD-GF-01 'NIL
+                                   (LIST 'INTEGER) (LAMBDA (X) 'A) '(X))) (t (c) nil))
+  (handler-case (setq *FIND-METHOD-GF-01-METHOD2* (%DEFMETHOD-META 'FIND-METHOD-GF-01 'NIL
+                                   (LIST 'RATIONAL) (LAMBDA (X) 'B) '(X))) (t (c) nil))
+  (handler-case (setq *FIND-METHOD-GF-01-METHOD3* (%DEFMETHOD-META 'FIND-METHOD-GF-01 'NIL
+                                   (LIST 'REAL) (LAMBDA (X) 'C) '(X))) (t (c) nil))
+  (handler-case (setq *FIND-METHOD-GF-01-METHOD4* (%DEFMETHOD-META 'FIND-METHOD-GF-01 'NIL
+                                   (LIST 'T) (LAMBDA (X) 'D) '(X))) (t (c) nil))
   (handler-case (%VALIDATE-DEFGENERIC-OPTIONS 'FIND-METHOD-GF-02 '(X) 'NIL) (t (c) nil))
   (handler-case (%DEFGENERIC 'FIND-METHOD-GF-02 '(X) 'NIL) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'FIND-METHOD-GF-02 'FIND-METHOD-GF-02)
               (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'FIND-METHOD-GF-02) (t (c) nil))
-  (handler-case (setq *FIND-METHOD-GF-02-METHOD1* (%DEFMETHOD 'FIND-METHOD-GF-02 'NIL
+  (handler-case (setq *FIND-METHOD-GF-02-METHOD1* (%DEFMETHOD-META 'FIND-METHOD-GF-02 'NIL
                                    (LIST (LIST 'EQL 1234567890))
-                                   (LAMBDA (X) 'A))) (t (c) nil))
+                                   (LAMBDA (X) 'A) '(X))) (t (c) nil))
   (handler-case (setq *FIND-METHOD-02-METHOD2-VALUE* (LIST 'A)) (t (c) nil))
-  (handler-case (setq *FIND-METHOD-GF-02-METHOD2* (%DEFMETHOD 'FIND-METHOD-GF-02 'NIL
+  (handler-case (setq *FIND-METHOD-GF-02-METHOD2* (%DEFMETHOD-META 'FIND-METHOD-GF-02 'NIL
                                    (LIST
                                     (LIST 'EQL *FIND-METHOD-02-METHOD2-VALUE*))
-                                   (LAMBDA (X) 'B))) (t (c) nil))
+                                   (LAMBDA (X) 'B) '(X))) (t (c) nil))
   (%try-chunk "find-method" 15211072 1 #'run-ansi-find-method-chunk-1)
   (%try-chunk "find-method" 15211072 2 #'run-ansi-find-method-chunk-2)
   (%try-chunk "find-method" 15211072 3 #'run-ansi-find-method-chunk-3)
@@ -179435,8 +179468,9 @@ NIL
 
 ;; === make-instance.lsp ===
 (in-package :modus.mvm)
-(%DEFMETHOD 'MAKE-INSTANCE 'NIL (LIST 'MAKE-INSTANCE-CLASS-01)
- (LAMBDA (X &REST INITARGS &KEY &ALLOW-OTHER-KEYS) INITARGS))
+(%DEFMETHOD-META 'MAKE-INSTANCE 'NIL (LIST 'MAKE-INSTANCE-CLASS-01)
+ (LAMBDA (X &REST INITARGS &KEY &ALLOW-OTHER-KEYS) INITARGS)
+ '(X &REST INITARGS &KEY &ALLOW-OTHER-KEYS))
 (defun run-init-make-instance ()
   (handler-case (%DEFCLASS 'MAKE-INSTANCE-CLASS-01 '(A B) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'MAKE-INSTANCE-CLASS-01
@@ -179445,8 +179479,9 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'MAKE-INSTANCE-CLASS-01 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'MAKE-INSTANCE-CLASS-01 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'MAKE-INSTANCE-CLASS-01 NIL) (t (c) nil))
-  (handler-case (%DEFMETHOD 'MAKE-INSTANCE 'NIL (LIST 'MAKE-INSTANCE-CLASS-01)
- (LAMBDA (X &REST INITARGS &KEY &ALLOW-OTHER-KEYS) INITARGS)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'MAKE-INSTANCE 'NIL (LIST 'MAKE-INSTANCE-CLASS-01)
+ (LAMBDA (X &REST INITARGS &KEY &ALLOW-OTHER-KEYS) INITARGS)
+ '(X &REST INITARGS &KEY &ALLOW-OTHER-KEYS)) (t (c) nil))
 )
 (defun run-ansi-make-instance-chunk-1 ()
   (handler-case (run-test 27375 (lambda () (HANDLER-CASE (PROGN (MAKE-INSTANCE) NIL)
@@ -179708,8 +179743,9 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'MAKE-INSTANCE-CLASS-01 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'MAKE-INSTANCE-CLASS-01 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'MAKE-INSTANCE-CLASS-01 NIL) (t (c) nil))
-  (handler-case (%DEFMETHOD 'MAKE-INSTANCE 'NIL (LIST 'MAKE-INSTANCE-CLASS-01)
- (LAMBDA (X &REST INITARGS &KEY &ALLOW-OTHER-KEYS) INITARGS)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'MAKE-INSTANCE 'NIL (LIST 'MAKE-INSTANCE-CLASS-01)
+ (LAMBDA (X &REST INITARGS &KEY &ALLOW-OTHER-KEYS) INITARGS)
+ '(X &REST INITARGS &KEY &ALLOW-OTHER-KEYS)) (t (c) nil))
   (%try-chunk "make-instance" 12606209 1 #'run-ansi-make-instance-chunk-1)
   (%try-chunk "make-instance" 12606209 2 #'run-ansi-make-instance-chunk-2)
 )
@@ -180379,7 +180415,7 @@ NIL
 (DEFINE-CONDITION MAKE-LOAD-FORM-CONDITION-03
     NIL
     ((A) (B) (C)))
-(%DEFMETHOD 'MAKE-LOAD-FORM 'NIL (LIST 'MAKE-LOAD-FORM-CLASS-04)
+(%DEFMETHOD-META 'MAKE-LOAD-FORM 'NIL (LIST 'MAKE-LOAD-FORM-CLASS-04)
  (LAMBDA (OBJ &OPTIONAL (ENV T))
    (DECLARE (IGNORE ENV))
    (LET ((NEWOBJ (GENSYM)))
@@ -180388,7 +180424,8 @@ NIL
                 WHEN (SLOT-BOUNDP OBJ SLOT-NAME)
                 COLLECT `(SETF (SLOT-VALUE ,NEWOBJ ',SLOT-NAME)
                                  ',(SLOT-VALUE OBJ SLOT-NAME)))
-        ,NEWOBJ))))
+        ,NEWOBJ)))
+ '(OBJ &OPTIONAL ENV))
 (defun run-init-make-load-form ()
   (handler-case (%DEFCLASS 'MAKE-LOAD-FORM-CLASS-01 '(A B C) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'MAKE-LOAD-FORM-CLASS-01 (LIST) (LIST)) (t (c) nil))
@@ -180403,7 +180440,7 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'MAKE-LOAD-FORM-CLASS-04 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'MAKE-LOAD-FORM-CLASS-04 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'MAKE-LOAD-FORM-CLASS-04 NIL) (t (c) nil))
-  (handler-case (%DEFMETHOD 'MAKE-LOAD-FORM 'NIL (LIST 'MAKE-LOAD-FORM-CLASS-04)
+  (handler-case (%DEFMETHOD-META 'MAKE-LOAD-FORM 'NIL (LIST 'MAKE-LOAD-FORM-CLASS-04)
  (LAMBDA (OBJ &OPTIONAL (ENV T))
    (DECLARE (IGNORE ENV))
    (LET ((NEWOBJ (GENSYM)))
@@ -180412,7 +180449,8 @@ NIL
                 WHEN (SLOT-BOUNDP OBJ SLOT-NAME)
                 COLLECT `(SETF (SLOT-VALUE ,NEWOBJ ',SLOT-NAME)
                                  ',(SLOT-VALUE OBJ SLOT-NAME)))
-        ,NEWOBJ)))) (t (c) nil))
+        ,NEWOBJ)))
+ '(OBJ &OPTIONAL ENV)) (t (c) nil))
 )
 (defun run-ansi-make-load-form-chunk-1 ()
   (handler-case (run-test 27405 (lambda () (LET* ((FUN #'MAKE-LOAD-FORM)
@@ -180673,7 +180711,7 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'MAKE-LOAD-FORM-CLASS-04 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'MAKE-LOAD-FORM-CLASS-04 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'MAKE-LOAD-FORM-CLASS-04 NIL) (t (c) nil))
-  (handler-case (%DEFMETHOD 'MAKE-LOAD-FORM 'NIL (LIST 'MAKE-LOAD-FORM-CLASS-04)
+  (handler-case (%DEFMETHOD-META 'MAKE-LOAD-FORM 'NIL (LIST 'MAKE-LOAD-FORM-CLASS-04)
  (LAMBDA (OBJ &OPTIONAL (ENV T))
    (DECLARE (IGNORE ENV))
    (LET ((NEWOBJ (GENSYM)))
@@ -180682,7 +180720,8 @@ NIL
                 WHEN (SLOT-BOUNDP OBJ SLOT-NAME)
                 COLLECT `(SETF (SLOT-VALUE ,NEWOBJ ',SLOT-NAME)
                                  ',(SLOT-VALUE OBJ SLOT-NAME)))
-        ,NEWOBJ)))) (t (c) nil))
+        ,NEWOBJ)))
+ '(OBJ &OPTIONAL ENV)) (t (c) nil))
   (%try-chunk "make-load-form" 9369405 1 #'run-ansi-make-load-form-chunk-1)
   (%try-chunk "make-load-form" 9369405 2 #'run-ansi-make-load-form-chunk-2)
 )
@@ -180694,48 +180733,49 @@ NIL
 (DEFUN MQ-GENERIC-FUNCTION (&REST %GF-ARGS)
   (%GF-DISPATCH 'MQ-GENERIC-FUNCTION %GF-ARGS))
 (DEFPARAMETER *MQ-METHOD-1*
-  (%DEFMETHOD 'MQ-GENERIC-FUNCTION 'NIL (LIST 'INTEGER) (LAMBDA (X) (1+ X))))
+  (%DEFMETHOD-META 'MQ-GENERIC-FUNCTION 'NIL (LIST 'INTEGER)
+   (LAMBDA (X) (1+ X)) '(X)))
 (DEFPARAMETER *MQ-METHOD-2*
-  (%DEFMETHOD 'MQ-GENERIC-FUNCTION ':BEFORE (LIST 'MQ-CLASS-01)
-   (LAMBDA (X) 'FOO)))
+  (%DEFMETHOD-META 'MQ-GENERIC-FUNCTION ':BEFORE (LIST 'MQ-CLASS-01)
+   (LAMBDA (X) 'FOO) '(X)))
 (DEFPARAMETER *MQ-METHOD-3*
-  (%DEFMETHOD 'MQ-GENERIC-FUNCTION ':AFTER (LIST 'MQ-CLASS-02)
-   (LAMBDA (X) 'FOO)))
+  (%DEFMETHOD-META 'MQ-GENERIC-FUNCTION ':AFTER (LIST 'MQ-CLASS-02)
+   (LAMBDA (X) 'FOO) '(X)))
 (DEFPARAMETER *MQ-METHOD-4*
-  (%DEFMETHOD 'MQ-GENERIC-FUNCTION ':AROUND (LIST 'MQ-CLASS-03)
-   (LAMBDA (X) 'FOO)))
+  (%DEFMETHOD-META 'MQ-GENERIC-FUNCTION ':AROUND (LIST 'MQ-CLASS-03)
+   (LAMBDA (X) 'FOO) '(X)))
 (defun run-init-method-qualifiers ()
   (handler-case (%VALIDATE-DEFGENERIC-OPTIONS 'MQ-GENERIC-FUNCTION '(X) 'NIL) (t (c) nil))
   (handler-case (%DEFGENERIC 'MQ-GENERIC-FUNCTION '(X) 'NIL) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'MQ-GENERIC-FUNCTION 'MQ-GENERIC-FUNCTION)
               (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'MQ-GENERIC-FUNCTION) (t (c) nil))
-  (handler-case (setq *MQ-METHOD-1* (%DEFMETHOD 'MQ-GENERIC-FUNCTION 'NIL (LIST 'INTEGER)
-                     (LAMBDA (X) (1+ X)))) (t (c) nil))
+  (handler-case (setq *MQ-METHOD-1* (%DEFMETHOD-META 'MQ-GENERIC-FUNCTION 'NIL (LIST 'INTEGER)
+                     (LAMBDA (X) (1+ X)) '(X))) (t (c) nil))
   (handler-case (%DEFCLASS 'MQ-CLASS-01 '(A B C) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'MQ-CLASS-01 (LIST) (LIST)) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DIRECT-SLOTS 'MQ-CLASS-01 '(A B C)) (t (c) nil))
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'MQ-CLASS-01 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'MQ-CLASS-01 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'MQ-CLASS-01 NIL) (t (c) nil))
-  (handler-case (setq *MQ-METHOD-2* (%DEFMETHOD 'MQ-GENERIC-FUNCTION ':BEFORE
-                     (LIST 'MQ-CLASS-01) (LAMBDA (X) 'FOO))) (t (c) nil))
+  (handler-case (setq *MQ-METHOD-2* (%DEFMETHOD-META 'MQ-GENERIC-FUNCTION ':BEFORE
+                     (LIST 'MQ-CLASS-01) (LAMBDA (X) 'FOO) '(X))) (t (c) nil))
   (handler-case (%DEFCLASS 'MQ-CLASS-02 '(E F G) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'MQ-CLASS-02 (LIST) (LIST)) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DIRECT-SLOTS 'MQ-CLASS-02 '(E F G)) (t (c) nil))
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'MQ-CLASS-02 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'MQ-CLASS-02 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'MQ-CLASS-02 NIL) (t (c) nil))
-  (handler-case (setq *MQ-METHOD-3* (%DEFMETHOD 'MQ-GENERIC-FUNCTION ':AFTER
-                     (LIST 'MQ-CLASS-02) (LAMBDA (X) 'FOO))) (t (c) nil))
+  (handler-case (setq *MQ-METHOD-3* (%DEFMETHOD-META 'MQ-GENERIC-FUNCTION ':AFTER
+                     (LIST 'MQ-CLASS-02) (LAMBDA (X) 'FOO) '(X))) (t (c) nil))
   (handler-case (%DEFCLASS 'MQ-CLASS-03 '(H I J) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'MQ-CLASS-03 (LIST) (LIST)) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DIRECT-SLOTS 'MQ-CLASS-03 '(H I J)) (t (c) nil))
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'MQ-CLASS-03 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'MQ-CLASS-03 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'MQ-CLASS-03 NIL) (t (c) nil))
-  (handler-case (setq *MQ-METHOD-4* (%DEFMETHOD 'MQ-GENERIC-FUNCTION ':AROUND
-                     (LIST 'MQ-CLASS-03) (LAMBDA (X) 'FOO))) (t (c) nil))
+  (handler-case (setq *MQ-METHOD-4* (%DEFMETHOD-META 'MQ-GENERIC-FUNCTION ':AROUND
+                     (LIST 'MQ-CLASS-03) (LAMBDA (X) 'FOO) '(X))) (t (c) nil))
 )
 (defun run-ansi-method-qualifiers-chunk-1 ()
   (handler-case (run-test 27422 (lambda () (METHOD-QUALIFIERS *MQ-METHOD-1*)) 'NIL) (t (c) (%test-crash-fail-c 27422 c)))
@@ -180754,32 +180794,32 @@ NIL
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'MQ-GENERIC-FUNCTION 'MQ-GENERIC-FUNCTION)
               (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'MQ-GENERIC-FUNCTION) (t (c) nil))
-  (handler-case (setq *MQ-METHOD-1* (%DEFMETHOD 'MQ-GENERIC-FUNCTION 'NIL (LIST 'INTEGER)
-                     (LAMBDA (X) (1+ X)))) (t (c) nil))
+  (handler-case (setq *MQ-METHOD-1* (%DEFMETHOD-META 'MQ-GENERIC-FUNCTION 'NIL (LIST 'INTEGER)
+                     (LAMBDA (X) (1+ X)) '(X))) (t (c) nil))
   (handler-case (%DEFCLASS 'MQ-CLASS-01 '(A B C) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'MQ-CLASS-01 (LIST) (LIST)) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DIRECT-SLOTS 'MQ-CLASS-01 '(A B C)) (t (c) nil))
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'MQ-CLASS-01 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'MQ-CLASS-01 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'MQ-CLASS-01 NIL) (t (c) nil))
-  (handler-case (setq *MQ-METHOD-2* (%DEFMETHOD 'MQ-GENERIC-FUNCTION ':BEFORE
-                     (LIST 'MQ-CLASS-01) (LAMBDA (X) 'FOO))) (t (c) nil))
+  (handler-case (setq *MQ-METHOD-2* (%DEFMETHOD-META 'MQ-GENERIC-FUNCTION ':BEFORE
+                     (LIST 'MQ-CLASS-01) (LAMBDA (X) 'FOO) '(X))) (t (c) nil))
   (handler-case (%DEFCLASS 'MQ-CLASS-02 '(E F G) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'MQ-CLASS-02 (LIST) (LIST)) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DIRECT-SLOTS 'MQ-CLASS-02 '(E F G)) (t (c) nil))
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'MQ-CLASS-02 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'MQ-CLASS-02 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'MQ-CLASS-02 NIL) (t (c) nil))
-  (handler-case (setq *MQ-METHOD-3* (%DEFMETHOD 'MQ-GENERIC-FUNCTION ':AFTER
-                     (LIST 'MQ-CLASS-02) (LAMBDA (X) 'FOO))) (t (c) nil))
+  (handler-case (setq *MQ-METHOD-3* (%DEFMETHOD-META 'MQ-GENERIC-FUNCTION ':AFTER
+                     (LIST 'MQ-CLASS-02) (LAMBDA (X) 'FOO) '(X))) (t (c) nil))
   (handler-case (%DEFCLASS 'MQ-CLASS-03 '(H I J) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'MQ-CLASS-03 (LIST) (LIST)) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DIRECT-SLOTS 'MQ-CLASS-03 '(H I J)) (t (c) nil))
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'MQ-CLASS-03 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'MQ-CLASS-03 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'MQ-CLASS-03 NIL) (t (c) nil))
-  (handler-case (setq *MQ-METHOD-4* (%DEFMETHOD 'MQ-GENERIC-FUNCTION ':AROUND
-                     (LIST 'MQ-CLASS-03) (LAMBDA (X) 'FOO))) (t (c) nil))
+  (handler-case (setq *MQ-METHOD-4* (%DEFMETHOD-META 'MQ-GENERIC-FUNCTION ':AROUND
+                     (LIST 'MQ-CLASS-03) (LAMBDA (X) 'FOO) '(X))) (t (c) nil))
   (%try-chunk "method-qualifiers" 9606622 1 #'run-ansi-method-qualifiers-chunk-1)
 )
 
@@ -180791,14 +180831,14 @@ NIL
 (DEFUN NMP-GF-02 (&REST %GF-ARGS) (%GF-DISPATCH 'NMP-GF-02 %GF-ARGS))
 (DEFUN NMP-GF-03 (&REST %GF-ARGS) (%GF-DISPATCH 'NMP-GF-03 %GF-ARGS))
 (DEFUN NMP-GF-04 (&REST %GF-ARGS) (%GF-DISPATCH 'NMP-GF-04 %GF-ARGS))
-(%DEFMETHOD 'NMP-GF-04 'NIL (LIST 'INTEGER 'SYMBOL)
- (LAMBDA (X Y) #'NEXT-METHOD-P))
-(%DEFMETHOD 'NMP-GF-04 'NIL (LIST 'T (LIST 'EQL NIL))
- (LAMBDA (X Y) (CONSTANTLY 2)))
+(%DEFMETHOD-META 'NMP-GF-04 'NIL (LIST 'INTEGER 'SYMBOL)
+ (LAMBDA (X Y) #'NEXT-METHOD-P) '(X Y))
+(%DEFMETHOD-META 'NMP-GF-04 'NIL (LIST 'T (LIST 'EQL NIL))
+ (LAMBDA (X Y) (CONSTANTLY 2)) '(X Y))
 (DEFUN NMP-GF-05 (&REST %GF-ARGS) (%GF-DISPATCH 'NMP-GF-05 %GF-ARGS))
-(%DEFMETHOD 'NMP-GF-05 ':AROUND (LIST 'NUMBER)
- (LAMBDA (X) (NOTNOT-MV (NEXT-METHOD-P))))
-(%DEFMETHOD 'NMP-GF-05 'NIL (LIST 'INTEGER) (LAMBDA (X) 'FOO))
+(%DEFMETHOD-META 'NMP-GF-05 ':AROUND (LIST 'NUMBER)
+ (LAMBDA (X) (NOTNOT-MV (NEXT-METHOD-P))) '(X))
+(%DEFMETHOD-META 'NMP-GF-05 'NIL (LIST 'INTEGER) (LAMBDA (X) 'FOO) '(X))
 (defun run-init-next-method-p ()
   (handler-case (%VALIDATE-DEFGENERIC-OPTIONS 'NMP-GF-01 '(X)
  '((:METHOD ((X INTEGER))) (:METHOD ((X NUMBER))) (:METHOD ((X SYMBOL))))) (t (c) nil))
@@ -180832,17 +180872,17 @@ NIL
   (handler-case (%DEFGENERIC 'NMP-GF-04 '(X Y) 'NIL) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'NMP-GF-04 'NMP-GF-04) (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'NMP-GF-04) (t (c) nil))
-  (handler-case (%DEFMETHOD 'NMP-GF-04 'NIL (LIST 'INTEGER 'SYMBOL)
- (LAMBDA (X Y) #'NEXT-METHOD-P)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'NMP-GF-04 'NIL (LIST 'T (LIST 'EQL NIL))
- (LAMBDA (X Y) (CONSTANTLY 2))) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'NMP-GF-04 'NIL (LIST 'INTEGER 'SYMBOL)
+ (LAMBDA (X Y) #'NEXT-METHOD-P) '(X Y)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'NMP-GF-04 'NIL (LIST 'T (LIST 'EQL NIL))
+ (LAMBDA (X Y) (CONSTANTLY 2)) '(X Y)) (t (c) nil))
   (handler-case (%VALIDATE-DEFGENERIC-OPTIONS 'NMP-GF-05 '(X) 'NIL) (t (c) nil))
   (handler-case (%DEFGENERIC 'NMP-GF-05 '(X) 'NIL) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'NMP-GF-05 'NMP-GF-05) (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'NMP-GF-05) (t (c) nil))
-  (handler-case (%DEFMETHOD 'NMP-GF-05 ':AROUND (LIST 'NUMBER)
- (LAMBDA (X) (NOTNOT-MV (NEXT-METHOD-P)))) (t (c) nil))
-  (handler-case (%DEFMETHOD 'NMP-GF-05 'NIL (LIST 'INTEGER) (LAMBDA (X) 'FOO)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'NMP-GF-05 ':AROUND (LIST 'NUMBER)
+ (LAMBDA (X) (NOTNOT-MV (NEXT-METHOD-P))) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'NMP-GF-05 'NIL (LIST 'INTEGER) (LAMBDA (X) 'FOO) '(X)) (t (c) nil))
 )
 (defun run-ansi-next-method-p-chunk-1 ()
   (handler-case (run-test 27428 (lambda () (NMP-GF-01 10)) 'T) (t (c) (%test-crash-fail-c 27428 c)))
@@ -180862,8 +180902,8 @@ NIL
   (handler-case (run-test 27438 (lambda () (HANDLER-CASE
                             (PROGN
                              (PROGN
-                              (%DEFMETHOD 'NMP-GF-06 'NIL (LIST 'T)
-                               (LAMBDA (X) (NEXT-METHOD-P NIL)))
+                              (%DEFMETHOD-META 'NMP-GF-06 'NIL (LIST 'T)
+                               (LAMBDA (X) (NEXT-METHOD-P NIL)) '(X))
                               (NMP-GF-06 NIL))
                              NIL)
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 27438 c)))
@@ -180901,17 +180941,17 @@ NIL
   (handler-case (%DEFGENERIC 'NMP-GF-04 '(X Y) 'NIL) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'NMP-GF-04 'NMP-GF-04) (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'NMP-GF-04) (t (c) nil))
-  (handler-case (%DEFMETHOD 'NMP-GF-04 'NIL (LIST 'INTEGER 'SYMBOL)
- (LAMBDA (X Y) #'NEXT-METHOD-P)) (t (c) nil))
-  (handler-case (%DEFMETHOD 'NMP-GF-04 'NIL (LIST 'T (LIST 'EQL NIL))
- (LAMBDA (X Y) (CONSTANTLY 2))) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'NMP-GF-04 'NIL (LIST 'INTEGER 'SYMBOL)
+ (LAMBDA (X Y) #'NEXT-METHOD-P) '(X Y)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'NMP-GF-04 'NIL (LIST 'T (LIST 'EQL NIL))
+ (LAMBDA (X Y) (CONSTANTLY 2)) '(X Y)) (t (c) nil))
   (handler-case (%VALIDATE-DEFGENERIC-OPTIONS 'NMP-GF-05 '(X) 'NIL) (t (c) nil))
   (handler-case (%DEFGENERIC 'NMP-GF-05 '(X) 'NIL) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'NMP-GF-05 'NMP-GF-05) (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'NMP-GF-05) (t (c) nil))
-  (handler-case (%DEFMETHOD 'NMP-GF-05 ':AROUND (LIST 'NUMBER)
- (LAMBDA (X) (NOTNOT-MV (NEXT-METHOD-P)))) (t (c) nil))
-  (handler-case (%DEFMETHOD 'NMP-GF-05 'NIL (LIST 'INTEGER) (LAMBDA (X) 'FOO)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'NMP-GF-05 ':AROUND (LIST 'NUMBER)
+ (LAMBDA (X) (NOTNOT-MV (NEXT-METHOD-P))) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'NMP-GF-05 'NIL (LIST 'INTEGER) (LAMBDA (X) 'FOO) '(X)) (t (c) nil))
   (%try-chunk "next-method-p" 8970959 1 #'run-ansi-next-method-p-chunk-1)
   (%try-chunk "next-method-p" 8970959 2 #'run-ansi-next-method-p-chunk-2)
 )
@@ -180948,20 +180988,20 @@ NIL
 (in-package :modus.mvm)
 (DEFUN NO-NEXT-METH-GF-01 (&REST %GF-ARGS)
   (%GF-DISPATCH 'NO-NEXT-METH-GF-01 %GF-ARGS))
-(%DEFMETHOD 'NO-NEXT-METH-GF-01 'NIL (LIST 'INTEGER)
- (LAMBDA (X) (CALL-NEXT-METHOD)))
-(%DEFMETHOD 'NO-NEXT-METH-GF-01 ':AROUND (LIST 'CHARACTER)
- (LAMBDA (X) (CALL-NEXT-METHOD)))
+(%DEFMETHOD-META 'NO-NEXT-METH-GF-01 'NIL (LIST 'INTEGER)
+ (LAMBDA (X) (CALL-NEXT-METHOD)) '(X))
+(%DEFMETHOD-META 'NO-NEXT-METH-GF-01 ':AROUND (LIST 'CHARACTER)
+ (LAMBDA (X) (CALL-NEXT-METHOD)) '(X))
 (defun run-init-no-next-method ()
   (handler-case (%VALIDATE-DEFGENERIC-OPTIONS 'NO-NEXT-METH-GF-01 '(X) 'NIL) (t (c) nil))
   (handler-case (%DEFGENERIC 'NO-NEXT-METH-GF-01 '(X) 'NIL) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'NO-NEXT-METH-GF-01 'NO-NEXT-METH-GF-01)
               (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'NO-NEXT-METH-GF-01) (t (c) nil))
-  (handler-case (%DEFMETHOD 'NO-NEXT-METH-GF-01 'NIL (LIST 'INTEGER)
- (LAMBDA (X) (CALL-NEXT-METHOD))) (t (c) nil))
-  (handler-case (%DEFMETHOD 'NO-NEXT-METH-GF-01 ':AROUND (LIST 'CHARACTER)
- (LAMBDA (X) (CALL-NEXT-METHOD))) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'NO-NEXT-METH-GF-01 'NIL (LIST 'INTEGER)
+ (LAMBDA (X) (CALL-NEXT-METHOD)) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'NO-NEXT-METH-GF-01 ':AROUND (LIST 'CHARACTER)
+ (LAMBDA (X) (CALL-NEXT-METHOD)) '(X)) (t (c) nil))
 )
 (defun run-ansi-no-next-method-chunk-1 ()
   (handler-case (run-test 27440 (lambda () (HANDLER-CASE (PROGN (NO-NEXT-METH-GF-01 10) :BAD)
@@ -180975,10 +181015,10 @@ NIL
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'NO-NEXT-METH-GF-01 'NO-NEXT-METH-GF-01)
               (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'NO-NEXT-METH-GF-01) (t (c) nil))
-  (handler-case (%DEFMETHOD 'NO-NEXT-METH-GF-01 'NIL (LIST 'INTEGER)
- (LAMBDA (X) (CALL-NEXT-METHOD))) (t (c) nil))
-  (handler-case (%DEFMETHOD 'NO-NEXT-METH-GF-01 ':AROUND (LIST 'CHARACTER)
- (LAMBDA (X) (CALL-NEXT-METHOD))) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'NO-NEXT-METH-GF-01 'NIL (LIST 'INTEGER)
+ (LAMBDA (X) (CALL-NEXT-METHOD)) '(X)) (t (c) nil))
+  (handler-case (%DEFMETHOD-META 'NO-NEXT-METH-GF-01 ':AROUND (LIST 'CHARACTER)
+ (LAMBDA (X) (CALL-NEXT-METHOD)) '(X)) (t (c) nil))
   (%try-chunk "no-next-method" 11647342 1 #'run-ansi-no-next-method-chunk-1)
 )
 
@@ -180986,11 +181026,12 @@ NIL
 
 ;; === reinitialize-instance.lsp ===
 (in-package :modus.mvm)
-(%DEFMETHOD 'REINITIALIZE-INSTANCE ':AFTER (LIST 'REINIT-CLASS-01)
+(%DEFMETHOD-META 'REINITIALIZE-INSTANCE ':AFTER (LIST 'REINIT-CLASS-01)
  (LAMBDA (INSTANCE &REST INITARGS &KEY (X NIL X-P))
    (DECLARE (IGNORE INITARGS))
    (WHEN X-P (SET-SLOT-VALUE INSTANCE 'A X))
-   INSTANCE))
+   INSTANCE)
+ '(INSTANCE &REST INITARGS &KEY X))
 (defun run-init-reinitialize-instance ()
   (handler-case (%DEFCLASS 'REINIT-CLASS-01 '(A B) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'REINIT-CLASS-01 (LIST (CONS ':B 'B) (CONS ':A 'A))
@@ -180999,11 +181040,12 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'REINIT-CLASS-01 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'REINIT-CLASS-01 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'REINIT-CLASS-01 NIL) (t (c) nil))
-  (handler-case (%DEFMETHOD 'REINITIALIZE-INSTANCE ':AFTER (LIST 'REINIT-CLASS-01)
+  (handler-case (%DEFMETHOD-META 'REINITIALIZE-INSTANCE ':AFTER (LIST 'REINIT-CLASS-01)
  (LAMBDA (INSTANCE &REST INITARGS &KEY (X NIL X-P))
    (DECLARE (IGNORE INITARGS))
    (WHEN X-P (SET-SLOT-VALUE INSTANCE 'A X))
-   INSTANCE)) (t (c) nil))
+   INSTANCE)
+ '(INSTANCE &REST INITARGS &KEY X)) (t (c) nil))
 )
 (defun run-ansi-reinitialize-instance-chunk-1 ()
   (handler-case (run-test-mv 27442 (lambda () (multiple-value-list (LET* ((OBJ
@@ -181345,11 +181387,12 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'REINIT-CLASS-01 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'REINIT-CLASS-01 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'REINIT-CLASS-01 NIL) (t (c) nil))
-  (handler-case (%DEFMETHOD 'REINITIALIZE-INSTANCE ':AFTER (LIST 'REINIT-CLASS-01)
+  (handler-case (%DEFMETHOD-META 'REINITIALIZE-INSTANCE ':AFTER (LIST 'REINIT-CLASS-01)
  (LAMBDA (INSTANCE &REST INITARGS &KEY (X NIL X-P))
    (DECLARE (IGNORE INITARGS))
    (WHEN X-P (SET-SLOT-VALUE INSTANCE 'A X))
-   INSTANCE)) (t (c) nil))
+   INSTANCE)
+ '(INSTANCE &REST INITARGS &KEY X)) (t (c) nil))
   (%try-chunk "reinitialize-instance" 3638692 1 #'run-ansi-reinitialize-instance-chunk-1)
   (%try-chunk "reinitialize-instance" 3638692 2 #'run-ansi-reinitialize-instance-chunk-2)
 )
@@ -181368,7 +181411,7 @@ NIL
                  (T (C) NIL))
    (%DG-GF-CALLABLE 'REMOVE-METH-GF-01)))
 (DEFPARAMETER *REMOVE-METH-GF-01-METHOD-T*
-  (%DEFMETHOD 'REMOVE-METH-GF-01 'NIL (LIST 'T) (LAMBDA (X) X)))
+  (%DEFMETHOD-META 'REMOVE-METH-GF-01 'NIL (LIST 'T) (LAMBDA (X) X) '(X)))
 (DEFPARAMETER *REMOVE-METH-GF-02*
   (PROGN
    (%VALIDATE-DEFGENERIC-OPTIONS 'REMOVE-METH-GF-02 '(X) 'NIL)
@@ -181379,7 +181422,7 @@ NIL
                  (T (C) NIL))
    (%DG-GF-CALLABLE 'REMOVE-METH-GF-02)))
 (DEFPARAMETER *REMOVE-METH-GF-02-METHOD-T*
-  (%DEFMETHOD 'REMOVE-METH-GF-02 'NIL (LIST 'T) (LAMBDA (X) X)))
+  (%DEFMETHOD-META 'REMOVE-METH-GF-02 'NIL (LIST 'T) (LAMBDA (X) X) '(X)))
 (DEFPARAMETER *REMOVE-METH-GF-03*
   (PROGN
    (%VALIDATE-DEFGENERIC-OPTIONS 'REMOVE-METH-GF-03 '(X) 'NIL)
@@ -181390,8 +181433,8 @@ NIL
                  (T (C) NIL))
    (%DG-GF-CALLABLE 'REMOVE-METH-GF-03)))
 (DEFPARAMETER *REMOVE-METH-GF-03-METHOD-T*
-  (%DEFMETHOD 'REMOVE-METH-GF-03 'NIL (LIST 'T)
-   (LAMBDA (X) (LIST *RMGF-03-VAR* X))))
+  (%DEFMETHOD-META 'REMOVE-METH-GF-03 'NIL (LIST 'T)
+   (LAMBDA (X) (LIST *RMGF-03-VAR* X)) '(X)))
 (defun run-init-remove-method ()
   (handler-case (setq *REMOVE-METH-GF-01* (PROGN
                            (%VALIDATE-DEFGENERIC-OPTIONS 'REMOVE-METH-GF-01
@@ -181404,8 +181447,8 @@ NIL
                              'REMOVE-METH-GF-01)
                             (T (C) NIL))
                            (%DG-GF-CALLABLE 'REMOVE-METH-GF-01))) (t (c) nil))
-  (handler-case (setq *REMOVE-METH-GF-01-METHOD-T* (%DEFMETHOD 'REMOVE-METH-GF-01 'NIL
-                                    (LIST 'T) (LAMBDA (X) X))) (t (c) nil))
+  (handler-case (setq *REMOVE-METH-GF-01-METHOD-T* (%DEFMETHOD-META 'REMOVE-METH-GF-01 'NIL
+                                    (LIST 'T) (LAMBDA (X) X) '(X))) (t (c) nil))
   (handler-case (setq *REMOVE-METH-GF-02* (PROGN
                            (%VALIDATE-DEFGENERIC-OPTIONS 'REMOVE-METH-GF-02
                             '(X) 'NIL)
@@ -181417,8 +181460,8 @@ NIL
                              'REMOVE-METH-GF-02)
                             (T (C) NIL))
                            (%DG-GF-CALLABLE 'REMOVE-METH-GF-02))) (t (c) nil))
-  (handler-case (setq *REMOVE-METH-GF-02-METHOD-T* (%DEFMETHOD 'REMOVE-METH-GF-02 'NIL
-                                    (LIST 'T) (LAMBDA (X) X))) (t (c) nil))
+  (handler-case (setq *REMOVE-METH-GF-02-METHOD-T* (%DEFMETHOD-META 'REMOVE-METH-GF-02 'NIL
+                                    (LIST 'T) (LAMBDA (X) X) '(X))) (t (c) nil))
   (handler-case (setq *REMOVE-METH-GF-03* (PROGN
                            (%VALIDATE-DEFGENERIC-OPTIONS 'REMOVE-METH-GF-03
                             '(X) 'NIL)
@@ -181430,9 +181473,9 @@ NIL
                              'REMOVE-METH-GF-03)
                             (T (C) NIL))
                            (%DG-GF-CALLABLE 'REMOVE-METH-GF-03))) (t (c) nil))
-  (handler-case (setq *REMOVE-METH-GF-03-METHOD-T* (%DEFMETHOD 'REMOVE-METH-GF-03 'NIL
+  (handler-case (setq *REMOVE-METH-GF-03-METHOD-T* (%DEFMETHOD-META 'REMOVE-METH-GF-03 'NIL
                                     (LIST 'T)
-                                    (LAMBDA (X) (LIST *RMGF-03-VAR* X)))) (t (c) nil))
+                                    (LAMBDA (X) (LIST *RMGF-03-VAR* X)) '(X))) (t (c) nil))
 )
 (defun run-ansi-remove-method-chunk-1 ()
   (handler-case (run-test 27455 (lambda () (AND
@@ -181446,12 +181489,13 @@ NIL
                                                       (REMOVE-METH-GF-01 10)
                                                       (PROGN
                                                        (SETF METH
-                                                               (%DEFMETHOD
+                                                               (%DEFMETHOD-META
                                                                 'REMOVE-METH-GF-01
                                                                 'NIL
                                                                 (LIST 'INTEGER)
                                                                 (LAMBDA (X)
-                                                                  (1+ X))))
+                                                                  (1+ X))
+                                                                '(X)))
                                                        NIL)
                                                       (REMOVE-METH-GF-01 10)
                                                       (EQT *REMOVE-METH-GF-01*
@@ -181470,23 +181514,25 @@ NIL
                                                        '(19 A))
                                                       (PROGN
                                                        (SETF METH1
-                                                               (%DEFMETHOD
+                                                               (%DEFMETHOD-META
                                                                 'REMOVE-METH-GF-01
                                                                 'NIL
                                                                 (LIST 'SYMBOL)
                                                                 (LAMBDA (X)
-                                                                  (LIST X))))
+                                                                  (LIST X))
+                                                                '(X)))
                                                        (MAPCAR
                                                         #'REMOVE-METH-GF-01
                                                         '(19 A)))
                                                       (PROGN
                                                        (SETF METH2
-                                                               (%DEFMETHOD
+                                                               (%DEFMETHOD-META
                                                                 'REMOVE-METH-GF-01
                                                                 'NIL
                                                                 (LIST 'NUMBER)
                                                                 (LAMBDA (X)
-                                                                  (1+ X))))
+                                                                  (1+ X))
+                                                                '(X)))
                                                        (MAPCAR
                                                         #'REMOVE-METH-GF-01
                                                         '(19 A)))
@@ -181515,23 +181561,25 @@ NIL
                                                        '(19 A))
                                                       (PROGN
                                                        (SETF METH1
-                                                               (%DEFMETHOD
+                                                               (%DEFMETHOD-META
                                                                 'REMOVE-METH-GF-01
                                                                 'NIL
                                                                 (LIST 'SYMBOL)
                                                                 (LAMBDA (X)
-                                                                  (LIST X))))
+                                                                  (LIST X))
+                                                                '(X)))
                                                        (MAPCAR
                                                         #'REMOVE-METH-GF-01
                                                         '(19 A)))
                                                       (PROGN
                                                        (SETF METH2
-                                                               (%DEFMETHOD
+                                                               (%DEFMETHOD-META
                                                                 'REMOVE-METH-GF-01
                                                                 'NIL
                                                                 (LIST 'NUMBER)
                                                                 (LAMBDA (X)
-                                                                  (1+ X))))
+                                                                  (1+ X))
+                                                                '(X)))
                                                        (MAPCAR
                                                         #'REMOVE-METH-GF-01
                                                         '(19 A)))
@@ -181561,23 +181609,25 @@ NIL
                                                        '(10 20.0))
                                                       (PROGN
                                                        (SETF METH1
-                                                               (%DEFMETHOD
+                                                               (%DEFMETHOD-META
                                                                 'REMOVE-METH-GF-01
                                                                 'NIL
                                                                 (LIST 'INTEGER)
                                                                 (LAMBDA (X)
-                                                                  (1- X))))
+                                                                  (1- X))
+                                                                '(X)))
                                                        (MAPCAR
                                                         #'REMOVE-METH-GF-01
                                                         '(10 20.0)))
                                                       (PROGN
                                                        (SETF METH2
-                                                               (%DEFMETHOD
+                                                               (%DEFMETHOD-META
                                                                 'REMOVE-METH-GF-01
                                                                 'NIL
                                                                 (LIST 'NUMBER)
                                                                 (LAMBDA (X)
-                                                                  (1+ X))))
+                                                                  (1+ X))
+                                                                '(X)))
                                                        (MAPCAR
                                                         #'REMOVE-METH-GF-01
                                                         '(10 20.0)))
@@ -181613,23 +181663,25 @@ NIL
                                                        '(10 20.0))
                                                       (PROGN
                                                        (SETF METH1
-                                                               (%DEFMETHOD
+                                                               (%DEFMETHOD-META
                                                                 'REMOVE-METH-GF-01
                                                                 'NIL
                                                                 (LIST 'INTEGER)
                                                                 (LAMBDA (X)
-                                                                  (1- X))))
+                                                                  (1- X))
+                                                                '(X)))
                                                        (MAPCAR
                                                         #'REMOVE-METH-GF-01
                                                         '(10 20.0)))
                                                       (PROGN
                                                        (SETF METH2
-                                                               (%DEFMETHOD
+                                                               (%DEFMETHOD-META
                                                                 'REMOVE-METH-GF-01
                                                                 'NIL
                                                                 (LIST 'NUMBER)
                                                                 (LAMBDA (X)
-                                                                  (1+ X))))
+                                                                  (1+ X))
+                                                                '(X)))
                                                        (MAPCAR
                                                         #'REMOVE-METH-GF-01
                                                         '(10 20.0)))
@@ -181665,23 +181717,25 @@ NIL
                                                        '(10 20.0))
                                                       (PROGN
                                                        (SETF METH1
-                                                               (%DEFMETHOD
+                                                               (%DEFMETHOD-META
                                                                 'REMOVE-METH-GF-01
                                                                 'NIL
                                                                 (LIST 'NUMBER)
                                                                 (LAMBDA (X)
-                                                                  (1+ X))))
+                                                                  (1+ X))
+                                                                '(X)))
                                                        (MAPCAR
                                                         #'REMOVE-METH-GF-01
                                                         '(10 20.0)))
                                                       (PROGN
                                                        (SETF METH2
-                                                               (%DEFMETHOD
+                                                               (%DEFMETHOD-META
                                                                 'REMOVE-METH-GF-01
                                                                 'NIL
                                                                 (LIST 'INTEGER)
                                                                 (LAMBDA (X)
-                                                                  (1- X))))
+                                                                  (1- X))
+                                                                '(X)))
                                                        (MAPCAR
                                                         #'REMOVE-METH-GF-01
                                                         '(10 20.0)))
@@ -181717,23 +181771,25 @@ NIL
                                                        '(10 20.0))
                                                       (PROGN
                                                        (SETF METH1
-                                                               (%DEFMETHOD
+                                                               (%DEFMETHOD-META
                                                                 'REMOVE-METH-GF-01
                                                                 'NIL
                                                                 (LIST 'NUMBER)
                                                                 (LAMBDA (X)
-                                                                  (1+ X))))
+                                                                  (1+ X))
+                                                                '(X)))
                                                        (MAPCAR
                                                         #'REMOVE-METH-GF-01
                                                         '(10 20.0)))
                                                       (PROGN
                                                        (SETF METH2
-                                                               (%DEFMETHOD
+                                                               (%DEFMETHOD-META
                                                                 'REMOVE-METH-GF-01
                                                                 'NIL
                                                                 (LIST 'INTEGER)
                                                                 (LAMBDA (X)
-                                                                  (1- X))))
+                                                                  (1- X))
+                                                                '(X)))
                                                        (MAPCAR
                                                         #'REMOVE-METH-GF-01
                                                         '(10 20.0)))
@@ -181773,13 +181829,14 @@ NIL
                                                        '(5 A))
                                                       (PROGN
                                                        (SETF METH
-                                                               (%DEFMETHOD
+                                                               (%DEFMETHOD-META
                                                                 'REMOVE-METH-GF-03
                                                                 ':BEFORE
                                                                 (LIST 'NUMBER)
                                                                 (LAMBDA (X)
                                                                   (INCF
-                                                                   *RMGF-03-VAR*))))
+                                                                   *RMGF-03-VAR*))
+                                                                '(X)))
                                                        (MAPCAR
                                                         #'REMOVE-METH-GF-03
                                                         '(5 A)))
@@ -181805,13 +181862,14 @@ NIL
                                                        '(5 A))
                                                       (PROGN
                                                        (SETF METH
-                                                               (%DEFMETHOD
+                                                               (%DEFMETHOD-META
                                                                 'REMOVE-METH-GF-03
                                                                 ':AFTER
                                                                 (LIST 'NUMBER)
                                                                 (LAMBDA (X)
                                                                   (INCF
-                                                                   *RMGF-03-VAR*))))
+                                                                   *RMGF-03-VAR*))
+                                                                '(X)))
                                                        (MAPCAR
                                                         #'REMOVE-METH-GF-03
                                                         '(5 A)))
@@ -181837,7 +181895,7 @@ NIL
                                                        '(5 A))
                                                       (PROGN
                                                        (SETF METH
-                                                               (%DEFMETHOD
+                                                               (%DEFMETHOD-META
                                                                 'REMOVE-METH-GF-03
                                                                 ':AROUND
                                                                 (LIST 'NUMBER)
@@ -181847,7 +181905,8 @@ NIL
                                                                   (PROG1
                                                                       (CALL-NEXT-METHOD)
                                                                     (DECF
-                                                                     *RMGF-03-VAR*)))))
+                                                                     *RMGF-03-VAR*)))
+                                                                '(X)))
                                                        (MAPCAR
                                                         #'REMOVE-METH-GF-03
                                                         '(5 A)))
@@ -181877,8 +181936,8 @@ NIL
                              'REMOVE-METH-GF-01)
                             (T (C) NIL))
                            (%DG-GF-CALLABLE 'REMOVE-METH-GF-01))) (t (c) nil))
-  (handler-case (setq *REMOVE-METH-GF-01-METHOD-T* (%DEFMETHOD 'REMOVE-METH-GF-01 'NIL
-                                    (LIST 'T) (LAMBDA (X) X))) (t (c) nil))
+  (handler-case (setq *REMOVE-METH-GF-01-METHOD-T* (%DEFMETHOD-META 'REMOVE-METH-GF-01 'NIL
+                                    (LIST 'T) (LAMBDA (X) X) '(X))) (t (c) nil))
   (handler-case (setq *REMOVE-METH-GF-02* (PROGN
                            (%VALIDATE-DEFGENERIC-OPTIONS 'REMOVE-METH-GF-02
                             '(X) 'NIL)
@@ -181890,8 +181949,8 @@ NIL
                              'REMOVE-METH-GF-02)
                             (T (C) NIL))
                            (%DG-GF-CALLABLE 'REMOVE-METH-GF-02))) (t (c) nil))
-  (handler-case (setq *REMOVE-METH-GF-02-METHOD-T* (%DEFMETHOD 'REMOVE-METH-GF-02 'NIL
-                                    (LIST 'T) (LAMBDA (X) X))) (t (c) nil))
+  (handler-case (setq *REMOVE-METH-GF-02-METHOD-T* (%DEFMETHOD-META 'REMOVE-METH-GF-02 'NIL
+                                    (LIST 'T) (LAMBDA (X) X) '(X))) (t (c) nil))
   (handler-case (setq *REMOVE-METH-GF-03* (PROGN
                            (%VALIDATE-DEFGENERIC-OPTIONS 'REMOVE-METH-GF-03
                             '(X) 'NIL)
@@ -181903,9 +181962,9 @@ NIL
                              'REMOVE-METH-GF-03)
                             (T (C) NIL))
                            (%DG-GF-CALLABLE 'REMOVE-METH-GF-03))) (t (c) nil))
-  (handler-case (setq *REMOVE-METH-GF-03-METHOD-T* (%DEFMETHOD 'REMOVE-METH-GF-03 'NIL
+  (handler-case (setq *REMOVE-METH-GF-03-METHOD-T* (%DEFMETHOD-META 'REMOVE-METH-GF-03 'NIL
                                     (LIST 'T)
-                                    (LAMBDA (X) (LIST *RMGF-03-VAR* X)))) (t (c) nil))
+                                    (LAMBDA (X) (LIST *RMGF-03-VAR* X)) '(X))) (t (c) nil))
   (%try-chunk "remove-method" 11819051 1 #'run-ansi-remove-method-chunk-1)
   (%try-chunk "remove-method" 11819051 2 #'run-ansi-remove-method-chunk-2)
 )
@@ -181915,7 +181974,7 @@ NIL
 ;; === shared-initialize.lsp ===
 (in-package :modus.mvm)
 (DEFSTRUCT SHARED-INIT-CLASS-03 A B C)
-(%DEFMETHOD 'SHARED-INITIALIZE 'NIL (LIST 'SHARED-INIT-CLASS-03 'T)
+(%DEFMETHOD-META 'SHARED-INITIALIZE 'NIL (LIST 'SHARED-INIT-CLASS-03 'T)
  (LAMBDA
      (OBJ SLOTS-TO-INIT
       &KEY (A NIL A-P) (B NIL B-P) (C NIL C-P) &ALLOW-OTHER-KEYS)
@@ -181923,19 +181982,22 @@ NIL
    (WHEN A-P (SETF (SHARED-INIT-CLASS-03-A OBJ) A))
    (WHEN B-P (SETF (SHARED-INIT-CLASS-03-B OBJ) B))
    (WHEN C-P (SETF (SHARED-INIT-CLASS-03-C OBJ) C))
-   OBJ))
-(%DEFMETHOD 'SHARED-INITIALIZE ':BEFORE (LIST 'SHARED-INIT-CLASS-07 'T)
+   OBJ)
+ '(OBJ SLOTS-TO-INIT &KEY A B C &ALLOW-OTHER-KEYS))
+(%DEFMETHOD-META 'SHARED-INITIALIZE ':BEFORE (LIST 'SHARED-INIT-CLASS-07 'T)
  (LAMBDA (OBJ SLOT-NAMES &REST ARGS)
    (DECLARE (IGNORE ARGS SLOT-NAMES))
    (SET-SLOT-VALUE OBJ 'A 'FOO)
-   OBJ))
-(%DEFMETHOD 'SHARED-INITIALIZE ':AROUND (LIST 'SHARED-INIT-CLASS-08 'T)
+   OBJ)
+ '(OBJ SLOT-NAMES &REST ARGS))
+(%DEFMETHOD-META 'SHARED-INITIALIZE ':AROUND (LIST 'SHARED-INIT-CLASS-08 'T)
  (LAMBDA (OBJ SLOT-NAMES &REST ARGS &KEY ONLY &ALLOW-OTHER-KEYS)
    (DECLARE (IGNORE SLOT-NAMES ARGS))
    (SET-SLOT-VALUE OBJ 'A 'FOO)
    (IF ONLY
        OBJ
-       (CALL-NEXT-METHOD))))
+       (CALL-NEXT-METHOD)))
+ '(OBJ SLOT-NAMES &REST ARGS &KEY ONLY &ALLOW-OTHER-KEYS))
 (defun run-init-shared-initialize ()
   (handler-case (%DEFCLASS 'SHARED-INIT-CLASS-01 '(A B C D) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'SHARED-INIT-CLASS-01
@@ -181964,7 +182026,7 @@ NIL
      (%REGISTER-CLOS-DEFAULT-INITARGS 'SHARED-INIT-CLASS-02
       (LIST (CONS ':C (LAMBDA () 100))))
      (FIND-CLASS 'SHARED-INIT-CLASS-02 NIL)))) (t (c) nil))
-  (handler-case (%DEFMETHOD 'SHARED-INITIALIZE 'NIL (LIST 'SHARED-INIT-CLASS-03 'T)
+  (handler-case (%DEFMETHOD-META 'SHARED-INITIALIZE 'NIL (LIST 'SHARED-INIT-CLASS-03 'T)
  (LAMBDA
      (OBJ SLOTS-TO-INIT
       &KEY (A NIL A-P) (B NIL B-P) (C NIL C-P) &ALLOW-OTHER-KEYS)
@@ -181972,7 +182034,8 @@ NIL
    (WHEN A-P (SETF (SHARED-INIT-CLASS-03-A OBJ) A))
    (WHEN B-P (SETF (SHARED-INIT-CLASS-03-B OBJ) B))
    (WHEN C-P (SETF (SHARED-INIT-CLASS-03-C OBJ) C))
-   OBJ)) (t (c) nil))
+   OBJ)
+ '(OBJ SLOTS-TO-INIT &KEY A B C &ALLOW-OTHER-KEYS)) (t (c) nil))
   (handler-case (%DEFCLASS 'SHARED-INIT-CLASS-04A '(A B) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'SHARED-INIT-CLASS-04A
  (LIST (CONS ':B 'B) (CONS ':A 'A))
@@ -182011,11 +182074,12 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'SHARED-INIT-CLASS-07 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'SHARED-INIT-CLASS-07 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'SHARED-INIT-CLASS-07 NIL) (t (c) nil))
-  (handler-case (%DEFMETHOD 'SHARED-INITIALIZE ':BEFORE (LIST 'SHARED-INIT-CLASS-07 'T)
+  (handler-case (%DEFMETHOD-META 'SHARED-INITIALIZE ':BEFORE (LIST 'SHARED-INIT-CLASS-07 'T)
  (LAMBDA (OBJ SLOT-NAMES &REST ARGS)
    (DECLARE (IGNORE ARGS SLOT-NAMES))
    (SET-SLOT-VALUE OBJ 'A 'FOO)
-   OBJ)) (t (c) nil))
+   OBJ)
+ '(OBJ SLOT-NAMES &REST ARGS)) (t (c) nil))
   (handler-case (%DEFCLASS 'SHARED-INIT-CLASS-08 '(A B) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'SHARED-INIT-CLASS-08 (LIST)
  (LIST (CONS 'B (LAMBDA () 'Y)) (CONS 'A (LAMBDA () 'X)))) (t (c) nil))
@@ -182023,13 +182087,14 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'SHARED-INIT-CLASS-08 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'SHARED-INIT-CLASS-08 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'SHARED-INIT-CLASS-08 NIL) (t (c) nil))
-  (handler-case (%DEFMETHOD 'SHARED-INITIALIZE ':AROUND (LIST 'SHARED-INIT-CLASS-08 'T)
+  (handler-case (%DEFMETHOD-META 'SHARED-INITIALIZE ':AROUND (LIST 'SHARED-INIT-CLASS-08 'T)
  (LAMBDA (OBJ SLOT-NAMES &REST ARGS &KEY ONLY &ALLOW-OTHER-KEYS)
    (DECLARE (IGNORE SLOT-NAMES ARGS))
    (SET-SLOT-VALUE OBJ 'A 'FOO)
    (IF ONLY
        OBJ
-       (CALL-NEXT-METHOD)))) (t (c) nil))
+       (CALL-NEXT-METHOD)))
+ '(OBJ SLOT-NAMES &REST ARGS &KEY ONLY &ALLOW-OTHER-KEYS)) (t (c) nil))
   (handler-case (%DEFCLASS 'SHARED-INIT-CLASS-09 '(A B) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'SHARED-INIT-CLASS-09 (LIST)
  (LIST (CONS 'B (LAMBDA () 'Y)) (CONS 'A (LAMBDA () 'X)))) (t (c) nil))
@@ -183136,7 +183201,7 @@ NIL
      (%REGISTER-CLOS-DEFAULT-INITARGS 'SHARED-INIT-CLASS-02
       (LIST (CONS ':C (LAMBDA () 100))))
      (FIND-CLASS 'SHARED-INIT-CLASS-02 NIL)))) (t (c) nil))
-  (handler-case (%DEFMETHOD 'SHARED-INITIALIZE 'NIL (LIST 'SHARED-INIT-CLASS-03 'T)
+  (handler-case (%DEFMETHOD-META 'SHARED-INITIALIZE 'NIL (LIST 'SHARED-INIT-CLASS-03 'T)
  (LAMBDA
      (OBJ SLOTS-TO-INIT
       &KEY (A NIL A-P) (B NIL B-P) (C NIL C-P) &ALLOW-OTHER-KEYS)
@@ -183144,7 +183209,8 @@ NIL
    (WHEN A-P (SETF (SHARED-INIT-CLASS-03-A OBJ) A))
    (WHEN B-P (SETF (SHARED-INIT-CLASS-03-B OBJ) B))
    (WHEN C-P (SETF (SHARED-INIT-CLASS-03-C OBJ) C))
-   OBJ)) (t (c) nil))
+   OBJ)
+ '(OBJ SLOTS-TO-INIT &KEY A B C &ALLOW-OTHER-KEYS)) (t (c) nil))
   (handler-case (%DEFCLASS 'SHARED-INIT-CLASS-04A '(A B) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'SHARED-INIT-CLASS-04A
  (LIST (CONS ':B 'B) (CONS ':A 'A))
@@ -183183,11 +183249,12 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'SHARED-INIT-CLASS-07 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'SHARED-INIT-CLASS-07 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'SHARED-INIT-CLASS-07 NIL) (t (c) nil))
-  (handler-case (%DEFMETHOD 'SHARED-INITIALIZE ':BEFORE (LIST 'SHARED-INIT-CLASS-07 'T)
+  (handler-case (%DEFMETHOD-META 'SHARED-INITIALIZE ':BEFORE (LIST 'SHARED-INIT-CLASS-07 'T)
  (LAMBDA (OBJ SLOT-NAMES &REST ARGS)
    (DECLARE (IGNORE ARGS SLOT-NAMES))
    (SET-SLOT-VALUE OBJ 'A 'FOO)
-   OBJ)) (t (c) nil))
+   OBJ)
+ '(OBJ SLOT-NAMES &REST ARGS)) (t (c) nil))
   (handler-case (%DEFCLASS 'SHARED-INIT-CLASS-08 '(A B) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'SHARED-INIT-CLASS-08 (LIST)
  (LIST (CONS 'B (LAMBDA () 'Y)) (CONS 'A (LAMBDA () 'X)))) (t (c) nil))
@@ -183195,13 +183262,14 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'SHARED-INIT-CLASS-08 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'SHARED-INIT-CLASS-08 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'SHARED-INIT-CLASS-08 NIL) (t (c) nil))
-  (handler-case (%DEFMETHOD 'SHARED-INITIALIZE ':AROUND (LIST 'SHARED-INIT-CLASS-08 'T)
+  (handler-case (%DEFMETHOD-META 'SHARED-INITIALIZE ':AROUND (LIST 'SHARED-INIT-CLASS-08 'T)
  (LAMBDA (OBJ SLOT-NAMES &REST ARGS &KEY ONLY &ALLOW-OTHER-KEYS)
    (DECLARE (IGNORE SLOT-NAMES ARGS))
    (SET-SLOT-VALUE OBJ 'A 'FOO)
    (IF ONLY
        OBJ
-       (CALL-NEXT-METHOD)))) (t (c) nil))
+       (CALL-NEXT-METHOD)))
+ '(OBJ SLOT-NAMES &REST ARGS &KEY ONLY &ALLOW-OTHER-KEYS)) (t (c) nil))
   (handler-case (%DEFCLASS 'SHARED-INIT-CLASS-09 '(A B) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'SHARED-INIT-CLASS-09 (LIST)
  (LIST (CONS 'B (LAMBDA () 'Y)) (CONS 'A (LAMBDA () 'X)))) (t (c) nil))
@@ -184409,7 +184477,7 @@ NIL
 
 ;; === update-instance-for-different-class.lsp ===
 (in-package :modus.mvm)
-(%DEFMETHOD 'UPDATE-INSTANCE-FOR-DIFFERENT-CLASS 'NIL
+(%DEFMETHOD-META 'UPDATE-INSTANCE-FOR-DIFFERENT-CLASS 'NIL
  (LIST 'UIFDC-CLASS-01A 'UIFDC-CLASS-01B)
  (LAMBDA (FROM-OBJ TO-OBJ &REST INITARGS &KEY &ALLOW-OTHER-KEYS)
    (DECLARE (IGNORE INITARGS))
@@ -184421,13 +184489,15 @@ NIL
    (IF (SLOT-BOUNDP FROM-OBJ 'B)
        (SET-SLOT-VALUE TO-OBJ 'A (SLOT-VALUE FROM-OBJ 'B))
        (SLOT-MAKUNBOUND TO-OBJ 'A))
-   TO-OBJ))
-(%DEFMETHOD 'UPDATE-INSTANCE-FOR-DIFFERENT-CLASS ':AFTER
+   TO-OBJ)
+ '(FROM-OBJ TO-OBJ &REST INITARGS &KEY &ALLOW-OTHER-KEYS))
+(%DEFMETHOD-META 'UPDATE-INSTANCE-FOR-DIFFERENT-CLASS ':AFTER
  (LIST 'UIFDC-CLASS-01A 'UIFDC-CLASS-02)
  (LAMBDA (FROM-OBJ TO-OBJ &REST INITARGS &KEY &ALLOW-OTHER-KEYS)
    (DECLARE (IGNORE INITARGS))
    (SET-SLOT-VALUE TO-OBJ 'A 100)
-   TO-OBJ))
+   TO-OBJ)
+ '(FROM-OBJ TO-OBJ &REST INITARGS &KEY &ALLOW-OTHER-KEYS))
 (defun run-init-update-instance-for-different-class ()
   (handler-case (%DEFCLASS 'UIFDC-CLASS-01A '(A B) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'UIFDC-CLASS-01A (LIST (CONS ':B 'B) (CONS ':A 'A))
@@ -184442,7 +184512,7 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'UIFDC-CLASS-01B 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'UIFDC-CLASS-01B (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'UIFDC-CLASS-01B NIL) (t (c) nil))
-  (handler-case (%DEFMETHOD 'UPDATE-INSTANCE-FOR-DIFFERENT-CLASS 'NIL
+  (handler-case (%DEFMETHOD-META 'UPDATE-INSTANCE-FOR-DIFFERENT-CLASS 'NIL
  (LIST 'UIFDC-CLASS-01A 'UIFDC-CLASS-01B)
  (LAMBDA (FROM-OBJ TO-OBJ &REST INITARGS &KEY &ALLOW-OTHER-KEYS)
    (DECLARE (IGNORE INITARGS))
@@ -184454,7 +184524,8 @@ NIL
    (IF (SLOT-BOUNDP FROM-OBJ 'B)
        (SET-SLOT-VALUE TO-OBJ 'A (SLOT-VALUE FROM-OBJ 'B))
        (SLOT-MAKUNBOUND TO-OBJ 'A))
-   TO-OBJ)) (t (c) nil))
+   TO-OBJ)
+ '(FROM-OBJ TO-OBJ &REST INITARGS &KEY &ALLOW-OTHER-KEYS)) (t (c) nil))
   (handler-case (%DEFCLASS 'UIFDC-CLASS-02 '(A B) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'UIFDC-CLASS-02 (LIST (CONS ':B 'B) (CONS ':A 'A))
  (LIST (CONS 'A (LAMBDA () 'X)))) (t (c) nil))
@@ -184462,12 +184533,13 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'UIFDC-CLASS-02 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'UIFDC-CLASS-02 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'UIFDC-CLASS-02 NIL) (t (c) nil))
-  (handler-case (%DEFMETHOD 'UPDATE-INSTANCE-FOR-DIFFERENT-CLASS ':AFTER
+  (handler-case (%DEFMETHOD-META 'UPDATE-INSTANCE-FOR-DIFFERENT-CLASS ':AFTER
  (LIST 'UIFDC-CLASS-01A 'UIFDC-CLASS-02)
  (LAMBDA (FROM-OBJ TO-OBJ &REST INITARGS &KEY &ALLOW-OTHER-KEYS)
    (DECLARE (IGNORE INITARGS))
    (SET-SLOT-VALUE TO-OBJ 'A 100)
-   TO-OBJ)) (t (c) nil))
+   TO-OBJ)
+ '(FROM-OBJ TO-OBJ &REST INITARGS &KEY &ALLOW-OTHER-KEYS)) (t (c) nil))
 )
 (defun run-ansi-update-instance-for-different-class-chunk-1 ()
   (handler-case (run-test-mv 27582 (lambda () (multiple-value-list (LET* ((OBJ
@@ -184789,7 +184861,7 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'UIFDC-CLASS-01B 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'UIFDC-CLASS-01B (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'UIFDC-CLASS-01B NIL) (t (c) nil))
-  (handler-case (%DEFMETHOD 'UPDATE-INSTANCE-FOR-DIFFERENT-CLASS 'NIL
+  (handler-case (%DEFMETHOD-META 'UPDATE-INSTANCE-FOR-DIFFERENT-CLASS 'NIL
  (LIST 'UIFDC-CLASS-01A 'UIFDC-CLASS-01B)
  (LAMBDA (FROM-OBJ TO-OBJ &REST INITARGS &KEY &ALLOW-OTHER-KEYS)
    (DECLARE (IGNORE INITARGS))
@@ -184801,7 +184873,8 @@ NIL
    (IF (SLOT-BOUNDP FROM-OBJ 'B)
        (SET-SLOT-VALUE TO-OBJ 'A (SLOT-VALUE FROM-OBJ 'B))
        (SLOT-MAKUNBOUND TO-OBJ 'A))
-   TO-OBJ)) (t (c) nil))
+   TO-OBJ)
+ '(FROM-OBJ TO-OBJ &REST INITARGS &KEY &ALLOW-OTHER-KEYS)) (t (c) nil))
   (handler-case (%DEFCLASS 'UIFDC-CLASS-02 '(A B) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'UIFDC-CLASS-02 (LIST (CONS ':B 'B) (CONS ':A 'A))
  (LIST (CONS 'A (LAMBDA () 'X)))) (t (c) nil))
@@ -184809,12 +184882,13 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'UIFDC-CLASS-02 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'UIFDC-CLASS-02 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'UIFDC-CLASS-02 NIL) (t (c) nil))
-  (handler-case (%DEFMETHOD 'UPDATE-INSTANCE-FOR-DIFFERENT-CLASS ':AFTER
+  (handler-case (%DEFMETHOD-META 'UPDATE-INSTANCE-FOR-DIFFERENT-CLASS ':AFTER
  (LIST 'UIFDC-CLASS-01A 'UIFDC-CLASS-02)
  (LAMBDA (FROM-OBJ TO-OBJ &REST INITARGS &KEY &ALLOW-OTHER-KEYS)
    (DECLARE (IGNORE INITARGS))
    (SET-SLOT-VALUE TO-OBJ 'A 100)
-   TO-OBJ)) (t (c) nil))
+   TO-OBJ)
+ '(FROM-OBJ TO-OBJ &REST INITARGS &KEY &ALLOW-OTHER-KEYS)) (t (c) nil))
   (%try-chunk "update-instance-for-different-class" 912047 1 #'run-ansi-update-instance-for-different-class-chunk-1)
 )
 

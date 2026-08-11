@@ -3198,10 +3198,20 @@
              (setq aok-seen t)
              (setq aok val)))
           (t
-           (when (null (%clos-initarg-to-slot new-name key))
+           ;; CLHS 7.2.2: the valid set is the slot :initargs of the NEW
+           ;; class UNIONED with the &key parameter names of the applicable
+           ;; UPDATE-INSTANCE-FOR-DIFFERENT-CLASS / SHARED-INITIALIZE
+           ;; methods — NOT initialize-instance, which change-class never
+           ;; calls.  Checking slot initargs alone rejected the standard
+           ;; shape of passing data to a u-i-f-d-c :after method.
+           (when (null (%clos-change-class-initarg-valid-p new-name key))
              (setq bad-key key)
              (setq bad-key-p t)))))
       (setq cur (cdr (cdr cur))))
+    ;; An applicable method with &ALLOW-OTHER-KEYS accepts any keyword.
+    (when (and bad-key-p (not aok)
+               (%clos-change-class-methods-aok-p new-name))
+      (setq aok t))
     (when (and bad-key-p (not aok))
       (error "change-class: invalid initarg ~S for class ~S"
              bad-key new-name))
@@ -4000,7 +4010,15 @@
    Bypass APPLY+&rest through SHARED-INITIALIZE (which truncates
    trailing initargs when modus's funcall passes >4 args through
    the dispatch closure's &rest).  Call %shared-init-default-spread
-   directly with the args list, the same way make-instance does."
+   directly with the args list, the same way make-instance does.
+
+   CLHS 7.3: the initargs are validated first — against the slot :initarg
+   names plus the &key parameter names of the applicable
+   REINITIALIZE-INSTANCE / SHARED-INITIALIZE methods.  This used to do NO
+   validation at all, so (reinitialize-instance i :totally-bogus 2)
+   returned quietly."
+  (when (%clos-instance-p instance)
+    (%clos-validate-reinit-initargs (aref instance 1) initargs))
   (let ((gf (%find-gf 'shared-initialize)))
     (cond
       ((and gf (%gf-methods gf))

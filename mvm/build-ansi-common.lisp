@@ -3288,11 +3288,30 @@
                       ;; Positional / specialized: strip specializer.
                       (push (if (consp p) (car p) p) p-list))))
                  (nreverse p-list)))
-              (rewritten-body (mapcar #'rewrite-reader-forms body)))
-         ;; Use lambda directly — can be inside init expressions
-         `(%defmethod ',gf-name ',(if qualifier qualifier nil)
-                      (list ,@specs)
-                      (lambda ,params ,@rewritten-body)))))
+              (rewritten-body (mapcar #'rewrite-reader-forms body))
+              ;; Key-acceptance METADATA lambda list.  %gf-record-method-meta
+              ;; needs only the SHAPE (&optional/&rest/&key/&allow-other-keys
+              ;; markers) and the &key parameter NAMES, so strip every
+              ;; (var default supplied-p) down to its head: that keeps the
+              ;; ((:kw var) ...) form (whose exposed keyword IS :kw) while
+              ;; dropping default-value FORMS, which must not be quoted into
+              ;; the image — a default coming from a quasiquoted defmethod
+              ;; is an SB-INT:COMMA struct with no compile-time literal
+              ;; representation.
+              (meta-ll (mapcar (lambda (p)
+                                 (if (symbolp p) p (if (consp p) (car p) p)))
+                               params)))
+         ;; Use lambda directly — can be inside init expressions.
+         ;; %defmethod-META, not bare %defmethod: without the metadata every
+         ;; method compiled into the image reads as "unknown lambda list" to
+         ;; %gf-check-keys (CLHS 7.6.5) and to the CLHS 7.1.2 initarg-validity
+         ;; union, both of which treat unknown as LENIENT.  That is why the
+         ;; 7.1.2 &key-name term moved zero ANSI tests when it landed: the
+         ;; corpus's methods all arrive through THIS rewriter.
+         `(%defmethod-meta ',gf-name ',(if qualifier qualifier nil)
+                           (list ,@specs)
+                           (lambda ,params ,@rewritten-body)
+                           ',meta-ll))))
 
     ;; (make-instance 'class-name &rest initargs)
     ;; → (let ((tmp (%make-instance 'class)))
@@ -3623,7 +3642,11 @@
      (if (member (car form)
                  '(%defclass %register-clos-slot-info %register-clos-direct-slots
                    %register-clos-class-slots %register-clos-default-initargs
-                   %defgeneric %defmethod %define-condition %defpackage-impl
+                   ;; %defmethod-meta is what the defmethod rewriter emits;
+                   ;; %defmethod stays listed because ansi-bridge and hand-
+                   ;; written probe source still call it directly.
+                   %defgeneric %defmethod %defmethod-meta
+                   %define-condition %defpackage-impl
                    %register-gf-fn))
          t
          (or (%form-has-clos-reg-p (car form))
@@ -4144,6 +4167,18 @@
                                (when (and (consp form)
                                           (member (car form)
                                                   '(%defpackage-impl %defmethod
+                                                    ;; …and the metadata-
+                                                    ;; recording form the
+                                                    ;; defmethod rewriter now
+                                                    ;; emits.  This list is
+                                                    ;; matched on the HEAD
+                                                    ;; SYMBOL, so renaming the
+                                                    ;; emitted call without
+                                                    ;; adding it here would
+                                                    ;; silently stop routing
+                                                    ;; every top-level method
+                                                    ;; into run-init-FILE.
+                                                    %defmethod-meta
                                                     ;; Package-mutation SETUP forms
                                                     ;; (make-package/intern/export/
                                                     ;; in-package …) written at top

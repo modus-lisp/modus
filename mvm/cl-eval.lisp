@@ -1678,6 +1678,11 @@
   ;; CLOS internals so eval'd defgeneric/defmethod forms resolve.
   (puthash "%DEFGENERIC" ht #'%defgeneric)
   (puthash "%DEFMETHOD" ht #'%defmethod)
+  ;; …and the metadata-recording wrapper the BUILD-TIME defmethod expansions
+  ;; emit (compiler.lisp + the gate rewriter).  A corpus form that reaches
+  ;; the bridge as data — e.g. an (eval '(defmethod …)) rewritten at build
+  ;; time — resolves its head here.
+  (puthash "%DEFMETHOD-META" ht #'%defmethod-meta)
   ;; mvm-eval DEFMETHOD/DEFGENERIC expansion targets (WS3 flip): full runtime
   ;; defmethod semantics + function-cell stub install.  Without these in the
   ;; bridge table, mvm-eval's :call to them silently resolved nothing.

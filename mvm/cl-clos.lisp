@@ -2295,6 +2295,28 @@
         (%gf-set-method-meta gf (cons (cons m meta)
                                       (%gf-method-meta gf)))))))
 
+(defun %defmethod-meta (gf-name qualifier specializers fn method-ll)
+  "BUILD-TIME DEFMETHOD entry point: %DEFMETHOD plus the key-acceptance
+   metadata.
+
+   The compiler's DEFMETHOD expansion had two arms — the mvm-eval one
+   routes through %DEFMETHOD-FULL, which records meta; the build-time one
+   called bare %DEFMETHOD and recorded NOTHING.  So every method COMPILED
+   INTO the image was invisible to the three consumers of the meta table:
+   %CLOS-INIT-GF-ALLOWS-OTHER-KEYS-P (CLHS 7.1.2 &allow-other-keys term),
+   %CLOS-INIT-GF-KEY-NAME-P (7.1.2 &key-parameter-name term) and
+   %GF-CHECK-KEYS (7.6.5 call-time keyword validity).  A missing entry
+   reads as \"unknown lambda list\", which those consumers treat as
+   LENIENT — so initarg validation silently did nothing for the entire
+   compiled corpus.
+
+   Kept as a single 5-argument helper rather than an inline LET in the
+   expansion: DEFMETHOD expands at hundreds of sites in a gate image, and
+   one call is markedly less code than a let + two calls each time."
+  (let ((m (%defmethod gf-name qualifier specializers fn)))
+    (%gf-record-method-meta (%find-gf gf-name) m method-ll)
+    m))
+
 ;;; ------------------------------------------------------------------
 ;;; PER-PACKAGE generic-function resolution (the CLOS-side analogue of
 ;;; the #211 fn-key fold and the e513ab0 macro-table fold — this is the

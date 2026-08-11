@@ -4193,8 +4193,28 @@
                ;; defun-wins, so a real defgeneric earlier still governs; this
                ;; only matters when defmethod appears with no defgeneric.
                (defun ,gf-name (&rest ,args-var) (%gf-dispatch ',gf-name ,args-var))
-               (%defmethod ',gf-name ',qualifier (list ,@specs)
-                           (lambda ,lambda-params ,@body)))))))
+               ;; %DEFMETHOD-META, not bare %DEFMETHOD: the metadata
+               ;; (has-key has-rest aok key-names) harvested from the
+               ;; UNMODIFIED method lambda-list PARAMS.  Note PARAMS, not
+               ;; LAMBDA-PARAMS — the latter has an implicit
+               ;; &ALLOW-OTHER-KEYS appended for CLHS 7.6.5 body leniency
+               ;; and recording THAT would tell every consumer the method
+               ;; accepts any keyword.  This is the same list the
+               ;; mvm-eval arm passes to %DEFMETHOD-FULL.
+               (%defmethod-meta ',gf-name ',qualifier (list ,@specs)
+                                (lambda ,lambda-params ,@body)
+                                ;; SHAPE + &key NAMES only: strip each
+                                ;; (var default supplied-p) to its head so no
+                                ;; default-value FORM is quoted into the
+                                ;; image.  SYMBOLP is tested FIRST because an
+                                ;; in-image CL symbol is a CONS wrapper
+                                ;; (*sym-tag* . array) — a consp-first test
+                                ;; would take its CAR and record the tag.
+                                ',(mapcar (lambda (p)
+                                            (if (symbolp p)
+                                                p
+                                                (if (consp p) (car p) p)))
+                                          params)))))))
 
   ;; DEFINE-METHOD-COMBINATION — (define-method-combination name &rest options)
   ;; SHORT form: (define-method-combination name :operator op

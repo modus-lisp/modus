@@ -62,6 +62,12 @@
 (chk "slot.bogus-rejected" (progn (make-instance 'ia-base :nosuch 1) :ACCEPTED))
 ;; :ALLOW-OTHER-KEYS at the CALL SITE suppresses the check (CLHS 7.1.2c).
 (chk "callsite.aok-t"      (progn (make-instance 'ia-base :nosuch 1 :allow-other-keys t) :ACCEPTED))
+;; ORACLE QUIRK, do not "fix" Modus toward this row.  CLHS 7.1.2 suppresses
+;; the validity check only when :ALLOW-OTHER-KEYS is TRUE, so a NIL value
+;; should leave :NOSUCH invalid — Modus signals, SBCL does not.  SBCL is
+;; also self-inconsistent here: its inline constructor path accepts BOTH
+;; (t and nil), while the same forms under EVAL signal INITARG-ERROR for
+;; both.  Measured, not assumed (probes/…/aoknil2 experiment).
 (chk "callsite.aok-nil"    (progn (make-instance 'ia-base :nosuch 1 :allow-other-keys nil) :ACCEPTED))
 
 ;;; ------------------------------------------------------------------

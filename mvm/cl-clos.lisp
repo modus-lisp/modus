@@ -1201,6 +1201,158 @@
     ((%clos-init-methods-declare-key-p class-name key) t)
     (t nil)))
 
+;;; ------------------------------------------------------------------
+;;; CLHS 7.2.2 (CHANGE-CLASS) and 7.3 (REINITIALIZE-INSTANCE) initarg
+;;; validity.  Same UNION shape as 7.1.2 above, but over DIFFERENT generic
+;;; functions — and the standard is specific about which:
+;;;
+;;;   make-instance          initialize-instance / shared-initialize /
+;;;                          allocate-instance
+;;;   reinitialize-instance  reinitialize-instance / shared-initialize
+;;;   change-class           update-instance-for-different-class /
+;;;                          shared-initialize
+;;;
+;;; so none of the three can reuse another's predicate.  In particular an
+;;; INITIALIZE-INSTANCE &key name is NOT a valid initarg for either of the
+;;; other two operations, which is why these take the GF name as a
+;;; parameter rather than hard-coding the 7.1.2 trio.
+;;;
+;;; The specializer POSITION is a parameter for the same reason: the class
+;;; being initialized is parameter 0 of initialize-instance / shared-
+;;; initialize / reinitialize-instance, but the NEW class is parameter 1 of
+;;; UPDATE-INSTANCE-FOR-DIFFERENT-CLASS (its lambda list is (previous
+;;; current …)).  Scanning index 0 there would test the OLD class and
+;;; answer a different question.
+;;; ------------------------------------------------------------------
+
+(defun %clos-gf-method-key-at-p (gf-name cpl-names key-name idx)
+  "True if some method of GF-NAME whose specializer at position IDX is a
+   class in CPL-NAMES declares a &KEY parameter named KEY-NAME (a string).
+   The generalization of %clos-init-gf-key-name-p, which is the IDX 0 case
+   over the 7.1.2 generic functions."
+  (when (null key-name) (return-from %clos-gf-method-key-at-p nil))
+  (let ((gf (%find-gf gf-name)))
+    (when gf
+      (let ((cur (%gf-methods gf)))
+        (loop
+          (when (null cur) (return nil))
+          (let* ((m (car cur))
+                 (spec (nth idx (%method-specializers m))))
+            (when (and spec (%clos-cpl-name-member-p spec cpl-names))
+              ;; meta = (has-key has-rest aok key-name-strings)
+              (let ((meta (%gf-method-meta-for gf m)))
+                (when meta
+                  (let ((kc (nth 3 meta)))
+                    (loop
+                      (when (null kc) (return nil))
+                      (let ((kn (car kc)))
+                        (when (and (stringp kn) (> (length kn) 0)
+                                   (string-equal kn key-name))
+                          (return-from %clos-gf-method-key-at-p t)))
+                      (setq kc (cdr kc))))))))
+          (setq cur (cdr cur)))))))
+
+(defun %clos-gf-method-aok-at-p (gf-name cpl-names idx)
+  "True if some method of GF-NAME whose specializer at position IDX is a
+   class in CPL-NAMES declares &ALLOW-OTHER-KEYS — which makes EVERY
+   keyword a valid initarg for that operation."
+  (let ((gf (%find-gf gf-name)))
+    (when gf
+      (let ((cur (%gf-methods gf)))
+        (loop
+          (when (null cur) (return nil))
+          (let* ((m (car cur))
+                 (spec (nth idx (%method-specializers m))))
+            (when (and spec (%clos-cpl-name-member-p spec cpl-names))
+              (let ((meta (%gf-method-meta-for gf m)))
+                (when (and meta (nth 2 meta))
+                  (return-from %clos-gf-method-aok-at-p t)))))
+          (setq cur (cdr cur)))))))
+
+(defun %clos-reinit-initarg-valid-p (class-name key)
+  "CLHS 7.3: KEY is a valid initarg for (REINITIALIZE-INSTANCE instance …)
+   when it names a slot :initarg anywhere in CLASS-NAME's CPL, or is a &KEY
+   parameter of an applicable REINITIALIZE-INSTANCE / SHARED-INITIALIZE
+   method, or is :ALLOW-OTHER-KEYS.  INITIALIZE-INSTANCE keys are
+   deliberately absent — reinitialize-instance never calls it."
+  (cond
+    ((%clos-sym-name-eq key :allow-other-keys) t)
+    ((%clos-initarg-to-slot class-name key) t)
+    (t
+     (let ((kn (%clos-initarg-key-string key))
+           (cpl (%clos-class-cpl-names class-name)))
+       (and kn
+            (or (%clos-gf-method-key-at-p 'reinitialize-instance cpl kn 0)
+                (%clos-gf-method-key-at-p 'shared-initialize cpl kn 0)))))))
+
+(defun %clos-reinit-methods-aok-p (class-name)
+  "CLHS 7.3 leniency: an applicable REINITIALIZE-INSTANCE /
+   SHARED-INITIALIZE method with &ALLOW-OTHER-KEYS accepts any keyword."
+  (let ((cpl (%clos-class-cpl-names class-name)))
+    (or (%clos-gf-method-aok-at-p 'reinitialize-instance cpl 0)
+        (%clos-gf-method-aok-at-p 'shared-initialize cpl 0))))
+
+(defun %clos-validate-reinit-initargs (class-name initargs)
+  "Validate INITARGS for REINITIALIZE-INSTANCE on CLASS-NAME (CLHS 7.3).
+   PROGRAM-ERROR on a malformed / odd-length plist or a non-symbol key,
+   ERROR on an initarg outside the 7.3 union — unless :ALLOW-OTHER-KEYS is
+   true at the call site or an applicable method declares it.
+   Does nothing when CLASS-NAME is not a registered CLOS class."
+  (when (%find-clos-class class-name)
+    ;; 1. proper, even-length, symbol-keyed plist
+    (let ((cur initargs))
+      (loop
+        (when (null cur) (return nil))
+        (when (not (consp cur)) (%signal-program-error))
+        (when (null (cdr cur)) (%signal-program-error))
+        (let ((key (car cur)))
+          (when (not (or (symbolp key) (%cl-sym-p key)))
+            (%signal-program-error)))
+        (setq cur (cdr (cdr cur)))))
+    ;; 2. call-site :allow-other-keys — leftmost occurrence wins
+    (let ((aok nil) (aok-seen nil) (cur initargs))
+      (loop
+        (when (or (null cur) (null (cdr cur))) (return nil))
+        (when (and (not aok-seen) (%clos-sym-name-eq (car cur) :allow-other-keys))
+          (setq aok-seen t)
+          (when (car (cdr cur)) (setq aok t)))
+        (setq cur (cdr (cdr cur))))
+      (when (and (not aok) (%clos-reinit-methods-aok-p class-name))
+        (setq aok t))
+      ;; 3. every supplied initarg must be in the union
+      (unless aok
+        (let ((c2 initargs))
+          (loop
+            (when (null c2) (return nil))
+            (let ((key (car c2)))
+              (unless (%clos-reinit-initarg-valid-p class-name key)
+                (error "reinitialize-instance: invalid initarg ~S" key)))
+            (setq c2 (cdr (cdr c2)))))))))
+
+(defun %clos-change-class-initarg-valid-p (new-name key)
+  "CLHS 7.2.2: KEY is a valid initarg for (CHANGE-CLASS instance NEW-NAME …)
+   when it names a slot :initarg anywhere in NEW-NAME's CPL, or is a &KEY
+   parameter of an applicable UPDATE-INSTANCE-FOR-DIFFERENT-CLASS method
+   (whose NEW-class parameter is the SECOND one) or SHARED-INITIALIZE
+   method, or is :ALLOW-OTHER-KEYS."
+  (cond
+    ((%clos-sym-name-eq key :allow-other-keys) t)
+    ((%clos-initarg-to-slot new-name key) t)
+    (t
+     (let ((kn (%clos-initarg-key-string key))
+           (cpl (%clos-class-cpl-names new-name)))
+       (and kn
+            (or (%clos-gf-method-key-at-p 'update-instance-for-different-class
+                                          cpl kn 1)
+                (%clos-gf-method-key-at-p 'shared-initialize cpl kn 0)))))))
+
+(defun %clos-change-class-methods-aok-p (new-name)
+  "CLHS 7.2.2 leniency: an applicable UPDATE-INSTANCE-FOR-DIFFERENT-CLASS /
+   SHARED-INITIALIZE method with &ALLOW-OTHER-KEYS accepts any keyword."
+  (let ((cpl (%clos-class-cpl-names new-name)))
+    (or (%clos-gf-method-aok-at-p 'update-instance-for-different-class cpl 1)
+        (%clos-gf-method-aok-at-p 'shared-initialize cpl 0))))
+
 (defun %clos-validate-initargs-d (class-or-name initargs)
   "Like %clos-validate-initargs but accepts a class designator (name
    symbol OR class object).  Used by the compiled make-instance

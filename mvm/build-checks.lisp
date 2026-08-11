@@ -369,7 +369,19 @@
           ((string= v "0") :off)
           ((string-equal v "warn") :warn)
           ((string-equal v "dump") :dump)
+          ((string-equal v "force") :force)
           (t :error))))
+
+;;; The whole cost of this check is RE-READING the blob; the analysis itself is
+;;; sub-second.  Measured on the 17.9 MB build-x64-linux blob: 1129 s to read,
+;;; 0.7 s to analyse.  That blob is 17 MB of baked ANSI test corpus, and the
+;;; four ANSI GATE RUNNERS are the only images anywhere near it (the largest
+;;; shipping blob is build-modus-selfhost at 5.0 MB).  They are also the images
+;;; with the least to say: all four call INIT-ALL-GLOBALS, so check A is off
+;;; there by construction — and #242's lesson is precisely that the gate image
+;;; was the one already fine.  So: skip above a threshold, loudly, with an
+;;; override.  MODUS_GLOBAL_CHECK=force runs it anyway.
+(defvar *global-check-max-blob-chars* (* 8 1024 1024))
 
 (defun %gck-build-label ()
   "Basename of the build script SBCL was handed, e.g. \"build-generic-cli\".
@@ -377,13 +389,18 @@
    two build scripts for the SAME target disagreeing about whether an
    initialiser gets called."
   (or (sb-ext:posix-getenv "MODUS_GLOBAL_CHECK_LABEL")
-      (let ((argv (cdr sb-ext:*posix-argv*)))
-        (dolist (a argv)
-          (let ((p (ignore-errors (pathname a))))
-            (when (and p (equal (pathname-type p) "lisp")
-                       (let ((n (pathname-name p)))
-                         (and n (> (length n) 6) (string= "build-" n :end2 6))))
-              (return-from %gck-build-label (pathname-name p))))))
+      ;; `sbcl --script foo.lisp' leaves *POSIX-ARGV* = (\"sbcl\") — the script
+      ;; path is NOT in it (measured).  It IS in the SB-IMPL::PROCESS-SCRIPT
+      ;; stack frame, and that is the OUTERMOST script, which is what we want:
+      ;; *LOAD-TRUENAME* here would say \"build-ansi-common\" for all four ANSI
+      ;; gate runners, collapsing four distinct images into one label.
+      (let ((frames (ignore-errors (sb-debug:list-backtrace :count 400))))
+        (dolist (f frames)
+          (when (and (consp f) (eq (car f) 'sb-impl::process-script)
+                     (stringp (cadr f)))
+            (let ((n (pathname-name (pathname (cadr f)))))
+              (when n (return-from %gck-build-label n))))))
+      (and *load-truename* (pathname-name *load-truename*))
       "image"))
 
 (defun check-global-inits (source-text &key (label (%gck-build-label)))
@@ -402,6 +419,16 @@
                 (length source-text) out)
         (finish-output)
         (sb-ext:exit :code 0)))
+    (when (and (not (eq mode :force))
+               (> (length source-text) *global-check-max-blob-chars*))
+      (format t "~&;; check-global-inits (~A): blob is ~,1F MB (> ~,1F MB) — SKIPPED. ~
+This is an ANSI gate runner with the test corpus baked in; re-reading it costs ~
+~~20 min for a check that is structurally quiet there.  MODUS_GLOBAL_CHECK=force ~
+runs it anyway.~%"
+              label (/ (length source-text) 1048576.0)
+              (/ *global-check-max-blob-chars* 1048576.0))
+      (finish-output)
+      (return-from check-global-inits nil))
     (let* ((forms (handler-case (read-all-forms-with-locations source-text)
                     (error (e)
                       (format t "~&;; check-global-inits: unreadable blob (~A) — skipped~%" e)

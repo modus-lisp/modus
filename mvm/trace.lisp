@@ -173,7 +173,7 @@
                                       (- ,end ,start #x100000000))))
                      (let ((*trace-depth* (1- *trace-depth*)))
                        (trace-exit ',name ,result ,cycles))
-                     ,result))))))))))
+                     ,result)))))))))
 
 ;;; ============================================================
 ;;; Simple profiling with timing accumulation

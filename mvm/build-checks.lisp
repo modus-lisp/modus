@@ -62,9 +62,16 @@
 ;;;;    a broken image.  D tees the build's output, buckets every compiler
 ;;;;    WARN by shape and ratchets the histogram.  See the CHECK D section.
 ;;;;
+;;;; E. SOURCE-PARSES (task #252).  A first-party .lisp that does not READ.
+;;;;    CHECK-PARSES already fails loudly on this — for the files the CURRENT
+;;;;    build concatenates.  E sweeps the whole tree, including the build
+;;;;    scripts themselves, so a file no routine build touches cannot carry a
+;;;;    read error for weeks.  See the CHECK E section.
+;;;;
 ;;;; A and B are about what the image never RUNS; C and D are about what the
-;;;; compiler silently DROPPED.  All four share one property: nothing fails,
-;;;; nothing is logged, and the damage shows up months later somewhere else.
+;;;; compiler silently DROPPED; E is about a file no build ever READS.  All
+;;;; five share one property: nothing fails, nothing is logged, and the damage
+;;;; shows up months later somewhere else.
 ;;;;
 ;;;; The call graph counts head position, #'NAME and 'NAME as calls, and does
 ;;;; not propagate through the generated name registries (see
@@ -83,7 +90,7 @@
 ;;;;   MODUS_GLOBAL_CHECK=force  run even on a blob over the size cap
 ;;;;   MODUS_GLOBAL_CHECK=dump   write the blob to $MODUS_GLOBAL_CHECK_OUT and
 ;;;;                             exit before compiling (offline analysis aid)
-;;;; Default: report and FAIL the build.  The knob covers all four checks.
+;;;; Default: report and FAIL the build.  The knob covers all five checks.
 ;;;;
 ;;;; BYTE-NEUTRALITY.  This file is host-only, but the host is not neutral:
 ;;;; CL:*GENSYM-COUNTER* leaks into every emitted image (see the REPRODUCIBILITY
@@ -1172,6 +1179,134 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
     fatal))
 
 ;;; ============================================================
+;;; CHECK E: SOURCE-PARSES — every first-party .lisp reads (task #252)
+;;; ============================================================
+;;; CHECK-PARSES (cross.lisp) already fails a build loudly on a file that does
+;;; not read.  Its blind spot is COVERAGE: a build script only calls it on the
+;;; files THAT build concatenates, so a file no routine build touches can carry
+;;; a read error indefinitely.  Two did, both found by hand at #252, both the
+;;; same shape — a prose comment containing a "quoted phrase", written INSIDE a
+;;; Lisp string literal, so the first inner quote terminated the string and the
+;;; prose became source:
+;;;
+;;;   boot/boot-linux-i386.lisp:147  (in a docstring)  -> build-i386-cli
+;;;       "Comma not inside a backquote."          broke at 7fcee4c
+;;;   mvm/build-mvm.lisp:340  (in *adapter-source*)    -> build-mvm
+;;;       "illegal terminating character after a colon"  broke at 1461e65
+;;;
+;;; Neither file is in any gate, so neither was read for weeks.  i386 is one of
+;;; the three platforms in the release gate (#203) and that side was not merely
+;;; unmeasured, it was UNBUILDABLE.
+;;;
+;;; So: sweep EVERY first-party .lisp in the tree once per build process,
+;;; whichever build it is — including the build scripts themselves, which
+;;; CHECK-PARSES structurally cannot cover (a build script is read by SBCL
+;;; before any Modus code runs).  Cost is ~1.5 s for 162 files; the sweep runs
+;;; once per process, not once per BUILD-IMAGE call.
+;;;
+;;; FALSE POSITIVES, measured on the whole tree.  Three files reference
+;;; packages that exist only inside a RUNNING image (CHIPZ, UIOP/ASDF, and the
+;;; Genera SCL/SYS/PROCESS/SI/CLI set).  Two of the three are cured by creating
+;;; the missing package on demand and deleting it again afterwards.  The third,
+;;; lib/install-tarball.lisp, uses `chipz:<external-symbol>' — a stub package
+;;; has no such external, and there is no way to satisfy that without a symbol
+;;; oracle — so it is excluded BY NAME, not by a pattern.  Keep that list at
+;;; three or fewer; a growing exclusion list means this check is being worked
+;;; around rather than used.
+(defvar *gck-parse-sweep-root*
+  (and *load-truename*
+       (make-pathname :directory (butlast (pathname-directory *load-truename*))
+                      :name nil :type nil :defaults *load-truename*))
+  "Repository root, derived at LOAD time from <root>/mvm/build-checks.lisp.")
+
+(defvar *gck-parse-sweep-dirs* '("boot" "lib" "mvm" "net" "runtime"))
+
+(defvar *gck-parse-sweep-exclusions* '("install-tarball")
+  "Pathname-names (no directory, no type) excluded from CHECK E.  See the
+   FALSE POSITIVES note above; each entry needs a reason there.")
+
+(defvar *gck-parse-sweep-done* nil
+  "CHECK E is tree-wide, not blob-wide, so it is worth running once per SBCL
+   process — not once per BUILD-IMAGE call (the fixpoint build makes several).")
+
+(defun %gck-parse-one (path stub-sink)
+  "Read PATH the way CHECK-PARSES does.  Returns NIL on success or a one-line
+   description of the reader error.  A `package X does not exist' error is not
+   a parse failure — create X, hand its name to STUB-SINK for later deletion,
+   and retry the file."
+  (loop for attempt from 0 below 16 do
+    (let ((outcome
+            (handler-case
+                (with-open-file (f path)
+                  (let ((*package* (or (find-package :modus.mvm) *package*)))
+                    (loop for next = (read f nil :eof) until (eq next :eof)))
+                  nil)
+              (package-error (e)
+                (let ((p (package-error-package e)))
+                  ;; A STRING designator means "no such package" — recoverable.
+                  ;; A PACKAGE object means "symbol not external in it" — real
+                  ;; for our purposes, and not a paren bug, so report it.
+                  (if (and p (or (stringp p) (symbolp p)) (not (find-package p)))
+                      (progn (make-package (string p) :use '(:cl))
+                             (funcall stub-sink (string p))
+                             :retry)
+                      (%gck-one-line e))))
+              (error (e) (%gck-one-line e)))))
+      (unless (eq outcome :retry) (return outcome))))
+  )
+
+(defun %gck-one-line (e)
+  "One-line rendering of a reader error.  SBCL appends `Stream: #<...>' to
+   every READER-ERROR report; it is pure noise once the file is named, and it
+   would eat the whole 160-char budget."
+  (let* ((s (substitute #\Space #\Newline (princ-to-string e)))
+         (cut (search "Stream: " s))
+         (s (string-trim " " (if cut (subseq s 0 cut) s))))
+    (subseq s 0 (min 160 (length s)))))
+
+(defun check-source-parses ()
+  "CHECK E.  Every .lisp under *GCK-PARSE-SWEEP-DIRS* must read cleanly."
+  (let ((mode (%gck-mode)))
+    (when (or (eq mode :off) *gck-parse-sweep-done* (null *gck-parse-sweep-root*))
+      (return-from check-source-parses nil))
+    (setf *gck-parse-sweep-done* t)
+    (let ((files (sort (loop for d in *gck-parse-sweep-dirs*
+                             append (directory
+                                     (merge-pathnames
+                                      (make-pathname :directory (list :relative d)
+                                                     :name :wild :type "lisp")
+                                      *gck-parse-sweep-root*)))
+                       #'string< :key #'namestring))
+          (stubs nil)
+          (findings nil))
+      (unwind-protect
+           (dolist (p files)
+             (unless (member (pathname-name p) *gck-parse-sweep-exclusions*
+                             :test #'string-equal)
+               (let ((e (%gck-parse-one p (lambda (n) (push n stubs)))))
+                 (when e
+                   (push (format nil "~A — ~A"
+                                 (enough-namestring p *gck-parse-sweep-root*) e)
+                         findings)))))
+        (dolist (s stubs) (ignore-errors (delete-package s))))
+      (setf findings (nreverse findings))
+      (format t "~&;; check-source-parses: ~D file~:P swept, ~D unreadable~%"
+              (length files) (length findings))
+      (finish-output)
+      (when findings
+        (let ((msg (format nil "~&~%*** check-source-parses: ~D file~:P do not read ***~%~
+A first-party source file failed SBCL's READ.  This is the #252 class: the~%~
+file builds nothing until it is fixed, and nothing else in the tree notices~%~
+because no gate reads it.  Common cause: a \"quoted phrase\" inside a Lisp~%~
+string literal or docstring — the inner quote ENDS the string.~%~
+Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
+                           (length findings) findings)))
+          (format t "~A" msg) (finish-output)
+          (unless (eq mode :warn)
+            (%gck-fail "check-source-parses failed"))))
+      findings)))
+
+;;; ============================================================
 ;;; Wiring: encapsulate BUILD-IMAGE
 ;;; ============================================================
 ;;; Every build script funnels through BUILD-IMAGE, so wrapping it here covers
@@ -1192,6 +1327,9 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
   "Read the blob ONCE and run every source-level check on it."
   (let ((mode (%gck-mode)))
     (when (eq mode :off) (return-from %gck-pre-checks nil))
+    ;; E is tree-wide and blob-independent, so it runs first and unconditionally
+    ;; (the size cap below is about re-reading a 17 MB blob, not about E).
+    (%gck-guard "check-source-parses" (check-source-parses))
     ;; check-global-inits owns the =dump / size-cap policy; let it run first
     ;; and only pre-read when it would not have skipped anyway.
     (if (or (eq mode :dump)

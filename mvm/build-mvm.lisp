@@ -337,7 +337,7 @@
     (aset v 8 (quote r11))
     ;; V9-V15 spill and V22 (VPC) is unmapped -> VREG-PHYS must return NIL.
     ;; Written EXPLICITLY: make-array zero-inits to FIXNUM 0, not NIL, and 0 is
-    ;; true, so an unwritten slot makes reg-info signal "Unknown register: 0".
+    ;; true, so an unwritten slot makes reg-info signal Unknown-register-0.
     (aset v 9 nil)  (aset v 10 nil) (aset v 11 nil) (aset v 12 nil)
     (aset v 13 nil) (aset v 14 nil) (aset v 15 nil) (aset v 22 nil)
     ;; V16=VR V17=VA V18=VL V19=VN V20=VSP V21=VFP V22=VPC

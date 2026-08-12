@@ -144,7 +144,7 @@
    and stays byte-identical to a pre-collector build.
 
    Consequence for debugging: on the hosted CLI a crash under sustained
-   allocation is NOT automatically "arena exhausted, no collector to call".
+   allocation is NOT automatically \"arena exhausted, no collector to call\".
    That inference is what this stale text invites, and it is wrong for the
    very build most likely to be under test (see task #218).  VL is at the
    semispace midpoint here, which is the GC-ON value, not the GC-OFF one.

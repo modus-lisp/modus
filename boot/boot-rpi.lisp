@@ -68,10 +68,13 @@
     (emit-aarch64-u32 buf #xD518C010)
     (emit-aarch64-u32 buf #xD5033FDF)
     ;; 6. Branch to native code at 0x1400
-    (let* ((cur (/ (mvm-buffer-position buf) 4))
+    ;; BUF is an a64-buffer (see emit-aarch64-u32 in boot-aarch64.lisp) since
+    ;; 8048454 unified boot + translator on one buffer, so POSITION already
+    ;; counts 32-bit INSTRUCTIONS -- no /4.
+    (let* ((cur (a64-buffer-position buf))
            (skip (- (/ #x1400 4) cur)))
       (emit-aarch64-u32 buf (logior (ash #b000101 26) (logand skip #x3FFFFFF)))
-      (let ((pad (- 512 (/ (mvm-buffer-position buf) 4))))
+      (let ((pad (- 512 (a64-buffer-position buf))))
         (dotimes (i pad) (emit-aarch64-u32 buf #xD503201F))))
     ;; 7. Exception vectors at 0x800
     (emit-rpi-exception-vectors buf)
@@ -320,14 +323,16 @@
 
 (defun emit-rpi-isr (buf)
   "Emit the DWC2 ISR at offset 0x1000 and pad to 0x1400."
-  (assert (= (mvm-buffer-position buf) #x1000))
+  ;; a64-buffer POSITION counts instructions, so byte offset 0x1000 is index
+  ;; #x400.  (See the note in emit-rpi-entry.)
+  (assert (= (a64-buffer-position buf) (/ #x1000 4)))
   (let ((insns (build-rpi-isr-vector)))
     (dotimes (i (length insns))
-      (mvm-emit-u32 buf (aref insns i))))
+      (emit-aarch64-u32 buf (aref insns i))))
   ;; Pad to offset 0x1400
-  (let ((pad (- (/ #x1400 4) (/ (mvm-buffer-position buf) 4))))
+  (let ((pad (- (/ #x1400 4) (a64-buffer-position buf))))
     (dotimes (i pad)
-      (mvm-emit-u32 buf #xD503201F))))
+      (emit-aarch64-u32 buf #xD503201F))))
 
 ;;; ============================================================
 ;;; RPi Boot Integration

@@ -17576,14 +17576,20 @@
             ;; `(when value …)` skipped a NIL initform → the var stayed
             ;; UNBOUND (asdf form 87 *image-dumped-p*; any `(defvar *x* nil)`
             ;; then a read of *x* under mvm-eval signalled UNBOUND-VARIABLE).
-            ;; ONLY emit the extra NIL-init thunk under mvm-eval (in-image
-            ;; runtime compile): at BUILD time init-thunks are not run
-            ;; (CLAUDE.md limitation #7), and generating one per every
-            ;; `(defvar *x* nil)` across the whole codebase perturbs the
-            ;; build layout — so keep the historical build-time behaviour
-            ;; (skip NIL) and only fix the runtime path that actually reads
-            ;; the value back.
-            (has-initform (if *mvm-eval-runtime-p* (consp (cddr form)) value))
+            ;; This USED to emit the NIL-init thunk only under mvm-eval, on the
+            ;; rationale that "at BUILD time init-thunks are not run (CLAUDE.md
+            ;; limitation #7)".  That premise is STALE: kernel-main calls
+            ;; (init-all-globals) at boot, and CHECK A verifies it.  So the
+            ;; skip-NIL branch left all 167 `(defvar *x* nil)` in the tree
+            ;; UNBOUND rather than NIL in every shipping image — CL:*MODULES*
+            ;; among them, which made PROVIDE/REQUIRE signal UNBOUND-VARIABLE
+            ;; and broke trivial-indent on the Quicklisp ladder.
+            ;;
+            ;; Ordering is safe: every build script calls (init-all-globals)
+            ;; FIRST and applies its explicit setq overrides AFTER, precisely
+            ;; so a defvar thunk cannot clobber them (see the "MUST come after
+            ;; init-all-globals" comments in build-generic-cli).
+            (has-initform (consp (cddr form)))
             (name-hash (normalize-name name)))
        ;; Register as global variable
        (setf (gethash name-hash *globals*) t)
@@ -17595,13 +17601,28 @@
        ;; 2) Wrap value in let to avoid register clobber when value is
        ;; a function call (which would clobber V0 holding the hash).
        (when has-initform
-         (let ((tmp-var (%mvm-gensym "INIT-TMP"))
-               (thunk-name (format nil "INIT-~A" (symbol-name name))))
+         (let* ((tmp-var (%mvm-gensym "INIT-TMP"))
+                (thunk-name (format nil "INIT-~A" (symbol-name name)))
+                (store `(let ((,tmp-var ,value))
+                          ,(%init-thunk-store name name-hash tmp-var))))
            (push thunk-name *init-thunk-names*)
            (mvm-compile-function
             thunk-name nil
-            (list `(let ((,tmp-var ,value))
-                     ,(%init-thunk-store name name-hash tmp-var))))))))
+            ;; A NIL initform is the case this arm was widened to cover, and
+            ;; it is the only one that can DESTROY state: several boot steps
+            ;; run BEFORE (init-all-globals) and store into a global that also
+            ;; has a `(defvar *x* nil)` somewhere — build-generic-cli's
+            ;; `(setq *macro-table* (make-hash-table))` is one, and an
+            ;; unconditional re-NIL of it breaks the reader outright.
+            ;;
+            ;; CLHS says DEFVAR assigns ONLY IF the variable is not already
+            ;; bound, so the guard is not a workaround — it is the specified
+            ;; behaviour, and it makes the widening safe by construction.
+            ;; Scoped to the NIL case so every pre-existing thunk emits
+            ;; byte-identical IR to before.
+            (list (if (null value)
+                      `(unless (boundp ',name) ,store)
+                      store)))))))
 
     ;; (defparameter name value) — same as defvar
     ((and (consp form) (name-eq (car form) "DEFPARAMETER"))
@@ -17609,6 +17630,10 @@
             (value (caddr form))
             ;; defparameter always has an initform (CLHS requires it); under
             ;; mvm-eval bind even a NIL initform (same rationale as DEFVAR).
+            ;; NOTE: deliberately NOT widened at build time the way DEFVAR was.
+            ;; DEFPARAMETER must ALWAYS assign (CLHS), so there is no
+            ;; boundp guard available to protect a value an earlier boot step
+            ;; already stored — widening this would re-NIL those unconditionally.
             (has-initform (if *mvm-eval-runtime-p* (consp (cddr form)) value))
             (name-hash (normalize-name name)))
        ;; Register as global variable

@@ -135,3 +135,79 @@ backquote sits in a LAMBDA body, a separate compilation scope.
 **This silent degradation is a live hazard worth its own build check** — the
 compiler already knows enough to print the warning; nothing fails the build on
 it.
+
+## 5. Probe rows
+
+`probes/binding-differential.lisp` section A10 — 44 rows (plus a
+`ds.slot.read-only.unchanged` row), both directions: valid access still
+returns the right value, invalid access signals a catchable TYPE-ERROR.
+Run with `./probes/run-binding-differential.sh <binary>`; the runner's grep
+now admits the `acc.` prefix.
+
+Disagreements with the SBCL oracle over those 44 rows:
+
+```
+baseline (modus-base) : 30 / 44
+fixed    (modus-fix)  :  2 / 44     <- both the documented residual
+                                       (acc.read.same-size-sibling,
+                                        acc.read.plain-vector)
+```
+
+The 87 rows OUTSIDE the accessor section are **byte-identical** between the
+two binaries, so nothing else moved.
+
+## 6. ANSI gate
+
+Gate binary built from this branch at `/home/claude/ws-acc/ansi-net`.
+Baseline `/home/claude/ws-mkinst/ansi-net2`.  64 shards, `n5gate.sh`.
+
+```
+NOISE base rep1 : passed=17503  CHUNK-CRASH=0  FILE-WEDGE=30
+NET accessors r1: passed=17504  CHUNK-CRASH=0  FILE-WEDGE=30
+NOISE base rep2 : passed=17504  CHUNK-CRASH=0  FILE-WEDGE=30
+NET accessors r2: passed=17504  CHUNK-CRASH=0  FILE-WEDGE=30
+```
+
+**Own noise floor, measured:** the baseline swept against ITSELF moves
+17503 -> 17504, and per-file the only file that differs is `divide`, at exactly
+ID **13445 — on the known-flaky list**.  The fix-vs-baseline difference on rep 1
+is *the same single flaky ID*, and on the settled reps (base2 vs fix2) the
+per-file diff is **0 files, net +0**.  Fix rep1 vs fix rep2 is also 0 files.
+So the change is indistinguishable from run-to-run noise: no losses to recheck.
+
+`structures-*` per file, every sweep, both binaries:
+
+```
+structures-01 = 12    structures-02 = 13    structures-03 = 36
+structure-00  =  0    structures-04 =  0    print-structure = 0
+```
+
+exactly the reference counts.  CHUNK-CRASH stayed 0 and FILE-WEDGE 30
+throughout.
+
+## 7. Ladder
+
+`/home/claude/lf/run-ql.sh`, run with the **baseline binary alongside as a
+control** in the same window:
+
+```
+BASE (control) : libs=22 clean=15  probes ok=96 err=16 missing=0  FAILURES=16
+FIX            : libs=22 clean=15  probes ok=96 err=16 missing=0  FAILURES=16
+```
+
+Identical, and identical per library (same 7 libraries carry the same errors).
+Matches the documented baseline of FAILURES 16 / clean 15 of 22.
+
+## 8. Still open
+
+* Same-length sibling struct and long-enough plain vector are accepted where
+  SBCL signals TYPE-ERROR.  Closing this needs per-instance type identity that
+  survives crossing a compilation unit — either an identity-independent marker
+  (the keyword intern table gives exactly that guarantee, per CLAUDE.md, but
+  changing the marker touches the predicate, the printer, `%struct-instance-p`,
+  cl-clos and eval2) or making the AOT DEFSTRUCT path populate `*struct-types*`
+  so an ancestry check is available.  Neither is a small change; both are
+  measurable via the two probe rows.
+* `;; WARN: cannot compile ,X, using nil` silently produces wrong code and only
+  warns.  A `build-checks.lisp` rule for it would have turned a multi-hour
+  bisect into a failed build with the variable named.

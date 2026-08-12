@@ -104,6 +104,10 @@
      '(array structure-object standard-object t))
     ((eq type-name 'condition) '(condition standard-object t))
     ((eq type-name 'cons)      '(cons list sequence t))
+    ;; READTABLE is a direct subclass of T (CLHS 4.3.1) — deliberately NOT
+    ;; (readtable cons list sequence t): it is not a list, even though its
+    ;; Modus representation is a tagged cons.
+    ((eq type-name 'readtable) '(readtable t))
     ((eq type-name 'list)      '(list sequence t))
     ((eq type-name 'null)      '(null symbol list sequence t))
     ((eq type-name 'symbol)    '(symbol t))
@@ -130,6 +134,16 @@
     ;; and GF methods specialized on COMPLEX / NUMBER never matched
     ;; (dg-mc.N.6/.8 once complex literals stopped compiling as 0).
     ((%complex-p obj)  'complex)
+    ;; READTABLE is a distinct built-in class (CLHS 4.3.1 / the type
+    ;; hierarchy), not a LIST — its Modus representation just happens to be
+    ;; a tagged cons.  Without this it dispatched as CONS, so a
+    ;; `(defmethod f ((rt readtable) …))` was never applicable:
+    ;; named-readtables' DEFREADTABLE does
+    ;;   (setf (documentation readtable 'readtable) docstring)
+    ;; against (defmethod (setf documentation) (d (readtable readtable) …)),
+    ;; which failed with "no applicable method for (SETF DOCUMENTATION)".
+    ;; Must precede the CONSP branch, like the RATIO / COMPLEX cases above.
+    ((readtablep obj)  'readtable)
     ((consp obj)       'cons)
     ;; conditions — detectable via the condition-type registry; their
     ;; CPL keeps STANDARD-OBJECT so methods that matched under the old

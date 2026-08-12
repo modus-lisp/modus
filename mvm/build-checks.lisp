@@ -102,36 +102,24 @@
 (in-package :modus.mvm)
 
 ;;; ------------------------------------------------------------------
-;;; REPRODUCIBILITY PIN — this file must not perturb CL:*GENSYM-COUNTER*
+;;; REPRODUCIBILITY — no pin needed here any more (task #251)
 ;;; ------------------------------------------------------------------
-;;; MEASURED, and it is not obvious: the host's *GENSYM-COUNTER* is an INPUT
-;;; to the emitted binary.  EXPAND-CL-LOOP does `(gensym "NAT")` /
-;;; `(gensym "BV")` while the MVM compiler expands IMAGE source, the resulting
-;;; symbol becomes an implicit global, and its NAME — "NAT19385" — is
-;;; name-hashed into the image.  A build-generic-cli image contains 99 of
-;;; them.  So ANY host-side edit that shifts the counter by even one changes
-;;; 435 bytes of a 37 MB binary, and "prove byte-identity with cmp" — the
-;;; standard for a host-only check — becomes impossible to meet.
+;;; This file used to carry THREE workarounds whose only job was to keep
+;;; CL:*GENSYM-COUNTER* exactly where it found it: a capture/restore pair
+;;; around the file, a second restore inside the BUILD-IMAGE wrapper, and a
+;;; PCL dfun warm-up for the tee stream's methods (the first
+;;; STREAM-WRITE-STRING on a new class costs one gensym, and left unwarmed it
+;;; was spent INSIDE the build).  They existed because the host's gensym
+;;; counter was an INPUT to the emitted binary — EXPAND-CL-LOOP called
+;;; `(gensym "NAT")` while the MVM compiler expanded IMAGE source, and the
+;;; resulting name was hashed in (99 of them in build-generic-cli), so a
+;;; one-tick shift moved 435 bytes of a 37 MB image.
 ;;;
-;;; Demonstrated exactly, not inferred: appending three bare `(gensym)` forms
-;;; to the 6de6fc3 build-checks.lisp reproduces, byte for byte
-;;; (sha256 03ea4c40…), the binary built from THIS file with the checks
-;;; disabled.  Three, because DEFCLASS + friends below cost three at load.
-;;;
-;;; Two pins keep this file byte-neutral by construction:
-;;;   * this one, restoring the counter at end of file (LOAD-time cost), and
-;;;   * one in the BUILD-IMAGE wrapper, restoring it immediately before the
-;;;     real BUILD-IMAGE runs (the checks' RUN-time cost).
-;;; Rolling the counter BACK is safe here: everything created in between is a
-;;; host-side macroexpansion symbol that never reaches image source, and the
-;;; counter is monotonic for the whole of BUILD-IMAGE afterwards, so no two
-;;; image-source gensyms can collide.
-;;;
-;;; That the host gensym counter leaks into the binary at all is a real
-;;; reproducibility defect, filed separately; this pin only stops THIS file
-;;; from tripping over it.
-
-(defvar *gck-gensym-counter-at-load* *gensym-counter*)
+;;; The root cause is fixed: the compiler now draws from its OWN counter
+;;; (*mvm-gensym-counter* / %MVM-GENSYM in mvm/compiler.lisp, reset at the top
+;;; of MVM-COMPILE-ALL), so nothing the host does before, during, or after a
+;;; build can move an emitted name.  The pins are redundant and are gone.
+;;; Verified by removing them and rebuilding: byte-identical.
 
 ;;; A check FAILING (findings) and a check BREAKING (a bug in the walker) must
 ;;; not look the same to a build.  The first should stop the build; the second
@@ -1364,12 +1352,7 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
   (setf *build-image-unwrapped* #'build-image)
   (setf (fdefinition 'build-image)
         (lambda (&rest args)
-          ;; Captured FIRST — before a single check runs — so that the value
-          ;; handed back to the real BUILD-IMAGE below is exactly the one it
-          ;; would have seen with no checks installed at all.  See the
-          ;; REPRODUCIBILITY PIN at the top of this file.
-          (let* ((gs *gensym-counter*)
-                 (src (or (getf args :source-text)
+          (let* ((src (or (getf args :source-text)
                           (let ((forms (getf args :source)))
                             (when forms
                               (with-output-to-string (s)
@@ -1387,34 +1370,13 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
                                         (pushnew line unknown :test #'equal)))))))
                  (result
                    (if (eq (%gck-mode) :off)
-                       (progn (setf *gensym-counter* gs)
-                              (apply *build-image-unwrapped* args))
+                       (apply *build-image-unwrapped* args)
                        (let* ((out (make-instance 'gck-tee-stream
                                                   :under *standard-output* :sink sink))
                               (err (make-instance 'gck-tee-stream
                                                   :under *error-output* :sink sink))
                               (*standard-output* out)
                               (*error-output* err))
-                         ;; Warm PCL's discriminating functions for the tee's
-                         ;; methods against a throwaway stream.  Computing a
-                         ;; dfun the first time a new class reaches
-                         ;; STREAM-WRITE-STRING costs a GENSYM, and left
-                         ;; unwarmed it is spent INSIDE the build, past the
-                         ;; pin below — measured as a stubborn +1 that shifted
-                         ;; every NAT<n> name in the image by one.
-                         (let ((warm (make-instance 'gck-tee-stream
-                                                    :under (make-broadcast-stream)
-                                                    :sink (lambda (l) (declare (ignore l))))))
-                           (write-char #\x warm)
-                           (write-string "warm" warm)
-                           (fresh-line warm)
-                           (terpri warm)
-                           (force-output warm)
-                           (finish-output warm))
-                         ;; See the REPRODUCIBILITY PIN at the top of this
-                         ;; file: hand the real BUILD-IMAGE the exact counter
-                         ;; it would have seen with no checks installed.
-                         (setf *gensym-counter* gs)
                          (unwind-protect (apply *build-image-unwrapped* args)
                            (%gck-tee-flush-line out)
                            (%gck-tee-flush-line err))))))
@@ -1423,10 +1385,3 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
               (check-compiler-warns hist (nreverse unknown)))
             result))))
 
-;;; ------------------------------------------------------------------
-;;; REPRODUCIBILITY PIN (2 of 2) — see the header.  Must be the LAST form.
-;;; Restores CL:*GENSYM-COUNTER* to its value on entry so that loading this
-;;; host-only file cannot shift the "NAT<n>" gensym names the MVM compiler
-;;; bakes into every image.  Without it, editing this file changes 435 bytes
-;;; of the emitted binary for no semantic reason.
-(setf *gensym-counter* *gck-gensym-counter-at-load*)

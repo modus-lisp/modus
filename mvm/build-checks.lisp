@@ -102,36 +102,24 @@
 (in-package :modus.mvm)
 
 ;;; ------------------------------------------------------------------
-;;; REPRODUCIBILITY PIN — this file must not perturb CL:*GENSYM-COUNTER*
+;;; REPRODUCIBILITY — no pin needed here any more (task #251)
 ;;; ------------------------------------------------------------------
-;;; MEASURED, and it is not obvious: the host's *GENSYM-COUNTER* is an INPUT
-;;; to the emitted binary.  EXPAND-CL-LOOP does `(gensym "NAT")` /
-;;; `(gensym "BV")` while the MVM compiler expands IMAGE source, the resulting
-;;; symbol becomes an implicit global, and its NAME — "NAT19385" — is
-;;; name-hashed into the image.  A build-generic-cli image contains 99 of
-;;; them.  So ANY host-side edit that shifts the counter by even one changes
-;;; 435 bytes of a 37 MB binary, and "prove byte-identity with cmp" — the
-;;; standard for a host-only check — becomes impossible to meet.
+;;; This file used to carry THREE workarounds whose only job was to keep
+;;; CL:*GENSYM-COUNTER* exactly where it found it: a capture/restore pair
+;;; around the file, a second restore inside the BUILD-IMAGE wrapper, and a
+;;; PCL dfun warm-up for the tee stream's methods (the first
+;;; STREAM-WRITE-STRING on a new class costs one gensym, and left unwarmed it
+;;; was spent INSIDE the build).  They existed because the host's gensym
+;;; counter was an INPUT to the emitted binary — EXPAND-CL-LOOP called
+;;; `(gensym "NAT")` while the MVM compiler expanded IMAGE source, and the
+;;; resulting name was hashed in (99 of them in build-generic-cli), so a
+;;; one-tick shift moved 435 bytes of a 37 MB image.
 ;;;
-;;; Demonstrated exactly, not inferred: appending three bare `(gensym)` forms
-;;; to the 6de6fc3 build-checks.lisp reproduces, byte for byte
-;;; (sha256 03ea4c40…), the binary built from THIS file with the checks
-;;; disabled.  Three, because DEFCLASS + friends below cost three at load.
-;;;
-;;; Two pins keep this file byte-neutral by construction:
-;;;   * this one, restoring the counter at end of file (LOAD-time cost), and
-;;;   * one in the BUILD-IMAGE wrapper, restoring it immediately before the
-;;;     real BUILD-IMAGE runs (the checks' RUN-time cost).
-;;; Rolling the counter BACK is safe here: everything created in between is a
-;;; host-side macroexpansion symbol that never reaches image source, and the
-;;; counter is monotonic for the whole of BUILD-IMAGE afterwards, so no two
-;;; image-source gensyms can collide.
-;;;
-;;; That the host gensym counter leaks into the binary at all is a real
-;;; reproducibility defect, filed separately; this pin only stops THIS file
-;;; from tripping over it.
-
-(defvar *gck-gensym-counter-at-load* *gensym-counter*)
+;;; The root cause is fixed: the compiler now draws from its OWN counter
+;;; (*mvm-gensym-counter* / %MVM-GENSYM in mvm/compiler.lisp, reset at the top
+;;; of MVM-COMPILE-ALL), so nothing the host does before, during, or after a
+;;; build can move an emitted name.  The pins are redundant and are gone.
+;;; Verified by removing them and rebuilding: byte-identical.
 
 ;;; A check FAILING (findings) and a check BREAKING (a bug in the walker) must
 ;;; not look the same to a build.  The first should stop the build; the second
@@ -1060,7 +1048,15 @@ finding~:P, baselined:~%~{;;   - ~A~%~}"
     (:unknown-being-kind "WARN: unknown BEING kind " nil
      "expand-cl-loop dropped a BEING clause it does not implement.")
     (:unknown-go-tag "WARN: unknown GO tag " nil
-     "compile-go could not resolve a tag."))
+     "compile-go could not resolve a tag.")
+    (:macroexpand-failed "WARN macroexpand " nil
+     "A user macro's expander ERRORED host-side at build time, so compiler.lisp
+      (~1964) substituted a runtime `(error …)' call for that one form.  This is
+      the OPPOSITE of the #249 silent-substitution class — the form fails
+      HONESTLY at runtime instead of vanishing, and the salvage exists so one
+      bad expander cannot skip a whole chunk defun.  Expected in the ANSI gate
+      runners, whose corpus contains expanders (defmacro.3) that deliberately
+      read a RUNTIME lexical the null-lexenv host EVAL cannot see."))
   "Known WARN shapes the MVM compiler emits while compiling a blob.  A line
    containing \"WARN\" that matches NONE of these is an UNKNOWN shape and fails
    the build: a new silent-substitution path has been added and nobody decided
@@ -1070,13 +1066,66 @@ finding~:P, baselined:~%~{;;   - ~A~%~}"
   '(("build-generic-cli"
      (:implicit-global . 41)
      (:implicit-global-setq . 123)
-     (:unresolved-function . 40)))
-  "Per-build-script (LABEL . ((SHAPE . COUNT) …)) for the NON-fatal shapes.
-   A FATAL shape (today only :CANNOT-COMPILE) ratchets at 0 in EVERY build
-   script whether or not it has a row here — that is the point of #249.  A
-   non-fatal shape is only compared where a row exists, so the 20-odd images
+     (:unresolved-function . 40))
+    ;; ANSI GATE RUNNER — bakes the transformed ANSI corpus into the image
+    ;; (CLAUDE.md, "Build taxonomy").  See :CORPUS-IMAGE below for why the
+    ;; non-fatal counts are recorded but not ratcheted.  Measured at 8ca0b6d.
+    ("build-x64-linux"
+     (:corpus-image . t)
+     (:cannot-compile . 5)              ; ,(RANDOM-FROM-SEQ …) x1, #2A(…) x4
+     (:macroexpand-failed . 4)
+     (:implicit-global . 1709)
+     (:implicit-global-setq . 354)
+     (:unresolved-function . 25)
+     (:unknown-go-tag . 5)
+     (:unknown-loop-clause . 1))
+    ("build-x64"
+     (:corpus-image . t)
+     (:cannot-compile . 5)
+     (:macroexpand-failed . 4)
+     (:implicit-global . 1709)
+     (:implicit-global-setq . 346)
+     (:unresolved-function . 25)
+     (:unknown-go-tag . 5)
+     (:unknown-loop-clause . 1))
+    ;; NOTE: the aarch64 gate runners need a BIGGER HOST heap than the x64 pair
+    ;; — `--dynamic-space-size 4096` dies with SB-KERNEL::HEAP-EXHAUSTED-ERROR
+    ;; partway through BUILD-IMAGE.  Build them with 12288.
+    ("build-aarch64-linux"
+     (:corpus-image . t)
+     (:cannot-compile . 5)
+     (:macroexpand-failed . 4)
+     (:implicit-global . 1715)
+     (:implicit-global-setq . 340)
+     (:unresolved-function . 25)
+     (:unknown-go-tag . 5)
+     (:unknown-loop-clause . 1))
+    ("build-aarch64"                     ; identical histogram to its Linux sibling
+     (:corpus-image . t)
+     (:cannot-compile . 5)
+     (:macroexpand-failed . 4)
+     (:implicit-global . 1715)
+     (:implicit-global-setq . 340)
+     (:unresolved-function . 25)
+     (:unknown-go-tag . 5)
+     (:unknown-loop-clause . 1)))
+  "Per-build-script (LABEL . ((SHAPE . COUNT) …)).
+
+   A FATAL shape (today only :CANNOT-COMPILE) ratchets at its baseline — 0 when
+   the label has no row, which is the point of #249: in a SHIPPING image a NIL
+   substitution is a live bug and must fail the build.
+
+   A non-fatal shape is only compared where a row exists, so the 20-odd images
    nobody has measured stay quiet instead of emitting a wall of noise about a
-   baseline that was never taken.  Measured at 6de6fc3.")
+   baseline that was never taken.
+
+   (:CORPUS-IMAGE . T) marks a label as an ANSI gate runner, whose source blob
+   includes the ANSI TEST CORPUS.  There the non-fatal counts are descriptive,
+   not a ratchet: the corpus deliberately contains pathological code (that is
+   what it tests), and it GROWS, so ratcheting its warn counts would fail the
+   primary gate build every time a test file is added.  The fatal shapes still
+   ratchet — a NEW uncompilable construct in the harness itself is exactly what
+   we want to catch.  Measured at 6de6fc3 / 8ca0b6d.")
 
 (defun %gck-warn-shape (line)
   (dolist (spec *global-check-warn-shapes*)
@@ -1162,8 +1211,12 @@ finding~:P, baselined:~%~{;;   - ~A~%~}"
         (let ((n (gethash key hist 0))
               (base (or (cdr (assoc key row)) 0)))
           ;; Non-fatal shapes are only ratcheted where a baseline row was
-          ;; actually MEASURED; a missing row is "unknown", not "zero".
-          (when (and (> n base) (or fatalp row))
+          ;; actually MEASURED; a missing row is "unknown", not "zero".  On a
+          ;; :CORPUS-IMAGE (an ANSI gate runner) they are descriptive only —
+          ;; the corpus is test data and it grows.  Fatal shapes always ratchet.
+          (when (and (> n base)
+                     (or fatalp
+                         (and row (not (cdr (assoc :corpus-image row))))))
             (let ((s (format nil "~(~A~) = ~D (baseline ~D) — ~D NEW instance~:P"
                              key n base (- n base))))
               (if fatalp (push s fatal) (push s noted)))))))
@@ -1336,6 +1389,80 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
 
 (defvar *build-image-unwrapped* nil)
 
+(defvar *gck-host-gensym-done* nil
+  "Tree-wide like CHECK E — once per SBCL process, not once per BUILD-IMAGE.")
+
+(defun %gck-find-gensym-call (code)
+  "Position of a CL:GENSYM *call* in CODE, or NIL.  The token must be followed
+   by a delimiter: a bare (SEARCH \"(gensym\" …) also fires on the prose
+   `(gensym'd …)' in compiler.lisp's own docstrings — measured, it did."
+  (let ((start 0) (n (length code)))
+    (loop
+      (let ((at (search "(gensym" code :start2 start)))
+        (when (null at) (return nil))
+        (let ((after (+ at 7)))
+          (if (or (>= after n)
+                  (member (char code after) '(#\Space #\Tab #\) #\Newline)))
+              (return at)
+              (setf start (1+ at))))))))
+
+(defun check-no-host-gensym ()
+  "CHECK F (task #251).  mvm/compiler.lisp must not call CL:GENSYM.
+
+   The compiler's macro expanders bake names into the image, and CL:GENSYM
+   draws them from CL:*GENSYM-COUNTER* — a counter the HOST owns.  That made
+   the emitted binary a function of host state: bumping the host counter by ONE
+   (loading a utility that gensyms, adding a DEFCLASS to a build script,
+   printing through a new stream class) moved 435 bytes of the 37 MB image.
+   %MVM-GENSYM fixed it by giving the compiler its own counter.
+
+   Nothing about that fix is self-enforcing: the next `(gensym \"FOO\")` typed
+   into an expander silently reopens the hole, and the only symptom is that
+   builds stop being reproducible — which nobody notices until they try to
+   `cmp` two of them.  So: ratchet it.  Exactly ONE CL:GENSYM call is allowed
+   in the file, the one inside %MVM-GENSYM's runtime-eval branch.
+
+   Text scan, not a read: this must hold for source as WRITTEN, and a reader
+   would happily accept `(gensym …)` hidden behind a macro anyway."
+  (let ((mode (%gck-mode)))
+    (when (or (eq mode :off) *gck-host-gensym-done* (null *gck-parse-sweep-root*))
+      (return-from check-no-host-gensym nil))
+    (setf *gck-host-gensym-done* t)
+    (let* ((path (merge-pathnames "mvm/compiler.lisp" *gck-parse-sweep-root*))
+           (hits nil)
+           (lineno 0))
+      (when (probe-file path)
+        (with-open-file (s path :direction :input)
+          (loop for line = (read-line s nil nil)
+                while line
+                do (incf lineno)
+                   (let ((i 0) (n (length line)))
+                     ;; Skip a whole-line comment; an inline `;' is handled by
+                     ;; only reporting matches that occur before it.
+                     (loop while (and (< i n) (member (char line i) '(#\Space #\Tab)))
+                           do (incf i))
+                     (unless (and (< i n) (char= (char line i) #\;))
+                       (let* ((semi (position #\; line))
+                              (code (if semi (subseq line 0 semi) line))
+                              (at (%gck-find-gensym-call code)))
+                         (when (and at
+                                    ;; the sole sanctioned call, %MVM-GENSYM's
+                                    ;; runtime-eval branch
+                                    (not (search "(gensym prefix)" code)))
+                           (push (format nil "compiler.lisp:~D: ~A"
+                                         lineno (string-left-trim " " line))
+                                 hits))))))))
+        (when hits
+          (format t "~&*** check-no-host-gensym: ~D CL:GENSYM call~:P in mvm/compiler.lisp ***~%"
+                  (length hits))
+          (dolist (h (nreverse hits)) (format t "  - ~A~%" h))
+          (format t "  Use %MVM-GENSYM instead — see the REPRODUCIBLE BUILDS note at~%")
+          (format t "  the top of mvm/compiler.lisp.  CL:GENSYM there makes the emitted~%")
+          (format t "  image depend on CL:*GENSYM-COUNTER*, i.e. on host state.~%")
+          (when (eq mode :warn)
+            (return-from check-no-host-gensym nil))
+          (%gck-fail "check-no-host-gensym failed")))))
+
 (defun %gck-pre-checks (src)
   "Read the blob ONCE and run every source-level check on it."
   (let ((mode (%gck-mode)))
@@ -1343,6 +1470,8 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
     ;; E is tree-wide and blob-independent, so it runs first and unconditionally
     ;; (the size cap below is about re-reading a 17 MB blob, not about E).
     (%gck-guard "check-source-parses" (check-source-parses))
+    ;; F is tree-wide too, and costs one 1 MB file read once per process.
+    (%gck-guard "check-no-host-gensym" (check-no-host-gensym))
     ;; check-global-inits owns the =dump / size-cap policy; let it run first
     ;; and only pre-read when it would not have skipped anyway.
     (if (or (eq mode :dump)
@@ -1364,12 +1493,7 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
   (setf *build-image-unwrapped* #'build-image)
   (setf (fdefinition 'build-image)
         (lambda (&rest args)
-          ;; Captured FIRST — before a single check runs — so that the value
-          ;; handed back to the real BUILD-IMAGE below is exactly the one it
-          ;; would have seen with no checks installed at all.  See the
-          ;; REPRODUCIBILITY PIN at the top of this file.
-          (let* ((gs *gensym-counter*)
-                 (src (or (getf args :source-text)
+          (let* ((src (or (getf args :source-text)
                           (let ((forms (getf args :source)))
                             (when forms
                               (with-output-to-string (s)
@@ -1387,34 +1511,13 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
                                         (pushnew line unknown :test #'equal)))))))
                  (result
                    (if (eq (%gck-mode) :off)
-                       (progn (setf *gensym-counter* gs)
-                              (apply *build-image-unwrapped* args))
+                       (apply *build-image-unwrapped* args)
                        (let* ((out (make-instance 'gck-tee-stream
                                                   :under *standard-output* :sink sink))
                               (err (make-instance 'gck-tee-stream
                                                   :under *error-output* :sink sink))
                               (*standard-output* out)
                               (*error-output* err))
-                         ;; Warm PCL's discriminating functions for the tee's
-                         ;; methods against a throwaway stream.  Computing a
-                         ;; dfun the first time a new class reaches
-                         ;; STREAM-WRITE-STRING costs a GENSYM, and left
-                         ;; unwarmed it is spent INSIDE the build, past the
-                         ;; pin below — measured as a stubborn +1 that shifted
-                         ;; every NAT<n> name in the image by one.
-                         (let ((warm (make-instance 'gck-tee-stream
-                                                    :under (make-broadcast-stream)
-                                                    :sink (lambda (l) (declare (ignore l))))))
-                           (write-char #\x warm)
-                           (write-string "warm" warm)
-                           (fresh-line warm)
-                           (terpri warm)
-                           (force-output warm)
-                           (finish-output warm))
-                         ;; See the REPRODUCIBILITY PIN at the top of this
-                         ;; file: hand the real BUILD-IMAGE the exact counter
-                         ;; it would have seen with no checks installed.
-                         (setf *gensym-counter* gs)
                          (unwind-protect (apply *build-image-unwrapped* args)
                            (%gck-tee-flush-line out)
                            (%gck-tee-flush-line err))))))
@@ -1423,10 +1526,3 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
               (check-compiler-warns hist (nreverse unknown)))
             result))))
 
-;;; ------------------------------------------------------------------
-;;; REPRODUCIBILITY PIN (2 of 2) — see the header.  Must be the LAST form.
-;;; Restores CL:*GENSYM-COUNTER* to its value on entry so that loading this
-;;; host-only file cannot shift the "NAT<n>" gensym names the MVM compiler
-;;; bakes into every image.  Without it, editing this file changes 435 bytes
-;;; of the emitted binary for no semantic reason.
-(setf *gensym-counter* *gck-gensym-counter-at-load*)

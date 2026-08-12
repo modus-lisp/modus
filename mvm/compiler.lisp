@@ -5466,7 +5466,29 @@
                                             ,@(when env-var (list env-var))))
                         (destructuring-bind (,@d-params) (cdr form)
                           ,@body))))))
-             (mvm-define-macro (normalize-name name) expander))
+             (mvm-define-macro (normalize-name name) expander)
+             ;; (1b) …and, under runtime EVAL, make that registration
+             ;; TRUTHFUL to the running program.  *MACRO-TABLE* is rebound
+             ;; per mvm-eval call, but FBOUNDP / MACRO-FUNCTION consult it
+             ;; while the compiled form is still executing.  So the classic
+             ;; portable-library idiom
+             ;;     (unless (fboundp 'FOO) (defmacro FOO …))
+             ;; saw FBOUNDP → T (from THIS compile-time entry), skipped the
+             ;; DEFMACRO branch, and then LOST the entry when *MACRO-TABLE*
+             ;; was unbound — FOO ended up defined nowhere.  bordeaux-threads
+             ;; writes every apiv1 default that way (DEFDMACRO), so
+             ;; BORDEAUX-THREADS:WITH-LOCK-HELD was never registered and the
+             ;; package-blind bare-name lookup fell through to the apiv2
+             ;; macro of the same name, whose expansion calls apiv2
+             ;; ACQUIRE-LOCK on an apiv1 lock → TYPE-ERROR.
+             ;;
+             ;; Registering the SAME expander in the runtime table closes the
+             ;; window: FBOUNDP's answer becomes true, and it stays true.
+             ;; Purely additive — the (2) path below registers the identical
+             ;; expander whenever the branch IS taken.  Mirrors the
+             ;; defstruct keyword-ctor persistence a few hundred lines down.
+             (when *mvm-eval-runtime-p*
+               (set-macro-function name expander)))
          ;; (2) RUNTIME registration + return-the-name.  An ANSI deftest
          ;; like defmacro.1 does `(eq (defmacro NAME (..) ..) 'NAME)` and
          ;; then `(eval '(NAME ..))`, so the compiled nested DEFMACRO must
@@ -7868,8 +7890,25 @@
          ;; gauntlet's premature stop).  Walk conses manually, rewriting
          ;; each car; a non-NIL atomic tail (always a BINDER in a pattern,
          ;; never an evaluated read) is preserved unrewritten.
+         ;;
+         ;; OPERATOR POSITION IS A FUNCTION NAME, NOT A VARIABLE READ.
+         ;; A SYMBOL in the car of a form names a function (CLHS 3.1.2.1.2)
+         ;; and lives in a namespace the cell rewrite must never touch.
+         ;; Rewriting it produced `((car %CELL-C) 1)` whenever a boxed
+         ;; variable shared its name with an FLET/LABELS function — the
+         ;; shape cl-utilities' WITH-COLLECTORS macro emits verbatim:
+         ;;   (let (c c-tail)
+         ;;     (labels ((c (thing) … (setf c …) …))  ; boxes C
+         ;;       (c 1) (c 2)))                       ; …and CALLS C
+         ;; The call then went indirect through the cell's VALUE: NIL gave
+         ;; UNDEFINED-FUNCTION, a fixnum gave "MVM: unknown opcode at PC 7"
+         ;; (the fixnum interpreted as a code address).  Only a CONS head
+         ;; is a real subform — ((lambda …) …) must still be rewritten so
+         ;; the LAMBDA branch above sees it.
          (t
-          (let ((head (cell-rewrite-form op boxed-vars lambda-params))
+          (let ((head (if (consp op)
+                          (cell-rewrite-form op boxed-vars lambda-params)
+                          op))
                 (acc nil)
                 (cur (cdr form)))
             (loop while (consp cur) do
@@ -10670,9 +10709,37 @@
                (progn
                  (push (list var nil) bindings)
                  (push `(setq ,var ,(loop-iter-init-form iter)) init-stmts))
-               ;; Has THEN clause: init from binding, step from step-form
-               (progn
-                 (push (list var (loop-iter-init-form iter)) bindings)
+               ;; Has THEN clause: the INIT form runs on the FIRST iteration
+               ;; only, the STEP form at the end of every iteration.
+               ;;
+               ;; The init form MUST be evaluated in INIT-STMTS, not as the
+               ;; LET* binding it used to be.  Sequential FOR clauses see each
+               ;; other's values within one iteration (CLHS 6.1.2.1), and a
+               ;; no-THEN `for q = expr` sibling assigns Q in INIT-STMTS — so a
+               ;; LET* binding for S was evaluated BEFORE Q was ever set and
+               ;; `for q = … for s = q then …` initialised S to NIL.  That is
+               ;; cl-ppcre's parser verbatim:
+               ;;   (loop for quant = (quant lexer)
+               ;;         for seq = quant then (cond …)
+               ;;         while (start-of-subexpr-p lexer)
+               ;;         finally (return seq))
+               ;; A one-token regex takes exactly one iteration, so SEQ never
+               ;; got past its NIL binding, PARSE-STRING answered :VOID for
+               ;; every pattern, and every scanner matched the empty string at
+               ;; position 0 (SCAN "b+" "abbbc" → 0 instead of 1 4 #() #()).
+               ;;
+               ;; INIT-STMTS is safe ground: WHILE/UNTIL land in
+               ;; PRE-BODY-TESTS, which the body assembly places AFTER
+               ;; init-stmts, and TEST-FORMS only ever holds an iterator's own
+               ;; exhaustion test (:IN/:ON/:ACROSS/:FROM/:REPEAT), which can
+               ;; never reference a THEN variable.
+               (let ((firstv (%mvm-gensym "FORTHEN-FIRST")))
+                 (push (list var nil) bindings)
+                 (push (list firstv t) bindings)
+                 (push `(if ,firstv
+                            (progn (setq ,var ,(loop-iter-init-form iter))
+                                   (setq ,firstv nil)))
+                       init-stmts)
                  (push `(setq ,var ,(loop-iter-step-form iter)) step-stmts)))))
 
         (:while

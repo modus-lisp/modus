@@ -10,7 +10,7 @@
 set -e
 
 AUX=/home/claude/modus-ref/ansi-test/auxiliary/ansi_aux
-LITE=/home/claude/modus/scripts/lite-universe.lisp
+LITE="$(cd "$(dirname "$0")" && pwd)/lite-universe.lisp"
 OUT=$1
 TEST_FILE=$2
 
@@ -38,7 +38,7 @@ for f in $AUX/ansi-aux.lsp $AUX/cons-aux.lsp $AUX/numbers-aux.lsp \
 done
 
 # Modus-friendly stubs after aux
-echo "(load \"/home/claude/modus/scripts/aux-stubs.lisp\")" >> "$OUT"
+echo "(load \"$(cd "$(dirname "$0")" && pwd)/aux-stubs.lisp\")" >> "$OUT"
 
 # The single test file
 echo "(handler-case (load \"$TEST_FILE\") (t (c) nil))" >> "$OUT"

@@ -52,6 +52,20 @@
 ;;;;    check A is structurally blind to it; the signal is the dead
 ;;;;    initialiser, not the variable.
 ;;;;
+;;;; C. LET-OF-UNREGISTERED-SPECIAL (task #248).  `(let ((*x* v)) …)' where
+;;;;    *X* is not a special the MVM compiler knows about compiles to a plain
+;;;;    LEXICAL let — the global is never assigned and every callee reads the
+;;;;    old value, silently.  See the CHECK C section for the measurement.
+;;;;
+;;;; D. COMPILER WARN HISTOGRAM (task #249).  COMPILE-FORM substitutes NIL for
+;;;;    any form it does not recognise and only WARNs, so a clean build emits
+;;;;    a broken image.  D tees the build's output, buckets every compiler
+;;;;    WARN by shape and ratchets the histogram.  See the CHECK D section.
+;;;;
+;;;; A and B are about what the image never RUNS; C and D are about what the
+;;;; compiler silently DROPPED.  All four share one property: nothing fails,
+;;;; nothing is logged, and the damage shows up months later somewhere else.
+;;;;
 ;;;; The call graph counts head position, #'NAME and 'NAME as calls, and does
 ;;;; not propagate through the generated name registries (see
 ;;;; *GLOBAL-CHECK-REGISTRY-PREFIXES*).  The assignment scan over-approximates
@@ -69,7 +83,14 @@
 ;;;;   MODUS_GLOBAL_CHECK=force  run even on a blob over the size cap
 ;;;;   MODUS_GLOBAL_CHECK=dump   write the blob to $MODUS_GLOBAL_CHECK_OUT and
 ;;;;                             exit before compiling (offline analysis aid)
-;;;; Default: report and FAIL the build.
+;;;; Default: report and FAIL the build.  The knob covers all four checks.
+;;;;
+;;;; BYTE-NEUTRALITY.  This file is host-only, but the host is not neutral:
+;;;; CL:*GENSYM-COUNTER* leaks into every emitted image (see the REPRODUCIBILITY
+;;;; PIN below).  Three pins keep the checks from perturbing it; a
+;;;; build-generic-cli image built with every check ON is byte-identical to one
+;;;; built from a tree without this file's changes at all.  Verify with `cmp',
+;;;; do not assume: `cmp modus <pristine>' after building both.
 
 (in-package :modus.mvm)
 
@@ -104,6 +125,26 @@
 ;;; from tripping over it.
 
 (defvar *gck-gensym-counter-at-load* *gensym-counter*)
+
+;;; A check FAILING (findings) and a check BREAKING (a bug in the walker) must
+;;; not look the same to a build.  The first should stop the build; the second
+;;; is my problem, not the build's, and gets reported and stepped over — 27
+;;; build scripts must not all die because one blob has a shape the analysis
+;;; mishandles.  #243 conflated the two; this separates them.
+(define-condition gck-check-failed (simple-error) ())
+
+(defun %gck-fail (fmt &rest args)
+  (error 'gck-check-failed :format-control fmt :format-arguments args))
+
+(defmacro %gck-guard (name &body body)
+  "Run BODY; let a GCK-CHECK-FAILED through, report any other error and go on."
+  `(handler-case (progn ,@body)
+     (gck-check-failed (c) (error c))
+     (error (c)
+       (format t "~&;; ~A: check itself errored (~A) — SKIPPED, not a build ~
+failure.  Please fix mvm/build-checks.lisp.~%" ,name c)
+       (finish-output)
+       nil)))
 
 ;;; ============================================================
 ;;; Allowlist
@@ -629,7 +670,7 @@ WITH A REASON.  Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~
                              label (length findings) findings)))
             (ecase mode
               (:warn (format t "~A" msg) (finish-output))
-              (:error (format t "~A" msg) (finish-output) (error "check-global-inits failed")))))
+              (:error (format t "~A" msg) (finish-output) (%gck-fail "check-global-inits failed")))))
         findings)))))
 
 ;;; ============================================================
@@ -690,6 +731,18 @@ WITH A REASON.  Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~
 ;;;                   (or at least harmless) lexical use of an earmuffed name.
 ;;;
 ;;; Only DYNAMIC-INTENT findings are eligible to fail the build.
+;;;
+;;; KNOWN BLIND SPOTS, stated rather than discovered later:
+;;;   * A LET inside a DEFMACRO template that expands at RUNTIME may be fine
+;;;     even when reported: mvm-eval's compiler consults *RUNTIME-SPECIAL-NAMES*
+;;;     (populated by runtime DEFVAR), which a host build cannot see.  None of
+;;;     the findings measured at 6de6fc3 are of that shape — all are direct
+;;;     DEFUN bodies — but a future one might be, and the fix
+;;;     (`(declare (special *X*))') is correct either way.
+;;;   * Only EARMUFFED names are scanned.  A special without earmuffs has the
+;;;     same hazard and is invisible here; the convention is the signal.
+;;;   * A blob over *GLOBAL-CHECK-MAX-BLOB-CHARS* is skipped along with checks
+;;;     A and B — i.e. the four ANSI gate runners, which are not shipped.
 
 (defvar *global-check-let-special-allowlist*
   '(;; -- add entries as "NAME"  ; reason
@@ -897,7 +950,7 @@ finding~:P, baselined:~%~{;;   - ~A~%~}"
                (finish-output))
               ((eq mode :warn) (format t "~A" msg) (finish-output))
               (t (format t "~A" msg) (finish-output)
-                 (error "check-let-of-unregistered-special failed")))))
+                 (%gck-fail "check-let-of-unregistered-special failed")))))
         dynamic))))
 
 ;;; ============================================================
@@ -1084,7 +1137,7 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
           ((:warn) (format t "~A" msg) (finish-output))
           ((:error :force :dump)
            (format t "~A" msg) (finish-output)
-           (error "check-compiler-warns failed")))))
+           (%gck-fail "check-compiler-warns failed")))))
     fatal))
 
 ;;; ============================================================
@@ -1113,16 +1166,17 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
     (if (or (eq mode :dump)
             (and (not (eq mode :force))
                  (> (length src) *global-check-max-blob-chars*)))
-        (check-global-inits src)
+        (%gck-guard "check-global-inits" (check-global-inits src))
         (let ((fl (handler-case (read-all-forms-with-locations src)
                     (error (e)
                       (format t "~&;; build-checks: unreadable blob (~A) — skipped~%" e)
                       nil))))
-          (check-global-inits src :pre-read fl)
+          (%gck-guard "check-global-inits" (check-global-inits src :pre-read fl))
           (when fl
-            (check-let-of-unregistered-special
-             (if (consp fl) (car fl) fl)
-             :lines (and (consp fl) (cdr fl))))))))
+            (%gck-guard "check-let-of-unregistered-special"
+              (check-let-of-unregistered-special
+               (if (consp fl) (car fl) fl)
+               :lines (and (consp fl) (cdr fl)))))))))
 
 (unless *build-image-unwrapped*
   (setf *build-image-unwrapped* #'build-image)
@@ -1183,7 +1237,8 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
                            (%gck-tee-flush-line out)
                            (%gck-tee-flush-line err))))))
             (declare (ignorable nunknown %pre))
-            (check-compiler-warns hist (nreverse unknown))
+            (%gck-guard "check-compiler-warns"
+              (check-compiler-warns hist (nreverse unknown)))
             result))))
 
 ;;; ------------------------------------------------------------------

@@ -4225,8 +4225,10 @@
     (%gf-check-arity gf args)
     (let ((applicable (%collect-applicable-methods gf args)))
       (when (null applicable)
-        ;; Try no-applicable-method hook
-        (error "no applicable method"))
+        ;; Name the generic function.  A bare "no applicable method" is
+        ;; unactionable when a library defines dozens of GFs — say which
+        ;; one, as every other CL does.
+        (error "no applicable method for generic function ~S" name))
       ;; CLHS 7.6.5 keyword validity (no-op unless the GF declares &KEY).
       (%gf-check-keys gf args applicable)
       (let* ((comb-raw (%gf-combination gf))

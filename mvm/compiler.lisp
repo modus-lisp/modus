@@ -17838,6 +17838,21 @@
             ;; :default (use struct slot order), NIL (0-arg ctor), or
             ;; a list of slot-name symbols (positional in that order).
             (named-constructors nil)
+            ;; T once ANY (:CONSTRUCTOR …) option has been seen — including
+            ;; the explicit-suppression form (:CONSTRUCTOR NIL).  CLHS 3.4.6:
+            ;; naming a constructor REPLACES the default MAKE-<name>; it does
+            ;; not add to it.  Emitting MAKE-<name> anyway is not harmless
+            ;; here, because Modus registers it as a keyword-parsing MACRO —
+            ;; and a macro SHADOWS a later plain DEFUN of the same name.
+            ;; cl-ppcre does exactly that:
+            ;;   (defstruct (lexer (:constructor make-lexer-internal)) …)
+            ;;   (defun make-lexer (string)
+            ;;     (make-lexer-internal :str … :len (length string)))
+            ;; so every `(make-lexer s)` call expanded to the phantom keyword
+            ;; ctor, which saw a positional string where it wanted keywords,
+            ;; ignored it, and built an EMPTY lexer.  Every regex then parsed
+            ;; to :VOID and every scanner matched "" at position 0.
+            (default-ctor-suppressed nil)
             ;; (:PREDICATE …) / (:COPIER …) — CLHS 3.4.6.  Three states each:
             ;;   :DEFAULT  option absent, or present with NO argument
             ;;             (`(:predicate)`) — generate under the default name
@@ -17877,6 +17892,13 @@
                ((name-eq opt-name "CONSTRUCTOR")
                 (let ((ctor-sym (cadr opt))
                       (arg-spec (if (cddr opt) (caddr opt) :default)))
+                  ;; `(cdr opt)` — not `(cadr opt)` — separates the bare
+                  ;; `(:constructor)` (default name, keep MAKE-<name>) from
+                  ;; `(:constructor NAME …)` and `(:constructor nil)`, both of
+                  ;; which suppress the default.  Same distinction the
+                  ;; PREDICATE / COPIER branches below already make.
+                  (when (cdr opt)
+                    (setf default-ctor-suppressed t))
                   (when (and ctor-sym (symbolp ctor-sym))
                     (push (cons ctor-sym arg-spec)
                           named-constructors))))
@@ -18014,7 +18036,10 @@
                                       (setf (nth idx positional) val)))
                                   (setf args (cddr args))))
                        `(,internal-ctor-sym ,@positional)))))
-             (mvm-define-macro ctor-name %ctor-expander)
+             ;; Only when no (:CONSTRUCTOR …) option replaced it — see
+             ;; DEFAULT-CTOR-SUPPRESSED above.
+             (unless default-ctor-suppressed
+               (mvm-define-macro ctor-name %ctor-expander))
              ;; mvm-eval (in-image runtime compile) PERSISTENCE: *macro-table* is
              ;; rebound PER mvm-eval CALL, so without a runtime registration a
              ;; LATER (eval '(make-NAME …)) compiled the ctor as an undefined
@@ -18030,11 +18055,13 @@
              ;; Build-time (*mvm-eval-runtime-p* NIL) never takes this branch, so
              ;; host/native builds are unchanged.
              (when *mvm-eval-runtime-p*
-               (set-macro-function (%defstruct-intern ctor-name)
-                                   %ctor-expander)
+               (unless default-ctor-suppressed
+                 (set-macro-function (%defstruct-intern ctor-name)
+                                     %ctor-expander))
                ;; Also register the struct type so cross-call TYPEP /
                ;; :include ancestry / #S printing see it — mirrors the
                ;; walker's runtime-DEFSTRUCT registration (cl-eval.lisp).
+               ;; Registry-only — independent of which constructors exist.
                (%register-struct-type struct-name include-parent
                                       slot-names conc-name))))
 

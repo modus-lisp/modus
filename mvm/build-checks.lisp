@@ -1048,7 +1048,15 @@ finding~:P, baselined:~%~{;;   - ~A~%~}"
     (:unknown-being-kind "WARN: unknown BEING kind " nil
      "expand-cl-loop dropped a BEING clause it does not implement.")
     (:unknown-go-tag "WARN: unknown GO tag " nil
-     "compile-go could not resolve a tag."))
+     "compile-go could not resolve a tag.")
+    (:macroexpand-failed "WARN macroexpand " nil
+     "A user macro's expander ERRORED host-side at build time, so compiler.lisp
+      (~1964) substituted a runtime `(error …)' call for that one form.  This is
+      the OPPOSITE of the #249 silent-substitution class — the form fails
+      HONESTLY at runtime instead of vanishing, and the salvage exists so one
+      bad expander cannot skip a whole chunk defun.  Expected in the ANSI gate
+      runners, whose corpus contains expanders (defmacro.3) that deliberately
+      read a RUNTIME lexical the null-lexenv host EVAL cannot see."))
   "Known WARN shapes the MVM compiler emits while compiling a blob.  A line
    containing \"WARN\" that matches NONE of these is an UNKNOWN shape and fails
    the build: a new silent-substitution path has been added and nobody decided
@@ -1058,13 +1066,45 @@ finding~:P, baselined:~%~{;;   - ~A~%~}"
   '(("build-generic-cli"
      (:implicit-global . 41)
      (:implicit-global-setq . 123)
-     (:unresolved-function . 40)))
-  "Per-build-script (LABEL . ((SHAPE . COUNT) …)) for the NON-fatal shapes.
-   A FATAL shape (today only :CANNOT-COMPILE) ratchets at 0 in EVERY build
-   script whether or not it has a row here — that is the point of #249.  A
-   non-fatal shape is only compared where a row exists, so the 20-odd images
+     (:unresolved-function . 40))
+    ;; ANSI GATE RUNNER — bakes the transformed ANSI corpus into the image
+    ;; (CLAUDE.md, "Build taxonomy").  See :CORPUS-IMAGE below for why the
+    ;; non-fatal counts are recorded but not ratcheted.  Measured at 8ca0b6d.
+    ("build-x64-linux"
+     (:corpus-image . t)
+     (:cannot-compile . 5)              ; ,(RANDOM-FROM-SEQ …) x1, #2A(…) x4
+     (:macroexpand-failed . 4)
+     (:implicit-global . 1709)
+     (:implicit-global-setq . 354)
+     (:unresolved-function . 25)
+     (:unknown-go-tag . 5)
+     (:unknown-loop-clause . 1))
+    ("build-x64"
+     (:corpus-image . t)
+     (:cannot-compile . 5)
+     (:macroexpand-failed . 4)
+     (:implicit-global . 1709)
+     (:implicit-global-setq . 346)
+     (:unresolved-function . 25)
+     (:unknown-go-tag . 5)
+     (:unknown-loop-clause . 1)))
+  "Per-build-script (LABEL . ((SHAPE . COUNT) …)).
+
+   A FATAL shape (today only :CANNOT-COMPILE) ratchets at its baseline — 0 when
+   the label has no row, which is the point of #249: in a SHIPPING image a NIL
+   substitution is a live bug and must fail the build.
+
+   A non-fatal shape is only compared where a row exists, so the 20-odd images
    nobody has measured stay quiet instead of emitting a wall of noise about a
-   baseline that was never taken.  Measured at 6de6fc3.")
+   baseline that was never taken.
+
+   (:CORPUS-IMAGE . T) marks a label as an ANSI gate runner, whose source blob
+   includes the ANSI TEST CORPUS.  There the non-fatal counts are descriptive,
+   not a ratchet: the corpus deliberately contains pathological code (that is
+   what it tests), and it GROWS, so ratcheting its warn counts would fail the
+   primary gate build every time a test file is added.  The fatal shapes still
+   ratchet — a NEW uncompilable construct in the harness itself is exactly what
+   we want to catch.  Measured at 6de6fc3 / 8ca0b6d.")
 
 (defun %gck-warn-shape (line)
   (dolist (spec *global-check-warn-shapes*)
@@ -1150,8 +1190,12 @@ finding~:P, baselined:~%~{;;   - ~A~%~}"
         (let ((n (gethash key hist 0))
               (base (or (cdr (assoc key row)) 0)))
           ;; Non-fatal shapes are only ratcheted where a baseline row was
-          ;; actually MEASURED; a missing row is "unknown", not "zero".
-          (when (and (> n base) (or fatalp row))
+          ;; actually MEASURED; a missing row is "unknown", not "zero".  On a
+          ;; :CORPUS-IMAGE (an ANSI gate runner) they are descriptive only —
+          ;; the corpus is test data and it grows.  Fatal shapes always ratchet.
+          (when (and (> n base)
+                     (or fatalp
+                         (and row (not (cdr (assoc :corpus-image row))))))
             (let ((s (format nil "~(~A~) = ~D (baseline ~D) — ~D NEW instance~:P"
                              key n base (- n base))))
               (if fatalp (push s fatal) (push s noted)))))))

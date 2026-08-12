@@ -350,10 +350,19 @@
 ;;; (*label-counter*, *kw-rest-counter* → "%KWF-~A-~D",
 ;;; *nonlocal-block-tag-counter*); CL:GENSYM was the one holdout.
 ;;;
-;;; SHAPE IS PRESERVED: like CL:GENSYM this returns a FRESH UNINTERNED symbol
-;;; named PREFIX + decimal-digits, so any code that inspects the prefix (e.g.
-;;; the "SPECPARM-"/"SAVE-" naming conventions) is unaffected.  Only the digits
-;;; differ, and only because they now come from a counter we own.
+;;; NAMES ARE COLLISION-PROOF BY CONSTRUCTION, which CL:GENSYM's were not.
+;;; This compiler resolves variables by NAME HASH — an uninterned symbol is
+;;; just "a name with no home package" (see compile-quote's %INTERN-SYMBOL-PKG
+;;; path), so uninternedness buys no separation at all.  A gensym named "Z1"
+;;; IS the corpus's variable Z1.  CL:GENSYM only avoided that by accident: the
+;;; host counter is in the tens of thousands by the time a build starts, so
+;;; "Z38291" happened not to be a name anyone writes.  A counter of our own
+;;; starts at 1, which would put "R1"/"Z1"/"K1"/"D1" — real prefixes used
+;;; below — squarely in the range humans DO write.  So the digits are preceded
+;;; by a `%' the source language never puts there: "NAT%42", "Z%7".  Same
+;;; PREFIX-then-suffix shape (the "SPECPARM-"/"SAVE-" conventions and every
+;;; prefix search still work); the separation is now structural rather than
+;;; statistical.
 ;;;
 ;;; RUNTIME EVAL IS UNCHANGED: in-image mvm-eval (*mvm-eval-runtime-p* T and
 ;;; NOT a static build) still calls CL:GENSYM.  There, the counter is the
@@ -370,9 +379,10 @@
    the REPRODUCIBLE BUILDS note above.")
 
 (defun %mvm-gensym (&optional (prefix "G"))
-  "Fresh uninterned symbol named PREFIX+digits, from a counter the COMPILER
-   owns.  Drop-in for CL:GENSYM inside the MVM compiler; see the REPRODUCIBLE
-   BUILDS note above for why the host's counter must not be used.
+  "Fresh uninterned symbol named PREFIX + \"%\" + digits, from a counter the
+   COMPILER owns.  Drop-in for CL:GENSYM inside the MVM compiler; see the
+   REPRODUCIBLE BUILDS note above for why the host's counter must not be used
+   and why the `%' is load-bearing rather than decorative.
    Runtime eval in-image still uses CL:GENSYM (image state, emits no bytes)."
   (if (and *mvm-eval-runtime-p* (not *static-build-p*))
       (gensym prefix)
@@ -382,7 +392,7 @@
         ;; reads NIL until MVM-COMPILE-ALL's SETQ lands.
         (setq *mvm-gensym-counter*
               (+ 1 (if *mvm-gensym-counter* *mvm-gensym-counter* 0)))
-        (make-symbol (format nil "~A~D" prefix *mvm-gensym-counter*)))))
+        (make-symbol (format nil "~A%~D" prefix *mvm-gensym-counter*)))))
 
 (defun %eval-expander-runtime (lambda-form)
   "Evaluate LAMBDA-FORM (a `(lambda …)` macro-expander) into a CALLABLE, in

@@ -1087,6 +1087,27 @@ finding~:P, baselined:~%~{;;   - ~A~%~}"
      (:implicit-global-setq . 346)
      (:unresolved-function . 25)
      (:unknown-go-tag . 5)
+     (:unknown-loop-clause . 1))
+    ;; NOTE: the aarch64 gate runners need a BIGGER HOST heap than the x64 pair
+    ;; — `--dynamic-space-size 4096` dies with SB-KERNEL::HEAP-EXHAUSTED-ERROR
+    ;; partway through BUILD-IMAGE.  Build them with 12288.
+    ("build-aarch64-linux"
+     (:corpus-image . t)
+     (:cannot-compile . 5)
+     (:macroexpand-failed . 4)
+     (:implicit-global . 1715)
+     (:implicit-global-setq . 340)
+     (:unresolved-function . 25)
+     (:unknown-go-tag . 5)
+     (:unknown-loop-clause . 1))
+    ("build-aarch64"                     ; identical histogram to its Linux sibling
+     (:corpus-image . t)
+     (:cannot-compile . 5)
+     (:macroexpand-failed . 4)
+     (:implicit-global . 1715)
+     (:implicit-global-setq . 340)
+     (:unresolved-function . 25)
+     (:unknown-go-tag . 5)
      (:unknown-loop-clause . 1)))
   "Per-build-script (LABEL . ((SHAPE . COUNT) …)).
 

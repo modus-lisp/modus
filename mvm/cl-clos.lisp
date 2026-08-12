@@ -1424,12 +1424,31 @@
               (error "make-instance: invalid initarg ~S" key)))
           (setq c2 (cddr c2)))))))
 
-(defun make-instance (&rest args)
-  "Per CLHS 7.1.1, MAKE-INSTANCE allocates an instance and dispatches
-   INITIALIZE-INSTANCE on it with the initargs.  We bypass apply on
-   initialize-instance — that goes through funcall+&rest, which in
-   modus loses trailing args when nargs > +max-reg-args+.  Instead we
-   call the dispatcher directly with the args list."
+(defun %make-instance-list (args)
+  "List-form MAKE-INSTANCE.  ARGS is (class-designator . initargs).
+
+   This is THE single implementation of the CLHS 7.1.1 instance-creation
+   protocol: allocate, validate the initarg plist (7.1.2), then dispatch
+   INITIALIZE-INSTANCE — which is what runs the user's
+   `(defmethod initialize-instance :after ...)` / SHARED-INITIALIZE
+   methods.  Every entry point routes here:
+
+     - the MAKE-INSTANCE defun below (apply / funcall / #'make-instance),
+     - compiler.lisp's MAKE-INSTANCE macro (the ordinary compiled
+       `(make-instance 'c ...)` call form, both build-time image source
+       and runtime eval2), and
+     - the SBCL-side ANSI corpus rewriter in build-ansi-common.lisp.
+
+   Before task #246 the latter two each open-coded
+   `%make-instance` + `%shared-init-default-spread`, which skips GF
+   dispatch entirely — so user initialization methods NEVER ran on the
+   ordinary call form (only via apply/funcall), and the direct form also
+   failed to bind *clos-applying-defaults* so (:default-initargs ...)
+   silently did not apply.
+
+   Takes a LIST rather than a &rest tail because modus's funcall+&rest
+   path collapses arguments when nargs > +max-reg-args+, which would
+   silently drop trailing initargs."
   (cond
     ((null args) (error "make-instance: requires a class designator"))
     (t
@@ -1438,11 +1457,16 @@
             (class-name (if (%clos-class-p class-or-name)
                             (aref class-or-name 1)
                             class-or-name))
-            (inst (%make-instance class-or-name))
+            ;; CLHS 7.1.2: an odd-length initarg plist is a PROGRAM-ERROR
+            ;; regardless of whether the class resolves, so check it
+            ;; BEFORE allocating (make-instance.error.2).
+            (odd (oddp (length initargs)))
+            (inst (progn (when odd (%signal-program-error))
+                         (%make-instance class-or-name)))
             ;; make-instance applies default-initargs (CLHS 7.1.4); bind
             ;; the flag so the shared-initialize default body picks them up.
             (*clos-applying-defaults* t))
-       (when (null inst) (return-from make-instance nil))
+       (when (null inst) (return-from %make-instance-list nil))
        ;; CLHS 7.1.2: reject malformed / unknown initargs.  Only validate
        ;; for genuine CLOS classes (registered); skip when inst allocation
        ;; succeeded but the class has no slot-info (defensive).
@@ -1450,6 +1474,14 @@
          (%clos-validate-initargs class-name initargs))
        (%dispatch-initialize-instance (cons inst initargs))
        inst))))
+
+(defun make-instance (&rest args)
+  "Per CLHS 7.1.1, MAKE-INSTANCE allocates an instance and dispatches
+   INITIALIZE-INSTANCE on it with the initargs.  We bypass apply on
+   initialize-instance — that goes through funcall+&rest, which in
+   modus loses trailing args when nargs > +max-reg-args+.  Instead we
+   call the list-form entry directly with the args list."
+  (%make-instance-list args))
 
 (defun %make-instance (class-or-name)
   "Allocate a new CLOS instance.  Accepts either a class name (symbol)

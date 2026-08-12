@@ -3887,20 +3887,30 @@
   ;; structural-error signalling, initarg plist validation.
 
   ;; MAKE-INSTANCE — (make-instance 'class &rest initargs)
-  ;; → alloc the instance, apply explicit initargs via the spread helper
-  ;; (slot-names NIL = initargs only, NO native initform funcall), then
-  ;; apply each remaining slot's :initform IN BYTECODE.
+  ;; → (%make-instance-list (list class . initargs))
   ;;
-  ;; WHY initforms run in bytecode and not via %shared-init-default-spread's
-  ;; T slot-names path: that native helper's step-2 does
+  ;; %make-instance-list (mvm/cl-clos.lisp) is the ONE implementation of the
+  ;; CLHS 7.1.1 instance-creation protocol: allocate, validate initargs
+  ;; (7.1.2), then DISPATCH INITIALIZE-INSTANCE.  The MAKE-INSTANCE defun
+  ;; and the SBCL-side ANSI rewriter both route to it too.
+  ;;
+  ;; Task #246: this macro used to open-code %make-instance +
+  ;; %shared-init-default-spread + a bytecode initform loop, which never
+  ;; touched the INITIALIZE-INSTANCE / SHARED-INITIALIZE generic functions.
+  ;; So `(defmethod initialize-instance :after ((x c) &key) ...)` — the
+  ;; single most common CLOS extension point — silently did nothing for the
+  ;; ordinary compiled call form (it only ran via apply/funcall, which reach
+  ;; the defun).  The open-coding also never bound *clos-applying-defaults*,
+  ;; so (:default-initargs ...) did not apply on the direct form either.
+  ;;
+  ;; The old comment here claimed the native T-slot-names initform path
+  ;; SIGSEGVs on mvm-eval classes because it does
   ;; `(aset instance idx (funcall thunk))` with the destination computed
-  ;; before the value.  For an mvm-eval class the thunk is a re-entrant interp
-  ;; trampoline, so (funcall thunk) recurses into mvm-interpret (may GC) —
-  ;; the native aset then wrote to a stale instance pointer → SIGSEGV.
-  ;; Funcalling each thunk at the TOP mvm-eval level (like a working
-  ;; mapcar-over-an-mvm-eval-lambda) and applying via set-slot-value avoids the
-  ;; deep-native re-entrancy.  CLHS: initforms apply only to slots not set by
-  ;; an initarg, so the %slot-boundp guard skips initarg-supplied slots.
+  ;; before the value.  That is stale: the raw-aset shape lives in
+  ;; %shared-initialize-default (the &rest entry), while
+  ;; %shared-init-default-spread's step 3 — the one this path reaches —
+  ;; applies initforms via set-slot-value AFTER the funcall returns, so a
+  ;; GC inside a re-entrant interp thunk cannot leave a stale destination.
   (mvm-define-macro "MAKE-INSTANCE"
     (lambda (form)
       (if (null (cdr form))
@@ -3909,39 +3919,7 @@
           ;; macro fell through to (%make-instance nil) → NIL, silently
           ;; succeeding; base's function path raised on (null args).
           '(%signal-program-error)
-      (let ((class-arg (cadr form))
-            (initargs  (cddr form))
-            (tmp   (gensym "MI-INST"))
-            (cls   (gensym "MI-CLS"))
-            (iargs (gensym "MI-IARGS"))
-            (cname (gensym "MI-CNAME"))
-            (pair  (gensym "MI-PAIR")))
-        ;; CLHS 7.1.2: validate the initarg plist BEFORE allocating — an
-        ;; odd-length plist is a PROGRAM-ERROR (make-instance.error.2) and an
-        ;; unrecognised initarg is an ERROR (make-instance.error.3).  The old
-        ;; macro skipped straight to %make-instance, so the auto-extracted
-        ;; runtime macro made (eval '(make-instance c :a)) silently succeed —
-        ;; regressing probes 8684/8685/8687.  Validating first also avoids the
-        ;; stale-instance hazard the rest of this macro guards against, since
-        ;; there is no live instance pointer yet if validation GCs.
-        `(let* ((,cls   ,class-arg)
-                (,iargs (list ,@initargs))
-                (,cname (if (%clos-class-p ,cls) (aref ,cls 1) ,cls)))
-           ;; An odd-length initarg plist is ALWAYS a program-error (CLHS
-           ;; 7.1.2 / make-instance.error.2), independent of whether the
-           ;; class is registered at runtime — so this check must run even
-           ;; when %find-clos-class can't resolve a build-time-registered
-           ;; class.  The class-gated call below adds the unknown-initarg
-           ;; check (make-instance.error.3/.4), which DOES need slot info.
-           (when (oddp (length ,iargs)) (%signal-program-error))
-           (when (%find-clos-class ,cname)
-             (%clos-validate-initargs ,cname ,iargs))
-           (let ((,tmp (%make-instance ,cls)))
-             (%shared-init-default-spread (list* ,tmp nil ,iargs))
-             (dolist (,pair (%clos-initform-alist ,cls))
-               (unless (%slot-boundp ,tmp (car ,pair))
-                 (set-slot-value ,tmp (car ,pair) (funcall (cdr ,pair)))))
-             ,tmp))))))
+          `(%make-instance-list (list ,(cadr form) ,@(cddr form))))))
 
   ;; DEFGENERIC — (defgeneric name lambda-list &rest options)
   ;; → register the GF + a dispatch defun NAME that funnels through

@@ -768,7 +768,13 @@ WITH A REASON.  Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~
       nil)) …)' to give the call a fresh #n= label table.  In-image that LET is
       lexical, so the per-READ reset never happens: %READ-SHARP-DISPATCH and
       friends read and PUSH onto the GLOBAL table, which therefore accumulates
-      across every read for the life of the image and is never cleared.")
+      across every read for the life of the image and is never cleared.
+      VERIFIED ON THE BINARY, not inferred — in the shipping x64 CLI:
+        (read-from-string \"#1=(1 2 3)\")  =>  (1 2 3)
+        *sharp-labels*                   =>  ((1 (1 2 3) . :SHARP-RESOLVED))
+        (read-from-string \"#1#\")         =>  (1 2 3)
+      That last one must signal a reader-error: #1# is undefined in a fresh
+      READ.  It resolves through the leaked table instead.")
     ("*SUPPRESS-LOOP-BLOCK-NIL*"
      "#248 FINDING 2 (unfixed, filed) — mvm/compiler.lisp COMPILE-COMPOUND's
       %NAMED-LOOP arm binds it so the inner simple-LOOP does not establish its
@@ -784,7 +790,11 @@ WITH A REASON.  Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~
     ("*UWP-SEQ-COUNTER*"
      "#248 FINDING 4 (unfixed, filed) — mvm/compiler.lisp MVM-COMPILE-ALL
       resets it per compilation unit.  Lexical in-image ⇒ never reset, so the
-      counter runs monotonically across every eval2 compile in the image.")
+      counter runs monotonically across every eval2 compile in the image.
+      VERIFIED ON THE BINARY: in the shipping x64 CLI, two successive
+      `(defun f (x) (unwind-protect (+ x 1) nil))' forms leave
+      *UWP-SEQ-COUNTER* reading 2 then 3, where MVM-COMPILE-ALL's
+      `(let ((*uwp-seq-counter* 0)) …)' should have reset it to 0 each time.")
     ("*INIT-THUNK-NAMES*"
      "#248 FINDING 5 (unfixed, filed) — mvm/cl-eval.lisp
       %MVM-EVAL-COMPILE-TUPLE and MVM-EVAL-FORMS both bind it around a compile.

@@ -594,10 +594,40 @@
                                        :element-type '(unsigned-byte 8)
                                        :initial-element 0)))
 
-            ;; Verify content fits before metadata
+            ;; Verify content fits before metadata.
+            ;;
+            ;; #252 — THIS IS THE CURRENT BLOCKER AND IT IS NOT A BOUND BUMP.
+            ;; Bisected: the fixpoint build last SUCCEEDED at a418e5f and first
+            ;; failed at 4fb1dab (2026-04-09, "LOOP always/thereis/unless +
+            ;; &rest parameters").  That first failure was NOT this ceiling —
+            ;; it was the host-side i386 reference-translation fixed buffer
+            ;; going INVALID-ARRAY-INDEX, which 5dd2972 (2026-07-16) wrapped in
+            ;; a handler-case.  Guarding it exposed the next wall, this one.
+            ;;
+            ;; At d63b677 content-end is 14870939 bytes against a 4194304
+            ;; ceiling — 3.5x over, from four months of CL-runtime + eval2 +
+            ;; JIT growth (source 728374 chars when it last built, 2332369 now).
+            ;;
+            ;; Raising METADATA-OFFSET ALONE PRODUCES A BROKEN IMAGE that
+            ;; builds silently.  The Gen0 image reads its metadata at a
+            ;; HARD-CODED VA 0x500000 (= x64 load-addr 0x100000 + 0x400000, and
+            ;; aarch64 0x80000 + 0x480000): 178 literal #x5000xx references
+            ;; across mvm/fixpoint-*.lisp, spanning +0x00..+0x78, not just the
+            ;; 64-byte header.  A real fix is a relayout:
+            ;;   1. one base constant for the metadata block, deriving all 178
+            ;;   2. move it above the image (e.g. VA 0x2000000)
+            ;;   3. relocate what a 15 MB image now overlaps on bare-metal x64:
+            ;;      the stack top at 0x800000 (*X64-STACK-TOP-OVERRIDE* exists
+            ;;      for exactly this) and the globals block at 0x600000
+            ;;   4. verify by BOOTING Gen0 in QEMU and running the x64->x64
+            ;;      chain, scripts/run-fixpoint-ssh.sh — a build that writes a
+            ;;      file proves nothing here
             (let ((content-end (+ ft-offset ft-entry-size)))
               (when (> content-end metadata-offset)
-                (error "Fixpoint content (~D bytes) exceeds metadata offset 0x~X"
+                (error "Fixpoint content (~D bytes) exceeds metadata offset 0x~X~@
+                        (#252: see the comment at this check — raising the ~
+                        offset alone yields a Gen0 that reads its metadata from ~
+                        the wrong address.)"
                        content-end metadata-offset)))
 
             ;; Copy base image + append bytecode + function table

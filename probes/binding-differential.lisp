@@ -159,6 +159,95 @@
 (chk "ds.slot.read-only"     (let ((s (make-d18)))
                                (handler-case (progn (setf (d18-b s) 9) (d18-b s))
                                  (error (c) (progn c :REFUSED)))))
+(chk "ds.slot.read-only.unchanged"
+     (let ((s (make-d18)))
+       (handler-case (setf (d18-b s) 9) (error (c) (progn c nil)))
+       (d18-b s)))
+
+;;; --- A10. SLOT ACCESS TYPE SAFETY (task #244 item 2).
+;;;
+;;;   A generated accessor used to dereference whatever it was handed.
+;;;   `(d19-a nil)` SIGSEGV'd inside %OBJ-ELT-REF (an OBJ-REF on an
+;;;   immediate); `(d19-a "s")` / `(d19-a 'sym)` / `(d19-a (cons 1 2))`
+;;;   returned GARBAGE with no signal at all; and a WRITE through a
+;;;   too-long index stored one word past a live object, which is heap
+;;;   corruption rather than a wrong answer.  SBCL signals TYPE-ERROR for
+;;;   every one of these.
+;;;
+;;;   Rows reduce to :OK / :TYPE-ERROR / :OTHER-ERROR / a value, never a
+;;;   condition object or a printed instance.  A row that comes back with a
+;;;   VALUE where the oracle says :TYPE-ERROR is an accessor that accepted a
+;;;   non-instance — the exact defect these rows exist to measure.
+(defmacro acc-chk (label form)
+  `(chk ,label (handler-case (progn ,form :OK)
+                 (type-error (c) (progn c :TYPE-ERROR))
+                 (error (c) (progn c :OTHER-ERROR)))))
+
+(defstruct d19 a b)                        ; 2 slots
+(defstruct d20 p q)                        ; 2 slots, SAME size as d19
+(defstruct d21 e f g h)                    ; 4 slots, larger
+(defstruct d22 bx by)                      ; :include parent
+(defstruct (d23 (:include d22)) dz)        ; child: parent slots + 1
+(defstruct (d24 (:constructor mk24 (u v))) u v)   ; BOA
+(defstruct (d25 (:conc-name qq-)) m n)     ; custom conc-name
+
+;; Controls — valid access must keep working, through every variant.
+(chk "acc.ok.reader"        (d19-a (make-d19 :a 1 :b 2)))
+(chk "acc.ok.writer"        (let ((s (make-d19))) (setf (d19-a s) 7) (d19-a s)))
+(chk "acc.ok.conc-name"     (qq-m (make-d25 :m 3 :n 4)))
+(chk "acc.ok.boa"           (d24-u (mk24 8 9)))
+(chk "acc.ok.copier"        (d19-b (copy-d19 (make-d19 :a 1 :b 2))))
+(chk "acc.ok.parent-on-child"  (d22-bx (make-d23 :bx 5 :by 6 :dz 7)))
+(chk "acc.ok.child-own-slot"   (d23-dz (make-d23 :bx 5 :by 6 :dz 7)))
+(chk "acc.ok.setf-parent-on-child"
+     (let ((s (make-d23 :bx 5 :by 6 :dz 7))) (setf (d22-bx s) 55) (d22-bx s)))
+(chk "acc.ok.setf-fn"       (let ((s (make-d19))) (funcall #'(setf d19-a) 11 s) (d19-a s)))
+
+;; Readers applied to things that are not instances.
+(acc-chk "acc.read.nil"     (d19-a nil))
+(acc-chk "acc.read.fixnum"  (d19-a 5))
+(acc-chk "acc.read.t"       (d19-a t))
+(acc-chk "acc.read.char"    (d19-a #\a))
+(acc-chk "acc.read.string"  (d19-a "abcdefgh"))
+(acc-chk "acc.read.symbol"  (d19-a 'zzz))
+(acc-chk "acc.read.cons"    (d19-a (cons 1 2)))
+(acc-chk "acc.read.list"    (d19-a (list 1 2 3 4)))
+(acc-chk "acc.read.float"   (d19-a 1.5d0))
+(acc-chk "acc.read.hash"    (d19-a (make-hash-table)))
+(acc-chk "acc.read.fn"      (d19-a #'car))
+(acc-chk "acc.read.conc-name" (qq-m nil))
+(acc-chk "acc.read.boa"     (d24-u nil))
+(acc-chk "acc.read.parent"  (d22-bx nil))
+(acc-chk "acc.read.child"   (d23-dz nil))
+
+;; Wrong STRUCT type.  The larger-struct and parent-instance rows are the
+;; ones a length-based guard can catch; the same-size sibling row is the
+;; documented residual (Modus has no per-instance type identity that
+;; survives crossing a compilation unit).
+(acc-chk "acc.read.parent-instance-thru-child-accessor"
+                            (d23-dz (make-d22 :bx 1 :by 2)))
+(acc-chk "acc.read.smaller-struct" (d21-h (make-d19 :a 1 :b 2)))
+(acc-chk "acc.read.same-size-sibling" (d19-a (make-d20 :p 1 :q 2)))
+(acc-chk "acc.read.plain-vector"      (d19-a (vector 1 2 3 4)))
+
+;; Writers applied to things that are not instances.  A writer that does not
+;; signal here has STORED into whatever it was handed.
+(acc-chk "acc.write.nil"    (setf (d19-a nil) 1))
+(acc-chk "acc.write.fixnum" (setf (d19-a 5) 1))
+(acc-chk "acc.write.string" (setf (d19-a "abcdefgh") 1))
+(acc-chk "acc.write.symbol" (setf (d19-a 'zzz) 1))
+(acc-chk "acc.write.cons"   (setf (d19-a (cons 1 2)) 1))
+(acc-chk "acc.write.parent-instance-thru-child-accessor"
+                            (setf (d23-dz (make-d22 :bx 1 :by 2)) 1))
+(acc-chk "acc.write.setf-fn-nil" (funcall #'(setf d19-a) 1 nil))
+
+;; Copier and predicate on non-instances.
+(acc-chk "acc.copy.nil"     (copy-d19 nil))
+(acc-chk "acc.copy.fixnum"  (copy-d19 5))
+(chk "acc.pred.nil"         (and (d19-p nil) t))
+(chk "acc.pred.fixnum"      (and (d19-p 5) t))
+(chk "acc.pred.char"        (and (d19-p #\a) t))
+(chk "acc.pred.sibling"     (and (d19-p (make-d20 :p 1 :q 2)) t))
 
 ;;; ==================================================================
 ;;; SECTION B — SPECIAL DECLARATIONS ON PARAMETERS

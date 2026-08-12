@@ -709,6 +709,48 @@
     (setq *defstruct-eff-slots* (cons (cons name-str slots) new)))
   slots)
 
+;; Parallel to *DEFSTRUCT-EFF-SLOTS*: per-struct list of :READ-ONLY flags, one
+;; per EFFECTIVE slot, in the same order.  Kept as a SEPARATE table rather than
+;; widening the (name . default) pairs because several call sites destructure
+;; those pairs with plain CAR/CDR — a third element there would silently turn
+;; every inherited slot's DEFAULT into a cons.  CLHS 3.4.6: read-only-ness is
+;; inherited by :INCLUDE (and an :INCLUDE slot override may only ADD it), so
+;; the child prepends the parent's flags exactly as it prepends the slots.
+(defvar *defstruct-eff-ro* nil)
+
+(defun %defstruct-eff-ro-get (name-str)
+  "Effective read-only flag list registered for struct NAME-STR, or NIL."
+  (let ((cur *defstruct-eff-ro*))
+    (loop
+      (when (null cur) (return nil))
+      (when (string= (car (car cur)) name-str) (return (cdr (car cur))))
+      (setq cur (cdr cur)))))
+
+(defun %defstruct-eff-ro-put (name-str flags)
+  "Register FLAGS as struct NAME-STR's per-effective-slot read-only flags."
+  (let ((new nil) (cur *defstruct-eff-ro*))
+    (loop
+      (when (null cur) (return nil))
+      (unless (string= (car (car cur)) name-str)
+        (setq new (cons (car cur) new)))
+      (setq cur (cdr cur)))
+    (setq *defstruct-eff-ro* (cons (cons name-str flags) new)))
+  flags)
+
+(defun %slot-spec-read-only-p (spec)
+  "True when a DEFSTRUCT slot description SPEC — (NAME DEFAULT . OPTIONS) —
+   carries a non-NIL :READ-ONLY option.  A bare symbol slot never is."
+  (if (not (consp spec))
+      nil
+      (let ((opts (cddr spec)) (found nil))
+        (loop
+          (when (null opts) (return found))
+          (when (and (cdr opts)
+                     (symbolp (car opts))
+                     (string= (symbol-name (car opts)) "READ-ONLY"))
+            (setq found (if (cadr opts) t nil)))
+          (setq opts (cddr opts))))))
+
 (defvar *arith-push-depth* 0
   "Depth of arithmetic PUSH/POP nesting. When > 0, we are inside an
    arithmetic operation that has pushed an intermediate result.
@@ -17697,10 +17739,31 @@
                             (%defstruct-eff-slots-get (%rt-fn-name include-parent))))
             (parent-slot-names (mapcar #'car parent-slots))
             (parent-slot-defaults (mapcar #'cdr parent-slots))
+            ;; CLHS 3.4.6 slot option :READ-ONLY — parsed per OWN slot and
+            ;; inherited for the parent's slots.  Previously accepted and
+            ;; silently discarded, so a write SBCL refuses succeeded here.
+            (own-slot-ro (mapcar #'%slot-spec-read-only-p raw-slots))
+            (parent-slot-ro (let ((f (%defstruct-eff-ro-get
+                                      (%rt-fn-name include-parent))))
+                              ;; A parent compiled before this table existed
+                              ;; (or an unregistered parent) yields NIL —
+                              ;; pad to the parent's slot count so the
+                              ;; effective lists stay index-aligned.
+                              (if (= (length f) (length parent-slot-names))
+                                  f
+                                  (make-list (length parent-slot-names)
+                                             :initial-element nil))))
             ;; Effective (inherited then own) slot lists used everywhere.
             (slot-names (append parent-slot-names own-slot-names))
             (slot-defaults (append parent-slot-defaults own-slot-defaults))
+            (slot-ro (append parent-slot-ro own-slot-ro))
             (nslots (length slot-names))
+            ;; Minimum instance length an instance must have for THIS
+            ;; struct's accessors to be in bounds: the 2-slot marker prefix
+            ;; plus every effective slot.  An :INCLUDE child is longer, so
+            ;; `>=` keeps parent accessors working on child instances while
+            ;; still rejecting a parent instance passed to a child accessor.
+            (min-inst-len (+ 2 nslots))
             (forms-to-compile nil))
        ;; Register THIS struct's effective slots so its own children inherit.
        (%defstruct-eff-slots-put
@@ -17710,6 +17773,7 @@
             (when (null ns) (return (nreverse r)))
             (setq r (cons (cons (car ns) (car ds)) r))
             (setq ns (cdr ns)) (setq ds (cdr ds)))))
+       (%defstruct-eff-ro-put struct-key slot-ro)
        ;; Constructor
        ;; NOTE: the internal all-slots ctor is named %%STRUCT-CTOR-<name>,
        ;; NOT %MAKE-<name>: a user (:constructor %MAKE-<name> (boa...)) — as
@@ -17985,18 +18049,84 @@
          )  ; close the (let ((ctor-name ...) ...)) ctor block
 
        ;; Accessors — use conc-name prefix (nil = slot name only)
+       ;;
+       ;; TYPE-CHECKED SLOT ACCESS (task #244 item 2).  The old bodies were a
+       ;; bare `(aref obj IDX)` / `(aset obj IDX val)`: the accessor
+       ;; dereferenced whatever it was handed.  `(zs-a nil)` SIGSEGV'd inside
+       ;; %OBJ-ELT-REF (an OBJ-REF on a DEAD-page immediate); `(zs-a "s")`,
+       ;; `(zs-a 'foo)` and `(zs-a (cons 1 2))` silently returned garbage; and
+       ;; `(setf (derived-dz base-instance) v)` WROTE one word past a live
+       ;; object — a heap-corruption vector, not merely a wrong answer.
+       ;;
+       ;; The guard is TWO tests, both on values the check has already proven
+       ;; safe to touch:
+       ;;   (= (obj-subtag obj) #x32)   — +SUBTAG-ARRAY+.  OBJ-SUBTAG is
+       ;;     tag-safe by construction (translate-x64.lisp's +op-obj-subtag+
+       ;;     returns 0 for any non-tag-9 word, T included), so this is legal
+       ;;     on NIL / T / fixnums / characters / conses and rejects them, as
+       ;;     well as strings (#x31), symbols (#x50), floats, bignums,
+       ;;     hash-tables, closures and native MDAs (#x34).
+       ;;   (>= (%prim-array-length obj) MIN-INST-LEN) — the instance is long
+       ;;     enough to hold every effective slot of THIS struct.  Bounds the
+       ;;     access AND rejects a parent instance passed to a child's
+       ;;     accessor, while an :INCLUDE child (which is longer) still passes
+       ;;     the parent's accessors, as CLHS requires.
+       ;;
+       ;; Deliberately NOT checked: `(eq (aref obj 0) '%struct-instance)`.
+       ;; That marker is NOT EQ across compilation units — measured, not
+       ;; assumed: in the CLI `(eq (aref (make-zs …) 0) '%struct-instance)` is
+       ;; NIL, because the constructor's literal and a fresh literal in
+       ;; another eval unit intern to different objects.  The type predicate
+       ;; gets away with it only because it is emitted in the SAME expansion
+       ;; as its constructor (its own comment says so).  An accessor must
+       ;; also accept instances built by %ALLOC-STRUCT, by the #S reader and
+       ;; by a copier from another unit, so a marker EQ here would reject
+       ;; valid structs.  Same reason the exact type-name is not compared:
+       ;; slot 1 has the identical identity problem, and the :INCLUDE
+       ;; ancestry that would rescue it lives in a registry the AOT defstruct
+       ;; path deliberately does not populate.  Residual, documented: a
+       ;; SAME-LENGTH sibling struct (or a long enough plain vector) is still
+       ;; accepted where SBCL signals TYPE-ERROR.
+       ;;
+       ;; Cost: this is not a net addition.  Having proven subtag #x32 the
+       ;; body can use %PRIM-AREF / %PRIM-ASET directly and skip the public
+       ;; AREF/ASET cond entirely — which was already testing %MDA-P (itself
+       ;; five type tests plus an OBJ-SUBTAG), CONSP and %PRIM-STRINGP on
+       ;; every single slot access.  See GATE-RESULT-244-accessors.md.
        (loop for slot in slot-names
              for i from 0
+             for slot-read-only in slot-ro
              do (let ((acc-name (if conc-name
                                     (format nil "~A~A" conc-name (symbol-name slot))
                                     (format nil "~A" (symbol-name slot)))))
                   (push `(defun ,(%defstruct-intern acc-name) (obj)
-                           (aref obj ,(+ 2 i)))
+                           (if (= (obj-subtag obj) #x32)
+                               (if (>= (%prim-array-length obj) ,min-inst-len)
+                                   (%prim-aref obj ,(+ 2 i))
+                                   (%signal-type-error))
+                               (%signal-type-error)))
                         forms-to-compile)
-                  (let ((setter-name (format nil "SET-~A" acc-name)))
+                  (let ((setter-name (format nil "SET-~A" acc-name))
+                        ;; CLHS 3.4.6: a :READ-ONLY slot has no writer at all.
+                        ;; Modus always emits SET-<ACC> / SETF-<ACC> (the SETF
+                        ;; place expansion calls SET-<ACC> unconditionally), so
+                        ;; suppressing the DEFUNs would degrade `(setf (ro-r1 x)
+                        ;; 1)` into an UNDEFINED-FUNCTION rather than a clear
+                        ;; refusal.  Emit the writers, but with a body that
+                        ;; signals and performs no store.
+                        (writer-body
+                          (if slot-read-only
+                              '((%signal-program-error))
+                              nil)))
                     (push `(defun ,(%defstruct-intern setter-name) (obj val)
-                             (aset obj ,(+ 2 i) val)
-                             val)
+                             ,@(or writer-body
+                                   `((if (= (obj-subtag obj) #x32)
+                                         (if (>= (%prim-array-length obj)
+                                                 ,min-inst-len)
+                                             (%prim-aset obj ,(+ 2 i) val)
+                                             (%signal-type-error))
+                                         (%signal-type-error))
+                                     val)))
                           forms-to-compile)
                     ;; Real (setf ACC) FUNCTION (CLHS 3.1.2.1.2.3 arg order:
                     ;; new-value first).  `#'(setf acc)` / `(funcall #'(setf
@@ -18022,8 +18152,14 @@
                     ;; who later writes their own `(defun (setf ACC) …)` DOES
                     ;; register, and wins, which is correct.
                     (push `(defun ,(format nil "SETF-~A" acc-name) (val obj)
-                             (aset obj ,(+ 2 i) val)
-                             val)
+                             ,@(or writer-body
+                                   `((if (= (obj-subtag obj) #x32)
+                                         (if (>= (%prim-array-length obj)
+                                                 ,min-inst-len)
+                                             (%prim-aset obj ,(+ 2 i) val)
+                                             (%signal-type-error))
+                                         (%signal-type-error))
+                                     val)))
                           forms-to-compile)
                     (let ((setter-sym (%defstruct-intern setter-name)))
                       (let ((setf-key (compute-name-hash (format nil "SETF-~A" acc-name))))
@@ -18043,11 +18179,19 @@
                          ((null copier-name) nil)
                          (t copier-name))))
          (when copy-sym
+           ;; Same guard as the accessors: COPY-<NAME> of NIL used to fault
+           ;; inside the first AREF.  Guard once, then copy through the
+           ;; primitive accessors (subtag #x32 is already proven).
            (push `(defun ,copy-sym (obj)
-                    (let ((new (make-array ,(+ 2 nslots))))
-                      ,@(loop for i from 0 below (+ 2 nslots)
-                              collect `(aset new ,i (aref obj ,i)))
-                      new))
+                    (if (= (obj-subtag obj) #x32)
+                        (if (>= (%prim-array-length obj) ,min-inst-len)
+                            (let ((new (make-array ,(+ 2 nslots))))
+                              ,@(loop for i from 0 below (+ 2 nslots)
+                                      collect `(%prim-aset new ,i
+                                                 (%prim-aref obj ,i)))
+                              new)
+                            (%signal-type-error))
+                        (%signal-type-error)))
                  forms-to-compile)))
 
        ;; Type predicate — checks the slot-0 marker and that the instance's

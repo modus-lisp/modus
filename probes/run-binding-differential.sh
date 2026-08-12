@@ -19,9 +19,9 @@ OUT="${2:-${TMPDIR:-/tmp}/binding-diff.$$}"
 mkdir -p "$OUT"
 
 sbcl --noinform --disable-debugger --script "$PROBE" 2>"$OUT/sbcl.err" \
-  | grep -aE '^(ds|sp)\.|^BINDING-DIFFERENTIAL-DONE' > "$OUT/sbcl.txt"
+  | grep -aE '^(ds|sp|acc)\.|^BINDING-DIFFERENTIAL-DONE' > "$OUT/sbcl.txt"
 timeout 900 "$BIN" --load "$PROBE" --quit 2>"$OUT/modus.err" \
-  | grep -aE '^(ds|sp)\.|^BINDING-DIFFERENTIAL-DONE' > "$OUT/modus.txt"
+  | grep -aE '^(ds|sp|acc)\.|^BINDING-DIFFERENTIAL-DONE' > "$OUT/modus.txt"
 
 fail=0
 for side in sbcl modus; do

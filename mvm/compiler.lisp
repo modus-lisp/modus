@@ -10073,21 +10073,39 @@
           ;; Old behavior (push :while iter to iterations → test-forms
           ;; AT START before init-stmts) broke `:FOR x :IN list :WHILE x`
           ;; because x was tested before init-stmt set it from car tmp.
+          ;;
+          ;; A WHILE that follows a DO/body clause goes into BODY-FORMS at
+          ;; its exact source position, NOT into post-body-tests.  Hoisting
+          ;; it past the remaining body clauses ran them on an iteration the
+          ;; WHILE had already terminated — cl-ppcre's END-STRING-AUX is
+          ;;   unless element-end do (setq continuep nil)
+          ;;   while element-end
+          ;;   unless skip     do (cond … collect …)
+          ;;   while continuep
+          ;; so the collect ran with ELEMENT-END NIL, left CONCATENATED-
+          ;; STRING = T, and (nreverse T) blew up — "b+" never got a
+          ;; scanner.  Accumulator clauses still force post-body-tests:
+          ;; acc-body is appended AFTER body, so a WHILE that follows a
+          ;; COLLECT cannot be expressed by an in-body position.
           ((= kw 208372112)  ; WHILE
            (let ((test `(if (null ,(cadr rest)) (return nil))))
-             (if (or (loop-state-body-forms state)
-                     (loop-state-accumulator state))
-                 (push test (loop-state-post-body-tests state))
-                 (push test (loop-state-pre-body-tests state))))
+             (cond
+               ((loop-state-accumulator state)
+                (push test (loop-state-post-body-tests state)))
+               ((loop-state-body-forms state)
+                (push test (loop-state-body-forms state)))
+               (t (push test (loop-state-pre-body-tests state)))))
            (setf rest (cddr rest)))
 
           ;; UNTIL condition — same source-order rule.
           ((= kw 301724213)  ; UNTIL
            (let ((test `(if ,(cadr rest) (return nil))))
-             (if (or (loop-state-body-forms state)
-                     (loop-state-accumulator state))
-                 (push test (loop-state-post-body-tests state))
-                 (push test (loop-state-pre-body-tests state))))
+             (cond
+               ((loop-state-accumulator state)
+                (push test (loop-state-post-body-tests state)))
+               ((loop-state-body-forms state)
+                (push test (loop-state-body-forms state)))
+               (t (push test (loop-state-pre-body-tests state)))))
            (setf rest (cddr rest)))
 
           ;; REPEAT n

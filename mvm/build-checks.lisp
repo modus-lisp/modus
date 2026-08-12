@@ -807,7 +807,28 @@ WITH A REASON.  Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~
       variable'.  Lexical in-image ⇒ the seven `(or *aarch64-translated-start-
       idx* 0)' readers all see 0, so a self-hosted AArch64 build appending into
       a pre-filled boot buffer computes native offsets against the wrong base.
-      Present in build-aarch64-cli / -linux / -ssh etc., absent from x64."))
+      Present in build-aarch64-cli / -linux / -ssh etc., absent from x64.")
+    ;; ---- FINDING 7: one cluster, mvm/cross.lisp, build-modus-selfhost only.
+    ;; ASSEMBLE-KERNEL-IMAGE binds seven translator hand-off variables in one
+    ;; LET and BUILD-IMAGE binds *AARCH64-SERIAL-BASE*; every consumer is in
+    ;; translate-aarch64.lisp, i.e. a DIFFERENT function reading the GLOBAL.
+    ;; Lexical in-image ⇒ MODUS BUILDING AN IMAGE FROM INSIDE MODUS (the WS5
+    ;; self-host path, and only that path — the host SBCL build is fine
+    ;; because SBCL honours the DEFVARs) hands the AArch64 translator NIL for
+    ;; the GC trampoline label, the handler push/pop labels, the generic
+    ;; arithmetic bytecode offsets and the UART base.
+    ("*AARCH64-GENSUB-BYTECODE-OFFSET*"   "#248 FINDING 7 (unfixed, filed) — cross.lisp ASSEMBLE-KERNEL-IMAGE cluster.")
+    ("*AARCH64-GENMUL-BYTECODE-OFFSET*"   "#248 FINDING 7 (unfixed, filed) — cross.lisp ASSEMBLE-KERNEL-IMAGE cluster.")
+    ("*AARCH64-GENADD-BYTECODE-OFFSET*"   "#248 FINDING 7 (unfixed, filed) — cross.lisp ASSEMBLE-KERNEL-IMAGE cluster.")
+    ("*AARCH64-GC-COLLECT-BYTECODE-OFFSET*" "#248 FINDING 7 (unfixed, filed) — cross.lisp ASSEMBLE-KERNEL-IMAGE cluster.")
+    ("*AARCH64-GC-TRAMPOLINE-LABEL*"      "#248 FINDING 7 (unfixed, filed) — cross.lisp ASSEMBLE-KERNEL-IMAGE cluster.")
+    ("*AARCH64-HANDLER-POP-LABEL*"        "#248 FINDING 7 (unfixed, filed) — cross.lisp ASSEMBLE-KERNEL-IMAGE cluster.")
+    ("*AARCH64-HANDLER-PUSH-LABEL*"       "#248 FINDING 7 (unfixed, filed) — cross.lisp ASSEMBLE-KERNEL-IMAGE cluster.")
+    ("*AARCH64-SERIAL-BASE*"
+     "#248 FINDING 7 (unfixed, filed) — cross.lisp BUILD-IMAGE's
+      `(let ((*aarch64-serial-base* (or *aarch64-serial-base* serial-base
+      #x09000000))) …)'.  The whole point of that LET is that the translator,
+      a different function, reads the global; lexical in-image it reads NIL."))
   "Alist (NAME . reason) of KNOWN, FILED, UNFIXED check-C findings.  Still
    PRINTED every build; they just do not fail it.")
 

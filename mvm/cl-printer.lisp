@@ -387,11 +387,24 @@
     ;; Native keyword (subtag #x53): just emit ":NAME" — no package qualifier
     ;; logic.  The CL-symbol path below handles KEYWORD-package CL symbols
     ;; via the qualifier branch (pkg-name = "" when KEYWORD).
+    ;;
+    ;; The leading ":" is a PACKAGE PREFIX and is therefore gated by
+    ;; *print-escape* / *print-readably* exactly like every other package
+    ;; qualifier (CLHS 22.1.3.3: "if *print-escape* is false ... only the
+    ;; characters of the name of the symbol are output").  So (princ :foo)
+    ;; and (format nil "~A" :foo) yield "FOO", while (prin1 :foo) and ~S
+    ;; still yield ":FOO".  Getting this wrong broke every library that
+    ;; builds a symbol name out of keywords — e.g. cl-base64's
+    ;; define-base64-decoder does
+    ;;   (intern (format nil "~A-~A-~A-~A" '#:base64 hose '#:to sink))
+    ;; which produced BASE64-:STRING-TO-:STRING, so the exported
+    ;; BASE64-STRING-TO-STRING had no function definition.
     (when (and (not (%cl-sym-p sym)) (not (null sym)) (not (eq sym t))
                (not (consp sym)) (not (integerp sym))
                (not (characterp sym)) (not (stringp sym))
                (= (obj-subtag sym) 83))   ; #x53 keyword
-      (%print-char 58 stream)             ; :
+      (when (or escape readably)
+        (%print-char 58 stream))          ; :
       (let* ((name (symbol-name sym))
              (rt   *readtable*)
              (rc   (if (and rt (readtablep rt)) (readtable-case rt) :upcase)))
@@ -3939,6 +3952,28 @@
         ((null r31) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30))
         ((null r32) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30 a31))
         (t (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30 a31))))))
+
+;;; FUNCALL AS A FUNCTION OBJECT.
+;;;
+;;; `(funcall f x)` in operator position is compiled inline by
+;;; compile-form (op-name 73964256 → COMPILE-FUNCALL) and never reaches a
+;;; callee, so Modus shipped with NO function named FUNCALL at all:
+;;; `#'funcall` evaluated to NIL and `(fboundp 'funcall)` answered NIL,
+;;; while its sibling APPLY (defined just above) worked.  CLHS requires
+;;; FUNCALL to be an ordinary function, and `#'funcall` is idiomatic —
+;;; cl-utilities' COMPOSE is literally
+;;;     (lambda (x) (reduce #'funcall functions :initial-value x :from-end t))
+;;; so every COMPOSEd function died with UNDEFINED-FUNCTION, taking
+;;; WITH-COLLECTORS' expander (which COMPOSEs GENSYM) down with it.
+;;; `(mapcar #'funcall fns args)` was equally dead.
+;;;
+;;; Defining it changes nothing about the inline path — compile-form still
+;;; intercepts FUNCALL in operator position before compile-call — it only
+;;; gives `(function funcall)` something to resolve to.
+(defun funcall (fn &rest args)
+  "CLHS FUNCALL: apply FN to ARGS.  Exists so #'FUNCALL is a real
+   function object; calls in operator position are compiled inline."
+  (apply fn args))
 
 (defun terpri (&rest stream-arg)
   ;; CLHS: terpri takes at most one arg (the stream).  Extra positional

@@ -5466,7 +5466,29 @@
                                             ,@(when env-var (list env-var))))
                         (destructuring-bind (,@d-params) (cdr form)
                           ,@body))))))
-             (mvm-define-macro (normalize-name name) expander))
+             (mvm-define-macro (normalize-name name) expander)
+             ;; (1b) …and, under runtime EVAL, make that registration
+             ;; TRUTHFUL to the running program.  *MACRO-TABLE* is rebound
+             ;; per mvm-eval call, but FBOUNDP / MACRO-FUNCTION consult it
+             ;; while the compiled form is still executing.  So the classic
+             ;; portable-library idiom
+             ;;     (unless (fboundp 'FOO) (defmacro FOO …))
+             ;; saw FBOUNDP → T (from THIS compile-time entry), skipped the
+             ;; DEFMACRO branch, and then LOST the entry when *MACRO-TABLE*
+             ;; was unbound — FOO ended up defined nowhere.  bordeaux-threads
+             ;; writes every apiv1 default that way (DEFDMACRO), so
+             ;; BORDEAUX-THREADS:WITH-LOCK-HELD was never registered and the
+             ;; package-blind bare-name lookup fell through to the apiv2
+             ;; macro of the same name, whose expansion calls apiv2
+             ;; ACQUIRE-LOCK on an apiv1 lock → TYPE-ERROR.
+             ;;
+             ;; Registering the SAME expander in the runtime table closes the
+             ;; window: FBOUNDP's answer becomes true, and it stays true.
+             ;; Purely additive — the (2) path below registers the identical
+             ;; expander whenever the branch IS taken.  Mirrors the
+             ;; defstruct keyword-ctor persistence a few hundred lines down.
+             (when *mvm-eval-runtime-p*
+               (set-macro-function name expander)))
          ;; (2) RUNTIME registration + return-the-name.  An ANSI deftest
          ;; like defmacro.1 does `(eq (defmacro NAME (..) ..) 'NAME)` and
          ;; then `(eval '(NAME ..))`, so the compiled nested DEFMACRO must
@@ -7868,8 +7890,25 @@
          ;; gauntlet's premature stop).  Walk conses manually, rewriting
          ;; each car; a non-NIL atomic tail (always a BINDER in a pattern,
          ;; never an evaluated read) is preserved unrewritten.
+         ;;
+         ;; OPERATOR POSITION IS A FUNCTION NAME, NOT A VARIABLE READ.
+         ;; A SYMBOL in the car of a form names a function (CLHS 3.1.2.1.2)
+         ;; and lives in a namespace the cell rewrite must never touch.
+         ;; Rewriting it produced `((car %CELL-C) 1)` whenever a boxed
+         ;; variable shared its name with an FLET/LABELS function — the
+         ;; shape cl-utilities' WITH-COLLECTORS macro emits verbatim:
+         ;;   (let (c c-tail)
+         ;;     (labels ((c (thing) … (setf c …) …))  ; boxes C
+         ;;       (c 1) (c 2)))                       ; …and CALLS C
+         ;; The call then went indirect through the cell's VALUE: NIL gave
+         ;; UNDEFINED-FUNCTION, a fixnum gave "MVM: unknown opcode at PC 7"
+         ;; (the fixnum interpreted as a code address).  Only a CONS head
+         ;; is a real subform — ((lambda …) …) must still be rewritten so
+         ;; the LAMBDA branch above sees it.
          (t
-          (let ((head (cell-rewrite-form op boxed-vars lambda-params))
+          (let ((head (if (consp op)
+                          (cell-rewrite-form op boxed-vars lambda-params)
+                          op))
                 (acc nil)
                 (cur (cdr form)))
             (loop while (consp cur) do
@@ -10034,21 +10073,39 @@
           ;; Old behavior (push :while iter to iterations → test-forms
           ;; AT START before init-stmts) broke `:FOR x :IN list :WHILE x`
           ;; because x was tested before init-stmt set it from car tmp.
+          ;;
+          ;; A WHILE that follows a DO/body clause goes into BODY-FORMS at
+          ;; its exact source position, NOT into post-body-tests.  Hoisting
+          ;; it past the remaining body clauses ran them on an iteration the
+          ;; WHILE had already terminated — cl-ppcre's END-STRING-AUX is
+          ;;   unless element-end do (setq continuep nil)
+          ;;   while element-end
+          ;;   unless skip     do (cond … collect …)
+          ;;   while continuep
+          ;; so the collect ran with ELEMENT-END NIL, left CONCATENATED-
+          ;; STRING = T, and (nreverse T) blew up — "b+" never got a
+          ;; scanner.  Accumulator clauses still force post-body-tests:
+          ;; acc-body is appended AFTER body, so a WHILE that follows a
+          ;; COLLECT cannot be expressed by an in-body position.
           ((= kw 208372112)  ; WHILE
            (let ((test `(if (null ,(cadr rest)) (return nil))))
-             (if (or (loop-state-body-forms state)
-                     (loop-state-accumulator state))
-                 (push test (loop-state-post-body-tests state))
-                 (push test (loop-state-pre-body-tests state))))
+             (cond
+               ((loop-state-accumulator state)
+                (push test (loop-state-post-body-tests state)))
+               ((loop-state-body-forms state)
+                (push test (loop-state-body-forms state)))
+               (t (push test (loop-state-pre-body-tests state)))))
            (setf rest (cddr rest)))
 
           ;; UNTIL condition — same source-order rule.
           ((= kw 301724213)  ; UNTIL
            (let ((test `(if ,(cadr rest) (return nil))))
-             (if (or (loop-state-body-forms state)
-                     (loop-state-accumulator state))
-                 (push test (loop-state-post-body-tests state))
-                 (push test (loop-state-pre-body-tests state))))
+             (cond
+               ((loop-state-accumulator state)
+                (push test (loop-state-post-body-tests state)))
+               ((loop-state-body-forms state)
+                (push test (loop-state-body-forms state)))
+               (t (push test (loop-state-pre-body-tests state)))))
            (setf rest (cddr rest)))
 
           ;; REPEAT n
@@ -10670,9 +10727,37 @@
                (progn
                  (push (list var nil) bindings)
                  (push `(setq ,var ,(loop-iter-init-form iter)) init-stmts))
-               ;; Has THEN clause: init from binding, step from step-form
-               (progn
-                 (push (list var (loop-iter-init-form iter)) bindings)
+               ;; Has THEN clause: the INIT form runs on the FIRST iteration
+               ;; only, the STEP form at the end of every iteration.
+               ;;
+               ;; The init form MUST be evaluated in INIT-STMTS, not as the
+               ;; LET* binding it used to be.  Sequential FOR clauses see each
+               ;; other's values within one iteration (CLHS 6.1.2.1), and a
+               ;; no-THEN `for q = expr` sibling assigns Q in INIT-STMTS — so a
+               ;; LET* binding for S was evaluated BEFORE Q was ever set and
+               ;; `for q = … for s = q then …` initialised S to NIL.  That is
+               ;; cl-ppcre's parser verbatim:
+               ;;   (loop for quant = (quant lexer)
+               ;;         for seq = quant then (cond …)
+               ;;         while (start-of-subexpr-p lexer)
+               ;;         finally (return seq))
+               ;; A one-token regex takes exactly one iteration, so SEQ never
+               ;; got past its NIL binding, PARSE-STRING answered :VOID for
+               ;; every pattern, and every scanner matched the empty string at
+               ;; position 0 (SCAN "b+" "abbbc" → 0 instead of 1 4 #() #()).
+               ;;
+               ;; INIT-STMTS is safe ground: WHILE/UNTIL land in
+               ;; PRE-BODY-TESTS, which the body assembly places AFTER
+               ;; init-stmts, and TEST-FORMS only ever holds an iterator's own
+               ;; exhaustion test (:IN/:ON/:ACROSS/:FROM/:REPEAT), which can
+               ;; never reference a THEN variable.
+               (let ((firstv (%mvm-gensym "FORTHEN-FIRST")))
+                 (push (list var nil) bindings)
+                 (push (list firstv t) bindings)
+                 (push `(if ,firstv
+                            (progn (setq ,var ,(loop-iter-init-form iter))
+                                   (setq ,firstv nil)))
+                       init-stmts)
                  (push `(setq ,var ,(loop-iter-step-form iter)) step-stmts)))))
 
         (:while
@@ -17771,6 +17856,21 @@
             ;; :default (use struct slot order), NIL (0-arg ctor), or
             ;; a list of slot-name symbols (positional in that order).
             (named-constructors nil)
+            ;; T once ANY (:CONSTRUCTOR …) option has been seen — including
+            ;; the explicit-suppression form (:CONSTRUCTOR NIL).  CLHS 3.4.6:
+            ;; naming a constructor REPLACES the default MAKE-<name>; it does
+            ;; not add to it.  Emitting MAKE-<name> anyway is not harmless
+            ;; here, because Modus registers it as a keyword-parsing MACRO —
+            ;; and a macro SHADOWS a later plain DEFUN of the same name.
+            ;; cl-ppcre does exactly that:
+            ;;   (defstruct (lexer (:constructor make-lexer-internal)) …)
+            ;;   (defun make-lexer (string)
+            ;;     (make-lexer-internal :str … :len (length string)))
+            ;; so every `(make-lexer s)` call expanded to the phantom keyword
+            ;; ctor, which saw a positional string where it wanted keywords,
+            ;; ignored it, and built an EMPTY lexer.  Every regex then parsed
+            ;; to :VOID and every scanner matched "" at position 0.
+            (default-ctor-suppressed nil)
             ;; (:PREDICATE …) / (:COPIER …) — CLHS 3.4.6.  Three states each:
             ;;   :DEFAULT  option absent, or present with NO argument
             ;;             (`(:predicate)`) — generate under the default name
@@ -17810,6 +17910,13 @@
                ((name-eq opt-name "CONSTRUCTOR")
                 (let ((ctor-sym (cadr opt))
                       (arg-spec (if (cddr opt) (caddr opt) :default)))
+                  ;; `(cdr opt)` — not `(cadr opt)` — separates the bare
+                  ;; `(:constructor)` (default name, keep MAKE-<name>) from
+                  ;; `(:constructor NAME …)` and `(:constructor nil)`, both of
+                  ;; which suppress the default.  Same distinction the
+                  ;; PREDICATE / COPIER branches below already make.
+                  (when (cdr opt)
+                    (setf default-ctor-suppressed t))
                   (when (and ctor-sym (symbolp ctor-sym))
                     (push (cons ctor-sym arg-spec)
                           named-constructors))))
@@ -17947,7 +18054,10 @@
                                       (setf (nth idx positional) val)))
                                   (setf args (cddr args))))
                        `(,internal-ctor-sym ,@positional)))))
-             (mvm-define-macro ctor-name %ctor-expander)
+             ;; Only when no (:CONSTRUCTOR …) option replaced it — see
+             ;; DEFAULT-CTOR-SUPPRESSED above.
+             (unless default-ctor-suppressed
+               (mvm-define-macro ctor-name %ctor-expander))
              ;; mvm-eval (in-image runtime compile) PERSISTENCE: *macro-table* is
              ;; rebound PER mvm-eval CALL, so without a runtime registration a
              ;; LATER (eval '(make-NAME …)) compiled the ctor as an undefined
@@ -17963,11 +18073,13 @@
              ;; Build-time (*mvm-eval-runtime-p* NIL) never takes this branch, so
              ;; host/native builds are unchanged.
              (when *mvm-eval-runtime-p*
-               (set-macro-function (%defstruct-intern ctor-name)
-                                   %ctor-expander)
+               (unless default-ctor-suppressed
+                 (set-macro-function (%defstruct-intern ctor-name)
+                                     %ctor-expander))
                ;; Also register the struct type so cross-call TYPEP /
                ;; :include ancestry / #S printing see it — mirrors the
                ;; walker's runtime-DEFSTRUCT registration (cl-eval.lisp).
+               ;; Registry-only — independent of which constructors exist.
                (%register-struct-type struct-name include-parent
                                       slot-names conc-name))))
 

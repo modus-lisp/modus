@@ -3314,52 +3314,30 @@
                            ',meta-ll))))
 
     ;; (make-instance 'class-name &rest initargs)
-    ;; → (let ((tmp (%make-instance 'class)))
-    ;;     (%shared-init-default-spread (list tmp t k1 v1 k2 v2 ...))
-    ;;     tmp)
-    ;; %shared-init-default-spread (in ansi-bridge.lisp) does leftmost-
-    ;; wins initarg application AND applies initforms for unset slots —
-    ;; matching CLHS make-instance semantics.  The old expansion emitted
-    ;; set-slot-value calls left-to-right (last-write-wins, wrong) and
-    ;; never applied initforms at all.
+    ;; → (%make-instance-list (list 'class-name k1 v1 k2 v2 ...))
+    ;;
+    ;; %make-instance-list (mvm/cl-clos.lisp) is the ONE implementation of
+    ;; the CLHS 7.1.1 protocol — allocate, validate the initarg plist
+    ;; (7.1.2), DISPATCH INITIALIZE-INSTANCE — shared with the MAKE-INSTANCE
+    ;; defun and with compiler.lisp's MAKE-INSTANCE macro.
+    ;;
+    ;; Task #246: this rewriter used to expand to %make-instance +
+    ;; %shared-init-default-spread, which is only the *default body* of
+    ;; SHARED-INITIALIZE — it never consults the INITIALIZE-INSTANCE or
+    ;; SHARED-INITIALIZE generic functions.  So every `(make-instance 'c ...)`
+    ;; in the corpus skipped the user's `initialize-instance :after` /
+    ;; `shared-initialize :after` methods entirely.  That is also why task
+    ;; #231's CLHS 7.1.2 &key-name union moved zero tests: the methods whose
+    ;; &key names it collected never ran on this path.
+    ;;
+    ;; Argument evaluation order is preserved: the class designator and each
+    ;; initarg value form are evaluated left-to-right, exactly once, as
+    ;; arguments to LIST (make-instance.order.3 evaluates a side-effecting
+    ;; (prog1 'name (incf i)) class form).
     ((and (eq (car form) 'make-instance) (cdr form))
-     (let* ((class-arg-raw (cadr form))
-            (class-arg (rewrite-reader-forms class-arg-raw))
-            (rest-args (cddr form)))
-       (if (null rest-args)
-           ;; No initargs: still want initforms applied.  Bind
-           ;; *clos-applying-defaults* T so default-initargs apply (CLHS
-           ;; 7.1.4) — distinguishing make-instance from bare shared-init.
-           `(let ((%clos-make-instance-tmp (%make-instance ,class-arg))
-                  (*clos-applying-defaults* t))
-              (%shared-init-default-spread
-                (list %clos-make-instance-tmp t))
-              %clos-make-instance-tmp)
-           ;; Has initargs: pass them through to the spread helper which
-           ;; matches them against the runtime initarg-map and applies
-           ;; initforms for any unset slots.  Values are recursively
-           ;; rewritten so quoted/embedded forms still resolve correctly.
-           (let ((rewritten-args (mapcar #'rewrite-reader-forms rest-args)))
-             ;; CLHS 7.1.2: validate the initarg plist — odd-length plist →
-             ;; program-error (make-instance.error.2), unknown initarg →
-             ;; error (make-instance.error.3/.4).  The runtime make-instance
-             ;; fn does this, but the compiled expansion bypasses it, so call
-             ;; the designator-accepting validator here.  The initarg VALUE
-             ;; forms may have side effects (order-of-evaluation tests), so
-             ;; bind the plist ONCE into %clos-mi-initargs and reuse it for
-             ;; both validation and the spread — never re-evaluate.
-             ;; Bind the class designator ONCE too — class-arg may have
-             ;; side effects ((prog1 'name (incf i)) in make-instance.order.3),
-             ;; so evaluating it for both %make-instance and validation would
-             ;; double-count.
-             `(let* ((%clos-mi-class ,class-arg)
-                     (%clos-make-instance-tmp (%make-instance %clos-mi-class))
-                     (%clos-mi-initargs (list ,@rewritten-args))
-                     (*clos-applying-defaults* t))
-                (%clos-validate-initargs-d %clos-mi-class %clos-mi-initargs)
-                (%shared-init-default-spread
-                  (cons %clos-make-instance-tmp (cons t %clos-mi-initargs)))
-                %clos-make-instance-tmp)))))
+     `(%make-instance-list
+        (list ,(rewrite-reader-forms (cadr form))
+              ,@(mapcar #'rewrite-reader-forms (cddr form)))))
 
     ;; (slot-value obj slot) → (slot-value obj slot) — already defined at runtime
     ;; (slot-boundp obj slot) → (slot-boundp obj slot) — already defined

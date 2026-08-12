@@ -1463,16 +1463,32 @@
             (odd (oddp (length initargs)))
             (inst (progn (when odd (%signal-program-error))
                          (%make-instance class-or-name)))
-            ;; make-instance applies default-initargs (CLHS 7.1.4); bind
-            ;; the flag so the shared-initialize default body picks them up.
-            (*clos-applying-defaults* t))
+            ;; make-instance applies default-initargs (CLHS 7.1.4); the
+            ;; SHARED-INITIALIZE default body reads this flag.
+            ;;
+            ;; SETQ + UNWIND-PROTECT, deliberately NOT a LET rebinding.
+            ;; The MVM compiler only turns a LET of a special into a real
+            ;; save/set/restore of the global when the name is in the
+            ;; CLHS-standard specials table, *clhs-extra-specials*, or the
+            ;; runtime-defvar registry (compiler.lisp compile-form's
+            ;; LET/LET* dispatch).  *clos-applying-defaults* is in none of
+            ;; them, so `(let ((*clos-applying-defaults* t)) ...)` compiles
+            ;; to a plain LEXICAL frame slot and the callee that reads the
+            ;; GLOBAL sees no change at all.  Verified by dumping the IR for
+            ;; both shapes with the real compiler: the LET form emits 29 IR
+            ;; ops and zero global ops, while a LET of a known CLHS special
+            ;; (*print-base*) emits 80 with the save/set/restore triple.
+            (saved-defaults *clos-applying-defaults*))
        (when (null inst) (return-from %make-instance-list nil))
        ;; CLHS 7.1.2: reject malformed / unknown initargs.  Only validate
        ;; for genuine CLOS classes (registered); skip when inst allocation
        ;; succeeded but the class has no slot-info (defensive).
        (when (%find-clos-class class-name)
          (%clos-validate-initargs class-name initargs))
-       (%dispatch-initialize-instance (cons inst initargs))
+       (setq *clos-applying-defaults* t)
+       (unwind-protect
+            (%dispatch-initialize-instance (cons inst initargs))
+         (setq *clos-applying-defaults* saved-defaults))
        inst))))
 
 (defun make-instance (&rest args)

@@ -11932,30 +11932,10 @@
                                                                                    0
                                                                                    0)) (t (c) (%test-crash-fail-c 12040 c)))
   (handler-case (run-test 12041 (lambda () (EQUALP
-                            (LET* ((%CLOS-MI-CLASS 'EQUALP-CLASS-36)
-                                   (%CLOS-MAKE-INSTANCE-TMP
-                                    (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                   (%CLOS-MI-INITARGS (LIST :SLOT1 1 :SLOT2 2))
-                                   (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                               %CLOS-MI-INITARGS)
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (CONS %CLOS-MAKE-INSTANCE-TMP
-                                     (CONS T %CLOS-MI-INITARGS)))
-                              %CLOS-MAKE-INSTANCE-TMP)
-                            (LET* ((%CLOS-MI-CLASS 'EQUALP-CLASS-36)
-                                   (%CLOS-MAKE-INSTANCE-TMP
-                                    (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                   (%CLOS-MI-INITARGS (LIST :SLOT1 1 :SLOT2 2))
-                                   (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                               %CLOS-MI-INITARGS)
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (CONS %CLOS-MAKE-INSTANCE-TMP
-                                     (CONS T %CLOS-MI-INITARGS)))
-                              %CLOS-MAKE-INSTANCE-TMP))) 'NIL) (t (c) (%test-crash-fail-c 12041 c)))
+                            (%MAKE-INSTANCE-LIST
+                             (LIST 'EQUALP-CLASS-36 :SLOT1 1 :SLOT2 2))
+                            (%MAKE-INSTANCE-LIST
+                             (LIST 'EQUALP-CLASS-36 :SLOT1 1 :SLOT2 2)))) 'NIL) (t (c) (%test-crash-fail-c 12041 c)))
   (handler-case (run-test-mv 12042 (lambda () (multiple-value-list (LET ((I 0) X Y)
                                                      (VALUES
                                                       (EQUALP (SETF X (INCF I))
@@ -138904,13 +138884,7 @@ NIL
                                  COLLECT X)) 'NIL) (t (c) (%test-crash-fail-c 25479 c)))
   (handler-case (run-test 25480 (lambda () (TYPE-OF (MAKE-TYPE-OF.EXAMPLE-STRUCT))) 'TYPE-OF.EXAMPLE-STRUCT) (t (c) (%test-crash-fail-c 25480 c)))
   (handler-case (run-test 25481 (lambda () (TYPE-OF
-                            (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                   (%MAKE-INSTANCE 'TYPE-OF.EXAMPLE-CLASS))
-                                  (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                              %CLOS-MAKE-INSTANCE-TMP))) 'TYPE-OF.EXAMPLE-CLASS) (t (c) (%test-crash-fail-c 25481 c)))
+                            (%MAKE-INSTANCE-LIST (LIST 'TYPE-OF.EXAMPLE-CLASS)))) 'TYPE-OF.EXAMPLE-CLASS) (t (c) (%test-crash-fail-c 25481 c)))
 )
 (defun run-ansi-type-of-chunk-2 ()
   (handler-case (run-test 25482 (lambda () (LET ((CLASS
@@ -138927,15 +138901,7 @@ NIL
                                     'TYPE-OF.EXAMPLE-CLASS-2 (LIST))
                                    (FIND-CLASS 'TYPE-OF.EXAMPLE-CLASS-2 NIL))))
                              (SETF (CLASS-NAME CLASS) NIL)
-                             (EQT
-                              (TYPE-OF
-                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                      (%MAKE-INSTANCE CLASS))
-                                     (*CLOS-APPLYING-DEFAULTS* T))
-                                 (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                  (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                 %CLOS-MAKE-INSTANCE-TMP))
+                             (EQT (TYPE-OF (%MAKE-INSTANCE-LIST (LIST CLASS)))
                               CLASS))) 'T) (t (c) (%test-crash-fail-c 25482 c)))
   (handler-case (run-test 25483 (lambda () (LET ((CLASS
                                   (PROGN
@@ -138951,15 +138917,7 @@ NIL
                                     'TYPE-OF.EXAMPLE-CLASS-3 (LIST))
                                    (FIND-CLASS 'TYPE-OF.EXAMPLE-CLASS-3 NIL))))
                              (SETF (FIND-CLASS 'TYPE-OF.EXAMPLE-CLASS-3) NIL)
-                             (EQT
-                              (TYPE-OF
-                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                      (%MAKE-INSTANCE CLASS))
-                                     (*CLOS-APPLYING-DEFAULTS* T))
-                                 (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                  (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                 %CLOS-MAKE-INSTANCE-TMP))
+                             (EQT (TYPE-OF (%MAKE-INSTANCE-LIST (LIST CLASS)))
                               CLASS))) 'T) (t (c) (%test-crash-fail-c 25483 c)))
   (handler-case (run-test 25484 (lambda () (LET* ((CLASS
                                    (PROGN
@@ -138974,15 +138932,7 @@ NIL
                                     (%REGISTER-CLOS-DEFAULT-INITARGS
                                      'TYPE-OF.EXAMPLE-CLASS-4 (LIST))
                                     (FIND-CLASS 'TYPE-OF.EXAMPLE-CLASS-4 NIL)))
-                                  (OBJ
-                                   (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                          (%MAKE-INSTANCE CLASS))
-                                         (*CLOS-APPLYING-DEFAULTS* T))
-                                     (DECLARE
-                                      (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                     (%SHARED-INIT-DEFAULT-SPREAD
-                                      (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                     %CLOS-MAKE-INSTANCE-TMP)))
+                                  (OBJ (%MAKE-INSTANCE-LIST (LIST CLASS))))
                              (SETF (CLASS-NAME CLASS) NIL)
                              (NOTNOT-MV (TYPEP OBJ CLASS)))) 'T) (t (c) (%test-crash-fail-c 25484 c)))
   (handler-case (run-test 25485 (lambda () (LET* ((C #C(-1 1/2)) (TYPE (TYPE-OF C)))
@@ -146174,19 +146124,9 @@ NIL
                                  UNLESS (OR (NULL DOC) (STRINGP DOC))
                                  COLLECT (LIST S DOC))) 'NIL) (t (c) (%test-crash-fail-c 26060 c)))
   (handler-case (run-test-mv 26061 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'DOCUMENTATION-TEST-CLASS-1))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'DOCUMENTATION-TEST-CLASS-1))))
                                                      (VALUES
                                                       (DOCUMENTATION OBJ T)
                                                       (SETF (DOCUMENTATION OBJ
@@ -156857,61 +156797,17 @@ NIL
                                                                          (D))) (t (c) (%test-crash-fail-c 26838 c)))
   (handler-case (run-test-mv 26839 (lambda () (multiple-value-list (VALUES
                                                     (CNM-GF-06
-                                                     (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                            (%MAKE-INSTANCE
-                                                             'CNM-CLASS-01D))
-                                                           (*CLOS-APPLYING-DEFAULTS*
-                                                            T))
-                                                       (DECLARE
-                                                        (SPECIAL
-                                                         *CLOS-APPLYING-DEFAULTS*))
-                                                       (%SHARED-INIT-DEFAULT-SPREAD
-                                                        (LIST
-                                                         %CLOS-MAKE-INSTANCE-TMP
-                                                         T))
-                                                       %CLOS-MAKE-INSTANCE-TMP))
+                                                     (%MAKE-INSTANCE-LIST
+                                                      (LIST 'CNM-CLASS-01D)))
                                                     (CNM-GF-06
-                                                     (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                            (%MAKE-INSTANCE
-                                                             'CNM-CLASS-01C))
-                                                           (*CLOS-APPLYING-DEFAULTS*
-                                                            T))
-                                                       (DECLARE
-                                                        (SPECIAL
-                                                         *CLOS-APPLYING-DEFAULTS*))
-                                                       (%SHARED-INIT-DEFAULT-SPREAD
-                                                        (LIST
-                                                         %CLOS-MAKE-INSTANCE-TMP
-                                                         T))
-                                                       %CLOS-MAKE-INSTANCE-TMP))
+                                                     (%MAKE-INSTANCE-LIST
+                                                      (LIST 'CNM-CLASS-01C)))
                                                     (CNM-GF-06
-                                                     (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                            (%MAKE-INSTANCE
-                                                             'CNM-CLASS-01B))
-                                                           (*CLOS-APPLYING-DEFAULTS*
-                                                            T))
-                                                       (DECLARE
-                                                        (SPECIAL
-                                                         *CLOS-APPLYING-DEFAULTS*))
-                                                       (%SHARED-INIT-DEFAULT-SPREAD
-                                                        (LIST
-                                                         %CLOS-MAKE-INSTANCE-TMP
-                                                         T))
-                                                       %CLOS-MAKE-INSTANCE-TMP))
+                                                     (%MAKE-INSTANCE-LIST
+                                                      (LIST 'CNM-CLASS-01B)))
                                                     (CNM-GF-06
-                                                     (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                            (%MAKE-INSTANCE
-                                                             'CNM-CLASS-01A))
-                                                           (*CLOS-APPLYING-DEFAULTS*
-                                                            T))
-                                                       (DECLARE
-                                                        (SPECIAL
-                                                         *CLOS-APPLYING-DEFAULTS*))
-                                                       (%SHARED-INIT-DEFAULT-SPREAD
-                                                        (LIST
-                                                         %CLOS-MAKE-INSTANCE-TMP
-                                                         T))
-                                                       %CLOS-MAKE-INSTANCE-TMP))
+                                                     (%MAKE-INSTANCE-LIST
+                                                      (LIST 'CNM-CLASS-01A)))
                                                     (CNM-GF-06 NIL)))) '((1 2 3
                                                                           4)
                                                                          (2 4)
@@ -157318,19 +157214,9 @@ NIL
 )
 (defun run-ansi-change-class-chunk-1 ()
   (handler-case (run-test-mv 26846 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CHANGE-CLASS-CLASS-01A))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CHANGE-CLASS-CLASS-01A)))
                                                          (NEW-CLASS
                                                           (FIND-CLASS
                                                            'CHANGE-CLASS-CLASS-01B)))
@@ -157360,27 +157246,10 @@ NIL
                                                                        (NIL NIL
                                                                         NIL))) (t (c) (%test-crash-fail-c 26846 c)))
   (handler-case (run-test-mv 26847 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CHANGE-CLASS-CLASS-01A)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A 1))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CHANGE-CLASS-CLASS-01A
+                                                            :A 1)))
                                                          (NEW-CLASS
                                                           (FIND-CLASS
                                                            'CHANGE-CLASS-CLASS-01B)))
@@ -157410,27 +157279,10 @@ NIL
                                                                        (NIL NIL
                                                                         NIL))) (t (c) (%test-crash-fail-c 26847 c)))
   (handler-case (run-test-mv 26848 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CHANGE-CLASS-CLASS-01A)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :B 2))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CHANGE-CLASS-CLASS-01A
+                                                            :B 2)))
                                                          (NEW-CLASS
                                                           (FIND-CLASS
                                                            'CHANGE-CLASS-CLASS-01B)))
@@ -157467,29 +157319,10 @@ NIL
                                                                                  NIL)
                                                                                 2)) (t (c) (%test-crash-fail-c 26848 c)))
   (handler-case (run-test-mv 26849 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CHANGE-CLASS-CLASS-01A)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A 1 :B
-                                                                        2 :C
-                                                                        5))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CHANGE-CLASS-CLASS-01A
+                                                            :A 1 :B 2 :C 5)))
                                                          (NEW-CLASS
                                                           (FIND-CLASS
                                                            'CHANGE-CLASS-CLASS-01B)))
@@ -157519,29 +157352,10 @@ NIL
                                                                      (T T NIL)
                                                                      (2 5))) (t (c) (%test-crash-fail-c 26849 c)))
   (handler-case (run-test-mv 26850 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CHANGE-CLASS-CLASS-01A)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A 1 :B
-                                                                        2 :C
-                                                                        5))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CHANGE-CLASS-CLASS-01A
+                                                            :A 1 :B 2 :C 5)))
                                                          (NEW-CLASS
                                                           (FIND-CLASS
                                                            'CHANGE-CLASS-CLASS-01B)))
@@ -157564,29 +157378,10 @@ NIL
                                                                      (T T NIL)
                                                                      (8 76))) (t (c) (%test-crash-fail-c 26850 c)))
   (handler-case (run-test-mv 26851 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CHANGE-CLASS-CLASS-01A)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A 1 :B
-                                                                        2 :C
-                                                                        5))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CHANGE-CLASS-CLASS-01A
+                                                            :A 1 :B 2 :C 5)))
                                                          (NEW-CLASS
                                                           (FIND-CLASS
                                                            'CHANGE-CLASS-CLASS-01B)))
@@ -157609,29 +157404,10 @@ NIL
                                                                      (T T NIL)
                                                                      (19 5))) (t (c) (%test-crash-fail-c 26851 c)))
   (handler-case (run-test-mv 26852 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CHANGE-CLASS-CLASS-01A)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A 1 :B
-                                                                        2 :C
-                                                                        5))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CHANGE-CLASS-CLASS-01A
+                                                            :A 1 :B 2 :C 5)))
                                                          (NEW-CLASS
                                                           (FIND-CLASS
                                                            'CHANGE-CLASS-CLASS-01B)))
@@ -157654,29 +157430,10 @@ NIL
                                                                      (T T NIL)
                                                                      (2 5))) (t (c) (%test-crash-fail-c 26852 c)))
   (handler-case (run-test-mv 26853 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CHANGE-CLASS-CLASS-01A)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A 1 :B
-                                                                        2 :C
-                                                                        5))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CHANGE-CLASS-CLASS-01A
+                                                            :A 1 :B 2 :C 5)))
                                                          (NEW-CLASS
                                                           (FIND-CLASS
                                                            'CHANGE-CLASS-CLASS-01B)))
@@ -157701,29 +157458,10 @@ NIL
 )
 (defun run-ansi-change-class-chunk-2 ()
   (handler-case (run-test-mv 26854 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CHANGE-CLASS-CLASS-01A)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A 1 :B
-                                                                        2 :C
-                                                                        5))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CHANGE-CLASS-CLASS-01A
+                                                            :A 1 :B 2 :C 5)))
                                                          (NEW-CLASS
                                                           (FIND-CLASS
                                                            'CHANGE-CLASS-CLASS-01B)))
@@ -157748,29 +157486,10 @@ NIL
                                                                      (T T NIL)
                                                                      (2 5))) (t (c) (%test-crash-fail-c 26854 c)))
   (handler-case (run-test-mv 26855 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CHANGE-CLASS-CLASS-01A)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A 1 :B
-                                                                        2 :C
-                                                                        5))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CHANGE-CLASS-CLASS-01A
+                                                            :A 1 :B 2 :C 5)))
                                                          (NEW-CLASS
                                                           (FIND-CLASS
                                                            'CHANGE-CLASS-CLASS-01B)))
@@ -157799,15 +157518,8 @@ NIL
                                                                      (2 5))) (t (c) (%test-crash-fail-c 26855 c)))
   (handler-case (run-test 26856 (lambda () (HANDLER-CASE
                             (LET ((OBJ
-                                   (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                          (%MAKE-INSTANCE
-                                           'CHANGE-CLASS-CLASS-01A))
-                                         (*CLOS-APPLYING-DEFAULTS* T))
-                                     (DECLARE
-                                      (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                     (%SHARED-INIT-DEFAULT-SPREAD
-                                      (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                     %CLOS-MAKE-INSTANCE-TMP))
+                                   (%MAKE-INSTANCE-LIST
+                                    (LIST 'CHANGE-CLASS-CLASS-01A)))
                                   (NEW-CLASS
                                    (FIND-CLASS 'CHANGE-CLASS-CLASS-01B)))
                               (DECLARE (OPTIMIZE (SAFETY 3)))
@@ -157815,27 +157527,10 @@ NIL
                                (CHANGE-CLASS OBJ NEW-CLASS :NONSENSE T)))
                             (ERROR NIL :EXPECTED-ERROR))) ':EXPECTED-ERROR) (t (c) (%test-crash-fail-c 26856 c)))
   (handler-case (run-test-mv 26857 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CHANGE-CLASS-CLASS-01A)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :B 1))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CHANGE-CLASS-CLASS-01A
+                                                            :B 1))))
                                                      (VALUES
                                                       (EQT OBJ
                                                        (CHANGE-CLASS OBJ
@@ -157854,19 +157549,9 @@ NIL
                                                                      (T T NIL)
                                                                      (1 3))) (t (c) (%test-crash-fail-c 26857 c)))
   (handler-case (run-test-mv 26858 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CHANGE-CLASS-CLASS-02A))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CHANGE-CLASS-CLASS-02A)))
                                                          (NEW-CLASS
                                                           (FIND-CLASS
                                                            'CHANGE-CLASS-CLASS-02B)))
@@ -157883,19 +157568,9 @@ NIL
                                                       (TYPEP* OBJ
                                                        'CHANGE-CLASS-CLASS-02B)
                                                       (MAP-SLOT-BOUNDP*
-                                                       (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                              (%MAKE-INSTANCE
-                                                               'CHANGE-CLASS-CLASS-02A))
-                                                             (*CLOS-APPLYING-DEFAULTS*
-                                                              T))
-                                                         (DECLARE
-                                                          (SPECIAL
-                                                           *CLOS-APPLYING-DEFAULTS*))
-                                                         (%SHARED-INIT-DEFAULT-SPREAD
-                                                          (LIST
-                                                           %CLOS-MAKE-INSTANCE-TMP
-                                                           T))
-                                                         %CLOS-MAKE-INSTANCE-TMP)
+                                                       (%MAKE-INSTANCE-LIST
+                                                        (LIST
+                                                         'CHANGE-CLASS-CLASS-02A))
                                                        '(A B))
                                                       (MAP-SLOT-BOUNDP* OBJ
                                                        '(A B)))))) '((NIL NIL)
@@ -157903,33 +157578,13 @@ NIL
                                                                      (NIL NIL)
                                                                      (NIL NIL))) (t (c) (%test-crash-fail-c 26858 c)))
   (handler-case (run-test-mv 26859 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CHANGE-CLASS-CLASS-02A))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CHANGE-CLASS-CLASS-02A)))
                                                          (OBJ2
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CHANGE-CLASS-CLASS-02A))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CHANGE-CLASS-CLASS-02A)))
                                                          OBJ3
                                                          (NEW-CLASS
                                                           (FIND-CLASS
@@ -157951,19 +157606,9 @@ NIL
                                                        'CHANGE-CLASS-CLASS-02B)
                                                       (MAP-SLOT-BOUNDP*
                                                        (SETF OBJ3
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'CHANGE-CLASS-CLASS-02A))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'CHANGE-CLASS-CLASS-02A)))
                                                        '(A B))
                                                       (MAP-SLOT-BOUNDP* OBJ
                                                        '(A B))
@@ -157990,33 +157635,13 @@ NIL
                                                                             NIL
                                                                             NIL)) (t (c) (%test-crash-fail-c 26859 c)))
   (handler-case (run-test-mv 26860 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CHANGE-CLASS-CLASS-02A))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CHANGE-CLASS-CLASS-02A)))
                                                          (OBJ2
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CHANGE-CLASS-CLASS-02A))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CHANGE-CLASS-CLASS-02A)))
                                                          (NEW-CLASS
                                                           (FIND-CLASS
                                                            'CHANGE-CLASS-CLASS-02B)))
@@ -158037,19 +157662,9 @@ NIL
                                                       (MAP-SLOT-BOUNDP* OBJ2
                                                        '(A B))
                                                       (MAP-SLOT-BOUNDP*
-                                                       (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                              (%MAKE-INSTANCE
-                                                               'CHANGE-CLASS-CLASS-02A))
-                                                             (*CLOS-APPLYING-DEFAULTS*
-                                                              T))
-                                                         (DECLARE
-                                                          (SPECIAL
-                                                           *CLOS-APPLYING-DEFAULTS*))
-                                                         (%SHARED-INIT-DEFAULT-SPREAD
-                                                          (LIST
-                                                           %CLOS-MAKE-INSTANCE-TMP
-                                                           T))
-                                                         %CLOS-MAKE-INSTANCE-TMP)
+                                                       (%MAKE-INSTANCE-LIST
+                                                        (LIST
+                                                         'CHANGE-CLASS-CLASS-02A))
                                                        '(A B))
                                                       (MAP-SLOT-BOUNDP* OBJ
                                                        '(A B))
@@ -158066,36 +157681,15 @@ NIL
                                                                        (T T)
                                                                        (T T))) (t (c) (%test-crash-fail-c 26860 c)))
   (handler-case (run-test-mv 26861 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   'CHANGE-CLASS-CLASS-03A))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (LIST
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               T))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST
+                                                             'CHANGE-CLASS-CLASS-03A)))
                                                           (NEW-CLASS
                                                            (FIND-CLASS
                                                             'CHANGE-CLASS-CLASS-03B))
                                                           (OBJ2
-                                                           (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   NEW-CLASS))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (LIST
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               T))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST NEW-CLASS)))
                                                           OBJ3)
                                                      (SLOT-MAKUNBOUND OBJ2 'A)
                                                      (SLOT-MAKUNBOUND OBJ2 'B)
@@ -158110,19 +157704,9 @@ NIL
                                                       (TYPEP* OBJ NEW-CLASS)
                                                       (EQT
                                                        (SETQ OBJ3
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       NEW-CLASS))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 NEW-CLASS)))
                                                        OBJ)
                                                       (MAP-SLOT-BOUNDP* OBJ
                                                        '(A B))
@@ -158137,44 +157721,16 @@ NIL
 )
 (defun run-ansi-change-class-chunk-3 ()
   (handler-case (run-test-mv 26862 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'CHANGE-CLASS-CLASS-03A)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :A 1))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST
+                                                             'CHANGE-CLASS-CLASS-03A
+                                                             :A 1)))
                                                           (NEW-CLASS
                                                            (FIND-CLASS
                                                             'CHANGE-CLASS-CLASS-03B))
                                                           (OBJ2
-                                                           (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   NEW-CLASS))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (LIST
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               T))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST NEW-CLASS)))
                                                           OBJ3)
                                                      (SLOT-MAKUNBOUND OBJ2 'A)
                                                      (SET-SLOT-VALUE OBJ2 'B
@@ -158192,19 +157748,9 @@ NIL
                                                       (TYPEP* OBJ NEW-CLASS)
                                                       (EQT
                                                        (SETQ OBJ3
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       NEW-CLASS))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 NEW-CLASS)))
                                                        OBJ)
                                                       (MAP-SLOT-BOUNDP* OBJ
                                                        '(A B))
@@ -158231,19 +157777,9 @@ NIL
                                                                                  17
                                                                                  17)) (t (c) (%test-crash-fail-c 26862 c)))
   (handler-case (run-test-mv 26863 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CHANGE-CLASS-CLASS-04A))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CHANGE-CLASS-CLASS-04A)))
                                                          (NEW-CLASS
                                                           (FIND-CLASS
                                                            'CHANGE-CLASS-CLASS-04B)))
@@ -158258,19 +157794,9 @@ NIL
                                                                                  T)
                                                                                 Y)) (t (c) (%test-crash-fail-c 26863 c)))
   (handler-case (run-test-mv 26864 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CHANGE-CLASS-CLASS-04A))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CHANGE-CLASS-CLASS-04A)))
                                                          (NEW-CLASS
                                                           (FIND-CLASS
                                                            'CHANGE-CLASS-CLASS-04B)))
@@ -158282,28 +157808,10 @@ NIL
                                                       (MAP-SLOT-VALUE OBJ
                                                        '(A C)))))) '(T (Z Y))) (t (c) (%test-crash-fail-c 26864 c)))
   (handler-case (run-test-mv 26865 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CHANGE-CLASS-CLASS-04A)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A 'P
-                                                                        :B 'Q))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CHANGE-CLASS-CLASS-04A
+                                                            :A 'P :B 'Q)))
                                                          (NEW-CLASS
                                                           (FIND-CLASS
                                                            'CHANGE-CLASS-CLASS-04B)))
@@ -158314,19 +157822,9 @@ NIL
                                                       (MAP-SLOT-VALUE OBJ
                                                        '(A C)))))) '(T (P Y))) (t (c) (%test-crash-fail-c 26865 c)))
   (handler-case (run-test-mv 26866 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CHANGE-CLASS-CLASS-04A))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CHANGE-CLASS-CLASS-04A)))
                                                          (NEW-CLASS
                                                           (FIND-CLASS
                                                            'CHANGE-CLASS-CLASS-04B)))
@@ -158360,19 +157858,9 @@ NIL
   (handler-case (run-test-mv 26868 (lambda () (multiple-value-list (LET ((*CHANGED-CLASS-ON-CLASS-05*
                                                           NIL)
                                                          (OBJ
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CHANGE-CLASS-CLASS-05))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CHANGE-CLASS-CLASS-05))))
                                                      (DECLARE
                                                       (SPECIAL
                                                        *CHANGED-CLASS-ON-CLASS-05*))
@@ -158387,19 +157875,8 @@ NIL
                                                            (FIND-CLASS
                                                             'CHANGE-CLASS-CLASS-06))
                                                           (OBJ
-                                                           (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   CLASS))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (LIST
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               T))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST CLASS))))
                                                      (VALUES
                                                       (MAP-SLOT-BOUNDP* OBJ
                                                        '(A B C))
@@ -158422,28 +157899,9 @@ NIL
                                                            (FIND-CLASS
                                                             'CHANGE-CLASS-CLASS-06))
                                                           (OBJ
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   CLASS)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :A
-                                                                         'BAD))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST CLASS :A
+                                                                  'BAD))))
                                                      (VALUES
                                                       (MAP-SLOT-BOUNDP* OBJ
                                                        '(A B C))
@@ -158599,19 +158057,8 @@ NIL
                                                            (FIND-CLASS
                                                             'CHANGE-CLASS-CLASS-08))
                                                           (OBJ
-                                                           (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   CLASS))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (LIST
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               T))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST CLASS))))
                                                      (VALUES
                                                       (MAP-SLOT-BOUNDP* OBJ
                                                        '(A B))
@@ -158632,28 +158079,9 @@ NIL
                                                            (FIND-CLASS
                                                             'CHANGE-CLASS-CLASS-08))
                                                           (OBJ
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   CLASS)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :A 1
-                                                                         :B 2))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST CLASS :A 1 :B
+                                                                  2))))
                                                      (VALUES
                                                       (MAP-SLOT-BOUNDP* OBJ
                                                        '(A B))
@@ -158674,19 +158102,8 @@ NIL
                                                            (FIND-CLASS
                                                             'CHANGE-CLASS-CLASS-08))
                                                           (OBJ
-                                                           (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   CLASS))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (LIST
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               T))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST CLASS))))
                                                      (VALUES
                                                       (MAP-SLOT-BOUNDP* OBJ
                                                        '(A B))
@@ -158709,27 +158126,15 @@ NIL
   (handler-case (run-test 26881 (lambda () (HANDLER-CASE
                             (PROGN
                              (CHANGE-CLASS
-                              (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                     (%MAKE-INSTANCE 'CHANGE-CLASS-CLASS-01A))
-                                    (*CLOS-APPLYING-DEFAULTS* T))
-                                (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                (%SHARED-INIT-DEFAULT-SPREAD
-                                 (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                %CLOS-MAKE-INSTANCE-TMP))
+                              (%MAKE-INSTANCE-LIST
+                               (LIST 'CHANGE-CLASS-CLASS-01A)))
                              NIL)
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26881 c)))
   (handler-case (run-test 26882 (lambda () (HANDLER-CASE
                             (PROGN
                              (LET ((OBJ
-                                    (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                           (%MAKE-INSTANCE
-                                            'CHANGE-CLASS-CLASS-01A))
-                                          (*CLOS-APPLYING-DEFAULTS* T))
-                                      (DECLARE
-                                       (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                      (%SHARED-INIT-DEFAULT-SPREAD
-                                       (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                      %CLOS-MAKE-INSTANCE-TMP))
+                                    (%MAKE-INSTANCE-LIST
+                                     (LIST 'CHANGE-CLASS-CLASS-01A)))
                                    (NEW-CLASS
                                     (FIND-CLASS 'CHANGE-CLASS-CLASS-01B)))
                                (CHANGE-CLASS OBJ NEW-CLASS :C2))
@@ -158738,15 +158143,8 @@ NIL
   (handler-case (run-test 26883 (lambda () (HANDLER-CASE
                             (PROGN
                              (LET ((OBJ
-                                    (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                           (%MAKE-INSTANCE
-                                            'CHANGE-CLASS-CLASS-01A))
-                                          (*CLOS-APPLYING-DEFAULTS* T))
-                                      (DECLARE
-                                       (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                      (%SHARED-INIT-DEFAULT-SPREAD
-                                       (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                      %CLOS-MAKE-INSTANCE-TMP))
+                                    (%MAKE-INSTANCE-LIST
+                                     (LIST 'CHANGE-CLASS-CLASS-01A)))
                                    (NEW-CLASS
                                     (FIND-CLASS 'CHANGE-CLASS-CLASS-01B)))
                                (CHANGE-CLASS OBJ NEW-CLASS '(NONSENSE) 'A))
@@ -158760,17 +158158,8 @@ NIL
                                          (HANDLER-CASE
                                           (PROGN
                                            (CHANGE-CLASS
-                                            (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                   (%MAKE-INSTANCE
-                                                    'CHANGE-CLASS-CLASS-01A))
-                                                  (*CLOS-APPLYING-DEFAULTS* T))
-                                              (DECLARE
-                                               (SPECIAL
-                                                *CLOS-APPLYING-DEFAULTS*))
-                                              (%SHARED-INIT-DEFAULT-SPREAD
-                                               (LIST %CLOS-MAKE-INSTANCE-TMP
-                                                     T))
-                                              %CLOS-MAKE-INSTANCE-TMP)
+                                            (%MAKE-INSTANCE-LIST
+                                             (LIST 'CHANGE-CLASS-CLASS-01A))
                                             CLASS)
                                            T)
                                           (ERROR NIL NIL)))
@@ -158935,13 +158324,7 @@ NIL
 (defun run-ansi-class-name-chunk-1 ()
   (handler-case (run-test 26886 (lambda () (CLASS-NAME (FIND-CLASS 'SYMBOL))) 'SYMBOL) (t (c) (%test-crash-fail-c 26886 c)))
   (handler-case (run-test 26887 (lambda () (CLASS-NAME
-                            (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                   (%MAKE-INSTANCE 'CLASS-NAME-CLASS-01))
-                                  (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                              %CLOS-MAKE-INSTANCE-TMP))) 'SILLY) (t (c) (%test-crash-fail-c 26887 c)))
+                            (%MAKE-INSTANCE-LIST (LIST 'CLASS-NAME-CLASS-01)))) 'SILLY) (t (c) (%test-crash-fail-c 26887 c)))
   (handler-case (run-test 26888 (lambda () (TYPEP* #'(SETF CLASS-NAME)
                             'STANDARD-GENERIC-FUNCTION)) 'T) (t (c) (%test-crash-fail-c 26888 c)))
   (handler-case (run-test-mv 26889 (lambda () (multiple-value-list (LET ((SYM (GENSYM))
@@ -159450,39 +158833,16 @@ NIL
 )
 (defun run-ansi-defclass-01-chunk-1 ()
   (handler-case (run-test 26904 (lambda () (NOTNOT-MV
-                            (TYPEP
-                             (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                    (%MAKE-INSTANCE 'CLASS-01))
-                                   (*CLOS-APPLYING-DEFAULTS* T))
-                               (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                               (%SHARED-INIT-DEFAULT-SPREAD
-                                (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                               %CLOS-MAKE-INSTANCE-TMP)
-                             'CLASS-01))) 'T) (t (c) (%test-crash-fail-c 26904 c)))
+                            (TYPEP (%MAKE-INSTANCE-LIST (LIST 'CLASS-01))
+                                   'CLASS-01))) 'T) (t (c) (%test-crash-fail-c 26904 c)))
   (handler-case (run-test 26905 (lambda () (NOTNOT-MV
                             (TYPEP
-                             (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                    (%MAKE-INSTANCE (FIND-CLASS 'CLASS-01)))
-                                   (*CLOS-APPLYING-DEFAULTS* T))
-                               (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                               (%SHARED-INIT-DEFAULT-SPREAD
-                                (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                               %CLOS-MAKE-INSTANCE-TMP)
+                             (%MAKE-INSTANCE-LIST
+                              (LIST (FIND-CLASS 'CLASS-01)))
                              'CLASS-01))) 'T) (t (c) (%test-crash-fail-c 26905 c)))
   (handler-case (run-test-mv 26906 (lambda () (multiple-value-list (LET ((C
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-01))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-01))))
                                                      (VALUES
                                                       (SET-SLOT-VALUE C 'S1 12)
                                                       (SET-SLOT-VALUE C 'S2 18)
@@ -159497,39 +158857,16 @@ NIL
                                                                                   18
                                                                                   27))) (t (c) (%test-crash-fail-c 26906 c)))
   (handler-case (run-test 26907 (lambda () (NOTNOT-MV
-                            (TYPEP
-                             (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                    (%MAKE-INSTANCE 'CLASS-02))
-                                   (*CLOS-APPLYING-DEFAULTS* T))
-                               (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                               (%SHARED-INIT-DEFAULT-SPREAD
-                                (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                               %CLOS-MAKE-INSTANCE-TMP)
-                             'CLASS-02))) 'T) (t (c) (%test-crash-fail-c 26907 c)))
+                            (TYPEP (%MAKE-INSTANCE-LIST (LIST 'CLASS-02))
+                                   'CLASS-02))) 'T) (t (c) (%test-crash-fail-c 26907 c)))
   (handler-case (run-test 26908 (lambda () (NOTNOT-MV
                             (TYPEP
-                             (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                    (%MAKE-INSTANCE (FIND-CLASS 'CLASS-02)))
-                                   (*CLOS-APPLYING-DEFAULTS* T))
-                               (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                               (%SHARED-INIT-DEFAULT-SPREAD
-                                (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                               %CLOS-MAKE-INSTANCE-TMP)
+                             (%MAKE-INSTANCE-LIST
+                              (LIST (FIND-CLASS 'CLASS-02)))
                              'CLASS-02))) 'T) (t (c) (%test-crash-fail-c 26908 c)))
   (handler-case (run-test-mv 26909 (lambda () (multiple-value-list (LET ((C
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-02))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-02))))
                                                      (VALUES
                                                       (SET-SLOT-VALUE C 'S1 12)
                                                       (SET-SLOT-VALUE C 'S2 18)
@@ -159544,41 +158881,18 @@ NIL
                                                                                   18
                                                                                   27))) (t (c) (%test-crash-fail-c 26909 c)))
   (handler-case (run-test 26910 (lambda () (NOTNOT-MV
-                            (TYPEP
-                             (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                    (%MAKE-INSTANCE 'CLASS-03))
-                                   (*CLOS-APPLYING-DEFAULTS* T))
-                               (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                               (%SHARED-INIT-DEFAULT-SPREAD
-                                (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                               %CLOS-MAKE-INSTANCE-TMP)
-                             'CLASS-03))) 'T) (t (c) (%test-crash-fail-c 26910 c)))
+                            (TYPEP (%MAKE-INSTANCE-LIST (LIST 'CLASS-03))
+                                   'CLASS-03))) 'T) (t (c) (%test-crash-fail-c 26910 c)))
   (handler-case (run-test 26911 (lambda () (NOTNOT-MV
                             (TYPEP
-                             (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                    (%MAKE-INSTANCE (FIND-CLASS 'CLASS-03)))
-                                   (*CLOS-APPLYING-DEFAULTS* T))
-                               (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                               (%SHARED-INIT-DEFAULT-SPREAD
-                                (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                               %CLOS-MAKE-INSTANCE-TMP)
+                             (%MAKE-INSTANCE-LIST
+                              (LIST (FIND-CLASS 'CLASS-03)))
                              'CLASS-03))) 'T) (t (c) (%test-crash-fail-c 26911 c)))
 )
 (defun run-ansi-defclass-01-chunk-2 ()
   (handler-case (run-test-mv 26912 (lambda () (multiple-value-list (LET ((C
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-03))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-03))))
                                                      (VALUES
                                                       (SET-SLOT-VALUE C 'S1 12)
                                                       (SET-SLOT-VALUE C 'S2 'A)
@@ -159593,19 +158907,8 @@ NIL
                                                                                   A
                                                                                   27))) (t (c) (%test-crash-fail-c 26912 c)))
   (handler-case (run-test-mv 26913 (lambda () (multiple-value-list (LET ((C
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-04))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-04))))
                                                      (VALUES
                                                       (SET-SLOT-VALUE C 'S1 'A)
                                                       (SET-SLOT-VALUE C 'S2 'B)
@@ -159625,33 +158928,11 @@ NIL
   (handler-case (run-test 26916 (lambda () (NOTNOT-MV (TYPEP #'S3-A 'GENERIC-FUNCTION))) 'T) (t (c) (%test-crash-fail-c 26916 c)))
   (handler-case (run-test 26917 (lambda () (NOTNOT-MV (TYPEP #'(SETF S3-A) 'GENERIC-FUNCTION))) 'T) (t (c) (%test-crash-fail-c 26917 c)))
   (handler-case (run-test-mv 26918 (lambda () (multiple-value-list (LET ((C1
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-05))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-05)))
                                                          (C2
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-05))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-05))))
                                                      (VALUES (NOT (EQL C1 C2))
                                                              (LIST
                                                               (SET-SLOT-VALUE
@@ -159691,19 +158972,9 @@ NIL
                                                               (SLOT-VALUE C2
                                                                           'S3))
                                                              (SLOT-VALUE
-                                                              (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                     (%MAKE-INSTANCE
-                                                                      'CLASS-05))
-                                                                    (*CLOS-APPLYING-DEFAULTS*
-                                                                     T))
-                                                                (DECLARE
-                                                                 (SPECIAL
-                                                                  *CLOS-APPLYING-DEFAULTS*))
-                                                                (%SHARED-INIT-DEFAULT-SPREAD
-                                                                 (LIST
-                                                                  %CLOS-MAKE-INSTANCE-TMP
-                                                                  T))
-                                                                %CLOS-MAKE-INSTANCE-TMP)
+                                                              (%MAKE-INSTANCE-LIST
+                                                               (LIST
+                                                                'CLASS-05))
                                                               'S3))))) '(T
                                                                          (12 17
                                                                           12
@@ -159716,19 +158987,8 @@ NIL
                                                                           Z)
                                                                          Z)) (t (c) (%test-crash-fail-c 26918 c)))
   (handler-case (run-test-mv 26919 (lambda () (multiple-value-list (LET ((C
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-06))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-06))))
                                                      (VALUES
                                                       (SET-SLOT-VALUE C 'S1 'X)
                                                       (SLOT-VALUE C 'S1)
@@ -159753,33 +159013,11 @@ NIL
 )
 (defun run-ansi-defclass-01-chunk-3 ()
   (handler-case (run-test-mv 26920 (lambda () (multiple-value-list (LET ((C1
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-06))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-06)))
                                                          (C2
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-06A))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-06A))))
                                                      (VALUES
                                                       (SET-SLOT-VALUE C1 'S1
                                                        'X)
@@ -159791,46 +159029,16 @@ NIL
                                                                                   (X
                                                                                    Y))) (t (c) (%test-crash-fail-c 26920 c)))
   (handler-case (run-test-mv 26921 (lambda () (multiple-value-list (LET ((C
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-07))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-07))))
                                                      (VALUES
                                                       (SLOT-BOUNDP C 'S1)
                                                       (SLOT-BOUNDP C 'S2))))) '(NIL
                                                                                 NIL)) (t (c) (%test-crash-fail-c 26921 c)))
   (handler-case (run-test-mv 26922 (lambda () (multiple-value-list (LET ((C
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CLASS-07)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :S1A
-                                                                        'X))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-07 :S1A
+                                                                 'X))))
                                                      (VALUES
                                                       (NOTNOT
                                                        (SLOT-BOUNDP C 'S1))
@@ -159839,28 +159047,9 @@ NIL
                                                                                 X
                                                                                 NIL)) (t (c) (%test-crash-fail-c 26922 c)))
   (handler-case (run-test-mv 26923 (lambda () (multiple-value-list (LET ((C
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CLASS-07)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :S1B
-                                                                        'X))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-07 :S1B
+                                                                 'X))))
                                                      (VALUES
                                                       (NOTNOT
                                                        (SLOT-BOUNDP C 'S1))
@@ -159869,29 +159058,9 @@ NIL
                                                                                 X
                                                                                 NIL)) (t (c) (%test-crash-fail-c 26923 c)))
   (handler-case (run-test-mv 26924 (lambda () (multiple-value-list (LET ((C
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CLASS-07)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :S1A 'Y
-                                                                        :S1B
-                                                                        'X))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-07 :S1A
+                                                                 'Y :S1B 'X))))
                                                      (VALUES
                                                       (NOTNOT
                                                        (SLOT-BOUNDP C 'S1))
@@ -159900,29 +159069,9 @@ NIL
                                                                                 Y
                                                                                 NIL)) (t (c) (%test-crash-fail-c 26924 c)))
   (handler-case (run-test-mv 26925 (lambda () (multiple-value-list (LET ((C
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CLASS-07)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :S1B 'Y
-                                                                        :S1A
-                                                                        'X))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-07 :S1B
+                                                                 'Y :S1A 'X))))
                                                      (VALUES
                                                       (NOTNOT
                                                        (SLOT-BOUNDP C 'S1))
@@ -159931,29 +159080,9 @@ NIL
                                                                                 Y
                                                                                 NIL)) (t (c) (%test-crash-fail-c 26925 c)))
   (handler-case (run-test-mv 26926 (lambda () (multiple-value-list (LET ((C
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CLASS-07)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :S1A 'Y
-                                                                        :S1A
-                                                                        'X))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-07 :S1A
+                                                                 'Y :S1A 'X))))
                                                      (VALUES
                                                       (NOTNOT
                                                        (SLOT-BOUNDP C 'S1))
@@ -159962,29 +159091,9 @@ NIL
                                                                                 Y
                                                                                 NIL)) (t (c) (%test-crash-fail-c 26926 c)))
   (handler-case (run-test-mv 26927 (lambda () (multiple-value-list (LET ((C
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CLASS-07)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :S2 'A
-                                                                        :S1A
-                                                                        'B))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-07 :S2
+                                                                 'A :S1A 'B))))
                                                      (VALUES
                                                       (NOTNOT
                                                        (SLOT-BOUNDP C 'S1))
@@ -159995,32 +159104,11 @@ NIL
 )
 (defun run-ansi-defclass-01-chunk-4 ()
   (handler-case (run-test-mv 26928 (lambda () (multiple-value-list (LET ((C
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CLASS-07)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :S2 'A
-                                                                        :S1A 'B
-                                                                        :S2 'X
-                                                                        :S1A 'Y
-                                                                        :S1B
-                                                                        'Z))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-07 :S2
+                                                                 'A :S1A 'B :S2
+                                                                 'X :S1A 'Y
+                                                                 :S1B 'Z))))
                                                      (VALUES
                                                       (NOTNOT
                                                        (SLOT-BOUNDP C 'S1))
@@ -160029,137 +159117,47 @@ NIL
                                                       (S1 C) (S2 C))))) '(T T B
                                                                           A)) (t (c) (%test-crash-fail-c 26928 c)))
   (handler-case (run-test-mv 26929 (lambda () (multiple-value-list (LET ((C
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CLASS-07)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :S1B 'X
-                                                                        :S1A
-                                                                        'Y))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-07 :S1B
+                                                                 'X :S1A 'Y))))
                                                      (VALUES
                                                       (NOTNOT
                                                        (SLOT-BOUNDP C 'S1))
                                                       (SLOT-BOUNDP C 'S2)
                                                       (S1 C))))) '(T NIL X)) (t (c) (%test-crash-fail-c 26929 c)))
   (handler-case (run-test-mv 26930 (lambda () (multiple-value-list (LET ((C
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CLASS-07)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :S1A 'X
-                                                                        :S2 'Y
-                                                                        :ALLOW-OTHER-KEYS
-                                                                        NIL))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-07 :S1A
+                                                                 'X :S2 'Y
+                                                                 :ALLOW-OTHER-KEYS
+                                                                 NIL))))
                                                      (VALUES (S1 C) (S2 C))))) '(X
                                                                                  Y)) (t (c) (%test-crash-fail-c 26930 c)))
   (handler-case (run-test-mv 26931 (lambda () (multiple-value-list (LET ((C
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CLASS-07)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :S1A 'A
-                                                                        :S2 'B
-                                                                        :GARBAGE
-                                                                        'Z
-                                                                        :ALLOW-OTHER-KEYS
-                                                                        T))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-07 :S1A
+                                                                 'A :S2 'B
+                                                                 :GARBAGE 'Z
+                                                                 :ALLOW-OTHER-KEYS
+                                                                 T))))
                                                      (VALUES (S1 C) (S2 C))))) '(A
                                                                                  B)) (t (c) (%test-crash-fail-c 26931 c)))
   (handler-case (run-test-mv 26932 (lambda () (multiple-value-list (LET ((C
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CLASS-07)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :S1A 'D
-                                                                        :S2 'C
-                                                                        :GARBAGE
-                                                                        'Z
-                                                                        :ALLOW-OTHER-KEYS
-                                                                        T
-                                                                        :ALLOW-OTHER-KEYS
-                                                                        NIL))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-07 :S1A
+                                                                 'D :S2 'C
+                                                                 :GARBAGE 'Z
+                                                                 :ALLOW-OTHER-KEYS
+                                                                 T
+                                                                 :ALLOW-OTHER-KEYS
+                                                                 NIL))))
                                                      (VALUES (S1 C) (S2 C))))) '(D
                                                                                  C)) (t (c) (%test-crash-fail-c 26932 c)))
   (handler-case (run-test-mv 26933 (lambda () (multiple-value-list (LET* ((*CLASS-08-S2-INITVAR*
                                                            'X)
                                                           (C
-                                                           (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   'CLASS-08))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (LIST
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               T))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'CLASS-08))))
                                                      (DECLARE
                                                       (SPECIAL
                                                        *CLASS-08-S2-INITVAR*))
@@ -160170,19 +159168,8 @@ NIL
   (handler-case (run-test-mv 26934 (lambda () (multiple-value-list (LET* ((*CLASS-09-S2-INITVAR*
                                                            'X)
                                                           (C
-                                                           (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   'CLASS-09))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (LIST
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               T))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'CLASS-09))))
                                                      (DECLARE
                                                       (SPECIAL
                                                        *CLASS-09-S2-INITVAR*))
@@ -160193,28 +159180,9 @@ NIL
   (handler-case (run-test-mv 26935 (lambda () (multiple-value-list (LET* ((*CLASS-09-S2-INITVAR*
                                                            'X)
                                                           (C
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'CLASS-09)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :S1
-                                                                         1))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'CLASS-09 :S1
+                                                                  1))))
                                                      (DECLARE
                                                       (SPECIAL
                                                        *CLASS-09-S2-INITVAR*))
@@ -160225,59 +159193,19 @@ NIL
 )
 (defun run-ansi-defclass-01-chunk-5 ()
   (handler-case (run-test-mv 26936 (lambda () (multiple-value-list (LET* ((C
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'CLASS-09)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :S2
-                                                                         'A))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'CLASS-09 :S2
+                                                                  'A))))
                                                      (VALUES (SLOT-VALUE C 'S1)
                                                              (SLOT-VALUE C
                                                                          'S2))))) '(0
                                                                                     A)) (t (c) (%test-crash-fail-c 26936 c)))
   (handler-case (run-test-mv 26937 (lambda () (multiple-value-list (LET* ((C
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'CLASS-09)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :S2 'A
-                                                                         :S1 10
-                                                                         :S1
-                                                                         'BAD
-                                                                         :S2
-                                                                         'BAD))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'CLASS-09 :S2
+                                                                  'A :S1 10 :S1
+                                                                  'BAD :S2
+                                                                  'BAD))))
                                                      (VALUES (SLOT-VALUE C 'S1)
                                                              (SLOT-VALUE C
                                                                          'S2))))) '(10
@@ -160285,19 +159213,8 @@ NIL
   (handler-case (run-test-mv 26938 (lambda () (multiple-value-list (LET* ((*CLASS-10-S1-INITVAR*
                                                            0)
                                                           (C
-                                                           (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   'CLASS-10))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (LIST
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               T))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'CLASS-10))))
                                                      (DECLARE
                                                       (SPECIAL
                                                        *CLASS-10-S1-INITVAR*))
@@ -160308,28 +159225,9 @@ NIL
   (handler-case (run-test-mv 26939 (lambda () (multiple-value-list (LET* ((*CLASS-10-S1-INITVAR*
                                                            0)
                                                           (C
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'CLASS-10)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :S1
-                                                                         10))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'CLASS-10 :S1
+                                                                  10))))
                                                      (DECLARE
                                                       (SPECIAL
                                                        *CLASS-10-S1-INITVAR*))
@@ -160337,380 +159235,106 @@ NIL
                                                       *CLASS-10-S1-INITVAR*
                                                       (SLOT-VALUE C 'S1))))) '(0
                                                                                10)) (t (c) (%test-crash-fail-c 26939 c)))
-  (handler-case (run-test 26940 (lambda () (SLOT-VALUE
-                            (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                   (%MAKE-INSTANCE 'CLASS-11))
-                                  (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                              %CLOS-MAKE-INSTANCE-TMP)
-                            'S1)) '7) (t (c) (%test-crash-fail-c 26940 c)))
+  (handler-case (run-test 26940 (lambda () (SLOT-VALUE (%MAKE-INSTANCE-LIST (LIST 'CLASS-11))
+                                       'S1)) '7) (t (c) (%test-crash-fail-c 26940 c)))
   (handler-case (run-test 26941 (lambda () (SLOT-VALUE
-                            (LET* ((%CLOS-MI-CLASS 'CLASS-11)
-                                   (%CLOS-MAKE-INSTANCE-TMP
-                                    (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                   (%CLOS-MI-INITARGS (LIST :S1 100))
-                                   (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                               %CLOS-MI-INITARGS)
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (CONS %CLOS-MAKE-INSTANCE-TMP
-                                     (CONS T %CLOS-MI-INITARGS)))
-                              %CLOS-MAKE-INSTANCE-TMP)
-                            'S1)) '100) (t (c) (%test-crash-fail-c 26941 c)))
-  (handler-case (run-test 26942 (lambda () (SLOT-VALUE
-                            (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                   (%MAKE-INSTANCE 'CLASS-12))
-                                  (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                              %CLOS-MAKE-INSTANCE-TMP)
-                            'S1)) 'X) (t (c) (%test-crash-fail-c 26942 c)))
+                            (%MAKE-INSTANCE-LIST (LIST 'CLASS-11 :S1 100)) 'S1)) '100) (t (c) (%test-crash-fail-c 26941 c)))
+  (handler-case (run-test 26942 (lambda () (SLOT-VALUE (%MAKE-INSTANCE-LIST (LIST 'CLASS-12))
+                                       'S1)) 'X) (t (c) (%test-crash-fail-c 26942 c)))
   (handler-case (run-test 26943 (lambda () (SLOT-VALUE
-                            (LET* ((%CLOS-MI-CLASS 'CLASS-12)
-                                   (%CLOS-MAKE-INSTANCE-TMP
-                                    (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                   (%CLOS-MI-INITARGS (LIST :S1 'Y))
-                                   (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                               %CLOS-MI-INITARGS)
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (CONS %CLOS-MAKE-INSTANCE-TMP
-                                     (CONS T %CLOS-MI-INITARGS)))
-                              %CLOS-MAKE-INSTANCE-TMP)
-                            'S1)) 'Y) (t (c) (%test-crash-fail-c 26943 c)))
+                            (%MAKE-INSTANCE-LIST (LIST 'CLASS-12 :S1 'Y)) 'S1)) 'Y) (t (c) (%test-crash-fail-c 26943 c)))
 )
 (defun run-ansi-defclass-01-chunk-6 ()
   (handler-case (run-test-mv 26944 (lambda () (multiple-value-list (LET ((C1
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-13))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-13)))
                                                          (C2
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CLASS-13)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :S1
-                                                                        'FOO))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-13 :S1
+                                                                 'FOO))))
                                                      (VALUES
                                                       (SLOT-VALUE C1 'S1)
                                                       (SLOT-VALUE C2 'S1))))) '(FOO
                                                                                 FOO)) (t (c) (%test-crash-fail-c 26944 c)))
   (handler-case (run-test 26945 (lambda () (LET ((C
-                                  (LET* ((%CLOS-MI-CLASS 'CLASS-14)
-                                         (%CLOS-MAKE-INSTANCE-TMP
-                                          (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                         (%CLOS-MI-INITARGS (LIST NIL 'X))
-                                         (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                                     %CLOS-MI-INITARGS)
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (CONS %CLOS-MAKE-INSTANCE-TMP
-                                           (CONS T %CLOS-MI-INITARGS)))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+                                  (%MAKE-INSTANCE-LIST
+                                   (LIST 'CLASS-14 NIL 'X))))
                              (S1 C))) 'X) (t (c) (%test-crash-fail-c 26945 c)))
   (handler-case (run-test 26946 (lambda () (LET ((C
-                                  (LET* ((%CLOS-MI-CLASS 'CLASS-15)
-                                         (%CLOS-MAKE-INSTANCE-TMP
-                                          (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                         (%CLOS-MI-INITARGS
-                                          (LIST :ALLOW-OTHER-KEYS NIL))
-                                         (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                                     %CLOS-MI-INITARGS)
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (CONS %CLOS-MAKE-INSTANCE-TMP
-                                           (CONS T %CLOS-MI-INITARGS)))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+                                  (%MAKE-INSTANCE-LIST
+                                   (LIST 'CLASS-15 :ALLOW-OTHER-KEYS NIL))))
                              (S1 C))) 'NIL) (t (c) (%test-crash-fail-c 26946 c)))
   (handler-case (run-test 26947 (lambda () (LET ((C
-                                  (LET* ((%CLOS-MI-CLASS 'CLASS-15)
-                                         (%CLOS-MAKE-INSTANCE-TMP
-                                          (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                         (%CLOS-MI-INITARGS
-                                          (LIST :ALLOW-OTHER-KEYS T))
-                                         (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                                     %CLOS-MI-INITARGS)
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (CONS %CLOS-MAKE-INSTANCE-TMP
-                                           (CONS T %CLOS-MI-INITARGS)))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+                                  (%MAKE-INSTANCE-LIST
+                                   (LIST 'CLASS-15 :ALLOW-OTHER-KEYS T))))
                              (S1 C))) 'T) (t (c) (%test-crash-fail-c 26947 c)))
   (handler-case (run-test 26948 (lambda () (LET ((C
-                                  (LET* ((%CLOS-MI-CLASS 'CLASS-15)
-                                         (%CLOS-MAKE-INSTANCE-TMP
-                                          (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                         (%CLOS-MI-INITARGS
-                                          (LIST :ALLOW-OTHER-KEYS T
-                                                :ALLOW-OTHER-KEYS NIL))
-                                         (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                                     %CLOS-MI-INITARGS)
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (CONS %CLOS-MAKE-INSTANCE-TMP
-                                           (CONS T %CLOS-MI-INITARGS)))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+                                  (%MAKE-INSTANCE-LIST
+                                   (LIST 'CLASS-15 :ALLOW-OTHER-KEYS T
+                                         :ALLOW-OTHER-KEYS NIL))))
                              (S1 C))) 'T) (t (c) (%test-crash-fail-c 26948 c)))
   (handler-case (run-test 26949 (lambda () (LET ((C
-                                  (LET* ((%CLOS-MI-CLASS 'CLASS-15)
-                                         (%CLOS-MAKE-INSTANCE-TMP
-                                          (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                         (%CLOS-MI-INITARGS
-                                          (LIST :ALLOW-OTHER-KEYS NIL
-                                                :ALLOW-OTHER-KEYS T))
-                                         (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                                     %CLOS-MI-INITARGS)
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (CONS %CLOS-MAKE-INSTANCE-TMP
-                                           (CONS T %CLOS-MI-INITARGS)))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+                                  (%MAKE-INSTANCE-LIST
+                                   (LIST 'CLASS-15 :ALLOW-OTHER-KEYS NIL
+                                         :ALLOW-OTHER-KEYS T))))
                              (S1 C))) 'NIL) (t (c) (%test-crash-fail-c 26949 c)))
   (handler-case (run-test 26950 (lambda () (LET ((C
-                                  (LET* ((%CLOS-MI-CLASS 'CLASS-15)
-                                         (%CLOS-MAKE-INSTANCE-TMP
-                                          (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                         (%CLOS-MI-INITARGS
-                                          (LIST :ALLOW-OTHER-KEYS T :FOO 'BAR))
-                                         (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                                     %CLOS-MI-INITARGS)
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (CONS %CLOS-MAKE-INSTANCE-TMP
-                                           (CONS T %CLOS-MI-INITARGS)))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+                                  (%MAKE-INSTANCE-LIST
+                                   (LIST 'CLASS-15 :ALLOW-OTHER-KEYS T :FOO
+                                         'BAR))))
                              (S1 C))) 'T) (t (c) (%test-crash-fail-c 26950 c)))
   (handler-case (run-test 26951 (lambda () (LET ((C
-                                  (LET* ((%CLOS-MI-CLASS 'CLASS-15)
-                                         (%CLOS-MAKE-INSTANCE-TMP
-                                          (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                         (%CLOS-MI-INITARGS
-                                          (LIST :ALLOW-OTHER-KEYS T
-                                                :ALLOW-OTHER-KEYS NIL :FOO
-                                                'BAR))
-                                         (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                                     %CLOS-MI-INITARGS)
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (CONS %CLOS-MAKE-INSTANCE-TMP
-                                           (CONS T %CLOS-MI-INITARGS)))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+                                  (%MAKE-INSTANCE-LIST
+                                   (LIST 'CLASS-15 :ALLOW-OTHER-KEYS T
+                                         :ALLOW-OTHER-KEYS NIL :FOO 'BAR))))
                              (S1 C))) 'T) (t (c) (%test-crash-fail-c 26951 c)))
 )
 (defun run-ansi-defclass-01-chunk-7 ()
-  (handler-case (run-test 26952 (lambda () (LET ((C
-                                  (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                         (%MAKE-INSTANCE 'CLASS-16))
-                                        (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+  (handler-case (run-test 26952 (lambda () (LET ((C (%MAKE-INSTANCE-LIST (LIST 'CLASS-16))))
                              (SLOT-VALUE C 'S1))) 'X) (t (c) (%test-crash-fail-c 26952 c)))
   (handler-case (run-test 26953 (lambda () (LET ((C
-                                  (LET* ((%CLOS-MI-CLASS 'CLASS-16)
-                                         (%CLOS-MAKE-INSTANCE-TMP
-                                          (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                         (%CLOS-MI-INITARGS (LIST :S1 'Y))
-                                         (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                                     %CLOS-MI-INITARGS)
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (CONS %CLOS-MAKE-INSTANCE-TMP
-                                           (CONS T %CLOS-MI-INITARGS)))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+                                  (%MAKE-INSTANCE-LIST
+                                   (LIST 'CLASS-16 :S1 'Y))))
                              (SLOT-VALUE C 'S1))) 'Y) (t (c) (%test-crash-fail-c 26953 c)))
   (handler-case (run-test 26954 (lambda () (LET ((C
-                                  (LET* ((%CLOS-MI-CLASS 'CLASS-16)
-                                         (%CLOS-MAKE-INSTANCE-TMP
-                                          (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                         (%CLOS-MI-INITARGS (LIST :S1 NIL))
-                                         (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                                     %CLOS-MI-INITARGS)
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (CONS %CLOS-MAKE-INSTANCE-TMP
-                                           (CONS T %CLOS-MI-INITARGS)))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+                                  (%MAKE-INSTANCE-LIST
+                                   (LIST 'CLASS-16 :S1 NIL))))
                              (SLOT-VALUE C 'S1))) 'NIL) (t (c) (%test-crash-fail-c 26954 c)))
-  (handler-case (run-test 26955 (lambda () (LET ((C
-                                  (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                         (%MAKE-INSTANCE 'CLASS-17))
-                                        (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+  (handler-case (run-test 26955 (lambda () (LET ((C (%MAKE-INSTANCE-LIST (LIST 'CLASS-17))))
                              (SLOT-VALUE C 'S1))) 'BAR) (t (c) (%test-crash-fail-c 26955 c)))
   (handler-case (run-test 26956 (lambda () (LET ((C
-                                  (LET* ((%CLOS-MI-CLASS 'CLASS-17)
-                                         (%CLOS-MAKE-INSTANCE-TMP
-                                          (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                         (%CLOS-MI-INITARGS (LIST :S1 'Z))
-                                         (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                                     %CLOS-MI-INITARGS)
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (CONS %CLOS-MAKE-INSTANCE-TMP
-                                           (CONS T %CLOS-MI-INITARGS)))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+                                  (%MAKE-INSTANCE-LIST
+                                   (LIST 'CLASS-17 :S1 'Z))))
                              (SLOT-VALUE C 'S1))) 'Z) (t (c) (%test-crash-fail-c 26956 c)))
   (handler-case (run-test 26957 (lambda () (LET ((C
-                                  (LET* ((%CLOS-MI-CLASS 'CLASS-17)
-                                         (%CLOS-MAKE-INSTANCE-TMP
-                                          (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                         (%CLOS-MI-INITARGS (LIST :S1 NIL))
-                                         (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                                     %CLOS-MI-INITARGS)
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (CONS %CLOS-MAKE-INSTANCE-TMP
-                                           (CONS T %CLOS-MI-INITARGS)))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+                                  (%MAKE-INSTANCE-LIST
+                                   (LIST 'CLASS-17 :S1 NIL))))
                              (SLOT-VALUE C 'S1))) 'NIL) (t (c) (%test-crash-fail-c 26957 c)))
-  (handler-case (run-test 26958 (lambda () (LET ((C
-                                  (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                         (%MAKE-INSTANCE 'CLASS-18))
-                                        (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+  (handler-case (run-test 26958 (lambda () (LET ((C (%MAKE-INSTANCE-LIST (LIST 'CLASS-18))))
                              (SLOT-VALUE C 'S1))) 'X) (t (c) (%test-crash-fail-c 26958 c)))
   (handler-case (run-test 26959 (lambda () (LET ((C
-                                  (LET* ((%CLOS-MI-CLASS 'CLASS-18)
-                                         (%CLOS-MAKE-INSTANCE-TMP
-                                          (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                         (%CLOS-MI-INITARGS (LIST :S1 'Z))
-                                         (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                                     %CLOS-MI-INITARGS)
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (CONS %CLOS-MAKE-INSTANCE-TMP
-                                           (CONS T %CLOS-MI-INITARGS)))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+                                  (%MAKE-INSTANCE-LIST
+                                   (LIST 'CLASS-18 :S1 'Z))))
                              (SLOT-VALUE C 'S1))) 'Z) (t (c) (%test-crash-fail-c 26959 c)))
 )
 (defun run-ansi-defclass-01-chunk-8 ()
   (handler-case (run-test 26960 (lambda () (LET ((C
-                                  (LET* ((%CLOS-MI-CLASS 'CLASS-18)
-                                         (%CLOS-MAKE-INSTANCE-TMP
-                                          (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                         (%CLOS-MI-INITARGS (LIST :S1 NIL))
-                                         (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                                     %CLOS-MI-INITARGS)
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (CONS %CLOS-MAKE-INSTANCE-TMP
-                                           (CONS T %CLOS-MI-INITARGS)))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+                                  (%MAKE-INSTANCE-LIST
+                                   (LIST 'CLASS-18 :S1 NIL))))
                              (SLOT-VALUE C 'S1))) 'NIL) (t (c) (%test-crash-fail-c 26960 c)))
   (handler-case (run-test 26961 (lambda () (LET ((C
-                                  (LET* ((%CLOS-MI-CLASS 'CLASS-18)
-                                         (%CLOS-MAKE-INSTANCE-TMP
-                                          (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                         (%CLOS-MI-INITARGS (LIST :S1B 'Z))
-                                         (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                                     %CLOS-MI-INITARGS)
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (CONS %CLOS-MAKE-INSTANCE-TMP
-                                           (CONS T %CLOS-MI-INITARGS)))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+                                  (%MAKE-INSTANCE-LIST
+                                   (LIST 'CLASS-18 :S1B 'Z))))
                              (SLOT-VALUE C 'S1))) 'Z) (t (c) (%test-crash-fail-c 26961 c)))
   (handler-case (run-test 26962 (lambda () (LET ((C
-                                  (LET* ((%CLOS-MI-CLASS 'CLASS-18)
-                                         (%CLOS-MAKE-INSTANCE-TMP
-                                          (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                         (%CLOS-MI-INITARGS (LIST :S1B NIL))
-                                         (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                                     %CLOS-MI-INITARGS)
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (CONS %CLOS-MAKE-INSTANCE-TMP
-                                           (CONS T %CLOS-MI-INITARGS)))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+                                  (%MAKE-INSTANCE-LIST
+                                   (LIST 'CLASS-18 :S1B NIL))))
                              (SLOT-VALUE C 'S1))) 'NIL) (t (c) (%test-crash-fail-c 26962 c)))
   (handler-case (run-test-mv 26963 (lambda () (multiple-value-list (LET* ((*CLASS-19-S1-INITVAR*
                                                            NIL)
                                                           (C
-                                                           (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   'CLASS-19))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (LIST
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               T))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'CLASS-19))))
                                                      (DECLARE
                                                       (SPECIAL
                                                        *CLASS-19-S1-INITVAR*))
@@ -160720,28 +159344,9 @@ NIL
   (handler-case (run-test-mv 26964 (lambda () (multiple-value-list (LET* ((*CLASS-19-S1-INITVAR*
                                                            NIL)
                                                           (C
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'CLASS-19)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :S1
-                                                                         NIL))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'CLASS-19 :S1
+                                                                  NIL))))
                                                      (DECLARE
                                                       (SPECIAL
                                                        *CLASS-19-S1-INITVAR*))
@@ -160751,28 +159356,9 @@ NIL
   (handler-case (run-test-mv 26965 (lambda () (multiple-value-list (LET* ((*CLASS-19-S1-INITVAR*
                                                            NIL)
                                                           (C
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'CLASS-19)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :S1
-                                                                         'X))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'CLASS-19 :S1
+                                                                  'X))))
                                                      (DECLARE
                                                       (SPECIAL
                                                        *CLASS-19-S1-INITVAR*))
@@ -160782,19 +159368,8 @@ NIL
   (handler-case (run-test-mv 26966 (lambda () (multiple-value-list (LET* (*CLASS-20-S1-INITVAR-1*
                                                           *CLASS-20-S1-INITVAR-2*
                                                           (C
-                                                           (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   'CLASS-20))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (LIST
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               T))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'CLASS-20))))
                                                      (DECLARE
                                                       (SPECIAL
                                                        *CLASS-20-S1-INITVAR-1*
@@ -160807,28 +159382,9 @@ NIL
   (handler-case (run-test-mv 26967 (lambda () (multiple-value-list (LET* (*CLASS-20-S1-INITVAR-1*
                                                           *CLASS-20-S1-INITVAR-2*
                                                           (C
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'CLASS-20)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :S1
-                                                                         'X))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'CLASS-20 :S1
+                                                                  'X))))
                                                      (DECLARE
                                                       (SPECIAL
                                                        *CLASS-20-S1-INITVAR-1*
@@ -160843,28 +159399,9 @@ NIL
   (handler-case (run-test-mv 26968 (lambda () (multiple-value-list (LET* (*CLASS-20-S1-INITVAR-1*
                                                           *CLASS-20-S1-INITVAR-2*
                                                           (C
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'CLASS-20)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :S1B
-                                                                         'Y))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'CLASS-20
+                                                                  :S1B 'Y))))
                                                      (DECLARE
                                                       (SPECIAL
                                                        *CLASS-20-S1-INITVAR-1*
@@ -160879,19 +159416,8 @@ NIL
                                                           (*CLASS-21-S1-INITVAR-2*
                                                            20)
                                                           (C
-                                                           (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   'CLASS-21))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (LIST
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               T))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'CLASS-21))))
                                                      (DECLARE
                                                       (SPECIAL
                                                        *CLASS-21-S1-INITVAR-1*
@@ -160908,28 +159434,9 @@ NIL
                                                           (*CLASS-21-S1-INITVAR-2*
                                                            20)
                                                           (C
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'CLASS-21)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :S1
-                                                                         'X))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'CLASS-21 :S1
+                                                                  'X))))
                                                      (DECLARE
                                                       (SPECIAL
                                                        *CLASS-21-S1-INITVAR-1*
@@ -160946,29 +159453,9 @@ NIL
                                                           (*CLASS-21-S1-INITVAR-2*
                                                            20)
                                                           (C
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'CLASS-21)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :S1 'X
-                                                                         :S1B
-                                                                         'Y))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'CLASS-21 :S1
+                                                                  'X :S1B 'Y))))
                                                      (DECLARE
                                                       (SPECIAL
                                                        *CLASS-21-S1-INITVAR-1*
@@ -160985,28 +159472,9 @@ NIL
                                                           (*CLASS-21-S1-INITVAR-2*
                                                            20)
                                                           (C
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'CLASS-21)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :S1B
-                                                                         'Y))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'CLASS-21
+                                                                  :S1B 'Y))))
                                                      (DECLARE
                                                       (SPECIAL
                                                        *CLASS-21-S1-INITVAR-1*
@@ -161023,28 +159491,9 @@ NIL
                                                           (*CLASS-21-S1-INITVAR-2*
                                                            20)
                                                           (C
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'CLASS-21)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :S2
-                                                                         'Y))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'CLASS-21 :S2
+                                                                  'Y))))
                                                      (DECLARE
                                                       (SPECIAL
                                                        *CLASS-21-S1-INITVAR-1*
@@ -161057,25 +159506,11 @@ NIL
                                                                                            11
                                                                                            21)) (t (c) (%test-crash-fail-c 26973 c)))
   (handler-case (run-test 26974 (lambda () (NOTNOT-MV
-                            (TYPEP
-                             (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                    (%MAKE-INSTANCE 'CLASS-22))
-                                   (*CLOS-APPLYING-DEFAULTS* T))
-                               (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                               (%SHARED-INIT-DEFAULT-SPREAD
-                                (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                               %CLOS-MAKE-INSTANCE-TMP)
-                             'CLASS-22))) 'T) (t (c) (%test-crash-fail-c 26974 c)))
+                            (TYPEP (%MAKE-INSTANCE-LIST (LIST 'CLASS-22))
+                                   'CLASS-22))) 'T) (t (c) (%test-crash-fail-c 26974 c)))
   (handler-case (run-test 26975 (lambda () (NOTNOT-MV
-                            (TYPEP
-                             (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                    (%MAKE-INSTANCE 'CLASS-23))
-                                   (*CLOS-APPLYING-DEFAULTS* T))
-                               (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                               (%SHARED-INIT-DEFAULT-SPREAD
-                                (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                               %CLOS-MAKE-INSTANCE-TMP)
-                             'CLASS-23))) 'T) (t (c) (%test-crash-fail-c 26975 c)))
+                            (TYPEP (%MAKE-INSTANCE-LIST (LIST 'CLASS-23))
+                                   'CLASS-23))) 'T) (t (c) (%test-crash-fail-c 26975 c)))
 )
 (defun run-ansi-defclass-01-chunk-10 ()
   (handler-case (run-test 26976 (lambda () (LET ((DOC (DOCUMENTATION 'CLASS-23 'TYPE)))
@@ -161088,152 +159523,39 @@ NIL
   (handler-case (run-test 26978 (lambda () (LET ((DOC (DOCUMENTATION (FIND-CLASS 'CLASS-23) T)))
                              (OR (NULL DOC)
                                  (EQUALT DOC "This is class-23 in ansi-tests")))) 'T) (t (c) (%test-crash-fail-c 26978 c)))
-  (handler-case (run-test 26979 (lambda () (S1
-                            (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                   (%MAKE-INSTANCE 'CLASS-24))
-                                  (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                              %CLOS-MAKE-INSTANCE-TMP))) 'T) (t (c) (%test-crash-fail-c 26979 c)))
+  (handler-case (run-test 26979 (lambda () (S1 (%MAKE-INSTANCE-LIST (LIST 'CLASS-24)))) 'T) (t (c) (%test-crash-fail-c 26979 c)))
   (handler-case (run-test 26980 (lambda () (S1
-                            (LET* ((%CLOS-MI-CLASS 'CLASS-24)
-                                   (%CLOS-MAKE-INSTANCE-TMP
-                                    (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                   (%CLOS-MI-INITARGS (LIST :NONSENSE T))
-                                   (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                               %CLOS-MI-INITARGS)
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (CONS %CLOS-MAKE-INSTANCE-TMP
-                                     (CONS T %CLOS-MI-INITARGS)))
-                              %CLOS-MAKE-INSTANCE-TMP))) 'T) (t (c) (%test-crash-fail-c 26980 c)))
+                            (%MAKE-INSTANCE-LIST (LIST 'CLASS-24 :NONSENSE T)))) 'T) (t (c) (%test-crash-fail-c 26980 c)))
   (handler-case (run-test 26981 (lambda () (S1
-                            (LET* ((%CLOS-MI-CLASS 'CLASS-24)
-                                   (%CLOS-MAKE-INSTANCE-TMP
-                                    (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                   (%CLOS-MI-INITARGS
-                                    (LIST :ALLOW-OTHER-KEYS NIL))
-                                   (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                               %CLOS-MI-INITARGS)
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (CONS %CLOS-MAKE-INSTANCE-TMP
-                                     (CONS T %CLOS-MI-INITARGS)))
-                              %CLOS-MAKE-INSTANCE-TMP))) 'NIL) (t (c) (%test-crash-fail-c 26981 c)))
+                            (%MAKE-INSTANCE-LIST
+                             (LIST 'CLASS-24 :ALLOW-OTHER-KEYS NIL)))) 'NIL) (t (c) (%test-crash-fail-c 26981 c)))
   (handler-case (run-test 26982 (lambda () (S1
-                            (LET* ((%CLOS-MI-CLASS 'CLASS-24)
-                                   (%CLOS-MAKE-INSTANCE-TMP
-                                    (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                   (%CLOS-MI-INITARGS
-                                    (LIST :ALLOW-OTHER-KEYS 'A :FOO T))
-                                   (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                               %CLOS-MI-INITARGS)
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (CONS %CLOS-MAKE-INSTANCE-TMP
-                                     (CONS T %CLOS-MI-INITARGS)))
-                              %CLOS-MAKE-INSTANCE-TMP))) 'A) (t (c) (%test-crash-fail-c 26982 c)))
-  (handler-case (run-test 26983 (lambda () (S1
-                            (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                   (%MAKE-INSTANCE 'CLASS-25))
-                                  (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                              %CLOS-MAKE-INSTANCE-TMP))) 'NIL) (t (c) (%test-crash-fail-c 26983 c)))
+                            (%MAKE-INSTANCE-LIST
+                             (LIST 'CLASS-24 :ALLOW-OTHER-KEYS 'A :FOO T)))) 'A) (t (c) (%test-crash-fail-c 26982 c)))
+  (handler-case (run-test 26983 (lambda () (S1 (%MAKE-INSTANCE-LIST (LIST 'CLASS-25)))) 'NIL) (t (c) (%test-crash-fail-c 26983 c)))
 )
 (defun run-ansi-defclass-01-chunk-11 ()
   (handler-case (run-test 26984 (lambda () (S1
-                            (LET* ((%CLOS-MI-CLASS 'CLASS-25)
-                                   (%CLOS-MAKE-INSTANCE-TMP
-                                    (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                   (%CLOS-MI-INITARGS
-                                    (LIST :ALLOW-OTHER-KEYS T))
-                                   (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                               %CLOS-MI-INITARGS)
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (CONS %CLOS-MAKE-INSTANCE-TMP
-                                     (CONS T %CLOS-MI-INITARGS)))
-                              %CLOS-MAKE-INSTANCE-TMP))) 'T) (t (c) (%test-crash-fail-c 26984 c)))
+                            (%MAKE-INSTANCE-LIST
+                             (LIST 'CLASS-25 :ALLOW-OTHER-KEYS T)))) 'T) (t (c) (%test-crash-fail-c 26984 c)))
   (handler-case (run-test 26985 (lambda () (S1
-                            (LET* ((%CLOS-MI-CLASS 'CLASS-25)
-                                   (%CLOS-MAKE-INSTANCE-TMP
-                                    (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                   (%CLOS-MI-INITARGS
-                                    (LIST :ALLOW-OTHER-KEYS T :FOO NIL))
-                                   (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                               %CLOS-MI-INITARGS)
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (CONS %CLOS-MAKE-INSTANCE-TMP
-                                     (CONS T %CLOS-MI-INITARGS)))
-                              %CLOS-MAKE-INSTANCE-TMP))) 'T) (t (c) (%test-crash-fail-c 26985 c)))
+                            (%MAKE-INSTANCE-LIST
+                             (LIST 'CLASS-25 :ALLOW-OTHER-KEYS T :FOO NIL)))) 'T) (t (c) (%test-crash-fail-c 26985 c)))
   (handler-case (run-test 26986 (lambda () (S1
-                            (LET* ((%CLOS-MI-CLASS 'CLASS-25)
-                                   (%CLOS-MAKE-INSTANCE-TMP
-                                    (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                   (%CLOS-MI-INITARGS
-                                    (LIST :ALLOW-OTHER-KEYS T :ALLOW-OTHER-KEYS
-                                          NIL))
-                                   (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                               %CLOS-MI-INITARGS)
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (CONS %CLOS-MAKE-INSTANCE-TMP
-                                     (CONS T %CLOS-MI-INITARGS)))
-                              %CLOS-MAKE-INSTANCE-TMP))) 'T) (t (c) (%test-crash-fail-c 26986 c)))
+                            (%MAKE-INSTANCE-LIST
+                             (LIST 'CLASS-25 :ALLOW-OTHER-KEYS T
+                                   :ALLOW-OTHER-KEYS NIL)))) 'T) (t (c) (%test-crash-fail-c 26986 c)))
   (handler-case (run-test 26987 (lambda () (S1
-                            (LET* ((%CLOS-MI-CLASS 'CLASS-25)
-                                   (%CLOS-MAKE-INSTANCE-TMP
-                                    (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                   (%CLOS-MI-INITARGS
-                                    (LIST :ALLOW-OTHER-KEYS T :ALLOW-OTHER-KEYS
-                                          NIL :FOO T))
-                                   (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                               %CLOS-MI-INITARGS)
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (CONS %CLOS-MAKE-INSTANCE-TMP
-                                     (CONS T %CLOS-MI-INITARGS)))
-                              %CLOS-MAKE-INSTANCE-TMP))) 'T) (t (c) (%test-crash-fail-c 26987 c)))
+                            (%MAKE-INSTANCE-LIST
+                             (LIST 'CLASS-25 :ALLOW-OTHER-KEYS T
+                                   :ALLOW-OTHER-KEYS NIL :FOO T)))) 'T) (t (c) (%test-crash-fail-c 26987 c)))
   (handler-case (run-test 26988 (lambda () (S1
-                            (LET* ((%CLOS-MI-CLASS 'CLASS-25)
-                                   (%CLOS-MAKE-INSTANCE-TMP
-                                    (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                   (%CLOS-MI-INITARGS
-                                    (LIST :ALLOW-OTHER-KEYS 'FOO
-                                          :ALLOW-OTHER-KEYS 'BAR))
-                                   (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                               %CLOS-MI-INITARGS)
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (CONS %CLOS-MAKE-INSTANCE-TMP
-                                     (CONS T %CLOS-MI-INITARGS)))
-                              %CLOS-MAKE-INSTANCE-TMP))) 'FOO) (t (c) (%test-crash-fail-c 26988 c)))
+                            (%MAKE-INSTANCE-LIST
+                             (LIST 'CLASS-25 :ALLOW-OTHER-KEYS 'FOO
+                                   :ALLOW-OTHER-KEYS 'BAR)))) 'FOO) (t (c) (%test-crash-fail-c 26988 c)))
   (handler-case (run-test-mv 26989 (lambda () (multiple-value-list (LET ((C
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-26))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-26))))
                                                      (VALUES
                                                       (SLOT-BOUNDP C 'S1-26)
                                                       (SETF (S1-26 C) 'X)
@@ -161271,19 +159593,8 @@ NIL
                                                                              T
                                                                              T)) (t (c) (%test-crash-fail-c 26990 c)))
   (handler-case (run-test-mv 26991 (lambda () (multiple-value-list (LET ((C
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-27))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-27))))
                                                      (VALUES
                                                       (SLOT-BOUNDP* C 'A)
                                                       (SLOT-VALUE C 'B)
@@ -161295,28 +159606,9 @@ NIL
 )
 (defun run-ansi-defclass-01-chunk-12 ()
   (handler-case (run-test-mv 26992 (lambda () (multiple-value-list (LET ((C
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CLASS-27)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :C 26
-                                                                        :D 43))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-27 :C
+                                                                 26 :D 43))))
                                                      (VALUES
                                                       (SLOT-BOUNDP* C 'A)
                                                       (SLOT-VALUE C 'B)
@@ -161329,15 +159621,8 @@ NIL
                              (FUNCALL *CLASS-28-RESET-FN* 5 10)
                              (LIST (FUNCALL *CLASS-28-QUERY-FN*)
                                    (LET ((OBJ
-                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                 (%MAKE-INSTANCE 'CLASS-28))
-                                                (*CLOS-APPLYING-DEFAULTS* T))
-                                            (DECLARE
-                                             (SPECIAL
-                                              *CLOS-APPLYING-DEFAULTS*))
-                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                             (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                          (%MAKE-INSTANCE-LIST
+                                           (LIST 'CLASS-28))))
                                      (LIST (TYPEP* OBJ 'CLASS-28)
                                            (TYPEP* OBJ CLASS)
                                            (EQT (CLASS-OF OBJ) CLASS)
@@ -161355,22 +159640,8 @@ NIL
                              (FUNCALL *CLASS-28-RESET-FN* 5 10)
                              (LIST (FUNCALL *CLASS-28-QUERY-FN*)
                                    (LET ((OBJ
-                                          (LET* ((%CLOS-MI-CLASS 'CLASS-28)
-                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                  (%MAKE-INSTANCE
-                                                   %CLOS-MI-CLASS))
-                                                 (%CLOS-MI-INITARGS
-                                                  (LIST :S1 17))
-                                                 (*CLOS-APPLYING-DEFAULTS* T))
-                                            (DECLARE
-                                             (SPECIAL
-                                              *CLOS-APPLYING-DEFAULTS*))
-                                            (%CLOS-VALIDATE-INITARGS-D
-                                             %CLOS-MI-CLASS %CLOS-MI-INITARGS)
-                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                             (CONS %CLOS-MAKE-INSTANCE-TMP
-                                                   (CONS T %CLOS-MI-INITARGS)))
-                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                          (%MAKE-INSTANCE-LIST
+                                           (LIST 'CLASS-28 :S1 17))))
                                      (LIST (TYPEP* OBJ 'CLASS-28)
                                            (TYPEP* OBJ CLASS)
                                            (EQT (CLASS-OF OBJ) CLASS)
@@ -161388,22 +159659,8 @@ NIL
                              (FUNCALL *CLASS-28-RESET-FN* 5 10)
                              (LIST (FUNCALL *CLASS-28-QUERY-FN*)
                                    (LET ((OBJ
-                                          (LET* ((%CLOS-MI-CLASS 'CLASS-28)
-                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                  (%MAKE-INSTANCE
-                                                   %CLOS-MI-CLASS))
-                                                 (%CLOS-MI-INITARGS
-                                                  (LIST :S2 17))
-                                                 (*CLOS-APPLYING-DEFAULTS* T))
-                                            (DECLARE
-                                             (SPECIAL
-                                              *CLOS-APPLYING-DEFAULTS*))
-                                            (%CLOS-VALIDATE-INITARGS-D
-                                             %CLOS-MI-CLASS %CLOS-MI-INITARGS)
-                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                             (CONS %CLOS-MAKE-INSTANCE-TMP
-                                                   (CONS T %CLOS-MI-INITARGS)))
-                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                          (%MAKE-INSTANCE-LIST
+                                           (LIST 'CLASS-28 :S2 17))))
                                      (LIST (TYPEP* OBJ 'CLASS-28)
                                            (TYPEP* OBJ CLASS)
                                            (EQT (CLASS-OF OBJ) CLASS)
@@ -161952,19 +160209,8 @@ NIL
 )
 (defun run-ansi-defclass-02-chunk-1 ()
   (handler-case (run-test-mv 26996 (lambda () (multiple-value-list (LET ((C
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-0201))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-0201))))
                                                      (VALUES
                                                       (MAP-SLOT-BOUNDP* C
                                                        '(A B C))
@@ -161991,19 +160237,8 @@ NIL
                                                                             NIL)
                                                                            CLASS-0201)) (t (c) (%test-crash-fail-c 26996 c)))
   (handler-case (run-test-mv 26997 (lambda () (multiple-value-list (LET ((C
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-0202))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-0202))))
                                                      (VALUES
                                                       (MAP-SLOT-BOUNDP* C
                                                        '(A B C D E F))
@@ -162029,33 +160264,11 @@ NIL
                                                                             T)
                                                                            CLASS-0202)) (t (c) (%test-crash-fail-c 26997 c)))
   (handler-case (run-test-mv 26998 (lambda () (multiple-value-list (LET ((C1
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-0203))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-0203)))
                                                          (C2
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-0204))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-0204))))
                                                      (VALUES
                                                       (MAP-SLOT-BOUNDP* C1
                                                        '(A B))
@@ -162094,33 +160307,11 @@ NIL
                                                                           NIL
                                                                           NIL))) (t (c) (%test-crash-fail-c 26998 c)))
   (handler-case (run-test-mv 26999 (lambda () (multiple-value-list (LET ((C1
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-0203))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-0203)))
                                                          (C2
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-0204))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-0204))))
                                                      (VALUES
                                                       (MAP-SLOT-BOUNDP* C1
                                                        '(A B))
@@ -162159,63 +160350,25 @@ NIL
                                                                           NIL
                                                                           NIL))) (t (c) (%test-crash-fail-c 26999 c)))
   (handler-case (run-test-mv 27000 (lambda () (multiple-value-list (LET ((C
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-0205A))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CLASS-0205A))))
                                                      (VALUES (SLOT-VALUE C 'A)
                                                              (SLOT-VALUE C 'B)
                                                              (SLOT-BOUNDP C
                                                                           'C))))) '(X
                                                                                     Y
                                                                                     NIL)) (t (c) (%test-crash-fail-c 27000 c)))
-  (handler-case (run-test 27001 (lambda () (LET ((C
-                                  (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                         (%MAKE-INSTANCE 'CLASS-0205B))
-                                        (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+  (handler-case (run-test 27001 (lambda () (LET ((C (%MAKE-INSTANCE-LIST (LIST 'CLASS-0205B))))
                              (MAP-SLOT-VALUE C '(A B C)))) '(Z Y W)) (t (c) (%test-crash-fail-c 27001 c)))
   (handler-case (run-test-mv 27002 (lambda () (multiple-value-list (LET ((C1
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-0206A))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CLASS-0206A)))
                                                          (C2
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-0206B))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CLASS-0206B))))
                                                      (VALUES
                                                       (MAP-SLOT-BOUNDP* C1
                                                        '(A B))
@@ -162253,47 +160406,17 @@ NIL
                                                                   (T T) (X Y)
                                                                   NIL)) (t (c) (%test-crash-fail-c 27002 c)))
   (handler-case (run-test-mv 27003 (lambda () (multiple-value-list (LET ((C1
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-0207A))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CLASS-0207A)))
                                                          (C2
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-0207B))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CLASS-0207B)))
                                                          (C3
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-0207C))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CLASS-0207C))))
                                                      (SLOT-MAKUNBOUND C1 'A)
                                                      (SLOT-MAKUNBOUND C2 'A)
                                                      (SLOT-MAKUNBOUND C3 'A)
@@ -162337,34 +160460,12 @@ NIL
 (defun run-ansi-defclass-02-chunk-2 ()
   (handler-case (run-test-mv 27004 (lambda () (multiple-value-list (VALUES
                                                     (SLOT-VALUE
-                                                     (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                            (%MAKE-INSTANCE
-                                                             'CLASS-0208A))
-                                                           (*CLOS-APPLYING-DEFAULTS*
-                                                            T))
-                                                       (DECLARE
-                                                        (SPECIAL
-                                                         *CLOS-APPLYING-DEFAULTS*))
-                                                       (%SHARED-INIT-DEFAULT-SPREAD
-                                                        (LIST
-                                                         %CLOS-MAKE-INSTANCE-TMP
-                                                         T))
-                                                       %CLOS-MAKE-INSTANCE-TMP)
+                                                     (%MAKE-INSTANCE-LIST
+                                                      (LIST 'CLASS-0208A))
                                                      'A)
                                                     (SLOT-VALUE
-                                                     (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                            (%MAKE-INSTANCE
-                                                             'CLASS-0208B))
-                                                           (*CLOS-APPLYING-DEFAULTS*
-                                                            T))
-                                                       (DECLARE
-                                                        (SPECIAL
-                                                         *CLOS-APPLYING-DEFAULTS*))
-                                                       (%SHARED-INIT-DEFAULT-SPREAD
-                                                        (LIST
-                                                         %CLOS-MAKE-INSTANCE-TMP
-                                                         T))
-                                                       %CLOS-MAKE-INSTANCE-TMP)
+                                                     (%MAKE-INSTANCE-LIST
+                                                      (LIST 'CLASS-0208B))
                                                      'A)))) '(X X)) (t (c) (%test-crash-fail-c 27004 c)))
   (handler-case (run-test-mv 27005 (lambda () (multiple-value-list (LET* ((COBJ1
                                                            (PROGN
@@ -162451,34 +160552,14 @@ NIL
                                                              (CLASS-NAME COBJ1)
                                                              (CLASS-NAME COBJ2)
                                                              (SLOT-VALUE
-                                                              (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                     (%MAKE-INSTANCE
-                                                                      'CLASS-0209A))
-                                                                    (*CLOS-APPLYING-DEFAULTS*
-                                                                     T))
-                                                                (DECLARE
-                                                                 (SPECIAL
-                                                                  *CLOS-APPLYING-DEFAULTS*))
-                                                                (%SHARED-INIT-DEFAULT-SPREAD
-                                                                 (LIST
-                                                                  %CLOS-MAKE-INSTANCE-TMP
-                                                                  T))
-                                                                %CLOS-MAKE-INSTANCE-TMP)
+                                                              (%MAKE-INSTANCE-LIST
+                                                               (LIST
+                                                                'CLASS-0209A))
                                                               'A)
                                                              (SLOT-VALUE
-                                                              (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                     (%MAKE-INSTANCE
-                                                                      'CLASS-0209B))
-                                                                    (*CLOS-APPLYING-DEFAULTS*
-                                                                     T))
-                                                                (DECLARE
-                                                                 (SPECIAL
-                                                                  *CLOS-APPLYING-DEFAULTS*))
-                                                                (%SHARED-INIT-DEFAULT-SPREAD
-                                                                 (LIST
-                                                                  %CLOS-MAKE-INSTANCE-TMP
-                                                                  T))
-                                                                %CLOS-MAKE-INSTANCE-TMP)
+                                                              (%MAKE-INSTANCE-LIST
+                                                               (LIST
+                                                                'CLASS-0209B))
                                                               'A))))) '(T T
                                                                         CLASS-0209A
                                                                         CLASS-0209B
@@ -162524,31 +160605,10 @@ NIL
                                   (DUMMY
                                    (PROGN
                                     (SET-SLOT-VALUE
-                                     (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                            (%MAKE-INSTANCE 'CLASS-0210A))
-                                           (*CLOS-APPLYING-DEFAULTS* T))
-                                       (DECLARE
-                                        (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                       (%SHARED-INIT-DEFAULT-SPREAD
-                                        (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                       %CLOS-MAKE-INSTANCE-TMP)
+                                     (%MAKE-INSTANCE-LIST (LIST 'CLASS-0210A))
                                      'A :BAD1)
-                                    (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                           (%MAKE-INSTANCE 'CLASS-0210B))
-                                          (*CLOS-APPLYING-DEFAULTS* T))
-                                      (DECLARE
-                                       (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                      (%SHARED-INIT-DEFAULT-SPREAD
-                                       (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                      %CLOS-MAKE-INSTANCE-TMP)
-                                    (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                           (%MAKE-INSTANCE 'CLASS-0210C))
-                                          (*CLOS-APPLYING-DEFAULTS* T))
-                                      (DECLARE
-                                       (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                      (%SHARED-INIT-DEFAULT-SPREAD
-                                       (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                      %CLOS-MAKE-INSTANCE-TMP)
+                                    (%MAKE-INSTANCE-LIST (LIST 'CLASS-0210B))
+                                    (%MAKE-INSTANCE-LIST (LIST 'CLASS-0210C))
                                     NIL))
                                   (COBJ4
                                    (PROGN
@@ -162592,35 +160652,14 @@ NIL
                                    (EQT COBJ3 COBJ6) (CLASS-NAME COBJ1)
                                    (CLASS-NAME COBJ2) (CLASS-NAME COBJ3)
                                    (LET ((C1
-                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                 (%MAKE-INSTANCE 'CLASS-0210A))
-                                                (*CLOS-APPLYING-DEFAULTS* T))
-                                            (DECLARE
-                                             (SPECIAL
-                                              *CLOS-APPLYING-DEFAULTS*))
-                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                             (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                            %CLOS-MAKE-INSTANCE-TMP))
+                                          (%MAKE-INSTANCE-LIST
+                                           (LIST 'CLASS-0210A)))
                                          (C2
-                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                 (%MAKE-INSTANCE 'CLASS-0210B))
-                                                (*CLOS-APPLYING-DEFAULTS* T))
-                                            (DECLARE
-                                             (SPECIAL
-                                              *CLOS-APPLYING-DEFAULTS*))
-                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                             (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                            %CLOS-MAKE-INSTANCE-TMP))
+                                          (%MAKE-INSTANCE-LIST
+                                           (LIST 'CLASS-0210B)))
                                          (C3
-                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                 (%MAKE-INSTANCE 'CLASS-0210C))
-                                                (*CLOS-APPLYING-DEFAULTS* T))
-                                            (DECLARE
-                                             (SPECIAL
-                                              *CLOS-APPLYING-DEFAULTS*))
-                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                             (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                          (%MAKE-INSTANCE-LIST
+                                           (LIST 'CLASS-0210C))))
                                      (SLOT-MAKUNBOUND C1 'A)
                                      (SLOT-MAKUNBOUND C2 'A)
                                      (SLOT-MAKUNBOUND C3 'A)
@@ -162750,92 +160789,31 @@ NIL
                                                              (CLASS-NAME COBJ1)
                                                              (CLASS-NAME COBJ2)
                                                              (SLOT-VALUE
-                                                              (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                     (%MAKE-INSTANCE
-                                                                      'CLASS-REDEF-03A))
-                                                                    (*CLOS-APPLYING-DEFAULTS*
-                                                                     T))
-                                                                (DECLARE
-                                                                 (SPECIAL
-                                                                  *CLOS-APPLYING-DEFAULTS*))
-                                                                (%SHARED-INIT-DEFAULT-SPREAD
-                                                                 (LIST
-                                                                  %CLOS-MAKE-INSTANCE-TMP
-                                                                  T))
-                                                                %CLOS-MAKE-INSTANCE-TMP)
+                                                              (%MAKE-INSTANCE-LIST
+                                                               (LIST
+                                                                'CLASS-REDEF-03A))
                                                               'A)
                                                              (SLOT-VALUE
-                                                              (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                     (%MAKE-INSTANCE
-                                                                      'CLASS-REDEF-03B))
-                                                                    (*CLOS-APPLYING-DEFAULTS*
-                                                                     T))
-                                                                (DECLARE
-                                                                 (SPECIAL
-                                                                  *CLOS-APPLYING-DEFAULTS*))
-                                                                (%SHARED-INIT-DEFAULT-SPREAD
-                                                                 (LIST
-                                                                  %CLOS-MAKE-INSTANCE-TMP
-                                                                  T))
-                                                                %CLOS-MAKE-INSTANCE-TMP)
+                                                              (%MAKE-INSTANCE-LIST
+                                                               (LIST
+                                                                'CLASS-REDEF-03B))
                                                               'A))))) '(T T
                                                                         CLASS-REDEF-03A
                                                                         CLASS-REDEF-03B
                                                                         X X)) (t (c) (%test-crash-fail-c 27007 c)))
   (handler-case (run-test-mv 27008 (lambda () (multiple-value-list (VALUES
                                                     (SLOT-VALUE
-                                                     (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                            (%MAKE-INSTANCE
-                                                             'CLASS-0211A))
-                                                           (*CLOS-APPLYING-DEFAULTS*
-                                                            T))
-                                                       (DECLARE
-                                                        (SPECIAL
-                                                         *CLOS-APPLYING-DEFAULTS*))
-                                                       (%SHARED-INIT-DEFAULT-SPREAD
-                                                        (LIST
-                                                         %CLOS-MAKE-INSTANCE-TMP
-                                                         T))
-                                                       %CLOS-MAKE-INSTANCE-TMP)
+                                                     (%MAKE-INSTANCE-LIST
+                                                      (LIST 'CLASS-0211A))
                                                      'A)
                                                     (SLOT-VALUE
-                                                     (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                            (%MAKE-INSTANCE
-                                                             'CLASS-0211B))
-                                                           (*CLOS-APPLYING-DEFAULTS*
-                                                            T))
-                                                       (DECLARE
-                                                        (SPECIAL
-                                                         *CLOS-APPLYING-DEFAULTS*))
-                                                       (%SHARED-INIT-DEFAULT-SPREAD
-                                                        (LIST
-                                                         %CLOS-MAKE-INSTANCE-TMP
-                                                         T))
-                                                       %CLOS-MAKE-INSTANCE-TMP)
+                                                     (%MAKE-INSTANCE-LIST
+                                                      (LIST 'CLASS-0211B))
                                                      'A)))) '(X X)) (t (c) (%test-crash-fail-c 27008 c)))
   (handler-case (run-test-mv 27009 (lambda () (multiple-value-list (LET ((C
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CLASS-0212A)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A1
-                                                                        'X))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-0212A
+                                                                 :A1 'X))))
                                                      (VALUES
                                                       (TYPEP* C 'CLASS-0212A)
                                                       (TYPEP* C 'CLASS-0212B)
@@ -162845,28 +160823,9 @@ NIL
                                                                                  X
                                                                                  NIL)) (t (c) (%test-crash-fail-c 27009 c)))
   (handler-case (run-test-mv 27010 (lambda () (multiple-value-list (LET ((C
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CLASS-0212B)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A1
-                                                                        'X))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-0212B
+                                                                 :A1 'X))))
                                                      (VALUES
                                                       (TYPEP* C 'CLASS-0212A)
                                                       (TYPEP* C 'CLASS-0212B)
@@ -162876,28 +160835,10 @@ NIL
                                                                                 X
                                                                                 NIL)) (t (c) (%test-crash-fail-c 27010 c)))
   (handler-case (run-test-mv 27011 (lambda () (multiple-value-list (LET ((C
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CLASS-0212B)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A2 'X
-                                                                        :B 'Y))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-0212B
+                                                                 :A2 'X :B
+                                                                 'Y))))
                                                      (VALUES
                                                       (TYPEP* C 'CLASS-0212A)
                                                       (TYPEP* C 'CLASS-0212B)
@@ -162909,29 +160850,10 @@ NIL
 )
 (defun run-ansi-defclass-02-chunk-3 ()
   (handler-case (run-test-mv 27012 (lambda () (multiple-value-list (LET ((C
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CLASS-0212B)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A1 'Z
-                                                                        :A2 'X
-                                                                        :B 'Y))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-0212B
+                                                                 :A1 'Z :A2 'X
+                                                                 :B 'Y))))
                                                      (VALUES
                                                       (TYPEP* C 'CLASS-0212A)
                                                       (TYPEP* C 'CLASS-0212B)
@@ -162941,30 +160863,10 @@ NIL
                                                                               Z
                                                                               Y)) (t (c) (%test-crash-fail-c 27012 c)))
   (handler-case (run-test-mv 27013 (lambda () (multiple-value-list (LET ((C
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CLASS-0212B)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A2 'X
-                                                                        :B 'Y
-                                                                        :A1
-                                                                        'Z))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-0212B
+                                                                 :A2 'X :B 'Y
+                                                                 :A1 'Z))))
                                                      (VALUES
                                                       (TYPEP* C 'CLASS-0212A)
                                                       (TYPEP* C 'CLASS-0212B)
@@ -162974,28 +160876,9 @@ NIL
                                                                               X
                                                                               Y)) (t (c) (%test-crash-fail-c 27013 c)))
   (handler-case (run-test-mv 27014 (lambda () (multiple-value-list (LET ((C
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CLASS-0213A)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A1
-                                                                        'X))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-0213A
+                                                                 :A1 'X))))
                                                      (VALUES
                                                       (TYPEP* C 'CLASS-0213A)
                                                       (TYPEP* C 'CLASS-0213B)
@@ -163005,28 +160888,9 @@ NIL
                                                                                  X
                                                                                  NIL)) (t (c) (%test-crash-fail-c 27014 c)))
   (handler-case (run-test-mv 27015 (lambda () (multiple-value-list (LET ((C
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CLASS-0213B)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A1
-                                                                        'X))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-0213B
+                                                                 :A1 'X))))
                                                      (VALUES
                                                       (TYPEP* C 'CLASS-0213A)
                                                       (TYPEP* C 'CLASS-0213B)
@@ -163036,28 +160900,9 @@ NIL
                                                                                 X
                                                                                 NIL)) (t (c) (%test-crash-fail-c 27015 c)))
   (handler-case (run-test-mv 27016 (lambda () (multiple-value-list (LET ((C
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CLASS-0214A)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A1
-                                                                        'X))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-0214A
+                                                                 :A1 'X))))
                                                      (VALUES
                                                       (TYPEP* C 'CLASS-0214A)
                                                       (TYPEP* C 'CLASS-0214B)
@@ -163067,28 +160912,9 @@ NIL
                                                                                  X
                                                                                  NIL)) (t (c) (%test-crash-fail-c 27016 c)))
   (handler-case (run-test-mv 27017 (lambda () (multiple-value-list (LET ((C
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CLASS-0214B)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A1
-                                                                        'Y))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-0214B
+                                                                 :A1 'Y))))
                                                      (VALUES
                                                       (TYPEP* C 'CLASS-0214A)
                                                       (TYPEP* C 'CLASS-0214B)
@@ -163098,28 +160924,9 @@ NIL
                                                                                 Y
                                                                                 NIL)) (t (c) (%test-crash-fail-c 27017 c)))
   (handler-case (run-test-mv 27018 (lambda () (multiple-value-list (LET ((C
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CLASS-0215A)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A1
-                                                                        'X))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-0215A
+                                                                 :A1 'X))))
                                                      (VALUES
                                                       (TYPEP* C 'CLASS-0215A)
                                                       (TYPEP* C 'CLASS-0215B)
@@ -163127,28 +160934,9 @@ NIL
                                                                               NIL
                                                                               X)) (t (c) (%test-crash-fail-c 27018 c)))
   (handler-case (run-test-mv 27019 (lambda () (multiple-value-list (LET ((C
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CLASS-0215B)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A1
-                                                                        'Y))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-0215B
+                                                                 :A1 'Y))))
                                                      (VALUES
                                                       (TYPEP* C 'CLASS-0215A)
                                                       (TYPEP* C 'CLASS-0215B)
@@ -163158,19 +160946,9 @@ NIL
 )
 (defun run-ansi-defclass-02-chunk-4 ()
   (handler-case (run-test-mv 27020 (lambda () (multiple-value-list (LET ((C
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-0216A))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CLASS-0216A))))
                                                      (VALUES
                                                       (TYPEP* C 'CLASS-0216A)
                                                       (TYPEP* C 'CLASS-0216B)
@@ -163180,19 +160958,9 @@ NIL
                                                                                NIL
                                                                                NIL)) (t (c) (%test-crash-fail-c 27020 c)))
   (handler-case (run-test-mv 27021 (lambda () (multiple-value-list (LET ((C
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-0216B))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CLASS-0216B))))
                                                      (VALUES
                                                       (TYPEP* C 'CLASS-0216A)
                                                       (TYPEP* C 'CLASS-0216B)
@@ -163202,19 +160970,9 @@ NIL
                                                                                X
                                                                                NIL)) (t (c) (%test-crash-fail-c 27021 c)))
   (handler-case (run-test-mv 27022 (lambda () (multiple-value-list (LET ((C
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-0217A))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CLASS-0217A))))
                                                      (VALUES
                                                       (MAP-SLOT-BOUNDP* C
                                                        '(A B C D))
@@ -163223,29 +160981,10 @@ NIL
                                                                       NIL)
                                                                      (10 20))) (t (c) (%test-crash-fail-c 27022 c)))
   (handler-case (run-test-mv 27023 (lambda () (multiple-value-list (LET ((C
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CLASS-0217A)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A1 'X
-                                                                        :C1
-                                                                        'Y))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-0217A
+                                                                 :A1 'X :C1
+                                                                 'Y))))
                                                      (VALUES
                                                       (MAP-SLOT-BOUNDP* C
                                                        '(A B C D))
@@ -163254,19 +160993,9 @@ NIL
                                                                         NIL)
                                                                        (X 20 Y))) (t (c) (%test-crash-fail-c 27023 c)))
   (handler-case (run-test-mv 27024 (lambda () (multiple-value-list (LET ((C
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-0217B))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CLASS-0217B))))
                                                      (VALUES
                                                       (MAP-SLOT-BOUNDP* C
                                                        '(A B C D))
@@ -163276,29 +161005,10 @@ NIL
                                                                        (30 20
                                                                         40))) (t (c) (%test-crash-fail-c 27024 c)))
   (handler-case (run-test-mv 27025 (lambda () (multiple-value-list (LET ((C
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'CLASS-0217B)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A1 'X
-                                                                        :D1
-                                                                        'Y))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST 'CLASS-0217B
+                                                                 :A1 'X :D1
+                                                                 'Y))))
                                                      (VALUES
                                                       (MAP-SLOT-BOUNDP* C
                                                        '(A B C D))
@@ -163307,25 +161017,9 @@ NIL
                                                                           T)
                                                                          (X 20
                                                                           40 Y))) (t (c) (%test-crash-fail-c 27025 c)))
-  (handler-case (run-test 27026 (lambda () (LET ((C
-                                  (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                         (%MAKE-INSTANCE 'CLASS-0218A))
-                                        (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+  (handler-case (run-test 27026 (lambda () (LET ((C (%MAKE-INSTANCE-LIST (LIST 'CLASS-0218A))))
                              (SLOT-VALUE C 'A))) 'X) (t (c) (%test-crash-fail-c 27026 c)))
-  (handler-case (run-test 27027 (lambda () (LET ((C
-                                  (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                         (%MAKE-INSTANCE 'CLASS-0218B))
-                                        (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+  (handler-case (run-test 27027 (lambda () (LET ((C (%MAKE-INSTANCE-LIST (LIST 'CLASS-0218B))))
                              (SLOT-VALUE C 'A))) 'X) (t (c) (%test-crash-fail-c 27027 c)))
 )
 (defun run-ansi-defclass-02-chunk-5 ()
@@ -163335,19 +161029,8 @@ NIL
                                                        *CLASS-0219-A-1*))
                                                      (VALUES
                                                       (SLOT-VALUE
-                                                       (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                              (%MAKE-INSTANCE
-                                                               'CLASS-0219A))
-                                                             (*CLOS-APPLYING-DEFAULTS*
-                                                              T))
-                                                         (DECLARE
-                                                          (SPECIAL
-                                                           *CLOS-APPLYING-DEFAULTS*))
-                                                         (%SHARED-INIT-DEFAULT-SPREAD
-                                                          (LIST
-                                                           %CLOS-MAKE-INSTANCE-TMP
-                                                           T))
-                                                         %CLOS-MAKE-INSTANCE-TMP)
+                                                       (%MAKE-INSTANCE-LIST
+                                                        (LIST 'CLASS-0219A))
                                                        'A)
                                                       *CLASS-0219-A-1*)))) '(X
                                                                              X)) (t (c) (%test-crash-fail-c 27028 c)))
@@ -163358,80 +161041,21 @@ NIL
                                                        *CLASS-0219-A-2*))
                                                      (VALUES
                                                       (SLOT-VALUE
-                                                       (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                              (%MAKE-INSTANCE
-                                                               'CLASS-0219B))
-                                                             (*CLOS-APPLYING-DEFAULTS*
-                                                              T))
-                                                         (DECLARE
-                                                          (SPECIAL
-                                                           *CLOS-APPLYING-DEFAULTS*))
-                                                         (%SHARED-INIT-DEFAULT-SPREAD
-                                                          (LIST
-                                                           %CLOS-MAKE-INSTANCE-TMP
-                                                           T))
-                                                         %CLOS-MAKE-INSTANCE-TMP)
+                                                       (%MAKE-INSTANCE-LIST
+                                                        (LIST 'CLASS-0219B))
                                                        'A)
                                                       *CLASS-0219-A-1*
                                                       *CLASS-0219-A-2*)))) '(Y
                                                                              NIL
                                                                              Y)) (t (c) (%test-crash-fail-c 27029 c)))
   (handler-case (run-test 27030 (lambda () (SLOT-VALUE
-                            (LET* ((%CLOS-MI-CLASS 'CLASS-0220A)
-                                   (%CLOS-MAKE-INSTANCE-TMP
-                                    (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                   (%CLOS-MI-INITARGS (LIST :A 10))
-                                   (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                               %CLOS-MI-INITARGS)
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (CONS %CLOS-MAKE-INSTANCE-TMP
-                                     (CONS T %CLOS-MI-INITARGS)))
-                              %CLOS-MAKE-INSTANCE-TMP)
-                            'A)) '10) (t (c) (%test-crash-fail-c 27030 c)))
+                            (%MAKE-INSTANCE-LIST (LIST 'CLASS-0220A :A 10)) 'A)) '10) (t (c) (%test-crash-fail-c 27030 c)))
   (handler-case (run-test 27031 (lambda () (SLOT-VALUE
-                            (LET* ((%CLOS-MI-CLASS 'CLASS-0220A)
-                                   (%CLOS-MAKE-INSTANCE-TMP
-                                    (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                   (%CLOS-MI-INITARGS (LIST :A 0))
-                                   (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                               %CLOS-MI-INITARGS)
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (CONS %CLOS-MAKE-INSTANCE-TMP
-                                     (CONS T %CLOS-MI-INITARGS)))
-                              %CLOS-MAKE-INSTANCE-TMP)
-                            'A)) '0) (t (c) (%test-crash-fail-c 27031 c)))
+                            (%MAKE-INSTANCE-LIST (LIST 'CLASS-0220A :A 0)) 'A)) '0) (t (c) (%test-crash-fail-c 27031 c)))
   (handler-case (run-test 27032 (lambda () (SLOT-VALUE
-                            (LET* ((%CLOS-MI-CLASS 'CLASS-0220B)
-                                   (%CLOS-MAKE-INSTANCE-TMP
-                                    (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                   (%CLOS-MI-INITARGS (LIST :A 0))
-                                   (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                               %CLOS-MI-INITARGS)
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (CONS %CLOS-MAKE-INSTANCE-TMP
-                                     (CONS T %CLOS-MI-INITARGS)))
-                              %CLOS-MAKE-INSTANCE-TMP)
-                            'A)) '0) (t (c) (%test-crash-fail-c 27032 c)))
+                            (%MAKE-INSTANCE-LIST (LIST 'CLASS-0220B :A 0)) 'A)) '0) (t (c) (%test-crash-fail-c 27032 c)))
   (handler-case (run-test 27033 (lambda () (SLOT-VALUE
-                            (LET* ((%CLOS-MI-CLASS 'CLASS-0220B)
-                                   (%CLOS-MAKE-INSTANCE-TMP
-                                    (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                   (%CLOS-MI-INITARGS (LIST :A 5))
-                                   (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                               %CLOS-MI-INITARGS)
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (CONS %CLOS-MAKE-INSTANCE-TMP
-                                     (CONS T %CLOS-MI-INITARGS)))
-                              %CLOS-MAKE-INSTANCE-TMP)
-                            'A)) '5) (t (c) (%test-crash-fail-c 27033 c)))
+                            (%MAKE-INSTANCE-LIST (LIST 'CLASS-0220B :A 5)) 'A)) '5) (t (c) (%test-crash-fail-c 27033 c)))
   (handler-case (run-test 27034 (lambda () (LET* ((CL (FIND-CLASS 'CLASS-0221A))
                                   (DOC (DOCUMENTATION CL T)))
                              (OR (NULL DOC)
@@ -163446,19 +161070,9 @@ NIL
                              (OR (NULL DOC)
                                  (EQUALT DOC "This is class class-0221c")))) 'T) (t (c) (%test-crash-fail-c 27036 c)))
   (handler-case (run-test-mv 27037 (lambda () (multiple-value-list (LET ((C
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-0222A))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CLASS-0222A))))
                                                      (VALUES (S1-W 'X C)
                                                              (S1-R C)
                                                              (S1-ACC C)
@@ -163468,19 +161082,9 @@ NIL
                                                                             X Y
                                                                             Y)) (t (c) (%test-crash-fail-c 27037 c)))
   (handler-case (run-test-mv 27038 (lambda () (multiple-value-list (LET ((C
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-0222B))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CLASS-0222B))))
                                                      (VALUES (S1-W 'X C)
                                                              (S1-R C)
                                                              (S1-ACC C)
@@ -163490,19 +161094,9 @@ NIL
                                                                             X Y
                                                                             Y)) (t (c) (%test-crash-fail-c 27038 c)))
   (handler-case (run-test-mv 27039 (lambda () (multiple-value-list (LET ((C
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-0223B))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CLASS-0223B))))
                                                      (VALUES
                                                       (SET-SLOT-VALUE C 'S1 'X)
                                                       (SET-SLOT-VALUE C 'S2 'Y)
@@ -163956,19 +161550,9 @@ NIL
 )
 (defun run-ansi-defclass-03-chunk-1 ()
   (handler-case (run-test-mv 27040 (lambda () (multiple-value-list (LET ((C
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-0301C))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CLASS-0301C))))
                                                      (VALUES
                                                       (TYPEP* C 'CLASS-0301A)
                                                       (TYPEP* C 'CLASS-0301B)
@@ -164004,19 +161588,9 @@ NIL
                                                                          (W X Y
                                                                           Z))) (t (c) (%test-crash-fail-c 27040 c)))
   (handler-case (run-test-mv 27041 (lambda () (multiple-value-list (LET ((C
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-0302C))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CLASS-0302C))))
                                                      (VALUES
                                                       (MAP-SLOT-BOUNDP* C
                                                        '(A B C D))
@@ -164025,47 +161599,17 @@ NIL
                                                                         NIL)
                                                                        (X Z V))) (t (c) (%test-crash-fail-c 27041 c)))
   (handler-case (run-test-mv 27042 (lambda () (multiple-value-list (LET ((C1
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-0303A))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CLASS-0303A)))
                                                          (C2
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-0303B))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CLASS-0303B)))
                                                          (C3
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'CLASS-0303C))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'CLASS-0303C))))
                                                      (SLOT-MAKUNBOUND C1 'A)
                                                      (SLOT-MAKUNBOUND C2 'B)
                                                      (VALUES
@@ -164138,23 +161682,9 @@ NIL
                                                                                   Y2
                                                                                   Y3))) (t (c) (%test-crash-fail-c 27042 c)))
   (handler-case (run-test 27043 (lambda () (SLOT-VALUE
-                            (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                   (%MAKE-INSTANCE 'CLASS-0304D))
-                                  (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                              %CLOS-MAKE-INSTANCE-TMP)
-                            'A)) 'Y) (t (c) (%test-crash-fail-c 27043 c)))
+                            (%MAKE-INSTANCE-LIST (LIST 'CLASS-0304D)) 'A)) 'Y) (t (c) (%test-crash-fail-c 27043 c)))
   (handler-case (run-test 27044 (lambda () (SLOT-VALUE
-                            (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                   (%MAKE-INSTANCE 'CLASS-0305D))
-                                  (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                              %CLOS-MAKE-INSTANCE-TMP)
-                            'A)) 'Y) (t (c) (%test-crash-fail-c 27044 c)))
+                            (%MAKE-INSTANCE-LIST (LIST 'CLASS-0305D)) 'A)) 'Y) (t (c) (%test-crash-fail-c 27044 c)))
   (handler-case (run-test 27045 (lambda () (LOOP FOR OBJ IN (MAPCAR #'MAKE-INSTANCE
                                                     '(CLASS-0306A CLASS-0306B
                                                       CLASS-0306C CLASS-0306D
@@ -164208,14 +161738,7 @@ NIL
                               (LIST))
                              (FIND-CLASS 'CLASS-0307B NIL))
                             (SLOT-VALUE
-                             (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                    (%MAKE-INSTANCE 'CLASS-0307B))
-                                   (*CLOS-APPLYING-DEFAULTS* T))
-                               (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                               (%SHARED-INIT-DEFAULT-SPREAD
-                                (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                               %CLOS-MAKE-INSTANCE-TMP)
-                             'A))) 'X) (t (c) (%test-crash-fail-c 27047 c)))
+                             (%MAKE-INSTANCE-LIST (LIST 'CLASS-0307B)) 'A))) 'X) (t (c) (%test-crash-fail-c 27047 c)))
 )
 (defun run-ansi-defclass-03-chunk-2 ()
   (handler-case (run-test 27048 (lambda () (PROGN
@@ -164258,18 +161781,7 @@ NIL
                               (LIST))
                              (FIND-CLASS 'CLASS-0308B NIL))
                             (SLOT-VALUE
-                             (LET* ((%CLOS-MI-CLASS 'CLASS-0308B)
-                                    (%CLOS-MAKE-INSTANCE-TMP
-                                     (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                    (%CLOS-MI-INITARGS (LIST :A 'X))
-                                    (*CLOS-APPLYING-DEFAULTS* T))
-                               (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                               (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                                %CLOS-MI-INITARGS)
-                               (%SHARED-INIT-DEFAULT-SPREAD
-                                (CONS %CLOS-MAKE-INSTANCE-TMP
-                                      (CONS T %CLOS-MI-INITARGS)))
-                               %CLOS-MAKE-INSTANCE-TMP)
+                             (%MAKE-INSTANCE-LIST (LIST 'CLASS-0308B :A 'X))
                              'A))) 'X) (t (c) (%test-crash-fail-c 27048 c)))
   (handler-case (run-test-mv 27049 (lambda () (multiple-value-list (PROGN
                                                     (SETF (FIND-CLASS
@@ -164295,19 +161807,9 @@ NIL
                                                               'CLASS-0309
                                                               NIL)))
                                                            (OBJ1
-                                                            (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    'CLASS-0309))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                              (DECLARE
-                                                               (SPECIAL
-                                                                *CLOS-APPLYING-DEFAULTS*))
-                                                              (%SHARED-INIT-DEFAULT-SPREAD
-                                                               (LIST
-                                                                %CLOS-MAKE-INSTANCE-TMP
-                                                                T))
-                                                              %CLOS-MAKE-INSTANCE-TMP)))
+                                                            (%MAKE-INSTANCE-LIST
+                                                             (LIST
+                                                              'CLASS-0309))))
                                                       (SETF (CLASS-NAME CLASS1)
                                                               NIL)
                                                       (LET ((CLASS2
@@ -164366,19 +161868,9 @@ NIL
                                                               'CLASS-0310A
                                                               NIL)))
                                                            (OBJ1
-                                                            (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    'CLASS-0310A))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                              (DECLARE
-                                                               (SPECIAL
-                                                                *CLOS-APPLYING-DEFAULTS*))
-                                                              (%SHARED-INIT-DEFAULT-SPREAD
-                                                               (LIST
-                                                                %CLOS-MAKE-INSTANCE-TMP
-                                                                T))
-                                                              %CLOS-MAKE-INSTANCE-TMP)))
+                                                            (%MAKE-INSTANCE-LIST
+                                                             (LIST
+                                                              'CLASS-0310A))))
                                                       (SETF (CLASS-NAME CLASS1)
                                                               'CLASS-0310B)
                                                       (LET ((CLASS2
@@ -164438,19 +161930,9 @@ NIL
                                                               'CLASS-0311
                                                               NIL)))
                                                            (OBJ1
-                                                            (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    'CLASS-0311))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                              (DECLARE
-                                                               (SPECIAL
-                                                                *CLOS-APPLYING-DEFAULTS*))
-                                                              (%SHARED-INIT-DEFAULT-SPREAD
-                                                               (LIST
-                                                                %CLOS-MAKE-INSTANCE-TMP
-                                                                T))
-                                                              %CLOS-MAKE-INSTANCE-TMP)))
+                                                            (%MAKE-INSTANCE-LIST
+                                                             (LIST
+                                                              'CLASS-0311))))
                                                       (SETF (FIND-CLASS
                                                              'CLASS-0311)
                                                               NIL)
@@ -164906,29 +162388,11 @@ NIL
                                      (IF (NOT (TYPEP CLASS2 'CLASS))
                                          2
                                          (LET ((I1
-                                                (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                       (%MAKE-INSTANCE C1))
-                                                      (*CLOS-APPLYING-DEFAULTS*
-                                                       T))
-                                                  (DECLARE
-                                                   (SPECIAL
-                                                    *CLOS-APPLYING-DEFAULTS*))
-                                                  (%SHARED-INIT-DEFAULT-SPREAD
-                                                   (LIST
-                                                    %CLOS-MAKE-INSTANCE-TMP T))
-                                                  %CLOS-MAKE-INSTANCE-TMP))
+                                                (%MAKE-INSTANCE-LIST
+                                                 (LIST C1)))
                                                (I2
-                                                (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                       (%MAKE-INSTANCE C2))
-                                                      (*CLOS-APPLYING-DEFAULTS*
-                                                       T))
-                                                  (DECLARE
-                                                   (SPECIAL
-                                                    *CLOS-APPLYING-DEFAULTS*))
-                                                  (%SHARED-INIT-DEFAULT-SPREAD
-                                                   (LIST
-                                                    %CLOS-MAKE-INSTANCE-TMP T))
-                                                  %CLOS-MAKE-INSTANCE-TMP)))
+                                                (%MAKE-INSTANCE-LIST
+                                                 (LIST C2))))
                                            (COND ((NOT (TYPEP I1 C1)) 3)
                                                  ((NOT (TYPEP I1 CLASS1)) 4)
                                                  ((NOT (TYPEP I1 C2)) 5)
@@ -164983,47 +162447,14 @@ NIL
                                            (IF (NOT (TYPEP CLASS3 'CLASS))
                                                3
                                                (LET ((I1
-                                                      (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                             (%MAKE-INSTANCE
-                                                              C1))
-                                                            (*CLOS-APPLYING-DEFAULTS*
-                                                             T))
-                                                        (DECLARE
-                                                         (SPECIAL
-                                                          *CLOS-APPLYING-DEFAULTS*))
-                                                        (%SHARED-INIT-DEFAULT-SPREAD
-                                                         (LIST
-                                                          %CLOS-MAKE-INSTANCE-TMP
-                                                          T))
-                                                        %CLOS-MAKE-INSTANCE-TMP))
+                                                      (%MAKE-INSTANCE-LIST
+                                                       (LIST C1)))
                                                      (I2
-                                                      (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                             (%MAKE-INSTANCE
-                                                              C2))
-                                                            (*CLOS-APPLYING-DEFAULTS*
-                                                             T))
-                                                        (DECLARE
-                                                         (SPECIAL
-                                                          *CLOS-APPLYING-DEFAULTS*))
-                                                        (%SHARED-INIT-DEFAULT-SPREAD
-                                                         (LIST
-                                                          %CLOS-MAKE-INSTANCE-TMP
-                                                          T))
-                                                        %CLOS-MAKE-INSTANCE-TMP))
+                                                      (%MAKE-INSTANCE-LIST
+                                                       (LIST C2)))
                                                      (I3
-                                                      (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                             (%MAKE-INSTANCE
-                                                              C3))
-                                                            (*CLOS-APPLYING-DEFAULTS*
-                                                             T))
-                                                        (DECLARE
-                                                         (SPECIAL
-                                                          *CLOS-APPLYING-DEFAULTS*))
-                                                        (%SHARED-INIT-DEFAULT-SPREAD
-                                                         (LIST
-                                                          %CLOS-MAKE-INSTANCE-TMP
-                                                          T))
-                                                        %CLOS-MAKE-INSTANCE-TMP)))
+                                                      (%MAKE-INSTANCE-LIST
+                                                       (LIST C3))))
                                                  (COND ((NOT (TYPEP I1 C1)) 4)
                                                        ((NOT (TYPEP I1 CLASS1))
                                                         5)
@@ -165093,47 +162524,14 @@ NIL
                                            (IF (NOT (TYPEP CLASS3 'CLASS))
                                                3
                                                (LET ((I1
-                                                      (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                             (%MAKE-INSTANCE
-                                                              C1))
-                                                            (*CLOS-APPLYING-DEFAULTS*
-                                                             T))
-                                                        (DECLARE
-                                                         (SPECIAL
-                                                          *CLOS-APPLYING-DEFAULTS*))
-                                                        (%SHARED-INIT-DEFAULT-SPREAD
-                                                         (LIST
-                                                          %CLOS-MAKE-INSTANCE-TMP
-                                                          T))
-                                                        %CLOS-MAKE-INSTANCE-TMP))
+                                                      (%MAKE-INSTANCE-LIST
+                                                       (LIST C1)))
                                                      (I2
-                                                      (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                             (%MAKE-INSTANCE
-                                                              C2))
-                                                            (*CLOS-APPLYING-DEFAULTS*
-                                                             T))
-                                                        (DECLARE
-                                                         (SPECIAL
-                                                          *CLOS-APPLYING-DEFAULTS*))
-                                                        (%SHARED-INIT-DEFAULT-SPREAD
-                                                         (LIST
-                                                          %CLOS-MAKE-INSTANCE-TMP
-                                                          T))
-                                                        %CLOS-MAKE-INSTANCE-TMP))
+                                                      (%MAKE-INSTANCE-LIST
+                                                       (LIST C2)))
                                                      (I3
-                                                      (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                             (%MAKE-INSTANCE
-                                                              C3))
-                                                            (*CLOS-APPLYING-DEFAULTS*
-                                                             T))
-                                                        (DECLARE
-                                                         (SPECIAL
-                                                          *CLOS-APPLYING-DEFAULTS*))
-                                                        (%SHARED-INIT-DEFAULT-SPREAD
-                                                         (LIST
-                                                          %CLOS-MAKE-INSTANCE-TMP
-                                                          T))
-                                                        %CLOS-MAKE-INSTANCE-TMP)))
+                                                      (%MAKE-INSTANCE-LIST
+                                                       (LIST C3))))
                                                  (COND ((NOT (TYPEP I1 C1)) 4)
                                                        ((NOT (TYPEP I1 CLASS1))
                                                         5)
@@ -165233,14 +162631,7 @@ NIL
                                     (%REGISTER-CLOS-DEFAULT-INITARGS ',C3
                                      (LIST))
                                     (FIND-CLASS ',C3 NIL))
-                                   (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                          (%MAKE-INSTANCE ',C1))
-                                         (*CLOS-APPLYING-DEFAULTS* T))
-                                     (DECLARE
-                                      (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                     (%SHARED-INIT-DEFAULT-SPREAD
-                                      (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                     %CLOS-MAKE-INSTANCE-TMP)))
+                                   (%MAKE-INSTANCE-LIST (LIST ',C1))))
                                 (ERROR NIL :GOOD))))) ':GOOD) (t (c) (%test-crash-fail-c 27079 c)))
 )
 (defun run-ansi-defclass-forward-reference ()
@@ -165860,64 +163251,24 @@ NIL
                                                        FN))
                                                      (VALUES
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-01))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-01)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-02))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-02)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-03))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-03)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-04))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP)))))) '(A
-                                                                                                 NIL
-                                                                                                 A
-                                                                                                 NIL)) (t (c) (%test-crash-fail-c 27086 c)))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-04))))))) '(A
+                                                                                         NIL
+                                                                                         A
+                                                                                         NIL)) (t (c) (%test-crash-fail-c 27086 c)))
   (handler-case (run-test-mv 27087 (lambda () (multiple-value-list (LET ((FN
                                                           (PROGN
                                                            (%VALIDATE-DEFGENERIC-OPTIONS
@@ -166774,69 +164125,29 @@ NIL
                                                        FN))
                                                      (VALUES
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-01))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-01)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-02))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-02)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-03))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-03)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-04))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP)))))) '((D)
-                                                                                                 (C
-                                                                                                  D)
-                                                                                                 (B
-                                                                                                  D)
-                                                                                                 (A
-                                                                                                  C
-                                                                                                  B
-                                                                                                  D))) (t (c) (%test-crash-fail-c 27098 c)))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-04))))))) '((D)
+                                                                                         (C
+                                                                                          D)
+                                                                                         (B
+                                                                                          D)
+                                                                                         (A
+                                                                                          C
+                                                                                          B
+                                                                                          D))) (t (c) (%test-crash-fail-c 27098 c)))
   (handler-case (run-test-mv 27099 (lambda () (multiple-value-list (LET ((FN
                                                           (PROGN
                                                            (%VALIDATE-DEFGENERIC-OPTIONS
@@ -167060,80 +164371,25 @@ NIL
                                                       'DG-MC.APPEND.13))
                                                     (VALUES
                                                      (DG-MC.APPEND.13
-                                                      (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                             (%MAKE-INSTANCE
-                                                              'DGMC-CLASS-01))
-                                                            (*CLOS-APPLYING-DEFAULTS*
-                                                             T))
-                                                        (DECLARE
-                                                         (SPECIAL
-                                                          *CLOS-APPLYING-DEFAULTS*))
-                                                        (%SHARED-INIT-DEFAULT-SPREAD
-                                                         (LIST
-                                                          %CLOS-MAKE-INSTANCE-TMP
-                                                          T))
-                                                        %CLOS-MAKE-INSTANCE-TMP))
+                                                      (%MAKE-INSTANCE-LIST
+                                                       (LIST 'DGMC-CLASS-01)))
                                                      (DG-MC.APPEND.13
-                                                      (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                             (%MAKE-INSTANCE
-                                                              'DGMC-CLASS-02))
-                                                            (*CLOS-APPLYING-DEFAULTS*
-                                                             T))
-                                                        (DECLARE
-                                                         (SPECIAL
-                                                          *CLOS-APPLYING-DEFAULTS*))
-                                                        (%SHARED-INIT-DEFAULT-SPREAD
-                                                         (LIST
-                                                          %CLOS-MAKE-INSTANCE-TMP
-                                                          T))
-                                                        %CLOS-MAKE-INSTANCE-TMP))
+                                                      (%MAKE-INSTANCE-LIST
+                                                       (LIST 'DGMC-CLASS-02)))
                                                      (HANDLER-CASE
                                                       (DG-MC.APPEND.13
-                                                       (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                              (%MAKE-INSTANCE
-                                                               'DGMC-CLASS-03))
-                                                             (*CLOS-APPLYING-DEFAULTS*
-                                                              T))
-                                                         (DECLARE
-                                                          (SPECIAL
-                                                           *CLOS-APPLYING-DEFAULTS*))
-                                                         (%SHARED-INIT-DEFAULT-SPREAD
-                                                          (LIST
-                                                           %CLOS-MAKE-INSTANCE-TMP
-                                                           T))
-                                                         %CLOS-MAKE-INSTANCE-TMP))
+                                                       (%MAKE-INSTANCE-LIST
+                                                        (LIST 'DGMC-CLASS-03)))
                                                       (ERROR NIL :CAUGHT))
                                                      (HANDLER-CASE
                                                       (DG-MC.APPEND.13
-                                                       (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                              (%MAKE-INSTANCE
-                                                               'DGMC-CLASS-04))
-                                                             (*CLOS-APPLYING-DEFAULTS*
-                                                              T))
-                                                         (DECLARE
-                                                          (SPECIAL
-                                                           *CLOS-APPLYING-DEFAULTS*))
-                                                         (%SHARED-INIT-DEFAULT-SPREAD
-                                                          (LIST
-                                                           %CLOS-MAKE-INSTANCE-TMP
-                                                           T))
-                                                         %CLOS-MAKE-INSTANCE-TMP))
+                                                       (%MAKE-INSTANCE-LIST
+                                                        (LIST 'DGMC-CLASS-04)))
                                                       (ERROR NIL :CAUGHT))
                                                      (HANDLER-CASE
                                                       (DG-MC.APPEND.13
-                                                       (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                              (%MAKE-INSTANCE
-                                                               'DGMC-CLASS-07))
-                                                             (*CLOS-APPLYING-DEFAULTS*
-                                                              T))
-                                                         (DECLARE
-                                                          (SPECIAL
-                                                           *CLOS-APPLYING-DEFAULTS*))
-                                                         (%SHARED-INIT-DEFAULT-SPREAD
-                                                          (LIST
-                                                           %CLOS-MAKE-INSTANCE-TMP
-                                                           T))
-                                                         %CLOS-MAKE-INSTANCE-TMP))
+                                                       (%MAKE-INSTANCE-LIST
+                                                        (LIST 'DGMC-CLASS-07)))
                                                       (ERROR NIL :CAUGHT)))))) '((FOO)
                                                                                  (BAR
                                                                                   FOO)
@@ -167906,69 +165162,29 @@ NIL
                                                        FN))
                                                      (VALUES
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-01))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-01)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-02))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-02)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-03))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-03)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-04))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP)))))) '((D)
-                                                                                                 (C
-                                                                                                  D)
-                                                                                                 (B
-                                                                                                  D)
-                                                                                                 (A
-                                                                                                  C
-                                                                                                  B
-                                                                                                  D))) (t (c) (%test-crash-fail-c 27111 c)))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-04))))))) '((D)
+                                                                                         (C
+                                                                                          D)
+                                                                                         (B
+                                                                                          D)
+                                                                                         (A
+                                                                                          C
+                                                                                          B
+                                                                                          D))) (t (c) (%test-crash-fail-c 27111 c)))
   (handler-case (run-test-mv 27112 (lambda () (multiple-value-list (LET ((FN
                                                           (PROGN
                                                            (%VALIDATE-DEFGENERIC-OPTIONS
@@ -168750,64 +165966,24 @@ NIL
                                                        FN))
                                                      (VALUES
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-01))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-01)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-02))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-02)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-03))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-03)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-04))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP)))))) '(1
-                                                                                                 5
-                                                                                                 3
-                                                                                                 5)) (t (c) (%test-crash-fail-c 27123 c)))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-04))))))) '(1
+                                                                                         5
+                                                                                         3
+                                                                                         5)) (t (c) (%test-crash-fail-c 27123 c)))
   (handler-case (run-test-mv 27124 (lambda () (multiple-value-list (LET ((FN
                                                           (PROGN
                                                            (%VALIDATE-DEFGENERIC-OPTIONS
@@ -169587,64 +166763,24 @@ NIL
                                                        FN))
                                                      (VALUES
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-01))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-01)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-02))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-02)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-03))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-03)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-04))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP)))))) '(8
-                                                                                                 4
-                                                                                                 2
-                                                                                                 1)) (t (c) (%test-crash-fail-c 27135 c)))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-04))))))) '(8
+                                                                                         4
+                                                                                         2
+                                                                                         1)) (t (c) (%test-crash-fail-c 27135 c)))
   (handler-case (run-test-mv 27136 (lambda () (multiple-value-list (LET ((FN
                                                           (PROGN
                                                            (%VALIDATE-DEFGENERIC-OPTIONS
@@ -170529,69 +167665,29 @@ NIL
                                                        FN))
                                                      (VALUES
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-01))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-01)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-02))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-02)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-03))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-03)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-04))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP)))))) '((D)
-                                                                                                 (C
-                                                                                                  D)
-                                                                                                 (B
-                                                                                                  D)
-                                                                                                 (A
-                                                                                                  C
-                                                                                                  B
-                                                                                                  D))) (t (c) (%test-crash-fail-c 27147 c)))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-04))))))) '((D)
+                                                                                         (C
+                                                                                          D)
+                                                                                         (B
+                                                                                          D)
+                                                                                         (A
+                                                                                          C
+                                                                                          B
+                                                                                          D))) (t (c) (%test-crash-fail-c 27147 c)))
   (handler-case (run-test-mv 27148 (lambda () (multiple-value-list (LET ((FN
                                                           (PROGN
                                                            (%VALIDATE-DEFGENERIC-OPTIONS
@@ -171367,64 +168463,24 @@ NIL
                                                        FN))
                                                      (VALUES
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-01))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-01)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-02))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-02)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-03))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-03)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-04))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP)))))) '(C
-                                                                                                 B
-                                                                                                 C
-                                                                                                 B)) (t (c) (%test-crash-fail-c 27159 c)))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-04))))))) '(C
+                                                                                         B
+                                                                                         C
+                                                                                         B)) (t (c) (%test-crash-fail-c 27159 c)))
   (handler-case (run-test-mv 27160 (lambda () (multiple-value-list (LET ((FN
                                                           (PROGN
                                                            (%VALIDATE-DEFGENERIC-OPTIONS
@@ -172197,64 +169253,24 @@ NIL
                                                        FN))
                                                      (VALUES
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-01))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-01)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-02))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-02)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-03))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-03)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-04))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP)))))) '(8
-                                                                                                 12
-                                                                                                 10
-                                                                                                 15)) (t (c) (%test-crash-fail-c 27171 c)))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-04))))))) '(8
+                                                                                         12
+                                                                                         10
+                                                                                         15)) (t (c) (%test-crash-fail-c 27171 c)))
   (handler-case (run-test-mv 27172 (lambda () (multiple-value-list (LET ((FN
                                                           (PROGN
                                                            (%VALIDATE-DEFGENERIC-OPTIONS
@@ -173317,64 +170333,24 @@ NIL
                                                        FN))
                                                      (VALUES
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-01))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-01)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-02))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-02)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-03))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-03)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-04))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP)))))) '(D
-                                                                                                 D
-                                                                                                 D
-                                                                                                 D)) (t (c) (%test-crash-fail-c 27186 c)))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-04))))))) '(D
+                                                                                         D
+                                                                                         D
+                                                                                         D)) (t (c) (%test-crash-fail-c 27186 c)))
   (handler-case (run-test-mv 27187 (lambda () (multiple-value-list (LET ((FN
                                                           (PROGN
                                                            (%VALIDATE-DEFGENERIC-OPTIONS
@@ -173447,64 +170423,24 @@ NIL
                                                        FN))
                                                      (VALUES
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-01))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-01)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-02))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-02)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-03))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-03)))
                                                       (FUNCALL FN
-                                                               (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       'DGMC-CLASS-04))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                 (DECLARE
-                                                                  (SPECIAL
-                                                                   *CLOS-APPLYING-DEFAULTS*))
-                                                                 (%SHARED-INIT-DEFAULT-SPREAD
-                                                                  (LIST
-                                                                   %CLOS-MAKE-INSTANCE-TMP
-                                                                   T))
-                                                                 %CLOS-MAKE-INSTANCE-TMP)))))) '(D
-                                                                                                 C
-                                                                                                 B
-                                                                                                 A)) (t (c) (%test-crash-fail-c 27187 c)))
+                                                               (%MAKE-INSTANCE-LIST
+                                                                (LIST
+                                                                 'DGMC-CLASS-04))))))) '(D
+                                                                                         C
+                                                                                         B
+                                                                                         A)) (t (c) (%test-crash-fail-c 27187 c)))
   (handler-case (run-test-mv 27188 (lambda () (multiple-value-list (LET ((FN
                                                           (PROGN
                                                            (%VALIDATE-DEFGENERIC-OPTIONS
@@ -176249,19 +173185,9 @@ NIL
                                                      (DECLARE
                                                       (TYPE FUNCTION FN))
                                                      (LET ((X
-                                                            (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    'DEFGENERIC.29.CLASS.3))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                              (DECLARE
-                                                               (SPECIAL
-                                                                *CLOS-APPLYING-DEFAULTS*))
-                                                              (%SHARED-INIT-DEFAULT-SPREAD
-                                                               (LIST
-                                                                %CLOS-MAKE-INSTANCE-TMP
-                                                                T))
-                                                              %CLOS-MAKE-INSTANCE-TMP)))
+                                                            (%MAKE-INSTANCE-LIST
+                                                             (LIST
+                                                              'DEFGENERIC.29.CLASS.3))))
                                                        (VALUES (FUNCALL FN X)
                                                                (FUNCALL FN X
                                                                         :FOO
@@ -177671,21 +174597,9 @@ NIL
 )
 (defun run-ansi-define-method-combination-chunk-2 ()
   (handler-case (run-test 27284 (lambda () (DMC-GF-04
-                            (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                   (%MAKE-INSTANCE 'DMC-CLASS-01H))
-                                  (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                              %CLOS-MAKE-INSTANCE-TMP))) '30) (t (c) (%test-crash-fail-c 27284 c)))
+                            (%MAKE-INSTANCE-LIST (LIST 'DMC-CLASS-01H)))) '30) (t (c) (%test-crash-fail-c 27284 c)))
   (handler-case (run-test 27285 (lambda () (DMC-GF-04
-                            (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                   (%MAKE-INSTANCE 'DMC-CLASS-01E))
-                                  (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                              %CLOS-MAKE-INSTANCE-TMP))) '6) (t (c) (%test-crash-fail-c 27285 c)))
+                            (%MAKE-INSTANCE-LIST (LIST 'DMC-CLASS-01E)))) '6) (t (c) (%test-crash-fail-c 27285 c)))
   (handler-case (run-test 27286 (lambda () (DMC-GF-04 'A)) 'NIL) (t (c) (%test-crash-fail-c 27286 c)))
   (handler-case (run-test-mv 27287 (lambda () (multiple-value-list (LET* ((DOC1
                                                            (SETF (DOCUMENTATION
@@ -179046,19 +175960,8 @@ NIL
                                                              (%DG-GF-CALLABLE
                                                               'FIND-CLASS-GF-01)))
                                                            (OBJ
-                                                            (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    CLASS1))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                              (DECLARE
-                                                               (SPECIAL
-                                                                *CLOS-APPLYING-DEFAULTS*))
-                                                              (%SHARED-INIT-DEFAULT-SPREAD
-                                                               (LIST
-                                                                %CLOS-MAKE-INSTANCE-TMP
-                                                                T))
-                                                              %CLOS-MAKE-INSTANCE-TMP)))
+                                                            (%MAKE-INSTANCE-LIST
+                                                             (LIST CLASS1))))
                                                       (ASSERT
                                                        (TYPEP FN 'FUNCTION))
                                                       (LOCALLY
@@ -179174,33 +176077,11 @@ NIL
                                                              (%DG-GF-CALLABLE
                                                               'FIND-CLASS-GF-02)))
                                                            (OBJ1
-                                                            (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    CLASS1))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                              (DECLARE
-                                                               (SPECIAL
-                                                                *CLOS-APPLYING-DEFAULTS*))
-                                                              (%SHARED-INIT-DEFAULT-SPREAD
-                                                               (LIST
-                                                                %CLOS-MAKE-INSTANCE-TMP
-                                                                T))
-                                                              %CLOS-MAKE-INSTANCE-TMP))
+                                                            (%MAKE-INSTANCE-LIST
+                                                             (LIST CLASS1)))
                                                            (OBJ2
-                                                            (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    CLASS2))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                              (DECLARE
-                                                               (SPECIAL
-                                                                *CLOS-APPLYING-DEFAULTS*))
-                                                              (%SHARED-INIT-DEFAULT-SPREAD
-                                                               (LIST
-                                                                %CLOS-MAKE-INSTANCE-TMP
-                                                                T))
-                                                              %CLOS-MAKE-INSTANCE-TMP)))
+                                                            (%MAKE-INSTANCE-LIST
+                                                             (LIST CLASS2))))
                                                       (ASSERT
                                                        (TYPEP FN 'FUNCTION))
                                                       (LOCALLY
@@ -179488,51 +176369,20 @@ NIL
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 27375 c)))
   (handler-case (run-test 27376 (lambda () (HANDLER-CASE
                             (PROGN
-                             (LET* ((%CLOS-MI-CLASS 'MAKE-INSTANCE-CLASS-01)
-                                    (%CLOS-MAKE-INSTANCE-TMP
-                                     (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                    (%CLOS-MI-INITARGS (LIST :A))
-                                    (*CLOS-APPLYING-DEFAULTS* T))
-                               (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                               (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                                %CLOS-MI-INITARGS)
-                               (%SHARED-INIT-DEFAULT-SPREAD
-                                (CONS %CLOS-MAKE-INSTANCE-TMP
-                                      (CONS T %CLOS-MI-INITARGS)))
-                               %CLOS-MAKE-INSTANCE-TMP)
+                             (%MAKE-INSTANCE-LIST
+                              (LIST 'MAKE-INSTANCE-CLASS-01 :A))
                              NIL)
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 27376 c)))
   (handler-case (run-test 27377 (lambda () (HANDLER-CASE
                             (PROGN
-                             (LET* ((%CLOS-MI-CLASS 'MAKE-INSTANCE-CLASS-01)
-                                    (%CLOS-MAKE-INSTANCE-TMP
-                                     (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                    (%CLOS-MI-INITARGS (LIST :Z 1))
-                                    (*CLOS-APPLYING-DEFAULTS* T))
-                               (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                               (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                                %CLOS-MI-INITARGS)
-                               (%SHARED-INIT-DEFAULT-SPREAD
-                                (CONS %CLOS-MAKE-INSTANCE-TMP
-                                      (CONS T %CLOS-MI-INITARGS)))
-                               %CLOS-MAKE-INSTANCE-TMP)
+                             (%MAKE-INSTANCE-LIST
+                              (LIST 'MAKE-INSTANCE-CLASS-01 :Z 1))
                              T)
                             (ERROR NIL :GOOD))) ':GOOD) (t (c) (%test-crash-fail-c 27377 c)))
   (handler-case (run-test 27378 (lambda () (HANDLER-CASE
                             (PROGN
-                             (LET* ((%CLOS-MI-CLASS
-                                     (FIND-CLASS 'MAKE-INSTANCE-CLASS-01))
-                                    (%CLOS-MAKE-INSTANCE-TMP
-                                     (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                    (%CLOS-MI-INITARGS (LIST :Z 1))
-                                    (*CLOS-APPLYING-DEFAULTS* T))
-                               (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                               (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                                %CLOS-MI-INITARGS)
-                               (%SHARED-INIT-DEFAULT-SPREAD
-                                (CONS %CLOS-MAKE-INSTANCE-TMP
-                                      (CONS T %CLOS-MI-INITARGS)))
-                               %CLOS-MAKE-INSTANCE-TMP)
+                             (%MAKE-INSTANCE-LIST
+                              (LIST (FIND-CLASS 'MAKE-INSTANCE-CLASS-01) :Z 1))
                              T)
                             (ERROR NIL :GOOD))) ':GOOD) (t (c) (%test-crash-fail-c 27378 c)))
   (handler-case (run-test 27379 (lambda () (HANDLER-CASE
@@ -179546,90 +176396,34 @@ NIL
                                  UNLESS (EVAL
                                          `(HANDLER-CASE
                                            (PROGN
-                                            (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                   (%MAKE-INSTANCE ',CL))
-                                                  (*CLOS-APPLYING-DEFAULTS* T))
-                                              (DECLARE
-                                               (SPECIAL
-                                                *CLOS-APPLYING-DEFAULTS*))
-                                              (%SHARED-INIT-DEFAULT-SPREAD
-                                               (LIST %CLOS-MAKE-INSTANCE-TMP
-                                                     T))
-                                              %CLOS-MAKE-INSTANCE-TMP)
+                                            (%MAKE-INSTANCE-LIST (LIST ',CL))
                                             NIL)
                                            (ERROR (C) T)))
                                  COLLECT CL)) 'NIL) (t (c) (%test-crash-fail-c 27380 c)))
-  (handler-case (run-test 27381 (lambda () (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                  (%MAKE-INSTANCE
-                                   (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                          (%MAKE-INSTANCE
-                                           'MAKE-INSTANCE-CLASS-01))
-                                         (*CLOS-APPLYING-DEFAULTS* T))
-                                     (DECLARE
-                                      (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                     (%SHARED-INIT-DEFAULT-SPREAD
-                                      (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                     %CLOS-MAKE-INSTANCE-TMP)))
-                                 (*CLOS-APPLYING-DEFAULTS* T))
-                             (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                             (%SHARED-INIT-DEFAULT-SPREAD
-                              (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                             %CLOS-MAKE-INSTANCE-TMP)) 'NIL) (t (c) (%test-crash-fail-c 27381 c)))
-  (handler-case (run-test 27382 (lambda () (LET* ((%CLOS-MI-CLASS
-                                   (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                          (%MAKE-INSTANCE
-                                           'MAKE-INSTANCE-CLASS-01))
-                                         (*CLOS-APPLYING-DEFAULTS* T))
-                                     (DECLARE
-                                      (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                     (%SHARED-INIT-DEFAULT-SPREAD
-                                      (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                     %CLOS-MAKE-INSTANCE-TMP))
-                                  (%CLOS-MAKE-INSTANCE-TMP
-                                   (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                  (%CLOS-MI-INITARGS (LIST :A 1 :B 2))
-                                  (*CLOS-APPLYING-DEFAULTS* T))
-                             (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                             (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                              %CLOS-MI-INITARGS)
-                             (%SHARED-INIT-DEFAULT-SPREAD
-                              (CONS %CLOS-MAKE-INSTANCE-TMP
-                                    (CONS T %CLOS-MI-INITARGS)))
-                             %CLOS-MAKE-INSTANCE-TMP)) '(:A 1 :B 2)) (t (c) (%test-crash-fail-c 27382 c)))
+  (handler-case (run-test 27381 (lambda () (%MAKE-INSTANCE-LIST
+                            (LIST
+                             (%MAKE-INSTANCE-LIST
+                              (LIST 'MAKE-INSTANCE-CLASS-01))))) 'NIL) (t (c) (%test-crash-fail-c 27381 c)))
+  (handler-case (run-test 27382 (lambda () (%MAKE-INSTANCE-LIST
+                            (LIST
+                             (%MAKE-INSTANCE-LIST
+                              (LIST 'MAKE-INSTANCE-CLASS-01))
+                             :A 1 :B 2))) '(:A 1 :B 2)) (t (c) (%test-crash-fail-c 27382 c)))
 )
 (defun run-ansi-make-instance-chunk-2 ()
   (handler-case (run-test-mv 27383 (lambda () (multiple-value-list (LET* ((I 0)
                                                           X
                                                           Y
                                                           (OBJ
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'MAKE-INSTANCE-CLASS-01)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :A
-                                                                         (SETF X
-                                                                                 (INCF
-                                                                                  I))
-                                                                         :B
-                                                                         (SETF Y
-                                                                                 (INCF
-                                                                                  I))))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST
+                                                             'MAKE-INSTANCE-CLASS-01
+                                                             :A
+                                                             (SETF X (INCF I))
+                                                             :B
+                                                             (SETF Y
+                                                                     (INCF
+                                                                      I))))))
                                                      (VALUES
                                                       (MAP-SLOT-VALUE OBJ
                                                        '(A B))
@@ -179640,42 +176434,19 @@ NIL
                                                           Z
                                                           W
                                                           (OBJ
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'MAKE-INSTANCE-CLASS-01)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :A
-                                                                         (SETF X
-                                                                                 (INCF
-                                                                                  I))
-                                                                         :B
-                                                                         (SETF Y
-                                                                                 (INCF
-                                                                                  I))
-                                                                         :B
-                                                                         (SETF Z
-                                                                                 (INCF
-                                                                                  I))
-                                                                         :A
-                                                                         (SETF W
-                                                                                 (INCF
-                                                                                  I))))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST
+                                                             'MAKE-INSTANCE-CLASS-01
+                                                             :A
+                                                             (SETF X (INCF I))
+                                                             :B
+                                                             (SETF Y (INCF I))
+                                                             :B
+                                                             (SETF Z (INCF I))
+                                                             :A
+                                                             (SETF W
+                                                                     (INCF
+                                                                      I))))))
                                                      (VALUES
                                                       (MAP-SLOT-VALUE OBJ
                                                        '(A B))
@@ -179688,46 +176459,23 @@ NIL
                                                           Z
                                                           W
                                                           (OBJ
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   (PROG1
-                                                                       'MAKE-INSTANCE-CLASS-01
-                                                                     (SETF U
-                                                                             (INCF
-                                                                              I))))
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :A
-                                                                         (SETF X
-                                                                                 (INCF
-                                                                                  I))
-                                                                         :B
-                                                                         (SETF Y
-                                                                                 (INCF
-                                                                                  I))
-                                                                         :B
-                                                                         (SETF Z
-                                                                                 (INCF
-                                                                                  I))
-                                                                         :A
-                                                                         (SETF W
-                                                                                 (INCF
-                                                                                  I))))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST
+                                                             (PROG1
+                                                                 'MAKE-INSTANCE-CLASS-01
+                                                               (SETF U
+                                                                       (INCF
+                                                                        I)))
+                                                             :A
+                                                             (SETF X (INCF I))
+                                                             :B
+                                                             (SETF Y (INCF I))
+                                                             :B
+                                                             (SETF Z (INCF I))
+                                                             :A
+                                                             (SETF W
+                                                                     (INCF
+                                                                      I))))))
                                                      (VALUES
                                                       (MAP-SLOT-VALUE OBJ
                                                        '(A B))
@@ -179771,31 +176519,10 @@ NIL
                                                            (FIND-CLASS
                                                             CLASS-DESIGNATOR))
                                                           (OBJ
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   CLASS)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :A 'X
-                                                                         :B 'Y
-                                                                         :C 'Z
-                                                                         :D
-                                                                         17))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST CLASS :A 'X
+                                                                  :B 'Y :C 'Z
+                                                                  :D 17))))
                                                      (VALUES
                                                       (EQT (CLASS-OF OBJ)
                                                        CLASS)
@@ -179821,31 +176548,10 @@ NIL
                                                            (FIND-CLASS
                                                             CLASS-DESIGNATOR))
                                                           (OBJ
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   CLASS)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :A 'X
-                                                                         :B 'Y
-                                                                         :C 'Z
-                                                                         :D
-                                                                         17))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP)))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST CLASS :A 'X
+                                                                  :B 'Y :C 'Z
+                                                                  :D 17))))
                                                      (VALUES
                                                       (EQT (CLASS-OF OBJ)
                                                        CLASS)
@@ -179948,19 +176654,8 @@ NIL
                                                                  NEWOBJ))))))) '(2
                                                                                  T)) (t (c) (%test-crash-fail-c 27391 c)))
   (handler-case (run-test-mv 27392 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   'MLFSS-02))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (LIST
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               T))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'MLFSS-02)))
                                                           (FORMS
                                                            (MULTIPLE-VALUE-LIST
                                                             (MAKE-LOAD-FORM-SAVING-SLOTS
@@ -179984,31 +176679,10 @@ NIL
                                                                                   NIL
                                                                                   NIL))) (t (c) (%test-crash-fail-c 27392 c)))
   (handler-case (run-test-mv 27393 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'MLFSS-02)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :A 1
-                                                                         :B 'A
-                                                                         :C
-                                                                         '(X Y
-                                                                           Z)))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'MLFSS-02 :A
+                                                                  1 :B 'A :C
+                                                                  '(X Y Z))))
                                                           (FORMS
                                                            (MULTIPLE-VALUE-LIST
                                                             (MAKE-LOAD-FORM-SAVING-SLOTS
@@ -180041,29 +176715,9 @@ NIL
                                                                                    Y
                                                                                    Z)))) (t (c) (%test-crash-fail-c 27393 c)))
   (handler-case (run-test-mv 27394 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'MLFSS-02)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :A
-                                                                         #(X Y
-                                                                           Z)))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'MLFSS-02 :A
+                                                                  #(X Y Z))))
                                                           (FORMS
                                                            (MULTIPLE-VALUE-LIST
                                                             (MAKE-LOAD-FORM-SAVING-SLOTS
@@ -180093,19 +176747,8 @@ NIL
                                                                                     Y
                                                                                     Z))) (t (c) (%test-crash-fail-c 27394 c)))
   (handler-case (run-test-mv 27395 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   'MLFSS-02))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (LIST
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               T))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'MLFSS-02)))
                                                           (FORMS
                                                            (MULTIPLE-VALUE-LIST
                                                             (MAKE-LOAD-FORM-SAVING-SLOTS
@@ -180131,31 +176774,10 @@ NIL
                                                                                   NIL
                                                                                   NIL))) (t (c) (%test-crash-fail-c 27395 c)))
   (handler-case (run-test-mv 27396 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'MLFSS-02)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :A
-                                                                         (LIST
-                                                                          'X)
-                                                                         :C
-                                                                         6/5))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'MLFSS-02 :A
+                                                                  (LIST 'X) :C
+                                                                  6/5)))
                                                           (FORMS
                                                            (MULTIPLE-VALUE-LIST
                                                             (MAKE-LOAD-FORM-SAVING-SLOTS
@@ -180184,31 +176806,10 @@ NIL
                                                                                ((X)
                                                                                 6/5))) (t (c) (%test-crash-fail-c 27396 c)))
   (handler-case (run-test-mv 27397 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'MLFSS-02)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :A
-                                                                         (LIST
-                                                                          'X)
-                                                                         :C
-                                                                         6/5))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'MLFSS-02 :A
+                                                                  (LIST 'X) :C
+                                                                  6/5)))
                                                           (FORMS
                                                            (MULTIPLE-VALUE-LIST
                                                             (MAKE-LOAD-FORM-SAVING-SLOTS
@@ -180238,30 +176839,10 @@ NIL
 )
 (defun run-ansi-make-load-form-saving-slots-chunk-2 ()
   (handler-case (run-test-mv 27398 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'MLFSS-02)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :A 7
-                                                                         :C 64
-                                                                         :B
-                                                                         100))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'MLFSS-02 :A
+                                                                  7 :C 64 :B
+                                                                  100)))
                                                           (FORMS
                                                            (MULTIPLE-VALUE-LIST
                                                             (MAKE-LOAD-FORM-SAVING-SLOTS
@@ -180370,27 +176951,15 @@ NIL
   (handler-case (run-test 27403 (lambda () (HANDLER-CASE
                             (PROGN
                              (MAKE-LOAD-FORM-SAVING-SLOTS
-                              (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                     (%MAKE-INSTANCE 'MLFSS-02))
-                                    (*CLOS-APPLYING-DEFAULTS* T))
-                                (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                (%SHARED-INIT-DEFAULT-SPREAD
-                                 (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                %CLOS-MAKE-INSTANCE-TMP)
+                              (%MAKE-INSTANCE-LIST (LIST 'MLFSS-02))
                               :SLOT-NAMES)
                              NIL)
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 27403 c)))
   (handler-case (run-test 27404 (lambda () (HANDLER-CASE
                             (PROGN
                              (MAKE-LOAD-FORM-SAVING-SLOTS
-                              (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                     (%MAKE-INSTANCE 'MLFSS-02))
-                                    (*CLOS-APPLYING-DEFAULTS* T))
-                                (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                (%SHARED-INIT-DEFAULT-SPREAD
-                                 (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                %CLOS-MAKE-INSTANCE-TMP)
-                              (GENSYM) T)
+                              (%MAKE-INSTANCE-LIST (LIST 'MLFSS-02)) (GENSYM)
+                              T)
                              NIL)
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 27404 c)))
 )
@@ -180455,15 +177024,8 @@ NIL
 (defun run-ansi-make-load-form-chunk-1 ()
   (handler-case (run-test 27405 (lambda () (LET* ((FUN #'MAKE-LOAD-FORM)
                                   (OBJ
-                                   (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                          (%MAKE-INSTANCE
-                                           'MAKE-LOAD-FORM-CLASS-01))
-                                         (*CLOS-APPLYING-DEFAULTS* T))
-                                     (DECLARE
-                                      (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                     (%SHARED-INIT-DEFAULT-SPREAD
-                                      (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                     %CLOS-MAKE-INSTANCE-TMP)))
+                                   (%MAKE-INSTANCE-LIST
+                                    (LIST 'MAKE-LOAD-FORM-CLASS-01))))
                              (IF (EQL
                                   (OR
                                    (FIND-METHOD FUN NIL '(STANDARD-OBJECT) NIL)
@@ -180510,15 +177072,8 @@ NIL
                                   (ERROR NIL :GOOD))
                                  :GOOD))) ':GOOD) (t (c) (%test-crash-fail-c 27407 c)))
   (handler-case (run-test 27408 (lambda () (LET* ((OBJ
-                                   (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                          (%MAKE-INSTANCE
-                                           'MAKE-LOAD-FORM-CLASS-01))
-                                         (*CLOS-APPLYING-DEFAULTS* T))
-                                     (DECLARE
-                                      (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                     (%SHARED-INIT-DEFAULT-SPREAD
-                                      (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                     %CLOS-MAKE-INSTANCE-TMP))
+                                   (%MAKE-INSTANCE-LIST
+                                    (LIST 'MAKE-LOAD-FORM-CLASS-01)))
                                   (FUN #'MAKE-LOAD-FORM)
                                   (METHODS
                                    (COMPUTE-APPLICABLE-METHODS FUN (LIST OBJ))))
@@ -180536,15 +177091,8 @@ NIL
                                    (COMPUTE-APPLICABLE-METHODS FUN (LIST OBJ))))
                              (NOTNOT-MV METHODS))) 'T) (t (c) (%test-crash-fail-c 27410 c)))
   (handler-case (run-test 27411 (lambda () (LET* ((OBJ
-                                   (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                          (%MAKE-INSTANCE
-                                           'MAKE-LOAD-FORM-CLASS-01))
-                                         (*CLOS-APPLYING-DEFAULTS* T))
-                                     (DECLARE
-                                      (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                     (%SHARED-INIT-DEFAULT-SPREAD
-                                      (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                     %CLOS-MAKE-INSTANCE-TMP))
+                                   (%MAKE-INSTANCE-LIST
+                                    (LIST 'MAKE-LOAD-FORM-CLASS-01)))
                                   (FUN #'MAKE-LOAD-FORM)
                                   (METHODS
                                    (COMPUTE-APPLICABLE-METHODS FUN
@@ -180567,19 +177115,9 @@ NIL
                                                                (LIST OBJ NIL))))
                              (NOTNOT-MV METHODS))) 'T) (t (c) (%test-crash-fail-c 27413 c)))
   (handler-case (run-test-mv 27417 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   'MAKE-LOAD-FORM-CLASS-04))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (LIST
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               T))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST
+                                                             'MAKE-LOAD-FORM-CLASS-04)))
                                                           (OBJ2
                                                            (EVAL
                                                             (MAKE-LOAD-FORM
@@ -180592,32 +177130,11 @@ NIL
                                                                        (NIL NIL
                                                                         NIL))) (t (c) (%test-crash-fail-c 27417 c)))
   (handler-case (run-test-mv 27418 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'MAKE-LOAD-FORM-CLASS-04)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :A 1
-                                                                         :B
-                                                                         '(A B
-                                                                           C)
-                                                                         :C
-                                                                         'A))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST
+                                                             'MAKE-LOAD-FORM-CLASS-04
+                                                             :A 1 :B '(A B C)
+                                                             :C 'A)))
                                                           (OBJ2
                                                            (EVAL
                                                             (MAKE-LOAD-FORM
@@ -180634,31 +177151,11 @@ NIL
                                                                         (A B C)
                                                                         A))) (t (c) (%test-crash-fail-c 27418 c)))
   (handler-case (run-test-mv 27419 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'MAKE-LOAD-FORM-CLASS-04)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :B
-                                                                         '(A B
-                                                                           C)
-                                                                         :C
-                                                                         'A))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST
+                                                             'MAKE-LOAD-FORM-CLASS-04
+                                                             :B '(A B C) :C
+                                                             'A)))
                                                           (OBJ2
                                                            (EVAL
                                                             (MAKE-LOAD-FORM OBJ
@@ -180678,21 +177175,9 @@ NIL
   (handler-case (run-test 27421 (lambda () (HANDLER-CASE
                             (PROGN
                              (LET ((OBJ
-                                    (LET* ((%CLOS-MI-CLASS
-                                            'MAKE-LOAD-FORM-CLASS-04)
-                                           (%CLOS-MAKE-INSTANCE-TMP
-                                            (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                           (%CLOS-MI-INITARGS
-                                            (LIST :B '(A B C) :C 'A))
-                                           (*CLOS-APPLYING-DEFAULTS* T))
-                                      (DECLARE
-                                       (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                      (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                                       %CLOS-MI-INITARGS)
-                                      (%SHARED-INIT-DEFAULT-SPREAD
-                                       (CONS %CLOS-MAKE-INSTANCE-TMP
-                                             (CONS T %CLOS-MI-INITARGS)))
-                                      %CLOS-MAKE-INSTANCE-TMP)))
+                                    (%MAKE-INSTANCE-LIST
+                                     (LIST 'MAKE-LOAD-FORM-CLASS-04 :B '(A B C)
+                                           :C 'A))))
                                (MAKE-LOAD-FORM OBJ NIL NIL))
                              NIL)
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 27421 c)))
@@ -181049,19 +177534,8 @@ NIL
 )
 (defun run-ansi-reinitialize-instance-chunk-1 ()
   (handler-case (run-test-mv 27442 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   'CLASS-01))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (LIST
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               T))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'CLASS-01)))
                                                           (OBJ2
                                                            (REINITIALIZE-INSTANCE
                                                             OBJ)))
@@ -181072,19 +177546,8 @@ NIL
                                                                                       NIL
                                                                                       NIL))) (t (c) (%test-crash-fail-c 27442 c)))
   (handler-case (run-test-mv 27443 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   'CLASS-01))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (LIST
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               T))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'CLASS-01)))
                                                           (OBJ2
                                                            (REINITIALIZE-INSTANCE
                                                             OBJ
@@ -181097,19 +177560,8 @@ NIL
                                                                                       NIL
                                                                                       NIL))) (t (c) (%test-crash-fail-c 27443 c)))
   (handler-case (run-test-mv 27444 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   'CLASS-01))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (LIST
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               T))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'CLASS-01)))
                                                           (OBJ2
                                                            (REINITIALIZE-INSTANCE
                                                             OBJ
@@ -181122,19 +177574,8 @@ NIL
                                                                                       NIL
                                                                                       NIL))) (t (c) (%test-crash-fail-c 27444 c)))
   (handler-case (run-test-mv 27445 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   'CLASS-01))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (LIST
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               T))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'CLASS-01)))
                                                           (OBJ2
                                                            (REINITIALIZE-INSTANCE
                                                             OBJ
@@ -181148,19 +177589,8 @@ NIL
                                                                                       NIL
                                                                                       NIL))) (t (c) (%test-crash-fail-c 27445 c)))
   (handler-case (run-test-mv 27446 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   'CLASS-07))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (LIST
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               T))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'CLASS-07)))
                                                           (OBJ2
                                                            (REINITIALIZE-INSTANCE
                                                             OBJ :S1A 'A :S2 'B
@@ -181172,28 +177602,9 @@ NIL
                                                                                   (A
                                                                                    B))) (t (c) (%test-crash-fail-c 27446 c)))
   (handler-case (run-test-mv 27447 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'CLASS-07)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :S1A
-                                                                         'A))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'CLASS-07
+                                                                  :S1A 'A)))
                                                           (OBJ2
                                                            (REINITIALIZE-INSTANCE
                                                             OBJ :S1B 'B)))
@@ -181204,28 +177615,9 @@ NIL
                                                               'S2))))) '(T B
                                                                          NIL)) (t (c) (%test-crash-fail-c 27447 c)))
   (handler-case (run-test-mv 27448 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'CLASS-07)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :S1A
-                                                                         'A))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST 'CLASS-07
+                                                                  :S1A 'A)))
                                                           (OBJ2
                                                            (REINITIALIZE-INSTANCE
                                                             OBJ :S2 'B)))
@@ -181237,19 +177629,9 @@ NIL
                                                                                     A
                                                                                     B)) (t (c) (%test-crash-fail-c 27448 c)))
   (handler-case (run-test-mv 27449 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   'REINIT-CLASS-01))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (LIST
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               T))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST
+                                                             'REINIT-CLASS-01)))
                                                           (OBJ2
                                                            (REINITIALIZE-INSTANCE
                                                             OBJ :A 1 :B 3)))
@@ -181261,29 +177643,10 @@ NIL
 )
 (defun run-ansi-reinitialize-instance-chunk-2 ()
   (handler-case (run-test-mv 27450 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'REINIT-CLASS-01)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :A 10
-                                                                         :B
-                                                                         20))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST
+                                                             'REINIT-CLASS-01
+                                                             :A 10 :B 20)))
                                                           (OBJ2
                                                            (REINITIALIZE-INSTANCE
                                                             OBJ :X 3)))
@@ -181293,29 +177656,10 @@ NIL
                                                                                  (3
                                                                                   20))) (t (c) (%test-crash-fail-c 27450 c)))
   (handler-case (run-test-mv 27451 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'REINIT-CLASS-01)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :A 10
-                                                                         :B
-                                                                         20))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST
+                                                             'REINIT-CLASS-01
+                                                             :A 10 :B 20)))
                                                           (OBJ2
                                                            (REINITIALIZE-INSTANCE
                                                             OBJ :X 3 :X 100)))
@@ -181325,19 +177669,9 @@ NIL
                                                                                  (3
                                                                                   20))) (t (c) (%test-crash-fail-c 27451 c)))
   (handler-case (run-test-mv 27452 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   'REINIT-CLASS-01))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (LIST
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               T))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST
+                                                             'REINIT-CLASS-01)))
                                                           (I 0)
                                                           X
                                                           Y
@@ -181367,14 +177701,7 @@ NIL
                                                                              4)) (t (c) (%test-crash-fail-c 27452 c)))
   (handler-case (run-test 27453 (lambda () (HANDLER-CASE
                             (REINITIALIZE-INSTANCE
-                             (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                    (%MAKE-INSTANCE 'CLASS-01))
-                                   (*CLOS-APPLYING-DEFAULTS* T))
-                               (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                               (%SHARED-INIT-DEFAULT-SPREAD
-                                (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                               %CLOS-MAKE-INSTANCE-TMP)
-                             :GARBAGE T)
+                             (%MAKE-INSTANCE-LIST (LIST 'CLASS-01)) :GARBAGE T)
                             (ERROR NIL :GOOD))) ':GOOD) (t (c) (%test-crash-fail-c 27453 c)))
   (handler-case (run-test 27454 (lambda () (HANDLER-CASE (PROGN (REINITIALIZE-INSTANCE) NIL)
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 27454 c)))
@@ -183300,80 +179627,31 @@ NIL
 )
 (defun run-ansi-slot-boundp-chunk-1 ()
   (handler-case (run-test 27514 (lambda () (LET ((OBJ
-                                  (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                         (%MAKE-INSTANCE
-                                          'SLOT-BOUNDP-CLASS-01))
-                                        (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+                                  (%MAKE-INSTANCE-LIST
+                                   (LIST 'SLOT-BOUNDP-CLASS-01))))
                              (SLOT-BOUNDP OBJ 'A))) 'NIL) (t (c) (%test-crash-fail-c 27514 c)))
   (handler-case (run-test 27515 (lambda () (LET ((OBJ
-                                  (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                         (%MAKE-INSTANCE
-                                          'SLOT-BOUNDP-CLASS-01))
-                                        (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+                                  (%MAKE-INSTANCE-LIST
+                                   (LIST 'SLOT-BOUNDP-CLASS-01))))
                              (SET-SLOT-VALUE OBJ 'A NIL)
                              (NOTNOT-MV (SLOT-BOUNDP OBJ 'A)))) 'T) (t (c) (%test-crash-fail-c 27515 c)))
   (handler-case (run-test 27516 (lambda () (LET ((OBJ
-                                  (LET* ((%CLOS-MI-CLASS 'SLOT-BOUNDP-CLASS-01)
-                                         (%CLOS-MAKE-INSTANCE-TMP
-                                          (%MAKE-INSTANCE %CLOS-MI-CLASS))
-                                         (%CLOS-MI-INITARGS (LIST :B NIL))
-                                         (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%CLOS-VALIDATE-INITARGS-D %CLOS-MI-CLASS
-                                     %CLOS-MI-INITARGS)
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (CONS %CLOS-MAKE-INSTANCE-TMP
-                                           (CONS T %CLOS-MI-INITARGS)))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+                                  (%MAKE-INSTANCE-LIST
+                                   (LIST 'SLOT-BOUNDP-CLASS-01 :B NIL))))
                              (NOTNOT-MV (SLOT-BOUNDP OBJ 'B)))) 'T) (t (c) (%test-crash-fail-c 27516 c)))
   (handler-case (run-test 27517 (lambda () (LET ((OBJ
-                                  (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                         (%MAKE-INSTANCE
-                                          'SLOT-BOUNDP-CLASS-01))
-                                        (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+                                  (%MAKE-INSTANCE-LIST
+                                   (LIST 'SLOT-BOUNDP-CLASS-01))))
                              (NOTNOT-MV (SLOT-BOUNDP OBJ 'C)))) 'T) (t (c) (%test-crash-fail-c 27517 c)))
   (handler-case (run-test 27518 (lambda () (LET ((OBJ
-                                  (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                         (%MAKE-INSTANCE
-                                          'SLOT-BOUNDP-CLASS-01))
-                                        (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+                                  (%MAKE-INSTANCE-LIST
+                                   (LIST 'SLOT-BOUNDP-CLASS-01))))
                              (SLOT-MAKUNBOUND OBJ 'C)
                              (SLOT-BOUNDP OBJ 'C))) 'NIL) (t (c) (%test-crash-fail-c 27518 c)))
   (handler-case (run-test-mv 27519 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'SLOT-BOUNDP-CLASS-01))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'SLOT-BOUNDP-CLASS-01)))
                                                          (I 0)
                                                          X
                                                          Y)
@@ -183391,15 +179669,8 @@ NIL
   (handler-case (run-test 27521 (lambda () (HANDLER-CASE
                             (PROGN
                              (LET ((OBJ
-                                    (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                           (%MAKE-INSTANCE
-                                            'SLOT-BOUNDP-CLASS-01))
-                                          (*CLOS-APPLYING-DEFAULTS* T))
-                                      (DECLARE
-                                       (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                      (%SHARED-INIT-DEFAULT-SPREAD
-                                       (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                      %CLOS-MAKE-INSTANCE-TMP)))
+                                    (%MAKE-INSTANCE-LIST
+                                     (LIST 'SLOT-BOUNDP-CLASS-01))))
                                (SLOT-BOUNDP OBJ))
                              NIL)
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 27521 c)))
@@ -183408,30 +179679,16 @@ NIL
   (handler-case (run-test 27522 (lambda () (HANDLER-CASE
                             (PROGN
                              (LET ((OBJ
-                                    (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                           (%MAKE-INSTANCE
-                                            'SLOT-BOUNDP-CLASS-01))
-                                          (*CLOS-APPLYING-DEFAULTS* T))
-                                      (DECLARE
-                                       (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                      (%SHARED-INIT-DEFAULT-SPREAD
-                                       (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                      %CLOS-MAKE-INSTANCE-TMP)))
+                                    (%MAKE-INSTANCE-LIST
+                                     (LIST 'SLOT-BOUNDP-CLASS-01))))
                                (SLOT-BOUNDP OBJ 'A NIL))
                              NIL)
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 27522 c)))
   (handler-case (run-test 27523 (lambda () (HANDLER-CASE
                             (PROGN
                              (LET ((OBJ
-                                    (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                           (%MAKE-INSTANCE
-                                            'SLOT-BOUNDP-CLASS-01))
-                                          (*CLOS-APPLYING-DEFAULTS* T))
-                                      (DECLARE
-                                       (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                      (%SHARED-INIT-DEFAULT-SPREAD
-                                       (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                      %CLOS-MAKE-INSTANCE-TMP)))
+                                    (%MAKE-INSTANCE-LIST
+                                     (LIST 'SLOT-BOUNDP-CLASS-01))))
                                (SLOT-BOUNDP OBJ 'NONEXISTENT-SLOT))
                              NIL)
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 27523 c)))
@@ -183647,25 +179904,15 @@ NIL
   (handler-case (run-test 27546 (lambda () (HANDLER-CASE
                             (PROGN
                              (SLOT-EXISTS-P
-                              (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                     (%MAKE-INSTANCE 'SLOT-EXISTS-P-CLASS-01))
-                                    (*CLOS-APPLYING-DEFAULTS* T))
-                                (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                (%SHARED-INIT-DEFAULT-SPREAD
-                                 (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                %CLOS-MAKE-INSTANCE-TMP))
+                              (%MAKE-INSTANCE-LIST
+                               (LIST 'SLOT-EXISTS-P-CLASS-01)))
                              NIL)
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 27546 c)))
   (handler-case (run-test 27547 (lambda () (HANDLER-CASE
                             (PROGN
                              (SLOT-EXISTS-P
-                              (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                     (%MAKE-INSTANCE 'SLOT-EXISTS-P-CLASS-01))
-                                    (*CLOS-APPLYING-DEFAULTS* T))
-                                (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                (%SHARED-INIT-DEFAULT-SPREAD
-                                 (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                %CLOS-MAKE-INSTANCE-TMP)
+                              (%MAKE-INSTANCE-LIST
+                               (LIST 'SLOT-EXISTS-P-CLASS-01))
                               'A NIL)
                              NIL)
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 27547 c)))
@@ -183749,19 +179996,9 @@ NIL
                                            (NOT (SLOT-BOUNDP OBJ SLOT-NAME))))
                                  COLLECT SLOT-NAME)) 'NIL) (t (c) (%test-crash-fail-c 27549 c)))
   (handler-case (run-test-mv 27550 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'SLOT-MAKUNBOUND-CLASS-01))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'SLOT-MAKUNBOUND-CLASS-01)))
                                                          (I 0)
                                                          X
                                                          Y)
@@ -183777,19 +180014,9 @@ NIL
                                                        OBJ)
                                                       I X Y)))) '(T 2 1 2)) (t (c) (%test-crash-fail-c 27550 c)))
   (handler-case (run-test-mv 27551 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'SLOT-MAKUNBOUND-CLASS-01))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'SLOT-MAKUNBOUND-CLASS-01)))
                                                          (I 0)
                                                          X
                                                          Y)
@@ -183810,27 +180037,15 @@ NIL
   (handler-case (run-test 27553 (lambda () (HANDLER-CASE
                             (PROGN
                              (SLOT-MAKUNBOUND
-                              (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                     (%MAKE-INSTANCE
-                                      'SLOT-MAKUNBOUND-CLASS-01))
-                                    (*CLOS-APPLYING-DEFAULTS* T))
-                                (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                (%SHARED-INIT-DEFAULT-SPREAD
-                                 (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                %CLOS-MAKE-INSTANCE-TMP))
+                              (%MAKE-INSTANCE-LIST
+                               (LIST 'SLOT-MAKUNBOUND-CLASS-01)))
                              NIL)
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 27553 c)))
   (handler-case (run-test 27554 (lambda () (HANDLER-CASE
                             (PROGN
                              (SLOT-MAKUNBOUND
-                              (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                     (%MAKE-INSTANCE
-                                      'SLOT-MAKUNBOUND-CLASS-01))
-                                    (*CLOS-APPLYING-DEFAULTS* T))
-                                (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                (%SHARED-INIT-DEFAULT-SPREAD
-                                 (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                %CLOS-MAKE-INSTANCE-TMP)
+                              (%MAKE-INSTANCE-LIST
+                               (LIST 'SLOT-MAKUNBOUND-CLASS-01))
                               'A NIL)
                              NIL)
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 27554 c)))
@@ -183882,19 +180097,9 @@ NIL
 )
 (defun run-ansi-slot-missing-chunk-1 ()
   (handler-case (run-test-mv 27556 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'SLOT-MISSING-CLASS-01))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'SLOT-MISSING-CLASS-01))))
                                                      (VALUES
                                                       (SLOT-VALUE OBJ 'FOO)
                                                       *SLOT-MISSING-CLASS-01-VAR*)))) '((FOO
@@ -183906,19 +180111,9 @@ NIL
                                                                                          NIL
                                                                                          NIL))) (t (c) (%test-crash-fail-c 27556 c)))
   (handler-case (run-test-mv 27557 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'SLOT-MISSING-CLASS-01))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'SLOT-MISSING-CLASS-01))))
                                                      (VALUES
                                                       (SET-SLOT-VALUE OBJ 'FOO
                                                        'BAR)
@@ -183928,19 +180123,9 @@ NIL
                                                                                          BAR
                                                                                          T))) (t (c) (%test-crash-fail-c 27557 c)))
   (handler-case (run-test-mv 27558 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'SLOT-MISSING-CLASS-01))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'SLOT-MISSING-CLASS-01))))
                                                      (VALUES
                                                       (EQT OBJ
                                                        (SLOT-MAKUNBOUND OBJ
@@ -183951,19 +180136,9 @@ NIL
                                                                                          NIL
                                                                                          NIL))) (t (c) (%test-crash-fail-c 27558 c)))
   (handler-case (run-test-mv 27559 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'SLOT-MISSING-CLASS-01))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'SLOT-MISSING-CLASS-01))))
                                                      (VALUES
                                                       (NOTNOT
                                                        (SLOT-BOUNDP OBJ 'ABC))
@@ -183973,51 +180148,23 @@ NIL
                                                                                          NIL
                                                                                          NIL))) (t (c) (%test-crash-fail-c 27559 c)))
   (handler-case (run-test 27560 (lambda () (LET ((OBJ
-                                  (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                         (%MAKE-INSTANCE
-                                          'SLOT-MISSING-CLASS-01))
-                                        (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+                                  (%MAKE-INSTANCE-LIST
+                                   (LIST 'SLOT-MISSING-CLASS-01))))
                              (SLOT-VALUE OBJ 'D))) '(D SLOT-VALUE NIL NIL)) (t (c) (%test-crash-fail-c 27560 c)))
   (handler-case (run-test 27561 (lambda () (LET ((OBJ
-                                  (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                         (%MAKE-INSTANCE
-                                          'SLOT-MISSING-CLASS-01))
-                                        (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                    %CLOS-MAKE-INSTANCE-TMP)))
+                                  (%MAKE-INSTANCE-LIST
+                                   (LIST 'SLOT-MISSING-CLASS-01))))
                              (SET-SLOT-VALUE OBJ 'D 'BAR))) 'BAR) (t (c) (%test-crash-fail-c 27561 c)))
   (handler-case (run-test 27562 (lambda () (LET* ((OBJ
-                                   (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                          (%MAKE-INSTANCE
-                                           'SLOT-MISSING-CLASS-01))
-                                         (*CLOS-APPLYING-DEFAULTS* T))
-                                     (DECLARE
-                                      (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                     (%SHARED-INIT-DEFAULT-SPREAD
-                                      (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                     %CLOS-MAKE-INSTANCE-TMP))
+                                   (%MAKE-INSTANCE-LIST
+                                    (LIST 'SLOT-MISSING-CLASS-01)))
                                   (VAL (SLOT-MAKUNBOUND OBJ 'D)))
                              (IF (EQ VAL OBJ)
                                  :GOOD
                                  VAL))) ':GOOD) (t (c) (%test-crash-fail-c 27562 c)))
   (handler-case (run-test 27563 (lambda () (LET* ((OBJ
-                                   (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                          (%MAKE-INSTANCE
-                                           'SLOT-MISSING-CLASS-01))
-                                         (*CLOS-APPLYING-DEFAULTS* T))
-                                     (DECLARE
-                                      (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                     (%SHARED-INIT-DEFAULT-SPREAD
-                                      (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                     %CLOS-MAKE-INSTANCE-TMP)))
+                                   (%MAKE-INSTANCE-LIST
+                                    (LIST 'SLOT-MISSING-CLASS-01))))
                              (SLOT-BOUNDP OBJ 'NOT-THERE))) 'NIL) (t (c) (%test-crash-fail-c 27563 c)))
 )
 (defun run-ansi-slot-missing ()
@@ -184070,19 +180217,9 @@ NIL
 )
 (defun run-ansi-slot-unbound-chunk-1 ()
   (handler-case (run-test-mv 27564 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'SLOT-UNBOUND-CLASS-01))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'SLOT-UNBOUND-CLASS-01))))
                                                      (VALUES
                                                       (SLOT-VALUE OBJ 'A)
                                                       (SLOT-VALUE OBJ 'B)
@@ -184093,58 +180230,24 @@ NIL
                                                                                 (SLOT-UNBOUND-CLASS-01
                                                                                  C))) (t (c) (%test-crash-fail-c 27564 c)))
   (handler-case (run-test-mv 27565 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'SLOT-UNBOUND-CLASS-01))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'SLOT-UNBOUND-CLASS-01))))
                                                      (VALUES (SUNB-A OBJ)
                                                              (SUNB-B OBJ))))) '((SLOT-UNBOUND-CLASS-01
                                                                                  A)
                                                                                 (SLOT-UNBOUND-CLASS-01
                                                                                  B))) (t (c) (%test-crash-fail-c 27565 c)))
   (handler-case (run-test 27566 (lambda () (SLOT-VALUE
-                            (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                   (%MAKE-INSTANCE 'SLOT-UNBOUND-CLASS-01))
-                                  (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                              %CLOS-MAKE-INSTANCE-TMP)
+                            (%MAKE-INSTANCE-LIST (LIST 'SLOT-UNBOUND-CLASS-01))
                             'E)) 'NIL) (t (c) (%test-crash-fail-c 27566 c)))
   (handler-case (run-test 27567 (lambda () (SLOT-VALUE
-                            (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                   (%MAKE-INSTANCE 'SLOT-UNBOUND-CLASS-01))
-                                  (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                              %CLOS-MAKE-INSTANCE-TMP)
+                            (%MAKE-INSTANCE-LIST (LIST 'SLOT-UNBOUND-CLASS-01))
                             'F)) '1) (t (c) (%test-crash-fail-c 27567 c)))
   (handler-case (run-test 27568 (lambda () (SUNB-E
-                            (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                   (%MAKE-INSTANCE 'SLOT-UNBOUND-CLASS-01))
-                                  (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                              %CLOS-MAKE-INSTANCE-TMP))) 'NIL) (t (c) (%test-crash-fail-c 27568 c)))
+                            (%MAKE-INSTANCE-LIST (LIST 'SLOT-UNBOUND-CLASS-01)))) 'NIL) (t (c) (%test-crash-fail-c 27568 c)))
   (handler-case (run-test 27569 (lambda () (SUNB-F
-                            (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                   (%MAKE-INSTANCE 'SLOT-UNBOUND-CLASS-01))
-                                  (*CLOS-APPLYING-DEFAULTS* T))
-                              (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                              (%SHARED-INIT-DEFAULT-SPREAD
-                               (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                              %CLOS-MAKE-INSTANCE-TMP))) '1) (t (c) (%test-crash-fail-c 27569 c)))
+                            (%MAKE-INSTANCE-LIST (LIST 'SLOT-UNBOUND-CLASS-01)))) '1) (t (c) (%test-crash-fail-c 27569 c)))
 )
 (defun run-ansi-slot-unbound ()
   (handler-case (%DEFCLASS 'SLOT-UNBOUND-CLASS-01 '(A B C E F) 'NIL) (t (c) nil))
@@ -184196,14 +180299,8 @@ NIL
 )
 (defun run-ansi-slot-value-chunk-1 ()
   (handler-case (run-test 27570 (lambda () (LET ((OBJ
-                                  (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                         (%MAKE-INSTANCE 'SLOT-VALUE-CLASS-01))
-                                        (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                    %CLOS-MAKE-INSTANCE-TMP))
+                                  (%MAKE-INSTANCE-LIST
+                                   (LIST 'SLOT-VALUE-CLASS-01)))
                                  (SLOT-NAMES *SLOT-VALUE-TEST-SLOT-NAMES*)
                                  (SLOT-VALUES *SLOT-VALUE-TEST-SLOT-VALUES*))
                              (LOOP FOR NAME IN SLOT-NAMES
@@ -184219,14 +180316,8 @@ NIL
                                             (LIST VAL)))
                                    COLLECT NAME))) 'NIL) (t (c) (%test-crash-fail-c 27570 c)))
   (handler-case (run-test 27571 (lambda () (LET ((OBJ
-                                  (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                         (%MAKE-INSTANCE 'SLOT-VALUE-CLASS-02))
-                                        (*CLOS-APPLYING-DEFAULTS* T))
-                                    (DECLARE
-                                     (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                    (%SHARED-INIT-DEFAULT-SPREAD
-                                     (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                    %CLOS-MAKE-INSTANCE-TMP))
+                                  (%MAKE-INSTANCE-LIST
+                                   (LIST 'SLOT-VALUE-CLASS-02)))
                                  (SLOT-NAMES *SLOT-VALUE-TEST-SLOT-NAMES*)
                                  (SLOT-VALUES *SLOT-VALUE-TEST-SLOT-VALUES*))
                              (LOOP FOR NAME IN SLOT-NAMES
@@ -184242,19 +180333,9 @@ NIL
                                             (LIST VAL)))
                                    COLLECT NAME))) 'NIL) (t (c) (%test-crash-fail-c 27571 c)))
   (handler-case (run-test-mv 27572 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'SLOT-VALUE-CLASS-01))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'SLOT-VALUE-CLASS-01)))
                                                          (I 0)
                                                          X
                                                          Y)
@@ -184269,19 +180350,9 @@ NIL
                                                         'A))
                                                       I X Y)))) '(T T 2 1 2)) (t (c) (%test-crash-fail-c 27572 c)))
   (handler-case (run-test-mv 27573 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'SLOT-VALUE-CLASS-01))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'SLOT-VALUE-CLASS-01)))
                                                          (I 0)
                                                          X
                                                          Y)
@@ -184300,27 +180371,15 @@ NIL
   (handler-case (run-test 27575 (lambda () (HANDLER-CASE
                             (PROGN
                              (SLOT-VALUE
-                              (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                     (%MAKE-INSTANCE 'SLOT-VALUE-CLASS-01))
-                                    (*CLOS-APPLYING-DEFAULTS* T))
-                                (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                (%SHARED-INIT-DEFAULT-SPREAD
-                                 (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                %CLOS-MAKE-INSTANCE-TMP))
+                              (%MAKE-INSTANCE-LIST
+                               (LIST 'SLOT-VALUE-CLASS-01)))
                              NIL)
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 27575 c)))
   (handler-case (run-test 27576 (lambda () (HANDLER-CASE
                             (PROGN
                              (LET ((OBJ
-                                    (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                           (%MAKE-INSTANCE
-                                            'SLOT-VALUE-CLASS-01))
-                                          (*CLOS-APPLYING-DEFAULTS* T))
-                                      (DECLARE
-                                       (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                      (%SHARED-INIT-DEFAULT-SPREAD
-                                       (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                      %CLOS-MAKE-INSTANCE-TMP)))
+                                    (%MAKE-INSTANCE-LIST
+                                     (LIST 'SLOT-VALUE-CLASS-01))))
                                (SET-SLOT-VALUE OBJ 'A T)
                                (SLOT-VALUE OBJ 'A NIL))
                              NIL)
@@ -184328,13 +180387,7 @@ NIL
   (handler-case (run-test 27577 (lambda () (HANDLER-CASE
                             (PROGN
                              (SLOT-VALUE
-                              (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                     (%MAKE-INSTANCE 'SLOT-VALUE-CLASS-01))
-                                    (*CLOS-APPLYING-DEFAULTS* T))
-                                (DECLARE (SPECIAL *CLOS-APPLYING-DEFAULTS*))
-                                (%SHARED-INIT-DEFAULT-SPREAD
-                                 (LIST %CLOS-MAKE-INSTANCE-TMP T))
-                                %CLOS-MAKE-INSTANCE-TMP)
+                              (%MAKE-INSTANCE-LIST (LIST 'SLOT-VALUE-CLASS-01))
                               (GENSYM))
                              :BAD)
                             (ERROR NIL :GOOD))) ':GOOD) (t (c) (%test-crash-fail-c 27577 c)))
@@ -184405,19 +180458,9 @@ NIL
 )
 (defun run-ansi-unbound-slot-chunk-1 ()
   (handler-case (run-test-mv 27580 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'UBS-CLASS-01))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'UBS-CLASS-01))))
                                                      (HANDLER-CASE
                                                       (SLOT-VALUE OBJ 'A)
                                                       (UNBOUND-SLOT (C)
@@ -184431,19 +180474,9 @@ NIL
                                                                                     T
                                                                                     A)) (t (c) (%test-crash-fail-c 27580 c)))
   (handler-case (run-test-mv 27581 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'UBS-CLASS-02))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'UBS-CLASS-02))))
                                                      (HANDLER-CASE
                                                       (SLOT-VALUE OBJ 'B)
                                                       (UNBOUND-SLOT (C)
@@ -184543,19 +180576,9 @@ NIL
 )
 (defun run-ansi-update-instance-for-different-class-chunk-1 ()
   (handler-case (run-test-mv 27582 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   'UIFDC-CLASS-01A))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (LIST
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               T))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST
+                                                             'UIFDC-CLASS-01A)))
                                                           (NEW-CLASS
                                                            (FIND-CLASS
                                                             'UIFDC-CLASS-01B))
@@ -184574,27 +180597,10 @@ NIL
                                                                      T T
                                                                      (NIL NIL))) (t (c) (%test-crash-fail-c 27582 c)))
   (handler-case (run-test-mv 27583 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'UIFDC-CLASS-01A)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :A 1))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST
+                                                             'UIFDC-CLASS-01A
+                                                             :A 1)))
                                                           (NEW-CLASS
                                                            (FIND-CLASS
                                                             'UIFDC-CLASS-01B))
@@ -184618,27 +180624,10 @@ NIL
                                                                                  T)
                                                                                 1)) (t (c) (%test-crash-fail-c 27583 c)))
   (handler-case (run-test-mv 27584 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'UIFDC-CLASS-01A)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :B 1))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST
+                                                             'UIFDC-CLASS-01A
+                                                             :B 1)))
                                                           (NEW-CLASS
                                                            (FIND-CLASS
                                                             'UIFDC-CLASS-01B))
@@ -184662,28 +180651,10 @@ NIL
                                                                                  NIL)
                                                                                 1)) (t (c) (%test-crash-fail-c 27584 c)))
   (handler-case (run-test-mv 27585 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'UIFDC-CLASS-01A)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :A 1
-                                                                         :B 2))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST
+                                                             'UIFDC-CLASS-01A
+                                                             :A 1 :B 2)))
                                                           (NEW-CLASS
                                                            (FIND-CLASS
                                                             'UIFDC-CLASS-01B))
@@ -184709,19 +180680,9 @@ NIL
                                                                                 2
                                                                                 1)) (t (c) (%test-crash-fail-c 27585 c)))
   (handler-case (run-test-mv 27586 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   'UIFDC-CLASS-01A))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (LIST
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               T))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST
+                                                             'UIFDC-CLASS-01A)))
                                                           (CLASS
                                                            (FIND-CLASS
                                                             'UIFDC-CLASS-02)))
@@ -184736,27 +180697,10 @@ NIL
                                                                                  NIL)
                                                                                 100)) (t (c) (%test-crash-fail-c 27586 c)))
   (handler-case (run-test-mv 27587 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'UIFDC-CLASS-01A)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :A 1))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST
+                                                             'UIFDC-CLASS-01A
+                                                             :A 1)))
                                                           (CLASS
                                                            (FIND-CLASS
                                                             'UIFDC-CLASS-02)))
@@ -184771,28 +180715,10 @@ NIL
                                                                                  NIL)
                                                                                 100)) (t (c) (%test-crash-fail-c 27587 c)))
   (handler-case (run-test-mv 27588 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'UIFDC-CLASS-01A)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :B
-                                                                         17))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST
+                                                             'UIFDC-CLASS-01A
+                                                             :B 17)))
                                                           (CLASS
                                                            (FIND-CLASS
                                                             'UIFDC-CLASS-02)))
@@ -184809,28 +180735,10 @@ NIL
                                                                                 100
                                                                                 17)) (t (c) (%test-crash-fail-c 27588 c)))
   (handler-case (run-test-mv 27589 (lambda () (multiple-value-list (LET* ((OBJ
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'UIFDC-CLASS-01A)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :B 17
-                                                                         :A 4))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP))
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST
+                                                             'UIFDC-CLASS-01A
+                                                             :B 17 :A 4)))
                                                           (CLASS
                                                            (FIND-CLASS
                                                             'UIFDC-CLASS-02)))
@@ -184955,29 +180863,11 @@ NIL
                               10
                                (RETURN-FROM DONE :GOOD)))) ':GOOD) (t (c) (%test-crash-fail-c 27594 c)))
   (handler-case (run-test-mv 27595 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'WITH-ACCESSORS-CLASS-01)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A 'X
-                                                                        :B 'Y
-                                                                        :C 'Z))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'WITH-ACCESSORS-CLASS-01
+                                                            :A 'X :B 'Y :C
+                                                            'Z))))
                                                      (WITH-ACCESSORS ((A WA-A)
                                                                       (B WA-B)
                                                                       (C WA-C))
@@ -184985,19 +180875,9 @@ NIL
                                                        (VALUES A B C))))) '(X Y
                                                                             Z)) (t (c) (%test-crash-fail-c 27595 c)))
   (handler-case (run-test-mv 27596 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'WITH-ACCESSORS-CLASS-01))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'WITH-ACCESSORS-CLASS-01))))
                                                      (WITH-ACCESSORS ((A WA-A)
                                                                       (B WA-B)
                                                                       (C WA-C))
@@ -185013,19 +180893,9 @@ NIL
                                                                                       Y
                                                                                       Z))) (t (c) (%test-crash-fail-c 27596 c)))
   (handler-case (run-test-mv 27597 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'WITH-ACCESSORS-CLASS-01))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'WITH-ACCESSORS-CLASS-01))))
                                                      (WITH-ACCESSORS ((A WA-A)
                                                                       (B WA-B)
                                                                       (C WA-C))
@@ -185043,29 +180913,11 @@ NIL
 )
 (defun run-ansi-with-accessors-chunk-2 ()
   (handler-case (run-test-mv 27598 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'WITH-ACCESSORS-CLASS-01)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A 5 :B
-                                                                        19 :C
-                                                                        312))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'WITH-ACCESSORS-CLASS-01
+                                                            :A 5 :B 19 :C
+                                                            312))))
                                                      (WITH-ACCESSORS ((A WA-A)
                                                                       (B WA-B)
                                                                       (C WA-C))
@@ -185081,29 +180933,11 @@ NIL
                                                                                       431
                                                                                       387))) (t (c) (%test-crash-fail-c 27598 c)))
   (handler-case (run-test-mv 27599 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'WITH-ACCESSORS-CLASS-01)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A 5 :B
-                                                                        19 :C
-                                                                        312))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'WITH-ACCESSORS-CLASS-01
+                                                            :A 5 :B 19 :C
+                                                            312))))
                                                      (WITH-ACCESSORS ((A WA-A)
                                                                       (B WA-B)
                                                                       (C WA-C))
@@ -185115,29 +180949,11 @@ NIL
                                                                             19
                                                                             312)) (t (c) (%test-crash-fail-c 27599 c)))
   (handler-case (run-test-mv 27600 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'WITH-ACCESSORS-CLASS-01)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A 5 :B
-                                                                        19 :C
-                                                                        312))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'WITH-ACCESSORS-CLASS-01
+                                                            :A 5 :B 19 :C
+                                                            312))))
                                                      (WITH-ACCESSORS ((A WA-A)
                                                                       (B WA-B)
                                                                       (C WA-C))
@@ -185280,57 +181096,21 @@ NIL
                                (RETURN :GOOD))
                              (RETURN :BAD))) ':GOOD) (t (c) (%test-crash-fail-c 27610 c)))
   (handler-case (run-test-mv 27611 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'WITH-SLOTS-CLASS-01)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A 'X
-                                                                        :B 'Y
-                                                                        :C 'Z))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'WITH-SLOTS-CLASS-01
+                                                            :A 'X :B 'Y :C
+                                                            'Z))))
                                                      (WITH-SLOTS (A B C)
                                                          OBJ
                                                        (VALUES A B C))))) '(X Y
                                                                             Z)) (t (c) (%test-crash-fail-c 27611 c)))
   (handler-case (run-test-mv 27612 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'WITH-SLOTS-CLASS-01)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A 'X
-                                                                        :B 'Y
-                                                                        :C 'Z))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'WITH-SLOTS-CLASS-01
+                                                            :A 'X :B 'Y :C
+                                                            'Z))))
                                                      (WITH-SLOTS (A B C)
                                                          OBJ
                                                        (VALUES (SETF A 'P)
@@ -185346,29 +181126,11 @@ NIL
 )
 (defun run-ansi-with-slots-chunk-2 ()
   (handler-case (run-test-mv 27613 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'WITH-SLOTS-CLASS-01)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A 'X
-                                                                        :B 'Y
-                                                                        :C 'Z))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'WITH-SLOTS-CLASS-01
+                                                            :A 'X :B 'Y :C
+                                                            'Z))))
                                                      (WITH-SLOTS (A B C)
                                                          OBJ
                                                        (VALUES (SETQ A 'P)
@@ -185382,29 +181144,11 @@ NIL
                                                                                       Q
                                                                                       R))) (t (c) (%test-crash-fail-c 27613 c)))
   (handler-case (run-test-mv 27614 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'WITH-SLOTS-CLASS-01)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A 'X
-                                                                        :B 'Y
-                                                                        :C 'Z))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'WITH-SLOTS-CLASS-01
+                                                            :A 'X :B 'Y :C
+                                                            'Z))))
                                                      (WITH-SLOTS ((A2 A) (B2 B)
                                                                   (C2 C))
                                                          OBJ
@@ -185412,29 +181156,11 @@ NIL
                                                                                Y
                                                                                Z)) (t (c) (%test-crash-fail-c 27614 c)))
   (handler-case (run-test-mv 27615 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'WITH-SLOTS-CLASS-01)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A 'X
-                                                                        :B 'Y
-                                                                        :C 'Z))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'WITH-SLOTS-CLASS-01
+                                                            :A 'X :B 'Y :C
+                                                            'Z))))
                                                      (WITH-SLOTS ((A2 A) (B2 B)
                                                                   (C2 C))
                                                          OBJ
@@ -185449,29 +181175,11 @@ NIL
                                                                                       Q
                                                                                       R))) (t (c) (%test-crash-fail-c 27615 c)))
   (handler-case (run-test-mv 27616 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'WITH-SLOTS-CLASS-01)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A 'X
-                                                                        :B 'Y
-                                                                        :C 'Z))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'WITH-SLOTS-CLASS-01
+                                                            :A 'X :B 'Y :C
+                                                            'Z))))
                                                      (WITH-SLOTS ((A2 A) (B2 B)
                                                                   (C2 C))
                                                          OBJ
@@ -185486,19 +181194,9 @@ NIL
                                                                                       Q
                                                                                       R))) (t (c) (%test-crash-fail-c 27616 c)))
   (handler-case (run-test-mv 27617 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'WITH-SLOTS-CLASS-01))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'WITH-SLOTS-CLASS-01))))
                                                      (WITH-SLOTS (A B C)
                                                          OBJ
                                                        (VALUES (SETF A 'P)
@@ -185512,273 +181210,89 @@ NIL
                                                                                       Q
                                                                                       R))) (t (c) (%test-crash-fail-c 27617 c)))
   (handler-case (run-test-mv 27618 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'WITH-SLOTS-CLASS-01)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A 1 :B
-                                                                        2 :C
-                                                                        3))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'WITH-SLOTS-CLASS-01
+                                                            :A 1 :B 2 :C 3))))
                                                      (WITH-SLOTS (A B C)
                                                          OBJ
                                                        (LET ((OBJ
-                                                              (LET* ((%CLOS-MI-CLASS
-                                                                      'WITH-SLOTS-CLASS-01)
-                                                                     (%CLOS-MAKE-INSTANCE-TMP
-                                                                      (%MAKE-INSTANCE
-                                                                       %CLOS-MI-CLASS))
-                                                                     (%CLOS-MI-INITARGS
-                                                                      (LIST :A
-                                                                            'BAD
-                                                                            :B
-                                                                            'BAD
-                                                                            :C
-                                                                            'BAD))
-                                                                     (*CLOS-APPLYING-DEFAULTS*
-                                                                      T))
-                                                                (DECLARE
-                                                                 (SPECIAL
-                                                                  *CLOS-APPLYING-DEFAULTS*))
-                                                                (%CLOS-VALIDATE-INITARGS-D
-                                                                 %CLOS-MI-CLASS
-                                                                 %CLOS-MI-INITARGS)
-                                                                (%SHARED-INIT-DEFAULT-SPREAD
-                                                                 (CONS
-                                                                  %CLOS-MAKE-INSTANCE-TMP
-                                                                  (CONS T
-                                                                        %CLOS-MI-INITARGS)))
-                                                                %CLOS-MAKE-INSTANCE-TMP)))
+                                                              (%MAKE-INSTANCE-LIST
+                                                               (LIST
+                                                                'WITH-SLOTS-CLASS-01
+                                                                :A 'BAD :B 'BAD
+                                                                :C 'BAD))))
                                                          (VALUES A B C)))))) '(1
                                                                                2
                                                                                3)) (t (c) (%test-crash-fail-c 27618 c)))
   (handler-case (run-test-mv 27619 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'WITH-SLOTS-CLASS-01)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A 1 :B
-                                                                        2 :C
-                                                                        3))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'WITH-SLOTS-CLASS-01
+                                                            :A 1 :B 2 :C 3))))
                                                      (WITH-SLOTS (A B C)
                                                          OBJ
                                                        (WITH-SLOTS ((A2 A)
                                                                     (B2 B)
                                                                     (C2 C))
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'WITH-SLOTS-CLASS-01)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :A
-                                                                         'BAD
-                                                                         :B
-                                                                         'BAD
-                                                                         :C
-                                                                         'BAD))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP)
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST
+                                                             'WITH-SLOTS-CLASS-01
+                                                             :A 'BAD :B 'BAD :C
+                                                             'BAD))
                                                          (VALUES A B C)))))) '(1
                                                                                2
                                                                                3)) (t (c) (%test-crash-fail-c 27619 c)))
   (handler-case (run-test-mv 27620 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'WITH-SLOTS-CLASS-01)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A 'BAD
-                                                                        :B 'BAD
-                                                                        :C
-                                                                        'BAD))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'WITH-SLOTS-CLASS-01
+                                                            :A 'BAD :B 'BAD :C
+                                                            'BAD))))
                                                      (WITH-SLOTS (A B C)
                                                          OBJ
                                                        (WITH-SLOTS (A B C)
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'WITH-SLOTS-CLASS-01)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :A 1
-                                                                         :B 2
-                                                                         :C 3))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP)
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST
+                                                             'WITH-SLOTS-CLASS-01
+                                                             :A 1 :B 2 :C 3))
                                                          (VALUES A B C)))))) '(1
                                                                                2
                                                                                3)) (t (c) (%test-crash-fail-c 27620 c)))
 )
 (defun run-ansi-with-slots-chunk-3 ()
   (handler-case (run-test-mv 27621 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'WITH-SLOTS-CLASS-01)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A 1 :B
-                                                                        2 :C
-                                                                        'BAD))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'WITH-SLOTS-CLASS-01
+                                                            :A 1 :B 2 :C
+                                                            'BAD))))
                                                      (WITH-SLOTS (A B)
                                                          OBJ
                                                        (WITH-SLOTS (C)
-                                                           (LET* ((%CLOS-MI-CLASS
-                                                                   'WITH-SLOTS-CLASS-01)
-                                                                  (%CLOS-MAKE-INSTANCE-TMP
-                                                                   (%MAKE-INSTANCE
-                                                                    %CLOS-MI-CLASS))
-                                                                  (%CLOS-MI-INITARGS
-                                                                   (LIST :A
-                                                                         'BAD
-                                                                         :B
-                                                                         'BAD
-                                                                         :C 3))
-                                                                  (*CLOS-APPLYING-DEFAULTS*
-                                                                   T))
-                                                             (DECLARE
-                                                              (SPECIAL
-                                                               *CLOS-APPLYING-DEFAULTS*))
-                                                             (%CLOS-VALIDATE-INITARGS-D
-                                                              %CLOS-MI-CLASS
-                                                              %CLOS-MI-INITARGS)
-                                                             (%SHARED-INIT-DEFAULT-SPREAD
-                                                              (CONS
-                                                               %CLOS-MAKE-INSTANCE-TMP
-                                                               (CONS T
-                                                                     %CLOS-MI-INITARGS)))
-                                                             %CLOS-MAKE-INSTANCE-TMP)
+                                                           (%MAKE-INSTANCE-LIST
+                                                            (LIST
+                                                             'WITH-SLOTS-CLASS-01
+                                                             :A 'BAD :B 'BAD :C
+                                                             3))
                                                          (VALUES A B C)))))) '(1
                                                                                2
                                                                                3)) (t (c) (%test-crash-fail-c 27621 c)))
   (handler-case (run-test-mv 27622 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET ((%CLOS-MAKE-INSTANCE-TMP
-                                                                 (%MAKE-INSTANCE
-                                                                  'WITH-SLOTS-CLASS-01))
-                                                                (*CLOS-APPLYING-DEFAULTS*
-                                                                 T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (LIST
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              T))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'WITH-SLOTS-CLASS-01))))
                                                      (WITH-SLOTS (A B C)
                                                          OBJ
                                                        (VALUES A B C))))) '(MISSING
                                                                             MISSING
                                                                             MISSING)) (t (c) (%test-crash-fail-c 27622 c)))
   (handler-case (run-test-mv 27623 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'WITH-SLOTS-CLASS-01)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A 'X
-                                                                        :B 'Y
-                                                                        :C 'Z))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'WITH-SLOTS-CLASS-01
+                                                            :A 'X :B 'Y :C
+                                                            'Z))))
                                                      (WITH-SLOTS (A B C)
                                                          OBJ
                                                        (DECLARE
@@ -185787,29 +181301,11 @@ NIL
                                                        (VALUES A B C))))) '(X Y
                                                                             Z)) (t (c) (%test-crash-fail-c 27623 c)))
   (handler-case (run-test-mv 27624 (lambda () (multiple-value-list (LET ((OBJ
-                                                          (LET* ((%CLOS-MI-CLASS
-                                                                  'WITH-SLOTS-CLASS-01)
-                                                                 (%CLOS-MAKE-INSTANCE-TMP
-                                                                  (%MAKE-INSTANCE
-                                                                   %CLOS-MI-CLASS))
-                                                                 (%CLOS-MI-INITARGS
-                                                                  (LIST :A 'X
-                                                                        :B 'Y
-                                                                        :C 'Z))
-                                                                 (*CLOS-APPLYING-DEFAULTS*
-                                                                  T))
-                                                            (DECLARE
-                                                             (SPECIAL
-                                                              *CLOS-APPLYING-DEFAULTS*))
-                                                            (%CLOS-VALIDATE-INITARGS-D
-                                                             %CLOS-MI-CLASS
-                                                             %CLOS-MI-INITARGS)
-                                                            (%SHARED-INIT-DEFAULT-SPREAD
-                                                             (CONS
-                                                              %CLOS-MAKE-INSTANCE-TMP
-                                                              (CONS T
-                                                                    %CLOS-MI-INITARGS)))
-                                                            %CLOS-MAKE-INSTANCE-TMP)))
+                                                          (%MAKE-INSTANCE-LIST
+                                                           (LIST
+                                                            'WITH-SLOTS-CLASS-01
+                                                            :A 'X :B 'Y :C
+                                                            'Z))))
                                                      (WITH-SLOTS (A B C)
                                                          OBJ
                                                        (DECLARE

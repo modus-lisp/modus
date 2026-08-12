@@ -17742,9 +17742,15 @@
             ;; CLHS 3.4.6 slot option :READ-ONLY — parsed per OWN slot and
             ;; inherited for the parent's slots.  Previously accepted and
             ;; silently discarded, so a write SBCL refuses succeeded here.
-            (own-slot-ro (mapcar #'%slot-spec-read-only-p raw-slots))
-            (parent-slot-ro (let ((f (%defstruct-eff-ro-get
-                                      (%rt-fn-name include-parent))))
+            (own-slot-ro (mapcar (lambda (s) (%slot-spec-read-only-p s))
+                                 raw-slots))
+            ;; Guarded exactly like PARENT-SLOTS above: %RT-FN-NAME wants a
+            ;; symbol and INCLUDE-PARENT is NIL for the (overwhelmingly
+            ;; common) no-:INCLUDE case.  Calling it unconditionally made
+            ;; every DEFSTRUCT signal a TYPE-ERROR at expansion time.
+            (parent-slot-ro (let ((f (when include-parent
+                                       (%defstruct-eff-ro-get
+                                        (%rt-fn-name include-parent)))))
                               ;; A parent compiled before this table existed
                               ;; (or an unregistered parent) yields NIL —
                               ;; pad to the parent's slot count so the
@@ -18106,27 +18112,44 @@
                                    (%signal-type-error))
                                (%signal-type-error)))
                         forms-to-compile)
-                  (let ((setter-name (format nil "SET-~A" acc-name))
-                        ;; CLHS 3.4.6: a :READ-ONLY slot has no writer at all.
-                        ;; Modus always emits SET-<ACC> / SETF-<ACC> (the SETF
-                        ;; place expansion calls SET-<ACC> unconditionally), so
-                        ;; suppressing the DEFUNs would degrade `(setf (ro-r1 x)
-                        ;; 1)` into an UNDEFINED-FUNCTION rather than a clear
-                        ;; refusal.  Emit the writers, but with a body that
-                        ;; signals and performs no store.
-                        (writer-body
-                          (if slot-read-only
-                              '((%signal-program-error))
-                              nil)))
+                  (let* ((setter-name (format nil "SET-~A" acc-name))
+                         ;; NOTE — CHECKED-STORE is bound HERE, as a plain
+                         ;; top-level backquote, and spliced below as a bare
+                         ;; variable.  Writing it inline as `,@(or writer-body
+                         ;; `(…))` — a backquote nested DIRECTLY inside a comma
+                         ;; of the enclosing backquote — compiles fine on the
+                         ;; SBCL host but the MVM compiler cannot compile the
+                         ;; inner commas when it compiles THIS file into the
+                         ;; image: it emits `;; WARN: cannot compile
+                         ;; ,MIN-INST-LEN, using nil' and substitutes NIL.  The
+                         ;; in-image DEFSTRUCT then built a setter template with
+                         ;; NIL where the slot index belonged and every runtime
+                         ;; `(defstruct s a b)' died with a TYPE-ERROR during
+                         ;; expansion — while the host-compiled image sources
+                         ;; were perfectly fine, so only the CLI showed it.
+                         ;; The nested-backquote-inside-`,@(mapcar (lambda …))'
+                         ;; sites elsewhere in this file are safe because the
+                         ;; inner backquote sits in a LAMBDA body, a separate
+                         ;; compilation scope.
+                         (checked-store
+                           `(if (= (obj-subtag obj) #x32)
+                                (if (>= (%prim-array-length obj) ,min-inst-len)
+                                    (%prim-aset obj ,(+ 2 i) val)
+                                    (%signal-type-error))
+                                (%signal-type-error)))
+                         ;; CLHS 3.4.6: a :READ-ONLY slot has no writer at all.
+                         ;; Modus always emits SET-<ACC> / SETF-<ACC> (the SETF
+                         ;; place expansion calls SET-<ACC> unconditionally), so
+                         ;; suppressing the DEFUNs would degrade `(setf (ro-r1 x)
+                         ;; 1)` into an UNDEFINED-FUNCTION rather than a clear
+                         ;; refusal.  Emit the writers, but with a body that
+                         ;; signals and performs no store.
+                         (writer-body
+                           (if slot-read-only
+                               (list '(%signal-program-error))
+                               (list checked-store 'val))))
                     (push `(defun ,(%defstruct-intern setter-name) (obj val)
-                             ,@(or writer-body
-                                   `((if (= (obj-subtag obj) #x32)
-                                         (if (>= (%prim-array-length obj)
-                                                 ,min-inst-len)
-                                             (%prim-aset obj ,(+ 2 i) val)
-                                             (%signal-type-error))
-                                         (%signal-type-error))
-                                     val)))
+                             ,@writer-body)
                           forms-to-compile)
                     ;; Real (setf ACC) FUNCTION (CLHS 3.1.2.1.2.3 arg order:
                     ;; new-value first).  `#'(setf acc)` / `(funcall #'(setf
@@ -18152,14 +18175,7 @@
                     ;; who later writes their own `(defun (setf ACC) …)` DOES
                     ;; register, and wins, which is correct.
                     (push `(defun ,(format nil "SETF-~A" acc-name) (val obj)
-                             ,@(or writer-body
-                                   `((if (= (obj-subtag obj) #x32)
-                                         (if (>= (%prim-array-length obj)
-                                                 ,min-inst-len)
-                                             (%prim-aset obj ,(+ 2 i) val)
-                                             (%signal-type-error))
-                                         (%signal-type-error))
-                                     val)))
+                             ,@writer-body)
                           forms-to-compile)
                     (let ((setter-sym (%defstruct-intern setter-name)))
                       (let ((setf-key (compute-name-hash (format nil "SETF-~A" acc-name))))

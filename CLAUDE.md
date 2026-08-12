@@ -573,6 +573,29 @@ at the end of the image must not overlap the globals or stack. Build scripts ass
 ## MVM Compiler — Source-Quality Guardrails
 
 - **`check-parses` at build time**: Build scripts (`build-x64-linux.lisp`, `build-fixpoint.lisp`, `build-mvm.lisp`) call `modus.mvm::check-parses` on every first-party source file before reading it. A paren mismatch in `%format-impl` once hid behind the lenient in-build reader for weeks, presenting as a fake "late cond branch miscompilation". `check-parses` fails fast with the specific file and error so this can't recur silently. If you write a new build script, wire it into your `mvm-text` wrapper.
+- **Never call `CL:GENSYM` in `mvm/compiler.lisp` — use `%MVM-GENSYM`** (task #251).
+  The compiler's expanders bake names into the image, so `CL:GENSYM` made the
+  emitted binary a function of `CL:*GENSYM-COUNTER*` — i.e. of HOST state, not
+  of source.  `expand-cl-loop`'s `(gensym "NAT")` name reaches the image (99 of
+  them in `build-generic-cli`), so bumping the host counter by ONE — loading a
+  host-only utility that gensyms, adding a `defclass` to a build script,
+  printing through a new stream class so PCL computes a dfun — changed **435
+  bytes** of the 37 MB binary with no semantic difference.  `%MVM-GENSYM` draws
+  from `*mvm-gensym-counter*`, which the compiler owns and `mvm-compile-all`
+  resets, so names depend only on the forms compiled and their order.  Two
+  points that are easy to get wrong if you touch it: (a) names are
+  `PREFIX%<digits>`, and the `%` is load-bearing — this compiler resolves
+  variables by NAME HASH, so an uninterned `Z1` **is** the corpus's `Z1`;
+  `CL:GENSYM` only escaped that because the host counter was already in the
+  tens of thousands.  (b) In-image runtime eval still uses `CL:GENSYM`
+  (image state, emits no bytes); a compile-scoped counter would reset per form
+  and hand two forms the same name.  `check-no-host-gensym` (CHECK F in
+  build-checks.lisp) ratchets this at exactly one sanctioned call.
+  **Reproducibility is testable: build, perturb something host-only, rebuild,
+  `cmp`.** Verified byte-identical under bare `(gensym)` calls, a
+  `defclass`/`defmethod`/PCL-dfun battery, a different build directory, 2000
+  fresh interns + hash-table iteration + `*random-state*`, `LC_ALL`/`TZ`/clean
+  env, and checks-on vs checks-off.
 - **`compile-call` warns on list-headed non-lambda fn**: The old fallback silently emitted `CALL-INDIRECT` on whatever the "function expression" evaluated to, which routed every downstream cond clause through T/NIL indirection for the `~( ~)` paren bug. Now any `((test) body)`-shaped fn (other than `(lambda …)` or `(setf NAME)`) prints `;; WARN compile-call: …` to stderr with the source location. The code still emits the indirect call so ANSI tests that deliberately construct bad callables keep compiling.
 - **`check-global-inits` at build time (#243)**: `mvm/build-checks.lisp` (host-only, loaded by `lib/load-mvm.lisp`, never baked) encapsulates `build-image` and audits the assembled blob **per build script** for globals whose initialisation never runs in *that* image — Active Limitation #7 below. Two checks: `ORPHANED-INITFORM` (non-NIL defvar initform in an image whose `kernel-main` never reaches `init-all-globals`, with no reachable assignment) and `ORPHANED-INITIALISER` (an `INIT-*`/`%INIT-*` defun that sets a global but is unreachable from `kernel-main` — the #242 shape, where the initialiser was correct and simply not called by 3 of 10 build scripts). It fails the build and names the variable. Every build prints a one-line summary. Known-unfixed instances live in `*GLOBAL-CHECK-BASELINE*` (printed, never fatal) so new ones still fail; knobs `MODUS_GLOBAL_CHECK=0|warn|force|dump`. Blobs over 8 MB (only the 4 ANSI gate runners) are skipped by default — the re-read costs ~20 min there.
 

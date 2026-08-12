@@ -1324,6 +1324,80 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
 
 (defvar *build-image-unwrapped* nil)
 
+(defvar *gck-host-gensym-done* nil
+  "Tree-wide like CHECK E — once per SBCL process, not once per BUILD-IMAGE.")
+
+(defun %gck-find-gensym-call (code)
+  "Position of a CL:GENSYM *call* in CODE, or NIL.  The token must be followed
+   by a delimiter: a bare (SEARCH \"(gensym\" …) also fires on the prose
+   `(gensym'd …)' in compiler.lisp's own docstrings — measured, it did."
+  (let ((start 0) (n (length code)))
+    (loop
+      (let ((at (search "(gensym" code :start2 start)))
+        (when (null at) (return nil))
+        (let ((after (+ at 7)))
+          (if (or (>= after n)
+                  (member (char code after) '(#\Space #\Tab #\) #\Newline)))
+              (return at)
+              (setf start (1+ at))))))))
+
+(defun check-no-host-gensym ()
+  "CHECK F (task #251).  mvm/compiler.lisp must not call CL:GENSYM.
+
+   The compiler's macro expanders bake names into the image, and CL:GENSYM
+   draws them from CL:*GENSYM-COUNTER* — a counter the HOST owns.  That made
+   the emitted binary a function of host state: bumping the host counter by ONE
+   (loading a utility that gensyms, adding a DEFCLASS to a build script,
+   printing through a new stream class) moved 435 bytes of the 37 MB image.
+   %MVM-GENSYM fixed it by giving the compiler its own counter.
+
+   Nothing about that fix is self-enforcing: the next `(gensym \"FOO\")` typed
+   into an expander silently reopens the hole, and the only symptom is that
+   builds stop being reproducible — which nobody notices until they try to
+   `cmp` two of them.  So: ratchet it.  Exactly ONE CL:GENSYM call is allowed
+   in the file, the one inside %MVM-GENSYM's runtime-eval branch.
+
+   Text scan, not a read: this must hold for source as WRITTEN, and a reader
+   would happily accept `(gensym …)` hidden behind a macro anyway."
+  (let ((mode (%gck-mode)))
+    (when (or (eq mode :off) *gck-host-gensym-done* (null *gck-parse-sweep-root*))
+      (return-from check-no-host-gensym nil))
+    (setf *gck-host-gensym-done* t)
+    (let* ((path (merge-pathnames "mvm/compiler.lisp" *gck-parse-sweep-root*))
+           (hits nil)
+           (lineno 0))
+      (when (probe-file path)
+        (with-open-file (s path :direction :input)
+          (loop for line = (read-line s nil nil)
+                while line
+                do (incf lineno)
+                   (let ((i 0) (n (length line)))
+                     ;; Skip a whole-line comment; an inline `;' is handled by
+                     ;; only reporting matches that occur before it.
+                     (loop while (and (< i n) (member (char line i) '(#\Space #\Tab)))
+                           do (incf i))
+                     (unless (and (< i n) (char= (char line i) #\;))
+                       (let* ((semi (position #\; line))
+                              (code (if semi (subseq line 0 semi) line))
+                              (at (%gck-find-gensym-call code)))
+                         (when (and at
+                                    ;; the sole sanctioned call, %MVM-GENSYM's
+                                    ;; runtime-eval branch
+                                    (not (search "(gensym prefix)" code)))
+                           (push (format nil "compiler.lisp:~D: ~A"
+                                         lineno (string-left-trim " " line))
+                                 hits))))))))
+        (when hits
+          (format t "~&*** check-no-host-gensym: ~D CL:GENSYM call~:P in mvm/compiler.lisp ***~%"
+                  (length hits))
+          (dolist (h (nreverse hits)) (format t "  - ~A~%" h))
+          (format t "  Use %MVM-GENSYM instead — see the REPRODUCIBLE BUILDS note at~%")
+          (format t "  the top of mvm/compiler.lisp.  CL:GENSYM there makes the emitted~%")
+          (format t "  image depend on CL:*GENSYM-COUNTER*, i.e. on host state.~%")
+          (when (eq mode :warn)
+            (return-from check-no-host-gensym nil))
+          (%gck-fail "check-no-host-gensym failed")))))
+
 (defun %gck-pre-checks (src)
   "Read the blob ONCE and run every source-level check on it."
   (let ((mode (%gck-mode)))
@@ -1331,6 +1405,8 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
     ;; E is tree-wide and blob-independent, so it runs first and unconditionally
     ;; (the size cap below is about re-reading a 17 MB blob, not about E).
     (%gck-guard "check-source-parses" (check-source-parses))
+    ;; F is tree-wide too, and costs one 1 MB file read once per process.
+    (%gck-guard "check-no-host-gensym" (check-no-host-gensym))
     ;; check-global-inits owns the =dump / size-cap policy; let it run first
     ;; and only pre-read when it would not have skipped anyway.
     (if (or (eq mode :dump)

@@ -238,7 +238,7 @@
     (t
      (let* ((op (car place))
             (args (cdr place))
-            (gs (mapcar (lambda (a) (declare (ignore a)) (gensym "PLC")) args))
+            (gs (mapcar (lambda (a) (declare (ignore a)) (%mvm-gensym "PLC")) args))
             (bindings (mapcar #'list gs args)))
        (cond
          ;; Accessors that mutate their CONTAINER in place (so the store
@@ -256,7 +256,7 @@
           ;; matters when several aset stores run in sequence (psetf/rotatef).
           (values bindings (cons 'aref gs)
                   (lambda (v)
-                    (let ((dg (gensym "AST")))
+                    (let ((dg (%mvm-gensym "AST")))
                       `(let ((,dg (aset ,@gs ,v))) ,dg)))))
          ((name-eq op "NTH")
           (values bindings (cons 'nth gs)
@@ -316,6 +316,73 @@
    so mvm-eval of `(defpackage …)` creates a reader-visible package, matching the
    tree-walker.  At build time it stays NIL, so the host build's DEFPACKAGE
    no-op is byte-identical to before.")
+
+;;; ============================================================
+;;; REPRODUCIBLE BUILDS — the compiler's own GENSYM
+;;; ============================================================
+;;;
+;;; The macro expanders below need fresh, collision-free variable names.  They
+;;; used to call CL:GENSYM, which draws from CL:*GENSYM-COUNTER* — a counter
+;;; owned by the HOST LISP, shared with every other thing the host does.  That
+;;; made the emitted image a function of host state rather than of source:
+;;;
+;;;   * EXPAND-CL-LOOP's `(gensym "NAT")` name reaches the image (99 of them in
+;;;     build-generic-cli).  Bump the host counter by ONE — load a host-only
+;;;     utility that gensyms, add a DEFCLASS to a build script, print through a
+;;;     new stream class so PCL computes a dfun — and 435 bytes of the 37 MB
+;;;     binary change, with no semantic difference whatsoever.
+;;;   * Proved by construction, not argued: appending three bare `(gensym)`
+;;;     forms to a host-only file reproduces a differently-configured build's
+;;;     binary BYTE FOR BYTE (task #251; earlier, d63b677).
+;;;
+;;; That is a reproducibility hole, and reproducibility is load-bearing here:
+;;; "you can read the whole system" is a much weaker claim when you cannot
+;;; rebuild the same bytes twice.  It also cost real time twice as a phantom
+;;; "this unrelated edit changed the binary" mystery, and it forced three
+;;; counter-pinning workarounds into mvm/build-checks.lisp that protected
+;;; exactly one file and nothing else.
+;;;
+;;; FIX: the compiler gets its OWN counter, reset at the top of
+;;; MVM-COMPILE-ALL.  Names are therefore a pure function of the source being
+;;; compiled and the order it is compiled in — nothing the host does before,
+;;; during, or after can move them.  This is the same pattern the compiler
+;;; already uses for every other name it bakes into an image
+;;; (*label-counter*, *kw-rest-counter* → "%KWF-~A-~D",
+;;; *nonlocal-block-tag-counter*); CL:GENSYM was the one holdout.
+;;;
+;;; SHAPE IS PRESERVED: like CL:GENSYM this returns a FRESH UNINTERNED symbol
+;;; named PREFIX + decimal-digits, so any code that inspects the prefix (e.g.
+;;; the "SPECPARM-"/"SAVE-" naming conventions) is unaffected.  Only the digits
+;;; differ, and only because they now come from a counter we own.
+;;;
+;;; RUNTIME EVAL IS UNCHANGED: in-image mvm-eval (*mvm-eval-runtime-p* T and
+;;; NOT a static build) still calls CL:GENSYM.  There, the counter is the
+;;; IMAGE's own state — it emits no bytes, and per-form compilation would reset
+;;; a compile-scoped counter and hand two different forms the same name.  A
+;;; static build (`modus --compile`) DOES take the deterministic path, which is
+;;; what makes a self-compiled image reproducible too.
+
+(defvar *mvm-gensym-counter* 0
+  "The MVM compiler's OWN gensym counter — deliberately NOT CL:*GENSYM-COUNTER*.
+   Reset to 0 at the top of MVM-COMPILE-ALL (by SETQ, not LET: in-image a
+   callee's write to a caller's LET-bound special does not propagate back, so a
+   LET binding here would make every %MVM-GENSYM return the same name).  See
+   the REPRODUCIBLE BUILDS note above.")
+
+(defun %mvm-gensym (&optional (prefix "G"))
+  "Fresh uninterned symbol named PREFIX+digits, from a counter the COMPILER
+   owns.  Drop-in for CL:GENSYM inside the MVM compiler; see the REPRODUCIBLE
+   BUILDS note above for why the host's counter must not be used.
+   Runtime eval in-image still uses CL:GENSYM (image state, emits no bytes)."
+  (if (and *mvm-eval-runtime-p* (not *static-build-p*))
+      (gensym prefix)
+      (progn
+        ;; Defensive OR: this is a defvar, and defvar init-thunks do not run at
+        ;; image boot (CLAUDE.md Active Limitation #7), so in a static build it
+        ;; reads NIL until MVM-COMPILE-ALL's SETQ lands.
+        (setq *mvm-gensym-counter*
+              (+ 1 (if *mvm-gensym-counter* *mvm-gensym-counter* 0)))
+        (make-symbol (format nil "~A~D" prefix *mvm-gensym-counter*)))))
 
 (defun %eval-expander-runtime (lambda-form)
   "Evaluate LAMBDA-FORM (a `(lambda …)` macro-expander) into a CALLABLE, in
@@ -1187,7 +1254,7 @@
           (dolist (a args)
             (if (and (<= j last)
                      (not (%anf-order-insensitive-p a)))
-                (let ((g (gensym "ANF")))
+                (let ((g (%mvm-gensym "ANF")))
                   (setq binds (cons (list g a) binds))
                   (setq new (cons g new)))
                 (setq new (cons a new)))
@@ -2070,7 +2137,7 @@
                   ;; ANSI returns the value of TEST if non-NIL.  Bind to
                   ;; a tmp so test is evaluated only once.
                   (if (null (cdr clause))
-                      (let ((tmp (gensym "CONDV")))
+                      (let ((tmp (%mvm-gensym "CONDV")))
                         `(let ((,tmp ,(car clause)))
                            (if ,tmp ,tmp (cond ,@(cdr clauses)))))
                       `(if ,(car clause)
@@ -2089,7 +2156,7 @@
       (let ((args (cdr form)))
         (cond ((null args) nil)
               ((null (cdr args)) (car args))
-              (t (let ((tmp (gensym "OR")))
+              (t (let ((tmp (%mvm-gensym "OR")))
                    `(let ((,tmp ,(car args)))
                       (if ,tmp ,tmp (or ,@(cdr args))))))))))
 
@@ -2106,7 +2173,7 @@
       (let ((slot-specs (cadr form))
             (instance-form (caddr form))
             (body (cdddr form))
-            (inst-tmp (gensym "WS-INST")))
+            (inst-tmp (%mvm-gensym "WS-INST")))
         `(let ((,inst-tmp ,instance-form))
            (symbol-macrolet
                ,(mapcar (lambda (spec)
@@ -2134,7 +2201,7 @@
       (let ((acc-specs (cadr form))
             (instance-form (caddr form))
             (body (cdddr form))
-            (inst-tmp (gensym "WA-INST")))
+            (inst-tmp (%mvm-gensym "WA-INST")))
         `(let ((,inst-tmp ,instance-form))
            (symbol-macrolet
                ,(mapcar (lambda (spec)
@@ -2160,7 +2227,7 @@
     (lambda (form)
       (let ((keyform (cadr form))
             (clauses (cddr form))
-            (tmp (gensym "CASE")))
+            (tmp (%mvm-gensym "CASE")))
         `(let ((,tmp ,keyform))
            (cond ,@(mapcar (lambda (clause)
                              (let* ((keys (car clause))
@@ -2191,7 +2258,7 @@
     (lambda (form)
       (let ((keyform (cadr form))
             (clauses (cddr form))
-            (tmp (gensym "ECASE")))
+            (tmp (%mvm-gensym "ECASE")))
         `(let ((,tmp ,keyform))
            (cond ,@(let ((out nil))
                      (dolist (clause clauses)
@@ -2217,7 +2284,7 @@
             (body (cddr form)))
         (let ((var (car spec))
               (list-form (cadr spec))
-              (tmp (gensym "DL")))
+              (tmp (%mvm-gensym "DL")))
           `(let ((,tmp ,list-form))
              (loop
                (if (null ,tmp)
@@ -2248,11 +2315,11 @@
       (let ((place (cadr form))
             (delta (if (cddr form) (caddr form) 1)))
         (if (symbolp place)
-            (let ((dg (gensym "DEC")))
+            (let ((dg (%mvm-gensym "DEC")))
               `(let ((,dg ,delta)) (setq ,place (- ,place ,dg))))
             (multiple-value-bind (bindings access writer)
                 (mvm-place-expansion place)
-              (let ((dg (gensym "DEC")))
+              (let ((dg (%mvm-gensym "DEC")))
                 `(let* (,@bindings (,dg ,delta))
                    ,(funcall writer `(- ,access ,dg)))))))))
 
@@ -2268,7 +2335,7 @@
         (loop while pairs do
           (let* ((var (first pairs))
                  (val (second pairs))
-                 (g (gensym "PSQ")))
+                 (g (%mvm-gensym "PSQ")))
             (push (list g val) bindings)
             (push (list 'setq var g) assigns)
             (setq pairs (cddr pairs))))
@@ -2292,7 +2359,7 @@
             (multiple-value-bind (bindings access writer)
                 (mvm-place-expansion place)
               (declare (ignore access))
-              (let ((vg (gensym "PSV")))
+              (let ((vg (%mvm-gensym "PSV")))
                 ;; place subforms first (left-to-right), then the value.
                 (dolist (b bindings) (push b all-bindings))
                 (push (list vg val) all-bindings)
@@ -2327,7 +2394,7 @@
              (let* ((accs (nreverse accs))
                     (wrs (nreverse wrs))
                     ;; read current values into gensyms (in order)
-                    (vgs (mapcar (lambda (a) (declare (ignore a)) (gensym "RTV"))
+                    (vgs (mapcar (lambda (a) (declare (ignore a)) (%mvm-gensym "RTV"))
                                  accs))
                     (read-binds (mapcar #'list vgs accs))
                     ;; rotate: place[i] <- vgs[i+1], place[last] <- vgs[0]
@@ -2361,7 +2428,7 @@
                  (push writer wrs)))
              (let* ((accs (nreverse accs))
                     (wrs (nreverse wrs))
-                    (vgs (mapcar (lambda (a) (declare (ignore a)) (gensym "SHV"))
+                    (vgs (mapcar (lambda (a) (declare (ignore a)) (%mvm-gensym "SHV"))
                                  accs))
                     (read-binds (mapcar #'list vgs accs))
                     ;; p[i] <- vgs[i+1], p[last] <- final-val
@@ -2376,7 +2443,7 @@
     (lambda (form)
       (let ((place (cadr form))
             (indicator (caddr form))
-            (result (gensym "R")))
+            (result (%mvm-gensym "R")))
         (if (symbolp place)
             `(let ((,result (%remf ,place ,indicator)))
                (setq ,place (cdr ,result))
@@ -2393,7 +2460,7 @@
             `(setq ,place (adjoin ,item ,place ,@kwargs))
             (multiple-value-bind (bindings access writer)
                 (mvm-place-expansion place)
-              (let ((ig (gensym "PNI")))
+              (let ((ig (%mvm-gensym "PNI")))
                 `(let* ((,ig ,item) ,@bindings)
                    ,(funcall writer `(adjoin ,ig ,access ,@kwargs)))))))))
 
@@ -2437,7 +2504,7 @@
          '(error "MAX requires at least one argument"))
         ((null (cddr form)) (cadr form))
         ((null (cdddr form))                               ; exactly 2 args
-         (let ((tmp (gensym "MAX")))
+         (let ((tmp (%mvm-gensym "MAX")))
            `(let ((,tmp ,(cadr form)))
               (if (> ,tmp ,(caddr form)) ,tmp ,(caddr form)))))
         (t                                                 ; 3+ args
@@ -2451,7 +2518,7 @@
          '(error "MIN requires at least one argument"))
         ((null (cddr form)) (cadr form))
         ((null (cdddr form))                               ; exactly 2 args
-         (let ((tmp (gensym "MIN")))
+         (let ((tmp (%mvm-gensym "MIN")))
            `(let ((,tmp ,(cadr form)))
               (if (< ,tmp ,(caddr form)) ,tmp ,(caddr form)))))
         (t                                                 ; 3+ args
@@ -2461,7 +2528,7 @@
   (mvm-define-macro "ABS"
     (lambda (form)
       (if (= (length form) 2)
-          (let ((tmp (gensym "ABS")))
+          (let ((tmp (%mvm-gensym "ABS")))
             ;; Complex argument: magnitude = sqrt(realpart^2 + imagpart^2),
             ;; routed through the %complex-abs helper.  Fixnum/real fast path
             ;; otherwise: sign-flip when negative.
@@ -2484,7 +2551,7 @@
   ;; PROG1 → LET + body + return first value
   (mvm-define-macro "PROG1"
     (lambda (form)
-      (let ((tmp (gensym "P1")))
+      (let ((tmp (%mvm-gensym "P1")))
         `(let ((,tmp ,(cadr form)))
            ,@(cddr form)
            ,tmp))))
@@ -2505,7 +2572,7 @@
             `(setq ,place (cons ,val ,place))
             (multiple-value-bind (bindings access writer)
                 (mvm-place-expansion place)
-              (let ((ig (gensym "PSH")))
+              (let ((ig (%mvm-gensym "PSH")))
                 `(let* ((,ig ,val) ,@bindings)
                    ,(funcall writer `(cons ,ig ,access)))))))))
 
@@ -2514,14 +2581,14 @@
   (mvm-define-macro "POP"
     (lambda (form)
       (let ((place (cadr form))
-            (tmp (gensym "POP")))
+            (tmp (%mvm-gensym "POP")))
         (if (symbolp place)
             `(let ((,tmp (car ,place)))
                (setq ,place (cdr ,place))
                ,tmp)
             (multiple-value-bind (bindings access writer)
                 (mvm-place-expansion place)
-              (let ((ag (gensym "POA")))
+              (let ((ag (%mvm-gensym "POA")))
                 `(let* (,@bindings (,ag ,access))
                    ,(funcall writer `(cdr ,ag))
                    (car ,ag))))))))
@@ -2573,7 +2640,7 @@
     (lambda (form)
       (let ((keyform (cadr form))
             (clauses (cddr form))
-            (tmp (gensym "TC")))
+            (tmp (%mvm-gensym "TC")))
         `(let ((,tmp ,keyform))
            (cond ,@(mapcar (lambda (clause)
                              (let ((type (car clause))
@@ -2612,7 +2679,7 @@
                           (setf whole-var (cadr pat))
                           (setf rest-pat (cddr pat)))
                         ;; Bind a temp for the value to avoid re-evaluation
-                        (let ((tmp (gensym "DB")))
+                        (let ((tmp (%mvm-gensym "DB")))
                           (let ((result (list (list tmp acc))))
                             (when whole-var
                               (setf result (append result (list (list whole-var tmp)))))
@@ -2647,7 +2714,7 @@
                                                                       (cadr opt-elt) nil))
                                                      (opt-supplied (if (and (consp opt-elt) (cddr opt-elt))
                                                                        (caddr opt-elt) nil))
-                                                     (next-cur (gensym "DC")))
+                                                     (next-cur (%mvm-gensym "DC")))
                                                 (setf result
                                                       (append result
                                                               (list (list opt-var
@@ -2685,7 +2752,7 @@
                                                                        (caddr key-elt) nil))
                                                      ;; Make :var keyword from var name
                                                      (kw (intern (symbol-name key-var) :keyword))
-                                                     (probe-tmp (gensym "KP")))
+                                                     (probe-tmp (%mvm-gensym "KP")))
                                                 (setf result
                                                       (append result
                                                               (list (list probe-tmp
@@ -2714,7 +2781,7 @@
                                      (setf rest-mode nil))
                                     (t
                                      ;; Normal element: bind car, advance cur to cdr
-                                     (let ((next-cur (gensym "DC")))
+                                     (let ((next-cur (%mvm-gensym "DC")))
                                        ;; For simple symbols: bind directly to (car cur)
                                        ;; For nested patterns: recurse
                                        (setf result
@@ -2806,8 +2873,8 @@
              ;; TAIL non-empty ⇒ a place list was supplied (possibly `()`).
              (places (if (and (consp tail) (listp (car tail))) (car tail) nil))
              (datum-args (if (consp tail) (cdr tail) nil))
-             (rv (gensym "ASSERTR"))
-             (sv (gensym "ASSERTV"))
+             (rv (%mvm-gensym "ASSERTR"))
+             (sv (%mvm-gensym "ASSERTV"))
              (err-form (if datum-args
                            `(error ,@datum-args)
                            `(error "Assertion failed: ~S" ',test))))
@@ -2918,7 +2985,7 @@
     (lambda (form)
       (let ((args (cdr form))
             (n (length (cdr form)))
-            (var (gensym "VEC")))
+            (var (%mvm-gensym "VEC")))
         `(let ((,var (make-array ,n)))
            ,@(loop for arg in args
                    for i from 0
@@ -2971,8 +3038,8 @@
                 ;;     this — they used to see D's (incf i) skipped.
                 ((and (consp place) (name-eq (car place) "GETHASH"))
                  (if (cdddr place)
-                     (let ((kt (gensym "K")) (ht (gensym "H"))
-                           (dt (gensym "D")))
+                     (let ((kt (%mvm-gensym "K")) (ht (%mvm-gensym "H"))
+                           (dt (%mvm-gensym "D")))
                        `(let* ((,kt ,(cadr place))
                                (,ht ,(caddr place))
                                (,dt ,(cadddr place)))
@@ -2995,7 +3062,7 @@
                 ;; Bind val to a temp so it's evaluated exactly once and
                 ;; returned after the store.
                 ((and (consp place) (name-eq (car place) "LDB"))
-                 (let ((vt (gensym "LDBV")))
+                 (let ((vt (%mvm-gensym "LDBV")))
                    `(let ((,vt ,value))
                       ,(if (symbolp (caddr place))
                            `(setq ,(caddr place)
@@ -3009,7 +3076,7 @@
                 ;; corresponding bits of val (CLHS).  Same return-newval
                 ;; contract as LDB.
                 ((and (consp place) (name-eq (car place) "MASK-FIELD"))
-                 (let ((vt (gensym "MFV")))
+                 (let ((vt (%mvm-gensym "MFV")))
                    `(let ((,vt ,value))
                       ,(if (symbolp (caddr place))
                            `(setq ,(caddr place)
@@ -3098,9 +3165,9 @@
                         (pargs  (cdr place))
                         (gargs  (mapcar (lambda (a)
                                           (declare (ignore a))
-                                          (gensym "SFA"))
+                                          (%mvm-gensym "SFA"))
                                         pargs))
-                        (gval   (gensym "SFV")))
+                        (gval   (%mvm-gensym "SFV")))
                    `(let* (,@(mapcar #'list gargs pargs)
                            (,gval ,value))
                       (,setter ,gval ,@gargs)
@@ -3189,8 +3256,8 @@
                      (store-list store-vars)
                      (body-forms body))
                  (lambda (place-args value-form)
-                   (let* ((var-gensyms   (mapcar (lambda (v) (gensym (symbol-name v))) vars-list))
-                          (store-gensyms (mapcar (lambda (v) (gensym (symbol-name v))) store-list))
+                   (let* ((var-gensyms   (mapcar (lambda (v) (%mvm-gensym (symbol-name v))) vars-list))
+                          (store-gensyms (mapcar (lambda (v) (%mvm-gensym (symbol-name v))) store-list))
                           ;; Compile a one-shot lambda whose params are
                           ;; the original var/store-var names; calling
                           ;; it with the gensyms makes every reference
@@ -3273,7 +3340,7 @@
         ;; place is typically a quoted form like (quote (my-car x)).
         ;; We return code that, at runtime, builds the 5-value tuple from `place'.
         `(let* ((p ,place)
-                (g (gensym "GSE-")))
+                (g (%mvm-gensym "GSE-")))
            (if (consp p)
                (values nil
                        (cdr p)
@@ -3400,7 +3467,7 @@
   (mvm-define-macro "POP"
     (lambda (form)
       (let ((place (cadr form))
-            (tmp (gensym "POP")))
+            (tmp (%mvm-gensym "POP")))
         `(let ((,tmp (car ,place)))
            (setf ,place (cdr ,place))
            ,tmp))))
@@ -3417,7 +3484,7 @@
     (lambda (form)
       (let ((first-form (cadr form))
             (rest-forms (cddr form))
-            (tmp (gensym "P1")))
+            (tmp (%mvm-gensym "P1")))
         `(let ((,tmp ,first-form))
            ,@rest-forms
            ,tmp))))
@@ -3428,7 +3495,7 @@
       (let ((first-form (cadr form))
             (second-form (caddr form))
             (rest-forms (cdddr form))
-            (tmp (gensym "P2")))
+            (tmp (%mvm-gensym "P2")))
         `(progn ,first-form
                 (let ((,tmp ,second-form))
                   ,@rest-forms
@@ -3494,7 +3561,7 @@
           ;; gensym tmpvars to capture the new values before any setq fires.
           (setf tmpvars (mapcar (lambda (v s)
                                   (declare (ignore s))
-                                  (gensym (concatenate 'string "DO-" (symbol-name v))))
+                                  (%mvm-gensym (concatenate 'string "DO-" (symbol-name v))))
                                 vars steps))
           `(let ,(mapcar #'list vars inits)
              (loop
@@ -3546,7 +3613,7 @@
              (list-form (cadr spec))
              (result (caddr spec))
              (body (cddr form))
-             (tmp (gensym "DL")))
+             (tmp (%mvm-gensym "DL")))
         `(block nil
            (let ((,tmp ,list-form) (,var nil))
              (loop
@@ -3564,7 +3631,7 @@
     (lambda (form)
       (let ((first (cadr form))
             (rest (cddr form))
-            (tmp (gensym "MVP1")))
+            (tmp (%mvm-gensym "MVP1")))
         (if rest
             `(let ((,tmp (multiple-value-list ,first)))
                ,@rest
@@ -3583,7 +3650,7 @@
   ;; value, losing VALID.  +60 ANSI subtypep tests gated on this.
   (mvm-define-macro "NOTNOT-MV"
     (lambda (form)
-      (let ((tmp (gensym "NNMV")))
+      (let ((tmp (%mvm-gensym "NNMV")))
         `(let ((,tmp (multiple-value-list ,(cadr form))))
            (%notnot-mv-fn ,tmp)))))
 
@@ -3626,8 +3693,8 @@
              (pkg (if (cdr spec) (cadr spec) '*package*))
              (result (and (cddr spec) (caddr spec)))
              (body (cddr form))
-             (syms (gensym "DS-SYMS"))
-             (cur (gensym "DS-CUR")))
+             (syms (%mvm-gensym "DS-SYMS"))
+             (cur (%mvm-gensym "DS-CUR")))
         `(block nil
            (let ((,syms nil))
              (%do-symbols-fn (lambda (,var) (setq ,syms (cons ,var ,syms))) ,pkg)
@@ -3647,8 +3714,8 @@
              (pkg (if (cdr spec) (cadr spec) '*package*))
              (result (and (cddr spec) (caddr spec)))
              (body (cddr form))
-             (syms (gensym "DES-SYMS"))
-             (cur (gensym "DES-CUR")))
+             (syms (%mvm-gensym "DES-SYMS"))
+             (cur (%mvm-gensym "DES-CUR")))
         `(block nil
            (let ((,syms nil))
              (%do-external-symbols-fn
@@ -3668,8 +3735,8 @@
              (var (car spec))
              (result (and (cdr spec) (cadr spec)))
              (body (cddr form))
-             (syms (gensym "DAS-SYMS"))
-             (cur (gensym "DAS-CUR")))
+             (syms (%mvm-gensym "DAS-SYMS"))
+             (cur (%mvm-gensym "DAS-CUR")))
         `(block nil
            (let ((,syms nil))
              (%do-all-symbols-fn (lambda (,var) (setq ,syms (cons ,var ,syms))))
@@ -3704,8 +3771,8 @@
              (pkg-form  (cadr binding))
              (types     (cddr binding))
              (body      (cddr form))
-             (entries   (gensym "WPI-ENTRIES"))
-             (top       (gensym "WPI-TOP")))
+             (entries   (%mvm-gensym "WPI-ENTRIES"))
+             (top       (%mvm-gensym "WPI-TOP")))
         `(let ((,entries (%collect-package-symbols ,pkg-form ',types)))
            (flet ((,mname ()
                     (if (null ,entries)
@@ -3848,7 +3915,7 @@
     (lambda (form)
       (let ((vars (cadr form))
             (val-form (caddr form))
-            (tmp (gensym "MVS")))
+            (tmp (%mvm-gensym "MVS")))
         (cond
           ((null vars) val-form)
           ((null (cdr vars)) `(setf ,(car vars) ,val-form))
@@ -3893,9 +3960,9 @@
                    (body (cddr lam))
                    (k-var (car params))
                    (v-var (cadr params))
-                   (ht-tmp (gensym "MH-HT"))
-                   (cur-tmp (gensym "MH-CUR"))
-                   (pair-tmp (gensym "MH-PAIR")))
+                   (ht-tmp (%mvm-gensym "MH-HT"))
+                   (cur-tmp (%mvm-gensym "MH-CUR"))
+                   (pair-tmp (%mvm-gensym "MH-PAIR")))
               `(let ((,ht-tmp ,ht-form))
                  (let ((,cur-tmp (car ,ht-tmp)))
                    (loop (when (null ,cur-tmp) (return nil))
@@ -3979,7 +4046,7 @@
              (combination nil)
              (apo nil)
              (inline-methods nil)
-             (args-var (gensym "GF-ARGS")))
+             (args-var (%mvm-gensym "GF-ARGS")))
         ;; Scan options for :method-combination / :argument-precedence-order /
         ;; (:method ...) — documentation and others are ignored (mvm-eval has no
         ;; runtime option validator; the tree-walker remains the reference for
@@ -4123,7 +4190,7 @@
              (params nil)
              (lambda-params nil)
              (in-tail nil)
-             (args-var (gensym "M-ARGS")))
+             (args-var (%mvm-gensym "M-ARGS")))
         (dolist (p sll)
           (cond
             ((and (symbolp p)
@@ -5833,7 +5900,7 @@
       ((and (member op-name '(197056347 210261673 190453506 141337206 411375988))  ; < > = <= >=
             (= (length (cdr form)) 3))
        (let ((a (cadr form)) (b (caddr form)) (c (cadddr form))
-             (ta (gensym "CMP-A")) (tb (gensym "CMP-B")) (tc (gensym "CMP-C")))
+             (ta (%mvm-gensym "CMP-A")) (tb (%mvm-gensym "CMP-B")) (tc (%mvm-gensym "CMP-C")))
          (compile-form `(let ((,ta ,a) (,tb ,b) (,tc ,c))
                           (and (,(car form) ,ta ,tb) (,(car form) ,tb ,tc)))
                        env dest)))
@@ -6155,14 +6222,14 @@
            ;; 2 places, one or both complex — use aref/aset
            ((= (length places) 2)
             (let ((p1 (car places)) (p2 (cadr places)))
-              (let ((tmp1 (gensym "R1")) (tmp2 (gensym "R2")))
+              (let ((tmp1 (%mvm-gensym "R1")) (tmp2 (%mvm-gensym "R2")))
                 (compile-form `(let ((,tmp1 ,p1) (,tmp2 ,p2))
                                  (setf ,p1 ,tmp2)
                                  (setf ,p2 ,tmp1)
                                  nil) env dest))))
            ;; N places: chain rotation
            (t
-            (let ((tmps (mapcar (lambda (p) (gensym "RT")) places)))
+            (let ((tmps (mapcar (lambda (p) (%mvm-gensym "RT")) places)))
               (compile-form `(let ,(mapcar #'list tmps places)
                                ,@(mapcar (lambda (place tmp-next)
                                            `(setf ,place ,tmp-next))
@@ -6177,7 +6244,7 @@
          (when (>= (length all) 2)
            (let* ((places (butlast all))
                   (new-val (car (last all)))
-                  (tmps (mapcar (lambda (p) (gensym "SF")) places)))
+                  (tmps (mapcar (lambda (p) (%mvm-gensym "SF")) places)))
              (compile-form `(let ,(mapcar #'list tmps places)
                               ,@(mapcar (lambda (place val)
                                           `(setf ,place ,val))
@@ -6400,7 +6467,7 @@
       ((= op-name 70667059)  ; TYPECASE
        (let ((key-form (cadr form))
              (clauses (cddr form))
-             (tmp (gensym "TC")))
+             (tmp (%mvm-gensym "TC")))
          (compile-form
           `(let ((,tmp ,key-form))
              (cond ,@(mapcar (lambda (clause)
@@ -6424,7 +6491,7 @@
            (= op-name 320052576))   ; CTYPECASE
        (let ((key-form (cadr form))
              (clauses (cddr form))
-             (tmp (gensym "ETC")))
+             (tmp (%mvm-gensym "ETC")))
          (compile-form
           `(let ((,tmp ,key-form))
              (cond ,@(mapcar (lambda (clause)
@@ -7054,11 +7121,11 @@
     ;; Build the clause dispatch that runs in the bytecode handler after an
     ;; invoke-restart longjmp: match (%rc-invoked-index) against each clause's
     ;; positional index, bind its lambda-list to (%rc-invoked-args), run body.
-    (let ((frame-var (gensym "RCFRAME"))
-          (cnd-var   (gensym "RCCND"))
-          (res-var   (gensym "RCRES"))
-          (args-var  (gensym "RCARGS"))
-          (idx-var   (gensym "RCIDX")))
+    (let ((frame-var (%mvm-gensym "RCFRAME"))
+          (cnd-var   (%mvm-gensym "RCCND"))
+          (res-var   (%mvm-gensym "RCRES"))
+          (args-var  (%mvm-gensym "RCARGS"))
+          (idx-var   (%mvm-gensym "RCIDX")))
       (let ((dispatch-clauses nil)
             (idx 0))
         (dolist (p parsed)
@@ -7615,7 +7682,7 @@
             (loop while (consp args) do
               (let ((place (car args))
                     (val   (cadr args))
-                    (tmp   (gensym "PSET-TMP")))
+                    (tmp   (%mvm-gensym "PSET-TMP")))
                 (push `(,tmp ,(cell-rewrite-form val boxed-vars lambda-params)) lets)
                 (push
                  (if (and (symbolp place) (member place boxed-vars :test #'name-equal))
@@ -7861,7 +7928,7 @@
                           `(let ,bindings ,@(or (strip-declares body) (list nil))))
                       env dest))))
   (let* ((special-names (mapcar (lambda (s) (symbol-name s)) specials))
-         (save-vars (mapcar (lambda (s) (gensym (concatenate 'string "SAVE-" (symbol-name s)))) specials))
+         (save-vars (mapcar (lambda (s) (%mvm-gensym (concatenate 'string "SAVE-" (symbol-name s)))) specials))
          (special-bindings nil))
     ;; Collect just the special bindings for save/set/restore generation
     (dolist (binding bindings)
@@ -7882,7 +7949,7 @@
            ;; Per-special TEMP names — carry the init value without
            ;; creating a lexical binding under the special's own name.
            (temp-vars
-             (mapcar (lambda (s) (gensym (concatenate 'string "SPECTMP-" (symbol-name s))))
+             (mapcar (lambda (s) (%mvm-gensym (concatenate 'string "SPECTMP-" (symbol-name s))))
                      specials))
            ;; Sets only for specials that actually have a binding in THIS
            ;; let — a (declare (special *y*)) with no binding form is just
@@ -7954,7 +8021,7 @@
                                                      :test #'string=)))
                                   (if pos
                                       (list rb
-                                            (list (gensym "SPECSET")
+                                            (list (%mvm-gensym "SPECSET")
                                                   `(set-symbol-value
                                                     ,(%global-var-bind-key (nth pos specials))
                                                     ,(nth pos temp-vars))))
@@ -8622,7 +8689,7 @@
                       (return)))
                 (rplacd last tail))
               (setq d-params tail)))
-        (let ((args-var (gensym "MLLARGS"))
+        (let ((args-var (%mvm-gensym "MLLARGS"))
               (inner body))
           (when aux-specs
             (setq inner
@@ -9547,7 +9614,7 @@
                         (existing
                          (setf var existing))
                         (t
-                         (setf var (gensym "CACC"))
+                         (setf var (%mvm-gensym "CACC"))
                          (push (cons var kind) (loop-state-cond-into-acc state))
                          ;; Push as accumulator with no INTO so generate-loop-code
                          ;; treats this gensym as the loop's return value.
@@ -9583,7 +9650,7 @@
              (setf rest (cddr rest))
              ;; FOR NIL is the "dummy iterator" — discard value via gensym
              ;; (binding NIL would error since it's a constant).
-             (when (null var) (setf var (gensym "FORNIL")))
+             (when (null var) (setf var (%mvm-gensym "FORNIL")))
              (when (consp var)
                ;; Destructuring FOR.  Two cases:
                ;;   1. FOR (a b ...) = value-form — flat list, value is captured
@@ -9611,7 +9678,7 @@
                    ((and rest (symbolp (car rest))
                          (= (normalize-name (car rest)) 190453506))  ; =
                     (let ((value-form (cadr rest))
-                          (g (gensym "DSTR")))
+                          (g (%mvm-gensym "DSTR")))
                       (setf rest (cddr rest))
                       (push (make-loop-iter :kind :general :var g
                                             :init-form value-form
@@ -9653,7 +9720,7 @@
                                ;; this and the iterated var IS commonly
                                ;; destructured (key is a cons, etc.).
                                (= nk 262800624))))      ; BEING
-                    (let ((g (gensym "DSTR")))
+                    (let ((g (%mvm-gensym "DSTR")))
                       (setf destr-pairs (%loop-destr-pairs components g))
                       (setf var g))))))
              (when (and var (not (consp var)) rest)
@@ -9729,37 +9796,37 @@
                           do (let ((sub-kw (normalize-name (car rest))))
                                (cond
                                  ((= sub-kw 220023313)  ; FROM
-                                  (let ((g (gensym "FROM")))
+                                  (let ((g (%mvm-gensym "FROM")))
                                     (push (list g (cadr rest)) clause-binds)
                                     (setf start-form g rest (cddr rest))))
                                  ((= sub-kw 528235156)  ; UPFROM
-                                  (let ((g (gensym "UPFROM")))
+                                  (let ((g (%mvm-gensym "UPFROM")))
                                     (push (list g (cadr rest)) clause-binds)
                                     (setf start-form g rest (cddr rest))))
                                  ((= sub-kw 358174843)  ; DOWNFROM
-                                  (let ((g (gensym "DOWNFROM")))
+                                  (let ((g (%mvm-gensym "DOWNFROM")))
                                     (push (list g (cadr rest)) clause-binds)
                                     (setf start-form g downward t rest (cddr rest))))
                                  ((or (= sub-kw 418976108)  ; TO
                                       (= sub-kw 23755929)) ; UPTO
-                                  (let ((g (gensym "TO")))
+                                  (let ((g (%mvm-gensym "TO")))
                                     (push (list g (cadr rest)) clause-binds)
                                     (setf end-test (if downward :downto :to)
                                           end-form g rest (cddr rest))))
                                  ((= sub-kw 128223996)  ; BELOW
-                                  (let ((g (gensym "BELOW")))
+                                  (let ((g (%mvm-gensym "BELOW")))
                                     (push (list g (cadr rest)) clause-binds)
                                     (setf end-test :below end-form g rest (cddr rest))))
                                  ((= sub-kw 372946816)  ; ABOVE
-                                  (let ((g (gensym "ABOVE")))
+                                  (let ((g (%mvm-gensym "ABOVE")))
                                     (push (list g (cadr rest)) clause-binds)
                                     (setf end-test :above end-form g rest (cddr rest))))
                                  ((= sub-kw 404037478)  ; DOWNTO
-                                  (let ((g (gensym "DOWNTO")))
+                                  (let ((g (%mvm-gensym "DOWNTO")))
                                     (push (list g (cadr rest)) clause-binds)
                                     (setf end-test :downto end-form g rest (cddr rest))))
                                  ((= sub-kw 517285148)  ; BY
-                                  (let ((g (gensym "BY")))
+                                  (let ((g (%mvm-gensym "BY")))
                                     (push (list g (cadr rest)) clause-binds)
                                     (setf by-form g rest (cddr rest)))))))
                     ;; Bare DOWNFROM with no end clause: iteration DIRECTION is
@@ -9796,14 +9863,14 @@
                  ((= iter-kw 516392248)  ; IN
                   (setf rest (cdr rest))
                   (let ((list-form (car rest))
-                        (tmp (gensym "LI"))
+                        (tmp (%mvm-gensym "LI"))
                         (by-fn nil))
                     (setf rest (cdr rest))
                     (when (and rest (symbolp (car rest))
                                (= (compute-name-hash (symbol-name (car rest)))
                                   517285148))  ; BY
                       (setf rest (cdr rest))
-                      (let ((g (gensym "INBY")))
+                      (let ((g (%mvm-gensym "INBY")))
                         (push (list g (car rest)) (loop-state-with-bindings state))
                         (setf by-fn g))
                       (setf rest (cdr rest)))
@@ -9817,8 +9884,8 @@
                  ((= iter-kw 18430408)  ; ACROSS
                   (setf rest (cdr rest))
                   (let ((array-form (car rest))
-                        (idx (gensym "LI"))
-                        (arr (gensym "LA")))
+                        (idx (%mvm-gensym "LI"))
+                        (arr (%mvm-gensym "LA")))
                     (setf rest (cdr rest))
                     (push (make-loop-iter :kind :across :var var
                                           :init-form array-form
@@ -9841,7 +9908,7 @@
                                (= (compute-name-hash (symbol-name (car rest)))
                                   517285148))  ; BY
                       (setf rest (cdr rest))
-                      (let ((g (gensym "ONBY")))
+                      (let ((g (%mvm-gensym "ONBY")))
                         (push (list g (car rest)) (loop-state-with-bindings state))
                         (setf by-fn g))
                       (setf rest (cdr rest)))
@@ -9925,7 +9992,7 @@
                                  :kind iter-kind :var var
                                  :init-form src-form
                                  :step-form using-var
-                                 :list-var (gensym "BNG"))
+                                 :list-var (%mvm-gensym "BNG"))
                                 (loop-state-iterations state)))))))
 
                  (t
@@ -9977,7 +10044,7 @@
           ;; REPEAT n
           ((= kw 305832296)  ; REPEAT
            (let ((n-form (cadr rest))
-                 (counter (gensym "RC")))
+                 (counter (%mvm-gensym "RC")))
              (push (make-loop-iter :kind :repeat :var counter
                                     :init-form n-form)
                    (loop-state-iterations state))
@@ -10053,7 +10120,7 @@
                    ;; (loop8 21523/21525/21526/21527 etc.)
                    (cond
                      ((consp var)
-                      (let* ((g (gensym "DSTRW"))
+                      (let* ((g (%mvm-gensym "DSTRW"))
                              (pairs (%loop-destr-pairs var g)))
                         (push (list g init) group)
                         (dolist (pair pairs)
@@ -10456,11 +10523,11 @@
                              (%loop-acc-into-var a))
                             ((member (car a) '(:maximize :minimize))
                              (or shared-extremum
-                                 (setq shared-extremum (gensym "EXTACC"))))
+                                 (setq shared-extremum (%mvm-gensym "EXTACC"))))
                             ((member (car a) '(:sum :count))
                              (or shared-numeric
-                                 (setq shared-numeric (gensym "NUMACC"))))
-                            (t (gensym "ACC"))))
+                                 (setq shared-numeric (%mvm-gensym "NUMACC"))))
+                            (t (%mvm-gensym "ACC"))))
                     accs)))
          ;; Picks "the" return-value acc (first non-INTO acc with a value).
          ;; Used only when there's exactly one anonymous accumulator and the
@@ -10513,7 +10580,7 @@
                (by (or (loop-iter-by-form iter) 1)))
            (push (list var (loop-iter-init-form iter)) bindings)
            (when (loop-iter-end-form iter)
-             (let* ((end-var (gensym "END"))
+             (let* ((end-var (%mvm-gensym "END"))
                     (down-p (member (loop-iter-end-test iter) '(:downto :above)))
                     ;; The body's step already advanced VAR past the last
                     ;; valid value by the time the test fires.  CLHS-correct
@@ -10565,7 +10632,7 @@
          (let ((var (loop-iter-var iter))
                (idx (loop-iter-list-var iter))
                (arr (loop-iter-step-form iter))
-               (lim (gensym "ACROSSLIM")))
+               (lim (%mvm-gensym "ACROSSLIM")))
            (push (list arr (loop-iter-init-form iter)) bindings)
            (push (list idx 0) bindings)
            (push (list var nil) bindings)
@@ -10619,7 +10686,7 @@
          (let ((var (loop-iter-var iter))
                (using (loop-iter-step-form iter))
                (alist (loop-iter-list-var iter))
-               (pair-var (gensym "HP")))
+               (pair-var (%mvm-gensym "HP")))
            (push (list alist `(car ,(loop-iter-init-form iter))) bindings)
            (push (list var nil) bindings)
            (when using (push (list using nil) bindings))
@@ -10636,7 +10703,7 @@
          (let ((var (loop-iter-var iter))
                (using (loop-iter-step-form iter))
                (alist (loop-iter-list-var iter))
-               (pair-var (gensym "HP")))
+               (pair-var (%mvm-gensym "HP")))
            (push (list alist `(car ,(loop-iter-init-form iter))) bindings)
            (push (list var nil) bindings)
            (when using (push (list using nil) bindings))
@@ -10791,8 +10858,8 @@
                    loop-body))
              ;; CLHS 6.1.1.7 FINALLY-skip-on-body-RETURN attempt 2:
              ;; inject (setq %nat t) into each test-form exit.
-             (%nat-var (gensym "NAT"))
-             (%bv-var (gensym "BV"))
+             (%nat-var (%mvm-gensym "NAT"))
+             (%bv-var (%mvm-gensym "BV"))
              (test-forms-with-nat
                (mapcar
                 (lambda (tf)
@@ -11604,7 +11671,7 @@
        ;; (values x) → x, count = 1
        ;; Must evaluate arg FIRST (it may itself be a values form that sets count),
        ;; then override count to 1.
-       (let ((tmp (gensym "V1")))
+       (let ((tmp (%mvm-gensym "V1")))
          (compile-form `(let ((,tmp ,(car args)))
                           (setf (mem-ref ,+mv-count-addr+ :u64) 1)
                           ,tmp)
@@ -11615,7 +11682,7 @@
        (let ((temp-vars nil)
              (bindings nil))
          (dolist (val-form args)
-           (let ((tmp (gensym "MV")))
+           (let ((tmp (%mvm-gensym "MV")))
              (push tmp temp-vars)
              (push (list tmp val-form) bindings)))
          (setf temp-vars (nreverse temp-vars))
@@ -11647,11 +11714,11 @@
    using more than 16 values lose the overflow — semantically wrong but
    bounded; the alternative is silent state corruption that wedges every
    downstream test (most notably tests 16714+ count-if-not)."
-  (let ((lst-tmp (gensym "VL"))
-        (cur-tmp (gensym "VLCUR"))
-        (idx-tmp (gensym "VLIDX"))
-        (cnt-tmp (gensym "VLCNT"))
-        (pri-tmp (gensym "VLPRI")))
+  (let ((lst-tmp (%mvm-gensym "VL"))
+        (cur-tmp (%mvm-gensym "VLCUR"))
+        (idx-tmp (%mvm-gensym "VLIDX"))
+        (cnt-tmp (%mvm-gensym "VLCNT"))
+        (pri-tmp (%mvm-gensym "VLPRI")))
     (compile-form
      `(let* ((,lst-tmp ,list-form)
              (,pri-tmp (if (null ,lst-tmp) nil (car ,lst-tmp)))
@@ -11681,8 +11748,8 @@
   (when (null vars)
     (return-from compile-multiple-value-bind
       (compile-form `(progn ,form ,@body) env dest)))
-  (let* ((primary-var (gensym "MVPRI"))
-         (count-var (gensym "MVC"))
+  (let* ((primary-var (%mvm-gensym "MVPRI"))
+         (count-var (%mvm-gensym "MVC"))
          (bindings nil))
     ;; First: capture primary in its own let scope
     (push (list primary-var form) bindings)
@@ -11860,10 +11927,10 @@
    reads).  Native compilation is unaffected: the inlined reads compile to the
    identical real-memory mem-refs %mv-to-list did.  The expansion is one loop
    (NOT a per-value unroll), so it stays compact at every call site."
-  (let ((pri (gensym "MVPRI"))
-        (cnt (gensym "MVC"))
-        (res (gensym "MVR"))
-        (i   (gensym "MVI")))
+  (let ((pri (%mvm-gensym "MVPRI"))
+        (cnt (%mvm-gensym "MVC"))
+        (res (%mvm-gensym "MVR"))
+        (i   (%mvm-gensym "MVI")))
     (compile-form
      `(progn
         ;; Reset count to 1 so single-valued expressions produce (list val).
@@ -12904,8 +12971,8 @@
       ;; (/ a b …) — pairwise; per-step rational/float dispatch.
       (let ((acc (car args)))
         (dolist (arg (cdr args))
-          (let ((a-sym (gensym "DA"))
-                (b-sym (gensym "DB")))
+          (let ((a-sym (%mvm-gensym "DA"))
+                (b-sym (%mvm-gensym "DB")))
             (setq acc `(let ((,a-sym ,acc) (,b-sym ,arg))
                          (cond ((or (%complex-p ,a-sym) (%complex-p ,b-sym))
                                 (complex-div ,a-sym ,b-sym))
@@ -12970,8 +13037,8 @@
     ;; explicitly across each clobbering op.
     (t
      (destructuring-bind (a b) args
-       (let ((a-sym (gensym "TA"))
-             (b-sym (gensym "TB")))
+       (let ((a-sym (%mvm-gensym "TA"))
+             (b-sym (%mvm-gensym "TB")))
          ;; Tag check on both operands.  Fixnum × fixnum: dispatch the
          ;; old inline :div / :mul / :sub code via %fixnum-truncate2
          ;; (compile-fixnum-truncate2 below).  Any other combination
@@ -13126,9 +13193,9 @@
    test loops' raw (mod big x) HUNG forever.  Reading the second value
    of truncate avoids the wide multiply entirely."
   (destructuring-bind (a b) args
-    (let ((n-sym (gensym "MN"))
-          (d-sym (gensym "MD"))
-          (r-sym (gensym "MR")))
+    (let ((n-sym (%mvm-gensym "MN"))
+          (d-sym (%mvm-gensym "MD"))
+          (r-sym (%mvm-gensym "MR")))
       (compile-form
         `(let* ((,n-sym ,a)
                 (,d-sym ,b)
@@ -13258,7 +13325,7 @@
     ;; 3+ args: chain comparisons with AND, after binding each operand
     ;; to a fresh temp first.
     (t
-     (let* ((tmps (loop for x in args collect (gensym "CMP")))
+     (let* ((tmps (loop for x in args collect (%mvm-gensym "CMP")))
             (binds (loop for tmp in tmps for x in args collect (list tmp x)))
             (op-sym (case branch-op
                       (:blt '<) (:bgt '>) (:beq '=)
@@ -14013,7 +14080,7 @@
    from the extra trampolines, or compile-stringp being recursively
    invoked during build of %mda-stringp itself.  Phase 4b TODO: route
    via a dedicated MDA-aware predicate that doesn't recurse."
-  (let ((g-arg (gensym "STRPA")))
+  (let ((g-arg (%mvm-gensym "STRPA")))
     (compile-form
      `(let ((,g-arg ,arg))
         (if (consp ,g-arg)
@@ -14025,7 +14092,7 @@
   "Compile (arrayp x) — true for any object with a string OR array
    subtag (#x31 or #x32), OR for a multi-dim/adjustable/fp/displaced
    wrapper cons.  Routes wrapper inputs through %wrapper-arrayp."
-  (let ((g (gensym "ARRAYP")))
+  (let ((g (%mvm-gensym "ARRAYP")))
     (compile-form
      `(let ((,g ,arg))
         (if (consp ,g)
@@ -14129,7 +14196,7 @@
    tag-check + NUMERIC-EQUAL-P fallback, which already handles floats,
    ratios, and bignums with proper caller-saved register discipline.
    Was: identity compare against fixnum 0 only, so `(zerop 0.0)` was nil."
-  (let ((sym (gensym "Z")))
+  (let ((sym (%mvm-gensym "Z")))
     (compile-form
       `(let ((,sym ,arg)) (= ,sym 0))
       env dest)))
@@ -14244,7 +14311,7 @@
          (w0 (car wt0)))
     (when (and (%mem-width-promotes-p w0 (cdr wt0))
                (not *target-big-endian-p*))
-      (let ((asym (gensym "MRA")))
+      (let ((asym (%mvm-gensym "MRA")))
         (return-from compile-mem-ref
           (compile-form
             (list 'let (list (list asym addr-form))
@@ -14293,7 +14360,7 @@
          ;; offsets swapped.  Stated rather than silently assumed.
          (when (and (%mem-width-promotes-p width needs-untag)
                     (not *target-big-endian-p*))
-           (let ((asym (gensym "MEMA")) (vsym (gensym "MEMV")))
+           (let ((asym (%mvm-gensym "MEMA")) (vsym (%mvm-gensym "MEMV")))
              (return-from compile-setf
                (compile-form
                  (list 'let (list (list asym addr-form) (list vsym value-form))
@@ -15308,8 +15375,8 @@
 ;;; is a single runtime (obj-subtag arr)==#x11 test — purely additive: for
 ;;; all pre-existing (non-#x11) objects the word path is taken unchanged.
 (defun compile-prim-aref (arr-form idx-form env dest)
-  (let ((g-arr (gensym "PAREFA"))
-        (g-idx (gensym "PAREFI")))
+  (let ((g-arr (%mvm-gensym "PAREFA"))
+        (g-idx (%mvm-gensym "PAREFI")))
     (compile-form
      `(let ((,g-arr ,arr-form) (,g-idx ,idx-form))
         (if (eql (obj-subtag ,g-arr) #x11)
@@ -15318,9 +15385,9 @@
      env dest)))
 
 (defun compile-prim-aset (arr-form idx-form val-form env dest)
-  (let ((g-arr (gensym "PASETA"))
-        (g-idx (gensym "PASETI"))
-        (g-val (gensym "PASETV")))
+  (let ((g-arr (%mvm-gensym "PASETA"))
+        (g-idx (%mvm-gensym "PASETI"))
+        (g-val (%mvm-gensym "PASETV")))
     (compile-form
      `(let ((,g-arr ,arr-form) (,g-idx ,idx-form) (,g-val ,val-form))
         (if (eql (obj-subtag ,g-arr) #x11)
@@ -15391,9 +15458,9 @@
   (when *compile-plain-arrays*
     ;; Image without the CL array runtime: flat word-slot arrays only.
     (return-from compile-aref (compile-word-aref arr-form idx-form env dest)))
-  (let ((g-arr (gensym "AREFA"))
-        (g-idx (gensym "AREFI"))
-        (g-raw (gensym "AREFR")))
+  (let ((g-arr (%mvm-gensym "AREFA"))
+        (g-idx (%mvm-gensym "AREFI"))
+        (g-raw (%mvm-gensym "AREFR")))
     (compile-form
      ;; CL conformance: (aref STRING i) must return a CHARACTER, not the
      ;; raw char-CODE.  All three storage shapes (native MDA char-data,
@@ -15449,10 +15516,10 @@
   (when *compile-plain-arrays*
     (return-from compile-aset
       (compile-word-aset arr-form idx-form val-form env dest)))
-  (let ((g-arr (gensym "ASETA"))
-        (g-idx (gensym "ASETI"))
-        (g-val (gensym "ASETV"))
-        (g-sto (gensym "ASETS")))
+  (let ((g-arr (%mvm-gensym "ASETA"))
+        (g-idx (%mvm-gensym "ASETI"))
+        (g-val (%mvm-gensym "ASETV"))
+        (g-sto (%mvm-gensym "ASETS")))
     (compile-form
      ;; CL conformance mirror of compile-aref: (setf (aref STRING i) ch)
      ;; accepts a CHARACTER and stores its char-CODE into the u8 store,
@@ -15525,7 +15592,7 @@
   (when *compile-plain-arrays*
     (return-from compile-array-length
       (compile-prim-array-length arr-form env dest)))
-  (let ((g-arr (gensym "ALENA")))
+  (let ((g-arr (%mvm-gensym "ALENA")))
     (compile-form
      `(let ((,g-arr ,arr-form))
         (if (consp ,g-arr)
@@ -15920,7 +15987,7 @@
             ;; --- required / &rest: a bare symbol ---
             ((and (symbolp p) (or (eq mode :required) (eq mode :rest)))
              (if (spec-p p)
-                 (let ((g (gensym (concatenate 'string "SPECPARM-"
+                 (let ((g (%mvm-gensym (concatenate 'string "SPECPARM-"
                                                (symbol-name p)))))
                    (push (cons p g) pairs)
                    (push g new-params))
@@ -15941,11 +16008,11 @@
                     (newvar var)
                     (newsup sup))
                (when (spec-p var)
-                 (setq newvar (gensym (concatenate 'string "SPECPARM-"
+                 (setq newvar (%mvm-gensym (concatenate 'string "SPECPARM-"
                                                    (symbol-name var))))
                  (push (cons var newvar) pairs))
                (when (spec-p sup)
-                 (setq newsup (gensym (concatenate 'string "SPECSUP-"
+                 (setq newsup (%mvm-gensym (concatenate 'string "SPECSUP-"
                                                    (symbol-name sup))))
                  (push (cons sup newsup) pairs))
                (push
@@ -16126,11 +16193,11 @@
               ;; and its OWN name still referring to any outer binding.
               (opt-gensyms (mapcar (lambda (o)
                                      (declare (ignore o))
-                                     (gensym "%OPT"))
+                                     (%mvm-gensym "%OPT"))
                                    optional))
               (new-params (append required opt-gensyms (list kw-rest)))
               (rest-slot (+ req-count (length optional)))
-              (nargs-var (when optional (gensym "%NARGS")))
+              (nargs-var (when optional (%mvm-gensym "%NARGS")))
               ;; Build let* bindings in CLHS 3.4.1 order:
               ;;   1. nargs snapshot + &optional rebinds (supplied checks
               ;;      via (> nargs idx); read nargs FIRST, before any
@@ -16256,7 +16323,7 @@
               ;; This mirrors the &key let* path above.
               (opt-gensyms (mapcar (lambda (o)
                                      (declare (ignore o))
-                                     (gensym "%OPT"))
+                                     (%mvm-gensym "%OPT"))
                                    optional))
               (new-params (append required
                                   opt-gensyms
@@ -16272,7 +16339,7 @@
          (cond
            ;; --- &optional present: gensym slots + let* rebind (CLHS scope) ---
            (optional
-            (let ((nargs-var (gensym "%NARGS"))
+            (let ((nargs-var (%mvm-gensym "%NARGS"))
                   (opt-bindings nil)   ; (user-name init) pairs for the let*
                   (key-defaults nil))
               (loop for opt in optional
@@ -17518,7 +17585,7 @@
        ;; 2) Wrap value in let to avoid register clobber when value is
        ;; a function call (which would clobber V0 holding the hash).
        (when has-initform
-         (let ((tmp-var (gensym "INIT-TMP"))
+         (let ((tmp-var (%mvm-gensym "INIT-TMP"))
                (thunk-name (format nil "INIT-~A" (symbol-name name))))
            (push thunk-name *init-thunk-names*)
            (mvm-compile-function
@@ -17538,7 +17605,7 @@
        (setf (gethash name-hash *globals*) t)
        (%note-runtime-special name-hash)
        (when has-initform
-         (let ((tmp-var (gensym "INIT-TMP"))
+         (let ((tmp-var (%mvm-gensym "INIT-TMP"))
                (thunk-name (format nil "INIT-~A" (symbol-name name))))
            (push thunk-name *init-thunk-names*)
            (mvm-compile-function
@@ -17615,7 +17682,7 @@
            ;; *static-build-p* (NIL in every normal host / ANSI-gate build) so
            ;; those stay byte-identical.
            (when *static-build-p*
-             (let ((tmp-var (gensym "INIT-TMP"))
+             (let ((tmp-var (%mvm-gensym "INIT-TMP"))
                    (thunk-name (format nil "INIT-~A" (symbol-name name)))
                    (name-hash (normalize-name name)))
                (push thunk-name *init-thunk-names*)
@@ -18290,6 +18357,15 @@
         (*uwp-seq-counter* 0)
         (*pending-flet-ir* nil)
         (all-ir nil))
+    ;; REPRODUCIBLE BUILDS: reset the compiler's own gensym counter so the
+    ;; names macro expansion bakes into this module depend only on the FORMS
+    ;; being compiled and the order they are compiled in — never on whatever
+    ;; the host (or an earlier check pass) did beforehand.  SETQ, not a LET
+    ;; binding in the list above: in-image a callee's write to a caller's
+    ;; LET-bound special does not propagate back to the caller's binding, so a
+    ;; LET here would make every %MVM-GENSYM read 0 and return the SAME name.
+    ;; (Same reason *init-thunk-names* is not let-bound — see the note below.)
+    (setq *mvm-gensym-counter* 0)
     ;; NOTE: *init-thunk-names* is intentionally NOT let-bound here.  It is
     ;; PUSH-mutated from the defvar/defparameter handler in mvm-compile-toplevel
     ;; (a DIFFERENT function called during phase 1) and read back below to

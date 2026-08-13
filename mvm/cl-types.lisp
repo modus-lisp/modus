@@ -3231,8 +3231,19 @@
                (not (stringp obj))
                (not (eql (obj-subtag obj) #x11))
                (not (and (consp obj) (eql (car obj) 8765432)))))
+         ;; CLHS 4.3 / the SEQUENCE system class: sequence = the union of
+         ;; LIST and VECTOR.  A multi-dimensional array is an ARRAY but NOT
+         ;; a sequence — `(typep (make-array '(2 2)) 'sequence)' is NIL in
+         ;; SBCL/CCL.  The old `(arrayp obj)' accepted rank-2+ MDAs, which
+         ;; made alexandria's PROPER-SEQUENCE (`(or proper-list
+         ;; (and (not list) sequence))') answer T for #2A((1 2) (3 4)).
+         ;; ARRAYP is checked FIRST because Modus' adjustable/displaced
+         ;; array wrappers are CONS-shaped — a `(consp obj)' test would
+         ;; accept an adjustable rank-2 array before the rank test ran.
          ((%typename-eq tn 'sequence)
-          (or (null obj) (consp obj) (arrayp obj)))
+          (if (arrayp obj)
+              (= (array-rank obj) 1)
+              (or (null obj) (consp obj))))
          ((%typename-eq tn 'unsigned-byte) (and (integerp obj) (>= obj 0)))
          ((%typename-eq tn 'signed-byte) (integerp obj))
          ((%typename-eq tn 'function) (or (functionp obj) (%generic-function-p obj)))

@@ -5754,8 +5754,17 @@
                                       (not (eql (obj-subtag obj) #x11))))
          ((eq tn 'bit-vector)    (arrayp obj))
          ((eq tn 'simple-bit-vector) (arrayp obj))
-         ((eq tn 'sequence)      (or (null obj) (consp obj)
-                                     (arrayp obj) (stringp obj)))
+         ;; CLHS 4.3: the SEQUENCE system class is exactly (or list vector).
+         ;; A multi-dimensional array is an ARRAY but NOT a sequence, so the
+         ;; rank must be checked — `(typep (make-array '(2 2)) 'sequence)' is
+         ;; NIL in SBCL/CCL.  With the old unconditional ARRAYP, alexandria's
+         ;; PROPER-SEQUENCE (`(or proper-list (and (not list) sequence))')
+         ;; answered T for #2A((1 2) (3 4)).  ARRAYP is checked BEFORE CONSP
+         ;; because Modus' adjustable/displaced array wrappers are themselves
+         ;; cons-shaped and would otherwise skip the rank test.
+         ((eq tn 'sequence)      (cond ((stringp obj) t)
+                                       ((arrayp obj) (= (array-rank obj) 1))
+                                       (t (or (null obj) (consp obj)))))
          ((eq tn 'function)      (or (functionp obj) (%generic-function-p obj)))
          ((eq tn 'compiled-function) (functionp obj))
          ((eq tn 'generic-function) (%generic-function-p obj))

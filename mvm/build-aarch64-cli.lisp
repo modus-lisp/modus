@@ -729,6 +729,22 @@
   ;; the full surface.  x64 additionally calls %install-runtime-cl-macros here;
   ;; this image deliberately does NOT (see *rt-macros-source* above -- baking
   ;; that table regressed DOTIMES on aarch64).
+  ;; PLATFORM FEATURES.  cl-reader.lisp's %init-reader leaves *features* at
+  ;; (:common-lisp :cl :ansi-cl :modus); on x64 %install-runtime-cl-macros then
+  ;; adds :unix :linux :little-endian (see mvm/runtime-cl-macros.lisp, which is
+  ;; the source of truth for WHY each one is needed).  This image cannot bake
+  ;; that file (see *rt-macros-source* above), so it pushes the same features
+  ;; here.  They are not cosmetic: MEASURED on the ladder, without them
+  ;; trivial-garbage's WEAK-POINTER-VALUE returned its own DOCSTRING (every
+  ;; reader-conditional branch of its body was dropped, leaving the docstring
+  ;; as the whole body), and babel loses both branches of each
+  ;; #+big-endian/#+little-endian pair, giving an odd-length initarg plist.
+  ;; :64-bit is a fact about this target (x64 gets it from the genera surface,
+  ;; which is off here).  :genera is deliberately NOT pushed -- the compat
+  ;; PACKAGES are not installed on this image, so advertising the feature would
+  ;; send libraries down Genera branches that then fail on missing packages.
+  (setq *features* (cons :little-endian
+                         (cons :linux (cons :unix (cons :64-bit *features*)))))
   ;; tar.lisp's *tar-block-size* defvar init-thunk does not run at boot
   ;; (MVM Active Limitation 7); set it so the baked tar reader works.
   (setq *tar-block-size* 512)

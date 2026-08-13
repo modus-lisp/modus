@@ -7538,10 +7538,18 @@
 
 (defun vars-mutated-in-lambdas (body-forms let-vars)
   "Find which of LET-VARS are mutated inside a lambda in BODY-FORMS.
-   Returns a list of variable names that need cell boxing."
+   Returns a list of variable names that need cell boxing.
+
+   Compound forms are MACROEXPANDED before dispatch (%CFV-MACROEXPAND):
+   a LAMBDA/FLET/LABELS that only exists in a macro's EXPANSION is still
+   a closure at compile time, and a mutation inside it still needs the
+   enclosing binding boxed."
   ;; Walk body forms looking for lambdas, then check for setq of let-vars inside them
   (let ((result nil))
     (labels ((scan (form in-lambda)
+               (unless (consp form) (return-from scan))
+               (let ((mx (%cfv-macroexpand form)))
+                 (when mx (setq form mx)))
                (unless (consp form) (return-from scan))
                (let ((op (car form)))
                  (cond
@@ -7712,12 +7720,26 @@
    DONE reads END/LIST while the enclosing LOOP setf's them — unboxed,
    DONE returned the whole string unsplit, and parse-version signalled
    PARSE-ERROR on the un-split segment (asdf gauntlet forms 112/233/236/
-   241).  Callers intersect this with mutated-anywhere before boxing."
+   241).  Callers intersect this with mutated-anywhere before boxing.
+
+   Compound forms are MACROEXPANDED before dispatch (%CFV-MACROEXPAND).
+   A closure that only exists in a macro's EXPANSION captures exactly as
+   a source-level one does — alexandria's DOPLIST wraps its body in a
+   (FLET ((results () … outer-var …)) …), so
+     (let (keys values)
+       (doplist (k v '(a 1 b 2 c 3) (values t (reverse keys) …))
+         (push k keys) (push v values)))
+   read KEYS/VALUES as NIL: unexpanded, this scanner saw no closure at
+   all, KEYS/VALUES were never boxed, and the FLET snapshotted their
+   creation-time (NIL) values while the PUSHes mutated the frame slots."
   (let ((result nil))
     (labels ((note (vs)
                (dolist (v vs)
                  (setq result (adjoin v result :test #'name-equal))))
              (scan (form)
+               (unless (consp form) (return-from scan))
+               (let ((mx (%cfv-macroexpand form)))
+                 (when mx (setq form mx)))
                (unless (consp form) (return-from scan))
                (let ((op (car form)))
                  (cond

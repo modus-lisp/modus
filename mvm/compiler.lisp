@@ -8655,19 +8655,36 @@
    expansions must stay visible inside nested lambdas (their expansions are
    frame-independent forms), while :stack/:reg bindings must NOT leak across
    the unit boundary — those belong to the OUTER frame; real free variables
-   are captured into the closure env instead (%collect-free-vars)."
+   are captured into the closure env instead (%collect-free-vars).
+
+   The FLET/LABELS fn-name mappings (compile-env-fn-names) are threaded
+   through for the same reason: a local function name maps to a UNIQUE
+   GLOBAL name, so calling it from inside a nested lambda is an ordinary
+   static call with no frame dependence at all.  Dropping them made
+   `(labels ((g (ls) … (lambda (x) (g …)) …)) …)' fail to compile with
+   UNDEFINED-FUNCTION G whenever the inner lambda also captured a variable
+   (the capture path is the only one that rebuilds the parent env) —
+   alexandria's MAP-PRODUCT is exactly that shape."
   (let ((out nil)
+        (fns nil)
         (e env))
     (loop
       (when (null e) (return nil))
       (dolist (b (compile-env-bindings e))
         (when (eq (binding-location b) :symbol-macro)
           (setq out (cons b out))))
+      ;; Innermost-first order is preserved: each env's own alist is already
+      ;; innermost-first, we walk envs innermost-first, and the final REVERSE
+      ;; undoes both pushes — so ENV-LOOKUP-FN's first-match ASSOC still sees
+      ;; the innermost shadowing binding first.
+      (dolist (fe (compile-env-fn-names e))
+        (setq fns (cons fe fns)))
       (setq e (compile-env-parent e)))
-    (if out
+    (if (or out fns)
         (make-compile-env :bindings (reverse out)
                           :stack-depth 0
-                          :parent nil)
+                          :parent nil
+                          :fn-names (reverse fns))
         nil)))
 
 ;; %NATIVE-SYM-P is image-only (defined in cl-eval.lisp, part of the bridge

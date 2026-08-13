@@ -4712,7 +4712,15 @@
       ;; as `(symbol-value 'A)` — silently filling the vector with the
       ;; current global value of each element-named variable, breaking
       ;; ~250 SUBSTITUTE-VECTOR / FIND-VECTOR / etc. tests.
-      ((and (vectorp form) (not (stringp form)))
+      ;; ANY rank, not just rank 1.  compile-quote's (arrayp value) branch
+      ;; already rebuilds an arbitrary-rank literal through
+      ;; %quote-array->nested-contents + (make-array DIMS :initial-contents …),
+      ;; the proven runtime MDA path (probes 8420-8429) — but compile-form
+      ;; only ever routed VECTORP here, so `#2A((a b c) (d e f))` missed it,
+      ;; fell through to the terminal cond arm and was SUBSTITUTED WITH NIL
+      ;; ("WARN: cannot compile #2A(…), using nil").  That is the #249
+      ;; silent-degradation class: the literal simply vanished.
+      ((and (arrayp form) (not (stringp form)))
        (compile-quote form dest))
 
       ;; Ratio literal → 2-slot subtag-ratio object with the actual

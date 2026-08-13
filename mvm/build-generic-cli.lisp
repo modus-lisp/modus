@@ -81,6 +81,15 @@
                      (mvm-text "mvm/mcgc-pin.lisp") (string #\Newline))
         "")))
 (defvar *rt-source*       (mvm-text "mvm/rt.lisp"))
+;; RTEST — the RT (Paul Dietz) regression tester as a real CL package, so a
+;; library's OWN test suite (`(:use :cl :foo #+sbcl :sb-rt #-sbcl :rtest)' —
+;; alexandria and everything shaped like it) can be loaded and RUN on Modus
+;; instead of being measured by a handful of hand-written smoke probes.
+;; This is providing a DEPENDENCY, like ASDF, not shimming a test framework:
+;; the semantics are RT's, validated test-for-test against SB-RT.  MUST come
+;; after *rt-source* — its DO-TESTS deliberately shadows rt.lisp's
+;; counter-printing one via last-defun-wins (see mvm/rtest.lisp header).
+(defvar *rtest-pkg-source* (mvm-text "mvm/rtest.lisp"))
 ;; STAGE 1 of retiring the tree-walker: ship the MVM ISA + bytecode
 ;; interpreter into the image so `eval` can eventually = compile→interpret
 ;; (one semantics, shared with the compiler) rather than the divergent
@@ -642,6 +651,7 @@
 (format t "  prelude: ~D chars~%" (length *prelude-source*))
 (format t "  gc:      ~D chars~%" (length *gc-source*))
 (format t "  rt:      ~D chars~%" (length *rt-source*))
+(format t "  rtest:   ~D chars~%" (length *rtest-pkg-source*))
 (format t "  bridge:  ~D chars~%" (length *bridge-source*))
 
 ;;; ============================================================
@@ -833,6 +843,16 @@
   ;; leaves Modus unrecognised, which is the pre-#237 status quo.
   ;; MODUS_NO_GENERA=1 skips it (see %install-genera-compat).
   (handler-case (%install-genera-compat) (t (c) nil))
+  ;; RTEST — the RT regression tester package (mvm/rtest.lisp).  MUST be
+  ;; created HERE, at boot, from image code: a package born at runtime is
+  ;; marked runtime-born and its symbols get package-folded function-table
+  ;; keys, so a runtime-born RTEST would give RTEST:DO-TESTS a different key
+  ;; than the DO-TESTS compiled into this image and every library suite that
+  ;; inherits it through (:use :rtest) would hit UNDEFINED-FUNCTION.  Also
+  ;; overrides the deftest macro installed by %install-deftest-macro above
+  ;; with the RT-faithful one (lazy form, literal expected values).  Wrapped:
+  ;; a failure here must never take down a normal boot.
+  (handler-case (%init-rtest) (t (c) nil))
   ;; ASDF INTERFACE — the ASDF / UIOP / ASDF-USER packages and entry points
   ;; over Modus's OWN loader (net/asdf-interface.lisp).  MUST come after
   ;; %install-runtime-cl-macros (the source uses DOLIST/WHEN/UNLESS/DEFCLASS)
@@ -954,6 +974,7 @@
                        *gc-source*       (string #\Newline)
                        *mcgc-pin-source*
                        *rt-source*       (string #\Newline)
+                       *rtest-pkg-source* (string #\Newline)
                        ;; STAGE 1: so the sft-auto scanner registers the
                        ;; interpreter's defuns (mvm-interpret, make-mvm-state,
                        ;; …) in *symbol-function-table* — without this they
@@ -1199,6 +1220,9 @@
     (string #\Newline)
     *mcgc-pin-source*
     *rt-source*
+    (string #\Newline)
+    ;; RTEST package — AFTER rt.lisp so its DO-TESTS wins (last-defun-wins).
+    *rtest-pkg-source*
     (string #\Newline)
     *rt-macros-source*
     (string #\Newline)

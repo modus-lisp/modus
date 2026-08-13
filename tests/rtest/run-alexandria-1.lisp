@@ -48,13 +48,19 @@
 (sy "EXPECTED-FAILURES" *expected-failures*)
 
 
-;; Tests that DO NOT TERMINATE on Modus.  Each is a bug in the honest
-;; inventory, not an exclusion: RT:SKIP counts as a FAILURE and the test
-;; stays in the 230 denominator.  Found mechanically from the last RT:RUN
-;; line with no following verdict.
-;;   BINOMIAL-COEFFICIENT.1/.2 -- compute correctly in <1s in a fresh
-;;                        image but do not complete after ~217 preceding
-;;                        tests (bignum arithmetic under heap pressure).
+;; The skip list is EMPTY: all 230 tests terminate and pass.  It is kept
+;; (rather than deleted) because RT:SKIP counts as a FAILURE and any test
+;; parked here stays in the 230 denominator -- so the list is the honest
+;; inventory of non-terminating tests, and it is currently empty.  Populate
+;; it mechanically from the last RT:RUN line with no following verdict.
+;; UNSKIPPED: BINOMIAL-COEFFICIENT.1/.2 -- did not complete after ~217
+;;   preceding tests; blamed on "bignum arithmetic under heap pressure".
+;;   The real cause was the native-bridge argument wrapper turning any data
+;;   fixnum equal to an in-module lambda bytecode offset into a closure
+;;   (%MVM-WRAP-ESCAPING, mvm/interp.lisp).  %multiply-range's bisection
+;;   passes small integers (bounds, (truncate (- k j) 2)) across that
+;;   bridge, so one poisoned index derailed the recursion.  Same root cause
+;;   as EXTREMUM.1; both terminate and pass now.
 ;; UNSKIPPED: GAUSSIAN-RANDOM.1 -- was "(random 1.0) out of [0,1)"; the real
 ;;   cause was the free-variable walker not macroexpanding, so the MACROLET
 ;;   `valid' inside gaussian-random's LABELS read MIN/MAX as NIL and the
@@ -79,7 +85,7 @@
       (setq cur (cdr cur)))
     (setq *rtest-skip-names* out)))
 
-(skip-these (list "BINOMIAL-COEFFICIENT.1" "BINOMIAL-COEFFICIENT.2"))
+(skip-these (list))
 (sy "SKIP-NAMES" *rtest-skip-names*)
 
 (sy "PHASE" "run")

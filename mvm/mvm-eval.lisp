@@ -1654,14 +1654,16 @@
                           ft-list))
               (let ((nm (string (function-info-name (car e))))
                     (off (function-info-bytecode-offset (car e))))
-                ;; NEVER record offset 0: at the native bridge a DATA fixnum 0
-                ;; argument (make-list 0 / member 0 / (- 10 j)=0 in nsubstitute's
-                ;; bounds loops) is indistinguishable from a lambda-at-offset-0,
-                ;; and wrapping it into a #x52 trampoline corrupted the callee
-                ;; (make-list "non-negative fixnum", remove returned input
-                ;; unchanged).  %mvm-lambda-offset-p has the matching read-side
-                ;; guard; data-0 priority is correct since the first module
-                ;; function is always a non-lambda (defun / %MVM-EVAL-THUNK).
+                ;; The T vs :DEFUN distinction is now COSMETIC (both entries
+                ;; are accepted by %mvm-module-fn-offset-p, the only reader).
+                ;; It used to matter because %mvm-wrap-escaping had a
+                ;; BARE-INTEGER branch that fired on the T entries alone, and
+                ;; offset 0 was excluded there so a DATA fixnum 0 (make-list 0 /
+                ;; member 0 / (- 10 j)=0 in nsubstitute's bounds loops) would
+                ;; not be wrapped into a #x52 trampoline.  That 0-guard was
+                ;; only ever a partial patch — ANY small data fixnum can equal
+                ;; a lambda offset — so the branch itself is gone; see
+                ;; %MVM-WRAP-ESCAPING in interp.lisp (alexandria EXTREMUM.1).
                 (if (and (or (search "$$LAMBDA" nm) (search "$$CLOSURE" nm))
                          (not (eql off 0)))
                     (puthash off lam-offsets t)
@@ -1673,10 +1675,6 @@
                     ;; any entry INCLUDING offset 0 (the first module fn — a
                     ;; materialized #'SELF closure's slot-0 is very often 0),
                     ;; which is safe because slot-0 of a #x52 is never DATA.
-                    ;; The BARE-INTEGER wrap branch keeps the stricter
-                    ;; %mvm-lambda-offset-p (value T + never 0), so a data
-                    ;; fixnum equal to a defun offset still crosses the
-                    ;; bridge unwrapped (make-list-0/member-0 protection).
                     (puthash off lam-offsets (quote :defun)))))
             ;; WS3 def persistence: install each top-level user DEFUN as a
             ;; re-entrant interp trampoline in BOTH global function tables —

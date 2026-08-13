@@ -450,41 +450,21 @@
                        (cons r (cdr mv))
                        (list r))))))
 
-(defun %mvm-lambda-offset-p (n lam-offsets)
-  "True if integer N is the bytecode entry offset of an mvm-eval LAMBDA / CLOSURE
-   function (as recorded in the LAM-OFFSETS hash, keyed by offset).  Built in
-   mvm-eval-forms from the functions whose names carry the `$$LAMBDA` / `$$CLOSURE`
-   marker — i.e. ONLY genuine lambda bodies, never the %mvm-eval-thunk, helper
-   defuns, or the function at offset 0.  This is what makes a BARE in-module
-   offset (a captureless lambda's fn-addr value) safely distinguishable from an
-   ordinary fixnum DATA argument at the native bridge: a data integer like 0 / 1
-   / 2 (loop counters, indices) is never a lambda entry, so it is left alone.
-   (The earlier ftab-membership test was unsafe: ftab[0] = 0, so the integer 0
-   collided with the first function's offset and got wrapped, breaking loops.)
-
-   N=0 GUARD (WS3, nsubstitute/remove cluster): the comment above CLAIMED offset
-   0 is never a recorded lambda, but empirically it can be — a bridge call with
-   a DATA argument whose VALUE is fixnum 0 (`(make-list 0)`, `(member 0 …)`,
-   `(identity 0)`, and the `(- 10 j)` / `(- j i)` zero results that flow into
-   make-list/make-array in nsubstitute's bounds-loop tests) was wrapped into a
-   #x52 trampoline, so the native callee saw a CLOSURE where it expected the
-   integer 0: make-list → \"size must be a non-negative fixnum\", member/remove →
-   `(eql <trampoline> elt)` never matched (so remove returned its input
-   UNCHANGED), identity → returned the trampoline.  A data fixnum 0 is far more
-   common than a lambda body legitimately at module offset 0, and excluding it is
-   safe: mvm-eval-forms reserves offset 0 for the first named defun / the
-   %MVM-EVAL-THUNK, ordered BEFORE the drained $$LAMBDA / $$CLOSURE bodies (which
-   therefore always get offsets > 0).  mvm-eval-forms also no longer records 0 in
-   lam-offsets; this guard is the matching defense at the read side."
-  (and (integerp n) (not (eql n 0)) lam-offsets
-       (gethash n lam-offsets)))
+;;; NOTE (retired predicate): there used to be a `%mvm-lambda-offset-p' here,
+;;; used by %MVM-WRAP-ESCAPING to decide whether a BARE FIXNUM argument
+;;; crossing the native bridge was really a captureless lambda's bytecode
+;;; entry offset.  That test is UNDECIDABLE and the branch is now GONE — see
+;;; the "NO BARE-INTEGER BRANCH" comment in %MVM-WRAP-ESCAPING below.  The
+;;; successive 0-guards it accumulated (make-list 0 / member 0 / identity 0)
+;;; were patches on an unfixable premise: ANY small data fixnum can equal a
+;;; lambda offset, not just 0.
 
 (defun %mvm-module-fn-offset-p (n lam-offsets)
   "True if integer N is the bytecode entry offset of ANY function in the
    current mvm-eval module — a $$LAMBDA/$$CLOSURE body (entry T) or an ordinary
    defun/flet/thunk (entry :DEFUN, recorded since compile-function-ref
-   materializes #'IN-MODULE-FN as a #x52 closure).  Unlike
-   %mvm-lambda-offset-p there is NO 0-exclusion: this predicate is consulted
+   materializes #'IN-MODULE-FN as a #x52 closure).  There is NO 0-exclusion:
+   this predicate is consulted
    ONLY on the slot-0 of a #x52 closure object (never on a bare integer that
    could be DATA), and slot-0 of a materialized #'SELF closure is very often
    0 (the first module function).  A native #x52 closure's slot-0 is a
@@ -495,16 +475,47 @@
 
 (defun %mvm-wrap-escaping (v bc ftab rt lam-offsets)
   "If V is an mvm-eval lambda value about to cross to NATIVE code, wrap it in a
-   trampoline so native funcall can invoke it.  Two escaping shapes:
-     - a #x52 CLOSURE object whose slot-0 is a LAMBDA bytecode offset: wrap
-       (slot0 offset, slot1 env).  This is the CAPTURING escaped lambda —
-       `(mapcar (lambda (x) (+ x k)) …)` where k is captured.
-     - a BARE LAMBDA bytecode OFFSET (a fixnum in LAM-OFFSETS): a CAPTURELESS
-       escaped lambda — `(mapcar (lambda (x) (* x 10)) …)`.  op-FN-ADDR stored
-       its offset as a plain fixnum (so the in-module call-indirect path jumps
-       to it); wrap it with NIL env.
+   trampoline so native funcall can invoke it.  ONE escaping shape:
+     - a #x52 CLOSURE object whose slot-0 is a module bytecode offset: wrap
+       (slot0 offset, slot1 env).  This covers BOTH the CAPTURING escaped
+       lambda `(mapcar (lambda (x) (+ x k)) …)` and — under mvm-eval, which is
+       the only place LAM-OFFSETS is ever populated — the CAPTURELESS one
+       `(mapcar (lambda (x) (* x 10)) …)` and #'IN-MODULE-FN, because
+       compile-lambda / compile-function-ref materialize those as #x52
+       closures with a NIL env whenever *MVM-EVAL-RUNTIME-P* is set.
      - everything else (data fixnums, conses, strings, real native fns, etc.)
-       passes through unchanged."
+       passes through unchanged.
+
+   NO BARE-INTEGER BRANCH — and this is load-bearing, not an omission.
+   A bare fixnum carrying a lambda's bytecode ENTRY OFFSET is bit-identical to
+   ordinary integer DATA, so no predicate can tell them apart; the old
+   `%mvm-lambda-offset-p' branch wrapped ANY argument fixnum whose value
+   happened to equal a recorded $$LAMBDA/$$CLOSURE offset into a #x52
+   trampoline, handing the native callee a CLOSURE where it expected a number.
+   Offsets are small (hundreds to low thousands), which is exactly the range
+   ordinary program data lives in, so the collision is routine rather than
+   exotic — it silently corrupts a SINGLE call out of a long run and is
+   invisible until the result is checked.
+
+   Found via alexandria's EXTREMUM.1: `(extremum <shuffled 0..1999> #'<)`
+   returned 2 instead of 0.  EXTREMUM's `(funcall predicate a b)` inside a
+   CAPTURING closure is a native bridge call, so its data arguments went
+   through this wrapper; the flet body sat at bytecode offset 393, so the
+   single element whose VALUE was 393 became a trampoline and `(< 393 x)`
+   answered NIL — resetting the fold accumulator once, mid-loop, and yielding
+   the minimum of a suffix.  Shifting every element by 10^6 made the same
+   permutation correct; that is the whole bug in one experiment.  The failure
+   looked \"intermittent and scale-dependent\" only because whether a
+   mis-compare changes the final answer depends on the data, and WHICH integer
+   is poisoned moves whenever the module's code layout moves.
+
+   Dropping the branch loses nothing: LAM-OFFSETS is built only by
+   MVM-EVAL-FORMS, which unconditionally sets *MVM-EVAL-RUNTIME-P*, and under
+   that flag no captureless lambda / #'IN-MODULE-FN is ever emitted as a bare
+   `:li-func' offset in the first place (compiler.lisp compile-lambda and
+   compile-function-ref both materialize a #x52 closure — see their comments,
+   which already cite this exact hazard).  So the branch could only ever fire
+   on data.  Native builds never populate LAM-OFFSETS at all."
   (cond
     ;; #x52 closure with a lambda offset in slot 0 → capturing lambda.
     ;; NB: native functionp is TRUE for a #x52 closure object, so this MUST be
@@ -516,13 +527,7 @@
           (= (obj-subtag v) #x52)
           (%mvm-module-fn-offset-p (%prim-aref v 0) lam-offsets))
      (%mvm-make-trampoline bc ftab rt (%prim-aref v 0) (%prim-aref v 1) lam-offsets))
-    ;; Bare lambda offset → captureless lambda.  Requires the entry value T
-    ;; (a genuine $$LAMBDA/$$CLOSURE offset): lam-offsets also carries :DEFUN
-    ;; entries for ordinary module functions (so materialized #'IN-MODULE-FN
-    ;; #x52 closures pass the branches above), and a data fixnum that happens
-    ;; to equal a defun offset must NOT be wrapped here.
-    ((eq (%mvm-lambda-offset-p v lam-offsets) t)
-     (%mvm-make-trampoline bc ftab rt v nil lam-offsets))
+    ;; (No bare-integer branch — see the docstring.)
     (t v)))
 
 (defun %mvm-wrap-escaping-result (v bc ftab rt lam-offsets)

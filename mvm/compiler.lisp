@@ -12091,6 +12091,21 @@
           ((or (= hash (compute-name-hash "WHEN"))
                (= hash (compute-name-hash "UNLESS")))
            (tail-form-is-values-p (cddr form)))
+          ;; and/or — CLHS 5.3: both return ALL the values of their LAST
+          ;; subform, and exactly one value on any short-circuit exit.  So
+          ;; the tail is the last subform, exactly like PROGN.  Falling into
+          ;; the conservative `(t t)' default instead meant the epilogue
+          ;; NEVER clamped MV-count for an AND-tailed function, so a stale
+          ;; count from an inner producer leaked out:
+          ;;   (and … (= 42 (gethash x tbl)))  -- GETHASH stores count=2,
+          ;;   the inline `=' stores nothing -- so MULTIPLE-VALUE-LIST of the
+          ;;   whole form manufactured a phantom second value
+          ;;   (alexandria ENSURE-GETHASH.1 got (T T), want (T)).
+          ;; `(and)' / `(or)' with no subforms are constants; (cdr form) is
+          ;; NIL and tail-form-is-values-p answers NIL (clamp), correct.
+          ((or (= hash (compute-name-hash "AND"))
+               (= hash (compute-name-hash "OR")))
+           (tail-form-is-values-p (cdr form)))
           ;; loop / block — walk body looking for any (return (values ...))
           ;; or (return-from NAME (values ...)).  Required so functions whose
           ;; tail is a loop with multi-value return don't get MV-COUNT=1

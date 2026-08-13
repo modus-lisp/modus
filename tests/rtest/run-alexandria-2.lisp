@@ -1,4 +1,4 @@
-;;;; Run alexandria's OWN test suite (alexandria-1/tests.lisp, UNMODIFIED) on
+;;;; Run alexandria's OWN test suite (alexandria-2/tests.lisp, UNMODIFIED) on
 ;;;; Modus, through the RTEST package (mvm/rtest.lisp).
 ;;;;
 ;;;; Ground truth from the SBCL oracle: 230 tests register on the non-SBCL
@@ -26,7 +26,7 @@
       (%it-eval-source (tar-bytes-to-string (%it-slurp-bytes path)) path)
     (t (c) (list :FILE-ABORT (handler-case (type-of c) (t (c2) :UNKNOWN))))))
 
-(sy "SUITE" "alexandria-1")
+(sy "SUITE" "alexandria-2")
 (sy "PHASE" "install")
 (sy "INSTALL"
     (handler-case (progn (install-tarball "/home/claude/lf/tars/alexandria.tar"
@@ -41,10 +41,10 @@
 (sy "PHASE" "load-tests")
 (sy "TESTS-FORMS-EVALED"
     (load-source-file
-     "/home/claude/quicklisp/dists/quicklisp/software/alexandria-20241012-git/alexandria-1/tests.lisp"))
-(sy "PKG-ALEXANDRIA-TESTS" (if (find-package "ALEXANDRIA/TESTS") t nil))
+     "/home/claude/quicklisp/dists/quicklisp/software/alexandria-20241012-git/alexandria-2/tests.lisp"))
+(sy "PKG-ALEXANDRIA-TESTS" (if (find-package "ALEXANDRIA-2/TESTS") t nil))
 (sy "REGISTERED" (length *rtest-entries*))
-(sy "ORACLE-REGISTERED" 230)
+(sy "ORACLE-REGISTERED" 20)
 (sy "EXPECTED-FAILURES" *expected-failures*)
 
 
@@ -74,7 +74,7 @@
       (setq cur (cdr cur)))
     (setq *rtest-skip-names* out)))
 
-(skip-these (list "GAUSSIAN-RANDOM.1" "BINOMIAL-COEFFICIENT.1" "BINOMIAL-COEFFICIENT.2"))
+(skip-these (list))  ; no known non-terminating test in alexandria-2
 (sy "SKIP-NAMES" *rtest-skip-names*)
 
 (sy "PHASE" "run")

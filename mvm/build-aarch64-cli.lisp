@@ -687,7 +687,13 @@
   (setq most-positive-fixnum  +fixnum-max+)
   (setq most-negative-fixnum +fixnum-neg-limit+)
   (setq pi 3.141592653589793d0)
-  (setq *default-pathname-defaults* \"/tmp/\")
+  ;; \"\" — NOT \"/tmp/\".  x64's build-generic-cli leaves this empty, so a
+  ;; relative pathname resolves against the process's cwd, which is what SBCL
+  ;; does and what every `modus --load some/rel/path.lisp' invocation assumes.
+  ;; With \"/tmp/\" here, `--load tests/rtest/run-alexandria-1.lisp' from the
+  ;; repo root died with FILE-ERROR on aarch64 while succeeding on x64, and
+  ;; (probe-file \"tests/...\") returned NIL against a file that exists.
+  (setq *default-pathname-defaults* \"\")
 
   ;; WS4 AArch64 JIT co-init: populate the translator's defparameter tables
   ;; (item 7 — init-thunks don't run) and, for the JIT, set stack-align-16 +

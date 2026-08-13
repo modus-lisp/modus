@@ -2303,6 +2303,17 @@
      (let ((s (%make-string-array 1)))
        (aset s 0 (char-code x))
        s))
+    ;; Native MVM symbol (#x50) / keyword (#x53).  %CL-SYM-P is false for
+    ;; these — they are heap objects, not (cons *sym-tag* …) wrappers — so
+    ;; without this branch `(string :a)' fell through to `(t x)' and RETURNED
+    ;; THE KEYWORD ITSELF.  That silently broke every string-designator use:
+    ;; alexandria's SET-EQUAL.4 (`:key 'string :test 'equal') compared a
+    ;; keyword object against the string "A" and got NIL.  Same recovery
+    ;; path %STRING-COERCE already uses for string-upcase/downcase/trim.
+    ((and (not (fixnump x)) (not (null x)) (not (consp x))
+          (let ((st (obj-subtag x)))
+            (or (= st #x50) (= st #x53))))
+     (symbol-name x))
     (t x)))
 
 ;;; --- Signal handling: catch SIGSEGV/SIGBUS/SIGFPE/SIGILL ---

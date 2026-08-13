@@ -378,9 +378,18 @@
 (defun %jit-write-movz-quad (base off word)
   "WS4-S5 (aarch64): patch a MOVZ/MOVK quad (4 consecutive 32-bit words) at
    BASE+OFF with the 4 imm16 halves of WORD.  Register-agnostic: reads each
-   placeholder word (imm=0) and ORs in (half << 5), preserving the placeholder's
-   Rd + move-wide opcode base — so a li-const/fn-addr site targeting ANY Xd (not
-   just x16) patches correctly.  The aarch64 analogue of %jit-write-imm64."
+   placeholder word and REPLACES its imm16 field (bits 5..20) with (half << 5),
+   preserving the placeholder's Rd + move-wide opcode base — so a li-const/
+   fn-addr site targeting ANY Xd (not just x16) patches correctly.  The aarch64
+   analogue of %jit-write-imm64.
+
+   RE-RUNNABLE (WS5 aa64 const-staleness fix): the imm16 field is CLEARED
+   (#xFFE0001F keeps every bit except 5..20) before the half is OR'd in.  The
+   old code OR'd into a field it assumed was still the 0 placeholder, which is
+   true on the FIRST bake but silently corrupts a re-bake — and a re-bake is
+   exactly what %jit-entry-for must do after a collection moves the const-pool
+   objects.  On a virgin placeholder the mask is a no-op, so first-bake output
+   is byte-identical to before."
   (let ((k 0))
     (loop
       (when (>= k 4) (return nil))
@@ -390,7 +399,7 @@
                         (ash (mem-ref (+ base (+ wo 2)) :u8) 16)
                         (ash (mem-ref (+ base (+ wo 3)) :u8) 24)))
              (imm (logand (ash word (- (* k 16))) #xFFFF))
-             (nw (logior w (ash imm 5))))
+             (nw (logior (logand w #xFFE0001F) (ash imm 5))))
         (setf (mem-ref (+ base wo) :u8) (logand nw 255))
         (setf (mem-ref (+ base (+ wo 1)) :u8) (logand (ash nw -8) 255))
         (setf (mem-ref (+ base (+ wo 2)) :u8) (logand (ash nw -16) 255))
@@ -403,6 +412,15 @@
   (dolist (p cpatches)
     (let ((obj (if *e2-const-pool* (gethash (cdr p) *e2-const-pool*) nil)))
       (%jit-write-imm64 base (car p) (%val->word obj)))))
+
+(defun %jit-patch-consts-aarch64 (base cpatches)
+  "aarch64 sibling of %jit-patch-consts: bake each live const-pool object's
+   tagged word into its MOVZ/MOVK quad.  CPATCHES = list of (movz-byte-off .
+   pool-idx).  Re-runnable after GC (see %jit-write-movz-quad's imm16 clear).
+   The caller must flush the I-cache over the patched range."
+  (dolist (p cpatches)
+    (let ((obj (if *e2-const-pool* (gethash (cdr p) *e2-const-pool*) nil)))
+      (%jit-write-movz-quad base (car p) (%val->word obj)))))
 
 (defun %jit-reloc-calls (base relocs rt-table)
   "Patch each out-of-module CALL movabs with the resolved native callee address.
@@ -844,10 +862,25 @@
    an exec page, copy the native words, relocate out-of-module CALLs (untagged
    callee addr = word-3) + #'NAME fn-addrs (tagged word) + patch li-const quads
    (pool object tagged word), flush the I-cache, and return a jit-entry
-   (base eoff nil gc-stamp).  cpatches is NIL: GC is off on aarch64-linux so the
-   const-pool never moves and %jit-entry-for's post-GC re-bake never fires.
+   (base eoff cpatches gc-stamp psize).
    Returns NIL if any reloc failed to resolve (→ interpret fallback).  MAY signal
-   a translator gap — the %jit-translate-page guard turns it into NIL."
+   a translator gap — the %jit-translate-page guard turns it into NIL.
+
+   WS5 #203 CORRECTION (this was THE aarch64 library-macro bug).  The old
+   docstring here claimed \"cpatches is NIL: GC is off on aarch64-linux so the
+   const-pool never moves and %jit-entry-for's post-GC re-bake never fires\".
+   GC is NOT off on aarch64-linux — it collects exactly like x64, just sooner.
+   So every JIT'd aarch64 page baked const-pool HEAP addresses that went
+   permanently stale at the first collection, with (a) no GC-safety gate and
+   (b) cpatches = NIL, which made %jit-entry-for's re-bake a no-op.  A runtime
+   DEFMACRO's expander is a closure living in such a page, so after one GC:
+       (eval '(defmacro m (a b) (list '+ a b)))  … one GC …
+       (macroexpand-1 '(m 2 3))  =>  (#<?> 2 3)
+   — the whole \"library FUNCTIONS work but library MACROS fail\" class
+   (alexandria/bordeaux-threads/iterate/cl-utilities on the aarch64 ladder).
+   x64 closed this with the GC-SAFETY GATE in %jit-translate-page-1; that gate
+   is now ported here verbatim in intent, and cpatches is carried so the
+   thunk's own consts are re-baked on a post-GC cache hit."
   (setq *aarch64-jit-mode* t)
   ;; WS5 aarch64 JIT: function entries must be 16-BYTE aligned inside the exec
   ;; page.  A closure's fn-addr slot is tagged with +tag-function+ (3) and
@@ -864,6 +897,49 @@
   (let ((ftbl (make-hash-table :test (quote eql))))
     (let ((i 0)) (dolist (e ft-list) (setf (gethash i ftbl) (cadr e)) (setq i (+ i 1))))
     (multiple-value-bind (nbuf fn-map) (translate-mvm-to-aarch64 bc ftbl)
+      ;; ============================================================
+      ;; GC-SAFETY GATE (R-CONST-BAKED) — aarch64 port of the x64 gate in
+      ;; %jit-translate-page-1.  See that function's long comment for the four
+      ;; hazard shapes; the reasoning is arch-independent, only the encoding
+      ;; (MOVZ/MOVK quad vs movabs imm64) and the offset units differ.
+      ;;
+      ;; A const patch site inside ANY function OTHER than the top-level thunk
+      ;; means a heap address is baked into code that OUTLIVES the seam (a
+      ;; lambda body / closure — e.g. a runtime DEFMACRO expander — or an
+      ;; in-page callee of one).  Nothing re-bakes those, so reject the page
+      ;; and let the module INTERPRET: op-LI-CONST reads *e2-const-pool* at
+      ;; execution time, which the collector keeps live.  Const sites confined
+      ;; to the thunk are allowed — the thunk is entered only through the seam,
+      ;; behind %jit-entry-for's post-GC re-bake.
+      ;;
+      ;; Offsets are BYTE offsets on both sides: *aarch64-li-const-patches*
+      ;; records (movz-byte-pos . pool-idx) and FN-MAP maps an MVM function
+      ;; offset to a native BYTE offset (same units %jit-write-movz-quad and
+      ;; the lrel patch loop below already use).
+      (let ((%cpat *aarch64-li-const-patches*))
+        (when %cpat
+          (let ((%tstart (gethash mvm-entry fn-map)))
+            (if (not (integerp %tstart))
+                ;; No identifiable thunk range → cannot prove any const site is
+                ;; seam-guarded.  Reject.
+                (progn
+                  (setq *jit-r-const-baked*
+                        (if *jit-r-const-baked* (+ 1 *jit-r-const-baked*) 1))
+                  (return-from %jit-translate-page-1-aarch64 nil))
+                ;; THUNK END = the smallest OTHER function start strictly
+                ;; greater than %TSTART, else the end of the buffer.  Scanned
+                ;; (not "next in ft-list") so the answer does not depend on
+                ;; ft-list ordering.
+                (let ((%tend (* (a64-buffer-position nbuf) 4)))
+                  (dolist (%e ft-list)
+                    (let ((%p (gethash (cadr %e) fn-map)))
+                      (when (and (integerp %p) (> %p %tstart) (< %p %tend))
+                        (setq %tend %p))))
+                  (dolist (%cp %cpat)
+                    (when (or (< (car %cp) %tstart) (>= (car %cp) %tend))
+                      (setq *jit-r-const-baked*
+                            (if *jit-r-const-baked* (+ 1 *jit-r-const-baked*) 1))
+                      (return-from %jit-translate-page-1-aarch64 nil))))))))
       (let* ((nwords (a64-buffer-position nbuf))
              (code (a64-buffer-code nbuf))
              (nlen (* nwords 4))
@@ -928,15 +1004,18 @@
                 (%jit-write-movz-quad base (car r) (logior addr 3))
                 (setq ok nil))))
         ;; Quoted-literal / string li-const patches (pool object tagged word).
-        (dolist (p cpat)
-          (let ((obj (if *e2-const-pool* (gethash (cdr p) *e2-const-pool*) nil)))
-            (%jit-write-movz-quad base (car p) (%val->word obj))))
+        ;; Post-gate these are THUNK-ONLY sites, so %jit-entry-for's post-GC
+        ;; re-bake (which runs before the seam re-enters the thunk) covers them.
+        (%jit-patch-consts-aarch64 base cpat)
         (%jit-icache-flush base nlen)
         (if (and ok eoff)
+            ;; 3rd element = CPATCHES, so %jit-entry-for can re-bake after a
+            ;; collection moved the pool objects (was NIL, which silently
+            ;; disabled the re-bake — see the docstring).
             ;; 5th element = PSIZE, so a transient form's page can be munmap'd
             ;; (%jit-free-page base psize) after its native call — see
             ;; %mvm-eval-jit-run's reclamation.
-            (list base eoff nil (%gc-count) psize)
+            (list base eoff cpat (%gc-count) psize)
             nil)))))
 
 (defvar *jit-translate-err-count* 0
@@ -991,7 +1070,18 @@
               ;; nested list place — build + puthash is compiler-safe).
               (let ((fresh (list (car hit) (cadr hit) (caddr hit) now
                                  (car (cddddr hit)) (cadr (cddddr hit)))))
-                (%jit-patch-consts (car fresh) (caddr fresh))
+                ;; Arch-aware: x64 bakes movabs imm64, aarch64 a MOVZ/MOVK
+                ;; quad, and self-modified aarch64 code needs an I-cache flush
+                ;; over the page before it is branched into again.
+                (if (eq *jit-target-arch* :aarch64)
+                    (progn
+                      (%jit-patch-consts-aarch64 (car fresh) (caddr fresh))
+                      (when (caddr fresh)
+                        (%jit-icache-flush (car fresh)
+                                           (if (car (cddddr fresh))
+                                               (car (cddddr fresh))
+                                               4096))))
+                    (%jit-patch-consts (car fresh) (caddr fresh)))
                 (setf (gethash bc *jit-page-cache*) fresh)
                 fresh)))
         (let ((je (%jit-translate-page bc mvm-entry ft-list rt-table)))

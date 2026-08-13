@@ -3357,24 +3357,67 @@
           (t
            (error "MVM compiler: unsupported defsetf form ~S" form))))))
 
-  ;; DEFINE-SETF-EXPANDER — stub.  Tests that use the full 5-value expansion
-  ;; protocol won't get the real semantics, but we register a generic short-form
-  ;; expander so the call form (setf (accessor args...) v) at least dispatches
-  ;; to a (set-accessor args... v) function — the same fallback as the generic
-  ;; struct-accessor case below.  Returns 'accessor.
+  ;; DEFINE-SETF-EXPANDER — CLHS 5.1.1.2 / §define-setf-expander, REAL
+  ;; 5-value protocol.
+  ;;
+  ;; (define-setf-expander ACCESSOR MACRO-LAMBDA-LIST body…) defines a
+  ;; function of the place's SUBFORMS that returns five values:
+  ;;   temps, vals, store-vars, storing-form, accessing-form
+  ;; SETF of (ACCESSOR arg…) is then
+  ;;   (let* ((temp1 val1) … (store NEW-VALUE)) storing-form)
+  ;;
+  ;; It used to be a STUB that registered the generic (SET-<ACCESSOR>
+  ;; args… v) fallback — so any library defining a real expander got an
+  ;; UNDEFINED-FUNCTION on a name nobody defines (alexandria's
+  ;; ASSOC-VALUE / RASSOC-VALUE → `SET-ASSOC-VALUE').  The body is an
+  ;; ordinary macro-expander body over a MACRO lambda-list (&whole /
+  ;; &environment / &key with defaults are all legal here), which is
+  ;; exactly what BUILD-MACROLET-EXPANDER already compiles — reuse it,
+  ;; calling the result with the reconstructed place form.
+  ;;
+  ;; The old SET-<ACCESSOR> fallback is kept for the degenerate shapes
+  ;; (no lambda-list / empty body) and for an expander that errors or
+  ;; returns something other than a usable 5-value set, so nothing that
+  ;; used to expand stops expanding.
   (mvm-define-macro "DEFINE-SETF-EXPANDER"
     (lambda (form)
-      (let ((accessor (cadr form)))
-        ;; Register a generic expander that dispatches to (set-<accessor> ... v)
+      (let* ((accessor (cadr form))
+             (ll       (caddr form))
+             (ebody    (cdddr form))
+             (efn      (and (listp ll) (consp ebody)
+                            (handler-case (build-macrolet-expander ll ebody)
+                              (t (c) (progn c nil))))))
         (mvm-define-setf-expander
           accessor
-          (let ((acc accessor))
+          (let ((acc accessor) (f efn))
             (lambda (place-args value-form)
-              ;; In-image-safe package (see cell-var-name): hardcoded
-              ;; :modus.mvm interns into NIL under mvm-eval → NIL setter head.
-              (let ((setter (intern (format nil "SET-~A" (symbol-name acc))
-                                    (or (find-package "MODUS.MVM") *package*))))
-                `(,setter ,@place-args ,value-form)))))
+              (let ((five (and f
+                               (handler-case
+                                   (multiple-value-list
+                                    (funcall f (cons acc place-args)))
+                                 (t (c) (progn c nil))))))
+                (if (and (consp five) (>= (length five) 4))
+                    (let ((temps  (first five))
+                          (vals   (second five))
+                          (stores (third five))
+                          (setter (fourth five)))
+                      `(let* (,@(let ((tt temps) (vv vals) (bs nil))
+                                  (loop
+                                    (when (or (null tt) (null vv)) (return nil))
+                                    (push (list (car tt) (car vv)) bs)
+                                    (setq tt (cdr tt)) (setq vv (cdr vv)))
+                                  (nreverse bs))
+                              ,@(if (consp stores)
+                                    (list (list (car stores) value-form))
+                                    nil))
+                         ,setter))
+                    ;; Degenerate / failed expander: historic fallback.
+                    ;; In-image-safe package (see cell-var-name): hardcoded
+                    ;; :modus.mvm interns into NIL under mvm-eval → NIL head.
+                    (let ((setter (intern (format nil "SET-~A" (symbol-name acc))
+                                          (or (find-package "MODUS.MVM")
+                                              *package*))))
+                      `(,setter ,@place-args ,value-form)))))))
         `(quote ,accessor))))
 
   ;; DEFINE-MODIFY-MACRO — (define-modify-macro name lambda-list fn [doc])

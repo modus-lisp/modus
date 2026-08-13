@@ -260,10 +260,33 @@
     "(defmacro declare (&rest decls) nil)"
     "(defmacro proclaim (form) nil)"
     "(defmacro declaim (&rest decls) nil)"
-    "(defmacro check-type (place type &rest args) nil)"
+    ;; CHECK-TYPE used to expand to NIL — a NO-OP.  Every runtime-eval'd
+    ;; library that guards its arguments with CHECK-TYPE therefore ran on with
+    ;; the bad value.  That is not merely a missing error: alexandria's
+    ;; READ-STREAM-CONTENT-INTO-STRING does
+    ;;   (check-type buffer-size positive-integer)
+    ;;   (loop :for bytes-read = (read-sequence buffer stream)
+    ;;         :do  (write-sequence buffer datum :start 0 :end bytes-read)
+    ;;         :while (= bytes-read buffer-size))
+    ;; so with :buffer-size 0 the unchecked value makes bytes-read and
+    ;; buffer-size both 0 and the loop SPINS FOREVER
+    ;; (READ-STREAM-CONTENT-INTO-STRING.2 expects a TYPE-ERROR).
+    ;; Signal a real TYPE-ERROR carrying :DATUM/:EXPECTED-TYPE so
+    ;; `(handler-case ... (type-error () ...))' can see it.  (CLHS also
+    ;; specifies a correctable STORE-VALUE restart; not provided here.)
+    "(defmacro check-type (place type &rest args)
+       (list 'unless (list 'typep place (list 'quote type))
+             (list 'error ''type-error :datum place
+                   :expected-type (list 'quote type))))"
     "(defmacro ignore-errors (&rest body)
        (list 'handler-case (cons 'progn body) (list t (list 'c) (list 'values nil 'c))))"
-    "(defmacro with-standard-io-syntax (&rest body) (cons 'progn body))"
+    ;; NOT a PROGN: w-s-i-s must bind the whole printer/reader variable set
+    ;; (notably *PRINT-CASE* to :UPCASE) around BODY.  Route to the existing
+    ;; worker in mvm/cl-reader.lisp, which restores on both the normal and
+    ;; error paths and propagates multiple values.
+    "(defmacro with-standard-io-syntax (&rest body)
+       (list '%with-standard-io-syntax
+             (list 'function (cons 'lambda (cons nil body)))))"
 
     ;; TYPECASE / ETYPECASE — expand to (let ((g KEY)) (cond ((typep g 'T1) ...) ...)).
     ;; Each clause's type spec is quoted and tested with TYPEP.  An OTHERWISE/T

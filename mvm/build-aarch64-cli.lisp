@@ -252,6 +252,118 @@
 ;;; expander silently degrades to a no-op.
 (defvar *runtime-backquote-source* (mvm-text "lib/runtime-backquote.lisp"))
 
+;;; ============================================================
+;;; Library-compatibility surface — parity with x64's build-generic-cli
+;;; ============================================================
+;;;
+;;; The aarch64 CLI baked NONE of the surface a real Common Lisp library needs:
+;;;   * no RTEST package         -> a library's own RT-shaped test suite
+;;;                                 (alexandria and everything that copied its
+;;;                                 layout) cannot even be READ.
+;;;   * no tar / install-tarball -> `install-tarball' was UNDEFINED-FUNCTION, so
+;;;                                 every ladder driver died on its first form.
+;;;   * no runtime CL macro table (mvm/runtime-cl-macros.lisp)
+;;;   * no :GENERA feature surface, no ASDF interface
+;;; All five are present in build-generic-cli, which is exactly why the library
+;;; ladder had only ever been measured on x64.  Baked HERE (in this wrapper, not
+;;; in the shared build-ansi-common.lisp) so the aarch64 ANSI GATE image is
+;;; untouched — the same rule the file-I/O overrides above follow.
+;;;
+;;; RTEST MUST be created at boot from IMAGE code (see %init-rtest's docstring):
+;;; a package born at runtime gets package-folded function-table keys, so a
+;;; runtime-born RTEST would give RTEST:DO-TESTS a different key than the
+;;; image's DO-TESTS and every suite call would hit UNDEFINED-FUNCTION.
+
+;; Strip `chipz::' / `chipz:' qualifiers from install-tarball's never-taken
+;; .tar.gz path: the flat-namespace image reader has no CHIPZ package and would
+;; error `Package CHIPZ does not exist', SILENTLY DROPPING the whole enclosing
+;; form.  Verbatim from build-generic-cli's %cli-strip-chipz.
+(defun %aa64-strip-one-prefix (text pfx)
+  (let ((result text))
+    (loop
+      (let ((pos (search pfx result)))
+        (unless pos (return result))
+        (setf result (concatenate 'string
+                                  (subseq result 0 pos)
+                                  (subseq result (+ pos (length pfx)))))))))
+
+(defun %aa64-strip-chipz (text)
+  (%aa64-strip-one-prefix (%aa64-strip-one-prefix text "chipz::") "chipz:"))
+
+(defun %aa64-escape-lisp-string (text)
+  "Escape TEXT so it can be emitted as a Lisp string literal."
+  (with-output-to-string (out)
+    (loop for c across text
+          do (cond ((char= c #\\) (write-string "\\\\" out))
+                   ((char= c #\") (write-string "\\\"" out))
+                   (t (write-char c out))))))
+
+;; RT (Paul Dietz) regression tester as the RTEST package.  Concatenated AFTER
+;; *rt-source* so its DO-TESTS wins by last-defun-wins.
+(defvar *rtest-pkg-source* (mvm-text "mvm/rtest.lisp"))
+
+;; Runtime CL macro table (when/unless/setf/incf/case/dolist/...), installed by
+;; %install-runtime-cl-macros from kernel-main.
+(defvar *rt-macros-source* (mvm-text "mvm/runtime-cl-macros.lisp"))
+
+;; tar + install-tarball: the untar -> parse-.asd -> topo-sort -> eval pipeline.
+;; GENERAL library primitives, NOT quicklisp wiring.  Baked (not runtime-loaded)
+;; for the reason build-generic-cli documents: %tar-slice's `(make-array LEN)'
+;; with a VARIABLE size hits a pre-existing mvm-eval bug that halves the length.
+(defvar *libload-source*
+  (concatenate 'string
+    (mvm-text "lib/tar.lisp")
+    (string #\Newline)
+    (%aa64-strip-chipz (read-file-text (merge-pathnames "lib/install-tarball.lisp"
+                                                        *modus-base*)))))
+
+;; :GENERA compatibility surface, baked as a boot-evaluated SOURCE STRING (it
+;; names packages CHECK-PARSES cannot resolve on the SBCL build host).
+(defvar *genera-compat-text*
+  (concatenate 'string
+               (read-file-text (merge-pathnames "net/cooperative-atomics.lisp"
+                                                *modus-base*))
+               (string #\Newline)
+               (read-file-text (merge-pathnames "net/genera-compat.lisp"
+                                                *modus-base*))))
+
+(defvar *genera-source*
+  (concatenate 'string "
+(defun %genera-compat-source ()
+  \"" (%aa64-escape-lisp-string *genera-compat-text*) "\")
+
+(defun %install-genera-compat ()
+  (let ((off (%cli-getenv \"MODUS_NO_GENERA\")))
+    (if (and off (> (length off) 0) (not (string= off \"0\")))
+        nil
+        (progn (%it-eval-source (%genera-compat-source) \"genera-compat\") t))))
+"))
+
+;; ASDF / UIOP / ASDF-USER naming layer over Modus's own loader.  Same
+;; boot-evaluated-source-string treatment, same reason.
+(defvar *asdf-interface-text*
+  (read-file-text (merge-pathnames "net/asdf-interface.lisp" *modus-base*)))
+
+(defvar *asdf-source*
+  (concatenate 'string "
+(defun %asdf-interface-source ()
+  \"" (%aa64-escape-lisp-string *asdf-interface-text*) "\")
+
+(defun %install-asdf-interface ()
+  (let ((off (%cli-getenv \"MODUS_NO_ASDF\")))
+    (if (and off (> (length off) 0) (not (string= off \"0\")))
+        nil
+        (progn (%it-eval-source (%asdf-interface-source) \"asdf-interface\") t))))
+"))
+
+(format t "  rtest:   ~D chars~%" (length *rtest-pkg-source*))
+(format t "  rtmacro: ~D chars~%" (length *rt-macros-source*))
+(format t "  libload: ~D chars (tar + install-tarball)~%" (length *libload-source*))
+(format t "  genera:  ~D chars (compat source baked for boot-time eval)~%"
+        (length *genera-compat-text*))
+(format t "  asdf:    ~D chars (interface source baked for boot-time eval)~%"
+        (length *asdf-interface-text*))
+
 ;;; ---- the AArch64 ARM of cli-toplevel -------------------------------------
 ;;;
 ;;; cli-toplevel is arch-neutral EXCEPT for %cli-argv-base — the one place it
@@ -294,7 +406,13 @@
                     (%scan-defun-names-host *rt-source*)
                     (%scan-defun-names-host *bridge-source*)
                     (%scan-defun-names-host *cli-toplevel-source*)
-                    (%scan-defun-names-host *runtime-backquote-source*)))
+                    (%scan-defun-names-host *runtime-backquote-source*)
+                    ;; Library-compat surface: without these, runtime EVAL
+                    ;; cannot resolve INSTALL-TARBALL / %IT-EVAL-SOURCE /
+                    ;; DO-TESTS by name and every driver dies at form 1.
+                    (%scan-defun-names-host *rtest-pkg-source*)
+                    (%scan-defun-names-host *rt-macros-source*)
+                    (%scan-defun-names-host *libload-source*)))
         (format t "  SFT auto-init (+cli-toplevel): ~D unique names / ~D chunk(s)~%"
                 count chunks)
         src))
@@ -585,6 +703,27 @@
   (when (%cli-probe-mode-p)
     (write-string-serial \"cli-jit-default=\") (print-dec (if *cli-jit-on* 1 0))
     (write-char-serial 10))
+
+  ;; --- library-compatibility boot hooks (parity with build-generic-cli) ----
+  ;; ORDER IS LOAD-BEARING and matches x64:
+  ;;   runtime CL macros first (the genera / asdf / library sources all use
+  ;;   DOLIST / WHEN / UNLESS / SETF at runtime-eval time), then the source-
+  ;;   string installs, then RTEST.  Each is wrapped so a failure can never
+  ;;   take down a normal boot.  All of them must run BEFORE cli-toplevel so
+  ;;   ~/.modusrc, --load and --eval already see the full surface.
+  (handler-case (%install-runtime-cl-macros) (t (c) nil))
+  ;; tar.lisp's *tar-block-size* defvar init-thunk does not run at boot
+  ;; (MVM Active Limitation 7); set it so the baked tar reader works.
+  (setq *tar-block-size* 512)
+  (handler-case (%install-genera-compat) (t (c) nil))
+  ;; RTEST — created HERE, at boot, from IMAGE code.  A package born at
+  ;; runtime is marked runtime-born and its symbols get package-folded
+  ;; function-table keys, so a runtime-born RTEST would give RTEST:DO-TESTS a
+  ;; different key than the DO-TESTS compiled into this image and every
+  ;; library suite inheriting it through (:use :rtest) would hit
+  ;; UNDEFINED-FUNCTION.
+  (handler-case (%init-rtest) (t (c) nil))
+  (handler-case (%install-asdf-interface) (t (c) nil))
 
   ;; ISOLATED pure-cons GC milestone (argv 33333) — runs BEFORE any JIT/mvm-eval
   ;; probe so its collection count is UNAMBIGUOUS (Stage-1 native-GC milestone).
@@ -995,7 +1134,9 @@
 
 (setq *sym-name-auto-source*
       (%build-sym-name-auto-source (list *driver-source* *cli-toplevel-source*
-                                         *runtime-backquote-source*)
+                                         *runtime-backquote-source*
+                                         *rtest-pkg-source* *rt-macros-source*
+                                         *libload-source*)
                                    (list *compiler-in-image-source*)))
 
 ;;; ============================================================
@@ -1010,7 +1151,13 @@
     *gc-source*       (string #\Newline)
     *mcgc-pin-source*
     *rt-source*       (string #\Newline)
+    ;; RTEST package — AFTER rt.lisp so its DO-TESTS wins (last-defun-wins).
+    *rtest-pkg-source* (string #\Newline)
+    *rt-macros-source* (string #\Newline)
     *bridge-source*   (string #\Newline)
+    ;; tar + install-tarball — AFTER the bridge (they need read / streams /
+    ;; %sys-* file I/O) so a library tarball can actually be installed.
+    *libload-source*  (string #\Newline)
     ;; MVM ISA + interp + compiler + mvm-eval + translate-aarch64 + co-init.
     *compiler-in-image-source* (string #\Newline)
     "(defvar *sym-name-table* nil)" (string #\Newline)
@@ -1027,6 +1174,12 @@
     *aarch64-fileio-override-source* (string #\Newline)
     *cli-toplevel-source*      (string #\Newline)
     *cli-aarch64-arm-source*   (string #\Newline)
+    ;; :GENERA + ASDF surfaces MUST come BEFORE *driver-source*: kernel-main
+    ;; lives in the driver and calls %install-genera-compat /
+    ;; %install-asdf-interface, and a forward reference across the blob does
+    ;; NOT resolve — it emits a NIL sentinel, i.e. a silent no-op boot hook.
+    *genera-source*            (string #\Newline)
+    *asdf-source*              (string #\Newline)
     *driver-source*            (string #\Newline)
     *cli-jit-default-source*))
 

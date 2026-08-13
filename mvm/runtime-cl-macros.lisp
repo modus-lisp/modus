@@ -306,13 +306,17 @@
                  (list (list t (list 'error \"CTYPECASE: no clause matches\")))))))"
 
     ;; DEFINE-MODIFY-MACRO — (define-modify-macro name lambda-list fn [doc]).
-    ;; Defines NAME as a macro: (name place a b …) => (setf place (fn place a b …)).
-    ;; We ignore the lambda-list's structure and capture all post-place args
-    ;; via &rest, which covers the `(&rest args)' shape ASDF's APPENDF uses.
+    ;; Defines NAME as a macro: (name place a b …) => FN applied to the place's
+    ;; value and the args, stored back.  We ignore the lambda-list's structure
+    ;; and capture all post-place args via &rest, which covers the
+    ;; `(&rest args)' shape ASDF's APPENDF uses.
+    ;; The body delegates to %DMM-EXPAND (compiler.lisp) so the place's
+    ;; subforms are evaluated EXACTLY ONCE (CLHS 5.1.3).  The old body pasted
+    ;; `(setf place (fn place . args))', writing PLACE twice — e.g.
+    ;; (maxf (svref v (incf p)) (incf p)) ran (incf p) three times.
     "(defmacro define-modify-macro (name lambda-list fn &rest doc)
        (list 'defmacro name (list 'place '&rest 'args)
-             (list 'list (list 'quote 'setf) 'place
-                   (list 'list* (list 'quote fn) 'place 'args))))"
+             (list '%dmm-expand (list 'quote fn) 'place 'args)))"
 
     ;; DESTRUCTURING-BIND — expand to (apply (lambda PATTERN BODY) EXPR).
     ;; %bind-params handles &optional/&rest/&key/&aux AND dotted tails, so

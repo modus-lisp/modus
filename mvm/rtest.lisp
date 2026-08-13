@@ -448,13 +448,39 @@
    the BUILD-TIME macro table and never reach runtime EVAL.  Pattern mirrors
    %install-deftest-macro in rt.lisp, which this deliberately overrides —
    that one registers an eagerly-thunked entry for the ANSI harness's
-   RT-RUN-REGISTERED-TESTS, which is a different (Modus-internal) contract."
+   RT-RUN-REGISTERED-TESTS, which is a different (Modus-internal) contract.
+
+   THE EXPANDER ACCEPTS BOTH OF MODUS'S TWO CALLING CONVENTIONS.  Modus has
+   two, and which one you get depends on what shape the expander object is:
+
+     * a compiled expander (which is what `(eval '(lambda …))' produces —
+       eval2 COMPILES the lambda) is called with the WHOLE FORM, the
+       CL-standard convention: macroexpand-1 (cl-eval.lisp) and
+       macroexpand-1-mvm (compiler.lisp) both do `(funcall mf form)'.
+     * an %interp-closure expander (what a runtime DEFMACRO produces) is
+       called with `(cdr form)', i.e. one parameter per macro argument.
+
+   rt.lisp's %install-deftest-macro assumes the SECOND for a lambda that
+   actually takes the FIRST, so its `name' parameter receives the entire
+   `(deftest NAME FORM . VALS)' list.  Measured, not theorised: with the
+   single-convention expander every test registered under the whole form as
+   its NAME, with a NIL body, and all 6 smoke tests failed.  Discriminating
+   on `(consp a)' is exact — a whole form is always a CONS and an RT test
+   NAME is always a SYMBOL — so this is correct under either convention and
+   stays correct if the dispatch changes."
   (set-macro-function 'deftest
-    (eval '(lambda (name form &rest vals)
-             (list 'rtest-add-entry
-                   (list 'quote name)
-                   (list 'quote form)
-                   (list 'quote vals))))))
+    (eval '(lambda (a &rest more)
+             (if (consp a)
+                 ;; Whole-form convention: A = (DEFTEST NAME FORM . VALS).
+                 (list 'rtest-add-entry
+                       (list 'quote (car (cdr a)))
+                       (list 'quote (car (cdr (cdr a))))
+                       (list 'quote (cdr (cdr (cdr a)))))
+                 ;; Arg-list convention: A = NAME, MORE = (FORM . VALS).
+                 (list 'rtest-add-entry
+                       (list 'quote a)
+                       (list 'quote (car more))
+                       (list 'quote (cdr more))))))))
 
 (defun %init-rtest ()
   "Create the RTEST package and initialize RT's specials.

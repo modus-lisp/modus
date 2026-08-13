@@ -3357,24 +3357,67 @@
           (t
            (error "MVM compiler: unsupported defsetf form ~S" form))))))
 
-  ;; DEFINE-SETF-EXPANDER — stub.  Tests that use the full 5-value expansion
-  ;; protocol won't get the real semantics, but we register a generic short-form
-  ;; expander so the call form (setf (accessor args...) v) at least dispatches
-  ;; to a (set-accessor args... v) function — the same fallback as the generic
-  ;; struct-accessor case below.  Returns 'accessor.
+  ;; DEFINE-SETF-EXPANDER — CLHS 5.1.1.2 / §define-setf-expander, REAL
+  ;; 5-value protocol.
+  ;;
+  ;; (define-setf-expander ACCESSOR MACRO-LAMBDA-LIST body…) defines a
+  ;; function of the place's SUBFORMS that returns five values:
+  ;;   temps, vals, store-vars, storing-form, accessing-form
+  ;; SETF of (ACCESSOR arg…) is then
+  ;;   (let* ((temp1 val1) … (store NEW-VALUE)) storing-form)
+  ;;
+  ;; It used to be a STUB that registered the generic (SET-<ACCESSOR>
+  ;; args… v) fallback — so any library defining a real expander got an
+  ;; UNDEFINED-FUNCTION on a name nobody defines (alexandria's
+  ;; ASSOC-VALUE / RASSOC-VALUE → `SET-ASSOC-VALUE').  The body is an
+  ;; ordinary macro-expander body over a MACRO lambda-list (&whole /
+  ;; &environment / &key with defaults are all legal here), which is
+  ;; exactly what BUILD-MACROLET-EXPANDER already compiles — reuse it,
+  ;; calling the result with the reconstructed place form.
+  ;;
+  ;; The old SET-<ACCESSOR> fallback is kept for the degenerate shapes
+  ;; (no lambda-list / empty body) and for an expander that errors or
+  ;; returns something other than a usable 5-value set, so nothing that
+  ;; used to expand stops expanding.
   (mvm-define-macro "DEFINE-SETF-EXPANDER"
     (lambda (form)
-      (let ((accessor (cadr form)))
-        ;; Register a generic expander that dispatches to (set-<accessor> ... v)
+      (let* ((accessor (cadr form))
+             (ll       (caddr form))
+             (ebody    (cdddr form))
+             (efn      (and (listp ll) (consp ebody)
+                            (handler-case (build-macrolet-expander ll ebody)
+                              (t (c) (progn c nil))))))
         (mvm-define-setf-expander
           accessor
-          (let ((acc accessor))
+          (let ((acc accessor) (f efn))
             (lambda (place-args value-form)
-              ;; In-image-safe package (see cell-var-name): hardcoded
-              ;; :modus.mvm interns into NIL under mvm-eval → NIL setter head.
-              (let ((setter (intern (format nil "SET-~A" (symbol-name acc))
-                                    (or (find-package "MODUS.MVM") *package*))))
-                `(,setter ,@place-args ,value-form)))))
+              (let ((five (and f
+                               (handler-case
+                                   (multiple-value-list
+                                    (funcall f (cons acc place-args)))
+                                 (t (c) (progn c nil))))))
+                (if (and (consp five) (>= (length five) 4))
+                    (let ((temps  (first five))
+                          (vals   (second five))
+                          (stores (third five))
+                          (setter (fourth five)))
+                      `(let* (,@(let ((tt temps) (vv vals) (bs nil))
+                                  (loop
+                                    (when (or (null tt) (null vv)) (return nil))
+                                    (push (list (car tt) (car vv)) bs)
+                                    (setq tt (cdr tt)) (setq vv (cdr vv)))
+                                  (nreverse bs))
+                              ,@(if (consp stores)
+                                    (list (list (car stores) value-form))
+                                    nil))
+                         ,setter))
+                    ;; Degenerate / failed expander: historic fallback.
+                    ;; In-image-safe package (see cell-var-name): hardcoded
+                    ;; :modus.mvm interns into NIL under mvm-eval → NIL head.
+                    (let ((setter (intern (format nil "SET-~A" (symbol-name acc))
+                                          (or (find-package "MODUS.MVM")
+                                              *package*))))
+                      `(,setter ,@place-args ,value-form)))))))
         `(quote ,accessor))))
 
   ;; DEFINE-MODIFY-MACRO — (define-modify-macro name lambda-list fn [doc])
@@ -7495,10 +7538,18 @@
 
 (defun vars-mutated-in-lambdas (body-forms let-vars)
   "Find which of LET-VARS are mutated inside a lambda in BODY-FORMS.
-   Returns a list of variable names that need cell boxing."
+   Returns a list of variable names that need cell boxing.
+
+   Compound forms are MACROEXPANDED before dispatch (%CFV-MACROEXPAND):
+   a LAMBDA/FLET/LABELS that only exists in a macro's EXPANSION is still
+   a closure at compile time, and a mutation inside it still needs the
+   enclosing binding boxed."
   ;; Walk body forms looking for lambdas, then check for setq of let-vars inside them
   (let ((result nil))
     (labels ((scan (form in-lambda)
+               (unless (consp form) (return-from scan))
+               (let ((mx (%cfv-macroexpand form)))
+                 (when mx (setq form mx)))
                (unless (consp form) (return-from scan))
                (let ((op (car form)))
                  (cond
@@ -7669,12 +7720,26 @@
    DONE reads END/LIST while the enclosing LOOP setf's them — unboxed,
    DONE returned the whole string unsplit, and parse-version signalled
    PARSE-ERROR on the un-split segment (asdf gauntlet forms 112/233/236/
-   241).  Callers intersect this with mutated-anywhere before boxing."
+   241).  Callers intersect this with mutated-anywhere before boxing.
+
+   Compound forms are MACROEXPANDED before dispatch (%CFV-MACROEXPAND).
+   A closure that only exists in a macro's EXPANSION captures exactly as
+   a source-level one does — alexandria's DOPLIST wraps its body in a
+   (FLET ((results () … outer-var …)) …), so
+     (let (keys values)
+       (doplist (k v '(a 1 b 2 c 3) (values t (reverse keys) …))
+         (push k keys) (push v values)))
+   read KEYS/VALUES as NIL: unexpanded, this scanner saw no closure at
+   all, KEYS/VALUES were never boxed, and the FLET snapshotted their
+   creation-time (NIL) values while the PUSHes mutated the frame slots."
   (let ((result nil))
     (labels ((note (vs)
                (dolist (v vs)
                  (setq result (adjoin v result :test #'name-equal))))
              (scan (form)
+               (unless (consp form) (return-from scan))
+               (let ((mx (%cfv-macroexpand form)))
+                 (when mx (setq form mx)))
                (unless (consp form) (return-from scan))
                (let ((op (car form)))
                  (cond
@@ -8535,11 +8600,58 @@
             (setq acc (%collect-bq-free-vars (car cur) bound env acc))
             (setq cur (cdr cur)))))))))
 
+(defun %cfv-definition-head-p (head)
+  "T when HEAD names a DEFINING macro (DEFUN / DEFMACRO / DEFSTRUCT /
+   DEFCLASS / DEFSETF / DEFINE-…).  The free-variable walker does NOT
+   macroexpand these: their expanders are the expensive, globally
+   side-effecting ones (registering macros, setf expanders, CLOS
+   metaobjects, building expander closures via %EVAL-EXPANDER-RUNTIME),
+   and a definition form never introduces a free reference to an
+   enclosing LEXICAL binding that the plain element walk would miss.
+   Cheap prefix test: all of them start with `DEF`."
+  (and (symbolp head)
+       (let ((n (symbol-name head)))
+         (and n (>= (length n) 3) (string= n "DEF" :end1 3)))))
+
+(defun %cfv-macroexpand (form)
+  "One macroexpansion step of FORM for the FREE-VARIABLE walker, or NIL
+   when FORM is not an expandable macro call.  Errors from a user
+   expander yield NIL (the walker then falls back to the plain element
+   walk) — free-var analysis must never turn a compile into a failure.
+
+   WHY THE WALKER EXPANDS AT ALL: compile-form macroexpands before it
+   lowers anything, so the code that actually gets compiled is the
+   EXPANSION — but %COLLECT-FREE-VARS used to inspect the UNEXPANDED
+   source.  A free reference introduced BY a macro was therefore
+   invisible to both consumers of this walker:
+     - COMPILE-LAMBDA: the reference was never added to CAPTURED-VARS,
+       so the closure didn't capture it and the compiled body read an
+       unbound global (NIL) instead of the outer binding.
+     - %FLET-FUNCTIONS-CAPTURE-VARS-P: the FLET/LABELS looked
+       capture-free, took the compile-as-a-global-function path, and the
+       same reference again compiled to a global read.
+   Minimal repro (SBCL: (T NIL); Modus before this fix: (T T)):
+     (let ((lo 3) (hi 9))
+       (macrolet ((valid (x) (list '<= 'lo x 'hi)))
+         (labels ((chk (v) (valid v))) (list (chk 5) (chk 50)))))
+   This is why alexandria's GAUSSIAN-RANDOM.1 sampled out of range: its
+   rejection test lives behind a macro inside a LABELS."
+  (and (consp form)
+       (symbolp (car form))
+       (car form)
+       (not (%cfv-definition-head-p (car form)))
+       (let ((r (handler-case (macroexpand-1-mvm form)
+                  (t (c) (progn c nil)))))
+         (and (consp r) (cdr r) (car r)))))
+
 (defun %collect-free-vars (form bound env acc)
   "Walk FORM; collect symbol references that are not in BOUND and ARE
    present in ENV. The result is the list of outer-scope variables the
    form references — i.e., what compile-lambda needs to copy into the
-   closure env-list. Every cons recurses into both car and cdr."
+   closure env-list. Every cons recurses into both car and cdr.
+
+   Compound forms whose head is a macro are MACROEXPANDED first and the
+   EXPANSION is walked instead of the source — see %CFV-MACROEXPAND."
   (cond
     ((null form) acc)
     ((symbolp form)
@@ -8665,15 +8777,32 @@
          ;; define-convenience-action-methods) compiled it as an unbound
          ;; global.  Iterate elements; a dotted tail is a potential var ref.
          (t
-          (let ((cur form))
-            (loop
-              (cond
-                ((null cur) (return acc))
-                ((atom cur)
-                 (return (%collect-free-vars cur bound env acc)))
-                (t
-                 (setq acc (%collect-free-vars (car cur) bound env acc))
-                 (setq cur (cdr cur))))))))))))
+          ;; MACRO CALL: walk the EXPANSION, which is what compile-form
+          ;; will actually lower.  Bounded re-expansion loop (a macro
+          ;; whose expansion is another macro call) mirrors
+          ;; macroexpand-mvm; deeper macro calls inside the expansion are
+          ;; reached by the recursive walk below.
+          (let ((expansion (%cfv-macroexpand form))
+                (steps 0))
+            (if expansion
+                (progn
+                  (loop
+                    (when (>= steps 100) (return nil))
+                    (let ((next (%cfv-macroexpand expansion)))
+                      (if next
+                          (progn (setq expansion next)
+                                 (setq steps (+ steps 1)))
+                          (return nil))))
+                  (%collect-free-vars expansion bound env acc))
+                (let ((cur form))
+                  (loop
+                    (cond
+                      ((null cur) (return acc))
+                      ((atom cur)
+                       (return (%collect-free-vars cur bound env acc)))
+                      (t
+                       (setq acc (%collect-free-vars (car cur) bound env acc))
+                       (setq cur (cdr cur))))))))))))))
 
 (defun %collect-free-vars-list (forms bound env acc)
   "Walk a list of forms (e.g. a lambda body). Iterates via plain LOOP

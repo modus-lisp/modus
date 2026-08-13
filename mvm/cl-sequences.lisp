@@ -445,9 +445,49 @@
       (t
        (%remove-vector item seq eff-test-fn key-fn start-idx end-idx eff-count from-end)))))
 
-(defun %remove-list (item lst test-fn key-fn start-idx end-idx count from-end)
-  ;; Walk the list, marking which indices to drop, then build a new list.
-  ;; FROM-END only matters when COUNT is bounded.
+(defun %delete-splice-list (lst to-drop)
+  "Destructively splice the elements of LST at the indices in TO-DROP out
+   of the list, by SET-CDR on the surviving predecessor cons.  Returns the
+   (possibly new) head.
+
+   This is the DESTRUCTIVE half of DELETE / DELETE-IF / DELETE-IF-NOT on
+   lists.  CLHS only says these MAY modify the argument, and Modus used to
+   forward all of them to the copying REMOVE family — conformant, but every
+   real implementation (SBCL, CCL, …) splices in place, and library code
+   written against them depends on the aliasing.  alexandria's DELETEF is
+   the canonical case:
+     (let* ((x (list 1 2 3)) (x* x)) (deletef x 2) (list x x*))
+   is ((1 3) (1 3)) everywhere else and was ((1 3) (1 2 3)) here.
+
+   Only the CDR chain is rewritten; CARs are untouched, so a cons another
+   list shares as a TAIL still sees the splice exactly as SBCL's does."
+  (let ((head lst) (prev nil) (cur lst) (i 0))
+    (loop
+      (when (null cur) (return head))
+      (let ((next (cdr cur)))
+        (if (member i to-drop)
+            (if prev (set-cdr prev next) (setq head next))
+            (setq prev cur))
+        (setq cur next)
+        (setq i (+ i 1))))))
+
+(defun %delete-list (item lst test-fn key-fn start-idx end-idx count from-end)
+  "DELETE on a list: same match/COUNT/FROM-END logic as %REMOVE-LIST, but
+   the result is produced by splicing LST rather than copying it."
+  (%delete-splice-list
+   lst (%remove-list-drop-indices item lst test-fn key-fn
+                                  start-idx end-idx count from-end)))
+
+(defun %delete-if-list (pred lst key-fn start-idx end-idx count from-end)
+  "DELETE-IF / DELETE-IF-NOT on a list — see %DELETE-LIST."
+  (%delete-splice-list
+   lst (%remove-if-list-drop-indices pred lst key-fn
+                                     start-idx end-idx count from-end)))
+
+(defun %remove-list-drop-indices (item lst test-fn key-fn start-idx end-idx count from-end)
+  "The 0-based indices of LST that a REMOVE/DELETE with these arguments
+   drops.  Factored out of %REMOVE-LIST so the destructive DELETE path
+   shares EXACTLY the same match/COUNT/FROM-END semantics."
   (let ((indices nil) (cur lst) (i 0))
     (loop
       (when (null cur) (return nil))
@@ -458,24 +498,44 @@
             (push i indices))))
       (setq cur (cdr cur))
       (setq i (+ i 1)))
-    ;; Apply count: keep only the first/last N matched indices.
-    (let ((to-drop indices))
-      (when (>= count 0)
-        (when from-end
-          ;; indices in reverse-traversal order (largest first); take first N
-          (setq to-drop (subseq indices 0 (min count (length indices)))))
-        (unless from-end
-          ;; want first N matches (smallest indices); indices is largest-first
-          (let ((rev (reverse indices)))
-            (setq to-drop (subseq rev 0 (min count (length rev))))
-            (setq to-drop to-drop))))
-      ;; Build result list excluding to-drop indices
-      (let ((result nil) (cur lst) (i 0))
-        (loop
-          (when (null cur) (return (nreverse result)))
-          (unless (member i to-drop) (push (car cur) result))
-          (setq cur (cdr cur))
-          (setq i (+ i 1)))))))
+    ;; INDICES is largest-first (push order).  Apply COUNT: :from-end keeps
+    ;; the LAST n matches (already at the front), otherwise the FIRST n.
+    (if (>= count 0)
+        (if from-end
+            (subseq indices 0 (min count (length indices)))
+            (let ((rev (reverse indices)))
+              (subseq rev 0 (min count (length rev)))))
+        indices)))
+
+(defun %remove-if-list-drop-indices (pred lst key-fn start-idx end-idx count from-end)
+  "As %REMOVE-LIST-DROP-INDICES, for the predicate form."
+  (let ((indices nil) (cur lst) (i 0))
+    (loop
+      (when (null cur) (return nil))
+      (when (and end-idx (>= i end-idx)) (return nil))
+      (when (>= i start-idx)
+        (let ((v (if key-fn (funcall key-fn (car cur)) (car cur))))
+          (when (funcall pred v) (push i indices))))
+      (setq cur (cdr cur))
+      (setq i (+ i 1)))
+    (if (>= count 0)
+        (if from-end
+            (subseq indices 0 (min count (length indices)))
+            (let ((rev (reverse indices)))
+              (subseq rev 0 (min count (length rev)))))
+        indices)))
+
+(defun %remove-list (item lst test-fn key-fn start-idx end-idx count from-end)
+  ;; Non-destructive: mark which indices to drop (shared with the DELETE
+  ;; path via %REMOVE-LIST-DROP-INDICES), then build a fresh list.
+  (let ((to-drop (%remove-list-drop-indices item lst test-fn key-fn
+                                            start-idx end-idx count from-end)))
+    (let ((result nil) (cur lst) (i 0))
+      (loop
+        (when (null cur) (return (nreverse result)))
+        (unless (member i to-drop) (push (car cur) result))
+        (setq cur (cdr cur))
+        (setq i (+ i 1))))))
 
 (defun %remove-vector (item vec test-fn key-fn start-idx end-idx count from-end)
   (let* ((len (array-length vec))
@@ -532,27 +592,15 @@
        (%remove-if-vector pred seq key-fn start-idx end-idx eff-count from-end)))))
 
 (defun %remove-if-list (pred lst key-fn start-idx end-idx count from-end)
-  (let ((indices nil) (cur lst) (i 0))
-    (loop
-      (when (null cur) (return nil))
-      (when (and end-idx (>= i end-idx)) (return nil))
-      (when (>= i start-idx)
-        (let ((v (if key-fn (funcall key-fn (car cur)) (car cur))))
-          (when (funcall pred v) (push i indices))))
-      (setq cur (cdr cur))
-      (setq i (+ i 1)))
-    (let ((to-drop indices))
-      (when (>= count 0)
-        (if from-end
-            (setq to-drop (subseq indices 0 (min count (length indices))))
-            (let ((rev (reverse indices)))
-              (setq to-drop (subseq rev 0 (min count (length rev)))))))
-      (let ((result nil) (cur lst) (i 0))
-        (loop
-          (when (null cur) (return (nreverse result)))
-          (unless (member i to-drop) (push (car cur) result))
-          (setq cur (cdr cur))
-          (setq i (+ i 1)))))))
+  ;; Non-destructive; index selection shared with %DELETE-IF-LIST.
+  (let ((to-drop (%remove-if-list-drop-indices pred lst key-fn
+                                               start-idx end-idx count from-end)))
+    (let ((result nil) (cur lst) (i 0))
+      (loop
+        (when (null cur) (return (nreverse result)))
+        (unless (member i to-drop) (push (car cur) result))
+        (setq cur (cdr cur))
+        (setq i (+ i 1))))))
 
 (defun %remove-if-vector (pred vec key-fn start-idx end-idx count from-end)
   (let* ((len (array-length vec))
@@ -2796,10 +2844,10 @@
           (setq r (cons item r)))))))
 
 (defun delete (item seq &rest args)
-  "Remove ITEM from SEQ (destructive — but we forward to non-destructive
-   remove since MVM doesn't track in-place mutation guarantees).
-   Inlined parsing (same as remove) so we don't go through apply-of-rest.
-   :test-not handled by wrapping into a negated test-fn."
+  "Remove ITEM from SEQ.  DESTRUCTIVE on lists (splices via SET-CDR, so
+   an alias of the head observes the removal, as in SBCL/CCL); copies for
+   vectors.  Inlined parsing (same as remove) so we don't go through
+   apply-of-rest.  :test-not is wrapped into a negated test-fn."
   (let* ((parsed (%nsubst-parse-args args))
          (count (car parsed))
          (from-end (cadr parsed))
@@ -2816,9 +2864,9 @@
                         (t nil))))
     (cond
       ((null seq) nil)
-      ((= eff-count 0) (if (consp seq) (copy-list seq) (copy-seq seq)))
+      ((= eff-count 0) (if (consp seq) seq (copy-seq seq)))
       ((consp seq)
-       (%remove-list item seq eff-test-fn key-fn start-idx end-idx eff-count from-end))
+       (%delete-list item seq eff-test-fn key-fn start-idx end-idx eff-count from-end))
       (t
        (%remove-vector item seq eff-test-fn key-fn start-idx end-idx eff-count from-end)))))
 
@@ -2836,9 +2884,9 @@
          (eff-count (%nsubst-effective-count count)))
     (cond
       ((null seq) nil)
-      ((= eff-count 0) (if (consp seq) (copy-list seq) (copy-seq seq)))
+      ((= eff-count 0) (if (consp seq) seq (copy-seq seq)))
       ((consp seq)
-       (%remove-if-list pred seq key-fn start-idx end-idx eff-count from-end))
+       (%delete-if-list pred seq key-fn start-idx end-idx eff-count from-end))
       (t
        (%remove-if-vector pred seq key-fn start-idx end-idx eff-count from-end)))))
 
@@ -2856,9 +2904,9 @@
          (neg-pred (lambda (x) (not (funcall pred x)))))
     (cond
       ((null seq) nil)
-      ((= eff-count 0) (if (consp seq) (copy-list seq) (copy-seq seq)))
+      ((= eff-count 0) (if (consp seq) seq (copy-seq seq)))
       ((consp seq)
-       (%remove-if-list neg-pred seq key-fn start-idx end-idx eff-count from-end))
+       (%delete-if-list neg-pred seq key-fn start-idx end-idx eff-count from-end))
       (t
        (%remove-if-vector neg-pred seq key-fn start-idx end-idx eff-count from-end)))))
 

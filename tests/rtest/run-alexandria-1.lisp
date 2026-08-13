@@ -52,9 +52,14 @@
 ;; inventory, not an exclusion: RT:SKIP counts as a FAILURE and the test
 ;; stays in the 230 denominator.  Found mechanically from the last RT:RUN
 ;; line with no following verdict.
-;;   GAUSSIAN-RANDOM.1 -- (random 1.0) returns values outside [0,1)
-;;                        (mvm/cl-sequences.lisp:2253 is integer-only), so
-;;                        alexandria's rejection sampler never converges.
+;;   BINOMIAL-COEFFICIENT.1/.2 -- compute correctly in <1s in a fresh
+;;                        image but do not complete after ~217 preceding
+;;                        tests (bignum arithmetic under heap pressure).
+;; UNSKIPPED: GAUSSIAN-RANDOM.1 -- was "(random 1.0) out of [0,1)"; the real
+;;   cause was the free-variable walker not macroexpanding, so the MACROLET
+;;   `valid' inside gaussian-random's LABELS read MIN/MAX as NIL and the
+;;   rejection sampler accepted every sample.  Fixed in the compiler; the
+;;   test terminates and passes.
 (defun test-name-by-string (str)
   "Look the SYMBOL up in the live registry so the skip list matches by
    identity, not by a re-READ that might intern a different symbol."
@@ -74,7 +79,7 @@
       (setq cur (cdr cur)))
     (setq *rtest-skip-names* out)))
 
-(skip-these (list "GAUSSIAN-RANDOM.1" "BINOMIAL-COEFFICIENT.1" "BINOMIAL-COEFFICIENT.2"))
+(skip-these (list "BINOMIAL-COEFFICIENT.1" "BINOMIAL-COEFFICIENT.2"))
 (sy "SKIP-NAMES" *rtest-skip-names*)
 
 (sy "PHASE" "run")

@@ -1437,6 +1437,17 @@
       (if (null s)
           (error "read-byte: not a stream")
           (let ((ty (%stream-type s)))
+            ;; CLHS §read-byte: STREAM must be a BINARY INPUT stream.  A
+            ;; non-input stream is a TYPE ERROR on the argument, NOT an
+            ;; end-of-file — so EOF-ERROR-P does not suppress it (SBCL and
+            ;; CCL both signal here).  Without this, an output-only stream
+            ;; fell through to the `t' branch and (read-byte s nil nil)
+            ;; quietly answered NIL, which reads as "empty input":
+            ;; alexandria's READ-STREAM-CONTENT-INTO-BYTE-VECTOR on a
+            ;; (make-broadcast-stream) returned #() where every other
+            ;; implementation signals.
+            (unless (input-stream-p s)
+              (error "read-byte: stream is not an input stream"))
             (cond
               ((= ty 9) (%fs-read-byte s eof-error-p eof-value))
               ;; Echo stream: read from input, echo byte to output side.

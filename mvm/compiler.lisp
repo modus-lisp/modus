@@ -276,6 +276,33 @@
           ;; it wasn't before either; correctness of the store wins.
           (values nil place (lambda (v) `(setf ,place ,v)))))))))
 
+(defun %dmm-expand (fn place args)
+  "Expansion for ONE USE of a DEFINE-MODIFY-MACRO-defined macro:
+   (NAME place arg…) => FN applied to the place's current value and ARGS,
+   stored back into the place.
+
+   CLHS 5.1.3: each subform of PLACE and each ARG is evaluated EXACTLY ONCE,
+   left to right.  The old expansion was a textual
+     (setf PLACE (FN PLACE ARG…))
+   which pastes PLACE TWICE, so every subform of the place ran twice:
+     (let ((v (vector 0 0 0)) (p 0)) (maxf (svref v (incf p)) (incf p)) …)
+   incremented P three times and stored into the WRONG element (alexandria
+   MAXF.4 / MINF.2).  Routing through MVM-PLACE-EXPANSION — the same
+   read/write decomposition INCF/DECF/PUSH use — binds the place's subforms
+   to gensyms once and reads and writes through those.  ARGS are likewise
+   let*-bound after the place subforms, preserving left-to-right order.
+
+   Called from the DEFMACRO body the DEFINE-MODIFY-MACRO expander emits, so
+   it runs in whichever compiler is expanding (host build or in-image)."
+  (if (symbolp place)
+      `(setq ,place (,fn ,place ,@args))
+      (multiple-value-bind (bindings access writer)
+          (mvm-place-expansion place)
+        (let ((gs (mapcar (lambda (a) (declare (ignore a)) (%mvm-gensym "DMA"))
+                          args)))
+          `(let* (,@bindings ,@(mapcar #'list gs args))
+             ,(funcall writer `(,fn ,access ,@gs)))))))
+
 (defvar *label-counter* 0
   "Monotonic counter for generating unique labels")
 
@@ -2501,11 +2528,20 @@
           `(logxor ,(cadr form) -1)
           '(%signal-program-error))))
 
-  ;; MAX → IF + comparison.  2-arg case kept byte-identical (the common path —
-  ;; no native layout shift); 3+ args fold LEFT into nested 2-arg max so
-  ;; (max 1 2 3) = 3 instead of silently dropping args past the 2nd.  The
-  ;; accumulator sub-max is let-bound (evaluated once); the trailing arg keeps
-  ;; the pre-existing 2-arg double-eval (acceptable, unchanged behavior).
+  ;; MAX → IF + comparison.  3+ args fold LEFT into nested 2-arg max so
+  ;; (max 1 2 3) = 3 instead of silently dropping args past the 2nd.
+  ;;
+  ;; BOTH operands are let*-bound.  The second one used to be pasted twice
+  ;; (once in the test, once in the else branch) — a documented "acceptable"
+  ;; double-evaluation that is in fact a CLHS violation (each subform is
+  ;; evaluated exactly once, left to right) AND produced wrong VALUES, not
+  ;; just extra side effects:
+  ;;   (let ((c 0)) (list (max 1 (incf c)) c))  =>  (2 2), want (1 1)
+  ;;   (let ((c 0)) (list (min 1 (incf c)) c))  =>  (2 2), want (1 1)
+  ;; because the test compared against the FIRST evaluation while the else
+  ;; branch returned the SECOND.  This surfaced through alexandria's MAXF/MINF,
+  ;; which are define-modify-macros over MAX/MIN — the modify-macro expansion
+  ;; itself is single-eval and was never at fault.
   (mvm-define-macro "MAX"
     (lambda (form)
       (cond
@@ -2514,13 +2550,14 @@
          '(error "MAX requires at least one argument"))
         ((null (cddr form)) (cadr form))
         ((null (cdddr form))                               ; exactly 2 args
-         (let ((tmp (%mvm-gensym "MAX")))
-           `(let ((,tmp ,(cadr form)))
-              (if (> ,tmp ,(caddr form)) ,tmp ,(caddr form)))))
+         (let ((tmp (%mvm-gensym "MAX"))
+               (tmp2 (%mvm-gensym "MAXB")))
+           `(let* ((,tmp ,(cadr form)) (,tmp2 ,(caddr form)))
+              (if (> ,tmp ,tmp2) ,tmp ,tmp2))))
         (t                                                 ; 3+ args
          `(max (max ,(cadr form) ,(caddr form)) ,@(cdddr form))))))
 
-  ;; MIN → IF + comparison (same structure as MAX).
+  ;; MIN → IF + comparison (same structure as MAX, same single-eval fix).
   (mvm-define-macro "MIN"
     (lambda (form)
       (cond
@@ -2528,9 +2565,10 @@
          '(error "MIN requires at least one argument"))
         ((null (cddr form)) (cadr form))
         ((null (cdddr form))                               ; exactly 2 args
-         (let ((tmp (%mvm-gensym "MIN")))
-           `(let ((,tmp ,(cadr form)))
-              (if (< ,tmp ,(caddr form)) ,tmp ,(caddr form)))))
+         (let ((tmp (%mvm-gensym "MIN"))
+               (tmp2 (%mvm-gensym "MINB")))
+           `(let* ((,tmp ,(cadr form)) (,tmp2 ,(caddr form)))
+              (if (< ,tmp ,tmp2) ,tmp ,tmp2))))
         (t                                                 ; 3+ args
          `(min (min ,(cadr form) ,(caddr form)) ,@(cdddr form))))))
 
@@ -3332,14 +3370,19 @@
   ;; appendf …)` then a use of APPENDF in a LATER top-level form got
   ;; UNDEFINED-FUNCTION (alexandria appendf/nconcf/unionf/nunionf).  A DEFMACRO
   ;; form routes through the DEFMACRO handler's persistence path (like any
-  ;; plain top-level defmacro).  The generic `(place &rest args)` expansion is
+  ;; plain top-level defmacro).  The generic `(place &rest args)` shape is
   ;; correct for every define-modify-macro use — FN can be a symbol or a lambda.
+  ;;
+  ;; The emitted DEFMACRO body delegates to %DMM-EXPAND rather than pasting
+  ;; `(setf PLACE (FN PLACE ARGS…))` textually: that shape wrote PLACE twice,
+  ;; so every subform of the place was evaluated twice (CLHS 5.1.3 requires
+  ;; exactly once, left to right) — alexandria MAXF.4 / MINF.2.
   (mvm-define-macro "DEFINE-MODIFY-MACRO"
     (lambda (form)
       (let ((name (cadr form))
             (fn (cadddr form)))
         `(defmacro ,name (%dmm-place &rest %dmm-args)
-           (list 'setf %dmm-place (list* ',fn %dmm-place %dmm-args))))))
+           (%dmm-expand ',fn %dmm-place %dmm-args)))))
 
   ;; GET-SETF-EXPANSION — stub returning a generic 5-value tuple.
   ;; Used by tests that introspect setf machinery; the structure is correct

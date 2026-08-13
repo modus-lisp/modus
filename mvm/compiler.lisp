@@ -2228,7 +2228,6 @@
   (mvm-define-macro "WITH-COMPILATION-UNIT"
     (lambda (form)
       `(progn ,@(cddr form))))
-
   ;; WITH-ACCESSORS — (with-accessors ((var accessor-name)*) instance body*)
   ;; Each spec is (VAR ACCESSOR-NAME); the var binds to a symbol-macro
   ;; that expands to (ACCESSOR-NAME INSTANCE), so SETF on the var
@@ -6495,11 +6494,18 @@
              (%handler-case-catch (progn ,@body-forms)
                (t (%c-cnd)
                  (if (if *catch-active* (eql *catch-tag* %c-tag) nil)
-                     (let ((%c-v *catch-value*))
+                     ;; CLHS 5.2: CATCH returns ALL the values THROW was given.
+                     ;; *CATCH-VALUES* carries them; it is NIL only when the
+                     ;; thrower recorded no list, in which case fall back to
+                     ;; the single *CATCH-VALUE* (also the right answer for
+                     ;; (throw tag (values)) modulo the zero-values case).
+                     (let ((%c-v *catch-value*)
+                           (%c-vs *catch-values*))
                        (setq *catch-active* nil)
                        (setq *catch-tag* nil)
                        (setq *catch-value* nil)
-                       %c-v)
+                       (setq *catch-values* nil)
+                       (if %c-vs (values-list %c-vs) %c-v))
                      (error %c-cnd)))))
           env dest)))
 
@@ -6509,9 +6515,14 @@
        (let ((tag-form (cadr form))
              (val-form (caddr form)))
          (compile-form
-          `(progn
-             (setq *catch-tag* ,tag-form)
-             (setq *catch-value* ,val-form)
+          ;; CLHS: TAG-FORM is evaluated before RESULT-FORM, hence the LET*.
+          ;; MULTIPLE-VALUE-LIST captures every value so the receiving CATCH
+          ;; can re-spread them (CLHS 5.2 — THROW/CATCH transmits all values).
+          `(let* ((%t-tag ,tag-form)
+                  (%t-vals (multiple-value-list ,val-form)))
+             (setq *catch-tag* %t-tag)
+             (setq *catch-value* (car %t-vals))
+             (setq *catch-values* %t-vals)
              (setq *catch-active* t)
              (error "throw"))
           env dest)))
@@ -6535,9 +6546,15 @@
        (let ((tag-form (cadr form))
              (val-form (caddr form)))
          (compile-form
-          `(progn
-             (setq *catch-tag* ,tag-form)
-             (setq *catch-value* ,val-form)
+          ;; Same multiple-value capture as THROW: a cross-unit RETURN-FROM is
+          ;; lowered to %NLX-THROW, and CLHS 5.2 makes BLOCK/RETURN-FROM a
+          ;; multiple-value pass-through.  Without the list the receiving
+          ;; CATCH frame could only hand back the primary value.
+          `(let* ((%t-tag ,tag-form)
+                  (%t-vals (multiple-value-list ,val-form)))
+             (setq *catch-tag* %t-tag)
+             (setq *catch-value* (car %t-vals))
+             (setq *catch-values* %t-vals)
              (setq *catch-active* t)
              (if (%error-handler-active-p)
                  (%hc-longjmp)

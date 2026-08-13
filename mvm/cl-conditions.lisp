@@ -424,6 +424,7 @@
   (setq *catch-active* nil)
   (setq *catch-tag* nil)
   (setq *catch-value* nil)
+  (setq *catch-values* nil)
   ;; condition (root)
   (%define-condition 'condition nil nil nil nil)
   ;; serious-condition
@@ -565,6 +566,15 @@
 (defvar *catch-active* nil)
 (defvar *catch-tag* nil)
 (defvar *catch-value* nil)
+;; ALL the values thrown, as a list.  CLHS 5.2: THROW/CATCH is a multiple-value
+;; boundary — (catch 'a (throw 'a (values 1 2 3))) must return three values —
+;; and the same applies to a cross-unit RETURN-FROM, which compile-block lowers
+;; to %NLX-THROW into a CATCH frame.  *CATCH-VALUE* alone could only carry the
+;; primary value, so alexandria's DOPLIST (whose (return (values ...)) escapes
+;; a FLET closure into the enclosing BLOCK NIL) was truncated to one value.
+;; NIL means "no list recorded"; the CATCH expansion then falls back to
+;; *CATCH-VALUE* so any thrower that predates this still works.
+(defvar *catch-values* nil)
 
 ;;; ============================================================
 ;;; Unhandled-condition escape report (diagnostic, purely additive)

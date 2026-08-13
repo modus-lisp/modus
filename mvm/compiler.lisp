@@ -2227,7 +2227,26 @@
   ;; emit `(progn body...)`.  Unblocks with-compilation-unit.{1..7} tests.
   (mvm-define-macro "WITH-COMPILATION-UNIT"
     (lambda (form)
-      `(progn ,@(cddr form))))
+      `(progn ,@(cddr form))))  ;; WITH-STANDARD-IO-SYNTAX — (with-standard-io-syntax body*)
+  ;; The runtime worker %WITH-STANDARD-IO-SYNTAX (mvm/cl-reader.lisp) has
+  ;; existed for years, but nothing bound the CL macro NAME to it outside the
+  ;; ANSI-gate builds' source rewriter.  In a clean image the form compiled to
+  ;; a call to an UNRESOLVED function, which the linker drops — leaving the
+  ;; last evaluated argument sitting in the destination register.  So the body
+  ;; ran with the CALLER's printer variables still in force and the form
+  ;; silently behaved as a PROGN:
+  ;;   (with-standard-io-syntax 1 2 3)                             => 3
+  ;;   (let ((*print-case* :downcase))
+  ;;     (with-standard-io-syntax (format nil "~A" 'foo-bar)))     => "foo-bar"
+  ;; (SBCL: "FOO-BAR" — w-s-i-s binds *PRINT-CASE* to :UPCASE.)  That is
+  ;; exactly alexandria's FORMAT-SYMBOL, which relies on w-s-i-s to make
+  ;; (format-symbol t "~A" sym) round-trip to the SAME symbol regardless of
+  ;; the ambient *PRINT-CASE* (FORMAT-SYMBOL.PRINT-CASE-BOUND).
+  ;; %WITH-STANDARD-IO-SYNTAX restores on both the normal and error paths and
+  ;; propagates multiple values via MULTIPLE-VALUE-PROG1.
+  (mvm-define-macro "WITH-STANDARD-IO-SYNTAX"
+    (lambda (form)
+      `(%with-standard-io-syntax (function (lambda () ,@(cdr form))))))
 
   ;; WITH-ACCESSORS — (with-accessors ((var accessor-name)*) instance body*)
   ;; Each spec is (VAR ACCESSOR-NAME); the var binds to a symbol-macro
@@ -6495,11 +6514,18 @@
              (%handler-case-catch (progn ,@body-forms)
                (t (%c-cnd)
                  (if (if *catch-active* (eql *catch-tag* %c-tag) nil)
-                     (let ((%c-v *catch-value*))
+                     ;; CLHS 5.2: CATCH returns ALL the values THROW was given.
+                     ;; *CATCH-VALUES* carries them; it is NIL only when the
+                     ;; thrower recorded no list, in which case fall back to
+                     ;; the single *CATCH-VALUE* (also the right answer for
+                     ;; (throw tag (values)) modulo the zero-values case).
+                     (let ((%c-v *catch-value*)
+                           (%c-vs *catch-values*))
                        (setq *catch-active* nil)
                        (setq *catch-tag* nil)
                        (setq *catch-value* nil)
-                       %c-v)
+                       (setq *catch-values* nil)
+                       (if %c-vs (values-list %c-vs) %c-v))
                      (error %c-cnd)))))
           env dest)))
 
@@ -6509,9 +6535,14 @@
        (let ((tag-form (cadr form))
              (val-form (caddr form)))
          (compile-form
-          `(progn
-             (setq *catch-tag* ,tag-form)
-             (setq *catch-value* ,val-form)
+          ;; CLHS: TAG-FORM is evaluated before RESULT-FORM, hence the LET*.
+          ;; MULTIPLE-VALUE-LIST captures every value so the receiving CATCH
+          ;; can re-spread them (CLHS 5.2 — THROW/CATCH transmits all values).
+          `(let* ((%t-tag ,tag-form)
+                  (%t-vals (multiple-value-list ,val-form)))
+             (setq *catch-tag* %t-tag)
+             (setq *catch-value* (car %t-vals))
+             (setq *catch-values* %t-vals)
              (setq *catch-active* t)
              (error "throw"))
           env dest)))
@@ -6535,9 +6566,15 @@
        (let ((tag-form (cadr form))
              (val-form (caddr form)))
          (compile-form
-          `(progn
-             (setq *catch-tag* ,tag-form)
-             (setq *catch-value* ,val-form)
+          ;; Same multiple-value capture as THROW: a cross-unit RETURN-FROM is
+          ;; lowered to %NLX-THROW, and CLHS 5.2 makes BLOCK/RETURN-FROM a
+          ;; multiple-value pass-through.  Without the list the receiving
+          ;; CATCH frame could only hand back the primary value.
+          `(let* ((%t-tag ,tag-form)
+                  (%t-vals (multiple-value-list ,val-form)))
+             (setq *catch-tag* %t-tag)
+             (setq *catch-value* (car %t-vals))
+             (setq *catch-values* %t-vals)
              (setq *catch-active* t)
              (if (%error-handler-active-p)
                  (%hc-longjmp)
@@ -8655,19 +8692,36 @@
    expansions must stay visible inside nested lambdas (their expansions are
    frame-independent forms), while :stack/:reg bindings must NOT leak across
    the unit boundary — those belong to the OUTER frame; real free variables
-   are captured into the closure env instead (%collect-free-vars)."
+   are captured into the closure env instead (%collect-free-vars).
+
+   The FLET/LABELS fn-name mappings (compile-env-fn-names) are threaded
+   through for the same reason: a local function name maps to a UNIQUE
+   GLOBAL name, so calling it from inside a nested lambda is an ordinary
+   static call with no frame dependence at all.  Dropping them made
+   `(labels ((g (ls) … (lambda (x) (g …)) …)) …)' fail to compile with
+   UNDEFINED-FUNCTION G whenever the inner lambda also captured a variable
+   (the capture path is the only one that rebuilds the parent env) —
+   alexandria's MAP-PRODUCT is exactly that shape."
   (let ((out nil)
+        (fns nil)
         (e env))
     (loop
       (when (null e) (return nil))
       (dolist (b (compile-env-bindings e))
         (when (eq (binding-location b) :symbol-macro)
           (setq out (cons b out))))
+      ;; Innermost-first order is preserved: each env's own alist is already
+      ;; innermost-first, we walk envs innermost-first, and the final REVERSE
+      ;; undoes both pushes — so ENV-LOOKUP-FN's first-match ASSOC still sees
+      ;; the innermost shadowing binding first.
+      (dolist (fe (compile-env-fn-names e))
+        (setq fns (cons fe fns)))
       (setq e (compile-env-parent e)))
-    (if out
+    (if (or out fns)
         (make-compile-env :bindings (reverse out)
                           :stack-depth 0
-                          :parent nil)
+                          :parent nil
+                          :fn-names (reverse fns))
         nil)))
 
 ;; %NATIVE-SYM-P is image-only (defined in cl-eval.lisp, part of the bridge
@@ -12074,6 +12128,21 @@
           ((or (= hash (compute-name-hash "WHEN"))
                (= hash (compute-name-hash "UNLESS")))
            (tail-form-is-values-p (cddr form)))
+          ;; and/or — CLHS 5.3: both return ALL the values of their LAST
+          ;; subform, and exactly one value on any short-circuit exit.  So
+          ;; the tail is the last subform, exactly like PROGN.  Falling into
+          ;; the conservative `(t t)' default instead meant the epilogue
+          ;; NEVER clamped MV-count for an AND-tailed function, so a stale
+          ;; count from an inner producer leaked out:
+          ;;   (and … (= 42 (gethash x tbl)))  -- GETHASH stores count=2,
+          ;;   the inline `=' stores nothing -- so MULTIPLE-VALUE-LIST of the
+          ;;   whole form manufactured a phantom second value
+          ;;   (alexandria ENSURE-GETHASH.1 got (T T), want (T)).
+          ;; `(and)' / `(or)' with no subforms are constants; (cdr form) is
+          ;; NIL and tail-form-is-values-p answers NIL (clamp), correct.
+          ((or (= hash (compute-name-hash "AND"))
+               (= hash (compute-name-hash "OR")))
+           (tail-form-is-values-p (cdr form)))
           ;; loop / block — walk body looking for any (return (values ...))
           ;; or (return-from NAME (values ...)).  Required so functions whose
           ;; tail is a loop with multi-value return don't get MV-COUNT=1

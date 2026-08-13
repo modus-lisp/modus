@@ -2413,6 +2413,23 @@
               (aset s i (if (integerp raw) raw (char-code raw))))
             (setq i (+ i 1)))))
        ((stringp object) object)
+       ;; General (non-string-subtag) VECTOR of characters, e.g.
+       ;; (vector #\a #\b #\c).  Without this branch the cond fell through
+       ;; to `(t object)' and coerce returned the SOURCE VECTOR unchanged —
+       ;; so (coerce #(#\a #\b #\c) 'string) was EQ to its argument and not
+       ;; EQUAL to "abc" (alexandria COPY-SEQUENCE.1).  ARRAYP is true for
+       ;; the cons-shaped adjustable/displaced wrappers too, and AREF/LENGTH
+       ;; both honour the wrapper, so this must precede the CONSP branch
+       ;; (which would otherwise walk a wrapper as if it were a list).
+       ((arrayp object)
+        (let ((len (length object))
+              (i 0))
+          (let ((s (%make-string-array len)))
+            (loop
+              (when (>= i len) (return s))
+              (let ((e (aref object i)))
+                (aset s i (if (characterp e) (char-code e) e)))
+              (setq i (+ i 1))))))
        ((consp object)
         (let ((len (length object))
               (i 0)
@@ -5754,8 +5771,17 @@
                                       (not (eql (obj-subtag obj) #x11))))
          ((eq tn 'bit-vector)    (arrayp obj))
          ((eq tn 'simple-bit-vector) (arrayp obj))
-         ((eq tn 'sequence)      (or (null obj) (consp obj)
-                                     (arrayp obj) (stringp obj)))
+         ;; CLHS 4.3: the SEQUENCE system class is exactly (or list vector).
+         ;; A multi-dimensional array is an ARRAY but NOT a sequence, so the
+         ;; rank must be checked — `(typep (make-array '(2 2)) 'sequence)' is
+         ;; NIL in SBCL/CCL.  With the old unconditional ARRAYP, alexandria's
+         ;; PROPER-SEQUENCE (`(or proper-list (and (not list) sequence))')
+         ;; answered T for #2A((1 2) (3 4)).  ARRAYP is checked BEFORE CONSP
+         ;; because Modus' adjustable/displaced array wrappers are themselves
+         ;; cons-shaped and would otherwise skip the rank test.
+         ((eq tn 'sequence)      (cond ((stringp obj) t)
+                                       ((arrayp obj) (= (array-rank obj) 1))
+                                       (t (or (null obj) (consp obj)))))
          ((eq tn 'function)      (or (functionp obj) (%generic-function-p obj)))
          ((eq tn 'compiled-function) (functionp obj))
          ((eq tn 'generic-function) (%generic-function-p obj))

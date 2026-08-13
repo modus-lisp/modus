@@ -2264,7 +2264,20 @@
       (let* ((seed (mem-ref #x100000A0 :u64))
              (next (logand (+ (* seed 1664525) 1013904223) #x3FFFFFFF)))
         (setf (mem-ref #x100000A0 :u64) next)
-        (- next (* (truncate next n) n)))))
+        ;; CLHS: LIMIT is a positive INTEGER *or* a positive FLOAT, and the
+        ;; result is of the same type as LIMIT and strictly within [0,LIMIT).
+        ;; The integer path below ((- next (* (truncate next n) n))) is a
+        ;; modulo, which is nonsense for a float LIMIT: (truncate next 1.0)
+        ;; is an integer, so the expression degenerated to (- next k) and
+        ;; (random 1.0) returned values like 3.0, -23.0, 26.0 — outside the
+        ;; interval, with the wrong type.  Every rejection sampler built on
+        ;; (random 1.0) then failed to converge (alexandria GAUSSIAN-RANDOM.1
+        ;; never terminated).  Scale the 30-bit LCG output into [0,1) and
+        ;; multiply: NEXT maxes at #x3FFFFFFF so the fraction is < 1 and the
+        ;; product is strictly < N.
+        (if (floatp-impl n)
+            (* n (/ (float next) 1073741824.0))
+            (- next (* (truncate next n) n))))))
 (defun do-special-strings (fn) (funcall fn ""))
 (defun typep* (obj type) (typep obj type))
 

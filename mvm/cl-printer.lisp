@@ -4318,20 +4318,47 @@
    signalled.  Every alexandria COPY-STREAM / READ-STREAM-CONTENT-INTO-STRING
    call went through this path.
    Per CLHS 3.4.1.4.1 the LEFTMOST occurrence of a duplicated keyword wins,
-   hence the seen-flags rather than plain overwrite."
-  (let ((start nil) (start-seen nil)
-        (end nil) (end-seen nil)
-        (cur args))
+   hence the seen-flags rather than plain overwrite.
+
+   Argument VALIDATION (CLHS 3.4.1.4 / the READ-SEQUENCE and WRITE-SEQUENCE
+   dictionary entries) also lives here: an odd-length keyword plist or an
+   unrecognised keyword is a PROGRAM-ERROR (unless :ALLOW-OTHER-KEYS is
+   true), and :START / :END must be an UNSIGNED-BYTE (:END may also be NIL)
+   or it is a TYPE-ERROR.  This is not gold-plating: while the bounds were
+   read positionally, EVERY keyword call signalled, so the whole
+   read-sequence.error.* / write-sequence.error.* family passed for the
+   wrong reason.  Parsing the keywords correctly removes that accidental
+   error, so the validation has to be real."
+  ;; Pass 1: is :ALLOW-OTHER-KEYS true anywhere?  (CLHS 3.4.1.4.1 — it is
+  ;; honoured wherever it appears, and its own leftmost value wins.)
+  (let ((allow nil) (scan args))
     (loop
-      (when (null cur) (return nil))
-      (when (null (cdr cur)) (return nil))
-      (let ((k (car cur)))
-        (cond ((and (eq k :start) (not start-seen))
-               (setq start (cadr cur)) (setq start-seen t))
-              ((and (eq k :end) (not end-seen))
-               (setq end (cadr cur)) (setq end-seen t))))
-      (setq cur (cddr cur)))
-    (cons (or start 0) end)))
+      (when (null scan) (return nil))
+      (when (null (cdr scan)) (return nil))
+      (when (eq (car scan) :allow-other-keys)
+        (when (cadr scan) (setq allow t))
+        (return nil))
+      (setq scan (cddr scan)))
+    (let ((start nil) (start-seen nil)
+          (end nil) (end-seen nil)
+          (cur args))
+      (loop
+        (when (null cur) (return nil))
+        (when (null (cdr cur))
+          (error 'program-error))
+        (let ((k (car cur)))
+          (cond ((eq k :start)
+                 (unless start-seen (setq start (cadr cur)) (setq start-seen t)))
+                ((eq k :end)
+                 (unless end-seen (setq end (cadr cur)) (setq end-seen t)))
+                ((eq k :allow-other-keys) nil)
+                (t (unless allow (error 'program-error)))))
+        (setq cur (cddr cur)))
+      (when (and start-seen (not (and (integerp start) (>= start 0))))
+        (error 'type-error :datum start :expected-type 'unsigned-byte))
+      (when (and end-seen end (not (and (integerp end) (>= end 0))))
+        (error 'type-error :datum end :expected-type 'unsigned-byte))
+      (cons (or start 0) end))))
 
 (defun read-sequence (seq stream &rest args)
   "Read elements from STREAM into SEQ. Returns end position."

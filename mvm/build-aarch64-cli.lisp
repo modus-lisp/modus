@@ -524,6 +524,25 @@
   (%install-runtime-backquote)
   (%init-clos-protocol)
 
+  ;; Run every built-in defvar/defparameter init thunk (task #245).  This
+  ;; image used to SKIP it and hand-set only the ~25 globals below, leaving
+  ;; 70 globals BOUND on x64 but UNBOUND here -- measured by probing
+  ;; (boundp) for all 574 defvar names on both binaries: x64 383 unbound,
+  ;; aarch64 441.  Every one of those is a live UNBOUND-VARIABLE waiting for
+  ;; whichever code path reads it first, which is why this is a release-gate
+  ;; item and not cosmetic.
+  ;;
+  ;; ORDER IS LOAD-BEARING and matches build-generic-cli: init-all-globals
+  ;; runs FIRST, the explicit setq overrides below run AFTER and win.  Each
+  ;; thunk is wrapped in handler-case at compile time, so a thunk that
+  ;; references a not-yet-bound symbol cannot abort the chain.
+  ;;
+  ;; Safe against the hazard that bit the x64 side: a `(defvar *x* nil)`
+  ;; thunk is boundp-guarded (CLHS -- DEFVAR assigns only if unbound), so it
+  ;; cannot re-NIL something an earlier %init-* call already stored, e.g.
+  ;; the (setq *sym-name-table* (make-hash-table)) above.
+  (init-all-globals)
+
   ;; File-I/O scratch buffers + counters (defvar init-thunks don't run at boot).
   (setq *cstr-scratch* #x0FE00000)
   (setq *io-buf-addr*  #x0FF00000)

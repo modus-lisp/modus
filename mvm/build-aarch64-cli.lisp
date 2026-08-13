@@ -302,9 +302,24 @@
 ;; *rt-source* so its DO-TESTS wins by last-defun-wins.
 (defvar *rtest-pkg-source* (mvm-text "mvm/rtest.lisp"))
 
-;; Runtime CL macro table (when/unless/setf/incf/case/dolist/...), installed by
-;; %install-runtime-cl-macros from kernel-main.
-(defvar *rt-macros-source* (mvm-text "mvm/runtime-cl-macros.lisp"))
+;; mvm/runtime-cl-macros.lisp is DELIBERATELY NOT BAKED HERE.  Adding it was
+;; measured to REGRESS this image: with it in, the runtime DOTIMES expander
+;; wins over the compiler's own handling and produces an expansion whose head
+;; symbols print as #<?> --
+;;   (macroexpand-1 '(dotimes (i 3) i))
+;;     x64        -> (LET ((I 0) (DT9008 3)) (LOOP (WHEN (>= I DT9008) ...)))
+;;     aa64 + rtm -> (#<?> ((I 0) (G808 3)) (#<?> (#<?> (#<?> I G808) ...)))
+;; so (defun f (n) (let ((acc nil)) (dotimes (i n) (push i acc)) acc)) compiled
+;; the binding list (I N) as a CALL and died UNDEFINED-FUNCTION NAME="I".  That
+;; one defect alone produced 298 form-eval errors while installing alexandria
+;; (x64: 1).  Without the file the compiler handles DOTIMES/DOLIST/WHEN/... as
+;; it always has here and the errors go away.  The residual divergence -- this
+;; image's MACROEXPAND-1 leaves (dotimes ...) UNEXPANDED where x64 expands it,
+;; so a library code walker that dispatches on MACRO-FUNCTION sees a call --
+;; is REAL, PRE-EXISTING (it reproduces on the unmodified image), and is
+;; tracked as a follow-up; it is not fixed by baking a macro table whose
+;; expansions are unreadable.
+(defvar *rt-macros-source* "")
 
 ;; tar + install-tarball: the untar -> parse-.asd -> topo-sort -> eval pipeline.
 ;; GENERAL library primitives, NOT quicklisp wiring.  Baked (not runtime-loaded)
@@ -357,7 +372,6 @@
 "))
 
 (format t "  rtest:   ~D chars~%" (length *rtest-pkg-source*))
-(format t "  rtmacro: ~D chars~%" (length *rt-macros-source*))
 (format t "  libload: ~D chars (tar + install-tarball)~%" (length *libload-source*))
 (format t "  genera:  ~D chars (compat source baked for boot-time eval)~%"
         (length *genera-compat-text*))
@@ -411,7 +425,6 @@
                     ;; cannot resolve INSTALL-TARBALL / %IT-EVAL-SOURCE /
                     ;; DO-TESTS by name and every driver dies at form 1.
                     (%scan-defun-names-host *rtest-pkg-source*)
-                    (%scan-defun-names-host *rt-macros-source*)
                     (%scan-defun-names-host *libload-source*)))
         (format t "  SFT auto-init (+cli-toplevel): ~D unique names / ~D chunk(s)~%"
                 count chunks)
@@ -711,13 +724,11 @@
     (write-char-serial 10))
 
   ;; --- library-compatibility boot hooks (parity with build-generic-cli) ----
-  ;; ORDER IS LOAD-BEARING and matches x64:
-  ;;   runtime CL macros first (the genera / asdf / library sources all use
-  ;;   DOLIST / WHEN / UNLESS / SETF at runtime-eval time), then the source-
-  ;;   string installs, then RTEST.  Each is wrapped so a failure can never
-  ;;   take down a normal boot.  All of them must run BEFORE cli-toplevel so
-  ;;   ~/.modusrc, --load and --eval already see the full surface.
-  (handler-case (%install-runtime-cl-macros) (t (c) nil))
+  ;; Each is wrapped so a failure can never take down a normal boot, and all of
+  ;; them run BEFORE cli-toplevel so ~/.modusrc, --load and --eval already see
+  ;; the full surface.  x64 additionally calls %install-runtime-cl-macros here;
+  ;; this image deliberately does NOT (see *rt-macros-source* above -- baking
+  ;; that table regressed DOTIMES on aarch64).
   ;; tar.lisp's *tar-block-size* defvar init-thunk does not run at boot
   ;; (MVM Active Limitation 7); set it so the baked tar reader works.
   (setq *tar-block-size* 512)
@@ -1158,7 +1169,7 @@
 (setq *sym-name-auto-source*
       (%build-sym-name-auto-source (list *driver-source* *cli-toplevel-source*
                                          *runtime-backquote-source*
-                                         *rtest-pkg-source* *rt-macros-source*
+                                         *rtest-pkg-source*
                                          *libload-source*)
                                    (list *compiler-in-image-source*)))
 
@@ -1176,7 +1187,6 @@
     *rt-source*       (string #\Newline)
     ;; RTEST package — AFTER rt.lisp so its DO-TESTS wins (last-defun-wins).
     *rtest-pkg-source* (string #\Newline)
-    *rt-macros-source* (string #\Newline)
     *bridge-source*   (string #\Newline)
     ;; tar + install-tarball — AFTER the bridge (they need read / streams /
     ;; %sys-* file I/O) so a library tarball can actually be installed.

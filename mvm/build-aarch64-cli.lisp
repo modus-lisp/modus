@@ -759,10 +759,15 @@
   ;;     So this is a BOOT-CONTEXT defect, not a defect in the genera source.
   ;;   * the sibling ASDF install, same baked-source-string mechanism, same
   ;;     boot position, DOES work here ((find-package \"ASDF\") is true).
-  ;; Turning it off costs no x64 parity: the x64 CLI built from this same tree
-  ;; does not have it installed either — (find-package \"SCL\") is NIL there and
-  ;; *features* carries neither :GENERA nor :64-BIT — so the two images are in
-  ;; the same effective state.  Root-causing the boot SIGSEGV is a follow-up.
+  ;; THIS DOES COST PARITY, and the cost is measured.  x64 built from this same
+  ;; tree DOES carry :GENERA and :64-BIT in *features*.  (Do not use
+  ;; (find-package \"SCL\") to check — it reports NIL on x64 too even though the
+  ;; install demonstrably ran; find-package is unreliable for these runtime-born
+  ;; packages, which is its own bug.  *features* is the reliable witness.)  The
+  ;; visible price on the ladder: trivial-gray-streams does not build its
+  ;; package here (P1.pkg=0 vs 1 on x64) because it takes a Gray-streams branch
+  ;; that the genera surface supplies.  Root-causing the boot SIGSEGV is the
+  ;; follow-up that buys that back.
   (let ((on (%cli-getenv \"MODUS_GENERA\")))
     (when (and on (> (length on) 0) (not (string= on \"0\")))
       (handler-case (%install-genera-compat) (t (c) nil))))

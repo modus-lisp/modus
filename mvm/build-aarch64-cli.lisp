@@ -734,11 +734,17 @@
   ;; adds :unix :linux :little-endian (see mvm/runtime-cl-macros.lisp, which is
   ;; the source of truth for WHY each one is needed).  This image cannot bake
   ;; that file (see *rt-macros-source* above), so it pushes the same features
-  ;; here.  They are not cosmetic: MEASURED on the ladder, without them
-  ;; trivial-garbage's WEAK-POINTER-VALUE returned its own DOCSTRING (every
-  ;; reader-conditional branch of its body was dropped, leaving the docstring
-  ;; as the whole body), and babel loses both branches of each
-  ;; #+big-endian/#+little-endian pair, giving an odd-length initarg plist.
+  ;; here, so a library's reader conditionals see the same world on both
+  ;; arches.  HONEST SCOPE, measured: adding these did NOT change any ladder
+  ;; probe outcome by itself.  In particular the docstring-return case
+  ;; (trivial-garbage:WEAK-POINTER-VALUE evaluating to its own docstring,
+  ;; because every reader-conditional branch of its body was dropped and the
+  ;; docstring was left as the whole body) is still there afterwards -- that
+  ;; one is the missing :GENERA, not the OS/endianness features.  These are
+  ;; landed because the divergence itself is a defect (x64 and aarch64 must
+  ;; not disagree about what machine they are), and because the reasons in
+  ;; mvm/runtime-cl-macros.lisp -- notably babel losing BOTH branches of each
+  ;; #+big-endian/#+little-endian pair -- apply here identically.
   ;; :64-bit is a fact about this target (x64 gets it from the genera surface,
   ;; which is off here).  :genera is deliberately NOT pushed -- the compat
   ;; PACKAGES are not installed on this image, so advertising the feature would

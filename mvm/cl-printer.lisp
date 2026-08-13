@@ -4306,10 +4306,38 @@
 ;;; stream's element-type: char streams read via %read-char-from-stream and
 ;;; store the CHARACTER (string dests coerce to code via aset); byte streams
 ;;; read via %fs-read-byte.
+(defun %rw-seq-bounds (args)
+  "Parse the &KEY plist of READ-SEQUENCE / WRITE-SEQUENCE (CLHS: both take
+   &KEY START END) and return (START . END), END NIL meaning `to the end'.
+
+   Both callers used to read ARGS POSITIONALLY — `(car args)' as START and
+   `(cadr args)' as END — so the ordinary CL spelling put a KEYWORD in the
+   index variable:
+     (write-sequence buf out :end 3)   =>  start = :END, end = 3
+   and the very first `(>= i actual-end)' compared :END against a fixnum and
+   signalled.  Every alexandria COPY-STREAM / READ-STREAM-CONTENT-INTO-STRING
+   call went through this path.
+   Per CLHS 3.4.1.4.1 the LEFTMOST occurrence of a duplicated keyword wins,
+   hence the seen-flags rather than plain overwrite."
+  (let ((start nil) (start-seen nil)
+        (end nil) (end-seen nil)
+        (cur args))
+    (loop
+      (when (null cur) (return nil))
+      (when (null (cdr cur)) (return nil))
+      (let ((k (car cur)))
+        (cond ((and (eq k :start) (not start-seen))
+               (setq start (cadr cur)) (setq start-seen t))
+              ((and (eq k :end) (not end-seen))
+               (setq end (cadr cur)) (setq end-seen t))))
+      (setq cur (cddr cur)))
+    (cons (or start 0) end)))
+
 (defun read-sequence (seq stream &rest args)
   "Read elements from STREAM into SEQ. Returns end position."
-  (let ((start (if args (car args) 0))
-        (end (if (cdr args) (cadr args) nil)))
+  (let* ((%bounds (%rw-seq-bounds args))
+         (start (car %bounds))
+         (end (cdr %bounds)))
     (let ((actual-end (if end end (length seq)))
           (i start)
           (in (%resolve-input-stream stream))
@@ -4334,9 +4362,11 @@
 
 ;;; write-sequence: write elements from seq to stream
 (defun write-sequence (seq stream &rest args)
-  "Write elements from SEQ to STREAM."
-  (let ((start (if args (car args) 0))
-        (end (if (cdr args) (cadr args) nil)))
+  "Write elements from SEQ to STREAM.  CLHS: &KEY START END — see
+   %RW-SEQ-BOUNDS for why these are no longer read positionally."
+  (let* ((%bounds (%rw-seq-bounds args))
+         (start (car %bounds))
+         (end (cdr %bounds)))
     (let ((actual-end (if end end (length seq)))
           (i start)
           (s (%resolve-output-stream stream)))

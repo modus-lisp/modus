@@ -104,6 +104,21 @@
 (defvar *print-circle-on-failure* nil
   "RT: value of *PRINT-CIRCLE* while printing a failure report.")
 
+(defvar *rtest-skip-names* nil
+  "MODUS EXTENSION, DEFAULT NIL.  Names DO-TESTS must NOT evaluate, because
+   they are known to LOOP FOREVER on this implementation and would otherwise
+   cost every test after them in the file.
+
+   A skipped test is reported `RT:SKIP <name>' and COUNTED AS A FAILURE — it
+   stays pending, it stays in the denominator, and DO-TESTS still returns NIL
+   because of it.  It is NOT an exclusion that flatters the score; it is the
+   only way to see the tests that come after a hang, and each entry here is a
+   Modus bug that must be listed in the failure inventory.
+
+   Populate it from the driver.  Finding the members is mechanical: every
+   test prints `RT:RUN <name>' BEFORE its form is evaluated, so the last
+   RT:RUN with no following RT:PASS/RT:FAIL/RT:ERR names the hang exactly.")
+
 (defvar *rtest-report-limit* 400
   "Truncate each printed form/value to this many characters.  A test whose
    expected value is a 10000-element list must not drown the log.")
@@ -323,6 +338,10 @@
    and the failure clustering need."
   (setq *test* (rtest-entry-name e))
   (rtest-set-pend e t)
+  ;; Progress marker BEFORE evaluation.  A form that never returns leaves its
+  ;; RT:RUN line as the last thing on stdout, which names the hang exactly.
+  (terpri) (princ "RT:RUN ") (princ (rtest-entry-name e)) (terpri)
+  (finish-output)
   (let ((aborted nil) (r nil))
     (if *catch-errors*
         (if *rtest-catch-all*
@@ -370,17 +389,26 @@
    failed errored) for THIS run — `errored' counts entries whose form
    signalled, which are a subset of the failures."
   (let ((cur (rtest-ordered-entries))
-        (passed 0) (failed 0) (errored 0))
+        (passed 0) (failed 0) (errored 0) (skipped 0))
     (loop
-      (when (null cur) (return (values passed failed errored)))
+      (when (null cur) (return (values passed failed errored skipped)))
       (let ((e (car cur)))
         (when (rtest-entry-pend e)
-          (let ((res (rtest-do-entry e)))
-            (cond
-              ((eq res :pass) (setq passed (+ passed 1)))
-              ((eq res :err) (progn (setq failed (+ failed 1))
-                                    (setq errored (+ errored 1))))
-              (t (setq failed (+ failed 1)))))))
+          (if (rtest-name-member (rtest-entry-name e) *rtest-skip-names*)
+              ;; Known non-terminating on this implementation.  Stays PENDING
+              ;; (so it counts as a failure and keeps DO-TESTS returning NIL);
+              ;; we just do not evaluate it.
+              (progn
+                (terpri) (princ "RT:SKIP ") (princ (rtest-entry-name e)) (terpri)
+                (finish-output)
+                (setq failed (+ failed 1))
+                (setq skipped (+ skipped 1)))
+              (let ((res (rtest-do-entry e)))
+                (cond
+                  ((eq res :pass) (setq passed (+ passed 1)))
+                  ((eq res :err) (progn (setq failed (+ failed 1))
+                                        (setq errored (+ errored 1))))
+                  (t (setq failed (+ failed 1))))))))
       (setq cur (cdr cur)))))
 
 (defun do-tests ()
@@ -400,7 +428,7 @@
       (princ " pending=") (princ npend)
       (terpri)
       (finish-output)
-      (multiple-value-bind (passed failed errored) (rtest-run-pending)
+      (multiple-value-bind (passed failed errored skipped) (rtest-run-pending)
         (let ((pending (pending-tests)))
           (let ((unexpected nil) (cur pending))
             (loop
@@ -415,6 +443,7 @@
             (princ " passed=") (princ passed)
             (princ " failed=") (princ failed)
             (princ " errored=") (princ errored)
+            (princ " skipped-hang=") (princ skipped)
             (terpri)
             (rtest-print-name-list "RT:FAILED" pending)
             (rtest-print-name-list "RT:UNEXPECTED" unexpected)
@@ -513,6 +542,7 @@
   (setq *test* nil)
   (setq *do-tests-when-defined* nil)
   (setq *print-circle-on-failure* nil)
+  (setq *rtest-skip-names* nil)
   (setq *rtest-report-limit* 400)
   (%install-rtest-deftest-macro)
   t)

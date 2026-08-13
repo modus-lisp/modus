@@ -715,7 +715,24 @@
   ;; tar.lisp's *tar-block-size* defvar init-thunk does not run at boot
   ;; (MVM Active Limitation 7); set it so the baked tar reader works.
   (setq *tar-block-size* 512)
-  (handler-case (%install-genera-compat) (t (c) nil))
+  ;; :GENERA is OPT-IN on aarch64 (MODUS_GENERA=1) — inverted vs x64's
+  ;; MODUS_NO_GENERA, deliberately.  Evaluating the baked compat source at BOOT
+  ;; SIGSEGVs here, with ZERO output, before any warning is printed.  MEASURED,
+  ;; not inferred:
+  ;;   * the IDENTICAL source evaluated at RUNTIME on this same binary works —
+  ;;     `--eval (%it-eval-source (tar-bytes-to-string (%it-slurp-bytes
+  ;;     \"net/cooperative-atomics.lisp+net/genera-compat.lisp\")) \"p\")'
+  ;;     returns 28 (forms evaluated) and (find-package \"SCL\") is then true.
+  ;;     So this is a BOOT-CONTEXT defect, not a defect in the genera source.
+  ;;   * the sibling ASDF install, same baked-source-string mechanism, same
+  ;;     boot position, DOES work here ((find-package \"ASDF\") is true).
+  ;; Turning it off costs no x64 parity: the x64 CLI built from this same tree
+  ;; does not have it installed either — (find-package \"SCL\") is NIL there and
+  ;; *features* carries neither :GENERA nor :64-BIT — so the two images are in
+  ;; the same effective state.  Root-causing the boot SIGSEGV is a follow-up.
+  (let ((on (%cli-getenv \"MODUS_GENERA\")))
+    (when (and on (> (length on) 0) (not (string= on \"0\")))
+      (handler-case (%install-genera-compat) (t (c) nil))))
   ;; RTEST — created HERE, at boot, from IMAGE code.  A package born at
   ;; runtime is marked runtime-born and its symbols get package-folded
   ;; function-table keys, so a runtime-born RTEST would give RTEST:DO-TESTS a

@@ -2227,7 +2227,27 @@
   ;; emit `(progn body...)`.  Unblocks with-compilation-unit.{1..7} tests.
   (mvm-define-macro "WITH-COMPILATION-UNIT"
     (lambda (form)
-      `(progn ,@(cddr form))))
+      `(progn ,@(cddr form))))  ;; WITH-STANDARD-IO-SYNTAX — (with-standard-io-syntax body*)
+  ;; The runtime worker %WITH-STANDARD-IO-SYNTAX (mvm/cl-reader.lisp) has
+  ;; existed for years, but nothing bound the CL macro NAME to it outside the
+  ;; ANSI-gate builds' source rewriter.  In a clean image the form compiled to
+  ;; a call to an UNRESOLVED function, which the linker drops — leaving the
+  ;; last evaluated argument sitting in the destination register.  So the body
+  ;; ran with the CALLER's printer variables still in force and the form
+  ;; silently behaved as a PROGN:
+  ;;   (with-standard-io-syntax 1 2 3)                             => 3
+  ;;   (let ((*print-case* :downcase))
+  ;;     (with-standard-io-syntax (format nil "~A" 'foo-bar)))     => "foo-bar"
+  ;; (SBCL: "FOO-BAR" — w-s-i-s binds *PRINT-CASE* to :UPCASE.)  That is
+  ;; exactly alexandria's FORMAT-SYMBOL, which relies on w-s-i-s to make
+  ;; (format-symbol t "~A" sym) round-trip to the SAME symbol regardless of
+  ;; the ambient *PRINT-CASE* (FORMAT-SYMBOL.PRINT-CASE-BOUND).
+  ;; %WITH-STANDARD-IO-SYNTAX restores on both the normal and error paths and
+  ;; propagates multiple values via MULTIPLE-VALUE-PROG1.
+  (mvm-define-macro "WITH-STANDARD-IO-SYNTAX"
+    (lambda (form)
+      `(%with-standard-io-syntax (function (lambda () ,@(cdr form))))))
+
   ;; WITH-ACCESSORS — (with-accessors ((var accessor-name)*) instance body*)
   ;; Each spec is (VAR ACCESSOR-NAME); the var binds to a symbol-macro
   ;; that expands to (ACCESSOR-NAME INSTANCE), so SETF on the var

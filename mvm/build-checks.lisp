@@ -1072,11 +1072,20 @@ finding~:P, baselined:~%~{;;   - ~A~%~}"
     ;; non-fatal counts are recorded but not ratcheted.  Measured at 8ca0b6d.
     ("build-x64-linux"
      (:corpus-image . t)
-     (:cannot-compile . 5)              ; ,(RANDOM-FROM-SEQ …) x1, #2A(…) x4
+     ;; Was 5 (a stray-comma form x1 + #2A(…) x4).  The four 2-D array
+     ;; literals now COMPILE — compile-form routes any-rank array literals to
+     ;; compile-quote, which already rebuilt them.  Only the stray
+     ;; `,(RANDOM-FROM-SEQ #(…))` remains, i.e. a comma outside any backquote,
+     ;; which is corpus weirdness rather than a Modus gap.  Re-measured here;
+     ;; the other three gate runners share this corpus and should also drop to
+     ;; 1, but their rows stay at 5 until someone actually MEASURES them --
+     ;; a fatal shape only fails when n > base, so a stale-high baseline is
+     ;; merely loose, and a guessed-low one would fail the build for no reason.
+     (:cannot-compile . 1)
      (:macroexpand-failed . 4)
      (:implicit-global . 1709)
      (:implicit-global-setq . 354)
-     (:unresolved-function . 25)
+     (:unresolved-function . 22)
      (:unknown-go-tag . 5)
      (:unknown-loop-clause . 1))
     ("build-x64"

@@ -8535,11 +8535,58 @@
             (setq acc (%collect-bq-free-vars (car cur) bound env acc))
             (setq cur (cdr cur)))))))))
 
+(defun %cfv-definition-head-p (head)
+  "T when HEAD names a DEFINING macro (DEFUN / DEFMACRO / DEFSTRUCT /
+   DEFCLASS / DEFSETF / DEFINE-…).  The free-variable walker does NOT
+   macroexpand these: their expanders are the expensive, globally
+   side-effecting ones (registering macros, setf expanders, CLOS
+   metaobjects, building expander closures via %EVAL-EXPANDER-RUNTIME),
+   and a definition form never introduces a free reference to an
+   enclosing LEXICAL binding that the plain element walk would miss.
+   Cheap prefix test: all of them start with `DEF`."
+  (and (symbolp head)
+       (let ((n (symbol-name head)))
+         (and n (>= (length n) 3) (string= n "DEF" :end1 3)))))
+
+(defun %cfv-macroexpand (form)
+  "One macroexpansion step of FORM for the FREE-VARIABLE walker, or NIL
+   when FORM is not an expandable macro call.  Errors from a user
+   expander yield NIL (the walker then falls back to the plain element
+   walk) — free-var analysis must never turn a compile into a failure.
+
+   WHY THE WALKER EXPANDS AT ALL: compile-form macroexpands before it
+   lowers anything, so the code that actually gets compiled is the
+   EXPANSION — but %COLLECT-FREE-VARS used to inspect the UNEXPANDED
+   source.  A free reference introduced BY a macro was therefore
+   invisible to both consumers of this walker:
+     - COMPILE-LAMBDA: the reference was never added to CAPTURED-VARS,
+       so the closure didn't capture it and the compiled body read an
+       unbound global (NIL) instead of the outer binding.
+     - %FLET-FUNCTIONS-CAPTURE-VARS-P: the FLET/LABELS looked
+       capture-free, took the compile-as-a-global-function path, and the
+       same reference again compiled to a global read.
+   Minimal repro (SBCL: (T NIL); Modus before this fix: (T T)):
+     (let ((lo 3) (hi 9))
+       (macrolet ((valid (x) (list '<= 'lo x 'hi)))
+         (labels ((chk (v) (valid v))) (list (chk 5) (chk 50)))))
+   This is why alexandria's GAUSSIAN-RANDOM.1 sampled out of range: its
+   rejection test lives behind a macro inside a LABELS."
+  (and (consp form)
+       (symbolp (car form))
+       (car form)
+       (not (%cfv-definition-head-p (car form)))
+       (let ((r (handler-case (macroexpand-1-mvm form)
+                  (t (c) (progn c nil)))))
+         (and (consp r) (cdr r) (car r)))))
+
 (defun %collect-free-vars (form bound env acc)
   "Walk FORM; collect symbol references that are not in BOUND and ARE
    present in ENV. The result is the list of outer-scope variables the
    form references — i.e., what compile-lambda needs to copy into the
-   closure env-list. Every cons recurses into both car and cdr."
+   closure env-list. Every cons recurses into both car and cdr.
+
+   Compound forms whose head is a macro are MACROEXPANDED first and the
+   EXPANSION is walked instead of the source — see %CFV-MACROEXPAND."
   (cond
     ((null form) acc)
     ((symbolp form)
@@ -8665,15 +8712,32 @@
          ;; define-convenience-action-methods) compiled it as an unbound
          ;; global.  Iterate elements; a dotted tail is a potential var ref.
          (t
-          (let ((cur form))
-            (loop
-              (cond
-                ((null cur) (return acc))
-                ((atom cur)
-                 (return (%collect-free-vars cur bound env acc)))
-                (t
-                 (setq acc (%collect-free-vars (car cur) bound env acc))
-                 (setq cur (cdr cur))))))))))))
+          ;; MACRO CALL: walk the EXPANSION, which is what compile-form
+          ;; will actually lower.  Bounded re-expansion loop (a macro
+          ;; whose expansion is another macro call) mirrors
+          ;; macroexpand-mvm; deeper macro calls inside the expansion are
+          ;; reached by the recursive walk below.
+          (let ((expansion (%cfv-macroexpand form))
+                (steps 0))
+            (if expansion
+                (progn
+                  (loop
+                    (when (>= steps 100) (return nil))
+                    (let ((next (%cfv-macroexpand expansion)))
+                      (if next
+                          (progn (setq expansion next)
+                                 (setq steps (+ steps 1)))
+                          (return nil))))
+                  (%collect-free-vars expansion bound env acc))
+                (let ((cur form))
+                  (loop
+                    (cond
+                      ((null cur) (return acc))
+                      ((atom cur)
+                       (return (%collect-free-vars cur bound env acc)))
+                      (t
+                       (setq acc (%collect-free-vars (car cur) bound env acc))
+                       (setq cur (cdr cur))))))))))))))
 
 (defun %collect-free-vars-list (forms bound env acc)
   "Walk a list of forms (e.g. a lambda body). Iterates via plain LOOP

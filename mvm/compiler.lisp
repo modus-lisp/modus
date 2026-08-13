@@ -11842,20 +11842,131 @@
         ,pri-tmp)
      env dest)))
 
+(defun %mv-tail-cannot-set-count-p (form)
+  "STATIC, CONSERVATIVE dual of TAIL-FORM-IS-VALUES-P, for MV *CONSUMER*
+   boundaries (multiple-value-list / -bind, and everything that expands into
+   them: nth-value, multiple-value-setq, multiple-value-call, mv-prog1).
+
+   Returns T only when FORM's TAIL position provably cannot write
+   +mv-count-addr+, i.e. FORM returns exactly one value and leaves whatever
+   count the surrounding code last stored.  Anything unknown answers NIL.
+
+   Why this exists: the MV protocol is `producer overwrites the count'.  A
+   consumer that merely RESETS the count to 1 *before* evaluating the form is
+   only correct when the form's LAST value-producing operation sets the count.
+   For (progn (values 1 2 3) 9) the reset happens, (values 1 2 3) stores 3,
+   and the literal 9 stores nothing — so the consumer read 3 and manufactured
+   two phantom values out of the stale MV slots:
+     (multiple-value-list (progn (values 1 2 3) 9)) => (9 2 3), want (9)
+     (multiple-value-list (progn (truncate 7 2) 5)) => (5 1), want (5)
+   Pre-setting cannot fix that and post-setting unconditionally would break
+   genuine MV returns, so the count must be established by the form's TAIL:
+   when this predicate says T the consumer stores 1 AFTER the form instead of
+   before, and it knows statically that there is exactly one value.
+
+   NOTE the asymmetry with TAIL-FORM-IS-VALUES-P: that one answers T for
+   anything unrecognized (safe for the function epilogue, which then declines
+   to clamp).  Here the safe default is the opposite — an unrecognized shape
+   must fall back to the old reset-before path.  In particular a form whose
+   operator is NOT a symbol (`((lambda () (values 4 5)))') answers NIL."
+  (cond
+    ;; A literal, a variable reference, NIL, a quoted atom: no MV write.
+    ((atom form) t)
+    ;; ((lambda …) …) and other non-symbol-headed shapes: unknown.
+    ((not (symbolp (car form))) nil)
+    (t
+     (let ((op (symbol-name (car form))))
+       (cond
+         ;; Value-transparent special forms: recurse into the tail only.
+         ((string= op "PROGN")
+          (and (cdr form) (%mv-tail-cannot-set-count-p (car (last form)))))
+         ((or (string= op "LET") (string= op "LET*"))
+          (and (cddr form) (%mv-tail-cannot-set-count-p (car (last form)))))
+         ((or (string= op "WHEN") (string= op "UNLESS"))
+          (and (cddr form) (%mv-tail-cannot-set-count-p (car (last form)))))
+         ;; AND / OR: only the LAST subform is in tail position (CLHS 5.1 —
+         ;; the non-last ones contribute their primary value only).  Degenerate
+         ;; (and) / (or) yield T / NIL: single.
+         ((or (string= op "AND") (string= op "OR"))
+          (or (null (cdr form))
+              (%mv-tail-cannot-set-count-p (car (last form)))))
+         ;; IF: BOTH arms must be provably single-valued.  A missing else
+         ;; arm yields NIL, which is an atom, so it answers T.
+         ((string= op "IF")
+          (and (%mv-tail-cannot-set-count-p (caddr form))
+               (%mv-tail-cannot-set-count-p (cadddr form))))
+         ;; COND: EVERY clause must be provably single-valued.  A test-only
+         ;; clause (TEST) returns the test itself, so check the test.  A
+         ;; clause-less (cond) yields NIL.
+         ((string= op "COND")
+          (let ((all t))
+            (dolist (clause (cdr form))
+              (unless (and (consp clause)
+                           (%mv-tail-cannot-set-count-p
+                            (if (cdr clause) (car (last clause)) (car clause))))
+                (setq all nil)))
+            all))
+         ;; Self-evidently single-valued operators.  PROG1/PROG2 return the
+         ;; PRIMARY value of their first/second form (CLHS), never more.
+         ((member op '("QUOTE" "FUNCTION" "LAMBDA" "SETQ" "PROG1" "PROG2"
+                       "MULTIPLE-VALUE-LIST")
+                  :test #'string=)
+          t)
+         ;; Primitives compiled inline: they never touch the MV buffer.
+         ;; Same roster TAIL-FORM-IS-VALUES-P treats as non-MV.
+         ((member op
+                  '("+" "-" "*" "/" "=" "<" ">" "<=" ">="
+                    "CAR" "CDR" "CONS" "LIST" "NULL" "NOT"
+                    "EQ" "EQL" "EQUAL" "EQUALP"
+                    "ATOM" "CONSP" "LISTP" "SYMBOLP"
+                    "NUMBERP" "STRINGP"
+                    "ASH" "LOGAND" "LOGIOR" "LOGXOR" "LOGNOT"
+                    "ZEROP" "PLUSP" "MINUSP" "EVENP" "ODDP"
+                    "1+" "1-" "ABS" "MIN" "MAX"
+                    "CHAR-CODE" "CODE-CHAR" "CHAR=" "CHAR<" "CHAR>"
+                    "ELT" "AREF" "LENGTH")
+                  :test #'string=)
+          t)
+         ;; Anything else (any named call): the callee owns the count.
+         (t nil))))))
+
 (defun compile-multiple-value-bind (vars form body env dest)
   "Compile (multiple-value-bind (v1 v2 ...) form body...).
    Evaluates form, then reads MV count and values into let* bindings.
    The form is wrapped in a dedicated let binding to isolate its evaluation
    from any outer push/pop context (prevents interaction with nested
-   compile-values calls)."
+   compile-values calls).
+
+   Two shapes, chosen STATICALLY by %mv-tail-cannot-set-count-p:
+   (a) FORM's tail provably cannot set the MV count → it has exactly ONE
+       value; bind the extra vars to NIL outright and store count=1 after
+       the form.  No stale count can leak in.
+   (b) otherwise → reset the count to 1 BEFORE the form (so a form that
+       stores nothing still reads as single-valued) and read it after."
   (when (null vars)
     (return-from compile-multiple-value-bind
       (compile-form `(progn ,form ,@body) env dest)))
+  ;; (a) statically single-valued form.
+  (when (%mv-tail-cannot-set-count-p form)
+    (let ((primary-var (%mvm-gensym "MVPRI")))
+      (return-from compile-multiple-value-bind
+        (compile-form
+         `(let ((,primary-var ,form))
+            (setf (mem-ref ,+mv-count-addr+ :u64) 1)
+            (let* ((,(car vars) ,primary-var)
+                   ,@(mapcar (lambda (v) (list v nil)) (cdr vars)))
+              ,@body))
+         env dest))))
   (let* ((primary-var (%mvm-gensym "MVPRI"))
          (count-var (%mvm-gensym "MVC"))
          (bindings nil))
-    ;; First: capture primary in its own let scope
-    (push (list primary-var form) bindings)
+    ;; First: capture primary in its own let scope.  Reset the count to 1
+    ;; first so a form that turns out to store nothing (an inlined primop
+    ;; behind a call-shaped tail) reads back as a single value rather than
+    ;; inheriting the previous producer's count.
+    (push (list primary-var `(progn (setf (mem-ref ,+mv-count-addr+ :u64) 1)
+                                    ,form))
+          bindings)
     ;; Then: read MV count
     (push (list count-var `(mem-ref ,+mv-count-addr+ :u64)) bindings)
     ;; Remaining vars: read from MV storage if count > index, else nil
@@ -11969,8 +12080,16 @@
           ;; Primitives that DON'T go through compile-call: + - * / etc.
           ;; They don't update MV-count.  Match by symbol-name (package-
           ;; agnostic) so :modus.mvm:+ and :cl-user::+ both match.
+          ;; MULTIPLE-VALUE-LIST returns exactly ONE value (a list).  Without
+          ;; it here, a function whose tail is (multiple-value-list (values
+          ;; 1 2 3)) left the count at 3 and its caller saw two phantom extra
+          ;; values.  (No literal defun form in this comment on purpose — the
+          ;; build scripts scan source TEXT for defun tokens to seed the
+          ;; runtime symbol-function table, and one in a comment shows up as
+          ;; a bogus "WARN li-func: unresolved function" in every build log.)
           ((member (symbol-name op)
-                   '("+" "-" "*" "/" "=" "<" ">" "<=" ">="
+                   '("MULTIPLE-VALUE-LIST"
+                     "+" "-" "*" "/" "=" "<" ">" "<=" ">="
                      "CAR" "CDR" "CONS" "LIST" "NULL" "NOT"
                      "EQ" "EQL" "EQUAL" "EQUALP"
                      "ATOM" "CONSP" "LISTP" "SYMBOLP"
@@ -12029,7 +12148,24 @@
    (consistent with how compile-values writes and compile-multiple-value-bind
    reads).  Native compilation is unaffected: the inlined reads compile to the
    identical real-memory mem-refs %mv-to-list did.  The expansion is one loop
-   (NOT a per-value unroll), so it stays compact at every call site."
+   (NOT a per-value unroll), so it stays compact at every call site.
+
+   The reset-BEFORE protocol is only valid when the form's tail is what sets
+   the count.  When %mv-tail-cannot-set-count-p proves the tail cannot write
+   the count, the form has exactly one value and we store count=1 AFTER it —
+   otherwise a stale count from an earlier producer inside the form leaks out
+   as phantom values, e.g. (multiple-value-list (progn (values 1 2 3) 9)) was
+   (9 2 3) instead of (9).  This is the ONE place the fix has to live for
+   nth-value / multiple-value-setq / multiple-value-call / multiple-value-prog1
+   / notnot-mv as well: they all macroexpand into multiple-value-list."
+  (when (%mv-tail-cannot-set-count-p form)
+    (let ((pri1 (%mvm-gensym "MVPRI")))
+      (return-from compile-multiple-value-list
+        (compile-form
+         `(let ((,pri1 ,form))
+            (setf (mem-ref ,+mv-count-addr+ :u64) 1)
+            (cons ,pri1 nil))
+         env dest))))
   (let ((pri (%mvm-gensym "MVPRI"))
         (cnt (%mvm-gensym "MVC"))
         (res (%mvm-gensym "MVR"))

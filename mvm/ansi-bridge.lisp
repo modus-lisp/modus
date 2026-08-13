@@ -2413,6 +2413,23 @@
               (aset s i (if (integerp raw) raw (char-code raw))))
             (setq i (+ i 1)))))
        ((stringp object) object)
+       ;; General (non-string-subtag) VECTOR of characters, e.g.
+       ;; (vector #\a #\b #\c).  Without this branch the cond fell through
+       ;; to `(t object)' and coerce returned the SOURCE VECTOR unchanged —
+       ;; so (coerce #(#\a #\b #\c) 'string) was EQ to its argument and not
+       ;; EQUAL to "abc" (alexandria COPY-SEQUENCE.1).  ARRAYP is true for
+       ;; the cons-shaped adjustable/displaced wrappers too, and AREF/LENGTH
+       ;; both honour the wrapper, so this must precede the CONSP branch
+       ;; (which would otherwise walk a wrapper as if it were a list).
+       ((arrayp object)
+        (let ((len (length object))
+              (i 0))
+          (let ((s (%make-string-array len)))
+            (loop
+              (when (>= i len) (return s))
+              (let ((e (aref object i)))
+                (aset s i (if (characterp e) (char-code e) e)))
+              (setq i (+ i 1))))))
        ((consp object)
         (let ((len (length object))
               (i 0)

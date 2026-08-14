@@ -123,8 +123,8 @@
 (defconstant +linux-i386-stack-size+ #x800000)   ; 8 MB
 (defconstant +linux-i386-bitmap-size+ #x800000
   "8 MB per bitmap = 1 bit / 16-byte granule over a 1 GB span; the arena is
-   512 MB + the 16 MB guard, so 4.125 MB is used.  TWO bitmaps: object-start (conservative-root
-   validation) and cons-kind (so %gc-scan-copied walks to-space by TYPE rather
+   512 MB + the 16 MB guard, so 4.125 MB is used.  TWO bitmaps:
+   object-start (conservative-root validation) and cons-kind (so %gc-scan-copied walks to-space by TYPE rather
    than forwarding every word — the latter mis-forwards bignum limbs, and
    SHA-256 on a 30-bit tower allocates almost nothing but bignums).")
 (defconstant +linux-i386-heap-alloc-start+ #x200

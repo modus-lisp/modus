@@ -295,60 +295,58 @@ sbcl --script mvm/build-rpi-periph.lisp   # GPIO/SPI/I2C peripherals
 
 ### Running i386 (hosted Linux/i386 — the REAL CL image)
 
-`mvm/build-i386-cli.lisp` is the real Common Lisp stack on 32 bits: prelude +
-gc + rt + the whole `cl-*.lisp` bridge + the **unforked** `net/crypto.lisp`,
-compiled to native i386. Everything goes through one script:
+`mvm/build-i386-cli.lisp` is the hosted Modus CLI on 32 bits, built from the
+**same** shared assembly (`mvm/build-cli-common.lisp`) as x64's `./modus` and
+the aarch64 CLI: CL bridge, in-image MVM compiler + `mvm-eval`, RTEST,
+tar/`install-tarball`, the hosted socket/storage/HTTP layer, the ASDF and
+`:GENERA` surfaces, and the SBCL-faithful toplevel (`--eval`/`--load`/
+`--script`/`--quit`, `~/.modusrc`, REPL).
 
 ```bash
-./scripts/run-i386.sh build          # build the image (layer 4)
-./scripts/run-i386.sh test           # regression suite; exit 0 = green
-./scripts/run-i386.sh gc             # heap / collector state
-./scripts/run-i386.sh bulk 64        # SHA-256 over 64 KiB: digest + collections
-./scripts/run-i386.sh chain 10       # cons-chain survival across collections
-./scripts/run-i386.sh argv A B       # argc/argv/envp off the initial stack
-./scripts/run-i386.sh exec ARGS...   # arbitrary invocation
+./scripts/run-i386.sh build              # build the image
+./scripts/run-i386.sh eval '(+ 1 2)'     # evaluate one form and exit
+./scripts/run-i386.sh repl               # interactive REPL on stdin
+./scripts/run-i386.sh exec ARGS...       # arbitrary invocation
+./scripts/run-ladder-i386.sh <img> <tag> # the 22-library ladder (the gate)
 ```
 
 **32-bit ELFs need `qemu-i386-static` — binfmt_misc is NOT registered here, so
 running the binary directly does not fail loudly, it silently fails to exec.**
-That cost hours once; the run script wraps it so it cannot happen again.
-
-The suite is self-checking: it prints PASS/FAIL per check and a summary, and
-exits non-zero on any failure. Expected values (digests, RFC 8439 quarter-round
-words, magnitude-ladder residues) are GENERATED from one computation and baked
-in — hand-transcribed hex produced four separate false findings during bring-up.
-Checks marked `KNOWN-GAP` are open defects reported loudly on every run without
-failing the gate (currently: runtime multiply does not promote on overflow —
-`ash` and `+` do).
+That cost hours once; the run scripts wrap it so it cannot happen again.
 
 Build knobs (env; full list at the top of `mvm/build-i386-cli.lisp`):
-`MODUS_I386_OUT`, `MODUS_I386_LAYER` are production; `MODUS_I386_GC=0`,
-`MODUS_I386_BMP=0`, `MODUS_I386_VL=<bytes>`, `MODUS_I386_GCSTRESS=<bytes>`,
+`MODUS_I386_OUT` is production; `MODUS_I386_GC=0`, `MODUS_I386_BMP=0`,
+`MODUS_I386_VL=<bytes>`, `MODUS_I386_GCSTRESS=<bytes>`,
 `MODUS_I386_NO_CHECKED=1` are dev/triage only. `GCSTRESS` makes the collector
 recollect at a fixed interval — a copying collector's corruption appears at the
 SECOND collection, so this is what makes survival tests cheap.
 
 i386 has a **native Cheney collector** (`i386-emit-gc-trampoline` in
-`translate-i386.lisp`), the third arch arm after x64 and aarch64, on by default.
-It is gated on `*i386-linux-mode*`: bare-metal i386 has no GC metadata or
-bitmaps and keeps `int $0x31`.
+`translate-i386.lisp`), the third arch arm after x64 and aarch64, **on by
+default**, with BOTH conservative-root bitmaps (object-start + cons-kind) on;
+the boot stub mmaps them because `gc.lisp`'s `%gc-bitmap-init` allocates through
+a trap i386 does not implement. It is gated on `*i386-linux-mode*`: bare-metal
+i386 has no GC metadata or bitmaps and keeps `int $0x31`.
 
-**Hosted toplevel (`lib/cli-toplevel.lisp`) is NOT yet wired on i386**, and the
-blocker is a prerequisite rather than wiring. Its `--eval`/`--load`/REPL all go
-through `eval` → `mvm-eval` → the self-hosted compiler + `mvm-interpret`; the
-i386 image contains `EVAL`/`LOAD`/`READ` but **not** `MVM-EVAL`,
-`COMPILE-SOURCE-TO-MODULE` or `MVM-INTERPRET` (verified in the symmap), because
-layer 4 stops at crypto. Wiring the toplevel therefore needs a layer 5 that
-compiles `mvm.lisp` + `interp.lisp` + `compiler.lisp` + `mvm-eval.lisp` into
-the 32-bit image — the self-host-on-32-bit workstream.
+**The i386 arch slots** — everything this wrapper is allowed to contain — are
+`exit` = syscall 1 (int 0x80 numbering); the i386 file-I/O syscall numbers and
+`stat64`/`fstat64` struct offsets; the argv/envp reader, which walks the copy
+the boot stub STAGED into the BSS at `0x10009000` rather than the live initial
+stack (4-byte slots, and the kernel stack at `0x40800390` is above the 2^30
+ceiling a tagged `mem-ref` address can express); and `*cstr-scratch*` /
+`*io-buf-addr*`, which must sit in the `0x10004000..0x10009000` BSS window
+because i386's heap is at `0x30000000` and every syscall address travels as a
+tagged fixnum. There is **no in-image JIT** on i386 (`*JIT-ON*` is forced NIL) —
+`translate-i386.lisp` builds the image but has no runtime arm; `mvm-eval` falls
+back to `mvm-interpret`, which is correct, just slower.
 
-The *arch-specific* half is already done and proven: only three functions in
-cli-toplevel are arch-dependent (`%cli-argv-base`, `%cli-collect-argv`,
-`%cli-getenv`), all for two reasons — pointers are 4 bytes not 8, and i386
-relocates its stack at boot so `%gc-stack-base` is not the initial SP. The boot
-stub now saves the initial ESP at `0x10000290`, and `run-i386.sh argv` walks the
-live initial stack to print the full argv (including `argv[0]`, which the
-argv[1]/argv[2] BSS copies never had) plus envp.
+**RETIRED (2026-08 convergence):** `MODUS_I386_LAYER=1..5` and the ~1300-line
+baked probe suite (`run-i386.sh test/gc/bulk/chain/argv/probe N`, including the
+SHA-256 GC-survival gate that needed `net/crypto.lisp` baked in). A shipping
+image bakes no test corpus ("Build taxonomy" above), and that suite is precisely
+what kept i386 on its own build lineage — which is why the library ladder and
+alexandria's own test suite had never run on 32 bits at all. Recover from git
+history at `ba693fa`; the replacement gate is the ladder.
 
 ### QEMU i386 — LEGACY mini-Lisp (32-bit x86, Multiboot)
 

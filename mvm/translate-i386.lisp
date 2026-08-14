@@ -387,6 +387,62 @@
    *i386-linux-mode* — the bitmaps are mmap'd by boot/boot-linux-i386.lisp, and
    with a null base the bit-set would write through a garbage pointer.")
 
+;;; ---- #259: allocation-payload initialisation -------------------------
+;;; The Cheney scan (i386-emit-gc-trampoline) walks to-space as a FLAT
+;;; word-by-word sweep and calls scan_word on EVERY 4-byte word, headers and
+;;; padding included.  Any word an allocator leaves unwritten is therefore
+;;; read as a conservative root candidate.  On a 32-bit word that is a much
+;;; worse proposition than on x64: a random word has roughly 1/128 odds of
+;;; carrying tag 1 or 9 AND landing inside a 256 MB semispace, whereas a
+;;; random 64-bit word essentially never forms a plausible heap pointer.
+;;;
+;;; i386 leaves MORE unwritten than x64 does, because 16-byte alignment is a
+;;; 4-word granule here and only a 2-word granule there:
+;;;   - a CONS is 16 bytes but only car(+0) and cdr(+4) are ever written, so
+;;;     HALF of every cons is uninitialised — and conses dominate the heap;
+;;;   - copy_object's cons arm copies 8 bytes and advances the free pointer by
+;;;     16, so the two stale tail words travel into to-space at every
+;;;     collection and are swept again;
+;;;   - :alloc-obj with count 1 or 2 rounds up to 16 bytes, leaving 1-2 words;
+;;;   - :alloc-array / :alloc-string / :alloc-u8 leave the WHOLE payload
+;;;     unwritten until the caller fills it, a window in which any intervening
+;;;     allocation can collect.
+(defparameter *i386-alloc-fill* :zero
+  "How allocation sites initialise the words they do not otherwise write.
+     NIL     — leave them (pre-#259 behaviour).
+     :ZERO   — store 0, so every unwritten word is fixnum 0 (tag 0) and
+               scan_word rejects it on the tag test alone.
+     :POISON — store a distinctive even (fixnum-tagged, therefore inert)
+               sentinel, for the diagnostic build that counts how many
+               unwritten words the collector actually reads.")
+
+(defparameter *i386-fill-strings* nil
+  "Whether :alloc-string also fills its payload.  Default NIL, mirroring
+   translate-x64.lisp's deliberate exclusion: zeroing string CONTENT there
+   turned garbage into NUL (char-code 0) and desynchronised the reader, a
+   functional regression proven distinct from layout shift.  The i386 arm
+   keeps the same conservative default.")
+
+(defconstant +i386-fill-poison-cons+ #x51510000
+  "Diagnostic sentinel for the two unwritten tail words of a cons.  Low
+   nibble 0 = fixnum, so it can never be mistaken for a root.")
+(defconstant +i386-fill-poison-obj+  #x52520000
+  "Diagnostic sentinel for unwritten object payload / alignment-tail words.")
+
+(defparameter *i386-gc-instrument* nil
+  "Emit conservative-root counters into scan_word and a 32-byte binary dump
+   at the end of every collection.  Diagnostic only; never ship enabled.")
+
+(defparameter *i386-gcdbg-base* #x1001E000
+  "BSS counter block for *i386-gc-instrument*.  Sits in the free tail of the
+   demand-zeroed BSS, between +linux-i386-argv-arena-end+ (#x1001E000) and
+   +linux-i386-bss-end+ (#x10020000) — everything below is spoken for
+   (cstr-scratch #x10004000, io-buf #x10008000, argv ptrs #x10009000,
+   argv arena #x1000A000).
+     +0  magic #xFEEDFACE   +4  scan_word calls    +8  tag 1/9 candidates
+     +12 in from-space      +16 object-start ok    +20 copied
+     +24 poison-cons words seen   +28 poison-obj words seen")
+
 (defparameter *i386-gc-enabled* t
   "Whether :gc-check calls the collector.  DEFAULT T since the native i386
    Cheney collector landed (i386-emit-gc-trampoline).
@@ -1279,6 +1335,12 @@
    x64 note; 32 bytes is far inside the collector's overshoot guard."
   (i386-emit-mov-reg-abs buf base-reg *va-addr*)
   (i386-emit-mov-mem-imm buf base-reg 0 +i386-float-header+)
+  ;; #259: a double-float is a 4-slot object, so header(+0) and slots
+  ;; (+4..+16) account for 20 of the 32 bytes the granule reserves.  The
+  ;; caller writes the four slots immediately (i386-emit-float-store-payload,
+  ;; no allocation in between), but +20/+24/+28 are never written by anyone
+  ;; and the flat Cheney sweep reads all three.
+  (i386-emit-fill-slots buf base-reg '(20 24 28) :obj bump-reg)
   (i386-emit-mov-reg-reg buf bump-reg base-reg)
   (i386-emit-add-reg-imm buf bump-reg +i386-float-size+)
   (i386-emit-mov-abs-reg buf *va-addr* bump-reg)
@@ -1444,6 +1506,99 @@
   (i386-emit-pop-reg buf +scratch1+)
   (i386-emit-pop-reg buf +scratch0+))
 
+(defun i386-fill-word (kind)
+  "The word an allocation site stores into a slot it does not otherwise
+   write, or NIL when *i386-alloc-fill* is off.  KIND is :CONS for a cons
+   cell's two tail words and :OBJ for object payload / alignment tail."
+  (case *i386-alloc-fill*
+    (:zero 0)
+    (:poison (if (eq kind :cons) +i386-fill-poison-cons+ +i386-fill-poison-obj+))
+    (t nil)))
+
+(defun i386-emit-fill-slots (buf base-reg offsets kind &optional via-reg)
+  "Store the fill word into [BASE-REG + off] for each OFF in OFFSETS.
+
+   With no VIA-REG this is immediate-form MOV — 7 bytes a slot, but it needs
+   no register at all beyond BASE-REG.  Every call site below can spare one
+   DEAD register, so they pass VIA-REG and get `XOR reg,reg' once plus 3
+   bytes a slot; on an image with this many allocation sites that difference
+   is megabytes of code.  VIA-REG must be dead at the call site AND must not
+   be EAX (which is VR)."
+  (let ((v (i386-fill-word kind)))
+    (when v
+      (cond ((null via-reg)
+             (dolist (off offsets)
+               (i386-emit-mov-mem-imm buf base-reg off v)))
+            (t
+             (if (zerop v)
+                 (i386-emit-xor-reg-reg buf via-reg via-reg)
+                 (i386-emit-mov-reg-imm buf via-reg v))
+             (dolist (off offsets)
+               (i386-emit-mov-mem-reg buf base-reg off via-reg)))))))
+
+(defun i386-emit-fill-range (buf ptr-reg base-reg kind)
+  "Fill [BASE-REG+4, PTR-REG) with the fill word, walking DOWN from PTR-REG.
+
+   The downward walk is what makes this fit i386's register budget.  At every
+   allocation site EAX is VR (the invariant is build-checked) and ECX/EDX are
+   the only scratch, so an upward loop would need a third register for the
+   bound — or a memory scratch word, which bare metal would have to reserve
+   too.  Walking down lets the END double as the cursor: PTR-REG is consumed
+   (it is dead at every call site) and BASE-REG, still needed for tagging,
+   is only read.  Stops at BASE-REG itself, which holds the header.
+
+   Unlike translate-x64's emit-zero-word-range this covers the 16-byte
+   ALIGNMENT TAIL as well as the logical payload.  On x64 the tail is at most
+   one word and zeroing it perturbed code layout enough to re-expose an
+   unrelated residual; on i386 the granule is four words, so the tail is
+   where most of the uninitialised memory actually is — a 1-slot object and
+   a cons each leave two whole tail words for the flat scan to read."
+  (let ((v (i386-fill-word kind)))
+    (when v
+      (let ((loop-label (i386-make-label))
+            (done-label (i386-make-label)))
+        (i386-emit-label buf loop-label)
+        (i386-emit-sub-reg-imm buf ptr-reg 4)
+        (i386-emit-cmp-reg-reg buf ptr-reg base-reg)
+        (i386-emit-jcc buf :be done-label)      ; reached the header word
+        (i386-emit-mov-mem-imm buf ptr-reg 0 v)
+        (i386-emit-jmp-rel32 buf loop-label)
+        (i386-emit-label buf done-label)))))
+
+(defun i386-emit-gcdbg-inc (buf slot)
+  "INC dword [*i386-gcdbg-base* + SLOT] when instrumenting.  Clobbers FLAGS
+   only; every call site below recomputes them before the next branch."
+  (when (and *i386-gc-instrument* *i386-linux-mode*)
+    (i386-emit-byte buf #xFF)
+    (i386-emit-byte buf (i386-modrm #b00 0 5))
+    (i386-emit-u32 buf (+ *i386-gcdbg-base* slot))))
+
+(defun i386-emit-gcdbg-count-poison (buf val-reg)
+  "Count the two diagnostic sentinels as they are swept.  VAL-REG holds the
+   word scan_word is examining."
+  (when (and *i386-gc-instrument* *i386-linux-mode*)
+    (dolist (pair (list (cons +i386-fill-poison-cons+ 24)
+                        (cons +i386-fill-poison-obj+ 28)))
+      (let ((skip (i386-make-label)))
+        (i386-emit-cmp-reg-imm buf val-reg (car pair))
+        (i386-emit-jcc buf :ne skip)
+        (i386-emit-gcdbg-inc buf (cdr pair))
+        (i386-emit-label buf skip)))))
+
+(defun i386-emit-gcdbg-dump (buf)
+  "write(2, counter-block, 32) so a run's totals survive in the log even if
+   the process later dies.  Wrapped in its own PUSHAD/POPAD: the collector
+   holds live state in EBX/ESI/EDI and the syscall clobbers EAX/ECX/EDX."
+  (when (and *i386-gc-instrument* *i386-linux-mode*)
+    (i386-emit-mov-abs-imm buf *i386-gcdbg-base* #xFEEDFACE)
+    (i386-emit-byte buf #x60)                              ; PUSHAD
+    (i386-emit-mov-reg-imm buf +i386-eax+ 4)               ; SYS_write
+    (i386-emit-mov-reg-imm buf +i386-ebx+ 2)               ; fd 2 = stderr
+    (i386-emit-mov-reg-imm buf +scratch0+ *i386-gcdbg-base*)
+    (i386-emit-mov-reg-imm buf +scratch1+ 32)
+    (i386-emit-byte buf #xCD) (i386-emit-byte buf #x80)    ; INT 0x80
+    (i386-emit-byte buf #x61)))                            ; POPAD
+
 (defun i386-emit-gcnative-bittest (buf addr-reg bitmap-addr)
   "BT the bit for raw address ADDR-REG in the bitmap whose base word lives at
    BITMAP-ADDR, leaving the answer in CF.  Preserves every register: the POPs
@@ -1577,6 +1732,8 @@
     (i386-emit-label buf scan-label)
     (i386-emit-push-reg buf +i386-eax+)                   ; address of the word
     (i386-emit-mov-reg-mem buf +scratch1+ +i386-eax+ 0)   ; EDX = the value
+    (i386-emit-gcdbg-inc buf 4)                           ; words examined
+    (i386-emit-gcdbg-count-poison buf +scratch1+)
     (i386-emit-mov-reg-reg buf +scratch0+ +scratch1+)
     (i386-emit-and-reg-imm buf +scratch0+ 15)
     (i386-emit-cmp-reg-imm buf +scratch0+ +tag-cons+)
@@ -1587,15 +1744,18 @@
 
     ;; ---- cons-tagged candidate ----
     (i386-emit-label buf w-cons)
+    (i386-emit-gcdbg-inc buf 8)                           ; tag 1/9 candidates
     (i386-emit-mov-reg-reg buf +scratch0+ +scratch1+)
     (i386-emit-and-reg-imm buf +scratch0+ -16)            ; ECX = raw target
     (i386-emit-cmp-reg-reg buf +scratch0+ +i386-ebx+)
     (i386-emit-jcc buf :b w-done)
     (i386-emit-cmp-reg-reg buf +scratch0+ +i386-edi+)
     (i386-emit-jcc buf :ae w-done)
+    (i386-emit-gcdbg-inc buf 12)                          ; inside from-space
     ;; object-start bit must be SET (conservative-root validation)
     (i386-emit-gcnative-bittest buf +scratch0+ *gc-startbmp-addr*)
     (i386-emit-jcc buf :ae w-done)                        ; JNC
+    (i386-emit-gcdbg-inc buf 16)                          ; object-start ok
     ;; ...and the start must really BE a cons.  aarch64 #160 (77c29e9): a
     ;; scratch word holding object_base|1 passes the start gate and would then
     ;; be copied as a 16-byte cons, truncating the object and stranding its
@@ -1606,14 +1766,17 @@
 
     ;; ---- object-tagged candidate ----
     (i386-emit-label buf w-obj)
+    (i386-emit-gcdbg-inc buf 8)                           ; tag 1/9 candidates
     (i386-emit-mov-reg-reg buf +scratch0+ +scratch1+)
     (i386-emit-and-reg-imm buf +scratch0+ -16)
     (i386-emit-cmp-reg-reg buf +scratch0+ +i386-ebx+)
     (i386-emit-jcc buf :b w-done)
     (i386-emit-cmp-reg-reg buf +scratch0+ +i386-edi+)
     (i386-emit-jcc buf :ae w-done)
+    (i386-emit-gcdbg-inc buf 12)                          ; inside from-space
     (i386-emit-gcnative-bittest buf +scratch0+ *gc-startbmp-addr*)
     (i386-emit-jcc buf :ae w-done)                        ; JNC
+    (i386-emit-gcdbg-inc buf 16)                          ; object-start ok
     ;; ...and the start must NOT be a cons — the mirror-image cross-check:
     ;; cons_base|9 would otherwise be copied as a variable-size object, reading
     ;; a cons's car as a header.
@@ -1621,6 +1784,7 @@
     (i386-emit-jcc buf :b w-done)                         ; JC
 
     (i386-emit-label buf w-copy)
+    (i386-emit-gcdbg-inc buf 20)                          ; copied
     (i386-emit-mov-reg-reg buf +i386-eax+ +scratch1+)     ; tagged pointer
     (i386-emit-call-rel32 buf copy-label)
     (i386-emit-pop-reg buf +scratch1+)                    ; address of the word
@@ -1880,6 +2044,8 @@
     (i386-emit-byte buf #xFF)                             ; INC dword [abs32]
     (i386-emit-byte buf (i386-modrm #b00 0 5))
     (i386-emit-u32 buf +i386-gc-count+)
+
+    (i386-emit-gcdbg-dump buf)
 
     (i386-emit-byte buf #x61)                             ; POPAD
     (i386-emit-ret buf)
@@ -3218,6 +3384,25 @@
            (i386-emit-mov-mem-reg buf +scratch1+ 0 +scratch0+)
            (i386-emit-pop-reg buf +scratch0+)              ; cdr back
            (i386-emit-mov-mem-reg buf +scratch1+ 4 +scratch0+)
+           ;; #259: a cons occupies 16 bytes but only car(+0)/cdr(+4) are ever
+           ;; written.  The other HALF is read by the flat Cheney sweep at
+           ;; every collection — and copy_object's cons arm carries it along,
+           ;; copying 8 bytes and advancing the free pointer by 16, so the
+           ;; stale words are re-swept in to-space too.  Conses dominate the
+           ;; heap, so these two words are the single largest source of
+           ;; uninitialised memory the i386 collector reads.
+           ;;
+           ;; RESIDUAL, stated rather than assumed: this fills the tail of a
+           ;; FRESHLY ALLOCATED cons only.  i386-emit-gcnative-copy's cons arm
+           ;; writes [ESI+0]/[ESI+4] and then advances ESI by 16, so a cons
+           ;; that SURVIVES a collection lands on two words of stale to-space
+           ;; content again.  Closing that needs two stores in copy_object
+           ;; (cheap — per surviving cons, not per allocation), but it is a
+           ;; codegen change and therefore a fresh ladder gate, and the
+           ;; measured value of the whole exercise is nil (see the #259 note
+           ;; in CLAUDE.md), so it is deliberately left for whoever next has a
+           ;; reason to re-gate this file.
+           (i386-emit-fill-slots buf +scratch1+ '(8 12) :cons +scratch0+)
            (i386-emit-gc-mark-start buf +scratch1+ t)   ; object-start + cons-kind
            (i386-emit-mov-reg-reg buf +scratch0+ +scratch1+)
            (i386-emit-or-reg-imm buf +scratch0+ +tag-cons+)
@@ -3330,9 +3515,31 @@
                                   (logior (ash count 8) subtag))
            ;; VR-PRESERVING: bump in ECX, then tag the BASE in EDX in place,
            ;; so no third register (EAX = VR) is needed.
-           (i386-emit-mov-reg-reg buf +scratch0+ +scratch1+)
            (let ((total (logand (+ (* (1+ count) 4) 15) (lognot 15))))
-             (i386-emit-add-reg-imm buf +scratch0+ total))
+             ;; #259: the caller fills the slots AFTER this opcode returns, and
+             ;; may allocate (and therefore collect) in between; the 16-byte
+             ;; granule adds up to three more unwritten tail words on top.
+             ;; Fill BEFORE ECX becomes the bump register: ECX is dead here, so
+             ;; the unrolled form can hoist the fill word into it (3 bytes a
+             ;; slot instead of 7).  Above the threshold a runtime loop keeps a
+             ;; wide struct from blowing up code size; that form consumes ECX
+             ;; as its cursor, so the bump is recomputed after it.
+             (cond ((null (i386-fill-word :obj))
+                    (i386-emit-mov-reg-reg buf +scratch0+ +scratch1+)
+                    (i386-emit-add-reg-imm buf +scratch0+ total))
+                   ((<= total 80)
+                    (i386-emit-fill-slots
+                     buf +scratch1+
+                     (loop for off from 4 below total by 4 collect off) :obj
+                     +scratch0+)
+                    (i386-emit-mov-reg-reg buf +scratch0+ +scratch1+)
+                    (i386-emit-add-reg-imm buf +scratch0+ total))
+                   (t
+                    (i386-emit-mov-reg-reg buf +scratch0+ +scratch1+)
+                    (i386-emit-add-reg-imm buf +scratch0+ total)
+                    (i386-emit-fill-range buf +scratch0+ +scratch1+ :obj)
+                    (i386-emit-mov-reg-reg buf +scratch0+ +scratch1+)
+                    (i386-emit-add-reg-imm buf +scratch0+ total))))
            (i386-emit-mov-abs-reg buf *va-addr* +scratch0+)
            (i386-emit-gc-mark-start buf +scratch1+)      ; object-start only
            (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
@@ -3361,6 +3568,8 @@
            (i386-emit-and-reg-imm buf +scratch0+ -16)
            (i386-emit-add-reg-reg buf +scratch0+ +scratch1+); ECX = new VA
            (i386-emit-mov-abs-reg buf *va-addr* +scratch0+)
+           ;; #259: the whole payload is unwritten until the caller fills it.
+           (i386-emit-fill-range buf +scratch0+ +scratch1+ :obj)
            (i386-emit-gc-mark-start buf +scratch1+)      ; object-start only
            (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
            (i386-store-vreg buf vd +scratch1+)))
@@ -3415,6 +3624,9 @@
            (i386-emit-mov-reg-abs buf +scratch1+ *va-addr*)        ; EDX = base
            (i386-emit-mov-mem-reg buf +scratch1+ 4 +scratch0+)     ; slot 0 = addr
            (i386-emit-mov-mem-imm buf +scratch1+ 0 #x116)          ; (1<<8)|#x16
+           ;; #259: header(+0) and slot 0(+4) are written; the 16-byte granule
+           ;; leaves +8/+12 for the flat sweep to read.
+           (i386-emit-fill-slots buf +scratch1+ '(8 12) :obj +scratch0+)
            (i386-emit-mov-reg-reg buf +scratch0+ +scratch1+)
            (i386-emit-add-reg-imm buf +scratch0+ 16)
            (i386-emit-mov-abs-reg buf *va-addr* +scratch0+)
@@ -3665,6 +3877,9 @@
          ;; (alloc-cons Vd) -- bump-allocate cons cell, tag as cons
          (let ((vd (first operands)))
            (i386-emit-mov-reg-abs buf +scratch1+ *va-addr*)
+           ;; #259: :alloc-cons hands back a cell whose car/cdr the caller
+           ;; writes later, so ALL FOUR words are uninitialised on exit.
+           (i386-emit-fill-slots buf +scratch1+ '(0 4 8 12) :cons +scratch0+)
            (i386-emit-gc-mark-start buf +scratch1+ t)   ; object-start + cons-kind
            (i386-emit-mov-reg-reg buf +scratch0+ +scratch1+)
            (i386-emit-or-reg-imm buf +scratch0+ +tag-cons+)
@@ -3938,6 +4153,14 @@
            (i386-emit-and-reg-imm buf +scratch0+ -16)
            (i386-emit-add-reg-reg buf +scratch0+ +scratch1+); ECX = new VA
            (i386-emit-mov-abs-reg buf *va-addr* +scratch0+)
+           ;; #259: string CONTENT is filled only when *i386-fill-strings* is
+           ;; on.  Default OFF, mirroring translate-x64.lisp: zeroing string
+           ;; bodies there turned uninitialised garbage into NUL (char-code 0)
+           ;; and desynchronised the reader — a functional regression proven
+           ;; (by an empty-range layout-isolation probe) to be about content,
+           ;; not layout and not GC roots.
+           (when *i386-fill-strings*
+             (i386-emit-fill-range buf +scratch0+ +scratch1+ :obj))
            ;; VR-PRESERVING: tag the base in EDX in place (never EAX).
            (i386-emit-gc-mark-start buf +scratch1+)      ; object-start only
            (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
@@ -3964,6 +4187,11 @@
            (i386-emit-and-reg-imm buf +scratch0+ -16)
            (i386-emit-add-reg-reg buf +scratch0+ +scratch1+); ECX = new VA
            (i386-emit-mov-abs-reg buf *va-addr* +scratch0+)
+           ;; #259: the byte payload is unwritten until the caller fills it.
+           ;; Unlike :alloc-string this is safe to fill — a u8 vector is a
+           ;; numeric buffer with no reader interaction, and translate-x64
+           ;; zeroes its counterpart for exactly this reason.
+           (i386-emit-fill-range buf +scratch0+ +scratch1+ :obj)
            ;; VR-PRESERVING: tag the base in EDX in place (never EAX).
            (i386-emit-gc-mark-start buf +scratch1+)      ; object-start only
            (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)

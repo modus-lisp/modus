@@ -551,6 +551,39 @@ sequence slows alloc-heavy code (optimizable follow-up).
 Functions are NOP-aligned to avoid addresses ending in 0x1 (cons tag collision
 with closure-aware funcall dispatch). See `*x64-native-code-offset*`.
 
+### i386 allocation zero-init (#259) — DONE, and it fixed nothing (measured)
+
+`*i386-alloc-fill*` (default `:zero`) now fills every word an i386 allocator
+does not otherwise write, at 8 sites: cons tail (+8/+12), `:alloc-cons` (all
+four words), `:alloc-obj` payload + alignment tail, `:alloc-array`,
+`:alloc-u8`, `:sap-new` tail, and the double-float granule's 3 tail words.
+`:alloc-string` content stays UNFILLED behind `*i386-fill-strings*`, mirroring
+translate-x64's deliberate exclusion.  The gap was real and bigger than x64's:
+16-byte alignment is a FOUR-word granule at 32 bits, so half of every cons was
+uninitialised, and `copy_object`'s cons arm copies 8 bytes while advancing the
+free pointer by 16 — the stale pair rides into to-space at every collection.
+
+**The false-root payoff hypothesis is DISPROVED, with numbers.**  A diagnostic
+build (`*i386-gc-instrument*`, default off — scan_word counters + a 32-byte
+binary `write(2,…)` per collection) measured **15.7% of every word the
+collector sweeps was allocator-uninitialised** (4,106,804 of 26,089,717 at GC
+25 of an alexandria load).  Making them inert moved the conservative-root
+population by **0.06%**: in-range candidates 3,686,693 → 3,684,417, copies
+3,654,082 → 3,652,347 (same tree, same workload, same GC index).  Structural
+reason: i386 already gates every candidate on the object-start AND cons-kind
+bitmaps plus a size sanity guard, so a surviving false root can only copy a
+REAL, correctly-typed object — **retention, never corruption**.  Note the
+start-bit gate is nearly a no-op in a cons-dense 32-bit heap (it rejected 512
+of 3.69M); the cons-kind gate did 63× more work (32,099 rejects).  Do not
+re-derive this: it is hardening, priced at +6.0% image and ~1% wall.
+
+The `MVM: unknown opcode` class **SURVIVES** and is NOT a GC/stale-reference
+class: named-readtables fails 10 top-level forms with the *same* (opcode, PC)
+pair in BOTH arms — deterministic.  That is the "called a non-function" shape
+documented at `mvm/compiler.lisp` ~8057 (a fixnum used as a code address).
+`named-readtables-ql` (~430s) is a far cheaper repro than `alexandria-ql`
+(~19min, exit 139 at `P1.curry`).
+
 ### Crash triage: it's almost never the GC — default elsewhere
 
 The collector is hardened (fuzz-closed layout-dependence, conservative-root

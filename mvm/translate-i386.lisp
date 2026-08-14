@@ -170,7 +170,27 @@
 ;;; reads it as its first prologue action.
 (defparameter *nargs-addr*   #x60C)  ; nargs convention slot (raw, untagged)
 (defparameter *cenv-addr*    #x610)  ; closure-env "register" (x64: R13)
-(defparameter *mvcount-addr* #x614)  ; multiple-values count (tagged)
+;;; MV-COUNT IS **NOT** A PRIVATE i386 SLOT — it is a SHARED contract address.
+;;;
+;;; Unlike nargs and cenv (whose only writer AND only reader are this
+;;; translator's :set-nargs/:get-nargs and :set-cenv/:get-cenv), the
+;;; multiple-value count is read and written by ARCHITECTURE-INDEPENDENT code:
+;;; mvm/compiler.lisp bakes `+mv-count-addr+` (#x10000090) into the mem-ref
+;;; forms it expands MULTIPLE-VALUE-BIND / MULTIPLE-VALUE-LIST / VALUES / NTH-
+;;; VALUE into, and shared CL source (prelude.lisp %MV-TO-LIST, cl-eval.lisp,
+;;; cl-clos.lisp, gc.lisp) reads the same literal.  translate-x64 and
+;;; translate-aarch64 therefore emit :set-mv-count against #x10000090 too.
+;;;
+;;; This slot used to be relocated with the rest of the block, so on i386 the
+;;; ONE writer (:set-mv-count) pointed at an address with ZERO readers: every
+;;; function epilogue's "I returned exactly one value" reset was DISCARDED,
+;;; while `(values a b c)` still stored 3 at #x10000090 through a compiler-
+;;; emitted mem-ref.  The count was therefore monotonically stale-high, and any
+;;; later (multiple-value-bind (x y) (f)) where F had internally produced
+;;; multiple values read PHANTOM secondaries out of #x10000098.  Symptom:
+;;; `(multiple-value-list (typep 1 'integer))` => ("T" T) on i386 vs (T) on x64.
+;;; Keep this EQ to modus.mvm::+mv-count-addr+; it must not be relocated.
+(defparameter *mvcount-addr* modus.mvm::+mv-count-addr+)  ; SHARED, see above
 (defparameter *gc-page-base-addr* #x618)  ; raw from_start, for the bit-set
 (defparameter *gc-startbmp-addr*  #x61C)  ; raw object-start bitmap base
 (defparameter *gc-consbmp-addr*   #x620)  ; raw cons-kind bitmap base
@@ -185,7 +205,8 @@
         *vn-addr*      (+ base #x08)
         *nargs-addr*   (+ base #x0C)
         *cenv-addr*    (+ base #x10)
-        *mvcount-addr*     (+ base #x14)
+        ;; base+#x14 stays RESERVED (do not reuse): *mvcount-addr* is a shared
+        ;; contract address, never relocated.  See its defparameter above.
         *gc-page-base-addr* (+ base #x18)
         *gc-startbmp-addr*  (+ base #x1C)
         *gc-consbmp-addr*   (+ base #x20))

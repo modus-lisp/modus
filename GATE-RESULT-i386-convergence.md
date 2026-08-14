@@ -236,3 +236,104 @@ The whole of this list was previously unmeasurable on 32 bits:
 25 KB of source · 30,000-character string literals through the in-image compiler ·
 `install-tarball` (gunzip, untar, `.asd` parse, component ordering) ·
 `--eval`/`--load`/`--quit`/`~/.modusrc` toplevel.
+
+---
+
+## 7. alexandria's OWN test suite — first run ever on 32 bits
+
+Both suites run UNMODIFIED through the RTEST package (`mvm/rtest.lisp`), which
+this convergence put into the i386 image for the first time.  Same driver, same
+tarball, same tree; x64 binary from this branch, i386 under `qemu-i386-static`.
+
+### alexandria-2 (`tests/rtest/run-alexandria-2.lisp`) — COMPLETED on both
+
+| | registered | PASS | ERR | terminated? |
+|---|---|---|---|---|
+| x64 | 20 | **20** | 0 | `@@PHASE=done` |
+| **i386** | 20 | **13** | **7** | `@@PHASE=done` |
+
+All 7 i386 errors are `PROGRAM-ERROR` and all 7 are `LINE-UP-FIRST.*` /
+`LINE-UP-LAST.*` — alexandria's threading macros, every one of them a
+`MACROEXPAND` of a library macro.  That is **defect B2** (§6B), one root cause.
+
+### alexandria-1 (`tests/rtest/run-alexandria-1.lisp`) — i386 does NOT terminate
+
+| | registered | PASS | FAIL | ERR | terminated? |
+|---|---|---|---|---|---|
+| x64 | 230 | **230** | 0 | 0 | `@@PHASE=done` |
+| **i386** | 230 | 12 | 7 | 11 | **NO — SIGSEGV at test 31** |
+
+Run twice (90 min and 6 h timeouts).  Both died with SIGSEGV at
+`RT:RUN COPY-HASH-TABLE.2`, and the `RT:PASS/FAIL/ERR` lines up to that point
+are **bit-identical** between the two runs — deterministic, not a timeout and
+not a race.  **12/7/11 is not a tally**: it is the state of the first 30 of 230
+tests before the process died.  Do not quote it as a score.
+
+The named failures cluster, and the clusters are the §6 defects:
+
+* `SWITCH.1/.2`, `ESWITCH.1/.2`, `CSWITCH.1/.2` FAIL, `UNWIND-PROTECT-CASE.1-5`
+  and `REQUIRED-ARGUMENT.1` ERR — all macro-expansion shaped (**B2**).
+* `COPY-ARRAY.1-4` ERR — the `make-array` family (see §6D: `make-array`
+  halving is an x64 bug too).
+* `ARRAY-INDEX.1` FAIL — `array-dimension-limit`-adjacent, i.e. a 2^24 constant
+  meeting a 30-bit fixnum.
+
+---
+
+## 8. THE 22-LIBRARY LADDER — the first measurement that has ever existed on i386
+
+Same tree, same drivers (`/home/claude/lf/drivers/*-ql.lisp`), same tarballs,
+same `lf/score.py`.  x64 native; aarch64 via `scripts/run-ladder-aarch64.sh`;
+i386 via the new `scripts/run-ladder-i386.sh`.  **All 22 logs on all three
+arches carry an `EXIT=` line — every run terminated before these tallies were
+read.**
+
+| arch | libs | **clean** | probes ok | err | missing | FAILURES |
+|---|---|---|---|---|---|---|
+| x64 | 22 | **18** | 102 | 8 | 2 | 10 |
+| aarch64 | 22 | **17** | 99 | 8 | 5 | 13 |
+| **i386** | 22 | **2** | **42** | **21** | **49** | **70** |
+
+**i386 is at 2/22 clean, 42 probes OK.**  That is the number the three-platform
+release gate needs and did not have.
+
+**16 of the 22 i386 libraries exit 139 (SIGSEGV)**, and `missing=49` is almost
+entirely probes never reached because the process died mid-log.  The crashes are
+*not* spread through the run: with few exceptions every one lands on the
+driver's `(lf-force-gc)` form, the first thing after the P1 probe block — i.e.
+cluster **B3**, amplified by trap **#x0520** (no signal handler ⇒ a fault ends
+the process instead of becoming one `(:ERR …)` line), and reached because of
+**§6C** (no JIT ⇒ the driver's GC counter always reads 0 ⇒ the loop runs its
+full 2500-iteration, ~500 MB bound).  Six libraries reach `LF-END`
+(`bordeaux-threads`, `cl-base64`, `named-readtables`, `salza2`, `sha1`,
+`trivial-garbage`); `salza2` and `trivial-garbage` score fully clean.
+
+aarch64 is **unchanged**: 17/22 clean, err 8 — its stated baseline, and by
+construction, since its binary is byte-identical to `main`'s (§1).  Its one
+disturbed row is `named-readtables`, whose qemu process was killed by session
+infrastructure part-way through and restarted detached; the headline `clean` and
+`err` figures are the baseline's exactly.
+
+---
+
+## 9. What to fix first, in order of measured leverage
+
+1. **B1 — the boot-time baked-string installs.**  One bug, two surfaces
+   (`:GENERA` + ASDF), and it is what makes `.asd` read-time guards abort.
+   Precisely localized: the compat sources are correct (they install fine when
+   read from disk on the same image), `%it-eval-source` is correct, so the
+   defect is in the build-time-baked string literal path used by exactly the two
+   boot steps that fail.
+2. **`#x0520` — the i386 signal-handler arm** (`rt_sigaction` + an `sa_restorer`
+   trampoline).  Today one fault destroys a whole run; with it, every defect
+   below degrades to a single `(:ERR …)` line and the remaining probes still
+   report.  This changes the *shape* of every future i386 measurement.
+3. **B3 — the collector's first collection.**  16 SIGSEGVs land here.
+   `MODUS_I386_VL=<small>` turns it into a seconds-long repro.
+4. **B2 — 2-argument funcall of a macro-expander closure.**  Cheapest of the
+   four (3-line repro), and it is every `LINE-UP-*` failure plus the code-walker
+   probes.
+5. **#216 / #217** — the genuine 30-bit-fixnum work, i.e. #201.
+6. **An i386 JIT arm** — not correctness, but it is what makes `mem-ref`
+   observable from interpreted code, and therefore what makes the shared
+   harnesses measure the same thing on all three arches.

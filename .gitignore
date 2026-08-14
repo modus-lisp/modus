@@ -8,3 +8,6 @@ gained.txt
 recheck.out
 probes/*.out
 alex-after.log
+# agent scratch (build-source dumps, sweep logs) -- never commit
+scratch/
+modus-aa64

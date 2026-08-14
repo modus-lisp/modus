@@ -575,7 +575,18 @@ bitmaps plus a size sanity guard, so a surviving false root can only copy a
 REAL, correctly-typed object — **retention, never corruption**.  Note the
 start-bit gate is nearly a no-op in a cons-dense 32-bit heap (it rejected 512
 of 3.69M); the cons-kind gate did 63× more work (32,099 rejects).  Do not
-re-derive this: it is hardening, priced at +6.0% image and ~1% wall.
+re-derive this: it is hardening, priced at +6.0% image (41,388,856 →
+43,865,800) and +0.50% aggregate wall over 18 ladder libraries.
+
+Same-run control (both arms built from one tree, ladders run CONCURRENTLY,
+22/22 terminated): base clean 7/22, ok 65, err 39, missing 8 → zero clean
+**8/22**, ok 48, err 33, missing 31.  The whole ok/missing swing is ONE
+library: `alexandria-ql` exit-139 at `P1.curry`.  That outcome is a coin flip
+for a FIXED binary — base segfaulted there standalone and completed in the
+ladder, and the pre-change baseline recorded base itself at exit-139 — so
+treat ±1 clean and ±20 probes on alexandria as harness noise, not signal.
+Real per-lib deltas: `parse-float-ql` 1 ok → 2 ok (now clean), `cl-base64-ql`
+0 ok → 1 ok; every other library bit-identical.
 
 The `MVM: unknown opcode` class **SURVIVES** and is NOT a GC/stale-reference
 class: named-readtables fails 10 top-level forms with the *same* (opcode, PC)

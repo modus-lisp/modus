@@ -20,11 +20,58 @@
 (defvar *linux-aarch64-r25-offset* +linux-aarch64-heap-size+
   "Offset from heap base for x25 (VL = alloc limit).  Midpoint with GC.")
 
+(defconstant +linux-aarch64-gc-guard+ #x1000000
+  "16 MB — the amount of MAPPED-BUT-UNCOUNTED memory that must lie past the
+   TOP semispace's end.  x64 allocates this explicitly as
+   +linux-x64-gc-guard+ (c9c6278); i386 omitted it and that was bug B3
+   (18b223b), which killed 16 of the 22 ladder libraries.
+
+   WHY: :gc-check tests `VA < VL' BEFORE an allocation whose size it does not
+   know, so the alloc following a passing check overshoots VL by up to that
+   object's whole size.  In the LOWER semispace the overshoot lands in the
+   (mapped) upper one and is harmless.  In the UPPER semispace there is
+   nothing above it but the end of the mmap, so without slack the object's own
+   initialising stores fault.
+
+   AArch64 SATISFIES THIS TODAY BY ACCIDENT, NOT BY DESIGN, which is why this
+   is a checked invariant rather than a constant to add.  heap-size is
+   #x38000000 (896 MB) while the shipping builds override the midpoint to
+   #x08000000 (128 MB semispaces), leaving ~640 MB of slack — measured live:
+   top semispace ends 0x7dac1ffffe00, mmap ends 0x7dac48000000.  But the
+   midpoint is settable per-build and via MODUS_GC_MIDPOINT, and this file's
+   own default (#x1C000000) would put the top semispace's end 512 bytes below
+   the mapping end — i386's B3 exactly.  Hence: assert, don't assume.")
+
+
 (defvar *linux-aarch64-gc-midpoint* +linux-aarch64-gc-midpoint+
   "WS4-AA64 #160: build-overridable semispace boundary.  to_start = heap+this,
    space_size = this - alloc_start.  Default = the 448MB constant; a GC-on repro
    build may shrink it (with a matching *linux-aarch64-r25-offset*) so collections
    fire on a modest allocation.")
+
+(defun check-aarch64-gc-guard-invariant ()
+  "Build-time only — emits no code.  Signals if the configured semispace
+   geometry leaves less than +linux-aarch64-gc-guard+ of mapped slack above
+   the top semispace.  GC-off builds (r25-offset = heap-size, so allocation is
+   bounded by the mapping itself and never flips) are exempt."
+  (when (/= *linux-aarch64-r25-offset* +linux-aarch64-heap-size+)
+    (let* ((midpoint *linux-aarch64-gc-midpoint*)
+           ;; to_start = base+midpoint, space_size = midpoint - alloc_start,
+           ;; so the top semispace ends at base + 2*midpoint - alloc_start.
+           (top-end (- (* 2 midpoint) +linux-aarch64-heap-alloc-start+))
+           (slack (- +linux-aarch64-heap-size+ top-end)))
+      (when (< slack +linux-aarch64-gc-guard+)
+        (error "AArch64 GC arena has no overshoot guard: midpoint #x~X puts the ~
+                top semispace's end at heap+#x~X, only ~D bytes below the ~D MB ~
+                mapping — need at least #x~X (16 MB).  Either raise ~
+                +linux-aarch64-heap-size+ to #x~X or lower the midpoint.  ~
+                Shipping this is i386 bug B3 (18b223b): every allocation larger ~
+                than the slack that trips :gc-check runs off the mmap and ~
+                SIGSEGVs in its own initialising stores."
+               midpoint top-end slack (ash +linux-aarch64-heap-size+ -20)
+               +linux-aarch64-gc-guard+
+               (+ top-end +linux-aarch64-gc-guard+)))))
+  t)
 
 (defvar *linux-aarch64-gc-metadata-shl* nil
   "WS4-AA64 #160: when non-nil, the entry stub stores the Cheney GC metadata
@@ -260,6 +307,7 @@
   ;; mmap heap:
   ;;   x0=hint=0x10000000, x1=size, x2=PROT_RW(3), x3=MAP_PRIV|ANON(0x22),
   ;;   x4=-1, x5=0, x8=222(mmap).  SVC #0.
+  (check-aarch64-gc-guard-invariant)
   (emit-aarch64-load-imm64 buf 0 #x10000000)
   (emit-aarch64-load-imm64 buf 1 +linux-aarch64-heap-size+)
   (emit-aarch64-load-imm64 buf 2 3)

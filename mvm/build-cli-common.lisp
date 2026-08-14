@@ -34,14 +34,21 @@
 ;;;; it is a hardware/target fact.  Each wrapper must DEFVAR all of these before
 ;;;; loading this file:
 ;;;;
-;;;;   *CLI-ARCH*                    :x64 | :aarch64
+;;;;   *CLI-ARCH*                    :x64 | :aarch64 | :i386
 ;;;;   *CLI-ARCH-SYSCALL-SOURCE*     sys-exit / halt.  exit_group is syscall 60
-;;;;                                 on x86-64 and 93 on the AArch64 generic ABI.
+;;;;                                 on x86-64, 93 on the AArch64 generic ABI
+;;;;                                 and 1 (exit) on the i386 int-0x80 ABI.
 ;;;;   *CLI-ARCH-PROBE-SOURCE*       arch-address diagnostic probes, baked ahead
 ;;;;                                 of kernel-main.
 ;;;;   *CLI-ARCH-KERNEL-PROLOGUE*    hardware setup that must precede the FIRST
 ;;;;                                 allocation (aarch64: BSS zeroing + GC
 ;;;;                                 object-start bitmap reservation).
+;;;;   *CLI-ARCH-IO-SCRATCH-SOURCE*  the *cstr-scratch* / *io-buf-addr* setqs.
+;;;;                                 A memory-map fact: i386's heap is at
+;;;;                                 0x30000000, so the 64-bit ports' 0x0FE00000
+;;;;                                 is unmapped there, and an i386 syscall
+;;;;                                 argument travels as a TAGGED fixnum so the
+;;;;                                 address must also be below 2^30.
 ;;;;   *CLI-ARCH-KERNEL-EPILOGUE*    the toplevel entry / probe program.
 ;;;;   *CLI-ARCH-OVERRIDE-SOURCE*    late last-defun-wins overrides spliced right
 ;;;;                                 after the bridge (aarch64: the `*at'-syscall
@@ -59,7 +66,7 @@
 
 (declaim (special *cli-arch*
                   *cli-arch-syscall-source* *cli-arch-probe-source*
-                  *cli-arch-kernel-prologue*
+                  *cli-arch-kernel-prologue* *cli-arch-io-scratch-source*
                   *cli-arch-kernel-epilogue* *cli-arch-override-source*))
 
 ;;; ============================================================
@@ -184,7 +191,19 @@
 (defvar *jit-on*
   (let ((no (sb-ext:posix-getenv "MODUS_NO_JIT"))
         (v  (sb-ext:posix-getenv "MODUS_USE_JIT")))
-    (cond ((and no (> (length no) 0)) nil)           ; MODUS_NO_JIT → rollback to interpret
+    (cond ;; NAMED DIVERGENCE — i386 is pure-interpret.  mvm/translate-i386.lisp
+          ;; exists and is what BUILDS this image, but there is no in-image JIT
+          ;; arm for it: no shrink needle for its code buffer, no co-init to
+          ;; populate the vreg/register tables limitation #7 leaves empty, and
+          ;; no runtime PROT_EXEC page primitive on the i386 trap table.  Baking
+          ;; the translator without those would leave %jit-translate-page
+          ;; failing every form — i.e. the same interpret path, plus ~1 MB of
+          ;; dead code.  mvm-eval's JIT seam falls back cleanly, so the image is
+          ;; correct, just slower.  Removing this line is the WHOLE change when
+          ;; an i386 JIT arm lands; it is tracked as an open item, not a fact
+          ;; about the hardware.
+          ((eq *cli-arch* :i386) nil)
+          ((and no (> (length no) 0)) nil)           ; MODUS_NO_JIT → rollback to interpret
           (v (or (string= v "1") (string-equal v "t") (string-equal v "yes")))  ; explicit
           ;; WS5 #206: DEFAULT is ON again.  It was turned OFF in 2d95d3e
           ;; because a JIT'd form that called a RUNTIME-DEFINED function
@@ -434,7 +453,9 @@
        ""                                  (string #\Newline)
        (or *translate-aarch64-source* "")  (string #\Newline)
        (or *aarch64-jit-coinit-source* "") (string #\Newline)))
-    (t (error "build-cli-common: unknown *cli-arch* ~S (want :x64 or :aarch64)"
+    ;; i386: no in-image JIT translator — see the *JIT-ON* comment above.
+    ((eq *cli-arch* :i386) "")
+    (t (error "build-cli-common: unknown *cli-arch* ~S (want :x64, :aarch64 or :i386)"
               *cli-arch*))))
 
 ;;; ARCH SLOT — boot hook + JIT gate.  Appended LAST so its %jit-enabled-p wins
@@ -898,7 +919,25 @@
   ;; bound symbol can't kill the chain — see CLAUDE.md known limitation
   ;; #7 history.  Most thunks succeed and we get init values for free.
   (init-all-globals)
-  ;; ANSI numeric/array constants whose DEFCONSTANT init thunks don't run
+"
+  ;; ARCH SLOT: file-I/O scratch addresses, spliced HERE — after
+  ;; (init-all-globals), deliberately.
+  ;;
+  ;; FINDING (2026-08, i386 convergence): the two `(setq *cstr-scratch* ...)' /
+  ;; `(setq *io-buf-addr* ...)' lines ~20 lines above are DEAD CODE on both
+  ;; 64-bit ports.  init-all-globals re-runs cl-fileio.lisp's defvar init
+  ;; thunks, which restore #x1DF00000 / #x1DE00000; a running ./modus reports
+  ;; exactly those, not the 0x0FE00000 pair the setqs name.  It is harmless
+  ;; there only because the 64-bit BSS happens to cover both addresses.  It is
+  ;; NOT harmless on a port with a smaller BSS: i386 reserves through
+  ;; +linux-i386-bss-end+ = 0x10020000, so 0x1DF00000 is unmapped and every
+  ;; %string-to-cstr would fault.  Hence a slot that lands AFTER the thunks.
+  ;; The dead lines above are left byte-for-byte alone so the two shipping
+  ;; 64-bit images stay identical; fixing them is a separate, gated change.
+  ;;
+  ;; x64/aarch64 pass "" here, so this splice adds nothing to their blobs.
+  *cli-arch-io-scratch-source*
+  "  ;; ANSI numeric/array constants whose DEFCONSTANT init thunks don't run
   ;; at boot (limitation #7).  The x64-linux gate image sets these in its
   ;; own kernel-main; build-generic relied only on init-all-globals, so
   ;; array-dimension-limit et al. were UNBOUND — third-party code that

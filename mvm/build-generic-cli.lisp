@@ -90,6 +90,11 @@
 ;; MCGC object-start bitmap is reserved host-side.
 (defvar *cli-arch-kernel-prologue* "")
 
+;; File-I/O scratch.  Both 64-bit ports park these just BELOW the heap base
+;; (0x10000000), inside the ELF's own mapped BSS tail.  i386 cannot: its heap
+;; is at 0x30000000 and 0x0FE00000 is unmapped there.
+(defvar *cli-arch-io-scratch-source* "")
+
 ;; x86-64 toplevel entry.  No baked probe program — this is a shipping CLI.
 (defvar *cli-arch-kernel-epilogue*
 "  ;; --- entry: the SHARED SBCL-faithful CLI toplevel ------------------------

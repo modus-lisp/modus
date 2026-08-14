@@ -258,6 +258,12 @@
 
 ")
 
+;;; ARCH SLOT: file-I/O scratch.  Identical to x64 -- both 64-bit ports park
+;;; these just BELOW the heap base (0x10000000), inside the ELF's own mapped
+;;; BSS tail.  i386 cannot: its heap is at 0x30000000 and 0x0FE00000 is
+;;; unmapped there.
+(defvar *cli-arch-io-scratch-source* "")
+
 ;;; ARCH SLOT: the toplevel entry / probe program.  This is the one place the
 ;;; two images are genuinely DIFFERENT PROGRAMS: x64's shipping CLI goes
 ;;; straight to cli-toplevel, while this image additionally carries the WS4

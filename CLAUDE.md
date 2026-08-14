@@ -640,6 +640,30 @@ CHUNK-CRASH 0 and FILE-WEDGE 30 on both, and all 3 deltas cleared on a
 deterministic single-process recheck (`read-byte` 24167/24168 pass in both;
 `times` 14486 is 1-in-5 flaky in BOTH arms) — **net regression 0**.
 
+**MERGE STATUS — #261 YES, #260 NOT YET.**  The i386 ladder separates them
+cleanly (attribution build = MV-count fix alone):
+
+- #261 alone is ladder-neutral on the libraries #260 disturbs
+  (bordeaux-threads / iterate / puri: identical probe values and EXIT=0), with
+  ONE measured exception — `cl-base64` `P1.enc` goes `YWJj` → `(ERR
+  TYPE-ERROR)`.  A correct MV count changes what a MULTIPLE-VALUE-BIND sees,
+  so this reads as a newly-EXPOSED downstream gap rather than a defect in the
+  fix, but it is unchased and should be treated as an open follow-up.
+- #260 converts **4 of 22 ladder libraries** (bordeaux-threads, cl-base64,
+  iterate, puri) from EXIT=0 to **EXIT=139**, by unlocking a macro path i386
+  could never previously execute.  Root cause of that SIGSEGV is NOT FOUND.
+  The obvious candidate was disproved by experiment: `%MACRO-EXPANDER-SHIM`
+  really did read `(car (%get-cenv))` after `(setq *%mexp-trace* …)`, and on
+  i386 cenv is a GLOBAL SLOT (globals+0x10) that any call clobbers — a genuine
+  latent hazard, fixed by hoisting both slot reads into a LET* — but the
+  crashes persist with the hoist in place (puri merely fails ~2 minutes
+  earlier).  Do not merge #260 until that is chased.
+
+RULE the cenv work established anyway: **nargs and cenv are BOTH
+call-clobbered convention slots on at least one target.**  Read them into
+locals as the first thing a shim body does; never re-read one after a call.
+x64/aarch64 hide this because cenv is R13 and comes back intact.
+
 WHEN COMPARING i386 TO x64, REMEMBER x64 DEFAULTS TO **JIT ON** AND i386 IS
 PURE-INTERPRET (`build-cli-common.lisp` "NAMED DIVERGENCE").  A bare x64-vs-i386
 diff confounds the two.  Rebuild the control with `MODUS_NO_JIT=1` before

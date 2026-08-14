@@ -595,6 +595,86 @@ documented at `mvm/compiler.lisp` ~8057 (a fixnum used as a code address).
 `named-readtables-ql` (~430s) is a far cheaper repro than `alexandria-ql`
 (~19min, exit 139 at `P1.curry`).
 
+### i386 CONVENTION-SLOT ADDRESS DIVERGENCE (#260/#261) — two bugs, both FIXED
+
+Chasing the unknown-opcode turned up a distinct, higher-impact class: a
+convention slot that ONE side of a contract addresses differently on i386.
+There are three such slots (`nargs`, `cenv`, `mv-count`) and the rule that
+separates them is **who reads it**:
+
+- `cenv` — reached from shared CL source only through the `(%get-cenv)`
+  PRIMITIVE, so each translator may keep its own slot.  Always correct.
+- `nargs` (#260) — genuinely per-target (x64/aarch64 park it at `#x10000150`;
+  translate-i386 has no spare physical register and uses globals+0x0C).  Only
+  `:set-nargs`/`:get-nargs` touch it — but `%MACRO-EXPANDER-SHIM` /
+  `%INTERP-MACRO-SHIM` read the raw literal `#x10000150`, a word i386 never
+  writes.  `(= nargs 2)` was never true, so **every**
+  `(funcall (macro-function 'X) form env)` — and therefore MACROEXPAND, which
+  funcalls MACRO-FUNCTION's result — signalled PROGRAM-ERROR on 32 bits while
+  MACROEXPAND-1 (dispatches via `%RAW-MACRO-EXPANDER`) worked.  Fix: use the
+  `(%get-nargs)` primitive.
+- `mv-count` (#261) — NOT per-target.  `mvm/compiler.lisp` bakes
+  `+mv-count-addr+` (`#x10000090`) into every MULTIPLE-VALUE-BIND /
+  MULTIPLE-VALUE-LIST / VALUES / NTH-VALUE expansion, and shared CL source
+  (prelude, cl-eval, cl-clos, gc) reads the same literal.  translate-i386
+  relocated it with its private block, so the ONE writer (`:set-mv-count`)
+  pointed at an address with ZERO readers: every function epilogue's
+  "I returned exactly one value" reset was DISCARDED while `(values a b c)`
+  still stored 3, leaving the count monotonically stale-high.  Fix: bind
+  `*mvcount-addr*` to `modus.mvm::+mv-count-addr+`, never relocate it.
+
+30-SECOND REPRODUCERS (they beat a 430 s ladder run — use them first):
+
+```
+./modus --eval "(print (multiple-value-list (typep 1 'integer)))"
+   (T)    x64/aarch64        (T T)  i386 pre-#261   ; also (concatenate …), (coerce …)
+(defmacro mm (x) (list 'quote x))
+(funcall (macro-function 'mm) '(mm 1) nil)
+   works  x64/aarch64        PROGRAM-ERROR  i386 pre-#260
+```
+
+x64/aarch64 CLI images are BYTE-IDENTICAL across #261 (translator-only).
+#260 touches `cl-eval.lisp`, so it moves x64 codegen (37,960,175 →
+37,960,551) and was gated on the 64-shard ANSI run: CTL 17522 / FIX 17519,
+CHUNK-CRASH 0 and FILE-WEDGE 30 on both, and all 3 deltas cleared on a
+deterministic single-process recheck (`read-byte` 24167/24168 pass in both;
+`times` 14486 is 1-in-5 flaky in BOTH arms) — **net regression 0**.
+
+WHEN COMPARING i386 TO x64, REMEMBER x64 DEFAULTS TO **JIT ON** AND i386 IS
+PURE-INTERPRET (`build-cli-common.lisp` "NAMED DIVERGENCE").  A bare x64-vs-i386
+diff confounds the two.  Rebuild the control with `MODUS_NO_JIT=1` before
+concluding "i386-specific" — it is a 4-minute build and it settled the
+unknown-opcode question in one run.
+
+### The `MVM: unknown opcode` class is STILL OPEN — what it is NOT
+
+Neither #260 nor #261 fixes it (10 failures before and after; the (opcode, PC)
+pair merely MOVES).  Measured facts, so nobody re-derives them:
+
+- i386-only.  x64 passes all 10 forms **with AND without the JIT**.
+- The 10 forms are exactly named-readtables' 10 `define-api` forms.  A
+  standalone harness (no `install-tarball`) reproduces 2 of them —
+  `make-readtable` and `ensure-readtable`, the only two whose DEFUN
+  lambda-list has an `&optional` spec **with a supplied-p variable**.
+- NOT the macro body: deleting the entire `#-sbcl (progn (check-type …))`
+  block from `define-api` still fails.
+- NOT the emitted form: `load`ing the x64-produced macroexpansion of
+  `make-readtable` VERBATIM on i386 succeeds.
+- NOT reproducible by hand: `(progn (declaim (ftype …)) (locally (defun f
+  (&optional (x nil xp) &key k) …)))` evaluated the same way passes on i386.
+- Ruled out individually: `parse-body`, `parse-ordinary-lambda-list` (both
+  byte-identical to x64 on the failing lambda lists), the dotted-destructuring
+  LOOP, the FLET parameter shadowing a boxed macro parameter, the inner
+  ASSERTs, the docstring, `destructuring-bind`, `constantp`.
+- Substituting a plain `(name)` lambda-list into the SAME macro makes it pass.
+- The error always comes from `mvm-interpret`'s `otherwise` arm, i.e.
+  `op-call-ind` took its `(integerp target)` branch and set PC to a bogus small
+  integer.  Observed pairs across builds: 4/956, 196/945, 6/5018, 31/5019,
+  7/5018 — the pair moves with unrelated code, which fits "a stale or foreign
+  in-module bytecode OFFSET reached operator position", not a corrupted opcode
+  stream.  Next step is to instrument that branch with the target value and the
+  module identity rather than to keep bisecting source shapes.
+
 ### Crash triage: it's almost never the GC — default elsewhere
 
 The collector is hardened (fuzz-closed layout-dependence, conservative-root

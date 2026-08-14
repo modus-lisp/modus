@@ -328,6 +328,24 @@ the boot stub mmaps them because `gc.lisp`'s `%gc-bitmap-init` allocates through
 a trap i386 does not implement. It is gated on `*i386-linux-mode*`: bare-metal
 i386 has no GC metadata or bitmaps and keeps `int $0x31`.
 
+The arena mmap is `+linux-i386-heap-size+` = two 256 MB semispaces **plus a
+16 MB `+linux-i386-gc-guard+`**. That guard is not optional and it is not an
+i386 invention — it is x64's `+linux-x64-gc-guard+` (c9c6278), which the i386
+port originally omitted. **`:gc-check` tests `VA < VL` BEFORE an allocation
+whose size it does not know**, so the alloc that follows a passing check
+overshoots VL by up to that object's whole size. In the FIRST semispace the
+overshoot lands in the (mapped) second semispace and is harmless (copy_object's
+read pointer trails its write pointer by a constant, so a straddling object
+still copies correctly); in the SECOND semispace `from_end` sat only
+`+linux-i386-heap-alloc-start+` = **512 bytes** below the end of the mapping, so
+once a process reached generation 2 any allocation bigger than 512 bytes that
+tripped the check ran off the mmap and SIGSEGV'd inside its own initialising
+stores. That was ladder defect **B3** — 16 of the 22 libraries. Residual, and
+identical on x64: a SINGLE allocation larger than the guard still overruns; the
+real cure is a size-aware `:gc-check`, a shared-compiler change.
+`boot-linux-aarch64.lisp` still has the un-guarded shape (heap 0x38000000,
+midpoint 0x1C000000 → the same 512-byte margin) and is a live suspect there.
+
 **The i386 arch slots** — everything this wrapper is allowed to contain — are
 `exit` = syscall 1 (int 0x80 numbering); the i386 file-I/O syscall numbers and
 `stat64`/`fstat64` struct offsets; the argv/envp reader, which walks the copy

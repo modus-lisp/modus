@@ -195,14 +195,14 @@
       (find key *outside-matrix* :key #'second :test #'string-equal)))
 
 ;;; Per-cell environment.  A legacy script may need env vars to build the
-;;; REAL image rather than a bring-up rung — see the i386 entry, where the
-;;; script's own default is MODUS_I386_LAYER=1 (prelude only, no CL bridge
-;;; at all).  Putting the layer here means the matrix cell means what it
-;;; says: "i386/hosted/-/cli" builds the i386 CLI, not rung 1 of its
-;;; bring-up ladder.
+;;; REAL image rather than a bring-up rung.
+;;;
+;;; MODUS_I386_LAYER is GONE (2026-08 CLI convergence): build-i386-cli.lisp is
+;;; now a thin arch tail over build-cli-common.lisp and bakes one fixed source
+;;; set, exactly like the x64 and aarch64 wrappers, so there is no rung to
+;;; select.  What is left here is only the output paths.
 (defparameter *cell-env*
   '(("i386/hosted/-/cli"
-     ("MODUS_I386_LAYER"  . "5")
      ("MODUS_I386_OUT"    . "/tmp/modus-i386-cli")
      ("MODUS_I386_SYMMAP" . "/tmp/modus-i386-cli.symmap"))))
 

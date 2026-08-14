@@ -165,9 +165,12 @@ The 12 failures are NOT 12 atrophied scripts. By actual cause:
    stub**, the EAX/VR invariant is clean, and it RUNS under
    `qemu-i386-static` (probe 5 evaluates: `e1=42 e2=3 e3=42 e4=66 e5=1`).
 
-   `mvm/build.lisp` now sets `MODUS_I386_LAYER=5` for the
-   `i386/hosted/-/cli` cell, so the matrix key means the CLI rather than
-   rung 1 of its ladder.
+   **SUPERSEDED (2026-08 CLI convergence):** `MODUS_I386_LAYER` no longer
+   exists.  `mvm/build-i386-cli.lisp` is a thin arch tail over
+   `mvm/build-cli-common.lisp` — the same shared assembly x64 and aarch64
+   use — and bakes one fixed source set, so there is no rung to select and
+   the matrix key can only mean the CLI.  `mvm/build.lisp`'s cell env now
+   carries only the output paths.
 
    **Remaining real i386 gap: floating point.**  13 distinct translator
    gaps, and 157 of the ~165 sites are float ops —

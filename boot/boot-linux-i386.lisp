@@ -83,7 +83,30 @@
 (defconstant +linux-i386-argv-arena-end+ #x1001E000)
 
 (defconstant +linux-i386-heap-hint+   #x30000000)
-(defconstant +linux-i386-heap-size+   #x20000000)  ; 512 MB = two 256 MB semispaces
+(defconstant +linux-i386-gc-guard+    #x1000000
+  "16 MB of MAPPED-BUT-UNCOUNTED memory past the SECOND semispace's from_end.
+   This is boot-linux-x64.lisp's +linux-x64-gc-guard+, which the i386 port
+   omitted; the omission is bug B3 (16 of the 22 ladder libraries died on it).
+
+   WHY IT IS NEEDED.  :gc-check (translate-i386.lisp, +op-gc-check+) tests
+   `VA < VL' BEFORE an allocation whose SIZE it does not know, so the alloc
+   that follows a passing check overshoots VL by up to that object's whole
+   size — measured 0xB8450 (754 KB) for one (make-array 1000000).  In the
+   FIRST semispace that overshoot lands in the (mapped) second semispace and
+   is harmless: copy_object's read pointer trails its write pointer by a
+   constant, so the straddling object still copies correctly.  In the SECOND
+   semispace from_end sat only +linux-i386-heap-alloc-start+ = 512 BYTES below
+   the end of the mmap, so ANY allocation bigger than 512 bytes that tripped
+   the check ran off the end of the mapping and the object's own initialising
+   stores SIGSEGV'd.  Measured on the pre-fix image, deterministically:
+   gc_count=1, VA=0x400b5250, VL=0x3fffce00, mapping end 0x3fffd000, fault at
+   cr2=0x3ffff000 inside an array-element store.
+
+   RESIDUAL, stated rather than assumed (and identical on x64): a SINGLE
+   allocation larger than the guard still overruns.  The real cure is a
+   size-aware :gc-check, which is a shared-compiler change, not an arch one.")
+(defconstant +linux-i386-heap-size+   (+ #x20000000 +linux-i386-gc-guard+)
+  "512 MB of arena (two 256 MB semispaces) + the 16 MB overshoot guard.")
 (defconstant +linux-i386-gc-midpoint+ #x10000000
   "Cheney semispace boundary: from-space is [alloc_start, midpoint),
    to-space is [midpoint, 2*midpoint).  Sized so that EVERY address in the
@@ -100,7 +123,7 @@
 (defconstant +linux-i386-stack-size+ #x800000)   ; 8 MB
 (defconstant +linux-i386-bitmap-size+ #x800000
   "8 MB per bitmap = 1 bit / 16-byte granule over a 1 GB span; the arena is
-   512 MB so 4 MB is used.  TWO bitmaps: object-start (conservative-root
+   512 MB + the 16 MB guard, so 4.125 MB is used.  TWO bitmaps: object-start (conservative-root
    validation) and cons-kind (so %gc-scan-copied walks to-space by TYPE rather
    than forwarding every word — the latter mis-forwards bignum limbs, and
    SHA-256 on a 30-bit tower allocates almost nothing but bignums).")

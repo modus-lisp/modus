@@ -1291,6 +1291,22 @@
 
 (format t "Full source: ~D characters~%" (length *full-source*))
 
+;;; MODUS_DUMP_FULL_SOURCE=<path> — write the assembled blob and STOP, without
+;;; building an image.  This is the refactor gate: the blob is the ONLY thing a
+;;; wrapper contributes to the emitted binary, so a wrapper refactor that leaves
+;;; it byte-identical is behaviour-preserving by construction, and proving that
+;;; takes ~20s instead of a ~10min image build.  Placed AFTER assembly and
+;;; BEFORE build-image so it cannot perturb what it measures.
+#+sbcl
+(let ((p (sb-ext:posix-getenv "MODUS_DUMP_FULL_SOURCE")))
+  (when (and p (plusp (length p)))
+    (with-open-file (o p :direction :output :if-exists :supersede
+                         :external-format :utf-8)
+      (write-string *full-source* o))
+    (format t "Dumped *full-source* to ~A (~D chars); skipping image build.~%"
+            p (length *full-source*))
+    (sb-ext:exit :code 0)))
+
 ;;; ============================================================
 ;;; 6. Build the image
 ;;; ============================================================

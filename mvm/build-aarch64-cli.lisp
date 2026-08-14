@@ -1245,6 +1245,18 @@
 
 (format t "Full source: ~D characters~%" (length *full-source*))
 
+;;; MODUS_DUMP_FULL_SOURCE=<path> — write the assembled blob and STOP (see the
+;;; identical hook in build-generic-cli.lisp for the rationale).
+#+sbcl
+(let ((p (sb-ext:posix-getenv "MODUS_DUMP_FULL_SOURCE")))
+  (when (and p (plusp (length p)))
+    (with-open-file (o p :direction :output :if-exists :supersede
+                         :external-format :utf-8)
+      (write-string *full-source* o))
+    (format t "Dumped *full-source* to ~A (~D chars); skipping image build.~%"
+            p (length *full-source*))
+    (sb-ext:exit :code 0)))
+
 ;;; ============================================================
 ;;; Build the Linux/AArch64 ELF (same target machinery as the gate wrapper)
 ;;; ============================================================

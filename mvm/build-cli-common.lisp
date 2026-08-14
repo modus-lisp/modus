@@ -1416,6 +1416,44 @@
 
 (format t "Full source: ~D characters~%" (length *full-source*))
 
+;;; ============================================================
+;;; BLOB READ CHECK — the assembled source must READ CLEANLY
+;;; ============================================================
+;;;
+;;; CLAUDE.md's `check-parses' guards each first-party FILE.  Nothing guarded
+;;; the ASSEMBLED BLOB, and a wrapper's arch slot can unbalance it without
+;;; touching any file: this check was added after a duplicated
+;;; `(defun %cli-argv-base ()' line in the aarch64 slot left an open form that
+;;; swallowed source to EOF.  The build reader (cross.lisp
+;;; READ-ALL-FORMS-WITH-LOCATIONS) is DELIBERATELY lenient -- it must be, since
+;;; the same reader ingests ANSI fixtures whose packages need not exist
+;;; host-side -- so it printed two "SKIP read at line ..." notes, dropped a few
+;;; hundred functions, and built a perfectly valid binary that SIGSEGV'd on a
+;;; NIL sentinel before its first write().  Cost: a 20-minute build plus a
+;;; qemu -strace session to find what a 30-second check reports directly.
+;;;
+;;; Scope is deliberately the TWO CLI WRAPPERS, not BUILD-IMAGE.  A check added
+;;; inside build-image changes all 29 build scripts at once, and the ANSI gate
+;;; runners legitimately carry corpus text this reader skips -- see
+;;; [[reference_build_ratchet_corpus_images]], where a fatal-at-0 check in
+;;; build-image made all four gate runners unbuildable.
+(let* ((log (with-output-to-string (*standard-output*)
+              (modus.mvm::read-all-forms-with-locations *full-source*)))
+       (skips (let ((n 0) (pos 0))
+                (loop
+                  (let ((p (search "SKIP read at line" log :start2 pos)))
+                    (unless p (return n))
+                    (incf n)
+                    (setq pos (+ p 17)))))))
+  (if (zerop skips)
+      (format t "Blob read check: OK (0 skipped forms)~%")
+      (error "~&BLOB READ CHECK FAILED: the assembled *full-source* has ~D~%~
+              unreadable form(s).  The build reader is lenient, so these would~%~
+              be SILENTLY DROPPED and the image would fault on a NIL sentinel.~%~
+              Almost always an unbalanced paren or unterminated string in a~%~
+              *CLI-ARCH-* slot in the wrapper.  Reader output:~%~A"
+             skips log)))
+
 ;;; MODUS_DUMP_FULL_SOURCE=<path> — write the assembled blob and STOP, without
 ;;; building an image.  This is the refactor gate: the blob is the ONLY thing a
 ;;; wrapper contributes to the emitted binary, so a wrapper refactor that leaves

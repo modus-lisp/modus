@@ -43363,7 +43363,6 @@
 
 
 (defun %cli-argv-base ()
-(defun %cli-argv-base ()
   (+ (%gc-stack-base) 8))
 (in-package :modus.mvm);;;; mvm.lisp - Modus Virtual Machine Instruction Set
 ;;;;
@@ -77842,7 +77841,6 @@
   (puthash "%SYS-STAT-SIZE" *symbol-function-table* #'%SYS-STAT-SIZE)
   (puthash "%SYS-STAT-EXISTS" *symbol-function-table* #'%SYS-STAT-EXISTS)
   (puthash "%SYS-STAT-MTIME" *symbol-function-table* #'%SYS-STAT-MTIME)
-  (puthash "%CLI-ARGV-BASE" *symbol-function-table* #'%CLI-ARGV-BASE)
   (puthash "%CLI-ARGV-BASE" *symbol-function-table* #'%CLI-ARGV-BASE)
   (puthash "SYS-EXIT" *symbol-function-table* #'SYS-EXIT)
   (puthash "HALT" *symbol-function-table* #'HALT)

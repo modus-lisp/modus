@@ -738,7 +738,6 @@
 
 
 (defun %cli-argv-base ()
-(defun %cli-argv-base ()
   (+ (%gc-stack-base) 8))
 ")
 

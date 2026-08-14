@@ -1,460 +1,84 @@
-;;;; build-aarch64-cli.lisp — minimal AArch64/Linux JIT host (WS4 Stage 3-5 sandbox)
+;;;; build-aarch64-cli.lisp — the hosted Modus CLI for Linux/AArch64.
 ;;;;
-;;;; A :linux-aarch64 ELF that bakes the FULL self-hosted stack — prelude + gc +
-;;;; rt + CL bridge + MVM ISA/interp/compiler + mvm-eval + the AArch64 native
-;;;; translator (translate-aarch64) + %init-aarch64-translator co-init — but NOT
-;;;; the ANSI test corpus.  Dropping the corpus (a) leaves layout headroom the
-;;;; gate image no longer has (adding baked JIT-driver source overflows the gate
-;;;; at PC=0), and (b) cuts build time.  kernel-main runs a baked JIT self-test
-;;;; (primitive probe → mvm-eval parity → Stage-3 out-of-module call relocation)
-;;;; and exits.  This is the iteration vehicle for WS4 AArch64 Stages 3/4/5.
+;;;; A :linux-aarch64 ELF you run as an ordinary process; same SBCL-faithful
+;;;; toplevel as x64's ./modus (argv + --eval/--load/--script/--quit + ~/.modusrc
+;;;; + REPL), plus a set of baked WS4 JIT regression probes selected by a bare
+;;;; numeric argv[1].
 ;;;;
 ;;;;   sbcl --dynamic-space-size 12288 --script mvm/build-aarch64-cli.lisp
-;;;;   → /home/claude/modus-aa64-cli   (override with MODUS_CLI_OUT)
+;;;;   -> /home/claude/modus-aa64-cli   (override with MODUS_CLI_OUT)
 ;;;;
-;;;; We LOAD build-ansi-common.lisp (with *ansi-target-arch* :aarch64) to reuse
-;;;; its proven source-var
-;;;; construction (mvm-text reads, the a64-buffer/translate shrink+strip, the
-;;;; %init-aarch64-translator co-init, the sft/sym-name/runtime-macro scanners)
-;;;; and its helpers.  The corpus it reads into *real-ansi-sources* is simply
-;;;; NOT concatenated into our *full-source*, so it is never compiled in.
-
-(defvar *ansi-target-bare-metal* nil)
-(defvar *ansi-target-arch* :aarch64)
-(load (merge-pathnames "build-ansi-common.lisp"
-                       (directory-namestring (truename *load-truename*))))
-
-(format t "~%=== Building minimal AArch64 CLI/JIT host (no corpus) ===~%")
-
-;;; #211: the (in-package …) eraser is RETIRED.  The build reader honours
-;;; (in-package …) and MVM-TEXT contains each file (it both starts and ends in
-;;; :MODUS.MVM), so erasing is obsolete — and the eraser was case-sensitive on
-;;; a lowercase needle, which meant it deleted the containment resets and kept
-;;; any uppercase declaration.  IN-PACKAGE compiles to nothing (compiler.lisp:
-;;; "package system is SBCL-side only"), so leaving the forms in costs nothing.
-;;; See mvm/build-x64-linux.lisp for the measured counts.
-
-;; WS4-AA64 #199 FLIP **REVERTED** (WS5 #203, 2026-07-31): the CLI now DEFAULTS
-;; the runtime JIT **OFF**.  Opt in with MODUS_USE_JIT=1.
-;;
-;; #199 flipped it ON for a real ~4.6x Cortex-A76 hot-code speedup (repeated
-;; mvm-eval 35168ms interpret -> 7661ms JIT, BENCH-NATIVE=300005).  That number
-;; still stands and probe 777777 still measures it — it forces *cli-jit-on* on
-;; regardless of this default, so the perf work is unaffected.
-;;
-;; What #199's correctness validation did NOT cover is a top-level form that has
-;; SIDE EFFECTS and a later form that uses what it defined — i.e. every source
-;; file ever written.  The 55555 stress and the odd-form battery both check the
-;; RETURNED VALUE of self-contained forms, so a form that runs TWICE scores as a
-;; pass.  Measured on this image with --load (each row is one 2-form file):
-;;
-;;   (defun g1 (x) (+ x 1)) / (princ "A=") (princ (g1 41))
-;;        JIT ON  -> "A=A=42"   the princ ran TWICE; JIT OFF -> "A=42"
-;;   same, but the call is inside (handler-case ... (t (c) :ERR))
-;;        JIT ON  -> :ERR                            JIT OFF -> 42
-;;   (defparameter *f1* (lambda (x) (+ x 1))) / (princ "C=") (funcall *f1* 41)
-;;        JIT ON  -> "C=" ~hundreds of times (runaway re-execution)
-;;   (defmacro md ...) / (funcall (%raw-macro-expander 'md) '(md 41))
-;;        JIT ON  -> "D=" ~hundreds of times;        JIT OFF -> (+ 41 1)
-;;
-;; So under the JIT a top-level form's side effects are DUPLICATED (the native
-;; run happens, then an error after the native call — e.g. the jit-mv-fallback
-;; path — makes the caller's handler-case re-interpret the WHOLE form), and in
-;; some shapes it re-runs unboundedly.  Duplicated output/IO is silent wrong
-;; behaviour even when the final value looks right.  A default that cannot load
-;; a file which defines something and then uses it is the wrong default however
-;; fast it is; correctness comes first (see feedback_correctness_over_regression).
-;;
-;; The JIT itself is NOT disabled or deleted — only its default.  Re-enable per
-;; build with MODUS_USE_JIT=1.  NOTE that MODUS_NO_JIT / MODUS_USE_JIT are
-;; BUILD-time knobs baked into %cli-jit-default; there is no runtime env
-;; override.
-;;
-;; THE RUNTIME KNOB WORKS IN BOTH DIRECTIONS — but it prints a scary warning.
-;; `--eval '(setq *cli-jit-on* t)'` emits
-;;   WARN: implicit global setq *CLI-JIT-ON*
-;; which reads like the assignment was lost to a fresh implicit global.  It is
-;; NOT: measured on this image, `--eval` reads back `before=NIL` / `after=T`,
-;; and — the behavioural proof, since a value readback alone could be a second
-;; cell — the JIT's own double-execution signature APPEARS after the setq (the
-;; two-form file `(defun g1 …)` + `(princ "A=") (princ (g1 41))` goes from
-;; "A=42" to "A=A=42").  So the compiled image's *cli-jit-on* and the name
-;; SETQ'd from --eval are the SAME cell; the WARN only records that the form
-;; being compiled at runtime had no defvar in scope.  Symmetrically,
-;; `(setq *cli-jit-on* nil)` disables it on a JIT-on build ("A=A=42" -> "A=42").
-;;
-;; What genuinely does NOT work is READING an internal that no baked defvar
-;; exports to the runtime namespace: `--eval '(princ *jit-native-count*)'`
-;; signals UNBOUND-VARIABLE even while the JIT is running and counting.  So use
-;; a BEHAVIOURAL probe (the doubling above), not a counter readback, to confirm
-;; which mode you are in.  For a durable JIT-on image, rebuild with
-;; MODUS_USE_JIT=1.
-;; ---------------------------------------------------------------------------
-;; WS5 #206/#207 (2026-08-02): the default is ON AGAIN.  Both defects above are
-;; FIXED at the root, and the re-flip condition stated in the paragraph above —
-;; "the re-execution cluster is fixed AND a probe covers define-in-one-form /
-;; use-in-a-later-form with side effects" — is satisfied by
-;; tests/runtime-metric.lisp, which is exactly that probe.
-;;
-;; Two independent root causes, both in the JIT's handling of a HEAP CLOSURE:
-;;
-;;  1. #206, the duplication.  A runtime-defined function is a heap closure
-;;     (word nibble 9), not native code (nibble 3), and the call relocation
-;;     patched its heap address in as a native call target.  The heap has no
-;;     PROT_EXEC, so the branch faulted MID-EXECUTION and the fallback re-ran
-;;     the whole form.  Fixed by requiring the FN tag before patching: a
-;;     non-tag-3 callee now fails the reloc, fails the page build, and the form
-;;     is interpreted ONCE.  (aec8341 / 3b9b4a4.)
-;;  2. #207, aarch64-only, why "C=" and "D=" repeated unboundedly above.
-;;     In-module +op-fn-addr+ emitted a MOVZ/MOVK PLACEHOLDER patched by
-;;     apply-aarch64-fn-addr-patches AFTER image assembly — which the runtime
-;;     JIT never runs.  So every JIT-built closure got slot 0 = literal 0 and
-;;     trapped in +op-call-ind+ before its body.  Fixed by emitting a full
-;;     4-instruction quad under *aarch64-jit-mode* and relocating it at
-;;     page-build time.  (21347e4.)  x64 was structurally immune: its
-;;     in-module fn-addr is PC-relative LEA + OR-3, nothing to patch.
-;;
-;; GATE — tests/runtime-metric.lisp with the JIT ON, vs SBCL: EMPTY DIFF, all
-;; 16 checks, form-ran-once=1, on BOTH aarch64 and x64.  ANSI: 64-shard NET
-;; BASE 17476 / NET 17475 with CHUNK-CRASH 0=0 and FILE-WEDGE 30=30; the lone
-;; -1 passes 3/3 on both binaries in isolation (shard-truncation noise).
-;; See GATE-RESULT-206-207.md.
-;;
-;; The behavioural-probe lesson above STILL APPLIES and is why this flip is
-;; trustworthy: it was validated with runtime-metric's form-ran-once, not with
-;; a counter readback (still UNBOUND at runtime) and not with value-only checks
-;; (which scored a twice-run form as a pass, and is what let #199 through).
-;;
-;; Rollback: MODUS_NO_JIT=1 or MODUS_USE_JIT=0 at BUILD time.
-;; ---------------------------------------------------------------------------
-;; One place decides, so the baked default and the banner cannot disagree —
-;; they were two copies of the same env test before.  MODUS_NO_JIT is honoured
-;; here too now, matching build-generic-cli.lisp's knob set exactly.
-(defvar *cli-jit-on-p*
-  (let ((no #+sbcl (sb-ext:posix-getenv "MODUS_NO_JIT")  #-sbcl nil)
-        (on #+sbcl (sb-ext:posix-getenv "MODUS_USE_JIT") #-sbcl nil))
-    (cond ((and no (> (length no) 0)) nil)                    ; explicit rollback
-          ((and on (> (length on) 0)) (not (string= on "0"))) ; explicit
-          (t t))))                                            ; DEFAULT: JIT ON
-(defvar *cli-jit-default-source*
-  (format nil "(defun %~A-jit-default () ~A)~%" "cli" (if *cli-jit-on-p* "t" "nil")))
-(format t "  CLI default runtime JIT: ~A~%"
-        (if *cli-jit-on-p*
-            "ON (default since WS5 #206/#207; MODUS_NO_JIT=1 to disable)"
-            "OFF (MODUS_NO_JIT / MODUS_USE_JIT=0)"))
+;;;; STRUCTURE — CONVERGED WITH x64 (2026-08).  This wrapper is a thin AArch64
+;;;; tail over mvm/build-cli-common.lisp, the SAME shared assembly
+;;;; mvm/build-generic-cli.lisp uses.  It previously (a) loaded
+;;;; build-ansi-common.lisp — the ANSI GATE-RUNNER harness, the wrong taxonomy
+;;;; class for a shipping image (CLAUDE.md "Build taxonomy") — and (b) re-derived
+;;;; the whole source set by hand.  Parity was maintained by comment, and every
+;;;; drift was found as a production bug rather than by review (#245's missing
+;;;; (init-all-globals), the absent RTEST that made arm library suites
+;;;; unrunnable, the absent hosted socket/storage/HTTP layer).
+;;;;
+;;;; What this file may legitimately contain is AArch64 HARDWARE FACT and
+;;;; nothing else.  A capability belongs in build-cli-common.lisp, where both
+;;;; arches get it at once.
 
 ;;; ============================================================
-;;; Linux/AArch64 file-I/O syscall overrides
-;;; ============================================================
-;;;
-;;; WS5 #203: cl-fileio.lisp hardcodes x86-64 syscall numbers (open=2, stat=4,
-;;; unlink=87, mkdir=83, rename=82).  The AArch64 generic ABI DROPPED all of
-;;; them in favour of the `*at' variants with a dirfd argument, so on aarch64
-;;; every one of those calls hits a bogus/unimplemented number: %sys-stat-exists
-;;; returned NIL for a file that exists and LOAD failed with FILE-ERROR for any
-;;; path.  That made --load / --script / ~/.modusrc dead on this image.
-;;;
-;;; The ANSI gate wrapper (mvm/build-aarch64-linux.lisp, section "4c") already
-;;; carries exactly these overrides — but they live in the WRAPPER, not in the
-;;; shared build-ansi-common.lisp, so this corpus-free CLI never got
-;;; them.  Copied verbatim rather than hoisted into the common file so the gate
-;;; image is untouched (hoisting would double-define them there).  Keep the two
-;;; copies in sync; the source of truth is build-aarch64-linux.lisp section 4c.
-;;;
-;;; Baked AFTER *bridge-source* so last-defun-wins picks the aarch64 forms.
-(defvar *aarch64-fileio-override-source* "
-(defun %sys-open-rdonly (path-str)
-  (%string-to-cstr path-str *cstr-scratch*)
-  (%aarch64-openat *cstr-scratch* 0 0))
-(defun %sys-open-wronly (path-str)
-  (%string-to-cstr path-str *cstr-scratch*)
-  (%aarch64-openat *cstr-scratch* 577 420))
-(defun %sys-open-append (path-str)
-  (%string-to-cstr path-str *cstr-scratch*)
-  (%aarch64-openat *cstr-scratch* 1089 420))
-(defun %sys-open-rdwr (path-str)
-  (%string-to-cstr path-str *cstr-scratch*)
-  (%aarch64-openat *cstr-scratch* 66 420))
-(defun %sys-open-create-excl (path-str)
-  (%string-to-cstr path-str *cstr-scratch*)
-  (%aarch64-openat *cstr-scratch* 193 420))
-(defun %sys-unlink (path-str)
-  (%string-to-cstr path-str *cstr-scratch*)
-  (%aarch64-unlinkat *cstr-scratch* 0 0))
-(defun %sys-rename (old-str new-str)
-  (%string-to-cstr old-str *cstr-scratch*)
-  (let ((new-addr (+ *cstr-scratch* 2048)))
-    (%string-to-cstr new-str new-addr)
-    (%aarch64-renameat *cstr-scratch* new-addr 0)))
-(defun %sys-mkdir (path-str mode)
-  (%string-to-cstr path-str *cstr-scratch*)
-  (%aarch64-mkdirat *cstr-scratch* mode 0))
-(defun %sys-stat-size (path-str)
-  (let ((path-addr (%string-to-cstr path-str *cstr-scratch*))
-        (buf-addr *io-buf-addr*))
-    (let ((ret (%aarch64-newfstatat path-addr buf-addr 0)))
-      (if (< ret 0)
-          -1
-          ;; struct stat on AArch64 differs from x86-64 layout —
-          ;; st_size is at offset 48 in both, so the same load works.
-          (mem-ref (+ buf-addr 48) :u32)))))
-(defun %sys-stat-exists (path-str)
-  (let ((path-addr (%string-to-cstr path-str *cstr-scratch*))
-        (buf-addr *io-buf-addr*))
-    (let ((ret (%aarch64-newfstatat path-addr buf-addr 0)))
-      (if (< ret 0) nil t))))
-(defun %sys-stat-mtime (path-str)
-  (let ((path-addr (%string-to-cstr path-str *cstr-scratch*))
-        (buf-addr *io-buf-addr*))
-    (let ((ret (%aarch64-newfstatat path-addr buf-addr 0)))
-      (if (< ret 0)
-          0
-          (mem-ref (+ buf-addr 88) :u32)))))
-
-")
-
-;;; ============================================================
-;;; The SHARED SBCL-faithful CLI toplevel (lib/cli-toplevel.lisp)
-;;; ============================================================
-;;;
-;;; WS5 #203 (2026-07-31): the aarch64 hosted image adopts the same toplevel
-;;; x64's build-generic-cli uses — full argv off the initial process stack,
-;;; SBCL-style left-to-right flag parsing (--eval/--load/--script/--quit/
-;;; --version/--help/--userinit/--end-toplevel-options), ~/.modusrc before an
-;;; interactive REPL, and %cli-repl on stdin.  It depends on read /
-;;; make-string-input-stream / load / %make-file-stream-full / %sys-stat-exists
-;;; / write-object / mem-ref / %gc-stack-base / sys-exit, all of which this
-;;; image already bakes (bridge + gc + driver).
-(defvar *cli-toplevel-source* (mvm-text "lib/cli-toplevel.lisp"))
-
-;;; ============================================================
-;;; Runtime (load-time) backquote expander
-;;; ============================================================
-;;;
-;;; WS5 #203 gap 5.  Backquote in a BAKED macro body is expanded at build time
-;;; by compiler.lisp, so this image looked fine — but a macro defined at RUNTIME
-;;; reaches EVAL with the reader's (BACKQUOTE template) marker intact, and with
-;;; no expander installed for BACKQUOTE the COMMA sub-markers survive into the
-;;; expansion.  `(defmacro m (x) `(+ ,x 1))' + `(m 41)' in a --load'ed file
-;;; failed with UNDEFINED-FUNCTION NAME="COMMA".  Since alexandria is
-;;; essentially a macro library (with-gensyms, once-only, if-let, when-let,
-;;; switch/eswitch, define-constant — all runtime defmacro + backquote), this
-;;; blocked `quickload :alexandria' outright.
-;;;
-;;; x64's build-generic-cli already had the expander; it was buried in that
-;;; wrapper's *driver-source* string, so aarch64 never got it.  Now extracted to
-;;; lib/runtime-backquote.lisp and shared by both (same duplication class as the
-;;; file-I/O overrides).  Concatenated right before *driver-source*, and fed to
-;;; BOTH auto-scanners below — the SFT one so runtime EVAL can resolve the
-;;; defuns by name, and (critically) the sym-name one, because %rbq-sym-name-eq
-;;; dispatches on (symbol-name sym) being "COMMA"/"COMMA-AT"/"BACKQUOTE": if
-;;; those names are missing from *SYM-NAME-TABLE* symbol-name returns "" and the
-;;; expander silently degrades to a no-op.
-(defvar *runtime-backquote-source* (mvm-text "lib/runtime-backquote.lisp"))
-
-;;; ============================================================
-;;; Library-compatibility surface — parity with x64's build-generic-cli
-;;; ============================================================
-;;;
-;;; The aarch64 CLI baked NONE of the surface a real Common Lisp library needs:
-;;;   * no RTEST package         -> a library's own RT-shaped test suite
-;;;                                 (alexandria and everything that copied its
-;;;                                 layout) cannot even be READ.
-;;;   * no tar / install-tarball -> `install-tarball' was UNDEFINED-FUNCTION, so
-;;;                                 every ladder driver died on its first form.
-;;;   * no runtime CL macro table (mvm/runtime-cl-macros.lisp)
-;;;   * no :GENERA feature surface, no ASDF interface
-;;; All five are present in build-generic-cli, which is exactly why the library
-;;; ladder had only ever been measured on x64.  Baked HERE (in this wrapper, not
-;;; in the shared build-ansi-common.lisp) so the aarch64 ANSI GATE image is
-;;; untouched — the same rule the file-I/O overrides above follow.
-;;;
-;;; RTEST MUST be created at boot from IMAGE code (see %init-rtest's docstring):
-;;; a package born at runtime gets package-folded function-table keys, so a
-;;; runtime-born RTEST would give RTEST:DO-TESTS a different key than the
-;;; image's DO-TESTS and every suite call would hit UNDEFINED-FUNCTION.
-
-;; Strip `chipz::' / `chipz:' qualifiers from install-tarball's never-taken
-;; .tar.gz path: the flat-namespace image reader has no CHIPZ package and would
-;; error `Package CHIPZ does not exist', SILENTLY DROPPING the whole enclosing
-;; form.  Verbatim from build-generic-cli's %cli-strip-chipz.
-(defun %aa64-strip-one-prefix (text pfx)
-  (let ((result text))
-    (loop
-      (let ((pos (search pfx result)))
-        (unless pos (return result))
-        (setf result (concatenate 'string
-                                  (subseq result 0 pos)
-                                  (subseq result (+ pos (length pfx)))))))))
-
-(defun %aa64-strip-chipz (text)
-  (%aa64-strip-one-prefix (%aa64-strip-one-prefix text "chipz::") "chipz:"))
-
-(defun %aa64-escape-lisp-string (text)
-  "Escape TEXT so it can be emitted as a Lisp string literal."
-  (with-output-to-string (out)
-    (loop for c across text
-          do (cond ((char= c #\\) (write-string "\\\\" out))
-                   ((char= c #\") (write-string "\\\"" out))
-                   (t (write-char c out))))))
-
-;; RT (Paul Dietz) regression tester as the RTEST package.  Concatenated AFTER
-;; *rt-source* so its DO-TESTS wins by last-defun-wins.
-(defvar *rtest-pkg-source* (mvm-text "mvm/rtest.lisp"))
-
-;; mvm/runtime-cl-macros.lisp is DELIBERATELY NOT BAKED HERE.  Adding it was
-;; measured to REGRESS this image: with it in, the runtime DOTIMES expander
-;; wins over the compiler's own handling and produces an expansion whose head
-;; symbols print as #<?> --
-;;   (macroexpand-1 '(dotimes (i 3) i))
-;;     x64        -> (LET ((I 0) (DT9008 3)) (LOOP (WHEN (>= I DT9008) ...)))
-;;     aa64 + rtm -> (#<?> ((I 0) (G808 3)) (#<?> (#<?> (#<?> I G808) ...)))
-;; so (defun f (n) (let ((acc nil)) (dotimes (i n) (push i acc)) acc)) compiled
-;; the binding list (I N) as a CALL and died UNDEFINED-FUNCTION NAME="I".  That
-;; one defect alone produced 298 form-eval errors while installing alexandria
-;; (x64: 1).  Without the file the compiler handles DOTIMES/DOLIST/WHEN/... as
-;; it always has here and the errors go away.  The residual divergence -- this
-;; image's MACROEXPAND-1 leaves (dotimes ...) UNEXPANDED where x64 expands it,
-;; so a library code walker that dispatches on MACRO-FUNCTION sees a call --
-;; is REAL, PRE-EXISTING (it reproduces on the unmodified image), and is
-;; tracked as a follow-up; it is not fixed by baking a macro table whose
-;; expansions are unreadable.
-(defvar *rt-macros-source* "")
-
-;; tar + install-tarball: the untar -> parse-.asd -> topo-sort -> eval pipeline.
-;; GENERAL library primitives, NOT quicklisp wiring.  Baked (not runtime-loaded)
-;; for the reason build-generic-cli documents: %tar-slice's `(make-array LEN)'
-;; with a VARIABLE size hits a pre-existing mvm-eval bug that halves the length.
-(defvar *libload-source*
-  (concatenate 'string
-    (mvm-text "lib/tar.lisp")
-    (string #\Newline)
-    (%aa64-strip-chipz (read-file-text (merge-pathnames "lib/install-tarball.lisp"
-                                                        *modus-base*)))))
-
-;; :GENERA compatibility surface, baked as a boot-evaluated SOURCE STRING (it
-;; names packages CHECK-PARSES cannot resolve on the SBCL build host).
-(defvar *genera-compat-text*
-  (concatenate 'string
-               (read-file-text (merge-pathnames "net/cooperative-atomics.lisp"
-                                                *modus-base*))
-               (string #\Newline)
-               (read-file-text (merge-pathnames "net/genera-compat.lisp"
-                                                *modus-base*))))
-
-(defvar *genera-source*
-  (concatenate 'string "
-(defun %genera-compat-source ()
-  \"" (%aa64-escape-lisp-string *genera-compat-text*) "\")
-
-(defun %install-genera-compat ()
-  (let ((off (%cli-getenv \"MODUS_NO_GENERA\")))
-    (if (and off (> (length off) 0) (not (string= off \"0\")))
-        nil
-        (progn (%it-eval-source (%genera-compat-source) \"genera-compat\") t))))
-"))
-
-;; ASDF / UIOP / ASDF-USER naming layer over Modus's own loader.  Same
-;; boot-evaluated-source-string treatment, same reason.
-(defvar *asdf-interface-text*
-  (read-file-text (merge-pathnames "net/asdf-interface.lisp" *modus-base*)))
-
-(defvar *asdf-source*
-  (concatenate 'string "
-(defun %asdf-interface-source ()
-  \"" (%aa64-escape-lisp-string *asdf-interface-text*) "\")
-
-(defun %install-asdf-interface ()
-  (let ((off (%cli-getenv \"MODUS_NO_ASDF\")))
-    (if (and off (> (length off) 0) (not (string= off \"0\")))
-        nil
-        (progn (%it-eval-source (%asdf-interface-source) \"asdf-interface\") t))))
-"))
-
-(format t "  rtest:   ~D chars~%" (length *rtest-pkg-source*))
-(format t "  libload: ~D chars (tar + install-tarball)~%" (length *libload-source*))
-(format t "  genera:  ~D chars (compat source baked for boot-time eval)~%"
-        (length *genera-compat-text*))
-(format t "  asdf:    ~D chars (interface source baked for boot-time eval)~%"
-        (length *asdf-interface-text*))
-
-;;; ---- the AArch64 ARM of cli-toplevel -------------------------------------
-;;;
-;;; cli-toplevel is arch-neutral EXCEPT for %cli-argv-base — the one place it
-;;; turns %gc-stack-base into the real byte address of argv[0]'s stack slot.
-;;;
-;;;   x64  (boot/boot-linux-x64.lisp)  stores the initial RSP RAW at
-;;;        0x10000058.  A (mem-ref … :u64) LOAD returns the stored word placed
-;;;        in a fixnum whose machine word IS those bits, so its Lisp VALUE is
-;;;        stored>>1 = RSP/2 — hence the shared file's `(* 2 …)`.
-;;;   aa64 (boot/boot-linux-aarch64.lisp) stores stack_base through `maybe-shl`
-;;;        when *linux-aarch64-gc-metadata-shl* is true — which THIS build sets
-;;;        (see the GC knobs at the bottom).  The word in memory is SP<<1, so
-;;;        the very same :u64 read already yields the REAL SP.  Doubling it
-;;;        would land at 2*SP — far outside the mapped stack.
-;;;
-;;; So the aarch64 arm is exactly "don't double".  Nothing else changes: an
-;;; argv[i]/envp[i] POINTER is stored RAW on the stack by the kernel on both
-;;; arches, so it reads back halved on both and the shared file's `(* 2 ptr)`
-;;; is already correct here.  aarch64 also keeps the kernel's stack (no i386-
-;;; style relocation), so no saved-SP slot is needed.
-;;;
-;;; Placed AFTER *cli-toplevel-source* in *full-source*: last-defun-wins means
-;;; every call site resolves to this one.
-(defvar *cli-aarch64-arm-source* "
-(defun %cli-argv-base ()
-  (+ (%gc-stack-base) 8))
-")
-
-;;; The common file's SFT auto-scan only covers prelude/gc/mcgc/rt/bridge, so
-;;; cli-toplevel's defuns would be invisible to runtime EVAL (build-generic-cli
-;;; gets them for free because it bakes the file INTO its *bridge-source*).
-;;; Regenerate with cli-toplevel's names appended so a --load'ed script can
-;;; call e.g. %cli-getenv by name.
-(setq *sft-auto-source*
-      (multiple-value-bind (src count chunks)
-          (%generate-sft-auto-source
-            (append (%scan-defun-names-host *prelude-source*)
-                    (%scan-defun-names-host *gc-source*)
-                    (%scan-defun-names-host *mcgc-pin-source*)
-                    (%scan-defun-names-host *rt-source*)
-                    (%scan-defun-names-host *bridge-source*)
-                    (%scan-defun-names-host *cli-toplevel-source*)
-                    (%scan-defun-names-host *runtime-backquote-source*)
-                    ;; Library-compat surface: without these, runtime EVAL
-                    ;; cannot resolve INSTALL-TARBALL / %IT-EVAL-SOURCE /
-                    ;; DO-TESTS by name and every driver dies at form 1.
-                    (%scan-defun-names-host *rtest-pkg-source*)
-                    (%scan-defun-names-host *libload-source*)))
-        (format t "  SFT auto-init (+cli-toplevel): ~D unique names / ~D chunk(s)~%"
-                count chunks)
-        src))
-
-;;; ============================================================
-;;; Driver (sys-exit + kernel-main JIT self-test)
+;;; ARCH SLOTS — AArch64
 ;;; ============================================================
 
-(defvar *driver-source* "
+(defvar *cli-arch* :aarch64)
 
+;;; exit_group is syscall 93 on the AArch64 generic ABI (60 on x86-64).
+;;;
+;;; KNOWN BUG, NOT a divergence: every NONZERO exit this image produces is
+;;; DOUBLED (`(sys-exit 1)' -> rc 2), because the value reaching the SVC is
+;;; still tagged.  Probes 11111/11112/11113 bisect it: an inline literal and an
+;;; inline let-variable both exit correctly, so the loss is specific to routing
+;;; a DEFUN PARAMETER through compile-syscall3's operand shuffle on aarch64.
+;;; x64 compiles the identical source correctly.  The fix belongs in
+;;; translate-aarch64 and needs its own ANSI-gated session; exit 0 is
+;;; unaffected, so success paths are correct.  The `(let ((c code)) ...)' rebind
+;;; is kept identical to x64's shape -- dropping it was MEASURED not to help.
+(defvar *cli-arch-syscall-source* "
+(defun sys-exit (code)
+  (let ((c code))
+    (syscall3 93 c 0 0)))
 (defun halt ()
   (syscall3 93 1 0 0))
+")
 
-;; WS5 #203 exit-code bisect: probes 11111/11112/11113 measured
-;;   inline (syscall3 93 3 0 0)            -> rc 3   (trap untag OK)
-;;   inline (let ((c 3)) (syscall3 93 c 0 0)) -> rc 3   (variable operand OK)
-;;   (sys-exit 3) through the wrapper below   -> rc 6   (2n — still tagged)
-;; so the loss is specific to routing a DEFUN PARAMETER into the trap.  MEASURED
-;; follow-up: dropping the pointless `(let ((c code)) ...)` rebind (done below)
-;; does NOT fix it — 11113 still exits 6.  So the defect is in how aarch64
-;; codegen lands a parameter in compile-syscall3's push/pop operand shuffle, not
-;; in the rebind; parameters work everywhere else in the image, and x64 compiles
-;; the identical source correctly (`modus --eval (sys-exit 7)` exits 7 there).
-;; NOT fixed here: the fix belongs in the shared compiler/translate-aarch64 and
-;; needs its own ANSI-gated session.  Probes 11111-11113 stay as the reproducer.
-;; CONSEQUENCE: every nonzero exit this image produces is DOUBLED (sys-exit 1 →
-;; rc 2).  Exit 0 is unaffected, so success paths are correct.
-(defun sys-exit (code)
-  (syscall3 93 code 0 0))
+;;; AArch64 diagnostic + WS4-JIT probe apparatus, baked ahead of kernel-main.
+;;; Selected by a bare numeric argv[1]; a normal `modus --eval ...' run never
+;;; enters probe mode and prints nothing extra.
+(defvar *cli-arch-probe-source* "
+
+;; Shared with x64 (build-generic-cli's probe slot): argv/argc off the fixed BSS
+;; slots the boot preamble publishes, and native probes for the handler-frame
+;; chain.  These must be NATIVE fns -- an INTERPRETED mem-ref only sees the
+;; interpreter's simulated per-state memory hash, so only compiled code can read
+;; the real RAM.  The BSS layout is identical on both arches, so this block is
+;; here for PARITY (x64 registers these names in the SFT; arm did not).
+(defun %argv-string-at (addr)
+  (let ((len 0))
+    (let ((i 0))
+      (loop
+        (let ((b (mem-ref (+ addr i) :u8)))
+          (when (= b 0) (return nil))
+          (setq i (+ i 1)))
+        (setq len i)))
+    (if (zerop len) nil
+        (let ((s (%make-string-array len)) (i 0))
+          (loop
+            (when (>= i len) (return s))
+            (aset s i (mem-ref (+ addr i) :u8))
+            (setq i (+ i 1)))))))
+(defun %argv1 () (%argv-string-at #x10000208))
+(defun %argv2 () (%argv-string-at #x10000248))
+(defun %argc  () (mem-ref #x10000200 :u32))
+(defun %hc-depth () (mem-ref #x10000400 :u32))
+(defun %hc-armed-p () (if (eql (mem-ref #x10000180 :u32) 0) nil t))
+(defun %hc-frame-ip (n) (mem-ref (+ #x10000408 (* 32 n) 16) :u32))
+(defun %hc-cur-ip () (mem-ref #x10000190 :u32))
 
 ;; WS5 #203: TRUE when argv[1] parses as a nonzero decimal, i.e. this run
 ;; selects one of the baked regression probes rather than the hosted CLI.
@@ -550,24 +174,21 @@
 (defun %jit-pv (x)
   (if (integerp x) (print-dec x) (write-string-serial \"NI\")))
 
-;; WS4 aarch64 Stage 5: runtime-controllable JIT gate for the in-image
-;; differential.  Overrides mvm-eval.lisp's base %jit-enabled-p (last-defun-wins)
-;; so we can flip the SEAM on/off per form via *cli-jit-on* and confirm the
-;; native path (translate-mvm-to-aarch64 → exec page → %jit-call) agrees with
-;; pure interpret AND actually ran native (*jit-native-count* advanced).
-(defvar *cli-jit-on* nil)
-(defun %jit-enabled-p () *cli-jit-on*)
+;; WS4 aarch64 Stage 5 probe helpers.  The JIT gate itself is now the SHARED
+;; *use-jit* that build-cli-common's *jit-boot-source* installs on both arches
+;; -- this file used to carry its own *use-jit* + %jit-enabled-p pair, a
+;; second gate that could disagree with the one production mvm-eval consults.
 
 ;; Stage-5 probe: eval FORM through the REAL mvm-eval seam twice — interpret
 ;; (jit off) then JIT (jit on) — compare, and report whether the JIT run took
 ;; the NATIVE path (native-count advanced) vs fell back to interpret.
 (defun %s5-probe (label form)
-  (setq *cli-jit-on* nil)
+  (setq *use-jit* nil)
   (let ((iv (handler-case (mvm-eval form) (t (c) (quote IERR))))
         (nc0 *jit-native-count*))
-    (setq *cli-jit-on* t)
+    (setq *use-jit* t)
     (let ((jv (handler-case (mvm-eval form) (t (c) (quote JERR)))))
-      (setq *cli-jit-on* nil)
+      (setq *use-jit* nil)
       (let ((native (> *jit-native-count* nc0)))
         (write-string-serial label)
         (if (eql iv jv)
@@ -581,25 +202,29 @@
   (write-string-serial label)
   ;; Force the interpret baseline (independent of the built-in default) so this
   ;; probe always compares manual-JIT vs pure interpret.
-  (let ((save *cli-jit-on*))
-    (setq *cli-jit-on* nil)
+  (let ((save *use-jit*))
+    (setq *use-jit* nil)
     (let ((iv (handler-case (mvm-eval form) (t (c) (quote IERR))))
           (jv (handler-case (%jit-run-form form) (t (c) (quote JERR)))))
-      (setq *cli-jit-on* save)
+      (setq *use-jit* save)
       (if (eql iv jv)
           (progn (write-string-serial \"MATCH v=\") (%jit-pv iv))
           (progn (write-string-serial \"MISMATCH i=\") (%jit-pv iv)
                  (write-string-serial \" j=\") (%jit-pv jv)))))
   (write-char-serial 10))
 
-(defun kernel-main ()
-  ;; Banner: CLI-BOOT.  Printed ONLY in probe mode (argv[1] parses as a
-  ;; nonzero decimal).  A hosted CLI must not emit anything on a clean
-  ;; `modus --eval ...` run — SBCL doesn't, and the SBCL-differential table
-  ;; compares stdout byte-for-byte.
-  (when (%cli-probe-mode-p)
-    (write-string-serial \"CLI-BOOT\") (write-char-serial 10))
+")
 
+;;; ARCH SLOT: hardware setup that must precede the FIRST allocation.
+;;;
+;;; Linux/AArch64 does not reliably zero a ~900MB BSS tail, and garbage in these
+;;; runtime-metadata slots corrupts the global alist / handler frames.  The
+;;; object-start bitmap must then be reserved BEFORE the first allocator call
+;;; (init-symbol-table, immediately below) so every mutator allocation records
+;;; its start bit.  %gc-bitmap-init is non-allocating.  x64 needs none of this:
+;;; boot/boot-linux-x64.lisp has already zeroed these slots and the MCGC bitmap
+;;; is reserved host-side.
+(defvar *cli-arch-kernel-prologue* "
   ;; Zero the runtime-metadata BSS slots (Linux/AArch64 kernels don't reliably
   ;; zero a ~900MB BSS tail; garbage here corrupts the global alist / handler
   ;; frames).  Same slots the ANSI gate kernel-main clears.
@@ -631,161 +256,17 @@
   (setf (mem-ref #x10000E40 :u64) 0)   ; #160 bug#4: cons-kind bitmap base
   (%gc-bitmap-init)
 
-  ;; Runtime init (mirrors the ANSI gate kernel-main prefix, trimmed).
-  (init-symbol-table)
-  (init-keyword-table)
-  (%init-packages)
-  (%init-streams)
-  (%init-reader)
-  (%init-condition-types)
-  (%init-method-combinations)
-  (%init-symbol-function-table)
-  (%init-sft-auto)
-  (setq *sym-name-table* (make-hash-table))
-  (%init-sym-name-auto)
-  (%init-runtime-macros)
-  (init-compiler-macro-set)
-  (%init-signal-handling)
-  (%init-signal-symbols)
-  (%init-make-load-form)
-  ;; WS5 #203 gap 5: register the load-time BACKQUOTE expander (same call site
-  ;; and ordering x64's build-generic-cli uses).  Without it a macro defined at
-  ;; RUNTIME keeps the reader's COMMA markers in its expansion and the first
-  ;; call dies with UNDEFINED-FUNCTION NAME=\"COMMA\".
-  (%install-runtime-backquote)
-  (%init-clos-protocol)
+")
 
-  ;; Run every built-in defvar/defparameter init thunk (task #245).  This
-  ;; image used to SKIP it and hand-set only the ~25 globals below, leaving
-  ;; 70 globals BOUND on x64 but UNBOUND here -- measured by probing
-  ;; (boundp) for all 574 defvar names on both binaries: x64 383 unbound,
-  ;; aarch64 441.  Every one of those is a live UNBOUND-VARIABLE waiting for
-  ;; whichever code path reads it first, which is why this is a release-gate
-  ;; item and not cosmetic.
-  ;;
-  ;; ORDER IS LOAD-BEARING and matches build-generic-cli: init-all-globals
-  ;; runs FIRST, the explicit setq overrides below run AFTER and win.  Each
-  ;; thunk is wrapped in handler-case at compile time, so a thunk that
-  ;; references a not-yet-bound symbol cannot abort the chain.
-  ;;
-  ;; Safe against the hazard that bit the x64 side: a `(defvar *x* nil)`
-  ;; thunk is boundp-guarded (CLHS -- DEFVAR assigns only if unbound), so it
-  ;; cannot re-NIL something an earlier %init-* call already stored, e.g.
-  ;; the (setq *sym-name-table* (make-hash-table)) above.
-  (init-all-globals)
-
-  ;; File-I/O scratch buffers + counters (defvar init-thunks don't run at boot).
-  (setq *cstr-scratch* #x0FE00000)
-  (setq *io-buf-addr*  #x0FF00000)
-  (setq *scratch-mmapped* nil)
-  (setq *filesystem* nil)
-  (setq *rt-test-count* 0)
-  (setq *rt-pass-count* 0)
-  (setq *rt-fail-count* 0)
-  (setq *write-object-budget* 1000000)
-  (setq *gensym-counter* 0)
-  (setq *gentemp-counter* 0)
-  (setq array-total-size-limit  (ash 1 24))
-  (setq array-dimension-limit   (ash 1 24))
-  (setq array-rank-limit        256)
-  (setq call-arguments-limit    256)
-  (setq lambda-parameters-limit 256)
-  ;; Full Unicode codespace — Modus chars are a 21-bit code field and
-  ;; CODE-CHAR/CHAR-CODE round-trip across the whole range.  DEFCONSTANT
-  ;; init thunks do not run at boot (limitation #7), so set it explicitly.
-  (setq char-code-limit         #x110000)
-  (setq lambda-list-keywords    (quote (&allow-other-keys &aux &body &environment &key
-                                        &optional &rest &whole)))
-  (setq multiple-values-limit   16)
-  (setq most-positive-fixnum  +fixnum-max+)
-  (setq most-negative-fixnum +fixnum-neg-limit+)
-  (setq pi 3.141592653589793d0)
-  ;; \"\" — NOT \"/tmp/\".  x64's build-generic-cli leaves this empty, so a
-  ;; relative pathname resolves against the process's cwd, which is what SBCL
-  ;; does and what every `modus --load some/rel/path.lisp' invocation assumes.
-  ;; With \"/tmp/\" here, `--load tests/rtest/run-alexandria-1.lisp' from the
-  ;; repo root died with FILE-ERROR on aarch64 while succeeding on x64, and
-  ;; (probe-file \"tests/...\") returned NIL against a file that exists.
-  (setq *default-pathname-defaults* \"\")
-
-  ;; WS4 AArch64 JIT co-init: populate the translator's defparameter tables
-  ;; (item 7 — init-thunks don't run) and, for the JIT, set stack-align-16 +
-  ;; linux-mode + jit-mode.  %init-aarch64-translator sets the first two;
-  ;; Stage-3 relocation additionally needs *aarch64-jit-mode* t.
-  (%init-aarch64-translator)
-  (setq *aarch64-jit-mode* t)
-  ;; Select the aarch64 JIT back-end and seed the CLI's default JIT gate from
-  ;; the build-time MODUS_USE_JIT/MODUS_NO_JIT knob (%cli-jit-default).  Probes
-  ;; below still force their own on/off around each form.
-  (setq *jit-target-arch* :aarch64)
-  (setq *cli-jit-on* (%cli-jit-default))
-  (when (%cli-probe-mode-p)
-    (write-string-serial \"cli-jit-default=\") (print-dec (if *cli-jit-on* 1 0))
-    (write-char-serial 10))
-
-  ;; --- library-compatibility boot hooks (parity with build-generic-cli) ----
-  ;; Each is wrapped so a failure can never take down a normal boot, and all of
-  ;; them run BEFORE cli-toplevel so ~/.modusrc, --load and --eval already see
-  ;; the full surface.  x64 additionally calls %install-runtime-cl-macros here;
-  ;; this image deliberately does NOT (see *rt-macros-source* above -- baking
-  ;; that table regressed DOTIMES on aarch64).
-  ;; PLATFORM FEATURES.  cl-reader.lisp's %init-reader leaves *features* at
-  ;; (:common-lisp :cl :ansi-cl :modus); on x64 %install-runtime-cl-macros then
-  ;; adds :unix :linux :little-endian (see mvm/runtime-cl-macros.lisp, which is
-  ;; the source of truth for WHY each one is needed).  This image cannot bake
-  ;; that file (see *rt-macros-source* above), so it pushes the same features
-  ;; here, so a library's reader conditionals see the same world on both
-  ;; arches.  HONEST SCOPE, measured: adding these did NOT change any ladder
-  ;; probe outcome by itself.  In particular the docstring-return case
-  ;; (trivial-garbage:WEAK-POINTER-VALUE evaluating to its own docstring,
-  ;; because every reader-conditional branch of its body was dropped and the
-  ;; docstring was left as the whole body) is still there afterwards -- that
-  ;; one is the missing :GENERA, not the OS/endianness features.  These are
-  ;; landed because the divergence itself is a defect (x64 and aarch64 must
-  ;; not disagree about what machine they are), and because the reasons in
-  ;; mvm/runtime-cl-macros.lisp -- notably babel losing BOTH branches of each
-  ;; #+big-endian/#+little-endian pair -- apply here identically.
-  ;; :64-bit is a fact about this target (x64 gets it from the genera surface,
-  ;; which is off here).  :genera is deliberately NOT pushed -- the compat
-  ;; PACKAGES are not installed on this image, so advertising the feature would
-  ;; send libraries down Genera branches that then fail on missing packages.
-  (setq *features* (cons :little-endian
-                         (cons :linux (cons :unix (cons :64-bit *features*)))))
-  ;; tar.lisp's *tar-block-size* defvar init-thunk does not run at boot
-  ;; (MVM Active Limitation 7); set it so the baked tar reader works.
-  (setq *tar-block-size* 512)
-  ;; :GENERA is OPT-IN on aarch64 (MODUS_GENERA=1) — inverted vs x64's
-  ;; MODUS_NO_GENERA, deliberately.  Evaluating the baked compat source at BOOT
-  ;; SIGSEGVs here, with ZERO output, before any warning is printed.  MEASURED,
-  ;; not inferred:
-  ;;   * the IDENTICAL source evaluated at RUNTIME on this same binary works —
-  ;;     `--eval (%it-eval-source (tar-bytes-to-string (%it-slurp-bytes
-  ;;     \"net/cooperative-atomics.lisp+net/genera-compat.lisp\")) \"p\")'
-  ;;     returns 28 (forms evaluated) and (find-package \"SCL\") is then true.
-  ;;     So this is a BOOT-CONTEXT defect, not a defect in the genera source.
-  ;;   * the sibling ASDF install, same baked-source-string mechanism, same
-  ;;     boot position, DOES work here ((find-package \"ASDF\") is true).
-  ;; THIS DOES COST PARITY, and the cost is measured.  x64 built from this same
-  ;; tree DOES carry :GENERA and :64-BIT in *features*.  (Do not use
-  ;; (find-package \"SCL\") to check — it reports NIL on x64 too even though the
-  ;; install demonstrably ran; find-package is unreliable for these runtime-born
-  ;; packages, which is its own bug.  *features* is the reliable witness.)  The
-  ;; visible price on the ladder: trivial-gray-streams does not build its
-  ;; package here (P1.pkg=0 vs 1 on x64) because it takes a Gray-streams branch
-  ;; that the genera surface supplies.  Root-causing the boot SIGSEGV is the
-  ;; follow-up that buys that back.
-  (let ((on (%cli-getenv \"MODUS_GENERA\")))
-    (when (and on (> (length on) 0) (not (string= on \"0\")))
-      (handler-case (%install-genera-compat) (t (c) nil))))
-  ;; RTEST — created HERE, at boot, from IMAGE code.  A package born at
-  ;; runtime is marked runtime-born and its symbols get package-folded
-  ;; function-table keys, so a runtime-born RTEST would give RTEST:DO-TESTS a
-  ;; different key than the DO-TESTS compiled into this image and every
-  ;; library suite inheriting it through (:use :rtest) would hit
-  ;; UNDEFINED-FUNCTION.
-  (handler-case (%init-rtest) (t (c) nil))
-  (handler-case (%install-asdf-interface) (t (c) nil))
-
+;;; ARCH SLOT: the toplevel entry / probe program.  This is the one place the
+;;; two images are genuinely DIFFERENT PROGRAMS: x64's shipping CLI goes
+;;; straight to cli-toplevel, while this image additionally carries the WS4
+;;; AArch64 JIT self-test and the #160 GC probes, reached only via a bare
+;;; numeric argv[1].  Kept separate deliberately -- these are AArch64 JIT
+;;; bring-up instruments (MOVZ/MOVK quad relocation, a64-buffer translation,
+;;; the aarch64 GC-poison repro) with no x64 counterpart, and folding them into
+;;; the shared file would put arch-specific debug apparatus in every image.
+(defvar *cli-arch-kernel-epilogue* "
   ;; ISOLATED pure-cons GC milestone (argv 33333) — runs BEFORE any JIT/mvm-eval
   ;; probe so its collection count is UNAMBIGUOUS (Stage-1 native-GC milestone).
   (when (eql (%parse-decimal-at-fixed-208) 33333)
@@ -818,14 +299,14 @@
   ;; every numeric-argv probe still gets the identical self-test prologue,
   ;; because %cli-probe-mode-p is true for all of them.
   (when (%cli-probe-mode-p)
-  ;; WS5 #203: the JIT self-test is ABOUT the JIT, so it forces *cli-jit-on* on
+  ;; WS5 #203: the JIT self-test is ABOUT the JIT, so it forces *use-jit* on
   ;; rather than inheriting the shipping default — which is now OFF (the #199
   ;; flip was reverted; see the big note at the top of this file).  This keeps
   ;; every downstream probe line (aa64s3/s4/s5, and the 44444 GC-poison probe
   ;; that runs after) byte-identical to the pre-revert binary; the ONLY probe
   ;; output that changes is the `cli-jit-default=' line, 1 -> 0, which is the
   ;; honest report of the new default.
-  (setq *cli-jit-on* t)
+  (setq *use-jit* t)
   ;; (1) Primitive probe: mmap PROT_RWX, write `movz x0,#84 ; ret` (84 = tagged
   ;;     fixnum 42), icache-flush, %jit-call.  Exercises traps #x0531/#x0533/
   ;;     #x0532 end-to-end.  Expect jitprim=42.
@@ -1023,8 +504,8 @@
   ;; External `time` on the two argv modes on the Pi = the real aarch64 speedup.
   (when (or (eql (%parse-decimal-at-fixed-208) 777777)
             (eql (%parse-decimal-at-fixed-208) 777778))
-    (setq *cli-jit-on* (eql (%parse-decimal-at-fixed-208) 777777))
-    (write-string-serial \"BENCH-START jit=\") (print-dec (if *cli-jit-on* 1 0)) (write-char-serial 10)
+    (setq *use-jit* (eql (%parse-decimal-at-fixed-208) 777777))
+    (write-string-serial \"BENCH-START jit=\") (print-dec (if *use-jit* 1 0)) (write-char-serial 10)
     (let ((n (let ((a (%parse-decimal-at-fixed-248))) (if (and a (> a 0)) a 300000)))
           (i 0) (acc 0))
       (write-string-serial \"BENCH-ITERS=\") (print-dec n) (write-char-serial 10)
@@ -1039,7 +520,7 @@
   ;;     process dies marks where the 896MB heap exhausts.  Runs only when argv1
   ;;     = 55555 (so the normal CLI run isn't destroyed by it).
   (when (eql (%parse-decimal-at-fixed-208) 55555)
-    (setq *cli-jit-on* t)
+    (setq *use-jit* t)
     (let ((i 0))
       (loop
         (when (>= i 4000) (return nil))
@@ -1049,7 +530,7 @@
         ;; distinct exec page → fresh ~1.7MB translation (no page-cache hit).
         (mvm-eval (list (quote +) i 1))
         (setq i (+ i 1))))
-    (setq *cli-jit-on* nil)
+    (setq *use-jit* nil)
     (write-string-serial \"stress-SURVIVED-4000\") (write-char-serial 10))
 
   ;; (8) WS4 #160 Piece 2 DEFUN-RETENTION regression net (argv1 = 56667):
@@ -1059,7 +540,7 @@
   ;;     installer page, this would UAF-crash; defun-bad must be 0 (body is a
   ;;     SEPARATE module, built on first call).
   (when (eql (%parse-decimal-at-fixed-208) 56667)
-    (setq *cli-jit-on* t)
+    (setq *use-jit* t)
     (write-string-serial \"DEFUNPROBE-START\") (write-char-serial 10)
     (mvm-eval (list (quote defun) (quote probefoo) (quote (x)) (list (quote +) (quote x) 100)))
     (let ((i 0)) (loop (when (>= i 3000) (return nil)) (mvm-eval (list (quote +) i 1)) (setq i (+ i 1))))
@@ -1078,7 +559,7 @@
   ;;     below is odd-but-valid; all must return the correct value.  A crash =
   ;;     a translator HARDWARE-FAULT the Lisp-error guard can't catch.
   (when (eql (%parse-decimal-at-fixed-208) 56668)
-    (setq *cli-jit-on* t)
+    (setq *use-jit* t)
     (write-string-serial \"BATTERY-START\") (write-char-serial 10)
     ;; b1: captureless constant lambda → funcall → 5
     (write-string-serial \"b1=\") (print-dec (funcall (mvm-eval (list (quote lambda) (quote ()) 5)))) (write-char-serial 10)
@@ -1106,7 +587,7 @@
   ;;     = a use-after-free (the transient/code-bearing classifier has a hole).
   ;;     Must PASS by construction (code-bearing pages are never reclaimed).
   (when (eql (%parse-decimal-at-fixed-208) 56666)
-    (setq *cli-jit-on* t)
+    (setq *use-jit* t)
     (write-string-serial \"CLOSPROBE-START\") (write-char-serial 10)
     (let ((fns nil) (i 0) (n 200))
       (loop (when (>= i n) (return nil))
@@ -1187,75 +668,82 @@
   (sys-exit 0))
 ")
 
-;;; ============================================================
-;;; Auto-generated sym-name reverse table (incl. driver + compiler-in-image
-;;; literals).  Reuses the common file's helper (which also scans the driver
-;;; source we just defined).
-;;; ============================================================
+;;; ARCH SLOT: late last-defun-wins overrides, spliced right after the bridge.
+;;;
+;;; (1) FILE I/O.  cl-fileio.lisp hardcodes x86-64 syscall numbers (open=2,
+;;;     stat=4, unlink=87, mkdir=83, rename=82).  The AArch64 generic ABI
+;;;     DROPPED all of them in favour of the `*at' variants with a dirfd
+;;;     argument, so on aarch64 every one hits a bogus/unimplemented number:
+;;;     %sys-stat-exists returned NIL for a file that exists and LOAD failed
+;;;     with FILE-ERROR for any path, making --load / --script / ~/.modusrc dead.
+;;;
+;;; (2) %CLI-ARGV-BASE.  lib/cli-toplevel.lisp turns %gc-stack-base into the
+;;;     byte address of argv[0]'s stack slot.  boot-linux-x64 stores the initial
+;;;     RSP RAW at 0x10000058, so a (mem-ref ... :u64) yields RSP/2 and the
+;;;     shared file doubles it.  boot-linux-aarch64 stores stack_base through
+;;;     `maybe-shl' (this build sets *linux-aarch64-gc-metadata-shl*), so the
+;;;     word in memory is already SP<<1 and the same read yields the REAL SP --
+;;;     doubling would land at 2*SP, far outside the mapped stack.  So the
+;;;     aarch64 arm is exactly "do not double".  An argv[i]/envp[i] POINTER is
+;;;     stored RAW by the kernel on BOTH arches, so the shared file's (* 2 ptr)
+;;;     is already correct here.
+(defvar *cli-arch-override-source* "
+(defun %sys-open-rdonly (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (%aarch64-openat *cstr-scratch* 0 0))
+(defun %sys-open-wronly (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (%aarch64-openat *cstr-scratch* 577 420))
+(defun %sys-open-append (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (%aarch64-openat *cstr-scratch* 1089 420))
+(defun %sys-open-rdwr (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (%aarch64-openat *cstr-scratch* 66 420))
+(defun %sys-open-create-excl (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (%aarch64-openat *cstr-scratch* 193 420))
+(defun %sys-unlink (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (%aarch64-unlinkat *cstr-scratch* 0 0))
+(defun %sys-rename (old-str new-str)
+  (%string-to-cstr old-str *cstr-scratch*)
+  (let ((new-addr (+ *cstr-scratch* 2048)))
+    (%string-to-cstr new-str new-addr)
+    (%aarch64-renameat *cstr-scratch* new-addr 0)))
+(defun %sys-mkdir (path-str mode)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (%aarch64-mkdirat *cstr-scratch* mode 0))
+(defun %sys-stat-size (path-str)
+  (let ((path-addr (%string-to-cstr path-str *cstr-scratch*))
+        (buf-addr *io-buf-addr*))
+    (let ((ret (%aarch64-newfstatat path-addr buf-addr 0)))
+      (if (< ret 0)
+          -1
+          ;; struct stat on AArch64 differs from x86-64 layout —
+          ;; st_size is at offset 48 in both, so the same load works.
+          (mem-ref (+ buf-addr 48) :u32)))))
+(defun %sys-stat-exists (path-str)
+  (let ((path-addr (%string-to-cstr path-str *cstr-scratch*))
+        (buf-addr *io-buf-addr*))
+    (let ((ret (%aarch64-newfstatat path-addr buf-addr 0)))
+      (if (< ret 0) nil t))))
+(defun %sys-stat-mtime (path-str)
+  (let ((path-addr (%string-to-cstr path-str *cstr-scratch*))
+        (buf-addr *io-buf-addr*))
+    (let ((ret (%aarch64-newfstatat path-addr buf-addr 0)))
+      (if (< ret 0)
+          0
+          (mem-ref (+ buf-addr 88) :u32)))))
 
-(setq *sym-name-auto-source*
-      (%build-sym-name-auto-source (list *driver-source* *cli-toplevel-source*
-                                         *runtime-backquote-source*
-                                         *rtest-pkg-source*
-                                         *libload-source*)
-                                   (list *compiler-in-image-source*)))
 
-;;; ============================================================
-;;; Assemble corpus-free *full-source*
-;;; ============================================================
+(defun %cli-argv-base ()
+(defun %cli-argv-base ()
+  (+ (%gc-stack-base) 8))
+")
 
-(format t "~%Assembling corpus-free full source...~%")
-
-(defvar *full-source*
-  (concatenate 'string
-    *prelude-source*  (string #\Newline)
-    *gc-source*       (string #\Newline)
-    *mcgc-pin-source*
-    *rt-source*       (string #\Newline)
-    ;; RTEST package — AFTER rt.lisp so its DO-TESTS wins (last-defun-wins).
-    *rtest-pkg-source* (string #\Newline)
-    *bridge-source*   (string #\Newline)
-    ;; tar + install-tarball — AFTER the bridge (they need read / streams /
-    ;; %sys-* file I/O) so a library tarball can actually be installed.
-    *libload-source*  (string #\Newline)
-    ;; MVM ISA + interp + compiler + mvm-eval + translate-aarch64 + co-init.
-    *compiler-in-image-source* (string #\Newline)
-    "(defvar *sym-name-table* nil)" (string #\Newline)
-    *sft-auto-source*          (string #\Newline)
-    *sym-name-auto-source*     (string #\Newline)
-    *runtime-macros-auto-source* (string #\Newline)
-    ;; The shared SBCL-faithful toplevel, then the AArch64 arm that overrides
-    ;; its single arch-specific function (%cli-argv-base) by last-defun-wins.
-    ;; Both must come AFTER the bridge (they need read / load / file streams /
-    ;; write-object) and BEFORE the driver only in the sense that the driver's
-    ;; kernel-main calls (cli-toplevel) — MVM resolves calls by name across the
-    ;; whole unit, so a forward reference to sys-exit is fine.
-    *runtime-backquote-source*  (string #\Newline)
-    *aarch64-fileio-override-source* (string #\Newline)
-    *cli-toplevel-source*      (string #\Newline)
-    *cli-aarch64-arm-source*   (string #\Newline)
-    ;; :GENERA + ASDF surfaces MUST come BEFORE *driver-source*: kernel-main
-    ;; lives in the driver and calls %install-genera-compat /
-    ;; %install-asdf-interface, and a forward reference across the blob does
-    ;; NOT resolve — it emits a NIL sentinel, i.e. a silent no-op boot hook.
-    *genera-source*            (string #\Newline)
-    *asdf-source*              (string #\Newline)
-    *driver-source*            (string #\Newline)
-    *cli-jit-default-source*))
-
-(format t "Full source: ~D characters~%" (length *full-source*))
-
-;;; MODUS_DUMP_FULL_SOURCE=<path> — write the assembled blob and STOP (see the
-;;; identical hook in build-generic-cli.lisp for the rationale).
-#+sbcl
-(let ((p (sb-ext:posix-getenv "MODUS_DUMP_FULL_SOURCE")))
-  (when (and p (plusp (length p)))
-    (with-open-file (o p :direction :output :if-exists :supersede
-                         :external-format :utf-8)
-      (write-string *full-source* o))
-    (format t "Dumped *full-source* to ~A (~D chars); skipping image build.~%"
-            p (length *full-source*))
-    (sb-ext:exit :code 0)))
+(load (merge-pathnames "build-cli-common.lisp"
+                       (directory-namestring (truename *load-truename*))))
 
 ;;; ============================================================
 ;;; Build the Linux/AArch64 ELF (same target machinery as the gate wrapper)

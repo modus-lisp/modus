@@ -42,7 +42,6 @@
 ;;;;   *CLI-ARCH-KERNEL-PROLOGUE*    hardware setup that must precede the FIRST
 ;;;;                                 allocation (aarch64: BSS zeroing + GC
 ;;;;                                 object-start bitmap reservation).
-;;;;   *CLI-ARCH-KERNEL-JIT-INIT*    native-translator co-init in kernel-main.
 ;;;;   *CLI-ARCH-KERNEL-EPILOGUE*    the toplevel entry / probe program.
 ;;;;   *CLI-ARCH-OVERRIDE-SOURCE*    late last-defun-wins overrides spliced right
 ;;;;                                 after the bridge (aarch64: the `*at'-syscall
@@ -60,7 +59,7 @@
 
 (declaim (special *cli-arch*
                   *cli-arch-syscall-source* *cli-arch-probe-source*
-                  *cli-arch-kernel-prologue* *cli-arch-kernel-jit-init*
+                  *cli-arch-kernel-prologue*
                   *cli-arch-kernel-epilogue* *cli-arch-override-source*))
 
 ;;; ============================================================
@@ -963,11 +962,12 @@
   ;; general library primitive, NOT ql wiring — the QL package + ql:quickload
   ;; come only from a runtime (load) of modus-quicklisp/setup.lisp.
   (setq *tar-block-size* 512)
-"
-  ;; ARCH SLOT: native-translator co-init inside kernel-main.
-  *cli-arch-kernel-jit-init*
-  ;; ---- SHARED library-compatibility boot hooks ---------------------------
-  "  ;; :GENERA — install the Genera compatibility surface and push the feature.
+  ;; WS5 rung 2: initialize the native JIT if it was baked (MODUS_USE_JIT=1).
+  ;; %jit-boot-init is baked to a no-op when JIT is off, or to the translator
+  ;; table co-init + (setq *use-jit* t) when JIT is on.  Wrapped so a JIT-init
+  ;; crash can never take down a normal boot.
+  (handler-case (%jit-boot-init) (t (c) nil))
+  ;; :GENERA — install the Genera compatibility surface and push the feature.
   ;; MUST come after %install-runtime-cl-macros (the compat source uses
   ;; DOLIST / WHEN / UNLESS / SETF) and before cli-toplevel, so that
   ;; ~/.modusrc, --load and --eval all already see :genera on *features*.

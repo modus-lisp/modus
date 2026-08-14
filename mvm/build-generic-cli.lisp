@@ -90,15 +90,6 @@
 ;; MCGC object-start bitmap is reserved host-side.
 (defvar *cli-arch-kernel-prologue* "")
 
-;; x86-64 native-translator co-init.
-(defvar *cli-arch-kernel-jit-init*
-"  ;; WS5 rung 2: initialize the native JIT if it was baked (MODUS_USE_JIT=1).
-  ;; %jit-boot-init is baked to a no-op when JIT is off, or to the translator
-  ;; table co-init + (setq *use-jit* t) when JIT is on.  Wrapped so a JIT-init
-  ;; crash can never take down a normal boot.
-  (handler-case (%jit-boot-init) (t (c) nil))
-")
-
 ;; x86-64 toplevel entry.  No baked probe program — this is a shipping CLI.
 (defvar *cli-arch-kernel-epilogue*
 "  ;; --- entry: the SHARED SBCL-faithful CLI toplevel ------------------------

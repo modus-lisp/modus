@@ -67,7 +67,25 @@
 (declaim (special *cli-arch*
                   *cli-arch-syscall-source* *cli-arch-probe-source*
                   *cli-arch-kernel-prologue* *cli-arch-io-scratch-source*
-                  *cli-arch-kernel-epilogue* *cli-arch-override-source*))
+                  *cli-arch-kernel-epilogue* *cli-arch-override-source*
+                  *cli-bare-metal* *cli-bare-metal-tarball*))
+
+;;; BARE-METAL SEAM.  DEFVAR, so a wrapper that binds these BEFORE loading this
+;;; file keeps its value and everything else defaults to the hosted behaviour —
+;;; i.e. every existing build stays byte-identical by construction.
+;;;
+;;;   *CLI-BARE-METAL*          T => omit the hosted payload (Linux syscalls,
+;;;                             fds, argv, cli-toplevel) from *BRIDGE-SOURCE*.
+;;;   *CLI-BARE-METAL-TARBALL*  T => bare metal, but still bake lib/tar.lisp +
+;;;                             lib/install-tarball.lisp so the image can
+;;;                             install a library it fetched itself.
+;;;
+;;; This exists so the bare-metal CL images are THIN TAILS over this shared
+;;; assembly rather than private forks of it.  The forks are exactly how the
+;;; 2026-08-15 console (PL011 vs mini UART) and USB-DMA-past-end-of-RAM bugs
+;;; survived: each was fixed in one assembly and not the other.
+(defvar *cli-bare-metal* nil)
+(defvar *cli-bare-metal-tarball* nil)
 
 ;;; ============================================================
 ;;; 1. Load MVM infrastructure (SBCL-side)
@@ -746,30 +764,13 @@
   (mvm-interpret (make-array 11 :initial-contents (list 17 16 42 0 0 0 0 0 0 0 162))))
 ")
 (defvar *rt-macros-source* (mvm-text "mvm/runtime-cl-macros.lisp"))
-(defvar *bridge-source*
-  (concatenate 'string
-    (mvm-text "mvm/cl-sequences.lisp")
-    (string #\Newline)
-    (mvm-text "mvm/cl-streams.lisp")
-    (string #\Newline)
-    (mvm-text "mvm/cl-fileio.lisp")
-    (string #\Newline)
-    (mvm-text "mvm/cl-printer.lisp")
-    (string #\Newline)
-    (mvm-text "mvm/cl-reader.lisp")
-    (string #\Newline)
-    (mvm-text "mvm/cl-eval.lisp")
-    (string #\Newline)
-    (mvm-text "mvm/cl-clos.lisp")
-    (string #\Newline)
-    (mvm-text "mvm/cl-types.lisp")
-    (string #\Newline)
-    (mvm-text "mvm/cl-packages.lisp")
-    (string #\Newline)
-    (mvm-text "mvm/cl-conditions.lisp")
-    (string #\Newline)
-    (mvm-text "mvm/ansi-bridge.lisp")
-    (string #\Newline)
+;;; The hosted payload, split out of *BRIDGE-SOURCE* so bare-metal targets can
+;;; omit it.  Non-bare-metal assembles EXACTLY the text it always did, in the
+;;; same order, so every hosted build's blob stays byte-identical.
+(defvar *cli-hosted-payload-source*
+  (cond
+    ((not *cli-bare-metal*)
+     (concatenate 'string
     ;; tar + install-tarball are baked as GENERAL library primitives (NOT ql).
     ;; They are the untar->parse-.asd->topo-sort->eval pipeline; nothing about
     ;; them is quicklisp-specific.  They are baked (not runtime-(load)ed by
@@ -814,6 +815,56 @@
     ;; Other hosted builds adopt this toplevel by baking this file and calling
     ;; (cli-toplevel) from kernel-main.
     (mvm-text "lib/cli-toplevel.lisp")))
+    ;; BARE METAL + tarball: keep ONLY the general untar -> parse-.asd ->
+    ;; topo-sort -> eval pipeline.  The RPi net build fetches a plain .tar over
+    ;; its own DWC2/CDC stack and installs it in RAM, so it needs these two and
+    ;; none of the Linux syscall layers above.  Same chipz strip, same reason.
+    (*cli-bare-metal-tarball*
+     (concatenate 'string
+       (mvm-text "lib/tar.lisp")
+       (string #\Newline)
+       (%cli-strip-chipz (read-file-text (merge-pathnames "lib/install-tarball.lisp"
+                                                          *modus-base*)))))
+    ;; BARE METAL, no library loading: nothing at all.
+    (t "")))
+
+(defvar *bridge-source*
+  (concatenate 'string
+    (mvm-text "mvm/cl-sequences.lisp")
+    (string #\Newline)
+    (mvm-text "mvm/cl-streams.lisp")
+    (string #\Newline)
+    (mvm-text "mvm/cl-fileio.lisp")
+    (string #\Newline)
+    (mvm-text "mvm/cl-printer.lisp")
+    (string #\Newline)
+    (mvm-text "mvm/cl-reader.lisp")
+    (string #\Newline)
+    (mvm-text "mvm/cl-eval.lisp")
+    (string #\Newline)
+    (mvm-text "mvm/cl-clos.lisp")
+    (string #\Newline)
+    (mvm-text "mvm/cl-types.lisp")
+    (string #\Newline)
+    (mvm-text "mvm/cl-packages.lisp")
+    (string #\Newline)
+    (mvm-text "mvm/cl-conditions.lisp")
+    (string #\Newline)
+    (mvm-text "mvm/ansi-bridge.lisp")
+    (string #\Newline)
+    ;; ---- BARE METAL STOPS HERE -------------------------------------------
+    ;; Everything below is the HOSTED payload: Linux syscalls, fds, argv.  A
+    ;; bare-metal target (no OS, no filesystem, no argv) sets *CLI-BARE-METAL*
+    ;; and gets "" here, optionally keeping just the tar/install-tarball
+    ;; library pipeline via *CLI-BARE-METAL-TARBALL* (the RPi net build fetches
+    ;; a .tar over its own USB/CDC stack and installs it in RAM).
+    ;;
+    ;; Splitting this out is what lets the bare-metal CL images (RPi, x64) be
+    ;; THIN TAILS over this file instead of private copies of it.  Those copies
+    ;; are how the console and DMA-region bugs of 2026-08-15 survived: a fix
+    ;; landed in one assembly and not the other.
+    *cli-hosted-payload-source*))
+
 ;; WS3 STEP 4b (2026-07-09): mvm/tree-walker.lisp is NO LONGER part of this
 ;; image — production eval is mvm-eval only.  The full-corpus + gauntlet census
 ;; measured ZERO %e2ic walker-fallback hits (the earlier "-142 fallback

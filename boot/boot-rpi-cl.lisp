@@ -81,10 +81,41 @@
 ;; contains no #' forms, so no :li-func patch site is ever emitted; the
 ;; hardcoded VBAR of 0x00080800 in emit-rpi-entry is the tell that the real
 ;; base is 0x80000.  A CL-stack image emits those patches constantly.
+;; CHAIN-LOAD SUPPORT.  The UART chain loader (net/uart-bootloader.lisp,
+;; `bootloader-load-addr' = #x300000) receives an image over the mini UART and
+;; JUMPS TO 0x300000 — it cannot use 0x80000, because that is where the chain
+;; loader itself is executing from.  So an image intended to be chain-loaded
+;; must be built to RUN at 0x300000 instead of the GPU's 0x80000.
+;;
+;; Remember cross.lisp adds 0x80000 (see the note above), so:
+;;     effective run address = declared :load-addr + 0x80000
+;;     0x80000  (SD card, GPU-loaded)  <- declare 0
+;;     0x300000 (chain-loaded)         <- declare 0x280000
+;;
+;; MODUS_RPI_CHAINLOAD=1 selects the chain-load layout.  Everything else —
+;; stack top, heap, peripherals — is unchanged; only the image base and its
+;; vector-table address move, and the 20 MB image at 0x300000 still ends far
+;; below the 0x08000000 stack top.
+(defvar *rpi-cl-chainload*
+  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_RPI_CHAINLOAD")))
+    (and v (plusp (length v)) (not (string= v "0"))))
+  "T when building an image to be delivered by the UART chain loader.")
+
+(defconstant +rpi-cl-gpu-load-addr+   #x00000000) ; -> runs at 0x80000
+(defconstant +rpi-cl-chain-load-addr+ #x00280000) ; -> runs at 0x300000
+
+(defvar *rpi-cl-load-addr*
+  (if *rpi-cl-chainload* +rpi-cl-chain-load-addr+ +rpi-cl-gpu-load-addr+))
+
+;; Kept for source compatibility; the GPU-loaded value.
 (defconstant +rpi-cl-load-addr+     #x00000000)
 
 (defconstant +rpi-cl-pl011-base+    #x3F201000)  ; BCM2837 UART0 (PL011)
-(defconstant +rpi-cl-vbar+          #x00080800)  ; image base + 0x800
+;; VBAR must track the image base: run address + 0x800.
+(defvar *rpi-cl-vbar*
+  (+ *rpi-cl-load-addr* #x80000 #x800)
+  "Vector table VA = actual run address + 0x800.")
+(defconstant +rpi-cl-vbar+          #x00080800)  ; GPU-loaded value
 (defconstant +rpi-cl-native-off+    #x00001000)  ; native code at image + 0x1000
 
 (defconstant +rpi-cl-stack-top+     #x08000000)  ; grows down
@@ -161,7 +192,7 @@
     (emit-aarch64-u32 buf #xD518D090)       ; MSR TPIDR_EL1, X16
 
     ;; --- 5. VBAR_EL1 ------------------------------------------------------
-    (emit-aarch64-load-imm64 buf x16 +rpi-cl-vbar+)
+    (emit-aarch64-load-imm64 buf x16 *rpi-cl-vbar*)
     (emit-aarch64-u32 buf #xD518C010)       ; MSR VBAR_EL1, X16
     (emit-aarch64-u32 buf #xD5033FDF)       ; ISB SY
 
@@ -198,7 +229,7 @@
   "Boot descriptor for a Pi 3B image running the real CL / MVM stack."
   (list :arch :aarch64
         :entry-fn #'emit-rpi-cl-entry
-        :load-addr +rpi-cl-load-addr+
+        :load-addr *rpi-cl-load-addr*
         :stack-top +rpi-cl-stack-top+
         :cons-base +rpi-cl-heap-base+
         :general-base (+ +rpi-cl-heap-mid+ #x01000000)

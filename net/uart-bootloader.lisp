@@ -51,19 +51,43 @@
 ;;; Kernel Receive + Jump
 ;;; ============================================================
 
+;; Default only.  The SENDER now supplies the load address on the wire (see
+;; bootloader-receive), so the loader adapts to the image instead of the image
+;; having to be built for a constant compiled in here.
+;;
+;; WHY: an image's fn-address constants, code bounds and :li-const patches are
+;; baked for ONE base at build time (cross.lisp adds 0x80000 to the declared
+;; :load-addr).  When that base and this constant disagree, the loader jumps
+;; into a mislaid image and the board wedges SILENTLY — the same failure shape
+;; as boot-rpi.lisp's double-counted :load-addr.  Carrying the address in the
+;; protocol makes the mismatch impossible.
 (defun bootloader-load-addr () #x300000)
+
+;; Refuse an address that would overwrite the loader itself (we execute from
+;; 0x80000) or land at/above the stack top.  A bad address is otherwise a
+;; guaranteed silent wedge, so say "AD" and give up instead of jumping.
+(defun bootloader-addr-ok (a)
+  (if (< a #x200000) nil (if (>= a #x08000000) nil t)))
 
 (defun bootloader-receive ()
   ;; Send ACK
   (write-byte #xAA)
-  ;; Read 4-byte kernel size
+  ;; Read 4-byte LOAD ADDRESS, then 4-byte kernel size
+  (let ((addr (uart-read-u32)))
+    (write-byte 65) (write-byte 68) (write-byte 58)  ;; "AD:"
+    (print-hex32 addr)
+    (write-byte 10)
+    (if (not (bootloader-addr-ok addr))
+        (progn
+          (write-byte 65) (write-byte 68) (write-byte 10)  ;; "AD\n" = bad addr
+          nil)
   (let ((size (uart-read-u32)))
     ;; Print size
     (write-byte 83) (write-byte 90) (write-byte 58)  ;; "SZ:"
     (print-hex32 size)
     (write-byte 10)
     ;; Read kernel data byte by byte
-    (let ((load-addr (bootloader-load-addr)))
+    (let ((load-addr addr))
       (let ((i 0))
         (let ((checksum 0))
           (loop
@@ -87,7 +111,7 @@
                   (jump-to-address load-addr))
                 (progn
                   (write-byte 69) (write-byte 82) (write-byte 10)  ;; "ER\n"
-                  nil))))))))
+                  nil))))))))))
 
 (defun uart-drain ()
   ;; Drain any garbage from UART RX FIFO (reset transients on GPIO)

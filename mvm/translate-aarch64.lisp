@@ -66,6 +66,26 @@
   "Store width for serial write: 0=byte (strb, PL011), 2=word (str, mini UART).
    BCM2835 mini UART requires 32-bit stores to AUX_MU_IO register.")
 
+(defvar *aarch64-serial-rx-poll* '(#x18 4 :tbnz)
+  "(OFFSET BIT POLARITY) for the serial RX ready-poll, mirroring
+   *AARCH64-SERIAL-TX-POLL*.  Default is PL011: poll UARTFR at 0x18 and keep
+   waiting while RXFE (bit 4) is SET, i.e. :TBNZ.
+
+   THIS EXISTS BECAUSE RX WAS HARDCODED WHILE TX WAS PARAMETERIZED, which made
+   the Pi Zero 2 W — whose ONLY console is the BCM2835 mini UART — able to
+   PRINT but never READ.  That asymmetry is invisible under QEMU raspi3b,
+   whose console is a PL011, so it passes every emulated test and fails on the
+   real hardware the push gate targets.
+
+   Mini UART (BCM2835 AUX): AUX_MU_LSR_REG is at 0x14 and bit 0 is
+   `data ready', so keep waiting while it is CLEAR => '(#x14 0 :tbz).
+   Compare the TX side, which already uses '(#x14 5 :tbz) (bit 5 =
+   transmitter empty) in build-pizero2w-*.
+
+   The flag register is read at width 2 (32-bit), matching the TX poll — the
+   AUX registers require 32-bit access, and a PL011 UARTFR read is
+   width-agnostic for bit 4.")
+
 (defvar *aarch64-serial-tx-poll* nil
   "TX-ready poll config: nil (no poll) or (offset bit polarity).
    offset = byte offset from serial base to status register.
@@ -1843,21 +1863,30 @@
                ((= code #x0301)
                 ;; Serial read: poll UART until a byte is available,
                 ;; return tagged fixnum char code in x0.
-                ;; PL011 UARTFR offset = 0x18, RXFE bit = bit 4
+                ;; Ready-poll is PARAMETERIZED via *aarch64-serial-rx-poll*,
+                ;; mirroring the TX side above.  Default '(#x18 4 :tbnz) is
+                ;; PL011 (wait while UARTFR.RXFE is set); the BCM2835 mini UART
+                ;; supplies '(#x14 0 :tbz) (wait while AUX_MU_LSR.bit0 clear).
+                ;; Hardcoding this was why the Pi Zero 2 W could print but not
+                ;; read — invisible under QEMU raspi3b, which is a PL011.
                 ;; load UART base into x17
                 (a64-load-imm64 buf +a64-x17+ *aarch64-serial-base*)
-                ;; poll loop (2 instructions):
-                ;;   ldrb w16, [x17, #0x18]   ; read UARTFR
-                (a64-ldr-width buf +a64-x16+ +a64-x17+ #x18 0)
-                ;;   tbnz x16, #4, -4         ; if RXFE set, branch back
-                ;; TBNZ encoding: b5|011011|1|b40|imm14|Rt
-                ;; b5=0, b40=00100 (bit 4), imm14=-1 (back 1 insn), Rt=x16
-                (a64-emit buf (logior (ash #b00110111 24)  ; TBNZ
-                                      (ash 4 19)           ; bit number = 4
-                                      (ash (logand -1 #x3FFF) 5)  ; imm14 = -1
-                                      +a64-x16+))
-                ;; read data byte: ldrb w0, [x17, #0]
-                (a64-ldr-width buf +a64-x0+ +a64-x17+ 0 0)
+                ;; poll loop (2 instructions), flag read at width 2 like TX:
+                ;;   ldr w18, [x17, #offset]
+                (destructuring-bind (offset bit polarity) *aarch64-serial-rx-poll*
+                  (a64-ldr-width buf 18 +a64-x17+ offset 2)
+                  ;;   tb(n)z x18, #bit, -4    ; loop while not-ready
+                  ;; TB(N)Z encoding: b5|011011|op|b40|imm14|Rt
+                  (let ((opcode (ecase polarity
+                                  (:tbz  #b00110110)
+                                  (:tbnz #b00110111))))
+                    (a64-emit buf (logior (ash opcode 24)
+                                          (ash bit 19)
+                                          (ash (logand -1 #x3FFF) 5)  ; imm14 = -1
+                                          18))))
+                ;; read data register at the configured width (0 = byte for
+                ;; PL011, 2 = 32-bit for the mini UART's AUX_MU_IO_REG)
+                (a64-ldr-width buf +a64-x0+ +a64-x17+ 0 *aarch64-serial-width*)
                 ;; tag as fixnum: lsl x0, x0, #1
                 (a64-lsl-imm buf +a64-x0+ +a64-x0+ 1))
                ((= code #x0302)

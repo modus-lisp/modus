@@ -124,11 +124,21 @@
                          "      (setf (mem-ref (conn-base i) :u32) 0)"
                          "      (setq i (+ i 1))))"
                          "  (net-actor-main))")))
+       ;; ORDER IS LOad-BEARING.  mvm/repl-source.lisp ALSO defines
+       ;; `kernel-main', and CLAUDE.md limitation #1 is last-defun-wins — so
+       ;; with boot-main FIRST (as it was) the REPL's kernel-main shadowed the
+       ;; chain loader's and the whole boot-main body became dead code,
+       ;; including the GPIO14/15 ALT5 setup and the magic-byte wait.  The
+       ;; resulting image booted, printed a "> " prompt and echoed input: a
+       ;; REPL wearing a bootloader's name.  On real hardware it was worse than
+       ;; useless — GPIO14/15 never switched to ALT5, so the mini UART was
+       ;; never connected to the header pins and the board looked dead.
+       ;; boot-main MUST come last.
        (combined-source (concatenate 'string
-                                      boot-main
                                       cl-user::*bootloader-source*
                                       cl-user::*net-source*
-                                      *repl-source*)))
+                                      *repl-source*
+                                      boot-main)))
   (format t "Building UART bootloader + SSH image...~%")
   (format t "Combined source: ~D chars~%" (length combined-source))
   (let ((image (build-image :target :rpi :source-text combined-source)))

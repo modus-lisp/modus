@@ -58,6 +58,11 @@
 (setf *aarch64-serial-width* 2)
 ;; Poll AUX_MU_LSR (base+0x14) bit 5 (TX empty) before each write
 (setf *aarch64-serial-tx-poll* '(#x14 5 :tbz))
+;; Mini UART RX: AUX_MU_LSR bit 0 = data ready, so wait while CLEAR.
+;; Without this the image PRINTS but never READS — the RX poll used to be
+;; hardcoded to PL011 (0x18 / bit 4 / :tbnz), which QEMU raspi3b satisfies
+;; and real Pi Zero 2 W hardware does not.
+(setf *aarch64-serial-rx-poll* '(#x14 0 :tbz))
 
 (let* ((hdmi-main (format nil "~{~A~%~}"
                         (list

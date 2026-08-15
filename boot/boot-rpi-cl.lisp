@@ -191,9 +191,23 @@
     (emit-aarch64-load-imm64 buf x16 +rpi-cl-percpu+)
     (emit-aarch64-u32 buf #xD518D090)       ; MSR TPIDR_EL1, X16
 
-    ;; --- 5. VBAR_EL1 ------------------------------------------------------
+    ;; --- 5. VBAR_EL1 *AND* VBAR_EL2 ---------------------------------------
+    ;; This image RUNS AT EL2 on a Pi 3B / Zero 2 W (measured: PSTATE 0x3c9,
+    ;; M[3:0]=0b1001; every logged exception is "from EL2 to EL2").  Setting
+    ;; only VBAR_EL1 left VBAR_EL2 = 0, so ANY fault vectored to
+    ;; VBAR_EL2 + 0x200 = 0x200 — where there is no code — took an Undefined
+    ;; Instruction, re-vectored to 0x200, and stormed FOREVER: 100% CPU, zero
+    ;; output, zero allocation.  Measured 53 MILLION such exceptions in 128 s.
+    ;; The vector table at *rpi-cl-vbar* was never even reachable, so the
+    ;; `B .' vectors could not help.
+    ;;
+    ;; That is the single worst failure mode on real hardware, where there is
+    ;; no `qemu -d int' to reveal it: a wedged board is indistinguishable from
+    ;; a dead serial link — which cost an afternoon of chasing wiring that was
+    ;; correct all along.
     (emit-aarch64-load-imm64 buf x16 *rpi-cl-vbar*)
     (emit-aarch64-u32 buf #xD518C010)       ; MSR VBAR_EL1, X16
+    (emit-aarch64-u32 buf #xD51CC010)       ; MSR VBAR_EL2, X16
     (emit-aarch64-u32 buf #xD5033FDF)       ; ISB SY
 
     ;; --- 6. code_base / code_end for FUNCTIONP ---------------------------

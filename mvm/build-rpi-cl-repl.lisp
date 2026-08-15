@@ -617,8 +617,15 @@
         (net-text "http-client.lisp")   (string #\Newline)
         ;; Bigger HTTP response buffer.  The stock http-fetch-impl caps a
         ;; response at 4096 bytes and tcp-rx-copy bounds its copy to 4096 — too
-        ;; small for a tarball.  Same 32 KB override build-aarch64.lisp's net
-        ;; build uses, so the two images fetch identically sized bodies.
+        ;; small for a tarball.  Default is the same 32 KB override
+        ;; build-aarch64.lisp's net build uses, so the two images fetch
+        ;; identically sized bodies; MODUS_NET_BUFSZ raises it for a bigger
+        ;; library (alexandria's .tar is 276480 bytes).  Baked as a defun, not a
+        ;; defvar: MVM active limitation #7 means a defvar initform never runs.
+        (format nil "~%(defun %net-resp-cap () ~D)~%"
+                (or #+sbcl (let ((v (sb-ext:posix-getenv "MODUS_NET_BUFSZ")))
+                             (and v (plusp (length v)) (parse-integer v)))
+                    32768))
         "
 (defun tcp-rx-copy (dest dest-off)
   (let ((buf (e1000-rx-buf)))
@@ -630,7 +637,7 @@
             (loop
               (when (>= i data-len) (return data-len))
               (let ((dst-idx (+ dest-off i)))
-                (when (< dst-idx 32768)
+                (when (< dst-idx (%net-resp-cap))
                   (aset dest dst-idx (mem-ref (+ data-base i) :u8))))
               (setq i (+ i 1))))
           data-len)))))
@@ -654,7 +661,7 @@
               (let ((req-len (http-build-get url scheme-end host-len
                                               path-start path-len req-buf)))
                 (tcp-send req-buf req-len)))
-            (let ((resp (make-array 32768))
+            (let ((resp (make-array (%net-resp-cap)))
                   (resp-len 0)
                   (done 0)
                   (idle 0))
@@ -675,10 +682,56 @@
         (string #\Newline))
       ""))
 
+;;; --- #263 rung 3: install + load the fetched library ------------------------
+;;;
+;;; lib/tar.lisp (ustar reader) + lib/install-tarball.lisp (untar -> find the
+;;; .asd -> parse its :components -> topo-sort by :depends-on -> read+eval each
+;;; source file).  BAKED into the image, not runtime-(load)ed, for two reasons:
+;;;
+;;;   1. There is no filesystem on bare metal, so there is nothing to LOAD from.
+;;;      install-tarball-from-bytes takes the archive as an in-RAM byte vector,
+;;;      which is exactly what net-fetch-bytes returns.
+;;;   2. %tar-slice calls (make-array LEN) with a VARIABLE size, and eval2's
+;;;      interpreter returns an array of length LEN/2 for that shape — which
+;;;      truncates any tar entry over 512 bytes so its source will not READ.
+;;;      The native build compiles the same make-array correctly, so baking
+;;;      sidesteps the gap.  Same reasoning as mvm/build-cli-common.lisp.
+;;;
+;;; install-tarball.lisp names `chipz:decompress' / `chipz:gzip' on the gunzip
+;;; branch.  This image has no CHIPZ package, so the build reader would error
+;;; `Package CHIPZ does not exist' and SILENTLY DROP the whole enclosing form
+;;; (taking %it-install-from-gz-bytes-1 with it).  Strip the qualifiers so they
+;;; collapse to bare `decompress'/`gzip' in the flat image namespace; the branch
+;;; is never taken because we serve a PLAIN .tar (install-tarball-from-bytes
+;;; only calls DECOMPRESS when the gzip magic 1F 8B is present).  Read via
+;;; read-file-text, NOT net-text/mvm-text — the host check-parses errors on
+;;; `chipz:' before we get a chance to strip it.  Mirrors %cli-strip-chipz in
+;;; mvm/build-cli-common.lisp and strip-package-prefixes in build-aarch64.lisp.
+(defun %rpi-strip-one-prefix (text pfx)
+  (let ((result text))
+    (loop
+      (let ((pos (search pfx result)))
+        (unless pos (return result))
+        (setf result (concatenate 'string
+                                  (subseq result 0 pos)
+                                  (subseq result (+ pos (length pfx)))))))))
+
+(defun %rpi-strip-chipz (text)
+  (%rpi-strip-one-prefix (%rpi-strip-one-prefix text "chipz::") "chipz:"))
+
+(defvar *install-source*
+  (if *net-build-p*
+      (concatenate 'string
+        (mvm-text "lib/tar.lisp") (string #\Newline)
+        (%rpi-strip-chipz
+         (read-file-text (merge-pathnames "lib/install-tarball.lisp" *modus-base*)))
+        (string #\Newline))
+      ""))
+
 ;; The rung-2 pipeline: bring the USB NIC up, DHCP for an address, fetch a
-;; .tar.gz over real HTTP and report its length + an FNV-1a-32 checksum so the
-;; body can be verified byte-for-byte against the file the host served.
-;; INSTALLING the tarball is rung 3 and is deliberately NOT done here.
+;; .tar over real HTTP and report its length + an FNV-1a-32 checksum so the
+;; body can be verified byte-for-byte against the file the host served; then
+;; (rung 3) INSTALL it, LOAD its sources and CALL a function from it.
 (defvar *net-driver-source*
   (if *net-build-p* "
 ;; Build a byte-array URL from a Lisp string (chars are CHARACTERS in the real
@@ -751,6 +804,62 @@
     (print-dec (logand (ash v -8) 255))  (write-char-serial 46)
     (print-dec (logand v 255))))
 
+;; --- #263 rung 3 -------------------------------------------------------------
+;; Fetch the archive ONCE, report it (rung-2 evidence: length / magic / FNV-1a),
+;; then INSTALL it (untar -> .asd -> component order -> read+eval each file) and
+;; CALL a function from the freshly loaded system.
+;;
+;; The call expression is a STRING read at runtime, never a literal in this
+;; source: `(sha1:sha1-hex \"abc\")' cannot be READ at build time because the
+;; SHA1 package does not exist until the library has loaded.  %lib-call-expr is
+;; baked as a defun (MVM active limitation #7: a defvar initform never runs at
+;; boot) and is overridable with MODUS_LIB_EXPR.
+(defun net-install-and-call (url-string)
+  ;; lib/tar.lisp's (defvar *tar-block-size* 512) init-thunk does NOT run at
+  ;; boot, so the variable is NIL and (+ off *tar-block-size*) wedges
+  ;; tar-do-entries.  Set it explicitly.  Same fix build-aarch64.lisp makes.
+  (setq *tar-block-size* 512)
+  (handler-case
+      (let ((tb (net-fetch-bytes url-string)))
+        (if (null tb)
+            (progn (write-string-serial \"LIB-FETCH-FAIL\") (write-char-serial 10) nil)
+            (progn
+              (write-string-serial \"FETCHED bytes=\")
+              (print-dec (cdr tb)) (write-char-serial 10)
+              (write-string-serial \"HEAD4=\")
+              (let ((k 0))
+                (loop (when (>= k 4) (return nil))
+                      (print-hex-byte (aref (car tb) k)) (write-char-serial 32)
+                      (setq k (+ k 1))))
+              (write-char-serial 10)
+              (write-string-serial \"FNV1A=\")
+              (print-dec (%net-fnv1a (car tb) (cdr tb))) (write-char-serial 10)
+              ;; --- INSTALL: untar + parse .asd + read/eval every component ---
+              (let ((sys (handler-case (install-tarball-from-bytes (car tb))
+                           (t (c) nil))))
+                (write-string-serial \"LIB-SYSTEM=\")
+                (if (stringp sys) (write-string-serial sys)
+                    (write-string-serial \"<install-failed>\"))
+                (write-char-serial 10))
+              ;; --- CALL: evaluate an expression from the installed system ---
+              (write-string-serial \"LIB-EXPR=\")
+              (write-string-serial (%lib-call-expr)) (write-char-serial 10)
+              (write-string-serial \"LIB-VALUE=\")
+              (handler-case
+                  (let ((v (eval (read-from-string (%lib-call-expr)))))
+                    (cond ((stringp v) (write-string-serial v))
+                          ((integerp v) (print-dec v))
+                          ((null v) (write-string-serial \"NIL\"))
+                          (t (handler-case (write-object v)
+                               (t (c) (write-string-serial \"<unprintable>\"))))))
+                (t (c)
+                  (write-string-serial \"<call-error> \")
+                  (handler-case (write-object c)
+                    (t (c2) (write-string-serial \"<err>\")))))
+              (write-char-serial 10)
+              t)))
+    (t (c) (write-string-serial \"LIB-ERR\") (write-char-serial 10) nil)))
+
 (defun run-net-pipeline ()
   (write-string-serial \"NET-PIPELINE-START\") (write-char-serial 10)
   ;; 1. DWC2 host controller + USB enumeration + CDC Ethernet.
@@ -770,8 +879,9 @@
             (print-dec (mem-ref (+ state #x1B) :u8)) (write-char-serial 10)
             (write-string-serial \"GW=\")
             (%net-print-ip-u32 (+ state #x1C)) (write-char-serial 10))
-          ;; 3. HTTP GET of a .tar.gz from the QEMU slirp gateway.
-          (net-fetch-report (%net-fetch-url)))))
+          ;; 3. HTTP GET of the library .tar from the QEMU slirp gateway, then
+          ;;    (rung 3) install it, load it, and call a function from it.
+          (net-install-and-call (%net-fetch-url)))))
   (write-string-serial \"NET-PIPELINE-DONE\") (write-char-serial 10))
 "
       ""))
@@ -780,9 +890,15 @@
 ;; means a defvar initform never runs at boot).  MODUS_NET_URL overrides it.
 (defvar *net-url-source*
   (if *net-build-p*
-      (format nil "~%(defun %net-fetch-url () ~S)~%"
+      (format nil "~%(defun %net-fetch-url () ~S)~%(defun %lib-call-expr () ~S)~%"
               (or #+sbcl (sb-ext:posix-getenv "MODUS_NET_URL")
-                  "http://10.0.2.2:8080/demo.tar.gz"))
+                  "http://10.0.2.2:8080/sha1.tar")
+              ;; #263 rung 3: the expression evaluated AFTER the fetched system
+              ;; is installed + loaded.  A STRING, read at runtime — the build
+              ;; reader cannot read `sha1:sha1-hex' (no SHA1 package until the
+              ;; library loads).  Override with MODUS_LIB_EXPR.
+              (or #+sbcl (sb-ext:posix-getenv "MODUS_LIB_EXPR")
+                  "(sha1:sha1-hex \"abc\")"))
       ""))
 
 ;; Spliced into kernel-main.  "" when the flag is off => zero bytes added.
@@ -1094,6 +1210,10 @@
                        ;; symbols into the SFT / sym-name tables too.  "" when
                        ;; MODUS_NET_BUILD is off.
                        *net-source*      (string #\Newline)
+                       ;; #263 rung 3: tar + install-tarball, so their defuns
+                       ;; (install-tarball-from-bytes, tar-extract, …) land in
+                       ;; the SFT and are reachable from runtime EVAL / the REPL.
+                       *install-source*  (string #\Newline)
                        *net-url-source*  (string #\Newline)
                        *net-driver-source* (string #\Newline)
                        *driver-source*))
@@ -1339,6 +1459,10 @@
     ;; *driver-source*, whose kernel-main calls run-net-pipeline.
     ;; All three are "" unless MODUS_NET_BUILD=1.
     *net-source*
+    ;; #263 rung 3: tar reader + tarball installer, AFTER the net stack (they
+    ;; report progress through its write-string-serial / print-dec) and after
+    ;; the CL runtime + mvm-eval whose EVAL loads each component file.
+    *install-source*
     *net-url-source*
     *net-driver-source*
     ;; Defvar for *sym-name-table* (compiler.lisp now supplies *macro-table*'s

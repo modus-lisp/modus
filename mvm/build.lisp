@@ -131,6 +131,18 @@
     ;; client) and drives DHCP -> TCP -> HTTP GET from kernel-main before the
     ;; REPL starts.  Flag-off it is byte-identical to the cl-repl cell above,
     ;; so this is a variant row, not a second image lineage.  See *CELL-ENV*.
+    ;;
+    ;; #263 rung 3 (the PUSH GATE) rides the SAME cell: the flag also bakes in
+    ;; lib/tar.lisp + lib/install-tarball.lisp, and the boot pipeline now
+    ;; INSTALLS the fetched archive (untar -> .asd -> :components -> read+eval
+    ;; each file) and CALLS a function from it.  Verified on QEMU raspi3b with
+    ;; the bundled systems/sha1.tar:
+    ;;   (sha1:sha1-hex "abc") => "A9993E364706816ABA3E25717850C26C9CD0D89D"
+    ;; MODUS_NET_URL picks the tarball (serve a PLAIN .tar — there is no chipz
+    ;; in this image, so the gunzip branch is an unresolved sentinel);
+    ;; MODUS_LIB_EXPR picks the expression evaluated after the load; and
+    ;; MODUS_NET_BUFSZ raises the 32 KB HTTP response cap for a bigger library
+    ;; (alexandria's .tar is 276480 bytes and needs e.g. 400000).
     ("aarch64/bare/rpi/cl-net" :aarch64 :bare :rpi :cl-net
      :legacy nil :aarch64 "/tmp/piboot/kernel8-net.img"    "build-rpi-cl-repl")
     ;; NOTE: the legacy repl-source RPi cells are BROKEN — one shared type

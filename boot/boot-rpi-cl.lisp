@@ -164,19 +164,70 @@
     (emit-aarch64-load-imm64 buf x16 +rpi-cl-stack-top+)
     (emit-aarch64-mov-sp buf sp x16)
 
-    ;; --- 2. PL011 UART0 init (same sequence as emit-rpi-entry) ------------
-    ;;   CR = 0 | IBRD = 26 | FBRD = 3 | LCRH = 0x70 (8N1, FIFO) | CR = 0x301
-    (emit-aarch64-load-imm64 buf x17 +rpi-cl-pl011-base+)
-    (emit-aarch64-movz buf x0 0 0)
-    (emit-aarch64-str-w buf x0 x17 12)      ; +0x30 UARTCR = 0
-    (emit-aarch64-movz buf x0 26 0)
-    (emit-aarch64-str-w buf x0 x17 9)       ; +0x24 UARTIBRD
-    (emit-aarch64-movz buf x0 3 0)
-    (emit-aarch64-str-w buf x0 x17 10)      ; +0x28 UARTFBRD
-    (emit-aarch64-movz buf x0 #x70 0)
-    (emit-aarch64-str-w buf x0 x17 11)      ; +0x2C UARTLCRH
-    (emit-aarch64-movz buf x0 #x0301 0)
-    (emit-aarch64-str-w buf x0 x17 12)      ; +0x30 UARTCR = enable|TX|RX
+    ;; --- 2. CONSOLE init --------------------------------------------------
+    ;; WHICH UART depends on *AARCH64-SERIAL-BASE*, which the build script sets.
+    ;; Getting this wrong is the worst failure on this board, for the reason
+    ;; section 5 spells out: a wedged board and a dead serial link look
+    ;; IDENTICAL.  Measured 2026-08-15 — pointing the translator's TRAP
+    ;; #x0300/#x0301 emitters at the mini UART while this preamble still only
+    ;; initialised the PL011 produced a totally silent board: the data path
+    ;; wrote to AUX_MU_IO on a peripheral THIS CODE had never enabled.
+    (if (= *aarch64-serial-base* #x3F215040)
+        (progn
+          ;; ---- BCM2835 mini UART (AUX), real Pi Zero 2 W ------------------
+          ;; The Zero 2 W routes the PL011 to Bluetooth; the mini UART owns
+          ;; GPIO14/15, so this is the ONLY console on the header pins.
+          ;; AUX block base is 0x3F215000 = AUX_MU_IO (0x3F215040) - 0x40.
+          ;; str-w offsets are SCALED BY 4, hence reg-offset/4 below.
+          ;;   +0x04 AUX_ENABLES  1  = enable the mini UART
+          ;;   +0x60 AUX_MU_CNTL  0  = TX/RX off while we configure
+          ;;   +0x44 AUX_MU_IER   0  = no interrupts (we poll)
+          ;;   +0x4C AUX_MU_LCR   3  = 8-bit  (bit1 is documented as reserved
+          ;;                             but must be set for 8-bit operation)
+          ;;   +0x50 AUX_MU_MCR   0  = RTS unused
+          ;;   +0x68 AUX_MU_BAUD  270 = 115200 with core_freq=250 fixed in
+          ;;                             config.txt: 250e6/(8*115200)-1 = 270.3
+          ;;   +0x60 AUX_MU_CNTL  3  = TX+RX enable
+          ;; GPIO14/15 muxing to ALT5 is left to the firmware, which does it
+          ;; because config.txt carries enable_uart=1.
+          ;; DO NOT REPROGRAM THE MINI UART.  The firmware has already enabled
+          ;; it, muxed GPIO14/15 and set the divisor, because config.txt
+          ;; carries enable_uart=1 — which is exactly why the UART chain
+          ;; loader (boot-rpi.lisp) prints BOOT/RDY while doing NO AUX setup
+          ;; whatsoever.  Inheriting that state is the proven-correct path.
+          ;;
+          ;; MEASURED THE HARD WAY: a previous version of this branch wrote the
+          ;; full init sequence here, including AUX_MU_BAUD = 270, derived from
+          ;; config.txt's core_freq=250 (250e6/(8*115200)-1).  The emitted code
+          ;; was byte-perfect and the board was still SILENT.  The mini UART
+          ;; divides the VPU CORE CLOCK, whose real value under start_cd.elf is
+          ;; not reliably 250 MHz on a Zero 2 W (stock core_freq is 400), so a
+          ;; hardcoded divisor reprograms a UART the firmware had ALREADY set
+          ;; up correctly and silences it.  Touch nothing; just transmit.
+          (emit-aarch64-load-imm64 buf x17 #x3F215040)
+          ;; EARLY LIFE SIGN, before a single Lisp instruction runs.  The TX
+          ;; FIFO is 8 deep and empty here, so 5 bytes need no LSR poll.
+          ;; If "BOOT" appears but MODUS-CL never does, the console is fine
+          ;; and the fault is in Lisp init - which is the single most useful
+          ;; bit of information this board can give us.
+          ;; x17 is AUX_MU_IO itself now, so the data register is offset 0.
+          (dolist (ch '(66 79 79 84 10))       ; "BOOT\n"
+            (emit-aarch64-movz buf x0 ch 0)
+            (emit-aarch64-str-w buf x0 x17 0)))
+        (progn
+          ;; ---- PL011 UART0 (QEMU raspi3b) ---------------------------------
+          ;;   CR = 0 | IBRD = 26 | FBRD = 3 | LCRH = 0x70 (8N1, FIFO) | CR = 0x301
+          (emit-aarch64-load-imm64 buf x17 +rpi-cl-pl011-base+)
+          (emit-aarch64-movz buf x0 0 0)
+          (emit-aarch64-str-w buf x0 x17 12)   ; +0x30 UARTCR = 0
+          (emit-aarch64-movz buf x0 26 0)
+          (emit-aarch64-str-w buf x0 x17 9)    ; +0x24 UARTIBRD
+          (emit-aarch64-movz buf x0 3 0)
+          (emit-aarch64-str-w buf x0 x17 10)   ; +0x28 UARTFBRD
+          (emit-aarch64-movz buf x0 #x70 0)
+          (emit-aarch64-str-w buf x0 x17 11)   ; +0x2C UARTLCRH
+          (emit-aarch64-movz buf x0 #x0301 0)
+          (emit-aarch64-str-w buf x0 x17 12))) ; +0x30 UARTCR = enable|TX|RX
 
     ;; --- 3. GC allocation registers --------------------------------------
     ;; RAW byte addresses (see the RAW-ADDR-AUDIT note in boot-aarch64.lisp):

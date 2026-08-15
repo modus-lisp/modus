@@ -775,7 +775,7 @@
   (let ((h 2166136261) (i 0))
     (loop
       (when (>= i n) (return h))
-      (when (zerop (logand i 16383))
+      (when (zerop (logand i 1023))
         (write-string-serial \"[f\") (print-dec i) (write-string-serial \"]\"))
       (setq h (logand (* (logxor h (aref arr i)) 16777619) #xFFFFFFFF))
       (setq i (+ i 1)))))
@@ -816,6 +816,8 @@
                 (loop (when (>= k 4) (return nil))
                       (print-hex-byte (aref (car tb) k)) (write-char-serial 32)
                       (setq k (+ k 1))))
+              (write-char-serial 10)
+              (write-string-serial \"OUTLEN=\") (print-dec (length (car tb)))
               (write-char-serial 10)
               (write-string-serial \"FNV1A=\")
               (print-dec (%net-fnv1a (car tb) (cdr tb)))
@@ -1669,15 +1671,28 @@
       ;; 0x10200000) and the peripherals, or the NIC DMAs over live data —
       ;; the exact failure build-aarch64.lisp's net relocation exists to stop.
       (when cl-user::*net-build-p*
-        (let ((net-lo #x20000000)
-              (net-hi #x20113000)
-              (meta-end #x10200000))
+        (let ((net-lo #x11000000)
+              (net-hi #x11113000)
+              (meta-end #x10200000)
+              ;; SMALLEST board this image must run on: Pi Zero 2 W, 512 MB,
+              ;; minus gpu_mem=16 => the ARM sees 0x1F000000 (496 MB).  QEMU
+              ;; raspi3b models a 1 GiB Pi 3B, so anything between 496 MB and
+              ;; 1 GiB passes every emulated test and addresses a HOLE on the
+              ;; real target.  The net block used to sit at 0x20000000 =
+              ;; exactly 512 MB and was unusable on hardware for that reason.
+              (min-board-ram #x1F000000))
           (when (< net-lo meta-end)
             (error "BUILD-TIME ASSERT: net DMA base ~X is inside the runtime ~
                     metadata window (ends ~X)." net-lo meta-end))
           (when (>= net-hi periph-base)
             (error "BUILD-TIME ASSERT: net region end ~X is inside the ~
                     BCM2837 peripheral window at ~X." net-hi periph-base))
+          (when (>= net-hi min-board-ram)
+            (error "BUILD-TIME ASSERT: net region end ~X is at/above ~X, the ~
+                    RAM the ARM sees on a Pi Zero 2 W (512 MB - gpu_mem=16). ~
+                    It would DMA into a hole on the real target while passing ~
+                    every QEMU raspi3b test, because raspi3b models 1 GiB."
+                   net-hi min-board-ram))
           (format t "  net/DMA    ~8,'0X .. ~8,'0X  (USB + E1000-shaped state)~%"
                   net-lo net-hi))))
 

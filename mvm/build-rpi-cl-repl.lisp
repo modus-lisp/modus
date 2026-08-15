@@ -527,6 +527,33 @@
 (defun %s1-interp ()
   (mvm-interpret (make-array 11 :initial-contents (list 17 16 42 0 0 0 0 0 0 0 162))))
 ")
+;;; ------------------------------------------------------------
+;;; BRING-UP CULLS (#209 rung 4).  Chain-loading a 20MB image over a
+;;; 9600-baud mini-UART takes ~5.6 hours, so the bring-up image can drop
+;;; payload that the bare Pi does not need YET.  Both knobs default OFF so
+;;; every existing build stays byte-identical; set the env var to cull.
+;;;
+;;;   MODUS_RPI_NO_BLOB=1    drop the embedded self-source blob (~3.7MB).
+;;;                          `read-embedded-source' is the only consumer and
+;;;                          it is commented out at its single call site; the
+;;;                          "MVMS" header is still emitted so the image
+;;;                          footer's offset arithmetic stays valid.
+;;;   MODUS_RPI_NO_BRIDGE=1  drop mvm/ansi-bridge.lisp (~1.7MB of source ->
+;;;                          ~3.5MB of image).  Test scaffolding (eqlt, the
+;;;                          rt-* harness, ANSI stand-ins) with one real
+;;;                          consumer: cl-eval.lisp's (puthash "EQLT" ...).
+;;;                          NOT proven boot-safe — measure, don't assume.
+(defun %rpi-cull-p (var)
+  (let ((v (sb-ext:posix-getenv var)))
+    (and v (plusp (length v)) (not (string= v "0")))))
+(defvar *rpi-no-blob* (%rpi-cull-p "MODUS_RPI_NO_BLOB"))
+(defvar *rpi-no-bridge* (%rpi-cull-p "MODUS_RPI_NO_BRIDGE"))
+(when *rpi-no-blob*
+  (setf modus.mvm::*embed-source-blob* nil)
+  (format t "~&;; CULL: embedded source blob DROPPED~%"))
+(when *rpi-no-bridge*
+  (format t "~&;; CULL: mvm/ansi-bridge.lisp DROPPED~%"))
+
 (defvar *rt-macros-source* (mvm-text "mvm/runtime-cl-macros.lisp"))
 (defvar *bridge-source*
   (concatenate 'string
@@ -550,7 +577,7 @@
     (string #\Newline)
     (mvm-text "mvm/cl-conditions.lisp")
     (string #\Newline)
-    (mvm-text "mvm/ansi-bridge.lisp")
+    (if *rpi-no-bridge* "" (mvm-text "mvm/ansi-bridge.lisp"))
     ;; BARE METAL stops here.  The hosted payload build-generic-cli bakes
     ;; after ansi-bridge — lib/tar.lisp, lib/install-tarball.lisp,
     ;; net/hosted-{sockets,storage,http}.lisp and lib/cli-toplevel.lisp — is

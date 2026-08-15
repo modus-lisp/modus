@@ -86,12 +86,31 @@
     (write-byte 83) (write-byte 90) (write-byte 58)  ;; "SZ:"
     (print-hex32 size)
     (write-byte 10)
-    ;; Read kernel data byte by byte
+    ;; Read kernel data.  DRAIN THE WHOLE FIFO PER POLL, don't poll per byte.
+    ;;
+    ;; MEASURED on real hardware: the old one-poll-per-byte loop could only
+    ;; absorb 8 bytes at a time — exactly the BCM2835 mini UART's RX FIFO depth
+    ;; — and a sender writing more than that silently lost bytes, so `i' never
+    ;; reached SIZE and the loop waited forever.  Sweep at 115200:
+    ;;     chunk=8 -> OK    chunk=16/32/64/256 -> no OK, ever
+    ;; Paced to 8 bytes it works but yields only ~1.0 KB/s, i.e. 5.6 HOURS for
+    ;; a 20 MB CL image.
+    ;;
+    ;; Note the "TO" never appeared either: uart-read-byte's guard is
+    ;; `(> i 50000000)', commented "~5 seconds at ~1GHz" — but with the MMU OFF
+    ;; every access is Device-nGnRnE (uncached), so that spin is MINUTES, not
+    ;; seconds.  A stalled receive therefore looks exactly like a hang.
+    ;;
+    ;; Draining while LSR bit 0 stays set amortises the poll across a whole
+    ;; FIFO-full.  It does NOT fix the deeper cost — the per-byte store into
+    ;; DRAM is also uncached with the MMU off — so the real lever remains
+    ;; enabling caching (already the first rung-2 item in boot-rpi-cl.lisp).
     (let ((load-addr addr))
       (let ((i 0))
         (let ((checksum 0))
           (loop
             (when (>= i size) (return nil))
+            ;; wait for at least one byte (with the existing safety timeout)
             (let ((b (uart-read-byte)))
               (when (= b -1)
                 ;; Timeout during receive
@@ -99,7 +118,15 @@
                 (return nil))
               (setf (mem-ref (+ load-addr i) :u8) b)
               (setq checksum (logand (+ checksum b) #xFF)))
-            (setq i (+ i 1)))
+            (setq i (+ i 1))
+            ;; then take everything else already sitting in the FIFO
+            (loop
+              (when (>= i size) (return nil))
+              (when (zerop (logand (mem-ref #x3F215054 :u32) 1)) (return nil))
+              (let ((b2 (logand (mem-ref #x3F215040 :u32) #xFF)))
+                (setf (mem-ref (+ load-addr i) :u8) b2)
+                (setq checksum (logand (+ checksum b2) #xFF)))
+              (setq i (+ i 1))))
           ;; Read expected checksum
           (let ((expected (uart-read-byte)))
             (if (= checksum expected)

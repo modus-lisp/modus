@@ -333,11 +333,29 @@
               (mvm-emit-u32 buf (mvm-function-info-native-offset fn-info))))))
     (mvm-buffer-used-bytes buf)))
 
+(defvar *embed-source-blob* t
+  "When NIL, emit the MVMS header with a ZERO-length body instead of the whole
+   source text.  Default T — every existing build is byte-identical.
+
+   WHY THIS EXISTS.  Measured on the bare-metal RPi CL image: the blob is
+   3,742,336 bytes of verbatim ASCII, 22% of a 17 MB image, and NOTHING READS
+   IT AT RUNTIME — the only consumer, `read-embedded-source', is commented out
+   at the one call site (see the `Get source' branch of build-image).  It is
+   carried so an image can compile its NEXT generation (the WS5 self-hosting
+   work: modus2/modus3).  A board that boots a REPL and loads a library never
+   needs it, and over a 1 KB/s UART chain-load those bytes cost ~an hour.
+
+   The header is still emitted with length 0 so the image metadata footer's
+   source-blob offset arithmetic stays valid — that offset is computed from
+   (length source-blob), so removing the field entirely would silently corrupt
+   the footer rather than fail loudly.")
+
 (defun embed-source-blob (source-text target)
   "Prepare the source text for embedding in the kernel image.
    The source is stored as plain ASCII text, readable by the
-   self-contained reader (Phase 1a)."
-  (let ((buf (make-mvm-buffer)))
+   self-contained reader (Phase 1a).  Suppressed by *EMBED-SOURCE-BLOB* = NIL."
+  (let ((buf (make-mvm-buffer))
+        (source-text (if *embed-source-blob* source-text "")))
     ;; Source blob header: [magic:4 | length:4 | text...]
     (mvm-emit-u32 buf #x4D564D53)  ; "MVMS" magic
     (mvm-emit-u32 buf (length source-text))

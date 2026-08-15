@@ -120,9 +120,15 @@
      :legacy nil :aarch64 "/tmp/modus-aarch64-ansi.bin"    "build-aarch64")
 
     ;; ---------------- bare / rpi ----------------
-    ;; NOTE: the whole RPi cell is BROKEN — one shared type error
-    ;; (#S(A64-BUFFER) vs MVM-BUFFER) inside BUILD-IMAGE :TARGET :RPI.
-    ;; Plan is migration to the CL/mvm image (#209), not repair.
+    ;; #209 rung 1 LANDED: the RPi family's migration onto the CL/mvm image.
+    ;; This cell boots on QEMU raspi3b, passes E2SMOKE, and gives a working
+    ;; CL REPL (mvm-eval) over PL011 — see build-rpi-cl-repl.lisp.  It shares
+    ;; nothing with the legacy repl-source cells below.
+    ("aarch64/bare/rpi/cl-repl" :aarch64 :bare :rpi :cl-repl
+     :legacy nil :aarch64 "/tmp/piboot/kernel8.img"        "build-rpi-cl-repl")
+    ;; NOTE: the legacy repl-source RPi cells are BROKEN — one shared type
+    ;; error (#S(A64-BUFFER) vs MVM-BUFFER) inside BUILD-IMAGE :TARGET :RPI.
+    ;; Plan is migration to the CL/mvm image (#209, the cell above), not repair.
     ("aarch64/bare/rpi/repl"  :aarch64 :bare   :rpi  :repl
      :native :rpi     :aarch64 "/tmp/kernel8.img"          "build-rpi-repl")
     ("aarch64/bare/rpi/ssh"   :aarch64 :bare   :rpi  :ssh

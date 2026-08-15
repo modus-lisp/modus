@@ -126,6 +126,13 @@
     ;; nothing with the legacy repl-source cells below.
     ("aarch64/bare/rpi/cl-repl" :aarch64 :bare :rpi :cl-repl
      :legacy nil :aarch64 "/tmp/piboot/kernel8.img"        "build-rpi-cl-repl")
+    ;; #209 rung 2: the SAME script with MODUS_NET_BUILD=1, which appends the
+    ;; Pi USB net stack (arch-rpi-cl + DWC2 + USB + CDC Ethernet + IP + HTTP
+    ;; client) and drives DHCP -> TCP -> HTTP GET from kernel-main before the
+    ;; REPL starts.  Flag-off it is byte-identical to the cl-repl cell above,
+    ;; so this is a variant row, not a second image lineage.  See *CELL-ENV*.
+    ("aarch64/bare/rpi/cl-net" :aarch64 :bare :rpi :cl-net
+     :legacy nil :aarch64 "/tmp/piboot/kernel8-net.img"    "build-rpi-cl-repl")
     ;; NOTE: the legacy repl-source RPi cells are BROKEN — one shared type
     ;; error (#S(A64-BUFFER) vs MVM-BUFFER) inside BUILD-IMAGE :TARGET :RPI.
     ;; Plan is migration to the CL/mvm image (#209, the cell above), not repair.
@@ -210,7 +217,15 @@
 (defparameter *cell-env*
   '(("i386/hosted/-/cli"
      ("MODUS_I386_OUT"    . "/tmp/modus-i386-cli")
-     ("MODUS_I386_SYMMAP" . "/tmp/modus-i386-cli.symmap"))))
+     ("MODUS_I386_SYMMAP" . "/tmp/modus-i386-cli.symmap"))
+    ;; #209 rung 2.  build-rpi-cl-repl.lisp builds the plain rung-1 REPL unless
+    ;; MODUS_NET_BUILD=1, so this cell is the only thing that distinguishes the
+    ;; net image from the cl-repl one — including its output path, or the two
+    ;; cells would overwrite each other at /tmp/piboot/kernel8.img.
+    ;; MODUS_NET_URL selects what the boot pipeline fetches.
+    ("aarch64/bare/rpi/cl-net"
+     ("MODUS_NET_BUILD"   . "1")
+     ("MODUS_CL_REPL_OUT" . "/tmp/piboot/kernel8-net.img"))))
 
 (defun apply-cell-env (key)
   (let ((entry (assoc key *cell-env* :test #'string-equal)))

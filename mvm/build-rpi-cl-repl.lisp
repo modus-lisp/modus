@@ -558,6 +558,240 @@
     ;; cli-toplevel in particular reads argv off the initial process stack
     ;; and opens fd 0; the serial driver below is its bare-metal counterpart.
     ""))
+;;; ============================================================
+;;; NET BUILD (MODUS_NET_BUILD=1) — #209 rung 2: HTTP over DWC2/USB
+;;; ============================================================
+;;;
+;;; When enabled, append the Pi's USB net stack (arch adapter + DWC2 host
+;;; controller + USB core + CDC Ethernet + IP/TCP/ARP/DHCP + HTTP client) to
+;;; the image and drive a DHCP -> TCP -> HTTP GET pipeline from kernel-main.
+;;; This is the DWC2 counterpart of build-aarch64.lisp's MODUS_NET_BUILD, which
+;;; does the same thing over E1000 on QEMU virt; the driver text below is
+;;; deliberately shaped like that one so the two stay diffable.
+;;;
+;;; EVERY var here is "" when the flag is off, and the kernel-main call site is
+;;; a spliced "" too, so the default (rung 1) image is BYTE-IDENTICAL.
+;;;
+;;; No SSH and no crypto: a plain-HTTP fetch needs only the NIC, IP and the
+;;; HTTP client.  No actors either — the fetch runs synchronously in
+;;; kernel-main, so there is no yield/context-switch to corrupt cons cells
+;;; (MVM active limitation #5).
+;;;
+;;; WHY THIS WORKS WHERE build-rpi-ssh DOES NOT.  The legacy repl-source RPi
+;;; SSH image wedges under QEMU 7.2 at the FIRST USB control transfer
+;;; (`D1E' = GET_DEVICE_DESCRIPTOR failed), and a `-trace usb_dwc2*' capture
+;;; shows why: HCCHAR is written twice as 0x00000040, i.e. WITHOUT the CHENA
+;;; enable bit, so QEMU is never asked to run a packet (zero usb_dwc2_packet_*
+;;; events in 265k trace lines).  `(hcchar-chena)' is `(ash 1 31)', and
+;;; compile-ash only INLINES a constant shift count <= 30 — 31 routes to the
+;;; runtime function `bignum-ash', which does not exist in a repl-source image,
+;;; so the constant evaluates to 0 and the OR is a no-op.  (`(ash 1 29)' for
+;;; GUSBCFG force-host is <= 30 and does reach the register, which is why the
+;;; controller inits and the port reports FS before it stalls.)  In THIS image
+;;; bignum-ash is present — it comes in with mvm/cl-eval.lisp as part of
+;;; *bridge-source*, which is concatenated BEFORE the net stack — so
+;;; (ash 1 31) yields 2147483648, CHENA is set, and enumeration proceeds.
+;;; The DWC2 driver was never broken; it was the runtime under it.
+(defvar *net-build-p*
+  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_NET_BUILD")))
+    (and v (string= v "1"))))
+
+(defvar *net-dir* (merge-pathnames "net/" *modus-base*))
+(defun net-text (rel)
+  (let ((p (merge-pathnames rel *net-dir*)))
+    (modus.mvm::check-parses p)
+    (read-file-text p)))
+
+(defvar *net-source*
+  (if *net-build-p*
+      (concatenate 'string
+        ;; arch-rpi-cl.lisp, NOT arch-raspi3b.lisp: the legacy adapter's DMA
+        ;; regions at 0x01000000 land INSIDE this ~20 MB image, and it carries a
+        ;; miniature make-array/aref/aset runtime that would replace the real CL
+        ;; one under last-defun-wins.  See that file's header.
+        (net-text "arch-rpi-cl.lisp")   (string #\Newline)
+        (net-text "dwc2.lisp")          (string #\Newline)
+        (net-text "usb.lisp")           (string #\Newline)
+        (net-text "cdc-ether.lisp")     (string #\Newline)
+        (net-text "ip.lisp")            (string #\Newline)
+        (net-text "http-client.lisp")   (string #\Newline)
+        ;; Bigger HTTP response buffer.  The stock http-fetch-impl caps a
+        ;; response at 4096 bytes and tcp-rx-copy bounds its copy to 4096 — too
+        ;; small for a tarball.  Same 32 KB override build-aarch64.lisp's net
+        ;; build uses, so the two images fetch identically sized bodies.
+        "
+(defun tcp-rx-copy (dest dest-off)
+  (let ((buf (e1000-rx-buf)))
+    (let ((ip-total (buf-read-u16-mem buf 16))
+          (tcp-hdr-len (ash (logand (mem-ref (+ buf 46) :u8) #xF0) -2)))
+      (let ((data-len (- ip-total (+ 20 tcp-hdr-len))))
+        (let ((data-base (+ (+ buf 34) tcp-hdr-len)))
+          (let ((i 0))
+            (loop
+              (when (>= i data-len) (return data-len))
+              (let ((dst-idx (+ dest-off i)))
+                (when (< dst-idx 32768)
+                  (aset dest dst-idx (mem-ref (+ data-base i) :u8))))
+              (setq i (+ i 1))))
+          data-len)))))
+(defun http-fetch-impl (url url-len)
+  (let ((scheme-end (url-skip-http url url-len)))
+    (let ((host-end (url-host-end url scheme-end url-len)))
+      (let ((port (url-parse-port url host-end url-len))
+            (path-start (url-path-off url scheme-end url-len)))
+        (let ((host-len (- host-end scheme-end))
+              (path-len (- url-len path-start)))
+          (let ((ip (resolve-host url scheme-end host-end)))
+            (when (zerop ip)
+              (write-byte 68) (write-byte 78) (write-byte 83)
+              (write-byte 58) (write-byte 48) (write-byte 10)
+              (return 0))
+            (when (zerop (tcp-connect ip port))
+              (write-byte 84) (write-byte 67) (write-byte 80)
+              (write-byte 58) (write-byte 70) (write-byte 10)
+              (return 0))
+            (let ((req-buf (make-array 512)))
+              (let ((req-len (http-build-get url scheme-end host-len
+                                              path-start path-len req-buf)))
+                (tcp-send req-buf req-len)))
+            (let ((resp (make-array 32768))
+                  (resp-len 0)
+                  (done 0)
+                  (idle 0))
+              (loop
+                (when (not (zerop done)) (return 0))
+                (let ((n (tcp-receive 300)))
+                  (if (> n 0)
+                      (progn
+                        (let ((copied (tcp-rx-copy resp resp-len)))
+                          (setq resp-len (+ resp-len copied)))
+                        (setq idle 0))
+                      (setq idle (+ idle 1))))
+                (when (zerop (tcp-state)) (setq done 1))
+                (when (> idle 20) (setq done 1)))
+              (tcp-close)
+              (cons resp resp-len))))))))
+"
+        (string #\Newline))
+      ""))
+
+;; The rung-2 pipeline: bring the USB NIC up, DHCP for an address, fetch a
+;; .tar.gz over real HTTP and report its length + an FNV-1a-32 checksum so the
+;; body can be verified byte-for-byte against the file the host served.
+;; INSTALLING the tarball is rung 3 and is deliberately NOT done here.
+(defvar *net-driver-source*
+  (if *net-build-p* "
+;; Build a byte-array URL from a Lisp string (chars are CHARACTERS in the real
+;; CL reader — char-code them, unlike the legacy repl-source images where a
+;; string slot already held the code).
+(defun %net-url (s)
+  (let* ((n (length s)) (arr (make-array n)))
+    (dotimes (i n) (aset arr i (char-code (char s i))))
+    (cons arr n)))
+
+;; FNV-1a 32-bit over the first N bytes of ARR.  Every intermediate fits in a
+;; 62-bit fixnum (2^32 * 2^24), so no bignum path is involved.
+(defun %net-fnv1a (arr n)
+  (let ((h 2166136261) (i 0))
+    (loop
+      (when (>= i n) (return h))
+      (setq h (logand (* (logxor h (aref arr i)) 16777619) #xFFFFFFFF))
+      (setq i (+ i 1)))))
+
+;; Fetch URL-STRING; return (body-array . body-length) or NIL.
+(defun net-fetch-bytes (url-string)
+  (let* ((u (%net-url url-string))
+         (result (http-fetch-impl (car u) (cdr u))))
+    (if (or (null result) (eq result 0))
+        nil
+        (let* ((resp (car result))
+               (resp-len (cdr result))
+               (body-off (http-find-body resp resp-len)))
+          (let* ((blen (- resp-len body-off))
+                 (out (make-array blen)))
+            (let ((i 0))
+              (loop
+                (when (>= i blen) (return nil))
+                (aset out i (aref resp (+ body-off i)))
+                (setq i (+ i 1))))
+            (cons out blen))))))
+
+;; Fetch URL-STRING and REPORT it: body length, the first four bytes (a .tar.gz
+;; must start 1F 8B 08) and an FNV-1a-32 of the whole body, which is what makes
+;; the transfer verifiable byte-for-byte against the file the server holds.
+;; A real defun (not driver-only text) so it lands in the symbol-function table
+;; and can be called from the REPL as well as from the boot pipeline.
+(defun net-fetch-report (url-string)
+  (handler-case
+      (let ((tb (net-fetch-bytes url-string)))
+        (if (null tb)
+            (progn (write-string-serial \"FETCH-FAIL\") (write-char-serial 10) 0)
+            (progn
+              (write-string-serial \"FETCHED bytes=\")
+              (print-dec (cdr tb)) (write-char-serial 10)
+              (write-string-serial \"HEAD4=\")
+              (let ((k 0))
+                (loop (when (>= k 4) (return nil))
+                      (print-hex-byte (aref (car tb) k)) (write-char-serial 32)
+                      (setq k (+ k 1))))
+              (write-char-serial 10)
+              (write-string-serial \"FNV1A=\")
+              (print-dec (%net-fnv1a (car tb) (cdr tb)))
+              (write-char-serial 10)
+              (cdr tb))))
+    (t (c) (write-string-serial \"FETCH-ERR\") (write-char-serial 10) -1)))
+
+;; Print the dotted quad held as a big-endian NUMBER in the u32 at ADDR.  The
+;; DHCP router option (state+0x1C) is stored this way by dhcp-parse-offer, so
+;; reading its four bytes in memory order prints them reversed.
+(defun %net-print-ip-u32 (addr)
+  (let ((v (mem-ref addr :u32)))
+    (print-dec (logand (ash v -24) 255)) (write-char-serial 46)
+    (print-dec (logand (ash v -16) 255)) (write-char-serial 46)
+    (print-dec (logand (ash v -8) 255))  (write-char-serial 46)
+    (print-dec (logand v 255))))
+
+(defun run-net-pipeline ()
+  (write-string-serial \"NET-PIPELINE-START\") (write-char-serial 10)
+  ;; 1. DWC2 host controller + USB enumeration + CDC Ethernet.
+  ;;    Prints DWC2:OK / PORT:xx / USB:vvvv:pppp / MAC:.. / CDC:OK itself.
+  (let ((r (handler-case (cdc-ether-init) (t (c) 0))))
+    (write-string-serial \"CDC-INIT=\") (print-dec r) (write-char-serial 10)
+    (if (zerop r)
+        (progn (write-string-serial \"NET-PIPELINE-ABORT\") (write-char-serial 10))
+        (progn
+          ;; 2. DHCP.  Prints DHCP:D / DHCP:O / DHCP:R / DHCP:A itself.
+          (handler-case (dhcp-client) (t (c) nil))
+          (let ((state (e1000-state-base)))
+            (write-string-serial \"IP=\")
+            (print-dec (mem-ref (+ state #x18) :u8)) (write-char-serial 46)
+            (print-dec (mem-ref (+ state #x19) :u8)) (write-char-serial 46)
+            (print-dec (mem-ref (+ state #x1A) :u8)) (write-char-serial 46)
+            (print-dec (mem-ref (+ state #x1B) :u8)) (write-char-serial 10)
+            (write-string-serial \"GW=\")
+            (%net-print-ip-u32 (+ state #x1C)) (write-char-serial 10))
+          ;; 3. HTTP GET of a .tar.gz from the QEMU slirp gateway.
+          (net-fetch-report (%net-fetch-url)))))
+  (write-string-serial \"NET-PIPELINE-DONE\") (write-char-serial 10))
+"
+      ""))
+
+;; The URL is baked as a real defun (not a defvar — MVM active limitation #7
+;; means a defvar initform never runs at boot).  MODUS_NET_URL overrides it.
+(defvar *net-url-source*
+  (if *net-build-p*
+      (format nil "~%(defun %net-fetch-url () ~S)~%"
+              (or #+sbcl (sb-ext:posix-getenv "MODUS_NET_URL")
+                  "http://10.0.2.2:8080/demo.tar.gz"))
+      ""))
+
+;; Spliced into kernel-main.  "" when the flag is off => zero bytes added.
+(defvar *net-pipeline-call*
+  (if *net-build-p*
+      "  (handler-case (run-net-pipeline) (t (c) nil))
+"
+      ""))
+
 ;; WS3 STEP 4b (2026-07-09): mvm/tree-walker.lisp is NO LONGER part of this
 ;; image — production eval is mvm-eval only.  The full-corpus + gauntlet census
 ;; measured ZERO %e2ic walker-fallback hits (the earlier "-142 fallback
@@ -817,7 +1051,11 @@
   (print-dec (handler-case (funcall (quote pf) 5) (t (c) -1)))
   (write-char-serial 10)
   (write-string-serial \"E2SMOKE-END\") (write-char-serial 10)
-
+"
+;; --- #209 rung 2: DWC2/USB -> DHCP -> TCP -> HTTP GET -------------------
+;; "" unless MODUS_NET_BUILD=1, so the rung-1 image is byte-identical.
+*net-pipeline-call*
+"
   ;; --- the REPL (lib/serial-repl.lisp) ------------------------------------
   (handler-case (cl-serial-repl) (t (c) nil))
   (sys-exit 0))
@@ -852,6 +1090,12 @@
                        *stage2-test-source* (string #\Newline)
                        *rt-macros-source* (string #\Newline)
                        *bridge-source*   (string #\Newline)
+                       ;; #209 rung 2: scan the net stack's defuns + quoted
+                       ;; symbols into the SFT / sym-name tables too.  "" when
+                       ;; MODUS_NET_BUILD is off.
+                       *net-source*      (string #\Newline)
+                       *net-url-source*  (string #\Newline)
+                       *net-driver-source* (string #\Newline)
                        *driver-source*))
 
 (defvar *all-defun-names*
@@ -1089,6 +1333,14 @@
     (string #\Newline)
     *stage2-test-source*
     (string #\Newline)
+    ;; #209 rung 2: the Pi USB net stack.  Placed AFTER the CL runtime, the
+    ;; compiler and mvm-eval so its own definitions win under last-defun-wins
+    ;; (the arch adapter deliberately overrides WRITE-BYTE), and BEFORE
+    ;; *driver-source*, whose kernel-main calls run-net-pipeline.
+    ;; All three are "" unless MODUS_NET_BUILD=1.
+    *net-source*
+    *net-url-source*
+    *net-driver-source*
     ;; Defvar for *sym-name-table* (compiler.lisp now supplies *macro-table*'s
     ;; defvar; runtime macroexpand-1 references it).
     "(defvar *sym-name-table* nil)
@@ -1223,7 +1475,26 @@
       (format t "  heap       ~8,'0X .. ~8,'0X  (112 MB, midpoint ~8,'0X)~%"
               heap-base heap-end +rpi-cl-heap-mid+)
       (format t "  periph     ~8,'0X ..            (PL011 UART0 at 3F201000)~%"
-              periph-base))
+              periph-base)
+      ;; #209 rung 2: the USB/net DMA + state block (net/arch-rpi-cl.lisp).
+      ;; It must clear BOTH the runtime metadata window (which ends at
+      ;; 0x10200000) and the peripherals, or the NIC DMAs over live data —
+      ;; the exact failure build-aarch64.lisp's net relocation exists to stop.
+      (when cl-user::*net-build-p*
+        (let ((net-lo #x20000000)
+              (net-hi #x20113000)
+              (meta-end #x10200000))
+          (when (< net-lo meta-end)
+            (error "BUILD-TIME ASSERT: net DMA base ~X is inside the runtime ~
+                    metadata window (ends ~X)." net-lo meta-end))
+          (when (>= net-hi periph-base)
+            (error "BUILD-TIME ASSERT: net region end ~X is inside the ~
+                    BCM2837 peripheral window at ~X." net-hi periph-base))
+          (format t "  net/DMA    ~8,'0X .. ~8,'0X  (USB + E1000-shaped state)~%"
+                  net-lo net-hi))))
 
-    (format t "~%Run: qemu-system-aarch64 -M raspi3b -kernel ~A -serial stdio -serial null -display none -no-reboot~%"
-            path)))
+    (format t "~%Run: qemu-system-aarch64 -M raspi3b -kernel ~A -serial stdio -serial null -display none -no-reboot~A~%"
+            path
+            (if cl-user::*net-build-p*
+                " -device usb-net,netdev=net0 -netdev user,id=net0"
+                ""))))

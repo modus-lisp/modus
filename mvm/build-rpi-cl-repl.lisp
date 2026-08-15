@@ -775,6 +775,8 @@
   (let ((h 2166136261) (i 0))
     (loop
       (when (>= i n) (return h))
+      (when (zerop (logand i 16383))
+        (write-string-serial \"[f\") (print-dec i) (write-string-serial \"]\"))
       (setq h (logand (* (logxor h (aref arr i)) 16777619) #xFFFFFFFF))
       (setq i (+ i 1)))))
 
@@ -1529,16 +1531,51 @@
 ;; syscalls — which is exactly what write-char-serial / read-char-serial need.
 (install-aarch64-translator)
 
-;; PL011 UART0 on the BCM2837 peripheral window.  Byte-wide data register at
-;; offset 0 and no TX-poll, i.e. the stock PL011 shape the translator's
-;; #x0300/#x0301 emitters assume.  Deliberately NOT the mini UART
-;; (0x3F215040 / width 2 / tx-poll '(#x14 5 :tbz)) that build-rpi-periph uses:
-;; the mini UART can transmit but `read-char-serial' has no RX-poll parameter
-;; and is hardcoded to PL011's UARTFR+0x18/RXFE-bit-4, so a mini-UART REPL
-;; could print but never read.  See the header.
-(setf *aarch64-serial-base* #x3F201000)
-(setf *aarch64-serial-width* 0)
-(setf *aarch64-serial-tx-poll* nil)
+;; CONSOLE SELECTION.  Two different boards, two different UARTs:
+;;
+;;   QEMU raspi3b (SD-card / -kernel path)  -> PL011 UART0 at 0x3F201000,
+;;     which is what QEMU wires to serial0.
+;;   REAL Pi Zero 2 W (UART chain-load)     -> BCM2835 mini UART at 0x3F215040.
+;;     On a Pi Zero 2 W the PL011 is routed to Bluetooth and the mini UART owns
+;;     GPIO14/15, so an image that writes PL011 transmits into the Bluetooth
+;;     modem and the wires stay SILENT.
+;;
+;; That difference is invisible under emulation and cost a full 88-minute
+;; chain-load cycle to notice: the loader's own BOOT/RDY/AD:/SZ: arrive over
+;; the mini UART (proving the pins), yet the image we hand control to was
+;; built for PL011, so a PERFECTLY SUCCESSFUL chain-load would look exactly
+;; like a dead transfer.
+;;
+;; The old comment here said the mini UART "could print but never read"
+;; because `read-char-serial' hardcoded PL011's UARTFR+0x18/RXFE-bit-4.  That
+;; is FIXED (1e84418): the RX ready-poll is now parameterized via
+;; *aarch64-serial-rx-poll*, exactly mirroring the TX side.
+(defvar *rpi-cl-miniuart*
+  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_RPI_MINIUART")))
+    (if (and v (plusp (length v)))
+        (not (string= v "0"))
+        ;; Default: follow the chain-load flag, because chain-loading is the
+        ;; real-hardware path and SD/QEMU is the PL011 path.
+        *rpi-cl-chainload*))
+  "T => target the BCM2835 mini UART (real Pi Zero 2 W).  NIL => PL011 (QEMU).")
+
+(if *rpi-cl-miniuart*
+    (progn
+      ;; AUX mini UART: AUX_MU_IO at base+0, AUX_MU_LSR at base+0x14.
+      ;; TX: wait while LSR bit 5 (transmitter empty) is CLEAR.
+      ;; RX: wait while LSR bit 0 (data ready)        is CLEAR.
+      ;; AUX registers require 32-bit access, hence width 2.
+      (setf *aarch64-serial-base* #x3F215040)
+      (setf *aarch64-serial-width* 2)
+      (setf *aarch64-serial-tx-poll* '(#x14 5 :tbz))
+      (setf *aarch64-serial-rx-poll* '(#x14 0 :tbz))
+      (format t "~&;; CONSOLE: BCM2835 mini UART 0x3F215040 (real Pi Zero 2 W)~%"))
+    (progn
+      (setf *aarch64-serial-base* #x3F201000)
+      (setf *aarch64-serial-width* 0)
+      (setf *aarch64-serial-tx-poll* nil)
+      (setf *aarch64-serial-rx-poll* '(#x18 4 :tbnz))
+      (format t "~&;; CONSOLE: PL011 UART0 0x3F201000 (QEMU raspi3b)~%")))
 
 ;; No GICv2 on a BCM2837, and nothing here needs interrupts (the REPL polls
 ;; the UART), so leave *aarch64-setup-irq-enable* NIL — the QEMU-virt bare

@@ -148,7 +148,11 @@ Now the harness:
 - Writes one "+" byte per pass to stdout immediately (no buffering,
   survives any later crash); the summary counts those bytes.
 
-Build: `sbcl --dynamic-space-size 2048 --script mvm/build-x64-linux.lisp`
+Build: `sbcl --dynamic-space-size 12288 --script mvm/build-x64-linux.lisp`
+(2048 was enough historically; the assembled blob is now ~17.6 MB and 2 GB
+dies with an SBCL HEAP-EXHAUSTED-ERROR partway through BUILD-IMAGE.  Always
+set `MODUS_ANSI_OUT` too — the default path is outside the worktree and two
+concurrent builds overwrite each other.)
 Run with summary: `./scripts/ansi-summary.sh` (runs binary, prints honest pass/fail/lost counts)
 
 ### CL Implementation Status

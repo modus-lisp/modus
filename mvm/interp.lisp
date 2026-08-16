@@ -1287,22 +1287,50 @@
                        (tag-fixnum (ash (untag-fixnum (reg-get regs vs)) amt)))
                  (setf pc npc3)))))
 
-          (#.+op-shr+ ; logical shift right
+          ;; SHR / SAR ARE WORD-LEVEL, exactly as the native translators
+          ;; implement them.  They shift the TAGGED WORD, not the fixnum value.
+          ;;
+          ;; This used to untag, shift the VALUE, and re-tag.  That round trip
+          ;; discards bit 0, so it was LOSSY in precisely the case the compiler
+          ;; relies on: `(:sar Vd Vd +fixnum-shift+)` is the UNTAG idiom (see
+          ;; compile-make-array-raw, compile-make-string-array, and ~7 further
+          ;; sites that emit `:shr Vd Vd +fixnum-shift+`).  A tagged fixnum's
+          ;; word is 2n — always even — so a word-level shift recovers n
+          ;; EXACTLY for every n, odd or even; the old value-level form yielded
+          ;; 2*(n>>1), i.e. n-1 for odd n.  That was the residual left by the
+          ;; alloc-array/alloc-string fix: (make-array 1001) built 1000.
+          ;;
+          ;; The obvious objection — "won't word-level shifts break (ash v k)?"
+          ;; — does not hold, and it is why this was not fixed sooner.  Reading
+          ;; the shift in isolation says yes: 2v>>1 = v is an ODD word for odd
+          ;; v, an invalid tagged fixnum.  But compile-ash does not stop there:
+          ;; its right-shift path emits `:sar` AND THEN MASKS the low tag bit
+          ;; with -2, restoring a valid word.  Measured, native and interpreted
+          ;; agree and are correct: (ash 9 -1) = 4 both ways.  The sequence is
+          ;; what has to be read, not the opcode.
+          ;;
+          ;; The general principle: the interpreter is a REFERENCE
+          ;; implementation of this ISA.  Being "more correct" than the
+          ;; translators is itself a divergence — it silently papers over
+          ;; compiler bugs while introducing its own.  Faithfulness first;
+          ;; if a faithful interpreter exposes a wrong answer, that is a
+          ;; compiler bug to fix at the source.
+          (#.+op-shr+ ; logical shift right — word-level
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
                (multiple-value-bind (amt npc3) (fetch-byte bc npc2)
-                 (let* ((u (untag-fixnum (reg-get regs vs)))
-                        (shifted (if (>= u 0) (ash u (- amt))
-                                     (ash (logand u #xFFFFFFFFFFFFFFFF) (- amt)))))
-                   (reg-set regs vd (tag-fixnum shifted)))
+                 (let ((w (reg-get regs vs)))
+                   (reg-set regs vd
+                            (if (>= w 0)
+                                (ash w (- amt))
+                                (ash (logand w #xFFFFFFFFFFFFFFFF) (- amt)))))
                  (setf pc npc3)))))
 
-          (#.+op-sar+ ; arithmetic shift right
+          (#.+op-sar+ ; arithmetic shift right — word-level
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
                (multiple-value-bind (amt npc3) (fetch-byte bc npc2)
-                 (reg-set regs vd
-                       (tag-fixnum (ash (untag-fixnum (reg-get regs vs)) (- amt))))
+                 (reg-set regs vd (ash (reg-get regs vs) (- amt)))
                  (setf pc npc3)))))
 
           (#.+op-shlv+ ; shift left by register

@@ -1496,11 +1496,39 @@
           ;; %alloc-native; slot access via the native %prim-aref/%prim-aset/
           ;; %prim-array-length (which run natively, not back through here).  So
           ;; these objects cross the native bridge to real CL functions.
+          ;; ALLOC-ARRAY / ALLOC-STRING take an **UNTAGGED** element count.
+          ;; That is the ISA contract the compiler emits for and the native
+          ;; translators implement — translate-x64.lisp says so outright:
+          ;;   "Vcount: UNTAGGED element count (compiler SAR'd it)"
+          ;; compile-make-array-1d / compile-make-string-array either
+          ;;   (:li Vd N)                      for a large constant, or
+          ;;   (compile-form N) (:sar Vd Vd 1) for a variable,
+          ;; so the register ALREADY holds the raw count.
+          ;;
+          ;; Applying %WORD->VAL here untagged it a SECOND time and silently
+          ;; built an array of HALF the requested size.  Measured on hardware:
+          ;;   (make-array 1000)                  -> 1000   (imm path, ok)
+          ;;   (make-array 65536)                 -> 32768  (halved)
+          ;;   (make-array 65537)                 -> TYPE-ERROR (odd raw count
+          ;;                                          has bit0 set, so it read
+          ;;                                          as a non-fixnum tag)
+          ;;   (let ((n 1000)) (make-array n))    -> 500    (halved)
+          ;; build-cli-common.lisp bakes lib/tar.lisp + install-tarball.lisp
+          ;; specifically to route around this: %tar-slice's (make-array LEN)
+          ;; truncated every >512-byte tar entry, and a runtime (load) of
+          ;; sha1.lisp came back 7311 -> 3655 bytes.
+          ;;
+          ;; NOTE the residual: for a VARIABLE odd count this interpreter's
+          ;; :sar is (tag-fixnum (ash (untag-fixnum w) -1)), which drops bit 0,
+          ;; so an odd n still allocates n-1.  Fixing that means making the
+          ;; untag lossless (a dedicated :untag op, or tagged alloc operands
+          ;; like :alloc-u8 already uses) and touches native codegen, so it is
+          ;; deliberately NOT bundled here.
           (#.+op-alloc-array+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vcount npc2) (fetch-reg bc npc)
                (reg-set regs vd (%val->word
-                                 (make-array (%word->val (reg-get regs vcount))
+                                 (make-array (reg-get regs vcount)
                                              :initial-element nil)))
                (setf pc npc2))))
 
@@ -1508,7 +1536,7 @@
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
                (reg-set regs vd (%val->word
-                                 (make-string (%word->val (reg-get regs vs))
+                                 (make-string (reg-get regs vs)
                                               :initial-element #\Space)))
                (setf pc npc2))))
 

@@ -2378,7 +2378,12 @@
   (setq *%sig-type-error-sym* 'type-error)
   (setq *%sig-program-error-sym* 'program-error)
   (setq *%sig-undefined-function-sym* 'undefined-function)
-  (setq *%sig-simple-error-sym* 'simple-error))
+  (setq *%sig-simple-error-sym* 'simple-error)
+  ;; Zero the %SIGNAL-* reentrancy latch.  MANDATORY on bare metal: the slot
+  ;; is raw RAM that nothing clears at reset, and a stale non-zero value would
+  ;; make the very first signal look like a reentry.  (%sig-reentry-depth also
+  ;; clamps out-of-range garbage, so the two together fail open.)
+  (setf (mem-ref #x10000C68 :u64) 0))
 
 (defun %interp-fault-condition ()
   "Build and PUBLISH (as *CURRENT-CONDITION*) a condition standing for a
@@ -2410,15 +2415,67 @@
     (setq *current-condition* c)
     c))
 
+;;; --- Reentrancy latch for the %SIGNAL-* helpers -----------------------------
+;;;
+;;; WHY A RAW SLOT AND NOT A SPECIAL.  Every %SIGNAL-* helper below reads a
+;;; special (*%sig-TYPE-sym*) to fill slot 0 of the condition.  Reading a
+;;; special is SYMBOL-VALUE, and since the globals store became a hash-table
+;;; (8953c39) SYMBOL-VALUE calls GETHASH.  So a type error raised INSIDE
+;;; GETHASH re-enters %SIGNAL-TYPE-ERROR, which reads the special again, which
+;;; calls GETHASH again — an unbounded 3-cycle.  A latch held in a special
+;;; would recurse identically; it has to be reachable without a hash lookup,
+;;; hence a raw memory slot.  Slot #x10000C68 is free (between cl-clos's
+;;; budget at C60 and the aa64 deadline tick at C70).
+;;;
+;;; MEASURED, not hypothetical (task #263, bare-metal RPi loading alexandria):
+;;; frame-chain walk at the wedge showed 27x GETHASH / 27x SYMBOL-VALUE /
+;;; 26x %SIGNAL-TYPE-ERROR in a perfect repeating cycle.  With no stack guard
+;;; (MMU off) SP descended from 0x08000000 to 0x6d52f8 — ~121 MB — writing
+;;; frame spills straight through the kernel's own code section (13,859 of
+;;; 106,496 slots in a 458 KB window differed from the image file), until
+;;; execution reached code the stack had already overwritten and took an
+;;; undefined-instruction fault.  On bare metal that is unrecoverable, so ANY
+;;; type error raised from inside GETHASH or SYMBOL-VALUE destroyed the
+;;; machine.  This latch bounds the recursion; it does not fix the bad hash
+;;; bucket that starts it (that is the open half of #263).
+
+(defun %sig-reentry-depth ()
+  "Current %SIGNAL-* nesting depth, from the raw latch slot.
+
+   FAILS OPEN BY DESIGN.  The slot is uninitialised RAM on bare metal and a
+   wild store can land on it.  A garbage value must not silently suppress
+   every type error in the image, so anything out of range reads as 0 —
+   signalling keeps working and we lose only the guard."
+  (let ((d (mem-ref #x10000C68 :u64)))
+    (if (if (< d 0) t (> d 32)) 0 d)))
+
+(defun %sig-reentry-enter ()
+  "Bump the latch; answer T when we are already inside a %SIGNAL-* helper."
+  (let ((d (%sig-reentry-depth)))
+    (setf (mem-ref #x10000C68 :u64) (+ d 1))
+    (if (> d 0) t nil)))
+
+(defun %sig-reentry-leave ()
+  "Drop the latch one level.  Called on the NON-longjmp path and immediately
+   before %HC-LONGJMP (which never returns), so the depth is always restored."
+  (let ((d (%sig-reentry-depth)))
+    (setf (mem-ref #x10000C68 :u64) (if (> d 0) (- d 1) 0))))
+
 (defun %signal-program-error ()
   "Runtime helper: signal a PROGRAM-ERROR condition for handler-case.
    Used by the compiler for arity errors. Sidesteps make-condition,
    which has a complex slot-collection path that's been flaky."
-  (let ((c (make-array 2)))
-    (aset c 0 *%sig-program-error-sym*)
-    (aset c 1 nil)
-    (setq *current-condition* c)
-    (if (%error-handler-active-p) (%hc-longjmp) nil)))
+  (if (%sig-reentry-enter)
+      ;; Reentry: building this condition is itself signalling.  Return NIL
+      ;; (the established no-handler contract — callers are all shaped
+      ;; `(progn (%signal-...) nil)') rather than recurse.
+      (progn (%sig-reentry-leave) nil)
+      (let ((c (make-array 2)))
+        (aset c 0 *%sig-program-error-sym*)
+        (aset c 1 nil)
+        (setq *current-condition* c)
+        (%sig-reentry-leave)
+        (if (%error-handler-active-p) (%hc-longjmp) nil))))
 
 (defun %signal-type-error ()
   "Runtime helper: signal a TYPE-ERROR condition for handler-case.
@@ -2426,22 +2483,31 @@
    type (e.g. negative index to elt, non-list to nthcdr).
    See %init-signal-symbols for why we read the symbol from a slot
    instead of `(aset c 0 'type-error)'."
-  (let ((c (make-array 2)))
-    (aset c 0 *%sig-type-error-sym*)
-    (aset c 1 nil)
-    (setq *current-condition* c)
-    (if (%error-handler-active-p) (%hc-longjmp) nil)))
+  (if (%sig-reentry-enter)
+      ;; Reentry — see the latch block above.  This is the one that killed the
+      ;; bare-metal Pi: GETHASH type-errors, we read *%sig-type-error-sym*,
+      ;; SYMBOL-VALUE calls GETHASH, repeat until the stack has eaten the kernel.
+      (progn (%sig-reentry-leave) nil)
+      (let ((c (make-array 2)))
+        (aset c 0 *%sig-type-error-sym*)
+        (aset c 1 nil)
+        (setq *current-condition* c)
+        (%sig-reentry-leave)
+        (if (%error-handler-active-p) (%hc-longjmp) nil))))
 
 (defun %signal-undefined-function ()
   "Runtime helper: signal UNDEFINED-FUNCTION.  Used by compile-funcall's
    NIL-guard so (funcall NIL ...) becomes a clean condition signal
    instead of a faulting indirect-call to NIL (or NIL-3 after
    function-pointer tagging — see TAG-PLAN.md)."
-  (let ((c (make-array 2)))
-    (aset c 0 *%sig-undefined-function-sym*)
-    (aset c 1 nil)
-    (setq *current-condition* c)
-    (if (%error-handler-active-p) (%hc-longjmp) nil)))
+  (if (%sig-reentry-enter)
+      (progn (%sig-reentry-leave) nil)
+      (let ((c (make-array 2)))
+        (aset c 0 *%sig-undefined-function-sym*)
+        (aset c 1 nil)
+        (setq *current-condition* c)
+        (%sig-reentry-leave)
+        (if (%error-handler-active-p) (%hc-longjmp) nil))))
 
 ;;; --- Initialize standard packages ---
 

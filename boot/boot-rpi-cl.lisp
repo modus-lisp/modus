@@ -136,20 +136,126 @@
 ;;; ============================================================
 ;;; Image layout:  boot 0x000 | vectors 0x800 | native 0x1000
 
-(defun emit-rpi-cl-exception-vectors (buf)
+;;; --- Sync-fault reporter -----------------------------------------------------
+;;;
+;;; WHY THIS EXISTS (task #263).  Every vector entry used to be `B .', so ANY
+;;; hardware fault froze the board with ZERO output.  That is exactly what the
+;;; alexandria wedge looked like for several sessions: 100% CPU, no bytes, and
+;;; a very convincing story about "an infinite loop in the compiler".  It was
+;;; an undefined-instruction fault (ESR EC=0) landing on this table.  Silence
+;;; is the expensive part — a fault that PRINTS is a bug you fix in an hour.
+;;;
+;;; The QEMU-virt image's entry 4 recovers via a handler-case longjmp.  That is
+;;; deliberately NOT what this does.  Recovery needs a trustworthy Lisp heap,
+;;; and the faults seen here happen precisely when the heap or the code has
+;;; already been damaged; resuming would launder a corrupt machine into a
+;;; plausible-looking one.  This REPORTS and HALTS.
+;;;
+;;; Registers are read at EL2 (this image runs at EL2 — see the VBAR_EL1 *AND*
+;;; VBAR_EL2 note in emit-rpi-cl-entry; the EL1 copies read 0).
+
+(defun emit-rpi-cl-putc-poll (buf miniuart)
+  "TX one byte from W0 through the console in X17.  3 instructions.
+   Poll polarity differs per UART: PL011 FR bit5 = TX-FULL (wait WHILE set);
+   mini-UART LSR bit5 = TX-EMPTY (wait UNTIL set)."
+  (if miniuart
+      (progn
+        (emit-aarch64-u32 buf #xB9401629)   ; LDR  W9,[X17,#0x14]  AUX_MU_LSR
+        (emit-aarch64-u32 buf #x362FFFE9))  ; TBZ  W9,#5,-1        wait til empty
+      (progn
+        (emit-aarch64-u32 buf #xB9401A29)   ; LDR  W9,[X17,#0x18]  UARTFR
+        (emit-aarch64-u32 buf #x372FFFE9))) ; TBNZ W9,#5,-1        wait til !full
+  (emit-aarch64-u32 buf #xB9000220))        ; STR  W0,[X17]
+
+(defun emit-rpi-cl-putc-imm (buf ch miniuart)
+  "Emit one literal character.  4 instructions."
+  (emit-aarch64-u32 buf (logior #xD2800000 (ash (logand ch #xFFFF) 5) 0)) ; MOVZ X0,#ch
+  (emit-rpi-cl-putc-poll buf miniuart))
+
+(defun emit-rpi-cl-puthex64 (buf miniuart)
+  "Print X10 as 16 hex digits, MSB first.  X11 = shift, X12 = 15 (preset by
+   the caller).  12 instructions, no calls — a BL here would clobber the very
+   X30 we may want to read."
+  (emit-aarch64-u32 buf #xD280078B)         ; MOVZ X11,#60
+  ;; L:
+  (emit-aarch64-u32 buf #x9ACB2540)         ; LSRV X0,X10,X11
+  (emit-aarch64-u32 buf #x8A0C0000)         ; AND  X0,X0,X12      (X12=15)
+  (emit-aarch64-u32 buf #xF100241F)         ; CMP  X0,#9
+  ;; B.HI must skip BOTH the digit ADD and the B that jumps over the letter
+  ;; ADD, i.e. +3 — not +2.  At +2 it lands on the B itself, the letter branch
+  ;; is unreachable, and every nibble above 9 prints as a raw control byte.
+  ;; Caught by disassembling the built image; the encoding looked fine on paper.
+  (emit-aarch64-u32 buf #x54000068)         ; B.HI +3             (>9 -> letter)
+  (emit-aarch64-u32 buf #x9100C000)         ; ADD  X0,X0,#48      '0'
+  (emit-aarch64-u32 buf #x14000002)         ; B    +2
+  (emit-aarch64-u32 buf #x91015C00)         ; ADD  X0,X0,#87      'a'-10
+  (emit-rpi-cl-putc-poll buf miniuart)      ; 3 instructions
+  (emit-aarch64-u32 buf #xF100116B)         ; SUBS X11,X11,#4
+  (emit-aarch64-u32 buf #x54FFFEAA))        ; B.GE -11            -> L
+
+(defun emit-rpi-cl-sync-fault-handler (buf miniuart)
+  "Body of the sync-exception reporter.  Lives in the entry-8..15 slots (lower-EL
+   vectors, which this image can never take: it runs at EL2 with nothing below
+   it).  Same trick the QEMU-virt image uses for its entry-7/8 continuations."
+  ;; X17 = console data register.
+  (emit-aarch64-load-imm64 buf 17 (if miniuart #x3F215040 +rpi-cl-pl011-base+))
+  (emit-aarch64-u32 buf #xD28001EC)         ; MOVZ X12,#15   (nibble mask)
+  (dolist (ch '(10 33 33 70 65 85 76 84 32)) ; "\n!!FAULT "
+    (emit-rpi-cl-putc-imm buf ch miniuart))
+  ;; ESR_EL2 — the fault class.  EC=0 means undefined instruction, which on
+  ;; this platform means we executed data (see #263).
+  (emit-rpi-cl-putc-imm buf 69 miniuart)    ; 'E'
+  (emit-aarch64-u32 buf #xD53C520A)         ; MRS X10,ESR_EL2
+  (emit-rpi-cl-puthex64 buf miniuart)
+  (emit-rpi-cl-putc-imm buf 32 miniuart)
+  ;; ELR_EL2 — the faulting PC.  Subtract the image base to index the symmap.
+  (emit-rpi-cl-putc-imm buf 76 miniuart)    ; 'L'
+  (emit-aarch64-u32 buf #xD53C402A)         ; MRS X10,ELR_EL2
+  (emit-rpi-cl-puthex64 buf miniuart)
+  (emit-rpi-cl-putc-imm buf 32 miniuart)
+  ;; FAR_EL2 — the faulting data address (0 for an undefined instruction).
+  (emit-rpi-cl-putc-imm buf 70 miniuart)    ; 'F'
+  (emit-aarch64-u32 buf #xD53C600A)         ; MRS X10,FAR_EL2
+  (emit-rpi-cl-puthex64 buf miniuart)
+  (emit-rpi-cl-putc-imm buf 32 miniuart)
+  ;; SP — the giveaway for the failure mode that started all this: if SP is
+  ;; inside the image rather than below 0x08000000, the stack has run away and
+  ;; is overwriting the kernel.
+  (emit-rpi-cl-putc-imm buf 83 miniuart)    ; 'S'
+  (emit-aarch64-u32 buf #x910003EA)         ; MOV X10,SP
+  (emit-rpi-cl-puthex64 buf miniuart)
+  (emit-rpi-cl-putc-imm buf 10 miniuart)    ; '\n'
+  (emit-aarch64-u32 buf #x14000000))        ; B .  — halt, do NOT resume
+
+(defun emit-rpi-cl-exception-vectors (buf &optional (miniuart nil))
   "16 entries x 32 instructions = 2 KB at image offset 0x800.
 
-   All entries are `B .' (spin).  The QEMU-virt bare image gives entry 4 a
-   sync-exception -> handler-case longjmp (its SIGSEGV-recovery equivalent)
-   and entry 5 a vtimer deadline IRQ; neither is ported yet.  Consequence,
-   stated plainly: a HARDWARE fault on the Pi wedges the machine instead of
-   surfacing as a recovered Lisp error.  Ordinary Lisp errors are signalled
-   in software and unwind through handler-case normally, so E2SMOKE and the
-   REPL's own error recovery are unaffected."
-  (dotimes (entry 16)
-    (declare (ignorable entry))
-    (emit-aarch64-u32 buf #x14000000)                      ; B .
-    (dotimes (i 31) (emit-aarch64-u32 buf #xD503201F))))   ; NOP x31
+   Entry 4 (Current EL, SP_ELx, Sync) branches to a reporter that prints
+   ESR/ELR/FAR/SP and halts; the reporter body occupies the entry-8..15 slots
+   (lower-EL vectors, unreachable on this image).  Everything else is still
+   `B .' — an IRQ or SError here has no meaning yet.
+
+   BEFORE THIS, a hardware fault froze the board with no output at all, which
+   is how #263 masqueraded as a compiler hang for several sessions."
+  (dotimes (entry 8)
+    (cond
+      ((= entry 4)
+       ;; B forward to the entry-8 slot: 4 entries x 32 instructions.
+       (emit-aarch64-u32 buf (logior #x14000000 128))
+       (dotimes (i 31) (emit-aarch64-u32 buf #xD503201F)))
+      (t
+       (emit-aarch64-u32 buf #x14000000)                    ; B .
+       (dotimes (i 31) (emit-aarch64-u32 buf #xD503201F)))))
+  ;; Entries 8..15 = 256 instruction slots: reporter + NOP padding.  The
+  ;; assert is the point — silently overrunning into whatever follows the
+  ;; vector table would be a far worse bug than the one being fixed.
+  (let ((before (a64-buffer-position buf)))
+    (emit-rpi-cl-sync-fault-handler buf miniuart)
+    (let ((used (- (a64-buffer-position buf) before)))
+      (when (> used 256)
+        (error "rpi-cl sync-fault handler is ~D instructions; only 256 fit ~
+                in the entry-8..15 slots" used))
+      (dotimes (i (- 256 used)) (emit-aarch64-u32 buf #xD503201F)))))
 
 (defun emit-rpi-cl-entry (buf)
   "Emit the Pi 3B CL-lineage boot preamble (MMU off, identity addressing)."
@@ -284,7 +390,9 @@
         (dotimes (i pad) (emit-aarch64-u32 buf #xD503201F))))
 
     ;; --- 8. Exception vectors at 0x800, native code follows at 0x1000 ----
-    (emit-rpi-cl-exception-vectors buf)))
+    ;; Pass the console selection so the fault reporter polls the right UART
+    ;; (same test as step 2 — mini-UART on a Zero 2 W, PL011 under QEMU).
+    (emit-rpi-cl-exception-vectors buf (= *aarch64-serial-base* #x3F215040))))
 
 ;;; ============================================================
 ;;; Descriptor

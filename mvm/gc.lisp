@@ -307,6 +307,40 @@
   (setf (mem-ref #x10000E18 :u64) (%mmap-exec-page #x800000))
   (setf (mem-ref #x10000E40 :u64) (%mmap-exec-page #x800000)))
 
+(defun %gc-bit-mask (bit)
+  "1 << BIT for BIT in 0..7, as a CONSTANT-ONLY dispatch.
+
+   MUST NOT be written (ash 1 bit).  compile-ash routes a VARIABLE shift count
+   — of ANY magnitude — to a runtime BIGNUM-ASH call (see compile-ash's final
+   `t' arm), and BIGNUM-ASH's positive-count path conses: %any-to-limbs builds
+   a sign/limb list and %make-bb allocates the result.  Every caller of this
+   function runs INSIDE %gc-collect, where the alloc pointer is still at/over
+   the limit, so ONE cons re-trips :gc-check and re-enters the collector.
+
+   MEASURED (RPi bare metal, #160 bitmaps on, Lisp-side collector): unbounded
+   %gc-collect recursion.  The phase trace printed '1' 1835 times with no '2'
+   — re-entry from the first %gc-is-start inside %gc-scan-stack — then, once
+   the recursion had driven SP below %gc-collect's own 0x07200000 window check,
+   '1S2' 12600 times (stack scan skipped, so re-entry moved to the first
+   %gc-is-start inside %gc-scan-globals).  SP finally ran 115 MB down from
+   0x08000000 into the image at 0x011F7960, overwrote code, and the sync-fault
+   reporter caught the resulting undefined instruction (ESR EC=0, FAR=0).
+
+   This is the invariant already stated for the word-access layer above (\"all
+   shift counts are <= 30 ... so nothing routes through BIGNUM-ASH\").  The
+   bitmap helpers were written for the targets whose collector is the NATIVE
+   trampoline (*aarch64-gc-native-mcgc*, x64 gc_trampoline), where they are
+   dead code and the shift is a hand-written LSLV — so nothing exercised them
+   until an image running the LISP collector turned the bitmaps on."
+  (if (= bit 0) 1
+      (if (= bit 1) 2
+          (if (= bit 2) 4
+              (if (= bit 3) 8
+                  (if (= bit 4) 16
+                      (if (= bit 5) 32
+                          (if (= bit 6) 64
+                              128))))))))
+
 (defun %gc-mark-start (raw-addr)
   "Set the object-start bit for the object whose raw byte address is RAW-ADDR."
   (let ((bmp (%gc-bitmap-base)))
@@ -316,7 +350,7 @@
                (byte-addr (+ bmp (ash gran -3)))
                (bit (logand gran 7)))
           (setf (mem-ref byte-addr :u8)
-                (logior (mem-ref byte-addr :u8) (ash 1 bit)))))))
+                (logior (mem-ref byte-addr :u8) (%gc-bit-mask bit)))))))
 
 (defun %gc-is-start (raw-addr)
   "T if RAW-ADDR is a recorded object start.  When the bitmap is off
@@ -327,7 +361,7 @@
         (let* ((gran (ash (- raw-addr (%gc-bitmap-page-base)) -4))
                (byte-addr (+ bmp (ash gran -3)))
                (bit (logand gran 7)))
-          (if (= (logand (mem-ref byte-addr :u8) (ash 1 bit)) 0) nil t)))))
+          (if (= (logand (mem-ref byte-addr :u8) (%gc-bit-mask bit)) 0) nil t)))))
 
 (defun %gc-mark-cons (raw-addr)
   "Set the CONS-KIND bit for the 16-byte cons whose raw byte address is RAW-ADDR
@@ -340,7 +374,7 @@
                (byte-addr (+ bmp (ash gran -3)))
                (bit (logand gran 7)))
           (setf (mem-ref byte-addr :u8)
-                (logior (mem-ref byte-addr :u8) (ash 1 bit)))))))
+                (logior (mem-ref byte-addr :u8) (%gc-bit-mask bit)))))))
 
 (defun %gc-is-cons-granule (raw-addr)
   "T if RAW-ADDR is a recorded CONS start (cons-kind bit set)."
@@ -350,7 +384,7 @@
         (let* ((gran (ash (- raw-addr (%gc-bitmap-page-base)) -4))
                (byte-addr (+ bmp (ash gran -3)))
                (bit (logand gran 7)))
-          (if (= (logand (mem-ref byte-addr :u8) (ash 1 bit)) 0) nil t)))))
+          (if (= (logand (mem-ref byte-addr :u8) (%gc-bit-mask bit)) 0) nil t)))))
 
 (defun %gc-leaf-subtag-p (subtag)
   "T if an object of SUBTAG has a RAW-DATA payload (no Lisp pointers) — the

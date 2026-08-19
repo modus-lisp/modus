@@ -1103,9 +1103,11 @@
   ;; collector overwriting its own saved_rsp (tell: phase trace 12345 -> 1S2345).
   ;;
   ;; Fixed RAM instead of mmap.  1 bit / 16-byte granule over the 112 MB heap =
-  ;; 0x07000000/128 = 0xE0000 bytes (896 KB) per bitmap.  Placed at 32 MB, which
-  ;; clears the ~21 MB image with room to grow and sits ~96 MB below the stack
-  ;; top; both bounds are asserted at build time.  MUST run before the first
+  ;; 0x07000000/128 = 0xE0000 bytes (896 KB) per bitmap.  Placed at 80 MB
+  ;; (0x05000000 / 0x05100000), which clears the image — note the image is
+  ;; ~54 MB with the bit-set emitted inline at every alloc site, NOT the ~21 MB
+  ;; of a bitmap-off build — and sits ~46 MB below the stack top; both bounds
+  ;; are asserted at build time.  MUST run before the first
   ;; allocation (init-symbol-table, just below) so every mutator alloc records
   ;; its start bit, and after %gc-init because page_base is read from from_start.
   ;;
@@ -1710,7 +1712,7 @@
       (when (>= image-va-end heap-base)
         (error "BUILD-TIME ASSERT: image end ~X reached the heap base ~X."
                image-va-end heap-base))
-      ;; #160 bitmaps live at 0x02000000 / 0x02100000, 0xE0000 bytes each
+      ;; #160 bitmaps live at 0x05000000 / 0x05100000, 0xE0000 bytes each
       ;; (1 bit / 16-byte granule over the 112 MB heap).  They must clear the
       ;; image below and the stack above; both are checked here rather than
       ;; discovered as heap corruption at runtime.  Keep in step with the

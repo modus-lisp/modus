@@ -69,6 +69,8 @@
 
 (defun %gc-is-forward (val)
   "Check if VAL is a forwarding pointer (low 4 bits = 1111).
+   SUPERSEDED inside the collector by %gc-is-forward-lo, which tests the low
+   32-bit half and so can never see a promoted word at all.
    #160/linux: guard on FIXNUMP first.  %gc-read64 returns the raw 64-bit word
    as a Lisp integer; a word >= most-positive-fixnum (2^62) — common on Linux
    where the stack/heap hold high-bit machine words — is a BIGNUM, and
@@ -80,6 +82,7 @@
 
 (defun %gc-is-pointer (val)
   "Check if VAL is a heap pointer (cons or object).
+   SUPERSEDED inside the collector by %gc-is-pointer-lo / %gc-cand-addr.
    #160/linux: guard on FIXNUMP first (see %gc-is-forward).  A genuine cons/
    object pointer into the heap (address ~2^47) is fixnum-range; a raw word that
    promoted to a BIGNUM (>= 2^62) is never such a pointer, and running
@@ -104,46 +107,157 @@
 ;;; using mem-ref, we need to convert: tagged_addr = raw_addr * 2.
 ;;; mem-ref does SHR 1 internally to get the real address.
 
+;;; ------------------------------------------------------------
+;;; EXACT machine-word access — the :u64 HALVING DEFECT and its fix
+;;; ------------------------------------------------------------
+;;; *** MEASURED (aarch64 bare metal, 2026-08; originally seen on i386):
+;;; (mem-ref A :u64) does NOT return the machine word at A.  memory-width-code
+;;; returns needs-tag NIL for :u64, so the loaded word is left in the vreg
+;;; UNTAGGED and every later Lisp operation reads it as a TAGGED value — the
+;;; integer you get back is word/2.  Proven against physical memory with gdb:
+;;; 0x10000040 (from_start) physically holds 0x12000000 while the collector
+;;; must and does use 0x09000000.
+;;;
+;;; This is NOT an i386-only footnote (the old docstring here claimed x64 and
+;;; aarch64 "use native trampolines instead" — FALSE for aarch64: its GC
+;;; trampoline is a register-saving shim that CALLS this Lisp %gc-collect, so
+;;; every bare-metal Pi/virt image runs this code).  Two consequences:
+;;;
+;;;   - A cons/object pointer word has low nibble 1 or 9, i.e. is ODD.  Halved,
+;;;     it lands as a POINTER, not a fixnum, so (fixnump val) is false and
+;;;     %gc-is-pointer / %gc-is-forward returned NIL for exactly the words a
+;;;     collector exists to forward.  The candidate was rejected BEFORE the
+;;;     object-start gate was ever consulted — %gc-forward-slot logged 0
+;;;     declines while roots went unforwarded (164 dead-space pointers left on
+;;;     the live stack after GC#1, 55 after GC#2).
+;;;   - Header decoding was off by the same factor: a header with true count 5
+;;;     and subtag #x32 decoded as count 2, subtag #x99.  (There are no
+;;;     compensating shifts anywhere in this file, so fixing the read also
+;;;     fixes header decoding — a real behavioural change, not a no-op.)
+;;;
+;;; THE FIX.  :u32 IS tagged (SHL 1 after a zero-extending load) and 32 bits
+;;; always fit a 64-bit target's fixnum, so a :u32 load is EXACT.  Read and
+;;; write machine words as two exact 32-bit halves, little-endian (lo at +0,
+;;; hi at +4 — every target running this collector is LE).
+;;;
+;;; ALLOCATION-FREE BY CONSTRUCTION.  %gc-collect must not allocate: a bignum
+;;; built here re-trips :gc-check and re-enters the collector (observable as
+;;; the phase trace printing "1234" forever with no "5").  So NO caller ever
+;;; materialises a 64-bit word: predicates take the LO half, word-to-word moves
+;;; go through %gc-move-word, header fields come from %gc-header-count, and the
+;;; single place halves are combined is %gc-cand-addr — which first REJECTS any
+;;; word with hi > 65535 (>= 2^48), a range no supported heap occupies, so the
+;;; combine is always fixnum-range.  All shift counts are <= 30 and all
+;;; literals < 2^24, so nothing routes through BIGNUM-ASH and nothing overflows
+;;; a 30-bit fixnum target either.
+
+(defun %gc-word-lo (raw-addr)
+  "Bits 0..31 of the machine word at byte address RAW-ADDR.  EXACT."
+  (mem-ref raw-addr :u32))
+
+(defun %gc-word-hi (raw-addr)
+  "Bits 32..63 of the machine word at byte address RAW-ADDR.  EXACT."
+  (mem-ref (+ raw-addr 4) :u32))
+
+(defun %gc-set-halves (raw-addr lo hi)
+  "Store the machine word whose halves are LO/HI at byte address RAW-ADDR."
+  (setf (mem-ref raw-addr :u32) lo)
+  (setf (mem-ref (+ raw-addr 4) :u32) hi))
+
+(defun %gc-move-word (src-addr dst-addr)
+  "Copy one machine word SRC-ADDR → DST-ADDR bit-exactly, without ever
+   materialising it as a Lisp integer (so it cannot promote to a bignum)."
+  (let ((lo (mem-ref src-addr :u32))
+        (hi (mem-ref (+ src-addr 4) :u32)))
+    (setf (mem-ref dst-addr :u32) lo)
+    (setf (mem-ref (+ dst-addr 4) :u32) hi)))
+
+(defun %gc-store-tagged (raw-addr addr tag)
+  "Store the machine word (ADDR | TAG) at byte address RAW-ADDR, as halves.
+   ADDR is a 16-byte-aligned raw byte address (always a Lisp fixnum here — it
+   is one of our own heap addresses); TAG is its low nibble (1 cons / 9 object
+   / 15 forwarding).  The high half is derived with two 16-bit shifts rather
+   than (ash addr -32) because compile-ash inlines :sar only for counts <= 30 —
+   a count of 32 would route through BIGNUM-ASH, which allocates."
+  (let* ((hi (ash (ash addr -16) -16))
+         (lo (- addr (* (* hi 65536) 65536))))
+    (setf (mem-ref raw-addr :u32) (logior lo tag))
+    (setf (mem-ref (+ raw-addr 4) :u32) hi)))
+
+(defun %gc-header-count (lo hi)
+  "Element count from an object header whose halves are LO/HI.  The count is
+   the header word >> 8, so it is (hi << 24) | (lo >> 8).  16777216 = 2^24 is
+   below every supported target's fixnum ceiling."
+  (if (= hi 0)
+      (ash lo -8)
+      (+ (* hi 16777216) (ash lo -8))))
+
+(defun %gc-is-forward-lo (lo)
+  "T if the machine word whose low half is LO is a forwarding pointer.
+   Only the low nibble matters, so the high half is irrelevant."
+  (= (logand lo 15) 15))
+
+(defun %gc-is-pointer-lo (lo)
+  "T if the machine word whose low half is LO carries a cons (1) or object (9)
+   tag.  Only the low nibble matters."
+  (let ((tag (logand lo 15)))
+    (if (= tag 1) t (if (= tag 9) t nil))))
+
+(defun %gc-cand-addr (lo hi from-start from-size)
+  "Tag-stripped byte address of the candidate machine word (LO,HI) when it is a
+   cons/object pointer INTO [FROM-START, FROM-START+FROM-SIZE); NIL otherwise.
+   This is the ONLY place the two halves are combined, and it rejects
+   hi > 65535 first: a word >= 2^48 is never a Modus heap pointer on any
+   supported target (bare metal sits below 2^32; hosted mmap heaps around
+   0x7dac_xxxx_xxxx have hi ~ 0x7dac), and combining one would build a BIGNUM —
+   an allocation inside the collector, which re-enters it.  Supersedes
+   %gc-in-space, which took an already-materialised word."
+  (if (%gc-is-pointer-lo lo)
+      (if (> hi 65535)
+          nil
+          (let ((addr (if (= hi 0)
+                          (logand lo (lognot 15))
+                          (+ (* (* hi 65536) 65536) (logand lo (lognot 15))))))
+            (if (< addr from-start)
+                nil
+                (if (>= addr (+ from-start from-size)) nil addr))))
+      nil))
+
+(defun %gc-tmp-free ()     (mem-ref #x10000108 :u64))
+(defun %gc-set-tmp-free (v) (setf (mem-ref #x10000108 :u64) v))
+
+;; TO-SPACE END, published by %gc-collect before any copying.  %gc-copy-object
+;; needs it to refuse a copy that would run off the top of to-space; it only
+;; receives the FROM-space geometry, and deriving to_end from it is fragile.
+(defun %gc-to-end ()      (mem-ref #x10000110 :u64))
+(defun %gc-set-to-end (v) (setf (mem-ref #x10000110 :u64) v))
+
 (defun %gc-read64 (raw-addr)
-  "Read one machine word from byte address RAW-ADDR.
-
-   *** MEASURED DEFECT (WS5/i386, 2026-07-31) — READ THIS BEFORE TRUSTING ANY
-   *** VALUE THIS FUNCTION RETURNS.
-   :u64 is RAW: memory-width-code returns needs-tag NIL for it, so the loaded
-   machine word is placed in the vreg UNTAGGED and every subsequent Lisp
-   operation reinterprets it as a TAGGED value.  The integer this function
-   yields is therefore word/2, not word.  Two consequences, both measured on
-   i386 (the first target to actually run this Lisp-side collector; x64 and
-   aarch64 use native trampolines instead):
-
-     - A cons/object pointer word has low nibble 1 or 9 and is therefore ODD,
-       so FIXNUMP is false for it.  %gc-is-pointer and %gc-is-forward both
-       guard on (fixnump val) and so return NIL for every real heap pointer:
-       nothing is ever forwarded.  Planted-word probe: 0x20000001 and
-       0x20000009 both report is-pointer = NIL.  Meanwhile an ordinary FIXNUM
-       whose value is 1 or 9 mod 16 IS accepted as a pointer — the only
-       candidates that get through are non-pointers.
-     - Header decoding is off by the same factor: for a header with true
-       count 5 and subtag #x32, (ash header -8) yields 2 and
-       (logand header #xFF) yields #x99.  ((ash header -7) happens to give the
-       true count, which is the tell.)
-
-   Nothing here is i386-specific; i386 merely exercised it.  A correct fix
-   gives this layer exact machine-word access (byte/halfword loads, composed
-   width- and endian-neutrally) or replaces the Lisp collector with a native
-   trampoline.  See mvm/build-i386-cli.lisp's collector-flag comment."
-  (mem-ref raw-addr :u64))
+  "DIAGNOSTIC ONLY — DO NOT CALL FROM INSIDE %gc-collect.
+   Returns the EXACT machine word at RAW-ADDR (composed from the two faithful
+   :u32 halves).  It is kept out of the collector because a word >= 2^62
+   promotes to a BIGNUM, i.e. allocates.  Historically this was
+   (mem-ref raw-addr :u64), which silently returned word/2 — see the block
+   comment above."
+  (let ((lo (mem-ref raw-addr :u32))
+        (hi (mem-ref (+ raw-addr 4) :u32)))
+    (if (= hi 0) lo (+ (* (* hi 65536) 65536) lo))))
 
 (defun %gc-write64 (raw-addr val)
-  "Write a 64-bit word VAL to byte address RAW-ADDR.
-   RAW-ADDR is a Lisp integer representing the byte address.
-   mem-ref handles the fixnum tagging internally."
-  (setf (mem-ref raw-addr :u64) val))
+  "DIAGNOSTIC ONLY — DO NOT CALL FROM INSIDE %gc-collect.
+   Writes VAL as the EXACT machine word at RAW-ADDR.  Historically this was
+   (setf (mem-ref raw-addr :u64) val), which deposited val*2; read and write
+   scaled together, so a round trip through the pair proved nothing (see the
+   probe-discipline note in the commit message)."
+  (let* ((hi (ash (ash val -16) -16))
+         (lo (- val (* (* hi 65536) 65536))))
+    (setf (mem-ref raw-addr :u32) lo)
+    (setf (mem-ref (+ raw-addr 4) :u32) hi)))
 
 (defun %gc-in-space (ptr space-start space-size)
-  "Check if tagged pointer PTR points into the space starting at
-   SPACE-START with size SPACE-SIZE. PTR is a raw tagged value;
-   the actual byte address is derived by stripping the tag."
+  "SUPERSEDED by %gc-cand-addr (which works on halves and never materialises a
+   word).  Kept for out-of-tree diagnostics.  Check if tagged pointer PTR
+   points into the space starting at SPACE-START with size SPACE-SIZE."
   (let ((raw-addr (logand ptr (lognot 15))))
     ;; raw-addr has tag bits cleared but is still in the 'divided by 2'
     ;; pointer space. For cons (tag 1): addr = ptr - 1 → ptr & ~15.
@@ -291,82 +405,144 @@
 ;;; Object Copying
 ;;; ============================================================
 
-(defun %gc-copy-object (ptr from-start from-size free-ptr)
-  "Copy the object at tagged PTR from from-space to to-space.
-   FROM-START and FROM-SIZE define the from-space boundaries.
+(defun %gc-copy-object (raw-addr tag from-start from-size free-ptr)
+  "Copy the object at byte address RAW-ADDR from from-space to to-space.
+   TAG is its tag nibble (1 = cons, 9 = headered object); RAW-ADDR is already
+   tag-stripped and range-checked by %gc-cand-addr — the caller never has to
+   materialise the 64-bit word, which is what keeps this allocation-free.
    FREE-PTR is the current free pointer in to-space (raw byte address).
-   Returns (new-tagged-value . new-free-ptr) packed as two values
-   stored at fixed temporaries since we can't allocate cons cells.
 
    Result stored at:
-     0x10000180: new tagged value
-     0x10000188: new free pointer (raw)"
-  (let ((tag (logand ptr 15)))
-    (cond
-      ;; Cons cell (tag = 1)
-      ((= tag 1)
-       (let ((raw-addr (- ptr 1)))   ; strip cons tag to get byte address
-         ;; Check if already forwarded
-         (let ((car-val (%gc-read64 raw-addr)))
-           (if (%gc-is-forward car-val)
-               ;; Already forwarded — extract new address
+     0x10000100: the new tagged value, as an EXACT machine word (two halves)
+     0x10000108: new free pointer (raw byte address, mem-ref :u64 convention)"
+  (cond
+    ;; Cons cell (tag = 1)
+    ((= tag 1)
+     (let ((car-lo (%gc-word-lo raw-addr))
+           (car-hi (%gc-word-hi raw-addr)))
+       (if (%gc-is-forward-lo car-lo)
+           ;; Already forwarded — the from-space word IS (new-addr | 15);
+           ;; hand back (new-addr | 1), high half untouched.
+           (progn
+             (%gc-set-halves #x10000100
+                             (logior (logand car-lo (lognot 15)) 1) car-hi)
+             (%gc-set-tmp-free free-ptr))
+           ;; Copy car and cdr to to-space — exact word moves, no Lisp value
+           ;; ever formed (a stack/heap word can be any 64 bits).
+           (if (> (+ free-ptr 16) (%gc-to-end))
+               ;; TO-SPACE OVERRUN GATE (see the object path below).
                (progn
-                 (%gc-write64 #x10000100 (logior (logand car-val (lognot 15)) 1))
-                 (%gc-write64 #x10000108 free-ptr))
-               ;; Copy car and cdr to to-space
-               (let ((cdr-val (%gc-read64 (+ raw-addr 8))))
-                 ;; Write car and cdr to free-ptr in to-space
-                 (%gc-write64 free-ptr car-val)
-                 (%gc-write64 (+ free-ptr 8) cdr-val)
-                 ;; New tagged pointer
-                 (let ((new-ptr (logior free-ptr 1)))
-                   ;; Leave forwarding pointer in from-space
-                   (%gc-write64 raw-addr (logior free-ptr 15))
-                   ;; #160: record the survivor's start bit in to-space (valid
-                   ;; from-space bits for the NEXT cycle after the swap).
-                   (%gc-mark-start free-ptr)
-                   ;; #160 bug#4: it's a CONS — record the cons-kind bit too so
-                   ;; the to-space object-by-object scan classifies it (16 bytes,
-                   ;; scan car+cdr) rather than reading car as an object header.
-                   (%gc-mark-cons free-ptr)
-                   ;; Return results
-                   (%gc-write64 #x10000100 new-ptr)
-                   (%gc-write64 #x10000108 (+ free-ptr 16))))))))
-      ;; Object (tag = 9)
-      ((= tag 9)
-       (let ((raw-addr (- ptr 9)))   ; strip object tag to get byte address
-         ;; Read header
-         (let ((header (%gc-read64 raw-addr)))
-           (if (%gc-is-forward header)
-               ;; Already forwarded
-               (progn
-                 (%gc-write64 #x10000100 (logior (logand header (lognot 15)) 9))
-                 (%gc-write64 #x10000108 free-ptr))
-               ;; Copy header + all element slots
-               (let ((count (ash header -8))  ; element count from header
-                     (subtag (logand header #xFF)))
-                 ;; Total size: (count + 2) * 8, aligned to 16
-                 ;; +2 for header word + padding word
-                 (let ((total-bytes (logand (+ (* (+ count 2) 8) 15) (lognot 15)))
-                       (i 0))
-                   ;; Copy all bytes (word by word)
-                   (loop
-                     (when (>= i total-bytes) (return nil))
-                     (%gc-write64 (+ free-ptr i) (%gc-read64 (+ raw-addr i)))
-                     (setq i (+ i 8)))
-                   ;; New tagged pointer
-                   (let ((new-ptr (logior free-ptr 9)))
+                 (%gc-store-tagged #x10000100 raw-addr 1)
+                 (%gc-set-tmp-free free-ptr))
+           (progn
+             (%gc-move-word raw-addr free-ptr)
+             (%gc-move-word (+ raw-addr 8) (+ free-ptr 8))
+             ;; Leave forwarding pointer in from-space
+             (%gc-store-tagged raw-addr free-ptr 15)
+             ;; #160: record the survivor's start bit in to-space (valid
+             ;; from-space bits for the NEXT cycle after the swap).
+             (%gc-mark-start free-ptr)
+             ;; #160 bug#4: it's a CONS — record the cons-kind bit too so
+             ;; the to-space object-by-object scan classifies it (16 bytes,
+             ;; scan car+cdr) rather than reading car as an object header.
+             (%gc-mark-cons free-ptr)
+             ;; Return results
+             (%gc-store-tagged #x10000100 free-ptr 1)
+             (%gc-set-tmp-free (+ free-ptr 16)))))))
+    ;; Object (tag = 9)
+    ((= tag 9)
+     (let ((hdr-lo (%gc-word-lo raw-addr))
+           (hdr-hi (%gc-word-hi raw-addr)))
+       (if (%gc-is-forward-lo hdr-lo)
+           ;; Already forwarded
+           (progn
+             (%gc-set-halves #x10000100
+                             (logior (logand hdr-lo (lognot 15)) 9) hdr-hi)
+             (%gc-set-tmp-free free-ptr))
+           ;; Copy header + all element slots
+           (let ((count (%gc-header-count hdr-lo hdr-hi)))
+             ;; Total size: (count + 2) * 8, aligned to 16
+             ;; +2 for header word + padding word
+             (let ((total-bytes (logand (+ (* (+ count 2) 8) 15) (lognot 15)))
+                   (i 0))
+               ;; MEMORY-SAFETY GATES.  No live object can be larger than the
+               ;; semispace it was allocated in, so a computed size above
+               ;; FROM-SIZE means this candidate is not an object at all and its
+               ;; "header" is data.  DECLINE it instead of running the copy loop.
+               ;;
+               ;; This became reachable the moment the :u64 halving defect above
+               ;; was fixed: before, %gc-is-pointer rejected every real pointer
+               ;; so nothing was ever copied.  On a target WITHOUT the #160
+               ;; object-start bitmap (bare-metal aarch64 — %gc-bitmap-init is
+               ;; mmap-only and *aarch64-gc-bitmap-enabled* is nil, so
+               ;; %gc-is-start degrades to T) a false conservative stack root is
+               ;; the only thing standing between the collector and a wild copy.
+               ;; MEASURED on the RPi image: a root pointing at a word
+               ;; #xDEAD1009 (low nibble 9 — object-shaped) decoded to
+               ;; count = 14593296, and the copy loop walked off DRAM into a
+               ;; synchronous external abort (ESR #x97000010, FAR #x6F6F7BA5).
+               ;; Declining leaves the slot pointing into the reclaimed
+               ;; semispace, which is the pre-bitmap conservative-collector risk
+               ;; and strictly better than scribbling over memory.  Where the
+               ;; bitmap IS on these gates never fire: a real object always fits,
+               ;; lies wholly inside its own semispace, and its copy fits in
+               ;; to-space.  Three invariants, all provable, all cheap:
+               ;;   (1) total-bytes <= from-size
+               ;;   (2) raw-addr + total-bytes <= from-start + from-size
+               ;;   (3) free-ptr  + total-bytes <= to_end
+               ;; WHY (3) IS NOT OPTIONAL, measured and DETERMINISTIC (identical
+               ;; trace on two runs of the same image): with only (1), a false
+               ;; root near the top of the upper semispace copied past
+               ;; 0x10000000 — and the GC METADATA BLOCK begins at 0x10000040,
+               ;; so the collector overwrote its own from_start/saved_rsp.  The
+               ;; tell is the phase trace turning from "12345" into "1S2345":
+               ;; saved_rsp stopped passing %gc-collect's own window check, the
+               ;; STACK SCAN was skipped, and the image died two collections
+               ;; later.  What makes these roots false is visible in
+               ;; compiler.lisp: +t-value+ is #xDEAD1009 and +nil-value+ is
+               ;; #xDEAD0001 — the IMMEDIATES T and NIL carry low nibbles 9 and
+               ;; 1, i.e. object and cons tags.  They are out of heap range so
+               ;; %gc-cand-addr rejects them directly, but a stack word pointing
+               ;; at a slot that HOLDS one lands mid-object, and the "header"
+               ;; read there is #xDEAD1009 -> count 14593296.  That is exactly
+               ;; what the #160 object-start bitmap exists to reject; it is not
+               ;; wired up on bare-metal aarch64 (%gc-bitmap-init is mmap-only,
+               ;; *aarch64-gc-bitmap-enabled* defaults nil), so until it is,
+               ;; these three invariants are the only thing standing between a
+               ;; false root and memory corruption.
+               ;; TO-SPACE OVERRUN GATE.  MEASURED consequence of NOT having
+               ;; it on the RPi image: the top semispace ends at 0x10000000 and
+               ;; the GC METADATA BLOCK starts at 0x10000040, so a copy that
+               ;; overruns to-space lands directly on from_start/saved_rsp — the
+               ;; collector overwrites its own root-scan geometry.  The tell is
+               ;; the phase trace turning into "1S2345": saved_rsp no longer
+               ;; passes %gc-collect's own window check, so the STACK SCAN IS
+               ;; SKIPPED and every stack root is dropped.
+               (if (if (> total-bytes from-size) t
+                       (if (> (+ raw-addr total-bytes) (+ from-start from-size)) t
+                           (> (+ free-ptr total-bytes) (%gc-to-end))))
+                   (progn
+                     (%gc-store-tagged #x10000100 raw-addr 9)
+                     (%gc-set-tmp-free free-ptr))
+                   (progn
+                     ;; Copy all bytes (word by word)
+                     (loop
+                       (when (>= i total-bytes) (return nil))
+                       (%gc-move-word (+ raw-addr i) (+ free-ptr i))
+                       (setq i (+ i 8)))
                      ;; Leave forwarding pointer in old location
-                     (%gc-write64 raw-addr (logior free-ptr 15))
+                     (%gc-store-tagged raw-addr free-ptr 15)
                      ;; #160: record the survivor's start bit in to-space.
                      (%gc-mark-start free-ptr)
                      ;; Return results
-                     (%gc-write64 #x10000100 new-ptr)
-                     (%gc-write64 #x10000108 (+ free-ptr total-bytes)))))))))
-      ;; Not a pointer — return unchanged
-      (t
-       (%gc-write64 #x10000100 ptr)
-       (%gc-write64 #x10000108 free-ptr)))))
+                     (%gc-store-tagged #x10000100 free-ptr 9)
+                     (%gc-set-tmp-free (+ free-ptr total-bytes)))))))))
+    ;; Not a pointer — unreachable (callers gate on %gc-cand-addr, which only
+    ;; admits tags 1 and 9); return the value unchanged so the caller's
+    ;; write-back is a no-op.
+    (t
+     (%gc-store-tagged #x10000100 raw-addr tag)
+     (%gc-set-tmp-free free-ptr))))
 
 ;;; ============================================================
 ;;; Root Scanning
@@ -376,20 +552,20 @@
   "Process one root slot at raw byte address RAW-SLOT-ADDR.
    If it contains a pointer into from-space, copy the object and
    update the slot. Returns the new free pointer."
-  (let ((val (%gc-read64 raw-slot-addr)))
-    (if (%gc-is-pointer val)
-        (if (%gc-in-space val from-start from-size)
-            ;; #160: only copy a candidate that is a RECORDED object start.
-            ;; A false root (looks like a from-space pointer but lands
-            ;; mid-object) is left untouched — no forward-pointer stamp.
-            (if (%gc-is-start (logand val (lognot 15)))
-                (progn
-                  (%gc-copy-object val from-start from-size free-ptr)
-                  ;; Update the slot with the new pointer
-                  (%gc-write64 raw-slot-addr (%gc-read64 #x10000100))
-                  ;; Return new free pointer
-                  (%gc-read64 #x10000108))
-                free-ptr)
+  (let* ((lo (%gc-word-lo raw-slot-addr))
+         (hi (%gc-word-hi raw-slot-addr))
+         (addr (%gc-cand-addr lo hi from-start from-size)))
+    (if addr
+        ;; #160: only copy a candidate that is a RECORDED object start.
+        ;; A false root (looks like a from-space pointer but lands
+        ;; mid-object) is left untouched — no forward-pointer stamp.
+        (if (%gc-is-start addr)
+            (progn
+              (%gc-copy-object addr (logand lo 15) from-start from-size free-ptr)
+              ;; Update the slot with the new pointer (exact word move)
+              (%gc-move-word #x10000100 raw-slot-addr)
+              ;; Return new free pointer
+              (%gc-tmp-free))
             free-ptr)
         free-ptr)))
 
@@ -441,7 +617,11 @@
     ;; read after an allocating step (e.g. %values-list conses each
     ;; element), so a collection mid-read strands the unread extras.
     ;; Scan exactly count-1 words, only when count>=2.
-    (let ((count (ash (%gc-read64 #x10000090) -1)))
+    ;; MV-COUNT is a TAGGED FIXNUM machine word (count<<1); its low half alone
+    ;; is exact for any plausible count.  Historically this read the halved
+    ;; :u64 value and shifted again, yielding count/2 — the extras scan was
+    ;; silently short by half.
+    (let ((count (ash (%gc-word-lo #x10000090) -1)))
       (when (>= count 2)
         (let ((i 0))
           (loop
@@ -480,12 +660,13 @@
         (progn
           (loop
             (when (>= scan fp) (return nil))
-            (let ((val (%gc-read64 scan)))
-              (when (%gc-is-pointer val)
-                (when (%gc-in-space val from-start from-size)
-                  (%gc-copy-object val from-start from-size fp)
-                  (%gc-write64 scan (%gc-read64 #x10000100))
-                  (setq fp (%gc-read64 #x10000108)))))
+            (let* ((lo (%gc-word-lo scan))
+                   (hi (%gc-word-hi scan))
+                   (addr (%gc-cand-addr lo hi from-start from-size)))
+              (when addr
+                (%gc-copy-object addr (logand lo 15) from-start from-size fp)
+                (%gc-move-word #x10000100 scan)
+                (setq fp (%gc-tmp-free))))
             (setq scan (+ scan 8)))
           fp)
         ;; -- Type-aware object-by-object walk (bitmaps on) --
@@ -499,9 +680,10 @@
                   (setq fp (%gc-forward-slot (+ scan 8) from-start from-size fp))
                   (setq scan (+ scan 16)))
                 ;; OBJECT: header at scan.
-                (let* ((header (%gc-read64 scan))
-                       (count (ash header -8))
-                       (subtag (logand header #xFF))
+                (let* ((hdr-lo (%gc-word-lo scan))
+                       (hdr-hi (%gc-word-hi scan))
+                       (count (%gc-header-count hdr-lo hdr-hi))
+                       (subtag (logand hdr-lo #xFF))
                        (total-bytes (logand (+ (* (+ count 2) 8) 15)
                                             (lognot 15))))
                   ;; Pointer-bearing objects: forward each of the COUNT slots
@@ -550,6 +732,10 @@
       (write-char-serial 83)  ; 'S' — stack-scan skipped
       (setq saved-rsp stack-base))
     ;; The free pointer in to-space starts at to_start
+    ;; Publish to-space's end so %gc-copy-object can refuse an overrunning
+    ;; copy (the metadata block sits immediately above the heap — see the gate
+    ;; in %gc-copy-object).
+    (%gc-set-to-end (+ to-start space-size))
     (let ((free-ptr to-start))
       ;; Step 1: Copy roots from the stack
       (setq free-ptr (%gc-scan-stack saved-rsp stack-base

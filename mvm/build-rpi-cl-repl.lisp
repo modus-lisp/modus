@@ -1015,6 +1015,30 @@
 ;; The serial REPL itself: CL reader + EVAL(=mvm-eval) + CL printer over COM1.
 (mvm-text "lib/serial-repl.lisp")
 "
+;; #160 bitmaps, bare-metal flavour — see the call in kernel-main for why.
+;; gc.lisp's %gc-bitmap-init uses %mmap-exec-page, which does not exist here.
+;;
+;; Both bases are published with the SAME convention gc.lisp's readers expect:
+;; (setf (mem-ref .. :u64)) stores value<<1 and %gc-bitmap-base et al read it
+;; back through the matching halving, exactly as the hosted path does — do NOT
+;; \"helpfully\" pre-shift these.  page_base is from_start (the lowest object
+;; address), matching %gc-bitmap-init.
+;;
+;; NON-ALLOCATING by construction: raw mem-ref stores and fixnum arithmetic
+;; only.  It runs before init-symbol-table, so there is no heap to allocate
+;; from yet, and a bignum here would fault rather than collect.
+(defun %rpi-gc-bitmap-init (obj-base cons-base nbytes)
+  (let ((i 0))
+    (loop
+      (when (>= i nbytes) (return nil))
+      (setf (mem-ref (+ obj-base i) :u64) 0)
+      (setf (mem-ref (+ cons-base i) :u64) 0)
+      (setq i (+ i 8))))
+  (setf (mem-ref #x10000E00 :u64) (%gc-from-start))
+  (setf (mem-ref #x10000E18 :u64) obj-base)
+  (setf (mem-ref #x10000E40 :u64) cons-base)
+  nil)
+
 (defun kernel-main ()
   ;; Banner first: proves native code is executing and the UART is alive
   ;; before any runtime init runs.
@@ -1065,6 +1089,32 @@
   ;; argument is the conservative stack scan base — keep it equal to the boot
   ;; SP (+rpi-cl-stack-top+).
   (%gc-init #x09000000 #x07000000 #x08000000)
+
+  ;; #160 OBJECT-START + CONS-KIND BITMAPS, bare-metal flavour.
+  ;;
+  ;; %gc-bitmap-init (gc.lisp) reserves these with %mmap-exec-page, which does
+  ;; not exist here, so bare metal had NO bitmap: %gc-is-start degraded to T and
+  ;; every conservative candidate was copied.  That was survivable only while
+  ;; the collector forwarded almost nothing (the %gc-read64 word/2 bug, fixed in
+  ;; b65730c).  With forwarding actually working, false roots get copied using
+  ;; DATA as a header — measured twice on this image: a copy loop walking off
+  ;; DRAM (ESR #x97000010), and a false root near the top of the upper semispace
+  ;; copying past 0x10000000 onto the GC metadata at 0x10000040, i.e. the
+  ;; collector overwriting its own saved_rsp (tell: phase trace 12345 -> 1S2345).
+  ;;
+  ;; Fixed RAM instead of mmap.  1 bit / 16-byte granule over the 112 MB heap =
+  ;; 0x07000000/128 = 0xE0000 bytes (896 KB) per bitmap.  Placed at 80 MB
+  ;; (0x05000000 / 0x05100000), which clears the image — note the image is
+  ;; ~54 MB with the bit-set emitted inline at every alloc site, NOT the ~21 MB
+  ;; of a bitmap-off build — and sits ~46 MB below the stack top; both bounds
+  ;; are asserted at build time.  MUST run before the first
+  ;; allocation (init-symbol-table, just below) so every mutator alloc records
+  ;; its start bit, and after %gc-init because page_base is read from from_start.
+  ;;
+  ;; DRAM is not guaranteed zero at reset, so the regions are cleared explicitly
+  ;; — a stale bit would validate a false root, which is the whole failure this
+  ;; exists to prevent.  Non-allocating: raw mem-ref stores only.
+  (%rpi-gc-bitmap-init #x05000000 #x05100000 #xE0000)
 
   ;; NOTE: no (setup-irq) / (nic-irq-unmask) here.  Those program a GICv2,
   ;; which a BCM2837 does not have (it uses the BCM interrupt controller), and
@@ -1585,6 +1635,14 @@
 ;; No actor scheduler either, so no sched lock: the translator then emits no
 ;; load/store-exclusive, which matters because this image runs MMU-off and
 ;; exclusives are UNPREDICTABLE on Device memory.
+;; #160: emit the object-start + cons-kind bit-set at every alloc site, so
+;; %gc-is-start can reject a conservative candidate that lands mid-object
+;; instead of degrading to T and copying it.  Matches build-aarch64-cli.lisp
+;; and build-aarch64-linux.lisp; the RPi image was the last aarch64 target
+;; still running the collector with NO bitmap.  The backing RAM is reserved and
+;; zeroed by %rpi-gc-bitmap-init in kernel-main.
+(setf *aarch64-gc-bitmap-enabled* t)
+
 (setf *aarch64-sched-lock-addr* nil)
 
 ;; SP alignment stays 8-byte (bare-metal EL1 with SCTLR.SA off), unlike Linux
@@ -1654,6 +1712,26 @@
       (when (>= image-va-end heap-base)
         (error "BUILD-TIME ASSERT: image end ~X reached the heap base ~X."
                image-va-end heap-base))
+      ;; #160 bitmaps live at 0x05000000 / 0x05100000, 0xE0000 bytes each
+      ;; (1 bit / 16-byte granule over the 112 MB heap).  They must clear the
+      ;; image below and the stack above; both are checked here rather than
+      ;; discovered as heap corruption at runtime.  Keep in step with the
+      ;; %rpi-gc-bitmap-init call in kernel-main.
+      (let* ((objmap-lo  #x05000000)
+             (consmap-lo #x05100000)
+             (map-bytes  #xE0000)
+             (maps-hi    (+ consmap-lo map-bytes)))
+        (when (< objmap-lo image-va-end)
+          (error "BUILD-TIME ASSERT: #160 object-start bitmap at ~X is inside ~
+                  the image (ends ~X)." objmap-lo image-va-end))
+        (when (> (+ objmap-lo map-bytes) consmap-lo)
+          (error "BUILD-TIME ASSERT: #160 object-start bitmap ~X+~X overlaps ~
+                  the cons-kind bitmap at ~X." objmap-lo map-bytes consmap-lo))
+        (when (>= maps-hi stack-va-lo)
+          (error "BUILD-TIME ASSERT: #160 bitmaps end ~X reach the stack low ~
+                  water ~X." maps-hi stack-va-lo))
+        (format t "  gc bitmaps ~8,'0X .. ~8,'0X  (#160 object-start + cons-kind)~%"
+                objmap-lo maps-hi))
       (when (> heap-end periph-base)
         (error "BUILD-TIME ASSERT: heap end ~X is inside the BCM2837 ~
                 peripheral window at ~X." heap-end periph-base))

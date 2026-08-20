@@ -69,7 +69,7 @@
                   *cli-arch-kernel-prologue* *cli-arch-io-scratch-source*
                   *cli-arch-kernel-epilogue* *cli-arch-override-source*
                   *cli-bare-metal* *cli-bare-metal-tarball*
-                  *cli-bare-metal-net-source*))
+                  *cli-bare-metal-net-source* *cli-omit-ansi-bridge*))
 
 ;;; BARE-METAL SEAM.  DEFVAR, so a wrapper that binds these BEFORE loading this
 ;;; file keeps its value and everything else defaults to the hosted behaviour —
@@ -103,12 +103,28 @@
 (defvar *cli-bare-metal-tarball* nil)
 (defvar *cli-bare-metal-net-source* "")
 
+;;; BRING-UP CULL, not part of the bare-metal seam: T drops mvm/ansi-bridge.lisp
+;;; (~1.7 MB of source -> ~3.5 MB of image) from *BRIDGE-SOURCE*.  It exists for
+;;; the Pi chain-load path, where every megabyte is minutes of UART time.  NOT
+;;; proven boot-safe — ansi-bridge.lisp is load-bearing (it defines list /
+;;; make-array / rplaca / the CLOS defaults and %init-clos-protocol), so measure,
+;;; do not assume.  Default NIL => every existing build is byte-identical.
+(defvar *cli-omit-ansi-bridge* nil)
+
 ;;; ============================================================
 ;;; 1. Load MVM infrastructure (SBCL-side)
 ;;; ============================================================
 
-(load (merge-pathnames "../lib/load-mvm.lisp"
-                       (directory-namestring (truename *load-truename*))))
+;;; GUARDED: a wrapper that must READ SOURCE FILES to build one of its arch
+;;; slots (the RPi bare-metal image reads its USB/net stack into
+;;; *CLI-BARE-METAL-NET-SOURCE*) has to load the MVM system itself, because a
+;;; slot must be bound BEFORE this file is loaded.  Loading the whole system a
+;;; second time is ~20s of pure waste and doubles every build warning.  Hosted
+;;; wrappers do not pre-load, so the package does not exist and this loads
+;;; exactly as it always did.
+(unless (find-package "MODUS.MVM")
+  (load (merge-pathnames "../lib/load-mvm.lisp"
+                         (directory-namestring (truename *load-truename*)))))
 (mvm-load "mvm/repl-source.lisp")
 
 (format t "~%=== Building generic Modus image ===~%")
@@ -866,7 +882,7 @@
     (string #\Newline)
     (mvm-text "mvm/cl-conditions.lisp")
     (string #\Newline)
-    (mvm-text "mvm/ansi-bridge.lisp")
+    (if *cli-omit-ansi-bridge* "" (mvm-text "mvm/ansi-bridge.lisp"))
     (string #\Newline)
     ;; ---- BARE METAL STOPS HERE -------------------------------------------
     ;; Everything below is the HOSTED payload: Linux syscalls, fds, argv.  A
@@ -960,7 +976,21 @@
   (init-keyword-table)
   (%init-packages)
   (%init-streams)
-  (%init-reader)
+"
+  ;; BARE-METAL SEAM.  %init-streams ends with
+  ;;   (setq *error-output* (%make-file-stream-full 2 1))
+  ;; — a Linux fd-2 stream.  Writing one char to it runs %fs-write-char ->
+  ;; %sys-write-raw -> (syscall3 1 …) -> TRAP #x0502, a literal SVC/SYSCALL with
+  ;; no OS behind it.  That made reading ANY global by name fail at COMPILE time
+  ;; (task #212): compile-variable-ref's implicit-global arm FORMATs to
+  ;; *error-output* before it emits the read, so `*n*' faulted, and HANDLER-CASE
+  ;; could not even be compiled to catch it.  There is exactly one console on a
+  ;; bare board, so stderr is the serial port.
+  (if *cli-bare-metal*
+      "  (setq *error-output* *standard-output*)
+"
+      "")
+  "  (%init-reader)
   (%init-condition-types)
   (%init-method-combinations)
   (%init-symbol-function-table)
@@ -971,8 +1001,17 @@
   (%init-runtime-macros)
   (setq *cstr-scratch* #x0FE00000)  ; moved below heap base
   (setq *io-buf-addr*  #x0FF00000)  ; moved out of heap semispace 0; see memory note
-  (%init-signal-handling)
-  (%init-signal-symbols)
+"
+  ;; BARE-METAL SEAM.  %init-signal-handling -> %install-signal-handlers ->
+  ;; TRAP #x0520, which BOTH translators emit as unconditional rt_sigaction
+  ;; syscalls (translate-aarch64.lisp ~2523 is NOT gated on
+  ;; *aarch64-linux-mode*).  On bare metal that is an SVC with no OS to service
+  ;; it — a synchronous exception, and on a Pi every vector is `b .', so it
+  ;; wedges the machine silently.  Hardware-fault recovery on bare metal is the
+  ;; boot's own vector table (x64: boot-x64.lisp IDT 13/14), not sigaction.
+  (if *cli-bare-metal* "" "  (%init-signal-handling)
+")
+  "  (%init-signal-symbols)
   (%init-make-load-form)
   (%install-runtime-backquote)
   ;; Init RT counters + registry (defvar init thunks don't run on bare metal)
@@ -985,8 +1024,15 @@
   ;; handler-case at compile time so a thunk that references a not-yet-
   ;; bound symbol can't kill the chain — see CLAUDE.md known limitation
   ;; #7 history.  Most thunks succeed and we get init values for free.
-  (init-all-globals)
 "
+  ;; BARE-METAL SEAM: an outer wrap as well.  A thunk that ESCAPES the
+  ;; compile-time handler-case is a recoverable Lisp error on a hosted image and
+  ;; an unrecoverable spin on a board whose exception vectors are `b .'.
+  (if *cli-bare-metal*
+      "  (handler-case (init-all-globals) (t (c) nil))
+"
+      "  (init-all-globals)
+")
   ;; ARCH SLOT: file-I/O scratch addresses, spliced HERE — after
   ;; (init-all-globals), deliberately.
   ;;
@@ -1231,6 +1277,16 @@
                        *rt-macros-source* (string #\Newline)
                        *bridge-source*   (string #\Newline)
                        *cli-arch-override-source*
+                       ;; BARE-METAL NET SEAM, second use site.  The scanners
+                       ;; below are what put a defun in *SYMBOL-FUNCTION-TABLE*
+                       ;; and a token in *SYM-NAME-TABLE*; a bare-metal target's
+                       ;; OWN driver/IP/HTTP/installer stack is real image source
+                       ;; and must be scanned like any other, or every one of its
+                       ;; functions is unreachable from runtime EVAL / the REPL
+                       ;; and its symbols print as :||.  "" on hosted builds, so
+                       ;; their scanner input — and therefore SFT-AUTO and
+                       ;; SYM-NAME-AUTO — is byte-identical.
+                       *cli-bare-metal-net-source*
                        *driver-source*))
 
 ;;; NOTE: *genera-source* is deliberately NOT part of *all-runtime-source*.

@@ -1255,8 +1255,34 @@
 "
   ;; --- the REPL (lib/serial-repl.lisp) ------------------------------------
   (handler-case (cl-serial-repl) (t (c) nil))
-  (sys-exit 0))
+  (halt))
 "))
+
+;;; WHY kernel-main ends in (halt) AND NOT (sys-exit 0)   [2026-08-19]
+;;;
+;;; SYS-EXIT is a COMPILER SPECIAL FORM, not a function call: compiler.lisp's
+;;; dispatch sends it to compile-sys-exit, filed under "--- Linux Syscalls ---",
+;;; which unconditionally emits TRAP #x0500 -> a literal SVC.  Bare metal has no
+;;; OS to service that, so it raises a synchronous exception.  Measured:
+;;;   !!FAULT E0000000056000500 L000000000325cd4c      (ESR EC=0x15 = SVC)
+;;; and the emitted sequence  mov x0,x26 / mov x0,#0 / svc #0x500  was read back
+;;; out of RAM through the QEMU gdbstub and found byte-identical in the image
+;;; FILE (file offset = vaddr - #x80000) — i.e. BAKED IN, not corruption.
+;;;
+;;; The (defun sys-exit (code) ... (halt)) in *driver-source* does NOT protect
+;;; us: the compiler intrinsifies the NAME, so that defun is dead code.  A build
+;;; CANNOT override a compiler special form by defining a function of the same
+;;; name.  See task #269 — the other three bare-metal builds have the same live
+;;; bug, and build-aarch64/build-x64 are ANSI gate runners where sys-exit is how
+;;; the run TERMINATES, so do NOT blanket-replace them.
+;;;
+;;; It stayed hidden because it is only reachable when cl-serial-repl RETURNS;
+;;; the healthy path loops in the REPL forever.
+;;;
+;;; KEEP THIS COMMENT OUTSIDE THE SOURCE STRING.  Text inside the string above
+;;; is COMPILED INTO THE IMAGE; adding a comment there changed the emitted image
+;;; from offset #x89 onward (GENERIC-MULTIPLY's code included), which destroys
+;;; any ability to attribute a behaviour change to the one-form edit.
 
 (defvar *all-runtime-source*
   (concatenate 'string *prelude-source*  (string #\Newline)
@@ -1642,6 +1668,24 @@
 ;; still running the collector with NO bitmap.  The backing RAM is reserved and
 ;; zeroed by %rpi-gc-bitmap-init in kernel-main.
 (setf *aarch64-gc-bitmap-enabled* t)
+
+;; #267 step 1: use the NATIVE aarch64 Cheney collector — the same one
+;; build-aarch64-cli.lisp runs — instead of falling through to gc.lisp's
+;; INTERPRETED %gc-collect.  This image was the LAST target in the tree still on
+;; the Lisp collector (x64 has its native trampoline, hosted aarch64 sets this
+;; flag, i386 has its own arm), and it is also the only target that fails to
+;; load alexandria.
+;;
+;; The BL flag is REQUIRED here, not cosmetic.  Native MCGC normally calls the
+;; trampoline as `BLR x28`, and x28 is materialised by emit-linux-aarch64-entry
+;; — the LINUX entry.  boot-rpi-cl.lisp never touches x28, so the mcgc flag
+;; ALONE made every gc-check an indirect call through a garbage register:
+;; measured 2026-08-20, the image branched into space on its first collection and
+;; re-entered at the image start (boot banner printed twice) with ZERO logged
+;; exceptions, since control never reached the EL2 vectors.  BL's ±128MB reach
+;; covers this ~57MB image with room to spare.
+(setf *aarch64-gc-native-mcgc* t)
+(setf *aarch64-gc-trampoline-call-via-bl* t)
 
 (setf *aarch64-sched-lock-addr* nil)
 

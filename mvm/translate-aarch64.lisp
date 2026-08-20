@@ -366,6 +366,29 @@
    offset+4 (hi16 lsl 16), no function tag (BLR takes a raw address).  Nil
    between builds and when native MCGC is off.")
 
+(defvar *aarch64-gc-trampoline-call-via-bl* nil
+  "Call the NATIVE MCGC trampoline with a short-range BL instead of `BLR x28`.
+
+   The BLR-x28 convention requires the boot stub to materialise the trampoline's
+   absolute VA into x28 (see *aarch64-x28-load-patch-offset*), and that load is
+   emitted ONLY by emit-linux-aarch64-entry — i.e. only on the Linux/hosted
+   entry.  A BARE-METAL entry (boot-rpi-cl.lisp) never touches x28, so setting
+   *aarch64-gc-native-mcgc* there ALONE turns every gc-check into a `BLR x28`
+   through whatever the mutator happened to leave in x28: a wild indirect call.
+   MEASURED 2026-08-20 — the RPi image branched off into space on its first
+   collection and re-entered at the image start (the serial log shows the boot
+   banner twice) with ZERO logged exceptions, because control never reached the
+   EL2 vectors, so it read as a spontaneous reset rather than a bad call.
+
+   BL's +/-128MB imm26 reach is the ONLY reason x28 exists: the ~200MB ANSI-gate
+   image overflows it.  A bare-metal RPi image is ~57MB, so a plain BL reaches
+   the tail trampoline comfortably and needs no boot-stub cooperation at all.
+   The trampoline itself is agnostic: it saves the caller's x28 to frame slot 224
+   and restores it, so it does not care whether x28 held the trampoline VA.
+
+   Set this together with *aarch64-gc-native-mcgc* on bare-metal aarch64 targets.
+   Defaults NIL, so hosted/gate emission is byte-identical.")
+
 ;;; ============================================================
 ;;; AArch64 Physical Register Numbers
 ;;; ============================================================
@@ -3935,7 +3958,13 @@
                   ;; COLD path (only when x24>=x25).  The Lisp-collector
                   ;; (bytecode-offset) path keeps the short-range BL — its x28 is
                   ;; NOT loaded, so BLR would be wrong, and its image fits ±128MB.
-                  (if *aarch64-gc-native-mcgc*
+                  ;; SAME CAVEAT ON BARE METAL: the x28 load lives in
+                  ;; emit-linux-aarch64-entry, so a bare-metal entry never sets it
+                  ;; and BLR x28 would be a wild indirect call.  Such targets set
+                  ;; *aarch64-gc-trampoline-call-via-bl* and take the BL path,
+                  ;; which their ~57MB image reaches easily.  See that defvar.
+                  (if (and *aarch64-gc-native-mcgc*
+                           (not *aarch64-gc-trampoline-call-via-bl*))
                       (a64-blr buf +a64-x28+)
                       (let ((idx (a64-current-index buf)))
                         (a64-bl buf 0)

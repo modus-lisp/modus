@@ -31,7 +31,9 @@
 ;;;;   *CLI-BARE-METAL-NET-SOURCE*  the Pi's own DWC2/USB/IP/HTTP stack
 ;;;;   *CLI-ARCH-SYSCALL-SOURCE*    `halt' (WFI), never `sys-exit' — see below
 ;;;;   *CLI-ARCH-PROBE-SOURCE*      lib/serial-repl.lisp + %rpi-gc-bitmap-init
-;;;;   *CLI-ARCH-OVERRIDE-SOURCE*   %cli-getenv stub (no process environment)
+;;;;   *CLI-ARCH-OVERRIDE-SOURCE*   lib/fdt.lisp + %cli-getenv over the
+;;;;                                firmware device tree's /chosen/bootargs
+;;;;                                (cmdline.txt on hardware, -append in QEMU)
 ;;;;   *CLI-ARCH-KERNEL-PROLOGUE*   banner, BSS-equivalent zeroing, %gc-init,
 ;;;;                                GC bitmaps — all before the FIRST allocation
 ;;;;   *CLI-ARCH-IO-SCRATCH-SOURCE* the globals whose defvar thunks must be
@@ -205,18 +207,35 @@
 
 ;;; ARCH SLOT: late last-defun-wins overrides, spliced right after the bridge.
 ;;;
-;;; %CLI-GETENV.  There is no process environment on bare metal, and the hosted
-;;; definition lives in lib/cli-toplevel.lisp — part of the payload
-;;; *CLI-BARE-METAL* omits.  But the SHARED kernel-main's :GENERA and ASDF
-;;; installers consult MODUS_NO_GENERA / MODUS_NO_ASDF through it.  Left
-;;; unresolved, those calls compile to a NIL sentinel, and calling one on a board
-;;; whose exception vectors are all `b .' wedges the machine with no output at
-;;; all.  A stub that always reports "unset" is the honest bare-metal answer:
-;;; both surfaces install, exactly as they do on a hosted image with no such
-;;; variable set.
-(defvar *cli-arch-override-source* "
-(defun %cli-getenv (name) (let ((n name)) nil))
-")
+;;; %CLI-GETENV — REAL, not a stub (task #271).
+;;;
+;;; There is no process environment on bare metal, and the hosted definition
+;;; lives in lib/cli-toplevel.lisp — part of the payload *CLI-BARE-METAL* omits.
+;;; But the SHARED kernel-main's :GENERA and ASDF installers consult
+;;; MODUS_NO_GENERA / MODUS_NO_ASDF through it, so until now this slot held
+;;; `(defun %cli-getenv (name) nil)': every knob was permanently "unset" and
+;;; ~55 KB of Genera + ASDF source went through the in-image compiler on EVERY
+;;; boot with no way to decline it.
+;;;
+;;; A board is not an environment-less machine; it is a machine whose
+;;; environment comes from FIRMWARE.  boot/boot-rpi-cl.lisp now saves the
+;;; device-tree pointer the AArch64 boot protocol passes in X0, and lib/fdt.lisp
+;;; reads /chosen/bootargs out of that tree and splits it into KEY=VALUE pairs
+;;; — which on a real Pi is the contents of cmdline.txt and under QEMU is
+;;; `-append'.  So MODUS_NO_ASDF=1 in cmdline.txt now does on hardware exactly
+;;; what MODUS_NO_ASDF=1 in the environment does on a hosted image, with no
+;;; rebuild.
+;;;
+;;; The parse is LAZY — first call, then cached (see lib/fdt.lisp's header for
+;;; why boot time would be the wrong place, and for the full guard list).  This
+;;; slot therefore contributes exactly one line of its own.
+(defvar *cli-arch-override-source*
+  (concatenate 'string
+    (string #\Newline)
+    (%rpi-mvm-text "lib/fdt.lisp")
+    "
+(defun %cli-getenv (name) (%bootargs-lookup (%fdt-bootargs) name))
+"))
 
 ;;; ARCH SLOT: hardware setup that must precede the FIRST allocation.
 (defvar *cli-arch-kernel-prologue* "
@@ -309,6 +328,18 @@
 ;;; globals whose init thunks either do not run (limitation #7) or run with a
 ;;; hosted value, plus %init-clos-protocol, which every other build's kernel-main
 ;;; calls and which must land after the thunks that would otherwise reset it.
+;;;
+;;; It also carries the #271 DTB REPORT — one line naming the device-tree
+;;; pointer the firmware passed, the /chosen/bootargs string read out of it, and
+;;; the value of MODUS_PROBE.  It lives HERE, and not in the epilogue, for one
+;;; reason: this is the earliest point in kernel-main at which allocation is
+;;; legal (heap up, globals initialised) and it is still BEFORE the :GENERA and
+;;; ASDF installers, which are the first real consumers of %CLI-GETENV.  So the
+;;; boot log states what the machine was told before anything acts on it — and
+;;; it is the call that populates lib/fdt.lisp's cache, which means the walk
+;;; happens at a point where a fault would be attributable, rather than inside
+;;; an installer's handler-case.  Wrapped, because a diagnostic must never be
+;;; the thing that stops a boot.
 (defvar *cli-arch-io-scratch-source* "  (setq *cstr-scratch* #x0FE00000)
   (setq *io-buf-addr*  #x0FF00000)
   (setq *scratch-mmapped* nil)
@@ -322,6 +353,19 @@
   (%init-standard-chars)
   (%init-boole-constants)
   (%init-clos-protocol)
+  (handler-case
+      (progn
+        (write-string-serial \"DTB ptr=\")
+        (print-dec (%fdt-base))
+        (write-string-serial \" bootargs=[\")
+        (let ((a (%fdt-bootargs)))
+          (if (null a) (write-string-serial \"<none>\") (write-string-serial a)))
+        (write-string-serial \"] MODUS_PROBE=[\")
+        (let ((v (%cli-getenv \"MODUS_PROBE\")))
+          (if (null v) (write-string-serial \"<nil>\") (write-string-serial v)))
+        (write-string-serial \"]\")
+        (write-char-serial 10))
+    (t (c) nil))
   (setq *serial-repl-buf* nil)
   (setq *serial-repl-len* 0)
   (setq *serial-repl-cap* 0)

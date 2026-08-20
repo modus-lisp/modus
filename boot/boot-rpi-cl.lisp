@@ -124,6 +124,34 @@
 (defconstant +rpi-cl-heap-end+      #x10000000)  ; 112 MB total
 (defconstant +rpi-cl-percpu+        #x10080000)  ; TPIDR_EL1
 
+;; #271: where the boot preamble parks the firmware's device-tree pointer.
+;;
+;; The AArch64 Linux boot protocol hands the kernel the PHYSICAL ADDRESS of a
+;; Flat Device Tree in X0, and the Pi firmware puts cmdline.txt into that tree
+;; at /chosen/bootargs (QEMU's -append does the same).  X0 is scratch to
+;; everything that follows — step 2 of the preamble writes it to the UART a few
+;; instructions later — so it has to be saved FIRST or it is gone.
+;;
+;; WHY THIS ADDRESS IS FREE.  0x1000xxxx is the runtime metadata window (the
+;; bare-metal stand-in for an ELF BSS).  Its assignments are dense but
+;; enumerable: 0x…0040-0x…0060 GC metadata; 0x…0080/0088/0148/0170 the four
+;; GC-scanned root tables; 0x…0090-0x…0138 the multiple-value block, which
+;; mvm/interp.lisp routes u64 traffic into by ADDRESS RANGE, so nothing
+;; unrelated may live there; 0x…0150-0x…01F0 nargs, code bounds and handler
+;; slots; 0x…0280-0x…0408 the longjmp / handler-stack apparatus; 0x…0C08-
+;; 0x…0DA0 fault-diagnostic and safepoint slots; 0x…0E00-0x…0EA8 the MCGC and
+;; bitmap config block (this image uses E00/E18/E40 of it).  A repo-wide sweep
+;; of every #x1000xxxx literal finds NOTHING between 0x10000EA8 and 0x10001000,
+;; and the next occupied address anywhere above is 0x10010000, the AArch64
+;; handler-stack depth.  0x10000F00 sits in that gap, 88 bytes clear of the
+;; config block below it and 256 clear of anything above.
+;;
+;; DO NOT ADD IT TO THE BSS-ZEROING LIST.  build-rpi-cl-repl.lisp's kernel-main
+;; prologue zeroes the metadata words that stand in for BSS.  This slot is
+;; written BEFORE kernel-main runs, so zeroing it would erase the one thing it
+;; exists to carry.  lib/fdt.lisp is the reader.
+(defconstant +rpi-cl-dtb-ptr-slot+  #x10000F00)  ; firmware DTB pointer (X0)
+
 ;; NIL register (x26).  The modern compiler bakes +nil-value+ = #xDEAD0001
 ;; into compiled literals and interp.lisp keys truthiness on that exact bit
 ;; pattern; boot-rpi.lisp's hardcoded x26 = 0 splits the NIL representation
@@ -261,6 +289,24 @@
   "Emit the Pi 3B CL-lineage boot preamble (MMU off, identity addressing)."
   (let ((sp 31) (x0 0) (x16 16) (x17 17)
         (x24 24) (x25 25) (x26 26))
+
+    ;; --- 0. FIRMWARE DEVICE-TREE POINTER (#271) ---------------------------
+    ;; MUST BE FIRST.  X0 holds the DTB physical address on entry per the
+    ;; AArch64 Linux boot protocol, and step 2 below uses X0 as the UART data
+    ;; scratch register.  Three instructions — MOVZ + MOVK to materialise the
+    ;; slot address (0x10000F00 has exactly two non-zero halfwords, so
+    ;; emit-aarch64-load-imm64 emits two), then one STR.  X16 is already the
+    ;; preamble's scratch register and is reloaded by step 1 on the next
+    ;; instruction, so nothing downstream can observe the borrow.
+    ;;
+    ;; The preamble is budgeted at 0x800 bytes (512 instructions) and step 7
+    ;; pads whatever is left, so three more instructions shift NOTHING: native
+    ;; code still begins at +rpi-cl-native-off+ = 0x1000 and every fn entry
+    ;; keeps its 16-byte alignment.  (This is the AArch64 counterpart of the
+    ;; x64 hazard where growing boot-linux-x64.lisp requires bumping
+    ;; *x64-native-code-offset* — that image has no such padding step.)
+    (emit-aarch64-load-imm64 buf x16 +rpi-cl-dtb-ptr-slot+)
+    (emit-aarch64-str-x buf x0 x16 0)
 
     ;; --- 1. Stack pointer -------------------------------------------------
     ;; 0x08000000, not boot-rpi.lisp's 0x00200000.  A CL image is tens of MB

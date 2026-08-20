@@ -68,7 +68,8 @@
                   *cli-arch-syscall-source* *cli-arch-probe-source*
                   *cli-arch-kernel-prologue* *cli-arch-io-scratch-source*
                   *cli-arch-kernel-epilogue* *cli-arch-override-source*
-                  *cli-bare-metal* *cli-bare-metal-tarball*))
+                  *cli-bare-metal* *cli-bare-metal-tarball*
+                  *cli-bare-metal-net-source*))
 
 ;;; BARE-METAL SEAM.  DEFVAR, so a wrapper that binds these BEFORE loading this
 ;;; file keeps its value and everything else defaults to the hosted behaviour —
@@ -79,13 +80,28 @@
 ;;;   *CLI-BARE-METAL-TARBALL*  T => bare metal, but still bake lib/tar.lisp +
 ;;;                             lib/install-tarball.lisp so the image can
 ;;;                             install a library it fetched itself.
+;;;   *CLI-BARE-METAL-NET-SOURCE*  the target's OWN network stack + installer,
+;;;                             spliced right after *STAGE2-TEST-SOURCE*.  A
+;;;                             bare-metal image has no host kernel, so it bakes
+;;;                             a real driver/IP/HTTP stack where a hosted image
+;;;                             uses *CLI-HOSTED-PAYLOAD-SOURCE*'s syscalls.
+;;;                             POSITION IS LOAD-BEARING: after the CL runtime,
+;;;                             the compiler and mvm-eval so the arch adapter's
+;;;                             own definitions win under last-defun-wins (it
+;;;                             deliberately overrides WRITE-BYTE), and BEFORE
+;;;                             *DRIVER-SOURCE*, whose kernel-main calls
+;;;                             run-net-pipeline.  "" on hosted builds.
 ;;;
 ;;; This exists so the bare-metal CL images are THIN TAILS over this shared
 ;;; assembly rather than private forks of it.  The forks are exactly how the
 ;;; 2026-08-15 console (PL011 vs mini UART) and USB-DMA-past-end-of-RAM bugs
-;;; survived: each was fixed in one assembly and not the other.
+;;; survived: each was fixed in one assembly and not the other.  The 2026-08-20
+;;; entry in that list: build-rpi-cl-repl carried a private copy of the x64 JIT
+;;; block (%init-x64-translator + x64-asm.lisp) on an AARCH64 image, dead only
+;;; because its *jit-on* was nil — see #266.
 (defvar *cli-bare-metal* nil)
 (defvar *cli-bare-metal-tarball* nil)
+(defvar *cli-bare-metal-net-source* "")
 
 ;;; ============================================================
 ;;; 1. Load MVM infrastructure (SBCL-side)
@@ -1469,6 +1485,14 @@
     *cli-arch-jit-translator-source*
     *stage2-test-source*
     (string #\Newline)
+    ;; BARE-METAL NET SEAM.  "" on hosted builds, so their blob is unchanged.
+    ;; A bare-metal image has no host kernel to syscall into, so it bakes its own
+    ;; driver/IP/HTTP stack + tarball installer here.  POSITION IS LOAD-BEARING:
+    ;; after the CL runtime, the compiler and mvm-eval so the arch adapter's own
+    ;; definitions win under last-defun-wins (it deliberately overrides
+    ;; WRITE-BYTE), and BEFORE *driver-source*, whose kernel-main calls
+    ;; run-net-pipeline.
+    *cli-bare-metal-net-source*
     ;; Defvar for *sym-name-table* (compiler.lisp now supplies *macro-table*'s
     ;; defvar; runtime macroexpand-1 references it).
     "(defvar *sym-name-table* nil)

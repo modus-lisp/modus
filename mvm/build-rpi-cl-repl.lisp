@@ -1590,6 +1590,37 @@
 
 (format t "Full source: ~D characters~%" (length *full-source*))
 
+;;; MODUS_DUMP_FULL_SOURCE=<path> — write the assembled blob and STOP, without
+;;; building an image.  Mirrors the gate in mvm/build-cli-common.lisp verbatim,
+;;; and exists for the same reason: the blob is the ONLY thing this wrapper
+;;; contributes to the emitted binary, so a refactor that leaves it
+;;; byte-identical is behaviour-preserving BY CONSTRUCTION, and proving that
+;;; takes ~20s instead of a ~20min image build + ~4min QEMU boot.
+;;;
+;;; This is the gate for #266 (migrating this file to a thin tail over
+;;; build-cli-common).  Capture the blob BEFORE restructuring, diff after; the
+;;; only differences should be the ones intended (e.g. the aarch64 JIT block
+;;; replacing the x64 one).
+;;;
+;;; WHY IT MATTERS HERE SPECIFICALLY: image byte-identity is NOT an achievable
+;;; bar for this build — measured 2026-08-20, a 1973-char source addition
+;;; reflowed 17.5% of the hosted aarch64 image and 7.5% of this one, because
+;;; emission is sensitive to source length/content (gensym numbering, intern
+;;; order, offsets).  The SOURCE BLOB is the level at which identity is both
+;;; achievable and meaningful.  Do not try to A/B the images.
+;;;
+;;; Placed AFTER assembly and BEFORE build-image so it cannot perturb what it
+;;; measures.
+#+sbcl
+(let ((p (sb-ext:posix-getenv "MODUS_DUMP_FULL_SOURCE")))
+  (when (and p (plusp (length p)))
+    (with-open-file (o p :direction :output :if-exists :supersede
+                         :external-format :utf-8)
+      (write-string *full-source* o))
+    (format t "Dumped *full-source* to ~A (~D chars); skipping image build.~%"
+            p (length *full-source*))
+    (sb-ext:exit :code 0)))
+
 ;;; ============================================================
 ;;; 6. Build the image
 ;;; ============================================================

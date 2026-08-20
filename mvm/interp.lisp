@@ -223,11 +223,34 @@
 
 ;;; Memory helpers
 
+;; REAL memory, not a simulation.  The MVM's LOAD/STORE are ordinary machine
+;; loads and stores — x64 emits `MOVZX r64,byte [addr]` / `MOV [addr],r8`,
+;; aarch64 `LDRB/STRB` — and the interpreter is itself native code, so it can
+;; and must perform the same access.  These used to key a per-STATE hash table,
+;; which made every interpreted `(setf (mem-ref A :u8) v)` a SILENT NO-OP: the
+;; write landed in a throwaway hash that MVM-INTERPRET discards when it
+;; returns, and the next form's fresh state read the address back as 0.  That
+;; manufactures FALSE PASSES — a probe that scribbles on a live structure and
+;; then "observes" that the structure still parses has in fact written nothing
+;; (task #272; it nearly shipped as a robustness result in #271).  Same family
+;; as the SHR/SAR word-level fix: a simulation that is "safer" than the ISA is
+;; still a divergence from it.
+;;
+;; The one deliberate deviation kept is the MV region (see %mv-slot-index):
+;; those u64 slots stay in the VALUE-domain MV-VALS vector so the moving GC
+;; traces them, and they are intercepted before any of this runs.
+;;
+;; Byte order follows the machine: MEM-READ/MEM-WRITE assemble little-endian,
+;; which is what every target that runs this interpreter (x64, aarch64, i386)
+;; actually is.  A big-endian host would need the loop order flipped.
 (defun mem-read-byte (state addr)
-  (gethash addr (mvm-memory state) 0))
+  (declare (ignore state))
+  (mem-ref addr :u8))
 
 (defun mem-write-byte (state addr byte)
-  (setf (gethash addr (mvm-memory state)) (logand byte #xFF)))
+  (declare (ignore state))
+  (let ((stored (setf (mem-ref addr :u8) (logand byte #xFF))))
+    stored))
 
 ;; The simulated MV region: count slot #x10000090, extra-value slots
 ;; #x10000098 + i*8 (i = 0..19; the native reserved region ends at
@@ -258,6 +281,37 @@
         (setf (svref (mvm-mv-vals state) mv) (%word->val val))
         (dotimes (i (ash 1 width))
           (mem-write-byte state (+ addr i) (logand (ash val (* i -8)) #xFF))))))
+
+;; VALUE-domain load/store — what OP-LOAD and OP-STORE actually need.
+;;
+;; A register slot holds a VALUE whose native WORD is what the machine
+;; register would contain, so :load must deposit "the value whose word is the
+;; loaded bits" and :store must write "the word of the value in the register".
+;; For u64 that is EXACTLY what a compiled `(mem-ref a :u64)` /
+;; `(setf (mem-ref a :u64) v)` does — memory-width-code marks u64 needs-tag
+;; NIL, so compile-mem-ref emits a bare `:load w=3` with no re-tag and
+;; compile-setf a bare `:store w=3` with no untag.  Delegating to them keeps
+;; the value domain intact end to end: a stored heap pointer or a negative
+;; fixnum round-trips bit-for-bit, where the byte-splitting path below would
+;; reassemble it as an unsigned magnitude and %word->val would hand back the
+;; wrong sign.  It is also 8 memory touches cheaper.
+;;
+;; For u8/u16/u32 the loaded word is small, so the word-integer path is exact;
+;; %word->val / %val->word here are precisely REG-SET / REG-GET.
+(defun mem-read-value (state addr width)
+  "The VALUE a register receives from (:load Vd Vaddr WIDTH) at ADDR."
+  (let ((mv (%mv-slot-index addr width)))
+    (cond (mv (svref (mvm-mv-vals state) mv))
+          ((= width 3) (mem-ref addr :u64))
+          (t (%word->val (mem-read state addr width))))))
+
+(defun mem-write-value (state addr val width)
+  "Store VAL — the VALUE held in a register — as (:store Vaddr Vs WIDTH) does."
+  (let ((mv (%mv-slot-index addr width)))
+    (cond (mv (setf (svref (mvm-mv-vals state) mv) val))
+          ((= width 3)
+           (let ((stored (setf (mem-ref addr :u64) val))) stored))
+          (t (mem-write state addr (%val->word val) width)))))
 
 ;;; Object representation — REAL native CL objects (no simulation).  The
 ;;; interpreter is itself native code, so it allocates native objects and
@@ -1279,12 +1333,31 @@
                  (reg-set regs vd (logxor (reg-get regs va) (reg-get regs vb)))
                  (setf pc npc3)))))
 
+          ;; SHL IS WORD-LEVEL, exactly like SHR/SAR below and exactly like the
+          ;; translators (x64 `SHL r64,imm`; aarch64 `LSL Xd,Xn,#imm`) — it
+          ;; shifts the TAGGED WORD, it does not untag/shift/re-tag.
+          ;;
+          ;; This was the last value-level shift left behind by the #165
+          ;; SHR/SAR fix, and it silently broke every `:sar`/`:shl` UNTAG-then-
+          ;; RETAG pair the compiler emits — compile-mem-ref and compile-setf's
+          ;; mem-ref path, and compile-val-to-word.  A word-level SAR followed by
+          ;; a value-level SHL is not an identity: it is `(w>>1<<1)`, so an ODD
+          ;; word came back one lower.  Measured on bare metal, that is exactly
+          ;; the reported `(setf (mem-ref A :u8) 213)` ⇒ 212 (task #272), even
+          ;; parity untouched; and `(%val->word <cons>)` handed back the cons
+          ;; address minus 1.
+          ;;
+          ;; It is a strictly narrower change than it looks: for any EVEN word —
+          ;; every tagged fixnum, which is every value the ash/tagging call sites
+          ;; shift — `2*((w>>1)<<amt)` and `w<<amt` are the SAME integer, so the
+          ;; result is bit-identical.  Only odd words (cons/char/object pointers,
+          ;; the NIL and T immediates, and raw untagged intermediates) change,
+          ;; and for those the old answer was simply wrong.
           (#.+op-shl+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
                (multiple-value-bind (amt npc3) (fetch-byte bc npc2)
-                 (reg-set regs vd
-                       (tag-fixnum (ash (untag-fixnum (reg-get regs vs)) amt)))
+                 (reg-set regs vd (ash (reg-get regs vs) amt))
                  (setf pc npc3)))))
 
           ;; SHR / SAR ARE WORD-LEVEL, exactly as the native translators
@@ -1762,28 +1835,34 @@
                    ;; extra halving collapsed adjacent 8-byte slots to 2-byte
                    ;; physical spacing, corrupting the MV-VALUES region — every
                    ;; secondary's high 32 bits got the next slot's value).
-                   (reg-set regs vd (mem-read state addr width)))
+                   ;;
+                   ;; MEM-READ-VALUE deposits the VALUE whose word is the loaded
+                   ;; bits — the register-domain equivalent of the native
+                   ;; MOVZX/MOV — so no re-tagging happens here.  compile-mem-ref
+                   ;; emits the `:shl 1` re-tag itself for u8/u16/u32, exactly as
+                   ;; the translators run it.
+                   (setf (svref regs vd) (mem-read-value state addr width)))
                  (setf pc npc3)))))
 
           (#.+op-store+
            (multiple-value-bind (vaddr npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
                (multiple-value-bind (width npc3) (fetch-byte bc npc2)
-                 (let ((addr (reg-get regs vaddr)) (val (reg-get regs vs)))
+                 (let ((addr (reg-get regs vaddr)))
                    ;; See op-load: the address is already untagged by compile-
                    ;; mem-ref's :shr; reg-get restores its word — do NOT untag
                    ;; again (the extra halving collapsed MV slot spacing 4x).
-                   ;; mem-ref :u64 (width 3) is RAW — no tag shift (CLHS-aligned
-                   ;; with the native mem-ref).  Storing the untagged value here
-                   ;; while op-load %word->val's on read gave a one-SAR asymmetry
-                   ;; that corrupted the multiple-value slots (#x10000090/98): the
-                   ;; MV-count 2 read back as 1, so values/multiple-value-list/
-                   ;; nth-value/MOD saw only the primary (WS4 oracle).  Keep the
-                   ;; untag for :u8/:u32 (width<3), which want the raw low bytes;
-                   ;; store the WORD (reg-get) for :u64 so op-load's %word->val
-                   ;; round-trips it (works for fixnum AND pointer MV values).
-                   (when (and (< width 3) (integerp val)) (setf val (untag-fixnum val)))
-                   (mem-write state addr val width))
+                   ;;
+                   ;; The VALUE is not untagged here either, and that is the
+                   ;; second half of task #272.  A `(when (< width 3) …
+                   ;; untag-fixnum)` used to sit here, so a u8/u16/u32 store went
+                   ;; through TWO untags: compile-setf already emits
+                   ;; `:sar dest dest 1` ahead of the `:store`, and the
+                   ;; translators then do a plain `MOV [addr],r8` / `STRB` with
+                   ;; no shift of their own.  Halving again wrote v/2.  Read the
+                   ;; emitted SEQUENCE, not the opcode name: :store is a bare
+                   ;; machine store at EVERY width.
+                   (mem-write-value state addr (svref regs vs) width))
                  (setf pc npc3)))))
 
           (#.+op-fence+ nil) ; memory barrier: no-op

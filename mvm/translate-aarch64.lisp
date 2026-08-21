@@ -3485,6 +3485,33 @@
              ;; for larger counts — a64-load-imm64 picks the right form.
              (a64-load-imm64 buf +a64-x16+ header-imm)
              (a64-stur buf +a64-x16+ +a64-x24+ 0)
+             ;; ---- Zero-initialise the payload (CRITICAL for GC correctness) ----
+             ;; Port of translate-x64.lisp's +op-alloc-obj+ zero-init.  The
+             ;; Cheney scan is a FLAT word-by-word walk that does not respect
+             ;; object headers, so any payload word a callsite has not written
+             ;; yet is scanned as a potential root; if it looks like a tagged
+             ;; pointer into from-space the collector stamps a forwarding
+             ;; pointer over an unrelated live object.  x64 closed this in
+             ;; 2faad76/8a76e16; aarch64 never got it, and QEMU HID the gap
+             ;; because it zero-fills guest RAM.  On real hardware (Pi Zero 2 W)
+             ;; DRAM comes up as garbage, and a sparsely-filled object — e.g. a
+             ;; readtable with only its macro chars set — faults in the reader.
+             ;; Payload = the +8 padding word plus COUNT data words = COUNT+1.
+             ;; The 16-byte alignment tail is deliberately left alone, matching
+             ;; x64 (zeroing it there shifted code layout and re-exposed a
+             ;; separate residual).  XZR is a free zero source.  x16 held the
+             ;; header and is dead here, and pd is written afterwards, so using
+             ;; x16 as a cursor is safe even when pd IS x16.
+             (let ((words (+ count 1)))
+               (if (<= (+ 8 (* count 8)) 255)   ; STUR's signed 9-bit offset
+                   (dotimes (i words)
+                     (a64-stur buf +a64-xzr+ +a64-x24+ (+ 8 (* i 8))))
+                   (progn                        ; past range: walk a cursor
+                     (a64-add-imm buf +a64-x16+ +a64-x24+ 8)
+                     (dotimes (i words)
+                       (a64-stur buf +a64-xzr+ +a64-x16+ 0)
+                       (when (< (1+ i) words)
+                         (a64-add-imm buf +a64-x16+ +a64-x16+ 8))))))
              ;; Tagged result = alloc_ptr + 9 (object tag matches x64).
              (a64-add-imm buf pd +a64-x24+ 9)
              (if (<= total-size #xFFF)
@@ -3678,6 +3705,26 @@
              (a64-movz buf +a64-x9+ #x32 0)
              (a64-orr-reg buf +a64-x16+ +a64-x16+ +a64-x9+)
              (a64-stur buf +a64-x16+ +a64-x24+ 0)
+             ;; ---- Zero-initialise the payload (CRITICAL for GC correctness) ----
+             ;; Same contract as +op-alloc-obj+ above, but COUNT is a RUNTIME
+             ;; value, so this is a loop rather than unrolled stores.  This is
+             ;; the site that actually bit us on real hardware: a readtable is
+             ;; an ARRAY, and its unset character slots held DRAM garbage.
+             ;; x16 = cursor (dead: it held the header, and pd is written
+             ;; later) and x9 = end (dead: it held the #x32 subtag constant).
+             ;; Neither can alias pcount, which ensure-src puts in a vreg phys
+             ;; reg (x0-x3 / x19-x23) or x17.
+             (a64-add-imm buf +a64-x16+ +a64-x24+ 8)             ; cursor
+             (a64-add-imm buf +a64-x9+ pcount 1)                 ; words = N+1
+             (a64-lsl-imm buf +a64-x9+ +a64-x9+ 3)               ; bytes
+             (a64-add-reg buf +a64-x9+ +a64-x16+ +a64-x9+ 0 0)   ; end
+             (let ((loop-start (a64-current-index buf)))
+               (a64-stur buf +a64-xzr+ +a64-x16+ 0)
+               (a64-add-imm buf +a64-x16+ +a64-x16+ 8)
+               (a64-cmp-reg buf +a64-x16+ +a64-x9+)
+               ;; B.LO (unsigned <) back to the store.  N=0 still writes the
+               ;; single padding word, then falls through on the first compare.
+               (a64-bcond buf #b0011 (- loop-start (a64-current-index buf))))
              ;; Aligned size = floor((count+3)/2)*16.
              (a64-add-imm buf +a64-x17+ pcount 3)
              (a64-lsr-imm buf +a64-x17+ +a64-x17+ 1)

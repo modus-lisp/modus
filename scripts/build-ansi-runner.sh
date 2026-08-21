@@ -15,7 +15,7 @@ set -e
 
 TESTS_ROOT=/home/claude/modus-ref/ansi-test/tests
 AUX=/home/claude/modus-ref/ansi-test/auxiliary/ansi_aux
-LITE=/home/claude/modus/scripts/lite-universe.lisp
+LITE="$(cd "$(dirname "$0")" && pwd)/lite-universe.lisp"
 OUT=$1
 SUBDIRS="$2"
 
@@ -40,7 +40,7 @@ done
 # Stubs AFTER aux so they win via last-defun-wins (in particular
 # make-scaffold-copy / check-scaffold-copy — the official defstruct
 # versions fail at runtime EVAL and silently kill rt-run).
-echo "(load \"/home/claude/modus/scripts/aux-stubs.lisp\")" >> "$OUT"
+echo "(load \"$(cd "$(dirname "$0")" && pwd)/aux-stubs.lisp\")" >> "$OUT"
 
 # Test files from each subdir, alphabetical, skipping load.lsp + *-aux.lsp.
 for subdir in $SUBDIRS; do

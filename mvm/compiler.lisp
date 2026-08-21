@@ -5820,11 +5820,37 @@
            (if (cdr saved)
                (setf (gethash (car saved) *macro-table*) (cdr saved))
                (remhash (car saved) *macro-table*)))))
-      ;; WITH-OPEN-FILE — compile as let binding stream var to a dummy file stream
+      ;; WITH-OPEN-FILE — OPEN the file named, run the body, CLOSE it.
+      ;;
+      ;; This used to bind the variable to (%make-file-stream) — a DUMMY stream —
+      ;; and discard the filename and every option.  It never opened anything, so
+      ;; the body read from a stream attached to no file: character reads returned
+      ;; the eof value and binary reads signalled "file-length: stream is closed".
+      ;; Silent, because returning :EOF is what an empty file does too.  A caller
+      ;; using OPEN/CLOSE by hand got correct data, which is why it survived — the
+      ;; idiomatic form was the broken one.
+      ;;
+      ;; It was a placeholder from before hosted file I/O existed.  It does now:
+      ;; OPEN, CLOSE, READ-BYTE/WRITE-BYTE, READ-SEQUENCE/WRITE-SEQUENCE and
+      ;; FILE-POSITION all verified against a file written by this image and read
+      ;; back by the host.  So the expansion is simply the real one, with
+      ;; UNWIND-PROTECT (which this compiler supports and runs) so the stream is
+      ;; closed on a non-local exit.
+      ;;
+      ;; (with-open-file (VAR FILENAME . OPTIONS) BODY...) — OPTIONS are passed
+      ;; through to OPEN untouched: :direction, :element-type, :if-exists and the
+      ;; rest are OPEN's business, not this macro's.
       ((= op-name 365656143)  ; WITH-OPEN-FILE
-       (let ((spec (cadr form))
-             (body (cddr form)))
-         (compile-form `(let ((,(car spec) (%make-file-stream))) ,@body) env dest)))
+       (let* ((spec (cadr form))
+              (var (car spec))
+              (filename (cadr spec))
+              (options (cddr spec))
+              (body (cddr form)))
+         (compile-form
+          `(let ((,var (open ,filename ,@options)))
+             (unwind-protect (progn ,@body)
+               (when ,var (close ,var))))
+          env dest)))
       ;; WITH-OUTPUT-TO-STRING — create string-output-stream, run body, return string
       ((= op-name 163216281)  ; WITH-OUTPUT-TO-STRING
        (let* ((spec (cadr form))
@@ -7548,6 +7574,27 @@
   (let ((result nil))
     (labels ((scan (form in-lambda)
                (unless (consp form) (return-from scan))
+               ;; DON'T WALK A QUASIQUOTE TEMPLATE.  Same hazard %COLLECT-FREE-VARS
+               ;; documents: `(cond ,@(cdr clauses))' reads as (SB-INT:QUASIQUOTE
+               ;; (COND #S(COMMA :EXPR (CDR CLAUSES) :KIND 2))), and the template's
+               ;; sublists are DATA, not forms.  SCAN descended into them anyway and
+               ;; handed (COND <comma>) to %CFV-MACROEXPAND, whose COND expander did
+               ;; (car clause) on a COMMA struct -> type error.  The build caught it,
+               ;; printed "WARN macroexpand COND failed at build time", and replaced
+               ;; that form with a runtime (error ...).  19 COND expansions died this
+               ;; way in a single CLI build; with the guard, 0.
+               ;;
+               ;; NOT the cause of the WITH-OPEN-FILE bug, though I assumed it was:
+               ;; with-open-file still hands its body a closed stream after this fix.
+               ;; That is a separate defect and this comment used to claim otherwise.
+               ;;
+               ;; Scan the EXPANSION rather than skipping outright: a comma payload
+               ;; is a real expression and `(foo ,(setq x 1))' really does mutate x,
+               ;; so the boxing decision still needs to see it.  EXPAND-BACKQUOTE is
+               ;; what COMPILE-FORM lowers anyway, so this scans what actually runs.
+               (when (and (consp form) (eq (car form) 'sb-int:quasiquote))
+                 (scan (expand-backquote (cadr form)) in-lambda)
+                 (return-from scan))
                (let ((mx (%cfv-macroexpand form)))
                  (when mx (setq form mx)))
                (unless (consp form) (return-from scan))

@@ -330,8 +330,26 @@
               (usb-set-port-speed speed))
             (return nil)))
         (setq i (+ i 1))))
-    ;; Clear port enable change (W1C bit 3) and connect detect (W1C bit 1)
-    (dwc2-write (dwc2-hprt0) (logior (hprt0-prtenchng) (hprt0-prtconndet)))
+    ;; Clear port enable change (W1C bit 3) and connect detect (W1C bit 1).
+    ;;
+    ;; MUST be based on the CURRENT HPRT0, not written bare.  HPRT0 mixes W1C
+    ;; status bits with ordinary R/W control bits — notably PPWR (bit 12), the
+    ;; port POWER enable.  Writing just the two W1C bits sends 0 to PPWR and
+    ;; cuts power to the port, so the device drops off the bus and every
+    ;; subsequent control transfer fails.  Measured on a real Pi Zero 2 W:
+    ;;     after dwc2-init   HPRT0 = 0x21401  (PCSTS=1 connected, PPWR=1)
+    ;;     after this write  HPRT0 = 0x00400  (PCSTS=0, PPWR=0 -- dead port)
+    ;; and usb-enumerate then failed at its first GET_DEVICE_DESCRIPTOR with
+    ;; "D1E", which looks exactly like a transfer bug and is not one.
+    ;;
+    ;; QEMU does not model port power, so this was invisible under emulation —
+    ;; the same class as the zeroed-DRAM dependency: emulator-benign, fatal on
+    ;; silicon.  dwc2-hprt0-read-safe masks the W1C bits OUT of the read, so
+    ;; ORing in exactly the ones we intend to clear is the correct idiom; the
+    ;; assert/deassert-reset writes above already use it.
+    (dwc2-write (dwc2-hprt0)
+                (logior (dwc2-hprt0-read-safe)
+                        (hprt0-prtenchng) (hprt0-prtconndet)))
     ;; Print speed
     (write-byte 80) (write-byte 79) (write-byte 82) (write-byte 84)  ; "PORT"
     (write-byte 58)  ; ":"

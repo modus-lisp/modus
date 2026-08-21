@@ -244,39 +244,17 @@
   (write-string-serial \"MODUS-CL\")
   (write-char-serial 10)
 
-  ;; BARE-METAL BSS-EQUIVALENT INIT.  On Linux the ELF BSS is zero-filled by
-  ;; the kernel; on bare metal these words hold whatever the firmware left in
-  ;; RAM, and symbol-value would dereference the garbage at 0x10000080 as the
-  ;; global-alist head.  Unlike the x64 bare image — whose boot-x64.lisp
-  ;; pre-zeroes 0x10000180 / 0x10000400 / 0x10000C70 — boot-rpi-cl.lisp zeroes
-  ;; NOTHING, so this list is the union of the x64 CL REPL's and the
-  ;; QEMU-virt bare AArch64 image's (build-aarch64.lisp kernel-main).
-  ;; On the Pi these are plain identity-mapped DRAM (QEMU virt needs an MMU
-  ;; remap to make 0x1000xxxx exist at all).
-  (setf (mem-ref #x10000080 :u64) 0)   ; global variable alist head
-  (setf (mem-ref #x10000088 :u64) 0)   ; symbol intern table
-  (setf (mem-ref #x10000090 :u64) 0)   ; MV count
-  (setf (mem-ref #x10000098 :u64) 0)   ; MV values
-  (setf (mem-ref #x10000148 :u64) 0)   ; keyword intern table
-  (setf (mem-ref #x10000150 :u64) 0)   ; dynamic nargs
-  (setf (mem-ref #x10000158 :u64) 0)   ; intern counter
-  (setf (mem-ref #x10000170 :u64) 0)   ; package-by-hash root
-  ;; NOT 0x10000160/168 — those are code_base/code_end, written by
-  ;; emit-aarch64-code-bounds-init in the boot preamble.  FUNCTIONP's
-  ;; in-code-range arm reads them; zeroing here would undo the boot.
-  (setf (mem-ref #x10000180 :u64) 0)   ; handler-case setjmp frame
-  (setf (mem-ref #x10000188 :u64) 0)
-  (setf (mem-ref #x100001C0 :u64) 0)   ; no-handler rescue fallback
-  (setf (mem-ref #x10000C30 :u64) 0)   ; fault diag slots
-  (setf (mem-ref #x10000C38 :u64) 0)
-  (setf (mem-ref #x10000C40 :u64) 0)
-  (setf (mem-ref #x10000C48 :u64) 0)
-  (setf (mem-ref #x10000C50 :u64) 0)
-  (setf (mem-ref #x10000C58 :u64) 0)
-  (setf (mem-ref #x10000C70 :u64) 0)   ; deadline countdown (no IRQ here)
-  (setf (mem-ref #x10000C80 :u64) 0)   ; %intern-symbol depth counter
-  (setf (mem-ref #x10000DA0 :u64) 0)   ; safepoint boundary
-  (setf (mem-ref #x10010000 :u64) 0)   ; handler-stack depth (aarch64 helpers)
+  ;; NO BSS-EQUIVALENT INIT HERE.  It used to be a ~22-entry list of individual
+  ;; (setf (mem-ref #x1000xxxx :u64) 0) slots, and it was wrong twice over: it
+  ;; ran AFTER the banner above — so write-string-serial's own global reads
+  ;; already walked the garbage alist head at 0x10000080 — and an enumeration
+  ;; can only cover the slots someone remembered, leaving any newly added
+  ;; metadata word uninitialised on hardware and fine under emulation.
+  ;; boot/boot-rpi-cl.lisp step 0 now bulk-zeroes 0x10000000..0x10001000 plus
+  ;; 0x10010000 before a single Lisp instruction runs, which is also the only
+  ;; place the bulk form is legal: the two words that must survive
+  ;; (0x10000F00 DTB pointer, 0x10000160/168 code bounds) are written by that
+  ;; same preamble afterwards.
 
   ;; GC METADATA — must precede the first allocation.  The x64 bare image gets
   ;; this from boot-x64.lisp's kernel64 entry; the AArch64 boot publishes only

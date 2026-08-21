@@ -290,8 +290,47 @@
   (let ((sp 31) (x0 0) (x16 16) (x17 17)
         (x24 24) (x25 25) (x26 26))
 
-    ;; --- 0. FIRMWARE DEVICE-TREE POINTER (#271) ---------------------------
-    ;; MUST BE FIRST.  X0 holds the DTB physical address on entry per the
+    ;; --- 0. ZERO THE RUNTIME METADATA WINDOW (the BSS stand-in) -----------
+    ;; On Linux the ELF BSS is zero-filled by the kernel.  On bare metal these
+    ;; words hold whatever the firmware left in RAM, and the very first Lisp
+    ;; function that reads a global dereferences the garbage at 0x10000080 as
+    ;; the global-alist head.  QEMU HID this for the entire life of this image
+    ;; because it zero-fills guest RAM; on a real Pi Zero 2 W the board printed
+    ;; "BOOT" and then died before "MODUS-CL" with ESR 0x96000004 (data abort,
+    ;; translation fault L0) on a garbage FAR — exactly the outcome section 5
+    ;; predicts for a fault in Lisp init.
+    ;;
+    ;; This REPLACES a ~22-entry enumerated list of individual slots that used
+    ;; to live in build-rpi-cl-repl.lisp's kernel-main prologue.  That list was
+    ;; wrong twice over: it ran AFTER the MODUS-CL banner (so the banner itself
+    ;; walked the garbage alist), and being an enumeration it could only ever
+    ;; cover the slots someone remembered — a new metadata word would be
+    ;; uninitialised on hardware and fine under emulation, i.e. invisible.
+    ;;
+    ;; Doing it HERE rather than in Lisp is what makes the bulk form legal:
+    ;; the two words that must NOT be zeroed are written by this same preamble
+    ;; AFTERWARDS — 0x10000F00 (the DTB pointer, step 0a below) and
+    ;; 0x10000160/168 (code_base/code_end, step 6).  A Lisp-side bulk zero
+    ;; would have to special-case both.
+    ;;
+    ;; Range 0x10000000..0x10001000 covers every documented slot (the highest
+    ;; is the MCGC/bitmap config block ending at 0x10000EA8), plus the lone
+    ;; AArch64 handler-stack depth word at 0x10010000.  X0 is untouched, so the
+    ;; firmware DTB pointer survives into step 0a.
+    (emit-aarch64-load-imm64 buf x16 #x10000000)
+    (emit-aarch64-load-imm64 buf x17 #x10001000)
+    (let ((loop-start (a64-current-index buf)))
+      (a64-stur buf +a64-xzr+ x16 0)
+      (a64-add-imm buf x16 x16 8)
+      (a64-cmp-reg buf x16 x17)
+      ;; B.LO (unsigned <) back to the store.
+      (a64-bcond buf #b0011 (- loop-start (a64-current-index buf))))
+    (emit-aarch64-load-imm64 buf x16 #x10010000)
+    (a64-stur buf +a64-xzr+ x16 0)
+
+    ;; --- 0a. FIRMWARE DEVICE-TREE POINTER (#271) --------------------------
+    ;; MUST FOLLOW step 0, which zeroes the window this slot lives in, and
+    ;; must precede step 2.  X0 holds the DTB physical address on entry per the
     ;; AArch64 Linux boot protocol, and step 2 below uses X0 as the UART data
     ;; scratch register.  Three instructions — MOVZ + MOVK to materialise the
     ;; slot address (0x10000F00 has exactly two non-zero halfwords, so

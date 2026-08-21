@@ -652,9 +652,27 @@
 "
       ""))
 
+;; MODUS_NET_NOAUTO=1 — build the net stack IN but do not start it.
+;;
+;; This is the on-hardware development knob.  With the pipeline spliced,
+;; kernel-main runs DHCP -> TCP -> HTTP before the REPL, which is exactly wrong
+;; when the NIC is one Modus cannot drive yet: DHCP does not error, it WAITS,
+;; so the board looks wedged and never reaches a prompt.  With NOAUTO the whole
+;; stack — dwc2 host, usb enumeration, cdc-ether, ip, http-client — is compiled
+;; in and reachable by name, and the image boots straight to the serial REPL,
+;; where `(dwc2-init)`, `(usb-enumerate)`, `(usb-control-transfer ...)` and
+;; `(usb-bulk-receive ...)` can be driven BY HAND against real silicon.  The
+;; pipeline is then just `(run-net-pipeline)` typed at the prompt.
+;;
+;; That turns bring-up for a new NIC from a ~20-minute rebuild per hypothesis
+;; into a line typed at a live board.
+(defvar *net-noauto-p*
+  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_NET_NOAUTO")))
+    (and v (string= v "1"))))
+
 ;; Spliced into kernel-main.  "" when the flag is off => zero bytes added.
 (defvar *net-pipeline-call*
-  (if *net-build-p*
+  (if (and *net-build-p* (not *net-noauto-p*))
       "  (handler-case (run-net-pipeline) (t (c) nil))
 "
       ""))

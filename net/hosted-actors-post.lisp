@@ -1156,3 +1156,452 @@
         (%gc-write64 (+ res #x1D0) (if (zerop rc) 0 1))
         (%gc-write64 (+ res #x1D8) (%gc-meta-read (+ r0 #x20) k))
         res)))
+
+;;; ============================================================
+;;; STEP 4 — ACTORS ON TWO THREADS
+;;; ============================================================
+;;;
+;;; ONE actor system, ONE run queue, ONE mailbox pool, ONE staging area, ONE
+;;; scheduler lock — and TWO kernel threads pulling work out of it.
+;;;
+;;; WHAT MAKES THIS SAFE IS THE STEP-1 PROTOCOL AND NOTHING ELSE.  Every
+;;; RESTORE-CONTEXT here is issued WHILE HOLDING the scheduler lock, and the
+;;; switch releases it after the stack switch.  That is not a style rule: an
+;;; actor becomes claimable by the other thread the instant the lock drops, so
+;;; releasing before the stack has moved would let two CPUs run on one stack.
+;;; It also means a RESTORE-CONTEXT issued WITHOUT the lock would zero a lock
+;;; the OTHER thread is holding — which is why the thread-2 hand-off below takes
+;;; the lock first even though it has nothing to protect.
+;;;
+;;; THE TOPOLOGY, and it is deliberately not "let everything migrate":
+;;;   thread 1  runs actor 1, the primordial actor, on the PROCESS stack.  It
+;;;             never YIELDs, so it is never enqueued and can never be picked up
+;;;             by the other thread; it drives the test and reports.
+;;;   thread 2  runs actors 2 and 3 on their own 64 KB band stacks, alternating
+;;;             through the SHARED run queue with ordinary YIELD.
+;;; Messages therefore cross a thread boundary twice per round trip: actor 1
+;;; (thread 1) -> actor 2 (thread 2) -> actor 3 (thread 2) -> actor 1 again.
+;;;
+;;; NOBODY BLOCKS, and that is a design constraint, not laziness.  RECEIVE's
+;;; blocking path ends at AP-SCHEDULER when the run queue is empty, and the
+;;; hosted AP-SCHEDULER cannot be made correct under threads without switching
+;;; off the blocking actor's stack first — the actor is marked BLOCKED and its
+;;; context saved, so the other thread may resume it onto the very stack we
+;;; would still be standing on.  The workers use TRY-RECEIVE + YIELD instead,
+;;; which is exactly what net/isolated-net.lisp's net-domain already does, and
+;;; every selftest here asserts the AP-SCHEDULER counter stayed at 0.
+;;;
+;;; THREAD-BLOCK WORDS STEP 4 ADDS (all inside the 0x600 the selftest zeroes):
+;;;   +0x400  thread 2's SCHEDULER save area (0x40) — where an actor hands the
+;;;           thread back so it can exit
+;;;   +0x440  STOP flag                    +0x448/+0x450  actor 2 ticks cpu0/cpu1
+;;;   +0x458/+0x460  actor 3 ticks         +0x468/+0x470  actor 1 ticks
+;;;   +0x478  actor 2 messages forwarded   +0x480  actor 3 messages logged
+;;;   +0x488  actor 2 structural errors    +0x490  actor 3 structural errors
+;;;   +0x498  driver bad acks              +0x4A0  thread 2 dispatches
+;;;   +0x4A8  thread 2 idle spins          +0x4B0  1 = an actor handed the
+;;;                                                thread back (0 = gave up)
+;;;   +0x4B8  driver poll iterations       +0x4C0  driver saw actor 2 advance
+;;;   +0x4C8  actor 2's progress counter   +0x4D0  thread 2's region block
+;;;   +0x4D8  thread 2's alloc ptr         +0x4E0  thread 2's region gc count
+;;;   +0x4E8  actor 2's own region gc count (step 5)
+;;;   +0x4F0  BUDGET                       +0x4F8  thread 2's gettid
+;;;   +0x500  thread 2 reached its dispatch loop
+;;;   +0x508  actor 2 chain-survival errors (step 5)
+;;;   +0x510  actor 3 chain-survival errors (step 5)
+;;;   +0x518  NLINKS for the threaded workers (0 = step 4, >0 = step 5)
+;;;   +0x520  actor 2 forced collections   +0x528  actor 1 forced collections
+;;;   +0x530  actor 1 chain-survival errors (step 5)
+;;;   +0x538  thread 1's region block (step 5)
+
+(defun %ha-tb-bump (tb off)
+  (%gc-write64 (+ tb off) (+ (%gc-read64 (+ tb off)) 1)))
+
+;; WHICH THREAD AM I ON?  The :CPU-ID slot, read through this thread's own GS
+;; base.  BASE+0 counts cpu 0's iterations, BASE+8 counts cpu 1's, so a single
+;; pair of numbers per actor says where that actor actually ran.
+(defun %ha-cpu-tick (tb base)
+  (if (zerop (percpu-ref 16))
+      (%ha-tb-bump tb base)
+      (%ha-tb-bump tb (+ base 8))))
+
+(defun %ha-mt-stop-p (tb) (if (zerop (%gc-read64 (+ tb #x440))) nil t))
+
+(defun %ha-mt-park (tb)
+  (loop
+    (%ha-cpu-tick tb #x448)
+    (if (%ha-mt-stop-p tb)
+        (if (= (percpu-ref 16) 1)
+            (progn
+              (spin-lock (sched-lock-addr))
+              (actor-set (get-current-actor) #x00 3)
+              (set-current-actor 0)
+              (restore-context (+ tb #x400)))
+            (yield))
+        (yield))))
+
+(defun %ha-mt-worker-a ()
+  "ACTOR 2.  Forward every message to actor 3, unchanged, checking its shape on
+   the way through.  TRY-RECEIVE + YIELD: never blocks, so AP-SCHEDULER is
+   never reached and the run queue is never asked for work that is not there."
+  (let ((tb (%ha-thread-block))
+        (n (%ha-nmsg))
+        (nl 0)
+        (chain nil)
+        (want 0)
+        (i 1))
+    (setq nl (%gc-read64 (+ tb #x518)))
+    (if (> nl 0)
+        (progn (setq chain (%gc-chain-build nl))
+               (setq want (%ha-chain-want nl)))
+        0)
+    (loop
+      (when (> i n) (return 0))
+      (%ha-cpu-tick tb #x448)
+      (let ((m (try-receive)))
+        (if (zerop m)
+            (yield)
+            (progn
+              (if (= (%ha-msg-ok m i) 1) 0 (%ha-tb-bump tb #x488))
+              (if (> nl 0)
+                  (if (= (%gc-chain-check chain nl) want)
+                      0 (%ha-tb-bump tb #x508))
+                  0)
+              (send 3 m)
+              (%gc-write64 (+ tb #x478) i)
+              (%gc-write64 (+ tb #x4C8) i)
+              (setq i (+ i 1))
+              (yield)))))
+    (%gc-write64 (+ tb #x4E8) (%ha-my-gc-count))
+    (%ha-mt-park tb)))
+
+(defun %ha-mt-worker-b ()
+  "ACTOR 3.  Log the three fixnums of every forwarded message and acknowledge to
+   actor 1 — which is on the OTHER thread, so the ack crosses the boundary."
+  (let ((tb (%ha-thread-block))
+        (n (%ha-nmsg))
+        (nl 0)
+        (chain nil)
+        (want 0)
+        (i 1))
+    (setq nl (%gc-read64 (+ tb #x518)))
+    (if (> nl 0)
+        (progn (setq chain (%gc-chain-build nl))
+               (setq want (%ha-chain-want nl)))
+        0)
+    (loop
+      (when (> i n) (return 0))
+      (%ha-cpu-tick tb #x458)
+      (let ((m (try-receive)))
+        (if (zerop m)
+            (yield)
+            (progn
+              ;; ACTOR 3 CHECKS BUT DOES NOT FORCE, and that is a root-window
+              ;; fact, not a preference.  Thread 2's region's root window is
+              ;; [live SP, actor-stack-base + 4*64K).  Actor 3's stack sits
+              ;; ABOVE actor 2's, so a collection triggered from actor 3 starts
+              ;; above actor 2's frames and would not scan actor 2's chain at
+              ;; all.  Triggered from actor 2 the window covers actor 2's live
+              ;; frames AND the whole of actor 3's stack, so BOTH actors' roots
+              ;; are seen.  Actor 3 therefore holds its chain live across the
+              ;; collections ACTOR 2 forces, and checks it every message.
+              (if (> nl 0)
+                  (if (= (%gc-chain-check chain nl) want)
+                      0 (%ha-tb-bump tb #x510))
+                  0)
+              (if (consp m)
+                  (if (consp (cdr m))
+                      (let ((e (%ha-log-entry (- i 1))))
+                        (%gc-write64 e (car m))
+                        (%gc-write64 (+ e 8) (car (cdr m)))
+                        (%gc-write64 (+ e 16) (cdr (cdr m)))
+                        (%gc-write64 (+ e 24) 1))
+                      (%ha-tb-bump tb #x490))
+                  (%ha-tb-bump tb #x490))
+              (send 1 (+ 900000 i))
+              (%gc-write64 (+ tb #x480) i)
+              (setq i (+ i 1))
+              (yield)))))
+    (%ha-mt-park tb)))
+
+(defun %ha-mt-entry-a ()
+  (- (%gc-word-of (fn-addr %ha-mt-worker-a) (+ (%ha-base) #x80)) 3))
+(defun %ha-mt-entry-b ()
+  (- (%gc-word-of (fn-addr %ha-mt-worker-b) (+ (%ha-base) #x80)) 3))
+
+;;; ---- THREAD 2's SCHEDULER ------------------------------------------------
+;;;
+;;; It is a scheduler in the only sense that matters here: it takes the lock,
+;;; pulls an actor off the SHARED run queue, makes it current in ITS OWN per-CPU
+;;; block, and RESTORE-CONTEXTs into it — the same five steps net/actors.lisp's
+;;; AP-SCHEDULER performs on bare metal, minus the CLI/HLT it cannot execute in
+;;; a process.  It never returns from that switch; the way back is an actor
+;;; RESTORE-CONTEXTing into the save area written here, which is why the area is
+;;; written BEFORE the first dispatch.
+
+(defun %ha-t2-dispatch (tb budget)
+  (let ((i 0))
+    (loop
+      (when (>= i budget) (return 0))
+      (spin-lock (sched-lock-addr))
+      (let ((id (actor-dequeue)))
+        (if (zerop id)
+            (progn
+              (spin-unlock (sched-lock-addr))
+              (%ha-tb-bump tb #x4A8)
+              (setq i (+ i 1)))
+            (progn
+              (%ha-tb-bump tb #x4A0)
+              (set-current-actor id)
+              (actor-set id #x00 1)
+              (percpu-set 40 (actor-get id #x70))
+              (percpu-set 48 (actor-get id #x78))
+              (actor-region-resume id)
+              (restore-context (+ (actor-struct-addr id) #x08))))))
+    0))
+
+(defun %ha-t2-sched-body ()
+  (let ((tb (%ha-thread-block))
+        (budget 0)
+        (r 0))
+    (setq budget (%gc-read64 (+ tb #x4F0)))
+    (%gc-write64 (+ tb #x98) (get-alloc-ptr))
+    (%gc-write64 (+ tb #x4F8) (syscall3 186 0 0 0))
+    ;; ---- MY GS base, MY cpu id, MY region ----
+    (%gc-write64 (+ tb #xD0) (%ha-percpu-init-cpu (%ha-cpu1-percpu-base) 1))
+    (set-current-actor 0)
+    (set-idle-flag 0)
+    (%ha-thread-adopt-region (%gc-read64 (+ tb #x4D0)) (%gc-read64 (+ tb #x340)))
+    (%gc-write64 (+ tb #x4D8) (get-alloc-ptr))
+    (%gc-write64 (+ tb #xB8) (%gc-region))
+    (%gc-write64 (+ tb #xA8) (percpu-ref 16))
+    (%gc-write64 (+ tb #x10) 1)
+    ;; ---- meet the driver, so the test can prove we overlapped ----
+    (%ha-barrier-arrive tb)
+    (%gc-write64 (+ tb #x28) (%ha-barrier-wait tb budget))
+    ;; ---- the way back, recorded before the first dispatch ----
+    (setq r (save-context (+ tb #x400)))
+    (if (zerop r)
+        (progn (%gc-write64 (+ tb #x500) 1)
+               (%ha-t2-dispatch tb budget))
+        0)
+    (%gc-write64 (+ tb #x4B0) (if (zerop r) 0 1))
+    (%gc-write64 (+ tb #x4E0) (%ha-my-gc-count))
+    (%gc-write64 (+ tb #xA0) (get-alloc-ptr))
+    (%gc-write64 (+ tb #x58) 1)
+    0))
+
+(defun %ha-t2-sched-entry ()
+  (- (%gc-word-of (fn-addr %ha-t2-sched-body) (+ (%ha-base) #x80)) 3))
+
+;;; ---- THE DRIVER, which IS actor 1 on thread 1 ---------------------------
+
+(defun %ha-mt-poll-acks (tb n budget)
+  "Collect N acknowledgements with TRY-RECEIVE, never blocking, counting how
+   many poll iterations saw actor 2's progress counter move underneath us.
+   THAT COUNT IS THE PARALLELISM EVIDENCE: a sequential run leaves it at zero,
+   because actor 2 would not be running while this loop is."
+  (let ((i 1)
+        (spins 0)
+        (bad 0)
+        (seen 0)
+        (last (%gc-read64 (+ tb #x4C8))))
+    (loop
+      (when (> i n) (return 0))
+      (when (>= spins budget) (return 0))
+      (%ha-cpu-tick tb #x468)
+      (let ((v (%gc-read64 (+ tb #x4C8))))
+        (if (= v last) 0 (progn (setq seen (+ seen 1)) (setq last v))))
+      (let ((a (try-receive)))
+        (if (zerop a)
+            (setq spins (+ spins 1))
+            (progn
+              (if (= a (+ 900000 i)) 0 (setq bad (+ bad 1)))
+              (setq i (+ i 1))))))
+    (%gc-write64 (+ tb #x498) bad)
+    (%gc-write64 (+ tb #x4B8) spins)
+    (%gc-write64 (+ tb #x4C0) seen)
+    (- i 1)))
+
+(defun %ha-mt-send-phase (ida n tb nl)
+  "Send N messages to actor IDA — a dotted tree of non-zero fixnums each, so
+   SEND takes its SERIALISING path (a NIL-terminated list cannot be sent by this
+   serialiser in a hosted image; see net/hosted-actors-post.lisp's header).
+
+   When NL > 0 this is step 5: hold an NL-cons chain live in THIS frame and
+   force a collection of THIS THREAD's OWN region after every send, so the two
+   threads' collections interleave with each other's."
+  (let ((i 1)
+        (chain nil)
+        (want 0))
+    (if (> nl 0)
+        (progn (setq chain (%gc-chain-build nl))
+               (setq want (%ha-chain-want nl)))
+        0)
+    (loop
+      (when (> i n) (return 0))
+      (send ida (cons i (cons (* i 7) (+ i 1000))))
+      (if (> nl 0)
+          (if (= (%gc-chain-check chain nl) want) 0 (%ha-tb-bump tb #x530))
+          0)
+      (setq i (+ i 1)))
+    0))
+
+(defun %ha-mt-selftest (nmsg budget nlinks)
+  "STEP-4 (and, with NLINKS > 0, STEP-5) ACCEPTANCE.  Returns the result
+   block's raw byte address, or 0 if the band or the thread stack is missing."
+  (if (zerop (%ha-carve))
+      0
+      (let* ((band (%ha-base))
+             (tb (%ha-thread-block))
+             (res (+ tb #x600))
+             (rcb3 (+ band #x240))
+             (rcb2 (+ band #x200))
+             (r0 (%gc-region-0))
+             ;; THREAD 1's REGION, whichever it is: its OWN carved one in step
+             ;; 5, region 0 in step 4.  The foreign-ref oracle aims at THIS, so
+             ;; that in step 4 it is pointed at a real, populated heap rather
+             ;; than at an all-zero control block whose range is empty — a check
+             ;; that can only answer 0 is not a check.
+             (tref r0)
+             (k 0) (mode0 0) (ida 0) (idb 0) (tid 0) (got 0)
+             (a0 0) (g0 0) (g3a 0) (g2a 0)
+             (ctl (+ band #x300)))
+        (%ha-zero tb (+ tb #x600))
+        (%ha-zero res (+ res #x300))
+        (%ha-zero (%ha-cpu1-percpu-base) (+ (%ha-cpu1-percpu-base) #x4000))
+        (if (zerop (%ha-thread-stack))
+            0
+            (progn
+              (setq mode0 (%ha-percpu-mode))
+              ;; ---- the actor system, on this thread ----
+              (%ha-actors-bringup nmsg 0)
+              (%ha-percpu-init-cpu (%ha-percpu-base) 0)
+              (setq k (%gc-meta-scale))
+              (%gc-write64 (+ tb #x340) k)
+              (%gc-write64 (+ tb #x4F0) budget)
+              (%gc-write64 (+ tb #x518) nlinks)
+              ;; ---- THREAD 2's REGION ----
+              ;; STACK_BASE is the TOP of the actor-stack slice thread 2's
+              ;; actors live in, not thread 2's own mmap'd stack: thread 2 runs
+              ;; actors on BAND stacks, so that is where its live roots are.
+              ;; Actors 2 and 3 occupy [base+2*64K, base+4*64K), and a root
+              ;; window running from the live SP up to base+4*64K covers both —
+              ;; the running actor's live frames exactly, and the parked one's
+              ;; frames plus some dead stack, which is conservative RETENTION,
+              ;; never corruption (the object-start bitmap rejects the rest).
+              (%gc-region-init rcb3 *ha-r2-from* *ha-r2-to* *ha-rsize*
+                               (+ (actor-stack-base) #x40000) k)
+              ;; ---- THREAD 1's REGION (step 5 only; step 4 stays in region 0) ----
+              (if (> nlinks 0)
+                  (progn
+                    (%gc-region-init rcb2 *ha-r1-from* *ha-r1-to* *ha-rsize*
+                                     (%gc-meta-read (+ r0 #x18) k) k)
+                    (setq tref rcb2)
+                    (%gc-write64 (+ tb #x538) rcb2))
+                  (%gc-write64 (+ tb #x538) r0))
+              (%gc-write64 (+ tb #x4D0) rcb3)
+              ;; ---- per-CPU cells ON, and only now ----
+              (%ha-set-percpu-mode 1)
+              (setq ida (actor-spawn (%ha-mt-entry-a)))
+              (setq idb (actor-spawn (%ha-mt-entry-b)))
+              (setq g0 (%gc-meta-read (+ r0 #x20) k))
+              ;; ---- thread 1 takes its own region, reversibly (step 5) ----
+              (setq a0 (get-alloc-ptr))
+              (if (> nlinks 0) (%gc-region-enter rcb2) 0)
+              ;; ---- the second thread ----
+              (setq tid (%ha-spawn-t2 (%ha-t2-sched-entry)))
+              (%ha-barrier-arrive tb)
+              (%gc-write64 (+ tb #x30) (%ha-barrier-wait tb budget))
+              ;; ---- N messages to actor 2, which is on the OTHER thread ----
+              (%ha-mt-send-phase ida nmsg tb nlinks)
+              (setq got (%ha-mt-poll-acks tb nmsg budget))
+              ;; ---- tell the workers to stop, and wait for the thread ----
+              (%gc-write64 (+ tb #x440) 1)
+              (%gc-write64 (+ res #x00) (%ha-join-t2 budget))
+              (setq g3a (%gc-meta-read (+ rcb3 #x20) k))
+              (setq g2a (%gc-meta-read (+ tref #x20) k))
+              (%gc-write64 (+ res #x08) tid)
+              (%gc-write64 (+ res #x10) ida)
+              (%gc-write64 (+ res #x18) idb)
+              (%gc-write64 (+ res #x20) got)
+              (%gc-write64 (+ res #x28) nmsg)
+              (%gc-write64 (+ res #x30) (%gc-read64 (+ tb #x478)))
+              (%gc-write64 (+ res #x38) (%gc-read64 (+ tb #x480)))
+              (%gc-write64 (+ res #x40) (%gc-read64 (+ tb #x488)))
+              (%gc-write64 (+ res #x48) (%gc-read64 (+ tb #x490)))
+              (%gc-write64 (+ res #x50) (%gc-read64 (+ tb #x498)))
+              (%gc-write64 (+ res #x58) (%gc-read64 (+ band #x190)))
+              (%gc-write64 (+ res #x60) (%gc-read64 (+ tb #x448)))
+              (%gc-write64 (+ res #x68) (%gc-read64 (+ tb #x450)))
+              (%gc-write64 (+ res #x70) (%gc-read64 (+ tb #x458)))
+              (%gc-write64 (+ res #x78) (%gc-read64 (+ tb #x460)))
+              (%gc-write64 (+ res #x80) (%gc-read64 (+ tb #x468)))
+              (%gc-write64 (+ res #x88) (%gc-read64 (+ tb #x470)))
+              (%gc-write64 (+ res #x90) (%gc-read64 (+ tb #x4A0)))
+              (%gc-write64 (+ res #x98) (%gc-read64 (+ tb #x4A8)))
+              (%gc-write64 (+ res #xA0) (%gc-read64 (+ tb #x4B0)))
+              (%gc-write64 (+ res #xA8) (%gc-read64 (+ tb #x4B8)))
+              (%gc-write64 (+ res #xB0) (%gc-read64 (+ tb #x4C0)))
+              (%gc-write64 (+ res #xB8) (%gc-read64 (+ tb #x28)))
+              (%gc-write64 (+ res #xC0) (%gc-read64 (+ tb #x30)))
+              (%gc-write64 (+ res #xC8) (%gc-read64 (+ tb #x500)))
+              (%gc-write64 (+ res #xD0) (%gc-read64 (+ tb #x4F8)))
+              (%gc-write64 (+ res #xD8) (syscall3 186 0 0 0))
+              (%gc-write64 (+ res #xE0) (%gc-read64 (+ tb #xA8)))
+              (%gc-write64 (+ res #xE8) (%gc-read64 (+ tb #xB8)))
+              (%gc-write64 (+ res #xF0) rcb3)
+              (%gc-write64 (+ res #xF8) (%gc-region))
+              (%gc-write64 (+ res #x100) (%ha-log-entry 0))
+              (%gc-write64 (+ res #x108) (%gc-read64 (+ tb #x4E0)))
+              (%gc-write64 (+ res #x110) g0)
+              (%gc-write64 (+ res #x118) (%gc-meta-read (+ r0 #x20) k))
+              (%gc-write64 (+ res #x120) (%gc-read64 (+ tb #x4D8)))
+              (%gc-write64 (+ res #x128) *ha-r2-from*)
+              (%gc-write64 (+ res #x130) (%gc-read64 (+ tb #x58)))
+              (%gc-write64 (+ res #x138) nlinks)
+              (%gc-write64 (+ res #x140) (%gc-read64 (+ tb #x508)))
+              (%gc-write64 (+ res #x148) (%gc-read64 (+ tb #x510)))
+              (%gc-write64 (+ res #x150) (%gc-read64 (+ tb #x530)))
+              (%gc-write64 (+ res #x158) (%gc-read64 (+ tb #x520)))
+              (%gc-write64 (+ res #x160) (%gc-read64 (+ tb #x528)))
+              (%gc-write64 (+ res #x168) g3a)
+              (%gc-write64 (+ res #x170) g2a)
+              (%gc-write64 (+ res #x178) tref)
+              (%gc-write64 (+ res #x180) (%gc-read64 (+ tb #x4E8)))
+              ;; ---- ISOLATION: neither region points into the other ----
+              (%gc-write64 (+ res #x188)
+                           (+ (%gc-count-foreign-refs
+                               (%gc-meta-read rcb3 k) (%gc-meta-read (+ rcb3 #x30) k)
+                               (%gc-meta-read tref k) (%gc-meta-read (+ tref #x10) k))
+                              (%gc-count-foreign-refs
+                               (%gc-meta-read rcb3 k) (%gc-meta-read (+ rcb3 #x30) k)
+                               (%gc-meta-read (+ tref #x08) k)
+                               (%gc-meta-read (+ tref #x10) k))))
+              (%gc-write64 (+ res #x190)
+                           (+ (%gc-count-foreign-refs
+                               (%gc-meta-read tref k) (%gc-meta-read (+ tref #x30) k)
+                               (%gc-meta-read rcb3 k) *ha-rsize*)
+                              (%gc-count-foreign-refs
+                               (%gc-meta-read tref k) (%gc-meta-read (+ tref #x30) k)
+                               (%gc-meta-read (+ rcb3 #x08) k) *ha-rsize*)))
+              ;; POSITIVE CONTROL, EXACT: a zeroed 8-word window holding exactly
+              ;; ONE cons-tagged pointer into thread 2's from-space must count 1.
+              ;; An oracle that can only answer zero is worth nothing.
+              (%ha-zero ctl (+ ctl #x40))
+              (%gc-write64 (+ ctl 24) (+ (%gc-meta-read rcb3 k) 1))
+              (%gc-write64 (+ res #x198)
+                           (%gc-count-foreign-refs ctl (+ ctl #x40)
+                                                   (%gc-meta-read rcb3 k)
+                                                   *ha-rsize*))
+              (%gc-write64 (+ res #x1A0)
+                           (%gc-count-foreign-refs ctl (+ ctl #x40)
+                                                   (%gc-meta-read tref k)
+                                                   (%gc-meta-read (+ tref #x10) k)))
+              ;; ---- put this thread back where it started ----
+              (if (> nlinks 0) (%gc-region-enter r0) 0)
+              (%ha-set-percpu-mode mode0)
+              (%gc-write64 (+ res #x1B8) a0)
+              (%gc-write64 (+ res #x1C0) (get-alloc-ptr))
+              (%gc-write64 (+ res #x1C8) (%gc-region))
+              res)))))

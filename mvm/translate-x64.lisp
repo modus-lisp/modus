@@ -854,6 +854,101 @@
               (emit-bytes buf #x41 #x58)         ; pop r8
               (emit-bytes buf #x5A)              ; pop rdx
               (emit-bytes buf #x5F))             ; pop rdi
+             ((= code #x0540)
+              ;; %SPAWN-THREAD — clone(2) A NATIVE OS THREAD.
+              ;;   V0(RSI) = entry address (tagged fixnum, raw byte address of a
+              ;;             ZERO-ARGUMENT native function)
+              ;;   V1(RDI) = stack TOP (tagged; the thread's stack grows down
+              ;;             from here, and it must be 16-byte aligned)
+              ;;   V2(R8)  = tid-word address (tagged; 4 bytes)
+              ;; Result in V0(RSI): the child TID, tagged, in the PARENT.
+              ;;
+              ;; WHY THIS IS A STUB AND NOT `(syscall6 56 …)'.  clone returns
+              ;; TWICE.  The child resumes at the instruction after SYSCALL with
+              ;; RAX=0 and RSP pointing at the NEW stack — but with every other
+              ;; register, RBP included, still holding the PARENT's values.  The
+              ;; compiler addresses let-bound locals as RBP-relative frame slots
+              ;; (+FRAME-SLOT-BASE+), so the moment the child executes one more
+              ;; line of compiled Lisp it reads and WRITES the parent's live
+              ;; frame from a second thread.  Returning through the caller's
+              ;; frame is worse still: the RET would pop a return address off a
+              ;; stack that has none.  So the fork in control flow has to happen
+              ;; HERE, in the instruction stream, before any compiled code runs:
+              ;; the child never returns from the trap at all — it zeroes RBP,
+              ;; CALLs the entry function on its own stack, and when that
+              ;; returns issues SYS_exit.
+              ;;
+              ;; SYS_exit (60) AND NOT SYS_exit_group (231): 60 terminates the
+              ;; CALLING THREAD; 231 would take the whole process down with it.
+              ;;
+              ;; FLAGS = 0x3D0F00:
+              ;;   CLONE_VM 0x100 | CLONE_FS 0x200 | CLONE_FILES 0x400 |
+              ;;   CLONE_SIGHAND 0x800 | CLONE_THREAD 0x10000 |
+              ;;   CLONE_SYSVSEM 0x40000 | CLONE_PARENT_SETTID 0x100000 |
+              ;;   CLONE_CHILD_CLEARTID 0x200000
+              ;; CLONE_THREAD is what makes this a THREAD (same thread group,
+              ;; own TID) rather than a process; it requires CLONE_SIGHAND,
+              ;; which requires CLONE_VM.  The two TID flags are the join
+              ;; mechanism: the kernel writes the TID into the word on the way
+              ;; in and ZEROES it on the way out, so a caller can observe
+              ;; "thread has actually exited" without a futex.
+              ;;
+              ;; CLONE_SETTLS IS DELIBERATELY ABSENT.  On x86-64 the tls
+              ;; argument sets the FS base, and Modus's per-CPU storage is GS
+              ;; (translate-x64 emits `GS:[disp32]' for PERCPU-REF/-SET).  A new
+              ;; thread therefore sets its OWN GS base with arch_prctl as its
+              ;; first act, which is a Lisp-level call, not a clone flag.
+              ;;
+              ;; RBX CARRIES THE ENTRY ACROSS THE SYSCALL because RCX and R11
+              ;; are destroyed by SYSCALL itself (return RIP / RFLAGS), and the
+              ;; child cannot pop anything — it is on a fresh stack.  RBX is
+              ;; V4, so the parent path restores it; the child path never needs
+              ;; to, because it never returns.
+              (emit-bytes buf #x56)                 ; push rsi   (V0)
+              (emit-bytes buf #x57)                 ; push rdi   (V1)
+              (emit-bytes buf #x41 #x50)            ; push r8    (V2)
+              (emit-bytes buf #x41 #x51)            ; push r9    (V3)
+              (emit-bytes buf #x52)                 ; push rdx   (V6)
+              (emit-bytes buf #x41 #x52)            ; push r10   (V7)
+              (emit-bytes buf #x53)                 ; push rbx   (V4)
+              (emit-bytes buf #x55)                 ; push rbp
+              (emit-bytes buf #x48 #x89 #xF3)       ; mov rbx, rsi
+              (emit-bytes buf #x48 #xD1 #xFB)       ; sar rbx, 1   (raw entry)
+              (emit-bytes buf #x48 #x89 #xFE)       ; mov rsi, rdi
+              (emit-bytes buf #x48 #xD1 #xFE)       ; sar rsi, 1   (child stack top)
+              (emit-bytes buf #x4C #x89 #xC2)       ; mov rdx, r8
+              (emit-bytes buf #x48 #xD1 #xFA)       ; sar rdx, 1   (parent_tidptr)
+              (emit-bytes buf #x49 #x89 #xD2)       ; mov r10, rdx (child_tidptr)
+              (emit-bytes buf #xBF)                 ; mov edi, imm32 (flags)
+              (emit-u32 buf #x003D0F00)
+              (emit-bytes buf #x45 #x31 #xC0)       ; xor r8d, r8d  (tls: unused)
+              (emit-bytes buf #xB8 #x38 #x00 #x00 #x00) ; mov eax, 56 (SYS_clone)
+              (emit-bytes buf #x0F #x05)            ; syscall
+              (emit-bytes buf #x48 #x85 #xC0)       ; test rax, rax
+              (let ((child (make-label))
+                    (done (make-label)))
+                (emit-jcc buf :e child)
+                ;; ---- PARENT: rax = child TID (or -errno) ----
+                (emit-bytes buf #x48 #x01 #xC0)     ; add rax, rax  (tag)
+                (emit-bytes buf #x48 #x89 #xC6)     ; mov rsi, rax  (→ V0)
+                (emit-bytes buf #x5D)               ; pop rbp
+                (emit-bytes buf #x5B)               ; pop rbx
+                (emit-bytes buf #x41 #x5A)          ; pop r10
+                (emit-bytes buf #x5A)               ; pop rdx
+                (emit-bytes buf #x41 #x59)          ; pop r9
+                (emit-bytes buf #x41 #x58)          ; pop r8
+                (emit-bytes buf #x5F)               ; pop rdi
+                (emit-bytes buf #x48 #x83 #xC4 #x08); add rsp, 8 (drop saved rsi)
+                (emit-jmp buf done)
+                ;; ---- CHILD: rsp = its own stack top, rbx = raw entry ----
+                (emit-label buf child)
+                (emit-bytes buf #x31 #xED)          ; xor ebp, ebp
+                (emit-bytes buf #xFF #xD3)          ; call rbx
+                (emit-bytes buf #x31 #xFF)          ; xor edi, edi  (status 0)
+                (emit-bytes buf #xB8 #x3C #x00 #x00 #x00) ; mov eax, 60 (SYS_exit)
+                (emit-bytes buf #x0F #x05)          ; syscall
+                (emit-bytes buf #x0F #x0B)          ; ud2 — unreachable
+                (emit-label buf done)))
              ((= code #x0533)
               ;; %JIT-ICACHE-FLUSH: no-op on x86-64 (coherent I-cache — writes
               ;; to an exec page are visible to fetch without maintenance).

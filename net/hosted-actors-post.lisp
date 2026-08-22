@@ -164,6 +164,234 @@
         res)))
 
 ;;; ============================================================
+;;; STEP 2 — NATIVE OS THREADS
+;;; ============================================================
+;;;
+;;; TWO MORE SLICES OF THE BAND, both in the 44 KB that sat unused between the
+;;; per-CPU block (+0x1000, 16 KB) and the actor table (+0x10000):
+;;;
+;;;   +0x5000  THREAD BLOCK, 4 KB — everything two threads say to each other.
+;;;   +0x6000  CPU 1's PER-CPU BLOCK, 16 KB — the second thread's GS base
+;;;            (step 3).  CPU 0's is the existing one at +0x1000.
+;;;
+;;; %HA-CARVE zeroes only [band, band+0x5000), so both are zeroed here by
+;;; their own initialisers rather than by the carve.
+;;;
+;;; THREAD-BLOCK LAYOUT (offsets from %HA-THREAD-BLOCK):
+;;;   +0x000  barrier LOCK word (its own lock, not the scheduler's)
+;;;   +0x008  barrier ARRIVAL counter
+;;;   +0x010  thread 2 "I am running" flag
+;;;   +0x018  thread 2's gettid            +0x020  thread 1's gettid
+;;;   +0x028  thread 2 barrier TIMED OUT   +0x030  thread 1 barrier TIMED OUT
+;;;   +0x038  thread 2's progress counter  +0x040  thread 1's progress counter
+;;;   +0x048  thread 2 saw t1 advance      +0x050  thread 1 saw t2 advance
+;;;   +0x058  thread 2 returned cleanly
+;;;   +0x068  spin BUDGET                  +0x080  WORK iterations
+;;;   +0x070  thread 2's getpid            +0x078  thread 1's getpid
+;;;   +0x088  the CLONE TID WORD (4 bytes) — see %HA-SPAWN-T2
+;;;   +0x098  thread 2's alloc pointer at ENTRY
+;;;   +0x0A0  thread 2's alloc pointer at EXIT
+;;;   +0x0A8  thread 2's cpu-id as IT reads it through GS (step 3)
+;;;   +0x0B0  thread 2's active-region cell address (step 3)
+;;;   +0x0B8  thread 2's active region  +0x0C0 .. +0x0F8 step 3/4/5 scratch
+;;;   +0x100  RESULT BLOCK
+
+(defun %ha-thread-block ()      (+ (%ha-base) #x5000))
+(defun %ha-cpu1-percpu-base ()  (+ (%ha-base) #x6000))
+
+;;; ---- A BARRIER, because "two TIDs exist" is not simultaneity -------------
+;;;
+;;; Each thread bumps the arrival counter under the block's OWN lock (not the
+;;; scheduler's — a barrier must not be entangled with the actor system), then
+;;; spins until the counter reaches 2.  If the two threads had run one after
+;;; the other, the first one to arrive would spin out its whole budget and
+;;; report a TIMEOUT: this cannot report success unless both threads were
+;;; inside the barrier at the same instant.  The budget is what keeps a
+;;; failure a FAILURE rather than a hang.
+
+(defun %ha-barrier-arrive (tb)
+  (spin-lock tb)
+  (%gc-write64 (+ tb 8) (+ (%gc-read64 (+ tb 8)) 1))
+  (spin-unlock tb)
+  0)
+
+(defun %ha-barrier-wait (tb budget)
+  "0 = the other thread arrived too; 1 = spun out BUDGET iterations alone."
+  (let ((i 0)
+        (r 1))
+    (loop
+      (if (>= (%gc-read64 (+ tb 8)) 2)
+          (progn (setq r 0) (return 0))
+          0)
+      (if (>= i budget)
+          (return 0)
+          (setq i (+ i 1))))
+    r))
+
+;;; ---- INTERLEAVED PROGRESS ------------------------------------------------
+;;;
+;;; Bump MY counter N times and count how many of those iterations saw THEIR
+;;; counter change underneath me.  Sequential execution scores ZERO here (the
+;;; other thread's counter is frozen for the whole loop); genuine concurrency
+;;; scores many.  Both threads run this at once, after the barrier.
+(defun %ha-thread-work (tb mine theirs seen n)
+  (let ((i 0)
+        (s 0)
+        (last (%gc-read64 (+ tb theirs))))
+    (loop
+      (when (>= i n) (return 0))
+      (%gc-write64 (+ tb mine) (+ i 1))
+      (let ((v (%gc-read64 (+ tb theirs))))
+        (if (= v last)
+            0
+            (progn (setq s (+ s 1)) (setq last v))))
+      (setq i (+ i 1)))
+    (%gc-write64 (+ tb seen) s)
+    s))
+
+;;; ---- THE SECOND THREAD ---------------------------------------------------
+;;;
+;;; ZERO ARGUMENTS, and it must stay that way: the clone stub enters it with a
+;;; bare `call rbx' on a fresh stack, so there is no argument marshalling and
+;;; no caller frame to read from.
+;;;
+;;; IT MUST NOT ALLOCATE, and this is measured rather than asserted.  R12 (the
+;;; bump-allocation pointer) and R14 (its limit) are ORDINARY REGISTERS, so the
+;;; child gets a COPY of the parent's at clone time — two threads allocating
+;;; from two copies of one pointer hand out the same addresses.  Fixing that is
+;;; step 3 (a region per thread, whose %GC-REGION-ENTER loads this thread's own
+;;; R12/R14).  Until then the thread records its alloc pointer at entry and at
+;;; exit and the test requires them EQUAL.  Everything it does is fixnum
+;;; arithmetic, raw memory reads/writes and syscalls, none of which allocate:
+;;; %GC-READ64 only allocates when the word it reads is >= 2^62 (a bignum), and
+;;; every word here is a small counter.
+(defun %ha-thread2-body ()
+  (let* ((tb (%ha-thread-block))
+         (budget (%gc-read64 (+ tb #x68)))
+         (work (%gc-read64 (+ tb #x80))))
+    (%gc-write64 (+ tb #x98) (get-alloc-ptr))
+    (%gc-write64 (+ tb #x18) (syscall3 186 0 0 0))   ; gettid
+    (%gc-write64 (+ tb #x70) (syscall3 39 0 0 0))    ; getpid
+    (%gc-write64 (+ tb #x10) 1)
+    (%ha-barrier-arrive tb)
+    (%gc-write64 (+ tb #x28) (%ha-barrier-wait tb budget))
+    (%ha-thread-work tb #x38 #x40 #x48 work)
+    (%gc-write64 (+ tb #xA0) (get-alloc-ptr))
+    (%gc-write64 (+ tb #x58) 1)
+    0))
+
+(defun %ha-thread2-entry ()
+  (- (%gc-word-of (fn-addr %ha-thread2-body) (+ (%ha-base) #x80)) 3))
+
+;;; ---- THE STACK AND THE SPAWN --------------------------------------------
+
+(defvar *ha-t2-stack* 0)             ; raw base of thread 2's stack, 0 = none
+(defvar *ha-t2-stack-size* 262144)   ; 256 KB
+
+(defun %ha-thread-stack ()
+  "Thread 2's stack, mmap'd ONCE.  Returns its raw base, or 0 if mmap failed.
+
+   NOT the carved band and NOT the GC heap.  A thread stack must not be inside
+   any region's semispaces: the collector would either scan it as somebody
+   else's roots or copy over it.  %MMAP-SHARED-PAGE is PROT_READ|WRITE
+   MAP_SHARED|MAP_ANONYMOUS — plain writable memory the collector knows nothing
+   about, and NOT the JIT's PROT_RWX page, because a stack has no business
+   being executable."
+  (if (> *ha-t2-stack* 0)
+      *ha-t2-stack*
+      (let ((p (%mmap-shared-page *ha-t2-stack-size*)))
+        ;; A failed mmap comes back as -errno, tagged, i.e. a small negative.
+        (if (< p 4096)
+            0
+            (progn (setq *ha-t2-stack* p) p)))))
+
+(defun %ha-spawn-t2 (entry)
+  "clone(2) thread 2 running ENTRY (a raw native entry address).  Returns the
+   child TID, or 0 if the stack could not be mapped.
+
+   THE TID WORD at thread-block +0x88 is the JOIN.  CLONE_PARENT_SETTID makes
+   the kernel write the new TID there before this call returns, and
+   CLONE_CHILD_CLEARTID makes it ZERO the same word when the thread has
+   actually exited — so polling it for zero is an OS-level `has this thread
+   really gone away', not a flag the thread set about itself."
+  (let ((stk (%ha-thread-stack))
+        (tb (%ha-thread-block)))
+    (if (zerop stk)
+        0
+        (%spawn-thread entry (+ stk *ha-t2-stack-size*) (+ tb #x88)))))
+
+(defun %ha-join-t2 (budget)
+  "0 once the kernel has cleared the TID word (the thread is gone); 1 if the
+   budget ran out first."
+  (let ((tb (%ha-thread-block))
+        (i 0)
+        (r 1))
+    (loop
+      (if (zerop (mem-ref (+ tb #x88) :u32))
+          (progn (setq r 0) (return 0))
+          0)
+      (if (>= i budget)
+          (return 0)
+          (setq i (+ i 1))))
+    r))
+
+(defun %ha-threads-selftest (budget work)
+  "STEP-2 ACCEPTANCE.  A second NATIVE OS THREAD — clone(2), its own mmap'd
+   stack, its own TID — with no actors involved at all.
+
+   Returns the result block's raw byte address, or 0 if the band could not be
+   carved or the stack could not be mapped."
+  (if (zerop (%ha-carve))
+      0
+      (let* ((tb (%ha-thread-block))
+             (res (+ tb #x100))
+             (a0 0) (tid 0))
+        (%ha-zero tb (+ tb #x300))
+        (%gc-write64 (+ tb #x68) budget)
+        (%gc-write64 (+ tb #x80) work)
+        (if (zerop (%ha-thread-stack))
+            0
+            (progn
+              (setq a0 (get-alloc-ptr))
+              (%gc-write64 (+ tb #x20) (syscall3 186 0 0 0))   ; our gettid
+              (%gc-write64 (+ tb #x78) (syscall3 39 0 0 0))    ; our getpid
+              (setq tid (%ha-spawn-t2 (%ha-thread2-entry)))
+              ;; The kernel wrote the TID into the word before returning here.
+              (%gc-write64 (+ res #x08) (mem-ref (+ tb #x88) :u32))
+              ;; ---- both threads must be inside the barrier at once ----
+              (%ha-barrier-arrive tb)
+              (%gc-write64 (+ tb #x30) (%ha-barrier-wait tb budget))
+              ;; ---- and then make progress at the same time ----
+              (%ha-thread-work tb #x40 #x38 #x50 work)
+              ;; ---- and the thread must really exit ----
+              (%gc-write64 (+ res #x78) (%ha-join-t2 budget))
+              (%gc-write64 (+ res #x80) (mem-ref (+ tb #x88) :u32))
+              (%gc-write64 res tid)
+              (%gc-write64 (+ res #x10) (%gc-read64 (+ tb #x18)))
+              (%gc-write64 (+ res #x18) (%gc-read64 (+ tb #x20)))
+              (%gc-write64 (+ res #x20) (%gc-read64 (+ tb #x70)))
+              (%gc-write64 (+ res #x28) (%gc-read64 (+ tb #x78)))
+              (%gc-write64 (+ res #x30) (%gc-read64 (+ tb #x10)))
+              (%gc-write64 (+ res #x38) (%gc-read64 (+ tb #x28)))
+              (%gc-write64 (+ res #x40) (%gc-read64 (+ tb #x30)))
+              (%gc-write64 (+ res #x48) (%gc-read64 (+ tb 8)))
+              (%gc-write64 (+ res #x50) (%gc-read64 (+ tb #x38)))
+              (%gc-write64 (+ res #x58) (%gc-read64 (+ tb #x40)))
+              (%gc-write64 (+ res #x60) (%gc-read64 (+ tb #x48)))
+              (%gc-write64 (+ res #x68) (%gc-read64 (+ tb #x50)))
+              (%gc-write64 (+ res #x70) (%gc-read64 (+ tb #x58)))
+              (%gc-write64 (+ res #x88) work)
+              (%gc-write64 (+ res #x90) budget)
+              (%gc-write64 (+ res #x98) *ha-t2-stack*)
+              (%gc-write64 (+ res #xA0) (+ *ha-t2-stack* *ha-t2-stack-size*))
+              ;; The second thread must not have allocated: it shares a COPY of
+              ;; this thread's R12, so an allocation there is a double-handout.
+              (%gc-write64 (+ res #xA8) (%gc-read64 (+ tb #x98)))
+              (%gc-write64 (+ res #xB0) (%gc-read64 (+ tb #xA0)))
+              (%gc-write64 (+ res #xB8) a0)
+              res)))))
+
+;;; ============================================================
 ;;; Band words the workers and the driver share
 ;;; ============================================================
 ;;;   +0x190  AP-SCHEDULER entry count (above)

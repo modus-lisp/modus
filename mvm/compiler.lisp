@@ -6390,6 +6390,9 @@
       ;; uncatchable per-test crash.
       ((= op-name (compute-name-hash "%MMAP-SHARED-PAGE"))
        (compile-mmap-shared (cdr form) env dest))
+      ;; (%spawn-thread entry stack-top tidptr) — clone(2) a NATIVE OS THREAD.
+      ((= op-name (compute-name-hash "%SPAWN-THREAD"))
+       (compile-spawn-thread (cdr form) env dest))
       ;; (%mmap-exec-page size) — PROT_RWX page for the WS4 runtime JIT.
       ((= op-name (compute-name-hash "%MMAP-EXEC-PAGE"))
        (compile-mmap-exec (cdr form) env dest))
@@ -15499,6 +15502,42 @@
   (compile-aarch64-fileio-trap #x0509 args env dest))
 (defun compile-aarch64-renameat (args env dest)
   (compile-aarch64-fileio-trap #x050A args env dest))
+
+(defun compile-spawn-thread (args env dest)
+  "Compile (%spawn-thread entry stack-top tidptr) — clone(2) a NATIVE OS
+   THREAD sharing this address space.  TRAP #x0540.
+
+   ENTRY is the raw byte address of a ZERO-ARGUMENT native function, as a
+   tagged fixnum — the same convention ACTOR-SPAWN uses for an actor's
+   continuation, i.e. `(fn-addr f)' with translate-x64's OR-3 tag taken off.
+   STACK-TOP is the raw address one past the end of a 16-byte-aligned region
+   the new thread will use as its stack (it grows DOWN from there).  TIDPTR is
+   the raw address of a 4-byte word: the kernel writes the new thread's TID
+   into it at clone time (CLONE_PARENT_SETTID) and ZEROES it when the thread
+   exits (CLONE_CHILD_CLEARTID), which is what makes a join observable without
+   a futex.
+
+   Returns the child TID (tagged) in the PARENT.  In the CHILD it does not
+   return at all: the trap's own stub calls ENTRY on the new stack and then
+   issues SYS_exit — see translate-x64.lisp for why the child MUST NOT return
+   through the caller's frame.
+
+   THREE ARGUMENTS, NOT SIX, and no reuse of COMPILE-SYSCALL6.  A raw
+   `(syscall6 56 …)' cannot work: the child comes back from the syscall with a
+   NEW RSP but the SAME RBP, so every frame-slot reference the compiler emits
+   after the call — frame slots are RBP-relative (translate-x64's
+   +FRAME-SLOT-BASE+) — would read and WRITE the parent's live frame from
+   another thread.  The branch has to happen in the instruction stream, before
+   any compiled Lisp runs.  Args are stack-spilled for the same reason
+   COMPILE-SYSCALL3 spills (see its docstring)."
+  (compile-form (nth 0 args) env dest) (emit-ir :push dest)   ; entry
+  (compile-form (nth 1 args) env dest) (emit-ir :push dest)   ; stack top
+  (compile-form (nth 2 args) env dest)                        ; tidptr in dest
+  (emit-ir :mov +vreg-v2+ dest)
+  (emit-ir :pop +vreg-v1+)
+  (emit-ir :pop +vreg-v0+)
+  (emit-ir :trap #x0540)
+  (emit-ir :mov dest +vreg-v0+))
 
 (defun compile-mmap-shared (args env dest)
   "Compile (%mmap-shared-page size) — allocate a shared anonymous mmap

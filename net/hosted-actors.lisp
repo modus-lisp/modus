@@ -24,6 +24,30 @@
 ;;;;      nothing outside net/actors.lisp has ever called them and net/actors.lisp
 ;;;;      is in no hosted image, so until this selftest ran, that code had never
 ;;;;      executed on x86-64 at all.
+;;;;   B. %HA-PERCPU-INIT / %HA-PERCPU-SELFTEST — PER-CPU STORAGE.
+;;;;      net/actors.lisp reads and writes its current-actor, idle-flag and
+;;;;      object-space pointers through PERCPU-REF / PERCPU-SET, which
+;;;;      translate-x64.lisp emits as `GS:[disp32]`.  On hosted Linux the GS
+;;;;      base is 0, so every one of those touches an absolute low address and
+;;;;      SIGSEGVs.  %HA-PERCPU-INIT points the GS base at the band's per-CPU
+;;;;      block with arch_prctl(ARCH_SET_GS) — syscall 158, code 0x1001.
+;;;;
+;;;;      WHY arch_prctl AND NOT A PLAIN-MEMORY OVERRIDE.  Because PERCPU-REF /
+;;;;      PERCPU-SET are COMPILER INTRINSICS (mvm/compiler.lisp dispatches on
+;;;;      the op-name hash before it ever looks a function up), a `(defun
+;;;;      percpu-ref …)' cannot shadow them: overriding would mean editing every
+;;;;      percpu call site in net/actors.lisp, i.e. changing the file whose
+;;;;      unmodified behaviour is the thing being tested.  Setting the segment
+;;;;      base leaves net/actors.lisp untouched and costs one syscall.  It is
+;;;;      also the honest emulation: GS: on x64 and TPIDR_EL1 on aarch64 are the
+;;;;      same mechanism, so the hosted image exercises the same instructions
+;;;;      the bare-metal one does rather than a different code path.
+;;;;
+;;;;      IT DOES NOT TURN ON *X64-GC-REGION-PERCPU*.  That flag makes the GC's
+;;;;      ACTIVE-REGION CELL a GS:-relative read from the collector AND the
+;;;;      mutator, and both sides must flip together or they read different
+;;;;      cells.  Setting a GS base for the actor system is a necessary
+;;;;      condition for that flag, not the same decision; the flag stays off.
 ;;;;
 ;;;; WHAT x64's SAVE-CTX DOES NOT SAVE, because it matters to everything above.
 ;;;; It saves RSP, RBX (V4) and RBP plus the continuation.  It does NOT save
@@ -42,12 +66,36 @@
 ;;; ============================================================
 ;;;
 ;;; ONE CARVE, recorded in globals, idempotent.  Region 0's two semispaces are
-;;; shrunk by (G + 2*S) bytes; the freed top of the FROM-space is the
-;;; infrastructure band, and the two S-byte slices above it are the semispace
-;;; pairs a per-actor region will eventually use (stage D).  Sizes are adaptive
-;;; for the same reason gc.lisp's selftests are: the hosted CLI has 896 MB
-;;; semispaces, the bare-metal RPi CL image has 56 MB, and a fixed 16 MB would
-;;; simply skip on the small one.
+;;; shrunk by 48 MB: the freed top 16 MB of the FROM-space is the
+;;; infrastructure band, and the two 16 MB slices above it are the semispace
+;;; PAIRS (from0+off, to0+off) a per-actor region uses in step D.
+;;;
+;;; BAND LAYOUT — every address net/actors.lisp asks for, as an offset:
+;;;   +0x000000  control head (4 KB)
+;;;     +0x0000  context save area A (the driver's)          — step A
+;;;     +0x0040  context save area B (the coroutine's)       — step A
+;;;     +0x0080  machine-word scratch (%GC-WORD-OF)
+;;;     +0x0088  coroutine progress counter                  — step A
+;;;     +0x0090  driver progress counter                     — step A
+;;;     +0x00A0  step-A result block (0x60)
+;;;     +0x0100  SCHED-LOCK-ADDR      (3 words)
+;;;     +0x0140  SCHED-STATE-BASE     (0x28)
+;;;     +0x0180  SCRATCH-ADDR         (1 word)
+;;;     +0x0188  DECODE-PTR-ADDR      (1 word)
+;;;     +0x0190  hosted AP-SCHEDULER entry counter
+;;;     +0x0200  region control block for actor 2            — step D
+;;;     +0x0240  region control block for actor 3            — step D
+;;;     +0x0280  POOL-STATE-BASE      (0x18)
+;;;     +0x0400  step-B / step-C / step-D result block (0x400)
+;;;     +0x0800  message log (0x800)
+;;;   +0x001000  PERCPU-DATA-BASE (16 KB; GS base points here)
+;;;   +0x010000  ACTOR-TABLE-BASE (64 x 128 = 0x2000)
+;;;   +0x020000  MAILBOX-POOL-BASE .. +0x040000 MAILBOX-POOL-LIMIT
+;;;   +0x080000  STAGING-BASE-ADDR (64 x 16 KB = 0x100000)
+;;;   +0x200000  ACTOR-STACK-BASE (actor N's stack top = +0x200000 + (N+1)*64 KB)
+;;;              The id-0 slot [+0x200000,+0x210000) is never an actor's (ids
+;;;              start at 1), so step A's coroutine borrows it.
+;;;   +0x400000  ACTOR-HEAP-BASE — see the note on ACTOR-HEAP-BASE below.
 
 (defvar *ha-band* 0)      ; raw byte address of the infrastructure band, 0 = uncarved
 (defvar *ha-bandsize* 0)  ; its length in bytes
@@ -67,7 +115,13 @@
 
 (defun %ha-carve ()
   "Carve the hosted actor band out of region 0, ONCE.  Returns the band's raw
-   byte address, or 0 if the active region is too small to carve from."
+   byte address, or 0 if the active region is too small to carve from.
+
+   Unlike gc.lisp's selftests this is NOT size-adaptive: the layout above needs
+   a band of at least 4.2 MB, and the only image that bakes this file is the
+   hosted x86-64 CLI, whose semispaces are 896 MB.  A heap too small for the
+   full carve gets an honest 0 (the test prints SKIP) rather than a band whose
+   sub-blocks silently overlap."
   (if (> *ha-band* 0)
       *ha-band*
       (let ((k (%gc-meta-scale))
@@ -75,10 +129,10 @@
         (let ((from0 (%gc-meta-read r0 k))
               (to0   (%gc-meta-read (+ r0 #x08) k))
               (size0 (%gc-meta-read (+ r0 #x10) k)))
-          (if (< size0 #x1800000)
+          (if (< size0 #x6000000)
               0
-              (let* ((s (if (< size0 #x8000000) #x200000 #x1000000))
-                     (g s)
+              (let* ((s #x1000000)
+                     (g #x1000000)
                      (new0 (- size0 (+ g (* 2 s)))))
                 (%gc-region-shrink r0 new0 k)
                 (setq *ha-rsize* s)
@@ -87,12 +141,109 @@
                 (setq *ha-r1-to*   (+ to0   (+ new0 g)))
                 (setq *ha-r2-from* (+ from0 (+ new0 (+ g s))))
                 (setq *ha-r2-to*   (+ to0   (+ new0 (+ g s))))
-                ;; Zero the control head only.  The rest of the band is actor
-                ;; stacks and pools that their own initialisers fill; zeroing
-                ;; 16 MB here would cost more than it proves.
-                (%ha-zero (+ from0 new0) (+ from0 (+ new0 #x1000)))
+                ;; Zero the control head, the per-CPU block and the actor
+                ;; table.  Everything else in the band is stacks and pools that
+                ;; their own initialisers fill; zeroing 16 MB would cost more
+                ;; than it proves.  The head MUST be zeroed: this memory was
+                ;; region 0's from-space a moment ago and can still hold words
+                ;; that look like heap pointers.
+                (%ha-zero (+ from0 new0) (+ from0 (+ new0 #x5000)))
+                (%ha-zero (+ from0 (+ new0 #x10000))
+                          (+ from0 (+ new0 #x12000)))
                 (setq *ha-band* (+ from0 new0))
                 *ha-band*))))))
+
+;;; ============================================================
+;;; STEP B — per-CPU storage: the GS base
+;;; ============================================================
+
+(defvar *ha-gs-base* 0)   ; the address arch_prctl was last given; 0 = never set
+
+(defun %ha-percpu-base () (+ *ha-band* #x1000))
+
+(defun %ha-percpu-init ()
+  "Point this thread's GS base at the band's per-CPU block, so that
+   PERCPU-REF / PERCPU-SET — which translate-x64.lisp emits as GS:[disp32] —
+   address real memory instead of absolute low addresses.
+
+   arch_prctl(ARCH_SET_GS = 0x1001, base) is syscall 158 on x86-64.  Returns
+   the raw kernel return value: 0 on success, a negative errno otherwise.
+   Returns -1 without syscalling if the band could not be carved.
+
+   IDEMPOTENT AND CHEAP.  Re-setting the same base is a no-op to the kernel;
+   this is called at the top of every selftest below rather than being a boot
+   hook, because a shipping ./modus that never touches an actor has no reason
+   to carry a non-zero GS base."
+  (if (zerop (%ha-carve))
+      -1
+      (let ((r (syscall3 158 #x1001 (%ha-percpu-base) 0)))
+        (if (zerop r) (setq *ha-gs-base* (%ha-percpu-base)) 0)
+        r)))
+
+(defun %ha-percpu-selftest ()
+  "STEP-B ACCEPTANCE.  Set the GS base, then write and read back EVERY per-CPU
+   slot net/actors.lisp uses — 0 self-ptr, 8 reduction, 16 cpu-id, 24
+   current-actor, 32 idle-flag, 40 obj-alloc, 48 obj-limit, 56 idle-stack-top —
+   through PERCPU-SET / PERCPU-REF, and cross-check the underlying memory.
+
+   THE MEMORY CROSS-CHECK IS THE POINT.  A read-back that only round-trips
+   proves nothing: it would also pass if GS: happened to address some other
+   mapped page.  PERCPU-SET stores the value STILL TAGGED (compile-percpu-set
+   does not untag), so the machine word at the block + offset must be exactly
+   2*value.  Reading that word with %GC-READ64 — which does not go through GS
+   at all — is what ties the segment base to the block this file owns.
+
+   Returns the result block's raw address, or 0 if the band could not be
+   carved.  Slot j's evidence is at res + 0x20 + j*16 (read-back) and
+   res + 0x28 + j*16 (the machine word), with j the slot INDEX 0..7 and the
+   byte offset 8*j.  Values written are 700000 + j."
+  (let ((rc (%ha-percpu-init)))
+    (if (zerop (%ha-carve))
+        0
+        (let ((res (+ *ha-band* #x400))
+              (pb (%ha-percpu-base)))
+          (%ha-zero res (+ res #x100))
+          (%gc-write64 res (if (zerop rc) 0 1))
+          (%gc-write64 (+ res #x08) pb)
+          (%gc-write64 (+ res #x10) *ha-gs-base*)
+          ;; ---- write every slot ----
+          ;; PERCPU-SET needs a CONSTANT offset (it becomes a disp32 in the
+          ;; instruction), so the eight slots are unrolled, not looped.
+          (percpu-set 0  700000)
+          (percpu-set 8  700001)
+          (percpu-set 16 700002)
+          (percpu-set 24 700003)
+          (percpu-set 32 700004)
+          (percpu-set 40 700005)
+          (percpu-set 48 700006)
+          (percpu-set 56 700007)
+          ;; ---- read every slot back, and look at the memory underneath ----
+          (%gc-write64 (+ res #x20) (percpu-ref 0))
+          (%gc-write64 (+ res #x28) (%gc-read64 (+ pb 0)))
+          (%gc-write64 (+ res #x30) (percpu-ref 8))
+          (%gc-write64 (+ res #x38) (%gc-read64 (+ pb 8)))
+          (%gc-write64 (+ res #x40) (percpu-ref 16))
+          (%gc-write64 (+ res #x48) (%gc-read64 (+ pb 16)))
+          (%gc-write64 (+ res #x50) (percpu-ref 24))
+          (%gc-write64 (+ res #x58) (%gc-read64 (+ pb 24)))
+          (%gc-write64 (+ res #x60) (percpu-ref 32))
+          (%gc-write64 (+ res #x68) (%gc-read64 (+ pb 32)))
+          (%gc-write64 (+ res #x70) (percpu-ref 40))
+          (%gc-write64 (+ res #x78) (%gc-read64 (+ pb 40)))
+          (%gc-write64 (+ res #x80) (percpu-ref 48))
+          (%gc-write64 (+ res #x88) (%gc-read64 (+ pb 48)))
+          (%gc-write64 (+ res #x90) (percpu-ref 56))
+          (%gc-write64 (+ res #x98) (%gc-read64 (+ pb 56)))
+          ;; ---- a value BIG enough to be a real pointer, not a small int ----
+          ;; obj-alloc/obj-limit carry heap addresses in net/actors.lisp, and a
+          ;; 47-bit hosted address is where a sign-extension or a lost high
+          ;; half would show up.  Use the live allocation pointer.
+          (percpu-set 40 (get-alloc-ptr))
+          (%gc-write64 (+ res #xA0) (percpu-ref 40))
+          (%gc-write64 (+ res #xA8) (get-alloc-ptr))
+          ;; ---- leave the block as net/actors.lisp expects to find it ----
+          (%ha-zero pb (+ pb 64))
+          res))))
 
 ;;; ============================================================
 ;;; STEP A — the context switch itself
@@ -112,9 +263,11 @@
 ;;;   +0x088  coroutine progress counter
 ;;;   +0x090  driver progress counter
 ;;;   +0x0A0  result block
-;;;   +0x100000  coroutine stack TOP (grows down; 960 KB of headroom below it)
+;;; The coroutine's stack TOP is the actor-stack slot for id 0 — an id no actor
+;;; ever gets (net/actors.lisp's ACTOR-COUNT starts at 2 and the primordial
+;;; actor is 1), so borrowing it cannot collide with a real actor's stack.
 
-(defun %ha-co-stack-top () (+ *ha-band* #x100000))
+(defun %ha-co-stack-top () (+ *ha-band* #x210000))
 
 ;; THE COROUTINE.  Never returns.  It is entered the first time by
 ;; RESTORE-CONTEXT jumping to its native entry point with RSP = its own stack

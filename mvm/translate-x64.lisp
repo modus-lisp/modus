@@ -4838,13 +4838,31 @@
       (emit-jcc buf :nc reject-label)               ; cons tag but bit clear (object) → reject
       (emit-jcc buf :c reject-label)))              ; object tag but bit set (cons) → reject
 
+(defvar *x64-gc-region-percpu* nil
+  "STAGE 3: where the ACTIVE-REGION WORD lives, for the NATIVE collector.
+
+   NIL (the default, and what every image built so far gets) — it is the single
+   word at +GC-REGION-ADDR+, and EMIT-LOAD-GC-REGION emits exactly the
+   `mov reg,[abs32]' it has emitted since stage 1: same instruction, same
+   bytes, no extra memory reference.
+
+   T — it is this CPU's entry of the per-CPU array based at +GC-REGION-ADDR+,
+   reached through the GS segment's :CPU-ID slot (+GC-PERCPU-CPU-ID-OFF+).
+   That is THREE instructions and one extra load, and it is OFF by default for
+   a reason that is not taste: on hosted Linux the GS base is 0, so `GS:[16]'
+   reads absolute address 16 and takes SIGSEGV.  Turning this on is only
+   correct on a target that has actually installed a per-CPU block, and it must
+   be turned on together with mvm/gc.lisp's gate word +GC-REGION-PERCPU-ADDR+
+   so the Lisp and native sides read the SAME cell.")
+
 (defun emit-load-gc-region (buf reg)
   "REG := the base address of the ACTIVE region's GC control block.
 
    The metadata this collector runs on is PER-REGION (mvm/compiler.lisp's
    +GC-OFF-*+ block): from/to semispaces, semispace size, root-stack base and
    collection count are eight OFFSETS into a 64-byte block, and which block is
-   live is the single word at +GC-REGION-ADDR+.
+   live is the word at +GC-REGION-ADDR+ — one word, or (stage 3, and only when
+   *X64-GC-REGION-PERCPU* is on) this CPU's entry of the array based there.
 
    ZERO MEANS REGION 0.  Nothing writes that word until something creates a
    second region, so on Linux the ELF BSS zero-fill and on bare metal the
@@ -4852,7 +4870,33 @@
    answer `region 0' — whose block is the historic one at +GC-REGION-0-BASE+.
    That is why stage 1 needed no boot-descriptor edit on any of the four
    targets, three of which cannot be booted where this was written."
-  (emit-mov-reg-abs buf reg modus.mvm::+gc-region-addr+)
+  (if *x64-gc-region-percpu*
+      ;; PER-CPU: reg = cpu_id (TAGGED, i.e. 2*id) -> 8*id -> [reg + table].
+      ;; The table is +GC-REGION-MAX-CPUS+ entries based at +GC-REGION-ADDR+,
+      ;; so entry 0 IS the historic word at the historic address.
+      (progn
+        (when (or (= (logand (reg-code reg) 7) 4)
+                  (= (logand (reg-code reg) 7) 5))
+          (error "emit-load-gc-region: the per-CPU form indexes off REG, so ~
+                  REG's low three bits must not be 4 (SIB escape) or 5 ~
+                  (RIP/disp32 escape); got ~S" reg))
+        ;; MOV reg, GS:[cpu_id]          65 REX.W 8B /r SIB=25 disp32
+        (emit-byte buf #x65)
+        (emit-byte buf (logior #x48 (if (reg-extended-p reg) #x04 0)))
+        (emit-byte buf #x8B)
+        (emit-byte buf (logior #x04 (ash (logand (reg-code reg) 7) 3)))
+        (emit-byte buf #x25)
+        (emit-u32 buf modus.mvm::+gc-percpu-cpu-id-off+)
+        ;; SHL reg, 2                    2*id -> 8*id
+        (emit-shl-reg-imm buf reg 2)
+        ;; MOV reg, [reg + table]        REX.W 8B /r mod=10 disp32
+        (emit-byte buf (logior #x48 (if (reg-extended-p reg) #x05 0)))
+        (emit-byte buf #x8B)
+        (emit-byte buf (logior #x80
+                               (ash (logand (reg-code reg) 7) 3)
+                               (logand (reg-code reg) 7)))
+        (emit-u32 buf modus.mvm::+gc-region-addr+))
+      (emit-mov-reg-abs buf reg modus.mvm::+gc-region-addr+))
   (let ((have-region (make-label)))
     (emit-cmp-reg-imm buf reg 0)
     (emit-jcc buf :ne have-region)

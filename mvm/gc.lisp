@@ -29,6 +29,22 @@
 ;;;; switched off another stack, the switch spilled its registers there, and
 ;;;; this is the SP it recorded — see %gc-region-park / %gc-region-switch.
 ;;;;
+;;;; STAGE 3 — A REGION IS A PROPERTY OF AN ACTOR.  Three things, none of which
+;;;; changes a single-region image:
+;;;;   1. The ACTIVE-REGION WORD stops being one word: it is the CPU-0 entry of
+;;;;      a per-CPU array based at the historic address (%gc-region-cell, gated
+;;;;      by a BSS word that is zero everywhere).
+;;;;   2. An ACTOR NAMES ITS REGION by pointer, in its own struct at +0x68 —
+;;;;      ZERO MEANS REGION 0, so an actor that owns no region is exactly the
+;;;;      actor of today.  net/actors.lisp's YIELD and RECEIVE call
+;;;;      %gc-region-switch with the SP save-context just recorded.
+;;;;   3. The aarch64 and i386 collectors READ THE ACTIVE REGION instead of
+;;;;      region 0, and aarch64's shim writes the live SP into the ACTIVE
+;;;;      region's +0x28 — and only when that field says RUNNING, so it can no
+;;;;      longer overwrite a parked window (translate-x64 has branched on that
+;;;;      since stage 2; aarch64 did not, and would have broken the parked
+;;;;      encoding the moment it grew a second region).
+;;;;
 ;;;; WHAT IS NOT PARTITIONED, said plainly: %gc-scan-globals.  The globals
 ;;;; alist, the symbol/keyword/package intern tables and the multiple-value
 ;;;; extras are ONE shared set of slots that every region scans, because any
@@ -76,22 +92,58 @@
 ;;; native asm.  The region POINTER has only one native reader (translate-x64's
 ;;; trampoline, a plain `mov reg,[abs32]`), so it is stored raw and read here as
 ;;; two exact :u32 halves.  Everything that touches it uses these two functions.
+;;;
+;;; STAGE 3 — AND IT IS NO LONGER *ONE* WORD.  A single active-region word is
+;;; one collecting thread by construction, which is the shape stage 1 removed
+;;; from the metadata block and stage 2 removed from the root set.  The word is
+;;; now the CPU-0 entry of a per-CPU array:
+;;;
+;;;     this CPU's active-region word  =  0x10000F08 + 8*cpu_id
+;;;
+;;; %GC-REGION-CELL is the one place that arithmetic happens, and it is GATED.
+;;; A per-CPU read means GS: (x64) / FS: (i386) / TPIDR_EL1 (aarch64), and on
+;;; hosted Linux the GS base is 0, so an unguarded per-CPU read is a SIGSEGV at
+;;; absolute address 16.  The gate is the word at 0x10000FF8, which is ZERO in
+;;; every image ever built — nothing writes it — and zero means "the active
+;;; region is the single word at 0x10000F08", i.e. the pre-stage-3 code
+;;; verbatim, at the pre-stage-3 address.  The gate's native twin is
+;;; translate-x64's *X64-GC-REGION-PERCPU* flag, also off.  See mvm/compiler.lisp
+;;; (+GC-REGION-PERCPU-ADDR+ / +GC-PERCPU-CPU-ID-OFF+ / +GC-REGION-MAX-CPUS+),
+;;; which owns all three numbers.
+
+(defun %gc-region-percpu-p ()
+  "Non-zero if the active region is stored PER CPU rather than in one word.
+   Zero — the BSS default, and the answer in every image built so far."
+  (mem-ref #x10000FF8 :u32))
+
+(defun %gc-region-cell ()
+  "Raw byte address of THIS CPU's active-region word.  0x10000F08 unless
+   per-CPU storage has been deliberately turned on, and 0x10000F08 for CPU 0
+   even then, so the historic word keeps its historic address.
+
+   The :CPU-ID slot is read TAGGED (percpu-ref yields the machine word, and
+   that slot holds a tagged fixnum), so the value IS the CPU number."
+  (if (= (mem-ref #x10000FF8 :u32) 0)
+      #x10000F08
+      (+ #x10000F08 (* (percpu-ref 16) 8))))
 
 (defun %gc-region ()
   "Raw byte address of the ACTIVE region's control block; 0 means region 0."
-  (let ((lo (mem-ref #x10000F08 :u32))
-        (hi (mem-ref (+ #x10000F08 4) :u32)))
-    (if (= hi 0)
-        (if (= lo 0) #x10000040 lo)
-        (+ (* (* hi 65536) 65536) lo))))
+  (let ((cell (%gc-region-cell)))
+    (let ((lo (mem-ref cell :u32))
+          (hi (mem-ref (+ cell 4) :u32)))
+      (if (= hi 0)
+          (if (= lo 0) #x10000040 lo)
+          (+ (* (* hi 65536) 65536) lo)))))
 
 (defun %gc-set-region (base)
   "Publish BASE as the active region's control block.  Stored as two exact
    32-bit halves for the reason given above."
-  (let* ((hi (ash (ash base -16) -16))
-         (lo (- base (* (* hi 65536) 65536))))
-    (setf (mem-ref #x10000F08 :u32) lo)
-    (setf (mem-ref (+ #x10000F08 4) :u32) hi)))
+  (let ((cell (%gc-region-cell)))
+    (let* ((hi (ash (ash base -16) -16))
+           (lo (- base (* (* hi 65536) 65536))))
+      (setf (mem-ref cell :u32) lo)
+      (setf (mem-ref (+ cell 4) :u32) hi))))
 
 (defun %gc-region-0 () #x10000040)
 
@@ -853,18 +905,29 @@
     ;; in that case; we'll get a less-precise GC but it won't
     ;; runaway.  Print 'S' to mark the skip.
     ;;
-    ;; STAGE 2 NOTE, and it is a LIMIT of this stage rather than a bug: the
-    ;; 0x07200000 floor is the bare-metal AArch64 stack guard, i.e. a property
-    ;; of the ONE stack that target has.  It is correct for a running actor
-    ;; there and it is what the only caller of this Lisp collector needs today,
-    ;; but a PARKED window on some other stack below that address would be
-    ;; silently dropped.  The upper bound is already per-region (stack-base);
-    ;; the lower one becomes per-region when aarch64 grows a second region —
-    ;; the same edit as making its shim region-aware, which stage 1 flagged and
-    ;; stage 3 owns.  translate-x64's trampoline, which is the collector that
-    ;; actually runs a parked window today, bounds it by SIZE instead
-    ;; (+GC-MAX-PARKED-WINDOW+) and needs no absolute floor.
-    (when (or (< saved-rsp #x07200000) (>= saved-rsp stack-base))
+    ;; STAGE 3 REPLACES THE ABSOLUTE FLOOR WITH A SIZE BOUND, which is what
+    ;; stage 2 said this line was waiting for.  The floor used to be
+    ;; 0x07200000 — the bare-metal AArch64 stack guard, i.e. a property of the
+    ;; ONE stack that ONE target has — so a PARKED window living on any other
+    ;; stack below it was silently dropped.  Now that aarch64's shim is
+    ;; region-aware and only writes +0x28 when the region is RUNNING, a
+    ;; non-zero value here can be a genuine parked SP on an actor's own 64 KB
+    ;; stack anywhere in memory, and an address test cannot tell it from
+    ;; garbage.  A SIZE test can, and it is exactly what translate-x64's
+    ;; trampoline has used since stage 2: the window may not exceed
+    ;; +GC-MAX-PARKED-WINDOW+ (16 MB, two orders above an actor stack and above
+    ;; a default 8 MB pthread stack), and it may not be inverted or empty.
+    ;; Over the cap, or zero, or above stack_base, the window collapses to
+    ;; EMPTY rather than walking unmapped pages — the same conservative answer
+    ;; the floor gave, reached by a rule that is not one board's memory map.
+    ;;
+    ;; ON THE SHIPPING AARCH64 SHAPE THIS IS THE SAME TEST.  Its live SP sits a
+    ;; few KB below stack_base = 0x08000000, so it passed the floor and it
+    ;; passes the cap; 0 and >= stack_base are rejected by both.  What changes
+    ;; is only that a window low in memory is now scanned instead of dropped.
+    (when (or (= saved-rsp 0)
+              (>= saved-rsp stack-base)
+              (> (- stack-base saved-rsp) #x1000000))
       (write-char-serial 83)  ; 'S' — stack-scan skipped
       (setq saved-rsp stack-base))
     ;; The free pointer in to-space starts at to_start
@@ -1050,6 +1113,57 @@
     prev))
 
 ;;; ------------------------------------------------------------
+;;; STAGE 3: AN ACTOR NAMES ITS REGION
+;;; ------------------------------------------------------------
+;;; net/actors.lisp's actor struct is a fully-allocated 128-byte stride whose
+;;; +0x28 and +0x68 were marked "(reserved)".  +0x68 now holds the RAW BYTE
+;;; ADDRESS of that actor's 64-byte region control block, in the same
+;;; convention as the SP at +0x08 and the alloc pointer/limit at +0x10/+0x18:
+;;; the STORED MACHINE WORD is the address (net/actors.lisp writes it through
+;;; (untag …), reads it back doubled).
+;;;
+;;; ZERO MEANS REGION 0.  An actor whose slot was never written owns no region
+;;; and allocates in region 0 — which is every actor in every image today, with
+;;; nothing to initialise anywhere.  +0x68 rather than +0x28 because +0x28 sits
+;;; inside the save area :SAVE-CTX writes through (it stores SP/alloc/limit/V4
+;;; at pa+0x00…0x18, the continuation at pa+0x28 = struct +0x30 and, on
+;;; aarch64, obj-alloc/obj-limit at pa+0x68/0x70 = struct +0x70/+0x78), while
+;;; +0x68 = pa+0x60 is written by nothing — and it sits beside obj-alloc and
+;;; obj-limit, which is where an actor's heap already lives.
+
+(defun %gc-actor-region (actor-addr)
+  "The control block of the region owned by the actor whose 128-byte struct
+   begins at raw byte address ACTOR-ADDR.  Reads the RAW machine word at
+   +0x68; ZERO MEANS REGION 0, so an actor that owns no region resolves to the
+   region every actor has always allocated in."
+  (let ((r (%gc-read64 (+ actor-addr #x68))))
+    (if (= r 0) (%gc-region-0) r)))
+
+(defun %gc-actor-sp (actor-addr)
+  "The SP net/actors.lisp's SAVE-CONTEXT recorded for that actor, raw, from
+   +0x08.  This is the number %gc-region-park wants and the reason the SP is an
+   argument: it already exists at the one place that needs it."
+  (%gc-read64 (+ actor-addr #x08)))
+
+(defun %gc-actor-park-window (rcb lo hi k)
+  "Declare that RCB's actor is off-CPU with its live frames in [LO,HI) — its
+   root window low end AND its stack_base, because the two are one description
+   of one stack.  A real actor never moves its stack_base (it is its own stack's
+   top, written once at spawn); the acceptance harness below has only ONE
+   machine stack for all its actors, so it moves both together instead."
+  (%gc-meta-write (+ rcb #x18) hi k)
+  (%gc-region-park rcb lo))
+
+(defun %gc-actor-hop (next-rcb next-stack-base cur-rcb cur-lo cur-hi k)
+  "ONE SCHEDULER HOP, in the shape net/actors.lisp's YIELD now has it: the
+   region being left is parked — its allocation pointer/limit AND its root
+   window — and NEXT-RCB becomes the running region.  Returns NEXT-RCB."
+  (%gc-meta-write (+ cur-rcb #x18) cur-hi k)
+  (%gc-region-switch next-rcb cur-lo)
+  (%gc-meta-write (+ next-rcb #x18) next-stack-base k)
+  next-rcb)
+
+;;; ------------------------------------------------------------
 ;;; THE ASSUMPTION STAGE 2 RESTS ON, AND HOW TO AUDIT IT
 ;;; ------------------------------------------------------------
 ;;; Collecting region N while looking at N's roots ALONE is correct only if no
@@ -1231,10 +1345,18 @@
           (to0   (%gc-meta-read (+ r0 #x08) k))
           (size0 (%gc-meta-read (+ r0 #x10) k))
           (sb    (%gc-meta-read (+ r0 #x18) k)))
-      (if (< size0 #x4000000)
+      ;; THE CARVE SIZE IS ADAPTIVE, and that is what lets this run on more than
+      ;; one target.  16 MB regions with a 16 MB guard below each need a 64 MB
+      ;; semispace to leave region 0 anything at all; the hosted x64 CLI has
+      ;; 896 MB and gets exactly the sizes stages 1 and 2 measured, but the
+      ;; bare-metal RPi image — the ONLY target whose native collector can
+      ;; actually be booted — has a 112 MB heap, i.e. 56 MB semispaces, and used
+      ;; to skip.  Below 128 MB the region and its guard drop to 2 MB, which is
+      ;; still 16x the 128 KB a 4000-link chain needs.
+      (if (< size0 #x1000000)
           0
-          (let* ((s #x1000000)
-                 (g #x1000000)
+          (let* ((s (if (< size0 #x8000000) #x200000 #x1000000))
+                 (g s)
                  (new0 (- size0 (* 2 (+ s g))))
                  (off2 (+ new0 g))
                  (off1 (+ new0 (+ g (+ s g))))
@@ -1355,10 +1477,18 @@
           (to0   (%gc-meta-read (+ r0 #x08) k))
           (size0 (%gc-meta-read (+ r0 #x10) k))
           (sb    (%gc-meta-read (+ r0 #x18) k)))
-      (if (< size0 #x4000000)
+      ;; THE CARVE SIZE IS ADAPTIVE, and that is what lets this run on more than
+      ;; one target.  16 MB regions with a 16 MB guard below each need a 64 MB
+      ;; semispace to leave region 0 anything at all; the hosted x64 CLI has
+      ;; 896 MB and gets exactly the sizes stages 1 and 2 measured, but the
+      ;; bare-metal RPi image — the ONLY target whose native collector can
+      ;; actually be booted — has a 112 MB heap, i.e. 56 MB semispaces, and used
+      ;; to skip.  Below 128 MB the region and its guard drop to 2 MB, which is
+      ;; still 16x the 128 KB a 4000-link chain needs.
+      (if (< size0 #x1000000)
           0
-          (let* ((s #x1000000)
-                 (g #x1000000)
+          (let* ((s (if (< size0 #x8000000) #x200000 #x1000000))
+                 (g s)
                  (new0 (- size0 (* 2 (+ s g))))
                  (off2 (+ new0 g))
                  (off1 (+ new0 (+ g (+ s g))))
@@ -1520,4 +1650,241 @@
             (%gc-write64 (+ res 424) (%gc-chain-check c2 nlinks))
             (%gc-write64 (+ res 432) (+ from0 off2))
             (%gc-write64 (+ res 440) s)
+            res)))))
+
+;;; ============================================================
+;;; STAGE-3 ACCEPTANCE: A REGION IS A PROPERTY OF AN ACTOR
+;;; ============================================================
+
+(defun %gc-region-actors-selftest (nlinks)
+  "STAGE-3 ACCEPTANCE.  Two regions owned by two ACTORS, round-robin switched
+   through %gc-region-switch with parked root windows, each forced to collect.
+
+   THE ACTOR SHAPE, not just two regions.  Three 128-byte actor structs are
+   laid out in the carved guard band exactly as net/actors.lisp lays them out,
+   and every hop reads what a scheduler reads: the OUTGOING actor's SP from its
+   struct at +0x08 (where SAVE-CONTEXT writes it) and the INCOMING actor's
+   region from its struct at +0x68, where ZERO MEANS REGION 0.  Actor 0's slot
+   is left zero on purpose — it is the actor of today, owning no region — and
+   the harness records that it resolves to region 0's block.
+
+   THE ROUND ROBIN.  Actor 1 fills region 1 with a chain, actor 2 fills region
+   2 with a chain, each publishing its chain head into ONE slot in the middle
+   of its own 512-byte parked window so the window is scanned as a RANGE.  Then
+   1, 2, 1, 2: at each stop the region is entered by a real hop, re-parked on
+   its own window (the harness has one machine stack for all three actors, so
+   'this actor's roots are on its own stack' has to be said explicitly rather
+   than being where the CPU happens to be), and FORCED to collect.
+
+   WHAT IS ASSERTED — every number read back out of memory, the caller judges:
+     (a) each region's OWN collection count rose, at every stop.  Collections
+         are FORCED (%gc-collect-here), never assumed: stage 1 measured that an
+         ordinary 200,000-allocation stress collects ZERO times here.
+     (b) each region's live data survived its own collection — the chain still
+         walks, read back through the parked slot, and the live byte count is
+         16*NLINKS + 16 (the chain plus the one junk cons that trips the check).
+     (c) collecting region A does not touch region B: B's live bytes, its
+         control block and its count are checksummed either side and must be
+         identical, in both directions, and region 0 likewise.
+     (d) %gc-count-foreign-refs is zero in BOTH directions across real
+         collections — plus a POSITIVE CONTROL on each parked window, a span
+         known to hold exactly ONE pointer into its region, because an oracle
+         that can only answer zero is worth nothing.
+
+   Writes its evidence into the carved guard band, where no region's collector
+   can reach it, and returns that block's address — or 0 if the active region
+   is too small to carve from."
+  (let ((k (%gc-meta-scale))
+        (r0 (%gc-region)))
+    (let ((from0 (%gc-meta-read r0 k))
+          (to0   (%gc-meta-read (+ r0 #x08) k))
+          (size0 (%gc-meta-read (+ r0 #x10) k))
+          (sb    (%gc-meta-read (+ r0 #x18) k)))
+      ;; THE CARVE SIZE IS ADAPTIVE, and that is what lets this run on more than
+      ;; one target.  16 MB regions with a 16 MB guard below each need a 64 MB
+      ;; semispace to leave region 0 anything at all; the hosted x64 CLI has
+      ;; 896 MB and gets exactly the sizes stages 1 and 2 measured, but the
+      ;; bare-metal RPi image — the ONLY target whose native collector can
+      ;; actually be booted — has a 112 MB heap, i.e. 56 MB semispaces, and used
+      ;; to skip.  Below 128 MB the region and its guard drop to 2 MB, which is
+      ;; still 16x the 128 KB a 4000-link chain needs.
+      (if (< size0 #x1000000)
+          0
+          (let* ((s (if (< size0 #x8000000) #x200000 #x1000000))
+                 (g s)
+                 (new0 (- size0 (* 2 (+ s g))))
+                 (off2 (+ new0 g))
+                 (off1 (+ new0 (+ g (+ s g))))
+                 (scratch (- (+ from0 off2) 8192))
+                 (rcb1 scratch)
+                 (rcb2 (+ scratch #x40))
+                 (at   (+ scratch #x100))
+                 (a0   (+ scratch #x100))
+                 (a1   (+ scratch #x180))
+                 (a2   (+ scratch #x200))
+                 (w1lo (+ scratch #x400)) (w1hi (+ scratch #x600))
+                 (slot1 (+ scratch #x500))
+                 (w2lo (+ scratch #x600)) (w2hi (+ scratch #x800))
+                 (slot2 (+ scratch #x700))
+                 (w0lo (+ scratch #x800)) (w0hi (+ scratch #xA00))
+                 (res  (+ scratch #x1000))
+                 (f1 (+ from0 off1)) (t1 (+ to0 off1))
+                 (f2 (+ from0 off2)) (t2 (+ to0 off2))
+                 (alloc0 0) (fill1 0) (fill2 0)
+                 (live1 0) (live2 0)
+                 (i 0) (cA nil) (cB nil))
+            ;; ---- carve, exactly as stages 1 and 2 ----
+            (%gc-region-shrink r0 new0 k)
+            (%gc-region-init rcb2 f2 t2 s sb k)
+            (%gc-region-init rcb1 f1 t1 s sb k)
+            ;; ---- zero the three synthetic stacks ----
+            (setq i w1lo)
+            (loop
+              (when (>= i w0hi) (return nil))
+              (%gc-write64 i 0)
+              (setq i (+ i 8)))
+            ;; ---- THE ACTOR TABLE, in net/actors.lisp's own layout ----
+            ;; +0x08 = SP (what SAVE-CONTEXT writes), +0x68 = region.
+            ;; Actor 0's region slot stays ZERO: it owns none, which is every
+            ;; actor in every image today, and it must resolve to region 0.
+            (%gc-write64 (+ a0 #x08) w0lo)  (%gc-write64 (+ a0 #x68) 0)
+            (%gc-write64 (+ a1 #x08) w1lo)  (%gc-write64 (+ a1 #x68) rcb1)
+            (%gc-write64 (+ a2 #x08) w2lo)  (%gc-write64 (+ a2 #x68) rcb2)
+            (%gc-write64 res rcb1)
+            (%gc-write64 (+ res 8) rcb2)
+            (%gc-write64 (+ res 16) r0)
+            (%gc-write64 (+ res 24) k)
+            (%gc-write64 (+ res 32) at)
+            (%gc-write64 (+ res 40) f1)
+            (%gc-write64 (+ res 48) t1)
+            (%gc-write64 (+ res 56) f2)
+            (%gc-write64 (+ res 64) t2)
+            (%gc-write64 (+ res 72) w1lo)
+            (%gc-write64 (+ res 80) w1hi)
+            (%gc-write64 (+ res 88) w2lo)
+            (%gc-write64 (+ res 96) w2hi)
+            (%gc-write64 (+ res 104) from0)
+            (%gc-write64 (+ res 112) new0)
+            ;; the encoding itself, resolved the way a scheduler resolves it
+            (%gc-write64 (+ res 128) (%gc-actor-region a0))
+            (%gc-write64 (+ res 136) (%gc-actor-region a1))
+            (%gc-write64 (+ res 144) (%gc-actor-region a2))
+            (%gc-write64 (+ res 152) (%gc-actor-sp a0))
+            (%gc-write64 (+ res 160) (%gc-actor-sp a1))
+            (%gc-write64 (+ res 168) (%gc-actor-sp a2))
+            (setq alloc0 (get-alloc-ptr))
+            (%gc-write64 (+ res 120) alloc0)
+            ;; ---- HOP 0 -> 1, and fill region 1 ----
+            (%gc-actor-hop (%gc-actor-region a1) sb r0 (%gc-actor-sp a0) w0hi k)
+            (setq cA (%gc-chain-build nlinks))
+            (setf (mem-ref slot1 :u64) cA)
+            (setq fill1 (get-alloc-ptr))
+            (%gc-write64 (+ res 176) fill1)
+            (%gc-write64 (+ res 192) (%gc-chain-check cA nlinks))
+            (%gc-write64 (+ res 648) (%gc-word-of cA (+ res 632)))
+            ;; ---- HOP 1 -> 2, and fill region 2 ----
+            (%gc-actor-hop (%gc-actor-region a2) sb rcb1 (%gc-actor-sp a1) w1hi k)
+            (%gc-write64 (+ res 208) (if (%gc-region-parked-p rcb1) 1 0))
+            (%gc-write64 (+ res 216) (%gc-meta-read (+ rcb1 #x28) k))
+            (setq cB (%gc-chain-build nlinks))
+            (setf (mem-ref slot2 :u64) cB)
+            (setq fill2 (get-alloc-ptr))
+            (%gc-write64 (+ res 184) fill2)
+            (%gc-write64 (+ res 200) (%gc-chain-check cB nlinks))
+            (%gc-write64 (+ res 656) (%gc-word-of cB (+ res 640)))
+            ;; ---- ROUND 1: HOP 2 -> 1, park on its own window, COLLECT ----
+            (%gc-actor-hop (%gc-actor-region a1) sb rcb2 (%gc-actor-sp a2) w2hi k)
+            (%gc-write64 (+ res 224) (if (%gc-region-parked-p rcb2) 1 0))
+            (%gc-write64 (+ res 232) (%gc-meta-read (+ rcb2 #x28) k))
+            (%gc-actor-park-window rcb1 w1lo w1hi k)
+            ;; the two positive controls: each window holds exactly ONE pointer
+            (%gc-write64 (+ res 240) (%gc-count-foreign-refs w1lo w1hi f1 s))
+            (%gc-write64 (+ res 248) (%gc-count-foreign-refs w2lo w2hi f2 s))
+            (%gc-write64 (+ res 256) (%gc-meta-read (+ rcb1 #x20) k))
+            (%gc-write64 (+ res 264) (%gc-sum-range f2 fill2))
+            (%gc-write64 (+ res 272) (%gc-sum-range rcb2 (+ rcb2 #x40)))
+            (%gc-write64 (+ res 280) (%gc-meta-read (+ rcb2 #x20) k))
+            (%gc-write64 (+ res 288) (%gc-sum-range from0 alloc0))
+            (%gc-write64 (+ res 296) (%gc-sum-range r0 (+ r0 #x40)))
+            (%gc-write64 (+ res 304) (%gc-meta-read (+ r0 #x20) k))
+            (%gc-collect-here)
+            (%gc-write64 (+ res 312) (%gc-meta-read (+ rcb1 #x20) k))
+            (%gc-write64 (+ res 320) (%gc-meta-read rcb1 k))
+            (%gc-write64 (+ res 328) (%gc-meta-read (+ rcb1 #x08) k))
+            (setq live1 (get-alloc-ptr))
+            (%gc-write64 (+ res 336) live1)
+            (%gc-write64 (+ res 344) (%gc-chain-check (mem-ref slot1 :u64) nlinks))
+            (%gc-write64 (+ res 352) (%gc-count-foreign-refs w1lo w1hi t1 s))
+            (%gc-write64 (+ res 360) (%gc-count-foreign-refs w1lo w1hi f1 s))
+            (%gc-write64 (+ res 368) (%gc-sum-range f2 fill2))
+            (%gc-write64 (+ res 376) (%gc-sum-range rcb2 (+ rcb2 #x40)))
+            (%gc-write64 (+ res 384) (%gc-meta-read (+ rcb2 #x20) k))
+            (%gc-write64 (+ res 392) (%gc-sum-range from0 alloc0))
+            (%gc-write64 (+ res 400) (%gc-sum-range r0 (+ r0 #x40)))
+            (%gc-write64 (+ res 408) (%gc-meta-read (+ r0 #x20) k))
+            ;; ---- ROUND 2: HOP 1 -> 2, park, COLLECT ----
+            (%gc-actor-hop (%gc-actor-region a2) sb rcb1 (%gc-actor-sp a1) w1hi k)
+            (%gc-actor-park-window rcb2 w2lo w2hi k)
+            (%gc-write64 (+ res 416) (%gc-meta-read (+ rcb2 #x20) k))
+            (%gc-write64 (+ res 424) (%gc-sum-range t1 live1))
+            (%gc-write64 (+ res 432) (%gc-meta-read (+ rcb1 #x20) k))
+            (%gc-collect-here)
+            (%gc-write64 (+ res 440) (%gc-meta-read (+ rcb2 #x20) k))
+            (%gc-write64 (+ res 448) (%gc-meta-read rcb2 k))
+            (setq live2 (get-alloc-ptr))
+            (%gc-write64 (+ res 456) live2)
+            (%gc-write64 (+ res 464) (%gc-chain-check (mem-ref slot2 :u64) nlinks))
+            (%gc-write64 (+ res 472) (%gc-count-foreign-refs w2lo w2hi t2 s))
+            (%gc-write64 (+ res 480) (%gc-sum-range t1 live1))
+            (%gc-write64 (+ res 488) (%gc-meta-read (+ rcb1 #x20) k))
+            ;; ---- ROUND 3: HOP 2 -> 1 again, park, COLLECT ----
+            (%gc-actor-hop (%gc-actor-region a1) sb rcb2 (%gc-actor-sp a2) w2hi k)
+            (%gc-actor-park-window rcb1 w1lo w1hi k)
+            (%gc-collect-here)
+            (%gc-write64 (+ res 496) (%gc-meta-read (+ rcb1 #x20) k))
+            (%gc-write64 (+ res 504) (%gc-chain-check (mem-ref slot1 :u64) nlinks))
+            (%gc-write64 (+ res 512) (get-alloc-ptr))
+            ;; region 1's live data, now back in its ORIGINAL from-space, vs
+            ;; region 2's two semispaces and region 0's from-space
+            (%gc-write64 (+ res 544)
+                         (+ (%gc-count-foreign-refs (%gc-meta-read rcb1 k)
+                                                    (get-alloc-ptr) f2 s)
+                            (%gc-count-foreign-refs (%gc-meta-read rcb1 k)
+                                                    (get-alloc-ptr) t2 s)))
+            (%gc-write64 (+ res 560)
+                         (%gc-count-foreign-refs (%gc-meta-read rcb1 k)
+                                                 (get-alloc-ptr)
+                                                 (%gc-meta-read r0 k) new0))
+            (%gc-write64 (+ res 576)
+                         (%gc-count-foreign-refs w1lo w1hi
+                                                 (%gc-meta-read rcb1 k) s))
+            ;; ---- ROUND 4: HOP 1 -> 2 again, park, COLLECT ----
+            (%gc-actor-hop (%gc-actor-region a2) sb rcb1 (%gc-actor-sp a1) w1hi k)
+            (%gc-actor-park-window rcb2 w2lo w2hi k)
+            (%gc-collect-here)
+            (%gc-write64 (+ res 520) (%gc-meta-read (+ rcb2 #x20) k))
+            (%gc-write64 (+ res 528) (%gc-chain-check (mem-ref slot2 :u64) nlinks))
+            (%gc-write64 (+ res 536) (get-alloc-ptr))
+            (%gc-write64 (+ res 552)
+                         (+ (%gc-count-foreign-refs (%gc-meta-read rcb2 k)
+                                                    (get-alloc-ptr) f1 s)
+                            (%gc-count-foreign-refs (%gc-meta-read rcb2 k)
+                                                    (get-alloc-ptr) t1 s)))
+            (%gc-write64 (+ res 584)
+                         (%gc-count-foreign-refs w2lo w2hi
+                                                 (%gc-meta-read rcb2 k) s))
+            ;; ---- HOP 2 -> 0: back to the actor that owns no region ----
+            (%gc-actor-hop (%gc-actor-region a0) sb rcb2 (%gc-actor-sp a2) w2hi k)
+            (%gc-write64 (+ res 568)
+                         (+ (+ (%gc-count-foreign-refs from0 alloc0 f1 s)
+                               (%gc-count-foreign-refs from0 alloc0 t1 s))
+                            (+ (%gc-count-foreign-refs from0 alloc0 f2 s)
+                               (%gc-count-foreign-refs from0 alloc0 t2 s))))
+            (%gc-write64 (+ res 592) nlinks)
+            (%gc-write64 (+ res 600) s)
+            (%gc-write64 (+ res 608) (%gc-region))
+            (%gc-write64 (+ res 616) (%gc-meta-read (+ r0 #x20) k))
+            (%gc-write64 (+ res 624) (if (%gc-region-parked-p r0) 1 0))
+            (%gc-write64 (+ res 664) w0lo)
+            (%gc-write64 (+ res 672) w0hi)
             res)))))

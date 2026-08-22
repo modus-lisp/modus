@@ -26,9 +26,38 @@
 ;;;;   +0x50  mailbox-head
 ;;;;   +0x58  mailbox-tail
 ;;;;   +0x60  linked-actor
-;;;;   +0x68  (reserved)
+;;;;   +0x68  GC REGION (raw byte address of this actor's 64-byte region
+;;;;          control block; ZERO MEANS REGION 0 — see below)
 ;;;;   +0x70  obj-alloc (per-actor object space)
 ;;;;   +0x78  obj-limit (per-actor object space)
+;;;;
+;;;; PER-REGION GC, STAGE 3: A REGION IS A PROPERTY OF AN ACTOR.
+;;;; Stage 1 made the heap a property of a region and stage 2 made the root set
+;;;; one; +0x68 is where an actor says WHICH region is its own.  It holds the
+;;;; raw byte address of that actor's control block in the same convention as
+;;;; the SP at +0x08 and the alloc pointer/limit at +0x10/+0x18 — the STORED
+;;;; MACHINE WORD is the address, hence (untag …) going in and *2 coming back.
+;;;;
+;;;; ZERO MEANS REGION 0, and that is the whole compatibility story: nothing
+;;;; writes the slot, SPAWN does not initialise it, and an actor whose slot is
+;;;; zero bump-allocates in region 0 exactly as every actor in every image
+;;;; built so far does.  ACTOR-REGION-HOP below short-circuits when NEITHER
+;;;; side of a switch owns a region, so a scheduler in which no actor owns one
+;;;; performs not a single extra memory write.
+;;;;
+;;;; +0x68 rather than the other reserved slot at +0x28 because +0x28 is inside
+;;;; the save area :SAVE-CTX writes through: SAVE-CONTEXT is handed cur+0x08 and
+;;;; stores SP/alloc/limit/V4 at pa+0x00…0x18, the continuation at pa+0x28
+;;;; (= struct +0x30) and, on aarch64, obj-alloc/obj-limit at pa+0x68/0x70
+;;;; (= struct +0x70/+0x78).  Struct +0x68 is pa+0x60, which nothing writes.
+;;;;
+;;;; WHAT THIS IMAGE DOES NOT HAVE.  A net/-only image does not link
+;;;; mvm/gc.lisp, so %GC-REGION-SWITCH and friends resolve through
+;;;; bare-runtime-stubs.lisp's %UNRESOLVED-FN and return NIL here.  That is
+;;;; harmless precisely because of the zero guard — the calls are unreachable
+;;;; while no actor owns a region — but it means GIVING AN ACTOR A REGION ON
+;;;; BARE METAL REQUIRES LINKING mvm/gc.lisp INTO THAT IMAGE FIRST.  The build
+;;;; log names every unresolved callee, so the gap is visible, not silent.
 
 ;;; ============================================================
 ;;; Spinlocks
@@ -68,6 +97,52 @@
 ;; Stack top for actor ID (each gets 64KB, grows down)
 (defun actor-stack-top (id)
   (+ (actor-stack-base) (* (+ id 1) #x10000)))
+
+;;; ============================================================
+;;; Per-region GC (stage 3): which region is this actor's?
+;;; ============================================================
+
+;; Raw byte address of ID's region control block, 0 if it owns none.
+;; ACTOR-GET reads the slot's machine word into a register, where a fixnum is
+;; value<<1 — so the Lisp value it hands back is HALF the address and the
+;; doubling here is the exact inverse of the (untag …) that stores it.
+(defun actor-region-raw (id)
+  (let ((w (actor-get id #x68)))
+    (if (zerop w) 0 (* w 2))))
+
+;; ONE SCHEDULER HOP, from the GC's point of view.  CUR-ID is being switched
+;; out and NEXT-ID switched in.  %GC-REGION-SWITCH parks the region being left
+;; — its allocation pointer and limit AND its root window, because an actor's
+;; heap and an actor's roots go off-CPU together — and makes the arriving
+;; actor's region the running one.
+;;
+;; THE SP IT PARKS AT is read straight back out of CUR-ID's struct at +0x08,
+;; where the SAVE-CONTEXT immediately above every call site has just written
+;; it.  That is the only place the number exists: no MVM primitive yields the
+;; stack pointer as a VALUE on every target, which is why %GC-REGION-PARK takes
+;; it as an argument at all.  ACTOR-GET returns the slot's machine word read as
+;; a Lisp integer (a fixnum is value<<1), so the doubling is the exact inverse
+;; of the (untag …) that SPAWN and :SAVE-CTX store through.
+;;
+;; THE GUARD IS THE COMPATIBILITY STORY, not an optimisation.  When NEITHER
+;; actor names a region, every actor is allocating in region 0 — the state of
+;; every image built so far — and this performs no write and makes no call.
+(defun actor-region-hop (cur-id next-id)
+  (let ((cr (actor-region-raw cur-id))
+        (nr (actor-region-raw next-id)))
+    (if (and (zerop cr) (zerop nr))
+        0
+        (%gc-region-switch (if (zerop nr) (%gc-region-0) nr)
+                           (* (actor-get cur-id #x08) 2)))))
+
+;; The same thing where there is NO outgoing actor to park: the idle scheduler
+;; picking work up, and an actor that has already marked itself dead.  Nothing
+;; is parked because nothing is leaving a live stack behind.
+(defun actor-region-resume (next-id)
+  (let ((nr (actor-region-raw next-id)))
+    (if (zerop nr)
+        0
+        (progn (%gc-region-enter nr) (%gc-region-unpark nr)))))
 
 ;;; ============================================================
 ;;; Run queue (linked list via actor struct +0x48)
@@ -305,6 +380,8 @@
                         (actor-set next-id #x00 1)
                         (percpu-set 40 (actor-get next-id #x70))
                         (percpu-set 48 (actor-get next-id #x78))
+                        ;; No outgoing actor, so nothing to park.
+                        (actor-region-resume next-id)
                         (let ((next-addr (actor-struct-addr next-id)))
                           (restore-context (+ next-addr #x08))))
                       (let ((cur-addr (actor-struct-addr cur-id)))
@@ -322,6 +399,19 @@
                               (actor-set next-id #x00 1)
                               (percpu-set 40 (actor-get next-id #x70))
                               (percpu-set 48 (actor-get next-id #x78))
+                              ;; PER-REGION GC, STAGE 3.  Park the outgoing
+                              ;; actor's region at the SP save-context wrote to
+                              ;; its struct at +0x08 and make the arriving
+                              ;; actor's region the running one.  It goes HERE,
+                              ;; immediately before restore-context, on purpose:
+                              ;; %gc-region-enter loads the arriving region's
+                              ;; parked allocation pointer/limit, and
+                              ;; restore-context then reinstates the same pair
+                              ;; from the arriving actor's own save area — so
+                              ;; there is no window in which the mutator is
+                              ;; running on one actor's stack with another
+                              ;; actor's allocation registers.
+                              (actor-region-hop cur-id next-id)
                               (let ((next-addr (actor-struct-addr next-id)))
                                 (restore-context (+ next-addr #x08))))
                             ;; Resume path: lock already released by restore-context
@@ -358,6 +448,9 @@
           (actor-set next-id #x00 1)
           (percpu-set 40 (actor-get next-id #x70))
           (percpu-set 48 (actor-get next-id #x78))
+          ;; The outgoing actor is DEAD (status 3) — its region has no roots
+          ;; worth parking, so this only enters the arriving one's.
+          (actor-region-resume next-id)
           (let ((next-addr (actor-struct-addr next-id)))
             (restore-context (+ next-addr #x08)))))))
 
@@ -400,6 +493,8 @@
             (actor-set next-id #x00 1)
             (percpu-set 40 (actor-get next-id #x70))
             (percpu-set 48 (actor-get next-id #x78))
+            ;; The idle loop owns no region, so there is nothing to park.
+            (actor-region-resume next-id)
             (let ((next-addr (actor-struct-addr next-id)))
               (restore-context (+ next-addr #x08))))))))
 
@@ -713,6 +808,11 @@
                           (actor-set next-id #x00 1)
                           (percpu-set 40 (actor-get next-id #x70))
                           (percpu-set 48 (actor-get next-id #x78))
+                          ;; Same hop as YIELD's: this actor blocks (status 4)
+                          ;; on its own stack, so its region parks at the SP
+                          ;; the save-context above just recorded, and stays
+                          ;; collectable from that window while it waits.
+                          (actor-region-hop cur-id next-id)
                           (let ((next-addr (actor-struct-addr next-id)))
                             (restore-context (+ next-addr #x08)))))))
                 ;; Resumed: dequeue the message that woke us

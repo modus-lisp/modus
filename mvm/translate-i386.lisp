@@ -499,20 +499,26 @@
    old semispace intact), so being able to force dozens of cycles out of a
    small workload is what makes the survival tests cheap.  NIL = normal.")
 
-;;; REGION 0 ONLY.  The GC metadata block is per-region as of stage 1 (see
-;;; mvm/compiler.lisp's +GC-OFF-*+ / +GC-REGION-ADDR+ block): the eight names
-;;; below spell "region 0's block, field F", which is what a single-region image
-;;; uses and therefore leaves this translator byte-for-byte as it was.  This
-;;; collector does NOT read the active-region pointer, so an i386 image that
-;;; created a second region would collect the wrong heap.  Porting it means the
-;;; same edit translate-x64's emit-gc-trampoline took: load the region base
-;;; once, address the five fields off it.  Nothing creates a second region on
-;;; i386 today, and there is no way to boot one where this was written.
-(defconstant +i386-gc-from-start+ modus.mvm::+gc-from-start-addr+)
-(defconstant +i386-gc-to-start+   modus.mvm::+gc-to-start-addr+)
-(defconstant +i386-gc-space-size+ modus.mvm::+gc-space-size-addr+)
-(defconstant +i386-gc-stack-base+ modus.mvm::+gc-stack-base-addr+)
-(defconstant +i386-gc-count+      modus.mvm::+gc-count-addr+)
+;;; STAGE 3: THE ACTIVE REGION, NOT REGION 0.  The GC metadata block has been
+;;; per-region since stage 1 (mvm/compiler.lisp's +GC-OFF-*+ / +GC-REGION-ADDR+
+;;; block owns the numbers); until now this collector read region 0's fields at
+;;; their absolute addresses, so an i386 image that created a second region
+;;; would have collected the wrong heap.  The names below are now OFFSETS, and
+;;; i386-emit-gc-trampoline resolves the base once at entry (ZERO MEANS REGION
+;;; 0, so a single-region i386 image addresses exactly the words it always did).
+;;;
+;;; The base has to go to MEMORY rather than a register: EBX/ESI/EDI are
+;;; collector state, EBP is every root loop's cursor, and scan_word clobbers
+;;; EAX/ECX/EDX — i386 has no register to spare.  Three read-only fields
+;;; (space_size, stack_base and the PRE-SWAP to_start) are hoisted into scratch
+;;; dwords for the same reason; the two fields that get WRITTEN (from_start,
+;;; to_start) and the count are addressed off the base.
+(defconstant +i386-gc-off-from+  modus.mvm::+gc-off-from-start+)
+(defconstant +i386-gc-off-to+    modus.mvm::+gc-off-to-start+)
+(defconstant +i386-gc-off-size+  modus.mvm::+gc-off-space-size+)
+(defconstant +i386-gc-off-sb+    modus.mvm::+gc-off-stack-base+)
+(defconstant +i386-gc-off-count+ modus.mvm::+gc-off-count+)
+(defconstant +i386-gc-off-sp+    modus.mvm::+gc-off-saved-sp+)
 (defvar *i386-genadd-label* nil)
 (defvar *i386-gensub-label* nil)
 (defvar *i386-genmul-label* nil)
@@ -558,6 +564,19 @@
   "Scratch used by the GC trampoline's handler-stack root loop: scan_word
    clobbers EAX/ECX/EDX and every other register is collector state, so the
    loop bound has to live in memory.")
+;;; STAGE-3 GC scratch, in the same gap: the resolved ACTIVE region base and
+;;; the three read-only fields hoisted out of it.  Written once per collection
+;;; at trampoline entry, before any root loop starts, and read from absolute
+;;; addresses thereafter because i386 has no register left to hold them.
+(defparameter *i386-gc-rcb-addr*  #x100003D8
+  "Resolved base of the ACTIVE region's 64-byte control block.")
+(defparameter *i386-gc-size-addr* #x100003DC
+  "This collection's space_size, hoisted out of the control block.")
+(defparameter *i386-gc-sb-addr*   #x100003E0
+  "This collection's stack_base, i.e. the HIGH end of this region's root window.")
+(defparameter *i386-gc-to-addr*   #x100003E4
+  "This collection's to_start, captured BEFORE the semispace swap.")
+
 (defparameter *i386-hstack-capcount-addr* #x100003F0
   "Cumulative count of capped pushes (diagnostic only).")
 (defparameter *i386-hstack-overflow-addr* #x100003F8
@@ -901,6 +920,14 @@
   "MOV [addr], reg (absolute 32-bit address, no base register)"
   ;; Encoding: 89 /r mod=00 r/m=5 disp32
   (i386-emit-byte buf #x89)
+  (i386-emit-byte buf (i386-modrm #b00 reg 5))
+  (i386-emit-u32 buf (logand addr #xFFFFFFFF)))
+
+(defun i386-emit-add-reg-abs (buf reg addr)
+  "ADD reg, [addr] (absolute 32-bit address, no base register)"
+  ;; Encoding: 03 /r mod=00 r/m=5 disp32
+  (i386-check-eax-write reg)
+  (i386-emit-byte buf #x03)
   (i386-emit-byte buf (i386-modrm #b00 reg 5))
   (i386-emit-u32 buf (logand addr #xFFFFFFFF)))
 
@@ -1935,19 +1962,55 @@
         (body-label (i386-make-label)))
     (i386-emit-label buf tramp-label)
     (i386-emit-byte buf #x60)                             ; PUSHAD
+    ;; --- STAGE 3: resolve the ACTIVE region's control block (0 = region 0) ---
+    (i386-emit-mov-reg-abs buf +i386-eax+ modus.mvm::+gc-region-addr+)
+    (let ((have (i386-make-label)))
+      (i386-emit-test-reg-reg buf +i386-eax+ +i386-eax+)
+      (i386-emit-jcc buf :ne have)
+      (i386-emit-mov-reg-imm buf +i386-eax+ modus.mvm::+gc-region-0-base+)
+      (i386-emit-label buf have))
+    (i386-emit-mov-abs-reg buf *i386-gc-rcb-addr* +i386-eax+)
     ;; --- metadata: EBX = from_start, ESI = free ptr (to_start), EDI = from_end
-    (i386-emit-mov-reg-abs buf +i386-ebx+ +i386-gc-from-start+)
-    (i386-emit-mov-reg-abs buf +i386-esi+ +i386-gc-to-start+)
+    (i386-emit-mov-reg-mem buf +i386-ebx+ +i386-eax+ +i386-gc-off-from+)
+    (i386-emit-mov-reg-mem buf +i386-esi+ +i386-eax+ +i386-gc-off-to+)
+    (i386-emit-mov-abs-reg buf *i386-gc-to-addr* +i386-esi+)   ; pre-swap to_start
+    (i386-emit-mov-reg-mem buf +scratch0+ +i386-eax+ +i386-gc-off-size+)
+    (i386-emit-mov-abs-reg buf *i386-gc-size-addr* +scratch0+)
+    (i386-emit-mov-reg-mem buf +scratch0+ +i386-eax+ +i386-gc-off-sb+)
+    (i386-emit-mov-abs-reg buf *i386-gc-sb-addr* +scratch0+)
     (i386-emit-mov-reg-reg buf +i386-edi+ +i386-ebx+)
-    (i386-emit-byte buf #x03)                             ; ADD EDI, [space_size]
-    (i386-emit-byte buf (i386-modrm #b00 +i386-edi+ 5))
-    (i386-emit-u32 buf +i386-gc-space-size+)
+    (i386-emit-add-reg-abs buf +i386-edi+ *i386-gc-size-addr*)
 
-    ;; --- stack roots: [ESP, stack_base) ---
-    (let ((sl (i386-make-label)) (sd (i386-make-label)))
+    ;; --- stack roots: THIS REGION'S ROOT WINDOW, [low, stack_base) ---
+    ;; STAGE 2's two cases, ported here by stage 3.  Until now the low end was
+    ;; ESP unconditionally, i.e. every region this collector could reach was
+    ;; assumed to be the RUNNING one.
+    ;;   saved_sp == 0  RUNNING — the low end is ESP, which is AT the PUSHAD
+    ;;                  frame, so the saved register file is inside the window.
+    ;;                  Nothing on i386 writes this field, so it reads as the
+    ;;                  BSS zero and this is byte-for-byte the old behaviour.
+    ;;   saved_sp != 0  PARKED — the region's actor was switched off its own
+    ;;                  stack and %gc-region-park recorded that SP.  Capped by
+    ;;                  SIZE (+GC-MAX-PARKED-WINDOW+), because the low end came
+    ;;                  from memory; over the cap, or inverted (the SUB wraps to
+    ;;                  a huge unsigned value), the window collapses to EMPTY
+    ;;                  rather than walking unmapped pages.
+    (let ((sl (i386-make-label)) (sd (i386-make-label))
+          (sp-live (i386-make-label)) (sp-ready (i386-make-label)))
+      (i386-emit-mov-reg-mem buf +i386-ebp+ +i386-eax+ +i386-gc-off-sp+)
+      (i386-emit-test-reg-reg buf +i386-ebp+ +i386-ebp+)
+      (i386-emit-jcc buf :e sp-live)
+      (i386-emit-mov-reg-abs buf +scratch0+ *i386-gc-sb-addr*)
+      (i386-emit-sub-reg-reg buf +scratch0+ +i386-ebp+)     ; stack_base - saved_sp
+      (i386-emit-cmp-reg-imm buf +scratch0+ modus.mvm::+gc-max-parked-window+)
+      (i386-emit-jcc buf :be sp-ready)
+      (i386-emit-mov-reg-abs buf +i386-ebp+ *i386-gc-sb-addr*)  ; bogus -> empty
+      (i386-emit-jmp-rel32 buf sp-ready)
+      (i386-emit-label buf sp-live)
       (i386-emit-mov-reg-reg buf +i386-ebp+ +i386-esp+)
+      (i386-emit-label buf sp-ready)
       (i386-emit-label buf sl)
-      (i386-emit-cmp-reg-abs buf +i386-ebp+ +i386-gc-stack-base+)
+      (i386-emit-cmp-reg-abs buf +i386-ebp+ *i386-gc-sb-addr*)
       (i386-emit-jcc buf :ae sd)
       (i386-emit-mov-reg-reg buf +i386-eax+ +i386-ebp+)
       (i386-emit-call-rel32 buf scan-label)
@@ -2025,7 +2088,7 @@
 
     ;; --- Cheney scan of to-space: [to_start, free_ptr), free_ptr growing ---
     (let ((cl (i386-make-label)) (cd (i386-make-label)))
-      (i386-emit-mov-reg-abs buf +i386-ebp+ +i386-gc-to-start+)
+      (i386-emit-mov-reg-abs buf +i386-ebp+ *i386-gc-to-addr*)
       (i386-emit-label buf cl)
       (i386-emit-cmp-reg-reg buf +i386-ebp+ +i386-esi+)
       (i386-emit-jcc buf :ae cd)
@@ -2035,18 +2098,16 @@
       (i386-emit-jmp-rel32 buf cl)
       (i386-emit-label buf cd))
 
-    ;; --- swap semispaces ---
-    (i386-emit-mov-reg-abs buf +i386-eax+ +i386-gc-to-start+)
-    (i386-emit-mov-abs-reg buf +i386-gc-from-start+ +i386-eax+)
-    (i386-emit-mov-abs-reg buf +i386-gc-to-start+ +i386-ebx+)
+    ;; --- swap semispaces, IN THE ACTIVE REGION'S CONTROL BLOCK ---
+    (i386-emit-mov-reg-abs buf +scratch0+ *i386-gc-rcb-addr*)
+    (i386-emit-mov-reg-abs buf +i386-eax+ *i386-gc-to-addr*)
+    (i386-emit-mov-mem-reg buf +scratch0+ +i386-gc-off-from+ +i386-eax+)
+    (i386-emit-mov-mem-reg buf +scratch0+ +i386-gc-off-to+ +i386-ebx+)
     ;; --- install VA = free pointer, VL = new from_start + space_size ---
     (i386-emit-mov-abs-reg buf *va-addr* +i386-esi+)
     (if *i386-gc-stress-limit*
         (i386-emit-add-reg-imm buf +i386-eax+ *i386-gc-stress-limit*)
-        (progn
-          (i386-emit-byte buf #x03)                       ; ADD EAX, [space_size]
-          (i386-emit-byte buf (i386-modrm #b00 +i386-eax+ 5))
-          (i386-emit-u32 buf +i386-gc-space-size+)))
+        (i386-emit-add-reg-abs buf +i386-eax+ *i386-gc-size-addr*))
     (i386-emit-mov-abs-reg buf *vl-addr* +i386-eax+)
 
     ;; --- MCGC point (c): byte-exact clear of the reclaimed range's bitmaps ---
@@ -2065,15 +2126,15 @@
       (i386-emit-shr-reg-imm buf +i386-eax+ 7)            ; 1 bit / 16 bytes
       (i386-emit-mov-reg-abs buf +i386-edi+ bmp)
       (i386-emit-add-reg-reg buf +i386-edi+ +i386-eax+)
-      (i386-emit-mov-reg-abs buf +scratch0+ +i386-gc-space-size+)
+      (i386-emit-mov-reg-abs buf +scratch0+ *i386-gc-size-addr*)
       (i386-emit-shr-reg-imm buf +scratch0+ 7)
       (i386-emit-byte buf #x31) (i386-emit-byte buf #xC0) ; XOR EAX, EAX
       (i386-emit-byte buf #xF3) (i386-emit-byte buf #xAA)); REP STOSB
 
-    ;; --- gc_count++ ---
-    (i386-emit-byte buf #xFF)                             ; INC dword [abs32]
-    (i386-emit-byte buf (i386-modrm #b00 0 5))
-    (i386-emit-u32 buf +i386-gc-count+)
+    ;; --- gc_count++, IN THIS REGION ---
+    (i386-emit-mov-reg-abs buf +i386-eax+ *i386-gc-rcb-addr*)
+    (i386-emit-byte buf #xFF)                             ; INC dword [eax+count]
+    (i386-emit-modrm-mem buf 0 +i386-eax+ +i386-gc-off-count+)
 
     (i386-emit-gcdbg-dump buf)
 

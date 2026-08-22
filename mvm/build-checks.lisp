@@ -1564,6 +1564,7 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
                    (subseq buf 0 (read-sequence buf s)))))
          (want-region (format nil "#x~8,'0X" +gc-region-addr+))
          (want-zero   (format nil "#x~8,'0X" +gc-region-0-base+))
+         (want-percpu (format nil "#x~8,'0X" +gc-region-percpu-addr+))
          (problems nil))
     (flet ((has (str) (search str text :test #'char-equal)))
       (unless (has want-region)
@@ -1575,6 +1576,23 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
         (push (format nil "mvm/gc.lisp does not mention the region-0 base ~A ~
                            (+GC-REGION-0-BASE+); %gc-region's zero default has drifted"
                       want-zero)
+              problems))
+      ;; STAGE 3.  The active-region word is now the CPU-0 entry of a per-CPU
+      ;; array, and which form is used is decided by a gate word that mvm/gc.lisp
+      ;; can only spell as a literal.  A drift here is the worst kind: the Lisp
+      ;; side would read one cell and translate-x64's trampoline another, so the
+      ;; collector and the mutator would disagree about which heap is live.
+      (unless (has want-percpu)
+        (push (format nil "mvm/gc.lisp does not mention the per-CPU gate word ~A ~
+                           (+GC-REGION-PERCPU-ADDR+); %gc-region-cell has drifted"
+                      want-percpu)
+              problems))
+      (unless (search (format nil "(percpu-ref ~D)" +gc-percpu-cpu-id-off+) text
+                      :test #'char-equal)
+        (push (format nil "mvm/gc.lisp does not read the per-CPU :CPU-ID slot as ~
+                           (percpu-ref ~D) (+GC-PERCPU-CPU-ID-OFF+); %gc-region-cell ~
+                           would index the per-CPU active-region table by the wrong slot"
+                      +gc-percpu-cpu-id-off+)
               problems))
       (dolist (off (list +gc-off-to-start+ +gc-off-space-size+ +gc-off-stack-base+
                          +gc-off-count+ +gc-off-saved-sp+ +gc-off-saved-alloc+

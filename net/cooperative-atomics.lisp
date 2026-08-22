@@ -55,6 +55,51 @@
 ;;;; COOPERATIVE-ATOMIC-PRECONDITION and fix every hit.  Do not reason from
 ;;;; "it worked before"; the guarantee is structural, and the structure is
 ;;;; what changes.
+;;;;
+;;;; ---- WHAT PER-REGION GC STAGE 3 CHANGED HERE (2026-08-22) ----
+;;;;
+;;;; Stage 3 of per-region GC (mvm/gc.lisp; CLAUDE.md "Per-region GC, stage 3")
+;;;; is the step whose stated purpose is to make PER-ACTOR SMP reachable, so it
+;;;; is exactly the kind of change that could invalidate the three facts above
+;;;; silently.  Recorded here rather than left to be rediscovered:
+;;;;
+;;;; ALL THREE FACTS STILL HOLD, AND FOR THE SAME REASONS.  Stage 3 added no
+;;;; yield site (the ONE `(emit-ir :yield)' in mvm/compiler.lisp's compile-loop
+;;;; is still the only one — fact 1); it made no scheduler preemptive
+;;;; (mvm/interp.lisp still treats +op-yield+ as a no-op and the hosted
+;;;; safepoint-deadline stub is still NIL — fact 2); and it installed no signal
+;;;; handler (fact 3).  NO IMAGE RUNS NATIVE THREADS: every shipping build is
+;;;; still single-core, and net/actors.lisp is still a COOPERATIVE scheduler
+;;;; whose only context switch is an explicit YIELD / RECEIVE call.
+;;;;
+;;;; SO THESE OPERATIONS DID NOT BECOME UNSAFE.  They also did not become safe:
+;;;; nothing here acquired a lock, a barrier or a compare-exchange.  What
+;;;; changed is only how far away the falsification now is.
+;;;;
+;;;; WHAT STAGE 3 ACTUALLY BUILT, stated so the next reader can tell what is
+;;;; load-bearing:
+;;;;   - An actor names its own GC region in its struct at +0x68, and
+;;;;     net/actors.lisp's YIELD and RECEIVE call %GC-REGION-SWITCH with the SP
+;;;;     save-context just recorded.  That is still a COOPERATIVE switch on ONE
+;;;;     CPU; it changes which heap the mutator allocates from, not when it can
+;;;;     be interrupted.
+;;;;   - The active-region word can now be PER-CPU (mvm/gc.lisp
+;;;;     %GC-REGION-CELL, translate-x64 *X64-GC-REGION-PERCPU*).  BOTH GATES
+;;;;     DEFAULT OFF and nothing writes the mode word, so no image built so far
+;;;;     has more than one active-region cell.
+;;;;
+;;;; THE PRECONDITION THAT MUST STILL BE TRUE, restated for the SMP step this
+;;;; is aimed at: the moment a SECOND CPU runs Modus code — which is what
+;;;; turning the per-CPU active-region cell on is FOR — fact 1 stops being
+;;;; sufficient on its own.  "No yield point inside the sequence" bounds only
+;;;; THIS CPU; another core executing the same read-modify-write concurrently
+;;;; needs no yield point to lose an update.  Facts 2 and 3 are equally
+;;;; single-core arguments.  So: PER-ACTOR SMP AND THESE MACROS CANNOT SHIP
+;;;; TOGETHER UNCHANGED.  Whoever enables the second CPU owns replacing every
+;;;; COOPERATIVE-ATOMIC-PRECONDITION site below with a real atomic (x86 LOCK
+;;;; CMPXCHG / XADD, aarch64 LDAXR/STLXR, riscv LR/SC, ppc LWARX/STWCX) — the
+;;;; MVM already has :xchg-mem, which net/actors.lisp's SPIN-LOCK uses, so the
+;;;; ISA is not the obstacle.
 ;;;; ---------------------------------------------------------------------
 ;;;;
 ;;;; SEMANTICS

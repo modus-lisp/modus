@@ -631,6 +631,98 @@ Two traps this cost time on, both pre-existing:
   per-region GC — but it means a scripted stress measures that instead of the
   collector.  Drive forced collections from compiled in-image code.
 
+### Per-region GC, stage 3: a REGION is a property of an ACTOR
+
+Stage 1 made the heap per-region, stage 2 the roots.  Stage 3 makes a region
+something an ACTOR OWNS, which is what PLAN.md's "Stage 3: Per-actor SMP" needs.
+Three parts, and **none of them changes a single-region image**:
+
+**1. The active-region word stops being ONE word.**  It is now the CPU-0 entry
+of a per-CPU array based at the same address: `+GC-REGION-ADDR+ + 8*cpu_id`, so
+a uniprocessor image reads and writes exactly the word it always did, at exactly
+the address stages 1 and 2 used.  "Which CPU" is the `:CPU-ID` slot at
+`+GC-PERCPU-CPU-ID-OFF+` (=16) that **every** boot descriptor's
+`percpu-layout-fn` already allocates — no per-CPU block grows, no
+`+*-PERCPU-STRIDE+` moves.  Both readers go through one place: `%GC-REGION-CELL`
+in `gc.lisp`, `EMIT-LOAD-GC-REGION` in translate-x64.
+
+**IT IS OFF, on both sides, and that is deliberate**: a per-CPU read is GS: on
+x64, FS: on i386, TPIDR_EL1 on aarch64, and **on hosted Linux the GS base is 0**,
+so an unguarded `GS:[16]` reads absolute address 16 and takes SIGSEGV.  The Lisp
+side branches on `+GC-REGION-PERCPU-ADDR+` (`0x10000FF8`), a BSS word that is
+zero in every image ever built — nothing writes it; the native side branches on
+the host flag `*X64-GC-REGION-PERCPU*`, default NIL.  Measured, not asserted:
+with the flag off `EMIT-LOAD-GC-REGION` and the **whole 826-byte x64 GC
+trampoline** are byte-identical to a build of the HEAD source loaded over the
+new one in the same image.  Turning it on is two deliberate acts and both must
+happen together or the collector and the mutator read different cells —
+`build-checks.lisp` CHECK G now ratchets both literals in `gc.lisp`.
+
+**2. An actor names its region by POINTER, in its struct at `+0x68`.**
+`ZERO MEANS REGION 0`, so an actor that owns no region is the actor of today and
+nothing needs initialising — `SPAWN` does not touch the slot.  `+0x68` and not
+the other reserved slot `+0x28` because `+0x28` is inside the save area
+`:SAVE-CTX` writes through (it gets `cur+0x08` and stores SP/alloc/limit/V4 at
+pa+0x00…0x18, the continuation at pa+0x28 = struct **+0x30**, and on aarch64
+obj-alloc/obj-limit at pa+0x68/0x70 = struct **+0x70/+0x78**); struct +0x68 is
+pa+0x60, which nothing writes.  `net/actors.lisp` gained `ACTOR-REGION-RAW`,
+`ACTOR-REGION-HOP` (YIELD's and RECEIVE's save paths, immediately before
+`restore-context`) and `ACTOR-REGION-RESUME` (the idle scheduler and
+`ACTOR-EXIT`, where there is no outgoing actor to park).  The SP it parks at is
+read back out of `+0x08`, where `SAVE-CONTEXT` has just written it.  **The guard
+is the compatibility story**: when neither side of a switch names a region, the
+hop makes no call and performs no write.
+
+**A net/-only image does not link `mvm/gc.lisp`**, so those four calls land on
+`bare-runtime-stubs.lisp`'s `%UNRESOLVED-FN` (→ NIL) there — measured, the
+aarch64 bare actors image goes 4760 unresolved calls / 24 functions → 4771 / 28,
+the extra 11 being the 4 new names plus 2 `GENERIC-MULTIPLY` and 5
+`NUMERIC-EQUAL-P` from the new helpers' own arithmetic.  Harmless while no actor
+owns a region, but **giving an actor a region on bare metal means linking
+`mvm/gc.lisp` into that image first.**
+
+**3. The aarch64 and i386 collectors are region-aware.**  Both used to read
+region 0's absolute field addresses.  Now: aarch64's native collector and its
+Lisp-calling shim both resolve the base once (`A64-LOAD-GC-REGION`), i386's
+trampoline resolves it into a BSS scratch dword at entry (it has no register to
+spare — EBX/ESI/EDI are collector state, EBP is every loop's cursor, scan_word
+clobbers EAX/ECX/EDX) and hoists the three read-only fields out of it.  Both
+also grew stage 2's **parked-window branch**, which they never had: `saved_sp==0`
+= RUNNING (low end is the live SP), non-zero = PARKED and the window is capped
+by SIZE, not by an address.  And **aarch64's shim now writes the live SP into
+`+0x28` only when that field says RUNNING** — it used to write unconditionally,
+which would have clobbered a parked actor's recorded SP and silently dropped
+every root it held.  `%gc-collect`'s old absolute floor (`0x07200000`, one
+board's stack guard) is gone for the same reason, replaced by the same size cap
+translate-x64 has used since stage 2.
+
+Acceptance: `./modus --script test/region-gc-actors.lisp` (53 checks).  Three
+actor structs in the carved guard band, in `net/actors.lisp`'s own layout; actor
+0's region slot left ZERO and required to resolve to region 0's block; actors 1
+and 2 owning carved regions and round-robin switched 1,2,1,2 with a FORCED
+collection at each stop while parked on their own 512-byte root windows.  Each
+region's own count rises, its chain still walks read back through its parked
+slot, live bytes are `16*N+16`, the other region and region 0 are bit-for-bit
+unchanged, and `%gc-count-foreign-refs` is 0 in every direction with a POSITIVE
+CONTROL (each window holds exactly one pointer) so the oracle can answer
+non-zero.
+
+**The carve in all three selftests is now ADAPTIVE** (2 MB regions below a 128 MB
+semispace, 16 MB above) for one reason: the bare-metal RPi CL image has 56 MB
+semispaces and used to skip — and it is the **only** target whose native
+collector can be booted here.  With that, stages 1, 2 AND 3 all RUN on the
+region-aware **aarch64 native collector** under `qemu-system-aarch64 -M raspi3b`,
+including the brand-new parked-window branch (chain A, rooted only from the
+parked window, survives; chain B, rooted only from the live stack, does not).
+`(%gc-forced-stress 2000 5)` there is `(1 6 2000 1999000 0 5)`.
+
+**`net/cooperative-atomics.lisp` was reconciled, not silently invalidated.**  Its
+three checked facts all still hold and for the same reasons — stage 3 added no
+yield site, made no scheduler preemptive and installed no signal handler, and no
+image runs native threads.  The macros did not become safe either.  The header
+now says so, and says the thing that matters: **fact 1 bounds only THIS CPU**, so
+per-actor SMP and those macros cannot ship together unchanged.
+
 ### Conservative-root validation collector (x64, landed ace1544 + 810a975)
 
 The Cheney collector is now hardened by an **object-start bitmap** (1 bit /

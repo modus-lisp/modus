@@ -214,6 +214,55 @@
 ;;; 0x10000EA8 and reserves through 0x10000EC0.
 (defconstant +gc-region-addr+ #x10000F08)
 
+;;; ---- STAGE 3: THE ACTIVE-REGION WORD STOPS BEING *ONE* WORD ---------------
+;;;
+;;; Stage 1 made the heap per-region, stage 2 made the roots per-region.  Both
+;;; still had exactly ONE word saying which region is active, which is one
+;;; collecting thread by construction — the same shape stage 1 removed from the
+;;; metadata block.  Stage 3 makes that word an ARRAY, one entry per CPU:
+;;;
+;;;     this CPU's active-region word  =  +GC-REGION-ADDR+ + 8 * cpu_id
+;;;
+;;; CPU 0's entry IS +GC-REGION-ADDR+, the historic word, at the historic
+;;; address.  So a uniprocessor image reads and writes exactly the word it
+;;; always did, at exactly the address every earlier stage used, and the whole
+;;; per-CPU apparatus is unreachable in it.
+;;;
+;;; WHICH CPU is asked with the per-CPU :CPU-ID slot at +GC-PERCPU-CPU-ID-OFF+.
+;;; That slot is NOT new — every boot descriptor's percpu-layout-fn already
+;;; allocates it (boot-x64 1206, boot-aarch64 689, boot-i386 304, boot-riscv,
+;;; boot-ppc64, boot-68k) — so nothing about the per-CPU block's size or layout
+;;; changes and no target's +*-PERCPU-STRIDE+ moves.
+;;;
+;;; AND IT IS OFF.  Reading a per-CPU slot means GS: on x64, FS: on i386,
+;;; TPIDR_EL1 on aarch64, and on HOSTED Linux the GS base is 0 — an unguarded
+;;; `GS:[16]' reads absolute address 16 and takes SIGSEGV.  So the per-CPU form
+;;; is behind a gate on BOTH sides, and both default to the single word:
+;;;
+;;;   Lisp   (mvm/gc.lisp %GC-REGION-CELL) branches on +GC-REGION-PERCPU-ADDR+,
+;;;          a BSS word that is ZERO in every image ever built — nothing writes
+;;;          it.  Zero = "the active-region word is the single word at
+;;;          +GC-REGION-ADDR+", which is the pre-stage-3 code verbatim.
+;;;   native (translate-x64 EMIT-LOAD-GC-REGION) branches on the HOST flag
+;;;          *X64-GC-REGION-PERCPU*, default NIL, which emits today's
+;;;          `mov reg,[abs32]' — byte for byte, no extra instruction.
+;;;
+;;; TURNING IT ON is therefore two deliberate acts (set the flag, write the
+;;; word) and it must not be done on a target whose GS/FS/TPIDR base is not a
+;;; real per-CPU block.  +GC-REGION-MAX-CPUS+ bounds the table: 16 entries =
+;;; 128 bytes, 0x10000F08..0x10000F88, which stays inside the documented BSS gap
+;;; (nothing between 0x10000EA8 and 0x10001000).  The mode word is put at the
+;;; TOP of that gap so the table can grow toward it.
+(defconstant +gc-region-max-cpus+ 16)
+(defconstant +gc-region-percpu-addr+ #x10000FF8
+  "Per-CPU-active-region mode word.  0 (every image today) = the active region
+   is the single word at +GC-REGION-ADDR+; non-zero = it is
+   +GC-REGION-ADDR+ + 8*cpu_id.")
+(defconstant +gc-percpu-cpu-id-off+ 16
+  "Byte offset of the :CPU-ID slot in the per-CPU block, as every boot
+   descriptor's percpu-layout-fn already defines it.  Stored TAGGED (value =
+   the CPU number), so on x64 `mov reg,GS:[16]' yields 2*cpu_id.")
+
 (defconstant +gc-from-start-addr+  (+ +gc-region-0-base+ +gc-off-from-start+))
 (defconstant +gc-to-start-addr+    (+ +gc-region-0-base+ +gc-off-to-start+))
 (defconstant +gc-space-size-addr+  (+ +gc-region-0-base+ +gc-off-space-size+))

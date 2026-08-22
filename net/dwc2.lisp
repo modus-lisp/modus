@@ -160,6 +160,47 @@
 (defun usb-device-class () (mem-ref (+ (usb-state-addr) #x20) :u32))
 (defun usb-set-device-class (v) (setf (mem-ref (+ (usb-state-addr) #x20) :u32) v))
 
+;; ------------------------------------------------------------
+;; #275 DIAGNOSTIC LATCHES.  Two blind spots stalled this investigation:
+;;
+;;  (a) dwc2-poll-channel writes HCINT = 0xFFFFFFFF before returning, so by
+;;      the time the REPL can look the reason is GONE — and its error arm
+;;      collapses XACTERR with "anything else" into the same -2.
+;;  (b) post-transfer HCTSIZ reads 0 BOTH when a transfer succeeded (XferSize
+;;      decrements to 0) AND when it was never programmed.  Ambiguous, so it
+;;      cannot tell "moved 8 bytes" from "did nothing" — which is exactly the
+;;      question, since the controller reports XFERCOMPL on a transfer that
+;;      moved zero bytes.
+;;
+;; These latch values AT THE MOMENT THEY MATTER into spare state words for the
+;; serial REPL to read.  Slots +0x30.. are free (documented map ends at +0x20)
+;; and the DMA window runs to 0x11113000.
+;; ------------------------------------------------------------
+(defun dwc2-diag-hctsiz-pre ()  (mem-ref (+ (usb-state-addr) #x30) :u32))
+(defun dwc2-diag-dma-pre ()     (mem-ref (+ (usb-state-addr) #x34) :u32))
+(defun dwc2-diag-hcchar-pre ()  (mem-ref (+ (usb-state-addr) #x38) :u32))
+(defun dwc2-diag-hcint ()       (mem-ref (+ (usb-state-addr) #x3C) :u32))
+(defun dwc2-diag-hctsiz-post () (mem-ref (+ (usb-state-addr) #x40) :u32))
+(defun dwc2-diag-polls ()       (mem-ref (+ (usb-state-addr) #x44) :u32))
+;; DATA-stage-specific copies.  The latches above are overwritten by every
+;; stage, so after a control transfer they always describe the STATUS stage
+;; (XferSize 0, PktCnt 1, DATA1) — which looks healthy and says nothing about
+;; whether the DATA stage moved bytes.  dwc2-control-data-in copies them here
+;; the moment its own poll returns, before STATUS runs.
+(defun dwc2-diag-d-hctsiz ()  (mem-ref (+ (usb-state-addr) #x48) :u32))
+(defun dwc2-diag-d-hcint ()   (mem-ref (+ (usb-state-addr) #x4C) :u32))
+(defun dwc2-diag-d-post ()    (mem-ref (+ (usb-state-addr) #x50) :u32))
+(defun dwc2-diag-d-result ()  (mem-ref (+ (usb-state-addr) #x54) :u32))
+;; DATA-stage HCDMA, latched BEFORE enable and again AFTER completion.  DWC2
+;; ADVANCES HCDMA as it writes, so the pair answers "did the controller write,
+;; and where": if post == pre the engine never moved, if post == pre+8 it wrote
+;; 8 bytes SOMEWHERE, and pre itself proves whether we even pointed it at the
+;; caller's buffer.  This is the one quantity still unmeasured while the
+;; controller claims XFERCOMPL|ACK with XferSize 8 -> 0 and the buffer is
+;; untouched.
+(defun dwc2-diag-d-dma-pre ()  (mem-ref (+ (usb-state-addr) #x58) :u32))
+(defun dwc2-diag-d-dma-post () (mem-ref (+ (usb-state-addr) #x5C) :u32))
+
 ;; ============================================================
 ;; Delay helper (millisecond-ish delays via io-delay loops)
 ;; Each io-delay is ~5000 UART reads. Approximate 1ms per call
@@ -389,8 +430,27 @@
           (logior (ash (logand pktcnt #x3FF) 19)
                   pid)))
 
+;; DEFINED BEFORE ITS CALLERS ON PURPOSE.  dwc2-setup-channel calls this, and
+;; a FORWARD call can compile to a NIL sentinel (build logs "WARN li-func:
+;; unresolved function ... emitting NIL sentinel"; see CLAUDE.md limitation 1
+;; and task #215).  A silently-no-op halt is exactly the bug this function
+;; exists to fix, so keep this definition ABOVE dwc2-setup-channel.
+(defun dwc2-halt-channel (ch)
+  ;; Halt an active channel. Sets CHDIS+CHENA, waits for CHHLTD.
+  (let ((hcchar (dwc2-read (dwc2-hcchar ch))))
+    (dwc2-write (dwc2-hcchar ch)
+                (logior hcchar (logior (hcchar-chena) (hcchar-chdis)))))
+  (let ((j 0))
+    (loop
+      (when (>= j 10000) (return nil))
+      (when (not (zerop (logand (dwc2-read (dwc2-hcint ch)) (hcint-chhltd))))
+        (return nil))
+      (setq j (+ j 1))))
+  (dwc2-write (dwc2-hcint ch) #xFFFFFFFF))
+
 (defun dwc2-setup-channel (ch hcchar-val)
   ;; Write HCCHAR for channel (without enabling yet)
+  ;;
   ;; Clear any pending interrupts first
   (dwc2-write (dwc2-hcint ch) #xFFFFFFFF)
   ;; Enable all interrupt masks for this channel
@@ -404,25 +464,18 @@
   ;; Configure transfer size and DMA, then enable channel
   (dwc2-write (dwc2-hctsiz ch) hctsiz-val)
   (dwc2-write (dwc2-hcdma ch) dma-addr)
+  ;; #275: latch what we ACTUALLY programmed, read back from the registers
+  ;; rather than from our own arguments — that distinguishes "computed the
+  ;; wrong value" from "the write did not land".
+  (setf (mem-ref (+ (usb-state-addr) #x30) :u32) (dwc2-read (dwc2-hctsiz ch)))
+  (setf (mem-ref (+ (usb-state-addr) #x34) :u32) (dwc2-read (dwc2-hcdma ch)))
+  (setf (mem-ref (+ (usb-state-addr) #x38) :u32) (dwc2-read (dwc2-hcchar ch)))
   ;; Enable channel: OR in CHENA bit
   (let ((hcchar (dwc2-read (dwc2-hcchar ch))))
     (let ((enabled (logior hcchar (hcchar-chena))))
       ;; Clear CHDIS if set
       (let ((final (logand enabled (logxor (hcchar-chdis) #xFFFFFFFF))))
         (dwc2-write (dwc2-hcchar ch) final)))))
-
-(defun dwc2-halt-channel (ch)
-  ;; Halt an active channel. Sets CHDIS+CHENA, waits for CHHLTD.
-  (let ((hcchar (dwc2-read (dwc2-hcchar ch))))
-    (dwc2-write (dwc2-hcchar ch)
-                (logior hcchar (logior (hcchar-chena) (hcchar-chdis)))))
-  (let ((j 0))
-    (loop
-      (when (>= j 10000) (return nil))
-      (when (not (zerop (logand (dwc2-read (dwc2-hcint ch)) (hcint-chhltd))))
-        (return nil))
-      (setq j (+ j 1))))
-  (dwc2-write (dwc2-hcint ch) #xFFFFFFFF))
 
 (defun dwc2-poll-channel (ch)
   ;; Poll channel for transfer completion.
@@ -444,6 +497,15 @@
           (dwc2-halt-channel ch)
           (return nil))
         (let ((hcint (dwc2-read (dwc2-hcint ch))))
+          ;; #275: latch the RAW HCINT and the post-transfer HCTSIZ on every
+          ;; iteration, so the last surviving values are the ones at the
+          ;; moment of decision — before the 0xFFFFFFFF clear below destroys
+          ;; them.  Also count polls: an instant completion (polls ~= 0) and a
+          ;; laboured one look identical in the return value.
+          (setf (mem-ref (+ (usb-state-addr) #x3C) :u32) hcint)
+          (setf (mem-ref (+ (usb-state-addr) #x40) :u32)
+                (dwc2-read (dwc2-hctsiz ch)))
+          (setf (mem-ref (+ (usb-state-addr) #x44) :u32) i)
           ;; Check if channel halted (DWC2 halts on completion/error)
           (when (not (zerop (logand hcint (hcint-chhltd))))
             (if (not (zerop (logand hcint (hcint-xfercompl))))
@@ -457,7 +519,27 @@
                             (setq result -2)))))
             (dwc2-write (dwc2-hcint ch) #xFFFFFFFF)
             (return nil))
-          ;; Non-halted XFERCOMPL (DMA mode may set this without halt)
+          ;; Non-halted XFERCOMPL.  The controller can raise XFERCOMPL in DMA
+          ;; mode without also raising CHHLTD — but the channel is NOT retired
+          ;; until it has been explicitly halted and CHHLTD observed.  Real
+          ;; silicon requires that handshake; QEMU does not, which is why
+          ;; returning straight from here worked under emulation for years.
+          ;;
+          ;; Without the halt, only the FIRST control-IN after dwc2-init moves
+          ;; data.  Every later transfer reports XFERCOMPL|ACK with XferSize
+          ;; 8 -> 0 and HCDMA advanced by 8 — every register claiming success —
+          ;; while the buffer is untouched.  The broken state is core-scoped
+          ;; and SURVIVES A PORT RESET, which is what finally located it here
+          ;; rather than in the port or the device.
+          ;;
+          ;; PROVEN on a Pi Zero 2 W from the serial REPL, no rebuild: calling
+          ;; (dwc2-halt-channel 0) by hand between two identical
+          ;; GET_DESCRIPTORs turned the second one's byte7 from 0 back into 64.
+          ;; U-Boot's dwc2.c does the same thing via wait_for_chhltd() on every
+          ;; transfer.
+          ;;
+          ;; NB: testing CHENA before halting is NOT sufficient — it reads
+          ;; CLEAR here.  "Looks disabled" is not "retired".
           (when (not (zerop (logand hcint (hcint-xfercompl))))
             (setq result 1)
             (dwc2-write (dwc2-hcint ch) #xFFFFFFFF)
@@ -488,16 +570,46 @@
   ;; Returns: 1=success, <=0 = error
   (let ((hcchar (dwc2-build-hcchar 64 0 1 0 devaddr)))
     (dwc2-setup-channel ch hcchar)
-    (let ((pktcnt (+ (/ len 64) 1)))
+    ;; #275: PktCnt MUST be computed with INTEGER division.  `/` in Common Lisp
+    ;; is exact rational division: (/ 8 64) is the RATIO 1/8, a heap object.
+    ;; dwc2-build-hctsiz then does (logand pktcnt #x3FF) on it, masking the low
+    ;; bits of its POINTER — so PktCnt was garbage that CHANGED on every call as
+    ;; the heap moved.  Proven on a Pi Zero 2 W: (integerp (/ 8 64)) => NIL, and
+    ;; (logand (+ (/ 8 64) 1) 1023) returned 884 then 1012 on two identical
+    ;; calls; the HCTSIZ actually programmed for two identical GET_DESCRIPTORs
+    ;; was 0x4EE00008 then 0x52600008 (PktCnt 476, then 588 — should be 1).
+    ;; QEMU's DWC2 model ignores PktCnt, so this was invisible under emulation.
+    (let ((pktcnt (if (zerop len) 1 (ceiling len 64))))
       (let ((hctsiz (dwc2-build-hctsiz len pktcnt (hctsiz-pid-data1))))
         (dwc2-start-transfer ch hctsiz buf)
-        (dwc2-poll-channel ch)))))
+        (let ((r (dwc2-poll-channel ch)))
+      (setf (mem-ref (+ (usb-state-addr) #x48) :u32)
+            (mem-ref (+ (usb-state-addr) #x30) :u32))
+      (setf (mem-ref (+ (usb-state-addr) #x4C) :u32)
+            (mem-ref (+ (usb-state-addr) #x3C) :u32))
+      (setf (mem-ref (+ (usb-state-addr) #x50) :u32)
+            (mem-ref (+ (usb-state-addr) #x40) :u32))
+      (setf (mem-ref (+ (usb-state-addr) #x54) :u32) (+ r 100))
+      (setf (mem-ref (+ (usb-state-addr) #x58) :u32)
+            (mem-ref (+ (usb-state-addr) #x34) :u32))
+      (setf (mem-ref (+ (usb-state-addr) #x5C) :u32)
+            (dwc2-read (dwc2-hcdma ch)))
+      r)))))
 
 (defun dwc2-control-data-out (ch devaddr buf len)
   ;; DATA stage of control OUT transfer
   (let ((hcchar (dwc2-build-hcchar 64 0 0 0 devaddr)))
     (dwc2-setup-channel ch hcchar)
-    (let ((pktcnt (+ (/ len 64) 1)))
+    ;; #275: PktCnt MUST be computed with INTEGER division.  `/` in Common Lisp
+    ;; is exact rational division: (/ 8 64) is the RATIO 1/8, a heap object.
+    ;; dwc2-build-hctsiz then does (logand pktcnt #x3FF) on it, masking the low
+    ;; bits of its POINTER — so PktCnt was garbage that CHANGED on every call as
+    ;; the heap moved.  Proven on a Pi Zero 2 W: (integerp (/ 8 64)) => NIL, and
+    ;; (logand (+ (/ 8 64) 1) 1023) returned 884 then 1012 on two identical
+    ;; calls; the HCTSIZ actually programmed for two identical GET_DESCRIPTORs
+    ;; was 0x4EE00008 then 0x52600008 (PktCnt 476, then 588 — should be 1).
+    ;; QEMU's DWC2 model ignores PktCnt, so this was invisible under emulation.
+    (let ((pktcnt (if (zerop len) 1 (ceiling len 64))))
       (let ((hctsiz (dwc2-build-hctsiz len pktcnt (hctsiz-pid-data1))))
         (dwc2-start-transfer ch hctsiz buf)
         (dwc2-poll-channel ch)))))
@@ -531,7 +643,16 @@
     (dwc2-setup-channel ch hcchar)
     ;; QEMU's DWC2 manages data toggle internally via USB endpoint state.
     ;; Always use DATA0 PID — the actual toggle is tracked by QEMU.
-    (let ((pktcnt (if (zerop len) 1 (/ (+ len (- mps 1)) mps))))
+    ;; #275: PktCnt MUST be computed with INTEGER division.  `/` in Common Lisp
+    ;; is exact rational division: (/ 8 64) is the RATIO 1/8, a heap object.
+    ;; dwc2-build-hctsiz then does (logand pktcnt #x3FF) on it, masking the low
+    ;; bits of its POINTER — so PktCnt was garbage that CHANGED on every call as
+    ;; the heap moved.  Proven on a Pi Zero 2 W: (integerp (/ 8 64)) => NIL, and
+    ;; (logand (+ (/ 8 64) 1) 1023) returned 884 then 1012 on two identical
+    ;; calls; the HCTSIZ actually programmed for two identical GET_DESCRIPTORs
+    ;; was 0x4EE00008 then 0x52600008 (PktCnt 476, then 588 — should be 1).
+    ;; QEMU's DWC2 model ignores PktCnt, so this was invisible under emulation.
+    (let ((pktcnt (if (zerop len) 1 (ceiling len mps))))
       (let ((hctsiz (dwc2-build-hctsiz len pktcnt (hctsiz-pid-data0))))
         (dwc2-start-transfer ch hctsiz buf)
         (dwc2-poll-channel ch)))))
@@ -571,7 +692,16 @@
 (defun dwc2-start-bulk-in (ch devaddr epnum buf len mps)
   (let ((hcchar (dwc2-build-hcchar mps epnum 1 2 devaddr)))
     (dwc2-setup-channel ch hcchar)
-    (let ((pktcnt (if (zerop len) 1 (/ (+ len (- mps 1)) mps))))
+    ;; #275: PktCnt MUST be computed with INTEGER division.  `/` in Common Lisp
+    ;; is exact rational division: (/ 8 64) is the RATIO 1/8, a heap object.
+    ;; dwc2-build-hctsiz then does (logand pktcnt #x3FF) on it, masking the low
+    ;; bits of its POINTER — so PktCnt was garbage that CHANGED on every call as
+    ;; the heap moved.  Proven on a Pi Zero 2 W: (integerp (/ 8 64)) => NIL, and
+    ;; (logand (+ (/ 8 64) 1) 1023) returned 884 then 1012 on two identical
+    ;; calls; the HCTSIZ actually programmed for two identical GET_DESCRIPTORs
+    ;; was 0x4EE00008 then 0x52600008 (PktCnt 476, then 588 — should be 1).
+    ;; QEMU's DWC2 model ignores PktCnt, so this was invisible under emulation.
+    (let ((pktcnt (if (zerop len) 1 (ceiling len mps))))
       (let ((hctsiz (dwc2-build-hctsiz len pktcnt (hctsiz-pid-data0))))
         (dwc2-start-transfer ch hctsiz buf)))))
 
@@ -581,6 +711,15 @@
 (defun dwc2-start-interrupt-in (ch devaddr epnum buf len mps)
   (let ((hcchar (dwc2-build-hcchar mps epnum 1 3 devaddr)))
     (dwc2-setup-channel ch hcchar)
-    (let ((pktcnt (if (zerop len) 1 (/ (+ len (- mps 1)) mps))))
+    ;; #275: PktCnt MUST be computed with INTEGER division.  `/` in Common Lisp
+    ;; is exact rational division: (/ 8 64) is the RATIO 1/8, a heap object.
+    ;; dwc2-build-hctsiz then does (logand pktcnt #x3FF) on it, masking the low
+    ;; bits of its POINTER — so PktCnt was garbage that CHANGED on every call as
+    ;; the heap moved.  Proven on a Pi Zero 2 W: (integerp (/ 8 64)) => NIL, and
+    ;; (logand (+ (/ 8 64) 1) 1023) returned 884 then 1012 on two identical
+    ;; calls; the HCTSIZ actually programmed for two identical GET_DESCRIPTORs
+    ;; was 0x4EE00008 then 0x52600008 (PktCnt 476, then 588 — should be 1).
+    ;; QEMU's DWC2 model ignores PktCnt, so this was invisible under emulation.
+    (let ((pktcnt (if (zerop len) 1 (ceiling len mps))))
       (let ((hctsiz (dwc2-build-hctsiz len pktcnt (hctsiz-pid-data0))))
         (dwc2-start-transfer ch hctsiz buf)))))

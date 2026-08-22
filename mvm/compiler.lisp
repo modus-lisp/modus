@@ -110,7 +110,7 @@
 ;;; MV-VALUES at 0x600020: array of up to 20 extra values (0x600020..0x6000C0)
 (defconstant +mv-count-addr+ #x10000090)
 
-;;; ---- THE GC METADATA BLOCK, IN ONE PLACE ----------------------------------
+;;; ---- THE GC METADATA BLOCK IS A REGION CONTROL BLOCK ----------------------
 ;;;
 ;;; These eight words were written as bare literals in TEN files: gc.lisp, three
 ;;; translators, four boot descriptors, two build scripts and a test.  Ten copies
@@ -120,21 +120,61 @@
 ;;; with ZERO readers and every "I returned one value" reset was discarded.
 ;;;
 ;;; They are named here, beside that one, for the same reason: so there is an
-;;; owner rather than a convention.  The VALUES are unchanged — this renames, it
-;;; does not move anything.
+;;; owner rather than a convention.
 ;;;
-;;; They also have to stop being constants before actors can be backed by native
-;;; threads.  A per-actor region needs its OWN from/to/size and its OWN saved
-;;; registers; one fixed triple is one collecting thread by construction.  When
-;;; that happens these become offsets from a region base, and the edit is here.
-(defconstant +gc-from-start-addr+ #x10000040)  ; from-space start (byte address)
-(defconstant +gc-to-start-addr+   #x10000048)  ; to-space start
-(defconstant +gc-space-size-addr+ #x10000050)  ; size of each semispace
-(defconstant +gc-stack-base-addr+ #x10000058)  ; top of stack, set at boot
-(defconstant +gc-count-addr+      #x10000060)  ; collections performed
-(defconstant +gc-saved-sp-addr+   #x10000068)  ; SP at GC entry (trampoline)
-(defconstant +gc-saved-alloc-addr+ #x10000070) ; alloc ptr at GC entry (r12/x24)
-(defconstant +gc-saved-limit-addr+ #x10000078) ; alloc limit at GC entry (r14/x25)
+;;; STAGE 1 OF PER-REGION GC.  They are no longer eight ADDRESSES; they are
+;;; eight OFFSETS into a 64-byte REGION CONTROL BLOCK, and a heap is one region.
+;;; A region owns its from/to semispaces, its semispace size, the stack window
+;;; its roots live in, its own collection count, and its own saved SP/alloc/limit
+;;; triple.  One fixed triple was one collecting thread by construction; N region
+;;; blocks are N independently collectable heaps.
+;;;
+;;; That is sound here for the reason net/actors.lisp already establishes: an
+;;; actor gets a PRIVATE allocation pointer and limit (x24/R12, x25/R14, saved
+;;; and restored across the context switch, plus obj-alloc/obj-limit in its
+;;; 128-byte struct), and messages are TERM-SERIALIZED — copied, never shared.
+;;; No actor can hold a pointer into another actor's region, so evacuating one
+;;; region can never strand a reference held by another.
+;;;
+;;; WHICH region is active is a single word, +GC-REGION-ADDR+, holding the raw
+;;; byte address of the active control block.  ZERO MEANS REGION 0, whose block
+;;; is the historic one at +GC-REGION-0-BASE+ = #x10000040.  That default is what
+;;; keeps this change free of boot-descriptor edits: nothing writes the word, so
+;;; on Linux the ELF BSS zero-fill answers "region 0", and on bare metal the
+;;; unwritten-metadata-reads-as-zero assumption this tree already depends on
+;;; (%gc-bitmap-base degrades to the pre-#160 path on exactly that basis) answers
+;;; the same.  An image that never creates a second region is behaviourally
+;;; identical to one built before regions existed.
+;;;
+;;; The eight legacy names below are RETAINED, and their VALUES ARE UNCHANGED:
+;;; they now spell "region 0's block, field F".  Every boot descriptor
+;;; initialises region 0 and so still uses them verbatim.
+(defconstant +gc-region-stride+   #x40)  ; one control block = 8 words
+(defconstant +gc-off-from-start+  #x00)  ; from-space start (byte address)
+(defconstant +gc-off-to-start+    #x08)  ; to-space start
+(defconstant +gc-off-space-size+  #x10)  ; size of each semispace
+(defconstant +gc-off-stack-base+  #x18)  ; top of this region's root stack
+(defconstant +gc-off-count+       #x20)  ; collections performed IN THIS REGION
+(defconstant +gc-off-saved-sp+    #x28)  ; SP at GC entry (trampoline)
+(defconstant +gc-off-saved-alloc+ #x30)  ; alloc ptr at GC entry (r12/x24)
+(defconstant +gc-off-saved-limit+ #x38)  ; alloc limit at GC entry (r14/x25)
+
+(defconstant +gc-region-0-base+ #x10000040)
+;;; The active-region word.  #x10000F08 is in the BSS gap boot-rpi-cl.lisp
+;;; documents ("a scan of every #x1000xxxx literal finds NOTHING between
+;;; 0x10000EA8 and 0x10001000"), immediately above that file's own DTB slot at
+;;; 0x10000F00 and clear of translate-x64's pinning scratch, which stops at
+;;; 0x10000EA8 and reserves through 0x10000EC0.
+(defconstant +gc-region-addr+ #x10000F08)
+
+(defconstant +gc-from-start-addr+  (+ +gc-region-0-base+ +gc-off-from-start+))
+(defconstant +gc-to-start-addr+    (+ +gc-region-0-base+ +gc-off-to-start+))
+(defconstant +gc-space-size-addr+  (+ +gc-region-0-base+ +gc-off-space-size+))
+(defconstant +gc-stack-base-addr+  (+ +gc-region-0-base+ +gc-off-stack-base+))
+(defconstant +gc-count-addr+       (+ +gc-region-0-base+ +gc-off-count+))
+(defconstant +gc-saved-sp-addr+    (+ +gc-region-0-base+ +gc-off-saved-sp+))
+(defconstant +gc-saved-alloc-addr+ (+ +gc-region-0-base+ +gc-off-saved-alloc+))
+(defconstant +gc-saved-limit-addr+ (+ +gc-region-0-base+ +gc-off-saved-limit+))
 
 (defconstant +mv-values-addr+ #x10000098)
 

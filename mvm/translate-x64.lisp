@@ -4838,12 +4838,35 @@
       (emit-jcc buf :nc reject-label)               ; cons tag but bit clear (object) → reject
       (emit-jcc buf :c reject-label)))              ; object tag but bit set (cons) → reject
 
+(defun emit-load-gc-region (buf reg)
+  "REG := the base address of the ACTIVE region's GC control block.
+
+   The metadata this collector runs on is PER-REGION (mvm/compiler.lisp's
+   +GC-OFF-*+ block): from/to semispaces, semispace size, root-stack base and
+   collection count are eight OFFSETS into a 64-byte block, and which block is
+   live is the single word at +GC-REGION-ADDR+.
+
+   ZERO MEANS REGION 0.  Nothing writes that word until something creates a
+   second region, so on Linux the ELF BSS zero-fill and on bare metal the
+   unwritten-metadata-reads-as-zero assumption this tree already relies on both
+   answer `region 0' — whose block is the historic one at +GC-REGION-0-BASE+.
+   That is why stage 1 needed no boot-descriptor edit on any of the four
+   targets, three of which cannot be booted where this was written."
+  (emit-mov-reg-abs buf reg modus.mvm::+gc-region-addr+)
+  (let ((have-region (make-label)))
+    (emit-cmp-reg-imm buf reg 0)
+    (emit-jcc buf :ne have-region)
+    (emit-mov-reg-imm buf reg modus.mvm::+gc-region-0-base+)
+    (emit-label buf have-region)))
+
 (defun emit-gc-trampoline (buf gc-trampoline-label gc-collect-label)
   "Emit a complete Cheney copying GC in native x64 assembly.
 
-   GC metadata layout (raw byte addresses at heap base 0x10000000):
-     +0x40: from_start   +0x48: to_start   +0x50: space_size
-     +0x58: stack_base   +0x60: gc_count
+   GC metadata layout — offsets into the ACTIVE region's 64-byte control block,
+   found via emit-load-gc-region (region 0's block is at 0x10000040, so the
+   effective addresses are unchanged for a single-region image):
+     +0x00: from_start   +0x08: to_start   +0x10: space_size
+     +0x18: stack_base   +0x20: gc_count
    All metadata values are stored as raw byte addresses (NOT tagged).
 
    Register convention during GC:
@@ -4891,17 +4914,23 @@
     ;; Save RSP for stack root scanning (after all pushes)
     (emit-bytes buf #x48 #x89 #xE5)              ; mov rbp, rsp  (save scan start)
 
-    ;; ---- Load GC metadata ----
+    ;; ---- Load GC metadata FROM THE ACTIVE REGION'S CONTROL BLOCK ----
+    ;; RAX = region base (see emit-load-gc-region: 0 in the pointer word means
+    ;; region 0, so an image that never created a second region loads exactly
+    ;; the addresses this code used to hard-code).  RAX stays the base until the
+    ;; stack scan starts using it as an argument register.
+    (emit-load-gc-region buf 'rax)
     ;; RBX = from_start (raw byte addr)
-    (emit-bytes buf #x48 #x8B #x1C #x25)         ; mov rbx, [abs32]
-    (emit-u32 buf modus.mvm::+gc-from-start-addr+)
+    (emit-mov-reg-mem buf 'rbx 'rax modus.mvm::+gc-off-from-start+)
     ;; R13 = to_start -> becomes free pointer
-    (emit-bytes buf #x4C #x8B #x2C #x25)         ; mov r13, [abs32]
-    (emit-u32 buf modus.mvm::+gc-to-start-addr+)
+    (emit-mov-reg-mem buf 'r13 'rax modus.mvm::+gc-off-to-start+)
     ;; RCX = from_start + space_size = from_end
-    (emit-bytes buf #x48 #x8B #x0C #x25)         ; mov rcx, [abs32]
-    (emit-u32 buf modus.mvm::+gc-space-size-addr+)
+    (emit-mov-reg-mem buf 'rcx 'rax modus.mvm::+gc-off-space-size+)
     (emit-add-reg-reg buf 'rcx 'rbx)             ; rcx = from_start + space_size
+    ;; RDX = stack_base.  Hoisted out of the stack-scan block below so it can
+    ;; share this one load of the region base; scan_word pushes/pops RDX, so it
+    ;; survives the whole scan exactly as before.
+    (emit-mov-reg-mem buf 'rdx 'rax modus.mvm::+gc-off-stack-base+)
 
     (emit-gc-dbg-char buf #x70)          ; 'p' — pushed regs + metadata loaded, about to scan stack
     ;; ---- Scan stack roots ----
@@ -4910,10 +4939,6 @@
     (emit-bytes buf #x48 #x89 #xEF)              ; mov rdi, rbp  (start of stack)
     (let ((stack-loop (make-label))
           (stack-done (make-label)))
-      ;; RDX = stack_base
-      (emit-bytes buf #x48 #x8B #x14 #x25)       ; mov rdx, [abs32]
-      (emit-u32 buf modus.mvm::+gc-stack-base-addr+)
-
       (emit-label buf stack-loop)
       (emit-cmp-reg-reg buf 'rdi 'rdx)           ; rdi >= stack_base?
       (emit-jcc buf :ae stack-done)
@@ -4993,9 +5018,10 @@
     (emit-gc-dbg-char buf #x72)          ; 'r' — roots scan done (globals+kw+pkg+mv)
 
     ;; ---- Cheney scan loop ----
-    ;; R10 = scan pointer (starts at to_start)
-    (emit-bytes buf #x4C #x8B #x14 #x25)         ; mov r10, [abs32]
-    (emit-u32 buf modus.mvm::+gc-to-start-addr+)                     ; r10 = to_start
+    ;; R10 = scan pointer (starts at to_start).  RAX is dead here (the MV loop
+    ;; above finished with it), so it carries the region base again.
+    (emit-load-gc-region buf 'rax)
+    (emit-mov-reg-mem buf 'r10 'rax modus.mvm::+gc-off-to-start+)   ; r10 = to_start
 
     (let ((cheney-loop (make-label))
           (cheney-done (make-label)))
@@ -5011,25 +5037,26 @@
       (emit-label buf cheney-done))
     (emit-gc-dbg-char buf #x63)          ; 'c' — cheney scan done
 
-    ;; ---- Swap semispaces ----
+    ;; ---- Swap THIS REGION's semispaces ----
+    ;; RSI carries the region base from here to the end of the collection: RSI is
+    ;; dead once the Cheney scan is done (it is scan_word's temp), REP STOSB in
+    ;; the bitmap clears below uses RDI/RCX/AL and leaves it alone, and it is
+    ;; restored from the stack by the epilogue like every other register.
+    (emit-load-gc-region buf 'rsi)
     ;; new from_start = old to_start
-    (emit-bytes buf #x48 #x8B #x04 #x25)         ; mov rax, [0x10000048]
-    (emit-u32 buf modus.mvm::+gc-to-start-addr+)
-    (emit-bytes buf #x48 #x89 #x04 #x25)         ; mov [0x10000040], rax
-    (emit-u32 buf modus.mvm::+gc-from-start-addr+)
+    (emit-mov-reg-mem buf 'rax 'rsi modus.mvm::+gc-off-to-start+)
+    (emit-mov-mem-reg buf 'rsi 'rax modus.mvm::+gc-off-from-start+)
     ;; new to_start = old from_start (in RBX)
-    (emit-bytes buf #x48 #x89 #x1C #x25)         ; mov [0x10000048], rbx
-    (emit-u32 buf modus.mvm::+gc-to-start-addr+)
+    (emit-mov-mem-reg buf 'rsi 'rbx modus.mvm::+gc-off-to-start+)
 
     ;; ---- Update R12 and R14 ----
     ;; R12 = free_ptr (R13)
     (emit-bytes buf #x4D #x89 #xEC)              ; mov r12, r13
-    ;; R14 = new from_start + space_size
-    ;; new from_start was old to_start, now at [0x10000040]
-    (emit-bytes buf #x48 #x8B #x04 #x25)         ; mov rax, [0x10000040]
-    (emit-u32 buf modus.mvm::+gc-from-start-addr+)
-    (emit-bytes buf #x48 #x03 #x04 #x25)         ; add rax, [0x10000050]
-    (emit-u32 buf modus.mvm::+gc-space-size-addr+)
+    ;; R14 = new from_start + space_size (new from_start was old to_start, just
+    ;; written back into this region's block)
+    (emit-mov-reg-mem buf 'rax 'rsi modus.mvm::+gc-off-from-start+)
+    (emit-mov-reg-mem buf 'r11 'rsi modus.mvm::+gc-off-space-size+)
+    (emit-add-reg-reg buf 'rax 'r11)
     (emit-bytes buf #x49 #x89 #xC6)              ; mov r14, rax
 
     ;; ---- MCGC point (c): clear the reclaimed from-space's object-start bitmap ----
@@ -5060,8 +5087,8 @@
       (emit-bytes buf #x48 #x8B #x3C #x25)           ; mov rdi, [bitmap_base]
       (emit-u32 buf +mcgc-cfg-bitmap-addr+)
       (emit-bytes buf #x48 #x01 #xC7)                ; add rdi, rax  (rdi = dest)
-      (emit-bytes buf #x48 #x8B #x0C #x25)           ; mov rcx, [space_size]
-      (emit-u32 buf modus.mvm::+gc-space-size-addr+)
+      ;; RSI = this region's control block (loaded at the swap above)
+      (emit-mov-reg-mem buf 'rcx 'rsi modus.mvm::+gc-off-space-size+)
       (emit-shr-reg-imm buf 'rcx 7)                  ; rcx = byte count = space_size/128
       (emit-bytes buf #x31 #xC0)                     ; xor eax, eax  (AL = fill 0)
       (emit-bytes buf #xF3 #xAA))                    ; rep stosb
@@ -5082,15 +5109,18 @@
       (emit-bytes buf #x48 #x81 #xC7)                ; add rdi, imm32 (kind delta)
       (emit-u32 buf +mcgc-kindbitmap-delta+)
       (emit-bytes buf #x48 #x01 #xC7)                ; add rdi, rax  (rdi = dest)
-      (emit-bytes buf #x48 #x8B #x0C #x25)           ; mov rcx, [space_size]
-      (emit-u32 buf modus.mvm::+gc-space-size-addr+)
+      ;; RSI = this region's control block (loaded at the swap above)
+      (emit-mov-reg-mem buf 'rcx 'rsi modus.mvm::+gc-off-space-size+)
       (emit-shr-reg-imm buf 'rcx 7)                  ; byte count = space_size/128
       (emit-bytes buf #x31 #xC0)                     ; xor eax, eax
       (emit-bytes buf #xF3 #xAA))                    ; rep stosb
 
-    ;; ---- Increment GC count ----
-    (emit-bytes buf #x48 #xFF #x04 #x25)          ; inc qword [0x10000060]
-    (emit-u32 buf modus.mvm::+gc-count-addr+)
+    ;; ---- Increment THIS REGION's collection count ----
+    ;; inc qword [rsi + gc_count].  Per-region, so "how many times has region N
+    ;; been collected" is answerable — which is what makes a per-region
+    ;; collection observable from outside the collector.
+    (emit-bytes buf #x48 #xFF #x46)               ; inc qword [rsi+disp8]
+    (emit-byte buf modus.mvm::+gc-off-count+)
 
     ;; ---- Restore registers ----
     (emit-jmp buf restore-label)
@@ -5646,6 +5676,14 @@
 
 (defun emit-page-gc-trampoline (buf page-gc-label)
   "MCGC stage-4c/4d WHOLE-REGION page-based MOSTLY-COPYING collector WITH PINNING.
+
+   NOT REGION-AWARE, and off by default (*MCGC-PINNING-ENABLED* is NIL).  Its
+   two references to the metadata block — +GC-STACK-BASE-ADDR+ and
+   +GC-COUNT-ADDR+ — resolve to REGION 0's fields, which is right for the only
+   images that enable it.  The model is also a poorer fit than Cheney's: this
+   collector owns a page pool over the WHOLE data region, so \"which region\" is
+   a question its free-list would have to answer too, not just its metadata
+   loads.  A pinning build must not create a second region.
 
    Bartlett page pool over the WHOLE data region (no two-run split for the
    collector — that was 4b).  Descriptor byte per 4 KiB page:

@@ -499,6 +499,15 @@
    old semispace intact), so being able to force dozens of cycles out of a
    small workload is what makes the survival tests cheap.  NIL = normal.")
 
+;;; REGION 0 ONLY.  The GC metadata block is per-region as of stage 1 (see
+;;; mvm/compiler.lisp's +GC-OFF-*+ / +GC-REGION-ADDR+ block): the eight names
+;;; below spell "region 0's block, field F", which is what a single-region image
+;;; uses and therefore leaves this translator byte-for-byte as it was.  This
+;;; collector does NOT read the active-region pointer, so an i386 image that
+;;; created a second region would collect the wrong heap.  Porting it means the
+;;; same edit translate-x64's emit-gc-trampoline took: load the region base
+;;; once, address the five fields off it.  Nothing creates a second region on
+;;; i386 today, and there is no way to boot one where this was written.
 (defconstant +i386-gc-from-start+ modus.mvm::+gc-from-start-addr+)
 (defconstant +i386-gc-to-start+   modus.mvm::+gc-to-start-addr+)
 (defconstant +i386-gc-space-size+ modus.mvm::+gc-space-size-addr+)

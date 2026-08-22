@@ -8,15 +8,22 @@
 ;;;; The collector must NOT allocate any heap memory — it uses only
 ;;;; mem-ref / mem-set for raw memory access and fixed-address metadata.
 ;;;;
-;;;; GC metadata layout (fixed addresses in globals area):
-;;;;   0x10000040: from_start  (byte address of current from-space start)
-;;;;   0x10000048: to_start    (byte address of current to-space start)
-;;;;   0x10000050: space_size  (size of each semispace in bytes)
-;;;;   0x10000058: stack_base  (top of stack, set at boot)
-;;;;   0x10000060: gc_count    (number of collections performed)
-;;;;   0x10000068: saved_rsp   (RSP at GC entry, set by trampoline)
-;;;;   0x10000070: saved_r12   (alloc ptr at GC entry, set by trampoline)
-;;;;   0x10000078: saved_r14   (alloc limit at GC entry, set by trampoline)
+;;;; GC metadata layout — a REGION CONTROL BLOCK, 64 bytes, one per heap region
+;;;; (offsets from the ACTIVE region's base; see %gc-region below):
+;;;;   +0x00: from_start  (byte address of current from-space start)
+;;;;   +0x08: to_start    (byte address of current to-space start)
+;;;;   +0x10: space_size  (size of each semispace in bytes)
+;;;;   +0x18: stack_base  (top of the stack this region's roots live on)
+;;;;   +0x20: gc_count    (collections performed IN THIS REGION)
+;;;;   +0x28: saved_rsp   (RSP at GC entry, set by trampoline)
+;;;;   +0x30: saved_r12   (alloc ptr at GC entry, set by trampoline)
+;;;;   +0x38: saved_r14   (alloc limit at GC entry, set by trampoline)
+;;;;
+;;;; Region 0's block is at 0x10000040, so those eight fields still have the
+;;;; addresses every boot descriptor writes.  See mvm/compiler.lisp's
+;;;; +GC-REGION-0-BASE+ / +GC-REGION-ADDR+ / +GC-OFF-*+ block, which OWNS these
+;;;; numbers; mvm/build-checks.lisp fails the build if the literals here drift
+;;;; from it.
 ;;;;
 ;;;; Tag encoding (64-bit words):
 ;;;;   xxx0 = fixnum (shift by 1) — not a pointer, skip
@@ -28,28 +35,73 @@
 (in-package :modus.mvm)
 
 ;;; ============================================================
-;;; GC Fixed Address Constants
+;;; The ACTIVE REGION and its control block
 ;;; ============================================================
-;;; These are raw byte addresses. To use with mem-ref, shift left by 1
-;;; (tag as fixnum). mem-ref :u64 does SHR 1 to get the real address.
+;;;
+;;; A "region" is one Cheney heap: two semispaces plus the bookkeeping needed to
+;;; flip them.  Which region the collector and the mutator are working in is one
+;;; word at 0x10000F08, holding the RAW byte address of that region's 64-byte
+;;; control block.
+;;;
+;;; ZERO MEANS REGION 0 (block at 0x10000040).  No boot descriptor writes the
+;;; word: on Linux the ELF BSS is zero-filled, and on bare metal this tree
+;;; already depends on unwritten metadata slots reading as zero (that is exactly
+;;; how %gc-bitmap-base below degrades to the pre-#160 behaviour).  So an image
+;;; that never creates a second region behaves precisely as it did before
+;;; regions existed, on every target, with no boot-time initialisation to get
+;;; wrong on a target that cannot be booted here.
+;;;
+;;; THE POINTER IS AN EXACT MACHINE WORD, not a metadata word.  The eight FIELDS
+;;; are read with (mem-ref … :u64), whose per-target halving convention the
+;;; block comment below documents at length — aarch64/i386 store them SHL'd so
+;;; that load reads back the raw value; x64 stores them raw and reads them in
+;;; native asm.  The region POINTER has only one native reader (translate-x64's
+;;; trampoline, a plain `mov reg,[abs32]`), so it is stored raw and read here as
+;;; two exact :u32 halves.  Everything that touches it uses these two functions.
 
-;; Source code literals are byte addresses directly.
-;; (mem-ref #xADDR :u64) reads from byte address ADDR.
-;; The compiler tags the literal (SHL 1), mem-ref untags (SHR 1).
-(defun %gc-from-start ()   (mem-ref #x10000040 :u64))
-(defun %gc-to-start ()     (mem-ref #x10000048 :u64))
-(defun %gc-space-size ()   (mem-ref #x10000050 :u64))
-(defun %gc-stack-base ()   (mem-ref #x10000058 :u64))
-(defun %gc-count ()        (mem-ref #x10000060 :u64))
-(defun %gc-saved-rsp ()    (mem-ref #x10000068 :u64))
-(defun %gc-saved-r12 ()    (mem-ref #x10000070 :u64))
-(defun %gc-saved-r14 ()    (mem-ref #x10000078 :u64))
+(defun %gc-region ()
+  "Raw byte address of the ACTIVE region's control block; 0 means region 0."
+  (let ((lo (mem-ref #x10000F08 :u32))
+        (hi (mem-ref (+ #x10000F08 4) :u32)))
+    (if (= hi 0)
+        (if (= lo 0) #x10000040 lo)
+        (+ (* (* hi 65536) 65536) lo))))
 
-(defun %gc-set-from-start (v)  (setf (mem-ref #x10000040 :u64) v))
-(defun %gc-set-to-start (v)    (setf (mem-ref #x10000048 :u64) v))
-(defun %gc-set-count (v)       (setf (mem-ref #x10000060 :u64) v))
-(defun %gc-set-r12 (v)         (setf (mem-ref #x10000070 :u64) v))
-(defun %gc-set-r14 (v)         (setf (mem-ref #x10000078 :u64) v))
+(defun %gc-set-region (base)
+  "Publish BASE as the active region's control block.  Stored as two exact
+   32-bit halves for the reason given above."
+  (let* ((hi (ash (ash base -16) -16))
+         (lo (- base (* (* hi 65536) 65536))))
+    (setf (mem-ref #x10000F08 :u32) lo)
+    (setf (mem-ref (+ #x10000F08 4) :u32) hi)))
+
+(defun %gc-region-0 () #x10000040)
+
+;;; ============================================================
+;;; GC Metadata Field Accessors
+;;; ============================================================
+;;; Field addresses are (active region base + field offset).  To use with
+;;; mem-ref the value is shifted left by 1 (tagged as fixnum); mem-ref :u64
+;;; does SHR 1 to get the real address.
+;;;
+;;; %gc-region returns a Lisp integer whose value IS the raw byte address, so
+;;; (mem-ref (+ (%gc-region) OFF) :u64) addresses exactly what the literal
+;;; (mem-ref #x100000xx :u64) used to address whenever region 0 is active.
+
+(defun %gc-from-start ()   (mem-ref (+ (%gc-region) #x00) :u64))
+(defun %gc-to-start ()     (mem-ref (+ (%gc-region) #x08) :u64))
+(defun %gc-space-size ()   (mem-ref (+ (%gc-region) #x10) :u64))
+(defun %gc-stack-base ()   (mem-ref (+ (%gc-region) #x18) :u64))
+(defun %gc-count ()        (mem-ref (+ (%gc-region) #x20) :u64))
+(defun %gc-saved-rsp ()    (mem-ref (+ (%gc-region) #x28) :u64))
+(defun %gc-saved-r12 ()    (mem-ref (+ (%gc-region) #x30) :u64))
+(defun %gc-saved-r14 ()    (mem-ref (+ (%gc-region) #x38) :u64))
+
+(defun %gc-set-from-start (v)  (setf (mem-ref (+ (%gc-region) #x00) :u64) v))
+(defun %gc-set-to-start (v)    (setf (mem-ref (+ (%gc-region) #x08) :u64) v))
+(defun %gc-set-count (v)       (setf (mem-ref (+ (%gc-region) #x20) :u64) v))
+(defun %gc-set-r12 (v)         (setf (mem-ref (+ (%gc-region) #x30) :u64) v))
+(defun %gc-set-r14 (v)         (setf (mem-ref (+ (%gc-region) #x38) :u64) v))
 
 ;;; ============================================================
 ;;; Tag Checking Helpers
@@ -811,6 +863,241 @@
   (let ((space-size (ash heap-size -1)))  ; half the total heap
     (%gc-set-from-start heap-start)
     (%gc-set-to-start (+ heap-start space-size))
-    (setf (mem-ref #x10000050 :u64) space-size)      ; space_size
-    (setf (mem-ref #x10000058 :u64) stack-base)       ; stack_base
+    (setf (mem-ref (+ (%gc-region) #x10) :u64) space-size)  ; space_size
+    (setf (mem-ref (+ (%gc-region) #x18) :u64) stack-base)  ; stack_base
     (%gc-set-count 0)))
+
+;;; ============================================================
+;;; REGIONS — creating them, moving between them, collecting one
+;;; ============================================================
+;;;
+;;; Everything above this line reads and writes THE ACTIVE region.  What follows
+;;; is the small amount of machinery needed to have more than one.
+;;;
+;;; THE STORAGE CONVENTION, AND WHY IT IS DERIVED RATHER THAN CONFIGURED.
+;;; A control-block FIELD is not simply a machine word: aarch64 and i386 store
+;;; the eight fields SHL'd by one, so that gc.lisp's (mem-ref … :u64) — which
+;;; halves, see the block comment above — reads the raw value back, while x64
+;;; stores them raw because its reader is native assembly.  A new region's block
+;;; must be written in whichever convention THIS target's collector reads, and
+;;; gc.lisp is one shared file compiled for all of them.  %gc-meta-scale does
+;;; not guess: the mutator's allocation pointer always lies inside the active
+;;; region's from-space, so the reading of from_start/space_size that brackets
+;;; it is the right one.  One measurement, no per-target knob to get wrong.
+
+(defun %gc-meta-scale ()
+  "1 if this target stores GC metadata fields raw, 2 if SHL'd.  See above."
+  (let ((r (%gc-region)))
+    (let ((f (%gc-read64 r))
+          (s (%gc-read64 (+ r #x10)))
+          (va (get-alloc-ptr)))
+      (if (< va f) 2 (if (>= va (+ f s)) 2 1)))))
+
+(defun %gc-meta-read (addr k)
+  "Field at raw byte address ADDR, in scale K (from %gc-meta-scale)."
+  (let ((w (%gc-read64 addr)))
+    (if (= k 1) w (ash w -1))))
+
+(defun %gc-meta-write (addr v k)
+  "Store V into the field at raw byte address ADDR, in scale K."
+  (%gc-write64 addr (if (= k 1) v (* v 2))))
+
+(defun %gc-word-of (v addr)
+  "V's MACHINE WORD, as an integer, via the scratch word at raw address ADDR.
+   The only way to look at a pointer as a number from Lisp: a :u64 store writes
+   the register verbatim, and the two-halves read is exact.  Used to record
+   where an object was before a collection and where it is after."
+  (setf (mem-ref addr :u64) v)
+  (%gc-read64 addr))
+
+(defun %gc-region-init (rcb from to size stack-base k)
+  "Write a complete region control block at raw byte address RCB: semispaces
+   [FROM,FROM+SIZE) and [TO,TO+SIZE), roots on the stack below STACK-BASE, no
+   collections yet, and a parked allocation pointer/limit spanning from-space.
+   RCB is 64 bytes of memory the CALLER owns — BSS, a carved guard band, or (in
+   stage 2/3) an actor's own struct.  Returns RCB."
+  (%gc-meta-write rcb from k)
+  (%gc-meta-write (+ rcb #x08) to k)
+  (%gc-meta-write (+ rcb #x10) size k)
+  (%gc-meta-write (+ rcb #x18) stack-base k)
+  (%gc-meta-write (+ rcb #x20) 0 k)
+  (%gc-meta-write (+ rcb #x28) 0 k)
+  (%gc-meta-write (+ rcb #x30) from k)
+  (%gc-meta-write (+ rcb #x38) (+ from size) k)
+  rcb)
+
+(defun %gc-region-enter (rcb)
+  "Make RCB the active region.  Parks the mutator's allocation pointer and limit
+   in the region being left and loads RCB's, which is exactly what
+   net/actors.lisp's context switch already does with x24/x25 per actor — the
+   difference is that the region those registers point into now carries its own
+   collector state.  Returns the region left, so (%gc-region-enter that) undoes
+   it."
+  (let ((prev (%gc-region))
+        (k (%gc-meta-scale)))
+    (%gc-meta-write (+ prev #x30) (get-alloc-ptr) k)
+    (%gc-meta-write (+ prev #x38) (get-alloc-limit) k)
+    (%gc-set-region rcb)
+    (set-alloc-ptr (%gc-meta-read (+ rcb #x30) k))
+    (set-alloc-limit (%gc-meta-read (+ rcb #x38) k))
+    prev))
+
+(defun %gc-region-shrink (rcb new-size k)
+  "Set RCB's semispace size to NEW-SIZE.  If RCB is the ACTIVE region the
+   mutator's allocation limit moves with it in the same breath: a limit outside
+   the region it is supposed to bound is a :gc-check that fires in the wrong
+   place, or not at all.  Returns NEW-SIZE."
+  (%gc-meta-write (+ rcb #x10) new-size k)
+  (if (= rcb (%gc-region))
+      (set-alloc-limit (+ (%gc-meta-read rcb k) new-size))
+      0)
+  new-size)
+
+(defun %gc-collect-here ()
+  "Force ONE collection OF THE ACTIVE REGION, through the target's ordinary
+   collector rather than a side door: pull the allocation limit down to the
+   allocation pointer, then allocate.  The :gc-check that allocation carries
+   trips, and the collector reads the active region's control block — so it
+   evacuates this region's from-space, flips this region's semispaces, and
+   bumps this region's count, touching no other region's memory.  Returns this
+   region's collection count afterwards."
+  (let ((junk nil))
+    (set-alloc-limit (get-alloc-ptr))
+    (setq junk (cons 0 0))
+    (setq junk (cdr junk))
+    (%gc-count)))
+
+;;; ============================================================
+;;; Per-region acceptance harness
+;;; ============================================================
+
+(defun %gc-sum-range (start end)
+  "Position-sensitive checksum of the machine words in [START,END).  Reads
+   EXACT 32-bit halves and folds them into a 24-bit accumulator, so it never
+   allocates and never needs a bignum.  64-BIT TARGETS ONLY: a raw :u32 half
+   reaches 2^32-1, which is a bignum in a 30-bit fixnum."
+  (let ((a start) (s 0))
+    (loop
+      (when (>= a end) (return s))
+      (setq s (logand (+ (* s 3) (mem-ref a :u32)) #xFFFFFF))
+      (setq s (logand (+ (* s 3) (mem-ref (+ a 4) :u32)) #xFFFFFF))
+      (setq a (+ a 8)))))
+
+(defun %gc-chain-build (n)
+  "A chain of N conses, car = index, newest first, allocated in the ACTIVE
+   region — plus one DEAD cons per link, so the region also holds garbage for a
+   collection to reclaim.  Returns the head."
+  (let ((head nil) (junk nil) (i 0))
+    (loop
+      (when (>= i n) (return head))
+      (setq junk (cons i i))
+      (setq head (cons i head))
+      (setq i (+ i 1)))))
+
+(defun %gc-chain-check (head n)
+  "0 if HEAD is not exactly N links carrying N-1, N-2, … 0; else 1 + their sum."
+  (let ((c head) (i (- n 1)) (sum 0))
+    (loop
+      (when (not (consp c)) (return (if (= i -1) (+ sum 1) 0)))
+      (when (not (= (car c) i)) (return 0))
+      (setq sum (+ sum i))
+      (setq i (- i 1))
+      (setq c (cdr c)))))
+
+(defun %gc-region-selftest (nlinks)
+  "STAGE-1 ACCEPTANCE: two extra regions, a collection of exactly ONE of them.
+
+   Carves two 16 MB regions off the TOP of the active region's two semispaces —
+   symmetrically, so they stay outside it across any number of its own flips —
+   with a 16 MB guard below each, because :gc-check tests the limit BEFORE an
+   allocation whose size it does not know and the allocation that follows a
+   passing check overshoots (the same reason +LINUX-X64-GC-GUARD+ exists).
+   Carving from inside the existing heap also keeps the new regions inside the
+   conservative-root bitmap's coverage, so their allocation sites record object
+   starts exactly as region 0's do.
+
+   Fills region 2, fills region 1 with a live chain plus garbage, snapshots
+   region 0's and region 2's bytes and collection counts, collects REGION 1
+   ONLY, and snapshots everything again.  Writes 34 machine words of evidence
+   into the carved guard band — where no region's collector can reach them —
+   and returns that block's raw byte address, or 0 if the active region is too
+   small to carve from.  The CALLER does the judging: every number here is read
+   back out of memory, not reported by this function's own bookkeeping."
+  (let ((k (%gc-meta-scale))
+        (r0 (%gc-region)))
+    (let ((from0 (%gc-meta-read r0 k))
+          (to0   (%gc-meta-read (+ r0 #x08) k))
+          (size0 (%gc-meta-read (+ r0 #x10) k))
+          (sb    (%gc-meta-read (+ r0 #x18) k)))
+      (if (< size0 #x4000000)
+          0
+          (let* ((s #x1000000)
+                 (g #x1000000)
+                 (new0 (- size0 (* 2 (+ s g))))
+                 (off2 (+ new0 g))
+                 (off1 (+ new0 (+ g (+ s g))))
+                 (scratch (- (+ from0 off2) 8192))
+                 (rcb1 scratch)
+                 (rcb2 (+ scratch #x40))
+                 (res (+ scratch 4096))
+                 (alloc0 0)
+                 (fill2 0)
+                 (home 0)
+                 (c1 nil)
+                 (c2 nil))
+            ;; ---- carve ----
+            (%gc-region-shrink r0 new0 k)
+            (%gc-region-init rcb2 (+ from0 off2) (+ to0 off2) s sb k)
+            (%gc-region-init rcb1 (+ from0 off1) (+ to0 off1) s sb k)
+            (%gc-write64 res rcb1)
+            (%gc-write64 (+ res 8) rcb2)
+            (%gc-write64 (+ res 16) r0)
+            (%gc-write64 (+ res 24) k)
+            (%gc-write64 (+ res 32) from0)
+            (%gc-write64 (+ res 40) new0)
+            ;; ---- fill region 2, then leave it alone ----
+            (setq alloc0 (get-alloc-ptr))
+            (%gc-write64 (+ res 48) alloc0)
+            (setq home (%gc-region-enter rcb2))
+            (setq c2 (%gc-chain-build nlinks))
+            (setq fill2 (get-alloc-ptr))
+            (%gc-write64 (+ res 56) fill2)
+            (%gc-write64 (+ res 64) (%gc-chain-check c2 nlinks))
+            ;; ---- fill region 1 ----
+            (%gc-region-enter rcb1)
+            (setq c1 (%gc-chain-build nlinks))
+            (%gc-write64 (+ res 72) (%gc-word-of c1 (+ res 264)))
+            (%gc-write64 (+ res 80) (%gc-chain-check c1 nlinks))
+            (%gc-write64 (+ res 88) (get-alloc-ptr))
+            ;; ---- snapshot the regions that must NOT move ----
+            (%gc-write64 (+ res 96)  (%gc-sum-range from0 alloc0))
+            (%gc-write64 (+ res 104) (%gc-sum-range (+ from0 off2) fill2))
+            (%gc-write64 (+ res 112) (%gc-meta-read (+ r0 #x20) k))
+            (%gc-write64 (+ res 120) (%gc-meta-read (+ rcb2 #x20) k))
+            (%gc-write64 (+ res 128) (%gc-sum-range r0 (+ r0 #x40)))
+            (%gc-write64 (+ res 136) (%gc-sum-range rcb2 (+ rcb2 #x40)))
+            (%gc-write64 (+ res 144) (%gc-meta-read rcb1 k))
+            (%gc-write64 (+ res 152) (%gc-meta-read (+ rcb1 #x08) k))
+            (%gc-write64 (+ res 160) (%gc-meta-read (+ rcb1 #x20) k))
+            ;; ---- COLLECT REGION 1, AND ONLY REGION 1 ----
+            (%gc-collect-here)
+            ;; ---- and again, afterwards ----
+            (%gc-write64 (+ res 168) (%gc-word-of c1 (+ res 272)))
+            (%gc-write64 (+ res 176) (%gc-chain-check c1 nlinks))
+            (%gc-write64 (+ res 184) (get-alloc-ptr))
+            (%gc-write64 (+ res 192) (%gc-sum-range from0 alloc0))
+            (%gc-write64 (+ res 200) (%gc-sum-range (+ from0 off2) fill2))
+            (%gc-write64 (+ res 208) (%gc-meta-read (+ r0 #x20) k))
+            (%gc-write64 (+ res 216) (%gc-meta-read (+ rcb2 #x20) k))
+            (%gc-write64 (+ res 224) (%gc-sum-range r0 (+ r0 #x40)))
+            (%gc-write64 (+ res 232) (%gc-sum-range rcb2 (+ rcb2 #x40)))
+            (%gc-write64 (+ res 240) (%gc-meta-read rcb1 k))
+            (%gc-write64 (+ res 248) (%gc-meta-read (+ rcb1 #x08) k))
+            (%gc-write64 (+ res 256) (%gc-meta-read (+ rcb1 #x20) k))
+            ;; ---- home ----
+            (%gc-region-enter home)
+            (%gc-write64 (+ res 280) nlinks)
+            (%gc-write64 (+ res 288) (%gc-chain-check c2 nlinks))
+            (%gc-write64 (+ res 296) (+ from0 off2))
+            (%gc-write64 (+ res 304) (+ from0 off1))
+            res)))))

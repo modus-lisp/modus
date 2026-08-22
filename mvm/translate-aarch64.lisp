@@ -4781,6 +4781,17 @@
     ;; next gc-check's BLR x28 would jump to the bitmap base.
     (a64-str-unsigned buf +a64-x28+ +a64-sp+ 224)
     ;; load GC metadata (all stored <<1 → ASR #1 to raw)
+    ;; REGION 0 ONLY.  The metadata block is per-region as of stage 1 (see
+    ;; mvm/compiler.lisp's +GC-OFF-*+ / +GC-REGION-ADDR+ block); the +GC-*-ADDR+
+    ;; names below now spell "region 0's block, field F", so a single-region
+    ;; image — which is every aarch64 image today — is unchanged to the byte.
+    ;; This shim does NOT read the active-region pointer, so it would save its
+    ;; registers into region 0's saved_sp/alloc/limit no matter which region the
+    ;; Lisp %gc-collect it calls was about to evacuate.  Porting is the same
+    ;; edit translate-x64's emit-gc-trampoline took: load the region base once
+    ;; (0 means region 0) and address the fields off it.  NOT DONE HERE because
+    ;; there is no way to boot an aarch64 image where this was written, and an
+    ;; unexercised change to a GC trampoline is worse than an honest gap.
     (flet ((load-asr (rd addr) (a64-load-imm64 buf +a64-x16+ addr)
                      (a64-ldr-unsigned buf rd +a64-x16+ 0) (a64-asr-imm buf rd rd 1)))
       (load-asr +a64-x19+ +gc-from-start-addr+)                   ; from_start

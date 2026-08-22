@@ -1535,3 +1535,59 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
               (check-compiler-warns hist (nreverse unknown)))
             result))))
 
+
+;;; ------------------------------------------------------------------
+;;; CHECK G. THE GC REGION CONSTANTS SPAN HOST AND IMAGE SOURCE
+;;; ------------------------------------------------------------------
+;;; mvm/compiler.lisp OWNS the GC region layout (+GC-REGION-ADDR+,
+;;; +GC-REGION-0-BASE+, +GC-OFF-*+).  Three translators and four boot
+;;; descriptors read those constants directly, because they are HOST source.
+;;; mvm/gc.lisp cannot: it is IMAGE source, compiled by Modus's own compiler
+;;; from text, so its copies of those two addresses are literals.
+;;;
+;;; That is the +MV-COUNT-ADDR+ shape all over again — two layers agreeing
+;;; about a number by convention — so it is checked rather than trusted.  A
+;;; drift here is silent and catastrophic in a specific way: the collector and
+;;; the mutator would disagree about WHICH REGION is active, and the collector
+;;; would evacuate one heap while the allocator bumped through another.
+;;;
+;;; The second half of the check is the one that catches a half-finished edit:
+;;; gc.lisp must contain NO absolute address of a region-0 metadata FIELD.
+;;; Every field access has to go through (+ (%gc-region) OFFSET); an accessor
+;;; left pointing at #x10000050 would read region 0's semispace size no matter
+;;; which region was being collected.  (#x10000040 itself is legitimate — it is
+;;; the region-0 default %gc-region falls back to.)
+(defun check-gc-region-literals ()
+  (let* ((path (merge-pathnames "mvm/gc.lisp" cl-user::*modus-base*))
+         (text (with-open-file (s path :direction :input)
+                 (let ((buf (make-string (file-length s))))
+                   (subseq buf 0 (read-sequence buf s)))))
+         (want-region (format nil "#x~8,'0X" +gc-region-addr+))
+         (want-zero   (format nil "#x~8,'0X" +gc-region-0-base+))
+         (problems nil))
+    (flet ((has (str) (search str text :test #'char-equal)))
+      (unless (has want-region)
+        (push (format nil "mvm/gc.lisp does not mention the active-region word ~A ~
+                           (+GC-REGION-ADDR+); %gc-region/%gc-set-region have drifted"
+                      want-region)
+              problems))
+      (unless (has want-zero)
+        (push (format nil "mvm/gc.lisp does not mention the region-0 base ~A ~
+                           (+GC-REGION-0-BASE+); %gc-region's zero default has drifted"
+                      want-zero)
+              problems))
+      (dolist (off (list +gc-off-to-start+ +gc-off-space-size+ +gc-off-stack-base+
+                         +gc-off-count+ +gc-off-saved-sp+ +gc-off-saved-alloc+
+                         +gc-off-saved-limit+))
+        (let ((abs (format nil "#x~8,'0X" (+ +gc-region-0-base+ off))))
+          (when (has abs)
+            (push (format nil "mvm/gc.lisp still uses the ABSOLUTE region-0 field ~
+                               address ~A; metadata access must be ~
+                               (+ (%gc-region) #x~2,'0X)"
+                          abs off)
+                  problems)))))
+    (when problems
+      (error "~&CHECK G (gc region constants) FAILED:~{~%  - ~A~}~%" (nreverse problems)))
+    t))
+
+(check-gc-region-literals)

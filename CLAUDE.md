@@ -516,6 +516,47 @@ Cheney semi-space copying collector. Two ~469MB semispaces within the mmap'd hea
 
 `scan_word` saves/restores RDX (stack_base) around copy_object calls.
 
+### Per-region GC, stage 1: the metadata block is a REGION CONTROL BLOCK
+
+The GC metadata is no longer global.  `mvm/compiler.lisp` owns the layout:
+eight `+GC-OFF-*+` OFFSETS (from/to/size/stack_base/count/saved sp+alloc+limit)
+into a 64-byte block, `+GC-REGION-0-BASE+` = `0x10000040`, and
+`+GC-REGION-ADDR+` = `0x10000F08`, one word holding the ACTIVE block's raw
+address.  `+GC-FROM-START-ADDR+` and friends still exist with their old values;
+they now spell "region 0's block, field F", so **no boot descriptor changed**.
+
+**ZERO MEANS REGION 0.** Nothing writes `0x10000F08` until something creates a
+second region, so BSS zero-fill (Linux) and unwritten-metadata-reads-as-zero
+(bare metal, the same assumption `%gc-bitmap-base` already degrades on) both
+answer "region 0".  A single-region image behaves exactly as before.
+
+Region-aware readers: `mvm/gc.lisp` (all field access is `(+ (%gc-region) OFF)`)
+and translate-x64's `emit-gc-trampoline` (`emit-load-gc-region` → `[reg+OFF]`).
+**NOT region-aware, and commented as such**: translate-aarch64's GC shim,
+translate-i386's collector, and translate-x64's page/pinning collector — they
+read region 0 unconditionally, which is correct until those targets create a
+second region.  Porting is the same edit: load the base once, index off it.
+
+API in `gc.lisp`: `%gc-region-init` (write a block anywhere the caller owns —
+BSS, a carved guard band, or an actor struct), `%gc-region-enter` (park the
+mutator's alloc ptr/limit in the region you leave, load the one you enter —
+exactly `actors.lisp`'s x24/x25 context switch), `%gc-region-shrink`,
+`%gc-collect-here` (pull the limit to the pointer so the next `:gc-check`
+trips — the real collector, not a side door).  `%gc-meta-scale` DERIVES whether
+this target stores metadata raw (x64) or SHL'd (aarch64/i386) by asking which
+reading brackets the alloc pointer, so there is no per-target knob.
+
+Soundness is `net/actors.lisp`'s: each actor has a private alloc ptr/limit and
+messages are term-serialized, so no actor holds a pointer into another's
+region.  **Stage 1 does not enforce that** — a pointer stored from region A
+into region B dangles when B is collected.
+
+Acceptance: `./modus --script test/region-gc.lisp` — carves two 16 MB regions
+off the top of region 0's semispaces, collects ONE, and checks the other two
+are bit-for-bit unchanged (23 checks).  Note the ordinary 200k-allocation
+stress collects **zero** times on an 896 MB semispace (measured); use
+`%gc-collect-here` or `MODUS_GC_R14` if you mean to exercise the collector.
+
 ### Conservative-root validation collector (x64, landed ace1544 + 810a975)
 
 The Cheney collector is now hardened by an **object-start bitmap** (1 bit /

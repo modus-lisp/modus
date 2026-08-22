@@ -399,29 +399,29 @@
   (emit-bytes buf #x48 #x81 #xC1)                ; add rcx, imm32
   (emit-le32 buf +linux-x64-heap-alloc-start+)
   (emit-bytes buf #x48 #x89 #x0C #x25)           ; mov [abs32], rcx
-  (emit-le32 buf #x10000040)
+  (emit-le32 buf +gc-from-start-addr+)
 
   ;; [0x10000048] = to_start = mmap_base + midpoint
   (emit-bytes buf #x48 #x89 #xC1)                ; mov rcx, rax
   (emit-bytes buf #x48 #x81 #xC1)                ; add rcx, imm32
   (emit-le32 buf +linux-x64-gc-midpoint+)
   (emit-bytes buf #x48 #x89 #x0C #x25)           ; mov [abs32], rcx
-  (emit-le32 buf #x10000048)
+  (emit-le32 buf +gc-to-start-addr+)
 
   ;; [0x10000050] = space_size = midpoint - alloc_offset
   (emit-bytes buf #x48 #xC7 #xC1)                ; mov rcx, imm32
   (emit-le32 buf (- +linux-x64-gc-midpoint+ +linux-x64-heap-alloc-start+))
   (emit-bytes buf #x48 #x89 #x0C #x25)           ; mov [abs32], rcx
-  (emit-le32 buf #x10000050)
+  (emit-le32 buf +gc-space-size-addr+)
 
   ;; [0x10000058] = stack_base = initial RSP
   (emit-bytes buf #x48 #x89 #xE1)                ; mov rcx, rsp
   (emit-bytes buf #x48 #x89 #x0C #x25)           ; mov [abs32], rcx
-  (emit-le32 buf #x10000058)
+  (emit-le32 buf +gc-stack-base-addr+)
 
   ;; [0x10000060] = gc_count = 0
   (emit-bytes buf #x48 #xC7 #x04 #x25)           ; mov qword [abs32], imm32
-  (emit-le32 buf #x10000060)
+  (emit-le32 buf +gc-count-addr+)
   (emit-le32 buf 0)
 
   ;; ---- MCGC config words (mmap base still in RAX) ----

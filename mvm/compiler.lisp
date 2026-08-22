@@ -109,6 +109,33 @@
 ;;; MV-COUNT at 0x600010: number of values returned (tagged fixnum)
 ;;; MV-VALUES at 0x600020: array of up to 20 extra values (0x600020..0x6000C0)
 (defconstant +mv-count-addr+ #x10000090)
+
+;;; ---- THE GC METADATA BLOCK, IN ONE PLACE ----------------------------------
+;;;
+;;; These eight words were written as bare literals in TEN files: gc.lisp, three
+;;; translators, four boot descriptors, two build scripts and a test.  Ten copies
+;;; of a number that several layers agree about by convention is precisely the
+;;; shape of the +MV-COUNT-ADDR+ bug directly above — translate-i386 relocated
+;;; that literal with its private block, so the one writer pointed at an address
+;;; with ZERO readers and every "I returned one value" reset was discarded.
+;;;
+;;; They are named here, beside that one, for the same reason: so there is an
+;;; owner rather than a convention.  The VALUES are unchanged — this renames, it
+;;; does not move anything.
+;;;
+;;; They also have to stop being constants before actors can be backed by native
+;;; threads.  A per-actor region needs its OWN from/to/size and its OWN saved
+;;; registers; one fixed triple is one collecting thread by construction.  When
+;;; that happens these become offsets from a region base, and the edit is here.
+(defconstant +gc-from-start-addr+ #x10000040)  ; from-space start (byte address)
+(defconstant +gc-to-start-addr+   #x10000048)  ; to-space start
+(defconstant +gc-space-size-addr+ #x10000050)  ; size of each semispace
+(defconstant +gc-stack-base-addr+ #x10000058)  ; top of stack, set at boot
+(defconstant +gc-count-addr+      #x10000060)  ; collections performed
+(defconstant +gc-saved-sp-addr+   #x10000068)  ; SP at GC entry (trampoline)
+(defconstant +gc-saved-alloc-addr+ #x10000070) ; alloc ptr at GC entry (r12/x24)
+(defconstant +gc-saved-limit-addr+ #x10000078) ; alloc limit at GC entry (r14/x25)
+
 (defconstant +mv-values-addr+ #x10000098)
 
 ;;; Closure environment storage (fixed address for passing env to closure functions)

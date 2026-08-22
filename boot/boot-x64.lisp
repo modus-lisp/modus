@@ -466,26 +466,26 @@
     ;;
     ;; Slot 0x10000040 = from_start = 0x10001000
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
-    (mvm-emit-u32 buf #x10000040) (mvm-emit-u32 buf 0)
+    (mvm-emit-u32 buf +gc-from-start-addr+) (mvm-emit-u32 buf 0)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xB8)
     (mvm-emit-u32 buf #x10001000) (mvm-emit-u32 buf 0)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x07)
     ;; Slot 0x10000048 = to_start = 0x17000000
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
-    (mvm-emit-u32 buf #x10000048) (mvm-emit-u32 buf 0)
+    (mvm-emit-u32 buf +gc-to-start-addr+) (mvm-emit-u32 buf 0)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xB8)
     (mvm-emit-u32 buf #x17000000) (mvm-emit-u32 buf 0)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x07)
     ;; Slot 0x10000050 = space_size = 0x06FFF000
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
-    (mvm-emit-u32 buf #x10000050) (mvm-emit-u32 buf 0)
+    (mvm-emit-u32 buf +gc-space-size-addr+) (mvm-emit-u32 buf 0)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xB8)
     (mvm-emit-u32 buf #x06FFF000) (mvm-emit-u32 buf 0)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x07)
     ;; Slot 0x10000058 = stack_base = top of stack (GC conservative-root
     ;; scan upper bound; must match the effective stack top).
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
-    (mvm-emit-u32 buf #x10000058) (mvm-emit-u32 buf 0)
+    (mvm-emit-u32 buf +gc-stack-base-addr+) (mvm-emit-u32 buf 0)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xB8)
     (mvm-emit-u32 buf (x64-effective-stack-top)) (mvm-emit-u32 buf 0)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x07)

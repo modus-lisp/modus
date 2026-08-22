@@ -4783,12 +4783,12 @@
     ;; load GC metadata (all stored <<1 → ASR #1 to raw)
     (flet ((load-asr (rd addr) (a64-load-imm64 buf +a64-x16+ addr)
                      (a64-ldr-unsigned buf rd +a64-x16+ 0) (a64-asr-imm buf rd rd 1)))
-      (load-asr +a64-x19+ #x10000040)                   ; from_start
-      (load-asr +a64-x22+ #x10000048)                   ; to_start
+      (load-asr +a64-x19+ +gc-from-start-addr+)                   ; from_start
+      (load-asr +a64-x22+ +gc-to-start-addr+)                   ; to_start
       (a64-mov-reg buf +a64-x21+ +a64-x22+)             ; free_ptr = to_start
-      (load-asr +a64-x25+ #x10000050)                   ; space_size
+      (load-asr +a64-x25+ +gc-space-size-addr+)                   ; space_size
       (a64-add-reg buf +a64-x20+ +a64-x19+ +a64-x25+ 0 0) ; from_end = from_start+space_size
-      (load-asr +a64-x23+ #x10000058)                   ; stack_base
+      (load-asr +a64-x23+ +gc-stack-base-addr+)                   ; stack_base
       (load-asr +a64-x27+ #x10000E00)                   ; page_base
       (load-asr +a64-x28+ #x10000E18))                  ; obj-bitmap base
     ;; ---- scan stack: x26 from SP to stack_base ----
@@ -4967,14 +4967,14 @@
       (a64-set-label buf zdone2b))
     ;; ---- swap metadata (store <<1) ----
     (a64-lsl-imm buf +a64-x9+ +a64-x22+ 1)              ; new from_start = to_start
-    (a64-load-imm64 buf +a64-x16+ #x10000040) (a64-str-unsigned buf +a64-x9+ +a64-x16+ 0)
+    (a64-load-imm64 buf +a64-x16+ +gc-from-start-addr+) (a64-str-unsigned buf +a64-x9+ +a64-x16+ 0)
     (a64-lsl-imm buf +a64-x9+ +a64-x19+ 1)              ; new to_start = old from_start
-    (a64-load-imm64 buf +a64-x16+ #x10000048) (a64-str-unsigned buf +a64-x9+ +a64-x16+ 0)
+    (a64-load-imm64 buf +a64-x16+ +gc-to-start-addr+) (a64-str-unsigned buf +a64-x9+ +a64-x16+ 0)
     ;; x24 = free_ptr ; x25 = new from_start(to_start x22) + space_size(x25)
     (a64-mov-reg buf +a64-x24+ +a64-x21+)
     (a64-add-reg buf +a64-x25+ +a64-x22+ +a64-x25+ 0 0)
     ;; gc_count += 1 (stored <<1 → += 2)
-    (a64-load-imm64 buf +a64-x16+ #x10000060)
+    (a64-load-imm64 buf +a64-x16+ +gc-count-addr+)
     (a64-ldr-unsigned buf +a64-x9+ +a64-x16+ 0) (a64-add-imm buf +a64-x9+ +a64-x9+ 2)
     (a64-str-unsigned buf +a64-x9+ +a64-x16+ 0)
     ;; ---- restore mutator regs + RET ----
@@ -5149,11 +5149,11 @@
     ;; integer.  Modus tags fixnums by SHL 1, so the stored 64-bit
     ;; word must already be SHL'd: we LSL x24 by 1 before storing,
     ;; and on the way back out (after %gc-collect) we ASR by 1.
-    (a64-load-imm64 buf +a64-x16+ #x10000070)
+    (a64-load-imm64 buf +a64-x16+ +gc-saved-alloc-addr+)
     (a64-lsl-imm buf +a64-x17+ +a64-x24+ 1)       ; x17 = x24 << 1 (Lisp-tagged)
     (a64-str-unsigned buf +a64-x17+ +a64-x16+ 0)
     ;; Stash x25 (alloc limit) → 0x10000078 (same SHL convention).
-    (a64-load-imm64 buf +a64-x16+ #x10000078)
+    (a64-load-imm64 buf +a64-x16+ +gc-saved-limit-addr+)
     (a64-lsl-imm buf +a64-x17+ +a64-x25+ 1)
     (a64-str-unsigned buf +a64-x17+ +a64-x16+ 0)
     ;; Stash CURRENT SP → 0x10000068.  The trampoline's register-save
@@ -5167,7 +5167,7 @@
     ;; a forwarding-tagged value, which then took funcall to a stale
     ;; object and wedged the runtime.  Stored SHL'd to match
     ;; (mem-ref :u64)'s tagging convention on the Lisp side.
-    (a64-load-imm64 buf +a64-x16+ #x10000068)
+    (a64-load-imm64 buf +a64-x16+ +gc-saved-sp-addr+)
     ;; LSL encodes reg 31 as XZR, so (lsl x17, sp, 1) produced (lsl x17, xzr, 1)
     ;; = 0, and every GC stored saved_rsp = 0.  Move SP to x17 via ADD-IMM
     ;; (which encodes reg 31 as SP) FIRST, then shift.  Diagnosed via gdb
@@ -5214,10 +5214,10 @@
     ;; wrote these via (setf (mem-ref ADDR :u64) FREE-PTR) — and
     ;; since Lisp fixnums are stored SHL'd in registers, :u64 emits
     ;; the SHL'd 64-bit pattern.  ASR by 1 to recover the raw address.
-    (a64-load-imm64 buf +a64-x16+ #x10000070)
+    (a64-load-imm64 buf +a64-x16+ +gc-saved-alloc-addr+)
     (a64-ldr-unsigned buf +a64-x24+ +a64-x16+ 0)
     (a64-asr-imm buf +a64-x24+ +a64-x24+ 1)
-    (a64-load-imm64 buf +a64-x16+ #x10000078)
+    (a64-load-imm64 buf +a64-x16+ +gc-saved-limit-addr+)
     (a64-ldr-unsigned buf +a64-x25+ +a64-x16+ 0)
     (a64-asr-imm buf +a64-x25+ +a64-x25+ 1)
     ;; Restore caller-saved regs and frame.

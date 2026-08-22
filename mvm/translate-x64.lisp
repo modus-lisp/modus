@@ -4894,13 +4894,13 @@
     ;; ---- Load GC metadata ----
     ;; RBX = from_start (raw byte addr)
     (emit-bytes buf #x48 #x8B #x1C #x25)         ; mov rbx, [abs32]
-    (emit-u32 buf #x10000040)
+    (emit-u32 buf modus.mvm::+gc-from-start-addr+)
     ;; R13 = to_start -> becomes free pointer
     (emit-bytes buf #x4C #x8B #x2C #x25)         ; mov r13, [abs32]
-    (emit-u32 buf #x10000048)
+    (emit-u32 buf modus.mvm::+gc-to-start-addr+)
     ;; RCX = from_start + space_size = from_end
     (emit-bytes buf #x48 #x8B #x0C #x25)         ; mov rcx, [abs32]
-    (emit-u32 buf #x10000050)
+    (emit-u32 buf modus.mvm::+gc-space-size-addr+)
     (emit-add-reg-reg buf 'rcx 'rbx)             ; rcx = from_start + space_size
 
     (emit-gc-dbg-char buf #x70)          ; 'p' — pushed regs + metadata loaded, about to scan stack
@@ -4912,7 +4912,7 @@
           (stack-done (make-label)))
       ;; RDX = stack_base
       (emit-bytes buf #x48 #x8B #x14 #x25)       ; mov rdx, [abs32]
-      (emit-u32 buf #x10000058)
+      (emit-u32 buf modus.mvm::+gc-stack-base-addr+)
 
       (emit-label buf stack-loop)
       (emit-cmp-reg-reg buf 'rdi 'rdx)           ; rdi >= stack_base?
@@ -4995,7 +4995,7 @@
     ;; ---- Cheney scan loop ----
     ;; R10 = scan pointer (starts at to_start)
     (emit-bytes buf #x4C #x8B #x14 #x25)         ; mov r10, [abs32]
-    (emit-u32 buf #x10000048)                     ; r10 = to_start
+    (emit-u32 buf modus.mvm::+gc-to-start-addr+)                     ; r10 = to_start
 
     (let ((cheney-loop (make-label))
           (cheney-done (make-label)))
@@ -5014,12 +5014,12 @@
     ;; ---- Swap semispaces ----
     ;; new from_start = old to_start
     (emit-bytes buf #x48 #x8B #x04 #x25)         ; mov rax, [0x10000048]
-    (emit-u32 buf #x10000048)
+    (emit-u32 buf modus.mvm::+gc-to-start-addr+)
     (emit-bytes buf #x48 #x89 #x04 #x25)         ; mov [0x10000040], rax
-    (emit-u32 buf #x10000040)
+    (emit-u32 buf modus.mvm::+gc-from-start-addr+)
     ;; new to_start = old from_start (in RBX)
     (emit-bytes buf #x48 #x89 #x1C #x25)         ; mov [0x10000048], rbx
-    (emit-u32 buf #x10000048)
+    (emit-u32 buf modus.mvm::+gc-to-start-addr+)
 
     ;; ---- Update R12 and R14 ----
     ;; R12 = free_ptr (R13)
@@ -5027,9 +5027,9 @@
     ;; R14 = new from_start + space_size
     ;; new from_start was old to_start, now at [0x10000040]
     (emit-bytes buf #x48 #x8B #x04 #x25)         ; mov rax, [0x10000040]
-    (emit-u32 buf #x10000040)
+    (emit-u32 buf modus.mvm::+gc-from-start-addr+)
     (emit-bytes buf #x48 #x03 #x04 #x25)         ; add rax, [0x10000050]
-    (emit-u32 buf #x10000050)
+    (emit-u32 buf modus.mvm::+gc-space-size-addr+)
     (emit-bytes buf #x49 #x89 #xC6)              ; mov r14, rax
 
     ;; ---- MCGC point (c): clear the reclaimed from-space's object-start bitmap ----
@@ -5061,7 +5061,7 @@
       (emit-u32 buf +mcgc-cfg-bitmap-addr+)
       (emit-bytes buf #x48 #x01 #xC7)                ; add rdi, rax  (rdi = dest)
       (emit-bytes buf #x48 #x8B #x0C #x25)           ; mov rcx, [space_size]
-      (emit-u32 buf #x10000050)
+      (emit-u32 buf modus.mvm::+gc-space-size-addr+)
       (emit-shr-reg-imm buf 'rcx 7)                  ; rcx = byte count = space_size/128
       (emit-bytes buf #x31 #xC0)                     ; xor eax, eax  (AL = fill 0)
       (emit-bytes buf #xF3 #xAA))                    ; rep stosb
@@ -5083,14 +5083,14 @@
       (emit-u32 buf +mcgc-kindbitmap-delta+)
       (emit-bytes buf #x48 #x01 #xC7)                ; add rdi, rax  (rdi = dest)
       (emit-bytes buf #x48 #x8B #x0C #x25)           ; mov rcx, [space_size]
-      (emit-u32 buf #x10000050)
+      (emit-u32 buf modus.mvm::+gc-space-size-addr+)
       (emit-shr-reg-imm buf 'rcx 7)                  ; byte count = space_size/128
       (emit-bytes buf #x31 #xC0)                     ; xor eax, eax
       (emit-bytes buf #xF3 #xAA))                    ; rep stosb
 
     ;; ---- Increment GC count ----
     (emit-bytes buf #x48 #xFF #x04 #x25)          ; inc qword [0x10000060]
-    (emit-u32 buf #x10000060)
+    (emit-u32 buf modus.mvm::+gc-count-addr+)
 
     ;; ---- Restore registers ----
     (emit-jmp buf restore-label)
@@ -5800,7 +5800,7 @@
     (emit-bytes buf #x48 #x89 #xEF)              ; mov rdi, rbp
     (let ((sp-loop (make-label)) (sp-done (make-label)) (sp-next (make-label))
           (sp-cand (make-label)))
-      (emit-mov-reg-abs buf 'rdx #x10000058)     ; rdx = stack_base
+      (emit-mov-reg-abs buf 'rdx modus.mvm::+gc-stack-base-addr+)     ; rdx = stack_base
       (emit-label buf sp-loop)
       (emit-cmp-reg-reg buf 'rdi 'rdx)
       (emit-jcc buf :ae sp-done)
@@ -6131,7 +6131,7 @@
       (let ((rok (make-label)))
         (emit-jcc buf :b rok) (emit-gc-dbg-char buf #x3C) (emit-label buf rok)))
 
-    (emit-bytes buf #x48 #xFF #x04 #x25) (emit-u32 buf #x10000060) ; gc_count++
+    (emit-bytes buf #x48 #xFF #x04 #x25) (emit-u32 buf modus.mvm::+gc-count-addr+) ; gc_count++
     (emit-jmp buf restore-label)
 
     ;; ===========================================================

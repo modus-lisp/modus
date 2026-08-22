@@ -499,11 +499,11 @@
    old semispace intact), so being able to force dozens of cycles out of a
    small workload is what makes the survival tests cheap.  NIL = normal.")
 
-(defconstant +i386-gc-from-start+ #x10000040)
-(defconstant +i386-gc-to-start+   #x10000048)
-(defconstant +i386-gc-space-size+ #x10000050)
-(defconstant +i386-gc-stack-base+ #x10000058)
-(defconstant +i386-gc-count+      #x10000060)
+(defconstant +i386-gc-from-start+ modus.mvm::+gc-from-start-addr+)
+(defconstant +i386-gc-to-start+   modus.mvm::+gc-to-start-addr+)
+(defconstant +i386-gc-space-size+ modus.mvm::+gc-space-size-addr+)
+(defconstant +i386-gc-stack-base+ modus.mvm::+gc-stack-base-addr+)
+(defconstant +i386-gc-count+      modus.mvm::+gc-count-addr+)
 (defvar *i386-genadd-label* nil)
 (defvar *i386-gensub-label* nil)
 (defvar *i386-genmul-label* nil)

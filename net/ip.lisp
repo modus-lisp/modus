@@ -129,7 +129,11 @@
 
 (defun arp-resolve ()
   (let ((state (e1000-state-base)))
-    (arp-request #x0A000202)
+    ;; #275: ARP the CONFIGURED gateway (state+0x1C, little-endian bytes as
+    ;; stored by DHCP/static config; htonl converts to arp-request's host-
+    ;; order convention).  This was hardcoded to QEMU slirp's 10.0.2.2,
+    ;; which can never resolve on a real network.
+    (arp-request (htonl (mem-ref (+ state #x1C) :u32)))
     (let ((found 0))
       (dotimes (round 200)
         (when (zerop found)

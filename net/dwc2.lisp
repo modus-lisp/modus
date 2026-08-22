@@ -715,21 +715,24 @@
   ;; Returns: 1=success, 0=NAK, <0=error
   (let ((hcchar (dwc2-build-hcchar mps epnum epdir 2 devaddr)))
     (dwc2-setup-channel ch hcchar)
-    ;; QEMU's DWC2 manages data toggle internally via USB endpoint state.
-    ;; Always use DATA0 PID — the actual toggle is tracked by QEMU.
-    ;; #275: PktCnt MUST be computed with INTEGER division.  `/` in Common Lisp
-    ;; is exact rational division: (/ 8 64) is the RATIO 1/8, a heap object.
-    ;; dwc2-build-hctsiz then does (logand pktcnt #x3FF) on it, masking the low
-    ;; bits of its POINTER — so PktCnt was garbage that CHANGED on every call as
-    ;; the heap moved.  Proven on a Pi Zero 2 W: (integerp (/ 8 64)) => NIL, and
-    ;; (logand (+ (/ 8 64) 1) 1023) returned 884 then 1012 on two identical
-    ;; calls; the HCTSIZ actually programmed for two identical GET_DESCRIPTORs
-    ;; was 0x4EE00008 then 0x52600008 (PktCnt 476, then 588 — should be 1).
-    ;; QEMU's DWC2 model ignores PktCnt, so this was invisible under emulation.
-    (let ((pktcnt (if (zerop len) 1 (ceiling len mps))))
-      (let ((hctsiz (dwc2-build-hctsiz len pktcnt (hctsiz-pid-data0))))
+    ;; #275 DATA TOGGLES (U-Boot pattern): program the stored per-endpoint
+    ;; PID, and after the transfer read the NEXT PID back from HCTSIZ bits
+    ;; 30:29 — the core updates the field as packets complete.  QEMU's model
+    ;; tracks toggles internally and ignores the programmed PID, so this is
+    ;; emulator-neutral; real silicon requires it (always-DATA0 makes the
+    ;; device drop every second packet as a retransmission).
+    ;; PktCnt MUST use integer division — (/ len mps) is an exact RATIO whose
+    ;; pointer bits once leaked into the register (see git c3e35dd).
+    (let ((pktcnt (if (zerop len) 1 (ceiling len mps)))
+          (tog (logand (if (= epdir 1) (usb-bulk-in-toggle) (usb-bulk-out-toggle)) 3)))
+      (let ((hctsiz (dwc2-build-hctsiz len pktcnt (ash tog 29))))
         (dwc2-start-transfer ch hctsiz buf)
-        (dwc2-poll-channel ch)))))
+        (let ((r (dwc2-poll-channel ch)))
+          (let ((next (logand (ash (dwc2-read (dwc2-hctsiz ch)) -29) 3)))
+            (if (= epdir 1)
+                (usb-set-bulk-in-toggle next)
+                (usb-set-bulk-out-toggle next)))
+          r)))))
 
 ;; Non-blocking bulk IN poll for persistent channel.
 ;; The channel stays active between calls — DWC2's work_bh auto-retries NAK.
@@ -745,6 +748,11 @@
     (if (not (zerop (logand hcint (hcint-chhltd))))
         (progn
           (dwc2-write (dwc2-hcint ch) #xFFFFFFFF)
+          ;; #275 toggles: latch the NEXT PID the core left in HCTSIZ for
+          ;; this endpoint (U-Boot pattern; QEMU ignores programmed PIDs so
+          ;; this is emulator-neutral).  Channel 1 is the bulk-IN channel.
+          (usb-set-bulk-in-toggle
+           (logand (ash (dwc2-read (dwc2-hctsiz ch)) -29) 3))
           (if (not (zerop (logand hcint (hcint-xfercompl))))
               1   ; success — data ready
               (if (not (zerop (logand hcint (hcint-stall))))
@@ -754,6 +762,8 @@
         (if (not (zerop (logand hcint (hcint-xfercompl))))
             (progn
               (dwc2-write (dwc2-hcint ch) #xFFFFFFFF)
+              (usb-set-bulk-in-toggle
+               (logand (ash (dwc2-read (dwc2-hctsiz ch)) -29) 3))
               1)
             ;; NAK without halt: clear NAK flag, DWC2 auto-retries
             (progn
@@ -766,17 +776,13 @@
 (defun dwc2-start-bulk-in (ch devaddr epnum buf len mps)
   (let ((hcchar (dwc2-build-hcchar mps epnum 1 2 devaddr)))
     (dwc2-setup-channel ch hcchar)
-    ;; #275: PktCnt MUST be computed with INTEGER division.  `/` in Common Lisp
-    ;; is exact rational division: (/ 8 64) is the RATIO 1/8, a heap object.
-    ;; dwc2-build-hctsiz then does (logand pktcnt #x3FF) on it, masking the low
-    ;; bits of its POINTER — so PktCnt was garbage that CHANGED on every call as
-    ;; the heap moved.  Proven on a Pi Zero 2 W: (integerp (/ 8 64)) => NIL, and
-    ;; (logand (+ (/ 8 64) 1) 1023) returned 884 then 1012 on two identical
-    ;; calls; the HCTSIZ actually programmed for two identical GET_DESCRIPTORs
-    ;; was 0x4EE00008 then 0x52600008 (PktCnt 476, then 588 — should be 1).
-    ;; QEMU's DWC2 model ignores PktCnt, so this was invisible under emulation.
+    ;; #275: PID from the stored bulk-IN toggle (dwc2-poll-bulk-in latches
+    ;; the next PID from HCTSIZ on completion — U-Boot pattern, QEMU-neutral).
+    ;; PktCnt MUST use integer division — see git c3e35dd for the ratio-
+    ;; pointer-in-register bug this once caused.
     (let ((pktcnt (if (zerop len) 1 (ceiling len mps))))
-      (let ((hctsiz (dwc2-build-hctsiz len pktcnt (hctsiz-pid-data0))))
+      (let ((hctsiz (dwc2-build-hctsiz len pktcnt
+                                       (ash (logand (usb-bulk-in-toggle) 3) 29))))
         (dwc2-start-transfer ch hctsiz buf)))))
 
 ;; Start a new interrupt IN transfer on channel ch.

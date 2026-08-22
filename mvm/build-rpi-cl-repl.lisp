@@ -398,6 +398,11 @@
         (%rpi-net-text "dwc2.lisp")          (string #\Newline)
         (%rpi-net-text "usb.lisp")           (string #\Newline)
         (%rpi-net-text "cdc-ether.lisp")     (string #\Newline)
+        ;; r8152.lisp AFTER cdc-ether: its e1000-probe/send/receive/rx-buf
+        ;; defuns override the CDC-ECM ones (last-defun-wins) — on real
+        ;; RTL8153 silicon the ECM config NAKs all bulk-IN, so the NIC is
+        ;; driven in vendor config 1 with an explicit RX enable.
+        (%rpi-net-text "r8152.lisp")         (string #\Newline)
         (%rpi-net-text "ip.lisp")            (string #\Newline)
         (%rpi-net-text "http-client.lisp")   (string #\Newline)
         ;; Bigger HTTP response buffer.  The stock http-fetch-impl caps a

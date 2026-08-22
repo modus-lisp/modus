@@ -5246,17 +5246,51 @@
     ;; object and wedged the runtime.  Stored SHL'd to match
     ;; (mem-ref :u64)'s tagging convention on the Lisp side.
     ;;
-    ;; THE GUARD IS STAGE 3's, and without it the parked encoding breaks here.
-    ;; saved_sp = 0 means "this region's actor is the one RUNNING", and this
-    ;; shim IS the running case — it has the live SP and nothing else does.  A
-    ;; NON-ZERO field means the region's actor is PARKED on its own stack and
-    ;; that value is the SP its context switch recorded; clobbering it with the
-    ;; live SP would hand the collector the wrong stack and silently drop every
-    ;; root the parked actor holds.  translate-x64's trampoline has branched on
-    ;; exactly this since stage 2 (it reads RBP and never writes the field);
-    ;; this shim has to write, so it tests first.
+    ;; THIS SHIM IS THE ONLY COLLECTOR ENTRY POINT IN THE TREE THAT WRITES
+    ;; +0x28 (translate-x64's trampoline holds RBP and translate-i386 holds ESP,
+    ;; so both only READ it), and that is why it is the only one that has to
+    ;; put back what it found.  Two separate requirements, both live:
+    ;;
+    ;;   RUNNING (field = 0).  The field must be given the live SP, because the
+    ;;   Lisp %gc-collect this is about to call reads the window's low end out
+    ;;   of memory and has no other way to learn it.
+    ;;
+    ;;   PARKED (field != 0).  The field must NOT be touched: it holds the SP
+    ;;   the context switch recorded on that actor's OWN stack, and clobbering
+    ;;   it hands the collector the wrong stack and drops every root the parked
+    ;;   actor holds.  This case IS reachable — %gc-collect-here collects the
+    ;;   ACTIVE region, and gc.lisp's stage-1/2/3 selftests deliberately make a
+    ;;   region active WHILE parked and collect it from there.
+    ;;
+    ;; AND THE FIELD MUST BE RESTORED ON THE WAY OUT.  A conditional write with
+    ;; no restore satisfies both requirements above and is still WRONG, because
+    ;; nothing else ever clears the field: %gc-collect only reads it into a
+    ;; local, and the tail of this shim only reloads x24/x25.  So the first
+    ;; collection leaves the live SP behind FOREVER, and the second one takes
+    ;; the PARKED branch on a value that is not a parked SP at all — it scans
+    ;; [SP-of-the-FIRST-collection, stack_base).  Stacks grow down, so a deeper
+    ;; second collection (the normal case: GC triggers from arbitrary alloc
+    ;; sites at arbitrary depths) gets a window starting ABOVE its own live
+    ;; frames, missing every one of them INCLUDING the register-save area at
+    ;; [sp, sp+232) that the block above just filled.  Those roots are never
+    ;; forwarded, from-space is reclaimed under them, and the heap is silently
+    ;; corrupted from the second collection onward.
+    ;;
+    ;; MEASURED, on a bare-metal shim-path RPi image under QEMU: two forced
+    ;; collections of one carved region, the second 200 frames deeper, with a
+    ;; 2000-link chain rooted ONLY by the deep frame's own local.  Without the
+    ;; restore, saved_sp read 0x07FFE028 after the FIRST collection and the
+    ;; second collection left 16 live bytes — the whole chain uncopied — where
+    ;; the correct answer is 32016.  test/region-gc-depth.lisp is that probe.
+    ;;
+    ;; So: stash the ORIGINAL in the frame's spare slot, install the live SP
+    ;; only if the original said RUNNING, and put the original back after the
+    ;; call.  The shim then leaves no trace, exactly as translate-x64 does by
+    ;; never writing at all — and it is correct whether the region it collects
+    ;; is running or parked.
+    (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ +gc-off-saved-sp+)
+    (a64-str-unsigned buf +a64-x17+ +a64-sp+ 224)   ; frame slot 224 = spare
     (let ((sp-done (incf *mvm-label-counter*)))
-      (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ +gc-off-saved-sp+)
       (a64-cmp-imm buf +a64-x17+ 0)
       (let ((i (a64-current-index buf)))
         (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i sp-done :bcond))
@@ -5314,6 +5348,12 @@
     (a64-asr-imm buf +a64-x24+ +a64-x24+ 1)
     (a64-ldr-unsigned buf +a64-x25+ +a64-x16+ +gc-off-saved-limit+)
     (a64-asr-imm buf +a64-x25+ +a64-x25+ 1)
+    ;; PUT BACK WHAT WE FOUND at +0x28 — see the long note at the write above.
+    ;; Restoring a 0 is what keeps the NEXT collection's window fresh; restoring
+    ;; a parked SP is what keeps a parked actor's root window intact.  The
+    ;; region cannot have changed: %gc-collect does not switch regions.
+    (a64-ldr-unsigned buf +a64-x17+ +a64-sp+ 224)
+    (a64-str-unsigned buf +a64-x17+ +a64-x16+ +gc-off-saved-sp+)
     ;; Restore caller-saved regs and frame.
     (a64-ldr-unsigned buf +a64-x30+ +a64-sp+ 216)
     (a64-ldr-unsigned buf +a64-x29+ +a64-sp+ 208)

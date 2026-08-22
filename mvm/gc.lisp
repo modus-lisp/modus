@@ -1888,3 +1888,98 @@
             (%gc-write64 (+ res 664) w0lo)
             (%gc-write64 (+ res 672) w0hi)
             res)))))
+
+;;; ============================================================
+;;; STACK-DEPTH REGRESSION: THE COLLECTOR ENTRY POINT MUST LEAVE NO TRACE
+;;; ============================================================
+;;;
+;;; A collector entry point that WRITES +0x28 (aarch64's shim is the only one
+;;; in the tree — translate-x64 and translate-i386 read the field and never
+;;; write it) has to put back exactly what it found, and this is what checks
+;;; that it does.
+;;;
+;;; WHY IT NEEDS TWO DIFFERENT STACK DEPTHS.  Every existing forced-collection
+;;; test drives %gc-collect-here from ONE call site, so every collection sees
+;;; the same SP and a stale saved_sp is indistinguishable from a fresh one.
+;;; Real collections trigger from arbitrary allocation sites at arbitrary
+;;; depths.  If an entry point writes the live SP once and never clears it, the
+;;; SECOND collection scans [SP-of-the-FIRST, stack_base) — and when the second
+;;; is DEEPER (the normal case; stacks grow down) that window starts ABOVE the
+;;; live frames and misses them, including the entry point's own register-save
+;;; area.  Those roots are never forwarded, from-space is reclaimed under them,
+;;; and the heap is silently corrupted from the second collection onward.
+;;;
+;;; THE ORACLES, in order of sharpness:
+;;;   - saved_sp AFTER a collection must be exactly what it was BEFORE.  Exact,
+;;;     deterministic, and true on every target: 0 for a running region.
+;;;   - the chain built in the DEEP frame, rooted ONLY by that frame's local,
+;;;     must survive the collection made from that frame.  If the window was
+;;;     stale the chain is unreachable and the region's live bytes collapse to
+;;;     the single junk cons %gc-collect-here allocates.  Bounded rather than
+;;;     equated, because a RUNNING region's window is the whole live stack and
+;;;     a conservative scan may retain a few dead conses off stale slots.
+
+(defun %gc-depth-descend (d nlinks res k)
+  "Descend D REAL machine frames — the recursive call is NOT in tail position,
+   so each level keeps a frame and the SP genuinely falls — then at the bottom
+   build an NLINKS chain rooted ONLY by this frame's own local and force ONE
+   collection from there.  Records saved_sp as seen at that depth BEFORE the
+   collection, and the count / from-start / alloc pointer / chain checksum
+   after it.  Returns D so no caller can tail-call this away."
+  (if (= d 0)
+      (let ((c (%gc-chain-build nlinks)))
+        (%gc-write64 (+ res 96) (%gc-meta-read (+ (%gc-region) #x28) k))
+        (%gc-collect-here)
+        (%gc-write64 (+ res 104) (%gc-meta-read (+ (%gc-region) #x20) k))
+        (%gc-write64 (+ res 112) (%gc-meta-read (%gc-region) k))
+        (%gc-write64 (+ res 120) (get-alloc-ptr))
+        (%gc-write64 (+ res 128) (%gc-chain-check c nlinks))
+        0)
+      (+ 1 (%gc-depth-descend (- d 1) nlinks res k))))
+
+(defun %gc-region-depth-selftest (nlinks depth)
+  "TWO forced collections of ONE carved region at DIFFERENT stack depths, the
+   second DEPTH frames DEEPER than the first.  See the block comment above for
+   what this catches and why one-call-site stress tests cannot catch it.
+   Returns the evidence block's address, or 0 if the active region is too small
+   to carve from.  The CALLER judges."
+  (let ((k (%gc-meta-scale))
+        (r0 (%gc-region)))
+    (let ((from0 (%gc-meta-read r0 k))
+          (to0   (%gc-meta-read (+ r0 #x08) k))
+          (size0 (%gc-meta-read (+ r0 #x10) k))
+          (sb    (%gc-meta-read (+ r0 #x18) k)))
+      (if (< size0 #x1000000)
+          0
+          (let* ((s (if (< size0 #x8000000) #x200000 #x1000000))
+                 (g s)
+                 (new0 (- size0 (+ s g)))
+                 (off1 (+ new0 g))
+                 (scratch (- (+ from0 off1) 8192))
+                 (rcb scratch)
+                 (res (+ scratch #x1000))
+                 (f1 (+ from0 off1))
+                 (t1 (+ to0 off1))
+                 (home 0))
+            (%gc-region-shrink r0 new0 k)
+            (%gc-region-init rcb f1 t1 s sb k)
+            (%gc-write64 res rcb)
+            (%gc-write64 (+ res 8) r0)
+            (%gc-write64 (+ res 16) k)
+            (%gc-write64 (+ res 24) f1)
+            (%gc-write64 (+ res 32) t1)
+            (%gc-write64 (+ res 40) new0)
+            (setq home (%gc-region-enter rcb))
+            ;; ---- COLLECTION #1, at THIS (shallow) depth ----
+            (%gc-write64 (+ res 64) (%gc-meta-read (+ rcb #x28) k))
+            (%gc-collect-here)
+            (%gc-write64 (+ res 72) (%gc-meta-read (+ rcb #x20) k))
+            (%gc-write64 (+ res 80) (%gc-meta-read (+ rcb #x28) k))
+            (%gc-write64 (+ res 88) (get-alloc-ptr))
+            ;; ---- COLLECTION #2, DEPTH frames DEEPER ----
+            (%gc-depth-descend depth nlinks res k)
+            (%gc-region-enter home)
+            (%gc-write64 (+ res 136) nlinks)
+            (%gc-write64 (+ res 144) depth)
+            (%gc-write64 (+ res 152) s)
+            res)))))

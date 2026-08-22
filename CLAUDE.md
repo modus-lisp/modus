@@ -689,12 +689,49 @@ spare — EBX/ESI/EDI are collector state, EBP is every loop's cursor, scan_word
 clobbers EAX/ECX/EDX) and hoists the three read-only fields out of it.  Both
 also grew stage 2's **parked-window branch**, which they never had: `saved_sp==0`
 = RUNNING (low end is the live SP), non-zero = PARKED and the window is capped
-by SIZE, not by an address.  And **aarch64's shim now writes the live SP into
-`+0x28` only when that field says RUNNING** — it used to write unconditionally,
-which would have clobbered a parked actor's recorded SP and silently dropped
-every root it held.  `%gc-collect`'s old absolute floor (`0x07200000`, one
-board's stack guard) is gone for the same reason, replaced by the same size cap
-translate-x64 has used since stage 2.
+by SIZE, not by an address.  `%gc-collect`'s old absolute floor (`0x07200000`,
+one board's stack guard) is gone for the same reason, replaced by the same size
+cap translate-x64 has used since stage 2.
+
+**A COLLECTOR ENTRY POINT THAT WRITES `+0x28` MUST PUT BACK WHAT IT FOUND.**
+aarch64's shim is the only one in the tree that writes the field at all
+(translate-x64 holds RBP, translate-i386 holds ESP, so both only read it), and
+it needs BOTH halves or it is wrong:
+- it must not write when the field says PARKED — that value is an actor's own
+  recorded SP, and **this case is reachable**, because `%gc-collect-here`
+  collects the ACTIVE region and the stage-1/2/3 selftests deliberately make a
+  region active *while parked* and collect it from there;
+- it must restore the original on the way out — nothing else ever clears the
+  field (`%gc-collect` reads it into a local and clamps the local), so a
+  conditional write with no restore leaves the first collection's live SP behind
+  **forever**, and the second collection scans `[SP-of-the-first, stack_base)`.
+  Stacks grow down, so a deeper second collection — the normal case, since GC
+  triggers from arbitrary allocation sites at arbitrary depths — gets a window
+  starting ABOVE its own live frames and misses all of them, the shim's own
+  232-byte register-save area included.
+
+All three variants were **measured on a bare-metal shim-path RPi image under
+QEMU** (`*aarch64-gc-native-mcgc*` NIL), with `test/region-gc-depth.lisp`'s
+probe (two forced collections of one carved region, the second 200 frames
+deeper, a 2000-link chain rooted only by the deep frame's local) and the stage-2
+parked test:
+
+| shim behaviour | `saved_sp` after GC #1 | live bytes after the DEEP GC #2 | parked chain A forwarded? | parked slot → new / old space |
+|---|---|---|---|---|
+| conditional write, no restore | `0x07FFE028` stale | **16** ✗ | 1 ✓ | 1 / 0 ✓ |
+| unconditional write (the pre-stage-3 shape) | `0x07FFE028` stale | 32016 ✓ | **0** ✗ | **0 / 1** ✗ |
+| **write-if-RUNNING + restore (shipped)** | **0** ✓ | **32016** ✓ | 1 ✓ | 1 / 0 ✓ |
+
+Correct answer for live bytes is `16*2000+16 = 32016`; `16` means the whole
+chain was never copied.  The unconditional row also prints `%gc-collect`'s
+**`S`** marker (stack-scan skipped): clobbering the parked SP with the live one
+inverts the window, so it collapses to empty.  Only the third row is correct on
+both axes — reverting the guard is *not* an equivalent fix.
+
+`./modus --script test/region-gc-depth.lisp` (7 checks) is that regression, and
+it is portable: it passes on x64 and on the aarch64 NATIVE arm by construction
+(neither writes the field), so it is a guard there and the real subject on the
+shim path.
 
 Acceptance: `./modus --script test/region-gc-actors.lisp` (53 checks).  Three
 actor structs in the carved guard band, in `net/actors.lisp`'s own layout; actor

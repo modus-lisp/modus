@@ -906,8 +906,32 @@
 ;; engine of the four legacy fork builds ONLY.  If %e2ic-compile ever fails on
 ;; a new shape it signals honestly (UNDEFINED-FUNCTION via the NIL fn sentinel).
 
+;;; ============================================================
+;;; HOSTED ACTORS (x86-64) — net/actors.lisp's arch adapter
+;;; ============================================================
+;;;
+;;; net/actors.lisp is architecture-independent but has only ever been linked
+;;; into BARE-METAL images, because its twelve address hooks were only ever
+;;; supplied by a board file handing out fixed physical addresses.  A hosted
+;;; process has no such RAM, so net/hosted-actors.lisp derives the same
+;;; addresses by SHRINKING REGION 0 and using the top of the semispaces that
+;;; frees — the same carve mvm/gc.lisp's stage-1/2/3 selftests already use.
+;;;
+;;; x64 ONLY, and hosted only.  aarch64's per-CPU storage is TPIDR_EL1 (a
+;;; system register the kernel does not let userspace write) rather than a GS
+;;; base an ordinary arch_prctl can set, so the aarch64 CLI gets "" here and
+;;; its blob is byte-identical to before.  Bare-metal targets already have a
+;;; board file and do not want this one.
+(defvar *cli-hosted-actors-source*
+  (if (and (eq *cli-arch* :x64) (not *cli-bare-metal*))
+      (concatenate 'string (string #\Newline)
+                   (mvm-text "net/hosted-actors.lisp")
+                   (string #\Newline))
+      ""))
+
 (format t "  prelude: ~D chars~%" (length *prelude-source*))
 (format t "  gc:      ~D chars~%" (length *gc-source*))
+(format t "  hosted-actors: ~D chars~%" (length *cli-hosted-actors-source*))
 (format t "  rt:      ~D chars~%" (length *rt-source*))
 (format t "  rtest:   ~D chars~%" (length *rtest-pkg-source*))
 (format t "  bridge:  ~D chars~%" (length *bridge-source*))
@@ -1277,6 +1301,10 @@
                        *rt-macros-source* (string #\Newline)
                        *bridge-source*   (string #\Newline)
                        *cli-arch-override-source*
+                       ;; HOSTED ACTORS: "" on aarch64 and on bare metal, so
+                       ;; their scanner input — hence SFT-AUTO and
+                       ;; SYM-NAME-AUTO — is byte-identical to before.
+                       *cli-hosted-actors-source*
                        ;; BARE-METAL NET SEAM, second use site.  The scanners
                        ;; below are what put a defun in *SYMBOL-FUNCTION-TABLE*
                        ;; and a token in *SYM-NAME-TABLE*; a bare-metal target's
@@ -1520,6 +1548,12 @@
     ;; override cl-fileio.lisp and lib/cli-toplevel.lisp, both baked inside it).
     ;; "" on x64.
     *cli-arch-override-source*
+    ;; HOSTED ACTORS (x86-64 hosted only; "" elsewhere).  POSITION IS
+    ;; LOAD-BEARING: after mvm/gc.lisp (whose %gc-region-* / %gc-read64 it
+    ;; calls — a forward reference across the blob does not resolve) and after
+    ;; the CL bridge (whose CONS/CAR/CONSP it uses), and before the compiler so
+    ;; nothing here can shadow a compiler internal.
+    *cli-hosted-actors-source*
     ;; STAGE 1: MVM ISA constants/structs + bytecode interpreter.
     *isa-source*
     (string #\Newline)

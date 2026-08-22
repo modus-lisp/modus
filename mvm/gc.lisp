@@ -1065,16 +1065,21 @@
 ;;;
 ;;; WHY THE SP IS AN ARGUMENT RATHER THAN SOMETHING THIS FILE READS.  gc.lisp is
 ;;; compiled by Modus's own compiler from text, and there is no MVM primitive
-;;; that yields the stack pointer as a VALUE on every target — :save-ctx comes
-;;; closest and translate-x64 does not implement it at all.  The value is not
-;;; missing, though: it exists at the one place that needs it.  net/actors.lisp's
-;;; YIELD calls (save-context (+ cur-addr #x08)), which writes the outgoing
-;;; actor's SP into its struct at +0x08, so a region-owning context switch has
-;;; the number in hand and passes it here.  Stage 3, where an actor's region
-;;; block lives in that same struct beside obj-alloc/obj-limit at +0x70/+0x78,
-;;; is where that call site gets written; today nothing in net/actors.lisp owns
-;;; a region (all actors bump-allocate inside region 0), so the only caller is
-;;; the acceptance harness below.
+;;; that yields the stack pointer as a VALUE.  :save-ctx comes closest — it
+;;; DEPOSITS the SP in a save area rather than returning it — and it is
+;;; implemented on every target that has actors, x64 INCLUDED (translate-x64.lisp
+;;; +op-save-ctx+ / +op-restore-ctx+: a real setjmp/longjmp over RSP/RBX/RBP plus
+;;; a continuation RIP).  An earlier revision of this comment claimed x64 did not
+;;; implement it at all; that was never true of the code and is now measured
+;;; false — test/hosted-ctx-switch.lisp drives 200 coroutine round trips through
+;;; those two opcodes on hosted x86-64.
+;;;
+;;; The value is not missing, then: it exists at the one place that needs it.
+;;; net/actors.lisp's YIELD calls (save-context (+ cur-addr #x08)), which writes
+;;; the outgoing actor's SP into its struct at +0x08, so a region-owning context
+;;; switch has the number in hand and passes it here.  Stage 3, where an actor's
+;;; region block lives in that same struct beside obj-alloc/obj-limit at
+;;; +0x70/+0x78, is where that call site got written.
 
 (defun %gc-region-park (rcb sp)
   "Record SP as RCB's parked root-window low end: RCB's actor is NOT running,

@@ -40,16 +40,16 @@
 ;;;; 0x1000xxxx runtime slot are unchanged.  Only the way those VAs come to
 ;;;; exist differs (identity + MMU-off here, page tables there).
 ;;;;
-;;;; MMU IS OFF.  With SCTLR_EL1.M clear every access is Device-nGnRnE:
-;;;; correct but uncached.  Under QEMU/TCG that costs nothing measurable (TCG
-;;;; models no caches).  On real silicon it would be brutally slow and is the
-;;;; first thing to fix in rung 2 — an identity 2-level table with
-;;;; Normal-WB for 0x00000000-0x3EFFFFFF and Device for 0x3F000000+.  Two
-;;;; further consequences worth knowing: unaligned accesses fault (Modus is
-;;;; naturally aligned, and the legacy `:rpi' images have run MMU-off on this
-;;;; board for a long time), and load/store-exclusive is UNPREDICTABLE on
-;;;; Device memory (no actors here, so *aarch64-sched-lock-addr* is NIL and
-;;;; the translator emits none).
+;;;; MMU IS ON — ON OUR TERMS (rung-2-lite, #275).  The preamble first
+;;;; SANITIZES whatever the loader left (U-Boot's `go' hands over with its
+;;;; own MMU + dirty dcache live — the root cause of a long stale-DMA saga),
+;;;; then installs an identity 2-level table: Normal-WB for RAM, Device for
+;;;; the 2MB USB DMA window at 0x11000000 and for the peripherals at
+;;;; 0x3F000000+.  CPU data runs cached; the DWC2's DMA window is uncached
+;;;; on both sides (CPU: Device attribute; core: the 0xC0000000 VC alias),
+;;;; so DMA coherence holds with NO per-transfer cache maintenance.  A
+;;;; hypothetical non-EL2 entry skips the enable and stays uncached-correct.
+;;;; Load/store-exclusive remains unused (*aarch64-sched-lock-addr* is NIL).
 ;;;;
 ;;;; SERIAL IS PL011 (UART0, 0x3F201000), NOT the mini UART.  This is forced,
 ;;;; not preferred: `read-char-serial' (TRAP #x0301) is hardcoded to the PL011
@@ -327,6 +327,79 @@
     (emit-aarch64-u32 buf #x8A2B014A)              ; bic x10, x10, x11
     (emit-aarch64-u32 buf #xD518100A)              ; msr sctlr_el1, x10
     (emit-aarch64-u32 buf #xD5033F9F)              ; dsb sy
+    (emit-aarch64-u32 buf #xD5033FDF)              ; isb
+
+    ;; --- -0.5. IDENTITY PAGE TABLE + MMU ON (rung-2-lite, #275) -----------
+    ;; Running truly uncached (the sanitize step above) costs ~25x on every
+    ;; data access — boot-to-banner went from ~45s to ~20min.  Turn the MMU
+    ;; back on, ON OUR TERMS: an identity map with RAM Normal-Write-Back
+    ;; (cached) and exactly two Device holes, so DMA coherence needs no
+    ;; per-transfer cache maintenance:
+    ;;   0x00000000-0x10FFFFFF  Normal-WB   image, stack, heap, metadata
+    ;;   0x11000000-0x111FFFFF  Device      the USB DMA window (dwc2 buffers
+    ;;                                      + usb-state; the DWC2 reads/writes
+    ;;                                      it via the uncached VC alias)
+    ;;   0x11200000-0x3EFFFFFF  Normal-WB
+    ;;   0x3F000000-0x3FFFFFFF  Device      BCM peripherals
+    ;;   above 1GB              unmapped    (only L1[0] is valid)
+    ;; L1 @ 0x70000, L2 @ 0x71000 (512 x 2MB blocks) — below both load
+    ;; addresses (SD 0x80000, netboot 0x300000), above the firmware pages.
+    ;; Tables are written while caches are OFF, so the walker sees them
+    ;; directly.  Enable is EL2-only (both boot paths enter at EL2); a
+    ;; hypothetical EL1 entry just stays uncached-correct.
+    ;; Zero the L1 page (only entry 0 becomes valid).
+    (emit-aarch64-load-imm64 buf x16 #x70000)
+    (emit-aarch64-load-imm64 buf x17 #x71000)
+    (let ((z (a64-current-index buf)))
+      (a64-stur buf +a64-xzr+ x16 0)
+      (a64-add-imm buf x16 x16 8)
+      (a64-cmp-reg buf x16 x17)
+      (a64-bcond buf #b0011 (- z (a64-current-index buf))))
+    ;; L1[0] = L2 | 3 (table descriptor)
+    (emit-aarch64-load-imm64 buf 12 #x70000)
+    (emit-aarch64-load-imm64 buf 15 #x71003)
+    (a64-stur buf 15 12 0)
+    ;; Fill L2: entry = pa | attrs.  pa is 2MB-aligned and attrs < 0x800, so
+    ;; ADD == OR.  0x701 = AF | SH=inner | AttrIdx0(Normal-WB) | block.
+    ;; 0x405 = AF | AttrIdx1(Device-nGnRnE) | block.
+    (emit-aarch64-load-imm64 buf 13 #x71000)       ; walker
+    (emit-aarch64-load-imm64 buf 8  #x72000)       ; end
+    (emit-aarch64-load-imm64 buf 14 0)             ; pa
+    (emit-aarch64-load-imm64 buf 11 #x200000)      ; block size
+    (emit-aarch64-load-imm64 buf 9  #x11000000)    ; USB DMA window
+    (emit-aarch64-load-imm64 buf 10 #x3F000000)    ; peripherals
+    (let ((fill (a64-current-index buf)))
+      (a64-add-imm buf 15 14 #x701)
+      (a64-cmp-reg buf 14 9)
+      (a64-bcond buf #b0001 2)                     ; b.ne +2
+      (a64-add-imm buf 15 14 #x405)
+      (a64-cmp-reg buf 14 10)
+      (a64-bcond buf #b0011 2)                     ; b.lo +2
+      (a64-add-imm buf 15 14 #x405)
+      (a64-stur buf 15 13 0)
+      (a64-add-imm buf 13 13 8)
+      (emit-aarch64-u32 buf #x8B0B01CE)            ; add x14, x14, x11
+      (a64-cmp-reg buf 13 8)
+      (a64-bcond buf #b0011 (- fill (a64-current-index buf))))
+    ;; MAIR: attr0 = 0xFF (Normal WB R/W-allocate), attr1 = 0x00 (Device-
+    ;; nGnRnE).  TCR_EL2 0x80803520 = RES1 | T0SZ=32 (4GB VA, start L1,
+    ;; 4KB granule) | IRGN0=ORGN0=WB-WA | SH0=inner | PS=4GB.
+    (emit-aarch64-u32 buf #xD5033F9F)              ; dsb sy — tables visible
+    (emit-aarch64-load-imm64 buf 15 #xFF)
+    (emit-aarch64-u32 buf #xD51CA20F)              ; msr mair_el2, x15
+    (emit-aarch64-load-imm64 buf 15 #x80803520)
+    (emit-aarch64-u32 buf #xD51C204F)              ; msr tcr_el2, x15
+    (emit-aarch64-u32 buf #xD51C200C)              ; msr ttbr0_el2, x12
+    (emit-aarch64-u32 buf #xD50C871F)              ; tlbi alle2
+    (emit-aarch64-u32 buf #xD5033F9F)              ; dsb sy
+    (emit-aarch64-u32 buf #xD5033FDF)              ; isb
+    (emit-aarch64-u32 buf #xD5384249)              ; mrs x9, CurrentEL
+    (emit-aarch64-u32 buf #xF100213F)              ; cmp x9, #8
+    (a64-bcond buf #b0001 6)                       ; b.ne +6 — enable EL2 only
+    (emit-aarch64-u32 buf #xD53C100A)              ; mrs x10, sctlr_el2
+    (emit-aarch64-u32 buf #xD28200AB)              ; movz x11, #0x1005 (M|C|I)
+    (emit-aarch64-u32 buf #xAA0B014A)              ; orr x10, x10, x11
+    (emit-aarch64-u32 buf #xD51C100A)              ; msr sctlr_el2, x10
     (emit-aarch64-u32 buf #xD5033FDF)              ; isb
 
     ;; --- 0. ZERO THE RUNTIME METADATA WINDOW (the BSS stand-in) -----------

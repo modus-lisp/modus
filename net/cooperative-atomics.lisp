@@ -56,6 +56,64 @@
 ;;;; "it worked before"; the guarantee is structural, and the structure is
 ;;;; what changes.
 ;;;;
+;;;; =====================================================================
+;;;; STATUS AS OF NATIVE THREADS (2026-08-22): **UNUSABLE UNDER SMP.**
+;;;; THIS FILE IS NO LONGER SAFE IN A PROCESS THAT HAS STARTED A THREAD.
+;;;; =====================================================================
+;;;;
+;;;; The falsification the three facts below were written to wait for HAS
+;;;; HAPPENED.  Hosted x86-64 now runs REAL OS THREADS: clone(2) with
+;;;; CLONE_VM|CLONE_THREAD and an mmap'd stack (translate-x64 TRAP #x0540,
+;;;; net/hosted-actors-post.lisp %HA-SPAWN-T2), a REAL scheduler spinlock on
+;;;; +OP-ATOMIC-XCHG+ released by +OP-RESTORE-CTX+, a per-thread GS base, a
+;;;; per-thread active GC region, and the actor system driven from two threads
+;;;; at once with messages crossing between them (test/hosted-threads.lisp,
+;;;; test/hosted-thread-regions.lisp, test/hosted-thread-actors.lisp,
+;;;; test/hosted-thread-gc.lisp).
+;;;;
+;;;; EXACTLY WHAT BROKE, fact by fact — and note that NONE of the three was
+;;;; wrong; all three were arguments about ONE CPU, and there are now two:
+;;;;
+;;;;   (1) "no yield point inside the sequence" still holds — compile-loop is
+;;;;       still the only (emit-ir :yield) site and none of the expansions below
+;;;;       contains a LOOP — and it is now INSUFFICIENT.  It bounded what THIS
+;;;;       CPU could do between the read and the write.  A second CPU executing
+;;;;       the same read-modify-write needs no yield point to lose an update: it
+;;;;       simply reads the same old value and writes over the other's result.
+;;;;
+;;;;   (2) "nothing preempts a running actor" still holds and is now equally
+;;;;       insufficient, for the same reason: a second thread does not have to
+;;;;       preempt anything to run at the same time.
+;;;;
+;;;;   (3) "no signal handler can touch the place" still holds — the only
+;;;;       handlers are the synchronous fault ones, and CLONE_SIGHAND shares
+;;;;       them rather than adding any — and is likewise a single-CPU argument.
+;;;;
+;;;; SO: %ATOMIC-CAS, %ATOMIC-INCF and %ATOMIC-DECF below are PLAIN
+;;;; READ-MODIFY-WRITE SEQUENCES WITH NO ATOMICITY AT ALL once a second thread
+;;;; exists.  They are not merely "not proven safe"; they are known-racy.  This
+;;;; file is still wired into no build script, and it MUST NOT BE WIRED INTO ONE
+;;;; that starts a thread.
+;;;;
+;;;; WHY THEY WERE NOT SIMPLY REWRITTEN ON +OP-ATOMIC-XCHG+.  The MVM has
+;;;; exactly one atomic primitive, XCHG-MEM — an UNCONDITIONAL exchange at a raw
+;;;; ADDRESS.  Neither half of that fits:
+;;;;   - an unconditional exchange is not a compare-and-swap and cannot be made
+;;;;     into one without a loop, and a CAS loop needs a CAS;
+;;;;   - PLACE here is an arbitrary CL place (a cons car, a struct slot, a
+;;;;     special), not an address, so there is nothing to hand XCHG-MEM anyway.
+;;;;
+;;;; THE TWO REAL FIXES, so the next reader does not have to re-derive them:
+;;;;   (a) ADD A CAS OPCODE.  x86 LOCK CMPXCHG, aarch64 LDAXR/STLXR, riscv
+;;;;       LR/SC, ppc LWARX/STWCX — the ISAs all have it; the MVM does not.
+;;;;       That plus an address-of for the place is the lock-free answer.
+;;;;   (b) TAKE A LOCK.  net/actors.lisp's SPIN-LOCK on XCHG-MEM is real now, so
+;;;;       wrapping each sequence in acquire/release at one dedicated word is a
+;;;;       CORRECT (coarse) implementation today — provided EVERY mutator of
+;;;;       those places goes through these macros, which is a property of the
+;;;;       consumer, not of this file.  Note the word must not be the SCHEDULER
+;;;;       lock: +OP-RESTORE-CTX+ zeroes that one on every context switch.
+;;;;
 ;;;; ---- WHAT PER-REGION GC STAGE 3 CHANGED HERE (2026-08-22) ----
 ;;;;
 ;;;; Stage 3 of per-region GC (mvm/gc.lisp; CLAUDE.md "Per-region GC, stage 3")
@@ -95,11 +153,16 @@
 ;;;; THIS CPU; another core executing the same read-modify-write concurrently
 ;;;; needs no yield point to lose an update.  Facts 2 and 3 are equally
 ;;;; single-core arguments.  So: PER-ACTOR SMP AND THESE MACROS CANNOT SHIP
-;;;; TOGETHER UNCHANGED.  Whoever enables the second CPU owns replacing every
-;;;; COOPERATIVE-ATOMIC-PRECONDITION site below with a real atomic (x86 LOCK
-;;;; CMPXCHG / XADD, aarch64 LDAXR/STLXR, riscv LR/SC, ppc LWARX/STWCX) — the
-;;;; MVM already has :xchg-mem, which net/actors.lisp's SPIN-LOCK uses, so the
-;;;; ISA is not the obstacle.
+;;;; TOGETHER UNCHANGED.
+;;;;
+;;;; **THAT MOMENT ARRIVED.**  The per-CPU active-region cell is ON in the
+;;;; hosted x86-64 CLI and a second OS THREAD runs Modus code beside the first.
+;;;; See the UNUSABLE UNDER SMP block at the top of this header, which is the
+;;;; current status; everything from here down is the record of how it got
+;;;; there.  The remark that "the MVM already has :xchg-mem, so the ISA is not
+;;;; the obstacle" was too optimistic and is corrected up there: XCHG-MEM is an
+;;;; UNCONDITIONAL exchange at a raw ADDRESS, which is neither a CAS nor
+;;;; applicable to an arbitrary CL place.
 ;;;; ---------------------------------------------------------------------
 ;;;;
 ;;;; SEMANTICS
@@ -152,7 +215,11 @@
 ;;;; merged as e4d26a8.
 ;;;; ---------------------------------------------------------------------
 
-;;; COOPERATIVE-ATOMIC-PRECONDITION: no LOOP => no YIELD => no interleaving.
+;;; COOPERATIVE-ATOMIC-PRECONDITION: **FALSIFIED — SMP.**  No LOOP still means
+;;; no YIELD, which still means no interleaving BY THIS CPU.  It has meant
+;;; nothing about a second thread since native threads landed, and there are now
+;;; two on hosted x86-64.  This expansion is a plain read-modify-write and it
+;;; loses updates.  See the UNUSABLE UNDER SMP block in the header.
 (defmacro %atomic-cas (place old new)
   (let ((o (gensym "OLD")) (n (gensym "NEW")))
     `(let ((,o ,old) (,n ,new))
@@ -160,12 +227,20 @@
            (progn (setf ,place ,n) t)
            nil))))
 
-;;; COOPERATIVE-ATOMIC-PRECONDITION: no LOOP => no YIELD => no interleaving.
+;;; COOPERATIVE-ATOMIC-PRECONDITION: **FALSIFIED — SMP.**  No LOOP still means
+;;; no YIELD, which still means no interleaving BY THIS CPU.  It has meant
+;;; nothing about a second thread since native threads landed, and there are now
+;;; two on hosted x86-64.  This expansion is a plain read-modify-write and it
+;;; loses updates.  See the UNUSABLE UNDER SMP block in the header.
 (defmacro %atomic-incf (place &optional (delta 1))
   (let ((d (gensym "D")))
     `(let ((,d ,delta)) (setf ,place (+ ,place ,d)))))
 
-;;; COOPERATIVE-ATOMIC-PRECONDITION: no LOOP => no YIELD => no interleaving.
+;;; COOPERATIVE-ATOMIC-PRECONDITION: **FALSIFIED — SMP.**  No LOOP still means
+;;; no YIELD, which still means no interleaving BY THIS CPU.  It has meant
+;;; nothing about a second thread since native threads landed, and there are now
+;;; two on hosted x86-64.  This expansion is a plain read-modify-write and it
+;;; loses updates.  See the UNUSABLE UNDER SMP block in the header.
 (defmacro %atomic-decf (place &optional (delta 1))
   (let ((d (gensym "D")))
     `(let ((,d ,delta)) (setf ,place (- ,place ,d)))))

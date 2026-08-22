@@ -442,6 +442,22 @@
     (if (zerop r) (percpu-set 16 cpu) 0)
     r))
 
+(defun %ha-thread-park-region (rcb k)
+  "Record THIS thread's allocation pointer and limit in RCB — the PARK half of
+   %GC-REGION-ENTER without the load half, for a thread that is about to exit or
+   is about to be audited from outside.
+
+   IT IS WHAT MAKES `THE OTHER THREAD\'S HEAP IS UNTOUCHED\' A REAL CHECK.  A
+   region\'s +0x30 holds its parked allocation frontier, and until something
+   parks it, it still holds what %GC-REGION-INIT left there: the from-space
+   START.  So `[from, parked-alloc)\' — the span every checksum and every
+   foreign-reference sweep uses as `this region\'s live heap\' — is EMPTY, and a
+   checksum over an empty range is a check that can only ever answer 0.
+   Measured: without this the step-5 heap checksum was 0 -> 0."
+  (%gc-meta-write (+ rcb #x30) (get-alloc-ptr) k)
+  (%gc-meta-write (+ rcb #x38) (get-alloc-limit) k)
+  0)
+
 (defun %ha-thread-adopt-region (rcb k)
   "Make RCB this THREAD's active region and load its allocation pointer/limit,
    WITHOUT parking whatever the cell named before.
@@ -1227,6 +1243,63 @@
 
 (defun %ha-mt-stop-p (tb) (if (zerop (%gc-read64 (+ tb #x440))) nil t))
 
+;;; ============================================================
+;;; THE GLOBAL COLLECTION LOCK — AN EXPLICIT PLACEHOLDER
+;;; ============================================================
+;;;
+;;; THE COLLECTOR IS NOT REENTRANT.  Two threads collecting at the same time
+;;; corrupt each other, and not subtly.  Three fixed, SHARED addresses carry
+;;; per-collection working state, one word each, with no per-region or
+;;; per-thread copy anywhere:
+;;;
+;;;   0x10000100  the scratch word %GC-FORWARD-SLOT / %GC-STORE-TAGGED /
+;;;               %GC-MOVE-WORD use ONCE PER FORWARDED SLOT
+;;;   0x10000108  tmp-free, the copying allocator's next free pointer
+;;;   0x10000110  to-end, the bound %GC-COPY-OBJECT's overrun guard reads
+;;;
+;;; And separately: %GC-SCAN-GLOBALS forwards a SHARED ROOT SET — the globals
+;;; alist, the symbol / keyword / package intern tables, the multiple-value
+;;; extras — which EVERY region scans, and forwarding REWRITES those slots.  Two
+;;; collections running at once would each rewrite the other's roots.
+;;;
+;;; SO EVERY COLLECTION IS SERIALIZED HERE, behind one lock, taken around the
+;;; WHOLE of the collection.  This is a PLACEHOLDER and it is meant to be
+;;; deleted: making the collector reentrant — per-region or per-thread scratch
+;;; words, and a globals root set that is scanned without a data race — is a
+;;; dedicated pass that comes AFTER threads land.  When it does, this lock is
+;;; what it removes, and the three addresses and the globals root set named
+;;; above are exactly the reasons it exists.
+;;;
+;;; WHAT IT IS NOT.  It is not a substitute for that pass: threads still block
+;;; each other for the whole of a collection, so this buys correctness, not
+;;; parallelism.  And it is deliberately NOT the scheduler lock: +OP-RESTORE-CTX+
+;;; zeroes the scheduler lock on every context switch, so a collection lock
+;;; sharing that word would be released by any switch that happened to run.
+;;;
+;;; The word is the band's +0x108 — one of the three the scheduler lock used to
+;;; occupy before it moved to the BSS in step 1, and zeroed by %HA-CARVE.
+(defun %ha-collect-lock-addr () (+ (%ha-base) #x108))
+
+(defun %ha-locked-collect-here ()
+  "%GC-COLLECT-HERE with the global collection lock held around the WHOLE
+   collection.  %GC-COLLECT-HERE pulls the allocation limit down to the pointer
+   and then allocates, so the collector runs INSIDE this call — which is what
+   makes wrapping it sufficient."
+  (spin-lock (%ha-collect-lock-addr))
+  (%gc-collect-here)
+  (spin-unlock (%ha-collect-lock-addr))
+  0)
+
+;;; THE HAND-BACK.  A worker that has finished and been told to stop returns the
+;;; THREAD it is standing on to that thread's own scheduler, by RESTORE-CONTEXT
+;;; into the save area the scheduler wrote before it ever entered an actor.
+;;; Only the thread-2 scheduler has such an area, so an actor does this only
+;;; while it is running on cpu 1; on cpu 0 it just keeps yielding, and thread 1's
+;;; driver is the one that ends the run.
+;;;
+;;; THE LOCK IS TAKEN FOR THE SWITCH, NOT FOR THE QUEUE.  +OP-RESTORE-CTX+
+;;; zeroes the scheduler lock unconditionally, so issuing one without holding it
+;;; would release a lock the OTHER thread owns.
 (defun %ha-mt-park (tb)
   (loop
     (%ha-cpu-tick tb #x448)
@@ -1264,8 +1337,13 @@
             (progn
               (if (= (%ha-msg-ok m i) 1) 0 (%ha-tb-bump tb #x488))
               (if (> nl 0)
-                  (if (= (%gc-chain-check chain nl) want)
-                      0 (%ha-tb-bump tb #x508))
+                  (progn
+                    (%ha-locked-collect-here)
+                    (%ha-tb-bump tb #x520)
+                    (if (= (%gc-chain-check chain nl) want)
+                        0 (%ha-tb-bump tb #x508))
+                    ;; The message must have moved with the rest of the region.
+                    (if (= (%ha-msg-ok m i) 1) 0 (%ha-tb-bump tb #x488)))
                   0)
               (send 3 m)
               (%gc-write64 (+ tb #x478) i)
@@ -1386,6 +1464,9 @@
                (%ha-t2-dispatch tb budget))
         0)
     (%gc-write64 (+ tb #x4B0) (if (zerop r) 0 1))
+    ;; PARK THIS THREAD'S ALLOCATION FRONTIER before it disappears, so that
+    ;; `this region's live heap' is a real span for whoever audits it next.
+    (%ha-thread-park-region (%gc-read64 (+ tb #x4D0)) (%gc-read64 (+ tb #x340)))
     (%gc-write64 (+ tb #x4E0) (%ha-my-gc-count))
     (%gc-write64 (+ tb #xA0) (get-alloc-ptr))
     (%gc-write64 (+ tb #x58) 1)
@@ -1442,7 +1523,10 @@
       (when (> i n) (return 0))
       (send ida (cons i (cons (* i 7) (+ i 1000))))
       (if (> nl 0)
-          (if (= (%gc-chain-check chain nl) want) 0 (%ha-tb-bump tb #x530))
+          (progn
+            (%ha-locked-collect-here)
+            (%ha-tb-bump tb #x528)
+            (if (= (%gc-chain-check chain nl) want) 0 (%ha-tb-bump tb #x530)))
           0)
       (setq i (+ i 1)))
     0))
@@ -1465,7 +1549,7 @@
              ;; that can only answer 0 is not a check.
              (tref r0)
              (k 0) (mode0 0) (ida 0) (idb 0) (tid 0) (got 0)
-             (a0 0) (g0 0) (g3a 0) (g2a 0)
+             (a0 0) (g0 0) (sum3 0) (sum3c 0) (g3a 0) (g2a 0)
              (ctl (+ band #x300)))
         (%ha-zero tb (+ tb #x600))
         (%ha-zero res (+ res #x300))
@@ -1519,8 +1603,34 @@
               ;; ---- tell the workers to stop, and wait for the thread ----
               (%gc-write64 (+ tb #x440) 1)
               (%gc-write64 (+ res #x00) (%ha-join-t2 budget))
+              ;; Park OUR frontier too, for the same reason thread 2 parked
+              ;; its own: every sweep below spans [from, parked-alloc).
+              (%ha-thread-park-region tref k)
+              ;; ================= PHASE 2: THE SEQUENTIAL AUDIT ==========
+              ;; "The other thread's region is untouched" cannot be measured
+              ;; WHILE the other thread is collecting it — the checksum is
+              ;; supposed to move then.  So it is measured HERE, after the join,
+              ;; when thread 2 is gone and this thread is the only one running:
+              ;; checksum thread 2's live heap and its control block, collect
+              ;; THIS thread's region twice, and checksum them again.
               (setq g3a (%gc-meta-read (+ rcb3 #x20) k))
               (setq g2a (%gc-meta-read (+ tref #x20) k))
+              (setq sum3 (%gc-sum-range (%gc-meta-read rcb3 k)
+                                        (%gc-meta-read (+ rcb3 #x30) k)))
+              (setq sum3c (%gc-sum-range rcb3 (+ rcb3 #x40)))
+              (%gc-write64 (+ res #x1D0) sum3)
+              (%gc-write64 (+ res #x1E0) sum3c)
+              (%gc-write64 (+ res #x1F0) g3a)
+              (%gc-write64 (+ res #x200) g2a)
+              (if (> nlinks 0)
+                  (progn (%ha-locked-collect-here) (%ha-locked-collect-here))
+                  0)
+              (%gc-write64 (+ res #x1D8)
+                           (%gc-sum-range (%gc-meta-read rcb3 k)
+                                          (%gc-meta-read (+ rcb3 #x30) k)))
+              (%gc-write64 (+ res #x1E8) (%gc-sum-range rcb3 (+ rcb3 #x40)))
+              (%gc-write64 (+ res #x1F8) (%gc-meta-read (+ rcb3 #x20) k))
+              (%gc-write64 (+ res #x208) (%gc-meta-read (+ tref #x20) k))
               (%gc-write64 (+ res #x08) tid)
               (%gc-write64 (+ res #x10) ida)
               (%gc-write64 (+ res #x18) idb)

@@ -760,6 +760,117 @@ image runs native threads.  The macros did not become safe either.  The header
 now says so, and says the thing that matters: **fact 1 bounds only THIS CPU**, so
 per-actor SMP and those macros cannot ship together unchanged.
 
+### Per-region GC, stage 3 ON HOSTED x64: the actors are REAL (7af5212 … 7c25356)
+
+Stage 3 wired `%GC-REGION-SWITCH` into `net/actors.lisp`'s `YIELD` and
+`RECEIVE`, and **those call sites had never executed**, because that file is
+bare-metal-only and is in no hosted image.  It is now linked into `./modus`, so
+on the one target runnable here the mechanism is driven by an actual scheduler
+instead of a harness standing in for one.  Four steps, four tests, all on
+hosted x86-64:
+
+| test | what it is the first execution of |
+|---|---|
+| `test/hosted-ctx-switch.lisp` (12) | `+op-save-ctx+` / `+op-restore-ctx+` on x64 |
+| `test/hosted-percpu.lisp` (19) | `PERCPU-REF`/`-SET` (`GS:[disp32]`) in a Linux process |
+| `test/hosted-actors.lisp` (20) | spawn / yield / send / receive / term serialisation |
+| `test/hosted-actor-regions.lisp` (48) | a NON-ZERO actor `+0x68`, i.e. stage 3 for real |
+
+**`translate-x64` DOES implement save-ctx/restore-ctx and always did** — `gc.lisp`
+used to claim otherwise; the comment is fixed.  It works unmodified: 200
+coroutine round trips, both sides progressing, locals intact.  It saves
+RSP/RBX/RBP + a continuation and NOTHING else — not V0-V3/V5-V8, which
+aarch64's equivalent pushes — and that is sound only because the compiler keeps
+let-bound locals in FRAME SLOTS, on the stack RSP restores.  The test holds a
+sentinel fixnum AND a heap cons across every switch to make that a measurement.
+
+**Memory comes from the heap, not from an invented address.**  A hosted process
+owns no fixed RAM, so `net/hosted-actors.lisp` derives all twelve address hooks
+by `%GC-REGION-SHRINK`ing region 0 by 48 MB — the same carve gc.lisp's selftests
+use — and laying the actor table, mailbox pool, staging buffers, per-CPU block
+and 64 KB actor stacks out in the freed top of the semispaces.
+
+**Per-CPU storage is `arch_prctl(ARCH_SET_GS)`, syscall 158.**  Not a
+plain-memory override: `PERCPU-REF`/`PERCPU-SET` are COMPILER INTRINSICS
+(op-name hash dispatch), so no `defun` can shadow them and overriding would mean
+editing every percpu call site in the file under test.  The test cross-checks
+every slot through `%GC-READ64`, which does not go through GS, so it cannot pass
+on a segment base pointing somewhere else.  ***`*X64-GC-REGION-PERCPU*` IS STILL
+OFF*** — a GS base is a NECESSARY condition for that flag, not the same
+decision.
+
+**Three things the port needed, each an arch fact:**
+- **`WRITE-BYTE` HAS TWO INCOMPATIBLE MEANINGS** — a board's ONE-argument console
+  byte vs ANSI's `(write-byte byte stream)`.  `net/actors.lisp`'s three progress
+  markers now use `WRITE-CHAR-SERIAL` (MVM trap `#x0300`, present on every
+  target).  This is the ONLY edit to that file.
+- **`SPIN-LOCK`/`SPIN-UNLOCK` MUST BE NO-OPS ON x64**, and not merely because one
+  core needs no lock: `net/actors.lisp` hands the RELEASE to `RESTORE-CONTEXT`,
+  which aarch64's `+op-restore-ctx+` does (via `*AARCH64-SCHED-LOCK-ADDR*`) and
+  **translate-x64's does not** — so a real lock would stay held across every
+  switch and the next `SPIN-LOCK` would spin forever.  Open follow-up.
+- **`AP-SCHEDULER` is overridden**: the bare-metal one uses trap `#x0400`
+  (translate-x64 does not decode it — falls through to a real `INT 0x30`) then
+  CLI / STI+HLT.  Hosted, an empty run queue is a DEADLOCK, not an idle CPU, so
+  it counts the event and returns; every test asserts the count is 0.
+
+**A NIL-TERMINATED LIST CANNOT BE SENT** by `TERM-SIZE`/`TERM-ENCODE` in a hosted
+image.  They open with `(zerop val)`, which spots the end of a list on bare
+metal WHERE NIL IS ZERO; hosted, NIL is the immediate `#xDEAD0001`, all three of
+`zerop`/`consp`/`numberp` are false, and it falls through to `SOFT-SUBTAG`,
+which dereferences it.  Dotted pairs of non-zero fixnums work and exercise the
+same cons path.  Fixing the general case changes `net/actors.lisp`'s semantics.
+
+**WHY STEP C (no regions) BEFORE STEP D.**  With every actor in region 0, whose
+stack_base is the PROCESS stack base, a collection while an actor runs on a band
+stack would scan terabytes of unmapped VA.  Step C therefore ASSERTS region 0
+never collects; step D fixes it, because a region's stack_base becomes ITS
+ACTOR'S STACK TOP and both the running and the parked window then lie inside one
+64 KB stack.  **Step D is not just a heap partition — it is what makes
+collecting DURING an actor possible at all.**
+
+**THE ORDERING ARGUMENT, which is a real correctness hazard.**  x64's SAVE-CTX
+does not save R12/R14, and that omission is what makes the hop work:
+`ACTOR-REGION-HOP` runs after `SAVE-CONTEXT` recorded the outgoing SP and
+immediately before `RESTORE-CONTEXT`, so `%GC-REGION-ENTER`'s load of the
+arriving region's alloc pointer/limit SURVIVES the restore (which moves only
+RSP/RBX/RBP).  Between the two, the CPU is on the OUTGOING actor's stack holding
+the ARRIVING region's allocation registers — safe only because nothing in that
+window allocates.  On aarch64 the window closes differently (its RESTORE-CTX
+reloads x24/x25 from the arriving actor's save area, so struct +0x10/+0x18 and
+the region's parked pair must agree there); this is measured on x64 only.
+
+Stage-3-for-real numbers: 2000-cons chain live in each worker's frame across 16
+forced collections of its OWN region, 0 walk failures; every message re-checked
+and re-sent AFTER a collection of the region it was decoded into; counts
+16/16 → 18/17 with region 0 at 0 throughout; the other region bit-for-bit
+identical (heap AND control block) across each collection; parked-window live
+bytes 32048 = 16*2000 + 3 junk conses; `%GC-COUNT-FOREIGN-REFS` 0 in every
+direction with an EXACT synthetic control (one planted pointer → 1) and a REAL
+one (each actor's parked window → 2 pointers into its own region).
+
+**KNOWN GAP, x64 parked windows.** `SAVE-CTX` spills RBX (V4) into the actor
+STRUCT (+0x20), which is in the band and therefore OUTSIDE the parked window
+`[SP, stack_base)`.  A Lisp POINTER left in RBX by a parked actor is restored on
+resume but is NOT scanned or forwarded while parked, so it would dangle if its
+object moved.  It is not reachable today — `SAVE-CONTEXT` is only ever called
+from `YIELD` and `RECEIVE`, whose V4 holds a fixnum — but it is the thing to fix
+before an actor can be parked from an arbitrary call site.  aarch64 has the same
+shape for x19/x24/x25.
+
+**`net/cooperative-atomics.lisp`'s three facts still hold**, re-checked: no new
+yield site (`compile-loop`'s is still the only `(emit-ir :yield)`), no
+preemption (hosted safepoint stub still NIL), no new signal handler, and the
+hosted scheduler is COOPERATIVE and SINGLE-CORE — its only switch is an explicit
+`YIELD`/`RECEIVE`.  Linking a live actor scheduler into the hosted image does
+not change that; what would is a second CPU.
+
+The aarch64 CLI is **per-function BIT-IDENTICAL** across this work
+(`scripts/fndiff.py`: 4536/4536 identical, native byte delta +0).  Its FILE size
+grows 304 bytes, and that is not code: `build-image` embeds the image's own
+source text (`embed-source-blob`), and `mvm/gc.lisp`'s corrected comment is 301
+chars longer.  **Judge these builds per-function, never by image size.**
+
 ### Conservative-root validation collector (x64, landed ace1544 + 810a975)
 
 The Cheney collector is now hardened by an **object-start bitmap** (1 bit /

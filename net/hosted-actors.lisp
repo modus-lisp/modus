@@ -418,7 +418,22 @@
 ;;; GC REGION, which is step D.
 
 (defun percpu-data-base ()   (+ (%ha-base) #x1000))
-(defun sched-lock-addr ()    (+ (%ha-base) #x100))
+
+;;; THE ONE HOOK THAT IS NOT AN OFFSET INTO THE BAND, and it is not an
+;;; inconsistency.  net/actors.lisp hands the scheduler lock's RELEASE to
+;;; RESTORE-CONTEXT (YIELD's resume arm is commented "lock already released by
+;;; restore-context"), and a context switch releases it from INSIDE the
+;;; instruction stream — translate-x64's +OP-RESTORE-CTX+ stores zero to
+;;; *X64-SCHED-LOCK-ADDR*, exactly as translate-aarch64 has always stored zero
+;;; to *AARCH64-SCHED-LOCK-ADDR*.  That address is baked in at TRANSLATE time,
+;;; so it cannot be a number this image works out at RUNTIME by carving its own
+;;; heap.  It is therefore a fixed BSS word, +HOSTED-SCHED-LOCK-ADDR+ in
+;;; mvm/compiler.lisp, in the same documented gap the per-region table lives in;
+;;; BSS zero-fill means it starts UNLOCKED with nothing having to initialise it.
+;;; mvm/build-generic-cli.lisp ratchets this literal against that constant, so
+;;; the two cannot drift apart silently — a drift would deadlock on the first
+;;; context switch.
+(defun sched-lock-addr ()    #x10000FC0)
 (defun sched-state-base ()   (+ (%ha-base) #x140))
 (defun scratch-addr ()       (+ (%ha-base) #x180))
 (defun decode-ptr-addr ()    (+ (%ha-base) #x188))

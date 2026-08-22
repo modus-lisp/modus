@@ -4,38 +4,43 @@
 ;;;; baked immediately BEFORE it, because a forward reference to an address
 ;;;; hook would resolve to the NIL sentinel.
 ;;;;
-;;;; Two overrides, both of them arch facts rather than conveniences, and then
-;;;; the actor-level selftests for steps C and D.
+;;;; One override (AP-SCHEDULER), one DELETED override (SPIN-LOCK — see below),
+;;;; and then the actor-level selftests for steps C and D.
 
 ;;; ============================================================
-;;; SPIN-LOCK / SPIN-UNLOCK — no-ops on one cooperative core
+;;; SPIN-LOCK / SPIN-UNLOCK — REAL, as of native threads
 ;;; ============================================================
 ;;;
-;;; THE REASON IS NOT "it is single-core so the lock is pointless" (true but
-;;; not sufficient); it is that KEEPING the lock would DEADLOCK on x64.
+;;; THERE IS NO OVERRIDE HERE ANY MORE, and its removal is the point.  This
+;;; file used to define `(defun spin-lock (addr) 0)' / `(defun spin-unlock
+;;; (addr) 0)', so net/actors.lisp's own TTAS lock on +OP-ATOMIC-XCHG+ never
+;;; ran in a hosted image.  The reason was NOT "one core needs no lock" — it
+;;; was that keeping the lock DEADLOCKED: net/actors.lisp hands the RELEASE to
+;;; RESTORE-CONTEXT (YIELD's resume arm is commented "lock already released by
+;;; restore-context"), aarch64's +OP-RESTORE-CTX+ honours that by storing zero
+;;; to *AARCH64-SCHED-LOCK-ADDR*, and translate-x64's did not — so the lock
+;;; stayed held across every switch and the next acquire spun forever.
 ;;;
-;;; net/actors.lisp takes the scheduler lock, does the switch, and hands the
-;;; RELEASE to RESTORE-CONTEXT — YIELD's resume arm is commented "lock already
-;;; released by restore-context".  That is true on aarch64, whose
-;;; +op-restore-ctx+ stores zero to *AARCH64-SCHED-LOCK-ADDR* after the SP
-;;; switch (translate-aarch64.lisp).  translate-x64.lisp's +op-restore-ctx+ has
-;;; NO such step: it reloads RBX/RBP/RSP and jumps.  So on x64 the lock would
-;;; stay held across every switch and the next SPIN-LOCK would spin forever.
+;;; THAT IS NOW FIXED AT THE SOURCE, not worked around.  translate-x64 has
+;;; *X64-SCHED-LOCK-ADDR*, the exact twin of the aarch64 knob, and its
+;;; +OP-RESTORE-CTX+ stores zero to it AFTER `mov rsp,[base]' and BEFORE the
+;;; jump — the same instant aarch64 releases, and the earliest instant that is
+;;; safe.  Earlier is NOT safe: by the time YIELD reaches RESTORE-CONTEXT the
+;;; OUTGOING actor is already back on the run queue, so releasing before the
+;;; stack switch would let a second thread dequeue it and restore onto a stack
+;;; this CPU has not left yet.  Later is not available: after the jump we are
+;;; running arbitrary actor code, including a FRESHLY SPAWNED actor entered at
+;;; its raw entry point, which has no idea a lock is outstanding.
 ;;;
-;;; On ONE cooperative core the lock protects nothing — there is no second CPU
-;;; and no preemption, so no other agent can observe the critical section — and
-;;; a no-op is exactly what every single-CPU adapter in the tree already ships
-;;; (net/arch-x86.lisp, net/arch-aarch64.lisp, net/32bit-overrides.lisp).
+;;; THE PAYOFF, which is why "the arriving code releases" was rejected as a
+;;; Lisp-level protocol: releasing inside the switch means net/actors.lisp needs
+;;; NO EDIT AT ALL.  Its resume arms are already written for this contract —
+;;; YIELD's does nothing, RECEIVE's re-acquires — and a fresh actor's entry
+;;; function is covered without a trampoline or an extra struct slot.
 ;;;
-;;; THE REAL FIX, deferred and named: teach translate-x64's RESTORE-CTX to
-;;; release the lock the way aarch64's does.  It needs the lock's address at
-;;; TRANSLATE time (aarch64 has *AARCH64-SCHED-LOCK-ADDR*, a build constant),
-;;; and this adapter's lock address is derived at RUNTIME from the carve — so
-;;; doing it properly means giving the hosted lock a fixed BSS address first.
-;;; That is a translator change plus a BSS-layout change; it buys nothing until
-;;; a second CPU exists, and it is not what steps C and D are about.
-(defun spin-lock (addr) 0)
-(defun spin-unlock (addr) 0)
+;;; The lock's address is +HOSTED-SCHED-LOCK-ADDR+, a fixed BSS word, because
+;;; the release is baked into the instruction stream at translate time; see
+;;; SCHED-LOCK-ADDR in net/hosted-actors.lisp.
 
 ;;; ============================================================
 ;;; AP-SCHEDULER — the bare-metal idle loop has no hosted meaning
@@ -57,6 +62,106 @@
     (%gc-write64 c (+ (%gc-read64 c) 1)))
   (set-current-actor 0)
   0)
+
+;;; ============================================================
+;;; STEP 1 ACCEPTANCE — the lock, and who releases it
+;;; ============================================================
+;;;
+;;; The COROUTINE half.  Entered by RESTORE-CONTEXT with RSP on the id-0 actor
+;;; stack slot (see %HA-CO-STACK-TOP).  Its ONE job is to look at the scheduler
+;;; lock word from the ARRIVING side of a context switch — the driver held it
+;;; when it switched, so a zero here is the +OP-RESTORE-CTX+ release and nothing
+;;; else — and then switch straight back.
+(defun %ha-lock-co-body ()
+  (let ((a *ha-band*)
+        (b (+ *ha-band* #x40))
+        (obs (+ *ha-band* #x560)))
+    (loop
+      (%gc-write64 obs (%gc-read64 (sched-lock-addr)))
+      (if (zerop (save-context b))
+          (restore-context a)
+          0))))
+
+(defun %ha-lock-selftest (n)
+  "STEP-1 ACCEPTANCE.  net/actors.lisp's REAL SPIN-LOCK/SPIN-UNLOCK — the TTAS
+   pair built on +OP-ATOMIC-XCHG+ (a genuine `XCHG [mem], reg', which x86
+   locks implicitly) — running in a hosted Linux process for the first time,
+   plus the thing that used to make that impossible: a context switch RELEASING
+   the lock.
+
+   Returns the result block's raw byte address, or 0 if the band could not be
+   carved.  Every number is read back out of memory; this function asserts
+   nothing itself.
+
+     res+0x00  the lock word before anything touched it   (must be 0: BSS)
+     res+0x08  the lock word while HELD                   (must be 1)
+     res+0x10  what an XCHG sees while held               (must be 1 — the
+               oracle has to be able to say HELD, or it proves nothing)
+     res+0x18  the lock word after SPIN-UNLOCK            (must be 0)
+     res+0x20  what an XCHG sees while free               (must be 0)
+     res+0x28  N, echoed
+     res+0x30  round trips where the word was wrong       (must be 0)
+     res+0x38  the lock word immediately BEFORE a switch  (must be 1)
+     res+0x40  the lock word as the ARRIVING side sees it (must be 0)
+     res+0x48  the lock word once control comes back      (must be 0)
+     res+0x50  the lock's address, so the test can check it is the BSS word
+               translate-x64 was told about and not a band offset"
+  (if (zerop (%ha-carve))
+      0
+      (let* ((band *ha-band*)
+             (lk (sched-lock-addr))
+             (res (+ band #x500))
+             (a band)
+             (b (+ band #x40))
+             (sa (+ band #x80))
+             (obs (+ band #x560))
+             (stk (%ha-co-stack-top))
+             (i 0)
+             (bad 0))
+        (%ha-zero res (+ res #x80))
+        (%gc-write64 lk 0)
+        (%gc-write64 res (%gc-read64 lk))
+        ;; ---- acquire, and look at the word underneath ----
+        (spin-lock lk)
+        (%gc-write64 (+ res #x08) (%gc-read64 lk))
+        (%gc-write64 (+ res #x10) (xchg-mem lk 1))
+        ;; ---- release, and look again ----
+        (spin-unlock lk)
+        (%gc-write64 (+ res #x18) (%gc-read64 lk))
+        (%gc-write64 (+ res #x20) (xchg-mem lk 1))
+        (spin-unlock lk)
+        ;; ---- N uncontended round trips ----
+        (loop
+          (when (>= i n) (return 0))
+          (spin-lock lk)
+          (if (= (%gc-read64 lk) 1) 0 (setq bad (+ bad 1)))
+          (spin-unlock lk)
+          (if (zerop (%gc-read64 lk)) 0 (setq bad (+ bad 1)))
+          (setq i (+ i 1)))
+        (%gc-write64 (+ res #x28) n)
+        (%gc-write64 (+ res #x30) bad)
+        ;; ---- THE SWITCH RELEASES IT ----
+        ;; Launch state for the coroutine, exactly as %HA-CTX-SELFTEST builds
+        ;; it: RSP = the id-0 stack slot, RBX/RBP zero, continuation =
+        ;; %HA-LOCK-CO-BODY's native entry with FN-ADDR's OR-3 tag taken off.
+        (%ha-zero a (+ b #x40))
+        (%gc-write64 obs 12345)
+        (%gc-write64 b stk)
+        (%gc-write64 (+ b #x18) 0)
+        (%gc-write64 (+ b #x28)
+                     (- (%gc-word-of (fn-addr %ha-lock-co-body) sa) 3))
+        (%gc-write64 (+ b #x38) 0)
+        (spin-lock lk)
+        (%gc-write64 (+ res #x38) (%gc-read64 lk))
+        (if (zerop (save-context a))
+            (restore-context b)
+            0)
+        (%gc-write64 (+ res #x40) (%gc-read64 obs))
+        (%gc-write64 (+ res #x48) (%gc-read64 lk))
+        (%gc-write64 (+ res #x50) lk)
+        ;; Leave it as the BSS had it.
+        (%gc-write64 lk 0)
+        res)))
 
 ;;; ============================================================
 ;;; Band words the workers and the driver share

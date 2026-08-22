@@ -52,6 +52,40 @@
    Set by Linux x64 builds to use SYS_write/SYS_read/SYS_exit instead of
    port I/O, PIC/PIT setup, etc.")
 
+(defvar *x64-sched-lock-addr* nil
+  "Scheduler-lock address for RESTORE-CTX's unlock.  NIL (the default, and what
+   every image built before native threads got) = emit nothing, so +OP-RESTORE-CTX+
+   is byte-for-byte the sequence it has always been.
+
+   THIS IS THE x64 TWIN OF *AARCH64-SCHED-LOCK-ADDR* AND IT EXISTS FOR THE SAME
+   REASON.  net/actors.lisp takes the scheduler lock, performs the switch, and
+   hands the RELEASE to RESTORE-CONTEXT — YIELD's resume arm is commented `lock
+   already released by restore-context'.  aarch64 has always honoured that
+   contract; x64 never did, which is why net/hosted-actors-post.lisp used to
+   override SPIN-LOCK/SPIN-UNLOCK to no-ops (a real lock would be held across
+   every switch and the next acquire would spin forever).
+
+   WHY THE SWITCH RELEASES, RATHER THAN THE DEPARTING ACTOR RELEASING FIRST.
+   By the time YIELD reaches RESTORE-CONTEXT it has already put the OUTGOING
+   actor back on the run queue, so the outgoing actor is visible to every other
+   CPU while this CPU is still executing on its stack.  Releasing before the
+   switch therefore lets a second thread dequeue that actor and RESTORE-CONTEXT
+   onto a stack we have not left — two CPUs, one stack.  The earliest instant at
+   which release is safe is the one AFTER `mov rsp,[base]': from there this CPU
+   touches only the ARRIVING actor's stack (the following `jmp rax' pushes
+   nothing), and the arriving actor was dequeued and marked running under the
+   same lock, so nobody else can claim it either.  That is exactly where aarch64
+   puts its release, and exactly where the emitter below puts this one.
+
+   NO FENCE IS NEEDED and its absence is not an oversight: x86-64 is TSO, so the
+   releasing store cannot be reordered before any earlier load or store.
+   aarch64 needs its DMB because it is not.
+
+   The address must be a fixed absolute one because it is baked into the
+   instruction stream at TRANSLATE time — see +HOSTED-SCHED-LOCK-ADDR+ in
+   mvm/compiler.lisp, which is the BSS word net/hosted-actors.lisp's
+   SCHED-LOCK-ADDR hands out.")
+
 (defvar *x64-li-const-patches* nil
   "List of (native-byte-offset . pool-index) pairs collected during
    translation.  Each entry says: at NATIVE-BYTE-OFFSET in the native
@@ -3483,6 +3517,14 @@
            (emit-mov-reg-mem buf 'rbx 'r11 #x18)   ; restore RBX
            (emit-mov-reg-mem buf 'rbp 'r11 #x38)   ; restore RBP
            (emit-mov-reg-mem buf 'rsp 'r11 #x00)   ; switch stack (no return)
+           ;; RELEASE THE SCHEDULER LOCK, and only ever HERE — after the stack
+           ;; switch, before the jump.  See *X64-SCHED-LOCK-ADDR* for why this
+           ;; is the earliest safe instant and why no fence is required.
+           ;; MOV qword [addr32], 0   =   48 C7 04 25 <addr32> <imm32>
+           (when *x64-sched-lock-addr*
+             (emit-bytes buf #x48 #xC7 #x04 #x25)
+             (emit-u32 buf *x64-sched-lock-addr*)
+             (emit-u32 buf 0))
            (emit-jmp-reg buf 'rax)))               ; jump to continuation
 
         ((op= +op-yield+)

@@ -258,6 +258,30 @@
   "Per-CPU-active-region mode word.  0 (every image today) = the active region
    is the single word at +GC-REGION-ADDR+; non-zero = it is
    +GC-REGION-ADDR+ + 8*cpu_id.")
+;;; ---- THE HOSTED SCHEDULER LOCK ------------------------------------------
+;;;
+;;; net/actors.lisp's SPIN-LOCK/SPIN-UNLOCK take an ADDRESS, and on bare metal
+;;; the board file hands out a fixed physical one.  A hosted process has no
+;;; such RAM, so net/hosted-actors.lisp derives every other actor address by
+;;; carving its own heap at RUNTIME — which is fine for everything the SCHEDULER
+;;; touches and impossible for this one word, because translate-x64's
+;;; +OP-RESTORE-CTX+ has to bake the release into the instruction stream at
+;;; TRANSLATE time (see *X64-SCHED-LOCK-ADDR* there, and its aarch64 twin).
+;;;
+;;; So the hosted scheduler lock lives in the BSS, at a fixed address, in the
+;;; same documented gap the per-region table uses: the table is 16 entries at
+;;; 0x10000F08..0x10000F88 and the mode word is at 0x10000FF8, so
+;;; 0x10000FC0..0x10000FD8 (SMP-INIT zeroes three consecutive words) is free.
+;;; BSS zero-fill means "unlocked" without anything having to initialise it.
+;;;
+;;; TWO PLACES MUST AGREE and a disagreement is an instant deadlock:
+;;; net/hosted-actors.lisp's SCHED-LOCK-ADDR and *X64-SCHED-LOCK-ADDR*, which
+;;; mvm/build-generic-cli.lisp sets from this constant and then ratchets against
+;;; the literal in that file.
+(defconstant +hosted-sched-lock-addr+ #x10000FC0
+  "BSS word the HOSTED actor scheduler's spinlock lives in.  Three words are
+   reserved (0x10000FC0/FC8/FD0) because SMP-INIT zeroes lock+0, +8 and +16.")
+
 (defconstant +gc-percpu-cpu-id-off+ 16
   "Byte offset of the :CPU-ID slot in the per-CPU block, as every boot
    descriptor's percpu-layout-fn already defines it.  Stored TAGGED (value =

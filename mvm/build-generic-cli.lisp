@@ -133,6 +133,27 @@
 ;; was in RAX).  See reference_append_funcall_bug.md.
 (setf modus.mvm.x64::*x64-native-code-offset* 397)
 
+;; NATIVE THREADS, STEP 1: the hosted actor scheduler gets a REAL spinlock.
+;; net/actors.lisp hands the lock's RELEASE to RESTORE-CONTEXT; with this set,
+;; translate-x64's +OP-RESTORE-CTX+ honours that contract the way aarch64's
+;; always has (store 0 AFTER the stack switch, before the jump).  Without it a
+;; real SPIN-LOCK would be held across every context switch and deadlock.
+;; RATCHET: net/hosted-actors.lisp's SCHED-LOCK-ADDR must hand out THIS address
+;; or the mutator and the switch release different words.
+(setf modus.mvm.x64::*x64-sched-lock-addr* modus.mvm::+hosted-sched-lock-addr+)
+(let ((txt (with-open-file (s (merge-pathnames "net/hosted-actors.lisp"
+                                               cl-user::*modus-base*))
+             (let ((b (make-string (file-length s))))
+               (subseq b 0 (read-sequence b s)))))
+      (want (format nil "(defun sched-lock-addr ()    #x~8,'0X)"
+                    modus.mvm::+hosted-sched-lock-addr+)))
+  (unless (search want txt)
+    (error "build-generic-cli: net/hosted-actors.lisp's SCHED-LOCK-ADDR does ~
+            not hand out +HOSTED-SCHED-LOCK-ADDR+ (~8,'0X).  Expected the line~% ~
+            ~A~%The scheduler lock the mutator takes and the word RESTORE-CTX ~
+            releases MUST be the same address, or the first context switch ~
+            deadlocks." modus.mvm::+hosted-sched-lock-addr+ want)))
+
 ;; Enable the GC trampoline: without this, every :alloc-obj advances R12
 ;; unchecked and the heap walks past the mapped region in long-running
 ;; sessions.  build-x64-linux / build-x64 set this; we

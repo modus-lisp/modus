@@ -131,9 +131,15 @@
               (size0 (%gc-meta-read (+ r0 #x10) k)))
           (if (< size0 #x6000000)
               0
+              ;; NEW0 is page-aligned DOWN so the band base inherits the
+              ;; semispace base's alignment.  net/actors.lisp's mailbox pool
+              ;; hands out 16-byte cells and TAGS them as conses
+              ;; (`(logior (untag ptr) (untag 1))'), so a band base whose low
+              ;; nibble was not 0 would produce pointers whose tag bits are
+              ;; part of the address.
               (let* ((s #x1000000)
                      (g #x1000000)
-                     (new0 (- size0 (+ g (* 2 s)))))
+                     (new0 (logand (- size0 (+ g (* 2 s))) (- 0 4096))))
                 (%gc-region-shrink r0 new0 k)
                 (setq *ha-rsize* s)
                 (setq *ha-bandsize* g)
@@ -159,7 +165,18 @@
 
 (defvar *ha-gs-base* 0)   ; the address arch_prctl was last given; 0 = never set
 
-(defun %ha-percpu-base () (+ *ha-band* #x1000))
+;; CARVE-ON-DEMAND.  Every address hook below goes through this rather than
+;; reading *HA-BAND* directly, so that a call into net/actors.lisp before
+;; anything set the system up computes a REAL address instead of dereferencing
+;; a small offset from zero.  Nothing in the shipping hosted image calls YIELD,
+;; SEND, RECEIVE, LINK or SHUTDOWN — those names are defined nowhere else in
+;; the hosted blob and called nowhere in it — so in practice the carve happens
+;; when a selftest asks for it.  But the failure mode of being WRONG about that
+;; should be a wasted 48 MB of semispace, not a SIGSEGV inside the scheduler.
+(defun %ha-base ()
+  (if (zerop *ha-band*) (%ha-carve) *ha-band*))
+
+(defun %ha-percpu-base () (+ (%ha-base) #x1000))
 
 (defun %ha-percpu-init ()
   "Point this thread's GS base at the band's per-CPU block, so that
@@ -373,3 +390,42 @@
         (%gc-write64 (+ res #x50) g0)
         (%gc-write64 (+ res #x58) (%gc-meta-read (+ (%gc-region) #x20) k))
         res)))
+
+;;; ============================================================
+;;; STEP C — net/actors.lisp's twelve address hooks
+;;; ============================================================
+;;;
+;;; This is the whole of what net/arch-x86.lisp's "Actor system address hooks"
+;;; block does for bare metal, except that not one of these numbers is a
+;;; constant: they are offsets into a band whose base the image DERIVED at
+;;; runtime by shrinking its own heap.  A hosted process may not invent
+;;; 0x06000000 — that address belongs to whatever the kernel put there.
+;;;
+;;; PERCPU-DATA-BASE is also the GS base (step B), so PERCPU-REF/-SET reach the
+;;; same block SMP-INIT initialises through MEM-REF.  That equality is checked
+;;; by test/hosted-percpu.lisp, not assumed here.
+;;;
+;;; ACTOR-HEAP-BASE, honestly.  ACTOR-SPAWN writes a per-actor bump-allocator
+;;; range into the struct at +0x10/+0x18 and an object-space range at
+;;; +0x70/+0x78, 4 MB per actor.  On x86-64 NOTHING DEREFERENCES THOSE: x64's
+;;; SAVE-CTX/RESTORE-CTX deliberately do not touch R12/R14 (see the header),
+;;; and the hosted image's allocator is region 0's, not percpu 40/48.  Only
+;;; aarch64's RESTORE-CTX reloads x24/x25 from +0x10/+0x18.  So this hook exists
+;;; to make ACTOR-SPAWN's arithmetic land on mapped memory rather than to hand
+;;; out heaps; the band is 16 MB, so ids past 4 name addresses above it, which
+;;; is harmless precisely because they are never dereferenced — and would NOT be
+;;; harmless on aarch64.  Where an actor's heap really comes from on x64 is its
+;;; GC REGION, which is step D.
+
+(defun percpu-data-base ()   (+ (%ha-base) #x1000))
+(defun sched-lock-addr ()    (+ (%ha-base) #x100))
+(defun sched-state-base ()   (+ (%ha-base) #x140))
+(defun scratch-addr ()       (+ (%ha-base) #x180))
+(defun decode-ptr-addr ()    (+ (%ha-base) #x188))
+(defun pool-state-base ()    (+ (%ha-base) #x280))
+(defun actor-table-base ()   (+ (%ha-base) #x10000))
+(defun mailbox-pool-base ()  (+ (%ha-base) #x20000))
+(defun mailbox-pool-limit () (+ (%ha-base) #x40000))
+(defun staging-base-addr ()  (+ (%ha-base) #x80000))
+(defun actor-stack-base ()   (+ (%ha-base) #x200000))
+(defun actor-heap-base ()    (+ (%ha-base) #x400000))

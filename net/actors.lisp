@@ -12,6 +12,18 @@
 ;;;;   get-idle-flag, set-idle-flag,
 ;;;;   wake-idle-ap
 ;;;;
+;;;; THE THREE PROGRESS MARKERS ("ACT", "Bye", "!") GO TO WRITE-CHAR-SERIAL,
+;;;; not to WRITE-BYTE, and that is not cosmetic.  WRITE-BYTE is a name with
+;;;; two incompatible meanings: on a board it is the arch adapter's ONE-argument
+;;;; console byte (net/arch-x86.lisp, net/arch-aarch64.lisp, …), and in a CL
+;;;; image it is ANSI's TWO-argument (write-byte byte stream).  This file is
+;;;; architecture-independent, so it cannot depend on which one it gets, and a
+;;;; one-argument call to the CL function is an arity error.  WRITE-CHAR-SERIAL
+;;;; is an MVM intrinsic (trap #x0300) that exists on every target — COM1/UART
+;;;; on bare metal, SYS_write(1) on hosted Linux — and is exactly what every
+;;;; board's WRITE-BYTE does with a boot marker anyway.  This is what lets the
+;;;; file be linked into a hosted image at all.
+;;;;
 ;;;; Actor struct layout (128 bytes, same as x86):
 ;;;;   +0x00  status        (0=free, 1=running, 2=ready, 3=dead, 4=blocked)
 ;;;;   +0x08  save area: SP
@@ -265,7 +277,8 @@
 
 (defun shutdown ()
   ;; Print "Bye\n" then halt
-  (write-byte 66) (write-byte 121) (write-byte 101) (write-byte 10)
+  (write-char-serial 66) (write-char-serial 121)
+  (write-char-serial 101) (write-char-serial 10)
   (loop (halt)))
 
 ;;; ============================================================
@@ -304,7 +317,8 @@
     (percpu-set 40 cur-alloc)
     (percpu-set 48 cur-limit))
   ;; Print "ACT"
-  (write-byte 65) (write-byte 67) (write-byte 84) (write-byte 10))
+  (write-char-serial 65) (write-char-serial 67)
+  (write-char-serial 84) (write-char-serial 10))
 
 ;;; ============================================================
 ;;; Actor spawn
@@ -320,7 +334,7 @@
     (if (>= count 64)
         (progn
           (spin-unlock (sched-lock-addr))
-          (write-byte 33)   ; '!' too many actors
+          (write-char-serial 33)   ; '!' too many actors
           0)
         (let ((id count))
           ;; Bump actor count

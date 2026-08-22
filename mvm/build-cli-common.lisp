@@ -922,10 +922,19 @@
 ;;; base an ordinary arch_prctl can set, so the aarch64 CLI gets "" here and
 ;;; its blob is byte-identical to before.  Bare-metal targets already have a
 ;;; board file and do not want this one.
+;;; THE ORDER IS LOAD-BEARING.  net/hosted-actors.lisp supplies the twelve
+;;; address hooks and must precede net/actors.lisp (a forward reference across
+;;; the blob does not resolve).  net/hosted-actors-post.lisp must FOLLOW it,
+;;; because its SPIN-LOCK / SPIN-UNLOCK / AP-SCHEDULER are last-defun-wins
+;;; overrides of definitions net/actors.lisp itself makes.
 (defvar *cli-hosted-actors-source*
   (if (and (eq *cli-arch* :x64) (not *cli-bare-metal*))
       (concatenate 'string (string #\Newline)
                    (mvm-text "net/hosted-actors.lisp")
+                   (string #\Newline)
+                   (mvm-text "net/actors.lisp")
+                   (string #\Newline)
+                   (mvm-text "net/hosted-actors-post.lisp")
                    (string #\Newline))
       ""))
 

@@ -557,6 +557,80 @@ are bit-for-bit unchanged (23 checks).  Note the ordinary 200k-allocation
 stress collects **zero** times on an 896 MB semispace (measured); use
 `%gc-collect-here` or `MODUS_GC_R14` if you mean to exercise the collector.
 
+### Per-region GC, stage 2: the ROOT SET is a property of the region
+
+The collector's stack scan is `[root_sp, stack_base)` and **both ends are
+fields of the region being collected** (`+GC-OFF-SAVED-SP+` / `+GC-OFF-STACK-
+BASE+`).  Collecting region N examines N's roots and nothing else — no global
+stack base, no other region's window.
+
+**`root_sp == 0` MEANS "THIS REGION'S ACTOR IS RUNNING"**, the same zero-is-the-
+historic-answer trick stage 1 used, so nothing needed initialising anywhere:
+
+| state | root window low end | who writes it |
+|---|---|---|
+| running | the LIVE SP at collector entry (x64: RBP, below all twelve pushed registers, so the register file is in the window; aarch64: its shim writes the same value into the field) | the collector entry point |
+| parked | the SP the context switch recorded on that actor's OWN stack, where the switch also spilled its registers | `%gc-region-park` |
+
+The two writers can never be live at once — a region is either running or
+parked.  `translate-x64`'s trampoline branches on `saved_sp = 0` because it has
+RBP in hand and no shim; the Lisp `%gc-collect` just reads the field, which is
+correct in both cases.  A parked window is size-capped at
+`+GC-MAX-PARKED-WINDOW+` (16 MB) since that low end came from memory rather
+than a register; over the cap the window collapses to EMPTY rather than walking
+unmapped pages.
+
+New API in `gc.lisp`: `%gc-region-park` (rcb sp), `%gc-region-unpark`,
+`%gc-region-parked-p`, `%gc-region-switch` (rcb sp) — park the region you leave
+*and* its roots, enter and un-park the one you arrive in.  **The SP is an
+ARGUMENT** because no MVM primitive yields the stack pointer as a value on every
+target (`:save-ctx` is not implemented on x64 at all); the value already exists
+where it is needed, since `actors.lisp`'s `yield` has just written the outgoing
+actor's SP to its struct at `+0x08`.  Nothing in `net/actors.lisp` owns a region
+yet (all actors bump-allocate inside region 0), so nothing calls it outside the
+tests — wiring that up is stage 3.
+
+**NOT partitioned, and it is the one root set stage 2 does not split**:
+`%gc-scan-globals` / the trampoline's globals block (globals alist, symbol +
+keyword + package intern tables, MV extras).  Any region's actor can store its
+own object into a global, so every region scans them; it is a no-op for
+anything that does not point into the region being collected, hence
+conservative-safe, but it is not per-region.
+
+**The soundness assumption, stated because stage 2 rests on it**: per-region
+collection is correct only because no actor can hold a pointer into another
+actor's region (`net/actors.lisp` term-serializes every message — copied, never
+shared).  **The collector does NOT enforce that and there is no write barrier**;
+a pointer stored from region A into region B dangles silently when B is
+collected.  `%gc-count-foreign-refs (start end other-start other-size)` is the
+debug-mode audit — exact, non-allocating, works in either direction — and
+`test/region-gc-roots.lisp` runs it both ways over the real heaps after a real
+collection, plus once as a positive control on a span known to hold exactly one
+such pointer.  The collector never calls it (it is an O(heap) sweep).
+
+Acceptance: `./modus --script test/region-gc-roots.lisp` (32 checks).  Two
+identical chains in region 1: A rooted ONLY from the parked window, B rooted
+ONLY from the live stack (which belongs to region 0's actor).  Collect region 1
+twice while parked — A survives, B does not; live bytes `16*N+16`, and `32*N+16`
+if the live stack had been scanned too.  Then the **negative control in the same
+binary**: un-park it, and every expectation inverts (chain C on the live stack
+survives, the parked slot is never even rewritten).
+
+`./modus --script test/gc-forced-stress.lisp` (4 checks) is the collector
+regression: 20 forced collections, 20,000 live structures, checksum
+199990000.
+
+Two traps this cost time on, both pre-existing:
+- **`%gc-count` reports HALF the count on x64.** The field is stored raw there
+  and `(mem-ref addr :u64)` halves — the defect `gc.lisp`'s word-access block
+  documents.  It is right where it is *used* (aarch64/i386 store fields SHL'd,
+  so the halving cancels); test code must read it with `%gc-meta-read`.
+- **`%gc-collect-here` at an interpreted `--script` toplevel breaks the next
+  `(format t …)`** (it re-runs its control string, then signals).  Reproduced on
+  an unmodified HEAD build, so it is a property of the mvm-eval toplevel, not of
+  per-region GC — but it means a scripted stress measures that instead of the
+  collector.  Drive forced collections from compiled in-image code.
+
 ### Conservative-root validation collector (x64, landed ace1544 + 810a975)
 
 The Cheney collector is now hardened by an **object-start bitmap** (1 bit /

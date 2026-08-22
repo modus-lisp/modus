@@ -4933,10 +4933,49 @@
     (emit-mov-reg-mem buf 'rdx 'rax modus.mvm::+gc-off-stack-base+)
 
     (emit-gc-dbg-char buf #x70)          ; 'p' — pushed regs + metadata loaded, about to scan stack
-    ;; ---- Scan stack roots ----
-    ;; Walk from RBP (saved RSP) to stack_base
+    ;; ---- Scan THIS REGION'S ROOT WINDOW ----
+    ;;
+    ;; STAGE 2.  The window is [saved_sp, stack_base) and BOTH ends come out of
+    ;; the region's own control block.  Which stack that is depends on whether
+    ;; this region's actor is the one running:
+    ;;
+    ;;   saved_sp == 0  RUNNING.  Its roots are on the LIVE machine stack, from
+    ;;                  RBP — which is RSP after the twelve pushes above, so the
+    ;;                  whole register file is inside the window — up to
+    ;;                  stack_base.  This is the historic behaviour, and it is
+    ;;                  what an image that never created a second region gets,
+    ;;                  because %gc-region-init writes 0 here and nothing on x64
+    ;;                  ever writes this field otherwise.
+    ;;   saved_sp != 0  PARKED.  Its actor was switched off some OTHER stack;
+    ;;                  the switch spilled that actor's registers there and
+    ;;                  recorded its SP here (gc.lisp %gc-region-park).  Scan
+    ;;                  THAT window and NOT the live stack — the live stack
+    ;;                  belongs to whoever is driving this collection, and its
+    ;;                  pointers into this region are, by the term-serialisation
+    ;;                  argument, not supposed to exist.
+    ;;
+    ;; The size gate is only on the parked path: that low end came from memory,
+    ;; so a stale or corrupt SP would walk unmapped pages.  Over the cap the
+    ;; window collapses to EMPTY (rdi = stack_base, loop exits immediately)
+    ;; rather than running wild.  SUB wraps when saved_sp > stack_base, giving a
+    ;; huge unsigned difference, so the one unsigned compare catches an inverted
+    ;; window too.  RSI is free here (it is scan_word's temp, and the scan has
+    ;; not started); RAX still holds the region base.
+    (let ((sp-ready (make-label))
+          (sp-live (make-label)))
+      (emit-mov-reg-mem buf 'rdi 'rax modus.mvm::+gc-off-saved-sp+)
+      (emit-cmp-reg-imm buf 'rdi 0)
+      (emit-jcc buf :e sp-live)
+      (emit-mov-reg-reg buf 'rsi 'rdx)           ; rsi = stack_base
+      (emit-sub-reg-reg buf 'rsi 'rdi)           ; rsi = stack_base - saved_sp
+      (emit-cmp-reg-imm buf 'rsi modus.mvm::+gc-max-parked-window+)
+      (emit-jcc buf :be sp-ready)
+      (emit-mov-reg-reg buf 'rdi 'rdx)           ; bogus window -> empty
+      (emit-jmp buf sp-ready)
+      (emit-label buf sp-live)
+      (emit-mov-reg-reg buf 'rdi 'rbp)           ; running: the live SP
+      (emit-label buf sp-ready))
     ;; RDI = current scan address
-    (emit-bytes buf #x48 #x89 #xEF)              ; mov rdi, rbp  (start of stack)
     (let ((stack-loop (make-label))
           (stack-done (make-label)))
       (emit-label buf stack-loop)

@@ -159,6 +159,53 @@
 (defconstant +gc-off-saved-alloc+ #x30)  ; alloc ptr at GC entry (r12/x24)
 (defconstant +gc-off-saved-limit+ #x38)  ; alloc limit at GC entry (r14/x25)
 
+;;; ---- STAGE 2: THE ROOT SET IS A PROPERTY OF THE REGION -------------------
+;;;
+;;; Stage 1 made the HEAP per-region.  A heap you cannot name the roots of is
+;;; still one collector, so stage 2 makes the ROOT WINDOW per-region too, out of
+;;; two fields that were already there:
+;;;
+;;;   [ +GC-OFF-SAVED-SP+ , +GC-OFF-STACK-BASE+ )
+;;;
+;;; is the half-open range of machine words the collector scans conservatively
+;;; when it collects THIS region.  Nothing else contributes stack roots — not a
+;;; global stack_base, not another region's window.
+;;;
+;;; +GC-OFF-SAVED-SP+ = 0 MEANS "THIS REGION'S ACTOR IS THE ONE RUNNING", and
+;;; the low end is then the LIVE stack pointer at collector entry, which the
+;;; collector already has in hand (translate-x64's trampoline has pushed every
+;;; register below it, so the register file is inside the window; translate-
+;;; aarch64's shim writes the same value into this field before calling
+;;; %gc-collect).  Non-zero means the region's actor is PARKED: it was switched
+;;; off some other stack, its registers were spilled there by the switch, and
+;;; this is the SP the switch recorded — so the parked triple (SP/alloc/limit)
+;;; that %gc-region-enter maintains IS that actor's root set.  Zero is the
+;;; historic single-actor answer, so nothing had to be initialised anywhere.
+;;;
+;;; WHO WRITES IT: the collector entry point in the running case (aarch64's
+;;; shim; x64 needs no write, it reads RBP), and the context switch in the
+;;; parked case — gc.lisp's %GC-REGION-PARK / %GC-REGION-SWITCH.  The two
+;;; writers can never be live at once, because a region is either running or
+;;; parked.
+;;;
+;;; SOUNDNESS.  Collecting region N while ignoring every other region's roots
+;;; is only correct because no actor may hold a pointer into another actor's
+;;; region: net/actors.lisp TERM-SERIALISES every message (copied, never
+;;; shared).  THAT IS ASSUMED, NOT ENFORCED, at collection time.  gc.lisp's
+;;; %GC-COUNT-FOREIGN-REFS is the debug-mode audit — it counts, in either
+;;; direction, the words of one region that carry a pointer into another — and
+;;; test/region-gc-roots.lisp runs it both ways after a real collection.  The
+;;; collector itself does not call it.
+(defconstant +gc-max-parked-window+ #x1000000
+  "Largest parked root window the collector will scan, in bytes (16 MB).  A
+   PARKED region's low end comes from memory rather than from a register, so a
+   corrupt or stale value would send the conservative scan walking unmapped
+   pages; beyond this size the window is treated as EMPTY instead.  16 MB is
+   two orders above net/actors.lisp's 64 KB actor stacks and still above a
+   default 8 MB pthread stack, so it cannot clip a real one.  It does NOT apply
+   to the running case, whose low end is the live SP and is bounded by
+   construction.")
+
 (defconstant +gc-region-0-base+ #x10000040)
 ;;; The active-region word.  #x10000F08 is in the BSS gap boot-rpi-cl.lisp
 ;;; documents ("a scan of every #x1000xxxx literal finds NOTHING between

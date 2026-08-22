@@ -141,6 +141,19 @@
 ;; RATCHET: net/hosted-actors.lisp's SCHED-LOCK-ADDR must hand out THIS address
 ;; or the mutator and the switch release different words.
 (setf modus.mvm.x64::*x64-sched-lock-addr* modus.mvm::+hosted-sched-lock-addr+)
+
+;; NATIVE THREADS, STEP 3: the ACTIVE REGION becomes PER-THREAD.
+;; :RUNTIME, deliberately, and not T.  This one binary serves ordinary
+;; single-threaded runs — GS base 0, where an unguarded `GS:[16]' SIGSEGVs on
+;; the first collection — AND threaded runs, where every thread has installed a
+;; per-CPU block and the collector must read THIS thread's cell.  :RUNTIME emits
+;; both forms and branches on the SAME gate word mvm/gc.lisp's %GC-REGION-CELL
+;; branches on (+GC-REGION-PERCPU-ADDR+), so the Lisp side and the native
+;; collector flip together and cannot read different cells.  The gate is 0 in
+;; the BSS, so a ./modus that never starts a thread behaves exactly as before.
+;; The branch is paid three times per COLLECTION (the only callers are inside
+;; the GC trampoline), never in an allocation fast path.
+(setf modus.mvm.x64::*x64-gc-region-percpu* :runtime)
 (let ((txt (with-open-file (s (merge-pathnames "net/hosted-actors.lisp"
                                                cl-user::*modus-base*))
              (let ((b (make-string (file-length s))))

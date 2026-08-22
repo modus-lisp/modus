@@ -209,24 +209,29 @@
 ;;; inside the barrier at the same instant.  The budget is what keeps a
 ;;; failure a FAILURE rather than a hang.
 
-(defun %ha-barrier-arrive (tb)
+;;; OFF is the ARRIVAL COUNTER's offset, so a test can have more than one
+;;; barrier; the LOCK is always the block's word 0.
+(defun %ha-barrier-at (tb off)
   (spin-lock tb)
-  (%gc-write64 (+ tb 8) (+ (%gc-read64 (+ tb 8)) 1))
+  (%gc-write64 (+ tb off) (+ (%gc-read64 (+ tb off)) 1))
   (spin-unlock tb)
   0)
 
-(defun %ha-barrier-wait (tb budget)
+(defun %ha-barrier-wait-at (tb off budget)
   "0 = the other thread arrived too; 1 = spun out BUDGET iterations alone."
   (let ((i 0)
         (r 1))
     (loop
-      (if (>= (%gc-read64 (+ tb 8)) 2)
+      (if (>= (%gc-read64 (+ tb off)) 2)
           (progn (setq r 0) (return 0))
           0)
       (if (>= i budget)
           (return 0)
           (setq i (+ i 1))))
     r))
+
+(defun %ha-barrier-arrive (tb) (%ha-barrier-at tb 8))
+(defun %ha-barrier-wait (tb budget) (%ha-barrier-wait-at tb 8 budget))
 
 ;;; ---- INTERLEAVED PROGRESS ------------------------------------------------
 ;;;
@@ -389,6 +394,309 @@
               (%gc-write64 (+ res #xA8) (%gc-read64 (+ tb #x98)))
               (%gc-write64 (+ res #xB0) (%gc-read64 (+ tb #xA0)))
               (%gc-write64 (+ res #xB8) a0)
+              res)))))
+
+;;; ============================================================
+;;; STEP 3 — A PER-THREAD ACTIVE REGION
+;;; ============================================================
+;;;
+;;; Stage 3 of per-region GC built the mechanism and left it OFF: the
+;;; active-region word became CPU 0's entry of a 16-entry array based at the
+;;; same address (+GC-REGION-ADDR+ + 8*cpu_id), gated on both sides — the Lisp
+;;; side on the BSS mode word +GC-REGION-PERCPU-ADDR+, the native side on
+;;; translate-x64's *X64-GC-REGION-PERCPU*.  Nothing had ever written the mode
+;;; word, so that code had never executed.  This turns it on.
+;;;
+;;; THE NATIVE SIDE IS :RUNTIME, NOT T, and that is the load-bearing decision.
+;;; ./modus is one binary serving two populations: ordinary single-threaded runs
+;;; where the GS base is 0 and an unguarded `GS:[16]' SIGSEGVs on the first
+;;; collection, and threaded runs where every thread has a per-CPU block.  So
+;;; EMIT-LOAD-GC-REGION now emits BOTH forms and branches on the SAME mode word
+;;; %GC-REGION-CELL branches on.  One word flips the mutator and the collector
+;;; together; they cannot end up reading different cells.
+;;;
+;;; ORDERING, which is the whole safety argument for turning it on at runtime:
+;;;   1. this thread points GS at a real per-CPU block and stamps CPU 0 into it;
+;;;   2. ONLY THEN is the mode word set;
+;;;   3. a new thread inherits the parent's GS base (clone is issued WITHOUT
+;;;      CLONE_SETTLS), so between the clone and its own arch_prctl it reads
+;;;      CPU 0's cell — the wrong cell, but never an unmapped one — and it does
+;;;      nothing that reads a region until it has stamped its own CPU id.
+
+(defun %ha-percpu-mode () (mem-ref #x10000FF8 :u32))
+
+(defun %ha-set-percpu-mode (v)
+  "Write the per-CPU active-region MODE WORD (+GC-REGION-PERCPU-ADDR+).
+   Non-zero = this CPU's cell is +GC-REGION-ADDR+ + 8*cpu_id, on BOTH the Lisp
+   side (%GC-REGION-CELL) and the native side (EMIT-LOAD-GC-REGION, compiled
+   :RUNTIME).  DO NOT set this before a real per-CPU block is installed."
+  (setf (mem-ref #x10000FF8 :u32) v)
+  v)
+
+(defun %ha-percpu-init-cpu (base cpu)
+  "Point THIS THREAD's GS base at BASE (arch_prctl ARCH_SET_GS, syscall 158)
+   and stamp CPU into the :CPU-ID slot at +GC-PERCPU-CPU-ID-OFF+ = 16.  The
+   order matters: PERCPU-SET is a GS-relative store, so it can only be issued
+   after the base is set.  Returns the kernel's return value (0 = success)."
+  (let ((r (syscall3 158 #x1001 base 0)))
+    (if (zerop r) (percpu-set 16 cpu) 0)
+    r))
+
+(defun %ha-thread-adopt-region (rcb k)
+  "Make RCB this THREAD's active region and load its allocation pointer/limit,
+   WITHOUT parking whatever the cell named before.
+
+   NOT %GC-REGION-ENTER, and the difference is a correctness one.  ENTER parks
+   the LEAVING region's allocation pointer and limit — the right thing when one
+   actor hands the CPU to another on the same thread.  A brand-new OS thread's
+   R12/R14 are a COPY of the spawning thread's, made at clone time and stale the
+   moment that thread allocates again; parking them into the region the cell
+   happens to name (region 0, whose block is SHARED) would roll another thread's
+   allocation frontier BACKWARDS and hand out addresses twice.  There is nothing
+   to park, so this does not park.
+
+   K IS AN ARGUMENT AND MUST NOT BE (%GC-META-SCALE) COMPUTED HERE.  That
+   function derives raw-vs-SHL'd metadata storage by asking whether the LIVE
+   ALLOCATION POINTER falls inside the ACTIVE REGION's from-space — a sound
+   trick on one thread, where those two always belong together, and WRONG in a
+   thread that has just been cloned: its R12 is a copy of the spawning thread's,
+   which by then is pointing into the SPAWNER's region while this thread's cell
+   still names region 0.  The derivation then answers 2 on x86-64, every field
+   read comes back HALVED, and this thread starts bump-allocating at half its
+   region's address.  Measured, not theorised — it is what the first run of
+   test/hosted-thread-regions.lisp reported.  The caller computes K while its
+   own cell and allocation pointer still agree, and hands it over."
+  (%gc-set-region rcb)
+  (set-alloc-ptr (%gc-meta-read (+ rcb #x30) k))
+  (set-alloc-limit (%gc-meta-read (+ rcb #x38) k))
+  0)
+
+;;; ---- the experiment -----------------------------------------------------
+;;;
+;;; ONE thread alternates the value in ITS OWN cell while the OTHER samples its
+;;; own cell and requires it never to change.  Two things make that a proof
+;;; rather than a tautology:
+;;;
+;;;   - the watcher ALSO samples the switcher's RAW cell address and counts how
+;;;     many DISTINCT values it saw there.  "I never saw my own cell change" is
+;;;     worthless if the other thread never switched during the window; this
+;;;     number says it did, and it is required to be >= 2.
+;;;   - the cell addresses are read back and checked to be the two DIFFERENT
+;;;     table entries (CPU 0 at +GC-REGION-ADDR+, CPU 1 eight bytes above it).
+;;;
+;;; THE SWITCHER USES %GC-SET-REGION, NOT %GC-REGION-ENTER, on purpose: ENTER
+;;; also parks and reloads R12/R14, and doing that thousands of times on the
+;;; driver's own thread would move its live allocation frontier around for
+;;; reasons that have nothing to do with what is being measured.  The full ENTER
+;;; path IS exercised, once per thread, by %HA-THREAD-ADOPT-REGION — and the
+;;; test checks the two threads end up with DIFFERENT allocation pointers,
+;;; which is the R12/R14-are-per-thread half of the claim.
+
+(defun %ha-region-switch-loop (tb rcb n countoff)
+  "Alternate this thread's cell between region 0 and RCB, N times.  Leaves it
+   on RCB.  Allocates nothing, so the alternation cannot trip a collection."
+  (let ((r0 (%gc-region-0))
+        (i 0))
+    (loop
+      (when (>= i n) (return 0))
+      (%gc-set-region r0)
+      (%gc-set-region rcb)
+      (%gc-write64 (+ tb countoff) (+ i 1))
+      (setq i (+ i 1)))
+    (%gc-set-region rcb)
+    0))
+
+(defun %ha-region-watch-loop (tb rcb other-cell n badoff seenoff)
+  "Sample MY cell N times — it must always read RCB — while counting the
+   DISTINCT values appearing at OTHER-CELL, the raw address of the other
+   thread's entry in the same table."
+  (let ((i 0)
+        (bad 0)
+        (seen 1)
+        (last (%gc-read64 other-cell)))
+    (loop
+      (when (>= i n) (return 0))
+      (if (= (%gc-region) rcb) 0 (setq bad (+ bad 1)))
+      (let ((v (%gc-read64 other-cell)))
+        (if (= v last)
+            0
+            (progn (setq seen (+ seen 1)) (setq last v))))
+      (setq i (+ i 1)))
+    (%gc-write64 (+ tb badoff) bad)
+    (%gc-write64 (+ tb seenoff) seen)
+    0))
+
+;;; Extra thread-block words step 3 uses (all inside the 0x300 the selftest
+;;; zeroes):
+;;;   +0x0C0  thread 2's region control block   +0x0C8  CPU 0's raw cell address
+;;;   +0x0D0  thread 2's arch_prctl return      +0x0D8  thread 2's region BEFORE
+;;;                                                     it adopted one
+;;;   +0x0E0  thread 2's alloc ptr after adopt  +0x0E8  its alloc limit
+;;;   +0x0F0  phase-A mismatches (watcher = t2) +0x0F8  phase-A distinct values
+;;;   +0x300  phase-B barrier counter           +0x308  phase-B mismatches (t1)
+;;;   +0x310  phase-B distinct values           +0x318  t1 phase-B timeout
+;;;   +0x320  t2 phase-B timeout                +0x328  t2 switch count
+;;;   +0x330  t1 switch count                   +0x338  CPU 1's raw cell address
+;;;   +0x340  the metadata SCALE, computed by the driver (see
+;;;           %HA-THREAD-ADOPT-REGION for why a thread must not derive it)
+
+(defun %ha-thread2-region-body ()
+  (let* ((tb (%ha-thread-block))
+         (budget (%gc-read64 (+ tb #x68)))
+         (work (%gc-read64 (+ tb #x80)))
+         (rcb (%gc-read64 (+ tb #xC0)))
+         (cell0 (%gc-read64 (+ tb #xC8)))
+         (k (%gc-read64 (+ tb #x340))))
+    (%gc-write64 (+ tb #x98) (get-alloc-ptr))
+    (%gc-write64 (+ tb #x18) (syscall3 186 0 0 0))
+    ;; ---- MY GS base, MY cpu id ----
+    (%gc-write64 (+ tb #xD0) (%ha-percpu-init-cpu (%ha-cpu1-percpu-base) 1))
+    (%gc-write64 (+ tb #xA8) (percpu-ref 16))
+    (%gc-write64 (+ tb #xB0) (%gc-region-cell))
+    ;; ---- WHAT MY CELL SAYS BEFORE I TOUCH IT ----
+    ;; This is the sharpest single number in the test.  Thread 1 has already put
+    ;; its OWN region in its OWN cell; my cell is still the BSS zero, so it must
+    ;; answer REGION 0.  If the per-CPU indexing were not working I would be
+    ;; reading thread 1's cell and would see thread 1's region here.
+    (%gc-write64 (+ tb #xD8) (%gc-region))
+    (%ha-thread-adopt-region rcb k)
+    (%gc-write64 (+ tb #xB8) (%gc-region))
+    (%gc-write64 (+ tb #xE0) (get-alloc-ptr))
+    (%gc-write64 (+ tb #xE8) (get-alloc-limit))
+    (%gc-write64 (+ tb #x10) 1)
+    ;; ---- PHASE A: thread 1 switches, I watch ----
+    (%ha-barrier-arrive tb)
+    (%gc-write64 (+ tb #x28) (%ha-barrier-wait tb budget))
+    (%ha-region-watch-loop tb rcb cell0 work #xF0 #xF8)
+    ;; ---- PHASE B: I switch, thread 1 watches ----
+    (%ha-barrier-at tb #x300)
+    (%gc-write64 (+ tb #x320) (%ha-barrier-wait-at tb #x300 budget))
+    (%ha-region-switch-loop tb rcb work #x328)
+    (%gc-write64 (+ tb #xA0) (get-alloc-ptr))
+    (%gc-write64 (+ tb #x58) 1)
+    0))
+
+(defun %ha-thread2-region-entry ()
+  (- (%gc-word-of (fn-addr %ha-thread2-region-body) (+ (%ha-base) #x80)) 3))
+
+(defun %ha-regions-percpu-selftest (budget work)
+  "STEP-3 ACCEPTANCE.  Two OS threads, two GS bases, two active-region cells.
+
+   Returns the result block's raw byte address, or 0 if the band could not be
+   carved or the thread stack could not be mapped."
+  (if (zerop (%ha-carve))
+      0
+      (let* ((tb (%ha-thread-block))
+             (res (+ tb #x100))
+             (rcb2 (+ (%ha-base) #x200))
+             (rcb3 (+ (%ha-base) #x240))
+             (r0 (%gc-region-0))
+             (mode0 0) (a1 0) (tid 0))
+        (%ha-zero tb (+ tb #x400))
+        (%ha-zero (%ha-cpu1-percpu-base) (+ (%ha-cpu1-percpu-base) #x4000))
+        (%gc-write64 (+ tb #x68) budget)
+        (%gc-write64 (+ tb #x80) work)
+        (if (zerop (%ha-thread-stack))
+            0
+            (progn
+              (setq mode0 (%ha-percpu-mode))
+              ;; ---- 1. THIS thread: a real per-CPU block, stamped CPU 0 ----
+              (%gc-write64 (+ res #x00) (%ha-percpu-init-cpu (%ha-percpu-base) 0))
+              ;; ---- 2. ONLY NOW is the per-CPU cell turned on ----
+              (%ha-set-percpu-mode 1)
+              (%gc-write64 (+ res #x08) mode0)
+              (%gc-write64 (+ res #x10) (%ha-percpu-mode))
+              (%gc-write64 (+ res #x18) (percpu-ref 16))
+              (%gc-write64 (+ res #x20) (%gc-region-cell))
+              ;; THE TWO REGIONS, and their STACK_BASEs are not decoration.
+              ;; A region's root window runs UP to its stack_base, so it must be
+              ;; the top of the stack of the thread that owns it: thread 2's
+              ;; region gets thread 2's mmap'd stack top, and this thread's gets
+              ;; region 0's stack_base — the process stack — because this thread
+              ;; is the one running on it.
+              (%gc-region-init rcb2 *ha-r1-from* *ha-r1-to* *ha-rsize*
+                               (%gc-meta-read (+ r0 #x18) (%gc-meta-scale))
+                               (%gc-meta-scale))
+              (%gc-region-init rcb3 *ha-r2-from* *ha-r2-to* *ha-rsize*
+                               (+ *ha-t2-stack* *ha-t2-stack-size*)
+                               (%gc-meta-scale))
+              (%gc-write64 (+ tb #xC0) rcb3)
+              (%gc-write64 (+ tb #xC8) (%gc-region-cell))
+              ;; THE METADATA SCALE, computed HERE and handed to thread 2.
+              ;; %GC-META-SCALE derives it by asking whether the live allocation
+              ;; pointer brackets the active region's from-space; that question
+              ;; is only meaningful on a thread whose cell and R12 belong
+              ;; together, which a freshly cloned thread's do not.  See
+              ;; %HA-THREAD-ADOPT-REGION.
+              (%gc-write64 (+ tb #x340) (%gc-meta-scale))
+              ;; ---- 3. THIS thread adopts its own region, REVERSIBLY ----
+              ;; %GC-REGION-ENTER and not a bare cell write, because here the
+              ;; park half is CORRECT: this thread is region 0's legitimate
+              ;; owner, so its live R12/R14 are exactly what region 0's block
+              ;; should record while it is away.  The matching (%gc-region-enter
+              ;; r0) at the end reloads them, so the driver comes back to the
+              ;; toplevel with the allocation frontier it left with — checked.
+              (setq a1 (get-alloc-ptr))
+              (%gc-region-enter rcb2)
+              (%gc-write64 (+ res #x28) (%gc-region))
+              (%gc-write64 (+ res #x120) (get-alloc-ptr))
+              ;; ---- 4. and only now spawn the second thread ----
+              (setq tid (%ha-spawn-t2 (%ha-thread2-region-entry)))
+              (%gc-write64 (+ res #x30) tid)
+              ;; ---- PHASE A: we switch, thread 2 watches ----
+              (%ha-barrier-arrive tb)
+              (%gc-write64 (+ tb #x30) (%ha-barrier-wait tb budget))
+              (%ha-region-switch-loop tb rcb2 work #x330)
+              ;; ---- PHASE B: thread 2 switches, we watch ----
+              (%gc-write64 (+ tb #x338) (+ (%gc-region-cell) 8))
+              (%ha-barrier-at tb #x300)
+              (%gc-write64 (+ tb #x318) (%ha-barrier-wait-at tb #x300 budget))
+              (%ha-region-watch-loop tb rcb2 (+ (%gc-region-cell) 8) work
+                                     #x308 #x310)
+              (%gc-write64 (+ res #x38) (%ha-join-t2 budget))
+              ;; ---- NOBODY COLLECTED, and that is measured, not assumed ----
+              ;; The switch loop leaves the cell naming region 0 for part of
+              ;; every iteration while R12/R14 still belong to this thread's own
+              ;; region, so a collection landing inside that window would
+              ;; evacuate the wrong heap.  It cannot happen — neither loop
+              ;; allocates, by construction, and %GC-REGION-SWITCH-LOOP must
+              ;; stay that way — and the three collection counts below say so.
+              (%gc-write64 (+ res #x130) (%gc-meta-read (+ r0 #x20) (%gc-meta-scale)))
+              (%gc-write64 (+ res #x138) (%gc-meta-read (+ rcb2 #x20) (%gc-meta-scale)))
+              (%gc-write64 (+ res #x140) (%gc-meta-read (+ rcb3 #x20) (%gc-meta-scale)))
+              ;; ---- put this thread back where it started, both halves ----
+              (%gc-region-enter r0)
+              (%ha-set-percpu-mode mode0)
+              ;; ---- evidence ----
+              (%gc-write64 (+ res #x40) (%gc-read64 (+ tb #xD0)))
+              (%gc-write64 (+ res #x48) (%gc-read64 (+ tb #xA8)))
+              (%gc-write64 (+ res #x50) (%gc-read64 (+ tb #xB0)))
+              (%gc-write64 (+ res #x58) (%gc-read64 (+ tb #xD8)))
+              (%gc-write64 (+ res #x60) (%gc-read64 (+ tb #xB8)))
+              (%gc-write64 (+ res #x68) rcb2)
+              (%gc-write64 (+ res #x70) rcb3)
+              (%gc-write64 (+ res #x78) r0)
+              (%gc-write64 (+ res #x80) (%gc-read64 (+ tb #x10)))
+              (%gc-write64 (+ res #x88) (%gc-read64 (+ tb #x28)))
+              (%gc-write64 (+ res #x90) (%gc-read64 (+ tb #x30)))
+              (%gc-write64 (+ res #x98) (%gc-read64 (+ tb #x320)))
+              (%gc-write64 (+ res #xA0) (%gc-read64 (+ tb #x318)))
+              (%gc-write64 (+ res #xA8) (%gc-read64 (+ tb #xF0)))
+              (%gc-write64 (+ res #xB0) (%gc-read64 (+ tb #xF8)))
+              (%gc-write64 (+ res #xB8) (%gc-read64 (+ tb #x308)))
+              (%gc-write64 (+ res #xC0) (%gc-read64 (+ tb #x310)))
+              (%gc-write64 (+ res #xC8) (%gc-read64 (+ tb #x330)))
+              (%gc-write64 (+ res #xD0) (%gc-read64 (+ tb #x328)))
+              (%gc-write64 (+ res #xD8) work)
+              (%gc-write64 (+ res #xE0) (%gc-read64 (+ tb #xE0)))
+              (%gc-write64 (+ res #xE8) (%gc-read64 (+ tb #xE8)))
+              (%gc-write64 (+ res #xF0) a1)
+              (%gc-write64 (+ res #xF8) (get-alloc-ptr))
+              (%gc-write64 (+ res #x100) (%gc-read64 (+ tb #x58)))
+              (%gc-write64 (+ res #x108) (%gc-read64 (+ tb #x338)))
+              (%gc-write64 (+ res #x110) *ha-r2-from*)
+              (%gc-write64 (+ res #x118) (%gc-region))
+              (%gc-write64 (+ res #x128) *ha-r1-from*)
               res)))))
 
 ;;; ============================================================

@@ -214,7 +214,16 @@
    carved.  Slot j's evidence is at res + 0x20 + j*16 (read-back) and
    res + 0x28 + j*16 (the machine word), with j the slot INDEX 0..7 and the
    byte offset 8*j.  Values written are 700000 + j."
-  (let ((rc (%ha-percpu-init)))
+  (let ((rc (%ha-percpu-init))
+        ;; THE :CPU-ID SLOT IS ABOUT TO HOLD 700002, and if the per-CPU
+        ;; active-region mode were ON that would make %GC-REGION-CELL index
+        ;; 700002 entries off a 16-entry table.  Nothing between here and the
+        ;; block being zeroed again allocates, so no collection can read it —
+        ;; but "nothing allocates" is a property of this function's body, not of
+        ;; the mechanism, so the mode word is turned off for the duration and
+        ;; put back.  It is zero in any image that has not started a thread.
+        (savemode (mem-ref #x10000FF8 :u32)))
+    (setf (mem-ref #x10000FF8 :u32) 0)
     (if (zerop (%ha-carve))
         0
         (let ((res (+ *ha-band* #x400))
@@ -260,6 +269,7 @@
           (%gc-write64 (+ res #xA8) (get-alloc-ptr))
           ;; ---- leave the block as net/actors.lisp expects to find it ----
           (%ha-zero pb (+ pb 64))
+          (setf (mem-ref #x10000FF8 :u32) savemode)
           res))))
 
 ;;; ============================================================

@@ -4990,7 +4990,22 @@
    reads absolute address 16 and takes SIGSEGV.  Turning this on is only
    correct on a target that has actually installed a per-CPU block, and it must
    be turned on together with mvm/gc.lisp's gate word +GC-REGION-PERCPU-ADDR+
-   so the Lisp and native sides read the SAME cell.")
+   so the Lisp and native sides read the SAME cell.
+
+   :RUNTIME — emit BOTH forms and branch between them on the gate word itself,
+   which is exactly what mvm/gc.lisp's %GC-REGION-CELL already does in Lisp.
+   THIS IS WHAT A HOSTED IMAGE NEEDS, and T is not.  ./modus is one binary that
+   has to serve two populations: ordinary single-threaded runs, where the GS
+   base is 0 and an unguarded `GS:[16]' is a SIGSEGV on the first collection,
+   and threaded runs, where every thread has installed a per-CPU block and the
+   collector MUST read this thread's cell.  A build-time T would make the first
+   population crash; :RUNTIME lets the same image be both, with the mode word as
+   the single switch that flips the Lisp side and the native side together.
+
+   The cost is one compare and one branch, and it is paid THREE TIMES PER
+   COLLECTION — the only callers are inside the GC trampoline (region base at
+   entry, again for the Cheney scan, again for the semispace swap), never in an
+   allocation fast path.")
 
 (defun emit-load-gc-region (buf reg)
   "REG := the base address of the ACTIVE region's GC control block.
@@ -5007,33 +5022,52 @@
    answer `region 0' — whose block is the historic one at +GC-REGION-0-BASE+.
    That is why stage 1 needed no boot-descriptor edit on any of the four
    targets, three of which cannot be booted where this was written."
-  (if *x64-gc-region-percpu*
-      ;; PER-CPU: reg = cpu_id (TAGGED, i.e. 2*id) -> 8*id -> [reg + table].
-      ;; The table is +GC-REGION-MAX-CPUS+ entries based at +GC-REGION-ADDR+,
-      ;; so entry 0 IS the historic word at the historic address.
-      (progn
-        (when (or (= (logand (reg-code reg) 7) 4)
-                  (= (logand (reg-code reg) 7) 5))
-          (error "emit-load-gc-region: the per-CPU form indexes off REG, so ~
-                  REG's low three bits must not be 4 (SIB escape) or 5 ~
-                  (RIP/disp32 escape); got ~S" reg))
-        ;; MOV reg, GS:[cpu_id]          65 REX.W 8B /r SIB=25 disp32
-        (emit-byte buf #x65)
-        (emit-byte buf (logior #x48 (if (reg-extended-p reg) #x04 0)))
-        (emit-byte buf #x8B)
-        (emit-byte buf (logior #x04 (ash (logand (reg-code reg) 7) 3)))
-        (emit-byte buf #x25)
-        (emit-u32 buf modus.mvm::+gc-percpu-cpu-id-off+)
-        ;; SHL reg, 2                    2*id -> 8*id
-        (emit-shl-reg-imm buf reg 2)
-        ;; MOV reg, [reg + table]        REX.W 8B /r mod=10 disp32
-        (emit-byte buf (logior #x48 (if (reg-extended-p reg) #x05 0)))
-        (emit-byte buf #x8B)
-        (emit-byte buf (logior #x80
-                               (ash (logand (reg-code reg) 7) 3)
-                               (logand (reg-code reg) 7)))
-        (emit-u32 buf modus.mvm::+gc-region-addr+))
-      (emit-mov-reg-abs buf reg modus.mvm::+gc-region-addr+))
+  (flet ((emit-percpu-form ()
+           ;; PER-CPU: reg = cpu_id (TAGGED, i.e. 2*id) -> 8*id -> [reg + table].
+           ;; The table is +GC-REGION-MAX-CPUS+ entries based at
+           ;; +GC-REGION-ADDR+, so entry 0 IS the historic word at the historic
+           ;; address.
+           (when (or (= (logand (reg-code reg) 7) 4)
+                     (= (logand (reg-code reg) 7) 5))
+             (error "emit-load-gc-region: the per-CPU form indexes off REG, so ~
+                     REG's low three bits must not be 4 (SIB escape) or 5 ~
+                     (RIP/disp32 escape); got ~S" reg))
+           ;; MOV reg, GS:[cpu_id]          65 REX.W 8B /r SIB=25 disp32
+           (emit-byte buf #x65)
+           (emit-byte buf (logior #x48 (if (reg-extended-p reg) #x04 0)))
+           (emit-byte buf #x8B)
+           (emit-byte buf (logior #x04 (ash (logand (reg-code reg) 7) 3)))
+           (emit-byte buf #x25)
+           (emit-u32 buf modus.mvm::+gc-percpu-cpu-id-off+)
+           ;; SHL reg, 2                    2*id -> 8*id
+           (emit-shl-reg-imm buf reg 2)
+           ;; MOV reg, [reg + table]        REX.W 8B /r mod=10 disp32
+           (emit-byte buf (logior #x48 (if (reg-extended-p reg) #x05 0)))
+           (emit-byte buf #x8B)
+           (emit-byte buf (logior #x80
+                                  (ash (logand (reg-code reg) 7) 3)
+                                  (logand (reg-code reg) 7)))
+           (emit-u32 buf modus.mvm::+gc-region-addr+)))
+    (cond
+      ((eq *x64-gc-region-percpu* :runtime)
+       ;; BOTH FORMS, selected by the SAME gate word mvm/gc.lisp's
+       ;; %GC-REGION-CELL branches on — so the collector and the mutator cannot
+       ;; end up reading different cells, whatever the mode is.  See the defvar
+       ;; for why a hosted image needs this rather than a build-time T.
+       (let ((percpu (make-label))
+             (joined (make-label)))
+         ;; CMP dword [+GC-REGION-PERCPU-ADDR+], 0   83 3C 25 disp32 imm8
+         (emit-bytes buf #x83 #x3C #x25)
+         (emit-u32 buf modus.mvm::+gc-region-percpu-addr+)
+         (emit-byte buf #x00)
+         (emit-jcc buf :ne percpu)
+         (emit-mov-reg-abs buf reg modus.mvm::+gc-region-addr+)
+         (emit-jmp buf joined)
+         (emit-label buf percpu)
+         (emit-percpu-form)
+         (emit-label buf joined)))
+      (*x64-gc-region-percpu* (emit-percpu-form))
+      (t (emit-mov-reg-abs buf reg modus.mvm::+gc-region-addr+))))
   (let ((have-region (make-label)))
     (emit-cmp-reg-imm buf reg 0)
     (emit-jcc buf :ne have-region)

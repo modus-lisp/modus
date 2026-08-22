@@ -290,6 +290,45 @@
   (let ((sp 31) (x0 0) (x16 16) (x17 17)
         (x24 24) (x25 25) (x26 26))
 
+    ;; --- -1. CACHE/MMU SANITIZE — never trust the loader (#275) -----------
+    ;; This image's whole memory model assumes SCTLR.M=0 (Device-nGnRnE,
+    ;; DMA-coherent, ordered).  The firmware-direct kernel8.img path honours
+    ;; that, but U-Boot's `go' (the netboot rig) jumps here with U-Boot's
+    ;; MMU + data cache STILL ON — unlike bootm, `go' does no cache teardown.
+    ;; Proven on a Pi Zero 2 W: an unaligned :u32 mem-ref SUCCEEDED at the
+    ;; REPL (Normal memory ⇒ translation on), and every DWC2 DMA read saw
+    ;; pre-write DRAM while CPU stores sat dirty in the inherited cache —
+    ;; the entire "stale SETUP" saga.  Sanitize unconditionally:
+    ;;   1. DC CIVAC every line of the low 512MB (dirty loader lines must
+    ;;      reach DRAM BEFORE the cache goes off; VA=PA under U-Boot's map,
+    ;;      and with caches already off the ops are harmless no-ops).
+    ;;   2. Clear SCTLR_EL2.{M,C} (both boot paths enter at EL2; guarded by
+    ;;      CurrentEL so a hypothetical EL1 entry skips the EL2 register).
+    ;;   3. Clear SCTLR_EL1.{M,C} too — legal from EL2, harmless, and covers
+    ;;      any future drop to EL1.
+    ;; X0 (firmware DTB pointer) is preserved; scratch = x9/x10/x11/x16/x17.
+    (emit-aarch64-load-imm64 buf x16 0)
+    (emit-aarch64-load-imm64 buf x17 #x20000000)
+    (let ((clean-loop (a64-current-index buf)))
+      (emit-aarch64-u32 buf #xD50B7E30)            ; dc civac, x16
+      (a64-add-imm buf x16 x16 64)
+      (a64-cmp-reg buf x16 x17)
+      (a64-bcond buf #b0011 (- clean-loop (a64-current-index buf))))
+    (emit-aarch64-u32 buf #xD5033F9F)              ; dsb sy
+    (emit-aarch64-u32 buf #xD5384249)              ; mrs x9, CurrentEL
+    (emit-aarch64-u32 buf #xF100213F)              ; cmp x9, #8  (EL2?)
+    (a64-bcond buf #b0001 5)                       ; b.ne +5 — skip EL2 block
+    (emit-aarch64-u32 buf #xD53C100A)              ; mrs x10, sctlr_el2
+    (emit-aarch64-u32 buf #xD28000AB)              ; movz x11, #5  (M|C)
+    (emit-aarch64-u32 buf #x8A2B014A)              ; bic x10, x10, x11
+    (emit-aarch64-u32 buf #xD51C100A)              ; msr sctlr_el2, x10
+    (emit-aarch64-u32 buf #xD538100A)              ; mrs x10, sctlr_el1
+    (emit-aarch64-u32 buf #xD28000AB)              ; movz x11, #5
+    (emit-aarch64-u32 buf #x8A2B014A)              ; bic x10, x10, x11
+    (emit-aarch64-u32 buf #xD518100A)              ; msr sctlr_el1, x10
+    (emit-aarch64-u32 buf #xD5033F9F)              ; dsb sy
+    (emit-aarch64-u32 buf #xD5033FDF)              ; isb
+
     ;; --- 0. ZERO THE RUNTIME METADATA WINDOW (the BSS stand-in) -----------
     ;; On Linux the ELF BSS is zero-filled by the kernel.  On bare metal these
     ;; words hold whatever the firmware left in RAM, and the very first Lisp

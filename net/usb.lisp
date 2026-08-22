@@ -72,6 +72,15 @@
   ;; request-type bit 7: 0=OUT (host->device), 1=IN (device->host)
   ;; buf: DMA buffer for data stage (physical address). Ignored if len=0.
   ;; Returns: 1=success, <=0=error
+  ;;
+  ;; #275 history: this function once flushed the TX+RX FIFOs per transfer to
+  ;; fight a "stale SETUP replay" on real silicon.  The true root cause was
+  ;; the ARM DATA CACHE inherited from U-Boot's `go' (MMU+dcache left ON):
+  ;; CPU stores to this buffer sat dirty in cache while the DWC2 DMA-fetched
+  ;; stale DRAM, so the wire carried the previous request.  Fixed at the root
+  ;; by the boot preamble's cache/MMU sanitize (boot/boot-rpi-cl.lisp step
+  ;; -1).  No per-transfer FIFO flush is needed (U-Boot and Linux flush only
+  ;; at core init), and none ever fixed it.
   (let ((ch 0))
     ;; Stage 1: SETUP
     (usb-build-setup request-type request value index len)

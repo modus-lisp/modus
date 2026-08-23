@@ -935,6 +935,12 @@
                    (mvm-text "net/actors.lisp")
                    (string #\Newline)
                    (mvm-text "net/hosted-actors-post.lisp")
+                   (string #\Newline)
+                   ;; REAL TIME AND REAL BLOCKING.  Last in the group, because
+                   ;; its SLEEP is a last-defun-wins override of the CL
+                   ;; bridge's no-op stub and its %THR-PAGE calls SPIN-LOCK
+                   ;; (net/actors.lisp) and %HA-ZERO (net/hosted-actors.lisp).
+                   (mvm-text "net/hosted-sync.lisp")
                    (string #\Newline))
       ""))
 

@@ -1158,6 +1158,9 @@ TERMINATES — deliberately not that every run passes, because the second bug is
 still open.
 
 **THE SECOND BUG IS NOT FIXED, AND IT IS THE CONCURRENT FORCED COLLECTION.**
+**— FIXED, and it was not the collection: see THE PER-THREAD WINDOW below.  The
+standing suspects named at the end of this section were right.  Kept as written
+because the bisect that localised it is the reason the fix was findable.**
 Localised by varying only `*gcevery*` from the script, which needs no rebuild:
 
 | arm | forced collections | result |
@@ -1188,7 +1191,10 @@ pieces of shared BSS named below that are neither tables nor per-thread: the
 jump to a dead stack address.  (The serialized arm additionally reintroduces a
 hang of its own, unexplained, on a path that is not the shipping default.)
 
-**WHAT IS STILL SERIALIZED, AND WHY.**  `test/hosted-thread-lisp.lisp` holds the
+**WHAT IS STILL SERIALIZED, AND WHY.  — The two pieces of shared BSS named
+here are PER-THREAD NOW (see THE PER-THREAD WINDOW below); the whole-iteration
+critical section in `test/hosted-thread-lisp.lisp` has NOT been narrowed, so
+this paragraph still describes that test.**  `test/hosted-thread-lisp.lisp` holds the
 runtime lock across the whole **Lisp-level** work of an iteration, not just the
 table calls.  Per-call locking is enough for the **tables**, but FORMAT and the
 printer also touch two pieces of shared BSS that are neither tables nor
@@ -1203,6 +1209,123 @@ the forced collections **are** genuinely concurrent.
 function" here means registering a fresh name in the shared symbol-function
 table and calling back through it — the table hazard, not the compiler's own
 globals.
+
+### THE PER-THREAD WINDOW: the MV buffer and the handler-frame stack stop being one copy per process
+
+**THIS CLOSES BOTH OPEN THREAD DEFECTS ABOVE, AND THEY WERE ONE DEFECT.**  The
+"second bug" (a fault during a concurrent forced collection, 54 of 60) and the
+residual hang were the same thing: **the handler-frame stack**.  Three pieces of
+the low BSS are state of the RUNNING COMPUTATION held one copy per PROCESS:
+
+| slot | what | failure mode under two threads |
+|---|---|---|
+| `0x10000090` / `0x10000098..0x10000138` | MV count + up to 21 extras | a wrong ANSWER — the producer stores in its epilogue, the consumer reads at the call site |
+| `0x10000150` | dynamic nargs | an `&rest` callee reads the other thread's caller's count |
+| `0x10000180..0x1019F`, `0x10000400..0xC0F`, `0x10000C10..0xC2F` | armed handler frame, frame stack + depth, longjmp scratch | a wrong JUMP — A arms, B arms over it, A's next unwind restores B's frame and lands **on B's stack** |
+
+That last row is exactly the captured fault signature: `RSP` on the process
+stack, a jump either to **0** or to an address **inside that same stack**.
+
+**THE MECHANISM IS A SEGMENT BASE, NOT A NEW ADDRESS.**  The compiler marks a
+`LOAD`/`STORE` whose address is provably a window slot — a new **width bit**
+(`+WIDTH-TLS-BIT+`; widths 4..7 are widths 0..3 plus "this is a window slot"),
+chosen over a new opcode because the address is already in a register by then,
+so the whole change is one prefix byte at one instruction rather than a new
+opcode number across four translators, an interpreter and the assembler.
+`translate-x64` turns the mark into an **FS override**.  The raw-asm sites carry
+the same prefix: SETJMP, LONGJMP, `__handler_push`/`__handler_pop`, the
+SIGSEGV/SIGBUS/SIGFPE/SIGILL stub, SET/GET-NARGS, and both GC trampolines'
+MV-extras root scan.
+
+**WHY FS, AND WHY NOTHING NEEDS INITIALISING.**  GS is already the per-CPU
+segment (`PERCPU-REF/-SET`), and the two must not fight.  A fresh Linux process
+has **FS base 0**, so `FS:[0x10000180]` *is* `[0x10000180]` — same word, same
+address, one byte longer.  A mode word would have had to be written before the
+first `MULTIPLE-VALUE-BIND`, and the first `MULTIPLE-VALUE-BIND` happens during
+boot.  A worker issues one `arch_prctl(ARCH_SET_FS, block - 0x10000000)` as its
+first act.  The self slot at `0x10000C30` holds **the base, not the block**, for
+the same reason: the main thread's is BSS zero and correct.
+
+**WHAT IS DELIBERATELY OUT OF THE WINDOW, because a wrong answer is silent:**
+`0x10000148` (keyword table), `0x10000158` (intern counter), `0x10000160/68`
+(code bounds), `0x10000170` (package table), `0x10000080/88` (globals alist,
+symbol table) sit inside the same address range and are process-global — a
+per-thread copy of the code bounds reads zero and breaks `FUNCTIONP` on thread
+2.  The window is an explicit **SET** of slots, not a range.
+`+CLOSURE-ENV-ADDR+` is out too: on x86-64 the closure environment is **R13**.
+
+**EVERY OTHER IMAGE IS UNCHANGED BY CONSTRUCTION.**  Compiler flag off = the bit
+is never emitted; back-end flag off = no prefix and widths 4..7 mask to 0..3;
+aarch64/i386/interp mask unconditionally.  Only `build-generic-cli` sets both.
+The one hand-computed length in the tree — SETJMP's `lea rax,[rip+N]`, which
+counts bytes to the end of its own trap block — is **15 not 14** when the window
+is on.
+
+**MEASURED, `test/hosted-thread-lisp.lisp`, 100 runs each, same harness
+(`test/classify-thread-lisp.sh`):**
+
+| | pass | clean death | ran-but-failed | HANG |
+|---|---|---|---|---|
+| `c187941` (before) | 91 | 6 | 1 | **2** |
+| after | **100** | 0 | 0 | **0** |
+
+**ACCEPTANCE:** `test/hosted-mv-handler.lisp`, 24 of 24 — two threads, 400
+iterations each, a forced collection every 25, per iteration a TRUNCATE each
+thread reconstructs, a three-value return checked in full, an unwind through
+`handler-case`, a NESTED unwind whose inner handler itself unwinds, and a
+three-value return ACROSS an armed `handler-case`.  Both barrier timeouts 0.
+**And the fix removed must fail:** `test/hosted-mv-handler-unsync.lisp` is the
+same binary and workload with MODE 1 (thread 2 skips `%TLS-INSTALL`) — **3 of 3
+died rc=139**.
+
+**BOUNDARY, stated:** the compiler baked *into* the image keeps `*TLS-WINDOW*`
+nil, so a function compiled by the RUNTIME JIT emits absolute window accesses.
+Identical on the main thread (base 0), wrong on a worker.  Runtime EVAL on a
+second thread was never attempted anyway.
+
+### N threads, and spawn takes a CLOSURE
+
+`%SPAWN-THREAD` took a **raw native entry address**, and
+`net/hosted-actors-post.lisp` had one stack, one thread block and one TID word —
+**exactly two OS threads**, and a body that had to be a zero-argument top-level
+`DEFUN`.  A closure could not be a thread body, so a thread could carry **no
+state of its own**.
+
+Now a table of **16** threads, each with its own stack, per-thread window (FS),
+per-CPU block (GS), TID word, and a **Lisp closure** as its body.
+`%MAKE-NATIVE-THREAD` takes a function and returns a handle;
+`%NATIVE-THREAD-ALIVE-P` / `%JOIN-NATIVE-THREAD` read the TID word **the kernel
+clears** on exit, not a flag the thread set about itself.
+
+**How a closure reaches a thread that cannot be passed an argument:** the clone
+stub enters the child with a bare `call rbx` on a fresh stack.  So the child is
+always the same zero-argument **trampoline**, and what varies is a **slot
+number** it picks up from the table.  Spawning is serialised by a lock and a
+handshake — publish slot, spawn, wait for the child's ack — so "which slot am
+I?" has one answer while any child is reading it.  The child acks **before**
+running the body: the ack means "I have read my slot".
+
+**Order inside the trampoline is load-bearing:** the per-thread window FIRST
+(until it returns, the thread's values and handler frames are still the
+spawner's — cloned without `CLONE_SETTLS`), then per-CPU block and CPU id, then
+the closure.
+
+The 16 per-CPU blocks and the thread table live in the thread page, grown 8 KB →
+336 KB; nothing at a lower offset moved.  The actor band only ever had room for
+two per-CPU blocks.
+
+**ACCEPTANCE:** `test/hosted-many-threads.lisp`, 12 of 12 — eight threads, eight
+closures over eight different captured values, all eight through a spin-budget
+barrier with **0 timeouts**, each summing its OWN K 200000 times and required to
+produce exactly `K*200000`, and all eight gettids / CPU ids / window bases
+pairwise distinct and none the driver's.
+
+**THE NEXT THING IN THE WAY, and it is not the thread layer:** a thread that
+**allocates** needs a **GC region** of its own, and `%HA-CARVE` produces exactly
+**two** out of region 0.  So 16 threads get everything except a region, and the
+eight-thread body is fixnum arithmetic, raw memory and syscalls.  Carving N
+regions is a change to the carve.  Until then a thread-per-client server can
+have its threads but not its conses.
 
 ### The socket layer becomes usable by a SERVER: unbounded transfers, per-CPU buffers, poll(2)
 

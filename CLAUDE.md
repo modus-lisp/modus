@@ -925,7 +925,7 @@ spin budget; a collector alone at entry waits for a second).  Gated `:LINUX`, so
 bare-metal x64 emission is byte-identical.
 
 **The negative control is the old lock, in the same binary, on the same
-workload** — `test/hosted-thread-gc-concurrent.lisp` (48 checks) runs it twice,
+workload** — `test/hosted-thread-gc-concurrent.lisp` (55 checks) runs it twice,
 one flag apart:
 
 | | overlap witnesses | barrier meetings | collectors inside at end |
@@ -968,6 +968,14 @@ threaded target: thread 1 gets scratch entry 0, thread 2 entry 1, +32 bytes.
 
 `build-checks.lisp` CHECK G now fails the build if `mvm/gc.lisp` still spells
 `0x10000108` or `0x10000110` as a literal — verified by reintroducing one.
+
+**AND THE ALIGNMENT LEDGER HAS A POSITIVE CONTROL**, because after the fix it
+reads zero everywhere, which means its increment path had never executed — the
+same "a check that can only answer 0" trap 0fdb21a caught in its own checksum.
+`%HA-ALIGN-CONTROL` initialises a throwaway block five times (aligned, then
+from / to / size / all-three nudged by exactly the 512 the shipping carve was
+off by) and the test asserts masks `0 / 1 / 2 / 4 / 7` and that
+`%GC-REGION-INIT` counted **4 of 5**.
 
 ### Conservative-root validation collector (x64, landed ace1544 + 810a975)
 

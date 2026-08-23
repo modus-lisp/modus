@@ -1690,6 +1690,52 @@
 ;; hash-table objects at BSS slots — so NO GC change is needed.  (The store
 ;; head is a hash-table = a cons whose car is the alist and whose cdr carries
 ;; the %HT-TAG metadata; a value of raw 0 means "not yet created".)
+;;; ============================================================
+;;; THE RUNTIME-TABLE LOCK
+;;; ============================================================
+;;;
+;;; THE PROBLEM IT EXISTS FOR.  The globals hash table below, the symbol intern
+;;; table at #x10000088, the keyword table at #x10000148, the package-by-hash
+;;; table at #x10000170 and the macro expander table in mvm/cl-eval.lisp are ONE
+;;; SET OF SHARED MUTABLE STRUCTURES.  Every thread interns into them, and a
+;;; concurrent PUTHASH is not merely a lost entry: two threads that both miss the
+;;; same GETHASH both allocate a symbol and both store it, so `(eq 'foo 'foo)'
+;;; stops holding ACROSS THREADS — the one invariant the whole symbol system
+;;; rests on.  Until this existed, a second thread could run computation but not
+;;; Lisp, and the threaded selftests said so in their headers.
+;;;
+;;; IT IS A GATE, AND THE GATE IS OFF EVERYWHERE BY DEFAULT.  #x10000DB8 is a
+;;; BSS word; nothing writes it unless a program deliberately declares that it
+;;; is running more than one thread through the runtime.  While it reads zero —
+;;; which is every image ever built, every bare-metal target, every ANSI gate
+;;; runner and every ordinary ./modus — %RT-ENTER and %RT-LEAVE are one 32-bit
+;;; load and a branch, and the two functions they would call are the NO-OPS
+;;; defined here.  A hosted x86-64 image overrides those two
+;;; (net/hosted-sync.lisp) with the real thing: a RECURSIVE futex mutex that
+;;; also makes region 0 the active heap for the duration, so that everything
+;;; allocated while the shared tables are being mutated lands in ONE region
+;;; rather than in the mutating thread's own — a symbol reachable only from a
+;;; table in region 0 would otherwise be collected the next time its own
+;;; thread's region was.
+;;;
+;;; WHY THE NO-OPS ARE DEFINED HERE RATHER THAN LEFT UNRESOLVED.  An unresolved
+;;; call resolves to %UNRESOLVED-FN, which is harmless at runtime but shows up
+;;; in every build's unresolved-function census; and the census is a ratchet.
+;;; Two one-line defuns keep every non-hosted image's count exactly where it was.
+(defun %rt-threads-live-p ()
+  "Non-zero when more than one thread is running Lisp through the shared
+   runtime tables.  Zero — the BSS default — everywhere else."
+  (mem-ref #x10000DB8 :u32))
+
+(defun %rt-enter-locked () 0)
+(defun %rt-leave-locked () 0)
+
+(defun %rt-enter ()
+  (if (= (mem-ref #x10000DB8 :u32) 0) 0 (%rt-enter-locked)))
+
+(defun %rt-leave ()
+  (if (= (mem-ref #x10000DB8 :u32) 0) 0 (%rt-leave-locked)))
+
 (defun %globals-table ()
   "The globals hash-table object at #x10000080, or NIL if not yet created."
   (let ((head (mem-ref #x10000080 :u64)))
@@ -1703,8 +1749,13 @@
   (when (null name-or-hash) (return-from symbol-value nil))
   (when (eq name-or-hash t) (return-from symbol-value t))
   (let ((key (if (integerp name-or-hash) name-or-hash
-                 (aref name-or-hash 0)))
-        (tbl (%globals-table)))
+                 (aref name-or-hash 0))))
+    ;; THE READ IS LOCKED TOO, and not out of caution: PUTHASH grows and
+    ;; REHASHES this table, and a reader walking it mid-rehash sees a structure
+    ;; that is momentarily neither the old one nor the new one.  Under a single
+    ;; thread %RT-ENTER is a load and a branch.
+    (%rt-enter)
+    (let ((tbl (%globals-table)))
     ;; GETHASH returns (VALUES value present-p) — TWO values.  Returning it
     ;; directly in tail position PROPAGATES both, leaving MV-COUNT=2 for the
     ;; caller.  The old linear-alist SYMBOL-VALUE returned exactly one value,
@@ -1714,17 +1765,21 @@
     ;; which then reports length 2 (boole.2 collected spuriously) or corrupts
     ;; the funcall MV path into a wild call (boole.1/.3 → RIP=0xDEAD0004).
     ;; Truncate to a single value with (VALUES …), which forces MV-COUNT=1.
-    (if tbl (values (gethash key tbl)) nil)))
+      (let ((v (if tbl (gethash key tbl) nil)))
+        (%rt-leave)
+        (values v)))))
 
 (defun set-symbol-value (name-hash value)
   "Set a global variable by its tagged name hash.  O(1) via the globals
    hash table at #x10000080, created lazily on first use."
+  (%rt-enter)
   (let ((tbl (%globals-table)))
     (unless tbl
       (setq tbl (make-hash-table))
       (setf (mem-ref #x10000080 :u64) tbl))
-    (puthash name-hash tbl value)
-    value))
+    (puthash name-hash tbl value))
+  (%rt-leave)
+  value)
 
 ;;; ============================================================
 ;;; Interned Symbols
@@ -1759,6 +1814,23 @@
 
 
 (defun %intern-symbol-pkg (name-hash pkg-hash)
+  "Intern a symbol identified by (NAME-HASH, PKG-HASH), under the runtime-table
+   lock.  See %RT-ENTER: the lock is a load and a branch until a program
+   declares that it is running Lisp on more than one thread, and from then on it
+   both serialises the table and makes region 0 the heap the symbol is allocated
+   in — a symbol reachable only from a table in region 0 would be collected the
+   next time its own thread's region was.
+
+   THE WRAPPER IS A SEPARATE FUNCTION because this compiler resolves every call
+   to the LAST defun of a name, so a hosted image cannot wrap a function by
+   redefining it and calling the old one.  Splitting the body out is the only
+   shape that lets the lock be added in ONE place and still be overridable."
+  (%rt-enter)
+  (let ((r (%intern-symbol-pkg-1 name-hash pkg-hash)))
+    (%rt-leave)
+    r))
+
+(defun %intern-symbol-pkg-1 (name-hash pkg-hash)
   "Intern a symbol identified by (NAME-HASH, PKG-HASH).  Per CLHS
    11.1.2 — see SYMBOLS_PLAN.md — symbol identity is per-package: the
    same NAME-HASH in two different packages produces two distinct
@@ -1850,6 +1922,19 @@
   (setf (mem-ref #x10000170 :u64) (make-hash-table)))
 
 (defun %intern-keyword (name-hash)
+  "Intern a keyword by name hash, under the runtime-table lock.  Split into a
+   wrapper and a body for the reason %INTERN-SYMBOL-PKG gives.
+
+   THIS ONE IS HOT: compile-keyword emits a call to it for EVERY `:foo' literal
+   in compiled code, so it runs on every evaluation of every keyword, FORMAT's
+   included.  That is exactly why it must be locked once a second thread exists,
+   and exactly why the lock has to cost nothing until then."
+  (%rt-enter)
+  (let ((r (%intern-keyword-1 name-hash)))
+    (%rt-leave)
+    r))
+
+(defun %intern-keyword-1 (name-hash)
   "Intern a keyword by name hash.  Same shape as %INTERN-SYMBOL but uses
    the keyword table at #x10000148 and allocates a #x53-subtag object so
    KEYWORDP can identify it.  Compile-keyword in compiler.lisp emits

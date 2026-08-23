@@ -1244,50 +1244,109 @@
 (defun %ha-mt-stop-p (tb) (if (zerop (%gc-read64 (+ tb #x440))) nil t))
 
 ;;; ============================================================
-;;; THE GLOBAL COLLECTION LOCK — AN EXPLICIT PLACEHOLDER
+;;; THE GLOBAL COLLECTION LOCK IS GONE.  WHAT REPLACED IT.
 ;;; ============================================================
 ;;;
-;;; THE COLLECTOR IS NOT REENTRANT.  Two threads collecting at the same time
-;;; corrupt each other, and not subtly.  Three fixed, SHARED addresses carry
-;;; per-collection working state, one word each, with no per-region or
-;;; per-thread copy anywhere:
+;;; The placeholder lock this file carried took ONE lock around the WHOLE of
+;;; every collection, and named three reasons.  Each has been answered, and the
+;;; answers are not the same shape as each other:
 ;;;
-;;;   0x10000100  the scratch word %GC-FORWARD-SLOT / %GC-STORE-TAGGED /
-;;;               %GC-MOVE-WORD use ONCE PER FORWARDED SLOT
-;;;   0x10000108  tmp-free, the copying allocator's next free pointer
-;;;   0x10000110  to-end, the bound %GC-COPY-OBJECT's overrun guard reads
+;;;   1. "Per-collection working state lives at three FIXED SHARED addresses,
+;;;      0x10000100/0x10000108/0x10000110."  TRUE OF THE LISP COLLECTOR, AND
+;;;      THE LISP COLLECTOR IS NOT THE ONE THAT RUNS HERE.  Hosted x86-64 —
+;;;      like bare x64 and i386 — collects in a NATIVE trampoline
+;;;      (translate-x64's emit-gc-trampoline), which keeps every per-collection
+;;;      value in REGISTERS: R13 free pointer, RBX from_start, RCX from_end,
+;;;      RDX stack_base, R10 scan pointer, RAX/RSI/RDI temps, all pushed on the
+;;;      collecting thread's own stack at entry.  It is private per CPU by
+;;;      construction and always was.  mvm/gc.lisp's %GC-COLLECT — the aarch64
+;;;      SHIM path — really did share those three words, and no longer does:
+;;;      they are a 32-byte block addressed PER CPU and threaded through the
+;;;      whole collector as an argument (%GC-SCRATCH-CELL / SC).
+;;;   2. "%GC-SCAN-GLOBALS forwards a SHARED ROOT SET and forwarding REWRITES
+;;;      those slots."  TRUE, AND NOT A RACE BETWEEN TWO COLLECTORS.  A slot is
+;;;      rewritten only when its value points into THIS region's from-space, and
+;;;      two regions' from-spaces are disjoint, so two collectors' writes to the
+;;;      shared root set are disjoint.  The argument in full — including the
+;;;      read side, and the separate MUTATOR hazard it does NOT cover — is in
+;;;      mvm/gc.lisp under THE GLOBALS ROOT SET UNDER CONCURRENT COLLECTION.
+;;;   3. The reason the lock did NOT name, and the only one that was a live
+;;;      defect here: THE BITMAPS.  One shared pair for the whole heap, and
+;;;      translate-x64 sets bits with an unLOCKed `BTS [base], idx' whose
+;;;      read-modify-write unit is EIGHT BITMAP BYTES = 1024 HEAP BYTES.  The
+;;;      carve below produced 512-aligned to-spaces, so the two carved regions'
+;;;      to-space boundary sat inside one such unit and a mutator allocating in
+;;;      one region could lose a collector's survivor bit in the other.  Fixed
+;;;      by aligning the carve and CHECKING it (%GC-REGION-ALIGN-CHECK, and the
+;;;      violation ledger the acceptance test asserts is zero).
 ;;;
-;;; And separately: %GC-SCAN-GLOBALS forwards a SHARED ROOT SET — the globals
-;;; alist, the symbol / keyword / package intern tables, the multiple-value
-;;; extras — which EVERY region scans, and forwarding REWRITES those slots.  Two
-;;; collections running at once would each rewrite the other's roots.
-;;;
-;;; SO EVERY COLLECTION IS SERIALIZED HERE, behind one lock, taken around the
-;;; WHOLE of the collection.  This is a PLACEHOLDER and it is meant to be
-;;; deleted: making the collector reentrant — per-region or per-thread scratch
-;;; words, and a globals root set that is scanned without a data race — is a
-;;; dedicated pass that comes AFTER threads land.  When it does, this lock is
-;;; what it removes, and the three addresses and the globals root set named
-;;; above are exactly the reasons it exists.
-;;;
-;;; WHAT IT IS NOT.  It is not a substitute for that pass: threads still block
-;;; each other for the whole of a collection, so this buys correctness, not
-;;; parallelism.  And it is deliberately NOT the scheduler lock: +OP-RESTORE-CTX+
-;;; zeroes the scheduler lock on every context switch, so a collection lock
-;;; sharing that word would be released by any switch that happened to run.
-;;;
-;;; The word is the band's +0x108 — one of the three the scheduler lock used to
-;;; occupy before it moved to the BSS in step 1, and zeroed by %HA-CARVE.
+;;; THE LOCK IS KEPT, SWITCHED OFF, so a future regression can be bisected
+;;; against the serialized path and the two can be measured against each other.
+;;; %HA-SET-COLLECT-SERIALIZED writes the flag; it is a word in the band, so it
+;;; is zero (concurrent) in every fresh run.  The lock word itself is still the
+;;; band's +0x108 — one of the three the scheduler lock used to occupy before it
+;;; moved to the BSS in step 1, and zeroed by %HA-CARVE — and it is still
+;;; deliberately NOT the scheduler lock, because +OP-RESTORE-CTX+ zeroes that
+;;; one on every context switch and would release a collection lock sharing it.
 (defun %ha-collect-lock-addr () (+ (%ha-base) #x108))
+(defun %ha-collect-serialized-addr () (+ (%ha-base) #x110))
 
-(defun %ha-locked-collect-here ()
-  "%GC-COLLECT-HERE with the global collection lock held around the WHOLE
-   collection.  %GC-COLLECT-HERE pulls the allocation limit down to the pointer
-   and then allocates, so the collector runs INSIDE this call — which is what
-   makes wrapping it sufficient."
-  (spin-lock (%ha-collect-lock-addr))
-  (%gc-collect-here)
-  (spin-unlock (%ha-collect-lock-addr))
+(defun %ha-collect-serialized-p ()
+  (if (zerop (%gc-read64 (%ha-collect-serialized-addr))) nil t))
+
+(defun %ha-set-collect-serialized (v)
+  "Turn the OLD global collection lock back on (V non-zero) or off (V zero).
+   OFF is the default and the shipping behaviour.  ON exists so that a future
+   corruption can be bisected against the serialized path in the SAME binary,
+   and so the cost of the two can be compared — not as a fallback anything is
+   expected to need."
+  (%gc-write64 (%ha-collect-serialized-addr) v)
+  v)
+
+(defun %ha-collect-here ()
+  "Force one collection of THIS thread's active region.
+
+   CONCURRENT BY DEFAULT: no lock, so two threads' collections overlap in time.
+   That overlap is not hoped for, it is MEASURED — translate-x64's trampoline
+   counts collectors inside itself with LOCKed increments and records a witness
+   whenever one enters while another is already there (see the collector
+   concurrency probe there, and %HA-GC-CONC-WITNESS below).
+
+   With the serialize flag ON this is the pre-removal behaviour exactly: one
+   lock around the WHOLE collection.  %GC-COLLECT-HERE pulls the allocation
+   limit down to the pointer and then allocates, so the collector runs INSIDE
+   this call, which is what makes wrapping it sufficient."
+  (if (%ha-collect-serialized-p)
+      (progn
+        (spin-lock (%ha-collect-lock-addr))
+        (%gc-collect-here)
+        (spin-unlock (%ha-collect-lock-addr)))
+      (%gc-collect-here))
+  0)
+
+;;; ---- READING THE CONCURRENCY PROBE ---------------------------------------
+;;; The four words translate-x64's trampoline maintains.  They are BSS, zero in
+;;; a fresh process, and nothing but the trampoline and these functions touch
+;;; them.
+(defun %ha-gc-conc-cur ()     (%gc-read64 #x10000EE0))
+(defun %ha-gc-conc-witness () (%gc-read64 #x10000EE8))
+(defun %ha-gc-conc-met ()     (%gc-read64 #x10000EF8))
+(defun %ha-gc-conc-barrier () (%gc-read64 #x10000EF0))
+
+(defun %ha-set-gc-conc-barrier (n)
+  "Arm (N > 0) or disarm (N = 0) the in-collection barrier with a SPIN BUDGET
+   of N.  A collector that enters and finds itself alone re-reads the in-count
+   until a second collector arrives or the budget is spent.  It is BOUNDED on
+   purpose: with collections serialized the second thread can never arrive, so
+   a bounded barrier makes that case FAIL AN ASSERTION rather than hang."
+  (%gc-write64 #x10000EF0 n)
+  n)
+
+(defun %ha-gc-conc-reset ()
+  (%gc-write64 #x10000EE0 0)
+  (%gc-write64 #x10000EE8 0)
+  (%gc-write64 #x10000EF0 0)
+  (%gc-write64 #x10000EF8 0)
   0)
 
 ;;; THE HAND-BACK.  A worker that has finished and been told to stop returns the
@@ -1338,7 +1397,7 @@
               (if (= (%ha-msg-ok m i) 1) 0 (%ha-tb-bump tb #x488))
               (if (> nl 0)
                   (progn
-                    (%ha-locked-collect-here)
+                    (%ha-collect-here)
                     (%ha-tb-bump tb #x520)
                     (if (= (%gc-chain-check chain nl) want)
                         0 (%ha-tb-bump tb #x508))
@@ -1524,7 +1583,7 @@
       (send ida (cons i (cons (* i 7) (+ i 1000))))
       (if (> nl 0)
           (progn
-            (%ha-locked-collect-here)
+            (%ha-collect-here)
             (%ha-tb-bump tb #x528)
             (if (= (%gc-chain-check chain nl) want) 0 (%ha-tb-bump tb #x530)))
           0)
@@ -1623,7 +1682,7 @@
               (%gc-write64 (+ res #x1F0) g3a)
               (%gc-write64 (+ res #x200) g2a)
               (if (> nlinks 0)
-                  (progn (%ha-locked-collect-here) (%ha-locked-collect-here))
+                  (progn (%ha-collect-here) (%ha-collect-here))
                   0)
               (%gc-write64 (+ res #x1D8)
                            (%gc-sum-range (%gc-meta-read rcb3 k)
@@ -1715,3 +1774,96 @@
               (%gc-write64 (+ res #x1C0) (get-alloc-ptr))
               (%gc-write64 (+ res #x1C8) (%gc-region))
               res)))))
+
+;;; ============================================================
+;;; STEP 6 — COLLECTION UNDER TWO THREADS WITH NO LOCK, AND THE
+;;;          PROOF THAT THE COLLECTIONS OVERLAPPED IN TIME
+;;; ============================================================
+;;;
+;;; %HA-MT-SELFTEST already runs both threads with forced collections of their
+;;; own regions and audits isolation.  What it CANNOT tell you is whether the
+;;; two collections were ever inside the collector AT THE SAME MOMENT — and
+;;; without that, removing the lock is untested: a serialized implementation
+;;; passes every isolation and survival check it makes.
+;;;
+;;; THIS WRAPPER ADDS THE ONLY EVIDENCE THAT SETTLES IT, taken by the
+;;; trampoline itself at the true boundaries of a collection:
+;;;
+;;;   WITNESS  a collector entered while another was ALREADY INSIDE
+;;;   MET      a collector, alone at entry, waited at the in-collection BARRIER
+;;;            and a second one arrived before its spin budget ran out
+;;;   CUR      collectors still inside when the run ended — MUST be 0, or the
+;;;            counter is not balanced and the other two numbers mean nothing
+;;;
+;;; RUN IT TWICE, ONE FLAG APART.  SERIALIZE = 1 puts the old global collection
+;;; lock back, in the same binary, on the same workload.  The second thread then
+;;; cannot enter the trampoline while the first is inside, so WITNESS and MET are
+;;; STRUCTURALLY ZERO — which is exactly what makes the concurrent run's non-zero
+;;; readings evidence rather than decoration.  A serialized implementation FAILS
+;;; this test; that is the point of it.
+;;;
+;;; THE BARRIER IS BOUNDED, so the serialized arm fails an assertion instead of
+;;; hanging, and it is DISARMED on the way out so that no later collection in
+;;; this process — the toplevel's own, for instance — ever spins.
+;;;
+;;; RESULT BLOCK at band+0x340 (band+0x300..0x340 is %HA-MT-SELFTEST's foreign-
+;;; reference positive control; 0x340..0x400 is otherwise unused):
+;;;   +0x00 witness   +0x08 met   +0x10 cur (must be 0)
+;;;   +0x18 region-alignment violations (must be 0)   +0x20 last violation mask
+;;;   +0x28 the %HA-MT-SELFTEST result block, or 0
+;;;   +0x30 serialize flag as it was actually set
+;;;   +0x38 barrier budget as it was actually set
+;;;   +0x40 thread 1's forced collections   +0x48 thread 2's forced collections
+;;;   +0x50 heap-window-uniform for thread 1's region (see mvm/gc.lisp)
+;;;   +0x58 heap-window-uniform for thread 2's region
+;;;   +0x60 region 0's own alignment mask (must be 0)
+(defun %ha-mt-conc-selftest (nmsg budget nlinks serialize barrier)
+  "STEP-6 ACCEPTANCE.  %HA-MT-SELFTEST with the collector concurrency probe
+   reset and read back, the barrier armed, and the old global collection lock
+   either off (SERIALIZE = 0, the shipping path) or on (non-zero, the negative
+   control).  Returns the block above, or 0 if the band could not be carved."
+  (if (zerop (%ha-carve))
+      0
+      (let ((out (+ (%ha-base) #x340))
+            (tb (%ha-thread-block))
+            (res 0))
+        (%ha-zero out (+ out #x70))
+        ;; The alignment ledger is reset HERE, not at image start: the regions
+        ;; this run cares about are the ones %HA-MT-SELFTEST is about to
+        ;; initialise, and counting earlier carves would blur the answer.
+        (%gc-region-align-reset)
+        (%ha-gc-conc-reset)
+        (%ha-set-collect-serialized serialize)
+        (%ha-set-gc-conc-barrier barrier)
+        (setq res (%ha-mt-selftest nmsg budget nlinks))
+        ;; DISARM FIRST, unconditionally.  Everything after this point — the
+        ;; reads below, the caller's FORMAT — can allocate and therefore
+        ;; collect, and a live barrier would make each of those spin out its
+        ;; whole budget alone.
+        (%ha-set-gc-conc-barrier 0)
+        (%ha-set-collect-serialized 0)
+        (%gc-write64 (+ out #x00) (%ha-gc-conc-witness))
+        (%gc-write64 (+ out #x08) (%ha-gc-conc-met))
+        (%gc-write64 (+ out #x10) (%ha-gc-conc-cur))
+        (%gc-write64 (+ out #x18) (%gc-region-align-violations))
+        (%gc-write64 (+ out #x20) (%gc-region-align-last))
+        (%gc-write64 (+ out #x28) res)
+        (%gc-write64 (+ out #x30) serialize)
+        (%gc-write64 (+ out #x38) barrier)
+        (%gc-write64 (+ out #x40) (%gc-read64 (+ tb #x528)))
+        (%gc-write64 (+ out #x48) (%gc-read64 (+ tb #x520)))
+        (%gc-write64 (+ out #x50)
+                     (%gc-heap-window-uniform-p (%gc-read64 (+ tb #x538))))
+        (%gc-write64 (+ out #x58)
+                     (%gc-heap-window-uniform-p (%gc-read64 (+ tb #x4D0))))
+        ;; REGION 0's OWN ALIGNMENT.  It never goes through %GC-REGION-INIT —
+        ;; boot writes its control block directly — so the violation ledger
+        ;; above cannot see it.  Ask the oracle explicitly, or the invariant
+        ;; would be "checked" everywhere except on the region every image has.
+        (let ((k (%gc-meta-scale))
+              (r0 (%gc-region-0)))
+          (%gc-write64 (+ out #x60)
+                       (%gc-region-align-check (%gc-meta-read r0 k)
+                                               (%gc-meta-read (+ r0 #x08) k)
+                                               (%gc-meta-read (+ r0 #x10) k))))
+        out)))

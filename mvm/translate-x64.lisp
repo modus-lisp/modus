@@ -4376,6 +4376,105 @@
 (defconstant +mcgc-cfg-uncap-addr+     #x10000EA8)  ; one-shot: next establish ignores the to-run cap
 (defconstant +mcgc-max-segments+ 4096)              ; seg[] capacity (64 KiB of metadata slack)
 
+;;; ============================================================
+;;; THE COLLECTOR CONCURRENCY PROBE — how "the collections OVERLAPPED"
+;;; stops being an assertion and becomes a measurement
+;;; ============================================================
+;;;
+;;; REMOVING A LOCK IS ONLY TESTED IF THE COLLECTIONS ACTUALLY OVERLAP IN TIME.
+;;; Two threads that collect one after the other prove nothing: they would pass
+;;; every isolation and survival check with the lock still in place.  The
+;;; evidence has to be taken at the TRUE boundaries of a collection, and on
+;;; hosted x86-64 the collection IS this trampoline — %GC-COLLECT-HERE only
+;;; pulls the allocation limit down so the next :gc-check calls it.  Bracketing
+;;; from Lisp would measure a superset.
+;;;
+;;; So the trampoline itself counts, with LOCKed instructions because two CPUs
+;;; are exactly the case being measured:
+;;;
+;;;   ENTRY   lock inc [cur]; if cur >= 2, lock inc [witness]
+;;;   EXIT    lock dec [cur]
+;;;
+;;; WITNESS > 0 MEANS A COLLECTOR ENTERED WHILE ANOTHER WAS ALREADY INSIDE.
+;;; That is the property, stated exactly; it cannot be produced by a serialized
+;;; implementation, so a test asserting it FAILS if the lock comes back.
+;;;
+;;; AND A BARRIER, so the evidence is not left to scheduling luck.  When
+;;; [barrier] is non-zero it is a SPIN BUDGET: a collector that finds itself
+;;; alone spins re-reading [cur] until another arrives (then bumps [met]) or the
+;;; budget runs out (then proceeds anyway).  With the collection lock ON, the
+;;; second thread cannot enter, so the first always burns its budget and [met]
+;;; stays 0 — which is precisely what makes the acceptance test discriminating.
+;;; The budget is BOUNDED so a serialized build fails an assertion instead of
+;;; hanging, and the word is ZERO in every image until a test writes it, so a
+;;; single-threaded image never spins at all.
+;;;
+;;; COST WHEN NOTHING IS MEASURING: two LOCKed increments per collection.
+;;;
+;;; The four words are the last free ones in the BSS gap this file already
+;;; documents (0x10000E40..0x10000EFF), below mvm/gc.lisp's scratch-config
+;;; (0x10000EC8) and region-alignment ledger (0x10000ED0/ED8).
+(defconstant +gc-conc-cur-addr+     #x10000EE0) ; collectors inside the trampoline
+(defconstant +gc-conc-witness-addr+ #x10000EE8) ; entries that found cur >= 2
+(defconstant +gc-conc-barrier-addr+ #x10000EF0) ; spin budget; 0 = barrier off
+(defconstant +gc-conc-met-addr+     #x10000EF8) ; barrier spins that saw a second
+
+(defvar *x64-gc-concurrency-probe* :linux
+  "Emit the collector concurrency probe in the GC trampoline.
+   :LINUX (default) = only when *X64-LINUX-MODE*, which is the only x64 arm
+   that has threads — so BARE-METAL x64 images stay byte-identical.
+   T = always, NIL = never.")
+
+(defun gc-concurrency-probe-on-p ()
+  (cond ((eq *x64-gc-concurrency-probe* :linux) *x64-linux-mode*)
+        (t *x64-gc-concurrency-probe*)))
+
+(defun emit-lock-inc-abs (buf slot)
+  "LOCK INC qword [SLOT] — F0 REX.W FF /0, ModRM mod=00 rm=100, SIB=0x25."
+  (emit-bytes buf #xF0 #x48 #xFF #x04 #x25)
+  (emit-u32 buf slot))
+
+(defun emit-lock-dec-abs (buf slot)
+  "LOCK DEC qword [SLOT] — F0 REX.W FF /1."
+  (emit-bytes buf #xF0 #x48 #xFF #x0C #x25)
+  (emit-u32 buf slot))
+
+(defun emit-gc-concurrency-enter (buf)
+  "Trampoline ENTRY probe.  Must be emitted AFTER the register pushes: it
+   clobbers RAX and RCX, both of which are on the stack by then."
+  (when (gc-concurrency-probe-on-p)
+    (let ((no-witness (make-label))
+          (no-barrier (make-label))
+          (spin (make-label))
+          (met (make-label)))
+      (emit-lock-inc-abs buf +gc-conc-cur-addr+)
+      (emit-mov-reg-abs buf 'rax +gc-conc-cur-addr+)
+      (emit-cmp-reg-imm buf 'rax 2)
+      (emit-jcc buf :b no-witness)
+      (emit-lock-inc-abs buf +gc-conc-witness-addr+)
+      (emit-label buf no-witness)
+      ;; THE BARRIER.  RCX = spin budget; zero (every image, until a test
+      ;; writes the word) skips the whole thing.
+      (emit-mov-reg-abs buf 'rcx +gc-conc-barrier-addr+)
+      (emit-bytes buf #x48 #x85 #xC9)              ; test rcx, rcx
+      (emit-jcc buf :z no-barrier)
+      (emit-label buf spin)
+      (emit-mov-reg-abs buf 'rax +gc-conc-cur-addr+)
+      (emit-cmp-reg-imm buf 'rax 2)
+      (emit-jcc buf :ae met)
+      (emit-sub-reg-imm buf 'rcx 1)
+      (emit-jcc buf :nz spin)
+      (emit-jmp buf no-barrier)                    ; budget spent: proceed alone
+      (emit-label buf met)
+      (emit-lock-inc-abs buf +gc-conc-met-addr+)
+      (emit-label buf no-barrier))))
+
+(defun emit-gc-concurrency-exit (buf)
+  "Trampoline EXIT probe.  Emitted at the restore label, BEFORE the pops, so
+   the count falls exactly when this collection stops being one."
+  (when (gc-concurrency-probe-on-p)
+    (emit-lock-dec-abs buf +gc-conc-cur-addr+)))
+
 (defconstant +mcgc-page-shift+ 12)                  ; 4 KiB pages
 (defconstant +mcgc-page-bytes+ #x1000)              ; 4 KiB
 (defconstant +mcgc-guard-bytes+ #x10000)            ; 64 KiB overshoot guard (16 pages)
@@ -5129,6 +5228,9 @@
     ;; Save RSP for stack root scanning (after all pushes)
     (emit-bytes buf #x48 #x89 #xE5)              ; mov rbp, rsp  (save scan start)
 
+    ;; ---- THIS COLLECTION HAS BEGUN.  Say so, where two CPUs can both see it.
+    (emit-gc-concurrency-enter buf)
+
     ;; ---- Load GC metadata FROM THE ACTIVE REGION'S CONTROL BLOCK ----
     ;; RAX = region base (see emit-load-gc-region: 0 in the pointer word means
     ;; region 0, so an image that never created a second region loads exactly
@@ -5670,6 +5772,8 @@
     (emit-label buf restore-label)
     ;; RSP should equal RBP (saved after all pushes). Force it for safety.
     (emit-mov-reg-reg buf 'rsp 'rbp)
+    ;; ---- ...and it has ended.  Before the pops, so RAX is still scratch.
+    (emit-gc-concurrency-exit buf)
     (emit-pop buf 'rbp)
     (emit-pop buf 'r13)
     (emit-pop buf 'r11)

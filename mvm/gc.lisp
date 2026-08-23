@@ -908,6 +908,16 @@
 ;;;     live defect, and the honest fix if it ever is one is a single 64-bit
 ;;;     store primitive, not a lock.
 ;;;
+;;; AND THAT WINDOW IS NOT SOMETHING HOSTED LINUX RELIABLY GIVES YOU.
+;;; MEASURED on hosted x86-64, 40 fresh processes: region 0 had both
+;;; semispaces inside one 4 GiB window in 26 of them.  The heap is a ~1.8 GB
+;;; mmap and ASLR places it where it likes, so it straddles a 4 GiB boundary
+;;; about a third of the time.  So this is not a precondition that can simply
+;;; be assumed on a hosted target — anyone making the LISP collector
+;;; concurrent must add the 64-bit store rather than lean on the layout.  It
+;;; costs nothing today because hosted x86-64 runs the NATIVE collector,
+;;; whose slot rewrite is one naturally-aligned 8-byte store.
+;;;
 ;;; THE OTHER HAZARD, WHICH IS REAL AND IS NOT THE COLLECTOR'S TO FIX: A
 ;;; MUTATOR ON THREAD B STORING TO A GLOBAL WHILE THREAD A'S COLLECTOR SCANS
 ;;; IT.  The isolation invariant constrains the VALUES in these slots (no actor

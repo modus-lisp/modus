@@ -740,6 +740,14 @@
 (defun %ha-bump (off)
   (let ((a (+ (%ha-base) off)))
     (%gc-write64 a (+ (%gc-read64 a) 1))))
+;;; THE MESSAGE LOG IS 0x800 BYTES AT BAND+0x800 — SIXTY-FOUR 32-BYTE ENTRIES,
+;;; and the next thing above it is PERCPU-DATA-BASE at band+0x1000, i.e. the
+;;; block the GS base points at.  A run with more than 64 messages would log
+;;; straight through the per-CPU block: current-actor, idle-flag, cpu-id and the
+;;; object-space pointers.  Nothing enforced that; %HA-LOG-CAP does, and every
+;;; writer below gates on it.  It is a CAP, not a wrap: entry 64 and beyond are
+;;; simply not logged, which loses diagnostics rather than state.
+(defun %ha-log-cap () 64)
 (defun %ha-log-entry (i) (+ (+ (%ha-base) #x800) (* i 32)))
 
 ;; The collection count of whatever region is active RIGHT NOW.  A worker calls
@@ -854,11 +862,15 @@
             0)
         (if (consp m)
             (if (consp (cdr m))
-                (let ((e (%ha-log-entry (- i 1))))
-                  (%gc-write64 e (car m))
-                  (%gc-write64 (+ e 8) (car (cdr m)))
-                  (%gc-write64 (+ e 16) (cdr (cdr m)))
-                  (%gc-write64 (+ e 24) 1))
+                ;; Capped for the same reason as the threaded worker's log:
+                ;; past %HA-LOG-CAP entries this runs into the per-CPU block.
+                (if (< (- i 1) (%ha-log-cap))
+                    (let ((e (%ha-log-entry (- i 1))))
+                      (%gc-write64 e (car m))
+                      (%gc-write64 (+ e 8) (car (cdr m)))
+                      (%gc-write64 (+ e 16) (cdr (cdr m)))
+                      (%gc-write64 (+ e 24) 1))
+                    0)
                 (%ha-bump #x1B8))
             (%ha-bump #x1B8)))
       (%ha-bump #x1A8)
@@ -1448,11 +1460,16 @@
                   0)
               (if (consp m)
                   (if (consp (cdr m))
-                      (let ((e (%ha-log-entry (- i 1))))
-                        (%gc-write64 e (car m))
-                        (%gc-write64 (+ e 8) (car (cdr m)))
-                        (%gc-write64 (+ e 16) (cdr (cdr m)))
-                        (%gc-write64 (+ e 24) 1))
+                      ;; STRUCTURE IS CHECKED FOR EVERY MESSAGE; only the
+                      ;; LOGGING is capped (see %HA-LOG-CAP — past 64 entries
+                      ;; the log runs into the per-CPU block).
+                      (if (< (- i 1) (%ha-log-cap))
+                          (let ((e (%ha-log-entry (- i 1))))
+                            (%gc-write64 e (car m))
+                            (%gc-write64 (+ e 8) (car (cdr m)))
+                            (%gc-write64 (+ e 16) (cdr (cdr m)))
+                            (%gc-write64 (+ e 24) 1))
+                          0)
                       (%ha-tb-bump tb #x490))
                   (%ha-tb-bump tb #x490))
               (send 1 (+ 900000 i))

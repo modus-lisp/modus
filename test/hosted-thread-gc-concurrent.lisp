@@ -162,8 +162,24 @@
               (chk "regions initialised with a violation" (w out #x18) 0)
               (chk "last violation mask"                  (w out #x20) 0)
               (chk "region 0's own alignment mask"        (w out #x60) 0)
-              (chk "thread 1's region is in one 4 GiB window" (w out #x50) 1)
-              (chk "thread 2's region is in one 4 GiB window" (w out #x58) 1))))))
+
+              ;; MEASURED AND REPORTED, DELIBERATELY NOT ASSERTED.  Heap-window
+              ;; uniformity is a precondition of the LISP collector's torn-read
+              ;; argument (mvm/gc.lisp, THE GLOBALS ROOT SET UNDER CONCURRENT
+              ;; COLLECTION, THE READ SIDE) and of NOTHING on this target: the
+              ;; native trampoline rewrites a slot with one naturally-aligned
+              ;; 8-byte store, which cannot tear.  And it is NOT A PROPERTY THIS
+              ;; TEST CONTROLS — the heap is a ~1.8 GB mmap and ASLR places it
+              ;; where it likes, so it straddles a 4 GiB boundary in about a
+              ;; third of runs (measured: uniform in 26 of 40).  Asserting it
+              ;; would make this test flaky for a reason that has nothing to do
+              ;; with the collector.
+              (format t "  note thread 1's region in one 4 GiB window = ~D~%"
+                      (w out #x50))
+              (format t "  note thread 2's region in one 4 GiB window = ~D~%"
+                      (w out #x58))
+              (format t "       (ASLR-dependent; bounds the LISP collector's~%")
+              (format t "        torn-read argument, not this target's)~%"))))))
 
 ;; ============== ARM 2: THE NEGATIVE CONTROL — PUT THE LOCK BACK ============
 (format t "~%~%NEGATIVE CONTROL: THE SAME RUN WITH THE OLD LOCK BACK ON~%")

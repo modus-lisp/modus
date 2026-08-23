@@ -111,6 +111,36 @@ in the next pass.
   checking restarts.  *(build-x64-linux.lisp ~line 2389)*
 - Various `make-int-list` / aux helpers — partial.
 
+### Argument evaluation order
+
+- **A call's 5th and later argument forms are evaluated FIRST, and among
+  themselves RIGHT-TO-LEFT** — the register arguments (1-4) are evaluated
+  afterwards, left to right.  CLHS 3.1.2.1.2.3 requires strict left-to-right
+  for the whole argument list.  *(divergent semantics; the overflow-argument
+  path — see `#x0530` COPY-OVERFLOW-ARGS in the translators.)*
+
+  Measured with a counter bumped once per argument form, `./modus` against
+  SBCL — the value each parameter receives, in parameter order:
+
+  | call | SBCL (correct) | modus |
+  |---|---|---|
+  | `(f4 (b) (b) (b) (b))` | `(1 2 3 4)` | `(1 2 3 4)` |
+  | `(f5 (b) (b) (b) (b) (b))` | `(1 2 3 4 5)` | `(2 3 4 5 1)` |
+  | `(f6 ...)` | `(1 2 3 4 5 6)` | `(3 4 5 6 2 1)` |
+  | `(f7 ...)` | `(1 2 3 4 5 6 7)` | `(4 5 6 7 3 2 1)` |
+
+  Same for `&rest` functions; `LIST` is unaffected because it does not go
+  through the general call path.
+
+  **Only argument lists with SIDE EFFECTS are affected** — each form is still
+  bound to the right parameter, so pure arguments give correct results and this
+  is invisible until an argument mutates something another argument reads.  The
+  common way to meet it is a `FORMAT` with three or more directives whose
+  arguments are not pure, e.g.
+  `(format t "~S ~S" (take-and-clear x) (read x))`, which reports the
+  *un-cleared* value.  Found by running glass/fb's drawing primitives under
+  modus against SBCL as the oracle (`test/run-glass-fb.sh`).
+
 ### Eval-time machinery
 
 - `eval-when` — partial; `(:compile-toplevel :load-toplevel :execute)`

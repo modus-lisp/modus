@@ -35,9 +35,12 @@
 ;;;; loading this file:
 ;;;;
 ;;;;   *CLI-ARCH*                    :x64 | :aarch64 | :i386
-;;;;   *CLI-ARCH-SYSCALL-SOURCE*     sys-exit / halt.  exit_group is syscall 60
-;;;;                                 on x86-64, 93 on the AArch64 generic ABI
-;;;;                                 and 1 (exit) on the i386 int-0x80 ABI.
+;;;;   *CLI-ARCH-SYSCALL-SOURCE*     sys-exit / halt.  exit_group is syscall 231
+;;;;                                 on x86-64, 94 on the AArch64 generic ABI
+;;;;                                 and 252 on the i386 int-0x80 ABI.  NOT
+;;;;                                 60/93/1 — those are `exit', which ends only
+;;;;                                 the calling thread and hangs a threaded
+;;;;                                 image forever.
 ;;;;   *CLI-ARCH-PROBE-SOURCE*       arch-address diagnostic probes, baked ahead
 ;;;;                                 of kernel-main.
 ;;;;   *CLI-ARCH-KERNEL-PROLOGUE*    hardware setup that must precede the FIRST
@@ -1011,8 +1014,10 @@
 ;; still sees these defuns unchanged.
 (defvar *driver-source*
  (concatenate 'string
-  ;; ARCH SLOT: sys-exit / halt.  exit_group is syscall 60 on x86-64 and 93 on
-  ;; the AArch64 generic ABI.
+  ;; ARCH SLOT: sys-exit / halt.  exit_group — the one that ends the PROCESS
+  ;; and not merely the calling thread — is syscall 231 on x86-64, 94 on the
+  ;; AArch64 generic ABI and 252 on i386.  Using plain `exit' (60/93/1) is a
+  ;; hang the moment a second thread is alive; see the arch files.
   *cli-arch-syscall-source*
   (mvm-text "lib/runtime-backquote.lisp")
   ;; ARCH SLOT: arch-address diagnostic probes, baked ahead of kernel-main.

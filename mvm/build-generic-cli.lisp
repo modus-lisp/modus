@@ -39,14 +39,26 @@
 
 (defvar *cli-arch* :x64)
 
-;; exit_group is syscall 60 on x86-64 (93 on the AArch64 generic ABI).
+;; ABI FACT, and it was WRONG here until the image grew threads: on x86-64
+;; syscall 60 is `exit', which ends ONLY THE CALLING THREAD; `exit_group', the
+;; one that ends the process, is 231.  (93 vs 94 on the AArch64 generic ABI,
+;; 1 vs 252 on i386.)  In a single-threaded image the two are indistinguishable,
+;; which is why this stood for so long.
+;;
+;; With a second thread alive the difference is a HANG.  The main thread exits
+;; through `exit', the kernel leaves the group leader as an unreapable ZOMBIE
+;; because the thread group is not empty, the second thread stays parked in
+;; futex_wait with nobody left to wake it, and any parent reading this process's
+;; output through a pipe never sees EOF.  That is the whole of the
+;; test/hosted-thread-lisp.lisp "flake": a fault on the main thread turned into
+;; a silent infinite hang instead of a report.  See test/run-thread-exit.sh.
 (defvar *cli-arch-syscall-source*
 "
 (defun sys-exit (code)
   (let ((c code))
-    (syscall3 60 c 0 0)))
+    (syscall3 231 c 0 0)))
 (defun halt ()
-  (syscall3 60 1 0 0))
+  (syscall3 231 1 0 0))
 ")
 
 ;; argv/argc off the fixed BSS slots the x64 boot preamble publishes, plus

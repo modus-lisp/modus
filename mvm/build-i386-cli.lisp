@@ -51,17 +51,21 @@
 (defvar *cli-arch* :i386)
 
 ;;; ABI FACT: the i386 int-0x80 table is its own numbering.  exit is 1 (60 on
-;;; x86-64, 93 on the AArch64 generic ABI); exit_group is 252 but plain exit is
-;;; what this single-threaded image wants and what the port has always used.
+;;; x86-64, 93 on the AArch64 generic ABI); exit_group is 252 (231 / 94).
+;;; This slot used plain `exit' on the reasoning that the image is
+;;; single-threaded — true when it was written, and the two are then
+;;; indistinguishable.  It is no longer true, and `exit' with a live sibling
+;;; thread is an unreapable zombie leader and a permanent hang, so all three
+;;; arches now use exit_group.
 ;;; The `(let ((c code)) ...)' rebind is kept identical in shape to the other
 ;;; two arches so a codegen difference in the operand shuffle shows up as a
 ;;; difference in the TRANSLATOR, not in the source.
 (defvar *cli-arch-syscall-source* "
 (defun sys-exit (code)
   (let ((c code))
-    (syscall3 1 c 0 0)))
+    (syscall3 252 c 0 0)))
 (defun halt ()
-  (syscall3 1 1 0 0))
+  (syscall3 252 1 0 0))
 ")
 
 ;;; NOT a divergence: byte-for-byte the x64 probe slot.

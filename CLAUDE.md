@@ -1128,6 +1128,66 @@ reliably.  **Two things to fix, and they are different bugs:** the
 `PROGRAM-ERROR` itself, and the teardown that leaves thread 2 parked forever
 when the main thread aborts.
 
+**THE TEARDOWN BUG IS FIXED (2026-08-23).  IT WAS `exit` WHERE `exit_group` WAS
+MEANT, IN THREE PLACES, AND IT WAS NEVER ABOUT THIS TEST.**  On x86-64 syscall
+**60 is `exit`** — it ends only the CALLING THREAD — and **`exit_group` is 231**
+(93 vs 94 on the AArch64 generic ABI, 1 vs 252 on i386).  Every comment in the
+tree asserted the opposite.  In a single-threaded image the two are
+indistinguishable, which is exactly why it stood: `./modus` had no second thread
+until this campaign.
+
+The load-bearing one was **not** `sys-exit` but the **SIGSEGV/SIGBUS/SIGFPE/
+SIGILL stub** that `translate-x64.lisp` emits for TRAP `#x0520`: its
+"no handler-case is active" arm ended with `mov eax,60; syscall`.  So ANY
+threaded modus program that faults on ANY thread with nothing armed to catch it
+left the group leader an unreapable `Z`, its sibling parked in `futex_wait` with
+nobody left to wake it, and every pipe reading its output blocked forever.  The
+observable failure was not a crash report but an infinite hang — the one mode
+that tells you nothing.  Fixed in the x64 stub (231) and the identical aarch64
+stub (94), plus `sys-exit`/`halt` in all three CLI arch slots.
+
+**NOT changed, because it is correct:** the clone child's own epilogue in the
+`#x0531` stub (`call rbx; xor edi,edi; mov eax,60; syscall`).  A worker thread
+that finishes SHOULD end only itself.
+
+**MEASURED, same binary, same workload.**  Before: failures were `rc=124`
+(the harness timeout — a hang).  After: **every** failure is `rc=139`, a clean
+immediate process death, and 50 consecutive runs produced **no hang at all**.
+`test/run-thread-exit.sh` is the regression, and it asserts only that every run
+TERMINATES — deliberately not that every run passes, because the second bug is
+still open.
+
+**THE SECOND BUG IS NOT FIXED, AND IT IS THE CONCURRENT FORCED COLLECTION.**
+Localised by varying only `*gcevery*` from the script, which needs no rebuild:
+
+| arm | forced collections | result |
+|---|---|---|
+| `(%tl-selftest 0 300 100000)` | none — `since` never reaches the threshold | **60 of 60 clean** |
+| `(%tl-selftest 0 300 25)` | 12 per thread (the shipping test) | **54 of 60** |
+| `(%tl-selftest 0 50 25)` | 2 per thread | 25 of 25 clean |
+
+Remove the collections and the failure disappears entirely.  The fault itself is
+a **corrupted control transfer on the MAIN thread**: with a temporary dump wired
+into the stub's exit arm (`MODUS_FAULT_DUMP=1`; ptrace is blocked on the dev box
+at Yama `ptrace_scope=2`, so there is no gdb and no strace), all four captured
+faults show `RSP` on the PROCESS stack and a jump either to address **0** or to
+an address **inside that same stack**, with `si_addr = RIP` — a fetch fault on a
+return address or handler frame that is no longer valid.  `RAX` reads
+`0xffffffffffffff24` in every one, which is tagged `-110` = `-ETIMEDOUT`, i.e.
+the thread had just come back from a timed-out futex park.
+
+**Serializing the collections does NOT fix it**, and that is the useful negative:
+with `(%ha-set-collect-serialized 1)` — the flag that exists in-tree for exactly
+this bisect — the rate is unchanged at **54 of 60**.  So this is not two
+collectors overlapping with each other; it is what a collection does with
+respect to the OTHER thread's Lisp work.  The standing suspects are the two
+pieces of shared BSS named below that are neither tables nor per-thread: the
+**multiple-value return buffer at `0x10000090`** and the **handler-frame stack at
+`0x10000400`** (one depth counter, one frame array, one armed-frame slot at
+`0x10000180`) — a stale or half-written frame restored by a pop is precisely a
+jump to a dead stack address.  (The serialized arm additionally reintroduces a
+hang of its own, unexplained, on a path that is not the shipping default.)
+
 **WHAT IS STILL SERIALIZED, AND WHY.**  `test/hosted-thread-lisp.lisp` holds the
 runtime lock across the whole **Lisp-level** work of an iteration, not just the
 table calls.  Per-call locking is enough for the **tables**, but FORMAT and the

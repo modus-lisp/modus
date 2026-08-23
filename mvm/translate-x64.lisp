@@ -52,6 +52,20 @@
    Set by Linux x64 builds to use SYS_write/SYS_read/SYS_exit instead of
    port I/O, PIC/PIT setup, etc.")
 
+(defvar *x64-fault-dump*
+  ;; NOTE the shape: `(and #+sbcl (getenv ...) t)' would read as `(and t)' — i.e.
+  ;; ON — on any host that is not SBCL, because the reader DELETES the guarded
+  ;; form rather than yielding NIL.  Bind first, then test.
+  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_FAULT_DUMP") #-sbcl nil))
+    (if v t nil))
+  "TEMPORARY DIAGNOSTIC, off unless MODUS_FAULT_DUMP is set in the build
+   environment.  When on, the SIGSEGV/SIGBUS/SIGFPE/SIGILL stub's
+   no-handler-active path writes its six captured diagnostic words (RIP, RSP,
+   call site, RAX, si_addr, ucontext pointer) raw to fd 2 before exit_group.
+   ptrace is blocked on the development box (Yama ptrace_scope=2), so neither
+   gdb nor strace can observe a fault; this is the substitute.  A shipping
+   image must NOT set it — the output is 48 raw bytes on stderr.")
+
 (defvar *x64-sched-lock-addr* nil
   "Scheduler-lock address for RESTORE-CTX's unlock.  NIL (the default, and what
    every image built before native threads got) = emit nothing, so +OP-RESTORE-CTX+
@@ -1391,12 +1405,40 @@
                 ;; jmp rdx
                 (emit-bytes buf #xFF #xE2)
 
-                ;; --- No active handler: sys_exit(139) ---
+                ;; --- No active handler: exit_group(139) ---
+                ;;
+                ;; exit_group (231), NOT exit (60).  This is the LAST thing a
+                ;; faulting thread does, and it must end the PROCESS.  `exit'
+                ;; ends only the calling thread: the group leader is left an
+                ;; unreapable ZOMBIE because the thread group is not empty, any
+                ;; sibling parked in futex_wait is never woken because the only
+                ;; thread that could have woken it is the one that just died,
+                ;; and a parent reading this process's output through a pipe
+                ;; never sees EOF.  The observable result is not a crash report
+                ;; but an INFINITE HANG — the one failure mode that says
+                ;; nothing.  In a single-threaded image the two syscalls are
+                ;; indistinguishable, which is why this survived so long.
+                ;;
+                ;; This is the general form of the bug, not a test fixture:
+                ;; ANY threaded modus program that faults on ANY thread with no
+                ;; handler-case active hung here.  test/hosted-thread-lisp.lisp
+                ;; is merely the first program that had a second thread.
                 (emit-label buf exit-label)
+                ;; TEMPORARY FAULT DUMP (MODUS_FAULT_DUMP build only): write the
+                ;; six diagnostic words captured above (RIP, RSP, call site, RAX,
+                ;; si_addr, ucontext) raw to fd 2, then exit.  ptrace is blocked
+                ;; on this box (Yama scope 2), so there is no gdb and no strace;
+                ;; this is the only way to see WHERE a fault landed.
+                (when *x64-fault-dump*
+                  (emit-bytes buf #xBF #x02 #x00 #x00 #x00)   ; mov edi, 2
+                  (emit-bytes buf #xBE #x30 #x0C #x00 #x10)   ; mov esi, 0x10000C30
+                  (emit-bytes buf #xBA #x30 #x00 #x00 #x00)   ; mov edx, 48
+                  (emit-bytes buf #xB8 #x01 #x00 #x00 #x00)   ; mov eax, 1 (write)
+                  (emit-bytes buf #x0F #x05))                 ; syscall
                 ;; mov edi, 139
                 (emit-bytes buf #xBF #x8B #x00 #x00 #x00)
-                ;; mov eax, 60 (sys_exit)
-                (emit-bytes buf #xB8 #x3C #x00 #x00 #x00)
+                ;; mov eax, 231 (sys_exit_group)
+                (emit-bytes buf #xB8 #xE7 #x00 #x00 #x00)
                 ;; syscall
                 (emit-bytes buf #x0F #x05)
 

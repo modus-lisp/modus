@@ -2613,10 +2613,18 @@
                               ;; BR x11.
                               (a64-emit buf (logior #xD61F0000 (ash +a64-x11+ 5)))
 
-                              ;; --- exit label: sys_exit(139) ---
+                              ;; --- exit label: exit_group(139) ---
+                              ;;
+                              ;; 94 (exit_group), NOT 93 (exit).  `exit' ends
+                              ;; only the calling thread, leaving the group
+                              ;; leader an unreapable zombie and any sibling
+                              ;; parked in futex_wait forever unwoken — a
+                              ;; faulting threaded program then HANGS instead
+                              ;; of reporting.  Identical bug to x86-64's
+                              ;; 60-vs-231; see translate-x64.lisp.
                               (let ((exit-label-idx (a64-current-index buf)))
                                 (a64-movz buf +a64-x0+ 139 0)
-                                (a64-movz buf +a64-x8+ 93 0)
+                                (a64-movz buf +a64-x8+ 94 0)
                                 (a64-svc buf 0)
 
                                 ;; ============================================

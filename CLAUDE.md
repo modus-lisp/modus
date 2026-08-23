@@ -1122,6 +1122,113 @@ function" here means registering a fresh name in the shared symbol-function
 table and calling back through it — the table hazard, not the compiler's own
 globals.
 
+### The socket layer becomes usable by a SERVER: unbounded transfers, per-CPU buffers, poll(2)
+
+The campaign is threads -> sockets -> glass.  `net/hosted-sockets.lisp` already
+had connect/listen/accept/send/recv, connected UDP and a DNS resolver on
+`syscall3`; what it did not have was anything a server could stand on.
+
+**THREE DEFECTS, NONE OF WHICH NEEDED A THREAD TO BE WRONG.**
+
+1. **A transfer was capped at one page, silently.** `SOCKET-SEND` copied LEN
+   bytes into `*IO-BUF-ADDR*` — a 4096-byte page — and issued one `write(2)`.
+   A LEN above 4096 wrote past the buffer.  Nothing named the limit, so nothing
+   could respect it.  `%SOCK-IO-CAP` names it and the transfer loop CHUNKS
+   against it, so a transfer is bounded by nothing whatever the buffer's size.
+   **Glass's `write-rect-raw` issues ONE `write-sequence` of 327 680 bytes at
+   1280 wide with default banding, and 4 096 000 with `*max-band-rows*` NIL.**
+2. **A short write lost the tail of the message.** `write(2)` on a socket takes
+   fewer bytes than offered whenever the send queue fills — exactly what a large
+   framebuffer update does.  The old code returned that short count and every
+   caller in the tree ignored it.  The loop now advances by what `write(2)`
+   actually took.
+3. **`SOCKET-LISTEN` bound `0.0.0.0` by default.**  Now `SOCKET-LISTEN` is
+   127.0.0.1 and `SOCKET-LISTEN-ON` takes an address — **a different function
+   name, so serving the network appears in a diff and cannot be arrived at by
+   leaving an argument off.**  Nothing in the image calls either
+   (`grep -rn "socket-listen" net/ mvm/ lib/ boot/` outside the socket files
+   returns nothing): loading opens no socket, the CLI opens no socket, there is
+   no autostart and no environment variable.
+
+**PER-*CPU* BUFFERS, NOT PER-*CONNECTION* ONES, and the reason is what makes the
+fix small.**  The bounce buffer's LIVE RANGE IS ONE SYSCALL — bytes in, one
+`read(2)`/`write(2)`, bytes out, nothing retained.  So the only thing that can
+overlap it is ANOTHER CPU, never a second connection on the same CPU: there is
+no preemption and no signal that re-enters Lisp, so a thread is inside exactly
+one socket call at a time.  Partition by what can actually overlap.  A
+per-connection buffer would additionally be an allocation per fd with an
+ownership question attached.  Same answer `%THR-TS` gives for timespecs and
+`%GC-SCRATCH-CELL` for the collector's per-collection state.
+
+`net/hosted-sockets-post.lisp` (x64-hosted only, baked after
+`net/hosted-sync.lisp`, overriding the three seam functions by last-defun-wins)
+maps ONE 1 MB anonymous page from two BSS words — **0x10000DF0 / 0x10000DF8, the
+last two free words below the MCGC config block at 0x10000E00** — holding
+per-CPU sockaddr scratch, per-CPU pollfd arrays, the server control block and
+16 x 64 KB of staging.  **SIZE IS NOT THE FIX**: the chunking loop would be
+equally correct at 64 bytes.  It also ends a hazard that was never about
+threads — the old buffer WAS `mvm/cl-fileio.lisp`'s file-I/O page, so reading a
+file during a socket transfer corrupted one of them on ONE CPU.
+
+**poll(2), AND THE REASON IS NOT PREFERENCE.**  A thread per connection is NOT
+AVAILABLE: `net/hosted-actors-post.lisp` has one stack, one thread block and one
+TID word, so the image runs exactly two OS threads and a thread-per-connection
+server would serve ONE client.  `select` has the kernel rewrite its fd_sets, so
+the set is rebuilt every pass anyway.  `epoll` wins at thousands of fds and
+loses here — a kernel object with a lifetime, and an edge-triggered mode whose
+failure is "a socket you did not fully drain goes quiet forever".  **`poll` is
+syscall 7 with THREE arguments, so it rides the existing `syscall3` trap: no new
+opcode, no `syscall6`, no translator change on any back-end.**  Each CPU polls a
+DISJOINT fd set, so the loops need no lock between them; a write that fills the
+send queue waits on POLLOUT through a RESERVED pollfd entry so it never disturbs
+the loop's own set.
+
+**MEASURED** (`test/run-socket-server.sh`, 4 concurrent connections x 1 MiB,
+client = PYTHON, 10 of 10):
+
+| | |
+|---|---|
+| accepted / retired / held at once | 4 / 4 / 4 |
+| CPU 0 | 2 097 152 bytes over 88 read events |
+| CPU 1 | 2 097 152 bytes over 105 read events |
+| max handlers inside at once | **2** |
+| overlap witnesses / handoffs | **135 / 135** |
+| wrong-CPU services, accept/poll/echo errors | 0 |
+| fd probe before / after | 4 / 4 |
+
+**THE WITNESS CAN ANSWER BOTH WAYS** — the trap 0fdb21a caught in its own
+checksum.  `MODUS_SK_NCPU=1` on the same workload gives max-inside **1**,
+overlap **0**, handoffs **0**, and the test ASSERTS those on that arm (10 of 10).
+
+**THE NEGATIVE CONTROL is `MODUS_SK_SHARED=1`** — every CPU back on the one
+process-global page, same binary, same workload.  **10 of 10 FAIL**, all four
+connections each time, with CROSS-CONNECTION CONTAMINATION (connection 0
+receives connection 1's/2's/3's pattern byte).  **And note what that means: the
+server's OWN checks still pass in the control, because the server counts bytes
+and not contents.  Only the external client sees it.  That is the argument for
+having one that is not modus.**
+
+**A MODUS STREAM ALREADY WORKS OVER A SOCKET FD**, which is the finding that
+matters most for glass (it does 100% of its RFB I/O through Lisp streams).
+`mvm/cl-fileio.lisp`'s `%MAKE-FILE-STREAM-FULL fd dir element-type` takes a RAW
+FD; pointed at a socket it does `write-byte`, `write-sequence` of 8192,
+`force-output`, `read-byte`, `read-sequence` and `close` verbatim.
+
+**BUG FOUND, NOT FIXED: `(listen stream)` returns T on a DRAINED socket** while
+`poll(2)` on the same fd correctly reports 0 ready.  `LISTEN` cannot be used as
+a readiness test.  Small, isolated, and wrong regardless of glass.
+
+**THE GAP MAP IS `docs/rfb-socket-gap-map.md`, and its headline is that SOCKETS
+ARE NOT WHAT STANDS BETWEEN MODUS AND GLASS.**  Glass is thread-per-client TIMES
+TWO (a reader parked in `read-byte` and a sender parked on a waitqueue, per
+connection; `make-thread` appears 99 times), and modus has ONE spare thread
+whose spawn takes a raw native entry address rather than a closure — so the
+literal shim serves ZERO clients.  The synchronisation half of `sb-thread` is
+largely already there (futex mutex + condvar); `sb-alien` is two libc functions
+that are both syscalls; `sb-posix` production use is 12 sites all in one file.
+Proposed next rung is NOT "port glass": load `glass/fb` — which depends on
+nothing and already carries `#-sb-thread` arms — with no sockets and no threads.
+
 ### Conservative-root validation collector (x64, landed ace1544 + 810a975)
 
 The Cheney collector is now hardened by an **object-start bitmap** (1 bit /
@@ -1587,6 +1694,35 @@ ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 test@10.0.0.2
 ```
 
 SSH credentials: username `test`, any password accepted (no real auth).
+
+### Socket / server tests — AND THE RULE THEY OBEY
+
+```bash
+# THE SERVER, against a client that is NOT modus (Python).  4 concurrent
+# connections x 1 MiB, two serving threads, byte-for-byte comparison.
+test/run-socket-server.sh ./modus /tmp/modus-socket-test 4 1048576 16384
+
+# THE POSITIVE CONTROL for the concurrency witness: one serving CPU.
+# max-inside must be 1, overlap 0, handoffs 0 — and the test asserts it.
+MODUS_SK_NCPU=1 test/run-socket-server.sh ./modus /tmp/mst1 4 1048576 16384
+
+# THE NEGATIVE CONTROL: every CPU back on the one shared page.  MUST FAIL.
+MODUS_SK_SHARED=1 test/run-socket-server.sh ./modus /tmp/mstc 4 1048576 16384
+
+# MODUS-TO-MODUS: the same server, a modus client, plus one 96 KB transfer in
+# a SINGLE socket-send-from against a 64 KB staging buffer.
+test/run-socket-modus.sh ./modus /tmp/modus-socket-modus 4 16 8192
+```
+
+**EVERY ONE OF THESE BINDS 127.0.0.1 AND AN EPHEMERAL PORT, AND NOTHING IS LEFT
+LISTENING.**  The modus side calls `SOCKET-LISTEN-ON` with `(%SOCK-LOOPBACK)`
+written out in full and has no other spelling available to it; the port is
+`bind(0)` + `getsockname`, so no script picks a number and none can collide with
+a desktop (5900-5920 or otherwise).  The server holds a **deadline** it checks
+once per poll timeout, so a run whose client never arrives still ends by itself
+and still closes its listener; `timeout` bounds the process as a second line of
+defence; and each harness **verifies with `ss` that the port is no longer
+listening** and fails the run if it is.
 
 ## Development Hosts
 

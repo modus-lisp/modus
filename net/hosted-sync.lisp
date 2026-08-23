@@ -38,7 +38,8 @@
 ;;; THE THREAD PAGE
 ;;; ============================================================
 ;;;
-;;; ONE 8 KB anonymous mapping, whose address lives in ONE BSS word.  Not the
+;;; ONE anonymous mapping (8 KB when this was written, 76 KB once the
+;;; per-thread windows moved in), whose address lives in ONE BSS word.  Not the
 ;;; carved actor band, because SLEEP has to work in a `./modus' that never
 ;;; starts an actor system; and not a Lisp global, because a global lives in
 ;;; the shared globals hash table, which is precisely the structure a second
@@ -51,7 +52,7 @@
 ;;; addresses above the block are not free to claim in shared source.  Two BSS
 ;;; words — a base and its init lock — buy 8 KB that is per-CPU-partitionable.
 ;;;
-;;; LAYOUT (offsets from the page base; it is TWO pages, 8 KB):
+;;; LAYOUT (offsets from the page base):
 ;;;   +0x000  per-CPU TIMESPEC scratch, 64 bytes per CPU, 16 CPUs.
 ;;;           +0x00 req.tv_sec  +0x08 req.tv_nsec
 ;;;           +0x10 rem.tv_sec  +0x18 rem.tv_nsec   (nanosleep's remainder)
@@ -68,6 +69,13 @@
 ;;;           +0x08 total wakes issued   +0x10 STOP flag for every scheduler
 ;;;           +0x18 legacy AP-SCHEDULER returns (the pre-blocking behaviour)
 ;;;   +0x1000 free scratch for tests (mutex words, condvars, counters)
+;;;   +0x2000 PER-THREAD WINDOW BLOCKS, 4 KB per CPU, 16 CPUs (+0x2000 +
+;;;           0x1000*cpu, ending at +0x12000).  See THE PER-THREAD WINDOW
+;;;           below.
+;;;   +0x12000 the MV/handler-case two-thread selftest's control block, 4 KB.
+;;;
+;;; The mapping is 76 KB rather than 8 KB for those two additions; NOTHING at
+;;; a lower offset moved, so every earlier user reads the same bytes.
 ;;;
 ;;; The two BSS words are 0x10000DA8 and 0x10000DB0 — the first two free words
 ;;; above the safepoint-boundary slot at 0x10000DA0 and below the MCGC config
@@ -89,11 +97,17 @@
           (let ((q (%gc-read64 (%thr-page-slot))))
             (if (> q 0)
                 (progn (spin-unlock (%thr-page-lock)) q)
-                (let ((m (%mmap-shared-page 8192)))
+                (let ((m (%mmap-shared-page 77824)))
                   ;; A failed mmap comes back as a small negative (-errno).
                   (if (< m 4096)
                       (progn (spin-unlock (%thr-page-lock)) 0)
                       (progn
+                        ;; Only the first 8 KB is explicitly zeroed: the
+                        ;; per-thread window blocks above +0x2000 are
+                        ;; MAP_ANONYMOUS pages, which the kernel already
+                        ;; guarantees zero — and zero is exactly the state a
+                        ;; fresh thread's window must start in (handler depth
+                        ;; 0, nothing armed).
                         (%ha-zero m (+ m 8192))
                         (%gc-write64 (%thr-page-slot) m)
                         (spin-unlock (%thr-page-lock))
@@ -128,6 +142,86 @@
    counters live here.  0 if the page could not be mapped."
   (let ((p (%thr-page)))
     (if (zerop p) 0 (+ p #x1000))))
+
+(defun %thr-tls-block (cpu)
+  "CPU's 4 KB PER-THREAD WINDOW block, or 0 if the page could not be mapped."
+  (let ((p (%thr-page)))
+    (if (zerop p) 0 (+ p (+ #x2000 (* cpu #x1000))))))
+
+;;; ============================================================
+;;; THE PER-THREAD WINDOW, INSTALLED
+;;; ============================================================
+;;;
+;;; The multiple-value return buffer, the dynamic-nargs slot and the
+;;; handler-frame machinery were ONE COPY FOR THE WHOLE IMAGE — see THE
+;;; PER-THREAD WINDOW in mvm/compiler.lisp for what is in the window and what
+;;; is deliberately left out of it.  The compiler now marks every access to
+;;; one of those slots, and translate-x64 turns the mark into an FS segment
+;;; override.  This is the other half: giving a thread a segment base.
+;;;
+;;; THE MAIN THREAD NEEDS NOTHING, AND THAT IS THE POINT.  A fresh Linux
+;;; process has FS base 0, so `FS:[0x10000180]' is `[0x10000180]' — the same
+;;; word at the same address, no initialisation, no mode word, nothing that
+;;; has to have happened before the first MULTIPLE-VALUE-BIND (which happens
+;;; during boot, well before any of this code could run).
+;;;
+;;; A WORKER THREAD INSTALLS ITS OWN AND MUST DO IT FIRST.  It is born with
+;;; the parent's FS base (clone is issued without CLONE_SETTLS), i.e. sharing
+;;; the main thread's window, so every instruction it executes before
+;;; %TLS-INSTALL is still racing the main thread's values and handler frames.
+;;; That window is a handful of instructions and it is stated rather than
+;;; hidden: put %TLS-INSTALL first in a thread body, ahead of the per-CPU and
+;;; region setup, because those allocate nothing but they do return values.
+
+(defun %tls-self-base ()
+  "This thread's segment base as the EXACT machine word, read from the self
+   slot INSIDE the window (so it answers about this thread).  0 on the main
+   thread, where nothing ever wrote it."
+  (let ((lo (mem-ref #x10000C30 :u32))
+        (hi (mem-ref #x10000C34 :u32)))
+    (if (= hi 0) lo (+ (* (* hi 65536) 65536) lo))))
+
+(defun %tls-set-self-base (base)
+  "Store BASE as the EXACT machine word in the self slot.  Two :u32 halves,
+   not one :u64: a :u64 store deposits val*2 (mvm/gc.lisp %GC-WRITE64 says
+   why), and the collector reads this slot as a raw machine word.
+
+   THE ADDRESS MUST BE A LITERAL HERE.  %GC-WRITE64 would take it as an
+   argument, and an address that arrives as an argument cannot carry the
+   segment override — it would write the MAIN thread's slot."
+  (let* ((hi (ash (ash base -16) -16))
+         (lo (- base (* (* hi 65536) 65536))))
+    (setf (mem-ref #x10000C30 :u32) lo)
+    (setf (mem-ref #x10000C34 :u32) hi)
+    0))
+
+(defun %tls-install (cpu)
+  "Give THIS THREAD its own per-thread window: point FS at CPU's block.
+   Returns 0 on success, the arch_prctl error otherwise (and 1 if the thread
+   page could not be mapped).
+
+   ARCH_SET_FS is 0x1002 (0x1001 is ARCH_SET_GS, which %HA-PERCPU-INIT-CPU
+   uses for the per-CPU block — the two segments are deliberately separate,
+   see *X64-TLS-WINDOW*).  The base is BLOCK - 0x10000000, because the
+   ADDRESSES in the emitted code are unchanged: the segment moves, not the
+   literal."
+  (let ((b (%thr-tls-block cpu)))
+    (if (or (zerop b) (< b #x10000000))
+        ;; A block BELOW the window base would make the segment base negative,
+        ;; i.e. non-canonical, and arch_prctl would refuse it.  Refuse first so
+        ;; the caller sees a decision rather than an errno.
+        1
+        (let* ((delta (- b #x10000000))
+               (r (syscall3 158 #x1002 delta 0)))
+          (if (zerop r)
+              (progn (%tls-set-self-base delta) 0)
+              r)))))
+
+(defun %tls-installed-p ()
+  "1 when this thread has its own window, 0 when it is still using the
+   process-wide one.  Reads the self slot THROUGH the window, so a thread that
+   has installed one sees its own non-zero base and the main thread sees 0."
+  (if (zerop (%tls-self-base)) 0 1))
 
 ;;; ============================================================
 ;;; CLOCKS
@@ -1394,6 +1488,12 @@
    yet."
   (let ((tb (%ha-thread-block))
         (ctl (%tl-ctl)))
+    ;; ITS OWN PER-THREAD WINDOW, FIRST.  Until this returns, this thread's
+    ;; multiple values and handler-case frames are the MAIN THREAD'S — it was
+    ;; cloned without CLONE_SETTLS, so it inherited FS base 0.  Everything
+    ;; below returns values and arms handler-cases; none of it may do so into
+    ;; somebody else's buffer.
+    (%gc-write64 (+ ctl #x50) (%tls-install 1))
     (%ha-percpu-init-cpu (%ha-cpu1-percpu-base) 1)
     (set-current-actor 0)
     (set-idle-flag 0)
@@ -1567,3 +1667,210 @@
                           (%gc-write64 (+ res #x120)
                                        (%gc-read64 (+ (%tl-slot 1) #x78)))
                           res)))))))))
+
+;;; ============================================================
+;;; MULTIPLE VALUES AND HANDLER-CASE, ON TWO THREADS AT ONCE
+;;; ============================================================
+;;;
+;;; WHAT THIS PINS.  The multiple-value return buffer and the handler-frame
+;;; stack used to be ONE COPY FOR THE WHOLE IMAGE (mvm/compiler.lisp, THE
+;;; PER-THREAD WINDOW).  A producer stores its extras and the consumer reads
+;;; them at the call site; a handler-case arms one global frame and its
+;;; matching CLEAR-HANDLER pops one global stack.  With two OS threads and a
+;;; preemptive kernel scheduler, both are races — and the handler one is not a
+;;; wrong ANSWER but a wrong JUMP: thread A's unwind restores a frame thread B
+;;; armed and lands on B's stack, which is what the campaign's captured faults
+;;; ("control transfer to 0 or into a live stack") looked like.
+;;;
+;;; WHAT MAKES IT A TEST RATHER THAN AN EXERCISE.  Every check is a VALUE the
+;;; thread computed and compared itself, tallied per thread, and the driver
+;;; requires BOTH tallies to be zero and BOTH iteration counts to reach N.
+;;; "It finished" is not accepted as a result: a sequential run spins its
+;;; barrier budget out alone and reports a timeout, and both timeouts must be
+;;; 0, so this cannot pass unless the two threads were inside the workload at
+;;; the same instant.  The forced collections are real collections of each
+;;; thread's own region, counted.
+;;;
+;;; AND THE NEGATIVE CONTROL IS ONE WORD, IN THE SAME BINARY, ON THE SAME
+;;; WORKLOAD.  MODE 1 makes thread 2 SKIP %TLS-INSTALL, so it keeps the FS
+;;; base it was cloned with — base 0, the main thread's window.  That is this
+;;; fix removed, exactly and only: the same code, the same collections, the
+;;; same iteration count, one segment base not installed.  It lives in its own
+;;; script (test/hosted-mv-handler-unsync.lisp) because a longjmp onto another
+;;; thread's stack is not obliged to fail politely.
+;;;
+;;; NOTHING HERE TOUCHES THE SHARED RUNTIME TABLES, and that is deliberate:
+;;; this must fail because of the WINDOW, not because of the intern tables the
+;;; runtime lock already covers.  TRUNCATE, VALUES, HANDLER-CASE and consing in
+;;; the thread's own region touch no table, so the workload runs with no lock
+;;; held at all and the two threads genuinely overlap.
+;;;
+;;; CONTROL BLOCK (offsets from %MVHC-CTL):
+;;;   +0x00 N            +0x08 gc-every     +0x10 mode (1 = control)
+;;;   +0x18 barrier      +0x20 barrier mutex
+;;;   +0x28 t2 started   +0x30 t2 finished  +0x38 t2's %TLS-INSTALL result
+;;;   +0x40 t1 barrier timeout              +0x48 t2 barrier timeout
+;;;   +0x100 + 0x40*slot  PER-THREAD BLOCK:
+;;;     +0x00 iterations              +0x08 multiple-value failures
+;;;     +0x10 handler-case failures   +0x18 nested-handler failures
+;;;     +0x20 forced collections      +0x28 this thread's segment base
+;;;     +0x30 handler-stack depth seen at the end (must be back to entry)
+
+(defun %mvhc-ctl () (let ((p (%thr-page))) (if (zerop p) 0 (+ p #x12000))))
+(defun %mvhc-slot (s) (+ (%mvhc-ctl) (+ #x100 (* s #x40))))
+
+(defun %mvhc-three (i)
+  "Three values whose extras land in the MV buffer.  The caller checks all
+   three, so a clobbered extra is a FAILED COMPARISON and not a crash."
+  (values i (+ i 1) (+ i 2)))
+
+(defun %mvhc-raise ()
+  "Unwind to the nearest armed handler-case, without allocating and without
+   touching a shared table.  %HC-LONGJMP is the same trap the condition system
+   uses once it has decided to transfer control (mvm/cl-conditions.lisp); going
+   straight to it keeps this test about the FRAME MACHINERY."
+  (%hc-longjmp)
+  0)
+
+(defun %mvhc-barrier (ctl budget)
+  "0 = both threads arrived; 1 = spun out BUDGET alone (a sequential run)."
+  (%mutex-lock (+ ctl #x20))
+  (%gc-write64 (+ ctl #x18) (+ (%gc-read64 (+ ctl #x18)) 1))
+  (%mutex-unlock (+ ctl #x20))
+  (let ((i 0) (r 1))
+    (loop
+      (when (>= (%gc-read64 (+ ctl #x18)) 2) (progn (setq r 0) (return 0)))
+      (when (>= i budget) (return 0))
+      (setq i (+ i 1)))
+    r))
+
+(defun %mvhc-run (slot)
+  "THE WORKLOAD.  Both threads run this, with different SLOTs and no lock."
+  (let* ((ctl (%mvhc-ctl))
+         (me (%mvhc-slot slot))
+         (n (%gc-read64 ctl))
+         (gcevery (%gc-read64 (+ ctl #x08)))
+         (chain (%tl-chain 200))
+         (want (%tl-chain-sum chain))
+         (depth0 (%hc-depth))
+         (i 0)
+         (since 0))
+    (%gc-write64 (+ me #x28) (%tls-self-base))
+    (loop
+      (when (>= i n) (return 0))
+      ;; ---- multiple values, plain ----
+      (multiple-value-bind (q r) (truncate (+ (* i 7) 3) 5)
+        (if (= (+ (* q 5) r) (+ (* i 7) 3)) 0 (%tl-bump me #x08)))
+      (multiple-value-bind (a b c) (%mvhc-three i)
+        (if (= a i)
+            (if (= b (+ i 1))
+                (if (= c (+ i 2)) 0 (%tl-bump me #x08))
+                (%tl-bump me #x08))
+            (%tl-bump me #x08)))
+      ;; ---- an unwind through handler-case ----
+      (if (= (handler-case (%mvhc-raise) (t (c) 8)) 8) 0 (%tl-bump me #x10))
+      ;; ---- a NESTED unwind: the inner handler itself unwinds, so the frame
+      ;; stack has to be popped twice, in order, on THIS thread ----
+      (if (= (handler-case
+                 (handler-case (%mvhc-raise) (t (c) (%mvhc-raise)))
+               (t (c) 5))
+             5)
+          0 (%tl-bump me #x18))
+      ;; ---- multiple values ACROSS an armed handler-case: the extras have to
+      ;; survive the arm/disarm, on this thread, while the other thread is
+      ;; doing the same thing ----
+      (multiple-value-bind (a b c)
+          (handler-case (%mvhc-three i) (t (c) (values 0 0 0)))
+        (if (= a i)
+            (if (= b (+ i 1))
+                (if (= c (+ i 2)) 0 (%tl-bump me #x08))
+                (%tl-bump me #x08))
+            (%tl-bump me #x08)))
+      ;; ---- forced collection of THIS thread's own region ----
+      (setq since (+ since 1))
+      (if (>= since gcevery)
+          (progn
+            (setq since 0)
+            (%ha-collect-here)
+            (%tl-bump me #x20)
+            (if (= (%tl-chain-sum chain) want) 0 (%tl-bump me #x08)))
+          0)
+      (%gc-write64 me (+ i 1))
+      (setq i (+ i 1)))
+    ;; The DIFFERENCE, not the absolute depth: thread 1 is the main thread and
+    ;; is running inside the script loader's own armed handler-cases, so its
+    ;; depth at entry is not 0.  What must hold is that every arm this workload
+    ;; made was matched by ITS OWN pop.
+    (%gc-write64 (+ me #x30) (- (%hc-depth) depth0))
+    0))
+
+(defun %mvhc-t2-body ()
+  "THREAD 2.  Its own per-thread window FIRST — unless MODE says not to, which
+   is the negative control."
+  (let ((tb (%ha-thread-block))
+        (ctl (%mvhc-ctl)))
+    (%gc-write64 (+ ctl #x38)
+                 (if (= (%gc-read64 (+ ctl #x10)) 1) 99 (%tls-install 1)))
+    (%ha-percpu-init-cpu (%ha-cpu1-percpu-base) 1)
+    (set-current-actor 0)
+    (set-idle-flag 0)
+    (%ha-thread-adopt-region (%gc-read64 (+ tb #x4D0)) (%gc-read64 (+ tb #x340)))
+    (%gc-write64 (+ ctl #x28) 1)
+    (%gc-write64 (+ ctl #x48) (%mvhc-barrier ctl 400000000))
+    (%mvhc-run 1)
+    (%ha-thread-park-region (%gc-read64 (+ tb #x4D0)) (%gc-read64 (+ tb #x340)))
+    (%gc-write64 (+ ctl #x30) 1)
+    0))
+
+(defun %mvhc-t2-entry ()
+  (- (%gc-word-of (fn-addr %mvhc-t2-body) (+ (%ha-base) #x80)) 3))
+
+(defun %mvhc-selftest (mode n gcevery)
+  "MODE 0 gives thread 2 its own per-thread window (the shipping path);
+   MODE 1 does not, which is this work REMOVED.  Returns the control block's
+   raw byte address, or 0."
+  (if (zerop (%ha-carve))
+      0
+      (let ((ctl (%mvhc-ctl))
+            (band (%ha-base)))
+        (if (zerop ctl)
+            0
+            (let ((rcb2 (+ band #x200))
+                  (rcb3 (+ band #x240))
+                  (r0 (%gc-region-0))
+                  (budget 400000000)
+                  (k 0) (mode0 0) (tid 0))
+              (progn
+                (%ha-zero ctl (+ ctl #x1000))
+                (%ha-zero (%ha-cpu1-percpu-base)
+                          (+ (%ha-cpu1-percpu-base) #x4000))
+                (%gc-write64 ctl n)
+                (%gc-write64 (+ ctl #x08) gcevery)
+                (%gc-write64 (+ ctl #x10) mode)
+                (%mutex-init (+ ctl #x20))
+                (if (zerop (%ha-thread-stack))
+                    0
+                    (progn
+                      (setq mode0 (%ha-percpu-mode))
+                      (%ha-percpu-init-cpu (%ha-percpu-base) 0)
+                      (setq k (%gc-meta-scale))
+                      (%gc-write64 (+ (%ha-thread-block) #x340) k)
+                      (%gc-region-init rcb2 *ha-r1-from* *ha-r1-to* *ha-rsize*
+                                       (%gc-meta-read (+ r0 #x18) k) k)
+                      (%gc-region-init rcb3 *ha-r2-from* *ha-r2-to* *ha-rsize*
+                                       (+ *ha-t2-stack* *ha-t2-stack-size*) k)
+                      (%gc-write64 (+ (%ha-thread-block) #x4D0) rcb3)
+                      (%ha-set-percpu-mode 1)
+                      (%gc-region-enter rcb2)
+                      (setq tid (%ha-spawn-t2 (%mvhc-t2-entry)))
+                      (%gc-write64 (+ ctl #x40) (%mvhc-barrier ctl budget))
+                      (%mvhc-run 0)
+                      (%gc-write64 (+ ctl #x50) (%ha-join-t2 budget))
+                      (%gc-write64 (+ ctl #x58) tid)
+                      (%gc-write64 (+ ctl #x60)
+                                   (%gc-meta-read (+ rcb2 #x20) k))
+                      (%gc-write64 (+ ctl #x68)
+                                   (%gc-meta-read (+ rcb3 #x20) k))
+                      (%gc-region-enter r0)
+                      (%ha-set-percpu-mode mode0)
+                      ctl))))))))

@@ -425,6 +425,13 @@
   ;; consistent gc-check/trampoline code.
   (setq *x64-gc-enabled* t)
   (setq *linux-x64-r14-offset* #x38000000)
+  ;; THE PER-THREAD WINDOW must match what the host baked into the image's
+  ;; fixed code, for the same reason *x64-gc-enabled* must: a JIT page that
+  ;; emitted absolute handler-frame accesses while the surrounding AOT code
+  ;; emits FS-relative ones would disagree on any thread whose FS base is not
+  ;; zero.  On the MAIN thread the two are the same address either way, which
+  ;; is why getting this wrong would be silent.
+  (setq *x64-tls-window* t)
   (setq *jit-xlate-err-info* nil)
   t)
 (in-package :modus.mvm)

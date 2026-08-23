@@ -166,6 +166,22 @@
 ;; The branch is paid three times per COLLECTION (the only callers are inside
 ;; the GC trampoline), never in an allocation fast path.
 (setf modus.mvm.x64::*x64-gc-region-percpu* :runtime)
+
+;; NATIVE THREADS, STEP 6: THE MULTIPLE-VALUE BUFFER AND THE HANDLER-FRAME
+;; STACK BECOME PER-THREAD.  Both sides of the seam are set here because they
+;; describe ONE decision: the compiler marks a LOAD/STORE whose address is a
+;; per-thread-window slot (mvm/compiler.lisp, THE PER-THREAD WINDOW), and the
+;; back-end turns that mark into an FS segment override (mvm/translate-x64.lisp,
+;; *X64-TLS-WINDOW*).  Set one without the other and the mark is emitted and
+;; then ignored — which is exactly today's behaviour, so it fails silently
+;; rather than loudly, hence both here in one place.
+;;
+;; This is safe for ordinary single-threaded runs WITHOUT any initialisation:
+;; a fresh Linux process has FS base 0, so every one of these accesses names
+;; the same word at the same address it always did.  A worker thread installs
+;; its own FS base as its first act.
+(setf modus.mvm::*tls-window* t)
+(setf modus.mvm.x64::*x64-tls-window* t)
 (let ((txt (with-open-file (s (merge-pathnames "net/hosted-actors.lisp"
                                                cl-user::*modus-base*))
              (let ((b (make-string (file-length s))))

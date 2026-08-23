@@ -582,6 +582,32 @@
 (defconstant +width-u32+ 2)
 (defconstant +width-u64+ 3)
 
+;;; ---- THREAD-LOCAL WIDTHS (bit 2 = "this address is in the per-thread
+;;; window") -------------------------------------------------------------
+;;;
+;;; LOAD/STORE carry their width in an imm8, so widths 4..7 are the same four
+;;; widths with one extra bit of meaning: the address operand names a slot in
+;;; the PER-THREAD window (the multiple-value buffer, the handler-frame stack,
+;;; the nargs slot), not a process-global one.  A back-end that has no notion
+;;; of thread-local storage MUST mask the bit off and behave exactly as it does
+;;; for 0..3 — which is what every back-end but hosted x86-64 does today, and
+;;; is also what hosted x86-64 does when its window flag is off.  That is the
+;;; property that keeps every non-threaded image byte-identical: the compiler
+;;; can emit the wider code unconditionally and nothing downstream changes
+;;; until a back-end opts in.
+;;;
+;;; WHY A WIDTH BIT AND NOT A NEW OPCODE.  The address is already in a register
+;;; by the time LOAD/STORE runs, so a back-end that wants a segment override
+;;; needs one prefix byte at exactly this instruction and nothing else — no new
+;;; opcode number to allocate across four translators, one interpreter and the
+;;; bytecode assembler, and no second copy of the addressing logic to keep in
+;;; step with the first.
+(defconstant +width-tls-bit+ 4)
+(defconstant +width-u8-tls+  4)
+(defconstant +width-u16-tls+ 5)
+(defconstant +width-u32-tls+ 6)
+(defconstant +width-u64-tls+ 7)
+
 ;;; ============================================================
 ;;; Bytecode Buffer
 ;;; ============================================================

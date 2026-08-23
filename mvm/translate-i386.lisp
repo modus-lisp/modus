@@ -3865,7 +3865,10 @@
         ;; ============================================
         ((op= +op-load+)
          ;; (load Vd Vaddr width:imm8)
-         (let ((vd (first operands)) (vaddr (second operands)) (width (third operands)))
+         (let ((vd (first operands)) (vaddr (second operands))
+               ;; Mask +WIDTH-TLS-BIT+: i386 has no per-thread window, so a
+               ;; thread-local width is the plain width.  See mvm/mvm.lisp.
+               (width (logand (third operands) 3)))
            (i386-load-vreg buf +scratch0+ vaddr)
            (ecase width
              (0 (i386-emit-movzx-byte buf +scratch0+ +scratch0+ 0))
@@ -3878,7 +3881,8 @@
          ;; (store Vaddr Vs width:imm8)
          ;; IMPORTANT: Load Vs (value) FIRST — loading Vaddr into EAX clobbers VR,
          ;; so if Vs=VR we'd get the address instead of the value.
-         (let ((vaddr (first operands)) (vs (second operands)) (width (third operands)))
+         (let ((vaddr (first operands)) (vs (second operands))
+               (width (logand (third operands) 3)))   ; +WIDTH-TLS-BIT+: see op-load
            (i386-load-vreg buf +scratch0+ vs)
            (i386-load-vreg buf +scratch1+ vaddr)
            (ecase width

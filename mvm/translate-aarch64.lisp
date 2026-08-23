@@ -3755,7 +3755,10 @@
           ((= op +op-load+)
            (let* ((vd (vr 0))
                   (pa (ensure-src (vr 1) +a64-x16+))
-                  (width (vr 2))
+                  ;; Mask +WIDTH-TLS-BIT+: AArch64 has no per-thread window
+                  ;; yet, so a thread-local width is the plain width.  See
+                  ;; mvm/mvm.lisp.
+                  (width (logand (vr 2) 3))
                   (pd (or (a64-phys-reg vd) +a64-x17+)))
              (a64-ldr-width buf pd pa 0 width)
              (unless (a64-phys-reg vd)
@@ -3765,7 +3768,7 @@
           ((= op +op-store+)
            (let ((pa (ensure-src (vr 0) +a64-x16+))
                  (ps (ensure-src (vr 1) +a64-x17+))
-                 (width (vr 2)))
+                 (width (logand (vr 2) 3)))   ; +WIDTH-TLS-BIT+: see op-load
              (a64-str-width buf ps pa 0 width)))
 
           ;; ---- FENCE ----

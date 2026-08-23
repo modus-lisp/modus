@@ -1755,6 +1755,10 @@
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vaddr npc2) (fetch-reg bc npc)
                (multiple-value-bind (width npc3) (fetch-byte bc npc2)
+                 ;; Mask +WIDTH-TLS-BIT+: the interpreter simulates ONE
+                 ;; address space with one thread, so a thread-local width is
+                 ;; the plain width.  See mvm/mvm.lisp.
+                 (setf width (logand width 3))
                  (let ((addr (reg-get regs vaddr)))
                    ;; compile-mem-ref already untags the address (:shr addr 1),
                    ;; so the reg holds the raw address VALUE.  reg-get's %val->word
@@ -1769,6 +1773,7 @@
            (multiple-value-bind (vaddr npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
                (multiple-value-bind (width npc3) (fetch-byte bc npc2)
+                 (setf width (logand width 3))   ; +WIDTH-TLS-BIT+: see op-load
                  (let ((addr (reg-get regs vaddr)) (val (reg-get regs vs)))
                    ;; See op-load: the address is already untagged by compile-
                    ;; mem-ref's :shr; reg-get restores its word — do NOT untag

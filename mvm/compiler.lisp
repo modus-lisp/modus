@@ -326,8 +326,118 @@
 ;;; Place after MV-VALUES area: 0x10000098 + 20*8 = 0x10000138, align to 0x10000140
 (defconstant +closure-env-addr+ #x10000140)
 
+;;; ---- THE PER-THREAD WINDOW ----------------------------------------------
+;;;
+;;; Three pieces of the low BSS are STATE OF THE RUNNING COMPUTATION, not state
+;;; of the process, and every one of them is one copy for the whole image:
+;;;
+;;;   0x10000090 / 0x10000098..0x10000138   the multiple-value return buffer —
+;;;       count, then up to 21 extras.  The producer stores it in its epilogue
+;;;       and the consumer reads it at the call site; anything that runs in
+;;;       between sees, or destroys, somebody else's values.
+;;;   0x10000150                             the dynamic nargs slot, written by
+;;;       a caller and read by an &rest callee's prologue — the same window.
+;;;   0x10000180..0x1019F, 0x10000400..0x10000C0F, 0x10000C10..0x10000C2F
+;;;       the armed handler-case frame (RSP/RBP/IP/RBX), the handler-frame
+;;;       stack with its depth counter, and the longjmp scratch.  Two threads
+;;;       arming handler-cases share ONE armed frame: thread A's fault or
+;;;       ERROR then longjmps onto thread B's stack, which is exactly the
+;;;       "control transfer to 0 or into a live stack" fault this campaign
+;;;       chased.
+;;;
+;;; They are made per-thread by a SEGMENT BASE, not by a new address: the
+;;; addresses stay literally what they were, and a back-end that opts in emits
+;;; the access relative to a segment whose base is 0 on the main thread and
+;;; (block - +TLS-WINDOW-BASE+) on every other.  So the main thread of every
+;;; image reads and writes exactly the words it always did, at exactly the
+;;; addresses every earlier stage used, and one extra prefix byte is the whole
+;;; cost.  Nothing needs initialising for the main thread to be correct, which
+;;; is why this shape was chosen over a per-CPU table with a mode word: a mode
+;;; word has to be written before the first MULTIPLE-VALUE-BIND, and the first
+;;; MULTIPLE-VALUE-BIND happens during boot.
+;;;
+;;; WHAT IS DELIBERATELY NOT IN THE WINDOW, and why, because a wrong answer
+;;; here is silent: 0x10000148 (keyword intern table), 0x10000158 (intern
+;;; counter), 0x10000160/0x10000168 (code bounds), 0x10000170 (package table)
+;;; and 0x10000080/0x10000088 (globals alist, symbol table) all sit INSIDE the
+;;; same address range and are process-global by definition — a per-thread copy
+;;; of the code bounds reads zero and breaks FUNCTIONP on the second thread.
+;;; The window is therefore an explicit SET of slots, not a range.
+;;; +CLOSURE-ENV-ADDR+ is not in it either: on x86-64 the closure environment
+;;; travels in R13, a register, so it is already per-thread; the memory slot is
+;;; only live on back-ends that have not opted in.
+(defconstant +tls-window-base+ #x10000000
+  "Address the per-thread window's offsets are measured from.  A thread's
+   segment base is (its block - this), so offset 0 of the window is this
+   address on the main thread.")
+
+(defconstant +tls-self-addr+ #x10000C30
+  "Per-thread slot holding this thread's SEGMENT BASE — the delta, not the
+   block address.  Code that must hand a window address to a CALLEE reads it
+   and adds the literal address: only an ACCESS can carry a segment override,
+   so an address crossing a function boundary has to be absolute.  (The
+   collector's MV-extras loop is the caller this exists for: it passes each
+   slot's address to a generic slot-forwarder.)
+
+   HOLDING THE DELTA RATHER THAN THE BLOCK IS WHAT MAKES THE MAIN THREAD FREE.
+   Its base is 0 and the slot is BSS zero, so `slot + 0x10000098' is the
+   historic address with nothing ever having initialised anything.  A worker
+   stores (its block - +TLS-WINDOW-BASE+) here when it installs that same value
+   as its segment base.")
+
+(defparameter *tls-window* nil
+  "Emit LOAD/STORE of per-thread-window slots with the thread-local width bit.
+   NIL — every image that has not opted in — emits the historic width, so the
+   bytecode is unchanged.  Set by builds whose target back-end implements the
+   bit (hosted x86-64).")
+
 ;;; Maximum number of register arguments
 (defconstant +max-reg-args+ 4)
+
+(defun %tls-window-offset-p (off)
+  "T when OFF (a byte offset from +TLS-WINDOW-BASE+) names a slot that is
+   state of the running COMPUTATION rather than of the process.  See THE
+   PER-THREAD WINDOW at the head of this file for what each range is and for
+   the slots deliberately left out."
+  (or (and (>= off #x090) (<= off #x138))    ; MV count + 21 extras
+      (and (>= off #x150) (<= off #x157))    ; dynamic nargs (u32)
+      (and (>= off #x180) (<= off #x19F))    ; armed handler frame RSP/RBP/IP/RBX
+      (and (>= off #x400) (<= off #xC0F))    ; handler-stack depth + 64 frames
+      (and (>= off #xC10) (<= off #xC37))))  ; longjmp scratch + the self slot
+
+(defun %tls-window-addr-form-p (form)
+  "T when FORM is an address the compiler can prove, AT COMPILE TIME, lands in
+   the per-thread window.  A bare constant, or (+ K x) / (+ x K) with K such a
+   constant — the MV-extras loop writes (+ +MV-VALUES-ADDR+ (* i 8)) and its
+   index is capped below the end of the extras area, so the base decides.
+   Anything else answers NIL and gets the ordinary process-global access, which
+   is the safe direction: a missed slot is today's behaviour, a wrongly claimed
+   one would give a thread a private copy of a shared table."
+  (cond ((integerp form)
+         (let ((off (- form +tls-window-base+)))
+           (and (>= off 0) (< off #x1000) (%tls-window-offset-p off))))
+        ((and (consp form) (consp (cdr form)) (consp (cddr form))
+              (null (cdddr form))
+              (symbolp (car form)) (name-eq (car form) "+"))
+         (or (%tls-window-addr-form-p (cadr form))
+             (%tls-window-addr-form-p (caddr form))))
+        (t nil)))
+
+(defun %tls-width (width addr-form)
+  "WIDTH, with the thread-local bit set when the window is on and ADDR-FORM is
+   provably a window slot."
+  (if (and *tls-window* (%tls-window-addr-form-p addr-form))
+      (logior width +width-tls-bit+)
+      width))
+
+(defun %mv-width ()
+  "Width code for a direct-IR access to the multiple-value buffer.  The sites
+   that emit :LI + :LOAD/:STORE by hand (UNWIND-PROTECT saving the MV block
+   across its cleanup, TRUNCATE publishing its remainder) name the address as
+   an immediate rather than as a MEM-REF form, so they ask for the bit here
+   instead of going through %TLS-WIDTH."
+  (if *tls-window* +width-u64-tls+ +width-u64+))
+
 
 ;;; ============================================================
 ;;; Compilation State
@@ -12738,11 +12848,11 @@
     ;; These are raw u64 (tagged CL objects), loaded without fixnum shift.
     (let ((mv-temp (alloc-temp-reg)))
       (emit-ir :li mv-temp +mv-count-addr+)
-      (emit-ir :load mv-temp mv-temp +width-u64+)
+      (emit-ir :load mv-temp mv-temp (%mv-width))
       (emit-ir :push mv-temp)
       (dotimes (i n-mv-slots)
         (emit-ir :li mv-temp (+ +mv-values-addr+ (* i 8)))
-        (emit-ir :load mv-temp mv-temp +width-u64+)
+        (emit-ir :load mv-temp mv-temp (%mv-width))
         (emit-ir :push mv-temp))
       (free-temp-reg))
 
@@ -12767,11 +12877,11 @@
       (loop for i from (1- n-mv-slots) downto 0 do
         (emit-ir :pop mv-temp)
         (emit-ir :li addr-temp (+ +mv-values-addr+ (* i 8)))
-        (emit-ir :store addr-temp mv-temp +width-u64+))
+        (emit-ir :store addr-temp mv-temp (%mv-width)))
       ;; Restore MV count
       (emit-ir :pop mv-temp)
       (emit-ir :li addr-temp +mv-count-addr+)
-      (emit-ir :store addr-temp mv-temp +width-u64+)
+      (emit-ir :store addr-temp mv-temp (%mv-width))
       (free-temp-reg)
       (free-temp-reg))
 
@@ -13882,10 +13992,10 @@
             (emit-ir :pop q-temp)
             ;; MV[0] = remainder, MV-COUNT = 2 (n-temp reused as addr)
             (emit-ir :li n-temp +mv-values-addr+)
-            (emit-ir :store n-temp r-temp +width-u64+)
+            (emit-ir :store n-temp r-temp (%mv-width))
             (emit-ir :li n-temp +mv-count-addr+)
             (emit-ir :li r-temp (ash 2 +fixnum-shift+))
-            (emit-ir :store n-temp r-temp +width-u64+)
+            (emit-ir :store n-temp r-temp (%mv-width))
             (emit-ir :mov dest q-temp)
             (free-temp-reg)
             (free-temp-reg)
@@ -13909,10 +14019,10 @@
           (emit-ir :pop q-temp)
           ;; MV[0] = remainder, MV-COUNT = 2
           (emit-ir :li addr-temp +mv-values-addr+)
-          (emit-ir :store addr-temp r-temp +width-u64+)
+          (emit-ir :store addr-temp r-temp (%mv-width))
           (emit-ir :li addr-temp +mv-count-addr+)
           (emit-ir :li r-temp (ash 2 +fixnum-shift+))
-          (emit-ir :store addr-temp r-temp +width-u64+)
+          (emit-ir :store addr-temp r-temp (%mv-width))
           (emit-ir :mov dest q-temp)
           (free-temp-reg)
           (free-temp-reg)
@@ -15070,7 +15180,7 @@
   (let* ((wt (memory-width-code type-form))
          (width (car wt))
          (needs-tag (cdr wt)))
-    (emit-ir :load dest dest width)
+    (emit-ir :load dest dest (%tls-width width addr-form))
     (when needs-tag
       (emit-ir :shl dest dest +fixnum-shift+))))
 
@@ -15127,7 +15237,7 @@
            (when needs-untag
              (emit-ir :sar dest dest +fixnum-shift+))
            ;; Store
-           (emit-ir :store addr-reg dest width)
+           (emit-ir :store addr-reg dest (%tls-width width addr-form))
            ;; Re-tag value in dest if we untagged it (for return value)
            (when needs-untag
              (emit-ir :shl dest dest +fixnum-shift+))
@@ -15393,7 +15503,9 @@
    Reads saved RSP at fixed address 0x10000180. Non-zero means active."
   ;; Load the saved RSP from fixed address
   (emit-ir :li dest #x10000180)
-  (emit-ir :load dest dest +width-u64+)
+  ;; THIS THREAD's armed frame — see THE PER-THREAD WINDOW.  A thread asking
+  ;; "is a handler-case active?" must not be answered about another one.
+  (emit-ir :load dest dest (%mv-width))
   ;; If zero (no handler), return NIL; if non-zero, return T
   (let ((nil-label (make-compiler-label))
         (end-label (make-compiler-label)))

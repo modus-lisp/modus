@@ -52,6 +52,56 @@
    Set by Linux x64 builds to use SYS_write/SYS_read/SYS_exit instead of
    port I/O, PIC/PIT setup, etc.")
 
+(defvar *x64-tls-window* nil
+  "THE PER-THREAD WINDOW (see mvm/compiler.lisp for what is in it and what is
+   deliberately left out).  When non-nil, every access to the multiple-value
+   buffer, the dynamic-nargs slot and the handler-frame machinery is emitted
+   with an FS segment override — the ADDRESS IS UNCHANGED, only the segment it
+   is measured from.
+
+   WHY FS AND NOT GS.  GS is already this back-end's per-CPU segment
+   (PERCPU-REF/-SET emit `GS:[disp32]'), and the two must not fight: a thread
+   points GS at its per-CPU block, whose slots live at small offsets, while the
+   window lives at 0x10000090..0x10000C37.  FS is untouched by Modus and by
+   this freestanding runtime — nothing here uses glibc's TLS ABI.
+
+   WHY THIS COSTS THE MAIN THREAD NOTHING.  A fresh Linux process starts with
+   FS base = 0, so `FS:[0x10000180]' IS `[0x10000180]' — the same word, on the
+   same instruction, one prefix byte longer.  No boot-time initialisation, no
+   mode word to write before the first MULTIPLE-VALUE-BIND, and nothing to get
+   wrong on an image that never starts a thread.  A worker thread issues one
+   arch_prctl(ARCH_SET_FS, block - 0x10000000) as its first act and every one
+   of these accesses lands in its own block.
+
+   OFF is the default and emits byte-identical code to every earlier stage:
+   the thread-local width bit is masked off and the raw asm sites skip the
+   prefix.")
+
+(defun emit-tls-prefix (buf)
+  "Emit the FS segment override (0x64) for the NEXT memory access, when the
+   per-thread window is on.  Legacy prefixes precede REX, so this must be the
+   last thing emitted before the instruction itself.  With the window off it
+   emits nothing at all, which is what keeps every other image byte-identical."
+  (when *x64-tls-window* (emit-bytes buf #x64)))
+
+(defun emit-tls-base (buf reg)
+  "REG = this thread's FS base, or 0 when the per-thread window is off.
+
+   THE SELF SLOT HOLDS THE BASE, NOT THE BLOCK, and that is the whole reason
+   nothing has to be initialised: on the main thread the slot is BSS zero and
+   the base IS zero, so `base + 0x10000098' is the historic address, reached
+   without a single boot-time store.  A worker stores its own FS base there
+   (block - 0x10000000) as part of installing it.
+
+   This exists for exactly one caller shape: code that must hand a WINDOW
+   address to a callee.  The collector's MV-extras loop passes each slot's
+   address to scan_word, and only an ACCESS can carry a segment override — an
+   address that crosses a function boundary has to be absolute."
+  (if *x64-tls-window*
+      (progn (emit-tls-prefix buf)
+             (emit-mov-reg-abs buf reg #x10000C30))
+      (emit-mov-reg-imm buf reg 0)))
+
 (defvar *x64-fault-dump*
   ;; NOTE the shape: `(and #+sbcl (getenv ...) t)' would read as `(and t)' — i.e.
   ;; ON — on any host that is not SBCL, because the reader DELETES the guarded
@@ -1128,13 +1178,14 @@
                 (emit-jcc buf :ne skiparm-label))
               ;; Save RSP to 0x10000180
               ;; Use movabs with RCX as temp (address > 0x7FFFFFFF, can't use disp32)
-              ;; mov rcx, 0x10000180
+              ;; mov rcx, 0x10000180  (immediate — the ACCESSES below carry
+              ;; the per-thread override, the address literal does not)
               (emit-bytes buf #x48 #xB9)
               (emit-u32 buf #x10000180) (emit-u32 buf 0)
               ;; mov [rcx], rsp
-              (emit-bytes buf #x48 #x89 #x21)
+              (emit-tls-prefix buf) (emit-bytes buf #x48 #x89 #x21)
               ;; mov [rcx+8], rbp
-              (emit-bytes buf #x48 #x89 #x69 #x08)
+              (emit-tls-prefix buf) (emit-bytes buf #x48 #x89 #x69 #x08)
               ;; mov [rcx+24], rbx  — save callee-saved RBX (V4) at slot 0x198.
               ;; The compiler caches values (e.g. let-bound cons-list cursors)
               ;; in V4 across function calls, relying on callees to preserve
@@ -1144,7 +1195,7 @@
               ;; the compiler tracks.  Saving RBX here and restoring in all
               ;; three longjmp paths (TRAP #x0511, #PF handler at 0x4F0820,
               ;; deadline-IRQ ISR at 0x4F0900) keeps RBX consistent.
-              (emit-bytes buf #x48 #x89 #x59 #x18)
+              (emit-tls-prefix buf) (emit-bytes buf #x48 #x89 #x59 #x18)
               ;; Save the address of the FIRST instruction after this trap block
               ;; into [rcx+16].  After lea (7 bytes), we still have:
               ;;   mov [rcx+16], rax     (4 bytes)
@@ -1155,11 +1206,18 @@
               ;; BARE-METAL adds the 12-byte in-transition flag clear between
               ;; mov [rcx+16],rax and the movabs: distance = 4+12+10 = 26.
               ;; lea rax, [rip+N] lands rax at the byte AFTER the trap.
+              ;; THE DISTANCE IS COUNTED, NOT ASSUMED: the FS override on the
+              ;; `mov [rcx+16], rax' below is one more byte between the end of
+              ;; this LEA and the end of the trap block, so the displacement
+              ;; is 15 rather than 14 when the per-thread window is on.  Get
+              ;; this wrong and SETJMP records a resume point one byte off.
               (emit-bytes buf #x48 #x8D #x05
-                          (if *x64-linux-mode* #x0E #x1A)
-                          #x00 #x00 #x00)            ; lea rax, [rip+14/26]
+                          (if *x64-linux-mode*
+                              (if *x64-tls-window* #x0F #x0E)
+                              #x1A)
+                          #x00 #x00 #x00)            ; lea rax, [rip+14/15/26]
               ;; mov [rcx+16], rax  — save return IP
-              (emit-bytes buf #x48 #x89 #x41 #x10)
+              (emit-tls-prefix buf) (emit-bytes buf #x48 #x89 #x41 #x10)
               (unless *x64-linux-mode*
                 ;; capped setjmp lands here (arm skipped); both paths clear
                 ;; the in-transition flag.
@@ -1245,7 +1303,8 @@
               ;;   jmp loop
               ;; done:
               ;;
-              ;; mov eax, dword [0x10000150]
+              ;; mov eax, dword [0x10000150]   (per-thread: THIS call's nargs)
+              (emit-tls-prefix buf)
               (emit-bytes buf #xA1 #x50 #x01 #x00 #x10 #x00 #x00 #x00 #x00)
               ;; cmp eax, 5
               (emit-bytes buf #x83 #xF8 #x05)
@@ -1354,10 +1413,14 @@
                 (emit-bytes buf #x48 #x89 #x04 #x25)
                 (emit-u32 buf #x10000C58)
                 ;; mov rcx, 0x10000180  (saved-handler-state address)
+                ;; PER-THREAD WINDOW: the signal runs on the FAULTING thread
+                ;; with that thread's FS base, so "is a handler-case active?"
+                ;; is answered about the thread that actually faulted — and the
+                ;; longjmp lands on ITS stack, not on some other thread's.
                 (emit-bytes buf #x48 #xB9)
                 (emit-u32 buf #x10000180) (emit-u32 buf 0)
                 ;; rdx = [rcx]  (saved RSP — zero means no handler-case active)
-                (emit-bytes buf #x48 #x8B #x11)
+                (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x11)
                 ;; test rdx, rdx
                 (emit-bytes buf #x48 #x85 #xD2)
                 ;; jz exit_path
@@ -1366,39 +1429,39 @@
                 ;; Save OUR state to scratch (#x10000C10..) before the pop
                 ;; helper overwrites [180].
                 ;; rdx already = [rcx] = our RSP
-                (emit-bytes buf #x48 #x89 #x14 #x25)             ; mov [imm32], rdx
+                (emit-tls-prefix buf) (emit-bytes buf #x48 #x89 #x14 #x25) ; mov [imm32], rdx
                 (emit-u32 buf #x10000C10)
                 ;; rdx = [rcx+8] (our RBP)
-                (emit-bytes buf #x48 #x8B #x51 #x08)
-                (emit-bytes buf #x48 #x89 #x14 #x25)
+                (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x51 #x08)
+                (emit-tls-prefix buf) (emit-bytes buf #x48 #x89 #x14 #x25)
                 (emit-u32 buf #x10000C18)
                 ;; rdx = [rcx+16] (our IP)
-                (emit-bytes buf #x48 #x8B #x51 #x10)
-                (emit-bytes buf #x48 #x89 #x14 #x25)
+                (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x51 #x10)
+                (emit-tls-prefix buf) (emit-bytes buf #x48 #x89 #x14 #x25)
                 (emit-u32 buf #x10000C20)
                 ;; rdx = [rcx+24] (our saved RBX).  The stub previously did
                 ;; NOT restore RBX — unlike TRAP #x0511 — so a fault-driven
                 ;; longjmp resumed the handler-case with the interrupted
                 ;; callee's RBX (V4) still live: the setjmp-time V4 value the
                 ;; compiler tracks was silently replaced (silent-unwind).
-                (emit-bytes buf #x48 #x8B #x51 #x18)
-                (emit-bytes buf #x48 #x89 #x14 #x25)
+                (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x51 #x18)
+                (emit-tls-prefix buf) (emit-bytes buf #x48 #x89 #x14 #x25)
                 (emit-u32 buf #x10000C28)
                 ;; Pop handler stack into [180]/+8/+16/+24 so the outer
                 ;; handler-case becomes active when we land in the body.
                 (emit-call buf pop-label)
                 ;; Restore from scratch and jump
                 ;; mov rdx, [0x10000C20]   ; IP
-                (emit-bytes buf #x48 #x8B #x14 #x25)
+                (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x14 #x25)
                 (emit-u32 buf #x10000C20)
                 ;; mov rbp, [0x10000C18]
-                (emit-bytes buf #x48 #x8B #x2C #x25)
+                (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x2C #x25)
                 (emit-u32 buf #x10000C18)
                 ;; mov rbx, [0x10000C28]   ; restore caller's V4=RBX
-                (emit-bytes buf #x48 #x8B #x1C #x25)
+                (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x1C #x25)
                 (emit-u32 buf #x10000C28)
                 ;; mov rsp, [0x10000C10]
-                (emit-bytes buf #x48 #x8B #x24 #x25)
+                (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x24 #x25)
                 (emit-u32 buf #x10000C10)
                 ;; mov eax, 0xDEAD1009 (T sentinel — 32-bit imm zero-extends to rax)
                 (emit-bytes buf #xB8 #x09 #x10 #xAD #xDE)
@@ -1702,6 +1765,7 @@
                 (emit-push buf 'rbx)
                 (emit-load-vreg buf va 'rsi)           ; arg0 = va (still intact)
                 (emit-load-vreg buf vb 'rdi)           ; arg1 = vb
+                (emit-tls-prefix buf)                  ; nargs is per-thread
                 (emit-bytes buf #xC7 #x04 #x25 #x50 #x01 #x00 #x10 #x02 #x00 #x00 #x00) ; [nargs]=2
                 (if gm-label
                     (emit-call buf gm-label)
@@ -1755,6 +1819,7 @@
                 (emit-push buf 'rbx)
                 (emit-load-vreg buf va 'rsi)
                 (emit-load-vreg buf vb 'rdi)
+                (emit-tls-prefix buf)                  ; nargs is per-thread
                 (emit-bytes buf #xC7 #x04 #x25 #x50 #x01 #x00 #x10 #x02 #x00 #x00 #x00) ; [nargs]=2
                 (if ga-label
                     (emit-call buf ga-label)
@@ -1809,6 +1874,7 @@
                 (emit-push buf 'rbx)
                 (emit-load-vreg buf va 'rsi)
                 (emit-load-vreg buf vb 'rdi)
+                (emit-tls-prefix buf)                  ; nargs is per-thread
                 (emit-bytes buf #xC7 #x04 #x25 #x50 #x01 #x00 #x10 #x02 #x00 #x00 #x00) ; [nargs]=2
                 (if gs-label
                     (emit-call buf gs-label)
@@ -2772,6 +2838,9 @@
          ;; many args the caller passed. Encoded as:
          ;;   mov dword [0x10000150], imm32
          (let ((n (first operands)))
+           ;; PER-THREAD WINDOW: nargs is state of the call in flight, so two
+           ;; threads calling &rest functions must not share one slot.
+           (emit-tls-prefix buf)
            (emit-bytes buf #xC7 #x04 #x25)         ; mov [disp32], imm32
            (emit-bytes buf #x50 #x01 #x00 #x10)    ; disp32 = #x10000150
            (emit-bytes buf (logand n #xFF) #x00 #x00 #x00)))
@@ -2784,7 +2853,8 @@
          ;; immediates) and :cons just work.
          (let* ((vd (first operands))
                 (d (dest-phys-or-scratch vd)))
-           ;; mov eax, dword [0x10000150]
+           ;; mov eax, dword [0x10000150]   (per-thread — see +OP-SET-NARGS+)
+           (emit-tls-prefix buf)
            (emit-bytes buf #xA1)                   ; mov eax, m32 (special form)
            (emit-bytes buf #x50 #x01 #x00 #x10
                             #x00 #x00 #x00 #x00)   ; abs64 (mov eax variant)
@@ -3242,13 +3312,22 @@
          ;; Width: 0=u8, 1=u16, 2=u32, 3=u64
          (let* ((vd (first operands))
                 (vaddr (second operands))
-                (width (third operands))
+                (raw-width (third operands))
+                (width (logand raw-width 3))
+                ;; 4 is +WIDTH-TLS-BIT+ (mvm/mvm.lisp), written as a LITERAL
+                ;; because this file is also read INSIDE the image, where the
+                ;; MODUS.MVM build-time constants are not in scope.
+                (tls (and *x64-tls-window* (logtest raw-width 4)))
                 (d (dest-phys-or-scratch vd)))
            ;; Get address into a temp
            (let ((pa (vreg-phys vaddr)))
              (unless pa
                (emit-load-vreg buf vaddr 'rax)
                (setf pa 'rax))
+             ;; PER-THREAD WINDOW: one FS override byte, emitted before the
+             ;; REX prefix as the encoding requires.  With the window off (or
+             ;; the bit clear) not a byte changes.
+             (when tls (emit-bytes buf #x64))
              (ecase width
                (0 ;; u8: MOVZX r64, byte [addr]
                 ;; REX.W 0F B6 /r (ModRM: [reg])
@@ -3265,7 +3344,12 @@
          ;; (store Vaddr Vs width:imm8) — raw memory write
          (let* ((vaddr (first operands))
                 (vs (second operands))
-                (width (third operands))
+                (raw-width (third operands))
+                (width (logand raw-width 3))
+                ;; 4 is +WIDTH-TLS-BIT+ (mvm/mvm.lisp), written as a LITERAL
+                ;; because this file is also read INSIDE the image, where the
+                ;; MODUS.MVM build-time constants are not in scope.
+                (tls (and *x64-tls-window* (logtest raw-width 4)))
                 (pa (vreg-phys vaddr))
                 (ps (vreg-phys vs)))
            ;; Need address in one register, value in another
@@ -3277,6 +3361,8 @@
              (emit-push buf 'r13)
              (emit-load-vreg buf vs 'r13)
              (setf ps 'r13))
+           ;; PER-THREAD WINDOW: see the matching note in +OP-LOAD+.
+           (when tls (emit-bytes buf #x64))
            (ecase width
              (0 (emit-mov-mem-byte buf pa ps))
              (1 (emit-mov-mem-word buf pa ps))
@@ -3705,6 +3791,8 @@
                 (addr #x10000090))      ; MV-COUNT-ADDR
            ;; MOV qword [addr32], imm32 (sign-extended)
            ;; 48 C7 04 25 <addr32-le> <imm32-le>
+           ;; PER-THREAD WINDOW: the MV count belongs to the returning thread.
+           (emit-tls-prefix buf)
            (emit-bytes buf #x48 #xC7 #x04 #x25)
            (emit-u32 buf addr)
            (emit-u32 buf tagged)))
@@ -4677,43 +4765,43 @@
     (emit-bytes buf #x48 #xC7 #x04 #x25) ; mov qword [imm32], 0
     (emit-u32 buf #x10000D20)
     (emit-u32 buf 0))
-  ;; mov rcx, 0x10000180
+  ;; mov rcx, 0x10000180  (an IMMEDIATE, not an access — no override)
   (emit-bytes buf #x48 #xB9)
   (emit-u32 buf #x10000180) (emit-u32 buf 0)
   ;; rdx = [rcx]      ; our RSP
-  (emit-bytes buf #x48 #x8B #x11)
+  (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x11)
   ;; mov [0x10000C10], rdx
-  (emit-bytes buf #x48 #x89 #x14 #x25)
+  (emit-tls-prefix buf) (emit-bytes buf #x48 #x89 #x14 #x25)
   (emit-u32 buf #x10000C10)
   ;; rdx = [rcx+8]    ; our RBP
-  (emit-bytes buf #x48 #x8B #x51 #x08)
+  (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x51 #x08)
   ;; mov [0x10000C18], rdx
-  (emit-bytes buf #x48 #x89 #x14 #x25)
+  (emit-tls-prefix buf) (emit-bytes buf #x48 #x89 #x14 #x25)
   (emit-u32 buf #x10000C18)
   ;; rdx = [rcx+16]   ; our IP
-  (emit-bytes buf #x48 #x8B #x51 #x10)
+  (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x51 #x10)
   ;; mov [0x10000C20], rdx
-  (emit-bytes buf #x48 #x89 #x14 #x25)
+  (emit-tls-prefix buf) (emit-bytes buf #x48 #x89 #x14 #x25)
   (emit-u32 buf #x10000C20)
   ;; rdx = [rcx+24]   ; our saved RBX
-  (emit-bytes buf #x48 #x8B #x51 #x18)
+  (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x51 #x18)
   ;; mov [0x10000C28], rdx
-  (emit-bytes buf #x48 #x89 #x14 #x25)
+  (emit-tls-prefix buf) (emit-bytes buf #x48 #x89 #x14 #x25)
   (emit-u32 buf #x10000C28)
   ;; Pop the handler stack back into [180]/+8/+16/+24
   (emit-call buf pop-label)
   ;; Restore from scratch and jump
   ;; mov rdx, [0x10000C20]   ; IP
-  (emit-bytes buf #x48 #x8B #x14 #x25)
+  (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x14 #x25)
   (emit-u32 buf #x10000C20)
   ;; mov rbp, [0x10000C18]   ; RBP
-  (emit-bytes buf #x48 #x8B #x2C #x25)
+  (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x2C #x25)
   (emit-u32 buf #x10000C18)
   ;; mov rbx, [0x10000C28]   ; restore caller's V4=RBX
-  (emit-bytes buf #x48 #x8B #x1C #x25)
+  (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x1C #x25)
   (emit-u32 buf #x10000C28)
   ;; mov rsp, [0x10000C10]   ; RSP
-  (emit-bytes buf #x48 #x8B #x24 #x25)
+  (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x24 #x25)
   (emit-u32 buf #x10000C10)
   (unless *x64-linux-mode*
     ;; clear the in-transition flag — state is now consistent
@@ -4810,8 +4898,11 @@
         (capped (make-label))
         (nomax (make-label)))
     (emit-label buf push-label)
-    ;; r10 = depth = [0x10000400]
-    (emit-bytes buf #x4C #x8B #x14 #x25)
+    ;; r10 = depth = [0x10000400]   (PER-THREAD WINDOW: every access in both
+    ;; helpers carries the FS override, so a thread pushes and pops ITS OWN
+    ;; frame stack.  One shared stack is how thread A's ERROR longjmped onto
+    ;; thread B's stack.)
+    (emit-tls-prefix buf) (emit-bytes buf #x4C #x8B #x14 #x25)
     (emit-u32 buf #x10000400)
     ;; cmp r10, 64 ; jge skip/capped
     ;; BARE-METAL (non-Linux): route the capped case through a diagnostic
@@ -4829,24 +4920,24 @@
     (emit-bytes buf #x49 #x81 #xC3)                  ; add r11, imm32
     (emit-u32 buf #x10000408)
     ;; rax = [0x10000180]; [r11] = rax
-    (emit-bytes buf #x48 #x8B #x04 #x25)
+    (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x04 #x25)
     (emit-u32 buf #x10000180)
-    (emit-bytes buf #x49 #x89 #x03)                  ; mov [r11], rax
+    (emit-tls-prefix buf) (emit-bytes buf #x49 #x89 #x03)   ; mov [r11], rax
     ;; rax = [0x10000188]; [r11+8] = rax
-    (emit-bytes buf #x48 #x8B #x04 #x25)
+    (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x04 #x25)
     (emit-u32 buf #x10000188)
-    (emit-bytes buf #x49 #x89 #x43 #x08)             ; mov [r11+8], rax
+    (emit-tls-prefix buf) (emit-bytes buf #x49 #x89 #x43 #x08) ; mov [r11+8], rax
     ;; rax = [0x10000190]; [r11+16] = rax
-    (emit-bytes buf #x48 #x8B #x04 #x25)
+    (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x04 #x25)
     (emit-u32 buf #x10000190)
-    (emit-bytes buf #x49 #x89 #x43 #x10)             ; mov [r11+16], rax
+    (emit-tls-prefix buf) (emit-bytes buf #x49 #x89 #x43 #x10) ; mov [r11+16], rax
     ;; rax = [0x10000198]; [r11+24] = rax   (saved RBX — see docstring)
-    (emit-bytes buf #x48 #x8B #x04 #x25)
+    (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x04 #x25)
     (emit-u32 buf #x10000198)
-    (emit-bytes buf #x49 #x89 #x43 #x18)             ; mov [r11+24], rax
+    (emit-tls-prefix buf) (emit-bytes buf #x49 #x89 #x43 #x18) ; mov [r11+24], rax
     ;; depth++ ; [0x10000400] = r10
     (emit-bytes buf #x49 #xFF #xC2)                  ; inc r10
-    (emit-bytes buf #x4C #x89 #x14 #x25)             ; mov [imm32], r10
+    (emit-tls-prefix buf) (emit-bytes buf #x4C #x89 #x14 #x25) ; mov [imm32], r10
     (emit-u32 buf #x10000400)
     (unless *x64-linux-mode*
       ;; DIAG: max-depth watermark at [0x10000D08]
@@ -4907,14 +4998,14 @@
       (emit-jmp buf done)
       (emit-label buf no-ovf))
     ;; r10 = depth = [0x10000400]
-    (emit-bytes buf #x4C #x8B #x14 #x25)
+    (emit-tls-prefix buf) (emit-bytes buf #x4C #x8B #x14 #x25)
     (emit-u32 buf #x10000400)
     ;; test r10, r10 ; jz empty
     (emit-bytes buf #x4D #x85 #xD2)
     (emit-jcc buf :e empty)
     ;; depth-- ; [0x10000400] = r10
     (emit-bytes buf #x49 #xFF #xCA)                  ; dec r10
-    (emit-bytes buf #x4C #x89 #x14 #x25)
+    (emit-tls-prefix buf) (emit-bytes buf #x4C #x89 #x14 #x25)
     (emit-u32 buf #x10000400)
     ;; r11 = depth*32 + 0x10000408
     (emit-bytes buf #x4D #x6B #xDA #x20)             ; imul r11, r10, 32
@@ -4923,20 +5014,20 @@
     ;; Use r10 as memory-scratch (its value is now consumed) so RAX
     ;; stays pristine across mem-to-mem copies.
     ;; [0x10000180] = [r11]
-    (emit-bytes buf #x4D #x8B #x13)                  ; mov r10, [r11]
-    (emit-bytes buf #x4C #x89 #x14 #x25)             ; mov [imm32], r10
+    (emit-tls-prefix buf) (emit-bytes buf #x4D #x8B #x13)   ; mov r10, [r11]
+    (emit-tls-prefix buf) (emit-bytes buf #x4C #x89 #x14 #x25) ; mov [imm32], r10
     (emit-u32 buf #x10000180)
     ;; [0x10000188] = [r11+8]
-    (emit-bytes buf #x4D #x8B #x53 #x08)             ; mov r10, [r11+8]
-    (emit-bytes buf #x4C #x89 #x14 #x25)
+    (emit-tls-prefix buf) (emit-bytes buf #x4D #x8B #x53 #x08) ; mov r10, [r11+8]
+    (emit-tls-prefix buf) (emit-bytes buf #x4C #x89 #x14 #x25)
     (emit-u32 buf #x10000188)
     ;; [0x10000190] = [r11+16]
-    (emit-bytes buf #x4D #x8B #x53 #x10)             ; mov r10, [r11+16]
-    (emit-bytes buf #x4C #x89 #x14 #x25)
+    (emit-tls-prefix buf) (emit-bytes buf #x4D #x8B #x53 #x10) ; mov r10, [r11+16]
+    (emit-tls-prefix buf) (emit-bytes buf #x4C #x89 #x14 #x25)
     (emit-u32 buf #x10000190)
     ;; [0x10000198] = [r11+24]   (saved RBX — see push above)
-    (emit-bytes buf #x4D #x8B #x53 #x18)             ; mov r10, [r11+24]
-    (emit-bytes buf #x4C #x89 #x14 #x25)
+    (emit-tls-prefix buf) (emit-bytes buf #x4D #x8B #x53 #x18) ; mov r10, [r11+24]
+    (emit-tls-prefix buf) (emit-bytes buf #x4C #x89 #x14 #x25)
     (emit-u32 buf #x10000198)
     (emit-jmp buf done)
     (emit-label buf empty)
@@ -4946,7 +5037,7 @@
       (emit-bytes buf #x48 #xFF #x04 #x25)           ; inc qword [imm32]
       (emit-u32 buf #x10000D10))
     ;; [0x10000180] = 0  (legacy "no handler" sentinel)
-    (emit-bytes buf #x48 #xC7 #x04 #x25)             ; mov qword [imm32], 0
+    (emit-tls-prefix buf) (emit-bytes buf #x48 #xC7 #x04 #x25) ; mov qword [imm32], 0
     (emit-u32 buf #x10000180)
     (emit-u32 buf 0)
     (emit-label buf done)
@@ -5396,15 +5487,24 @@
     (let ((mv-loop (make-label))
           (mv-done (make-label)))
       ;; R10 = (mem[0x10000090] >> 1) - 1  =  number of extra values
-      (emit-mov-reg-imm buf 'rax #x10000090)
+      ;; PER-THREAD WINDOW: the collector runs on the thread that hit the
+      ;; limit, so the extras it must keep alive are THAT thread's.  With the
+      ;; window off emit-tls-base yields 0 and this is the historic address.
+      (if *x64-tls-window*
+          (progn (emit-tls-base buf 'rax)
+                 (emit-add-reg-imm buf 'rax #x10000090))
+          (emit-mov-reg-imm buf 'rax #x10000090))
       (emit-mov-reg-mem buf 'r10 'rax 0)         ; r10 = tagged count
       (emit-shr-reg-imm buf 'r10 1)              ; untag -> raw count
       (emit-sub-reg-imm buf 'r10 1)              ; r10 = count - 1 (extras)
       ;; if extras <= 0, nothing to scan (SUB sets SF/ZF: jle when <=0)
       (emit-cmp-reg-imm buf 'r10 0)
       (emit-jcc buf :le mv-done)
-      ;; RDI = 0x10000098 (first extra value slot)
-      (emit-mov-reg-imm buf 'rdi #x10000098)
+      ;; RDI = 0x10000098 (first extra value slot), per-thread
+      (if *x64-tls-window*
+          (progn (emit-tls-base buf 'rdi)
+                 (emit-add-reg-imm buf 'rdi #x10000098))
+          (emit-mov-reg-imm buf 'rdi #x10000098))
       (emit-label buf mv-loop)
       (emit-mov-reg-reg buf 'rax 'rdi)           ; rax = slot addr
       (emit-call buf scan-word-label)
@@ -6293,13 +6393,20 @@
     (emit-mov-reg-imm buf 'rax #x10000148) (emit-call buf scan-word-label)
     (emit-mov-reg-imm buf 'rax #x10000170) (emit-call buf scan-word-label)
     (let ((mv-loop (make-label)) (mv-done (make-label)))
-      (emit-mov-reg-imm buf 'rax #x10000090)
+      ;; PER-THREAD WINDOW — see the matching note in the copying trampoline.
+      (if *x64-tls-window*
+          (progn (emit-tls-base buf 'rax)
+                 (emit-add-reg-imm buf 'rax #x10000090))
+          (emit-mov-reg-imm buf 'rax #x10000090))
       (emit-mov-reg-mem buf 'r10 'rax 0)
       (emit-shr-reg-imm buf 'r10 1)
       (emit-sub-reg-imm buf 'r10 1)
       (emit-cmp-reg-imm buf 'r10 0)
       (emit-jcc buf :le mv-done)
-      (emit-mov-reg-imm buf 'rdi #x10000098)
+      (if *x64-tls-window*
+          (progn (emit-tls-base buf 'rdi)
+                 (emit-add-reg-imm buf 'rdi #x10000098))
+          (emit-mov-reg-imm buf 'rdi #x10000098))
       (emit-label buf mv-loop)
       (emit-mov-reg-reg buf 'rax 'rdi)
       (emit-call buf scan-word-label)

@@ -871,6 +871,104 @@ grows 304 bytes, and that is not code: `build-image` embeds the image's own
 source text (`embed-source-blob`), and `mvm/gc.lisp`'s corrected comment is 301
 chars longer.  **Judge these builds per-function, never by image size.**
 
+### Per-region GC, stage 4: the collector is REENTRANT — the global collection lock is GONE
+
+`%HA-LOCKED-COLLECT-HERE` (0fdb21a) serialized every collection behind one lock
+and named three reasons.  All three are answered and the lock is removed; it is
+KEPT SWITCHED OFF (`%HA-SET-COLLECT-SERIALIZED`) so a future corruption can be
+bisected against the serialized path in the same binary.
+
+**FIRST, WHICH COLLECTOR RUNS WHERE, because it reframes the whole problem.**
+The three fixed shared words `0x10000100/0x10000108/0x10000110` belong to
+`mvm/gc.lisp`'s **Lisp** `%GC-COLLECT`, which runs on the **aarch64 SHIM path**
+and on any target with no native arm.  It is **not** what runs on the target
+that has threads: hosted x86-64 — like bare x64 and i386 — collects in a NATIVE
+trampoline (`translate-x64`'s `emit-gc-trampoline`) that keeps every
+per-collection value in **registers** (R13 free ptr, RBX from_start, RCX
+from_end, RDX stack_base, R10 scan ptr), pushed on the collecting thread's own
+stack.  It was private per CPU by construction and always was.
+
+| the lock's reason | verdict |
+|---|---|
+| three fixed shared scratch words | real, but only on the **Lisp** arm.  Now a 32-byte block **per CPU** (`%GC-SCRATCH-CELL`), threaded through the whole collector as an argument `SC` resolved once in `%GC-COLLECT`.  Zero config word = the historic block, so single-threaded images are unchanged. |
+| the shared **globals root set** | **not a race between two collectors.**  `%GC-FORWARD-SLOT` rewrites a slot only when its value points into **this** region's from-space, and two regions' from-spaces are disjoint, so two collectors' writes are disjoint.  Full argument (incl. the read side and the separate MUTATOR hazard it does *not* cover) lives in `mvm/gc.lisp`. |
+| *(not named by the lock)* the shared **BITMAPS** | **the one live defect.**  See below. |
+
+**THE BITMAP HAZARD THE LOCK WAS SILENTLY COVERING.**  One pair of bitmaps
+covers the whole heap at 1 bit / 16-byte granule.  The widest **unLOCKed**
+read-modify-write on them is `translate-x64`'s `BTS [base], idx` at 64-bit
+operand size, which by the Intel definition touches the **eight-byte unit** at
+`base + 8*(idx >> 6)` — eight bitmap bytes = **1024 heap bytes** — and it is on
+the allocation fast path.  So two regions whose boundary falls inside such a
+unit share a read-modify-write word, and a mutator in one can lose a
+collector's survivor bit in the other.  **A lost start bit is not benign**:
+`%gc-forward-slot` and `scan_word` both reject a candidate whose granule is not
+a recorded start, so the object is silently not forwarded.
+
+Measured on hosted x64 with the invariant's own oracle, **before** the fix:
+`old r1-to align mask = 2`, `old r2-to align mask = 2`, `r0 align mask = 2` —
+both carved regions' **to-spaces** were 512-aligned, because region 0's
+`space_size` was `512 mod 1024` (`+LINUX-X64-HEAP-ALLOC-START+` was `0x200`
+against a 1024-aligned midpoint) and the carve derived the to-side by adding it.
+Fixed at three layers: the boot constant `0x200 -> 0x400`, `%HA-CARVE` rounding
+both bases up to page_base's congruence (with 4 KB of headroom reserved in
+`NEW0`), and `%GC-REGION-INIT` **measuring** it into a violation ledger.
+**Align against page_base, never against from0** — from0 is whichever semispace
+is currently the from-space and it swaps on every collection.
+
+**REMOVING A LOCK IS ONLY TESTED IF THE COLLECTIONS OVERLAP IN TIME**, and
+`test/hosted-thread-gc.lisp`'s 39 checks all pass with the lock still in.  So
+the trampoline itself counts, with LOCKed instructions, at the true boundaries
+of a collection: `lock inc [cur]` / witness if `cur >= 2` at entry, `lock dec`
+at the restore label, plus a bounded **in-collection barrier** (`[barrier]` is a
+spin budget; a collector alone at entry waits for a second).  Gated `:LINUX`, so
+bare-metal x64 emission is byte-identical.
+
+**The negative control is the old lock, in the same binary, on the same
+workload** — `test/hosted-thread-gc-concurrent.lisp` (48 checks) runs it twice,
+one flag apart:
+
+| | overlap witnesses | barrier meetings | collectors inside at end |
+|---|---|---|---|
+| concurrent | **48** | **51** | 0 |
+| serialized | **0** | **0** | 0 |
+
+A serialized implementation FAILS the concurrent arm.
+`test/hosted-thread-gc-stress.lisp` (675 checks) then runs 24 whole two-thread
+rounds — 64 messages, a 2000-cons chain live on every actor, a forced collection
+per message on both threads: **3120 collections, 1541 witnesses, 1978 barrier
+meetings, zero chain-survival failures, zero foreign refs, zero alignment
+violations.**
+
+**Two things the 10x runs found, both mine and not the collector's:**
+- **Heap-window uniformity must not be asserted on a hosted target.**
+  `%GC-HEAP-WINDOW-UNIFORM-P` measures the precondition of the *Lisp*
+  collector's torn-read argument (two 32-bit stores).  Measured over 40 fresh
+  processes, region 0 had both semispaces in one 4 GiB window in **26** — the
+  ~1.8 GB mmap straddles a boundary about a third of the time under ASLR.  It
+  bounds nothing on x64 (the native slot rewrite is one aligned 8-byte store),
+  so the test reports it and asserts neither.  The useful conclusion: making the
+  **Lisp** collector concurrent on a hosted target needs a 64-bit store, not a
+  layout assumption.
+- **The message log would have run into the per-CPU block.**  0x800 bytes at
+  `band+0x800` = 64 entries, with `PERCPU-DATA-BASE` immediately above; nothing
+  bounded the index.  Unreachable at NMSG=48, found while sizing the stress.
+  `%HA-LOG-CAP` now bounds both writers.
+
+**EXECUTED, NOT MERELY COMPILED.**  x86-64 cannot run `%GC-COLLECT`, so the Lisp
+arm is driven on the one bootable target that can:
+`MODUS_RPI_GC_SHIM=1 sbcl --script mvm/build-rpi-cl-repl.lisp` turns the native
+aarch64 collector off so every gc-check lands in the shim, which CALLs
+`%GC-COLLECT`.  Under `qemu-system-aarch64 -M raspi3b`:
+`(%gc-forced-stress 2000 5)` → `(1 6 2000 1999000 0 5)` (the value documented
+for that image on its *native* arm) and `(%gc-forced-stress 500 3)` →
+`(6 9 500 124750 0 3)`; violations 0.  Default OFF — the shipping image is
+byte-identical.  The per-CPU **addressing** is separately exercised on the
+threaded target: thread 1 gets scratch entry 0, thread 2 entry 1, +32 bytes.
+
+`build-checks.lisp` CHECK G now fails the build if `mvm/gc.lisp` still spells
+`0x10000108` or `0x10000110` as a literal — verified by reintroducing one.
+
 ### Conservative-root validation collector (x64, landed ace1544 + 810a975)
 
 The Cheney collector is now hardened by an **object-start bitmap** (1 bit /

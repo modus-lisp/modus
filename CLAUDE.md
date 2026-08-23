@@ -940,6 +940,23 @@ per message on both threads: **3120 collections, 1541 witnesses, 1978 barrier
 meetings, zero chain-survival failures, zero foreign refs, zero alignment
 violations.**
 
+**AND THE HONEST THROUGHPUT ANSWER: on this workload there isn't one.**  The
+flag exists so the two paths can be MEASURED, so they were — 12 rounds x 64
+messages x 2 threads x 2000-cons chains, barrier off, same binary:
+
+| | wall (3 reps) | overlap witnesses |
+|---|---|---|
+| concurrent | 3.36 / 3.25 / 3.31 s | 528 / 522 / 517 |
+| serialized | 3.21 / 3.45 / 3.25 s | 0 / 0 / 0 |
+
+Indistinguishable, and that is expected rather than disappointing: a forced
+collection of a 16 MB region holding ~2000 live conses takes microseconds, so
+the run is dominated by message passing and chain walking and the serialized
+arm almost never actually blocks.  **Removing the lock bought correctness and
+structure, not throughput on this workload** — the throughput case needs
+regions large enough that a collection is long compared to the interval between
+them.  Do not quote a speedup here; there isn't one to quote.
+
 **Two things the 10x runs found, both mine and not the collector's:**
 - **Heap-window uniformity must not be asserted on a hosted target.**
   `%GC-HEAP-WINDOW-UNIFORM-P` measures the precondition of the *Lisp*

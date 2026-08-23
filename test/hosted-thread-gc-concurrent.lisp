@@ -93,6 +93,24 @@
       (progn (setq *fail* (+ *fail* 1))
              (format t "  FAIL ~A = ~D (expected > 0)~%" name got))))
 
+;; ===== THE ALIGNMENT ORACLE, WITH A POSITIVE CONTROL, FIRST =============
+;; Everything below asserts the violation ledger is ZERO.  An oracle that can
+;; only ANSWER zero is worth nothing — the same trap the "other region is
+;; untouched" checksum fell into once already.  So prove it can answer
+;; non-zero, and with the right bit, before believing its zeros.
+(format t "~%THE ALIGNMENT ORACLE CAN ANSWER NON-ZERO~%")
+(let ((c (%ha-align-control)))
+  (if (zerop c)
+      (format t "SKIP: the actor band could not be carved.~%")
+      (progn
+        (chk "aligned region -> no mask"      (w c #x00) 0)
+        (chk "from-space +512 -> mask 1"      (w c #x08) 1)
+        (chk "to-space   +512 -> mask 2"      (w c #x10) 2)
+        (chk "size       +512 -> mask 4"      (w c #x18) 4)
+        (chk "all three  +512 -> mask 7"      (w c #x20) 7)
+        (chk "%GC-REGION-INIT counted 4 of 5" (w c #x28) 4)
+        (chk "and recorded the last mask"     (w c #x30) 7))))
+
 (format t "~%CONCURRENT COLLECTION UNDER TWO NATIVE THREADS~%")
 (format t "  ~D messages, ~D-cons chain live on each side,~%" *nmsg* *nlinks*)
 (format t "  a forced collection per message on each thread, NO LOCK.~%~%")

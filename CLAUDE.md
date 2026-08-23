@@ -994,6 +994,134 @@ from / to / size / all-three nudged by exactly the 512 the shipping carve was
 off by) and the test asserts masks `0 / 1 / 2 / 4 / 7` and that
 `%GC-REGION-INIT` counted **4 of 5**.
 
+### Threads become USABLE: the shared runtime tables, blocking receive, mutex/condvar, SLEEP
+
+Stage 4 gave hosted x86-64 two real OS threads with independent, concurrent
+collections.  What it did NOT give them was the ability to run **Lisp**.  Every
+threaded selftest's header says the workload touches "arithmetic, raw memory
+access and message passing only — no FORMAT, INTERN, EVAL, or symbol/keyword
+literal", and that restriction was the **ceiling**, not an accident.  Four
+things, in the order they matter:
+
+**1. THE SHARED TABLES ARE LOCKED, AND THE LOCK ALSO CHOOSES THE HEAP.**  The
+globals hash table (`0x10000080`), the symbol / keyword / package intern tables
+(`0x10000088` / `0x10000148` / `0x10000170`) and `%MACRO-PKG-*` are one set of
+shared mutable structures.  A concurrent `PUTHASH` is not merely a lost entry:
+two threads that both miss the same `GETHASH` both allocate a symbol and both
+store it, so **`(eq 'foo 'foo)` stops holding across threads**.
+
+`%RT-ENTER` / `%RT-LEAVE` (mvm/prelude.lisp) wrap `SYMBOL-VALUE`,
+`SET-SYMBOL-VALUE`, `%INTERN-SYMBOL-PKG`, `%INTERN-KEYWORD` and the three
+`%MACRO-PKG-*`.  They are a **gate on one BSS word (`0x10000DB8`) plus two no-op
+bodies**; nothing writes the word unless a program declares it is running Lisp
+on more than one thread, so every other image — bare metal, the four ANSI gate
+runners, the aarch64 and i386 CLIs, an ordinary `./modus` — pays one 32-bit load
+and a branch.  The hosted x64 image overrides the two bodies
+(net/hosted-sync.lisp) with a **recursive** futex mutex (recursive because
+interning reaches globals and `SYMBOL-VALUE` takes the same lock; ownership is
+the CPU id, not `gettid`, so `%RT-THREADS-ON` refuses unless per-CPU storage is
+on).
+
+**A LOCK ALONE IS HALF THE FIX, and the other half is the hazard mvm/gc.lisp
+records as out of scope.**  A Cheney collector scans only what it **copies**, so
+a table living in region 0 is never walked into by thread B's collector — and a
+symbol B allocated in B's own region, whose only reference is that table, is not
+forwarded.  It is garbage the instant B collects.  So the locked section makes
+**region 0 the active heap** (`%GC-REGION-ENTER` parks the thread's own
+allocation pointer/limit and loads region 0's) and puts the thread back on the
+way out; under the lock exactly one thread is in region 0, so its single parked
+frontier is not a shared pointer two CPUs read.
+
+***PRECONDITION, MEASURED NOT ASSUMED: region 0 must not collect while this is
+in use.***  Its root window ends at the **process** stack base, which is not
+where thread 2's roots are.  It is ~840 MB after the carve and the interned
+universe is small; `test/hosted-thread-lisp.lisp` requires region 0's collection
+count **unchanged**, so a workload that outgrew this FAILS rather than corrupts.
+Making region 0 collectable under threads needs a stop-the-world handshake with
+per-thread root windows — **not done**.
+
+**ORDERING TRAP:** `%RT-LEAVE-LOCKED` must not decrement the depth to zero until
+**after** the region is restored.  `%GC-REGION-ENTER` is ordinary compiled Lisp;
+anything it touches that the compiler resolved as an implicit global becomes a
+`SYMBOL-VALUE` call, which takes this same lock.  At depth 0 that nested acquire
+sees itself as the outermost holder, restores the region again and **unlocks** —
+and the outer frame then unlocks a mutex the other thread owns.
+
+**2. BLOCKING `RECEIVE`.**  `RECEIVE`'s blocking arm used to release the
+scheduler lock and then call the idle loop — but from the instant the lock drops
+the actor is claimable by another CPU, and this CPU is still standing on its
+stack.  The arm is now `AP-SCHEDULER-BLOCKED`, entered **with the lock held**
+(bare-metal behaviour unchanged: it is the two lines `RECEIVE` used to run
+inline).  Hosted, it `RESTORE-CONTEXT`s into the thread's own scheduler context,
+which moves RSP off the actor's stack and only then releases, because
+`+OP-RESTORE-CTX+` zeroes the lock after the stack switch.  `%SCHED-RUN` parks
+on a futex; `WAKE-IDLE-AP` — already called by `ACTOR-SPAWN` and
+`MAILBOX-ENQUEUE-AND-WAKE`, and previously `0` — is the wake.
+
+**The wake word is a STATE written with XCHG, not a sequence counter.**
+Incrementing a sequence is a read-modify-write and this ISA has an unconditional
+exchange but no atomic add, so two wakers could write back the same value and a
+stale writer could restore exactly the value a not-yet-parked idler is about to
+wait on.  Idler `XCHG(wake,0)` **before** looking at the queue; waker
+`XCHG(wake,1)` **after** enqueuing.
+
+**3. MUTEX / CONDVAR ON FUTEX(2), WITH NO NEW INSTRUCTION.**  The textbook futex
+mutex uses CAS to move 1 → 2 without disturbing 0.  `+OP-ATOMIC-XCHG+` is an
+unconditional exchange, so the three-state protocol writes 2 **unconditionally**
+and reads what was there; the direction it errs in is a wake nobody needs.  The
+condvar avoids an atomic increment by **requiring the associated mutex across
+`%COND-SIGNAL`** (as pthreads permits), which makes the sequence counter
+ordinary protected code.  **No `LOCK CMPXCHG` was added and none is needed.**
+`%MUTEX-LOCK` parks with a 20 ms timeout as a *safety net* — a lost wake would
+otherwise be a hang, the one failure mode that tells you nothing —
+and `%FUTEX-TIMEOUTS` counts every expiry so "no wake was lost" is asserted.
+
+**4. `SLEEP` WAS `(defun sleep (n) nil)`.**  It is now a restarting
+`nanosleep(2)`; restarting is not optional, because this image installs signal
+handlers and a non-restarting SLEEP would sometimes do nothing at all.
+
+**MEMORY:** one 8 KB `mmap` (the *thread page*) addressed from **one** BSS word
+(`0x10000DA8`, with `0x10000DB0` its init lock) — per-CPU timespecs, per-CPU
+scheduler contexts, the scheduler globals, and test scratch.  Not the carved
+actor band (SLEEP must work with no actor system) and not a Lisp global (a
+global lives in the very table a second thread must not be mutating).
+
+**A REAL BUG FOUND ON THE WAY: `SPIN-LOCK`'s test-and-TEST-and-set inner loop
+was a no-op.**  It spun on `(zerop (mem-ref addr :u64))`, and a `:u64` load hands
+the machine word back **as a tagged Lisp value** — so a held lock, raw 1, read
+that way is Lisp 0 and `zerop` said UNLOCKED every time.  The acquire
+degenerated into an unbounded XCHG hammer.  `:u8` fixes it (a `:u8` load is
+tagged on the way out, so the value IS the raw byte; big-endian degrades to
+today's behaviour).  Measured with a busy-polling actor on one thread and a
+sender on the other: ten sends cost **2.0 s** of extra wall time typically and
+**260 s** in the worst run; with the read-only wait, **0.1 s**.
+
+**ACCEPTANCE (all 10-of-10 runs):**
+
+| test | checks | headline numbers |
+|---|---|---|
+| `test/hosted-thread-lisp.lisp` | 29 | 2 threads x 300 iterations of intern / FORMAT / globals / define-and-call / cons; 12 forced collections each; region 0 at **0** collections; 624 lock acquisitions, 24 contended; 0 futex timeouts |
+| `test/hosted-thread-lisp-unsync.lisp` | — | **the negative control**: same workload, gate OFF.  10/10 FAIL — 6 SIGSEGV, 4 TYPE-ERROR aborts, one run dumped the symbol-name table as garbage |
+| `test/hosted-blocking-receive.lisp` | 29 | idle window: blocking **wall 1000 ms / CPU 0 ms**, polling **wall 1000 ms / CPU 997 ms** |
+| `test/hosted-mutex.lisp` | 18 | negative control 338187 of 600000 survived (**261813 lost**); under the mutex exactly 600000; condvar wait wall 300 ms / thread CPU 0 ms |
+| `test/hosted-sleep.lisp` | 13 | sleeping 400 ms -> wall 400 / cpu 0; spinning 400 ms -> wall 400 / cpu 398 |
+
+**WHAT IS STILL SERIALIZED, AND WHY.**  `test/hosted-thread-lisp.lisp` holds the
+runtime lock across the whole **Lisp-level** work of an iteration, not just the
+table calls.  Per-call locking is enough for the **tables**, but FORMAT and the
+printer also touch two pieces of shared BSS that are neither tables nor
+per-thread: **the multiple-value return buffer at `0x10000090`** (one buffer for
+every CPU) and **the handler-frame stack at `0x10000400`** (one depth counter,
+one frame array).  Making those per-thread means moving addresses the *compiler*
+bakes into every emitted `MULTIPLE-VALUE-BIND` and every function epilogue on
+four back-ends — its own campaign, and the next real obstacle.  The consing and
+the forced collections **are** genuinely concurrent.
+
+**Runtime EVAL / `compile` on a second thread was NOT attempted.**  "Defining a
+function" here means registering a fresh name in the shared symbol-function
+table and calling back through it — the table hazard, not the compiler's own
+globals.
+
 ### Conservative-root validation collector (x64, landed ace1544 + 810a975)
 
 The Cheney collector is now hardened by an **object-start bitmap** (1 bit /

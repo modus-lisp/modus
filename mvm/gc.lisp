@@ -1140,6 +1140,90 @@
   (setf (mem-ref addr :u64) v)
   (%gc-read64 addr))
 
+;;; ------------------------------------------------------------
+;;; THE REGION ALIGNMENT INVARIANT — why 1024, and why it is CHECKED
+;;; ------------------------------------------------------------
+;;; ONE PAIR OF BITMAPS COVERS THE WHOLE HEAP: object-start and cons-kind, 8 MB
+;;; each, 1 bit per 16-byte granule, indexed from page_base.  Regions are
+;;; DISJOINT ADDRESS RANGES, so their BITS are disjoint by construction, and
+;;; that is where the reasoning used to stop.  It is not enough, because bits
+;;; are not what hardware writes.
+;;;
+;;; THE WIDEST UNLOCKED READ-MODIFY-WRITE ANY IMPLEMENTATION PERFORMS ON THESE
+;;; MAPS IS translate-x64's `BTS [base], idx' AT 64-BIT OPERAND SIZE — emitted
+;;; at every allocation site (emit-mcgc-set-start-bit, the cons-kind
+;;; subroutine) and at every survivor copy (emit-mcgc-set-copy-bit).  By the
+;;; Intel definition, BT/BTS with a memory base and a REGISTER bit offset
+;;; accesses the unit at `base + (OperandSize/8) * (BitOffset DIV OperandSize)'
+;;; — for 64-bit operands, the EIGHT-BYTE unit at base + 8*(idx >> 6).  Eight
+;;; bitmap bytes is 8 * 128 = 1024 HEAP BYTES.  And it carries no LOCK prefix,
+;;; because it is on the allocation fast path.
+;;;
+;;; So if two regions' boundary falls INSIDE one of those units, the two share
+;;; a read-modify-write word: thread B allocating in its region can read the
+;;; unit, and write back a copy that does not contain the survivor bit thread
+;;; A's collector set in the other half a moment earlier.  A LOST START BIT is
+;;; not a benign loss — %gc-forward-slot and scan_word both REJECT a candidate
+;;; whose granule is not a recorded start, so the object is silently not
+;;; forwarded and every reference to it is left pointing into the reclaimed
+;;; semispace.
+;;;
+;;; The Lisp collector's own %gc-mark-start / %gc-mark-cons do a BYTE
+;;; read-modify-write, which would need only 128; the CLEAR after a swap
+;;; (%gc-clear-bitmap-range, and translate-x64's `rep stosb') is byte-exact and
+;;; likewise needs 128.  1024 is the maximum over implementations, so it is the
+;;; invariant: every region's FROM-space start, TO-space start and semispace
+;;; SIZE must be a multiple of 1024 RELATIVE TO page_base.
+;;;
+;;; MEASURED, BEFORE IT WAS ENFORCED: hosted x86-64.  Region 0's space_size is
+;;; 939523584 bytes = 512 mod 1024, and net/hosted-actors.lisp derived each
+;;; carved region's TO-space by adding that size to a page-aligned from-side
+;;; offset — so both carved regions' to-spaces were 512-aligned and their
+;;; shared boundary sat exactly in the middle of a BTS unit.  The from-spaces
+;;; were fine (their offsets are 4096-multiples).  It was invisible because
+;;; every collection was serialized behind the global collection lock.
+
+(defun %gc-bitmap-page-base-exact ()
+  "page_base as an EXACT byte address.  %gc-bitmap-page-base reads it with
+   (mem-ref … :u64), which HALVES — right on the targets whose %gc-bitmap-init
+   wrote the word through the doubling (setf (mem-ref … :u64) …), wrong on x64
+   where boot ASSEMBLY stores it raw.  That is the same split the eight
+   control-block fields have, and it has the same answer: the config word
+   follows THIS TARGET's metadata convention, so read it in that scale."
+  (%gc-meta-read #x10000E00 (%gc-meta-scale)))
+
+(defun %gc-region-align-check (from to size)
+  "0 if a region with semispaces at FROM and TO, each SIZE bytes, satisfies the
+   1024-byte bitmap alignment invariant above; otherwise a bitmask naming what
+   is wrong: 1 = from-space start, 2 = to-space start, 4 = size.
+
+   Answers 0 when the bitmaps are OFF (bitmap_base = 0): no bitmap, no shared
+   read-modify-write word, nothing to align.  Congruence is tested against
+   page_base's own low bits rather than by subtraction, so it is correct even
+   for a region below page_base (which is itself a bug, but not this one's)."
+  (if (= (%gc-bitmap-base) 0)
+      0
+      (let ((p (logand (%gc-bitmap-page-base-exact) 1023))
+            (v 0))
+        (if (= (logand from 1023) p) 0 (setq v (+ v 1)))
+        (if (= (logand to 1023) p)   0 (setq v (+ v 2)))
+        (if (= (logand size 1023) 0) 0 (setq v (+ v 4)))
+        v)))
+
+;;; THE VIOLATION LEDGER.  %gc-region-init cannot REFUSE a misaligned carve —
+;;; it is called from callers that have already committed the memory, and
+;;; failing there would turn a latent race into an immediate crash on targets
+;;; that are fine.  So it RECORDS: a count of regions initialised with a
+;;; violation, and the mask of the LAST one, at two BSS words that are zero in
+;;; every image until something violates the rule.  A test asserts the count is
+;;; zero; that is what makes this a checked invariant rather than a comment.
+(defun %gc-region-align-violations () (%gc-read64 #x10000ED0))
+(defun %gc-region-align-last ()       (%gc-read64 #x10000ED8))
+(defun %gc-region-align-reset ()
+  (%gc-write64 #x10000ED0 0)
+  (%gc-write64 #x10000ED8 0)
+  0)
+
 (defun %gc-region-init (rcb from to size stack-base k)
   "Write a complete region control block at raw byte address RCB: semispaces
    [FROM,FROM+SIZE) and [TO,TO+SIZE), roots on the stack below STACK-BASE, no
@@ -1147,7 +1231,15 @@
    RCB is 64 bytes of memory the CALLER owns — BSS, a carved guard band, or (in
    stage 2/3) an actor's own struct.  Returns RCB.
 
-"
+   IT CHECKS THE BITMAP ALIGNMENT INVARIANT and records a violation rather than
+   refusing one; see the block comment above %gc-region-align-check for what
+   1024 buys and what losing it costs."
+  (let ((v (%gc-region-align-check from to size)))
+    (if (= v 0)
+        0
+        (progn
+          (%gc-write64 #x10000ED0 (+ (%gc-read64 #x10000ED0) 1))
+          (%gc-write64 #x10000ED8 v))))
   (%gc-meta-write rcb from k)
   (%gc-meta-write (+ rcb #x08) to k)
   (%gc-meta-write (+ rcb #x10) size k)

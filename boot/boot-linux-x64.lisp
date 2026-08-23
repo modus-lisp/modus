@@ -26,7 +26,18 @@
 (defconstant +linux-x64-gc-guard+ #x1000000)    ; 16MB guard past the 2nd semispace
 (defconstant +linux-x64-gc-midpoint+ #x38000000)  ; 896MB semispace (2x orig): self-compile ~580MB total alloc fits WITHOUT a collection (avoids the large-working-set-collection corruption). Total mmap 2x896MB+guard ~1.8GB < 2GB imm32 cap.
 (defconstant +linux-x64-heap-data-size+ (+ #x70000000 +linux-x64-gc-guard+))  ; 1792MB + 16MB guard
-(defconstant +linux-x64-heap-alloc-start+ #x200)  ; Offset from heap base to first allocatable byte
+;; #x400 AND NOT #x200, WHICH IS A GC CONCURRENCY FIX, NOT A COSMETIC ONE.
+;; page_base is heap_base + this offset, from_start is the same address, and
+;; space_size is (midpoint - this offset).  The object-start and cons-kind
+;; bitmaps are ONE pair for the whole heap and translate-x64 sets bits with an
+;; unLOCKed `BTS [base], idx' at 64-bit operand size, whose read-modify-write
+;; unit is eight bitmap bytes = 1024 HEAP BYTES.  So every region boundary must
+;; be a multiple of 1024 FROM page_base (mvm/gc.lisp %GC-REGION-ALIGN-CHECK).
+;; At #x200 the midpoint is 1024-aligned but space_size was 512 mod 1024, so
+;; region 0's to-space start and size both violated the rule; at #x400 both are
+;; multiples of 1024 and region 0 satisfies it like every carved region.
+;; The 512 extra bytes are padding nobody allocates in.
+(defconstant +linux-x64-heap-alloc-start+ #x400)  ; Offset from heap base to first allocatable byte
 
 ;;; ------------------------------------------------------------
 ;;; Mostly-Copying (Bartlett) GC metadata region (MCGC).

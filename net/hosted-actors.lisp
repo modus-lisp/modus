@@ -118,6 +118,18 @@
       (setf (mem-ref a :u64) 0)
       (setq a (+ a 8)))))
 
+(defun %ha-align-up-to-page-base (a)
+  "A rounded UP to the next address congruent to the bitmap page_base modulo
+   mvm/gc.lisp's region alignment (1024).  That congruence — not plain
+   1024-alignment — is what the bitmap needs, because the granule index every
+   BTS uses is (addr - page_base) >> 4.  Identity when the bitmaps are off."
+  (if (= (%gc-bitmap-base) 0)
+      a
+      (let ((d (logand (- (logand (%gc-bitmap-page-base-exact) 1023)
+                          (logand a 1023))
+                       1023)))
+        (+ a d))))
+
 (defun %ha-carve ()
   "Carve the hosted actor band out of region 0, ONCE.  Returns the band's raw
    byte address, or 0 if the active region is too small to carve from.
@@ -142,16 +154,43 @@
               ;; (`(logior (untag ptr) (untag 1))'), so a band base whose low
               ;; nibble was not 0 would produce pointers whose tag bits are
               ;; part of the address.
+              ;; The extra 4096 is HEADROOM, and it is not optional: the two
+              ;; carved region bases are rounded UP to the bitmap alignment
+              ;; (%HA-ALIGN-UP-TO-PAGE-BASE, up to 1023 bytes each), and
+              ;; without it NEW0's own 4096-rounding can leave a slack of
+              ;; exactly zero and the top region would run off the semispace.
               (let* ((s #x1000000)
                      (g #x1000000)
-                     (new0 (logand (- size0 (+ g (* 2 s))) (- 0 4096))))
+                     (new0 (logand (- size0 (+ g (+ (* 2 s) 4096)))
+                                   (- 0 4096))))
                 (%gc-region-shrink r0 new0 k)
                 (setq *ha-rsize* s)
                 (setq *ha-bandsize* g)
-                (setq *ha-r1-from* (+ from0 (+ new0 g)))
-                (setq *ha-r1-to*   (+ to0   (+ new0 g)))
-                (setq *ha-r2-from* (+ from0 (+ new0 (+ g s))))
-                (setq *ha-r2-to*   (+ to0   (+ new0 (+ g s))))
+                ;; THE CARVED REGIONS MUST BE 1024-BYTE ALIGNED RELATIVE TO THE
+                ;; BITMAP page_base, or two threads collecting at once share a
+                ;; bitmap read-modify-write word: translate-x64's
+                ;; `BTS [base], idx' at 64-bit operand size touches the
+                ;; EIGHT-BYTE unit at base + 8*(idx >> 6) — 1024 heap bytes —
+                ;; with no LOCK prefix.  See mvm/gc.lisp %GC-REGION-ALIGN-CHECK.
+                ;;
+                ;; MEASURED: the TO side was 512 off.  NEW0 and G are
+                ;; 4096-multiples, so the from side inherited FROM0's
+                ;; congruence; the to side adds SIZE0 as well, and region 0's
+                ;; space_size is 939523584 = 512 mod 1024 on this layout — so
+                ;; both carved to-spaces came out 512 off and their shared
+                ;; boundary sat in the middle of a BTS unit.
+                ;;
+                ;; ALIGNMENT IS AGAINST page_base, NOT AGAINST FROM0.  FROM0 is
+                ;; whichever semispace is CURRENTLY the from-space, and it swaps
+                ;; on every collection, so after an odd number of collections
+                ;; the from side is the one that is 512 off.  page_base is fixed
+                ;; for the life of the image, which is exactly what the bitmap
+                ;; granule index is computed from.  Both sides are rounded UP
+                ;; into the 4 KB of headroom NEW0 reserves below.
+                (setq *ha-r1-from* (%ha-align-up-to-page-base (+ from0 (+ new0 g))))
+                (setq *ha-r1-to*   (%ha-align-up-to-page-base (+ to0   (+ new0 g))))
+                (setq *ha-r2-from* (+ *ha-r1-from* s))
+                (setq *ha-r2-to*   (+ *ha-r1-to* s))
                 ;; Zero the control head, the per-CPU block and the actor
                 ;; table.  Everything else in the band is stacks and pools that
                 ;; their own initialisers fill; zeroing 16 MB would cost more

@@ -1241,6 +1241,7 @@
 ;;;   +0x520  actor 2 forced collections   +0x528  actor 1 forced collections
 ;;;   +0x530  actor 1 chain-survival errors (step 5)
 ;;;   +0x538  thread 1's region block (step 5)
+;;;   +0x540  thread 2's GC scratch cell   +0x548  thread 1's GC scratch cell
 
 (defun %ha-tb-bump (tb off)
   (%gc-write64 (+ tb off) (+ (%gc-read64 (+ tb off)) 1)))
@@ -1527,6 +1528,13 @@
     (set-idle-flag 0)
     (%ha-thread-adopt-region (%gc-read64 (+ tb #x4D0)) (%gc-read64 (+ tb #x340)))
     (%gc-write64 (+ tb #x4D8) (get-alloc-ptr))
+    ;; THIS THREAD'S GC SCRATCH BLOCK, recorded so the test can prove the
+    ;; per-CPU addressing really resolves to two different blocks under two
+    ;; real threads.  The LISP collector is the only consumer and x86-64 does
+    ;; not run it, so this is the one place that mechanism can be EXERCISED on
+    ;; the target that has threads: the ADDRESSING is checked here even though
+    ;; the collector that would use it runs elsewhere.
+    (%gc-write64 (+ tb #x540) (%gc-scratch-cell))
     (%gc-write64 (+ tb #xB8) (%gc-region))
     (%gc-write64 (+ tb #xA8) (percpu-ref 16))
     (%gc-write64 (+ tb #x10) 1)
@@ -1670,6 +1678,7 @@
               (setq a0 (get-alloc-ptr))
               (if (> nlinks 0) (%gc-region-enter rcb2) 0)
               ;; ---- the second thread ----
+              (%gc-write64 (+ tb #x548) (%gc-scratch-cell))
               (setq tid (%ha-spawn-t2 (%ha-t2-sched-entry)))
               (%ha-barrier-arrive tb)
               (%gc-write64 (+ tb #x30) (%ha-barrier-wait tb budget))
@@ -1834,6 +1843,8 @@
 ;;;   +0x50 heap-window-uniform for thread 1's region (see mvm/gc.lisp)
 ;;;   +0x58 heap-window-uniform for thread 2's region
 ;;;   +0x60 region 0's own alignment mask (must be 0)
+;;;   +0x68 thread 1's GC scratch cell   +0x70 thread 2's GC scratch cell
+;;;   +0x78 the installed per-CPU scratch array base (0 = not installed)
 (defun %ha-mt-conc-selftest (nmsg budget nlinks serialize barrier)
   "STEP-6 ACCEPTANCE.  %HA-MT-SELFTEST with the collector concurrency probe
    reset and read back, the barrier armed, and the old global collection lock
@@ -1844,7 +1855,7 @@
       (let ((out (+ (%ha-base) #x340))
             (tb (%ha-thread-block))
             (res 0))
-        (%ha-zero out (+ out #x70))
+        (%ha-zero out (+ out #x80))
         ;; The alignment ledger is reset HERE, not at image start: the regions
         ;; this run cares about are the ones %HA-MT-SELFTEST is about to
         ;; initialise, and counting earlier carves would blur the answer.
@@ -1873,6 +1884,9 @@
                      (%gc-heap-window-uniform-p (%gc-read64 (+ tb #x538))))
         (%gc-write64 (+ out #x58)
                      (%gc-heap-window-uniform-p (%gc-read64 (+ tb #x4D0))))
+        (%gc-write64 (+ out #x68) (%gc-read64 (+ tb #x548)))
+        (%gc-write64 (+ out #x70) (%gc-read64 (+ tb #x540)))
+        (%gc-write64 (+ out #x78) (%gc-scratch-cfg))
         ;; REGION 0's OWN ALIGNMENT.  It never goes through %GC-REGION-INIT —
         ;; boot writes its control block directly — so the violation ledger
         ;; above cannot see it.  Ask the oracle explicitly, or the invariant

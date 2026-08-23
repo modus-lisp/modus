@@ -174,6 +174,22 @@
               ;; third of runs (measured: uniform in 26 of 40).  Asserting it
               ;; would make this test flaky for a reason that has nothing to do
               ;; with the collector.
+              (format t "~%-- THE PER-COLLECTION SCRATCH BLOCK IS PER CPU --~%")
+              ;; THE ADDRESSING, EXERCISED ON THE TARGET THAT HAS THREADS.
+              ;; The three per-collection words this pass moved belong to the
+              ;; LISP collector, and hosted x86-64 does not run it — it collects
+              ;; in the native trampoline, whose per-collection state is in
+              ;; REGISTERS.  So the COLLECTOR side is verified elsewhere (the
+              ;; aarch64 shim path, under QEMU).  What can be verified HERE, and
+              ;; is, is the part that could actually be wrong under two threads:
+              ;; that %GC-SCRATCH-CELL resolves to a DIFFERENT block on each,
+              ;; and that both lie in the installed array.
+              (chk-pos "per-CPU scratch array installed" (w out #x78))
+              (chk "thread 1's scratch cell is entry 0"
+                   (w out #x68) (w out #x78))
+              (chk "thread 2's scratch cell is entry 1"
+                   (w out #x70) (+ (w out #x78) 32))
+              (format t "~%-- NOTES --~%")
               (format t "  note thread 1's region in one 4 GiB window = ~D~%"
                       (w out #x50))
               (format t "  note thread 2's region in one 4 GiB window = ~D~%"

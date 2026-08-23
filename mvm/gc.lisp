@@ -858,10 +858,119 @@
       (setq fp (%gc-forward-slot addr from-start from-size fp sc))
       (setq addr (+ addr 8)))))
 
+;;; ============================================================
+;;; THE GLOBALS ROOT SET UNDER CONCURRENT COLLECTION
+;;; ============================================================
+;;;
+;;; THE QUESTION.  %gc-scan-globals forwards a SHARED set of slots — the
+;;; globals alist head, the symbol / keyword / package intern table heads, the
+;;; live multiple-value extras — that EVERY region scans, because any region's
+;;; actor can store its own object into a global.  Forwarding REWRITES those
+;;; slots.  Two collectors running at once therefore both walk the same list of
+;;; addresses and both may write to them.  Does that race?
+;;;
+;;; THE ANSWER, FOR TWO COLLECTORS: NO, AND IT ALREADY DID NOT.  The argument
+;;; is four steps and each one is a property of code in this file:
+;;;
+;;;   1. %GC-FORWARD-SLOT WRITES A SLOT ONLY WHEN ITS VALUE POINTS INTO *THIS*
+;;;      REGION'S FROM-SPACE.  The write is guarded by %gc-cand-addr, which
+;;;      returns NIL unless the word carries a cons or object tag AND its
+;;;      tag-stripped address lies in [from-start, from-start+from-size) — the
+;;;      geometry of the region being collected, passed down from %gc-collect.
+;;;      Every other slot is read and left alone.  (translate-x64's scan_word
+;;;      is the same three tests against RBX/RCX, and the same guard.)
+;;;   2. TWO REGIONS' FROM-SPACES ARE DISJOINT ADDRESS RANGES.  That is what a
+;;;      region IS, and since the alignment invariant above it is disjoint at
+;;;      1024-byte granularity rather than merely by construction.
+;;;   3. A MACHINE WORD DENOTES ONE ADDRESS, so it lies in at most one region's
+;;;      from-space.
+;;;   4. Therefore for any given slot at most ONE of the running collectors
+;;;      writes it, and two concurrent collectors' writes to this shared root
+;;;      set are DISJOINT.  No lock is needed and none was needed.
+;;;
+;;; THE READ SIDE, which step 4 does not cover on its own.  Collector B READS
+;;; every slot, including ones collector A is rewriting.  What B may observe:
+;;;   - on the NATIVE path (translate-x64's `mov [rsi], rax'), a single
+;;;     naturally-aligned 8-byte store, which x86-64 guarantees is not torn.  B
+;;;     sees either the old value (a pointer into A's FROM-space) or the new one
+;;;     (a pointer into A's TO-space).  Both are addresses in region A, so both
+;;;     fail B's step-1 test and B declines.  AIRTIGHT.
+;;;   - on the LISP path (%gc-move-word, TWO 32-bit stores), B may observe a
+;;;     word with one half old and one half new.  The two addresses are both in
+;;;     region A; if the heap lies inside a single 4 GiB window their HIGH
+;;;     halves are equal, no mixture is observable, and the argument is
+;;;     unchanged.  %GC-HEAP-WINDOW-UNIFORM-P measures that rather than assuming
+;;;     it.  Outside such a window a mixed word could name an arbitrary address,
+;;;     which could fall in B's from-space, and B would then forward it and
+;;;     destroy A's update.  NOTE THAT NO TARGET IS IN THIS POSITION TODAY: the
+;;;     Lisp collector runs on the aarch64 shim path and on no target that has
+;;;     a second thread.  It is a precondition for whoever builds one, not a
+;;;     live defect, and the honest fix if it ever is one is a single 64-bit
+;;;     store primitive, not a lock.
+;;;
+;;; THE OTHER HAZARD, WHICH IS REAL AND IS NOT THE COLLECTOR'S TO FIX: A
+;;; MUTATOR ON THREAD B STORING TO A GLOBAL WHILE THREAD A'S COLLECTOR SCANS
+;;; IT.  The isolation invariant constrains the VALUES in these slots (no actor
+;;; holds a pointer into another's region), and says NOTHING about the SLOTS,
+;;; which are shared.  So:
+;;;   - A reads slot S, copies the object it names, and writes the forwarded
+;;;     pointer back.  If B stored a new value into S in between, A's write-back
+;;;     DESTROYS it — a lost update, and not a benign one: B's object is now
+;;;     unreferenced and A's is referenced by a slot B thought it had reused.
+;;;   - Symmetrically, B's store can land between A's read and A's write and be
+;;;     silently overwritten.
+;;; Making the collector reentrant does not touch this, and cannot: it needs a
+;;; write barrier, per-thread globals, or a stop-the-world handshake, and all
+;;; three are larger than a GC pass.
+;;;
+;;; AND IT IS ALREADY BROKEN WITHOUT ANY COLLECTOR IN THE PICTURE, which is the
+;;; reason it is out of scope rather than merely deferred.  EVERY slot in this
+;;; root set is an unsynchronised shared mutable structure under SMP: the
+;;; globals alist head is push-updated by every new global, the symbol, keyword
+;;; and package tables are hash tables mutated by INTERN, and the
+;;; multiple-value buffer at 0x10000090/0x10000098 is ONE buffer for all CPUs —
+;;; two threads returning multiple values clobber each other's extras whether or
+;;; not anything is collecting.  net/cooperative-atomics.lisp states this in
+;;; full and concludes UNUSABLE UNDER SMP.
+;;;
+;;; SO THE SCOPE RULE, which the threaded tests enforce and state: a threaded
+;;; workload must not INTERN, EVAL, FORMAT or otherwise mutate the shared
+;;; runtime tables.  What it may do — arithmetic, raw memory, message passing,
+;;; and CONSING, which is what per-region heaps are for — touches none of them.
+;;; Within that rule the globals root set is safe to scan from two collectors at
+;;; once, by the four-step argument above.
+
+(defun %gc-heap-window-uniform-p (rcb)
+  "1 if the region at RCB has both semispaces inside ONE 4 GiB window — i.e.
+   from_start, to_start and both ends share the same bits 32..63.  That is the
+   condition under which the LISP collector's two-halves slot rewrite cannot be
+   observed torn by another collector (see the READ SIDE above); 0 otherwise.
+   DIAGNOSTIC: allocates, and must not be called from inside %gc-collect.
+
+   The high half is taken with TWO 16-bit shifts, not (ash x -32) and not
+   (floor x 4294967296): compile-ash inlines :sar only for counts <= 30, and a
+   2^32 literal is a BIGNUM on a 30-bit-fixnum target — and this file is
+   compiled for i386 as well."
+  (let* ((k (%gc-meta-scale))
+         (f (%gc-meta-read rcb k))
+         (tt (%gc-meta-read (+ rcb #x08) k))
+         (s (%gc-meta-read (+ rcb #x10) k))
+         (hf (ash (ash f -16) -16)))
+    (if (= hf (ash (ash (+ f s) -16) -16))
+        (if (= hf (ash (ash tt -16) -16))
+            (if (= hf (ash (ash (+ tt s) -16) -16)) 1 0)
+            0)
+        0)))
+
 (defun %gc-scan-globals (from-start from-size free-ptr sc)
   "Scan the global variable alist for root pointers.
    The alist head is at 0x10000080. Each entry is (name-hash . value).
-   We need to forward the alist spine (cons cells) and the values."
+   We need to forward the alist spine (cons cells) and the values.
+
+   THIS IS THE SHARED ROOT SET, and it is safe to scan from two collectors at
+   once — see THE GLOBALS ROOT SET UNDER CONCURRENT COLLECTION above, which is
+   the argument in full, including the one hazard (a concurrent MUTATOR) that
+   it does not cover and cannot."
   ;; The globals alist head pointer itself
   (let ((fp (%gc-forward-slot #x10000080 from-start from-size free-ptr sc)))
     ;; The symbol intern table head pointer

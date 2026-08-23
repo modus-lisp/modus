@@ -76,12 +76,41 @@
 ;;; ============================================================
 
 ;; Acquire spinlock at addr using atomic exchange (TTAS pattern)
+;;
+;; THE INNER LOOP READS :U8, AND IT USED TO READ :U64, WHICH MADE IT A NO-OP.
+;; The whole point of test-and-TEST-and-set is that a thread which fails to
+;; acquire spins on a plain LOAD — the line stays Shared in every waiter's cache
+;; and only the release invalidates it — instead of hammering the line with
+;; XCHG, which takes it Exclusive on every attempt and starves the holder's
+;; neighbours.
+;;
+;; SPIN-UNLOCK writes the word as a RAW machine word (0 or 1), and per
+;; mvm/gc.lisp's word-access block `(mem-ref addr :u64)' loads the machine word
+;; and hands it back AS A TAGGED LISP VALUE — so a held lock, raw 1, read back
+;; as :u64 is the Lisp value 0 and `zerop' said UNLOCKED every time.  The inner
+;; loop therefore fell straight through on its first iteration and the acquire
+;; degenerated into an unbounded XCHG hammer.
+;;
+;; :U8 IS THE FIX AND IT IS DELIBERATELY NOT :U64.  A :u8 load is tagged on the
+;; way out (mvm-eval's mem-ref semantics), so the Lisp value IS the raw byte: 0
+;; or 1.  It reads byte 0 of the word, which on a little-endian target is the
+;; one SPIN-UNLOCK zeroes — the same assumption NEEDS-STAGING and STAGING-TAG in
+;; this file already make.  On a big-endian target byte 0 is the MSB, always 0
+;; for a 0/1 lock, so the loop falls through exactly as it does today: the fix
+;; is an improvement where it applies and a no-op where it does not.
+;;
+;; MEASURED on hosted x86-64 with an actor busy-polling TRY-RECEIVE + YIELD on
+;; one thread (it takes and releases this lock twice per iteration with no work
+;; in between) while another thread SENDs to it: ten sends took 2.0 s of extra
+;; wall time typically and 122 s in the worst run observed, because the
+;; releasing thread re-acquired from its own L1 before the remote XCHG could
+;; land.  With the read-only wait it is 0.1 s.
 (defun spin-lock (addr)
   (loop
     (if (zerop (xchg-mem addr 1))
         (return 0)
         (loop
-          (if (zerop (mem-ref addr :u64))
+          (if (zerop (mem-ref addr :u8))
               (return 0)
               (pause))))))
 
@@ -485,6 +514,32 @@
 ;;; Scheduler (idle loop)
 ;;; ============================================================
 
+;; THE HAND-OFF POINT FOR AN ACTOR THAT HAS JUST BLOCKED, and it is a separate
+;; function for exactly one reason: WHO HOLDS THE SCHEDULER LOCK.
+;;
+;; RECEIVE reaches here having marked the calling actor BLOCKED (status 4) and
+;; saved its context, WITH THE LOCK STILL HELD.  From the instant the lock drops
+;; that actor is claimable by any other CPU — a sender flips it back to READY and
+;; enqueues it (MAILBOX-ENQUEUE-AND-WAKE), and another CPU's scheduler may then
+;; RESTORE-CONTEXT onto its stack.  This CPU is STILL STANDING ON THAT STACK
+;; until it switches away, so the order "release, then leave the stack" is a
+;; two-CPUs-one-stack race, and the order "leave the stack, then release" is not.
+;;
+;; ON BARE METAL these two lines ARE what RECEIVE used to do inline, unchanged:
+;; release and fall into the idle loop, which switches to the per-CPU idle stack
+;; as its first act.  The window is real there too, but bare metal has never run
+;; a second CPU, so nothing can take the actor before the switch.
+;;
+;; A HOSTED IMAGE OVERRIDES THIS (net/hosted-sync.lisp) to do it in the safe
+;; order: RESTORE-CONTEXT into the thread's own scheduler context — which moves
+;; RSP off the actor's stack and only THEN releases the lock, because
+;; +OP-RESTORE-CTX+ zeroes the lock word after the stack switch and before the
+;; jump.  That is why RECEIVE now calls this instead of unlocking itself: an
+;; override cannot re-acquire a lock it was not handed.
+(defun ap-scheduler-blocked ()
+  (spin-unlock (sched-lock-addr))
+  (ap-scheduler))
+
 (defun ap-scheduler ()
   ;; Switch to per-CPU idle stack
   (switch-idle-stack)
@@ -815,8 +870,10 @@
                   (actor-set cur-id #x78 (percpu-ref 48))
                   (let ((next-id (actor-dequeue)))
                     (if (zerop next-id)
-                        (progn (spin-unlock (sched-lock-addr))
-                               (ap-scheduler))
+                        ;; NOTHING ELSE TO RUN.  Hand the CPU over WITH THE LOCK
+                        ;; STILL HELD — see AP-SCHEDULER-BLOCKED for why the
+                        ;; release cannot happen on this side of the call.
+                        (ap-scheduler-blocked)
                         (progn
                           (set-current-actor next-id)
                           (actor-set next-id #x00 1)

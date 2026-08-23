@@ -835,6 +835,22 @@
 (setf *aarch64-gc-native-mcgc* t)
 (setf *aarch64-gc-trampoline-call-via-bl* t)
 
+;; DEV/TRIAGE KNOB — MODUS_RPI_GC_SHIM=1 turns the native collector OFF, so
+;; every gc-check lands in translate-aarch64's register-saving SHIM, which
+;; CALLS mvm/gc.lisp's Lisp %GC-COLLECT.  That is the ONLY collector arm
+;; bootable here that actually executes mvm/gc.lisp's Cheney code — x86-64
+;; (hosted and bare) and i386 all run native trampolines — so it is how a
+;; change to that file gets executed rather than merely compiled.  CLAUDE.md's
+;; "shim behaviour" table (stage 3) was measured this way.  Default OFF, so the
+;; shipping image is byte-identical.
+#+sbcl
+(let ((v (sb-ext:posix-getenv "MODUS_RPI_GC_SHIM")))
+  (when (and v (> (length v) 0) (not (string= v "0")))
+    (setf *aarch64-gc-native-mcgc* nil)
+    (setf *aarch64-gc-trampoline-call-via-bl* nil)
+    (format t "~%;; RPi CL REPL: NATIVE MCGC OFF — the LISP collector ~
+               (mvm/gc.lisp %GC-COLLECT) runs via the aarch64 shim~%")))
+
 (setf *aarch64-sched-lock-addr* nil)
 
 ;; SP alignment stays 8-byte (bare-metal EL1 with SCTLR.SA off), unlike Linux

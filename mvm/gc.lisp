@@ -45,6 +45,37 @@
 ;;;;      since stage 2; aarch64 did not, and would have broken the parked
 ;;;;      encoding the moment it grew a second region).
 ;;;;
+;;;; REENTRANCY — WHAT A COLLECTION OWNS, AND WHAT IT SHARES
+;;;;
+;;;; Two CPUs may now be inside a collection at the same time, each collecting
+;;;; ITS OWN region.  Everything a collection writes therefore has to be either
+;;;; (a) private to that collection, or (b) provably disjoint from what the
+;;;; other one writes.  The inventory, so nobody has to rediscover it:
+;;;;
+;;;;   PRIVATE, per collection
+;;;;     the eight control-block fields   — per REGION, and a region has one
+;;;;                                        owner (stage 3)
+;;;;     the scratch block (3 words)      — per CPU, resolved once in
+;;;;                                        %gc-collect and threaded down as
+;;;;                                        SC.  It used to be three FIXED
+;;;;                                        SHARED addresses; see the SCRATCH
+;;;;                                        BLOCK comment below.
+;;;;     from/to/size/free-ptr/scan-ptr   — arguments and locals
+;;;;
+;;;;   SHARED, and each needs its own argument
+;;;;     the globals root set             — see %gc-scan-globals
+;;;;     the object-start / cons-kind bitmaps — one pair for the whole heap;
+;;;;                                        disjoint per region only under an
+;;;;                                        ALIGNMENT rule (%gc-region-init)
+;;;;
+;;;; NOTE WHICH COLLECTOR THIS FILE IS.  %gc-collect is the LISP collector.  It
+;;;; is what runs on the aarch64 SHIM path (translate-aarch64's register-saving
+;;;; trampoline CALLs it) and on any target with no native arm.  x86-64 —
+;;;; hosted and bare — and i386 run a NATIVE collector instead
+;;;; (translate-x64's emit-gc-trampoline, translate-i386's), which keeps every
+;;;; per-collection value in REGISTERS and so was already private per CPU.  The
+;;;; bitmaps and the globals root set are shared by BOTH.
+;;;;
 ;;;; WHAT IS NOT PARTITIONED, said plainly: %gc-scan-globals.  The globals
 ;;;; alist, the symbol/keyword/package intern tables and the multiple-value
 ;;;; extras are ONE shared set of slots that every region scans, because any
@@ -350,14 +381,82 @@
                 (if (>= addr (+ from-start from-size)) nil addr))))
       nil))
 
-(defun %gc-tmp-free ()     (mem-ref #x10000108 :u64))
-(defun %gc-set-tmp-free (v) (setf (mem-ref #x10000108 :u64) v))
+;;; ------------------------------------------------------------
+;;; PER-COLLECTION WORKING STATE — the SCRATCH BLOCK
+;;; ------------------------------------------------------------
+;;; A collection needs three words of working memory that CANNOT be Lisp
+;;; locals, because each of them holds an arbitrary MACHINE WORD and
+;;; materialising one as a Lisp integer can promote it to a BIGNUM — an
+;;; allocation, inside the collector, which re-enters the collector (see the
+;;; EXACT machine-word block above, and %gc-bit-mask's measured recursion):
+;;;
+;;;   +0x00  the forwarded value %GC-FORWARD-SLOT / %GC-STORE-TAGGED /
+;;;          %GC-MOVE-WORD hand between %GC-COPY-OBJECT and its caller, ONCE
+;;;          PER FORWARDED SLOT
+;;;   +0x08  tmp-free, the copying allocator's next free pointer
+;;;   +0x10  to-end, the bound %GC-COPY-OBJECT's overrun guard reads
+;;;   +0x18  reserved (pads the block to 32, so a per-CPU array of them keeps
+;;;          every entry on its own 32-byte boundary)
+;;;
+;;; UNTIL NATIVE THREADS THESE WERE THREE FIXED, SHARED ADDRESSES —
+;;; 0x10000100 / 0x10000108 / 0x10000110 — with no per-region or per-thread
+;;; copy anywhere.  That is exactly one collecting thread by construction: two
+;;; collections at once each clobber the other's forwarded value on EVERY
+;;; forwarded slot, and each moves the other's free pointer.  It is the reason
+;;; net/hosted-actors-post.lisp carried a global collection lock.
+;;;
+;;; THE BLOCK IS NOW ADDRESSED PER CPU, and it is threaded through the
+;;; collector as an ARGUMENT (`SC') rather than read from a literal, so that
+;;; "which scratch block" is resolved ONCE per collection, in %GC-COLLECT, and
+;;; every function below it is explicitly a function of the collection it is
+;;; part of.  That is not decoration: it is what makes the data-flow auditable
+;;; — grep for `#x10000100' and you will find only this comment.
+;;;
+;;; ZERO MEANS THE HISTORIC BLOCK.  %GC-SCRATCH-CFG is a BSS word that no image
+;;; writes unless something deliberately installs a per-CPU array, so a
+;;; single-threaded image — every bare-metal image, and hosted x64 until the
+;;; actor bring-up runs — resolves to 0x10000100 and behaves exactly as it did
+;;; before this existed.  Same degradation story as %GC-BITMAP-BASE and the
+;;; active-region cell, and for the same reason: there is no boot-time
+;;; initialisation to get wrong on a target that cannot be booted here.
+;;;
+;;; AND IT IS DOUBLE-GATED.  Indexing per CPU means reading the :CPU-ID slot
+;;; through GS:/FS:/TPIDR_EL1, which SIGSEGVs where no per-CPU base has been
+;;; installed.  So the per-CPU form is taken only when the config word is
+;;; non-zero AND the active-region per-CPU gate (0x10000FF8) is on — the same
+;;; word %GC-REGION-CELL branches on, so the scratch block and the active
+;;; region can never disagree about whether this image has per-CPU storage.
+
+(defun %gc-scratch-cfg () (mem-ref #x10000EC8 :u64))
+
+(defun %gc-scratch-init (base)
+  "Install BASE as the base of a per-CPU array of 32-byte GC scratch blocks
+   (+GC-REGION-MAX-CPUS+ = 16 entries, so 512 bytes).  The memory is the
+   CALLER's — a carved band, BSS, anything it owns and nothing else uses.
+   BASE = 0 restores the historic single shared block at 0x10000100.
+   Returns BASE."
+  (setf (mem-ref #x10000EC8 :u64) base)
+  base)
+
+(defun %gc-scratch-cell ()
+  "Raw byte address of THIS CPU's 32-byte GC scratch block.  0x10000100 —
+   the historic address — unless a per-CPU array has been installed AND the
+   per-CPU gate is on.  See the block comment above."
+  (let ((b (mem-ref #x10000EC8 :u64)))
+    (if (= b 0)
+        #x10000100
+        (if (= (mem-ref #x10000FF8 :u32) 0)
+            b
+            (+ b (* (percpu-ref 16) 32))))))
+
+(defun %gc-tmp-free (sc)      (mem-ref (+ sc 8) :u64))
+(defun %gc-set-tmp-free (sc v) (setf (mem-ref (+ sc 8) :u64) v))
 
 ;; TO-SPACE END, published by %gc-collect before any copying.  %gc-copy-object
 ;; needs it to refuse a copy that would run off the top of to-space; it only
 ;; receives the FROM-space geometry, and deriving to_end from it is fragile.
-(defun %gc-to-end ()      (mem-ref #x10000110 :u64))
-(defun %gc-set-to-end (v) (setf (mem-ref #x10000110 :u64) v))
+(defun %gc-to-end (sc)      (mem-ref (+ sc 16) :u64))
+(defun %gc-set-to-end (sc v) (setf (mem-ref (+ sc 16) :u64) v))
 
 (defun %gc-read64 (raw-addr)
   "DIAGNOSTIC ONLY — DO NOT CALL FROM INSIDE %gc-collect.
@@ -566,16 +665,18 @@
 ;;; Object Copying
 ;;; ============================================================
 
-(defun %gc-copy-object (raw-addr tag from-start from-size free-ptr)
+(defun %gc-copy-object (raw-addr tag from-start from-size free-ptr sc)
   "Copy the object at byte address RAW-ADDR from from-space to to-space.
    TAG is its tag nibble (1 = cons, 9 = headered object); RAW-ADDR is already
    tag-stripped and range-checked by %gc-cand-addr — the caller never has to
    materialise the 64-bit word, which is what keeps this allocation-free.
    FREE-PTR is the current free pointer in to-space (raw byte address).
+   SC is THIS COLLECTION's scratch block (%gc-scratch-cell), passed down from
+   %gc-collect so that two collections on two CPUs never share these words.
 
    Result stored at:
-     0x10000100: the new tagged value, as an EXACT machine word (two halves)
-     0x10000108: new free pointer (raw byte address, mem-ref :u64 convention)"
+     SC+0x00: the new tagged value, as an EXACT machine word (two halves)
+     SC+0x08: new free pointer (raw byte address, mem-ref :u64 convention)"
   (cond
     ;; Cons cell (tag = 1)
     ((= tag 1)
@@ -585,16 +686,16 @@
            ;; Already forwarded — the from-space word IS (new-addr | 15);
            ;; hand back (new-addr | 1), high half untouched.
            (progn
-             (%gc-set-halves #x10000100
+             (%gc-set-halves sc
                              (logior (logand car-lo (lognot 15)) 1) car-hi)
-             (%gc-set-tmp-free free-ptr))
+             (%gc-set-tmp-free sc free-ptr))
            ;; Copy car and cdr to to-space — exact word moves, no Lisp value
            ;; ever formed (a stack/heap word can be any 64 bits).
-           (if (> (+ free-ptr 16) (%gc-to-end))
+           (if (> (+ free-ptr 16) (%gc-to-end sc))
                ;; TO-SPACE OVERRUN GATE (see the object path below).
                (progn
-                 (%gc-store-tagged #x10000100 raw-addr 1)
-                 (%gc-set-tmp-free free-ptr))
+                 (%gc-store-tagged sc raw-addr 1)
+                 (%gc-set-tmp-free sc free-ptr))
            (progn
              (%gc-move-word raw-addr free-ptr)
              (%gc-move-word (+ raw-addr 8) (+ free-ptr 8))
@@ -608,8 +709,8 @@
              ;; scan car+cdr) rather than reading car as an object header.
              (%gc-mark-cons free-ptr)
              ;; Return results
-             (%gc-store-tagged #x10000100 free-ptr 1)
-             (%gc-set-tmp-free (+ free-ptr 16)))))))
+             (%gc-store-tagged sc free-ptr 1)
+             (%gc-set-tmp-free sc (+ free-ptr 16)))))))
     ;; Object (tag = 9)
     ((= tag 9)
      (let ((hdr-lo (%gc-word-lo raw-addr))
@@ -617,9 +718,9 @@
        (if (%gc-is-forward-lo hdr-lo)
            ;; Already forwarded
            (progn
-             (%gc-set-halves #x10000100
+             (%gc-set-halves sc
                              (logior (logand hdr-lo (lognot 15)) 9) hdr-hi)
-             (%gc-set-tmp-free free-ptr))
+             (%gc-set-tmp-free sc free-ptr))
            ;; Copy header + all element slots
            (let ((count (%gc-header-count hdr-lo hdr-hi)))
              ;; Total size: (count + 2) * 8, aligned to 16
@@ -681,10 +782,10 @@
                ;; SKIPPED and every stack root is dropped.
                (if (if (> total-bytes from-size) t
                        (if (> (+ raw-addr total-bytes) (+ from-start from-size)) t
-                           (> (+ free-ptr total-bytes) (%gc-to-end))))
+                           (> (+ free-ptr total-bytes) (%gc-to-end sc))))
                    (progn
-                     (%gc-store-tagged #x10000100 raw-addr 9)
-                     (%gc-set-tmp-free free-ptr))
+                     (%gc-store-tagged sc raw-addr 9)
+                     (%gc-set-tmp-free sc free-ptr))
                    (progn
                      ;; Copy all bytes (word by word)
                      (loop
@@ -696,23 +797,30 @@
                      ;; #160: record the survivor's start bit in to-space.
                      (%gc-mark-start free-ptr)
                      ;; Return results
-                     (%gc-store-tagged #x10000100 free-ptr 9)
-                     (%gc-set-tmp-free (+ free-ptr total-bytes)))))))))
+                     (%gc-store-tagged sc free-ptr 9)
+                     (%gc-set-tmp-free sc (+ free-ptr total-bytes)))))))))
     ;; Not a pointer — unreachable (callers gate on %gc-cand-addr, which only
     ;; admits tags 1 and 9); return the value unchanged so the caller's
     ;; write-back is a no-op.
     (t
-     (%gc-store-tagged #x10000100 raw-addr tag)
-     (%gc-set-tmp-free free-ptr))))
+     (%gc-store-tagged sc raw-addr tag)
+     (%gc-set-tmp-free sc free-ptr))))
 
 ;;; ============================================================
 ;;; Root Scanning
 ;;; ============================================================
 
-(defun %gc-forward-slot (raw-slot-addr from-start from-size free-ptr)
+(defun %gc-forward-slot (raw-slot-addr from-start from-size free-ptr sc)
   "Process one root slot at raw byte address RAW-SLOT-ADDR.
    If it contains a pointer into from-space, copy the object and
-   update the slot. Returns the new free pointer."
+   update the slot. Returns the new free pointer.
+   SC is this collection's scratch block; see the block comment on
+   %GC-SCRATCH-CELL for why it is an argument and not a literal.
+
+   THE SLOT IS ONLY REWRITTEN WHEN ITS VALUE POINTS INTO *THIS* REGION'S
+   FROM-SPACE.  That single fact is what makes a SHARED root set (the globals
+   below) safe to scan from two collectors at once — see the GLOBALS ROOT SET
+   UNDER CONCURRENT COLLECTION analysis in the header."
   (let* ((lo (%gc-word-lo raw-slot-addr))
          (hi (%gc-word-hi raw-slot-addr))
          (addr (%gc-cand-addr lo hi from-start from-size)))
@@ -722,15 +830,16 @@
         ;; mid-object) is left untouched — no forward-pointer stamp.
         (if (%gc-is-start addr)
             (progn
-              (%gc-copy-object addr (logand lo 15) from-start from-size free-ptr)
+              (%gc-copy-object addr (logand lo 15)
+                               from-start from-size free-ptr sc)
               ;; Update the slot with the new pointer (exact word move)
-              (%gc-move-word #x10000100 raw-slot-addr)
+              (%gc-move-word sc raw-slot-addr)
               ;; Return new free pointer
-              (%gc-tmp-free))
+              (%gc-tmp-free sc))
             free-ptr)
         free-ptr)))
 
-(defun %gc-scan-stack (rsp-val stack-base from-start from-size free-ptr)
+(defun %gc-scan-stack (rsp-val stack-base from-start from-size free-ptr sc)
   "Scan the stack for root pointers. The stack grows downward,
    so RSP is the lowest address and STACK-BASE is the highest.
    Each 8-byte word on the stack is checked as a potential tagged value.
@@ -746,25 +855,25 @@
         (fp free-ptr))
     (loop
       (when (>= addr stack-base) (return fp))
-      (setq fp (%gc-forward-slot addr from-start from-size fp))
+      (setq fp (%gc-forward-slot addr from-start from-size fp sc))
       (setq addr (+ addr 8)))))
 
-(defun %gc-scan-globals (from-start from-size free-ptr)
+(defun %gc-scan-globals (from-start from-size free-ptr sc)
   "Scan the global variable alist for root pointers.
    The alist head is at 0x10000080. Each entry is (name-hash . value).
    We need to forward the alist spine (cons cells) and the values."
   ;; The globals alist head pointer itself
-  (let ((fp (%gc-forward-slot #x10000080 from-start from-size free-ptr)))
+  (let ((fp (%gc-forward-slot #x10000080 from-start from-size free-ptr sc)))
     ;; The symbol intern table head pointer
-    (setq fp (%gc-forward-slot #x10000088 from-start from-size fp))
+    (setq fp (%gc-forward-slot #x10000088 from-start from-size fp sc))
     ;; The keyword intern table (0x10000148) and package-by-hash table
     ;; (0x10000170) are ALSO heap roots — both are hash-tables interned
     ;; into during runtime EVAL.  Missing them stranded keywords/symbols
     ;; in dead from-space after a collection, faulting the next deref.
     ;; (This mirrors the x64 inline trampoline fix in translate-x64.lisp;
     ;; keep the two root sets in sync.)
-    (setq fp (%gc-forward-slot #x10000148 from-start from-size fp))
-    (setq fp (%gc-forward-slot #x10000170 from-start from-size fp))
+    (setq fp (%gc-forward-slot #x10000148 from-start from-size fp sc))
+    (setq fp (%gc-forward-slot #x10000170 from-start from-size fp sc))
     ;; NOTE: the pre-interned signal-condition symbols at 0xCA0/0xCA8/0xCB0
     ;; (%init-signal-symbols) are deliberately NOT scanned: they are
     ;; interned native MVM symbols already forwarded via the symbol intern
@@ -788,7 +897,7 @@
           (loop
             (when (>= i (- count 1)) (return))
             (setq fp (%gc-forward-slot (+ #x10000098 (* i 8))
-                                       from-start from-size fp))
+                                       from-start from-size fp sc))
             (setq i (+ i 1))))))
     fp))
 
@@ -796,7 +905,7 @@
 ;;; Cheney Scan Loop
 ;;; ============================================================
 
-(defun %gc-scan-copied (scan-start free-ptr from-start from-size)
+(defun %gc-scan-copied (scan-start free-ptr from-start from-size sc)
   "Cheney scan loop, TYPE-AWARE (#160 bug#4).  Walk to-space OBJECT-BY-OBJECT
    from SCAN-START to the (growing) free pointer.  At each object start use the
    CONS-KIND bitmap to classify:
@@ -825,9 +934,9 @@
                    (hi (%gc-word-hi scan))
                    (addr (%gc-cand-addr lo hi from-start from-size)))
               (when addr
-                (%gc-copy-object addr (logand lo 15) from-start from-size fp)
-                (%gc-move-word #x10000100 scan)
-                (setq fp (%gc-tmp-free))))
+                (%gc-copy-object addr (logand lo 15) from-start from-size fp sc)
+                (%gc-move-word sc scan)
+                (setq fp (%gc-tmp-free sc))))
             (setq scan (+ scan 8)))
           fp)
         ;; -- Type-aware object-by-object walk (bitmaps on) --
@@ -837,8 +946,9 @@
             (if (%gc-is-cons-granule scan)
                 ;; CONS: forward car (scan) and cdr (scan+8); 16 bytes.
                 (progn
-                  (setq fp (%gc-forward-slot scan from-start from-size fp))
-                  (setq fp (%gc-forward-slot (+ scan 8) from-start from-size fp))
+                  (setq fp (%gc-forward-slot scan from-start from-size fp sc))
+                  (setq fp (%gc-forward-slot (+ scan 8)
+                                             from-start from-size fp sc))
                   (setq scan (+ scan 16)))
                 ;; OBJECT: header at scan.
                 (let* ((hdr-lo (%gc-word-lo scan))
@@ -855,7 +965,7 @@
                       (loop
                         (when (>= i count) (return nil))
                         (setq fp (%gc-forward-slot (+ scan (+ 16 (* i 8)))
-                                                   from-start from-size fp))
+                                                   from-start from-size fp sc))
                         (setq i (+ i 1)))))
                   ;; Guard against a zero/garbage size stalling the walk.
                   (setq scan (+ scan (if (< total-bytes 16) 16 total-bytes))))))
@@ -889,11 +999,18 @@
    choice explicitly because it has a live RBP in hand and no shim to write the
    field; it branches on saved_sp = 0.
 
+   ITS PER-COLLECTION WORKING STATE IS RESOLVED ONCE, HERE.  SC — this CPU's
+   32-byte scratch block — is read at entry and threaded through every function
+   below as an argument, so a collection on another CPU cannot touch the words
+   this one hands between %gc-copy-object and its callers.  See the SCRATCH
+   BLOCK comment above %GC-SCRATCH-CELL.
+
    This function must NOT allocate any heap memory."
   (let ((from-start (%gc-from-start))
         (to-start (%gc-to-start))
         (space-size (%gc-space-size))
         (stack-base (%gc-stack-base))
+        (sc (%gc-scratch-cell))
         (saved-rsp (%gc-saved-rsp)))
     (write-char-serial 49)  ; '1' — got metadata
     ;; Sanity-check: saved-rsp must be in the valid stack window
@@ -934,18 +1051,18 @@
     ;; Publish to-space's end so %gc-copy-object can refuse an overrunning
     ;; copy (the metadata block sits immediately above the heap — see the gate
     ;; in %gc-copy-object).
-    (%gc-set-to-end (+ to-start space-size))
+    (%gc-set-to-end sc (+ to-start space-size))
     (let ((free-ptr to-start))
       ;; Step 1: Copy roots from the stack
       (setq free-ptr (%gc-scan-stack saved-rsp stack-base
-                                      from-start space-size free-ptr))
+                                      from-start space-size free-ptr sc))
       (write-char-serial 50)  ; '2' — stack scanned
       ;; Step 2: Copy roots from globals
-      (setq free-ptr (%gc-scan-globals from-start space-size free-ptr))
+      (setq free-ptr (%gc-scan-globals from-start space-size free-ptr sc))
       (write-char-serial 51)  ; '3' — globals scanned
       ;; Step 3: Cheney scan loop — process all copied objects
       (setq free-ptr (%gc-scan-copied to-start free-ptr
-                                       from-start space-size))
+                                       from-start space-size sc))
       (write-char-serial 52)  ; '4' — scan done
       ;; Step 4: Swap semispaces
       (%gc-set-from-start to-start)
@@ -1028,7 +1145,9 @@
    [FROM,FROM+SIZE) and [TO,TO+SIZE), roots on the stack below STACK-BASE, no
    collections yet, and a parked allocation pointer/limit spanning from-space.
    RCB is 64 bytes of memory the CALLER owns — BSS, a carved guard band, or (in
-   stage 2/3) an actor's own struct.  Returns RCB."
+   stage 2/3) an actor's own struct.  Returns RCB.
+
+"
   (%gc-meta-write rcb from k)
   (%gc-meta-write (+ rcb #x08) to k)
   (%gc-meta-write (+ rcb #x10) size k)

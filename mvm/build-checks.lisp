@@ -1587,6 +1587,27 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
                            (+GC-REGION-PERCPU-ADDR+); %gc-region-cell has drifted"
                       want-percpu)
               problems))
+      ;; THE PER-COLLECTION SCRATCH BLOCK.  Same shape, same failure mode: the
+      ;; config word's address is a HOST constant and an IMAGE literal, and a
+      ;; drift means one CPU's collector writes another's forwarded-value word.
+      (unless (has (format nil "#x~8,'0X" +gc-scratch-cfg-addr+))
+        (push (format nil "mvm/gc.lisp does not mention the GC scratch config ~
+                           word ~8,'0X (+GC-SCRATCH-CFG-ADDR+); ~
+                           %gc-scratch-cell/%gc-scratch-init have drifted"
+                      +gc-scratch-cfg-addr+)
+              problems))
+      ;; And the three per-collection words must no longer be reachable as
+      ;; literals: every use goes through the SC argument %gc-collect resolves
+      ;; once.  0x10000100 itself is legitimate — it is the zero-config default
+      ;; %gc-scratch-cell falls back to, exactly as #x10000040 is for regions —
+      ;; but +8 and +16 must be gone, or half the collector is still shared.
+      (dolist (off '(8 16))
+        (let ((abs (format nil "#x~8,'0X" (+ #x10000100 off))))
+          (when (has abs)
+            (push (format nil "mvm/gc.lisp still uses the ABSOLUTE scratch word ~
+                               ~A; per-collection state must be (+ SC ~D)"
+                          abs off)
+                  problems))))
       (unless (search (format nil "(percpu-ref ~D)" +gc-percpu-cpu-id-off+) text
                       :test #'char-equal)
         (push (format nil "mvm/gc.lisp does not read the per-CPU :CPU-ID slot as ~

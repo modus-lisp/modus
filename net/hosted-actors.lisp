@@ -90,6 +90,11 @@
 ;;;     +0x0800  message log (0x800)
 ;;;   +0x001000  PERCPU-DATA-BASE (16 KB; GS base points here)
 ;;;   +0x010000  ACTOR-TABLE-BASE (64 x 128 = 0x2000)
+;;;   +0x012000  GC SCRATCH ARRAY (16 x 32 = 0x200) — mvm/gc.lisp's
+;;;              per-collection working state, one 32-byte block PER CPU.
+;;;              Installed by %HA-CARVE via %GC-SCRATCH-INIT; until something
+;;;              does that, the collector uses the historic single shared block
+;;;              at 0x10000100, which is one collecting thread by construction.
 ;;;   +0x020000  MAILBOX-POOL-BASE .. +0x040000 MAILBOX-POOL-LIMIT
 ;;;   +0x080000  STAGING-BASE-ADDR (64 x 16 KB = 0x100000)
 ;;;   +0x200000  ACTOR-STACK-BASE (actor N's stack top = +0x200000 + (N+1)*64 KB)
@@ -155,8 +160,18 @@
                 ;; that look like heap pointers.
                 (%ha-zero (+ from0 new0) (+ from0 (+ new0 #x5000)))
                 (%ha-zero (+ from0 (+ new0 #x10000))
-                          (+ from0 (+ new0 #x12000)))
+                          (+ from0 (+ new0 #x12200)))
                 (setq *ha-band* (+ from0 new0))
+                ;; THE COLLECTOR'S PER-COLLECTION STATE BECOMES PER CPU.  Until
+                ;; this runs, mvm/gc.lisp's three working words are the historic
+                ;; FIXED SHARED addresses 0x10000100/0x10000108/0x10000110 — one
+                ;; collecting thread by construction, and two threads collecting
+                ;; at once clobber each other on every forwarded slot.  The
+                ;; per-CPU form is additionally gated on the active-region
+                ;; per-CPU word (%HA-SET-PERCPU-MODE), because indexing by CPU
+                ;; means a GS-relative read and a hosted process starts with a
+                ;; GS base of 0.
+                (%gc-scratch-init (+ *ha-band* #x12000))
                 *ha-band*))))))
 
 ;;; ============================================================

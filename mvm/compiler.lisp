@@ -282,6 +282,30 @@
   "BSS word the HOSTED actor scheduler's spinlock lives in.  Three words are
    reserved (0x10000FC0/FC8/FD0) because SMP-INIT zeroes lock+0, +8 and +16.")
 
+;;; ---- THE PER-COLLECTION SCRATCH BLOCK -----------------------------------
+;;;
+;;; The LISP collector (mvm/gc.lisp %GC-COLLECT — the aarch64 SHIM path; x64
+;;; and i386 run native trampolines that keep this state in REGISTERS) needs
+;;; three words of working memory per collection that cannot be Lisp locals,
+;;; because each holds an arbitrary MACHINE WORD and materialising one can
+;;; promote it to a bignum, i.e. ALLOCATE, inside the collector.
+;;;
+;;; Those three words were FIXED SHARED ADDRESSES 0x10000100/0x10000108/
+;;; 0x10000110 — one collecting thread by construction.  They are now a 32-byte
+;;; block addressed PER CPU, and this word holds the base of the per-CPU array
+;;; (+GC-REGION-MAX-CPUS+ entries = 512 bytes).  ZERO — the BSS default, and
+;;; the answer in every image that has not started a second thread — means the
+;;; historic single block at 0x10000100, so nothing needs initialising on a
+;;; target that cannot be booted here.
+;;;
+;;; 0x10000EC8 is the first word past translate-x64's page-PINNING reservation
+;;; (which ends at 0x10000EC0) inside the BSS gap that file documents as free
+;;; through 0x10000EFF.  It is NOT in the per-region table (0x10000F08..F88)
+;;; and NOT the per-CPU gate (0x10000FF8).
+(defconstant +gc-scratch-cfg-addr+ #x10000EC8
+  "BSS word holding the base of the per-CPU GC scratch-block array; 0 = the
+   historic single block at 0x10000100.  mvm/gc.lisp %GC-SCRATCH-CELL.")
+
 (defconstant +gc-percpu-cpu-id-off+ 16
   "Byte offset of the :CPU-ID slot in the per-CPU block, as every boot
    descriptor's percpu-layout-fn already defines it.  Stored TAGGED (value =

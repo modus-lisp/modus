@@ -1106,6 +1106,28 @@ sender on the other: ten sends cost **2.0 s** of extra wall time typically and
 | `test/hosted-mutex.lisp` | 18 | negative control 338187 of 600000 survived (**261813 lost**); under the mutex exactly 600000; condvar wait wall 300 ms / thread CPU 0 ms |
 | `test/hosted-sleep.lisp` | 13 | sleeping 400 ms -> wall 400 / cpu 0; spinning 400 ms -> wall 400 / cpu 398 |
 
+**CORRECTION (2026-08-23, measured): `test/hosted-thread-lisp.lisp` IS NOT
+10-OF-10.  IT IS ABOUT 27 OF 30, AND IT WAS ALREADY.**  Run 30 times in a row
+rather than 10, it aborts roughly one time in ten with an unhandled
+`PROGRAM-ERROR` out of `%TL-SELFTEST` (occasionally a SIGSEGV) — **before it
+prints a single section header**, so the failure is inside the two-thread
+workload and not in the reporting.  When that happens the process becomes an
+**unreapable zombie**: the main thread dies through a path that ends only the
+thread, thread 2 is still parked in `futex_wait` and nothing wakes it, so the
+leader stays `Z` with one live task and any pipe reading its output never sees
+EOF.  A harness that runs this test through a pipe therefore HANGS rather than
+reports.
+
+**It is pre-existing, and that is measured, not assumed.**  The same 30 runs
+against the binary built from `166fa1b` — the commit before the socket work —
+score **27 of 30 with the identical signature**, against **27 of 30** for the
+binary after it.  The socket work is not implicated (this test never opens a
+socket) and neither is anything else recent; the "all 10-of-10" line above was
+written from ten-run samples, which is simply too few to see a 1-in-10 event
+reliably.  **Two things to fix, and they are different bugs:** the
+`PROGRAM-ERROR` itself, and the teardown that leaves thread 2 parked forever
+when the main thread aborts.
+
 **WHAT IS STILL SERIALIZED, AND WHY.**  `test/hosted-thread-lisp.lisp` holds the
 runtime lock across the whole **Lisp-level** work of an iteration, not just the
 table calls.  Per-call locking is enough for the **tables**, but FORMAT and the

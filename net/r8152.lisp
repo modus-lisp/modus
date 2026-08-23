@@ -45,12 +45,23 @@
   ;; (+0x000), data buffer (+0x40..+0x240) and usb-state (+0x800).
   (+ (usb-dma-base) #x400))
 
-(defun r8152-read-dword (addr)
-  ;; Read the dword-aligned PLA register window at ADDR.
-  ;; Returns the 32-bit value, or -1 on transfer failure.
+(defun r8152-read-dword-once (addr)
+  ;; One PLA dword read.  Returns the 32-bit value, or -1 on transfer failure.
   (let ((r (usb-control-transfer (usb-dev-addr) #xC0 5 addr #x0100
                                  (r8152-reg-scratch) 4)))
     (if (<= r 0) -1 (mem-ref (r8152-reg-scratch) :u32))))
+
+(defun r8152-read-dword (addr)
+  ;; #275: vendor control transfers on this DWC2+RTL8153 are FLAKY — an
+  ;; occasional -1 that clears on retry.  Retry a failed read up to 5x with a
+  ;; short settle so a single transient glitch does not fail the whole enable.
+  (let ((i 0) (v -1))
+    (loop
+      (when (or (>= v 0) (>= i 5)) (return v))
+      (setq v (r8152-read-dword-once addr))
+      (when (< v 0) (dwc2-delay-ms 20))
+      (setq i (+ i 1)))
+    v))
 
 (defun r8152-write-dword (addr val)
   ;; Whole-dword write (BYTE_EN_DWORD).  Safe only for registers whose
@@ -91,15 +102,68 @@
                                          (r8152-reg-scratch) 4)))
             (if (> r 0) 1 0))))))
 
+(defun r8152-rx-ok ()
+  ;; RX is enabled iff PLA_CR shows RE|TE (byte lane 3 of dword 0xe810), the
+  ;; RCR accept bits are set (0xc010) AND RXDY_GATED_EN is clear in PLA_MISC_1
+  ;; (bit 19 of dword 0xe858).
+  (let ((cr (r8152-read-dword #xe810))
+        (rc (r8152-read-dword #xc010))
+        (m1 (r8152-read-dword #xe858)))
+    (if (and (>= cr 0) (>= rc 0) (>= m1 0)
+             (= (logand cr #x0C000000) #x0C000000)
+             (= (logand rc #x0E) #x0E)
+             (= (logand m1 #x80000) 0))
+        1 0)))
+
+;; Both confirm-helpers are defined BEFORE r8152-rx-enable that calls them —
+;; a forward call can compile to a silent NIL sentinel on the MVM (CLAUDE.md
+;; limitation #1 / #215), which would make the enable a no-op.
+(defun r8152-set-bits-confirm (addr set)
+  ;; RMW-set SET in the dword at ADDR, read back, retry up to 4x (50ms) until
+  ;; the bits stick.  Safe only for non-config-gated registers (RCR here).
+  (let ((i 0) (ok 0))
+    (loop
+      (when (or (> ok 0) (>= i 4)) (return ok))
+      (r8152-rmw-dword addr set 0)
+      (dwc2-delay-ms 50)
+      (let ((v (r8152-read-dword addr)))
+        (when (and (>= v 0) (= (logand v set) set)) (setq ok 1)))
+      (setq i (+ i 1)))
+    ok))
+
+(defun r8152-ungate-confirm ()
+  ;; Clear RXDY_GATED_EN (word-granular via r8152-ungate-rxdy), read back,
+  ;; retry up to 4x (50ms) until the gate bit is clear.
+  (let ((i 0) (ok 0))
+    (loop
+      (when (or (> ok 0) (>= i 4)) (return ok))
+      (r8152-ungate-rxdy)
+      (dwc2-delay-ms 50)
+      (let ((v (r8152-read-dword #xe858)))
+        (when (and (>= v 0) (= (logand v #x80000) 0)) (setq ok 1)))
+      (setq i (+ i 1)))
+    ok))
+
 (defun r8152-rx-enable ()
-  ;; 1. RCR: accept broadcast/multicast/perfect-match/all.
-  (r8152-rmw-dword #xc010 #x0F 0)
-  ;; 2. PLA_CR |= RE|TE under the CRWECR config-write unlock.
-  (r8152-rmw-dword #xe81c #xC0 #xFF)
-  (r8152-rmw-dword #xe810 #x0C000000 0)
-  (r8152-rmw-dword #xe81c 0 #xFF)
-  ;; 3. Un-gate the receive path (word-granular — see r8152-ungate-rxdy).
-  (r8152-ungate-rxdy))
+  ;; MINIMAL + IDEMPOTENT.  Root-caused on a Pi Zero 2 W by reading the
+  ;; registers back over the REPL:
+  ;;   * U-Boot (which used this NIC for its own TFTP) leaves PLA_CR with
+  ;;     RE|TE ALREADY SET, and that survives Modus's port reset — so we must
+  ;;     NOT touch PLA_CR or its CRWECR config-write unlock.  Re-writing
+  ;;     PLA_CR under the unlock is exactly what wedged the chip (PHYSTATUS
+  ;;     0xFF, vendor interface dead) in every earlier attempt.
+  ;;   * What U-Boot leaves WRONG for us is two "safe" (non-config-gated)
+  ;;     registers: PLA_RCR accept bits are clear (so every frame is filtered
+  ;;     out) and RXDY_GATED_EN is set (so the RX path is gated off).
+  ;; So the whole enable is two idempotent writes — RCR accept + RXDY ungate
+  ;; — each written then READ BACK, retrying only that one write on a flaky
+  ;; -1 (vendor transfers occasionally glitch; see r8152-read-dword).  No
+  ;; whole-sequence retry (that collides and wedges), no PLA_CR, no CRWECR.
+  ;; RCR = APM|AM|AB (0x0E), matching Linux rtl8152_set_rx_mode (NOT AAP/
+  ;; promiscuous).
+  (r8152-set-bits-confirm #xc010 #x0E)     ; RCR accept perfect|multi|broadcast
+  (r8152-ungate-confirm)                    ; clear RXDY_GATED_EN (word-granular)
+  (r8152-rx-ok))
 
 ;; ============================================================
 ;; Probe override: CDC-ECM bring-up + Realtek RX enable

@@ -941,6 +941,20 @@
                    ;; bridge's no-op stub and its %THR-PAGE calls SPIN-LOCK
                    ;; (net/actors.lisp) and %HA-ZERO (net/hosted-actors.lisp).
                    (mvm-text "net/hosted-sync.lisp")
+                   (string #\Newline)
+                   ;; THE SOCKET LAYER ON TWO CPUs.  Last in the group, and
+                   ;; that is load-bearing three times over: its %SOCK-IO-BUF /
+                   ;; %SOCK-ADDR-BUF / %SOCK-IO-CAP are last-defun-wins
+                   ;; overrides of the seam net/hosted-sockets.lisp defines
+                   ;; (which is baked inside *BRIDGE-SOURCE*, well above this);
+                   ;; it calls SPIN-LOCK (net/actors.lisp) and %THR-CPU /
+                   ;; %SLEEP-MS / %MONOTONIC-NS (net/hosted-sync.lisp), neither
+                   ;; of which resolves as a forward reference; and it spawns
+                   ;; thread 2 through %HA-SPAWN-T2 (net/hosted-actors-post).
+                   ;; "" on aarch64 and on bare metal with the rest of the
+                   ;; group, so those images keep the single-buffer socket
+                   ;; layer and their blobs are unaffected.
+                   (mvm-text "net/hosted-sockets-post.lisp")
                    (string #\Newline))
       ""))
 

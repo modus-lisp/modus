@@ -73,9 +73,13 @@
 ;;;           0x1000*cpu, ending at +0x12000).  See THE PER-THREAD WINDOW
 ;;;           below.
 ;;;   +0x12000 the MV/handler-case two-thread selftest's control block, 4 KB.
+;;;   +0x13000 THE THREAD TABLE, 4 KB — one record per thread, plus the
+;;;            spawn handshake words.  See MANY THREADS, FROM CLOSURES.
+;;;   +0x14000 PER-CPU BLOCKS, 16 KB per CPU, 16 CPUs (ending at +0x54000).
+;;;            The actor band only ever had room for two.
 ;;;
-;;; The mapping is 76 KB rather than 8 KB for those two additions; NOTHING at
-;;; a lower offset moved, so every earlier user reads the same bytes.
+;;; The mapping is 336 KB rather than 8 KB for those additions; NOTHING at a
+;;; lower offset moved, so every earlier user reads the same bytes.
 ;;;
 ;;; The two BSS words are 0x10000DA8 and 0x10000DB0 — the first two free words
 ;;; above the safepoint-boundary slot at 0x10000DA0 and below the MCGC config
@@ -97,7 +101,7 @@
           (let ((q (%gc-read64 (%thr-page-slot))))
             (if (> q 0)
                 (progn (spin-unlock (%thr-page-lock)) q)
-                (let ((m (%mmap-shared-page 77824)))
+                (let ((m (%mmap-shared-page 344064)))
                   ;; A failed mmap comes back as a small negative (-errno).
                   (if (< m 4096)
                       (progn (spin-unlock (%thr-page-lock)) 0)
@@ -1874,3 +1878,261 @@
                       (%gc-region-enter r0)
                       (%ha-set-percpu-mode mode0)
                       ctl))))))))
+
+;;; ============================================================
+;;; MANY THREADS, FROM CLOSURES
+;;; ============================================================
+;;;
+;;; WHAT WAS THERE BEFORE.  ONE spare thread, and %SPAWN-THREAD took a RAW
+;;; NATIVE ENTRY ADDRESS: net/hosted-actors-post.lisp had one stack, one thread
+;;; block and one TID word, so the image ran exactly two OS threads, and the
+;;; thing a thread ran had to be a zero-argument top-level DEFUN whose address
+;;; the caller had computed.  A closure could not be a thread body, so a thread
+;;; could not carry any state of its own — which is the first thing any real
+;;; MAKE-THREAD is asked for.
+;;;
+;;; WHAT IS HERE NOW.  A table of N threads, each with its own stack, its own
+;;; per-thread window (FS), its own per-CPU block (GS), its own TID word, and a
+;;; LISP CLOSURE as its body.  %MAKE-NATIVE-THREAD takes a function and returns
+;;; a handle; %JOIN-NATIVE-THREAD waits on the kernel's own answer.
+;;;
+;;; HOW A CLOSURE REACHES A THREAD THAT CANNOT BE PASSED AN ARGUMENT.  The
+;;; clone stub enters the child with a bare `call rbx' on a fresh stack: no
+;;; argument marshalling, no caller frame, nothing to read from.  So the child
+;;; is always the SAME zero-argument trampoline, and what varies is a SLOT
+;;; NUMBER it picks up from the table.  Spawning is serialised by a lock and a
+;;; handshake — the parent publishes the slot, spawns, and waits for the child
+;;; to acknowledge before releasing the lock — so "which slot am I?" has
+;;; exactly one answer while any child is reading it.  That is also why the
+;;; child ACKs before running the body rather than after: the ack means "I have
+;;; read my slot", not "I have finished".
+;;;
+;;; WHAT A THREAD GETS, AND IN WHICH ORDER, because the order is load-bearing:
+;;;   1. its PER-THREAD WINDOW (FS).  First, always — until this returns the
+;;;      thread's multiple values and handler frames are the spawner's.
+;;;   2. its PER-CPU BLOCK (GS) and CPU id, which is what the collector's
+;;;      active-region cell and %THR-CPU read.
+;;;   3. its slot in the table marked running, then the closure.
+;;;
+;;; WHAT IS DELIBERATELY NOT HERE — STATED, NOT HIDDEN.  A thread that
+;;; ALLOCATES needs a GC REGION of its own, and net/hosted-actors.lisp's carve
+;;; produces exactly TWO (16 MB each, plus the actor band) out of region 0.
+;;; So this layer gives 16 threads everything a thread needs EXCEPT a region,
+;;; and a body that conses beyond the two carved regions has nowhere to put it.
+;;; Carving N regions is a change to the carve, not to this file, and it is the
+;;; next thing in the way of a thread-per-client server.
+
+(defun %thr-max-threads () 16)
+
+(defun %thr-table () (let ((p (%thr-page))) (if (zerop p) 0 (+ p #x13000))))
+(defun %thr-percpu-base (cpu)
+  (let ((p (%thr-page))) (if (zerop p) 0 (+ p (+ #x14000 (* cpu #x4000))))))
+
+;; Handshake words (offsets in the thread table):
+;;   +0x00 the slot the child about to start should take
+;;   +0x08 that child's acknowledgement
+;;   +0x10 the spawn lock            +0x18 %GC-WORD-OF scratch
+;;   +0x20 threads started ever      +0x28 a shared arrival counter for tests
+;;   +0x30 that counter's lock
+;;   +0x100 + 0x40*i  PER-THREAD RECORD:
+;;     +0x00 state (0 free, 1 live, 2 done)   +0x08 the CLONE TID WORD (u32)
+;;     +0x10 stack base   +0x18 stack size    +0x20 cpu id
+;;     +0x28 reached the body  +0x30 returned from the body
+;;     +0x38 this thread's segment base
+(defun %thr-pending-slot () (+ (%thr-table) #x00))
+(defun %thr-ack ()          (+ (%thr-table) #x08))
+(defun %thr-spawn-lock ()   (+ (%thr-table) #x10))
+(defun %thr-scratch-word () (+ (%thr-table) #x18))
+(defun %thr-started ()      (+ (%thr-table) #x20))
+(defun %thr-arrivals ()     (+ (%thr-table) #x28))
+(defun %thr-barrier-lock () (+ (%thr-table) #x30))
+(defun %thr-rec (i)         (+ (%thr-table) (+ #x100 (* i #x40))))
+
+(defvar *thr-funs* nil
+  "The thread bodies, by slot.  A vector and not a table: a fresh thread reads
+   its own entry and nothing writes the vector while a child is starting (the
+   spawn lock and the handshake see to that), so this needs no locking of its
+   own — which matters, because a starting thread has no GC region and must not
+   go anywhere near the shared runtime tables.")
+
+(defvar *thr-stack-bytes* 262144)
+
+(defun %thr-funs ()
+  (if (null *thr-funs*) (setq *thr-funs* (make-array 16)) 0)
+  *thr-funs*)
+
+(defun %thr-trampoline ()
+  "EVERY thread starts here.  Zero arguments, because the clone stub enters it
+   with a bare `call rbx' — see the handshake above for how it learns which
+   thread it is."
+  (let* ((tt (%thr-table))
+         (slot (%gc-read64 tt))
+         (rec (%thr-rec slot)))
+    ;; 1. ITS OWN WINDOW, BEFORE ANYTHING THAT RETURNS A VALUE OR ARMS A
+    ;;    HANDLER.  It was cloned without CLONE_SETTLS, so right now its
+    ;;    multiple values and handler frames are still the spawner's.
+    (%tls-install slot)
+    (%gc-write64 (+ rec #x38) (%tls-self-base))
+    ;; 2. its own per-CPU block and CPU id.
+    (%ha-percpu-init-cpu (%thr-percpu-base slot) slot)
+    (set-current-actor 0)
+    (set-idle-flag 0)
+    (%gc-write64 (+ rec #x20) slot)
+    ;; 3. tell the spawner the slot has been read; it may now start the next.
+    (%gc-write64 (+ rec #x28) 1)
+    (%gc-write64 (%thr-ack) 1)
+    (funcall (aref (%thr-funs) slot))
+    (%gc-write64 (+ rec #x30) 1)
+    (%gc-write64 (+ rec #x00) 2)
+    0))
+
+(defun %thr-trampoline-entry ()
+  (- (%gc-word-of (fn-addr %thr-trampoline) (%thr-scratch-word)) 3))
+
+(defun %thr-free-slot ()
+  "The lowest slot that has never been used or whose thread has exited.  Slot
+   0 is the MAIN thread's — it has a window and a per-CPU block of its own
+   identity and is not startable — so slots run from 1."
+  (let ((i 1) (r -1))
+    (loop
+      (when (>= i (%thr-max-threads)) (return 0))
+      (when (zerop (%gc-read64 (+ (%thr-rec i) #x00)))
+        (progn (setq r i) (return 0)))
+      (setq i (+ i 1)))
+    r))
+
+(defun %make-native-thread (fn)
+  "Start an OS thread running the closure FN.  Returns its slot — the handle
+   %JOIN-NATIVE-THREAD and %NATIVE-THREAD-ALIVE-P take — or a negative number:
+   -1 no free slot, -2 the thread page could not be mapped, -3 no stack,
+   -4 clone failed, -5 the child never acknowledged its slot.
+
+   FN TAKES NO ARGUMENTS, which is not a restriction on generality: a closure
+   carries whatever it captured, and that is how a thread gets its state."
+  (let ((tt (%thr-table)))
+    (if (zerop tt)
+        -2
+        (progn
+          (%thr-funs)
+          (spin-lock (%thr-spawn-lock))
+          (let ((slot (%thr-free-slot)))
+            (if (< slot 0)
+                (progn (spin-unlock (%thr-spawn-lock)) -1)
+                (let* ((rec (%thr-rec slot))
+                       (stk (%mmap-shared-page *thr-stack-bytes*)))
+                  (if (< stk 4096)
+                      (progn (spin-unlock (%thr-spawn-lock)) -3)
+                      (progn
+                        (aset (%thr-funs) slot fn)
+                        (%gc-write64 (+ rec #x00) 1)
+                        (%gc-write64 (+ rec #x08) 0)
+                        (%gc-write64 (+ rec #x10) stk)
+                        (%gc-write64 (+ rec #x18) *thr-stack-bytes*)
+                        (%gc-write64 (+ rec #x28) 0)
+                        (%gc-write64 (+ rec #x30) 0)
+                        (%gc-write64 (%thr-pending-slot) slot)
+                        (%gc-write64 (%thr-ack) 0)
+                        (let ((tid (%spawn-thread (%thr-trampoline-entry)
+                                                  (+ stk *thr-stack-bytes*)
+                                                  (+ rec #x08))))
+                          (if (< tid 1)
+                              (progn (%gc-write64 (+ rec #x00) 0)
+                                     (spin-unlock (%thr-spawn-lock))
+                                     -4)
+                              ;; WAIT FOR THE ACK BEFORE RELEASING THE LOCK.
+                              ;; The pending-slot word has one reader and it
+                              ;; has not necessarily run yet.
+                              (let ((i 0) (ok 0))
+                                (loop
+                                  (when (= (%gc-read64 (%thr-ack)) 1)
+                                    (progn (setq ok 1) (return 0)))
+                                  (when (>= i 2000000000) (return 0))
+                                  (setq i (+ i 1)))
+                                (%gc-write64 (%thr-started)
+                                             (+ (%gc-read64 (%thr-started)) 1))
+                                (spin-unlock (%thr-spawn-lock))
+                                (if (= ok 1) slot -5))))))))))))) 
+
+(defun %native-thread-alive-p (slot)
+  "1 while the KERNEL still has this thread, 0 once it is gone.  The TID word
+   is cleared by the kernel itself (CLONE_CHILD_CLEARTID), so this is not a
+   flag the thread set about itself."
+  (if (zerop (mem-ref (+ (%thr-rec slot) #x08) :u32)) 0 1))
+
+(defun %join-native-thread (slot budget)
+  "0 once the thread is gone, 1 if BUDGET ran out first.  Frees the slot on
+   success so a later %MAKE-NATIVE-THREAD can reuse it."
+  (let ((i 0) (r 1))
+    (loop
+      (when (zerop (mem-ref (+ (%thr-rec slot) #x08) :u32))
+        (progn (setq r 0) (return 0)))
+      (when (>= i budget) (return 0))
+      (setq i (+ i 1)))
+    (if (zerop r) (%gc-write64 (+ (%thr-rec slot) #x00) 0) 0)
+    r))
+
+(defun %thr-arrive-and-wait (want budget)
+  "A barrier with a SPIN BUDGET, for proving simultaneity: 0 = every one of
+   WANT threads was inside it at once, 1 = this thread spun out its budget
+   alone, which is what a sequential run scores.
+
+   THE ARRIVAL IS UNDER A LOCK.  A read-modify-write of one counter by eight
+   threads loses increments, and a lost increment here is not a wrong number
+   but a barrier that never opens — i.e. a hang dressed as a timeout."
+  (spin-lock (%thr-barrier-lock))
+  (%gc-write64 (%thr-arrivals) (+ (%gc-read64 (%thr-arrivals)) 1))
+  (spin-unlock (%thr-barrier-lock))
+  (let ((i 0) (r 1))
+    (loop
+      (when (>= (%gc-read64 (%thr-arrivals)) want) (progn (setq r 0) (return 0)))
+      (when (>= i budget) (return 0))
+      (setq i (+ i 1)))
+    r))
+
+(defun %thr-reset-table ()
+  "Zero the whole table — the handshake words, every record and the arrival
+   counter.  Called by a driver before it starts a batch."
+  (let ((tt (%thr-table)))
+    (if (zerop tt) 0 (progn (%ha-zero tt (+ tt #x1000)) 1))))
+
+(defun %thr-my-cpu-raw ()
+  "This thread's CPU id straight out of its per-CPU block.  UNGUARDED — only a
+   thread that has installed a per-CPU block may call it, because PERCPU-REF is
+   a GS-relative load and GS base 0 makes it read absolute address 16.  %THR-CPU
+   is the guarded one; this exists so a worker can report its OWN id without
+   the process-wide mode word (which the collector also reads) being touched."
+  (percpu-ref 16))
+
+(defun %thr-make-counter (k out want budget)
+  "A THREAD BODY AS A CLOSURE, capturing K (this worker's own number) and OUT
+   (where it reports).  Returned by a function so the capture is real: eight
+   calls make eight closures over eight different values, and each thread's
+   arithmetic answer is derived from ITS OWN K, so a thread running somebody
+   else's body is a wrong number rather than an indistinguishable success.
+
+   IT DOES NOT ALLOCATE, and that is a boundary rather than a preference: a
+   thread has no GC region of its own yet (see MANY THREADS, FROM CLOSURES).
+   Fixnum arithmetic, raw memory and syscalls only.
+
+   REPORT BLOCK at OUT:
+     +0x00 barrier result (0 = all WANT threads were inside it at once)
+     +0x08 the K it captured   +0x10 K*ITERS, summed the long way
+     +0x18 its gettid          +0x20 its CPU id, read through its own GS
+     +0x28 its segment base, read through its own FS
+     +0x30 99 when the body ran to the end"
+  (lambda ()
+    (%gc-write64 (+ out #x00) (%thr-arrive-and-wait want budget))
+    (%gc-write64 (+ out #x08) k)
+    (let ((sum 0) (i 0))
+      (loop
+        (when (>= i 200000) (return 0))
+        (setq sum (+ sum k))
+        (setq i (+ i 1)))
+      (%gc-write64 (+ out #x10) sum))
+    (%gc-write64 (+ out #x18) (syscall3 186 0 0 0))
+    (%gc-write64 (+ out #x20) (%thr-my-cpu-raw))
+    (%gc-write64 (+ out #x28) (%tls-self-base))
+    (%gc-write64 (+ out #x30) 99)
+    0))
+
+(defun %thr-report (i) (+ (%thr-table) (+ #x800 (* i #x40))))

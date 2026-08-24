@@ -270,6 +270,24 @@
    = 3)."
   (%clock-ns 3))
 
+;;; ------------------------------------------------------------
+;;; …AND THE CL INTERNAL CLOCKS RIDE ON THEM
+;;; ------------------------------------------------------------
+;;;
+;;; LAST-DEFUN-WINS overrides of the seam mvm/ansi-bridge.lisp defines at 0.
+;;; They live HERE and not there for the same reason %CLOCK-NS-AT does: a
+;;; clock_gettime(2) needs a timespec that no other running thread is
+;;; writing, and the per-CPU scratch that provides one is this file's.
+;;;
+;;; GET-INTERNAL-REAL-TIME is what glass paces frames with, so "how long
+;;; since I last sent" has to be a duration and not a call count.  It is
+;;; CLOCK_MONOTONIC, so it does not step when the wall clock is set.
+(defun %irt-ns () (%monotonic-ns))
+
+;;; CLOCK_PROCESS_CPUTIME_ID: the number that tells a spinning loop from a
+;;; blocked one, which is exactly what GET-INTERNAL-RUN-TIME is for.
+(defun %irun-ns () (%cpu-ns))
+
 ;;; ============================================================
 ;;; SLEEP
 ;;; ============================================================

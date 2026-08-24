@@ -1701,6 +1701,55 @@ single clean run of any of these means "not reproduced in this shape", never
 "correct" — the same lesson the pixel-2591 story taught, and the reason the
 runner defaults to three runs per arm and reports a rate.
 
+### THE ROOT CAUSE, MEASURED: a worker's INTERN puts the symbol in the WRONG REGION
+
+`%RT-ENTER` exists so that the shared runtime tables and everything reachable
+from them live in **region 0** — that is the whole argument of "A LOCK ALONE IS
+HALF THE FIX" above, and it is why the locked section hops the heap at all.
+
+**IT DOES NOT.**  `test/run-worker-xregion.sh` asks where the objects actually
+are, with `%GC-WORD-OF` for the addresses and `%GC-COUNT-FOREIGN-REFS` for the
+audit, at collection count 0 so nothing has had a chance to dangle yet:
+
+| arm | last object | its name | foreign refs, region 0's live span -> the worker's region |
+|---|---|---|---|
+| strings (control) | the worker's region | — | **0** |
+| **intern** | **the worker's region** | **the worker's region** | **508** (516 on another run) |
+
+So it is not merely the NAME STRING computed before the call, which was the
+obvious suspect: **the symbol object itself** is allocated in the worker's
+region, and region 0's tables then point at it.  That is the forbidden
+direction of the one rule per-region collection rests on, created once per
+fresh intern, and nothing enforces it.
+
+**AND IT IS FATAL RATHER THAN UNTIDY, WITH A CONTROL.**  Those pointers are not
+on the worker's stack, so the worker's own collector never updates them.  Force
+ONE collection of the worker's region after interning and the process takes
+**SIGSEGV, 3 of 3**.  The identical shape — same loop, same length, same strings,
+same forced collection, differing only in that the results are KEPT rather than
+INTERNED — survives **3 of 3**, with every object correctly moving
+(`721EE898A769 -> 721F205FF9E9`) and its re-lookup still `EQ`.
+
+That is why `intern-fresh` in `test/run-worker-intern.sh` dies and the other
+three arms do not, why it is layout-sensitive (it bites when the worker's region
+happens to collect), and why the glass sender dies with the same
+`MVM LONGJMP (TRAP #x0511)` signature: glass interns while it serves.
+
+**THE FIX IS A DESIGN QUESTION, NOT A PATCH**, which is why none was attempted:
+intern in the owning region and accept that the tables are then per-region; or
+COPY the name into region 0 and allocate the symbol there, which means the
+locked section must own the allocation rather than merely hop the frontier; or
+make the tables' region explicit and give every shared-table write a barrier.
+The audit is the acceptance test for whichever is chosen —
+`test/run-worker-xregion.sh` goes green when a worker's fresh intern stops
+leaving a pointer behind.
+
+**A TRAP THIS COST A CYCLE ON: `SYS-EXIT` FROM INSIDE A NESTED `LET*`/`IF` IN A
+`--script` DOES NOT TAKE EFFECT.**  The process ran to the end of the file and
+exited **0** while the verdict line above it said FAIL — and every runner reads
+the code, not the prose.  Put the exit at TOPLEVEL; the other tests in this tree
+already do.
+
 ### THE CLOCKS ARE CLOCKS (243b265)
 
 `GET-INTERNAL-REAL-TIME` bound `T` — `(let ((t (handler-case (syscall3 201 …))))`

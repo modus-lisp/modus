@@ -2731,6 +2731,51 @@
   (let ((b (%thr-percpu-base (%thr-cpu))))
     (if (zerop b) 0 (+ b #x3C00))))
 
+;;; ============================================================
+;;; THE FILE-STREAM STAGING PAGE, PER CPU — AND IT IS A CORRECTNESS FIX
+;;; ============================================================
+;;;
+;;; mvm/cl-fileio.lisp stages EVERY raw read and EVERY raw write through a page
+;;; a syscall can be handed the address of.  There was one such page for the
+;;; process (*IO-BUF-ADDR*), which was right while there was one thread and is
+;;; silent data corruption now that there are sixteen: %FS-WRITE-BYTE stores the
+;;; byte at the page and then issues write(2) from it, so two threads writing to
+;;; two DIFFERENT descriptors send each other's bytes.
+;;;
+;;; MEASURED BEFORE THIS EXISTED, on this image: 327 680 bytes — the size of one
+;;; RFB raw rectangle at 1280 wide with glass's default 64-row banding — written
+;;; by one thread and read by another across a loopback socket pair came back
+;;; with 73 933 bytes WRONG, while the identical transfer on one thread was
+;;; byte-perfect.  Nothing signalled.  It is on glass's critical path twice over:
+;;; glass is thread-per-client, and each client is a reader thread and a sender
+;;; thread on the SAME socket.
+;;;
+;;; 4096 BYTES AT +0x2000, which is the first thing to use the middle of the
+;;; per-CPU block: the actor system has the first 64 bytes and the four 256-byte
+;;; scratches above have 0x3C00-0x3FFF, so 0x2000-0x2FFF is clear of both with
+;;; room on either side.  The size is not a choice — cl-fileio reads 4096 into
+;;; it (%FS-READ-CHAR, %FS-READ-BYTE) and a smaller page would overrun into
+;;; whatever came next.
+;;;
+;;; IT DEFERS TO THE OLD PAGE UNLESS PER-CPU MODE IS ACTUALLY ON, and that guard
+;;; is deliberate rather than defensive.  Reading the mode word is a load;
+;;; asking %THR-PERCPU-BASE is a call that MMAPS the 336 KB thread page on first
+;;; use.  Every single-threaded ./modus — which is every test in the tree that
+;;; is not about threads — would otherwise pay a new mapping at its first
+;;; character of output, for a page it has no second thread to share.  With the
+;;; mode off there IS only one thread running Lisp, so the old page is not
+;;; merely acceptable, it is correct.  The mode is turned on by %SB-THREADS-UP
+;;; before MAKE-THREAD ever returns, so anything that can race is covered.
+(defun %fs-io-page ()
+  "THIS THREAD's 4096-byte raw I/O staging page.  Overrides the definition in
+   mvm/cl-fileio.lisp by last-defun-wins, which is the same seam
+   net/hosted-sockets-post.lisp uses for %SOCK-IO-BUF and for the same reason:
+   the file that needs the page is loaded long before per-CPU blocks exist."
+  (if (= (mem-ref #x10000FF8 :u32) 0)
+      *io-buf-addr*
+      (let ((b (%thr-percpu-base (%thr-cpu))))
+        (if (zerop b) *io-buf-addr* (+ b #x2000)))))
+
 ;;; A C STRING IN PER-CPU SCRATCH.  The process-wide *CSTR-SCRATCH* is one
 ;;; buffer for every thread, which is a path two threads calling stat(2) at once
 ;;; both write.  256 bytes at +0x3E00; longer strings are REFUSED (0) rather

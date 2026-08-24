@@ -20,13 +20,37 @@
 ;;;;   lock    inside (glass::with-fb-locked (fb) …)           — a recursive mutex
 ;;;;   both    inside BOTH, nested, exactly as RFB-SENDER-LOOP nests them
 ;;;;
-;;;; MEASURED ON THIS TREE: plain, tx and lock each deliver all 49 180 bytes.
-;;;; BOTH dies after 32 787 — three bytes into the SECOND rectangle's header —
-;;;; with `MVM LONGJMP (TRAP #x0511) with no active handler-case', which is the
-;;;; same byte count and the same place the real server stops.  So the wall is
-;;;; not the socket, not the encoder, not the thread, and not either wrapper:
-;;;; it is the two of them NESTED, on a worker, around a body that allocates
-;;;; enough to collect that worker's own region several times.
+;;;; TWO FAILURES, AND THEY ARE NOT THE SAME SIZE OF PROBLEM.
+;;;;
+;;;; (1) `both' STOPS AT 32 785 BYTES — three bytes into the SECOND rectangle's
+;;;;     header — with `MVM LONGJMP (TRAP #x0511) with no active handler-case',
+;;;;     the same byte count and the same place the real RFB server stops.
+;;;;     Reproduces on every machine it has been run on.  Since plain, tx and
+;;;;     lock all COMPLETE the transfer, this stop is not the socket, not the
+;;;;     thread and not either wrapper alone: it is the two of them NESTED.
+;;;;
+;;;; (2) A SINGLE ZERO PIXEL, in the arms that complete, AND IT IS
+;;;;     ENVIRONMENT-DEPENDENT.  On one machine all three completing arms
+;;;;     reported index 2591 = (31,20) reading 0x000000; on another, an earlier
+;;;;     run reported 2528 = (96,19), also 0x000000; and on that same second
+;;;;     machine the CURRENT tree passes those three arms 14 runs running, and
+;;;;     3 more under a 32 MB collection trigger, from a binary verified
+;;;;     BYTE-IDENTICAL to the first.  So:
+;;;;
+;;;;       * the baseline is NOT clean, and an earlier version of this header
+;;;;         said "every pixel correct" on the strength of a handful of runs on
+;;;;         one box.  It was a sample, reported as a property;
+;;;;       * the index MOVES between environments, so it is not a fixed
+;;;;         structural offset — not an encoder or buffer boundary;
+;;;;       * the value is ZERO both times, and zero is what MAKE-FRAMEBUFFER
+;;;;         fills with, so it reads as ONE LOST STORE rather than one wrong
+;;;;         value.
+;;;;
+;;;;     WHICH LOST STORE IS EXACTLY WHAT FB-SELFCHECK BELOW ANSWERS, and the
+;;;;     answer costs one run: `bad' non-zero BEFORE serving means the PAINT
+;;;;     lost it and the wire is innocent; `bad=0' before with the client still
+;;;;     reporting a zero means the picture was right and the ENCODE or the
+;;;;     TRANSPORT lost it.  Report that line with any failure here.
 ;;;;
 ;;;; ============================================================
 ;;;; WHAT WOULD MAKE THIS A LIE

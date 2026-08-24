@@ -8,11 +8,16 @@
 # RFB-SENDER-LOOP puts around GLASS:SEND-RECTS, and the Python peer counts the
 # bytes that reach it.
 #
-# EXPECTED ON THIS TREE (and the reason the file exists): plain, tx and lock
-# each deliver all 49180 bytes; `both' does not.  So `all' is EXPECTED TO
-# REPORT A FAILING ARM and this script exits non-zero when it does — it is a
-# reproducer, and a reproducer that passes has stopped reproducing.  When the
-# defect is fixed, all four arms deliver and this exits 0.
+# EXPECTED: `both' does not deliver, on every machine tried, so `all' is
+# EXPECTED TO REPORT A FAILING ARM and this script exits non-zero when it does
+# — it is a reproducer, and a reproducer that passes has stopped reproducing.
+#
+# THE OTHER THREE ARMS ARE ENVIRONMENT-DEPENDENT: they complete the transfer
+# everywhere, but on some machines exactly one pixel arrives as 0x000000, at an
+# index that MOVES between environments (2591 on one, 2528 on another).  If you
+# see that, the line to report is FB-SELFCHECK — it grades the framebuffer
+# before a client can connect, so it says whether the PAINT lost the pixel or
+# the WIRE did.  GLASS_SEND_SELFCHECK=0 turns the readback off.
 #
 # NOTHING IS LEFT LISTENING: loopback, a kernel-chosen port, 5900-5920 refused,
 # and `ss' asked afterwards.

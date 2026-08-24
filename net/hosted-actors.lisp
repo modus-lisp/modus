@@ -112,6 +112,11 @@
 ;;;              page because a region control block is memory the COLLECTOR
 ;;;              reads on every allocation check, and the band is the one
 ;;;              mapping this file already guarantees is live and never moves.
+;;;   +0x00B000  per-thread REPORT BLOCKS for the N-regions acceptance test
+;;;   +0x00C000  that test's result block (0x800), then %SYNC-CELL-CTL at
+;;;              +0xC800 — the mutex/condvar arena's bump lock and pointers.
+;;;              ZEROED BY THE CARVE, and it must be: its first word is a spin
+;;;              lock and this memory was region 0's from-space a moment ago.
 ;;;   +0x010000  ACTOR-TABLE-BASE (64 x 128 = 0x2000)
 ;;;   +0x012000  GC SCRATCH ARRAY (16 x 32 = 0x200) — mvm/gc.lisp's
 ;;;              per-collection working state, one 32-byte block PER CPU.
@@ -279,6 +284,23 @@
                 ;; ago and can still hold anything.
                 (%ha-zero (+ from0 (+ new0 #xA000))
                           (+ from0 (+ new0 #xA400)))
+                ;; AND THE BAND'S UPPER SCRATCH, +0xC000..+0xD000.  It holds
+                ;; the N-region selftest's result block and — the reason this
+                ;; line exists — %SYNC-CELL-CTL at +0xC800, whose FIRST WORD IS
+                ;; A SPIN LOCK.  This memory was region 0's from-space a moment
+                ;; ago, so a non-zero word there is an ALREADY-HELD lock that
+                ;; nothing will ever release: the first MAKE-MUTEX spins at a
+                ;; full core forever.
+                ;;
+                ;; MEASURED, AND IT IS WHY THIS IS NOT A TIDY-UP.  Loading
+                ;; glass's clipboard.lisp under modus hung at 100% of one core
+                ;; on `(defvar *session-clipboard-lock* (%clip-make-lock))',
+                ;; the first form in the whole campaign to ask for a mutex
+                ;; AFTER enough allocation had happened to leave garbage at that
+                ;; address.  Every earlier test asked for one from a nearly
+                ;; fresh heap and got a zero by luck.
+                (%ha-zero (+ from0 (+ new0 #xC000))
+                          (+ from0 (+ new0 #xD000)))
                 (%ha-zero (+ from0 (+ new0 #x10000))
                           (+ from0 (+ new0 #x12200)))
                 (setq *ha-band* (+ from0 new0))

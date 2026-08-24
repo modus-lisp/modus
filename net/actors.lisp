@@ -650,6 +650,65 @@
                 (setf (mem-ref buf :u8) 1)
                 (setf (mem-ref (+ buf 1) :u64) val)
                 9)
+          ;; ---- STRINGS AND SYMBOLS GO BY VALUE, NOT BY POINTER ----------
+          ;;
+          ;; Both used to fall off the end of this dispatch into the "unknown
+          ;; object type — encode as fixnum" arm, which writes THE OBJECT'S OWN
+          ;; TAGGED POINTER and labels it a fixnum.  Measured, not inferred: a
+          ;; symbol encoded to tag 1 with a payload equal, bit for bit, to its
+          ;; own machine word.  So every actor message carrying a string or a
+          ;; symbol handed the receiver a pointer into the SENDER'S REGION —
+          ;; the exact violation of "no region holds a pointer into another"
+          ;; that the whole per-region collector rests on, sitting in the
+          ;; message path.  Serialising is the ONLY thing that makes separate
+          ;; regions per actor sound, and for the two commonest payload types
+          ;; it was not happening.
+          ;;
+          ;; TAG 3 IS NOT NEW.  TERM-DECODE-STEP has always had the arm that
+          ;; reads a length, reads the bytes and MAKE-STRINGs a copy IN THE
+          ;; RECEIVER'S REGION; it was dead code because nothing ever emitted
+          ;; it.  The asymmetry was the bug.  This emits it.
+          (if (stringp val)
+              (let ((slen (length val)))
+                (setf (mem-ref buf :u8) 3)
+                (setf (mem-ref (+ buf 1) :u32) slen)
+                (let ((i 0))
+                  (loop
+                    (when (>= i slen) (return 0))
+                    (setf (mem-ref (+ (+ buf 5) i) :u8) (char-code (aref val i)))
+                    (setq i (+ i 1))))
+                (+ 5 slen))
+          ;; TAG 6 — A SYMBOL, BY NAME AND PACKAGE NAME.
+          ;;
+          ;; The receiver INTERNS it, which is the whole point: the intern
+          ;; happens on the RECEIVING thread, so the symbol and the table that
+          ;; points at it are allocated in the SAME region by construction.  No
+          ;; barrier, no promotion, no delegation — the pointer that would have
+          ;; had to be fixed up is never created.
+          ;;
+          ;; A symbol with no home package (an uninterned gensym) encodes a
+          ;; ZERO-length package and decodes through MAKE-SYMBOL: two actors
+          ;; cannot share an uninterned symbol by name and must not pretend to.
+              (if (symbolp val)
+                  (let* ((nm (symbol-name val))
+                         (pk (symbol-package val))
+                         (pn (if pk (package-name pk) ""))
+                         (nlen (length nm))
+                         (plen (length pn)))
+                    (setf (mem-ref buf :u8) 6)
+                    (setf (mem-ref (+ buf 1) :u32) nlen)
+                    (let ((i 0))
+                      (loop
+                        (when (>= i nlen) (return 0))
+                        (setf (mem-ref (+ (+ buf 5) i) :u8) (char-code (aref nm i)))
+                        (setq i (+ i 1))))
+                    (setf (mem-ref (+ (+ buf 5) nlen) :u32) plen)
+                    (let ((i 0) (pbase (+ (+ buf 9) nlen)))
+                      (loop
+                        (when (>= i plen) (return 0))
+                        (setf (mem-ref (+ pbase i) :u8) (char-code (aref pn i)))
+                        (setq i (+ i 1))))
+                    (+ (+ 9 nlen) plen))
               ;; Object: dispatch on subtag
               (let ((st (soft-subtag val)))
                 (if (= st #x32)
@@ -676,11 +735,17 @@
                                       (mem-ref (+ (+ addr 8) (ash i 3)) :u64))
                                 (setq i (+ i 1))))
                             (+ 5 (ash nlimbs 3))))
-                        ;; Unknown object type — encode as fixnum
+                        ;; STILL UNKNOWN — and still a pointer, deliberately
+                        ;; left as it was.  Everything that has been MEASURED
+                        ;; to come through here (symbols, strings) is now
+                        ;; handled above; narrowing this arm further without a
+                        ;; demonstration of what lands in it would be guessing.
+                        ;; It remains a soundness hole for any type nobody has
+                        ;; looked at yet.
                         (progn
                           (setf (mem-ref buf :u8) 1)
                           (setf (mem-ref (+ buf 1) :u64) val)
-                          9))))))))
+                          9))))))))))
 
 ;; Deserialize one term from staging buffer.
 ;; Uses global read pointer at decode-ptr-addr to track position.
@@ -700,6 +765,38 @@
                       (let ((car-val (term-decode-step)))
                         (let ((cdr-val (term-decode-step)))
                           (cons car-val cdr-val))))
+                    (if (= tag 6)
+                        ;; A SYMBOL, BY NAME — AND THE INTERN HAPPENS HERE.
+                        ;;
+                        ;; That is the entire point of the tag.  Interning on
+                        ;; the RECEIVING thread allocates the symbol in the
+                        ;; RECEIVER'S region, which is the same region as the
+                        ;; table that will point at it — so the cross-region
+                        ;; pointer that used to be shipped in the message is
+                        ;; never created rather than being created and then
+                        ;; repaired.
+                        (let ((nlen (mem-ref (+ buf 1) :u32)))
+                          (let ((nm (make-string nlen)))
+                            (let ((i 0))
+                              (loop
+                                (when (>= i nlen) (return 0))
+                                (string-set nm i (mem-ref (+ (+ buf 5) i) :u8))
+                                (setq i (+ i 1))))
+                            (let ((plen (mem-ref (+ (+ buf 5) nlen) :u32)))
+                              (let ((pn (make-string plen))
+                                    (pbase (+ (+ buf 9) nlen)))
+                                (let ((i 0))
+                                  (loop
+                                    (when (>= i plen) (return 0))
+                                    (string-set pn i (mem-ref (+ pbase i) :u8))
+                                    (setq i (+ i 1))))
+                                (setf (mem-ref da :u64) (+ pbase plen))
+                                ;; No home package — an uninterned symbol.  Two
+                                ;; actors cannot share one by name, so give the
+                                ;; receiver its own rather than pretend.
+                                (if (= plen 0)
+                                    (make-symbol nm)
+                                    (intern nm pn))))))
                     (if (= tag 3)
                         (let ((slen (mem-ref (+ buf 1) :u32)))
                           (let ((s (make-string slen)))
@@ -732,7 +829,7 @@
                                       (setq i (+ i 1))))
                                 (setf (mem-ref da :u64)
                                       (+ (+ buf 5) (ash nlimbs 3)))
-                                b))))))))))))
+                                b)))))))))))))
 
 ;; Allocate bignum with nlimbs limbs
 (defun make-bignum-n (nlimbs)

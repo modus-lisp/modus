@@ -1571,15 +1571,46 @@ socket, one worker, one `GLASS:SEND-RECTS`, and a Python peer that computes
 
 | arm | wrappers | result |
 |---|---|---|
-| plain | none | 49180 bytes, every pixel correct |
-| tx | `(let ((glass::*tx* (list 0))) …)` | 49180 bytes, every pixel correct |
-| lock | `(glass::with-fb-locked (fb) …)` | 49180 bytes, every pixel correct |
+| plain | none | 49180 bytes delivered |
+| tx | `(let ((glass::*tx* (list 0))) …)` | 49180 bytes delivered |
+| lock | `(glass::with-fb-locked (fb) …)` | 49180 bytes delivered |
 | **both** | the two, **nested**, as the sender loop nests them | **32785, then the process dies** |
 
-So it is not the socket, not the encoder (`WRITE-RECT-RAW`'s output for both
-bands is byte-perfect written to a FILE from the same worker), not the thread,
-not the concurrent reader (measured with the main thread parked in `READ-BYTE`
-on that stream and without — no difference), and not either wrapper alone.
+So the STOP is not the socket, not the encoder (`WRITE-RECT-RAW`'s output for
+both bands is byte-perfect written to a FILE from the same worker), not the
+thread, not the concurrent reader (measured with the main thread parked in
+`READ-BYTE` on that stream and without — no difference), and not either wrapper
+alone.
+
+**THE THREE COMPLETING ARMS ARE NOT CLEAN, AND THIS TABLE SAID THEY WERE.**
+They deliver every byte, but on SOME MACHINES exactly one pixel arrives as
+`0x000000`.  This was first written up as "every pixel correct" on the strength
+of a handful of runs on one box — a sample reported as a property, and it sent
+two people at the wrong target.  What is actually established:
+
+* index **2591** = (31,20) on one machine, in all three completing arms;
+  **2528** = (96,19) on another, in an earlier run.  **The index MOVES between
+  environments**, so it is not a fixed structural offset — not an encoder or a
+  buffer boundary.
+* the value is **ZERO both times**, and zero is what `MAKE-FRAMEBUFFER` fills
+  with, so it reads as **one lost STORE**, not one wrong value.
+* it does **not** reproduce on the second machine at all: 14 consecutive clean
+  runs of the shipping binary, plus 3 more built with `MODUS_GC_R14=33554432`
+  so collections fire constantly — and that binary was verified **byte-identical**
+  to a fresh build of the same commit, so the tree is reproducible and the
+  variation is environmental, not a build difference.
+* **`MODUS_GC_R14` IS A BUILD-TIME KNOB, NOT A RUNTIME ONE** (`build-generic-cli.lisp`
+  reads it with `posix-getenv` while building).  Setting it on the command line
+  of `./modus` does nothing and silently looks like "no collections happened".
+
+`test/glass-send-worker.lisp` now grades the FRAMEBUFFER through glass's own
+`FB-GET`, before the port is announced and again after serving, because a
+client reporting a bad pixel cannot tell a store lost while PAINTING from a
+byte lost on the WIRE.  **`FB-SELFCHECK` is the line to read**: non-zero before
+serving = the paint lost it; `bad=0` before with the client still seeing a zero
+= the encode or the transport lost it.  The client also counts every bad pixel
+now, groups them into runs and prints stream byte offsets, so "one lost store"
+and "a corrupted region" stop being indistinguishable.
 
 **AND IT IS NOT THE JIT.**  The whole family reproduces IDENTICALLY under
 `MODUS_NO_JIT=1` — three runs each, same failure, same place.  So

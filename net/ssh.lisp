@@ -436,16 +436,38 @@
             (let ((blen (mem-ref (+ ssh #x6D4) :u32)))
               (if (> blen 4)
                   (let ((arr (ssh-buf-to-array ssh blen)))
-                    (let ((pkt-len (ssh-get-u32 arr 0)))
-                      (if (not (< blen (+ 4 pkt-len)))
-                          (let ((parsed (ssh-parse-packet ssh arr blen)))
-                            (when parsed
-                              (ssh-buf-consume ssh (+ 4 pkt-len))
-                              (setf (mem-ref (+ ssh #x04) :u32)
-                                    (+ (mem-ref (+ ssh #x04) :u32) 1))
-                              (setq result parsed)))
-                          (let ((msg (receive)))
-                            (when (zerop msg) (return ()))))))
+                    ;; ROBUSTNESS: a duplicate/leftover version line ("SSH-...")
+                    ;; can precede the real packet (TCP retransmit of the client's
+                    ;; version+KEXINIT after a SYN-ACK retransmit).  If the buffer
+                    ;; starts with "SSH-", skip it (to the \n) so we don't read
+                    ;; the ASCII as a bogus packet length.
+                    (if (and (eq (aref arr 0) 83) (eq (aref arr 1) 83)
+                             (eq (aref arr 2) 72) (eq (aref arr 3) 45))
+                        (let ((nl 0) (i 0))
+                          (loop
+                            (when (or (not (zerop nl)) (>= i blen)) (return 0))
+                            (when (eq (aref arr i) 10) (setq nl i))
+                            (setq i (+ i 1)))
+                          (if (not (zerop nl))
+                              (ssh-buf-consume ssh (+ nl 1))
+                              (let ((msg (receive)))
+                                (when (zerop msg) (return ())))))
+                        (let ((pkt-len (ssh-get-u32 arr 0)))
+                          ;; DEFENSE: max unencrypted SSH packet is 35000 bytes.
+                          ;; A larger pkt-len means the buffer is desynced/garbage
+                          ;; — drop it rather than make-array a huge region (which
+                          ;; faults).  Resync by discarding the bad buffer.
+                          (if (> pkt-len 35000)
+                              (ssh-buf-consume ssh blen)
+                              (if (not (< blen (+ 4 pkt-len)))
+                                  (let ((parsed (ssh-parse-packet ssh arr blen)))
+                                    (when parsed
+                                      (ssh-buf-consume ssh (+ 4 pkt-len))
+                                      (setf (mem-ref (+ ssh #x04) :u32)
+                                            (+ (mem-ref (+ ssh #x04) :u32) 1))
+                                      (setq result parsed)))
+                                  (let ((msg (receive)))
+                                    (when (zerop msg) (return ()))))))))
                   (let ((msg (receive)))
                     (when (zerop msg) (return ())))))
             (setq tries (+ tries 1))))
@@ -485,9 +507,14 @@
 ;; Returns 1 on success, 0 on failure
 ;; ssh = per-connection SSH state base
 (defun ssh-receive-version (ssh)
+  ;; NOTE: flags use explicit ZEROP tests -- 0 is TRUTHY in the CL/mvm-eval
+  ;; image (bare (when flag) with flag=0 fired immediately, returning success
+  ;; without parsing; V_C stayed empty => wrong exchange hash => the client's
+  ;; "incorrect signature").  Legacy repl-source images treat word-0 as false,
+  ;; which is why this ever appeared to work.
   (let ((got-version 0) (tries 0))
     (loop
-      (when got-version (return 1))
+      (when (not (zerop got-version)) (return 1))
       (when (> tries 50) (return 0))
       ;; Wait for data from net-actor
       (let ((msg (receive)))
@@ -501,12 +528,12 @@
                 ;; Find \r\n or \n
                 (let ((end 0) (i 3))
                   (loop
-                    (when end (return ()))
+                    (when (not (zerop end)) (return ()))
                     (when (> i blen) (return ()))
                     (when (eq (mem-ref (+ ssh #x6D8 i) :u8) 10) ; \n
                       (setq end i))
                     (setq i (+ i 1)))
-                  (when end
+                  (when (not (zerop end))
                     ;; Store version (without \r\n) at ssh+0x650
                     (let ((vlen end))
                       (when (eq (mem-ref (+ ssh #x6D8 (- end 1)) :u8) 13)
@@ -573,7 +600,7 @@
                                                                     qs-str (array-length qs-str))))
                                               (let ((hash-input (ssh-concat2 p6 (array-length p6)
                                                                               k-mpint (array-length k-mpint))))
-                                                (sha256 hash-input (array-length hash-input)))))))))))))))))))))))))))
+                                                (sha256 hash-input))))))))))))))))))))))))))
 
 ;; Encode host public key in SSH format: string("ssh-ed25519") + string(pubkey)
 ;; ssh = per-connection SSH state base
@@ -613,13 +640,13 @@
                                     h 32)))
               (let ((p2 (ssh-concat2 p1 (array-length p1) id 1)))
                 (let ((p3 (ssh-concat2 p2 (array-length p2) sid 32)))
-                  (let ((k1 (sha256 p3 (array-length p3))))
+                  (let ((k1 (sha256 p3)))
                     ;; If needed > 32, compute K2 = SHA256(K || H || K1)
                     (if (> needed-len 32)
                         (let ((p4 (ssh-concat2 k-mpint (array-length k-mpint)
                                                 h 32)))
                           (let ((p5 (ssh-concat2 p4 (array-length p4) k1 32)))
-                            (let ((k2 (sha256 p5 (array-length p5))))
+                            (let ((k2 (sha256 p5)))
                               (ssh-concat2 k1 32 k2 32))))
                         k1)))))))))))
 
@@ -693,7 +720,8 @@
               (usb-keepalive)
               (let ((sig (ed25519-sign-fast h 32)))
                 (usb-keepalive)
-                (ssh-send-kex-reply ssh sig srv-eph)))))))))
+                (ssh-send-kex-reply ssh sig srv-eph)
+))))))))
 
 ;; Send NEWKEYS message
 (defun ssh-send-newkeys (ssh)

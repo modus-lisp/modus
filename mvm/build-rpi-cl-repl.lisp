@@ -387,6 +387,155 @@
   (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_NET_BUILD")))
     (and v (string= v "1"))))
 
+;; MODUS_SSH_BUILD=1 — fold the crypto layer (SHA-256/512, ChaCha20, Poly1305,
+;; X25519, Ed25519) into the CL host-net image, staging toward a bare-metal SSH
+;; server.  Additive: "" when off, so the HTTP image is byte-identical.  Crypto
+;; is separable from the SSH transport/actor stack — it depends only on pure
+;; arithmetic + a scratch region at (e1000-state-base)+0x100, both of which the
+;; CL host adapter (arch-rpi-cl.lisp) already provides, and which does NOT
+;; overlap r8152.lisp's NIC state (+0x08..+0x44).  Building it VERIFIES the
+;; crypto sources MVM-compile for AArch64 under the CL/mvm-eval image (the heavy
+;; 32-bit rotations are exactly where a compile-ash/bignum gap would surface).
+;; The SSH transport (actors + ssh.lisp + a fresh actor/SSH address map for the
+;; 0x11000000 layout) is the next layer and needs on-hardware iteration.
+(defvar *ssh-build-p*
+  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_SSH_BUILD")))
+    (and v (string= v "1"))))
+
+;; Crypto source, spliced into *net-source* after ip.lisp.  "" unless SSH build.
+(defvar *crypto-source*
+  (if *ssh-build-p*
+      (concatenate 'string
+        (%rpi-net-text "crypto.lisp")        (string #\Newline)
+        (%rpi-net-text "crypto-fast.lisp")   (string #\Newline))
+      ""))
+
+;; Actor/SSH address map for the CL host image's memory layout.  The legacy
+;; block (arch-raspi3b) sits at 0x0200_0000/0x0600_0000, which lands INSIDE this
+;; 58 MB image and would corrupt code; shift +0x10000000 (the same shift
+;; arch-rpi-cl applied to the net block → 0x1100_0000).  All in Normal-WB RAM
+;; per boot-rpi-cl's page table (0x11200000-0x3EFFFFFF is Normal-WB; the USB DMA
+;; window 0x11000000-0x111FFFFF is Device — actor code must NOT run there).
+;; arch-rpi-cl does NOT define these, so there is no last-defun-wins conflict.
+(defvar *ssh-addr-map-source*
+  (if *ssh-build-p*
+      "
+(defun percpu-data-base ()   #x12000000)
+(defun sched-lock-addr ()    #x12000200)
+(defun actor-table-base ()   #x12010000)
+(defun sched-state-base ()   #x12012000)
+(defun scratch-addr ()       #x12012050)
+(defun decode-ptr-addr ()    #x12012058)
+(defun actor-stack-base ()   #x12020000)
+(defun mailbox-pool-base ()  #x12420000)
+(defun mailbox-pool-limit () #x12440000)
+(defun pool-state-base ()    #x12440000)
+(defun staging-base-addr ()  #x12500000)
+(defun actor-heap-base ()    #x16000000)
+;; SSH CPU-side scratch MUST be Normal-WB, not the Device USB-DMA window: the
+;; SSH stack does UNALIGNED u32 stores into e1000-state (ssh-init-strings @
+;; +0x1000, crypto @ +0x680) and ssh-ipc, which Device-nGnRnE memory faults
+;; (ESR alignment). arch-rpi-cl puts these at 0x1106/8/11_0000 (inside the 2 MB
+;; Device block). Relocate to Normal-WB 0x1300_0000; the DMA buffers
+;; (usb-dma/e1000-rx/tx-buf/desc, cdc-rx = e1000-rx-buf-base) STAY in the Device
+;; window — they are separate addresses and not referenced off e1000-state.
+(defun e1000-state-base ()   #x13000000)
+(defun ssh-conn-base ()      #x13010000)
+(defun ssh-ipc-base ()       #x13100000)
+"
+      ""))
+
+;; SSH transport: address map + actor scheduler + net-actor + SSH server.
+;; actors-net-overrides.lisp comes AFTER ip.lisp (which also defines
+;; net-actor-main) so its actor-aware version wins under last-defun-wins.
+;; NOTE (staged, not yet functional): actor-spawn/nfn-lookup are native-fn-addr
+;; stubs in the arch adapters; running net-actor-main as a CL/mvm-eval function
+;; needs them rewired to the CL fn-table — live-REPL work once the NIC is up.
+;; aarch64-overrides.lisp is deliberately OMITTED (its reader conflicts with the
+;; CL reader); the SSH channel→eval wiring is part of that same live work.
+;; SINGLE-THREADED SSH (no actor scheduler): aarch64-overrides.lisp provides the
+;; inline net-accept-connection -> ssh-connection-handler -> ssh-handle-connection
+;; path (sidesteps the actor context-switch), the capture-aware write-byte SSH
+;; output routing needs, and the crypto helpers (pre-compute-server-eph /
+;; -host-sign, ed25519-sign-fast, ssh-random, usb-keepalive).  It loads AFTER
+;; ssh.lisp so its single-threaded defuns win under last-defun-wins.  actors.lisp
+;; is kept only so ssh.lisp's actor-spawn reference resolves; net-actor-main (the
+;; poll loop) comes from ip.lisp and yields as a no-op when the actor system is
+;; uninitialised, so calling it directly IS the single-threaded server.
+;; Its native-eval = (eval-sexp ...) is the DELETED tree-walker; override it with
+;; the CL image's production eval so the SSH shell evaluates via mvm-eval.
+(defvar *ssh-transport-source*
+  (if *ssh-build-p*
+      (concatenate 'string
+        *ssh-addr-map-source*                     (string #\Newline)
+        (%rpi-net-text "actors.lisp")             (string #\Newline)
+        (%rpi-net-text "ssh.lisp")                (string #\Newline)
+        (%rpi-net-text "aarch64-overrides.lisp")  (string #\Newline)
+        "(defun native-eval (form) (eval form))"  (string #\Newline)
+        ;; ssh-handle-connection fix + trace live in net/aarch64-overrides.lisp.
+        ;; FIX: single-threaded server handles ONE connection at a time.  Guard
+        ;; against RE-ENTRANT net-accept-connection: while inside a connection
+        ;; (flag ssh-ipc+0x60450 = 1), a reconnect SYN must NOT spawn a nested
+        ;; accept — that crosses the per-conn receive buffers (the client's KEXINIT
+        ;; ends up unread while a nested handler reads a fresh version).  Data
+        ;; segments (non-SYN) still deliver to the active connection.
+        "(defun net-handle-tcp (buf pkt-len)
+  (let ((src-ip (buf-read-u32-mem buf 26))
+        (src-port (buf-read-u16-mem buf 34))
+        (dst-port (buf-read-u16-mem buf 36))
+        (tcp-flags (mem-ref (+ buf 47) :u8)))
+    (if (eq (logand tcp-flags #x12) #x02)
+        (when (zerop (mem-ref (+ (ssh-ipc-base) #x60450) :u32))
+          (when (eq dst-port (mem-ref (+ (ssh-ipc-base) #x60438) :u32))
+            (setf (mem-ref (+ (ssh-ipc-base) #x60450) :u32) 1)
+            (net-accept-connection src-ip src-port dst-port buf)
+            (setf (mem-ref (+ (ssh-ipc-base) #x60450) :u32) 0)))
+        (let ((conn (net-find-connection src-ip src-port dst-port)))
+          (when (not (= conn (- 0 1)))
+            (net-deliver-data conn buf pkt-len tcp-flags))))))"
+        (string #\Newline)
+        ;; CL-native exec path: the shared ssh-do-eval-expr (aarch64-overrides)
+        ;; calls eval-sexp (the DELETED tree-walker) + buf-read-list (the legacy
+        ;; repl-source reader) — neither exists in this image, so exec produced
+        ;; no output.  Route the command through the REAL CL stack instead:
+        ;; read-from-string -> eval (eval2) -> prin1-to-string -> channel data.
+        "(defun ssh-eval-line (ssh cmd cmd-len)
+  (let ((s (make-string cmd-len)))
+    (dotimes (i cmd-len) (aset s i (code-char (aref cmd i))))
+    (let ((result (eval (read-from-string s))))
+      (let ((rs (prin1-to-string result)))
+        (let ((rl (length rs)))
+          (let ((arr (make-array (+ rl 3))))
+            (aset arr 0 61) (aset arr 1 32)
+            (dotimes (i rl) (aset arr (+ 2 i) (char-code (aref rs i))))
+            (aset arr (+ 2 rl) 10)
+            (ssh-send-string ssh arr (+ rl 3))))))))"
+        (string #\Newline)
+        ;; One-shot single-threaded SSH bring-up: zero the Normal-WB scratch
+        ;; (uninitialised DRAM on real HW), adopt the NIC, static IP 10.0.0.2,
+        ;; register listen port 22, crypto pre-compute, actor/mailbox init, then
+        ;; the synchronous poll loop.  Called from the REPL; net-actor-main
+        ;; blocks, serving inline (net-accept-connection -> ssh-handle-connection).
+        "(defun ssh-boot ()
+  (let ((s (e1000-state-base))) (dotimes (i 1024) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
+  (let ((s (ssh-ipc-base))) (dotimes (i 76800) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
+  (let ((s (ssh-conn-base))) (dotimes (i 8192) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
+  (e1000-probe)
+  (setf (mem-ref (+ (e1000-state-base) 24) :u32) 33554442)
+  (setf (mem-ref (+ (e1000-state-base) 28) :u32) 16777226)
+  (setf (mem-ref (+ (ssh-ipc-base) #x60438) :u32) 22)
+  (ssh-seed-random)
+  (ssh-init-strings)
+  (ssh-use-default-key)
+  (pre-compute-host-sign)
+  (pre-compute-server-eph (conn-ssh 0))
+  (smp-init)
+  (actor-init)
+  (write-string-serial \"NETUP\") (write-char-serial 10)
+  (net-actor-main))"
+        (string #\Newline))
+      ""))
+
 (defvar *net-source*
   (if *net-build-p*
       (concatenate 'string
@@ -404,6 +553,11 @@
         ;; driven in vendor config 1 with an explicit RX enable.
         (%rpi-net-text "r8152.lisp")         (string #\Newline)
         (%rpi-net-text "ip.lisp")            (string #\Newline)
+        ;; MODUS_SSH_BUILD=1 folds crypto + the SSH transport here (after ip.lisp
+        ;; so ssh-seed-random sees the NIC state and net-actor-main overrides
+        ;; ip.lisp's); both "" otherwise.
+        *crypto-source*
+        *ssh-transport-source*
         (%rpi-net-text "http-client.lisp")   (string #\Newline)
         ;; Bigger HTTP response buffer.  The stock http-fetch-impl caps a
         ;; response at 4096 bytes and tcp-rx-copy bounds its copy to 4096 — too

@@ -591,21 +591,32 @@
           (tcp-data-off (ash (logand (mem-ref (+ buf 46) :u8) #xF0) -2)))
       (let ((data-len (- ip-total (+ 20 tcp-data-off))))
         (when (> data-len 0)
-          ;; Copy data BEFORE sending ACK — the ACK triggers DWC2 MMIO which
-          ;; can cause QEMU to complete a pending bulk IN transfer on another
-          ;; channel, overwriting the receive buffer while we're still reading it.
+          ;; TCP reassembly: only APPEND an IN-ORDER segment (their-seq matches
+          ;; the next byte we expect, tracked at cb+0x014).  A duplicate
+          ;; (their-seq < expected, e.g. a retransmit provoked by our SYN-ACK
+          ;; retransmit) or an out-of-order segment must NOT be appended — else
+          ;; the recv buffer gets a duplicate version/KEXINIT and the reader
+          ;; mis-parses.  In both non-matching cases just re-ACK the expected
+          ;; seq so the client resends the right bytes.
           (let ((their-seq (buf-read-u32-mem buf 38))
-                (buf-len (mem-ref (+ ssh #x6D4) :u32))
-                (data-start (+ (+ (+ buf 14) 20) tcp-data-off)))
-            (let ((i 0))
-              (loop
-                (when (>= i data-len) (return 0))
-                (setf (mem-ref (+ (+ (+ ssh #x6D8) buf-len) i) :u8)
-                      (mem-ref (+ data-start i) :u8))
-                (setq i (+ i 1))))
-            (setf (mem-ref (+ ssh #x6D4) :u32) (+ buf-len data-len))
-            (setf (mem-ref (+ cb #x014) :u32) (+ their-seq data-len))
-            (tcp-ack-conn cb)))))))
+                (expected (mem-ref (+ cb #x014) :u32)))
+            (if (eq their-seq expected)
+                ;; Copy data BEFORE sending ACK — the ACK triggers DWC2 MMIO
+                ;; which can complete a pending bulk-IN on another channel,
+                ;; overwriting the receive buffer while we still read it.
+                (let ((buf-len (mem-ref (+ ssh #x6D4) :u32))
+                      (data-start (+ (+ (+ buf 14) 20) tcp-data-off)))
+                  (let ((i 0))
+                    (loop
+                      (when (>= i data-len) (return 0))
+                      (setf (mem-ref (+ (+ (+ ssh #x6D8) buf-len) i) :u8)
+                            (mem-ref (+ data-start i) :u8))
+                      (setq i (+ i 1))))
+                  (setf (mem-ref (+ ssh #x6D4) :u32) (+ buf-len data-len))
+                  (setf (mem-ref (+ cb #x014) :u32) (+ their-seq data-len))
+                  (tcp-ack-conn cb))
+                ;; Duplicate / out-of-order: re-ACK, do NOT append.
+                (tcp-ack-conn cb))))))))
 
 (defun net-wait-ack (conn)
   (let ((cb (conn-base conn))

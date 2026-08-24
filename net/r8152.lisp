@@ -1,60 +1,51 @@
-;;;; r8152.lisp - Realtek RTL8153 RX enable for CDC-ECM mode
+;;;; r8152.lisp - Realtek RTL8153 driver, ADOPT + vendor-descriptor framing
 ;;;;
-;;;; Loaded AFTER cdc-ether.lisp.  On real RTL8153 silicon (Anker hub dongle,
-;;;; 0x291A:2817 hub + 0BDA:8153 NIC) the CDC-ECM function enumerates,
-;;;; configures, reads its MAC and TRANSMITS perfectly — but never forwards a
-;;;; single received frame: the MAC-level receive path is left disabled and
-;;;; no amount of ECM-standard requests (SET_INTERFACE alt 1, packet filter,
-;;;; endpoint-halt clears) opens it.  Wire-verified with tcpdump on the far
-;;;; end: our ARP requests hit the wire and were answered in microseconds;
-;;;; the replies died inside the NIC.
+;;;; Loaded AFTER cdc-ether.lisp; overrides e1000-probe/send/receive/rx-buf.
 ;;;;
-;;;; The fix is Realtek-specific: the vendor register interface (bRequest 5,
-;;;; wIndex = MCU_TYPE_PLA 0x0100 | byte-enables) WORKS while the ECM config
-;;;; is active, so we drive the MAC's RX enable directly and keep the ECM
-;;;; data path (raw frames, no descriptors).  Every step below was bisected
-;;;; live on the board with PLA_PHYSTATUS reads between writes:
+;;;; DESIGN: on this bare-metal RPi the netboot loader (U-Boot) drives the
+;;;; SAME DWC2 host controller and the SAME RTL8153 to fetch the kernel over
+;;;; TFTP.  When Modus takes over it INHERITS that fully-working device rather
+;;;; than tearing it down: the controller is left running, the NIC enumerated
+;;;; in its vendor configuration with RX already enabled, and Modus can issue
+;;;; control/bulk transfers to it directly (verified: GET_DESCRIPTOR from the
+;;;; REPL with no dwc2-init / no enumerate / no port reset returns the device
+;;;; descriptor).  So e1000-probe does NOT dwc2-init or usb-enumerate — those
+;;;; re-configured the NIC into CDC-ECM and produced a flaky raw-frame path.
 ;;;;
-;;;;   - PLA_RCR (0xc010, dword): |= AAP|APM|AM|AB — safe as whole-dword RMW.
-;;;;   - PLA_CR (0xe813, byte lane 3 of dword 0xe810): |= RE|TE — must be
-;;;;     bracketed by the PLA_CRWECR (0xe81c) unlock: 0xC0 before, 0x00
-;;;;     after.  Verified stuck by read-back (RE|TE = 0x0C).
-;;;;   - PLA_MISC_1 (0xe85a, word at lanes 2-3 of dword 0xe858): clear
-;;;;     RXDY_GATED_EN (0x0008).  THE TRAP: a whole-dword RMW of 0xe858
-;;;;     WEDGES THE DEVICE (vendor interface dies, TX dies) even when the
-;;;;     neighbour bytes are written back with their read values — the write
-;;;;     MUST be word-granular via byte-enables (0x33 << 2 -> wIndex 0x01CC),
-;;;;     exactly as Linux's ocp_write_word does.  With the proper enables the
-;;;;     un-gate lands cleanly and is the final step that opens RX.
+;;;; The earlier CDC-ECM approach (drive the MAC RX-enable registers by hand
+;;;; and send/receive RAW ethernet frames) pinged but dropped ~half its
+;;;; frames — the chip was in ECM mode while we poked its vendor registers, a
+;;;; hybrid it only half-supports.  This driver instead matches U-Boot's
+;;;; r8152: use the VENDOR framing the RTL8153 actually expects —
+;;;;   TX: an 8-byte tx_desc {opts1 = len | TX_FS(1<<31) | TX_LS(1<<30);
+;;;;       opts2 = 0} followed by the frame.
+;;;;   RX: each bulk-IN payload is one or more frames, each prefixed by a
+;;;;       24-byte rx_desc; frame length = opts1 & 0x7FFF, minus the 4-byte
+;;;;       CRC; payload starts 24 bytes in.
+;;;; (We take the first frame per bulk transfer; a ring parser for aggregated
+;;;; frames is a follow-up.)
 ;;;;
-;;;; Config note: the "vendor" config 1 on this dongle personality is a trap —
-;;;; vendor register access DIES when it is selected (and enumerating into it
-;;;; gives no working registers either).  Stay in ECM (config-descriptor
-;;;; index 1, the usb-hub-config-index default).
-;;;;
-;;;; What is NOT here, deliberately: the FMC packet-filter-MCU toggle and the
-;;;; full U-Boot r8153_init — unnecessary per the live bisect; the NIC
-;;;; arrives from the loader/firmware with everything else in order.
+;;;; The RTL8153's USB address is assigned by U-Boot and SHUFFLES per boot
+;;;; (seen at 3 and 5), so e1000-probe SCANS for VID 0x0BDA PID 0x8153 rather
+;;;; than hard-coding it.  Endpoints are fixed by the vendor config: bulk-IN
+;;;; ep1, bulk-OUT ep2, interrupt-IN ep3, all mps 512.
 
 ;; ============================================================
-;; Vendor register access (MCU_TYPE_PLA)
+;; Vendor register access (MCU_TYPE_PLA) — used for the MAC read and an
+;; optional RX-enable safety net.  bRequest 5, bmRequestType 0xC0 read /
+;; 0x40 write, wValue = register addr, wIndex = MCU_TYPE_PLA (0x0100) |
+;; byte-enables.
 ;; ============================================================
 
-(defun r8152-reg-scratch ()
-  ;; A dword scratch inside the USB DMA window, clear of the setup buffer
-  ;; (+0x000), data buffer (+0x40..+0x240) and usb-state (+0x800).
-  (+ (usb-dma-base) #x400))
+(defun r8152-reg-scratch () (+ (usb-dma-base) #x400))
 
 (defun r8152-read-dword-once (addr)
-  ;; One PLA dword read.  Returns the 32-bit value, or -1 on transfer failure.
   (let ((r (usb-control-transfer (usb-dev-addr) #xC0 5 addr #x0100
                                  (r8152-reg-scratch) 4)))
     (if (<= r 0) -1 (mem-ref (r8152-reg-scratch) :u32))))
 
 (defun r8152-read-dword (addr)
-  ;; #275: vendor control transfers on this DWC2+RTL8153 are FLAKY — an
-  ;; occasional -1 that clears on retry.  Retry a failed read up to 5x with a
-  ;; short settle so a single transient glitch does not fail the whole enable.
+  ;; Vendor control transfers occasionally glitch (-1); retry a few times.
   (let ((i 0) (v -1))
     (loop
       (when (or (>= v 0) (>= i 5)) (return v))
@@ -63,49 +54,8 @@
       (setq i (+ i 1)))
     v))
 
-(defun r8152-write-dword (addr val)
-  ;; Whole-dword write (BYTE_EN_DWORD).  Safe only for registers whose
-  ;; aligned dword has no write-sensitive neighbours (RCR, MAR).
-  (setf (mem-ref (r8152-reg-scratch) :u32) val)
-  (usb-control-transfer (usb-dev-addr) #x40 5 addr #x01FF
-                        (r8152-reg-scratch) 4))
-
-(defun r8152-rmw-dword (addr set clear)
-  ;; new = (old & ~clear) | set on a PLA dword.  Returns 1/0.
-  (let ((old (r8152-read-dword addr)))
-    (if (< old 0)
-        0
-        (let ((r (r8152-write-dword addr
-                                    (logior (logand old (logxor clear #xFFFFFFFF))
-                                            set))))
-          (if (> r 0) 1 0)))))
-
-(defun r8152-phystatus ()
-  ;; PLA_PHYSTATUS byte (link bit 0x02).  0xFF/255 = vendor access dead.
-  (logand (r8152-read-dword #xe908) #xFF))
-
-;; ============================================================
-;; The RX enable (order and byte-enables are wire-bisected — see header)
-;; ============================================================
-
-(defun r8152-ungate-rxdy ()
-  ;; Clear RXDY_GATED_EN in PLA_MISC_1 with a WORD-granular write
-  ;; (byte-enables 0x33 << 2 for lanes 2-3 of dword 0xe858).  A dword write
-  ;; here bricks the vendor interface AND the data path until re-enumeration.
-  (let ((old (r8152-read-dword #xe858)))
-    (if (< old 0)
-        0
-        (progn
-          (setf (mem-ref (r8152-reg-scratch) :u32)
-                (logand old #xFFF7FFFF))
-          (let ((r (usb-control-transfer (usb-dev-addr) #x40 5 #xe858 #x01CC
-                                         (r8152-reg-scratch) 4)))
-            (if (> r 0) 1 0))))))
-
 (defun r8152-rx-ok ()
-  ;; RX is enabled iff PLA_CR shows RE|TE (byte lane 3 of dword 0xe810), the
-  ;; RCR accept bits are set (0xc010) AND RXDY_GATED_EN is clear in PLA_MISC_1
-  ;; (bit 19 of dword 0xe858).
+  ;; RX enabled iff PLA_CR RE|TE set, PLA_RCR accept bits set, RXDY ungated.
   (let ((cr (r8152-read-dword #xe810))
         (rc (r8152-read-dword #xc010))
         (m1 (r8152-read-dword #xe858)))
@@ -115,74 +65,135 @@
              (= (logand m1 #x80000) 0))
         1 0)))
 
-;; Both confirm-helpers are defined BEFORE r8152-rx-enable that calls them —
-;; a forward call can compile to a silent NIL sentinel on the MVM (CLAUDE.md
-;; limitation #1 / #215), which would make the enable a no-op.
-(defun r8152-set-bits-confirm (addr set)
-  ;; RMW-set SET in the dword at ADDR, read back, retry up to 4x (50ms) until
-  ;; the bits stick.  Safe only for non-config-gated registers (RCR here).
-  (let ((i 0) (ok 0))
-    (loop
-      (when (or (> ok 0) (>= i 4)) (return ok))
-      (r8152-rmw-dword addr set 0)
-      (dwc2-delay-ms 50)
-      (let ((v (r8152-read-dword addr)))
-        (when (and (>= v 0) (= (logand v set) set)) (setq ok 1)))
-      (setq i (+ i 1)))
-    ok))
+;; ============================================================
+;; Adopt: find the RTL8153 among U-Boot's already-enumerated devices
+;; ============================================================
 
-(defun r8152-ungate-confirm ()
-  ;; Clear RXDY_GATED_EN (word-granular via r8152-ungate-rxdy), read back,
-  ;; retry up to 4x (50ms) until the gate bit is clear.
-  (let ((i 0) (ok 0))
-    (loop
-      (when (or (> ok 0) (>= i 4)) (return ok))
-      (r8152-ungate-rxdy)
-      (dwc2-delay-ms 50)
-      (let ((v (r8152-read-dword #xe858)))
-        (when (and (>= v 0) (= (logand v #x80000) 0)) (setq ok 1)))
-      (setq i (+ i 1)))
-    ok))
+(defun r8152-is-8153 (buf)
+  ;; buf holds an 18-byte device descriptor; VID 0x0BDA PID 0x8153 at 8..11.
+  (and (eq (usb-desc-byte buf 8) #xDA) (eq (usb-desc-byte buf 9) #x0B)
+       (eq (usb-desc-byte buf 10) #x53) (eq (usb-desc-byte buf 11) #x81)))
 
-(defun r8152-rx-enable ()
-  ;; MINIMAL + IDEMPOTENT.  Root-caused on a Pi Zero 2 W by reading the
-  ;; registers back over the REPL:
-  ;;   * U-Boot (which used this NIC for its own TFTP) leaves PLA_CR with
-  ;;     RE|TE ALREADY SET, and that survives Modus's port reset — so we must
-  ;;     NOT touch PLA_CR or its CRWECR config-write unlock.  Re-writing
-  ;;     PLA_CR under the unlock is exactly what wedged the chip (PHYSTATUS
-  ;;     0xFF, vendor interface dead) in every earlier attempt.
-  ;;   * What U-Boot leaves WRONG for us is two "safe" (non-config-gated)
-  ;;     registers: PLA_RCR accept bits are clear (so every frame is filtered
-  ;;     out) and RXDY_GATED_EN is set (so the RX path is gated off).
-  ;; So the whole enable is two idempotent writes — RCR accept + RXDY ungate
-  ;; — each written then READ BACK, retrying only that one write on a flaky
-  ;; -1 (vendor transfers occasionally glitch; see r8152-read-dword).  No
-  ;; whole-sequence retry (that collides and wedges), no PLA_CR, no CRWECR.
-  ;; RCR = APM|AM|AB (0x0E), matching Linux rtl8152_set_rx_mode (NOT AAP/
-  ;; promiscuous).
-  (r8152-set-bits-confirm #xc010 #x0E)     ; RCR accept perfect|multi|broadcast
-  (r8152-ungate-confirm)                    ; clear RXDY_GATED_EN (word-granular)
-  (r8152-rx-ok))
+(defun r8152-find-addr ()
+  ;; Scan USB addresses 2..7 for the RTL8153.  Returns the address, or 0.
+  (let ((a 2) (found 0) (dbuf (usb-data-buf)))
+    (loop
+      (when (or (> found 0) (> a 7)) (return found))
+      (let ((r (usb-get-descriptor a 1 0 dbuf 18)))
+        (when (and (> r 0) (r8152-is-8153 dbuf)) (setq found a)))
+      (setq a (+ a 1)))
+    found))
+
+(defun r8152-read-mac (state)
+  ;; MAC from PLA_IDR (0xc000, 6 bytes) into state+0x08..0x0D.
+  (let ((lo (r8152-read-dword #xc000)) (hi (r8152-read-dword #xc004)))
+    (when (and (>= lo 0) (>= hi 0))
+      (setf (mem-ref (+ state #x08) :u8) (logand lo #xFF))
+      (setf (mem-ref (+ state #x09) :u8) (logand (ash lo -8) #xFF))
+      (setf (mem-ref (+ state #x0A) :u8) (logand (ash lo -16) #xFF))
+      (setf (mem-ref (+ state #x0B) :u8) (logand (ash lo -24) #xFF))
+      (setf (mem-ref (+ state #x0C) :u8) (logand hi #xFF))
+      (setf (mem-ref (+ state #x0D) :u8) (logand (ash hi -8) #xFF)))))
+
+;; RXDY ungate (word-granular, byte-enables 0x33<<2 -> wIndex 0x01CC).
+(defun r8152-ungate-rxdy ()
+  (let ((old (r8152-read-dword #xe858)))
+    (if (< old 0) 0
+        (progn
+          (setf (mem-ref (r8152-reg-scratch) :u32) (logand old #xFFF7FFFF))
+          (let ((r (usb-control-transfer (usb-dev-addr) #x40 5 #xe858 #x01CC
+                                         (r8152-reg-scratch) 4)))
+            (if (> r 0) 1 0))))))
+
+;; Set the PLA_RCR accept bits (whole-dword write, wIndex = PLA | 0xFF).
+;; U-Boot leaves RCR clear, so the NIC filters every frame until we set
+;; APM|AM|AB (0x0E, non-promiscuous, matching Linux rtl8152_set_rx_mode).
+(defun r8152-set-rcr ()
+  (let ((old (r8152-read-dword #xc010)))
+    (if (< old 0) 0
+        (progn
+          (setf (mem-ref (r8152-reg-scratch) :u32) (logior old #x0E))
+          (let ((r (usb-control-transfer (usb-dev-addr) #x40 5 #xc010 #x01FF
+                                         (r8152-reg-scratch) 4)))
+            (if (> r 0) 1 0))))))
 
 ;; ============================================================
-;; Probe override: CDC-ECM bring-up + Realtek RX enable
+;; Probe: adopt U-Boot's running device (no init, no enumerate)
 ;; ============================================================
 
 (defun e1000-probe ()
-  ;; cdc-ether-init does the whole USB bring-up (hub enumeration into the
-  ;; ECM config, alt-setting 1, MAC from the ECM iMACAddress string, state
-  ;; init) and arms the persistent bulk-IN; then the Realtek RX enable opens
-  ;; the receive path and the channel is re-armed clean.  ECM framing is raw
-  ;; ethernet, so cdc-ether's e1000-send/e1000-receive/e1000-rx-buf are used
-  ;; unchanged.
-  (let ((r (cdc-ether-init)))
-    (if (zerop r)
-        0
-        (progn
-          (r8152-rx-enable)
-          (dwc2-halt-channel 1)
+  (let ((addr (r8152-find-addr)))
+    (if (zerop addr)
+        (progn (write-string-serial "R8152:NOTFOUND") (write-char-serial 10) 0)
+        (let ((state (e1000-state-base)))
+          (usb-set-dev-addr addr)
+          (usb-set-bulk-in-ep 1)
+          (usb-set-bulk-out-ep 2)
+          (usb-set-bulk-in-mps 512)
+          (usb-set-bulk-out-mps 512)
           (usb-set-bulk-in-toggle 0)
-          (dwc2-start-bulk-in 1 (usb-dev-addr) (usb-bulk-in-ep)
-                              (cdc-rx-buf-addr) 2048 (usb-bulk-in-mps))
+          (usb-set-bulk-out-toggle 0)
+          (r8152-read-mac state)
+          (setf (mem-ref (+ state #x10) :u32) 0)   ; RX cursor
+          (setf (mem-ref (+ state #x14) :u32) 0)   ; TX cursor
+          (setf (mem-ref (+ state #x44) :u32) 0)   ; RX pkt len
+          (setf (mem-ref (+ state #x18) :u32) #x0F02000A)  ; 10.0.2.15 (DHCP overwrites)
+          (setf (mem-ref (+ state #x1C) :u32) #x0202000A)  ; 10.0.2.2
+          ;; U-Boot leaves PLA_CR RE|TE set (survives handoff) but RCR clear
+          ;; and RXDY gated.  Set the two idempotent "safe" registers — RCR
+          ;; accept bits and the RXDY ungate — matching the proven enable.
+          ;; No PLA_CR / CRWECR (RE|TE already set; touching it wedges).
+          (r8152-set-rcr)
+          (r8152-ungate-rxdy)
+          ;; Print MAC + addr for diagnostics.
+          (write-string-serial "R8152:A") (print-dec addr)
+          (write-string-serial " MAC:")
+          (print-hex-byte (mem-ref (+ state #x08) :u8)) (write-char-serial 58)
+          (print-hex-byte (mem-ref (+ state #x0D) :u8)) (write-char-serial 10)
+          ;; Arm the persistent bulk-IN (vendor RX: rx_desc + frame + CRC).
+          (dwc2-start-bulk-in 1 addr 1 (cdc-rx-buf-addr) 2048 512)
           1))))
+
+;; ============================================================
+;; NIC interface — vendor descriptor framing
+;; ============================================================
+
+(defun e1000-send (buf len)
+  ;; 8-byte tx_desc {len | TX_FS(1<<31) | TX_LS(1<<30), 0} then the frame.
+  (let ((tx (e1000-tx-buf-base)))
+    (setf (mem-ref tx :u32) (logior len #xC0000000))
+    (setf (mem-ref (+ tx 4) :u32) 0)
+    (let ((i 0))
+      (loop (when (>= i len) (return nil))
+        (setf (mem-ref (+ tx 8 i) :u8) (aref buf i))
+        (setq i (+ i 1))))
+    (let ((r (dwc2-bulk-transfer 2 (usb-dev-addr) (usb-bulk-out-ep)
+                                 0 tx (+ len 8) (usb-bulk-out-mps))))
+      (if (eq r 1) 1 0))))
+
+(defun e1000-rx-buf () (+ (cdc-rx-buf-addr) 24))   ; skip the 24-byte rx_desc
+
+(defun e1000-receive ()
+  ;; DEFERRED RE-ARM (state+0x48 = rearm-pending): the old code re-armed the
+  ;; next bulk-IN into the SAME single rx buffer immediately on completion —
+  ;; before the caller copied the frame out.  Back-to-back TCP segments then
+  ;; DMA-overwrote the buffer MID-COPY (client KEXINIT cookie bytes replaced
+  ;; by later payload text -> wrong I_C -> wrong exchange hash -> OpenSSH
+  ;; "incorrect signature").  Re-arming at the START of the NEXT call keeps
+  ;; the buffer stable across the caller's whole copy window; USB flow
+  ;; control makes it loss-free (un-armed endpoint NAKs, the RTL8153 holds
+  ;; frames in its internal FIFO).
+  (when (not (zerop (mem-ref (+ (e1000-state-base) #x48) :u32)))
+    (setf (mem-ref (+ (e1000-state-base) #x48) :u32) 0)
+    (dwc2-start-bulk-in 1 (usb-dev-addr) (usb-bulk-in-ep)
+                        (cdc-rx-buf-addr) 2048 (usb-bulk-in-mps)))
+  (let ((result (dwc2-poll-bulk-in 1)))
+    (if (zerop result)
+        0
+        (let ((plen (if (eq result 1)
+                        (- (logand (mem-ref (cdc-rx-buf-addr) :u32) #x7FFF) 4)
+                        0)))
+          (setf (mem-ref (+ (e1000-state-base) #x48) :u32) 1)
+          (if (and (> plen 0) (< plen 1600))
+              (progn (setf (mem-ref (+ (e1000-state-base) #x44) :u32) plen) plen)
+              0)))))

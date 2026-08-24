@@ -1900,6 +1900,46 @@ remote party.  glass reads a protocol with fixed message types and interns
 nothing from it (its 21 fresh interns are all warm-up, and they stop), so
 nothing here does it today.
 
+### `MEM-REF` HALVES ON READ — and it broke a fix that had passed its own test
+
+    (setf (mem-ref (+ b 5) :u8)  104)   ->  (mem-ref (+ b 5) :u8)  = 52
+    (setf (mem-ref (+ b 1) :u32) 5)     ->  (mem-ref (+ b 1) :u32) = 2
+
+Not just `:u64`, and not just `%GC-COUNT`: the tagged-fixnum shift applies to
+the NARROW widths too, so **`MEM-REF` reads back half of what was stored** at
+`:u8` and `:u32`.  A fresh `%MMAP-SHARED-PAGE` makes it worse — there `:u8`
+reads **0** while `%GC-READ64` reads the same bytes correctly, which is what
+made a round-trip harness fail on `CONS`, a path that had not been touched, and
+sent a whole diagnostic down the wrong hole.
+
+**READ NARROW FIELDS WITH `%GC-READ64` AND MASK.**  `(logand (%gc-read64 a) 255)`.
+
+**IT CONDEMNED A COMMITTED FIX, AND THE TEST DID NOT CATCH IT.**  The TERM-ENCODE
+change that made symbols go by name and strings by value (9f1a577) wrote its
+payload with `(setf (mem-ref … :u8) (char-code …))` and was **reverted in
+6a578a3** because the bytes cannot be read back:
+
+    "hello"  round-tripped to  "     "     (right length, wrong content)
+    a symbol round-tripped to  NIL
+
+The test that passed it — `test/hosted-term-encode-syms.lisp` — checked the TAG
+and the BYTE COUNT and not the CONTENT, so it went green on an encoder that
+destroys its payload.  That is the same weak-instrument failure this file warns
+about twice already, committed anyway.  **A serialiser test that does not
+round-trip is not a serialiser test.**
+
+The revert is the honest state: symbols and strings still cross the actor
+boundary BY POINTER (the soundness bug stands, `test/hosted-term-encode-syms.lisp`
+still fails), which is worse in theory but works in practice, where the fix
+silently corrupted every string and symbol in an actor message — on a path no
+test in the bar covers, because nothing in the bar sends one.
+
+WHEN IT IS REDONE: use `%GC-WRITE64`/`%GC-READ64` with masking and shifts for
+the payload bytes, and make the test assert the DECODED VALUE — `(equal (rt "hello") "hello")`,
+`(eq (rt sym) (intern "…"))` — through the REAL staging buffer
+(`(staging-base-addr)`, after `%HA-ACTORS-BRINGUP`), not a private mmap page.
+That harness works; it is what produced the numbers above.
+
 **A TRAP THIS COST A CYCLE ON: `SYS-EXIT` FROM INSIDE A NESTED `LET*`/`IF` IN A
 `--script` DOES NOT TAKE EFFECT.**  The process ran to the end of the file and
 exited **0** while the verdict line above it said FAIL — and every runner reads

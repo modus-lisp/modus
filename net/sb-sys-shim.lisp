@@ -346,9 +346,20 @@
    ;; SLOT NAMES SOCK-TYPE / SOCK-PROTOCOL AND NOT TYPE / PROTOCOL: `:type' is
    ;; also a DEFCLASS slot OPTION, and a slot whose name collides with an option
    ;; keyword is the kind of thing that reads correctly and parses differently.
+   ;;
+   ;; THE INITARGS ARE :TYPE AND :PROTOCOL, WHICH ARE NOT THE SLOT NAMES, and
+   ;; that is the entire point.  A slot's initarg is independent of its name,
+   ;; and the initarg is not ours to choose: `sb-bsd-sockets' spells it :TYPE,
+   ;; every caller in the world writes
+   ;;     (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)
+   ;; and glass writes it five times (src/socket.lisp:280,300,332,513,514).
+   ;; The first draft named the initargs after the slots, so every one of those
+   ;; five call sites died with `invalid initarg' at the first socket a real
+   ;; program opened — the shim was portable-SHAPED in its arguments and
+   ;; shim-shaped in its initargs, which is the same mistake one level down.
    (family :initarg :family :initform 2 :accessor %socket-family)
-   (sock-type :initarg :sock-type :initform :stream :accessor %socket-type)
-   (sock-protocol :initarg :sock-protocol :initform :tcp
+   (sock-type :initarg :type :initform :stream :accessor %socket-type)
+   (sock-protocol :initarg :protocol :initform :tcp
                   :accessor %socket-protocol)))
 
 (defclass sb-bsd-sockets:inet-socket (sb-bsd-sockets:socket) ())
@@ -363,13 +374,12 @@
         (t 2)))                                            ; AF_INET
 
 (defun %socket-fd (socket)
-  "The descriptor, opening it on first use.
+  "The descriptor, opening it if it does not have one yet.
 
-   THE DESCRIPTOR IS CREATED LAZILY AND NOT IN INITIALIZE-INSTANCE, which is
-   where SBCL creates it.  The observable difference is the moment a
-   file-descriptor limit or a permission failure is reported: SBCL reports it at
-   MAKE-INSTANCE, this reports it at the first bind/connect/accessor.  It is
-   stated rather than hidden; nothing in glass depends on the earlier point."
+   IT NORMALLY HAS ONE ALREADY: INITIALIZE-INSTANCE opens it, as SBCL's does.
+   This remains the single place a descriptor is created, so a socket that
+   somehow reached here without one still gets a working one rather than
+   handing NIL to a syscall."
   (let ((fd (sb-bsd-sockets:socket-file-descriptor socket)))
     (if fd
         fd
@@ -379,6 +389,29 @@
           (if (< r 0)
               (%sock-signal r)
               (progn (setf (slot-value socket 'fd) r) r))))))
+
+(defmethod initialize-instance :after ((socket sb-bsd-sockets:socket) &rest initargs)
+  "OPEN THE DESCRIPTOR AT MAKE-INSTANCE, WHICH IS WHERE SBCL OPENS IT.
+
+   The first draft of this shim opened it lazily, at the first bind/connect, and
+   argued that nothing in glass depended on the earlier point.  That was true of
+   glass and false of the SURFACE: `(sb-bsd-sockets:socket-file-descriptor
+   sock)' on a freshly made socket answers a descriptor under SBCL and answered
+   NIL here — so any caller that reaches for the fd before binding (to set an
+   option this shim does not name, to hand it to a poll set, to log it) got NIL
+   and then handed NIL to a syscall.  A shim that is portable-SHAPED in its
+   arguments has to be portable-shaped in WHEN things happen too, wherever that
+   is observable, and this one was observable with a single accessor call.
+
+   A SOCKET MADE WITH :FD ALREADY HAS ONE — that is SOCKET-ACCEPT wrapping a
+   descriptor the kernel just handed it — so this must not open a second one and
+   leak the first.  %SOCKET-FD is exactly that test, so it is what runs here.
+
+   The cost of being faithful is that MAKE-INSTANCE can now SIGNAL (EMFILE, or
+   the INET6 refusal), which is also what SBCL's does."
+  initargs
+  (%socket-fd socket)
+  socket)
 
 ;;; ---- addresses ----------------------------------------------------------
 
@@ -434,11 +467,11 @@
            ;; classes it can be.
            (if (typep socket 'sb-bsd-sockets:local-socket)
                (make-instance 'sb-bsd-sockets:local-socket :fd r
-                              :sock-type (%socket-type socket)
-                              :sock-protocol (%socket-protocol socket))
+                              :type (%socket-type socket)
+                              :protocol (%socket-protocol socket))
                (make-instance 'sb-bsd-sockets:inet-socket :fd r
-                              :sock-type (%socket-type socket)
-                              :sock-protocol (%socket-protocol socket))))
+                              :type (%socket-type socket)
+                              :protocol (%socket-protocol socket))))
           ((= r -11) nil)                       ; EAGAIN
           (t (%sock-signal r)))))
 

@@ -75,7 +75,7 @@
 
 (format t "~%-- a listener on an EPHEMERAL loopback port -------------~%")
 (let ((listener (make-instance 'sb-bsd-sockets:inet-socket
-                               :sock-type :stream :sock-protocol :tcp)))
+                               :type :stream :protocol :tcp)))
   (chk-true "the listener is a socket" (typep listener 'sb-bsd-sockets:socket))
   (chk-true "... and an inet-socket" (typep listener 'sb-bsd-sockets:inet-socket))
   (chk-true "setf sockopt-reuse-address"
@@ -90,7 +90,7 @@
 
     ;; ---- connect to it ----
     (let ((client (make-instance 'sb-bsd-sockets:inet-socket
-                                 :sock-type :stream :sock-protocol :tcp)))
+                                 :type :stream :protocol :tcp)))
       (sb-bsd-sockets:socket-connect client #(127 0 0 1) port)
       (let ((server (sb-bsd-sockets:socket-accept listener)))
         (chk-true "socket-accept returned a socket"
@@ -201,7 +201,7 @@
 
 (format t "~%-- connecting to a port nobody is on --------------------~%")
 (chk "connection-refused-error is signalled and is a socket-error"
-     (let ((s (make-instance 'sb-bsd-sockets:inet-socket :sock-type :stream)))
+     (let ((s (make-instance 'sb-bsd-sockets:inet-socket :type :stream)))
        (handler-case (progn (sb-bsd-sockets:socket-connect s #(127 0 0 1) 1) :connected)
          (sb-bsd-sockets:connection-refused-error (c) c :refused)
          (sb-bsd-sockets:socket-error (c) c :other-socket-error)

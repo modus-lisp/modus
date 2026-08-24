@@ -1648,6 +1648,59 @@ lock-protected shared heap, or give each CPU its own non-collecting slice of
 region 0 for locked-section allocation so no two threads ever share a frontier.
 Both are carve changes and neither was attempted.
 
+### — AND THAT LEAD IS REFUTED.  DO NOT CHANGE THE CARVE.
+
+It was the most substantial thing anyone had, and it is wrong.  Three
+measurements, on a reproducer that fails **8 of 8**:
+
+* **THE HOP ALONE IS HARMLESS.**  A worker taking the runtime lock 200 000
+  times — hopping into region 0 and back — while the main thread conses
+  continuously **outside** the lock: chain intact, 0 corrupted walks, rc=0.
+  If loading a stale parked frontier were the defect, this is the shape that
+  would show it.
+* **THE POSITIVE CONTROL DOES NOT FIX IT.**  Wrapping the main thread's
+  allocation in `%RT-ENTER`/`%RT-LEAVE` by hand — so no thread can be in
+  region 0 while main advances it, which is exactly what the proposed carve
+  would buy — leaves the failure **6 of 6, unchanged**.  The control was
+  verified to be real: `%RT-ENTER` is fbound and moves the lock's acquisition
+  counter at `0x10000DE0` by one.
+* **THE MAIN THREAD IS NOT INVOLVED AT ALL.**  With `MAIN_ROUNDS=0` — main
+  allocates nothing whatever after spawning — the failure reproduces
+  identically.  A two-thread heap race that survives one thread doing nothing
+  is not a two-thread heap race.
+
+The staleness *precondition* is real but narrow, and was measured rather than
+assumed: over a loop with no explicit global read, region 0's parked frontier
+moved **19 201 920 bytes** while the loop's own conses account for 3 200 000 —
+the evaluator itself hops constantly, so the block is republished far more
+often than the mechanism needs.  (`GET-ALLOC-PTR` reads **0** from evaluated
+code and cannot be used as the live frontier in a script; the control block's
+`+0x30` field is what to read.)
+
+**WHAT IT ACTUALLY IS, narrowed to one operation.**
+`test/run-worker-intern.sh` is self-bisecting — four arms, one loop, one
+worker thread, differing only in the loop body:
+
+| arm | what it does | result |
+|---|---|---|
+| cons | conses | clean 3/3 |
+| format | `FORMAT NIL` — allocates strings | clean 3/3 |
+| intern-same | INTERNs ONE name repeatedly — takes the lock, searches the shared table | clean 3/3 |
+| **intern-fresh** | INTERNs a NEW name each time — takes the lock AND **adds** to the table | **clean 0/3**, `MVM LONGJMP (TRAP #x0511) with no active handler-case` |
+
+So it is not consing on a worker, not allocating on a worker, not taking the
+runtime lock on a worker, and not searching the shared tables from one.  What
+is left is **adding** to them.  The signature is the glass sender's, exactly.
+
+**AND IT IS LAYOUT-SENSITIVE, WHICH IS NOW A PROPERTY OF THIS WHOLE CLASS
+RATHER THAN A SURPRISE.**  Whether a given arm dies moves with the LENGTH of
+the interned names and with whether the loop body reads a global:
+`(format nil "XR-~D" i)` with a literal prefix passes 5/5 where
+`(format nil "~a~D" *pfx* i)` with the same prefix in a global fails 4/4.  A
+single clean run of any of these means "not reproduced in this shape", never
+"correct" — the same lesson the pixel-2591 story taught, and the reason the
+runner defaults to three runs per arm and reports a rate.
+
 ### THE CLOCKS ARE CLOCKS (243b265)
 
 `GET-INTERNAL-REAL-TIME` bound `T` — `(let ((t (handler-case (syscall3 201 …))))`

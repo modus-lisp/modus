@@ -431,7 +431,28 @@
   ;; emits FS-relative ones would disagree on any thread whose FS base is not
   ;; zero.  On the MAIN thread the two are the same address either way, which
   ;; is why getting this wrong would be silent.
+  ;;
+  ;; BOTH HALVES, AND ONLY ONE WAS HERE.  *X64-TLS-WINDOW* is the TRANSLATOR
+  ;; half — it emits the FS prefix when the width carries the thread-local bit.
+  ;; *TLS-WINDOW* is the COMPILER half — it is what SETS that bit, at
+  ;; %TLS-WIDTH / %MV-WIDTH, for an address it can prove lands in the window.
+  ;; With only the translator half on, the bit was never set and every
+  ;; JIT-compiled MULTIPLE-VALUE-BIND, HANDLER-CASE and UNWIND-PROTECT reached
+  ;; the MAIN THREAD's window from whatever thread it ran on.  CLAUDE.md
+  ;; recorded that as a stated boundary -- runtime EVAL on a second thread was
+  ;; never attempted anyway -- and it is attempted now, because glass is loaded at
+  ;; runtime and its RFB server is HANDLER-CASE on a worker thread.
+  ;;
+  ;; MEASURED BEFORE THE FIX, hosted x64: a JIT-compiled thread body whose
+  ;; whole content was (handler-case 222 (t (c) -1)) died reporting an
+  ;; MVM CALL-IND with a non-callable target -- an indirect call through a
+  ;; handler frame that belonged to another thread-s window.  MULTIPLE-VALUE-
+  ;; BIND and LOOP in the same position were fine, which is exactly the shape
+  ;; of a shared HANDLER-FRAME STACK rather than a shared MV buffer.
+  ;; (No quotation marks in this comment on purpose: it is INSIDE the co-init
+  ;; SOURCE STRING, so a double quote here ends the string literal.)
   (setq *x64-tls-window* t)
+  (setq *tls-window* t)
   (setq *jit-xlate-err-info* nil)
   t)
 (in-package :modus.mvm)
@@ -1192,6 +1213,16 @@
   ;; leaves Modus unrecognised, which is the pre-#237 status quo.
   ;; MODUS_NO_GENERA=1 skips it (see %install-genera-compat).
   (handler-case (%install-genera-compat) (t (c) nil))
+  ;; THE SBCL COMPATIBILITY SURFACE — SB-THREAD, SB-BSD-SOCKETS, SB-POSIX,
+  ;; SB-SYS, SB-ALIEN.  MUST come after %install-runtime-cl-macros (the source
+  ;; uses DEFCLASS / DOLIST / WHEN / UNLESS / LOOP) and BEFORE cli-toplevel, so
+  ;; that ~/.modusrc, --load, --script and --eval all see the packages BEFORE
+  ;; any form mentioning them is READ.  That ordering is not a nicety: a package
+  ;; that does not exist at read time is a READER-ERROR on the whole form, so a
+  ;; script saying `sb-thread:make-thread' does not fail at the call, it fails
+  ;; at the read.  Wrapped: a failure here must never take down a normal boot.
+  ;; MODUS_NO_SB=1 skips it.
+  (handler-case (%install-sb-shims) (t (c) nil))
   ;; RTEST — the RT regression tester package (mvm/rtest.lisp).  MUST be
   ;; created HERE, at boot, from image code: a package born at runtime is
   ;; marked runtime-born and its symbols get package-folded function-table
@@ -1277,6 +1308,62 @@
 
 (format t "  genera:  ~D chars (compat source baked for boot-time eval)~%"
         (length *genera-compat-text*))
+
+;;; ============================================================
+;;; THE SBCL COMPATIBILITY SURFACE (SB-THREAD, SB-BSD-SOCKETS, SB-POSIX,
+;;; SB-SYS, SB-ALIEN)
+;;;
+;;; net/sb-thread-shim.lisp and net/sb-sys-shim.lisp have the rationale and
+;;; the PARTIAL list.  Baked as boot-evaluated SOURCE STRINGS for the same
+;;; reason the Genera surface is, and for one more: these packages EXIST on
+;;; the host.  `(defpackage "SB-THREAD" …)' read and evaluated host-side
+;;; would collide with SBCL's own, and `(defun sb-thread:make-thread …)'
+;;; would be a package-lock violation.  Carried as a literal, nothing
+;;; host-side ever reads a form in them.
+;;;
+;;; ORDER: THREAD BEFORE SYS.  The socket shim's SOCKET-MAKE-STREAM and the
+;;; thread shim are independent, but %SB-THREADS-UP is the thing that turns
+;;; per-CPU regions on, and anything that wants a thread wants that first.
+;;;
+;;; WHY IT IS INSTALLED AT ALL, given that modus advertises :GENERA and not
+;;; :SBCL.  Because `#+sb-thread' in portable code — glass/fb's framebuffer
+;;; and clipboard locks are exactly this — is a question about a SURFACE, not
+;;; about a vendor.  With the surface present, that code takes the same arm
+;;; SBCL takes, which is the arm it is tested on.  The features pushed are
+;;; :SB-THREAD and :SB-BSD-SOCKETS and NOT :SBCL: modus is not SBCL and code
+;;; that asks whether it is still gets the right answer.
+;;;
+;;; NOTHING HERE LISTENS, CONNECTS OR STARTS A THREAD.  Installing the shim
+;;; creates packages and defines functions.  A socket is opened when a caller
+;;; makes one; a thread starts when a caller asks for one.
+;;;
+;;; ESCAPE HATCH: MODUS_NO_SB=1 skips both entirely — no packages, no
+;;; features, boot cost back to baseline.  Same reversible-flip pattern as
+;;; MODUS_NO_GENERA.
+;;; ============================================================
+
+(defvar *sb-shim-text*
+  (concatenate 'string
+               (read-file-text (merge-pathnames "net/sb-thread-shim.lisp"
+                                                *modus-base*))
+               (string #\Newline)
+               (read-file-text (merge-pathnames "net/sb-sys-shim.lisp"
+                                                *modus-base*))))
+
+(defvar *sb-shim-source*
+  (concatenate 'string "
+(defun %sb-shim-source ()
+  \"" (%escape-lisp-string *sb-shim-text*) "\")
+
+(defun %install-sb-shims ()
+  (let ((off (%cli-getenv \"MODUS_NO_SB\")))
+    (if (and off (> (length off) 0) (not (string= off \"0\")))
+        nil
+        (progn (%it-eval-source (%sb-shim-source) \"sb-shims\") t))))
+"))
+
+(format t "  sb-shim: ~D chars (sb-thread/sb-bsd-sockets source baked for boot-time eval)~%"
+        (length *sb-shim-text*))
 
 ;;; ============================================================
 ;;; ASDF INTERFACE over Modus's own loader
@@ -1642,6 +1729,16 @@
     ;; "WARN li-func: unresolved function %INSTALL-GENERA-COMPAT —
     ;; emitting NIL sentinel", i.e. a silent no-op boot hook.
     *genera-source*
+    (string #\Newline)
+    ;; THE SBCL COMPATIBILITY SURFACE.  Same placement rule and the same
+    ;; two reasons as *genera-source*: BEFORE *driver-source* because
+    ;; kernel-main calls %install-sb-shims and a forward reference across
+    ;; the blob emits a NIL sentinel (a silent no-op boot hook), and NOT in
+    ;; *all-runtime-source* because its body is one large string literal
+    ;; that the TEXTUAL scan-defuns scanner would mine for names like
+    ;; `sb-thread::make-thread' and then emit `#'sb-thread::make-thread'
+    ;; into a chunk that cannot compile.
+    *sb-shim-source*
     (string #\Newline)
     ;; ASDF interface (net/asdf-interface.lisp).  Same placement rule as
     ;; *genera-source*: BEFORE *driver-source*, because kernel-main calls

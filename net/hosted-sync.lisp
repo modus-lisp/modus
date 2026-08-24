@@ -2598,3 +2598,147 @@
               (%gc-write64 (+ res #xB8) (get-alloc-ptr)))
             (%ha-set-percpu-mode mode0)
             res))))
+
+;;; ============================================================
+;;; WHAT A PORTABLE THREAD API NEEDS THAT THE PRIMITIVES ABOVE DO NOT HAVE
+;;; ============================================================
+;;;
+;;; Two things, and both exist because the shim layer (net/sb-thread-shim.lisp)
+;;; is EVALUATED AT RUNTIME while these must be AOT: a runtime-compiled function
+;;; is fine on any thread now that the JIT marks per-thread-window accesses, but
+;;; a CELL ALLOCATOR handing out addresses that a FUTEX will be told to watch
+;;; must not itself be able to move, and a raw spin lock protecting a bump
+;;; pointer is exactly the kind of code that belongs in the image.
+;;;
+;;;   1. A TIMED CONDITION WAIT.  %COND-WAIT parks forever; sb-thread's
+;;;      CONDITION-WAIT takes :TIMEOUT and glass's sender/reader handoff passes
+;;;      1/60 of a second (src/rfb.lisp:744-753).  Without a timeout that handoff
+;;;      is a hang rather than a frame.
+;;;   2. A CELL ARENA.  A mutex is ONE MACHINE WORD AT A FIXED ADDRESS.  It
+;;;      cannot live inside a Lisp object: this collector COPIES, so the address
+;;;      a parked thread handed the kernel would be stale the moment the object
+;;;      moved, and FUTEX_WAKE would be delivered to an address nobody is
+;;;      watching.  So mutex/condvar/semaphore words come out of a raw arena and
+;;;      the Lisp object holds the ADDRESS.
+;;;
+;;;      THE ARENA IS NEVER RECLAIMED, AND THAT IS A PARTIAL IMPLEMENTATION.  A
+;;;      cell is handed out and never returned, because knowing a cell is dead
+;;;      means knowing no thread is parked on it, and nothing here knows that.
+;;;      With 4 MB of cells that is 65536 mutexes for the life of the process.
+;;;      A program that makes a mutex per connection forever will exhaust it, and
+;;;      %SYNC-CELL then answers 0 rather than handing out an address twice —
+;;;      %SYNC-CELLS-EXHAUSTED counts the refusals so the failure is visible.
+
+(defun %cond-ts (ms)
+  "This CPU's 16-byte condition-wait timespec, armed at MS milliseconds.  0 if
+   the thread page could not be mapped, which %FUTEX-WAIT-TO reads as `no
+   timeout'.  It is the SCHEDULER block's free tail at +0x68 and not %THR-TS,
+   whose 64 bytes are entirely spoken for (req, rem, clock scratch, and the
+   mutex's own 20 ms safety-net timeout at +0x30)."
+  (let ((b (%thr-sched-block (%thr-cpu))))
+    (if (zerop b)
+        0
+        (let ((p (+ b #x68))
+              (sec (truncate ms 1000)))
+          (%gc-write64 p sec)
+          (%gc-write64 (+ p 8) (* (- ms (* sec 1000)) 1000000))
+          p))))
+
+(defun %cond-wait-ms (cv mtx ms)
+  "%COND-WAIT with a deadline.  Returns 0 if it was woken (or woke spuriously)
+   and 1 if the wait expired.  MS of 0 or less means no timeout at all, i.e.
+   exactly %COND-WAIT.  MTX must be held on entry and is held on return.
+
+   SPURIOUS WAKEUPS ARE STILL PERMITTED, so 0 does not mean the predicate is
+   true; call this in a loop around the predicate, the way every caller of
+   %COND-WAIT already does."
+  (let ((seq (%gc-read64 cv))
+        (ts (if (> ms 0) (%cond-ts ms) 0)))
+    (%mutex-unlock mtx)
+    (let ((r (%futex-wait-to cv seq ts)))
+      (%mutex-lock mtx)
+      (if (= r -110) 1 0))))
+
+;;; THE ARENA.  Control words in the band at +0xC800 (band +0xC000..+0xC800 is
+;;; the N-regions selftest's result block; +0xC800..+0xD000 is otherwise unused):
+;;;   +0x00 the bump lock   +0x08 arena base   +0x10 next free
+;;;   +0x18 arena limit     +0x20 cells handed out   +0x28 refusals
+(defun %sync-cell-ctl () (+ (%ha-base) #xC800))
+(defun %sync-cell-size () 64)
+(defun %sync-arena-bytes () 4194304)
+
+(defun %sync-cells-handed-out () (%gc-read64 (+ (%sync-cell-ctl) #x20)))
+(defun %sync-cells-exhausted () (%gc-read64 (+ (%sync-cell-ctl) #x28)))
+
+(defun %sync-cell ()
+  "A 64-byte ZEROED cell at a raw address that will never move, or 0 if the
+   arena could not be mapped or is exhausted.  Cell layout, by convention of
+   the callers rather than of this function:
+     +0x00 futex mutex word   +0x08 condvar sequence word
+     +0x10 owner (cpu id + 1)  +0x18 recursion depth
+     +0x20 semaphore count     +0x28 .. +0x3F spare"
+  (let ((ctl (%sync-cell-ctl)))
+    (spin-lock ctl)
+    (let ((base (%gc-read64 (+ ctl #x08))))
+      (if (zerop base)
+          (let ((m (%mmap-shared-page (%sync-arena-bytes))))
+            (if (< m 4096)
+                (progn (spin-unlock ctl) 0)
+                (progn (%gc-write64 (+ ctl #x08) m)
+                       (%gc-write64 (+ ctl #x10) m)
+                       (%gc-write64 (+ ctl #x18) (+ m (%sync-arena-bytes)))
+                       0)))
+          0))
+    (let ((next (%gc-read64 (+ ctl #x10)))
+          (lim  (%gc-read64 (+ ctl #x18))))
+      (if (or (zerop next) (> (+ next (%sync-cell-size)) lim))
+          (progn (%gc-write64 (+ ctl #x28) (+ (%gc-read64 (+ ctl #x28)) 1))
+                 (spin-unlock ctl)
+                 0)
+          (progn
+            (%gc-write64 (+ ctl #x10) (+ next (%sync-cell-size)))
+            (%gc-write64 (+ ctl #x20) (+ (%gc-read64 (+ ctl #x20)) 1))
+            (spin-unlock ctl)
+            ;; Zeroed OUTSIDE the lock: the cell is nobody else's now.  A fresh
+            ;; MAP_ANONYMOUS page is already zero, but the arena is one mapping
+            ;; for the life of the process and this is cheap certainty.
+            (%ha-zero next (+ next (%sync-cell-size)))
+            next)))))
+
+;;; THE ALIEN SCRATCH.  sb-alien's WITH-ALIEN needs a few bytes of raw memory
+;;; per binding, per thread, that a syscall can be handed a pointer to.  256
+;;; bytes at the top of this CPU's per-CPU block, which is 16 KB of which the
+;;; actor system uses the first 64.  PER CPU and not per call: WITH-ALIEN nests
+;;; at most a few deep in glass and the shim bumps a cursor inside it.
+(defun %alien-scratch ()
+  (let ((b (%thr-percpu-base (%thr-cpu))))
+    (if (zerop b) 0 (+ b #x3F00))))
+
+;;; THE SOCKADDR SCRATCH, SEPARATE FROM MODUS'S OWN.  net/hosted-sockets-post's
+;;; %SOCK-ADDR-BUF is per-CPU and SIXTY-FOUR BYTES; a sockaddr_un is 110, so a
+;;; UNIX-socket bind built there would run into the NEXT CPU's buffer.  256
+;;; bytes at +0x3D00, below the alien scratch, and used by nothing else — so a
+;;; shim building an address cannot disturb an in-flight socket-send either.
+(defun %sockaddr-scratch ()
+  (let ((b (%thr-percpu-base (%thr-cpu))))
+    (if (zerop b) 0 (+ b #x3D00))))
+
+;;; A 256-BYTE PER-CPU BUFFER FOR STRUCTS A SYSCALL FILLS IN — struct stat is
+;;; 144 bytes.  Separate from the alien scratch because that one is a BUMP
+;;; ARENA whose cursor is only unwound by WITH-ALIEN; a function that just needs
+;;; a buffer would leak it.
+(defun %struct-scratch ()
+  (let ((b (%thr-percpu-base (%thr-cpu))))
+    (if (zerop b) 0 (+ b #x3C00))))
+
+;;; A C STRING IN PER-CPU SCRATCH.  The process-wide *CSTR-SCRATCH* is one
+;;; buffer for every thread, which is a path two threads calling stat(2) at once
+;;; both write.  256 bytes at +0x3E00; longer strings are REFUSED (0) rather
+;;; than truncated into a different filename.
+(defun %cstr-percpu (str)
+  (let ((b (%thr-percpu-base (%thr-cpu))))
+    (if (or (zerop b) (> (length str) 250))
+        0
+        (let ((a (+ b #x3E00)))
+          (%string-to-cstr str a)
+          a))))

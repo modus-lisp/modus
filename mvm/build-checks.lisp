@@ -1288,6 +1288,25 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
 ;;; oracle — so it is excluded BY NAME, not by a pattern.  Keep that list at
 ;;; three or fewer; a growing exclusion list means this check is being worked
 ;;; around rather than used.
+;;;
+;;; THE FOURTH AND FIFTH, AND WHY THEY ARE A DIFFERENT CASE ENTIRELY.
+;;; net/sb-thread-shim.lisp and net/sb-sys-shim.lisp define the SB-THREAD,
+;;; SB-BSD-SOCKETS, SB-POSIX, SB-SYS and SB-ALIEN surfaces that glass asks
+;;; modus for.  The on-demand stub trick above cannot help: those packages are
+;;; NOT missing on the host, they are SBCL'"'"'S OWN AND LOCKED, so merely READING
+;;; `sb-thread::threadp'"'"' interns into a locked package and signals
+;;;
+;;;     Lock on package SB-THREAD violated when interning THREADP
+;;;
+;;; before a single form is evaluated.  Unlocking SBCL'"'"'s packages to read a
+;;; file is a larger and worse change than excluding two files.
+;;;
+;;; WHAT COVERS THEM INSTEAD, because "excluded" must not mean "unread": both
+;;; files are read AND EVALUATED at every boot of the built image by
+;;; %INSTALL-SB-SHIMS, and test/hosted-sb-thread.lisp fails if the install did
+;;; not happen.  So the #252 class — a "quoted phrase" inside a string literal —
+;;; is caught by the image itself on the very next run, which is a stricter
+;;; reader than this sweep and the one that actually has to read them.
 (defvar *gck-parse-sweep-root*
   (and *load-truename*
        (make-pathname :directory (butlast (pathname-directory *load-truename*))
@@ -1296,7 +1315,8 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
 
 (defvar *gck-parse-sweep-dirs* '("boot" "lib" "mvm" "net" "runtime"))
 
-(defvar *gck-parse-sweep-exclusions* '("install-tarball")
+(defvar *gck-parse-sweep-exclusions*
+  '("install-tarball" "sb-thread-shim" "sb-sys-shim")
   "Pathname-names (no directory, no type) excluded from CHECK E.  See the
    FALSE POSITIVES note above; each entry needs a reason there.")
 

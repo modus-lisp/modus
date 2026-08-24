@@ -35,6 +35,10 @@ cleanup() {
   rm -rf "$WORK"
 }
 trap cleanup EXIT
+# An EXTERNAL kill is the case that leaks: without a handler the shell dies
+# without reaping, and the server keeps its listener.  Same lesson as
+# run-glass-send-worker.sh, learned the same way.
+trap 'cleanup; exit 143' TERM INT HUP
 
 sbcl --script test/glass-manifest.lisp "$GLASS/" "$CRAM/" "$WORK/manifest.lisp" || {
   echo "FAIL: could not build the manifest from the .asd files" >&2; exit 1; }

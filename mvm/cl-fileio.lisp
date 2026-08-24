@@ -194,6 +194,28 @@
     (%make-stream 9
       (cons fd (cons dir (cons 0 (cons buf (cons 0 (cons 0 (cons nil elt-type))))))))))
 
+(defun %fd-input-ready-p (fd)
+  "T when a read on FD would not block.  THE CONSERVATIVE ANSWER IS T, and this
+   is the conservative definition: a plain file always has something to read (or
+   EOF, which does not block either), and nothing in this layer can ask the
+   kernel about a socket without poll(2), which is defined three files later.
+
+   IT IS A SEAM, AND net/hosted-sockets-post.lisp OVERRIDES IT WITH A REAL
+   poll(2).  Until this existed, LISTEN on a drained SOCKET stream answered T —
+   the fd was valid, so it said yes — while poll on the same fd correctly
+   reported nothing ready.  Measured:
+
+       LISTEN-empty T   (poll says 0 ready)
+       LISTEN-data  T   (poll says 1 ready)
+
+   which makes LISTEN useless as a readiness test and silently defeats any
+   stream-level poll built on it.  A forward reference does not resolve across
+   the compiled blob, so the fix cannot be written where LISTEN is; it is
+   written here, where LISTEN can see it, and replaced later where poll can be
+   called.  Last-defun-wins is how SLEEP stops being a no-op too."
+  fd
+  t)
+
 (defun %make-file-stream ()
   "Create a closed/dummy file stream."
   (%make-stream 9 (cons -1 (cons 0 (cons 0 (cons nil (cons 0 (cons 0 (cons t (quote character))))))))))

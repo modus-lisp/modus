@@ -819,3 +819,296 @@
                     (%gc-write64 (+ c #x138) tid)
                     (%gc-write64 (+ c #x140) band)
                     c)))))))
+
+;;; ============================================================
+;;; LISTEN ON AN FD STREAM, FOR REAL
+;;; ============================================================
+;;;
+;;; mvm/cl-printer.lisp's LISTEN asks %FD-INPUT-READY-P, whose default answer
+;;; (mvm/cl-fileio.lisp) is the conservative T it has always given.  This is the
+;;; real one, and it is here because poll(2) is here.
+;;;
+;;; MEASURED BEFORE THIS: on a drained socket stream, LISTEN said T while poll on
+;;; the same fd said 0 ready — so LISTEN could not be used as a readiness test at
+;;; all, and any stream-level poll built on it would spin.  glass reaches for it
+;;; in exactly one place (src/audio-stream.lisp's drain loop), which is not on
+;;; the RFB path, but the wrongness is a bug regardless of glass.
+;;;
+;;; A ZERO-MILLISECOND poll AND NOT A NON-BLOCKING READ.  A read would have to
+;;; put the byte somewhere, and the only place is the stream's own buffer, whose
+;;; position bookkeeping LISTEN has no business touching.  poll answers the
+;;; question asked without consuming anything.
+;;;
+;;; EOF COUNTS AS READY, and that is CLHS-correct rather than a convenience: a
+;;; stream at end-of-file does not block, so LISTEN is permitted to say T and
+;;; READ-BYTE then returns the eof value.  POLLHUP (16) and POLLERR (8) are
+;;; therefore ready as much as POLLIN (1) is.
+;;; IT USES ITS OWN 8 BYTES AND NOT THE SERVER'S POLLFD ARRAY.  The obvious
+;;; spelling — SOCKET-WAIT-READABLE, which already polls one fd — answers the
+;;; CONSERVATIVE T whenever the socket server's page is not mapped, and that
+;;; page is mapped by the SERVER machinery, not by opening a socket.  So a
+;;; plain client stream would have gone on getting the old wrong answer.
+;;; Measured: LISTEN on a drained stream still said T through that route.
+;;; The per-CPU sockaddr scratch is 256 bytes owned by this layer; +192 is
+;;; eight of them, which is one struct pollfd.
+(defun %fd-input-ready-p (fd)
+  (let ((a (%sockaddr-scratch)))
+    (if (zerop a)
+        t
+        (let ((p (+ a 192)))
+          (setf (mem-ref p :u32) fd)
+          (setf (mem-ref (+ p 4) :u16) 1)      ; POLLIN
+          (setf (mem-ref (+ p 6) :u16) 0)
+          (if (> (syscall3 7 p 1 0) 0) t nil)))))
+
+;;; ============================================================
+;;; LISTENING ON A PORT THAT WAS DECIDED BEFORE THE PROCESS STARTED
+;;; ============================================================
+;;;
+;;; Every listener in the tree so far binds PORT 0 and asks the kernel what it
+;;; got, which is right for a test — nothing picks a number, nothing races, and
+;;; nothing can collide with a desktop.  It is not usable for a service somebody
+;;; has to CONNECT to: a VNC client needs the port in advance.
+;;;
+;;; SO THIS IS A SEPARATELY NAMED FUNCTION AND NOT A DEFAULT ARGUMENT ON
+;;; SOCKET-LISTEN.  Listening is a deliberate act, and an act whose consequence
+;;; is "this port is now reachable" should be spelled differently from one whose
+;;; consequence is "the kernel gave me a number nobody else has".  A default
+;;; argument would let a call site acquire the second behaviour by accident.
+;;;
+;;; THE DEFAULT ADDRESS IS 127.0.0.1 AND IT IS NOT AN ARGUMENT.  Binding
+;;; anything else is %SOCKET-LISTEN-PORT-ON-ADDRESS, a DISTINCT further call, so
+;;; that exposing a port to the network is a different line of code and not a
+;;; different value in the same line.
+;;;
+;;; PORT 0 IS REFUSED.  It is the one number that means "I did not decide", and
+;;; the whole purpose of this entry point is that a decision was made.  A caller
+;;; that wants an ephemeral port already has SOCKET-LISTEN.
+;;;
+;;; NOTHING CALLS EITHER OF THESE AT LOAD TIME OR AT CLI START.  They are
+;;; reachable only from a program that names them.
+(defun socket-listen-port (port)
+  "Listen on 127.0.0.1:PORT — an EXPLICIT port, decided by the caller, with a
+   backlog of 16.  Returns the listening fd, -1 on any failure, and -2 if PORT
+   is 0 or out of range.  THE ADDRESS IS 127.0.0.1: this machine and nothing
+   else.  Use SOCKET-LISTEN-PORT-ON-ADDRESS to bind anywhere else."
+  (if (or (< port 1) (> port 65535))
+      -2
+      (socket-listen-on (%sock-loopback) port 16)))
+
+(defun socket-listen-port-on-address (ip port)
+  "Listen on IP:PORT with an explicit port and a backlog of 16.  IP is a
+   host-order 32-bit address; (%SOCK-ANY-ADDR) is every interface.
+
+   THIS IS THE OFF-LOOPBACK SPELLING and it exists so that going off loopback
+   is a different call rather than a different argument.  Returns the listening
+   fd, -1 on failure, -2 if PORT is 0 or out of range."
+  (if (or (< port 1) (> port 65535))
+      -2
+      (socket-listen-on ip port 16)))
+
+;;; ============================================================
+;;; THE SYSCALL FLOOR UNDER A RUNTIME-EVALUATED SOCKET SHIM
+;;; ============================================================
+;;;
+;;; net/sb-sys-shim.lisp is EVALUATED AT BOOT, so every function in it is
+;;; compiled by the RUNTIME JIT rather than baked into the image.  That is the
+;;; only way to define `sb-bsd-sockets:socket-bind' at all — the host reading
+;;; the build owns that package and would refuse — and it comes with a defect
+;;; that this block exists to route around.
+;;;
+;;; MEASURED, on this image, with the shim out of the picture entirely:
+;;;
+;;;     (defvar *a* <an address>)
+;;;     (defun f3 () (syscall3 39 *a* 0 0))      ; getpid
+;;;     (defun f4 (x) (syscall3 39 x 0 0))
+;;;     (f3) => 39        <-- THE SYSCALL NUMBER, not the pid
+;;;     (f4 *a*) => 804095  <-- correct
+;;;
+;;;     (defun f2 () (let ((a *a*)) (syscall3 49 41 a 16)))
+;;;     (defun f1 (fd a len) (syscall3 49 fd a len))
+;;;     (f2) => 49        <-- again the syscall number
+;;;     (f1 41 *a* 16) => -9   <-- correct (EBADF)
+;;;
+;;; A JIT-COMPILED FUNCTION THAT READS A GLOBAL AND CALLS SYSCALL3 GETS THE
+;;; SYSCALL NUMBER BACK INSTEAD OF THE KERNEL'S ANSWER.  Every argument reaches
+;;; the kernel — the syscall really is issued — but the RESULT is wrong, and a
+;;; non-negative wrong result is indistinguishable from success to every caller
+;;; that checks for a negative errno.  That is how a `socket-bind' that appeared
+;;; to succeed left a socket bound to nothing: it is what
+;;; test/hosted-sb-sockets.lisp reported as `bound to loopback: got #(0 0 0 0)'.
+;;;
+;;; SO THE SHIM DOES NOT ISSUE SYSCALLS.  It calls these, which are AOT and
+;;; therefore compiled by the same compiler as the rest of the image.  The shim
+;;; keeps the CLOS surface, the argument shapes and the conditions; the kernel
+;;; is reached from here.  That split is not a workaround so much as the right
+;;; layering — a compatibility package should be a naming layer — but it is
+;;; being done NOW because of a compiler bug, and the bug is real and is not
+;;; fixed by this.  It is reported at the top of this block so that whoever
+;;; fixes it can delete nothing here and simply stop worrying.
+;;;
+;;; ONE PACKED RETURN AND NOT (VALUES …): the same JIT is what would have to
+;;; carry the second value back into shim code, and there is no reason to find
+;;; out whether it does.
+
+(defun %sbs-scratch ()
+  "This layer's own 256-byte per-CPU scratch — %SOCKADDR-SCRATCH, which nothing
+   else writes.  0 if the thread page could not be mapped."
+  (%sockaddr-scratch))
+
+(defun %sbs-addr-in (ip port)
+  "sockaddr_in(AF_INET, PORT, IP) in this CPU's scratch; returns its address."
+  (let ((a (%sbs-scratch)))
+    (if (zerop a)
+        0
+        (progn
+          (%ha-zero a (+ a 16))
+          (setf (mem-ref a :u16) 2)
+          (setf (mem-ref (+ a 2) :u8) (logand (ash port -8) 255))
+          (setf (mem-ref (+ a 3) :u8) (logand port 255))
+          (setf (mem-ref (+ a 4) :u8) (logand (ash ip -24) 255))
+          (setf (mem-ref (+ a 5) :u8) (logand (ash ip -16) 255))
+          (setf (mem-ref (+ a 6) :u8) (logand (ash ip -8) 255))
+          (setf (mem-ref (+ a 7) :u8) (logand ip 255))
+          a))))
+
+(defun %sbs-addr-un (path)
+  "sockaddr_un(AF_UNIX, PATH) in this CPU's scratch; returns the LENGTH to pass
+   to bind/connect, or a negative number: -1 no scratch, -2 the path is longer
+   than the 107 bytes sun_path holds."
+  (let ((a (%sbs-scratch))
+        (n (length path)))
+    (if (zerop a)
+        -1
+        (if (> n 107)
+            -2
+            (progn
+              (%ha-zero a (+ a 112))
+              (setf (mem-ref a :u16) 1)
+              (let ((i 0))
+                (loop
+                  (when (>= i n) (return nil))
+                  (setf (mem-ref (+ a (+ 2 i)) :u8) (char-code (char path i)))
+                  (setq i (+ i 1))))
+              (+ 3 n))))))
+
+(defun %sbs-open (family type) (syscall3 41 family type 0))
+(defun %sbs-close (fd) (syscall3 3 fd 0 0))
+(defun %sbs-listen (fd backlog) (syscall3 50 fd backlog 0))
+(defun %sbs-accept (fd) (syscall3 43 fd 0 0))
+(defun %sbs-shutdown (fd how) (syscall3 48 fd how 0))
+
+(defun %sbs-bind-in (fd ip port)
+  (let ((a (%sbs-addr-in ip port)))
+    (if (zerop a) -12 (syscall3 49 fd a 16))))
+
+(defun %sbs-connect-in (fd ip port)
+  (let ((a (%sbs-addr-in ip port)))
+    (if (zerop a) -12 (syscall3 42 fd a 16))))
+
+(defun %sbs-bind-un (fd path)
+  (let ((len (%sbs-addr-un path)))
+    (if (< len 0) -36 (syscall3 49 fd (%sbs-scratch) len))))
+
+(defun %sbs-connect-un (fd path)
+  (let ((len (%sbs-addr-un path)))
+    (if (< len 0) -36 (syscall3 42 fd (%sbs-scratch) len))))
+
+(defun %sbs-getname (fd which)
+  "getsockname(51) / getpeername(52), PACKED: (ip * 65536) + port, both host
+   order, or a negative -errno.  One integer because a (values …) would have to
+   travel back into JIT-compiled shim code."
+  (let ((a (%sbs-scratch)))
+    (if (zerop a)
+        -12
+        (progn
+          (%ha-zero a (+ a 64))
+          (setf (mem-ref (+ a 128) :u32) 16)
+          (let ((r (syscall3 which fd a (+ a 128))))
+            (if (< r 0)
+                r
+                (+ (* (+ (* (mem-ref (+ a 4) :u8) 16777216)
+                         (+ (* (mem-ref (+ a 5) :u8) 65536)
+                            (+ (* (mem-ref (+ a 6) :u8) 256)
+                               (mem-ref (+ a 7) :u8))))
+                      65536)
+                   (+ (* (mem-ref (+ a 2) :u8) 256) (mem-ref (+ a 3) :u8)))))))))
+
+(defun %sbs-setopt (fd level opt value)
+  "setsockopt(2) with a 4-byte int VALUE — syscall 54."
+  (let ((a (%sbs-scratch)))
+    (if (zerop a)
+        -12
+        (progn (setf (mem-ref (+ a 160) :u32) value)
+               (syscall6 54 fd level opt (+ a 160) 4 0)))))
+
+(defun %sbs-getopt (fd level opt)
+  "getsockopt(2) of a 4-byte int — syscall 55.  The VALUE, or a negative
+   -errno."
+  (let ((a (%sbs-scratch)))
+    (if (zerop a)
+        -12
+        (progn (setf (mem-ref (+ a 160) :u32) 0)
+               (setf (mem-ref (+ a 168) :u32) 4)
+               (let ((r (syscall6 55 fd level opt (+ a 160) (+ a 168) 0)))
+                 (if (< r 0) r (mem-ref (+ a 160) :u32)))))))
+
+(defun %sbs-ioctl-int (fd request)
+  "ioctl(fd, REQUEST, &int) — syscall 16.  The int, or a negative -errno.
+   SIOCOUTQ (#x5411) is what glass's sender loop measures backpressure with."
+  (let ((a (%sbs-scratch)))
+    (if (zerop a)
+        -12
+        (progn (setf (mem-ref (+ a 176) :u32) 0)
+               (let ((r (syscall3 16 fd request (+ a 176))))
+                 (if (< r 0) r (mem-ref (+ a 176) :u32)))))))
+
+(defun %sbs-peercred (fd which)
+  "getsockopt(fd, SOL_SOCKET, SO_PEERCRED) — syscall 55 — returning ONE field
+   of `struct ucred': WHICH 0 = pid, 1 = uid, 2 = gid.  Negative on failure.
+
+   ON A TCP SOCKET THIS SUCCEEDS AND ANSWERS NOTHING: Linux fills pid 0 and
+   uid/gid of -1 rather than failing, so pid 0 is the tell and a caller must
+   check it.  glass's PEER-CREDENTIALS already does exactly that."
+  (let ((a (%sbs-scratch)))
+    (if (zerop a)
+        -12
+        (progn
+          (%ha-zero a (+ a 208))
+          (setf (mem-ref (+ a 208) :u32) 12)
+          (let ((r (syscall6 55 fd 1 17 (+ a 192) (+ a 208) 0)))
+            (if (< r 0) r (mem-ref (+ a (+ 192 (* which 4))) :u32)))))))
+
+;;; ---- the same floor for the sb-posix surface ----------------------------
+
+(defun %sbs-path-cstr (path)
+  "PATH as a NUL-terminated C string in this CPU's own scratch.  0 if it is too
+   long — refused rather than truncated into a different filename."
+  (%cstr-percpu path))
+
+(defun %sbs-stat-field (path which)
+  "stat(2) — syscall 4 — returning ONE field: WHICH 0 = mode, 1 = uid, 2 = gid,
+   3 = inode, 4 = size.  A negative return is -errno."
+  (let ((buf (%struct-scratch))
+        (p (%sbs-path-cstr path)))
+    (if (or (zerop buf) (zerop p))
+        -36
+        (let ((r (syscall3 4 p buf 0)))
+          (if (< r 0)
+              r
+              (if (= which 0) (mem-ref (+ buf #x18) :u32)
+                  (if (= which 1) (mem-ref (+ buf #x1C) :u32)
+                      (if (= which 2) (mem-ref (+ buf #x20) :u32)
+                          (if (= which 3) (%gc-read64 (+ buf #x08))
+                              (%gc-read64 (+ buf #x30)))))))))))
+
+(defun %sbs-chmod (path mode)
+  (let ((p (%sbs-path-cstr path)))
+    (if (zerop p) -36 (syscall3 90 p mode 0))))
+
+(defun %sbs-unlink (path)
+  (let ((p (%sbs-path-cstr path)))
+    (if (zerop p) -36 (syscall3 87 p 0 0))))
+
+(defun %sbs-getuid () (syscall3 102 0 0 0))
+(defun %sbs-getpid () (syscall3 39 0 0 0))

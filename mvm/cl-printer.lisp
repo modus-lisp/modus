@@ -4210,13 +4210,15 @@
                        (when (null streams) (return found))
                        (when (listen (car streams)) (setq found t) (return t))
                        (setq streams (cdr streams)))))))
-            ;; File stream: check if buffer has data
+            ;; File stream: buffered data first, then ASK THE KERNEL.
+            ;; The buffer check must come first and cannot be replaced by the
+            ;; poll: bytes already pulled out of the fd are ready to read and
+            ;; the fd itself has nothing left to say about them.
             ((= ty 9)
              (let ((bpos (%fs-bpos s))
                    (blen (%fs-blen s)))
                (if (< bpos blen) t
-                   ;; Would need a non-blocking read to check — return t if fd valid
-                   (if (>= (%fs-fd s) 0) t nil))))
+                   (if (>= (%fs-fd s) 0) (%fd-input-ready-p (%fs-fd s)) nil))))
             (t nil)))
         nil)))
 (defun %substring (str start end)

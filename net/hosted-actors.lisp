@@ -66,9 +66,25 @@
 ;;; ============================================================
 ;;;
 ;;; ONE CARVE, recorded in globals, idempotent.  Region 0's two semispaces are
-;;; shrunk by 48 MB: the freed top 16 MB of the FROM-space is the
-;;; infrastructure band, and the two 16 MB slices above it are the semispace
-;;; PAIRS (from0+off, to0+off) a per-actor region uses in step D.
+;;; shrunk: the freed top 16 MB of the FROM-space is the infrastructure band,
+;;; and the N 16 MB slices above it are the semispace PAIRS (from0+off,
+;;; to0+off) a per-actor — and now a per-THREAD — region uses.
+;;;
+;;; N REGIONS, NOT TWO.  The carve used to produce exactly two, which was
+;;; enough for two actors on two threads and was the reason %MAKE-NATIVE-THREAD
+;;; could hand back a thread that could not cons: sixteen thread slots and two
+;;; heaps.  It now produces one per thread slot (%HA-MAX-REGIONS), each with its
+;;; own semispace pair, its own control block, its own root window and its own
+;;; collection count.  Region i's from-space is *HA-RBASE-FROM* + i*rsize and
+;;; its control block is band +0xA000 + i*0x40.
+;;;
+;;; IT IS ADAPTIVE IN COUNT AND NOT IN SIZE.  A region is 16 MB or it is not
+;;; carved; what varies with the heap is HOW MANY.  %HA-FIT-REGIONS never
+;;; returns fewer than two, so an image whose semispaces only ever afforded the
+;;; historic pair carves exactly the historic pair at exactly the historic
+;;; addresses — *HA-R1-FROM* and *HA-R2-FROM* are still regions 0 and 1 — and
+;;; every test written against those two is unchanged.  The shipping hosted
+;;; x86-64 CLI has 896 MB semispaces and gets all sixteen.
 ;;;
 ;;; BAND LAYOUT — every address net/actors.lisp asks for, as an offset:
 ;;;   +0x000000  control head (4 KB)
@@ -89,6 +105,13 @@
 ;;;     +0x0400  step-B / step-C / step-D result block (0x400)
 ;;;     +0x0800  message log (0x800)
 ;;;   +0x001000  PERCPU-DATA-BASE (16 KB; GS base points here)
+;;;   +0x005000  the two-thread selftest's thread block (net/hosted-actors-post)
+;;;   +0x006000  cpu 1's per-CPU block for that selftest (16 KB)
+;;;   +0x00A000  PER-THREAD REGION CONTROL BLOCKS — 16 x 64 = 0x400 bytes, one
+;;;              per thread slot, %HA-RCB.  In the band and not in the thread
+;;;              page because a region control block is memory the COLLECTOR
+;;;              reads on every allocation check, and the band is the one
+;;;              mapping this file already guarantees is live and never moves.
 ;;;   +0x010000  ACTOR-TABLE-BASE (64 x 128 = 0x2000)
 ;;;   +0x012000  GC SCRATCH ARRAY (16 x 32 = 0x200) — mvm/gc.lisp's
 ;;;              per-collection working state, one 32-byte block PER CPU.
@@ -104,7 +127,14 @@
 
 (defvar *ha-band* 0)      ; raw byte address of the infrastructure band, 0 = uncarved
 (defvar *ha-bandsize* 0)  ; its length in bytes
-(defvar *ha-rsize* 0)     ; per-actor region semispace size
+(defvar *ha-rsize* 0)     ; per-region semispace size
+(defvar *ha-nregions* 0)  ; how many per-thread regions the carve produced
+(defvar *ha-rbase-from* 0) ; region i's from-space = *ha-rbase-from* + i * *ha-rsize*
+(defvar *ha-rbase-to* 0)   ; region i's to-space   = *ha-rbase-to*   + i * *ha-rsize*
+;; REGIONS 0 AND 1 UNDER THEIR OLD NAMES.  Every test and every selftest written
+;; before the carve went to N spells the first two regions this way, and they are
+;; still literally the first two slices — so these are aliases, not a parallel
+;; allocation.  New code should use %HA-REGION-FROM / %HA-REGION-TO.
 (defvar *ha-r1-from* 0)
 (defvar *ha-r1-to* 0)
 (defvar *ha-r2-from* 0)
@@ -130,15 +160,48 @@
                        1023)))
         (+ a d))))
 
-(defun %ha-carve ()
-  "Carve the hosted actor band out of region 0, ONCE.  Returns the band's raw
-   byte address, or 0 if the active region is too small to carve from.
+(defun %ha-max-regions ()
+  "How many per-thread GC regions the carve will produce when the heap can
+   afford them.  ONE PER THREAD SLOT — net/hosted-sync.lisp's %THR-MAX-THREADS
+   is defined as this number, so a thread slot without a region cannot exist by
+   construction rather than by two constants agreeing."
+  16)
 
-   Unlike gc.lisp's selftests this is NOT size-adaptive: the layout above needs
-   a band of at least 4.2 MB, and the only image that bakes this file is the
-   hosted x86-64 CLI, whose semispaces are 896 MB.  A heap too small for the
-   full carve gets an honest 0 (the test prints SKIP) rather than a band whose
-   sub-blocks silently overlap."
+(defun %ha-fit-regions (size0 g s maxn)
+  "How many S-byte region pairs a semispace of SIZE0 can afford after the
+   G-byte band and 4096 bytes of alignment headroom, while leaving region 0 at
+   least HALF of what it had.  Never more than MAXN.
+
+   NEVER FEWER THAN TWO, and that floor is the compatibility guarantee rather
+   than a rounding convenience: every image before this carve went to N shrank
+   region 0 by exactly (G + 2S + 4096) and put its two regions at exactly those
+   two addresses.  An image whose heap only affords two must keep doing exactly
+   that, so the arithmetic below must produce 2 — not 1, and not 0 — wherever
+   the old code produced its pair.  The 96 MB floor in %HA-CARVE is what stops
+   a heap that affords NEITHER from getting a band at all.
+
+   Repeated addition rather than a division: N is at most 16, and this runs
+   during the carve, where the arithmetic must not be able to allocate."
+  (let ((room (- size0 (ash size0 -1)))
+        (used (+ g 4096))
+        (n 0))
+    (loop
+      (when (>= n maxn) (return 0))
+      (when (> (+ used s) room) (return 0))
+      (setq used (+ used s))
+      (setq n (+ n 1)))
+    (if (< n 2) 2 n)))
+
+(defun %ha-carve ()
+  "Carve the hosted actor band and the per-thread GC regions out of region 0,
+   ONCE.  Returns the band's raw byte address, or 0 if the active region is too
+   small to carve from.
+
+   The band is NOT size-adaptive: the layout above needs at least 4.2 MB, and
+   the only image that bakes this file is the hosted x86-64 CLI, whose
+   semispaces are 896 MB.  A heap too small for the full carve gets an honest 0
+   (the test prints SKIP) rather than a band whose sub-blocks silently overlap.
+   The REGION COUNT is adaptive; see %HA-FIT-REGIONS."
   (if (> *ha-band* 0)
       *ha-band*
       (let ((k (%gc-meta-scale))
@@ -161,11 +224,13 @@
               ;; exactly zero and the top region would run off the semispace.
               (let* ((s #x1000000)
                      (g #x1000000)
-                     (new0 (logand (- size0 (+ g (+ (* 2 s) 4096)))
+                     (n (%ha-fit-regions size0 g s (%ha-max-regions)))
+                     (new0 (logand (- size0 (+ g (+ (* n s) 4096)))
                                    (- 0 4096))))
                 (%gc-region-shrink r0 new0 k)
                 (setq *ha-rsize* s)
                 (setq *ha-bandsize* g)
+                (setq *ha-nregions* n)
                 ;; THE CARVED REGIONS MUST BE 1024-BYTE ALIGNED RELATIVE TO THE
                 ;; BITMAP page_base, or two threads collecting at once share a
                 ;; bitmap read-modify-write word: translate-x64's
@@ -187,10 +252,17 @@
                 ;; for the life of the image, which is exactly what the bitmap
                 ;; granule index is computed from.  Both sides are rounded UP
                 ;; into the 4 KB of headroom NEW0 reserves below.
-                (setq *ha-r1-from* (%ha-align-up-to-page-base (+ from0 (+ new0 g))))
-                (setq *ha-r1-to*   (%ha-align-up-to-page-base (+ to0   (+ new0 g))))
-                (setq *ha-r2-from* (+ *ha-r1-from* s))
-                (setq *ha-r2-to*   (+ *ha-r1-to* s))
+                ;;
+                ;; ROUNDING THE TWO BASES IS ENOUGH FOR ALL N.  The slices are
+                ;; S = 16 MB apart and S is a multiple of 1024, so every later
+                ;; region inherits the base's congruence exactly.  That is why
+                ;; the headroom stays 4096 and does not grow with N.
+                (setq *ha-rbase-from* (%ha-align-up-to-page-base (+ from0 (+ new0 g))))
+                (setq *ha-rbase-to*   (%ha-align-up-to-page-base (+ to0   (+ new0 g))))
+                (setq *ha-r1-from* *ha-rbase-from*)
+                (setq *ha-r1-to*   *ha-rbase-to*)
+                (setq *ha-r2-from* (+ *ha-rbase-from* s))
+                (setq *ha-r2-to*   (+ *ha-rbase-to* s))
                 ;; Zero the control head, the per-CPU block and the actor
                 ;; table.  Everything else in the band is stacks and pools that
                 ;; their own initialisers fill; zeroing 16 MB would cost more
@@ -198,6 +270,15 @@
                 ;; region 0's from-space a moment ago and can still hold words
                 ;; that look like heap pointers.
                 (%ha-zero (+ from0 new0) (+ from0 (+ new0 #x5000)))
+                ;; THE PER-THREAD REGION CONTROL BLOCKS.  %GC-REGION-INIT writes
+                ;; every one of a block's eight fields, so zeroing is not what
+                ;; makes an INITIALISED block correct — it is what makes an
+                ;; UNINITIALISED one readable: %THR-TRAMPOLINE tests its slot's
+                ;; block-address word for zero to decide whether it was given a
+                ;; region, and this memory was region 0's from-space a moment
+                ;; ago and can still hold anything.
+                (%ha-zero (+ from0 (+ new0 #xA000))
+                          (+ from0 (+ new0 #xA400)))
                 (%ha-zero (+ from0 (+ new0 #x10000))
                           (+ from0 (+ new0 #x12200)))
                 (setq *ha-band* (+ from0 new0))
@@ -480,6 +561,34 @@
 ;;; is harmless precisely because they are never dereferenced — and would NOT be
 ;;; harmless on aarch64.  Where an actor's heap really comes from on x64 is its
 ;;; GC REGION, which is step D.
+
+;;; ============================================================
+;;; THE PER-THREAD REGIONS, BY INDEX
+;;; ============================================================
+;;;
+;;; Three functions and one rule: REGION I BELONGS TO THREAD SLOT I.  The
+;;; mapping is the identity on purpose — a thread's slot is what it reads out of
+;;; the spawn handshake before it has a window, a per-CPU block or a heap, so it
+;;; is the one number a starting thread is certain of, and deriving its region
+;;; from anything else would mean a lookup it cannot yet do.
+;;;
+;;; SLOT 0 IS THE MAIN THREAD'S AND ITS REGION IS SPARE.  The main thread runs
+;;; on the process stack and allocates in region 0 — that is what every image
+;;; has always done and what %RT-ENTER depends on — so region 0 of the carve is
+;;; never adopted by %THR-TRAMPOLINE.  It is carved anyway, because indexing by
+;;; slot with a hole at 0 is a subtraction waiting to be got wrong, and because
+;;; it is what the two-actor selftests have always used as *HA-R1-FROM*.
+
+(defun %ha-nregions ()
+  "How many per-thread regions this image carved.  0 before the carve."
+  *ha-nregions*)
+
+(defun %ha-region-from (i) (+ *ha-rbase-from* (* i *ha-rsize*)))
+(defun %ha-region-to (i)   (+ *ha-rbase-to*   (* i *ha-rsize*)))
+
+(defun %ha-rcb (i)
+  "Raw byte address of thread slot I's 64-byte region control block."
+  (+ (%ha-base) (+ #xA000 (* i #x40))))
 
 (defun percpu-data-base ()   (+ (%ha-base) #x1000))
 

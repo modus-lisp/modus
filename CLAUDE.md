@@ -1278,6 +1278,16 @@ three-value return ACROSS an armed `handler-case`.  Both barrier timeouts 0.
 same binary and workload with MODE 1 (thread 2 skips `%TLS-INSTALL`) — **3 of 3
 died rc=139**.
 
+**THAT CONTROL IS PROBABILISTIC, NOT DETERMINISTIC — CORRECTED 2026-08-23.**
+The damage is a race between two threads over one window, so a run in which
+they never interleave badly comes back CLEAN.  Independently measured over 12
+runs: **11 detected the missing fix, 1 survived**.  (A later 12-run batch on
+the N-regions binary scored 12 of 12; same coin, different toss.)  A single
+clean run of this control is therefore not evidence that the fix is
+unnecessary.  Read the RATE over at least a dozen runs, never one result.  The
+"3 of 3" above is a sample too small to have shown this and should be read that
+way.
+
 **BOUNDARY, stated:** the compiler baked *into* the image keeps `*TLS-WINDOW*`
 nil, so a function compiled by the RUNTIME JIT emits absolute window accesses.
 Identical on the main thread (base 0), wrong on a worker.  Runtime EVAL on a

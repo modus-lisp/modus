@@ -16,6 +16,15 @@
 ;;;; dies here is evidence; a process that reports non-zero failure counters is
 ;;;; evidence; a process that reports everything zero means the fix under test
 ;;;; is not what makes the real test pass, and that is a FAIL.
+;;;;
+;;;; IT IS PROBABILISTIC, NOT DETERMINISTIC, AND THAT MATTERS TO WHOEVER READS
+;;;; ITS RESULT.  The damage is a RACE between two threads over one window, so
+;;;; a run in which the two never interleave badly comes back CLEAN.  MEASURED
+;;;; INDEPENDENTLY, 2026-08-23: 11 of 12 runs detected the missing fix and ONE
+;;;; SURVIVED.  A single clean run of this control is therefore not evidence
+;;;; that the fix is unnecessary; only a batch is.  Run it at least a dozen
+;;;; times and read the RATE.  (A later 12-run batch scored 12 of 12 — which is
+;;;; the same statement about the same coin.)
 
 (defvar *n* 400)
 (defvar *gcevery* 25)

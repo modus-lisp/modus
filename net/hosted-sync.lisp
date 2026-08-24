@@ -1914,15 +1914,32 @@
 ;;;      active-region cell and %THR-CPU read.
 ;;;   3. its slot in the table marked running, then the closure.
 ;;;
-;;; WHAT IS DELIBERATELY NOT HERE — STATED, NOT HIDDEN.  A thread that
-;;; ALLOCATES needs a GC REGION of its own, and net/hosted-actors.lisp's carve
-;;; produces exactly TWO (16 MB each, plus the actor band) out of region 0.
-;;; So this layer gives 16 threads everything a thread needs EXCEPT a region,
-;;; and a body that conses beyond the two carved regions has nowhere to put it.
-;;; Carving N regions is a change to the carve, not to this file, and it is the
-;;; next thing in the way of a thread-per-client server.
+;;;   4. its GC REGION — but only if the process is in a state where it can
+;;;      have one.  See A THREAD THAT CAN CONS below.
+;;;
+;;; A THREAD THAT CAN CONS.  Until the carve went to N regions this layer gave
+;;; 16 threads everything a thread needs EXCEPT a heap, and a body that consed
+;;; had nowhere to put it.  Region i of the carve now belongs to thread slot i,
+;;; and %MAKE-NATIVE-THREAD initialises it — semispaces, root window, collection
+;;; count — before the clone, because the SPAWNER is the one that knows the
+;;; stack it just mapped and is the only one that may compute the metadata scale
+;;; (see %HA-THREAD-ADOPT-REGION for why a cloned thread must not).
+;;;
+;;; IT IS CONDITIONAL, AND THE CONDITION IS NOT A PREFERENCE.  A thread can own
+;;; an active region only if the active-region cell is PER CPU: with the mode
+;;; word at +GC-REGION-PERCPU-ADDR+ off, every thread's %GC-SET-REGION writes
+;;; the ONE shared word, so a thread adopting its own region would move the MAIN
+;;; thread's heap out from under it mid-allocation.  So the rule is exactly:
+;;;
+;;;     a thread gets its own region when per-CPU active-region storage is on,
+;;;     and gets none when it is off.
+;;;
+;;; With the mode word off — the state of every fresh ./modus, and the state
+;;; test/hosted-many-threads.lisp runs in — this layer behaves precisely as it
+;;; did before regions existed.  Turning the mode on is %HA-SET-PERCPU-MODE, an
+;;; explicit act, and %THR-THREADS-CAN-CONS-P is the question this file asks.
 
-(defun %thr-max-threads () 16)
+(defun %thr-max-threads () (%ha-max-regions))
 
 (defun %thr-table () (let ((p (%thr-page))) (if (zerop p) 0 (+ p #x13000))))
 (defun %thr-percpu-base (cpu)
@@ -1934,11 +1951,23 @@
 ;;   +0x10 the spawn lock            +0x18 %GC-WORD-OF scratch
 ;;   +0x20 threads started ever      +0x28 a shared arrival counter for tests
 ;;   +0x30 that counter's lock
-;;   +0x100 + 0x40*i  PER-THREAD RECORD:
+;;   +0x100 + 0x80*i  PER-THREAD RECORD — 128 BYTES, NOT 64.  It was 64 until a
+;;     thread needed a heap, and the four words that describe one did not fit;
+;;     writing them anyway put a live region control block on top of the NEXT
+;;     record's STATE word, so %THR-FREE-SLOT saw every other slot as taken and
+;;     eight threads came back on slots 1,3,5,…,15.  Measured, on the first run
+;;     of test/hosted-many-regions.lisp.  Everything reaches a record through
+;;     %THR-REC, so widening it is one line — but the reports had to move up.
 ;;     +0x00 state (0 free, 1 live, 2 done)   +0x08 the CLONE TID WORD (u32)
 ;;     +0x10 stack base   +0x18 stack size    +0x20 cpu id
 ;;     +0x28 reached the body  +0x30 returned from the body
 ;;     +0x38 this thread's segment base
+;;     +0x40 the REGION CONTROL BLOCK this thread must adopt, 0 = none
+;;     +0x48 the METADATA SCALE the spawner computed for it
+;;     +0x50 what its active region answered BEFORE it adopted one
+;;     +0x58 its allocation pointer just after adopting
+;;   +0xA00 + 0x40*i  PER-THREAD REPORT BLOCK, for tests.  Above the records
+;;     (which now end at +0x900) and below the end of the 4 KB table.
 (defun %thr-pending-slot () (+ (%thr-table) #x00))
 (defun %thr-ack ()          (+ (%thr-table) #x08))
 (defun %thr-spawn-lock ()   (+ (%thr-table) #x10))
@@ -1946,7 +1975,7 @@
 (defun %thr-started ()      (+ (%thr-table) #x20))
 (defun %thr-arrivals ()     (+ (%thr-table) #x28))
 (defun %thr-barrier-lock () (+ (%thr-table) #x30))
-(defun %thr-rec (i)         (+ (%thr-table) (+ #x100 (* i #x40))))
+(defun %thr-rec (i)         (+ (%thr-table) (+ #x100 (* i #x80))))
 
 (defvar *thr-funs* nil
   "The thread bodies, by slot.  A vector and not a table: a fresh thread reads
@@ -1960,6 +1989,32 @@
 (defun %thr-funs ()
   (if (null *thr-funs*) (setq *thr-funs* (make-array 16)) 0)
   *thr-funs*)
+
+(defun %thr-threads-can-cons-p ()
+  "1 when a spawned thread may be given a GC region of its own, 0 when it may
+   not.  The condition is that the active-region cell is PER CPU and that the
+   carve produced regions at all; see A THREAD THAT CAN CONS above."
+  (if (= (mem-ref #x10000FF8 :u32) 0)
+      0
+      (if (zerop (%ha-nregions)) 0 1)))
+
+(defun %thr-prepare-region (slot stack-top k)
+  "Initialise thread slot SLOT's region: its own semispace pair out of the
+   carve, a root window bounded above by STACK-TOP — the top of the stack this
+   thread is about to be cloned onto, so the window the collector scans is that
+   thread's frames and nothing else — and a collection count of its own,
+   starting at zero.  Returns the control block, or 0 if SLOT has no region.
+
+   K IS THE SPAWNER'S metadata scale, passed in for the reason given at
+   %HA-THREAD-ADOPT-REGION: %GC-META-SCALE asks whether the live allocation
+   pointer falls inside the active region's from-space, which is only a
+   meaningful question on a thread whose cell and R12 belong together."
+  (if (>= slot (%ha-nregions))
+      0
+      (let ((rcb (%ha-rcb slot)))
+        (%gc-region-init rcb (%ha-region-from slot) (%ha-region-to slot)
+                         *ha-rsize* stack-top k)
+        rcb)))
 
 (defun %thr-trampoline ()
   "EVERY thread starts here.  Zero arguments, because the clone stub enters it
@@ -1978,10 +2033,34 @@
     (set-current-actor 0)
     (set-idle-flag 0)
     (%gc-write64 (+ rec #x20) slot)
-    ;; 3. tell the spawner the slot has been read; it may now start the next.
+    ;; 3. ITS OWN HEAP, if the spawner prepared one.  AFTER the per-CPU block
+    ;;    and not before: adopting a region is a write to THIS CPU's
+    ;;    active-region cell, and which cell that is comes from the CPU id
+    ;;    stamped one line above.  Adopting before the stamp would write CPU 0's
+    ;;    cell — the main thread's.
+    ;;
+    ;;    The BEFORE reading is recorded rather than discarded: with per-CPU
+    ;;    cells working, a thread that has not adopted anything must answer
+    ;;    REGION 0, and a thread reading its spawner's region here would mean
+    ;;    the indexing is not working at all.
+    (let ((rcb (%gc-read64 (+ rec #x40))))
+      (if (zerop rcb)
+          0
+          (progn
+            (%gc-write64 (+ rec #x50) (%gc-region))
+            (%ha-thread-adopt-region rcb (%gc-read64 (+ rec #x48)))
+            (%gc-write64 (+ rec #x58) (get-alloc-ptr)))))
+    ;; 4. tell the spawner the slot has been read; it may now start the next.
     (%gc-write64 (+ rec #x28) 1)
     (%gc-write64 (%thr-ack) 1)
     (funcall (aref (%thr-funs) slot))
+    ;; PARK THE ALLOCATION FRONTIER ON THE WAY OUT.  A region's +0x30 is where
+    ;; its live heap ends as far as anything outside this thread is concerned;
+    ;; until it is parked it still holds the from-space START, and every
+    ;; checksum and every foreign-reference sweep over "this region's live heap"
+    ;; would run over an empty range and answer 0.
+    (let ((rcb (%gc-read64 (+ rec #x40))))
+      (if (zerop rcb) 0 (%ha-thread-park-region rcb (%gc-read64 (+ rec #x48)))))
     (%gc-write64 (+ rec #x30) 1)
     (%gc-write64 (+ rec #x00) 2)
     0))
@@ -2030,6 +2109,21 @@
                         (%gc-write64 (+ rec #x18) *thr-stack-bytes*)
                         (%gc-write64 (+ rec #x28) 0)
                         (%gc-write64 (+ rec #x30) 0)
+                        (%gc-write64 (+ rec #x50) 0)
+                        (%gc-write64 (+ rec #x58) 0)
+                        ;; ITS HEAP, PREPARED BY THE SPAWNER, BEFORE THE CLONE.
+                        ;; The root window's top is the top of the stack just
+                        ;; mapped, which only this side knows; and the metadata
+                        ;; scale is computed HERE, where the cell and the
+                        ;; allocation pointer still belong together.
+                        (if (zerop (%thr-threads-can-cons-p))
+                            (progn (%gc-write64 (+ rec #x40) 0)
+                                   (%gc-write64 (+ rec #x48) 0))
+                            (let ((k (%gc-meta-scale)))
+                              (%gc-write64 (+ rec #x48) k)
+                              (%gc-write64 (+ rec #x40)
+                                           (%thr-prepare-region
+                                            slot (+ stk *thr-stack-bytes*) k))))
                         (%gc-write64 (%thr-pending-slot) slot)
                         (%gc-write64 (%thr-ack) 0)
                         (let ((tid (%spawn-thread (%thr-trampoline-entry)
@@ -2135,4 +2229,372 @@
     (%gc-write64 (+ out #x30) 99)
     0))
 
-(defun %thr-report (i) (+ (%thr-table) (+ #x800 (* i #x40))))
+(defun %thr-report (i) (+ (%thr-table) (+ #xA00 (* i #x40))))
+
+;;; ============================================================
+;;; N THREADS, N HEAPS — the acceptance worker
+;;; ============================================================
+;;;
+;;; The report blocks are in the BAND and not in the thread page because they
+;;; must outlive nothing and collide with nothing: the thread page's scratch is
+;;; already spoken for by the two-thread selftests, and the band has 23 KB free
+;;; above the region control blocks.  128 bytes per slot at +0xB000.
+
+(defun %thr-region-report (i) (+ (%ha-base) (+ #xB000 (* i #x80))))
+
+(defun %thr-rec-region (i)  (%gc-read64 (+ (%thr-rec i) #x40)))
+(defun %thr-rec-before (i)  (%gc-read64 (+ (%thr-rec i) #x50)))
+(defun %thr-rec-alloc (i)   (%gc-read64 (+ (%thr-rec i) #x58)))
+
+(defun %thr-make-heap-worker (out nlinks ngc want budget k)
+  "A THREAD BODY THAT ALLOCATES AND COLLECTS ITS OWN HEAP.  Holds a live chain
+   of NLINKS conses across NGC forced collections of its own region, building a
+   fresh chain's worth of garbage between each so every collection has
+   something to reclaim and something to move.
+
+   IT IS A CLOSURE, so N of these are N independent workers over N different
+   report blocks — the same construction %THR-MAKE-COUNTER uses, and for the
+   same reason: a thread running somebody else's body must produce a WRONG
+   NUMBER rather than an indistinguishable success.
+
+   K IS THE SPAWNER'S metadata scale.  A worker reads its own collection count
+   with %GC-META-READ and not %GC-COUNT, because %GC-COUNT goes through
+   (mem-ref … :u64), which HALVES — right on the targets that store the eight
+   control-block fields SHL'd by one, wrong on hosted x86-64, which stores them
+   raw.  The count that comes back here is therefore the count the collector
+   actually wrote.
+
+   NO FORMAT, NO INTERN, NO SYMBOL LITERAL.  Same restriction every threaded
+   selftest before this one carries: the runtime's shared tables are
+   unsynchronised unless %RT-THREADS-ON has been called, and this test is about
+   heaps, not about that lock.  CONS is not on that list — conses go in this
+   thread's own region, which is the whole point.
+
+   REPORT BLOCK at OUT:
+     +0x00 barrier result (0 = all WANT threads were inside it at once)
+     +0x08 its active region      +0x10 its active-region CELL address
+     +0x18 its CPU id             +0x20 allocation pointer on entry
+     +0x28 its own region's collection count BEFORE
+     +0x30 ... and AFTER          +0x38 chain walks that failed mid-run
+     +0x40 the final chain check (0 = broken, else 1 + the sum of its cars)
+     +0x48 allocation pointer at the end
+     +0x50 its gettid             +0x58 its segment base (FS)
+     +0x60 99 when the body ran to the end"
+  (lambda ()
+    (%gc-write64 (+ out #x00) (%thr-arrive-and-wait want budget))
+    (%gc-write64 (+ out #x08) (%gc-region))
+    (%gc-write64 (+ out #x10) (%gc-region-cell))
+    (%gc-write64 (+ out #x18) (%thr-my-cpu-raw))
+    (%gc-write64 (+ out #x20) (get-alloc-ptr))
+    (%gc-write64 (+ out #x28) (%gc-meta-read (+ (%gc-region) #x20) k))
+    (let ((chain (%gc-chain-build nlinks))
+          (bad 0)
+          (i 0))
+      (loop
+        (when (>= i ngc) (return 0))
+        (%ha-collect-here)
+        (if (zerop (%gc-chain-check chain nlinks)) (setq bad (+ bad 1)) 0)
+        (%gc-chain-build nlinks)
+        (setq i (+ i 1)))
+      (%gc-write64 (+ out #x38) bad)
+      (%gc-write64 (+ out #x40) (%gc-chain-check chain nlinks)))
+    (%gc-write64 (+ out #x30) (%gc-meta-read (+ (%gc-region) #x20) k))
+    (%gc-write64 (+ out #x48) (get-alloc-ptr))
+    (%gc-write64 (+ out #x50) (syscall3 186 0 0 0))
+    (%gc-write64 (+ out #x58) (%tls-self-base))
+    (%gc-write64 (+ out #x60) 99)
+    0))
+
+;;; ------------------------------------------------------------
+;;; THE ACCEPTANCE DRIVER — N THREADS, N REGIONS, ONE AUDIT
+;;; ------------------------------------------------------------
+;;;
+;;; WHAT WOULD MAKE THIS A LIE, AND WHAT STOPS IT.
+;;;
+;;;   "Each thread collected" is a COUNT ON ITS OWN CONTROL BLOCK, read with
+;;;   %GC-META-READ in the target's own metadata scale, and it has to have risen
+;;;   by at least the number of collections the worker was told to force.  A
+;;;   shared counter would rise N times as fast on one block and not at all on
+;;;   the others; N blocks each rising by NGC cannot be produced that way.
+;;;
+;;;   "Its data survived" is a WALK, not a flag: the chain's links must still
+;;;   carry NLINKS-1 … 0 in order after every collection, and the walk is
+;;;   repeated between every pair of them, not only at the end.
+;;;
+;;;   "Another thread's region is untouched" is measured with the workers GONE.
+;;;   While they are running their checksums are supposed to move.  After the
+;;;   join the DRIVER collects ITS OWN region twice, and every worker's heap and
+;;;   every worker's control block must be bit-for-bit identical across those
+;;;   two collections.  THE CHECKSUM IS ASSERTED NON-ZERO FIRST — a checksum
+;;;   over an empty range answers 0 for any two runs, so "unchanged" would
+;;;   otherwise be free.  (What makes the range non-empty is the trampoline
+;;;   parking the thread's allocation frontier into +0x30 on the way out; before
+;;;   that existed this check could only ever have answered 0 -> 0.)
+;;;
+;;;   "The regions are isolated" is %GC-COUNT-FOREIGN-REFS over EVERY ORDERED
+;;;   PAIR — each worker's live heap swept for pointers into every other
+;;;   worker's from-space AND to-space — WITH A POSITIVE CONTROL that plants one
+;;;   cons-tagged pointer in a zeroed window and requires the answer 1, and asks
+;;;   the same window about a different region and requires 0.
+;;;
+;;; RESULT BLOCK at band +0xC000 (band +0xC000..+0x10000 is otherwise unused):
+;;;   +0x00 threads asked for      +0x08 regions the carve produced
+;;;   +0x10 spawn failures         +0x18 join timeouts
+;;;   +0x20 region 0's collection count before … +0x28 … and after
+;;;   +0x30 region-alignment violations   +0x38 last violation mask
+;;;   +0x40 the driver's own region      +0x48 its count before its two forced
+;;;   +0x50 … and after                  +0x58 foreign refs, all ordered pairs
+;;;   +0x60 positive control (must be 1) +0x68 same window, other region (0)
+;;;   +0x70 workers whose HEAP checksum moved across the driver's collections
+;;;   +0x78 workers whose CONTROL BLOCK checksum moved
+;;;   +0x80 workers whose heap checksum was ZERO (an unassertable check)
+;;;   +0x88 workers whose active region was not their own slot's block
+;;;   +0x90 workers whose active-region CELL was not their own slot's entry
+;;;   +0x98 the driver's chain check after its own two collections
+;;;   +0xA0 the metadata scale     +0xA8 collectors that entered concurrently
+;;;   +0xB0 collectors still inside at the end (must be 0)
+;;;   +0xB8 the driver's allocation pointer, restored
+;;;   +0xC0 the per-CPU mode word as this call found it
+;;;   +0xC8 distinct worker regions seen   +0xD0 distinct worker gettids
+;;;   +0xD8 distinct final chain answers   +0xE0 distinct heap checksums
+;;;   +0x100 + 0x20*i  worker i: heap sum before / after, block sum before /after
+;;;   +0x400 + 8*i     worker i's spawn handle
+
+(defun %thr-nr-slot (res i) (+ res (+ #x100 (* i #x20))))
+(defun %thr-nr-handle (res i) (+ res (+ #x400 (* i 8))))
+
+(defun %thr-nr-distinct (res n off)
+  "How many DISTINCT values the N worker report blocks carry at offset OFF.
+   Pairwise, because N is 8 and a sort would allocate."
+  (let ((i 0) (d 0))
+    (loop
+      (when (>= i n) (return 0))
+      (let ((j 0) (new 1))
+        (loop
+          (when (>= j i) (return 0))
+          (when (= (%gc-read64 (+ (%thr-region-report i) off))
+                   (%gc-read64 (+ (%thr-region-report j) off)))
+            (setq new 0))
+          (setq j (+ j 1)))
+        (setq d (+ d new)))
+      (setq i (+ i 1)))
+    d))
+
+(defun %thr-nr-distinct-slots (res n)
+  "How many DISTINCT heap checksums the N per-worker evidence slots carry."
+  (let ((i 0) (d 0))
+    (loop
+      (when (>= i n) (return 0))
+      (let ((j 0) (new 1))
+        (loop
+          (when (>= j i) (return 0))
+          (when (= (%gc-read64 (%thr-nr-slot res i))
+                   (%gc-read64 (%thr-nr-slot res j)))
+            (setq new 0))
+          (setq j (+ j 1)))
+        (setq d (+ d new)))
+      (setq i (+ i 1)))
+    d))
+
+(defun %thr-nr-pairs (n k)
+  "Foreign references summed over EVERY ORDERED PAIR of worker regions: worker
+   i's live heap [from, parked-alloc) swept for pointers into worker j's
+   from-space and into worker j's to-space, for every j other than i.  Worker i
+   occupies slot i+1, because slot 0 is the main thread's."
+  (let ((i 0) (tot 0))
+    (loop
+      (when (>= i n) (return 0))
+      (let* ((a (%ha-rcb (+ i 1)))
+             (alo (%gc-meta-read a k))
+             (ahi (%gc-meta-read (+ a #x30) k))
+             (j 0))
+        (loop
+          (when (>= j n) (return 0))
+          (if (= i j)
+              0
+              (let ((b (%ha-rcb (+ j 1))))
+                (setq tot (+ tot (%gc-count-foreign-refs
+                                  alo ahi (%gc-meta-read b k) *ha-rsize*)))
+                (setq tot (+ tot (%gc-count-foreign-refs
+                                  alo ahi (%gc-meta-read (+ b #x08) k)
+                                  *ha-rsize*)))))
+          (setq j (+ j 1))))
+      (setq i (+ i 1)))
+    tot))
+
+(defun %thr-nr-snapshot (res n k off)
+  "Checksum every worker's live heap and its control block into the per-worker
+   evidence slots at OFF (0 = the before pair, 8 = the after pair)."
+  (let ((i 0))
+    (loop
+      (when (>= i n) (return 0))
+      (let ((a (%ha-rcb (+ i 1)))
+            (s (%thr-nr-slot res i)))
+        (%gc-write64 (+ s off)
+                     (%gc-sum-range (%gc-meta-read a k)
+                                    (%gc-meta-read (+ a #x30) k)))
+        (%gc-write64 (+ s (+ #x10 off)) (%gc-sum-range a (+ a #x40))))
+      (setq i (+ i 1)))
+    0))
+
+(defun %thr-nregion-selftest (n nlinks ngc budget)
+  "N THREADS, N HEAPS.  Start N worker threads — slots 1..N, regions 1..N —
+   each holding a live chain of NLINKS conses across NGC forced collections OF
+   ITS OWN REGION, then audit isolation with the workers gone.  Returns the
+   result block's raw byte address, or 0 if the band could not be carved.
+
+   PARTIAL, AND SAID HERE RATHER THAN DISCOVERED: this leaves the per-CPU
+   active-region mode word ON if it was off when it started only for the length
+   of the call — it is restored before returning — and it does NOT exercise the
+   runtime-table lock (%RT-THREADS-ON).  The workers do arithmetic, raw memory
+   and CONS.  No FORMAT, no INTERN, no symbol literal."
+  (if (zerop (%ha-carve))
+      0
+      (if (zerop (%thr-table))
+          0
+          (let* ((res (+ (%ha-base) #xC000))
+                 (r0 (%gc-region-0))
+                 (mode0 (%ha-percpu-mode))
+                 (fails 0)
+                 (touts 0)
+                 (i 0))
+            (%ha-zero res (+ res #x800))
+            (%thr-reset-table)
+            (let ((z 0))
+              (loop
+                (when (>= z (%ha-max-regions)) (return 0))
+                (%ha-zero (%thr-region-report z) (+ (%thr-region-report z) #x80))
+                (setq z (+ z 1))))
+            (%gc-region-align-reset)
+            (%ha-gc-conc-reset)
+            (%gc-write64 (+ res #x00) n)
+            (%gc-write64 (+ res #x08) (%ha-nregions))
+            (%gc-write64 (+ res #xC0) mode0)
+            (%gc-write64 (+ res #x20) (%gc-meta-read (+ r0 #x20) (%gc-meta-scale)))
+            ;; ---- THIS thread: a real per-CPU block, stamped CPU 0, and only
+            ;;      then the mode word.  The order is the one %HA-REGIONS-PERCPU-
+            ;;      SELFTEST establishes: a per-CPU cell read with no per-CPU
+            ;;      block is a GS-relative load at absolute address 16.
+            (%ha-percpu-init-cpu (%ha-percpu-base) 0)
+            (%ha-set-percpu-mode 1)
+            (let ((k (%gc-meta-scale)))
+              (%gc-write64 (+ res #xA0) k)
+              ;; ---- spawn ----
+              ;; The driver stays in REGION 0 for the whole of the spawn and the
+              ;; join.  It must: %MAKE-NATIVE-THREAD stores the closure in a
+              ;; vector that lives in region 0, and a closure allocated in the
+              ;; driver's OWN carved region would be reachable only through that
+              ;; vector — which no collector of the driver's region scans, since
+              ;; the vector is not in that region's from-space.  It would be
+              ;; garbage the first time the driver collected.
+              (setq i 0)
+              (loop
+                (when (>= i n) (return 0))
+                ;; WORKER I GETS A CHAIN OF ITS OWN LENGTH, NLINKS + 7i.  Not
+                ;; decoration: with every worker holding the SAME chain, every
+                ;; worker's heap checksum comes out the same number, because
+                ;; %GC-SUM-RANGE folds to 24 bits and the regions are 16 MB —
+                ;; exactly 2^24 — apart, so the only thing that differs between
+                ;; two regions' live heaps is invisible to it.  "Region B is
+                ;; unchanged" would then also hold if region B held region C's
+                ;; data.  Distinct lengths make the eight checksums distinct,
+                ;; and the test asserts that they are.
+                (let ((h (%make-native-thread
+                          (%thr-make-heap-worker (%thr-region-report (+ i 1))
+                                                 (+ nlinks (* i 7))
+                                                 ngc n budget k))))
+                  (%gc-write64 (%thr-nr-handle res i) h)
+                  (if (< h 0) (setq fails (+ fails 1)) 0))
+                (setq i (+ i 1)))
+              (%gc-write64 (+ res #x10) fails)
+              ;; ---- join ----
+              (setq i 0)
+              (loop
+                (when (>= i n) (return 0))
+                (let ((h (%gc-read64 (%thr-nr-handle res i))))
+                  (if (< h 0)
+                      0
+                      (if (zerop (%join-native-thread h budget))
+                          0
+                          (setq touts (+ touts 1)))))
+                (setq i (+ i 1)))
+              (%gc-write64 (+ res #x18) touts)
+              ;; ---- did each worker land in ITS OWN region, on ITS OWN cell? --
+              (setq i 0)
+              (let ((badr 0) (badc 0) (zeroes 0))
+                (loop
+                  (when (>= i n) (return 0))
+                  (let ((rp (%thr-region-report (+ i 1))))
+                    (if (= (%gc-read64 (+ rp #x08)) (%ha-rcb (+ i 1)))
+                        0 (setq badr (+ badr 1)))
+                    (if (= (%gc-read64 (+ rp #x10)) (+ #x10000F08 (* (+ i 1) 8)))
+                        0 (setq badc (+ badc 1))))
+                  (setq i (+ i 1)))
+                (%gc-write64 (+ res #x88) badr)
+                (%gc-write64 (+ res #x90) badc)
+                (%gc-write64 (+ res #xC8) (%thr-nr-distinct res n #x08))
+                (%gc-write64 (+ res #xD0) (%thr-nr-distinct res n #x50))
+                (%gc-write64 (+ res #xD8) (%thr-nr-distinct res n #x40))
+                ;; ---- isolation, every ordered pair, before anything else
+                ;;      moves: the workers are gone and their heaps are parked.
+                (%gc-write64 (+ res #x58) (%thr-nr-pairs n k))
+                ;; POSITIVE CONTROL, EXACT.  A zeroed 8-word window holding
+                ;; exactly one cons-tagged pointer into worker 1's from-space
+                ;; must count 1 — and 0 when asked about worker 2's.
+                (let ((ctl (+ (%ha-base) #x300)))
+                  (%ha-zero ctl (+ ctl #x40))
+                  (%gc-write64 (+ ctl 24) (+ (%gc-meta-read (%ha-rcb 1) k) 1))
+                  (%gc-write64 (+ res #x60)
+                               (%gc-count-foreign-refs ctl (+ ctl #x40)
+                                                       (%gc-meta-read (%ha-rcb 1) k)
+                                                       *ha-rsize*))
+                  (%gc-write64 (+ res #x68)
+                               (%gc-count-foreign-refs ctl (+ ctl #x40)
+                                                       (%gc-meta-read (%ha-rcb 2) k)
+                                                       *ha-rsize*)))
+                ;; ---- snapshot every worker's heap and block ----
+                (%thr-nr-snapshot res n k 0)
+                ;; ---- THE DRIVER COLLECTS ITS OWN REGION, TWICE ----
+                ;; Slot 0's region, whose root window is bounded by the PROCESS
+                ;; stack — this thread's — because this thread is the one
+                ;; running on it.  %GC-REGION-ENTER and not a bare cell write:
+                ;; the park half is correct here, this thread is region 0's
+                ;; legitimate owner, and the matching enter at the end puts its
+                ;; allocation frontier back.
+                (%gc-region-init (%ha-rcb 0) (%ha-region-from 0) (%ha-region-to 0)
+                                 *ha-rsize* (%gc-meta-read (+ r0 #x18) k) k)
+                (%gc-write64 (+ res #x40) (%ha-rcb 0))
+                (%gc-region-enter (%ha-rcb 0))
+                (%gc-write64 (+ res #x48) (%gc-meta-read (+ (%ha-rcb 0) #x20) k))
+                (let ((chain (%gc-chain-build nlinks)))
+                  (%ha-collect-here)
+                  (%gc-chain-build nlinks)
+                  (%ha-collect-here)
+                  (%gc-write64 (+ res #x98) (%gc-chain-check chain nlinks)))
+                (%gc-write64 (+ res #x50) (%gc-meta-read (+ (%ha-rcb 0) #x20) k))
+                (%thr-nr-snapshot res n k 8)
+                (%gc-region-enter r0)
+                ;; ---- and now compare, back in region 0 ----
+                (setq i 0)
+                (let ((movedh 0) (movedb 0))
+                  (loop
+                    (when (>= i n) (return 0))
+                    (let ((s (%thr-nr-slot res i)))
+                      (if (= (%gc-read64 s) (%gc-read64 (+ s 8)))
+                          0 (setq movedh (+ movedh 1)))
+                      (if (= (%gc-read64 (+ s #x10)) (%gc-read64 (+ s #x18)))
+                          0 (setq movedb (+ movedb 1)))
+                      (if (zerop (%gc-read64 s)) (setq zeroes (+ zeroes 1)) 0))
+                    (setq i (+ i 1)))
+                  (%gc-write64 (+ res #x70) movedh)
+                  (%gc-write64 (+ res #x78) movedb)
+                  (%gc-write64 (+ res #x80) zeroes)
+                  (%gc-write64 (+ res #xE0) (%thr-nr-distinct-slots res n))))
+              (%gc-write64 (+ res #x28) (%gc-meta-read (+ r0 #x20) k))
+              (%gc-write64 (+ res #x30) (%gc-region-align-violations))
+              (%gc-write64 (+ res #x38) (%gc-region-align-last))
+              (%gc-write64 (+ res #xA8) (%ha-gc-conc-witness))
+              (%gc-write64 (+ res #xB0) (%ha-gc-conc-cur))
+              (%gc-write64 (+ res #xB8) (get-alloc-ptr)))
+            (%ha-set-percpu-mode mode0)
+            res))))

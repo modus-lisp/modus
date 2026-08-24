@@ -1436,6 +1436,103 @@ primitives.  It is bounded to **calling a runtime-JIT-compiled function from a
 worker thread, at a rate**, and it is the ceiling that stands between the shim
 and running glass.
 
+### GLASS'S OWN RFB SERVER RUNS ON MODUS AND SHAKES HANDS WITH A REAL VNC CLIENT
+
+Four things, in the order they were found, and one wall.
+
+**THE SHIM WAS PORTABLE-SHAPED IN ITS ARGUMENTS AND SHIM-SHAPED IN ITS
+INITARGS.**  `net/sb-sys-shim.lisp`'s socket class named its slots `sock-type` /
+`sock-protocol` — correctly, because `:type` is also a DEFCLASS slot option —
+and then named its INITARGS after the slots.  An initarg is not the slot's name
+and is not ours to choose: `sb-bsd-sockets` spells it `:TYPE`, and glass writes
+`(make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)` five
+times.  Every one died at the first socket a real program opened.  The slots keep
+their names; the initargs are now `:TYPE` and `:PROTOCOL`.
+
+**AND THE DESCRIPTOR IS OPENED AT MAKE-INSTANCE, WHERE SBCL OPENS IT.**  The
+first draft opened it lazily and argued nothing in glass depended on the earlier
+point.  True of glass, false of the surface: `socket-file-descriptor` on a fresh
+socket answered NIL here and a descriptor under SBCL, one accessor call away.
+A shim has to be portable-shaped in WHEN, too, wherever that is observable.
+
+**FIND THE GAPS ALL AT ONCE OR PAY A BUILD EACH.**  The shim is baked into the
+image, so discovering gaps by running glass costs one rebuild per gap and only
+ever finds the gaps on the path the first client takes.
+`test/run-glass-shim-audit.sh` asks the WHOLE surface in one run, in the shape
+glass writes it (every probe is a transcription of a named call site), with
+**SBCL run first and required to score 100%** so a wrong probe is reported as a
+harness bug rather than a modus gap.  It went **22 ok / 20 GAPS -> 42 ok / 0
+GAPS** across two builds instead of twenty.
+
+**THE FILE-STREAM STAGING PAGE WAS ONE PAGE FOR THE WHOLE PROCESS, AND THAT IS
+SILENT DATA CORRUPTION.**  `mvm/cl-fileio.lisp` stages every raw read and write
+through `*IO-BUF-ADDR*`: `%FS-WRITE-BYTE` stores the byte there and then issues
+`write(2)` from it, so two threads writing to two DIFFERENT descriptors send
+each other's bytes.  **Measured: 327 680 bytes** — one RFB raw rectangle at 1280
+wide with glass's default banding — **written by one thread and read by another
+came back with 73 933 bytes wrong**, while the identical transfer on one thread
+was byte-perfect, and nothing signalled.  Fixed by making the page a SEAM
+(`%FS-IO-PAGE` in cl-fileio, historic behaviour) overridden per-CPU in
+`net/hosted-sync.lisp` by last-defun-wins — the same seam `%SOCK-IO-BUF` already
+uses, at +0x2000 in the per-CPU block.  It defers to the old page unless per-CPU
+mode is on, so a single-threaded `./modus` maps nothing new.  After it: 48 KB
+across two threads in **1 ms, zero bytes wrong**.
+
+**WHAT NOW RUNS.**  `test/run-glass-serve.sh` stands up GLASS:SERVE — glass's
+own `src/rfb.lisp`, loaded from the glass tree, on glass's own TCP-LISTEN, with
+glass's per-client reader AND sender threads — and points `test/glass-rfb-client.py`
+(Python, not modus, generating its own expected image) at it.  **The handshake
+completes end to end**: ProtocolVersion, security type None, SecurityResult,
+ClientInit/ServerInit with all ten pixel-format fields checked against glass's
+values (note `big-endian-flag` **0**, where modus's own minimal server in
+`test/rfb-static.lisp` says 1 — two different legal wires, two clients) and the
+desktop name.  17 client-side checks pass.
+
+**THE WALL: THE FRAME NEVER ARRIVES.**  With `:WAKE NIL` the sender polls
+forever and delivers nothing; with a real WAKE the server process **dies
+outright, with no condition and no output**, immediately after the client is
+counted in.  Every ingredient passes in isolation, measured this round:
+
+* `RFB-SENDER-LOOP` itself, on a worker, producing a correct **4112-byte** Raw
+  update that a peer reads back;
+* a worker writing 4112 bytes to the SAME stream the main thread is parked
+  reading — 0 wrong;
+* timed `CONDITION-WAIT` on a worker, **200/200**;
+* `WITH-MUTEX` / `WITH-RECURSIVE-LOCK` acquired on a worker, including one the
+  main thread used first, and contended both ways;
+* a struct slot written by main AFTER a worker is already polling it — seen;
+* `FORMAT` on a worker, to `*error-output*` and to `t`;
+* a blocking `READ-BYTE` on main not starving a worker.
+
+What is left is the runtime-JIT concurrency ceiling named in the section above:
+glass is LOADED AT RUNTIME, so `rfb-sender-loop` is JIT-compiled, and it is
+called from a worker thread at 60 Hz.  `test/run-glass-serve.sh` is the thing
+that will notice when that lifts.
+
+**TWO INSTRUMENTS THAT LIE, AND COST HOURS BEFORE THEY WERE CAUGHT.**
+
+* **`GET-INTERNAL-REAL-TIME` IS A CALL COUNTER, NOT A CLOCK.**  It returns 1, 2,
+  3 on successive calls and is unmoved by a real `(sleep 3)`.  So every "busy
+  wait until N ms have passed" written against it returns after N CALLS — which
+  made a worker thread look BLOCKED when it had simply not been given a
+  microsecond.  `GET-UNIVERSAL-TIME` is correct; `SLEEP` is correct (verified
+  against wall time: `(sleep 5)` costs 5 s of real time and no user time).
+  glass uses `get-internal-real-time` as a real unit throughout `rfb.lisp`.
+* **`#'NAME` RESOLVES LATE.**  Saving `#'f` and then redefining `f` gives you
+  the NEW `f`, so the classic diagnostic wrapper calls itself until the stack
+  dies.  Replace outright when instrumenting; do not wrap.
+
+**THE HARNESSES, ALL RE-RUNNABLE, ALL SBCL-REFERENCED WHERE THAT MEANS
+ANYTHING.**
+
+    test/run-glass-load.sh        :glass loads — 13 of 13 files (its 8 + cram's 5),
+                                  file list read out of glass.asd/cram.asd, each
+                                  file's witness the LAST thing it defines
+                                  (because modus's LOAD swallows a form that dies)
+    test/run-glass-shim-audit.sh  the whole SB-* surface — 42 ok / 0 gaps
+    test/run-glass-serve.sh       glass's RFB server vs a real Python VNC client
+                                  (handshake passes; the frame does not arrive)
+
 ### THE CARVE TOOK MEMORY THAT WAS STILL IN USE — and all eight glass files load
 
 `%HA-CARVE` takes the top ~272 MB of region 0's 896 MB semispaces for the actor

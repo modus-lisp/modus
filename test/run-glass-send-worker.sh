@@ -76,7 +76,7 @@ for m in $MODES; do
   SERVER_PID=""
 
   echo "  server rc=$SRC"
-  grep -E 'MVM LONGJMP|UNHANDLED-ESCAPE|worker:|SERVER DONE' "$WORK/server.$m.out" | sed 's/^/  /'
+  grep -E 'MVM LONGJMP|UNHANDLED-ESCAPE|worker:|SERVER DONE|FB-SELFCHECK' "$WORK/server.$m.out" | sed 's/^/  /'
 
   if ss -ltnH "sport = :$PORT" 2>/dev/null | grep -q .; then
     echo "  FAIL: something is still listening on $PORT"; RC=1

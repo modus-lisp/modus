@@ -91,6 +91,57 @@
 (defun fb-width-of  (fb) (funcall (find-symbol "FB-WIDTH" "GLASS") fb))
 (defun fb-height-of (fb) (funcall (find-symbol "FB-HEIGHT" "GLASS") fb))
 
+;;; ---- IS THE PICTURE WRONG, OR IS THE WIRE WRONG? ---------------------------
+;;;
+;;; A client that reports a bad pixel cannot tell those apart, and they are
+;;; different bugs in different code.  So the framebuffer is READ BACK through
+;;; glass's own FB-GET and compared against the same rule that painted it —
+;;; once BEFORE anything is served and once AFTER, because "never painted" and
+;;; "painted, then clobbered by the encoder" are also different bugs.
+;;;
+;;; MAKE-FRAMEBUFFER fills with +BLACK+ = 0, so an unpainted pixel reads 0 —
+;;; which is exactly the value a bad pixel has come back as every time this has
+;;; been seen.  That makes "how many read 0" worth reporting separately from
+;;; "how many are wrong": a wrong-but-non-zero pixel would be a different
+;;; mechanism entirely.
+;;; GLASS_SEND_SELFCHECK=0 turns it off.  The knob is not decoration: this
+;;; failure has behaved as though it depends on where things land, so an
+;;; instrument that runs 12 288 extra calls before the encode could in
+;;; principle move the thing it is trying to measure.  The BEFORE check cannot
+;;; hide a painting bug — the painting has already happened by then — but the
+;;; AFTER check and the encode share a process, so if a run fails WITHOUT this
+;;; and passes WITH it, that is itself the finding, and the knob is how you
+;;; establish it in one command instead of one edit.
+(defun gsw-selfcheck-on-p ()
+  (let ((s (%cli-getenv "GLASS_SEND_SELFCHECK")))
+    (not (and s (string= s "0")))))
+
+(defun gsw-check-fb (fb tag)
+  (unless (gsw-selfcheck-on-p) (return-from gsw-check-fb 0))
+  (let ((get (find-symbol "FB-GET" "GLASS"))
+        (w (fb-width-of fb)) (h (fb-height-of fb))
+        (bad 0) (zero 0) (fx -1) (fy -1) (fgot 0) (fwant 0) (y 0))
+    (loop
+      (when (>= y h) (return nil))
+      (let ((x 0))
+        (loop
+          (when (>= x w) (return nil))
+          (let ((got (funcall get fb x y))
+                (want (gsw-pixel x y)))
+            (unless (eql got want)
+              (setq bad (+ bad 1))
+              (when (eql got 0) (setq zero (+ zero 1)))
+              (when (< fx 0) (setq fx x fy y fgot got fwant want))))
+          (setq x (+ x 1))))
+      (setq y (+ y 1)))
+    (format t "~&FB-SELFCHECK ~a: bad=~d zero=~d" tag bad zero)
+    (when (>= fx 0)
+      (format t " first=(~d,~d) index=~d got=~x want=~x"
+              fx fy (+ (* fy w) fx) fgot fwant))
+    (format t "~%")
+    (finish-output)
+    bad))
+
 (defvar *mode*
   (let ((s (%cli-getenv "GLASS_SEND_MODE")))
     (cond ((null s) "both")
@@ -133,6 +184,9 @@
           (sys-exit 1))
         nil)
     (format t "~&MODE ~a~%" *mode*)
+    ;; BEFORE the port line, so the picture is graded before any client can
+    ;; connect and nothing about the transfer can be blamed for it.
+    (gsw-check-fb fb "before-serving")
     (format t "~&PORT ~d~%" port)
     (finish-output))
   (let* ((conn (sb-bsd-sockets:socket-accept listener))
@@ -155,6 +209,7 @@
       (finish-output)
       (format t "~&worker joined: ~s~%" (sb-thread:join-thread th))
       (finish-output))
+    (gsw-check-fb fb "after-serving")
     (sb-bsd-sockets:socket-close conn))
   (sb-bsd-sockets:socket-close listener))
 

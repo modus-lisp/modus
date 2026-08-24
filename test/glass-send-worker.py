@@ -73,21 +73,49 @@ def main():
     if nrects != 2:
         print(f"  FAIL {nrects} rectangles, expected 2"); ok = False
 
+    # EVERY BAD PIXEL IS COUNTED, not just the first.  Stopping at the first
+    # mismatch cannot tell ONE lost pixel from a corrupted RUN, and those are
+    # different bugs — a single wrong pixel at a layout-dependent index is a
+    # lost store, a contiguous run is a buffer or a boundary.  Zeros are
+    # counted apart from other wrong values for the same reason: the
+    # framebuffer's fill is 0, so a zero is "nobody wrote this" and a non-zero
+    # mismatch is "somebody wrote the wrong thing".
     off = 4
+    bad = 0
+    zeros = 0
+    runs = []          # (start_index, length) of consecutive bad pixels
+    shown = []
     for want in ((0, 0, FBW, BAND), (0, BAND, FBW, FBH - BAND)):
         rx, ry, rw, rh, enc = struct.unpack(">HHHHi", buf[off:off + 12])
         if (rx, ry, rw, rh) != want or enc != 0:
             print(f"  FAIL rect ({rx},{ry},{rw},{rh}) enc={enc}, expected {want} enc=0")
             ok = False
         off += 12
+        prev_bad = None
         for i in range(0, rw * rh):
             v = struct.unpack("<I", buf[off + i * 4:off + i * 4 + 4])[0] & 0xFFFFFF
             w = expected_pixel(rx + (i % rw), ry + (i // rw))
             if v != w:
-                print(f"  FAIL pixel {i} of rect at y={ry}: got {v:#08x} want {w:#08x}")
-                ok = False
-                break
+                bad += 1
+                if v == 0:
+                    zeros += 1
+                if prev_bad is not None and i == prev_bad + 1:
+                    runs[-1][1] += 1
+                else:
+                    runs.append([i, 1])
+                prev_bad = i
+                if len(shown) < 5:
+                    shown.append(
+                        f"    pixel {i} (x={rx + i % rw},y={ry + i // rw}) "
+                        f"stream-byte {off + i * 4}: got {v:#08x} want {w:#08x}")
         off += rw * rh * 4
+
+    if bad:
+        ok = False
+        print(f"  FAIL {bad} bad pixel(s), {zeros} of them zero, "
+              f"in {len(runs)} run(s); longest run {max(r[1] for r in runs)}")
+        for line in shown:
+            print(line)
 
     print("CLIENT: COMPLETE AND CORRECT" if ok else "CLIENT: COMPLETE BUT WRONG")
     return 0 if ok else 1

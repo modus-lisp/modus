@@ -1,0 +1,109 @@
+kiln diff — PRODUCED, NOT APPLIED.  kiln is READ-ONLY.
+
+Two files: one new, one two-hunk change to boot/entrypoint.sh.  Nothing in it
+listens unless the subcommand is named, and the port is an argument.
+
+diff --git a/boot/entrypoint.sh b/boot/entrypoint.sh
+--- a/boot/entrypoint.sh
++++ b/boot/entrypoint.sh
+@@ -13,6 +13,18 @@
+ # Every entry point runs from the saved core, so the McCLIM compile that the
+ # image build already paid for is never paid again.
+ lisp() { exec sbcl --core "$CORE" --control-stack-size 256 --dynamic-space-size "${KILN_HEAP:-4096}" "$@"; }
+ 
++# modus-lisp's OWN Lisp, as the HOST rather than as a guest.  Everything above
++# runs glass on SBCL; this runs glass on modus.  There is no --core: modus does
++# not save images, so every start pays its own compile of whatever it loads.
++#
++# It is a SEPARATE function and not a flag on lisp(), because the two are not
++# interchangeable — the core has McCLIM in it and modus has no McCLIM, so the
++# desktop subcommand cannot be served this way and must not silently try.
++modus_lisp() {
++  [ -x "$ROOT/modus/modus" ] || { echo "kiln: no modus binary at $ROOT/modus/modus" >&2; exit 1; }
++  exec "$ROOT/modus/modus" "$@"
++}
++
+ # Is something LISTENING on this port, in this namespace?
+@@ -120,6 +132,34 @@
+   lock)
+     # Refresh repos.lock against the org's live refs and print it to stdout.
+     # Runs on a plain sbcl, not the core: the core has no cairn in it.
+     exec sbcl --script /kiln/boot/lock.lisp "$@"
+     ;;
+ 
++  modus-rfb)
++    # glass's RFB SERVER — the :glass system and nothing above it — running on
++    # modus instead of on SBCL.  NOT the desktop: that is mcclim-glass, which
++    # needs McCLIM, sb-concurrency and glass/term, none of which modus has.
++    #
++    # THE PORT IS AN ARGUMENT AND HAS NO DEFAULT.  `kiln run modus-rfb' with no
++    # port prints usage and exits; it does not pick 5900 and it does not pick an
++    # ephemeral one, because a VNC client has to be told a number in advance and
++    # a number nobody chose is not one you can be told.  It binds 127.0.0.1 and
++    # there is no argument that changes that — publishing it is kiln's own
++    # --vnc plumbing, one layer up, where it already is.
++    port=${1:-}
++    [ -n "$port" ] || { echo "usage: kiln run modus-rfb PORT" >&2; exit 2; }
++    shift
++    case "$port" in
++      ''|*[!0-9]*) echo "kiln: modus-rfb: PORT must be a number" >&2; exit 2 ;;
++    esac
++    [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || {
++      echo "kiln: modus-rfb: PORT out of range" >&2; exit 2; }
++    echo "kiln: glass RFB on modus — 127.0.0.1:$port"
++    MODUS_RFB_PORT=$port modus_lisp --script /kiln/boot/modus-rfb.lisp "$@"
++    ;;
++
+   shell|sh)
+
+--- /dev/null
++++ b/boot/modus-rfb.lisp
+@@
++;;;; modus-rfb.lisp — glass's RFB server, on modus, on a port the caller named.
++;;;;
++;;;;   kiln run modus-rfb 5999
++;;;;
++;;;; NOT the desktop.  This loads the ASDF system :glass and nothing above it:
++;;;; packages, record, framebuffer, clipboard, perf, socket, rfb, zrle, over
++;;;; cram.  mcclim-glass is a different and much larger system and modus has
++;;;; none of what it needs.
++;;;;
++;;;; LOADED BY PATH AND NOT BY QUICKLOAD, deliberately: modus's ASDF interface
++;;;; is a naming layer over its own loader and the point of this entry point is
++;;;; to be explicit about exactly which eight files are being asked for.
++;;;;
++;;;; NOTHING LISTENS UNTIL THE LAST FORM.  Loading this file's dependencies
++;;;; opens no socket; the bind happens in GLASS:SERVE, once, on the port the
++;;;; environment names, on 127.0.0.1.
++
++(defvar *root* (or (sb-ext:posix-getenv "MODUS_ROOT") "/opt/modus-lisp"))
++
++(defun kiln-load (system file)
++  (load (format nil "~A/~A/src/~A.lisp" *root* system file)))
++
++(dolist (f '("packages" "deflate" "inflate" "prefix" "lzw")) (kiln-load "cram" f))
++(dolist (f '("packages" "record" "framebuffer" "clipboard" "perf" "socket"
++             "rfb" "zrle"))
++  (kiln-load "glass" f))
++
++(let* ((s (sb-ext:posix-getenv "MODUS_RFB_PORT"))
++       (port (and s (parse-integer s :junk-allowed t))))
++  (unless (and port (> port 0) (< port 65536))
++    (format *error-output* "~&modus-rfb: MODUS_RFB_PORT is not a port.~%")
++    (sb-ext:exit :code 2))
++  (let ((fb (funcall (find-symbol "MAKE-FRAMEBUFFER" "GLASS")
++                     (or (and (sb-ext:posix-getenv "MODUS_RFB_W")
++                              (parse-integer (sb-ext:posix-getenv "MODUS_RFB_W")
++                                             :junk-allowed t))
++                         1024)
++                     (or (and (sb-ext:posix-getenv "MODUS_RFB_H")
++                              (parse-integer (sb-ext:posix-getenv "MODUS_RFB_H")
++                                             :junk-allowed t))
++                         768))))
++    (format t "~&modus-rfb: glass:serve on 127.0.0.1:~D~%" port)
++    ;; :ADDRESS "127.0.0.1" IS NOT OPTIONAL AND IS NOT THE DEFAULT.  glass's
++    ;; SERVE defaults to "0.0.0.0" (src/rfb.lisp:958) — every interface — which
++    ;; is glass's call to make and not this entry point's to inherit.  kiln
++    ;; publishes a port with its own --vnc plumbing; the server inside the
++    ;; container binds loopback.
++    (funcall (find-symbol "SERVE" "GLASS") fb port :address "127.0.0.1")))

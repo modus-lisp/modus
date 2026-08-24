@@ -1337,6 +1337,105 @@ eight-thread body is fixnum arithmetic, raw memory and syscalls.  Carving N
 regions is a change to the carve.  Until then a thread-per-client server can
 have its threads but not its conses.
 
+### Sixteen regions, one per thread — a thread that can cons
+
+`%HA-CARVE` now produces **one region per thread slot** (`%HA-MAX-REGIONS` = 16),
+each with its own semispace pair, its own 64-byte control block at band
+`+0xA000 + 64i`, its own root window bounded by **that thread's** stack, and its
+own collection count.  `%HA-FIT-REGIONS` decides how many the heap affords —
+sixteen at 896 MB semispaces, **never fewer than two**, so an image that only
+ever afforded the historic pair carves the historic pair at the historic
+addresses and `*HA-R1-FROM*` / `*HA-R2-FROM*` still name them.  `%THR-MAX-THREADS`
+is now *defined as* `%HA-MAX-REGIONS`, so a slot without a region cannot exist.
+
+**A thread gets its heap exactly when it can have one.**  The spawner
+initialises the slot's region before the clone (it is the side that knows the
+stack it just mapped, and the only side that may compute the metadata scale);
+the trampoline adopts it *after* stamping its CPU id, because which
+active-region cell it writes comes from that stamp.  All of it is gated on
+per-CPU active-region storage being ON — with the mode word off, every
+`%GC-SET-REGION` writes one shared word.  Mode off ⇒ no region ⇒ this layer
+behaves exactly as it did.
+
+**ACCEPTANCE:** `test/hosted-many-regions.lisp`, **106 checks**.  Eight threads,
+eight heaps, twelve forced collections each, all eight inside one barrier at
+once; each block's own count 0 → 12 (eight counters, not one); worker *i* holds
+400+7*i* links and must walk back **its own** answer, so eight different
+numbers; with the workers gone the driver collects its own region twice and
+every worker's heap **and** control block is bit-for-bit identical across it,
+with the checksum asserted **non-zero** first and all eight asserted
+**distinct**; `%GC-COUNT-FOREIGN-REFS` over all **56 ordered pairs** = 0 with a
+positive control of 1; region 0 collected **0** times; 85 collector entries
+while another collector was already inside.
+
+**Two defects the test found, both real.**  (1) The per-thread record was 64
+bytes and the heap fields did not fit — a region control block written at
+`rec+0x40` landed on the *next* record's STATE word, so eight threads came back
+on slots 1,3,5,…,15 and four of the audited regions were never initialised.
+Records are 128 bytes now.  (2) Eight identical chains give eight **identical**
+checksums: `%GC-SUM-RANGE` folds to 24 bits and the regions are 16 MB = 2^24
+apart, so the only thing that differs between two live heaps is exactly what it
+masks away.  "Region B is unchanged" would have held if B held C's data.
+
+### The sb-thread / sb-bsd-sockets surface, and two compiler bugs it exposed
+
+`net/sb-thread-shim.lisp` and `net/sb-sys-shim.lisp` are the **SBCL
+compatibility surface** glass asks modus for — `SB-THREAD`, `SB-BSD-SOCKETS`,
+`SB-POSIX`, `SB-SYS`, `SB-ALIEN`, and `SB-EXT` (which **did not exist** in this
+image: measured, `(find-package "SB-EXT")` ⇒ NIL, while glass says
+`sb-ext:posix-getenv` 34 times).  Both are **evaluated at boot from a baked
+source string**, like `net/genera-compat.lisp` and for one more reason: these
+packages exist ON THE HOST AND ARE LOCKED, so merely *reading*
+`sb-thread::threadp` host-side is a package-lock violation.  `MODUS_NO_SB=1`
+skips both.  The features pushed are `:SB-THREAD` and `:SB-BSD-SOCKETS` and
+**not** `:SBCL`.
+
+**ACCEPTANCE:** `test/hosted-sb-thread.lisp` (44 checks) and
+`test/hosted-sb-sockets.lisp` (52 checks).
+
+**THE JIT DID NOT KNOW ABOUT THE PER-THREAD WINDOW.**  The runtime co-init set
+`*X64-TLS-WINDOW*` (the translator half) and **not** `*TLS-WINDOW*` (the
+compiler half, which is what *sets* the width bit).  So every JIT-compiled
+`MULTIPLE-VALUE-BIND`, `HANDLER-CASE` and `UNWIND-PROTECT` reached the MAIN
+thread's window from whatever thread it ran on.  Measured before the fix: a
+JIT-compiled thread body whose whole content was `(handler-case 222 (error (c)
+-1))` died with an MVM CALL-IND through a non-callable target, while
+MULTIPLE-VALUE-BIND and LOOP in the same position were fine — the shape of a
+shared **handler-frame stack**.  One `setq` in `mvm/build-cli-common.lisp`.
+
+**`SYSCALL3` FROM JIT-COMPILED CODE RETURNS THE SYSCALL NUMBER** when a global
+read is in the same function.  Measured, no shim involved:
+
+```
+(defvar *a* <an address>)
+(defun f3 () (syscall3 39 *a* 0 0))            => 39      ; NOT the pid
+(defun f4 (x) (syscall3 39 x 0 0))             => 804095  ; correct
+(defun f2 () (let ((a *a*)) (syscall3 49 41 a 16))) => 49
+(defun f1 (fd a len) (syscall3 49 fd a len))   => -9 (EBADF), correct
+```
+
+The syscall IS issued; the RESULT is wrong, and a non-negative wrong result is
+indistinguishable from success to a caller checking for `-errno`.  That is how a
+`socket-bind` that appeared to succeed left a socket bound to nothing.
+**NOT FIXED.**  Routed around: the shim issues no syscalls at all, and
+`net/hosted-sockets-post.lisp` gained an AOT `%SBS-*` floor it calls instead.
+
+**`(LISTEN stream)` ON A DRAINED SOCKET ANSWERED T** — fixed, via a
+`%FD-INPUT-READY-P` seam whose conservative default lives where `LISTEN` can see
+it (`mvm/cl-fileio.lisp`) and whose real zero-millisecond `poll(2)` lives where
+`poll` can be called (`net/hosted-sockets-post.lisp`).
+
+**THE CEILING, MEASURED.**  8 threads x 20 000 locked increments through the AOT
+primitives is EXACT, five batches running, slots and regions reused correctly.
+The same 8 threads at 2000 iterations **through runtime-JIT-compiled code**
+fault NON-DETERMINISTICALLY inside the MVM (`LONGJMP with no active
+handler-case`, `unknown opcode #x4 at PC N`).  Region 0 collected **zero** times
+in every such run, so it is not the documented region-0-from-a-worker-stack
+hazard; not thread count (4 threads faults too), not slot reuse, not the futex
+primitives.  It is bounded to **calling a runtime-JIT-compiled function from a
+worker thread, at a rate**, and it is the ceiling that stands between the shim
+and running glass.
+
 ### The socket layer becomes usable by a SERVER: unbounded transfers, per-CPU buffers, poll(2)
 
 The campaign is threads -> sockets -> glass.  `net/hosted-sockets.lisp` already

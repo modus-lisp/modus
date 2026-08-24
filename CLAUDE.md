@@ -1436,6 +1436,104 @@ primitives.  It is bounded to **calling a runtime-JIT-compiled function from a
 worker thread, at a rate**, and it is the ceiling that stands between the shim
 and running glass.
 
+### THE CARVE TOOK MEMORY THAT WAS STILL IN USE — and all eight glass files load
+
+`%HA-CARVE` takes the top ~272 MB of region 0's 896 MB semispaces for the actor
+band and the sixteen per-thread regions, then **zeroes four ranges inside what
+it took**.  It never asked whether anything was living there.
+
+At boot nothing is: every selftest in `net/hosted-actors.lisp` calls
+`%HA-PERCPU-INIT` on its first line, so every measurement this layer has ever
+taken was taken from a nearly fresh heap.  **A REAL PROGRAM DOES NOT CARVE AT
+BOOT.**  The carve is reached from `%HA-BASE` ← `%SYNC-CELL-CTL` ← the FIRST
+`sb-thread:make-mutex` a program executes, and a program asks for its first lock
+whenever it happens to want one.  glass wants one at
+`(defvar *session-clipboard-lock* (%clip-make-lock))` — `src/clipboard.lisp`,
+the fourth file — by which point loading cram's five files and glass's first
+three has pushed the allocation frontier **past the carve point**.  Measured,
+not inferred: with the fix in place that load reports
+`*ha-carve-collections*` = **1**, which is the count of times the frontier was
+found above `from0 + new0`.
+
+**THE ZEROING WAS NEVER THE BUG, AND AN EARLIER ROUND FIXED THE WRONG HALF.**
+The comment at `+0xC000` in that file records the first face of this: a non-zero
+word at `%SYNC-CELL-CTL`'s spin lock, left over from region 0's from-space, hung
+the first `MAKE-MUTEX` at a full core — and the answer was to zero that range
+too.  That cures the hang by *widening the damage*.  All four `%HA-ZERO` ranges
+were writing over live objects.
+
+**WHAT IT LOOKED LIKE, so the shape is recognisable next time.**  The keyword
+`:NAME` came back with a wrecked header, so `SYMBOLP` said NIL, so the compiler's
+terminal arm reported `WARN: cannot compile #<?>, using nil` **on the next form
+read** — a literal silently replaced by NIL — and the `TYPE-ERROR` that followed
+carried a condition object whose own type-name slot was garbage, so
+`%CONDITION-P` rejected it, so `handler-case` matched no clause (**including a
+`T` clause**) and it escaped to LOAD's swallow as
+`!! UNHANDLED-ESCAPE load-toplevel-form-swallowed: #(#<?111> NIL)`.
+
+**THAT ESCAPE IS NOT A CONDITION-SYSTEM BUG.**  Two independent findings, both
+measured.  (1) The signal is raised while the **toplevel form is being
+COMPILED**, before the `handler-case` in it has been armed — so there is no
+frame to catch it and `(handler-case (eval '…) (t (c) …))` fails identically.
+(2) Where a runtime signal *is* involved, the condition's type-name is a wrecked
+pointer, so every `(typep *current-condition* 'X)` is NIL by construction.
+`handler-case` was doing exactly what it was told.  In the same image
+`(handler-case (error "boom") (t (c) :CAUGHT))` and `(handler-case (car 5) …)`
+both catch, and `*CATCH-ACTIVE*` is NIL.
+
+**IT IS NOT A MISSED GC ROOT, AND THE MEASUREMENT THAT SETTLES IT IS `%GC-COUNT`
+= 0.**  `(%gc-count)` reads **0** at boot, after each of cram's five files, after
+each of glass's first three, and immediately before the failing call.  A
+forwarding pointer can only be written by `copy_object`, which only runs during
+a collection, and no collection had run.  The low-nibble-#xF headers are real
+forwarding words — they are the tracks of the **first** collection, which the
+shrink itself provokes by moving the limit below the frontier — but they are
+downstream of the carve, not the cause of it.  The missed reference is not one
+`scan_word` forgot: it is every object above the new boundary, which the shrink
+put **outside the region** while the band overwrote it.
+
+**THE FIX: `%HA-CARVE-ROOM`.**  Ask, before committing, whether the live
+frontier (`GET-ALLOC-PTR`) is at or below the carve point.  If it is not,
+**collect region 0 once** — a Cheney collection compacts the live set to the
+bottom of the new from-space, which is exactly the shape that makes the top
+spare again, and it is the region's ordinary collector rather than a side door —
+then re-read and re-ask.  Still over (a program with >620 MB genuinely live) is
+an honest **0**, the same answer a heap too small to carve from already gets: a
+refusal is a mutex the caller cannot have, a silent carve is a heap the caller
+cannot trust.  `*HA-CARVE-COLLECTIONS*` and `*HA-CARVE-REFUSALS*` are counts, so
+"it happened and nobody noticed" is distinguishable from "it never happened".
+`%HA-CARVE-NEW0` is split out and used by **both** sides, so the address the
+check guards cannot drift from the address the carve uses.  The collection FLIPS
+the semispaces, so `%HA-CARVE` re-reads `from0`/`to0`/`size0` after it.
+
+Degrades to the historic behaviour by construction: a `VA` of 0, or one outside
+`[from0, from0+size0)`, means this is not a live Cheney region (bare metal, an
+uninitialised image) and the check abstains.
+
+**RESULT: ALL EIGHT FILES OF THE `:glass` SYSTEM LOAD ON MODUS** — packages,
+record, framebuffer, clipboard, perf, socket, rfb, zrle, over cram's five — from
+a plain `./modus --script`, with no early-carve workaround and
+`refusals=0`.  It was four before.
+
+**AND THE NEXT WALL, NAMED:** `GLASS:SERVE-ONE` gets as far as opening its
+socket and dies in the shim, not in glass —
+`SIMPLE-ERROR | make-instance: invalid initarg ~S ARGS=(TYPE)`.  `sb-bsd-sockets`
+makes an `INET-SOCKET` with `:TYPE` and `:PROTOCOL`; `net/sb-sys-shim.lisp`'s
+class does not take them.  That is a shim gap with a name, which is a different
+kind of problem from the one this section is about.
+
+**RESIDUAL, STATED RATHER THAN HIDDEN.**  The forced collection happens while an
+interpreted/JIT'd **toplevel form is executing**, and that form then re-runs part
+of itself: the eight-file load prints `>> packages … >> clipboard` and then
+`>> packages` again, because the `DOLIST` restarted.  Harmless here (the forms
+are idempotent `DEFUN`s and the load completes correctly) and pre-existing — it
+is the same shape as the documented "`%GC-COLLECT-HERE` at an interpreted
+`--script` toplevel breaks the next `(format t …)`" — but the carve is now a
+place that *reaches* it, so it is on the critical path and it was not before.
+`(%gc-count)` read from an interpreted toplevel after such a collection also
+misbehaves.  Both are the same unfixed defect and both are one level below this
+one.
+
 ### The socket layer becomes usable by a SERVER: unbounded transfers, per-CPU buffers, poll(2)
 
 The campaign is threads -> sockets -> glass.  `net/hosted-sockets.lisp` already

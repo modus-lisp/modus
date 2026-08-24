@@ -144,6 +144,11 @@
 (defvar *ha-r1-to* 0)
 (defvar *ha-r2-from* 0)
 (defvar *ha-r2-to* 0)
+;; THE CARVE'S OWN LEDGER.  Both are counts, not flags, so "it happened once and
+;; nobody noticed" is distinguishable from "it never happened" — the same reason
+;; %HA-ALIGN-CONTROL exists.  See %HA-CARVE-ROOM.
+(defvar *ha-carve-collections* 0)  ; forced collections the carve needed to fit
+(defvar *ha-carve-refusals* 0)     ; carves declined because live data was in the way
 
 (defun %ha-zero (start end)
   "Zero [START,END) a machine word at a time.  Raw byte addresses."
@@ -197,10 +202,81 @@
       (setq n (+ n 1)))
     (if (< n 2) 2 n)))
 
+(defun %ha-carve-new0 (size0)
+  "The byte offset into a semispace of SIZE0 at which the carve begins — the
+   band base, and the new size of region 0.  Split out of %HA-CARVE because
+   %HA-CARVE-ROOM has to know the answer BEFORE the carve commits to it."
+  (let* ((s #x1000000)
+         (g #x1000000)
+         (n (%ha-fit-regions size0 g s (%ha-max-regions))))
+    (logand (- size0 (+ g (+ (* n s) 4096))) (- 0 4096))))
+
+(defun %ha-carve-room (from0 size0)
+  "MAKE ROOM FOR THE CARVE, OR SAY THERE IS NONE.  Returns 1 if region 0's live
+   allocation frontier is at or below the carve point (so the carve takes only
+   memory nothing is using), and 0 if it is not.
+
+   THE CARVE IS NOT FREE MEMORY UNLESS NOTHING HAS REACHED IT YET, and nothing
+   used to check.  %HA-CARVE takes the top ~272 MB of an 896 MB semispace and
+   then ZEROES four ranges inside it (the control head, the region control
+   blocks, the upper scratch, the actor table).  Called at boot — which is what
+   every selftest in this file does, via %HA-PERCPU-INIT on its first line —
+   the allocation frontier is nowhere near that and the memory really is spare.
+   Called LATE it is not spare at all: it is live heap, and the zeroing lands on
+   whatever objects are there.
+
+   THAT IS NOT HYPOTHETICAL.  The carve is reached from %HA-BASE, which is
+   reached from %SYNC-CELL-CTL, which is reached from the FIRST
+   `sb-thread:make-mutex' a program executes — and a program asks for its first
+   lock whenever it happens to want one, not at boot.  Loading cram's five files
+   and glass's first three under `./modus' and then asking for one mutex put the
+   frontier past the carve point, and the zeroing destroyed live objects: the
+   keyword :NAME came back with a wrecked header, so SYMBOLP said NIL, so the
+   compiler's terminal arm reported `WARN: cannot compile #<?>, using nil' on
+   the NEXT form read, and the TYPE-ERROR that followed had a condition object
+   whose own type-name slot was garbage.  An earlier round saw one face of this
+   — a non-zero word at +0xC800 read as an already-held spin lock, hanging the
+   first MAKE-MUTEX at a full core — and answered it by zeroing that range too,
+   which cures the hang by widening the damage.  The zeroing was never the bug.
+
+   SO: COLLECT FIRST, THEN RE-ASK.  A Cheney collection compacts the live set to
+   the bottom of the (new) from-space, which is exactly the shape that makes the
+   top spare again, and it is the region's ordinary collector rather than a side
+   door.  If the frontier is still past the carve point afterwards — a program
+   with more than ~620 MB genuinely live — the answer is 0 and %HA-CARVE returns
+   an honest 0, the same answer a heap too small to carve from already gets.
+   A refusal is a mutex the caller cannot have; a silent carve is a heap the
+   caller cannot trust.
+
+   CALLERS RE-READ from0/to0 AFTER THIS.  The collection FLIPS the semispaces,
+   so every field read before it is stale on the way out.
+
+   Degrades to the historic behaviour when the frontier cannot be read: a
+   VA of 0, or one outside [from0, from0+size0), means this is not a live
+   Cheney region (bare metal, an uninitialised image) and the check abstains."
+  (let ((va (get-alloc-ptr)))
+    (if (or (= va 0) (< va from0) (> va (+ from0 size0)))
+        1
+        (if (<= va (+ from0 (%ha-carve-new0 size0)))
+            1
+            (progn
+              (setq *ha-carve-collections* (+ *ha-carve-collections* 1))
+              (%gc-collect-here)
+              ;; The flip moved everything: re-read the region's own fields.
+              (let* ((k2 (%gc-meta-scale))
+                     (r2 (%gc-region))
+                     (f2 (%gc-meta-read r2 k2))
+                     (s2 (%gc-meta-read (+ r2 #x10) k2))
+                     (v2 (get-alloc-ptr)))
+                (if (<= v2 (+ f2 (%ha-carve-new0 s2)))
+                    1
+                    (progn (setq *ha-carve-refusals* (+ *ha-carve-refusals* 1))
+                           0))))))))
+
 (defun %ha-carve ()
   "Carve the hosted actor band and the per-thread GC regions out of region 0,
    ONCE.  Returns the band's raw byte address, or 0 if the active region is too
-   small to carve from.
+   small to carve from, or if its LIVE DATA is in the way (see %HA-CARVE-ROOM).
 
    The band is NOT size-adaptive: the layout above needs at least 4.2 MB, and
    the only image that bakes this file is the hosted x86-64 CLI, whose
@@ -211,10 +287,14 @@
       *ha-band*
       (let ((k (%gc-meta-scale))
             (r0 (%gc-region)))
-        (let ((from0 (%gc-meta-read r0 k))
-              (to0   (%gc-meta-read (+ r0 #x08) k))
-              (size0 (%gc-meta-read (+ r0 #x10) k)))
-          (if (< size0 #x6000000)
+        ;; ROOM FIRST — it may COLLECT, which flips the semispaces, so every
+        ;; field below must be read after it and not before.
+        (let ((room (%ha-carve-room (%gc-meta-read r0 k)
+                                    (%gc-meta-read (+ r0 #x10) k))))
+        (let ((from0 (%gc-meta-read (%gc-region) k))
+              (to0   (%gc-meta-read (+ (%gc-region) #x08) k))
+              (size0 (%gc-meta-read (+ (%gc-region) #x10) k)))
+          (if (or (= room 0) (< size0 #x6000000))
               0
               ;; NEW0 is page-aligned DOWN so the band base inherits the
               ;; semispace base's alignment.  net/actors.lisp's mailbox pool
@@ -227,12 +307,18 @@
               ;; (%HA-ALIGN-UP-TO-PAGE-BASE, up to 1023 bytes each), and
               ;; without it NEW0's own 4096-rounding can leave a slack of
               ;; exactly zero and the top region would run off the semispace.
+              ;; NEW0 comes from %HA-CARVE-NEW0 and NOT from a second copy of
+              ;; this arithmetic: %HA-CARVE-ROOM checked the frontier against
+              ;; that function's answer, and two spellings that could drift
+              ;; would make the check guard an address the carve does not use.
               (let* ((s #x1000000)
                      (g #x1000000)
                      (n (%ha-fit-regions size0 g s (%ha-max-regions)))
-                     (new0 (logand (- size0 (+ g (+ (* n s) 4096)))
-                                   (- 0 4096))))
-                (%gc-region-shrink r0 new0 k)
+                     (new0 (%ha-carve-new0 size0)))
+                ;; R0 was read before %HA-CARVE-ROOM; a collection there does
+                ;; not move the CONTROL BLOCK (only the semispaces flip), but
+                ;; shrink the block the fields above actually came from.
+                (%gc-region-shrink (%gc-region) new0 k)
                 (setq *ha-rsize* s)
                 (setq *ha-bandsize* g)
                 (setq *ha-nregions* n)
@@ -314,7 +400,7 @@
                 ;; means a GS-relative read and a hosted process starts with a
                 ;; GS base of 0.
                 (%gc-scratch-init (+ *ha-band* #x12000))
-                *ha-band*))))))
+                *ha-band*)))))))
 
 ;;; ============================================================
 ;;; STEP B — per-CPU storage: the GS base

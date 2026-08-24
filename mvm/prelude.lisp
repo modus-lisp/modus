@@ -1039,9 +1039,23 @@
         ;; decimal. "#<?123>" is still a distinctive "unknown type"
         ;; token but lets us tell different unprintable types apart
         ;; in test output.
+        ;;
+        ;; AND SAY SO WHEN THE HEADER IS A FORWARDING POINTER.  The Cheney
+        ;; collector leaves `new_addr | 0x0F' in a moved object's header word
+        ;; and OBJ-SUBTAG is that word's LOW BYTE, so a low nibble of #xF is
+        ;; not a subtag at all — it is the tail of a forwarding pointer, and
+        ;; the value being printed is a STALE reference to an object the
+        ;; collector has already moved.  No subtag runtime/tags.lisp defines
+        ;; has low nibble #xF, so the test is exact and not a heuristic.  The
+        ;; distinction matters: "#<?111>" reads as an unprintable type and
+        ;; sends you to the printer, "#<?F111>" reads as a missed GC root and
+        ;; sends you to the collector.
         (write-char-serial 35) (write-char-serial 60) (write-char-serial 63)
         (when (and (not (fixnump obj)) (not (consp obj)) (not (null obj)))
-          (print-dec (obj-subtag obj)))
+          (let ((st (obj-subtag obj)))
+            (when (= (logand st 15) 15)
+              (write-char-serial 70))          ; F — stale forwarding header
+            (print-dec st)))
         (write-char-serial 62))))))
 
 (defun princ-object (obj)

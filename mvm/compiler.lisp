@@ -10089,6 +10089,36 @@
         ((or (= kw 226908395) (= kw 463569520)) :when)  ; WHEN IF
         ((= kw 64017389) :unless)))  ; UNLESS
 
+;;; CLHS 6.1.3: COLLECT, APPEND and NCONC are ONE accumulation category
+;;; ("list"), so several of them with no INTO — or several INTO the SAME
+;;; variable — build a SINGLE list, in source order.  They used to get one
+;;; accumulator EACH here, and the LOOP returned whichever was declared
+;;; first: `(loop for k in '(1 2 3) if (evenp k) collect k else nconc
+;;; (list k k))' answered (2) where it must answer (1 1 2 3 3).  That is
+;;; not an exotic shape — it is how glass's BAND-RECTS splits a tall
+;;; rectangle, so a framebuffer taller than one band encoded to ZERO
+;;; rectangles and a VNC client waited forever for pixels that were never
+;;; going to be described.
+;;;
+;;; The unification is REVERSED accumulation for all three, undone once at
+;;; the end.  COLLECT already pushed with CONS and was NREVERSEd at exit;
+;;; APPEND/NCONC now splice their list on REVERSED (REVAPPEND copies, as
+;;; APPEND must; NRECONC destroys, as NCONC may) and ride the same final
+;;; NREVERSE.  So the three share one variable AND one representation, and
+;;; the O(n^2) forward `(append acc expr)' becomes linear as a side effect.
+(defun %loop-acc-list-kind-p (kind)
+  "True when KIND accumulates into CLHS 6.1.3's `list' category, i.e. it
+   may legally share one accumulator with the other two."
+  (member kind '(:collect :collect-when :append :nconc)))
+
+(defun %loop-acc-group (kind)
+  "The accumulation CATEGORY of KIND — accumulators of the same category
+   with no INTO share one variable.  NIL for kinds that share nothing."
+  (cond ((%loop-acc-list-kind-p kind) :list)
+        ((member kind '(:sum :count)) :numeric)
+        ((member kind '(:maximize :minimize)) :extremum)
+        (t nil)))
+
 (defun %loop-acc-stmt (kind expr into-var)
   "Build the body statement for a single accumulator clause inside a
    WHEN/IF/UNLESS branch.  INTO-VAR is the variable to write into.  The
@@ -10098,8 +10128,8 @@
     (:collect `(setq ,into-var (cons ,expr ,into-var)))
     (:sum     `(setq ,into-var (+ ,into-var ,expr)))
     (:count   `(when ,expr (setq ,into-var (+ ,into-var 1))))
-    (:append  `(setq ,into-var (append ,into-var ,expr)))
-    (:nconc   `(setq ,into-var (nconc ,into-var ,expr)))
+    (:append  `(setq ,into-var (revappend ,expr ,into-var)))
+    (:nconc   `(setq ,into-var (nreconc ,expr ,into-var)))
     (:maximize `(let ((%v ,expr))
                   (setq ,into-var (if (null ,into-var) %v
                                       (if (%loop-gt %v ,into-var) %v ,into-var)))))
@@ -10255,7 +10285,13 @@
                     ;; otherwise allocate a fresh one.
                     (let ((existing
                            (dolist (ci (loop-state-cond-into-acc state) nil)
-                             (when (and (eq (cdr ci) kind)
+                             (when (and (if (%loop-acc-group kind)
+                                            ;; same CATEGORY, not merely the
+                                            ;; same word: COLLECT/APPEND/NCONC
+                                            ;; are one accumulator (CLHS 6.1.3)
+                                            (eq (%loop-acc-group (cdr ci))
+                                                (%loop-acc-group kind))
+                                            (eq (cdr ci) kind))
                                         ;; only treat as shared if it was
                                         ;; an anon (registered via :anon-cond)
                                         (find-if
@@ -11186,9 +11222,21 @@
          ;; running value across iters.  Groups:
          ;;   - :maximize / :minimize  (extremum) — loop10 61
          ;;   - :sum / :count          (numeric)  — loop10 82/83
+         ;;   - :collect / :append / :nconc  (list)      — CLHS 6.1.3
+         ;; The LIST group is seeded from an :anon-cond var when the loop
+         ;; already has one, because that gensym is baked into body-forms
+         ;; by parse-cl-loop and cannot be renamed here — so a top-level
+         ;; COLLECT and a conditional NCONC land on the SAME variable.
          (acc-vars
           (let ((shared-extremum nil)
-                (shared-numeric nil))
+                (shared-numeric nil)
+                (shared-list
+                  (let ((found nil))
+                    (dolist (a accs found)
+                      (when (and (null found)
+                                 (eq (car a) :anon-cond)
+                                 (%loop-acc-list-kind-p (caddr a)))
+                        (setq found (cadr a)))))))
             (mapcar (lambda (a)
                       (cond ((eq (car a) :anon-cond) (cadr a))
                             ((%loop-acc-into-var a)
@@ -11199,6 +11247,9 @@
                             ((member (car a) '(:sum :count))
                              (or shared-numeric
                                  (setq shared-numeric (%mvm-gensym "NUMACC"))))
+                            ((%loop-acc-list-kind-p (car a))
+                             (or shared-list
+                                 (setq shared-list (%mvm-gensym "LISTACC"))))
                             (t (%mvm-gensym "ACC"))))
                     accs)))
          ;; Picks "the" return-value acc (first non-INTO acc with a value).
@@ -11233,7 +11284,12 @@
     ;; first iteration via (if (null acc) val (max acc val)).
     ;; Shared acc-vars (from grouping anonymous :sum/:count or
     ;; :max/:min) appear multiple times in acc-vars — bind once.
-    (let ((i -1) (bound-vars nil))
+    ;; Seeded with the conditional-INTO vars bound just above: a top-level
+    ;; COLLECT can now SHARE an :anon-cond gensym (one list accumulator per
+    ;; CLHS 6.1.3), and binding it twice in the same LET* would shadow the
+    ;; outer one — harmless today because both inits are NIL, wrong the
+    ;; moment a list kind gets a non-NIL init.
+    (let ((i -1) (bound-vars (mapcar (function car) cond-into)))
       (dolist (acc accs)
         (incf i)
         (let ((av (nth i acc-vars)))
@@ -11471,10 +11527,14 @@
             (:count
              (push `(when ,(cadr acc)
                       (setq ,av (+ ,av 1))) acc-body))
+            ;; REVERSED, like :collect, and undone by the same closing
+            ;; NREVERSE — see %LOOP-ACC-LIST-KIND-P.  REVAPPEND copies its
+            ;; argument (APPEND must not destroy it); NRECONC reuses it
+            ;; (NCONC may).
             (:append
-             (push `(setq ,av (append ,av ,(cadr acc))) acc-body))
+             (push `(setq ,av (revappend ,(cadr acc) ,av)) acc-body))
             (:nconc
-             (push `(setq ,av (nconc ,av ,(cadr acc))) acc-body))
+             (push `(setq ,av (nreconc ,(cadr acc) ,av)) acc-body))
             (:maximize
              (push `(let ((%acc-v ,(cadr acc)))
                       (setq ,av
@@ -11643,7 +11703,7 @@
                (let ((ix -1) (fixups nil) (seen-vars nil))
                  (dolist (a accs)
                    (incf ix)
-                   (when (member (car a) '(:collect :collect-when))
+                   (when (%loop-acc-list-kind-p (car a))
                      (let ((v (nth ix acc-vars)))
                        (unless (member v seen-vars)
                          (push v seen-vars)
@@ -11654,7 +11714,7 @@
                  ;; INTO foo, foo gets pushed twice — fixing it twice would
                  ;; cancel the nreverse.
                  (dolist (ci cond-into)
-                   (when (eq (cdr ci) :collect)
+                   (when (%loop-acc-list-kind-p (cdr ci))
                      (let ((v (car ci)))
                        (unless (member v seen-vars)
                          (push v seen-vars)

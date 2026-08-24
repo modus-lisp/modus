@@ -1509,6 +1509,9 @@ glass is LOADED AT RUNTIME, so `rfb-sender-loop` is JIT-compiled, and it is
 called from a worker thread at 60 Hz.  `test/run-glass-serve.sh` is the thing
 that will notice when that lifts.
 
+**— WRONG ON BOTH COUNTS, AND MEASURED WRONG.  IT WAS TWO DEFECTS AND NEITHER
+WAS THE JIT.  See THE FRAME IS DESCRIBED below.**
+
 **TWO INSTRUMENTS THAT LIE, AND COST HOURS BEFORE THEY WERE CAUGHT.**
 
 * **`GET-INTERNAL-REAL-TIME` IS A CALL COUNTER, NOT A CLOCK.**  It returns 1, 2,
@@ -1518,9 +1521,135 @@ that will notice when that lifts.
   microsecond.  `GET-UNIVERSAL-TIME` is correct; `SLEEP` is correct (verified
   against wall time: `(sleep 5)` costs 5 s of real time and no user time).
   glass uses `get-internal-real-time` as a real unit throughout `rfb.lisp`.
+  **FIXED (243b265) — it is clock_gettime(CLOCK_MONOTONIC) now; see THE CLOCKS
+  ARE CLOCKS below.**
 * **`#'NAME` RESOLVES LATE.**  Saving `#'f` and then redefining `f` gives you
   the NEW `f`, so the classic diagnostic wrapper calls itself until the stack
   dies.  Replace outright when instrumenting; do not wrap.
+
+### THE FRAME IS DESCRIBED: the empty update was a LOOP bug, not a thread bug
+
+**THE SERVER WAS SENDING FOUR BYTES THAT MEANT "ZERO RECTANGLES FOLLOW".**  Read
+off the wire with a permissive Python client that dumps whatever arrives instead
+of asserting: `00 00 00 00` — a FramebufferUpdate header with `n-rects = 0`.  The
+client then waited forever for pixels the server had already decided not to
+describe, which is what "the frame never arrives" was.
+
+The cause is in **this repository's LOOP**, and it is CLHS 6.1.3: COLLECT,
+APPEND and NCONC are ONE accumulation category, and this LOOP gave them one
+accumulator EACH, returning whichever was declared first.
+
+    (loop for k in '(1 2 3) if (evenp k) collect k else nconc (list k k))
+      => (2)          here (before)        => (1 1 2 3 3)   SBCL
+
+That is glass's `BAND-RECTS` verbatim: rectangles short enough to need no
+banding took the COLLECT arm and were described; rectangles TALL enough to need
+banding took the NCONC arm and were **dropped**.  A 96-row framebuffer banded at
+`*MAX-BAND-ROWS*` = 64 came out as NIL.  Fixed in 6a9a72a by making the three
+kinds share one variable AND one representation (all three accumulate reversed —
+`REVAPPEND` for APPEND, which copies; `NRECONC` for NCONC, which may destroy —
+and ride COLLECT's existing closing NREVERSE).
+
+**AFTER IT**, on the wire, from `test/run-glass-serve.sh`'s own server: two
+rectangles, `(0 0 128 64)` and `(0 64 128 32)`, 49180 bytes, pixels matching the
+image the Python client generates for itself.  The 96-row screen in that test
+was chosen on purpose — a 64-row one would have needed no banding and passed
+this whole time.
+
+**AND THE SERVER STOPPED DYING.**  Before: `SIMPLE-ERROR | MVM LONGJMP (TRAP
+#x0511) with no active handler-case`, process gone.  After: server side PASS, 8
+checks, 0 failed, listener closed, fd probe unchanged.
+
+### AND THE SECOND DEFECT, BISECTED: IT IS NOT THE JIT
+
+The client still does not get the whole frame: the transfer stops at **32785
+bytes**, three bytes into the SECOND rectangle's header.
+`test/run-glass-send-worker.sh` is that stop with the RFB session removed — one
+socket, one worker, one `GLASS:SEND-RECTS`, and a Python peer that computes
+49180 itself and checks every pixel.  Four arms differing ONLY by which wrappers
+`RFB-SENDER-LOOP` puts around the call:
+
+| arm | wrappers | result |
+|---|---|---|
+| plain | none | 49180 bytes, every pixel correct |
+| tx | `(let ((glass::*tx* (list 0))) …)` | 49180 bytes, every pixel correct |
+| lock | `(glass::with-fb-locked (fb) …)` | 49180 bytes, every pixel correct |
+| **both** | the two, **nested**, as the sender loop nests them | **32785, then the process dies** |
+
+So it is not the socket, not the encoder (`WRITE-RECT-RAW`'s output for both
+bands is byte-perfect written to a FILE from the same worker), not the thread,
+not the concurrent reader (measured with the main thread parked in `READ-BYTE`
+on that stream and without — no difference), and not either wrapper alone.
+
+**AND IT IS NOT THE JIT.**  The whole family reproduces IDENTICALLY under
+`MODUS_NO_JIT=1` — three runs each, same failure, same place.  So
+`%JIT-ENTRY-FOR`'s per-region `(%gc-count)` re-bake stamp and the unlocked
+`*jit-page-cache*` are **not what is in the way**, whatever else may be wrong
+with them.  Both were standing hypotheses; both are dead.
+
+**WHAT THE EVIDENCE POINTS AT INSTEAD — the RUNTIME-LOCK REGION HOP.**  Not
+proven, and stated as a lead rather than a finding:
+
+* A hot loop reading its source array from a GLOBAL (so every iteration is a
+  `SYMBOL-VALUE`, which takes the runtime lock and hops the active region to
+  region 0) hands a worker back a `(unsigned-byte 8)` array whose element 0 is
+  the CHARACTER `#\V`.  The **identical** loop with the array hoisted into a
+  local — no hop — is correct on two successive workers.  Same binary, same run
+  length, one difference.
+* A run of that shape left a file in the working tree literally named
+  `#<?STALE-FORWARDED-191>`: a global whose value was a pathname STRING came
+  back, on a worker, as a stale forwarding pointer, and `WITH-OPEN-FILE` created
+  a file named after the printed representation of the wreck.
+* The mechanism that would explain it is already named in this file: `%RT-ENTER`
+  parks the caller's frontier and loads REGION 0's from its control block, but
+  the MAIN thread allocates in region 0 **from registers, without the lock**, so
+  the block's frontier is stale by however much main has consed since its last
+  hop.  "Two threads in region 0 with one parked allocation frontier between
+  them" is exactly what `%RT-LEAVE-LOCKED`'s own docstring says the lock exists
+  to prevent — and the lock does not cover main's ordinary allocation, because
+  region 0 IS main's heap.
+* Region 0's collection count is **0** throughout, so this is not the documented
+  "region 0 must not collect from a worker stack" hazard.
+
+The obvious shape of a fix is to stop region 0 being two things at once: either
+give the main thread a region of its own so region 0 is only ever the
+lock-protected shared heap, or give each CPU its own non-collecting slice of
+region 0 for locked-section allocation so no two threads ever share a frontier.
+Both are carve changes and neither was attempted.
+
+### THE CLOCKS ARE CLOCKS (243b265)
+
+`GET-INTERNAL-REAL-TIME` bound `T` — `(let ((t (handler-case (syscall3 201 …))))`
+— so `(integerp t)` asked whether TRUE is an integer, said no, and took the
+call-counter branch on every call regardless of the syscall.  And syscall 201 is
+`time(2)`, whole SECONDS, reported as if it were the thousandths
+`INTERNAL-TIME-UNITS-PER-SECOND` promised; on the AArch64 generic ABI 201 is
+`listen(2)`.  `GET-INTERNAL-RUN-TIME` was `(defun get-internal-run-time () 0)`,
+which made every `(- after before)` zero.
+
+Both now go through a seam — `%IRT-NS` / `%IRUN-NS`, defined at 0 in
+`mvm/ansi-bridge.lisp` ("this target has no clock") and overridden by
+last-defun-wins in `net/hosted-sync.lisp`, which is where `clock_gettime(2)` can
+be called at all because it owns the **per-CPU** timespec scratch (a shared
+timespec is two threads writing one buffer).  Real time is CLOCK_MONOTONIC, run
+time is CLOCK_PROCESS_CPUTIME_ID.  The unit is converted in ONE place
+(`%NS-TO-ITU`) so the clock and `INTERNAL-TIME-UNITS-PER-SECOND` cannot drift
+apart again, and the default is now 1000000 — which is what
+`build-x64-linux`, `build-x64`, `build-aarch64`, `build-aarch64-linux`,
+`build-x64-cl-repl` and `build-rpi-cl-repl` all already SETQ'd it to.  The CLI
+was the odd one out at 1000.
+
+Measured on the built binary: `(sleep 2)` moves it 2000122 units = 2.000122 s;
+two back-to-back calls differ by 11 units; run time over a busy loop 10786
+units, over `(sleep 1)` 30 units.
+
+**A TRAP FOR THE NEXT INSTRUMENTER: `(%GC-COUNT)` IS NOT A COUNT ON x64.**  The
+field is stored raw there and `mem-ref :u64` halves it, so a count of 1 reads
+back as a value whose bit pattern is a CONS tag and prints as garbage.  That
+looked exactly like heap corruption after a forced collection and cost a
+detour.  Read it with `%GC-META-READ`, or `(%gc-read64 (+ (%gc-region) #x20))`.
+This is already written down under "Two traps this cost time on"; it is written
+down again here because it was still walked into.
 
 **THE HARNESSES, ALL RE-RUNNABLE, ALL SBCL-REFERENCED WHERE THAT MEANS
 ANYTHING.**

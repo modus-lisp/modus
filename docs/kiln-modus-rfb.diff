@@ -1,3 +1,45 @@
+kiln diff — APPLIED, and corrected in the applying.  kiln is no longer read-only.
+
+Landed in the kiln repository as `modus-rfb: glass's RFB SERVER, on modus, on a
+port you name' (b26cc7a, LOCAL — not pushed).  Kept here because the diff below
+is what was PROPOSED and the commit is what was NEEDED, and the difference is
+the useful part:
+
+  * kiln had ALREADY grown a `modus' subcommand (3ae2e94) between this diff
+    being written and it being applied, so the entrypoint hunk applied to a
+    file that no longer looked like this.  The MODUS_LISP helper landed as
+    proposed; the `modus-rfb' case landed beside an existing `modus' case
+    rather than after `lock'.
+  * THE DRIVER HALF WAS MISSING.  A case in boot/entrypoint.sh is only
+    reachable as `kiln run modus-rfb PORT', with no port PUBLISHED to the host
+    — so a VNC client on the host could not connect to it and the command was
+    unusable for its stated purpose.  The commit adds `cmd_modus_rfb' to
+    bin/kiln, which publishes through PUBLISH_ON (loopback unless KILN_EXPOSE,
+    the same one widening as everything else here) and refuses 5900-5920.
+  * `[ -x "$ROOT/modus/modus" ]' became MODUS_BIN, so a hand-built binary can
+    be pointed at without editing the script — which matters because of the
+    next point.
+  * THE STALENESS STORY WAS NOT TOLD.  modus is a static ELF built once in the
+    Dockerfile; unlike the SBCL side, where ASDF loads changed systems over the
+    cached core on every start, NOTHING reloads it, so editing the modus
+    checkout changes nothing until `kiln build'.  That is now said in the
+    entrypoint comment, the Dockerfile comment, the README and
+    `kiln modus-rfb --help'.
+  * The claim "modus has no threads and no sockets yet" was still in three
+    places (bin/kiln's help, the Dockerfile comment, the README).  It is false
+    now and was corrected in all three.
+  * A REAL BUG FOUND WHILE READING: the `modus)' case did its own `shift' on
+    top of the dispatcher's, so `kiln modus --eval FORM' reached the binary
+    with `--eval' eaten.
+
+NOT VERIFIED IN A CONTAINER — there is no engine on this machine.  What IS
+verified: `bash -n bin/kiln', `sh -n boot/entrypoint.sh',
+`kiln modus-rfb --help', and the refusals for a non-numeric port and for 5901.
+
+The original text follows, unchanged.
+
+================================================================
+
 kiln diff — PRODUCED, NOT APPLIED.  kiln is READ-ONLY.
 
 Two files: one new, one two-hunk change to boot/entrypoint.sh.  Nothing in it

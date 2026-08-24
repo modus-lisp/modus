@@ -1821,6 +1821,85 @@ cross-region pointer reappears between two service actors.
 `test/run-worker-xregion.sh` is the instrument that would catch it: point its
 audit at the two owners' regions in both directions and require zero.
 
+### WHAT GLASS ACTUALLY INTERNS WHILE SERVING — the gate, measured
+
+The design question was empirical: fresh interns are the only ones that are
+fatal (`intern-same` is clean 3/3), so a 7.8 ms delegated round trip only
+matters if fresh interns happen at frame rate.
+
+**They do not.  They are a WARM-UP COST and they stop.**  The symbol table
+(`0x10000088`) and keyword table (`0x10000148`) each grow by exactly one per
+FRESH intern and not at all for a found one, so sampling their COUNT is a
+fresh-intern odometer that touches nothing on the hot path — no redefinition,
+no instrumentation of the seam.  A sampler thread using only primitives (no
+FORMAT, no keyword literals, so it cannot intern and cannot pollute what it
+measures) over a real `run-glass-serve.sh` session:
+
+| | symbols | keywords |
+|---|---|---|
+| after `:glass` loads | 4070 | 439 |
+| +25 ms | 4072 | 439 |
+| +131 ms | 4078 | 439 |
+| +233 ms | 4088 | 441 |
+| **+334 ms** | **4091** | **441** |
+| +437 ms … +5751 ms (47 more samples) | 4091 | 441 |
+
+**21 fresh symbols and 2 fresh keywords for the whole serve phase**, the last
+of them at 334 ms, and then **47 consecutive samples with zero growth** while a
+client was connected and the sender loop was running.  So delegation would cost
+21 round trips ONCE — about 164 ms at today's broken handoff — and **nothing per
+frame**.  The design is affordable as it stands.
+
+*Honest bound on that:* the sampler thread itself stopped after 5.75 s (58
+samples where 1200 were asked for), so what is established is "flat for 5.4 s of
+active serving", not for the whole session.  At 60 Hz that is still ~324 frames
+with no fresh intern.
+
+**`#x10000C80` IS NOT A FRESH-INTERN COUNTER.**  It looks like one — incremented
+at the top of `%INTERN-SYMBOL-PKG-1`, decremented on the found path — but the
+FRESH path decrements too (line 1926).  It is a re-entrancy DEPTH counter and
+nets to zero.  Use the table counts.
+
+### TERM-ENCODE SENDS SYMBOLS AND STRINGS BY POINTER — demonstrated
+
+The copy-not-share invariant that lets actors have separate regions is supposed
+to be `TERM-ENCODE`'s job.  It dispatches on exactly five shapes — NIL, cons,
+fixnum, array (`#x32`), bignum (`#x30`) — and everything else falls off the end
+into `;; Unknown object type — encode as fixnum`, which writes the object's own
+tagged pointer and labels it tag 1.
+
+Demonstrated rather than read (`test/hosted-term-encode-syms.lisp`), with a CONS
+as the positive control:
+
+    A SYMBOL   tag=1  9 bytes  payload=70D86CFE9509  symbol's own word=70D86CFE9509
+    A STRING   tag=1  9 bytes
+    A CONS     tag=2  19 bytes   <- the control: this one really is serialised
+
+The payload IS the pointer, exactly.  **So cross-actor messages already carry
+cross-region references today**, for two of the most ordinary payload types —
+the same violation class that is fatal for a worker's fresh intern, sitting in
+the message path.
+
+**AND THE DECODER ALREADY HAS THE RIGHT MECHANISM, UNUSED.**  `TERM-DECODE-STEP`
+has a **tag 3** arm that reads a length and bytes and calls `MAKE-STRING` — a
+copy, allocated in the RECEIVER's region, which is exactly right.  It is DEAD
+CODE, because the encoder never emits tag 3.  The asymmetry is the bug: the fix
+for strings is to make the encoder use the arm the decoder already has, and the
+fix for symbols is the same shape one level up — **encode the NAME, and let the
+receiver INTERN it on its own thread, into its own namespace, in its own
+region**, so the symbol and the table that points at it are co-located by
+construction and the audit stays at zero without a barrier or a delegation.
+
+Tag 1's decode arm just reads the raw word back and returns it, so today the
+receiver gets the sender's pointer verbatim — no copy, no intern.
+
+**A NOTE FOR WHOEVER BUILDS IT:** the receiver's namespace then grows with
+whatever names arrive.  Bounded and fine for actor-to-actor traffic; for names
+taken off the WIRE from an untrusted peer it is unbounded growth driven by a
+remote party.  glass reads a protocol with fixed message types and interns
+nothing from it (its 21 fresh interns are all warm-up, and they stop), so
+nothing here does it today.
+
 **A TRAP THIS COST A CYCLE ON: `SYS-EXIT` FROM INSIDE A NESTED `LET*`/`IF` IN A
 `--script` DOES NOT TAKE EFFECT.**  The process ran to the end of the file and
 exited **0** while the verdict line above it said FAIL — and every runner reads

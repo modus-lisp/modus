@@ -27,12 +27,25 @@ cd "$(dirname "$0")/.." || exit 1
 [ -x "$BIN" ] || { echo "no such binary: $BIN" >&2; exit 1; }
 
 RC=0
+# NO PIPELINE, AND THAT IS THE POINT.  This used to read ${PIPESTATUS[0]} to
+# get the arm's exit code through a `| grep'.  PIPESTATUS is a BASH ARRAY: run
+# under sh (dash) the whole line is a `Bad substitution', the shell aborts the
+# statement, RC is never set, and the script prints PASS while the failing arm
+# scrolls past.  A harness that reports a false pass when invoked with the
+# wrong shell is worse than one that does not run at all.
+#
+# So the output goes to a file, the exit code is read directly from $?, and
+# nothing here needs an array.  Checked with `sh' as well as `bash'.
+OUT=$(mktemp) || exit 1
+trap 'rm -f "$OUT"' EXIT
+
 for arm in strings intern; do
   echo "=== ARM $arm ==="
-  XREGION_ARM="$arm" XREGION_K="$K" "$BIN" --script test/hosted-worker-xregion.lisp 2>/dev/null \
-    | grep -E '^(ok|FAIL|===|last object|its name|FOREIGN|worker region|[0-9]+ checks|WORKER CROSS)'
-  # shellcheck disable=SC2181
-  [ "${PIPESTATUS[0]}" -eq 0 ] || RC=1
+  XREGION_ARM="$arm" XREGION_K="$K" "$BIN" --script test/hosted-worker-xregion.lisp \
+      > "$OUT" 2>/dev/null
+  arm_rc=$?
+  grep -E '^(ok|FAIL|===|last object|its name|FOREIGN|worker region|[0-9]+ checks|WORKER CROSS)' "$OUT"
+  [ "$arm_rc" -eq 0 ] || RC=1
   echo
 done
 

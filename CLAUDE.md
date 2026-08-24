@@ -1744,6 +1744,83 @@ The audit is the acceptance test for whichever is chosen —
 `test/run-worker-xregion.sh` goes green when a worker's fresh intern stops
 leaving a pointer behind.
 
+### DELEGATION TO A SERVICE ACTOR — what was measured before building it
+
+The chosen fix is that allocating mutations of the shared tables are performed
+by ONE owner — a dedicated service actor holding the whole interlocked set
+(symbols, keywords, packages, macro tables) in its own region — which every
+other thread, main included, reaches by message.  Four things were measured
+first.  **Two of them are blocking, so no machinery was written.**
+
+**1. WHICH OPERATIONS ACTUALLY HAVE TO DELEGATE.**  The seam wraps eight
+operations; they are not alike:
+
+| operation | allocates & stores? | verdict |
+|---|---|---|
+| `SYMBOL-VALUE` | no — `GETHASH` only | **must NOT delegate.** Still needs the LOCK: `PUTHASH` rehashes and a reader mid-rehash sees neither table |
+| `%MACRO-PKG-GET` | no — lookup | must not delegate; lock only |
+| `%INTERN-SYMBOL-PKG` | **yes** — allocates the symbol, stores it | **delegate** |
+| `%INTERN-KEYWORD` | **yes** — same, and it is HOT (every `:foo` literal) | **delegate** |
+| `%MACRO-PKG-REM` | yes — rebuilds the alist | delegate |
+| `SET-SYMBOL-VALUE` | stores a **CALLER-SUPPLIED** value | **delegation does not fix it** |
+| `%MACRO-PKG-PUT` | stores a **CALLER-SUPPLIED** closure | **delegation does not fix it** |
+
+That last row is the one to face.  Delegation fixes operations whose
+allocation is INTRINSIC — interning builds the symbol itself, so performing it
+on the owner puts it in the owner's region.  It does nothing for operations
+that store an object the CALLER already made: `(setf (symbol-value 'x) obj)`
+puts a pointer to the caller's `obj` in the owner's table no matter which
+thread performs the store.  Those need the value promoted (copied into the
+owner's region) or the reference accepted and the invariant weakened.  Deciding
+that is part of the design, not an implementation detail.
+
+**2. THE INVERTED POINTER DIRECTION IS ALREADY FATAL TODAY.**  After this change
+every thread holds references INTO the owner's region, so that region must
+never collect while anyone runs.  Measured: **region 0 collects** under ordinary
+pressure (count 0 → 1).  And when it does, in evaluated code, the toplevel form
+running at the time is DESTROYED — one probe printed its banner twice with the
+count reading 0 and then 1, i.e. the form was re-executed across the collection,
+and was then swallowed.  So "the owner's region must not collect" is not a new
+requirement to be designed in; it is an existing hazard this design would make
+LOAD-BEARING for every thread at once.  A forced `%GC-COLLECT-HERE` on that
+region is survivable; a natural one under allocation pressure is not.
+
+**3. THE ROUND TRIP COSTS 7.8 MILLISECONDS, AND THAT IS NOT DELEGATION'S FAULT.**
+A two-thread handoff — post, wake the owner, wait, be woken — measured with
+`SB-THREAD`'s own mutex and condvar:
+
+    cross-thread round trip   7 745 000 ns  = 7 745 us   -> 2 per 60 Hz frame
+    direct fresh INTERN         119 472 ns  =   119 us   -> 139 per frame
+    FORMAT NIL alone             61 902 ns  =    62 us
+
+**It is not the condvar timeout**: flat at 8466 / 7848 / 7881 us for timeouts of
+1 s, 20 ms and 2 ms.  Shortening the timeout by 500x changed nothing, so the
+waiter is not sitting out a timeout.  `WITH-MUTEX` takes the no-timeout path,
+`%MUTEX-LOCK`, which this tree documents as parking "with a 20ms timeout so a
+lost wake would be a re-check rather than a hang" — and a mean of ~7.8 ms is
+what you get when a large fraction of acquisitions take that 20 ms recovery.
+**That points at LOST WAKEUPS in the mutex handoff**, which would be a defect
+worth fixing whatever happens to delegation — glass's own `WAKE-SIGNAL` /
+`WAKE-WAIT` is this exact path, at 60 Hz, against a 16 666 us budget.
+
+So the cost of delegation cannot be honestly measured until the handoff is
+fixed: any number taken now measures the lost wake, not the design.  **That is
+the finding, reported with numbers rather than worked around** — and it is not
+a reason to substitute main for the service actor, which would inherit the same
+handoff.
+
+**4. THE OWNER MUST TAKE THE DIRECT PATH.**  A caller that IS the owner must not
+post to itself; with a service actor this is a cheap identity test at the top of
+the seam (`am I the owner? then call the -1 body directly`) rather than the
+delicate case it would have been with main as owner.
+
+**AND THE SPLIT-OWNER TRAP IS REAL AND ALREADY AUDITABLE.**  Interning touches
+packages, keywords ARE a package, and the macro table is keyed per package — so
+symbols/keywords/packages/macros must share ONE owner, or the very same
+cross-region pointer reappears between two service actors.
+`test/run-worker-xregion.sh` is the instrument that would catch it: point its
+audit at the two owners' regions in both directions and require zero.
+
 **A TRAP THIS COST A CYCLE ON: `SYS-EXIT` FROM INSIDE A NESTED `LET*`/`IF` IN A
 `--script` DOES NOT TAKE EFFECT.**  The process ran to the end of the file and
 exited **0** while the verdict line above it said FAIL — and every runner reads

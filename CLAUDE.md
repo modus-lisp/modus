@@ -1900,45 +1900,41 @@ remote party.  glass reads a protocol with fixed message types and interns
 nothing from it (its 21 fresh interns are all warm-up, and they stop), so
 nothing here does it today.
 
-### `MEM-REF` HALVES ON READ — and it broke a fix that had passed its own test
+### THE DECODER'S STRING ARM CALLS A FUNCTION THAT DOES NOT EXIST
 
-    (setf (mem-ref (+ b 5) :u8)  104)   ->  (mem-ref (+ b 5) :u8)  = 52
-    (setf (mem-ref (+ b 1) :u32) 5)     ->  (mem-ref (+ b 1) :u32) = 2
+    (fboundp 'string-set)  =>  NIL
+    grep -rn "defun string-set"  =>  nothing, anywhere in the tree
+    grep -rn "(string-set "      =>  net/actors.lisp:709, and NOWHERE else
 
-Not just `:u64`, and not just `%GC-COUNT`: the tagged-fixnum shift applies to
-the NARROW widths too, so **`MEM-REF` reads back half of what was stored** at
-`:u8` and `:u32`.  A fresh `%MMAP-SHARED-PAGE` makes it worse — there `:u8`
-reads **0** while `%GC-READ64` reads the same bytes correctly, which is what
-made a round-trip harness fail on `CONS`, a path that had not been touched, and
-sent a whole diagnostic down the wrong hole.
+`TERM-DECODE-STEP`'s tag-3 arm — the one that reads a length, reads the bytes
+and rebuilds a string in the RECEIVER's region — fills that string with
+`STRING-SET`, **which is not defined**.  So the arm was dead code in two senses
+at once: nothing ever emitted tag 3, and it could not have worked if anything
+had.  `(MAKE-STRING 5)` returns `"     "`, so a decode through it yields a
+string of the right LENGTH and no content — which is exactly what came back
+when tag 3 was finally emitted.
 
-**READ NARROW FIELDS WITH `%GC-READ64` AND MASK.**  `(logand (%gc-read64 a) 255)`.
+That is the real reason 9f1a577 was reverted in 6a578a3.  `(SETF (AREF s i) c)`,
+`(SETF (CHAR s i) c)` and `(SETF (SCHAR s i) c)` all work; the one-line repair
+is to use one of them and `CODE-CHAR`.
 
-**IT CONDEMNED A COMMITTED FIX, AND THE TEST DID NOT CATCH IT.**  The TERM-ENCODE
-change that made symbols go by name and strings by value (9f1a577) wrote its
-payload with `(setf (mem-ref … :u8) (char-code …))` and was **reverted in
-6a578a3** because the bytes cannot be read back:
+**AND THE REASON RECORDED HERE BEFORE WAS WRONG.**  This section previously
+claimed `MEM-REF` halves on read at `:u8`/`:u32` — 104 reading back 52, 5
+reading back 2 — and told the next reader to write payload bytes with
+`%GC-WRITE64` instead.  **It does not halve, and that instruction was false.**
+Re-measured across every context that differed: a fresh `%MMAP-SHARED-PAGE`
+before the actor band exists, the same page afterwards, the actor staging
+buffer, at `:u8` `:u32` and `:u64`, inside a `DEFUN` and at toplevel in a `LET`,
+with the reads inline in the `FORMAT` arguments and hoisted into locals first.
+**All ten round-trip exactly**, and a second machine could not reproduce the
+halving either.
 
-    "hello"  round-tripped to  "     "     (right length, wrong content)
-    a symbol round-tripped to  NIL
-
-The test that passed it — `test/hosted-term-encode-syms.lisp` — checked the TAG
-and the BYTE COUNT and not the CONTENT, so it went green on an encoder that
-destroys its payload.  That is the same weak-instrument failure this file warns
-about twice already, committed anyway.  **A serialiser test that does not
-round-trip is not a serialiser test.**
-
-The revert is the honest state: symbols and strings still cross the actor
-boundary BY POINTER (the soundness bug stands, `test/hosted-term-encode-syms.lisp`
-still fails), which is worse in theory but works in practice, where the fix
-silently corrupted every string and symbol in an actor message — on a path no
-test in the bar covers, because nothing in the bar sends one.
-
-WHEN IT IS REDONE: use `%GC-WRITE64`/`%GC-READ64` with masking and shifts for
-the payload bytes, and make the test assert the DECODED VALUE — `(equal (rt "hello") "hello")`,
-`(eq (rt sym) (intern "…"))` — through the REAL staging buffer
-(`(staging-base-addr)`, after `%HA-ACTORS-BRINGUP`), not a private mmap page.
-That harness works; it is what produced the numbers above.
+The bogus readout came from a probe that ALSO died on `STRING-SET` being
+undefined and re-executed its toplevel form — the values were printed twice —
+and it was taken on a binary that no longer exists.  One unexplained
+measurement, generalised into a rule, and written down as an instruction: the
+opposite of what the rest of this file is for.  A single reading that cannot be
+reproduced in a second shape is not a finding.
 
 **A TRAP THIS COST A CYCLE ON: `SYS-EXIT` FROM INSIDE A NESTED `LET*`/`IF` IN A
 `--script` DOES NOT TAKE EFFECT.**  The process ran to the end of the file and

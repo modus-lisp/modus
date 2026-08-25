@@ -1943,6 +1943,47 @@ value needs serialising and picks the buffer.
 check would pass even if the decoder returned the sender's pointer.  The
 cross-region half is `test/hosted-term-xregion.lisp`, below.
 
+### LOCAL SYMBOL TABLES: the lookup chain is free, the TABLE is not
+
+Tested before building, because the proposal was that standard CL packages
+might already give it.  **Half of it do.**
+
+**THE LOOKUP CHAIN ALREADY WORKS, EXACTLY AS SPECIFIED.**  With
+`(defpackage "ACTOR-LOCAL" (:use "COMMON-LISP"))`:
+
+    (eq (intern "CAR" "ACTOR-LOCAL") (intern "CAR" "COMMON-LISP"))  =>  T
+    (package-name (symbol-package (intern "CAR" "ACTOR-LOCAL")))    =>  "COMMON-LISP"
+    (fboundp (intern "CAR" "ACTOR-LOCAL"))                          =>  T
+
+So an inherited name resolves to *the* shared symbol, its function cell is
+found, and nothing is allocated — the "must not orphan shared symbols"
+requirement is already met by the package system.  Measured on a WORKER, that
+path leaves **`region 0 -> worker = 0`**.
+
+**BUT A PACKAGE IS NOT A TABLE.**  `%INTERN-SYMBOL-PKG` has exactly ONE store —
+the table at `0x10000088`, in region 0 — keyed by a COMPOSITE of name-hash and
+pkg-hash.  Adding a package adds a key prefix, not a table:
+
+    fresh name in ACTOR-LOCAL   -> shared table 1944 -> 1945   (grew by 1)
+    fresh name in CL-USER       -> shared table 1945 -> 1946   (grew by 1)
+
+and on a worker, 40 fresh names interned into the actor-local package leave
+**`region 0 -> worker = 56`**.  Non-zero, for the same reason as before: the
+symbol is in the worker's region and the table registering it is in region 0.
+
+**SO: reuse the chain, replace the store.**  Local copies of symbols need a
+genuinely PER-REGION intern table — the lookup order (own table, then inherited
+tables read-only, then create locally) is already implemented and correct; what
+has to change is that step three writes into a table that lives in the actor's
+own region rather than into `0x10000088`.  A per-actor PACKAGE gets none of that
+on its own.
+
+**KEYWORDS ARE A SEPARATE STORE ALREADY** — `0x10000148`, not `0x10000088` — so
+they need the same treatment separately, and `:foo` literals are the hot path
+(`compile-keyword` emits an intern for every one).  Whether per-actor keyword
+tables are acceptable is NOT yet measured; the serialised-boundary argument says
+yes and that is reasoning, not evidence.
+
 ### THE CROSS-REGION AUDIT: strings are clean, SYMBOLS ARE NOT
 
 Sender = the main thread (region 0).  Receiver = a worker thread, which owns its

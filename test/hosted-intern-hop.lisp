@@ -63,6 +63,24 @@
 ;;;;   REPRODUCED — survivors are about 1 run in 4, and the six runs attempted
 ;;;;   after that one were four deaths and two hangs.
 ;;;;
+;;;;   AND IT DID NOT REPRODUCE.  Twelve further `percall' runs, each bounded and
+;;;;   classified, with the count read on MAIN after the join exactly as the
+;;;;   theory requires: survived 1, died 9, hung 2 — and the ONE survivor
+;;;;   reported +22, which is the HEALTHY number (20 fresh interns plus the two
+;;;;   the harness makes).  So across every run ever made there are two
+;;;;   survivors, one at -1949 and one at +22.  That is not a rate and it is not
+;;;;   a lead any more; it is a single unexplained observation, and the honest
+;;;;   reading is that -1949 may have been a one-off.  TREAT IT AS OPEN, NOT AS
+;;;;   THE MECHANISM.
+;;;;
+;;;;   THE METHOD IS WHAT FAILED, AND IT IS FIXABLE.  Reading the count on main
+;;;;   after the join is the right place to read it, but `percall' survives 1 run
+;;;;   in 12, so it can never produce a rate for anything measured on a survivor.
+;;;;   A subject that survives reliably is a PREREQUISITE for this question — a
+;;;;   smaller K, or the AOT arm if that turns out to be the clean one.  Anyone
+;;;;   picking this up should build that subject first rather than run `percall'
+;;;;   more times.
+;;;;
 ;;;;   A THIRD OUTCOME EXISTS AND WAS NOT PREVIOUSLY RECORDED: `percall' HANGS,
 ;;;;   1 run in 4, rather than dying.  A hang is not a variant of a fault; it is
 ;;;;   a lock left held or a lost wakeup, which is the same %MUTEX-LOCK 20 ms

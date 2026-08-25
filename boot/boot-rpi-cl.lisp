@@ -537,9 +537,34 @@
     ;; compiled code bumps x24 per allocation and compares against x25; when
     ;; they meet, +op-gc-check+ BLs the GC trampoline, which reloads both from
     ;; the metadata kernel-main's (%gc-init ...) publishes.
+    ;; The initial x25 carries the same ALLOC-OVERSHOOT GUARD BAND the GC
+    ;; trampoline applies at every exit (*aarch64-gc-limit-guard*, see
+    ;; translate-aarch64.lisp): the gc-check tests x24 BEFORE the alloc, so a
+    ;; large object allocated just under the limit writes past it by its full
+    ;; size.  Guard here too, or the FIRST from-space would run to the exact
+    ;; midpoint and a top-of-space alloc would overshoot into the to-space.
     (emit-aarch64-load-imm64 buf x24 +rpi-cl-heap-base+)
-    (emit-aarch64-load-imm64 buf x25 +rpi-cl-heap-mid+)
+    (emit-aarch64-load-imm64 buf x25 (- +rpi-cl-heap-mid+
+                                        modus.mvm::*aarch64-gc-limit-guard*))
     (emit-aarch64-load-imm64 buf x26 *rpi-cl-nil-value*)
+
+    ;; NATIVE MCGC + runtime JIT: reserve x28 = the GC trampoline's absolute
+    ;; VA, exactly as emit-linux-aarch64-entry does (see the comment there and
+    ;; *aarch64-x28-load-patch-offset*).  BAKED bare-metal code keeps its
+    ;; short-range BL to the trampoline (*aarch64-gc-trampoline-call-via-bl*),
+    ;; but RUNTIME-JIT'd pages live in the exec region at 0x14000000 — outside
+    ;; BL's +/-128MB reach of the trampoline — so their gc-checks are emitted
+    ;; as `BLR x28` by the in-image translator (the coinit override flips
+    ;; via-bl off at runtime).  Without this load the runtime translator's
+    ;; only alternative was the `brk #1` placeholder: the first JIT'd
+    ;; allocation to cross the heap limit died (measured 2026-08-25: the
+    ;; early-boot fault at ELR 0x11ef8d0).  MOVZ/MOVK pair patched post-link
+    ;; by cross.lisp::apply-aarch64-x28-trampoline-patch.
+    (when modus.mvm::*aarch64-gc-native-mcgc*
+      (setf modus.mvm::*aarch64-x28-load-patch-offset*
+            (* (a64-current-index buf) 4))
+      (a64-movz buf 28 0 0)   ; placeholder (lo16)
+      (a64-movk buf 28 0 1))  ; placeholder (hi16 lsl 16)
 
     ;; --- 4. TPIDR_EL1 = per-CPU base -------------------------------------
     (emit-aarch64-load-imm64 buf x16 +rpi-cl-percpu+)

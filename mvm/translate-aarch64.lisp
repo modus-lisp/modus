@@ -294,51 +294,15 @@
    validation (ace1544/810a975), adapted to the Lisp-side collector.  Default
    nil = no SET emitted = byte-identical to pre-#160 (bare-metal, gate, x64).")
 
-(defun emit-aarch64-gc-set-bit (buf cfg-bitmap-addr)
-  "WS4-AA64 #160: set the bit for the object whose raw base is in x24 (the alloc
-   pointer, BEFORE the opcode bumps it) in the bitmap whose base pointer lives at
-   config CFG-BITMAP-ADDR (0x10000E18 = object-start, 0x10000E40 = cons-kind).
-   1 bit / 16-byte granule; page_base at config 0x10000E00 — both bases stored
-   value<<1 by %gc-bitmap-init, so LDR then ASR #1 recovers the raw address.
-   Scratch x9..x13 (dead across MVM opcodes; alloc opcodes use x16/x17 + phys
-   vregs, never x9..x13).  Guarded: base == 0 (pre-init / disabled) skips the
-   write.  AND/LSLV/LDRB/STRB encodings assembler-verified."
-  (a64-load-imm64 buf +a64-x10+ cfg-bitmap-addr)
-  (a64-ldr-unsigned buf +a64-x11+ +a64-x10+ 0)
-  (a64-asr-imm buf +a64-x11+ +a64-x11+ 1)            ; x11 = bitmap_base
-  (a64-cmp-imm buf +a64-x11+ 0)
-  (let ((skip (incf *mvm-label-counter*)))
-    (let ((idx (a64-current-index buf)))
-      (a64-bcond buf +cc-eq+ 0)                       ; base==0 → skip
-      (a64-add-fixup buf idx skip :bcond))
-    (a64-load-imm64 buf +a64-x10+ #x10000E00)
-    (a64-ldr-unsigned buf +a64-x9+ +a64-x10+ 0)
-    (a64-asr-imm buf +a64-x9+ +a64-x9+ 1)             ; x9 = page_base
-    (a64-sub-reg buf +a64-x9+ +a64-x24+ +a64-x9+ 0 0) ; x9 = addr - page_base
-    (a64-lsr-imm buf +a64-x10+ +a64-x9+ 7)            ; x10 = byte offset (gran>>3)
-    (a64-add-reg buf +a64-x11+ +a64-x11+ +a64-x10+ 0 0) ; x11 = byte address
-    (a64-lsr-imm buf +a64-x9+ +a64-x9+ 4)             ; x9 = granule
-    (a64-emit buf #x92400929)                         ; AND x9, x9, #7  (bit index)
-    (a64-movz buf +a64-x12+ 1 0)                      ; x12 = 1
-    (a64-emit buf #x9AC9218C)                         ; LSLV x12, x12, x9  (1<<bit)
-    (a64-emit buf #x3940016D)                         ; LDRB w13, [x11]
-    (a64-orr-reg buf +a64-x13+ +a64-x13+ +a64-x12+)   ; w13 |= mask
-    (a64-emit buf #x3900016D)                         ; STRB w13, [x11]
-    (a64-set-label buf skip)))
-
-(defun emit-aarch64-gc-mark-start (buf)
-  "Set the OBJECT-START bit (bitmap base @0x10000E18) for the object at x24.
-   Emitted at every alloc site under *aarch64-gc-bitmap-enabled*."
-  (when *aarch64-gc-bitmap-enabled*
-    (emit-aarch64-gc-set-bit buf #x10000E18)))
-
-(defun emit-aarch64-gc-mark-cons (buf)
-  "WS4-AA64 #160 bug#4: ALSO set the CONS-KIND bit (bitmap base @0x10000E40) for
-   the 16-byte cons at x24, so %gc-scan-copied classifies it as a cons (scan
-   car+cdr) rather than reading car as an object header.  Emitted only at the
-   CONS alloc site, after emit-aarch64-gc-mark-start."
-  (when *aarch64-gc-bitmap-enabled*
-    (emit-aarch64-gc-set-bit buf #x10000E40)))
+;;; emit-aarch64-gc-set-bit / -mark-start / -mark-cons are defined BELOW the
+;;; +a64-x*+ register block and the +cc-*+ condition codes (after +cc-al+),
+;;; NOT here next to their gating defvar.  The MVM compiler folds defconstants
+;;; POSITIONALLY: a use compiled before the defconstant becomes a global read,
+;;; and defconstant initforms never run in-image (Limitation #7) → NIL → the
+;;; a64-* encoder's (ash NIL k) → infinite BIGNUM-ASH recursion at runtime-JIT
+;;; translate time.  Same class as the +a64-x28+ gc-check bug (2026-08-25).
+;;; Moving the DEFUNS later is call-site-safe: calls resolve by the final fn
+;;; table, only constants are position-sensitive.
 
 (defvar *aarch64-code-base-patch-offset* nil
   "Byte offset of the MOVZ that loads code_base in the boot stub's
@@ -423,6 +387,15 @@
 (defconstant +a64-x27+ 27)   ; CENV — closure-env (mirrors x64 R13).  Callee-
                              ; saved by AAPCS; not touched by handler-stack
                              ; PUSH/POP helpers (those clobber x9..x13 only).
+(defconstant +a64-x28+ 28)   ; free scratch (unused by Modus codegen); GC
+                             ; obj-bitmap base inside the trampoline; on
+                             ; bare-metal JIT builds, holds the GC-trampoline
+                             ; VA (loaded once in the boot entry stub) so
+                             ; JIT'd gc-checks can BLR x28 across the >128MB
+                             ; BL-range gap.  Defined HERE, before every use:
+                             ; the MVM compiler folds constants positionally,
+                             ; and a use compiled before the defconstant
+                             ; becomes an uninitialized-global read (NIL).
 (defconstant +a64-x29+ 29)   ; FP
 (defconstant +a64-x30+ 30)   ; LR
 (defconstant +a64-sp+  31)   ; SP (context-dependent encoding with XZR)
@@ -747,6 +720,57 @@
 (defconstant +cc-vs+ #x6)    ; overflow set (V=1) — signed overflow occurred
 (defconstant +cc-vc+ #x7)    ; overflow clear (V=0)
 (defconstant +cc-al+ #xE)    ; always
+
+;;; #160 bitmap set-bit emitters.  Defined HERE — after the +a64-x*+ register
+;;; constants and the +cc-*+ codes — so every constant below folds to a literal
+;;; when the MVM compiler bakes this file for the runtime JIT (see the note at
+;;; the *aarch64-gc-bitmap-enabled* defvar).
+
+(defun emit-aarch64-gc-set-bit (buf cfg-bitmap-addr)
+  "WS4-AA64 #160: set the bit for the object whose raw base is in x24 (the alloc
+   pointer, BEFORE the opcode bumps it) in the bitmap whose base pointer lives at
+   config CFG-BITMAP-ADDR (0x10000E18 = object-start, 0x10000E40 = cons-kind).
+   1 bit / 16-byte granule; page_base at config 0x10000E00 — both bases stored
+   value<<1 by %gc-bitmap-init, so LDR then ASR #1 recovers the raw address.
+   Scratch x9..x13 (dead across MVM opcodes; alloc opcodes use x16/x17 + phys
+   vregs, never x9..x13).  Guarded: base == 0 (pre-init / disabled) skips the
+   write.  AND/LSLV/LDRB/STRB encodings assembler-verified."
+  (a64-load-imm64 buf +a64-x10+ cfg-bitmap-addr)
+  (a64-ldr-unsigned buf +a64-x11+ +a64-x10+ 0)
+  (a64-asr-imm buf +a64-x11+ +a64-x11+ 1)            ; x11 = bitmap_base
+  (a64-cmp-imm buf +a64-x11+ 0)
+  (let ((skip (incf *mvm-label-counter*)))
+    (let ((idx (a64-current-index buf)))
+      (a64-bcond buf +cc-eq+ 0)                       ; base==0 → skip
+      (a64-add-fixup buf idx skip :bcond))
+    (a64-load-imm64 buf +a64-x10+ #x10000E00)
+    (a64-ldr-unsigned buf +a64-x9+ +a64-x10+ 0)
+    (a64-asr-imm buf +a64-x9+ +a64-x9+ 1)             ; x9 = page_base
+    (a64-sub-reg buf +a64-x9+ +a64-x24+ +a64-x9+ 0 0) ; x9 = addr - page_base
+    (a64-lsr-imm buf +a64-x10+ +a64-x9+ 7)            ; x10 = byte offset (gran>>3)
+    (a64-add-reg buf +a64-x11+ +a64-x11+ +a64-x10+ 0 0) ; x11 = byte address
+    (a64-lsr-imm buf +a64-x9+ +a64-x9+ 4)             ; x9 = granule
+    (a64-emit buf #x92400929)                         ; AND x9, x9, #7  (bit index)
+    (a64-movz buf +a64-x12+ 1 0)                      ; x12 = 1
+    (a64-emit buf #x9AC9218C)                         ; LSLV x12, x12, x9  (1<<bit)
+    (a64-emit buf #x3940016D)                         ; LDRB w13, [x11]
+    (a64-orr-reg buf +a64-x13+ +a64-x13+ +a64-x12+)   ; w13 |= mask
+    (a64-emit buf #x3900016D)                         ; STRB w13, [x11]
+    (a64-set-label buf skip)))
+
+(defun emit-aarch64-gc-mark-start (buf)
+  "Set the OBJECT-START bit (bitmap base @0x10000E18) for the object at x24.
+   Emitted at every alloc site under *aarch64-gc-bitmap-enabled*."
+  (when *aarch64-gc-bitmap-enabled*
+    (emit-aarch64-gc-set-bit buf #x10000E18)))
+
+(defun emit-aarch64-gc-mark-cons (buf)
+  "WS4-AA64 #160 bug#4: ALSO set the CONS-KIND bit (bitmap base @0x10000E40) for
+   the 16-byte cons at x24, so %gc-scan-copied classifies it as a cons (scan
+   car+cdr) rather than reading car as an object header.  Emitted only at the
+   CONS alloc site, after emit-aarch64-gc-mark-start."
+  (when *aarch64-gc-bitmap-enabled*
+    (emit-aarch64-gc-set-bit buf #x10000E40)))
 
 ;;; --- ADD (shifted register) ---
 ;;; sf|0|0|01011|shift(2)|0|Rm(5)|imm6(6)|Rn(5)|Rd(5)
@@ -2183,6 +2207,37 @@
                 (a64-movz buf +a64-x8+ 222 0)
                 (a64-svc buf 0)
                 (a64-lsl-imm buf +a64-x0+ +a64-x0+ 1))  ; tag result
+               ((= code #x0531)
+                ;; BARE-METAL %MMAP-EXEC-PAGE: no mmap — bump-allocate from the
+                ;; reserved JIT code region [0x14000000, 0x18000000).  The
+                ;; bare-metal page tables map all RAM Normal-WB with no PXN/UXN
+                ;; (block attr 0x701), so the region is already executable; the
+                ;; #x0533 DC CVAU / IC IVAU flush provides SMC coherency.  The
+                ;; bump pointer lives at 0x13FFFFF0; real-hardware DRAM is NOT
+                ;; zeroed, so a range check re-initialises it on first use
+                ;; (garbage/0 -> region base) instead of trusting a boot zero.
+                ;; V0(x0)=size(tagged); result = tagged 16-aligned address.
+                (a64-asr-imm buf +a64-x1+ +a64-x0+ 1)        ; x1 = size
+                (a64-add-imm buf +a64-x1+ +a64-x1+ 15)
+                (a64-lsr-imm buf +a64-x1+ +a64-x1+ 4)
+                (a64-lsl-imm buf +a64-x1+ +a64-x1+ 4)        ; 16-align size
+                (a64-load-imm64 buf +a64-x9+ #x13FFFFF0)     ; x9  = &bump
+                (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0)  ; x10 = cur
+                (a64-load-imm64 buf +a64-x11+ #x14000000)    ; x11 = lo
+                (a64-load-imm64 buf +a64-x12+ #x18000000)    ; x12 = hi
+                ;; CSEL Xd, Xn, Xm, cond: Xd = cond ? Xn : Xm — Rn is bits 5-9,
+                ;; Rm bits 16-20.  (First cut had Rn/Rm swapped: the garbage-
+                ;; reset arm was a no-op and the valid-pointer arm clobbered to
+                ;; base, so EVERY page allocated at 0x14000000 and overlapped.)
+                (a64-cmp-reg buf +a64-x10+ +a64-x11+)
+                (a64-emit buf (logior #x9A800000 (ash +a64-x10+ 16)
+                                      (ash 3 12) (ash +a64-x11+ 5) +a64-x10+)) ; CSEL x10,x11,x10,LO
+                (a64-cmp-reg buf +a64-x10+ +a64-x12+)
+                (a64-emit buf (logior #x9A800000 (ash +a64-x10+ 16)
+                                      (ash 2 12) (ash +a64-x11+ 5) +a64-x10+)) ; CSEL x10,x11,x10,HS
+                (a64-add-reg buf +a64-x12+ +a64-x10+ +a64-x1+ 0 0) ; new = cur+size
+                (a64-str-unsigned buf +a64-x12+ +a64-x9+ 0)
+                (a64-lsl-imm buf +a64-x0+ +a64-x10+ 1))      ; tagged result
                ((= code #x0532)
                 ;; %JIT-CALL (arch-neutral trap; x64 uses the same #x0532).
                 ;; V0(x0) = entry byte-address as a TAGGED fixnum (word =
@@ -2228,7 +2283,7 @@
                   (a64-bcond buf +cc-cc+ (- i-top (a64-current-index buf)))) ; B.LO
                 (a64-dsb buf #xB)                          ; DSB ISH
                 (a64-isb buf))                             ; ISB
-               ((= code #x0534)
+               ((and *aarch64-linux-mode* (= code #x0534))
                 ;; %JIT-FREE-PAGE base len — munmap(addr, len).  aarch64=215.
                 ;; Reclaims a transient JIT exec page (x64 = no-op); reclaim is
                 ;; runtime-gated to *jit-reclaim-on* (currently off; flip round).
@@ -2237,6 +2292,10 @@
                 (a64-movz buf +a64-x8+ 215 0)             ; munmap
                 (a64-svc buf 0)
                 (a64-lsl-imm buf +a64-x0+ +a64-x0+ 1))    ; tag result
+               ((= code #x0534)
+                ;; BARE-METAL %JIT-FREE-PAGE: the bump region is never
+                ;; reclaimed (and reclaim is runtime-gated off anyway) — no-op.
+                (a64-movz buf +a64-x0+ 0 0))
                ((= code #x0510)
                 ;; SETJMP: Save SP, FP (X29), return-IP to 0x10000180/188/190.
                 ;; First call: return NIL (=X26=0) in X0.  On longjmp:
@@ -4609,7 +4668,25 @@
 ;;; the SAME bitmaps Stage-B/a6d12ae built: object-start @0x10000E18 (validated
 ;;; in scan_word, set on survivors in copy_object).  cons-kind kind-check +
 ;;; leaf-subtag type-aware skip are STAGE 2.
-(defconstant +a64-x28+ 28)   ; free scratch (unused by Modus codegen); GC obj-bitmap base
+;;; +a64-x28+ is defined up in the register block (with +a64-x27+ etc.) —
+;;; it MUST precede its first use at the :gc-check emission site, because the
+;;; MVM compiler folds named constants positionally: a use compiled BEFORE the
+;;; defconstant becomes a global-variable read, and defconstant initforms never
+;;; run at boot (Limitation #7) → the read yields NIL → (ash NIL 5) inside
+;;; a64-blr → infinite BIGNUM-ASH recursion that eats the image (found by the
+;;; QEMU RAM-vs-file diff, 2026-08-25).
+
+(defvar *aarch64-gc-limit-guard* 0
+  "Alloc-overshoot guard band, in bytes, subtracted from the mutator alloc
+   LIMIT register (x25) at GC-trampoline exit.  The gc-check compares the
+   alloc pointer BEFORE the allocation, so an object allocated just under the
+   limit writes header + zero-init up to its full size PAST it.  On Linux the
+   mmap extends past the limit so 0 is safe; bare-metal RPi sets #x800000
+   (8 MB) because the upper semispace ends at #x10000000 with the GC config
+   page immediately after — see the trampoline-exit comment.  Must exceed the
+   largest single allocation (biggest known: the 64K-element a64-buffer code
+   array, 512 KB; MODUS_NET_BUFSZ 400 KB).  Build-time (baked trampoline)
+   only; the boot stub's initial x25 must apply the same guard itself.")
 
 (defvar *aarch64-gc-native-mcgc* nil
   "WS4-AA64 #160 Stage 1.  When non-nil, emit-aarch64-handler-helpers emits the
@@ -5018,8 +5095,25 @@
     (a64-lsl-imm buf +a64-x9+ +a64-x19+ 1)              ; new to_start = old from_start
     (a64-load-imm64 buf +a64-x16+ #x10000048) (a64-str-unsigned buf +a64-x9+ +a64-x16+ 0)
     ;; x24 = free_ptr ; x25 = new from_start(to_start x22) + space_size(x25)
+    ;; minus the ALLOC-OVERSHOOT GUARD BAND (*aarch64-gc-limit-guard*, 0 on
+    ;; Linux where the mmap already ends 16MB past the limit).  The gc-check
+    ;; compares x24 BEFORE the alloc, so a large object allocated just under
+    ;; the limit writes header+zero-init up to its full size PAST the limit.
+    ;; On bare metal the upper semispace ends at #x10000000 with the GC config
+    ;; page immediately after — a 64K-element a64-buffer allocated near the
+    ;; top zeroed space_size/bitmap-bases/MV slots and the next collection ran
+    ;; on garbage geometry (caught by watchpoint on #x10000050, 2026-08-25;
+    ;; both the "MAP-PRODUCT over the config page" corruption and the
+    ;; bitmap-on exception storm were this).  Keeping the guard in the LIMIT
+    ;; REGISTER (not the metadata) means scan/copy bounds still use the true
+    ;; semispace end, and any alloc smaller than the guard stays inside RAM.
     (a64-mov-reg buf +a64-x24+ +a64-x21+)
     (a64-add-reg buf +a64-x25+ +a64-x22+ +a64-x25+ 0 0)
+    (when (and (boundp '*aarch64-gc-limit-guard*)
+               (integerp *aarch64-gc-limit-guard*)
+               (> *aarch64-gc-limit-guard* 0))
+      (a64-load-imm64 buf +a64-x9+ *aarch64-gc-limit-guard*)
+      (a64-sub-reg buf +a64-x25+ +a64-x25+ +a64-x9+ 0 0))
     ;; gc_count += 1 (stored <<1 → += 2)
     (a64-load-imm64 buf +a64-x16+ #x10000060)
     (a64-ldr-unsigned buf +a64-x9+ +a64-x16+ 0) (a64-add-imm buf +a64-x9+ +a64-x9+ 2)

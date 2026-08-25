@@ -400,10 +400,24 @@
                           (tcp-data-off (ash (logand (mem-ref (+ buf 46) :u8) #xF0) -2)))
                       (let ((data-len (- ip-total (+ 20 tcp-data-off))))
                         (when (> data-len 0)
-                          (let ((their-seq (buf-read-u32-mem buf 38)))
-                            (setf (mem-ref (+ state #x40) :u32) (+ their-seq data-len))
-                            (tcp-send-segment 16 (make-array 0) 0)
-                            (setq received data-len)))
+                          ;; In-order only: accept a segment ONLY when its seq
+                          ;; matches the next byte we expect (state+0x40, the
+                          ;; ack we advertise).  A retransmitted/out-of-order
+                          ;; segment must NOT be delivered — the HTTP client
+                          ;; used to append a duplicate segment mid-stream,
+                          ;; corrupting a fetched tarball (alexandria install:
+                          ;; FETCHED 276588 vs served 276480, +108 dup bytes).
+                          ;; Same fix as net-deliver-data on the server path:
+                          ;; re-ACK the expected seq and wait for the right
+                          ;; bytes.
+                          (let ((their-seq (buf-read-u32-mem buf 38))
+                                (expected (mem-ref (+ state #x40) :u32)))
+                            (if (eq their-seq expected)
+                                (progn
+                                  (setf (mem-ref (+ state #x40) :u32) (+ their-seq data-len))
+                                  (tcp-send-segment 16 (make-array 0) 0)
+                                  (setq received data-len))
+                                (tcp-send-segment 16 (make-array 0) 0))))
                         (when (not (zerop (logand tcp-flags 1)))
                           (let ((their-seq (buf-read-u32-mem buf 38)))
                             (setf (mem-ref (+ state #x40) :u32) (+ their-seq 1))

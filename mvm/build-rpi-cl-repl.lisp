@@ -102,13 +102,18 @@
 (defvar *cli-bare-metal* t)
 (defvar *cli-bare-metal-tarball* t)
 
-;;; Runtime JIT: OFF.  %jit-translate-page mmaps a PROT_EXEC page and mprotects
-;;; it; there is no mmap on bare metal, so the native-code seam is a later rung.
-;;; eval = mvm-eval = compile -> MVM bytecode -> mvm-interpret, exactly what the
-;;; bare ANSI gate runs.  Flipping this to T is task #267 — and when it flips,
-;;; this image inherits build-cli-common's ARCH-DISPATCHED aarch64 translator
-;;; block instead of the private x64 copy this file used to carry.
-(defvar *jit-on* nil)
+;;; Runtime JIT: ON (flipped 2026-08-24).  The mmap obstacle is gone:
+;;; translate-aarch64's trap #x0531 now has a BARE-METAL branch that
+;;; bump-allocates exec pages from the reserved region [0x14000000,
+;;; 0x18000000) (Normal-WB, no PXN — already executable; bump word at
+;;; 0x13FFFFF0 with a range-check init because real DRAM is not zeroed),
+;;; and #x0534 (munmap) is a bare-metal no-op.  Traps #x0532 (BLR) and
+;;; #x0533 (DC CVAU / IC IVAU / ISB) were always pure-CPU and work as-is.
+;;; This image inherits build-cli-common's ARCH-DISPATCHED aarch64
+;;; translator block; the Linux co-init is overridden below
+;;; (*rpi-jit-coinit-override*) so runtime-emitted traps use the
+;;; bare-metal paths (mini-UART serial, bump-allocator pages).
+(defvar *jit-on* t)
 
 ;;; ------------------------------------------------------------
 ;;; BRING-UP CULLS (#209 rung 4).  Chain-loading a 20MB image over a 9600-baud
@@ -502,8 +507,10 @@
         "(defun ssh-eval-line (ssh cmd cmd-len)
   (let ((s (make-string cmd-len)))
     (dotimes (i cmd-len) (aset s i (code-char (aref cmd i))))
-    (let ((result (eval (read-from-string s))))
-      (let ((rs (prin1-to-string result)))
+    (let ((result (handler-case (eval (read-from-string s))
+                    (t (c) (list (quote error) c)))))
+      (let ((rs (handler-case (prin1-to-string result)
+                  (t (c) (prin1-to-string (quote unprintable))))))
         (let ((rl (length rs)))
           (let ((arr (make-array (+ rl 3))))
             (aset arr 0 61) (aset arr 1 32)
@@ -843,8 +850,76 @@
 ;;; calls run-net-pipeline.  It is ALSO spliced into *ALL-RUNTIME-SOURCE*, so
 ;;; every defun here reaches the symbol-function table and every token here
 ;;; reaches *SYM-NAME-TABLE*.
+;;; BARE-METAL JIT co-init override.  build-cli-common's aarch64 co-init sets
+;;; *aarch64-linux-mode* T (runtime-emitted traps = Linux syscalls).  On bare
+;;; metal the runtime translator must instead emit the BARE-METAL trap paths:
+;;; serial via the UART this build selected (mirrored from the build-time
+;;; console selection above), exec pages via the #x0531 bump allocator.  Wins
+;;; over the common co-init by last-defun-wins (net-source is appended after
+;;; the JIT translator block in *all-runtime-source*).  Also zero the bump
+;;; word explicitly at init — cheap belt to the trap's own range-check braces.
+;;; NOTE: the serial globals (*aarch64-serial-base* etc.) are not set until
+;;; the console-selection block AFTER build-cli-common loads, so this defvar
+;;; re-derives the SAME choice from the env vars directly (identical logic to
+;;; boot-rpi-cl.lisp's *rpi-cl-chainload* + the console block below).
+(defvar *rpi-jit-coinit-override*
+  (if *jit-on*
+      (let* ((chain (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_RPI_CHAINLOAD")))
+                      (and v (string= v "1"))))
+             (mini (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_RPI_MINIUART")))
+                     (if (and v (plusp (length v)))
+                         (not (string= v "0"))
+                         chain))))
+        (format nil "
+(defun %init-aarch64-translator ()
+  (let ((map (make-array 23)))
+    (aset map 0 0) (aset map 1 1) (aset map 2 2) (aset map 3 3)
+    (aset map 4 19) (aset map 5 20) (aset map 6 21) (aset map 7 22) (aset map 8 23)
+    (aset map 9 nil) (aset map 10 nil) (aset map 11 nil) (aset map 12 nil)
+    (aset map 13 nil) (aset map 14 nil) (aset map 15 nil)
+    (aset map 16 0) (aset map 17 24) (aset map 18 25) (aset map 19 26)
+    (aset map 20 31) (aset map 21 29) (aset map 22 nil)
+    (setq *a64-vreg-to-phys* map))
+  (when (null *mvm-label-counter*) (setq *mvm-label-counter* 0))
+  (setq *aarch64-stack-align-16* nil)
+  (setq *aarch64-linux-mode* nil)
+  (setq *aarch64-gc-native-mcgc* t)
+  (setq *aarch64-gc-trampoline-call-via-bl* nil)
+  (setq *aarch64-gc-trampoline-label* 1)
+  ;; *aarch64-gc-bitmap-enabled* at runtime: MUST eventually be T — while
+  ;; NIL, objects allocated by JIT'd code carry no object-start bit, the
+  ;; native GC's conservative-root validation REJECTS stack roots pointing
+  ;; at them, and they get dropped while live.  PROVEN consequence (QEMU,
+  ;; 2026-08-25): loading alexandria, a dangling string wrote the symbol
+  ;; name MAP-PRODUCT's char codes over the GC config page at #x10000000,
+  ;; wrecking from_start/to_start/space_size -> wild-pointer data abort in
+  ;; %PARSE-START-END.  But enabling it wedged the image in a recursive
+  ;; exception storm at the first JIT'd alloc (PC pinned at VBAR+0x200,
+  ;; gdbstub unable to translate guest addresses => page tables corrupted).
+  ;; MODUS_RPI_JIT_BITMAP=1 builds the enable in for debugging that wedge.
+  ~A
+  ~A
+  (setf (mem-ref #x13FFFFF0 :u64) #x14000000)
+  t)
+"
+                (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_RPI_JIT_BITMAP")))
+                  (if (and v (string= v "1"))
+                      "(setq *aarch64-gc-bitmap-enabled* t)"
+                      ";; bitmap-enable off (MODUS_RPI_JIT_BITMAP unset)"))
+                (if mini
+                    "(setq *aarch64-serial-base* #x3F215040)
+  (setq *aarch64-serial-width* 2)
+  (setq *aarch64-serial-tx-poll* (list #x14 5 :tbz))
+  (setq *aarch64-serial-rx-poll* (list #x14 0 :tbz))"
+                    "(setq *aarch64-serial-base* #x3F201000)
+  (setq *aarch64-serial-width* 0)
+  (setq *aarch64-serial-tx-poll* nil)
+  (setq *aarch64-serial-rx-poll* (list #x18 4 :tbnz))")))
+      ""))
+
 (defvar *cli-bare-metal-net-source*
-  (concatenate 'string *net-source* *net-url-source* *net-driver-source*))
+  (concatenate 'string *net-source* *net-url-source* *net-driver-source*
+               *rpi-jit-coinit-override*))
 
 ;;; ARCH SLOT: the toplevel entry / probe program.  The hosted CLIs hand off to
 ;;; cli-toplevel here; this image runs the same E2SMOKE self-check the bare ANSI
@@ -971,6 +1046,17 @@
 ;; still running the collector with NO bitmap.  The backing RAM is reserved and
 ;; zeroed by %rpi-gc-bitmap-init in kernel-main.
 (setf *aarch64-gc-bitmap-enabled* t)
+
+;; ALLOC-OVERSHOOT GUARD BAND (#277 root cause): the gc-check compares x24
+;; BEFORE the alloc, so an object allocated just under the limit writes
+;; header + zero-init up to its full size past it — and this image's upper
+;; semispace ends at #x10000000 with the GC config page immediately after.
+;; Watchpoint-proven (2026-08-25): a 64K-element a64-buffer alloc zeroed
+;; space_size at #x10000050 mid-JIT-translate, and the next collection ran on
+;; garbage geometry.  8 MB clears every known large alloc (512 KB JIT code
+;; array, 400 KB MODUS_NET_BUFSZ) with ~48 MB/semispace left.  Applied by the
+;; baked trampoline at every exit AND by boot-rpi-cl's initial x25.
+(setf *aarch64-gc-limit-guard* #x800000)
 
 ;; #267 step 1: use the NATIVE aarch64 Cheney collector — the same one
 ;; build-aarch64-cli.lisp runs — instead of falling through to gc.lisp's

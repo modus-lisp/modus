@@ -1984,6 +1984,45 @@ they need the same treatment separately, and `:foo` literals are the hot path
 tables are acceptable is NOT yet measured; the serialised-boundary argument says
 yes and that is reasoning, not evidence.
 
+### THE PER-ACTOR INTERN STORE — feasible, designed, NOT BUILT
+
+Where the local table can live, checked rather than assumed: the per-thread
+RECORD at `%THR-REC i` is 128 bytes with only `+0x00..+0x30` used, and
+`%THR-PERCPU-BASE` hands out a 16 KB block per CPU at `+0x14000 + cpu*0x4000`.
+Either gives a RAW per-thread word — which is the requirement, because the slot
+must not be reachable from region 0, so a Lisp global cannot hold it.
+
+**THE DESIGN POINT THAT MAKES IT SAFE IS DEFAULT-OFF.**  `%INTERN-SYMBOL-PKG` is
+the hottest function in the runtime — every symbol literal, and via
+`%INTERN-KEYWORD` every `:foo` — so the shape must be:
+
+    (let ((local (%local-symtab)))          ; 0 unless this thread opted in
+      (if (zerop local)
+          <EXACTLY TODAY'S PATH, byte for byte>
+          <own table, then shared read-only, then create locally>))
+
+With no thread opting in, behaviour is today's by construction, so the bar
+cannot move — rather than by testing that it did not.  The local path then does:
+`GETHASH` in the local table; miss -> `%RT-ENTER` + `GETHASH` the shared table +
+`%RT-LEAVE` (read-only, no allocation); miss -> allocate the symbol and
+`PUTHASH` it into the LOCAL table **without hopping**, so both land in this
+thread's region.
+
+**THE HAZARD IS STEP THREE, AND IT IS NOT THE TABLE.**  Creating a symbol is not
+one `PUTHASH`: `%INTERN-SYMBOL-PKG-1` also resolves the home package out of
+`0x10000170`, fills slot 1, seeds slot 2, and re-reads the table root because
+`%ALLOC-SYM3` can collect.  Duplicating that is where the bugs will be, and the
+package object it stores in slot 1 is itself a REGION-0 object — a
+`worker -> region 0` pointer, which is the expected direction and fine, but it
+means "the symbol is entirely local" is false in detail and should not be
+claimed without an audit.
+
+**KEYWORDS ARE A SECOND, SEPARATE STORE** (`0x10000148`) on the hot path, and
+whether per-actor keywords are acceptable is still REASONING, not evidence — see
+above.  The test that would settle it: two actors each with `:foo`, one sending
+it to the other, and the receiver's `:foo` must be `EQ` to its own with the
+audit still at zero.
+
 ### THE CROSS-REGION AUDIT: strings are clean, SYMBOLS ARE NOT
 
 Sender = the main thread (region 0).  Receiver = a worker thread, which owns its

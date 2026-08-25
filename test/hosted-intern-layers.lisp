@@ -59,6 +59,20 @@
 ;;;; the runtime lock and hop the active region to region 0 (%RT-ENTER); that is
 ;;;; the suspect, and it is NOT established here.
 ;;;;
+;;;; AND IT IS NOT THE JIT.  `low' with MODUS_NO_JIT=1 is 3 of 6 — the same rate
+;;;; — so the runtime-JIT concurrency ceiling this tree names elsewhere is not
+;;;; what is killing it.  That agrees with the earlier finding that the whole
+;;;; family reproduces identically with the JIT off.
+;;;;
+;;;; AND IT SITS AGAINST A GREEN TEST, WHICH IS THE INTERESTING PART.
+;;;; test/hosted-thread-lisp.lisp interns fresh symbols through the SAME
+;;;; %INTERN-SYMBOL-PKG, on two threads, 300 iterations each, and scores 100 of
+;;;; 100.  The difference is not the function: there the whole workload is
+;;;; AOT-compiled inside the image (%TL-SELFTEST, net/hosted-sync.lisp) and the
+;;;; runtime lock is held across a whole iteration, while here the loop is
+;;;; runtime-compiled script code taking the lock per call.  Which of those two
+;;;; differences matters is UNMEASURED.
+;;;;
 ;;;; D2 MATTERS FOR THE FIX: it means "put the allocation in region 0 under the
 ;;;; lock" — the remedy this tree already applies to %INTERN-SYMBOL-PKG and the
 ;;;; obvious one to extend to CL:INTERN — is a remedy whose own arm is red.

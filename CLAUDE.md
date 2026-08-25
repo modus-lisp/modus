@@ -1900,41 +1900,70 @@ remote party.  glass reads a protocol with fixed message types and interns
 nothing from it (its 21 fresh interns are all warm-up, and they stop), so
 nothing here does it today.
 
-### THE DECODER'S STRING ARM CALLS A FUNCTION THAT DOES NOT EXIST
+### THE SERIALISER COPIES WHAT IT SENDS (3cb7590) — and the decode arm that never existed
 
-    (fboundp 'string-set)  =>  NIL
-    grep -rn "defun string-set"  =>  nothing, anywhere in the tree
+**`STRING-SET` WAS DEFINED NOWHERE IN THE TREE.**
+
+    (fboundp 'string-set)        =>  NIL
+    grep -rn "defun string-set"  =>  nothing, anywhere
     grep -rn "(string-set "      =>  net/actors.lisp:709, and NOWHERE else
 
-`TERM-DECODE-STEP`'s tag-3 arm — the one that reads a length, reads the bytes
-and rebuilds a string in the RECEIVER's region — fills that string with
-`STRING-SET`, **which is not defined**.  So the arm was dead code in two senses
-at once: nothing ever emitted tag 3, and it could not have worked if anything
-had.  `(MAKE-STRING 5)` returns `"     "`, so a decode through it yields a
-string of the right LENGTH and no content — which is exactly what came back
-when tag 3 was finally emitted.
+`TERM-DECODE-STEP`'s tag-3 arm — read a length, read the bytes, rebuild the
+string in the RECEIVER's region — filled it with that.  So the arm was dead in
+**two** senses at once: nothing ever emitted tag 3, and it could not have worked
+if anything had.  `(MAKE-STRING 5)` returns `"     "`, so a decode through it
+gives the right LENGTH and no content — which is exactly what came back the
+first time the encoder emitted tag 3, and the whole reason that attempt
+(9f1a577) was reverted in 6a578a3.  `(SETF (AREF s i) (CODE-CHAR …))` exists;
+that is the repair, at all three sites.
 
-That is the real reason 9f1a577 was reverted in 6a578a3.  `(SETF (AREF s i) c)`,
-`(SETF (CHAR s i) c)` and `(SETF (SCHAR s i) c)` all work; the one-line repair
-is to use one of them and `CODE-CHAR`.
+**NOW: symbols by NAME at tag 6, strings by VALUE at tag 3**, so the receiver
+INTERNS on its own thread, in its own region — the symbol and the table that
+points at it co-located by construction, no barrier and no delegation.
 
-**AND THE REASON RECORDED HERE BEFORE WAS WRONG.**  This section previously
-claimed `MEM-REF` halves on read at `:u8`/`:u32` — 104 reading back 52, 5
-reading back 2 — and told the next reader to write payload bytes with
-`%GC-WRITE64` instead.  **It does not halve, and that instruction was false.**
-Re-measured across every context that differed: a fresh `%MMAP-SHARED-PAGE`
-before the actor band exists, the same page afterwards, the actor staging
-buffer, at `:u8` `:u32` and `:u64`, inside a `DEFUN` and at toplevel in a `LET`,
-with the reads inline in the `FORMAT` arguments and hoisted into locals first.
-**All ten round-trip exactly**, and a second machine could not reproduce the
-halving either.
+**AND THE TEST ASSERTS THE DECODED VALUE, WHICH IS THE WHOLE LESSON.**
+`test/hosted-term-encode-syms.lisp` checks the TAG and the BYTE COUNT, and it
+**passed an encoder that destroyed every payload it touched**.  A serialiser
+test that does not round-trip is not a serialiser test.
+`test/hosted-term-roundtrip.lisp` is 27 checks of `(equal (rt "hello") "hello")`
+and `(eq (rt sym) (intern "…"))` through the **real staging buffer** after
+`%HA-ACTORS-BRINGUP` — not a private `%MMAP-SHARED-PAGE`, which is what faulted
+on CONS and sent a whole diagnostic down the wrong hole.  Every decoded value
+must also be a COPY and not the sender's object, with a CONS as positive
+control: if a cons ever comes back `EQ`, nothing is being serialised.
 
-The bogus readout came from a probe that ALSO died on `STRING-SET` being
-undefined and re-executed its toplevel form — the values were printed twice —
-and it was taken on a binary that no longer exists.  One unexplained
-measurement, generalised into a rule, and written down as an instruction: the
-opposite of what the rest of this file is for.  A single reading that cannot be
-reproduced in a second shape is not a finding.
+**AND THROUGH THE REAL MAILBOX — the gap that let it ship green.**  All four
+actor tests in the bar exercise `TERM-ENCODE`/`TERM-DECODE` and send **only
+fixnums and conses**, so a serialiser that wrecked every string and symbol went
+past twenty-plus green tests without a murmur.  `SEND`/`RECEIVE` is a different
+path from calling the encoder directly — `SEND` decides for itself whether a
+value needs serialising and picks the buffer.
+
+***WHAT IT DOES NOT PROVE.***  The mailbox section sends to **SELF** — one actor,
+one region — so its `EQ` check would pass even if the decoder returned the
+sender's pointer.  The cross-region claim (a symbol decoded by an actor in
+ANOTHER region leaves **zero** pointers into the sender's per
+`%GC-COUNT-FOREIGN-REFS`, control still answering non-zero) needs two actors on
+two regions and is **NOT TESTED**.
+
+**STILL BY POINTER:** anything that is not NIL / cons / fixnum / string / symbol
+/ array / bignum still falls into `;; Unknown object type — encode as fixnum`.
+Narrowing that arm further without a demonstration of what lands in it would be
+guessing; it remains a soundness hole for any type nobody has looked at.
+
+**A CLAIM THAT WAS RETRACTED HERE, kept because the retraction is the lesson.**
+This section once said `MEM-REF` halves on read at `:u8`/`:u32` — 104 back as
+52, 5 back as 2 — and instructed the next reader to use `%GC-WRITE64` instead.
+**False.**  Re-measured across every context that differed (fresh mmap page
+before the band exists, the same page after, the staging buffer; `:u8` `:u32`
+`:u64`; inside a `DEFUN` and at toplevel in a `LET`; reads inline in `FORMAT`
+arguments and hoisted into locals): **all ten round-trip exactly**, and a second
+machine could not reproduce it either.  The bogus readout came from a probe that
+ALSO died on `STRING-SET` and re-executed its toplevel form, on a binary that no
+longer exists.  One unexplained measurement, generalised into a rule and written
+down as an instruction for someone else — the exact failure the rest of this
+file exists to prevent.  **A single reading that cannot be reproduced in a
+second shape is not a finding.**
 
 **A TRAP THIS COST A CYCLE ON: `SYS-EXIT` FROM INSIDE A NESTED `LET*`/`IF` IN A
 `--script` DOES NOT TAKE EFFECT.**  The process ran to the end of the file and

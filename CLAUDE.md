@@ -1744,6 +1744,78 @@ The audit is the acceptance test for whichever is chosen —
 `test/run-worker-xregion.sh` goes green when a worker's fresh intern stops
 leaving a pointer behind.
 
+### — AND IT NAMED THE WRONG INTERN.  THERE ARE TWO, AND THEY FAIL DIFFERENTLY
+
+The section above, and the whole per-actor-store design drawn against it, say
+`%INTERN-SYMBOL-PKG` is the operation that allocates a worker's fresh symbol in
+the worker's region.  **It is not, and it never was on this tree.**
+`%INTERN-SYMBOL-PKG` is wrapped in `%RT-ENTER`/`%RT-LEAVE`, and `%RT-ENTER`'s
+whole job is to make **region 0** the active heap for the duration — so a fresh
+symbol interned through it *on a worker* is allocated in region 0, beside the
+table at `0x10000088` that registers it, and leaves **no** region-0 -> worker
+pointer.  Measured three ways: the symbol's machine word lands below the carve
+in region 0's span while a `CONS` made on the same worker two lines earlier
+lands in the worker's region; `%GC-COUNT-FOREIGN-REFS` is unchanged across 8 and
+across 20 fresh interns; and `(%RT-ENTER)` on a worker really does move
+`(%GC-REGION)` to `0x10000040` and back.
+
+**THE OPERATION AT FAULT IS `CL:INTERN`** (`mvm/cl-packages.lisp`), which is
+under no lock at all.  Its create-new-symbol branch allocates the CL symbol
+(`%MAKE-CL-SYMBOL`), its name string and the package symtab entry in the
+**calling thread's** region and then links all three into structures that live
+in region 0 — the shared intern table **and** the package object's own internal
+symtab (`%PKG-SET-INTERNAL` of a `%SYMTAB-ADD`).  Both red tests take that path
+and neither takes the other one: `test/hosted-worker-intern.lisp`'s fatal
+`intern-fresh` arm calls `CL:INTERN`, and `test/hosted-term-xregion.lisp`'s
+symbol case reaches it through `TERM-DECODE-STEP`'s tag-6 arm.
+
+`test/run-intern-layers.sh` is the instrument — three arms, one loop, one
+worker, one process each, the audit and the spans and the direction identical
+between them, with the shared table's COUNT as the odometer so an arm cannot
+score zero by quietly interning nothing:
+
+| arm | body | clean | audit |
+|---|---|---|---|
+| `str` | K strings | **10 / 10** | 0 |
+| `low` | K fresh `%INTERN-SYMBOL-PKG` | **5 / 10** | **0** on every run that completes |
+| `cl` | K fresh `CL:INTERN` | **0 / 8** | **+44** at K=20, every run, process never dies |
+
+**SO THERE ARE TWO DEFECTS AND ONLY ONE OF THEM IS THE DOCUMENTED ONE.**
+
+* **D1, `CL:INTERN`'s cross-region pointers** — deterministic (8 of 8), linear
+  in K (+36 at K=20, +296 at K=200 on the probe this grew out of), and the
+  process never dies: it reports the number and exits on the check.  This is
+  the `29` `test/hosted-term-xregion.lisp` reports.
+* **D2, the low-level intern is lethal at about one run in two, and the
+  cross-region mechanism does not explain it** — `low` dies 5 times in 10 with
+  `MVM LONGJMP (TRAP #x0511) with no active handler-case`, the campaign's
+  headline signature, *while its audit reads zero on every run that survives*.
+  `str` at 10 of 10 rules out "any loop on a worker dies".  What `low` does and
+  `str` does not is take the runtime lock and hop the active region; that is a
+  **suspect, not a finding**.
+
+**D2 IS WHY THE OBVIOUS FIX IS NOT AVAILABLE.**  The obvious fix for D1 is the
+remedy this tree already applies to `%INTERN-SYMBOL-PKG`: wrap `CL:INTERN` in
+`%RT-ENTER`/`%RT-LEAVE` so the symbol, its name and the symtab cons are
+allocated in region 0 beside the tables that point at them.  Bracketing a
+`CL:INTERN` call site by hand — no rebuild, the definition untouched —
+reproduces the signature **at K=1, deterministically**, and a sub-bisect inside
+the create path put the death at the first `GETHASH`/`PUTHASH` on the shared
+table rather than at the allocation (`%MAKE-CL-SYMBOL` and
+`%CL-SYM-SET-PACKAGE` both complete).  **That sub-bisect is NOT reliable and is
+recorded as a lead only**: the same operations in a slightly different function
+shape pass 3 of 3, which is this campaign's documented layout-sensitivity, and
+a single run of any of these means "not reproduced in this shape".
+
+**WHAT IS THEREFORE STILL OPEN**, restated so the next attempt starts from the
+right place: the acceptance criterion is unchanged and correct (`region 0 ->
+worker` 29 -> 0), but the code to change is `CL:INTERN`, not
+`%INTERN-SYMBOL-PKG`; and D2 has to be understood first, because every proposed
+remedy for D1 — hop the region, delegate to an owner, or keep a per-actor store
+— runs on the same worker-side machinery that is killing `low` half the time
+today.  **A fix for D1 validated on a substrate that fails 5 in 10 cannot be
+told from luck.**
+
 ### DELEGATION TO A SERVICE ACTOR — what was measured before building it
 
 The chosen fix is that allocating mutations of the shared tables are performed
@@ -1985,6 +2057,23 @@ tables are acceptable is NOT yet measured; the serialised-boundary argument says
 yes and that is reasoning, not evidence.
 
 ### THE PER-ACTOR INTERN STORE — feasible, designed, NOT BUILT
+
+***READ THE CORRECTION FIRST*** — "AND IT NAMED THE WRONG INTERN" above.  This
+section is a design for `%INTERN-SYMBOL-PKG`, and `%INTERN-SYMBOL-PKG` is
+**not** the function that leaves the forbidden pointer: measured, it allocates
+in region 0 and its audit is 0.  `CL:INTERN` is.  The shape below (default-off,
+a raw per-thread slot, own table then shared read-only then create locally) is
+still the right shape, but it has to be applied one layer up, where the store
+is not one hash table but a hash table **and** every package's own symtab — and
+there is a rooting question this section never asked: **a raw per-thread word is
+not a GC root.**  The collector's precise root set is the fixed list in
+`translate-x64`'s `EMIT-GC-TRAMPOLINE` (globals, symbol, keyword, package, MV
+extras); a local table living in the worker's region and rooted only from a
+word in the thread page would be collected out from under its owner at that
+thread's first collection.  The per-thread WINDOW (FS, `%TLS-WINDOW-OFFSET-P`)
+is the one per-thread store the collector can already address — `emit-tls-base`
++ offset, exactly as the MV-extras loop does — and offsets `0xC38..0xFFF` of the
+window block are unclaimed.  Neither has been built.
 
 Where the local table can live, checked rather than assumed: the per-thread
 RECORD at `%THR-REC i` is 128 bytes with only `+0x00..+0x30` used, and

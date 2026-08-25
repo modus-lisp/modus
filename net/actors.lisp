@@ -780,7 +780,7 @@
                             (let ((i 0))
                               (loop
                                 (when (>= i nlen) (return 0))
-                                (string-set nm i (mem-ref (+ (+ buf 5) i) :u8))
+                                (setf (aref nm i) (code-char (mem-ref (+ (+ buf 5) i) :u8)))
                                 (setq i (+ i 1))))
                             (let ((plen (mem-ref (+ (+ buf 5) nlen) :u32)))
                               (let ((pn (make-string plen))
@@ -788,7 +788,7 @@
                                 (let ((i 0))
                                   (loop
                                     (when (>= i plen) (return 0))
-                                    (string-set pn i (mem-ref (+ pbase i) :u8))
+                                    (setf (aref pn i) (code-char (mem-ref (+ pbase i) :u8)))
                                     (setq i (+ i 1))))
                                 (setf (mem-ref da :u64) (+ pbase plen))
                                 ;; No home package — an uninterned symbol.  Two
@@ -798,12 +798,22 @@
                                     (make-symbol nm)
                                     (intern nm pn))))))
                     (if (= tag 3)
+                        ;; STRING-SET USED TO FILL THIS, AND STRING-SET DOES NOT
+                        ;; EXIST.  Not "was removed" — `defun string-set' appears
+                        ;; nowhere in the tree, (FBOUNDP 'STRING-SET) is NIL, and
+                        ;; this was its ONLY call site.  So this arm was dead in
+                        ;; two senses at once: nothing ever emitted tag 3, and it
+                        ;; could not have worked if anything had.  MAKE-STRING
+                        ;; fills with spaces, so decoding through it gave a
+                        ;; string of the right LENGTH and no content — which is
+                        ;; exactly what came back the first time the encoder
+                        ;; emitted tag 3.
                         (let ((slen (mem-ref (+ buf 1) :u32)))
                           (let ((s (make-string slen)))
                             (let ((i 0))
                               (loop
                                 (when (>= i slen) (return 0))
-                                (string-set s i (mem-ref (+ (+ buf 5) i) :u8))
+                                (setf (aref s i) (code-char (mem-ref (+ (+ buf 5) i) :u8)))
                                 (setq i (+ i 1))))
                             (setf (mem-ref da :u64) (+ (+ buf 5) slen))
                             s))

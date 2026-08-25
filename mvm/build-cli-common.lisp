@@ -986,6 +986,21 @@
                    ;; group, so those images keep the single-buffer socket
                    ;; layer and their blobs are unaffected.
                    (mvm-text "net/hosted-sockets-post.lisp")
+                   (string #\Newline)
+                   ;; THE AOT HALF OF AN A/B.  test/hosted-intern-layers.lisp's
+                   ;; `low' arm — a worker interning fresh symbols through
+                   ;; %INTERN-SYMBOL-PKG — dies about half the time while its
+                   ;; cross-region audit reads ZERO, and the green test that
+                   ;; interns through the SAME function differs from it in
+                   ;; exactly one unmeasured way: the green one's loop is
+                   ;; compiled INTO THE IMAGE.  This file is that loop, in the
+                   ;; image, so the difference can be measured instead of
+                   ;; argued.  Last in the group: it calls %INTERN-SYMBOL-PKG
+                   ;; (prelude), %GC-* (mvm/gc.lisp) and CL:INTERN /
+                   ;; CONCATENATE (the CL bridge), none of which resolve as
+                   ;; forward references across the blob.  "" on aarch64 and on
+                   ;; bare metal with the rest of the group.
+                   (mvm-text "net/hosted-intern-probe.lisp")
                    (string #\Newline))
       ""))
 

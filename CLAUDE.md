@@ -1816,6 +1816,126 @@ remedy for D1 — hop the region, delegate to an owner, or keep a per-actor stor
 today.  **A fix for D1 validated on a substrate that fails 5 in 10 cannot be
 told from luck.**
 
+### D2 IS NOT THE COMPILATION MODE, AND IT IS NOT THE INTERN: MAIN ALLOCATES OVER A WORKER'S OBJECTS IN REGION 0
+
+**FIRST, THE HYPOTHESIS THAT WAS LEFT STANDING IS DEAD.**  The section above
+ends by naming ONE unmeasured difference between the red `low` arm and the
+green `test/hosted-thread-lisp.lisp`: the green one's loop is AOT-compiled
+inside the image (`%TL-SELFTEST`) while the red one's is runtime-compiled
+`--script` code.  It could not be settled from a binary that did not contain
+the loop, so `net/hosted-intern-probe.lisp` puts it there — `%IP-WORKER`, a
+line-for-line copy of `test/hosted-intern-layers.lisp`'s worker, baked into the
+blob — and `test/hosted-intern-aot.lisp` runs EITHER that copy OR an identical
+script-side copy, in one process shape, from one binary, chosen by an
+environment variable.  Everything the loop is called from is runtime-compiled
+in both; the only thing that moves is where the loop was compiled.
+
+**BOTH FAIL.**  `test/run-intern-aot.sh`, 10 runs per cell, survived / died /
+hung classified separately:
+
+| mode | arm | survived | died | hung |
+|---|---|---|---|---|
+| aot | str | **10** | 0 | 0 |
+| aot | low | **0** | 9 | **1** |
+| aot | cl | 0 | 10 | 0 |
+| rt | str | **10** | 0 | 0 |
+| rt | low | **3** | 7 | 0 |
+| rt | cl | 0 | 10 | 0 |
+
+AOT is not better; on this sample it is worse, which is within this campaign's
+documented layout-sensitivity and should not be read as "AOT is worse".  The
+`cl` cells are the audit's positive control and answer **+43 (aot) / +44 (rt)**
+in the forbidden direction, so the instrument is live in both modes and a zero
+from `low` is a real zero.  **The compilation mode is not the variable, and
+glass being LOADed at runtime is therefore not what stops the frame.**
+
+**SECOND, THE STATEMENT IS NOT ABOUT INTERNING.**  `test/run-intern-shape.sh`
+removes one thing at a time from the red arm — same worker, same K, same
+`%INTERN-SYMBOL-PKG` call, one named difference each, 10 runs per arm:
+
+| arm | what it is | survived | died | hung |
+|---|---|---|---|---|
+| `bare` | the loop and NOTHING else — no audit, no count, no returned list | **3** | 7 | 0 |
+| `count` | bare + the shared table's COUNT | 0 | 10 | 0 |
+| `audit` | count + the O(heap) foreign-ref sweep (today's `low`) | 0 | 10 | 0 |
+| `list` | bare, returning a list consed in the worker's region | 0 | 8 | 2 |
+| `outer` | bare, with ONE `%RT-ENTER`/`%RT-LEAVE` around the whole loop | 0 | 8 | 2 |
+| **`main`** | **the same loop on the MAIN thread** | **10** | 0 | 0 |
+| `str` | K strings on the worker — the allocation control | **10** | 0 | 0 |
+
+So it is not the audit, not the table count, not the returned list and not lock
+granularity — and it is not `%INTERN-SYMBOL-PKG`, because the identical loop on
+the MAIN thread is 10 of 10.  What `bare` does that `main` and `str` do not is
+**allocate in REGION 0 from a thread that is not region 0's owner.**
+
+**THIRD, MEASURED IN ADDRESSES: MAIN WRITES OVER WHAT THE WORKER ALLOCATED.**
+`test/hosted-region0-frontier.lisp` has the worker allocate TWO marked conses
+in one function microseconds apart, differing in exactly one thing — `hot` under
+the runtime lock (so, region 0, which is also main's heap and which main
+bump-allocates from its REGISTERS, outside the lock) and `own` outside it (the
+worker's own region, which nothing else touches).  Both hold `123456789 .
+987654321`; the driver reads both back after the join.
+`test/run-region0-frontier.sh`, 20 runs:
+
+|  | |
+|---|---|
+| runs that reported | 17 of 20 (3 died before they could, 0 hung) |
+| the worker's **region 0** cons came back CHANGED | **5 of 17** |
+| the CONTROL — its **own-region** cons changed | **0 of 17** |
+| both changed (would mean the worker, not the region) | 0 of 17 |
+| the worker's fresh symbol landed inside the span main allocated during the worker's life | **17 of 17** |
+
+First corrupted example: `hot @ 132208071466369  car 45  cdr 84`.  Same worker,
+same function, same instant, one region apart.
+
+**AND THE STALENESS SUB-HYPOTHESIS IS REFUTED IN THE SAME FILE, WHICH IS WHY
+THAT FILE IS THE INSTRUMENT AND NOT AN ARGUMENT.**  The obvious mechanism —
+"region 0's parked frontier is BEHIND main's live one, so a worker allocates
+underneath main" — is **wrong as stated**: probed atomically inside one compiled
+function (everything passed in as arguments, because an implicit global here is
+a `SYMBOL-VALUE`, which takes the lock, which REPUBLISHES the field and
+manufactures a false answer), main's live frontier and region 0's parked
+frontier are **49 bytes apart** — one cons — and stay so.  mvm-eval hops so
+often that the field is essentially always current.  *A first version of this
+file read the two in successive TOPLEVEL forms and measured a megabyte of gap
+that was purely the evaluator's own allocation in between; that number said
+nothing and is the reason the probe is a compiled function now.*
+
+What is left is the narrower and worse thing: the two are in step **at hop
+boundaries only**.  While a worker holds the lock and bump-allocates region 0
+from the parked field, main is NOT in the lock and keeps bump-allocating region
+0 **from its own registers**, which the worker's advance never touches; and
+main's next hop parks its register value back over the worker's advance.  Two
+mutators, one region, two copies of one frontier.  That is exactly what
+`%RT-LEAVE-LOCKED`'s docstring says the lock exists to prevent, and the lock
+does not cover main's ordinary allocation because region 0 IS main's heap.
+
+**AND IT EXPLAINS THE GREEN TEST, WHICH NOTHING ELSE DID.**  `%TL-SELFTEST`
+puts the MAIN thread in a carved region of its own — `(%gc-region-enter rcb2)`
+before it spawns — so region 0 there is **nobody's mutator heap**, its frontier
+is only ever moved by lock holders, and there is no second copy.  100 of 100.
+Everything red in this campaign runs main in region 0; everything green does
+not.
+
+**WHY THIS IS NOT THE LEAD "— AND THAT LEAD IS REFUTED" ALREADY KILLED.**  All
+three refutations there are about the HOP, which allocates nothing in region 0:
+200 000 lock acquisitions on a worker are clean, 20 hops with no intern are 6 of
+6 clean, and `MAIN_ROUNDS=0` still fails.  That last one is the important
+distinction — **"main's loop does not cons" is not "main does not allocate"**:
+main is still evaluating the script, and mvm-eval allocates in region 0 on every
+form.  The claim here is about a worker that ALLOCATES in region 0, which none
+of those three shapes does.
+
+**WHAT IS NOT ESTABLISHED, STATED PLAINLY.**  (1) No fix was attempted or
+measured.  (2) The corrupted-cons rate (5 of 17) and the `bare` death rate (7 of
+10) are consistent with one mechanism but were not shown to be the same event —
+nothing here traces a specific death to a specific overwrite.  (3) The obvious
+remedy shape is the one the green test already embodies — stop region 0 being
+two things at once, by giving the main thread a region of its own so region 0 is
+only ever the lock-protected shared heap.  **CLAUDE.md warns "DO NOT CHANGE THE
+CARVE" against the refuted lead; that warning was earned against a DIFFERENT
+claim and this one has not been tested, so it is a candidate and not a plan.**
+
 ### DELEGATION TO A SERVICE ACTOR — what was measured before building it
 
 The chosen fix is that allocating mutations of the shared tables are performed
@@ -2219,6 +2339,16 @@ ANYTHING.**
     test/run-glass-shim-audit.sh  the whole SB-* surface — 42 ok / 0 gaps
     test/run-glass-serve.sh       glass's RFB server vs a real Python VNC client
                                   (handshake passes; the frame does not arrive)
+    test/run-intern-aot.sh        AOT versus runtime-compiled, same loop, same
+                                  binary — the A/B that killed the last standing
+                                  hypothesis.  Needs net/hosted-intern-probe.lisp
+                                  baked in; every `aot' cell says SKIP if it is not
+    test/run-intern-shape.sh      one difference at a time off the red arm; `main'
+                                  10/10 against `bare' 3/10 is what moves the
+                                  statement off INTERN and onto REGION 0
+    test/run-region0-frontier.sh  the overwrite itself, in addresses, with the
+                                  control INSIDE the run: two marked conses from
+                                  one worker, one region apart
 
 ### THE CARVE TOOK MEMORY THAT WAS STILL IN USE — and all eight glass files load
 

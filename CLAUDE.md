@@ -1936,6 +1936,78 @@ only ever the lock-protected shared heap.  **CLAUDE.md warns "DO NOT CHANGE THE
 CARVE" against the refuted lead; that warning was earned against a DIFFERENT
 claim and this one has not been tested, so it is a candidate and not a plan.**
 
+### SHAPE A ("MAIN LEAVES REGION 0") IS DEAD AT ITS GATE — probed, not built
+
+The candidate above was gated before building: hop main into slot 0's carved
+region — the region the carve has always reserved for it ("SLOT 0 IS THE MAIN
+THREAD'S AND ITS REGION IS SPARE", net/hosted-actors.lisp) — mid-script, and
+measure what actually happens.  `test/hosted-mainhop-probe.lisp` /
+`test/run-mainhop-probe.sh`.  Every number below is 10 of 10 or 5 of 5,
+deterministic; the control arm (`MAINHOP_CONTROL=1`, identical script, hop and
+forced collection skipped) survives 5 of 5 with every publication row at **+0**,
+so each instrument answers both ways.
+
+**THE PARTS THAT WORK, measured (P1/P2, 15 of 15 each):** post-hop, a cons
+lands in main's region; a fresh `%INTERN-SYMBOL-PKG` symbol STILL lands in
+region 0 (the lock hop keeps routing shared allocations); FORMAT works; and
+region 0's frontier is **exactly still** under compiled lock-free work — the
+literal gate question "does main allocate region 0 outside the lock after the
+hop" is answered **zero**.  One region, one frontier: that half of shape A is
+sound.
+
+**WHAT KILLS IT: region-0-resident structures point into main's region, and
+main's region cannot collect without stranding them.**  Three witnesses, one
+mechanism:
+
+1. **Publication is pervasive and is mostly the READER (P3).**  region 0 ->
+   main's-region references, re-counted after each kind of evaluated toplevel
+   form: DEFUN +12, heap-valued DEFVAR/SETQ +13, heap-string global +15, even a
+   bare FORMAT form +14, one CL:INTERN +18 — ~12–18 per toplevel form
+   REGARDLESS of kind, i.e. it is the evaluation/read machinery itself (every
+   fresh source symbol goes through `CL:INTERN`, the D1 defect, now committed
+   by MAIN), not an enumerable set of user-visible sites.  Control: all rows
+   +0.
+2. **One FORCED collection of main's region dangles a DEFVAR'd heap value
+   immediately (P4, 15 of 15).**  `(setq *l* (list 10 20 30 40))` then one
+   `%ha-collect-here`: the argument-passed chain survives (conservative stack
+   root), the list read back through the globals table is garbage
+   (100 -> a different junk word every run).  The post-hop DEFUN and the
+   CL:INTERN'd symbol happened to survive in 15 of 15 — do not lean on that;
+   the DEFVAR is the proof.
+3. **The FIRST natural collection of main's region kills the whole script
+   (P5, 15 of 15), even when the allocating loop is compiled.**  ~48 MB of
+   `make-string` inside one compiled function -> main's 16 MB region collects
+   -> death in the LOAD machinery (`load-read-error-stops-load` /
+   `load-toplevel-form-swallowed`, TYPE-ERROR): the load loop
+   (`%load-from-stream`, mvm/ansi-bridge.lisp) reads and evals on main, and
+   the pre-hop stream/table structures in region 0 hold pointers into main's
+   region that the collection never fixes — `EMIT-GC-TRAMPOLINE` scans the
+   fixed tables' ROOT SLOTS and Cheney-walks only the collecting region's
+   to-space, so region-0 INTERNALS are never walked (confirmed by reading
+   translate-x64.lisp:5445ff against the observed deaths).
+
+**THE CONTROL IS WHAT MAKES THE MECHANISM CLAIM TIGHT.**  In the control run
+the SAME ~48 MB workload made region 0 itself collect naturally, once, with
+main inside it — **and evaluated code survived**, because when region 0
+collects, the tables are INSIDE the collecting region and the whole graph is
+forwarded consistently.  Same workload, same collector, same code — the only
+difference is whether the dangles cross a region boundary.  (Region 0 at probe
+start: 654 MB semispace, 302 MB live — so region 0's own natural collections
+are a real, occasionally-taken path today, at least under compiled code.)
+
+**CONSEQUENCE.**  Shape A as "main enters its own region at bringup" cannot
+carry an evaluator: any script that allocates ~16 MB after bringup dies at
+main's first collection, and loading glass evaluates far more than that.  It
+would pass the small reproducers and die at `run-glass-serve.sh`.  The honest
+alternatives, in order of what is now known: **shape B** — one frontier IN
+MEMORY for region 0, bumped by main and lock-holders alike (touches allocation
+codegen on the hottest path, but requires none of the above to be solved) — or
+shape A plus walking/repairing region-0 internals on every other region's
+collection, which is a collector redesign.  The D1 story is unchanged and
+shape-independent: `CL:INTERN` publishes caller-region objects into region-0
+tables from ANY thread, and the probe measured it doing so from main at
+~12–18 refs per evaluated form the moment main is not in region 0.
+
 ### DELEGATION TO A SERVICE ACTOR — what was measured before building it
 
 The chosen fix is that allocating mutations of the shared tables are performed

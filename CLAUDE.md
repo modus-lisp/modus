@@ -1939,12 +1939,47 @@ past twenty-plus green tests without a murmur.  `SEND`/`RECEIVE` is a different
 path from calling the encoder directly — `SEND` decides for itself whether a
 value needs serialising and picks the buffer.
 
-***WHAT IT DOES NOT PROVE.***  The mailbox section sends to **SELF** — one actor,
-one region — so its `EQ` check would pass even if the decoder returned the
-sender's pointer.  The cross-region claim (a symbol decoded by an actor in
-ANOTHER region leaves **zero** pointers into the sender's per
-`%GC-COUNT-FOREIGN-REFS`, control still answering non-zero) needs two actors on
-two regions and is **NOT TESTED**.
+***THE MAILBOX SECTION SENDS TO SELF*** — one actor, one region — so its `EQ`
+check would pass even if the decoder returned the sender's pointer.  The
+cross-region half is `test/hosted-term-xregion.lisp`, below.
+
+### THE CROSS-REGION AUDIT: strings are clean, SYMBOLS ARE NOT
+
+Sender = the main thread (region 0).  Receiver = a worker thread, which owns its
+own region (checked, not assumed).  The worker decodes, then
+`%GC-COUNT-FOREIGN-REFS` runs both ways:
+
+| payload | region 0 -> worker | worker -> region 0 |
+|---|---|---|
+| a string | **0** | 133 |
+| a symbol | **29** | 137 |
+
+**THE TWO DIRECTIONS ARE NOT THE SAME REQUIREMENT**, and demanding zero both
+ways was this file's first mistake here — the backward number is ~150 for a
+worker that has merely started up.  `region 0 -> worker` MUST be zero: those
+pointers are not on the worker's stack, so its collector never updates them and
+they dangle the moment its region collects — the mechanism behind
+`test/run-worker-intern.sh`'s SIGSEGV.  `worker -> region 0` is EXPECTED
+non-zero and violates nothing today: every symbol and global a worker touches is
+a region-0 object.  What it does mean is that **region 0 must never collect out
+from under a live worker**, which this tree relies on, does not enforce, and no
+test exercises.
+
+**AND THE CO-LOCATION ARGUMENT WAS WRONG.**  "The receiver interns, so the
+symbol and the table that points at it are co-located by construction" — the
+receiver does intern, and the symbol IS in the receiver's region, but the intern
+table is the SHARED one at `0x10000088`, which lives in **region 0**.  So the
+forbidden pointer is not avoided, only MOVED: region 0's table now points at the
+RECEIVER's symbol instead of the sender's.  Serialising was still necessary —
+the string is 0 where before the fix it shipped a raw pointer — but **it is not
+sufficient for symbols**, and delegating fresh interns to the region's owner is
+therefore load-bearing rather than an optimisation.  That `29` going to `0` is
+its acceptance criterion.
+
+*(A dedicated positive control that interned 400 fresh symbols on the worker was
+tried and removed: it takes the process down, because that is precisely the
+defect, so it could never report. The string and symbol cases are the control —
+same audit, same spans, same direction, answering 0 and 29.)*
 
 **STILL BY POINTER:** anything that is not NIL / cons / fixnum / string / symbol
 / array / bignum still falls into `;; Unknown object type — encode as fixnum`.

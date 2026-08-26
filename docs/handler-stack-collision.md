@@ -156,6 +156,30 @@ section reports 16,489/17,465 = 94.4% without stating the provenance of the
 `auxiliary/ansi_aux`) is recognisably the GCL ANSI test suite, but that is an
 inference from filenames, not something the tree asserts.
 
+### The paths are absolute, and contexts run in separate containers
+
+This is why the corpus "was absent" here and present for you: **same host,
+different container, different checkout.** `/home/claude/modus/tmp/ansi-test`
+and `/home/claude/modus-ref/ansi-test` are absolute paths that resolve inside
+whichever container is running, so each context silently measures **its own
+copy** of the corpus under the same name, with nothing in the tree recording
+which copy that is.
+
+It is not hypothetical. Gate PASS was reported from another context as
+`17521 → 17522, NET=+1, lost=0, markers unchanged`. The corpus
+`scripts/get-ansi-corpus.sh` fetches (upstream `ca06bd9`, 2026-03-10) has
+**17,376 static deftests**, and `CLAUDE.md` records a *total* of **17,465**.
+A passed count of 17,521 exceeds both. So those runs and ours are not measuring
+the same corpus — the numbers are not a discrepancy to reconcile, they are two
+different corpora wearing the same path.
+
+**Consequence for reading any conformance number in this tree:** an absolute
+count is meaningful only alongside the corpus revision it came from. `NET` is
+same-run and therefore still sound *within* one context — it is the right
+metric and the other context used it correctly — but a NET from one container
+cannot be compared against a NET from another, and neither can be checked
+against `CLAUDE.md`'s 94.4% without knowing which corpus produced it.
+
 **Two requests, both cheap and both worth more than this bug report:**
 
 1. **Record the provenance** — a line in `CLAUDE.md` or a `scripts/get-ansi-corpus.sh`

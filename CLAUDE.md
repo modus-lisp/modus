@@ -2008,6 +2008,96 @@ shape-independent: `CL:INTERN` publishes caller-region objects into region-0
 tables from ANY thread, and the probe measured it doing so from main at
 ~12–18 refs per evaluated form the moment main is not in region 0.
 
+### B-LITE LANDED (b372b57): locked sections allocate in an IMMORTAL ARENA, and CL:INTERN joins them — the collision and D1 are dead
+
+**THE DESIGN, sized before building.**  Full shape B (region 0's frontier in
+memory, bumped by everyone) would touch >=49 R12 frontier sites + 13 gc-check
+emissions in translate-x64, 11 interpreter alloc sites, and eventually the
+aarch64 twin — the hottest path, gated.  **B-LITE** costs one file:
+`%RT-THREADS-ON` carves a **32 MB arena** off the top of region 0's semispace
+(`%GC-REGION-SHRINK` — the same gesture `%HA-CARVE` makes — plus a parked-limit
+clamp for the main-not-in-region-0 shape), and each CPU gets a **1 MB slice**:
+a 64-byte block whose `+0x30/+0x38` the existing `%GC-REGION-ENTER` parks and
+loads, entered at outermost `%RT-ENTER`, refilled from the arena under the
+mutex when headroom < 64 KB, persisted per-CPU by the ordinary leave-side park.
+A locked section touches region 0's frontier NEVER; main's registers and every
+worker's slice advance with no coordination.  **The arena is OUTSIDE the
+collector's bounds** — the trampoline reads from/to/size from the region block
+at collection time, so no collection ever evacuates or overwrites it: IMMORTAL,
+no re-carve, no epoch, nothing to go stale.  Cost of immortality, measured: 128
+bytes per fresh locked intern (percall, K=20 — the only shape that survives
+measuring pre-fix; K>=100 in one hold died 14 of 14) -> ~260K fresh interns per
+process.  Exhaustion falls back to the old path COUNTED (arena words `+0x18`).
+Default-off: no bringup, no gate, no arena, byte-for-byte.
+
+**AND `CL:INTERN` RUNS UNDER THE LOCK, WITH THE NAME COPIED THERE**
+(mvm/cl-packages.lisp): a signal-safe wrapper hoists the arg-count check,
+package resolution and the string designator BEFORE the lock (a longjmp out of
+a held lock leaves it held), and the locked body's create branch `COPY-SEQ`s
+the caller-region name — stored uncopied it left ~2 region-0 -> worker refs
+per fresh intern (+41 at K=20 with the lock alone).  Found/inherited paths
+stay copy-free (immortal-arena burn per lookup would be wrong).  Plus
+mvm-eval: the eval/JIT **caches are not populated off-main**
+(`%MVM-ON-MAIN-THREAD-P`) and `*MVM-LAST-MV*` is cleared as soon as latched at
+all three seams.
+
+**MEASURED, final binary, all rates:** frontier probe **0/20** corrupted with
+20/20 reporting (pre-fix control on the same probe: 2/8 corrupted + 2 dead);
+intern-layers str/low/cl **10/10 each**; worker-intern cons/format/intern-same/
+**intern-fresh 5/5 each**; shape arms bare/count/audit/list/outer/main/str
+**10/10 each, 0 hangs**; worker-xregion both arms PASS;
+`test/run-term-xregion.sh` string/symbol **0 refs, 3/3 each**;
+`test/run-intern-collect.sh` — **the SIGSEGV subject as a standing test**: K
+fresh CL:INTERNs on a worker then TWO forced collections of its own region,
+every symbol EQ after both — **10/10**.  Full bar green including
+classify-thread-lisp 100/0/0.
+
+**DECOMPOSITIONS THE ACCEPTANCE FORCED, each now in a test:**
+* **The historic xregion "29" was 2 real + 27 pollution.**  Measured on the
+  pre-fix binary: symbol case alone = **2** (the symbol + its name — exactly
+  the create path's stores); the other 27 were the STRING case's worker result
+  crossing the region boundary BY POINTER through the join box, counted by the
+  next worker's audit over its reused span (the sweep covers garbage).
+  `run-term-xregion.sh` runs one case per process; its `joinshare` case
+  DEMONSTRATES the join-by-pointer residual on purpose and doubles as the
+  audit's in-vivo positive control.  **Thread return values crossing regions
+  by pointer is a real, named, open residual.**
+* **The last +1 was the interpreter's MV hand-off global** — `*MVM-LAST-MV*`
+  holds the most recent 2-valued call's `(count . secondaries)` cons from
+  whichever thread ran; on a worker that is a worker-region cons in a
+  region-0-reachable global.  Verified exactly: clearing that ONE word took
+  the audit 1 -> 0.  It is the per-thread-window campaign's explicitly
+  deferred interpreter state; the tests that audit interning measure, REPORT
+  and clear it, in that order.
+* **Audits must sweep the arena** — `il-fwd`/`xr-fwd`/worker-xregion's sweep
+  now cover `[%RT-ARENA-BASE, %RT-ARENA-ALLOC)` too, or the fix would have
+  gone green by moving objects out of the swept span.
+
+**OPEN REGRESSION, LEFT VISIBLE — the shim audit's 327680-byte two-thread
+transfer probe dies on arena binaries** (TYPE-ERROR escaping an ARMED
+handler-case — the wrecked-condition shape), in the audit's exact shape only.
+Discriminated hard, all rated: pre-arena binary **5/5 PASS**, arena binaries
+**0/5**, a carve-disabled build **3/3 PASS**, slice-path-disabled-at-runtime
+(after real bringup — the first attempt disabled before `%RT-THREADS-ON` ran
+and the carve re-armed it, a trap for the next person) **3/3 PASS**, so the
+shrink is exonerated and it is the SLICE PATH ENGAGED.  Every reduction fails
+to reproduce the discriminant: sequential spawn stress 3/3 clean, minimal
+spawn+sockets+transfer shapes die on the PRE-FIX binary too (and three
+"passing" single runs of those reductions were all small-sample lies —
+re-rated to 0/3).  Slice/lock state reads sane at the death point.  Mechanism
+NOT identified; the ingredients in the audit's shape are prior thread spawns +
+sockets + an evaluated reader closure + a big concurrent transfer in one
+process.
+
+**AND THE WALL IN FRONT OF GLASS IS UNMOVED, WHICH IS THE HONEST PARTITION:**
+`run-glass-send-worker.sh` plain/tx/lock deliver **49180/49180** and `both`
+still stops at **32785** with `MVM LONGJMP (TRAP #x0511)` — byte-identical to
+the pre-fix record.  The collision was real and is fixed; it was never that
+wall.  glass-load 13/13, rfb-static PASS, glass-fb md5-identical;
+`run-glass-serve.sh` still times out on the client (downstream of the `both`
+wall).  The next campaign starts at the `both` arm: the nested
+`*tx*`-special-binding + `with-fb-locked` pair on a worker.
+
 ### DELEGATION TO A SERVICE ACTOR — what was measured before building it
 
 The chosen fix is that allocating mutations of the shared tables are performed

@@ -408,6 +408,106 @@
                       (if (equal last *mono-expect*) :ok :wrong-final))
                   v))))))
 
+;;; ============================================================
+;;; REGION 0 -> WORKER POINTERS, FROM SPECIAL-VARIABLE BINDING
+;;; ============================================================
+;;;
+;;; THE ARM PARTITION NAMES A MECHANISM.  Clean: plain, lock, bothnil, othersp.
+;;; Corrupted: tx, both, lockalloc.  `bothnil' is the tell — IDENTICAL nesting,
+;;; same recursive lock, same unwind-protects, *TX* bound to NIL — and it is
+;;; clean.  So it is not the nesting, not the lock, not the unwind.  What the
+;;; corrupted arms do and the clean ones do not is ALLOCATE A FRESH CONS ON THE
+;;; WORKER AND STORE IT INTO A GLOBAL:
+;;;
+;;;   (let ((glass::*tx* (list 0))) …)
+;;;     1. (LIST 0) conses in the WORKER'S region;
+;;;     2. modus shallow-binds — SET-SYMBOL-VALUE writes that cons into the
+;;;        globals table, WHICH LIVES IN REGION 0.
+;;;
+;;; That is a REGION 0 -> WORKER pointer, the forbidden direction this campaign
+;;; already proved fatal for CL:INTERN (the audit read +44 and one forced
+;;; collection SIGSEGV'd 3 of 3).  Interning was fixed by copying into the lock
+;;; arena; SPECIAL-VARIABLE BINDING WAS NEVER FIXED, and COMPILE-LET-WITH-
+;;; SPECIALS does not go near the arena.  If that is the mechanism, the cons is
+;;; unreachable from any root the WORKER'S collector walks, so its space is
+;;; reclaimed and re-issued while *TX* still names it — which is exactly "a live
+;;; cons handed out again as fresh allocation", and exactly why the CAR comes
+;;; back a CHARACTER or a FUNCTION rather than a corrupted integer.
+;;;
+;;; ***MEASURED WITH %GC-COUNT-FOREIGN-REFS, AFTER THE SEND, IN ITS OWN ARMS.***
+;;; Nothing is added to the hot path and no shipped arm is touched, so this
+;;; cannot move the bug.  The count is taken INSIDE the binding but AFTER BODY
+;;; has returned, because modus shallow-binds: once the LET unwinds, the global
+;;; is restored and the pointer under test no longer exists.
+;;;
+;;; VACUITY GUARD, the same one that has already caught this campaign twice: a
+;;; zero is only meaningful if the spans being scanned are non-zero.  FR-REPORT
+;;; prints both spans next to the count, and a zero span means NOT MEASURED.
+;;;
+;;; ============================================================
+;;; MEASURED, 3 of 3, DETERMINISTIC (arm `txfr'):
+;;;
+;;;   FR[pre] =0  r0span=107661168 wspan=16777216 wgc=0
+;;;   a=CONS/0 b=CONS/4 c=CONS/32851 d=CONS/16429      <- d < c, corrupted
+;;;   FR[post]=1  r0span=107669856 wspan=16777216 wgc=17
+;;;
+;;; ***EXACTLY ONE REGION 0 -> WORKER POINTER EXISTS AT THE END OF A CORRUPTED
+;;; SEND, WHERE THERE WERE NONE BEFORE THE BINDING***, across 17 collections of
+;;; the worker's own region.  One cons, one pointer, the forbidden direction.
+;;; That is the shape the hypothesis predicts.
+;;;
+;;; ***THE FIRST VERSION OF THIS PROBE SCANNED ONLY FROM-SPACE AND READ 0.***
+;;; The worker's live data had flipped to to-space.  A false zero would have
+;;; killed a live hypothesis for the second time in this campaign; scanning
+;;; BOTH semispaces is not defensive, it is the difference between the two
+;;; answers.  Do not remove it.
+;;;
+;;; ***WHAT IS NOT ESTABLISHED: THE BETWEEN-ARM CONTROL.***  `bothnilfr' is the
+;;; same shape with *TX* bound to NIL and it should read 0.  It does not run —
+;;; "the server never announced a port", 3 of 3, deterministic, cause unknown
+;;; and NOT diagnosed.  So the +1 is attributed to the binding only by the
+;;; WITHIN-RUN control (pre=0 -> post=1, same process, same spans); anything
+;;; else the send stores globally would also be counted.  ***THE MECHANISM IS
+;;; CONSISTENT WITH THE MEASUREMENT, NOT YET PROVEN BY IT.***  Fixing
+;;; `bothnilfr' is the next step and it is a cheap one.
+(defun fr-fwd ()
+  "Region 0's live span AND the lock arena -> THIS worker's region.
+   ***BOTH SEMISPACES ARE SCANNED*** (+0x00 from_start, +0x08 to_start): after a
+   flip the worker's live data is in the other one, and scanning only from-space
+   would return a FALSE ZERO — which is the failure mode this whole campaign is
+   about.  Returns (count region0-span worker-span worker-gc-count)."
+  (let* ((k (%gc-meta-scale)) (rw (%gc-region))
+         (wfrom (%gc-meta-read (+ rw #x00) k))
+         (wto (%gc-meta-read (+ rw #x08) k))
+         (wsize (%gc-meta-read (+ rw #x10) k))
+         (wgc (%gc-meta-read (+ rw #x20) k))
+         (r0 (%gc-region-0))
+         (r0from (%gc-meta-read (+ r0 #x00) k))
+         (r0alloc (%gc-meta-read (+ r0 #x30) k))
+         (ab (%rt-arena-base))
+         (aa (%rt-arena-alloc)))
+    (list (+ (%gc-count-foreign-refs r0from r0alloc wfrom wsize)
+             (%gc-count-foreign-refs r0from r0alloc wto wsize)
+             (if (> aa ab) (%gc-count-foreign-refs ab aa wfrom wsize) 0)
+             (if (> aa ab) (%gc-count-foreign-refs ab aa wto wsize) 0))
+          (- r0alloc r0from)
+          wsize
+          wgc)))
+
+(defun fr-report (tag)
+  (let ((r (fr-fwd)))
+    (write-string-serial " FR[")
+    (write-string-serial tag)
+    (write-string-serial "]=")
+    (write-string-serial (princ-to-string (first r)))
+    (write-string-serial " r0span=")
+    (write-string-serial (princ-to-string (second r)))
+    (write-string-serial " wspan=")
+    (write-string-serial (princ-to-string (third r)))
+    (write-string-serial " wgc=")
+    (write-string-serial (princ-to-string (fourth r)))
+    (write-string-serial " ")))
+
 (defun do-send (s fb mode)
   (cond
     ;; ---- the four arms run-glass-send-worker.sh names ----
@@ -416,6 +516,16 @@
     ((string= mode "lock")  (glass::with-fb-locked (fb) (body s fb)))
     ((string= mode "both")  (glass::with-fb-locked (fb)
                               (let ((glass::*tx* (list 0))) (body s fb))))
+    ;; ---- REGION0->WORKER PROBE ARMS.  `txfr' mirrors `tx' (corrupted),
+    ;; `bothnilfr' mirrors `bothnil' (clean).  Same shape, one binds a fresh
+    ;; cons and one binds NIL: that is the whole experiment.
+    ((string= mode "txfr")
+     (fr-report "pre")
+     (let ((glass::*tx* (list 0))) (body s fb) (fr-report "post")))
+    ((string= mode "bothnilfr")
+     (fr-report "pre")
+     (glass::with-fb-locked (fb)
+       (let ((glass::*tx* nil)) (body s fb) (fr-report "post"))))
     ;; ---- THE SECOND GRADER'S ARM: identical to `both', graded harder ----
     ((string= mode "bothmono") (glass::with-fb-locked (fb)
                                  (let ((glass::*tx* (list 0))) (body-mono s fb))))

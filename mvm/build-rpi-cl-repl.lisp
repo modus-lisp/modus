@@ -102,13 +102,18 @@
 (defvar *cli-bare-metal* t)
 (defvar *cli-bare-metal-tarball* t)
 
-;;; Runtime JIT: OFF.  %jit-translate-page mmaps a PROT_EXEC page and mprotects
-;;; it; there is no mmap on bare metal, so the native-code seam is a later rung.
-;;; eval = mvm-eval = compile -> MVM bytecode -> mvm-interpret, exactly what the
-;;; bare ANSI gate runs.  Flipping this to T is task #267 — and when it flips,
-;;; this image inherits build-cli-common's ARCH-DISPATCHED aarch64 translator
-;;; block instead of the private x64 copy this file used to carry.
-(defvar *jit-on* nil)
+;;; Runtime JIT: ON (flipped 2026-08-24).  The mmap obstacle is gone:
+;;; translate-aarch64's trap #x0531 now has a BARE-METAL branch that
+;;; bump-allocates exec pages from the reserved region [0x14000000,
+;;; 0x18000000) (Normal-WB, no PXN — already executable; bump word at
+;;; 0x13FFFFF0 with a range-check init because real DRAM is not zeroed),
+;;; and #x0534 (munmap) is a bare-metal no-op.  Traps #x0532 (BLR) and
+;;; #x0533 (DC CVAU / IC IVAU / ISB) were always pure-CPU and work as-is.
+;;; This image inherits build-cli-common's ARCH-DISPATCHED aarch64
+;;; translator block; the Linux co-init is overridden below
+;;; (*rpi-jit-coinit-override*) so runtime-emitted traps use the
+;;; bare-metal paths (mini-UART serial, bump-allocator pages).
+(defvar *jit-on* t)
 
 ;;; ------------------------------------------------------------
 ;;; BRING-UP CULLS (#209 rung 4).  Chain-loading a 20MB image over a 9600-baud
@@ -244,39 +249,17 @@
   (write-string-serial \"MODUS-CL\")
   (write-char-serial 10)
 
-  ;; BARE-METAL BSS-EQUIVALENT INIT.  On Linux the ELF BSS is zero-filled by
-  ;; the kernel; on bare metal these words hold whatever the firmware left in
-  ;; RAM, and symbol-value would dereference the garbage at 0x10000080 as the
-  ;; global-alist head.  Unlike the x64 bare image — whose boot-x64.lisp
-  ;; pre-zeroes 0x10000180 / 0x10000400 / 0x10000C70 — boot-rpi-cl.lisp zeroes
-  ;; NOTHING, so this list is the union of the x64 CL REPL's and the
-  ;; QEMU-virt bare AArch64 image's (build-aarch64.lisp kernel-main).
-  ;; On the Pi these are plain identity-mapped DRAM (QEMU virt needs an MMU
-  ;; remap to make 0x1000xxxx exist at all).
-  (setf (mem-ref #x10000080 :u64) 0)   ; global variable alist head
-  (setf (mem-ref #x10000088 :u64) 0)   ; symbol intern table
-  (setf (mem-ref #x10000090 :u64) 0)   ; MV count
-  (setf (mem-ref #x10000098 :u64) 0)   ; MV values
-  (setf (mem-ref #x10000148 :u64) 0)   ; keyword intern table
-  (setf (mem-ref #x10000150 :u64) 0)   ; dynamic nargs
-  (setf (mem-ref #x10000158 :u64) 0)   ; intern counter
-  (setf (mem-ref #x10000170 :u64) 0)   ; package-by-hash root
-  ;; NOT 0x10000160/168 — those are code_base/code_end, written by
-  ;; emit-aarch64-code-bounds-init in the boot preamble.  FUNCTIONP's
-  ;; in-code-range arm reads them; zeroing here would undo the boot.
-  (setf (mem-ref #x10000180 :u64) 0)   ; handler-case setjmp frame
-  (setf (mem-ref #x10000188 :u64) 0)
-  (setf (mem-ref #x100001C0 :u64) 0)   ; no-handler rescue fallback
-  (setf (mem-ref #x10000C30 :u64) 0)   ; fault diag slots
-  (setf (mem-ref #x10000C38 :u64) 0)
-  (setf (mem-ref #x10000C40 :u64) 0)
-  (setf (mem-ref #x10000C48 :u64) 0)
-  (setf (mem-ref #x10000C50 :u64) 0)
-  (setf (mem-ref #x10000C58 :u64) 0)
-  (setf (mem-ref #x10000C70 :u64) 0)   ; deadline countdown (no IRQ here)
-  (setf (mem-ref #x10000C80 :u64) 0)   ; %intern-symbol depth counter
-  (setf (mem-ref #x10000DA0 :u64) 0)   ; safepoint boundary
-  (setf (mem-ref #x10010000 :u64) 0)   ; handler-stack depth (aarch64 helpers)
+  ;; NO BSS-EQUIVALENT INIT HERE.  It used to be a ~22-entry list of individual
+  ;; (setf (mem-ref #x1000xxxx :u64) 0) slots, and it was wrong twice over: it
+  ;; ran AFTER the banner above — so write-string-serial's own global reads
+  ;; already walked the garbage alist head at 0x10000080 — and an enumeration
+  ;; can only cover the slots someone remembered, leaving any newly added
+  ;; metadata word uninitialised on hardware and fine under emulation.
+  ;; boot/boot-rpi-cl.lisp step 0 now bulk-zeroes 0x10000000..0x10001000 plus
+  ;; 0x10010000 before a single Lisp instruction runs, which is also the only
+  ;; place the bulk form is legal: the two words that must survive
+  ;; (0x10000F00 DTB pointer, 0x10000160/168 code bounds) are written by that
+  ;; same preamble afterwards.
 
   ;; GC METADATA — must precede the first allocation.  The x64 bare image gets
   ;; this from boot-x64.lisp's kernel64 entry; the AArch64 boot publishes only
@@ -409,6 +392,157 @@
   (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_NET_BUILD")))
     (and v (string= v "1"))))
 
+;; MODUS_SSH_BUILD=1 — fold the crypto layer (SHA-256/512, ChaCha20, Poly1305,
+;; X25519, Ed25519) into the CL host-net image, staging toward a bare-metal SSH
+;; server.  Additive: "" when off, so the HTTP image is byte-identical.  Crypto
+;; is separable from the SSH transport/actor stack — it depends only on pure
+;; arithmetic + a scratch region at (e1000-state-base)+0x100, both of which the
+;; CL host adapter (arch-rpi-cl.lisp) already provides, and which does NOT
+;; overlap r8152.lisp's NIC state (+0x08..+0x44).  Building it VERIFIES the
+;; crypto sources MVM-compile for AArch64 under the CL/mvm-eval image (the heavy
+;; 32-bit rotations are exactly where a compile-ash/bignum gap would surface).
+;; The SSH transport (actors + ssh.lisp + a fresh actor/SSH address map for the
+;; 0x11000000 layout) is the next layer and needs on-hardware iteration.
+(defvar *ssh-build-p*
+  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_SSH_BUILD")))
+    (and v (string= v "1"))))
+
+;; Crypto source, spliced into *net-source* after ip.lisp.  "" unless SSH build.
+(defvar *crypto-source*
+  (if *ssh-build-p*
+      (concatenate 'string
+        (%rpi-net-text "crypto.lisp")        (string #\Newline)
+        (%rpi-net-text "crypto-fast.lisp")   (string #\Newline))
+      ""))
+
+;; Actor/SSH address map for the CL host image's memory layout.  The legacy
+;; block (arch-raspi3b) sits at 0x0200_0000/0x0600_0000, which lands INSIDE this
+;; 58 MB image and would corrupt code; shift +0x10000000 (the same shift
+;; arch-rpi-cl applied to the net block → 0x1100_0000).  All in Normal-WB RAM
+;; per boot-rpi-cl's page table (0x11200000-0x3EFFFFFF is Normal-WB; the USB DMA
+;; window 0x11000000-0x111FFFFF is Device — actor code must NOT run there).
+;; arch-rpi-cl does NOT define these, so there is no last-defun-wins conflict.
+(defvar *ssh-addr-map-source*
+  (if *ssh-build-p*
+      "
+(defun percpu-data-base ()   #x12000000)
+(defun sched-lock-addr ()    #x12000200)
+(defun actor-table-base ()   #x12010000)
+(defun sched-state-base ()   #x12012000)
+(defun scratch-addr ()       #x12012050)
+(defun decode-ptr-addr ()    #x12012058)
+(defun actor-stack-base ()   #x12020000)
+(defun mailbox-pool-base ()  #x12420000)
+(defun mailbox-pool-limit () #x12440000)
+(defun pool-state-base ()    #x12440000)
+(defun staging-base-addr ()  #x12500000)
+(defun actor-heap-base ()    #x16000000)
+;; SSH CPU-side scratch MUST be Normal-WB, not the Device USB-DMA window: the
+;; SSH stack does UNALIGNED u32 stores into e1000-state (ssh-init-strings @
+;; +0x1000, crypto @ +0x680) and ssh-ipc, which Device-nGnRnE memory faults
+;; (ESR alignment). arch-rpi-cl puts these at 0x1106/8/11_0000 (inside the 2 MB
+;; Device block). Relocate to Normal-WB 0x1300_0000; the DMA buffers
+;; (usb-dma/e1000-rx/tx-buf/desc, cdc-rx = e1000-rx-buf-base) STAY in the Device
+;; window — they are separate addresses and not referenced off e1000-state.
+(defun e1000-state-base ()   #x13000000)
+(defun ssh-conn-base ()      #x13010000)
+(defun ssh-ipc-base ()       #x13100000)
+"
+      ""))
+
+;; SSH transport: address map + actor scheduler + net-actor + SSH server.
+;; actors-net-overrides.lisp comes AFTER ip.lisp (which also defines
+;; net-actor-main) so its actor-aware version wins under last-defun-wins.
+;; NOTE (staged, not yet functional): actor-spawn/nfn-lookup are native-fn-addr
+;; stubs in the arch adapters; running net-actor-main as a CL/mvm-eval function
+;; needs them rewired to the CL fn-table — live-REPL work once the NIC is up.
+;; aarch64-overrides.lisp is deliberately OMITTED (its reader conflicts with the
+;; CL reader); the SSH channel→eval wiring is part of that same live work.
+;; SINGLE-THREADED SSH (no actor scheduler): aarch64-overrides.lisp provides the
+;; inline net-accept-connection -> ssh-connection-handler -> ssh-handle-connection
+;; path (sidesteps the actor context-switch), the capture-aware write-byte SSH
+;; output routing needs, and the crypto helpers (pre-compute-server-eph /
+;; -host-sign, ed25519-sign-fast, ssh-random, usb-keepalive).  It loads AFTER
+;; ssh.lisp so its single-threaded defuns win under last-defun-wins.  actors.lisp
+;; is kept only so ssh.lisp's actor-spawn reference resolves; net-actor-main (the
+;; poll loop) comes from ip.lisp and yields as a no-op when the actor system is
+;; uninitialised, so calling it directly IS the single-threaded server.
+;; Its native-eval = (eval-sexp ...) is the DELETED tree-walker; override it with
+;; the CL image's production eval so the SSH shell evaluates via mvm-eval.
+(defvar *ssh-transport-source*
+  (if *ssh-build-p*
+      (concatenate 'string
+        *ssh-addr-map-source*                     (string #\Newline)
+        (%rpi-net-text "actors.lisp")             (string #\Newline)
+        (%rpi-net-text "ssh.lisp")                (string #\Newline)
+        (%rpi-net-text "aarch64-overrides.lisp")  (string #\Newline)
+        "(defun native-eval (form) (eval form))"  (string #\Newline)
+        ;; ssh-handle-connection fix + trace live in net/aarch64-overrides.lisp.
+        ;; FIX: single-threaded server handles ONE connection at a time.  Guard
+        ;; against RE-ENTRANT net-accept-connection: while inside a connection
+        ;; (flag ssh-ipc+0x60450 = 1), a reconnect SYN must NOT spawn a nested
+        ;; accept — that crosses the per-conn receive buffers (the client's KEXINIT
+        ;; ends up unread while a nested handler reads a fresh version).  Data
+        ;; segments (non-SYN) still deliver to the active connection.
+        "(defun net-handle-tcp (buf pkt-len)
+  (let ((src-ip (buf-read-u32-mem buf 26))
+        (src-port (buf-read-u16-mem buf 34))
+        (dst-port (buf-read-u16-mem buf 36))
+        (tcp-flags (mem-ref (+ buf 47) :u8)))
+    (if (eq (logand tcp-flags #x12) #x02)
+        (when (zerop (mem-ref (+ (ssh-ipc-base) #x60450) :u32))
+          (when (eq dst-port (mem-ref (+ (ssh-ipc-base) #x60438) :u32))
+            (setf (mem-ref (+ (ssh-ipc-base) #x60450) :u32) 1)
+            (net-accept-connection src-ip src-port dst-port buf)
+            (setf (mem-ref (+ (ssh-ipc-base) #x60450) :u32) 0)))
+        (let ((conn (net-find-connection src-ip src-port dst-port)))
+          (when (not (= conn (- 0 1)))
+            (net-deliver-data conn buf pkt-len tcp-flags))))))"
+        (string #\Newline)
+        ;; CL-native exec path: the shared ssh-do-eval-expr (aarch64-overrides)
+        ;; calls eval-sexp (the DELETED tree-walker) + buf-read-list (the legacy
+        ;; repl-source reader) — neither exists in this image, so exec produced
+        ;; no output.  Route the command through the REAL CL stack instead:
+        ;; read-from-string -> eval (eval2) -> prin1-to-string -> channel data.
+        "(defun ssh-eval-line (ssh cmd cmd-len)
+  (let ((s (make-string cmd-len)))
+    (dotimes (i cmd-len) (aset s i (code-char (aref cmd i))))
+    (let ((result (handler-case (eval (read-from-string s))
+                    (t (c) (list (quote error) c)))))
+      (let ((rs (handler-case (prin1-to-string result)
+                  (t (c) (prin1-to-string (quote unprintable))))))
+        (let ((rl (length rs)))
+          (let ((arr (make-array (+ rl 3))))
+            (aset arr 0 61) (aset arr 1 32)
+            (dotimes (i rl) (aset arr (+ 2 i) (char-code (aref rs i))))
+            (aset arr (+ 2 rl) 10)
+            (ssh-send-string ssh arr (+ rl 3))))))))"
+        (string #\Newline)
+        ;; One-shot single-threaded SSH bring-up: zero the Normal-WB scratch
+        ;; (uninitialised DRAM on real HW), adopt the NIC, static IP 10.0.0.2,
+        ;; register listen port 22, crypto pre-compute, actor/mailbox init, then
+        ;; the synchronous poll loop.  Called from the REPL; net-actor-main
+        ;; blocks, serving inline (net-accept-connection -> ssh-handle-connection).
+        "(defun ssh-boot ()
+  (let ((s (e1000-state-base))) (dotimes (i 1024) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
+  (let ((s (ssh-ipc-base))) (dotimes (i 76800) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
+  (let ((s (ssh-conn-base))) (dotimes (i 8192) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
+  (e1000-probe)
+  (setf (mem-ref (+ (e1000-state-base) 24) :u32) 33554442)
+  (setf (mem-ref (+ (e1000-state-base) 28) :u32) 16777226)
+  (setf (mem-ref (+ (ssh-ipc-base) #x60438) :u32) 22)
+  (ssh-seed-random)
+  (ssh-init-strings)
+  (ssh-use-default-key)
+  (pre-compute-host-sign)
+  (pre-compute-server-eph (conn-ssh 0))
+  (smp-init)
+  (actor-init)
+  (write-string-serial \"NETUP\") (write-char-serial 10)
+  (net-actor-main))"
+        (string #\Newline))
+      ""))
+
 (defvar *net-source*
   (if *net-build-p*
       (concatenate 'string
@@ -420,7 +554,17 @@
         (%rpi-net-text "dwc2.lisp")          (string #\Newline)
         (%rpi-net-text "usb.lisp")           (string #\Newline)
         (%rpi-net-text "cdc-ether.lisp")     (string #\Newline)
+        ;; r8152.lisp AFTER cdc-ether: its e1000-probe/send/receive/rx-buf
+        ;; defuns override the CDC-ECM ones (last-defun-wins) — on real
+        ;; RTL8153 silicon the ECM config NAKs all bulk-IN, so the NIC is
+        ;; driven in vendor config 1 with an explicit RX enable.
+        (%rpi-net-text "r8152.lisp")         (string #\Newline)
         (%rpi-net-text "ip.lisp")            (string #\Newline)
+        ;; MODUS_SSH_BUILD=1 folds crypto + the SSH transport here (after ip.lisp
+        ;; so ssh-seed-random sees the NIC state and net-actor-main overrides
+        ;; ip.lisp's); both "" otherwise.
+        *crypto-source*
+        *ssh-transport-source*
         (%rpi-net-text "http-client.lisp")   (string #\Newline)
         ;; Bigger HTTP response buffer.  The stock http-fetch-impl caps a
         ;; response at 4096 bytes and tcp-rx-copy bounds its copy to 4096 — too
@@ -674,9 +818,27 @@
 "
       ""))
 
+;; MODUS_NET_NOAUTO=1 — build the net stack IN but do not start it.
+;;
+;; This is the on-hardware development knob.  With the pipeline spliced,
+;; kernel-main runs DHCP -> TCP -> HTTP before the REPL, which is exactly wrong
+;; when the NIC is one Modus cannot drive yet: DHCP does not error, it WAITS,
+;; so the board looks wedged and never reaches a prompt.  With NOAUTO the whole
+;; stack — dwc2 host, usb enumeration, cdc-ether, ip, http-client — is compiled
+;; in and reachable by name, and the image boots straight to the serial REPL,
+;; where `(dwc2-init)`, `(usb-enumerate)`, `(usb-control-transfer ...)` and
+;; `(usb-bulk-receive ...)` can be driven BY HAND against real silicon.  The
+;; pipeline is then just `(run-net-pipeline)` typed at the prompt.
+;;
+;; That turns bring-up for a new NIC from a ~20-minute rebuild per hypothesis
+;; into a line typed at a live board.
+(defvar *net-noauto-p*
+  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_NET_NOAUTO")))
+    (and v (string= v "1"))))
+
 ;; Spliced into kernel-main.  "" when the flag is off => zero bytes added.
 (defvar *net-pipeline-call*
-  (if *net-build-p*
+  (if (and *net-build-p* (not *net-noauto-p*))
       "  (handler-case (run-net-pipeline) (t (c) nil))
 "
       ""))
@@ -688,8 +850,76 @@
 ;;; calls run-net-pipeline.  It is ALSO spliced into *ALL-RUNTIME-SOURCE*, so
 ;;; every defun here reaches the symbol-function table and every token here
 ;;; reaches *SYM-NAME-TABLE*.
+;;; BARE-METAL JIT co-init override.  build-cli-common's aarch64 co-init sets
+;;; *aarch64-linux-mode* T (runtime-emitted traps = Linux syscalls).  On bare
+;;; metal the runtime translator must instead emit the BARE-METAL trap paths:
+;;; serial via the UART this build selected (mirrored from the build-time
+;;; console selection above), exec pages via the #x0531 bump allocator.  Wins
+;;; over the common co-init by last-defun-wins (net-source is appended after
+;;; the JIT translator block in *all-runtime-source*).  Also zero the bump
+;;; word explicitly at init — cheap belt to the trap's own range-check braces.
+;;; NOTE: the serial globals (*aarch64-serial-base* etc.) are not set until
+;;; the console-selection block AFTER build-cli-common loads, so this defvar
+;;; re-derives the SAME choice from the env vars directly (identical logic to
+;;; boot-rpi-cl.lisp's *rpi-cl-chainload* + the console block below).
+(defvar *rpi-jit-coinit-override*
+  (if *jit-on*
+      (let* ((chain (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_RPI_CHAINLOAD")))
+                      (and v (string= v "1"))))
+             (mini (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_RPI_MINIUART")))
+                     (if (and v (plusp (length v)))
+                         (not (string= v "0"))
+                         chain))))
+        (format nil "
+(defun %init-aarch64-translator ()
+  (let ((map (make-array 23)))
+    (aset map 0 0) (aset map 1 1) (aset map 2 2) (aset map 3 3)
+    (aset map 4 19) (aset map 5 20) (aset map 6 21) (aset map 7 22) (aset map 8 23)
+    (aset map 9 nil) (aset map 10 nil) (aset map 11 nil) (aset map 12 nil)
+    (aset map 13 nil) (aset map 14 nil) (aset map 15 nil)
+    (aset map 16 0) (aset map 17 24) (aset map 18 25) (aset map 19 26)
+    (aset map 20 31) (aset map 21 29) (aset map 22 nil)
+    (setq *a64-vreg-to-phys* map))
+  (when (null *mvm-label-counter*) (setq *mvm-label-counter* 0))
+  (setq *aarch64-stack-align-16* nil)
+  (setq *aarch64-linux-mode* nil)
+  (setq *aarch64-gc-native-mcgc* t)
+  (setq *aarch64-gc-trampoline-call-via-bl* nil)
+  (setq *aarch64-gc-trampoline-label* 1)
+  ;; *aarch64-gc-bitmap-enabled* at runtime: MUST eventually be T — while
+  ;; NIL, objects allocated by JIT'd code carry no object-start bit, the
+  ;; native GC's conservative-root validation REJECTS stack roots pointing
+  ;; at them, and they get dropped while live.  PROVEN consequence (QEMU,
+  ;; 2026-08-25): loading alexandria, a dangling string wrote the symbol
+  ;; name MAP-PRODUCT's char codes over the GC config page at #x10000000,
+  ;; wrecking from_start/to_start/space_size -> wild-pointer data abort in
+  ;; %PARSE-START-END.  But enabling it wedged the image in a recursive
+  ;; exception storm at the first JIT'd alloc (PC pinned at VBAR+0x200,
+  ;; gdbstub unable to translate guest addresses => page tables corrupted).
+  ;; MODUS_RPI_JIT_BITMAP=1 builds the enable in for debugging that wedge.
+  ~A
+  ~A
+  (setf (mem-ref #x13FFFFF0 :u64) #x14000000)
+  t)
+"
+                (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_RPI_JIT_BITMAP")))
+                  (if (and v (string= v "1"))
+                      "(setq *aarch64-gc-bitmap-enabled* t)"
+                      ";; bitmap-enable off (MODUS_RPI_JIT_BITMAP unset)"))
+                (if mini
+                    "(setq *aarch64-serial-base* #x3F215040)
+  (setq *aarch64-serial-width* 2)
+  (setq *aarch64-serial-tx-poll* (list #x14 5 :tbz))
+  (setq *aarch64-serial-rx-poll* (list #x14 0 :tbz))"
+                    "(setq *aarch64-serial-base* #x3F201000)
+  (setq *aarch64-serial-width* 0)
+  (setq *aarch64-serial-tx-poll* nil)
+  (setq *aarch64-serial-rx-poll* (list #x18 4 :tbnz))")))
+      ""))
+
 (defvar *cli-bare-metal-net-source*
-  (concatenate 'string *net-source* *net-url-source* *net-driver-source*))
+  (concatenate 'string *net-source* *net-url-source* *net-driver-source*
+               *rpi-jit-coinit-override*))
 
 ;;; ARCH SLOT: the toplevel entry / probe program.  The hosted CLIs hand off to
 ;;; cli-toplevel here; this image runs the same E2SMOKE self-check the bare ANSI
@@ -816,6 +1046,17 @@
 ;; still running the collector with NO bitmap.  The backing RAM is reserved and
 ;; zeroed by %rpi-gc-bitmap-init in kernel-main.
 (setf *aarch64-gc-bitmap-enabled* t)
+
+;; ALLOC-OVERSHOOT GUARD BAND (#277 root cause): the gc-check compares x24
+;; BEFORE the alloc, so an object allocated just under the limit writes
+;; header + zero-init up to its full size past it — and this image's upper
+;; semispace ends at #x10000000 with the GC config page immediately after.
+;; Watchpoint-proven (2026-08-25): a 64K-element a64-buffer alloc zeroed
+;; space_size at #x10000050 mid-JIT-translate, and the next collection ran on
+;; garbage geometry.  8 MB clears every known large alloc (512 KB JIT code
+;; array, 400 KB MODUS_NET_BUFSZ) with ~48 MB/semispace left.  Applied by the
+;; baked trampoline at every exit AND by boot-rpi-cl's initial x25.
+(setf *aarch64-gc-limit-guard* #x800000)
 
 ;; #267 step 1: use the NATIVE aarch64 Cheney collector — the same one
 ;; build-aarch64-cli.lisp runs — instead of falling through to gc.lisp's

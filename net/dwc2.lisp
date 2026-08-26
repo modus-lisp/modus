@@ -129,6 +129,12 @@
 ;;   +0x1C: bulk-out data toggle (u32: 0=DATA0, 1=DATA1)
 ;; ============================================================
 
+;; #275 history: for one build this was a 4-slot rotating buffer chasing a
+;; phantom "per-address DMA read cache".  The real culprit was the ARM DATA
+;; CACHE inherited from U-Boot's `go' (which, unlike bootm, hands over with
+;; MMU+dcache still ON): CPU stores sat dirty in cache while the DWC2 read
+;; stale DRAM.  Fixed at the root by the boot preamble's cache/MMU sanitize
+;; step (boot/boot-rpi-cl.lisp step -1); a plain fixed buffer is correct.
 (defun usb-setup-buf () (usb-dma-base))
 (defun usb-data-buf () (+ (usb-dma-base) #x40))
 (defun usb-state-addr () (+ (usb-dma-base) #x800))
@@ -159,6 +165,63 @@
 
 (defun usb-device-class () (mem-ref (+ (usb-state-addr) #x20) :u32))
 (defun usb-set-device-class (v) (setf (mem-ref (+ (usb-state-addr) #x20) :u32) v))
+
+;; ------------------------------------------------------------
+;; #275 DIAGNOSTIC LATCHES.  Two blind spots stalled this investigation:
+;;
+;;  (a) dwc2-poll-channel writes HCINT = 0xFFFFFFFF before returning, so by
+;;      the time the REPL can look the reason is GONE — and its error arm
+;;      collapses XACTERR with "anything else" into the same -2.
+;;  (b) post-transfer HCTSIZ reads 0 BOTH when a transfer succeeded (XferSize
+;;      decrements to 0) AND when it was never programmed.  Ambiguous, so it
+;;      cannot tell "moved 8 bytes" from "did nothing" — which is exactly the
+;;      question, since the controller reports XFERCOMPL on a transfer that
+;;      moved zero bytes.
+;;
+;; These latch values AT THE MOMENT THEY MATTER into spare state words for the
+;; serial REPL to read.  Slots +0x30.. are free (documented map ends at +0x20)
+;; and the DMA window runs to 0x11113000.
+;; ------------------------------------------------------------
+(defun dwc2-diag-hctsiz-pre ()  (mem-ref (+ (usb-state-addr) #x30) :u32))
+(defun dwc2-diag-dma-pre ()     (mem-ref (+ (usb-state-addr) #x34) :u32))
+(defun dwc2-diag-hcchar-pre ()  (mem-ref (+ (usb-state-addr) #x38) :u32))
+(defun dwc2-diag-hcint ()       (mem-ref (+ (usb-state-addr) #x3C) :u32))
+(defun dwc2-diag-hctsiz-post () (mem-ref (+ (usb-state-addr) #x40) :u32))
+(defun dwc2-diag-polls ()       (mem-ref (+ (usb-state-addr) #x44) :u32))
+;; DATA-stage-specific copies.  The latches above are overwritten by every
+;; stage, so after a control transfer they always describe the STATUS stage
+;; (XferSize 0, PktCnt 1, DATA1) — which looks healthy and says nothing about
+;; whether the DATA stage moved bytes.  dwc2-control-data-in copies them here
+;; the moment its own poll returns, before STATUS runs.
+(defun dwc2-diag-d-hctsiz ()  (mem-ref (+ (usb-state-addr) #x48) :u32))
+(defun dwc2-diag-d-hcint ()   (mem-ref (+ (usb-state-addr) #x4C) :u32))
+(defun dwc2-diag-d-post ()    (mem-ref (+ (usb-state-addr) #x50) :u32))
+(defun dwc2-diag-d-result ()  (mem-ref (+ (usb-state-addr) #x54) :u32))
+;; DATA-stage HCDMA, latched BEFORE enable and again AFTER completion.  DWC2
+;; ADVANCES HCDMA as it writes, so the pair answers "did the controller write,
+;; and where": if post == pre the engine never moved, if post == pre+8 it wrote
+;; 8 bytes SOMEWHERE, and pre itself proves whether we even pointed it at the
+;; caller's buffer.  This is the one quantity still unmeasured while the
+;; controller claims XFERCOMPL|ACK with XferSize 8 -> 0 and the buffer is
+;; untouched.
+(defun dwc2-diag-d-dma-pre ()  (mem-ref (+ (usb-state-addr) #x58) :u32))
+(defun dwc2-diag-d-dma-post () (mem-ref (+ (usb-state-addr) #x5C) :u32))
+
+;; SETUP-stage copies (#275).  SET_ADDRESS is SETUP + STATUS-IN with no data
+;; stage, so the d-* latches never fire for it and the generic latches get
+;; overwritten by the STATUS stage.  dwc2-control-setup snapshots here the
+;; moment its poll returns — the only way to see whether the flushed
+;; SET_ADDRESS SETUP itself completes on the wire during enumerate.
+(defun dwc2-diag-s-hctsiz ()  (mem-ref (+ (usb-state-addr) #x60) :u32))
+(defun dwc2-diag-s-hcint ()   (mem-ref (+ (usb-state-addr) #x64) :u32))
+(defun dwc2-diag-s-post ()    (mem-ref (+ (usb-state-addr) #x68) :u32))
+(defun dwc2-diag-s-result () (mem-ref (+ (usb-state-addr) #x6C) :u32))
+(defun dwc2-diag-s-dma-pre ()  (mem-ref (+ (usb-state-addr) #x70) :u32))
+(defun dwc2-diag-s-dma-post () (mem-ref (+ (usb-state-addr) #x74) :u32))
+;; STATUS-IN-stage copies — the other half of SET_ADDRESS.
+(defun dwc2-diag-st-hcint ()  (mem-ref (+ (usb-state-addr) #x78) :u32))
+(defun dwc2-diag-st-post ()   (mem-ref (+ (usb-state-addr) #x7C) :u32))
+(defun dwc2-diag-st-result () (mem-ref (+ (usb-state-addr) #x80) :u32))
 
 ;; ============================================================
 ;; Delay helper (millisecond-ish delays via io-delay loops)
@@ -330,8 +393,26 @@
               (usb-set-port-speed speed))
             (return nil)))
         (setq i (+ i 1))))
-    ;; Clear port enable change (W1C bit 3) and connect detect (W1C bit 1)
-    (dwc2-write (dwc2-hprt0) (logior (hprt0-prtenchng) (hprt0-prtconndet)))
+    ;; Clear port enable change (W1C bit 3) and connect detect (W1C bit 1).
+    ;;
+    ;; MUST be based on the CURRENT HPRT0, not written bare.  HPRT0 mixes W1C
+    ;; status bits with ordinary R/W control bits — notably PPWR (bit 12), the
+    ;; port POWER enable.  Writing just the two W1C bits sends 0 to PPWR and
+    ;; cuts power to the port, so the device drops off the bus and every
+    ;; subsequent control transfer fails.  Measured on a real Pi Zero 2 W:
+    ;;     after dwc2-init   HPRT0 = 0x21401  (PCSTS=1 connected, PPWR=1)
+    ;;     after this write  HPRT0 = 0x00400  (PCSTS=0, PPWR=0 -- dead port)
+    ;; and usb-enumerate then failed at its first GET_DEVICE_DESCRIPTOR with
+    ;; "D1E", which looks exactly like a transfer bug and is not one.
+    ;;
+    ;; QEMU does not model port power, so this was invisible under emulation —
+    ;; the same class as the zeroed-DRAM dependency: emulator-benign, fatal on
+    ;; silicon.  dwc2-hprt0-read-safe masks the W1C bits OUT of the read, so
+    ;; ORing in exactly the ones we intend to clear is the correct idiom; the
+    ;; assert/deassert-reset writes above already use it.
+    (dwc2-write (dwc2-hprt0)
+                (logior (dwc2-hprt0-read-safe)
+                        (hprt0-prtenchng) (hprt0-prtconndet)))
     ;; Print speed
     (write-byte 80) (write-byte 79) (write-byte 82) (write-byte 84)  ; "PORT"
     (write-byte 58)  ; ":"
@@ -356,11 +437,19 @@
   ;; epdir: 0=OUT, 1=IN (bit 15)
   ;; eptype: 0=control, 1=iso, 2=bulk, 3=interrupt (bits 19:18)
   ;; devaddr: device address (bits 28:22)
-  (logior (logand mps #x7FF)
-          (logior (ash (logand epnum #xF) 11)
-                  (logior (ash (logand epdir 1) 15)
-                          (logior (ash (logand eptype 3) 18)
-                                  (ash (logand devaddr #x7F) 22))))))
+  ;;
+  ;; #275: MULTICNT (bits 21:20) MUST be 1.  MC=0 is a reserved/invalid value
+  ;; on real Synopsys cores; both U-Boot and Linux write MC=1 into HCCHAR on
+  ;; EVERY transfer (U-Boot: FIELD_PREP(HCCHAR_MULTICNT_MASK, 1) in
+  ;; transfer_chunk's clrsetbits).  QEMU's DWC2 model ignores the field, so
+  ;; leaving it 0 was invisible under emulation — same silicon-only class as
+  ;; PPWR, PktCnt and the stale-SETUP TX-FIFO replay.
+  (logior (ash 1 20)
+          (logior (logand mps #x7FF)
+                  (logior (ash (logand epnum #xF) 11)
+                          (logior (ash (logand epdir 1) 15)
+                                  (logior (ash (logand eptype 3) 18)
+                                          (ash (logand devaddr #x7F) 22)))))))
 
 (defun dwc2-build-hctsiz (xfersize pktcnt pid)
   ;; Build HCTSIZ register value
@@ -371,28 +460,11 @@
           (logior (ash (logand pktcnt #x3FF) 19)
                   pid)))
 
-(defun dwc2-setup-channel (ch hcchar-val)
-  ;; Write HCCHAR for channel (without enabling yet)
-  ;; Clear any pending interrupts first
-  (dwc2-write (dwc2-hcint ch) #xFFFFFFFF)
-  ;; Enable all interrupt masks for this channel
-  (dwc2-write (dwc2-hcintmsk ch) #x7FF)
-  ;; Write HCCHAR without CHENA
-  (dwc2-write (dwc2-hcchar ch) hcchar-val)
-  ;; No split transfers
-  (dwc2-write (dwc2-hcsplt ch) 0))
-
-(defun dwc2-start-transfer (ch hctsiz-val dma-addr)
-  ;; Configure transfer size and DMA, then enable channel
-  (dwc2-write (dwc2-hctsiz ch) hctsiz-val)
-  (dwc2-write (dwc2-hcdma ch) dma-addr)
-  ;; Enable channel: OR in CHENA bit
-  (let ((hcchar (dwc2-read (dwc2-hcchar ch))))
-    (let ((enabled (logior hcchar (hcchar-chena))))
-      ;; Clear CHDIS if set
-      (let ((final (logand enabled (logxor (hcchar-chdis) #xFFFFFFFF))))
-        (dwc2-write (dwc2-hcchar ch) final)))))
-
+;; DEFINED BEFORE ITS CALLERS ON PURPOSE.  dwc2-setup-channel calls this, and
+;; a FORWARD call can compile to a NIL sentinel (build logs "WARN li-func:
+;; unresolved function ... emitting NIL sentinel"; see CLAUDE.md limitation 1
+;; and task #215).  A silently-no-op halt is exactly the bug this function
+;; exists to fix, so keep this definition ABOVE dwc2-setup-channel.
 (defun dwc2-halt-channel (ch)
   ;; Halt an active channel. Sets CHDIS+CHENA, waits for CHHLTD.
   (let ((hcchar (dwc2-read (dwc2-hcchar ch))))
@@ -405,6 +477,61 @@
         (return nil))
       (setq j (+ j 1))))
   (dwc2-write (dwc2-hcint ch) #xFFFFFFFF))
+
+(defun dwc2-setup-channel (ch hcchar-val)
+  ;; Write HCCHAR for channel (without enabling yet)
+  ;;
+  ;; Clear any pending interrupts first
+  (dwc2-write (dwc2-hcint ch) #xFFFFFFFF)
+  ;; Enable all interrupt masks for this channel
+  (dwc2-write (dwc2-hcintmsk ch) #x7FF)
+  ;; Write HCCHAR without CHENA
+  (dwc2-write (dwc2-hcchar ch) hcchar-val)
+  ;; No split transfers
+  (dwc2-write (dwc2-hcsplt ch) 0))
+
+;; #275: translate ARM-physical DMA addresses to the VideoCore bus alias.
+;; The DWC2's DMA master sits on the VC bus, where a raw ARM-physical address
+;; selects the L2-CACHED SDRAM alias; ORing 0xC0000000 selects the UNCACHED
+;; alias — exactly U-Boot/Linux phys_to_bus() on BCM283x (the DT dma-ranges
+;; is <0xC0000000 0x0 ...> on these boards).  QEMU's bcm2835 model translates
+;; all four aliases onto RAM, so this is emulator-neutral.
+;;
+;; Attribution honesty: the dramatic wire experiments that seemed to prove a
+;; frozen-VC-L2 mechanism were later found to be dominated by a different
+;; confound (the ARM dcache inherited from U-Boot's `go' — see the boot
+;; preamble sanitize step).  This translation is kept because it is what the
+;; reference drivers do and the VC L2 is real; its independent necessity on
+;; this board was not cleanly re-measured post-confound.
+(defun dwc2-bus-addr (a) (logior a #xC0000000))
+
+(defun dwc2-start-transfer (ch hctsiz-val dma-addr)
+  ;; Configure transfer size and DMA, then enable channel
+  (dwc2-write (dwc2-hctsiz ch) hctsiz-val)
+  (dwc2-write (dwc2-hcdma ch) (dwc2-bus-addr dma-addr))
+  ;; #275: latch what we ACTUALLY programmed, read back from the registers
+  ;; rather than from our own arguments — that distinguishes "computed the
+  ;; wrong value" from "the write did not land".
+  (setf (mem-ref (+ (usb-state-addr) #x30) :u32) (dwc2-read (dwc2-hctsiz ch)))
+  (setf (mem-ref (+ (usb-state-addr) #x34) :u32) (dwc2-read (dwc2-hcdma ch)))
+  (setf (mem-ref (+ (usb-state-addr) #x38) :u32) (dwc2-read (dwc2-hcchar ch)))
+  ;; #275 DSB before CHENA.  The caller just wrote the SETUP/OUT payload to
+  ;; DRAM; with the MMU off those stores and the MMIO CHENA write below
+  ;; target DIFFERENT device regions, so AArch64 gives them NO mutual
+  ;; ordering guarantee — the enable could reach the core before the payload
+  ;; reaches DRAM.  Architecturally required; QEMU/TCG never reorders, so
+  ;; emulation cannot exercise it.  (net/dwc2-device.lisp — the gadget side —
+  ;; carries the same barrier for the same reason.  The stale-SETUP symptoms
+  ;; once attributed to this race turned out to be dominated by the inherited
+  ;; U-Boot dcache, fixed in the boot preamble; the barrier stays because the
+  ;; ordering hole is real regardless.)
+  (memory-barrier)
+  ;; Enable channel: OR in CHENA bit
+  (let ((hcchar (dwc2-read (dwc2-hcchar ch))))
+    (let ((enabled (logior hcchar (hcchar-chena))))
+      ;; Clear CHDIS if set
+      (let ((final (logand enabled (logxor (hcchar-chdis) #xFFFFFFFF))))
+        (dwc2-write (dwc2-hcchar ch) final)))))
 
 (defun dwc2-poll-channel (ch)
   ;; Poll channel for transfer completion.
@@ -426,6 +553,15 @@
           (dwc2-halt-channel ch)
           (return nil))
         (let ((hcint (dwc2-read (dwc2-hcint ch))))
+          ;; #275: latch the RAW HCINT and the post-transfer HCTSIZ on every
+          ;; iteration, so the last surviving values are the ones at the
+          ;; moment of decision — before the 0xFFFFFFFF clear below destroys
+          ;; them.  Also count polls: an instant completion (polls ~= 0) and a
+          ;; laboured one look identical in the return value.
+          (setf (mem-ref (+ (usb-state-addr) #x3C) :u32) hcint)
+          (setf (mem-ref (+ (usb-state-addr) #x40) :u32)
+                (dwc2-read (dwc2-hctsiz ch)))
+          (setf (mem-ref (+ (usb-state-addr) #x44) :u32) i)
           ;; Check if channel halted (DWC2 halts on completion/error)
           (when (not (zerop (logand hcint (hcint-chhltd))))
             (if (not (zerop (logand hcint (hcint-xfercompl))))
@@ -439,7 +575,27 @@
                             (setq result -2)))))
             (dwc2-write (dwc2-hcint ch) #xFFFFFFFF)
             (return nil))
-          ;; Non-halted XFERCOMPL (DMA mode may set this without halt)
+          ;; Non-halted XFERCOMPL.  The controller can raise XFERCOMPL in DMA
+          ;; mode without also raising CHHLTD — but the channel is NOT retired
+          ;; until it has been explicitly halted and CHHLTD observed.  Real
+          ;; silicon requires that handshake; QEMU does not, which is why
+          ;; returning straight from here worked under emulation for years.
+          ;;
+          ;; Without the halt, only the FIRST control-IN after dwc2-init moves
+          ;; data.  Every later transfer reports XFERCOMPL|ACK with XferSize
+          ;; 8 -> 0 and HCDMA advanced by 8 — every register claiming success —
+          ;; while the buffer is untouched.  The broken state is core-scoped
+          ;; and SURVIVES A PORT RESET, which is what finally located it here
+          ;; rather than in the port or the device.
+          ;;
+          ;; PROVEN on a Pi Zero 2 W from the serial REPL, no rebuild: calling
+          ;; (dwc2-halt-channel 0) by hand between two identical
+          ;; GET_DESCRIPTORs turned the second one's byte7 from 0 back into 64.
+          ;; U-Boot's dwc2.c does the same thing via wait_for_chhltd() on every
+          ;; transfer.
+          ;;
+          ;; NB: testing CHENA before halting is NOT sufficient — it reads
+          ;; CLEAR here.  "Looks disabled" is not "retired".
           (when (not (zerop (logand hcint (hcint-xfercompl))))
             (setq result 1)
             (dwc2-write (dwc2-hcint ch) #xFFFFFFFF)
@@ -463,23 +619,65 @@
     (dwc2-setup-channel ch hcchar)
     (let ((hctsiz (dwc2-build-hctsiz 8 1 (hctsiz-pid-setup))))
       (dwc2-start-transfer ch hctsiz setup-buf)
-      (dwc2-poll-channel ch))))
+      (let ((r (dwc2-poll-channel ch)))
+        (setf (mem-ref (+ (usb-state-addr) #x60) :u32)
+              (mem-ref (+ (usb-state-addr) #x30) :u32))
+        (setf (mem-ref (+ (usb-state-addr) #x64) :u32)
+              (mem-ref (+ (usb-state-addr) #x3C) :u32))
+        (setf (mem-ref (+ (usb-state-addr) #x68) :u32)
+              (mem-ref (+ (usb-state-addr) #x40) :u32))
+        (setf (mem-ref (+ (usb-state-addr) #x6C) :u32) (+ r 100))
+        (setf (mem-ref (+ (usb-state-addr) #x70) :u32)
+              (mem-ref (+ (usb-state-addr) #x34) :u32))
+        (setf (mem-ref (+ (usb-state-addr) #x74) :u32)
+              (dwc2-read (dwc2-hcdma ch)))
+        r))))
 
 (defun dwc2-control-data-in (ch devaddr buf len)
   ;; DATA stage of control IN transfer
   ;; Returns: 1=success, <=0 = error
   (let ((hcchar (dwc2-build-hcchar 64 0 1 0 devaddr)))
     (dwc2-setup-channel ch hcchar)
-    (let ((pktcnt (+ (/ len 64) 1)))
+    ;; #275: PktCnt MUST be computed with INTEGER division.  `/` in Common Lisp
+    ;; is exact rational division: (/ 8 64) is the RATIO 1/8, a heap object.
+    ;; dwc2-build-hctsiz then does (logand pktcnt #x3FF) on it, masking the low
+    ;; bits of its POINTER — so PktCnt was garbage that CHANGED on every call as
+    ;; the heap moved.  Proven on a Pi Zero 2 W: (integerp (/ 8 64)) => NIL, and
+    ;; (logand (+ (/ 8 64) 1) 1023) returned 884 then 1012 on two identical
+    ;; calls; the HCTSIZ actually programmed for two identical GET_DESCRIPTORs
+    ;; was 0x4EE00008 then 0x52600008 (PktCnt 476, then 588 — should be 1).
+    ;; QEMU's DWC2 model ignores PktCnt, so this was invisible under emulation.
+    (let ((pktcnt (if (zerop len) 1 (ceiling len 64))))
       (let ((hctsiz (dwc2-build-hctsiz len pktcnt (hctsiz-pid-data1))))
         (dwc2-start-transfer ch hctsiz buf)
-        (dwc2-poll-channel ch)))))
+        (let ((r (dwc2-poll-channel ch)))
+      (setf (mem-ref (+ (usb-state-addr) #x48) :u32)
+            (mem-ref (+ (usb-state-addr) #x30) :u32))
+      (setf (mem-ref (+ (usb-state-addr) #x4C) :u32)
+            (mem-ref (+ (usb-state-addr) #x3C) :u32))
+      (setf (mem-ref (+ (usb-state-addr) #x50) :u32)
+            (mem-ref (+ (usb-state-addr) #x40) :u32))
+      (setf (mem-ref (+ (usb-state-addr) #x54) :u32) (+ r 100))
+      (setf (mem-ref (+ (usb-state-addr) #x58) :u32)
+            (mem-ref (+ (usb-state-addr) #x34) :u32))
+      (setf (mem-ref (+ (usb-state-addr) #x5C) :u32)
+            (dwc2-read (dwc2-hcdma ch)))
+      r)))))
 
 (defun dwc2-control-data-out (ch devaddr buf len)
   ;; DATA stage of control OUT transfer
   (let ((hcchar (dwc2-build-hcchar 64 0 0 0 devaddr)))
     (dwc2-setup-channel ch hcchar)
-    (let ((pktcnt (+ (/ len 64) 1)))
+    ;; #275: PktCnt MUST be computed with INTEGER division.  `/` in Common Lisp
+    ;; is exact rational division: (/ 8 64) is the RATIO 1/8, a heap object.
+    ;; dwc2-build-hctsiz then does (logand pktcnt #x3FF) on it, masking the low
+    ;; bits of its POINTER — so PktCnt was garbage that CHANGED on every call as
+    ;; the heap moved.  Proven on a Pi Zero 2 W: (integerp (/ 8 64)) => NIL, and
+    ;; (logand (+ (/ 8 64) 1) 1023) returned 884 then 1012 on two identical
+    ;; calls; the HCTSIZ actually programmed for two identical GET_DESCRIPTORs
+    ;; was 0x4EE00008 then 0x52600008 (PktCnt 476, then 588 — should be 1).
+    ;; QEMU's DWC2 model ignores PktCnt, so this was invisible under emulation.
+    (let ((pktcnt (if (zerop len) 1 (ceiling len 64))))
       (let ((hctsiz (dwc2-build-hctsiz len pktcnt (hctsiz-pid-data1))))
         (dwc2-start-transfer ch hctsiz buf)
         (dwc2-poll-channel ch)))))
@@ -490,7 +688,13 @@
     (dwc2-setup-channel ch hcchar)
     (let ((hctsiz (dwc2-build-hctsiz 0 1 (hctsiz-pid-data1))))
       (dwc2-start-transfer ch hctsiz (usb-data-buf))
-      (dwc2-poll-channel ch))))
+      (let ((r (dwc2-poll-channel ch)))
+        (setf (mem-ref (+ (usb-state-addr) #x78) :u32)
+              (mem-ref (+ (usb-state-addr) #x3C) :u32))
+        (setf (mem-ref (+ (usb-state-addr) #x7C) :u32)
+              (mem-ref (+ (usb-state-addr) #x40) :u32))
+        (setf (mem-ref (+ (usb-state-addr) #x80) :u32) (+ r 100))
+        r))))
 
 (defun dwc2-control-status-out (ch devaddr)
   ;; STATUS stage for control IN (host receives data, host sends ZLP OUT)
@@ -511,12 +715,24 @@
   ;; Returns: 1=success, 0=NAK, <0=error
   (let ((hcchar (dwc2-build-hcchar mps epnum epdir 2 devaddr)))
     (dwc2-setup-channel ch hcchar)
-    ;; QEMU's DWC2 manages data toggle internally via USB endpoint state.
-    ;; Always use DATA0 PID — the actual toggle is tracked by QEMU.
-    (let ((pktcnt (if (zerop len) 1 (/ (+ len (- mps 1)) mps))))
-      (let ((hctsiz (dwc2-build-hctsiz len pktcnt (hctsiz-pid-data0))))
+    ;; #275 DATA TOGGLES (U-Boot pattern): program the stored per-endpoint
+    ;; PID, and after the transfer read the NEXT PID back from HCTSIZ bits
+    ;; 30:29 — the core updates the field as packets complete.  QEMU's model
+    ;; tracks toggles internally and ignores the programmed PID, so this is
+    ;; emulator-neutral; real silicon requires it (always-DATA0 makes the
+    ;; device drop every second packet as a retransmission).
+    ;; PktCnt MUST use integer division — (/ len mps) is an exact RATIO whose
+    ;; pointer bits once leaked into the register (see git c3e35dd).
+    (let ((pktcnt (if (zerop len) 1 (ceiling len mps)))
+          (tog (logand (if (= epdir 1) (usb-bulk-in-toggle) (usb-bulk-out-toggle)) 3)))
+      (let ((hctsiz (dwc2-build-hctsiz len pktcnt (ash tog 29))))
         (dwc2-start-transfer ch hctsiz buf)
-        (dwc2-poll-channel ch)))))
+        (let ((r (dwc2-poll-channel ch)))
+          (let ((next (logand (ash (dwc2-read (dwc2-hctsiz ch)) -29) 3)))
+            (if (= epdir 1)
+                (usb-set-bulk-in-toggle next)
+                (usb-set-bulk-out-toggle next)))
+          r)))))
 
 ;; Non-blocking bulk IN poll for persistent channel.
 ;; The channel stays active between calls — DWC2's work_bh auto-retries NAK.
@@ -532,6 +748,11 @@
     (if (not (zerop (logand hcint (hcint-chhltd))))
         (progn
           (dwc2-write (dwc2-hcint ch) #xFFFFFFFF)
+          ;; #275 toggles: latch the NEXT PID the core left in HCTSIZ for
+          ;; this endpoint (U-Boot pattern; QEMU ignores programmed PIDs so
+          ;; this is emulator-neutral).  Channel 1 is the bulk-IN channel.
+          (usb-set-bulk-in-toggle
+           (logand (ash (dwc2-read (dwc2-hctsiz ch)) -29) 3))
           (if (not (zerop (logand hcint (hcint-xfercompl))))
               1   ; success — data ready
               (if (not (zerop (logand hcint (hcint-stall))))
@@ -541,6 +762,8 @@
         (if (not (zerop (logand hcint (hcint-xfercompl))))
             (progn
               (dwc2-write (dwc2-hcint ch) #xFFFFFFFF)
+              (usb-set-bulk-in-toggle
+               (logand (ash (dwc2-read (dwc2-hctsiz ch)) -29) 3))
               1)
             ;; NAK without halt: clear NAK flag, DWC2 auto-retries
             (progn
@@ -553,8 +776,13 @@
 (defun dwc2-start-bulk-in (ch devaddr epnum buf len mps)
   (let ((hcchar (dwc2-build-hcchar mps epnum 1 2 devaddr)))
     (dwc2-setup-channel ch hcchar)
-    (let ((pktcnt (if (zerop len) 1 (/ (+ len (- mps 1)) mps))))
-      (let ((hctsiz (dwc2-build-hctsiz len pktcnt (hctsiz-pid-data0))))
+    ;; #275: PID from the stored bulk-IN toggle (dwc2-poll-bulk-in latches
+    ;; the next PID from HCTSIZ on completion — U-Boot pattern, QEMU-neutral).
+    ;; PktCnt MUST use integer division — see git c3e35dd for the ratio-
+    ;; pointer-in-register bug this once caused.
+    (let ((pktcnt (if (zerop len) 1 (ceiling len mps))))
+      (let ((hctsiz (dwc2-build-hctsiz len pktcnt
+                                       (ash (logand (usb-bulk-in-toggle) 3) 29))))
         (dwc2-start-transfer ch hctsiz buf)))))
 
 ;; Start a new interrupt IN transfer on channel ch.
@@ -563,6 +791,15 @@
 (defun dwc2-start-interrupt-in (ch devaddr epnum buf len mps)
   (let ((hcchar (dwc2-build-hcchar mps epnum 1 3 devaddr)))
     (dwc2-setup-channel ch hcchar)
-    (let ((pktcnt (if (zerop len) 1 (/ (+ len (- mps 1)) mps))))
+    ;; #275: PktCnt MUST be computed with INTEGER division.  `/` in Common Lisp
+    ;; is exact rational division: (/ 8 64) is the RATIO 1/8, a heap object.
+    ;; dwc2-build-hctsiz then does (logand pktcnt #x3FF) on it, masking the low
+    ;; bits of its POINTER — so PktCnt was garbage that CHANGED on every call as
+    ;; the heap moved.  Proven on a Pi Zero 2 W: (integerp (/ 8 64)) => NIL, and
+    ;; (logand (+ (/ 8 64) 1) 1023) returned 884 then 1012 on two identical
+    ;; calls; the HCTSIZ actually programmed for two identical GET_DESCRIPTORs
+    ;; was 0x4EE00008 then 0x52600008 (PktCnt 476, then 588 — should be 1).
+    ;; QEMU's DWC2 model ignores PktCnt, so this was invisible under emulation.
+    (let ((pktcnt (if (zerop len) 1 (ceiling len mps))))
       (let ((hctsiz (dwc2-build-hctsiz len pktcnt (hctsiz-pid-data0))))
         (dwc2-start-transfer ch hctsiz buf)))))

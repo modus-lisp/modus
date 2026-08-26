@@ -500,20 +500,23 @@
       (return ()))
     (let ((kexinit (ssh-build-kexinit ssh)))
       (ssh-send-payload ssh kexinit (array-length kexinit)))
-    (let ((cli-kex (ssh-receive-packet ssh 100)))
-      (when (zerop cli-kex) (return ()))
+    ;; FIX: ssh-receive-packet returns NIL on timeout; (zerop NIL) does NOT
+    ;; catch it, so (car NIL) faults.  And the stock 100-try timeout is too
+    ;; short on real hardware.  Null-check + use 50000 like ssh-message-loop.
+    (let ((cli-kex (ssh-receive-packet ssh 50000)))
+      (when (or (null cli-kex) (zerop cli-kex)) (return ()))
       (let ((cli-kex-payload (car cli-kex)))
         (when (not (eq (aref cli-kex-payload 0) 20)) (return ()))
         (ssh-mem-store (+ cb #x1F00) cli-kex-payload (cdr cli-kex))
         (setf (mem-ref (+ ssh #x20) :u32) (cdr cli-kex))
-        (let ((kex-init (ssh-receive-packet ssh 100)))
-          (when (zerop kex-init) (return ()))
+        (let ((kex-init (ssh-receive-packet ssh 50000)))
+          (when (or (null kex-init) (zerop kex-init)) (return ()))
           (let ((kex-payload (car kex-init)))
             (when (not (eq (aref kex-payload 0) 30)) (return ()))
             (ssh-handle-kex ssh kex-payload (cdr kex-init))
             (ssh-send-newkeys ssh)
-            (let ((nk (ssh-receive-packet ssh 100)))
-              (when (zerop nk) (return ()))
+            (let ((nk (ssh-receive-packet ssh 50000)))
+              (when (or (null nk) (zerop nk)) (return ()))
               (when (not (eq (aref (car nk) 0) 21)) (return ()))
               (ssh-derive-keys ssh)
               (ssh-message-loop ssh))))))))
@@ -554,8 +557,20 @@
                     (dotimes (i cmd-len)
                       (aset cmd i (aref payload (+ cmd-off 4 i))))
                     (ssh-eval-line ssh cmd cmd-len)
-                    ;; Send EOF + CLOSE after exec
+                    ;; Send exit-status 0 + EOF + CLOSE after exec
                     (let ((cli-chan (mem-ref (+ ssh #x18) :u32)))
+                      ;; SSH_MSG_CHANNEL_REQUEST "exit-status" want_reply=0 status=0
+                      (let ((xs (make-array 25)))
+                        (aset xs 0 98)
+                        (ssh-put-u32 xs 1 cli-chan)
+                        (ssh-put-u32 xs 5 11)
+                        (aset xs 9 101) (aset xs 10 120) (aset xs 11 105)
+                        (aset xs 12 116) (aset xs 13 45) (aset xs 14 115)
+                        (aset xs 15 116) (aset xs 16 97) (aset xs 17 116)
+                        (aset xs 18 117) (aset xs 19 115)
+                        (aset xs 20 0)
+                        (ssh-put-u32 xs 21 0)
+                        (ssh-send-payload ssh xs 25))
                       (let ((eof-msg (make-array 5)))
                         (aset eof-msg 0 96)
                         (ssh-put-u32 eof-msg 1 cli-chan)
@@ -590,11 +605,20 @@
 ;; when it arrives in the same packet as the ACK.
 (defun net-wait-ack (conn)
   (let ((cb (conn-base conn))
+        ;; Server ISN: net-accept-connection already sent SYN-ACK once, bumping
+        ;; cb+0x010 to ISN+1.  Save ISN so retransmits reuse the SAME seq.
+        (isn (- (mem-ref (+ (conn-base conn) #x010) :u32) 1))
         (acked 0)
         (tries 0))
     (loop
       (when (not (zerop acked)) (return 1))
-      (when (> tries 500) (return 0))
+      (when (> tries 800) (return 0))
+      ;; Retransmit the SYN-ACK (identical seq) if it was lost — the single-
+      ;; threaded server no longer depends on the client's reconnect (which the
+      ;; re-entrancy guard now blocks) to retry the handshake.
+      (when (and (> tries 0) (eq (mod tries 40) 0))
+        (setf (mem-ref (+ cb #x010) :u32) isn)
+        (tcp-send-segment-conn cb 18 (make-array 0) 0))
       (io-delay)
       (let ((pkt-len (e1000-receive)))
         (when (not (zerop pkt-len))
@@ -603,7 +627,10 @@
               (when (eq (mem-ref (+ b2 13) :u8) 0)
                 (when (eq (mem-ref (+ b2 23) :u8) 6)
                   (let ((f2 (mem-ref (+ b2 47) :u8)))
-                    (when (eq (logand f2 #x10) #x10)
+                    ;; Accept ONLY a real ACK (ACK set, SYN clear) — a SYN
+                    ;; retransmit must not be mistaken for the handshake ACK.
+                    (when (and (eq (logand f2 #x10) #x10)
+                               (zerop (logand f2 #x02)))
                       (setf (mem-ref cb :u32) 2)
                       (setq acked 1)
                       ;; Deliver any piggybacked data

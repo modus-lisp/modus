@@ -545,6 +545,12 @@
 ;; Monotonic counter producing unique CATCH tags for non-local blocks.
 ;; The tag is a large fixnum literal so EQL comparison in the catch
 ;; handler is unambiguous and it can never collide with a user CATCH tag.
+(defvar *in-loop-catch-wrap* nil
+  "One-shot guard: T while compile-loop's escaping-closure branch compiles
+   its inner (catch TAG (loop ...)) — the inner compile-loop consumes the
+   flag (resets it to NIL) and takes the plain path, preventing infinite
+   wrap recursion while leaving deeper nested loops free to wrap again.")
+
 (defvar *nonlocal-block-tag-counter* 0
   "Counter for generating unique non-local BLOCK catch tags")
 
@@ -4594,14 +4600,39 @@
                                  initform-pairs)))))
                 (setq cur (cddr cur))))))
         (setq slot-names (nreverse slot-names))
-        `(progn
-           (%defclass ',class-name ',slot-names ',supers)
-           (%register-clos-slot-info ',class-name
-                                     (list ,@(nreverse initarg-pairs))
-                                     (list ,@(nreverse initform-pairs)))
-           (%register-clos-direct-slots ',class-name ',slot-names)
-           ,@(nreverse extra-defuns)
-           (find-class ',class-name nil)))))
+        ;; CLASS OPTIONS — (defclass name supers slots . options).  This
+        ;; macro used to drop the options tail entirely, so a runtime
+        ;; (:default-initargs ...) registered nothing and make-instance left
+        ;; the slot UNBOUND (found via the unmodified Quicklisp client's
+        ;; ql-http octet-sink, whose STORAGE slot is filled ONLY by a
+        ;; default-initarg, 2026-08-26).  cl-clos already has the CLHS 7.1.4
+        ;; registry + application; wire the option to it, with the same
+        ;; %clos-make-initform-thunk bridge the initform path uses (an
+        ;; in-module closure escaping unwrapped executes garbage when a
+        ;; later make-instance funcalls it cross-module).
+        (let ((default-initarg-pairs nil))
+          (dolist (opt (cddddr form))
+            (when (and (consp opt) (symbolp (car opt))
+                       (string= (symbol-name (car opt)) "DEFAULT-INITARGS"))
+              (let ((cur (cdr opt)))
+                (loop
+                  (when (null cur) (return nil))
+                  (setq default-initarg-pairs
+                        (cons `(cons ',(car cur)
+                                     (%clos-make-initform-thunk
+                                      (lambda () ,(cadr cur))))
+                              default-initarg-pairs))
+                  (setq cur (cddr cur))))))
+          `(progn
+             (%defclass ',class-name ',slot-names ',supers)
+             (%register-clos-slot-info ',class-name
+                                       (list ,@(nreverse initarg-pairs))
+                                       (list ,@(nreverse initform-pairs)))
+             (%register-clos-direct-slots ',class-name ',slot-names)
+             (%register-clos-default-initargs ',class-name
+                                              (list ,@(nreverse default-initarg-pairs)))
+             ,@(nreverse extra-defuns)
+             (find-class ',class-name nil))))))
   ;; PERF: snapshot the just-built 94-macro *macro-table* into the persistent
   ;; template so every subsequent call takes the fast copy path above instead of
   ;; re-constructing all these closures.  (First call only.)
@@ -5820,11 +5851,19 @@
            (if (cdr saved)
                (setf (gethash (car saved) *macro-table*) (cdr saved))
                (remhash (car saved) *macro-table*)))))
-      ;; WITH-OPEN-FILE — compile as let binding stream var to a dummy file stream
+      ;; WITH-OPEN-FILE — CLHS: open the file, bind the stream, close on ANY
+      ;; exit.  (This used to bind a CLOSED DUMMY stream — (%make-file-stream),
+      ;; fd -1 — so every with-open-file body saw instant EOF and writes went
+      ;; nowhere.  Found when the unmodified Quicklisp client's quicklisp.asd
+      ;; read version.txt through it, 2026-08-26.)  A nil stream — reachable
+      ;; via :if-does-not-exist nil — skips the close.
       ((= op-name 365656143)  ; WITH-OPEN-FILE
        (let ((spec (cadr form))
              (body (cddr form)))
-         (compile-form `(let ((,(car spec) (%make-file-stream))) ,@body) env dest)))
+         (compile-form `(let ((,(car spec) (open ,@(cdr spec))))
+                          (unwind-protect (progn ,@body)
+                            (when ,(car spec) (close ,(car spec)))))
+                       env dest)))
       ;; WITH-OUTPUT-TO-STRING — create string-output-stream, run body, return string
       ((= op-name 163216281)  ; WITH-OUTPUT-TO-STRING
        (let* ((spec (cadr form))
@@ -9517,26 +9556,76 @@
   (if (and (consp body) (cl-loop-keyword-p (car body)))
       ;; CL-style loop: expand to basic forms, then compile
       (compile-form (expand-cl-loop body) env dest)
-      ;; Simple infinite loop
-      (let* ((loop-label (make-compiler-label))
-             (exit-label (make-compiler-label))
-             (*loop-exit-label* exit-label)
-             (*loop-exit-uwp-seq* (%uwp-current-seq))
-             (*block-labels*
-               (if *suppress-loop-block-nil*
-                   *block-labels*
-                   (cons (list nil exit-label dest (%uwp-current-seq))
-                         *block-labels*))))
-        ;; Loop entry
-        (emit-ir-label loop-label)
-        ;; Compile loop body
-        (compile-progn body env dest)
-        ;; Yield/preemption check
-        (emit-ir :yield)
-        ;; Jump back to loop start
-        (emit-ir :br loop-label)
-        ;; Exit label (target of return)
-        (emit-ir-label exit-label))))
+      ;; Simple infinite loop.
+      ;;
+      ;; CROSS-UNIT (RETURN …) FROM A CLOSURE IN THE BODY: the lexical
+      ;; exit-label dies at the lambda boundary (mvm-compile-function-internal
+      ;; resets *block-labels*/*loop-exit-label*), so a body like
+      ;;   (loop … (call-with-x (lambda () (return v))))
+      ;; compiled the lambda's RETURN as a FUNCTION return — the closure
+      ;; exited, the value was discarded, and the loop re-iterated FOREVER.
+      ;; Found via the unmodified Quicklisp client: ql-http's http-fetch is
+      ;; exactly (loop … (with-connection (…) … (return (values …)))) and
+      ;; install-dist re-fetched endlessly (task #278).  compile-block
+      ;; already solves this for explicit (block nil …): scan the body, and
+      ;; when a closure captures the exit, wrap the whole thing in a runtime
+      ;; CATCH frame registered under name-hash 0 in *nonlocal-blocks* so
+      ;; compile-return %nlx-throws to it — from BOTH units (a lexical :br
+      ;; out of the catch would skip its setjmp teardown, see compile-block).
+      ;; Same guard, same setq+unwind-protect dynamic push (NOT a special
+      ;; LET — the documented mvm-eval limitation).
+      (if (and (not (prog1 *in-loop-catch-wrap*
+                      (setq *in-loop-catch-wrap* nil)))
+               (not *suppress-loop-block-nil*)
+               (%return-from-escapes-block-p body 0 nil nil)
+               (not (%block-runtime-catch-unsafe-p body)))
+          (let* ((tag-val (progn
+                            (incf *nonlocal-block-tag-counter*)
+                            (+ 700000000 *nonlocal-block-tag-counter*)))
+                 (%nlb-saved *nonlocal-blocks*))
+            (setq *nonlocal-blocks* (cons (list 0 tag-val) %nlb-saved))
+            ;; The inner loop compiles COMPLETELY NORMALLY — its own lexical
+            ;; exit-label and (nil …) block entry, both INSIDE the catch
+            ;; body, so a same-unit (return) (and the runtime YIELD's
+            ;; interrupt-escape, which routes through compile-return) takes
+            ;; the fast local :br and the catch frame pops on normal body
+            ;; completion.  Only CROSS-UNIT returns (inside lambdas, where
+            ;; mvm-compile-function-internal resets the lexical state) fall
+            ;; through to the (0 TAG) nonlocal entry and THROW to this
+            ;; frame.  An earlier version nulled *loop-exit-label* under a
+            ;; suppress flag so ALL returns would throw — that turned the
+            ;; YIELD escape into a per-iteration conditional %nlx-throw of
+            ;; this tag reading an uninitialized counter slot (spurious
+            ;; re-throw after the handler resume; task #278 trace).
+            ;; *in-loop-catch-wrap* is a ONE-SHOT flag (setq, not LET — the
+            ;; documented mvm-eval special-let limitation): the inner
+            ;; compile-loop consumes it and takes the plain path, deeper
+            ;; nested loops see NIL and may wrap again.
+            (setq *in-loop-catch-wrap* t)
+            (unwind-protect
+                 (compile-form (list 'catch tag-val (cons 'loop body))
+                               env dest)
+              (setq *in-loop-catch-wrap* nil)
+              (setq *nonlocal-blocks* %nlb-saved)))
+          (let* ((loop-label (make-compiler-label))
+                 (exit-label (make-compiler-label))
+                 (*loop-exit-label* exit-label)
+                 (*loop-exit-uwp-seq* (%uwp-current-seq))
+                 (*block-labels*
+                   (if *suppress-loop-block-nil*
+                       *block-labels*
+                       (cons (list nil exit-label dest (%uwp-current-seq))
+                             *block-labels*))))
+            ;; Loop entry
+            (emit-ir-label loop-label)
+            ;; Compile loop body
+            (compile-progn body env dest)
+            ;; Yield/preemption check
+            (emit-ir :yield)
+            ;; Jump back to loop start
+            (emit-ir :br loop-label)
+            ;; Exit label (target of return)
+            (emit-ir-label exit-label)))))
 
 ;;; ============================================================
 ;;; CL-Style Loop Expansion
@@ -11542,6 +11631,46 @@
     (emit-ir :pop value-dest))
   (emit-ir :br exit-label))
 
+(defun %walker-macroexpand (form)
+  "Bounded, error-safe full macroexpansion for the escape/unsafe walkers
+   (%return-from-escapes-block-p / %block-runtime-catch-unsafe-p).
+   RUNTIME (mvm-eval) ONLY — build-time walkers keep seeing raw source so
+   host images stay byte-identical.  Without this, a runtime macro like
+   quicklisp's WITH-CONNECTION (expanding to call-with-connection + a
+   LAMBDA) hid the lambda boundary from the escape scan: the (return …)
+   inside it read as same-unit, no runtime catch frame was installed, and
+   the cross-unit return silently function-returned — ql-http's fetch loop
+   re-fetched forever (task #278).  On any expander error return the form
+   unchanged (the walkers then see the raw shape — the prior behavior)."
+  (if (not *mvm-eval-runtime-p*)
+      form
+      (let ((cur form) (n 0))
+        (loop
+          (when (or (> n 50) (not (consp cur)) (not (symbolp (car cur))))
+            (return cur))
+          ;; Never expand heads the walkers handle STRUCTURALLY.  LAMBDA in
+          ;; particular is itself a registered macro ((lambda …) → (function
+          ;; (lambda …))): expanding it and then walking into the spliced
+          ;; inner lambda re-expands forever (unbounded walk recursion — the
+          ;; probe hang this comment guards against).
+          (let ((h (normalize-name (car cur))))
+            (when (or (= h 80380232)    ; LAMBDA
+                      (= h 402801909)   ; FUNCTION
+                      (= h 338547669)   ; QUOTE
+                      (= h 372279278)   ; BLOCK
+                      (= h 445617652)   ; FLET
+                      (= h 417505106)   ; LABELS
+                      (= h 164933334)   ; RETURN-FROM
+                      (= h 232767877)   ; RETURN
+                      (= h 502453647)   ; GO
+                      (= h 182681998)   ; UNWIND-PROTECT
+                      (= h 44774594))   ; CATCH
+              (return cur)))
+          (let ((r (handler-case (macroexpand-1-mvm cur) (t (c) nil))))
+            (if (and (consp r) (cdr r))
+                (progn (setq cur (car r)) (setq n (+ n 1)))
+                (return cur)))))))
+
 (defun %return-from-escapes-block-p (body block-hash crossed-lambda shadowed)
   "Scan BODY (a list of forms) for a RETURN-FROM (or RETURN if BLOCK-HASH
    is 0, the NIL block) targeting BLOCK-HASH that lives INSIDE a lambda
@@ -11555,7 +11684,9 @@
    catch frame for that subtree)."
   (let ((found nil))
     (labels ((walk (form xl sh)
-               (when (and (not found) (consp form))
+               (when (and (not found) (consp form)
+                          (progn (setq form (%walker-macroexpand form))
+                                 (consp form)))
                  (cond
                    ;; quote — opaque, never a return-from
                    ((%form-op-is form 338547669 "QUOTE") nil)
@@ -11671,11 +11802,27 @@
    lambda/flet/labels wins are preserved for everything else."
   (let ((found nil))
     (labels ((walk (form in-fn)
-               (when (and (not found) (consp form))
+               (when (and (not found) (consp form)
+                          (progn (setq form (%walker-macroexpand form))
+                                 (consp form)))
                  (cond
                    ((%form-op-is form 338547669 "QUOTE") nil)
                    ((%form-op-is form 182681998 "UNWIND-PROTECT")
-                    (setq found t))
+                    ;; Same-unit uwp shares the runtime's single setjmp
+                    ;; slot with our catch frame — still disqualifies.
+                    ;; INSIDE a lambda/flet body (in-fn) it is a DIFFERENT
+                    ;; compilation unit at runtime: the throw threads
+                    ;; through it via the 9525 NLX-through-uwp machinery,
+                    ;; so keep walking (a cross-unit GO inside still
+                    ;; matters) instead of disqualifying.  Without this,
+                    ;; ql http-fetch's with-connection lambda (whose
+                    ;; expansion contains unwind-protect) lost its catch
+                    ;; frame and the fetch loop never exited (task #278).
+                    (if in-fn
+                        (let ((cur (cdr form)))
+                          (loop while (consp cur) do (walk (car cur) in-fn)
+                                (setq cur (cdr cur))))
+                        (setq found t)))
                    ((and in-fn (%form-op-is form 502453647 "GO"))
                     (setq found t))
                    ((%form-op-is form 80380232 "LAMBDA")

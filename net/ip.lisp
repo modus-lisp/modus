@@ -129,7 +129,11 @@
 
 (defun arp-resolve ()
   (let ((state (e1000-state-base)))
-    (arp-request #x0A000202)
+    ;; #275: ARP the CONFIGURED gateway (state+0x1C, little-endian bytes as
+    ;; stored by DHCP/static config; htonl converts to arp-request's host-
+    ;; order convention).  This was hardcoded to QEMU slirp's 10.0.2.2,
+    ;; which can never resolve on a real network.
+    (arp-request (htonl (mem-ref (+ state #x1C) :u32)))
     (let ((found 0))
       (dotimes (round 200)
         (when (zerop found)
@@ -396,10 +400,24 @@
                           (tcp-data-off (ash (logand (mem-ref (+ buf 46) :u8) #xF0) -2)))
                       (let ((data-len (- ip-total (+ 20 tcp-data-off))))
                         (when (> data-len 0)
-                          (let ((their-seq (buf-read-u32-mem buf 38)))
-                            (setf (mem-ref (+ state #x40) :u32) (+ their-seq data-len))
-                            (tcp-send-segment 16 (make-array 0) 0)
-                            (setq received data-len)))
+                          ;; In-order only: accept a segment ONLY when its seq
+                          ;; matches the next byte we expect (state+0x40, the
+                          ;; ack we advertise).  A retransmitted/out-of-order
+                          ;; segment must NOT be delivered — the HTTP client
+                          ;; used to append a duplicate segment mid-stream,
+                          ;; corrupting a fetched tarball (alexandria install:
+                          ;; FETCHED 276588 vs served 276480, +108 dup bytes).
+                          ;; Same fix as net-deliver-data on the server path:
+                          ;; re-ACK the expected seq and wait for the right
+                          ;; bytes.
+                          (let ((their-seq (buf-read-u32-mem buf 38))
+                                (expected (mem-ref (+ state #x40) :u32)))
+                            (if (eq their-seq expected)
+                                (progn
+                                  (setf (mem-ref (+ state #x40) :u32) (+ their-seq data-len))
+                                  (tcp-send-segment 16 (make-array 0) 0)
+                                  (setq received data-len))
+                                (tcp-send-segment 16 (make-array 0) 0))))
                         (when (not (zerop (logand tcp-flags 1)))
                           (let ((their-seq (buf-read-u32-mem buf 38)))
                             (setf (mem-ref (+ state #x40) :u32) (+ their-seq 1))
@@ -587,21 +605,32 @@
           (tcp-data-off (ash (logand (mem-ref (+ buf 46) :u8) #xF0) -2)))
       (let ((data-len (- ip-total (+ 20 tcp-data-off))))
         (when (> data-len 0)
-          ;; Copy data BEFORE sending ACK — the ACK triggers DWC2 MMIO which
-          ;; can cause QEMU to complete a pending bulk IN transfer on another
-          ;; channel, overwriting the receive buffer while we're still reading it.
+          ;; TCP reassembly: only APPEND an IN-ORDER segment (their-seq matches
+          ;; the next byte we expect, tracked at cb+0x014).  A duplicate
+          ;; (their-seq < expected, e.g. a retransmit provoked by our SYN-ACK
+          ;; retransmit) or an out-of-order segment must NOT be appended — else
+          ;; the recv buffer gets a duplicate version/KEXINIT and the reader
+          ;; mis-parses.  In both non-matching cases just re-ACK the expected
+          ;; seq so the client resends the right bytes.
           (let ((their-seq (buf-read-u32-mem buf 38))
-                (buf-len (mem-ref (+ ssh #x6D4) :u32))
-                (data-start (+ (+ (+ buf 14) 20) tcp-data-off)))
-            (let ((i 0))
-              (loop
-                (when (>= i data-len) (return 0))
-                (setf (mem-ref (+ (+ (+ ssh #x6D8) buf-len) i) :u8)
-                      (mem-ref (+ data-start i) :u8))
-                (setq i (+ i 1))))
-            (setf (mem-ref (+ ssh #x6D4) :u32) (+ buf-len data-len))
-            (setf (mem-ref (+ cb #x014) :u32) (+ their-seq data-len))
-            (tcp-ack-conn cb)))))))
+                (expected (mem-ref (+ cb #x014) :u32)))
+            (if (eq their-seq expected)
+                ;; Copy data BEFORE sending ACK — the ACK triggers DWC2 MMIO
+                ;; which can complete a pending bulk-IN on another channel,
+                ;; overwriting the receive buffer while we still read it.
+                (let ((buf-len (mem-ref (+ ssh #x6D4) :u32))
+                      (data-start (+ (+ (+ buf 14) 20) tcp-data-off)))
+                  (let ((i 0))
+                    (loop
+                      (when (>= i data-len) (return 0))
+                      (setf (mem-ref (+ (+ (+ ssh #x6D8) buf-len) i) :u8)
+                            (mem-ref (+ data-start i) :u8))
+                      (setq i (+ i 1))))
+                  (setf (mem-ref (+ ssh #x6D4) :u32) (+ buf-len data-len))
+                  (setf (mem-ref (+ cb #x014) :u32) (+ their-seq data-len))
+                  (tcp-ack-conn cb))
+                ;; Duplicate / out-of-order: re-ACK, do NOT append.
+                (tcp-ack-conn cb))))))))
 
 (defun net-wait-ack (conn)
   (let ((cb (conn-base conn))

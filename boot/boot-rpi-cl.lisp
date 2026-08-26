@@ -40,16 +40,16 @@
 ;;;; 0x1000xxxx runtime slot are unchanged.  Only the way those VAs come to
 ;;;; exist differs (identity + MMU-off here, page tables there).
 ;;;;
-;;;; MMU IS OFF.  With SCTLR_EL1.M clear every access is Device-nGnRnE:
-;;;; correct but uncached.  Under QEMU/TCG that costs nothing measurable (TCG
-;;;; models no caches).  On real silicon it would be brutally slow and is the
-;;;; first thing to fix in rung 2 — an identity 2-level table with
-;;;; Normal-WB for 0x00000000-0x3EFFFFFF and Device for 0x3F000000+.  Two
-;;;; further consequences worth knowing: unaligned accesses fault (Modus is
-;;;; naturally aligned, and the legacy `:rpi' images have run MMU-off on this
-;;;; board for a long time), and load/store-exclusive is UNPREDICTABLE on
-;;;; Device memory (no actors here, so *aarch64-sched-lock-addr* is NIL and
-;;;; the translator emits none).
+;;;; MMU IS ON — ON OUR TERMS (rung-2-lite, #275).  The preamble first
+;;;; SANITIZES whatever the loader left (U-Boot's `go' hands over with its
+;;;; own MMU + dirty dcache live — the root cause of a long stale-DMA saga),
+;;;; then installs an identity 2-level table: Normal-WB for RAM, Device for
+;;;; the 2MB USB DMA window at 0x11000000 and for the peripherals at
+;;;; 0x3F000000+.  CPU data runs cached; the DWC2's DMA window is uncached
+;;;; on both sides (CPU: Device attribute; core: the 0xC0000000 VC alias),
+;;;; so DMA coherence holds with NO per-transfer cache maintenance.  A
+;;;; hypothetical non-EL2 entry skips the enable and stays uncached-correct.
+;;;; Load/store-exclusive remains unused (*aarch64-sched-lock-addr* is NIL).
 ;;;;
 ;;;; SERIAL IS PL011 (UART0, 0x3F201000), NOT the mini UART.  This is forced,
 ;;;; not preferred: `read-char-serial' (TRAP #x0301) is hardcoded to the PL011
@@ -290,8 +290,159 @@
   (let ((sp 31) (x0 0) (x16 16) (x17 17)
         (x24 24) (x25 25) (x26 26))
 
-    ;; --- 0. FIRMWARE DEVICE-TREE POINTER (#271) ---------------------------
-    ;; MUST BE FIRST.  X0 holds the DTB physical address on entry per the
+    ;; --- -1. CACHE/MMU SANITIZE — never trust the loader (#275) -----------
+    ;; This image's whole memory model assumes SCTLR.M=0 (Device-nGnRnE,
+    ;; DMA-coherent, ordered).  The firmware-direct kernel8.img path honours
+    ;; that, but U-Boot's `go' (the netboot rig) jumps here with U-Boot's
+    ;; MMU + data cache STILL ON — unlike bootm, `go' does no cache teardown.
+    ;; Proven on a Pi Zero 2 W: an unaligned :u32 mem-ref SUCCEEDED at the
+    ;; REPL (Normal memory ⇒ translation on), and every DWC2 DMA read saw
+    ;; pre-write DRAM while CPU stores sat dirty in the inherited cache —
+    ;; the entire "stale SETUP" saga.  Sanitize unconditionally:
+    ;;   1. DC CIVAC every line of the low 512MB (dirty loader lines must
+    ;;      reach DRAM BEFORE the cache goes off; VA=PA under U-Boot's map,
+    ;;      and with caches already off the ops are harmless no-ops).
+    ;;   2. Clear SCTLR_EL2.{M,C} (both boot paths enter at EL2; guarded by
+    ;;      CurrentEL so a hypothetical EL1 entry skips the EL2 register).
+    ;;   3. Clear SCTLR_EL1.{M,C} too — legal from EL2, harmless, and covers
+    ;;      any future drop to EL1.
+    ;; X0 (firmware DTB pointer) is preserved; scratch = x9/x10/x11/x16/x17.
+    (emit-aarch64-load-imm64 buf x16 0)
+    (emit-aarch64-load-imm64 buf x17 #x20000000)
+    (let ((clean-loop (a64-current-index buf)))
+      (emit-aarch64-u32 buf #xD50B7E30)            ; dc civac, x16
+      (a64-add-imm buf x16 x16 64)
+      (a64-cmp-reg buf x16 x17)
+      (a64-bcond buf #b0011 (- clean-loop (a64-current-index buf))))
+    (emit-aarch64-u32 buf #xD5033F9F)              ; dsb sy
+    (emit-aarch64-u32 buf #xD5384249)              ; mrs x9, CurrentEL
+    (emit-aarch64-u32 buf #xF100213F)              ; cmp x9, #8  (EL2?)
+    (a64-bcond buf #b0001 5)                       ; b.ne +5 — skip EL2 block
+    (emit-aarch64-u32 buf #xD53C100A)              ; mrs x10, sctlr_el2
+    (emit-aarch64-u32 buf #xD28000AB)              ; movz x11, #5  (M|C)
+    (emit-aarch64-u32 buf #x8A2B014A)              ; bic x10, x10, x11
+    (emit-aarch64-u32 buf #xD51C100A)              ; msr sctlr_el2, x10
+    (emit-aarch64-u32 buf #xD538100A)              ; mrs x10, sctlr_el1
+    (emit-aarch64-u32 buf #xD28000AB)              ; movz x11, #5
+    (emit-aarch64-u32 buf #x8A2B014A)              ; bic x10, x10, x11
+    (emit-aarch64-u32 buf #xD518100A)              ; msr sctlr_el1, x10
+    (emit-aarch64-u32 buf #xD5033F9F)              ; dsb sy
+    (emit-aarch64-u32 buf #xD5033FDF)              ; isb
+
+    ;; --- -0.5. IDENTITY PAGE TABLE + MMU ON (rung-2-lite, #275) -----------
+    ;; Running truly uncached (the sanitize step above) costs ~25x on every
+    ;; data access — boot-to-banner went from ~45s to ~20min.  Turn the MMU
+    ;; back on, ON OUR TERMS: an identity map with RAM Normal-Write-Back
+    ;; (cached) and exactly two Device holes, so DMA coherence needs no
+    ;; per-transfer cache maintenance:
+    ;;   0x00000000-0x10FFFFFF  Normal-WB   image, stack, heap, metadata
+    ;;   0x11000000-0x111FFFFF  Device      the USB DMA window (dwc2 buffers
+    ;;                                      + usb-state; the DWC2 reads/writes
+    ;;                                      it via the uncached VC alias)
+    ;;   0x11200000-0x3EFFFFFF  Normal-WB
+    ;;   0x3F000000-0x3FFFFFFF  Device      BCM peripherals
+    ;;   above 1GB              unmapped    (only L1[0] is valid)
+    ;; L1 @ 0x70000, L2 @ 0x71000 (512 x 2MB blocks) — below both load
+    ;; addresses (SD 0x80000, netboot 0x300000), above the firmware pages.
+    ;; Tables are written while caches are OFF, so the walker sees them
+    ;; directly.  Enable is EL2-only (both boot paths enter at EL2); a
+    ;; hypothetical EL1 entry just stays uncached-correct.
+    ;; Zero the L1 page (only entry 0 becomes valid).
+    (emit-aarch64-load-imm64 buf x16 #x70000)
+    (emit-aarch64-load-imm64 buf x17 #x71000)
+    (let ((z (a64-current-index buf)))
+      (a64-stur buf +a64-xzr+ x16 0)
+      (a64-add-imm buf x16 x16 8)
+      (a64-cmp-reg buf x16 x17)
+      (a64-bcond buf #b0011 (- z (a64-current-index buf))))
+    ;; L1[0] = L2 | 3 (table descriptor)
+    (emit-aarch64-load-imm64 buf 12 #x70000)
+    (emit-aarch64-load-imm64 buf 15 #x71003)
+    (a64-stur buf 15 12 0)
+    ;; Fill L2: entry = pa | attrs.  pa is 2MB-aligned and attrs < 0x800, so
+    ;; ADD == OR.  0x701 = AF | SH=inner | AttrIdx0(Normal-WB) | block.
+    ;; 0x405 = AF | AttrIdx1(Device-nGnRnE) | block.
+    (emit-aarch64-load-imm64 buf 13 #x71000)       ; walker
+    (emit-aarch64-load-imm64 buf 8  #x72000)       ; end
+    (emit-aarch64-load-imm64 buf 14 0)             ; pa
+    (emit-aarch64-load-imm64 buf 11 #x200000)      ; block size
+    (emit-aarch64-load-imm64 buf 9  #x11000000)    ; USB DMA window
+    (emit-aarch64-load-imm64 buf 10 #x3F000000)    ; peripherals
+    (let ((fill (a64-current-index buf)))
+      (a64-add-imm buf 15 14 #x701)
+      (a64-cmp-reg buf 14 9)
+      (a64-bcond buf #b0001 2)                     ; b.ne +2
+      (a64-add-imm buf 15 14 #x405)
+      (a64-cmp-reg buf 14 10)
+      (a64-bcond buf #b0011 2)                     ; b.lo +2
+      (a64-add-imm buf 15 14 #x405)
+      (a64-stur buf 15 13 0)
+      (a64-add-imm buf 13 13 8)
+      (emit-aarch64-u32 buf #x8B0B01CE)            ; add x14, x14, x11
+      (a64-cmp-reg buf 13 8)
+      (a64-bcond buf #b0011 (- fill (a64-current-index buf))))
+    ;; MAIR: attr0 = 0xFF (Normal WB R/W-allocate), attr1 = 0x00 (Device-
+    ;; nGnRnE).  TCR_EL2 0x80803520 = RES1 | T0SZ=32 (4GB VA, start L1,
+    ;; 4KB granule) | IRGN0=ORGN0=WB-WA | SH0=inner | PS=4GB.
+    (emit-aarch64-u32 buf #xD5033F9F)              ; dsb sy — tables visible
+    (emit-aarch64-load-imm64 buf 15 #xFF)
+    (emit-aarch64-u32 buf #xD51CA20F)              ; msr mair_el2, x15
+    (emit-aarch64-load-imm64 buf 15 #x80803520)
+    (emit-aarch64-u32 buf #xD51C204F)              ; msr tcr_el2, x15
+    (emit-aarch64-u32 buf #xD51C200C)              ; msr ttbr0_el2, x12
+    (emit-aarch64-u32 buf #xD50C871F)              ; tlbi alle2
+    (emit-aarch64-u32 buf #xD5033F9F)              ; dsb sy
+    (emit-aarch64-u32 buf #xD5033FDF)              ; isb
+    (emit-aarch64-u32 buf #xD5384249)              ; mrs x9, CurrentEL
+    (emit-aarch64-u32 buf #xF100213F)              ; cmp x9, #8
+    (a64-bcond buf #b0001 6)                       ; b.ne +6 — enable EL2 only
+    (emit-aarch64-u32 buf #xD53C100A)              ; mrs x10, sctlr_el2
+    (emit-aarch64-u32 buf #xD28200AB)              ; movz x11, #0x1005 (M|C|I)
+    (emit-aarch64-u32 buf #xAA0B014A)              ; orr x10, x10, x11
+    (emit-aarch64-u32 buf #xD51C100A)              ; msr sctlr_el2, x10
+    (emit-aarch64-u32 buf #xD5033FDF)              ; isb
+
+    ;; --- 0. ZERO THE RUNTIME METADATA WINDOW (the BSS stand-in) -----------
+    ;; On Linux the ELF BSS is zero-filled by the kernel.  On bare metal these
+    ;; words hold whatever the firmware left in RAM, and the very first Lisp
+    ;; function that reads a global dereferences the garbage at 0x10000080 as
+    ;; the global-alist head.  QEMU HID this for the entire life of this image
+    ;; because it zero-fills guest RAM; on a real Pi Zero 2 W the board printed
+    ;; "BOOT" and then died before "MODUS-CL" with ESR 0x96000004 (data abort,
+    ;; translation fault L0) on a garbage FAR — exactly the outcome section 5
+    ;; predicts for a fault in Lisp init.
+    ;;
+    ;; This REPLACES a ~22-entry enumerated list of individual slots that used
+    ;; to live in build-rpi-cl-repl.lisp's kernel-main prologue.  That list was
+    ;; wrong twice over: it ran AFTER the MODUS-CL banner (so the banner itself
+    ;; walked the garbage alist), and being an enumeration it could only ever
+    ;; cover the slots someone remembered — a new metadata word would be
+    ;; uninitialised on hardware and fine under emulation, i.e. invisible.
+    ;;
+    ;; Doing it HERE rather than in Lisp is what makes the bulk form legal:
+    ;; the two words that must NOT be zeroed are written by this same preamble
+    ;; AFTERWARDS — 0x10000F00 (the DTB pointer, step 0a below) and
+    ;; 0x10000160/168 (code_base/code_end, step 6).  A Lisp-side bulk zero
+    ;; would have to special-case both.
+    ;;
+    ;; Range 0x10000000..0x10001000 covers every documented slot (the highest
+    ;; is the MCGC/bitmap config block ending at 0x10000EA8), plus the lone
+    ;; AArch64 handler-stack depth word at 0x10010000.  X0 is untouched, so the
+    ;; firmware DTB pointer survives into step 0a.
+    (emit-aarch64-load-imm64 buf x16 #x10000000)
+    (emit-aarch64-load-imm64 buf x17 #x10001000)
+    (let ((loop-start (a64-current-index buf)))
+      (a64-stur buf +a64-xzr+ x16 0)
+      (a64-add-imm buf x16 x16 8)
+      (a64-cmp-reg buf x16 x17)
+      ;; B.LO (unsigned <) back to the store.
+      (a64-bcond buf #b0011 (- loop-start (a64-current-index buf))))
+    (emit-aarch64-load-imm64 buf x16 #x10010000)
+    (a64-stur buf +a64-xzr+ x16 0)
+
+    ;; --- 0a. FIRMWARE DEVICE-TREE POINTER (#271) --------------------------
+    ;; MUST FOLLOW step 0, which zeroes the window this slot lives in, and
+    ;; must precede step 2.  X0 holds the DTB physical address on entry per the
     ;; AArch64 Linux boot protocol, and step 2 below uses X0 as the UART data
     ;; scratch register.  Three instructions — MOVZ + MOVK to materialise the
     ;; slot address (0x10000F00 has exactly two non-zero halfwords, so
@@ -386,9 +537,34 @@
     ;; compiled code bumps x24 per allocation and compares against x25; when
     ;; they meet, +op-gc-check+ BLs the GC trampoline, which reloads both from
     ;; the metadata kernel-main's (%gc-init ...) publishes.
+    ;; The initial x25 carries the same ALLOC-OVERSHOOT GUARD BAND the GC
+    ;; trampoline applies at every exit (*aarch64-gc-limit-guard*, see
+    ;; translate-aarch64.lisp): the gc-check tests x24 BEFORE the alloc, so a
+    ;; large object allocated just under the limit writes past it by its full
+    ;; size.  Guard here too, or the FIRST from-space would run to the exact
+    ;; midpoint and a top-of-space alloc would overshoot into the to-space.
     (emit-aarch64-load-imm64 buf x24 +rpi-cl-heap-base+)
-    (emit-aarch64-load-imm64 buf x25 +rpi-cl-heap-mid+)
+    (emit-aarch64-load-imm64 buf x25 (- +rpi-cl-heap-mid+
+                                        modus.mvm::*aarch64-gc-limit-guard*))
     (emit-aarch64-load-imm64 buf x26 *rpi-cl-nil-value*)
+
+    ;; NATIVE MCGC + runtime JIT: reserve x28 = the GC trampoline's absolute
+    ;; VA, exactly as emit-linux-aarch64-entry does (see the comment there and
+    ;; *aarch64-x28-load-patch-offset*).  BAKED bare-metal code keeps its
+    ;; short-range BL to the trampoline (*aarch64-gc-trampoline-call-via-bl*),
+    ;; but RUNTIME-JIT'd pages live in the exec region at 0x14000000 — outside
+    ;; BL's +/-128MB reach of the trampoline — so their gc-checks are emitted
+    ;; as `BLR x28` by the in-image translator (the coinit override flips
+    ;; via-bl off at runtime).  Without this load the runtime translator's
+    ;; only alternative was the `brk #1` placeholder: the first JIT'd
+    ;; allocation to cross the heap limit died (measured 2026-08-25: the
+    ;; early-boot fault at ELR 0x11ef8d0).  MOVZ/MOVK pair patched post-link
+    ;; by cross.lisp::apply-aarch64-x28-trampoline-patch.
+    (when modus.mvm::*aarch64-gc-native-mcgc*
+      (setf modus.mvm::*aarch64-x28-load-patch-offset*
+            (* (a64-current-index buf) 4))
+      (a64-movz buf 28 0 0)   ; placeholder (lo16)
+      (a64-movk buf 28 0 1))  ; placeholder (hi16 lsl 16)
 
     ;; --- 4. TPIDR_EL1 = per-CPU base -------------------------------------
     (emit-aarch64-load-imm64 buf x16 +rpi-cl-percpu+)

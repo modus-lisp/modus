@@ -1280,6 +1280,28 @@
           (when (%defpkg-pool-contains pool s) (%signal-program-error))
           (setq pool (cons s pool)))))
 
+    ;; A name repeated across (or within) :export clauses is a UNION, not a
+    ;; program-error: CLHS 11.1.1.1's disjointness rule is about CROSS-option
+    ;; overlap (:export vs :intern), not repetition inside one option.  The
+    ;; unmodified Quicklisp client's QL-DIST defpackage exports DIST and
+    ;; RELEASE in three thematic :export clauses (PREFERENCE in two) and is
+    ;; legal CL.  Dedupe both lists by name, keeping first occurrence, BEFORE
+    ;; the cross-option check below.
+    (let ((seen nil) (out nil))
+      (dolist (n export-names)
+        (let ((s (%pkg-string-designator n)))
+          (unless (%defpkg-pool-contains seen s)
+            (setq seen (cons s seen))
+            (setq out (cons n out)))))
+      (setq export-names (reverse out)))
+    (let ((seen nil) (out nil))
+      (dolist (n intern-names)
+        (let ((s (%pkg-string-designator n)))
+          (unless (%defpkg-pool-contains seen s)
+            (setq seen (cons s seen))
+            (setq out (cons n out)))))
+      (setq intern-names (reverse out)))
+
     ;; --- Disjointness pool 2: :export and :intern must be disjoint.
     (let ((pool nil))
       (dolist (n intern-names)

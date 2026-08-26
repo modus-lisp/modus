@@ -72,6 +72,15 @@
   ;; request-type bit 7: 0=OUT (host->device), 1=IN (device->host)
   ;; buf: DMA buffer for data stage (physical address). Ignored if len=0.
   ;; Returns: 1=success, <=0=error
+  ;;
+  ;; #275 history: this function once flushed the TX+RX FIFOs per transfer to
+  ;; fight a "stale SETUP replay" on real silicon.  The true root cause was
+  ;; the ARM DATA CACHE inherited from U-Boot's `go' (MMU+dcache left ON):
+  ;; CPU stores to this buffer sat dirty in cache while the DWC2 DMA-fetched
+  ;; stale DRAM, so the wire carried the previous request.  Fixed at the root
+  ;; by the boot preamble's cache/MMU sanitize (boot/boot-rpi-cl.lisp step
+  ;; -1).  No per-transfer FIFO flush is needed (U-Boot and Linux flush only
+  ;; at core init), and none ever fixed it.
   (let ((ch 0))
     ;; Stage 1: SETUP
     (usb-build-setup request-type request value index len)
@@ -287,6 +296,13 @@
 ;; root port and attached devices like usb-net.
 ;; ============================================================
 
+;; Which config-descriptor INDEX the hub path selects for the downstream
+;; device.  QEMU usb-net: index 0 = RNDIS, index 1 = CDC-ECM -> default 1.
+;; net/r8152.lisp overrides this to 0 (last-defun-wins) so real RTL8153
+;; hardware enumerates STRAIGHT into vendor config 1 — switching configs
+;; after enumeration makes the NIC drop off the hub port.
+(defun usb-hub-config-index () 1)
+
 (defun usb-hub-enumerate-downstream (hub-addr dbuf)
   ;; Hub at hub-addr is already configured.
   ;; Find and enumerate the downstream CDC device.
@@ -354,17 +370,19 @@
                 (print-hex-byte (usb-desc-byte dbuf 11))
                 (print-hex-byte (usb-desc-byte dbuf 10))
                 (write-byte 10)
-                ;; Get config descriptor index 1 (CDC Ethernet, not RNDIS)
-                ;; QEMU usb-net: index 0 = RNDIS (config val 2),
-                ;;               index 1 = CDC-ECM (config val 1)
-                (let ((r6 (usb-get-descriptor 2 (usb-desc-configuration) 1 dbuf 9)))
+                ;; Get the selected config descriptor (see usb-hub-config-index:
+                ;; QEMU usb-net wants index 1 = CDC-ECM; real RTL8153 wants
+                ;; index 0 = vendor config).
+                (let ((r6 (usb-get-descriptor 2 (usb-desc-configuration)
+                                              (usb-hub-config-index) dbuf 9)))
                   (when (<= r6 0)
                     (write-byte 72) (write-byte 67) (write-byte 49) (write-byte 10)
                     (return 0))
                   (let ((total-len (usb-desc-u16 dbuf 2)))
                     (when (> total-len 512) (setq total-len 512))
                     ;; Full config descriptor
-                    (let ((r7 (usb-get-descriptor 2 (usb-desc-configuration) 1 dbuf total-len)))
+                    (let ((r7 (usb-get-descriptor 2 (usb-desc-configuration)
+                                                  (usb-hub-config-index) dbuf total-len)))
                       (when (<= r7 0)
                         (write-byte 72) (write-byte 67) (write-byte 50) (write-byte 10)
                         (return 0))

@@ -2098,6 +2098,138 @@ wall.  glass-load 13/13, rfb-static PASS, glass-fb md5-identical;
 wall).  The next campaign starts at the `both` arm: the nested
 `*tx*`-special-binding + `with-fb-locked` pair on a worker.
 
+### THE `both` WALL IS DOWN: A WORKER'S SPECIAL IS BOUND IN ITS OWN STORAGE (51ef582)
+
+**IT WAS THE SHALLOW BINDING, AND THE PROOF WAS A BETWEEN-ARM CONTROL.**  Modus
+shallow-binds specials (`compile-let-with-specials`): save the global cell into
+a lexical, `set-symbol-value` the new value, restore in an unwind-protect.  So
+on a worker `(let ((glass::*tx* (list 0))) …)` conses **in the worker's region**
+and then writes that cons into the globals table, which lives in **region 0**.
+That is the forbidden direction; the worker's collector is copying, so the cons
+is moved or reclaimed and the region-0 slot is never updated — the cell is
+re-issued as fresh allocation while `*tx*` still names it and its CAR comes back
+a `CHARACTER`.  `txfr` (`*tx*` = a fresh cons) went `FR[pre]=0 → FR[post]=1`
+while `bothnilfr` (`*tx*` = NIL — nothing to publish) stayed 0, with the same
+nesting, the same recursive lock and the same 17 collections of the worker's
+region between them.
+
+**THE FIX IS THE GENERAL ONE, and three cheaper shapes are dead.**  A thread's
+dynamic binding now lives in **that thread's own storage** — what SBCL does with
+per-symbol TLS indices — and never enters the region-0 globals table.  Rejected,
+with reasons, so they are not re-proposed: *keeping the value alive in the
+binding's stack record* (it stops being collected but the copying collector
+still MOVES it and nothing updates the region-0 slot — a use-after-free traded
+for a stale pointer); *copying the value on publish*, the `CL:INTERN` arena
+route (interning copies a STRING whose identity nobody holds, but a special can
+be bound to any object and **`EQ` is observable** — `*tx*` must be the same cons
+`TX+` increments); *evaluating the initform in the arena* (fixes
+`(let ((*x* (list 0))))` and not `(let ((*x* some-existing-worker-object)))`,
+i.e. passes the test and leaves the general case broken).
+
+**WHERE IT LIVES, AND WHY NOT WHERE THE PLAN SAID.**  Each thread's 4 KB
+per-thread window block: `blk+0xC50` next-free entry, `blk+0xC58` depth stored
+**tagged** (the collector untags with one SHR, exactly like the MV count),
+`blk+0xC60` onward 58 entries of `[key][value]`.  ***THE STANDING CLAIM THAT
+"`0xC38..0xFFF` ARE UNCLAIMED" IS FALSE AS AN ADDRESS RANGE*** — it is true only
+of window OFFSETS.  `0x10000DA8` (thread page), `0x10000DB8` (the RT gate),
+`0x10000DF0/DF8` (socket page), `0x10000E00…` (MCGC config), `0x10000F08` (GC
+region) and `0x10000FF8` (per-CPU mode) all live in it and are process-global;
+claiming them as window offsets would have given every worker a private copy of
+the collector's own configuration.  So the entries are addressed **absolutely**
+from the thread's own base (`%DYNB-BLOCK`, via the existing self slot at
+`0x10000C30`) and **no window offset was added at all** — a worker's block bytes
+`0xC50..0xFFF` are private memory nothing else addresses.
+
+**A RAW PER-THREAD WORD IS NOT A GC ROOT**, and that is the half of this that
+cannot be skipped.  The precise root set is the fixed list in
+`EMIT-GC-TRAMPOLINE`, so `translate-x64` grew `EMIT-DYNBIND-ROOT-SCAN`: exactly
+DEPTH value words, reached through `EMIT-TLS-BASE` just as the MV-extras loop
+is — the collector runs on the thread that hit its own limit, so the stack it
+walks is that thread's.  Emitted into both the copying trampoline and the
+pinning collector's twin, gated on `*X64-TLS-WINDOW*` so every other image is
+byte-identical.  Without it this would be the first rejected shape with the
+staleness merely moved, and `test/hosted-dynbind.lisp`'s `*bit-survive*` is the
+check that catches exactly that.
+
+**DEFAULT-OFF BY CONSTRUCTION.**  The gate is `(mem-ref #x10000DB8 :u32)` — the
+**same word `%RT-ENTER` already tests** — so a single-threaded `./modus`, every
+bare-metal image and every ANSI gate runner pays one 32-bit load and a branch on
+the read path and reaches the identical code.  **The MAIN thread of an armed
+image is unarmed too** (its FS base is 0, so `%DYNB-BLOCK` answers 0 and it
+shallow-binds exactly as before), and that is correct rather than a gap: main
+*is* region 0's mutator, so a binding main publishes creates no cross-region
+pointer.
+
+**FOUR PLACES, NOT ONE.**  `compile-let-with-specials` emits `%DYNBIND` /
+`%DYNUNBIND` instead of `SET-SYMBOL-VALUE` at its three sites; **`cl-packages`'s
+`SYMBOL-VALUE` override needed the same three lines as prelude's**, because it
+is the one that actually runs in any image with a package system
+(last-defun-wins) and editing only prelude would have been dead code in
+`./modus`; `SET-SYMBOL-VALUE` hits this thread's binding first so a `SETQ`
+inside a `LET` cannot go round the back; `PROGV` is the sixth entry point and
+takes the same pair.  `%TLS-INSTALL` empties the stack before arming, because
+blocks are reused when thread slots are.
+
+**`%DYNUNBIND` TRUNCATES, IT DOES NOT POP**, and the difference is load-bearing:
+a `LET*` of two specials evaluates its inits INSIDE the unwind-protect, so a
+throw out of the second leaves the first bound and the second not while the
+cleanup still runs BOTH restores — and the restores run in binding order, not
+reverse.  Truncating to the entry whose key matches is right in both cases,
+because by the time a cleanup runs every inner binding has already been popped
+by its own.  Overflow at 58 nested specials is an honest `ERROR`, not a silent
+shallow bind: a shallow bind there is the publication this exists to prevent
+*and* would desynchronise the stack.
+
+**MEASURED, all rates, on one build:**
+
+| | |
+|---|---|
+| `run-glass-tx-cell.sh txfr` | **`FR[post]` 1 → 0**, 3 of 3, spans non-vacuous (r0span 109 MB, wspan 16.7 MB, wgc **17**), grade monotone 0/4/32784/49180/49180 |
+| `run-glass-tx-cell.sh bothnilfr` | `FR[post]` 0, 3 of 3 — the between-arm control still answers 0 |
+| **`run-glass-tx-cell.sh both`** | **5 of 5 delivered 49180/49180, 0 of 5 overwritten** (was 0 of 5, stopping at 32785 with `MVM LONGJMP (TRAP #x0511)`) |
+| `run-glass-send-worker.sh both` | 49180/49180, `FB-SELFCHECK bad=0` before *and* after |
+| **`run-glass-serve.sh`** | **5 of 5** — a real Python VNC client, **0 pixels differing** from the image it generates itself, 2 rectangles, 12288 distinct values |
+| `run-glass-serve.sh 3` | **4 of 4**, three concurrent clients, each byte-perfect |
+
+**AND A LANGUAGE TEST, BECAUSE "NO FOREIGN REFS" IS NOT "CORRECT".**  A
+mechanism that dropped every worker-side binding on the floor would score zero
+foreign refs and pass `txfr` perfectly.  `test/hosted-dynbind.lisp` asks the
+CL questions — `EQ` exact, restore, shadow/unshadow, `SETQ` inside a binding not
+leaking past it, non-local exit, `LET*` inits seeing earlier bindings, a special
+this thread never bound still reading the process-wide value, `PROGV`, and
+survival of the bound object across this thread's own collections — as one
+bitmask, run on MAIN and on a WORKER so a difference between them is a failure
+rather than a story.  **3 of 3 clean (8191/8191) on the fix; 3 of 3 FAIL on a
+control binary built from `0634eb5`, at exactly one bit** — 8191 − 7167 = 1024 =
+`*bit-survive*`, the bound object not surviving the worker's own region
+collections.  Deterministic, one bit, both directions: that is what a positive
+control looks like.
+
+**FULL BAR GREEN**, every count exact: thread-lisp 29, sb-thread 44, sb-sockets
+52, mv-handler 24, many-threads 12, many-regions 106, threads 18, mutex 18,
+sleep 13, blocking-receive 29, actors 20, actor-regions 48, percpu 19,
+ctx-switch 12, spinlock 11, thread-gc 39, thread-gc-concurrent 55,
+thread-regions 36, thread-actors 38, region-gc 23, region-gc-roots 32,
+region-gc-depth 7, region-gc-actors 53, gc-forced-stress 4, term-roundtrip 27,
+socket-server 33, glass-load 13/13, rfb-static PASS, `glass/fb` md5
+`b021d08a2b47fa871d8c0735a0141f6a`, **classify-thread-lisp 100 pass / 0
+clean-death / 0 hang of 100**.
+
+**TWO THINGS THE CONTROL BUILD SETTLED THAT WOULD OTHERWISE HAVE BEEN BLAMED ON
+THIS CHANGE**, both re-run on a `0634eb5` worktree build:
+* `build-checks`'s `implicit-global-setq = 124 (baseline 123)` and
+  `unresolved-function = 45 (baseline 40)` are **identical at `0634eb5`** — the
+  baselines in `build-checks.lisp` are stale, and this change adds none.
+* the shim audit's known arena regression is **unchanged**: `rc=1` after 25 ok
+  on **3 of 3 runs of each binary**.  Its SBCL reference half is still
+  `42 ok / 0 gaps`.
+
+**STILL OPEN, STATED:** `SET-SYMBOL-VALUE` of a special this thread has NOT
+bound still writes the shared table with a caller-supplied value — a different
+operation with its own cross-region story, untouched here; `BOUNDP` walks the
+table, so a special bound only per-thread reads as unbound on that thread; the
+58-binding ceiling; and `kiln modus-rfb PORT` was not run.
+
 ### DELEGATION TO A SERVICE ACTOR — what was measured before building it
 
 The chosen fix is that allocating mutations of the shared tables are performed

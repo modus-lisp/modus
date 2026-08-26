@@ -323,6 +323,91 @@
     (chk "e")))
 
 ;;; The arms.  ONE body; they differ only in the wrapper.
+;;; ============================================================
+;;; THE SECOND GRADER: MONOTONICITY AND AN EXACT FINAL VALUE
+;;; ============================================================
+;;;
+;;; ***`integerp' IS NOT ENOUGH.***  The grade above reports NOTINT: when the
+;;; CAR stops being an integer, and a garbage FIXNUM passes it silently — the
+;;; run that produced a=0 b=4 c=32852 d=16459 e=16459 was graded CLEAN, and
+;;; d IS LESS THAN c on a counter that only ever increments.
+;;;
+;;; *TX* counts one per byte written, so across the five grade points it must
+;;; be NON-DECREASING and must END at exactly 49180 (4 header bytes + 12+32768
+;;; for rect 1 + 12+16384 for rect 2).  That is the grade that would not have
+;;; been fooled.
+;;;
+;;; ***IT IS A SEPARATE ARM, NOT AN EDIT TO CHK.***  Changing CHK is precisely
+;;; what moves this bug — measured: accessor reads in CHK made `both' deliver
+;;; 49180 and grade clean on BOTH binaries while the shipped shape stops at
+;;; 32785 on both.  So the shipped reproduction stays byte-comparable and this
+;;; runs alongside it under its own mode.  A disagreement between the two arms
+;;; is a DATUM about layout sensitivity, not a contradiction.
+(defvar *mono-seen* nil)            ; the five readings, newest first
+(defvar *mono-expect* 49180)
+
+(defun chk-mono (tag)
+  (write-string-serial tag)
+  (if (consp glass::*tx*)
+      (let ((v (car glass::*tx*)))
+        (setq *mono-seen* (cons v *mono-seen*))
+        (write-string-serial "=CONS/")
+        ;; SAME MARKER THE SHIPPED GRADE USES, so the runner's NOTINT: grep
+        ;; still sees this arm.  A character printed bare reads as "S".
+        (if (integerp v)
+            (write-string-serial (princ-to-string v))
+            (progn (write-string-serial "NOTINT:")
+                   (write-string-serial (princ-to-string (type-of v))))))
+      (progn (setq *mono-seen* (cons :broken *mono-seen*))
+             (write-string-serial "=BROKEN")))
+  (write-string-serial " "))
+
+(defun body-mono (s fb)
+  (let ((w-u8 (find-symbol "W-U8" "GLASS"))
+        (w-u16 (find-symbol "W-U16" "GLASS"))
+        (wrr (find-symbol "WRITE-RECT-RAW" "GLASS")))
+    (chk-mono "a")
+    (funcall w-u8 s 0) (funcall w-u8 s 0) (funcall w-u16 s 2)
+    (chk-mono "b")
+    (funcall wrr s fb 0 0 *fbw* 64 nil)
+    (chk-mono "c")
+    (funcall wrr s fb 0 64 *fbw* 32 nil)
+    (chk-mono "d")
+    (force-output s)
+    (chk-mono "e")))
+
+;;; Reports (verdict readings), and the verdict names WHICH law broke.
+;;; ***THE AGGREGATE VERDICT ONLY PRINTS IF THE RUN COMPLETES.***  Today this
+;;; arm dies mid-send (32785, CAR already a CHARACTER at grade point c), so the
+;;; line to read is the per-point `a=CONS/… b=CONS/…' trace CHK-MONO emits
+;;; inline.  That is deliberate: the readings are recorded as they are taken,
+;;; so a run that dies still shows where the counter stopped being sane.
+;;;
+;;; AND NOTE WHAT THIS ARM ALREADY DEMONSTRATES: it is the shipped `both'
+;;; nesting with a grader that merely RECORDS each reading, and it stops at
+;;; 32785 with NOTINT:CHARACTER — while the shipped CHK, which records
+;;; nothing, delivers all 49180 and only shows NOTINT at d/e.  One SETQ per
+;;; grade point moves the failure.  Fifth demonstration.
+(defun grade-mono ()
+  (let ((v (reverse *mono-seen*)))
+    (if (null v)
+        (list :no-readings v)
+        (let ((bad nil) (prev nil) (rest v))
+          (loop
+            (when (null rest) (return nil))
+            (let ((x (car rest)))
+              (if (not (integerp x))
+                  (setq bad (or bad :not-an-integer))
+                  (if (and prev (< x prev))
+                      (setq bad (or bad :went-backwards))
+                      nil))
+              (if (integerp x) (setq prev x) nil))
+            (setq rest (cdr rest)))
+          (let ((last (car (last v))))
+            (list (or bad
+                      (if (equal last *mono-expect*) :ok :wrong-final))
+                  v))))))
+
 (defun do-send (s fb mode)
   (cond
     ;; ---- the four arms run-glass-send-worker.sh names ----
@@ -331,6 +416,9 @@
     ((string= mode "lock")  (glass::with-fb-locked (fb) (body s fb)))
     ((string= mode "both")  (glass::with-fb-locked (fb)
                               (let ((glass::*tx* (list 0))) (body s fb))))
+    ;; ---- THE SECOND GRADER'S ARM: identical to `both', graded harder ----
+    ((string= mode "bothmono") (glass::with-fb-locked (fb)
+                                 (let ((glass::*tx* (list 0))) (body-mono s fb))))
     ;; ---- the nesting is a passenger ----
     ;; identical nesting; *TX* NIL so TX+ reads the special and does no INCF
     ((string= mode "bothnil") (glass::with-fb-locked (fb)
@@ -428,6 +516,20 @@
       (finish-output))
     (sb-bsd-sockets:socket-close conn))
   (sb-bsd-sockets:socket-close listener))
+
+;;; THE SECOND GRADER REPORTS FROM THE DRIVER, after the join — reading
+;;; *MONO-SEEN* on the worker would be one more allocation in the hot path,
+;;; which is the thing that moves this bug.
+(if (string= *mode* "bothmono")
+    (let ((g (grade-mono)))
+      (format t "~&MONO readings=~s~%" (second g))
+      (format t "~&MONO verdict=~s (expected final ~s)~%" (first g) *mono-expect*)
+      (format t "~&MONO ~a~%"
+              (if (eq (first g) :ok)
+                  "PASS — non-decreasing and exactly the expected final byte count"
+                  "FAIL — the counter is corrupted; `integerp' alone would have called this clean")))
+    nil)
+(finish-output)
 
 (format t "~&SERVER DONE~%")
 (finish-output)

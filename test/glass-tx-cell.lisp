@@ -120,6 +120,61 @@
 ;;;; WHAT IS NOT: which allocation writes it, or why.
 ;;;;
 ;;;; ============================================================
+;;;; DEAD HYPOTHESIS: THE %RT-ENTER/%RT-LEAVE SEAM.  THE GATE READS ZERO.
+;;;; ============================================================
+;;;;
+;;;; The natural next theory — and a good one, because it is the shape that was
+;;;; really there in region 0 last round — is that the worker's OWN allocation
+;;;; frontier is parked and reloaded across the runtime-table seam, and comes
+;;;; back STALE: worker allocates the counter, keeps allocating in registers,
+;;;; TX+ reads *TX* through SYMBOL-VALUE which parks the frontier and hops, and
+;;;; %RT-LEAVE restores a value older than the registers had reached, so the
+;;;; next allocation is issued over the counter.  Two copies of one frontier,
+;;;; one level down.
+;;;;
+;;;; IT NEVER RUNS.  %RT-ENTER is
+;;;;     (if (= (mem-ref #x10000DB8 :u32) 0) 0 (%rt-enter-locked))
+;;;; and #x10000DB8 is the threads-live gate, a BSS word that ONLY
+;;;; %RT-THREADS-ON writes.  SB-THREAD:MAKE-THREAD does not call it; nothing in
+;;;; glass calls it; nothing in this file calls it.  CHK prints the gate at
+;;;; every grade point, on the worker, and in the failing arm it reads:
+;;;;
+;;;;     a[gate=0]=CONS/0  b[gate=0]=CONS/4  c[gate=0]=CONS/NOTINT:CHARACTER
+;;;;
+;;;; Zero where the counter is still intact and zero where it is already
+;;;; wrecked.  With the gate zero %RT-ENTER and %RT-LEAVE are a 32-bit load and
+;;;; a branch: NO mutex, NO region hop, NO parked frontier, NOTHING to rewind.
+;;;; The seam is not merely innocent here, it is not executed, so no
+;;;; instrumentation of it can say anything.  Turning the gate ON would be a
+;;;; different experiment about a different program.
+;;;;
+;;;; KEEP THE GATE PRINT.  It costs one number per grade point and it is what
+;;;; stops this hypothesis being re-derived a fourth time.
+;;;;
+;;;; IT ALSO CORRECTS A CLAIM THIS CAMPAIGN HAS BEEN REPEATING.
+;;;; test/glass-send-worker.lisp's header says a special read "compiles to
+;;;; SYMBOL-VALUE, which takes the runtime-table lock and hops the active GC
+;;;; region to region 0".  That is true only with the gate on, and the gate is
+;;;; off in every run either test has ever made.  SYMBOL-VALUE here is a
+;;;; GETHASH on the globals table and nothing else.
+;;;;
+;;;; AND IT NARROWS THE SUBJECT.  TX+ is `(when *tx* (incf (car *tx*)))', so
+;;;; EVERY arm — including the clean ones — performs the SYMBOL-VALUE read once
+;;;; per byte.  The reads are common to all arms and the clean arms are clean.
+;;;; What only the corrupted arms do is WRITE: a cons exists and is RPLACA'd
+;;;; ~32800 times while the worker allocates.
+;;;;
+;;;; ---- and one measurement that answered nothing, reported anyway ----
+;;;; CANARY conses a 3-element list immediately before the counter and checks
+;;;; it at the end.  It is INCONCLUSIVE: the canary is intact 3 of 3 — but so
+;;;; is the counter, 0 of 3 overwritten, where the same arm without the canary
+;;;; is corrupted.  ONE EXTRA THREE-CONS ALLOCATION MOVES THE BUG AWAY.  That
+;;;; is the third independent demonstration of layout sensitivity in this file
+;;;; (the others: opening BODY up, and the non-monotone FBW table), and it is
+;;;; the standing warning for anyone instrumenting this — the probe changes the
+;;;; thing it measures, so a clean run under a new probe is not evidence.
+;;;;
+;;;; ============================================================
 ;;;; WHAT WOULD MAKE THIS A LIE
 ;;;; ============================================================
 ;;;;
@@ -197,6 +252,9 @@
 ;;; moment under test, and the point is to disturb it as little as a print can.
 (defun chk (tag)
   (write-string-serial tag)
+  (write-string-serial "[gate=")
+  (write-string-serial (princ-to-string (mem-ref #x10000DB8 :u32)))
+  (write-string-serial "]")
   (if (null glass::*tx*)
       ;; The arms that never install a counter (plain / lock / bothnil /
       ;; othersp) legitimately read NIL.  That is OFF, not BROKEN — the runner
@@ -268,6 +326,21 @@
          (body s fb)
          (write-string-serial (if (consp keep) "keep=CONS " "keep=BROKEN "))
          keep)))
+    ;; ---- is it the counter, or is it ANY object allocated there? ----
+    ;; CANARY conses a 3-element list next to the counter, hands it to nobody,
+    ;; reads it from nobody until the end, and reports whether it still holds
+    ;; (0 1 2).  If the canary rots too, the overwrite is indiscriminate and the
+    ;; subject is the allocator, not *TX*.
+    ((string= mode "canary")
+     (glass::with-fb-locked (fb)
+       (let ((canary (list 0 1 2)))
+         (setq glass::*tx* (list 0))
+         (body s fb)
+         (write-string-serial
+          (if (and (consp canary) (equal canary '(0 1 2)))
+              "canary=INTACT "
+              (concatenate 'string "canary=ROTTED:" (princ-to-string canary) " ")))
+         canary)))
     (t (error "glass-tx-cell: unknown mode ~a" mode))))
 
 (let* ((fb (gsw-make-fb))

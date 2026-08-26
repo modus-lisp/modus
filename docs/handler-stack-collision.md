@@ -128,11 +128,46 @@ worker its own copy of the collector's configuration:
 4. `test/run-glass-serve.sh ./modus 3` — glass's own RFB server, 3 concurrent
    real VNC clients, 0 pixels differing. It exercises handler unwinding on
    per-client threads and is the end-to-end witness.
-5. The ANSI gate, unchanged, from your side — **we cannot run it here.** The
-   corpus is absent from this machine (`tmp/ansi-test` does not exist, and no
-   `*.lsp` corpus is anywhere under `/home/claude`), so every shard would
-   report `expected/ran = 0`. That asymmetry is why we are writing this down
-   rather than resolving the merge ourselves.
+5. The ANSI gate, unchanged, from your side — **we cannot run it here.** See
+   below; that asymmetry is why we are writing this down rather than resolving
+   the merge ourselves.
+
+## The corpus is not obtainable from this repo
+
+Five scripts hard-code the corpus at an absolute path outside the tree:
+
+```
+scripts/build-ansi-runner.sh:16       TESTS_ROOT=/home/claude/modus-ref/ansi-test/tests
+scripts/build-ansi-runner.sh:17       AUX=/home/claude/modus-ref/ansi-test/auxiliary/ansi_aux
+scripts/build-ansi-file-runner.sh:12  AUX=/home/claude/modus-ref/ansi-test/auxiliary/ansi_aux
+scripts/run-ansi-per-file.sh:24       TESTS_ROOT=/home/claude/modus-ref/ansi-test/tests
+scripts/run-ansi-all.sh:11            TESTS_ROOT=/home/claude/modus-ref/ansi-test/tests
+```
+
+`/home/claude/modus-ref` **does not exist on this machine**, and no corpus is
+present anywhere on it (`find / -name ansi-aux-macros.lsp` → nothing). So every
+shard reports `expected/ran = 0`, and `acceptance-gate.sh` would compare two
+zeroes and call it PASS.
+
+**Nothing in the repo says where the corpus comes from** — no clone URL, no
+fetch step, no note of which suite it is. `CLAUDE.md`'s ANSI Conformance
+section reports 16,489/17,465 = 94.4% without stating the provenance of the
+17,465. The layout (`tests/*.lsp`, `auxiliary/ansi-aux-macros.lsp`,
+`auxiliary/ansi_aux`) is recognisably the GCL ANSI test suite, but that is an
+inference from filenames, not something the tree asserts.
+
+**Two requests, both cheap and both worth more than this bug report:**
+
+1. **Record the provenance** — a line in `CLAUDE.md` or a `scripts/get-ansi-corpus.sh`
+   saying which suite, which revision, and where it came from. A conformance
+   number whose corpus cannot be reconstructed is not reproducible, and the
+   gate silently passes when the corpus is missing rather than refusing.
+2. **Make the gate refuse a missing corpus.** `acceptance-gate.sh` should exit
+   2 (infrastructure error) when `TESTS_ROOT` is absent or the aux files do not
+   load, rather than reporting `NET = 0` and PASS. As written, a machine
+   without the corpus cannot tell a clean merge from an unmeasured one — which
+   is the same class of defect as everything else in this report: an unsafe
+   state that is indistinguishable from a safe one.
 
 ## Merge-order note
 

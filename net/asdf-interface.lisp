@@ -367,6 +367,21 @@
       (error 'asdf::missing-component :requires (asdf::coerce-name name)))
     (asdf::%register name ds path nil)))
 
+(defun asdf::%search-fns-locate (n)
+  "Consult ASDF::*SYSTEM-DEFINITION-SEARCH-FUNCTIONS* — the ASDF-2-era
+   hook quicklisp pushes QL-DIST::SYSTEM-DEFINITION-SEARCHER onto.  That
+   searcher ensure-installs the release (tarball fetch + untar) and
+   answers the installed .asd's pathname.  The variable is defined at
+   RUNTIME (by ql's setup / the genera shim), so read it defensively;
+   a searcher error is a miss."
+  (let ((fns (handler-case asdf::*system-definition-search-functions*
+               (t (c) nil)))
+        (hit nil))
+    (dolist (f fns hit)
+      (when (null hit)
+        (let ((r (handler-case (funcall f n) (t (c) nil))))
+          (when r (setq hit r)))))))
+
 (defun asdf::find-system (name &optional (error-p t))
   "ASDF:FIND-SYSTEM — the SYSTEM object for NAME.  Already-seen systems
    answer from the registry (so the object is EQ across calls); otherwise
@@ -380,8 +395,17 @@
       (t (let ((path (asdf::%locate-asd n)))
            (cond
              (path (asdf::%register-from-asd n path))
-             (error-p (error 'asdf::missing-component :requires n))
-             (t nil)))))))
+             (t
+              ;; Registry + central-registry missed: run the runtime
+              ;; search functions (quicklisp integration — see
+              ;; %search-fns-locate).  A hit is the .asd's pathname.
+              (let ((spath (asdf::%search-fns-locate n)))
+                (cond
+                  (spath (asdf::%register-from-asd
+                          n (handler-case (namestring spath)
+                              (t (c) spath))))
+                  (error-p (error 'asdf::missing-component :requires n))
+                  (t nil))))))))))
 
 ;;; =====================================================================
 ;;; 8.  Loading

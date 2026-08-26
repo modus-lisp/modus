@@ -1398,24 +1398,105 @@
         (%prim-aset s i (mem-ref (+ addr i) :u8))
         (setq i (+ i 1))))))
 
+(defun %dir-entries-raw (path)
+  "List the BARE entry names of directory PATH (no . / ..), or NIL.
+   The pre-glob body of DIRECTORY, unchanged."
+  (let ((fd (handler-case (%sys-open-rdonly path) (t (c) -1))))
+    (when (or (null fd) (< fd 0)) (return-from %dir-entries-raw nil))
+    (let ((acc nil) (done nil))
+      (loop
+        (when done (return nil))
+        (let ((n (%sys-getdents64 fd *%dirent-buf-addr* *%dirent-buf-size*)))
+          (cond
+            ((or (null n) (<= n 0)) (setq done t))
+            (t (setq acc (%parse-dirents *%dirent-buf-addr* n acc))))))
+      (handler-case (%sys-close fd) (t (c) nil))
+      (nreverse acc))))
+
+(defun %path-openable-p (path)
+  (let ((fd (handler-case (%sys-open-rdonly path) (t (c) -1))))
+    (if (and fd (>= fd 0))
+        (progn (handler-case (%sys-close fd) (t (c) nil)) t)
+        nil)))
+
+(defun %glob-match-p (pat str)
+  "Shell-style match: * in PAT matches any run of characters."
+  (let ((pn (length pat)) (sn (length str)))
+    (labels ((gm (pp ss)
+               (cond
+                 ((>= pp pn) (>= ss sn))
+                 ((char= (char pat pp) #\*)
+                  (if (>= (+ pp 1) pn)
+                      t
+                      (let ((k ss) (hit nil))
+                        (loop
+                          (when (gm (+ pp 1) k) (setq hit t) (return nil))
+                          (when (>= k sn) (return nil))
+                          (setq k (+ k 1)))
+                        hit)))
+                 ((>= ss sn) nil)
+                 ((char= (char pat pp) (char str ss))
+                  (gm (+ pp 1) (+ ss 1)))
+                 (t nil))))
+      (gm 0 0))))
+
+(defun %split-slash (s)
+  (let ((out nil) (start 0) (i 0) (n (length s)))
+    (loop
+      (when (> i n) (return (nreverse out)))
+      (if (or (= i n) (char= (char s i) #\/))
+          (progn (push (subseq s start i) out)
+                 (setq start (+ i 1))))
+      (setq i (+ i 1)))))
+
+(defun %glob-expand (base comps)
+  "Expand glob COMPS (path components) under BASE (\"\" or ends in /).
+   Returns full-path strings.  A component \"*.*\" follows the CL
+   :name/:type :wild convention (matches dot-less names too) → \"*\"."
+  (cond
+    ((null comps)
+     (if (%path-openable-p base) (list base) nil))
+    (t
+     (let* ((comp (car comps))
+            (rest (cdr comps))
+            (comp (if (string= comp "*.*") "*" comp)))
+       (cond
+         ;; trailing "" (pattern ended in /): base must be a directory
+         ((and (string= comp "") (null rest))
+          (if (%path-openable-p base) (list base) nil))
+         ((not (position #\* comp))
+          (if (null rest)
+              (let ((cand (concatenate 'string base comp)))
+                (if (%path-openable-p cand) (list cand) nil))
+              (%glob-expand (concatenate 'string base comp "/") rest)))
+         (t
+          (let ((entries (%dir-entries-raw (if (string= base "") "./" base)))
+                (out nil))
+            (dolist (name entries (nreverse out))
+              (when (%glob-match-p comp name)
+                (if (null rest)
+                    (push (concatenate 'string base name) out)
+                    (let ((sub (%glob-expand
+                                (concatenate 'string base name "/") rest)))
+                      (dolist (r sub) (push r out)))))))))))))
+
 (defun directory (x &rest args)
-  "Return list of files in directory X.  Linux-only; uses
-   open(O_DIRECTORY)+getdents64.  Returns NIL when the syscall is
-   unavailable or the path can't be opened."
+  "Return the entries of directory X.  Linux-only (getdents64).
+   Non-wild X: bare entry-name strings (the long-standing in-tree
+   contract; shims post-process these).  WILD X — any component
+   containing `*` (e.g. quicklisp's \"dists/*/distinfo.txt\") — returns
+   FULL pathname strings of every match, expanding each wild component
+   against the real filesystem.  Directory-only matches are requested by
+   a trailing slash."
   (declare (ignore args))
   (let ((path (handler-case (namestring x) (t (c) nil))))
     (when (null path) (return-from directory nil))
-    (let ((fd (handler-case (%sys-open-rdonly path) (t (c) -1))))
-      (when (or (null fd) (< fd 0)) (return-from directory nil))
-      (let ((acc nil) (done nil))
-        (loop
-          (when done (return nil))
-          (let ((n (%sys-getdents64 fd *%dirent-buf-addr* *%dirent-buf-size*)))
-            (cond
-              ((or (null n) (<= n 0)) (setq done t))
-              (t (setq acc (%parse-dirents *%dirent-buf-addr* n acc))))))
-        (handler-case (%sys-close fd) (t (c) nil))
-        (nreverse acc)))))
+    (if (not (position #\* path))
+        (%dir-entries-raw path)
+        (let ((comps (%split-slash path)))
+          (if (and comps (string= (car comps) ""))
+              (%glob-expand "/" (cdr comps))
+              (%glob-expand "" comps))))))
 
 ;;; --- with-open-stream ---
 (defun %with-open-stream-fn (stream thunk)

@@ -141,6 +141,7 @@
 
 (defconstant +num-vregs+ 23)
 
+(defvar *nlx-state-serial* 0)
 (defstruct (mvm-state (:conc-name mvm-))
   (regs    (make-array +num-vregs+ :initial-element 0) :type simple-vector)
   (stack   nil :type list)
@@ -199,7 +200,8 @@
   ;; LONGJMP pops the top entry, restores the snapshot, sets pc to resume-PC
   ;; and VR to a non-NIL marker so the handler-case's `:bnnull` takes the
   ;; handler path (mirroring the native setjmp's non-zero return).
-  (handlers nil :type list))
+  (handlers nil :type list)
+  (serial (incf *nlx-state-serial*)))
 
 ;; A jmp-buf saved by SETJMP (TRAP #x0510): everything the interpreter needs to
 ;; resume the handler-case body's setjmp point after a LONGJMP.  pc is the
@@ -207,6 +209,9 @@
 ;; code does `mov dest,VR; bnnull dest,handler`); the rest is dynamic interp
 ;; state captured so the unwind restores the operand stack / call frames / the
 ;; calling-convention scratch registers to exactly the setjmp-time values.
+(defvar *nlx-trace* nil
+  "When T, print a line at every interp SETJMP/LONGJMP/CLEAR-HANDLER.")
+
 (defstruct (mvm-jmpbuf (:conc-name mvm-jb-))
   (pc         0   :type fixnum)
   (stack      nil :type list)
@@ -927,6 +932,8 @@
                ;; so the BNNULL falls through to the body (the native "setjmp
                ;; returned 0 = normal entry" path).
                ((= code #x0510)
+                (when *nlx-trace*
+                  (format t "~%[NLX setjmp st=~D depth->~D pc=~D]" (mvm-serial state) (+ 1 (length (mvm-handlers state))) npc))
                 (push (make-mvm-jmpbuf
                        :pc npc
                        :stack (mvm-stack state)
@@ -946,6 +953,8 @@
                ;; outer mvm-eval-forms handler reports it (matches native: a longjmp
                ;; with a zeroed jmp-buf slot is undefined / a crash).
                ((= code #x0511)
+                (when *nlx-trace*
+                  (format t "~%[NLX longjmp st=~D depth=~D pc=~D]" (mvm-serial state) (length (mvm-handlers state)) pc))
                 (let ((rpc (%mvm-longjmp-restore state)))
                   (if rpc
                       (progn (setf regs (mvm-regs state)) (setf pc rpc))
@@ -954,6 +963,8 @@
                ;; jmp-buf so a later error doesn't unwind to this (now exited)
                ;; frame.  Pure pop; PC just advances.
                ((= code #x0512)
+                (when *nlx-trace*
+                  (format t "~%[NLX clear st=~D depth=~D]" (mvm-serial state) (length (mvm-handlers state))))
                 (when (mvm-handlers state)
                   (pop (mvm-handlers state)))
                 (setf pc npc))
@@ -2263,6 +2274,9 @@
           ;; re-signal so mvm-eval-forms' outer handler reports :interp-err (an
           ;; uncaught error / unmatched throw, matching native semantics).
           (error (c)
+            (when *nlx-trace*
+              (format t "~%[NLX bridge st=~D depth=~D pc=~D cnd=~A]"
+                      (mvm-serial state) (length (mvm-handlers state)) pc (type-of c)))
             (if (mvm-handlers state)
                 (setf %lj c)
                 (error c)))

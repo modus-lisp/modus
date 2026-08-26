@@ -589,7 +589,24 @@
    register the accessor as a method specialized on CLASS-NAME; else no-op
    (the plain defun serves).  KIND :writer gets (new-value obj) params."
   (let ((gf (%find-gf fn-name)))
+    (when (null gf)
+      ;; CLHS 7.6.2: accessors ARE methods on a (possibly implicitly
+      ;; created) generic function.  With only the plain defun, two
+      ;; classes sharing an accessor NAME hit last-defun-wins:
+      ;; quicklisp's RELEASE (:accessor name -> slot PROJECT-NAME) was
+      ;; shadowed by a later class's NAME accessor reading slot NAME ->
+      ;; "no slot named NAME in class RELEASE" (task #278).  Create the
+      ;; GF and install its dispatch stub (replacing the plain defun);
+      ;; every subsequent class's accessor adds its own method.
+      (%defgeneric fn-name (if (eq kind ':writer) '(nv obj) '(obj)) nil)
+      (setq gf (%find-gf fn-name)))
     (when gf
+      ;; ALWAYS (re)install the dispatch stub: the DEFCLASS expansion
+      ;; emits the plain accessor DEFUN right before this call, so each
+      ;; new class's defun CLOBBERS the stub a previous class installed —
+      ;; (kname instance-of-first-class) then read the LAST class's slot
+      ;; ("no slot named SLOT-B in class KA" minimal repro, task #278).
+      (%gf-install-dispatch-stub fn-name)
       (if (eq kind ':writer)
           (%defmethod fn-name nil (list 't class-name)
                       (lambda (nv obj) (set-slot-value obj slot-name nv)))
@@ -1901,12 +1918,26 @@
                  (when (null best-fn)
                    (setq best-fn m-fn)))))))
         (setq cur (cdr cur))))
-    ;; Call best match: specific > general > default error
+    ;; Call best match: specific > general > runtime-GF method > default error
     (let ((fn (if best-specific best-specific best-fn)))
       (if fn
         (funcall fn cls obj slot-name)
-        ;; Default: signal unbound-slot condition
-        (error 'unbound-slot :name slot-name :instance obj)))))
+        ;; A RUNTIME (defmethod slot-unbound ((c t) (o CLASS) (s (eql 'X))) …)
+        ;; — e.g. quicklisp's lazily-computed BASE-DIRECTORY (ql-dist
+        ;; dist.lisp:508) — registers as a plain GF method on SLOT-UNBOUND,
+        ;; NOT via the build-time rewriter's %add-slot-unbound-method, so the
+        ;; list above never sees it.  Mirror CLASS-NAME's pattern below:
+        ;; dispatch to an applicable user method when one exists, else the
+        ;; default unbound-slot signal.
+        (let ((gf (%find-gf 'slot-unbound)))
+          (if (and gf (%gf-p gf) (%gf-methods gf))
+              (let ((applicable (%collect-applicable-methods
+                                 gf (list cls obj slot-name))))
+                (if applicable
+                    (%gf-dispatch-standard gf (list cls obj slot-name)
+                                           applicable)
+                    (error 'unbound-slot :name slot-name :instance obj)))
+              (error 'unbound-slot :name slot-name :instance obj)))))))
 
 (defun slot-unbound (class obj slot-name)
   "Default slot-unbound: signals an unbound-slot condition with
@@ -2829,7 +2860,21 @@
         (unless *symbol-function-table* (%sft-init))
         (puthash alias *symbol-function-table* wrapper)
         (when *native-sym-function-table*
-          (puthash hash *native-sym-function-table* wrapper)))))
+          (puthash hash *native-sym-function-table* wrapper))
+        ;; The bare-string / bare-hash keys above predate the #211
+        ;; package-aware function tables: a caller in the GF's home
+        ;; package compiles (SET-INNER … v) with a PACKAGE-QUALIFIED
+        ;; key (e.g. QL-DIST::SET-PREFERENCE for quicklisp's
+        ;; (defgeneric (setf preference) …)) and never finds the blind
+        ;; entry.  Intern SET-INNER in the INNER symbol's package and
+        ;; register through set-symbol-function, which builds the same
+        ;; qualified key the call-site lookup uses.
+        (let* ((inner (cadr gf-name))
+               (pkg (handler-case (symbol-package inner) (t (c) nil))))
+          (when pkg
+            (let ((alias-sym (handler-case (intern alias pkg) (t (c) nil))))
+              (when alias-sym
+                (set-symbol-function alias-sym wrapper))))))))
   nil)
 
 (defun %defmethod-full (gf-name qualifier specializers fn params)

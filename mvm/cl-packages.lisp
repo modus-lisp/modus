@@ -1614,9 +1614,29 @@
   (when (eq name-or-hash t) (return-from symbol-value t))
   (let ((key (if (integerp name-or-hash)
                  name-or-hash
-                 (%sym-global-key name-or-hash)))
-        (tbl (%globals-table)))
-    (if (and tbl key) (values (gethash key tbl)) nil)))
+                 (%sym-global-key name-or-hash))))
+    ;; THIS THREAD'S OWN DYNAMIC BINDINGS COME FIRST.  Prelude's SYMBOL-VALUE
+    ;; carries the same three lines and the same comment; BOTH need them,
+    ;; because this override is the one that actually runs in any image with a
+    ;; package system (last-defun-wins) and prelude's is the one that runs in
+    ;; the images without one.  Gate = the word %RT-ENTER tests, so an image
+    ;; that never declared itself threaded pays one 32-bit load and a branch;
+    ;; the main thread of a threaded image has window base 0 and pays two more
+    ;; before reaching the identical code.  See PER-THREAD DYNAMIC BINDINGS in
+    ;; mvm/prelude.lisp for why a worker's binding may not go in the table.
+    ;; KEY CAN BE NIL HERE (%SYM-GLOBAL-KEY answers NIL for a non-symbol), and
+    ;; NIL is the immediate #xDEAD0001, which a value slot could legitimately
+    ;; hold — so a NIL key must never be handed to the scan or it could match
+    ;; some other binding's value word and return that binding's value.
+    (unless (or (null key) (eql (mem-ref #x10000DB8 :u32) 0))
+      (let ((blk (%dynb-block)))
+        (unless (eql blk 0)
+          (let ((a (%dynb-find key (- (%dynb-next blk) 16)
+                               (- (%dynb-depth blk) 1))))
+            (unless (eql a 0)
+              (return-from symbol-value (values (mem-ref a :u64))))))))
+    (let ((tbl (%globals-table)))
+      (if (and tbl key) (values (gethash key tbl)) nil))))
 
 (defun boundp (sym)
   "True if SYM has a value in the global symbol-value alist (#x10000080).
@@ -1937,7 +1957,12 @@
     (loop
       (when (null vc) (return nil))
       (when (null vlc) (return nil))
-      (set-symbol-value (%progv-hash (car vc)) (car vlc))
+      ;; %DYNBIND, not SET-SYMBOL-VALUE: PROGV establishes a dynamic BINDING,
+      ;; so on a worker thread it must land in that thread's own storage
+      ;; rather than in region 0's globals table — the same reason
+      ;; COMPILE-LET-WITH-SPECIALS emits it.  Identical to the old call on
+      ;; every unarmed thread.
+      (%dynbind (%progv-hash (car vc)) (car vlc))
       (setq vc (cdr vc))
       (setq vlc (cdr vlc)))))
 
@@ -1947,6 +1972,9 @@
     (loop
       (when (null cur) (return nil))
       (let ((p (car cur)))
-        (set-symbol-value (car p) (cdr p)))
+        ;; The %DYNBIND above's counterpart.  %DYNUNBIND truncates this
+        ;; thread's binding stack to the entry it finds, so restoring in
+        ;; binding order (which is the order %PROGV-SAVE built) is correct.
+        (%dynunbind (car p) (cdr p)))
       (setq cur (cdr cur)))))
 

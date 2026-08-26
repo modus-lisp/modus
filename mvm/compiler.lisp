@@ -8450,9 +8450,21 @@
 
 (defun compile-let-with-specials (bindings body specials env dest &optional sequential)
   "Compile let/let* with (declare (special ...)) variables.
-   Special vars use dynamic binding via symbol-value/set-symbol-value.
+   Special vars use dynamic binding via symbol-value/%DYNBIND/%DYNUNBIND.
    On entry: save old values, set new values.
    On exit: restore old values, preserving multiple-value state.
+
+   %DYNBIND / %DYNUNBIND, NOT SET-SYMBOL-VALUE, and the difference is only
+   visible on a WORKER THREAD.  A shallow bind writes the new value into the
+   globals table, which lives in REGION 0 — so a worker binding a special to
+   an object it just consed publishes a region-0 -> worker pointer, the one
+   direction per-region collection forbids, and the worker's own copying
+   collector then moves or reclaims the object without updating that slot.
+   %DYNBIND puts the binding in the binding thread's OWN storage instead
+   (mvm/prelude.lisp, PER-THREAD DYNAMIC BINDINGS) and is byte-for-byte the
+   old SET-SYMBOL-VALUE on every thread that has not armed the seam — which
+   is every thread of every single-threaded image, and the main thread of a
+   threaded one.
    When SEQUENTIAL is true (let* context), all bindings are kept in original
    order to preserve sequential dependencies (e.g. from multiple-value-bind).
 
@@ -8536,13 +8548,13 @@
                                    :key (lambda (b)
                                           (symbol-name (if (consp b) (car b) b)))
                                    :test #'string=)
-                         (push `(set-symbol-value ,(%global-var-bind-key spec) ,tmp)
+                         (push `(%dynbind ,(%global-var-bind-key spec) ,tmp)
                                acc)))
                      specials temp-vars)
                (nreverse acc)))
            (restore-forms
              (mapcar (lambda (sv spec)
-                       `(set-symbol-value ,(%global-var-bind-key spec) ,sv))
+                       `(%dynunbind ,(%global-var-bind-key spec) ,sv))
                      save-vars specials))
            (stripped-body (strip-declares body)))
       ;; NON-LOCAL EXIT (#240, 2026-08-08): the restore MUST run on every
@@ -8595,7 +8607,7 @@
                                   (if pos
                                       (list rb
                                             (list (%mvm-gensym "SPECSET")
-                                                  `(set-symbol-value
+                                                  `(%dynbind
                                                     ,(%global-var-bind-key (nth pos specials))
                                                     ,(nth pos temp-vars))))
                                       (list rb)))))

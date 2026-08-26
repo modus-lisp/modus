@@ -102,6 +102,52 @@
              (emit-mov-reg-abs buf reg #x10000C30))
       (emit-mov-reg-imm buf reg 0)))
 
+(defun emit-dynbind-root-scan (buf scan-word-label)
+  "Scan THIS THREAD's dynamic-binding stack as a precise root set.
+
+   A special bound on a worker no longer goes into the region-0 globals table
+   — it goes into that thread's own per-thread window block (mvm/prelude.lisp,
+   PER-THREAD DYNAMIC BINDINGS).  A RAW PER-THREAD WORD IS NOT A GC ROOT: the
+   precise root set is exactly the fixed list this trampoline walks, so
+   without this loop the bound object would be moved or reclaimed by the very
+   collector its binder is running on, and the binding would hand back a
+   forwarding pointer.  That is the failure the whole change exists to end,
+   and leaving this out would merely move it.
+
+   THE COLLECTOR RUNS ON THE THREAD THAT HIT ITS OWN LIMIT, so EMIT-TLS-BASE
+   resolves to that thread's block and the stack walked is that thread's —
+   the same argument the MV-extras loop above rests on.  The main thread's
+   base is 0 and it never binds here, so the first test skips everything;
+   with the window off nothing is emitted at all and every other image stays
+   byte-identical.
+
+   Layout, from mvm/prelude.lisp: blk+0xC58 = depth as a TAGGED fixnum (one
+   SHR, exactly like the MV count), blk+0xC60 = entry 0, 16 bytes per entry,
+   [key][value].  Only the VALUE word is scanned; a key is a name hash, i.e.
+   a fixnum, which scan_word would reject anyway.
+
+   RDI and R10 are the loop registers because scan_word/copy_object preserve
+   them — the MV-extras loop above depends on the same property."
+  (when *x64-tls-window*
+    (let ((db-loop (make-label))
+          (db-done (make-label)))
+      (emit-tls-base buf 'rdi)                       ; rdi = this thread's base
+      (emit-cmp-reg-imm buf 'rdi 0)
+      (emit-jcc buf :e db-done)                      ; base 0 = main thread
+      (emit-mov-reg-mem buf 'r10 'rdi #x10000C58)    ; r10 = tagged depth
+      (emit-shr-reg-imm buf 'r10 1)                  ; untag
+      (emit-cmp-reg-imm buf 'r10 0)
+      (emit-jcc buf :le db-done)
+      (emit-add-reg-imm buf 'rdi #x10000C68)         ; rdi = &entry0.value
+      (emit-label buf db-loop)
+      (emit-mov-reg-reg buf 'rax 'rdi)               ; rax = slot addr
+      (emit-call buf scan-word-label)
+      (emit-add-reg-imm buf 'rdi 16)                 ; next entry
+      (emit-sub-reg-imm buf 'r10 1)
+      (emit-cmp-reg-imm buf 'r10 0)
+      (emit-jcc buf :g db-loop)
+      (emit-label buf db-done))))
+
 (defvar *x64-fault-dump*
   ;; NOTE the shape: `(and #+sbcl (getenv ...) t)' would read as `(and t)' — i.e.
   ;; ON — on any host that is not SBCL, because the reader DELETES the guarded
@@ -5513,7 +5559,9 @@
       (emit-cmp-reg-imm buf 'r10 0)
       (emit-jcc buf :g mv-loop)
       (emit-label buf mv-done))
-    (emit-gc-dbg-char buf #x72)          ; 'r' — roots scan done (globals+kw+pkg+mv)
+    ;; THIS THREAD'S DYNAMIC BINDINGS — the other per-thread root set.
+    (emit-dynbind-root-scan buf scan-word-label)
+    (emit-gc-dbg-char buf #x72)          ; 'r' — roots scan done (globals+kw+pkg+mv+dynbind)
 
     ;; ---- Cheney scan loop ----
     ;; R10 = scan pointer (starts at to_start).  RAX is dead here (the MV loop
@@ -6415,6 +6463,8 @@
       (emit-cmp-reg-imm buf 'r10 0)
       (emit-jcc buf :g mv-loop)
       (emit-label buf mv-done))
+    ;; THIS THREAD'S DYNAMIC BINDINGS — see EMIT-DYNBIND-ROOT-SCAN.
+    (emit-dynbind-root-scan buf scan-word-label)
     (emit-gc-dbg-char buf #x72)          ; 'r' — precise roots done
 
     ;; ================= P2b: scan PINNED pages' objects (gray roots) =========

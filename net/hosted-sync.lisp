@@ -218,7 +218,21 @@
         (let* ((delta (- b #x10000000))
                (r (syscall3 158 #x1002 delta 0)))
           (if (zerop r)
-              (progn (%tls-set-self-base delta) 0)
+              (progn
+                ;; EMPTY THIS THREAD'S DYNAMIC-BINDING STACK BEFORE ARMING IT.
+                ;; The block is reused when a thread slot is reused, and a
+                ;; thread that died with bindings live would otherwise hand
+                ;; its successor a non-zero depth pointing at entries full of
+                ;; the previous occupant's collected objects — which the
+                ;; collector would then scan as roots.  Written through the
+                ;; ABSOLUTE block address (B), not a window offset, and
+                ;; BEFORE the self slot is set, so no path can observe the
+                ;; thread as armed with a stale stack.  See PER-THREAD
+                ;; DYNAMIC BINDINGS in mvm/prelude.lisp for the layout.
+                (setf (mem-ref (+ b #xC50) :u64) 0)   ; next-free entry
+                (setf (mem-ref (+ b #xC58) :u64) 0)   ; depth
+                (%tls-set-self-base delta)
+                0)
               r)))))
 
 (defun %tls-installed-p ()

@@ -55,7 +55,7 @@ build_gate () { # worktree-dir -> builds tmp/ansi-gate-bin inside it
   local dir="$1"
   ( cd "$dir" && mkdir -p tmp && \
     MODUS_ANSI_OUT="$dir/tmp/ansi-gate-bin" \
-    sbcl --dynamic-space-size 2048 --script mvm/build-x64-linux.lisp \
+    sbcl --dynamic-space-size 8192 --script mvm/build-x64-linux.lisp \
     > "$dir/tmp/gate-build.log" 2>&1 )
 }
 

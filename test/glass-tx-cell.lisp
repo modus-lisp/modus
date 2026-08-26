@@ -120,59 +120,91 @@
 ;;;; WHAT IS NOT: which allocation writes it, or why.
 ;;;;
 ;;;; ============================================================
-;;;; DEAD HYPOTHESIS: THE %RT-ENTER/%RT-LEAVE SEAM.  THE GATE READS ZERO.
+;;;; DEAD HYPOTHESIS: "THE SEAM IS INERT — THE GATE READS ZERO".  THE GATE
+;;;; WAS ARMED THE WHOLE TIME AND THE ZERO WAS THIS FILE'S OWN INSTRUMENT.
 ;;;; ============================================================
 ;;;;
-;;;; The natural next theory — and a good one, because it is the shape that was
-;;;; really there in region 0 last round — is that the worker's OWN allocation
-;;;; frontier is parked and reloaded across the runtime-table seam, and comes
-;;;; back STALE: worker allocates the counter, keeps allocating in registers,
-;;;; TX+ reads *TX* through SYMBOL-VALUE which parks the frontier and hops, and
-;;;; %RT-LEAVE restores a value older than the registers had reached, so the
-;;;; next allocation is issued over the counter.  Two copies of one frontier,
-;;;; one level down.
+;;;; A previous version of CHK printed the threads-live gate and the per-CPU
+;;;; mode word at every grade point, as inline (MEM-REF <literal> :U32), and
+;;;; they read ZERO on the worker in every run — which was written up as
+;;;; "%RT-ENTER is a load and a branch, the runtime-table lock never engages,
+;;;; B-lite's arena is never carved, the seam cannot be what corrupts the
+;;;; counter because it is not even executed."
 ;;;;
-;;;; IT NEVER RUNS.  %RT-ENTER is
-;;;;     (if (= (mem-ref #x10000DB8 :u32) 0) 0 (%rt-enter-locked))
-;;;; and #x10000DB8 is the threads-live gate, a BSS word that ONLY
-;;;; %RT-THREADS-ON writes.  SB-THREAD:MAKE-THREAD does not call it; nothing in
-;;;; glass calls it; nothing in this file calls it.  CHK prints the gate at
-;;;; every grade point, on the worker, and in the failing arm it reads:
+;;;; ***ALL OF THAT WAS A READ ARTIFACT.***  An inline MEM-REF of a literal
+;;;; address, in a TOPLEVEL FORM that also contains a call to a function
+;;;; defined by net/sb-thread-shim.lisp, reads the value the address held
+;;;; BEFORE the form began — and the worker's whole lambda lives inside such a
+;;;; form, because SB-THREAD:MAKE-THREAD is in it.  Measured deterministically,
+;;;; JIT on and off; full isolation in test/hosted-bringup-bare.lisp and probe
+;;;; F of test/hosted-bringup-gate.lisp.
 ;;;;
-;;;;     a[gate=0]=CONS/0  b[gate=0]=CONS/4  c[gate=0]=CONS/NOTINT:CHARACTER
+;;;; Read through the compiled accessors instead and the same run says
+;;;; gate=1 mode=1 on the worker at every grade point, with the lock's own
+;;;; acquisition counter (#x10000DE0) climbing past 700,000 during the send.
+;;;; The seam is FULLY ARMED in glass's process and always was.  So:
 ;;;;
-;;;; Zero where the counter is still intact and zero where it is already
-;;;; wrecked.  With the gate zero %RT-ENTER and %RT-LEAVE are a 32-bit load and
-;;;; a branch: NO mutex, NO region hop, NO parked frontier, NOTHING to rewind.
-;;;; The seam is not merely innocent here, it is not executed, so no
-;;;; instrumentation of it can say anything.  Turning the gate ON would be a
-;;;; different experiment about a different program.
+;;;;   * "the lock is inert here" is FALSE — do not re-derive it;
+;;;;   * "B-lite's arena was never carved in the glass runs, which is why the
+;;;;     wall measured byte-identical before and after B-lite" is FALSE too,
+;;;;     and that candidate explanation is withdrawn;
+;;;;   * arming the seam does NOT stop the overwrite — the overwrite happens
+;;;;     with the seam armed, which is the state it was always measured in.
+;;;;     The writer is still unfound, and the seam is still not implicated,
+;;;;     but now for the honest reason (it runs and the counter dies anyway)
+;;;;     rather than the false one (it never runs).
 ;;;;
-;;;; KEEP THE GATE PRINT.  It costs one number per grade point and it is what
-;;;; stops this hypothesis being re-derived a fourth time.
+;;;; THE GATE COLUMNS ARE GONE FROM CHK, and deliberately not replaced with
+;;;; honest ones: see the layout warning below.  The seam's state on a worker
+;;;; is established where it can be measured without disturbing this fixture —
+;;;; probe A of test/hosted-bringup-gate.lisp has the worker itself report
+;;;; gate=1 mode=1, and test/hosted-bringup-bare.lisp asserts the lock
+;;;; ENGAGING via the acquisition counter rather than via any word read.
 ;;;;
-;;;; IT ALSO CORRECTS A CLAIM THIS CAMPAIGN HAS BEEN REPEATING.
-;;;; test/glass-send-worker.lisp's header says a special read "compiles to
-;;;; SYMBOL-VALUE, which takes the runtime-table lock and hops the active GC
-;;;; region to region 0".  That is true only with the gate on, and the gate is
-;;;; off in every run either test has ever made.  SYMBOL-VALUE here is a
-;;;; GETHASH on the globals table and nothing else.
+;;;; ============================================================
+;;;; ***THE INSTRUMENT MOVES THE BUG.  THIS IS THE FOURTH DEMONSTRATION.***
+;;;; ============================================================
 ;;;;
-;;;; AND IT NARROWS THE SUBJECT.  TX+ is `(when *tx* (incf (car *tx*)))', so
-;;;; EVERY arm — including the clean ones — performs the SYMBOL-VALUE read once
-;;;; per byte.  The reads are common to all arms and the clean arms are clean.
-;;;; What only the corrupted arms do is WRITE: a cons exists and is RPLACA'd
-;;;; ~32800 times while the worker allocates.
+;;;; Changing CHK from two inline MEM-REFs to two compiled accessor calls plus
+;;;; one %RT-ACQUISITIONS read — a change that reads MORE honestly and does
+;;;; strictly less lying — made the `both' arm deliver all 49180 bytes and
+;;;; grade CLEAN.  It looked exactly like a fix.  It is not:
 ;;;;
-;;;; ---- and one measurement that answered nothing, reported anyway ----
-;;;; CANARY conses a 3-element list immediately before the counter and checks
-;;;; it at the end.  It is INCONCLUSIVE: the canary is intact 3 of 3 — but so
-;;;; is the counter, 0 of 3 overwritten, where the same arm without the canary
-;;;; is corrupted.  ONE EXTRA THREE-CONS ALLOCATION MOVES THE BUG AWAY.  That
-;;;; is the third independent demonstration of layout sensitivity in this file
-;;;; (the others: opening BODY up, and the non-monotone FBW table), and it is
-;;;; the standing warning for anyone instrumenting this — the probe changes the
-;;;; thing it measures, so a clean run under a new probe is not evidence.
+;;;;   instrument                          binary      result
+;;;;   inline MEM-REF gate columns         pre-guard   32785, NOTINT:CHARACTER
+;;;;   inline MEM-REF gate columns         post-guard  32785, NOTINT:CHARACTER
+;;;;   accessor calls + acquisitions       pre-guard   49180, graded "clean"
+;;;;   accessor calls + acquisitions       post-guard  49180, graded "clean"
+;;;;
+;;;; The BINARY does not matter.  The INSTRUMENT decides.  Same lesson as the
+;;;; CANARY (a three-cons allocation made a reliably-corrupted arm clean), as
+;;;; opening BODY up, and as the non-monotone FBW table.  ***A CLEAN RUN UNDER
+;;;; A NEW PROBE IS NOT EVIDENCE OF A FIX.  Change the probe and re-run the
+;;;; OLD probe before believing anything.***
+;;;;
+;;;; ============================================================
+;;;; ***AND `integerp' IS NOT ENOUGH EITHER — THE COUNTER GOES BACKWARDS.***
+;;;; ============================================================
+;;;;
+;;;; The grade below reports NOTINT: when the CAR stops being an integer, and
+;;;; the runner greps for that.  A garbage FIXNUM passes it silently.  Under
+;;;; the accessor instrument above, the "clean" run reads:
+;;;;
+;;;;     a=CONS/0  b=CONS/4  c=CONS/32852  d=CONS/16459  e=CONS/16459
+;;;;
+;;;; d is LESS THAN c.  *TX* counts one per byte written, so it cannot
+;;;; decrease; and the C value moves with the instrument too (32852 with the
+;;;; accessors, 32837 without the gate columns, against a 4 + 12 + 32768 =
+;;;; 32784 that neither matches).  So the counter is corrupted in the
+;;;; "clean" arm as well — the overwrite merely landed on a value that
+;;;; happens to be an integer.
+;;;;
+;;;; ***THE GRADE THAT WOULD NOT HAVE BEEN FOOLED IS MONOTONICITY PLUS A
+;;;; FINAL VALUE***, and it is the next thing to add here: a=0, b=4, and
+;;;; a=<b<=c<=d=e=49180 exactly.  It is not added in this round because
+;;;; changing CHK is precisely what moves the bug, and the currently shipped
+;;;; shape is the one that still REPRODUCES.  Whoever adds it must re-run the
+;;;; old shape alongside and report both.
 ;;;;
 ;;;; ============================================================
 ;;;; WHAT WOULD MAKE THIS A LIE
@@ -205,11 +237,11 @@
   (sys-exit 2))
 
 (format t "~&main: PRE-LOAD gate=~s mode=~s flag=~s~%"
-        (mem-ref #x10000DB8 :u32) (mem-ref #x10000FF8 :u32) *sb-threads-up*)
+        (%rt-threads-live-p) (%ha-percpu-mode) *sb-threads-up*)
 (finish-output)
 (dolist (entry *glass-files*) (load (first entry)))
 (format t "~&main: POST-LOAD gate=~s mode=~s flag=~s~%"
-        (mem-ref #x10000DB8 :u32) (mem-ref #x10000FF8 :u32) *sb-threads-up*)
+        (%rt-threads-live-p) (%ha-percpu-mode) *sb-threads-up*)
 (format t "~&=== loaded ===~%")
 (force-output)
 
@@ -257,11 +289,6 @@
 ;;; moment under test, and the point is to disturb it as little as a print can.
 (defun chk (tag)
   (write-string-serial tag)
-  (write-string-serial "[gate=")
-  (write-string-serial (princ-to-string (mem-ref #x10000DB8 :u32)))
-  (write-string-serial "/mode=")
-  (write-string-serial (princ-to-string (mem-ref #x10000FF8 :u32)))
-  (write-string-serial "]")
   (if (null glass::*tx*)
       ;; The arms that never install a counter (plain / lock / bothnil /
       ;; othersp) legitimately read NIL.  That is OFF, not BROKEN — the runner
@@ -376,7 +403,7 @@
     ;; reported as the longjmp line, losing its identity; with one, the arm
     ;; reports what actually signalled.
     (format t "~&main: PRE-THREAD gate=~s mode=~s flag=~s~%"
-            (mem-ref #x10000DB8 :u32) (mem-ref #x10000FF8 :u32) *sb-threads-up*)
+            (%rt-threads-live-p) (%ha-percpu-mode) *sb-threads-up*)
     (finish-output)
     (let ((th (sb-thread:make-thread
                (lambda ()

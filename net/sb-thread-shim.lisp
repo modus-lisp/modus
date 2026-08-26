@@ -93,10 +93,35 @@
 (defvar *sb-threads-up* nil
   "T once the process has been switched to the multithreaded configuration.")
 
+;;; GATE ON THE WORDS, NOT ON THE CALLS HAVING BEEN MADE.  The three steps
+;;; below each have a documented refusal path — %RT-THREADS-ON returns 0 when
+;;; the mode word is not set, and returns BEFORE it carves B-lite's arena and
+;;; BEFORE it opens the gate — and the first version of this function DISCARDED
+;;; every one of those return values and ended in an unconditional `t'.  A
+;;; process in which bringup had silently half-happened was then
+;;; indistinguishable from a healthy one, AND the flag was latched, so no later
+;;; call could ever retry.  An unsafe configuration that cannot be told from a
+;;; safe one is the thing that hides for four rounds, so this SIGNALS.
+;;;
+;;; ***READ THE WORDS THROUGH %HA-PERCPU-MODE AND %RT-THREADS-LIVE-P, NEVER AS
+;;; AN INLINE (MEM-REF #x10000FF8 :U32) HERE.***  This file is EVALUATED from a
+;;; baked source string, and an inline MEM-REF of a literal address, in a form
+;;; that also calls a function defined by that string, reads the value the word
+;;; held BEFORE the form began — measured, deterministically, and it is the
+;;; single instrument artifact that produced this campaign's "the gate is 0"
+;;; reports.  See the block at the top of test/hosted-bringup-bare.lisp.  The
+;;; two accessors are ordinary compiled functions in the image and are honest.
+
 (defun %sb-threads-up ()
   "Make the process safe for a second thread to run Lisp in.  Idempotent.
    Returns T, or NIL if the actor band could not be carved (in which case
-   MAKE-THREAD will refuse rather than hand back something broken)."
+   MAKE-THREAD will refuse rather than hand back something broken).
+
+   SIGNALS if the band carved but the seam did not actually arm, rather than
+   latching a partial success: with the per-CPU mode word clear every
+   %GC-SET-REGION writes one shared word, and with the threads-live gate clear
+   the runtime-table lock is INERT, so SYMBOL-VALUE, INTERN and the macro
+   tables run unsynchronised on every worker.  Both are silent corruption."
   (if *sb-threads-up*
       t
       (if (zerop (%ha-carve))
@@ -105,8 +130,20 @@
             (%ha-percpu-init-cpu (%ha-percpu-base) 0)
             (%ha-set-percpu-mode 1)
             (%rt-threads-on)
-            (setq *sb-threads-up* t)
-            t))))
+            (if (zerop (%ha-percpu-mode))
+                (error "sb-thread: modus could not bring this process up to ~
+                        multithreaded — the per-CPU active-region mode word ~
+                        (#x10000FF8) is still 0 after %HA-SET-PERCPU-MODE.  ~
+                        Every thread would share one active-region cell.")
+                (if (zerop (%rt-threads-live-p))
+                    (error "sb-thread: modus could not bring this process up ~
+                            to multithreaded — the per-CPU mode word is set ~
+                            but the threads-live gate (#x10000DB8) is still 0, ~
+                            so %RT-THREADS-ON refused.  The runtime-table lock ~
+                            would be inert and B-lite's arena uncarved.")
+                    (progn
+                      (setq *sb-threads-up* t)
+                      t)))))))
 
 ;;; ============================================================
 ;;; THREADS

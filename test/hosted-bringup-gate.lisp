@@ -1,118 +1,109 @@
-;;;; hosted-bringup-gate.lisp — %SB-THREADS-UP LATCHES SUCCESS AND CLEARS THE
-;;;; PER-CPU MODE WORD ON ITS WAY OUT.
+;;;; hosted-bringup-gate.lisp — %SB-THREADS-UP ARMS THE SEAM.  THE "IT DOESN'T"
+;;;; REPORTS WERE AN INLINE-MEM-REF READ ARTIFACT, AND SO WERE BOTH MECHANISMS
+;;;; BEFORE THEM.
 ;;;;
 ;;;;   ./modus --script test/hosted-bringup-gate.lisp
-;;;;
-;;;; Six probes, no threads spawned, no sockets, no glass.  Each prints its own
-;;;; numbers; the last two are the finding.
+;;;;   MODUS_BRINGUP_PROBE=A|B|C|D|E|F|G ./modus --script test/hosted-bringup-gate.lisp
 ;;;;
 ;;;; ============================================================
-;;;; WHY THIS EXISTS
-;;;; ============================================================
-;;;;
-;;;; test/glass-tx-cell.lisp prints the threads-live gate at every grade point
-;;;; and it reads ZERO on the worker.  With the gate zero, %RT-ENTER is a
-;;;; 32-bit load and a branch: the runtime-table lock never engages, every
-;;;; SYMBOL-VALUE / INTERN / macro-table access on a worker runs unsynchronised,
-;;;; and — because %RT-ARENA-CARVE is called INSIDE %RT-THREADS-ON, past its
-;;;; early return — B-lite's arena is never carved either.
-;;;;
-;;;; That last one matters beyond this file: the glass wall was measured
-;;;; BYTE-IDENTICAL before and after B-lite and treated as evidence that the
-;;;; fix had missed it.  A likelier reading is that the fix was never switched
-;;;; on in that process.  (NOT yet demonstrated — see WHAT IS NOT SHOWN.)
-;;;;
-;;;; ============================================================
-;;;; WHAT IS MEASURED — AND ONE PROBE PER PROCESS, OR IT MEASURES NOTHING
+;;;; ONE PROBE PER PROCESS, OR IT MEASURES NOTHING
 ;;;; ============================================================
 ;;;;
 ;;;; ***THE FIRST VERSION OF THIS FILE RAN PROBE A FIRST, UNCONDITIONALLY.***
-;;;; Probe A spawns a thread, spawning a thread ARMS the gate, and B/C/D/E then
+;;;; Probe A spawns a thread, spawning a thread ARMS the seam, and B/C/D/E then
 ;;;; ran on an already-armed system and reported a healthy one.  Every number in
 ;;;; the first draft of this header was that artifact.  A is gated now; run
 ;;;; exactly one probe per process or read nothing.
 ;;;;
-;;;; A  MODUS_BRINGUP_PROBE=A — a bare MAKE-THREAD ARMS the gate: the worker
-;;;;    reads gate=1 mode=1.  So "MAKE-THREAD does not arm the gate" is NOT true
-;;;;    as a blanket statement.
-;;;;
-;;;; B  MODUS_BRINGUP_PROBE=B — %SB-THREADS-UP alone, IN THIS FILE'S SHAPE:
-;;;;    pre gate=0 mode=0 flag=NIL -> post ret=T gate=1 mode=1 flag=T.  It ARMS.
-;;;;
-;;;; F  test/hosted-bringup-bare.lisp — THE SAME CALL, IN A BARE SCRIPT
-;;;;    (two FORMATs and a LET, no DEFUNs, no COND): pre gate=0 mode=0 flag=NIL
-;;;;    -> post **ret=T gate=0 mode=0 flag=T**, 4 of 4, with and without a large
-;;;;    DEFVAR prepended.
-;;;;
-;;;; ***B AND F ARE THE SAME CALL AND DISAGREE.***  That is the finding, and it
-;;;; is the campaign's layout-sensitivity again rather than a mechanism:
-;;;; %SB-THREADS-UP arms the seam in some script shapes and, in others, RETURNS
-;;;; T AND LATCHES *SB-THREADS-UP* WITHOUT ARMING ANYTHING.  Once latched, every
-;;;; later call short-circuits on the flag, so the seam can never come up in
-;;;; that process.  The latch is unconditional:
-;;;;
-;;;;      (progn (%ha-percpu-init-cpu (%ha-percpu-base) 0)
-;;;;             (%ha-set-percpu-mode 1)
-;;;;             (%rt-threads-on)          ; <- return value DISCARDED
-;;;;             (setq *sb-threads-up* t)
-;;;;             t)                        ; <- unconditional T
-;;;;
-;;;;    so an unarmed bringup is indistinguishable from an armed one to every
-;;;;    caller.  THAT is the defect this file establishes, whatever turns out to
-;;;;    decide which way a given shape falls.
-;;;;
-;;;; C  MODUS_BRINGUP_PROBE=C — the four steps of the body, at toplevel: carve
-;;;;    non-zero, percpu-init 0, set-mode -> mode=1, rt-threads-on -> 1.  (Its
-;;;;    gate readback prints 0 because it is read in the SAME FORMAT call that
-;;;;    invokes %RT-THREADS-ON; read it in a separate form and it is 1.  Another
-;;;;    instrument artifact — do not read C's gate column.)
-;;;;
-;;;; D  MODUS_BRINGUP_PROBE=D — set mode to 1 BY HAND, then call it.
-;;;;    ***A PREVIOUS ROUND REPORTED "mode=1 in, mode=0 out — %SB-THREADS-UP
-;;;;    CLEARS THE MODE WORD".  THAT DOES NOT REPRODUCE.***  One probe per
-;;;;    process it reads mode=1 gate=1: mode survives.  The clearing was a
-;;;;    property of that harness, not of the tree.  D prints its own verdict
-;;;;    line; believe the line, not this paragraph.
-;;;;
-;;;; E  MODUS_BRINGUP_PROBE=E — %HA-PERCPU-INIT-CPU with mode pre-set: mode
-;;;;    survives it.  So percpu-init is NOT a clearing call.
-;;;;
 ;;;; ============================================================
-;;;; WHY IT MATTERS, AND WHAT IS NOT SHOWN
+;;;; THE THREE DEAD MECHANISMS.  DO NOT RE-DERIVE THEM.
 ;;;; ============================================================
 ;;;;
-;;;; test/glass-tx-cell.lisp prints the gate at every grade point and it reads
-;;;; ZERO on the worker — glass's process is in the non-arming shape.  With the
-;;;; gate zero, %RT-ENTER is a 32-bit load and a branch: the runtime-table lock
-;;;; never engages, every SYMBOL-VALUE / INTERN / macro-table access on a worker
-;;;; runs unsynchronised, and — because %RT-ARENA-CARVE is called INSIDE
-;;;; %RT-THREADS-ON, past its early return — B-lite's arena is never carved.
+;;;; 1. "MAKE-THREAD never arms the gate" — FALSE.  Probe A: the worker reads
+;;;;    gate=1 mode=1.
 ;;;;
-;;;; That last one is a candidate explanation for the glass wall having measured
-;;;; BYTE-IDENTICAL before and after B-lite: not that the fix missed it, but
-;;;; that the fix was never switched on there.  ***CANDIDATE, NOT SHOWN.***
+;;;; 2. "%SB-THREADS-UP clears the mode word (1 in, 0 out)" — an artifact of a
+;;;;    probe file that spawned a thread first and armed everything after it.
+;;;;    Probe D reproduces nothing; %HA-PERCPU-INIT-CPU is exonerated by E.
 ;;;;
-;;;;   NOT SHOWN: what decides which shape arms.  Both B and F are two FORMATs
-;;;;   and a LET around one call; the differences are DEFUNs and a COND.
+;;;; 3. "%SB-THREADS-UP latches success WITHOUT arming, in some script shapes"
+;;;;    — ALSO FALSE, and this was the one that survived longest.  It arms.
+;;;;    Every "gate=0 mode=0 after a successful bringup" reading in this
+;;;;    campaign — this file's old probe F, test/hosted-bringup-bare.lisp, and
+;;;;    test/glass-tx-cell.lisp's per-grade-point `[gate=0/mode=0]' on the
+;;;;    worker — came from ONE defect in the INSTRUMENT:
 ;;;;
-;;;;   NOT SHOWN: whether arming the gate changes the tx-cell overwrite at all.
-;;;;   Untested.  If the overwrite is independent of the lock it survives arming
-;;;;   and the writer is still unfound.
+;;;;      an inline (MEM-REF <literal address> :U32), in a TOPLEVEL FORM that
+;;;;      also contains a call to a function defined by
+;;;;      net/sb-thread-shim.lisp, reads the value that address held BEFORE the
+;;;;      form began.
 ;;;;
-;;;;   NOT SHOWN: whether this is the 327680-byte shim-audit regression, which
-;;;;   discriminated on "arena binaries".  If the arena never engaged there, the
-;;;;   discriminant was something else.  Suggestive, unmeasured.
+;;;;    It is not about arming and not about %SB-THREADS-UP.  Probe F below is
+;;;;    a form whose only shim call is `(sb-thread:threadp 5)' — which arms
+;;;;    nothing and does nothing — on an ALREADY-armed system, and its inline
+;;;;    reads still answer 0 in the same argument list in which the compiled
+;;;;    accessors answer 1.  That is why B and the old F "disagreed about the
+;;;;    same call": they differed in whether the READ sat in the same form as a
+;;;;    shim CALL, not in what the call did.  There was never a shape that
+;;;;    failed to arm, so there was never a shape question to answer.
 ;;;;
-;;;; WHAT TO DO ABOUT IT is not in this file: a bringup that cannot arm the seam
-;;;; should SIGNAL, and should not latch *SB-THREADS-UP* on a partial success.
-;;;; That is a source change to net/sb-thread-shim.lisp and a rebuild, and it
-;;;; was not attempted here.
+;;;; ***GRADE THIS SEAM WITH %RT-THREADS-LIVE-P AND %HA-PERCPU-MODE*** — ordinary
+;;;; compiled functions in the image, honest everywhere — or better, with the
+;;;; FUNCTIONAL oracle: %RT-THREADS-ON zeroes the acquisition counter at
+;;;; #x10000DE0 and every locked section increments it, so 200 SYMBOL-VALUEs
+;;;; move it by thousands after bringup and not at all before.  That observes
+;;;; the lock ENGAGING without reading the gate at all.  It is what
+;;;; test/hosted-bringup-bare.lisp now asserts (16 checks), and it is the
+;;;; measurement that killed mechanism 3.
+;;;;
+;;;; ============================================================
+;;;; THE PROBES
+;;;; ============================================================
+;;;;
+;;;; A  a bare MAKE-THREAD arms the seam: worker reads gate=1 mode=1.
+;;;; B  %SB-THREADS-UP alone: pre 0/0/NIL -> post ret=T gate=1 mode=1 flag=T.
+;;;; C  the four steps of the body, at toplevel.  (Its gate column is read in
+;;;;    the same FORMAT that invokes %RT-THREADS-ON — see probe F for why that
+;;;;    is not a fact about the gate.)
+;;;; D  mode set to 1 BY HAND, then the call: mode survives.  Mechanism 2 dead.
+;;;; E  %HA-PERCPU-INIT-CPU with mode pre-set: mode survives.  Not a clearer.
+;;;; F  ***THE ARTIFACT ITSELF***, on an already-armed system: one argument
+;;;;    list, compiled-accessor reads against inline MEM-REF reads, plus the
+;;;;    same inline reads from a form with no shim call in it for contrast.
+;;;; G  ***THE NEGATIVE CONTROL FOR THE BRINGUP GUARD.***  %RT-THREADS-ON is
+;;;;    redefined to a no-op, so the seam CANNOT arm, and %SB-THREADS-UP is
+;;;;    then required to SIGNAL and to leave *SB-THREADS-UP* NIL.  On a binary
+;;;;    built before that guard it returns T and latches instead — measured
+;;;;    both ways, which is what makes G worth having.
+;;;;
+;;;; ============================================================
+;;;; WHAT IS STILL NOT SHOWN
+;;;; ============================================================
+;;;;
+;;;;   The tx-cell overwrite is NOT explained by an inert lock, because the
+;;;;   lock was never inert.  Whether arming changes the overwrite is a
+;;;;   question this file cannot answer; test/run-glass-tx-cell.sh can, and its
+;;;;   grade points now read the seam honestly.
+;;;;
+;;;;   The underlying evaluator defect — why an inline MEM-REF of a literal
+;;;;   address goes stale in a form containing a shim call — is CHARACTERISED
+;;;;   here but NOT fixed and NOT root-caused.  It is a reason to distrust that
+;;;;   idiom everywhere, not just here.
 ;;;;
 ;;;; NOTHING HERE LISTENS, CONNECTS, OR LEAVES A THREAD RUNNING: probe A joins
 ;;;; its one thread; the rest is memory reads.
 
+;;; READ THE SEAM THROUGH THESE, NOT INLINE.  Both bodies are the same inline
+;;; MEM-REF the probes must not write in place — inside an ordinary compiled
+;;; DEFUN the read is honest, which is exactly the contrast probe F prints.
 (defun bg-gate () (mem-ref #x10000DB8 :u32))
 (defun bg-mode () (mem-ref #x10000FF8 :u32))
+
+;;; PROBE G's NEUTERING MUST HAPPEN AT TOPLEVEL, BEFORE THE PROBE FORM, and it
+;;; must not be evaluated for any other probe — redefining %RT-THREADS-ON is
+;;; precisely the thing that makes bringup fail, so it is gated hard.
+(when (let ((w (%cli-getenv "MODUS_BRINGUP_PROBE"))) (and w (string= w "G")))
+  (eval '(defun %rt-threads-on () 0)))
 
 (format t "~&=== hosted-bringup-gate ===~%")
 (format t "~&start: gate=~s mode=~s flag=~s~%" (bg-gate) (bg-mode) *sb-threads-up*)
@@ -181,6 +172,44 @@
      (format t "~&E VERDICT: the clearing call is ~a~%"
              (if (zerop (bg-mode)) "STILL UNIDENTIFIED — mode is 0 at the end"
                  "not on this path — mode survived to the end")))
+
+    ;; ---- F: THE READ ARTIFACT ITSELF --------------------------------------
+    ;; Arm the seam FIRST, in its own toplevel form, so nothing below is about
+    ;; arming.  Then read the two words twice: through the compiled accessors
+    ;; and as inline MEM-REFs, in ONE argument list, from a form whose only
+    ;; shim call is THREADP — which arms nothing and does nothing.
+    ((and which (string= which "F"))
+     ;; NOTE: the whole (LET ((which …)) (COND …)) around this arm is ONE
+     ;; toplevel form and it contains shim calls, so every inline MEM-REF in it
+     ;; — including these — is in the affected position.  That is the point.
+     (%sb-threads-up)
+     (let ((ig (mem-ref #x10000DB8 :u32))
+           (im (mem-ref #x10000FF8 :u32))
+           (fg (bg-gate))
+           (fm (bg-mode))
+           (acq (%rt-acquisitions)))
+       (format t "~&F fn-gate=~s fn-mode=~s inline-gate=~s inline-mode=~s acquisitions=~s~%"
+               fg fm ig im acq)
+       (format t "~&F VERDICT: ~a~%"
+               (if (and (= fg 1) (zerop ig))
+                   "REPRODUCED — an inline MEM-REF in a shim-calling toplevel form reads STALE while the compiled accessor reads the truth"
+                   "did NOT reproduce in this shape; report that, do not assume it is fixed"))))
+
+    ;; ---- G: THE NEGATIVE CONTROL FOR THE BRINGUP GUARD --------------------
+    ;; %RT-THREADS-ON is neutered, so the seam CANNOT arm.  %SB-THREADS-UP is
+    ;; required to SIGNAL and to leave the flag NIL.  A binary built before the
+    ;; guard returns T and latches — that is the "before" half of the control,
+    ;; and it is why this probe reports which half it saw rather than just
+    ;; asserting.
+    ((and which (string= which "G"))
+     (let ((r (handler-case (list :returned (%sb-threads-up))
+                (error (e) (list :signalled (princ-to-string e))))))
+       (format t "~&G outcome=~s flag=~s gate=~s mode=~s~%"
+               (first r) *sb-threads-up* (bg-gate) (bg-mode))
+       (format t "~&G VERDICT: ~a~%"
+               (if (and (eq (first r) :signalled) (null *sb-threads-up*))
+                   "GUARDED — bringup that cannot arm SIGNALS and does not latch"
+                   "UNGUARDED — bringup latched a partial success (pre-guard binary)"))))
 
     (t (format t "~&(no probe selected)~%"))))
 

@@ -521,6 +521,12 @@
     ;; cons and one binds NIL: that is the whole experiment.
     ((string= mode "txfr")
      (fr-report "pre")
+     ;; ***BODY, NOT BODY-MONO.***  Measured: switching this arm to the
+     ;; recording grader moves the failure earlier — it dies at 32785 before
+     ;; FR-REPORT "post" is ever reached, and the FR measurement is lost.
+     ;; Sixth demonstration that the instrument moves this bug.  The FR count
+     ;; and the monotonicity grade CANNOT be taken in the same arm; `bothmono'
+     ;; grades, `txfr' counts pointers.
      (let ((glass::*tx* (list 0))) (body s fb) (fr-report "post")))
     ((string= mode "bothnilfr")
      (fr-report "pre")
@@ -635,9 +641,11 @@
       (format t "~&MONO readings=~s~%" (second g))
       (format t "~&MONO verdict=~s (expected final ~s)~%" (first g) *mono-expect*)
       (format t "~&MONO ~a~%"
+              (if (string= *mode* "bothnilfr")
+                  "N/A — this arm binds *TX* to NIL on purpose; it installs no counter, so there is nothing to grade. It is the FR control, not a delivery arm."
               (if (eq (first g) :ok)
                   "PASS — non-decreasing and exactly the expected final byte count"
-                  "FAIL — the counter is corrupted; `integerp' alone would have called this clean")))
+                  "FAIL — the counter is corrupted; `integerp' alone would have called this clean"))))
     nil)
 (finish-output)
 

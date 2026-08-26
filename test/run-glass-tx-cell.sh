@@ -119,6 +119,33 @@ for m in $MODES; do
     if grep -q 'NOTINT:\|=BROKEN' "$WORK/server.out"; then
       echo "  !! COUNTER OVERWRITTEN (a NOTINT:/BROKEN grade above)"
       CORRUPT=$((CORRUPT + 1))
+    # ***integerp IS NOT ENOUGH.***  A garbage FIXNUM passes the grep above, and
+    # a run reading a=0 b=4 c=32852 d=16459 e=16459 was reported CLEAN for three
+    # rounds -- d IS LESS THAN c on a counter that only ever increments.  *TX*
+    # counts one per byte, so across the grade points it must be NON-DECREASING
+    # and must END at exactly 49180 (4 + 12+32768 + 12+16384).  This grades the
+    # readings the trace ALREADY prints, so it adds nothing to the hot path and
+    # cannot move the bug.
+    elif ! grep -oE '[a-e]=CONS/[0-9]+' "$WORK/server.out" |
+         sed 's/.*CONS\///' |
+         awk -v want=49180 '
+             { v[n] = $1 + 0; n = n + 1 }
+             END {
+               if (n == 0) { exit 0 }
+               for (i = 1; i < n; i = i + 1) {
+                 if (v[i] < v[i-1]) {
+                   printf "  !! COUNTER WENT BACKWARDS: %d -> %d at grade point %d\n", v[i-1], v[i], i
+                   exit 1
+                 }
+               }
+               if (v[n-1] != want) {
+                 printf "  !! COUNTER ENDED AT %d, EXPECTED %d\n", v[n-1], want
+                 exit 1
+               }
+               exit 0
+             }'; then
+      echo "  !! COUNTER CORRUPTED (monotonicity/final-value grade; integerp alone would have passed this)"
+      CORRUPT=$((CORRUPT + 1))
     fi
     [ "$CRC" -eq 0 ] && [ "$SRC" -eq 0 ] && PASS=$((PASS + 1))
   done
@@ -128,7 +155,7 @@ for m in $MODES; do
 done
 
 if [ "$RC" -eq 0 ]; then
-  echo "PASS: every arm delivered — the overwrite has stopped reproducing."
+  echo "PASS: every arm delivered AND its counter was monotone and ended at 49180."
 else
   echo "FAIL: at least one arm did not — the overwrite, reproduced."
 fi

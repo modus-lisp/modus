@@ -204,7 +204,12 @@
   (finish-output)
   (sys-exit 2))
 
+(format t "~&main: PRE-LOAD gate=~s mode=~s flag=~s~%"
+        (mem-ref #x10000DB8 :u32) (mem-ref #x10000FF8 :u32) *sb-threads-up*)
+(finish-output)
 (dolist (entry *glass-files*) (load (first entry)))
+(format t "~&main: POST-LOAD gate=~s mode=~s flag=~s~%"
+        (mem-ref #x10000DB8 :u32) (mem-ref #x10000FF8 :u32) *sb-threads-up*)
 (format t "~&=== loaded ===~%")
 (force-output)
 
@@ -254,6 +259,8 @@
   (write-string-serial tag)
   (write-string-serial "[gate=")
   (write-string-serial (princ-to-string (mem-ref #x10000DB8 :u32)))
+  (write-string-serial "/mode=")
+  (write-string-serial (princ-to-string (mem-ref #x10000FF8 :u32)))
   (write-string-serial "]")
   (if (null glass::*tx*)
       ;; The arms that never install a counter (plain / lock / bothnil /
@@ -368,6 +375,9 @@
     ;; the TYPE-ERROR unwinds into the interpreter's empty handler list and is
     ;; reported as the longjmp line, losing its identity; with one, the arm
     ;; reports what actually signalled.
+    (format t "~&main: PRE-THREAD gate=~s mode=~s flag=~s~%"
+            (mem-ref #x10000DB8 :u32) (mem-ref #x10000FF8 :u32) *sb-threads-up*)
+    (finish-output)
     (let ((th (sb-thread:make-thread
                (lambda ()
                  (write-string-serial "worker: sending ")

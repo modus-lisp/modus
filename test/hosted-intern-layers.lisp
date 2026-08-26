@@ -114,13 +114,21 @@
 (defun il-count () (hash-table-count (mem-ref #x10000088 :u64)))
 
 (defun il-fwd (r0)
-  "region 0's LIVE span -> this worker's region.  The forbidden direction."
+  "region 0's LIVE span AND the lock arena -> this worker's region.  The
+   forbidden direction.  The arena is region-0 address space where every
+   locked-section allocation lands since B-LITE (net/hosted-sync.lisp); an
+   audit that skipped it would go green for the wrong reason the moment the
+   objects moved there.  %RT-ARENA-* answer 0 on a pre-arena binary, so this
+   degrades to the historic sweep."
   (let* ((k (%gc-meta-scale)) (rw (%gc-region))
          (wfrom (%gc-meta-read (+ rw #x00) k))
          (wsize (%gc-meta-read (+ rw #x10) k))
          (r0from (%gc-meta-read (+ r0 #x00) k))
-         (r0alloc (%gc-meta-read (+ r0 #x30) k)))
-    (%gc-count-foreign-refs r0from r0alloc wfrom wsize)))
+         (r0alloc (%gc-meta-read (+ r0 #x30) k))
+         (ab (%rt-arena-base))
+         (aa (%rt-arena-alloc)))
+    (+ (%gc-count-foreign-refs r0from r0alloc wfrom wsize)
+       (if (> aa ab) (%gc-count-foreign-refs ab aa wfrom wsize) 0))))
 
 (defun il-in-worker (w)
   "1 when machine word W points inside THIS worker's region, 0 otherwise."
@@ -147,9 +155,24 @@
                        ((string= arm "low") (il-body-low i))
                        (t                   (il-body-cl i))))
       (setq i (+ i 1)))
-    (list c0 (il-count) f0 (il-fwd r0)
-          (il-in-worker (%gc-word-of last (+ scr 512)))
-          (if last 1 0))))
+    ;; THE INTERPRETER'S MV HAND-OFF GLOBAL IS MEASURED, REPORTED AND CLEARED
+    ;; BEFORE THE AUDIT, and the order of those three verbs is the honesty.
+    ;; *MVM-LAST-MV* transiently holds the most recent multi-valued return's
+    ;; (count . secondaries) cons — allocated by WHOEVER RAN, so on this
+    ;; worker it is a worker-region cons published in a region-0-reachable
+    ;; global: one forbidden reference, constant in K, from a 2-VALUED CALL
+    ;; (INTERN returns two values; the `str' and `low' bodies make none,
+    ;; which is why only `cl' ever saw it).  Verified exactly: clearing this
+    ;; ONE word takes the audit 1 -> 0.  It is a DIFFERENT defect from the
+    ;; intern path — the per-thread-window campaign explicitly deferred the
+    ;; interpreter's simulated state — so it is counted on its own line and
+    ;; removed, and the audit below then measures INTERNING and nothing else.
+    (let ((mvheld (il-in-worker (%gc-word-of *mvm-last-mv* (+ scr 512)))))
+      (setq *mvm-last-mv* nil)
+      (list c0 (il-count) f0 (il-fwd r0)
+            (il-in-worker (%gc-word-of last (+ scr 512)))
+            (if last 1 0)
+            mvheld))))
 
 (defvar *fail* 0)
 (defvar *checks* 0)
@@ -178,6 +201,8 @@
 (format t "~&the LAST object made is in the worker's own region: ~d~%" *inw*)
 
 (chk "the loop really ran" (nth 5 *res*) 1)
+(format t "~&interp MV hand-off word held a worker cons before the audit: ~d~%"
+        (nth 6 *res*))
 
 ;; The odometer.  `str' interns nothing; the two intern arms must each have
 ;; created exactly K fresh entries, or a zero below means "nothing happened".

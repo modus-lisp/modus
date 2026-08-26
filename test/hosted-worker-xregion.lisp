@@ -103,7 +103,16 @@
            (aobj (%gc-word-of obj scratch))
            (aname (%gc-word-of (if intern-p (symbol-name obj) obj) scratch))
            (r0alloc (%gc-meta-read (+ r0 #x30) kk))
-           (foreign (%gc-count-foreign-refs r0from r0alloc wfrom wsize)))
+           ;; The lock arena is region-0 address space and is where every
+           ;; locked-section allocation lands since B-LITE — sweep it too, or
+           ;; a green here means only "the audit stopped looking".  %RT-ARENA-*
+           ;; answer 0 on a pre-arena binary (historic sweep, unchanged).
+           (ab (%rt-arena-base))
+           (aa (%rt-arena-alloc))
+           (foreign (+ (%gc-count-foreign-refs r0from r0alloc wfrom wsize)
+                       (if (> aa ab)
+                           (%gc-count-foreign-refs ab aa wfrom wsize)
+                           0))))
       (list rw wfrom wto wsize r0from r0size aobj aname foreign
             (%gc-meta-read (+ rw #x20) kk)))))
 

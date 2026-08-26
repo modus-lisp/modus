@@ -1195,6 +1195,151 @@
 (defun %rt-depth-addr () #x10000DD0)
 (defun %rt-saved-addr () #x10000DD8)
 
+;;; ============================================================
+;;; B-LITE: PER-CPU ALLOCATION SLICES FOR LOCKED SECTIONS
+;;; ============================================================
+;;;
+;;; THE DEFECT THIS REMOVES, measured before it was designed
+;;; (test/run-region0-frontier.sh): region 0 had TWO mutators and ONE frontier
+;;; stored in TWO places.  Main allocates region 0 from its REGISTERS, outside
+;;; the lock, because region 0 is its heap; a locked worker allocated region 0
+;;; from the PARKED field (+0x30), which does not track main's registers
+;;; between hops; and main's next hop parked its register value back OVER the
+;;; worker's advance.  A worker's region-0 cons came back overwritten in 5 of
+;;; 17 runs while the same worker's own-region cons survived 17 of 17.
+;;;
+;;; THE FIX: a locked section no longer touches region 0's frontier AT ALL.
+;;; %RT-THREADS-ON carves an ARENA off the top of region 0's semispace —
+;;; address space main can never reach, because the carve shrinks region 0's
+;;; SIZE and main's allocation limit in the same breath (%GC-REGION-SHRINK,
+;;; the same gesture %HA-CARVE has always made) — and each CPU gets a SLICE of
+;;; it: a 64-byte block whose +0x30/+0x38 the existing %GC-REGION-ENTER parks
+;;; and loads exactly as it would a region's.  Disjoint ranges, no
+;;; coordination: main's registers and every worker's slice advance without
+;;; ever reading each other.  Region 0's parked field is once again written
+;;; only by its owner's own enter/leave pairs.
+;;;
+;;; WHY THE OBJECTS ARE STILL "IN REGION 0" WHERE IT MATTERS: the arena is
+;;; region-0 ADDRESS SPACE, so a region-0 table entry pointing at a slice
+;;; object is not a cross-region reference and dangles under nobody's
+;;; collection — which is the property the whole lock discipline exists to
+;;; buy.  (Shape A died at its gate for lacking exactly this; see CLAUDE.md.)
+;;;
+;;; WHAT HAPPENS WHEN REGION 0 COLLECTS — the question that killed the
+;;; alternative designs, answered by READ MECHANICS rather than hope: the
+;;; trampoline loads from_start/to_start/space_size FROM THE REGION BLOCK AT
+;;; COLLECTION TIME (translate-x64.lisp, emit-gc-trampoline entry), so after
+;;; the shrink the arena is above the from-space membership test and outside
+;;; the copy destination of EVERY future collection, whichever semispace holds
+;;; it.  Arena objects are never evacuated and never overwritten: the arena is
+;;; IMMORTAL.  No re-carve hook, no epoch, no stale slice after a flip —
+;;; there is nothing to go stale.  The cost of immortality is that arena
+;;; garbage is never reclaimed; at the measured 128 bytes per fresh locked
+;;; intern (percall, K=20, the only shape that survives measuring on the
+;;; pre-fix tree) the 32 MB arena affords ~260 000 fresh interns per process,
+;;; two orders of magnitude above a full glass load.
+;;;
+;;; DEFAULT-OFF, BYTE FOR BYTE: the slice path exists only behind the
+;;; threads-live gate, which only %RT-THREADS-ON sets, and only when the carve
+;;; produced an arena (big heaps; small ones keep today's path).  An image or
+;;; a run that never brings up actors never executes one instruction of this.
+;;;
+;;; RESIDUAL, STATED PLAINLY (pre-existing, narrowed but NOT closed): main can
+;;; still collect region 0 naturally while a worker is inside the lock.  The
+;;; worker's frontier and its fresh objects now survive that (they are in the
+;;; immortal arena), which is strictly better than before — but a worker READING
+;;; a region-0 structure mid-evacuation still races the collector, exactly as
+;;; it always has.
+;;;
+;;; SLICE EXHAUSTION: an outermost %RT-ENTER refills this CPU's slice from the
+;;; arena whenever headroom is below 64 KB, so a single locked section has at
+;;; least that; a section allocating MORE than 64 KB in one hold would run the
+;;; slice into its limit and the gc-check would collect THE SLICE BLOCK, which
+;;; is meaningless — that is this design's one landmine, sized 64 KB against
+;;; locked sections that measure in hundreds of bytes.  An EXHAUSTED ARENA
+;;; falls back to today's region-0 path and COUNTS the fall (the word after
+;;; the arena triple), so the collision can come back only visibly.
+;;;
+;;; WORDS (band, after the 16 thread-region-report slots at +0xB000):
+;;;   +0xB800  16 x 64-byte per-CPU slice blocks (RCB layout; +0x30/+0x38 live)
+;;;   +0xBC00  arena base   +0xBC08 arena frontier   +0xBC10 arena end
+;;;   +0xBC18  fallback count (arena exhausted -> old path, counted)
+
+(defun %rt-slice-base ()   (+ (%ha-base) #xB800))
+(defun %rt-slice-block (cpu) (+ (%rt-slice-base) (* cpu #x40)))
+(defun %rt-arena-words ()  (+ (%ha-base) #xBC00))
+(defun %rt-arena-base ()
+  (if (zerop (%ha-base)) 0 (%gc-read64 (%rt-arena-words))))
+(defun %rt-arena-alloc ()
+  (if (zerop (%ha-base)) 0 (%gc-read64 (+ (%rt-arena-words) #x08))))
+(defun %rt-arena-end ()
+  (if (zerop (%ha-base)) 0 (%gc-read64 (+ (%rt-arena-words) #x10))))
+(defun %rt-arena-fallbacks ()
+  (if (zerop (%ha-base)) 0 (%gc-read64 (+ (%rt-arena-words) #x18))))
+
+(defun %rt-slice-ensure ()
+  "This CPU's slice block with at least 64 KB of headroom, refilled from the
+   arena if not — the caller holds the runtime mutex, which is what makes the
+   arena frontier single-writer.  0 when there is no arena or it is exhausted
+   (counted), in which case the caller uses the pre-B-lite path."
+  (let ((ae (%rt-arena-end)))
+    (if (zerop ae)
+        0
+        (let* ((k (%gc-meta-scale))
+               (blk (%rt-slice-block (%thr-cpu)))
+               (alloc (%gc-meta-read (+ blk #x30) k))
+               (limit (%gc-meta-read (+ blk #x38) k)))
+          (if (>= (- limit alloc) #x10000)
+              blk
+              (let ((af (%rt-arena-alloc)))
+                (if (> (+ af #x100000) ae)
+                    (progn
+                      (%gc-write64 (+ (%rt-arena-words) #x18)
+                                   (+ (%rt-arena-fallbacks) 1))
+                      0)
+                    (progn
+                      ;; A slice IS a region block as far as %GC-REGION-ENTER
+                      ;; is concerned: init writes +0x30 = AF, +0x38 = AF+1MB.
+                      ;; It is never collected, so from/to/stack are inert.
+                      (%gc-region-init blk af af #x100000 0 k)
+                      (%gc-write64 (+ (%rt-arena-words) #x08) (+ af #x100000))
+                      blk))))))))
+
+(defun %rt-arena-carve ()
+  "Carve the immortal lock arena off the top of region 0's CURRENT from-space,
+   once, shrinking region 0's size — and, in the same breath, the live
+   allocation limit if region 0 is active and the parked one if it is not —
+   so main can never reach it.  1 = arena ready, 0 = heap too small or
+   frontier already past the carve point (both keep today's path)."
+  (if (> (%rt-arena-end) 0)
+      1
+      (let* ((k (%gc-meta-scale))
+             (r0 (%gc-region-0))
+             (from (%gc-meta-read r0 k))
+             (size (%gc-meta-read (+ r0 #x10) k)))
+        (if (< size #x6000000)
+            0
+            (let ((newsize (- size #x2000000)))
+              (if (or (> (%gc-meta-read (+ r0 #x30) k) (+ from newsize))
+                      (and (= r0 (%gc-region))
+                           (> (get-alloc-ptr) (+ from newsize))))
+                  0
+                  (let ((base (%ha-align-up-to-page-base (+ from newsize))))
+                    (%gc-region-shrink r0 newsize k)
+                    ;; If main is NOT in region 0 right now (%TL-SELFTEST's
+                    ;; shape), the shrink moved no live register; clamp the
+                    ;; PARKED limit so the next enter of region 0 honors the
+                    ;; carve too.
+                    (if (> (%gc-meta-read (+ r0 #x38) k) (+ from newsize))
+                        (%gc-meta-write (+ r0 #x38) (+ from newsize) k)
+                        0)
+                    (%ha-zero (%rt-slice-base) (+ (%rt-slice-base) #x400))
+                    (%gc-write64 (%rt-arena-words) base)
+                    (%gc-write64 (+ (%rt-arena-words) #x08) base)
+                    (%gc-write64 (+ (%rt-arena-words) #x10) (+ from size))
+                    (%gc-write64 (+ (%rt-arena-words) #x18) 0)
+                    1)))))))
+
 (defun %rt-enter-locked ()
   (let ((me (+ (%thr-cpu) 1)))
     (if (= (%gc-read64 (%rt-owner-addr)) me)
@@ -1214,9 +1359,19 @@
           (%gc-write64 #x10000DE0 (+ (%gc-read64 #x10000DE0) 1))
           (%gc-write64 (%rt-owner-addr) me)
           (%gc-write64 (%rt-depth-addr) 1)
-          ;; PARK MY REGION, TAKE REGION 0.  %GC-REGION-ENTER returns the region
-          ;; it left, which is exactly what %RT-LEAVE needs to undo it.
-          (%gc-write64 (%rt-saved-addr) (%gc-region-enter (%gc-region-0)))
+          ;; PARK MY REGION, TAKE MY SLICE — or, with no arena (small heap,
+          ;; exhausted arena, or an image from before the carve), REGION 0
+          ;; exactly as before.  The slice is region-0 ADDRESS SPACE that main
+          ;; can never reach, so the locked section's allocations are
+          ;; co-located with the tables WITHOUT touching the frontier main
+          ;; also uses — the two-mutators-one-frontier collision this block
+          ;; exists to document.  %GC-REGION-ENTER returns the region it left,
+          ;; which is exactly what %RT-LEAVE needs to undo it; on the way out
+          ;; it parks the SLICE block, which is what persists the slice
+          ;; frontier for this CPU's next acquisition.
+          (let ((blk (%rt-slice-ensure)))
+            (%gc-write64 (%rt-saved-addr)
+                         (%gc-region-enter (if (zerop blk) (%gc-region-0) blk))))
           0))))
 
 (defun %rt-leave-locked ()
@@ -1263,6 +1418,12 @@
         (%mutex-init (%rt-mutex-addr))
         (%gc-write64 #x10000DE0 0)
         (%gc-write64 #x10000DE8 0)
+        ;; B-LITE (see the block above %RT-SLICE-BASE): carve the lock arena
+        ;; BEFORE the gate opens, so no locked section ever runs against a
+        ;; half-carved arena.  A 0 here (small heap, frontier in the way) is
+        ;; not a failure — the slice path just never engages and every locked
+        ;; section behaves exactly as before this change.
+        (%rt-arena-carve)
         (setf (mem-ref (%rt-gate-addr) :u32) 1)
         1)))
 

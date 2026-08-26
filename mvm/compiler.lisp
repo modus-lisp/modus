@@ -4594,14 +4594,39 @@
                                  initform-pairs)))))
                 (setq cur (cddr cur))))))
         (setq slot-names (nreverse slot-names))
-        `(progn
-           (%defclass ',class-name ',slot-names ',supers)
-           (%register-clos-slot-info ',class-name
-                                     (list ,@(nreverse initarg-pairs))
-                                     (list ,@(nreverse initform-pairs)))
-           (%register-clos-direct-slots ',class-name ',slot-names)
-           ,@(nreverse extra-defuns)
-           (find-class ',class-name nil)))))
+        ;; CLASS OPTIONS — (defclass name supers slots . options).  This
+        ;; macro used to drop the options tail entirely, so a runtime
+        ;; (:default-initargs ...) registered nothing and make-instance left
+        ;; the slot UNBOUND (found via the unmodified Quicklisp client's
+        ;; ql-http octet-sink, whose STORAGE slot is filled ONLY by a
+        ;; default-initarg, 2026-08-26).  cl-clos already has the CLHS 7.1.4
+        ;; registry + application; wire the option to it, with the same
+        ;; %clos-make-initform-thunk bridge the initform path uses (an
+        ;; in-module closure escaping unwrapped executes garbage when a
+        ;; later make-instance funcalls it cross-module).
+        (let ((default-initarg-pairs nil))
+          (dolist (opt (cddddr form))
+            (when (and (consp opt) (symbolp (car opt))
+                       (string= (symbol-name (car opt)) "DEFAULT-INITARGS"))
+              (let ((cur (cdr opt)))
+                (loop
+                  (when (null cur) (return nil))
+                  (setq default-initarg-pairs
+                        (cons `(cons ',(car cur)
+                                     (%clos-make-initform-thunk
+                                      (lambda () ,(cadr cur))))
+                              default-initarg-pairs))
+                  (setq cur (cddr cur))))))
+          `(progn
+             (%defclass ',class-name ',slot-names ',supers)
+             (%register-clos-slot-info ',class-name
+                                       (list ,@(nreverse initarg-pairs))
+                                       (list ,@(nreverse initform-pairs)))
+             (%register-clos-direct-slots ',class-name ',slot-names)
+             (%register-clos-default-initargs ',class-name
+                                              (list ,@(nreverse default-initarg-pairs)))
+             ,@(nreverse extra-defuns)
+             (find-class ',class-name nil))))))
   ;; PERF: snapshot the just-built 94-macro *macro-table* into the persistent
   ;; template so every subsequent call takes the fast copy path above instead of
   ;; re-constructing all these closures.  (First call only.)
@@ -5820,11 +5845,19 @@
            (if (cdr saved)
                (setf (gethash (car saved) *macro-table*) (cdr saved))
                (remhash (car saved) *macro-table*)))))
-      ;; WITH-OPEN-FILE — compile as let binding stream var to a dummy file stream
+      ;; WITH-OPEN-FILE — CLHS: open the file, bind the stream, close on ANY
+      ;; exit.  (This used to bind a CLOSED DUMMY stream — (%make-file-stream),
+      ;; fd -1 — so every with-open-file body saw instant EOF and writes went
+      ;; nowhere.  Found when the unmodified Quicklisp client's quicklisp.asd
+      ;; read version.txt through it, 2026-08-26.)  A nil stream — reachable
+      ;; via :if-does-not-exist nil — skips the close.
       ((= op-name 365656143)  ; WITH-OPEN-FILE
        (let ((spec (cadr form))
              (body (cddr form)))
-         (compile-form `(let ((,(car spec) (%make-file-stream))) ,@body) env dest)))
+         (compile-form `(let ((,(car spec) (open ,@(cdr spec))))
+                          (unwind-protect (progn ,@body)
+                            (when ,(car spec) (close ,(car spec)))))
+                       env dest)))
       ;; WITH-OUTPUT-TO-STRING — create string-output-stream, run body, return string
       ((= op-name 163216281)  ; WITH-OUTPUT-TO-STRING
        (let* ((spec (cadr form))

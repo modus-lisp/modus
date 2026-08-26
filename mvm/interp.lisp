@@ -2275,8 +2275,9 @@
           ;; uncaught error / unmatched throw, matching native semantics).
           (error (c)
             (when *nlx-trace*
-              (format t "~%[NLX bridge st=~D depth=~D pc=~D cnd=~A]"
-                      (mvm-serial state) (length (mvm-handlers state)) pc (type-of c)))
+              (format t "~%[NLX bridge st=~D depth=~D pc=~D cnd=~A rpt=~A]"
+                      (mvm-serial state) (length (mvm-handlers state)) pc (type-of c)
+                      (handler-case (format nil "~A" c) (t (e2) "?"))))
             (if (mvm-handlers state)
                 (setf %lj c)
                 (error c)))

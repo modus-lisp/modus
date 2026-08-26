@@ -976,13 +976,12 @@
                 (emit-u32 buf #x10000D28)
                 (emit-u32 buf 1))
               (emit-call buf (translate-state-handler-push-label state))
-              ;; BARE-METAL BALANCED-CAP: r11=1 from __handler_push means the
+              ;; BALANCED-CAP (universal): r11=1 from __handler_push means the
               ;; push was CAPPED (frame dropped, overflow counted) — skip
               ;; arming [0x10000180] so this handler-case is a transparent
               ;; no-op instead of a stack corrupter.  See emit-handler-helpers.
-              (unless *x64-linux-mode*
-                (emit-bytes buf #x4D #x85 #xDB)      ; test r11, r11
-                (emit-jcc buf :ne skiparm-label))
+              (emit-bytes buf #x4D #x85 #xDB)        ; test r11, r11
+              (emit-jcc buf :ne skiparm-label)
               ;; Save RSP to 0x10000180
               ;; Use movabs with RCX as temp (address > 0x7FFFFFFF, can't use disp32)
               ;; mov rcx, 0x10000180
@@ -1017,13 +1016,18 @@
                           #x00 #x00 #x00)            ; lea rax, [rip+14/26]
               ;; mov [rcx+16], rax  — save return IP
               (emit-bytes buf #x48 #x89 #x41 #x10)
-              (unless *x64-linux-mode*
-                ;; capped setjmp lands here (arm skipped); both paths clear
-                ;; the in-transition flag.
-                (emit-label buf skiparm-label)
-                (emit-bytes buf #x48 #xC7 #x04 #x25) ; mov qword [imm32], 0
-                (emit-u32 buf #x10000D28)
-                (emit-u32 buf 0))
+              (if *x64-linux-mode*
+                  ;; Linux: capped setjmp lands here (arm skipped) and falls
+                  ;; into the NIL first-time return.  The label is zero bytes,
+                  ;; so the lea rax,[rip+0x0E] resume distance is unchanged.
+                  (emit-label buf skiparm-label)
+                  (progn
+                    ;; capped setjmp lands here (arm skipped); both paths
+                    ;; clear the in-transition flag.
+                    (emit-label buf skiparm-label)
+                    (emit-bytes buf #x48 #xC7 #x04 #x25) ; mov qword [imm32], 0
+                    (emit-u32 buf #x10000D28)
+                    (emit-u32 buf 0)))
               ;; mov rax, NIL (#xDEAD0001) — first-time return.
               ;; On longjmp, execution jumps just past this and RAX holds T
               ;; (set by LONGJMP trap), so the value going into VR is T.
@@ -4395,10 +4399,13 @@
   (unless *x64-linux-mode*
     (emit-bytes buf #x48 #xC7 #x04 #x25) ; mov qword [imm32], 1
     (emit-u32 buf #x10000D28)
-    (emit-u32 buf 1)
-    (emit-bytes buf #x48 #xC7 #x04 #x25) ; mov qword [imm32], 0
-    (emit-u32 buf #x10000D20)
-    (emit-u32 buf 0))
+    (emit-u32 buf 1))
+  ;; Zero the live-overflow word on EVERY target: the BALANCED-CAP is now
+  ;; universal (Linux port of the bare-metal fix — see emit-handler-helpers),
+  ;; so the longjmp must discard pending capped-frame absorbs everywhere.
+  (emit-bytes buf #x48 #xC7 #x04 #x25)   ; mov qword [imm32], 0
+  (emit-u32 buf #x10000D20)
+  (emit-u32 buf 0)
   ;; mov rcx, 0x10000180
   (emit-bytes buf #x48 #xB9)
   (emit-u32 buf #x10000180) (emit-u32 buf 0)
@@ -4543,13 +4550,30 @@
     ;; REAL frame from the stack (the bare-metal ANSI drain-to-depth-0
     ;; halt class).  The counter makes cap events observable from the
     ;; runner (mem-ref #x10000D00).
-    (emit-bytes buf #x49 #x83 #xFA #x40)
-    (emit-jcc buf :ge (if *x64-linux-mode* skip capped))
+    (if *x64-linux-mode*
+        (progn (emit-bytes buf #x49 #x81 #xFA)       ; cmp r10, imm32
+               (emit-u32 buf 512))
+        (emit-bytes buf #x49 #x83 #xFA #x40))        ; cmp r10, 64
+    ;; BALANCED-CAP is UNIVERSAL: the old Linux-mode bare `jge skip` (drop
+    ;; the frame, still arm, still pop later) drained one REAL outer frame
+    ;; per capped setjmp+clear pair — deep nesting (e.g. quicklisp's
+    ;; deflate under nested mvm-interpret) then made a later longjmp
+    ;; restore a long-dead frame: wild RIP, RSP in reused memory (task
+    ;; #278 gunzip SIGSEGV).  Route every target through the capped path.
+    ;;
+    ;; LINUX gets a BIGGER stack as well: 512 frames at [0x10001000..
+    ;; 0x10005000] (free BSS inside the ELF LOAD segment) — deep nested
+    ;; interpretation legitimately exceeds 64 frames, and a capped CATCH
+    ;; frame is a transparent no-op that can no longer catch its own tag
+    ;; (the deterministic 64KB gunzip failure).  BARE METAL keeps
+    ;; 64 frames at [0x10000408..0x10000C08]: 0x10001000 is the bare-metal
+    ;; HEAP BASE (boot-x64.lisp semispaces) — NOT free there.
+    (emit-jcc buf :ge capped)
     ;; r11 = depth*32
     (emit-bytes buf #x4D #x6B #xDA #x20)            ; imul r11, r10, 32
     ;; r11 += 0x10000408
     (emit-bytes buf #x49 #x81 #xC3)                  ; add r11, imm32
-    (emit-u32 buf #x10000408)
+    (emit-u32 buf (if *x64-linux-mode* #x10001000 #x10000408))
     ;; rax = [0x10000180]; [r11] = rax
     (emit-bytes buf #x48 #x8B #x04 #x25)
     (emit-u32 buf #x10000180)
@@ -4578,12 +4602,13 @@
       (emit-jcc buf :ge nomax)
       (emit-bytes buf #x4C #x89 #x14 #x25)           ; mov [imm32], r10
       (emit-u32 buf #x10000D08)
-      (emit-label buf nomax)
-      ;; r11 = 0: frame stored — SETJMP arms [0x10000180]
-      (emit-bytes buf #x4D #x31 #xDB))               ; xor r11, r11
+      (emit-label buf nomax))
+    ;; r11 = 0: frame stored — SETJMP arms [0x10000180].  UNIVERSAL (the
+    ;; capped path returns r11=1; the setjmp trap tests it on every target).
+    (emit-bytes buf #x4D #x31 #xDB)                  ; xor r11, r11
     (emit-label buf skip)
     (emit-bytes buf #xC3)                            ; ret
-    (unless *x64-linux-mode*
+    (progn
       ;; capped-push path (BARE-METAL BALANCED-CAP): the frame is NOT
       ;; stored, but the event is COUNTED in the live-overflow word at
       ;; [0x10000D20] so the matching CLEAR-HANDLER pop absorbs it
@@ -4610,8 +4635,8 @@
         (no-ovf (make-label)))
     (emit-label buf pop-label)
     (emit-bytes buf #x50)                            ; push rax
-    (unless *x64-linux-mode*
-      ;; BARE-METAL BALANCED-CAP: if the live-overflow word [0x10000D20]
+    (progn
+      ;; BALANCED-CAP (universal): if the live-overflow word [0x10000D20]
       ;; is non-zero, this pop textually matches a CAPPED push (whose
       ;; frame was never stored) — absorb it: decrement overflow, leave
       ;; [0x10000180..198] and the stored stack untouched.  Longjmp-side
@@ -4641,7 +4666,7 @@
     ;; r11 = depth*32 + 0x10000408
     (emit-bytes buf #x4D #x6B #xDA #x20)             ; imul r11, r10, 32
     (emit-bytes buf #x49 #x81 #xC3)                  ; add r11, imm32
-    (emit-u32 buf #x10000408)
+    (emit-u32 buf (if *x64-linux-mode* #x10001000 #x10000408))
     ;; Use r10 as memory-scratch (its value is now consumed) so RAX
     ;; stays pristine across mem-to-mem copies.
     ;; [0x10000180] = [r11]

@@ -4702,44 +4702,8 @@
   ;; ---- __handler_push ----
   (let ((skip (make-label))
         (capped (make-label))
-        (nomax (make-label))
-        (ring-skip (make-label))
-        (ring-rec (make-label)))
+        (nomax (make-label)))
     (emit-label buf push-label)
-    (when *x64-linux-mode*
-      ;; DIAG RING (Linux, #278 drain forensics): record (caller-RA,
-      ;; depth*2+1) into the 64-entry ring at [0x10006008], index
-      ;; qword at [0x10006000].  Clobbers rax/r10/r11 only — already
-      ;; caller-clobbered by this helper.  Strip after the drain is fixed.
-      ;; LATCH [0x10005FF0]: 0 = frozen (no recording — BSS boot default),
-      ;; <0 = record always, >0 = record this event and decrement (arm a
-      ;; freeze-after-N window from the probe via native %hc-ring-arm).
-      (emit-bytes buf #x48 #x8B #x04 #x25) (emit-u32 buf #x10005FF0)  ; mov rax,[latch]
-      (emit-bytes buf #x48 #x85 #xC0)                                  ; test rax,rax
-      (emit-jcc buf :e ring-skip)
-      (emit-jcc buf :l ring-rec)
-      (emit-bytes buf #x48 #xFF #x0C #x25) (emit-u32 buf #x10005FF0)  ; dec qword [latch]
-      (emit-label buf ring-rec)
-      ;; 1M entries x 32B at [0x10008000..0x12008000] (free Linux BSS
-      ;; inside the ELF LOAD segment) — big enough to hold a whole
-      ;; inter-progress-signal window (~57K events) without wrapping.
-      ;; Entry: [RA, depth*2+flag, caller2 = [rbp+8] (the longjmping
-      ;; fn's own return address — all compiled fns are rbp-framed), 0].
-      (emit-bytes buf #x4C #x8B #x14 #x25) (emit-u32 buf #x10006000)  ; mov r10,[idx]
-      (emit-bytes buf #x4D #x89 #xD3)                                  ; mov r11,r10
-      (emit-bytes buf #x49 #x81 #xE3) (emit-u32 buf #x000FFFFF)        ; and r11,1M-1
-      (emit-bytes buf #x49 #xC1 #xE3 #x05)                             ; shl r11,5
-      (emit-bytes buf #x49 #x81 #xC3) (emit-u32 buf #x10008000)        ; add r11,base
-      (emit-bytes buf #x48 #x8B #x04 #x24)                             ; mov rax,[rsp]
-      (emit-bytes buf #x49 #x89 #x03)                                  ; mov [r11],rax
-      (emit-bytes buf #x48 #x8B #x04 #x25) (emit-u32 buf #x10000400)   ; mov rax,[depth]
-      (emit-bytes buf #x48 #x8D #x04 #x45 #x01 #x00 #x00 #x00)    ; lea rax,[rax*2+1]
-      (emit-bytes buf #x49 #x89 #x43 #x08)                             ; mov [r11+8],rax
-      (emit-bytes buf #x48 #x8B #x45 #x08)                             ; mov rax,[rbp+8]
-      (emit-bytes buf #x49 #x89 #x43 #x10)                             ; mov [r11+16],rax
-      (emit-bytes buf #x49 #xFF #xC2)                                  ; inc r10
-      (emit-bytes buf #x4C #x89 #x14 #x25) (emit-u32 buf #x10006000)   ; mov [idx],r10
-      (emit-label buf ring-skip))
     ;; r10 = depth = [0x10000400]
     (emit-bytes buf #x4C #x8B #x14 #x25)
     (emit-u32 buf #x10000400)
@@ -4833,40 +4797,9 @@
   ;; (masquerading as an unknown-subtag object like #<?184>).
   (let ((empty (make-label))
         (done (make-label))
-        (no-ovf (make-label))
-        (ring-skip (make-label))
-        (ring-rec (make-label)))
+        (no-ovf (make-label)))
     (emit-label buf pop-label)
     (emit-bytes buf #x50)                            ; push rax
-    (when *x64-linux-mode*
-      ;; DIAG RING (Linux, #278 drain forensics): record (caller-RA,
-      ;; depth*2+0) into the 64-entry ring at [0x10006008], index
-      ;; qword at [0x10006000].  Clobbers rax/r10/r11 only — already
-      ;; caller-clobbered by this helper.  Strip after the drain is fixed.
-      ;; LATCH [0x10005FF0]: same protocol as the push side (0 = frozen,
-      ;; <0 = always, >0 = record + decrement).
-      (emit-bytes buf #x48 #x8B #x04 #x25) (emit-u32 buf #x10005FF0)  ; mov rax,[latch]
-      (emit-bytes buf #x48 #x85 #xC0)                                  ; test rax,rax
-      (emit-jcc buf :e ring-skip)
-      (emit-jcc buf :l ring-rec)
-      (emit-bytes buf #x48 #xFF #x0C #x25) (emit-u32 buf #x10005FF0)  ; dec qword [latch]
-      (emit-label buf ring-rec)
-      ;; Same 1M x 32B geometry as the push side (incl. caller2=[rbp+8]).
-      (emit-bytes buf #x4C #x8B #x14 #x25) (emit-u32 buf #x10006000)  ; mov r10,[idx]
-      (emit-bytes buf #x4D #x89 #xD3)                                  ; mov r11,r10
-      (emit-bytes buf #x49 #x81 #xE3) (emit-u32 buf #x000FFFFF)        ; and r11,1M-1
-      (emit-bytes buf #x49 #xC1 #xE3 #x05)                             ; shl r11,5
-      (emit-bytes buf #x49 #x81 #xC3) (emit-u32 buf #x10008000)        ; add r11,base
-      (emit-bytes buf #x48 #x8B #x44 #x24 #x08)                             ; mov rax,[rsp+8]
-      (emit-bytes buf #x49 #x89 #x03)                                  ; mov [r11],rax
-      (emit-bytes buf #x48 #x8B #x04 #x25) (emit-u32 buf #x10000400)   ; mov rax,[depth]
-      (emit-bytes buf #x48 #x8D #x04 #x45 #x00 #x00 #x00 #x00)    ; lea rax,[rax*2+0]
-      (emit-bytes buf #x49 #x89 #x43 #x08)                             ; mov [r11+8],rax
-      (emit-bytes buf #x48 #x8B #x45 #x08)                             ; mov rax,[rbp+8]
-      (emit-bytes buf #x49 #x89 #x43 #x10)                             ; mov [r11+16],rax
-      (emit-bytes buf #x49 #xFF #xC2)                                  ; inc r10
-      (emit-bytes buf #x4C #x89 #x14 #x25) (emit-u32 buf #x10006000)   ; mov [idx],r10
-      (emit-label buf ring-skip))
 
     (progn
       ;; BALANCED-CAP (universal): if the live-overflow word [0x10000D20]

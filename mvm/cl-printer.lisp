@@ -3886,26 +3886,6 @@
     ;; Interp-closure dispatch — fast path for runtime-eval'd lambdas.
     (when (and (consp fn) (eq (car fn) '%interp-closure))
       (return-from apply (%call-interp-closure fn all-args)))
-    ;; DIAG (#278 drain forensics): an APPLY of a non-function is the root
-    ;; of the install-context TYPE-ERROR/frame-drain — name the value
-    ;; loudly before funcall raises.  Strip after the drain is fixed.
-    (when (not (functionp fn))
-      (write-string-serial "!! APPLY-BADFN type=")
-      (handler-case (write-object (type-of fn))
-        (t (c) (write-string-serial "?")))
-      (write-string-serial " val=")
-      (handler-case
-          (if (symbolp fn)
-              (write-object fn)
-              (if (consp fn)
-                  (progn (write-string-serial "cons-car=")
-                         (write-object (car fn)))
-                  (write-object fn)))
-        (t (c) (write-string-serial "?")))
-      (write-string-serial " nargs=")
-      (handler-case (write-object (length all-args))
-        (t (c) (write-string-serial "?")))
-      (write-char-serial 10))
     (let* ((a0 (and all-args (car all-args)))
            (r1 (and all-args (cdr all-args)))
            (a1 (and r1 (car r1)))

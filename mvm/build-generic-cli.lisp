@@ -83,18 +83,10 @@
 ;; code addrs are < 4GB so :u32 (tagged load) is exact.
 (defun %hc-frame-ip (n) (mem-ref (+ #x10000408 (* 32 n) 16) :u32))
 (defun %hc-cur-ip () (mem-ref #x10000190 :u32))
-;; BALANCED-CAP counters + push/pop diagnostic ring (all values < 2^32,
-;; so tagged :u32 loads are exact).  Ring: 1M entries x 16B at
-;; [0x10008000], index qword [0x10006000], arm/freeze latch [0x10005FF0]
-;; (0 = frozen — boot default; >0 = record + decrement per event).
+;; BALANCED-CAP counters (all values < 2^32, so tagged :u32 loads are
+;; exact).
 (defun %hc-overflow () (mem-ref #x10000D20 :u32))
 (defun %hc-capcount () (mem-ref #x10000D00 :u32))
-(defun %hc-ring-idx () (mem-ref #x10006000 :u32))
-(defun %hc-ring-ra (i) (mem-ref (+ #x10008000 (* 32 i)) :u32))
-(defun %hc-ring-df (i) (mem-ref (+ #x10008000 (* 32 i) 8) :u32))
-(defun %hc-ring-ra2 (i) (mem-ref (+ #x10008000 (* 32 i) 16) :u32))
-(defun %hc-ring-arm (n) (setf (mem-ref #x10005FF0 :u32) n) n)
-(defun %hc-ring-latch () (mem-ref #x10005FF0 :u32))
 ;; Fault-stub scratch (RIP/RSP/[RSP]/RAX at 0x10000C30/C38/C40/C48) as
 ;; tagged u32 halves — values can exceed 32 bits, and interpreted :u64
 ;; reads are untrustworthy.  i = slot 0..3, j = 0 (lo) / 1 (hi).

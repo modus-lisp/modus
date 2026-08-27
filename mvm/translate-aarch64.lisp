@@ -4018,6 +4018,20 @@
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
              (emit-aarch64-gc-mark-start buf)   ; #160: x24 = new cons base
              (emit-aarch64-gc-mark-cons buf)    ; #160 bug#4: mark it CONS-KIND
+             ;; ---- Zero-initialise both words (CRITICAL for GC correctness) ----
+             ;; #274 was ported to +op-alloc-obj+ and +op-alloc-array+ but NOT
+             ;; here, and cons is the worst place to leave it out: mark-cons has
+             ;; just set the CONS-KIND bit, so the collector will scan these two
+             ;; words AS car/cdr POINTERS.  Between this opcode and the caller's
+             ;; car/cdr stores there is a window — the very next allocation's
+             ;; gc-check can collect inside it — where both words hold whatever
+             ;; the previous generation (or, on real hardware, uninitialised
+             ;; DRAM) left behind, and the collector follows them.  QEMU hides
+             ;; part of this by zero-filling guest RAM, but a reused semispace
+             ;; is never zero.  Two stores, no cursor needed: offsets 0 and 8
+             ;; are both inside STUR's signed 9-bit range.
+             (a64-stur buf +a64-xzr+ +a64-x24+ 0)
+             (a64-stur buf +a64-xzr+ +a64-x24+ 8)
              (a64-mov-reg buf pd +a64-x24+)
              (a64-add-imm buf +a64-x24+ +a64-x24+ 16)
              (unless (a64-phys-reg vd)

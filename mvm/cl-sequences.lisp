@@ -2331,11 +2331,27 @@
 
 ;;; String functions
 (defun %concat-elt-count (s)
+  "Element count of one CONCATENATE input.  Signals a type error for a
+   non-sequence instead of guessing.
+
+   The old catch-all `(t (array-length s))' ran ARRAY-LENGTH on ANY value that
+   was not NIL, a cons or a string — a symbol, a number, a hash-table, a
+   struct.  ARRAY-LENGTH is a raw header read with no type check, so it
+   returned whatever bits sat where a header would be: `(array-length '(1 2))'
+   yields 14593280 here.  That garbage becomes CONCATENATE's TOTAL, TOTAL
+   becomes the argument of `(make-array total)', and a ~10^12 element count
+   walks the allocator off the end of the heap.  So passing a non-sequence to
+   CONCATENATE was an unbounded wild write and a bare SIGSEGV rather than the
+   TYPE-ERROR CLHS 17.2.1 asks for — and the fault lands in the allocator,
+   nowhere near the caller that supplied the bad value.
+
+   ARRAYP covers strings and vectors alike (the old STRINGP clause did exactly
+   what the catch-all did), and the two CONSP clauses computed the same LENGTH,
+   so the fast paths are unchanged."
   (cond ((null s) 0)
-        ((and (consp s) (array-wrapper-p s)) (length s))
         ((consp s) (length s))
-        ((stringp s) (array-length s))
-        (t (array-length s))))
+        ((arrayp s) (array-length s))
+        (t (%signal-type-error))))
 
 (defun %concat-result-kind (result-type)
   "Resolve a concatenate RESULT-TYPE designator to one of :LIST,

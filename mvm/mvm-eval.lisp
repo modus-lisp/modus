@@ -434,6 +434,74 @@
         (setq mx (cdr p))))
     (+ mx 1)))
 
+(defvar *jit-cv-sites* nil
+  "DIAGNOSTIC: pages built carrying at least one constant-vector site.")
+(defvar *jit-cv-reject* nil
+  "How many page builds were REJECTED because the installed constant vector did
+   not cover the module's own indices.  Nonzero means the sizing path is wrong;
+   the page is not used, so the form interprets instead of faulting.")
+(defvar *jit-cv-diag* nil
+  "Bounded diagnostic-print budget; NIL until first use.")
+
+(defun %jit-cv-verbose-p ()
+  "Opt-in gate for the WS5 #223 constant-vector diagnostics.  T prints a bounded
+   CVDIAG line per checkpoint; NIL (default) keeps the JIT path silent."
+  nil)
+
+(defun %jit-constvec-covers-p (cpatches where)
+  "T if the INSTALLED constant vector exists and is long enough for every
+   constant-vector index this module was compiled against.
+
+   This is a correctness guard, not just a probe.  The emitted sequence is
+   `movabs d,<root>; mov d,[d]; mov d,[d + idx*8 + 7]` — if the root is 0 or the
+   vector is shorter than IDX, that third instruction reads unmapped memory and
+   the process dies with no diagnosable state.  There is no way to bounds-check
+   it in the emitted code, so it is checked HERE, once per page build, against
+   the same list the sizing used.  A failure returns NIL and the caller
+   abandons the page, so the form interprets — wrong-but-alive instead of a
+   SIGSEGV, and the interpret path is byte-for-byte the pre-#223 behaviour.
+
+   The vector's REAL length is read with %prim-array-length rather than trusting
+   *jit-constvec-cap*: if the bug is that the cap bookkeeping disagrees with the
+   object, trusting the bookkeeping would make this guard agree with the bug."
+  (let ((n 0) (mx -1))
+    (dolist (p cpatches)
+      (when (< (car p) 0)
+        (setq n (+ n 1))
+        (when (> (cdr p) mx) (setq mx (cdr p)))))
+    (if (eql n 0)
+        t
+        (let* ((v (%jit-constvec))
+               (vlen (if v (%prim-array-length v) 0))
+               ;; INTACTNESS, not just length.  The vector is reachable ONLY
+               ;; from the BSS root, so if the collector ever declines to
+               ;; forward it (rather than merely moving it) the root points at
+               ;; recycled from-space and every slot read is garbage — which
+               ;; looks exactly like the observed fault.  Slot 0 must still be
+               ;; pool entry 0; comparing against the pool, which is rooted
+               ;; through the globals alist, detects recycling for free.
+               (intact (or (null *e2-const-count*) (eql *e2-const-count* 0)
+                           (and v (> vlen 0)
+                                (eq (aref v 0) (gethash 0 *e2-const-pool*)))))
+               (ok (and v (> vlen mx) intact)))
+          (setq *jit-cv-sites* (if *jit-cv-sites* (+ 1 *jit-cv-sites*) 1))
+          (when (null *jit-cv-diag*) (setq *jit-cv-diag* 0))
+          (unless ok
+            (setq *jit-cv-reject* (if *jit-cv-reject* (+ 1 *jit-cv-reject*) 1)))
+          ;; Bounded output: the first few pages carrying sites, plus the first
+          ;; few rejections.  A gate run builds tens of thousands of pages, so an
+          ;; unbounded print would bury the answer it is meant to produce.
+          ;; Diagnostics are OPT-IN (%jit-cv-verbose-p, a defun not a defvar —
+          ;; defvar init-thunks do not run in-image).  A shipping CLI must not
+          ;; print to stdout on the JIT path; flip the defun to T to debug.
+          (when (and (%jit-cv-verbose-p)
+                     (< *jit-cv-diag* 12) (or (not ok) (< *jit-cv-sites* 4)))
+            (setq *jit-cv-diag* (+ *jit-cv-diag* 1))
+            (format t "CVDIAG ~A ok=~A sites=~D maxidx=~D vlen=~D intact=~A cap=~S hi=~S count=~S~%"
+                    where (if ok "T" "NIL") n mx vlen (if intact "T" "NIL")
+                    *jit-constvec-cap* *jit-constvec-hi* *e2-const-count*))
+          ok))))
+
 ;;; ============================================================
 ;;; WS5 #223 — the GC-updated JIT constant vector (Lisp side)
 ;;; ============================================================
@@ -993,6 +1061,12 @@
     ;; into the GC-rooted constant vector the thunk's emitted loads read from.
     ;; Must happen before the page runs; a no-op when the indirection is off.
     (%jit-sync-constvec (%jit-constvec-need *x64-li-const-patches*))
+    ;; WS5 #223 SAFETY GUARD.  Verify the vector actually covers this module's
+    ;; indices before any of its code can run.  If it does not, abandon the page
+    ;; and let the form interpret — the emitted slot load has no bounds check and
+    ;; an uncovered index is an unmapped read, i.e. an undiagnosable SIGSEGV.
+    (unless (%jit-constvec-covers-p *x64-li-const-patches* "build")
+      (return-from %jit-translate-page-1 nil))
     (let* ((nlen (code-buffer-position nbuf))
            (nbytes (code-buffer-bytes nbuf))
            (relocs *x64-call-relocs*)
@@ -1404,6 +1478,15 @@
           ;; single-value form reads back 1 (the thunk epilogue sets it, but
           ;; be defensive).  A form that sets it >1 falls back for correct MV.
           (setf (mem-ref #x10000090 :u64) 1)
+          ;; WS5 #223 SECOND CHECK, at the LAST moment before control enters the
+          ;; page.  The build-time check proves the vector was correct when the
+          ;; page was made; this one proves it is STILL correct now.  A page can
+          ;; be minutes and many collections old by the time it is re-entered
+          ;; from *jit-page-cache*, and an installed native function's page is
+          ;; re-entered without passing through here at all — so a failure here
+          ;; localises the invalidation to the window between build and call,
+          ;; which is the one thing the fault address cannot tell us.
+          (%jit-constvec-covers-p (caddr je) "precall")
           ;; WS5 #203 POINT OF NO RETURN.  Everything above this line is JIT
           ;; setup: if it signals, no user code has run and the interpret
           ;; fallback is safe.  The instant we branch into the page, the form's

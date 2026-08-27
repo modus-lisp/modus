@@ -77,6 +77,64 @@
 ;;;; "it worked before"; the guarantee is structural, and the structure is
 ;;;; what changes.
 ;;;;
+;;;; ---------------------------------------------------------------------
+;;;; THE REPLACEMENT DESIGN (2026-08-27) — and why it is NOT "hosted only"
+;;;; ---------------------------------------------------------------------
+;;;;
+;;;; DO NOT justify the bare-metal arm with "the scheduler there is
+;;;; cooperative."  That is true today and it is the wrong thing to build on.
+;;;; Measured on this tree:
+;;;;
+;;;;   * PSCI CPU_ON is GENERATED but never CALLED (boot/boot-aarch64.lisp
+;;;;     ~678, +PSCI-CPU-ON-64+ #xC4000003).  RISC-V SBI hart-start and
+;;;;     PPC64 OPAL thread-start generators exist in the same state.
+;;;;   * WAKE-IDLE-AP on bare metal is `(defun wake-idle-ap () 0)`
+;;;;     (net/actors.lisp ~301) — a no-op.  Only net/hosted-sync.lisp ~649
+;;;;     has a real one.
+;;;;
+;;;; So bare metal is single-core *because nobody has called the function
+;;;; yet*, not because of anything structural — and bringing up a second core
+;;;; is active work.  An implementation whose correctness rests on that would
+;;;; fail the day CPU_ON is called, silently, as lost updates inside the
+;;;; primitives a portability library builds on.  That is precisely the
+;;;; mistake this header already made once.
+;;;;
+;;;; WHAT IS ACTUALLY AVAILABLE, on both backends, today:
+;;;;
+;;;;   +OP-ATOMIC-XCHG+   translate-x64      present
+;;;;   +OP-ATOMIC-XCHG+   translate-aarch64  present
+;;;;   any compare-exchange                   ABSENT EVERYWHERE
+;;;;
+;;;; SPIN-LOCK (net/actors.lisp) is already built on XCHG-MEM and is
+;;;; bare-metal code, so a real atomic exchange is proven on both
+;;;; architectures.  That is enough for two of the three operations:
+;;;;
+;;;;   %ATOMIC-INCF / %ATOMIC-DECF — a spinlock on XCHG, on EVERY target.
+;;;;       Correct without any appeal to how the scheduler behaves, and it
+;;;;       stays correct when the second core comes up.  No mutex, so bare
+;;;;       metal is not a special case (%MUTEX-LOCK is hosted-only —
+;;;;       net/hosted-sync.lisp is inside the (and (eq *cli-arch* :x64)
+;;;;       (not *cli-bare-metal*)) group in mvm/build-cli-common.lisp).
+;;;;
+;;;;   %ATOMIC-CAS — BLOCKED ON AN INSTRUCTION, not on a design.  XCHG is an
+;;;;       UNCONDITIONAL exchange and cannot express compare-and-swap.  This
+;;;;       needs LOCK CMPXCHG on x64 and LDAXR/STLXR on aarch64 added to the
+;;;;       translators.  Until then a CAS built from XCHG would be a lie.
+;;;;
+;;;; THE GATE IS "MORE THAN ONE THREAD OF CONTROL IS LIVE", not "is this
+;;;; hosted".  %RT-THREADS-LIVE-P (mvm/prelude.lisp — NOT in the hosted-only
+;;;; group, so it exists on every target and reads 0 where nothing armed it)
+;;;; is the hosted half.  Bare-metal SMP must arm the same predicate when it
+;;;; starts a second CPU, so the atomics flip to the safe path by themselves
+;;;; rather than by someone remembering.
+;;;;
+;;;; HOW TO TEST IT WITHOUT HARDWARE: `-smp 2` under QEMU is sufficient.  The
+;;;; oracle already exists in test/hosted-mutex.lisp — its negative control
+;;;; loses 261,813 of 600,000 unprotected increments and exactly 0 under the
+;;;; mutex.  A bare-metal port of that shape is the acceptance test; an
+;;;; atomics test that cannot lose an update when the protection is removed
+;;;; is not testing anything.
+;;;;
 ;;;; =====================================================================
 ;;;; STATUS AS OF NATIVE THREADS (2026-08-22): **UNUSABLE UNDER SMP.**
 ;;;; THIS FILE IS NO LONGER SAFE IN A PROCESS THAT HAS STARTED A THREAD.

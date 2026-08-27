@@ -94,6 +94,21 @@
 (defconstant +mcgc-cfg-freelist-count+ #x10000E28)  ; current free page count
 (defconstant +mcgc-cfg-alloc-page+     #x10000E30)  ; current alloc page index
 (defconstant +mcgc-cfg-data-end+       #x10000E38)  ; raw addr one past data region
+;; THIS LIST IS NOT THE WHOLE BLOCK.  mvm/translate-x64.lisp declares eleven
+;; MORE config words at 0x10000E40..0x10000EA8 (the stage-4 page-collector
+;; scratch) which boot does not initialise and therefore does not name here.
+;; Reading only this list is how WS5 #223 first put the JIT constant-vector root
+;; at 0x10000E40 — on top of +mcgc-cfg-run-start-addr+.  The assert below keeps
+;; that root clear of the entire MCGC block; grep `#x10000[EF]..` repo-wide
+;; before claiming any word in this range.
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (assert (or (< modus.mvm.x64::*x64-jit-constvec-root* #x10000E00)
+              (> modus.mvm.x64::*x64-jit-constvec-root* #x10000EA8))
+          () "WS5 #223: *x64-jit-constvec-root* ~X collides with the MCGC config block 0x10000E00..0x10000EA8"
+          modus.mvm.x64::*x64-jit-constvec-root*)
+  (assert (< modus.mvm.x64::*x64-jit-constvec-root* #x10000FF0)
+          () "WS5 #223: *x64-jit-constvec-root* ~X is past the end of the fixed BSS block"
+          modus.mvm.x64::*x64-jit-constvec-root*))
 
 ;; When GC is enabled, R14 = midpoint (GC fires at half heap).
 ;; When GC is disabled, R14 = full heap size (no GC trigger).

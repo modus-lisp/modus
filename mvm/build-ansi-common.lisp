@@ -280,7 +280,36 @@
 ;; alist/vector keys (rax, rsi, :e, …) are quoted here EXACTLY as the
 ;; translator quotes them, so per-package interning makes them EQ to the keys
 ;; the translator's reg-info / vreg-phys / emit-jcc compare against.
-(defvar *x64-translator-coinit-source* "
+;; WS5 #223: the x64 gate runner's JIT gate, read from MODUS_USE_JIT with the
+;; SAME predicate build-x64-linux.lisp uses to bake %jit-enabled-p (kept as two
+;; independent reads of one env var rather than a shared special, because the
+;; two files read in different packages at this point).  It selects one optional
+;; line of the co-init below, so a JIT-off gate image is byte-identical to a
+;; build without this change.
+(defvar *x64-jit-on*
+  (let ((v (sb-ext:posix-getenv "MODUS_USE_JIT")))
+    (and v (or (string= v "1") (string-equal v "t") (string-equal v "yes")))))
+
+(defvar *x64-constvec-coinit-line*
+  ;; MUST agree with the host-side (setf modus.mvm.x64::*x64-jit-constvec-p* t)
+  ;; in build-x64-linux.lisp: the emitted li-const indirection is only sound
+  ;; because that host flag put the vector's BSS word in the image collector's
+  ;; root list.
+  (if *x64-jit-on*
+      (concatenate 'string
+        "  (setq *x64-jit-constvec-p* t)
+"
+        ;; #226 FULL SCOPE (opt-in): every JIT li-const through the vector, so
+        ;; const-bearing runtime defuns install native.  MODUS_CONSTVEC_FULL=1
+        ;; on a JIT-ON gate build; off keeps the thunk-only #278 scope.
+        (if (let ((v (sb-ext:posix-getenv "MODUS_CONSTVEC_FULL")))
+              (and v (string= v "1")))
+            "  (setq *x64-jit-constvec-full-p* t)
+"
+            ""))
+      ""))
+
+(defvar *x64-translator-coinit-source* (concatenate 'string "
 ;; #211: read this replica in :MODUS.ASM, the package x64-asm.lisp itself
 ;; declares.  The image interns symbols PER PACKAGE (CLHS 11.1.2), so a
 ;; register name quoted here must be the SAME symbol reg-info's ASSOC sees in
@@ -360,9 +389,9 @@
   (setq *x64-native-code-offset* 0)
   ;; Linux syscalls for any TRAP (not exercised by the trivial-form probe).
   (setq *x64-linux-mode* t)
-  t)
+" *x64-constvec-coinit-line* "  t)
 (in-package :modus.mvm)
-")
+"))
 ;; Co-init: *a64-vreg-to-phys* is a defparameter init-thunk (NOT run at boot —
 ;; CLAUDE.md item 7), so populate it explicitly from %init-aarch64-translator.
 ;; Values are the vreg-index → aarch64-phys-reg map from translate-aarch64.lisp

@@ -3334,6 +3334,28 @@
                            (declare (special *print-escape*))
                            (%write-obj n s nil nil)
                            (%print-string-raw (get-output-stream-string s) stream)))))
+                  ;; ~$ — monetary floating point: ~d,n,w,padchar$
+                  ;; (CLHS 22.3.3.3).  D = fraction digits (default 2);
+                  ;; W/pad map onto the fixed-float printer; N (minimum
+                  ;; integer digits) beyond the default is not simulated.
+                  ;; Was MISSING entirely: quicklisp's progress line
+                  ;; ("~D bytes in ~$ seconds") errored per update inside
+                  ;; the progress handler, and the recovery path consumed
+                  ;; one per-fork handler frame per occurrence — the
+                  ;; install-context frame drain (task #278).
+                  ((= dir 36)
+                   (let ((n (car arg-list)))
+                     (setq arg-list (cdr arg-list))
+                     (if (or (integerp n) (ratiop n) (%ieee-float-p n))
+                         (%format-fixed-float n param3
+                                              (if param1 param1 2)
+                                              nil nil param4 atp stream)
+                         (let ((s (make-string-output-stream))
+                               (*print-escape* nil))
+                           (declare (special *print-escape*))
+                           (%write-obj n s nil nil)
+                           (%print-string-raw (get-output-stream-string s)
+                                              stream)))))
                   ;; ~C — character
                   ((or (= dir 67) (= dir 99))
                    (let ((c (car arg-list)))
@@ -3851,6 +3873,16 @@
                        (return (append (nreverse individual) (car cur))))
                      (setq individual (cons (car cur) individual))
                      (setq cur (cdr cur))))))))
+    ;; CLHS: APPLY accepts function DESIGNATORS — resolve a symbol to its
+    ;; global function.  Compiled call sites resolve constant designators
+    ;; statically, so only this runtime path ever sees a bare symbol
+    ;; (interpreted code, sequence fns spreading #'sym, ql-dist's funcall
+    ;; of hook symbols).  Without this the funcall dispatch below routes
+    ;; the symbol to %SIGNAL-TYPE-ERROR — the task-#278 silent
+    ;; frame-drain that blocked ql:quickload's gunzip step.
+    (when (and fn (symbolp fn))
+      (let ((rf (handler-case (symbol-function fn) (t (c) nil))))
+        (when rf (setq fn rf))))
     ;; Interp-closure dispatch — fast path for runtime-eval'd lambdas.
     (when (and (consp fn) (eq (car fn) '%interp-closure))
       (return-from apply (%call-interp-closure fn all-args)))

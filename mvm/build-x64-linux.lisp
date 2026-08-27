@@ -56,11 +56,19 @@
                      ~%  ;; loaded as the call destination (0xdead0001 = tagged NIL).~
                      ~%  ;; Each value is divided by 2 for print-dec safety~
                      ~%  ;; (raw u64 with arbitrary low bit upsets print-dec).~
-                     ~%  (let ((rip  (mem-ref #x10000C30 :u64))~
-                     ~%        (site (mem-ref #x10000C40 :u64))~
-                     ~%        (rax  (mem-ref #x10000C48 :u64))~
-                     ~%        (siad (mem-ref #x10000C50 :u64))~
-                     ~%        (uctx (mem-ref #x10000C58 :u64)))~
+                     ~%  ;; #226 FATALITY FIX: these slots hold RAW machine words (a stack~
+                     ~%  ;; word, a register) whose LOW BIT can be 1.  compile-ash's bignum~
+                     ~%  ;; guard then dispatches the odd word to BIGNUM-ASH as if it were a~
+                     ~%  ;; heap pointer -> unbounded recursion -> stack exhaustion -> the~
+                     ~%  ;; SIGSEGV handler itself dies and the whole fork/process is killed.~
+                     ~%  ;; That converted a RECOVERABLE fault's report into a FATAL crash~
+                     ~%  ;; (rc=139 at nunion 11088).  Scrub the low bits with %word-logand~
+                     ~%  ;; (raw :and, no tag dispatch) so ash sees an even fixnum word.~
+                     ~%  (let ((rip  (%word-logand (mem-ref #x10000C30 :u64) -8))~
+                     ~%        (site (%word-logand (mem-ref #x10000C40 :u64) -8))~
+                     ~%        (rax  (%word-logand (mem-ref #x10000C48 :u64) -8))~
+                     ~%        (siad (%word-logand (mem-ref #x10000C50 :u64) -8))~
+                     ~%        (uctx (%word-logand (mem-ref #x10000C58 :u64) -8)))~
                      ~%    (when (> rip 0)~
                      ~%      (write-string-serial \" RIP/4=\") (print-dec (ash rip -1))~
                      ~%      (write-string-serial \" SITE/4=\") (print-dec (ash site -1))~
@@ -148,10 +156,11 @@
                      ~%  (write-string-serial \" COND:\")~
                      ~%  (setq *write-object-budget* 80)~
                      ~%  (handler-case (write-object c) (t (e) nil))~
-                     ~%  (let ((rip  (mem-ref #x10000C30 :u64))~
-                     ~%        (site (mem-ref #x10000C40 :u64))~
-                     ~%        (rax  (mem-ref #x10000C48 :u64))~
-                     ~%        (siad (mem-ref #x10000C50 :u64)))~
+                     ~%  ;; #226: %word-logand scrub — see %record-test-fail above.~
+                     ~%  (let ((rip  (%word-logand (mem-ref #x10000C30 :u64) -8))~
+                     ~%        (site (%word-logand (mem-ref #x10000C40 :u64) -8))~
+                     ~%        (rax  (%word-logand (mem-ref #x10000C48 :u64) -8))~
+                     ~%        (siad (%word-logand (mem-ref #x10000C50 :u64) -8)))~
                      ~%    (when (> rip 0)~
                      ~%      (write-string-serial \" RIP/4=\") (print-dec (ash rip -1))~
                      ~%      (write-string-serial \" SITE/4=\") (print-dec (ash site -1))~
@@ -823,25 +832,31 @@
 (defun %ws4-s4-patch-consts (base patches)
   ;; Write each live pool object's tagged word into its movabs imm64 slot.
   ;; PATCHES = list of (imm64-native-off . pool-idx).
+  ;; WS5 #223/#226: a NEGATIVE offset is a constant-vector SIZING record —
+  ;; the emitted load is indirect, there is no immediate to bake.  Writing
+  ;; 8 bytes at base-1 clobbered the page's first instructions and the
+  ;; durability re-exec took a wild jump (RIP=-1; the constvec-full gate
+  ;; regression from test 11088 on).  Skip them, as %jit-patch-consts does.
   (dolist (p patches)
-    (let* ((imm-off (car p))
-           (idx (cdr p))
-           (obj (if *e2-const-pool* (gethash idx *e2-const-pool*) nil))
-           ;; obj's actual tagged native word.  Empirically (see DIAG probe): a
-           ;; heap object/cons value's native tagged word == (%val->word obj)
-           ;; directly — %val->word (SHL 1) maps the runtime value cell to the
-           ;; native word a register holds (raw_addr|tag, e.g. cons tag 0x1).
-           ;; (Contrast the S3 FN path, which additionally SAR-1's then -3's,
-           ;; because a resolved fn OBJECT boxes raw_code|3 one level deeper.)
-           (word (%val->word obj))
-           (a (+ base imm-off))
-           (v word)
-           (j 0))
-      (loop while (< j 8)
-            do (progn
-                 (setf (mem-ref (+ a j) :u8) (logand v 255))
-                 (setq v (ash v -8))
-                 (setq j (+ j 1)))))))
+    (when (>= (car p) 0)
+      (let* ((imm-off (car p))
+             (idx (cdr p))
+             (obj (if *e2-const-pool* (gethash idx *e2-const-pool*) nil))
+             ;; obj's actual tagged native word.  Empirically (see DIAG probe): a
+             ;; heap object/cons value's native tagged word == (%val->word obj)
+             ;; directly — %val->word (SHL 1) maps the runtime value cell to the
+             ;; native word a register holds (raw_addr|tag, e.g. cons tag 0x1).
+             ;; (Contrast the S3 FN path, which additionally SAR-1's then -3's,
+             ;; because a resolved fn OBJECT boxes raw_code|3 one level deeper.)
+             (word (%val->word obj))
+             (a (+ base imm-off))
+             (v word)
+             (j 0))
+        (loop while (< j 8)
+              do (progn
+                   (setf (mem-ref (+ a j) :u8) (logand v 255))
+                   (setq v (ash v -8))
+                   (setq j (+ j 1))))))))
 
 (defun %ws4-s4-force-gc ()
   ;; Force at least one Cheney collection by churning cons allocation until the
@@ -879,6 +894,13 @@
                (lam-offsets (cadr (cddddr tuple))))
           (setq *x64-jit-mode* t)
           (multiple-value-bind (nbuf fn-map) (translate-mvm-to-x64 bc ft-list)
+            ;; WS5 #223: on a JIT-ON image li-const emits a load from the
+            ;; GC-updated constant vector, so this probe must publish the
+            ;; vector before executing the page exactly as %jit-translate-page-1
+            ;; does — otherwise the emitted `mov d,[0x10000E40]` reads 0 and the
+            ;; next load faults.  No-op (and cpatches non-empty, so the
+            ;; re-patch/durability leg below runs unchanged) on a JIT-OFF image.
+            (%jit-sync-constvec (%jit-constvec-need *x64-li-const-patches*))
             (let* ((nlen (code-buffer-position nbuf))
                    (nbytes (code-buffer-bytes nbuf))
                    ;; Snapshot BOTH reloc lists (fresh per translate).
@@ -1787,6 +1809,18 @@
 ;; Functions at code-buffer positions P where (0x15F+P) & 0xF in {1,9} would be
 ;; misidentified as cons/object pointers by compile-funcall.
 (setf modus.mvm.x64::*x64-native-code-offset* 351)
+
+;; WS5 #223: when this gate runner is built JIT-ON, its collector must scan the
+;; JIT constant-vector BSS root, or every const the JIT installs into the vector
+;; dangles after the first collection.  Same MODUS_USE_JIT predicate the
+;; %jit-enabled-p bake and build-ansi-common.lisp's *x64-jit-on* use — all three
+;; must agree.  JIT-OFF leaves the flag NIL, so the emitted collector (and the
+;; whole image, given the co-init line is likewise omitted) is byte-identical to
+;; a build without this change.
+(when (let ((v (sb-ext:posix-getenv "MODUS_USE_JIT")))
+        (and v (or (string= v "1") (string-equal v "t") (string-equal v "yes"))))
+  (setf modus.mvm.x64::*x64-jit-constvec-p* t)
+  (format t "~&;; WS5 #223: JIT constant-vector indirection ENABLED (GC root + li-const)~%"))
 
 ;; MCGC page-pinning test knob (stage 4).  OFF by default — canonical stays on
 ;; the validation Cheney collector.  Set MODUS_MCGC_PINNING=1 for a pinning

@@ -83,6 +83,14 @@
 ;; code addrs are < 4GB so :u32 (tagged load) is exact.
 (defun %hc-frame-ip (n) (mem-ref (+ #x10000408 (* 32 n) 16) :u32))
 (defun %hc-cur-ip () (mem-ref #x10000190 :u32))
+;; BALANCED-CAP counters (all values < 2^32, so tagged :u32 loads are
+;; exact).
+(defun %hc-overflow () (mem-ref #x10000D20 :u32))
+(defun %hc-capcount () (mem-ref #x10000D00 :u32))
+;; Fault-stub scratch (RIP/RSP/[RSP]/RAX at 0x10000C30/C38/C40/C48) as
+;; tagged u32 halves — values can exceed 32 bits, and interpreted :u64
+;; reads are untrustworthy.  i = slot 0..3, j = 0 (lo) / 1 (hi).
+(defun %hc-fault-w (i j) (mem-ref (+ #x10000C30 (* 8 i) (* 4 j)) :u32))
 ")
 
 ;; x86-64 needs no pre-init hardware setup: boot/boot-linux-x64.lisp has already
@@ -138,6 +146,14 @@
 ;; sessions.  build-x64-linux / build-x64 set this; we
 ;; need it too so the generic image survives ANSI sweeps.
 (setf modus.mvm.x64::*x64-gc-enabled* t)
+;; WS5 #223 / #278: this IMAGE's collector must scan the JIT constant-vector
+;; root (BSS 0x10000F00), or a const the JIT mirrored into the vector dangles
+;; after the first collection.  Gated on *jit-on* so a MODUS_NO_JIT build's
+;; emitted collector is byte-identical to pre-#223.  The in-image translator
+;; gets the matching setq from the %init-x64-translator co-init source
+;; (build-cli-common.lisp), which only runs when JIT is on.
+(when cl-user::*jit-on*
+  (setf modus.mvm.x64::*x64-jit-constvec-p* t))
 ;; Linux-x64 layout: enable the CONS-KIND bitmap (GC correctness fix for the
 ;; cons-tagged-scratch symbol-truncation bug).  The kind-bitmap base delta is
 ;; a boot-linux-x64 layout constant, so the master flag is Linux-only for now.

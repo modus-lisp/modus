@@ -60,6 +60,118 @@
    Bound freshly to nil at the start of TRANSLATE-MVM-TO-X64; read
    by ASSEMBLE-KERNEL-IMAGE after translation completes.")
 
+;;; ============================================================
+;;; WS5 #223 — the GC-updated JIT CONSTANT VECTOR
+;;; ============================================================
+;;;
+;;; Baking a const-pool object's CURRENT tagged heap address into a `movabs`
+;;; immediate (the *x64-li-const-patches* scheme above) is only sound while
+;;; something re-bakes the site after every collection.  The JIT seam does that
+;;; for a page re-entered THROUGH the seam (%jit-entry-for, keyed on %gc-count),
+;;; but NOT for a function that has been persistently installed as native code
+;;; (WS5 #222) and is thereafter entered directly by other native code.  That is
+;;; why #222 refused to install any function whose native byte range contained a
+;;; const patch site — quoted literals, strings, &key and special reads all kept
+;;; interpreter trampolines.
+;;;
+;;; The fix is one level of indirection.  Under the JIT we do NOT bake an
+;;; address; we emit a load from slot IDX of an ordinary heap ARRAY:
+;;;
+;;;     movabs d, +x64-jit-constvec-root+     ; a FIXED BSS word, never moves
+;;;     mov    d, [d]                         ; the tagged const vector (tag 9)
+;;;     mov    d, [d + IDX*8 + 7]             ; the const (obj-ref offset formula)
+;;;
+;;; The BSS word is added to the collector's root list (emit-gc-trampoline /
+;;; emit-page-gc-trampoline below), so the GC forwards the vector itself AND —
+;;; via the ordinary Cheney scan of the copied vector — every const inside it.
+;;; Emitted code therefore always reads a CURRENT address with no re-baking at
+;;; all, and *x64-li-const-patches* stays empty in JIT mode, so #222's
+;;; per-function const-cleanliness test passes for every function.
+;;;
+;;; This is the ONE thing the exec page cannot do for itself: the page is mmap'd
+;;; memory outside the GC heap and is never scanned, so a reference held only
+;;; from the page would not keep the vector alive.  Hence the fixed BSS root,
+;;; which the collector already knows how to scan (same two instructions as the
+;;; symbol / keyword / package-by-hash table roots).
+;;;
+;;; Cost: two extra dependent loads per const reference (both L1-resident in any
+;;; loop) in exchange for native installation of every const-bearing function.
+(defvar *x64-jit-constvec-root* #x10000F00
+  "Fixed BSS word holding the tagged JIT constant vector (0 = not yet
+   allocated).  mvm/mvm-eval.lisp's %jit-constvec / %jit-sync-constvec own the
+   Lisp side and MUST use the same address (it is repeated there as a literal
+   because the two files are in different packages and defconstants do not fold
+   in-image).
+
+   ADDRESS CHOICE — this was 0x10000E40 and that was a COLLISION.
+   boot/boot-linux-x64.lisp documents 0x10000E00.. as a free BSS gap and lists
+   the MCGC config words it initialises there (0x10000E00..0x10000E38), but
+   THIS FILE defines eleven more of them below (0x10000E40..0x10000EA8, see
+   +mcgc-cfg-run-start-addr+ onward) — and 0x10000E40 is exactly
+   +mcgc-cfg-run-start-addr+.  Reading only the boot file's list is how the
+   collision got made; the check that finds it is a repo-wide grep for
+   `#x10000[EF]..`.  0x10000F00 is clear of the whole MCGC block by 88 bytes and
+   still inside the mapped BSS (below 0x10000FF0).  boot/boot-linux-x64.lisp
+   carries a host-side assert that keeps it that way.")
+
+(defvar *x64-li-constvec-max* -1
+  "Highest :li-const POOL INDEX emitted through the constant-vector path during
+   the current TRANSLATE-MVM-TO-X64 (-1 = none).  Reset per translation next to
+   *x64-li-const-patches*; read by mvm/mvm-eval.lisp's %jit-sync-constvec, which
+   must size the vector to cover it.
+
+   THIS IS NOT REDUNDANT WITH *e2-const-count*, and assuming it was is what made
+   the constant vector read OUT OF BOUNDS.  `:li-const IDX` has TWO independent
+   index producers in mvm/compiler.lisp:
+     * compile-quote's mvm-eval path — IDX from %e2-const-register, i.e. an
+       *e2-const-pool* index bounded by *e2-const-count*;
+     * compile-quote's *constant-table* path — IDX = (length *constant-table*),
+       a serialized-string-pool index with NO relation to the quote pool, used
+       for string literals >= 256 chars (compiler.lisp ~6169), for *static-build-p*
+       builds, and by the generic `t` fallback (~6236).
+   The baked-immediate path tolerated the second kind by accident:
+   %jit-patch-consts' (gethash idx *e2-const-pool*) missed, and it baked
+   (%val->word nil) — a WRONG VALUE (NIL) but a well-formed, non-faulting word.
+   A vector load of the same index runs off the end of the array and yields an
+   arbitrary heap word, which is a crash, not a wrong value.  So the vector is
+   sized by max(*e2-const-count*, *x64-li-constvec-max* + 1) and its
+   non-pool slots hold NIL — reproducing the old behaviour exactly.")
+
+(defvar *x64-cur-fn-name* nil
+  "Name (string) of the function currently being translated by
+   TRANSLATE-MVM-TO-X64's per-function loop.  Set (not bound) at the top of
+   each iteration.  Read by +op-li-const+ to scope the #223 constant-vector
+   indirection to the SEAM-GUARDED THUNK only (#278): the thunk is the one
+   function entered exactly once, through %jit-entry-for, right after
+   %jit-sync-constvec has run — so its vector loads can never observe a
+   missing/short vector.  Non-thunk functions keep the baked-movabs form,
+   which the R-CONST-BAKED page gate then rejects exactly as before; the
+   accepted-page set is unchanged, but a mid-flight GC can no longer stale a
+   running top-level form's own literals (the ql:quickload killer).")
+
+(defvar *x64-jit-constvec-full-p* nil
+  "FULL-SCOPE constant-vector indirection (#226): when T (and
+   *x64-jit-constvec-p* is on), EVERY JIT-mode li-const emits the vector
+   load — not just the thunk's.  This lifts the R-CONST-BAKED restriction
+   entirely: cpatches stay empty, so const-bearing runtime DEFUNs install
+   as native code (#222) instead of interpreter trampolines.  The payoff
+   is the interpreted-deflate class: a quoted-literal-bearing runtime
+   defun in a hot loop went 12.78s -> 1.22s on the jit-constvec branch.
+   NIL = thunk-only scope (the conservative #278 correctness fix).
+   Rollback: leave this NIL — one flag, no other change.")
+
+(defvar *x64-jit-constvec-p* nil
+  "Enable the constant-vector indirection.  Two effects, deliberately gated on
+   ONE flag so they cannot get out of step:
+     1. emit-gc-trampoline / emit-page-gc-trampoline scan
+        *x64-jit-constvec-root* as a root (needed in the IMAGE's collector, so
+        this is set host-side by every JIT-capable build);
+     2. together with *x64-jit-mode*, +op-li-const+ emits the indirect load
+        instead of the baked movabs (JIT pages only — the image's own li-const
+        sites are patched with static string-pool addresses by
+        assemble-kernel-image and must keep the baked form).
+   NIL host-side for a JIT-off build, so those images are byte-identical.")
+
 (defvar *x64-jit-mode* nil
   "WS4 STAGE 3.  When non-nil (set ONLY by the in-image runtime JIT driver
    around a translate-mvm-to-x64 call), op-call emits an absolute indirect
@@ -1378,16 +1490,83 @@
          ;; The immediate sits at start+2.
          (let* ((vd (first operands))
                 (idx (second operands))
-                (d (dest-phys-or-scratch vd))
-                (start-pos (code-buffer-position buf)))
-           (emit-mov-reg-imm buf d 0)
-           ;; Sanity: 10-byte movabs.  If this changes (e.g. due to
-           ;; small-immediate optimisation in emit-mov-reg-imm), the
-           ;; patch offset below would be wrong.
-           (let ((emitted (- (code-buffer-position buf) start-pos)))
-             (unless (= emitted 10)
-               (error "li-const: expected 10-byte movabs, got ~D" emitted)))
-           (push (cons (+ start-pos 2) idx) *x64-li-const-patches*)
+                (d (dest-phys-or-scratch vd)))
+           (if (and *x64-jit-mode* *x64-jit-constvec-p*
+                    ;; Scope: FULL (#226 — every li-const, lifting the
+                    ;; const restriction so const-bearing defuns install
+                    ;; native) when *x64-jit-constvec-full-p*; otherwise
+                    ;; THUNK-ONLY (#278 hazard-3 fix — see
+                    ;; *x64-cur-fn-name*).
+                    (or *x64-jit-constvec-full-p*
+                        (and (stringp *x64-cur-fn-name*)
+                             (string-equal *x64-cur-fn-name*
+                                           "%MVM-EVAL-THUNK"))))
+               ;; WS5 #223 JIT path: indirect through the GC-updated constant
+               ;; vector, so nothing has to be re-baked after a collection and
+               ;; *x64-li-const-patches* stays EMPTY (which is what lets #222
+               ;; install const-bearing functions natively).  D is used as its
+               ;; own address scratch — no register beyond the destination is
+               ;; touched, exactly as in the baked form.  emit-mov-reg-mem
+               ;; handles the RSP/R12 SIB and RBP/R13 disp8 encodings, and no
+               ;; byte offset is recorded because IDX is known right here.
+               (progn
+                 ;; Record the index on *x64-li-const-patches* with a NEGATIVE
+                 ;; byte offset.  Deliberately this list and not a new global:
+                 ;; %jit-translate-page-1 already reads *x64-li-const-patches*
+                 ;; across the package boundary and that read is proven by the
+                 ;; whole #222 mechanism, whereas a freshly added translator
+                 ;; global is an unverified read on a path where a silent NIL
+                 ;; would size the constant vector too short and turn the slot
+                 ;; load into an out-of-bounds fault.  A -1 offset is inert
+                 ;; everywhere it flows: %jit-fn-native-offsets' range test
+                 ;; `(and (>= off start) (< off end))` can never match a
+                 ;; negative offset against a start >= 0, so the const
+                 ;; restriction stays lifted; %jit-patch-consts skips it
+                 ;; explicitly.
+                 (push (cons -1 idx) *x64-li-const-patches*)
+                 (when (> idx (if (integerp *x64-li-constvec-max*)
+                                  *x64-li-constvec-max* -1))
+                   (setf *x64-li-constvec-max* idx))
+                 ;; #226 ROOT CAUSE FIX: this branch runs IN-IMAGE (the runtime
+                 ;; JIT), where DEFVAR init-forms are NOT run at boot (CLAUDE.md
+                 ;; Active Limitation #7) — so a bare read of
+                 ;; *x64-jit-constvec-root* yields NIL, and the emit path bakes
+                 ;; NIL-as-fixnum = #xDEAD0001>>1 = #x6F568000 as the root
+                 ;; address.  The emitted `movabs d,#x6F568000; mov d,[d];
+                 ;; mov d,[d+idx*8+7]` then reads a zero word from an unrelated
+                 ;; mapped page instead of the vector %jit-sync-constvec
+                 ;; installed at #x10000F00 — every "constant" load returns
+                 ;; garbage (arbitrary heap words / small fixnums where a
+                 ;; function was expected) or faults at idx*8+7.  Under the
+                 ;; thunk-only scope the mis-rooted loads were confined to the
+                 ;; thunk; under the #226 FULL scope every JIT li-const took
+                 ;; this path and the gate died (nunion 11088 et al).
+                 ;; Fall back to the literal exactly as mvm/mvm-eval.lisp's
+                 ;; %jit-constvec / %jit-constvec-install hard-code it (their
+                 ;; comment: defconstants do not fold in-image).  Host-side the
+                 ;; defvar IS initialised to #x10000F00, so image builds are
+                 ;; byte-identical.
+                 (emit-mov-reg-imm buf d (if (integerp *x64-jit-constvec-root*)
+                                             *x64-jit-constvec-root*
+                                             #x10000F00))
+                 (emit-mov-reg-mem buf d d 0)
+                 ;; Slot address = (vec - 9) + 16 + idx*8 = vec + idx*8 + 7,
+                 ;; the same formula +op-obj-ref+ / +op-aref+ use.
+                 (emit-mov-reg-mem buf d d (+ (* idx 8) 7)))
+               ;; Image-build path (unchanged): a MOVABS reg, 0 placeholder whose
+               ;; 8-byte immediate is patched with the tagged pool address at
+               ;; image-assembly time.  emit-mov-reg-imm in 64-bit mode emits
+               ;;   REX.W (1B) | B8+r (1B) | imm64 (8B) = 10 bytes,
+               ;; so the immediate sits at start+2.
+               (let ((start-pos (code-buffer-position buf)))
+                 (emit-mov-reg-imm buf d 0)
+                 ;; Sanity: 10-byte movabs.  If this changes (e.g. due to
+                 ;; small-immediate optimisation in emit-mov-reg-imm), the
+                 ;; patch offset below would be wrong.
+                 (let ((emitted (- (code-buffer-position buf) start-pos)))
+                   (unless (= emitted 10)
+                     (error "li-const: expected 10-byte movabs, got ~D" emitted)))
+                 (push (cons (+ start-pos 2) idx) *x64-li-const-patches*)))
            (maybe-store-scratch buf vd)))
 
         ((op= +op-push+)
@@ -4214,7 +4393,8 @@
 
 ;;; Stage-4 page-collector scratch words (ELF BSS, zero-init; NOT written by
 ;;; boot, so they read 0 until the collector's lazy-init seeds them).  Verified
-;;; free above the 0x10000E00 config block (0x10000E40..0x10000EFF unused).
+;;; free above the 0x10000E00 config block (0x10000E40..0x10000EF8; 0x10000F00
+;;; is *x64-jit-constvec-root*, WS5 #223 — see the top of this file).
 (defconstant +mcgc-cfg-run-start-addr+ #x10000E40)  ; raw addr: start of current alloc run
 (defconstant +mcgc-cfg-run-end-addr+   #x10000E48)  ; raw addr: one past current alloc run
 (defconstant +mcgc-cfg-to-start-addr+  #x10000E50)  ; raw addr: to-run start (this GC)
@@ -4241,6 +4421,13 @@
 (defconstant +mcgc-cfg-seg-count-addr+ #x10000E98)  ; # active to-run segments this GC
 (defconstant +mcgc-cfg-oom-addr+       #x10000EA0)  ; set to 1 if a refill found no free run (true OOM)
 (defconstant +mcgc-cfg-uncap-addr+     #x10000EA8)  ; one-shot: next establish ignores the to-run cap
+;; NEXT FREE MCGC CONFIG SLOT IS 0x10000EB0.  Do NOT run this block past
+;; 0x10000EF8: *x64-jit-constvec-root* (top of this file) owns 0x10000F00.
+;; The reverse mistake has already been made once — 0x10000E40 was claimed for
+;; the JIT constant vector while +mcgc-cfg-run-start-addr+ above already had it,
+;; because boot/boot-linux-x64.lisp's "verified-free gap" comment only lists the
+;; eight words IT initialises, not the eleven declared here.  Grep
+;; `#x10000[EF]..` across the whole repo before claiming any word in this range.
 (defconstant +mcgc-max-segments+ 4096)              ; seg[] capacity (64 KiB of metadata slack)
 
 (defconstant +mcgc-page-shift+ 12)                  ; 4 KiB pages
@@ -4635,6 +4822,7 @@
         (no-ovf (make-label)))
     (emit-label buf pop-label)
     (emit-bytes buf #x50)                            ; push rax
+
     (progn
       ;; BALANCED-CAP (universal): if the live-overflow word [0x10000D20]
       ;; is non-zero, this pop textually matches a CAPPED push (whose
@@ -4972,6 +5160,18 @@
     ;; root slot the GC must forward.
     (emit-mov-reg-imm buf 'rax #x10000170)
     (emit-call buf scan-word-label)
+    ;; WS5 #223: the JIT constant vector at *x64-jit-constvec-root*.  Same
+    ;; convention again — a fixed BSS word holding a tagged heap ARRAY that the
+    ;; collector must forward; forwarding the array then makes the ordinary
+    ;; Cheney scan of its copied payload forward every const inside it, which is
+    ;; what makes a baked-address-free `mov d,[vec + idx*8 + 7]` correct across
+    ;; a collection with no re-patching.  The word is 0 until the first const-
+    ;; bearing JIT page is built; scan_word rejects tag 0, so scanning it early
+    ;; is a no-op.  Gated: emitted ONLY in a JIT-capable image, so a JIT-off
+    ;; build's collector is byte-identical.
+    (when *x64-jit-constvec-p*
+      (emit-mov-reg-imm buf 'rax *x64-jit-constvec-root*)
+      (emit-call buf scan-word-label))
     ;; NOTE: the pre-interned signal-condition symbols ('TYPE-ERROR /
     ;; 'PROGRAM-ERROR / 'UNDEFINED-FUNCTION) no longer live in raw slots
     ;; 0xCA0/0xCA8/0xCB0 — those slots were NOT scanned here, so after the
@@ -5879,6 +6079,11 @@
     (emit-mov-reg-imm buf 'rax #x10000088) (emit-call buf scan-word-label)
     (emit-mov-reg-imm buf 'rax #x10000148) (emit-call buf scan-word-label)
     (emit-mov-reg-imm buf 'rax #x10000170) (emit-call buf scan-word-label)
+    ;; WS5 #223 JIT constant-vector root — see emit-gc-trampoline.  Kept in
+    ;; lock-step with the Cheney collector's root list so the MCGC page
+    ;; collector (gated off by default) cannot silently drop it if enabled.
+    (when *x64-jit-constvec-p*
+      (emit-mov-reg-imm buf 'rax *x64-jit-constvec-root*) (emit-call buf scan-word-label))
     (let ((mv-loop (make-label)) (mv-done (make-label)))
       (emit-mov-reg-imm buf 'rax #x10000090)
       (emit-mov-reg-mem buf 'r10 'rax 0)
@@ -6538,6 +6743,12 @@
    tagged constant-pool addresses."
   ;; Reset the patch list for this translation.
   (setf *x64-li-const-patches* nil)
+  ;; WS5 #223: reset the constant-vector high-water index (the JIT path records
+  ;; here instead of pushing a byte patch site).
+  (setf *x64-li-constvec-max* -1)
+  ;; #278: reset the current-function name so a translation whose function
+  ;; table lacks a thunk cannot inherit a stale "in the thunk" answer.
+  (setf *x64-cur-fn-name* nil)
   ;; WS4 STAGE 3: reset the out-of-module CALL relocation list.
   (setf *x64-call-relocs* nil)
   ;; WS4 (Class 2): reset the out-of-module FN-ADDR relocation list.
@@ -6615,6 +6826,9 @@
             for offset = (second entry)
             for length = (third entry)
             do
+               ;; #278: publish the current function's name for the
+               ;; +op-li-const+ thunk-only constant-vector scope check.
+               (setf *x64-cur-fn-name* name)
                (let* ((fn-label (aref fn-labels i))
                       (state (make-translate-state
                               :buf buf

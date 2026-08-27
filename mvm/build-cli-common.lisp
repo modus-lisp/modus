@@ -345,7 +345,8 @@
 ;; the image runtime, so %jit-translate-page would otherwise read the defvar
 ;; default (NIL) and emit gc-checks/trampoline inconsistently with the baked code.
 (defvar *jit-coinit-source*
-  (when (and *jit-on* (eq *cli-arch* :x64)) "
+  (when (and *jit-on* (eq *cli-arch* :x64))
+   (concatenate 'string "
 ;; #211: read this replica in :MODUS.ASM, the package x64-asm.lisp itself
 ;; declares.  The image interns symbols PER PACKAGE (CLHS 11.1.2), so a
 ;; register name quoted here must be the SAME symbol reg-info's ASSOC sees in
@@ -423,9 +424,35 @@
   (setq *x64-gc-enabled* t)
   (setq *linux-x64-r14-offset* #x38000000)
   (setq *jit-xlate-err-info* nil)
-  t)
+  ;; WS5 #223 / #278: emit the THUNK's li-const as a load from the GC-updated
+  ;; constant vector instead of a baked heap address, so a mid-flight
+  ;; collection cannot stale a running top-level form's literals.  MUST match
+  ;; the host-side (setf modus.mvm.x64::*x64-jit-constvec-p* t) that put the
+  ;; vector's BSS word in this image's collector root list — the emitted load
+  ;; is only sound because that root exists.
+  (setq *x64-jit-constvec-p* t)
+  ;; #226 FULL SCOPE is a BUILD-TIME OPT-IN (MODUS_CONSTVEC_FULL=1): every
+  ;; JIT li-const goes through the vector, so const-bearing runtime defuns
+  ;; (the interpreted-deflate class) install native — ql:quickload drops
+  ;; from ~25min to ~45s and is verified end-to-end at that setting.  It is
+  ;; NOT the default because the JIT-on ANSI gate exposes a residual
+  ;; eval-result corruption under full scope (RUN-TYPEP-DEBUG-TESTS calls a
+  ;; fixnum; deterministic repro `gate-bin 11080 11140`, task #226) that
+  ;; thunk-only scope does not have.  The optional setq is spliced in by the
+  ;; concatenation below when the env knob is set.
+"
+   ;; #226 is FIXED (the in-image root-address defvar read; see the
+   ;; translate-x64 literal-fallback commit), so FULL scope is the DEFAULT —
+   ;; it is what makes ql:quickload take ~45s instead of ~25min.  Set
+   ;; MODUS_CONSTVEC_FULL=0 to fall back to thunk-only scope.
+   (if (let ((v (sb-ext:posix-getenv "MODUS_CONSTVEC_FULL")))
+         (and v (string= v "0")))
+       ""
+       "  (setq *x64-jit-constvec-full-p* t)
+")
+   "  t)
 (in-package :modus.mvm)
-"))
+")))
 
 ;; Baked boot hook + JIT gate.  Appended LAST so its %jit-enabled-p wins over
 ;; mvm-eval.lisp's base version (last-defun).  When JIT is OFF both defuns are

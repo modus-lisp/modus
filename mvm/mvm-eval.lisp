@@ -408,10 +408,226 @@
 
 (defun %jit-patch-consts (base cpatches)
   "Bake each live const-pool object's tagged native word into its movabs imm64.
-   CPATCHES = list of (imm64-native-off . pool-idx).  Re-runnable after GC."
+   CPATCHES = list of (imm64-native-off . pool-idx).  Re-runnable after GC.
+
+   WS5 #223: CPATCHES is EMPTY on x64 whenever the constant-vector indirection
+   is active (*x64-jit-constvec-p*), because the translator then emits a load
+   from the GC-updated vector instead of a baked address.  This function stays
+   for the aarch64 back-end (GC off, pool never moves) and for any build that
+   leaves the indirection off."
   (dolist (p cpatches)
-    (let ((obj (if *e2-const-pool* (gethash (cdr p) *e2-const-pool*) nil)))
-      (%jit-write-imm64 base (car p) (%val->word obj)))))
+    ;; A NEGATIVE offset is a WS5 #223 constant-vector record, not a byte patch
+    ;; site: there is no immediate to bake, the index is carried only so
+    ;; %jit-constvec-need can size the vector.  Skip it.
+    (when (>= (car p) 0)
+      (let ((obj (if *e2-const-pool* (gethash (cdr p) *e2-const-pool*) nil)))
+        (%jit-write-imm64 base (car p) (%val->word obj))))))
+
+(defun %jit-constvec-need (cpatches)
+  "1 + the highest constant-vector index in CPATCHES (the entries with a
+   negative byte offset), or 0 if there are none.  Computed from the list
+   %jit-translate-page-1 already snapshots, so no additional cross-package
+   global read sits on the path that decides the vector's length."
+  (let ((mx -1))
+    (dolist (p cpatches)
+      (when (and (< (car p) 0) (> (cdr p) mx))
+        (setq mx (cdr p))))
+    (+ mx 1)))
+
+(defvar *jit-cv-sites* nil
+  "DIAGNOSTIC: pages built carrying at least one constant-vector site.")
+(defvar *jit-cv-reject* nil
+  "How many page builds were REJECTED because the installed constant vector did
+   not cover the module's own indices.  Nonzero means the sizing path is wrong;
+   the page is not used, so the form interprets instead of faulting.")
+(defvar *jit-cv-diag* nil
+  "Bounded diagnostic-print budget; NIL until first use.")
+
+(defun %jit-cv-verbose-p ()
+  "Opt-in gate for the WS5 #223 constant-vector diagnostics.  T prints a bounded
+   CVDIAG line per checkpoint; NIL (default) keeps the JIT path silent."
+  nil)
+
+(defun %jit-constvec-covers-p (cpatches where)
+  "T if the INSTALLED constant vector exists and is long enough for every
+   constant-vector index this module was compiled against.
+
+   This is a correctness guard, not just a probe.  The emitted sequence is
+   `movabs d,<root>; mov d,[d]; mov d,[d + idx*8 + 7]` — if the root is 0 or the
+   vector is shorter than IDX, that third instruction reads unmapped memory and
+   the process dies with no diagnosable state.  There is no way to bounds-check
+   it in the emitted code, so it is checked HERE, once per page build, against
+   the same list the sizing used.  A failure returns NIL and the caller
+   abandons the page, so the form interprets — wrong-but-alive instead of a
+   SIGSEGV, and the interpret path is byte-for-byte the pre-#223 behaviour.
+
+   The vector's REAL length is read with %prim-array-length rather than trusting
+   *jit-constvec-cap*: if the bug is that the cap bookkeeping disagrees with the
+   object, trusting the bookkeeping would make this guard agree with the bug."
+  (let ((n 0) (mx -1))
+    (dolist (p cpatches)
+      (when (< (car p) 0)
+        (setq n (+ n 1))
+        (when (> (cdr p) mx) (setq mx (cdr p)))))
+    (if (eql n 0)
+        t
+        (let* ((v (%jit-constvec))
+               (vlen (if v (%prim-array-length v) 0))
+               ;; INTACTNESS, not just length.  The vector is reachable ONLY
+               ;; from the BSS root, so if the collector ever declines to
+               ;; forward it (rather than merely moving it) the root points at
+               ;; recycled from-space and every slot read is garbage — which
+               ;; looks exactly like the observed fault.  Slot 0 must still be
+               ;; pool entry 0; comparing against the pool, which is rooted
+               ;; through the globals alist, detects recycling for free.
+               (intact (or (null *e2-const-count*) (eql *e2-const-count* 0)
+                           (and v (> vlen 0)
+                                (eq (aref v 0) (gethash 0 *e2-const-pool*)))))
+               (ok (and v (> vlen mx) intact)))
+          (setq *jit-cv-sites* (if *jit-cv-sites* (+ 1 *jit-cv-sites*) 1))
+          (when (null *jit-cv-diag*) (setq *jit-cv-diag* 0))
+          (unless ok
+            (setq *jit-cv-reject* (if *jit-cv-reject* (+ 1 *jit-cv-reject*) 1)))
+          ;; Bounded output: the first few pages carrying sites, plus the first
+          ;; few rejections.  A gate run builds tens of thousands of pages, so an
+          ;; unbounded print would bury the answer it is meant to produce.
+          ;; Diagnostics are OPT-IN (%jit-cv-verbose-p, a defun not a defvar —
+          ;; defvar init-thunks do not run in-image).  A shipping CLI must not
+          ;; print to stdout on the JIT path; flip the defun to T to debug.
+          (when (and (%jit-cv-verbose-p)
+                     (< *jit-cv-diag* 12) (or (not ok) (< *jit-cv-sites* 4)))
+            (setq *jit-cv-diag* (+ *jit-cv-diag* 1))
+            (format t "CVDIAG ~A ok=~A sites=~D maxidx=~D vlen=~D intact=~A cap=~S hi=~S count=~S~%"
+                    where (if ok "T" "NIL") n mx vlen (if intact "T" "NIL")
+                    *jit-constvec-cap* *jit-constvec-hi* *e2-const-count*))
+          ok))))
+
+;;; ============================================================
+;;; WS5 #223 — the GC-updated JIT constant vector (Lisp side)
+;;; ============================================================
+;;;
+;;; The translator (mvm/translate-x64.lisp, +op-li-const+) compiles a quoted
+;;; literal reference to
+;;;
+;;;     movabs d, 0x10000F00 ; mov d,[d] ; mov d,[d + idx*8 + 7]
+;;;
+;;; i.e. slot IDX of an ordinary heap ARRAY reachable from a fixed BSS word that
+;;; the collector scans as a root.  This file owns that array: allocating it,
+;;; installing it in the BSS word, growing it, and keeping slot I equal to
+;;; (gethash I *e2-const-pool*).
+;;;
+;;; The pool is APPEND-ONLY (%e2-const-register in mvm/compiler.lisp hands out
+;;; *e2-const-count* and increments; nothing ever rewrites or removes an entry),
+;;; so synchronisation is a high-water mark, not a rescan: only indices
+;;; [*jit-constvec-hi*, *e2-const-count*) are ever copied.  Total work over a
+;;; session is O(number of consts), not O(consts x pages).
+;;;
+;;; Retention: the vector holds a second reference to every const the pool
+;;; already holds forever, so it adds NO new retention class — *e2-const-pool*
+;;; is itself an unbounded append-only global.
+;;;
+;;; 0x10000F00 is repeated here as a literal rather than shared with the
+;;; translator's *x64-jit-constvec-root*: the two files are in different
+;;; packages, and an in-image defconstant does not fold.  If one moves, move both.
+
+(defvar *jit-constvec-cap* nil
+  "Allocated length of the JIT constant vector, or NIL before the first sync.")
+
+(defvar *jit-constvec-hi* nil
+  "High-water mark: pool indices [0,*jit-constvec-hi*) are already mirrored into
+   the vector.  NIL before the first sync.")
+
+(defun %jit-constvec ()
+  "The live JIT constant vector, or NIL if none has been installed yet.
+   ALWAYS re-read through this — never cache the array across an allocation,
+   because the collector moves it and updates the BSS word in place.
+   `mem-ref :u64` is a raw-word reinterpret in both directions (the keyword
+   intern table at #x10000148 is stored and read exactly this way, see
+   init-keyword-table / find-symbol), so an unset root reads back as FIXNUM 0."
+  (let ((w (mem-ref #x10000F00 :u64)))
+    (if (eql w 0) nil w)))
+
+(defun %jit-constvec-install (v)
+  "Publish V as the JIT constant vector by storing its tagged word in the fixed
+   BSS root the emitted code loads from and the collector forwards."
+  (setf (mem-ref #x10000F00 :u64) v)
+  v)
+
+(defun %jit-sync-constvec (vneed)
+  "Make the JIT constant vector hold every *e2-const-pool* entry registered so
+   far AND be long enough for every :li-const index the translation just
+   emitted.  Returns the pool high-water mark.
+
+   Called from %jit-translate-page-1 after translation (so both
+   *e2-const-count* and *x64-li-constvec-max* are final) and BEFORE the page is
+   executed.  Idempotent and cheap in the steady state: when nothing new was
+   registered it is a few global reads and a comparison.
+
+   VNEED is 1 + the highest constant-vector index this translation emitted
+   (%jit-constvec-need of the caller's *x64-li-const-patches* snapshot).
+
+   TWO BOUNDS, NOT ONE.  Sizing by *e2-const-count* alone is WRONG and was the
+   cause of a whole class of gate SIGSEGVs: compile-quote also emits :li-const
+   with a *constant-table* index (string literals >= 256 chars and the generic
+   quote fallback), which has no relation to the quote pool and can exceed it.
+   The baked-immediate path absorbed that silently — %jit-patch-consts' gethash
+   missed and it baked (%val->word nil) — but a vector load of the same index
+   reads PAST THE END of the array and yields an arbitrary heap word.  So the
+   vector covers max(*e2-const-count*, *x64-li-constvec-max* + 1) and every slot
+   that is not a live pool entry holds NIL, which reproduces the old value
+   exactly.  See the constant-vector records in mvm/translate-x64.lisp's
+   +op-li-const+ handler.
+
+   The NIL prefill also replaces MAKE-ARRAY's fixnum-0 fill: 0 is not what the
+   baked path produced, and it is TRUE in CL, so a stale slot read as 0 would
+   change behaviour rather than merely being unhelpful.
+
+   GC safety: MAKE-ARRAY may collect.  The OLD vector stays reachable through
+   the BSS root across that collection and is re-read afterwards; the NEW vector
+   is only reachable from this frame's stack slot, which the conservative root
+   scan finds and updates.  Neither AREF nor ASET allocates, so no collection
+   can happen inside any of the loops."
+  (let* ((n (if *e2-const-count* *e2-const-count* 0))
+         (need (if (> vneed n) vneed n)))
+    (when (null *jit-constvec-cap*) (setq *jit-constvec-cap* 0))
+    (when (null *jit-constvec-hi*) (setq *jit-constvec-hi* 0))
+    (when (> need *jit-constvec-cap*)
+      (let* ((want (let ((c (if (> *jit-constvec-cap* 0)
+                                (* *jit-constvec-cap* 2)
+                                1024)))
+                     (if (< c need) need c)))
+             (nv (make-array want)))
+        ;; NIL-fill first (see the docstring): every slot that never receives a
+        ;; pool entry must read back NIL, not MAKE-ARRAY's fixnum 0.
+        (let ((k 0))
+          (loop
+            (when (>= k want) (return nil))
+            ;; CLAUDE.md limitation 2: a variable-index ASET in non-last
+            ;; position needs a binding to force dest=frame-slot.
+            (let ((dummy (aset nv k nil))) dummy)
+            (setq k (+ k 1))))
+        ;; re-read AFTER the alloc: a GC inside make-array moves the old vector
+        ;; and rewrites the BSS root.
+        (let ((old (%jit-constvec))
+              (k 0)
+              (lim *jit-constvec-hi*))
+          (loop
+            (when (>= k lim) (return nil))
+            (let ((dummy (aset nv k (aref old k)))) dummy)
+            (setq k (+ k 1))))
+        (%jit-constvec-install nv)
+        (setq *jit-constvec-cap* want)))
+    ;; Mirror only genuinely-new POOL entries.  The high-water mark tracks the
+    ;; POOL, never the allocated length — slots past *e2-const-count* stay NIL
+    ;; and are correctly overwritten later if the pool grows into them.
+    (let ((k *jit-constvec-hi*))
+      (loop
+        (when (>= k n) (return nil))
+        (let ((o (if *e2-const-pool* (gethash k *e2-const-pool*) nil)))
+          (let ((dummy (aset (%jit-constvec) k o))) dummy))
+        (setq k (+ k 1))))
+    (setq *jit-constvec-hi* n)
+    n))
 
 (defun %jit-patch-consts-aarch64 (base cpatches)
   "aarch64 sibling of %jit-patch-consts: bake each live const-pool object's
@@ -420,6 +636,19 @@
    The caller must flush the I-cache over the patched range."
   (dolist (p cpatches)
     (let ((obj (if *e2-const-pool* (gethash (cdr p) *e2-const-pool*) nil)))
+      (%jit-write-movz-quad base (car p) (%val->word obj)))))
+
+;; Pool-EXPLICIT patcher variants for the cross-page sweep
+;; (%jit-refresh-all-pages): identical to the two above but read POOL, the
+;; page's OWN const pool (stored in its jit-entry), instead of the global
+;; *e2-const-pool* — which is only that page's pool at its own seam.
+(defun %jit-patch-consts-pool (base cpatches pool)
+  (dolist (p cpatches)
+    (let ((obj (if pool (gethash (cdr p) pool) nil)))
+      (%jit-write-imm64 base (car p) (%val->word obj)))))
+(defun %jit-patch-consts-aarch64-pool (base cpatches pool)
+  (dolist (p cpatches)
+    (let ((obj (if pool (gethash (cdr p) pool) nil)))
       (%jit-write-movz-quad base (car p) (%val->word obj)))))
 
 (defun %jit-reloc-calls (base relocs rt-table)
@@ -569,21 +798,28 @@
 ;;; so the conservative root scan ignores it.  The cost is that a REDEFINITION
 ;;; leaks its predecessor's page (a few KB); see %jit-install-native-fns.
 ;;;
-;;; THE CONST-POOL RESTRICTION (the reason this is per-FUNCTION, not per-page).
-;;; %jit-patch-consts bakes each const-pool object's CURRENT tagged heap address
-;;; into a movabs immediate.  Those objects MOVE under the Cheney collector, and
-;;; the existing re-bake (%jit-entry-for, keyed on %gc-count) only fires when a
-;;; page is re-entered THROUGH THE SEAM.  A persistently-installed function is
-;;; entered directly by native code, so nothing would re-bake it and a GC would
-;;; leave it holding a dangling from-space address.  There is no Lisp-visible
-;;; post-GC hook to fix this from here (gc_trampoline is emitted assembly and
-;;; never calls back into Lisp).  So a function is installed natively only when
-;;; NO const patch site falls inside ITS OWN native byte range — which is why
-;;; %jit-fn-native-offsets computes per-function ranges rather than gating the
-;;; whole page on (null cpatches).  A defun that closes over a quoted literal or
-;;; a string keeps its interpreter trampoline; it is correct, just not native.
-;;; Lifting that restriction needs an indirection through a GC-updated constant
-;;; vector (a translator + collector change) and is deliberately out of scope.
+;;; THE CONST-POOL RESTRICTION — LIFTED by WS5 #223 (the constant vector).
+;;; %jit-patch-consts USED TO bake each const-pool object's CURRENT tagged heap
+;;; address into a movabs immediate.  Those objects MOVE under the Cheney
+;;; collector, and the re-bake (%jit-entry-for, keyed on %gc-count) only fires
+;;; when a page is re-entered THROUGH THE SEAM.  A persistently-installed
+;;; function is entered directly by native code, so nothing re-baked it and a GC
+;;; left it holding a dangling from-space address.  There is no Lisp-visible
+;;; post-GC hook to fix that from here (gc_trampoline is emitted assembly and
+;;; never calls back into Lisp), so a function was installed natively only when
+;;; NO const patch site fell inside ITS OWN native byte range — quoted literals,
+;;; strings, &key and special reads all kept interpreter trampolines.
+;;;
+;;; The restriction is now gone at its root: under *x64-jit-constvec-p* the
+;;; translator emits `movabs d,<fixed BSS root>; mov d,[d]; mov d,[d+idx*8+7]`,
+;;; a load from an ordinary heap array the collector forwards, so no address is
+;;; ever baked and nothing needs re-baking.  *x64-li-const-patches* is therefore
+;;; EMPTY on that path and %jit-fn-native-offsets' cleanliness test admits every
+;;; function.  The per-function range analysis is KEPT rather than deleted: it is
+;;; the safety interlock that makes the feature correct-by-construction if the
+;;; indirection is ever off (a different back-end, a build that leaves the flag
+;;; NIL) — cpatches non-empty then re-imposes exactly the old, conservative rule.
+;;; See the WS5 #223 block above %jit-sync-constvec for the mechanism.
 
 (defun %jit-fn-native-offsets (ft-list fn-map nlen cpatches)
   "Alist (NAME . NATIVE-BYTE-OFFSET) for every function of FT-LIST whose native
@@ -776,14 +1012,23 @@
     ;; does.  So: a const patch site inside ANY non-thunk function rejects the
     ;; page; const sites confined to the thunk are allowed to bake.
     ;;
-    ;; RESIDUAL, stated rather than hidden: hazard 3 above survives for the
-    ;; THUNK'S OWN consts — a single top-level form holding a quoted literal
-    ;; that itself allocates past the collection threshold still reads a stale
-    ;; address after that mid-flight GC.  Closing that too needs the const pool
-    ;; reached through a GC-UPDATED INDIRECTION (task #226's constant vector),
-    ;; after which this whole gate can be deleted.  *jit-r-const-baked* counts
-    ;; how often the gate fires.
-    (let ((%cpatches *x64-li-const-patches*))
+    ;; RESIDUAL — NOW CLOSED for the thunk (#278, hazard-3 fix): the thunk's
+    ;; own consts no longer bake at all.  With *x64-jit-constvec-p* on, the
+    ;; translator emits the THUNK's :li-const as a load through the GC-updated
+    ;; constant vector (WS5 #223's indirection, scoped to the one function that
+    ;; is entered only through the seam), recording a NEGATIVE-offset sizing
+    ;; entry instead of a byte patch site.  A mid-flight collection therefore
+    ;; can no longer stale a running top-level form's remaining literals — the
+    ;; proven ql:quickload killer (the "~&>>> " loader-loop SIGSEGV).  NON-thunk
+    ;; consts still emit baked movabs sites and this gate still rejects any
+    ;; page carrying one, so the accepted-page set is unchanged.  Deleting the
+    ;; gate entirely (vector loads everywhere) is the full #226 follow-up.
+    ;; *jit-r-const-baked* counts how often the gate fires.
+    (let ((%cpatches nil))
+      ;; Only POSITIVE offsets are baked movabs patch sites; negative entries
+      ;; are constant-vector sizing records (GC-safe anywhere) — skip them.
+      (dolist (%p *x64-li-const-patches*)
+        (when (>= (car %p) 0) (setq %cpatches (cons %p %cpatches))))
       (when %cpatches
         (let* ((%tlbl (gethash "%MVM-EVAL-THUNK" fn-map))
                (%tstart (if %tlbl (label-position %tlbl) nil)))
@@ -812,6 +1057,16 @@
                     (setq *jit-r-const-baked*
                           (if *jit-r-const-baked* (+ 1 *jit-r-const-baked*) 1))
                     (return-from %jit-translate-page-1 nil))))))))
+    ;; WS5 #223 (thunk-scoped): mirror every newly registered const-pool entry
+    ;; into the GC-rooted constant vector the thunk's emitted loads read from.
+    ;; Must happen before the page runs; a no-op when the indirection is off.
+    (%jit-sync-constvec (%jit-constvec-need *x64-li-const-patches*))
+    ;; WS5 #223 SAFETY GUARD.  Verify the vector actually covers this module's
+    ;; indices before any of its code can run.  If it does not, abandon the page
+    ;; and let the form interpret — the emitted slot load has no bounds check and
+    ;; an uncovered index is an unmapped read, i.e. an undiagnosable SIGSEGV.
+    (unless (%jit-constvec-covers-p *x64-li-const-patches* "build")
+      (return-from %jit-translate-page-1 nil))
     (let* ((nlen (code-buffer-position nbuf))
            (nbytes (code-buffer-bytes nbuf))
            (relocs *x64-call-relocs*)
@@ -850,9 +1105,13 @@
             (%jit-patch-consts base cpatches)
             ;; 5th = PSIZE (read only on the aarch64 reclaim path; harmless
             ;; here).  6th = the per-function native-offset alist for WS5 #222
-            ;; native DEFUN installation.
+            ;; native DEFUN installation.  7th = THIS module's const pool —
+            ;; %jit-patch-consts reads the GLOBAL *e2-const-pool*, which is
+            ;; only correct at this module's own seam; the cross-page sweep
+            ;; (%jit-refresh-all-pages) must patch from the page's OWN pool.
             (list base eoff cpatches (%gc-count) psize
-                  (%jit-fn-native-offsets ft-list fn-map nlen cpatches)))
+                  (%jit-fn-native-offsets ft-list fn-map nlen cpatches)
+                  *e2-const-pool*))
           nil))))
 
 (defun %jit-translate-page-1-aarch64 (bc mvm-entry ft-list rt-table)
@@ -1015,7 +1274,10 @@
             ;; 5th element = PSIZE, so a transient form's page can be munmap'd
             ;; (%jit-free-page base psize) after its native call — see
             ;; %mvm-eval-jit-run's reclamation.
-            (list base eoff cpat (%gc-count) psize)
+            ;; 6th (fn-native-offsets) unused on this path; 7th = this
+            ;; module's const pool for the cross-page sweep (see the x64
+            ;; creator's comment).
+            (list base eoff cpat (%gc-count) psize nil *e2-const-pool*)
             nil)))))
 
 (defvar *jit-translate-err-count* 0
@@ -1053,6 +1315,62 @@
              (if *jit-fallback-count* (+ 1 *jit-fallback-count*) 1))
        nil)))
 
+(defvar *jit-all-fresh-stamp* nil
+  "The %gc-count as of the last %JIT-REFRESH-ALL-PAGES sweep.  Boots NIL
+   (defvars don't init) so the first call always sweeps.")
+(defvar *jit-refresh-busy* nil
+  "Reentrancy guard: MAPHASH inside the sweep may itself route calls
+   through APPLY, which calls the sweep.")
+
+(defun %jit-refresh-all-pages ()
+  "Re-patch const immediates of EVERY cached runtime-JIT page whose
+   gc-stamp is stale.  %JIT-ENTRY-FOR covers only the mvm-eval cache
+   path; a DIRECT call into a JIT page (APPLY/FUNCALL of a resolved
+   runtime defun, or a JIT-to-JIT baked call) otherwise executes stale
+   const-pool immediates after any GC — task #278's install drain, and
+   a 4-line repro: (eval defun with a quoted literal) + %gc-collect +
+   (funcall 'it) => garbage/fault.  Cheap when clean: one %gc-count
+   read + eql against the sweep stamp."
+  (when (and *jit-page-cache* (not *jit-refresh-busy*))
+    (let ((now (%gc-count)))
+      (unless (eql now *jit-all-fresh-stamp*)
+        (setq *jit-refresh-busy* t)
+        (unwind-protect
+            (let ((stale nil))
+              ;; Collect first — repatching mutates the table (puthash
+              ;; fresh entries) and mutating under maphash is undefined.
+              ;; ONLY entries carrying their OWN pool (7th element) are
+              ;; sweepable: %jit-patch-consts reads the GLOBAL
+              ;; *e2-const-pool*, which belongs to whatever module is
+              ;; current — patching another page against it CORRUPTS that
+              ;; page (measured: the first sweep build broke setup).
+              ;; Pool-less entries stay stale-stamped and are re-baked at
+              ;; their own seam by %jit-entry-for as before.
+              (maphash (lambda (bc hit)
+                         (when (and (not (eql now (cadddr hit)))
+                                    (caddr (cddddr hit)))
+                           (setq stale (cons (cons bc hit) stale))))
+                       *jit-page-cache*)
+              (dolist (pair stale)
+                (let* ((bc (car pair))
+                       (hit (cdr pair))
+                       (pool (caddr (cddddr hit)))
+                       (fresh (list (car hit) (cadr hit) (caddr hit) now
+                                    (car (cddddr hit)) (cadr (cddddr hit))
+                                    pool)))
+                  (if (eq *jit-target-arch* :aarch64)
+                      (progn
+                        (%jit-patch-consts-aarch64-pool (car fresh) (caddr fresh) pool)
+                        (when (caddr fresh)
+                          (%jit-icache-flush (car fresh)
+                                             (if (car (cddddr fresh))
+                                                 (car (cddddr fresh))
+                                                 4096))))
+                      (%jit-patch-consts-pool (car fresh) (caddr fresh) pool))
+                  (setf (gethash bc *jit-page-cache*) fresh)))
+              (setq *jit-all-fresh-stamp* now))
+          (setq *jit-refresh-busy* nil))))))
+
 (defun %jit-entry-for (bc mvm-entry ft-list rt-table)
   "Return a ready-to-call jit-entry (base eoff cpatches gc-stamp) for BC, using
    *jit-page-cache* (keyed by BC identity) if present — RE-PATCHING const
@@ -1068,8 +1386,11 @@
               ;; A GC moved the const-pool objects; re-bake immediates, then
               ;; re-store a fresh entry with the new stamp (avoid mutating a
               ;; nested list place — build + puthash is compiler-safe).
+              ;; Preserve the 7th element (the page's own pool) for the
+              ;; cross-page sweep.
               (let ((fresh (list (car hit) (cadr hit) (caddr hit) now
-                                 (car (cddddr hit)) (cadr (cddddr hit)))))
+                                 (car (cddddr hit)) (cadr (cddddr hit))
+                                 (caddr (cddddr hit)))))
                 ;; Arch-aware: x64 bakes movabs imm64, aarch64 a MOVZ/MOVK
                 ;; quad, and self-modified aarch64 code needs an I-cache flush
                 ;; over the page before it is branched into again.
@@ -1157,6 +1478,15 @@
           ;; single-value form reads back 1 (the thunk epilogue sets it, but
           ;; be defensive).  A form that sets it >1 falls back for correct MV.
           (setf (mem-ref #x10000090 :u64) 1)
+          ;; WS5 #223 SECOND CHECK, at the LAST moment before control enters the
+          ;; page.  The build-time check proves the vector was correct when the
+          ;; page was made; this one proves it is STILL correct now.  A page can
+          ;; be minutes and many collections old by the time it is re-entered
+          ;; from *jit-page-cache*, and an installed native function's page is
+          ;; re-entered without passing through here at all — so a failure here
+          ;; localises the invalidation to the window between build and call,
+          ;; which is the one thing the fault address cannot tell us.
+          (%jit-constvec-covers-p (caddr je) "precall")
           ;; WS5 #203 POINT OF NO RETURN.  Everything above this line is JIT
           ;; setup: if it signals, no user code has run and the interpret
           ;; fallback is safe.  The instant we branch into the page, the form's

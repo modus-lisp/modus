@@ -557,6 +557,21 @@
 (defvar *tagbody-tags* nil
   "Alist of (tag . label) for tagbody/go")
 
+;; Cross-unit GO (#278: ql's (tagbody retry (handler-case … (go retry))) —
+;; the GO sits inside a handler LAMBDA, a different compilation unit, so the
+;; lexical *tagbody-tags* label is unreachable).  Mirror of *nonlocal-blocks*:
+;; an alist of (TAG-KEY TAG-VALUE TAG-INDEX) that is NOT reset across the
+;; lambda boundary.  A TAGBODY whose tags are GO'd from inside a nested
+;; function form compiles to a dispatch LOOP around a runtime CATCH frame;
+;; the escaping GO emits (%nlx-throw TAG-VALUE TAG-INDEX) and the loop
+;; re-enters the body at that tag's segment.  TAG-KEY = normalize-name for
+;; symbol tags, the integer itself for integer tags (CLHS 5.6.1.2).
+(defvar *nonlocal-tagbodies* nil
+  "Alist of (tag-key tag-value tag-index) for cross-unit tagbody/go")
+
+(defvar *nonlocal-tagbody-tag-counter* 0
+  "Counter for generating unique non-local TAGBODY catch tags")
+
 ;; -------------------------------------------------------------------
 ;; Lexical UNWIND-PROTECT cleanup stack (NLX-through-unwind-protect).
 ;;
@@ -11929,6 +11944,180 @@
    any atom; in practice symbols and integers cover all tests."
   (or (symbolp x) (integerp x)))
 
+(defun %go-tag-key (tag)
+  "Comparable key for a tagbody tag: symbol → name hash (matches the
+   symbol-identity conventions of the nonlocal-block registry), integer →
+   itself."
+  (if (symbolp tag) (normalize-name tag) tag))
+
+(defun %go-escapes-tagbody-p (body tag-keys)
+  "T when BODY contains a (GO tag) with tag ∈ TAG-KEYS inside a
+   function-creating form (lambda / flet / labels / #') — i.e. a GO that
+   the lexical *tagbody-tags* label cannot reach because the lambda
+   boundary resets it (the ql retry-loop shape, #278).  Macroexpands as it
+   walks so handler-case/handler-bind clause lambdas are seen."
+  (let ((found nil))
+    (labels ((walk (form in-fn)
+               (when (and (not found) (consp form)
+                          (progn (setq form (%walker-macroexpand form))
+                                 (consp form)))
+                 (cond
+                   ((%form-op-is form 338547669 "QUOTE") nil)
+                   ((%form-op-is form 502453647 "GO")
+                    (when (and in-fn
+                               (member (%go-tag-key (cadr form)) tag-keys
+                                       :test #'eql))
+                      (setq found t)))
+                   ((%form-op-is form 80380232 "LAMBDA")
+                    (let ((cur (cddr form)))
+                      (loop while (consp cur) do (walk (car cur) t)
+                            (setq cur (cdr cur)))))
+                   ;; RESTART-CASE (a special form here, so no macroexpansion
+                   ;; reveals a lambda): clause BODIES compile as separate
+                   ;; bytecode closures (compile-restart-case), so a GO inside
+                   ;; one is cross-unit — the ql delete-and-retry /
+                   ;; register-local-projects (go :retry) shape (#278).
+                   ((%form-op-is form 308006321 "RESTART-CASE")
+                    (walk (cadr form) in-fn)
+                    (let ((cur (cddr form)))
+                      (loop while (consp cur) do
+                        (let ((bcur (if (consp (car cur)) (cddr (car cur)) nil)))
+                          (loop while (consp bcur) do (walk (car bcur) t)
+                                (setq bcur (cdr bcur))))
+                        (setq cur (cdr cur)))))
+                   ((or (%form-op-is form 445617652 "FLET")
+                        (%form-op-is form 417505106 "LABELS"))
+                    (let ((cur (cadr form)))
+                      (loop while (consp cur) do
+                        (let ((bcur (cddr (car cur))))
+                          (loop while (consp bcur) do (walk (car bcur) t)
+                                (setq bcur (cdr bcur))))
+                        (setq cur (cdr cur))))
+                    (let ((cur (cddr form)))
+                      (loop while (consp cur) do (walk (car cur) in-fn)
+                            (setq cur (cdr cur)))))
+                   ((%form-op-is form 402801909 "FUNCTION")
+                    (walk (cadr form) in-fn))
+                   (t (let ((cur form))
+                        (loop while (consp cur) do (walk (car cur) in-fn)
+                              (setq cur (cdr cur)))))))))
+      (let ((cur body))
+        (loop while (consp cur) do (walk (car cur) nil)
+              (setq cur (cdr cur)))))
+    found))
+
+(defun %tagbody-nlx-unsafe-p (body)
+  "T if the cross-unit-GO catch lowering must not be used: a SAME-UNIT
+   UNWIND-PROTECT in BODY shares the runtime's single setjmp-slot stack
+   with the tagbody's catch frame (the same disqualifier as
+   %block-runtime-catch-unsafe-p case (a)).  An unwind-protect INSIDE a
+   nested lambda is a different unit at runtime — the throw threads
+   through it via the 9525 NLX machinery — so it does not disqualify."
+  (let ((found nil))
+    (labels ((walk (form in-fn)
+               (when (and (not found) (consp form)
+                          (progn (setq form (%walker-macroexpand form))
+                                 (consp form)))
+                 (cond
+                   ((%form-op-is form 338547669 "QUOTE") nil)
+                   ((%form-op-is form 182681998 "UNWIND-PROTECT")
+                    (if in-fn
+                        (let ((cur (cdr form)))
+                          (loop while (consp cur) do (walk (car cur) in-fn)
+                                (setq cur (cdr cur))))
+                        (setq found t)))
+                   ((%form-op-is form 80380232 "LAMBDA")
+                    (let ((cur (cddr form)))
+                      (loop while (consp cur) do (walk (car cur) t)
+                            (setq cur (cdr cur)))))
+                   ((or (%form-op-is form 445617652 "FLET")
+                        (%form-op-is form 417505106 "LABELS"))
+                    (let ((cur (cadr form)))
+                      (loop while (consp cur) do
+                        (let ((bcur (cddr (car cur))))
+                          (loop while (consp bcur) do (walk (car bcur) t)
+                                (setq bcur (cdr bcur))))
+                        (setq cur (cdr cur))))
+                    (let ((cur (cddr form)))
+                      (loop while (consp cur) do (walk (car cur) in-fn)
+                            (setq cur (cdr cur)))))
+                   ((%form-op-is form 402801909 "FUNCTION")
+                    (walk (cadr form) in-fn))
+                   (t (let ((cur form))
+                        (loop while (consp cur) do (walk (car cur) in-fn)
+                              (setq cur (cdr cur)))))))))
+      (let ((cur body))
+        (loop while (consp cur) do (walk (car cur) nil)
+              (setq cur (cdr cur)))))
+    found))
+
+(defun %tagbody-forms-from (body from-tag)
+  "The forms of BODY starting AFTER tag FROM-TAG (NIL = from the start),
+   with all tag atoms removed — one dispatch segment of the cross-unit GO
+   lowering."
+  (let ((out nil) (emitting (null from-tag)))
+    (dolist (item body)
+      (if (%tagbody-tag-p item)
+          (when (and (not emitting) (eql item from-tag))
+            (setq emitting t))
+          (when emitting (push item out))))
+    (nreverse out)))
+
+(defun compile-tagbody-nlx (body tags env dest)
+  "Cross-unit GO lowering (#278).  Compile TAGBODY as a dispatch loop
+   around a runtime CATCH frame:
+
+     (let ((%tb-go-idx -1))
+       (loop
+         (setq %tb-go-idx
+               (catch TAG-VAL
+                 (progn <segment for %tb-go-idx> -2)))
+         (when (eql %tb-go-idx -2) (return nil))))
+
+   Every GO to one of TAGS — same-unit or from inside a nested lambda —
+   compiles to (%nlx-throw TAG-VAL idx) via the *nonlocal-tagbodies*
+   registry (compile-go), which unwinds (running intervening
+   unwind-protect cleanups, 9525) to the catch, whose value re-enters the
+   body at that tag's segment.  Normal completion returns the -2 sentinel
+   and exits the loop.  The (return nil) is lexical out of LOOP's block,
+   NOT out of the catch, so the catch's setjmp teardown is preserved.
+   Segment tails are duplicated per dispatch arm — the caller caps the
+   tag count so the expansion stays small."
+  (incf *nonlocal-tagbody-tag-counter*)
+  (let* ((tag-val (+ 800000000 *nonlocal-tagbody-tag-counter*))
+         (arms (cons (list '(eql %tb-go-idx -1)
+                           (cons 'progn (%tagbody-forms-from body nil)))
+                     nil))
+         (idx 0))
+    (dolist (tg tags)
+      (setq arms (cons (list (list 'eql '%tb-go-idx idx)
+                             (cons 'progn (%tagbody-forms-from body tg)))
+                       arms))
+      (setq idx (+ idx 1)))
+    (let ((%ntb-saved *nonlocal-tagbodies*)
+          (entries nil)
+          (i 0))
+      (dolist (tg tags)
+        (setq entries (cons (list (%go-tag-key tg) tag-val i) entries))
+        (setq i (+ i 1)))
+      ;; Save + setq + unwind-protect restore (NOT a LET binding): the
+      ;; in-image compile of a nested lambda body must see these entries —
+      ;; same reason compile-block manages *nonlocal-blocks* this way.
+      (setq *nonlocal-tagbodies* (append entries %ntb-saved))
+      (unwind-protect
+           (compile-form
+            (list 'let (list (list '%tb-go-idx -1))
+                  (list 'loop
+                        (list 'setq '%tb-go-idx
+                              (list 'catch tag-val
+                                    (list 'progn
+                                          (cons 'cond (reverse arms))
+                                          -2)))
+                        (list 'when (list 'eql '%tb-go-idx -2)
+                              (list 'return nil))))
+            env dest)
+        (setq *nonlocal-tagbodies* %ntb-saved)))))
+
 (defun compile-tagbody (body env dest)
   "Compile (tagbody {tag | form}*).  Tags can be symbols or integers
    per CLHS 5.6.1.2; the previous symbol-only check silently treated
@@ -11940,6 +12129,28 @@
   ;; unwind-protect in the body unwinds every u-p whose seq exceeds this
   ;; — running their cleanups and popping their setjmp frames — before
   ;; branching to the tag (CLHS 5.2).
+  ;;
+  ;; CROSS-UNIT GO (#278): a (go tag) inside a nested lambda (ql's
+  ;; (tagbody retry (handler-case … (error () … (go retry)))) fetch-retry
+  ;; shape) cannot use the lexical label — the lambda boundary resets
+  ;; *tagbody-tags* and the old path compiled the GO to a silent NIL
+  ;; no-op ("WARN: unknown GO tag").  Detect that shape and lower the
+  ;; whole tagbody through a runtime CATCH dispatch loop instead
+  ;; (compile-tagbody-nlx), mirroring compile-block's cross-unit
+  ;; RETURN-FROM.  Capped at 4 tags (segment tails duplicate per arm) and
+  ;; disqualified by a same-unit UNWIND-PROTECT (shared setjmp slot) —
+  ;; those fall back to the old path, no worse than before.
+  (let ((%tb-tags nil))
+    (dolist (item body)
+      (when (%tagbody-tag-p item) (setq %tb-tags (cons item %tb-tags))))
+    (setq %tb-tags (reverse %tb-tags))
+    (when (and %tb-tags
+               (<= (length %tb-tags) 4)
+               (%go-escapes-tagbody-p
+                body (mapcar (function %go-tag-key) %tb-tags))
+               (not (%tagbody-nlx-unsafe-p body)))
+      (compile-tagbody-nlx body %tb-tags env dest)
+      (return-from compile-tagbody)))
   (let ((*tagbody-tags* nil)
         (tb-seq (%uwp-current-seq)))
     ;; First pass: collect tags and create labels
@@ -11958,15 +12169,24 @@
     (compile-nil dest)))
 
 (defun compile-go (tag env dest)
-  "Compile (go tag)"
-  (declare (ignore env dest))
+  "Compile (go tag).  Priority mirrors RETURN-FROM: (1) lexical
+   *tagbody-tags* — same unit, direct branch; (2) *nonlocal-tagbodies* —
+   the target TAGBODY compiled through the cross-unit CATCH dispatch loop
+   (compile-tagbody-nlx), so emit a THROW carrying the tag's dispatch
+   index; (3) warn + NIL (unchanged last resort)."
   ;; assoc with EQL so integer tags compare correctly.
   (let ((entry (assoc tag *tagbody-tags* :test #'eql)))
     (unless entry
-      (progn
-        (format t "  WARN: unknown GO tag ~A~%" tag)
-        (compile-nil dest)
-        (return-from compile-go)))
+      (let ((ne (assoc (%go-tag-key tag) *nonlocal-tagbodies* :test #'eql)))
+        (if ne
+            ;; (%nlx-throw TAG-VAL idx): unwinds (running unwind-protect
+            ;; cleanups) to the tagbody's catch loop, which re-enters the
+            ;; body at this tag's segment.
+            (compile-form (list '%nlx-throw (cadr ne) (caddr ne)) env dest)
+            (progn
+              (format t "  WARN: unknown GO tag ~A~%" tag)
+              (compile-nil dest))))
+      (return-from compile-go))
     ;; entry = (TAG LABEL . TARGET-SEQ).  Run intervening unwind-protect
     ;; cleanups before branching (GO carries no value, so no push/pop).
     (%emit-uwp-unwind-to (cddr entry))

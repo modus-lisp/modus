@@ -1,10 +1,31 @@
 ;;;; cooperative-atomics.lisp — atomic read-modify-write for Modus
 ;;;;
-;;;; STATUS: NOT WIRED INTO ANY BUILD SCRIPT.  Read "WIRING THIS UP" at the
-;;;; end of this header first — reaching these operations from a portable
-;;;; threading library also needs net/genera-compat.lisp, which
-;;;; makes Modus advertise :GENERA.  That is a campaign-level decision, not a
-;;;; local one.
+;;;; STATUS: **WIRED IN AND LIVE — and that is now a HAZARD.**  This line used
+;;;; to read "NOT WIRED INTO ANY BUILD SCRIPT"; that stopped being true and
+;;;; nobody updated it.  Measured in the shipping `./modus` (2026-08-27):
+;;;;
+;;;;   :GENERA in *FEATURES*        => T      (so bordeaux-threads takes its
+;;;;                                           Genera branch, by design)
+;;;;   PROCESS:ATOMIC-INCF          => bound
+;;;;   SYS:STORE-CONDITIONAL        => bound
+;;;;
+;;;; It reaches the image as *GENERA-COMPAT-TEXT* (mvm/build-cli-common.lisp
+;;;; ~1301) and is installed by %INSTALL-GENERA-COMPAT (~1230).
+;;;;
+;;;; So a portable threading library loading on Modus today gets THESE
+;;;; operations — and see the UNUSABLE UNDER SMP block below: Modus now has
+;;;; native OS threads, which falsifies the precondition every one of them
+;;;; rests on.  The wiring was correct when the runtime was cooperative; the
+;;;; runtime changed underneath it.
+;;;;
+;;;; THE FIX IS NOW AVAILABLE AND WAS NOT BEFORE.  Modus has a real mutex
+;;;; (%MUTEX-LOCK / %MUTEX-UNLOCK, net/hosted-sync.lisp, acceptance
+;;;; test/hosted-mutex.lisp 18 checks) and a real XCHG (+OP-ATOMIC-XCHG+).
+;;;; Either route works: take a single global atomics mutex when the threads
+;;;; gate is live (%RT-THREADS-LIVE-P) and fall through to today's code when it
+;;;; is not — the same default-off shape used everywhere else in this tree —
+;;;; or add LOCK CMPXCHG to the translator, which %ATOMIC-CAS needs since XCHG
+;;;; is an unconditional exchange and cannot express compare-and-swap.
 ;;;;
 ;;;; ---------------------------------------------------------------------
 ;;;; !!! SMP LANDMINE — READ THIS BEFORE ENABLING MULTI-CORE !!!

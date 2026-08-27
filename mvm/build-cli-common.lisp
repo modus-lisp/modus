@@ -430,6 +430,10 @@
   ;; vector's BSS word in this image's collector root list — the emitted load
   ;; is only sound because that root exists.
   (setq *x64-jit-constvec-p* t)
+  ;; #226 FULL SCOPE: every JIT li-const goes through the vector, so
+  ;; const-bearing runtime defuns (the interpreted-deflate class) install
+  ;; native.  Rollback: delete this one setq (thunk-only #278 scope stays).
+  (setq *x64-jit-constvec-full-p* t)
   t)
 (in-package :modus.mvm)
 "))

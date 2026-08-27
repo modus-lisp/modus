@@ -296,8 +296,17 @@
   ;; because that host flag put the vector's BSS word in the image collector's
   ;; root list.
   (if *x64-jit-on*
-      "  (setq *x64-jit-constvec-p* t)
+      (concatenate 'string
+        "  (setq *x64-jit-constvec-p* t)
 "
+        ;; #226 FULL SCOPE (opt-in): every JIT li-const through the vector, so
+        ;; const-bearing runtime defuns install native.  MODUS_CONSTVEC_FULL=1
+        ;; on a JIT-ON gate build; off keeps the thunk-only #278 scope.
+        (if (let ((v (sb-ext:posix-getenv "MODUS_CONSTVEC_FULL")))
+              (and v (string= v "1")))
+            "  (setq *x64-jit-constvec-full-p* t)
+"
+            ""))
       ""))
 
 (defvar *x64-translator-coinit-source* (concatenate 'string "

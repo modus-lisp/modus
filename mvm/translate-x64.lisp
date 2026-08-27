@@ -149,6 +149,17 @@
    accepted-page set is unchanged, but a mid-flight GC can no longer stale a
    running top-level form's own literals (the ql:quickload killer).")
 
+(defvar *x64-jit-constvec-full-p* nil
+  "FULL-SCOPE constant-vector indirection (#226): when T (and
+   *x64-jit-constvec-p* is on), EVERY JIT-mode li-const emits the vector
+   load — not just the thunk's.  This lifts the R-CONST-BAKED restriction
+   entirely: cpatches stay empty, so const-bearing runtime DEFUNs install
+   as native code (#222) instead of interpreter trampolines.  The payoff
+   is the interpreted-deflate class: a quoted-literal-bearing runtime
+   defun in a hot loop went 12.78s -> 1.22s on the jit-constvec branch.
+   NIL = thunk-only scope (the conservative #278 correctness fix).
+   Rollback: leave this NIL — one flag, no other change.")
+
 (defvar *x64-jit-constvec-p* nil
   "Enable the constant-vector indirection.  Two effects, deliberately gated on
    ONE flag so they cannot get out of step:
@@ -1481,13 +1492,15 @@
                 (idx (second operands))
                 (d (dest-phys-or-scratch vd)))
            (if (and *x64-jit-mode* *x64-jit-constvec-p*
-                    ;; #278: THUNK-ONLY scope — see *x64-cur-fn-name*.  The
-                    ;; full-scope variant (vector loads in installed
-                    ;; functions too) is branch jit-constvec's unresolved
-                    ;; JIT-on gate SIGSEGV; do not widen this without
-                    ;; closing that first.
-                    (stringp *x64-cur-fn-name*)
-                    (string-equal *x64-cur-fn-name* "%MVM-EVAL-THUNK"))
+                    ;; Scope: FULL (#226 — every li-const, lifting the
+                    ;; const restriction so const-bearing defuns install
+                    ;; native) when *x64-jit-constvec-full-p*; otherwise
+                    ;; THUNK-ONLY (#278 hazard-3 fix — see
+                    ;; *x64-cur-fn-name*).
+                    (or *x64-jit-constvec-full-p*
+                        (and (stringp *x64-cur-fn-name*)
+                             (string-equal *x64-cur-fn-name*
+                                           "%MVM-EVAL-THUNK"))))
                ;; WS5 #223 JIT path: indirect through the GC-updated constant
                ;; vector, so nothing has to be re-baked after a collection and
                ;; *x64-li-const-patches* stays EMPTY (which is what lets #222

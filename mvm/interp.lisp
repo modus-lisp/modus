@@ -958,7 +958,25 @@
                 (let ((rpc (%mvm-longjmp-restore state)))
                   (if rpc
                       (progn (setf regs (mvm-regs state)) (setf pc rpc))
-                      (error "MVM LONGJMP (TRAP #x0511) with no active handler-case"))))
+                      ;; No jmp-buf left in THIS state.  If a condition is in
+                      ;; flight, re-signal THE ORIGINAL OBJECT so it keeps its
+                      ;; identity across the nested-interpret boundary — the
+                      ;; enclosing state's bridge catches it and dispatches it
+                      ;; against ITS handler frames.  Signalling a fresh
+                      ;; SIMPLE-ERROR here (what this did before) destroyed the
+                      ;; condition at the boundary: a library that signals
+                      ;; `(error 'not-found …)' several frames deep reached the
+                      ;; caller's `(handler-case … (lib-error () …))' as an
+                      ;; unrelated SIMPLE-ERROR, so the clause never matched and
+                      ;; the error escaped to the toplevel LOAD swallow.
+                      ;; %interp-inflight-condition is image-side (cl-conditions)
+                      ;; and absent host-side, hence the symbol-function probe.
+                      (let* ((f (and (fboundp '%interp-inflight-condition)
+                                     (symbol-function '%interp-inflight-condition)))
+                             (c (and f (funcall f))))
+                        (if c
+                            (error c)
+                            (error "MVM LONGJMP (TRAP #x0511) with no active handler-case"))))))
                ;; CLEAR-HANDLER (#x0512): the body completed normally — pop the
                ;; jmp-buf so a later error doesn't unwind to this (now exited)
                ;; frame.  Pure pop; PC just advances.

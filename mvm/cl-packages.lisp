@@ -44,6 +44,12 @@
 (defun %pkg-use-list (pkg) (aref (%pkg-data pkg) 4))
 (defun %pkg-used-by (pkg) (aref (%pkg-data pkg) 5))
 (defun %pkg-shadowing (pkg) (aref (%pkg-data pkg) 6))
+;;; Slot 9 — package-local nicknames: an alist of (NICKNAME-STRING . PACKAGE).
+;;; Not ANSI, but de-facto standard (SBCL/CCL/ECL/ABCL) and used by 189 files
+;;; across 26 of the 43 modus-lisp org repos, so a library that says
+;;;   (defpackage #:foo (:local-nicknames (#:dev #:pagetree.device)))
+;;; and then writes `dev:dev-page-size' is unreadable without it.
+(defun %pkg-local-nicknames (pkg) (aref (%pkg-data pkg) 9))
 
 (defun %pkg-set-name (pkg v) (aset (%pkg-data pkg) 0 v))
 (defun %pkg-set-nicknames (pkg v) (aset (%pkg-data pkg) 1 v))
@@ -52,6 +58,32 @@
 (defun %pkg-set-use-list (pkg v) (aset (%pkg-data pkg) 4 v))
 (defun %pkg-set-used-by (pkg v) (aset (%pkg-data pkg) 5 v))
 (defun %pkg-set-shadowing (pkg v) (aset (%pkg-data pkg) 6 v))
+;;; Set once any package acquires a local nickname.  FIND-PACKAGE consults
+;;; *PACKAGE* only when this is true — during %init-packages, FIND-PACKAGE runs
+;;; BEFORE `(setq *package* …)`, and an unguarded read of an unbound *PACKAGE*
+;;; there would break boot (Active Limitation 7).  %init-packages SETQs this
+;;; NIL alongside *pkg-tag* for the same reason.
+(defvar *pkg-any-local-nicknames* nil)
+
+(defun %pkg-set-local-nicknames (pkg v)
+  (when v (setq *pkg-any-local-nicknames* t))
+  (aset (%pkg-data pkg) 9 v))
+
+(defun %pkg-lookup-local-nickname (name-str pkg)
+  "Resolve NAME-STR against PKG's package-local nicknames.  Returns the target
+   package, or NIL.  Case-sensitive on the nickname STRING the way every other
+   package lookup here is case-insensitive: we compare with string-equal so
+   `(:local-nicknames (#:dev …))' matches a `DEV:' qualifier."
+  (if (and pkg (%pkg-p pkg) name-str)
+      (let ((cur (%pkg-local-nicknames pkg)) (found nil))
+        (loop
+          (when (or found (null cur)) (return found))
+          (let ((entry (car cur)))
+            (when (and (consp entry) (stringp (car entry))
+                       (string-equal (car entry) name-str))
+              (setq found (cdr entry))))
+          (setq cur (cdr cur))))
+      nil))
 
 ;;; --- CL Symbol predicates and accessors ---
 ;;;
@@ -440,6 +472,12 @@
     ((%pkg-p name) name)
     (t
      (let ((name-str (%pkg-string-designator name)))
+       ;; Package-local nicknames win over global names (SBCL semantics): a
+       ;; PLN shadows a same-named global package for code read in that
+       ;; package, which is the whole point of the feature.
+       (when *pkg-any-local-nicknames*
+         (let ((local (%pkg-lookup-local-nickname name-str *package*)))
+           (when local (return-from find-package local))))
        (when (and name-str (string-equal name-str "CL-TEST"))
          (let ((clu (find-package-1 "COMMON-LISP-USER")))
            (when clu (return-from find-package clu))))
@@ -534,7 +572,7 @@
 (defun %make-package-object (name-string)
   "Allocate and initialize an empty package object."
   (%mark-runtime-born-pkg name-string)
-  (let ((data (make-array 9)))
+  (let ((data (make-array 10)))
     (aset data 0 name-string) ; name
     (aset data 1 nil)         ; nicknames
     (aset data 2 nil)         ; internal-symbols (alist)
@@ -544,6 +582,7 @@
     (aset data 6 nil)         ; shadowing-symbols
     (aset data 7 nil)         ; internal-symbols hash index (slot 2 + 5)
     (aset data 8 nil)         ; external-symbols hash index (slot 3 + 5)
+    (aset data 9 nil)         ; package-local nicknames: ((NAME . PKG) ...)
     (cons *pkg-tag* data)))
 
 (defun make-package (name &rest args)
@@ -1223,7 +1262,8 @@
         (intern-names nil)
         (size-seen nil)
         (doc-seen nil)
-        (doc-string nil))
+        (doc-string nil)
+        (local-nicknames nil))
     ;; --- Parse options ---
     (dolist (opt options)
       (when (consp opt)
@@ -1249,6 +1289,12 @@
              (when doc-seen (%signal-program-error))
              (setq doc-seen t)
              (when (cdr opt) (setq doc-string (cadr opt))))
+            ((eq key :local-nicknames)
+             ;; (:local-nicknames (LOCAL-NAME TARGET-PACKAGE) ...) — the
+             ;; de-facto-standard extension.  Collected here as raw specs;
+             ;; resolved to package objects AFTER the package is built, so a
+             ;; nickname may name a package defined later in the same file.
+             (setq local-nicknames (append local-nicknames (cdr opt))))
             ((eq key :size)
              ;; Duplicate :size → program-error (CLHS).  Value ignored
              ;; otherwise — Modus packages don't pre-allocate symbol
@@ -1368,7 +1414,72 @@
       ;; a non-nil value was supplied.
       (when doc-string
         (set-documentation pkg t doc-string))
+      ;; Package-local nicknames.  Each spec is (LOCAL-NAME TARGET); a spec
+      ;; whose TARGET does not exist yet is skipped rather than fatal — the
+      ;; ANSI-ish rule would be an error, but a skipped nickname degrades to
+      ;; the pre-existing "unknown package" reader error at the use site,
+      ;; which is a far better diagnostic than aborting the defpackage.
+      (dolist (spec local-nicknames)
+        (when (consp spec)
+          (let ((local (%pkg-string-designator (car spec)))
+                (target (and (consp (cdr spec))
+                             (%resolve-package (cadr spec)))))
+            (when (and local target)
+              (%pkg-set-local-nicknames
+               pkg (cons (cons local target) (%pkg-local-nicknames pkg)))))))
       pkg)))
+
+;;; --- package-local nickname API (SBCL calls these SB-EXT:…) ---
+
+(defun package-local-nicknames (&optional pkg)
+  "An alist of (NICKNAME-STRING . PACKAGE) local to PKG (default *package*)."
+  (let ((p (if pkg (%resolve-package pkg) *package*)))
+    (if p (%pkg-local-nicknames p) nil)))
+
+(defun add-package-local-nickname (local-nickname actual-package &optional pkg)
+  "Make LOCAL-NICKNAME resolve to ACTUAL-PACKAGE inside PKG (default *package*).
+   Replaces any existing local nickname of the same name.  Returns PKG."
+  (let ((p (if pkg (%resolve-package pkg) *package*))
+        (target (%resolve-package actual-package))
+        (name (%pkg-string-designator local-nickname)))
+    (when (and p target name)
+      (remove-package-local-nickname name p)
+      (%pkg-set-local-nicknames
+       p (cons (cons name target) (%pkg-local-nicknames p))))
+    p))
+
+(defun remove-package-local-nickname (old-nickname &optional pkg)
+  "Drop OLD-NICKNAME from PKG's local nicknames.  T if one was removed."
+  (let ((p (if pkg (%resolve-package pkg) *package*))
+        (name (%pkg-string-designator old-nickname)))
+    (if (and p name)
+        (let ((acc nil) (cur (%pkg-local-nicknames p)) (hit nil))
+          (loop
+            (when (null cur) (return nil))
+            (let ((entry (car cur)))
+              (if (and (consp entry) (stringp (car entry))
+                       (string-equal (car entry) name))
+                  (setq hit t)
+                  (setq acc (cons entry acc))))
+            (setq cur (cdr cur)))
+          (when hit (%pkg-set-local-nicknames p (nreverse acc)))
+          hit)
+        nil)))
+
+(defun package-locally-nicknamed-by-list (pkg)
+  "The packages that have a local nickname for PKG."
+  (let ((target (%resolve-package pkg))
+        (acc nil))
+    (when target
+      (dolist (p *all-packages*)
+        (let ((cur (%pkg-local-nicknames p)) (hit nil))
+          (loop
+            (when (or hit (null cur)) (return nil))
+            (when (and (consp (car cur)) (eq (cdr (car cur)) target))
+              (setq hit t))
+            (setq cur (cdr cur)))
+          (when hit (setq acc (cons p acc))))))
+    acc))
 
 ;;; --- in-package ---
 

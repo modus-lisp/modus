@@ -2540,6 +2540,9 @@
   (setq *pkg-tag* 987654321)
   (setq *sym-tag* 123456789)
   (setq *all-packages* nil)
+  ;; No package has a local nickname yet — and this must be BOUND before the
+  ;; find-package calls below, which run before *package* itself is set.
+  (setq *pkg-any-local-nicknames* nil)
   ;; The pkg-by-hash table at memory slot #x10000170 starts empty
   ;; here; each make-package below adds its entry via
   ;; %register-pkg-by-hash so compile-quote's per-symbol

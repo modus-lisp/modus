@@ -3809,6 +3809,24 @@
              (a64-movz buf +a64-x10+ #x11 0)                  ; x10 = 0x11 subtag
              (a64-orr-reg buf +a64-x16+ +a64-x16+ +a64-x10+)  ; x16 = header
              (a64-stur buf +a64-x16+ +a64-x24+ 0)             ; [x24] = header
+             ;; ---- Zero-initialise the payload (CRITICAL for GC correctness) ----
+             ;; The bytes are PACKED, but the collector's flat scan reads WORDS,
+             ;; so an unwritten 8-byte group is a root candidate like any other.
+             ;; Zero the pad word at +8 and every word covering the N payload
+             ;; bytes at +16: end = x24 + 16 + ((N+7) & ~7).  x16 held the
+             ;; header and x10 the subtag — both dead — while x9 (= N) must
+             ;; SURVIVE for the size calc below, so it is only read here.
+             (a64-add-imm buf +a64-x16+ +a64-x9+ 7)
+             (a64-lsr-imm buf +a64-x16+ +a64-x16+ 3)
+             (a64-lsl-imm buf +a64-x16+ +a64-x16+ 3)             ; (N+7) & ~7
+             (a64-add-reg buf +a64-x16+ +a64-x24+ +a64-x16+ 0 0)
+             (a64-add-imm buf +a64-x16+ +a64-x16+ 16)            ; end
+             (a64-add-imm buf +a64-x10+ +a64-x24+ 8)             ; cursor
+             (let ((loop-start (a64-current-index buf)))
+               (a64-stur buf +a64-xzr+ +a64-x10+ 0)
+               (a64-add-imm buf +a64-x10+ +a64-x10+ 8)
+               (a64-cmp-reg buf +a64-x10+ +a64-x16+)
+               (a64-bcond buf #b0011 (- loop-start (a64-current-index buf))))
              (a64-add-imm buf pd +a64-x24+ 9)                 ; result = base | tag9
              ;; size = align16(16 + N) = ((N + 31) >> 4) << 4
              (a64-add-imm buf +a64-x17+ +a64-x9+ 31)
@@ -4465,6 +4483,29 @@
              (a64-movz buf +a64-x9+ #x31 0)
              (a64-orr-reg buf +a64-x16+ +a64-x16+ +a64-x9+)
              (a64-stur buf +a64-x16+ +a64-x24+ 0)
+             ;; ---- Zero-initialise the payload (CRITICAL for GC correctness) ----
+             ;; Same loop as +op-alloc-array+ (identical size shape: pad word +
+             ;; COUNT element words).  x64 deliberately leaves string CONTENT
+             ;; unfilled behind *x64-fill-strings*, and i386 mirrored that; we
+             ;; fill here anyway, because the Cheney scan is a FLAT word walk
+             ;; that does not consult the #x31 subtag — an unwritten content
+             ;; word is scanned as a root exactly like an array slot, and a
+             ;; string is very often allocated and then filled incrementally.
+             ;; If this ever needs to become optional, gate it the way x64
+             ;; gates *x64-fill-strings* rather than deleting it.
+             ;; x16 held the header (dead) and x9 held the subtag constant
+             ;; (dead); pd is written after the loop, so x16 is safe as cursor
+             ;; even when pd IS x16.  Must run BEFORE the x17 size calc below,
+             ;; which is where pcount would be clobbered if pcount is x17.
+             (a64-add-imm buf +a64-x16+ +a64-x24+ 8)             ; cursor
+             (a64-add-imm buf +a64-x9+ pcount 1)                 ; words = N+1
+             (a64-lsl-imm buf +a64-x9+ +a64-x9+ 3)               ; bytes
+             (a64-add-reg buf +a64-x9+ +a64-x16+ +a64-x9+ 0 0)   ; end
+             (let ((loop-start (a64-current-index buf)))
+               (a64-stur buf +a64-xzr+ +a64-x16+ 0)
+               (a64-add-imm buf +a64-x16+ +a64-x16+ 8)
+               (a64-cmp-reg buf +a64-x16+ +a64-x9+)
+               (a64-bcond buf #b0011 (- loop-start (a64-current-index buf))))
              (a64-add-imm buf +a64-x17+ pcount 3)
              (a64-lsr-imm buf +a64-x17+ +a64-x17+ 1)
              (a64-lsl-imm buf +a64-x17+ +a64-x17+ 4)

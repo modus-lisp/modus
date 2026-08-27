@@ -2281,6 +2281,93 @@ operation with its own cross-region story, untouched here; `BOUNDP` walks the
 table, so a special bound only per-thread reads as unbound on that thread; the
 58-binding ceiling; and `kiln modus-rfb PORT` was not run.
 
+### THE COOPERATIVE ATOMICS ARE SMP-SAFE — except %ATOMIC-CAS, which is not
+
+`net/cooperative-atomics.lisp`'s `%ATOMIC-CAS` / `%ATOMIC-INCF` / `%ATOMIC-DECF`
+were plain read-modify-writes whose entire atomicity argument was "nothing
+preempts a running actor".  Native threads falsified that, and the file is **not
+inert**: `mvm/build-cli-common.lisp` bakes it as `*GENERA-COMPAT-TEXT*` and
+`%INSTALL-GENERA-COMPAT` evaluates it at boot in **every CLI image**, so a
+portable threading library that finds `:GENERA` in `*FEATURES*` — which is the
+whole point of advertising it — lands on these.
+
+**INCF AND DECF NOW TAKE A TTAS SPINLOCK ON `+OP-ATOMIC-XCHG+`, GATED ON
+`%RT-THREADS-LIVE-P`.**  Not a mutex: `%MUTEX-LOCK` is inside the
+`(and (eq *cli-arch* :x64) (not *cli-bare-metal*))` group, and bare metal must
+not be a special case.  Not a call to `SPIN-LOCK` either, and that is the one
+non-obvious choice — `SPIN-LOCK` is overridden to `(defun spin-lock (addr) nil)`
+in `arch-x86`, `arch-aarch64`, `arch-raspi3b`, `arch-arm32*`, `arch-rpi-cl` and
+`32bit-overrides`, so which definition wins is a per-build load-order question
+and a lock that silently degrades to a no-op is the failure mode this campaign
+keeps paying for.  The gate is the *threads* predicate, not a hosted test:
+`%RT-THREADS-LIVE-P` is in `mvm/prelude.lisp`, outside the hosted-only group, so
+bare-metal SMP arms the same word and these flip by themselves.
+
+**`%ATOMIC-CAS` IS DELIBERATELY UNTOUCHED AND STILL UNSAFE.**  It is blocked on
+an INSTRUCTION — `XCHG` is an *unconditional* exchange, and no back-end has a
+compare-exchange.  It could have been wrapped in the same spinlock and would
+then be internally correct, **for callers that route every mutation of the place
+through these macros** — which is precisely the assumption a CAS exists to avoid
+needing.  A lock-based CAS passes a lock-based test suite and lies to the first
+caller that mixes it with a plain `SETF`.  Its FALSIFIED marker stands.
+
+**THE UNARMED PATH IS UNCHANGED, AND THE PROOF IS STRONGER THAN "SAME CODE
+EMITTED".**  This file is never compiled at build time — `read-file-text` puts
+it in the image as TEXT — so a control build from the parent commit and the
+product build have a **byte-identical native code section**: same md5
+(`afafea96902714063b8a6da1b910f54e`), `scripts/fndiff.py` **5034/5034 functions
+identical, TOTAL DELTA +0**.  The whole change is 96 592 bytes of embedded
+source string.  Within that string the gate-off branch is character-for-
+character the old macro body; an unarmed image pays one load of `#x10000DB8`
+and a branch, exactly what `%RT-ENTER` and `%DYNBIND` already cost it.  It is
+**not** byte-identical *emission* for the operation itself — a runtime gate
+cannot be — and saying so would be an overstatement.
+
+**THE LOCK IS `#x10000FE0`, WITH AN ACQUISITION COUNTER AT `#x10000FE8`**, both
+in the BSS gap `mvm/compiler.lisp` and `boot/boot-rpi-cl.lisp` both document as
+free (nothing between the per-region table `F08..F88`, SMP-INIT's three
+scheduler-lock words `FC0/FC8/FD0`, and the per-CPU mode word `FF8`), and
+neither is a per-thread window slot (`%TLS-WINDOW-OFFSET-P` covers `090..138`,
+`150`, `180..19F`, `400..C0F`, `C10..C37` only).  **It must not be the scheduler
+lock**: `+OP-RESTORE-CTX+` zeroes `#x10000FC0` on every context switch.  The
+counter is bumped inside the critical section by the armed path only, which
+makes it a **two-way oracle** rather than a statistic — gate off it must not
+move at all, gate on it must move by *exactly* the operation count.
+
+**A LANDMINE FOR WHOEVER BRINGS UP BARE-METAL SMP: ZERO THE LOCK WORD FIRST.**
+Hosted, that word is BSS and the kernel zero-fills it.  On bare metal the
+`#x1000xxxx` window is ordinary RAM and `build-rpi-cl-repl.lisp`'s prologue
+zeroes an *enumerated list* that does not include it.  Uninitialised RAM holding
+a non-zero byte IS A HELD LOCK — the first `%ATOMIC-INCF` after bringup hangs.
+`mvm/build-pizero2w-actors.lisp` already carries "Clear TCP send lock —
+uninitialized RAM deadlocks spin-lock" for exactly this.  `%ATOMICS-LOCK-ADDR`
+is a one-defun seam so a target with a different free-metadata map can move it.
+
+**ACCEPTANCE — `test/hosted-atomics.lisp` (31 checks) + `test/run-atomics.sh`,
+four threads, 20 000 operations each, TWO negative controls that fail
+differently:**
+
+| arm | result |
+|---|---|
+| INCF protected | exactly **80000**, acquisitions exactly 80000 |
+| DECF protected | exactly **0** from 80000, acquisitions exactly 80000 |
+| MIXED (+3 then −2 per iteration, so neither operation alone gives the answer) | exactly **80000**, acquisitions exactly 160000 |
+| **in-process control** — the same four threads, the read-modify-write written out (character-for-character the old expansion) | lost **50 804 – 59 985** of 80000 |
+| **`MODUS_ATOMICS_MODE=unsync`** — the REAL MACRO, same binary, gate cleared: one BSS word apart | lost **47 534 – 58 304** of 80000 |
+| rates over 10 runs each | protected exact **10 of 10**; control lost updates **10 of 10**; 0 unclean exits |
+
+The unarmed half is asserted with a **sentinel, not a zero**: 1000 unarmed INCFs
++ 400 unarmed DECFs must leave a planted non-zero value in the lock word intact
+and the acquisition counter at 0.  A zero-vs-zero check could not tell "the gate
+bypassed the lock" from "the lock was taken every time".
+
+**NOT EXECUTED, stated rather than implied: there is no bare-metal arm.**  QEMU
+`-smp 4` would give a bare-metal image four vCPUs, but PSCI `CPU_ON` is still
+never called and `WAKE-IDLE-AP` is still `(defun wake-idle-ap () 0)`, so modus
+runs on one of them, the gate reads 0, and the unarmed path is what executes —
+there is nothing to race.  A bare-metal arm becomes runnable the day a second
+core does, and it is the same test.
+
 ### DELEGATION TO A SERVICE ACTOR — what was measured before building it
 
 The chosen fix is that allocating mutations of the shared tables are performed

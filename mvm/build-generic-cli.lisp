@@ -154,6 +154,14 @@
 ;; sessions.  build-x64-linux / build-x64 set this; we
 ;; need it too so the generic image survives ANSI sweeps.
 (setf modus.mvm.x64::*x64-gc-enabled* t)
+;; WS5 #223 / #278: this IMAGE's collector must scan the JIT constant-vector
+;; root (BSS 0x10000F00), or a const the JIT mirrored into the vector dangles
+;; after the first collection.  Gated on *jit-on* so a MODUS_NO_JIT build's
+;; emitted collector is byte-identical to pre-#223.  The in-image translator
+;; gets the matching setq from the %init-x64-translator co-init source
+;; (build-cli-common.lisp), which only runs when JIT is on.
+(when cl-user::*jit-on*
+  (setf modus.mvm.x64::*x64-jit-constvec-p* t))
 ;; Linux-x64 layout: enable the CONS-KIND bitmap (GC correctness fix for the
 ;; cons-tagged-scratch symbol-truncation bug).  The kind-bitmap base delta is
 ;; a boot-linux-x64 layout constant, so the master flag is Linux-only for now.

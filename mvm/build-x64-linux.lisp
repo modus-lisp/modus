@@ -879,6 +879,13 @@
                (lam-offsets (cadr (cddddr tuple))))
           (setq *x64-jit-mode* t)
           (multiple-value-bind (nbuf fn-map) (translate-mvm-to-x64 bc ft-list)
+            ;; WS5 #223: on a JIT-ON image li-const emits a load from the
+            ;; GC-updated constant vector, so this probe must publish the
+            ;; vector before executing the page exactly as %jit-translate-page-1
+            ;; does — otherwise the emitted `mov d,[0x10000E40]` reads 0 and the
+            ;; next load faults.  No-op (and cpatches non-empty, so the
+            ;; re-patch/durability leg below runs unchanged) on a JIT-OFF image.
+            (%jit-sync-constvec (%jit-constvec-need *x64-li-const-patches*))
             (let* ((nlen (code-buffer-position nbuf))
                    (nbytes (code-buffer-bytes nbuf))
                    ;; Snapshot BOTH reloc lists (fresh per translate).
@@ -1787,6 +1794,18 @@
 ;; Functions at code-buffer positions P where (0x15F+P) & 0xF in {1,9} would be
 ;; misidentified as cons/object pointers by compile-funcall.
 (setf modus.mvm.x64::*x64-native-code-offset* 351)
+
+;; WS5 #223: when this gate runner is built JIT-ON, its collector must scan the
+;; JIT constant-vector BSS root, or every const the JIT installs into the vector
+;; dangles after the first collection.  Same MODUS_USE_JIT predicate the
+;; %jit-enabled-p bake and build-ansi-common.lisp's *x64-jit-on* use — all three
+;; must agree.  JIT-OFF leaves the flag NIL, so the emitted collector (and the
+;; whole image, given the co-init line is likewise omitted) is byte-identical to
+;; a build without this change.
+(when (let ((v (sb-ext:posix-getenv "MODUS_USE_JIT")))
+        (and v (or (string= v "1") (string-equal v "t") (string-equal v "yes"))))
+  (setf modus.mvm.x64::*x64-jit-constvec-p* t)
+  (format t "~&;; WS5 #223: JIT constant-vector indirection ENABLED (GC root + li-const)~%"))
 
 ;; MCGC page-pinning test knob (stage 4).  OFF by default — canonical stays on
 ;; the validation Cheney collector.  Set MODUS_MCGC_PINNING=1 for a pinning

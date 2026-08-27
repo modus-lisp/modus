@@ -423,6 +423,13 @@
   (setq *x64-gc-enabled* t)
   (setq *linux-x64-r14-offset* #x38000000)
   (setq *jit-xlate-err-info* nil)
+  ;; WS5 #223 / #278: emit the THUNK's li-const as a load from the GC-updated
+  ;; constant vector instead of a baked heap address, so a mid-flight
+  ;; collection cannot stale a running top-level form's literals.  MUST match
+  ;; the host-side (setf modus.mvm.x64::*x64-jit-constvec-p* t) that put the
+  ;; vector's BSS word in this image's collector root list — the emitted load
+  ;; is only sound because that root exists.
+  (setq *x64-jit-constvec-p* t)
   t)
 (in-package :modus.mvm)
 "))

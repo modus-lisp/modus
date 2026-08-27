@@ -441,11 +441,15 @@
   ;; thunk-only scope does not have.  The optional setq is spliced in by the
   ;; concatenation below when the env knob is set.
 "
+   ;; #226 is FIXED (the in-image root-address defvar read; see the
+   ;; translate-x64 literal-fallback commit), so FULL scope is the DEFAULT —
+   ;; it is what makes ql:quickload take ~45s instead of ~25min.  Set
+   ;; MODUS_CONSTVEC_FULL=0 to fall back to thunk-only scope.
    (if (let ((v (sb-ext:posix-getenv "MODUS_CONSTVEC_FULL")))
-         (and v (string= v "1")))
+         (and v (string= v "0")))
+       ""
        "  (setq *x64-jit-constvec-full-p* t)
-"
-       "")
+")
    "  t)
 (in-package :modus.mvm)
 ")))

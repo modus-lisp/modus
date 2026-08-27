@@ -16084,11 +16084,27 @@
      ;; vector with `(make-array total)` (integer) — routing that to the
      ;; defun would recurse forever.  %MAKE-ARRAY-RAW is the un-guarded raw
      ;; 1-D alloc (no re-entry), and CONSP has excluded the cons case.
+     ;; The guard tests FIXNUMP, not (not CONSP).  Excluding conses closed the
+     ;; multi-dim case above, but it let EVERY OTHER non-fixnum through to the
+     ;; raw path: a string, a symbol, a struct, a bignum — anything with tag 9
+     ;; — gets SAR'd into a garbage element count exactly the way the cons
+     ;; pointer did, and ALLOC-ARRAY then writes a header and a zero-init run
+     ;; off the end of the heap.  That is an unbounded wild write reached from
+     ;; ordinary `(make-array n)` whenever N is not what the caller thought,
+     ;; and it is how a plain type error presents as a SIGSEGV with no
+     ;; condition (aarch64 pagetree/cabinet load, where N arrived as a
+     ;; pointer-shaped word).  Testing FIXNUMP positively routes cons dims
+     ;; AND garbage to the real MAKE-ARRAY, which handles the former and
+     ;; signals an honest type error for the latter.  FIXNUMP is a low-bit
+     ;; test (compile-fixnump), not a call, so the fast path is unchanged in
+     ;; cost.  The no-recursion property still holds: %MAKE-ARRAY-RAW is
+     ;; reached only for fixnums, and MAKE-ARRAY's own internal
+     ;; `(make-array total)` on an integer total keeps taking it.
      (compile-form
       `(let ((%mar-sz ,size-form))
-         (if (consp %mar-sz)
-             (funcall (function make-array) %mar-sz)
-             (%make-array-raw %mar-sz)))
+         (if (fixnump %mar-sz)
+             (%make-array-raw %mar-sz)
+             (funcall (function make-array) %mar-sz)))
       env dest))))
 
 (defun compile-make-array-raw (size-form env dest)

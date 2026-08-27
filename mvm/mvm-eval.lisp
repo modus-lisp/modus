@@ -422,6 +422,19 @@
     (let ((obj (if *e2-const-pool* (gethash (cdr p) *e2-const-pool*) nil)))
       (%jit-write-movz-quad base (car p) (%val->word obj)))))
 
+;; Pool-EXPLICIT patcher variants for the cross-page sweep
+;; (%jit-refresh-all-pages): identical to the two above but read POOL, the
+;; page's OWN const pool (stored in its jit-entry), instead of the global
+;; *e2-const-pool* — which is only that page's pool at its own seam.
+(defun %jit-patch-consts-pool (base cpatches pool)
+  (dolist (p cpatches)
+    (let ((obj (if pool (gethash (cdr p) pool) nil)))
+      (%jit-write-imm64 base (car p) (%val->word obj)))))
+(defun %jit-patch-consts-aarch64-pool (base cpatches pool)
+  (dolist (p cpatches)
+    (let ((obj (if pool (gethash (cdr p) pool) nil)))
+      (%jit-write-movz-quad base (car p) (%val->word obj)))))
+
 (defun %jit-reloc-calls (base relocs rt-table)
   "Patch each out-of-module CALL movabs with the resolved native callee address.
    Returns T if every reloc resolved, NIL if any failed (→ caller falls back)."
@@ -850,9 +863,13 @@
             (%jit-patch-consts base cpatches)
             ;; 5th = PSIZE (read only on the aarch64 reclaim path; harmless
             ;; here).  6th = the per-function native-offset alist for WS5 #222
-            ;; native DEFUN installation.
+            ;; native DEFUN installation.  7th = THIS module's const pool —
+            ;; %jit-patch-consts reads the GLOBAL *e2-const-pool*, which is
+            ;; only correct at this module's own seam; the cross-page sweep
+            ;; (%jit-refresh-all-pages) must patch from the page's OWN pool.
             (list base eoff cpatches (%gc-count) psize
-                  (%jit-fn-native-offsets ft-list fn-map nlen cpatches)))
+                  (%jit-fn-native-offsets ft-list fn-map nlen cpatches)
+                  *e2-const-pool*))
           nil))))
 
 (defun %jit-translate-page-1-aarch64 (bc mvm-entry ft-list rt-table)
@@ -1015,7 +1032,10 @@
             ;; 5th element = PSIZE, so a transient form's page can be munmap'd
             ;; (%jit-free-page base psize) after its native call — see
             ;; %mvm-eval-jit-run's reclamation.
-            (list base eoff cpat (%gc-count) psize)
+            ;; 6th (fn-native-offsets) unused on this path; 7th = this
+            ;; module's const pool for the cross-page sweep (see the x64
+            ;; creator's comment).
+            (list base eoff cpat (%gc-count) psize nil *e2-const-pool*)
             nil)))))
 
 (defvar *jit-translate-err-count* 0
@@ -1053,6 +1073,62 @@
              (if *jit-fallback-count* (+ 1 *jit-fallback-count*) 1))
        nil)))
 
+(defvar *jit-all-fresh-stamp* nil
+  "The %gc-count as of the last %JIT-REFRESH-ALL-PAGES sweep.  Boots NIL
+   (defvars don't init) so the first call always sweeps.")
+(defvar *jit-refresh-busy* nil
+  "Reentrancy guard: MAPHASH inside the sweep may itself route calls
+   through APPLY, which calls the sweep.")
+
+(defun %jit-refresh-all-pages ()
+  "Re-patch const immediates of EVERY cached runtime-JIT page whose
+   gc-stamp is stale.  %JIT-ENTRY-FOR covers only the mvm-eval cache
+   path; a DIRECT call into a JIT page (APPLY/FUNCALL of a resolved
+   runtime defun, or a JIT-to-JIT baked call) otherwise executes stale
+   const-pool immediates after any GC — task #278's install drain, and
+   a 4-line repro: (eval defun with a quoted literal) + %gc-collect +
+   (funcall 'it) => garbage/fault.  Cheap when clean: one %gc-count
+   read + eql against the sweep stamp."
+  (when (and *jit-page-cache* (not *jit-refresh-busy*))
+    (let ((now (%gc-count)))
+      (unless (eql now *jit-all-fresh-stamp*)
+        (setq *jit-refresh-busy* t)
+        (unwind-protect
+            (let ((stale nil))
+              ;; Collect first — repatching mutates the table (puthash
+              ;; fresh entries) and mutating under maphash is undefined.
+              ;; ONLY entries carrying their OWN pool (7th element) are
+              ;; sweepable: %jit-patch-consts reads the GLOBAL
+              ;; *e2-const-pool*, which belongs to whatever module is
+              ;; current — patching another page against it CORRUPTS that
+              ;; page (measured: the first sweep build broke setup).
+              ;; Pool-less entries stay stale-stamped and are re-baked at
+              ;; their own seam by %jit-entry-for as before.
+              (maphash (lambda (bc hit)
+                         (when (and (not (eql now (cadddr hit)))
+                                    (caddr (cddddr hit)))
+                           (setq stale (cons (cons bc hit) stale))))
+                       *jit-page-cache*)
+              (dolist (pair stale)
+                (let* ((bc (car pair))
+                       (hit (cdr pair))
+                       (pool (caddr (cddddr hit)))
+                       (fresh (list (car hit) (cadr hit) (caddr hit) now
+                                    (car (cddddr hit)) (cadr (cddddr hit))
+                                    pool)))
+                  (if (eq *jit-target-arch* :aarch64)
+                      (progn
+                        (%jit-patch-consts-aarch64-pool (car fresh) (caddr fresh) pool)
+                        (when (caddr fresh)
+                          (%jit-icache-flush (car fresh)
+                                             (if (car (cddddr fresh))
+                                                 (car (cddddr fresh))
+                                                 4096))))
+                      (%jit-patch-consts-pool (car fresh) (caddr fresh) pool))
+                  (setf (gethash bc *jit-page-cache*) fresh)))
+              (setq *jit-all-fresh-stamp* now))
+          (setq *jit-refresh-busy* nil))))))
+
 (defun %jit-entry-for (bc mvm-entry ft-list rt-table)
   "Return a ready-to-call jit-entry (base eoff cpatches gc-stamp) for BC, using
    *jit-page-cache* (keyed by BC identity) if present — RE-PATCHING const
@@ -1068,8 +1144,11 @@
               ;; A GC moved the const-pool objects; re-bake immediates, then
               ;; re-store a fresh entry with the new stamp (avoid mutating a
               ;; nested list place — build + puthash is compiler-safe).
+              ;; Preserve the 7th element (the page's own pool) for the
+              ;; cross-page sweep.
               (let ((fresh (list (car hit) (cadr hit) (caddr hit) now
-                                 (car (cddddr hit)) (cadr (cddddr hit)))))
+                                 (car (cddddr hit)) (cadr (cddddr hit))
+                                 (caddr (cddddr hit)))))
                 ;; Arch-aware: x64 bakes movabs imm64, aarch64 a MOVZ/MOVK
                 ;; quad, and self-modified aarch64 code needs an I-cache flush
                 ;; over the page before it is branched into again.

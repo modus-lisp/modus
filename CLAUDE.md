@@ -2,6 +2,17 @@
 
 Modus is a self-hosting bare-metal Lisp operating system. It compiles Lisp to native code via the MVM (Modus Virtual Machine) — a portable virtual ISA with translators for 9 CPU architectures. The system runs SSH servers, handles USB devices, and supports cooperative actor-based concurrency, all on bare metal with no OS underneath.
 
+**Concurrency, as of 2026-08: two models, and which one you get depends on the
+target.** Bare metal is still the cooperative actor scheduler described above.
+**Hosted x86-64 additionally has native OS threads** — up to 16, each with its
+own GC region, root window, multiple-value buffer, handler-frame stack and
+dynamic bindings — plus Linux sockets, a real mutex/condition-variable pair, a
+real `SLEEP`, and `sb-thread` / `sb-bsd-sockets` surfaces. The witness is
+`test/run-glass-serve.sh`: the **glass** compositor, unmodified, serving real
+VNC clients from its own RFB server on modus. See "Per-region GC" and the
+threading sections below; `docs/handler-stack-collision.md` is required reading
+before touching the handler stack or the per-thread window.
+
 ## Directory Structure
 
 ```
@@ -241,6 +252,32 @@ Key fixes en route: call-relocation untag (5b866fa), out-of-module GC-trampoline
 `(ldb (byte 32 32) bignum)` high-word extract was broken by limitation #8; now
 `(logand …)` + `(ash (floor V 2^31) -1)`).  Next: port the JIT to aarch64; then
 back to Quicklisp.
+
+### `check-compiler-warns` baselines are STALE, and that is a hazard
+
+`build-generic-cli` currently reports, on every build:
+
+```
+implicit-global=41  implicit-global-setq=124  unresolved-function=45
+  - implicit-global-setq = 124 (baseline 123) — 1 NEW instance
+  - unresolved-function  = 45  (baseline 40)  — 5 NEW instances
+```
+
+**Both overages are pre-existing at HEAD** — established by building a control
+with the change under test reverted and getting an identical census, twice, in
+different rounds. The five unresolved names are `F1`–`F4` and
+`IS-EXTERNAL-SYMBOL-OF`: `#'NAME` sentinels with no definition in the blob,
+benign by the check's own definition.
+
+The hazard is not the five. It is that **a check which always cries wolf is a
+check nobody reads**, so a genuine sixth would be invisible — the same
+"unsafe state indistinguishable from a safe one" pattern that cost this
+campaign several rounds elsewhere.
+
+Fixing it means *deciding*, not silencing: either resolve the five, or move the
+baselines in `mvm/build-checks.lisp` (`:unresolved-function . 40`, line ~1069)
+**with a comment naming what was absorbed and why**. Bumping a baseline without
+naming its contents just relocates the problem.
 
 ## Build Commands
 
@@ -1488,6 +1525,13 @@ values (note `big-endian-flag` **0**, where modus's own minimal server in
 `test/rfb-static.lisp` says 1 — two different legal wires, two clients) and the
 desktop name.  17 client-side checks pass.
 
+> **SUPERSEDED — the frame arrives.** This wall fell to per-thread dynamic
+> binding; see the dynbind section below (`EMIT-DYNBIND-ROOT-SCAN`,
+> `run-glass-serve.sh` 5 of 5 with 0 pixels differing). The diagnosis in this
+> section is kept because the *ingredients-pass-in-isolation* measurements are
+> still true and still useful — what was wrong was the conclusion that the
+> nesting mattered. Do not restart from here.
+
 **THE WALL: THE FRAME NEVER ARRIVES.**  With `:WAKE NIL` the sender polls
 forever and delivers nothing; with a real WAKE the server process **dies
 outright, with no condition and no output**, immediately after the client is
@@ -2088,6 +2132,13 @@ re-rated to 0/3).  Slice/lock state reads sane at the death point.  Mechanism
 NOT identified; the ingredients in the audit's shape are prior thread spawns +
 sockets + an evaluated reader closure + a big concurrent transfer in one
 process.
+
+> **SUPERSEDED — the partition was honest and the wall has since fallen.** The
+> `both` arm was never a distinct failure mode: the byte count could not see a
+> corrupted counter, and the real defect was a worker's special binding
+> publishing its value into region 0's globals table. Fixed by per-thread
+> dynamic binding, below. The partition recorded here was correct at the time
+> and is why the search moved to the right place.
 
 **AND THE WALL IN FRONT OF GLASS IS UNMOVED, WHICH IS THE HONEST PARTITION:**
 `run-glass-send-worker.sh` plain/tx/lock deliver **49180/49180** and `both`

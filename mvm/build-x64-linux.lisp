@@ -823,25 +823,31 @@
 (defun %ws4-s4-patch-consts (base patches)
   ;; Write each live pool object's tagged word into its movabs imm64 slot.
   ;; PATCHES = list of (imm64-native-off . pool-idx).
+  ;; WS5 #223/#226: a NEGATIVE offset is a constant-vector SIZING record —
+  ;; the emitted load is indirect, there is no immediate to bake.  Writing
+  ;; 8 bytes at base-1 clobbered the page's first instructions and the
+  ;; durability re-exec took a wild jump (RIP=-1; the constvec-full gate
+  ;; regression from test 11088 on).  Skip them, as %jit-patch-consts does.
   (dolist (p patches)
-    (let* ((imm-off (car p))
-           (idx (cdr p))
-           (obj (if *e2-const-pool* (gethash idx *e2-const-pool*) nil))
-           ;; obj's actual tagged native word.  Empirically (see DIAG probe): a
-           ;; heap object/cons value's native tagged word == (%val->word obj)
-           ;; directly — %val->word (SHL 1) maps the runtime value cell to the
-           ;; native word a register holds (raw_addr|tag, e.g. cons tag 0x1).
-           ;; (Contrast the S3 FN path, which additionally SAR-1's then -3's,
-           ;; because a resolved fn OBJECT boxes raw_code|3 one level deeper.)
-           (word (%val->word obj))
-           (a (+ base imm-off))
-           (v word)
-           (j 0))
-      (loop while (< j 8)
-            do (progn
-                 (setf (mem-ref (+ a j) :u8) (logand v 255))
-                 (setq v (ash v -8))
-                 (setq j (+ j 1)))))))
+    (when (>= (car p) 0)
+      (let* ((imm-off (car p))
+             (idx (cdr p))
+             (obj (if *e2-const-pool* (gethash idx *e2-const-pool*) nil))
+             ;; obj's actual tagged native word.  Empirically (see DIAG probe): a
+             ;; heap object/cons value's native tagged word == (%val->word obj)
+             ;; directly — %val->word (SHL 1) maps the runtime value cell to the
+             ;; native word a register holds (raw_addr|tag, e.g. cons tag 0x1).
+             ;; (Contrast the S3 FN path, which additionally SAR-1's then -3's,
+             ;; because a resolved fn OBJECT boxes raw_code|3 one level deeper.)
+             (word (%val->word obj))
+             (a (+ base imm-off))
+             (v word)
+             (j 0))
+        (loop while (< j 8)
+              do (progn
+                   (setf (mem-ref (+ a j) :u8) (logand v 255))
+                   (setq v (ash v -8))
+                   (setq j (+ j 1))))))))
 
 (defun %ws4-s4-force-gc ()
   ;; Force at least one Cheney collection by churning cons allocation until the

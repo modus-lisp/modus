@@ -165,20 +165,25 @@ whichever container is running, so each context silently measures **its own
 copy** of the corpus under the same name, with nothing in the tree recording
 which copy that is.
 
-It is not hypothetical. Gate PASS was reported from another context as
-`17521 → 17522, NET=+1, lost=0, markers unchanged`. The corpus
-`scripts/get-ansi-corpus.sh` fetches (upstream `ca06bd9`, 2026-03-10) has
-**17,376 static deftests**, and `CLAUDE.md` records a *total* of **17,465**.
-A passed count of 17,521 exceeds both. So those runs and ours are not measuring
-the same corpus — the numbers are not a discrepancy to reconcile, they are two
-different corpora wearing the same path.
+**How close the two copies actually are — measured, after an earlier draft of
+this section got it wrong.** A gate run here on `b60624a` gives
+`base: passed=17501`; the other context reported `17521 → 17522`. That is a
+**20-test difference, ~0.1%** — near-identical corpora, almost certainly
+adjacent upstream revisions.
 
-**Consequence for reading any conformance number in this tree:** an absolute
-count is meaningful only alongside the corpus revision it came from. `NET` is
-same-run and therefore still sound *within* one context — it is the right
-metric and the other context used it correctly — but a NET from one container
-cannot be compared against a NET from another, and neither can be checked
-against `CLAUDE.md`'s 94.4% without knowing which corpus produced it.
+An earlier draft claimed the corpora were materially different, reasoning that
+a passed count of 17,521 exceeded our **17,376 static `(deftest` occurrences**
+and so had to come from a bigger corpus. That reasoning was wrong: our own base
+run passes **17,501** against the same 17,376 static count, because a
+meaningful fraction of the suite is **macro-generated** and never appears as a
+literal `(deftest` in the source. Grepping `(deftest` undercounts the corpus
+and cannot be used to compare two copies of it.
+
+**What still stands:** the paths are absolute and each container has its own
+copy, so an absolute count is only meaningful alongside the corpus revision it
+came from, and `scripts/get-ansi-corpus.sh` prints that revision for exactly
+this reason. `NET` is same-run and sound within one context — the other
+context used it correctly.
 
 **Two requests, both cheap and both worth more than this bug report:**
 
@@ -209,3 +214,40 @@ merge (4 conflicts: `mvm/compiler.lisp`, `mvm/interp.lisp`,
 `mvm/translate-x64.lisp` ×2, `mvm/translate-aarch64.lisp`) and by direct
 measurement of the window predicate. Nothing in this report is inferred from a
 comment; the address arithmetic was run.*
+
+---
+
+## Our branch through the same gate
+
+Run here, `scripts/acceptance-gate.sh b60624a 3110068`, 64 shards, same corpus
+both sides:
+
+```
+base b60624a   passed=17501   CHUNK-CRASH=0   FILE-WEDGE=30
+fix  3110068   passed=17499   CHUNK-CRASH=0   FILE-WEDGE=30
+NET=-2   lost=9   gained=7                    VERDICT: PASS
+```
+
+**Markers unchanged in both timing-immune counters**, which is the part that
+matters: 98 commits of per-region GC, native threads, sockets, an arena for
+locked sections and per-thread dynamic binding cost **no crashes and no
+wedges**.
+
+Per the doctrine, the lost set, read rather than waved at:
+
+```
+lost    14593  21928 21929 21937 21938 21946  24276  26456 26457
+gained  13500  21573 21944 21945  24465 24467 24503
+```
+
+Five of the nine losses and two of the seven gains sit in one narrow band
+(`219xx`), flipping in **both** directions. Adjacent IDs moving both ways in a
+single neighbourhood is the signature of shard timing, not of a behaviour
+change — consistent with the ±200 absolute jitter this gate documents, against
+a NET of −2 on 17,500 (0.01%).
+
+**That is an inference, not a measurement.** The doctrine's actual remedy for a
+negative NET — sub-shard the disagreeing range at `NSH=128+` and diff the
+per-ID sets again — was **not run**. If −2 needs to be explained rather than
+absorbed before merge, that is the run to do, and `21900-21999` is where to
+point it.

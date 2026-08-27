@@ -345,7 +345,8 @@
 ;; the image runtime, so %jit-translate-page would otherwise read the defvar
 ;; default (NIL) and emit gc-checks/trampoline inconsistently with the baked code.
 (defvar *jit-coinit-source*
-  (when (and *jit-on* (eq *cli-arch* :x64)) "
+  (when (and *jit-on* (eq *cli-arch* :x64))
+   (concatenate 'string "
 ;; #211: read this replica in :MODUS.ASM, the package x64-asm.lisp itself
 ;; declares.  The image interns symbols PER PACKAGE (CLHS 11.1.2), so a
 ;; register name quoted here must be the SAME symbol reg-info's ASSOC sees in
@@ -430,13 +431,24 @@
   ;; vector's BSS word in this image's collector root list — the emitted load
   ;; is only sound because that root exists.
   (setq *x64-jit-constvec-p* t)
-  ;; #226 FULL SCOPE: every JIT li-const goes through the vector, so
-  ;; const-bearing runtime defuns (the interpreted-deflate class) install
-  ;; native.  Rollback: delete this one setq (thunk-only #278 scope stays).
-  (setq *x64-jit-constvec-full-p* t)
-  t)
+  ;; #226 FULL SCOPE is a BUILD-TIME OPT-IN (MODUS_CONSTVEC_FULL=1): every
+  ;; JIT li-const goes through the vector, so const-bearing runtime defuns
+  ;; (the interpreted-deflate class) install native — ql:quickload drops
+  ;; from ~25min to ~45s and is verified end-to-end at that setting.  It is
+  ;; NOT the default because the JIT-on ANSI gate exposes a residual
+  ;; eval-result corruption under full scope (RUN-TYPEP-DEBUG-TESTS calls a
+  ;; fixnum; deterministic repro `gate-bin 11080 11140`, task #226) that
+  ;; thunk-only scope does not have.  The optional setq is spliced in by the
+  ;; concatenation below when the env knob is set.
+"
+   (if (let ((v (sb-ext:posix-getenv "MODUS_CONSTVEC_FULL")))
+         (and v (string= v "1")))
+       "  (setq *x64-jit-constvec-full-p* t)
+"
+       "")
+   "  t)
 (in-package :modus.mvm)
-"))
+")))
 
 ;; Baked boot hook + JIT gate.  Appended LAST so its %jit-enabled-p wins over
 ;; mvm-eval.lisp's base version (last-defun).  When JIT is OFF both defuns are

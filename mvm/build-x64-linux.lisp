@@ -56,11 +56,19 @@
                      ~%  ;; loaded as the call destination (0xdead0001 = tagged NIL).~
                      ~%  ;; Each value is divided by 2 for print-dec safety~
                      ~%  ;; (raw u64 with arbitrary low bit upsets print-dec).~
-                     ~%  (let ((rip  (mem-ref #x10000C30 :u64))~
-                     ~%        (site (mem-ref #x10000C40 :u64))~
-                     ~%        (rax  (mem-ref #x10000C48 :u64))~
-                     ~%        (siad (mem-ref #x10000C50 :u64))~
-                     ~%        (uctx (mem-ref #x10000C58 :u64)))~
+                     ~%  ;; #226 FATALITY FIX: these slots hold RAW machine words (a stack~
+                     ~%  ;; word, a register) whose LOW BIT can be 1.  compile-ash's bignum~
+                     ~%  ;; guard then dispatches the odd word to BIGNUM-ASH as if it were a~
+                     ~%  ;; heap pointer -> unbounded recursion -> stack exhaustion -> the~
+                     ~%  ;; SIGSEGV handler itself dies and the whole fork/process is killed.~
+                     ~%  ;; That converted a RECOVERABLE fault's report into a FATAL crash~
+                     ~%  ;; (rc=139 at nunion 11088).  Scrub the low bits with %word-logand~
+                     ~%  ;; (raw :and, no tag dispatch) so ash sees an even fixnum word.~
+                     ~%  (let ((rip  (%word-logand (mem-ref #x10000C30 :u64) -8))~
+                     ~%        (site (%word-logand (mem-ref #x10000C40 :u64) -8))~
+                     ~%        (rax  (%word-logand (mem-ref #x10000C48 :u64) -8))~
+                     ~%        (siad (%word-logand (mem-ref #x10000C50 :u64) -8))~
+                     ~%        (uctx (%word-logand (mem-ref #x10000C58 :u64) -8)))~
                      ~%    (when (> rip 0)~
                      ~%      (write-string-serial \" RIP/4=\") (print-dec (ash rip -1))~
                      ~%      (write-string-serial \" SITE/4=\") (print-dec (ash site -1))~
@@ -148,10 +156,11 @@
                      ~%  (write-string-serial \" COND:\")~
                      ~%  (setq *write-object-budget* 80)~
                      ~%  (handler-case (write-object c) (t (e) nil))~
-                     ~%  (let ((rip  (mem-ref #x10000C30 :u64))~
-                     ~%        (site (mem-ref #x10000C40 :u64))~
-                     ~%        (rax  (mem-ref #x10000C48 :u64))~
-                     ~%        (siad (mem-ref #x10000C50 :u64)))~
+                     ~%  ;; #226: %word-logand scrub — see %record-test-fail above.~
+                     ~%  (let ((rip  (%word-logand (mem-ref #x10000C30 :u64) -8))~
+                     ~%        (site (%word-logand (mem-ref #x10000C40 :u64) -8))~
+                     ~%        (rax  (%word-logand (mem-ref #x10000C48 :u64) -8))~
+                     ~%        (siad (%word-logand (mem-ref #x10000C50 :u64) -8)))~
                      ~%    (when (> rip 0)~
                      ~%      (write-string-serial \" RIP/4=\") (print-dec (ash rip -1))~
                      ~%      (write-string-serial \" SITE/4=\") (print-dec (ash site -1))~

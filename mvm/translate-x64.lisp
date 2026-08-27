@@ -1524,9 +1524,31 @@
                  ;; restriction stays lifted; %jit-patch-consts skips it
                  ;; explicitly.
                  (push (cons -1 idx) *x64-li-const-patches*)
-                 (when (> idx *x64-li-constvec-max*)
+                 (when (> idx (if (integerp *x64-li-constvec-max*)
+                                  *x64-li-constvec-max* -1))
                    (setf *x64-li-constvec-max* idx))
-                 (emit-mov-reg-imm buf d *x64-jit-constvec-root*)
+                 ;; #226 ROOT CAUSE FIX: this branch runs IN-IMAGE (the runtime
+                 ;; JIT), where DEFVAR init-forms are NOT run at boot (CLAUDE.md
+                 ;; Active Limitation #7) — so a bare read of
+                 ;; *x64-jit-constvec-root* yields NIL, and the emit path bakes
+                 ;; NIL-as-fixnum = #xDEAD0001>>1 = #x6F568000 as the root
+                 ;; address.  The emitted `movabs d,#x6F568000; mov d,[d];
+                 ;; mov d,[d+idx*8+7]` then reads a zero word from an unrelated
+                 ;; mapped page instead of the vector %jit-sync-constvec
+                 ;; installed at #x10000F00 — every "constant" load returns
+                 ;; garbage (arbitrary heap words / small fixnums where a
+                 ;; function was expected) or faults at idx*8+7.  Under the
+                 ;; thunk-only scope the mis-rooted loads were confined to the
+                 ;; thunk; under the #226 FULL scope every JIT li-const took
+                 ;; this path and the gate died (nunion 11088 et al).
+                 ;; Fall back to the literal exactly as mvm/mvm-eval.lisp's
+                 ;; %jit-constvec / %jit-constvec-install hard-code it (their
+                 ;; comment: defconstants do not fold in-image).  Host-side the
+                 ;; defvar IS initialised to #x10000F00, so image builds are
+                 ;; byte-identical.
+                 (emit-mov-reg-imm buf d (if (integerp *x64-jit-constvec-root*)
+                                             *x64-jit-constvec-root*
+                                             #x10000F00))
                  (emit-mov-reg-mem buf d d 0)
                  ;; Slot address = (vec - 9) + 16 + idx*8 = vec + idx*8 + 7,
                  ;; the same formula +op-obj-ref+ / +op-aref+ use.

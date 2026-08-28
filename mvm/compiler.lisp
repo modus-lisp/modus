@@ -14271,6 +14271,27 @@
           (emit-ir-label end-label)
           (free-temp-reg)))))
 
+(defun %eql-immediate-literal-p (form)
+  "True when FORM is a literal whose identity is its value, so EQ decides EQL.
+   Fixnums and characters are immediates in this representation; T / NIL are
+   unique immediates; a quoted symbol is interned, so EQ holds for it too.
+   Floats, ratios and bignums are BOXED and are deliberately excluded — they
+   are exactly what EQL's slow path exists for."
+  (flet ((imm-p (v)
+           (or (and (integerp v)
+                    ;; In FIXNUM range for THIS target — outside it the
+                    ;; literal is a boxed bignum and EQ is not enough.
+                    (<= (- (+ +fixnum-max+ 1)) v +fixnum-max+))
+               (characterp v)
+               (null v)
+               (eq v t))))
+    (or (imm-p form)
+        (and (consp form) (name-eq (car form) "QUOTE")
+             (consp (cdr form))
+             (let ((v (cadr form)))
+               ;; A quoted SYMBOL is interned, so EQ decides it too.
+               (or (imm-p v) (symbolp v)))))))
+
 (defun compile-eql (args env dest)
   "Compile (eql a b) — like EQ but with value-equal for boxed numbers
    (ratios subtag #x33, IEEE floats subtag #x60, bignums subtag #x30).
@@ -14284,6 +14305,24 @@
   (if (or (null args) (null (cdr args)) (cddr args))
       (compile-form `(error "wrong number of arguments") env dest)
       (destructuring-bind (a b) args
+        ;; FAST PATH — a constant IMMEDIATE operand makes the slow call dead.
+        ;; The slow path exists only for BOXED numbers (bignum #x30, ratio
+        ;; #x33, float #x60): two separately-consed 4/3s are EQL but not EQ.
+        ;; A fixnum or a character is an IMMEDIATE — its identity IS its
+        ;; value — so when either side is such a literal, EQ already decides
+        ;; EQL and the runtime call can never change the answer.  (A boxed
+        ;; number is never EQL to a fixnum: the tower canonicalises anything
+        ;; in fixnum range to a fixnum.)  FLOAT and RATIO literals are
+        ;; deliberately NOT included — those genuinely need the slot compare.
+        ;;
+        ;; This is not a micro-optimisation.  Measured on x64, 20M iterations:
+        ;; `(eql n 17)` cost 19.4 ns while `obj-subtag` cost 1.3 and a 2-binding
+        ;; LET 1.5 — because the MISMATCH case is the common one and it took a
+        ;; full function call every time.  EQL against a constant is
+        ;; everywhere: CASE/ECASE expansions, MEMBER/ASSOC/POSITION/FIND with
+        ;; the default :test, and %prim-aref's own subtag dispatch.
+        (when (or (%eql-immediate-literal-p a) (%eql-immediate-literal-p b))
+          (return-from compile-eql (compile-eq args env dest)))
         (let ((temp (alloc-temp-reg))
               (true-label (make-compiler-label))
               (end-label (make-compiler-label)))
@@ -16305,7 +16344,13 @@
         (g-idx (%mvm-gensym "PAREFI")))
     (compile-form
      `(let ((,g-arr ,arr-form) (,g-idx ,idx-form))
-        (if (eql (obj-subtag ,g-arr) #x11)
+        ;; EQ, not EQL: OBJ-SUBTAG yields a tagged FIXNUM and #x11 is a
+        ;; fixnum literal, so the values are immediates and EQ decides.
+        ;; EQL here took its runtime-call slow path on EVERY access, because
+        ;; the MISMATCH case (any array that is not byte-packed) is the
+        ;; common one — 19 ns of call per element read.  compile-eql now
+        ;; folds this itself, but say what is meant.
+        (if (eq (obj-subtag ,g-arr) #x11)
             (%u8-ref ,g-arr ,g-idx)
             (%word-aref ,g-arr ,g-idx)))
      env dest)))
@@ -16316,7 +16361,8 @@
         (g-val (%mvm-gensym "PASETV")))
     (compile-form
      `(let ((,g-arr ,arr-form) (,g-idx ,idx-form) (,g-val ,val-form))
-        (if (eql (obj-subtag ,g-arr) #x11)
+        ;; EQ, not EQL — see compile-prim-aref.
+        (if (eq (obj-subtag ,g-arr) #x11)
             (%u8-set ,g-arr ,g-idx ,g-val)
             (%word-aset ,g-arr ,g-idx ,g-val)))
      env dest)))

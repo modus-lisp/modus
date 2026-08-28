@@ -2516,30 +2516,17 @@
                                   (t raw))))
                     (setq pos (+ pos 1))
                     (setq i (+ i 1)))))
-               ((%prim-stringp s)
-                ;; PERF: raw CODE copy, for a PRIMITIVE string only.  Public
-                ;; AREF on a string wraps the stored code in CODE-CHAR and
-                ;; public ASET coerces the character back to a code, so the
-                ;; old line boxed and unboxed every character for nothing.
-                ;; %PRIM-AREF / %PRIM-ASET move the stored word directly.
-                ;;
-                ;; The guard is %PRIM-STRINGP, *not* STRINGP.  STRINGP is also
-                ;; true of an MDA-BACKED string, whose elements live in
-                ;; (%mda-data s) — compile-aref's first branch checks %mda-p
-                ;; for exactly that reason, and %PRIM-AREF does no peeling.
-                ;; Gating this on STRINGP read the MDA's header slots as
-                ;; characters and cost ANSI concatenate.16588 / .16589; the
-                ;; general branch below now catches those.
-                (let ((n (array-length s)) (i 0))
-                  (loop
-                    (when (>= i n) (return nil))
-                    (%prim-aset result pos (%prim-aref s i))
-                    (setq pos (+ pos 1))
-                    (setq i (+ i 1)))))
                ((stringp s)
-                ;; MDA-backed or otherwise non-primitive string — public AREF
-                ;; peels it correctly.  This is the pre-optimisation path,
-                ;; kept verbatim for every string shape the fast path rejects.
+                ;; PUBLIC AREF/ASET, deliberately.  Two attempts to copy raw
+                ;; codes here both broke FILL-POINTER strings (ANSI
+                ;; concatenate.28/.29, which expect (concatenate 'string x)
+                ;; to honour the fill pointer): first gated on STRINGP, then
+                ;; on %PRIM-STRINGP — and %PRIM-STRINGP is TRUE for a
+                ;; fill-pointer string, so the second guard excluded nothing.
+                ;; The character boxing this does is real cost (~5x per char
+                ;; vs SUBSEQ) but it is CORRECT for every string shape, and a
+                ;; faster path needs a predicate that has been MEASURED to
+                ;; exclude wrappers, not assumed to.
                 (dotimes (i (array-length s))
                   (aset result pos (aref s i)) (setq pos (+ pos 1))))
                ((consp s)

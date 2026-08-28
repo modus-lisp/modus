@@ -2385,13 +2385,43 @@
              (t :vector))))
     (t :vector)))
 
+(defun %concat-check-seqs (seqs)
+  "Signal a TYPE-ERROR naming the first CONCATENATE input that is not a
+   sequence — BEFORE any counting, allocation or copying happens.
+
+   %CONCAT-ELT-COUNT already refuses a non-sequence, but it runs inside the
+   counting pass and only on the arms that count; the :LIST arm never calls it
+   and walks SEQS directly.  Checking every input up front makes the failure
+   uniform across arms and, more importantly, makes it NAME THE VALUE: the
+   condition carries the offending object as its DATUM, so a caller that passes
+   the wrong thing (a FUNCTION, say) is identifiable from the error instead of
+   from a debugger session.  That is the whole point — the previous behaviour
+   was a raw header read whose garbage surfaced as a SIGSEGV in the allocator,
+   arbitrarily far from the caller at fault.
+
+   Cost is one pass over the ARGUMENT LIST — typically two or three elements,
+   never over the sequence CONTENTS — so this is not a hot path and needs no
+   opt-out.
+
+   DELIBERATELY NOT A RUNTIME FLAG.  A `(defvar *concat-check* t)' switch would
+   read as garbage in any image whose kernel-main never reaches
+   init-all-globals (Active Limitation 7), and an UNBOUND read here would break
+   CONCATENATE everywhere rather than merely skipping a check — trading a
+   narrow bug for a broad one.  If this ever must become optional, make it a
+   BUILD-TIME switch the way translate-x64 gates *x64-fill-strings*."
+  (dolist (s seqs)
+    (unless (or (null s) (consp s) (arrayp s))
+      (error 'type-error :datum s :expected-type 'sequence))))
+
 (defun concatenate (result-type &rest seqs)
   "Concatenate sequences.  Recognises list / string / vector result
    types (atomic and compound forms like (vector * *)).
 
    Per CLHS 17.2.1: type-error when RESULT-TYPE is a known
-   non-sequence designator (FIXNUM, SYMBOL, etc.) or when a
-   pinned-length compound spec doesn't match the produced length."
+   non-sequence designator (FIXNUM, SYMBOL, etc.), when a
+   pinned-length compound spec doesn't match the produced length, or
+   when any input is not a sequence."
+  (%concat-check-seqs seqs)
   ;; Reject known non-sequence head types + check pinned-length match.
   (let* ((head (if (consp result-type) (car result-type) result-type)))
     (when (member head '(symbol integer fixnum function character keyword

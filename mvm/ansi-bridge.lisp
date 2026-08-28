@@ -2446,7 +2446,18 @@
          ;; Bit-vectors in Modus are plain arrays of 0/1 (bit-vector-p
          ;; tests element values), so coercing a list/vector/bit-vector to
          ;; BIT-VECTOR is the same flatten-to-array path as VECTOR.
-         (eq result-type 'bit-vector) (eq result-type 'simple-bit-vector))
+         (eq result-type 'bit-vector) (eq result-type 'simple-bit-vector)
+         ;; ARRAY / SIMPLE-ARRAY — the SAME path.  Missing them meant
+         ;; `(coerce '(1 2 3) '(simple-array (unsigned-byte 8) (*)))' fell
+         ;; through to `(t object)' and returned THE LIST, silently and with
+         ;; no error, so every downstream (aref result i) read a cons.  That
+         ;; is how pagetree's meta-page magic constant stayed a list: its
+         ;; checksum matched but the magic-byte compare never did, so
+         ;; valid-meta-p was NIL for a meta page written moments earlier —
+         ;; every committed transaction became invisible to a fresh pager and
+         ;; an aborted write txn took the whole store with it.  cl-sequences'
+         ;; COERCE already had this arm; this one wins by last-defun-wins.
+         (eq result-type 'array) (eq result-type 'simple-array))
      (cond
        ;; Wrapped vector — flatten to plain vector of effective length
        ((and (consp object) (array-wrapper-p object))

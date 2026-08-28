@@ -823,13 +823,19 @@
   (mvm-interpret (make-array 11 :initial-contents (list 17 16 42 0 0 0 0 0 0 0 162))))
 ")
 (defvar *rt-macros-source* (mvm-text "mvm/runtime-cl-macros.lisp"))
-;;; The hosted payload, split out of *BRIDGE-SOURCE* so bare-metal targets can
-;;; omit it.  Non-bare-metal assembles EXACTLY the text it always did, in the
-;;; same order, so every hosted build's blob stays byte-identical.
-(defvar *cli-hosted-payload-source*
-  (cond
-    ((not *cli-bare-metal*)
-     (concatenate 'string
+;;; THE LIBRARY-LOADING LAYER — COMMON TO EVERY TARGET THAT LOADS LIBRARIES.
+;;;
+;;; This is the untar -> parse-.asd -> topo-sort -> eval pipeline, and there is
+;;; nothing hosted about it: the same code serves `./modus' on Linux and the
+;;; bare-metal Pi, which fetches a .tar over its own DWC2/CDC stack and installs
+;;; it in RAM.  It used to live INSIDE the hosted arm of one big `cond', welded
+;;; to the Linux syscall layers below, so a bare-metal target that could not
+;;; take `hosted-sockets' also lost `install-tarball' — an accident of how the
+;;; cond was written, never a requirement.  Split so the two can be selected
+;;; independently: platform backing is per-target, library loading is not.
+(defvar *cli-library-payload-source*
+  (if (or (not *cli-bare-metal*) *cli-bare-metal-tarball*)
+      (concatenate 'string
     ;; tar + install-tarball are baked as GENERAL library primitives (NOT ql).
     ;; They are the untar->parse-.asd->topo-sort->eval pipeline; nothing about
     ;; them is quicklisp-specific.  They are baked (not runtime-(load)ed by
@@ -854,7 +860,19 @@
     (mvm-text "lib/tar.lisp")
     (string #\Newline)
     (%cli-strip-chipz (read-file-text (merge-pathnames "lib/install-tarball.lisp"
-                                                       *modus-base*)))
+                                                       *modus-base*))))
+      ""))
+
+;;; THE HOSTED PLATFORM LAYER — Linux syscalls, hosted targets only.
+;;;
+;;; Sockets / block storage / HTTP / the SBCL-faithful toplevel.  These are
+;;; IMPLEMENTATIONS of contracts, not the contracts themselves: bare metal
+;;; satisfies the same ones through ip.lisp + a device driver (and, for the
+;;; filesystem, pagetree/cabinet).  This is the ONLY part that is genuinely
+;;; per-target.
+(defvar *cli-hosted-platform-source*
+  (if (not *cli-bare-metal*)
+      (concatenate 'string
     (string #\Newline)
     ;; Hosted TCP+UDP sockets (Linux syscalls): connected-socket primitives +
     ;; DNS-over-UDP/TCP resolver.  The gateway to networked ql:quickload.
@@ -873,19 +891,15 @@
     ;; %gc-read64/%gc-stack-base (from gc.lisp, already in *all-runtime-source*).
     ;; Other hosted builds adopt this toplevel by baking this file and calling
     ;; (cli-toplevel) from kernel-main.
-    (mvm-text "lib/cli-toplevel.lisp")))
-    ;; BARE METAL + tarball: keep ONLY the general untar -> parse-.asd ->
-    ;; topo-sort -> eval pipeline.  The RPi net build fetches a plain .tar over
-    ;; its own DWC2/CDC stack and installs it in RAM, so it needs these two and
-    ;; none of the Linux syscall layers above.  Same chipz strip, same reason.
-    (*cli-bare-metal-tarball*
-     (concatenate 'string
-       (mvm-text "lib/tar.lisp")
-       (string #\Newline)
-       (%cli-strip-chipz (read-file-text (merge-pathnames "lib/install-tarball.lisp"
-                                                          *modus-base*)))))
-    ;; BARE METAL, no library loading: nothing at all.
-    (t "")))
+    (mvm-text "lib/cli-toplevel.lisp"))
+      ""))
+
+;;; What the image actually bakes: libraries first, then platform.  Hosted
+;;; builds get exactly the text they always did, in the same order, so their
+;;; blobs stay byte-identical across this split; a bare-metal-tarball build
+;;; gets the library layer and an empty platform layer.
+(defvar *cli-hosted-payload-source*
+  (concatenate 'string *cli-library-payload-source* *cli-hosted-platform-source*))
 
 (defvar *bridge-source*
   (concatenate 'string

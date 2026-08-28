@@ -2385,6 +2385,29 @@
   ;; clamps out-of-range garbage, so the two together fail open.)
   (setf (mem-ref #x10000C68 :u64) 0))
 
+(defun %interp-inflight-condition ()
+  "The condition currently being signalled, if any — the object a compiled
+   handler-case dispatch tail was testing when it re-longjmped outward.
+
+   mvm-interpret calls this when a TRAP #x0511 finds NO jmp-buf left in the
+   CURRENT interp state.  That happens whenever a condition has to cross a
+   nested-interpret boundary: a library function loaded at runtime signals
+   `(error 'not-found …)', its own module has no matching handler-case, the
+   dispatch tail re-longjmps, and the frame that would catch it lives in the
+   CALLER's interp state.  Before this existed, that path signalled a fresh
+   SIMPLE-ERROR (\"MVM LONGJMP … with no active handler-case\") and the real
+   condition was DESTROYED at the boundary — so `(handler-case (lib:op …)
+   (lib:lib-error () …))' never matched, while a handler-bind INSIDE the
+   boundary saw the correct type.  Returning it here lets the interpreter
+   re-signal the ORIGINAL object, which the outer state then dispatches on
+   normally.
+
+   Returns NIL unless *CURRENT-CONDITION* really holds a condition, so a
+   genuinely unbalanced longjmp (a THROW whose CATCH is gone) still reports
+   the honest message rather than laundering itself into a stale condition."
+  (let ((c *current-condition*))
+    (if (%condition-p c) c nil)))
+
 (defun %interp-fault-condition ()
   "Build and PUBLISH (as *CURRENT-CONDITION*) a condition standing for a
    HARDWARE FAULT (SIGSEGV/SIGBUS/SIGFPE/SIGILL) that the boot signal stub
@@ -2540,6 +2563,9 @@
   (setq *pkg-tag* 987654321)
   (setq *sym-tag* 123456789)
   (setq *all-packages* nil)
+  ;; No package has a local nickname yet — and this must be BOUND before the
+  ;; find-package calls below, which run before *package* itself is set.
+  (setq *pkg-any-local-nicknames* nil)
   ;; The pkg-by-hash table at memory slot #x10000170 starts empty
   ;; here; each make-package below adds its entry via
   ;; %register-pkg-by-hash so compile-quote's per-symbol

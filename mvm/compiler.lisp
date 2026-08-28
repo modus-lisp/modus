@@ -1939,6 +1939,57 @@
   (let ((q (%global-var-pkg-key sym)))
     (if q q (normalize-name sym))))
 
+;;; ============================================================
+;;; Safety levels (SKETCH — the SBCL model, minimally)
+;;; ============================================================
+;;;
+;;; SBCL compiles type checks in or out per `(optimize (safety N))'; the check
+;;; is not *skipped* at runtime, it is never EMITTED.  That is the right shape
+;;; for Modus too: a runtime flag would cost a global read per call to skip
+;;; work that is often smaller than the read, and a DEFVAR-based flag is
+;;; unbound in any image whose kernel-main never reaches init-all-globals
+;;; (Active Limitation 7) — so reading it would break the guarded function
+;;; everywhere rather than merely unguard it.
+;;;
+;;; THIS IS A SKETCH, deliberately small:
+;;;   * one GLOBAL level, not per-function policy, and no scope restoration —
+;;;     a `(declaim (optimize (safety 0)))' anywhere lowers it from that point
+;;;     on.  CL's real rule is lexical (DECLARE inside a form, restored on
+;;;     exit); implementing that needs the level threaded through ENV.
+;;;   * only SAFETY is read; SPEED/SPACE/DEBUG/COMPILATION-SPEED are parsed
+;;;     and ignored.
+;;;   * `(safety-check N form...)' is the only consumer.  It is spelled as a
+;;;     special form rather than a macro so the body is never even macro-
+;;;     expanded when it is compiled out.
+;;; Cleaning this up means: per-function policy in ENV, lexical restore, and
+;;; teaching the existing emitted checks (aref bounds, car/cdr type tests) to
+;;; consult it.
+(defvar *compile-safety* 1
+  "Compile-time SAFETY level, 0-3.  Checks wrapped in (SAFETY-CHECK N ...) are
+   emitted only when this is >= N.  Set by `(declaim (optimize (safety N)))'
+   in the source being compiled, or by MODUS_SAFETY at build time.")
+
+(defun %declaim-note-optimize (form)
+  "Scan a DECLAIM/PROCLAIM form for (OPTIMIZE (SAFETY N)) and record the level.
+   Accepts the abbreviated `(optimize safety)' spelling (= level 3) too, and
+   ignores every other quality.  Returns nothing useful; called for effect."
+  (dolist (spec (cdr form))
+    ;; `(proclaim '(optimize ...))' arrives quoted; unwrap one QUOTE.
+    (let ((s (if (and (consp spec) (name-eq (car spec) "QUOTE") (consp (cdr spec)))
+                 (cadr spec)
+                 spec)))
+      (when (and (consp s) (name-eq (car s) "OPTIMIZE"))
+        (dolist (q (cdr s))
+          (cond
+            ;; (safety N)
+            ((and (consp q) (symbolp (car q)) (name-eq (car q) "SAFETY")
+                  (consp (cdr q)) (integerp (cadr q)))
+             (setq *compile-safety* (cadr q)))
+            ;; bare SAFETY == (safety 3)
+            ((and (symbolp q) (name-eq q "SAFETY"))
+             (setq *compile-safety* 3))
+            (t nil)))))))
+
 (defun name-eq (sym name-string)
   "Check if SYM's name matches NAME-STRING via hash comparison"
   (and (symbolp sym)
@@ -6735,10 +6786,22 @@
       ;; which silently made the whole package system a stub and cost
       ;; ~980 passes on cl-symbols.lsp.  Now they fall through to
       ;; compile-call so the real defuns get invoked.
+      ;; (safety-check N form...) — emit FORMs only at safety level >= N.
+      ;; Compiled out entirely below that: the body is not walked, not
+      ;; macroexpanded, and costs nothing at runtime.  See *compile-safety*.
+      ((= op-name (compute-name-hash "SAFETY-CHECK"))
+       (if (and (consp (cdr form)) (integerp (cadr form))
+                (>= *compile-safety* (cadr form)))
+           (compile-form (cons 'progn (cddr form)) env dest)
+           (compile-nil dest)))
+
       ((member op-name '(86089372   ; PROVIDE
                           101258370   ; REQUIRE
                           62725856  ; PROCLAIM
                           102992244))  ; DECLAIM
+       ;; Still a runtime no-op, but DECLAIM/PROCLAIM carry the optimize
+       ;; policy, so read the level out on the way past.
+       (%declaim-note-optimize form)
        (compile-nil dest))
 
       (t (compile-call op (cdr form) env dest)))))
@@ -14208,6 +14271,27 @@
           (emit-ir-label end-label)
           (free-temp-reg)))))
 
+(defun %eql-immediate-literal-p (form)
+  "True when FORM is a literal whose identity is its value, so EQ decides EQL.
+   Fixnums and characters are immediates in this representation; T / NIL are
+   unique immediates; a quoted symbol is interned, so EQ holds for it too.
+   Floats, ratios and bignums are BOXED and are deliberately excluded — they
+   are exactly what EQL's slow path exists for."
+  (flet ((imm-p (v)
+           (or (and (integerp v)
+                    ;; In FIXNUM range for THIS target — outside it the
+                    ;; literal is a boxed bignum and EQ is not enough.
+                    (<= (- (+ +fixnum-max+ 1)) v +fixnum-max+))
+               (characterp v)
+               (null v)
+               (eq v t))))
+    (or (imm-p form)
+        (and (consp form) (name-eq (car form) "QUOTE")
+             (consp (cdr form))
+             (let ((v (cadr form)))
+               ;; A quoted SYMBOL is interned, so EQ decides it too.
+               (or (imm-p v) (symbolp v)))))))
+
 (defun compile-eql (args env dest)
   "Compile (eql a b) — like EQ but with value-equal for boxed numbers
    (ratios subtag #x33, IEEE floats subtag #x60, bignums subtag #x30).
@@ -14221,6 +14305,24 @@
   (if (or (null args) (null (cdr args)) (cddr args))
       (compile-form `(error "wrong number of arguments") env dest)
       (destructuring-bind (a b) args
+        ;; FAST PATH — a constant IMMEDIATE operand makes the slow call dead.
+        ;; The slow path exists only for BOXED numbers (bignum #x30, ratio
+        ;; #x33, float #x60): two separately-consed 4/3s are EQL but not EQ.
+        ;; A fixnum or a character is an IMMEDIATE — its identity IS its
+        ;; value — so when either side is such a literal, EQ already decides
+        ;; EQL and the runtime call can never change the answer.  (A boxed
+        ;; number is never EQL to a fixnum: the tower canonicalises anything
+        ;; in fixnum range to a fixnum.)  FLOAT and RATIO literals are
+        ;; deliberately NOT included — those genuinely need the slot compare.
+        ;;
+        ;; This is not a micro-optimisation.  Measured on x64, 20M iterations:
+        ;; `(eql n 17)` cost 19.4 ns while `obj-subtag` cost 1.3 and a 2-binding
+        ;; LET 1.5 — because the MISMATCH case is the common one and it took a
+        ;; full function call every time.  EQL against a constant is
+        ;; everywhere: CASE/ECASE expansions, MEMBER/ASSOC/POSITION/FIND with
+        ;; the default :test, and %prim-aref's own subtag dispatch.
+        (when (or (%eql-immediate-literal-p a) (%eql-immediate-literal-p b))
+          (return-from compile-eql (compile-eq args env dest)))
         (let ((temp (alloc-temp-reg))
               (true-label (make-compiler-label))
               (end-label (make-compiler-label)))
@@ -16084,11 +16186,27 @@
      ;; vector with `(make-array total)` (integer) — routing that to the
      ;; defun would recurse forever.  %MAKE-ARRAY-RAW is the un-guarded raw
      ;; 1-D alloc (no re-entry), and CONSP has excluded the cons case.
+     ;; The guard tests FIXNUMP, not (not CONSP).  Excluding conses closed the
+     ;; multi-dim case above, but it let EVERY OTHER non-fixnum through to the
+     ;; raw path: a string, a symbol, a struct, a bignum — anything with tag 9
+     ;; — gets SAR'd into a garbage element count exactly the way the cons
+     ;; pointer did, and ALLOC-ARRAY then writes a header and a zero-init run
+     ;; off the end of the heap.  That is an unbounded wild write reached from
+     ;; ordinary `(make-array n)` whenever N is not what the caller thought,
+     ;; and it is how a plain type error presents as a SIGSEGV with no
+     ;; condition (aarch64 pagetree/cabinet load, where N arrived as a
+     ;; pointer-shaped word).  Testing FIXNUMP positively routes cons dims
+     ;; AND garbage to the real MAKE-ARRAY, which handles the former and
+     ;; signals an honest type error for the latter.  FIXNUMP is a low-bit
+     ;; test (compile-fixnump), not a call, so the fast path is unchanged in
+     ;; cost.  The no-recursion property still holds: %MAKE-ARRAY-RAW is
+     ;; reached only for fixnums, and MAKE-ARRAY's own internal
+     ;; `(make-array total)` on an integer total keeps taking it.
      (compile-form
       `(let ((%mar-sz ,size-form))
-         (if (consp %mar-sz)
-             (funcall (function make-array) %mar-sz)
-             (%make-array-raw %mar-sz)))
+         (if (fixnump %mar-sz)
+             (%make-array-raw %mar-sz)
+             (funcall (function make-array) %mar-sz)))
       env dest))))
 
 (defun compile-make-array-raw (size-form env dest)
@@ -16226,7 +16344,13 @@
         (g-idx (%mvm-gensym "PAREFI")))
     (compile-form
      `(let ((,g-arr ,arr-form) (,g-idx ,idx-form))
-        (if (eql (obj-subtag ,g-arr) #x11)
+        ;; EQ, not EQL: OBJ-SUBTAG yields a tagged FIXNUM and #x11 is a
+        ;; fixnum literal, so the values are immediates and EQ decides.
+        ;; EQL here took its runtime-call slow path on EVERY access, because
+        ;; the MISMATCH case (any array that is not byte-packed) is the
+        ;; common one — 19 ns of call per element read.  compile-eql now
+        ;; folds this itself, but say what is meant.
+        (if (eq (obj-subtag ,g-arr) #x11)
             (%u8-ref ,g-arr ,g-idx)
             (%word-aref ,g-arr ,g-idx)))
      env dest)))
@@ -16237,7 +16361,8 @@
         (g-val (%mvm-gensym "PASETV")))
     (compile-form
      `(let ((,g-arr ,arr-form) (,g-idx ,idx-form) (,g-val ,val-form))
-        (if (eql (obj-subtag ,g-arr) #x11)
+        ;; EQ, not EQL — see compile-prim-aref.
+        (if (eq (obj-subtag ,g-arr) #x11)
             (%u8-set ,g-arr ,g-idx ,g-val)
             (%word-aset ,g-arr ,g-idx ,g-val)))
      env dest)))
@@ -18508,6 +18633,9 @@
                                  101258370   ; REQUIRE
                                  62725856  ; PROCLAIM
                                  102992244))) ; DECLAIM
+     ;; Same as the expression-level clause: a runtime no-op, but the
+     ;; optimize policy is read out first (see *compile-safety*).
+     (%declaim-note-optimize form)
      nil)
 
     ;; (eval-when (situations...) body...) — compile body as top-level forms

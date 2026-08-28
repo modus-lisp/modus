@@ -2331,11 +2331,27 @@
 
 ;;; String functions
 (defun %concat-elt-count (s)
+  "Element count of one CONCATENATE input.  Signals a type error for a
+   non-sequence instead of guessing.
+
+   The old catch-all `(t (array-length s))' ran ARRAY-LENGTH on ANY value that
+   was not NIL, a cons or a string — a symbol, a number, a hash-table, a
+   struct.  ARRAY-LENGTH is a raw header read with no type check, so it
+   returned whatever bits sat where a header would be: `(array-length '(1 2))'
+   yields 14593280 here.  That garbage becomes CONCATENATE's TOTAL, TOTAL
+   becomes the argument of `(make-array total)', and a ~10^12 element count
+   walks the allocator off the end of the heap.  So passing a non-sequence to
+   CONCATENATE was an unbounded wild write and a bare SIGSEGV rather than the
+   TYPE-ERROR CLHS 17.2.1 asks for — and the fault lands in the allocator,
+   nowhere near the caller that supplied the bad value.
+
+   ARRAYP covers strings and vectors alike (the old STRINGP clause did exactly
+   what the catch-all did), and the two CONSP clauses computed the same LENGTH,
+   so the fast paths are unchanged."
   (cond ((null s) 0)
-        ((and (consp s) (array-wrapper-p s)) (length s))
         ((consp s) (length s))
-        ((stringp s) (array-length s))
-        (t (array-length s))))
+        ((arrayp s) (array-length s))
+        (t (%signal-type-error))))
 
 (defun %concat-result-kind (result-type)
   "Resolve a concatenate RESULT-TYPE designator to one of :LIST,
@@ -2369,15 +2385,59 @@
              (t :vector))))
     (t :vector)))
 
+(defun %concat-check-seqs (seqs)
+  "Signal a TYPE-ERROR naming the first CONCATENATE input that is not a
+   sequence — BEFORE any counting, allocation or copying happens.
+
+   %CONCAT-ELT-COUNT already refuses a non-sequence, but it runs inside the
+   counting pass and only on the arms that count; the :LIST arm never calls it
+   and walks SEQS directly.  Checking every input up front makes the failure
+   uniform across arms and, more importantly, makes it NAME THE VALUE: the
+   condition carries the offending object as its DATUM, so a caller that passes
+   the wrong thing (a FUNCTION, say) is identifiable from the error instead of
+   from a debugger session.  That is the whole point — the previous behaviour
+   was a raw header read whose garbage surfaced as a SIGSEGV in the allocator,
+   arbitrarily far from the caller at fault.
+
+   Cost is one pass over the ARGUMENT LIST — typically two or three elements,
+   never over the sequence CONTENTS — so this is not a hot path and needs no
+   opt-out.
+
+   DELIBERATELY NOT A RUNTIME FLAG.  A `(defvar *concat-check* t)' switch would
+   read as garbage in any image whose kernel-main never reaches
+   init-all-globals (Active Limitation 7), and an UNBOUND read here would break
+   CONCATENATE everywhere rather than merely skipping a check — trading a
+   narrow bug for a broad one.  If this ever must become optional, make it a
+   BUILD-TIME switch — which now exists: the body is wrapped in
+   (SAFETY-CHECK 1 ...), so `MODUS_SAFETY=0' (or a source-level
+   `(declaim (optimize (safety 0)))') compiles it out entirely rather than
+   skipping it at runtime.  At the default level 1 it is emitted as before."
+  (safety-check 1
+    (dolist (s seqs)
+      (unless (or (null s) (consp s) (arrayp s))
+        (error 'type-error :datum s :expected-type 'sequence)))))
+
 (defun concatenate (result-type &rest seqs)
   "Concatenate sequences.  Recognises list / string / vector result
    types (atomic and compound forms like (vector * *)).
 
    Per CLHS 17.2.1: type-error when RESULT-TYPE is a known
-   non-sequence designator (FIXNUM, SYMBOL, etc.) or when a
-   pinned-length compound spec doesn't match the produced length."
+   non-sequence designator (FIXNUM, SYMBOL, etc.), when a
+   pinned-length compound spec doesn't match the produced length, or
+   when any input is not a sequence."
+  (%concat-check-seqs seqs)
   ;; Reject known non-sequence head types + check pinned-length match.
   (let* ((head (if (consp result-type) (car result-type) result-type)))
+    ;; PERF: the MEMBER below scans an 18-element constant list on EVERY call
+    ;; (measured: 629 ns, ~8% of a two-string CONCATENATE).  Every designator
+    ;; real code actually passes — STRING / LIST / VECTOR and their SIMPLE-
+    ;; variants — is guaranteed to miss it, so short-circuit on those first:
+    ;; four EQ tests at ~4 ns instead of the full scan.  The list is still
+    ;; consulted for everything else, so SEQUENCE, FIXNUM, HASH-TABLE etc.
+    ;; are rejected exactly as before.
+    (unless (or (eq head 'string) (eq head 'list) (eq head 'vector)
+                (eq head 'simple-string) (eq head 'simple-vector)
+                (eq head 'base-string) (eq head 'simple-base-string))
     (when (member head '(symbol integer fixnum function character keyword
                          ratio rational complex number real
                          hash-table package readtable stream pathname
@@ -2385,7 +2445,7 @@
                          ;; representation, so concatenate signals.  (CLHS
                          ;; 17.1: result must be a concrete subtype.)
                          sequence))
-      (%signal-type-error))
+      (%signal-type-error)))
     ;; NULL is the (empty) sequence type containing only NIL.  An empty
     ;; concatenation yields NIL; a non-empty one is a type-error.
     (when (eq head 'null)
@@ -2456,7 +2516,30 @@
                                   (t raw))))
                     (setq pos (+ pos 1))
                     (setq i (+ i 1)))))
+               ((%prim-stringp s)
+                ;; PERF: raw CODE copy, for a PRIMITIVE string only.  Public
+                ;; AREF on a string wraps the stored code in CODE-CHAR and
+                ;; public ASET coerces the character back to a code, so the
+                ;; old line boxed and unboxed every character for nothing.
+                ;; %PRIM-AREF / %PRIM-ASET move the stored word directly.
+                ;;
+                ;; The guard is %PRIM-STRINGP, *not* STRINGP.  STRINGP is also
+                ;; true of an MDA-BACKED string, whose elements live in
+                ;; (%mda-data s) — compile-aref's first branch checks %mda-p
+                ;; for exactly that reason, and %PRIM-AREF does no peeling.
+                ;; Gating this on STRINGP read the MDA's header slots as
+                ;; characters and cost ANSI concatenate.16588 / .16589; the
+                ;; general branch below now catches those.
+                (let ((n (array-length s)) (i 0))
+                  (loop
+                    (when (>= i n) (return nil))
+                    (%prim-aset result pos (%prim-aref s i))
+                    (setq pos (+ pos 1))
+                    (setq i (+ i 1)))))
                ((stringp s)
+                ;; MDA-backed or otherwise non-primitive string — public AREF
+                ;; peels it correctly.  This is the pre-optimisation path,
+                ;; kept verbatim for every string shape the fast path rejects.
                 (dotimes (i (array-length s))
                   (aset result pos (aref s i)) (setq pos (+ pos 1))))
                ((consp s)

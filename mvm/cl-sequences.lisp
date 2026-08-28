@@ -2516,20 +2516,32 @@
                                   (t raw))))
                     (setq pos (+ pos 1))
                     (setq i (+ i 1)))))
-               ((stringp s)
-                ;; PERF: raw CODE copy.  Public AREF on a string wraps the
-                ;; stored code in CODE-CHAR and public ASET coerces the
-                ;; character back to a code, so the old line boxed and
-                ;; unboxed every character for nothing.  %PRIM-AREF /
-                ;; %PRIM-ASET move the stored word directly (27 ns vs 37+39).
-                ;; Both sides are known strings here, so the conversions are
-                ;; provably identity.
+               ((%prim-stringp s)
+                ;; PERF: raw CODE copy, for a PRIMITIVE string only.  Public
+                ;; AREF on a string wraps the stored code in CODE-CHAR and
+                ;; public ASET coerces the character back to a code, so the
+                ;; old line boxed and unboxed every character for nothing.
+                ;; %PRIM-AREF / %PRIM-ASET move the stored word directly.
+                ;;
+                ;; The guard is %PRIM-STRINGP, *not* STRINGP.  STRINGP is also
+                ;; true of an MDA-BACKED string, whose elements live in
+                ;; (%mda-data s) — compile-aref's first branch checks %mda-p
+                ;; for exactly that reason, and %PRIM-AREF does no peeling.
+                ;; Gating this on STRINGP read the MDA's header slots as
+                ;; characters and cost ANSI concatenate.16588 / .16589; the
+                ;; general branch below now catches those.
                 (let ((n (array-length s)) (i 0))
                   (loop
                     (when (>= i n) (return nil))
                     (%prim-aset result pos (%prim-aref s i))
                     (setq pos (+ pos 1))
                     (setq i (+ i 1)))))
+               ((stringp s)
+                ;; MDA-backed or otherwise non-primitive string — public AREF
+                ;; peels it correctly.  This is the pre-optimisation path,
+                ;; kept verbatim for every string shape the fast path rejects.
+                (dotimes (i (array-length s))
+                  (aset result pos (aref s i)) (setq pos (+ pos 1))))
                ((consp s)
                 (dolist (c s)
                   (aset result pos (if (characterp c) (char-code c) c))

@@ -2408,10 +2408,14 @@
    init-all-globals (Active Limitation 7), and an UNBOUND read here would break
    CONCATENATE everywhere rather than merely skipping a check — trading a
    narrow bug for a broad one.  If this ever must become optional, make it a
-   BUILD-TIME switch the way translate-x64 gates *x64-fill-strings*."
-  (dolist (s seqs)
-    (unless (or (null s) (consp s) (arrayp s))
-      (error 'type-error :datum s :expected-type 'sequence))))
+   BUILD-TIME switch — which now exists: the body is wrapped in
+   (SAFETY-CHECK 1 ...), so `MODUS_SAFETY=0' (or a source-level
+   `(declaim (optimize (safety 0)))') compiles it out entirely rather than
+   skipping it at runtime.  At the default level 1 it is emitted as before."
+  (safety-check 1
+    (dolist (s seqs)
+      (unless (or (null s) (consp s) (arrayp s))
+        (error 'type-error :datum s :expected-type 'sequence)))))
 
 (defun concatenate (result-type &rest seqs)
   "Concatenate sequences.  Recognises list / string / vector result

@@ -1939,6 +1939,57 @@
   (let ((q (%global-var-pkg-key sym)))
     (if q q (normalize-name sym))))
 
+;;; ============================================================
+;;; Safety levels (SKETCH — the SBCL model, minimally)
+;;; ============================================================
+;;;
+;;; SBCL compiles type checks in or out per `(optimize (safety N))'; the check
+;;; is not *skipped* at runtime, it is never EMITTED.  That is the right shape
+;;; for Modus too: a runtime flag would cost a global read per call to skip
+;;; work that is often smaller than the read, and a DEFVAR-based flag is
+;;; unbound in any image whose kernel-main never reaches init-all-globals
+;;; (Active Limitation 7) — so reading it would break the guarded function
+;;; everywhere rather than merely unguard it.
+;;;
+;;; THIS IS A SKETCH, deliberately small:
+;;;   * one GLOBAL level, not per-function policy, and no scope restoration —
+;;;     a `(declaim (optimize (safety 0)))' anywhere lowers it from that point
+;;;     on.  CL's real rule is lexical (DECLARE inside a form, restored on
+;;;     exit); implementing that needs the level threaded through ENV.
+;;;   * only SAFETY is read; SPEED/SPACE/DEBUG/COMPILATION-SPEED are parsed
+;;;     and ignored.
+;;;   * `(safety-check N form...)' is the only consumer.  It is spelled as a
+;;;     special form rather than a macro so the body is never even macro-
+;;;     expanded when it is compiled out.
+;;; Cleaning this up means: per-function policy in ENV, lexical restore, and
+;;; teaching the existing emitted checks (aref bounds, car/cdr type tests) to
+;;; consult it.
+(defvar *compile-safety* 1
+  "Compile-time SAFETY level, 0-3.  Checks wrapped in (SAFETY-CHECK N ...) are
+   emitted only when this is >= N.  Set by `(declaim (optimize (safety N)))'
+   in the source being compiled, or by MODUS_SAFETY at build time.")
+
+(defun %declaim-note-optimize (form)
+  "Scan a DECLAIM/PROCLAIM form for (OPTIMIZE (SAFETY N)) and record the level.
+   Accepts the abbreviated `(optimize safety)' spelling (= level 3) too, and
+   ignores every other quality.  Returns nothing useful; called for effect."
+  (dolist (spec (cdr form))
+    ;; `(proclaim '(optimize ...))' arrives quoted; unwrap one QUOTE.
+    (let ((s (if (and (consp spec) (name-eq (car spec) "QUOTE") (consp (cdr spec)))
+                 (cadr spec)
+                 spec)))
+      (when (and (consp s) (name-eq (car s) "OPTIMIZE"))
+        (dolist (q (cdr s))
+          (cond
+            ;; (safety N)
+            ((and (consp q) (symbolp (car q)) (name-eq (car q) "SAFETY")
+                  (consp (cdr q)) (integerp (cadr q)))
+             (setq *compile-safety* (cadr q)))
+            ;; bare SAFETY == (safety 3)
+            ((and (symbolp q) (name-eq q "SAFETY"))
+             (setq *compile-safety* 3))
+            (t nil)))))))
+
 (defun name-eq (sym name-string)
   "Check if SYM's name matches NAME-STRING via hash comparison"
   (and (symbolp sym)
@@ -6735,10 +6786,22 @@
       ;; which silently made the whole package system a stub and cost
       ;; ~980 passes on cl-symbols.lsp.  Now they fall through to
       ;; compile-call so the real defuns get invoked.
+      ;; (safety-check N form...) — emit FORMs only at safety level >= N.
+      ;; Compiled out entirely below that: the body is not walked, not
+      ;; macroexpanded, and costs nothing at runtime.  See *compile-safety*.
+      ((= op-name (compute-name-hash "SAFETY-CHECK"))
+       (if (and (consp (cdr form)) (integerp (cadr form))
+                (>= *compile-safety* (cadr form)))
+           (compile-form (cons 'progn (cddr form)) env dest)
+           (compile-nil dest)))
+
       ((member op-name '(86089372   ; PROVIDE
                           101258370   ; REQUIRE
                           62725856  ; PROCLAIM
                           102992244))  ; DECLAIM
+       ;; Still a runtime no-op, but DECLAIM/PROCLAIM carry the optimize
+       ;; policy, so read the level out on the way past.
+       (%declaim-note-optimize form)
        (compile-nil dest))
 
       (t (compile-call op (cdr form) env dest)))))
@@ -18524,6 +18587,9 @@
                                  101258370   ; REQUIRE
                                  62725856  ; PROCLAIM
                                  102992244))) ; DECLAIM
+     ;; Same as the expression-level clause: a runtime no-op, but the
+     ;; optimize policy is read out first (see *compile-safety*).
+     (%declaim-note-optimize form)
      nil)
 
     ;; (eval-when (situations...) body...) — compile body as top-level forms

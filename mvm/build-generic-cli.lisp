@@ -209,6 +209,19 @@
   (when (and sm (> (length sm) 0))
     (setf modus.mvm::*write-symmap-path* sm)))
 
+;; MODUS_SAFETY=N — compile-time safety level (SBCL's (optimize (safety N))).
+;; Checks wrapped in (SAFETY-CHECK N ...) are emitted only at level >= N, so
+;; 0 removes them from the image rather than skipping them at runtime.
+;; Source-level `(declaim (optimize (safety N)))' overrides this from its
+;; point on; see *compile-safety* in compiler.lisp.
+#+sbcl
+(let ((sv (sb-ext:posix-getenv "MODUS_SAFETY")))
+  (when (and sv (> (length sv) 0))
+    (let ((n (parse-integer sv :junk-allowed t)))
+      (when n
+        (setf modus.mvm::*compile-safety* n)
+        (format t ";; MODUS_SAFETY=~D (checks below this level are not emitted)~%" n)))))
+
 (format t "~%Compiling generic image (~D chars)...~%"
         (length cl-user::*full-source*))
 

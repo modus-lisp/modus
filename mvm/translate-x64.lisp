@@ -52,6 +52,150 @@
    Set by Linux x64 builds to use SYS_write/SYS_read/SYS_exit instead of
    port I/O, PIC/PIT setup, etc.")
 
+(defvar *x64-tls-window* nil
+  "THE PER-THREAD WINDOW (see mvm/compiler.lisp for what is in it and what is
+   deliberately left out).  When non-nil, every access to the multiple-value
+   buffer, the dynamic-nargs slot and the handler-frame machinery is emitted
+   with an FS segment override — the ADDRESS IS UNCHANGED, only the segment it
+   is measured from.
+
+   WHY FS AND NOT GS.  GS is already this back-end's per-CPU segment
+   (PERCPU-REF/-SET emit `GS:[disp32]'), and the two must not fight: a thread
+   points GS at its per-CPU block, whose slots live at small offsets, while the
+   window lives at 0x10000090..0x10000C37.  FS is untouched by Modus and by
+   this freestanding runtime — nothing here uses glibc's TLS ABI.
+
+   WHY THIS COSTS THE MAIN THREAD NOTHING.  A fresh Linux process starts with
+   FS base = 0, so `FS:[0x10000180]' IS `[0x10000180]' — the same word, on the
+   same instruction, one prefix byte longer.  No boot-time initialisation, no
+   mode word to write before the first MULTIPLE-VALUE-BIND, and nothing to get
+   wrong on an image that never starts a thread.  A worker thread issues one
+   arch_prctl(ARCH_SET_FS, block - 0x10000000) as its first act and every one
+   of these accesses lands in its own block.
+
+   OFF is the default and emits byte-identical code to every earlier stage:
+   the thread-local width bit is masked off and the raw asm sites skip the
+   prefix.")
+
+(defun emit-tls-prefix (buf)
+  "Emit the FS segment override (0x64) for the NEXT memory access, when the
+   per-thread window is on.  Legacy prefixes precede REX, so this must be the
+   last thing emitted before the instruction itself.  With the window off it
+   emits nothing at all, which is what keeps every other image byte-identical."
+  (when *x64-tls-window* (emit-bytes buf #x64)))
+
+(defun emit-tls-base (buf reg)
+  "REG = this thread's FS base, or 0 when the per-thread window is off.
+
+   THE SELF SLOT HOLDS THE BASE, NOT THE BLOCK, and that is the whole reason
+   nothing has to be initialised: on the main thread the slot is BSS zero and
+   the base IS zero, so `base + 0x10000098' is the historic address, reached
+   without a single boot-time store.  A worker stores its own FS base there
+   (block - 0x10000000) as part of installing it.
+
+   This exists for exactly one caller shape: code that must hand a WINDOW
+   address to a callee.  The collector's MV-extras loop passes each slot's
+   address to scan_word, and only an ACCESS can carry a segment override — an
+   address that crosses a function boundary has to be absolute."
+  (if *x64-tls-window*
+      (progn (emit-tls-prefix buf)
+             (emit-mov-reg-abs buf reg #x10000C30))
+      (emit-mov-reg-imm buf reg 0)))
+
+(defun emit-dynbind-root-scan (buf scan-word-label)
+  "Scan THIS THREAD's dynamic-binding stack as a precise root set.
+
+   A special bound on a worker no longer goes into the region-0 globals table
+   — it goes into that thread's own per-thread window block (mvm/prelude.lisp,
+   PER-THREAD DYNAMIC BINDINGS).  A RAW PER-THREAD WORD IS NOT A GC ROOT: the
+   precise root set is exactly the fixed list this trampoline walks, so
+   without this loop the bound object would be moved or reclaimed by the very
+   collector its binder is running on, and the binding would hand back a
+   forwarding pointer.  That is the failure the whole change exists to end,
+   and leaving this out would merely move it.
+
+   THE COLLECTOR RUNS ON THE THREAD THAT HIT ITS OWN LIMIT, so EMIT-TLS-BASE
+   resolves to that thread's block and the stack walked is that thread's —
+   the same argument the MV-extras loop above rests on.  The main thread's
+   base is 0 and it never binds here, so the first test skips everything;
+   with the window off nothing is emitted at all and every other image stays
+   byte-identical.
+
+   Layout, from mvm/prelude.lisp: blk+0xC58 = depth as a TAGGED fixnum (one
+   SHR, exactly like the MV count), blk+0xC60 = entry 0, 16 bytes per entry,
+   [key][value].  Only the VALUE word is scanned; a key is a name hash, i.e.
+   a fixnum, which scan_word would reject anyway.
+
+   RDI and R10 are the loop registers because scan_word/copy_object preserve
+   them — the MV-extras loop above depends on the same property."
+  (when *x64-tls-window*
+    (let ((db-loop (make-label))
+          (db-done (make-label)))
+      (emit-tls-base buf 'rdi)                       ; rdi = this thread's base
+      (emit-cmp-reg-imm buf 'rdi 0)
+      (emit-jcc buf :e db-done)                      ; base 0 = main thread
+      (emit-mov-reg-mem buf 'r10 'rdi #x10000C58)    ; r10 = tagged depth
+      (emit-shr-reg-imm buf 'r10 1)                  ; untag
+      (emit-cmp-reg-imm buf 'r10 0)
+      (emit-jcc buf :le db-done)
+      (emit-add-reg-imm buf 'rdi #x10000C68)         ; rdi = &entry0.value
+      (emit-label buf db-loop)
+      (emit-mov-reg-reg buf 'rax 'rdi)               ; rax = slot addr
+      (emit-call buf scan-word-label)
+      (emit-add-reg-imm buf 'rdi 16)                 ; next entry
+      (emit-sub-reg-imm buf 'r10 1)
+      (emit-cmp-reg-imm buf 'r10 0)
+      (emit-jcc buf :g db-loop)
+      (emit-label buf db-done))))
+
+(defvar *x64-fault-dump*
+  ;; NOTE the shape: `(and #+sbcl (getenv ...) t)' would read as `(and t)' — i.e.
+  ;; ON — on any host that is not SBCL, because the reader DELETES the guarded
+  ;; form rather than yielding NIL.  Bind first, then test.
+  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_FAULT_DUMP") #-sbcl nil))
+    (if v t nil))
+  "TEMPORARY DIAGNOSTIC, off unless MODUS_FAULT_DUMP is set in the build
+   environment.  When on, the SIGSEGV/SIGBUS/SIGFPE/SIGILL stub's
+   no-handler-active path writes its six captured diagnostic words (RIP, RSP,
+   call site, RAX, si_addr, ucontext pointer) raw to fd 2 before exit_group.
+   ptrace is blocked on the development box (Yama ptrace_scope=2), so neither
+   gdb nor strace can observe a fault; this is the substitute.  A shipping
+   image must NOT set it — the output is 48 raw bytes on stderr.")
+
+(defvar *x64-sched-lock-addr* nil
+  "Scheduler-lock address for RESTORE-CTX's unlock.  NIL (the default, and what
+   every image built before native threads got) = emit nothing, so +OP-RESTORE-CTX+
+   is byte-for-byte the sequence it has always been.
+
+   THIS IS THE x64 TWIN OF *AARCH64-SCHED-LOCK-ADDR* AND IT EXISTS FOR THE SAME
+   REASON.  net/actors.lisp takes the scheduler lock, performs the switch, and
+   hands the RELEASE to RESTORE-CONTEXT — YIELD's resume arm is commented `lock
+   already released by restore-context'.  aarch64 has always honoured that
+   contract; x64 never did, which is why net/hosted-actors-post.lisp used to
+   override SPIN-LOCK/SPIN-UNLOCK to no-ops (a real lock would be held across
+   every switch and the next acquire would spin forever).
+
+   WHY THE SWITCH RELEASES, RATHER THAN THE DEPARTING ACTOR RELEASING FIRST.
+   By the time YIELD reaches RESTORE-CONTEXT it has already put the OUTGOING
+   actor back on the run queue, so the outgoing actor is visible to every other
+   CPU while this CPU is still executing on its stack.  Releasing before the
+   switch therefore lets a second thread dequeue that actor and RESTORE-CONTEXT
+   onto a stack we have not left — two CPUs, one stack.  The earliest instant at
+   which release is safe is the one AFTER `mov rsp,[base]': from there this CPU
+   touches only the ARRIVING actor's stack (the following `jmp rax' pushes
+   nothing), and the arriving actor was dequeued and marked running under the
+   same lock, so nobody else can claim it either.  That is exactly where aarch64
+   puts its release, and exactly where the emitter below puts this one.
+
+   NO FENCE IS NEEDED and its absence is not an oversight: x86-64 is TSO, so the
+   releasing store cannot be reordered before any earlier load or store.
+   aarch64 needs its DMB because it is not.
+
+   The address must be a fixed absolute one because it is baked into the
+   instruction stream at TRANSLATE time — see +HOSTED-SCHED-LOCK-ADDR+ in
+   mvm/compiler.lisp, which is the BSS word net/hosted-actors.lisp's
+   SCHED-LOCK-ADDR hands out.")
+
 (defvar *x64-li-const-patches* nil
   "List of (native-byte-offset . pool-index) pairs collected during
    translation.  Each entry says: at NATIVE-BYTE-OFFSET in the native
@@ -932,6 +1076,101 @@
               (emit-bytes buf #x41 #x58)         ; pop r8
               (emit-bytes buf #x5A)              ; pop rdx
               (emit-bytes buf #x5F))             ; pop rdi
+             ((= code #x0540)
+              ;; %SPAWN-THREAD — clone(2) A NATIVE OS THREAD.
+              ;;   V0(RSI) = entry address (tagged fixnum, raw byte address of a
+              ;;             ZERO-ARGUMENT native function)
+              ;;   V1(RDI) = stack TOP (tagged; the thread's stack grows down
+              ;;             from here, and it must be 16-byte aligned)
+              ;;   V2(R8)  = tid-word address (tagged; 4 bytes)
+              ;; Result in V0(RSI): the child TID, tagged, in the PARENT.
+              ;;
+              ;; WHY THIS IS A STUB AND NOT `(syscall6 56 …)'.  clone returns
+              ;; TWICE.  The child resumes at the instruction after SYSCALL with
+              ;; RAX=0 and RSP pointing at the NEW stack — but with every other
+              ;; register, RBP included, still holding the PARENT's values.  The
+              ;; compiler addresses let-bound locals as RBP-relative frame slots
+              ;; (+FRAME-SLOT-BASE+), so the moment the child executes one more
+              ;; line of compiled Lisp it reads and WRITES the parent's live
+              ;; frame from a second thread.  Returning through the caller's
+              ;; frame is worse still: the RET would pop a return address off a
+              ;; stack that has none.  So the fork in control flow has to happen
+              ;; HERE, in the instruction stream, before any compiled code runs:
+              ;; the child never returns from the trap at all — it zeroes RBP,
+              ;; CALLs the entry function on its own stack, and when that
+              ;; returns issues SYS_exit.
+              ;;
+              ;; SYS_exit (60) AND NOT SYS_exit_group (231): 60 terminates the
+              ;; CALLING THREAD; 231 would take the whole process down with it.
+              ;;
+              ;; FLAGS = 0x3D0F00:
+              ;;   CLONE_VM 0x100 | CLONE_FS 0x200 | CLONE_FILES 0x400 |
+              ;;   CLONE_SIGHAND 0x800 | CLONE_THREAD 0x10000 |
+              ;;   CLONE_SYSVSEM 0x40000 | CLONE_PARENT_SETTID 0x100000 |
+              ;;   CLONE_CHILD_CLEARTID 0x200000
+              ;; CLONE_THREAD is what makes this a THREAD (same thread group,
+              ;; own TID) rather than a process; it requires CLONE_SIGHAND,
+              ;; which requires CLONE_VM.  The two TID flags are the join
+              ;; mechanism: the kernel writes the TID into the word on the way
+              ;; in and ZEROES it on the way out, so a caller can observe
+              ;; "thread has actually exited" without a futex.
+              ;;
+              ;; CLONE_SETTLS IS DELIBERATELY ABSENT.  On x86-64 the tls
+              ;; argument sets the FS base, and Modus's per-CPU storage is GS
+              ;; (translate-x64 emits `GS:[disp32]' for PERCPU-REF/-SET).  A new
+              ;; thread therefore sets its OWN GS base with arch_prctl as its
+              ;; first act, which is a Lisp-level call, not a clone flag.
+              ;;
+              ;; RBX CARRIES THE ENTRY ACROSS THE SYSCALL because RCX and R11
+              ;; are destroyed by SYSCALL itself (return RIP / RFLAGS), and the
+              ;; child cannot pop anything — it is on a fresh stack.  RBX is
+              ;; V4, so the parent path restores it; the child path never needs
+              ;; to, because it never returns.
+              (emit-bytes buf #x56)                 ; push rsi   (V0)
+              (emit-bytes buf #x57)                 ; push rdi   (V1)
+              (emit-bytes buf #x41 #x50)            ; push r8    (V2)
+              (emit-bytes buf #x41 #x51)            ; push r9    (V3)
+              (emit-bytes buf #x52)                 ; push rdx   (V6)
+              (emit-bytes buf #x41 #x52)            ; push r10   (V7)
+              (emit-bytes buf #x53)                 ; push rbx   (V4)
+              (emit-bytes buf #x55)                 ; push rbp
+              (emit-bytes buf #x48 #x89 #xF3)       ; mov rbx, rsi
+              (emit-bytes buf #x48 #xD1 #xFB)       ; sar rbx, 1   (raw entry)
+              (emit-bytes buf #x48 #x89 #xFE)       ; mov rsi, rdi
+              (emit-bytes buf #x48 #xD1 #xFE)       ; sar rsi, 1   (child stack top)
+              (emit-bytes buf #x4C #x89 #xC2)       ; mov rdx, r8
+              (emit-bytes buf #x48 #xD1 #xFA)       ; sar rdx, 1   (parent_tidptr)
+              (emit-bytes buf #x49 #x89 #xD2)       ; mov r10, rdx (child_tidptr)
+              (emit-bytes buf #xBF)                 ; mov edi, imm32 (flags)
+              (emit-u32 buf #x003D0F00)
+              (emit-bytes buf #x45 #x31 #xC0)       ; xor r8d, r8d  (tls: unused)
+              (emit-bytes buf #xB8 #x38 #x00 #x00 #x00) ; mov eax, 56 (SYS_clone)
+              (emit-bytes buf #x0F #x05)            ; syscall
+              (emit-bytes buf #x48 #x85 #xC0)       ; test rax, rax
+              (let ((child (make-label))
+                    (done (make-label)))
+                (emit-jcc buf :e child)
+                ;; ---- PARENT: rax = child TID (or -errno) ----
+                (emit-bytes buf #x48 #x01 #xC0)     ; add rax, rax  (tag)
+                (emit-bytes buf #x48 #x89 #xC6)     ; mov rsi, rax  (→ V0)
+                (emit-bytes buf #x5D)               ; pop rbp
+                (emit-bytes buf #x5B)               ; pop rbx
+                (emit-bytes buf #x41 #x5A)          ; pop r10
+                (emit-bytes buf #x5A)               ; pop rdx
+                (emit-bytes buf #x41 #x59)          ; pop r9
+                (emit-bytes buf #x41 #x58)          ; pop r8
+                (emit-bytes buf #x5F)               ; pop rdi
+                (emit-bytes buf #x48 #x83 #xC4 #x08); add rsp, 8 (drop saved rsi)
+                (emit-jmp buf done)
+                ;; ---- CHILD: rsp = its own stack top, rbx = raw entry ----
+                (emit-label buf child)
+                (emit-bytes buf #x31 #xED)          ; xor ebp, ebp
+                (emit-bytes buf #xFF #xD3)          ; call rbx
+                (emit-bytes buf #x31 #xFF)          ; xor edi, edi  (status 0)
+                (emit-bytes buf #xB8 #x3C #x00 #x00 #x00) ; mov eax, 60 (SYS_exit)
+                (emit-bytes buf #x0F #x05)          ; syscall
+                (emit-bytes buf #x0F #x0B)          ; ud2 — unreachable
+                (emit-label buf done)))
              ((= code #x0533)
               ;; %JIT-ICACHE-FLUSH: no-op on x86-64 (coherent I-cache — writes
               ;; to an exec page are visible to fetch without maintenance).
@@ -1096,13 +1335,14 @@
               (emit-jcc buf :ne skiparm-label)
               ;; Save RSP to 0x10000180
               ;; Use movabs with RCX as temp (address > 0x7FFFFFFF, can't use disp32)
-              ;; mov rcx, 0x10000180
+              ;; mov rcx, 0x10000180  (immediate — the ACCESSES below carry
+              ;; the per-thread override, the address literal does not)
               (emit-bytes buf #x48 #xB9)
               (emit-u32 buf #x10000180) (emit-u32 buf 0)
               ;; mov [rcx], rsp
-              (emit-bytes buf #x48 #x89 #x21)
+              (emit-tls-prefix buf) (emit-bytes buf #x48 #x89 #x21)
               ;; mov [rcx+8], rbp
-              (emit-bytes buf #x48 #x89 #x69 #x08)
+              (emit-tls-prefix buf) (emit-bytes buf #x48 #x89 #x69 #x08)
               ;; mov [rcx+24], rbx  — save callee-saved RBX (V4) at slot 0x198.
               ;; The compiler caches values (e.g. let-bound cons-list cursors)
               ;; in V4 across function calls, relying on callees to preserve
@@ -1112,7 +1352,7 @@
               ;; the compiler tracks.  Saving RBX here and restoring in all
               ;; three longjmp paths (TRAP #x0511, #PF handler at 0x4F0820,
               ;; deadline-IRQ ISR at 0x4F0900) keeps RBX consistent.
-              (emit-bytes buf #x48 #x89 #x59 #x18)
+              (emit-tls-prefix buf) (emit-bytes buf #x48 #x89 #x59 #x18)
               ;; Save the address of the FIRST instruction after this trap block
               ;; into [rcx+16].  After lea (7 bytes), we still have:
               ;;   mov [rcx+16], rax     (4 bytes)
@@ -1123,11 +1363,18 @@
               ;; BARE-METAL adds the 12-byte in-transition flag clear between
               ;; mov [rcx+16],rax and the movabs: distance = 4+12+10 = 26.
               ;; lea rax, [rip+N] lands rax at the byte AFTER the trap.
+              ;; THE DISTANCE IS COUNTED, NOT ASSUMED: the FS override on the
+              ;; `mov [rcx+16], rax' below is one more byte between the end of
+              ;; this LEA and the end of the trap block, so the displacement
+              ;; is 15 rather than 14 when the per-thread window is on.  Get
+              ;; this wrong and SETJMP records a resume point one byte off.
               (emit-bytes buf #x48 #x8D #x05
-                          (if *x64-linux-mode* #x0E #x1A)
-                          #x00 #x00 #x00)            ; lea rax, [rip+14/26]
+                          (if *x64-linux-mode*
+                              (if *x64-tls-window* #x0F #x0E)
+                              #x1A)
+                          #x00 #x00 #x00)            ; lea rax, [rip+14/15/26]
               ;; mov [rcx+16], rax  — save return IP
-              (emit-bytes buf #x48 #x89 #x41 #x10)
+              (emit-tls-prefix buf) (emit-bytes buf #x48 #x89 #x41 #x10)
               (if *x64-linux-mode*
                   ;; Linux: capped setjmp lands here (arm skipped) and falls
                   ;; into the NIL first-time return.  The label is zero bytes,
@@ -1218,7 +1465,8 @@
               ;;   jmp loop
               ;; done:
               ;;
-              ;; mov eax, dword [0x10000150]
+              ;; mov eax, dword [0x10000150]   (per-thread: THIS call's nargs)
+              (emit-tls-prefix buf)
               (emit-bytes buf #xA1 #x50 #x01 #x00 #x10 #x00 #x00 #x00 #x00)
               ;; cmp eax, 5
               (emit-bytes buf #x83 #xF8 #x05)
@@ -1327,10 +1575,14 @@
                 (emit-bytes buf #x48 #x89 #x04 #x25)
                 (emit-u32 buf #x10000C58)
                 ;; mov rcx, 0x10000180  (saved-handler-state address)
+                ;; PER-THREAD WINDOW: the signal runs on the FAULTING thread
+                ;; with that thread's FS base, so "is a handler-case active?"
+                ;; is answered about the thread that actually faulted — and the
+                ;; longjmp lands on ITS stack, not on some other thread's.
                 (emit-bytes buf #x48 #xB9)
                 (emit-u32 buf #x10000180) (emit-u32 buf 0)
                 ;; rdx = [rcx]  (saved RSP — zero means no handler-case active)
-                (emit-bytes buf #x48 #x8B #x11)
+                (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x11)
                 ;; test rdx, rdx
                 (emit-bytes buf #x48 #x85 #xD2)
                 ;; jz exit_path
@@ -1339,51 +1591,79 @@
                 ;; Save OUR state to scratch (#x10000C10..) before the pop
                 ;; helper overwrites [180].
                 ;; rdx already = [rcx] = our RSP
-                (emit-bytes buf #x48 #x89 #x14 #x25)             ; mov [imm32], rdx
+                (emit-tls-prefix buf) (emit-bytes buf #x48 #x89 #x14 #x25) ; mov [imm32], rdx
                 (emit-u32 buf #x10000C10)
                 ;; rdx = [rcx+8] (our RBP)
-                (emit-bytes buf #x48 #x8B #x51 #x08)
-                (emit-bytes buf #x48 #x89 #x14 #x25)
+                (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x51 #x08)
+                (emit-tls-prefix buf) (emit-bytes buf #x48 #x89 #x14 #x25)
                 (emit-u32 buf #x10000C18)
                 ;; rdx = [rcx+16] (our IP)
-                (emit-bytes buf #x48 #x8B #x51 #x10)
-                (emit-bytes buf #x48 #x89 #x14 #x25)
+                (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x51 #x10)
+                (emit-tls-prefix buf) (emit-bytes buf #x48 #x89 #x14 #x25)
                 (emit-u32 buf #x10000C20)
                 ;; rdx = [rcx+24] (our saved RBX).  The stub previously did
                 ;; NOT restore RBX — unlike TRAP #x0511 — so a fault-driven
                 ;; longjmp resumed the handler-case with the interrupted
                 ;; callee's RBX (V4) still live: the setjmp-time V4 value the
                 ;; compiler tracks was silently replaced (silent-unwind).
-                (emit-bytes buf #x48 #x8B #x51 #x18)
-                (emit-bytes buf #x48 #x89 #x14 #x25)
+                (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x51 #x18)
+                (emit-tls-prefix buf) (emit-bytes buf #x48 #x89 #x14 #x25)
                 (emit-u32 buf #x10000C28)
                 ;; Pop handler stack into [180]/+8/+16/+24 so the outer
                 ;; handler-case becomes active when we land in the body.
                 (emit-call buf pop-label)
                 ;; Restore from scratch and jump
                 ;; mov rdx, [0x10000C20]   ; IP
-                (emit-bytes buf #x48 #x8B #x14 #x25)
+                (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x14 #x25)
                 (emit-u32 buf #x10000C20)
                 ;; mov rbp, [0x10000C18]
-                (emit-bytes buf #x48 #x8B #x2C #x25)
+                (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x2C #x25)
                 (emit-u32 buf #x10000C18)
                 ;; mov rbx, [0x10000C28]   ; restore caller's V4=RBX
-                (emit-bytes buf #x48 #x8B #x1C #x25)
+                (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x1C #x25)
                 (emit-u32 buf #x10000C28)
                 ;; mov rsp, [0x10000C10]
-                (emit-bytes buf #x48 #x8B #x24 #x25)
+                (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x24 #x25)
                 (emit-u32 buf #x10000C10)
                 ;; mov eax, 0xDEAD1009 (T sentinel — 32-bit imm zero-extends to rax)
                 (emit-bytes buf #xB8 #x09 #x10 #xAD #xDE)
                 ;; jmp rdx
                 (emit-bytes buf #xFF #xE2)
 
-                ;; --- No active handler: sys_exit(139) ---
+                ;; --- No active handler: exit_group(139) ---
+                ;;
+                ;; exit_group (231), NOT exit (60).  This is the LAST thing a
+                ;; faulting thread does, and it must end the PROCESS.  `exit'
+                ;; ends only the calling thread: the group leader is left an
+                ;; unreapable ZOMBIE because the thread group is not empty, any
+                ;; sibling parked in futex_wait is never woken because the only
+                ;; thread that could have woken it is the one that just died,
+                ;; and a parent reading this process's output through a pipe
+                ;; never sees EOF.  The observable result is not a crash report
+                ;; but an INFINITE HANG — the one failure mode that says
+                ;; nothing.  In a single-threaded image the two syscalls are
+                ;; indistinguishable, which is why this survived so long.
+                ;;
+                ;; This is the general form of the bug, not a test fixture:
+                ;; ANY threaded modus program that faults on ANY thread with no
+                ;; handler-case active hung here.  test/hosted-thread-lisp.lisp
+                ;; is merely the first program that had a second thread.
                 (emit-label buf exit-label)
+                ;; TEMPORARY FAULT DUMP (MODUS_FAULT_DUMP build only): write the
+                ;; six diagnostic words captured above (RIP, RSP, call site, RAX,
+                ;; si_addr, ucontext) raw to fd 2, then exit.  ptrace is blocked
+                ;; on this box (Yama scope 2), so there is no gdb and no strace;
+                ;; this is the only way to see WHERE a fault landed.
+                (when *x64-fault-dump*
+                  (emit-bytes buf #xBF #x02 #x00 #x00 #x00)   ; mov edi, 2
+                  (emit-bytes buf #xBE #x30 #x0C #x00 #x10)   ; mov esi, 0x10000C30
+                  (emit-bytes buf #xBA #x30 #x00 #x00 #x00)   ; mov edx, 48
+                  (emit-bytes buf #xB8 #x01 #x00 #x00 #x00)   ; mov eax, 1 (write)
+                  (emit-bytes buf #x0F #x05))                 ; syscall
                 ;; mov edi, 139
                 (emit-bytes buf #xBF #x8B #x00 #x00 #x00)
-                ;; mov eax, 60 (sys_exit)
-                (emit-bytes buf #xB8 #x3C #x00 #x00 #x00)
+                ;; mov eax, 231 (sys_exit_group)
+                (emit-bytes buf #xB8 #xE7 #x00 #x00 #x00)
                 ;; syscall
                 (emit-bytes buf #x0F #x05)
 
@@ -1714,6 +1994,7 @@
                 (emit-push buf 'rbx)
                 (emit-load-vreg buf va 'rsi)           ; arg0 = va (still intact)
                 (emit-load-vreg buf vb 'rdi)           ; arg1 = vb
+                (emit-tls-prefix buf)                  ; nargs is per-thread
                 (emit-bytes buf #xC7 #x04 #x25 #x50 #x01 #x00 #x10 #x02 #x00 #x00 #x00) ; [nargs]=2
                 (if gm-label
                     (emit-call buf gm-label)
@@ -1767,6 +2048,7 @@
                 (emit-push buf 'rbx)
                 (emit-load-vreg buf va 'rsi)
                 (emit-load-vreg buf vb 'rdi)
+                (emit-tls-prefix buf)                  ; nargs is per-thread
                 (emit-bytes buf #xC7 #x04 #x25 #x50 #x01 #x00 #x10 #x02 #x00 #x00 #x00) ; [nargs]=2
                 (if ga-label
                     (emit-call buf ga-label)
@@ -1821,6 +2103,7 @@
                 (emit-push buf 'rbx)
                 (emit-load-vreg buf va 'rsi)
                 (emit-load-vreg buf vb 'rdi)
+                (emit-tls-prefix buf)                  ; nargs is per-thread
                 (emit-bytes buf #xC7 #x04 #x25 #x50 #x01 #x00 #x10 #x02 #x00 #x00 #x00) ; [nargs]=2
                 (if gs-label
                     (emit-call buf gs-label)
@@ -2784,6 +3067,9 @@
          ;; many args the caller passed. Encoded as:
          ;;   mov dword [0x10000150], imm32
          (let ((n (first operands)))
+           ;; PER-THREAD WINDOW: nargs is state of the call in flight, so two
+           ;; threads calling &rest functions must not share one slot.
+           (emit-tls-prefix buf)
            (emit-bytes buf #xC7 #x04 #x25)         ; mov [disp32], imm32
            (emit-bytes buf #x50 #x01 #x00 #x10)    ; disp32 = #x10000150
            (emit-bytes buf (logand n #xFF) #x00 #x00 #x00)))
@@ -2796,7 +3082,8 @@
          ;; immediates) and :cons just work.
          (let* ((vd (first operands))
                 (d (dest-phys-or-scratch vd)))
-           ;; mov eax, dword [0x10000150]
+           ;; mov eax, dword [0x10000150]   (per-thread — see +OP-SET-NARGS+)
+           (emit-tls-prefix buf)
            (emit-bytes buf #xA1)                   ; mov eax, m32 (special form)
            (emit-bytes buf #x50 #x01 #x00 #x10
                             #x00 #x00 #x00 #x00)   ; abs64 (mov eax variant)
@@ -3254,13 +3541,22 @@
          ;; Width: 0=u8, 1=u16, 2=u32, 3=u64
          (let* ((vd (first operands))
                 (vaddr (second operands))
-                (width (third operands))
+                (raw-width (third operands))
+                (width (logand raw-width 3))
+                ;; 4 is +WIDTH-TLS-BIT+ (mvm/mvm.lisp), written as a LITERAL
+                ;; because this file is also read INSIDE the image, where the
+                ;; MODUS.MVM build-time constants are not in scope.
+                (tls (and *x64-tls-window* (logtest raw-width 4)))
                 (d (dest-phys-or-scratch vd)))
            ;; Get address into a temp
            (let ((pa (vreg-phys vaddr)))
              (unless pa
                (emit-load-vreg buf vaddr 'rax)
                (setf pa 'rax))
+             ;; PER-THREAD WINDOW: one FS override byte, emitted before the
+             ;; REX prefix as the encoding requires.  With the window off (or
+             ;; the bit clear) not a byte changes.
+             (when tls (emit-bytes buf #x64))
              (ecase width
                (0 ;; u8: MOVZX r64, byte [addr]
                 ;; REX.W 0F B6 /r (ModRM: [reg])
@@ -3277,7 +3573,12 @@
          ;; (store Vaddr Vs width:imm8) — raw memory write
          (let* ((vaddr (first operands))
                 (vs (second operands))
-                (width (third operands))
+                (raw-width (third operands))
+                (width (logand raw-width 3))
+                ;; 4 is +WIDTH-TLS-BIT+ (mvm/mvm.lisp), written as a LITERAL
+                ;; because this file is also read INSIDE the image, where the
+                ;; MODUS.MVM build-time constants are not in scope.
+                (tls (and *x64-tls-window* (logtest raw-width 4)))
                 (pa (vreg-phys vaddr))
                 (ps (vreg-phys vs)))
            ;; Need address in one register, value in another
@@ -3289,6 +3590,8 @@
              (emit-push buf 'r13)
              (emit-load-vreg buf vs 'r13)
              (setf ps 'r13))
+           ;; PER-THREAD WINDOW: see the matching note in +OP-LOAD+.
+           (when tls (emit-bytes buf #x64))
            (ecase width
              (0 (emit-mov-mem-byte buf pa ps))
              (1 (emit-mov-mem-word buf pa ps))
@@ -3666,6 +3969,14 @@
            (emit-mov-reg-mem buf 'rbx 'r11 #x18)   ; restore RBX
            (emit-mov-reg-mem buf 'rbp 'r11 #x38)   ; restore RBP
            (emit-mov-reg-mem buf 'rsp 'r11 #x00)   ; switch stack (no return)
+           ;; RELEASE THE SCHEDULER LOCK, and only ever HERE — after the stack
+           ;; switch, before the jump.  See *X64-SCHED-LOCK-ADDR* for why this
+           ;; is the earliest safe instant and why no fence is required.
+           ;; MOV qword [addr32], 0   =   48 C7 04 25 <addr32> <imm32>
+           (when *x64-sched-lock-addr*
+             (emit-bytes buf #x48 #xC7 #x04 #x25)
+             (emit-u32 buf *x64-sched-lock-addr*)
+             (emit-u32 buf 0))
            (emit-jmp-reg buf 'rax)))               ; jump to continuation
 
         ((op= +op-yield+)
@@ -3709,6 +4020,8 @@
                 (addr #x10000090))      ; MV-COUNT-ADDR
            ;; MOV qword [addr32], imm32 (sign-extended)
            ;; 48 C7 04 25 <addr32-le> <imm32-le>
+           ;; PER-THREAD WINDOW: the MV count belongs to the returning thread.
+           (emit-tls-prefix buf)
            (emit-bytes buf #x48 #xC7 #x04 #x25)
            (emit-u32 buf addr)
            (emit-u32 buf tagged)))
@@ -4430,6 +4743,105 @@
 ;; `#x10000[EF]..` across the whole repo before claiming any word in this range.
 (defconstant +mcgc-max-segments+ 4096)              ; seg[] capacity (64 KiB of metadata slack)
 
+;;; ============================================================
+;;; THE COLLECTOR CONCURRENCY PROBE — how "the collections OVERLAPPED"
+;;; stops being an assertion and becomes a measurement
+;;; ============================================================
+;;;
+;;; REMOVING A LOCK IS ONLY TESTED IF THE COLLECTIONS ACTUALLY OVERLAP IN TIME.
+;;; Two threads that collect one after the other prove nothing: they would pass
+;;; every isolation and survival check with the lock still in place.  The
+;;; evidence has to be taken at the TRUE boundaries of a collection, and on
+;;; hosted x86-64 the collection IS this trampoline — %GC-COLLECT-HERE only
+;;; pulls the allocation limit down so the next :gc-check calls it.  Bracketing
+;;; from Lisp would measure a superset.
+;;;
+;;; So the trampoline itself counts, with LOCKed instructions because two CPUs
+;;; are exactly the case being measured:
+;;;
+;;;   ENTRY   lock inc [cur]; if cur >= 2, lock inc [witness]
+;;;   EXIT    lock dec [cur]
+;;;
+;;; WITNESS > 0 MEANS A COLLECTOR ENTERED WHILE ANOTHER WAS ALREADY INSIDE.
+;;; That is the property, stated exactly; it cannot be produced by a serialized
+;;; implementation, so a test asserting it FAILS if the lock comes back.
+;;;
+;;; AND A BARRIER, so the evidence is not left to scheduling luck.  When
+;;; [barrier] is non-zero it is a SPIN BUDGET: a collector that finds itself
+;;; alone spins re-reading [cur] until another arrives (then bumps [met]) or the
+;;; budget runs out (then proceeds anyway).  With the collection lock ON, the
+;;; second thread cannot enter, so the first always burns its budget and [met]
+;;; stays 0 — which is precisely what makes the acceptance test discriminating.
+;;; The budget is BOUNDED so a serialized build fails an assertion instead of
+;;; hanging, and the word is ZERO in every image until a test writes it, so a
+;;; single-threaded image never spins at all.
+;;;
+;;; COST WHEN NOTHING IS MEASURING: two LOCKed increments per collection.
+;;;
+;;; The four words are the last free ones in the BSS gap this file already
+;;; documents (0x10000E40..0x10000EFF), below mvm/gc.lisp's scratch-config
+;;; (0x10000EC8) and region-alignment ledger (0x10000ED0/ED8).
+(defconstant +gc-conc-cur-addr+     #x10000EE0) ; collectors inside the trampoline
+(defconstant +gc-conc-witness-addr+ #x10000EE8) ; entries that found cur >= 2
+(defconstant +gc-conc-barrier-addr+ #x10000EF0) ; spin budget; 0 = barrier off
+(defconstant +gc-conc-met-addr+     #x10000EF8) ; barrier spins that saw a second
+
+(defvar *x64-gc-concurrency-probe* :linux
+  "Emit the collector concurrency probe in the GC trampoline.
+   :LINUX (default) = only when *X64-LINUX-MODE*, which is the only x64 arm
+   that has threads — so BARE-METAL x64 images stay byte-identical.
+   T = always, NIL = never.")
+
+(defun gc-concurrency-probe-on-p ()
+  (cond ((eq *x64-gc-concurrency-probe* :linux) *x64-linux-mode*)
+        (t *x64-gc-concurrency-probe*)))
+
+(defun emit-lock-inc-abs (buf slot)
+  "LOCK INC qword [SLOT] — F0 REX.W FF /0, ModRM mod=00 rm=100, SIB=0x25."
+  (emit-bytes buf #xF0 #x48 #xFF #x04 #x25)
+  (emit-u32 buf slot))
+
+(defun emit-lock-dec-abs (buf slot)
+  "LOCK DEC qword [SLOT] — F0 REX.W FF /1."
+  (emit-bytes buf #xF0 #x48 #xFF #x0C #x25)
+  (emit-u32 buf slot))
+
+(defun emit-gc-concurrency-enter (buf)
+  "Trampoline ENTRY probe.  Must be emitted AFTER the register pushes: it
+   clobbers RAX and RCX, both of which are on the stack by then."
+  (when (gc-concurrency-probe-on-p)
+    (let ((no-witness (make-label))
+          (no-barrier (make-label))
+          (spin (make-label))
+          (met (make-label)))
+      (emit-lock-inc-abs buf +gc-conc-cur-addr+)
+      (emit-mov-reg-abs buf 'rax +gc-conc-cur-addr+)
+      (emit-cmp-reg-imm buf 'rax 2)
+      (emit-jcc buf :b no-witness)
+      (emit-lock-inc-abs buf +gc-conc-witness-addr+)
+      (emit-label buf no-witness)
+      ;; THE BARRIER.  RCX = spin budget; zero (every image, until a test
+      ;; writes the word) skips the whole thing.
+      (emit-mov-reg-abs buf 'rcx +gc-conc-barrier-addr+)
+      (emit-bytes buf #x48 #x85 #xC9)              ; test rcx, rcx
+      (emit-jcc buf :z no-barrier)
+      (emit-label buf spin)
+      (emit-mov-reg-abs buf 'rax +gc-conc-cur-addr+)
+      (emit-cmp-reg-imm buf 'rax 2)
+      (emit-jcc buf :ae met)
+      (emit-sub-reg-imm buf 'rcx 1)
+      (emit-jcc buf :nz spin)
+      (emit-jmp buf no-barrier)                    ; budget spent: proceed alone
+      (emit-label buf met)
+      (emit-lock-inc-abs buf +gc-conc-met-addr+)
+      (emit-label buf no-barrier))))
+
+(defun emit-gc-concurrency-exit (buf)
+  "Trampoline EXIT probe.  Emitted at the restore label, BEFORE the pops, so
+   the count falls exactly when this collection stops being one."
+  (when (gc-concurrency-probe-on-p)
+    (emit-lock-dec-abs buf +gc-conc-cur-addr+)))
+
 (defconstant +mcgc-page-shift+ 12)                  ; 4 KiB pages
 (defconstant +mcgc-page-bytes+ #x1000)              ; 4 KiB
 (defconstant +mcgc-guard-bytes+ #x10000)            ; 64 KiB overshoot guard (16 pages)
@@ -4597,39 +5009,39 @@
   (emit-bytes buf #x48 #xB9)
   (emit-u32 buf #x10000180) (emit-u32 buf 0)
   ;; rdx = [rcx]      ; our RSP
-  (emit-bytes buf #x48 #x8B #x11)
+  (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x11)
   ;; mov [0x10000C10], rdx
-  (emit-bytes buf #x48 #x89 #x14 #x25)
+  (emit-tls-prefix buf) (emit-bytes buf #x48 #x89 #x14 #x25)
   (emit-u32 buf #x10000C10)
   ;; rdx = [rcx+8]    ; our RBP
-  (emit-bytes buf #x48 #x8B #x51 #x08)
+  (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x51 #x08)
   ;; mov [0x10000C18], rdx
-  (emit-bytes buf #x48 #x89 #x14 #x25)
+  (emit-tls-prefix buf) (emit-bytes buf #x48 #x89 #x14 #x25)
   (emit-u32 buf #x10000C18)
   ;; rdx = [rcx+16]   ; our IP
-  (emit-bytes buf #x48 #x8B #x51 #x10)
+  (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x51 #x10)
   ;; mov [0x10000C20], rdx
-  (emit-bytes buf #x48 #x89 #x14 #x25)
+  (emit-tls-prefix buf) (emit-bytes buf #x48 #x89 #x14 #x25)
   (emit-u32 buf #x10000C20)
   ;; rdx = [rcx+24]   ; our saved RBX
-  (emit-bytes buf #x48 #x8B #x51 #x18)
+  (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x51 #x18)
   ;; mov [0x10000C28], rdx
-  (emit-bytes buf #x48 #x89 #x14 #x25)
+  (emit-tls-prefix buf) (emit-bytes buf #x48 #x89 #x14 #x25)
   (emit-u32 buf #x10000C28)
   ;; Pop the handler stack back into [180]/+8/+16/+24
   (emit-call buf pop-label)
   ;; Restore from scratch and jump
   ;; mov rdx, [0x10000C20]   ; IP
-  (emit-bytes buf #x48 #x8B #x14 #x25)
+  (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x14 #x25)
   (emit-u32 buf #x10000C20)
   ;; mov rbp, [0x10000C18]   ; RBP
-  (emit-bytes buf #x48 #x8B #x2C #x25)
+  (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x2C #x25)
   (emit-u32 buf #x10000C18)
   ;; mov rbx, [0x10000C28]   ; restore caller's V4=RBX
-  (emit-bytes buf #x48 #x8B #x1C #x25)
+  (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x1C #x25)
   (emit-u32 buf #x10000C28)
   ;; mov rsp, [0x10000C10]   ; RSP
-  (emit-bytes buf #x48 #x8B #x24 #x25)
+  (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x24 #x25)
   (emit-u32 buf #x10000C10)
   (unless *x64-linux-mode*
     ;; clear the in-transition flag — state is now consistent
@@ -4726,8 +5138,11 @@
         (capped (make-label))
         (nomax (make-label)))
     (emit-label buf push-label)
-    ;; r10 = depth = [0x10000400]
-    (emit-bytes buf #x4C #x8B #x14 #x25)
+    ;; r10 = depth = [0x10000400]   (PER-THREAD WINDOW: every access in both
+    ;; helpers carries the FS override, so a thread pushes and pops ITS OWN
+    ;; frame stack.  One shared stack is how thread A's ERROR longjmped onto
+    ;; thread B's stack.)
+    (emit-tls-prefix buf) (emit-bytes buf #x4C #x8B #x14 #x25)
     (emit-u32 buf #x10000400)
     ;; cmp r10, 64 ; jge skip/capped
     ;; BARE-METAL (non-Linux): route the capped case through a diagnostic
@@ -4762,24 +5177,24 @@
     (emit-bytes buf #x49 #x81 #xC3)                  ; add r11, imm32
     (emit-u32 buf (if *x64-linux-mode* #x10001000 #x10000408))
     ;; rax = [0x10000180]; [r11] = rax
-    (emit-bytes buf #x48 #x8B #x04 #x25)
+    (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x04 #x25)
     (emit-u32 buf #x10000180)
-    (emit-bytes buf #x49 #x89 #x03)                  ; mov [r11], rax
+    (emit-tls-prefix buf) (emit-bytes buf #x49 #x89 #x03)   ; mov [r11], rax
     ;; rax = [0x10000188]; [r11+8] = rax
-    (emit-bytes buf #x48 #x8B #x04 #x25)
+    (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x04 #x25)
     (emit-u32 buf #x10000188)
-    (emit-bytes buf #x49 #x89 #x43 #x08)             ; mov [r11+8], rax
+    (emit-tls-prefix buf) (emit-bytes buf #x49 #x89 #x43 #x08) ; mov [r11+8], rax
     ;; rax = [0x10000190]; [r11+16] = rax
-    (emit-bytes buf #x48 #x8B #x04 #x25)
+    (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x04 #x25)
     (emit-u32 buf #x10000190)
-    (emit-bytes buf #x49 #x89 #x43 #x10)             ; mov [r11+16], rax
+    (emit-tls-prefix buf) (emit-bytes buf #x49 #x89 #x43 #x10) ; mov [r11+16], rax
     ;; rax = [0x10000198]; [r11+24] = rax   (saved RBX — see docstring)
-    (emit-bytes buf #x48 #x8B #x04 #x25)
+    (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x04 #x25)
     (emit-u32 buf #x10000198)
-    (emit-bytes buf #x49 #x89 #x43 #x18)             ; mov [r11+24], rax
+    (emit-tls-prefix buf) (emit-bytes buf #x49 #x89 #x43 #x18) ; mov [r11+24], rax
     ;; depth++ ; [0x10000400] = r10
     (emit-bytes buf #x49 #xFF #xC2)                  ; inc r10
-    (emit-bytes buf #x4C #x89 #x14 #x25)             ; mov [imm32], r10
+    (emit-tls-prefix buf) (emit-bytes buf #x4C #x89 #x14 #x25) ; mov [imm32], r10
     (emit-u32 buf #x10000400)
     (unless *x64-linux-mode*
       ;; DIAG: max-depth watermark at [0x10000D08]
@@ -4842,14 +5257,14 @@
       (emit-jmp buf done)
       (emit-label buf no-ovf))
     ;; r10 = depth = [0x10000400]
-    (emit-bytes buf #x4C #x8B #x14 #x25)
+    (emit-tls-prefix buf) (emit-bytes buf #x4C #x8B #x14 #x25)
     (emit-u32 buf #x10000400)
     ;; test r10, r10 ; jz empty
     (emit-bytes buf #x4D #x85 #xD2)
     (emit-jcc buf :e empty)
     ;; depth-- ; [0x10000400] = r10
     (emit-bytes buf #x49 #xFF #xCA)                  ; dec r10
-    (emit-bytes buf #x4C #x89 #x14 #x25)
+    (emit-tls-prefix buf) (emit-bytes buf #x4C #x89 #x14 #x25)
     (emit-u32 buf #x10000400)
     ;; r11 = depth*32 + 0x10000408
     (emit-bytes buf #x4D #x6B #xDA #x20)             ; imul r11, r10, 32
@@ -4858,20 +5273,20 @@
     ;; Use r10 as memory-scratch (its value is now consumed) so RAX
     ;; stays pristine across mem-to-mem copies.
     ;; [0x10000180] = [r11]
-    (emit-bytes buf #x4D #x8B #x13)                  ; mov r10, [r11]
-    (emit-bytes buf #x4C #x89 #x14 #x25)             ; mov [imm32], r10
+    (emit-tls-prefix buf) (emit-bytes buf #x4D #x8B #x13)   ; mov r10, [r11]
+    (emit-tls-prefix buf) (emit-bytes buf #x4C #x89 #x14 #x25) ; mov [imm32], r10
     (emit-u32 buf #x10000180)
     ;; [0x10000188] = [r11+8]
-    (emit-bytes buf #x4D #x8B #x53 #x08)             ; mov r10, [r11+8]
-    (emit-bytes buf #x4C #x89 #x14 #x25)
+    (emit-tls-prefix buf) (emit-bytes buf #x4D #x8B #x53 #x08) ; mov r10, [r11+8]
+    (emit-tls-prefix buf) (emit-bytes buf #x4C #x89 #x14 #x25)
     (emit-u32 buf #x10000188)
     ;; [0x10000190] = [r11+16]
-    (emit-bytes buf #x4D #x8B #x53 #x10)             ; mov r10, [r11+16]
-    (emit-bytes buf #x4C #x89 #x14 #x25)
+    (emit-tls-prefix buf) (emit-bytes buf #x4D #x8B #x53 #x10) ; mov r10, [r11+16]
+    (emit-tls-prefix buf) (emit-bytes buf #x4C #x89 #x14 #x25)
     (emit-u32 buf #x10000190)
     ;; [0x10000198] = [r11+24]   (saved RBX — see push above)
-    (emit-bytes buf #x4D #x8B #x53 #x18)             ; mov r10, [r11+24]
-    (emit-bytes buf #x4C #x89 #x14 #x25)
+    (emit-tls-prefix buf) (emit-bytes buf #x4D #x8B #x53 #x18) ; mov r10, [r11+24]
+    (emit-tls-prefix buf) (emit-bytes buf #x4C #x89 #x14 #x25)
     (emit-u32 buf #x10000198)
     (emit-jmp buf done)
     (emit-label buf empty)
@@ -4881,7 +5296,7 @@
       (emit-bytes buf #x48 #xFF #x04 #x25)           ; inc qword [imm32]
       (emit-u32 buf #x10000D10))
     ;; [0x10000180] = 0  (legacy "no handler" sentinel)
-    (emit-bytes buf #x48 #xC7 #x04 #x25)             ; mov qword [imm32], 0
+    (emit-tls-prefix buf) (emit-bytes buf #x48 #xC7 #x04 #x25) ; mov qword [imm32], 0
     (emit-u32 buf #x10000180)
     (emit-u32 buf 0)
     (emit-label buf done)
@@ -5051,12 +5466,113 @@
       (emit-jcc buf :nc reject-label)               ; cons tag but bit clear (object) → reject
       (emit-jcc buf :c reject-label)))              ; object tag but bit set (cons) → reject
 
+(defvar *x64-gc-region-percpu* nil
+  "STAGE 3: where the ACTIVE-REGION WORD lives, for the NATIVE collector.
+
+   NIL (the default, and what every image built so far gets) — it is the single
+   word at +GC-REGION-ADDR+, and EMIT-LOAD-GC-REGION emits exactly the
+   `mov reg,[abs32]' it has emitted since stage 1: same instruction, same
+   bytes, no extra memory reference.
+
+   T — it is this CPU's entry of the per-CPU array based at +GC-REGION-ADDR+,
+   reached through the GS segment's :CPU-ID slot (+GC-PERCPU-CPU-ID-OFF+).
+   That is THREE instructions and one extra load, and it is OFF by default for
+   a reason that is not taste: on hosted Linux the GS base is 0, so `GS:[16]'
+   reads absolute address 16 and takes SIGSEGV.  Turning this on is only
+   correct on a target that has actually installed a per-CPU block, and it must
+   be turned on together with mvm/gc.lisp's gate word +GC-REGION-PERCPU-ADDR+
+   so the Lisp and native sides read the SAME cell.
+
+   :RUNTIME — emit BOTH forms and branch between them on the gate word itself,
+   which is exactly what mvm/gc.lisp's %GC-REGION-CELL already does in Lisp.
+   THIS IS WHAT A HOSTED IMAGE NEEDS, and T is not.  ./modus is one binary that
+   has to serve two populations: ordinary single-threaded runs, where the GS
+   base is 0 and an unguarded `GS:[16]' is a SIGSEGV on the first collection,
+   and threaded runs, where every thread has installed a per-CPU block and the
+   collector MUST read this thread's cell.  A build-time T would make the first
+   population crash; :RUNTIME lets the same image be both, with the mode word as
+   the single switch that flips the Lisp side and the native side together.
+
+   The cost is one compare and one branch, and it is paid THREE TIMES PER
+   COLLECTION — the only callers are inside the GC trampoline (region base at
+   entry, again for the Cheney scan, again for the semispace swap), never in an
+   allocation fast path.")
+
+(defun emit-load-gc-region (buf reg)
+  "REG := the base address of the ACTIVE region's GC control block.
+
+   The metadata this collector runs on is PER-REGION (mvm/compiler.lisp's
+   +GC-OFF-*+ block): from/to semispaces, semispace size, root-stack base and
+   collection count are eight OFFSETS into a 64-byte block, and which block is
+   live is the word at +GC-REGION-ADDR+ — one word, or (stage 3, and only when
+   *X64-GC-REGION-PERCPU* is on) this CPU's entry of the array based there.
+
+   ZERO MEANS REGION 0.  Nothing writes that word until something creates a
+   second region, so on Linux the ELF BSS zero-fill and on bare metal the
+   unwritten-metadata-reads-as-zero assumption this tree already relies on both
+   answer `region 0' — whose block is the historic one at +GC-REGION-0-BASE+.
+   That is why stage 1 needed no boot-descriptor edit on any of the four
+   targets, three of which cannot be booted where this was written."
+  (flet ((emit-percpu-form ()
+           ;; PER-CPU: reg = cpu_id (TAGGED, i.e. 2*id) -> 8*id -> [reg + table].
+           ;; The table is +GC-REGION-MAX-CPUS+ entries based at
+           ;; +GC-REGION-ADDR+, so entry 0 IS the historic word at the historic
+           ;; address.
+           (when (or (= (logand (reg-code reg) 7) 4)
+                     (= (logand (reg-code reg) 7) 5))
+             (error "emit-load-gc-region: the per-CPU form indexes off REG, so ~
+                     REG's low three bits must not be 4 (SIB escape) or 5 ~
+                     (RIP/disp32 escape); got ~S" reg))
+           ;; MOV reg, GS:[cpu_id]          65 REX.W 8B /r SIB=25 disp32
+           (emit-byte buf #x65)
+           (emit-byte buf (logior #x48 (if (reg-extended-p reg) #x04 0)))
+           (emit-byte buf #x8B)
+           (emit-byte buf (logior #x04 (ash (logand (reg-code reg) 7) 3)))
+           (emit-byte buf #x25)
+           (emit-u32 buf modus.mvm::+gc-percpu-cpu-id-off+)
+           ;; SHL reg, 2                    2*id -> 8*id
+           (emit-shl-reg-imm buf reg 2)
+           ;; MOV reg, [reg + table]        REX.W 8B /r mod=10 disp32
+           (emit-byte buf (logior #x48 (if (reg-extended-p reg) #x05 0)))
+           (emit-byte buf #x8B)
+           (emit-byte buf (logior #x80
+                                  (ash (logand (reg-code reg) 7) 3)
+                                  (logand (reg-code reg) 7)))
+           (emit-u32 buf modus.mvm::+gc-region-addr+)))
+    (cond
+      ((eq *x64-gc-region-percpu* :runtime)
+       ;; BOTH FORMS, selected by the SAME gate word mvm/gc.lisp's
+       ;; %GC-REGION-CELL branches on — so the collector and the mutator cannot
+       ;; end up reading different cells, whatever the mode is.  See the defvar
+       ;; for why a hosted image needs this rather than a build-time T.
+       (let ((percpu (make-label))
+             (joined (make-label)))
+         ;; CMP dword [+GC-REGION-PERCPU-ADDR+], 0   83 3C 25 disp32 imm8
+         (emit-bytes buf #x83 #x3C #x25)
+         (emit-u32 buf modus.mvm::+gc-region-percpu-addr+)
+         (emit-byte buf #x00)
+         (emit-jcc buf :ne percpu)
+         (emit-mov-reg-abs buf reg modus.mvm::+gc-region-addr+)
+         (emit-jmp buf joined)
+         (emit-label buf percpu)
+         (emit-percpu-form)
+         (emit-label buf joined)))
+      (*x64-gc-region-percpu* (emit-percpu-form))
+      (t (emit-mov-reg-abs buf reg modus.mvm::+gc-region-addr+))))
+  (let ((have-region (make-label)))
+    (emit-cmp-reg-imm buf reg 0)
+    (emit-jcc buf :ne have-region)
+    (emit-mov-reg-imm buf reg modus.mvm::+gc-region-0-base+)
+    (emit-label buf have-region)))
+
 (defun emit-gc-trampoline (buf gc-trampoline-label gc-collect-label)
   "Emit a complete Cheney copying GC in native x64 assembly.
 
-   GC metadata layout (raw byte addresses at heap base 0x10000000):
-     +0x40: from_start   +0x48: to_start   +0x50: space_size
-     +0x58: stack_base   +0x60: gc_count
+   GC metadata layout — offsets into the ACTIVE region's 64-byte control block,
+   found via emit-load-gc-region (region 0's block is at 0x10000040, so the
+   effective addresses are unchanged for a single-region image):
+     +0x00: from_start   +0x08: to_start   +0x10: space_size
+     +0x18: stack_base   +0x20: gc_count
    All metadata values are stored as raw byte addresses (NOT tagged).
 
    Register convention during GC:
@@ -5104,29 +5620,73 @@
     ;; Save RSP for stack root scanning (after all pushes)
     (emit-bytes buf #x48 #x89 #xE5)              ; mov rbp, rsp  (save scan start)
 
-    ;; ---- Load GC metadata ----
+    ;; ---- THIS COLLECTION HAS BEGUN.  Say so, where two CPUs can both see it.
+    (emit-gc-concurrency-enter buf)
+
+    ;; ---- Load GC metadata FROM THE ACTIVE REGION'S CONTROL BLOCK ----
+    ;; RAX = region base (see emit-load-gc-region: 0 in the pointer word means
+    ;; region 0, so an image that never created a second region loads exactly
+    ;; the addresses this code used to hard-code).  RAX stays the base until the
+    ;; stack scan starts using it as an argument register.
+    (emit-load-gc-region buf 'rax)
     ;; RBX = from_start (raw byte addr)
-    (emit-bytes buf #x48 #x8B #x1C #x25)         ; mov rbx, [abs32]
-    (emit-u32 buf #x10000040)
+    (emit-mov-reg-mem buf 'rbx 'rax modus.mvm::+gc-off-from-start+)
     ;; R13 = to_start -> becomes free pointer
-    (emit-bytes buf #x4C #x8B #x2C #x25)         ; mov r13, [abs32]
-    (emit-u32 buf #x10000048)
+    (emit-mov-reg-mem buf 'r13 'rax modus.mvm::+gc-off-to-start+)
     ;; RCX = from_start + space_size = from_end
-    (emit-bytes buf #x48 #x8B #x0C #x25)         ; mov rcx, [abs32]
-    (emit-u32 buf #x10000050)
+    (emit-mov-reg-mem buf 'rcx 'rax modus.mvm::+gc-off-space-size+)
     (emit-add-reg-reg buf 'rcx 'rbx)             ; rcx = from_start + space_size
+    ;; RDX = stack_base.  Hoisted out of the stack-scan block below so it can
+    ;; share this one load of the region base; scan_word pushes/pops RDX, so it
+    ;; survives the whole scan exactly as before.
+    (emit-mov-reg-mem buf 'rdx 'rax modus.mvm::+gc-off-stack-base+)
 
     (emit-gc-dbg-char buf #x70)          ; 'p' — pushed regs + metadata loaded, about to scan stack
-    ;; ---- Scan stack roots ----
-    ;; Walk from RBP (saved RSP) to stack_base
+    ;; ---- Scan THIS REGION'S ROOT WINDOW ----
+    ;;
+    ;; STAGE 2.  The window is [saved_sp, stack_base) and BOTH ends come out of
+    ;; the region's own control block.  Which stack that is depends on whether
+    ;; this region's actor is the one running:
+    ;;
+    ;;   saved_sp == 0  RUNNING.  Its roots are on the LIVE machine stack, from
+    ;;                  RBP — which is RSP after the twelve pushes above, so the
+    ;;                  whole register file is inside the window — up to
+    ;;                  stack_base.  This is the historic behaviour, and it is
+    ;;                  what an image that never created a second region gets,
+    ;;                  because %gc-region-init writes 0 here and nothing on x64
+    ;;                  ever writes this field otherwise.
+    ;;   saved_sp != 0  PARKED.  Its actor was switched off some OTHER stack;
+    ;;                  the switch spilled that actor's registers there and
+    ;;                  recorded its SP here (gc.lisp %gc-region-park).  Scan
+    ;;                  THAT window and NOT the live stack — the live stack
+    ;;                  belongs to whoever is driving this collection, and its
+    ;;                  pointers into this region are, by the term-serialisation
+    ;;                  argument, not supposed to exist.
+    ;;
+    ;; The size gate is only on the parked path: that low end came from memory,
+    ;; so a stale or corrupt SP would walk unmapped pages.  Over the cap the
+    ;; window collapses to EMPTY (rdi = stack_base, loop exits immediately)
+    ;; rather than running wild.  SUB wraps when saved_sp > stack_base, giving a
+    ;; huge unsigned difference, so the one unsigned compare catches an inverted
+    ;; window too.  RSI is free here (it is scan_word's temp, and the scan has
+    ;; not started); RAX still holds the region base.
+    (let ((sp-ready (make-label))
+          (sp-live (make-label)))
+      (emit-mov-reg-mem buf 'rdi 'rax modus.mvm::+gc-off-saved-sp+)
+      (emit-cmp-reg-imm buf 'rdi 0)
+      (emit-jcc buf :e sp-live)
+      (emit-mov-reg-reg buf 'rsi 'rdx)           ; rsi = stack_base
+      (emit-sub-reg-reg buf 'rsi 'rdi)           ; rsi = stack_base - saved_sp
+      (emit-cmp-reg-imm buf 'rsi modus.mvm::+gc-max-parked-window+)
+      (emit-jcc buf :be sp-ready)
+      (emit-mov-reg-reg buf 'rdi 'rdx)           ; bogus window -> empty
+      (emit-jmp buf sp-ready)
+      (emit-label buf sp-live)
+      (emit-mov-reg-reg buf 'rdi 'rbp)           ; running: the live SP
+      (emit-label buf sp-ready))
     ;; RDI = current scan address
-    (emit-bytes buf #x48 #x89 #xEF)              ; mov rdi, rbp  (start of stack)
     (let ((stack-loop (make-label))
           (stack-done (make-label)))
-      ;; RDX = stack_base
-      (emit-bytes buf #x48 #x8B #x14 #x25)       ; mov rdx, [abs32]
-      (emit-u32 buf #x10000058)
-
       (emit-label buf stack-loop)
       (emit-cmp-reg-reg buf 'rdi 'rdx)           ; rdi >= stack_base?
       (emit-jcc buf :ae stack-done)
@@ -5198,15 +5758,24 @@
     (let ((mv-loop (make-label))
           (mv-done (make-label)))
       ;; R10 = (mem[0x10000090] >> 1) - 1  =  number of extra values
-      (emit-mov-reg-imm buf 'rax #x10000090)
+      ;; PER-THREAD WINDOW: the collector runs on the thread that hit the
+      ;; limit, so the extras it must keep alive are THAT thread's.  With the
+      ;; window off emit-tls-base yields 0 and this is the historic address.
+      (if *x64-tls-window*
+          (progn (emit-tls-base buf 'rax)
+                 (emit-add-reg-imm buf 'rax #x10000090))
+          (emit-mov-reg-imm buf 'rax #x10000090))
       (emit-mov-reg-mem buf 'r10 'rax 0)         ; r10 = tagged count
       (emit-shr-reg-imm buf 'r10 1)              ; untag -> raw count
       (emit-sub-reg-imm buf 'r10 1)              ; r10 = count - 1 (extras)
       ;; if extras <= 0, nothing to scan (SUB sets SF/ZF: jle when <=0)
       (emit-cmp-reg-imm buf 'r10 0)
       (emit-jcc buf :le mv-done)
-      ;; RDI = 0x10000098 (first extra value slot)
-      (emit-mov-reg-imm buf 'rdi #x10000098)
+      ;; RDI = 0x10000098 (first extra value slot), per-thread
+      (if *x64-tls-window*
+          (progn (emit-tls-base buf 'rdi)
+                 (emit-add-reg-imm buf 'rdi #x10000098))
+          (emit-mov-reg-imm buf 'rdi #x10000098))
       (emit-label buf mv-loop)
       (emit-mov-reg-reg buf 'rax 'rdi)           ; rax = slot addr
       (emit-call buf scan-word-label)
@@ -5215,12 +5784,15 @@
       (emit-cmp-reg-imm buf 'r10 0)
       (emit-jcc buf :g mv-loop)
       (emit-label buf mv-done))
-    (emit-gc-dbg-char buf #x72)          ; 'r' — roots scan done (globals+kw+pkg+mv)
+    ;; THIS THREAD'S DYNAMIC BINDINGS — the other per-thread root set.
+    (emit-dynbind-root-scan buf scan-word-label)
+    (emit-gc-dbg-char buf #x72)          ; 'r' — roots scan done (globals+kw+pkg+mv+dynbind)
 
     ;; ---- Cheney scan loop ----
-    ;; R10 = scan pointer (starts at to_start)
-    (emit-bytes buf #x4C #x8B #x14 #x25)         ; mov r10, [abs32]
-    (emit-u32 buf #x10000048)                     ; r10 = to_start
+    ;; R10 = scan pointer (starts at to_start).  RAX is dead here (the MV loop
+    ;; above finished with it), so it carries the region base again.
+    (emit-load-gc-region buf 'rax)
+    (emit-mov-reg-mem buf 'r10 'rax modus.mvm::+gc-off-to-start+)   ; r10 = to_start
 
     (let ((cheney-loop (make-label))
           (cheney-done (make-label)))
@@ -5236,25 +5808,26 @@
       (emit-label buf cheney-done))
     (emit-gc-dbg-char buf #x63)          ; 'c' — cheney scan done
 
-    ;; ---- Swap semispaces ----
+    ;; ---- Swap THIS REGION's semispaces ----
+    ;; RSI carries the region base from here to the end of the collection: RSI is
+    ;; dead once the Cheney scan is done (it is scan_word's temp), REP STOSB in
+    ;; the bitmap clears below uses RDI/RCX/AL and leaves it alone, and it is
+    ;; restored from the stack by the epilogue like every other register.
+    (emit-load-gc-region buf 'rsi)
     ;; new from_start = old to_start
-    (emit-bytes buf #x48 #x8B #x04 #x25)         ; mov rax, [0x10000048]
-    (emit-u32 buf #x10000048)
-    (emit-bytes buf #x48 #x89 #x04 #x25)         ; mov [0x10000040], rax
-    (emit-u32 buf #x10000040)
+    (emit-mov-reg-mem buf 'rax 'rsi modus.mvm::+gc-off-to-start+)
+    (emit-mov-mem-reg buf 'rsi 'rax modus.mvm::+gc-off-from-start+)
     ;; new to_start = old from_start (in RBX)
-    (emit-bytes buf #x48 #x89 #x1C #x25)         ; mov [0x10000048], rbx
-    (emit-u32 buf #x10000048)
+    (emit-mov-mem-reg buf 'rsi 'rbx modus.mvm::+gc-off-to-start+)
 
     ;; ---- Update R12 and R14 ----
     ;; R12 = free_ptr (R13)
     (emit-bytes buf #x4D #x89 #xEC)              ; mov r12, r13
-    ;; R14 = new from_start + space_size
-    ;; new from_start was old to_start, now at [0x10000040]
-    (emit-bytes buf #x48 #x8B #x04 #x25)         ; mov rax, [0x10000040]
-    (emit-u32 buf #x10000040)
-    (emit-bytes buf #x48 #x03 #x04 #x25)         ; add rax, [0x10000050]
-    (emit-u32 buf #x10000050)
+    ;; R14 = new from_start + space_size (new from_start was old to_start, just
+    ;; written back into this region's block)
+    (emit-mov-reg-mem buf 'rax 'rsi modus.mvm::+gc-off-from-start+)
+    (emit-mov-reg-mem buf 'r11 'rsi modus.mvm::+gc-off-space-size+)
+    (emit-add-reg-reg buf 'rax 'r11)
     (emit-bytes buf #x49 #x89 #xC6)              ; mov r14, rax
 
     ;; ---- MCGC point (c): clear the reclaimed from-space's object-start bitmap ----
@@ -5285,8 +5858,8 @@
       (emit-bytes buf #x48 #x8B #x3C #x25)           ; mov rdi, [bitmap_base]
       (emit-u32 buf +mcgc-cfg-bitmap-addr+)
       (emit-bytes buf #x48 #x01 #xC7)                ; add rdi, rax  (rdi = dest)
-      (emit-bytes buf #x48 #x8B #x0C #x25)           ; mov rcx, [space_size]
-      (emit-u32 buf #x10000050)
+      ;; RSI = this region's control block (loaded at the swap above)
+      (emit-mov-reg-mem buf 'rcx 'rsi modus.mvm::+gc-off-space-size+)
       (emit-shr-reg-imm buf 'rcx 7)                  ; rcx = byte count = space_size/128
       (emit-bytes buf #x31 #xC0)                     ; xor eax, eax  (AL = fill 0)
       (emit-bytes buf #xF3 #xAA))                    ; rep stosb
@@ -5307,15 +5880,18 @@
       (emit-bytes buf #x48 #x81 #xC7)                ; add rdi, imm32 (kind delta)
       (emit-u32 buf +mcgc-kindbitmap-delta+)
       (emit-bytes buf #x48 #x01 #xC7)                ; add rdi, rax  (rdi = dest)
-      (emit-bytes buf #x48 #x8B #x0C #x25)           ; mov rcx, [space_size]
-      (emit-u32 buf #x10000050)
+      ;; RSI = this region's control block (loaded at the swap above)
+      (emit-mov-reg-mem buf 'rcx 'rsi modus.mvm::+gc-off-space-size+)
       (emit-shr-reg-imm buf 'rcx 7)                  ; byte count = space_size/128
       (emit-bytes buf #x31 #xC0)                     ; xor eax, eax
       (emit-bytes buf #xF3 #xAA))                    ; rep stosb
 
-    ;; ---- Increment GC count ----
-    (emit-bytes buf #x48 #xFF #x04 #x25)          ; inc qword [0x10000060]
-    (emit-u32 buf #x10000060)
+    ;; ---- Increment THIS REGION's collection count ----
+    ;; inc qword [rsi + gc_count].  Per-region, so "how many times has region N
+    ;; been collected" is answerable — which is what makes a per-region
+    ;; collection observable from outside the collector.
+    (emit-bytes buf #x48 #xFF #x46)               ; inc qword [rsi+disp8]
+    (emit-byte buf modus.mvm::+gc-off-count+)
 
     ;; ---- Restore registers ----
     (emit-jmp buf restore-label)
@@ -5611,6 +6187,8 @@
     (emit-label buf restore-label)
     ;; RSP should equal RBP (saved after all pushes). Force it for safety.
     (emit-mov-reg-reg buf 'rsp 'rbp)
+    ;; ---- ...and it has ended.  Before the pops, so RAX is still scratch.
+    (emit-gc-concurrency-exit buf)
     (emit-pop buf 'rbp)
     (emit-pop buf 'r13)
     (emit-pop buf 'r11)
@@ -5872,6 +6450,14 @@
 (defun emit-page-gc-trampoline (buf page-gc-label)
   "MCGC stage-4c/4d WHOLE-REGION page-based MOSTLY-COPYING collector WITH PINNING.
 
+   NOT REGION-AWARE, and off by default (*MCGC-PINNING-ENABLED* is NIL).  Its
+   two references to the metadata block — +GC-STACK-BASE-ADDR+ and
+   +GC-COUNT-ADDR+ — resolve to REGION 0's fields, which is right for the only
+   images that enable it.  The model is also a poorer fit than Cheney's: this
+   collector owns a page pool over the WHOLE data region, so \"which region\" is
+   a question its free-list would have to answer too, not just its metadata
+   loads.  A pinning build must not create a second region.
+
    Bartlett page pool over the WHOLE data region (no two-run split for the
    collector — that was 4b).  Descriptor byte per 4 KiB page:
      0 = free
@@ -6025,7 +6611,7 @@
     (emit-bytes buf #x48 #x89 #xEF)              ; mov rdi, rbp
     (let ((sp-loop (make-label)) (sp-done (make-label)) (sp-next (make-label))
           (sp-cand (make-label)))
-      (emit-mov-reg-abs buf 'rdx #x10000058)     ; rdx = stack_base
+      (emit-mov-reg-abs buf 'rdx modus.mvm::+gc-stack-base-addr+)     ; rdx = stack_base
       (emit-label buf sp-loop)
       (emit-cmp-reg-reg buf 'rdi 'rdx)
       (emit-jcc buf :ae sp-done)
@@ -6085,13 +6671,20 @@
     (when *x64-jit-constvec-p*
       (emit-mov-reg-imm buf 'rax *x64-jit-constvec-root*) (emit-call buf scan-word-label))
     (let ((mv-loop (make-label)) (mv-done (make-label)))
-      (emit-mov-reg-imm buf 'rax #x10000090)
+      ;; PER-THREAD WINDOW — see the matching note in the copying trampoline.
+      (if *x64-tls-window*
+          (progn (emit-tls-base buf 'rax)
+                 (emit-add-reg-imm buf 'rax #x10000090))
+          (emit-mov-reg-imm buf 'rax #x10000090))
       (emit-mov-reg-mem buf 'r10 'rax 0)
       (emit-shr-reg-imm buf 'r10 1)
       (emit-sub-reg-imm buf 'r10 1)
       (emit-cmp-reg-imm buf 'r10 0)
       (emit-jcc buf :le mv-done)
-      (emit-mov-reg-imm buf 'rdi #x10000098)
+      (if *x64-tls-window*
+          (progn (emit-tls-base buf 'rdi)
+                 (emit-add-reg-imm buf 'rdi #x10000098))
+          (emit-mov-reg-imm buf 'rdi #x10000098))
       (emit-label buf mv-loop)
       (emit-mov-reg-reg buf 'rax 'rdi)
       (emit-call buf scan-word-label)
@@ -6100,6 +6693,8 @@
       (emit-cmp-reg-imm buf 'r10 0)
       (emit-jcc buf :g mv-loop)
       (emit-label buf mv-done))
+    ;; THIS THREAD'S DYNAMIC BINDINGS — see EMIT-DYNBIND-ROOT-SCAN.
+    (emit-dynbind-root-scan buf scan-word-label)
     (emit-gc-dbg-char buf #x72)          ; 'r' — precise roots done
 
     ;; ================= P2b: scan PINNED pages' objects (gray roots) =========
@@ -6361,7 +6956,7 @@
       (let ((rok (make-label)))
         (emit-jcc buf :b rok) (emit-gc-dbg-char buf #x3C) (emit-label buf rok)))
 
-    (emit-bytes buf #x48 #xFF #x04 #x25) (emit-u32 buf #x10000060) ; gc_count++
+    (emit-bytes buf #x48 #xFF #x04 #x25) (emit-u32 buf modus.mvm::+gc-count-addr+) ; gc_count++
     (emit-jmp buf restore-label)
 
     ;; ===========================================================

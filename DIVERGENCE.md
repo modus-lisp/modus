@@ -111,6 +111,63 @@ in the next pass.
   checking restarts.  *(build-x64-linux.lisp ~line 2389)*
 - Various `make-int-list` / aux helpers — partial.
 
+### Argument evaluation order
+
+- **A call's 5th and later argument forms are evaluated FIRST, and among
+  themselves RIGHT-TO-LEFT** — the register arguments (1-4) are evaluated
+  afterwards, left to right.  CLHS 3.1.2.1.2.3 requires strict left-to-right
+  for the whole argument list.  *(divergent semantics; the overflow-argument
+  path — see `#x0530` COPY-OVERFLOW-ARGS in the translators.)*
+
+  Measured with a counter bumped once per argument form, `./modus` against
+  SBCL — the value each parameter receives, in parameter order:
+
+  | call | SBCL (correct) | modus |
+  |---|---|---|
+  | `(f4 (b) (b) (b) (b))` | `(1 2 3 4)` | `(1 2 3 4)` |
+  | `(f5 (b) (b) (b) (b) (b))` | `(1 2 3 4 5)` | `(2 3 4 5 1)` |
+  | `(f6 ...)` | `(1 2 3 4 5 6)` | `(3 4 5 6 2 1)` |
+  | `(f7 ...)` | `(1 2 3 4 5 6 7)` | `(4 5 6 7 3 2 1)` |
+
+  Same for `&rest` functions; `LIST` is unaffected because it does not go
+  through the general call path.
+
+  **Only argument lists with SIDE EFFECTS are affected** — each form is still
+  bound to the right parameter, so pure arguments give correct results and this
+  is invisible until an argument mutates something another argument reads.  The
+  common way to meet it is a `FORMAT` with three or more directives whose
+  arguments are not pure, e.g.
+  `(format t "~S ~S" (take-and-clear x) (read x))`, which reports the
+  *un-cleared* value.  Found by running glass/fb's drawing primitives under
+  modus against SBCL as the oracle (`test/run-glass-fb.sh`).
+
+  **RE-DERIVED INDEPENDENTLY IN THE THREADS/GLASS CAMPAIGN (2026-08), AND THE
+  TABLE ABOVE IS CORRECT AS WRITTEN.**  The second measurement reported "three
+  bumps evaluate 3,1,2" and looked like a contradiction.  It is not — it is the
+  same rule, and the reconciliation is the thing worth writing down:
+
+  * ***`FORMAT`'s `t` AND THE CONTROL STRING OCCUPY ARGUMENT SLOTS 1 AND 2.***
+    So `(format t "~s ~s ~s" (b 1) (b 2) (b 3))` has the three side-effecting
+    forms in slots **3, 4 and 5** — one of them is in the overflow path — and
+    the rule predicts evaluation order `3, 1, 2` exactly, which is what was
+    measured.  It is very easy to count the visible arguments and conclude the
+    register/overflow boundary sits three places later than it does.
+  * **THE TABLE ABOVE MEASURES A DIFFERENT QUANTITY FROM AN EVALUATION-ORDER
+    LOG.**  Its columns are *the value each parameter receives*, with a counter
+    bumped once per argument form — so the FIRST form evaluated receives 1.
+    Eval order `(5 1 2 3 4)` therefore shows up as params `(2 3 4 5 1)`.  Both
+    descriptions are of the same run.  When re-measuring, log the order
+    directly (push a marker per form and reverse it) as well as the parameter
+    values, or the two are easy to mistake for a disagreement.
+
+  Confirmed on the current build with a direct evaluation-order log —
+  `f3` -> `(1 2 3)`, `f4` -> `(1 2 3 4)`, `f5` -> `(5 1 2 3 4)`,
+  `f6` -> `(6 5 1 2 3 4)`, `f7` -> `(7 6 5 1 2 3 4)`, SBCL `(1 2 … n)`
+  throughout — i.e. arguments 5+ first and right-to-left among themselves, then
+  1-4 left to right, precisely the rule stated above.  **This bug has now cost
+  two separate investigations; read this entry before measuring it a third
+  time.**
+
 ### Eval-time machinery
 
 - `eval-when` — partial; `(:compile-toplevel :load-toplevel :execute)`

@@ -343,7 +343,7 @@
   ;; gc.lisp's (mem-ref :u64) reads back (see the defvar docstring).
   (flet ((maybe-shl () (when *linux-aarch64-gc-metadata-shl*
                          (emit-aarch64-u32 buf #x8B0A014A))))  ; ADD x10,x10,x10
-    (emit-aarch64-load-imm64 buf 17 #x10000040)
+    (emit-aarch64-load-imm64 buf 17 +gc-from-start-addr+)
     ;; from_start = mmap+alloc_start
     (emit-aarch64-u32 buf #xAA1603EA)   ; MOV x10, x22
     (emit-aarch64-load-imm64 buf 16 +linux-aarch64-heap-alloc-start+)

@@ -2,6 +2,17 @@
 
 Modus is a self-hosting bare-metal Lisp operating system. It compiles Lisp to native code via the MVM (Modus Virtual Machine) — a portable virtual ISA with translators for 9 CPU architectures. The system runs SSH servers, handles USB devices, and supports cooperative actor-based concurrency, all on bare metal with no OS underneath.
 
+**Concurrency, as of 2026-08: two models, and which one you get depends on the
+target.** Bare metal is still the cooperative actor scheduler described above.
+**Hosted x86-64 additionally has native OS threads** — up to 16, each with its
+own GC region, root window, multiple-value buffer, handler-frame stack and
+dynamic bindings — plus Linux sockets, a real mutex/condition-variable pair, a
+real `SLEEP`, and `sb-thread` / `sb-bsd-sockets` surfaces. The witness is
+`test/run-glass-serve.sh`: the **glass** compositor, unmodified, serving real
+VNC clients from its own RFB server on modus. See "Per-region GC" and the
+threading sections below; `docs/handler-stack-collision.md` is required reading
+before touching the handler stack or the per-thread window.
+
 ## Directory Structure
 
 ```
@@ -241,6 +252,32 @@ Key fixes en route: call-relocation untag (5b866fa), out-of-module GC-trampoline
 `(ldb (byte 32 32) bignum)` high-word extract was broken by limitation #8; now
 `(logand …)` + `(ash (floor V 2^31) -1)`).  Next: port the JIT to aarch64; then
 back to Quicklisp.
+
+### `check-compiler-warns` baselines are STALE, and that is a hazard
+
+`build-generic-cli` currently reports, on every build:
+
+```
+implicit-global=41  implicit-global-setq=124  unresolved-function=45
+  - implicit-global-setq = 124 (baseline 123) — 1 NEW instance
+  - unresolved-function  = 45  (baseline 40)  — 5 NEW instances
+```
+
+**Both overages are pre-existing at HEAD** — established by building a control
+with the change under test reverted and getting an identical census, twice, in
+different rounds. The five unresolved names are `F1`–`F4` and
+`IS-EXTERNAL-SYMBOL-OF`: `#'NAME` sentinels with no definition in the blob,
+benign by the check's own definition.
+
+The hazard is not the five. It is that **a check which always cries wolf is a
+check nobody reads**, so a genuine sixth would be invisible — the same
+"unsafe state indistinguishable from a safe one" pattern that cost this
+campaign several rounds elsewhere.
+
+Fixing it means *deciding*, not silencing: either resolve the five, or move the
+baselines in `mvm/build-checks.lisp` (`:unresolved-function . 40`, line ~1069)
+**with a comment naming what was absorbed and why**. Bumping a baseline without
+naming its contents just relocates the problem.
 
 ## Build Commands
 
@@ -515,6 +552,2440 @@ Cheney semi-space copying collector. Two ~469MB semispaces within the mmap'd hea
 - **Init**: lazy — metadata computed from heap_base on first trigger
 
 `scan_word` saves/restores RDX (stack_base) around copy_object calls.
+
+### Per-region GC, stage 1: the metadata block is a REGION CONTROL BLOCK
+
+The GC metadata is no longer global.  `mvm/compiler.lisp` owns the layout:
+eight `+GC-OFF-*+` OFFSETS (from/to/size/stack_base/count/saved sp+alloc+limit)
+into a 64-byte block, `+GC-REGION-0-BASE+` = `0x10000040`, and
+`+GC-REGION-ADDR+` = `0x10000F08`, one word holding the ACTIVE block's raw
+address.  `+GC-FROM-START-ADDR+` and friends still exist with their old values;
+they now spell "region 0's block, field F", so **no boot descriptor changed**.
+
+**ZERO MEANS REGION 0.** Nothing writes `0x10000F08` until something creates a
+second region, so BSS zero-fill (Linux) and unwritten-metadata-reads-as-zero
+(bare metal, the same assumption `%gc-bitmap-base` already degrades on) both
+answer "region 0".  A single-region image behaves exactly as before.
+
+Region-aware readers: `mvm/gc.lisp` (all field access is `(+ (%gc-region) OFF)`)
+and translate-x64's `emit-gc-trampoline` (`emit-load-gc-region` → `[reg+OFF]`).
+**NOT region-aware, and commented as such**: translate-aarch64's GC shim,
+translate-i386's collector, and translate-x64's page/pinning collector — they
+read region 0 unconditionally, which is correct until those targets create a
+second region.  Porting is the same edit: load the base once, index off it.
+
+API in `gc.lisp`: `%gc-region-init` (write a block anywhere the caller owns —
+BSS, a carved guard band, or an actor struct), `%gc-region-enter` (park the
+mutator's alloc ptr/limit in the region you leave, load the one you enter —
+exactly `actors.lisp`'s x24/x25 context switch), `%gc-region-shrink`,
+`%gc-collect-here` (pull the limit to the pointer so the next `:gc-check`
+trips — the real collector, not a side door).  `%gc-meta-scale` DERIVES whether
+this target stores metadata raw (x64) or SHL'd (aarch64/i386) by asking which
+reading brackets the alloc pointer, so there is no per-target knob.
+
+Soundness is `net/actors.lisp`'s: each actor has a private alloc ptr/limit and
+messages are term-serialized, so no actor holds a pointer into another's
+region.  **Stage 1 does not enforce that** — a pointer stored from region A
+into region B dangles when B is collected.
+
+Acceptance: `./modus --script test/region-gc.lisp` — carves two 16 MB regions
+off the top of region 0's semispaces, collects ONE, and checks the other two
+are bit-for-bit unchanged (23 checks).  Note the ordinary 200k-allocation
+stress collects **zero** times on an 896 MB semispace (measured); use
+`%gc-collect-here` or `MODUS_GC_R14` if you mean to exercise the collector.
+
+### Per-region GC, stage 2: the ROOT SET is a property of the region
+
+The collector's stack scan is `[root_sp, stack_base)` and **both ends are
+fields of the region being collected** (`+GC-OFF-SAVED-SP+` / `+GC-OFF-STACK-
+BASE+`).  Collecting region N examines N's roots and nothing else — no global
+stack base, no other region's window.
+
+**`root_sp == 0` MEANS "THIS REGION'S ACTOR IS RUNNING"**, the same zero-is-the-
+historic-answer trick stage 1 used, so nothing needed initialising anywhere:
+
+| state | root window low end | who writes it |
+|---|---|---|
+| running | the LIVE SP at collector entry (x64: RBP, below all twelve pushed registers, so the register file is in the window; aarch64: its shim writes the same value into the field) | the collector entry point |
+| parked | the SP the context switch recorded on that actor's OWN stack, where the switch also spilled its registers | `%gc-region-park` |
+
+The two writers can never be live at once — a region is either running or
+parked.  `translate-x64`'s trampoline branches on `saved_sp = 0` because it has
+RBP in hand and no shim; the Lisp `%gc-collect` just reads the field, which is
+correct in both cases.  A parked window is size-capped at
+`+GC-MAX-PARKED-WINDOW+` (16 MB) since that low end came from memory rather
+than a register; over the cap the window collapses to EMPTY rather than walking
+unmapped pages.
+
+New API in `gc.lisp`: `%gc-region-park` (rcb sp), `%gc-region-unpark`,
+`%gc-region-parked-p`, `%gc-region-switch` (rcb sp) — park the region you leave
+*and* its roots, enter and un-park the one you arrive in.  **The SP is an
+ARGUMENT** because no MVM primitive yields the stack pointer as a value on every
+target (`:save-ctx` is not implemented on x64 at all); the value already exists
+where it is needed, since `actors.lisp`'s `yield` has just written the outgoing
+actor's SP to its struct at `+0x08`.  Nothing in `net/actors.lisp` owns a region
+yet (all actors bump-allocate inside region 0), so nothing calls it outside the
+tests — wiring that up is stage 3.
+
+**NOT partitioned, and it is the one root set stage 2 does not split**:
+`%gc-scan-globals` / the trampoline's globals block (globals alist, symbol +
+keyword + package intern tables, MV extras).  Any region's actor can store its
+own object into a global, so every region scans them; it is a no-op for
+anything that does not point into the region being collected, hence
+conservative-safe, but it is not per-region.
+
+**The soundness assumption, stated because stage 2 rests on it**: per-region
+collection is correct only because no actor can hold a pointer into another
+actor's region (`net/actors.lisp` term-serializes every message — copied, never
+shared).  **The collector does NOT enforce that and there is no write barrier**;
+a pointer stored from region A into region B dangles silently when B is
+collected.  `%gc-count-foreign-refs (start end other-start other-size)` is the
+debug-mode audit — exact, non-allocating, works in either direction — and
+`test/region-gc-roots.lisp` runs it both ways over the real heaps after a real
+collection, plus once as a positive control on a span known to hold exactly one
+such pointer.  The collector never calls it (it is an O(heap) sweep).
+
+Acceptance: `./modus --script test/region-gc-roots.lisp` (32 checks).  Two
+identical chains in region 1: A rooted ONLY from the parked window, B rooted
+ONLY from the live stack (which belongs to region 0's actor).  Collect region 1
+twice while parked — A survives, B does not; live bytes `16*N+16`, and `32*N+16`
+if the live stack had been scanned too.  Then the **negative control in the same
+binary**: un-park it, and every expectation inverts (chain C on the live stack
+survives, the parked slot is never even rewritten).
+
+`./modus --script test/gc-forced-stress.lisp` (4 checks) is the collector
+regression: 20 forced collections, 20,000 live structures, checksum
+199990000.
+
+Two traps this cost time on, both pre-existing:
+- **`%gc-count` reports HALF the count on x64.** The field is stored raw there
+  and `(mem-ref addr :u64)` halves — the defect `gc.lisp`'s word-access block
+  documents.  It is right where it is *used* (aarch64/i386 store fields SHL'd,
+  so the halving cancels); test code must read it with `%gc-meta-read`.
+- **`%gc-collect-here` at an interpreted `--script` toplevel breaks the next
+  `(format t …)`** (it re-runs its control string, then signals).  Reproduced on
+  an unmodified HEAD build, so it is a property of the mvm-eval toplevel, not of
+  per-region GC — but it means a scripted stress measures that instead of the
+  collector.  Drive forced collections from compiled in-image code.
+
+### Per-region GC, stage 3: a REGION is a property of an ACTOR
+
+Stage 1 made the heap per-region, stage 2 the roots.  Stage 3 makes a region
+something an ACTOR OWNS, which is what PLAN.md's "Stage 3: Per-actor SMP" needs.
+Three parts, and **none of them changes a single-region image**:
+
+**1. The active-region word stops being ONE word.**  It is now the CPU-0 entry
+of a per-CPU array based at the same address: `+GC-REGION-ADDR+ + 8*cpu_id`, so
+a uniprocessor image reads and writes exactly the word it always did, at exactly
+the address stages 1 and 2 used.  "Which CPU" is the `:CPU-ID` slot at
+`+GC-PERCPU-CPU-ID-OFF+` (=16) that **every** boot descriptor's
+`percpu-layout-fn` already allocates — no per-CPU block grows, no
+`+*-PERCPU-STRIDE+` moves.  Both readers go through one place: `%GC-REGION-CELL`
+in `gc.lisp`, `EMIT-LOAD-GC-REGION` in translate-x64.
+
+**IT IS OFF, on both sides, and that is deliberate**: a per-CPU read is GS: on
+x64, FS: on i386, TPIDR_EL1 on aarch64, and **on hosted Linux the GS base is 0**,
+so an unguarded `GS:[16]` reads absolute address 16 and takes SIGSEGV.  The Lisp
+side branches on `+GC-REGION-PERCPU-ADDR+` (`0x10000FF8`), a BSS word that is
+zero in every image ever built — nothing writes it; the native side branches on
+the host flag `*X64-GC-REGION-PERCPU*`, default NIL.  Measured, not asserted:
+with the flag off `EMIT-LOAD-GC-REGION` and the **whole 826-byte x64 GC
+trampoline** are byte-identical to a build of the HEAD source loaded over the
+new one in the same image.  Turning it on is two deliberate acts and both must
+happen together or the collector and the mutator read different cells —
+`build-checks.lisp` CHECK G now ratchets both literals in `gc.lisp`.
+
+**2. An actor names its region by POINTER, in its struct at `+0x68`.**
+`ZERO MEANS REGION 0`, so an actor that owns no region is the actor of today and
+nothing needs initialising — `SPAWN` does not touch the slot.  `+0x68` and not
+the other reserved slot `+0x28` because `+0x28` is inside the save area
+`:SAVE-CTX` writes through (it gets `cur+0x08` and stores SP/alloc/limit/V4 at
+pa+0x00…0x18, the continuation at pa+0x28 = struct **+0x30**, and on aarch64
+obj-alloc/obj-limit at pa+0x68/0x70 = struct **+0x70/+0x78**); struct +0x68 is
+pa+0x60, which nothing writes.  `net/actors.lisp` gained `ACTOR-REGION-RAW`,
+`ACTOR-REGION-HOP` (YIELD's and RECEIVE's save paths, immediately before
+`restore-context`) and `ACTOR-REGION-RESUME` (the idle scheduler and
+`ACTOR-EXIT`, where there is no outgoing actor to park).  The SP it parks at is
+read back out of `+0x08`, where `SAVE-CONTEXT` has just written it.  **The guard
+is the compatibility story**: when neither side of a switch names a region, the
+hop makes no call and performs no write.
+
+**A net/-only image does not link `mvm/gc.lisp`**, so those four calls land on
+`bare-runtime-stubs.lisp`'s `%UNRESOLVED-FN` (→ NIL) there — measured, the
+aarch64 bare actors image goes 4760 unresolved calls / 24 functions → 4771 / 28,
+the extra 11 being the 4 new names plus 2 `GENERIC-MULTIPLY` and 5
+`NUMERIC-EQUAL-P` from the new helpers' own arithmetic.  Harmless while no actor
+owns a region, but **giving an actor a region on bare metal means linking
+`mvm/gc.lisp` into that image first.**
+
+**3. The aarch64 and i386 collectors are region-aware.**  Both used to read
+region 0's absolute field addresses.  Now: aarch64's native collector and its
+Lisp-calling shim both resolve the base once (`A64-LOAD-GC-REGION`), i386's
+trampoline resolves it into a BSS scratch dword at entry (it has no register to
+spare — EBX/ESI/EDI are collector state, EBP is every loop's cursor, scan_word
+clobbers EAX/ECX/EDX) and hoists the three read-only fields out of it.  Both
+also grew stage 2's **parked-window branch**, which they never had: `saved_sp==0`
+= RUNNING (low end is the live SP), non-zero = PARKED and the window is capped
+by SIZE, not by an address.  `%gc-collect`'s old absolute floor (`0x07200000`,
+one board's stack guard) is gone for the same reason, replaced by the same size
+cap translate-x64 has used since stage 2.
+
+**A COLLECTOR ENTRY POINT THAT WRITES `+0x28` MUST PUT BACK WHAT IT FOUND.**
+aarch64's shim is the only one in the tree that writes the field at all
+(translate-x64 holds RBP, translate-i386 holds ESP, so both only read it), and
+it needs BOTH halves or it is wrong:
+- it must not write when the field says PARKED — that value is an actor's own
+  recorded SP, and **this case is reachable**, because `%gc-collect-here`
+  collects the ACTIVE region and the stage-1/2/3 selftests deliberately make a
+  region active *while parked* and collect it from there;
+- it must restore the original on the way out — nothing else ever clears the
+  field (`%gc-collect` reads it into a local and clamps the local), so a
+  conditional write with no restore leaves the first collection's live SP behind
+  **forever**, and the second collection scans `[SP-of-the-first, stack_base)`.
+  Stacks grow down, so a deeper second collection — the normal case, since GC
+  triggers from arbitrary allocation sites at arbitrary depths — gets a window
+  starting ABOVE its own live frames and misses all of them, the shim's own
+  232-byte register-save area included.
+
+All three variants were **measured on a bare-metal shim-path RPi image under
+QEMU** (`*aarch64-gc-native-mcgc*` NIL), with `test/region-gc-depth.lisp`'s
+probe (two forced collections of one carved region, the second 200 frames
+deeper, a 2000-link chain rooted only by the deep frame's local) and the stage-2
+parked test:
+
+| shim behaviour | `saved_sp` after GC #1 | live bytes after the DEEP GC #2 | parked chain A forwarded? | parked slot → new / old space |
+|---|---|---|---|---|
+| conditional write, no restore | `0x07FFE028` stale | **16** ✗ | 1 ✓ | 1 / 0 ✓ |
+| unconditional write (the pre-stage-3 shape) | `0x07FFE028` stale | 32016 ✓ | **0** ✗ | **0 / 1** ✗ |
+| **write-if-RUNNING + restore (shipped)** | **0** ✓ | **32016** ✓ | 1 ✓ | 1 / 0 ✓ |
+
+Correct answer for live bytes is `16*2000+16 = 32016`; `16` means the whole
+chain was never copied.  The unconditional row also prints `%gc-collect`'s
+**`S`** marker (stack-scan skipped): clobbering the parked SP with the live one
+inverts the window, so it collapses to empty.  Only the third row is correct on
+both axes — reverting the guard is *not* an equivalent fix.
+
+`./modus --script test/region-gc-depth.lisp` (7 checks) is that regression, and
+it is portable: it passes on x64 and on the aarch64 NATIVE arm by construction
+(neither writes the field), so it is a guard there and the real subject on the
+shim path.
+
+Acceptance: `./modus --script test/region-gc-actors.lisp` (53 checks).  Three
+actor structs in the carved guard band, in `net/actors.lisp`'s own layout; actor
+0's region slot left ZERO and required to resolve to region 0's block; actors 1
+and 2 owning carved regions and round-robin switched 1,2,1,2 with a FORCED
+collection at each stop while parked on their own 512-byte root windows.  Each
+region's own count rises, its chain still walks read back through its parked
+slot, live bytes are `16*N+16`, the other region and region 0 are bit-for-bit
+unchanged, and `%gc-count-foreign-refs` is 0 in every direction with a POSITIVE
+CONTROL (each window holds exactly one pointer) so the oracle can answer
+non-zero.
+
+**The carve in all three selftests is now ADAPTIVE** (2 MB regions below a 128 MB
+semispace, 16 MB above) for one reason: the bare-metal RPi CL image has 56 MB
+semispaces and used to skip — and it is the **only** target whose native
+collector can be booted here.  With that, stages 1, 2 AND 3 all RUN on the
+region-aware **aarch64 native collector** under `qemu-system-aarch64 -M raspi3b`,
+including the brand-new parked-window branch (chain A, rooted only from the
+parked window, survives; chain B, rooted only from the live stack, does not).
+`(%gc-forced-stress 2000 5)` there is `(1 6 2000 1999000 0 5)`.
+
+**`net/cooperative-atomics.lisp` was reconciled, not silently invalidated.**  Its
+three checked facts all still hold and for the same reasons — stage 3 added no
+yield site, made no scheduler preemptive and installed no signal handler, and no
+image runs native threads.  The macros did not become safe either.  The header
+now says so, and says the thing that matters: **fact 1 bounds only THIS CPU**, so
+per-actor SMP and those macros cannot ship together unchanged.
+
+### Per-region GC, stage 3 ON HOSTED x64: the actors are REAL (7af5212 … 7c25356)
+
+Stage 3 wired `%GC-REGION-SWITCH` into `net/actors.lisp`'s `YIELD` and
+`RECEIVE`, and **those call sites had never executed**, because that file is
+bare-metal-only and is in no hosted image.  It is now linked into `./modus`, so
+on the one target runnable here the mechanism is driven by an actual scheduler
+instead of a harness standing in for one.  Four steps, four tests, all on
+hosted x86-64:
+
+| test | what it is the first execution of |
+|---|---|
+| `test/hosted-ctx-switch.lisp` (12) | `+op-save-ctx+` / `+op-restore-ctx+` on x64 |
+| `test/hosted-percpu.lisp` (19) | `PERCPU-REF`/`-SET` (`GS:[disp32]`) in a Linux process |
+| `test/hosted-actors.lisp` (20) | spawn / yield / send / receive / term serialisation |
+| `test/hosted-actor-regions.lisp` (48) | a NON-ZERO actor `+0x68`, i.e. stage 3 for real |
+
+**`translate-x64` DOES implement save-ctx/restore-ctx and always did** — `gc.lisp`
+used to claim otherwise; the comment is fixed.  It works unmodified: 200
+coroutine round trips, both sides progressing, locals intact.  It saves
+RSP/RBX/RBP + a continuation and NOTHING else — not V0-V3/V5-V8, which
+aarch64's equivalent pushes — and that is sound only because the compiler keeps
+let-bound locals in FRAME SLOTS, on the stack RSP restores.  The test holds a
+sentinel fixnum AND a heap cons across every switch to make that a measurement.
+
+**Memory comes from the heap, not from an invented address.**  A hosted process
+owns no fixed RAM, so `net/hosted-actors.lisp` derives all twelve address hooks
+by `%GC-REGION-SHRINK`ing region 0 by 48 MB — the same carve gc.lisp's selftests
+use — and laying the actor table, mailbox pool, staging buffers, per-CPU block
+and 64 KB actor stacks out in the freed top of the semispaces.
+
+**Per-CPU storage is `arch_prctl(ARCH_SET_GS)`, syscall 158.**  Not a
+plain-memory override: `PERCPU-REF`/`PERCPU-SET` are COMPILER INTRINSICS
+(op-name hash dispatch), so no `defun` can shadow them and overriding would mean
+editing every percpu call site in the file under test.  The test cross-checks
+every slot through `%GC-READ64`, which does not go through GS, so it cannot pass
+on a segment base pointing somewhere else.  ***`*X64-GC-REGION-PERCPU*` IS STILL
+OFF*** — a GS base is a NECESSARY condition for that flag, not the same
+decision.
+
+**Three things the port needed, each an arch fact:**
+- **`WRITE-BYTE` HAS TWO INCOMPATIBLE MEANINGS** — a board's ONE-argument console
+  byte vs ANSI's `(write-byte byte stream)`.  `net/actors.lisp`'s three progress
+  markers now use `WRITE-CHAR-SERIAL` (MVM trap `#x0300`, present on every
+  target).  This is the ONLY edit to that file.
+- **`SPIN-LOCK`/`SPIN-UNLOCK` MUST BE NO-OPS ON x64**, and not merely because one
+  core needs no lock: `net/actors.lisp` hands the RELEASE to `RESTORE-CONTEXT`,
+  which aarch64's `+op-restore-ctx+` does (via `*AARCH64-SCHED-LOCK-ADDR*`) and
+  **translate-x64's does not** — so a real lock would stay held across every
+  switch and the next `SPIN-LOCK` would spin forever.  Open follow-up.
+- **`AP-SCHEDULER` is overridden**: the bare-metal one uses trap `#x0400`
+  (translate-x64 does not decode it — falls through to a real `INT 0x30`) then
+  CLI / STI+HLT.  Hosted, an empty run queue is a DEADLOCK, not an idle CPU, so
+  it counts the event and returns; every test asserts the count is 0.
+
+**A NIL-TERMINATED LIST CANNOT BE SENT** by `TERM-SIZE`/`TERM-ENCODE` in a hosted
+image.  They open with `(zerop val)`, which spots the end of a list on bare
+metal WHERE NIL IS ZERO; hosted, NIL is the immediate `#xDEAD0001`, all three of
+`zerop`/`consp`/`numberp` are false, and it falls through to `SOFT-SUBTAG`,
+which dereferences it.  Dotted pairs of non-zero fixnums work and exercise the
+same cons path.  Fixing the general case changes `net/actors.lisp`'s semantics.
+
+**WHY STEP C (no regions) BEFORE STEP D.**  With every actor in region 0, whose
+stack_base is the PROCESS stack base, a collection while an actor runs on a band
+stack would scan terabytes of unmapped VA.  Step C therefore ASSERTS region 0
+never collects; step D fixes it, because a region's stack_base becomes ITS
+ACTOR'S STACK TOP and both the running and the parked window then lie inside one
+64 KB stack.  **Step D is not just a heap partition — it is what makes
+collecting DURING an actor possible at all.**
+
+**THE ORDERING ARGUMENT, which is a real correctness hazard.**  x64's SAVE-CTX
+does not save R12/R14, and that omission is what makes the hop work:
+`ACTOR-REGION-HOP` runs after `SAVE-CONTEXT` recorded the outgoing SP and
+immediately before `RESTORE-CONTEXT`, so `%GC-REGION-ENTER`'s load of the
+arriving region's alloc pointer/limit SURVIVES the restore (which moves only
+RSP/RBX/RBP).  Between the two, the CPU is on the OUTGOING actor's stack holding
+the ARRIVING region's allocation registers — safe only because nothing in that
+window allocates.  On aarch64 the window closes differently (its RESTORE-CTX
+reloads x24/x25 from the arriving actor's save area, so struct +0x10/+0x18 and
+the region's parked pair must agree there); this is measured on x64 only.
+
+Stage-3-for-real numbers: 2000-cons chain live in each worker's frame across 16
+forced collections of its OWN region, 0 walk failures; every message re-checked
+and re-sent AFTER a collection of the region it was decoded into; counts
+16/16 → 18/17 with region 0 at 0 throughout; the other region bit-for-bit
+identical (heap AND control block) across each collection; parked-window live
+bytes 32048 = 16*2000 + 3 junk conses; `%GC-COUNT-FOREIGN-REFS` 0 in every
+direction with an EXACT synthetic control (one planted pointer → 1) and a REAL
+one (each actor's parked window → 2 pointers into its own region).
+
+**KNOWN GAP, x64 parked windows.** `SAVE-CTX` spills RBX (V4) into the actor
+STRUCT (+0x20), which is in the band and therefore OUTSIDE the parked window
+`[SP, stack_base)`.  A Lisp POINTER left in RBX by a parked actor is restored on
+resume but is NOT scanned or forwarded while parked, so it would dangle if its
+object moved.  It is not reachable today — `SAVE-CONTEXT` is only ever called
+from `YIELD` and `RECEIVE`, whose V4 holds a fixnum — but it is the thing to fix
+before an actor can be parked from an arbitrary call site.  aarch64 has the same
+shape for x19/x24/x25.
+
+**`net/cooperative-atomics.lisp`'s three facts still hold**, re-checked: no new
+yield site (`compile-loop`'s is still the only `(emit-ir :yield)`), no
+preemption (hosted safepoint stub still NIL), no new signal handler, and the
+hosted scheduler is COOPERATIVE and SINGLE-CORE — its only switch is an explicit
+`YIELD`/`RECEIVE`.  Linking a live actor scheduler into the hosted image does
+not change that; what would is a second CPU.
+
+The aarch64 CLI is **per-function BIT-IDENTICAL** across this work
+(`scripts/fndiff.py`: 4536/4536 identical, native byte delta +0).  Its FILE size
+grows 304 bytes, and that is not code: `build-image` embeds the image's own
+source text (`embed-source-blob`), and `mvm/gc.lisp`'s corrected comment is 301
+chars longer.  **Judge these builds per-function, never by image size.**
+
+### Per-region GC, stage 4: the collector is REENTRANT — the global collection lock is GONE
+
+`%HA-LOCKED-COLLECT-HERE` (0fdb21a) serialized every collection behind one lock
+and named three reasons.  All three are answered and the lock is removed; it is
+KEPT SWITCHED OFF (`%HA-SET-COLLECT-SERIALIZED`) so a future corruption can be
+bisected against the serialized path in the same binary.
+
+**FIRST, WHICH COLLECTOR RUNS WHERE, because it reframes the whole problem.**
+The three fixed shared words `0x10000100/0x10000108/0x10000110` belong to
+`mvm/gc.lisp`'s **Lisp** `%GC-COLLECT`, which runs on the **aarch64 SHIM path**
+and on any target with no native arm.  It is **not** what runs on the target
+that has threads: hosted x86-64 — like bare x64 and i386 — collects in a NATIVE
+trampoline (`translate-x64`'s `emit-gc-trampoline`) that keeps every
+per-collection value in **registers** (R13 free ptr, RBX from_start, RCX
+from_end, RDX stack_base, R10 scan ptr), pushed on the collecting thread's own
+stack.  It was private per CPU by construction and always was.
+
+| the lock's reason | verdict |
+|---|---|
+| three fixed shared scratch words | real, but only on the **Lisp** arm.  Now a 32-byte block **per CPU** (`%GC-SCRATCH-CELL`), threaded through the whole collector as an argument `SC` resolved once in `%GC-COLLECT`.  Zero config word = the historic block, so single-threaded images are unchanged. |
+| the shared **globals root set** | **not a race between two collectors.**  `%GC-FORWARD-SLOT` rewrites a slot only when its value points into **this** region's from-space, and two regions' from-spaces are disjoint, so two collectors' writes are disjoint.  Full argument (incl. the read side and the separate MUTATOR hazard it does *not* cover) lives in `mvm/gc.lisp`. |
+| *(not named by the lock)* the shared **BITMAPS** | **the one live defect.**  See below. |
+
+**THE BITMAP HAZARD THE LOCK WAS SILENTLY COVERING.**  One pair of bitmaps
+covers the whole heap at 1 bit / 16-byte granule.  The widest **unLOCKed**
+read-modify-write on them is `translate-x64`'s `BTS [base], idx` at 64-bit
+operand size, which by the Intel definition touches the **eight-byte unit** at
+`base + 8*(idx >> 6)` — eight bitmap bytes = **1024 heap bytes** — and it is on
+the allocation fast path.  So two regions whose boundary falls inside such a
+unit share a read-modify-write word, and a mutator in one can lose a
+collector's survivor bit in the other.  **A lost start bit is not benign**:
+`%gc-forward-slot` and `scan_word` both reject a candidate whose granule is not
+a recorded start, so the object is silently not forwarded.
+
+Measured on hosted x64 with the invariant's own oracle, **before** the fix:
+`old r1-to align mask = 2`, `old r2-to align mask = 2`, `r0 align mask = 2` —
+both carved regions' **to-spaces** were 512-aligned, because region 0's
+`space_size` was `512 mod 1024` (`+LINUX-X64-HEAP-ALLOC-START+` was `0x200`
+against a 1024-aligned midpoint) and the carve derived the to-side by adding it.
+Fixed at three layers: the boot constant `0x200 -> 0x400`, `%HA-CARVE` rounding
+both bases up to page_base's congruence (with 4 KB of headroom reserved in
+`NEW0`), and `%GC-REGION-INIT` **measuring** it into a violation ledger.
+**Align against page_base, never against from0** — from0 is whichever semispace
+is currently the from-space and it swaps on every collection.
+
+**REMOVING A LOCK IS ONLY TESTED IF THE COLLECTIONS OVERLAP IN TIME**, and
+`test/hosted-thread-gc.lisp`'s 39 checks all pass with the lock still in.  So
+the trampoline itself counts, with LOCKed instructions, at the true boundaries
+of a collection: `lock inc [cur]` / witness if `cur >= 2` at entry, `lock dec`
+at the restore label, plus a bounded **in-collection barrier** (`[barrier]` is a
+spin budget; a collector alone at entry waits for a second).  Gated `:LINUX`, so
+bare-metal x64 emission is byte-identical.
+
+**The negative control is the old lock, in the same binary, on the same
+workload** — `test/hosted-thread-gc-concurrent.lisp` (55 checks) runs it twice,
+one flag apart:
+
+| | overlap witnesses | barrier meetings | collectors inside at end |
+|---|---|---|---|
+| concurrent | **48** | **51** | 0 |
+| serialized | **0** | **0** | 0 |
+
+A serialized implementation FAILS the concurrent arm.
+`test/hosted-thread-gc-stress.lisp` (675 checks) then runs 24 whole two-thread
+rounds — 64 messages, a 2000-cons chain live on every actor, a forced collection
+per message on both threads: **3120 collections, 1541 witnesses, 1978 barrier
+meetings, zero chain-survival failures, zero foreign refs, zero alignment
+violations.**
+
+**AND THE HONEST THROUGHPUT ANSWER: on this workload there isn't one.**  The
+flag exists so the two paths can be MEASURED, so they were — 12 rounds x 64
+messages x 2 threads x 2000-cons chains, barrier off, same binary:
+
+| | wall (3 reps) | overlap witnesses |
+|---|---|---|
+| concurrent | 3.36 / 3.25 / 3.31 s | 528 / 522 / 517 |
+| serialized | 3.21 / 3.45 / 3.25 s | 0 / 0 / 0 |
+
+Indistinguishable, and that is expected rather than disappointing: a forced
+collection of a 16 MB region holding ~2000 live conses takes microseconds, so
+the run is dominated by message passing and chain walking and the serialized
+arm almost never actually blocks.  **Removing the lock bought correctness and
+structure, not throughput on this workload** — the throughput case needs
+regions large enough that a collection is long compared to the interval between
+them.  Do not quote a speedup here; there isn't one to quote.
+
+**Two things the 10x runs found, both mine and not the collector's:**
+- **Heap-window uniformity must not be asserted on a hosted target.**
+  `%GC-HEAP-WINDOW-UNIFORM-P` measures the precondition of the *Lisp*
+  collector's torn-read argument (two 32-bit stores).  Measured over 40 fresh
+  processes, region 0 had both semispaces in one 4 GiB window in **26** — the
+  ~1.8 GB mmap straddles a boundary about a third of the time under ASLR.  It
+  bounds nothing on x64 (the native slot rewrite is one aligned 8-byte store),
+  so the test reports it and asserts neither.  The useful conclusion: making the
+  **Lisp** collector concurrent on a hosted target needs a 64-bit store, not a
+  layout assumption.
+- **The message log would have run into the per-CPU block.**  0x800 bytes at
+  `band+0x800` = 64 entries, with `PERCPU-DATA-BASE` immediately above; nothing
+  bounded the index.  Unreachable at NMSG=48, found while sizing the stress.
+  `%HA-LOG-CAP` now bounds both writers.
+
+**EXECUTED, NOT MERELY COMPILED.**  x86-64 cannot run `%GC-COLLECT`, so the Lisp
+arm is driven on the one bootable target that can:
+`MODUS_RPI_GC_SHIM=1 sbcl --script mvm/build-rpi-cl-repl.lisp` turns the native
+aarch64 collector off so every gc-check lands in the shim, which CALLs
+`%GC-COLLECT`.  Under `qemu-system-aarch64 -M raspi3b`:
+`(%gc-forced-stress 2000 5)` → `(1 6 2000 1999000 0 5)` (the value documented
+for that image on its *native* arm) and `(%gc-forced-stress 500 3)` →
+`(6 9 500 124750 0 3)`; violations 0.  Default OFF — the shipping image is
+byte-identical.  The per-CPU **addressing** is separately exercised on the
+threaded target: thread 1 gets scratch entry 0, thread 2 entry 1, +32 bytes.
+
+`build-checks.lisp` CHECK G now fails the build if `mvm/gc.lisp` still spells
+`0x10000108` or `0x10000110` as a literal — verified by reintroducing one.
+
+**AND THE ALIGNMENT LEDGER HAS A POSITIVE CONTROL**, because after the fix it
+reads zero everywhere, which means its increment path had never executed — the
+same "a check that can only answer 0" trap 0fdb21a caught in its own checksum.
+`%HA-ALIGN-CONTROL` initialises a throwaway block five times (aligned, then
+from / to / size / all-three nudged by exactly the 512 the shipping carve was
+off by) and the test asserts masks `0 / 1 / 2 / 4 / 7` and that
+`%GC-REGION-INIT` counted **4 of 5**.
+
+### Threads become USABLE: the shared runtime tables, blocking receive, mutex/condvar, SLEEP
+
+Stage 4 gave hosted x86-64 two real OS threads with independent, concurrent
+collections.  What it did NOT give them was the ability to run **Lisp**.  Every
+threaded selftest's header says the workload touches "arithmetic, raw memory
+access and message passing only — no FORMAT, INTERN, EVAL, or symbol/keyword
+literal", and that restriction was the **ceiling**, not an accident.  Four
+things, in the order they matter:
+
+**1. THE SHARED TABLES ARE LOCKED, AND THE LOCK ALSO CHOOSES THE HEAP.**  The
+globals hash table (`0x10000080`), the symbol / keyword / package intern tables
+(`0x10000088` / `0x10000148` / `0x10000170`) and `%MACRO-PKG-*` are one set of
+shared mutable structures.  A concurrent `PUTHASH` is not merely a lost entry:
+two threads that both miss the same `GETHASH` both allocate a symbol and both
+store it, so **`(eq 'foo 'foo)` stops holding across threads**.
+
+`%RT-ENTER` / `%RT-LEAVE` (mvm/prelude.lisp) wrap `SYMBOL-VALUE`,
+`SET-SYMBOL-VALUE`, `%INTERN-SYMBOL-PKG`, `%INTERN-KEYWORD` and the three
+`%MACRO-PKG-*`.  They are a **gate on one BSS word (`0x10000DB8`) plus two no-op
+bodies**; nothing writes the word unless a program declares it is running Lisp
+on more than one thread, so every other image — bare metal, the four ANSI gate
+runners, the aarch64 and i386 CLIs, an ordinary `./modus` — pays one 32-bit load
+and a branch.  The hosted x64 image overrides the two bodies
+(net/hosted-sync.lisp) with a **recursive** futex mutex (recursive because
+interning reaches globals and `SYMBOL-VALUE` takes the same lock; ownership is
+the CPU id, not `gettid`, so `%RT-THREADS-ON` refuses unless per-CPU storage is
+on).
+
+**A LOCK ALONE IS HALF THE FIX, and the other half is the hazard mvm/gc.lisp
+records as out of scope.**  A Cheney collector scans only what it **copies**, so
+a table living in region 0 is never walked into by thread B's collector — and a
+symbol B allocated in B's own region, whose only reference is that table, is not
+forwarded.  It is garbage the instant B collects.  So the locked section makes
+**region 0 the active heap** (`%GC-REGION-ENTER` parks the thread's own
+allocation pointer/limit and loads region 0's) and puts the thread back on the
+way out; under the lock exactly one thread is in region 0, so its single parked
+frontier is not a shared pointer two CPUs read.
+
+***PRECONDITION, MEASURED NOT ASSUMED: region 0 must not collect while this is
+in use.***  Its root window ends at the **process** stack base, which is not
+where thread 2's roots are.  It is ~840 MB after the carve and the interned
+universe is small; `test/hosted-thread-lisp.lisp` requires region 0's collection
+count **unchanged**, so a workload that outgrew this FAILS rather than corrupts.
+Making region 0 collectable under threads needs a stop-the-world handshake with
+per-thread root windows — **not done**.
+
+**ORDERING TRAP:** `%RT-LEAVE-LOCKED` must not decrement the depth to zero until
+**after** the region is restored.  `%GC-REGION-ENTER` is ordinary compiled Lisp;
+anything it touches that the compiler resolved as an implicit global becomes a
+`SYMBOL-VALUE` call, which takes this same lock.  At depth 0 that nested acquire
+sees itself as the outermost holder, restores the region again and **unlocks** —
+and the outer frame then unlocks a mutex the other thread owns.
+
+**2. BLOCKING `RECEIVE`.**  `RECEIVE`'s blocking arm used to release the
+scheduler lock and then call the idle loop — but from the instant the lock drops
+the actor is claimable by another CPU, and this CPU is still standing on its
+stack.  The arm is now `AP-SCHEDULER-BLOCKED`, entered **with the lock held**
+(bare-metal behaviour unchanged: it is the two lines `RECEIVE` used to run
+inline).  Hosted, it `RESTORE-CONTEXT`s into the thread's own scheduler context,
+which moves RSP off the actor's stack and only then releases, because
+`+OP-RESTORE-CTX+` zeroes the lock after the stack switch.  `%SCHED-RUN` parks
+on a futex; `WAKE-IDLE-AP` — already called by `ACTOR-SPAWN` and
+`MAILBOX-ENQUEUE-AND-WAKE`, and previously `0` — is the wake.
+
+**The wake word is a STATE written with XCHG, not a sequence counter.**
+Incrementing a sequence is a read-modify-write and this ISA has an unconditional
+exchange but no atomic add, so two wakers could write back the same value and a
+stale writer could restore exactly the value a not-yet-parked idler is about to
+wait on.  Idler `XCHG(wake,0)` **before** looking at the queue; waker
+`XCHG(wake,1)` **after** enqueuing.
+
+**3. MUTEX / CONDVAR ON FUTEX(2), WITH NO NEW INSTRUCTION.**  The textbook futex
+mutex uses CAS to move 1 → 2 without disturbing 0.  `+OP-ATOMIC-XCHG+` is an
+unconditional exchange, so the three-state protocol writes 2 **unconditionally**
+and reads what was there; the direction it errs in is a wake nobody needs.  The
+condvar avoids an atomic increment by **requiring the associated mutex across
+`%COND-SIGNAL`** (as pthreads permits), which makes the sequence counter
+ordinary protected code.  **No `LOCK CMPXCHG` was added and none is needed.**
+`%MUTEX-LOCK` parks with a 20 ms timeout as a *safety net* — a lost wake would
+otherwise be a hang, the one failure mode that tells you nothing —
+and `%FUTEX-TIMEOUTS` counts every expiry so "no wake was lost" is asserted.
+
+**4. `SLEEP` WAS `(defun sleep (n) nil)`.**  It is now a restarting
+`nanosleep(2)`; restarting is not optional, because this image installs signal
+handlers and a non-restarting SLEEP would sometimes do nothing at all.
+
+**MEMORY:** one 8 KB `mmap` (the *thread page*) addressed from **one** BSS word
+(`0x10000DA8`, with `0x10000DB0` its init lock) — per-CPU timespecs, per-CPU
+scheduler contexts, the scheduler globals, and test scratch.  Not the carved
+actor band (SLEEP must work with no actor system) and not a Lisp global (a
+global lives in the very table a second thread must not be mutating).
+
+**A REAL BUG FOUND ON THE WAY: `SPIN-LOCK`'s test-and-TEST-and-set inner loop
+was a no-op.**  It spun on `(zerop (mem-ref addr :u64))`, and a `:u64` load hands
+the machine word back **as a tagged Lisp value** — so a held lock, raw 1, read
+that way is Lisp 0 and `zerop` said UNLOCKED every time.  The acquire
+degenerated into an unbounded XCHG hammer.  `:u8` fixes it (a `:u8` load is
+tagged on the way out, so the value IS the raw byte; big-endian degrades to
+today's behaviour).  Measured with a busy-polling actor on one thread and a
+sender on the other: ten sends cost **2.0 s** of extra wall time typically and
+**260 s** in the worst run; with the read-only wait, **0.1 s**.
+
+**ACCEPTANCE (all 10-of-10 runs):**
+
+| test | checks | headline numbers |
+|---|---|---|
+| `test/hosted-thread-lisp.lisp` | 29 | 2 threads x 300 iterations of intern / FORMAT / globals / define-and-call / cons; 12 forced collections each; region 0 at **0** collections; 624 lock acquisitions, 24 contended; 0 futex timeouts |
+| `test/hosted-thread-lisp-unsync.lisp` | — | **the negative control**: same workload, gate OFF.  10/10 FAIL — 6 SIGSEGV, 4 TYPE-ERROR aborts, one run dumped the symbol-name table as garbage |
+| `test/hosted-blocking-receive.lisp` | 29 | idle window: blocking **wall 1000 ms / CPU 0 ms**, polling **wall 1000 ms / CPU 997 ms** |
+| `test/hosted-mutex.lisp` | 18 | negative control 338187 of 600000 survived (**261813 lost**); under the mutex exactly 600000; condvar wait wall 300 ms / thread CPU 0 ms |
+| `test/hosted-sleep.lisp` | 13 | sleeping 400 ms -> wall 400 / cpu 0; spinning 400 ms -> wall 400 / cpu 398 |
+
+**CORRECTION (2026-08-23, measured): `test/hosted-thread-lisp.lisp` IS NOT
+10-OF-10.  IT IS ABOUT 27 OF 30, AND IT WAS ALREADY.**  Run 30 times in a row
+rather than 10, it aborts roughly one time in ten with an unhandled
+`PROGRAM-ERROR` out of `%TL-SELFTEST` (occasionally a SIGSEGV) — **before it
+prints a single section header**, so the failure is inside the two-thread
+workload and not in the reporting.  When that happens the process becomes an
+**unreapable zombie**: the main thread dies through a path that ends only the
+thread, thread 2 is still parked in `futex_wait` and nothing wakes it, so the
+leader stays `Z` with one live task and any pipe reading its output never sees
+EOF.  A harness that runs this test through a pipe therefore HANGS rather than
+reports.
+
+**It is pre-existing, and that is measured, not assumed.**  The same 30 runs
+against the binary built from `166fa1b` — the commit before the socket work —
+score **27 of 30 with the identical signature**, against **27 of 30** for the
+binary after it.  The socket work is not implicated (this test never opens a
+socket) and neither is anything else recent; the "all 10-of-10" line above was
+written from ten-run samples, which is simply too few to see a 1-in-10 event
+reliably.  **Two things to fix, and they are different bugs:** the
+`PROGRAM-ERROR` itself, and the teardown that leaves thread 2 parked forever
+when the main thread aborts.
+
+**THE TEARDOWN BUG IS FIXED (2026-08-23).  IT WAS `exit` WHERE `exit_group` WAS
+MEANT, IN THREE PLACES, AND IT WAS NEVER ABOUT THIS TEST.**  On x86-64 syscall
+**60 is `exit`** — it ends only the CALLING THREAD — and **`exit_group` is 231**
+(93 vs 94 on the AArch64 generic ABI, 1 vs 252 on i386).  Every comment in the
+tree asserted the opposite.  In a single-threaded image the two are
+indistinguishable, which is exactly why it stood: `./modus` had no second thread
+until this campaign.
+
+The load-bearing one was **not** `sys-exit` but the **SIGSEGV/SIGBUS/SIGFPE/
+SIGILL stub** that `translate-x64.lisp` emits for TRAP `#x0520`: its
+"no handler-case is active" arm ended with `mov eax,60; syscall`.  So ANY
+threaded modus program that faults on ANY thread with nothing armed to catch it
+left the group leader an unreapable `Z`, its sibling parked in `futex_wait` with
+nobody left to wake it, and every pipe reading its output blocked forever.  The
+observable failure was not a crash report but an infinite hang — the one mode
+that tells you nothing.  Fixed in the x64 stub (231) and the identical aarch64
+stub (94), plus `sys-exit`/`halt` in all three CLI arch slots.
+
+**NOT changed, because it is correct:** the clone child's own epilogue in the
+`#x0531` stub (`call rbx; xor edi,edi; mov eax,60; syscall`).  A worker thread
+that finishes SHOULD end only itself.
+
+**MEASURED, same binary, same workload.**  Before: failures were `rc=124`
+(the harness timeout — a hang).  After: **every** failure is `rc=139`, a clean
+immediate process death, and 50 consecutive runs produced **no hang at all**.
+`test/run-thread-exit.sh` is the regression, and it asserts only that every run
+TERMINATES — deliberately not that every run passes, because the second bug is
+still open.
+
+**THE SECOND BUG IS NOT FIXED, AND IT IS THE CONCURRENT FORCED COLLECTION.**
+**— FIXED, and it was not the collection: see THE PER-THREAD WINDOW below.  The
+standing suspects named at the end of this section were right.  Kept as written
+because the bisect that localised it is the reason the fix was findable.**
+Localised by varying only `*gcevery*` from the script, which needs no rebuild:
+
+| arm | forced collections | result |
+|---|---|---|
+| `(%tl-selftest 0 300 100000)` | none — `since` never reaches the threshold | **60 of 60 clean** |
+| `(%tl-selftest 0 300 25)` | 12 per thread (the shipping test) | **54 of 60** |
+| `(%tl-selftest 0 50 25)` | 2 per thread | 25 of 25 clean |
+
+Remove the collections and the failure disappears entirely.  The fault itself is
+a **corrupted control transfer on the MAIN thread**: with a temporary dump wired
+into the stub's exit arm (`MODUS_FAULT_DUMP=1`; ptrace is blocked on the dev box
+at Yama `ptrace_scope=2`, so there is no gdb and no strace), all four captured
+faults show `RSP` on the PROCESS stack and a jump either to address **0** or to
+an address **inside that same stack**, with `si_addr = RIP` — a fetch fault on a
+return address or handler frame that is no longer valid.  `RAX` reads
+`0xffffffffffffff24` in every one, which is tagged `-110` = `-ETIMEDOUT`, i.e.
+the thread had just come back from a timed-out futex park.
+
+**Serializing the collections does NOT fix it**, and that is the useful negative:
+with `(%ha-set-collect-serialized 1)` — the flag that exists in-tree for exactly
+this bisect — the rate is unchanged at **54 of 60**.  So this is not two
+collectors overlapping with each other; it is what a collection does with
+respect to the OTHER thread's Lisp work.  The standing suspects are the two
+pieces of shared BSS named below that are neither tables nor per-thread: the
+**multiple-value return buffer at `0x10000090`** and the **handler-frame stack at
+`0x10000400`** (one depth counter, one frame array, one armed-frame slot at
+`0x10000180`) — a stale or half-written frame restored by a pop is precisely a
+jump to a dead stack address.  (The serialized arm additionally reintroduces a
+hang of its own, unexplained, on a path that is not the shipping default.)
+
+**WHAT IS STILL SERIALIZED, AND WHY.  — The two pieces of shared BSS named
+here are PER-THREAD NOW (see THE PER-THREAD WINDOW below); the whole-iteration
+critical section in `test/hosted-thread-lisp.lisp` has NOT been narrowed, so
+this paragraph still describes that test.**  `test/hosted-thread-lisp.lisp` holds the
+runtime lock across the whole **Lisp-level** work of an iteration, not just the
+table calls.  Per-call locking is enough for the **tables**, but FORMAT and the
+printer also touch two pieces of shared BSS that are neither tables nor
+per-thread: **the multiple-value return buffer at `0x10000090`** (one buffer for
+every CPU) and **the handler-frame stack at `0x10000400`** (one depth counter,
+one frame array).  Making those per-thread means moving addresses the *compiler*
+bakes into every emitted `MULTIPLE-VALUE-BIND` and every function epilogue on
+four back-ends — its own campaign, and the next real obstacle.  The consing and
+the forced collections **are** genuinely concurrent.
+
+**Runtime EVAL / `compile` on a second thread was NOT attempted.**  "Defining a
+function" here means registering a fresh name in the shared symbol-function
+table and calling back through it — the table hazard, not the compiler's own
+globals.
+
+### THE PER-THREAD WINDOW: the MV buffer and the handler-frame stack stop being one copy per process
+
+**THIS CLOSES BOTH OPEN THREAD DEFECTS ABOVE, AND THEY WERE ONE DEFECT.**  The
+"second bug" (a fault during a concurrent forced collection, 54 of 60) and the
+residual hang were the same thing: **the handler-frame stack**.  Three pieces of
+the low BSS are state of the RUNNING COMPUTATION held one copy per PROCESS:
+
+| slot | what | failure mode under two threads |
+|---|---|---|
+| `0x10000090` / `0x10000098..0x10000138` | MV count + up to 21 extras | a wrong ANSWER — the producer stores in its epilogue, the consumer reads at the call site |
+| `0x10000150` | dynamic nargs | an `&rest` callee reads the other thread's caller's count |
+| `0x10000180..0x1019F`, `0x10000400..0xC0F`, `0x10000C10..0xC2F` | armed handler frame, frame stack + depth, longjmp scratch | a wrong JUMP — A arms, B arms over it, A's next unwind restores B's frame and lands **on B's stack** |
+
+That last row is exactly the captured fault signature: `RSP` on the process
+stack, a jump either to **0** or to an address **inside that same stack**.
+
+**THE MECHANISM IS A SEGMENT BASE, NOT A NEW ADDRESS.**  The compiler marks a
+`LOAD`/`STORE` whose address is provably a window slot — a new **width bit**
+(`+WIDTH-TLS-BIT+`; widths 4..7 are widths 0..3 plus "this is a window slot"),
+chosen over a new opcode because the address is already in a register by then,
+so the whole change is one prefix byte at one instruction rather than a new
+opcode number across four translators, an interpreter and the assembler.
+`translate-x64` turns the mark into an **FS override**.  The raw-asm sites carry
+the same prefix: SETJMP, LONGJMP, `__handler_push`/`__handler_pop`, the
+SIGSEGV/SIGBUS/SIGFPE/SIGILL stub, SET/GET-NARGS, and both GC trampolines'
+MV-extras root scan.
+
+**WHY FS, AND WHY NOTHING NEEDS INITIALISING.**  GS is already the per-CPU
+segment (`PERCPU-REF/-SET`), and the two must not fight.  A fresh Linux process
+has **FS base 0**, so `FS:[0x10000180]` *is* `[0x10000180]` — same word, same
+address, one byte longer.  A mode word would have had to be written before the
+first `MULTIPLE-VALUE-BIND`, and the first `MULTIPLE-VALUE-BIND` happens during
+boot.  A worker issues one `arch_prctl(ARCH_SET_FS, block - 0x10000000)` as its
+first act.  The self slot at `0x10000C30` holds **the base, not the block**, for
+the same reason: the main thread's is BSS zero and correct.
+
+**WHAT IS DELIBERATELY OUT OF THE WINDOW, because a wrong answer is silent:**
+`0x10000148` (keyword table), `0x10000158` (intern counter), `0x10000160/68`
+(code bounds), `0x10000170` (package table), `0x10000080/88` (globals alist,
+symbol table) sit inside the same address range and are process-global — a
+per-thread copy of the code bounds reads zero and breaks `FUNCTIONP` on thread
+2.  The window is an explicit **SET** of slots, not a range.
+`+CLOSURE-ENV-ADDR+` is out too: on x86-64 the closure environment is **R13**.
+
+**EVERY OTHER IMAGE IS UNCHANGED BY CONSTRUCTION.**  Compiler flag off = the bit
+is never emitted; back-end flag off = no prefix and widths 4..7 mask to 0..3;
+aarch64/i386/interp mask unconditionally.  Only `build-generic-cli` sets both.
+The one hand-computed length in the tree — SETJMP's `lea rax,[rip+N]`, which
+counts bytes to the end of its own trap block — is **15 not 14** when the window
+is on.
+
+**MEASURED, `test/hosted-thread-lisp.lisp`, 100 runs each, same harness
+(`test/classify-thread-lisp.sh`):**
+
+| | pass | clean death | ran-but-failed | HANG |
+|---|---|---|---|---|
+| `c187941` (before) | 91 | 6 | 1 | **2** |
+| after | **100** | 0 | 0 | **0** |
+
+**ACCEPTANCE:** `test/hosted-mv-handler.lisp`, 24 of 24 — two threads, 400
+iterations each, a forced collection every 25, per iteration a TRUNCATE each
+thread reconstructs, a three-value return checked in full, an unwind through
+`handler-case`, a NESTED unwind whose inner handler itself unwinds, and a
+three-value return ACROSS an armed `handler-case`.  Both barrier timeouts 0.
+**And the fix removed must fail:** `test/hosted-mv-handler-unsync.lisp` is the
+same binary and workload with MODE 1 (thread 2 skips `%TLS-INSTALL`) — **3 of 3
+died rc=139**.
+
+**THAT CONTROL IS PROBABILISTIC, NOT DETERMINISTIC — CORRECTED 2026-08-23.**
+The damage is a race between two threads over one window, so a run in which
+they never interleave badly comes back CLEAN.  Independently measured over 12
+runs: **11 detected the missing fix, 1 survived**.  (A later 12-run batch on
+the N-regions binary scored 12 of 12; same coin, different toss.)  A single
+clean run of this control is therefore not evidence that the fix is
+unnecessary.  Read the RATE over at least a dozen runs, never one result.  The
+"3 of 3" above is a sample too small to have shown this and should be read that
+way.
+
+**BOUNDARY, stated:** the compiler baked *into* the image keeps `*TLS-WINDOW*`
+nil, so a function compiled by the RUNTIME JIT emits absolute window accesses.
+Identical on the main thread (base 0), wrong on a worker.  Runtime EVAL on a
+second thread was never attempted anyway.
+
+### N threads, and spawn takes a CLOSURE
+
+`%SPAWN-THREAD` took a **raw native entry address**, and
+`net/hosted-actors-post.lisp` had one stack, one thread block and one TID word —
+**exactly two OS threads**, and a body that had to be a zero-argument top-level
+`DEFUN`.  A closure could not be a thread body, so a thread could carry **no
+state of its own**.
+
+Now a table of **16** threads, each with its own stack, per-thread window (FS),
+per-CPU block (GS), TID word, and a **Lisp closure** as its body.
+`%MAKE-NATIVE-THREAD` takes a function and returns a handle;
+`%NATIVE-THREAD-ALIVE-P` / `%JOIN-NATIVE-THREAD` read the TID word **the kernel
+clears** on exit, not a flag the thread set about itself.
+
+**How a closure reaches a thread that cannot be passed an argument:** the clone
+stub enters the child with a bare `call rbx` on a fresh stack.  So the child is
+always the same zero-argument **trampoline**, and what varies is a **slot
+number** it picks up from the table.  Spawning is serialised by a lock and a
+handshake — publish slot, spawn, wait for the child's ack — so "which slot am
+I?" has one answer while any child is reading it.  The child acks **before**
+running the body: the ack means "I have read my slot".
+
+**Order inside the trampoline is load-bearing:** the per-thread window FIRST
+(until it returns, the thread's values and handler frames are still the
+spawner's — cloned without `CLONE_SETTLS`), then per-CPU block and CPU id, then
+the closure.
+
+The 16 per-CPU blocks and the thread table live in the thread page, grown 8 KB →
+336 KB; nothing at a lower offset moved.  The actor band only ever had room for
+two per-CPU blocks.
+
+**ACCEPTANCE:** `test/hosted-many-threads.lisp`, 12 of 12 — eight threads, eight
+closures over eight different captured values, all eight through a spin-budget
+barrier with **0 timeouts**, each summing its OWN K 200000 times and required to
+produce exactly `K*200000`, and all eight gettids / CPU ids / window bases
+pairwise distinct and none the driver's.
+
+**THE NEXT THING IN THE WAY, and it is not the thread layer:** a thread that
+**allocates** needs a **GC region** of its own, and `%HA-CARVE` produces exactly
+**two** out of region 0.  So 16 threads get everything except a region, and the
+eight-thread body is fixnum arithmetic, raw memory and syscalls.  Carving N
+regions is a change to the carve.  Until then a thread-per-client server can
+have its threads but not its conses.
+
+### Sixteen regions, one per thread — a thread that can cons
+
+`%HA-CARVE` now produces **one region per thread slot** (`%HA-MAX-REGIONS` = 16),
+each with its own semispace pair, its own 64-byte control block at band
+`+0xA000 + 64i`, its own root window bounded by **that thread's** stack, and its
+own collection count.  `%HA-FIT-REGIONS` decides how many the heap affords —
+sixteen at 896 MB semispaces, **never fewer than two**, so an image that only
+ever afforded the historic pair carves the historic pair at the historic
+addresses and `*HA-R1-FROM*` / `*HA-R2-FROM*` still name them.  `%THR-MAX-THREADS`
+is now *defined as* `%HA-MAX-REGIONS`, so a slot without a region cannot exist.
+
+**A thread gets its heap exactly when it can have one.**  The spawner
+initialises the slot's region before the clone (it is the side that knows the
+stack it just mapped, and the only side that may compute the metadata scale);
+the trampoline adopts it *after* stamping its CPU id, because which
+active-region cell it writes comes from that stamp.  All of it is gated on
+per-CPU active-region storage being ON — with the mode word off, every
+`%GC-SET-REGION` writes one shared word.  Mode off ⇒ no region ⇒ this layer
+behaves exactly as it did.
+
+**ACCEPTANCE:** `test/hosted-many-regions.lisp`, **106 checks**.  Eight threads,
+eight heaps, twelve forced collections each, all eight inside one barrier at
+once; each block's own count 0 → 12 (eight counters, not one); worker *i* holds
+400+7*i* links and must walk back **its own** answer, so eight different
+numbers; with the workers gone the driver collects its own region twice and
+every worker's heap **and** control block is bit-for-bit identical across it,
+with the checksum asserted **non-zero** first and all eight asserted
+**distinct**; `%GC-COUNT-FOREIGN-REFS` over all **56 ordered pairs** = 0 with a
+positive control of 1; region 0 collected **0** times; 85 collector entries
+while another collector was already inside.
+
+**Two defects the test found, both real.**  (1) The per-thread record was 64
+bytes and the heap fields did not fit — a region control block written at
+`rec+0x40` landed on the *next* record's STATE word, so eight threads came back
+on slots 1,3,5,…,15 and four of the audited regions were never initialised.
+Records are 128 bytes now.  (2) Eight identical chains give eight **identical**
+checksums: `%GC-SUM-RANGE` folds to 24 bits and the regions are 16 MB = 2^24
+apart, so the only thing that differs between two live heaps is exactly what it
+masks away.  "Region B is unchanged" would have held if B held C's data.
+
+### The sb-thread / sb-bsd-sockets surface, and two compiler bugs it exposed
+
+`net/sb-thread-shim.lisp` and `net/sb-sys-shim.lisp` are the **SBCL
+compatibility surface** glass asks modus for — `SB-THREAD`, `SB-BSD-SOCKETS`,
+`SB-POSIX`, `SB-SYS`, `SB-ALIEN`, and `SB-EXT` (which **did not exist** in this
+image: measured, `(find-package "SB-EXT")` ⇒ NIL, while glass says
+`sb-ext:posix-getenv` 34 times).  Both are **evaluated at boot from a baked
+source string**, like `net/genera-compat.lisp` and for one more reason: these
+packages exist ON THE HOST AND ARE LOCKED, so merely *reading*
+`sb-thread::threadp` host-side is a package-lock violation.  `MODUS_NO_SB=1`
+skips both.  The features pushed are `:SB-THREAD` and `:SB-BSD-SOCKETS` and
+**not** `:SBCL`.
+
+**ACCEPTANCE:** `test/hosted-sb-thread.lisp` (44 checks) and
+`test/hosted-sb-sockets.lisp` (52 checks).
+
+**THE JIT DID NOT KNOW ABOUT THE PER-THREAD WINDOW.**  The runtime co-init set
+`*X64-TLS-WINDOW*` (the translator half) and **not** `*TLS-WINDOW*` (the
+compiler half, which is what *sets* the width bit).  So every JIT-compiled
+`MULTIPLE-VALUE-BIND`, `HANDLER-CASE` and `UNWIND-PROTECT` reached the MAIN
+thread's window from whatever thread it ran on.  Measured before the fix: a
+JIT-compiled thread body whose whole content was `(handler-case 222 (error (c)
+-1))` died with an MVM CALL-IND through a non-callable target, while
+MULTIPLE-VALUE-BIND and LOOP in the same position were fine — the shape of a
+shared **handler-frame stack**.  One `setq` in `mvm/build-cli-common.lisp`.
+
+**`SYSCALL3` FROM JIT-COMPILED CODE RETURNS THE SYSCALL NUMBER** when a global
+read is in the same function.  Measured, no shim involved:
+
+```
+(defvar *a* <an address>)
+(defun f3 () (syscall3 39 *a* 0 0))            => 39      ; NOT the pid
+(defun f4 (x) (syscall3 39 x 0 0))             => 804095  ; correct
+(defun f2 () (let ((a *a*)) (syscall3 49 41 a 16))) => 49
+(defun f1 (fd a len) (syscall3 49 fd a len))   => -9 (EBADF), correct
+```
+
+The syscall IS issued; the RESULT is wrong, and a non-negative wrong result is
+indistinguishable from success to a caller checking for `-errno`.  That is how a
+`socket-bind` that appeared to succeed left a socket bound to nothing.
+**NOT FIXED.**  Routed around: the shim issues no syscalls at all, and
+`net/hosted-sockets-post.lisp` gained an AOT `%SBS-*` floor it calls instead.
+
+**`(LISTEN stream)` ON A DRAINED SOCKET ANSWERED T** — fixed, via a
+`%FD-INPUT-READY-P` seam whose conservative default lives where `LISTEN` can see
+it (`mvm/cl-fileio.lisp`) and whose real zero-millisecond `poll(2)` lives where
+`poll` can be called (`net/hosted-sockets-post.lisp`).
+
+**THE CEILING, MEASURED.**  8 threads x 20 000 locked increments through the AOT
+primitives is EXACT, five batches running, slots and regions reused correctly.
+The same 8 threads at 2000 iterations **through runtime-JIT-compiled code**
+fault NON-DETERMINISTICALLY inside the MVM (`LONGJMP with no active
+handler-case`, `unknown opcode #x4 at PC N`).  Region 0 collected **zero** times
+in every such run, so it is not the documented region-0-from-a-worker-stack
+hazard; not thread count (4 threads faults too), not slot reuse, not the futex
+primitives.  It is bounded to **calling a runtime-JIT-compiled function from a
+worker thread, at a rate**, and it is the ceiling that stands between the shim
+and running glass.
+
+### GLASS'S OWN RFB SERVER RUNS ON MODUS AND SHAKES HANDS WITH A REAL VNC CLIENT
+
+Four things, in the order they were found, and one wall.
+
+**THE SHIM WAS PORTABLE-SHAPED IN ITS ARGUMENTS AND SHIM-SHAPED IN ITS
+INITARGS.**  `net/sb-sys-shim.lisp`'s socket class named its slots `sock-type` /
+`sock-protocol` — correctly, because `:type` is also a DEFCLASS slot option —
+and then named its INITARGS after the slots.  An initarg is not the slot's name
+and is not ours to choose: `sb-bsd-sockets` spells it `:TYPE`, and glass writes
+`(make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)` five
+times.  Every one died at the first socket a real program opened.  The slots keep
+their names; the initargs are now `:TYPE` and `:PROTOCOL`.
+
+**AND THE DESCRIPTOR IS OPENED AT MAKE-INSTANCE, WHERE SBCL OPENS IT.**  The
+first draft opened it lazily and argued nothing in glass depended on the earlier
+point.  True of glass, false of the surface: `socket-file-descriptor` on a fresh
+socket answered NIL here and a descriptor under SBCL, one accessor call away.
+A shim has to be portable-shaped in WHEN, too, wherever that is observable.
+
+**FIND THE GAPS ALL AT ONCE OR PAY A BUILD EACH.**  The shim is baked into the
+image, so discovering gaps by running glass costs one rebuild per gap and only
+ever finds the gaps on the path the first client takes.
+`test/run-glass-shim-audit.sh` asks the WHOLE surface in one run, in the shape
+glass writes it (every probe is a transcription of a named call site), with
+**SBCL run first and required to score 100%** so a wrong probe is reported as a
+harness bug rather than a modus gap.  It went **22 ok / 20 GAPS -> 42 ok / 0
+GAPS** across two builds instead of twenty.
+
+**THE FILE-STREAM STAGING PAGE WAS ONE PAGE FOR THE WHOLE PROCESS, AND THAT IS
+SILENT DATA CORRUPTION.**  `mvm/cl-fileio.lisp` stages every raw read and write
+through `*IO-BUF-ADDR*`: `%FS-WRITE-BYTE` stores the byte there and then issues
+`write(2)` from it, so two threads writing to two DIFFERENT descriptors send
+each other's bytes.  **Measured: 327 680 bytes** — one RFB raw rectangle at 1280
+wide with glass's default banding — **written by one thread and read by another
+came back with 73 933 bytes wrong**, while the identical transfer on one thread
+was byte-perfect, and nothing signalled.  Fixed by making the page a SEAM
+(`%FS-IO-PAGE` in cl-fileio, historic behaviour) overridden per-CPU in
+`net/hosted-sync.lisp` by last-defun-wins — the same seam `%SOCK-IO-BUF` already
+uses, at +0x2000 in the per-CPU block.  It defers to the old page unless per-CPU
+mode is on, so a single-threaded `./modus` maps nothing new.  After it: 48 KB
+across two threads in **1 ms, zero bytes wrong**.
+
+**WHAT NOW RUNS.**  `test/run-glass-serve.sh` stands up GLASS:SERVE — glass's
+own `src/rfb.lisp`, loaded from the glass tree, on glass's own TCP-LISTEN, with
+glass's per-client reader AND sender threads — and points `test/glass-rfb-client.py`
+(Python, not modus, generating its own expected image) at it.  **The handshake
+completes end to end**: ProtocolVersion, security type None, SecurityResult,
+ClientInit/ServerInit with all ten pixel-format fields checked against glass's
+values (note `big-endian-flag` **0**, where modus's own minimal server in
+`test/rfb-static.lisp` says 1 — two different legal wires, two clients) and the
+desktop name.  17 client-side checks pass.
+
+> **SUPERSEDED — the frame arrives.** This wall fell to per-thread dynamic
+> binding; see the dynbind section below (`EMIT-DYNBIND-ROOT-SCAN`,
+> `run-glass-serve.sh` 5 of 5 with 0 pixels differing). The diagnosis in this
+> section is kept because the *ingredients-pass-in-isolation* measurements are
+> still true and still useful — what was wrong was the conclusion that the
+> nesting mattered. Do not restart from here.
+
+**THE WALL: THE FRAME NEVER ARRIVES.**  With `:WAKE NIL` the sender polls
+forever and delivers nothing; with a real WAKE the server process **dies
+outright, with no condition and no output**, immediately after the client is
+counted in.  Every ingredient passes in isolation, measured this round:
+
+* `RFB-SENDER-LOOP` itself, on a worker, producing a correct **4112-byte** Raw
+  update that a peer reads back;
+* a worker writing 4112 bytes to the SAME stream the main thread is parked
+  reading — 0 wrong;
+* timed `CONDITION-WAIT` on a worker, **200/200**;
+* `WITH-MUTEX` / `WITH-RECURSIVE-LOCK` acquired on a worker, including one the
+  main thread used first, and contended both ways;
+* a struct slot written by main AFTER a worker is already polling it — seen;
+* `FORMAT` on a worker, to `*error-output*` and to `t`;
+* a blocking `READ-BYTE` on main not starving a worker.
+
+What is left is the runtime-JIT concurrency ceiling named in the section above:
+glass is LOADED AT RUNTIME, so `rfb-sender-loop` is JIT-compiled, and it is
+called from a worker thread at 60 Hz.  `test/run-glass-serve.sh` is the thing
+that will notice when that lifts.
+
+**— WRONG ON BOTH COUNTS, AND MEASURED WRONG.  IT WAS TWO DEFECTS AND NEITHER
+WAS THE JIT.  See THE FRAME IS DESCRIBED below.**
+
+**TWO INSTRUMENTS THAT LIE, AND COST HOURS BEFORE THEY WERE CAUGHT.**
+
+* **`GET-INTERNAL-REAL-TIME` IS A CALL COUNTER, NOT A CLOCK.**  It returns 1, 2,
+  3 on successive calls and is unmoved by a real `(sleep 3)`.  So every "busy
+  wait until N ms have passed" written against it returns after N CALLS — which
+  made a worker thread look BLOCKED when it had simply not been given a
+  microsecond.  `GET-UNIVERSAL-TIME` is correct; `SLEEP` is correct (verified
+  against wall time: `(sleep 5)` costs 5 s of real time and no user time).
+  glass uses `get-internal-real-time` as a real unit throughout `rfb.lisp`.
+  **FIXED (243b265) — it is clock_gettime(CLOCK_MONOTONIC) now; see THE CLOCKS
+  ARE CLOCKS below.**
+* **`#'NAME` RESOLVES LATE.**  Saving `#'f` and then redefining `f` gives you
+  the NEW `f`, so the classic diagnostic wrapper calls itself until the stack
+  dies.  Replace outright when instrumenting; do not wrap.
+
+### THE FRAME IS DESCRIBED: the empty update was a LOOP bug, not a thread bug
+
+**THE SERVER WAS SENDING FOUR BYTES THAT MEANT "ZERO RECTANGLES FOLLOW".**  Read
+off the wire with a permissive Python client that dumps whatever arrives instead
+of asserting: `00 00 00 00` — a FramebufferUpdate header with `n-rects = 0`.  The
+client then waited forever for pixels the server had already decided not to
+describe, which is what "the frame never arrives" was.
+
+The cause is in **this repository's LOOP**, and it is CLHS 6.1.3: COLLECT,
+APPEND and NCONC are ONE accumulation category, and this LOOP gave them one
+accumulator EACH, returning whichever was declared first.
+
+    (loop for k in '(1 2 3) if (evenp k) collect k else nconc (list k k))
+      => (2)          here (before)        => (1 1 2 3 3)   SBCL
+
+That is glass's `BAND-RECTS` verbatim: rectangles short enough to need no
+banding took the COLLECT arm and were described; rectangles TALL enough to need
+banding took the NCONC arm and were **dropped**.  A 96-row framebuffer banded at
+`*MAX-BAND-ROWS*` = 64 came out as NIL.  Fixed in 6a9a72a by making the three
+kinds share one variable AND one representation (all three accumulate reversed —
+`REVAPPEND` for APPEND, which copies; `NRECONC` for NCONC, which may destroy —
+and ride COLLECT's existing closing NREVERSE).
+
+**AFTER IT**, on the wire, from `test/run-glass-serve.sh`'s own server: two
+rectangles, `(0 0 128 64)` and `(0 64 128 32)`, 49180 bytes, pixels matching the
+image the Python client generates for itself.  The 96-row screen in that test
+was chosen on purpose — a 64-row one would have needed no banding and passed
+this whole time.
+
+**AND THE SERVER STOPPED DYING.**  Before: `SIMPLE-ERROR | MVM LONGJMP (TRAP
+#x0511) with no active handler-case`, process gone.  After: server side PASS, 8
+checks, 0 failed, listener closed, fd probe unchanged.
+
+### AND THE SECOND DEFECT, BISECTED: IT IS NOT THE JIT
+
+The client still does not get the whole frame: the transfer stops at **32785
+bytes**, three bytes into the SECOND rectangle's header.
+`test/run-glass-send-worker.sh` is that stop with the RFB session removed — one
+socket, one worker, one `GLASS:SEND-RECTS`, and a Python peer that computes
+49180 itself and checks every pixel.  Four arms differing ONLY by which wrappers
+`RFB-SENDER-LOOP` puts around the call:
+
+| arm | wrappers | result |
+|---|---|---|
+| plain | none | 49180 bytes delivered |
+| tx | `(let ((glass::*tx* (list 0))) …)` | 49180 bytes delivered |
+| lock | `(glass::with-fb-locked (fb) …)` | 49180 bytes delivered |
+| **both** | the two, **nested**, as the sender loop nests them | **32785, then the process dies** |
+
+So the STOP is not the socket, not the encoder (`WRITE-RECT-RAW`'s output for
+both bands is byte-perfect written to a FILE from the same worker), not the
+thread, not the concurrent reader (measured with the main thread parked in
+`READ-BYTE` on that stream and without — no difference), and not either wrapper
+alone.
+
+**THE THREE COMPLETING ARMS ARE NOT CLEAN, AND THIS TABLE SAID THEY WERE.**
+They deliver every byte, but on SOME MACHINES exactly one pixel arrives as
+`0x000000`.  This was first written up as "every pixel correct" on the strength
+of a handful of runs on one box — a sample reported as a property, and it sent
+two people at the wrong target.  What is actually established:
+
+* index **2591** = (31,20) on one machine, in all three completing arms;
+  **2528** = (96,19) on another, in an earlier run.  **The index MOVES between
+  environments**, so it is not a fixed structural offset — not an encoder or a
+  buffer boundary.
+* the value is **ZERO both times**, and zero is what `MAKE-FRAMEBUFFER` fills
+  with, so it reads as **one lost STORE**, not one wrong value.
+* it does **not** reproduce on the second machine at all: 14 consecutive clean
+  runs of the shipping binary, plus 3 more built with `MODUS_GC_R14=33554432`
+  so collections fire constantly — and that binary was verified **byte-identical**
+  to a fresh build of the same commit, so the tree is reproducible and the
+  variation is environmental, not a build difference.
+* **`MODUS_GC_R14` IS A BUILD-TIME KNOB, NOT A RUNTIME ONE** (`build-generic-cli.lisp`
+  reads it with `posix-getenv` while building).  Setting it on the command line
+  of `./modus` does nothing and silently looks like "no collections happened".
+
+`test/glass-send-worker.lisp` now grades the FRAMEBUFFER through glass's own
+`FB-GET`, before the port is announced and again after serving, because a
+client reporting a bad pixel cannot tell a store lost while PAINTING from a
+byte lost on the WIRE.  **`FB-SELFCHECK` is the line to read**: non-zero before
+serving = the paint lost it; `bad=0` before with the client still seeing a zero
+= the encode or the transport lost it.  The client also counts every bad pixel
+now, groups them into runs and prints stream byte offsets, so "one lost store"
+and "a corrupted region" stop being indistinguishable.
+
+**AND IT IS NOT THE JIT.**  The whole family reproduces IDENTICALLY under
+`MODUS_NO_JIT=1` — three runs each, same failure, same place.  So
+`%JIT-ENTRY-FOR`'s per-region `(%gc-count)` re-bake stamp and the unlocked
+`*jit-page-cache*` are **not what is in the way**, whatever else may be wrong
+with them.  Both were standing hypotheses; both are dead.
+
+**WHAT THE EVIDENCE POINTS AT INSTEAD — the RUNTIME-LOCK REGION HOP.**  Not
+proven, and stated as a lead rather than a finding:
+
+* A hot loop reading its source array from a GLOBAL (so every iteration is a
+  `SYMBOL-VALUE`, which takes the runtime lock and hops the active region to
+  region 0) hands a worker back a `(unsigned-byte 8)` array whose element 0 is
+  the CHARACTER `#\V`.  The **identical** loop with the array hoisted into a
+  local — no hop — is correct on two successive workers.  Same binary, same run
+  length, one difference.
+* A run of that shape left a file in the working tree literally named
+  `#<?STALE-FORWARDED-191>`: a global whose value was a pathname STRING came
+  back, on a worker, as a stale forwarding pointer, and `WITH-OPEN-FILE` created
+  a file named after the printed representation of the wreck.
+* The mechanism that would explain it is already named in this file: `%RT-ENTER`
+  parks the caller's frontier and loads REGION 0's from its control block, but
+  the MAIN thread allocates in region 0 **from registers, without the lock**, so
+  the block's frontier is stale by however much main has consed since its last
+  hop.  "Two threads in region 0 with one parked allocation frontier between
+  them" is exactly what `%RT-LEAVE-LOCKED`'s own docstring says the lock exists
+  to prevent — and the lock does not cover main's ordinary allocation, because
+  region 0 IS main's heap.
+* Region 0's collection count is **0** throughout, so this is not the documented
+  "region 0 must not collect from a worker stack" hazard.
+
+The obvious shape of a fix is to stop region 0 being two things at once: either
+give the main thread a region of its own so region 0 is only ever the
+lock-protected shared heap, or give each CPU its own non-collecting slice of
+region 0 for locked-section allocation so no two threads ever share a frontier.
+Both are carve changes and neither was attempted.
+
+### — AND THAT LEAD IS REFUTED.  DO NOT CHANGE THE CARVE.
+
+It was the most substantial thing anyone had, and it is wrong.  Three
+measurements, on a reproducer that fails **8 of 8**:
+
+* **THE HOP ALONE IS HARMLESS.**  A worker taking the runtime lock 200 000
+  times — hopping into region 0 and back — while the main thread conses
+  continuously **outside** the lock: chain intact, 0 corrupted walks, rc=0.
+  If loading a stale parked frontier were the defect, this is the shape that
+  would show it.
+* **THE POSITIVE CONTROL DOES NOT FIX IT.**  Wrapping the main thread's
+  allocation in `%RT-ENTER`/`%RT-LEAVE` by hand — so no thread can be in
+  region 0 while main advances it, which is exactly what the proposed carve
+  would buy — leaves the failure **6 of 6, unchanged**.  The control was
+  verified to be real: `%RT-ENTER` is fbound and moves the lock's acquisition
+  counter at `0x10000DE0` by one.
+* **THE MAIN THREAD IS NOT INVOLVED AT ALL.**  With `MAIN_ROUNDS=0` — main
+  allocates nothing whatever after spawning — the failure reproduces
+  identically.  A two-thread heap race that survives one thread doing nothing
+  is not a two-thread heap race.
+
+The staleness *precondition* is real but narrow, and was measured rather than
+assumed: over a loop with no explicit global read, region 0's parked frontier
+moved **19 201 920 bytes** while the loop's own conses account for 3 200 000 —
+the evaluator itself hops constantly, so the block is republished far more
+often than the mechanism needs.  (`GET-ALLOC-PTR` reads **0** from evaluated
+code and cannot be used as the live frontier in a script; the control block's
+`+0x30` field is what to read.)
+
+**WHAT IT ACTUALLY IS, narrowed to one operation.**
+`test/run-worker-intern.sh` is self-bisecting — four arms, one loop, one
+worker thread, differing only in the loop body:
+
+| arm | what it does | result |
+|---|---|---|
+| cons | conses | clean 3/3 |
+| format | `FORMAT NIL` — allocates strings | clean 3/3 |
+| intern-same | INTERNs ONE name repeatedly — takes the lock, searches the shared table | clean 3/3 |
+| **intern-fresh** | INTERNs a NEW name each time — takes the lock AND **adds** to the table | **clean 0/3**, `MVM LONGJMP (TRAP #x0511) with no active handler-case` |
+
+So it is not consing on a worker, not allocating on a worker, not taking the
+runtime lock on a worker, and not searching the shared tables from one.  What
+is left is **adding** to them.  The signature is the glass sender's, exactly.
+
+**AND IT IS LAYOUT-SENSITIVE, WHICH IS NOW A PROPERTY OF THIS WHOLE CLASS
+RATHER THAN A SURPRISE.**  Whether a given arm dies moves with the LENGTH of
+the interned names and with whether the loop body reads a global:
+`(format nil "XR-~D" i)` with a literal prefix passes 5/5 where
+`(format nil "~a~D" *pfx* i)` with the same prefix in a global fails 4/4.  A
+single clean run of any of these means "not reproduced in this shape", never
+"correct" — the same lesson the pixel-2591 story taught, and the reason the
+runner defaults to three runs per arm and reports a rate.
+
+### THE ROOT CAUSE, MEASURED: a worker's INTERN puts the symbol in the WRONG REGION
+
+`%RT-ENTER` exists so that the shared runtime tables and everything reachable
+from them live in **region 0** — that is the whole argument of "A LOCK ALONE IS
+HALF THE FIX" above, and it is why the locked section hops the heap at all.
+
+**IT DOES NOT.**  `test/run-worker-xregion.sh` asks where the objects actually
+are, with `%GC-WORD-OF` for the addresses and `%GC-COUNT-FOREIGN-REFS` for the
+audit, at collection count 0 so nothing has had a chance to dangle yet:
+
+| arm | last object | its name | foreign refs, region 0's live span -> the worker's region |
+|---|---|---|---|
+| strings (control) | the worker's region | — | **0** |
+| **intern** | **the worker's region** | **the worker's region** | **508** (516 on another run) |
+
+So it is not merely the NAME STRING computed before the call, which was the
+obvious suspect: **the symbol object itself** is allocated in the worker's
+region, and region 0's tables then point at it.  That is the forbidden
+direction of the one rule per-region collection rests on, created once per
+fresh intern, and nothing enforces it.
+
+**AND IT IS FATAL RATHER THAN UNTIDY, WITH A CONTROL.**  Those pointers are not
+on the worker's stack, so the worker's own collector never updates them.  Force
+ONE collection of the worker's region after interning and the process takes
+**SIGSEGV, 3 of 3**.  The identical shape — same loop, same length, same strings,
+same forced collection, differing only in that the results are KEPT rather than
+INTERNED — survives **3 of 3**, with every object correctly moving
+(`721EE898A769 -> 721F205FF9E9`) and its re-lookup still `EQ`.
+
+That is why `intern-fresh` in `test/run-worker-intern.sh` dies and the other
+three arms do not, why it is layout-sensitive (it bites when the worker's region
+happens to collect), and why the glass sender dies with the same
+`MVM LONGJMP (TRAP #x0511)` signature: glass interns while it serves.
+
+**THE FIX IS A DESIGN QUESTION, NOT A PATCH**, which is why none was attempted:
+intern in the owning region and accept that the tables are then per-region; or
+COPY the name into region 0 and allocate the symbol there, which means the
+locked section must own the allocation rather than merely hop the frontier; or
+make the tables' region explicit and give every shared-table write a barrier.
+The audit is the acceptance test for whichever is chosen —
+`test/run-worker-xregion.sh` goes green when a worker's fresh intern stops
+leaving a pointer behind.
+
+### — AND IT NAMED THE WRONG INTERN.  THERE ARE TWO, AND THEY FAIL DIFFERENTLY
+
+The section above, and the whole per-actor-store design drawn against it, say
+`%INTERN-SYMBOL-PKG` is the operation that allocates a worker's fresh symbol in
+the worker's region.  **It is not, and it never was on this tree.**
+`%INTERN-SYMBOL-PKG` is wrapped in `%RT-ENTER`/`%RT-LEAVE`, and `%RT-ENTER`'s
+whole job is to make **region 0** the active heap for the duration — so a fresh
+symbol interned through it *on a worker* is allocated in region 0, beside the
+table at `0x10000088` that registers it, and leaves **no** region-0 -> worker
+pointer.  Measured three ways: the symbol's machine word lands below the carve
+in region 0's span while a `CONS` made on the same worker two lines earlier
+lands in the worker's region; `%GC-COUNT-FOREIGN-REFS` is unchanged across 8 and
+across 20 fresh interns; and `(%RT-ENTER)` on a worker really does move
+`(%GC-REGION)` to `0x10000040` and back.
+
+**THE OPERATION AT FAULT IS `CL:INTERN`** (`mvm/cl-packages.lisp`), which is
+under no lock at all.  Its create-new-symbol branch allocates the CL symbol
+(`%MAKE-CL-SYMBOL`), its name string and the package symtab entry in the
+**calling thread's** region and then links all three into structures that live
+in region 0 — the shared intern table **and** the package object's own internal
+symtab (`%PKG-SET-INTERNAL` of a `%SYMTAB-ADD`).  Both red tests take that path
+and neither takes the other one: `test/hosted-worker-intern.lisp`'s fatal
+`intern-fresh` arm calls `CL:INTERN`, and `test/hosted-term-xregion.lisp`'s
+symbol case reaches it through `TERM-DECODE-STEP`'s tag-6 arm.
+
+`test/run-intern-layers.sh` is the instrument — three arms, one loop, one
+worker, one process each, the audit and the spans and the direction identical
+between them, with the shared table's COUNT as the odometer so an arm cannot
+score zero by quietly interning nothing:
+
+| arm | body | clean | audit |
+|---|---|---|---|
+| `str` | K strings | **10 / 10** | 0 |
+| `low` | K fresh `%INTERN-SYMBOL-PKG` | **5 / 10** | **0** on every run that completes |
+| `cl` | K fresh `CL:INTERN` | **0 / 8** | **+44** at K=20, every run, process never dies |
+
+**SO THERE ARE TWO DEFECTS AND ONLY ONE OF THEM IS THE DOCUMENTED ONE.**
+
+* **D1, `CL:INTERN`'s cross-region pointers** — deterministic (8 of 8), linear
+  in K (+36 at K=20, +296 at K=200 on the probe this grew out of), and the
+  process never dies: it reports the number and exits on the check.  This is
+  the `29` `test/hosted-term-xregion.lisp` reports.
+* **D2, the low-level intern is lethal at about one run in two, and the
+  cross-region mechanism does not explain it** — `low` dies 5 times in 10 with
+  `MVM LONGJMP (TRAP #x0511) with no active handler-case`, the campaign's
+  headline signature, *while its audit reads zero on every run that survives*.
+  `str` at 10 of 10 rules out "any loop on a worker dies".  What `low` does and
+  `str` does not is take the runtime lock and hop the active region; that is a
+  **suspect, not a finding**.
+
+**D2 IS WHY THE OBVIOUS FIX IS NOT AVAILABLE.**  The obvious fix for D1 is the
+remedy this tree already applies to `%INTERN-SYMBOL-PKG`: wrap `CL:INTERN` in
+`%RT-ENTER`/`%RT-LEAVE` so the symbol, its name and the symtab cons are
+allocated in region 0 beside the tables that point at them.  Bracketing a
+`CL:INTERN` call site by hand — no rebuild, the definition untouched —
+reproduces the signature **at K=1, deterministically**, and a sub-bisect inside
+the create path put the death at the first `GETHASH`/`PUTHASH` on the shared
+table rather than at the allocation (`%MAKE-CL-SYMBOL` and
+`%CL-SYM-SET-PACKAGE` both complete).  **That sub-bisect is NOT reliable and is
+recorded as a lead only**: the same operations in a slightly different function
+shape pass 3 of 3, which is this campaign's documented layout-sensitivity, and
+a single run of any of these means "not reproduced in this shape".
+
+**WHAT IS THEREFORE STILL OPEN**, restated so the next attempt starts from the
+right place: the acceptance criterion is unchanged and correct (`region 0 ->
+worker` 29 -> 0), but the code to change is `CL:INTERN`, not
+`%INTERN-SYMBOL-PKG`; and D2 has to be understood first, because every proposed
+remedy for D1 — hop the region, delegate to an owner, or keep a per-actor store
+— runs on the same worker-side machinery that is killing `low` half the time
+today.  **A fix for D1 validated on a substrate that fails 5 in 10 cannot be
+told from luck.**
+
+### D2 IS NOT THE COMPILATION MODE, AND IT IS NOT THE INTERN: MAIN ALLOCATES OVER A WORKER'S OBJECTS IN REGION 0
+
+**FIRST, THE HYPOTHESIS THAT WAS LEFT STANDING IS DEAD.**  The section above
+ends by naming ONE unmeasured difference between the red `low` arm and the
+green `test/hosted-thread-lisp.lisp`: the green one's loop is AOT-compiled
+inside the image (`%TL-SELFTEST`) while the red one's is runtime-compiled
+`--script` code.  It could not be settled from a binary that did not contain
+the loop, so `net/hosted-intern-probe.lisp` puts it there — `%IP-WORKER`, a
+line-for-line copy of `test/hosted-intern-layers.lisp`'s worker, baked into the
+blob — and `test/hosted-intern-aot.lisp` runs EITHER that copy OR an identical
+script-side copy, in one process shape, from one binary, chosen by an
+environment variable.  Everything the loop is called from is runtime-compiled
+in both; the only thing that moves is where the loop was compiled.
+
+**BOTH FAIL.**  `test/run-intern-aot.sh`, 10 runs per cell, survived / died /
+hung classified separately:
+
+| mode | arm | survived | died | hung |
+|---|---|---|---|---|
+| aot | str | **10** | 0 | 0 |
+| aot | low | **0** | 9 | **1** |
+| aot | cl | 0 | 10 | 0 |
+| rt | str | **10** | 0 | 0 |
+| rt | low | **3** | 7 | 0 |
+| rt | cl | 0 | 10 | 0 |
+
+AOT is not better; on this sample it is worse, which is within this campaign's
+documented layout-sensitivity and should not be read as "AOT is worse".  The
+`cl` cells are the audit's positive control and answer **+43 (aot) / +44 (rt)**
+in the forbidden direction, so the instrument is live in both modes and a zero
+from `low` is a real zero.  **The compilation mode is not the variable, and
+glass being LOADed at runtime is therefore not what stops the frame.**
+
+**SECOND, THE STATEMENT IS NOT ABOUT INTERNING.**  `test/run-intern-shape.sh`
+removes one thing at a time from the red arm — same worker, same K, same
+`%INTERN-SYMBOL-PKG` call, one named difference each, 10 runs per arm:
+
+| arm | what it is | survived | died | hung |
+|---|---|---|---|---|
+| `bare` | the loop and NOTHING else — no audit, no count, no returned list | **3** | 7 | 0 |
+| `count` | bare + the shared table's COUNT | 0 | 10 | 0 |
+| `audit` | count + the O(heap) foreign-ref sweep (today's `low`) | 0 | 10 | 0 |
+| `list` | bare, returning a list consed in the worker's region | 0 | 8 | 2 |
+| `outer` | bare, with ONE `%RT-ENTER`/`%RT-LEAVE` around the whole loop | 0 | 8 | 2 |
+| **`main`** | **the same loop on the MAIN thread** | **10** | 0 | 0 |
+| `str` | K strings on the worker — the allocation control | **10** | 0 | 0 |
+
+So it is not the audit, not the table count, not the returned list and not lock
+granularity — and it is not `%INTERN-SYMBOL-PKG`, because the identical loop on
+the MAIN thread is 10 of 10.  What `bare` does that `main` and `str` do not is
+**allocate in REGION 0 from a thread that is not region 0's owner.**
+
+**THIRD, MEASURED IN ADDRESSES: MAIN WRITES OVER WHAT THE WORKER ALLOCATED.**
+`test/hosted-region0-frontier.lisp` has the worker allocate TWO marked conses
+in one function microseconds apart, differing in exactly one thing — `hot` under
+the runtime lock (so, region 0, which is also main's heap and which main
+bump-allocates from its REGISTERS, outside the lock) and `own` outside it (the
+worker's own region, which nothing else touches).  Both hold `123456789 .
+987654321`; the driver reads both back after the join.
+`test/run-region0-frontier.sh`, 20 runs:
+
+|  | |
+|---|---|
+| runs that reported | 17 of 20 (3 died before they could, 0 hung) |
+| the worker's **region 0** cons came back CHANGED | **5 of 17** |
+| the CONTROL — its **own-region** cons changed | **0 of 17** |
+| both changed (would mean the worker, not the region) | 0 of 17 |
+| the worker's fresh symbol landed inside the span main allocated during the worker's life | **17 of 17** |
+
+First corrupted example: `hot @ 132208071466369  car 45  cdr 84`.  Same worker,
+same function, same instant, one region apart.
+
+**AND THE STALENESS SUB-HYPOTHESIS IS REFUTED IN THE SAME FILE, WHICH IS WHY
+THAT FILE IS THE INSTRUMENT AND NOT AN ARGUMENT.**  The obvious mechanism —
+"region 0's parked frontier is BEHIND main's live one, so a worker allocates
+underneath main" — is **wrong as stated**: probed atomically inside one compiled
+function (everything passed in as arguments, because an implicit global here is
+a `SYMBOL-VALUE`, which takes the lock, which REPUBLISHES the field and
+manufactures a false answer), main's live frontier and region 0's parked
+frontier are **49 bytes apart** — one cons — and stay so.  mvm-eval hops so
+often that the field is essentially always current.  *A first version of this
+file read the two in successive TOPLEVEL forms and measured a megabyte of gap
+that was purely the evaluator's own allocation in between; that number said
+nothing and is the reason the probe is a compiled function now.*
+
+What is left is the narrower and worse thing: the two are in step **at hop
+boundaries only**.  While a worker holds the lock and bump-allocates region 0
+from the parked field, main is NOT in the lock and keeps bump-allocating region
+0 **from its own registers**, which the worker's advance never touches; and
+main's next hop parks its register value back over the worker's advance.  Two
+mutators, one region, two copies of one frontier.  That is exactly what
+`%RT-LEAVE-LOCKED`'s docstring says the lock exists to prevent, and the lock
+does not cover main's ordinary allocation because region 0 IS main's heap.
+
+**AND IT EXPLAINS THE GREEN TEST, WHICH NOTHING ELSE DID.**  `%TL-SELFTEST`
+puts the MAIN thread in a carved region of its own — `(%gc-region-enter rcb2)`
+before it spawns — so region 0 there is **nobody's mutator heap**, its frontier
+is only ever moved by lock holders, and there is no second copy.  100 of 100.
+Everything red in this campaign runs main in region 0; everything green does
+not.
+
+**WHY THIS IS NOT THE LEAD "— AND THAT LEAD IS REFUTED" ALREADY KILLED.**  All
+three refutations there are about the HOP, which allocates nothing in region 0:
+200 000 lock acquisitions on a worker are clean, 20 hops with no intern are 6 of
+6 clean, and `MAIN_ROUNDS=0` still fails.  That last one is the important
+distinction — **"main's loop does not cons" is not "main does not allocate"**:
+main is still evaluating the script, and mvm-eval allocates in region 0 on every
+form.  The claim here is about a worker that ALLOCATES in region 0, which none
+of those three shapes does.
+
+**WHAT IS NOT ESTABLISHED, STATED PLAINLY.**  (1) No fix was attempted or
+measured.  (2) The corrupted-cons rate (5 of 17) and the `bare` death rate (7 of
+10) are consistent with one mechanism but were not shown to be the same event —
+nothing here traces a specific death to a specific overwrite.  (3) The obvious
+remedy shape is the one the green test already embodies — stop region 0 being
+two things at once, by giving the main thread a region of its own so region 0 is
+only ever the lock-protected shared heap.  **CLAUDE.md warns "DO NOT CHANGE THE
+CARVE" against the refuted lead; that warning was earned against a DIFFERENT
+claim and this one has not been tested, so it is a candidate and not a plan.**
+
+### SHAPE A ("MAIN LEAVES REGION 0") IS DEAD AT ITS GATE — probed, not built
+
+The candidate above was gated before building: hop main into slot 0's carved
+region — the region the carve has always reserved for it ("SLOT 0 IS THE MAIN
+THREAD'S AND ITS REGION IS SPARE", net/hosted-actors.lisp) — mid-script, and
+measure what actually happens.  `test/hosted-mainhop-probe.lisp` /
+`test/run-mainhop-probe.sh`.  Every number below is 10 of 10 or 5 of 5,
+deterministic; the control arm (`MAINHOP_CONTROL=1`, identical script, hop and
+forced collection skipped) survives 5 of 5 with every publication row at **+0**,
+so each instrument answers both ways.
+
+**THE PARTS THAT WORK, measured (P1/P2, 15 of 15 each):** post-hop, a cons
+lands in main's region; a fresh `%INTERN-SYMBOL-PKG` symbol STILL lands in
+region 0 (the lock hop keeps routing shared allocations); FORMAT works; and
+region 0's frontier is **exactly still** under compiled lock-free work — the
+literal gate question "does main allocate region 0 outside the lock after the
+hop" is answered **zero**.  One region, one frontier: that half of shape A is
+sound.
+
+**WHAT KILLS IT: region-0-resident structures point into main's region, and
+main's region cannot collect without stranding them.**  Three witnesses, one
+mechanism:
+
+1. **Publication is pervasive and is mostly the READER (P3).**  region 0 ->
+   main's-region references, re-counted after each kind of evaluated toplevel
+   form: DEFUN +12, heap-valued DEFVAR/SETQ +13, heap-string global +15, even a
+   bare FORMAT form +14, one CL:INTERN +18 — ~12–18 per toplevel form
+   REGARDLESS of kind, i.e. it is the evaluation/read machinery itself (every
+   fresh source symbol goes through `CL:INTERN`, the D1 defect, now committed
+   by MAIN), not an enumerable set of user-visible sites.  Control: all rows
+   +0.
+2. **One FORCED collection of main's region dangles a DEFVAR'd heap value
+   immediately (P4, 15 of 15).**  `(setq *l* (list 10 20 30 40))` then one
+   `%ha-collect-here`: the argument-passed chain survives (conservative stack
+   root), the list read back through the globals table is garbage
+   (100 -> a different junk word every run).  The post-hop DEFUN and the
+   CL:INTERN'd symbol happened to survive in 15 of 15 — do not lean on that;
+   the DEFVAR is the proof.
+3. **The FIRST natural collection of main's region kills the whole script
+   (P5, 15 of 15), even when the allocating loop is compiled.**  ~48 MB of
+   `make-string` inside one compiled function -> main's 16 MB region collects
+   -> death in the LOAD machinery (`load-read-error-stops-load` /
+   `load-toplevel-form-swallowed`, TYPE-ERROR): the load loop
+   (`%load-from-stream`, mvm/ansi-bridge.lisp) reads and evals on main, and
+   the pre-hop stream/table structures in region 0 hold pointers into main's
+   region that the collection never fixes — `EMIT-GC-TRAMPOLINE` scans the
+   fixed tables' ROOT SLOTS and Cheney-walks only the collecting region's
+   to-space, so region-0 INTERNALS are never walked (confirmed by reading
+   translate-x64.lisp:5445ff against the observed deaths).
+
+**THE CONTROL IS WHAT MAKES THE MECHANISM CLAIM TIGHT.**  In the control run
+the SAME ~48 MB workload made region 0 itself collect naturally, once, with
+main inside it — **and evaluated code survived**, because when region 0
+collects, the tables are INSIDE the collecting region and the whole graph is
+forwarded consistently.  Same workload, same collector, same code — the only
+difference is whether the dangles cross a region boundary.  (Region 0 at probe
+start: 654 MB semispace, 302 MB live — so region 0's own natural collections
+are a real, occasionally-taken path today, at least under compiled code.)
+
+**CONSEQUENCE.**  Shape A as "main enters its own region at bringup" cannot
+carry an evaluator: any script that allocates ~16 MB after bringup dies at
+main's first collection, and loading glass evaluates far more than that.  It
+would pass the small reproducers and die at `run-glass-serve.sh`.  The honest
+alternatives, in order of what is now known: **shape B** — one frontier IN
+MEMORY for region 0, bumped by main and lock-holders alike (touches allocation
+codegen on the hottest path, but requires none of the above to be solved) — or
+shape A plus walking/repairing region-0 internals on every other region's
+collection, which is a collector redesign.  The D1 story is unchanged and
+shape-independent: `CL:INTERN` publishes caller-region objects into region-0
+tables from ANY thread, and the probe measured it doing so from main at
+~12–18 refs per evaluated form the moment main is not in region 0.
+
+### B-LITE LANDED (b372b57): locked sections allocate in an IMMORTAL ARENA, and CL:INTERN joins them — the collision and D1 are dead
+
+**THE DESIGN, sized before building.**  Full shape B (region 0's frontier in
+memory, bumped by everyone) would touch >=49 R12 frontier sites + 13 gc-check
+emissions in translate-x64, 11 interpreter alloc sites, and eventually the
+aarch64 twin — the hottest path, gated.  **B-LITE** costs one file:
+`%RT-THREADS-ON` carves a **32 MB arena** off the top of region 0's semispace
+(`%GC-REGION-SHRINK` — the same gesture `%HA-CARVE` makes — plus a parked-limit
+clamp for the main-not-in-region-0 shape), and each CPU gets a **1 MB slice**:
+a 64-byte block whose `+0x30/+0x38` the existing `%GC-REGION-ENTER` parks and
+loads, entered at outermost `%RT-ENTER`, refilled from the arena under the
+mutex when headroom < 64 KB, persisted per-CPU by the ordinary leave-side park.
+A locked section touches region 0's frontier NEVER; main's registers and every
+worker's slice advance with no coordination.  **The arena is OUTSIDE the
+collector's bounds** — the trampoline reads from/to/size from the region block
+at collection time, so no collection ever evacuates or overwrites it: IMMORTAL,
+no re-carve, no epoch, nothing to go stale.  Cost of immortality, measured: 128
+bytes per fresh locked intern (percall, K=20 — the only shape that survives
+measuring pre-fix; K>=100 in one hold died 14 of 14) -> ~260K fresh interns per
+process.  Exhaustion falls back to the old path COUNTED (arena words `+0x18`).
+Default-off: no bringup, no gate, no arena, byte-for-byte.
+
+**AND `CL:INTERN` RUNS UNDER THE LOCK, WITH THE NAME COPIED THERE**
+(mvm/cl-packages.lisp): a signal-safe wrapper hoists the arg-count check,
+package resolution and the string designator BEFORE the lock (a longjmp out of
+a held lock leaves it held), and the locked body's create branch `COPY-SEQ`s
+the caller-region name — stored uncopied it left ~2 region-0 -> worker refs
+per fresh intern (+41 at K=20 with the lock alone).  Found/inherited paths
+stay copy-free (immortal-arena burn per lookup would be wrong).  Plus
+mvm-eval: the eval/JIT **caches are not populated off-main**
+(`%MVM-ON-MAIN-THREAD-P`) and `*MVM-LAST-MV*` is cleared as soon as latched at
+all three seams.
+
+**MEASURED, final binary, all rates:** frontier probe **0/20** corrupted with
+20/20 reporting (pre-fix control on the same probe: 2/8 corrupted + 2 dead);
+intern-layers str/low/cl **10/10 each**; worker-intern cons/format/intern-same/
+**intern-fresh 5/5 each**; shape arms bare/count/audit/list/outer/main/str
+**10/10 each, 0 hangs**; worker-xregion both arms PASS;
+`test/run-term-xregion.sh` string/symbol **0 refs, 3/3 each**;
+`test/run-intern-collect.sh` — **the SIGSEGV subject as a standing test**: K
+fresh CL:INTERNs on a worker then TWO forced collections of its own region,
+every symbol EQ after both — **10/10**.  Full bar green including
+classify-thread-lisp 100/0/0.
+
+**DECOMPOSITIONS THE ACCEPTANCE FORCED, each now in a test:**
+* **The historic xregion "29" was 2 real + 27 pollution.**  Measured on the
+  pre-fix binary: symbol case alone = **2** (the symbol + its name — exactly
+  the create path's stores); the other 27 were the STRING case's worker result
+  crossing the region boundary BY POINTER through the join box, counted by the
+  next worker's audit over its reused span (the sweep covers garbage).
+  `run-term-xregion.sh` runs one case per process; its `joinshare` case
+  DEMONSTRATES the join-by-pointer residual on purpose and doubles as the
+  audit's in-vivo positive control.  **Thread return values crossing regions
+  by pointer is a real, named, open residual.**
+* **The last +1 was the interpreter's MV hand-off global** — `*MVM-LAST-MV*`
+  holds the most recent 2-valued call's `(count . secondaries)` cons from
+  whichever thread ran; on a worker that is a worker-region cons in a
+  region-0-reachable global.  Verified exactly: clearing that ONE word took
+  the audit 1 -> 0.  It is the per-thread-window campaign's explicitly
+  deferred interpreter state; the tests that audit interning measure, REPORT
+  and clear it, in that order.
+* **Audits must sweep the arena** — `il-fwd`/`xr-fwd`/worker-xregion's sweep
+  now cover `[%RT-ARENA-BASE, %RT-ARENA-ALLOC)` too, or the fix would have
+  gone green by moving objects out of the swept span.
+
+**OPEN REGRESSION, LEFT VISIBLE — the shim audit's 327680-byte two-thread
+transfer probe dies on arena binaries** (TYPE-ERROR escaping an ARMED
+handler-case — the wrecked-condition shape), in the audit's exact shape only.
+Discriminated hard, all rated: pre-arena binary **5/5 PASS**, arena binaries
+**0/5**, a carve-disabled build **3/3 PASS**, slice-path-disabled-at-runtime
+(after real bringup — the first attempt disabled before `%RT-THREADS-ON` ran
+and the carve re-armed it, a trap for the next person) **3/3 PASS**, so the
+shrink is exonerated and it is the SLICE PATH ENGAGED.  Every reduction fails
+to reproduce the discriminant: sequential spawn stress 3/3 clean, minimal
+spawn+sockets+transfer shapes die on the PRE-FIX binary too (and three
+"passing" single runs of those reductions were all small-sample lies —
+re-rated to 0/3).  Slice/lock state reads sane at the death point.  Mechanism
+NOT identified; the ingredients in the audit's shape are prior thread spawns +
+sockets + an evaluated reader closure + a big concurrent transfer in one
+process.
+
+> **SUPERSEDED — the partition was honest and the wall has since fallen.** The
+> `both` arm was never a distinct failure mode: the byte count could not see a
+> corrupted counter, and the real defect was a worker's special binding
+> publishing its value into region 0's globals table. Fixed by per-thread
+> dynamic binding, below. The partition recorded here was correct at the time
+> and is why the search moved to the right place.
+
+**AND THE WALL IN FRONT OF GLASS IS UNMOVED, WHICH IS THE HONEST PARTITION:**
+`run-glass-send-worker.sh` plain/tx/lock deliver **49180/49180** and `both`
+still stops at **32785** with `MVM LONGJMP (TRAP #x0511)` — byte-identical to
+the pre-fix record.  The collision was real and is fixed; it was never that
+wall.  glass-load 13/13, rfb-static PASS, glass-fb md5-identical;
+`run-glass-serve.sh` still times out on the client (downstream of the `both`
+wall).  The next campaign starts at the `both` arm: the nested
+`*tx*`-special-binding + `with-fb-locked` pair on a worker.
+
+### THE `both` WALL IS DOWN: A WORKER'S SPECIAL IS BOUND IN ITS OWN STORAGE (51ef582)
+
+**IT WAS THE SHALLOW BINDING, AND THE PROOF WAS A BETWEEN-ARM CONTROL.**  Modus
+shallow-binds specials (`compile-let-with-specials`): save the global cell into
+a lexical, `set-symbol-value` the new value, restore in an unwind-protect.  So
+on a worker `(let ((glass::*tx* (list 0))) …)` conses **in the worker's region**
+and then writes that cons into the globals table, which lives in **region 0**.
+That is the forbidden direction; the worker's collector is copying, so the cons
+is moved or reclaimed and the region-0 slot is never updated — the cell is
+re-issued as fresh allocation while `*tx*` still names it and its CAR comes back
+a `CHARACTER`.  `txfr` (`*tx*` = a fresh cons) went `FR[pre]=0 → FR[post]=1`
+while `bothnilfr` (`*tx*` = NIL — nothing to publish) stayed 0, with the same
+nesting, the same recursive lock and the same 17 collections of the worker's
+region between them.
+
+**THE FIX IS THE GENERAL ONE, and three cheaper shapes are dead.**  A thread's
+dynamic binding now lives in **that thread's own storage** — what SBCL does with
+per-symbol TLS indices — and never enters the region-0 globals table.  Rejected,
+with reasons, so they are not re-proposed: *keeping the value alive in the
+binding's stack record* (it stops being collected but the copying collector
+still MOVES it and nothing updates the region-0 slot — a use-after-free traded
+for a stale pointer); *copying the value on publish*, the `CL:INTERN` arena
+route (interning copies a STRING whose identity nobody holds, but a special can
+be bound to any object and **`EQ` is observable** — `*tx*` must be the same cons
+`TX+` increments); *evaluating the initform in the arena* (fixes
+`(let ((*x* (list 0))))` and not `(let ((*x* some-existing-worker-object)))`,
+i.e. passes the test and leaves the general case broken).
+
+**WHERE IT LIVES, AND WHY NOT WHERE THE PLAN SAID.**  Each thread's 4 KB
+per-thread window block: `blk+0xC50` next-free entry, `blk+0xC58` depth stored
+**tagged** (the collector untags with one SHR, exactly like the MV count),
+`blk+0xC60` onward 58 entries of `[key][value]`.  ***THE STANDING CLAIM THAT
+"`0xC38..0xFFF` ARE UNCLAIMED" IS FALSE AS AN ADDRESS RANGE*** — it is true only
+of window OFFSETS.  `0x10000DA8` (thread page), `0x10000DB8` (the RT gate),
+`0x10000DF0/DF8` (socket page), `0x10000E00…` (MCGC config), `0x10000F08` (GC
+region) and `0x10000FF8` (per-CPU mode) all live in it and are process-global;
+claiming them as window offsets would have given every worker a private copy of
+the collector's own configuration.  So the entries are addressed **absolutely**
+from the thread's own base (`%DYNB-BLOCK`, via the existing self slot at
+`0x10000C30`) and **no window offset was added at all** — a worker's block bytes
+`0xC50..0xFFF` are private memory nothing else addresses.
+
+**A RAW PER-THREAD WORD IS NOT A GC ROOT**, and that is the half of this that
+cannot be skipped.  The precise root set is the fixed list in
+`EMIT-GC-TRAMPOLINE`, so `translate-x64` grew `EMIT-DYNBIND-ROOT-SCAN`: exactly
+DEPTH value words, reached through `EMIT-TLS-BASE` just as the MV-extras loop
+is — the collector runs on the thread that hit its own limit, so the stack it
+walks is that thread's.  Emitted into both the copying trampoline and the
+pinning collector's twin, gated on `*X64-TLS-WINDOW*` so every other image is
+byte-identical.  Without it this would be the first rejected shape with the
+staleness merely moved, and `test/hosted-dynbind.lisp`'s `*bit-survive*` is the
+check that catches exactly that.
+
+**DEFAULT-OFF BY CONSTRUCTION.**  The gate is `(mem-ref #x10000DB8 :u32)` — the
+**same word `%RT-ENTER` already tests** — so a single-threaded `./modus`, every
+bare-metal image and every ANSI gate runner pays one 32-bit load and a branch on
+the read path and reaches the identical code.  **The MAIN thread of an armed
+image is unarmed too** (its FS base is 0, so `%DYNB-BLOCK` answers 0 and it
+shallow-binds exactly as before), and that is correct rather than a gap: main
+*is* region 0's mutator, so a binding main publishes creates no cross-region
+pointer.
+
+**FOUR PLACES, NOT ONE.**  `compile-let-with-specials` emits `%DYNBIND` /
+`%DYNUNBIND` instead of `SET-SYMBOL-VALUE` at its three sites; **`cl-packages`'s
+`SYMBOL-VALUE` override needed the same three lines as prelude's**, because it
+is the one that actually runs in any image with a package system
+(last-defun-wins) and editing only prelude would have been dead code in
+`./modus`; `SET-SYMBOL-VALUE` hits this thread's binding first so a `SETQ`
+inside a `LET` cannot go round the back; `PROGV` is the sixth entry point and
+takes the same pair.  `%TLS-INSTALL` empties the stack before arming, because
+blocks are reused when thread slots are.
+
+**`%DYNUNBIND` TRUNCATES, IT DOES NOT POP**, and the difference is load-bearing:
+a `LET*` of two specials evaluates its inits INSIDE the unwind-protect, so a
+throw out of the second leaves the first bound and the second not while the
+cleanup still runs BOTH restores — and the restores run in binding order, not
+reverse.  Truncating to the entry whose key matches is right in both cases,
+because by the time a cleanup runs every inner binding has already been popped
+by its own.  Overflow at 58 nested specials is an honest `ERROR`, not a silent
+shallow bind: a shallow bind there is the publication this exists to prevent
+*and* would desynchronise the stack.
+
+**MEASURED, all rates, on one build:**
+
+| | |
+|---|---|
+| `run-glass-tx-cell.sh txfr` | **`FR[post]` 1 → 0**, 3 of 3, spans non-vacuous (r0span 109 MB, wspan 16.7 MB, wgc **17**), grade monotone 0/4/32784/49180/49180 |
+| `run-glass-tx-cell.sh bothnilfr` | `FR[post]` 0, 3 of 3 — the between-arm control still answers 0 |
+| **`run-glass-tx-cell.sh both`** | **5 of 5 delivered 49180/49180, 0 of 5 overwritten** (was 0 of 5, stopping at 32785 with `MVM LONGJMP (TRAP #x0511)`) |
+| `run-glass-send-worker.sh both` | 49180/49180, `FB-SELFCHECK bad=0` before *and* after |
+| **`run-glass-serve.sh`** | **5 of 5** — a real Python VNC client, **0 pixels differing** from the image it generates itself, 2 rectangles, 12288 distinct values |
+| `run-glass-serve.sh 3` | **4 of 4**, three concurrent clients, each byte-perfect |
+
+**AND A LANGUAGE TEST, BECAUSE "NO FOREIGN REFS" IS NOT "CORRECT".**  A
+mechanism that dropped every worker-side binding on the floor would score zero
+foreign refs and pass `txfr` perfectly.  `test/hosted-dynbind.lisp` asks the
+CL questions — `EQ` exact, restore, shadow/unshadow, `SETQ` inside a binding not
+leaking past it, non-local exit, `LET*` inits seeing earlier bindings, a special
+this thread never bound still reading the process-wide value, `PROGV`, and
+survival of the bound object across this thread's own collections — as one
+bitmask, run on MAIN and on a WORKER so a difference between them is a failure
+rather than a story.  **3 of 3 clean (8191/8191) on the fix; 3 of 3 FAIL on a
+control binary built from `0634eb5`, at exactly one bit** — 8191 − 7167 = 1024 =
+`*bit-survive*`, the bound object not surviving the worker's own region
+collections.  Deterministic, one bit, both directions: that is what a positive
+control looks like.
+
+**FULL BAR GREEN**, every count exact: thread-lisp 29, sb-thread 44, sb-sockets
+52, mv-handler 24, many-threads 12, many-regions 106, threads 18, mutex 18,
+sleep 13, blocking-receive 29, actors 20, actor-regions 48, percpu 19,
+ctx-switch 12, spinlock 11, thread-gc 39, thread-gc-concurrent 55,
+thread-regions 36, thread-actors 38, region-gc 23, region-gc-roots 32,
+region-gc-depth 7, region-gc-actors 53, gc-forced-stress 4, term-roundtrip 27,
+socket-server 33, glass-load 13/13, rfb-static PASS, `glass/fb` md5
+`b021d08a2b47fa871d8c0735a0141f6a`, **classify-thread-lisp 100 pass / 0
+clean-death / 0 hang of 100**.
+
+**TWO THINGS THE CONTROL BUILD SETTLED THAT WOULD OTHERWISE HAVE BEEN BLAMED ON
+THIS CHANGE**, both re-run on a `0634eb5` worktree build:
+* `build-checks`'s `implicit-global-setq = 124 (baseline 123)` and
+  `unresolved-function = 45 (baseline 40)` are **identical at `0634eb5`** — the
+  baselines in `build-checks.lisp` are stale, and this change adds none.
+* the shim audit's known arena regression is **unchanged**: `rc=1` after 25 ok
+  on **3 of 3 runs of each binary**.  Its SBCL reference half is still
+  `42 ok / 0 gaps`.
+
+**STILL OPEN, STATED:** `SET-SYMBOL-VALUE` of a special this thread has NOT
+bound still writes the shared table with a caller-supplied value — a different
+operation with its own cross-region story, untouched here; `BOUNDP` walks the
+table, so a special bound only per-thread reads as unbound on that thread; the
+58-binding ceiling; and `kiln modus-rfb PORT` was not run.
+
+### THE COOPERATIVE ATOMICS ARE SMP-SAFE — except %ATOMIC-CAS, which is not
+
+`net/cooperative-atomics.lisp`'s `%ATOMIC-CAS` / `%ATOMIC-INCF` / `%ATOMIC-DECF`
+were plain read-modify-writes whose entire atomicity argument was "nothing
+preempts a running actor".  Native threads falsified that, and the file is **not
+inert**: `mvm/build-cli-common.lisp` bakes it as `*GENERA-COMPAT-TEXT*` and
+`%INSTALL-GENERA-COMPAT` evaluates it at boot in **every CLI image**, so a
+portable threading library that finds `:GENERA` in `*FEATURES*` — which is the
+whole point of advertising it — lands on these.
+
+**INCF AND DECF NOW TAKE A TTAS SPINLOCK ON `+OP-ATOMIC-XCHG+`, GATED ON
+`%RT-THREADS-LIVE-P`.**  Not a mutex: `%MUTEX-LOCK` is inside the
+`(and (eq *cli-arch* :x64) (not *cli-bare-metal*))` group, and bare metal must
+not be a special case.  Not a call to `SPIN-LOCK` either, and that is the one
+non-obvious choice — `SPIN-LOCK` is overridden to `(defun spin-lock (addr) nil)`
+in `arch-x86`, `arch-aarch64`, `arch-raspi3b`, `arch-arm32*`, `arch-rpi-cl` and
+`32bit-overrides`, so which definition wins is a per-build load-order question
+and a lock that silently degrades to a no-op is the failure mode this campaign
+keeps paying for.  The gate is the *threads* predicate, not a hosted test:
+`%RT-THREADS-LIVE-P` is in `mvm/prelude.lisp`, outside the hosted-only group, so
+bare-metal SMP arms the same word and these flip by themselves.
+
+**`%ATOMIC-CAS` IS DELIBERATELY UNTOUCHED AND STILL UNSAFE.**  It is blocked on
+an INSTRUCTION — `XCHG` is an *unconditional* exchange, and no back-end has a
+compare-exchange.  It could have been wrapped in the same spinlock and would
+then be internally correct, **for callers that route every mutation of the place
+through these macros** — which is precisely the assumption a CAS exists to avoid
+needing.  A lock-based CAS passes a lock-based test suite and lies to the first
+caller that mixes it with a plain `SETF`.  Its FALSIFIED marker stands.
+
+**THE UNARMED PATH IS UNCHANGED, AND THE PROOF IS STRONGER THAN "SAME CODE
+EMITTED".**  This file is never compiled at build time — `read-file-text` puts
+it in the image as TEXT — so a control build from the parent commit and the
+product build have a **byte-identical native code section**: same md5
+(`afafea96902714063b8a6da1b910f54e`), `scripts/fndiff.py` **5034/5034 functions
+identical, TOTAL DELTA +0**.  The whole change is 96 592 bytes of embedded
+source string.  Within that string the gate-off branch is character-for-
+character the old macro body; an unarmed image pays one load of `#x10000DB8`
+and a branch, exactly what `%RT-ENTER` and `%DYNBIND` already cost it.  It is
+**not** byte-identical *emission* for the operation itself — a runtime gate
+cannot be — and saying so would be an overstatement.
+
+**THE LOCK IS `#x10000FE0`, WITH AN ACQUISITION COUNTER AT `#x10000FE8`**, both
+in the BSS gap `mvm/compiler.lisp` and `boot/boot-rpi-cl.lisp` both document as
+free (nothing between the per-region table `F08..F88`, SMP-INIT's three
+scheduler-lock words `FC0/FC8/FD0`, and the per-CPU mode word `FF8`), and
+neither is a per-thread window slot (`%TLS-WINDOW-OFFSET-P` covers `090..138`,
+`150`, `180..19F`, `400..C0F`, `C10..C37` only).  **It must not be the scheduler
+lock**: `+OP-RESTORE-CTX+` zeroes `#x10000FC0` on every context switch.  The
+counter is bumped inside the critical section by the armed path only, which
+makes it a **two-way oracle** rather than a statistic — gate off it must not
+move at all, gate on it must move by *exactly* the operation count.
+
+**A LANDMINE FOR WHOEVER BRINGS UP BARE-METAL SMP: ZERO THE LOCK WORD FIRST.**
+Hosted, that word is BSS and the kernel zero-fills it.  On bare metal the
+`#x1000xxxx` window is ordinary RAM and `build-rpi-cl-repl.lisp`'s prologue
+zeroes an *enumerated list* that does not include it.  Uninitialised RAM holding
+a non-zero byte IS A HELD LOCK — the first `%ATOMIC-INCF` after bringup hangs.
+`mvm/build-pizero2w-actors.lisp` already carries "Clear TCP send lock —
+uninitialized RAM deadlocks spin-lock" for exactly this.  `%ATOMICS-LOCK-ADDR`
+is a one-defun seam so a target with a different free-metadata map can move it.
+
+**ACCEPTANCE — `test/hosted-atomics.lisp` (31 checks) + `test/run-atomics.sh`,
+four threads, 20 000 operations each, TWO negative controls that fail
+differently:**
+
+| arm | result |
+|---|---|
+| INCF protected | exactly **80000**, acquisitions exactly 80000 |
+| DECF protected | exactly **0** from 80000, acquisitions exactly 80000 |
+| MIXED (+3 then −2 per iteration, so neither operation alone gives the answer) | exactly **80000**, acquisitions exactly 160000 |
+| **in-process control** — the same four threads, the read-modify-write written out (character-for-character the old expansion) | lost **50 804 – 59 985** of 80000 |
+| **`MODUS_ATOMICS_MODE=unsync`** — the REAL MACRO, same binary, gate cleared: one BSS word apart | lost **47 534 – 58 304** of 80000 |
+| rates over 10 runs each | protected exact **10 of 10**; control lost updates **10 of 10**; 0 unclean exits |
+
+The unarmed half is asserted with a **sentinel, not a zero**: 1000 unarmed INCFs
++ 400 unarmed DECFs must leave a planted non-zero value in the lock word intact
+and the acquisition counter at 0.  A zero-vs-zero check could not tell "the gate
+bypassed the lock" from "the lock was taken every time".
+
+**NOT EXECUTED, stated rather than implied: there is no bare-metal arm.**  QEMU
+`-smp 4` would give a bare-metal image four vCPUs, but PSCI `CPU_ON` is still
+never called and `WAKE-IDLE-AP` is still `(defun wake-idle-ap () 0)`, so modus
+runs on one of them, the gate reads 0, and the unarmed path is what executes —
+there is nothing to race.  A bare-metal arm becomes runnable the day a second
+core does, and it is the same test.
+
+### DELEGATION TO A SERVICE ACTOR — what was measured before building it
+
+The chosen fix is that allocating mutations of the shared tables are performed
+by ONE owner — a dedicated service actor holding the whole interlocked set
+(symbols, keywords, packages, macro tables) in its own region — which every
+other thread, main included, reaches by message.  Four things were measured
+first.  **Two of them are blocking, so no machinery was written.**
+
+**1. WHICH OPERATIONS ACTUALLY HAVE TO DELEGATE.**  The seam wraps eight
+operations; they are not alike:
+
+| operation | allocates & stores? | verdict |
+|---|---|---|
+| `SYMBOL-VALUE` | no — `GETHASH` only | **must NOT delegate.** Still needs the LOCK: `PUTHASH` rehashes and a reader mid-rehash sees neither table |
+| `%MACRO-PKG-GET` | no — lookup | must not delegate; lock only |
+| `%INTERN-SYMBOL-PKG` | **yes** — allocates the symbol, stores it | **delegate** |
+| `%INTERN-KEYWORD` | **yes** — same, and it is HOT (every `:foo` literal) | **delegate** |
+| `%MACRO-PKG-REM` | yes — rebuilds the alist | delegate |
+| `SET-SYMBOL-VALUE` | stores a **CALLER-SUPPLIED** value | **delegation does not fix it** |
+| `%MACRO-PKG-PUT` | stores a **CALLER-SUPPLIED** closure | **delegation does not fix it** |
+
+That last row is the one to face.  Delegation fixes operations whose
+allocation is INTRINSIC — interning builds the symbol itself, so performing it
+on the owner puts it in the owner's region.  It does nothing for operations
+that store an object the CALLER already made: `(setf (symbol-value 'x) obj)`
+puts a pointer to the caller's `obj` in the owner's table no matter which
+thread performs the store.  Those need the value promoted (copied into the
+owner's region) or the reference accepted and the invariant weakened.  Deciding
+that is part of the design, not an implementation detail.
+
+**2. THE INVERTED POINTER DIRECTION IS ALREADY FATAL TODAY.**  After this change
+every thread holds references INTO the owner's region, so that region must
+never collect while anyone runs.  Measured: **region 0 collects** under ordinary
+pressure (count 0 → 1).  And when it does, in evaluated code, the toplevel form
+running at the time is DESTROYED — one probe printed its banner twice with the
+count reading 0 and then 1, i.e. the form was re-executed across the collection,
+and was then swallowed.  So "the owner's region must not collect" is not a new
+requirement to be designed in; it is an existing hazard this design would make
+LOAD-BEARING for every thread at once.  A forced `%GC-COLLECT-HERE` on that
+region is survivable; a natural one under allocation pressure is not.
+
+**3. THE ROUND TRIP COSTS 7.8 MILLISECONDS, AND THAT IS NOT DELEGATION'S FAULT.**
+A two-thread handoff — post, wake the owner, wait, be woken — measured with
+`SB-THREAD`'s own mutex and condvar:
+
+    cross-thread round trip   7 745 000 ns  = 7 745 us   -> 2 per 60 Hz frame
+    direct fresh INTERN         119 472 ns  =   119 us   -> 139 per frame
+    FORMAT NIL alone             61 902 ns  =    62 us
+
+**It is not the condvar timeout**: flat at 8466 / 7848 / 7881 us for timeouts of
+1 s, 20 ms and 2 ms.  Shortening the timeout by 500x changed nothing, so the
+waiter is not sitting out a timeout.  `WITH-MUTEX` takes the no-timeout path,
+`%MUTEX-LOCK`, which this tree documents as parking "with a 20ms timeout so a
+lost wake would be a re-check rather than a hang" — and a mean of ~7.8 ms is
+what you get when a large fraction of acquisitions take that 20 ms recovery.
+**That points at LOST WAKEUPS in the mutex handoff**, which would be a defect
+worth fixing whatever happens to delegation — glass's own `WAKE-SIGNAL` /
+`WAKE-WAIT` is this exact path, at 60 Hz, against a 16 666 us budget.
+
+So the cost of delegation cannot be honestly measured until the handoff is
+fixed: any number taken now measures the lost wake, not the design.  **That is
+the finding, reported with numbers rather than worked around** — and it is not
+a reason to substitute main for the service actor, which would inherit the same
+handoff.
+
+**4. THE OWNER MUST TAKE THE DIRECT PATH.**  A caller that IS the owner must not
+post to itself; with a service actor this is a cheap identity test at the top of
+the seam (`am I the owner? then call the -1 body directly`) rather than the
+delicate case it would have been with main as owner.
+
+**AND THE SPLIT-OWNER TRAP IS REAL AND ALREADY AUDITABLE.**  Interning touches
+packages, keywords ARE a package, and the macro table is keyed per package — so
+symbols/keywords/packages/macros must share ONE owner, or the very same
+cross-region pointer reappears between two service actors.
+`test/run-worker-xregion.sh` is the instrument that would catch it: point its
+audit at the two owners' regions in both directions and require zero.
+
+### WHAT GLASS ACTUALLY INTERNS WHILE SERVING — the gate, measured
+
+The design question was empirical: fresh interns are the only ones that are
+fatal (`intern-same` is clean 3/3), so a 7.8 ms delegated round trip only
+matters if fresh interns happen at frame rate.
+
+**They do not.  They are a WARM-UP COST and they stop.**  The symbol table
+(`0x10000088`) and keyword table (`0x10000148`) each grow by exactly one per
+FRESH intern and not at all for a found one, so sampling their COUNT is a
+fresh-intern odometer that touches nothing on the hot path — no redefinition,
+no instrumentation of the seam.  A sampler thread using only primitives (no
+FORMAT, no keyword literals, so it cannot intern and cannot pollute what it
+measures) over a real `run-glass-serve.sh` session:
+
+| | symbols | keywords |
+|---|---|---|
+| after `:glass` loads | 4070 | 439 |
+| +25 ms | 4072 | 439 |
+| +131 ms | 4078 | 439 |
+| +233 ms | 4088 | 441 |
+| **+334 ms** | **4091** | **441** |
+| +437 ms … +5751 ms (47 more samples) | 4091 | 441 |
+
+**21 fresh symbols and 2 fresh keywords for the whole serve phase**, the last
+of them at 334 ms, and then **47 consecutive samples with zero growth** while a
+client was connected and the sender loop was running.  So delegation would cost
+21 round trips ONCE — about 164 ms at today's broken handoff — and **nothing per
+frame**.  The design is affordable as it stands.
+
+*Honest bound on that:* the sampler thread itself stopped after 5.75 s (58
+samples where 1200 were asked for), so what is established is "flat for 5.4 s of
+active serving", not for the whole session.  At 60 Hz that is still ~324 frames
+with no fresh intern.
+
+**`#x10000C80` IS NOT A FRESH-INTERN COUNTER.**  It looks like one — incremented
+at the top of `%INTERN-SYMBOL-PKG-1`, decremented on the found path — but the
+FRESH path decrements too (line 1926).  It is a re-entrancy DEPTH counter and
+nets to zero.  Use the table counts.
+
+### TERM-ENCODE SENDS SYMBOLS AND STRINGS BY POINTER — demonstrated
+
+The copy-not-share invariant that lets actors have separate regions is supposed
+to be `TERM-ENCODE`'s job.  It dispatches on exactly five shapes — NIL, cons,
+fixnum, array (`#x32`), bignum (`#x30`) — and everything else falls off the end
+into `;; Unknown object type — encode as fixnum`, which writes the object's own
+tagged pointer and labels it tag 1.
+
+Demonstrated rather than read (`test/hosted-term-encode-syms.lisp`), with a CONS
+as the positive control:
+
+    A SYMBOL   tag=1  9 bytes  payload=70D86CFE9509  symbol's own word=70D86CFE9509
+    A STRING   tag=1  9 bytes
+    A CONS     tag=2  19 bytes   <- the control: this one really is serialised
+
+The payload IS the pointer, exactly.  **So cross-actor messages already carry
+cross-region references today**, for two of the most ordinary payload types —
+the same violation class that is fatal for a worker's fresh intern, sitting in
+the message path.
+
+**AND THE DECODER ALREADY HAS THE RIGHT MECHANISM, UNUSED.**  `TERM-DECODE-STEP`
+has a **tag 3** arm that reads a length and bytes and calls `MAKE-STRING` — a
+copy, allocated in the RECEIVER's region, which is exactly right.  It is DEAD
+CODE, because the encoder never emits tag 3.  The asymmetry is the bug: the fix
+for strings is to make the encoder use the arm the decoder already has, and the
+fix for symbols is the same shape one level up — **encode the NAME, and let the
+receiver INTERN it on its own thread, into its own namespace, in its own
+region**, so the symbol and the table that points at it are co-located by
+construction and the audit stays at zero without a barrier or a delegation.
+
+Tag 1's decode arm just reads the raw word back and returns it, so today the
+receiver gets the sender's pointer verbatim — no copy, no intern.
+
+**A NOTE FOR WHOEVER BUILDS IT:** the receiver's namespace then grows with
+whatever names arrive.  Bounded and fine for actor-to-actor traffic; for names
+taken off the WIRE from an untrusted peer it is unbounded growth driven by a
+remote party.  glass reads a protocol with fixed message types and interns
+nothing from it (its 21 fresh interns are all warm-up, and they stop), so
+nothing here does it today.
+
+### THE SERIALISER COPIES WHAT IT SENDS (3cb7590) — and the decode arm that never existed
+
+**`STRING-SET` WAS DEFINED NOWHERE IN THE TREE.**
+
+    (fboundp 'string-set)        =>  NIL
+    grep -rn "defun string-set"  =>  nothing, anywhere
+    grep -rn "(string-set "      =>  net/actors.lisp:709, and NOWHERE else
+
+`TERM-DECODE-STEP`'s tag-3 arm — read a length, read the bytes, rebuild the
+string in the RECEIVER's region — filled it with that.  So the arm was dead in
+**two** senses at once: nothing ever emitted tag 3, and it could not have worked
+if anything had.  `(MAKE-STRING 5)` returns `"     "`, so a decode through it
+gives the right LENGTH and no content — which is exactly what came back the
+first time the encoder emitted tag 3, and the whole reason that attempt
+(9f1a577) was reverted in 6a578a3.  `(SETF (AREF s i) (CODE-CHAR …))` exists;
+that is the repair, at all three sites.
+
+**NOW: symbols by NAME at tag 6, strings by VALUE at tag 3**, so the receiver
+INTERNS on its own thread, in its own region — the symbol and the table that
+points at it co-located by construction, no barrier and no delegation.
+
+**AND THE TEST ASSERTS THE DECODED VALUE, WHICH IS THE WHOLE LESSON.**
+`test/hosted-term-encode-syms.lisp` checks the TAG and the BYTE COUNT, and it
+**passed an encoder that destroyed every payload it touched**.  A serialiser
+test that does not round-trip is not a serialiser test.
+`test/hosted-term-roundtrip.lisp` is 27 checks of `(equal (rt "hello") "hello")`
+and `(eq (rt sym) (intern "…"))` through the **real staging buffer** after
+`%HA-ACTORS-BRINGUP` — not a private `%MMAP-SHARED-PAGE`, which is what faulted
+on CONS and sent a whole diagnostic down the wrong hole.  Every decoded value
+must also be a COPY and not the sender's object, with a CONS as positive
+control: if a cons ever comes back `EQ`, nothing is being serialised.
+
+**AND THROUGH THE REAL MAILBOX — the gap that let it ship green.**  All four
+actor tests in the bar exercise `TERM-ENCODE`/`TERM-DECODE` and send **only
+fixnums and conses**, so a serialiser that wrecked every string and symbol went
+past twenty-plus green tests without a murmur.  `SEND`/`RECEIVE` is a different
+path from calling the encoder directly — `SEND` decides for itself whether a
+value needs serialising and picks the buffer.
+
+***THE MAILBOX SECTION SENDS TO SELF*** — one actor, one region — so its `EQ`
+check would pass even if the decoder returned the sender's pointer.  The
+cross-region half is `test/hosted-term-xregion.lisp`, below.
+
+### LOCAL SYMBOL TABLES: the lookup chain is free, the TABLE is not
+
+Tested before building, because the proposal was that standard CL packages
+might already give it.  **Half of it do.**
+
+**THE LOOKUP CHAIN ALREADY WORKS, EXACTLY AS SPECIFIED.**  With
+`(defpackage "ACTOR-LOCAL" (:use "COMMON-LISP"))`:
+
+    (eq (intern "CAR" "ACTOR-LOCAL") (intern "CAR" "COMMON-LISP"))  =>  T
+    (package-name (symbol-package (intern "CAR" "ACTOR-LOCAL")))    =>  "COMMON-LISP"
+    (fboundp (intern "CAR" "ACTOR-LOCAL"))                          =>  T
+
+So an inherited name resolves to *the* shared symbol, its function cell is
+found, and nothing is allocated — the "must not orphan shared symbols"
+requirement is already met by the package system.  Measured on a WORKER, that
+path leaves **`region 0 -> worker = 0`**.
+
+**BUT A PACKAGE IS NOT A TABLE.**  `%INTERN-SYMBOL-PKG` has exactly ONE store —
+the table at `0x10000088`, in region 0 — keyed by a COMPOSITE of name-hash and
+pkg-hash.  Adding a package adds a key prefix, not a table:
+
+    fresh name in ACTOR-LOCAL   -> shared table 1944 -> 1945   (grew by 1)
+    fresh name in CL-USER       -> shared table 1945 -> 1946   (grew by 1)
+
+and on a worker, 40 fresh names interned into the actor-local package leave
+**`region 0 -> worker = 56`**.  Non-zero, for the same reason as before: the
+symbol is in the worker's region and the table registering it is in region 0.
+
+**SO: reuse the chain, replace the store.**  Local copies of symbols need a
+genuinely PER-REGION intern table — the lookup order (own table, then inherited
+tables read-only, then create locally) is already implemented and correct; what
+has to change is that step three writes into a table that lives in the actor's
+own region rather than into `0x10000088`.  A per-actor PACKAGE gets none of that
+on its own.
+
+**KEYWORDS ARE A SEPARATE STORE ALREADY** — `0x10000148`, not `0x10000088` — so
+they need the same treatment separately, and `:foo` literals are the hot path
+(`compile-keyword` emits an intern for every one).  Whether per-actor keyword
+tables are acceptable is NOT yet measured; the serialised-boundary argument says
+yes and that is reasoning, not evidence.
+
+### THE PER-ACTOR INTERN STORE — feasible, designed, NOT BUILT
+
+***READ THE CORRECTION FIRST*** — "AND IT NAMED THE WRONG INTERN" above.  This
+section is a design for `%INTERN-SYMBOL-PKG`, and `%INTERN-SYMBOL-PKG` is
+**not** the function that leaves the forbidden pointer: measured, it allocates
+in region 0 and its audit is 0.  `CL:INTERN` is.  The shape below (default-off,
+a raw per-thread slot, own table then shared read-only then create locally) is
+still the right shape, but it has to be applied one layer up, where the store
+is not one hash table but a hash table **and** every package's own symtab — and
+there is a rooting question this section never asked: **a raw per-thread word is
+not a GC root.**  The collector's precise root set is the fixed list in
+`translate-x64`'s `EMIT-GC-TRAMPOLINE` (globals, symbol, keyword, package, MV
+extras); a local table living in the worker's region and rooted only from a
+word in the thread page would be collected out from under its owner at that
+thread's first collection.  The per-thread WINDOW (FS, `%TLS-WINDOW-OFFSET-P`)
+is the one per-thread store the collector can already address — `emit-tls-base`
++ offset, exactly as the MV-extras loop does — and offsets `0xC38..0xFFF` of the
+window block are unclaimed.  Neither has been built.
+
+Where the local table can live, checked rather than assumed: the per-thread
+RECORD at `%THR-REC i` is 128 bytes with only `+0x00..+0x30` used, and
+`%THR-PERCPU-BASE` hands out a 16 KB block per CPU at `+0x14000 + cpu*0x4000`.
+Either gives a RAW per-thread word — which is the requirement, because the slot
+must not be reachable from region 0, so a Lisp global cannot hold it.
+
+**THE DESIGN POINT THAT MAKES IT SAFE IS DEFAULT-OFF.**  `%INTERN-SYMBOL-PKG` is
+the hottest function in the runtime — every symbol literal, and via
+`%INTERN-KEYWORD` every `:foo` — so the shape must be:
+
+    (let ((local (%local-symtab)))          ; 0 unless this thread opted in
+      (if (zerop local)
+          <EXACTLY TODAY'S PATH, byte for byte>
+          <own table, then shared read-only, then create locally>))
+
+With no thread opting in, behaviour is today's by construction, so the bar
+cannot move — rather than by testing that it did not.  The local path then does:
+`GETHASH` in the local table; miss -> `%RT-ENTER` + `GETHASH` the shared table +
+`%RT-LEAVE` (read-only, no allocation); miss -> allocate the symbol and
+`PUTHASH` it into the LOCAL table **without hopping**, so both land in this
+thread's region.
+
+**THE HAZARD IS STEP THREE, AND IT IS NOT THE TABLE.**  Creating a symbol is not
+one `PUTHASH`: `%INTERN-SYMBOL-PKG-1` also resolves the home package out of
+`0x10000170`, fills slot 1, seeds slot 2, and re-reads the table root because
+`%ALLOC-SYM3` can collect.  Duplicating that is where the bugs will be, and the
+package object it stores in slot 1 is itself a REGION-0 object — a
+`worker -> region 0` pointer, which is the expected direction and fine, but it
+means "the symbol is entirely local" is false in detail and should not be
+claimed without an audit.
+
+**KEYWORDS ARE A SECOND, SEPARATE STORE** (`0x10000148`) on the hot path, and
+whether per-actor keywords are acceptable is still REASONING, not evidence — see
+above.  The test that would settle it: two actors each with `:foo`, one sending
+it to the other, and the receiver's `:foo` must be `EQ` to its own with the
+audit still at zero.
+
+### THE CROSS-REGION AUDIT: strings are clean, SYMBOLS ARE NOT
+
+Sender = the main thread (region 0).  Receiver = a worker thread, which owns its
+own region (checked, not assumed).  The worker decodes, then
+`%GC-COUNT-FOREIGN-REFS` runs both ways:
+
+| payload | region 0 -> worker | worker -> region 0 |
+|---|---|---|
+| a string | **0** | 133 |
+| a symbol | **29** | 137 |
+
+**THE TWO DIRECTIONS ARE NOT THE SAME REQUIREMENT**, and demanding zero both
+ways was this file's first mistake here — the backward number is ~150 for a
+worker that has merely started up.  `region 0 -> worker` MUST be zero: those
+pointers are not on the worker's stack, so its collector never updates them and
+they dangle the moment its region collects — the mechanism behind
+`test/run-worker-intern.sh`'s SIGSEGV.  `worker -> region 0` is EXPECTED
+non-zero and violates nothing today: every symbol and global a worker touches is
+a region-0 object.  What it does mean is that **region 0 must never collect out
+from under a live worker**, which this tree relies on, does not enforce, and no
+test exercises.
+
+**AND THE CO-LOCATION ARGUMENT WAS WRONG.**  "The receiver interns, so the
+symbol and the table that points at it are co-located by construction" — the
+receiver does intern, and the symbol IS in the receiver's region, but the intern
+table is the SHARED one at `0x10000088`, which lives in **region 0**.  So the
+forbidden pointer is not avoided, only MOVED: region 0's table now points at the
+RECEIVER's symbol instead of the sender's.  Serialising was still necessary —
+the string is 0 where before the fix it shipped a raw pointer — but **it is not
+sufficient for symbols**, and delegating fresh interns to the region's owner is
+therefore load-bearing rather than an optimisation.  That `29` going to `0` is
+its acceptance criterion.
+
+*(A dedicated positive control that interned 400 fresh symbols on the worker was
+tried and removed: it takes the process down, because that is precisely the
+defect, so it could never report. The string and symbol cases are the control —
+same audit, same spans, same direction, answering 0 and 29.)*
+
+**STILL BY POINTER:** anything that is not NIL / cons / fixnum / string / symbol
+/ array / bignum still falls into `;; Unknown object type — encode as fixnum`.
+Narrowing that arm further without a demonstration of what lands in it would be
+guessing; it remains a soundness hole for any type nobody has looked at.
+
+**A CLAIM THAT WAS RETRACTED HERE, kept because the retraction is the lesson.**
+This section once said `MEM-REF` halves on read at `:u8`/`:u32` — 104 back as
+52, 5 back as 2 — and instructed the next reader to use `%GC-WRITE64` instead.
+**False.**  Re-measured across every context that differed (fresh mmap page
+before the band exists, the same page after, the staging buffer; `:u8` `:u32`
+`:u64`; inside a `DEFUN` and at toplevel in a `LET`; reads inline in `FORMAT`
+arguments and hoisted into locals): **all ten round-trip exactly**, and a second
+machine could not reproduce it either.  The bogus readout came from a probe that
+ALSO died on `STRING-SET` and re-executed its toplevel form, on a binary that no
+longer exists.  One unexplained measurement, generalised into a rule and written
+down as an instruction for someone else — the exact failure the rest of this
+file exists to prevent.  **A single reading that cannot be reproduced in a
+second shape is not a finding.**
+
+**A TRAP THIS COST A CYCLE ON: `SYS-EXIT` FROM INSIDE A NESTED `LET*`/`IF` IN A
+`--script` DOES NOT TAKE EFFECT.**  The process ran to the end of the file and
+exited **0** while the verdict line above it said FAIL — and every runner reads
+the code, not the prose.  Put the exit at TOPLEVEL; the other tests in this tree
+already do.
+
+### THE CLOCKS ARE CLOCKS (243b265)
+
+`GET-INTERNAL-REAL-TIME` bound `T` — `(let ((t (handler-case (syscall3 201 …))))`
+— so `(integerp t)` asked whether TRUE is an integer, said no, and took the
+call-counter branch on every call regardless of the syscall.  And syscall 201 is
+`time(2)`, whole SECONDS, reported as if it were the thousandths
+`INTERNAL-TIME-UNITS-PER-SECOND` promised; on the AArch64 generic ABI 201 is
+`listen(2)`.  `GET-INTERNAL-RUN-TIME` was `(defun get-internal-run-time () 0)`,
+which made every `(- after before)` zero.
+
+Both now go through a seam — `%IRT-NS` / `%IRUN-NS`, defined at 0 in
+`mvm/ansi-bridge.lisp` ("this target has no clock") and overridden by
+last-defun-wins in `net/hosted-sync.lisp`, which is where `clock_gettime(2)` can
+be called at all because it owns the **per-CPU** timespec scratch (a shared
+timespec is two threads writing one buffer).  Real time is CLOCK_MONOTONIC, run
+time is CLOCK_PROCESS_CPUTIME_ID.  The unit is converted in ONE place
+(`%NS-TO-ITU`) so the clock and `INTERNAL-TIME-UNITS-PER-SECOND` cannot drift
+apart again, and the default is now 1000000 — which is what
+`build-x64-linux`, `build-x64`, `build-aarch64`, `build-aarch64-linux`,
+`build-x64-cl-repl` and `build-rpi-cl-repl` all already SETQ'd it to.  The CLI
+was the odd one out at 1000.
+
+Measured on the built binary: `(sleep 2)` moves it 2000122 units = 2.000122 s;
+two back-to-back calls differ by 11 units; run time over a busy loop 10786
+units, over `(sleep 1)` 30 units.
+
+**A TRAP FOR THE NEXT INSTRUMENTER: `(%GC-COUNT)` IS NOT A COUNT ON x64.**  The
+field is stored raw there and `mem-ref :u64` halves it, so a count of 1 reads
+back as a value whose bit pattern is a CONS tag and prints as garbage.  That
+looked exactly like heap corruption after a forced collection and cost a
+detour.  Read it with `%GC-META-READ`, or `(%gc-read64 (+ (%gc-region) #x20))`.
+This is already written down under "Two traps this cost time on"; it is written
+down again here because it was still walked into.
+
+**THE HARNESSES, ALL RE-RUNNABLE, ALL SBCL-REFERENCED WHERE THAT MEANS
+ANYTHING.**
+
+    test/run-glass-load.sh        :glass loads — 13 of 13 files (its 8 + cram's 5),
+                                  file list read out of glass.asd/cram.asd, each
+                                  file's witness the LAST thing it defines
+                                  (because modus's LOAD swallows a form that dies)
+    test/run-glass-shim-audit.sh  the whole SB-* surface — 42 ok / 0 gaps
+    test/run-glass-serve.sh       glass's RFB server vs a real Python VNC client
+                                  (handshake passes; the frame does not arrive)
+    test/run-intern-aot.sh        AOT versus runtime-compiled, same loop, same
+                                  binary — the A/B that killed the last standing
+                                  hypothesis.  Needs net/hosted-intern-probe.lisp
+                                  baked in; every `aot' cell says SKIP if it is not
+    test/run-intern-shape.sh      one difference at a time off the red arm; `main'
+                                  10/10 against `bare' 3/10 is what moves the
+                                  statement off INTERN and onto REGION 0
+    test/run-region0-frontier.sh  the overwrite itself, in addresses, with the
+                                  control INSIDE the run: two marked conses from
+                                  one worker, one region apart
+
+### THE CARVE TOOK MEMORY THAT WAS STILL IN USE — and all eight glass files load
+
+`%HA-CARVE` takes the top ~272 MB of region 0's 896 MB semispaces for the actor
+band and the sixteen per-thread regions, then **zeroes four ranges inside what
+it took**.  It never asked whether anything was living there.
+
+At boot nothing is: every selftest in `net/hosted-actors.lisp` calls
+`%HA-PERCPU-INIT` on its first line, so every measurement this layer has ever
+taken was taken from a nearly fresh heap.  **A REAL PROGRAM DOES NOT CARVE AT
+BOOT.**  The carve is reached from `%HA-BASE` ← `%SYNC-CELL-CTL` ← the FIRST
+`sb-thread:make-mutex` a program executes, and a program asks for its first lock
+whenever it happens to want one.  glass wants one at
+`(defvar *session-clipboard-lock* (%clip-make-lock))` — `src/clipboard.lisp`,
+the fourth file — by which point loading cram's five files and glass's first
+three has pushed the allocation frontier **past the carve point**.  Measured,
+not inferred: with the fix in place that load reports
+`*ha-carve-collections*` = **1**, which is the count of times the frontier was
+found above `from0 + new0`.
+
+**THE ZEROING WAS NEVER THE BUG, AND AN EARLIER ROUND FIXED THE WRONG HALF.**
+The comment at `+0xC000` in that file records the first face of this: a non-zero
+word at `%SYNC-CELL-CTL`'s spin lock, left over from region 0's from-space, hung
+the first `MAKE-MUTEX` at a full core — and the answer was to zero that range
+too.  That cures the hang by *widening the damage*.  All four `%HA-ZERO` ranges
+were writing over live objects.
+
+**WHAT IT LOOKED LIKE, so the shape is recognisable next time.**  The keyword
+`:NAME` came back with a wrecked header, so `SYMBOLP` said NIL, so the compiler's
+terminal arm reported `WARN: cannot compile #<?>, using nil` **on the next form
+read** — a literal silently replaced by NIL — and the `TYPE-ERROR` that followed
+carried a condition object whose own type-name slot was garbage, so
+`%CONDITION-P` rejected it, so `handler-case` matched no clause (**including a
+`T` clause**) and it escaped to LOAD's swallow as
+`!! UNHANDLED-ESCAPE load-toplevel-form-swallowed: #(#<?111> NIL)`.
+
+**THAT ESCAPE IS NOT A CONDITION-SYSTEM BUG.**  Two independent findings, both
+measured.  (1) The signal is raised while the **toplevel form is being
+COMPILED**, before the `handler-case` in it has been armed — so there is no
+frame to catch it and `(handler-case (eval '…) (t (c) …))` fails identically.
+(2) Where a runtime signal *is* involved, the condition's type-name is a wrecked
+pointer, so every `(typep *current-condition* 'X)` is NIL by construction.
+`handler-case` was doing exactly what it was told.  In the same image
+`(handler-case (error "boom") (t (c) :CAUGHT))` and `(handler-case (car 5) …)`
+both catch, and `*CATCH-ACTIVE*` is NIL.
+
+**IT IS NOT A MISSED GC ROOT, AND THE MEASUREMENT THAT SETTLES IT IS `%GC-COUNT`
+= 0.**  `(%gc-count)` reads **0** at boot, after each of cram's five files, after
+each of glass's first three, and immediately before the failing call.  A
+forwarding pointer can only be written by `copy_object`, which only runs during
+a collection, and no collection had run.  The low-nibble-#xF headers are real
+forwarding words — they are the tracks of the **first** collection, which the
+shrink itself provokes by moving the limit below the frontier — but they are
+downstream of the carve, not the cause of it.  The missed reference is not one
+`scan_word` forgot: it is every object above the new boundary, which the shrink
+put **outside the region** while the band overwrote it.
+
+**THE FIX: `%HA-CARVE-ROOM`.**  Ask, before committing, whether the live
+frontier (`GET-ALLOC-PTR`) is at or below the carve point.  If it is not,
+**collect region 0 once** — a Cheney collection compacts the live set to the
+bottom of the new from-space, which is exactly the shape that makes the top
+spare again, and it is the region's ordinary collector rather than a side door —
+then re-read and re-ask.  Still over (a program with >620 MB genuinely live) is
+an honest **0**, the same answer a heap too small to carve from already gets: a
+refusal is a mutex the caller cannot have, a silent carve is a heap the caller
+cannot trust.  `*HA-CARVE-COLLECTIONS*` and `*HA-CARVE-REFUSALS*` are counts, so
+"it happened and nobody noticed" is distinguishable from "it never happened".
+`%HA-CARVE-NEW0` is split out and used by **both** sides, so the address the
+check guards cannot drift from the address the carve uses.  The collection FLIPS
+the semispaces, so `%HA-CARVE` re-reads `from0`/`to0`/`size0` after it.
+
+Degrades to the historic behaviour by construction: a `VA` of 0, or one outside
+`[from0, from0+size0)`, means this is not a live Cheney region (bare metal, an
+uninitialised image) and the check abstains.
+
+**RESULT: ALL EIGHT FILES OF THE `:glass` SYSTEM LOAD ON MODUS** — packages,
+record, framebuffer, clipboard, perf, socket, rfb, zrle, over cram's five — from
+a plain `./modus --script`, with no early-carve workaround and
+`refusals=0`.  It was four before.
+
+**AND THE NEXT WALL, NAMED:** `GLASS:SERVE-ONE` gets as far as opening its
+socket and dies in the shim, not in glass —
+`SIMPLE-ERROR | make-instance: invalid initarg ~S ARGS=(TYPE)`.  `sb-bsd-sockets`
+makes an `INET-SOCKET` with `:TYPE` and `:PROTOCOL`; `net/sb-sys-shim.lisp`'s
+class does not take them.  That is a shim gap with a name, which is a different
+kind of problem from the one this section is about.
+
+**RESIDUAL, STATED RATHER THAN HIDDEN.**  The forced collection happens while an
+interpreted/JIT'd **toplevel form is executing**, and that form then re-runs part
+of itself: the eight-file load prints `>> packages … >> clipboard` and then
+`>> packages` again, because the `DOLIST` restarted.  Harmless here (the forms
+are idempotent `DEFUN`s and the load completes correctly) and pre-existing — it
+is the same shape as the documented "`%GC-COLLECT-HERE` at an interpreted
+`--script` toplevel breaks the next `(format t …)`" — but the carve is now a
+place that *reaches* it, so it is on the critical path and it was not before.
+`(%gc-count)` read from an interpreted toplevel after such a collection also
+misbehaves.  Both are the same unfixed defect and both are one level below this
+one.
+
+### The socket layer becomes usable by a SERVER: unbounded transfers, per-CPU buffers, poll(2)
+
+The campaign is threads -> sockets -> glass.  `net/hosted-sockets.lisp` already
+had connect/listen/accept/send/recv, connected UDP and a DNS resolver on
+`syscall3`; what it did not have was anything a server could stand on.
+
+**THREE DEFECTS, NONE OF WHICH NEEDED A THREAD TO BE WRONG.**
+
+1. **A transfer was capped at one page, silently.** `SOCKET-SEND` copied LEN
+   bytes into `*IO-BUF-ADDR*` — a 4096-byte page — and issued one `write(2)`.
+   A LEN above 4096 wrote past the buffer.  Nothing named the limit, so nothing
+   could respect it.  `%SOCK-IO-CAP` names it and the transfer loop CHUNKS
+   against it, so a transfer is bounded by nothing whatever the buffer's size.
+   **Glass's `write-rect-raw` issues ONE `write-sequence` of 327 680 bytes at
+   1280 wide with default banding, and 4 096 000 with `*max-band-rows*` NIL.**
+2. **A short write lost the tail of the message.** `write(2)` on a socket takes
+   fewer bytes than offered whenever the send queue fills — exactly what a large
+   framebuffer update does.  The old code returned that short count and every
+   caller in the tree ignored it.  The loop now advances by what `write(2)`
+   actually took.
+3. **`SOCKET-LISTEN` bound `0.0.0.0` by default.**  Now `SOCKET-LISTEN` is
+   127.0.0.1 and `SOCKET-LISTEN-ON` takes an address — **a different function
+   name, so serving the network appears in a diff and cannot be arrived at by
+   leaving an argument off.**  Nothing in the image calls either
+   (`grep -rn "socket-listen" net/ mvm/ lib/ boot/` outside the socket files
+   returns nothing): loading opens no socket, the CLI opens no socket, there is
+   no autostart and no environment variable.
+
+**PER-*CPU* BUFFERS, NOT PER-*CONNECTION* ONES, and the reason is what makes the
+fix small.**  The bounce buffer's LIVE RANGE IS ONE SYSCALL — bytes in, one
+`read(2)`/`write(2)`, bytes out, nothing retained.  So the only thing that can
+overlap it is ANOTHER CPU, never a second connection on the same CPU: there is
+no preemption and no signal that re-enters Lisp, so a thread is inside exactly
+one socket call at a time.  Partition by what can actually overlap.  A
+per-connection buffer would additionally be an allocation per fd with an
+ownership question attached.  Same answer `%THR-TS` gives for timespecs and
+`%GC-SCRATCH-CELL` for the collector's per-collection state.
+
+`net/hosted-sockets-post.lisp` (x64-hosted only, baked after
+`net/hosted-sync.lisp`, overriding the three seam functions by last-defun-wins)
+maps ONE 1 MB anonymous page from two BSS words — **0x10000DF0 / 0x10000DF8, the
+last two free words below the MCGC config block at 0x10000E00** — holding
+per-CPU sockaddr scratch, per-CPU pollfd arrays, the server control block and
+16 x 64 KB of staging.  **SIZE IS NOT THE FIX**: the chunking loop would be
+equally correct at 64 bytes.  It also ends a hazard that was never about
+threads — the old buffer WAS `mvm/cl-fileio.lisp`'s file-I/O page, so reading a
+file during a socket transfer corrupted one of them on ONE CPU.
+
+**poll(2), AND THE REASON IS NOT PREFERENCE.**  A thread per connection is NOT
+AVAILABLE: `net/hosted-actors-post.lisp` has one stack, one thread block and one
+TID word, so the image runs exactly two OS threads and a thread-per-connection
+server would serve ONE client.  `select` has the kernel rewrite its fd_sets, so
+the set is rebuilt every pass anyway.  `epoll` wins at thousands of fds and
+loses here — a kernel object with a lifetime, and an edge-triggered mode whose
+failure is "a socket you did not fully drain goes quiet forever".  **`poll` is
+syscall 7 with THREE arguments, so it rides the existing `syscall3` trap: no new
+opcode, no `syscall6`, no translator change on any back-end.**  Each CPU polls a
+DISJOINT fd set, so the loops need no lock between them; a write that fills the
+send queue waits on POLLOUT through a RESERVED pollfd entry so it never disturbs
+the loop's own set.
+
+**MEASURED** (`test/run-socket-server.sh`, 4 concurrent connections x 1 MiB,
+client = PYTHON, 10 of 10):
+
+| | |
+|---|---|
+| accepted / retired / held at once | 4 / 4 / 4 |
+| CPU 0 | 2 097 152 bytes over 88 read events |
+| CPU 1 | 2 097 152 bytes over 105 read events |
+| max handlers inside at once | **2** |
+| overlap witnesses / handoffs | **135 / 135** |
+| wrong-CPU services, accept/poll/echo errors | 0 |
+| fd probe before / after | 4 / 4 |
+
+**THE WITNESS CAN ANSWER BOTH WAYS** — the trap 0fdb21a caught in its own
+checksum.  `MODUS_SK_NCPU=1` on the same workload gives max-inside **1**,
+overlap **0**, handoffs **0**, and the test ASSERTS those on that arm (10 of 10).
+
+**THE NEGATIVE CONTROL is `MODUS_SK_SHARED=1`** — every CPU back on the one
+process-global page, same binary, same workload.  **10 of 10 FAIL**, all four
+connections each time, with CROSS-CONNECTION CONTAMINATION (connection 0
+receives connection 1's/2's/3's pattern byte).  **And note what that means: the
+server's OWN checks still pass in the control, because the server counts bytes
+and not contents.  Only the external client sees it.  That is the argument for
+having one that is not modus.**
+
+**A MODUS STREAM ALREADY WORKS OVER A SOCKET FD**, which is the finding that
+matters most for glass (it does 100% of its RFB I/O through Lisp streams).
+`mvm/cl-fileio.lisp`'s `%MAKE-FILE-STREAM-FULL fd dir element-type` takes a RAW
+FD; pointed at a socket it does `write-byte`, `write-sequence` of 8192,
+`force-output`, `read-byte`, `read-sequence` and `close` verbatim.
+
+**BUG FOUND, NOT FIXED: `(listen stream)` returns T on a DRAINED socket** while
+`poll(2)` on the same fd correctly reports 0 ready.  `LISTEN` cannot be used as
+a readiness test.  Small, isolated, and wrong regardless of glass.
+
+**THE GAP MAP IS `docs/rfb-socket-gap-map.md`, and its headline is that SOCKETS
+ARE NOT WHAT STANDS BETWEEN MODUS AND GLASS.**  Glass is thread-per-client TIMES
+TWO (a reader parked in `read-byte` and a sender parked on a waitqueue, per
+connection; `make-thread` appears 99 times), and modus has ONE spare thread
+whose spawn takes a raw native entry address rather than a closure — so the
+literal shim serves ZERO clients.  The synchronisation half of `sb-thread` is
+largely already there (futex mutex + condvar); `sb-alien` is two libc functions
+that are both syscalls; `sb-posix` production use is 12 sites all in one file.
+Proposed next rung is NOT "port glass": load `glass/fb` — which depends on
+nothing and already carries `#-sb-thread` arms — with no sockets and no threads.
 
 ### Conservative-root validation collector (x64, landed ace1544 + 810a975)
 
@@ -981,6 +3452,35 @@ ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 test@10.0.0.2
 ```
 
 SSH credentials: username `test`, any password accepted (no real auth).
+
+### Socket / server tests — AND THE RULE THEY OBEY
+
+```bash
+# THE SERVER, against a client that is NOT modus (Python).  4 concurrent
+# connections x 1 MiB, two serving threads, byte-for-byte comparison.
+test/run-socket-server.sh ./modus /tmp/modus-socket-test 4 1048576 16384
+
+# THE POSITIVE CONTROL for the concurrency witness: one serving CPU.
+# max-inside must be 1, overlap 0, handoffs 0 — and the test asserts it.
+MODUS_SK_NCPU=1 test/run-socket-server.sh ./modus /tmp/mst1 4 1048576 16384
+
+# THE NEGATIVE CONTROL: every CPU back on the one shared page.  MUST FAIL.
+MODUS_SK_SHARED=1 test/run-socket-server.sh ./modus /tmp/mstc 4 1048576 16384
+
+# MODUS-TO-MODUS: the same server, a modus client, plus one 96 KB transfer in
+# a SINGLE socket-send-from against a 64 KB staging buffer.
+test/run-socket-modus.sh ./modus /tmp/modus-socket-modus 4 16 8192
+```
+
+**EVERY ONE OF THESE BINDS 127.0.0.1 AND AN EPHEMERAL PORT, AND NOTHING IS LEFT
+LISTENING.**  The modus side calls `SOCKET-LISTEN-ON` with `(%SOCK-LOOPBACK)`
+written out in full and has no other spelling available to it; the port is
+`bind(0)` + `getsockname`, so no script picks a number and none can collide with
+a desktop (5900-5920 or otherwise).  The server holds a **deadline** it checks
+once per poll timeout, so a run whose client never arrives still ends by itself
+and still closes its listener; `timeout` bounds the process as a second line of
+defence; and each harness **verifies with `ss` that the port is no longer
+listening** and fails the run if it is.
 
 ## Development Hosts
 

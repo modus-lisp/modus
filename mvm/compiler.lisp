@@ -109,14 +109,335 @@
 ;;; MV-COUNT at 0x600010: number of values returned (tagged fixnum)
 ;;; MV-VALUES at 0x600020: array of up to 20 extra values (0x600020..0x6000C0)
 (defconstant +mv-count-addr+ #x10000090)
+
+;;; ---- THE GC METADATA BLOCK IS A REGION CONTROL BLOCK ----------------------
+;;;
+;;; These eight words were written as bare literals in TEN files: gc.lisp, three
+;;; translators, four boot descriptors, two build scripts and a test.  Ten copies
+;;; of a number that several layers agree about by convention is precisely the
+;;; shape of the +MV-COUNT-ADDR+ bug directly above — translate-i386 relocated
+;;; that literal with its private block, so the one writer pointed at an address
+;;; with ZERO readers and every "I returned one value" reset was discarded.
+;;;
+;;; They are named here, beside that one, for the same reason: so there is an
+;;; owner rather than a convention.
+;;;
+;;; STAGE 1 OF PER-REGION GC.  They are no longer eight ADDRESSES; they are
+;;; eight OFFSETS into a 64-byte REGION CONTROL BLOCK, and a heap is one region.
+;;; A region owns its from/to semispaces, its semispace size, the stack window
+;;; its roots live in, its own collection count, and its own saved SP/alloc/limit
+;;; triple.  One fixed triple was one collecting thread by construction; N region
+;;; blocks are N independently collectable heaps.
+;;;
+;;; That is sound here for the reason net/actors.lisp already establishes: an
+;;; actor gets a PRIVATE allocation pointer and limit (x24/R12, x25/R14, saved
+;;; and restored across the context switch, plus obj-alloc/obj-limit in its
+;;; 128-byte struct), and messages are TERM-SERIALIZED — copied, never shared.
+;;; No actor can hold a pointer into another actor's region, so evacuating one
+;;; region can never strand a reference held by another.
+;;;
+;;; WHICH region is active is a single word, +GC-REGION-ADDR+, holding the raw
+;;; byte address of the active control block.  ZERO MEANS REGION 0, whose block
+;;; is the historic one at +GC-REGION-0-BASE+ = #x10000040.  That default is what
+;;; keeps this change free of boot-descriptor edits: nothing writes the word, so
+;;; on Linux the ELF BSS zero-fill answers "region 0", and on bare metal the
+;;; unwritten-metadata-reads-as-zero assumption this tree already depends on
+;;; (%gc-bitmap-base degrades to the pre-#160 path on exactly that basis) answers
+;;; the same.  An image that never creates a second region is behaviourally
+;;; identical to one built before regions existed.
+;;;
+;;; The eight legacy names below are RETAINED, and their VALUES ARE UNCHANGED:
+;;; they now spell "region 0's block, field F".  Every boot descriptor
+;;; initialises region 0 and so still uses them verbatim.
+(defconstant +gc-region-stride+   #x40)  ; one control block = 8 words
+(defconstant +gc-off-from-start+  #x00)  ; from-space start (byte address)
+(defconstant +gc-off-to-start+    #x08)  ; to-space start
+(defconstant +gc-off-space-size+  #x10)  ; size of each semispace
+(defconstant +gc-off-stack-base+  #x18)  ; top of this region's root stack
+(defconstant +gc-off-count+       #x20)  ; collections performed IN THIS REGION
+(defconstant +gc-off-saved-sp+    #x28)  ; SP at GC entry (trampoline)
+(defconstant +gc-off-saved-alloc+ #x30)  ; alloc ptr at GC entry (r12/x24)
+(defconstant +gc-off-saved-limit+ #x38)  ; alloc limit at GC entry (r14/x25)
+
+;;; ---- STAGE 2: THE ROOT SET IS A PROPERTY OF THE REGION -------------------
+;;;
+;;; Stage 1 made the HEAP per-region.  A heap you cannot name the roots of is
+;;; still one collector, so stage 2 makes the ROOT WINDOW per-region too, out of
+;;; two fields that were already there:
+;;;
+;;;   [ +GC-OFF-SAVED-SP+ , +GC-OFF-STACK-BASE+ )
+;;;
+;;; is the half-open range of machine words the collector scans conservatively
+;;; when it collects THIS region.  Nothing else contributes stack roots — not a
+;;; global stack_base, not another region's window.
+;;;
+;;; +GC-OFF-SAVED-SP+ = 0 MEANS "THIS REGION'S ACTOR IS THE ONE RUNNING", and
+;;; the low end is then the LIVE stack pointer at collector entry, which the
+;;; collector already has in hand (translate-x64's trampoline has pushed every
+;;; register below it, so the register file is inside the window; translate-
+;;; aarch64's shim writes the same value into this field before calling
+;;; %gc-collect).  Non-zero means the region's actor is PARKED: it was switched
+;;; off some other stack, its registers were spilled there by the switch, and
+;;; this is the SP the switch recorded — so the parked triple (SP/alloc/limit)
+;;; that %gc-region-enter maintains IS that actor's root set.  Zero is the
+;;; historic single-actor answer, so nothing had to be initialised anywhere.
+;;;
+;;; WHO WRITES IT: the collector entry point in the running case (aarch64's
+;;; shim; x64 needs no write, it reads RBP), and the context switch in the
+;;; parked case — gc.lisp's %GC-REGION-PARK / %GC-REGION-SWITCH.  The two
+;;; writers can never be live at once, because a region is either running or
+;;; parked.
+;;;
+;;; SOUNDNESS.  Collecting region N while ignoring every other region's roots
+;;; is only correct because no actor may hold a pointer into another actor's
+;;; region: net/actors.lisp TERM-SERIALISES every message (copied, never
+;;; shared).  THAT IS ASSUMED, NOT ENFORCED, at collection time.  gc.lisp's
+;;; %GC-COUNT-FOREIGN-REFS is the debug-mode audit — it counts, in either
+;;; direction, the words of one region that carry a pointer into another — and
+;;; test/region-gc-roots.lisp runs it both ways after a real collection.  The
+;;; collector itself does not call it.
+(defconstant +gc-max-parked-window+ #x1000000
+  "Largest parked root window the collector will scan, in bytes (16 MB).  A
+   PARKED region's low end comes from memory rather than from a register, so a
+   corrupt or stale value would send the conservative scan walking unmapped
+   pages; beyond this size the window is treated as EMPTY instead.  16 MB is
+   two orders above net/actors.lisp's 64 KB actor stacks and still above a
+   default 8 MB pthread stack, so it cannot clip a real one.  It does NOT apply
+   to the running case, whose low end is the live SP and is bounded by
+   construction.")
+
+(defconstant +gc-region-0-base+ #x10000040)
+;;; The active-region word.  #x10000F08 is in the BSS gap boot-rpi-cl.lisp
+;;; documents ("a scan of every #x1000xxxx literal finds NOTHING between
+;;; 0x10000EA8 and 0x10001000"), immediately above that file's own DTB slot at
+;;; 0x10000F00 and clear of translate-x64's pinning scratch, which stops at
+;;; 0x10000EA8 and reserves through 0x10000EC0.
+(defconstant +gc-region-addr+ #x10000F08)
+
+;;; ---- STAGE 3: THE ACTIVE-REGION WORD STOPS BEING *ONE* WORD ---------------
+;;;
+;;; Stage 1 made the heap per-region, stage 2 made the roots per-region.  Both
+;;; still had exactly ONE word saying which region is active, which is one
+;;; collecting thread by construction — the same shape stage 1 removed from the
+;;; metadata block.  Stage 3 makes that word an ARRAY, one entry per CPU:
+;;;
+;;;     this CPU's active-region word  =  +GC-REGION-ADDR+ + 8 * cpu_id
+;;;
+;;; CPU 0's entry IS +GC-REGION-ADDR+, the historic word, at the historic
+;;; address.  So a uniprocessor image reads and writes exactly the word it
+;;; always did, at exactly the address every earlier stage used, and the whole
+;;; per-CPU apparatus is unreachable in it.
+;;;
+;;; WHICH CPU is asked with the per-CPU :CPU-ID slot at +GC-PERCPU-CPU-ID-OFF+.
+;;; That slot is NOT new — every boot descriptor's percpu-layout-fn already
+;;; allocates it (boot-x64 1206, boot-aarch64 689, boot-i386 304, boot-riscv,
+;;; boot-ppc64, boot-68k) — so nothing about the per-CPU block's size or layout
+;;; changes and no target's +*-PERCPU-STRIDE+ moves.
+;;;
+;;; AND IT IS OFF.  Reading a per-CPU slot means GS: on x64, FS: on i386,
+;;; TPIDR_EL1 on aarch64, and on HOSTED Linux the GS base is 0 — an unguarded
+;;; `GS:[16]' reads absolute address 16 and takes SIGSEGV.  So the per-CPU form
+;;; is behind a gate on BOTH sides, and both default to the single word:
+;;;
+;;;   Lisp   (mvm/gc.lisp %GC-REGION-CELL) branches on +GC-REGION-PERCPU-ADDR+,
+;;;          a BSS word that is ZERO in every image ever built — nothing writes
+;;;          it.  Zero = "the active-region word is the single word at
+;;;          +GC-REGION-ADDR+", which is the pre-stage-3 code verbatim.
+;;;   native (translate-x64 EMIT-LOAD-GC-REGION) branches on the HOST flag
+;;;          *X64-GC-REGION-PERCPU*, default NIL, which emits today's
+;;;          `mov reg,[abs32]' — byte for byte, no extra instruction.
+;;;
+;;; TURNING IT ON is therefore two deliberate acts (set the flag, write the
+;;; word) and it must not be done on a target whose GS/FS/TPIDR base is not a
+;;; real per-CPU block.  +GC-REGION-MAX-CPUS+ bounds the table: 16 entries =
+;;; 128 bytes, 0x10000F08..0x10000F88, which stays inside the documented BSS gap
+;;; (nothing between 0x10000EA8 and 0x10001000).  The mode word is put at the
+;;; TOP of that gap so the table can grow toward it.
+(defconstant +gc-region-max-cpus+ 16)
+(defconstant +gc-region-percpu-addr+ #x10000FF8
+  "Per-CPU-active-region mode word.  0 (every image today) = the active region
+   is the single word at +GC-REGION-ADDR+; non-zero = it is
+   +GC-REGION-ADDR+ + 8*cpu_id.")
+;;; ---- THE HOSTED SCHEDULER LOCK ------------------------------------------
+;;;
+;;; net/actors.lisp's SPIN-LOCK/SPIN-UNLOCK take an ADDRESS, and on bare metal
+;;; the board file hands out a fixed physical one.  A hosted process has no
+;;; such RAM, so net/hosted-actors.lisp derives every other actor address by
+;;; carving its own heap at RUNTIME — which is fine for everything the SCHEDULER
+;;; touches and impossible for this one word, because translate-x64's
+;;; +OP-RESTORE-CTX+ has to bake the release into the instruction stream at
+;;; TRANSLATE time (see *X64-SCHED-LOCK-ADDR* there, and its aarch64 twin).
+;;;
+;;; So the hosted scheduler lock lives in the BSS, at a fixed address, in the
+;;; same documented gap the per-region table uses: the table is 16 entries at
+;;; 0x10000F08..0x10000F88 and the mode word is at 0x10000FF8, so
+;;; 0x10000FC0..0x10000FD8 (SMP-INIT zeroes three consecutive words) is free.
+;;; BSS zero-fill means "unlocked" without anything having to initialise it.
+;;;
+;;; TWO PLACES MUST AGREE and a disagreement is an instant deadlock:
+;;; net/hosted-actors.lisp's SCHED-LOCK-ADDR and *X64-SCHED-LOCK-ADDR*, which
+;;; mvm/build-generic-cli.lisp sets from this constant and then ratchets against
+;;; the literal in that file.
+(defconstant +hosted-sched-lock-addr+ #x10000FC0
+  "BSS word the HOSTED actor scheduler's spinlock lives in.  Three words are
+   reserved (0x10000FC0/FC8/FD0) because SMP-INIT zeroes lock+0, +8 and +16.")
+
+;;; ---- THE PER-COLLECTION SCRATCH BLOCK -----------------------------------
+;;;
+;;; The LISP collector (mvm/gc.lisp %GC-COLLECT — the aarch64 SHIM path; x64
+;;; and i386 run native trampolines that keep this state in REGISTERS) needs
+;;; three words of working memory per collection that cannot be Lisp locals,
+;;; because each holds an arbitrary MACHINE WORD and materialising one can
+;;; promote it to a bignum, i.e. ALLOCATE, inside the collector.
+;;;
+;;; Those three words were FIXED SHARED ADDRESSES 0x10000100/0x10000108/
+;;; 0x10000110 — one collecting thread by construction.  They are now a 32-byte
+;;; block addressed PER CPU, and this word holds the base of the per-CPU array
+;;; (+GC-REGION-MAX-CPUS+ entries = 512 bytes).  ZERO — the BSS default, and
+;;; the answer in every image that has not started a second thread — means the
+;;; historic single block at 0x10000100, so nothing needs initialising on a
+;;; target that cannot be booted here.
+;;;
+;;; 0x10000EC8 is the first word past translate-x64's page-PINNING reservation
+;;; (which ends at 0x10000EC0) inside the BSS gap that file documents as free
+;;; through 0x10000EFF.  It is NOT in the per-region table (0x10000F08..F88)
+;;; and NOT the per-CPU gate (0x10000FF8).
+(defconstant +gc-scratch-cfg-addr+ #x10000EC8
+  "BSS word holding the base of the per-CPU GC scratch-block array; 0 = the
+   historic single block at 0x10000100.  mvm/gc.lisp %GC-SCRATCH-CELL.")
+
+(defconstant +gc-percpu-cpu-id-off+ 16
+  "Byte offset of the :CPU-ID slot in the per-CPU block, as every boot
+   descriptor's percpu-layout-fn already defines it.  Stored TAGGED (value =
+   the CPU number), so on x64 `mov reg,GS:[16]' yields 2*cpu_id.")
+
+(defconstant +gc-from-start-addr+  (+ +gc-region-0-base+ +gc-off-from-start+))
+(defconstant +gc-to-start-addr+    (+ +gc-region-0-base+ +gc-off-to-start+))
+(defconstant +gc-space-size-addr+  (+ +gc-region-0-base+ +gc-off-space-size+))
+(defconstant +gc-stack-base-addr+  (+ +gc-region-0-base+ +gc-off-stack-base+))
+(defconstant +gc-count-addr+       (+ +gc-region-0-base+ +gc-off-count+))
+(defconstant +gc-saved-sp-addr+    (+ +gc-region-0-base+ +gc-off-saved-sp+))
+(defconstant +gc-saved-alloc-addr+ (+ +gc-region-0-base+ +gc-off-saved-alloc+))
+(defconstant +gc-saved-limit-addr+ (+ +gc-region-0-base+ +gc-off-saved-limit+))
+
 (defconstant +mv-values-addr+ #x10000098)
 
 ;;; Closure environment storage (fixed address for passing env to closure functions)
 ;;; Place after MV-VALUES area: 0x10000098 + 20*8 = 0x10000138, align to 0x10000140
 (defconstant +closure-env-addr+ #x10000140)
 
+;;; ---- THE PER-THREAD WINDOW ----------------------------------------------
+;;;
+;;; Three pieces of the low BSS are STATE OF THE RUNNING COMPUTATION, not state
+;;; of the process, and every one of them is one copy for the whole image:
+;;;
+;;;   0x10000090 / 0x10000098..0x10000138   the multiple-value return buffer —
+;;;       count, then up to 21 extras.  The producer stores it in its epilogue
+;;;       and the consumer reads it at the call site; anything that runs in
+;;;       between sees, or destroys, somebody else's values.
+;;;   0x10000150                             the dynamic nargs slot, written by
+;;;       a caller and read by an &rest callee's prologue — the same window.
+;;;   0x10000180..0x1019F, 0x10000400..0x10000C0F, 0x10000C10..0x10000C2F
+;;;       the armed handler-case frame (RSP/RBP/IP/RBX), the handler-frame
+;;;       stack with its depth counter, and the longjmp scratch.  Two threads
+;;;       arming handler-cases share ONE armed frame: thread A's fault or
+;;;       ERROR then longjmps onto thread B's stack, which is exactly the
+;;;       "control transfer to 0 or into a live stack" fault this campaign
+;;;       chased.
+;;;
+;;; They are made per-thread by a SEGMENT BASE, not by a new address: the
+;;; addresses stay literally what they were, and a back-end that opts in emits
+;;; the access relative to a segment whose base is 0 on the main thread and
+;;; (block - +TLS-WINDOW-BASE+) on every other.  So the main thread of every
+;;; image reads and writes exactly the words it always did, at exactly the
+;;; addresses every earlier stage used, and one extra prefix byte is the whole
+;;; cost.  Nothing needs initialising for the main thread to be correct, which
+;;; is why this shape was chosen over a per-CPU table with a mode word: a mode
+;;; word has to be written before the first MULTIPLE-VALUE-BIND, and the first
+;;; MULTIPLE-VALUE-BIND happens during boot.
+;;;
+;;; WHAT IS DELIBERATELY NOT IN THE WINDOW, and why, because a wrong answer
+;;; here is silent: 0x10000148 (keyword intern table), 0x10000158 (intern
+;;; counter), 0x10000160/0x10000168 (code bounds), 0x10000170 (package table)
+;;; and 0x10000080/0x10000088 (globals alist, symbol table) all sit INSIDE the
+;;; same address range and are process-global by definition — a per-thread copy
+;;; of the code bounds reads zero and breaks FUNCTIONP on the second thread.
+;;; The window is therefore an explicit SET of slots, not a range.
+;;; +CLOSURE-ENV-ADDR+ is not in it either: on x86-64 the closure environment
+;;; travels in R13, a register, so it is already per-thread; the memory slot is
+;;; only live on back-ends that have not opted in.
+(defconstant +tls-window-base+ #x10000000
+  "Address the per-thread window's offsets are measured from.  A thread's
+   segment base is (its block - this), so offset 0 of the window is this
+   address on the main thread.")
+
+(defconstant +tls-self-addr+ #x10000C30
+  "Per-thread slot holding this thread's SEGMENT BASE — the delta, not the
+   block address.  Code that must hand a window address to a CALLEE reads it
+   and adds the literal address: only an ACCESS can carry a segment override,
+   so an address crossing a function boundary has to be absolute.  (The
+   collector's MV-extras loop is the caller this exists for: it passes each
+   slot's address to a generic slot-forwarder.)
+
+   HOLDING THE DELTA RATHER THAN THE BLOCK IS WHAT MAKES THE MAIN THREAD FREE.
+   Its base is 0 and the slot is BSS zero, so `slot + 0x10000098' is the
+   historic address with nothing ever having initialised anything.  A worker
+   stores (its block - +TLS-WINDOW-BASE+) here when it installs that same value
+   as its segment base.")
+
+(defparameter *tls-window* nil
+  "Emit LOAD/STORE of per-thread-window slots with the thread-local width bit.
+   NIL — every image that has not opted in — emits the historic width, so the
+   bytecode is unchanged.  Set by builds whose target back-end implements the
+   bit (hosted x86-64).")
+
 ;;; Maximum number of register arguments
 (defconstant +max-reg-args+ 4)
+
+(defun %tls-window-offset-p (off)
+  "T when OFF (a byte offset from +TLS-WINDOW-BASE+) names a slot that is
+   state of the running COMPUTATION rather than of the process.  See THE
+   PER-THREAD WINDOW at the head of this file for what each range is and for
+   the slots deliberately left out."
+  (or (and (>= off #x090) (<= off #x138))    ; MV count + 21 extras
+      (and (>= off #x150) (<= off #x157))    ; dynamic nargs (u32)
+      (and (>= off #x180) (<= off #x19F))    ; armed handler frame RSP/RBP/IP/RBX
+      (and (>= off #x400) (<= off #xC0F))    ; handler-stack depth + 64 frames
+      (and (>= off #xC10) (<= off #xC37))))  ; longjmp scratch + the self slot
+
+(defun %tls-window-addr-form-p (form)
+  "T when FORM is an address the compiler can prove, AT COMPILE TIME, lands in
+   the per-thread window.  A bare constant, or (+ K x) / (+ x K) with K such a
+   constant — the MV-extras loop writes (+ +MV-VALUES-ADDR+ (* i 8)) and its
+   index is capped below the end of the extras area, so the base decides.
+   Anything else answers NIL and gets the ordinary process-global access, which
+   is the safe direction: a missed slot is today's behaviour, a wrongly claimed
+   one would give a thread a private copy of a shared table."
+  (cond ((integerp form)
+         (let ((off (- form +tls-window-base+)))
+           (and (>= off 0) (< off #x1000) (%tls-window-offset-p off))))
+        ((and (consp form) (consp (cdr form)) (consp (cddr form))
+              (null (cdddr form))
+              (symbolp (car form)) (name-eq (car form) "+"))
+         (or (%tls-window-addr-form-p (cadr form))
+             (%tls-window-addr-form-p (caddr form))))
+        (t nil)))
+
+(defun %tls-width (width addr-form)
+  "WIDTH, with the thread-local bit set when the window is on and ADDR-FORM is
+   provably a window slot."
+  (if (and *tls-window* (%tls-window-addr-form-p addr-form))
+      (logior width +width-tls-bit+)
+      width))
+
+(defun %mv-width ()
+  "Width code for a direct-IR access to the multiple-value buffer.  The sites
+   that emit :LI + :LOAD/:STORE by hand (UNWIND-PROTECT saving the MV block
+   across its cleanup, TRUNCATE publishing its remainder) name the address as
+   an immediate rather than as a MEM-REF form, so they ask for the bit here
+   instead of going through %TLS-WIDTH."
+  (if *tls-window* +width-u64-tls+ +width-u64+))
+
 
 ;;; ============================================================
 ;;; Compilation State
@@ -5917,19 +6238,37 @@
            (if (cdr saved)
                (setf (gethash (car saved) *macro-table*) (cdr saved))
                (remhash (car saved) *macro-table*)))))
-      ;; WITH-OPEN-FILE — CLHS: open the file, bind the stream, close on ANY
-      ;; exit.  (This used to bind a CLOSED DUMMY stream — (%make-file-stream),
-      ;; fd -1 — so every with-open-file body saw instant EOF and writes went
-      ;; nowhere.  Found when the unmodified Quicklisp client's quicklisp.asd
-      ;; read version.txt through it, 2026-08-26.)  A nil stream — reachable
-      ;; via :if-does-not-exist nil — skips the close.
+      ;; WITH-OPEN-FILE — OPEN the file named, run the body, CLOSE it.
+      ;;
+      ;; This used to bind the variable to (%make-file-stream) — a DUMMY stream —
+      ;; and discard the filename and every option.  It never opened anything, so
+      ;; the body read from a stream attached to no file: character reads returned
+      ;; the eof value and binary reads signalled "file-length: stream is closed".
+      ;; Silent, because returning :EOF is what an empty file does too.  A caller
+      ;; using OPEN/CLOSE by hand got correct data, which is why it survived — the
+      ;; idiomatic form was the broken one.
+      ;;
+      ;; It was a placeholder from before hosted file I/O existed.  It does now:
+      ;; OPEN, CLOSE, READ-BYTE/WRITE-BYTE, READ-SEQUENCE/WRITE-SEQUENCE and
+      ;; FILE-POSITION all verified against a file written by this image and read
+      ;; back by the host.  So the expansion is simply the real one, with
+      ;; UNWIND-PROTECT (which this compiler supports and runs) so the stream is
+      ;; closed on a non-local exit.
+      ;;
+      ;; (with-open-file (VAR FILENAME . OPTIONS) BODY...) — OPTIONS are passed
+      ;; through to OPEN untouched: :direction, :element-type, :if-exists and the
+      ;; rest are OPEN's business, not this macro's.
       ((= op-name 365656143)  ; WITH-OPEN-FILE
-       (let ((spec (cadr form))
-             (body (cddr form)))
-         (compile-form `(let ((,(car spec) (open ,@(cdr spec))))
-                          (unwind-protect (progn ,@body)
-                            (when ,(car spec) (close ,(car spec)))))
-                       env dest)))
+       (let* ((spec (cadr form))
+              (var (car spec))
+              (filename (cadr spec))
+              (options (cddr spec))
+              (body (cddr form)))
+         (compile-form
+          `(let ((,var (open ,filename ,@options)))
+             (unwind-protect (progn ,@body)
+               (when ,var (close ,var))))
+          env dest)))
       ;; WITH-OUTPUT-TO-STRING — create string-output-stream, run body, return string
       ((= op-name 163216281)  ; WITH-OUTPUT-TO-STRING
        (let* ((spec (cadr form))
@@ -6282,6 +6621,9 @@
       ;; uncatchable per-test crash.
       ((= op-name (compute-name-hash "%MMAP-SHARED-PAGE"))
        (compile-mmap-shared (cdr form) env dest))
+      ;; (%spawn-thread entry stack-top tidptr) — clone(2) a NATIVE OS THREAD.
+      ((= op-name (compute-name-hash "%SPAWN-THREAD"))
+       (compile-spawn-thread (cdr form) env dest))
       ;; (%mmap-exec-page size) — PROT_RWX page for the WS4 runtime JIT.
       ((= op-name (compute-name-hash "%MMAP-EXEC-PAGE"))
        (compile-mmap-exec (cdr form) env dest))
@@ -7665,6 +8007,27 @@
   (let ((result nil))
     (labels ((scan (form in-lambda)
                (unless (consp form) (return-from scan))
+               ;; DON'T WALK A QUASIQUOTE TEMPLATE.  Same hazard %COLLECT-FREE-VARS
+               ;; documents: `(cond ,@(cdr clauses))' reads as (SB-INT:QUASIQUOTE
+               ;; (COND #S(COMMA :EXPR (CDR CLAUSES) :KIND 2))), and the template's
+               ;; sublists are DATA, not forms.  SCAN descended into them anyway and
+               ;; handed (COND <comma>) to %CFV-MACROEXPAND, whose COND expander did
+               ;; (car clause) on a COMMA struct -> type error.  The build caught it,
+               ;; printed "WARN macroexpand COND failed at build time", and replaced
+               ;; that form with a runtime (error ...).  19 COND expansions died this
+               ;; way in a single CLI build; with the guard, 0.
+               ;;
+               ;; NOT the cause of the WITH-OPEN-FILE bug, though I assumed it was:
+               ;; with-open-file still hands its body a closed stream after this fix.
+               ;; That is a separate defect and this comment used to claim otherwise.
+               ;;
+               ;; Scan the EXPANSION rather than skipping outright: a comma payload
+               ;; is a real expression and `(foo ,(setq x 1))' really does mutate x,
+               ;; so the boxing decision still needs to see it.  EXPAND-BACKQUOTE is
+               ;; what COMPILE-FORM lowers anyway, so this scans what actually runs.
+               (when (and (consp form) (eq (car form) 'sb-int:quasiquote))
+                 (scan (expand-backquote (cadr form)) in-lambda)
+                 (return-from scan))
                (let ((mx (%cfv-macroexpand form)))
                  (when mx (setq form mx)))
                (unless (consp form) (return-from scan))
@@ -8196,9 +8559,21 @@
 
 (defun compile-let-with-specials (bindings body specials env dest &optional sequential)
   "Compile let/let* with (declare (special ...)) variables.
-   Special vars use dynamic binding via symbol-value/set-symbol-value.
+   Special vars use dynamic binding via symbol-value/%DYNBIND/%DYNUNBIND.
    On entry: save old values, set new values.
    On exit: restore old values, preserving multiple-value state.
+
+   %DYNBIND / %DYNUNBIND, NOT SET-SYMBOL-VALUE, and the difference is only
+   visible on a WORKER THREAD.  A shallow bind writes the new value into the
+   globals table, which lives in REGION 0 — so a worker binding a special to
+   an object it just consed publishes a region-0 -> worker pointer, the one
+   direction per-region collection forbids, and the worker's own copying
+   collector then moves or reclaims the object without updating that slot.
+   %DYNBIND puts the binding in the binding thread's OWN storage instead
+   (mvm/prelude.lisp, PER-THREAD DYNAMIC BINDINGS) and is byte-for-byte the
+   old SET-SYMBOL-VALUE on every thread that has not armed the seam — which
+   is every thread of every single-threaded image, and the main thread of a
+   threaded one.
    When SEQUENTIAL is true (let* context), all bindings are kept in original
    order to preserve sequential dependencies (e.g. from multiple-value-bind).
 
@@ -8282,13 +8657,13 @@
                                    :key (lambda (b)
                                           (symbol-name (if (consp b) (car b) b)))
                                    :test #'string=)
-                         (push `(set-symbol-value ,(%global-var-bind-key spec) ,tmp)
+                         (push `(%dynbind ,(%global-var-bind-key spec) ,tmp)
                                acc)))
                      specials temp-vars)
                (nreverse acc)))
            (restore-forms
              (mapcar (lambda (sv spec)
-                       `(set-symbol-value ,(%global-var-bind-key spec) ,sv))
+                       `(%dynunbind ,(%global-var-bind-key spec) ,sv))
                      save-vars specials))
            (stripped-body (strip-declares body)))
       ;; NON-LOCAL EXIT (#240, 2026-08-08): the restore MUST run on every
@@ -8341,7 +8716,7 @@
                                   (if pos
                                       (list rb
                                             (list (%mvm-gensym "SPECSET")
-                                                  `(set-symbol-value
+                                                  `(%dynbind
                                                     ,(%global-var-bind-key (nth pos specials))
                                                     ,(nth pos temp-vars))))
                                       (list rb)))))
@@ -9885,6 +10260,36 @@
         ((or (= kw 226908395) (= kw 463569520)) :when)  ; WHEN IF
         ((= kw 64017389) :unless)))  ; UNLESS
 
+;;; CLHS 6.1.3: COLLECT, APPEND and NCONC are ONE accumulation category
+;;; ("list"), so several of them with no INTO — or several INTO the SAME
+;;; variable — build a SINGLE list, in source order.  They used to get one
+;;; accumulator EACH here, and the LOOP returned whichever was declared
+;;; first: `(loop for k in '(1 2 3) if (evenp k) collect k else nconc
+;;; (list k k))' answered (2) where it must answer (1 1 2 3 3).  That is
+;;; not an exotic shape — it is how glass's BAND-RECTS splits a tall
+;;; rectangle, so a framebuffer taller than one band encoded to ZERO
+;;; rectangles and a VNC client waited forever for pixels that were never
+;;; going to be described.
+;;;
+;;; The unification is REVERSED accumulation for all three, undone once at
+;;; the end.  COLLECT already pushed with CONS and was NREVERSEd at exit;
+;;; APPEND/NCONC now splice their list on REVERSED (REVAPPEND copies, as
+;;; APPEND must; NRECONC destroys, as NCONC may) and ride the same final
+;;; NREVERSE.  So the three share one variable AND one representation, and
+;;; the O(n^2) forward `(append acc expr)' becomes linear as a side effect.
+(defun %loop-acc-list-kind-p (kind)
+  "True when KIND accumulates into CLHS 6.1.3's `list' category, i.e. it
+   may legally share one accumulator with the other two."
+  (member kind '(:collect :collect-when :append :nconc)))
+
+(defun %loop-acc-group (kind)
+  "The accumulation CATEGORY of KIND — accumulators of the same category
+   with no INTO share one variable.  NIL for kinds that share nothing."
+  (cond ((%loop-acc-list-kind-p kind) :list)
+        ((member kind '(:sum :count)) :numeric)
+        ((member kind '(:maximize :minimize)) :extremum)
+        (t nil)))
+
 (defun %loop-acc-stmt (kind expr into-var)
   "Build the body statement for a single accumulator clause inside a
    WHEN/IF/UNLESS branch.  INTO-VAR is the variable to write into.  The
@@ -9894,8 +10299,8 @@
     (:collect `(setq ,into-var (cons ,expr ,into-var)))
     (:sum     `(setq ,into-var (+ ,into-var ,expr)))
     (:count   `(when ,expr (setq ,into-var (+ ,into-var 1))))
-    (:append  `(setq ,into-var (append ,into-var ,expr)))
-    (:nconc   `(setq ,into-var (nconc ,into-var ,expr)))
+    (:append  `(setq ,into-var (revappend ,expr ,into-var)))
+    (:nconc   `(setq ,into-var (nreconc ,expr ,into-var)))
     (:maximize `(let ((%v ,expr))
                   (setq ,into-var (if (null ,into-var) %v
                                       (if (%loop-gt %v ,into-var) %v ,into-var)))))
@@ -10051,7 +10456,13 @@
                     ;; otherwise allocate a fresh one.
                     (let ((existing
                            (dolist (ci (loop-state-cond-into-acc state) nil)
-                             (when (and (eq (cdr ci) kind)
+                             (when (and (if (%loop-acc-group kind)
+                                            ;; same CATEGORY, not merely the
+                                            ;; same word: COLLECT/APPEND/NCONC
+                                            ;; are one accumulator (CLHS 6.1.3)
+                                            (eq (%loop-acc-group (cdr ci))
+                                                (%loop-acc-group kind))
+                                            (eq (cdr ci) kind))
                                         ;; only treat as shared if it was
                                         ;; an anon (registered via :anon-cond)
                                         (find-if
@@ -10982,9 +11393,21 @@
          ;; running value across iters.  Groups:
          ;;   - :maximize / :minimize  (extremum) — loop10 61
          ;;   - :sum / :count          (numeric)  — loop10 82/83
+         ;;   - :collect / :append / :nconc  (list)      — CLHS 6.1.3
+         ;; The LIST group is seeded from an :anon-cond var when the loop
+         ;; already has one, because that gensym is baked into body-forms
+         ;; by parse-cl-loop and cannot be renamed here — so a top-level
+         ;; COLLECT and a conditional NCONC land on the SAME variable.
          (acc-vars
           (let ((shared-extremum nil)
-                (shared-numeric nil))
+                (shared-numeric nil)
+                (shared-list
+                  (let ((found nil))
+                    (dolist (a accs found)
+                      (when (and (null found)
+                                 (eq (car a) :anon-cond)
+                                 (%loop-acc-list-kind-p (caddr a)))
+                        (setq found (cadr a)))))))
             (mapcar (lambda (a)
                       (cond ((eq (car a) :anon-cond) (cadr a))
                             ((%loop-acc-into-var a)
@@ -10995,6 +11418,9 @@
                             ((member (car a) '(:sum :count))
                              (or shared-numeric
                                  (setq shared-numeric (%mvm-gensym "NUMACC"))))
+                            ((%loop-acc-list-kind-p (car a))
+                             (or shared-list
+                                 (setq shared-list (%mvm-gensym "LISTACC"))))
                             (t (%mvm-gensym "ACC"))))
                     accs)))
          ;; Picks "the" return-value acc (first non-INTO acc with a value).
@@ -11029,7 +11455,12 @@
     ;; first iteration via (if (null acc) val (max acc val)).
     ;; Shared acc-vars (from grouping anonymous :sum/:count or
     ;; :max/:min) appear multiple times in acc-vars — bind once.
-    (let ((i -1) (bound-vars nil))
+    ;; Seeded with the conditional-INTO vars bound just above: a top-level
+    ;; COLLECT can now SHARE an :anon-cond gensym (one list accumulator per
+    ;; CLHS 6.1.3), and binding it twice in the same LET* would shadow the
+    ;; outer one — harmless today because both inits are NIL, wrong the
+    ;; moment a list kind gets a non-NIL init.
+    (let ((i -1) (bound-vars (mapcar (function car) cond-into)))
       (dolist (acc accs)
         (incf i)
         (let ((av (nth i acc-vars)))
@@ -11267,10 +11698,14 @@
             (:count
              (push `(when ,(cadr acc)
                       (setq ,av (+ ,av 1))) acc-body))
+            ;; REVERSED, like :collect, and undone by the same closing
+            ;; NREVERSE — see %LOOP-ACC-LIST-KIND-P.  REVAPPEND copies its
+            ;; argument (APPEND must not destroy it); NRECONC reuses it
+            ;; (NCONC may).
             (:append
-             (push `(setq ,av (append ,av ,(cadr acc))) acc-body))
+             (push `(setq ,av (revappend ,(cadr acc) ,av)) acc-body))
             (:nconc
-             (push `(setq ,av (nconc ,av ,(cadr acc))) acc-body))
+             (push `(setq ,av (nreconc ,(cadr acc) ,av)) acc-body))
             (:maximize
              (push `(let ((%acc-v ,(cadr acc)))
                       (setq ,av
@@ -11439,7 +11874,7 @@
                (let ((ix -1) (fixups nil) (seen-vars nil))
                  (dolist (a accs)
                    (incf ix)
-                   (when (member (car a) '(:collect :collect-when))
+                   (when (%loop-acc-list-kind-p (car a))
                      (let ((v (nth ix acc-vars)))
                        (unless (member v seen-vars)
                          (push v seen-vars)
@@ -11450,7 +11885,7 @@
                  ;; INTO foo, foo gets pushed twice — fixing it twice would
                  ;; cancel the nreverse.
                  (dolist (ci cond-into)
-                   (when (eq (cdr ci) :collect)
+                   (when (%loop-acc-list-kind-p (cdr ci))
                      (let ((v (car ci)))
                        (unless (member v seen-vars)
                          (push v seen-vars)
@@ -12907,11 +13342,11 @@
     ;; These are raw u64 (tagged CL objects), loaded without fixnum shift.
     (let ((mv-temp (alloc-temp-reg)))
       (emit-ir :li mv-temp +mv-count-addr+)
-      (emit-ir :load mv-temp mv-temp +width-u64+)
+      (emit-ir :load mv-temp mv-temp (%mv-width))
       (emit-ir :push mv-temp)
       (dotimes (i n-mv-slots)
         (emit-ir :li mv-temp (+ +mv-values-addr+ (* i 8)))
-        (emit-ir :load mv-temp mv-temp +width-u64+)
+        (emit-ir :load mv-temp mv-temp (%mv-width))
         (emit-ir :push mv-temp))
       (free-temp-reg))
 
@@ -12936,11 +13371,11 @@
       (loop for i from (1- n-mv-slots) downto 0 do
         (emit-ir :pop mv-temp)
         (emit-ir :li addr-temp (+ +mv-values-addr+ (* i 8)))
-        (emit-ir :store addr-temp mv-temp +width-u64+))
+        (emit-ir :store addr-temp mv-temp (%mv-width)))
       ;; Restore MV count
       (emit-ir :pop mv-temp)
       (emit-ir :li addr-temp +mv-count-addr+)
-      (emit-ir :store addr-temp mv-temp +width-u64+)
+      (emit-ir :store addr-temp mv-temp (%mv-width))
       (free-temp-reg)
       (free-temp-reg))
 
@@ -14051,10 +14486,10 @@
             (emit-ir :pop q-temp)
             ;; MV[0] = remainder, MV-COUNT = 2 (n-temp reused as addr)
             (emit-ir :li n-temp +mv-values-addr+)
-            (emit-ir :store n-temp r-temp +width-u64+)
+            (emit-ir :store n-temp r-temp (%mv-width))
             (emit-ir :li n-temp +mv-count-addr+)
             (emit-ir :li r-temp (ash 2 +fixnum-shift+))
-            (emit-ir :store n-temp r-temp +width-u64+)
+            (emit-ir :store n-temp r-temp (%mv-width))
             (emit-ir :mov dest q-temp)
             (free-temp-reg)
             (free-temp-reg)
@@ -14078,10 +14513,10 @@
           (emit-ir :pop q-temp)
           ;; MV[0] = remainder, MV-COUNT = 2
           (emit-ir :li addr-temp +mv-values-addr+)
-          (emit-ir :store addr-temp r-temp +width-u64+)
+          (emit-ir :store addr-temp r-temp (%mv-width))
           (emit-ir :li addr-temp +mv-count-addr+)
           (emit-ir :li r-temp (ash 2 +fixnum-shift+))
-          (emit-ir :store addr-temp r-temp +width-u64+)
+          (emit-ir :store addr-temp r-temp (%mv-width))
           (emit-ir :mov dest q-temp)
           (free-temp-reg)
           (free-temp-reg)
@@ -15278,7 +15713,7 @@
   (let* ((wt (memory-width-code type-form))
          (width (car wt))
          (needs-tag (cdr wt)))
-    (emit-ir :load dest dest width)
+    (emit-ir :load dest dest (%tls-width width addr-form))
     (when needs-tag
       (emit-ir :shl dest dest +fixnum-shift+))))
 
@@ -15335,7 +15770,7 @@
            (when needs-untag
              (emit-ir :sar dest dest +fixnum-shift+))
            ;; Store
-           (emit-ir :store addr-reg dest width)
+           (emit-ir :store addr-reg dest (%tls-width width addr-form))
            ;; Re-tag value in dest if we untagged it (for return value)
            (when needs-untag
              (emit-ir :shl dest dest +fixnum-shift+))
@@ -15601,7 +16036,9 @@
    Reads saved RSP at fixed address 0x10000180. Non-zero means active."
   ;; Load the saved RSP from fixed address
   (emit-ir :li dest #x10000180)
-  (emit-ir :load dest dest +width-u64+)
+  ;; THIS THREAD's armed frame — see THE PER-THREAD WINDOW.  A thread asking
+  ;; "is a handler-case active?" must not be answered about another one.
+  (emit-ir :load dest dest (%mv-width))
   ;; If zero (no handler), return NIL; if non-zero, return T
   (let ((nil-label (make-compiler-label))
         (end-label (make-compiler-label)))
@@ -15734,6 +16171,42 @@
   (compile-aarch64-fileio-trap #x0509 args env dest))
 (defun compile-aarch64-renameat (args env dest)
   (compile-aarch64-fileio-trap #x050A args env dest))
+
+(defun compile-spawn-thread (args env dest)
+  "Compile (%spawn-thread entry stack-top tidptr) — clone(2) a NATIVE OS
+   THREAD sharing this address space.  TRAP #x0540.
+
+   ENTRY is the raw byte address of a ZERO-ARGUMENT native function, as a
+   tagged fixnum — the same convention ACTOR-SPAWN uses for an actor's
+   continuation, i.e. `(fn-addr f)' with translate-x64's OR-3 tag taken off.
+   STACK-TOP is the raw address one past the end of a 16-byte-aligned region
+   the new thread will use as its stack (it grows DOWN from there).  TIDPTR is
+   the raw address of a 4-byte word: the kernel writes the new thread's TID
+   into it at clone time (CLONE_PARENT_SETTID) and ZEROES it when the thread
+   exits (CLONE_CHILD_CLEARTID), which is what makes a join observable without
+   a futex.
+
+   Returns the child TID (tagged) in the PARENT.  In the CHILD it does not
+   return at all: the trap's own stub calls ENTRY on the new stack and then
+   issues SYS_exit — see translate-x64.lisp for why the child MUST NOT return
+   through the caller's frame.
+
+   THREE ARGUMENTS, NOT SIX, and no reuse of COMPILE-SYSCALL6.  A raw
+   `(syscall6 56 …)' cannot work: the child comes back from the syscall with a
+   NEW RSP but the SAME RBP, so every frame-slot reference the compiler emits
+   after the call — frame slots are RBP-relative (translate-x64's
+   +FRAME-SLOT-BASE+) — would read and WRITE the parent's live frame from
+   another thread.  The branch has to happen in the instruction stream, before
+   any compiled Lisp runs.  Args are stack-spilled for the same reason
+   COMPILE-SYSCALL3 spills (see its docstring)."
+  (compile-form (nth 0 args) env dest) (emit-ir :push dest)   ; entry
+  (compile-form (nth 1 args) env dest) (emit-ir :push dest)   ; stack top
+  (compile-form (nth 2 args) env dest)                        ; tidptr in dest
+  (emit-ir :mov +vreg-v2+ dest)
+  (emit-ir :pop +vreg-v1+)
+  (emit-ir :pop +vreg-v0+)
+  (emit-ir :trap #x0540)
+  (emit-ir :mov dest +vreg-v0+))
 
 (defun compile-mmap-shared (args env dest)
   "Compile (%mmap-shared-page size) — allocate a shared anonymous mmap

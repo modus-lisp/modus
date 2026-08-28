@@ -35,9 +35,12 @@
 ;;;; loading this file:
 ;;;;
 ;;;;   *CLI-ARCH*                    :x64 | :aarch64 | :i386
-;;;;   *CLI-ARCH-SYSCALL-SOURCE*     sys-exit / halt.  exit_group is syscall 60
-;;;;                                 on x86-64, 93 on the AArch64 generic ABI
-;;;;                                 and 1 (exit) on the i386 int-0x80 ABI.
+;;;;   *CLI-ARCH-SYSCALL-SOURCE*     sys-exit / halt.  exit_group is syscall 231
+;;;;                                 on x86-64, 94 on the AArch64 generic ABI
+;;;;                                 and 252 on the i386 int-0x80 ABI.  NOT
+;;;;                                 60/93/1 — those are `exit', which ends only
+;;;;                                 the calling thread and hangs a threaded
+;;;;                                 image forever.
 ;;;;   *CLI-ARCH-PROBE-SOURCE*       arch-address diagnostic probes, baked ahead
 ;;;;                                 of kernel-main.
 ;;;;   *CLI-ARCH-KERNEL-PROLOGUE*    hardware setup that must precede the FIRST
@@ -423,6 +426,34 @@
   ;; consistent gc-check/trampoline code.
   (setq *x64-gc-enabled* t)
   (setq *linux-x64-r14-offset* #x38000000)
+  ;; THE PER-THREAD WINDOW must match what the host baked into the image's
+  ;; fixed code, for the same reason *x64-gc-enabled* must: a JIT page that
+  ;; emitted absolute handler-frame accesses while the surrounding AOT code
+  ;; emits FS-relative ones would disagree on any thread whose FS base is not
+  ;; zero.  On the MAIN thread the two are the same address either way, which
+  ;; is why getting this wrong would be silent.
+  ;;
+  ;; BOTH HALVES, AND ONLY ONE WAS HERE.  *X64-TLS-WINDOW* is the TRANSLATOR
+  ;; half — it emits the FS prefix when the width carries the thread-local bit.
+  ;; *TLS-WINDOW* is the COMPILER half — it is what SETS that bit, at
+  ;; %TLS-WIDTH / %MV-WIDTH, for an address it can prove lands in the window.
+  ;; With only the translator half on, the bit was never set and every
+  ;; JIT-compiled MULTIPLE-VALUE-BIND, HANDLER-CASE and UNWIND-PROTECT reached
+  ;; the MAIN THREAD's window from whatever thread it ran on.  CLAUDE.md
+  ;; recorded that as a stated boundary -- runtime EVAL on a second thread was
+  ;; never attempted anyway -- and it is attempted now, because glass is loaded at
+  ;; runtime and its RFB server is HANDLER-CASE on a worker thread.
+  ;;
+  ;; MEASURED BEFORE THE FIX, hosted x64: a JIT-compiled thread body whose
+  ;; whole content was (handler-case 222 (t (c) -1)) died reporting an
+  ;; MVM CALL-IND with a non-callable target -- an indirect call through a
+  ;; handler frame that belonged to another thread-s window.  MULTIPLE-VALUE-
+  ;; BIND and LOOP in the same position were fine, which is exactly the shape
+  ;; of a shared HANDLER-FRAME STACK rather than a shared MV buffer.
+  ;; (No quotation marks in this comment on purpose: it is INSIDE the co-init
+  ;; SOURCE STRING, so a double quote here ends the string literal.)
+  (setq *x64-tls-window* t)
+  (setq *tls-window* t)
   (setq *jit-xlate-err-info* nil)
   ;; WS5 #223 / #278: emit the THUNK's li-const as a load from the GC-updated
   ;; constant vector instead of a baked heap address, so a mid-flight
@@ -947,8 +978,76 @@
 ;; engine of the four legacy fork builds ONLY.  If %e2ic-compile ever fails on
 ;; a new shape it signals honestly (UNDEFINED-FUNCTION via the NIL fn sentinel).
 
+;;; ============================================================
+;;; HOSTED ACTORS (x86-64) — net/actors.lisp's arch adapter
+;;; ============================================================
+;;;
+;;; net/actors.lisp is architecture-independent but has only ever been linked
+;;; into BARE-METAL images, because its twelve address hooks were only ever
+;;; supplied by a board file handing out fixed physical addresses.  A hosted
+;;; process has no such RAM, so net/hosted-actors.lisp derives the same
+;;; addresses by SHRINKING REGION 0 and using the top of the semispaces that
+;;; frees — the same carve mvm/gc.lisp's stage-1/2/3 selftests already use.
+;;;
+;;; x64 ONLY, and hosted only.  aarch64's per-CPU storage is TPIDR_EL1 (a
+;;; system register the kernel does not let userspace write) rather than a GS
+;;; base an ordinary arch_prctl can set, so the aarch64 CLI gets "" here and
+;;; its blob is byte-identical to before.  Bare-metal targets already have a
+;;; board file and do not want this one.
+;;; THE ORDER IS LOAD-BEARING.  net/hosted-actors.lisp supplies the twelve
+;;; address hooks and must precede net/actors.lisp (a forward reference across
+;;; the blob does not resolve).  net/hosted-actors-post.lisp must FOLLOW it,
+;;; because its SPIN-LOCK / SPIN-UNLOCK / AP-SCHEDULER are last-defun-wins
+;;; overrides of definitions net/actors.lisp itself makes.
+(defvar *cli-hosted-actors-source*
+  (if (and (eq *cli-arch* :x64) (not *cli-bare-metal*))
+      (concatenate 'string (string #\Newline)
+                   (mvm-text "net/hosted-actors.lisp")
+                   (string #\Newline)
+                   (mvm-text "net/actors.lisp")
+                   (string #\Newline)
+                   (mvm-text "net/hosted-actors-post.lisp")
+                   (string #\Newline)
+                   ;; REAL TIME AND REAL BLOCKING.  Last in the group, because
+                   ;; its SLEEP is a last-defun-wins override of the CL
+                   ;; bridge's no-op stub and its %THR-PAGE calls SPIN-LOCK
+                   ;; (net/actors.lisp) and %HA-ZERO (net/hosted-actors.lisp).
+                   (mvm-text "net/hosted-sync.lisp")
+                   (string #\Newline)
+                   ;; THE SOCKET LAYER ON TWO CPUs.  Last in the group, and
+                   ;; that is load-bearing three times over: its %SOCK-IO-BUF /
+                   ;; %SOCK-ADDR-BUF / %SOCK-IO-CAP are last-defun-wins
+                   ;; overrides of the seam net/hosted-sockets.lisp defines
+                   ;; (which is baked inside *BRIDGE-SOURCE*, well above this);
+                   ;; it calls SPIN-LOCK (net/actors.lisp) and %THR-CPU /
+                   ;; %SLEEP-MS / %MONOTONIC-NS (net/hosted-sync.lisp), neither
+                   ;; of which resolves as a forward reference; and it spawns
+                   ;; thread 2 through %HA-SPAWN-T2 (net/hosted-actors-post).
+                   ;; "" on aarch64 and on bare metal with the rest of the
+                   ;; group, so those images keep the single-buffer socket
+                   ;; layer and their blobs are unaffected.
+                   (mvm-text "net/hosted-sockets-post.lisp")
+                   (string #\Newline)
+                   ;; THE AOT HALF OF AN A/B.  test/hosted-intern-layers.lisp's
+                   ;; `low' arm — a worker interning fresh symbols through
+                   ;; %INTERN-SYMBOL-PKG — dies about half the time while its
+                   ;; cross-region audit reads ZERO, and the green test that
+                   ;; interns through the SAME function differs from it in
+                   ;; exactly one unmeasured way: the green one's loop is
+                   ;; compiled INTO THE IMAGE.  This file is that loop, in the
+                   ;; image, so the difference can be measured instead of
+                   ;; argued.  Last in the group: it calls %INTERN-SYMBOL-PKG
+                   ;; (prelude), %GC-* (mvm/gc.lisp) and CL:INTERN /
+                   ;; CONCATENATE (the CL bridge), none of which resolve as
+                   ;; forward references across the blob.  "" on aarch64 and on
+                   ;; bare metal with the rest of the group.
+                   (mvm-text "net/hosted-intern-probe.lisp")
+                   (string #\Newline))
+      ""))
+
 (format t "  prelude: ~D chars~%" (length *prelude-source*))
 (format t "  gc:      ~D chars~%" (length *gc-source*))
+(format t "  hosted-actors: ~D chars~%" (length *cli-hosted-actors-source*))
 (format t "  rt:      ~D chars~%" (length *rt-source*))
 (format t "  rtest:   ~D chars~%" (length *rtest-pkg-source*))
 (format t "  bridge:  ~D chars~%" (length *bridge-source*))
@@ -999,8 +1098,10 @@
 ;; still sees these defuns unchanged.
 (defvar *driver-source*
  (concatenate 'string
-  ;; ARCH SLOT: sys-exit / halt.  exit_group is syscall 60 on x86-64 and 93 on
-  ;; the AArch64 generic ABI.
+  ;; ARCH SLOT: sys-exit / halt.  exit_group — the one that ends the PROCESS
+  ;; and not merely the calling thread — is syscall 231 on x86-64, 94 on the
+  ;; AArch64 generic ABI and 252 on i386.  Using plain `exit' (60/93/1) is a
+  ;; hang the moment a second thread is alive; see the arch files.
   *cli-arch-syscall-source*
   (mvm-text "lib/runtime-backquote.lisp")
   ;; ARCH SLOT: arch-address diagnostic probes, baked ahead of kernel-main.
@@ -1168,6 +1269,16 @@
   ;; leaves Modus unrecognised, which is the pre-#237 status quo.
   ;; MODUS_NO_GENERA=1 skips it (see %install-genera-compat).
   (handler-case (%install-genera-compat) (t (c) nil))
+  ;; THE SBCL COMPATIBILITY SURFACE — SB-THREAD, SB-BSD-SOCKETS, SB-POSIX,
+  ;; SB-SYS, SB-ALIEN.  MUST come after %install-runtime-cl-macros (the source
+  ;; uses DEFCLASS / DOLIST / WHEN / UNLESS / LOOP) and BEFORE cli-toplevel, so
+  ;; that ~/.modusrc, --load, --script and --eval all see the packages BEFORE
+  ;; any form mentioning them is READ.  That ordering is not a nicety: a package
+  ;; that does not exist at read time is a READER-ERROR on the whole form, so a
+  ;; script saying `sb-thread:make-thread' does not fail at the call, it fails
+  ;; at the read.  Wrapped: a failure here must never take down a normal boot.
+  ;; MODUS_NO_SB=1 skips it.
+  (handler-case (%install-sb-shims) (t (c) nil))
   ;; RTEST — the RT regression tester package (mvm/rtest.lisp).  MUST be
   ;; created HERE, at boot, from image code: a package born at runtime is
   ;; marked runtime-born and its symbols get package-folded function-table
@@ -1255,6 +1366,62 @@
         (length *genera-compat-text*))
 
 ;;; ============================================================
+;;; THE SBCL COMPATIBILITY SURFACE (SB-THREAD, SB-BSD-SOCKETS, SB-POSIX,
+;;; SB-SYS, SB-ALIEN)
+;;;
+;;; net/sb-thread-shim.lisp and net/sb-sys-shim.lisp have the rationale and
+;;; the PARTIAL list.  Baked as boot-evaluated SOURCE STRINGS for the same
+;;; reason the Genera surface is, and for one more: these packages EXIST on
+;;; the host.  `(defpackage "SB-THREAD" …)' read and evaluated host-side
+;;; would collide with SBCL's own, and `(defun sb-thread:make-thread …)'
+;;; would be a package-lock violation.  Carried as a literal, nothing
+;;; host-side ever reads a form in them.
+;;;
+;;; ORDER: THREAD BEFORE SYS.  The socket shim's SOCKET-MAKE-STREAM and the
+;;; thread shim are independent, but %SB-THREADS-UP is the thing that turns
+;;; per-CPU regions on, and anything that wants a thread wants that first.
+;;;
+;;; WHY IT IS INSTALLED AT ALL, given that modus advertises :GENERA and not
+;;; :SBCL.  Because `#+sb-thread' in portable code — glass/fb's framebuffer
+;;; and clipboard locks are exactly this — is a question about a SURFACE, not
+;;; about a vendor.  With the surface present, that code takes the same arm
+;;; SBCL takes, which is the arm it is tested on.  The features pushed are
+;;; :SB-THREAD and :SB-BSD-SOCKETS and NOT :SBCL: modus is not SBCL and code
+;;; that asks whether it is still gets the right answer.
+;;;
+;;; NOTHING HERE LISTENS, CONNECTS OR STARTS A THREAD.  Installing the shim
+;;; creates packages and defines functions.  A socket is opened when a caller
+;;; makes one; a thread starts when a caller asks for one.
+;;;
+;;; ESCAPE HATCH: MODUS_NO_SB=1 skips both entirely — no packages, no
+;;; features, boot cost back to baseline.  Same reversible-flip pattern as
+;;; MODUS_NO_GENERA.
+;;; ============================================================
+
+(defvar *sb-shim-text*
+  (concatenate 'string
+               (read-file-text (merge-pathnames "net/sb-thread-shim.lisp"
+                                                *modus-base*))
+               (string #\Newline)
+               (read-file-text (merge-pathnames "net/sb-sys-shim.lisp"
+                                                *modus-base*))))
+
+(defvar *sb-shim-source*
+  (concatenate 'string "
+(defun %sb-shim-source ()
+  \"" (%escape-lisp-string *sb-shim-text*) "\")
+
+(defun %install-sb-shims ()
+  (let ((off (%cli-getenv \"MODUS_NO_SB\")))
+    (if (and off (> (length off) 0) (not (string= off \"0\")))
+        nil
+        (progn (%it-eval-source (%sb-shim-source) \"sb-shims\") t))))
+"))
+
+(format t "  sb-shim: ~D chars (sb-thread/sb-bsd-sockets source baked for boot-time eval)~%"
+        (length *sb-shim-text*))
+
+;;; ============================================================
 ;;; ASDF INTERFACE over Modus's own loader
 ;;;
 ;;; net/asdf-interface.lisp's header has the rationale and the honest
@@ -1318,6 +1485,10 @@
                        *rt-macros-source* (string #\Newline)
                        *bridge-source*   (string #\Newline)
                        *cli-arch-override-source*
+                       ;; HOSTED ACTORS: "" on aarch64 and on bare metal, so
+                       ;; their scanner input — hence SFT-AUTO and
+                       ;; SYM-NAME-AUTO — is byte-identical to before.
+                       *cli-hosted-actors-source*
                        ;; BARE-METAL NET SEAM, second use site.  The scanners
                        ;; below are what put a defun in *SYMBOL-FUNCTION-TABLE*
                        ;; and a token in *SYM-NAME-TABLE*; a bare-metal target's
@@ -1561,6 +1732,12 @@
     ;; override cl-fileio.lisp and lib/cli-toplevel.lisp, both baked inside it).
     ;; "" on x64.
     *cli-arch-override-source*
+    ;; HOSTED ACTORS (x86-64 hosted only; "" elsewhere).  POSITION IS
+    ;; LOAD-BEARING: after mvm/gc.lisp (whose %gc-region-* / %gc-read64 it
+    ;; calls — a forward reference across the blob does not resolve) and after
+    ;; the CL bridge (whose CONS/CAR/CONSP it uses), and before the compiler so
+    ;; nothing here can shadow a compiler internal.
+    *cli-hosted-actors-source*
     ;; STAGE 1: MVM ISA constants/structs + bytecode interpreter.
     *isa-source*
     (string #\Newline)
@@ -1608,6 +1785,16 @@
     ;; "WARN li-func: unresolved function %INSTALL-GENERA-COMPAT —
     ;; emitting NIL sentinel", i.e. a silent no-op boot hook.
     *genera-source*
+    (string #\Newline)
+    ;; THE SBCL COMPATIBILITY SURFACE.  Same placement rule and the same
+    ;; two reasons as *genera-source*: BEFORE *driver-source* because
+    ;; kernel-main calls %install-sb-shims and a forward reference across
+    ;; the blob emits a NIL sentinel (a silent no-op boot hook), and NOT in
+    ;; *all-runtime-source* because its body is one large string literal
+    ;; that the TEXTUAL scan-defuns scanner would mine for names like
+    ;; `sb-thread::make-thread' and then emit `#'sb-thread::make-thread'
+    ;; into a chunk that cannot compile.
+    *sb-shim-source*
     (string #\Newline)
     ;; ASDF interface (net/asdf-interface.lisp).  Same placement rule as
     ;; *genera-source*: BEFORE *driver-source*, because kernel-main calls

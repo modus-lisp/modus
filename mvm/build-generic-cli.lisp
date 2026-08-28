@@ -39,14 +39,26 @@
 
 (defvar *cli-arch* :x64)
 
-;; exit_group is syscall 60 on x86-64 (93 on the AArch64 generic ABI).
+;; ABI FACT, and it was WRONG here until the image grew threads: on x86-64
+;; syscall 60 is `exit', which ends ONLY THE CALLING THREAD; `exit_group', the
+;; one that ends the process, is 231.  (93 vs 94 on the AArch64 generic ABI,
+;; 1 vs 252 on i386.)  In a single-threaded image the two are indistinguishable,
+;; which is why this stood for so long.
+;;
+;; With a second thread alive the difference is a HANG.  The main thread exits
+;; through `exit', the kernel leaves the group leader as an unreapable ZOMBIE
+;; because the thread group is not empty, the second thread stays parked in
+;; futex_wait with nobody left to wake it, and any parent reading this process's
+;; output through a pipe never sees EOF.  That is the whole of the
+;; test/hosted-thread-lisp.lisp "flake": a fault on the main thread turned into
+;; a silent infinite hang instead of a report.  See test/run-thread-exit.sh.
 (defvar *cli-arch-syscall-source*
 "
 (defun sys-exit (code)
   (let ((c code))
-    (syscall3 60 c 0 0)))
+    (syscall3 231 c 0 0)))
 (defun halt ()
-  (syscall3 60 1 0 0))
+  (syscall3 231 1 0 0))
 ")
 
 ;; argv/argc off the fixed BSS slots the x64 boot preamble publishes, plus
@@ -140,6 +152,56 @@
 ;; intact (silently looks like the fn returned T or whatever else
 ;; was in RAX).  See reference_append_funcall_bug.md.
 (setf modus.mvm.x64::*x64-native-code-offset* 397)
+
+;; NATIVE THREADS, STEP 1: the hosted actor scheduler gets a REAL spinlock.
+;; net/actors.lisp hands the lock's RELEASE to RESTORE-CONTEXT; with this set,
+;; translate-x64's +OP-RESTORE-CTX+ honours that contract the way aarch64's
+;; always has (store 0 AFTER the stack switch, before the jump).  Without it a
+;; real SPIN-LOCK would be held across every context switch and deadlock.
+;; RATCHET: net/hosted-actors.lisp's SCHED-LOCK-ADDR must hand out THIS address
+;; or the mutator and the switch release different words.
+(setf modus.mvm.x64::*x64-sched-lock-addr* modus.mvm::+hosted-sched-lock-addr+)
+
+;; NATIVE THREADS, STEP 3: the ACTIVE REGION becomes PER-THREAD.
+;; :RUNTIME, deliberately, and not T.  This one binary serves ordinary
+;; single-threaded runs — GS base 0, where an unguarded `GS:[16]' SIGSEGVs on
+;; the first collection — AND threaded runs, where every thread has installed a
+;; per-CPU block and the collector must read THIS thread's cell.  :RUNTIME emits
+;; both forms and branches on the SAME gate word mvm/gc.lisp's %GC-REGION-CELL
+;; branches on (+GC-REGION-PERCPU-ADDR+), so the Lisp side and the native
+;; collector flip together and cannot read different cells.  The gate is 0 in
+;; the BSS, so a ./modus that never starts a thread behaves exactly as before.
+;; The branch is paid three times per COLLECTION (the only callers are inside
+;; the GC trampoline), never in an allocation fast path.
+(setf modus.mvm.x64::*x64-gc-region-percpu* :runtime)
+
+;; NATIVE THREADS, STEP 6: THE MULTIPLE-VALUE BUFFER AND THE HANDLER-FRAME
+;; STACK BECOME PER-THREAD.  Both sides of the seam are set here because they
+;; describe ONE decision: the compiler marks a LOAD/STORE whose address is a
+;; per-thread-window slot (mvm/compiler.lisp, THE PER-THREAD WINDOW), and the
+;; back-end turns that mark into an FS segment override (mvm/translate-x64.lisp,
+;; *X64-TLS-WINDOW*).  Set one without the other and the mark is emitted and
+;; then ignored — which is exactly today's behaviour, so it fails silently
+;; rather than loudly, hence both here in one place.
+;;
+;; This is safe for ordinary single-threaded runs WITHOUT any initialisation:
+;; a fresh Linux process has FS base 0, so every one of these accesses names
+;; the same word at the same address it always did.  A worker thread installs
+;; its own FS base as its first act.
+(setf modus.mvm::*tls-window* t)
+(setf modus.mvm.x64::*x64-tls-window* t)
+(let ((txt (with-open-file (s (merge-pathnames "net/hosted-actors.lisp"
+                                               cl-user::*modus-base*))
+             (let ((b (make-string (file-length s))))
+               (subseq b 0 (read-sequence b s)))))
+      (want (format nil "(defun sched-lock-addr ()    #x~8,'0X)"
+                    modus.mvm::+hosted-sched-lock-addr+)))
+  (unless (search want txt)
+    (error "build-generic-cli: net/hosted-actors.lisp's SCHED-LOCK-ADDR does ~
+            not hand out +HOSTED-SCHED-LOCK-ADDR+ (~8,'0X).  Expected the line~% ~
+            ~A~%The scheduler lock the mutator takes and the word RESTORE-CTX ~
+            releases MUST be the same address, or the first context switch ~
+            deadlocks." modus.mvm::+hosted-sched-lock-addr+ want)))
 
 ;; Enable the GC trampoline: without this, every :alloc-obj advances R12
 ;; unchecked and the heap walks past the mapped region in long-running

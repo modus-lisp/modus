@@ -485,7 +485,17 @@
                   (and n (stringp n) (> (length n) 0) n))))))
 
 (defun %macro-pkg-get (sym key)
-  "Expander registered for SYM's own package under name KEY, or NIL."
+  "Expander registered for SYM's own package under name KEY, or NIL.
+
+   LOCKED, like every other shared runtime table — see %RT-ENTER in
+   mvm/prelude.lisp.  A load and a branch until a program declares that it is
+   running Lisp on more than one thread."
+  (%rt-enter)
+  (let ((r (%macro-pkg-get-1 sym key)))
+    (%rt-leave)
+    r))
+
+(defun %macro-pkg-get-1 (sym key)
   (let ((res nil))
     (when (and *macro-pkg-table* (stringp key))
       (let ((pn (%macro-sym-pkg-name sym)))
@@ -496,7 +506,13 @@
     res))
 
 (defun %macro-pkg-put (sym key fn)
-  "Register FN as the expander for SYM's own package under name KEY."
+  "Register FN as the expander for SYM's own package under name KEY.  LOCKED."
+  (%rt-enter)
+  (let ((r (%macro-pkg-put-1 sym key fn)))
+    (%rt-leave)
+    r))
+
+(defun %macro-pkg-put-1 (sym key fn)
   (let ((pn (%macro-sym-pkg-name sym)))
     (when (and pn (stringp key))
       (unless *macro-pkg-table*
@@ -510,7 +526,13 @@
             (puthash key *macro-pkg-table* (cons (cons pn fn) al)))))))
 
 (defun %macro-pkg-rem (sym key)
-  "Drop SYM's own-package expander under name KEY (fmakunbound)."
+  "Drop SYM's own-package expander under name KEY (fmakunbound).  LOCKED."
+  (%rt-enter)
+  (let ((r (%macro-pkg-rem-1 sym key)))
+    (%rt-leave)
+    r))
+
+(defun %macro-pkg-rem-1 (sym key)
   (let ((pn (%macro-sym-pkg-name sym)))
     (when (and pn *macro-pkg-table* (stringp key))
       (let ((al (gethash key *macro-pkg-table*))

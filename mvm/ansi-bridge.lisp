@@ -3834,14 +3834,74 @@
         (+ unix-sec 2208988800)
         0)))
 
-(defun get-internal-run-time ()
-  "Return internal run time units."
+;; GET-INTERNAL-RUN-TIME's real body is with GET-INTERNAL-REAL-TIME below,
+;; over the same seam.  Returning a constant 0 made `(- after before)' zero
+;; for every measurement in the image.
+
+;;; ============================================================
+;;; THE INTERNAL CLOCKS ARE CLOCKS — %IRT-NS / %IRUN-NS
+;;; ============================================================
+;;;
+;;; A SEAM, defined here at 0 ("this target has no clock") and overridden
+;;; by last-defun-wins in net/hosted-sync.lisp, which is where
+;;; clock_gettime(2) can actually be called (it owns the per-CPU timespec
+;;; scratch — a shared one would be two threads writing one buffer).
+;;; Bare-metal images keep the counter fallback below, which is what they
+;;; had; hosted images get a real monotonic clock.
+;;;
+;;; UNITS ARE NANOSECONDS HERE and INTERNAL-TIME-UNITS-PER-SECOND out
+;;; there, converted in ONE place, so the two cannot drift.  They HAD
+;;; drifted: the old GET-INTERNAL-REAL-TIME returned a CALL COUNTER — 1,
+;;; 2, 3 on successive calls, unmoved by a real (SLEEP 2) — while
+;;; INTERNAL-TIME-UNITS-PER-SECOND said 1000, so every rate limit, timeout
+;;; and frame pacer written against it counted CALLS and called them
+;;; milliseconds.  (glass's RFB sender is one of those.)  The counter is
+;;; still the LAST resort, because a clock that stands still is worse than
+;;; one that ticks in the wrong unit, but it is no longer the only answer.
+(defun %irt-ns ()
+  "Monotonic elapsed nanoseconds, or 0 if this target has no clock."
   0)
 
-;; GET-INTERNAL-REAL-TIME early stub removed 2026-06-01 — real
-;; syscall-based copy at L3388 wins.
+(defun %irun-ns ()
+  "Consumed CPU nanoseconds, or 0 if this target has no clock."
+  0)
 
-(defvar internal-time-units-per-second 1000)
+(defvar internal-time-units-per-second 1000000)
+
+(defvar *%irt-counter* 0)
+(defvar *%irun-counter* 0)
+
+(defun %ns-to-itu (ns)
+  "NS nanoseconds as INTERNAL-TIME-UNITS.  Integer division, so the unit
+   is whatever INTERNAL-TIME-UNITS-PER-SECOND currently says and nothing
+   has to be edited in two places when it changes."
+  (let ((per (if (and (boundp (quote internal-time-units-per-second))
+                      (integerp internal-time-units-per-second)
+                      (> internal-time-units-per-second 0))
+                 internal-time-units-per-second
+                 1000000)))
+    (if (>= per 1000000000)
+        (* ns (floor per 1000000000))
+        (floor ns (floor 1000000000 per)))))
+
+(defun get-internal-real-time ()
+  "CLHS GET-INTERNAL-REAL-TIME: elapsed time in INTERNAL-TIME-UNITS from an
+   arbitrary origin.  A monotonic clock where there is one; a call counter
+   only where there is not."
+  (let ((ns (%irt-ns)))
+    (if (and (integerp ns) (> ns 0))
+        (%ns-to-itu ns)
+        (progn (setq *%irt-counter* (+ *%irt-counter* 1))
+               *%irt-counter*))))
+
+(defun get-internal-run-time ()
+  "CLHS GET-INTERNAL-RUN-TIME: CPU time consumed, in INTERNAL-TIME-UNITS.
+   Was a constant 0, which made every (- after before) zero."
+  (let ((ns (%irun-ns)))
+    (if (and (integerp ns) (> ns 0))
+        (%ns-to-itu ns)
+        (progn (setq *%irun-counter* (+ *%irun-counter* 1))
+               *%irun-counter*))))
 
 (defun %leap-year-p (year)
   (and (= 0 (mod year 4))
@@ -4559,15 +4619,20 @@
              (* minute 60)
              second
              (* zone 3600))))))
-;;; GET-INTERNAL-REAL-TIME — uses Linux time(2) (syscall 201) when
-;;; available, falls back to a monotonic counter.
-(defvar *%irt-counter* 0)
-(defun get-internal-real-time ()
-  (let ((t (handler-case (syscall3 201 0 0 0) (t (c) 0))))
-    (cond
-      ((and (integerp t) (> t 0)) t)
-      (t (setq *%irt-counter* (+ *%irt-counter* 1))
-         *%irt-counter*))))
+;;; GET-INTERNAL-REAL-TIME lives with GET-INTERNAL-RUN-TIME and
+;;; INTERNAL-TIME-UNITS-PER-SECOND, up at "THE INTERNAL CLOCKS ARE CLOCKS".
+;;; The copy that used to be here was LAST, so it was the one that won, and
+;;; it was a call counter for two reasons at once:
+;;;
+;;;   (let ((t (handler-case (syscall3 201 0 0 0) (t (c) 0)))) …)
+;;;
+;;; (1) it BOUND T.  T is a constant; a reference to `t' in the body reads
+;;; the constant, so `(integerp t)' asked whether TRUE is an integer, said
+;;; NO, and fell through to the counter on EVERY call regardless of what
+;;; the syscall returned.  (2) Even had it worked, syscall 201 is `time(2)'
+;;; — WHOLE SECONDS since the epoch — reported as if it were the 1000ths
+;;; INTERNAL-TIME-UNITS-PER-SECOND promised, and 201 is `listen(2)' on the
+;;; AArch64 generic ABI, so this was never portable either.
 
 ;;; CLASS-OF — strict 1-arg arity
 (defun class-of (x &rest extra)

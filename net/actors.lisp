@@ -12,6 +12,18 @@
 ;;;;   get-idle-flag, set-idle-flag,
 ;;;;   wake-idle-ap
 ;;;;
+;;;; THE THREE PROGRESS MARKERS ("ACT", "Bye", "!") GO TO WRITE-CHAR-SERIAL,
+;;;; not to WRITE-BYTE, and that is not cosmetic.  WRITE-BYTE is a name with
+;;;; two incompatible meanings: on a board it is the arch adapter's ONE-argument
+;;;; console byte (net/arch-x86.lisp, net/arch-aarch64.lisp, …), and in a CL
+;;;; image it is ANSI's TWO-argument (write-byte byte stream).  This file is
+;;;; architecture-independent, so it cannot depend on which one it gets, and a
+;;;; one-argument call to the CL function is an arity error.  WRITE-CHAR-SERIAL
+;;;; is an MVM intrinsic (trap #x0300) that exists on every target — COM1/UART
+;;;; on bare metal, SYS_write(1) on hosted Linux — and is exactly what every
+;;;; board's WRITE-BYTE does with a boot marker anyway.  This is what lets the
+;;;; file be linked into a hosted image at all.
+;;;;
 ;;;; Actor struct layout (128 bytes, same as x86):
 ;;;;   +0x00  status        (0=free, 1=running, 2=ready, 3=dead, 4=blocked)
 ;;;;   +0x08  save area: SP
@@ -26,21 +38,79 @@
 ;;;;   +0x50  mailbox-head
 ;;;;   +0x58  mailbox-tail
 ;;;;   +0x60  linked-actor
-;;;;   +0x68  (reserved)
+;;;;   +0x68  GC REGION (raw byte address of this actor's 64-byte region
+;;;;          control block; ZERO MEANS REGION 0 — see below)
 ;;;;   +0x70  obj-alloc (per-actor object space)
 ;;;;   +0x78  obj-limit (per-actor object space)
+;;;;
+;;;; PER-REGION GC, STAGE 3: A REGION IS A PROPERTY OF AN ACTOR.
+;;;; Stage 1 made the heap a property of a region and stage 2 made the root set
+;;;; one; +0x68 is where an actor says WHICH region is its own.  It holds the
+;;;; raw byte address of that actor's control block in the same convention as
+;;;; the SP at +0x08 and the alloc pointer/limit at +0x10/+0x18 — the STORED
+;;;; MACHINE WORD is the address, hence (untag …) going in and *2 coming back.
+;;;;
+;;;; ZERO MEANS REGION 0, and that is the whole compatibility story: nothing
+;;;; writes the slot, SPAWN does not initialise it, and an actor whose slot is
+;;;; zero bump-allocates in region 0 exactly as every actor in every image
+;;;; built so far does.  ACTOR-REGION-HOP below short-circuits when NEITHER
+;;;; side of a switch owns a region, so a scheduler in which no actor owns one
+;;;; performs not a single extra memory write.
+;;;;
+;;;; +0x68 rather than the other reserved slot at +0x28 because +0x28 is inside
+;;;; the save area :SAVE-CTX writes through: SAVE-CONTEXT is handed cur+0x08 and
+;;;; stores SP/alloc/limit/V4 at pa+0x00…0x18, the continuation at pa+0x28
+;;;; (= struct +0x30) and, on aarch64, obj-alloc/obj-limit at pa+0x68/0x70
+;;;; (= struct +0x70/+0x78).  Struct +0x68 is pa+0x60, which nothing writes.
+;;;;
+;;;; WHAT THIS IMAGE DOES NOT HAVE.  A net/-only image does not link
+;;;; mvm/gc.lisp, so %GC-REGION-SWITCH and friends resolve through
+;;;; bare-runtime-stubs.lisp's %UNRESOLVED-FN and return NIL here.  That is
+;;;; harmless precisely because of the zero guard — the calls are unreachable
+;;;; while no actor owns a region — but it means GIVING AN ACTOR A REGION ON
+;;;; BARE METAL REQUIRES LINKING mvm/gc.lisp INTO THAT IMAGE FIRST.  The build
+;;;; log names every unresolved callee, so the gap is visible, not silent.
 
 ;;; ============================================================
 ;;; Spinlocks
 ;;; ============================================================
 
 ;; Acquire spinlock at addr using atomic exchange (TTAS pattern)
+;;
+;; THE INNER LOOP READS :U8, AND IT USED TO READ :U64, WHICH MADE IT A NO-OP.
+;; The whole point of test-and-TEST-and-set is that a thread which fails to
+;; acquire spins on a plain LOAD — the line stays Shared in every waiter's cache
+;; and only the release invalidates it — instead of hammering the line with
+;; XCHG, which takes it Exclusive on every attempt and starves the holder's
+;; neighbours.
+;;
+;; SPIN-UNLOCK writes the word as a RAW machine word (0 or 1), and per
+;; mvm/gc.lisp's word-access block `(mem-ref addr :u64)' loads the machine word
+;; and hands it back AS A TAGGED LISP VALUE — so a held lock, raw 1, read back
+;; as :u64 is the Lisp value 0 and `zerop' said UNLOCKED every time.  The inner
+;; loop therefore fell straight through on its first iteration and the acquire
+;; degenerated into an unbounded XCHG hammer.
+;;
+;; :U8 IS THE FIX AND IT IS DELIBERATELY NOT :U64.  A :u8 load is tagged on the
+;; way out (mvm-eval's mem-ref semantics), so the Lisp value IS the raw byte: 0
+;; or 1.  It reads byte 0 of the word, which on a little-endian target is the
+;; one SPIN-UNLOCK zeroes — the same assumption NEEDS-STAGING and STAGING-TAG in
+;; this file already make.  On a big-endian target byte 0 is the MSB, always 0
+;; for a 0/1 lock, so the loop falls through exactly as it does today: the fix
+;; is an improvement where it applies and a no-op where it does not.
+;;
+;; MEASURED on hosted x86-64 with an actor busy-polling TRY-RECEIVE + YIELD on
+;; one thread (it takes and releases this lock twice per iteration with no work
+;; in between) while another thread SENDs to it: ten sends took 2.0 s of extra
+;; wall time typically and 122 s in the worst run observed, because the
+;; releasing thread re-acquired from its own L1 before the remote XCHG could
+;; land.  With the read-only wait it is 0.1 s.
 (defun spin-lock (addr)
   (loop
     (if (zerop (xchg-mem addr 1))
         (return 0)
         (loop
-          (if (zerop (mem-ref addr :u64))
+          (if (zerop (mem-ref addr :u8))
               (return 0)
               (pause))))))
 
@@ -68,6 +138,52 @@
 ;; Stack top for actor ID (each gets 64KB, grows down)
 (defun actor-stack-top (id)
   (+ (actor-stack-base) (* (+ id 1) #x10000)))
+
+;;; ============================================================
+;;; Per-region GC (stage 3): which region is this actor's?
+;;; ============================================================
+
+;; Raw byte address of ID's region control block, 0 if it owns none.
+;; ACTOR-GET reads the slot's machine word into a register, where a fixnum is
+;; value<<1 — so the Lisp value it hands back is HALF the address and the
+;; doubling here is the exact inverse of the (untag …) that stores it.
+(defun actor-region-raw (id)
+  (let ((w (actor-get id #x68)))
+    (if (zerop w) 0 (* w 2))))
+
+;; ONE SCHEDULER HOP, from the GC's point of view.  CUR-ID is being switched
+;; out and NEXT-ID switched in.  %GC-REGION-SWITCH parks the region being left
+;; — its allocation pointer and limit AND its root window, because an actor's
+;; heap and an actor's roots go off-CPU together — and makes the arriving
+;; actor's region the running one.
+;;
+;; THE SP IT PARKS AT is read straight back out of CUR-ID's struct at +0x08,
+;; where the SAVE-CONTEXT immediately above every call site has just written
+;; it.  That is the only place the number exists: no MVM primitive yields the
+;; stack pointer as a VALUE on every target, which is why %GC-REGION-PARK takes
+;; it as an argument at all.  ACTOR-GET returns the slot's machine word read as
+;; a Lisp integer (a fixnum is value<<1), so the doubling is the exact inverse
+;; of the (untag …) that SPAWN and :SAVE-CTX store through.
+;;
+;; THE GUARD IS THE COMPATIBILITY STORY, not an optimisation.  When NEITHER
+;; actor names a region, every actor is allocating in region 0 — the state of
+;; every image built so far — and this performs no write and makes no call.
+(defun actor-region-hop (cur-id next-id)
+  (let ((cr (actor-region-raw cur-id))
+        (nr (actor-region-raw next-id)))
+    (if (and (zerop cr) (zerop nr))
+        0
+        (%gc-region-switch (if (zerop nr) (%gc-region-0) nr)
+                           (* (actor-get cur-id #x08) 2)))))
+
+;; The same thing where there is NO outgoing actor to park: the idle scheduler
+;; picking work up, and an actor that has already marked itself dead.  Nothing
+;; is parked because nothing is leaving a live stack behind.
+(defun actor-region-resume (next-id)
+  (let ((nr (actor-region-raw next-id)))
+    (if (zerop nr)
+        0
+        (progn (%gc-region-enter nr) (%gc-region-unpark nr)))))
 
 ;;; ============================================================
 ;;; Run queue (linked list via actor struct +0x48)
@@ -190,7 +306,8 @@
 
 (defun shutdown ()
   ;; Print "Bye\n" then halt
-  (write-byte 66) (write-byte 121) (write-byte 101) (write-byte 10)
+  (write-char-serial 66) (write-char-serial 121)
+  (write-char-serial 101) (write-char-serial 10)
   (loop (halt)))
 
 ;;; ============================================================
@@ -229,7 +346,8 @@
     (percpu-set 40 cur-alloc)
     (percpu-set 48 cur-limit))
   ;; Print "ACT"
-  (write-byte 65) (write-byte 67) (write-byte 84) (write-byte 10))
+  (write-char-serial 65) (write-char-serial 67)
+  (write-char-serial 84) (write-char-serial 10))
 
 ;;; ============================================================
 ;;; Actor spawn
@@ -245,7 +363,7 @@
     (if (>= count 64)
         (progn
           (spin-unlock (sched-lock-addr))
-          (write-byte 33)   ; '!' too many actors
+          (write-char-serial 33)   ; '!' too many actors
           0)
         (let ((id count))
           ;; Bump actor count
@@ -305,6 +423,8 @@
                         (actor-set next-id #x00 1)
                         (percpu-set 40 (actor-get next-id #x70))
                         (percpu-set 48 (actor-get next-id #x78))
+                        ;; No outgoing actor, so nothing to park.
+                        (actor-region-resume next-id)
                         (let ((next-addr (actor-struct-addr next-id)))
                           (restore-context (+ next-addr #x08))))
                       (let ((cur-addr (actor-struct-addr cur-id)))
@@ -322,6 +442,19 @@
                               (actor-set next-id #x00 1)
                               (percpu-set 40 (actor-get next-id #x70))
                               (percpu-set 48 (actor-get next-id #x78))
+                              ;; PER-REGION GC, STAGE 3.  Park the outgoing
+                              ;; actor's region at the SP save-context wrote to
+                              ;; its struct at +0x08 and make the arriving
+                              ;; actor's region the running one.  It goes HERE,
+                              ;; immediately before restore-context, on purpose:
+                              ;; %gc-region-enter loads the arriving region's
+                              ;; parked allocation pointer/limit, and
+                              ;; restore-context then reinstates the same pair
+                              ;; from the arriving actor's own save area — so
+                              ;; there is no window in which the mutator is
+                              ;; running on one actor's stack with another
+                              ;; actor's allocation registers.
+                              (actor-region-hop cur-id next-id)
                               (let ((next-addr (actor-struct-addr next-id)))
                                 (restore-context (+ next-addr #x08))))
                             ;; Resume path: lock already released by restore-context
@@ -358,6 +491,9 @@
           (actor-set next-id #x00 1)
           (percpu-set 40 (actor-get next-id #x70))
           (percpu-set 48 (actor-get next-id #x78))
+          ;; The outgoing actor is DEAD (status 3) — its region has no roots
+          ;; worth parking, so this only enters the arriving one's.
+          (actor-region-resume next-id)
           (let ((next-addr (actor-struct-addr next-id)))
             (restore-context (+ next-addr #x08)))))))
 
@@ -377,6 +513,32 @@
 ;;; ============================================================
 ;;; Scheduler (idle loop)
 ;;; ============================================================
+
+;; THE HAND-OFF POINT FOR AN ACTOR THAT HAS JUST BLOCKED, and it is a separate
+;; function for exactly one reason: WHO HOLDS THE SCHEDULER LOCK.
+;;
+;; RECEIVE reaches here having marked the calling actor BLOCKED (status 4) and
+;; saved its context, WITH THE LOCK STILL HELD.  From the instant the lock drops
+;; that actor is claimable by any other CPU — a sender flips it back to READY and
+;; enqueues it (MAILBOX-ENQUEUE-AND-WAKE), and another CPU's scheduler may then
+;; RESTORE-CONTEXT onto its stack.  This CPU is STILL STANDING ON THAT STACK
+;; until it switches away, so the order "release, then leave the stack" is a
+;; two-CPUs-one-stack race, and the order "leave the stack, then release" is not.
+;;
+;; ON BARE METAL these two lines ARE what RECEIVE used to do inline, unchanged:
+;; release and fall into the idle loop, which switches to the per-CPU idle stack
+;; as its first act.  The window is real there too, but bare metal has never run
+;; a second CPU, so nothing can take the actor before the switch.
+;;
+;; A HOSTED IMAGE OVERRIDES THIS (net/hosted-sync.lisp) to do it in the safe
+;; order: RESTORE-CONTEXT into the thread's own scheduler context — which moves
+;; RSP off the actor's stack and only THEN releases the lock, because
+;; +OP-RESTORE-CTX+ zeroes the lock word after the stack switch and before the
+;; jump.  That is why RECEIVE now calls this instead of unlocking itself: an
+;; override cannot re-acquire a lock it was not handed.
+(defun ap-scheduler-blocked ()
+  (spin-unlock (sched-lock-addr))
+  (ap-scheduler))
 
 (defun ap-scheduler ()
   ;; Switch to per-CPU idle stack
@@ -400,6 +562,8 @@
             (actor-set next-id #x00 1)
             (percpu-set 40 (actor-get next-id #x70))
             (percpu-set 48 (actor-get next-id #x78))
+            ;; The idle loop owns no region, so there is nothing to park.
+            (actor-region-resume next-id)
             (let ((next-addr (actor-struct-addr next-id)))
               (restore-context (+ next-addr #x08))))))))
 
@@ -486,6 +650,65 @@
                 (setf (mem-ref buf :u8) 1)
                 (setf (mem-ref (+ buf 1) :u64) val)
                 9)
+          ;; ---- STRINGS AND SYMBOLS GO BY VALUE, NOT BY POINTER ----------
+          ;;
+          ;; Both used to fall off the end of this dispatch into the "unknown
+          ;; object type — encode as fixnum" arm, which writes THE OBJECT'S OWN
+          ;; TAGGED POINTER and labels it a fixnum.  Measured, not inferred: a
+          ;; symbol encoded to tag 1 with a payload equal, bit for bit, to its
+          ;; own machine word.  So every actor message carrying a string or a
+          ;; symbol handed the receiver a pointer into the SENDER'S REGION —
+          ;; the exact violation of "no region holds a pointer into another"
+          ;; that the whole per-region collector rests on, sitting in the
+          ;; message path.  Serialising is the ONLY thing that makes separate
+          ;; regions per actor sound, and for the two commonest payload types
+          ;; it was not happening.
+          ;;
+          ;; TAG 3 IS NOT NEW.  TERM-DECODE-STEP has always had the arm that
+          ;; reads a length, reads the bytes and MAKE-STRINGs a copy IN THE
+          ;; RECEIVER'S REGION; it was dead code because nothing ever emitted
+          ;; it.  The asymmetry was the bug.  This emits it.
+          (if (stringp val)
+              (let ((slen (length val)))
+                (setf (mem-ref buf :u8) 3)
+                (setf (mem-ref (+ buf 1) :u32) slen)
+                (let ((i 0))
+                  (loop
+                    (when (>= i slen) (return 0))
+                    (setf (mem-ref (+ (+ buf 5) i) :u8) (char-code (aref val i)))
+                    (setq i (+ i 1))))
+                (+ 5 slen))
+          ;; TAG 6 — A SYMBOL, BY NAME AND PACKAGE NAME.
+          ;;
+          ;; The receiver INTERNS it, which is the whole point: the intern
+          ;; happens on the RECEIVING thread, so the symbol and the table that
+          ;; points at it are allocated in the SAME region by construction.  No
+          ;; barrier, no promotion, no delegation — the pointer that would have
+          ;; had to be fixed up is never created.
+          ;;
+          ;; A symbol with no home package (an uninterned gensym) encodes a
+          ;; ZERO-length package and decodes through MAKE-SYMBOL: two actors
+          ;; cannot share an uninterned symbol by name and must not pretend to.
+              (if (symbolp val)
+                  (let* ((nm (symbol-name val))
+                         (pk (symbol-package val))
+                         (pn (if pk (package-name pk) ""))
+                         (nlen (length nm))
+                         (plen (length pn)))
+                    (setf (mem-ref buf :u8) 6)
+                    (setf (mem-ref (+ buf 1) :u32) nlen)
+                    (let ((i 0))
+                      (loop
+                        (when (>= i nlen) (return 0))
+                        (setf (mem-ref (+ (+ buf 5) i) :u8) (char-code (aref nm i)))
+                        (setq i (+ i 1))))
+                    (setf (mem-ref (+ (+ buf 5) nlen) :u32) plen)
+                    (let ((i 0) (pbase (+ (+ buf 9) nlen)))
+                      (loop
+                        (when (>= i plen) (return 0))
+                        (setf (mem-ref (+ pbase i) :u8) (char-code (aref pn i)))
+                        (setq i (+ i 1))))
+                    (+ (+ 9 nlen) plen))
               ;; Object: dispatch on subtag
               (let ((st (soft-subtag val)))
                 (if (= st #x32)
@@ -512,11 +735,17 @@
                                       (mem-ref (+ (+ addr 8) (ash i 3)) :u64))
                                 (setq i (+ i 1))))
                             (+ 5 (ash nlimbs 3))))
-                        ;; Unknown object type — encode as fixnum
+                        ;; STILL UNKNOWN — and still a pointer, deliberately
+                        ;; left as it was.  Everything that has been MEASURED
+                        ;; to come through here (symbols, strings) is now
+                        ;; handled above; narrowing this arm further without a
+                        ;; demonstration of what lands in it would be guessing.
+                        ;; It remains a soundness hole for any type nobody has
+                        ;; looked at yet.
                         (progn
                           (setf (mem-ref buf :u8) 1)
                           (setf (mem-ref (+ buf 1) :u64) val)
-                          9))))))))
+                          9))))))))))
 
 ;; Deserialize one term from staging buffer.
 ;; Uses global read pointer at decode-ptr-addr to track position.
@@ -536,13 +765,55 @@
                       (let ((car-val (term-decode-step)))
                         (let ((cdr-val (term-decode-step)))
                           (cons car-val cdr-val))))
+                    (if (= tag 6)
+                        ;; A SYMBOL, BY NAME — AND THE INTERN HAPPENS HERE.
+                        ;;
+                        ;; That is the entire point of the tag.  Interning on
+                        ;; the RECEIVING thread allocates the symbol in the
+                        ;; RECEIVER'S region, which is the same region as the
+                        ;; table that will point at it — so the cross-region
+                        ;; pointer that used to be shipped in the message is
+                        ;; never created rather than being created and then
+                        ;; repaired.
+                        (let ((nlen (mem-ref (+ buf 1) :u32)))
+                          (let ((nm (make-string nlen)))
+                            (let ((i 0))
+                              (loop
+                                (when (>= i nlen) (return 0))
+                                (setf (aref nm i) (code-char (mem-ref (+ (+ buf 5) i) :u8)))
+                                (setq i (+ i 1))))
+                            (let ((plen (mem-ref (+ (+ buf 5) nlen) :u32)))
+                              (let ((pn (make-string plen))
+                                    (pbase (+ (+ buf 9) nlen)))
+                                (let ((i 0))
+                                  (loop
+                                    (when (>= i plen) (return 0))
+                                    (setf (aref pn i) (code-char (mem-ref (+ pbase i) :u8)))
+                                    (setq i (+ i 1))))
+                                (setf (mem-ref da :u64) (+ pbase plen))
+                                ;; No home package — an uninterned symbol.  Two
+                                ;; actors cannot share one by name, so give the
+                                ;; receiver its own rather than pretend.
+                                (if (= plen 0)
+                                    (make-symbol nm)
+                                    (intern nm pn))))))
                     (if (= tag 3)
+                        ;; STRING-SET USED TO FILL THIS, AND STRING-SET DOES NOT
+                        ;; EXIST.  Not "was removed" — `defun string-set' appears
+                        ;; nowhere in the tree, (FBOUNDP 'STRING-SET) is NIL, and
+                        ;; this was its ONLY call site.  So this arm was dead in
+                        ;; two senses at once: nothing ever emitted tag 3, and it
+                        ;; could not have worked if anything had.  MAKE-STRING
+                        ;; fills with spaces, so decoding through it gave a
+                        ;; string of the right LENGTH and no content — which is
+                        ;; exactly what came back the first time the encoder
+                        ;; emitted tag 3.
                         (let ((slen (mem-ref (+ buf 1) :u32)))
                           (let ((s (make-string slen)))
                             (let ((i 0))
                               (loop
                                 (when (>= i slen) (return 0))
-                                (string-set s i (mem-ref (+ (+ buf 5) i) :u8))
+                                (setf (aref s i) (code-char (mem-ref (+ (+ buf 5) i) :u8)))
                                 (setq i (+ i 1))))
                             (setf (mem-ref da :u64) (+ (+ buf 5) slen))
                             s))
@@ -568,7 +839,7 @@
                                       (setq i (+ i 1))))
                                 (setf (mem-ref da :u64)
                                       (+ (+ buf 5) (ash nlimbs 3)))
-                                b))))))))))))
+                                b)))))))))))))
 
 ;; Allocate bignum with nlimbs limbs
 (defun make-bignum-n (nlimbs)
@@ -706,13 +977,20 @@
                   (actor-set cur-id #x78 (percpu-ref 48))
                   (let ((next-id (actor-dequeue)))
                     (if (zerop next-id)
-                        (progn (spin-unlock (sched-lock-addr))
-                               (ap-scheduler))
+                        ;; NOTHING ELSE TO RUN.  Hand the CPU over WITH THE LOCK
+                        ;; STILL HELD — see AP-SCHEDULER-BLOCKED for why the
+                        ;; release cannot happen on this side of the call.
+                        (ap-scheduler-blocked)
                         (progn
                           (set-current-actor next-id)
                           (actor-set next-id #x00 1)
                           (percpu-set 40 (actor-get next-id #x70))
                           (percpu-set 48 (actor-get next-id #x78))
+                          ;; Same hop as YIELD's: this actor blocks (status 4)
+                          ;; on its own stack, so its region parks at the SP
+                          ;; the save-context above just recorded, and stays
+                          ;; collectable from that window while it waits.
+                          (actor-region-hop cur-id next-id)
                           (let ((next-addr (actor-struct-addr next-id)))
                             (restore-context (+ next-addr #x08)))))))
                 ;; Resumed: dequeue the message that woke us

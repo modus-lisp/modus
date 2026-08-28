@@ -886,11 +886,45 @@
                              (if (null level) 1 (+ level 1)) escape)
                  (setq i (+ i 1))))
              (%print-char 41 stream)))))  ; ) — close let, t, cond, arrayp
-      ;; Anything else: #<type>
+      ;; Anything else — SAY WHAT IT IS.  A bare "#<?>" carried no information
+      ;; at all, and this arm is exactly where a broken object arrives: a
+      ;; condition whose type-name slot has gone bad prints through here, and
+      ;; the report then names nothing.  Print the header SUBTAG, by name when
+      ;; it is one the runtime defines and as a decimal otherwise, so two
+      ;; different unprintable types can be told apart.
+      ;;
+      ;; THE FORWARDING CASE IS THE ONE THAT MATTERS.  The Cheney collector
+      ;; leaves `new_addr | 0x0F' in a moved object's header word, and
+      ;; OBJ-SUBTAG is that word's low byte — so a low nibble of #xF is not a
+      ;; subtag at all, it is the tail of a forwarding pointer, and the value
+      ;; being printed is a STALE reference to an object the collector already
+      ;; moved.  No defined subtag has low nibble #xF (they are #x01/#x10/#x11/
+      ;; #x14/#x16/#x30/#x32/#x33/#x40/#x41/#x50/#x51/#x52/#x60/#x61/#x64..66),
+      ;; so the test is exact rather than a heuristic.  Printing "STALE" here
+      ;; turns "some object I cannot print" into "a GC root was missed", which
+      ;; is a different bug report.
+      ;;
+      ;; Deterministic on purpose: no address is printed, so output stays
+      ;; byte-stable across runs and the printing gates keep working.
       (t
-       (%print-char 35 stream)
-       (%print-char 60 stream)
-       (%print-char 63 stream)
+       (%print-char 35 stream)   ; #
+       (%print-char 60 stream)   ; <
+       (%print-char 63 stream)   ; ?
+       (let ((st (obj-subtag obj)))
+         (cond
+           ((= (logand st 15) 15)
+            (%print-string-raw "STALE-FORWARDED-" stream)
+            (%print-integer-in-base st 10 stream))
+           ((= st #x51) (%print-string-raw "FUNCTION" stream))
+           ((= st #x52) (%print-string-raw "CLOSURE" stream))
+           ((= st #x41) (%print-string-raw "HASH-TABLE" stream))
+           ((= st #x16) (%print-string-raw "SAP" stream))
+           ((= st #x61) (%print-string-raw "MVM-MODULE" stream))
+           ((= st #x11) (%print-string-raw "U8-VECTOR" stream))
+           ((= st #x14) (%print-string-raw "U64-VECTOR" stream))
+           ((= st #x40) (%print-string-raw "STRUCT" stream))
+           ((= st #x50) (%print-string-raw "SYMBOL" stream))
+           (t (%print-integer-in-base st 10 stream))))
        (%print-char 62 stream)))))
 
 ;;; Float printing helper
@@ -4242,13 +4276,15 @@
                        (when (null streams) (return found))
                        (when (listen (car streams)) (setq found t) (return t))
                        (setq streams (cdr streams)))))))
-            ;; File stream: check if buffer has data
+            ;; File stream: buffered data first, then ASK THE KERNEL.
+            ;; The buffer check must come first and cannot be replaced by the
+            ;; poll: bytes already pulled out of the fd are ready to read and
+            ;; the fd itself has nothing left to say about them.
             ((= ty 9)
              (let ((bpos (%fs-bpos s))
                    (blen (%fs-blen s)))
                (if (< bpos blen) t
-                   ;; Would need a non-blocking read to check — return t if fd valid
-                   (if (>= (%fs-fd s) 0) t nil))))
+                   (if (>= (%fs-fd s) 0) (%fd-input-ready-p (%fs-fd s)) nil))))
             (t nil)))
         nil)))
 (defun %substring (str start end)

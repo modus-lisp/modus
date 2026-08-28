@@ -1039,9 +1039,23 @@
         ;; decimal. "#<?123>" is still a distinctive "unknown type"
         ;; token but lets us tell different unprintable types apart
         ;; in test output.
+        ;;
+        ;; AND SAY SO WHEN THE HEADER IS A FORWARDING POINTER.  The Cheney
+        ;; collector leaves `new_addr | 0x0F' in a moved object's header word
+        ;; and OBJ-SUBTAG is that word's LOW BYTE, so a low nibble of #xF is
+        ;; not a subtag at all — it is the tail of a forwarding pointer, and
+        ;; the value being printed is a STALE reference to an object the
+        ;; collector has already moved.  No subtag runtime/tags.lisp defines
+        ;; has low nibble #xF, so the test is exact and not a heuristic.  The
+        ;; distinction matters: "#<?111>" reads as an unprintable type and
+        ;; sends you to the printer, "#<?F111>" reads as a missed GC root and
+        ;; sends you to the collector.
         (write-char-serial 35) (write-char-serial 60) (write-char-serial 63)
         (when (and (not (fixnump obj)) (not (consp obj)) (not (null obj)))
-          (print-dec (obj-subtag obj)))
+          (let ((st (obj-subtag obj)))
+            (when (= (logand st 15) 15)
+              (write-char-serial 70))          ; F — stale forwarding header
+            (print-dec st)))
         (write-char-serial 62))))))
 
 (defun princ-object (obj)
@@ -1690,10 +1704,230 @@
 ;; hash-table objects at BSS slots — so NO GC change is needed.  (The store
 ;; head is a hash-table = a cons whose car is the alist and whose cdr carries
 ;; the %HT-TAG metadata; a value of raw 0 means "not yet created".)
+;;; ============================================================
+;;; THE RUNTIME-TABLE LOCK
+;;; ============================================================
+;;;
+;;; THE PROBLEM IT EXISTS FOR.  The globals hash table below, the symbol intern
+;;; table at #x10000088, the keyword table at #x10000148, the package-by-hash
+;;; table at #x10000170 and the macro expander table in mvm/cl-eval.lisp are ONE
+;;; SET OF SHARED MUTABLE STRUCTURES.  Every thread interns into them, and a
+;;; concurrent PUTHASH is not merely a lost entry: two threads that both miss the
+;;; same GETHASH both allocate a symbol and both store it, so `(eq 'foo 'foo)'
+;;; stops holding ACROSS THREADS — the one invariant the whole symbol system
+;;; rests on.  Until this existed, a second thread could run computation but not
+;;; Lisp, and the threaded selftests said so in their headers.
+;;;
+;;; IT IS A GATE, AND THE GATE IS OFF EVERYWHERE BY DEFAULT.  #x10000DB8 is a
+;;; BSS word; nothing writes it unless a program deliberately declares that it
+;;; is running more than one thread through the runtime.  While it reads zero —
+;;; which is every image ever built, every bare-metal target, every ANSI gate
+;;; runner and every ordinary ./modus — %RT-ENTER and %RT-LEAVE are one 32-bit
+;;; load and a branch, and the two functions they would call are the NO-OPS
+;;; defined here.  A hosted x86-64 image overrides those two
+;;; (net/hosted-sync.lisp) with the real thing: a RECURSIVE futex mutex that
+;;; also makes region 0 the active heap for the duration, so that everything
+;;; allocated while the shared tables are being mutated lands in ONE region
+;;; rather than in the mutating thread's own — a symbol reachable only from a
+;;; table in region 0 would otherwise be collected the next time its own
+;;; thread's region was.
+;;;
+;;; WHY THE NO-OPS ARE DEFINED HERE RATHER THAN LEFT UNRESOLVED.  An unresolved
+;;; call resolves to %UNRESOLVED-FN, which is harmless at runtime but shows up
+;;; in every build's unresolved-function census; and the census is a ratchet.
+;;; Two one-line defuns keep every non-hosted image's count exactly where it was.
+(defun %rt-threads-live-p ()
+  "Non-zero when more than one thread is running Lisp through the shared
+   runtime tables.  Zero — the BSS default — everywhere else."
+  (mem-ref #x10000DB8 :u32))
+
+(defun %rt-enter-locked () 0)
+(defun %rt-leave-locked () 0)
+
+(defun %rt-enter ()
+  (if (= (mem-ref #x10000DB8 :u32) 0) 0 (%rt-enter-locked)))
+
+(defun %rt-leave ()
+  (if (= (mem-ref #x10000DB8 :u32) 0) 0 (%rt-leave-locked)))
+
 (defun %globals-table ()
   "The globals hash-table object at #x10000080, or NIL if not yet created."
   (let ((head (mem-ref #x10000080 :u64)))
     (if (or (eql head 0) (not (consp head))) nil head)))
+
+;;; ============================================================
+;;; PER-THREAD DYNAMIC BINDINGS
+;;; ============================================================
+;;;
+;;; A DYNAMIC BINDING MADE ON A WORKER MUST NOT BE PUBLISHED INTO REGION 0.
+;;; Modus shallow-binds specials: COMPILE-LET-WITH-SPECIALS saves the global
+;;; cell into a lexical, writes the new value with SET-SYMBOL-VALUE and puts
+;;; the old one back in an unwind-protect.  On a worker thread that is the one
+;;; forbidden direction of the rule per-region collection rests on:
+;;;
+;;;   (let ((*tx* (list 0))) …)   on a worker
+;;;     1. (LIST 0) conses in the WORKER's region;
+;;;     2. the bind writes that cons into the globals table, which lives in
+;;;        REGION 0.
+;;;
+;;; The worker's collector is copying, so the cons is evacuated or reclaimed
+;;; and the region-0 slot is never updated: the cell is re-issued as fresh
+;;; allocation while *TX* still names it, and its CAR comes back a CHARACTER
+;;; or a FUNCTION.  Measured with a between-arm control in
+;;; test/glass-tx-cell.lisp: `txfr' (*tx* = a fresh cons) goes FR[pre]=0 ->
+;;; FR[post]=1 while `bothnilfr' (*tx* = NIL — nothing to publish) stays 0,
+;;; with the same nesting, the same lock and the same 17 collections of the
+;;; worker's region between them.
+;;;
+;;; SO THE BINDING LIVES IN THE THREAD'S OWN STORAGE, WHICH IS WHAT SBCL DOES
+;;; WITH PER-SYMBOL TLS INDICES.  Three shapes were rejected first and none of
+;;; them should be re-proposed:
+;;;   * keeping the value alive in the binding's stack record — it stops being
+;;;     COLLECTED but the copying collector still MOVES it, and nothing updates
+;;;     the region-0 slot: a use-after-free traded for a stale pointer;
+;;;   * copying the value on publish (the CL:INTERN arena route) — interning
+;;;     copies a STRING whose identity nobody holds, but a special can be bound
+;;;     to any object and EQ IS OBSERVABLE: *TX* must be the same cons TX+
+;;;     increments;
+;;;   * evaluating the initform in the arena — fixes (let ((*x* (list 0)))) and
+;;;     not (let ((*x* some-existing-worker-object))), i.e. it passes the test
+;;;     and leaves the general case broken.
+;;;
+;;; WHERE IT LIVES.  Each thread's 4 KB PER-THREAD WINDOW block (net/hosted-
+;;; sync.lisp's %THR-TLS-BLOCK) has its top unused: the window's own slots stop
+;;; at offset 0xC37.  Offsets 0xC50..0xFFF of a WORKER's block are private
+;;; memory nothing else addresses — the process-global words that share those
+;;; ADDRESSES (0x10000DB8, 0x10000DF0, 0x10000E00…, 0x10000F08) are main-image
+;;; BSS, not part of any worker's block, which is why this area is addressed
+;;; ABSOLUTELY from the thread's own base rather than being claimed as new
+;;; window offsets.  (The claim in the campaign notes that "0xC38..0xFFF are
+;;; unclaimed" is about window OFFSETS and is false as an address range.)
+;;;
+;;;   blk+0xC50   address of the next free entry (0 = never used yet)
+;;;   blk+0xC58   depth, as a TAGGED fixnum — the collector reads it and
+;;;               untags with one SHR, exactly like the MV count
+;;;   blk+0xC60   entry 0: [key][value], 16 bytes, 58 of them to blk+0x1000
+;;;
+;;; THE VALUE SLOTS ARE A GC ROOT OF THE OWNING THREAD'S REGION.  A raw
+;;; per-thread word is NOT a root — the precise root set is the fixed list in
+;;; EMIT-GC-TRAMPOLINE — so translate-x64's trampoline grew a loop over exactly
+;;; DEPTH value words, reached through EMIT-TLS-BASE just as the MV-extras loop
+;;; is.  The collector runs on the thread that hit its own limit, so the stack
+;;; it walks is that thread's.  Without it this would be the rejected shape
+;;; above with the staleness merely moved.
+;;;
+;;; AND EVERY UNARMED THREAD TAKES TODAY'S PATH.  The gate is
+;;; (mem-ref #x10000DB8 :u32) — the SAME word %RT-ENTER already tests, zero in
+;;; every image that has not declared it is running Lisp on more than one
+;;; thread — so a single-threaded ./modus, every bare-metal image and every
+;;; ANSI gate runner pays one 32-bit load and a branch on the read path and
+;;; reaches the identical code.  The MAIN thread of an armed image is unarmed
+;;; too: its FS base is 0 (nothing ever wrote the self slot), %DYNB-BLOCK
+;;; answers 0, and it shallow-binds exactly as before.  That is deliberate and
+;;; it is not a gap: main IS region 0's mutator, so a binding main publishes
+;;; into the globals table creates no cross-region pointer.
+(defun %dynb-block ()
+  "This thread's per-thread window BLOCK, or 0 when it has none.
+
+   Reads the self slot THROUGH the window (offset 0xC30 is a window slot, so
+   the access carries the FS override), which is what makes it answer about
+   THIS thread.  The slot holds the segment BASE, not the block, so the main
+   thread's BSS zero is both the correct base and the correct answer here."
+  (let ((lo (mem-ref #x10000C30 :u32))
+        (hi (mem-ref #x10000C34 :u32)))
+    (if (eql hi 0)
+        (if (eql lo 0) 0 (+ #x10000000 lo))
+        (+ #x10000000 (+ (* (* hi 65536) 65536) lo)))))
+
+(defun %dynb-depth (blk)
+  "Number of live dynamic bindings on this thread's stack.  Stored TAGGED so
+   the collector can untag it with one SHR, as it does the MV count."
+  (mem-ref (+ blk #xC58) :u64))
+
+(defun %dynb-next (blk)
+  "Address of the next free entry's KEY word."
+  (let ((a (mem-ref (+ blk #xC50) :u64)))
+    (if (eql a 0) (+ blk #xC60) a)))
+
+(defun %dynb-set-top (blk next depth)
+  "Publish the stack top.  ORDER IS THE CONTRACT: a caller writes the entry
+   BEFORE calling this, because the collector scans exactly DEPTH entries and
+   would otherwise walk a word the previous occupant left behind."
+  (setf (mem-ref (+ blk #xC50) :u64) next)
+  (setf (mem-ref (+ blk #xC58) :u64) depth)
+  depth)
+
+(defun %dynb-find (key a i)
+  "Address of the VALUE word of the innermost binding of KEY, or 0.  A is the
+   KEY word of entry I; walk DOWN so an inner binding shadows an outer one.
+
+   NO MULTIPLICATION AND NO GLOBAL READ ANYWHERE ON THIS PATH — it is called
+   from SYMBOL-VALUE, so anything that itself read a global would recurse."
+  (if (< i 0)
+      0
+      (if (eql (mem-ref a :u64) key)
+          (+ a 8)
+          (%dynb-find key (- a 16) (- i 1)))))
+
+(defun %dynb-unwind (blk key a i)
+  "Pop the innermost binding of KEY, and everything above it, by truncating
+   the stack to entry I.  Answers 1 when it found one, 0 when it did not.
+
+   TRUNCATE RATHER THAN POP, and the difference is load-bearing.  A LET* of
+   two specials evaluates its inits INSIDE the unwind-protect, so a throw out
+   of the second init leaves the first bound and the second not, while the
+   cleanup still runs BOTH restores; and the restores run in binding order,
+   not reverse.  Truncation is right in both cases — by the time this
+   cleanup runs every INNER binding has already been popped by its own
+   cleanup, so nothing above I is live."
+  (if (< i 0)
+      0
+      (if (eql (mem-ref a :u64) key)
+          (progn (%dynb-set-top blk a i) 1)
+          (%dynb-unwind blk key (- a 16) (- i 1)))))
+
+(defun %dynb-overflow (key)
+  "58 nested special bindings on one thread.  An honest error rather than a
+   silent shallow bind: a shallow bind here is the region-0 publication this
+   whole mechanism exists to prevent, and it would additionally desynchronise
+   the stack so the matching %DYNUNBIND truncated somebody else's entry."
+  (error "dynamic binding stack exhausted (58 nested specials) for key ~S" key))
+
+(defun %dynbind (key val)
+  "Establish a dynamic binding of the global named by KEY (a name hash).
+   A drop-in replacement for the SET-SYMBOL-VALUE that COMPILE-LET-WITH-
+   SPECIALS used to emit, and identical to it on every unarmed thread."
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      (set-symbol-value key val)
+      (let ((blk (%dynb-block)))
+        (if (eql blk 0)
+            (set-symbol-value key val)
+            (let ((d (%dynb-depth blk))
+                  (a (%dynb-next blk)))
+              (if (>= d 58)
+                  (%dynb-overflow key)
+                  (progn
+                    ;; Entry first, top second — see %DYNB-SET-TOP.
+                    (setf (mem-ref a :u64) key)
+                    (setf (mem-ref (+ a 8) :u64) val)
+                    (%dynb-set-top blk (+ a 16) (+ d 1))
+                    val)))))))
+
+(defun %dynunbind (key saved)
+  "Undo the matching %DYNBIND.  SAVED is the value the compiler read before
+   the binding was made; it is what the shallow path restores and what the
+   deep path ignores, because the deep path's outer value is still sitting in
+   the entry below the one it truncates away."
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      (set-symbol-value key saved)
+      (let ((blk (%dynb-block)))
+        (if (eql blk 0)
+            (set-symbol-value key saved)
+            (let ((d (%dynb-depth blk)))
+              (if (<= d 0)
+                  saved
+                  (progn (%dynb-unwind blk key (- (%dynb-next blk) 16) (- d 1))
+                         saved)))))))
 
 (defun symbol-value (name-or-hash)
   "Look up a global variable by name hash or symbol object.
@@ -1703,8 +1937,27 @@
   (when (null name-or-hash) (return-from symbol-value nil))
   (when (eq name-or-hash t) (return-from symbol-value t))
   (let ((key (if (integerp name-or-hash) name-or-hash
-                 (aref name-or-hash 0)))
-        (tbl (%globals-table)))
+                 (aref name-or-hash 0))))
+    ;; THIS THREAD'S OWN DYNAMIC BINDINGS COME FIRST — see PER-THREAD DYNAMIC
+    ;; BINDINGS above.  The gate is the word %RT-ENTER already tests, so an
+    ;; image that never declared itself threaded pays one 32-bit load and a
+    ;; branch and reaches the identical code below; the main thread of a
+    ;; threaded image pays two more and reaches it too, because its window
+    ;; base is zero.  A binding found here needs NO LOCK and no region hop:
+    ;; the storage is this thread's and nothing else can be in it.
+    (unless (eql (mem-ref #x10000DB8 :u32) 0)
+      (let ((blk (%dynb-block)))
+        (unless (eql blk 0)
+          (let ((a (%dynb-find key (- (%dynb-next blk) 16)
+                               (- (%dynb-depth blk) 1))))
+            (unless (eql a 0)
+              (return-from symbol-value (values (mem-ref a :u64))))))))
+    ;; THE READ IS LOCKED TOO, and not out of caution: PUTHASH grows and
+    ;; REHASHES this table, and a reader walking it mid-rehash sees a structure
+    ;; that is momentarily neither the old one nor the new one.  Under a single
+    ;; thread %RT-ENTER is a load and a branch.
+    (%rt-enter)
+    (let ((tbl (%globals-table)))
     ;; GETHASH returns (VALUES value present-p) — TWO values.  Returning it
     ;; directly in tail position PROPAGATES both, leaving MV-COUNT=2 for the
     ;; caller.  The old linear-alist SYMBOL-VALUE returned exactly one value,
@@ -1714,17 +1967,35 @@
     ;; which then reports length 2 (boole.2 collected spuriously) or corrupts
     ;; the funcall MV path into a wild call (boole.1/.3 → RIP=0xDEAD0004).
     ;; Truncate to a single value with (VALUES …), which forces MV-COUNT=1.
-    (if tbl (values (gethash key tbl)) nil)))
+      (let ((v (if tbl (gethash key tbl) nil)))
+        (%rt-leave)
+        (values v)))))
 
 (defun set-symbol-value (name-hash value)
   "Set a global variable by its tagged name hash.  O(1) via the globals
    hash table at #x10000080, created lazily on first use."
+  ;; A SETQ OF A SPECIAL THIS THREAD HAS BOUND MUST HIT THAT BINDING, not the
+  ;; process-wide cell — otherwise (let ((*x* …)) (setq *x* …)) on a worker
+  ;; would put the worker's object back into region 0 through the side door.
+  ;; Assignment to a special this thread has NOT bound still writes the shared
+  ;; table: that is a different operation with a different (and still open)
+  ;; cross-region story, and it is not what a LET does.
+  (unless (eql (mem-ref #x10000DB8 :u32) 0)
+    (let ((blk (%dynb-block)))
+      (unless (eql blk 0)
+        (let ((a (%dynb-find name-hash (- (%dynb-next blk) 16)
+                             (- (%dynb-depth blk) 1))))
+          (unless (eql a 0)
+            (setf (mem-ref a :u64) value)
+            (return-from set-symbol-value value))))))
+  (%rt-enter)
   (let ((tbl (%globals-table)))
     (unless tbl
       (setq tbl (make-hash-table))
       (setf (mem-ref #x10000080 :u64) tbl))
-    (puthash name-hash tbl value)
-    value))
+    (puthash name-hash tbl value))
+  (%rt-leave)
+  value)
 
 ;;; ============================================================
 ;;; Interned Symbols
@@ -1759,6 +2030,23 @@
 
 
 (defun %intern-symbol-pkg (name-hash pkg-hash)
+  "Intern a symbol identified by (NAME-HASH, PKG-HASH), under the runtime-table
+   lock.  See %RT-ENTER: the lock is a load and a branch until a program
+   declares that it is running Lisp on more than one thread, and from then on it
+   both serialises the table and makes region 0 the heap the symbol is allocated
+   in — a symbol reachable only from a table in region 0 would be collected the
+   next time its own thread's region was.
+
+   THE WRAPPER IS A SEPARATE FUNCTION because this compiler resolves every call
+   to the LAST defun of a name, so a hosted image cannot wrap a function by
+   redefining it and calling the old one.  Splitting the body out is the only
+   shape that lets the lock be added in ONE place and still be overridable."
+  (%rt-enter)
+  (let ((r (%intern-symbol-pkg-1 name-hash pkg-hash)))
+    (%rt-leave)
+    r))
+
+(defun %intern-symbol-pkg-1 (name-hash pkg-hash)
   "Intern a symbol identified by (NAME-HASH, PKG-HASH).  Per CLHS
    11.1.2 — see SYMBOLS_PLAN.md — symbol identity is per-package: the
    same NAME-HASH in two different packages produces two distinct
@@ -1850,6 +2138,19 @@
   (setf (mem-ref #x10000170 :u64) (make-hash-table)))
 
 (defun %intern-keyword (name-hash)
+  "Intern a keyword by name hash, under the runtime-table lock.  Split into a
+   wrapper and a body for the reason %INTERN-SYMBOL-PKG gives.
+
+   THIS ONE IS HOT: compile-keyword emits a call to it for EVERY `:foo' literal
+   in compiled code, so it runs on every evaluation of every keyword, FORMAT's
+   included.  That is exactly why it must be locked once a second thread exists,
+   and exactly why the lock has to cost nothing until then."
+  (%rt-enter)
+  (let ((r (%intern-keyword-1 name-hash)))
+    (%rt-leave)
+    r))
+
+(defun %intern-keyword-1 (name-hash)
   "Intern a keyword by name hash.  Same shape as %INTERN-SYMBOL but uses
    the keyword table at #x10000148 and allocates a #x53-subtag object so
    KEYWORDP can identify it.  Compile-keyword in compiler.lisp emits

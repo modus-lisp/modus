@@ -19,6 +19,43 @@
 (defvar *cstr-scratch* #x1DF00000)  ; C-string scratch: up to 4096 bytes
 (defvar *io-buf-addr*  #x1DE00000)  ; Raw I/O buffer: 4096 bytes
 
+;;; ============================================================
+;;; THE STAGING PAGE IS A SEAM, because ONE PAGE IS NOT ENOUGH FOR TWO THREADS
+;;; ============================================================
+;;;
+;;; Every raw read and every raw write in this file goes through a page of
+;;; memory a syscall can be handed the address of — a Lisp object cannot be one,
+;;; because this collector copies.  Until threads existed there was exactly one
+;;; such page and that was correct, because there was exactly one thread.
+;;;
+;;; IT IS NOT CORRECT NOW, AND THE FAILURE IS SILENT DATA CORRUPTION.
+;;; %FS-WRITE-BYTE stores the byte at the page and then issues write(2) from it.
+;;; Two threads writing to two DIFFERENT descriptors interleave as
+;;;
+;;;     A: store 'a' at the page        B: store 'b' at the page
+;;;     A: write(fdA, page, 1)  -> sends 'b'
+;;;     B: write(fdB, page, 1)  -> sends 'b'
+;;;
+;;; so A's stream silently receives B's bytes.  MEASURED, on this image, before
+;;; this seam existed: 327 680 bytes written by one thread and read by another
+;;; across a loopback socket pair came back with 73 933 bytes wrong — while the
+;;; identical transfer on ONE thread was byte-perfect.  That is the shape of a
+;;; shared staging page and of nothing else.
+;;;
+;;; It is on the critical path for glass, which is thread-per-client TIMES TWO:
+;;; a reader thread parked on the socket and a sender thread writing pixels to
+;;; the SAME socket, for every connected viewer.
+;;;
+;;; THE SEAM, NOT THE FIX, LIVES HERE.  This file is loaded long before the
+;;; per-CPU blocks exist (net/hosted-sync.lisp), so it cannot ask for one.  It
+;;; names the question instead, and net/hosted-sockets-post.lisp answers it by
+;;; last-defun-wins — exactly what that file already does for %SOCK-IO-BUF, and
+;;; for the same reason.  Alone, this defun is the historic behaviour verbatim.
+(defun %fs-io-page ()
+  "The address of THIS THREAD's raw I/O staging page, 4096 bytes.
+   Overridden in net/hosted-sockets-post.lisp once per-CPU blocks exist."
+  *io-buf-addr*)
+
 ;;; Linux open flags
 (defun %o-rdonly ()   0)
 (defun %o-wronly ()   1)
@@ -143,7 +180,7 @@
   ;; calls symbol-value which trashes V5 (RCX) = arg1's register.
   ;; By binding to locals first, the values sit in callee-saved/stack slots.
   (let ((path-addr (%string-to-cstr path-str *cstr-scratch*))
-        (buf-addr *io-buf-addr*))
+        (buf-addr (%fs-io-page)))
     (let ((ret (syscall3 4 path-addr buf-addr 0)))
       (if (< ret 0)
           -1
@@ -153,14 +190,14 @@
 (defun %sys-stat-exists (path-str)
   "Return t if file exists, nil otherwise."
   (let ((path-addr (%string-to-cstr path-str *cstr-scratch*))
-        (buf-addr *io-buf-addr*))
+        (buf-addr (%fs-io-page)))
     (let ((ret (syscall3 4 path-addr buf-addr 0)))
       (if (< ret 0) nil t))))
 
 (defun %sys-stat-mtime (path-str)
   "Return file modification time (lower 32 bits of seconds since epoch), or 0."
   (let ((path-addr (%string-to-cstr path-str *cstr-scratch*))
-        (buf-addr *io-buf-addr*))
+        (buf-addr (%fs-io-page)))
     (let ((ret (syscall3 4 path-addr buf-addr 0)))
       (if (< ret 0)
           0
@@ -170,7 +207,7 @@
 ;;; fstat(2) on Linux x64: syscall 5, fills struct stat
 (defun %sys-fstat-size (fd)
   "Return file size for open fd (lower 32 bits), or -1."
-  (let ((buf-addr *io-buf-addr*))
+  (let ((buf-addr (%fs-io-page)))
     (let ((ret (syscall3 5 fd buf-addr 0)))
       (if (< ret 0)
           -1
@@ -193,6 +230,28 @@
         (elt-type (if et (car et) 'character)))
     (%make-stream 9
       (cons fd (cons dir (cons 0 (cons buf (cons 0 (cons 0 (cons nil elt-type))))))))))
+
+(defun %fd-input-ready-p (fd)
+  "T when a read on FD would not block.  THE CONSERVATIVE ANSWER IS T, and this
+   is the conservative definition: a plain file always has something to read (or
+   EOF, which does not block either), and nothing in this layer can ask the
+   kernel about a socket without poll(2), which is defined three files later.
+
+   IT IS A SEAM, AND net/hosted-sockets-post.lisp OVERRIDES IT WITH A REAL
+   poll(2).  Until this existed, LISTEN on a drained SOCKET stream answered T —
+   the fd was valid, so it said yes — while poll on the same fd correctly
+   reported nothing ready.  Measured:
+
+       LISTEN-empty T   (poll says 0 ready)
+       LISTEN-data  T   (poll says 1 ready)
+
+   which makes LISTEN useless as a readiness test and silently defeats any
+   stream-level poll built on it.  A forward reference does not resolve across
+   the compiled blob, so the fix cannot be written where LISTEN is; it is
+   written here, where LISTEN can see it, and replaced later where poll can be
+   called.  Last-defun-wins is how SLEEP stops being a no-op too."
+  fd
+  t)
 
 (defun %make-file-stream ()
   "Create a closed/dummy file stream."
@@ -501,7 +560,7 @@
                 (%fs-set-pos stream (+ (%fs-pos stream) 1))
                 ch)
               ;; Need to refill buffer
-              (let ((n (%sys-read-raw fd *io-buf-addr* 4096)))
+              (let ((n (%sys-read-raw fd (%fs-io-page) 4096)))
                 (if (<= n 0)
                     ;; EOF
                     (if eof-error-p (error "end of file") eof-value)
@@ -509,7 +568,7 @@
                     ;; NOTE: aset with variable index has dest=nil bug when non-last form.
                     ;; Workaround: wrap in let so dest = frame slot (spill register).
                     (let ((buf (%fs-buf stream))
-                          (io-addr *io-buf-addr*)
+                          (io-addr (%fs-io-page))
                           (i 0))
                       (loop
                         (when (>= i n) (return nil))
@@ -528,9 +587,12 @@
   "Write a char code to a file stream."
   (let ((fd (%fs-fd stream)))
     (when (>= fd 0)
-      ;; Write single byte via io-buf
-      (setf (mem-ref *io-buf-addr* :u8) code)
-      (%sys-write-raw fd *io-buf-addr* 1)
+      ;; ONE BINDING, TWO USES.  The store and the write(2) must name the SAME
+      ;; page; asking the seam twice would be two answers if a thread were ever
+      ;; migrated between them.
+      (let ((page (%fs-io-page)))
+        (setf (mem-ref page :u8) code)
+        (%sys-write-raw fd page 1))
       (%fs-set-pos stream (+ (%fs-pos stream) 1)))))
 
 ;;; --- File stream read-byte ---
@@ -561,14 +623,14 @@
                 (%fs-set-bpos stream (+ bpos 1))
                 (%fs-set-pos stream (+ (%fs-pos stream) 1))
                 b)
-              (let ((n (%sys-read-raw fd *io-buf-addr* 4096)))
+              (let ((n (%sys-read-raw fd (%fs-io-page) 4096)))
                 (if (<= n 0)
                     (if eof-error-p (error "end of file") eof-value)
                     ;; Copy io-buf to stream's buffer
                     ;; NOTE: aset with variable index has dest=nil bug when non-last form.
                     ;; Workaround: wrap in let so dest = frame slot (spill register).
                     (let ((buf (%fs-buf stream))
-                          (io-addr *io-buf-addr*)
+                          (io-addr (%fs-io-page))
                           (i 0))
                       (loop
                         (when (>= i n) (return nil))
@@ -584,8 +646,9 @@
   "Write one byte to a file stream."
   (let ((fd (%fs-fd stream)))
     (when (>= fd 0)
-      (setf (mem-ref *io-buf-addr* :u8) byte)
-      (%sys-write-raw fd *io-buf-addr* 1)
+      (let ((page (%fs-io-page)))          ; see %FS-WRITE-CHAR: one binding
+        (setf (mem-ref page :u8) byte)
+        (%sys-write-raw fd page 1))
       (%fs-set-pos stream (+ (%fs-pos stream) 1)))))
 
 ;;; --- file-length ---

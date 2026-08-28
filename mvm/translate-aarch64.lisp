@@ -2672,10 +2672,18 @@
                               ;; BR x11.
                               (a64-emit buf (logior #xD61F0000 (ash +a64-x11+ 5)))
 
-                              ;; --- exit label: sys_exit(139) ---
+                              ;; --- exit label: exit_group(139) ---
+                              ;;
+                              ;; 94 (exit_group), NOT 93 (exit).  `exit' ends
+                              ;; only the calling thread, leaving the group
+                              ;; leader an unreapable zombie and any sibling
+                              ;; parked in futex_wait forever unwoken — a
+                              ;; faulting threaded program then HANGS instead
+                              ;; of reporting.  Identical bug to x86-64's
+                              ;; 60-vs-231; see translate-x64.lisp.
                               (let ((exit-label-idx (a64-current-index buf)))
                                 (a64-movz buf +a64-x0+ 139 0)
-                                (a64-movz buf +a64-x8+ 93 0)
+                                (a64-movz buf +a64-x8+ 94 0)
                                 (a64-svc buf 0)
 
                                 ;; ============================================
@@ -3871,7 +3879,10 @@
           ((= op +op-load+)
            (let* ((vd (vr 0))
                   (pa (ensure-src (vr 1) +a64-x16+))
-                  (width (vr 2))
+                  ;; Mask +WIDTH-TLS-BIT+: AArch64 has no per-thread window
+                  ;; yet, so a thread-local width is the plain width.  See
+                  ;; mvm/mvm.lisp.
+                  (width (logand (vr 2) 3))
                   (pd (or (a64-phys-reg vd) +a64-x17+)))
              (a64-ldr-width buf pd pa 0 width)
              (unless (a64-phys-reg vd)
@@ -3881,7 +3892,7 @@
           ((= op +op-store+)
            (let ((pa (ensure-src (vr 0) +a64-x16+))
                  (ps (ensure-src (vr 1) +a64-x17+))
-                 (width (vr 2)))
+                 (width (logand (vr 2) 3)))   ; +WIDTH-TLS-BIT+: see op-load
              (a64-str-width buf ps pa 0 width)))
 
           ;; ---- FENCE ----
@@ -4759,6 +4770,35 @@
   "LSLV Xd, Xn, Xm  (0x9AC02000|Xm<<16|Xn<<5|Xd)."
   (a64-emit buf (logior #x9AC02000 (ash rm 16) (ash rn 5) rd)))
 
+(defun a64-load-gc-region (buf rd rtmp)
+  "RD := the base address of the ACTIVE region's GC control block.  RTMP is
+   clobbered; RD and RTMP must differ.
+
+   STAGE 3.  The metadata this collector runs on is PER-REGION (mvm/compiler.lisp's
+   +GC-OFF-*+ block): from/to semispaces, size, root-stack base, collection
+   count and the saved SP/alloc/limit triple are eight OFFSETS into a 64-byte
+   block, and which block is live is the word at +GC-REGION-ADDR+.
+
+   THE POINTER IS STORED RAW on every target — unlike the eight fields, which
+   aarch64 stores <<1 so that gc.lisp's halving (mem-ref … :u64) reads them back
+   — because mvm/gc.lisp's %GC-SET-REGION writes it as two exact 32-bit halves.
+   So this is a plain LDR with no ASR, matching translate-x64's plain
+   `mov reg,[abs32]'.
+
+   ZERO MEANS REGION 0.  Nothing writes that word until something creates a
+   second region, so on bare metal the unwritten-metadata-reads-as-zero
+   assumption this tree already relies on answers `region 0' — whose block is
+   the historic one at +GC-REGION-0-BASE+, i.e. the addresses this collector
+   used to hard-code."
+  (a64-load-imm64 buf rtmp +gc-region-addr+)
+  (a64-ldr-unsigned buf rd rtmp 0)
+  (let ((have (incf *mvm-label-counter*)))
+    (a64-cmp-imm buf rd 0)
+    (let ((i (a64-current-index buf)))
+      (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i have :bcond))
+    (a64-load-imm64 buf rd +gc-region-0-base+)
+    (a64-set-label buf have)))
+
 (defun emit-aarch64-native-gc-trampoline (buf)
   "Native Cheney copying collector.  Layout: label → B main → [scan_word] →
    [copy_object] → main.  GC registers (all mutator regs saved in a 240B frame):
@@ -4960,18 +5000,57 @@
     ;; next gc-check's BLR x28 would jump to the bitmap base.
     (a64-str-unsigned buf +a64-x28+ +a64-sp+ 224)
     ;; load GC metadata (all stored <<1 → ASR #1 to raw)
-    (flet ((load-asr (rd addr) (a64-load-imm64 buf +a64-x16+ addr)
-                     (a64-ldr-unsigned buf rd +a64-x16+ 0) (a64-asr-imm buf rd rd 1)))
-      (load-asr +a64-x19+ #x10000040)                   ; from_start
-      (load-asr +a64-x22+ #x10000048)                   ; to_start
+    ;; STAGE 3: THE ACTIVE REGION, not region 0.  Every field below is an
+    ;; OFFSET into the control block of whichever region is active (x17), which
+    ;; is what stage 1 flagged and left undone here because there is no way to
+    ;; boot an aarch64 image where this is written.  ZERO MEANS REGION 0, so a
+    ;; single-region image — which is every aarch64 image today — loads exactly
+    ;; the addresses this code used to hard-code.  The two bitmap CONFIG words
+    ;; are not region fields and keep their absolute addresses.
+    (a64-load-gc-region buf +a64-x17+ +a64-x16+)
+    (flet ((load-abs (rd addr) (a64-load-imm64 buf +a64-x16+ addr)
+                     (a64-ldr-unsigned buf rd +a64-x16+ 0) (a64-asr-imm buf rd rd 1))
+           (load-fld (rd off) (a64-ldr-unsigned buf rd +a64-x17+ off)
+                     (a64-asr-imm buf rd rd 1)))
+      (load-fld +a64-x19+ +gc-off-from-start+)          ; from_start
+      (load-fld +a64-x22+ +gc-off-to-start+)            ; to_start
       (a64-mov-reg buf +a64-x21+ +a64-x22+)             ; free_ptr = to_start
-      (load-asr +a64-x25+ #x10000050)                   ; space_size
+      (load-fld +a64-x25+ +gc-off-space-size+)          ; space_size
       (a64-add-reg buf +a64-x20+ +a64-x19+ +a64-x25+ 0 0) ; from_end = from_start+space_size
-      (load-asr +a64-x23+ #x10000058)                   ; stack_base
-      (load-asr +a64-x27+ #x10000E00)                   ; page_base
-      (load-asr +a64-x28+ #x10000E18))                  ; obj-bitmap base
-    ;; ---- scan stack: x26 from SP to stack_base ----
-    (a64-add-imm buf +a64-x26+ +a64-sp+ 0)              ; x26 = SP (scan start)
+      (load-fld +a64-x23+ +gc-off-stack-base+)          ; stack_base
+      (load-abs +a64-x27+ #x10000E00)                   ; page_base
+      (load-abs +a64-x28+ #x10000E18))                  ; obj-bitmap base
+    ;; ---- scan THIS REGION'S ROOT WINDOW: [x26, stack_base) ----
+    ;; STAGE 2, ported here by stage 3 — until now this collector started the
+    ;; scan at the live SP unconditionally, i.e. it assumed every region it
+    ;; could ever collect was the RUNNING one.  Same two cases translate-x64's
+    ;; trampoline has branched on since stage 2:
+    ;;   saved_sp == 0  RUNNING — the low end is the live SP, which is AT the
+    ;;                  register-save frame (the stp block above), so the whole
+    ;;                  saved register file is inside the window.  %gc-region-init
+    ;;                  writes 0 here, so this is what a single-region image gets
+    ;;                  and it is byte-for-byte the old behaviour.
+    ;;   saved_sp != 0  PARKED — this region's actor was switched off its OWN
+    ;;                  stack and the switch recorded that SP.  The window is
+    ;;                  capped by SIZE (+GC-MAX-PARKED-WINDOW+) because that low
+    ;;                  end came from memory: over the cap, or inverted (the SUB
+    ;;                  wraps to a huge unsigned value), it collapses to EMPTY
+    ;;                  rather than walking unmapped pages.
+    (let ((sp-live (incf *mvm-label-counter*))
+          (sp-ready (incf *mvm-label-counter*)))
+      (a64-ldr-unsigned buf +a64-x26+ +a64-x17+ +gc-off-saved-sp+)
+      (a64-asr-imm buf +a64-x26+ +a64-x26+ 1)
+      (a64-cmp-imm buf +a64-x26+ 0)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i sp-live :bcond))
+      (a64-sub-reg buf +a64-x9+ +a64-x23+ +a64-x26+ 0 0)   ; stack_base - saved_sp
+      (a64-load-imm64 buf +a64-x10+ +gc-max-parked-window+)
+      (a64-cmp-reg buf +a64-x10+ +a64-x9+)                 ; cap ? window
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i sp-ready :bcond))
+      (a64-mov-reg buf +a64-x26+ +a64-x23+)                ; bogus window -> empty
+      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i sp-ready :b))
+      (a64-set-label buf sp-live)
+      (a64-add-imm buf +a64-x26+ +a64-sp+ 0)               ; running: the live SP
+      (a64-set-label buf sp-ready))
     (let ((sloop (incf *mvm-label-counter*))
           (sdone (incf *mvm-label-counter*)))
       (a64-set-label buf sloop)
@@ -5144,11 +5223,16 @@
       (a64-add-imm buf +a64-x9+ +a64-x9+ 1)
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i zbyte2 :b))
       (a64-set-label buf zdone2b))
-    ;; ---- swap metadata (store <<1) ----
+    ;; ---- swap metadata (store <<1), IN THE ACTIVE REGION'S BLOCK ----
+    ;; x17 was the region base at entry but the scan subroutines use it as
+    ;; scratch, so it is resolved again here rather than kept live across the
+    ;; whole collection.  It cannot have changed: nothing switches regions
+    ;; inside a collection.
+    (a64-load-gc-region buf +a64-x16+ +a64-x17+)
     (a64-lsl-imm buf +a64-x9+ +a64-x22+ 1)              ; new from_start = to_start
-    (a64-load-imm64 buf +a64-x16+ #x10000040) (a64-str-unsigned buf +a64-x9+ +a64-x16+ 0)
+    (a64-str-unsigned buf +a64-x9+ +a64-x16+ +gc-off-from-start+)
     (a64-lsl-imm buf +a64-x9+ +a64-x19+ 1)              ; new to_start = old from_start
-    (a64-load-imm64 buf +a64-x16+ #x10000048) (a64-str-unsigned buf +a64-x9+ +a64-x16+ 0)
+    (a64-str-unsigned buf +a64-x9+ +a64-x16+ +gc-off-to-start+)
     ;; x24 = free_ptr ; x25 = new from_start(to_start x22) + space_size(x25)
     ;; minus the ALLOC-OVERSHOOT GUARD BAND (*aarch64-gc-limit-guard*, 0 on
     ;; Linux where the mmap already ends 16MB past the limit).  The gc-check
@@ -5169,10 +5253,10 @@
                (> *aarch64-gc-limit-guard* 0))
       (a64-load-imm64 buf +a64-x9+ *aarch64-gc-limit-guard*)
       (a64-sub-reg buf +a64-x25+ +a64-x25+ +a64-x9+ 0 0))
-    ;; gc_count += 1 (stored <<1 → += 2)
-    (a64-load-imm64 buf +a64-x16+ #x10000060)
-    (a64-ldr-unsigned buf +a64-x9+ +a64-x16+ 0) (a64-add-imm buf +a64-x9+ +a64-x9+ 2)
-    (a64-str-unsigned buf +a64-x9+ +a64-x16+ 0)
+    ;; gc_count += 1 (stored <<1 → += 2), IN THIS REGION
+    (a64-ldr-unsigned buf +a64-x9+ +a64-x16+ +gc-off-count+)
+    (a64-add-imm buf +a64-x9+ +a64-x9+ 2)
+    (a64-str-unsigned buf +a64-x9+ +a64-x16+ +gc-off-count+)
     ;; ---- restore mutator regs + RET ----
     (a64-ldr-unsigned buf +a64-x28+ +a64-sp+ 224)   ; restore trampoline VA into x28
     (a64-ldr-unsigned buf +a64-x30+ +a64-sp+ 216)
@@ -5340,22 +5424,27 @@
     ;; needs the same SHL/ASR-by-1 dance — see also
     ;; reference_aarch64_gc_trampoline.md for the original debugging.
     ;;
-    ;; Stash x24 (alloc ptr) → 0x10000070.  %gc-collect reads this
+    ;; STAGE 3: ALL THREE SLOTS BELONG TO THE ACTIVE REGION, NOT REGION 0.
+    ;; This shim used to write 0x10000068/70/78 — region 0's saved_sp / alloc /
+    ;; limit — no matter which region the %gc-collect it is about to call was
+    ;; going to evacuate.  x16 now holds the active region's control block for
+    ;; all three (ZERO MEANS REGION 0, so a single-region image writes exactly
+    ;; the three addresses it always did).
+    (a64-load-gc-region buf +a64-x16+ +a64-x17+)
+    ;; Stash x24 (alloc ptr) → region+0x30.  %gc-collect reads this
     ;; via (mem-ref ADDR :u64) and treats the result as a Lisp
     ;; integer.  Modus tags fixnums by SHL 1, so the stored 64-bit
     ;; word must already be SHL'd: we LSL x24 by 1 before storing,
     ;; and on the way back out (after %gc-collect) we ASR by 1.
-    (a64-load-imm64 buf +a64-x16+ #x10000070)
     (a64-lsl-imm buf +a64-x17+ +a64-x24+ 1)       ; x17 = x24 << 1 (Lisp-tagged)
-    (a64-str-unsigned buf +a64-x17+ +a64-x16+ 0)
-    ;; Stash x25 (alloc limit) → 0x10000078 (same SHL convention).
-    (a64-load-imm64 buf +a64-x16+ #x10000078)
+    (a64-str-unsigned buf +a64-x17+ +a64-x16+ +gc-off-saved-alloc+)
+    ;; Stash x25 (alloc limit) → region+0x38 (same SHL convention).
     (a64-lsl-imm buf +a64-x17+ +a64-x25+ 1)
-    (a64-str-unsigned buf +a64-x17+ +a64-x16+ 0)
-    ;; Stash CURRENT SP → 0x10000068.  The trampoline's register-save
-    ;; area at [sp, sp+232) IS a root region: any tagged pointer in
-    ;; x0..x23/x26/x27 that's now sitting on the stack must be
-    ;; forwarded by the GC scan or its restore at trampoline exit
+    (a64-str-unsigned buf +a64-x17+ +a64-x16+ +gc-off-saved-limit+)
+    ;; Stash CURRENT SP → region+0x28, AND ONLY IF THAT FIELD SAYS RUNNING.
+    ;; The trampoline's register-save area at [sp, sp+232) IS a root region:
+    ;; any tagged pointer in x0..x23/x26/x27 that's now sitting on the stack
+    ;; must be forwarded by the GC scan or its restore at trampoline exit
     ;; uncovers a stale pre-GC pointer.  Pre-GC bug: we used SP+240
     ;; here, which skipped past the saved-reg frame and missed roots
     ;; — the kernel "worked" until a saved closure pointer landed in
@@ -5363,15 +5452,64 @@
     ;; a forwarding-tagged value, which then took funcall to a stale
     ;; object and wedged the runtime.  Stored SHL'd to match
     ;; (mem-ref :u64)'s tagging convention on the Lisp side.
-    (a64-load-imm64 buf +a64-x16+ #x10000068)
-    ;; LSL encodes reg 31 as XZR, so (lsl x17, sp, 1) produced (lsl x17, xzr, 1)
-    ;; = 0, and every GC stored saved_rsp = 0.  Move SP to x17 via ADD-IMM
-    ;; (which encodes reg 31 as SP) FIRST, then shift.  Diagnosed via gdb
-    ;; watchpoint on 0x10000068 (2026-05-17): str x17, [x16] preceded by
-    ;; lsl x17, xzr, #1 — caught the offending instruction.
-    (a64-add-imm buf +a64-x17+ +a64-sp+ 0)        ; mov x17, sp
-    (a64-lsl-imm buf +a64-x17+ +a64-x17+ 1)       ; x17 = SP << 1
-    (a64-str-unsigned buf +a64-x17+ +a64-x16+ 0)
+    ;;
+    ;; THIS SHIM IS THE ONLY COLLECTOR ENTRY POINT IN THE TREE THAT WRITES
+    ;; +0x28 (translate-x64's trampoline holds RBP and translate-i386 holds ESP,
+    ;; so both only READ it), and that is why it is the only one that has to
+    ;; put back what it found.  Two separate requirements, both live:
+    ;;
+    ;;   RUNNING (field = 0).  The field must be given the live SP, because the
+    ;;   Lisp %gc-collect this is about to call reads the window's low end out
+    ;;   of memory and has no other way to learn it.
+    ;;
+    ;;   PARKED (field != 0).  The field must NOT be touched: it holds the SP
+    ;;   the context switch recorded on that actor's OWN stack, and clobbering
+    ;;   it hands the collector the wrong stack and drops every root the parked
+    ;;   actor holds.  This case IS reachable — %gc-collect-here collects the
+    ;;   ACTIVE region, and gc.lisp's stage-1/2/3 selftests deliberately make a
+    ;;   region active WHILE parked and collect it from there.
+    ;;
+    ;; AND THE FIELD MUST BE RESTORED ON THE WAY OUT.  A conditional write with
+    ;; no restore satisfies both requirements above and is still WRONG, because
+    ;; nothing else ever clears the field: %gc-collect only reads it into a
+    ;; local, and the tail of this shim only reloads x24/x25.  So the first
+    ;; collection leaves the live SP behind FOREVER, and the second one takes
+    ;; the PARKED branch on a value that is not a parked SP at all — it scans
+    ;; [SP-of-the-FIRST-collection, stack_base).  Stacks grow down, so a deeper
+    ;; second collection (the normal case: GC triggers from arbitrary alloc
+    ;; sites at arbitrary depths) gets a window starting ABOVE its own live
+    ;; frames, missing every one of them INCLUDING the register-save area at
+    ;; [sp, sp+232) that the block above just filled.  Those roots are never
+    ;; forwarded, from-space is reclaimed under them, and the heap is silently
+    ;; corrupted from the second collection onward.
+    ;;
+    ;; MEASURED, on a bare-metal shim-path RPi image under QEMU: two forced
+    ;; collections of one carved region, the second 200 frames deeper, with a
+    ;; 2000-link chain rooted ONLY by the deep frame's own local.  Without the
+    ;; restore, saved_sp read 0x07FFE028 after the FIRST collection and the
+    ;; second collection left 16 live bytes — the whole chain uncopied — where
+    ;; the correct answer is 32016.  test/region-gc-depth.lisp is that probe.
+    ;;
+    ;; So: stash the ORIGINAL in the frame's spare slot, install the live SP
+    ;; only if the original said RUNNING, and put the original back after the
+    ;; call.  The shim then leaves no trace, exactly as translate-x64 does by
+    ;; never writing at all — and it is correct whether the region it collects
+    ;; is running or parked.
+    (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ +gc-off-saved-sp+)
+    (a64-str-unsigned buf +a64-x17+ +a64-sp+ 224)   ; frame slot 224 = spare
+    (let ((sp-done (incf *mvm-label-counter*)))
+      (a64-cmp-imm buf +a64-x17+ 0)
+      (let ((i (a64-current-index buf)))
+        (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i sp-done :bcond))
+      ;; LSL encodes reg 31 as XZR, so (lsl x17, sp, 1) produced (lsl x17, xzr, 1)
+      ;; = 0, and every GC stored saved_rsp = 0.  Move SP to x17 via ADD-IMM
+      ;; (which encodes reg 31 as SP) FIRST, then shift.  Diagnosed via gdb
+      ;; watchpoint on 0x10000068 (2026-05-17): str x17, [x16] preceded by
+      ;; lsl x17, xzr, #1 — caught the offending instruction.
+      (a64-add-imm buf +a64-x17+ +a64-sp+ 0)      ; mov x17, sp
+      (a64-lsl-imm buf +a64-x17+ +a64-x17+ 1)     ; x17 = SP << 1
+      (a64-str-unsigned buf +a64-x17+ +a64-x16+ +gc-off-saved-sp+)
+      (a64-set-label buf sp-done))
     ;; Set NARGS = 0 for the %gc-collect call (the ABI puts nargs at
     ;; raw u32 slot 0x10000150; only matters if the callee has an
     ;; arity check, but emit it for parity with the standard call
@@ -5406,16 +5544,23 @@
     (a64-movk buf +a64-x16+ 0 1)              ; placeholder for high 16
     (a64-sub-imm buf +a64-x16+ +a64-x16+ 3)   ; strip +tag-function+
     (a64-blr buf +a64-x16+)
-    ;; Reload x24, x25 from (now-updated) metadata.  %gc-collect
-    ;; wrote these via (setf (mem-ref ADDR :u64) FREE-PTR) — and
+    ;; Reload x24, x25 from (now-updated) metadata OF THE ACTIVE REGION.
+    ;; %gc-collect wrote these via (setf (mem-ref ADDR :u64) FREE-PTR) — and
     ;; since Lisp fixnums are stored SHL'd in registers, :u64 emits
     ;; the SHL'd 64-bit pattern.  ASR by 1 to recover the raw address.
-    (a64-load-imm64 buf +a64-x16+ #x10000070)
-    (a64-ldr-unsigned buf +a64-x24+ +a64-x16+ 0)
+    ;; The base is resolved again because x16 is scratch across the call;
+    ;; %gc-collect does not switch regions, so it is the same block.
+    (a64-load-gc-region buf +a64-x16+ +a64-x17+)
+    (a64-ldr-unsigned buf +a64-x24+ +a64-x16+ +gc-off-saved-alloc+)
     (a64-asr-imm buf +a64-x24+ +a64-x24+ 1)
-    (a64-load-imm64 buf +a64-x16+ #x10000078)
-    (a64-ldr-unsigned buf +a64-x25+ +a64-x16+ 0)
+    (a64-ldr-unsigned buf +a64-x25+ +a64-x16+ +gc-off-saved-limit+)
     (a64-asr-imm buf +a64-x25+ +a64-x25+ 1)
+    ;; PUT BACK WHAT WE FOUND at +0x28 — see the long note at the write above.
+    ;; Restoring a 0 is what keeps the NEXT collection's window fresh; restoring
+    ;; a parked SP is what keeps a parked actor's root window intact.  The
+    ;; region cannot have changed: %gc-collect does not switch regions.
+    (a64-ldr-unsigned buf +a64-x17+ +a64-sp+ 224)
+    (a64-str-unsigned buf +a64-x17+ +a64-x16+ +gc-off-saved-sp+)
     ;; Restore caller-saved regs and frame.
     (a64-ldr-unsigned buf +a64-x30+ +a64-sp+ 216)
     (a64-ldr-unsigned buf +a64-x29+ +a64-sp+ 208)

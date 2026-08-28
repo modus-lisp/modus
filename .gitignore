@@ -11,3 +11,4 @@ alex-after.log
 # agent scratch (build-source dumps, sweep logs) -- never commit
 scratch/
 modus-aa64
+mvm/*.fasl

@@ -259,6 +259,25 @@
             "<condition-no-string-control>"))
     (t (c2) "<condition-unreportable>")))
 
+(defun %mvm-on-main-thread-p ()
+  "T on the MAIN thread, and unconditionally in every image that never turned
+   per-CPU storage on — the same 0x10000FF8 gate %GC-REGION-CELL branches on,
+   so a single-threaded image pays one load and a branch and behaves exactly
+   as before.
+
+   WHY THE CACHES ASK: a module compiled DURING A CALL ON A WORKER is
+   allocated in the WORKER'S region, and a global cache is region-0-reachable
+   — so caching it publishes a region-0 -> worker reference that the worker's
+   own collector can never fix (the forbidden direction; see the B-LITE block
+   in net/hosted-sync.lisp).  Measured: one evaluated DEFUN whose body defers
+   to per-call mvm-eval, first-called on a worker, left EXACTLY ONE such
+   reference via *MVM-EVAL-CACHE*, constant in K.  A worker therefore runs
+   uncached — correctness for a soundness invariant, at a perf cost only a
+   worker-side eval loop would notice."
+  (if (= (mem-ref #x10000FF8 :u32) 0)
+      t
+      (if (= (percpu-ref 16) 0) t nil)))
+
 (defvar *jit-page-cache* nil
   "WS4-S5b per-module JIT cache.  EQ hash keyed by the compiled BC byte-array
    identity → a jit-entry list (base eoff cpatches gc-stamp).  A repeated mvm-eval
@@ -1403,10 +1422,15 @@
                                                (car (cddddr fresh))
                                                4096))))
                     (%jit-patch-consts (car fresh) (caddr fresh)))
-                (setf (gethash bc *jit-page-cache*) fresh)
+                ;; OFF-MAIN, DO NOT CACHE: BC and the tuple are worker-region
+                ;; objects and this table is region-0-reachable — see
+                ;; %MVM-ON-MAIN-THREAD-P.
+                (when (%mvm-on-main-thread-p)
+                  (setf (gethash bc *jit-page-cache*) fresh))
                 fresh)))
         (let ((je (%jit-translate-page bc mvm-entry ft-list rt-table)))
-          (when je (setf (gethash bc *jit-page-cache*) je))
+          (when (and je (%mvm-on-main-thread-p))
+            (setf (gethash bc *jit-page-cache*) je))
           je))))
 
 (defun %mvm-eval-jit-run (bc entry ft-list fn-table rt-table lam-offsets cache-p
@@ -1722,6 +1746,13 @@
          ;; at the top of this function and interp.lisp) — nothing may come
          ;; between %prim and %mv.
          (%mv *mvm-last-mv*)
+         ;; CLEARED AS SOON AS LATCHED: after %mv is bound the global is stale
+         ;; by this seam's own contract ("read IMMEDIATELY"), and on a WORKER
+         ;; it holds a cons allocated in the worker's region — a global is
+         ;; region-0-reachable, so leaving it published is one forbidden
+         ;; region-0 -> worker reference per worker eval (measured: exactly
+         ;; the last audit residue after the CL:INTERN fix).
+         (%mvclr (setq *mvm-last-mv* nil))
          ;; WS5 #203: restore on the SUCCESS path too, but only AFTER %mv has
          ;; been latched.  The handler restores before it re-signals or falls
          ;; back; a run that completes normally would otherwise leave
@@ -2154,7 +2185,14 @@
             ;; PERF Round 2: cache the compiled module for these forms so a
             ;; later mvm-eval of the same forms skips the whole compile.  bc is a
             ;; fresh copy (mvm-buffer-used-bytes), safe despite buffer reuse.
-            (when %cacheable
+            (when (and %cacheable
+                       ;; OFF-MAIN, DO NOT CACHE — the tuple below was
+                       ;; allocated in THIS thread's region during the
+                       ;; compile, and the cache is region-0-reachable.
+                       ;; Measured as EXACTLY the last remaining
+                       ;; region-0 -> worker reference after the CL:INTERN
+                       ;; lock+copy fix.  See %MVM-ON-MAIN-THREAD-P.
+                       (%mvm-on-main-thread-p))
               (setf (gethash forms *mvm-eval-cache*)
                     ;; WS4-S5b: ft-list inserted at index 2 (see %mvm-eval-run-tuple
                     ;; layout comment).  reverse → source order (fn-table order).
@@ -2229,7 +2267,9 @@
                                                  :runtime-table rt-table :return-raw nil
                                                  :lambda-offsets lam-offsets)
                                   bc fn-table rt-table lam-offsets))))
-                   (%mv *mvm-last-mv*))
+                   (%mv *mvm-last-mv*)
+                   ;; Cleared as soon as latched — see the sibling seam above.
+                   (%mvclr (setq *mvm-last-mv* nil)))
               (setq *e2-active-defun-names* %adn-saved)
               ;; WS5 #203: restore the guard flags on the SUCCESS path too, or a
               ;; completed native run leaves *jit-native-ran* set and the NEXT
@@ -2556,7 +2596,9 @@
    values (same *mvm-last-mv* protocol as %mvm-eval-run-tuple) so MV parity
    with production mvm-eval holds through the closure boundary."
   (let* ((%r (apply tramp args))
-         (%mv *mvm-last-mv*))
+         (%mv *mvm-last-mv*)
+         ;; Cleared as soon as latched — see the sibling seams above.
+         (%mvclr (setq *mvm-last-mv* nil)))
     (if %mv
         (if (eql (car %mv) 0)
             (values)

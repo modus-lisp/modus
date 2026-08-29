@@ -565,6 +565,18 @@
   (%init-aarch64-translator)
   (setq *aarch64-jit-mode* t)
   (setq *jit-target-arch* :aarch64)
+  ;; #281: the set-bit emitters read *aarch64-gc-bitmap-enabled* AT EMIT TIME,
+  ;; and the build script's (setf ... t) is HOST-side only — at runtime the
+  ;; defvar reads NIL (Limitation 7), so every runtime-JIT'd alloc skipped its
+  ;; object-start/cons-kind bit.  The validating collector then REFUSES to
+  ;; forward any reference to those objects (scan_word bitmap gate), leaving
+  ;; stale from-space pointers: a runtime DEFMETHOD's specializer list is
+  ;; JIT-materialized, so every runtime-defined GF lost dispatch at the first
+  ;; collection.  Enable it here, where the runtime JIT comes up — gated on
+  ;; %gc-bitmap-init actually having published a bitmap base, so an image
+  ;; without reserved bitmaps stays off instead of emitting wild stores.
+  (when (> (mem-ref #x10000E18 :u64) 0)
+    (setq *aarch64-gc-bitmap-enabled* t))
   (setq *use-jit* t)
   t)
 (defun %jit-enabled-p () (and (boundp (quote *use-jit*)) *use-jit*))

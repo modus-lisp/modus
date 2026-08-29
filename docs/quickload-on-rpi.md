@@ -123,39 +123,53 @@ Status and honest limits: **ungated** (the refactor moves `%FS-READ-CHAR`, which
 every file read goes through — wants a 64-shard run), **not on main**, and **not
 yet run on bare metal at all**, because of 2d.
 
-### 2d. THE NEW CRITICAL PATH — aarch64 loses runtime CLOS methods at the first GC
+### 2d. SOLVED (2026-08-29) — aarch64 lost runtime CLOS methods at the first GC
 
-Task **#281**, and it is a bigger problem than cabinet. On aarch64 a generic
-function defined *at runtime* stops dispatching after the first collection:
+Task **#281**, root-caused and fixed the day after it was written up. The
+repro (a runtime `defmethod` dying with "no applicable method" after 200k
+allocations, 3/3 deterministic, x64 immune) turned out to be one missing
+runtime flag with a long causal chain:
 
-```lisp
-(defclass w () ()) (defgeneric wsync (x)) (defmethod wsync ((x w)) :SYNCED)
-(wsync *w*)                                    ; => :SYNCED
-(let ((j nil)) (dotimes (i 200000) (setq j (cons (make-array 20) j))))
-(wsync *w*)                                    ; => "no applicable method"
-```
+`*aarch64-gc-bitmap-enabled*` was set by the **build scripts only** — host
+side. At runtime the defvar read NIL (Limitation 7), and the set-bit emitters
+consult it **at emit time**, so every page the *in-image runtime JIT* emitted
+allocated conses and objects with **no object-start/cons-kind bitmap bit**.
+The aa64 validating collector applies the bitmap gate to *every* word its
+`scan_word` visits — Cheney scan slots included — so any reference to a
+JIT-allocated object was treated as a conservative false positive and **never
+forwarded**. A runtime `defmethod`'s specializer list is JIT-materialized:
+after the first collection the method record's specializer slot pointed at a
+from-space corpse (forwarding stamp visible as subtag `0x5F`), the
+specializer↔CPL `eq` failed, and dispatch was gone for good.
 
-x64 returns `:SYNCED` both times; aarch64 fails deterministically, 3/3.
-**Bare-metal RPi is aarch64**, so this sits directly on the gate — and it hits
-any library that uses CLOS, not just cabinet.
+Proof was a chain-walk printing `%val->word` for every link either side of a
+GC (`cabfs/aa-chain.lisp`): registry → entry → gf → method list → method all
+moved to to-space; the specializer-list slot kept its pre-GC word. Two earlier
+"leads" died honestly: the "binding into locals repairs it" observation was an
+artifact (probe defuns shift compile-time allocation so the GC trigger never
+fires — read the gc counter at `0x10000060`, probe shapes lie), and `ash` of a
+symbol SEGVs at runtime on aa64, so pointer-printing must use `%val->word`.
 
-Narrowed, so it is not re-derived: the **class survives**
-(`(eq (class-of *w*) (find-class 'w))` is still T afterwards) and the **GF
-survives and is found**, with its method list intact and the error naming it.
-What breaks is the match between a method's specializer and the instance's
-class. A fresh `make-instance` fails too.
+Fixes, both on `cabinet-fs`:
+- **de6b02c** — `%jit-boot-init`'s aarch64 arm enables the flag at runtime,
+  gated on `%gc-bitmap-init` actually having published a bitmap base.
+- **b781961** — the RPi build's identical enable was env-gated behind the
+  "exception storm" wedge note; that wedge was symptom 3 of the
+  alloc-overshoot bug fixed in bfca1db, so the gate was stale. Default is now
+  ON (`MODUS_RPI_JIT_BITMAP=0` = triage opt-out). Build verified.
 
-Four theories died: it is **not** package-local nicknames (`(eq 'd::dsync
-'tdev::dsync)` is T on both arches), not method shape, not `find-class`
-beforehand, and **not `pager.lisp`** — where a per-file bisect first pointed.
-Pager contains no `defmethod` at all; it was merely the first load big enough to
-trigger a collection. Moving the trigger rather than the form is what cleared
-it: 200k conses with no new code reproduce it exactly.
+Verified on the rebuilt hosted CLI: repro 3/3 `:SYNCED`, every dispatch shape
+survives gc=3, and — the payoff — **the full pagetree+cabinet stack now loads
+and its smoke test passes on aarch64** (format-fs, make-directories, UTF-8
+write/read round-trip, readdir) through 16 collections. Silicon validation of
+the RPi image is pending the next netboot.
 
-The lead: a probe that binds the GF *and its method list* into locals and then
-calls it succeeds after the same allocation, while merely calling `%find-gf`
-beforehand does not help. That points at a stale specializer in the dispatch
-path that re-resolution repairs.
+**Residual, split out as task #282:** some probe *shapes* still hit exactly one
+swallowed TYPE-ERROR at a shape-determined point during the load (btree in one
+shape, fs.lisp in another), after which the next toplevel form aborts —
+deterministic per shape, `MODUS_NO_JIT=1` changes nothing, not the guard band
+(#258), x64 clean. A different, smaller bug; it no longer blocks the rung
+because a clean shape loads and runs everything.
 
 ### 2c. Two smaller, well-understood items
 
@@ -231,15 +245,12 @@ SD/eMMC is required only for a filesystem that **survives a reboot**. The gate
 does not ask for that, and putting a BCM SDHOST driver on the critical path
 would be an expensive way to learn nothing new.
 
-**1 — Fix #281, aarch64 runtime CLOS after GC.** Everything else is now
-downstream of this. It is not optional and it is not cabinet-specific: until a
-runtime-defined generic function survives a collection on aarch64, no
-CLOS-using library can be loaded on the Pi at all. Start from the lead in §2d —
-instrument the applicability test to print the method's stored specializer and
-the argument's class either side of a collection, and compare object identity.
-If the specializer is a stale copy, this is a missed root or an un-forwarded
-pointer in the method record; the aarch64 collector is the arm that already
-needed #160's bitmap port and bfca1db's guard band.
+**1 — ~~Fix #281~~ DONE (2026-08-29, de6b02c + b781961; §2d).** Runtime CLOS
+survives collections on aarch64, and cabinet's full stack loads and passes its
+smoke test there. What replaced it, much smaller: **#282**, a shape-determined
+single swallowed TYPE-ERROR during heavy LOAD on aa64 (JIT-independent, one
+probe shape hits it, another loads everything clean). Chase it before trusting
+long unattended loads on the board, but it does not block the next steps.
 
 **2 — Gate and merge the filesystem seam** (branch `cabinet-fs`, `a325f25`).
 64-shard run, because `%FS-READ-CHAR` is on every file read. The design is
@@ -250,8 +261,9 @@ that it works on bare metal.
 driver** — `mem-device` is pure CL, an adjustable vector of
 `(unsigned-byte 8)` pages (`pagetree/src/device.lisp:29-60`). So the bare-metal
 v1 is: bake or fetch cabinet+pagetree source, load it, `cabinet-mount`. Cabinet
-already passes **6,823 checks / 0 failures** on Modus, and all 10 of its and
-pagetree's files LOAD cleanly on aarch64 — only post-GC dispatch fails.
+already passes **6,823 checks / 0 failures** on Modus, and as of 2026-08-29 all
+10 of its and pagetree's files load AND the format-fs/round-trip smoke passes
+on aarch64 (hosted, through 16 collections).
 
 **4 — Vendor the genuine client.** With a filesystem, the hosted mechanism
 (`cl:load` the real client) works unchanged. It brings its own
@@ -334,13 +346,14 @@ source out of an in-RAM cabinet filesystem, compiles it, and runs it. That was
 "the one subsystem", and it took one seam in `cl-fileio.lisp` plus a loadable
 shim, not a rewrite.
 
-**A different blocker replaced it, and it is a better problem to have.** #281 is
-sharp, deterministic, twelve lines, and aarch64-only, with four wrong theories
-already eliminated by experiment — including my own recent package-local
-nickname code, which was the obvious suspect and is innocent. It is also worth
-more than cabinet: a runtime-defined generic function that loses its methods at
-the first collection breaks *any* CLOS-using library on the Pi, so fixing it
-unblocks far more than this gate.
+**The blocker that replaced it is now fixed too.** #281 turned out to be one
+missing runtime flag: the aarch64 in-image JIT emitted every allocation with no
+GC bitmap bit, and the validating collector then refused to forward any
+reference to those objects — a runtime `defmethod`'s specializer list being the
+first casualty anyone noticed (§2d, commits de6b02c + b781961). With it fixed,
+**cabinet loads and runs on aarch64** — the filesystem is no longer x64-only.
+The fix is worth more than cabinet: it un-breaks *every* CLOS-using library on
+the Pi's architecture, and the same enable is now default-ON in the RPi image.
 
 What has not changed: the parts that could have stayed impossible — booting on
 silicon, an RTL8153 driver written from scratch, JIT-compiling on the board,
@@ -348,6 +361,8 @@ fetching a real library over real HTTP and running it — remain done, and the
 board was re-verified healthy on this date. What is left still has names and
 line numbers rather than mysteries.
 
-The honest caveat on all of it: the filesystem is proven on **x64 only**, it is
-**ungated**, and it has **never run on bare metal**. Those are the next three
-things to be true, in that order, and #281 gates the third.
+The honest caveats: the filesystem seam is still **ungated** and has **never
+run on bare metal**; the aarch64 result is hosted-QEMU, with silicon validation
+pending the next netboot; and #282 (one shape-determined swallowed TYPE-ERROR
+during heavy loads on aa64) is open, characterized, and smaller than anything
+it replaced.

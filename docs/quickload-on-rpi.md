@@ -79,36 +79,83 @@ alexandria in 43.6 s" — was obtained by `cl:load`ing that host checkout into t
 That is the right design for a hosted image. It is exactly wrong for a machine
 with no disk to load from.
 
-### 2b. There is no filesystem — this is the real remaining problem
+### 2b. There was no filesystem — SOLVED on x64, 2026-08-29
 
 `ql:quickload` is not a function that fetches a tarball. It is a program that
 reads and writes a directory tree: `setup.lisp`, `config.lisp`, `dist.lisp`,
 `local-projects.lisp` all call `cl:load` / `open` / `probe-file` /
-`ensure-directories-exist` against real paths, and the dist machinery caches
-metadata and fasls under `~/quicklisp/`.
+`ensure-directories-exist` against real paths.
 
-On the bare-metal image:
+On bare metal every one of those is a Linux syscall with no OS behind it
+(`build-cli-common.lisp:1021` — "a literal SVC with no OS behind it"), so `OPEN`
+and `LOAD` existed as symbols and **faulted when called**. That was named here
+as the one load-bearing gap.
 
-- `net/hosted-storage.lisp` is **hosted-gated** (`build-cli-common.lisp:883`);
-  bare metal gets no storage layer.
-- There is **no SD/eMMC/SDHOST block driver**. Searched
-  `build-rpi-cl-repl.lisp` and `build-cli-common.lisp` for `mmc|emmc|sdhost|block`
-  — zero hits. Stating that explicitly because an empty grep is not evidence on
-  its own; the absence is corroborated by `build-cli-common.lisp:871`, which
-  names "pagetree/cabinet" as what bare metal *would* need.
-- `mvm/cl-fileio.lisp` **is** baked (it sits above the bare-metal cut at
-  `build-cli-common.lisp:928`), but every primitive is a raw Linux syscall —
-  `%sys-open-rdonly` → `(syscall3 2 …)` (`cl-fileio.lisp:67-99`). On bare metal
-  those are "a literal SVC with no OS behind it" (`build-cli-common.lisp:1021-1024`).
-  So `OPEN` and `LOAD` exist as symbols and **fault when called**. That is worse
-  than absent: it fails late and in the dark.
-- `*filesystem*` (`cl-fileio.lisp:682`, "alist of (path . content) for
-  bare-metal use") is set to `nil` by the RPi build
-  (`build-rpi-cl-repl.lisp:329`). Repo-wide it is written by six build scripts
-  and **read by nothing** — a vestigial defvar, not a working in-memory FS.
+**It is now closed on x64** (branch `cabinet-fs`, `a325f25`). `cl-fileio.lisp`
+carries one seam — the function-valued global `*CAB-CALL*` — and when it is set
+every `%SYS-*` primitive routes to a cabinet filesystem instead of a syscall.
+`lib/cabinet-fs.lisp` is the loadable other half. Measured:
 
-**This is the gate.** Everything else on the list is hours of plumbing; this is
-a subsystem.
+```
+probe-file /nope        => NIL
+(with-open-file … :output) writes, (… :input) reads it back verbatim
+(load "/hello.lisp")    => defines CAB-HELLO, which returns :FROM-CABINET
+(cabinet-unmount)       => real syscalls again
+```
+
+That is CL's `LOAD` pulling source out of an in-RAM filesystem, compiling it and
+running it, with no kernel underneath.
+
+Two things measured on the way that are easy to get wrong:
+
+- **The seam has to be baked; a runtime override does not work.** A runtime
+  `(defun %sys-stat-exists …)` is visible to interpreted callers but NOT to the
+  already-compiled `PROBE-FILE`, which keeps calling the baked one — direct call
+  returns 1 while `probe-file` still returns NIL. Compiled call sites bind at
+  build time.
+- **Cabinet bytes must never travel through `*IO-BUF-ADDR*`.** The stream layer
+  already keeps its own Lisp buffer, so `%SYS-READ-INTO-BUF` fills that directly
+  on both paths. Routing through the raw buffer would have worked JIT-on and
+  silently corrupted JIT-off, because `(setf (mem-ref addr :u8) v)` is a no-op
+  on the interpreted path (task #272).
+
+Status and honest limits: **ungated** (the refactor moves `%FS-READ-CHAR`, which
+every file read goes through — wants a 64-shard run), **not on main**, and **not
+yet run on bare metal at all**, because of 2d.
+
+### 2d. THE NEW CRITICAL PATH — aarch64 loses runtime CLOS methods at the first GC
+
+Task **#281**, and it is a bigger problem than cabinet. On aarch64 a generic
+function defined *at runtime* stops dispatching after the first collection:
+
+```lisp
+(defclass w () ()) (defgeneric wsync (x)) (defmethod wsync ((x w)) :SYNCED)
+(wsync *w*)                                    ; => :SYNCED
+(let ((j nil)) (dotimes (i 200000) (setq j (cons (make-array 20) j))))
+(wsync *w*)                                    ; => "no applicable method"
+```
+
+x64 returns `:SYNCED` both times; aarch64 fails deterministically, 3/3.
+**Bare-metal RPi is aarch64**, so this sits directly on the gate — and it hits
+any library that uses CLOS, not just cabinet.
+
+Narrowed, so it is not re-derived: the **class survives**
+(`(eq (class-of *w*) (find-class 'w))` is still T afterwards) and the **GF
+survives and is found**, with its method list intact and the error naming it.
+What breaks is the match between a method's specializer and the instance's
+class. A fresh `make-instance` fails too.
+
+Four theories died: it is **not** package-local nicknames (`(eq 'd::dsync
+'tdev::dsync)` is T on both arches), not method shape, not `find-class`
+beforehand, and **not `pager.lisp`** — where a per-file bisect first pointed.
+Pager contains no `defmethod` at all; it was merely the first load big enough to
+trigger a collection. Moving the trigger rather than the form is what cleared
+it: 200k conses with no new code reproduce it exactly.
+
+The lead: a probe that binds the GF *and its method list* into locals and then
+calls it succeeds after the same allocation, while merely calling `%find-gf`
+beforehand does not help. That points at a stale specializer in the dispatch
+path that re-resolution repairs.
 
 ### 2c. Two smaller, well-understood items
 
@@ -184,43 +231,40 @@ SD/eMMC is required only for a filesystem that **survives a reboot**. The gate
 does not ask for that, and putting a BCM SDHOST driver on the critical path
 would be an expensive way to learn nothing new.
 
-**1 — Storage. `cabinet`/`pagetree` as the Modus filesystem (task #279).**
-This is the intended answer and it is already most of the way there. `pagetree`
-is a copy-on-write B+tree over a ~5-operation block device; `cabinet` is a
-POSIX-ish filesystem on top of it. Both were written for this — pagetree's
-`src/device.lisp` says "a disk driver on modus tomorrow" — and `(cabinet:format-fs
-nil)` gives an **in-RAM** filesystem, so the bare-metal v1 needs no block driver
-at all.
+**1 — Fix #281, aarch64 runtime CLOS after GC.** Everything else is now
+downstream of this. It is not optional and it is not cabinet-specific: until a
+runtime-defined generic function survives a collection on aarch64, no
+CLOS-using library can be loaded on the Pi at all. Start from the lead in §2d —
+instrument the applicability test to print the method's stored specializer and
+the argument's class either side of a collection, and compare object identity.
+If the specializer is a stale copy, this is a missed root or an un-forwarded
+pointer in the method record; the aarch64 collector is the arm that already
+needed #160's bitmap port and bfca1db's guard band.
 
-Status: cabinet's own differential-oracle suite runs **on Modus** at
-**6,823 checks / 0 failures**, including a persistence round trip (1500 fuzzed
-ops against a real file → unmount → remount → compare against the model).
-Getting there found and fixed three Modus bugs (package-local nicknames,
-condition identity across a nested-interpret boundary, `COERCE` silently
-ignoring `ARRAY`/`SIMPLE-ARRAY`) — all now on main.
+**2 — Gate and merge the filesystem seam** (branch `cabinet-fs`, `a325f25`).
+64-shard run, because `%FS-READ-CHAR` is on every file read. The design is
+proven end to end on x64; what is unproven is that it is regression-free and
+that it works on bare metal.
 
-Remaining for this step: wire cabinet under the pathname/stream layer so
-`OPEN`/`LOAD`/`PROBE-FILE`/`ENSURE-DIRECTORIES-EXIST` route to it instead of to
-naked syscalls. Sources are at `/home/claude/modus-lisp/{cabinet,pagetree}`;
-they are not yet vendored into this repo.
+**3 — Storage on the board.** `(cabinet:format-fs nil)` needs **no block
+driver** — `mem-device` is pure CL, an adjustable vector of
+`(unsigned-byte 8)` pages (`pagetree/src/device.lisp:29-60`). So the bare-metal
+v1 is: bake or fetch cabinet+pagetree source, load it, `cabinet-mount`. Cabinet
+already passes **6,823 checks / 0 failures** on Modus, and all 10 of its and
+pagetree's files LOAD cleanly on aarch64 — only post-GC dispatch fails.
 
-**2 — Vendor the genuine client.** Once there is a filesystem, the hosted
-mechanism (`cl:load` the real client) works unchanged. The client brings its own
-`deflate.lisp`/`minitar.lisp`, so chipz is not needed — note that
-`install-tarball`'s chipz calls are prefix-stripped to bare `decompress`/`gzip`
-(`build-cli-common.lisp:154-164`) and are dangling names on a never-taken path.
+**4 — Vendor the genuine client.** With a filesystem, the hosted mechanism
+(`cl:load` the real client) works unchanged. It brings its own
+`deflate.lisp`/`minitar.lisp`, so chipz is not needed.
 
-**3 — Populate `~/quicklisp/` at boot.** The in-RAM FS starts empty and does not
-survive reset, so the client's tree has to be materialised each boot — either
-baked as a payload and unpacked into cabinet, or fetched. Decide which; the
-former is deterministic and testable, the latter is closer to the real thing.
+**5 — Populate `~/quicklisp/` at boot**, since an in-RAM FS starts empty and
+does not survive reset. Baked-and-unpacked is deterministic; fetched is closer
+to the real thing.
 
-**4 — Size the network.** `MODUS_NET_BUFSZ=400000`, and confirm the fetched byte
+**6 — Size the network.** `MODUS_NET_BUFSZ=400000`, and confirm fetched
 **content**, never the reported count.
 
-**5 — Run it on silicon.** Not QEMU. See the risk below.
-
----
+**7 — Run it on silicon.** The rig works and the board is healthy (§4).
 
 ## 4. Risks
 
@@ -282,13 +326,28 @@ So step 5 is **not** blocked on hardware. Two caveats found while confirming it:
 
 ## 5. Honest summary
 
-The hard, uncertain parts are behind us. Booting on silicon, driving USB
-ethernet from scratch, JIT-compiling on the board, fetching a real library over
-real HTTP and running it — those were the things that could have stayed
-impossible, and they don't have open questions attached to them any more.
+Updated 2026-08-29, after a session that moved the answer.
 
-What remains is **one subsystem** (a filesystem, already written and already
-passing 6,823 of its own checks on Modus) plus **plumbing** (vendor a client,
-populate a directory, raise a buffer). The failures left in this project have
-names and line numbers rather than mysteries, and that is a different kind of
-hard than where it started.
+**The gap this document was written to name is closed on x64.** CL's `OPEN` and
+`LOAD` now work with no operating system underneath them — `LOAD` reads Lisp
+source out of an in-RAM cabinet filesystem, compiles it, and runs it. That was
+"the one subsystem", and it took one seam in `cl-fileio.lisp` plus a loadable
+shim, not a rewrite.
+
+**A different blocker replaced it, and it is a better problem to have.** #281 is
+sharp, deterministic, twelve lines, and aarch64-only, with four wrong theories
+already eliminated by experiment — including my own recent package-local
+nickname code, which was the obvious suspect and is innocent. It is also worth
+more than cabinet: a runtime-defined generic function that loses its methods at
+the first collection breaks *any* CLOS-using library on the Pi, so fixing it
+unblocks far more than this gate.
+
+What has not changed: the parts that could have stayed impossible — booting on
+silicon, an RTL8153 driver written from scratch, JIT-compiling on the board,
+fetching a real library over real HTTP and running it — remain done, and the
+board was re-verified healthy on this date. What is left still has names and
+line numbers rather than mysteries.
+
+The honest caveat on all of it: the filesystem is proven on **x64 only**, it is
+**ungated**, and it has **never run on bare metal**. Those are the next three
+things to be true, in that order, and #281 gates the third.

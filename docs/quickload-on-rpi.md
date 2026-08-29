@@ -129,6 +129,61 @@ a subsystem.
 
 Ordered by dependency, not by size.
 
+### Does the RAM disk fit, or is an SD driver needed first?
+
+**It fits, with ~85× margin, and no SD driver is needed for the gate.**
+
+What quicklisp needs on disk, measured against the host install:
+
+| item | size |
+|---|---|
+| the QL client itself | 296 KB |
+| dist index (`releases.txt` 578 KB + `systems.txt` 470 KB) | ~1 MB |
+| alexandria tarball | 57 KB |
+| **minimal quickload-alexandria** | **~2 MB** |
+| whole host tree, dozens of libraries installed | 49 MB |
+
+What the board has (448 MiB confirmed by U-Boot on the hardware, not assumed —
+not 512, not 496):
+
+```
+0x00300000  image (netboot)        ~60 MB, ends ~0x03F00000
+0x08000000  stack top (grows down)
+0x09000000  Cheney from-space   ┐
+0x0C800000  semispace midpoint  ├─ 112 MB heap = 2 x 56 MB
+0x10000000  heap end / metadata ┘
+0x11000000  USB DMA window (Device, 2 MB)
+0x11200000  ---- Normal-WB, cached, UNUSED ----┐
+   ...      SSH builds park actors at 0x12/0x13/0x16000000
+0x1C000000  top of physical DRAM               ┘  ~174 MB free (REPL build)
+```
+
+`0x11200000-0x3EFFFFFF` is **already mapped Normal-WB** by the boot page tables
+(`boot-rpi-cl.lisp:338-343`), so this needs no MMU work. In an SSH build the
+actor regions carve it up and roughly 45 MB remains between `ssh-ipc-base` and
+`actor-heap-base` — still ample for 2 MB.
+
+**Put the RAM disk OUTSIDE the Lisp heap**, as a raw block device in that
+region, rather than as a Lisp array inside it. Three reasons, in order of
+weight:
+
+1. **pagetree's interface already *is* a block device** (~5 ops). A raw memory
+   range with read-block/write-block is the direct implementation — nothing to
+   adapt or wrap.
+2. **Inside the heap, the GC copies the whole filesystem on every collection,
+   forever.** FS contents are permanently live — they never become garbage — so
+   in a Cheney collector every byte is copied at every single collection. It
+   also consumes semispace that the compiler needs for its ~1.7 MB/form of
+   transient garbage (task #188), in a 56 MB space that already hosts 512 KB JIT
+   code arrays and a 400 KB network buffer.
+3. **The SD driver later drops in behind the same five operations.** The RAM
+   disk is not throwaway scaffolding; it is the same interface with a different
+   backing store.
+
+SD/eMMC is required only for a filesystem that **survives a reboot**. The gate
+does not ask for that, and putting a BCM SDHOST driver on the critical path
+would be an expensive way to learn nothing new.
+
 **1 — Storage. `cabinet`/`pagetree` as the Modus filesystem (task #279).**
 This is the intended answer and it is already most of the way there. `pagetree`
 is a copy-on-write B+tree over a ~5-operation block device; `cabinet` is a
@@ -186,11 +241,42 @@ console for a data abort. The method that works is PC-sampling over QEMU's
 gdbstub and diffing RAM against the image file
 (`reference_baremetal_faults_are_invisible`).
 
-**Hardware, as of 2026-08-29:** `modulator` (Pi Zero 2 W) is **unreachable**
-(`no route to host`) — same as on 2026-08-15. `modus-pi` is up (Pi 5, aarch64,
-Linux) and is the TFTP head of the netboot rig. So silicon validation currently
-runs through modus-pi; the Pi Zero's own reachability needs restoring before
-step 5.
+**Hardware, verified 2026-08-29: the rig works and the board is healthy.**
+
+The Pi Zero 2 W does **not** answer on the network and has no SSH — it is
+attached to the Pi 5 (`modus-pi`) by **GPIO and UART**, not by USB or IP:
+`/dev/ttyAMA0` for console, GPIO 17 → the Zero's RUN pin for reset
+(`~/pi5-reset-zero.sh`). Do not conclude anything about it from `ping`,
+`ssh modulator`, or `lsusb` — none of those instruments can see it. That
+mistake was made once on this date and produced a confident "the board is
+powered off" that was simply false.
+
+The working check is `~/netboot-modus.py --img <name> --capture N [--send FORM]`,
+which resets, interrupts U-Boot autoboot, TFTPs from `modus-pi:/srv/tftp`, runs
+`go 0x300000`, and streams serial. Measured on this date:
+
+```
+DRAM:  448 MiB                              <- U-Boot, on the board
+63341720 bytes transferred (TFTP)
+## Starting application at 0x00300000 ...
+BOOT / MODUS-CL / DTB ptr=1
+E2SMOKE-START add=3 sqr=25 defcall=49 persist-call=36 persist-fn=45 E2SMOKE-END
+Modus CL REPL (bare metal).  EVAL = MVM-EVAL.
+> (+ 2 3)                          => 5
+> (length (list 1 2 3 4))          => 4
+```
+
+So step 5 is **not** blocked on hardware. Two caveats found while confirming it:
+
+- **The saved U-Boot env boots from the SD card, not the network:**
+  `bootcmd = usb start; fatload mmc 0:1 0x300000 modus-ssh.img; go 0x300000`,
+  and `ipaddr`/`serverip` are unset. A plain reset therefore loads whatever
+  `modus-ssh.img` is on the card — currently an image that starts and prints
+  **nothing** for 75 s. Netbooting a known image is the way to test; don't read
+  the card's default as a platform result.
+- A fixed-size `fatload` is deterministic to the millisecond across resets
+  (61,792,816 bytes / 2578 ms, twice). That looks like a suspicious coincidence
+  if you have assumed it was a network transfer. It is not one.
 
 ---
 

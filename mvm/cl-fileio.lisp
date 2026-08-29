@@ -58,6 +58,58 @@
     (setf (mem-ref (+ addr len) :u8) 0)
     addr))
 
+;;; ======================================================================
+;;; CABINET FILESYSTEM BACKEND — the seam that lets OPEN/LOAD work with no
+;;; operating system under them.
+;;;
+;;; Every %sys-* below is a Linux syscall.  On BARE METAL there is nothing
+;;; behind those syscalls (build-cli-common.lisp:1021: "a literal SVC with
+;;; no OS behind it"), so OPEN and LOAD exist as symbols and FAULT when
+;;; called.  That, not the network and not the compiler, is what stops a
+;;; real Quicklisp client from running on a Pi.
+;;;
+;;; When *CAB-CALL* is non-NIL it is a function of (OP &REST ARGS) supplied
+;;; at runtime by the cabinet shim, and every primitive routes to it.
+;;; Exactly ONE global is the contract, so this file never mentions the
+;;; CABINET package — which it could not do anyway: cl-fileio is BAKED and
+;;; cabinet is LOADED afterwards.
+;;;
+;;; Why a baked seam rather than a runtime override of these defuns:
+;;; MEASURED 2026-08-29 — a runtime (defun %sys-stat-exists ...) is visible
+;;; to interpreted callers but NOT to the already-compiled PROBE-FILE,
+;;; which keeps calling the baked one.  Compiled call sites bind at build
+;;; time, so the branch has to be here.
+;;;
+;;; Cabinet fds are numbered from +CAB-FD-BASE+ up so they cannot collide
+;;; with real kernel fds on a hosted image, where both backends coexist.
+(defvar *cab-call* nil)          ; (op &rest args) -> value, or NIL = syscalls
+(defvar *cab-fds* nil)           ; alist (fd path . pos)
+(defvar *cab-fd-next* 900)
+
+(defun %cab-on () *cab-call*)
+
+(defun %cab (op &rest args)
+  "Dispatch OP to the cabinet shim.  Never called unless *CAB-CALL* is set."
+  (apply *cab-call* op args))
+
+(defun %cab-fd-entry (fd) (assoc fd *cab-fds*))
+(defun %cab-fd-p (fd) (and *cab-call* (>= fd 900) (%cab-fd-entry fd)))
+
+(defun %cab-fd-open (path pos)
+  "Register a new cabinet fd for PATH starting at POS; return the fd."
+  (let ((fd *cab-fd-next*))
+    (setq *cab-fd-next* (+ fd 1))
+    (setq *cab-fds* (cons (cons fd (cons path pos)) *cab-fds*))
+    fd))
+
+(defun %cab-fd-path (fd) (let ((e (%cab-fd-entry fd))) (and e (cadr e))))
+(defun %cab-fd-pos  (fd) (let ((e (%cab-fd-entry fd))) (and e (cddr e))))
+(defun %cab-fd-set-pos (fd pos)
+  (let ((e (%cab-fd-entry fd))) (when e (setf (cddr e) pos))))
+(defun %cab-fd-close (fd)
+  (setq *cab-fds* (remove-if (lambda (e) (eql (car e) fd)) *cab-fds*))
+  0)
+
 ;;; Low-level file syscalls.
 ;;; syscall3 takes tagged fixnum args, untags them before syscall.
 ;;; For addresses (path pointer), we pass the raw address as a fixnum — syscall3 untags (SHR 1).
@@ -66,37 +118,55 @@
 
 (defun %sys-open-rdonly (path-str)
   "Open file for reading. Returns fd (fixnum) or negative errno."
-  (%string-to-cstr path-str *cstr-scratch*)
-  ;; syscall3: num=2(open), arg1=path-ptr(tagged addr), arg2=flags=0(O_RDONLY), arg3=0
-  (syscall3 2 *cstr-scratch* 0 0))
+  (if (%cab-on)
+      (if (%cab :exists path-str) (%cab-fd-open path-str 0) -2)
+      (progn
+        (%string-to-cstr path-str *cstr-scratch*)
+        ;; syscall3: num=2(open), arg1=path-ptr(tagged addr), arg2=flags=0(O_RDONLY), arg3=0
+        (syscall3 2 *cstr-scratch* 0 0))))
 
 (defun %sys-open-wronly (path-str)
   "Open file for writing (create/truncate). Returns fd or negative errno."
-  (%string-to-cstr path-str *cstr-scratch*)
-  ;; O_WRONLY|O_CREAT|O_TRUNC = 1|0x40|0x200 = 0x241 = 577
-  (syscall3 2 *cstr-scratch* 577 420))  ; 420 = 0644 octal
+  (if (%cab-on)
+      (progn (%cab :create path-str) (%cab-fd-open path-str 0))
+      (progn
+        (%string-to-cstr path-str *cstr-scratch*)
+        ;; O_WRONLY|O_CREAT|O_TRUNC = 1|0x40|0x200 = 0x241 = 577
+        (syscall3 2 *cstr-scratch* 577 420))))  ; 420 = 0644 octal
 
 (defun %sys-open-append (path-str)
   "Open file for appending. Returns fd or negative errno."
-  (%string-to-cstr path-str *cstr-scratch*)
-  ;; O_WRONLY|O_CREAT|O_APPEND = 1|0x40|0x400 = 0x441 = 1089
-  (syscall3 2 *cstr-scratch* 1089 420))
+  (if (%cab-on)
+      (progn (unless (%cab :exists path-str) (%cab :create path-str))
+             (%cab-fd-open path-str (%cab :size path-str)))
+      (progn
+        (%string-to-cstr path-str *cstr-scratch*)
+        ;; O_WRONLY|O_CREAT|O_APPEND = 1|0x40|0x400 = 0x441 = 1089
+        (syscall3 2 *cstr-scratch* 1089 420))))
 
 (defun %sys-open-rdwr (path-str)
   "Open file for read+write. Returns fd or negative errno."
-  (%string-to-cstr path-str *cstr-scratch*)
-  ;; O_RDWR|O_CREAT = 2|0x40 = 66
-  (syscall3 2 *cstr-scratch* 66 420))
+  (if (%cab-on)
+      (progn (unless (%cab :exists path-str) (%cab :create path-str))
+             (%cab-fd-open path-str 0))
+      (progn
+        (%string-to-cstr path-str *cstr-scratch*)
+        ;; O_RDWR|O_CREAT = 2|0x40 = 66
+        (syscall3 2 *cstr-scratch* 66 420))))
 
 (defun %sys-open-create-excl (path-str)
   "Open/create file exclusively (error if exists). Returns fd or negative errno."
-  (%string-to-cstr path-str *cstr-scratch*)
-  ;; O_WRONLY|O_CREAT|O_EXCL = 1|0x40|0x80 = 0xC1 = 193
-  (syscall3 2 *cstr-scratch* 193 420))
+  (if (%cab-on)
+      (if (%cab :exists path-str) -17          ; EEXIST
+          (progn (%cab :create path-str) (%cab-fd-open path-str 0)))
+      (progn
+        (%string-to-cstr path-str *cstr-scratch*)
+        ;; O_WRONLY|O_CREAT|O_EXCL = 1|0x40|0x80 = 0xC1 = 193
+        (syscall3 2 *cstr-scratch* 193 420))))
 
 (defun %sys-close (fd)
   "Close file descriptor."
-  (syscall3 3 fd 0 0))
+  (if (%cab-fd-p fd) (%cab-fd-close fd) (syscall3 3 fd 0 0)))
 
 (defun %sys-getpid ()
   "Linux x64 syscall 39 (getpid).  Used to disambiguate per-process
@@ -111,33 +181,99 @@
   "Write COUNT bytes from buf at BUF-ADDR to FD. Returns bytes written or negative."
   (syscall3 1 fd buf-addr count))
 
+;;; Buffer transfer that never touches a raw address.
+;;;
+;;; The stream layer keeps its OWN Lisp buffer (%FS-BUF, a string) and, on
+;;; the syscall path, copies *IO-BUF-ADDR* into it one MEM-REF at a time.
+;;; The cabinet path fills that Lisp buffer DIRECTLY.  Deliberate: a raw
+;;; `(setf (mem-ref addr :u8) v)` is a silent no-op on the interpreted path
+;;; (task #272), so routing cabinet bytes through *IO-BUF-ADDR* would work
+;;; JIT-on and silently corrupt JIT-off.  Keeping bytes in Lisp values
+;;; sidesteps that whole class.
+(defun %sys-read-into-buf (fd buf count)
+  "Read up to COUNT bytes from FD into the STRING BUF (as char codes).
+   Returns the number of bytes read, 0 at EOF, or negative on error."
+  (if (%cab-fd-p fd)
+      (let* ((path  (%cab-fd-path fd))
+             (pos   (%cab-fd-pos fd))
+             (bytes (%cab :read path))
+             (len   (length bytes)))
+        (if (>= pos len)
+            0
+            (let ((n (min count (- len pos)))
+                  (i 0))
+              (loop
+                (when (>= i n) (return nil))
+                (let ((dummy (%prim-aset buf i (aref bytes (+ pos i)))))
+                  (setq i (+ i 1))))
+              (%cab-fd-set-pos fd (+ pos n))
+              n)))
+      (let ((n (%sys-read-raw fd *io-buf-addr* count)))
+        (if (<= n 0)
+            n
+            (let ((io-addr *io-buf-addr*)
+                  (i 0))
+              (loop
+                (when (>= i n) (return nil))
+                (let ((dummy (%prim-aset buf i (mem-ref (+ io-addr i) :u8))))
+                  (setq i (+ i 1))))
+              n)))))
+
+(defun %sys-write-byte-1 (fd code)
+  "Write the single byte CODE to FD.  Returns 1, or negative on error."
+  (if (%cab-fd-p fd)
+      (let ((path (%cab-fd-path fd))
+            (pos  (%cab-fd-pos fd)))
+        (%cab :write-byte path pos code)
+        (%cab-fd-set-pos fd (+ pos 1))
+        1)
+      (progn (setf (mem-ref *io-buf-addr* :u8) code)
+             (%sys-write-raw fd *io-buf-addr* 1))))
+
 (defun %sys-lseek (fd offset whence)
   "Seek FD. whence: 0=SEEK_SET, 1=SEEK_CUR, 2=SEEK_END."
-  (syscall3 8 fd offset whence))
+  (if (%cab-fd-p fd)
+      (let* ((path (%cab-fd-path fd))
+             (new (cond ((eql whence 0) offset)
+                        ((eql whence 1) (+ (%cab-fd-pos fd) offset))
+                        (t (+ (%cab :size path) offset)))))
+        (%cab-fd-set-pos fd new)
+        new)
+      (syscall3 8 fd offset whence)))
 
 (defun %sys-unlink (path-str)
   "Delete a file."
-  (%string-to-cstr path-str *cstr-scratch*)
-  (syscall3 87 *cstr-scratch* 0 0))
+  (if (%cab-on)
+      (progn (%cab :unlink path-str) 0)
+      (progn (%string-to-cstr path-str *cstr-scratch*)
+             (syscall3 87 *cstr-scratch* 0 0))))
 
 (defun %sys-rename (old-str new-str)
   "Rename a file."
-  (%string-to-cstr old-str *cstr-scratch*)
-  ;; Use a second scratch area 2048 bytes in
-  (let ((new-addr (+ *cstr-scratch* 2048)))
-    (%string-to-cstr new-str new-addr)
-    (syscall3 82 *cstr-scratch* new-addr 0)))
+  (if (%cab-on)
+      (progn (%cab :rename old-str new-str) 0)
+      (progn
+        (%string-to-cstr old-str *cstr-scratch*)
+        ;; Use a second scratch area 2048 bytes in
+        (let ((new-addr (+ *cstr-scratch* 2048)))
+          (%string-to-cstr new-str new-addr)
+          (syscall3 82 *cstr-scratch* new-addr 0)))))
 
 (defun %sys-mkdir (path-str mode)
   "Create a directory."
-  (%string-to-cstr path-str *cstr-scratch*)
-  (syscall3 83 *cstr-scratch* mode 0))
+  (if (%cab-on)
+      (progn (%cab :mkdir path-str) 0)
+      (progn (%string-to-cstr path-str *cstr-scratch*)
+             (syscall3 83 *cstr-scratch* mode 0))))
 
 ;;; stat(2) on Linux x64: syscall 4, fills struct stat (144 bytes)
 ;;; We only need st_size at offset 48 and st_mtime at offset 88.
 ;;; Use :u32 loads (tagged) for values that fit in 32 bits.
 (defun %sys-stat-size (path-str)
   "Return file size in bytes (lower 32 bits), or -1 if not found."
+  (when (%cab-on)
+    (return-from %sys-stat-size
+      (if (%cab :exists path-str) (%cab :size path-str) -1)))
   ;; Bind both addresses to locals before syscall3 to avoid register clobbering:
   ;; compile-syscall3 evaluates each arg into V4-V7; evaluating arg2 (io-buf global)
   ;; calls symbol-value which trashes V5 (RCX) = arg1's register.
@@ -152,6 +288,7 @@
 
 (defun %sys-stat-exists (path-str)
   "Return t if file exists, nil otherwise."
+  (when (%cab-on) (return-from %sys-stat-exists (if (%cab :exists path-str) t nil)))
   (let ((path-addr (%string-to-cstr path-str *cstr-scratch*))
         (buf-addr *io-buf-addr*))
     (let ((ret (syscall3 4 path-addr buf-addr 0)))
@@ -159,6 +296,7 @@
 
 (defun %sys-stat-mtime (path-str)
   "Return file modification time (lower 32 bits of seconds since epoch), or 0."
+  (when (%cab-on) (return-from %sys-stat-mtime (%cab :mtime path-str)))
   (let ((path-addr (%string-to-cstr path-str *cstr-scratch*))
         (buf-addr *io-buf-addr*))
     (let ((ret (syscall3 4 path-addr buf-addr 0)))
@@ -170,6 +308,8 @@
 ;;; fstat(2) on Linux x64: syscall 5, fills struct stat
 (defun %sys-fstat-size (fd)
   "Return file size for open fd (lower 32 bits), or -1."
+  (when (%cab-fd-p fd)
+    (return-from %sys-fstat-size (%cab :size (%cab-fd-path fd))))
   (let ((buf-addr *io-buf-addr*))
     (let ((ret (syscall3 5 fd buf-addr 0)))
       (if (< ret 0)
@@ -501,23 +641,13 @@
                 (%fs-set-pos stream (+ (%fs-pos stream) 1))
                 ch)
               ;; Need to refill buffer
-              (let ((n (%sys-read-raw fd *io-buf-addr* 4096)))
+              ;; %SYS-READ-INTO-BUF fills the stream's own Lisp buffer, from
+              ;; the syscall via *IO-BUF-ADDR* or straight from cabinet bytes.
+              (let ((n (%sys-read-into-buf fd (%fs-buf stream) 4096)))
                 (if (<= n 0)
                     ;; EOF
                     (if eof-error-p (error "end of file") eof-value)
-                    ;; Copy io-buf to stream's buffer
-                    ;; NOTE: aset with variable index has dest=nil bug when non-last form.
-                    ;; Workaround: wrap in let so dest = frame slot (spill register).
-                    (let ((buf (%fs-buf stream))
-                          (io-addr *io-buf-addr*)
-                          (i 0))
-                      (loop
-                        (when (>= i n) (return nil))
-                        ;; %prim-aset: store the raw byte CODE into the string
-                        ;; buffer (public ASET would coerce a CHARACTER, but we
-                        ;; have a fixnum code) — see e159986.
-                        (let ((dummy (%prim-aset buf i (mem-ref (+ io-addr i) :u8))))
-                          (setq i (+ i 1))))
+                    (progn
                       (%fs-set-bpos stream 0)
                       (%fs-set-blen stream n)
                       ;; Recurse to read first char
@@ -528,9 +658,7 @@
   "Write a char code to a file stream."
   (let ((fd (%fs-fd stream)))
     (when (>= fd 0)
-      ;; Write single byte via io-buf
-      (setf (mem-ref *io-buf-addr* :u8) code)
-      (%sys-write-raw fd *io-buf-addr* 1)
+      (%sys-write-byte-1 fd code)
       (%fs-set-pos stream (+ (%fs-pos stream) 1)))))
 
 ;;; --- File stream read-byte ---
@@ -561,20 +689,10 @@
                 (%fs-set-bpos stream (+ bpos 1))
                 (%fs-set-pos stream (+ (%fs-pos stream) 1))
                 b)
-              (let ((n (%sys-read-raw fd *io-buf-addr* 4096)))
+              (let ((n (%sys-read-into-buf fd (%fs-buf stream) 4096)))
                 (if (<= n 0)
                     (if eof-error-p (error "end of file") eof-value)
-                    ;; Copy io-buf to stream's buffer
-                    ;; NOTE: aset with variable index has dest=nil bug when non-last form.
-                    ;; Workaround: wrap in let so dest = frame slot (spill register).
-                    (let ((buf (%fs-buf stream))
-                          (io-addr *io-buf-addr*)
-                          (i 0))
-                      (loop
-                        (when (>= i n) (return nil))
-                        ;; %prim-aset: raw byte CODE into the string buffer.
-                        (let ((dummy (%prim-aset buf i (mem-ref (+ io-addr i) :u8))))
-                          (setq i (+ i 1))))
+                    (progn
                       (%fs-set-bpos stream 0)
                       (%fs-set-blen stream n)
                       (%fs-read-byte-raw stream eof-error-p eof-value)))))))))
@@ -584,8 +702,7 @@
   "Write one byte to a file stream."
   (let ((fd (%fs-fd stream)))
     (when (>= fd 0)
-      (setf (mem-ref *io-buf-addr* :u8) byte)
-      (%sys-write-raw fd *io-buf-addr* 1)
+      (%sys-write-byte-1 fd byte)
       (%fs-set-pos stream (+ (%fs-pos stream) 1)))))
 
 ;;; --- file-length ---

@@ -886,26 +886,28 @@
   (setq *aarch64-gc-native-mcgc* t)
   (setq *aarch64-gc-trampoline-call-via-bl* nil)
   (setq *aarch64-gc-trampoline-label* 1)
-  ;; *aarch64-gc-bitmap-enabled* at runtime: MUST eventually be T — while
-  ;; NIL, objects allocated by JIT'd code carry no object-start bit, the
-  ;; native GC's conservative-root validation REJECTS stack roots pointing
-  ;; at them, and they get dropped while live.  PROVEN consequence (QEMU,
-  ;; 2026-08-25): loading alexandria, a dangling string wrote the symbol
-  ;; name MAP-PRODUCT's char codes over the GC config page at #x10000000,
-  ;; wrecking from_start/to_start/space_size -> wild-pointer data abort in
-  ;; %PARSE-START-END.  But enabling it wedged the image in a recursive
-  ;; exception storm at the first JIT'd alloc (PC pinned at VBAR+0x200,
-  ;; gdbstub unable to translate guest addresses => page tables corrupted).
-  ;; MODUS_RPI_JIT_BITMAP=1 builds the enable in for debugging that wedge.
+  ;; *aarch64-gc-bitmap-enabled* at runtime: MUST be T — while NIL, objects
+  ;; allocated by JIT'd code carry no object-start/cons-kind bit and the
+  ;; native GC's bitmap gate (applied by scan_word to EVERY scanned word,
+  ;; not just stack roots) refuses to FORWARD any reference to them: a
+  ;; runtime DEFMETHOD's JIT-materialized specializer list goes stale at the
+  ;; first collection and every runtime-defined GF loses dispatch (#281 —
+  ;; the exact bug found and fixed on the hosted CLI, de6b02c).  The
+  ;; recursive-exception-storm-at-first-JIT-alloc that once made this
+  ;; enable look unsafe was symptom 3 of the alloc-overshoot guard-band
+  ;; bug, root-caused and fixed in bfca1db (*aarch64-gc-limit-guard* 8MB),
+  ;; and the enable was verified clean there (QEMU raspi3b, alexandria
+  ;; through the JIT, bitmap-enabled image).  Default is therefore ON;
+  ;; MODUS_RPI_JIT_BITMAP=0 builds it out for triage.
   ~A
   ~A
   (setf (mem-ref #x13FFFFF0 :u64) #x14000000)
   t)
 "
                 (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_RPI_JIT_BITMAP")))
-                  (if (and v (string= v "1"))
-                      "(setq *aarch64-gc-bitmap-enabled* t)"
-                      ";; bitmap-enable off (MODUS_RPI_JIT_BITMAP unset)"))
+                  (if (and v (string= v "0"))
+                      ";; bitmap-enable OFF (MODUS_RPI_JIT_BITMAP=0 triage build)"
+                      "(setq *aarch64-gc-bitmap-enabled* t)"))
                 (if mini
                     "(setq *aarch64-serial-base* #x3F215040)
   (setq *aarch64-serial-width* 2)

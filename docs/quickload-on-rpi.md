@@ -161,8 +161,13 @@ Fixes, both on `cabinet-fs`:
 Verified on the rebuilt hosted CLI: repro 3/3 `:SYNCED`, every dispatch shape
 survives gc=3, and — the payoff — **the full pagetree+cabinet stack now loads
 and its smoke test passes on aarch64** (format-fs, make-directories, UTF-8
-write/read round-trip, readdir) through 16 collections. Silicon validation of
-the RPi image is pending the next netboot.
+write/read round-trip, readdir) through 16 collections. **Validated on
+silicon the same day**: the bitmap-on RPi image (`modus-clos-mini.img`)
+netbooted to the Zero 2 W runs the repro to `SYNCED` before GC, through NINE
+collections, and after — on the old instance and a fresh one. (One rig trap
+re-paid en route: the first netboot image was built without
+`MODUS_RPI_MINIUART=1`/`MODUS_RPI_CHAINLOAD=1` and was silent on the board
+while green in QEMU — both knobs are now in the MODULATOR notes.)
 
 **Residual, split out as task #282:** some probe *shapes* still hit exactly one
 swallowed TYPE-ERROR at a shape-determined point during the load (btree in one
@@ -362,7 +367,7 @@ board was re-verified healthy on this date. What is left still has names and
 line numbers rather than mysteries.
 
 The honest caveats: the filesystem seam is still **ungated** and has **never
-run on bare metal**; the aarch64 result is hosted-QEMU, with silicon validation
-pending the next netboot; and #282 (one shape-determined swallowed TYPE-ERROR
-during heavy loads on aa64) is open, characterized, and smaller than anything
-it replaced.
+run on bare metal** (the *fix* is silicon-validated — nine collections with
+runtime CLOS surviving on the Zero 2 W — but cabinet itself has only run
+hosted); and #282 (one shape-determined swallowed TYPE-ERROR during heavy
+loads on aa64) is open, characterized, and smaller than anything it replaced.

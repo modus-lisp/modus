@@ -3880,9 +3880,14 @@
                       (> internal-time-units-per-second 0))
                  internal-time-units-per-second
                  1000000)))
-    (if (>= per 1000000000)
-        (* ns (floor per 1000000000))
-        (floor ns (floor 1000000000 per)))))
+    ;; VALUES truncates to ONE: FLOOR returns its remainder as a second
+    ;; value, and both callers are CLHS functions specified to return
+    ;; exactly one.  Without this, (multiple-value-list
+    ;; (get-internal-run-time)) is a 2-element list.
+    (values
+     (if (>= per 1000000000)
+         (* ns (floor per 1000000000))
+         (floor ns (floor 1000000000 per))))))
 
 (defun get-internal-real-time ()
   "CLHS GET-INTERNAL-REAL-TIME: elapsed time in INTERNAL-TIME-UNITS from an

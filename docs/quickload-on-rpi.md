@@ -366,6 +366,16 @@ fetching a real library over real HTTP and running it — remain done, and the
 board was re-verified healthy on this date. What is left still has names and
 line numbers rather than mysteries.
 
+**MILESTONE (2026-08-29, late): `ql:quickload` WORKS OVER CABINET on hosted
+x64.** The genuine, unmodified client — loaded from cabinet, dist installed
+into cabinet over real sockets, tarball fetched, gunzipped, untarred, and all
+18 alexandria files ASDF-loaded from cabinet — ends in `FLATTEN => (1 2 3 4)`.
+Recipe: `cabfs/ql-cab2.lisp` (shim + prelude + client files + local mirror).
+It took three seam fixes (DIRECTORY routing, a write-behind cache, a read
+cache — the last also cut untar GC churn ~7x) and surviving two of my own
+probe artifacts. Residual: a rare (~1/6) wrong-bytes flake in the untar read
+path (#282, byte-level capture plan recorded) — reruns pass.
+
 The honest caveats: the filesystem seam is still **ungated** and has **never
 run on bare metal** (the *fix* is silicon-validated — nine collections with
 runtime CLOS surviving on the Zero 2 W — but cabinet itself has only run

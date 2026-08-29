@@ -50,6 +50,7 @@
 (defvar *cabfs-debug* nil)
 
 (defun %cabfs-put (path bytes)
+  (%cabfs-rcache-drop path)
   (unless (%cabfs-exists path)
     (handler-case (funcall *cf-create* *cabfs* path)
       (error (c)
@@ -68,6 +69,31 @@
 ;;; correctness anchor (write file -> close -> LOAD it reads through :read).
 
 (defvar *cf-wcache* nil)          ; alist (path . (bytes-vector . len))
+
+;;; Read cache — ONE entry.  The stream layer refills through %CAB :read,
+;;; and %cabfs-bytes re-materializes the ENTIRE file from cabinet on every
+;;; call: a 276KB tar read byte-wise churned ~20-50 COLLECTIONS per untar
+;;; (measured, #282).  Serving repeat reads of the same path from a cached
+;;; copy removes that churn.  Invalidation: any write/create/flush of the
+;;; path, and wholesale on unlink/rename.
+
+(defvar *cf-rcache-path* nil)
+(defvar *cf-rcache-bytes* nil)
+
+(defun %cabfs-rcache-drop (path)
+  "Invalidate the read cache: for PATH, or entirely when PATH is NIL."
+  (when (and *cf-rcache-path*
+             (or (null path) (equal path *cf-rcache-path*)))
+    (setq *cf-rcache-path* nil)
+    (setq *cf-rcache-bytes* nil)))
+
+(defun %cabfs-bytes-cached (path)
+  (if (and *cf-rcache-path* (equal path *cf-rcache-path*))
+      *cf-rcache-bytes*
+      (let ((b (%cabfs-bytes path)))
+        (setq *cf-rcache-path* path)
+        (setq *cf-rcache-bytes* b)
+        b)))
 
 (defun %cabfs-wc-cell (path)
   "The write cache cell for PATH, creating it (seeded from the existing file
@@ -99,6 +125,7 @@
 
 (defun %cabfs-write-byte (path pos code)
   "Store CODE at byte offset POS in the write cache, growing as needed."
+  (%cabfs-rcache-drop path)
   (let* ((cell (%cabfs-wc-cell path))
          (v (car cell)))
     (when (>= pos (length v))
@@ -117,7 +144,7 @@
   (let ((a (car args)) (b (cadr args)) (c (caddr args)))
     (cond
       ((eq op :exists) (progn (%cabfs-flush-path a) (%cabfs-exists a)))
-      ((eq op :read)   (progn (%cabfs-flush-path a) (%cabfs-bytes a)))
+      ((eq op :read)   (progn (%cabfs-flush-path a) (%cabfs-bytes-cached a)))
       ((eq op :size)   (progn (%cabfs-flush-path a)
                               (if (%cabfs-exists a)
                                   (length (%cabfs-bytes a)) -1)))
@@ -136,11 +163,11 @@
       ((eq op :write-byte) (%cabfs-write-byte a b c))
       ((eq op :mkdir)  (handler-case (progn (funcall *cf-mkdir* *cabfs* a) 0)
                          (error () 0)))
-      ((eq op :unlink) (progn (%cabfs-flush-all)
+      ((eq op :unlink) (progn (%cabfs-flush-all) (%cabfs-rcache-drop nil)
                               (handler-case
                                   (progn (funcall *cf-unlink* *cabfs* a) 0)
                                 (error () -1))))
-      ((eq op :rename) (progn (%cabfs-flush-all)
+      ((eq op :rename) (progn (%cabfs-flush-all) (%cabfs-rcache-drop nil)
                               (handler-case
                                   (progn (funcall *cf-rename* *cabfs* a b) 0)
                                 (error () -1))))

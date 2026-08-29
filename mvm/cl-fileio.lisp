@@ -1517,7 +1517,21 @@
 
 (defun %dir-entries-raw (path)
   "List the BARE entry names of directory PATH (no . / ..), or NIL.
-   The pre-glob body of DIRECTORY, unchanged."
+   The pre-glob body of DIRECTORY, unchanged.  CABINET (#279): when the
+   *CAB-CALL* seam is mounted, directory enumeration must come from the
+   cabinet FS, not getdents64 — quicklisp's dist discovery is
+   (directory \"dists/*/distinfo.txt\"), and this was the one file-I/O
+   surface the seam missed (all-dists returned NIL over a populated FS)."
+  (when (%cab-on)
+    (return-from %dir-entries-raw
+      (let* ((n (length path))
+             (p (if (and (> n 1) (char= (char path (- n 1)) #\/))
+                    (subseq path 0 (- n 1))
+                    path))
+             (ents (handler-case (%cab :readdir p) (t (c) nil)))
+             (out nil))
+        (dolist (e ents (nreverse out))
+          (push (if (consp e) (car e) e) out)))))
   (let ((fd (handler-case (%sys-open-rdonly path) (t (c) -1))))
     (when (or (null fd) (< fd 0)) (return-from %dir-entries-raw nil))
     (let ((acc nil) (done nil))
@@ -1531,6 +1545,16 @@
       (nreverse acc))))
 
 (defun %path-openable-p (path)
+  ;; CABINET (#279): existence through the seam — cabinet EXISTS-P answers
+  ;; for both files and directories.  A trailing slash (glob "dir/" form)
+  ;; is stripped; cabinet paths don't carry one.
+  (when (%cab-on)
+    (return-from %path-openable-p
+      (let* ((n (length path))
+             (p (if (and (> n 1) (char= (char path (- n 1)) #\/))
+                    (subseq path 0 (- n 1))
+                    path)))
+        (if (handler-case (%cab :exists p) (t (c) nil)) t nil))))
   (let ((fd (handler-case (%sys-open-rdonly path) (t (c) -1))))
     (if (and fd (>= fd 0))
         (progn (handler-case (%sys-close fd) (t (c) nil)) t)

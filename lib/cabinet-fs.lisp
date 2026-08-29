@@ -52,46 +52,98 @@
     (handler-case (funcall *cf-create* *cabfs* path) (error () nil)))
   (funcall *cf-write* *cabfs* path bytes))
 
+;;; Write-behind cache.  The stream layer writes ONE BYTE per %CAB call, and
+;;; the naive implementation re-read + re-wrote the whole file each time —
+;;; O(n^2) per file, unusable for quicklisp's 568KB releases.txt.  Writes now
+;;; land in a per-path (vector . len) cell and flush to cabinet lazily: on any
+;;; read/size/exists of that path, and wholesale on readdir/rename/unlink.
+;;; There is no :close op in the seam protocol, so the read-side flush is the
+;;; correctness anchor (write file -> close -> LOAD it reads through :read).
+
+(defvar *cf-wcache* nil)          ; alist (path . (bytes-vector . len))
+
+(defun %cabfs-wc-cell (path)
+  "The write cache cell for PATH, creating it (seeded from the existing file
+   contents) on first use."
+  (let ((e (assoc path *cf-wcache* :test (function equal))))
+    (if e (cdr e)
+        (let* ((old (if (%cabfs-exists path) (%cabfs-bytes path) nil))
+               (n   (if old (length old) 0))
+               (cap (max 256 (* 2 n)))
+               (v   (make-array cap :element-type '(unsigned-byte 8)
+                                    :initial-element 0)))
+          (when old (replace v old))
+          (let ((cell (cons v n)))
+            (setq *cf-wcache* (cons (cons path cell) *cf-wcache*))
+            cell)))))
+
+(defun %cabfs-flush-path (path)
+  (let ((e (assoc path *cf-wcache* :test (function equal))))
+    (when e
+      (let* ((cell (cdr e))
+             (out (subseq (car cell) 0 (cdr cell))))
+        (%cabfs-put path out))
+      (setq *cf-wcache* (remove e *cf-wcache*))
+      t)))
+
+(defun %cabfs-flush-all ()
+  (let ((paths (mapcar (function car) *cf-wcache*)))
+    (dolist (p paths) (%cabfs-flush-path p))))
+
 (defun %cabfs-write-byte (path pos code)
-  "Store CODE at byte offset POS, extending the file as needed.
-   The stream layer writes one byte per call, so this is O(n) per byte on a
-   naive copy.  Kept simple deliberately: correctness first, and a
-   write-behind buffer is a localised change once something measures slow."
-  (let* ((old (%cabfs-bytes path))
-         (len (length old))
-         (n   (max len (+ pos 1)))
-         (new (make-array n :element-type '(unsigned-byte 8)
+  "Store CODE at byte offset POS in the write cache, growing as needed."
+  (let* ((cell (%cabfs-wc-cell path))
+         (v (car cell)))
+    (when (>= pos (length v))
+      (let ((nv (make-array (max 256 (* 2 (+ pos 1)))
+                            :element-type '(unsigned-byte 8)
                             :initial-element 0)))
-    (replace new old)
-    (setf (aref new pos) code)
-    (%cabfs-put path new)
+        (replace nv v)
+        (setf (car cell) nv)
+        (setq v nv)))
+    (setf (aref v pos) code)
+    (when (>= pos (cdr cell)) (setf (cdr cell) (+ pos 1)))
     1))
 
 (defun %cabfs-dispatch (op &rest args)
   "The whole protocol cl-fileio's %CAB speaks."
   (let ((a (car args)) (b (cadr args)) (c (caddr args)))
     (cond
-      ((eq op :exists) (%cabfs-exists a))
-      ((eq op :read)   (%cabfs-bytes a))
-      ((eq op :size)   (if (%cabfs-exists a) (length (%cabfs-bytes a)) -1))
+      ((eq op :exists) (progn (%cabfs-flush-path a) (%cabfs-exists a)))
+      ((eq op :read)   (progn (%cabfs-flush-path a) (%cabfs-bytes a)))
+      ((eq op :size)   (progn (%cabfs-flush-path a)
+                              (if (%cabfs-exists a)
+                                  (length (%cabfs-bytes a)) -1)))
       ((eq op :create) (progn (%cabfs-ensure-parent a)
+                              ;; a fresh :create truncates — drop any stale cache
+                              (let ((e (assoc a *cf-wcache*
+                                              :test (function equal))))
+                                (when e (setq *cf-wcache* (remove e *cf-wcache*))))
                               (handler-case (funcall *cf-create* *cabfs* a)
                                 (error () nil))
                               0))
       ((eq op :write-byte) (%cabfs-write-byte a b c))
       ((eq op :mkdir)  (handler-case (progn (funcall *cf-mkdir* *cabfs* a) 0)
                          (error () 0)))
-      ((eq op :unlink) (handler-case (progn (funcall *cf-unlink* *cabfs* a) 0)
-                         (error () -1)))
-      ((eq op :rename) (handler-case (progn (funcall *cf-rename* *cabfs* a b) 0)
-                         (error () -1)))
-      ((eq op :readdir) (handler-case (funcall *cf-readdir* *cabfs* a)
-                          (error () nil)))
+      ((eq op :unlink) (progn (%cabfs-flush-all)
+                              (handler-case
+                                  (progn (funcall *cf-unlink* *cabfs* a) 0)
+                                (error () -1))))
+      ((eq op :rename) (progn (%cabfs-flush-all)
+                              (handler-case
+                                  (progn (funcall *cf-rename* *cabfs* a b) 0)
+                                (error () -1))))
+      ((eq op :readdir) (progn (%cabfs-flush-all)
+                               (handler-case (funcall *cf-readdir* *cabfs* a)
+                                 (error () nil))))
       ;; Cabinet keeps mtimes, but nothing on the quickload path compares
       ;; them across a reboot (the FS is in RAM), so a constant is honest
       ;; and avoids a stat round trip per PROBE-FILE.
       ((eq op :mtime)  0)
-      (t (error "cabinet-fs: unknown op ~s" op)))))
+      (t (error "cabinet-fs: unknown op type=~s name=~s args0=~s"
+                (type-of op)
+                (handler-case (symbol-name op) (error () :NOT-SYM))
+                (handler-case (if (stringp a) a (type-of a)) (error () :?)))))))
 
 (defun %cabfs-parent (path)
   "Directory part of PATH, or NIL at the root."

@@ -47,9 +47,16 @@
   (handler-case (funcall *cf-read* *cabfs* path)
     (error () (make-array 0 :element-type '(unsigned-byte 8)))))
 
+(defvar *cabfs-debug* nil)
+
 (defun %cabfs-put (path bytes)
   (unless (%cabfs-exists path)
-    (handler-case (funcall *cf-create* *cabfs* path) (error () nil)))
+    (handler-case (funcall *cf-create* *cabfs* path)
+      (error (c)
+        (when *cabfs-debug*
+          (format t "~&[cabfs] create ~a failed: ~s ~a~%" path (type-of c)
+                  (handler-case (format nil "~a" c) (error () "?")))
+          (finish-output)))))
   (funcall *cf-write* *cabfs* path bytes))
 
 ;;; Write-behind cache.  The stream layer writes ONE BYTE per %CAB call, and
@@ -120,7 +127,11 @@
                                               :test (function equal))))
                                 (when e (setq *cf-wcache* (remove e *cf-wcache*))))
                               (handler-case (funcall *cf-create* *cabfs* a)
-                                (error () nil))
+                                (error (c)
+                                  (when *cabfs-debug*
+                                    (format t "~&[cabfs] :create ~a failed: ~s~%"
+                                            a (type-of c))
+                                    (finish-output))))
                               0))
       ((eq op :write-byte) (%cabfs-write-byte a b c))
       ((eq op :mkdir)  (handler-case (progn (funcall *cf-mkdir* *cabfs* a) 0)

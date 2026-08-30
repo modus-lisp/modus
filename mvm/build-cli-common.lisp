@@ -576,7 +576,23 @@
   ;; %gc-bitmap-init actually having published a bitmap base, so an image
   ;; without reserved bitmaps stays off instead of emitting wild stores.
   (when (> (mem-ref #x10000E18 :u64) 0)
-    (setq *aarch64-gc-bitmap-enabled* t))
+    (setq *aarch64-gc-bitmap-enabled* t)
+    ;; #282 root cause, the SIBLINGS of the #281 flag: the :gc-check emitter
+    ;; (translate-aarch64.lisp op-gc-check) picks its arm from THREE more
+    ;; host-side-only defvars.  At runtime all read NIL (Limitation 7), so
+    ;; every runtime-JIT'd page's gc-check took the legacy fallback arm --
+    ;; `b.cc +2; BRK #1` -- a check that TRAPS instead of calling the
+    ;; collector.  Any JIT'd code whose own allocation crossed the heap
+    ;; limit died (SIGTRAP raw, or SIGSEGV/garbage downstream when the
+    ;; trap recovery left corrupt state): the whole heavy-load
+    ;; shape-dependent fault family.  Setting these makes runtime-emitted
+    ;; gc-checks use the same `b.lo skip; BLR x28` the baked code uses --
+    ;; x28 (the trampoline VA) is loaded once at boot by the Linux entry.
+    ;; Mirrors build-rpi-cl-repl.lisp:884-888, which does these setqs at
+    ;; runtime for the board image.
+    (setq *aarch64-linux-mode* t)
+    (setq *aarch64-gc-native-mcgc* t)
+    (setq *aarch64-gc-trampoline-label* 1))
   (setq *use-jit* t)
   t)
 (defun %jit-enabled-p () (and (boundp (quote *use-jit*)) *use-jit*))

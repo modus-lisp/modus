@@ -905,7 +905,9 @@
   ;; address into the instruction stream.  A baked address is only re-baked
   ;; when the seam re-enters the thunk, so a collection that fired WHILE a
   ;; thunk was running left the rest of that run reading stale from-space --
-  ;; on the hosted CLI that was a crash after ~5500 loop iterations.  The
+  ;; on the hosted CLI that was a crash after about 5500 loop iterations.
+  ;; (NO TILDE IN THIS BLOCK: it is a host FORMAT template, so a tilde is a
+  ;; directive -- same class of trap as the no-double-quotes rule.)  The
   ;; native trampoline scans #x10000F10 as a fixed root (translate-aarch64),
   ;; and this image always uses that trampoline.
   ;;

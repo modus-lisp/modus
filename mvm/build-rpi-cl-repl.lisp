@@ -900,6 +900,22 @@
   ;; through the JIT, bitmap-enabled image).  Default is therefore ON;
   ;; MODUS_RPI_JIT_BITMAP=0 builds it out for triage.
   ~A
+  ;; #282 layer 2: JIT-mode li-const reads the pool object THROUGH the
+  ;; GC-updated constant vector at #x10000F10 instead of baking its heap
+  ;; address into the instruction stream.  A baked address is only re-baked
+  ;; when the seam re-enters the thunk, so a collection that fired WHILE a
+  ;; thunk was running left the rest of that run reading stale from-space --
+  ;; on the hosted CLI that was a crash after ~5500 loop iterations.  The
+  ;; native trampoline scans #x10000F10 as a fixed root (translate-aarch64),
+  ;; and this image always uses that trampoline.
+  ;;
+  ;; ZERO THE ROOT FIRST, and note this is NOT ceremony on bare metal: DRAM
+  ;; comes up with whatever was in it (QEMU zero-fills, silicon does not --
+  ;; see the zeroed-DRAM dependency found on the real Pi Zero 2 W).  A garbage
+  ;; word here would be read back as a tagged vector and its length taken.
+  ;; %jit-constvec treats 0 as no-vector-installed, which is the safe state.
+  (setf (mem-ref #x10000F10 :u64) 0)
+  (setq *aarch64-jit-constvec-p* t)
   ~A
   (setf (mem-ref #x13FFFFF0 :u64) #x14000000)
   t)

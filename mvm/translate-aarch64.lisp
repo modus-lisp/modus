@@ -197,7 +197,41 @@
    quad whose imm16 fields must be patched with the 64-bit tagged
    constant-pool address of pool slot POOL-INDEX.  Applied by
    cross.lisp's apply-li-const-patches once the image layout is final
-   (mirrors x64's *x64-li-const-patches* MOVABS-immediate scheme).")
+   (mirrors x64's *x64-li-const-patches* MOVABS-immediate scheme).
+
+   #282 CONSTVEC: under *aarch64-jit-constvec-p* an entry may instead carry a
+   NEGATIVE byte offset, which is not a patch site at all — it records the
+   index so %jit-constvec-need can size the constant vector.  Exactly x64's
+   convention; %jit-patch-consts-aarch64 and the R-CONST-BAKED gate both skip
+   negative entries.")
+
+(defvar *aarch64-jit-constvec-root* #x10000F10
+  "#282: fixed metadata word holding the tagged JIT constant VECTOR, the
+   aarch64 sibling of *x64-jit-constvec-root*.  Emitted li-const loads read the
+   pool object THROUGH this root, so a collection that moves the object — even
+   one that fires while the JIT'd thunk is still running — is transparent: the
+   collector forwards the vector and rewrites this word in place.
+
+   NOT #x10000F00 (x64's slot).  On bare-metal RPi that address is
+   +rpi-cl-dtb-ptr-slot+, the firmware device-tree pointer the boot preamble
+   stores before kernel-main runs; the same translator serves both aarch64
+   targets, so the root has to be free on BOTH.  #x10000F10 is in the gap
+   boot/boot-rpi-cl.lisp documents as empty from #x10000EA8 to #x10001000
+   (aarch64 uses only E00/E18/E40 of the config block), 16 bytes clear of the
+   DTB slot and 240 clear of anything above.  Grep #x10000[EF].. before
+   claiming any other word in this range.")
+
+(defvar *aarch64-jit-constvec-p* nil
+  "#282: enable the constant-VECTOR indirection for JIT-mode li-const.  NIL at
+   image-build time so whole-image codegen is byte-identical (the baked
+   MOVZ/MOVK quad + apply-li-const-patches).  Set to T at runtime by
+   %jit-boot-init (Limitation #7 — a defvar initform would never run in-image).")
+
+(defvar *aarch64-li-constvec-max* -1
+  "#282: highest constant-vector index emitted during the current JIT
+   translation, so the driver can size the vector to cover indices that come
+   from *constant-table* rather than the quote pool.  See %jit-sync-constvec's
+   TWO BOUNDS note — sizing by *e2-const-count* alone reads past the end.")
 
 (defvar *aarch64-fn-addr-patches* nil
   "List of (native-byte-offset . target-bytecode-offset) recorded by
@@ -2961,16 +2995,54 @@
           ((= op +op-li-const+)
            (let* ((vd (vr 0))
                   (idx (vr 1))
-                  (pd (or (a64-phys-reg vd) +a64-x16+))
-                  (movz-byte-pos
-                   (* (- (a64-current-index buf)
-                         (or *aarch64-translated-start-idx* 0))
-                      4)))
-             (push (cons movz-byte-pos idx) *aarch64-li-const-patches*)
-             (a64-movz buf pd 0 0)   ; bits 0-15
-             (a64-movk buf pd 0 1)   ; bits 16-31
-             (a64-movk buf pd 0 2)   ; bits 32-47
-             (a64-movk buf pd 0 3)   ; bits 48-63
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (if (and *aarch64-jit-mode* *aarch64-jit-constvec-p*
+                      ;; The slot load below is an LDR with a 12-bit SCALED
+                      ;; unsigned offset: byte offsets up to 32760, i.e. idx
+                      ;; <= 4095.  A larger index falls through to the baked
+                      ;; quad, which the R-CONST-BAKED gate then rejects, so
+                      ;; that form interprets (correct, just not native)
+                      ;; rather than silently loading from a truncated offset.
+                      (<= idx 4095))
+                 ;; #282 CONSTVEC PATH (aarch64 port of WS5 #223 / #226).
+                 ;; Load the pool object THROUGH the GC-updated vector, so
+                 ;; nothing is baked and nothing needs re-baking after a
+                 ;; collection — including a collection that fires while this
+                 ;; very thunk is mid-run, which is what the baked form could
+                 ;; not survive.  PD is its own address scratch, so no register
+                 ;; beyond the destination is touched (same as the baked form).
+                 (progn
+                   ;; Negative offset = a sizing record, not a patch site.
+                   (push (cons -1 idx) *aarch64-li-const-patches*)
+                   (when (> idx (if (integerp *aarch64-li-constvec-max*)
+                                    *aarch64-li-constvec-max* -1))
+                     (setq *aarch64-li-constvec-max* idx))
+                   ;; This branch runs IN-IMAGE, where defvar initforms may not
+                   ;; have run (Limitation #7): a NIL read here would bake
+                   ;; NIL-as-address and every constant load would return
+                   ;; garbage.  Fall back to the same literal %jit-constvec
+                   ;; hard-codes.  Host-side the defvar IS initialised, so
+                   ;; image builds are unaffected.
+                   (a64-load-imm64 buf pd (if (integerp *aarch64-jit-constvec-root*)
+                                              *aarch64-jit-constvec-root*
+                                              #x10000F10))
+                   (a64-ldr-unsigned buf pd pd 0)      ; pd = tagged vector
+                   ;; Slot address = (vec - 9) + 16 + idx*8 = vec + idx*8 + 7,
+                   ;; the formula obj-ref/aref use.  LDR needs an 8-aligned
+                   ;; scaled offset, so fold the +7 into the base first.
+                   (a64-add-imm buf pd pd 7)
+                   (a64-ldr-unsigned buf pd pd (* idx 8)))
+                 ;; Image-build path (unchanged): MOVZ/MOVK placeholder quad,
+                 ;; patched with the tagged pool address once layout is final.
+                 (let ((movz-byte-pos
+                        (* (- (a64-current-index buf)
+                              (or *aarch64-translated-start-idx* 0))
+                           4)))
+                   (push (cons movz-byte-pos idx) *aarch64-li-const-patches*)
+                   (a64-movz buf pd 0 0)   ; bits 0-15
+                   (a64-movk buf pd 0 1)   ; bits 16-31
+                   (a64-movk buf pd 0 2)   ; bits 32-47
+                   (a64-movk buf pd 0 3))) ; bits 48-63
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
@@ -4988,7 +5060,15 @@
       (scan-fixed #x10000080)      ; globals hash-table
       (scan-fixed #x10000088)      ; symbol intern table
       (scan-fixed #x10000148)      ; keyword intern table
-      (scan-fixed #x10000170))     ; package-by-hash table
+      (scan-fixed #x10000170)      ; package-by-hash table
+      ;; #282 JIT constant-vector root.  Emitted li-const loads read the pool
+      ;; object through this word, so it MUST be forwarded like any other root
+      ;; — otherwise the vector is collected out from under running JIT'd code
+      ;; and the indirection is worse than the baked form it replaced.  Scanned
+      ;; unconditionally: an unset root reads 0, whose tag is neither 1 nor 9,
+      ;; so scan_word returns immediately.  Keep in lock-step with the emit
+      ;; site's *aarch64-jit-constvec-root*.
+      (scan-fixed #x10000F10))
     ;; ---- MV region: count-1 extras from 0x98 (only when 2<=count<=16) ----
     ;; count = [0x90]>>1; extras = count-1.  Guards (both SIGNED, mirroring x64's
     ;; JLE — a b.eq-only guard let a zeroed/garbage count run extras=-1 as a
@@ -5463,7 +5543,9 @@
   ;; (single-function translations — function-table nil — must not
   ;; drop a pending module's patches).
   (when function-table
-    (setf *aarch64-li-const-patches* nil))
+    (setf *aarch64-li-const-patches* nil)
+    ;; #282: the constvec high-water mark is per-module for the same reason.
+    (setf *aarch64-li-constvec-max* -1))
   ;; WS4 aarch64 Stage 3/4: fresh JIT call-reloc + fn-addr-reloc lists per module
   ;; (only populated under *aarch64-jit-mode*; nil otherwise so image-build
   ;; codegen is unchanged).

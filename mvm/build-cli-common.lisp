@@ -592,7 +592,20 @@
     ;; runtime for the board image.
     (setq *aarch64-linux-mode* t)
     (setq *aarch64-gc-native-mcgc* t)
-    (setq *aarch64-gc-trampoline-label* 1))
+    (setq *aarch64-gc-trampoline-label* 1)
+    ;; #282 layer 2: route JIT-mode li-const through the GC-updated constant
+    ;; VECTOR instead of baking the pool object's heap address into the
+    ;; instruction stream.  A baked address is only re-baked when the seam
+    ;; re-enters the thunk, so a collection that fires WHILE the thunk runs
+    ;; (any long loop) left the rest of that run reading stale from-space.
+    ;; Gated on the same published-bitmap check as the flags above: the
+    ;; indirection is only correct when the collector is actually forwarding
+    ;; the root at #x10000F10, which only the native trampoline does.
+    ;; Zero the root before enabling: %jit-constvec treats 0 as
+    ;; no-vector-installed, the safe state.  On Linux the BSS already reads 0;
+    ;; this costs one store and keeps the hosted and bare-metal init identical.
+    (setf (mem-ref #x10000F10 :u64) 0)
+    (setq *aarch64-jit-constvec-p* t))
   (setq *use-jit* t)
   t)
 (defun %jit-enabled-p () (and (boundp (quote *use-jit*)) *use-jit*))

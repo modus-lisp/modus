@@ -635,8 +635,14 @@
    pool-idx).  Re-runnable after GC (see %jit-write-movz-quad's imm16 clear).
    The caller must flush the I-cache over the patched range."
   (dolist (p cpatches)
-    (let ((obj (if *e2-const-pool* (gethash (cdr p) *e2-const-pool*) nil)))
-      (%jit-write-movz-quad base (car p) (%val->word obj)))))
+    ;; #282: a NEGATIVE offset is a constant-VECTOR sizing record, not a patch
+    ;; site — there is no immediate to bake, and treating it as one would write
+    ;; a quad at a negative offset.  Skip it (x64's %jit-patch-consts does the
+    ;; same).  This also covers %jit-entry-for's post-GC re-bake, which calls
+    ;; through here with the entry's stored cpatches.
+    (when (>= (car p) 0)
+      (let ((obj (if *e2-const-pool* (gethash (cdr p) *e2-const-pool*) nil)))
+        (%jit-write-movz-quad base (car p) (%val->word obj))))))
 
 ;; Pool-EXPLICIT patcher variants for the cross-page sweep
 ;; (%jit-refresh-all-pages): identical to the two above but read POOL, the
@@ -1175,25 +1181,43 @@
       ;; records (movz-byte-pos . pool-idx) and FN-MAP maps an MVM function
       ;; offset to a native BYTE offset (same units %jit-write-movz-quad and
       ;; the lrel patch loop below already use).
-      ;; #282 LAYER 2: reject EVERY page with baked const sites — even
-      ;; thunk-only ones.  The x64 gate admits thunk-confined sites because
-      ;; %jit-entry-for re-bakes them after a collection AND x64's constvec
-      ;; (indirect li-const through the fixed root, translate-x64's
-      ;; *x64-jit-constvec-root*) covers the mid-run window.  aarch64 has NO
-      ;; constvec: a li-const is a baked MOVZ/MOVK heap address, and the
-      ;; re-bake only runs when the seam RE-ENTERS the thunk.  A collection
-      ;; triggered WHILE the thunk is still running (any long loop — the
-      ;; htgrow2 repro's 8000-iteration puthash loop crosses the first GC at
-      ;; ~i=5500) leaves the remainder of that very run loading stale
-      ;; from-space addresses; after the next flip those words are arbitrary
-      ;; garbage (the APPLY-of-fixnum PC=2 crash, gdbstub-captured).  Until
-      ;; the constvec is ported to aarch64, interpret any const-bearing form:
-      ;; op-LI-CONST reads *e2-const-pool* at execution time, which the
-      ;; collector keeps live.  (The old thunk-range admission logic is in
-      ;; git history at 32cc26f; restore it only WITH a constvec.)
-      (when *aarch64-li-const-patches*
-        (setq *jit-r-const-baked*
-              (if *jit-r-const-baked* (+ 1 *jit-r-const-baked*) 1))
+      ;; #282 LAYER 2: reject any page carrying a BAKED const site.
+      ;;
+      ;; A baked li-const is a heap address written into the instruction
+      ;; stream.  %jit-entry-for re-bakes such sites after a collection, but
+      ;; only when the seam RE-ENTERS the thunk — so a collection that fires
+      ;; while the thunk is STILL RUNNING (any long loop; the htgrow2 repro's
+      ;; 8000-iteration puthash loop crosses its first GC at ~i=5500) leaves
+      ;; the remainder of that very run loading stale from-space addresses,
+      ;; which become arbitrary garbage at the next semispace flip.  That was
+      ;; the gdbstub-captured APPLY-of-fixnum crash (PC=0x2).
+      ;;
+      ;; With the constvec on (*aarch64-jit-constvec-p*), li-const emits an
+      ;; indirect load through *aarch64-jit-constvec-root* and records a
+      ;; NEGATIVE offset instead — no baked address, nothing to go stale, and
+      ;; the collector forwards the vector through that root.  Those entries
+      ;; are sizing records, so they never trip this gate.  A baked entry can
+      ;; still appear (constvec off, or idx > 4095 exceeding the LDR's scaled
+      ;; offset), and it is rejected wherever it sits — including inside the
+      ;; thunk, which is where x64's gate differs: x64 can admit thunk-confined
+      ;; baked sites because its full-scope constvec covers the mid-run window
+      ;; regardless.  Rejected forms interpret; op-LI-CONST reads
+      ;; *e2-const-pool* at execution time, which the collector keeps live.
+      (dolist (%cp *aarch64-li-const-patches*)
+        (when (>= (car %cp) 0)
+          (setq *jit-r-const-baked*
+                (if *jit-r-const-baked* (+ 1 *jit-r-const-baked*) 1))
+          (return-from %jit-translate-page-1-aarch64 nil)))
+      ;; Mirror every newly registered pool entry into the GC-rooted vector the
+      ;; emitted loads read from, and size it to cover this module's indices.
+      ;; Must happen before the page can run; a no-op when the indirection is
+      ;; off (no negative entries → need 0).
+      (%jit-sync-constvec (%jit-constvec-need *aarch64-li-const-patches*))
+      ;; SAFETY GUARD: the emitted slot load has NO bounds check, so an index
+      ;; the installed vector does not cover is an unmapped read — an
+      ;; undiagnosable SIGSEGV.  Verify coverage before any of this code runs;
+      ;; on failure abandon the page and let the form interpret.
+      (unless (%jit-constvec-covers-p *aarch64-li-const-patches* "build-aa64")
         (return-from %jit-translate-page-1-aarch64 nil))
       (let* ((nwords (a64-buffer-position nbuf))
              (code (a64-buffer-code nbuf))

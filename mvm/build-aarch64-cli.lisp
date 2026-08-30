@@ -693,48 +693,98 @@
 ;;;     aarch64 arm is exactly "do not double".  An argv[i]/envp[i] POINTER is
 ;;;     stored RAW by the kernel on BOTH arches, so the shared file's (* 2 ptr)
 ;;;     is already correct here.
+;;; #283 CABINET SEAM.  These eleven functions OVERRIDE the mvm/cl-fileio.lisp
+;;; definitions (last-defun-wins, Active Limitation 1) because aarch64 Linux has
+;;; no open/stat/unlink/rename/mkdir syscalls -- only the *at variants.  The
+;;; originals each begin with a (%cab-on) branch that routes the operation to the
+;;; mounted cabinet filesystem, and this block USED TO DROP IT, so on aarch64
+;;; every file operation went to the real kernel even with a cabinet mounted.
+;;;
+;;; That was SILENT AND DATA-WRONG, not a crash: for a path the host also has,
+;;; the real open succeeded and returned the HOST file's bytes.  Measured with
+;;; a sentinel (cabfs/bypass.lisp) -- cabinet held CABINET-SENTINEL-42, aarch64
+;;; with-open-file returned the host's 2021-02-13, x64 returned the sentinel.
+;;; It also made whole test runs lie: 13/13 quicklisp client files appeared to
+;;; load from the cabinet while every one came off the real disk.
+;;;
+;;; So the arch slot here is ONLY the syscall shape.  Any policy the shared
+;;; definition applies BEFORE the syscall must be reproduced verbatim.  When
+;;; adding a %sys-* override, diff it against mvm/cl-fileio.lisp first.
 (defvar *cli-arch-override-source* "
 (defun %sys-open-rdonly (path-str)
-  (%string-to-cstr path-str *cstr-scratch*)
-  (%aarch64-openat *cstr-scratch* 0 0))
+  (if (%cab-on)
+      (if (%cab :exists path-str) (%cab-fd-open path-str 0) -2)
+      (progn
+        (%string-to-cstr path-str *cstr-scratch*)
+        (%aarch64-openat *cstr-scratch* 0 0))))
 (defun %sys-open-wronly (path-str)
-  (%string-to-cstr path-str *cstr-scratch*)
-  (%aarch64-openat *cstr-scratch* 577 420))
+  (if (%cab-on)
+      (progn (%cab :create path-str) (%cab-fd-open path-str 0))
+      (progn
+        (%string-to-cstr path-str *cstr-scratch*)
+        (%aarch64-openat *cstr-scratch* 577 420))))
 (defun %sys-open-append (path-str)
-  (%string-to-cstr path-str *cstr-scratch*)
-  (%aarch64-openat *cstr-scratch* 1089 420))
+  (if (%cab-on)
+      (progn (unless (%cab :exists path-str) (%cab :create path-str))
+             (%cab-fd-open path-str (%cab :size path-str)))
+      (progn
+        (%string-to-cstr path-str *cstr-scratch*)
+        (%aarch64-openat *cstr-scratch* 1089 420))))
 (defun %sys-open-rdwr (path-str)
-  (%string-to-cstr path-str *cstr-scratch*)
-  (%aarch64-openat *cstr-scratch* 66 420))
+  (if (%cab-on)
+      (progn (unless (%cab :exists path-str) (%cab :create path-str))
+             (%cab-fd-open path-str 0))
+      (progn
+        (%string-to-cstr path-str *cstr-scratch*)
+        (%aarch64-openat *cstr-scratch* 66 420))))
 (defun %sys-open-create-excl (path-str)
-  (%string-to-cstr path-str *cstr-scratch*)
-  (%aarch64-openat *cstr-scratch* 193 420))
+  (if (%cab-on)
+      (if (%cab :exists path-str) -17
+          (progn (%cab :create path-str) (%cab-fd-open path-str 0)))
+      (progn
+        (%string-to-cstr path-str *cstr-scratch*)
+        (%aarch64-openat *cstr-scratch* 193 420))))
 (defun %sys-unlink (path-str)
-  (%string-to-cstr path-str *cstr-scratch*)
-  (%aarch64-unlinkat *cstr-scratch* 0 0))
+  (if (%cab-on)
+      (progn (%cab :unlink path-str) 0)
+      (progn
+        (%string-to-cstr path-str *cstr-scratch*)
+        (%aarch64-unlinkat *cstr-scratch* 0 0))))
 (defun %sys-rename (old-str new-str)
-  (%string-to-cstr old-str *cstr-scratch*)
-  (let ((new-addr (+ *cstr-scratch* 2048)))
-    (%string-to-cstr new-str new-addr)
-    (%aarch64-renameat *cstr-scratch* new-addr 0)))
+  (if (%cab-on)
+      (progn (%cab :rename old-str new-str) 0)
+      (progn
+        (%string-to-cstr old-str *cstr-scratch*)
+        (let ((new-addr (+ *cstr-scratch* 2048)))
+          (%string-to-cstr new-str new-addr)
+          (%aarch64-renameat *cstr-scratch* new-addr 0)))))
 (defun %sys-mkdir (path-str mode)
-  (%string-to-cstr path-str *cstr-scratch*)
-  (%aarch64-mkdirat *cstr-scratch* mode 0))
+  (if (%cab-on)
+      (progn (%cab :mkdir path-str) 0)
+      (progn
+        (%string-to-cstr path-str *cstr-scratch*)
+        (%aarch64-mkdirat *cstr-scratch* mode 0))))
 (defun %sys-stat-size (path-str)
+  (when (%cab-on)
+    (return-from %sys-stat-size
+      (if (%cab :exists path-str) (%cab :size path-str) -1)))
   (let ((path-addr (%string-to-cstr path-str *cstr-scratch*))
         (buf-addr *io-buf-addr*))
     (let ((ret (%aarch64-newfstatat path-addr buf-addr 0)))
       (if (< ret 0)
           -1
-          ;; struct stat on AArch64 differs from x86-64 layout —
+          ;; struct stat on AArch64 differs from x86-64 layout --
           ;; st_size is at offset 48 in both, so the same load works.
           (mem-ref (+ buf-addr 48) :u32)))))
 (defun %sys-stat-exists (path-str)
+  (when (%cab-on)
+    (return-from %sys-stat-exists (if (%cab :exists path-str) t nil)))
   (let ((path-addr (%string-to-cstr path-str *cstr-scratch*))
         (buf-addr *io-buf-addr*))
     (let ((ret (%aarch64-newfstatat path-addr buf-addr 0)))
       (if (< ret 0) nil t))))
 (defun %sys-stat-mtime (path-str)
+  (when (%cab-on) (return-from %sys-stat-mtime (%cab :mtime path-str)))
   (let ((path-addr (%string-to-cstr path-str *cstr-scratch*))
         (buf-addr *io-buf-addr*))
     (let ((ret (%aarch64-newfstatat path-addr buf-addr 0)))

@@ -1175,30 +1175,26 @@
       ;; records (movz-byte-pos . pool-idx) and FN-MAP maps an MVM function
       ;; offset to a native BYTE offset (same units %jit-write-movz-quad and
       ;; the lrel patch loop below already use).
-      (let ((%cpat *aarch64-li-const-patches*))
-        (when %cpat
-          (let ((%tstart (gethash mvm-entry fn-map)))
-            (if (not (integerp %tstart))
-                ;; No identifiable thunk range → cannot prove any const site is
-                ;; seam-guarded.  Reject.
-                (progn
-                  (setq *jit-r-const-baked*
-                        (if *jit-r-const-baked* (+ 1 *jit-r-const-baked*) 1))
-                  (return-from %jit-translate-page-1-aarch64 nil))
-                ;; THUNK END = the smallest OTHER function start strictly
-                ;; greater than %TSTART, else the end of the buffer.  Scanned
-                ;; (not "next in ft-list") so the answer does not depend on
-                ;; ft-list ordering.
-                (let ((%tend (* (a64-buffer-position nbuf) 4)))
-                  (dolist (%e ft-list)
-                    (let ((%p (gethash (cadr %e) fn-map)))
-                      (when (and (integerp %p) (> %p %tstart) (< %p %tend))
-                        (setq %tend %p))))
-                  (dolist (%cp %cpat)
-                    (when (or (< (car %cp) %tstart) (>= (car %cp) %tend))
-                      (setq *jit-r-const-baked*
-                            (if *jit-r-const-baked* (+ 1 *jit-r-const-baked*) 1))
-                      (return-from %jit-translate-page-1-aarch64 nil))))))))
+      ;; #282 LAYER 2: reject EVERY page with baked const sites — even
+      ;; thunk-only ones.  The x64 gate admits thunk-confined sites because
+      ;; %jit-entry-for re-bakes them after a collection AND x64's constvec
+      ;; (indirect li-const through the fixed root, translate-x64's
+      ;; *x64-jit-constvec-root*) covers the mid-run window.  aarch64 has NO
+      ;; constvec: a li-const is a baked MOVZ/MOVK heap address, and the
+      ;; re-bake only runs when the seam RE-ENTERS the thunk.  A collection
+      ;; triggered WHILE the thunk is still running (any long loop — the
+      ;; htgrow2 repro's 8000-iteration puthash loop crosses the first GC at
+      ;; ~i=5500) leaves the remainder of that very run loading stale
+      ;; from-space addresses; after the next flip those words are arbitrary
+      ;; garbage (the APPLY-of-fixnum PC=2 crash, gdbstub-captured).  Until
+      ;; the constvec is ported to aarch64, interpret any const-bearing form:
+      ;; op-LI-CONST reads *e2-const-pool* at execution time, which the
+      ;; collector keeps live.  (The old thunk-range admission logic is in
+      ;; git history at 32cc26f; restore it only WITH a constvec.)
+      (when *aarch64-li-const-patches*
+        (setq *jit-r-const-baked*
+              (if *jit-r-const-baked* (+ 1 *jit-r-const-baked*) 1))
+        (return-from %jit-translate-page-1-aarch64 nil))
       (let* ((nwords (a64-buffer-position nbuf))
              (code (a64-buffer-code nbuf))
              (nlen (* nwords 4))

@@ -50,6 +50,9 @@
 (let* ((glass (second sb-ext:*posix-argv*))
        (cram  (third  sb-ext:*posix-argv*))
        (out   (fourth sb-ext:*posix-argv*))
+       ;; cl-transport sits beside glass; the runner may also pass it as argv 5.
+       (ctrans (or (fifth sb-ext:*posix-argv*)
+                   (merge-pathnames "../cl-transport/" glass)))
        ;; (system  root  asd  witnesses-in-file-order)
        ;;
        ;; A WITNESS IS THE LAST THING ITS FILE DEFINES, so a toplevel form
@@ -64,13 +67,28 @@
                  ("CRAM" "LZW-DECODE")))       ; lzw.lisp
                ("glass/fb"        ,glass ,(merge-pathnames "glass.asd" glass)
                 (("GLASS" nil)                 ; packages.lisp
+                 ("GLASS" "WORD-NAME")         ; wordlist.lisp
                  ("GLASS" "DEFINE-RECORD")     ; record.lisp
                  ("GLASS" "FB-BLIT")))         ; framebuffer.lisp
                ("glass/clipboard" ,glass ,(merge-pathnames "glass.asd" glass)
                 (("GLASS" "CLIPBOARD-PASTE"))) ; clipboard.lisp
+               ;; cl-transport/listeners, BETWEEN clipboard and :glass.  glass
+               ;; stopped owning its sockets (glass 3ac9844) — src/transports.lisp
+               ;; IMPORTS ~35 names out of CL-TRANSPORT.LISTENERS and re-exports
+               ;; them, and SIGNALS if the package does not have them.  So this
+               ;; system must be loaded first or :glass cannot load at all, and
+               ;; the witness below is a symbol that only exists because the
+               ;; import found it.
+               ("cl-transport/listeners" ,ctrans
+                ,(merge-pathnames "cl-transport.asd" ctrans)
+                (("CL-TRANSPORT.LISTENERS" "SOCKET-UNSENT-BYTES"))) ; listeners.lisp
                ("glass"           ,glass ,(merge-pathnames "glass.asd" glass)
                 (("GLASS" "PERF-REPORT")       ; perf.lisp
-                 ("GLASS" "SOCKET-UNSENT-BYTES") ; socket.lisp
+                 ;; transports.lisp defines no function of its own — its whole
+                 ;; body is the IMPORT above, so the witness is that a borrowed
+                 ;; name is now a GLASS symbol.  Same name as the line above on
+                 ;; purpose: it must be present in BOTH packages.
+                 ("GLASS" "SOCKET-UNSENT-BYTES") ; transports.lisp
                  ("GLASS" "SERVE-ONE")         ; rfb.lisp
                  ("GLASS" "WRITE-RECT-TRLE"))))))  ; zrle.lisp
   (with-open-file (o out :direction :output :if-exists :supersede)

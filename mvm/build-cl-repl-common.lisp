@@ -235,6 +235,17 @@
       (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_VIRT_JIT")))
         (not (and v (string= v "0"))))))
 
+;;; MODUS_YIELD_NOP=1 — translate the YIELD opcode as NOP instead of SEV+WFE.
+;;; YIELD sits at EVERY compiled loop back-edge, including mvm-interpret's own
+;;; dispatch loop, so on aa64 every interpreted bytecode op pays one SEV+WFE.
+;;; x64 bare metal uses a cheap flag-check and x64 Linux a NOP for the same
+;;; opcode; QEMU raspi3b already runs NOP (*aarch64-yield-nop* docstring).
+;;; A/B measurement knob first; if the WFE is the measured wall, the non-actor
+;;; CL images should default to NOP.
+(let ((v #+sbcl (sb-ext:posix-getenv "MODUS_YIELD_NOP")))
+  (when (and v (string= v "1"))
+    (setq modus.mvm::*aarch64-yield-nop* t)))
+
 ;;; :VIRT JIT exec window.  From the build's own memory map: image ends
 ;;; 0x03933480 and the GC bitmaps start 0x05000000, so [0x04000000,0x05000000)
 ;;; is 16 MB of unused Normal-WB DRAM inside the VA 0-0FFFFFFF window, clear of

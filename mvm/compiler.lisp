@@ -5887,6 +5887,36 @@
       ;; does NOT route through the native %with-restarts bridge under mvm-eval)
       ((= op-name 308006321)  ; RESTART-CASE
        (compile-restart-case (cadr form) (cddr form) env dest))
+      ;; WITH-SIMPLE-RESTART (CLHS 9.1.4.2.2).  Modus had NO expander for this
+      ;; form at all — not a macro, not a special form — so
+      ;; `(with-simple-restart (abort "...") body)' compiled into a CALL to a
+      ;; function named WITH-SIMPLE-RESTART and signalled UNDEFINED-FUNCTION at
+      ;; runtime.  That is precisely what stopped `quicklisp::setup', which
+      ;; wraps its local-init loading in one; the failure had been observed for
+      ;; a long time as "setup aborts" with no reason attached.
+      ;;
+      ;; The ANSI harness has carried a rewrite pass for this form
+      ;; (build-ansi-common.lisp) — which by this project's own rule is the
+      ;; signature of a missing feature, not of a bad test.  With a real
+      ;; expander that rewrite is redundant.
+      ;;
+      ;; Standard expansion: a restart-case whose single clause takes no
+      ;; arguments and returns the two values CLHS mandates (NIL and T).  The
+      ;; report is attached only when it is a literal string with no format
+      ;; arguments; a format-control-plus-args report would need a closure, and
+      ;; omitting it costs only the printed description of the restart.
+      ((= op-name 483931868)  ; WITH-SIMPLE-RESTART
+       (let* ((spec (cadr form))
+              (rname (car spec))
+              (rfmt (cadr spec))
+              (rbody (cddr form)))
+         (compile-form
+          (list 'restart-case
+                (cons 'progn rbody)
+                (if (and (stringp rfmt) (null (cddr spec)))
+                    (list rname '() :report rfmt '(values nil t))
+                    (list rname '() '(values nil t))))
+          env dest)))
       ;; IGNORE-ERRORS — compile body only
       ((= op-name 97207481)  ; IGNORE-ERRORS
        (compile-progn (cdr form) env dest))
@@ -6314,6 +6344,7 @@
 
       ;; --- Timestamp Counter ---
       ((= op-name 215533517) (compile-rdtsc dest))  ; RDTSC
+      ((= op-name (compute-name-hash "CNTFRQ")) (compile-cntfrq dest))
 
       ;; --- Wait For Interrupt ---
       ((= op-name 243189679) (compile-wfi dest))  ; WFI
@@ -15813,6 +15844,14 @@
   "Compile (rdtsc) — read timestamp counter, return 64-bit cycles.
    Uses TRAP #x0310; result is in VR (RAX)."
   (emit-ir :trap #x0310)
+  (emit-ir :mov dest +vreg-vr+))
+
+(defun compile-cntfrq (dest)
+  "Compile (cntfrq) — ticks per second of the counter (rdtsc) reads, or 0 when
+   the platform cannot report one.  Together they give seconds without an RTC,
+   which is what a board with no battery-backed clock actually has.  Uses TRAP
+   #x0311; result is in VR."
+  (emit-ir :trap #x0311)
   (emit-ir :mov dest +vreg-vr+))
 
 (defun compile-wfi (dest)

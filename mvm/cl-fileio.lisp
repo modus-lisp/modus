@@ -1716,9 +1716,26 @@
       ((= ty 5)
        (dolist (sub (%stream-data stream))
          (write-byte byte sub)))
-      ;; Synonym: delegate
-      ((= ty 7) (write-byte byte (symbol-value (%stream-data stream))))
-      (t nil)))
+      ;; Synonym: delegate.  Resolve the target the way %WRITE-CHAR-TO-STREAM
+      ;; does — the datum may be a symbol, a string naming one, or a stream —
+      ;; rather than assuming SYMBOL-VALUE applies.
+      ((= ty 7)
+       (let* ((target (%stream-data stream))
+              (ts (cond ((symbolp target) (symbol-value target))
+                        ((stringp target) (symbol-value (intern target)))
+                        (t target))))
+         (if (streamp ts) (write-byte byte ts) (write-char-serial byte))))
+      ;; Serial-io, and anything else that resolves to the console.
+      ;;
+      ;; This arm did not exist: the cond ended `(t nil)', so a byte written to
+      ;; a console stream was DISCARDED.  %WRITE-CHAR-TO-STREAM has had the
+      ;; matching `((= ty 8) (write-char-serial code))' and
+      ;; `(t (write-char-serial code))' arms all along — character output
+      ;; reached the UART, byte output silently did not.  On bare metal, where
+      ;; the console IS the only always-present sink, that asymmetry makes
+      ;; (write-byte b *standard-output*) a no-op.
+      ((= ty 8) (write-char-serial byte))
+      (t (write-char-serial byte))))
   byte)
 
 ;;; Helper: concatenate two strings

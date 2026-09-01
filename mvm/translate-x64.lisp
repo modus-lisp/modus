@@ -1044,7 +1044,18 @@
               ;; shl rax, 32
               (emit-bytes buf #x48 #xC1 #xE0 #x20)
               ;; or rax, rcx
-              (emit-bytes buf #x48 #x09 #xC8))
+              (emit-bytes buf #x48 #x09 #xC8)
+              ;; shl rax, 1 — tag as a fixnum.  A value register holds a TAGGED
+              ;; word; a raw counter with its low bit set carries the cons tag
+              ;; (0x1), i.e. a wild pointer, on half of all reads.
+              (emit-bytes buf #x48 #xD1 #xE0))
+             ((= code #x0311)
+              ;; CNTFRQ equivalent: x86 has no architectural "counter Hz"
+              ;; register (the TSC rate is discoverable only via CPUID leaf 0x15
+              ;; or calibration), so report frequency-unknown rather than invent
+              ;; a number.  Tagged 0.
+              ;; xor eax, eax
+              (emit-bytes buf #x31 #xC0))
              ((= code #x0510)
               (let ((skiparm-label (make-label)))
               ;; SETJMP: Save RSP, RBP, and return address to fixed memory.

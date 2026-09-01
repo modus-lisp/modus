@@ -48,12 +48,27 @@
             (setq try 10001))))
       result)))
 
+;; RX ring depth, as a DEFUN so an arch adapter can override it by
+;; last-defun-wins (a defvar initform would not run in-image, Limitation 7).
+;;
+;; WHY THIS IS TUNABLE.  The ring is the ONLY buffering between the wire and a
+;; guest that can pause (a GC mid-transfer is exactly such a pause).  Measured
+;; 2026-08-31 on QEMU virt: with 128 descriptors the ring holds 128*2048 =
+;; 262144 bytes, and the ONLY HTTP body that ever truncated was the only one
+;; larger than that -- 348160 bytes, while 194560 and 9287 always arrived whole.
+;; Under ring capacity the NIC absorbs the whole response across any stall; over
+;; it, a stall drops packets, TCP retransmits, and the peer closes.
+;; Default stays 128 so every other arch keeps its existing DMA layout; an arch
+;; that raises it MUST also move e1000-tx-desc-base/e1000-tx-buf-base clear of
+;; the larger rx-buf region.
+(defun e1000-rx-ring-count () 128)
+
 ;; Initialize E1000 RX descriptors
-;; 128 descriptors, buffers at rx-buf-base (each 2048 bytes)
+;; (e1000-rx-ring-count) descriptors, buffers at rx-buf-base (each 2048 bytes)
 (defun e1000-init-rx ()
   (let ((rx-desc (e1000-rx-desc-base))
         (rx-buf (e1000-rx-buf-base)))
-    (dotimes (i 128)
+    (dotimes (i (e1000-rx-ring-count))
       (let ((desc-addr (+ rx-desc (* i 16)))
             (buf-addr (+ rx-buf (* i 2048))))
         ;; Buffer address low 32 bits
@@ -66,9 +81,9 @@
     ;; Set RX descriptor ring registers
     (e1000-write-reg #x2800 rx-desc)   ; RDBAL
     (e1000-write-reg #x2804 0)         ; RDBAH
-    (e1000-write-reg #x2808 2048)      ; RDLEN (128 * 16)
+    (e1000-write-reg #x2808 (* (e1000-rx-ring-count) 16))  ; RDLEN
     (e1000-write-reg #x2810 0)         ; RDH (head)
-    (e1000-write-reg #x2818 127)       ; RDT (tail)
+    (e1000-write-reg #x2818 (- (e1000-rx-ring-count) 1))    ; RDT (tail)
     ;; Store RX cursor = 0
     (setf (mem-ref (+ (e1000-state-base) #x10) :u32) 0)))
 
@@ -102,9 +117,9 @@
         (state (e1000-state-base)))
     (when (zerop mmio)
       ;; "E1000:No" + newline
-      (write-byte 69) (write-byte 49) (write-byte 48) (write-byte 48)
-      (write-byte 48) (write-byte 58) (write-byte 78) (write-byte 111)
-      (write-byte 10)
+      (%serial-byte 69) (%serial-byte 49) (%serial-byte 48) (%serial-byte 48)
+      (%serial-byte 48) (%serial-byte 58) (%serial-byte 78) (%serial-byte 111)
+      (%serial-byte 10)
       (return 0))
 
     ;; 1. Reset: write CTRL.RST (bit 26)
@@ -131,19 +146,19 @@
       (e1000-write-reg #x5404 (logior mac2 #x80000000))  ; AV bit
 
       ;; Print "MAC:" then hex bytes
-      (write-byte 77) (write-byte 65) (write-byte 67) (write-byte 58)
+      (%serial-byte 77) (%serial-byte 65) (%serial-byte 67) (%serial-byte 58)
       (print-hex-byte (logand mac0 #xFF))
-      (write-byte 58)
+      (%serial-byte 58)
       (print-hex-byte (logand (ash mac0 -8) #xFF))
-      (write-byte 58)
+      (%serial-byte 58)
       (print-hex-byte (logand mac1 #xFF))
-      (write-byte 58)
+      (%serial-byte 58)
       (print-hex-byte (logand (ash mac1 -8) #xFF))
-      (write-byte 58)
+      (%serial-byte 58)
       (print-hex-byte (logand mac2 #xFF))
-      (write-byte 58)
+      (%serial-byte 58)
       (print-hex-byte (logand (ash mac2 -8) #xFF))
-      (write-byte 10))
+      (%serial-byte 10))
 
     ;; 4. Clear multicast table (128 dwords at 0x5200)
     (dotimes (i 128)
@@ -181,14 +196,25 @@
     (e1000-write-reg #xD8 #xFFFFFFFF)  ; IMC: clear all
     (e1000-write-reg #xD0 #x80)        ; IMS: enable RXT0 (bit 7)
 
-    ;; Store our IP (10.0.2.15) and gateway (10.0.2.2)
-    (setf (mem-ref (+ state #x18) :u32) #x0F02000A)  ; 10.0.2.15
-    (setf (mem-ref (+ state #x1C) :u32) #x0202000A)  ; 10.0.2.2
+    ;; Start UNCONFIGURED (0.0.0.0) — DHCP must supply the address.
+    ;;
+    ;; This used to preload 10.0.2.15 / 10.0.2.2 with the comment "will be
+    ;; overwritten by DHCP".  Those are exactly slirp's first lease and its
+    ;; gateway, so when DHCP FAILED the stale defaults still routed under QEMU
+    ;; and the run looked like a success — the one failure the network bring-up
+    ;; most needs to report was the one it could not show.  A value that
+    ;; happens to match the expected answer is not evidence the mechanism ran.
+    ;;
+    ;; 0.0.0.0 is also the correct source address for a DHCP DISCOVER, so this
+    ;; is what an unconfigured interface should hold anyway.  Anything needing
+    ;; a static address must now set it explicitly and visibly.
+    (setf (mem-ref (+ state #x18) :u32) 0)
+    (setf (mem-ref (+ state #x1C) :u32) 0)
 
     ;; "E1000:OK" + newline
-    (write-byte 69) (write-byte 49) (write-byte 48) (write-byte 48)
-    (write-byte 48) (write-byte 58) (write-byte 79) (write-byte 75)
-    (write-byte 10)
+    (%serial-byte 69) (%serial-byte 49) (%serial-byte 48) (%serial-byte 48)
+    (%serial-byte 48) (%serial-byte 58) (%serial-byte 79) (%serial-byte 75)
+    (%serial-byte 10)
     1))
 
 ;; Send raw ethernet frame from byte array
@@ -241,17 +267,50 @@
           ;; Packet received! Get length from descriptor
           (let ((desc-addr (+ (e1000-rx-desc-base) (* rx-cur 16))))
             (let ((pkt-len (mem-ref (+ desc-addr 8) :u16)))
-              ;; Advance cursor and update RDT
-              (let ((next (if (< (+ rx-cur 1) 128) (+ rx-cur 1) 0)))
+              ;; Advance cursor, then DEFERRED RE-ARM.
+              ;;
+              ;; RDT must NOT be set to rx-cur here.  Writing rx-cur hands that
+              ;; descriptor straight back to the NIC while its buffer is still
+              ;; unread: the caller only fetches it AFTER this returns, via
+              ;; e1000-hw-rx-buf (which deliberately returns rx-cur-1, "the
+              ;; previous cursor's buffer, since we already advanced") and then
+              ;; copies it.  So the NIC owned a buffer the driver was still
+              ;; reading, and at line rate it overwrote it.
+              ;;
+              ;; Interpreted, packets arrived sparsely enough relative to
+              ;; processing that the window almost never closed on us.  Once the
+              ;; aarch64 JIT made this loop native the driver re-armed instantly,
+              ;; the NIC always had free descriptors and streamed flat out, and a
+              ;; 348160-byte HTTP body came back TRUNCATED at 97723 / 182683 /
+              ;; 226080 / 298080 bytes -- varying, because it is a race.  TCP saw
+              ;; the loss, retransmitted, and the peer eventually closed
+              ;; (RXEND why=1), which is what proved this was data loss and not
+              ;; the receive loop's own timeout.
+              ;;
+              ;; Re-arm rx-cur-1 instead: the descriptor consumed by the PREVIOUS
+              ;; call, which the caller has provably finished with.  Costs one
+              ;; descriptor of ring depth (127 of 128 usable) and needs no extra
+              ;; state.  On the very first call prev = 127, which is exactly the
+              ;; RDT the init path already programmed, so it is a no-op.
+              ;;
+              ;; Same defect and same fix as the Pi's r8152 RX DMA race.  A
+              ;; latent race is a function of RELATIVE speed, so a speedup is a
+              ;; correctness change: after one, re-audit everything that hands a
+              ;; buffer to hardware.
+              (let ((next (if (< (+ rx-cur 1) (e1000-rx-ring-count))
+                              (+ rx-cur 1) 0))
+                    (prev (if (zerop rx-cur)
+                              (- (e1000-rx-ring-count) 1)
+                              (- rx-cur 1))))
                 (setf (mem-ref (+ state #x10) :u32) next)
-                (e1000-write-reg #x2818 rx-cur))
+                (e1000-write-reg #x2818 prev))
               pkt-len))))))
 
 ;; Get pointer to current RX buffer data
 (defun e1000-hw-rx-buf ()
   (let ((rx-cur (mem-ref (+ (e1000-state-base) #x10) :u32)))
     ;; Return previous cursor's buffer since we already advanced
-    (let ((prev (if (zerop rx-cur) 127 (- rx-cur 1))))
+    (let ((prev (if (zerop rx-cur) (- (e1000-rx-ring-count) 1) (- rx-cur 1))))
       (+ (e1000-rx-buf-base) (* prev 2048)))))
 
 ;; Find E1000 and initialize. Main entry point.
@@ -260,16 +319,16 @@
     (if (zerop mmio)
         (progn
           ;; "E1000:NF" + newline
-          (write-byte 69) (write-byte 49) (write-byte 48) (write-byte 48)
-          (write-byte 48) (write-byte 58) (write-byte 78) (write-byte 70)
-          (write-byte 10)
+          (%serial-byte 69) (%serial-byte 49) (%serial-byte 48) (%serial-byte 48)
+          (%serial-byte 48) (%serial-byte 58) (%serial-byte 78) (%serial-byte 70)
+          (%serial-byte 10)
           0)
         (progn
           ;; "E1000:MMIO=" then hex32
-          (write-byte 69) (write-byte 49) (write-byte 48) (write-byte 48)
-          (write-byte 48) (write-byte 58)
+          (%serial-byte 69) (%serial-byte 49) (%serial-byte 48) (%serial-byte 48)
+          (%serial-byte 48) (%serial-byte 58)
           (print-hex32 (logand mmio #xFFFFFFFF))
-          (write-byte 10)
+          (%serial-byte 10)
           (e1000-init)))))
 
 ;;; Default API wrappers — override these via last-defun-wins for other drivers

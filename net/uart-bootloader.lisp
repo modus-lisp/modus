@@ -71,21 +71,21 @@
 
 (defun bootloader-receive ()
   ;; Send ACK
-  (write-byte #xAA)
+  (%serial-byte #xAA)
   ;; Read 4-byte LOAD ADDRESS, then 4-byte kernel size
   (let ((addr (uart-read-u32)))
-    (write-byte 65) (write-byte 68) (write-byte 58)  ;; "AD:"
+    (%serial-byte 65) (%serial-byte 68) (%serial-byte 58)  ;; "AD:"
     (print-hex32 addr)
-    (write-byte 10)
+    (%serial-byte 10)
     (if (not (bootloader-addr-ok addr))
         (progn
-          (write-byte 65) (write-byte 68) (write-byte 10)  ;; "AD\n" = bad addr
+          (%serial-byte 65) (%serial-byte 68) (%serial-byte 10)  ;; "AD\n" = bad addr
           nil)
   (let ((size (uart-read-u32)))
     ;; Print size
-    (write-byte 83) (write-byte 90) (write-byte 58)  ;; "SZ:"
+    (%serial-byte 83) (%serial-byte 90) (%serial-byte 58)  ;; "SZ:"
     (print-hex32 size)
-    (write-byte 10)
+    (%serial-byte 10)
     ;; Read kernel data.  DRAIN THE WHOLE FIFO PER POLL, don't poll per byte.
     ;;
     ;; MEASURED on real hardware: the old one-poll-per-byte loop could only
@@ -114,7 +114,7 @@
             (let ((b (uart-read-byte)))
               (when (= b -1)
                 ;; Timeout during receive
-                (write-byte 84) (write-byte 79) (write-byte 10)  ;; "TO\n"
+                (%serial-byte 84) (%serial-byte 79) (%serial-byte 10)  ;; "TO\n"
                 (return nil))
               (setf (mem-ref (+ load-addr i) :u8) b)
               (setq checksum (logand (+ checksum b) #xFF)))
@@ -131,13 +131,13 @@
           (let ((expected (uart-read-byte)))
             (if (= checksum expected)
                 (progn
-                  (write-byte 79) (write-byte 75) (write-byte 10)  ;; "OK\n"
+                  (%serial-byte 79) (%serial-byte 75) (%serial-byte 10)  ;; "OK\n"
                   ;; Small delay for UART TX to drain
                   (delay-us 50000)
                   ;; Jump to loaded kernel
                   (jump-to-address load-addr))
                 (progn
-                  (write-byte 69) (write-byte 82) (write-byte 10)  ;; "ER\n"
+                  (%serial-byte 69) (%serial-byte 82) (%serial-byte 10)  ;; "ER\n"
                   nil))))))))))
 
 (defun uart-drain ()

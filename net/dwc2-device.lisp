@@ -116,18 +116,18 @@
 
 (defun gadget-trace-dump ()
   ;; Dump trace buffer over serial
-  (write-byte 84)(write-byte 82)(write-byte 58)  ;; "TR:"
+  (%serial-byte 84)(%serial-byte 82)(%serial-byte 58)  ;; "TR:"
   (let ((count (trace-pos)))
     (print-dec count)
-    (write-byte 10)
+    (%serial-byte 10)
     (let ((i 0))
       (loop
         (when (>= i count) (return 0))
         (print-hex-byte (mem-ref (+ (trace-buf) i) :u8))
         (when (zerop (logand (+ i 1) 31))
-          (write-byte 10))  ;; newline every 32 bytes
+          (%serial-byte 10))  ;; newline every 32 bytes
         (setq i (+ i 1))))
-    (write-byte 10)))
+    (%serial-byte 10)))
 
 ;;; ============================================================
 ;;; Delay helpers
@@ -142,7 +142,7 @@
 
 (defun gadget-trace (ch)
   ;; Print a single trace character using raw serial TRAP
-  ;; Bypasses the defun write-byte (capture-aware) to rule out flag issues
+  ;; Bypasses the defun %serial-byte (capture-aware) to rule out flag issues
   (write-char-serial ch))
 
 ;;; ============================================================
@@ -464,10 +464,10 @@
 (defun mbox-power-on-usb ()
   ;; Power ON USB HCD
   (let ((state (mbox-send-power 3)))  ;; ON | WAIT (bit 1=WAIT, bit 0=1=ON)
-    (write-byte 80)(write-byte 87)(write-byte 82)  ;; "PWR"
-    (write-byte 58) ;; ":"
+    (%serial-byte 80)(%serial-byte 87)(%serial-byte 82)  ;; "PWR"
+    (%serial-byte 58) ;; ":"
     (print-hex-byte (logand state #xFF))
-    (write-byte 10)
+    (%serial-byte 10)
     state))
 
 ;;; ============================================================
@@ -566,13 +566,13 @@
           (dwc2-write (dwc2-gusbcfg) c2)))))
   (gadget-delay 200)  ;; Wait for mode switch
   ;; Debug: print GUSBCFG
-  (write-byte 71)(write-byte 85)(write-byte 58)  ;; "GU:"
+  (%serial-byte 71)(%serial-byte 85)(%serial-byte 58)  ;; "GU:"
   (let ((gu (dwc2-read (dwc2-gusbcfg))))
     (print-hex-byte (logand gu #xFF))
     (print-hex-byte (logand (ash gu -8) #xFF))
     (print-hex-byte (logand (ash gu -16) #xFF))
     (print-hex-byte (logand (ash gu -24) #xFF)))
-  (write-byte 10)
+  (%serial-byte 10)
   ;; ---- Phase 4: Force session valid (GOTGCTL) ----
   ;; Force VbValid + BValid + AValid for device mode without VBUS sensing
   (let ((otg (dwc2-read (dwc2-base))))
@@ -582,9 +582,9 @@
   ;; Force Full Speed to avoid HS chirp — HS gets EPROTO on read/all
   ;; FS is known to work for 8-byte reads; testing full enumeration at FS
   (dwc2-write (dwc2-dcfg) 5)
-  (write-byte 68)(write-byte 67)(write-byte 58)  ;; "DC:"
+  (%serial-byte 68)(%serial-byte 67)(%serial-byte 58)  ;; "DC:"
   (print-hex-byte (logand (dwc2-read (dwc2-dcfg)) #xFF))
-  (write-byte 10)
+  (%serial-byte 10)
   ;; ---- Phase 6: AHB + FIFOs + interrupts ----
   (dwc2-write (dwc2-gahbcfg) 1)
   ;; Flush all FIFOs (TinyUSB does this in core_init after reset)
@@ -625,7 +625,7 @@
     (let ((cleared (logand dctl (logxor 2 #xFFFFFFFF))))
       (dwc2-write (dwc2-dctl) (logior cleared (logior (ash 1 10) (ash 1 8))))))
   (dwc2-write (dwc2-gahbcfg) 1)
-  (write-byte 71)(write-byte 65)(write-byte 68)(write-byte 10)  ;; "GAD\n"
+  (%serial-byte 71)(%serial-byte 65)(%serial-byte 68)(%serial-byte 10)  ;; "GAD\n"
   1)
 
 ;;; ============================================================
@@ -718,11 +718,11 @@
           (wlength (logior wlen-lo (ash wlen-hi 8))))
       (trace-event-val #x15 breq)  ;; SETUP bRequest
       ;; Debug: print "S:XX" for every SETUP (breq in hex)
-      (write-byte 83)(write-byte 58)  ;; "S:"
+      (%serial-byte 83)(%serial-byte 58)  ;; "S:"
       (print-hex-byte breq)
-      (write-byte 87)(write-byte 58)  ;; "W:"
+      (%serial-byte 87)(%serial-byte 58)  ;; "W:"
       (print-hex-byte (logand wlength #xFF))
-      (write-byte 10)
+      (%serial-byte 10)
       (if (eq breq 6)       ;; GET_DESCRIPTOR
           (let ((desc-type (ash wvalue -8))
                 (desc-idx (logand wvalue #xFF)))
@@ -738,12 +738,12 @@
                 ;; Apply address IMMEDIATELY (before ZLP), matching Linux dwc2 gadget driver.
                 ;; DWC2 core internally latches: uses OLD address for STATUS phase,
                 ;; NEW address for subsequent transactions.
-                (write-byte 83)(write-byte 65)(write-byte 58)  ;; "SA:"
+                (%serial-byte 83)(%serial-byte 65)(%serial-byte 58)  ;; "SA:"
                 (print-hex-byte (logand wvalue #xFF))
                 (let ((dcfg (dwc2-read (dwc2-dcfg))))
                   (let ((cleared (logand dcfg (logxor (ash #x7F 4) #xFFFFFFFF))))
                     (dwc2-write (dwc2-dcfg) (logior cleared (ash wvalue 4)))))
-                (write-byte 10)
+                (%serial-byte 10)
                 (gadget-ep0-send-zlp))
               (if (eq breq 9)   ;; SET_CONFIGURATION
                   (progn
@@ -754,9 +754,9 @@
                   (if (eq breq 11)  ;; SET_INTERFACE
                       (progn
                         ;; CDC-ECM: Alt 0 = no endpoints, Alt 1 = data active
-                        (write-byte 65)(write-byte 76)(write-byte 84)(write-byte 58)  ;; "ALT:"
+                        (%serial-byte 65)(%serial-byte 76)(%serial-byte 84)(%serial-byte 58)  ;; "ALT:"
                         (print-hex-byte (logand wvalue #xFF))
-                        (write-byte 10)
+                        (%serial-byte 10)
                         (if (eq wvalue 1)
                             ;; Alt 1: activate data endpoints + reset DATA0
                             (progn
@@ -776,7 +776,7 @@
 
 (defun gadget-handle-reset ()
   (trace-event #x10)  ;; RST
-  (write-byte 82)(write-byte 83)(write-byte 84)(write-byte 10)  ;; "RST\n"
+  (%serial-byte 82)(%serial-byte 83)(%serial-byte 84)(%serial-byte 10)  ;; "RST\n"
   (gadget-set-configured 0)
   (gadget-set-addr-pending 0)
   ;; Reset address to 0
@@ -825,7 +825,7 @@
 
 (defun gadget-handle-enum-done ()
   (trace-event #x11)  ;; ENUM
-  (write-byte 69)(write-byte 68)(write-byte 10)  ;; "ED\n" = EnumDone
+  (%serial-byte 69)(%serial-byte 68)(%serial-byte 10)  ;; "ED\n" = EnumDone
   ;; Enumeration complete — read DSTS for negotiated speed
   ;; DSTS bits 2:1: 0=HS, 1=FS(UTMI 30/60), 2=LS, 3=FS(48)
   ;; EP0 MPS=64 for HS and FS (DIEPCTL[0] bits 1:0 = 0)
@@ -1139,46 +1139,46 @@
   ;; Re-arm EP0 after drain
   (gadget-ep0-prepare)
   ;; Print hardware registers (after deploy output window closes)
-  (write-byte 73)(write-byte 68)(write-byte 58)  ;; "ID:"
+  (%serial-byte 73)(%serial-byte 68)(%serial-byte 58)  ;; "ID:"
   (let ((id (dwc2-read (+ (dwc2-base) #x40))))  ;; GSNPSID
     (print-hex-byte (logand id #xFF))
     (print-hex-byte (logand (ash id -8) #xFF))
     (print-hex-byte (logand (ash id -16) #xFF))
     (print-hex-byte (logand (ash id -24) #xFF)))
-  (write-byte 10)
-  (write-byte 72)(write-byte 87)(write-byte 58)  ;; "HW:"
+  (%serial-byte 10)
+  (%serial-byte 72)(%serial-byte 87)(%serial-byte 58)  ;; "HW:"
   (let ((hw (dwc2-read (+ (dwc2-base) #x48))))  ;; GHWCFG2
     (print-hex-byte (logand hw #xFF))
     (print-hex-byte (logand (ash hw -8) #xFF))
     (print-hex-byte (logand (ash hw -16) #xFF))
     (print-hex-byte (logand (ash hw -24) #xFF)))
-  (write-byte 10)
-  (write-byte 72)(write-byte 52)(write-byte 58)  ;; "H4:"
+  (%serial-byte 10)
+  (%serial-byte 72)(%serial-byte 52)(%serial-byte 58)  ;; "H4:"
   (let ((h4 (dwc2-read (+ (dwc2-base) #x50))))  ;; GHWCFG4
     (print-hex-byte (logand h4 #xFF))
     (print-hex-byte (logand (ash h4 -8) #xFF))
     (print-hex-byte (logand (ash h4 -16) #xFF))
     (print-hex-byte (logand (ash h4 -24) #xFF)))
-  (write-byte 10)
+  (%serial-byte 10)
   ;; GHWCFG3 (bits 31:16 = DFIFO depth in 32-bit words)
-  (write-byte 72)(write-byte 51)(write-byte 58)  ;; "H3:"
+  (%serial-byte 72)(%serial-byte 51)(%serial-byte 58)  ;; "H3:"
   (let ((h3 (dwc2-read (+ (dwc2-base) #x4C))))
     (print-hex-byte (logand h3 #xFF))
     (print-hex-byte (logand (ash h3 -8) #xFF))
     (print-hex-byte (logand (ash h3 -16) #xFF))
     (print-hex-byte (logand (ash h3 -24) #xFF)))
-  (write-byte 10)
+  (%serial-byte 10)
   ;; Also print GUSBCFG post-connect for verification
-  (write-byte 71)(write-byte 85)(write-byte 58)  ;; "GU:"
+  (%serial-byte 71)(%serial-byte 85)(%serial-byte 58)  ;; "GU:"
   (let ((gu (dwc2-read (dwc2-gusbcfg))))
     (print-hex-byte (logand gu #xFF))
     (print-hex-byte (logand (ash gu -8) #xFF))
     (print-hex-byte (logand (ash gu -16) #xFF))
     (print-hex-byte (logand (ash gu -24) #xFF)))
-  (write-byte 10)
+  (%serial-byte 10)
   ;; Wait for enumeration to complete (host configures us)
-  (write-byte 69)(write-byte 78)(write-byte 85)(write-byte 77)  ;; "ENUM"
-  (write-byte 10)
+  (%serial-byte 69)(%serial-byte 78)(%serial-byte 85)(%serial-byte 77)  ;; "ENUM"
+  (%serial-byte 10)
   ;; Poll loop — 100M iterations (~30 seconds)
   ;; Each iteration does 1+ MMIO reads via gadget-poll (~300ns each)
   ;; Host needs ~10-12s to enumerate (2 × 5s timeouts then success)
@@ -1194,8 +1194,8 @@
   (write-char-serial 10)
   ;; Always dump trace buffer
   (gadget-trace-dump)
-  (write-byte 67)(write-byte 70)(write-byte 71)  ;; "CFG"
-  (write-byte 10)
+  (%serial-byte 67)(%serial-byte 70)(%serial-byte 71)  ;; "CFG"
+  (%serial-byte 10)
   ;; Continue polling USB after SET_CONFIGURATION.
   ;; The host's cdc_ether driver sends SET_INTERFACE and other requests
   ;; immediately after configuration. We must respond or it times out (-110).
@@ -1205,10 +1205,10 @@
       (when (>= j 500000) (return 0))
       (gadget-poll)
       (setq j (+ j 1))))
-  (write-byte 80)(write-byte 49)(write-byte 10)  ;; "P1\n" = post-config done
+  (%serial-byte 80)(%serial-byte 49)(%serial-byte 10)  ;; "P1\n" = post-config done
   ;; Final EP2 re-arm — ensure it's properly armed after all probe activity
   (gadget-arm-ep2)
-  (write-byte 80)(write-byte 82)(write-byte 66)(write-byte 10)  ;; "PRB\n" = probe done
+  (%serial-byte 80)(%serial-byte 82)(%serial-byte 66)(%serial-byte 10)  ;; "PRB\n" = probe done
   ;; Enable interrupt-driven USB: ISR drains RX FIFO to ring buffer,
   ;; allowing USB to stay responsive during long crypto operations.
   (gadget-enable-irq)

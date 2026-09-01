@@ -208,7 +208,7 @@ bytecode via the self-hosted compiler and run it through `mvm-interpret`
 deleted after every consumer was ported: the x64-Linux gate image, the
 generic/gauntlet image, the bare-metal x64 runner (build-x64.lisp), the
 Linux/AArch64 runner (build-aarch64-linux.lisp, verified natively on a
-Pi 5), and the bare-metal AArch64 runner (build-aarch64.lisp).  The
+Pi 5), and the bare-metal AArch64 runner (build-aarch64-ansi.lisp).  The
 deletion was census-gated: an instrumented build measured ZERO walker
 fallback invocations across the full ANSI corpus and the asdf gauntlet.
 An interp-closure shape mvm-eval cannot compile now SIGNALS an honest error
@@ -258,7 +258,11 @@ Two kinds of build:
 - **ANSI gate runners (NOT for shipping)** — bake the transformed ANSI test
   corpus into the kernel image and run it natively, for the conformance gate:
   `build-x64-linux` (the 64-shard Linux gate), `build-x64` (bare-metal QEMU),
-  and the `build-aarch64`/`build-aarch64-linux` counterparts.  Only these 4
+  and the `build-aarch64-ansi`/`build-aarch64-linux` counterparts.  (The gate
+  runner for QEMU virt was called `build-aarch64` until 2026-08-30; it was
+  renamed because a bare arch name reads like the plain image for that arch,
+  not a corpus-baking test build.  `build-aarch64` is now the CLEAN QEMU-virt
+  image.)  Only these 4
   compile the `.lsp` corpus in; their host-build logs are noisy with
   test-corpus warnings by design.  Each pair shares its ~4300-line harness via a
   common module — `mvm/build-ansi-common.lisp`, shared by all four; each of the

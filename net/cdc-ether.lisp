@@ -132,17 +132,17 @@
     ;; 1. Initialize DWC2 host controller
     (let ((r1 (dwc2-init)))
       (when (zerop r1)
-        (write-byte 67) (write-byte 68) (write-byte 67)  ; "CDC"
-        (write-byte 58) (write-byte 69) (write-byte 49)  ; ":E1"
-        (write-byte 10)
+        (%serial-byte 67) (%serial-byte 68) (%serial-byte 67)  ; "CDC"
+        (%serial-byte 58) (%serial-byte 69) (%serial-byte 49)  ; ":E1"
+        (%serial-byte 10)
         (return 0))
 
       ;; 2. Enumerate USB device
       (let ((r2 (usb-enumerate)))
         (when (zerop r2)
-          (write-byte 67) (write-byte 68) (write-byte 67)  ; "CDC"
-          (write-byte 58) (write-byte 69) (write-byte 50)  ; ":E2"
-          (write-byte 10)
+          (%serial-byte 67) (%serial-byte 68) (%serial-byte 67)  ; "CDC"
+          (%serial-byte 58) (%serial-byte 69) (%serial-byte 50)  ; ":E2"
+          (%serial-byte 10)
           (return 0))
 
         ;; 3. Initialize network state
@@ -167,18 +167,18 @@
           (setf (mem-ref (+ state #x1C) :u32) #x0202000A)  ; 10.0.2.2
 
           ;; Print MAC (read from state, not hardcoded)
-          (write-byte 77) (write-byte 65) (write-byte 67) (write-byte 58)  ; "MAC:"
-          (print-hex-byte (mem-ref (+ state #x08) :u8)) (write-byte 58)
-          (print-hex-byte (mem-ref (+ state #x09) :u8)) (write-byte 58)
-          (print-hex-byte (mem-ref (+ state #x0A) :u8)) (write-byte 58)
-          (print-hex-byte (mem-ref (+ state #x0B) :u8)) (write-byte 58)
-          (print-hex-byte (mem-ref (+ state #x0C) :u8)) (write-byte 58)
-          (print-hex-byte (mem-ref (+ state #x0D) :u8)) (write-byte 10)
+          (%serial-byte 77) (%serial-byte 65) (%serial-byte 67) (%serial-byte 58)  ; "MAC:"
+          (print-hex-byte (mem-ref (+ state #x08) :u8)) (%serial-byte 58)
+          (print-hex-byte (mem-ref (+ state #x09) :u8)) (%serial-byte 58)
+          (print-hex-byte (mem-ref (+ state #x0A) :u8)) (%serial-byte 58)
+          (print-hex-byte (mem-ref (+ state #x0B) :u8)) (%serial-byte 58)
+          (print-hex-byte (mem-ref (+ state #x0C) :u8)) (%serial-byte 58)
+          (print-hex-byte (mem-ref (+ state #x0D) :u8)) (%serial-byte 10)
 
           ;; Print status
-          (write-byte 67) (write-byte 68) (write-byte 67)  ; "CDC"
-          (write-byte 58) (write-byte 79) (write-byte 75)  ; ":OK"
-          (write-byte 10)
+          (%serial-byte 67) (%serial-byte 68) (%serial-byte 67)  ; "CDC"
+          (%serial-byte 58) (%serial-byte 79) (%serial-byte 75)  ; ":OK"
+          (%serial-byte 10)
 
           ;; Start the first bulk IN transfer (persistent channel).
           ;; DWC2's work_bh will auto-retry NAK'd transfers.

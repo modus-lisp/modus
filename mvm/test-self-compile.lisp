@@ -107,12 +107,12 @@
         ;; Quick sanity: build a small image using the translators
         (format t "~%=== Build x86-64 REPL image (sanity) ===~%")
         (let ((image (build-image :target :x86-64
-                                  :source-text "(defun kernel-main () (write-byte 42) (halt))")))
+                                  :source-text "(defun kernel-main () (%serial-byte 42) (halt))")))
           (format t "  x86-64 image: ~D bytes~%"
                   (length (kernel-image-image-bytes image))))
         (format t "~%=== Build fixpoint AArch64 REPL image (sanity) ===~%")
         (let ((image (build-image :target :fixpoint
-                                  :source-text "(defun kernel-main () (write-byte 42) (halt))")))
+                                  :source-text "(defun kernel-main () (%serial-byte 42) (halt))")))
           (format t "  AArch64 fixpoint image: ~D bytes~%"
                   (length (kernel-image-image-bytes image))))
         (format t "~%=== Self-compile summary ===~%")

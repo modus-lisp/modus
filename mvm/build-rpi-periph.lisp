@@ -71,43 +71,43 @@
                          "  (setf (mem-ref #x3F215068 :u32) 270)"
                          "  (setf (mem-ref #x3F215060 :u32) 3)"
                          ;; Print "UART\n"
-                         "  (write-byte 85) (write-byte 65) (write-byte 82)"
-                         "  (write-byte 84) (write-byte 10)"
+                         "  (%serial-byte 85) (%serial-byte 65) (%serial-byte 82)"
+                         "  (%serial-byte 84) (%serial-byte 10)"
                          ;; === Test 1: Hardware RNG ===
                          ;; Print "RNG:"
-                         "  (write-byte 82) (write-byte 78) (write-byte 71) (write-byte 58)"
+                         "  (%serial-byte 82) (%serial-byte 78) (%serial-byte 71) (%serial-byte 58)"
                          "  (let ((rnd (arch-seed-random)))"
                          "    (print-hex32 rnd))"
-                         "  (write-byte 10)"
+                         "  (%serial-byte 10)"
                          ;; === Test 2: System Timer ===
                          ;; Print "TMR:"
-                         "  (write-byte 84) (write-byte 77) (write-byte 82) (write-byte 58)"
+                         "  (%serial-byte 84) (%serial-byte 77) (%serial-byte 82) (%serial-byte 58)"
                          "  (let ((t1 (timer-read-lo)))"
                          "    (print-hex32 t1))"
-                         "  (write-byte 10)"
+                         "  (%serial-byte 10)"
                          ;; Marker before io-delay: "D!"
-                         "  (write-byte 68) (write-byte 33)"
+                         "  (%serial-byte 68) (%serial-byte 33)"
                          ;; io-delay now pure counter loop (no MMIO)
                          "  (io-delay)"
                          ;; Print "DLY:" + elapsed time
-                         "  (write-byte 68) (write-byte 76) (write-byte 89) (write-byte 58)"
+                         "  (%serial-byte 68) (%serial-byte 76) (%serial-byte 89) (%serial-byte 58)"
                          "  (let ((t2 (timer-read-lo)))"
                          "    (print-hex32 t2))"
-                         "  (write-byte 10)"
+                         "  (%serial-byte 10)"
                          ;; === Test 3: Activity LED ===
                          ;; Print "LED:"
-                         "  (write-byte 76) (write-byte 69) (write-byte 68) (write-byte 58)"
+                         "  (%serial-byte 76) (%serial-byte 69) (%serial-byte 68) (%serial-byte 58)"
                          "  (led-init)"
                          "  (led-blink 3 200)"
                          "  (led-on)"
                          ;; Print "OK\n"
-                         "  (write-byte 79) (write-byte 75) (write-byte 10)"
+                         "  (%serial-byte 79) (%serial-byte 75) (%serial-byte 10)"
                          ;; === Test 4: GPU Framebuffer ===
                          ;; Print "FB:"
-                         "  (write-byte 70) (write-byte 66) (write-byte 58)"
+                         "  (%serial-byte 70) (%serial-byte 66) (%serial-byte 58)"
                          "  (let ((fb-addr (fb-init 640 480)))"
                          "    (print-hex32 fb-addr))"
-                         "  (write-byte 10)"
+                         "  (%serial-byte 10)"
                          ;; Draw test pattern: colored rectangles
                          "  (let ((fb-addr (mem-ref (fb-state) :u32)))"
                          "    (when (not (zerop fb-addr))"
@@ -128,8 +128,8 @@
                          ;; Cyan rectangle
                          "      (fb-fill-rect 460 280 160 100 0 255 255)))"
                          ;; Print "DONE\n"
-                         "  (write-byte 68) (write-byte 79) (write-byte 78)"
-                         "  (write-byte 69) (write-byte 10)"
+                         "  (%serial-byte 68) (%serial-byte 79) (%serial-byte 78)"
+                         "  (%serial-byte 69) (%serial-byte 10)"
                          ;; Halt — infinite loop
                          "  (loop (delay-us 1000000)))")))
        (combined-source (concatenate 'string

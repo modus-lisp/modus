@@ -10,7 +10,7 @@
 ;;;;      The bare CL image is ~20 MB and loads at 0x80000, so it ENDS around
 ;;;;      0x1450000 — i.e. the legacy USB DMA base at 0x01000000 sits INSIDE
 ;;;;      the kernel image and the NIC would DMA over native code.  (Exactly the
-;;;;      class build-aarch64.lisp's MODUS_NET_BUILD relocation exists to avoid:
+;;;;      class build-aarch64-ansi.lisp's MODUS_NET_BUILD relocation exists to avoid:
 ;;;;      there the E1000 rings aliased the GC heap and wedged the reader.)
 ;;;;      Every region here is shifted by +0x1F000000 into the large free
 ;;;;      identity-mapped hole between the runtime metadata (ends 0x10200000)
@@ -33,13 +33,13 @@
 ;;;;      native-eval and emit-prompt stubs are dropped: they exist only to
 ;;;;      satisfy mvm/repl-source.lisp, which this image does not load.
 ;;;;
-;;;; WRITE-BYTE.  The net stack's `write-byte' is the legacy 1-arg "put a byte
+;;;; WRITE-BYTE.  The net stack's `%serial-byte' is the legacy 1-arg "put a byte
 ;;;; on the console" primitive, and it is called ~200 times across dwc2.lisp /
 ;;;; usb.lisp / cdc-ether.lisp / ip.lisp / http-client.lisp for their status
 ;;;; output.  CL's WRITE-BYTE (mvm/cl-fileio.lisp) is the 2-arg (byte stream)
 ;;;; function.  In the flat MVM namespace the later definition wins, so this
 ;;;; file's 1-arg version SHADOWS the CL one for the whole image.  That is
-;;;; deliberate and is what build-aarch64.lisp's net build does too; the only
+;;;; deliberate and is what build-aarch64-ansi.lisp's net build does too; the only
 ;;;; casualty is binary-stream output, which a bare-metal image has no
 ;;;; file descriptors for anyway.
 
@@ -62,7 +62,7 @@
 ;; Console byte out.  No capture buffer / suppress flag in this image — the
 ;; serial port is the only console (kernel-main also points *error-output* at
 ;; it), so write straight to the UART.
-(defun write-byte (b)
+(defun %serial-byte (b)
   (write-char-serial b))
 
 ;; Entropy from UART read timing.  Not used by the plain-HTTP path (no crypto
@@ -78,8 +78,8 @@
 ;; Hex printing (cdc-ether prints the MAC with these).
 (defun print-hex-digit (n)
   (if (< n 10)
-      (write-byte (+ n 48))
-      (write-byte (+ n 55))))
+      (%serial-byte (+ n 48))
+      (%serial-byte (+ n 55))))
 
 (defun print-hex-byte (b)
   (let ((hi (logand (ash b -4) 15))

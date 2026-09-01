@@ -153,7 +153,7 @@
     ;; always uses opcodes).
     ("numberp" 1 (obj))
     ;; I/O (different UART/address on each arch)
-    ("write-byte" 1 (b))
+    ("%serial-byte" 1 (b))
     ("io-delay" 0 ())
     ("arch-seed-random" 0 ())
     ;; DWC2 register helpers (bit 30/31 overflow on 31-bit fixnum)

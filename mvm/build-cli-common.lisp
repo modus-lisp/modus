@@ -149,7 +149,7 @@
 ;; Strip `chipz::' / `chipz:' package qualifiers from a source string so the
 ;; flat-namespace image reader doesn't error `Package CHIPZ does not exist'
 ;; (which would silently drop the whole enclosing form).  Longer prefix first.
-;; Mirrors build-aarch64.lisp's strip-package-prefixes.  Used ONLY for baking
+;; Mirrors build-aarch64-ansi.lisp's strip-package-prefixes.  Used ONLY for baking
 ;; lib/install-tarball.lisp — see the *bridge-source* note.
 (defun %cli-strip-one-prefix (text pfx)
   (let ((result text))
@@ -560,7 +560,8 @@
 (defun %jit-enabled-p () (and (boundp (quote *use-jit*)) *use-jit*))
 ")
     (t
-     "
+     (concatenate 'string
+      "
 (defun %jit-boot-init ()
   (%init-aarch64-translator)
   (setq *aarch64-jit-mode* t)
@@ -590,8 +591,32 @@
     ;; x28 (the trampoline VA) is loaded once at boot by the Linux entry.
     ;; Mirrors build-rpi-cl-repl.lisp:884-888, which does these setqs at
     ;; runtime for the board image.
-    (setq *aarch64-linux-mode* t)
-    (setq *aarch64-gc-native-mcgc* t)
+"
+      ;; *AARCH64-LINUX-MODE* IS NOT ONE OF THE UNIVERSAL FLAGS.  The other four
+      ;; settings in this block are the same on every aarch64 target; this one
+      ;; selects which TRAP ARM the runtime translator emits, and on bare metal
+      ;; the Linux arm is a syscall instruction with no kernel to service it.
+      ;;
+      ;; Found 2026-08-31 on QEMU virt.  build-cl-repl-common's
+      ;; *RPI-JIT-COINIT-OVERRIDE* correctly sets it NIL — and then THIS defun,
+      ;; which CALLS %init-aarch64-translator as its first act and runs the
+      ;; setqs after, put it straight back to T.  Net effect on both bare-metal
+      ;; aarch64 images: every runtime-JIT'd (write-char-serial c) emitted
+      ;; `svc #0` (write(2)) instead of a UART store, and %mmap-exec-page's
+      ;; runtime arm emitted mmap.  The image's BAKED code is unaffected (the
+      ;; host flag is NIL for these builds), so it only bites code the JIT
+      ;; emits — which is why it stayed invisible while the JIT was translating
+      ;; nothing.  Symptom once the constvec fix let the JIT engage: the probe
+      ;; printed everything routed through baked DEFUNs and then died at the
+      ;; first JIT-INLINED intrinsic, PROGRAM-ERROR from the SVC's exception.
+      (if *cli-bare-metal*
+          "    ;; BARE METAL: no OS to service an SVC — keep the bare-metal
+    ;; trap arms (UART MMIO store, bump-allocated exec pages).
+    (setq *aarch64-linux-mode* nil)
+"
+          "    (setq *aarch64-linux-mode* t)
+")
+      "    (setq *aarch64-gc-native-mcgc* t)
     (setq *aarch64-gc-trampoline-label* 1)
     ;; #282 layer 2: route JIT-mode li-const through the GC-updated constant
     ;; VECTOR instead of baking the pool object's heap address into the
@@ -609,7 +634,7 @@
   (setq *use-jit* t)
   t)
 (defun %jit-enabled-p () (and (boundp (quote *use-jit*)) *use-jit*))
-")))
+"))))
 
 (defvar *stage2-test-source* "
 ;; Multiply overflow promotion regression probes (compiled native mul-checked).

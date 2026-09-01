@@ -787,7 +787,7 @@
 (defconstant +tdk-stack-va+      #x08000000)  ; Stack top (outside image)
 
 ;; NIL register (x26) init value for the fixpoint entry.  Legacy fixpoint
-;; builds use 0; the bare-metal AArch64 ANSI runner (build-aarch64.lisp)
+;; builds use 0; the bare-metal AArch64 ANSI runner (build-aarch64-ansi.lisp)
 ;; sets #xDEAD0001 to match the modern compiler's +nil-value+ (compiled
 ;; literals and interp.lisp's truthiness both key on that exact bit
 ;; pattern).  Default 0 keeps existing fixpoint builds byte-identical.
@@ -1128,16 +1128,70 @@
     ;; 12. ISB (synchronize context)
     (emit-aarch64-u32 buf #xD5033FDF)            ; ISB
 
-    ;; 13. Enable MMU: SCTLR_EL1 |= M (bit 0) | C (bit 2) | I (bit 12)
-    ;;     Read SCTLR_EL1, OR with 0x1005, write back
+    ;; 13. Enable MMU: SCTLR_EL1 |= M (bit 0) | C (bit 2) | I (bit 12),
+    ;;     and CLEAR SA (bit 3) — see below.
+    ;;     Read SCTLR_EL1, OR with 0x1005, BIC 0x8, write back
     (emit-aarch64-u32 buf #xD5381000)            ; MRS X0, SCTLR_EL1
     (emit-aarch64-load-imm64 buf x1 #x1005)
     ;; ORR X0, X0, X1
     ;; sf=1 opc=01 01010 shift=00 N=0 Rm=X1 imm6=0 Rn=X0 Rd=X0
     (emit-aarch64-u32 buf #xAA010000)
+    ;; SCTLR_EL1.SA (bit 3) = 0 — DISABLE the EL1 SP-alignment check.
+    ;;
+    ;; NOT cosmetic, and QEMU TCG cannot see the bug this fixes.  Modus's
+    ;; bare-metal AArch64 stack discipline is deliberately EIGHT bytes:
+    ;; *aarch64-stack-align-16* is NIL for these images (set at
+    ;; build-cl-repl-common.lisp:1282), so :push/:pop emit the single-word
+    ;; STR Xs,[SP,#-8]! / LDR Xd,[SP],#8 form and SP is 8-mod-16 for half of
+    ;; its life.  The handler frame layout (fork-file et al.) depends on that
+    ;; single-word stride, so the stack discipline is a deliberate choice, not
+    ;; an oversight — but a choice the CPU has to be TOLD about.  SCTLR_EL1.SA
+    ;; is architecturally UNKNOWN at reset and this code previously only OR'd
+    ;; bits in, so whatever the entry environment left there survived.
+    ;;
+    ;; With SA=1 at EL1, any SP-relative load/store with a misaligned SP raises
+    ;; an SP alignment fault (ESR_EL1 EC=0x26).  QEMU TCG does not implement
+    ;; that check, so every QEMU run has been silently forgiving it; REAL ARM
+    ;; silicon is not.  Measured on a Pi 5 under -accel kvm: the guest died
+    ;; before printing one byte, PC parked in the fault catcher's `b .`, with
+    ;;   ESR_EL1 = 0x9a000000  -> EC = 0x26, SP alignment fault
+    ;;   ELR_EL1 = 0x43526308  -> the faulting PC, inside the image
+    ;;   FAR_EL1 = 0x07fffba8  -> equals SP, and is 8 mod 16
+    ;; (SCTLR_EL1 itself reads back `void` over QEMU's gdbstub, so the ESR is
+    ;; the evidence that the check was enabled, not a direct read of the bit.)
+    ;;
+    ;; The Pi Zero 2 W image escaped this only because boot-rpi-cl runs at EL2,
+    ;; where the governing bit is SCTLR_EL2.SA and the firmware left it clear.
+    ;; This image runs at EL1, so it must clear SA itself.
+    (emit-aarch64-load-imm64 buf x1 #x8)
+    (emit-aarch64-u32 buf #x8A210000)            ; BIC X0, X0, X1
     (emit-aarch64-u32 buf #xD5181000)            ; MSR SCTLR_EL1, X0
 
     ;; 14. ISB (ensure MMU is active for next instruction)
+    (emit-aarch64-u32 buf #xD5033FDF)            ; ISB
+
+    ;; 15. Enable FP/SIMD: CPACR_EL1.FPEN (bits 21:20) = 0b11.
+    ;;
+    ;; NOT optional, and its absence is silent-but-fatal.  At EL1 reset FPEN=00
+    ;; TRAPS every FP/SIMD instruction, and translate-aarch64 emits real ones
+    ;; (a64-fadd-d / a64-fmul-d / a64-fdiv-d / a64-scvtf-d-x, ~line 1005+).  So
+    ;; on bare metal EVERY float operation trapped.  The visible symptom was far
+    ;; away from the cause: the READER could not read a float literal, `read`
+    ;; signalled PROGRAM-ERROR, install-tarball treats a read error as
+    ;; end-of-file, and so a library file silently TRUNCATED at its first float
+    ;; while the installer still reported "done".  pagetree/src/btree.lisp died
+    ;; at line 1040 — its first float — losing every definition after it.
+    ;;
+    ;; Hosted images never showed this because Linux enables FP for userspace.
+    ;; Nothing in this tree wrote CPACR_EL1 before now, so this applies to every
+    ;; bare-metal AArch64 image, the Raspberry Pi boot included.
+    ;;
+    ;; Must precede any FP instruction; here is the earliest safe point after
+    ;; the MMU is live.  CPACR_EL1 is S3_0_C1_C0_2.
+    (emit-aarch64-u32 buf #xD5381040)            ; MRS X0, CPACR_EL1
+    (emit-aarch64-load-imm64 buf x1 #x300000)    ; FPEN = 0b11 -> bits 21:20
+    (emit-aarch64-u32 buf #xAA010000)            ; ORR X0, X0, X1
+    (emit-aarch64-u32 buf #xD5181040)            ; MSR CPACR_EL1, X0
     (emit-aarch64-u32 buf #xD5033FDF)            ; ISB
 
     ;; ================================================================

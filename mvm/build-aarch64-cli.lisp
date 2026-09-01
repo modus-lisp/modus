@@ -75,9 +75,18 @@
 (defun %argv1 () (%argv-string-at #x10000208))
 (defun %argv2 () (%argv-string-at #x10000248))
 (defun %argc  () (mem-ref #x10000200 :u32))
-(defun %hc-depth () (mem-ref #x10000400 :u32))
+;; AArch64 handler-stack geometry differs from x64 and these observers were
+;; COPIED FROM THE x64 BUILD UNCHANGED, so they read the wrong memory:
+;;   x64      depth @ 0x10000400, frames @ 0x10000408 + 32*N  (32-byte frames)
+;;   aarch64  depth @ 0x10010000, frames @ 0x10010008 + 24*N  (24-byte frames)
+;; (translate-aarch64.lisp:4892 documents the AArch64 layout; the x64 numbers
+;; are at translate-x64.lisp:4716.)  Every aarch64 handler-depth measurement
+;; taken before 2026-08-31 read address 0x10000400, which is NOT the depth slot
+;; on this target -- those readings were meaningless.  The two slots that ARE
+;; shared (current handler state 0x10000180/190) were already correct.
+(defun %hc-depth () (mem-ref #x10010000 :u32))
 (defun %hc-armed-p () (if (eql (mem-ref #x10000180 :u32) 0) nil t))
-(defun %hc-frame-ip (n) (mem-ref (+ #x10000408 (* 32 n) 16) :u32))
+(defun %hc-frame-ip (n) (mem-ref (+ #x10010008 (* 24 n) 16) :u32))
 (defun %hc-cur-ip () (mem-ref #x10000190 :u32))
 
 ;; WS5 #203: TRUE when argv[1] parses as a nonzero decimal, i.e. this run

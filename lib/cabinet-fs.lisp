@@ -160,7 +160,7 @@
                                             a (type-of c))
                                     (finish-output))))
                               0))
-      ((eq op :write-byte) (%cabfs-write-byte a b c))
+      ((eq op :%serial-byte) (%cabfs-write-byte a b c))
       ((eq op :mkdir)  (handler-case (progn (funcall *cf-mkdir* *cabfs* a) 0)
                          (error () 0)))
       ((eq op :unlink) (progn (%cabfs-flush-all) (%cabfs-rcache-drop nil)

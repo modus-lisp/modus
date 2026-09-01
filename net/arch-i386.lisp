@@ -40,8 +40,8 @@
 ;; Hex printing utilities
 (defun print-hex-digit (n)
   (if (< n 10)
-      (write-byte (+ n 48))
-      (write-byte (+ n 55))))
+      (%serial-byte (+ n 48))
+      (%serial-byte (+ n 55))))
 
 (defun print-hex-byte (b)
   (let ((hi (logand (ash b -4) 15))
@@ -60,8 +60,8 @@
   (setup-irq)
   (setf (mem-ref #x600010 :u32) 1))
 
-;; write-byte: capture-aware for SSH output routing
-(defun write-byte (b)
+;; %serial-byte: capture-aware for SSH output routing
+(defun %serial-byte (b)
   (let ((flags (mem-ref (+ #x540000 #x14) :u32)))
     (when (zerop (logand flags 2))
       (write-char-serial b))
@@ -75,7 +75,7 @@
 (defun print-dec (n)
   (when (>= n 10)
     (print-dec (truncate n 10)))
-  (write-byte (+ (mod n 10) 48)))
+  (%serial-byte (+ (mod n 10) 48)))
 
 ;; buf-read-u32-mem, buf-read-u32, ssh-get-u32, htonl overrides
 ;; are in 32bit-overrides.lisp (loaded LAST, after ip.lisp/ssh.lisp)
@@ -97,8 +97,8 @@
 ;; Prompt
 (defun emit-prompt ()
   (if (zerop (mem-ref (+ #x540000 #x12A00) :u64))
-      (progn (write-byte 62) (write-byte 32))
+      (progn (%serial-byte 62) (%serial-byte 32))
       (progn
-        (write-byte 109) (write-byte 111)
-        (write-byte 100) (write-byte 117)
-        (write-byte 115) (write-byte 62) (write-byte 32))))
+        (%serial-byte 109) (%serial-byte 111)
+        (%serial-byte 100) (%serial-byte 117)
+        (%serial-byte 115) (%serial-byte 62) (%serial-byte 32))))

@@ -346,17 +346,17 @@
   (dwc2-delay-ms 100)
 
   ;; Print status
-  (write-byte 68) (write-byte 87) (write-byte 67)   ; "DWC"
-  (write-byte 50) (write-byte 58)                    ; "2:"
+  (%serial-byte 68) (%serial-byte 87) (%serial-byte 67)   ; "DWC"
+  (%serial-byte 50) (%serial-byte 58)                    ; "2:"
 
   ;; Check port connect
   (let ((hprt (dwc2-read (dwc2-hprt0))))
     (if (not (zerop (logand hprt (hprt0-prtconnsts))))
         (progn
-          (write-byte 79) (write-byte 75) (write-byte 10)  ; "OK\n"
+          (%serial-byte 79) (%serial-byte 75) (%serial-byte 10)  ; "OK\n"
           1)
         (progn
-          (write-byte 78) (write-byte 67) (write-byte 10)  ; "NC\n"
+          (%serial-byte 78) (%serial-byte 67) (%serial-byte 10)  ; "NC\n"
           0))))
 
 ;; ============================================================
@@ -414,16 +414,16 @@
                 (logior (dwc2-hprt0-read-safe)
                         (hprt0-prtenchng) (hprt0-prtconndet)))
     ;; Print speed
-    (write-byte 80) (write-byte 79) (write-byte 82) (write-byte 84)  ; "PORT"
-    (write-byte 58)  ; ":"
+    (%serial-byte 80) (%serial-byte 79) (%serial-byte 82) (%serial-byte 84)  ; "PORT"
+    (%serial-byte 58)  ; ":"
     (if (eq result 1)
-        (progn (write-byte 70) (write-byte 83))    ; "FS"
+        (progn (%serial-byte 70) (%serial-byte 83))    ; "FS"
         (if (eq result 0)
-            (progn (write-byte 72) (write-byte 83)) ; "HS"
+            (progn (%serial-byte 72) (%serial-byte 83)) ; "HS"
             (if (eq result 2)
-                (progn (write-byte 76) (write-byte 83)) ; "LS"
-                (write-byte 63))))                        ; "?"
-    (write-byte 10)
+                (progn (%serial-byte 76) (%serial-byte 83)) ; "LS"
+                (%serial-byte 63))))                        ; "?"
+    (%serial-byte 10)
     result))
 
 ;; ============================================================

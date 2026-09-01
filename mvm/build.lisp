@@ -117,7 +117,18 @@
     ("x64/bare/qemu/ansi"     :x64     :bare   :qemu :ansi
      :legacy nil :x64     "/tmp/modus-x64-ansi.bin"        "build-x64")
     ("aarch64/bare/qemu/ansi" :aarch64 :bare   :qemu :ansi
-     :legacy nil :aarch64 "/tmp/modus-aarch64-ansi.bin"    "build-aarch64")
+     :legacy nil :aarch64 "/tmp/modus-aarch64-ansi.bin"    "build-aarch64-ansi")
+    ;; The CLEAN QEMU-virt counterpart of the cl-repl cell below: the SAME
+    ;; CL/mvm image (build-cl-repl-common.lisp), booted through
+    ;; boot/boot-aarch64.lisp's fixpoint MMU descriptor instead of the Pi's, and
+    ;; networked over PCI/E1000 instead of DWC2/USB.  Bakes NO test corpus —
+    ;; that is the `ansi' cell directly above, which is a different lineage.
+    ("aarch64/bare/qemu/cl-repl" :aarch64 :bare :qemu :cl-repl
+     :legacy nil :aarch64 "/tmp/modus-aarch64-cl-repl.bin" "build-aarch64")
+    ;; Same script with MODUS_NET_BUILD=1 — see *CELL-ENV*, and see the
+    ;; aarch64/bare/rpi/cl-net comment for what the flag turns on.
+    ("aarch64/bare/qemu/cl-net" :aarch64 :bare :qemu :cl-net
+     :legacy nil :aarch64 "/tmp/modus-aarch64-cl-net.bin" "build-aarch64")
 
     ;; ---------------- bare / rpi ----------------
     ;; #209 rung 1 LANDED: the RPi family's migration onto the CL/mvm image.
@@ -237,7 +248,16 @@
     ;; MODUS_NET_URL selects what the boot pipeline fetches.
     ("aarch64/bare/rpi/cl-net"
      ("MODUS_NET_BUILD"   . "1")
-     ("MODUS_CL_REPL_OUT" . "/tmp/piboot/kernel8-net.img"))))
+     ("MODUS_CL_REPL_OUT" . "/tmp/piboot/kernel8-net.img"))
+    ;; The QEMU-virt sibling of the row above.  MODUS_NET_BUFSZ is NOT optional
+    ;; for a real library: %net-resp-cap is baked at BUILD time and past the cap
+    ;; tcp-rx-copy silently DROPS bytes while the log still prints the full
+    ;; "FETCHED bytes=" length, so an 88%-zero-filled tarball presents as a wild
+    ;; -pointer data abort deep inside arithmetic.  400000 covers alexandria.
+    ("aarch64/bare/qemu/cl-net"
+     ("MODUS_NET_BUILD"   . "1")
+     ("MODUS_NET_BUFSZ"   . "400000")
+     ("MODUS_CL_REPL_OUT" . "/tmp/modus-aarch64-cl-net.bin"))))
 
 (defun apply-cell-env (key)
   (let ((entry (assoc key *cell-env* :test #'string-equal)))
@@ -405,18 +425,18 @@
                          "                (ssh-message-loop ssh)))))))))"
                          ;; Split kernel-main into phases to stay under ~25 sequential forms limit
                          "(defun km-init-crypto ()"
-                         "  (write-byte 91) (write-byte 49) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 49) (%serial-byte 93)"
                          "  (sha256-init)"
-                         "  (write-byte 91) (write-byte 50) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 50) (%serial-byte 93)"
                          "  (sha512-init)"
-                         "  (write-byte 91) (write-byte 51) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 51) (%serial-byte 93)"
                          "  (ed25519-init)"
-                         "  (write-byte 91) (write-byte 52) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 52) (%serial-byte 93)"
                          "  (ssh-seed-random) 0)"
                          "(defun km-init-net ()"
-                         "  (write-byte 91) (write-byte 53) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 53) (%serial-byte 93)"
                          "  (dhcp-client)"
-                         "  (write-byte 91) (write-byte 54) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 54) (%serial-byte 93)"
                          "  (ssh-seed-random)"
                          "  (ssh-init-strings) 0)"
                          "(defun km-set-host-key ()"
@@ -436,7 +456,7 @@
                          "    (setf (mem-ref (+ state #x624) :u32) 1)) 0)"
                          ;; kernel-main: init hardware + crypto, then delegate to ssh-server
                          "(defun kernel-main ()"
-                         "  (write-byte 90) (write-byte 90) (write-byte 90) (write-byte 10)"
+                         "  (%serial-byte 90) (%serial-byte 90) (%serial-byte 90) (%serial-byte 10)"
                          "  (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 0)"
                          "  (pci-assign-bars)"
                          "  (e1000-probe)"
@@ -454,13 +474,13 @@
   '(
                          ;; Split kernel-main to stay under ~25 sequential forms per function
                          "(defun km-init-crypto ()"
-                         "  (write-byte 91) (write-byte 49) (write-byte 93) (sha256-init)"
-                         "  (write-byte 91) (write-byte 50) (write-byte 93) (sha512-init)"
-                         "  (write-byte 91) (write-byte 51) (write-byte 93) (ed25519-init)"
-                         "  (write-byte 91) (write-byte 52) (write-byte 93) (ssh-seed-random) 0)"
+                         "  (%serial-byte 91) (%serial-byte 49) (%serial-byte 93) (sha256-init)"
+                         "  (%serial-byte 91) (%serial-byte 50) (%serial-byte 93) (sha512-init)"
+                         "  (%serial-byte 91) (%serial-byte 51) (%serial-byte 93) (ed25519-init)"
+                         "  (%serial-byte 91) (%serial-byte 52) (%serial-byte 93) (ssh-seed-random) 0)"
                          "(defun km-init-net ()"
-                         "  (write-byte 91) (write-byte 53) (write-byte 93) (dhcp-client)"
-                         "  (write-byte 91) (write-byte 54) (write-byte 93) (ssh-seed-random)"
+                         "  (%serial-byte 91) (%serial-byte 53) (%serial-byte 93) (dhcp-client)"
+                         "  (%serial-byte 91) (%serial-byte 54) (%serial-byte 93) (ssh-seed-random)"
                          "  (ssh-init-strings) 0)"
                          "(defun km-set-host-key ()"
                          "  (let ((state (e1000-state-base)))"
@@ -509,8 +529,8 @@
                          "  (km-init-net)"
                          "  (km-set-host-key)"
                          "  (pre-compute-host-sign)"
-                         "  (write-byte 83) (write-byte 83) (write-byte 72)"
-                         "  (write-byte 58) (print-dec 22) (write-byte 10)"
+                         "  (%serial-byte 83) (%serial-byte 83) (%serial-byte 72)"
+                         "  (%serial-byte 58) (print-dec 22) (%serial-byte 10)"
                          "  (km-init-conns)"
                          "  (km-set-eph-priv) (km-set-eph-pub)"
                          "  (enable-gic-timer)"
@@ -526,17 +546,17 @@
                          "  (setf (mem-ref (+ (ssh-ipc-base) #x60000) :u64) 0)"
                          "  (pci-assign-bars)"
                          "  (e1000-probe)"
-                         "  (write-byte 91) (write-byte 49) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 49) (%serial-byte 93)"
                          "  (sha256-init)"
-                         "  (write-byte 91) (write-byte 50) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 50) (%serial-byte 93)"
                          "  (sha512-init)"
-                         "  (write-byte 91) (write-byte 51) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 51) (%serial-byte 93)"
                          "  (ed25519-init)"
-                         "  (write-byte 91) (write-byte 52) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 52) (%serial-byte 93)"
                          "  (ssh-seed-random)"
-                         "  (write-byte 91) (write-byte 53) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 53) (%serial-byte 93)"
                          "  (dhcp-client)"
-                         "  (write-byte 91) (write-byte 54) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 54) (%serial-byte 93)"
                          "  (ssh-seed-random)"
                          "  (ssh-init-strings)"
                          ;; Embed pre-computed Ed25519 host key
@@ -556,8 +576,8 @@
                          "    (setf (mem-ref (+ state #x624) :u32) 1))"
                          ;; Pre-compute ed25519 host key derivatives (s, prefix)
                          "  (pre-compute-host-sign)"
-                         "  (write-byte 83) (write-byte 83) (write-byte 72)"
-                         "  (write-byte 58) (print-dec 22) (write-byte 10)"
+                         "  (%serial-byte 83) (%serial-byte 83) (%serial-byte 72)"
+                         "  (%serial-byte 58) (print-dec 22) (%serial-byte 10)"
                          "  (setf (mem-ref (+ (ssh-ipc-base) #x60438) :u32) 22)"
                          "  (let ((i 0))"
                          "    (loop"

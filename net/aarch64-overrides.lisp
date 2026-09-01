@@ -24,19 +24,19 @@
       (edit-set-line-len (+ len 1))
       (edit-set-cursor-pos (+ pos 1))
       ;; Echo: print from cursor to end, then move cursor back
-      (write-byte b)
+      (%serial-byte b)
       (let ((i (+ pos 1)))
         (loop
           (when (>= i (+ len 1)) (return 0))
-          (write-byte (mem-ref (+ (+ (ssh-ipc-base) #x28) i) :u8))
+          (%serial-byte (mem-ref (+ (+ (ssh-ipc-base) #x28) i) :u8))
           (setq i (+ i 1))))
       ;; Move cursor back to just after inserted char
       (let ((tail (- len pos)))
         (when (> tail 0)
           ;; ESC [ <n> D — cursor left
-          (write-byte 27) (write-byte 91)
+          (%serial-byte 27) (%serial-byte 91)
           (print-dec tail)
-          (write-byte 68))))))
+          (%serial-byte 68))))))
 
 ;; Delete byte before cursor (backspace)
 (defun line-delete-back ()
@@ -54,19 +54,19 @@
         (edit-set-line-len (- len 1))
         (edit-set-cursor-pos new-pos)
         ;; Erase: move left, reprint tail, space over old last char, reposition
-        (write-byte 8)  ; backspace
+        (%serial-byte 8)  ; backspace
         (let ((i new-pos))
           (loop
             (when (>= i (- len 1)) (return 0))
-            (write-byte (mem-ref (+ (+ (ssh-ipc-base) #x28) i) :u8))
+            (%serial-byte (mem-ref (+ (+ (ssh-ipc-base) #x28) i) :u8))
             (setq i (+ i 1))))
-        (write-byte 32)  ; space over old last char
+        (%serial-byte 32)  ; space over old last char
         ;; Move cursor back
         (let ((back (- len new-pos)))
           (when (> back 0)
-            (write-byte 27) (write-byte 91)
+            (%serial-byte 27) (%serial-byte 91)
             (print-dec back)
-            (write-byte 68)))))))
+            (%serial-byte 68)))))))
 
 ;; Process a single byte of input for line editing
 ;; Returns: 1 = enter pressed, 2 = ctrl-d, nil = continue
@@ -85,11 +85,11 @@
               (if (eq b 67)  ; right arrow
                   (when (< (edit-cursor-pos) (edit-line-len))
                     (edit-set-cursor-pos (+ (edit-cursor-pos) 1))
-                    (write-byte 27) (write-byte 91) (write-byte 67))
+                    (%serial-byte 27) (%serial-byte 91) (%serial-byte 67))
                   (when (eq b 68)  ; left arrow
                     (when (> (edit-cursor-pos) 0)
                       (edit-set-cursor-pos (- (edit-cursor-pos) 1))
-                      (write-byte 27) (write-byte 91) (write-byte 68)))))
+                      (%serial-byte 27) (%serial-byte 91) (%serial-byte 68)))))
             (if (> esc 2)
                 ;; Absorb extended escape sequences
                 (if (>= b 64)
@@ -113,7 +113,7 @@
                                 (if (eq b 3)
                                     ;; Ctrl-C: cancel line
                                     (progn
-                                      (write-byte 94) (write-byte 67) (write-byte 10)
+                                      (%serial-byte 94) (%serial-byte 67) (%serial-byte 10)
                                       (edit-set-line-len 0)
                                       (edit-set-cursor-pos 0)
                                       (emit-prompt))
@@ -121,10 +121,10 @@
                                         ;; Ctrl-U: clear line
                                         (progn
                                           (when (> (edit-cursor-pos) 0)
-                                            (write-byte 27) (write-byte 91)
+                                            (%serial-byte 27) (%serial-byte 91)
                                             (print-dec (edit-cursor-pos))
-                                            (write-byte 68))
-                                          (write-byte 27) (write-byte 91) (write-byte 75)
+                                            (%serial-byte 68))
+                                          (%serial-byte 27) (%serial-byte 91) (%serial-byte 75)
                                           (edit-set-line-len 0)
                                           (edit-set-cursor-pos 0))
                                         ;; Printable character
@@ -255,22 +255,22 @@
           new-g)
         g)))
 
-;; Print an s-expression via write-byte (capture-aware)
-;; write-byte aware decimal print (not write-char-serial like prelude's print-dec)
+;; Print an s-expression via %serial-byte (capture-aware)
+;; %serial-byte aware decimal print (not write-char-serial like prelude's print-dec)
 (defun ssh-print-dec (n)
   (if (< n 10)
-      (write-byte (+ 48 n))
+      (%serial-byte (+ 48 n))
       (let ((q (truncate n 10)))
         (let ((r (- n (* q 10))))
           (ssh-print-dec q)
-          (write-byte (+ 48 r))))))
+          (%serial-byte (+ 48 r))))))
 
 (defun ssh-print-sexp (x)
   (if (null x)
-      (progn (write-byte 78) (write-byte 73) (write-byte 76))
+      (progn (%serial-byte 78) (%serial-byte 73) (%serial-byte 76))
       (if (fixnump x)
           (if (< x 0)
-              (progn (write-byte 45) (ssh-print-dec (- 0 x)))
+              (progn (%serial-byte 45) (ssh-print-dec (- 0 x)))
               (ssh-print-dec x))
           (if (consp x)
               (if (eq (car x) 9999)
@@ -278,33 +278,33 @@
                   (ssh-print-chars (cdr x))
                   ;; List
                   (progn
-                    (write-byte 40)
+                    (%serial-byte 40)
                     (ssh-print-sexp (car x))
                     (ssh-print-list-tail (cdr x))))
-              (write-byte 63)))))
+              (%serial-byte 63)))))
 
 (defun ssh-print-list-tail (xs)
   (if (null xs)
-      (write-byte 41)
+      (%serial-byte 41)
       (if (consp xs)
           (if (eq (car xs) 9999)
               ;; Improper list ending in symbol
               (progn
-                (write-byte 32) (write-byte 46) (write-byte 32)
+                (%serial-byte 32) (%serial-byte 46) (%serial-byte 32)
                 (ssh-print-chars (cdr xs))
-                (write-byte 41))
+                (%serial-byte 41))
               (progn
-                (write-byte 32)
+                (%serial-byte 32)
                 (ssh-print-sexp (car xs))
                 (ssh-print-list-tail (cdr xs))))
           (progn
-            (write-byte 32) (write-byte 46) (write-byte 32)
+            (%serial-byte 32) (%serial-byte 46) (%serial-byte 32)
             (ssh-print-sexp xs)
-            (write-byte 41)))))
+            (%serial-byte 41)))))
 
 (defun ssh-print-chars (chars)
   (when (consp chars)
-    (write-byte (car chars))
+    (%serial-byte (car chars))
     (ssh-print-chars (cdr chars))))
 
 ;; Override ssh-do-eval-expr: use buffer reader instead of read-list
@@ -321,10 +321,10 @@
           ;; Enable capture for output
           (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 3)
           (setf (mem-ref (+ (ssh-ipc-base) #x18) :u32) 0)
-          (write-byte 10)
-          (write-byte 61) (write-byte 32)
+          (%serial-byte 10)
+          (%serial-byte 61) (%serial-byte 32)
           (ssh-print-sexp result)
-          (write-byte 10)
+          (%serial-byte 10)
           ;; Flush captured output
           (let ((out-len (mem-ref (+ (ssh-ipc-base) #x18) :u32)))
             (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 0)
@@ -469,8 +469,8 @@
   ;; No GC helper on AArch64 (no native eval at runtime)
   (when (zerop (mem-ref (+ (e1000-state-base) #x624) :u32))
     (ssh-use-default-key))
-  (write-byte 83) (write-byte 83) (write-byte 72)
-  (write-byte 58) (print-dec port) (write-byte 10)
+  (%serial-byte 83) (%serial-byte 83) (%serial-byte 72)
+  (%serial-byte 58) (print-dec port) (%serial-byte 10)
   ;; Store listen port
   (setf (mem-ref (+ (ssh-ipc-base) #x60438) :u32) port)
   ;; Clear connection table

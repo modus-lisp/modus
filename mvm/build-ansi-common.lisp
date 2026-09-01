@@ -5,7 +5,7 @@
 ;;;;   build-x64-linux.lisp      (nil :x64)     — Linux ELF, the 64-shard gate
 ;;;;   build-x64.lisp            (t   :x64)     — bare-metal multiboot kernel (QEMU)
 ;;;;   build-aarch64-linux.lisp  (nil :aarch64) — Linux AArch64 ELF gate
-;;;;   build-aarch64.lisp        (t   :aarch64) — bare-metal AArch64 (QEMU virt)
+;;;;   build-aarch64-ansi.lisp        (t   :aarch64) — bare-metal AArch64 (QEMU virt)
 ;;;;
 ;;;; This file holds everything the four share: load the MVM system, read the
 ;;;; first-party + mvm-eval sources, all the build-time transforms (chunking,

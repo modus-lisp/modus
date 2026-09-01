@@ -222,12 +222,12 @@
   (sha256-init)
   (let ((hash (sha256 (make-array 0))))
     ;; Print "S:" then first 4 bytes as hex
-    (write-byte 83) (write-byte 58)
+    (%serial-byte 83) (%serial-byte 58)
     (print-hex-byte (aref hash 0))
     (print-hex-byte (aref hash 1))
     (print-hex-byte (aref hash 2))
     (print-hex-byte (aref hash 3))
-    (write-byte 10)
+    (%serial-byte 10)
     hash))
 
 ;; ================================================================
@@ -367,15 +367,15 @@
     (dotimes (i 32) (aset key i i))
     (aset nonce 7 #x4a)
     ;; Debug: print before chacha-block
-    (write-byte 67) (write-byte 49)  ; "C1"
+    (%serial-byte 67) (%serial-byte 49)  ; "C1"
     (let ((ks (chacha-block key nonce 1)))
       ;; Print "C:" then first 4 keystream bytes
-      (write-byte 67) (write-byte 58)
+      (%serial-byte 67) (%serial-byte 58)
       (print-hex-byte (aref ks 0))
       (print-hex-byte (aref ks 1))
       (print-hex-byte (aref ks 2))
       (print-hex-byte (aref ks 3))
-      (write-byte 10))))
+      (%serial-byte 10))))
 
 ;; Phase 7.5: Poly1305
 
@@ -555,7 +555,7 @@
   (let ((key (make-array 32))
         (msg (make-array 34)))
     ;; Print "P:"
-    (write-byte 80) (write-byte 58)
+    (%serial-byte 80) (%serial-byte 58)
     (aset key 0 #x85) (aset key 1 #xd6) (aset key 2 #xbe) (aset key 3 #x78)
     (aset key 4 #x57) (aset key 5 #x55) (aset key 6 #x6d) (aset key 7 #x33)
     (aset key 8 #x7f) (aset key 9 #x44) (aset key 10 #x52) (aset key 11 #xfe)
@@ -580,7 +580,7 @@
       (print-hex-byte (aref mac 1))
       (print-hex-byte (aref mac 2))
       (print-hex-byte (aref mac 3))
-      (write-byte 10))))
+      (%serial-byte 10))))
 
 ;; Phase 7.5: X25519 - Donna representation (alternating 26/25-bit limbs)
 ;; Field element: 40-byte array (10 x 4 bytes), total 255 bits
@@ -1026,12 +1026,12 @@
     ;; Expected: 8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a
     (let ((pub (x25519-public-key priv)))
       ;; Print "X:" then first 4 bytes hex
-      (write-byte 88) (write-byte 58)
+      (%serial-byte 88) (%serial-byte 58)
       (print-hex-byte (aref pub 0))
       (print-hex-byte (aref pub 1))
       (print-hex-byte (aref pub 2))
       (print-hex-byte (aref pub 3))
-      (write-byte 10))))
+      (%serial-byte 10))))
 
 ;; ================================================================
 ;; Phase 7.6: SHA-512
@@ -1338,12 +1338,12 @@
 (defun sha512-test ()
   (sha512-init)
   (let ((hash (sha512 (make-array 0))))
-    (write-byte 72) (write-byte 58)
+    (%serial-byte 72) (%serial-byte 58)
     (print-hex-byte (aref hash 0))
     (print-hex-byte (aref hash 1))
     (print-hex-byte (aref hash 2))
     (print-hex-byte (aref hash 3))
-    (write-byte 10)
+    (%serial-byte 10)
     hash))
 
 ;; ================================================================
@@ -1433,7 +1433,7 @@
 (defun ed25519-init ()
   ;; Check init flag
   (when (zerop (mem-ref (+ (e1000-state-base) #x5D0) :u32))
-    (write-byte 69) (write-byte 73)  ; "EI"
+    (%serial-byte 69) (%serial-byte 73)  ; "EI"
     ;; All constants precomputed at build time (no fe-invert needed!)
     ;; d = -121665/121666 mod p (10 x 26/25-bit limbs)
     (setf (mem-ref (+ (e1000-state-base) #x500) :u32) 56195235)
@@ -1501,7 +1501,7 @@
     (setf (mem-ref (+ (e1000-state-base) #x5CE) :u8) #xde) (setf (mem-ref (+ (e1000-state-base) #x5CF) :u8) #x14)
     ;; Set init flag
     (setf (mem-ref (+ (e1000-state-base) #x5D0) :u32) 1)
-    (write-byte 10)))  ; newline
+    (%serial-byte 10)))  ; newline
 
 ;; Recover x from y and sign bit on Ed25519 curve
 ;; sign: 0 = even, non-zero = odd
@@ -1986,33 +1986,33 @@
 ;; Private key: all zeros
 ;; Expected public key: 3b6a27bc ceb6a42d ...
 (defun ed25519-test ()
-  (write-byte 69) (write-byte 84)  ; "ET"
+  (%serial-byte 69) (%serial-byte 84)  ; "ET"
   (let ((privkey (make-array 32)))
     ;; All zeros private key (must zero - make-array doesn't on real hardware)
     (dotimes (i 32) (aset privkey i 0))
     (let ((pubkey (ed25519-public-key privkey)))
       ;; Print first 4 bytes
-      (write-byte 80) (write-byte 58)  ; "P:"
+      (%serial-byte 80) (%serial-byte 58)  ; "P:"
       (print-hex-byte (aref pubkey 0))
       (print-hex-byte (aref pubkey 1))
       (print-hex-byte (aref pubkey 2))
       (print-hex-byte (aref pubkey 3))
-      (write-byte 10)
+      (%serial-byte 10)
       ;; Sign empty message
       (let ((msg (make-array 0)))
         (let ((sig (ed25519-sign privkey msg 0)))
           ;; Print first 4 bytes of signature
-          (write-byte 83) (write-byte 58)  ; "S:"
+          (%serial-byte 83) (%serial-byte 58)  ; "S:"
           (print-hex-byte (aref sig 0))
           (print-hex-byte (aref sig 1))
           (print-hex-byte (aref sig 2))
           (print-hex-byte (aref sig 3))
-          (write-byte 10)
+          (%serial-byte 10)
           ;; Verify
           (let ((valid (ed25519-verify pubkey sig msg 0)))
-            (write-byte 86) (write-byte 58)  ; "V:"
-            (if valid (write-byte 49) (write-byte 48))  ; "1" or "0"
-            (write-byte 10)
+            (%serial-byte 86) (%serial-byte 58)  ; "V:"
+            (if valid (%serial-byte 49) (%serial-byte 48))  ; "1" or "0"
+            (%serial-byte 10)
             valid))))))
 
 

@@ -463,19 +463,19 @@
     ;; Get config descriptor (first 9 bytes for total length)
     (let ((r1 (usb-get-descriptor devaddr (usb-desc-configuration) 0 dbuf 9)))
       (when (<= r1 0)
-        (write-byte 72) (write-byte 67) (write-byte 69) (write-byte 10)
+        (%serial-byte 72) (%serial-byte 67) (%serial-byte 69) (%serial-byte 10)
         (return 0))
       (let ((total-len (usb-desc-u16 dbuf 2)))
         (when (> total-len 512) (setq total-len 512))
         ;; Get full config descriptor
         (let ((r2 (usb-get-descriptor devaddr (usb-desc-configuration) 0 dbuf total-len)))
           (when (<= r2 0)
-            (write-byte 72) (write-byte 67) (write-byte 50) (write-byte 10)
+            (%serial-byte 72) (%serial-byte 67) (%serial-byte 50) (%serial-byte 10)
             (return 0))
           ;; Find HID interface + interrupt EP
           (let ((found (hid-parse-config-find-interrupt-ep dbuf total-len)))
             (when (zerop found)
-              (write-byte 78) (write-byte 72) (write-byte 73) (write-byte 68) (write-byte 10)
+              (%serial-byte 78) (%serial-byte 72) (%serial-byte 73) (%serial-byte 68) (%serial-byte 10)
               (return 0))
             ;; Read parsed results
             (let ((ep-addr (mem-ref (hid-parse-scratch) :u32))
@@ -499,9 +499,9 @@
                       ;; Start interrupt IN on channel 3
                       (dwc2-start-interrupt-in 3 devaddr ep-num
                                                (hid-kbd-dma) ep-mps ep-mps)
-                      (write-byte 75) (write-byte 66) (write-byte 68) ; "KBD"
-                      (write-byte 58) (write-byte 79) (write-byte 75) ; ":OK"
-                      (write-byte 10)
+                      (%serial-byte 75) (%serial-byte 66) (%serial-byte 68) ; "KBD"
+                      (%serial-byte 58) (%serial-byte 79) (%serial-byte 75) ; ":OK"
+                      (%serial-byte 10)
                       (return 1))
                     (if (eq iface-protocol 2)
                         ;; Mouse
@@ -514,9 +514,9 @@
                           ;; Start interrupt IN on channel 4
                           (dwc2-start-interrupt-in 4 devaddr ep-num
                                                    (hid-mouse-dma) ep-mps ep-mps)
-                          (write-byte 77) (write-byte 79) (write-byte 85) ; "MOU"
-                          (write-byte 58) (write-byte 79) (write-byte 75) ; ":OK"
-                          (write-byte 10)
+                          (%serial-byte 77) (%serial-byte 79) (%serial-byte 85) ; "MOU"
+                          (%serial-byte 58) (%serial-byte 79) (%serial-byte 75) ; ":OK"
+                          (%serial-byte 10)
                           (return 1))
                         ;; Tablet / other HID
                         (progn
@@ -528,9 +528,9 @@
                           ;; Start interrupt IN on channel 5
                           (dwc2-start-interrupt-in 5 devaddr ep-num
                                                    (hid-tablet-dma) ep-mps ep-mps)
-                          (write-byte 84) (write-byte 66) (write-byte 76) ; "TBL"
-                          (write-byte 58) (write-byte 79) (write-byte 75) ; ":OK"
-                          (write-byte 10)
+                          (%serial-byte 84) (%serial-byte 66) (%serial-byte 76) ; "TBL"
+                          (%serial-byte 58) (%serial-byte 79) (%serial-byte 75) ; ":OK"
+                          (%serial-byte 10)
                           (return 1))))))))))))
 
 ;; ============================================================
@@ -545,13 +545,13 @@
     ;; 1. Reset port
     (let ((speed (dwc2-port-reset)))
       (when (< speed 0)
-        (write-byte 72) (write-byte 82) (write-byte 69) (write-byte 10) ; "HRE"
+        (%serial-byte 72) (%serial-byte 82) (%serial-byte 69) (%serial-byte 10) ; "HRE"
         (return 0))
       (dwc2-delay-ms 20)
       ;; 2. GET_DEVICE_DESCRIPTOR at address 0 (first 8 bytes)
       (let ((r1 (usb-get-descriptor 0 (usb-desc-device) 0 dbuf 8)))
         (when (<= r1 0)
-          (write-byte 72) (write-byte 68) (write-byte 49) (write-byte 10) ; "HD1"
+          (%serial-byte 72) (%serial-byte 68) (%serial-byte 49) (%serial-byte 10) ; "HD1"
           (return 0))
         ;; 3. Reset again before SET_ADDRESS
         (dwc2-port-reset)
@@ -559,22 +559,22 @@
         ;; 4. SET_ADDRESS to 1
         (let ((r2 (usb-set-address 1)))
           (when (<= r2 0)
-            (write-byte 72) (write-byte 65) (write-byte 49) (write-byte 10) ; "HA1"
+            (%serial-byte 72) (%serial-byte 65) (%serial-byte 49) (%serial-byte 10) ; "HA1"
             (return 0))
           (dwc2-delay-ms 10)
           ;; 5. Full device descriptor at address 1
           (let ((r3 (usb-get-descriptor 1 (usb-desc-device) 0 dbuf 18)))
             (when (<= r3 0)
-              (write-byte 72) (write-byte 68) (write-byte 50) (write-byte 10) ; "HD2"
+              (%serial-byte 72) (%serial-byte 68) (%serial-byte 50) (%serial-byte 10) ; "HD2"
               (return 0))
             ;; Print VID:PID
-            (write-byte 72) (write-byte 73) (write-byte 68) (write-byte 58) ; "HID:"
+            (%serial-byte 72) (%serial-byte 73) (%serial-byte 68) (%serial-byte 58) ; "HID:"
             (print-hex-byte (mem-ref (+ dbuf 9) :u8))
             (print-hex-byte (mem-ref (+ dbuf 8) :u8))
-            (write-byte 58)
+            (%serial-byte 58)
             (print-hex-byte (mem-ref (+ dbuf 11) :u8))
             (print-hex-byte (mem-ref (+ dbuf 10) :u8))
-            (write-byte 10)
+            (%serial-byte 10)
             ;; Check if this is a hub (class 9)
             (let ((dev-class (mem-ref (+ dbuf 4) :u8)))
               (if (eq dev-class 9)
@@ -604,7 +604,7 @@
     ;; 1. Get hub descriptor
     (let ((r1 (usb-control-transfer hub-addr #xA0 6 #x2900 0 dbuf 8)))
       (when (<= r1 0)
-        (write-byte 72) (write-byte 72) (write-byte 68) (write-byte 10) ; "HHD"
+        (%serial-byte 72) (%serial-byte 72) (%serial-byte 68) (%serial-byte 10) ; "HHD"
         (return 0))
       (let ((num-ports (mem-ref (+ dbuf 2) :u8)))
         ;; 2. Power all ports
@@ -627,7 +627,7 @@
                       (return nil)))))
               (setq p (+ p 1))))
           (when (zerop conn-port)
-            (write-byte 72) (write-byte 78) (write-byte 67) (write-byte 10) ; "HNC"
+            (%serial-byte 72) (%serial-byte 78) (%serial-byte 67) (%serial-byte 10) ; "HNC"
             (return 0))
           ;; 4. Reset port
           (usb-control-transfer hub-addr #x23 3 4 conn-port 0 0)
@@ -637,7 +637,7 @@
           ;; 5. Enumerate downstream device
           (let ((r3 (usb-get-descriptor 0 (usb-desc-device) 0 dbuf 8)))
             (when (<= r3 0)
-              (write-byte 72) (write-byte 68) (write-byte 51) (write-byte 10) ; "HD3"
+              (%serial-byte 72) (%serial-byte 68) (%serial-byte 51) (%serial-byte 10) ; "HD3"
               (return 0))
             ;; SET_ADDRESS to 2
             (let ((r4 (usb-set-address 2)))
@@ -647,13 +647,13 @@
               (let ((r5 (usb-get-descriptor 2 (usb-desc-device) 0 dbuf 18)))
                 (when (<= r5 0) (return 0))
                 ;; Print VID:PID
-                (write-byte 68) (write-byte 69) (write-byte 86) (write-byte 58) ; "DEV:"
+                (%serial-byte 68) (%serial-byte 69) (%serial-byte 86) (%serial-byte 58) ; "DEV:"
                 (print-hex-byte (mem-ref (+ dbuf 9) :u8))
                 (print-hex-byte (mem-ref (+ dbuf 8) :u8))
-                (write-byte 58)
+                (%serial-byte 58)
                 (print-hex-byte (mem-ref (+ dbuf 11) :u8))
                 (print-hex-byte (mem-ref (+ dbuf 10) :u8))
-                (write-byte 10)
+                (%serial-byte 10)
                 ;; Configure device
                 (let ((r6 (usb-get-descriptor 2 (usb-desc-configuration) 0 dbuf 9)))
                   (when (<= r6 0) (return 0))
@@ -682,11 +682,11 @@
   ;; 3. Init scancode tables
   ;; 4. Enumerate and configure USB HID devices
   (hid-clear-state)
-  (write-byte 72) (write-byte 73) (write-byte 68) (write-byte 10) ; "HID\n"
+  (%serial-byte 72) (%serial-byte 73) (%serial-byte 68) (%serial-byte 10) ; "HID\n"
   ;; Init DWC2
   (let ((ok (dwc2-init)))
     (when (zerop ok)
-      (write-byte 78) (write-byte 79) (write-byte 68) (write-byte 10) ; "NOD\n"
+      (%serial-byte 78) (%serial-byte 79) (%serial-byte 68) (%serial-byte 10) ; "NOD\n"
       (return nil))
     ;; Init scancode tables
     (hid-init-scancode-table)

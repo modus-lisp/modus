@@ -10,11 +10,11 @@
 
 ;;; Helper: print 2-char marker to serial
 (defun prof-mark-2 (c1 c2)
-  (write-byte 91)   ; [
-  (write-byte c1)
-  (write-byte c2)
-  (write-byte 93)   ; ]
-  (write-byte 10))  ; newline
+  (%serial-byte 91)   ; [
+  (%serial-byte c1)
+  (%serial-byte c2)
+  (%serial-byte 93)   ; ]
+  (%serial-byte 10))  ; newline
 
 (defun ssh-handle-kex (ssh kex-init-payload kex-init-len)
   (let ((cli-eph (make-array 32)))

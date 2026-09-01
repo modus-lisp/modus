@@ -25,7 +25,7 @@
 (defvar *net-dir*
   (merge-pathnames "net/" *modus-base*))
 
-;; We need arch-raspi3b.lisp for base primitives (write-byte, print-hex, alloc,
+;; We need arch-raspi3b.lisp for base primitives (%serial-byte, print-hex, alloc,
 ;; array ops) but NOT the full dwc2-device.lisp — just the mailbox helpers.
 ;; bcm2835-periph.lisp provides fb-init, fb-pixel, fb-clear, fb-fill-rect.
 (defvar *hdmi-source*

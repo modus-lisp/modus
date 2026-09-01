@@ -6,7 +6,7 @@
 ;;;; Supports: Intel E1000 (8086:100E, QEMU) and 82579LM (8086:1502, T420).
 ;;;;
 ;;;; Requires (loaded before this file):
-;;;;   arch-i386.lisp    — e1000-state-base, io-delay, write-byte, etc.
+;;;;   arch-i386.lisp    — e1000-state-base, io-delay, %serial-byte, etc.
 ;;;;   e1000.lisp        — e1000-init-rx, e1000-init-tx, e1000-hw-send/receive
 ;;;;   i386-console.lisp — mmio-do-read32, mmio-do-write32, mmio-result-byte,
 ;;;;                        pci-addr, pci-config-read-raw, addr-add-byte*
@@ -25,14 +25,14 @@
 ;;; Override console print functions back to serial for NIC init
 ;;; ============================================================
 ;;; i386-console.lisp redefines print-nibble/print-str to use
-;;; write-char-output (VGA). Override back to write-byte (serial)
+;;; write-char-output (VGA). Override back to %serial-byte (serial)
 ;;; so NIC diagnostic output doesn't spam the VGA screen.
 
 (defun print-nibble (n)
   (let ((v n))
     (if (< v 10)
-        (write-byte (+ v 48))
-      (write-byte (+ v 55)))))
+        (%serial-byte (+ v 48))
+      (%serial-byte (+ v 55)))))
 
 (defun print-str (s)
   (let ((str s))
@@ -40,7 +40,7 @@
       (let ((len (array-length str)))
         (loop
           (when (>= i len) (return 0))
-          (write-byte (aref str i))
+          (%serial-byte (aref str i))
           (setq i (+ i 1)))))))
 
 ;;; ============================================================
@@ -502,20 +502,20 @@
   (e1000-read-mac-from-regs)
   (let ((state (e1000-state-base)))
     ;; "MAC:" header
-    (write-byte 77) (write-byte 65) (write-byte 67) (write-byte 58)
+    (%serial-byte 77) (%serial-byte 65) (%serial-byte 67) (%serial-byte 58)
     (let ((s state))
       (print-hex-byte (mem-ref (+ s #x08) :u8))
-      (write-byte 58)
+      (%serial-byte 58)
       (print-hex-byte (mem-ref (+ s #x09) :u8))
-      (write-byte 58)
+      (%serial-byte 58)
       (print-hex-byte (mem-ref (+ s #x0A) :u8))
-      (write-byte 58)
+      (%serial-byte 58)
       (print-hex-byte (mem-ref (+ s #x0B) :u8))
-      (write-byte 58)
+      (%serial-byte 58)
       (print-hex-byte (mem-ref (+ s #x0C) :u8))
-      (write-byte 58)
+      (%serial-byte 58)
       (print-hex-byte (mem-ref (+ s #x0D) :u8))
-      (write-byte 10))))
+      (%serial-byte 10))))
 
 (defun e1000-init-mac-regs ()
   ;; Program RAL0/RAH0 with MAC address.
@@ -681,14 +681,14 @@
 
 (defun e1000-init-print-bar0 ()
   ;; "BAR0:" to serial
-  (write-byte 66) (write-byte 65) (write-byte 82) (write-byte 48) (write-byte 58)
+  (%serial-byte 66) (%serial-byte 65) (%serial-byte 82) (%serial-byte 48) (%serial-byte 58)
   (pci-nic-print-bar0)
-  (write-byte 10))
+  (%serial-byte 10))
 
 (defun e1000-init-print-ok ()
   ;; "NIC:OK\n" to serial
-  (write-byte 78) (write-byte 73) (write-byte 67)
-  (write-byte 58) (write-byte 79) (write-byte 75) (write-byte 10))
+  (%serial-byte 78) (%serial-byte 73) (%serial-byte 67)
+  (%serial-byte 58) (%serial-byte 79) (%serial-byte 75) (%serial-byte 10))
 
 (defun e1000-init-phase2 ()
   ;; RX/TX descriptor rings + control registers
@@ -1136,8 +1136,8 @@
 (defun e1000-init ()
   ;; E1000/E1000e initialization — BIOS-preserving (no CTRL.RST).
   (when (not (e1000-init-check-bar0))
-    (write-byte 78) (write-byte 73) (write-byte 67)
-    (write-byte 58) (write-byte 78) (write-byte 111) (write-byte 10)
+    (%serial-byte 78) (%serial-byte 73) (%serial-byte 67)
+    (%serial-byte 58) (%serial-byte 78) (%serial-byte 111) (%serial-byte 10)
     (return 0))
   (e1000-init-print-bar0)
   (pci-nic-set-d0)
@@ -1219,8 +1219,8 @@
         (progn
           (write-char-output 78)
           ;; "NIC:NF\n" (not found)
-          (write-byte 78) (write-byte 73) (write-byte 67)
-          (write-byte 58) (write-byte 78) (write-byte 70) (write-byte 10)
+          (%serial-byte 78) (%serial-byte 73) (%serial-byte 67)
+          (%serial-byte 58) (%serial-byte 78) (%serial-byte 70) (%serial-byte 10)
           0)
       (progn
         (write-char-output 70)

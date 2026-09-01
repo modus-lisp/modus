@@ -149,8 +149,8 @@
                               (mem-ref (+ buf 22 i) :u8)))
                       (setq found 1)))))))))
       (when (not (zerop found))
-        (write-byte 65) (write-byte 82) (write-byte 80) (write-byte 58)
-        (write-byte 79) (write-byte 75) (write-byte 10))
+        (%serial-byte 65) (%serial-byte 82) (%serial-byte 80) (%serial-byte 58)
+        (%serial-byte 79) (%serial-byte 75) (%serial-byte 10))
       found)))
 
 (defun arp-reply (req-buf)
@@ -346,11 +346,27 @@
 
 (defun tcp-connect (dst-ip dst-port)
   (let ((state (e1000-state-base)))
-    (setf (mem-ref (+ state #x30) :u32) 1)
-    (setf (mem-ref (+ state #x34) :u16) 49152)
+    ;; Local port and ISN must VARY per connection.  They used to be the
+    ;; constants 49152 and 1000, so every outbound connection reused one 4-tuple
+    ;; and one sequence space: the first fetch of a boot succeeded and closed,
+    ;; the peer held that tuple in TIME_WAIT, and the next SYN — carrying an ISN
+    ;; below the sequence numbers the peer had already seen — was dropped as an
+    ;; old duplicate.  Symptom: fetch #1 perfect (TCP:OK, full byte count),
+    ;; fetch #2 `TCP:F`.  This is invisible to a single-fetch demo, which is all
+    ;; the net images shipped with; it appears the moment a driver fetches
+    ;; twice.
+    ;;
+    ;; The counter lives at the free state slot 0x50.  It is MASKED because
+    ;; bare-metal DRAM is not zeroed, so it can start as garbage — only the
+    ;; SEQUENCE of values matters, never the starting value.
+    (let ((n (logand (+ (mem-ref (+ state #x50) :u32) 1) #x3FFF)))
+      (setf (mem-ref (+ state #x50) :u32) n)
+      (setf (mem-ref (+ state #x30) :u32) 1)
+      (setf (mem-ref (+ state #x34) :u16) (+ 49152 n))
+      (setf (mem-ref (+ state #x3C) :u32) (logand (+ 1000 (* n 65536))
+                                                  #xFFFFFFFF)))
     (setf (mem-ref (+ state #x36) :u16) dst-port)
     (setf (mem-ref (+ state #x38) :u32) dst-ip)
-    (setf (mem-ref (+ state #x3C) :u32) 1000)
     (setf (mem-ref (+ state #x40) :u32) 0)
     (tcp-send-segment 2 (make-array 0) 0)
     (let ((connected 0))
@@ -372,12 +388,12 @@
                             (setq connected 1))))))))))))
       (if (not (zerop connected))
           (progn
-            (write-byte 84) (write-byte 67) (write-byte 80) (write-byte 58)
-            (write-byte 79) (write-byte 75) (write-byte 10)
+            (%serial-byte 84) (%serial-byte 67) (%serial-byte 80) (%serial-byte 58)
+            (%serial-byte 79) (%serial-byte 75) (%serial-byte 10)
             1)
           (progn
-            (write-byte 84) (write-byte 67) (write-byte 80) (write-byte 58)
-            (write-byte 70) (write-byte 10)
+            (%serial-byte 84) (%serial-byte 67) (%serial-byte 80) (%serial-byte 58)
+            (%serial-byte 70) (%serial-byte 10)
             0)))))
 
 (defun tcp-send (data len)
@@ -418,11 +434,39 @@
                                   (tcp-send-segment 16 (make-array 0) 0)
                                   (setq received data-len))
                                 (tcp-send-segment 16 (make-array 0) 0))))
+                        ;; FIN.  A FIN consumes ONE sequence number, and it
+                        ;; consumes it AFTER this segment's own payload — so the
+                        ;; next byte we expect is their-seq + data-len + 1, not
+                        ;; their-seq + 1.  The old code stored their-seq + 1
+                        ;; unconditionally, REWINDING the ack past payload this
+                        ;; very segment carried.
+                        ;;
+                        ;; It also closed unconditionally.  The data path above
+                        ;; is strictly in-order: a segment arriving after a drop
+                        ;; is refused and re-ACKed so the sender retransmits.
+                        ;; Accepting the FIN while that hole is outstanding
+                        ;; threw the recovery away — we marked the socket CLOSED
+                        ;; with bytes still missing, which is how a 348 KB fetch
+                        ;; came back truncated (`RXEND why=1`, the peer-closed
+                        ;; arm, at 161k/226k/298k run to run).
+                        ;;
+                        ;; Measured: baseline 3 of 9 large fetches complete,
+                        ;; with this fix 9 of 9, arms alternated over 3 rounds.
+                        ;;
+                        ;; Both sides are masked to 32 bits because the stored
+                        ;; ack truncates on the :u32 store and a 348 KB body
+                        ;; whose random ISN starts near 2^32 wraps mid-transfer.
                         (when (not (zerop (logand tcp-flags 1)))
-                          (let ((their-seq (buf-read-u32-mem buf 38)))
-                            (setf (mem-ref (+ state #x40) :u32) (+ their-seq 1))
-                            (tcp-send-segment 16 (make-array 0) 0)
-                            (setf (mem-ref (+ state #x30) :u32) 0)))))))))))))
+                          (let ((their-seq (buf-read-u32-mem buf 38))
+                                (expected (mem-ref (+ state #x40) :u32)))
+                            (if (eq expected
+                                    (logand (+ their-seq data-len) #xFFFFFFFF))
+                                (progn
+                                  (setf (mem-ref (+ state #x40) :u32)
+                                        (logand (+ expected 1) #xFFFFFFFF))
+                                  (tcp-send-segment 16 (make-array 0) 0)
+                                  (setf (mem-ref (+ state #x30) :u32) 0))
+                                (tcp-send-segment 16 (make-array 0) 0))))))))))))))
     received))
 
 (defun tcp-close ()
@@ -482,10 +526,10 @@
                                                 (setq accepted 1)))))))))))))))))))))))
     (if (not (zerop accepted))
         (progn
-          (write-byte 76) (write-byte 79) (write-byte 75) (write-byte 10)
+          (%serial-byte 76) (%serial-byte 79) (%serial-byte 75) (%serial-byte 10)
           1)
         (progn
-          (write-byte 76) (write-byte 70) (write-byte 10)
+          (%serial-byte 76) (%serial-byte 70) (%serial-byte 10)
           0))))
 
 ;; ================================================================
@@ -768,40 +812,40 @@
 
 (defun net-state ()
   (let ((state (e1000-state-base)))
-    (write-byte 73) (write-byte 80) (write-byte 58)
+    (%serial-byte 73) (%serial-byte 80) (%serial-byte 58)
     (print-dec (mem-ref (+ state #x18) :u8))
-    (write-byte 46)
+    (%serial-byte 46)
     (print-dec (mem-ref (+ state #x19) :u8))
-    (write-byte 46)
+    (%serial-byte 46)
     (print-dec (mem-ref (+ state #x1A) :u8))
-    (write-byte 46)
+    (%serial-byte 46)
     (print-dec (mem-ref (+ state #x1B) :u8))
-    (write-byte 10)
-    (write-byte 71) (write-byte 87) (write-byte 58)
+    (%serial-byte 10)
+    (%serial-byte 71) (%serial-byte 87) (%serial-byte 58)
     (print-hex-byte (mem-ref (+ state #x28) :u8))
     (dotimes (i 5)
-      (write-byte 58)
+      (%serial-byte 58)
       (print-hex-byte (mem-ref (+ state #x29 i) :u8)))
-    (write-byte 10)
-    (write-byte 77) (write-byte 77) (write-byte 58)
+    (%serial-byte 10)
+    (%serial-byte 77) (%serial-byte 77) (%serial-byte 58)
     (dotimes (i 8)
       (print-hex-byte (mem-ref (+ state i) :u8)))
-    (write-byte 10)
-    (write-byte 84) (write-byte 67) (write-byte 58)
+    (%serial-byte 10)
+    (%serial-byte 84) (%serial-byte 67) (%serial-byte 58)
     (print-dec (e1000-read-reg #x400))
-    (write-byte 10)
-    (write-byte 83) (write-byte 84) (write-byte 58)
+    (%serial-byte 10)
+    (%serial-byte 83) (%serial-byte 84) (%serial-byte 58)
     (print-dec (e1000-read-reg 8))
-    (write-byte 10)
-    (write-byte 82) (write-byte 72) (write-byte 58)
+    (%serial-byte 10)
+    (%serial-byte 82) (%serial-byte 72) (%serial-byte 58)
     (print-dec (e1000-read-reg #x2810))
-    (write-byte 10)
-    (write-byte 82) (write-byte 84) (write-byte 58)
+    (%serial-byte 10)
+    (%serial-byte 82) (%serial-byte 84) (%serial-byte 58)
     (print-dec (e1000-read-reg #x2818))
-    (write-byte 10)
-    (write-byte 82) (write-byte 67) (write-byte 58)
+    (%serial-byte 10)
+    (%serial-byte 82) (%serial-byte 67) (%serial-byte 58)
     (print-dec (e1000-read-reg #x100))
-    (write-byte 10)))
+    (%serial-byte 10)))
 
 (defun tcp-test-send ()
   (let ((buf (make-array 4)))
@@ -820,12 +864,12 @@
     (let ((n (tcp-receive 500)))
       (if (> n 0)
           (progn
-            (write-byte 82) (write-byte 88) (write-byte 58) (print-dec n) (write-byte 10)
+            (%serial-byte 82) (%serial-byte 88) (%serial-byte 58) (print-dec n) (%serial-byte 10)
             (tcp-close)
             n)
           (progn
-            (write-byte 82) (write-byte 88) (write-byte 58)
-            (write-byte 78) (write-byte 79) (write-byte 10)
+            (%serial-byte 82) (%serial-byte 88) (%serial-byte 58)
+            (%serial-byte 78) (%serial-byte 79) (%serial-byte 10)
             0)))))
 
 (defun tcp-echo-test ()
@@ -889,16 +933,16 @@
                 (aset pkt 37 (logand icsum #xFF)))
               (e1000-send pkt (+ 14 ip-total))))
           (when (eq icmp-type 0)
-            (write-byte 80) (write-byte 111) (write-byte 110)
-            (write-byte 103) (write-byte 58)
+            (%serial-byte 80) (%serial-byte 111) (%serial-byte 110)
+            (%serial-byte 103) (%serial-byte 58)
             (print-dec (mem-ref (+ buf ip-offset 12) :u8))
-            (write-byte 46)
+            (%serial-byte 46)
             (print-dec (mem-ref (+ buf ip-offset 13) :u8))
-            (write-byte 46)
+            (%serial-byte 46)
             (print-dec (mem-ref (+ buf ip-offset 14) :u8))
-            (write-byte 46)
+            (%serial-byte 46)
             (print-dec (mem-ref (+ buf ip-offset 15) :u8))
-            (write-byte 10))))))
+            (%serial-byte 10))))))
 
 (defun ping (dst-ip)
   (let ((state (e1000-state-base))
@@ -927,16 +971,16 @@
                 (when (eq (mem-ref (+ buf 13) :u8) 0)
                   (when (eq (mem-ref (+ buf 23) :u8) 1)
                     (when (eq (mem-ref (+ buf 34) :u8) 0)
-                      (write-byte 80) (write-byte 111) (write-byte 110)
-                      (write-byte 103) (write-byte 58)
+                      (%serial-byte 80) (%serial-byte 111) (%serial-byte 110)
+                      (%serial-byte 103) (%serial-byte 58)
                       (print-dec (mem-ref (+ buf 26) :u8))
-                      (write-byte 46)
+                      (%serial-byte 46)
                       (print-dec (mem-ref (+ buf 27) :u8))
-                      (write-byte 46)
+                      (%serial-byte 46)
                       (print-dec (mem-ref (+ buf 28) :u8))
-                      (write-byte 46)
+                      (%serial-byte 46)
                       (print-dec (mem-ref (+ buf 29) :u8))
-                      (write-byte 10)
+                      (%serial-byte 10)
                       (setq got-reply 1))))))))))
     got-reply))
 
@@ -1251,8 +1295,8 @@
 (defun dhcp-client ()
   (let ((state (e1000-state-base)))
     (dhcp-discover)
-    (write-byte 68) (write-byte 72) (write-byte 67) (write-byte 80) (write-byte 58)
-    (write-byte 68) (write-byte 10)
+    (%serial-byte 68) (%serial-byte 72) (%serial-byte 67) (%serial-byte 80) (%serial-byte 58)
+    (%serial-byte 68) (%serial-byte 10)
     (let ((got-offer 0))
       (dotimes (try 500)
         (when (zerop got-offer)
@@ -1275,14 +1319,14 @@
                                     (setq got-offer 1))))))))))))))))
       (if (zerop got-offer)
           (progn
-            (write-byte 68) (write-byte 72) (write-byte 67) (write-byte 80) (write-byte 58)
-            (write-byte 70) (write-byte 10)
+            (%serial-byte 68) (%serial-byte 72) (%serial-byte 67) (%serial-byte 80) (%serial-byte 58)
+            (%serial-byte 70) (%serial-byte 10)
             0)
           (let ((offered-ip (mem-ref (+ state #x68) :u32))
                 (server-ip (mem-ref (+ state #x6C) :u32)))
             (dhcp-request offered-ip server-ip)
-            (write-byte 68) (write-byte 72) (write-byte 67) (write-byte 80) (write-byte 58)
-            (write-byte 82) (write-byte 10)
+            (%serial-byte 68) (%serial-byte 72) (%serial-byte 67) (%serial-byte 80) (%serial-byte 58)
+            (%serial-byte 82) (%serial-byte 10)
             (let ((got-ack 0))
               (dotimes (try 500)
                 (when (zerop got-ack)
@@ -1304,8 +1348,8 @@
                                         (setq got-ack 1))))))))))))))
               (if (zerop got-ack)
                   (progn
-                    (write-byte 68) (write-byte 72) (write-byte 67) (write-byte 80) (write-byte 58)
-                    (write-byte 70) (write-byte 10)
+                    (%serial-byte 68) (%serial-byte 72) (%serial-byte 67) (%serial-byte 80) (%serial-byte 58)
+                    (%serial-byte 70) (%serial-byte 10)
                     0)
                   (progn
                     (let ((ip (mem-ref (+ state #x68) :u32)))
@@ -1314,16 +1358,16 @@
                       (setf (mem-ref (+ state #x1A) :u8) (logand (ash ip -8) #xFF))
                       (setf (mem-ref (+ state #x1B) :u8) (logand ip #xFF)))
                     (setf (mem-ref (+ state #x60) :u32) 3)
-                    (write-byte 68) (write-byte 72) (write-byte 67) (write-byte 80)
-                    (write-byte 58) (write-byte 73) (write-byte 80) (write-byte 61)
+                    (%serial-byte 68) (%serial-byte 72) (%serial-byte 67) (%serial-byte 80)
+                    (%serial-byte 58) (%serial-byte 73) (%serial-byte 80) (%serial-byte 61)
                     (print-dec (mem-ref (+ state #x18) :u8))
-                    (write-byte 46)
+                    (%serial-byte 46)
                     (print-dec (mem-ref (+ state #x19) :u8))
-                    (write-byte 46)
+                    (%serial-byte 46)
                     (print-dec (mem-ref (+ state #x1A) :u8))
-                    (write-byte 46)
+                    (%serial-byte 46)
                     (print-dec (mem-ref (+ state #x1B) :u8))
-                    (write-byte 10)
+                    (%serial-byte 10)
                     (let ((gw-ip (mem-ref (+ state #x1C) :u32)))
                       (arp-request gw-ip)
                       (let ((arp-done 0))
@@ -1428,22 +1472,22 @@
         (let ((resp-len (udp-receive 500)))
           (if (zerop resp-len)
               (progn
-                (write-byte 68) (write-byte 78) (write-byte 83) (write-byte 58)
-                (write-byte 70) (write-byte 10)
+                (%serial-byte 68) (%serial-byte 78) (%serial-byte 83) (%serial-byte 58)
+                (%serial-byte 70) (%serial-byte 10)
                 0)
               (let ((ip (dns-parse-response)))
-                (write-byte 68) (write-byte 78) (write-byte 83) (write-byte 58)
+                (%serial-byte 68) (%serial-byte 78) (%serial-byte 83) (%serial-byte 58)
                 (if (zerop ip)
-                    (progn (write-byte 70) (write-byte 10))
+                    (progn (%serial-byte 70) (%serial-byte 10))
                     (progn
                       (print-dec (logand (ash ip -24) #xFF))
-                      (write-byte 46)
+                      (%serial-byte 46)
                       (print-dec (logand (ash ip -16) #xFF))
-                      (write-byte 46)
+                      (%serial-byte 46)
                       (print-dec (logand (ash ip -8) #xFF))
-                      (write-byte 46)
+                      (%serial-byte 46)
                       (print-dec (logand ip #xFF))
-                      (write-byte 10)))
+                      (%serial-byte 10)))
                 ip)))))))
 
 (defun dns-test ()

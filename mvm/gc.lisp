@@ -52,6 +52,96 @@
 (defun %gc-set-r14 (v)         (setf (mem-ref #x10000078 :u64) v))
 
 ;;; ============================================================
+;;; GC PAUSE STATISTICS (#286)
+;;; ============================================================
+;;; Read side of the counters the NATIVE AARCH64 Cheney trampoline maintains
+;;; (mvm/translate-aarch64.lisp, *aarch64-gc-stats-enabled*, default on).  The
+;;; collector timestamps itself with CNTVCT_EL0 at entry and exit and folds the
+;;; delta into three words; it also records free_ptr - to_start, which is
+;;; exactly the bytes it copied, i.e. the SURVIVORS of that collection.
+;;;
+;;; SLOT MAP — keep in lock-step with the emitter's copy, which uses bare
+;;; literals at the emit sites.  All six live in the 0x10000EA8..0x10001000 gap
+;;; boot/boot-rpi-cl.lisp documents, clear of 0x10000F00 (RPi DTB pointer),
+;;; 0x10000F10 (JIT constvec root) and 0x10000FF0 (call-thunk x30 save):
+;;;
+;;;   0x10000F20  start   CNTVCT at collection entry (collector scratch)
+;;;   0x10000F28  total   sum of pause ticks
+;;;   0x10000F30  max     longest single pause, ticks
+;;;   0x10000F38  last    most recent pause, ticks
+;;;   0x10000F40  bytes   cumulative bytes copied (survivors)
+;;;   0x10000F48  lastb   bytes copied by the most recent collection
+;;;   0x10000F50  base    %GC-COUNT at the last %GC-STATS-RESET (READER-owned;
+;;;                       the collector never touches this one)
+;;;
+;;; WHY 0x10000F50 EXISTS.  The five collector words are resettable but
+;;; %GC-COUNT is not — it is the shared cross-target counter and mvm-eval keys
+;;; its JIT re-bake on it, so zeroing it would be a correctness change, not a
+;;; measurement one.  Without a base, a mean computed after a reset divides
+;;; ticks-since-reset by collections-since-BOOT and reads low by exactly that
+;;; ratio.  Measured on QEMU virt 2026-08-31: 88042 us over 1 collection
+;;; reported as a 1693 us mean because the divisor was 52.
+;;;
+;;; Every word is stored <<1 by the collector, the same convention as the
+;;; 0x40..0x60 block, so a plain (mem-ref addr :u64) reads back the value as a
+;;; fixnum with no shifting here.  Ticks, not nanoseconds: the collector must
+;;; not divide (and must not allocate), so the scaling is the reader's job —
+;;; see %GC-PAUSE-MS below, which needs (cntfrq) and therefore lives in
+;;; mvm/ansi-bridge.lisp rather than in this allocation-free file.
+;;;
+;;; ONLY the native aarch64 trampoline writes these.  On x64/i386 the words are
+;;; readable (the metadata window is mapped well past 0x10001000 on both) and
+;;; read 0, meaning "not instrumented on this target" — NOT "no collections".
+;;; %GC-COUNT is the portable one.
+
+(defun %gc-stat-total-ticks () (mem-ref #x10000F28 :u64))
+(defun %gc-stat-max-ticks   () (mem-ref #x10000F30 :u64))
+(defun %gc-stat-last-ticks  () (mem-ref #x10000F38 :u64))
+(defun %gc-stat-total-bytes () (mem-ref #x10000F40 :u64))
+(defun %gc-stat-last-bytes  () (mem-ref #x10000F48 :u64))
+(defun %gc-stat-base-count  () (mem-ref #x10000F50 :u64))
+
+(defun %gc-stat-count ()
+  "Collections COVERED by the current tick/byte totals, i.e. since the last
+   %GC-STATS-RESET.  This — not %GC-COUNT — is the correct divisor for a mean
+   pause.  Before any reset the base is 0 and this equals %GC-COUNT."
+  (- (%gc-count) (%gc-stat-base-count)))
+
+(defun %gc-stats-reset ()
+  "Zero the pause/survivor counters and re-base the collection count.  Lets a
+   caller measure ONE workload instead of everything since boot.  Safe to call
+   at any time: the collector only ever reads 0x10000F20 between its own entry
+   and exit, and a reset in that window is impossible from Lisp.
+
+   %GC-COUNT itself is deliberately NOT zeroed — it is the shared cross-target
+   counter and mvm-eval keys its JIT re-bake on it.  0x10000F50 records where
+   it stood instead, which is what makes %GC-STAT-COUNT honest."
+  (setf (mem-ref #x10000F50 :u64) (%gc-count))
+  (setf (mem-ref #x10000F20 :u64) 0)
+  (setf (mem-ref #x10000F28 :u64) 0)
+  (setf (mem-ref #x10000F30 :u64) 0)
+  (setf (mem-ref #x10000F38 :u64) 0)
+  (setf (mem-ref #x10000F40 :u64) 0)
+  (setf (mem-ref #x10000F48 :u64) 0)
+  t)
+
+(defun %gc-stats ()
+  "GC statistics as a plist:
+     (:COUNT n :SINCE-RESET n :TOTAL-TICKS n :MAX-TICKS n :LAST-TICKS n
+      :TOTAL-BYTES n :LAST-BYTES n)
+   :COUNT is collections since boot; :SINCE-RESET is how many the tick and byte
+   totals actually cover, and is the divisor to use for a mean.  Ticks are
+   CNTVCT_EL0 ticks; divide by (cntfrq) for seconds, or call %GC-PAUSE-MS.
+   Conses — call it from the mutator, never from the collector."
+  (list :count        (%gc-count)
+        :since-reset  (%gc-stat-count)
+        :total-ticks  (%gc-stat-total-ticks)
+        :max-ticks    (%gc-stat-max-ticks)
+        :last-ticks   (%gc-stat-last-ticks)
+        :total-bytes  (%gc-stat-total-bytes)
+        :last-bytes   (%gc-stat-last-bytes)))
+
+;;; ============================================================
 ;;; Tag Checking Helpers
 ;;; ============================================================
 

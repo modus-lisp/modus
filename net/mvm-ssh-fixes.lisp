@@ -467,7 +467,7 @@
   (let ((s ssh))
     (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 3)
     (setf (mem-ref (+ (ssh-ipc-base) #x18) :u32) 0)
-    (write-byte 10)
+    (%serial-byte 10)
     (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 0)
     (ssh-flush-output s)))
 
@@ -538,10 +538,10 @@
         (let ((result (eval-sexp lst nil globals)))
           (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 3)
           (setf (mem-ref (+ (ssh-ipc-base) #x18) :u32) 0)
-          (write-byte 10)
-          (write-byte 61) (write-byte 32)
+          (%serial-byte 10)
+          (%serial-byte 61) (%serial-byte 32)
           (ssh-print-sexp result)
-          (write-byte 10)
+          (%serial-byte 10)
           (cd-flush-eval-output s))))))
 
 (defun ssh-do-eval-expr (ssh)

@@ -113,12 +113,12 @@
   (let ((hprt (dwc2-hprt0-read-safe)))
     (dwc2-write (dwc2-hprt0) (logior hprt (hprt0-prtpwr))))
   (dwc2-delay-ms 100)
-  (write-byte 68) (write-byte 87) (write-byte 67)
-  (write-byte 50) (write-byte 58)
+  (%serial-byte 68) (%serial-byte 87) (%serial-byte 67)
+  (%serial-byte 50) (%serial-byte 58)
   (let ((hprt (dwc2-read (dwc2-hprt0))))
     (if (not (zerop (logand hprt (hprt0-prtconnsts))))
-        (progn (write-byte 79) (write-byte 75) (write-byte 10) 1)
-        (progn (write-byte 78) (write-byte 67) (write-byte 10) 0))))
+        (progn (%serial-byte 79) (%serial-byte 75) (%serial-byte 10) 1)
+        (progn (%serial-byte 78) (%serial-byte 67) (%serial-byte 10) 0))))
 (defun dwc2-init ()
   (dwc2-init-32-setup)
   (dwc2-init-32-channels)
@@ -219,12 +219,12 @@
       (dwc2-write (dwc2-hprt0) cleared)))
   (dwc2-delay-ms 20)
   (let ((hprt (dwc2-read (dwc2-hprt0))))
-    (write-byte 80) (write-byte 79) (write-byte 82) (write-byte 84) (write-byte 58)
+    (%serial-byte 80) (%serial-byte 79) (%serial-byte 82) (%serial-byte 84) (%serial-byte 58)
     (let ((speed (logand (ash hprt -17) 3)))
-      (if (eq speed 0) (progn (write-byte 72) (write-byte 83))
-          (if (eq speed 1) (progn (write-byte 70) (write-byte 83))
-              (if (eq speed 2) (progn (write-byte 76) (write-byte 83)) 0)))
-      (write-byte 10)
+      (if (eq speed 0) (progn (%serial-byte 72) (%serial-byte 83))
+          (if (eq speed 1) (progn (%serial-byte 70) (%serial-byte 83))
+              (if (eq speed 2) (progn (%serial-byte 76) (%serial-byte 83)) 0)))
+      (%serial-byte 10)
       speed)))
 
 ;;; ============================================================
@@ -243,8 +243,8 @@
 (defun io-delay ()
   (dotimes (d 5000) (mem-ref #x3F201000 :u8)))
 
-;; write-byte: capture-aware for SSH output routing
-(defun write-byte (b)
+;; %serial-byte: capture-aware for SSH output routing
+(defun %serial-byte (b)
   (let ((flags (mem-ref (+ #x01100000 #x14) :u32)))
     (when (zerop (logand flags 2))
       (write-char-serial b))
@@ -341,16 +341,16 @@
 (defun print-dec (n)
   (when (>= n 10)
     (print-dec (truncate n 10)))
-  (write-byte (+ (mod n 10) 48)))
+  (%serial-byte (+ (mod n 10) 48)))
 
 ;; Prompt
 (defun emit-prompt ()
   (if (zerop (mem-ref (+ #x01100000 #x12A00) :u64))
-      (progn (write-byte 62) (write-byte 32))
+      (progn (%serial-byte 62) (%serial-byte 32))
       (progn
-        (write-byte 109) (write-byte 111)
-        (write-byte 100) (write-byte 117)
-        (write-byte 115) (write-byte 62) (write-byte 32))))
+        (%serial-byte 109) (%serial-byte 111)
+        (%serial-byte 100) (%serial-byte 117)
+        (%serial-byte 115) (%serial-byte 62) (%serial-byte 32))))
 
 ;; Single-threaded stubs
 (defun actor-spawn (fn) nil)

@@ -57,7 +57,7 @@
 ;; Install the AArch64 translator
 (install-aarch64-translator)
 
-;; Use mini UART (0x3F215040) instead of PL011 (0x3F201000) for write-byte
+;; Use mini UART (0x3F215040) instead of PL011 (0x3F201000) for %serial-byte
 (setf *aarch64-serial-base* #x3F215040)
 ;; BCM2837 peripherals require 32-bit stores
 (setf *aarch64-serial-width* 2)
@@ -94,25 +94,25 @@
                          "  (setf (mem-ref #x3F215068 :u32) 270)"
                          "  (setf (mem-ref #x3F215060 :u32) 3)"
                          ;; UART ready marker
-                         "  (write-byte 85) (write-byte 65) (write-byte 82)"
-                         "  (write-byte 84) (write-byte 10)"
+                         "  (%serial-byte 85) (%serial-byte 65) (%serial-byte 82)"
+                         "  (%serial-byte 84) (%serial-byte 10)"
                          ;; Initialize SMP + actor system (yield is safe before USB)
                          "  (smp-init)"
                          "  (actor-init)"
                          ;; === Crypto before USB — avoids NETDEV WATCHDOG ===
                          ;; All slow crypto runs here with no USB device active.
                          ;; usb-keepalive (yield-based) is a no-op since no other actors exist.
-                         "  (write-byte 91) (write-byte 49) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 49) (%serial-byte 93)"
                          "  (sha256-init)"
-                         "  (write-byte 91) (write-byte 50) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 50) (%serial-byte 93)"
                          "  (sha512-init)"
-                         "  (write-byte 91) (write-byte 51) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 51) (%serial-byte 93)"
                          ;; Clear ed25519 init flag — uninitialized RAM on real hardware
                          "  (setf (mem-ref (+ (e1000-state-base) #x5D0) :u32) 0)"
                          "  (ed25519-init)"
-                         "  (write-byte 91) (write-byte 52) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 52) (%serial-byte 93)"
                          "  (ssh-seed-random)"
-                         "  (write-byte 91) (write-byte 53) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 53) (%serial-byte 93)"
                          ;; Host key inline
                          "  (let ((state (e1000-state-base)))"
                          "    (setf (mem-ref (+ state #x710) :u64) 0)"
@@ -128,22 +128,22 @@
                          "    (setf (mem-ref (+ state #x748) :u32) #xA148C03A)"
                          "    (setf (mem-ref (+ state #x74C) :u32) #x29DA598B)"
                          "    (setf (mem-ref (+ state #x624) :u32) 1))"
-                         "  (write-byte 91) (write-byte 57) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 57) (%serial-byte 93)"
                          ;; Pre-compute ed25519 host key derivatives (SHA-512 only, fast)
                          "  (pre-compute-host-sign)"
-                         "  (write-byte 91) (write-byte 65) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 65) (%serial-byte 93)"
                          ;; Clear pre-compute flag — uninitialized RAM on real hardware
                          "  (setf (mem-ref (+ (e1000-state-base) #x6C0) :u32) 0)"
                          ;; Pre-compute server ephemeral X25519 key pair (~10s scalar mult)
                          "  (pre-compute-server-eph (conn-ssh 0))"
-                         "  (write-byte 91) (write-byte 66) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 66) (%serial-byte 93)"
                          ;; === USB init — crypto already done, no NETDEV WATCHDOG ===
                          "  (cdc-ether-init)"
-                         "  (write-byte 91) (write-byte 67) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 67) (%serial-byte 93)"
                          ;; Set DNS server to 8.8.8.8 (works with host NAT)
                          "  (setf (mem-ref (+ (e1000-state-base) #x58) :u32) #x08080808)"
-                         "  (write-byte 83) (write-byte 83) (write-byte 72)"
-                         "  (write-byte 58) (print-dec 22) (write-byte 10)"
+                         "  (%serial-byte 83) (%serial-byte 83) (%serial-byte 72)"
+                         "  (%serial-byte 58) (print-dec 22) (%serial-byte 10)"
                          "  (setf (mem-ref (+ (ssh-ipc-base) #x60438) :u32) 22)"
                          ;; Clear connection slots — uninitialized RAM on real hardware
                          "  (let ((i 0))"
@@ -276,9 +276,9 @@
                         "  (let ((lst (buf-read-list)))"
                         "    (let ((globals (ssh-get-globals)))"
                         "      (let ((result (eval-sexp lst nil globals)))"
-                        "        (write-byte 10) (write-byte 61) (write-byte 32)"
+                        "        (%serial-byte 10) (%serial-byte 61) (%serial-byte 32)"
                         "        (ssh-print-sexp result)"
-                        "        (write-byte 10)))))"
+                        "        (%serial-byte 10)))))"
                         "(defun ssh-do-eval-expr (ssh)"
                         "  (let ((len (edit-line-len)))"
                         ;; Enable capture for output

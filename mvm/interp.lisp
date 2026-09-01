@@ -924,6 +924,12 @@
                 ;; RDTSC: fake value in interpreter
                 (reg-set regs +vreg-vr+ 0)
                 (setf pc npc))
+               ((= code #x0311)
+                ;; CNTFRQ: no counter under the interpreter, so report
+                ;; frequency-unknown — the same answer a platform without the
+                ;; register gives, which callers already have to handle.
+                (reg-set regs +vreg-vr+ 0)
+                (setf pc npc))
                ;; --- handler-case / catch / throw setjmp-longjmp ---
                ;; SETJMP (#x0510): push a jmp-buf recording the resume-PC (npc,
                ;; the instruction right after this trap, where the compiled

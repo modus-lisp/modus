@@ -689,7 +689,7 @@
   ;;
   ;; There is exactly one console here, so stderr is the serial port.  This is
   ;; what *error-output* was before WS5 #203 split it onto fd 2 for the hosted
-  ;; differential table.  LATENT ELSEWHERE: build-x64.lisp / build-aarch64.lisp
+  ;; differential table.  LATENT ELSEWHERE: build-x64.lisp / build-aarch64-ansi.lisp
   ;; (the bare-metal ANSI gate images) call %init-streams too and have the same
   ;; unwritable stderr; not touched here to keep the gate images byte-identical.
   (setq *error-output* *standard-output*)

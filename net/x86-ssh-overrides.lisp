@@ -686,8 +686,8 @@
   (sha256-test)
   ;; SHA-512 test: hash("") should start with CF83E135
   (sha512-test)
-  (write-byte 83) (write-byte 83) (write-byte 72)
-  (write-byte 58) (print-dec port) (write-byte 10)
+  (%serial-byte 83) (%serial-byte 83) (%serial-byte 72)
+  (%serial-byte 58) (print-dec port) (%serial-byte 10)
   ;; Store listen port
   (setf (mem-ref (+ (ssh-ipc-base) #x60438) :u32) port)
   ;; Clear connection table

@@ -54,7 +54,7 @@
 ;; Strip `chipz::' / `chipz:' package qualifiers from a source string so the
 ;; flat-namespace image reader doesn't error `Package CHIPZ does not exist'
 ;; (which would silently drop the whole enclosing form).  Longer prefix first.
-;; Mirrors build-aarch64.lisp's strip-package-prefixes.  Used ONLY for baking
+;; Mirrors build-aarch64-ansi.lisp's strip-package-prefixes.  Used ONLY for baking
 ;; lib/install-tarball.lisp — see the *bridge-source* note.
 (defun %cli-strip-one-prefix (text pfx)
   (let ((result text))

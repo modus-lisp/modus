@@ -56,26 +56,26 @@
 ;;; Output helpers
 ;;; ============================================================
 
-(defun write-byte (b)
+(defun %serial-byte (b)
   (write-char-serial b))
 
 (defun print-dec (n)
   (when (>= n 10)
     (print-dec (truncate n 10)))
-  (write-byte (+ (mod n 10) 48)))
+  (%serial-byte (+ (mod n 10) 48)))
 
 (defun print-str (s)
   (let ((i 0))
     (loop
       (when (>= i (array-length s)) (return 0))
-      (write-byte (aref s i))
+      (%serial-byte (aref s i))
       (setq i (+ i 1)))))
 
-(defun print-nl () (write-byte 10))
+(defun print-nl () (%serial-byte 10))
 
 (defun print-label (a b c d e)
-  (write-byte a) (write-byte b) (write-byte c)
-  (write-byte d) (write-byte e))
+  (%serial-byte a) (%serial-byte b) (%serial-byte c)
+  (%serial-byte d) (%serial-byte e))
 
 ;;; ============================================================
 ;;; Benchmark 1: Fibonacci (recursive)
@@ -286,29 +286,29 @@
 (defun run-bench (name expected thunk-result)
   (let ((r thunk-result))
     ;; Print name
-    (write-byte 91)  ; [
+    (%serial-byte 91)  ; [
     (let ((i 0))
       (loop
         (when (>= i (array-length name)) (return 0))
-        (write-byte (aref name i))
+        (%serial-byte (aref name i))
         (setq i (+ i 1))))
-    (write-byte 93)  ; ]
-    (write-byte 32)  ; space
+    (%serial-byte 93)  ; ]
+    (%serial-byte 32)  ; space
     ;; Print result
     (print-dec r)
-    (write-byte 32)  ; space
+    (%serial-byte 32)  ; space
     ;; Check
     (if (eq r expected)
-        (progn (write-byte 79) (write-byte 75))  ; OK
-        (progn (write-byte 70) (write-byte 65)    ; FAIL
-               (write-byte 73) (write-byte 76)))
+        (progn (%serial-byte 79) (%serial-byte 75))  ; OK
+        (progn (%serial-byte 70) (%serial-byte 65)    ; FAIL
+               (%serial-byte 73) (%serial-byte 76)))
     (print-nl)
     r))
 
 (defun kernel-main ()
   ;; Banner
-  (write-byte 66) (write-byte 69) (write-byte 78)
-  (write-byte 67) (write-byte 72) (print-nl)  ; BENCH
+  (%serial-byte 66) (%serial-byte 69) (%serial-byte 78)
+  (%serial-byte 67) (%serial-byte 72) (print-nl)  ; BENCH
 
   ;; fib
   (let ((n (make-array 3)))
@@ -352,8 +352,8 @@
     (run-bench n 7169284 (bench-divmod)))
 
   ;; Done
-  (write-byte 68) (write-byte 79) (write-byte 78)
-  (write-byte 69) (print-nl)  ; DONE
+  (%serial-byte 68) (%serial-byte 79) (%serial-byte 78)
+  (%serial-byte 69) (print-nl)  ; DONE
   (loop))
 ")
 

@@ -195,6 +195,17 @@
         (setq acc (cons form acc))))
     (nreverse acc)))
 
+;;; Count of files truncated by a read error during the current install.
+;;; A DEFUN accessor, not a bare read of the global: a defvar initform does not
+;;; run in-image (MVM Active Limitation #7), so *IT-READ-ERRORS* can be UNBOUND
+;;; on a fresh image and a plain read would fail rather than return 0.  Every
+;;; install resets it via %IT-RESET-READ-ERRORS before doing any work.
+(defvar *it-read-errors* 0)
+(defun %it-read-errors ()
+  (handler-case (if (integerp *it-read-errors*) *it-read-errors* 0)
+    (t (c) 0)))
+(defun %it-reset-read-errors () (setq *it-read-errors* 0))
+
 (defun %it-eval-source (source-string tag)
   "Read+eval every top-level form of SOURCE-STRING with *PACKAGE* and
    *READTABLE* BOUND, per CLHS 24.2 (LOAD): \"load binds *readtable* and
@@ -236,9 +247,23 @@
     (loop
       (let ((form (handler-case (read s nil eof)
                     (t (c)
+                      ;; A READ error ENDS THE FILE (an EVAL error, below, just
+                      ;; prints and continues).  That asymmetry is correct — a
+                      ;; half-read form leaves the stream at an unknown offset —
+                      ;; but it means the rest of the file VANISHES.  Record it
+                      ;; so the install cannot then report plain success:
+                      ;; 2026-08-30 a bare-metal FP trap made `read' fail on the
+                      ;; first float literal in pagetree/src/btree.lisp, silently
+                      ;; discarding every definition after line 1040 while
+                      ;; install-tarball still printed "done, system=cabstack".
+                      ;; The truncation was invisible until something called a
+                      ;; missing function much later, and the honest error line
+                      ;; here read as noise next to a success report.
+                      (setq *it-read-errors* (+ 1 (%it-read-errors)))
                       (write-string-serial "  !! read error in ")
                       (write-string-serial tag) (write-string-serial ": ")
                       (handler-case (write-object c) (t (c2) (write-string-serial "<err>")))
+                      (write-string-serial "  -- REST OF FILE DISCARDED")
                       (write-char-serial 10)
                       eof))))     ; a read error ends the file
         (when (eq form eof) (return count))
@@ -502,6 +527,7 @@
    between two component files, must not leak out.  Escape-safe by
    construction (lexical save + unwind-protect + setq), NOT (let ((*package*
    ...))) — see %it-eval-source's docstring for why that is not enough."
+  (%it-reset-read-errors)   ; per-install; the final report reads this
   (let ((saved-package *package*)
         (saved-readtable *readtable*))
     (unwind-protect
@@ -578,6 +604,22 @@
             (when *it-register-hook*
               (handler-case (funcall *it-register-hook* this-sysname ds nil)
                 (t (c) nil)))
-            (write-string-serial "install-tarball: done, system=")
-            (write-string-serial this-sysname) (write-char-serial 10)
+            ;; Report TRUNCATION, loudly, instead of a bare "done".  An install
+            ;; that lost whole files is not a success, and saying so here is the
+            ;; difference between a one-line diagnosis and a multi-hour hunt.
+            (if (zerop (%it-read-errors))
+                (progn
+                  (write-string-serial "install-tarball: done, system=")
+                  (write-string-serial this-sysname) (write-char-serial 10))
+                (progn
+                  (write-string-serial
+                   "install-tarball: INCOMPLETE -- files were TRUNCATED by read errors: ")
+                  (print-dec (%it-read-errors))
+                  (write-char-serial 10)
+                  (write-string-serial
+                   "  the system is only PARTIALLY loaded; later UNDEFINED-FUNCTION")
+                  (write-char-serial 10)
+                  (write-string-serial
+                   "  errors are a CONSEQUENCE of this, not an independent bug.  system=")
+                  (write-string-serial this-sysname) (write-char-serial 10)))
             this-sysname))))))

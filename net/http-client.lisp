@@ -230,14 +230,14 @@
           (let ((ip (resolve-host url scheme-end host-end)))
             (when (zerop ip)
               ;; "DNS:0\n"
-              (write-byte 68) (write-byte 78) (write-byte 83)
-              (write-byte 58) (write-byte 48) (write-byte 10)
+              (%serial-byte 68) (%serial-byte 78) (%serial-byte 83)
+              (%serial-byte 58) (%serial-byte 48) (%serial-byte 10)
               (return 0))
             ;; Connect
             (when (zerop (tcp-connect ip port))
               ;; "TCP:F\n"
-              (write-byte 84) (write-byte 67) (write-byte 80)
-              (write-byte 58) (write-byte 70) (write-byte 10)
+              (%serial-byte 84) (%serial-byte 67) (%serial-byte 80)
+              (%serial-byte 58) (%serial-byte 70) (%serial-byte 10)
               (return 0))
             ;; Build and send GET request
             (let ((req-buf (make-array 512)))
@@ -268,12 +268,12 @@
 ;;; Response printing and default http-fetch
 ;;; ============================================================
 
-;; Print response body (after headers) via write-byte
+;; Print response body (after headers) via %serial-byte
 (defun http-print-result (result)
   (if (zerop result)
       (progn
         ;; "ERR\n"
-        (write-byte 69) (write-byte 82) (write-byte 82) (write-byte 10)
+        (%serial-byte 69) (%serial-byte 82) (%serial-byte 82) (%serial-byte 10)
         0)
       (let ((resp (car result))
             (resp-len (cdr result)))
@@ -282,9 +282,9 @@
           (let ((i body-off))
             (loop
               (when (>= i resp-len) (return 0))
-              (write-byte (aref resp i))
+              (%serial-byte (aref resp i))
               (setq i (+ i 1)))))
-        (write-byte 10)
+        (%serial-byte 10)
         resp-len)))
 
 ;; Default http-fetch: fetch and print. Overridden in actor mode.

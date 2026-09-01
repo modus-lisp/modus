@@ -46,8 +46,8 @@
                          (list
                           "(defun kernel-main ()"
                           "  (hid-init)"
-                          "  (write-byte 82) (write-byte 69) (write-byte 80) (write-byte 76)"
-                          "  (write-byte 10)"
+                          "  (%serial-byte 82) (%serial-byte 69) (%serial-byte 80) (%serial-byte 76)"
+                          "  (%serial-byte 10)"
                           "  (let ((globals (cons nil nil)))"
                           "    (repl globals)))")))
        ;; kernel-main first, then REPL source, then HID source.

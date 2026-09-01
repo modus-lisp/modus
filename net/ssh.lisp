@@ -1027,7 +1027,7 @@
               (setq i (+ i 1)))
             (return 0))))))
 
-;; Flush captured write-byte output to SSH channel
+;; Flush captured %serial-byte output to SSH channel
 (defun ssh-flush-output (ssh)
   (let ((out-len (mem-ref (+ (ssh-ipc-base) #x18) :u32)))
     (when (> out-len 0)
@@ -1063,7 +1063,7 @@
                       ;; Newline echo
                       (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 3)
                       (setf (mem-ref (+ (ssh-ipc-base) #x18) :u32) 0)
-                      (write-byte 10)
+                      (%serial-byte 10)
                       (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 0)
                       (ssh-flush-output ssh)
                       ;; Evaluate
@@ -1128,10 +1128,10 @@
       (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 3)
       (setf (mem-ref (+ (ssh-ipc-base) #x18) :u32) 0)
       (let ((result (native-eval lst)))
-        (write-byte 10)
-        (write-byte 61) (write-byte 32)
+        (%serial-byte 10)
+        (%serial-byte 61) (%serial-byte 32)
         (print-obj result)
-        (write-byte 10)
+        (%serial-byte 10)
         (let ((out-len (mem-ref (+ (ssh-ipc-base) #x18) :u32)))
           (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 0)
           (setf (mem-ref (+ (ssh-ipc-base) #x24) :u32) 0)
@@ -1177,10 +1177,10 @@
       (let ((cb (+ (ssh-conn-base) (ash i 14))))
         (let ((state (mem-ref cb :u32)))
           (when (not (zerop state))
-            (write-byte 83) (print-dec (+ i 1))
-            (write-byte 58) (write-byte 65)
+            (%serial-byte 83) (print-dec (+ i 1))
+            (%serial-byte 58) (%serial-byte 65)
             (print-dec (mem-ref (+ cb #x18) :u32))
-            (write-byte 10))))
+            (%serial-byte 10))))
       (setq i (+ i 1)))))
 
 ;; Return current session's slot number (1-indexed, avoids 0=NIL)
@@ -1216,7 +1216,7 @@
                 (loop
                   (when (>= ridx widx) (return count))
                   (let ((val (mem-ref (+ cb #x3718 (ash (logand ridx 7) 2)) :u32)))
-                    (write-byte 60) (print-obj val) (write-byte 62) (write-byte 10))
+                    (%serial-byte 60) (print-obj val) (%serial-byte 62) (%serial-byte 10))
                   (setq ridx (+ ridx 1))
                   (setq count (+ count 1)))
                 (setf (mem-ref (+ cb #x3714) :u32) ridx)
@@ -1276,8 +1276,8 @@
   (init-gc-helper)
   (when (zerop (mem-ref (+ (e1000-state-base) #x624) :u32))
     (ssh-use-default-key))
-  (write-byte 83) (write-byte 83) (write-byte 72)  ; "SSH"
-  (write-byte 58) (print-dec port) (write-byte 10)
+  (%serial-byte 83) (%serial-byte 83) (%serial-byte 72)  ; "SSH"
+  (%serial-byte 58) (print-dec port) (%serial-byte 10)
   ;; Store listen port for net-actor
   (setf (mem-ref (+ (ssh-ipc-base) #x60438) :u32) port)
   ;; Clear connection table (4 slots x 16KB)

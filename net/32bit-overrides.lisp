@@ -477,55 +477,55 @@
 ;; SHA-256 diagnostic: test K[0], W[0], ash, rotations, BSIG1
 (defun sha256-diag ()
   ;; Test K[0] = 0x428A2F98
-  (write-byte 75) (write-byte 48) (write-byte 58) ;; K0:
+  (%serial-byte 75) (%serial-byte 48) (%serial-byte 58) ;; K0:
   (print-w32 (sha256-load-k 0))
-  (write-byte 10)
+  (%serial-byte 10)
   ;; Test w32-from-be on padded[0..3] = [0x80, 0, 0, 0]
   (let ((p (make-array 4)))
     (aset p 0 #x80) (aset p 1 0) (aset p 2 0) (aset p 3 0)
-    (write-byte 87) (write-byte 48) (write-byte 58) ;; W0:
+    (%serial-byte 87) (%serial-byte 48) (%serial-byte 58) ;; W0:
     (print-w32 (w32-from-be p 0))
-    (write-byte 10))
+    (%serial-byte 10))
   ;; Test ash with variable count: (ash 100 3) should be 800
   (let ((v 100) (n 3))
-    (write-byte 65) (write-byte 49) (write-byte 58) ;; A1:
+    (%serial-byte 65) (%serial-byte 49) (%serial-byte 58) ;; A1:
     (print-dec (ash v n))
-    (write-byte 10))
+    (%serial-byte 10))
   ;; Test ash with negative variable: (ash 100 -3) should be 12
   (let ((v 100) (n 3))
-    (write-byte 65) (write-byte 50) (write-byte 58) ;; A2:
+    (%serial-byte 65) (%serial-byte 50) (%serial-byte 58) ;; A2:
     (print-dec (ash v (- 0 n)))
-    (write-byte 10))
+    (%serial-byte 10))
   ;; Test w32-rotr-small step by step: rotr(0x510E527F, 6)
   ;; Expected: 0xFD443949
   (let ((x (cons #x510e #x527f)))
     (let ((hi (car x)) (lo (cdr x)))
       ;; hi >> 6 = 0x510E >> 6 = 0x0144
       (let ((hi-shr (ash hi (- 0 6))))
-        (write-byte 82) (write-byte 49) (write-byte 58) ;; R1: hi>>6
+        (%serial-byte 82) (%serial-byte 49) (%serial-byte 58) ;; R1: hi>>6
         (print-dec hi-shr)
-        (write-byte 10))
+        (%serial-byte 10))
       ;; lo & 63 = 0x527F & 63 = 0x3F
       (let ((lo-bits (logand lo 63)))
-        (write-byte 82) (write-byte 50) (write-byte 58) ;; R2: lo&mask
+        (%serial-byte 82) (%serial-byte 50) (%serial-byte 58) ;; R2: lo&mask
         (print-dec lo-bits)
-        (write-byte 10))
+        (%serial-byte 10))
       ;; (lo & 63) << 10 = 0x3F << 10 = 0xFC00
       (let ((lo-bits (logand lo 63)))
         (let ((lo-shl (ash lo-bits 10)))
-          (write-byte 82) (write-byte 51) (write-byte 58) ;; R3: lo_bits<<10
+          (%serial-byte 82) (%serial-byte 51) (%serial-byte 58) ;; R3: lo_bits<<10
           (print-dec lo-shl)
-          (write-byte 10)))
+          (%serial-byte 10)))
       ;; Full w32-rotr-small(x, 6, 63, 10) result
-      (write-byte 82) (write-byte 54) (write-byte 58) ;; R6:
+      (%serial-byte 82) (%serial-byte 54) (%serial-byte 58) ;; R6:
       (print-w32 (w32-rotr-small x 6 63 10))
-      (write-byte 10)))
+      (%serial-byte 10)))
   ;; Test BSIG1(510e527f) — expected: 3a6fe67d
   (let ((e-val (cons #x510e #x527f)))
     (let ((bs1 (sha256-bsig1 e-val)))
-      (write-byte 66) (write-byte 49) (write-byte 58) ;; B1:
+      (%serial-byte 66) (%serial-byte 49) (%serial-byte 58) ;; B1:
       (print-w32 bs1)
-      (write-byte 10))))
+      (%serial-byte 10))))
 
 ;; Override sha256: original uses 3-arg + with (if ...) (broken on MVM i386)
 (defun sha256 (msg)
@@ -1622,32 +1622,32 @@
 
 ;; Diagnostic ssh-message-loop with markers
 (defun ssh-message-loop (ssh)
-  (write-byte 77) (write-byte 76) (write-byte 10)
+  (%serial-byte 77) (%serial-byte 76) (%serial-byte 10)
   (let ((flag-addr (+ (conn-ssh 3) #x700))
         (cb (- ssh #x20)))
     (setf (mem-ref flag-addr :u32) 1)
     ;; Print encrypted flag
-    (write-byte 69) (write-byte 58)
-    (print-dec (mem-ref (+ ssh #x0C) :u32)) (write-byte 10)
+    (%serial-byte 69) (%serial-byte 58)
+    (print-dec (mem-ref (+ ssh #x0C) :u32)) (%serial-byte 10)
     ;; Print c2s key (first 8 bytes) for verification
-    (write-byte 67) (write-byte 75) (write-byte 58)
+    (%serial-byte 67) (%serial-byte 75) (%serial-byte 58)
     (dotimes (i 8) (print-hex-byte (mem-ref (+ (+ ssh #x090) i) :u8)))
-    (write-byte 10)
+    (%serial-byte 10)
     ;; Print c2s K2 key (second 32 bytes of c2s key, for length cipher)
-    (write-byte 75) (write-byte 50) (write-byte 58)
+    (%serial-byte 75) (%serial-byte 50) (%serial-byte 58)
     (dotimes (i 8) (print-hex-byte (mem-ref (+ (+ ssh #x0B0) i) :u8)))
-    (write-byte 10)
+    (%serial-byte 10)
     (loop
       (when (zerop (mem-ref flag-addr :u32)) (return ()))
       (let ((pkt (ssh-receive-packet ssh 50000)))
         (if pkt
             (progn
-              (write-byte 77) (print-dec (aref (car pkt) 0)) (write-byte 10)
+              (%serial-byte 77) (print-dec (aref (car pkt) 0)) (%serial-byte 10)
               (ssh-dispatch-msg ssh (car pkt) (cdr pkt) flag-addr))
             (progn
               ;; Print buffer state on timeout/nil
-              (write-byte 77) (write-byte 48) (write-byte 58)
-              (print-dec (mem-ref (+ ssh #x6D4) :u32)) (write-byte 10)
+              (%serial-byte 77) (%serial-byte 48) (%serial-byte 58)
+              (print-dec (mem-ref (+ ssh #x6D4) :u32)) (%serial-byte 10)
               (setf (mem-ref flag-addr :u32) 0)))))))
 
 ;; Override ed25519-verify to avoid ASET+AREF register clobber bug.

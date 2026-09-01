@@ -259,7 +259,7 @@
                (string #\Newline)
                ;; kernel-main LAST — "last-defun-wins" makes this the entry point.
                ;; The JMP in boot code targets the last kernel-main in the function table.
-               ;; Must use write-char-serial (the MVM compiler builtin), not write-byte.
+               ;; Must use write-char-serial (the MVM compiler builtin), not %serial-byte.
                "(defun kernel-main ()
   ;; Set up timer interrupts (PIC+PIT+IDT on x64/i386, NOP on aarch64/arm32).
   ;; Boot code also sets this up, but setup-irq ensures it works for all

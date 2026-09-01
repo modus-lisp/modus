@@ -35,10 +35,10 @@
     (when (zerop s) (setq s 42))
     s))
 
-;; write-byte: capture-aware for SSH output routing
+;; %serial-byte: capture-aware for SSH output routing
 ;; Flags at (ssh-ipc-base)+0x14: bit0=capture-to-buffer, bit1=suppress-serial
 ;; Buffer at (ssh-ipc-base)+0x100, pos at (ssh-ipc-base)+0x18
-(defun write-byte (b)
+(defun %serial-byte (b)
   (let ((flags (mem-ref (+ #x40300000 #x14) :u32)))
     (when (zerop (logand flags 2))
       (write-char-serial b))
@@ -52,8 +52,8 @@
 
 (defun print-hex-digit (n)
   (if (< n 10)
-      (write-byte (+ n 48))
-      (write-byte (+ n 55))))
+      (%serial-byte (+ n 48))
+      (%serial-byte (+ n 55))))
 
 (defun print-hex-byte (b)
   (let ((hi (logand (ash b -4) 15))
@@ -189,16 +189,16 @@
 (defun print-dec (n)
   (when (>= n 10)
     (print-dec (truncate n 10)))
-  (write-byte (+ (mod n 10) 48)))
+  (%serial-byte (+ (mod n 10) 48)))
 
 ;; Prompt
 (defun emit-prompt ()
   (if (zerop (mem-ref (+ #x40300000 #x12A00) :u64))
-      (progn (write-byte 62) (write-byte 32))
+      (progn (%serial-byte 62) (%serial-byte 32))
       (progn
-        (write-byte 109) (write-byte 111)
-        (write-byte 100) (write-byte 117)
-        (write-byte 115) (write-byte 62) (write-byte 32))))
+        (%serial-byte 109) (%serial-byte 111)
+        (%serial-byte 100) (%serial-byte 117)
+        (%serial-byte 115) (%serial-byte 62) (%serial-byte 32))))
 
 ;; ============================================================
 ;; E1000 init override for 30-bit fixnum safety
@@ -212,9 +212,9 @@
   (let ((mmio (mem-ref (e1000-state-base) :u64))
         (state (e1000-state-base)))
     (when (zerop mmio)
-      (write-byte 69) (write-byte 49) (write-byte 48) (write-byte 48)
-      (write-byte 48) (write-byte 58) (write-byte 78) (write-byte 111)
-      (write-byte 10)
+      (%serial-byte 69) (%serial-byte 49) (%serial-byte 48) (%serial-byte 48)
+      (%serial-byte 48) (%serial-byte 58) (%serial-byte 78) (%serial-byte 111)
+      (%serial-byte 10)
       (return 0))
 
     ;; 1. Reset: write CTRL.RST (bit 26)
@@ -242,19 +242,19 @@
       (setf (mem-ref (+ mmio #x5407) :u8) #x80)
 
       ;; Print "MAC:" then hex bytes
-      (write-byte 77) (write-byte 65) (write-byte 67) (write-byte 58)
+      (%serial-byte 77) (%serial-byte 65) (%serial-byte 67) (%serial-byte 58)
       (print-hex-byte (logand mac0 #xFF))
-      (write-byte 58)
+      (%serial-byte 58)
       (print-hex-byte (logand (ash mac0 -8) #xFF))
-      (write-byte 58)
+      (%serial-byte 58)
       (print-hex-byte (logand mac1 #xFF))
-      (write-byte 58)
+      (%serial-byte 58)
       (print-hex-byte (logand (ash mac1 -8) #xFF))
-      (write-byte 58)
+      (%serial-byte 58)
       (print-hex-byte (logand mac2 #xFF))
-      (write-byte 58)
+      (%serial-byte 58)
       (print-hex-byte (logand (ash mac2 -8) #xFF))
-      (write-byte 10))
+      (%serial-byte 10))
 
     ;; 4. Clear multicast table
     (dotimes (i 128)
@@ -291,7 +291,7 @@
     (setf (mem-ref (+ state #x1C) :u32) #x0202000A)
 
     ;; "E1000:OK" + newline
-    (write-byte 69) (write-byte 49) (write-byte 48) (write-byte 48)
-    (write-byte 48) (write-byte 58) (write-byte 79) (write-byte 75)
-    (write-byte 10)
+    (%serial-byte 69) (%serial-byte 49) (%serial-byte 48) (%serial-byte 48)
+    (%serial-byte 48) (%serial-byte 58) (%serial-byte 79) (%serial-byte 75)
+    (%serial-byte 10)
     1))

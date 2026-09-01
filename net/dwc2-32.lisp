@@ -146,16 +146,16 @@
   (dwc2-delay-ms 100)
 
   ;; Print status
-  (write-byte 68) (write-byte 87) (write-byte 67)
-  (write-byte 50) (write-byte 58)
+  (%serial-byte 68) (%serial-byte 87) (%serial-byte 67)
+  (%serial-byte 50) (%serial-byte 58)
 
   (let ((hprt (dwc2-read (dwc2-hprt0))))
     (if (not (zerop (logand hprt (hprt0-prtconnsts))))
         (progn
-          (write-byte 79) (write-byte 75) (write-byte 10)
+          (%serial-byte 79) (%serial-byte 75) (%serial-byte 10)
           1)
         (progn
-          (write-byte 78) (write-byte 67) (write-byte 10)
+          (%serial-byte 78) (%serial-byte 67) (%serial-byte 10)
           0))))
 
 ;; Override dwc2-core-reset: check AHB idle via scratch (bit 31)
@@ -297,11 +297,11 @@
   ;; Read port speed from HPRT0 bits [17:16]
   (let ((hprt (dwc2-read (dwc2-hprt0))))
     ;; Print speed
-    (write-byte 80) (write-byte 79) (write-byte 82) (write-byte 84) (write-byte 58)
+    (%serial-byte 80) (%serial-byte 79) (%serial-byte 82) (%serial-byte 84) (%serial-byte 58)
     (let ((speed (logand (ash hprt -17) 3)))
       (cond
-        ((eq speed 0) (write-byte 72) (write-byte 83))
-        ((eq speed 1) (write-byte 70) (write-byte 83))
-        ((eq speed 2) (write-byte 76) (write-byte 83)))
-      (write-byte 10)
+        ((eq speed 0) (%serial-byte 72) (%serial-byte 83))
+        ((eq speed 1) (%serial-byte 70) (%serial-byte 83))
+        ((eq speed 2) (%serial-byte 76) (%serial-byte 83)))
+      (%serial-byte 10)
       speed)))

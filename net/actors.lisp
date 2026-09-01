@@ -190,7 +190,7 @@
 
 (defun shutdown ()
   ;; Print "Bye\n" then halt
-  (write-byte 66) (write-byte 121) (write-byte 101) (write-byte 10)
+  (%serial-byte 66) (%serial-byte 121) (%serial-byte 101) (%serial-byte 10)
   (loop (halt)))
 
 ;;; ============================================================
@@ -229,7 +229,7 @@
     (percpu-set 40 cur-alloc)
     (percpu-set 48 cur-limit))
   ;; Print "ACT"
-  (write-byte 65) (write-byte 67) (write-byte 84) (write-byte 10))
+  (%serial-byte 65) (%serial-byte 67) (%serial-byte 84) (%serial-byte 10))
 
 ;;; ============================================================
 ;;; Actor spawn
@@ -245,7 +245,7 @@
     (if (>= count 64)
         (progn
           (spin-unlock (sched-lock-addr))
-          (write-byte 33)   ; '!' too many actors
+          (%serial-byte 33)   ; '!' too many actors
           0)
         (let ((id count))
           ;; Bump actor count

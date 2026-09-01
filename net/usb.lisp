@@ -192,8 +192,8 @@
       ;; 1. Reset port
       (let ((speed (dwc2-port-reset)))
         (when (< speed 0)
-          (write-byte 85) (write-byte 83) (write-byte 66)
-          (write-byte 58) (write-byte 69) (write-byte 10)
+          (%serial-byte 85) (%serial-byte 83) (%serial-byte 66)
+          (%serial-byte 58) (%serial-byte 69) (%serial-byte 10)
           (return 0))
 
         ;; 2. Short delay after reset
@@ -202,7 +202,7 @@
         ;; 3. GET_DEVICE_DESCRIPTOR at address 0, first 8 bytes
         (let ((r1 (usb-get-descriptor 0 (usb-desc-device) 0 dbuf 8)))
           (when (<= r1 0)
-            (write-byte 68) (write-byte 49) (write-byte 69) (write-byte 10)
+            (%serial-byte 68) (%serial-byte 49) (%serial-byte 69) (%serial-byte 10)
             (return 0))
 
           ;; Read bMaxPacketSize0 (byte 7)
@@ -216,7 +216,7 @@
             ;; 5. SET_ADDRESS to address 1
             (let ((r2 (usb-set-address 1)))
               (when (<= r2 0)
-                (write-byte 65) (write-byte 49) (write-byte 69) (write-byte 10)
+                (%serial-byte 65) (%serial-byte 49) (%serial-byte 69) (%serial-byte 10)
                 (return 0))
 
               ;; Wait for address to take effect
@@ -226,17 +226,17 @@
               ;; 6. GET_DEVICE_DESCRIPTOR at new address (full 18 bytes)
               (let ((r3 (usb-get-descriptor 1 (usb-desc-device) 0 dbuf 18)))
                 (when (<= r3 0)
-                  (write-byte 68) (write-byte 50) (write-byte 69) (write-byte 10)
+                  (%serial-byte 68) (%serial-byte 50) (%serial-byte 69) (%serial-byte 10)
                   (return 0))
 
                 ;; Print vendor:product
-                (write-byte 85) (write-byte 83) (write-byte 66) (write-byte 58)
+                (%serial-byte 85) (%serial-byte 83) (%serial-byte 66) (%serial-byte 58)
                 (print-hex-byte (usb-desc-byte dbuf 9))
                 (print-hex-byte (usb-desc-byte dbuf 8))
-                (write-byte 58)
+                (%serial-byte 58)
                 (print-hex-byte (usb-desc-byte dbuf 11))
                 (print-hex-byte (usb-desc-byte dbuf 10))
-                (write-byte 10)
+                (%serial-byte 10)
 
                 ;; Save device class for hub detection
                 (usb-set-device-class (usb-desc-byte dbuf 4))
@@ -244,7 +244,7 @@
                 ;; 7. GET_CONFIGURATION_DESCRIPTOR (first 9 bytes)
                 (let ((r4 (usb-get-descriptor 1 (usb-desc-configuration) 0 dbuf 9)))
                   (when (<= r4 0)
-                    (write-byte 67) (write-byte 49) (write-byte 69) (write-byte 10)
+                    (%serial-byte 67) (%serial-byte 49) (%serial-byte 69) (%serial-byte 10)
                     (return 0))
 
                   ;; Read wTotalLength
@@ -255,7 +255,7 @@
                     ;; Get full configuration descriptor
                     (let ((r5 (usb-get-descriptor 1 (usb-desc-configuration) 0 dbuf total-len)))
                       (when (<= r5 0)
-                        (write-byte 67) (write-byte 50) (write-byte 69) (write-byte 10)
+                        (%serial-byte 67) (%serial-byte 50) (%serial-byte 69) (%serial-byte 10)
                         (return 0))
 
                       ;; 8. Parse endpoints
@@ -265,7 +265,7 @@
                         (let ((config-val (usb-desc-byte dbuf 5)))
                           (let ((r6 (usb-set-configuration 1 config-val)))
                             (when (<= r6 0)
-                              (write-byte 83) (write-byte 67) (write-byte 69) (write-byte 10)
+                              (%serial-byte 83) (%serial-byte 67) (%serial-byte 69) (%serial-byte 10)
                               (return 0))
 
                             ;; Initialize data toggles
@@ -273,20 +273,20 @@
                             (usb-set-bulk-out-toggle 0)
 
                             ;; Print result
-                            (write-byte 85) (write-byte 83) (write-byte 66) (write-byte 58)
+                            (%serial-byte 85) (%serial-byte 83) (%serial-byte 66) (%serial-byte 58)
                             (if (eq found 1)
                                 (progn
-                                  (write-byte 79) (write-byte 75)
-                                  (write-byte 10)
+                                  (%serial-byte 79) (%serial-byte 75)
+                                  (%serial-byte 10)
                                   (return 1))
                                 ;; No bulk endpoints -- check for hub
                                 (if (eq (usb-device-class) 9)
                                     (progn
-                                      (write-byte 72) (write-byte 85) (write-byte 66) (write-byte 10)
+                                      (%serial-byte 72) (%serial-byte 85) (%serial-byte 66) (%serial-byte 10)
                                       (let ((hr (usb-hub-enumerate-downstream 1 dbuf)))
                                         (return hr)))
                                     (progn
-                                      (write-byte 78) (write-byte 69) (write-byte 10)
+                                      (%serial-byte 78) (%serial-byte 69) (%serial-byte 10)
                                       (return 0))))))))))))))))))
 
 ;; ============================================================
@@ -312,7 +312,7 @@
     ;; bmRequestType=0xA0 (class, device, IN), wValue=0x2900
     (let ((r1 (usb-control-transfer hub-addr #xA0 6 #x2900 0 dbuf 8)))
       (when (<= r1 0)
-        (write-byte 72) (write-byte 68) (write-byte 10)
+        (%serial-byte 72) (%serial-byte 68) (%serial-byte 10)
         (return 0))
       (let ((num-ports (usb-desc-byte dbuf 2)))
         ;; 2. Power all ports: SET_FEATURE(PORT_POWER=8)
@@ -338,7 +338,7 @@
                       (return nil)))))
               (setq p (+ p 1))))
           (when (zerop conn-port)
-            (write-byte 72) (write-byte 78) (write-byte 67) (write-byte 10)
+            (%serial-byte 72) (%serial-byte 78) (%serial-byte 67) (%serial-byte 10)
             (return 0))
           ;; 4. Reset port: SET_FEATURE(PORT_RESET=4)
           (usb-control-transfer hub-addr #x23 3 4 conn-port 0 0)
@@ -349,34 +349,34 @@
           ;; 5. Enumerate downstream device (starts at address 0)
           (let ((r3 (usb-get-descriptor 0 (usb-desc-device) 0 dbuf 8)))
             (when (<= r3 0)
-              (write-byte 72) (write-byte 68) (write-byte 49) (write-byte 10)
+              (%serial-byte 72) (%serial-byte 68) (%serial-byte 49) (%serial-byte 10)
               (return 0))
             ;; SET_ADDRESS to 2 (hub is at 1)
             (let ((r4 (usb-set-address 2)))
               (when (<= r4 0)
-                (write-byte 72) (write-byte 65) (write-byte 10)
+                (%serial-byte 72) (%serial-byte 65) (%serial-byte 10)
                 (return 0))
               (dwc2-delay-ms 10)
               ;; Full device descriptor at address 2
               (let ((r5 (usb-get-descriptor 2 (usb-desc-device) 0 dbuf 18)))
                 (when (<= r5 0)
-                  (write-byte 72) (write-byte 68) (write-byte 50) (write-byte 10)
+                  (%serial-byte 72) (%serial-byte 68) (%serial-byte 50) (%serial-byte 10)
                   (return 0))
                 ;; Print downstream VID:PID
-                (write-byte 68) (write-byte 69) (write-byte 86) (write-byte 58)
+                (%serial-byte 68) (%serial-byte 69) (%serial-byte 86) (%serial-byte 58)
                 (print-hex-byte (usb-desc-byte dbuf 9))
                 (print-hex-byte (usb-desc-byte dbuf 8))
-                (write-byte 58)
+                (%serial-byte 58)
                 (print-hex-byte (usb-desc-byte dbuf 11))
                 (print-hex-byte (usb-desc-byte dbuf 10))
-                (write-byte 10)
+                (%serial-byte 10)
                 ;; Get the selected config descriptor (see usb-hub-config-index:
                 ;; QEMU usb-net wants index 1 = CDC-ECM; real RTL8153 wants
                 ;; index 0 = vendor config).
                 (let ((r6 (usb-get-descriptor 2 (usb-desc-configuration)
                                               (usb-hub-config-index) dbuf 9)))
                   (when (<= r6 0)
-                    (write-byte 72) (write-byte 67) (write-byte 49) (write-byte 10)
+                    (%serial-byte 72) (%serial-byte 67) (%serial-byte 49) (%serial-byte 10)
                     (return 0))
                   (let ((total-len (usb-desc-u16 dbuf 2)))
                     (when (> total-len 512) (setq total-len 512))
@@ -384,7 +384,7 @@
                     (let ((r7 (usb-get-descriptor 2 (usb-desc-configuration)
                                                   (usb-hub-config-index) dbuf total-len)))
                       (when (<= r7 0)
-                        (write-byte 72) (write-byte 67) (write-byte 50) (write-byte 10)
+                        (%serial-byte 72) (%serial-byte 67) (%serial-byte 50) (%serial-byte 10)
                         (return 0))
                       ;; Parse bulk endpoints
                       (let ((found (usb-parse-config-find-bulk-eps dbuf total-len)))
@@ -392,7 +392,7 @@
                         (let ((config-val (usb-desc-byte dbuf 5)))
                           (let ((r8 (usb-set-configuration 2 config-val)))
                             (when (<= r8 0)
-                              (write-byte 72) (write-byte 83) (write-byte 69) (write-byte 10)
+                              (%serial-byte 72) (%serial-byte 83) (%serial-byte 69) (%serial-byte 10)
                               (return 0))
                             ;; Try SET_INTERFACE (best-effort; QEMU usb-net may STALL)
                             (usb-set-interface 2 1 1)
@@ -401,10 +401,10 @@
                             (usb-set-dev-addr 2)
                             (if (eq found 1)
                                 (progn
-                                  (write-byte 72) (write-byte 58) (write-byte 79) (write-byte 75) (write-byte 10)
+                                  (%serial-byte 72) (%serial-byte 58) (%serial-byte 79) (%serial-byte 75) (%serial-byte 10)
                                   (return 1))
                                 (progn
-                                  (write-byte 72) (write-byte 58) (write-byte 78) (write-byte 69) (write-byte 10)
+                                  (%serial-byte 72) (%serial-byte 58) (%serial-byte 78) (%serial-byte 69) (%serial-byte 10)
                                   (return 0)))))))))))))))))
 
 ;; ============================================================

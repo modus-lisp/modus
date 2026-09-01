@@ -146,6 +146,14 @@
 ;; handler-stack depth.  0x10000F00 sits in that gap, 88 bytes clear of the
 ;; config block below it and 256 clear of anything above.
 ;;
+;; SINCE WRITTEN, three further tenants have moved into that gap.  Anyone
+;; claiming a word here must grep #x10000[EF].. first; the list as of #286 is:
+;;   0x10000F00       this slot (DTB pointer)
+;;   0x10000F10       *aarch64-jit-constvec-root* (#282, translate-aarch64.lisp)
+;;   0x10000F20..F50  GC pause statistics (#286, seven words — see mvm/gc.lisp)
+;;   0x10000FF0       caller-x30 save slot for the out-of-module call thunks
+;; Still free: 0x10000EA8..0x10000EFF, 0x10000F18, 0x10000F58..0x10000FE8.
+;;
 ;; DO NOT ADD IT TO THE BSS-ZEROING LIST.  build-rpi-cl-repl.lisp's kernel-main
 ;; prologue zeroes the metadata words that stand in for BSS.  This slot is
 ;; written BEFORE kernel-main runs, so zeroing it would erase the one thing it
@@ -156,7 +164,7 @@
 ;; into compiled literals and interp.lisp keys truthiness on that exact bit
 ;; pattern; boot-rpi.lisp's hardcoded x26 = 0 splits the NIL representation
 ;; and breaks mvm-eval.  Same knob and same value as the QEMU-virt bare image
-;; (*aarch64-fixpoint-nil-value*, set to #xDEAD0001 by build-aarch64.lisp).
+;; (*aarch64-fixpoint-nil-value*, set to #xDEAD0001 by build-aarch64-ansi.lisp).
 (defvar *rpi-cl-nil-value* #xDEAD0001)
 
 ;;; ============================================================
@@ -302,10 +310,23 @@
     ;;   1. DC CIVAC every line of the low 512MB (dirty loader lines must
     ;;      reach DRAM BEFORE the cache goes off; VA=PA under U-Boot's map,
     ;;      and with caches already off the ops are harmless no-ops).
-    ;;   2. Clear SCTLR_EL2.{M,C} (both boot paths enter at EL2; guarded by
+    ;;   2. Clear SCTLR_EL2.{M,C,SA} (both boot paths enter at EL2; guarded by
     ;;      CurrentEL so a hypothetical EL1 entry skips the EL2 register).
-    ;;   3. Clear SCTLR_EL1.{M,C} too — legal from EL2, harmless, and covers
+    ;;   3. Clear SCTLR_EL1.{M,C,SA} too — legal from EL2, harmless, and covers
     ;;      any future drop to EL1.
+    ;;
+    ;; SA (bit 3) joined the mask 2026-08-31.  Modus's bare-metal AArch64 stack
+    ;; discipline is deliberately EIGHT bytes (*aarch64-stack-align-16* is NIL
+    ;; for these images), so SP is 8-mod-16 for half its life and SA=1 makes the
+    ;; next SP-relative access raise an SP alignment fault (ESR EC=0x26).  QEMU
+    ;; TCG does not implement that check; real ARM silicon does.  The bare-metal
+    ;; QEMU-virt image died before printing one byte the first time it was ever
+    ;; run under -accel kvm on a Pi 5 — see the matching note in
+    ;; boot-aarch64.lisp.  This image has been getting away with it only because
+    ;; the firmware happened to hand over with SA clear; that is luck, not a
+    ;; guarantee, and the U-Boot `go' netboot path below hands over in a state
+    ;; the firmware path demonstrably does not share.  Cost is one bit in a mask
+    ;; that was already being written.
     ;; X0 (firmware DTB pointer) is preserved; scratch = x9/x10/x11/x16/x17.
     (emit-aarch64-load-imm64 buf x16 0)
     (emit-aarch64-load-imm64 buf x17 #x20000000)
@@ -319,11 +340,11 @@
     (emit-aarch64-u32 buf #xF100213F)              ; cmp x9, #8  (EL2?)
     (a64-bcond buf #b0001 5)                       ; b.ne +5 — skip EL2 block
     (emit-aarch64-u32 buf #xD53C100A)              ; mrs x10, sctlr_el2
-    (emit-aarch64-u32 buf #xD28000AB)              ; movz x11, #5  (M|C)
+    (emit-aarch64-u32 buf #xD28001AB)              ; movz x11, #13 (M|C|SA)
     (emit-aarch64-u32 buf #x8A2B014A)              ; bic x10, x10, x11
     (emit-aarch64-u32 buf #xD51C100A)              ; msr sctlr_el2, x10
     (emit-aarch64-u32 buf #xD538100A)              ; mrs x10, sctlr_el1
-    (emit-aarch64-u32 buf #xD28000AB)              ; movz x11, #5
+    (emit-aarch64-u32 buf #xD28001AB)              ; movz x11, #13 (M|C|SA)
     (emit-aarch64-u32 buf #x8A2B014A)              ; bic x10, x10, x11
     (emit-aarch64-u32 buf #xD518100A)              ; msr sctlr_el1, x10
     (emit-aarch64-u32 buf #xD5033F9F)              ; dsb sy
@@ -587,6 +608,39 @@
     (emit-aarch64-load-imm64 buf x16 *rpi-cl-vbar*)
     (emit-aarch64-u32 buf #xD518C010)       ; MSR VBAR_EL1, X16
     (emit-aarch64-u32 buf #xD51CC010)       ; MSR VBAR_EL2, X16
+    (emit-aarch64-u32 buf #xD5033FDF)       ; ISB SY
+
+    ;; --- 5b. Enable FP/SIMD -----------------------------------------------
+    ;; Without this EVERY floating-point instruction traps, and
+    ;; translate-aarch64 emits real ones (a64-fadd-d / a64-fmul-d /
+    ;; a64-fdiv-d / a64-scvtf-d-x).  The symptom is nowhere near the cause:
+    ;; the READER cannot build a float, so `read' signals PROGRAM-ERROR,
+    ;; install-tarball treats a read error as end-of-file, and a library file
+    ;; silently TRUNCATES at its first float literal while the installer still
+    ;; prints "done".  Diagnosed in QEMU virt 2026-08-30, where
+    ;; pagetree/src/btree.lisp lost every definition after line 1040.
+    ;;
+    ;; TWO registers, because THIS IMAGE RUNS AT EL2 (see the VBAR note above:
+    ;; PSTATE 0x3c9, M[3:0]=0b1001).  At EL2 the trap is CPTR_EL2.TFP, NOT
+    ;; CPACR_EL1 — setting only CPACR_EL1 (which is what the QEMU-virt EL1
+    ;; boot needs) would leave the Pi still trapping.  Write both so the image
+    ;; is correct at whichever EL it ends up running.
+    ;;   CPTR_EL2  = S3_4_C1_C1_2 : clear TFP (bit 10) => do not trap FP
+    ;;   CPACR_EL1 = S3_0_C1_C0_2 : FPEN (bits 21:20) = 0b11 => full access
+    ;; Encodings cross-checked by regenerating the four MRS/MSR words already
+    ;; present above (SCTLR_EL1 read/write, VBAR_EL1, VBAR_EL2) from the same
+    ;; formula: field = op0[1:0]<<14 | op1<<11 | CRn<<7 | CRm<<3 | op2, then
+    ;; MRS = 0xD5300000|field<<5|Rt, MSR = 0xD5100000|field<<5|Rt.  All four
+    ;; matched this file byte for byte, so the two new ones are derived, not
+    ;; guessed.  x16/x17 are the scratch pair this preamble already uses.
+    (emit-aarch64-u32 buf #xD53C1150)       ; MRS X16, CPTR_EL2
+    (emit-aarch64-load-imm64 buf x17 #x400) ; TFP = bit 10
+    (emit-aarch64-u32 buf #x8A310210)       ; BIC X16, X16, X17  (clear TFP)
+    (emit-aarch64-u32 buf #xD51C1150)       ; MSR CPTR_EL2, X16
+    (emit-aarch64-u32 buf #xD5381050)       ; MRS X16, CPACR_EL1
+    (emit-aarch64-load-imm64 buf x17 #x300000) ; FPEN = bits 21:20
+    (emit-aarch64-u32 buf #xAA110210)       ; ORR X16, X16, X17
+    (emit-aarch64-u32 buf #xD5181050)       ; MSR CPACR_EL1, X16
     (emit-aarch64-u32 buf #xD5033FDF)       ; ISB SY
 
     ;; --- 6. code_base / code_end for FUNCTIONP ---------------------------

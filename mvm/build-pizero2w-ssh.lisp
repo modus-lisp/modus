@@ -45,7 +45,7 @@
 ;; Install the AArch64 translator
 (install-aarch64-translator)
 
-;; Use mini UART (0x3F215040) instead of PL011 (0x3F201000) for write-byte
+;; Use mini UART (0x3F215040) instead of PL011 (0x3F201000) for %serial-byte
 ;; Mini UART clock is always running; PL011 clock needs mailbox setup
 (setf *aarch64-serial-base* #x3F215040)
 ;; BCM2837 peripherals require 32-bit stores (byte stores silently ignored)
@@ -87,27 +87,27 @@
                          ;; AUX_MU_CNTL = 3 (enable TX+RX)
                          "  (setf (mem-ref #x3F215060 :u32) 3)"
                          ;; UART ready marker
-                         "  (write-byte 85) (write-byte 65) (write-byte 82)"
-                         "  (write-byte 84) (write-byte 10)"
+                         "  (%serial-byte 85) (%serial-byte 65) (%serial-byte 82)"
+                         "  (%serial-byte 84) (%serial-byte 10)"
                          ;; Initialize USB gadget + CDC-ECM Ethernet
                          "  (cdc-ether-init)"
                          ;; Set DNS server to 8.8.8.8 (works with host NAT)
                          "  (setf (mem-ref (+ (e1000-state-base) #x58) :u32) #x08080808)"
-                         "  (write-byte 91) (write-byte 49) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 49) (%serial-byte 93)"
                          "  (sha256-init)"
-                         "  (write-byte 91) (write-byte 50) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 50) (%serial-byte 93)"
                          "  (sha512-init)"
-                         "  (write-byte 91) (write-byte 51) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 51) (%serial-byte 93)"
                          ;; Clear ed25519 init flag — uninitialized RAM on real hardware
                          ;; may be non-zero, causing ed25519-init to skip initialization
                          "  (setf (mem-ref (+ (e1000-state-base) #x5D0) :u32) 0)"
                          "  (ed25519-init)"
-                         "  (write-byte 91) (write-byte 52) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 52) (%serial-byte 93)"
                          "  (ssh-seed-random)"
-                         "  (write-byte 91) (write-byte 53) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 53) (%serial-byte 93)"
                          ;; Ed25519 self-test: sign empty message with zero key, verify
                          "  (ed25519-test)"
-                         "  (write-byte 91) (write-byte 54) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 54) (%serial-byte 93)"
                          ;; Host key inline
                          "  (let ((state (e1000-state-base)))"
                          "    (setf (mem-ref (+ state #x710) :u64) 0)"
@@ -123,24 +123,24 @@
                          "    (setf (mem-ref (+ state #x748) :u32) #xA148C03A)"
                          "    (setf (mem-ref (+ state #x74C) :u32) #x29DA598B)"
                          "    (setf (mem-ref (+ state #x624) :u32) 1))"
-                         "  (write-byte 91) (write-byte 57) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 57) (%serial-byte 93)"
                          ;; Pre-compute ed25519 host key derivatives (s, prefix)
                          ;; This saves ~5s of crypto during SSH key exchange
                          "  (pre-compute-host-sign)"
-                         "  (write-byte 91) (write-byte 66) (write-byte 93)"
-                         "  (write-byte 83) (write-byte 83) (write-byte 72)"
-                         "  (write-byte 58) (print-dec 22) (write-byte 10)"
+                         "  (%serial-byte 91) (%serial-byte 66) (%serial-byte 93)"
+                         "  (%serial-byte 83) (%serial-byte 83) (%serial-byte 72)"
+                         "  (%serial-byte 58) (print-dec 22) (%serial-byte 10)"
                          "  (setf (mem-ref (+ (ssh-ipc-base) #x60438) :u32) 22)"
                          "  (let ((i 0))"
                          "    (loop"
                          "      (when (>= i 4) (return 0))"
                          "      (setf (mem-ref (conn-base i) :u32) 0)"
                          "      (setq i (+ i 1))))"
-                         "  (write-byte 91) (write-byte 65) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 65) (%serial-byte 93)"
                          ;; Pre-compute server ephemeral X25519 key pair
                          ;; Must be after conn-base clear and ssh-seed-random
                          "  (pre-compute-server-eph (conn-ssh 0))"
-                         "  (write-byte 91) (write-byte 67) (write-byte 93)"
+                         "  (%serial-byte 91) (%serial-byte 67) (%serial-byte 93)"
                          ;; Enable ARM timer for WFI-based io-delay (after all crypto init)
                          "  (enable-rpi-timer)"
                          "  (net-actor-main))"

@@ -19,10 +19,10 @@
       (dotimes (d 5000) (mem-ref #x3F201000 :u8))
       (progn (timer-rearm) (wfi))))
 
-;; write-byte: capture-aware for SSH output routing
+;; %serial-byte: capture-aware for SSH output routing
 ;; Flags at ssh-ipc-base+0x14: bit0=capture-to-buffer, bit1=suppress-serial
 ;; Buffer at ssh-ipc-base+0x100, pos at ssh-ipc-base+0x18
-(defun write-byte (b)
+(defun %serial-byte (b)
   (let ((flags (mem-ref (+ #x01100000 #x14) :u32)))
     (when (zerop (logand flags 2))
       (write-char-serial b))
@@ -45,8 +45,8 @@
 
 (defun print-hex-digit (n)
   (if (< n 10)
-      (write-byte (+ n 48))
-      (write-byte (+ n 55))))
+      (%serial-byte (+ n 48))
+      (%serial-byte (+ n 55))))
 
 (defun print-hex-byte (b)
   (let ((hi (logand (ash b -4) 15))
@@ -208,20 +208,20 @@
 (defun print-dec (n)
   ;; Print non-negative integer in decimal
   (if (< n 10)
-      (write-byte (+ 48 n))
+      (%serial-byte (+ 48 n))
       (let ((q 0) (r 0))
         (setq q (/ n 10))
         (setq r (- n (* q 10)))
         (print-dec q)
-        (write-byte (+ 48 r)))))
+        (%serial-byte (+ 48 r)))))
 
 (defun emit-prompt ()
   (if (zerop (mem-ref (+ #x01100000 #x12A00) :u64))
-      (progn (write-byte 62) (write-byte 32))
+      (progn (%serial-byte 62) (%serial-byte 32))
       (progn
-        (write-byte 109) (write-byte 111)
-        (write-byte 100) (write-byte 117)
-        (write-byte 115) (write-byte 62) (write-byte 32))))
+        (%serial-byte 109) (%serial-byte 111)
+        (%serial-byte 100) (%serial-byte 117)
+        (%serial-byte 115) (%serial-byte 62) (%serial-byte 32))))
 
 ;; ============================================================
 ;; Actor system address hooks (RPi 3B / Pi Zero 2 W memory layout)

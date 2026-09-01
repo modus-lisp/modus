@@ -2308,6 +2308,15 @@
   "Coerce X to a string. String->itself, symbol->name, character->1-char string."
   (cond
     ((stringp x) x)
+    ;; NIL is a SYMBOL, and CLHS makes every symbol a string designator, so
+    ;; (string nil) is "NIL" -- not NIL.  This branch must come BEFORE the
+    ;; obj-subtag test below, which deliberately excludes NIL (an immediate,
+    ;; not a heap object, so obj-subtag on it reads garbage).  Without it NIL
+    ;; fell through to the (t x) identity arm and STRING returned NIL, which
+    ;; made every downstream designator use fail: quicklisp's user-agent-string
+    ;; does (string-equal version nil) and that error was the whole reason
+    ;; ql-http could not build an HTTP request on any arch (#293).
+    ((null x) "NIL")
     ((%cl-sym-p x) (%cl-sym-name x))
     ((characterp x)
      (let ((s (%make-string-array 1)))

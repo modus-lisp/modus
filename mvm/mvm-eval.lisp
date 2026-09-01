@@ -206,6 +206,26 @@
 (defvar *jit-r-mmap-fail* nil)
 (defvar *jit-r-page-nil* nil)
 (defvar *jit-r-native-escape* nil)
+;;; AArch64 UNCOUNTED-EXIT INSTRUMENTATION.
+;;; %jit-translate-page-1-aarch64 used to `(setq ok nil)` in three relocation
+;;; loops and `return-from … nil` at two more places WITHOUT bumping any
+;;; counter, so a ~50% fallback rate showed up as R-PAGE-NIL = total with every
+;;; named reason reading 0 — i.e. the census could not name the blocker at all.
+;;; The three SITE counters below are per-relocation-site; the four PAGE
+;;; counters are per rejected page (first cause wins), so they are the ones that
+;;; decompose *jit-fallback-count*.
+(defvar *jit-r-lrel-fail* nil
+  "SITE count: an IN-MODULE fn-addr (closure slot-0 / #'LOCAL) reloc failed —
+   fn-map had no native offset, or the entry was not 16-byte aligned.")
+(defvar *jit-r-eoff-nil* nil
+  "PAGE count: fn-map held no native offset for the module's ENTRY function, so
+   there was nothing to call even though every reloc resolved.")
+(defvar *jit-r-aa-crel-pages* nil
+  "PAGE count: rejected because an OUT-OF-MODULE CALL could not be relocated.")
+(defvar *jit-r-aa-frel-pages* nil
+  "PAGE count: rejected because an out-of-module #'NAME value load failed.")
+(defvar *jit-r-aa-lrel-pages* nil
+  "PAGE count: rejected because an IN-MODULE fn-addr reloc failed.")
 (defvar *jit-r-const-baked* nil
   "R-CONST-BAKED: the module's native code would contain BAKED const-pool heap
    addresses (%jit-patch-consts movabs sites), which the next collection makes
@@ -529,6 +549,55 @@
 ;;; 0x10000F00 is repeated here as a literal rather than shared with the
 ;;; translator's *x64-jit-constvec-root*: the two files are in different
 ;;; packages, and an in-image defconstant does not fold.  If one moves, move both.
+;;;
+;;; ============================================================
+;;; THE ROOT IS PER-TARGET (#282 residual, found 2026-08-31)
+;;; ============================================================
+;;;
+;;; x64's root is #x10000F00 (*x64-jit-constvec-root*, translate-x64.lisp:99).
+;;; aarch64's is #x10000F10 (*aarch64-jit-constvec-root*, translate-aarch64.lisp
+;;; :208) — deliberately NOT F00, because on bare-metal aarch64 F00 is
+;;; +rpi-cl-dtb-ptr-slot+ (boot/boot-rpi-cl.lisp:153), the firmware device-tree
+;;; pointer.  The emitted li-const load reads the per-target root
+;;; (translate-aarch64.lisp:3069) and the aarch64 native GC trampoline scans the
+;;; per-target root as a fixed root (translate-aarch64.lisp:5114) — but THIS
+;;; file, which is the only thing that ever WRITES the vector into a root,
+;;; hardcoded x64's F00 on both back-ends.  So on aarch64:
+;;;
+;;;   * the vector was published at F00 while the code loaded from F10 (always
+;;;     0 — measured: JD 87 = 0 after a full bare-metal virt boot);
+;;;   * nothing rooted F00, so the word went stale at the first collection and
+;;;     %jit-constvec handed back a recycled from-space address (measured:
+;;;     %prim-array-length of it = 14,593,280);
+;;;   * %jit-constvec-covers-p's INTACT test therefore failed on every page
+;;;     build that carried a constvec site, and its `return-from … nil` at
+;;;     %jit-translate-page-1-aarch64 is one of the two exits that bump NO R-*
+;;;     census counter — so the blocker was invisible to the census.
+;;;     Measured on bare-metal QEMU virt: *jit-cv-reject* = 261 of 263 total
+;;;     fallbacks, *jit-native-count* = 0, with R-TRANSLATE-ERR / R-RELOC-* /
+;;;     R-MMAP / R-CONST-BAKED all 0.
+;;;   * worse than "no JIT": %jit-sync-constvec's mirror loop kept doing
+;;;     (aset (%jit-constvec) k o) into that recycled address — wild heap
+;;;     writes on a path that ran even though not one form ever went native.
+;;;
+;;; This is the CONVENTION-SLOT ADDRESS DIVERGENCE class (CLAUDE.md #260/#261):
+;;; one side of a contract addresses a slot differently from the other.  The
+;;; cure is the same one #261 used — resolve the address in ONE place, from the
+;;; back-end selector, so the writer and the reader cannot drift apart.
+
+(defun %jit-constvec-root ()
+  "The BSS word holding the tagged JIT constant vector FOR THE ACTIVE BACK-END.
+   Must equal the translator's own root — *x64-jit-constvec-root* (#x10000F00)
+   or *aarch64-jit-constvec-root* (#x10000F10) — because the emitted li-const
+   load and the collector's fixed-root scan both use that one.
+
+   A DEFUN, not a defvar: a defvar initform does not run in-image (Limitation 7)
+   and this is read on the JIT's hot path.  BOUNDP-guarded so an image whose
+   *jit-target-arch* never got set falls back to the x64 slot, which is the
+   historical value — i.e. this change is a no-op on x64 by construction."
+  (if (and (boundp (quote *jit-target-arch*)) (eq *jit-target-arch* :aarch64))
+      #x10000F10
+      #x10000F00))
 
 (defvar *jit-constvec-cap* nil
   "Allocated length of the JIT constant vector, or NIL before the first sync.")
@@ -544,13 +613,14 @@
    `mem-ref :u64` is a raw-word reinterpret in both directions (the keyword
    intern table at #x10000148 is stored and read exactly this way, see
    init-keyword-table / find-symbol), so an unset root reads back as FIXNUM 0."
-  (let ((w (mem-ref #x10000F00 :u64)))
+  (let ((w (mem-ref (%jit-constvec-root) :u64)))
     (if (eql w 0) nil w)))
 
 (defun %jit-constvec-install (v)
   "Publish V as the JIT constant vector by storing its tagged word in the fixed
-   BSS root the emitted code loads from and the collector forwards."
-  (setf (mem-ref #x10000F00 :u64) v)
+   BSS root the emitted code loads from and the collector forwards.
+   PER-TARGET address — see %jit-constvec-root."
+  (setf (mem-ref (%jit-constvec-root) :u64) v)
   v)
 
 (defun %jit-sync-constvec (vneed)
@@ -865,6 +935,67 @@
             (when (and (> (cdr o) start) (< (cdr o) end)) (setq end (cdr o))))
           (dolist (cp cpatches)
             (when (and (>= (car cp) start) (< (car cp) end)) (setq clean nil)))
+          (when clean (setq out (cons c out)))))
+      out)))
+
+(defun %jit-fn-native-offsets-aarch64 (ft-list fn-map nlen cpatches)
+  "AArch64 sibling of %jit-fn-native-offsets: the (NAME . NATIVE-BYTE-OFFSET)
+   alist %jit-install-native-fns needs to publish a module's top-level DEFUNs as
+   REAL NATIVE functions (WS5 #222).
+
+   IT EXISTS BECAUSE THE TWO BACK-ENDS RETURN DIFFERENT FN-MAPS, and that alone
+   is why aarch64 never got #222.  translate-mvm-to-x64's fn-map is keyed by
+   NAME and holds a LABEL (label-position resolves it); translate-mvm-to-aarch64's
+   is keyed by MVM BYTECODE OFFSET and holds the native BYTE OFFSET directly
+   (see its docstring, and %jit-translate-page-1-aarch64's own
+   `(gethash mvm-entry fn-map)` for the module entry).  FT-LIST is
+   (NAME MVM-OFFSET LENGTH) on both back-ends, so CADR bridges the two.
+
+   WHAT IT FIXES.  With element 6 of the aarch64 jit-entry hardwired to NIL,
+   %mvm-eval-jit-run's `(when (and persist-names (cadr (cddddr je)) …))` never
+   fired, so EVERY runtime DEFUN kept the %mvm-make-trampoline heap closure
+   (tag 9).  The out-of-module CALL relocation requires a tag-3 NATIVE callee
+   (#206 — the heap has no PROT_EXEC), so every later form calling a runtime
+   DEFUN failed relocation and the WHOLE calling module interpreted.  That is
+   self-propagating: a library is a connected component of runtime DEFUNs, so
+   loading one leaves all of it interpreted.  Measured on QEMU virt before this
+   change: 227 of 227 fallbacks were out-of-module CALL rejects, 1491 of 1518
+   failed sites were [heap-closure], and *jit-native-defun-count* was 0.
+
+   CLEANLINESS RULE, identical to the x64 sibling: a function is admitted only
+   if its native byte range holds NO BAKED const patch site, because a baked
+   const is a heap address in code that outlives the seam and nothing re-bakes
+   it.  On this back-end the page-level R-CONST-BAKED gate has already rejected
+   the whole module if any positive-offset patch exists, so the test is normally
+   vacuous — it is kept as the interlock that re-imposes the old conservative
+   rule automatically should the constvec ever be off.  NEGATIVE offsets are
+   constvec SIZING records, not patch sites: they name a slot in the GC-updated
+   constant vector, which is append-only and globally indexed, so an installed
+   function reading it after any number of collections still gets its own
+   constant.  They are GC-safe anywhere and must not reject a function."
+  (let ((raw nil))
+    (dolist (e ft-list)
+      (let ((nm (car e)) (dup nil))
+        ;; A name appearing twice makes the range attribution ambiguous — skip
+        ;; both, exactly as the x64 sibling does.
+        (let ((seen 0))
+          (dolist (e2 ft-list)
+            (when (string= (car e2) nm) (setq seen (+ seen 1))))
+          (when (> seen 1) (setq dup t)))
+        (unless dup
+          (let ((p (gethash (cadr e) fn-map)))
+            (when (integerp p) (setq raw (cons (cons nm p) raw)))))))
+    ;; END = the smallest start strictly greater than this one (scanned, so the
+    ;; result does not depend on FT-LIST ordering), else NLEN.  Over-wide for
+    ;; the last function, which can only REJECT one, never admit a dirty one.
+    (let ((out nil))
+      (dolist (c raw)
+        (let ((start (cdr c)) (end nlen) (clean t))
+          (dolist (o raw)
+            (when (and (> (cdr o) start) (< (cdr o) end)) (setq end (cdr o))))
+          (dolist (cp cpatches)
+            (when (and (>= (car cp) 0) (>= (car cp) start) (< (car cp) end))
+              (setq clean nil)))
           (when clean (setq out (cons c out)))))
       out)))
 
@@ -1230,11 +1361,16 @@
              (npages (+ 1 (ash nlen -12)))
              (psize (ash npages 12))
              (base (%mmap-exec-page psize))
-             (k 0) (ok t))
+             ;; WHY: 0 = no failure yet, 1 = out-of-module CALL, 2 = #'NAME
+             ;; value load, 3 = in-module fn-addr.  FIRST cause wins, so the
+             ;; page-level counters partition the rejected pages exactly.
+             (k 0) (ok t) (why 0))
         ;; SAFE-FLIP GUARD: MAP_FAILED (mmap returns -errno = a NEGATIVE/tiny Lisp
         ;; integer, vs a huge-positive address) → DON'T write/call a bad page;
         ;; return NIL so the seam falls back to mvm-interpret for this form.
         (when (< base 4096)
+          (setq *jit-r-mmap-fail*
+                (if *jit-r-mmap-fail* (+ 1 *jit-r-mmap-fail*) 1))
           (return-from %jit-translate-page-1-aarch64 nil))
         (loop
           (when (>= k nwords) (return nil))
@@ -1258,13 +1394,55 @@
                  (fn (and name (%mvm-resolve-runtime-fn name)))
                  (word (if fn (%val->word fn) 0))
                  (addr (if (eql (logand word 15) 3) (- word 3) 0)))
-            (if (> addr 0) (%jit-write-movz-quad base (car r) addr) (setq ok nil))))
+            (if (> addr 0)
+                (%jit-write-movz-quad base (car r) addr)
+                (progn
+                  ;; CENSUS (x64 parity): "resolved but it is a HEAP closure —
+                  ;; a runtime DEFUN" is a completely different blocker from
+                  ;; "no such runtime function", and only the first is fixable
+                  ;; by publishing runtime DEFUNs natively (WS5 #222).
+                  (if fn
+                      (setq *jit-r-reloc-call-nonnative*
+                            (if *jit-r-reloc-call-nonnative*
+                                (+ 1 *jit-r-reloc-call-nonnative*) 1))
+                      (setq *jit-r-reloc-call-unresolved*
+                            (if *jit-r-reloc-call-unresolved*
+                                (+ 1 *jit-r-reloc-call-unresolved*) 1)))
+                  ;; Name recording is OPT-IN (*jit-census-on*): %jit-census-note
+                  ;; concatenates a fresh string and linearly rescans a
+                  ;; 96-entry alist at EVERY failed site, which measurably slows
+                  ;; a library load.  The tallies above are always on.
+                  ;; boundp-guarded because a defvar initform may not have run
+                  ;; (Limitation 7), and an UNBOUND-VARIABLE signalled here is
+                  ;; swallowed by %jit-translate-page's handler-case, which would
+                  ;; re-badge every reject as R-TRANSLATE-ERR and destroy the
+                  ;; very attribution this census exists to provide.
+                  (when (and name (boundp (quote *jit-census-on*)) *jit-census-on*
+                             (boundp (quote *jit-blocked-callees*)))
+                    (setq *jit-blocked-callees*
+                          (%jit-census-note
+                            (if fn (concatenate (quote string) name " [heap-closure]")
+                                (concatenate (quote string) name " [unresolved]"))
+                            *jit-blocked-callees*)))
+                  (when (eql why 0) (setq why 1))
+                  (setq ok nil)))))
         ;; Out-of-module #'NAME fn-addr relocations (full TAGGED fn word).
         (dolist (r frel)
           (let* ((name (gethash (cdr r) rt-table))
                  (fn (and name (%mvm-resolve-runtime-fn name)))
                  (word (if fn (%val->word fn) 0)))
-            (if (> word 0) (%jit-write-movz-quad base (car r) word) (setq ok nil))))
+            (if (> word 0)
+                (%jit-write-movz-quad base (car r) word)
+                (progn
+                  (setq *jit-r-reloc-fnaddr-fail*
+                        (if *jit-r-reloc-fnaddr-fail*
+                            (+ 1 *jit-r-reloc-fnaddr-fail*) 1))
+                  (when (and name (boundp (quote *jit-census-on*)) *jit-census-on*
+                             (boundp (quote *jit-blocked-fnaddrs*)))
+                    (setq *jit-blocked-fnaddrs*
+                          (%jit-census-note name *jit-blocked-fnaddrs*)))
+                  (when (eql why 0) (setq why 2))
+                  (setq ok nil)))))
         ;; WS5: IN-MODULE fn-addr relocations.  These are the sites that build a
         ;; CLOSURE (make-closure stores the lambda's fn-addr in slot 0) and any
         ;; #'LOCAL-FN value-load.  The whole-image path defers them to
@@ -1281,12 +1459,31 @@
                  (addr (if noff (+ base noff) 0)))
             (if (and noff (eql (logand addr 15) 0))
                 (%jit-write-movz-quad base (car r) (logior addr 3))
-                (setq ok nil))))
+                (progn
+                  (setq *jit-r-lrel-fail*
+                        (if *jit-r-lrel-fail* (+ 1 *jit-r-lrel-fail*) 1))
+                  (when (eql why 0) (setq why 3))
+                  (setq ok nil)))))
         ;; Quoted-literal / string li-const patches (pool object tagged word).
         ;; Post-gate these are THUNK-ONLY sites, so %jit-entry-for's post-GC
         ;; re-bake (which runs before the seam re-enters the thunk) covers them.
         (%jit-patch-consts-aarch64 base cpat)
         (%jit-icache-flush base nlen)
+        ;; PAGE-LEVEL ATTRIBUTION.  One bump per REJECTED page, by first cause,
+        ;; so these partition the R-PAGE-NIL total (the site counters above can
+        ;; multiply-count a single page).
+        (unless (and ok eoff)
+          (cond ((eql why 1) (setq *jit-r-aa-crel-pages*
+                                   (if *jit-r-aa-crel-pages*
+                                       (+ 1 *jit-r-aa-crel-pages*) 1)))
+                ((eql why 2) (setq *jit-r-aa-frel-pages*
+                                   (if *jit-r-aa-frel-pages*
+                                       (+ 1 *jit-r-aa-frel-pages*) 1)))
+                ((eql why 3) (setq *jit-r-aa-lrel-pages*
+                                   (if *jit-r-aa-lrel-pages*
+                                       (+ 1 *jit-r-aa-lrel-pages*) 1)))
+                (t (setq *jit-r-eoff-nil*
+                         (if *jit-r-eoff-nil* (+ 1 *jit-r-eoff-nil*) 1)))))
         (if (and ok eoff)
             ;; 3rd element = CPATCHES, so %jit-entry-for can re-bake after a
             ;; collection moved the pool objects (was NIL, which silently
@@ -1294,10 +1491,20 @@
             ;; 5th element = PSIZE, so a transient form's page can be munmap'd
             ;; (%jit-free-page base psize) after its native call — see
             ;; %mvm-eval-jit-run's reclamation.
-            ;; 6th (fn-native-offsets) unused on this path; 7th = this
-            ;; module's const pool for the cross-page sweep (see the x64
-            ;; creator's comment).
-            (list base eoff cpat (%gc-count) psize nil *e2-const-pool*)
+            ;; 6th = the per-function native-offset alist for WS5 #222 native
+            ;; DEFUN installation.  This was hardwired NIL, which silently
+            ;; disabled #222 on this back-end: every runtime DEFUN kept its
+            ;; tag-9 heap trampoline, so every later form CALLING one failed the
+            ;; #206 native-callee relocation and the whole calling module
+            ;; interpreted — call-relocation contagion across a library's entire
+            ;; call graph.  See %jit-fn-native-offsets-aarch64 for why a
+            ;; separate function is needed (the two back-ends' fn-maps are keyed
+            ;; differently) and for the measurement.
+            ;; 7th = this module's const pool for the cross-page sweep (see the
+            ;; x64 creator's comment).
+            (list base eoff cpat (%gc-count) psize
+                  (%jit-fn-native-offsets-aarch64 ft-list fn-map nlen cpat)
+                  *e2-const-pool*)
             nil)))))
 
 (defvar *jit-translate-err-count* 0
@@ -1583,7 +1790,20 @@
                     (let ((result (%mvm-wrap-escaping-result raw bc fn-table rt-table lam-offsets)))
                       ;; Reclaim the (uncached) aarch64 page unless the RESULT is a
                       ;; function/closure whose code is in it.  car(cddddr je) = PSIZE.
-                      (when (and aa64 (car (cddddr je)) (not (functionp result)))
+                      (when (and aa64 (car (cddddr je)) (not (functionp result))
+                                 ;; NEVER reclaim a page this module PUBLISHED
+                                 ;; functions out of (WS5 #222): their entry
+                                 ;; addresses are live in both function tables
+                                 ;; and in any later page that baked them, so
+                                 ;; munmap would be a use-after-free of code.
+                                 ;; Reclamation is currently gated off
+                                 ;; (*jit-reclaim-on* has no binding at all, so
+                                 ;; AA64 is NIL), which is why this was latent;
+                                 ;; now that aarch64 installs natives it is the
+                                 ;; invariant made explicit, not a behaviour
+                                 ;; change.
+                                 (not (and persist-names (cadr (cddddr je))
+                                           (%jit-native-defuns-p))))
                         (%jit-free-page (car je) (car (cddddr je))))
                       result))
                   ;; RESIDUAL SHAPE ONLY: a count outside [0,21] (or a non-fixnum
@@ -2663,3 +2883,75 @@
                    (progn (%e2ic-bump-fallback)
                           (error "mvm-eval: deftype expander compile failed (type=~S)"
                                  type))))))))))
+
+;;; ============================================================
+;;; DISASSEMBLE — the real one (overrides cl-eval.lisp's fallback)
+;;; ============================================================
+;;;
+;;; POSITION IS LOAD-BEARING.  This must live AFTER *compiler-source* in the
+;;; build's source assembly (bridge -> mvm.lisp -> interp -> compiler.lisp ->
+;;; mvm-eval.lisp).  Calls are resolved BY NAME AT BUILD TIME, so the same code
+;;; placed in cl-eval.lisp (inside the bridge) binds make-mvm-buffer and
+;;; mvm-compile-toplevel to %%unresolved-fn, which returns NIL, and the
+;;; disassembler then dies with a TYPE-ERROR on the NIL buffer.  That is not a
+;;; hypothetical: it is what the first attempt did, and the build log named it
+;;; ("1 x MODUS.MVM::MAKE-MVM-BUFFER" under "unresolved calls").
+;;;
+;;; Modus prints MVM BYTECODE, not native code, and that is the honest choice:
+;;; native code exists only for forms the JIT has translated, which happens on
+;;; EXECUTION, not definition, and the image's baked functions retain no
+;;; bytecode at all.  Bytecode is also arch-independent, so this same output
+;;; appears on x64, aarch64 and i386.
+
+(defun %disassemble-form (form)
+  "Compile FORM (a DEFUN form) through the SAME pipeline mvm-eval uses --
+   mvm-compile-toplevel -> emit-bytecode-for-ir -- and print the resulting
+   MVM bytecode symbolically.  Returns T if anything was printed.
+
+   Reusing the production pipeline is the point: a disassembler on its own
+   private path could disagree with what actually executes, which would make
+   it worse than no disassembler at all."
+  (let ((all-ir nil) (ok nil))
+    (let ((result (mvm-compile-toplevel form)))
+      (cond
+        ((null result) nil)
+        ((and (consp result) (eq (car result) :multi-result))
+         (dolist (sub (cdr result))
+           (when (and (car sub) (cdr sub))
+             (setq all-ir (cons (cons (car sub) (cdr sub)) all-ir)))))
+        (t (when (and (car result) (cdr result))
+             (setq all-ir (cons (cons (car result) (cdr result)) all-ir))))))
+    (setq all-ir (reverse all-ir))
+    (dolist (e all-ir)
+      (let* ((info (car e))
+             (ir (cdr e))
+             (size (let ((s 0))
+                     (dolist (insn ir) (setq s (+ s (ir-instruction-size insn))))
+                     s))
+             (buf (make-mvm-buffer :bytes (make-array (+ size 256))))
+             (lp (compute-label-positions ir)))
+        (emit-bytecode-for-ir buf ir lp)
+        (format t "; ~A  (~D bytes of MVM bytecode)~%"
+                (string (function-info-name info)) size)
+        (disassemble-mvm (mvm-buffer-used-bytes buf))
+        (setq ok t)))
+    ok))
+
+(defun disassemble (fn)
+  "CLHS DISASSEMBLE.  FN is an extended function designator OR a lambda
+   expression.  Output format is implementation-defined; the return is NIL.
+
+   A LAMBDA EXPRESSION is compiled fresh and fully disassembled to MVM
+   bytecode.  For a named function there is no retained source or bytecode,
+   so we say so plainly instead of printing something misleading."
+  (let ((done nil))
+    (when (and (consp fn) (symbolp (car fn))
+               (string-equal (string (car fn)) "LAMBDA"))
+      (setq done (%disassemble-form
+                  (cons (quote defun)
+                        (cons (quote %disassembled-lambda) (cdr fn))))))
+    (unless done
+      (format t "; disassemble: no bytecode retained for this object.~%")
+      (format t ";   Pass a lambda expression to see compiler output, e.g.~%")
+      (format t ";   (disassemble '(lambda (x) (* x x)))~%")))
+  nil)

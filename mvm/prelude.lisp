@@ -10,7 +10,7 @@
 ;;;; - let, let*, if, cond, loop, setq, progn, when, unless
 ;;;; - car, cdr, cons, consp, null, not, eq, atom
 ;;;; - Arithmetic, comparisons, logand, logior, logxor, ash
-;;;; - write-byte, mem-ref
+;;;; - %serial-byte, mem-ref
 
 
 (in-package :modus.mvm)
@@ -610,15 +610,89 @@
 ;;; Array Utilities
 ;;; ============================================================
 
+;;; ------------------------------------------------------------------
+;;; Bulk element copy — the slot-to-slot fast path.
+;;;
+;;; The sequence copiers (set-subseq, replace, copy-seq, subseq,
+;;; concatenate) were all written as per-element loops over the PUBLIC
+;;; accessors, e.g. `(setf (elt dst i) (elt src i))'.  On a string that is
+;;; brutal: `elt' is a full generic dispatch, and because public string
+;;; access is CL-conformant it lifts each stored CHAR CODE into a
+;;; CHARACTER via code-char, only for the setter to drive it straight back
+;;; down to a code.  Two dispatched calls plus a pointless code→char→code
+;;; round trip, per character.
+;;;
+;;; Measured on x64 before this existed (2000 iterations x 4096 chars,
+;;; externally wall-clock timed because GET-INTERNAL-REAL-TIME is a call
+;;; counter, not a clock — see the timer task):
+;;;   set-subseq 1003 ms   concatenate 895 ms   copy-seq 503 ms
+;;;   replace/subseq 397 ms          SBCL: all at memcpy speed, ~0 ms
+;;; i.e. ~122 ns PER CHARACTER for set-subseq.
+;;;
+;;; Strings store char CODES in ordinary word slots, so a string→string
+;;; copy is just slot→slot: the entire code→char→code round trip is
+;;; provably redundant.  %BULK-COPY does the loop over %word-aref /
+;;; %word-aset, which are inline intrinsics (obj-ref / obj-set) rather
+;;; than calls, and hoists every type test OUT of the loop.
+(defun %bulk-copy-ok-p (dst src)
+  "True when DST and SRC are both plain word-slot arrays holding the SAME
+   element representation, so raw slot-to-slot copying is exact.
+
+   Deliberately conservative — every rejected case falls back to the
+   generic element loop, which is slow but correct:
+     • conses are fill-pointer / displaced / adjustable WRAPPERS, whose
+       slots are not the elements (compile-aref routes these to
+       %wrapper-aref for exactly this reason);
+     • %mda-p objects keep their elements in a separate %mda-data store;
+     • subtag #x11 is a byte-packed u8 vector, which needs %u8-ref /
+       %u8-set — %word-aref would read a whole word across 8 elements;
+     • a string slot holds a char CODE while a general-vector slot holds a
+       TAGGED value, so copying words between the two kinds would store
+       codes where characters belong.  Require the kinds to match.
+   Note this makes no assumption about WHICH subtag strings use — if
+   strings ever become byte-packed (the base-string task), the #x11 test
+   rejects them here and correctness is preserved without a change."
+  (and (not (consp dst)) (not (consp src))
+       (not (%mda-p dst)) (not (%mda-p src))
+       (not (eq (obj-subtag dst) #x11))
+       (not (eq (obj-subtag src) #x11))
+       (if (%prim-stringp dst)
+           (%prim-stringp src)
+           (not (%prim-stringp src)))))
+
+(defun %bulk-copy (dst dstart src sstart n)
+  "Copy N elements SRC[sstart…] → DST[dstart…] by raw word slots.
+   Caller must have checked %bulk-copy-ok-p and the bounds.
+
+   memmove semantics, not memcpy: when the two are the SAME object and
+   the destination starts after the source, a forward loop would overwrite
+   source elements before reading them, so copy descending in that case.
+   CLHS requires this — REPLACE on one sequence with overlapping ranges
+   must behave as if it copied through a temporary."
+  (if (and (eq dst src) (> dstart sstart))
+      (let ((i (- n 1)))
+        (loop
+          (when (< i 0) (return dst))
+          (%word-aset dst (+ dstart i) (%word-aref src (+ sstart i)))
+          (setq i (- i 1))))
+      (let ((i 0))
+        (loop
+          (when (>= i n) (return dst))
+          (%word-aset dst (+ dstart i) (%word-aref src (+ sstart i)))
+          (setq i (+ i 1))))))
+
 (defun copy-seq (array)
   "Copy an array, returning a new array with the same elements."
   (let ((len (array-length array))
         (result (make-array (array-length array))))
-    (let ((i 0))
-      (loop
-        (when (= i len) (return result))
-        (aset result i (aref array i))
-        (setq i (+ i 1))))))
+    (if (%bulk-copy-ok-p result array)
+        (%bulk-copy result 0 array 0 len)
+        (let ((i 0))
+          (loop
+            (when (= i len) (return result))
+            (aset result i (aref array i))
+            (setq i (+ i 1)))))
+    result))
 
 ;;; ============================================================
 ;;; String Utilities
@@ -701,7 +775,14 @@
               (allow-other nil)
               (t (error "string-equal: bad keyword"))))
       (setq o (cddr o)))
-    (let* ((len-a (array-length a))
+    ;; CLHS: STRING-EQUAL takes STRING DESIGNATORS, not strings -- a character,
+    ;; a symbol (NIL included), or a string.  These used to go straight into
+    ;; ARRAY-LENGTH, so (string-equal "0.0.1" nil) faulted instead of returning
+    ;; NIL.  Coerce first; STRING is the identity on real strings, so the
+    ;; common path is unchanged.
+    (let* ((a (string a))
+           (b (string b))
+           (len-a (array-length a))
            (len-b (array-length b))
            (ee1 (or e1 len-a))
            (ee2 (or e2 len-b))
@@ -1419,7 +1500,25 @@
              (setq i (+ i 1)))
            (logand h 255))
          (%ht-nohash)))
-    ((fixnump key)  (logand key 255))
+    ;; MIX the fixnum, do not truncate it.  `(logand key 255)' keeps only the
+    ;; low 8 bits, and the single biggest user of a fixnum-keyed EQL table is
+    ;; the INTERPRETER's memory model, whose keys are ADDRESSES — whose low
+    ;; 3-4 bits are always zero by alignment.  Truncation therefore mapped
+    ;; every address into 32 of the 256 buckets (16 when 16-byte aligned) and
+    ;; every access linearly scanned a chain 8-16x too long.  Measured on the
+    ;; x64 CLI, 8000 keys x 200 probes, varying ONLY the key spacing:
+    ;;     stride  1 (256 buckets used) -> 1 s
+    ;;     stride  8 ( 32 buckets used) -> 4 s
+    ;;     stride 16 ( 16 buckets used) -> 8 s
+    ;; i.e. time scales inversely with the bucket count actually reached.
+    ;;
+    ;; Folding the high bits down mixes the alignment zeros away while staying
+    ;; branch-free and allocation-free (all intermediates stay fixnums, so no
+    ;; bignum path and nothing to collect).  Must agree between %ht-bucket-find
+    ;; and %ht-bucket-put — both call THIS function, so they cannot diverge.
+    ((fixnump key)
+     (let ((k (if (< key 0) (- key) key)))
+       (logand (logxor k (logxor (ash k -8) (ash k -16))) 255)))
     ((characterp key) (logand (char-code key) 255))
     ((null key) 17)
     ((eq key t) 19)
@@ -2030,10 +2129,12 @@
                          (%make-string-array len)
                          (make-array len))))
         (let ((i 0))
-          (loop
-            (when (= i len) (return result))
-            (aset result i (aref seq (+ start i)))
-            (setq i (+ i 1))))))))
+          (if (%bulk-copy-ok-p result seq)
+              (progn (%bulk-copy result 0 seq start len) result)
+              (loop
+                (when (= i len) (return result))
+                (aset result i (aref seq (+ start i)))
+                (setq i (+ i 1)))))))))
 
 (defun concatenate-strings (s1 s2)
   "Concatenate two strings (arrays of chars)."

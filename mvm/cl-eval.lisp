@@ -1433,28 +1433,78 @@
 ;;; Compile: return proper 3 values
 ;;; ============================================================
 
-(defun compile (name &rest args)
-  "Compile NAME (or lambda-expression in DEF). Returns (values fn warns failp).
-   On bare metal, functions are already compiled. For nil name with lambda,
-   return an interpreted closure."
-  (let ((def (if args (car args) nil)))
+(defun %compile-lambda-form (form)
+  "Compile the lambda-expression FORM to a REAL function through the
+   production pipeline (mvm-eval → the self-hosted MVM compiler).
+
+   Returns NIL — not an error — when the compiler cannot handle this
+   lambda shape, so the caller can degrade to an interpreted closure.
+   The FUNCTIONP guard is load-bearing: mvm-eval returns whatever the
+   form evaluated to, and only a genuine closure object is an acceptable
+   COMPILE result."
+  (let ((fn (handler-case (mvm-eval form)
+              (t (c) nil))))
+    (if (functionp fn) fn nil)))
+
+(defun %compile-impl (name args)
+  "THE single implementation of CLHS COMPILE.  Returns
+   (values function warnings-p failure-p).
+
+   It lives in a named helper, not directly in `compile', because
+   ansi-bridge.lisp assembles AFTER this file and also defines `compile' —
+   under last-defun-wins that shadow is what images actually call.  It used
+   to REPLICATE this logic, and the two copies drifting apart has already
+   broken the corpus once (see the comment at that defun).  Both `compile'
+   defuns are now one-line forwarders to this function, so there is exactly
+   one behaviour no matter which one wins.
+
+   (compile nil '(lambda …)) now genuinely COMPILES.  It used to build an
+   (%INTERP-CLOSURE …) marker cons, which is NOT a function — `functionp'
+   on the result was NIL, in plain violation of CLHS, and handing that
+   shape back to mvm-eval SIGNALS.  The lambda now goes through the same
+   pipeline EVAL and LOAD use, so the primary value is a real compiled
+   closure that `functionp' accepts.
+
+   COMPILE takes its lambda in the NULL lexical environment (CLHS 3.2.2),
+   so there is no captured env for mvm-eval to be unable to represent —
+   which is exactly why this is safe to route here and why EVAL's
+   interp-closure caveat does not apply.
+
+   The interp-closure path is RETAINED as a fallback for lambda shapes the
+   compiler cannot yet handle: degrading to an interpreted closure keeps
+   such calls WORKING (just slower and not `functionp') instead of turning
+   a compiler coverage gap into a hard error.  failure-p stays NIL there
+   because a callable function was still produced — CLHS reserves
+   failure-p for conditions of type ERROR during compilation.
+
+   With a non-nil NAME, CLHS makes the PRIMARY VALUE the NAME, not the
+   function object, and a supplied definition REPLACES name's definition.
+   (Verified against SBCL: (compile 'f) returns the symbol F.)"
+  (let* ((def (if args (car args) nil))
+         (form (if (and (consp def) (eq (car def) 'quote)) (cadr def) def))
+         (lambda-p (and (consp form) (%eval-sym-eq (car form) "LAMBDA"))))
     (cond
-      ;; (compile nil '(lambda ...)) — create interpreted closure
-      ((and (null name) def)
-       (let ((form (if (and (consp def) (eq (car def) 'quote))
-                       (cadr def)
-                       def)))
-         (if (and (consp form) (%eval-sym-eq (car form) "LAMBDA"))
-             (let ((fn (list '%interp-closure (cadr form) (cddr form) nil)))
-               (values fn nil nil))
-             (values def nil nil))))
-      ;; (compile 'name) — function already compiled, return it
-      (name
-       (let ((fn (if *symbol-function-table*
-                     (gethash (%eval-sym-name name) *symbol-function-table*)
-                     nil)))
-         (values (or fn name) nil nil)))
-      (t (values nil nil nil)))))
+      ;; (compile nil '(lambda ...)) — the primary value IS the function.
+      ((null name)
+       (cond ((null def) (values nil nil nil))
+             (lambda-p
+              (values (or (%compile-lambda-form form)
+                          (list '%interp-closure (cadr form) (cddr form) nil))
+                      nil nil))
+             (t (values def nil nil))))
+      ;; (compile 'name [definition]) — install when a definition is given;
+      ;; the primary value is NAME either way.
+      (t
+       (when lambda-p
+         (set-symbol-function name
+                              (or (%compile-lambda-form form)
+                                  (list '%interp-closure
+                                        (cadr form) (cddr form) nil))))
+       (values name nil nil)))))
+
+(defun compile (name &rest args)
+  "CLHS COMPILE — see %compile-impl for the implementation and rationale."
+  (%compile-impl name args))
 
 ;;; ============================================================
 ;;; Load: read + eval from file
@@ -3741,6 +3791,16 @@
     (let ((n1 (- end1 start1))
           (n2 (- end2 start2)))
       (let ((count (if (< n1 n2) n1 n2)))
+        ;; Fast path: two plain word-slot arrays of the same element kind.
+        ;; %bulk-copy is memmove-correct — it copies DESCENDING when the
+        ;; regions overlap forward — so it gets CLHS's overlap guarantee
+        ;; without materialising anything.  The general path below conses a
+        ;; fresh list of the ENTIRE source window (one cons per element,
+        ;; 4096 of them for a 4 KB string) purely to be overlap-safe; that
+        ;; allocation, not the copying, is most of its cost.
+        (when (%bulk-copy-ok-p seq1 seq2)
+          (%bulk-copy seq1 start1 seq2 start2 count)
+          (return-from replace seq1))
         ;; CLHS REPLACE: when SEQ1 and SEQ2 are the same object and the
         ;; source/destination regions overlap, the result is as if the
         ;; whole source window were copied to a temporary first.  We always
@@ -3920,12 +3980,21 @@
 ;;; ARITY contract: (DISASSEMBLE) and (DISASSEMBLE x y) must error.
 ;;; With this defun, compile-call's arity check fires on those forms.
 (defun disassemble (fn)
-  "Stub disassembler — writes a single line to *standard-output* and
-   returns NIL.  Per CLHS, exact output format is implementation-defined;
-   the ANSI suite only checks (a) return value is NIL and (b) something
-   was written to *standard-output*."
+  "FALLBACK DISASSEMBLE for images that do NOT bake the MVM compiler.
+   Writes one line to *standard-output* and returns NIL, which is all CLHS
+   requires (output format is implementation-defined).
+
+   Compiler-bearing images (the CLI, and anything assembling
+   *mvm-eval-canonical-source*) OVERRIDE this with the real disassembler
+   via last-defun-wins -- see mvm/mvm-eval.lisp.  It has to live there,
+   not here: source is assembled bridge -> mvm.lisp -> compiler.lisp ->
+   mvm-eval.lisp, calls are resolved BY NAME AT BUILD TIME, and cl-eval.lisp
+   is inside the bridge -- so a call to make-mvm-buffer or
+   mvm-compile-toplevel from this file binds to %%unresolved-fn (returns
+   NIL) and the disassembler dies with a TYPE-ERROR on the NIL buffer.
+   Measured, not theorised: that is exactly what the first attempt did."
   (declare (ignore fn))
-  (write-string "; modus disassembly stub")
+  (write-string "; modus: no disassembler in this image (compiler not baked)")
   (write-char-to-stream (code-char 10) *standard-output*)
   nil)
 

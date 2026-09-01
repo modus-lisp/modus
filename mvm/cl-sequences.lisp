@@ -2527,8 +2527,21 @@
                 ;; vs SUBSEQ) but it is CORRECT for every string shape, and a
                 ;; faster path needs a predicate that has been MEASURED to
                 ;; exclude wrappers, not assumed to.
-                (dotimes (i (array-length s))
-                  (aset result pos (aref s i)) (setq pos (+ pos 1))))
+                ;;
+                ;; %BULK-COPY-OK-P is that predicate, and it is measured: it
+                ;; rejects conses (every wrapper), %mda-p, subtag #x11, and
+                ;; any string/non-string mismatch, and the copy test exercises
+                ;; fill-pointer strings, adjustable and displaced arrays and
+                ;; u8 vectors against SBCL.  Note the two earlier attempts
+                ;; failed by gating on STRINGP / %PRIM-STRINGP, both of which
+                ;; are TRUE for a fill-pointer string — the CONSP test is what
+                ;; actually excludes wrappers, because a wrapper IS a cons.
+                (if (%bulk-copy-ok-p result s)
+                    (let ((n (array-length s)))
+                      (%bulk-copy result pos s 0 n)
+                      (setq pos (+ pos n)))
+                    (dotimes (i (array-length s))
+                      (aset result pos (aref s i)) (setq pos (+ pos 1)))))
                ((consp s)
                 (dolist (c s)
                   (aset result pos (if (characterp c) (char-code c) c))

@@ -205,6 +205,44 @@
    convention; %jit-patch-consts-aarch64 and the R-CONST-BAKED gate both skip
    negative entries.")
 
+(defun %a64-jit-genarith-entry (name)
+  "JIT-mode fallback target for a checked-arith overflow slow path — the
+   aarch64 port of translate-x64.lisp's %X64-JIT-GENARITH-ENTRY.  Resolve a
+   main-image runtime helper (GENERIC-ADD / GENERIC-SUBTRACT /
+   GENERIC-MULTIPLY) to its UNTAGGED native entry, or NIL if unavailable.
+
+   WHY IT IS NEEDED, measured on bare-metal QEMU virt 2026-08-31.  The three
+   overflow slow paths are gated on *AARCH64-GEN{ADD,SUB,MUL}-BYTECODE-OFFSET*,
+   which cross.lisp sets during IMAGE ASSEMBLY.  A single-form runtime-JIT
+   module has no such offset (nothing sets it at runtime — Limitation 7's
+   sibling), so every arm fell through to its `plain (possibly wrapping)'
+   comment and fixnum overflow SILENTLY WRAPPED instead of promoting:
+
+       (- (* 4611686018427387903 2) 9223372036854775805)
+         interpreted => 1                    (correct)
+         JIT'd       => -9223372036854775807 (the product wrapped to -2)
+
+   x64 hit exactly this and fixed it here; aarch64 never got the port, and it
+   stayed invisible while the aarch64 JIT was translating nothing.  Note the
+   image-assembly path could not be reused even with an offset: it records a
+   patch site in *AARCH64-FN-ADDR-PATCHES*, which APPLY-AARCH64-FN-ADDR-PATCHES
+   fixes up at assembly time and the runtime JIT never runs.  The helper lives
+   at a FIXED main-image code address that the collector never moves, so baking
+   it as an absolute LOAD-IMM64 + BLR target is safe with no relocation.
+
+   Tag-checked: a RUNTIME-defined GENERIC-MULTIPLY would be a heap closure
+   (tag 9) in memory with no execute permission, so require +tag-function+ (3)
+   exactly as the out-of-module CALL relocation does."
+  (handler-case
+      (let ((fn (%mvm-resolve-runtime-fn name)))
+        (if fn
+            (let ((w (%val->word fn)))
+              (if (and (integerp w) (> w 3) (eql (logand w 15) 3))
+                  (- w 3)
+                  nil))
+            nil))
+    (t (c) (let ((%ignore c)) %ignore) nil)))
+
 (defvar *aarch64-jit-constvec-root* #x10000F10
   "#282: fixed metadata word holding the tagged JIT constant VECTOR, the
    aarch64 sibling of *x64-jit-constvec-root*.  Emitted li-const loads read the
@@ -1579,7 +1617,34 @@
 
 (defconstant +sysreg-tpidr-el1+ #xC684 "TPIDR_EL1: S3_0_C13_C0_4")
 (defconstant +sysreg-vbar-el1+  #xC600 "VBAR_EL1: S3_0_C12_C0_0")
+;;; JIT exec-page region for BARE METAL (#x0531 %MMAP-EXEC-PAGE bump allocator).
+;;;
+;;; DEFUNS, not defvars, and that is load-bearing: this file is BAKED INTO the
+;;; image for the in-image JIT, and a defvar initform does not run there
+;;; (MVM Active Limitation #7) — the reader would get NIL and hand it to
+;;; a64-load-imm64.  That exact shape is #226 and #282.  A defun always works
+;;; in both places, and a platform override is just a later defun
+;;; (last-defun-wins).
+;;;
+;;; Defaults are the Raspberry Pi values.  QEMU virt CANNOT use them: under
+;;; boot-aarch64's fixpoint tables L2[128..511] map VA 0x10000000-0x3FFFFFFF as
+;;; identity DEVICE memory (PCI MMIO), so JIT pages written at 0x14000000 would
+;;; land in unbacked MMIO and %jit-call would branch into zeros.  The virt build
+;;; overrides these with a real DRAM window.
+(defun %jit-exec-bump () #x13FFFFF0)
+(defun %jit-exec-lo   () #x14000000)
+(defun %jit-exec-hi   () #x18000000)
+
 (defconstant +sysreg-cntpct-el0+ #xDF01 "CNTPCT_EL0: S3_3_C14_C0_1")
+;; MRS sysreg field = op0[1:0]<<14 | op1<<11 | CRn<<7 | CRm<<3 | op2.
+;; CNTFRQ_EL0 is S3_3_C14_C0_0, i.e. CNTPCT's encoding with op2=0.
+(defconstant +sysreg-cntfrq-el0+ #xDF00 "CNTFRQ_EL0: S3_3_C14_C0_0")
+;; CNTVCT_EL0 (S3_3_C14_C0_2) is the VIRTUAL counter.  Prefer it over CNTPCT:
+;; Linux/arm64 leaves CNTKCTL_EL1.EL0PCTEN clear, so reading the PHYSICAL
+;; counter from EL0 traps — measured on a Pi 5, `mrs x, cntpct_el0` SIGILLs
+;; while `mrs x, cntvct_el0` returns a live count and CNTFRQ_EL0 reads fine.
+;; CNTVCT is readable at EL1 too, so one register serves hosted AND bare metal.
+(defconstant +sysreg-cntvct-el0+ #xDF02 "CNTVCT_EL0: S3_3_C14_C0_2")
 
 ;;; --- Atomic exchange (LDXR/STXR pair) ---
 ;;; LDXR Xt, [Xn]: size|001000|0|1|0|Rs(11111)|0|Rt2(11111)|Rn|Rt
@@ -1834,6 +1899,32 @@
   (a64-ldp-offset buf +a64-x2+ +a64-x3+ +a64-sp+ 16)
   (a64-ldp-post   buf +a64-x0+ +a64-x1+ +a64-sp+ 32))
 
+(defun a64-emit-generic-arith-call-abs (buf va vb entry)
+  "As A64-EMIT-GENERIC-ARITH-CALL, but the callee is an ABSOLUTE, already
+   untagged native entry address (from %A64-JIT-GENARITH-ENTRY) materialised
+   with LOAD-IMM64, instead of the MOVZ/MOVK placeholder that
+   APPLY-AARCH64-FN-ADDR-PATCHES fixes up at image-assembly time.  The runtime
+   JIT never runs that pass, so a placeholder there would branch to address 0.
+   Identical in every other respect — same caller-save set, same NARGS=2 store,
+   same result-in-x16 contract — so the two paths are interchangeable at the
+   call site.  Separate DEFUN rather than an &optional on the original: this
+   file is baked into the image when the JIT is on, and the emitted callers
+   there are compiled by the MVM compiler, not SBCL."
+  (a64-stp-pre    buf +a64-x0+ +a64-x1+ +a64-sp+ -32)
+  (a64-stp-offset buf +a64-x2+ +a64-x3+ +a64-sp+ 16)
+  (a64-emit-load-vreg buf +a64-x9+  va)
+  (a64-emit-load-vreg buf +a64-x10+ vb)
+  (a64-mov-reg buf +a64-x0+ +a64-x9+)
+  (a64-mov-reg buf +a64-x1+ +a64-x10+)
+  (a64-load-imm64 buf +a64-x17+ #x10000150)
+  (a64-movz buf +a64-x16+ 2 0)
+  (a64-str-width buf +a64-x16+ +a64-x17+ 0 2)
+  (a64-load-imm64 buf +a64-x16+ entry)
+  (a64-blr buf +a64-x16+)
+  (a64-mov-reg buf +a64-x16+ +a64-x0+)
+  (a64-ldp-offset buf +a64-x2+ +a64-x3+ +a64-sp+ 16)
+  (a64-ldp-post   buf +a64-x0+ +a64-x1+ +a64-sp+ 32))
+
 (defun translate-mvm-insn (insn buf mvm-to-native-label)
   "Translate a single decoded MVM instruction, emitting AArch64
    native code into BUF. MVM-TO-NATIVE-LABEL maps MVM byte offsets
@@ -1983,8 +2074,24 @@
                 ;; WFI: Wait For Interrupt (sleep until next IRQ)
                 (a64-emit buf #xD503207F))
                ((= code #x0310)
-                ;; RDTSC equivalent: read CNTPCT_EL0 (physical timer counter) into X0 (VR)
-                (a64-mrs buf +a64-x0+ +sysreg-cntpct-el0+))
+                ;; RDTSC equivalent: read the generic timer counter into X0 (VR).
+                ;; VIRTUAL counter, not physical — see +sysreg-cntvct-el0+.  This
+                ;; read used to be CNTPCT_EL0, which FAULTS at EL0: on hosted
+                ;; aarch64 every (rdtsc) raised SIGILL, and because Modus installs
+                ;; a SIGILL handler the fault was swallowed and the call quietly
+                ;; returned 0 instead of crashing.
+                ;; The LSL is not cosmetic: a value register holds a TAGGED word,
+                ;; and a raw counter with its low bit set has the cons tag (0x1),
+                ;; so any code that let the value reach the GC or a type test was
+                ;; handing them a wild pointer half the time.  Tag it as a fixnum.
+                (a64-mrs buf +a64-x0+ +sysreg-cntvct-el0+)
+                (a64-lsl-imm buf +a64-x0+ +a64-x0+ 1))
+               ((= code #x0311)
+                ;; CNTFRQ_EL0: counter ticks per second.  Same tagging rule.
+                ;; Firmware programs this register; it reads 0 if firmware did
+                ;; not, which callers must treat as "frequency unknown".
+                (a64-mrs buf +a64-x0+ +sysreg-cntfrq-el0+)
+                (a64-lsl-imm buf +a64-x0+ +a64-x0+ 1))
                ((= code #x0320)
                 ;; SETUP-IRQ: virtual timer init (always) + GICv2 (conditional)
                 ;; Save x0/x16 — TRAP is inline, compiler doesn't know we clobber them
@@ -2082,6 +2189,21 @@
                 (when *aarch64-linux-mode*
                   ;; Remap table for one-to-one cases (same arg shape).
                   ;; Format: ((x64-num . aarch64-num) ...).
+                  ;;
+                  ;; A MISSING ENTRY IS NOT A NO-OP — it is a wrong syscall.
+                  ;; An unmapped number passes through to SVC as-is, so it
+                  ;; names whatever AArch64 assigned to it.  The socket
+                  ;; entries below were absent until 2026-08-31: net/hosted-
+                  ;; sockets.lisp issues socket=41/connect=42 (x86-64
+                  ;; numbering), and on AArch64 41 is pivot_root and 42 is
+                  ;; nfsservctl, so EVERY socket-connect returned -1 and the
+                  ;; hosted aarch64 CLI had no working networking at all —
+                  ;; ql:quickload could not fetch, and quicklisp:setup came
+                  ;; back with dists=NIL.  Symptom was indistinguishable from
+                  ;; a network/firewall problem; curl from the same box
+                  ;; reached the server fine.  When adding a syscall to the
+                  ;; hosted layer, ADD IT HERE TOO or it silently calls
+                  ;; something else.
                   (dolist (pair '(( 0 . 63)    ; read
                                   ( 1 . 64)    ; write
                                   ( 3 . 57)    ; close
@@ -2089,9 +2211,20 @@
                                   ( 8 . 62)    ; lseek
                                   ( 9 . 222)   ; mmap
                                   (39 . 172)   ; getpid
+                                  (41 . 198)   ; socket
+                                  (42 . 203)   ; connect
+                                  (43 . 202)   ; accept
+                                  (49 . 200)   ; bind
+                                  (50 . 201)   ; listen
                                   (60 . 93)    ; exit
                                   (93 . 93)    ; exit_group (idempotent)
-                                  (217 . 61))) ; getdents64
+                                  (217 . 61)   ; getdents64
+                                  ;; clock_gettime — GET-INTERNAL-REAL-TIME.
+                                  ;; Unmapped, x64's 228 would land on aa64
+                                  ;; 228 (sched_getaffinity): no fault, just
+                                  ;; a wrong answer, which is exactly how the
+                                  ;; socket syscalls hid for so long.
+                                  (228 . 113)))
                     ;; CMP x8, #x64-num; CSEL x8, #aarch64-num, x8, EQ
                     (let ((from (car pair))
                           (to   (cdr pair)))
@@ -2255,10 +2388,10 @@
                 (a64-add-imm buf +a64-x1+ +a64-x1+ 15)
                 (a64-lsr-imm buf +a64-x1+ +a64-x1+ 4)
                 (a64-lsl-imm buf +a64-x1+ +a64-x1+ 4)        ; 16-align size
-                (a64-load-imm64 buf +a64-x9+ #x13FFFFF0)     ; x9  = &bump
+                (a64-load-imm64 buf +a64-x9+ (%jit-exec-bump))  ; x9  = &bump
                 (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0)  ; x10 = cur
-                (a64-load-imm64 buf +a64-x11+ #x14000000)    ; x11 = lo
-                (a64-load-imm64 buf +a64-x12+ #x18000000)    ; x12 = hi
+                (a64-load-imm64 buf +a64-x11+ (%jit-exec-lo)) ; x11 = lo
+                (a64-load-imm64 buf +a64-x12+ (%jit-exec-hi)) ; x12 = hi
                 ;; CSEL Xd, Xn, Xm, cond: Xd = cond ? Xn : Xm — Rn is bits 5-9,
                 ;; Rm bits 16-20.  (First cut had Rn/Rm swapped: the garbage-
                 ;; reset arm was a no-op and the valid-pointer arm clobbered to
@@ -2911,20 +3044,30 @@
           ((= op +op-add-checked+)
            (let* ((vd (vr 0)) (va (vr 1)) (vb (vr 2))
                   (pa (ensure-src va +a64-x16+))
-                  (pb (ensure-src vb +a64-x17+)))
+                  (pb (ensure-src vb +a64-x17+))
+                  ;; RUNTIME-JIT slow-path target: see %A64-JIT-GENARITH-ENTRY.
+                  ;; Only consulted when the image-assembly offset is absent,
+                  ;; which at image-build time it never is — so whole-image
+                  ;; codegen is untouched.
+                  (ga-entry (if (or *aarch64-genadd-bytecode-offset*
+                                    (not *aarch64-jit-mode*))
+                                nil
+                                (%a64-jit-genarith-entry "GENERIC-ADD"))))
              (cond
-               (*aarch64-genadd-bytecode-offset*
+               ((or *aarch64-genadd-bytecode-offset* ga-entry)
                 (let ((done (incf *mvm-label-counter*)))
                   (a64-adds-reg buf +a64-x16+ pa pb 0 0)
                   (let ((idx (a64-current-index buf)))
                     (a64-bcond buf +cc-vc+ 0)
                     (a64-add-fixup buf idx done :bcond))
-                  (a64-emit-generic-arith-call
-                   buf va vb *aarch64-genadd-bytecode-offset*)
+                  (if ga-entry
+                      (a64-emit-generic-arith-call-abs buf va vb ga-entry)
+                      (a64-emit-generic-arith-call
+                       buf va vb *aarch64-genadd-bytecode-offset*))
                   (a64-set-label buf done)
                   (store-dst +a64-x16+ vd)))
                (t
-                ;; No GENERIC-ADD in this image: plain wrapping add.
+                ;; No GENERIC-ADD reachable at all: plain wrapping add.
                 (a64-add-reg buf +a64-x16+ pa pb 0 0)
                 (store-dst +a64-x16+ vd)))))
 
@@ -2939,20 +3082,26 @@
           ((= op +op-sub-checked+)
            (let* ((vd (vr 0)) (va (vr 1)) (vb (vr 2))
                   (pa (ensure-src va +a64-x16+))
-                  (pb (ensure-src vb +a64-x17+)))
+                  (pb (ensure-src vb +a64-x17+))
+                  (gs-entry (if (or *aarch64-gensub-bytecode-offset*
+                                    (not *aarch64-jit-mode*))
+                                nil
+                                (%a64-jit-genarith-entry "GENERIC-SUBTRACT"))))
              (cond
-               (*aarch64-gensub-bytecode-offset*
+               ((or *aarch64-gensub-bytecode-offset* gs-entry)
                 (let ((done (incf *mvm-label-counter*)))
                   (a64-subs-reg buf +a64-x16+ pa pb 0 0)
                   (let ((idx (a64-current-index buf)))
                     (a64-bcond buf +cc-vc+ 0)
                     (a64-add-fixup buf idx done :bcond))
-                  (a64-emit-generic-arith-call
-                   buf va vb *aarch64-gensub-bytecode-offset*)
+                  (if gs-entry
+                      (a64-emit-generic-arith-call-abs buf va vb gs-entry)
+                      (a64-emit-generic-arith-call
+                       buf va vb *aarch64-gensub-bytecode-offset*))
                   (a64-set-label buf done)
                   (store-dst +a64-x16+ vd)))
                (t
-                ;; No GENERIC-SUBTRACT in this image: plain wrapping sub.
+                ;; No GENERIC-SUBTRACT reachable at all: plain wrapping sub.
                 (a64-sub-reg buf +a64-x16+ pa pb 0 0)
                 (store-dst +a64-x16+ vd)))))
 
@@ -2964,9 +3113,13 @@
           ((= op +op-mul-checked+)
            (let* ((vd (vr 0)) (va (vr 1)) (vb (vr 2))
                   (pa (ensure-src va +a64-x16+))
-                  (pb (ensure-src vb +a64-x17+)))
+                  (pb (ensure-src vb +a64-x17+))
+                  (gm-entry (if (or *aarch64-genmul-bytecode-offset*
+                                    (not *aarch64-jit-mode*))
+                                nil
+                                (%a64-jit-genarith-entry "GENERIC-MULTIPLY"))))
              (cond
-               (*aarch64-genmul-bytecode-offset*
+               ((or *aarch64-genmul-bytecode-offset* gm-entry)
                 (let ((done (incf *mvm-label-counter*)))
                   (a64-asr-imm buf +a64-x9+ pa 1)          ; x9 = untag(va)
                   (a64-mov-reg buf +a64-x10+ pb)           ; x10 = vb (tagged)
@@ -2977,12 +3130,14 @@
                   (let ((idx (a64-current-index buf)))
                     (a64-bcond buf +cc-eq+ 0)
                     (a64-add-fixup buf idx done :bcond))
-                  (a64-emit-generic-arith-call
-                   buf va vb *aarch64-genmul-bytecode-offset*)
+                  (if gm-entry
+                      (a64-emit-generic-arith-call-abs buf va vb gm-entry)
+                      (a64-emit-generic-arith-call
+                       buf va vb *aarch64-genmul-bytecode-offset*))
                   (a64-set-label buf done)
                   (store-dst +a64-x16+ vd)))
                (t
-                ;; No GENERIC-MULTIPLY: plain (possibly wrapping) mul.
+                ;; No GENERIC-MULTIPLY reachable at all: plain wrapping mul.
                 (a64-asr-imm buf +a64-x9+ pa 1)
                 (a64-mul buf +a64-x16+ +a64-x9+ pb)
                 (store-dst +a64-x16+ vd)))))
@@ -4821,6 +4976,65 @@
    of the Lisp-%gc-collect-calling one.  Default nil → the Lisp path is emitted
    (byte-identical to pre-Stage-1 for gate/bare-metal).")
 
+;;; ============================================================
+;;; GC PAUSE INSTRUMENTATION (#286) — metadata slot allocation
+;;; ============================================================
+;;; The native aarch64 collector timestamps itself with CNTVCT_EL0 and
+;;; accumulates six words in the runtime-metadata window.  THESE ADDRESSES ARE
+;;; THE ONLY COPY the emitter uses (bare literals at the two emit sites below,
+;;; exactly as #x10000E00/E18/E40 and #x10000F10 already are); the LISP-side
+;;; readers live in mvm/gc.lisp as %GC-STAT-* DEFUNs.  Deliberately NOT defined
+;;; as defuns here as well: this file is baked into the image for the in-image
+;;; JIT and so is gc.lisp, and a duplicate defun name in shared image source is
+;;; last-defun-wins (see CLAUDE.md).  Keep the two lists in lock-step.
+;;;
+;;;   0x10000F20  gc_stat_start   CNTVCT at collection ENTRY (scratch; live
+;;;                               only for the duration of one collection)
+;;;   0x10000F28  gc_stat_total   sum of pause ticks over all collections
+;;;   0x10000F30  gc_stat_max     longest single pause, in ticks
+;;;   0x10000F38  gc_stat_last    most recent pause, in ticks
+;;;   0x10000F40  gc_stat_bytes   cumulative bytes copied into to-space
+;;;   0x10000F48  gc_stat_lastb   bytes copied by the most recent collection
+;;;
+;;; A SEVENTH word, 0x10000F50, belongs to the same block but is READER-owned:
+;;; %GC-STATS-RESET stores %GC-COUNT there so a mean pause can be divided by
+;;; the collections the totals actually cover.  The trampoline never touches
+;;; it; it is listed here only so nobody claims the address.
+;;;
+;;; ALL SIX ARE STORED <<1, the same convention as every other word in this
+;;; block (0x40..0x60, 0xE00/E18/E40): a raw (mem-ref addr :u64) then reads
+;;; them back as a plain fixnum with no shifting in Lisp.  It is also what
+;;; makes them SAFE — the collector scans its own stack frame conservatively,
+;;; and a <<1 word has an even low nibble, so it can never be mistaken for a
+;;; cons (tag 1) or object (tag 9) pointer.
+;;;
+;;; WHY THIS ADDRESS RANGE.  boot/boot-rpi-cl.lisp documents 0x10000EA8 ..
+;;; 0x10001000 as the one free gap in the metadata window.  Taken within it:
+;;; 0x10000F00 (+rpi-cl-dtb-ptr-slot+, firmware device-tree pointer, written by
+;;; the RPi preamble BEFORE Lisp runs and deliberately not zeroed) and
+;;; 0x10000F10 (*aarch64-jit-constvec-root*, #282) and 0x10000FF0 (the caller-x30
+;;; save slot used by the out-of-module call thunks).  0x10000F20..0x10000F57 is
+;;; 16 bytes clear of the constvec root below and 152 clear of the x30 slot
+;;; above.  Grep #x10000[EF].. before claiming any other word in this range.
+;;;
+;;; WHY CNTVCT_EL0 AND NOT CNTPCT_EL0: see +sysreg-cntvct-el0+.  CNTPCT traps
+;;; at EL0, and Modus's SIGILL handler swallowed the fault so the read came
+;;; back a quiet 0.  CNTVCT reads at EL0/EL1/EL2, which is what lets the SAME
+;;; emitted trampoline serve QEMU virt (enters at EL1) and the Pi (EL2).
+
+(defvar *aarch64-gc-stats-enabled* t
+  "#286.  When non-nil, emit-aarch64-native-gc-trampoline instruments itself
+   with the CNTVCT_EL0 pause timer + copied-bytes counters described above.
+
+   DEFAULTS ON because it is genuinely free: FIVE instructions at collection
+   ENTRY and THIRTY at EXIT, once per collection — nothing whatsoever is
+   added to the allocation fast path, which is where a collector can actually
+   be made slow.  Nothing here allocates, conses, or shifts by a variable
+   count (Limitation #8 / BIGNUM-ASH), so it is legal inside the collector.
+
+   Build-time only (the trampoline is baked once); set NIL in a build script
+   to get a byte-identical pre-#286 trampoline back.")
+
 (defun a64-ldrb (buf wt xn)
   "LDRB Wt, [Xn, #0]  (assembler-verified 0x39400000|Xn<<5|Wt)."
   (a64-emit buf (logior #x39400000 (ash xn 5) wt)))
@@ -5031,6 +5245,19 @@
     ;; object-start bitmap base below, so it MUST be restored before RET or the
     ;; next gc-check's BLR x28 would jump to the bitmap base.
     (a64-str-unsigned buf +a64-x28+ +a64-sp+ 224)
+    ;; ---- #286 PAUSE TIMER: stamp collection ENTRY ----
+    ;; Placed AFTER the register save (so x9/x16 are free scratch) and BEFORE
+    ;; the metadata load, i.e. it brackets the whole collection including the
+    ;; stack scan.  Stored <<1 at 0x10000F20 so the word is an even fixnum and
+    ;; the conservative stack/root scan can never read it as a pointer.
+    ;; No ISB: this measures a millisecond-scale pause, so speculative slop
+    ;; around the counter read is far below the noise floor and an ISB would
+    ;; be the only part of this that costs anything.
+    (when *aarch64-gc-stats-enabled*
+      (a64-mrs buf +a64-x9+ +sysreg-cntvct-el0+)
+      (a64-lsl-imm buf +a64-x9+ +a64-x9+ 1)
+      (a64-load-imm64 buf +a64-x16+ #x10000F20)
+      (a64-str-unsigned buf +a64-x9+ +a64-x16+ 0))
     ;; load GC metadata (all stored <<1 → ASR #1 to raw)
     (flet ((load-asr (rd addr) (a64-load-imm64 buf +a64-x16+ addr)
                      (a64-ldr-unsigned buf rd +a64-x16+ 0) (a64-asr-imm buf rd rd 1)))
@@ -5253,6 +5480,53 @@
     (a64-load-imm64 buf +a64-x16+ #x10000060)
     (a64-ldr-unsigned buf +a64-x9+ +a64-x16+ 0) (a64-add-imm buf +a64-x9+ +a64-x9+ 2)
     (a64-str-unsigned buf +a64-x9+ +a64-x16+ 0)
+    ;; ---- #286 PAUSE TIMER + SURVIVOR BYTES: close out this collection ----
+    ;; MUST stay here, before the register restore: x21 (free_ptr) and x22
+    ;; (to_start) are still live and their difference is exactly the number of
+    ;; bytes copy_object copied into to-space this cycle, i.e. the SURVIVORS —
+    ;; free, because the collector already knows it.  x9/x10/x11/x12/x16 are
+    ;; dead scratch here (every one of them is reloaded from the frame two
+    ;; instructions further down); x24/x25 hold the new mutator alloc-ptr and
+    ;; limit and are NOT touched.
+    ;;
+    ;; Deltas are computed on the <<1 values directly: (end<<1)-(start<<1) =
+    ;; delta<<1, so no untag/retag round-trip is needed anywhere, and every
+    ;; word written stays an even fixnum.  Wrap is a non-issue — 2^62 ticks is
+    ;; ~2000 years at the 62.5 MHz QEMU virt counter.
+    (when *aarch64-gc-stats-enabled*
+      (a64-mrs buf +a64-x9+ +sysreg-cntvct-el0+)
+      (a64-lsl-imm buf +a64-x9+ +a64-x9+ 1)               ; x9  = end<<1
+      (a64-load-imm64 buf +a64-x16+ #x10000F20)
+      (a64-ldr-unsigned buf +a64-x10+ +a64-x16+ 0)        ; x10 = start<<1
+      (a64-sub-reg buf +a64-x11+ +a64-x9+ +a64-x10+ 0 0)  ; x11 = pause<<1
+      ;; gc_stat_last = pause
+      (a64-load-imm64 buf +a64-x16+ #x10000F38)
+      (a64-str-unsigned buf +a64-x11+ +a64-x16+ 0)
+      ;; gc_stat_total += pause
+      (a64-load-imm64 buf +a64-x16+ #x10000F28)
+      (a64-ldr-unsigned buf +a64-x10+ +a64-x16+ 0)
+      (a64-add-reg buf +a64-x10+ +a64-x10+ +a64-x11+ 0 0)
+      (a64-str-unsigned buf +a64-x10+ +a64-x16+ 0)
+      ;; gc_stat_max = max(gc_stat_max, pause)   [unsigned; both operands <<1]
+      (a64-load-imm64 buf +a64-x16+ #x10000F30)
+      (a64-ldr-unsigned buf +a64-x10+ +a64-x16+ 0)
+      (let ((nomax (incf *mvm-label-counter*)))
+        (a64-cmp-reg buf +a64-x10+ +a64-x11+)
+        (let ((i (a64-current-index buf)))
+          (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i nomax :bcond)) ; max >= pause
+        (a64-str-unsigned buf +a64-x11+ +a64-x16+ 0)
+        (a64-set-label buf nomax))
+      ;; survivors = free_ptr(x21) - to_start(x22)
+      (a64-sub-reg buf +a64-x12+ +a64-x21+ +a64-x22+ 0 0)
+      (a64-lsl-imm buf +a64-x12+ +a64-x12+ 1)             ; x12 = bytes<<1
+      ;; gc_stat_lastb = survivors
+      (a64-load-imm64 buf +a64-x16+ #x10000F48)
+      (a64-str-unsigned buf +a64-x12+ +a64-x16+ 0)
+      ;; gc_stat_bytes += survivors
+      (a64-load-imm64 buf +a64-x16+ #x10000F40)
+      (a64-ldr-unsigned buf +a64-x10+ +a64-x16+ 0)
+      (a64-add-reg buf +a64-x10+ +a64-x10+ +a64-x12+ 0 0)
+      (a64-str-unsigned buf +a64-x10+ +a64-x16+ 0))
     ;; ---- restore mutator regs + RET ----
     (a64-ldr-unsigned buf +a64-x28+ +a64-sp+ 224)   ; restore trampoline VA into x28
     (a64-ldr-unsigned buf +a64-x30+ +a64-sp+ 216)

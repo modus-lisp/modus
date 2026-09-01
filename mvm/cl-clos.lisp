@@ -5844,9 +5844,20 @@
            (let ((r (%make-string-array len)))
              (dotimes (i len r) (aset r i (wrapper-aref seq i)))))
          (copy-list seq)))
+    ;; NOTE: this SHADOWS prelude.lisp's copy-seq (cl-clos.lisp assembles
+    ;; later → last-defun-wins), so the bulk fast path has to be here too.
+    ;; Wiring only the prelude copy left copy-seq at its old cost while
+    ;; set-subseq and replace dropped to ~0 — the giveaway was one function
+    ;; in the family not moving.
     ((stringp seq)
-     (let ((r (%make-string-array (length seq)))) (dotimes (i (length seq) r) (aset r i (aref seq i)))))
-    (t (let ((r (make-array (length seq)))) (dotimes (i (length seq) r) (aset r i (aref seq i)))))))
+     (let ((r (%make-string-array (length seq))))
+       (if (%bulk-copy-ok-p r seq)
+           (progn (%bulk-copy r 0 seq 0 (length seq)) r)
+           (dotimes (i (length seq) r) (aset r i (aref seq i))))))
+    (t (let ((r (make-array (length seq))))
+         (if (%bulk-copy-ok-p r seq)
+             (progn (%bulk-copy r 0 seq 0 (length seq)) r)
+             (dotimes (i (length seq) r) (aset r i (aref seq i))))))))
 (defun sqrt (n)
   "Square root.  Returns:
    - exact integer for perfect-square integer input,
@@ -5929,10 +5940,19 @@
          (val-len (length val))
          (copy-len (min (- effective-end start) val-len))
          (i 0))
-    (loop
-      (when (>= i copy-len) (return seq))
-      (setf (elt seq (+ start i)) (elt val i))
-      (setq i (+ i 1)))))
+    ;; Fast path: both plain word-slot arrays of the same element kind, so
+    ;; the elements can be copied slot-to-slot.  The generic loop below
+    ;; goes through ELT, which on a string lifts each stored char CODE to a
+    ;; CHARACTER only for the setter to convert it straight back — two
+    ;; dispatched calls and a redundant round trip PER CHARACTER (measured
+    ;; 122 ns/char before this).  %bulk-copy-ok-p hoists all the type tests
+    ;; out of the loop; anything it rejects falls through unchanged.
+    (if (%bulk-copy-ok-p seq val)
+        (progn (%bulk-copy seq start val 0 copy-len) seq)
+        (loop
+          (when (>= i copy-len) (return seq))
+          (setf (elt seq (+ start i)) (elt val i))
+          (setq i (+ i 1))))))
 (defun is-ordered-by (pred) (lambda (x y) (funcall pred x y)))
 ;; NTH-VALUE — compile-time macro at compiler.lisp:847 handles direct
 ;; call; this runtime defun is for #'NTH-VALUE / funcall-on-symbol.

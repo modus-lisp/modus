@@ -1303,36 +1303,22 @@
 (defun compile-and-load (form) nil)
 
 ;;; compile shadow — ansi-bridge.lisp loads AFTER cl-eval.lisp, so this
-;;; defun wins via last-defun.  Replicate cl-eval.lisp:2883's logic
-;;; (the previous stub `(defun compile (name &rest args) name)' silently
-;;; shadowed it, breaking every `(funcall (compile nil '(lambda ...)) ...)'
-;;; pattern — the misc.lsp test file's entire 460 tests crashed because
-;;; compile returned NIL).
+;;; defun wins via last-defun.  It MUST stay a pure forwarder.
+;;;
+;;; History, so nobody re-inlines a body here a third time: this started as
+;;; the stub `(defun compile (name &rest args) name)', which silently
+;;; shadowed the real one and broke every
+;;; `(funcall (compile nil '(lambda ...)) ...)' — all 460 tests in misc.lsp
+;;; crashed because compile returned NIL.  The repair REPLICATED cl-eval's
+;;; body here, which merely converted the failure mode from "shadowed" to
+;;; "two copies that drift": #297 fixed COMPILE in cl-eval.lisp and nothing
+;;; changed, because THIS copy is what images actually call.
+;;;
+;;; There is now exactly one implementation (%compile-impl, in cl-eval.lisp)
+;;; and both `compile' defuns forward to it.  Do not add logic here.
 (defun compile (name &rest args)
-  "Compile NAME (or lambda-expression in DEF).  For (compile nil
-   '(lambda ...)) return an interpreted closure; for (compile NAME)
-   return the SFT-looked-up compiled function."
-  (let ((def (if args (car args) nil)))
-    (cond
-      ((and (null name) def)
-       (let ((form (if (and (consp def) (eq (car def) 'quote))
-                       (cadr def)
-                       def)))
-         (if (and (consp form)
-                  (or (eq (car form) 'lambda)
-                      (and (symbolp (car form))
-                           (string-equal (symbol-name (car form)) "LAMBDA"))))
-             (values (list '%interp-closure (cadr form) (cddr form) nil)
-                     nil nil)
-             (values def nil nil))))
-      (name
-       (let ((fn (if (and (boundp '*symbol-function-table*)
-                          *symbol-function-table*)
-                     (gethash (if (symbolp name) (symbol-name name) name)
-                              *symbol-function-table*)
-                     nil)))
-         (values (or fn name) nil nil)))
-      (t (values nil nil nil)))))
+  "CLHS COMPILE — forwards to the single implementation in cl-eval.lisp."
+  (%compile-impl name args))
 
 ;;; ============================================================
 ;;; check-equivalence — types-and-classes test helper
@@ -3834,6 +3820,77 @@
         (+ unix-sec 2208988800)
         0)))
 
+(defun %timer-universal-time ()
+  "Seconds from the CPU's counter, for a machine with no RTC and no syscall
+   underneath — i.e. bare metal.  Returns 0 when the platform reports no
+   counter frequency, which callers must treat as no-clock-available.
+
+   This is NOT wall-clock time: a Raspberry Pi has no battery-backed clock, so
+   nothing in the machine knows the date at power-on.  It is seconds since
+   boot, which is a real, monotonically advancing hardware clock — enough for
+   file timestamps and elapsed-time, and honest about what it is.  Getting the
+   actual date needs NTP or a firmware-supplied time.
+
+   Do NOT make this the default GET-UNIVERSAL-TIME: on a hosted image the
+   syscall gives real wall-clock time and must win.  Bare-metal builds select
+   this explicitly (they cannot detect themselves at runtime — hosted AArch64
+   can read the same EL0 counter registers, so the counter does not
+   distinguish them)."
+  (let ((hz (cntfrq)))
+    (if (and (integerp hz) (> hz 0))
+        (floor (rdtsc) hz)
+        0)))
+
+;;; --- GC pause statistics, scaled (#286) --------------------------------
+;;; mvm/gc.lisp owns the raw counters; the SCALING lives here because it needs
+;;; (cntfrq), and gc.lisp is the one file that must stay free of anything that
+;;; could allocate or trap unexpectedly on a target that lacks the arm.
+;;; %timer-universal-time directly above is the existing proof that (cntfrq)
+;;; compiles and runs wherever this file is baked.
+
+(defun %gc-pause-ms (ticks)
+  "Convert a CNTVCT tick count from the %GC-STAT-* accessors to whole
+   milliseconds.  Returns 0 when the platform reports no counter frequency
+   (which callers must read as clock-unavailable, not as a zero-length pause).
+   Integer division on purpose — this file has no float contract to lean on."
+  (let ((hz (cntfrq)))
+    (if (and (integerp hz) (> hz 0) (integerp ticks))
+        (floor (* ticks 1000) hz)
+        0)))
+
+(defun %gc-pause-us (ticks)
+  "As %GC-PAUSE-MS but in microseconds — the useful resolution when a
+   collection is well under a millisecond."
+  (let ((hz (cntfrq)))
+    (if (and (integerp hz) (> hz 0) (integerp ticks))
+        (floor (* ticks 1000000) hz)
+        0)))
+
+(defun %gc-report ()
+  "One-line-per-field GC pause report, printed to *standard-output*.  This is
+   the thing to call from a probe or a REPL; %GC-STATS is the machine-readable
+   form.  Prints ticks AND microseconds so a reading is still interpretable if
+   the counter frequency ever reads back as 0."
+  (let ((n     (%gc-stat-count))     ; collections the totals actually COVER
+        (all   (%gc-count))
+        (total (%gc-stat-total-ticks))
+        (mx    (%gc-stat-max-ticks))
+        (last  (%gc-stat-last-ticks))
+        (tb    (%gc-stat-total-bytes))
+        (lb    (%gc-stat-last-bytes)))
+    (format t "~&GC collections : ~D since boot, ~D covered by these totals~%"
+            all n)
+    (format t "GC cntfrq      : ~D Hz~%" (cntfrq))
+    (format t "GC total pause : ~D ticks = ~D us (~D ms)~%"
+            total (%gc-pause-us total) (%gc-pause-ms total))
+    (format t "GC max pause   : ~D ticks = ~D us (~D ms)~%"
+            mx (%gc-pause-us mx) (%gc-pause-ms mx))
+    (format t "GC last pause  : ~D ticks = ~D us~%" last (%gc-pause-us last))
+    (format t "GC mean pause  : ~D us~%"
+            (if (and (integerp n) (> n 0)) (floor (%gc-pause-us total) n) 0))
+    (format t "GC copied      : ~D bytes total, ~D bytes last~%" tb lb)
+    n))
+
 (defun get-internal-run-time ()
   "Return internal run time units."
   0)
@@ -4559,15 +4616,52 @@
              (* minute 60)
              second
              (* zone 3600))))))
-;;; GET-INTERNAL-REAL-TIME — uses Linux time(2) (syscall 201) when
-;;; available, falls back to a monotonic counter.
+;;; GET-INTERNAL-REAL-TIME — millisecond monotonic clock.
+;;;
+;;; THIS WAS NOT A CLOCK.  The previous version bound its result to a
+;;; variable literally named `t':
+;;;
+;;;     (let ((t (syscall3 201 0 0 0)))
+;;;       (cond ((and (integerp t) (> t 0)) t) ...))
+;;;
+;;; `t' is the CONSTANT TRUE, not a fresh binding, so `(integerp t)' asks
+;;; whether the boolean T is an integer — always NIL.  The syscall ran,
+;;; returned a perfectly good epoch (verified: 1788223533), and the result
+;;; was discarded on EVERY call, falling through to *%irt-counter* forever.
+;;; So the function returned 1, 2, 3, … and a 3M-iteration loop and a
+;;; 6M-iteration loop both "took 1 unit".  GET-UNIVERSAL-TIME makes the
+;;; identical syscall and works, purely because it named its variable
+;;; `unix-sec'.  NEVER bind T (or NIL) as a variable.
+;;;
+;;; This silently poisoned every in-image measurement: no error, just
+;;; plausible small integers.  Anything that measures elapsed time —
+;;; profiling, quicklisp progress, benchmark suites, timeouts — got noise.
+;;;
+;;; time(2) was also the wrong syscall: it yields SECONDS while
+;;; INTERNAL-TIME-UNITS-PER-SECOND advertises 1000, so even repaired it
+;;; would report 0 for anything under a second.  Use clock_gettime with
+;;; CLOCK_MONOTONIC (elapsed time must not jump when the wall clock is
+;;; stepped) and convert to milliseconds.
+;;;
+;;; The timespec is read back with :u32 loads, NOT :u64 — a :u64 mem-ref
+;;; yields RAW bits, but the kernel wrote raw integers, so they would be
+;;; misread as tagged words.  :u32 returns a properly tagged fixnum, and
+;;; both fields fit: tv_sec is uptime, tv_nsec < 10^9.
 (defvar *%irt-counter* 0)
+(defconstant +clock-monotonic+ 1)
 (defun get-internal-real-time ()
-  (let ((t (handler-case (syscall3 201 0 0 0) (t (c) 0))))
-    (cond
-      ((and (integerp t) (> t 0)) t)
-      (t (setq *%irt-counter* (+ *%irt-counter* 1))
-         *%irt-counter*))))
+  (let* ((buf *io-buf-addr*)
+         (rc (handler-case (syscall3 228 +clock-monotonic+ buf 0)
+               (t (c) -1))))
+    (if (and (integerp rc) (= rc 0))
+        (let ((sec  (mem-ref buf :u32))
+              (nsec (mem-ref (+ buf 8) :u32)))
+          (+ (* sec 1000) (floor nsec 1000000)))
+        ;; No usable clock (bare metal without the syscall).  Keep the
+        ;; counter so callers still get a monotonically increasing value,
+        ;; but this is NOT time and must not be read as such.
+        (progn (setq *%irt-counter* (+ *%irt-counter* 1))
+               *%irt-counter*))))
 
 ;;; CLASS-OF — strict 1-arg arity
 (defun class-of (x &rest extra)

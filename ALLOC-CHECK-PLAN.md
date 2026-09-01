@@ -112,18 +112,42 @@ Three separable cribs:
 
 ## Staged plan
 
-**Stage 0 — unblock merging.** Identify ANSI test **24718** (`lambda.lsp`,
-`GOT:NIL EXP:T`), the one deterministic regression from the six fixes in
-`d277611`. Get the harness's own id→test mapping rather than assuming
-contiguity with deftest order, then bisect the six. `#297 CL:COMPILE` is the
-suspect, not the answer. Nothing merges to main until this is understood.
+**Stage 0 — unblock merging. DONE (dcf10cd).** 24718 = COMPILE.5, literal
+identity — a REVEAL from `#297 CL:COMPILE`, not a regression; filed #302.
+cabinet-fs merged to main after acceptance-gate PASS (NET +4, markers flat).
 
-**Stage 1a — fuse only, guard band STAYS.**
+**Stage 1a — fuse only, guard band STAYS. DONE (branch gc-check-fused,
+8f2aa6f..834a0fe).**
 Emit `add scratch,VA,size; cmp scratch,VL` in place of `cmp VA,VL`.
 This is a strict superset of the current check: it can only reject *more*
 allocations, never fewer, so **it cannot introduce an overshoot** even if the
 size plumbing is imperfect. That property is the whole reason for splitting the
 stages — keep it true.
+  Landed shape: `:gc-check-n` (#x8C, :imm32 compile-time bytes) fused ahead of
+`:alloc-obj` (the only opcode with a provably dead scratch reg on x64 — RAX is
+live across the check before `:cons`); `:gc-check-r` (#x8D, :reg :imm8) for
+variable-size `:alloc-array`/`:alloc-string` (kind 0, untagged count) and
+`:alloc-u8` (kind 1, tagged) — the kind byte exists because an unconditional
+untag would HALVE an untagged count (silent under-check). x64 + aarch64
+lowerings live; i386 decodes and ignores (table-driven); interp arms consume
+operands. aarch64 verified at encoding level and under `MODUS_GC_R14=262144`.
+`:cons` deliberately unfused (16 bytes fixed → Stage-C VL bias covers it);
+`:sap-new` has NO gc-check at all (pre-existing, filed #304).
+  Honest perf accounting: **zero measured speedup** — fusion saves ~1 of ~24
+cons-path instructions and 99.8% of checks precede CONS which isn't fused.
+The perf levers are the MCGC BTS sequence (~75% of cons cost) and the
+compiler's own ~7ms/defun (#296). Stage 1a's value is CORRECTNESS: it closes
+the live aa64 512-byte-margin overshoot window for fixed+var-size allocs.
+  Detour worth the record: the branch was blocked for a full session by a
+deterministic gate crash (ANSI 22143 child-death) that bisected — through 14
+killed theories — to **the literal defvar name `*FUSE-GC-CHECKS*`**, with no
+hash collision at any width and no string match anywhere. Renaming the var
+(834a0fe, `*gc-check-fusion-enabled*`) is the verified dodge; the mechanism
+hunt is task #305, full matrix in `/home/claude/cabfs/gate-1a/BISECT-22143.md`.
+
+**Stage C — bias VL by 16 so the unsized `:cons` check is exact** (cons is
+always 16 bytes), then shrink/remove guard bands. Removal stays blocked on
+#304 (`:sap-new` unchecked) — until sap-new is checked, some band must remain.
 
 **Stage 1b — remove the guard bands**, as a *separate* commit, only after 1a is
 proven. One-commit-wide bisect if anything moves.

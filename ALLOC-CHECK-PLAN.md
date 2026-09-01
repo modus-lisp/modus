@@ -148,7 +148,13 @@ have taken on in a while. Required before each stage lands:
 - Bare-metal aarch64 (QEMU, then board) — the overshoot bug was found there and
   QEMU zero-fills DRAM where hardware does not.
 
-Do not start a stage at the tail of a session; this wants a quiet box.
+What actually protects this change is the VERIFICATION discipline below, not
+picking a good moment to start.  Every measurement error made while planning
+this (a stale `ansi-file-ranges.txt`, a binary older than the commit under
+test, a null test range read as a pass, a build failure diagnosed off the
+wrong end of a backtrace) was caught by re-checking the measurement, and none
+of them correlated with how long the session had run.  Re-check the
+measurement; don't wait for a quiet box.
 
 ## Files in scope
 

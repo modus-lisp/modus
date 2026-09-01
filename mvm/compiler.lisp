@@ -1072,6 +1072,96 @@
 ;;; Simple linear allocation of V4-V8 for expression temporaries.
 ;;; Resets at the start of each expression statement.
 
+;;; ============================================================
+;;; Size-aware GC checks (ALLOC-CHECK-PLAN Stage 1a)
+;;; ============================================================
+;;;
+;;; Plain :gc-check compares the alloc pointer to the limit BEFORE an
+;;; allocation whose size it does not know, so the alloc that follows a
+;;; passing check can overshoot the limit by the whole object.  These helpers
+;;; emit :gc-check-n instead, carrying the exact byte count, so a translator
+;;; can test the POST-allocation pointer.  See ALLOC-CHECK-PLAN.md.
+;;;
+;;; The two size formulas are TAKEN FROM THE ALLOCATORS, not from the docs:
+;;;   translate-x64.lisp +op-alloc-obj+ : (logand (+ (* (+ count 2) 8) 15)
+;;;                                               (lognot 15))
+;;;   translate-x64.lisp +op-cons+      : R12 += 16
+;;; If either allocator's advance changes, these must change with it.
+
+(defvar *fuse-gc-checks* t
+  "Gate for the Stage-1a size-aware gc-check peephole (fuse-gc-checks).
+   Set NIL to emit the historical unsized :gc-check everywhere — the image is
+   then byte-identical to pre-Stage-1a, which is how the pass is A/B'd.
+
+   NOTE (Limitation #7): a non-NIL defvar initform only takes effect where
+   init-all-globals runs.  In an image that skips it this reads NIL and the
+   in-image compiler simply does not fuse — safe, because :gc-check-n is a
+   strict superset of :gc-check, so not fusing forgoes the improvement without
+   weakening the check.")
+
+(defconstant +mvm-cons-bytes+ 16
+  "Bytes an :alloc-cons / :cons advances the allocation pointer by.")
+
+(defun %alloc-obj-bytes (count)
+  "Bytes an (:alloc-obj _ COUNT _) advances the allocation pointer by:
+   align16((COUNT + 2) * 8).  The +2 is the 8-byte header plus 8 bytes of
+   padding — object data starts at raw+16, not raw+8."
+  (logand (+ (* (+ count 2) 8) 15) (lognot 15)))
+
+(defun emit-gc-check-obj (count)
+  "Emit a size-aware check for an upcoming (:alloc-obj _ COUNT _).
+   Falls back to the unsized :gc-check when COUNT is not a compile-time
+   constant — correct either way, since the sized form is a strict superset
+   and the guard bands are still in place (Stage 1a keeps them)."
+  (if (and (integerp count) (>= count 0))
+      (emit-ir :gc-check-n (%alloc-obj-bytes count))
+      (emit-ir :gc-check)))
+
+(defun emit-gc-check-cons ()
+  "Emit a size-aware check for an upcoming :cons / :alloc-cons."
+  (emit-ir :gc-check-n +mvm-cons-bytes+))
+
+(defun fuse-gc-checks (ir)
+  "Peephole: rewrite (:gc-check) IMMEDIATELY followed by an allocation into
+   the size-aware (:gc-check-n nbytes).
+
+   Done as a pass over the finished IR rather than by editing the ~34
+   `(emit-ir :gc-check)` call sites, for two reasons: it reads the size off
+   the ACTUAL following instruction instead of a hand-transcribed copy of it,
+   and it keeps working for allocation sites added later.
+
+   Adjacency is required, deliberately.  If anything — including a :label —
+   sits between the check and the alloc, the pair is left alone: a label is a
+   branch target, and a jump to it would otherwise land after a check that had
+   been re-sized for an allocation the jumping path never reasoned about.
+
+   Sizes not statically known (a variable-length string or array) keep the
+   unsized :gc-check.  That is correct, not a compromise: :gc-check-n is a
+   strict superset of :gc-check, so leaving a site unfused only forgoes the
+   improvement — it cannot introduce an overshoot the old code did not have.
+
+   MUST run BEFORE compute-label-positions / ir-instruction-size.  :gc-check
+   is 1 byte and :gc-check-n is 5, so rewriting after sizing would emit five
+   bytes where the layout reserved one and silently mis-target every branch
+   downstream."
+  (let ((out '())
+        (rest ir))
+    (loop
+      (when (null rest) (return (nreverse out)))
+      (let* ((insn (car rest))
+             (next (cadr rest))
+             (nbytes (and (consp insn) (eq (car insn) :gc-check)
+                          (consp next)
+                          (case (car next)
+                            (:alloc-obj
+                             (let ((count (third next)))
+                               (and (integerp count) (>= count 0)
+                                    (%alloc-obj-bytes count))))
+                            ((:cons :alloc-cons) +mvm-cons-bytes+)
+                            (t nil)))))
+        (push (if nbytes (list :gc-check-n nbytes) insn) out)
+        (setq rest (cdr rest))))))
+
 (defun reset-temp-regs ()
   "Reset the temporary register counter"
   (setf *temp-reg-counter* 0))
@@ -17827,6 +17917,10 @@
       (:cli   1)
       (:sti   1)
       (:gc-check 1)
+      ;; 1 opcode + imm32 nbytes.  This size MUST be right: every branch
+      ;; displacement after a :gc-check-n is computed from this table, so a
+      ;; wrong entry silently mis-targets jumps rather than failing loudly.
+      (:gc-check-n 5)
       (:yield 1)
       (:set-mv-count 2)
 
@@ -18028,6 +18122,8 @@
            (mvm-sti buf))
           (:gc-check
            (mvm-gc-check buf))
+          (:gc-check-n
+           (mvm-gc-check-n buf (second insn)))
           (:mcgc-collect
            (mvm-mcgc-collect buf))
           (:yield
@@ -19555,6 +19651,13 @@
              (ir (cdr result)))
         (when (and info ir)
           (setf all-ir (nconc all-ir (list (cons info ir)))))))
+
+    ;; Phase 2b: fuse size-aware gc-checks.  MUST be here — after the IR is
+    ;; final, before Phase 3 computes label positions from ir-instruction-size
+    ;; (:gc-check is 1 byte, :gc-check-n is 5).  See fuse-gc-checks.
+    (when *fuse-gc-checks*
+      (dolist (entry all-ir)
+        (setf (cdr entry) (fuse-gc-checks (cdr entry)))))
 
     ;; Phase 3: Emit bytecode
     (let ((buf (make-mvm-buffer)))

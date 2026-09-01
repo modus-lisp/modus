@@ -3908,7 +3908,15 @@
            (i386-emit-mov-abs-reg buf *va-addr* +scratch1+)
            (i386-store-vreg buf vd +scratch0+)))
 
-        ((op= +op-gc-check+)
+        ;; STAGE 1a PARTIAL — +op-gc-check-n+ shares this arm and ignores its
+        ;; size operand (decoded table-driven, discarded), so behaviour is
+        ;; bit-for-bit what it was before the opcode existed.  Landed now
+        ;; because the SHARED compiler emits :gc-check-n for every target at
+        ;; once.  i386 is actually the BEST-placed arch to fuse: it already
+        ;; loads VA into ECX here, so `add ecx, nbytes` before the compare is
+        ;; one extra instruction and needs no register it does not already
+        ;; have — unlike x64, which has no free register at all.
+        ((or (op= +op-gc-check+) (op= +op-gc-check-n+))
          ;; Compare VA (alloc ptr) against VL (alloc limit)
          ;; Both at absolute addresses. If VA >= VL, trigger GC.
          ;; IMPORTANT: Use scratch0 (ECX), NOT EAX! EAX is VR and may hold

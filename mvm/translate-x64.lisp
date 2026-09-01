@@ -3416,6 +3416,46 @@
                (emit-call buf gc-lbl)
                (emit-label buf skip-label)))))
 
+        ((op= +op-gc-check-n+)
+         ;; STAGE 1a PARTIAL — lowers exactly like +op-gc-check+ for now, so
+         ;; behaviour is bit-for-bit what it was before :gc-check-n existed.
+         ;; The size operand is decoded (table-driven) and discarded.
+         ;;
+         ;; ★ WHY NOT THE FUSED FORM YET — READ BEFORE "FIXING" THIS.
+         ;; The obvious lowering is
+         ;;     lea rax, [r12+nbytes] ; cmp rax, r14 ; jl skip ; call gc
+         ;; and I wrote exactly that, on the argument that RAX is dead here
+         ;; because both allocators stage through it (+op-alloc-obj+ puts the
+         ;; header in RAX then `xor eax,eax` for the payload fill).
+         ;;
+         ;; THAT ARGUMENT IS WRONG, and translate-i386.lisp's gc-check arm
+         ;; says so outright: "Use scratch0 (ECX), NOT EAX! EAX is VR and may
+         ;; hold a live value (e.g., the car arg popped before GC-CHECK +
+         ;; CONS)."  compile-cons emits `:pop dest` / `:gc-check` /
+         ;; `:cons dest dest temp` — when dest is VR, RAX holds the CAR across
+         ;; this instruction.  Clobbering it silently corrupts the cons.
+         ;;
+         ;; The real obstacle: x64 has no free register (all 16 are allocated
+         ;; — see reference_register_file_is_fully_allocated), so a fused
+         ;; check needs either a register freed elsewhere or a push/pop pair,
+         ;; and push/pop makes the fast path 5 instructions where it is now 3,
+         ;; forfeiting the speedup this change exists to get.  Options worth
+         ;; weighing: (a) have fuse-gc-checks decline to fuse when the
+         ;; allocation's dest is VR — cheap but only sound if VR is otherwise
+         ;; provably dead, which is NOT established; (b) free a register;
+         ;; (c) keep VL biased by the largest fusable size so `cmp r12,r14`
+         ;; alone is already size-aware for bounded allocations.
+         (let* ((_nbytes (first operands))
+                (page-lbl (and (mcgc-pinning-on-p) (mcgc-page-gc-label)))
+                (gc-lbl (or page-lbl (translate-state-gc-label state))))
+           (declare (ignorable _nbytes))
+           (when gc-lbl
+             (let ((skip-label (make-label)))
+               (emit-cmp-reg-reg buf 'r12 'r14)
+               (emit-jcc buf :l skip-label)
+               (emit-call buf gc-lbl)
+               (emit-label buf skip-label)))))
+
         ((op= +op-mcgc-collect+)
          ;; (%mcgc-collect) — force a full page collection UNCONDITIONALLY when
          ;; pinning is on (the gc-check is R12<R14-gated; an explicit collect

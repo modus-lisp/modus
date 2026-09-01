@@ -4284,7 +4284,23 @@
 
           ;; ---- GC-CHECK ----
           ;; CMP VA, VL; B.LT ok; BRK #1 (GC trap); ok:
-          ((= op +op-gc-check+)
+          ;; STAGE 1a PARTIAL — +op-gc-check-n+ shares this arm.  aarch64 does
+          ;; not yet USE the size operand, so it lowers exactly like
+          ;; +op-gc-check+ and behaviour is bit-for-bit what it was before
+          ;; :gc-check-n existed.  Sharing the arm (rather than duplicating
+          ;; the trampoline-selection cond below) means there is no second
+          ;; copy to drift.
+          ;;
+          ;; The arm is landed now, ahead of the aarch64 fusion, because the
+          ;; SHARED compiler emits :gc-check-n for every target at once —
+          ;; without it this translator would meet an unknown opcode.
+          ;;
+          ;; The real lowering is `add xN, x24, #nbytes; cmp xN, x25`.  It
+          ;; needs a scratch that is provably dead at the allocation; x64 can
+          ;; use RAX because both allocators stage through it, but that
+          ;; argument does NOT carry over — establish it for aarch64 against
+          ;; the alloc expansions before using x16/x17 (ABI IP0/IP1).
+          ((or (= op +op-gc-check+) (= op +op-gc-check-n+))
            ;; CMP alloc-ptr (x24) against limit (x25).  When x24 < x25
            ;; (still room) skip the slow path; otherwise call the GC
            ;; trampoline if it's wired up.  Legacy BRK #1 retained as

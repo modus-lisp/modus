@@ -2146,6 +2146,16 @@
           (#.+op-gc-check+ nil) ; no-op in interpreter
           (#.+op-mcgc-collect+ nil) ; no-op in interpreter (no page pool)
 
+          ;; Size-aware gc-check.  Semantically the same no-op as :gc-check
+          ;; here (the interpreter allocates through the host), but it carries
+          ;; an imm32 operand that MUST be consumed — the interpreter
+          ;; hand-decodes, so skipping the fetch would leave PC pointing into
+          ;; the middle of the size field and execute it as opcodes.
+          (#.+op-gc-check-n+
+           (multiple-value-bind (_nbytes npc) (fetch-u32 bc pc)
+             (declare (ignore _nbytes))
+             (setf pc npc)))
+
           (#.+op-write-barrier+
            (multiple-value-bind (_vobj npc) (fetch-reg bc pc)
              (declare (ignore _vobj))

@@ -46,7 +46,8 @@
    #:+op-aref+ #:+op-aset+ #:+op-array-len+
    #:+op-load+ #:+op-store+ #:+op-fence+
    #:+op-call+ #:+op-call-ind+ #:+op-ret+ #:+op-tailcall+
-   #:+op-alloc-cons+ #:+op-gc-check+ #:+op-write-barrier+ #:+op-mcgc-collect+
+   #:+op-alloc-cons+ #:+op-gc-check+ #:+op-gc-check-n+
+   #:+op-write-barrier+ #:+op-mcgc-collect+
    #:+op-save-ctx+ #:+op-restore-ctx+ #:+op-yield+ #:+op-atomic-xchg+
    #:+op-io-read+ #:+op-io-write+ #:+op-halt+
    #:+op-cli+ #:+op-sti+ #:+op-percpu-ref+ #:+op-percpu-set+
@@ -96,7 +97,8 @@
    #:mvm-alloc-u8 #:mvm-u8-ref #:mvm-u8-set
    #:mvm-load #:mvm-store #:mvm-fence
    #:mvm-call #:mvm-call-ind #:mvm-ret #:mvm-tailcall
-   #:mvm-alloc-cons #:mvm-gc-check #:mvm-write-barrier #:mvm-mcgc-collect
+   #:mvm-alloc-cons #:mvm-gc-check #:mvm-gc-check-n
+   #:mvm-write-barrier #:mvm-mcgc-collect
    #:mvm-save-ctx #:mvm-restore-ctx #:mvm-yield #:mvm-atomic-xchg
    #:mvm-io-read #:mvm-io-write #:mvm-halt
    #:mvm-cli #:mvm-sti #:mvm-percpu-ref #:mvm-percpu-set
@@ -319,6 +321,30 @@
 (defconstant +op-gc-check+      #x89)  ; (gc-check) - no operands
 (defconstant +op-write-barrier+ #x8A)  ; (write-barrier Vobj) - 1 reg
 (defconstant +op-mcgc-collect+  #x8B)  ; (mcgc-collect) - no operands; force a page GC
+(defconstant +op-gc-check-n+    #x8C)  ; (gc-check-n nbytes:imm32) - SIZE-AWARE check
+;;; +op-gc-check-n+ is the size-aware form of +op-gc-check+ and exists because
+;;; the size-BLIND one is a latent heap-overrun.  Plain :gc-check compares the
+;;; allocation pointer against the limit BEFORE an allocation whose size it
+;;; does not know, so the alloc that follows a passing check can overshoot the
+;;; limit by up to that object's entire size.  That is the only reason the
+;;; 16 MB +linux-*-gc-guard+ bands exist, and a single allocation larger than
+;;; the guard still runs off the end of the mmap — already the root cause of a
+;;; three-symptom bug on the bare-metal Pi.
+;;;
+;;; The sized form lets a translator test the POST-allocation pointer
+;;; (`add scratch, VA, nbytes; cmp scratch, VL`), which SBCL does on both x86
+;;; and arm64 (src/compiler/x86/alloc.lisp, src/compiler/arm64/macros.lisp —
+;;; they fuse the bump into the check).  See ALLOC-CHECK-PLAN.md.
+;;;
+;;; NBYTES is the FULL allocation size in bytes, already 16-byte aligned —
+;;; i.e. what the allocator will actually advance VA by, not the slot count.
+;;; imm32 rather than imm16 because a big-bignum limb array can exceed 64 KB.
+;;;
+;;; SUPERSET PROPERTY (do not break this): for any nbytes > 0, VA+nbytes >= VL
+;;; whenever VA >= VL, so this check fires strictly more often than the
+;;; unsized one.  Emitting it can therefore never MISS a collection the old
+;;; check would have caught, which is what makes it safe to land while the
+;;; guard bands are still in place.
 
 ;; Actor/concurrency
 (defconstant +op-save-ctx+    #x90)  ; (save-ctx) - no operands
@@ -511,6 +537,7 @@
 ;; GC
 (defopcode :alloc-cons    #x88 (:reg)         "Bump-allocate cons cell")
 (defopcode :gc-check      #x89 ()             "Check allocation limit, GC if needed")
+(defopcode :gc-check-n    #x8C (:imm32)       "Size-aware check: GC if VA+nbytes would pass VL")
 (defopcode :write-barrier #x8A (:reg)         "Mark card table dirty")
 (defopcode :mcgc-collect  #x8B ()             "Force a page GC (MCGC pinning); nop if pinning off")
 
@@ -1033,6 +1060,11 @@
 
 (defun mvm-gc-check (buf)
   (encode-instruction buf +op-gc-check+))
+
+(defun mvm-gc-check-n (buf nbytes)
+  "Size-aware allocation check.  NBYTES is the FULL 16-byte-aligned allocation
+   size the allocator will advance VA by.  See +op-gc-check-n+."
+  (encode-instruction buf +op-gc-check-n+ nbytes))
 
 (defun mvm-mcgc-collect (buf)
   (encode-instruction buf +op-mcgc-collect+))

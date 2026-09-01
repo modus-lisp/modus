@@ -4307,7 +4307,8 @@
           ;; a big-bignum limb array from :alloc-obj can exceed 512 bytes —
           ;; so on this arch the sized check closes a LIVE overshoot window,
           ;; not a theoretical one.
-          ((or (= op +op-gc-check+) (= op +op-gc-check-n+))
+          ((or (= op +op-gc-check+) (= op +op-gc-check-n+)
+               (= op +op-gc-check-r+))
            ;; CMP alloc-ptr (x24) against limit (x25) — or, for the sized
            ;; form, CMP (x24 + nbytes) against x25 via x16.  When below the
            ;; limit (still room) skip the slow path; otherwise call the GC
@@ -4320,6 +4321,27 @@
            ;; userspace puts the mmap'd heap at high addresses
            ;; (~0x7FFF_xxxxxxxx) where the sign bit can flip mid-heap;
            ;; B.LO (unsigned less-than) is the right form there.
+           (if (= op +op-gc-check-r+)
+               ;; RUNTIME-size form: compute post-alloc pointer from the
+               ;; count register.  x16 is dead by the same argument as the -n
+               ;; form (every var-size allocator stages its header through x16
+               ;; first); the count vreg itself is only READ.
+               ;;
+               ;; KIND is the count REPRESENTATION, and the split is
+               ;; load-bearing (see mvm.lisp +op-gc-check-r+): kind 0 =
+               ;; UNTAGGED slot count (array/string — the compiler SAR'd it
+               ;; before the check) so NO untag here, LSL #3 only; kind 1 =
+               ;; TAGGED byte count (u8) so LSR #1 only.  Untagging an
+               ;; already-untagged count halves it and UNDER-checks.
+               (let* ((vcount (vr 0))
+                      (kind (vr 1))
+                      (ps (ensure-src vcount +a64-x16+)))
+                 (if (= kind 0)
+                     (a64-lsl-imm buf +a64-x16+ ps 3)
+                     (a64-lsr-imm buf +a64-x16+ ps 1))
+                 (a64-add-imm buf +a64-x16+ +a64-x16+ 32)
+                 (a64-add-reg buf +a64-x16+ +a64-x16+ +a64-x24+ 0 0)
+                 (a64-cmp-reg buf +a64-x16+ +a64-x25+))
            (if (= op +op-gc-check-n+)
                (let ((nbytes (vr 0)))
                  ;; a64-add-imm is imm12 (<= 4095); a big-bignum limb array
@@ -4331,7 +4353,7 @@
                        (a64-load-imm64 buf +a64-x16+ nbytes)
                        (a64-add-reg buf +a64-x16+ +a64-x24+ +a64-x16+ 0 0)))
                  (a64-cmp-reg buf +a64-x16+ +a64-x25+))
-               (a64-cmp-reg buf +a64-x24+ +a64-x25+))
+               (a64-cmp-reg buf +a64-x24+ +a64-x25+)))
            (let ((cc (if *aarch64-linux-mode* +cc-cc+ +cc-lt+)))
              (cond
                ;; Only emit the BL-to-trampoline when BOTH the label is

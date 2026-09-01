@@ -46,7 +46,7 @@
    #:+op-aref+ #:+op-aset+ #:+op-array-len+
    #:+op-load+ #:+op-store+ #:+op-fence+
    #:+op-call+ #:+op-call-ind+ #:+op-ret+ #:+op-tailcall+
-   #:+op-alloc-cons+ #:+op-gc-check+ #:+op-gc-check-n+
+   #:+op-alloc-cons+ #:+op-gc-check+ #:+op-gc-check-n+ #:+op-gc-check-r+
    #:+op-write-barrier+ #:+op-mcgc-collect+
    #:+op-save-ctx+ #:+op-restore-ctx+ #:+op-yield+ #:+op-atomic-xchg+
    #:+op-io-read+ #:+op-io-write+ #:+op-halt+
@@ -97,7 +97,7 @@
    #:mvm-alloc-u8 #:mvm-u8-ref #:mvm-u8-set
    #:mvm-load #:mvm-store #:mvm-fence
    #:mvm-call #:mvm-call-ind #:mvm-ret #:mvm-tailcall
-   #:mvm-alloc-cons #:mvm-gc-check #:mvm-gc-check-n
+   #:mvm-alloc-cons #:mvm-gc-check #:mvm-gc-check-n #:mvm-gc-check-r
    #:mvm-write-barrier #:mvm-mcgc-collect
    #:mvm-save-ctx #:mvm-restore-ctx #:mvm-yield #:mvm-atomic-xchg
    #:mvm-io-read #:mvm-io-write #:mvm-halt
@@ -345,6 +345,29 @@
 ;;; unsized one.  Emitting it can therefore never MISS a collection the old
 ;;; check would have caught, which is what makes it safe to land while the
 ;;; guard bands are still in place.
+(defconstant +op-gc-check-r+    #x8D)  ; (gc-check-r Vcount kind:imm8)
+;;; The RUNTIME-size sibling of +op-gc-check-n+, for allocations whose size is
+;;; only known at run time — :alloc-array/:alloc-string (per-slot) and
+;;; :alloc-u8/:sap-new (per-byte).  These are exactly the "single allocation
+;;; larger than the guard still overruns" residual CLAUDE.md documents: a
+;;; >16MB string blows past the x64/i386 guard band, and on the un-guarded
+;;; aarch64-Linux heap a >512-byte one did.
+;;;
+;;; Vcount holds the element count in the SAME representation the following
+;;; allocator expects — the conventions differ PER OPCODE and getting this
+;;; wrong under-checks (half the size), violating the superset property:
+;;;   KIND 0 (:alloc-array/:alloc-string): count is UNTAGGED — the compiler
+;;;     SAR's it before the check (translate-x64 +op-alloc-array+ docstring:
+;;;     "Vcount: UNTAGGED element count (compiler SAR'd it)").
+;;;     bytes ~ count*8 + 32  (>= align16((count+2)*8))
+;;;   KIND 1 (:alloc-u8): count is TAGGED — that allocator untags it itself.
+;;;     bytes ~ count/2 + 32  (>= align16(count/2 + 16))
+;;; :sap-new is NOT covered: its two compiler sites disagree about tagging
+;;; AND emit no :gc-check at all today (a pre-existing unchecked-allocation
+;;; gap — see the task list).
+;;; Both formulas OVERESTIMATE by up to 16 bytes rather than align exactly —
+;;; an overestimate preserves the superset property at less translator cost
+;;; (no AND-immediate, which aarch64 encodes awkwardly).
 
 ;; Actor/concurrency
 (defconstant +op-save-ctx+    #x90)  ; (save-ctx) - no operands
@@ -538,6 +561,7 @@
 (defopcode :alloc-cons    #x88 (:reg)         "Bump-allocate cons cell")
 (defopcode :gc-check      #x89 ()             "Check allocation limit, GC if needed")
 (defopcode :gc-check-n    #x8C (:imm32)       "Size-aware check: GC if VA+nbytes would pass VL")
+(defopcode :gc-check-r    #x8D (:reg :imm8)   "Runtime-size check: GC if VA+f(count,kind) would pass VL")
 (defopcode :write-barrier #x8A (:reg)         "Mark card table dirty")
 (defopcode :mcgc-collect  #x8B ()             "Force a page GC (MCGC pinning); nop if pinning off")
 
@@ -1065,6 +1089,11 @@
   "Size-aware allocation check.  NBYTES is the FULL 16-byte-aligned allocation
    size the allocator will advance VA by.  See +op-gc-check-n+."
   (encode-instruction buf +op-gc-check-n+ nbytes))
+
+(defun mvm-gc-check-r (buf vcount kind)
+  "Runtime-size allocation check.  VCOUNT holds the tagged element count;
+   KIND 0 = slots, 1 = bytes.  See +op-gc-check-r+."
+  (encode-instruction buf +op-gc-check-r+ vcount kind))
 
 (defun mvm-mcgc-collect (buf)
   (encode-instruction buf +op-mcgc-collect+))

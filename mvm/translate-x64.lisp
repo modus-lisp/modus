@@ -3457,6 +3457,50 @@
                (emit-call buf gc-lbl)
                (emit-label buf skip-label)))))
 
+        ((op= +op-gc-check-r+)
+         ;; RUNTIME-size check (ALLOC-CHECK-PLAN): the count is in a register,
+         ;; so compute the post-allocation pointer from it.
+         ;;   mov  rax, <count>
+         ;;   kind 0 (UNTAGGED slots — array/string; the compiler SAR'd the
+         ;;           count before the check):    shl rax, 3
+         ;;   kind 1 (TAGGED bytes — u8; that allocator untags itself):
+         ;;                                       sar rax, 1
+         ;;   add  rax, 32           ; header+pad + up-to-16 align overshoot
+         ;;   add  rax, r12
+         ;;   cmp  rax, r14
+         ;;   jl   skip / call gc
+         ;; The per-kind untag/no-untag split is LOAD-BEARING: untagging an
+         ;; already-untagged count halves it and UNDER-checks, breaking the
+         ;; superset property.  See +op-gc-check-r+ in mvm.lisp.
+         ;; The +32 OVERESTIMATES the aligned size by up to 16 bytes —
+         ;; deliberately, to preserve the superset property without an AND.
+         ;;
+         ;; RAX is dead here by the same construction as the :gc-check-n arm:
+         ;; fuse-gc-checks emits :gc-check-r only IMMEDIATELY before
+         ;; :alloc-array/:alloc-string/:alloc-u8/:sap-new, and each of those
+         ;; begins by staging its COUNT through RAX (`mov rax, pc` /
+         ;; emit-load-vreg into +scratch-reg+).  The count VREG itself is NOT
+         ;; clobbered — only RAX — so the allocator still reads it intact.
+         (let* ((vcount (first operands))
+                (kind (second operands))
+                (pc (vreg-phys vcount))
+                (page-lbl (and (mcgc-pinning-on-p) (mcgc-page-gc-label)))
+                (gc-lbl (or page-lbl (translate-state-gc-label state))))
+           (when gc-lbl
+             (let ((skip-label (make-label)))
+               (if pc
+                   (emit-mov-reg-reg buf +scratch-reg+ pc)
+                   (emit-load-vreg buf vcount +scratch-reg+))
+               (if (= kind 0)
+                   (emit-shl-reg-imm buf +scratch-reg+ 3)   ; untagged slots
+                   (emit-sar-reg-imm buf +scratch-reg+ 1))  ; tagged bytes
+               (emit-add-reg-imm buf +scratch-reg+ 32)
+               (emit-add-reg-reg buf +scratch-reg+ 'r12)
+               (emit-cmp-reg-reg buf +scratch-reg+ 'r14)
+               (emit-jcc buf :l skip-label)
+               (emit-call buf gc-lbl)
+               (emit-label buf skip-label)))))
+
         ((op= +op-mcgc-collect+)
          ;; (%mcgc-collect) — force a full page collection UNCONDITIONALLY when
          ;; pinning is on (the gc-check is R12<R14-gated; an explicit collect

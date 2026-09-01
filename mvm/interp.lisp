@@ -2156,6 +2156,15 @@
              (declare (ignore _nbytes))
              (setf pc npc)))
 
+          ;; Runtime-size check: reg + imm8 operands, both consumed, no-op
+          ;; here for the same reason as :gc-check-n above.
+          (#.+op-gc-check-r+
+           (multiple-value-bind (_vcount npc) (fetch-reg bc pc)
+             (declare (ignore _vcount))
+             (multiple-value-bind (_kind npc2) (fetch-byte bc npc)
+               (declare (ignore _kind))
+               (setf pc npc2))))
+
           (#.+op-write-barrier+
            (multiple-value-bind (_vobj npc) (fetch-reg bc pc)
              (declare (ignore _vobj))

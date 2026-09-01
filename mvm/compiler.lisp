@@ -1181,8 +1181,35 @@
                             ;; (16 bytes), which would make the existing
                             ;; `cmp VA,VL` already size-aware for conses at
                             ;; zero instruction cost.  Follow-up, not 1a.
+                            (t nil))))
+             ;; RUNTIME-size fusion: :gc-check followed by a variable-size
+             ;; allocator becomes :gc-check-r on the allocator's own COUNT
+             ;; register.  Adjacency is again the correctness argument, twice
+             ;; over: (a) same label reasoning as above; (b) the count
+             ;; register provably holds the count at the check, because the
+             ;; very next instruction consumes it as the count.
+             ;;
+             ;; KIND encodes the PER-OPCODE count representation — see the
+             ;; +op-gc-check-r+ comment in mvm.lisp.  KIND 0: UNTAGGED slot
+             ;; count (:alloc-array/:alloc-string — the compiler SARs before
+             ;; the check).  KIND 1: TAGGED byte count (:alloc-u8 — that
+             ;; allocator untags it itself).  :sap-new is deliberately absent:
+             ;; its two sites disagree about tagging AND emit no :gc-check
+             ;; today, so there is no pair to fuse — that unchecked-alloc gap
+             ;; is filed separately.
+             (rcheck (and (not nbytes)
+                          (consp insn) (eq (car insn) :gc-check)
+                          (consp next)
+                          (case (car next)
+                            ((:alloc-array :alloc-string)
+                             (list :gc-check-r (third next) 0))
+                            ((:alloc-u8)
+                             (list :gc-check-r (third next) 1))
                             (t nil)))))
-        (push (if nbytes (list :gc-check-n nbytes) insn) out)
+        (push (cond (nbytes (list :gc-check-n nbytes))
+                    (rcheck rcheck)
+                    (t insn))
+              out)
         (setq rest (cdr rest))))))
 
 (defun reset-temp-regs ()
@@ -17944,6 +17971,8 @@
       ;; displacement after a :gc-check-n is computed from this table, so a
       ;; wrong entry silently mis-targets jumps rather than failing loudly.
       (:gc-check-n 5)
+      ;; 1 opcode + 1 reg + 1 kind byte.  Same warning as :gc-check-n above.
+      (:gc-check-r 3)
       (:yield 1)
       (:set-mv-count 2)
 
@@ -18147,6 +18176,8 @@
            (mvm-gc-check buf))
           (:gc-check-n
            (mvm-gc-check-n buf (second insn)))
+          (:gc-check-r
+           (mvm-gc-check-r buf (second insn) (third insn)))
           (:mcgc-collect
            (mvm-mcgc-collect buf))
           (:yield

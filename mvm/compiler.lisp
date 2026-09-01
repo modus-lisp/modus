@@ -1088,7 +1088,7 @@
 ;;;   translate-x64.lisp +op-cons+      : R12 += 16
 ;;; If either allocator's advance changes, these must change with it.
 
-(defvar *fuse-gc-checks* t
+(defvar *gc-check-fusion-enabled* t
   "Gate for the Stage-1a size-aware gc-check peephole (fuse-gc-checks).
    Set NIL to emit the historical unsized :gc-check everywhere — the image is
    then byte-identical to pre-Stage-1a, which is how the pass is A/B'd.
@@ -19709,7 +19709,7 @@
     ;; Phase 2b: fuse size-aware gc-checks.  MUST be here — after the IR is
     ;; final, before Phase 3 computes label positions from ir-instruction-size
     ;; (:gc-check is 1 byte, :gc-check-n is 5).  See fuse-gc-checks.
-    (when *fuse-gc-checks*
+    (when *gc-check-fusion-enabled*
       (dolist (entry all-ir)
         (setf (cdr entry) (fuse-gc-checks (cdr entry)))))
 

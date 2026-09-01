@@ -4284,25 +4284,33 @@
 
           ;; ---- GC-CHECK ----
           ;; CMP VA, VL; B.LT ok; BRK #1 (GC trap); ok:
-          ;; STAGE 1a PARTIAL — +op-gc-check-n+ shares this arm.  aarch64 does
-          ;; not yet USE the size operand, so it lowers exactly like
-          ;; +op-gc-check+ and behaviour is bit-for-bit what it was before
-          ;; :gc-check-n existed.  Sharing the arm (rather than duplicating
-          ;; the trampoline-selection cond below) means there is no second
-          ;; copy to drift.
+          ;; +op-gc-check-n+ shares this arm with +op-gc-check+ so there is no
+          ;; second trampoline-selection cond to drift.  The sized form
+          ;; prepends `add x16, x24, #nbytes` and compares x16 (the
+          ;; POST-allocation pointer) where the unsized form compares x24 —
+          ;; that is the whole difference, and it is what makes the check
+          ;; size-aware: it fires when the ALLOCATION would cross the limit,
+          ;; not merely when the pointer already has.
           ;;
-          ;; The arm is landed now, ahead of the aarch64 fusion, because the
-          ;; SHARED compiler emits :gc-check-n for every target at once —
-          ;; without it this translator would meet an unknown opcode.
+          ;; ★ WHY x16 IS SAFE, AND ONLY HERE.  fuse-gc-checks emits
+          ;; :gc-check-n ONLY before :alloc-obj (never :cons — see its
+          ;; comment).  aarch64's +op-alloc-obj+ (~3762) begins by loading the
+          ;; header immediate into x16 (`a64-load-imm64 buf +a64-x16+
+          ;; header-imm`), so anything in x16 is destroyed by the allocation
+          ;; regardless — it cannot have been live across this point.  Same
+          ;; argument, register-for-register, as RAX on x64.  If
+          ;; fuse-gc-checks is ever widened past :alloc-obj, re-establish
+          ;; this.
           ;;
-          ;; The real lowering is `add xN, x24, #nbytes; cmp xN, x25`.  It
-          ;; needs a scratch that is provably dead at the allocation; x64 can
-          ;; use RAX because both allocators stage through it, but that
-          ;; argument does NOT carry over — establish it for aarch64 against
-          ;; the alloc expansions before using x16/x17 (ABI IP0/IP1).
+          ;; This matters MORE on aarch64 than x64: boot-linux-aarch64.lisp
+          ;; has the un-guarded heap shape (~512-byte margin, CLAUDE.md), and
+          ;; a big-bignum limb array from :alloc-obj can exceed 512 bytes —
+          ;; so on this arch the sized check closes a LIVE overshoot window,
+          ;; not a theoretical one.
           ((or (= op +op-gc-check+) (= op +op-gc-check-n+))
-           ;; CMP alloc-ptr (x24) against limit (x25).  When x24 < x25
-           ;; (still room) skip the slow path; otherwise call the GC
+           ;; CMP alloc-ptr (x24) against limit (x25) — or, for the sized
+           ;; form, CMP (x24 + nbytes) against x25 via x16.  When below the
+           ;; limit (still room) skip the slow path; otherwise call the GC
            ;; trampoline if it's wired up.  Legacy BRK #1 retained as
            ;; a fallback for builds where no trampoline is registered.
            ;;
@@ -4312,7 +4320,18 @@
            ;; userspace puts the mmap'd heap at high addresses
            ;; (~0x7FFF_xxxxxxxx) where the sign bit can flip mid-heap;
            ;; B.LO (unsigned less-than) is the right form there.
-           (a64-cmp-reg buf +a64-x24+ +a64-x25+)
+           (if (= op +op-gc-check-n+)
+               (let ((nbytes (vr 0)))
+                 ;; a64-add-imm is imm12 (<= 4095); a big-bignum limb array
+                 ;; can exceed that, so take the load-imm64 + add-reg form
+                 ;; there.  x16 is dead here — see the arm comment above.
+                 (if (<= nbytes 4095)
+                     (a64-add-imm buf +a64-x16+ +a64-x24+ nbytes)
+                     (progn
+                       (a64-load-imm64 buf +a64-x16+ nbytes)
+                       (a64-add-reg buf +a64-x16+ +a64-x24+ +a64-x16+ 0 0)))
+                 (a64-cmp-reg buf +a64-x16+ +a64-x25+))
+               (a64-cmp-reg buf +a64-x24+ +a64-x25+))
            (let ((cc (if *aarch64-linux-mode* +cc-cc+ +cc-lt+)))
              (cond
                ;; Only emit the BL-to-trampoline when BOTH the label is

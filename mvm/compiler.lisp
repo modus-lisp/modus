@@ -1157,7 +1157,30 @@
                              (let ((count (third next)))
                                (and (integerp count) (>= count 0)
                                     (%alloc-obj-bytes count))))
-                            ((:cons :alloc-cons) +mvm-cons-bytes+)
+                            ;; :cons / :alloc-cons are deliberately NOT fused.
+                            ;; A fused check needs a scratch register, and the
+                            ;; only candidate on x64 is RAX (= VR).  For
+                            ;; :alloc-obj that is provably free: the allocator
+                            ;; stages the header through RAX and then does
+                            ;; `xor eax,eax` to zero-fill the payload, so any
+                            ;; value in RAX is destroyed by the allocation
+                            ;; anyway and cannot have been live.
+                            ;;
+                            ;; :cons breaks that argument in BOTH directions.
+                            ;; compile-cons emits `:pop dest` / `:gc-check` /
+                            ;; `:cons dest dest temp`, so when dest is VR the
+                            ;; CAR is live in RAX going INTO the cons; and the
+                            ;; cons emitter only touches RAX when a source is
+                            ;; spilled, so a value can also survive ACROSS it.
+                            ;; Either way RAX is not free.  See the x64
+                            ;; +op-gc-check-n+ arm.
+                            ;;
+                            ;; Cons is ~21% of emitted IR, so this is the bulk
+                            ;; of the remaining prize; recovering it needs a
+                            ;; freed register or a VL biased by the cons size
+                            ;; (16 bytes), which would make the existing
+                            ;; `cmp VA,VL` already size-aware for conses at
+                            ;; zero instruction cost.  Follow-up, not 1a.
                             (t nil)))))
         (push (if nbytes (list :gc-check-n nbytes) insn) out)
         (setq rest (cdr rest))))))

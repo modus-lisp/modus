@@ -3421,37 +3421,38 @@
          ;; behaviour is bit-for-bit what it was before :gc-check-n existed.
          ;; The size operand is decoded (table-driven) and discarded.
          ;;
-         ;; ★ WHY NOT THE FUSED FORM YET — READ BEFORE "FIXING" THIS.
-         ;; The obvious lowering is
-         ;;     lea rax, [r12+nbytes] ; cmp rax, r14 ; jl skip ; call gc
-         ;; and I wrote exactly that, on the argument that RAX is dead here
-         ;; because both allocators stage through it (+op-alloc-obj+ puts the
-         ;; header in RAX then `xor eax,eax` for the payload fill).
+         ;;   lea  rax, [r12 + nbytes]   ; where R12 WILL be after the alloc
+         ;;   cmp  rax, r14
+         ;;   jl   skip
+         ;;   call gc
+         ;; skip:
          ;;
-         ;; THAT ARGUMENT IS WRONG, and translate-i386.lisp's gc-check arm
-         ;; says so outright: "Use scratch0 (ECX), NOT EAX! EAX is VR and may
-         ;; hold a live value (e.g., the car arg popped before GC-CHECK +
-         ;; CONS)."  compile-cons emits `:pop dest` / `:gc-check` /
-         ;; `:cons dest dest temp` — when dest is VR, RAX holds the CAR across
-         ;; this instruction.  Clobbering it silently corrupts the cons.
+         ;; ★ WHY RAX IS SAFE HERE, AND ONLY HERE.
+         ;; fuse-gc-checks emits :gc-check-n ONLY before :alloc-obj, never
+         ;; before :cons.  That restriction is what licenses this clobber:
+         ;; +op-alloc-obj+ stages the header through RAX and then does
+         ;; `xor eax,eax` to zero-fill the payload, so anything in RAX is
+         ;; destroyed by the allocation regardless — it cannot have been live
+         ;; across this point in correct code.
          ;;
-         ;; The real obstacle: x64 has no free register (all 16 are allocated
-         ;; — see reference_register_file_is_fully_allocated), so a fused
-         ;; check needs either a register freed elsewhere or a push/pop pair,
-         ;; and push/pop makes the fast path 5 instructions where it is now 3,
-         ;; forfeiting the speedup this change exists to get.  Options worth
-         ;; weighing: (a) have fuse-gc-checks decline to fuse when the
-         ;; allocation's dest is VR — cheap but only sound if VR is otherwise
-         ;; provably dead, which is NOT established; (b) free a register;
-         ;; (c) keep VL biased by the largest fusable size so `cmp r12,r14`
-         ;; alone is already size-aware for bounded allocations.
-         (let* ((_nbytes (first operands))
+         ;; The same argument FAILS for :cons, which is why cons is excluded.
+         ;; translate-i386's gc-check arm states it plainly: "Use scratch0
+         ;; (ECX), NOT EAX! EAX is VR and may hold a live value (e.g. the car
+         ;; arg popped before GC-CHECK + CONS)."  compile-cons emits
+         ;; `:pop dest` / `:gc-check` / `:cons dest dest temp`, so with dest =
+         ;; VR the CAR is live in RAX going in; and the cons emitter only
+         ;; touches RAX when a source is spilled, so a value can survive
+         ;; across it too.  I wrote this lowering for cons first and it would
+         ;; have silently corrupted conses under register pressure.
+         ;;
+         ;; If fuse-gc-checks is ever widened past :alloc-obj, this breaks.
+         (let* ((nbytes (first operands))
                 (page-lbl (and (mcgc-pinning-on-p) (mcgc-page-gc-label)))
                 (gc-lbl (or page-lbl (translate-state-gc-label state))))
-           (declare (ignorable _nbytes))
            (when gc-lbl
              (let ((skip-label (make-label)))
-               (emit-cmp-reg-reg buf 'r12 'r14)
+               (emit-lea buf +scratch-reg+ 'r12 nbytes)
+               (emit-cmp-reg-reg buf +scratch-reg+ 'r14)
                (emit-jcc buf :l skip-label)
                (emit-call buf gc-lbl)
                (emit-label buf skip-label)))))

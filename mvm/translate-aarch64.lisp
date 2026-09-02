@@ -2468,6 +2468,15 @@
                 ;; reclaimed (and reclaim is runtime-gated off anyway) — no-op.
                 (a64-movz buf +a64-x0+ 0 0))
                ((= code #x0510)
+                ;; #307: a RUNTIME-JIT page (no handler-stack helper labels) cannot arm a
+                ;; handler frame -- it only saves into the single global jmpbuf at
+                ;; #x10000180, so any inner handler-case that returns normally leaves this
+                ;; one DISARMED and the next error escapes (error-no-armed-handler).  x64
+                ;; pushes real frames.  Until the helpers are reachable from JIT pages,
+                ;; REJECT the page: the translate guard turns this into an interpret
+                ;; fallback, whose emulated handler stack is correct.
+                (when (and *aarch64-jit-mode* (null *aarch64-handler-push-label*))
+                  (error "aarch64 JIT: handler-case in a JIT page needs the handler-stack helpers (#307) -- interpreting"))
                 ;; SETJMP: Save SP, FP (X29), return-IP to 0x10000180/188/190.
                 ;; First call: return NIL (=X26=0) in X0.  On longjmp:
                 ;; execution resumes here with X0 = T (#xDEAD1009).

@@ -5317,11 +5317,19 @@
    (interned per name-hash) but real symbol-typed objects."
   ;; emit-li-tagged: byte-identical native, :li-halves in mvm-eval (see the symbol
   ;; case in compile-quote — raw :li corrupts a ~60-bit name-hash in-image).
-  (emit-li-tagged +vreg-v0+ (normalize-name kw))
-  (when *mvm-emit-halves* (emit-ir :set-nargs 1))  ; mvm-eval bridge needs nargs (see compile-quote symbol case)
-  (emit-ir :call "%INTERN-KEYWORD" 1)
-  (unless (= dest +vreg-vr+)
-    (emit-ir :mov dest +vreg-vr+)))
+  ;; PERF: under the in-image runtime compiler the keyword OBJECT already
+  ;; exists (it is the literal in the form being compiled), so load it from
+  ;; the quote pool like every other literal instead of re-interning it on
+  ;; every evaluation (43 ns per literal; the &key prologue evaluates several
+  ;; per call).  Static builds keep the intern call: no pool exists there.
+  (if (and *mvm-eval-runtime-p* (not *static-build-p*))
+      (emit-ir :li-const dest (%e2-const-register kw))
+      (progn
+        (emit-li-tagged +vreg-v0+ (normalize-name kw))
+        (when *mvm-emit-halves* (emit-ir :set-nargs 1))  ; mvm-eval bridge needs nargs (see compile-quote symbol case)
+        (emit-ir :call "%INTERN-KEYWORD" 1)
+        (unless (= dest +vreg-vr+)
+          (emit-ir :mov dest +vreg-vr+)))))
 
 ;;; ------ Variable Reference ------
 

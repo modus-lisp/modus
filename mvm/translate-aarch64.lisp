@@ -295,6 +295,10 @@
    SVC #x0511 undefined-call trap.  Nil at image-build time → whole-image
    codegen unchanged (byte-identical to pre-Stage-3).")
 
+(defvar *aarch64-call-reloc-nargs* nil
+  "#306 BRIDGE: alist (movz-byte-off . nargs) parallel to *aarch64-call-relocs*.")
+(defvar *aarch64-last-set-nargs* nil
+  "The most recent :set-nargs immediate seen by the translator (JIT mode).")
 (defvar *aarch64-call-relocs* nil
   "WS4 aarch64 Stage 3.  List of (movz-quad-native-byte-offset . synthetic-mvm-
    offset) collected during a JIT translation.  At JIT time the driver resolves
@@ -4153,7 +4157,8 @@
                 (let ((movz-byte-off (* (- (a64-current-index buf)
                                            (or *aarch64-translated-start-idx* 0))
                                         4)))
-                  (push (cons movz-byte-off target-offset) *aarch64-call-relocs*))
+                  (push (cons movz-byte-off target-offset) *aarch64-call-relocs*)
+                  (push (cons movz-byte-off *aarch64-last-set-nargs*) *aarch64-call-reloc-nargs*))
                 (a64-movz buf +a64-x16+ 0 0)   ; placeholder addr[15:0]  LSL 0
                 (a64-movk buf +a64-x16+ 0 1)   ; placeholder addr[31:16] LSL 16
                 (a64-movk buf +a64-x16+ 0 2)   ; placeholder addr[47:32] LSL 32
@@ -4738,6 +4743,7 @@
           ;;   str w16, [x17]
           ((= op +op-set-nargs+)
            (let ((n (vr 0)))
+             (setq *aarch64-last-set-nargs* n)
              (a64-movz buf +a64-x16+ (logand n #xFFFF) 0)
              (a64-load-imm64 buf +a64-x17+ #x10000150)
              (a64-str-width buf +a64-x16+ +a64-x17+ 0 2)))  ; size=2 = 32-bit STR
@@ -5881,6 +5887,8 @@
   ;; (only populated under *aarch64-jit-mode*; nil otherwise so image-build
   ;; codegen is unchanged).
   (setf *aarch64-call-relocs* nil)
+  (setf *aarch64-call-reloc-nargs* nil)
+  (setf *aarch64-last-set-nargs* nil)
   (setf *aarch64-fn-addr-relocs* nil)
   (setf *aarch64-fn-addr-local-relocs* nil)
   (let* ((buf (or *aarch64-translate-into-buf* (make-a64-buffer)))

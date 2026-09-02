@@ -742,11 +742,13 @@
 (defvar *jit-thunk-page* nil "Current thunk pool page base (exec).")
 (defvar *jit-thunk-bump* nil "Byte offset of the next free thunk in the page.")
 (defvar *jit-bridged-sites* nil "CENSUS: call sites patched to a bridge thunk.")
-(defvar *jit-bridge-off* nil
-  "Kill switch for the late-bound bridge: (setq *jit-bridge-off* t) disables
-   it at runtime.  A defvar reads NIL at boot (limitation 7), so the bridge is
-   ON by default; the gate is the DEFUN below.")
-(defun %jit-bridge-on-p () (not *jit-bridge-off*))
+(defvar *jit-bridge-on* nil
+  "Runtime gate for the late-bound bridge.  A defvar reads NIL at boot
+   (limitation 7), so the bridge is OFF through boot — boot-time forms are
+   one-shot and the aarch64 boot BRK'd with it on — and is enabled by
+   (setq *jit-bridge-on* t) after boot (the CLI toplevel does this once
+   validated; until then it is explicit).")
+(defun %jit-bridge-on-p () *jit-bridge-on*)
 ;; DEFUNs, not defconstants: a defconstant in this file read UNBOUND at
 ;; runtime (the positional-folding class), which faulted the builder.
 (defun %jit-thunk-size () 48)
@@ -776,8 +778,11 @@
 ;; caller-save clobber signature (reference_mvm_caller_save_bug).  Each step
 ;; below keeps at most two values live across a call.
 (defun %jit-thunk-new-page ()
+  ;; x64's %mmap-exec-page yields a SAP-able page (the page-1 idiom is
+  ;; (sap-address (make-sap page))); aarch64's yields the INTEGER address and
+  ;; its page path uses it directly — mirror each arch's own idiom.
   (let ((pg (%mmap-exec-page 4096)))
-    (let ((base (sap-address (make-sap pg))))
+    (let ((base (if (eq *jit-target-arch* :aarch64) pg (sap-address (make-sap pg)))))
       (if (< base 4096)
           nil
           (progn (setq *jit-thunk-page* base)
@@ -842,6 +847,73 @@
       nil
       (let ((addr (%jit-thunk-alloc)))
         (if (null addr) nil (%jit-thunk-fill addr name nargs)))))
+
+;;; aarch64 bridge thunk (96-byte slot; words, I-cache flushed).  V0..V3 =
+;;; x0..x3.  Layout:
+;;;   [mov x3,x2 / mov x2,x1 / mov x1,x0 as needed]
+;;;   movz/movk x0 <- tagged idx            (4 words, via %jit-write-movz-quad)
+;;;   movz w16, #nargs+1                     52800010 | n<<5
+;;;   movz/movk x17 <- #x10000150            (4 words)
+;;;   str w16, [x17]                         B9000230
+;;;   movz/movk x16 <- bridge-N entry        (4 words)
+;;;   br x16                                 D61F0200
+(defun %jit-emit-word32 (addr w)
+  (setf (mem-ref addr :u8) (logand w 255))
+  (setf (mem-ref (+ addr 1) :u8) (logand (ash w -8) 255))
+  (setf (mem-ref (+ addr 2) :u8) (logand (ash w -16) 255))
+  (setf (mem-ref (+ addr 3) :u8) (logand (ash w -24) 255))
+  4)
+
+(defun %jit-emit-quad-placeholder (addr rd)
+  "MOVZ/MOVK placeholder quad for register RD (imm16 = 0); 16 bytes."
+  (%jit-emit-word32 addr (logior #xD2800000 rd))
+  (%jit-emit-word32 (+ addr 4) (logior #xF2A00000 rd))
+  (%jit-emit-word32 (+ addr 8) (logior #xF2C00000 rd))
+  (%jit-emit-word32 (+ addr 12) (logior #xF2E00000 rd))
+  16)
+
+(defun %jit-thunk-alloc-aarch64 ()
+  (when (> (+ *jit-thunk-bump* 96) 4096)
+    (%jit-thunk-new-page))
+  (if (null *jit-thunk-page*)
+      nil
+      (let ((a (+ *jit-thunk-page* *jit-thunk-bump*)))
+        (setq *jit-thunk-bump* (+ *jit-thunk-bump* 96))
+        a)))
+
+(defun %jit-thunk-emit-shift-aarch64 (addr nargs)
+  (let ((k 0))
+    (when (>= nargs 3) (setq k (+ k (%jit-emit-word32 (+ addr k) #xAA0203E3))))  ; mov x3,x2
+    (when (>= nargs 2) (setq k (+ k (%jit-emit-word32 (+ addr k) #xAA0103E2))))  ; mov x2,x1
+    (when (>= nargs 1) (setq k (+ k (%jit-emit-word32 (+ addr k) #xAA0003E1))))  ; mov x1,x0
+    k))
+
+(defun %jit-thunk-emit-tail-aarch64 (addr k idx nargs)
+  (%jit-emit-quad-placeholder (+ addr k) 0)
+  (%jit-write-movz-quad addr k (ash idx 1))
+  (%jit-emit-word32 (+ addr k 16) (logior #x52800010 (ash (+ nargs 1) 5)))
+  (%jit-emit-quad-placeholder (+ addr k 20) 17)
+  (%jit-write-movz-quad addr (+ k 20) #x10000150)
+  (%jit-emit-word32 (+ addr k 36) #xB9000230)
+  (%jit-emit-quad-placeholder (+ addr k 40) 16)
+  (%jit-write-movz-quad addr (+ k 40) (%jit-bridge-entry nargs))
+  (%jit-emit-word32 (+ addr k 56) #xD61F0200)
+  (+ k 60))
+
+(defun %jit-thunk-fill-aarch64 (addr name nargs)
+  (let ((idx *jit-bridge-count*))
+    (setf (aref *jit-bridge-names* idx) name)
+    (setq *jit-bridge-count* (+ idx 1))
+    (%jit-thunk-emit-tail-aarch64 addr (%jit-thunk-emit-shift-aarch64 addr nargs) idx nargs)
+    (%jit-icache-flush addr 96)
+    addr))
+
+(defun %jit-make-bridge-thunk-aarch64 (name nargs)
+  (if (or (null nargs) (> nargs 3) (null (%jit-bridge-ensure))
+          (>= *jit-bridge-count* 4096))
+      nil
+      (let ((addr (%jit-thunk-alloc-aarch64)))
+        (if (null addr) nil (%jit-thunk-fill-aarch64 addr name nargs)))))
 
 (defun %jit-reloc-calls (base relocs rt-table)
   "Patch each out-of-module CALL movabs with the resolved native callee address.
@@ -1520,6 +1592,14 @@
                  (fn (and name (%mvm-resolve-runtime-fn name)))
                  (word (if fn (%val->word fn) 0))
                  (addr (if (eql (logand word 15) 3) (- word 3) 0)))
+            ;; #306 BRIDGE (aarch64 arm): non-native callee -> per-site thunk.
+            (when (and (= addr 0) fn (%jit-bridge-on-p))
+              (let* ((na (assoc (car r) *aarch64-call-reloc-nargs*))
+                     (th (and na (%jit-make-bridge-thunk-aarch64 name (cdr na)))))
+                (when th
+                  (setq addr th)
+                  (setq *jit-bridged-sites*
+                        (if *jit-bridged-sites* (+ 1 *jit-bridged-sites*) 1)))))
             (if (> addr 0)
                 (%jit-write-movz-quad base (car r) addr)
                 (progn

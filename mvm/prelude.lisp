@@ -722,9 +722,15 @@
     (let ((i 0))
       (loop
         (when (= i len) (return result))
-        (let ((ch (aref str i)))
-          (let ((up (char-upcase ch)))
-            (aset result i (if (characterp up) (char-code up) up))))
+        ;; Raw slot access: ASCII letters upcase inline; anything else goes
+        ;; through CHAR-UPCASE (the generic AREF path was ~125 ns per char).
+        (let ((c (%ensure-char-code (%prim-aref str i))))
+          (if (and (>= c 97) (<= c 122))
+              (%prim-aset result i (- c 32))
+              (if (< c 128)
+                  (%prim-aset result i c)
+                  (let ((up (char-upcase (code-char c))))
+                    (%prim-aset result i (if (characterp up) (char-code up) up))))))
         (setq i (+ i 1))))))
 
 (defun string-downcase (str)

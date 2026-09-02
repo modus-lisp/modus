@@ -3275,3 +3275,26 @@
       (format t ";   (disassemble '(lambda (x) (* x x)))~%")))
   nil)
 
+;;; PERF (#306): compiler.lisp's COMPUTE-NAME-HASH (the HOST definition, which
+;;; upcases a fresh copy of the name with STRING-UPCASE and walks it with the
+;;; generic AREF) is spliced into the image AFTER prelude.lisp's raw version,
+;;; so last-defun-wins made every in-image name hash allocate a string —
+;;; ~650k calls per alexandria quickload; STRING-UPCASE was 29% of the PC
+;;; profile.  This override (spliced after compiler.lisp) restores the raw
+;;; %PRIM-AREF loop with inline ASCII upcasing.  Bit-identical result.
+(defun compute-name-hash (name-string)
+  (let ((h1 40389) (h2 48879)          ; #x9DC5 / #xBEEF
+        (len (array-length name-string))
+        (i 0))
+    (loop
+      (when (>= i len) (return nil))
+      (let ((c (%prim-aref name-string i)))
+        (when (and (>= c 97) (<= c 122))
+          (setq c (- c 32)))
+        (setq c (logand c 65535))
+        (setq h1 (logand (* (logxor h1 c) 403) 65535))
+        (setq h2 (logand (* (logxor h2 c) 89) 65535)))
+      (setq i (+ i 1)))
+    (let ((combined (logior (ash (logand h1 +name-hash-hi-mask+) +name-hash-shift+)
+                            (logand h2 +name-hash-lo-mask+))))
+      (if (= combined 0) 1 combined))))

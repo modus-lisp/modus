@@ -1513,6 +1513,84 @@
 (defvar *jit-last-translate-err* nil
   "DIAGNOSTIC: the last condition caught by %jit-translate-page's guard.")
 
+;;; #306 RETRY QUEUE — dissolve the R-CALL-NONNAT contagion.
+;;;
+;;; A DEFUN module whose exec page fails to build at DEFINITION time (almost
+;;; always because a CALLEE was not native YET — %jit-reloc-calls rejects a
+;;; heap-closure callee) installs its functions as interpreter trampolines
+;;; and, until now, they stayed interpreted FOREVER: every later caller of
+;;; those functions then failed ITS reloc too.  Load ORDER, not capability,
+;;; decided what ran native (~50% fallback on bare-metal aarch64, where the
+;;; interpreter is ~1000x slower than native code — see
+;;; reference_interp_speed_fully_attributed).
+;;;
+;;; The cure is retry-at-the-minting-point: the ONLY place a native
+;;; symbol-function entry is made is %jit-install-native-fns after a
+;;; successful page build, so remember each failed DEF* module (its bc,
+;;; entry, ft-list, rt-table, names) and re-attempt the translation whenever
+;;; a NEW native function appears (that is exactly when a queued module's
+;;; missing callee may have become native).  Success installs natives via the
+;;; normal path and overwrites the trampolines (last-write-wins).  Bounded:
+;;; at most +jit-retry-max-attempts+ tries per module, queue capped, drain
+;;; guarded against reentrancy (%jit-install-native-fns is called from the
+;;; drain itself).
+(defvar *jit-retry-queue* nil
+  "List of (attempts bc entry ft-list rt-table names) for DEF* modules whose
+   page failed to build.  Boots NIL (defvars don't init) — that is the empty
+   queue.")
+(defvar *jit-retry-busy* nil "Reentrancy guard for %jit-retry-drain.")
+(defvar *jit-retry-succeeded* nil
+  "CENSUS: modules that went native on a retry.  NIL = 0.")
+(defvar *jit-retry-exhausted* nil
+  "CENSUS: modules dropped after +jit-retry-max-attempts+ failures.  NIL = 0.")
+(defconstant +jit-retry-max-attempts+ 4)
+(defconstant +jit-retry-queue-cap+ 256)
+(defconstant +jit-retry-install-gap+ 16
+  "An entry is re-attempted only after this many NEW native installs since
+   its last attempt, so a module whose callee is defined 60 defuns later
+   still gets its chance without a translate storm (4 attempts x 16 = 64).")
+
+(defun %jit-retry-enqueue (bc entry ft-list rt-table names)
+  "Remember a DEF* module whose page failed, if the queue has room."
+  (when (and names (< (length *jit-retry-queue*) +jit-retry-queue-cap+))
+    (setq *jit-retry-queue*
+          (cons (list 0 bc entry ft-list rt-table names
+                      (or *jit-native-defun-count* 0))
+                *jit-retry-queue*))))
+
+(defun %jit-retry-drain ()
+  "Re-attempt every queued module once.  Called after a successful native
+   install (a new native callee exists).  A module that builds is installed
+   and removed; one that fails is kept with attempts+1, or dropped at the cap."
+  (when (and *jit-retry-queue* (not *jit-retry-busy*))
+    (setq *jit-retry-busy* t)
+    (unwind-protect
+        (let ((keep nil) (now (or *jit-native-defun-count* 0)))
+          (dolist (e *jit-retry-queue*)
+            (let* ((attempts (car e)) (bc (cadr e)) (entry (caddr e))
+                   (ft-list (cadddr e)) (rt-table (car (cddddr e)))
+                   (names (cadr (cddddr e)))
+                   (last (caddr (cddddr e)))
+                   (je (if (< (- now last) +jit-retry-install-gap+)
+                           nil
+                           (%jit-translate-page bc entry ft-list rt-table))))
+              (cond
+                ((and je (cadr (cddddr je)))
+                 (%jit-install-native-fns (car je) (cadr (cddddr je)) names)
+                 (when *jit-page-cache* (setf (gethash bc *jit-page-cache*) je))
+                 (setq *jit-retry-succeeded*
+                       (if *jit-retry-succeeded* (+ 1 *jit-retry-succeeded*) 1)))
+                ((< (- now last) +jit-retry-install-gap+)
+                 (setq keep (cons e keep)))            ; not due yet, untouched
+                ((< (+ 1 attempts) +jit-retry-max-attempts+)
+                 (setq keep (cons (list (+ 1 attempts) bc entry ft-list rt-table names now)
+                                  keep)))
+                (t
+                 (setq *jit-retry-exhausted*
+                       (if *jit-retry-exhausted* (+ 1 *jit-retry-exhausted*) 1))))))
+          (setq *jit-retry-queue* keep))
+      (setq *jit-retry-busy* nil))))
+
 (defun %jit-translate-page (bc mvm-entry ft-list rt-table)
   "FLIP-SAFETY GUARD (Fix 1): translate + build a JIT exec page for BC, but
    turn ANY error signalled while translating/relocating (e.g. a translator
@@ -1700,7 +1778,10 @@
           ;; On a page-build failure (je NIL) nothing is published and the
           ;; trampolines stand — the interpret fallback is unchanged.
           (when (and persist-names (cadr (cddddr je)) (%jit-native-defuns-p))
-            (%jit-install-native-fns (car je) (cadr (cddddr je)) persist-names))
+            (%jit-install-native-fns (car je) (cadr (cddddr je)) persist-names)
+            ;; #306: a new native callee exists — give queued failed modules
+            ;; their retry.
+            (%jit-retry-drain))
           ;; Native code stamps MV-count into real BSS; seed it to 1 so a
           ;; single-value form reads back 1 (the thunk epilogue sets it, but
           ;; be defensive).  A form that sets it >1 falls back for correct MV.
@@ -1841,6 +1922,10 @@
                 (if *jit-r-page-nil* (+ 1 *jit-r-page-nil*) 1))
           (setq *jit-fallback-count*
                 (if *jit-fallback-count* (+ 1 *jit-fallback-count*) 1))
+          ;; #306: a DEF* module whose page failed — remember it for retry once
+          ;; more callees have gone native (see *jit-retry-queue*).
+          (when (and persist-names (%jit-native-defuns-p))
+            (%jit-retry-enqueue bc entry ft-list rt-table persist-names))
           (%mvm-wrap-escaping-result
             (mvm-interpret bc :entry-point entry
                            :function-table fn-table :runtime-table rt-table

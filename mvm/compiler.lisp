@@ -5478,7 +5478,7 @@
     "DEFVAR" "WITH" "IN-PACKAGE" "%ALLOC-MDA-RAW"
     "VALUES-LIST" "%SAVE-OUTER-HANDLER" "%GET-NARGS" "CLI"
     ">=" "T" "AND" "REQUIRE"
-    "CHARACTERP" "USING" "SAP-REF-32" "SAP-SET-64"
+    "CHARACTERP" "USING" "SAP-REF-32" "SAP-SET-64" "TYPEP"
     "INITIALLY" "LET" "DEFSTRUCT" "EQUALP"
     "OTHERWISE" "FROM" "HANDLER-CASE" "%FLOAT-ADD"
     "MMIO-DO-READ32" "<=" "SYSCALL3" "IO-OUT-DWORD"
@@ -5557,6 +5557,23 @@
                (zerop (length n))       ; name not recoverable — trust the hash
                (string-equal n sf)))))))
 
+(defun %typep-fold-pred (type-sym)
+  "Predicate symbol for a standard type name TYPEP can fold to, else NIL."
+  (let ((n (symbol-name type-sym)))
+    (cond ((string= n "INTEGER") 'integerp)
+          ((string= n "FIXNUM") 'integerp)
+          ((string= n "CONS") 'consp)
+          ((string= n "LIST") 'listp)
+          ((string= n "NULL") 'null)
+          ((string= n "SYMBOL") 'symbolp)
+          ((string= n "STRING") 'stringp)
+          ((string= n "CHARACTER") 'characterp)
+          ((string= n "FUNCTION") 'functionp)
+          ((string= n "HASH-TABLE") 'hash-table-p)
+          ((string= n "KEYWORD") 'keywordp)
+          ((string= n "ATOM") 'atom)
+          (t nil))))
+
 (defun compile-compound (form env dest)
   "Compile a compound form (operator . args)"
   (let* ((op (car form))
@@ -5583,6 +5600,14 @@
        (compile-funcall form env dest))
       ;; --- Special Forms ---
       ((= op-name 338547669)    (compile-quote (cadr form) dest))  ; QUOTE
+      ;; PERF: (typep X 'SIMPLE-TYPE) with a literal standard type name folds
+      ;; to the inline predicate at compile time (the runtime TYPEP walks a
+      ;; 45-clause chain; standard type names cannot be redefined, CLHS 11.1.2.1.2).
+      ((and (= op-name #.(compute-name-hash "TYPEP"))
+            (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
+            (consp (caddr form)) (eq (car (caddr form)) 'quote)
+            (symbolp (cadr (caddr form))) (%typep-fold-pred (cadr (caddr form))))
+       (compile-form (list (%typep-fold-pred (cadr (caddr form))) (cadr form)) env dest))
       ((= op-name 463569520)       (compile-if (cdr form) env dest))  ; IF
       ((= op-name 28734859)    (compile-progn (cdr form) env dest))  ; PROGN
       ((= op-name 536263002)  ; LET

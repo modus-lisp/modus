@@ -1627,22 +1627,11 @@
   "K-th 62-bit limb (LSB-first) of VALUE's magnitude."
   (logand (ash (abs value) (* +neg-limb-bits+ k)) +fixnum-max+))
 
-(defun %cl-sym-fast-hash (x)
-  "HOST STUB (returns NIL): cl-packages.lisp overrides it in-image to return
-   an interned CL symbol's slot-0 name hash without rehashing the string
-   (override in mvm-eval.lisp)."
-  (declare (ignorable x))
-  nil)
 (defun normalize-name (sym)
   "Convert a symbol to its name hash for comparison.
-   Returns 0 for non-symbol, non-integer inputs.
-   PERF: an in-image CL symbol already carries compute-name-hash(name) in
-   slot 0 (%make-cl-symbol), so take it from there — the string path was
-   1,026,012 calls / 1.6 s of a 13 s alexandria quickload (each call
-   allocating an upcased copy of the name)."
+   Returns 0 for non-symbol, non-integer inputs."
   (cond
     ((integerp sym) sym)
-    ((%cl-sym-fast-hash sym) (%cl-sym-fast-hash sym))
     ((symbolp sym) (compute-name-hash (symbol-name sym)))
     ((stringp sym) (compute-name-hash sym))
     (t 0)))

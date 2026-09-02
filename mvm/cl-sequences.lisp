@@ -993,8 +993,13 @@
                 ;; CODE x2) — CHAR= was 20% of a library-load profile.
                 (loop
                   (when (= i len1) (return t))
-                  (unless (eq (%prim-aref sa (+ s1 i)) (%prim-aref sb (+ s2 i)))
-                    (return nil))
+                  ;; Slots normally hold CODES, but a slot may hold a CHARACTER
+                  ;; (see %ENSURE-CHAR-CODE) — so a raw EQ miss re-compares
+                  ;; through the normalizer before declaring a mismatch.
+                  (let ((ca (%prim-aref sa (+ s1 i))) (cb (%prim-aref sb (+ s2 i))))
+                    (unless (or (eq ca cb)
+                                (eql (%ensure-char-code ca) (%ensure-char-code cb)))
+                      (return nil)))
                   (setq i (+ i 1)))
                 (loop
                   (when (= i len1) (return t))

@@ -798,8 +798,8 @@
               ;; raw code for the case-fold + numeric compare.  RAW = both
               ;; are plain #x31 strings, so read the codes straight from the
               ;; slots (no AREF dispatch / code-char boxing / call per char).
-              (let ((ca (if raw (%prim-aref a (+ s1 i)) (%ensure-char-code (aref a (+ s1 i)))))
-                    (cb (if raw (%prim-aref b (+ s2 i)) (%ensure-char-code (aref b (+ s2 i))))))
+              (let ((ca (%ensure-char-code (if raw (%prim-aref a (+ s1 i)) (aref a (+ s1 i)))))
+                    (cb (%ensure-char-code (if raw (%prim-aref b (+ s2 i)) (aref b (+ s2 i))))))
                 (when (and (>= ca 65) (<= ca 90)) (setq ca (+ ca 32)))
                 (when (and (>= cb 65) (<= cb 90)) (setq cb (+ cb 32)))
                 (unless (= ca cb) (return nil)))

@@ -119,11 +119,6 @@
 (defun %cl-sym-data (sym) sym)  ; legacy accessor — slots live directly on sym
 (defun %cl-sym-hash (sym) (aref sym 0))
 (defun %cl-sym-package (sym) (aref sym 1))
-(defun %cl-sym-fast-hash (x)
-  "In-image override of compiler.lisp's stub: slot 0 of a CL symbol is
-   compute-name-hash(name) (see %make-cl-symbol), so NORMALIZE-NAME can skip
-   rehashing the string.  NIL for anything that is not a CL symbol."
-  (if (%cl-sym-p x) (aref x 0) nil))
 (defun %cl-sym-name (sym)
   "Slot 2 holds the name string.  Compile-time `'foo' literals interned
    via %INTERN-SYMBOL-PKG start with slot 2 empty (we don't pass the

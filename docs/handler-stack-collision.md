@@ -251,3 +251,71 @@ negative NET — sub-shard the disagreeing range at `NSH=128+` and diff the
 per-ID sets again — was **not run**. If −2 needs to be explained rather than
 absorbed before merge, that is the run to do, and `21900-21999` is where to
 point it.
+
+---
+
+## The merge happened, and the collision is now MEASURED, not predicted
+
+`origin/merge-fix-bq` (`c8864da`) merges this branch with `main` at `ea12243`.
+The merge itself is careful — five textual conflicts resolved by hand with
+stated reasoning, and it caught a real bug in this branch (`GET-INTERNAL-RUN-TIME`
+returned FLOOR's remainder as a second value; ANSI 26072/26073; fixed in
+`c8864da` and cherry-picked here as `1552eb9`). **It resolved the text and
+never engaged the design collision above.** Its handler push emits
+
+```
+add r11, 0x10001000          ; frame = depth*32 + 0x10001000   (main's address)
+FS: mov [r11], rax           ; FS-relative store                 (our prefix)
+```
+
+and the geometry makes that worse than "process-global again":
+
+```
+%THR-TLS-BLOCK(cpu)  = page + 0x2000 + cpu * 0x1000     (stride 0x1000, contiguous)
+FS base              = block - 0x10000000               (%TLS-INSTALL)
+FS:[0x10001000]      = block + 0x1000 = %THR-TLS-BLOCK(cpu + 1)
+```
+
+**A worker's handler frames are written into the NEXT thread's window.**
+
+Measured on a build of `c8864da`, `test/hosted-handler-neighbour.lisp` — main
+reads two slots of cpu 2's window, one worker on cpu 1 nests 100
+`handler-case`s and returns, main reads again; nothing is instrumented inside
+the nesting, so the observation cannot move the bug:
+
+```
+                       merge c8864da              this branch e6285dc
+cpu2 +0x640  (frame 50)  0 -> 730228544470          0 -> 0
+cpu2 +0x1900 (frame 200) 0 -> 0   (control)         0 -> 0
+                         FAIL 3 of 3               PASS 3 of 3
+```
+
+Every existing threaded test passes on the merge — `hosted-mv-handler` 24,
+`hosted-thread-lisp` 29, `hosted-atomics` 31, `classify-thread-lisp` 100/0/0,
+and glass's own RFB server delivers a correct frame — **because none of them has
+three armed workers nesting handlers at the same time.** With cpu N's frames
+over cpu N+1's MV buffer, handler depth and dynamic bindings, the failure is a
+hang or a silent wrong value, never a clean fault; a live-victim variant of this
+test hung to its timeout.
+
+**Two instrument traps met on the way, recorded so the next person skips them:**
+a `WITH-MUTEX` (or any unwind-protect-bearing macro) inside the nesting function
+sends it to the interpreter, whose `handler-case` never touches the native frame
+stack — the test then passes and proves nothing; and a 6-worker "deep nesting"
+test passed because each victim only checked its window before its neighbour
+had written into it. The committed test reads from main, after the join.
+
+**Fix shape, unchanged from above:** the per-thread slot must actually hold the
+512 frames. Either the window stride grows to cover `0x1000..0x4FFF` (16 KB of
+frames after the 4 KB window, with `%TLS-WINDOW-OFFSET-P`, the page size at
+344064, the thread table at `+0x13000` and the per-CPU blocks at `+0x14000` all
+moved accordingly), or the window holds a pointer to a separately-mapped
+per-thread frame region — and in either case the collector must be told about
+the frames (`EMIT-DYNBIND-ROOT-SCAN` is the precedent). `hosted-handler-neighbour`
+going 3-of-3 FAIL to 3-of-3 PASS on the merge is the acceptance.
+
+**Still open on both builds, unrelated to the stack:** `run-glass-serve.sh`
+reports client PASS (0 pixels differing) but server `rc=1` — a toplevel form in
+the harness's post-serve "nothing left behind" section (the `inet-socket` fd
+probe) dies with a swallowed `TYPE-ERROR` after the frame is delivered. Harness,
+not glass, not the frame; not yet diagnosed.

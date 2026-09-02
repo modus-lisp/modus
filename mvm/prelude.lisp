@@ -789,13 +789,17 @@
            (slen1 (- ee1 s1))
            (slen2 (- ee2 s2)))
       (if (= slen1 slen2)
-          (let ((i 0))
+          (let ((i 0)
+                (raw (and (%prim-stringp a) (not (%mda-p a))
+                          (%prim-stringp b) (not (%mda-p b)))))
             (loop
               (when (= i slen1) (return t))
               ;; AREF on a string now yields a CHARACTER; normalize to a
-              ;; raw code for the case-fold + numeric compare.
-              (let ((ca (%ensure-char-code (aref a (+ s1 i))))
-                    (cb (%ensure-char-code (aref b (+ s2 i)))))
+              ;; raw code for the case-fold + numeric compare.  RAW = both
+              ;; are plain #x31 strings, so read the codes straight from the
+              ;; slots (no AREF dispatch / code-char boxing / call per char).
+              (let ((ca (if raw (%prim-aref a (+ s1 i)) (%ensure-char-code (aref a (+ s1 i)))))
+                    (cb (if raw (%prim-aref b (+ s2 i)) (%ensure-char-code (aref b (+ s2 i))))))
                 (when (and (>= ca 65) (<= ca 90)) (setq ca (+ ca 32)))
                 (when (and (>= cb 65) (<= cb 90)) (setq cb (+ cb 32)))
                 (unless (= ca cb) (return nil)))
@@ -1277,19 +1281,44 @@
    present-p is NIL.  We compute the (value present-p) pair as a cons
    inside the search loop and call `values' once at the tail — calling
    `values' inside `return' was losing the second value (loop+return
-   appears to clobber MV-count on its way out)."
+   appears to clobber MV-count on its way out).
+
+   HOT PATH: the holder is read with plain CAR/CDR and the :NOHASH sentinel
+   is compared as its literal fixnum (-424242001, see %HT-NOHASH) — every
+   helper call here showed up as its own line in the in-image profile."
   (let ((found-pair nil)
         (use-linear t)
-        (holder (%ht-bucket-holder ht)))
+        (holder (let ((c (cdr ht)))          ; %ht-bucket-holder, inlined
+                  (if (and (consp c) (eq (car c) (%ht-tag)))
+                      (car (cdr (cdr (cdr (cdr (cdr c))))))
+                      nil))))
     (when holder
-      (let ((vec (%ht-active-vec-h ht holder)))
-        (when vec
-          ;; O(1) bucket path.  :NOHASH key (e.g. a string in an EQ/EQL table)
-          ;; falls through to the linear path.
-          (let ((r (%ht-bucket-find vec key (%ht-h-strcmp holder))))
-            (unless (eq r (%ht-nohash))
-              (setq use-linear nil)
-              (setq found-pair r))))))
+      (let ((vec (car holder)))
+        (when (null vec)
+          ;; still small: build the index once the table crosses the threshold
+          (when (>= (car (cdr holder)) 32)
+            (setq vec (%ht-rebuild-index ht holder (cdr (cdr holder))))))
+        (when (and vec (not (eq vec -424242001)))
+          (if (fixnump key)
+              ;; FIXNUM FAST PATH, fully inline (same mix as %ht-hash): this is
+              ;; every SYMBOL-VALUE / SET-SYMBOL-VALUE of a special, every
+              ;; keyword literal and every name-hash keyed compiler table.
+              (let* ((k (if (< key 0) (- key) key))
+                     (h (logand (logxor k (logxor (ash k -8) (ash k -16)))
+                                (- (%prim-array-length vec) 1)))
+                     (cur (%word-aref vec h)))
+                (setq use-linear nil)
+                (loop
+                  (when (null cur) (return nil))
+                  (let ((e (car cur)))
+                    (when (eq (car e) key) (setq found-pair (cdr e)) (return nil)))
+                  (setq cur (cdr cur))))
+              ;; O(1) bucket path.  :NOHASH key (e.g. a string in an EQ/EQL
+              ;; table) falls through to the linear path.
+              (let ((r (%ht-bucket-find vec key (cdr (cdr holder)))))
+                (unless (eq r -424242001)
+                  (setq use-linear nil)
+                  (setq found-pair r)))))))
     (when use-linear
       ;; Linear alist path (legacy / small / nohash table / :nohash key).
       (let ((cmp (%ht-keytest ht)) (cur (car ht)))
@@ -1308,10 +1337,27 @@
   "Set KEY to VALUE in hash table HT. Returns VALUE.
    Maintains both the authoritative CAR alist and (for large explicit-:TEST
    tables) the O(1) bucket index + the holder's entry count."
-  (let* ((holder (%ht-bucket-holder ht))
+  (let* ((holder (let ((c (cdr ht)))          ; %ht-bucket-holder, inlined
+                   (if (and (consp c) (eq (car c) (%ht-tag)))
+                       (car (cdr (cdr (cdr (cdr (cdr c))))))
+                       nil)))
          (vec (and holder (%ht-active-vec-h ht holder)))
          (strcmp? (and vec (%ht-h-strcmp holder)))
-         (existing (and vec (%ht-bucket-find vec key strcmp?))))
+         (existing (and vec
+                        (if (fixnump key)
+                            ;; fixnum fast path (mirrors GETHASH)
+                            (let* ((k (if (< key 0) (- key) key))
+                                   (h (logand (logxor k (logxor (ash k -8) (ash k -16)))
+                                              (- (%prim-array-length vec) 1)))
+                                   (cur (%word-aref vec h))
+                                   (r nil))
+                              (loop
+                                (when (null cur) (return nil))
+                                (let ((e (car cur)))
+                                  (when (eq (car e) key) (setq r (cdr e)) (return nil)))
+                                (setq cur (cdr cur)))
+                              r)
+                            (%ht-bucket-find vec key strcmp?)))))
     (cond
       ;; ---- Bucket path: key IS bucketable and already present → update. ----
       ((and vec existing (not (eq existing (%ht-nohash))))
@@ -1322,7 +1368,13 @@
        (let ((new-pair (cons key value)))
          (set-car ht (cons new-pair (car ht)))
          (%ht-h-set-count holder (+ (%ht-h-count holder) 1))
-         (%ht-bucket-put vec key new-pair strcmp?)
+         ;; Keep chains short: once the table holds more than 2 entries per
+         ;; bucket, rebuild the index at the next power of two (the rebuild
+         ;; walks the alist, which already contains NEW-PAIR).
+         (if (and (> (%ht-h-count holder) (* 2 (%prim-array-length vec)))
+                  (< (%prim-array-length vec) 65536))
+             (%ht-rebuild-index ht holder strcmp?)
+             (%ht-bucket-put vec key new-pair strcmp?))
          value))
       ;; ---- Linear alist path (legacy / small / nohash table, OR a :NOHASH
       ;;      key under an active bucket).  Also bumps the holder count so a
@@ -1474,22 +1526,25 @@
 (defun %ht-h-set-count (h n) (set-car (cdr h) n))
 
 (defun %ht-bucket-holder (ht)
-  "Return the (vec-or-flag count . strcmp?) bucket-holder cons for HT, or NIL if
-   HT is a legacy table without one.  The proper 5-list meta has the holder as
-   its 5th element; the legacy improper meta has no 5th element."
-  (let ((m (%ht-meta ht)))
-    (if (and (consp m) (consp (cdr m)) (consp (cddr m))
-             (consp (cdr (cddr m))) (consp (cddr (cddr m))))
-        (car (cddr (cddr m)))   ; 5th element = bucket-holder cons
+  "Return the (vec-or-flag count . strcmp?) bucket-holder cons for HT, or NIL
+   for something that is not a tagged table.  HOT PATH: this runs on every
+   GETHASH/PUTHASH.  Both MAKE-HASH-TABLE paths build the proper 5-list meta
+   (test rsize rthresh size holder), so after the tag check the holder is a
+   fixed cdr-walk with no per-link CONSP probes (the probing version alone was
+   12% of the in-image profile of a library load)."
+  (let ((c (cdr ht)))
+    (if (and (consp c) (eq (car c) (%ht-tag)))
+        (car (cdr (cdr (cdr (cdr (cdr c))))))
         nil)))
 
-(defun %ht-hash (key strcmp?)
+(defun %ht-hash (key strcmp? mask)
   "Cheap bucket index for KEY, or :NOHASH for a key we can't index by structure.
    STRINGS are only bucketed when STRCMP? (EQUAL tables, content compare); under
    EQ/EQL distinct string objects with equal contents are DISTINCT keys, so
    string keys are :NOHASH there (correct linear fallback).  Fixnums / chars /
    symbols / nil / t index identically under all tests (immediates / interned).
-   String hash is CASE-SENSITIVE."
+   String hash is CASE-SENSITIVE.  MASK = bucket-count minus one (the
+   bucket vector is a power of two in length and GROWS with the table)."
   (cond
     ((stringp key)
      (if strcmp?
@@ -1498,7 +1553,7 @@
              (when (>= i len) (return nil))
              (setq h (logand (* (logxor h (%prim-aref key i)) 16777619) #xFFFFFFFF))
              (setq i (+ i 1)))
-           (logand h 255))
+           (logand h mask))
          (%ht-nohash)))
     ;; MIX the fixnum, do not truncate it.  `(logand key 255)' keeps only the
     ;; low 8 bits, and the single biggest user of a fixnum-keyed EQL table is
@@ -1518,36 +1573,39 @@
     ;; and %ht-bucket-put — both call THIS function, so they cannot diverge.
     ((fixnump key)
      (let ((k (if (< key 0) (- key) key)))
-       (logand (logxor k (logxor (ash k -8) (ash k -16))) 255)))
-    ((characterp key) (logand (char-code key) 255))
+       (logand (logxor k (logxor (ash k -8) (ash k -16))) mask)))
+    ((characterp key) (logand (char-code key) mask))
     ((null key) 17)
     ((eq key t) 19)
-    ((%cl-sym-p key) (logand (%cl-sym-hash key) 255))
-    ((%native-mvm-sym-p key) (logand (%native-mvm-sym-hash key) 255))
+    ((%cl-sym-p key) (logand (%cl-sym-hash key) mask))
+    ((%native-mvm-sym-p key) (logand (%native-mvm-sym-hash key) mask))
     (t (%ht-nohash))))
 
 (defun %ht-vec-set (vec i val)
   "Var-index ASET forced to dest=frame-slot (CLAUDE.md var-index ASET bug)."
   (let ((dummy (aset vec i val))) dummy))
 
-(defun %ht-new-bucket-vec ()
-  "256 NIL-filled buckets (alloc-array zero-inits to fixnum 0, NOT NIL)."
-  (let ((vec (make-array 256)) (i 0))
+(defun %ht-new-bucket-vec (n)
+  "N NIL-filled buckets (alloc-array zero-inits to fixnum 0, NOT NIL)."
+  (let ((vec (make-array n)) (i 0))
     (loop
-      (when (>= i 256) (return vec))
+      (when (>= i n) (return vec))
       (%ht-vec-set vec i nil)
       (setq i (+ i 1)))))
 
 (defun %ht-bucket-find (vec key strcmp?)
   "Find the (key . pair) entry in VEC's bucket for KEY; returns the alist PAIR,
-   NIL (absent), or :NOHASH (key not bucketable → caller must use the linear
+   NIL (absent), or :NOHASH (key not bucketable -> caller must use the linear
    alist path).  Bucket entries store the SAME pair cons that lives in the
-   table's CAR alist.  Comparison is inlined: STRCMP? strings by content, all
-   else by EQL."
-  (let ((h (%ht-hash key strcmp?)))
+   table's CAR alist.  HOT PATH: the bucket is read with the leaf %WORD-AREF
+   (the generic AREF's multi-dim/string dispatch was 6% of a library-load
+   profile by itself), and identity keys compare with EQ -- every bucketable
+   non-string key (fixnum, char, NIL, T, symbol) is an immediate or an interned
+   object, so EQ is exact there; bignums/floats never reach a bucket."
+  (let ((h (%ht-hash key strcmp? (- (%prim-array-length vec) 1))))
     (if (eq h (%ht-nohash))
         (%ht-nohash)
-        (let ((cur (aref vec h)))
+        (let ((cur (%word-aref vec h)))
           (if (and strcmp? (stringp key))
               ;; string-content path
               (loop
@@ -1560,23 +1618,23 @@
               (loop
                 (when (null cur) (return nil))
                 (let ((e (car cur)))
-                  (when (eql (car e) key) (return (cdr e))))
+                  (when (eq (car e) key) (return (cdr e))))
                 (setq cur (cdr cur))))))))
 
 (defun %ht-bucket-put (vec key pair strcmp?)
   "Index PAIR (the alist cons) under KEY in VEC.  Caller guarantees KEY isn't
    already present (gethash/puthash check first).  No-op for :NOHASH keys."
-  (let ((h (%ht-hash key strcmp?)))
+  (let ((h (%ht-hash key strcmp? (- (%prim-array-length vec) 1))))
     (unless (eq h (%ht-nohash))
-      (let ((old (aref vec h)))
+      (let ((old (%word-aref vec h)))
         (%ht-vec-set vec h (cons (cons key pair) old)))))
   pair)
 
 (defun %ht-bucket-rem (vec key strcmp?)
   "Remove KEY's entry from VEC's bucket."
-  (let ((h (%ht-hash key strcmp?)))
+  (let ((h (%ht-hash key strcmp? (- (%prim-array-length vec) 1))))
     (unless (eq h (%ht-nohash))
-      (let ((result nil) (cur (aref vec h)))
+      (let ((result nil) (cur (%word-aref vec h)))
         (loop
           (when (null cur) (return nil))
           (let ((ek (car (car cur))))
@@ -1588,19 +1646,26 @@
         (%ht-vec-set vec h (nreverse result))))))
 
 (defun %ht-rebuild-index (ht holder strcmp?)
-  "Build the 256-bucket index from HT's current alist and store it in HOLDER's
-   car.  If any key isn't structurally hashable, mark :NOHASH and bail (the
-   table permanently falls back to the linear alist scan)."
-  (let ((vec (%ht-new-bucket-vec)) (cur (car ht)) (ok t))
+  "Build (or RE-build, larger) the bucket index from HT's current alist and
+   store it in HOLDER's car.  The bucket count is a power of two sized so the
+   average chain stays at or under 2 entries (min 256, max 65536): a fixed
+   256 buckets over the 7.5k-entry symbol tables meant 30-entry chains on
+   every GETHASH.  If any key isn't structurally hashable, mark :NOHASH and
+   bail (the table permanently falls back to the linear alist scan)."
+  (let ((cnt (%ht-h-count holder)) (n 256))
     (loop
-      (when (null cur) (return nil))
-      (let* ((pair (car cur)) (k (car pair)))
-        (when (eq (%ht-hash k strcmp?) (%ht-nohash)) (setq ok nil) (return nil))
-        (%ht-bucket-put vec k pair strcmp?))
-      (setq cur (cdr cur)))
-    (if ok
-        (progn (%ht-h-set-vec holder vec) vec)
-        (progn (%ht-h-set-vec holder (%ht-nohash)) (%ht-nohash)))))
+      (when (or (>= n (* 2 cnt)) (>= n 65536)) (return nil))
+      (setq n (* n 2)))
+    (let ((vec (%ht-new-bucket-vec n)) (cur (car ht)) (ok t))
+      (loop
+        (when (null cur) (return nil))
+        (let* ((pair (car cur)) (k (car pair)))
+          (when (eq (%ht-hash k strcmp? 255) (%ht-nohash)) (setq ok nil) (return nil))
+          (%ht-bucket-put vec k pair strcmp?))
+        (setq cur (cdr cur)))
+      (if ok
+          (progn (%ht-h-set-vec holder vec) vec)
+          (progn (%ht-h-set-vec holder (%ht-nohash)) (%ht-nohash))))))
 
 (defun %ht-active-vec-h (ht holder)
   "Return the active bucket vector for HT (HOLDER already fetched), building it

@@ -984,11 +984,23 @@
            (len2 (- ee2 s2)))
       (if (= len1 len2)
           (let ((i 0))
-            (loop
-              (when (= i len1) (return t))
-              ;; AREF on strings now yields CHARACTERs — compare via char=.
-              (unless (char= (aref sa (+ s1 i)) (aref sb (+ s2 i))) (return nil))
-              (setq i (+ i 1))))
+            (if (and (%prim-stringp sa) (not (%mda-p sa))
+                     (%prim-stringp sb) (not (%mda-p sb)))
+                ;; FAST PATH (both plain #x31 strings): compare raw char
+                ;; codes slot-by-slot.  The generic loop below costs ~8
+                ;; calls and a &rest cons per character (AREF dispatch +
+                ;; code-char boxing x2, CHAR= &rest, %CHAR2=, %ENSURE-CHAR-
+                ;; CODE x2) — CHAR= was 20% of a library-load profile.
+                (loop
+                  (when (= i len1) (return t))
+                  (unless (eq (%prim-aref sa (+ s1 i)) (%prim-aref sb (+ s2 i)))
+                    (return nil))
+                  (setq i (+ i 1)))
+                (loop
+                  (when (= i len1) (return t))
+                  ;; AREF on strings now yields CHARACTERs — compare via char=.
+                  (unless (char= (aref sa (+ s1 i)) (aref sb (+ s2 i))) (return nil))
+                  (setq i (+ i 1)))))
           nil))))
 (defun string/= (a b &rest args)
   "Case-sensitive inequality.  Returns position of mismatch (in a's

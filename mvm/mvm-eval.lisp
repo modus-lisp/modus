@@ -3274,3 +3274,12 @@
       (format t ";   Pass a lambda expression to see compiler output, e.g.~%")
       (format t ";   (disassemble '(lambda (x) (* x x)))~%")))
   nil)
+
+;;; PERF (#306 compile path): an in-image CL symbol already carries
+;;; compute-name-hash(name) in slot 0 (%make-cl-symbol), so NORMALIZE-NAME can
+;;; take it from there instead of re-hashing an upcased copy of the name on
+;;; every call (1,026,012 calls / 1.6 s of a 13 s alexandria quickload).
+;;; compiler.lisp carries a host stub returning NIL; this override must live in
+;;; a file spliced AFTER compiler.lisp (this one) or the stub wins.
+(defun %cl-sym-fast-hash (x)
+  (if (%cl-sym-p x) (aref x 0) nil))

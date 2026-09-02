@@ -188,7 +188,7 @@
    Dual write: NAME's own package plus the historic bare entry."
   (let ((h (cond ((integerp name) name)
                  ((stringp name) (compute-name-hash name))
-                 ((symbolp name) (compute-name-hash (symbol-name name)))
+                 ((symbolp name) (normalize-name name))
                  (t (error "mvm-define-setf-expander: bad name ~S" name)))))
     (let ((p (%reg-pkg-of name)))
       (when p
@@ -204,7 +204,7 @@
    (task #241); the bare entry stays as the fallback."
   (let ((h (cond ((integerp name) name)
                  ((stringp name) (compute-name-hash name))
-                 ((symbolp name) (compute-name-hash (symbol-name name)))
+                 ((symbolp name) (normalize-name name))
                  (t nil))))
     (and h
          (or (and *setf-expanders-pkg*
@@ -1627,11 +1627,22 @@
   "K-th 62-bit limb (LSB-first) of VALUE's magnitude."
   (logand (ash (abs value) (* +neg-limb-bits+ k)) +fixnum-max+))
 
+(defun %cl-sym-fast-hash (x)
+  "HOST STUB (returns NIL): cl-packages.lisp overrides it in-image to return
+   an interned CL symbol's slot-0 name hash without rehashing the string
+   (override in mvm-eval.lisp)."
+  (declare (ignorable x))
+  nil)
 (defun normalize-name (sym)
   "Convert a symbol to its name hash for comparison.
-   Returns 0 for non-symbol, non-integer inputs."
+   Returns 0 for non-symbol, non-integer inputs.
+   PERF: an in-image CL symbol already carries compute-name-hash(name) in
+   slot 0 (%make-cl-symbol), so take it from there — the string path was
+   1,026,012 calls / 1.6 s of a 13 s alexandria quickload (each call
+   allocating an upcased copy of the name)."
   (cond
     ((integerp sym) sym)
+    ((%cl-sym-fast-hash sym) (%cl-sym-fast-hash sym))
     ((symbolp sym) (compute-name-hash (symbol-name sym)))
     ((stringp sym) (compute-name-hash sym))
     (t 0)))
@@ -2133,7 +2144,7 @@
 (defun name-eq (sym name-string)
   "Check if SYM's name matches NAME-STRING via hash comparison"
   (and (symbolp sym)
-       (= (compute-name-hash (symbol-name sym))
+       (= (normalize-name sym)
           (compute-name-hash name-string))))
 
 ;;; ============================================================
@@ -2507,7 +2518,7 @@
                                (cond
                                  ((or (eq keys t)
                                       (and (symbolp keys)
-                                           (= (compute-name-hash (symbol-name keys)) 101669203)))  ; OTHERWISE
+                                           (= (normalize-name keys) 101669203)))  ; OTHERWISE
                                   `(t ,@effective-body))
                                  ((listp keys)
                                   `((or ,@(mapcar (lambda (k) `(eql ,tmp ',k)) keys))
@@ -2926,7 +2937,7 @@
                                    (body (cdr clause)))
                                (if (or (eq type t)
                                        (and (symbolp type)
-                                            (= (compute-name-hash (symbol-name type))
+                                            (= (normalize-name type)
                                                101669203)))  ; OTHERWISE
                                    `(t ,@body)
                                    `((typep ,tmp ',type) ,@body))))
@@ -3394,7 +3405,7 @@
                 ;; Unlocks PSETF.29 and similar.
                 ((and (consp place) (name-eq (car place) "SYMBOL-VALUE"))
                  ;; %SYM-GLOBAL-KEY (task #241) rather than a bare
-                 ;; (compute-name-hash (symbol-name …)): a runtime-born
+                 ;; (normalize-name …): a runtime-born
                  ;; package's special is stored under its qualified key, and
                  ;; a SETF of (symbol-value sym) has to hit the same cell a
                  ;; compiled read of that variable does.
@@ -6014,14 +6025,14 @@
       ;; this case, mvm-eval compiled HANDLER-BIND as an ORDINARY CALL —
       ;; the binding list was evaluated as a function call (usually
       ;; signalling) and the handlers never installed.
-      ((= op-name 49694955)   ; (compute-name-hash "HANDLER-BIND")
+      ((= op-name 49694955)   ; #.(compute-name-hash "HANDLER-BIND")
        (compile-handler-bind (cadr form) (cddr form) env dest))
       ;; %HANDLER-CASE-CATCH — internal: the handler-case variant CATCH
       ;; expands to.  Identical to HANDLER-CASE except it does NOT get the
       ;; NLX-transparency guard (its T-clause IS the frame that consumes a
       ;; matching block/catch tag — guarding it would longjmp past the
       ;; catch that owns the tag and no throw would ever land).
-      ((= op-name 243424779)   ; (compute-name-hash "%HANDLER-CASE-CATCH")
+      ((= op-name 243424779)   ; #.(compute-name-hash "%HANDLER-CASE-CATCH")
        (compile-handler-case (cadr form) (cddr form) env dest t))
       ;; RESTART-CASE — bytecode setjmp/longjmp (stays in the interpreter;
       ;; does NOT route through the native %with-restarts bridge under mvm-eval)
@@ -6240,7 +6251,7 @@
       ((= op-name 210297867)  ; 1-
        (when (arity-ok-p form 1 1 env dest) (compile-1- (cadr form) env dest)))
       ((= op-name 396221377) (compile-truncate (cdr form) env dest))  ; TRUNCATE
-      ((= op-name (compute-name-hash "%FIXNUM-TRUNCATE2"))
+      ((= op-name #.(compute-name-hash "%FIXNUM-TRUNCATE2"))
        (compile-fixnum-truncate2 (cdr form) env dest))
 
       ;; --- IEEE float intrinsics (target-:native lowers via :fadd etc.) ---
@@ -6439,38 +6450,38 @@
       ;; or x64 (the trap codes are gated on *aarch64-linux-mode* and
       ;; emit garbage on other targets — the build script doesn't emit
       ;; calls to these unless we're in Linux/AArch64 mode).
-      ((= op-name (compute-name-hash "%AARCH64-ALARM"))     (compile-aarch64-alarm     (cdr form) env dest))
-      ((= op-name (compute-name-hash "%AARCH64-OPENAT"))    (compile-aarch64-openat    (cdr form) env dest))
-      ((= op-name (compute-name-hash "%AARCH64-UNLINKAT"))  (compile-aarch64-unlinkat  (cdr form) env dest))
-      ((= op-name (compute-name-hash "%AARCH64-NEWFSTATAT")) (compile-aarch64-newfstatat (cdr form) env dest))
-      ((= op-name (compute-name-hash "%AARCH64-MKDIRAT"))   (compile-aarch64-mkdirat   (cdr form) env dest))
-      ((= op-name (compute-name-hash "%AARCH64-RENAMEAT"))  (compile-aarch64-renameat  (cdr form) env dest))
+      ((= op-name #.(compute-name-hash "%AARCH64-ALARM"))     (compile-aarch64-alarm     (cdr form) env dest))
+      ((= op-name #.(compute-name-hash "%AARCH64-OPENAT"))    (compile-aarch64-openat    (cdr form) env dest))
+      ((= op-name #.(compute-name-hash "%AARCH64-UNLINKAT"))  (compile-aarch64-unlinkat  (cdr form) env dest))
+      ((= op-name #.(compute-name-hash "%AARCH64-NEWFSTATAT")) (compile-aarch64-newfstatat (cdr form) env dest))
+      ((= op-name #.(compute-name-hash "%AARCH64-MKDIRAT"))   (compile-aarch64-mkdirat   (cdr form) env dest))
+      ((= op-name #.(compute-name-hash "%AARCH64-RENAMEAT"))  (compile-aarch64-renameat  (cdr form) env dest))
       ;; (%mmap-shared-page size) — allocate a shared-memory anonymous
       ;; mmap page.  Returns the tagged address or -1 (tagged) on error.
       ;; Used by fork-file to share a last-attempted-test-id slot
       ;; between parent and child so the parent can re-fork past an
       ;; uncatchable per-test crash.
-      ((= op-name (compute-name-hash "%MMAP-SHARED-PAGE"))
+      ((= op-name #.(compute-name-hash "%MMAP-SHARED-PAGE"))
        (compile-mmap-shared (cdr form) env dest))
       ;; (%mmap-exec-page size) — PROT_RWX page for the WS4 runtime JIT.
-      ((= op-name (compute-name-hash "%MMAP-EXEC-PAGE"))
+      ((= op-name #.(compute-name-hash "%MMAP-EXEC-PAGE"))
        (compile-mmap-exec (cdr form) env dest))
       ;; (%jit-call entry-addr) — call JIT'd native code at ENTRY-ADDR.
-      ((= op-name (compute-name-hash "%JIT-CALL"))
+      ((= op-name #.(compute-name-hash "%JIT-CALL"))
        (compile-jit-call (cdr form) env dest))
       ;; (%jit-icache-flush base len) — make freshly-written JIT bytes in
       ;; [base,base+len) executable.  AArch64 needs D-cache clean + I-cache
       ;; invalidate; x64 is a no-op.
-      ((= op-name (compute-name-hash "%JIT-ICACHE-FLUSH"))
+      ((= op-name #.(compute-name-hash "%JIT-ICACHE-FLUSH"))
        (compile-jit-icache-flush (cdr form) env dest))
       ;; (%jit-free-page base len) — munmap a transient JIT exec page (WS4
       ;; #160 Piece 2 reclamation).  aarch64 munmap; x64 no-op.
-      ((= op-name (compute-name-hash "%JIT-FREE-PAGE"))
+      ((= op-name #.(compute-name-hash "%JIT-FREE-PAGE"))
        (compile-jit-free-page (cdr form) env dest))
       ;; (%get-cenv) — read the closure-env register (R13 on x64) into
       ;; DEST. Used only by the closure body prologue to snapshot the
       ;; env-list set by the caller's compile-funcall closure path.
-      ((= op-name (compute-name-hash "%GET-CENV"))
+      ((= op-name #.(compute-name-hash "%GET-CENV"))
        (emit-ir :get-cenv dest))
 
       ;; --- Error Handler (handler-case support) ---
@@ -6479,12 +6490,12 @@
       ;; (%error-handler-active-p) — check if a handler-case is active
       ((= op-name 347568651) (compile-error-handler-active-p dest))  ; %ERROR-HANDLER-ACTIVE-P
       ;; (%install-signal-handlers handler-addr) — install SIGSEGV/etc handlers
-      ((= op-name (compute-name-hash "%INSTALL-SIGNAL-HANDLERS"))
+      ((= op-name #.(compute-name-hash "%INSTALL-SIGNAL-HANDLERS"))
        (compile-install-signal-handlers (cdr form) env dest))
 
       ;; --- Timestamp Counter ---
       ((= op-name 215533517) (compile-rdtsc dest))  ; RDTSC
-      ((= op-name (compute-name-hash "CNTFRQ")) (compile-cntfrq dest))
+      ((= op-name #.(compute-name-hash "CNTFRQ")) (compile-cntfrq dest))
 
       ;; --- Wait For Interrupt ---
       ((= op-name 243189679) (compile-wfi dest))  ; WFI
@@ -6559,10 +6570,10 @@
       ((= op-name 152947911)   (compile-make-bignum dest))  ; %make-bignum
       ((= op-name 10557132)   (compile-make-ratio dest))   ; %make-ratio
       ((= op-name 9531149) (compile-make-float dest))  ; %make-float
-      ((= op-name (compute-name-hash "%MAKE-FLOAT2")) (compile-make-float2 dest))
-      ((= op-name (compute-name-hash "%MAKE-SINGLE2")) (compile-make-single2 dest))
-      ((= op-name (compute-name-hash "%MAKE-SHORT2")) (compile-make-short2 dest))
-      ((= op-name (compute-name-hash "%MAKE-LONG2")) (compile-make-long2 dest))
+      ((= op-name #.(compute-name-hash "%MAKE-FLOAT2")) (compile-make-float2 dest))
+      ((= op-name #.(compute-name-hash "%MAKE-SINGLE2")) (compile-make-single2 dest))
+      ((= op-name #.(compute-name-hash "%MAKE-SHORT2")) (compile-make-short2 dest))
+      ((= op-name #.(compute-name-hash "%MAKE-LONG2")) (compile-make-long2 dest))
       ;; --- Closure construction ---
       ;; (%make-closure fn env) -> tag-object / subtag-0x52, 2 slots.
       ;; Replaces (cons #'fn env) for closure object creation. The
@@ -6575,7 +6586,7 @@
       ;; --- Array Operations ---
       ((= op-name 17023737)       (compile-make-array form env dest))  ; MAKE-ARRAY
       ;; %MAKE-STRING-ARRAY — like make-array but with string subtag
-      ((= op-name (compute-name-hash "%MAKE-STRING-ARRAY"))
+      ((= op-name #.(compute-name-hash "%MAKE-STRING-ARRAY"))
        (compile-make-string-array (cadr form) env dest))
       ((= op-name 338454479)             (compile-aref-form form env dest))  ; AREF
       ;; SVREF — same machinery as AREF but strict 2-arg arity (CLHS):
@@ -6599,31 +6610,31 @@
       ;; the shifted bits carry their own tag (fixnum/cons/object) — this is a
       ;; pure reinterpret, no type guard.  (mvm-eval already does %word->val for
       ;; fixnums as (ash r -1); these generalize it to pointers.)
-      ((= op-name (compute-name-hash "%VAL->WORD"))
+      ((= op-name #.(compute-name-hash "%VAL->WORD"))
        (compile-val-to-word (cdr form) env dest))
-      ((= op-name (compute-name-hash "%WORD->VAL"))
+      ((= op-name #.(compute-name-hash "%WORD->VAL"))
        (compile-word-to-val (cdr form) env dest))
-      ((= op-name (compute-name-hash "%PRIM-AREF"))
+      ((= op-name #.(compute-name-hash "%PRIM-AREF"))
        (compile-prim-aref (cadr form) (caddr form) env dest))
-      ((= op-name (compute-name-hash "%PRIM-ARRAYP"))
+      ((= op-name #.(compute-name-hash "%PRIM-ARRAYP"))
        (compile-prim-arrayp (cadr form) env dest))
-      ((= op-name (compute-name-hash "%PRIM-ASET"))
+      ((= op-name #.(compute-name-hash "%PRIM-ASET"))
        (compile-prim-aset (cadr form) (caddr form) (cadddr form) env dest))
-      ((= op-name (compute-name-hash "%PRIM-ARRAY-LENGTH"))
+      ((= op-name #.(compute-name-hash "%PRIM-ARRAY-LENGTH"))
        (compile-prim-array-length (cadr form) env dest))
-      ((= op-name (compute-name-hash "%PRIM-STRINGP"))
+      ((= op-name #.(compute-name-hash "%PRIM-STRINGP"))
        (compile-prim-stringp (cadr form) env dest))
-      ((= op-name (compute-name-hash "%MAKE-ARRAY-RAW"))
+      ((= op-name #.(compute-name-hash "%MAKE-ARRAY-RAW"))
        (compile-make-array-raw (cadr form) env dest))
-      ((= op-name (compute-name-hash "%ALLOC-U8"))
+      ((= op-name #.(compute-name-hash "%ALLOC-U8"))
        (compile-alloc-u8 (cadr form) env dest))
-      ((= op-name (compute-name-hash "%U8-REF"))
+      ((= op-name #.(compute-name-hash "%U8-REF"))
        (compile-u8-ref (cadr form) (caddr form) env dest))
-      ((= op-name (compute-name-hash "%U8-SET"))
+      ((= op-name #.(compute-name-hash "%U8-SET"))
        (compile-u8-set (cadr form) (caddr form) (cadddr form) env dest))
-      ((= op-name (compute-name-hash "%WORD-AREF"))
+      ((= op-name #.(compute-name-hash "%WORD-AREF"))
        (compile-word-aref (cadr form) (caddr form) env dest))
-      ((= op-name (compute-name-hash "%WORD-ASET"))
+      ((= op-name #.(compute-name-hash "%WORD-ASET"))
        (compile-word-aset (cadr form) (caddr form) (cadddr form) env dest))
 
       ;; ROTATEF — (rotatef place1 place2 ...) → rotate values left
@@ -6881,7 +6892,7 @@
       ;; This is a SEPARATE op from user-visible THROW so that the change
       ;; does NOT alter restart-case / catch internals that rely on the
       ;; full (error "throw") signal path.
-      ((= op-name 423943347)   ; (compute-name-hash "%NLX-THROW")
+      ((= op-name 423943347)   ; #.(compute-name-hash "%NLX-THROW")
        (let ((tag-form (cadr form))
              (val-form (caddr form)))
          (compile-form
@@ -6960,7 +6971,7 @@
       ;; (safety-check N form...) — emit FORMs only at safety level >= N.
       ;; Compiled out entirely below that: the body is not walked, not
       ;; macroexpanded, and costs nothing at runtime.  See *compile-safety*.
-      ((= op-name (compute-name-hash "SAFETY-CHECK"))
+      ((= op-name #.(compute-name-hash "SAFETY-CHECK"))
        (if (and (consp (cdr form)) (integerp (cadr form))
                 (>= *compile-safety* (cadr form)))
            (compile-form (cons 'progn (cddr form)) env dest)
@@ -12817,7 +12828,7 @@
     (when (atom form) (return-from tail-form-is-values-p nil))
     (let ((op (car form)))
       (when (not (symbolp op)) (return-from tail-form-is-values-p nil))
-      (let ((hash (compute-name-hash (symbol-name op))))
+      (let ((hash (normalize-name op)))
         (cond
           ;; Direct values call
           ((= hash 18794783) t)  ; VALUES
@@ -12839,7 +12850,7 @@
           ;; class as the IF branch handling below: a RETURN-FROM into the
           ;; block with a non-values result leaves the MV count to the
           ;; dynamic path, which the heuristic already accepts.
-          ((= hash (compute-name-hash "BLOCK"))
+          ((= hash #.(compute-name-hash "BLOCK"))
            (tail-form-is-values-p (cddr form)))
           ;; if — check both branches
           ((= hash 463569520)     ; IF
@@ -12847,7 +12858,7 @@
                (and (cadddr form) (tail-form-is-values-p (list (cadddr form))))))
           ;; cond — check the body of each clause (last expression)
           ;; Hash for COND.  We compute it dynamically on first use.
-          ((= hash (compute-name-hash "COND"))
+          ((= hash #.(compute-name-hash "COND"))
            (let ((any-yes nil))
              (dolist (clause (cdr form))
                (when (and (consp clause) (cdr clause)
@@ -12855,8 +12866,8 @@
                  (setq any-yes t)))
              any-yes))
           ;; when/unless — body returns (values ...) if its last form does
-          ((or (= hash (compute-name-hash "WHEN"))
-               (= hash (compute-name-hash "UNLESS")))
+          ((or (= hash #.(compute-name-hash "WHEN"))
+               (= hash #.(compute-name-hash "UNLESS")))
            (tail-form-is-values-p (cddr form)))
           ;; and/or — CLHS 5.3: both return ALL the values of their LAST
           ;; subform, and exactly one value on any short-circuit exit.  So
@@ -12870,18 +12881,18 @@
           ;;   (alexandria ENSURE-GETHASH.1 got (T T), want (T)).
           ;; `(and)' / `(or)' with no subforms are constants; (cdr form) is
           ;; NIL and tail-form-is-values-p answers NIL (clamp), correct.
-          ((or (= hash (compute-name-hash "AND"))
-               (= hash (compute-name-hash "OR")))
+          ((or (= hash #.(compute-name-hash "AND"))
+               (= hash #.(compute-name-hash "OR")))
            (tail-form-is-values-p (cdr form)))
           ;; loop / block — walk body looking for any (return (values ...))
           ;; or (return-from NAME (values ...)).  Required so functions whose
           ;; tail is a loop with multi-value return don't get MV-COUNT=1
           ;; clobber on the function epilogue.
-          ((or (= hash (compute-name-hash "LOOP"))
-               (= hash (compute-name-hash "BLOCK")))
+          ((or (= hash #.(compute-name-hash "LOOP"))
+               (= hash #.(compute-name-hash "BLOCK")))
            (loop-body-has-mv-return-p (cdr form)))
           ;; multiple-value-bind — MV result comes from the body's tail form.
-          ((= hash (compute-name-hash "MULTIPLE-VALUE-BIND"))
+          ((= hash #.(compute-name-hash "MULTIPLE-VALUE-BIND"))
            (tail-form-is-values-p (cdddr form)))
           ;; multiple-value-call — like APPLY/FUNCALL, its result is whatever
           ;; the CALLED function returned, INCLUDING multiple values.  Always
@@ -12890,14 +12901,14 @@
           ;; mvc like `(multiple-value-call f (apply g args))`, so the lambda
           ;; epilogue clamped MV-count=1 and dropped a callee's extra values —
           ;; alexandria multiple-value-compose + ensure-gethash.)
-          ((= hash (compute-name-hash "MULTIPLE-VALUE-CALL")) t)
+          ((= hash #.(compute-name-hash "MULTIPLE-VALUE-CALL")) t)
           ;; multiple-value-prog1 — MV propagation comes from FIRST (the
           ;; saved-values form), NOT the cleanup body.  Without this
           ;; (defun … (multiple-value-prog1 (funcall body-fn) cleanup))
           ;; was getting MV-count=1 reset by the epilogue because cdddr
           ;; tail was the cleanup setq, which the conservative T branch
           ;; misidentified as values-preserving.  Now we check FIRST.
-          ((= hash (compute-name-hash "MULTIPLE-VALUE-PROG1"))
+          ((= hash #.(compute-name-hash "MULTIPLE-VALUE-PROG1"))
            (tail-form-is-values-p (list (cadr form))))
           ;; (apply #'values ...) or (apply <whatever> ...) — APPLY's
           ;; result is whatever the called function returned, including
@@ -12906,10 +12917,10 @@
           ;; rely on MV-count being preserved through the apply tail
           ;; call; the function epilogue's set-mv-count=1 would clobber
           ;; it back to 1 and break (subtypep* …).
-          ((= hash (compute-name-hash "APPLY")) t)
+          ((= hash #.(compute-name-hash "APPLY")) t)
           ;; (funcall #'values …) — same reasoning as APPLY but for the
           ;; spread-args form.
-          ((= hash (compute-name-hash "FUNCALL")) t)
+          ((= hash #.(compute-name-hash "FUNCALL")) t)
           ;; Any other symbol-headed compound: if it's a function call
           ;; (NOT a primitive like + - * if cond etc.), the callee owns
           ;; its return MV-state.  Either the callee returns single via
@@ -12956,12 +12967,12 @@
     ((atom forms) nil)
     ((and (consp forms) (symbolp (car forms))
           (let ((h (compute-name-hash (symbol-name (car forms)))))
-            (or (= h (compute-name-hash "RETURN"))
-                (= h (compute-name-hash "RETURN-FROM"))))
+            (or (= h #.(compute-name-hash "RETURN"))
+                (= h #.(compute-name-hash "RETURN-FROM"))))
           (cdr forms))
      ;; (return X) — X is (cadr forms); (return-from N X) — X is (caddr forms)
      (let* ((is-rfrom (= (compute-name-hash (symbol-name (car forms)))
-                         (compute-name-hash "RETURN-FROM")))
+                         #.(compute-name-hash "RETURN-FROM")))
             (val-form (if is-rfrom (caddr forms) (cadr forms))))
        (and val-form (consp val-form)
             (tail-form-is-values-p (list val-form)))))

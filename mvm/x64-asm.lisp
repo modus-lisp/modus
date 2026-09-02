@@ -49,12 +49,18 @@
           (setf (code-buffer-bytes buf) new-bytes))))))
 
 (defun emit-byte (buf byte)
-  (let ((pos (code-buffer-position buf)))
-    (%code-buffer-ensure buf pos)
-    (when (null (code-buffer-bytes buf))
-      (format t "  DBG-EMIT: code-buffer-bytes NIL at pos=~D~%" pos)
-      (error "emit-byte: code-buffer-bytes is NIL at pos ~D" pos))
-    (setf (aref (code-buffer-bytes buf) pos) (ldb (byte 8 0) byte))
+  ;; PERF (2026-09-02): this is the runtime JIT's innermost loop — ~30 bytes
+  ;; per translated MVM op, ~130k ops per alexandria quickload.  The old body
+  ;; cost ~7 calls per byte in-image (a runtime (BYTE 8 0) bytespec + generic
+  ;; LDB, an unconditional ensure call, a debug null check, generic AREF and
+  ;; a struct setter): translation was 3.35 s of a 12.3 s load.  Keep the
+  ;; capacity check inline and the masking a primop.
+  (let ((pos (code-buffer-position buf))
+        (bytes (code-buffer-bytes buf)))
+    (when (>= pos (length bytes))
+      (%code-buffer-ensure buf pos)
+      (setq bytes (code-buffer-bytes buf)))
+    (setf (aref bytes pos) (logand byte 255))
     (setf (code-buffer-position buf) (+ pos 1))))
 
 (defun emit-bytes (buf &rest bytes)
@@ -206,8 +212,18 @@
 ;; If a bare register symbol is ever genuinely wanted, quote it — do not
 ;; reintroduce image-wide constants for 48 two-letter names.  See task #211.
 
+(defvar *reg-info-table* nil
+  "EQ hash of register symbol -> its *registers* entry, built on first use
+   (a defvar initform does not run in-image).  PERF: reg-info runs 3-4x per
+   emitted instruction; the ASSOC over ~48 entries was ~25% of translation
+   time in both the host profile (%ASSOC + REG-INFO) and, by inference, the
+   in-image JIT.")
 (defun reg-info (reg)
-  (or (assoc reg *registers*)
+  (unless *reg-info-table*
+    (let ((h (make-hash-table :test 'eq)))
+      (dolist (e *registers*) (setf (gethash (car e) h) e))
+      (setq *reg-info-table* h)))
+  (or (gethash reg *reg-info-table*)
       (error "Unknown register: ~A" reg)))
 
 (defun reg-code (reg)

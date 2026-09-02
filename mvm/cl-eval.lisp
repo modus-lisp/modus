@@ -149,9 +149,21 @@
       (if fn
           fn
           (let ((c (%make-condition 'undefined-function (list :name sym))))
-            (if (%error-handler-active-p)
-                (%hc-longjmp)
-                (progn (error "undefined function") nil)))))))
+            ;; PUBLISH the condition before unwinding — same sequence as the
+            ;; unbound-variable path above.  The old code longjmp'd with C
+            ;; never stored in *current-condition*, so the handler-case that
+            ;; caught it received whatever condition was caught LAST (a stale
+            ;; FILE-ERROR / cabinet NOT-FOUND): quickload's real
+            ;; UNDEFINED-FUNCTION on bare metal reported as NOT-FOUND
+            ;; "/ql/local-init", and a direct probe reproduced it on x64.
+            (setq *current-condition* c)
+            (%associate-active-restart-frames c)
+            (let ((handled (%signal-condition c)))
+              (if handled
+                  nil
+                  (if (%error-handler-active-p)
+                      (%hc-longjmp)
+                      (progn (error "undefined function") nil)))))))))
 
 (defun set-symbol-function (sym fn)
   "Set the function cell of SYM to FN.  Updates both the name-keyed

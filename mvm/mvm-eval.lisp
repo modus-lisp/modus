@@ -1762,7 +1762,12 @@
   (when (and names (< (length *jit-retry-queue*) (%jit-retry-queue-cap)))
     (setq *jit-retry-queue*
           (cons (list 0 bc entry ft-list rt-table names
-                      (or *jit-native-defun-count* 0))
+                      (or *jit-native-defun-count* 0)
+                      ;; The module's OWN const pool: %jit-translate-page bakes
+                      ;; literals from the GLOBAL *e2-const-pool*, which is
+                      ;; only correct at this module's own seam.  A retry runs
+                      ;; at a LATER module's seam, so it must restore this.
+                      *e2-const-pool*)
                 *jit-retry-queue*))))
 
 (defun %jit-retry-drain ()
@@ -1778,9 +1783,16 @@
                    (ft-list (cadddr e)) (rt-table (car (cddddr e)))
                    (names (cadr (cddddr e)))
                    (last (caddr (cddddr e)))
+                   (pool (cadddr (cddddr e)))
                    (je (if (< (- now last) (%jit-retry-install-gap))
                            nil
-                           (%jit-translate-page bc entry ft-list rt-table))))
+                           ;; Lexical-save + setq-restore of the pool (the
+                           ;; codebase's escape-safe idiom, not a dynamic LET).
+                           (let ((saved *e2-const-pool*))
+                             (setq *e2-const-pool* pool)
+                             (let ((r (%jit-translate-page bc entry ft-list rt-table)))
+                               (setq *e2-const-pool* saved)
+                               r)))))
               (cond
                 ((and je (cadr (cddddr je)))
                  (%jit-install-native-fns (car je) (cadr (cddddr je)) names)
@@ -1790,7 +1802,7 @@
                 ((< (- now last) (%jit-retry-install-gap))
                  (setq keep (cons e keep)))            ; not due yet, untouched
                 ((< (+ 1 attempts) (%jit-retry-max-attempts))
-                 (setq keep (cons (list (+ 1 attempts) bc entry ft-list rt-table names now)
+                 (setq keep (cons (list (+ 1 attempts) bc entry ft-list rt-table names now pool)
                                   keep)))
                 (t
                  (setq *jit-retry-exhausted*

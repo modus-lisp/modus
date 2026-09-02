@@ -285,6 +285,9 @@
    SBCL-style toplevel options left-to-right, loads the userinit rc before an
    interactive REPL, and either runs the REPL or exits.  Call this from
    kernel-main."
+  ;; #306: boot is over — enable the JIT's late-bound call bridge for
+  ;; everything the user loads (it stays OFF through boot; see *jit-bridge-on*).
+  (setq *jit-bridge-on* t)
   ;; Expose the full argv as *posix-argv* (element 0 = program name).
   (setq *posix-argv* (%cli-collect-argv))
   (let* ((all *posix-argv*)

@@ -1408,6 +1408,9 @@
     ;; "" unless MODUS_NET_BUILD=1.
     *net-pipeline-call*
     "
+  ;; #306: boot is over — enable the JIT's late-bound call bridge for what the
+  ;; REPL evaluates (OFF through boot; see *jit-bridge-on* in mvm-eval.lisp).
+  (setq *jit-bridge-on* t)
   ;; --- the REPL (lib/serial-repl.lisp) ------------------------------------
   (handler-case (cl-serial-repl) (t (c) nil))
   (halt))

@@ -185,6 +185,13 @@
    re-signaling, so the mvm-eval seam can report exactly which instruction
    shape hit a translator gap.")
 
+(defvar *x64-call-reloc-nargs* nil
+  "#306 BRIDGE: alist (imm-off . nargs) parallel to *x64-call-relocs* — the
+   :set-nargs immediate that preceded each out-of-module CALL site, so the JIT
+   can build a per-site bridge thunk of the right arity when the callee turns
+   out to be a heap closure / generic function (see %jit-reloc-calls).")
+(defvar *x64-last-set-nargs* nil
+  "The most recent :set-nargs immediate seen by the translator (JIT mode).")
 (defvar *x64-call-relocs* nil
   "WS4 STAGE 3 (runtime JIT out-of-module call relocation).  List of
    (native-imm64-byte-offset . synthetic-mvm-offset) pairs collected
@@ -2795,6 +2802,7 @@
          ;; many args the caller passed. Encoded as:
          ;;   mov dword [0x10000150], imm32
          (let ((n (first operands)))
+           (setq *x64-last-set-nargs* n)
            (emit-bytes buf #xC7 #x04 #x25)         ; mov [disp32], imm32
            (emit-bytes buf #x50 #x01 #x00 #x10)    ; disp32 = #x10000150
            (emit-bytes buf (logand n #xFF) #x00 #x00 #x00)))
@@ -3338,6 +3346,7 @@
                (if (and *x64-jit-mode* target-offset (>= target-offset #x40000000))
                    (let ((imm-off (+ (code-buffer-position buf) 2)))  ; skip 48 B8
                      (push (cons imm-off target-offset) *x64-call-relocs*)
+                     (push (cons imm-off *x64-last-set-nargs*) *x64-call-reloc-nargs*)
                      (emit-mov-reg-imm buf 'rax 0)   ; movabs rax, 0 (patched)
                      (emit-call-reg buf 'rax))        ; call rax
                    ;; Unknown target — emit CALL rel32 placeholder (unchanged).
@@ -6847,6 +6856,8 @@
   (setf *x64-cur-fn-name* nil)
   ;; WS4 STAGE 3: reset the out-of-module CALL relocation list.
   (setf *x64-call-relocs* nil)
+  (setf *x64-call-reloc-nargs* nil)
+  (setf *x64-last-set-nargs* nil)
   ;; WS4 (Class 2): reset the out-of-module FN-ADDR relocation list.
   (setf *x64-fn-addr-relocs* nil)
   (let* ((buf (let ((b (make-code-buffer))

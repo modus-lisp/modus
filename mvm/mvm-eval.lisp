@@ -727,6 +727,122 @@
     (let ((obj (if pool (gethash (cdr p) pool) nil)))
       (%jit-write-movz-quad base (car p) (%val->word obj)))))
 
+;;; #306 LATE-BOUND BRIDGE (x64).  A JIT'd page's out-of-module CALL is a
+;;; `movabs rax, imm64; call rax` whose imm64 must be a NATIVE entry.  When the
+;;; callee resolves to a heap object — an interp closure, a #x52 closure, or a
+;;; STANDARD-GENERIC-FUNCTION (CLOS accessors: never native by construction) —
+;;; the page used to be rejected and the WHOLE caller ran interpreted, ~1000x
+;;; slower.  Now the site is patched to a per-site THUNK that shifts the args up
+;;; one register, loads V0 with a stable NAME INDEX, sets nargs, and tail-jumps
+;;; to the baked %JIT-BRIDGE-N, which resolves the name at CALL time (late
+;;; binding — redefinition-safe, GC-safe: the thunk holds no heap pointer) and
+;;; FUNCALLs.  Sites with >3 args still fail the page (rare; register window).
+(defvar *jit-bridge-names* nil "Vector of callee NAME strings, indexed by thunk.")
+(defvar *jit-bridge-count* nil "Fill index into *jit-bridge-names*.  NIL = 0.")
+(defvar *jit-thunk-page* nil "Current thunk pool page base (exec).")
+(defvar *jit-thunk-bump* nil "Byte offset of the next free thunk in the page.")
+(defvar *jit-bridged-sites* nil "CENSUS: call sites patched to a bridge thunk.")
+(defvar *jit-bridge-off* nil
+  "Kill switch for the late-bound bridge: (setq *jit-bridge-off* t) disables
+   it at runtime.  A defvar reads NIL at boot (limitation 7), so the bridge is
+   ON by default; the gate is the DEFUN below.")
+(defun %jit-bridge-on-p () (not *jit-bridge-off*))
+;; DEFUNs, not defconstants: a defconstant in this file read UNBOUND at
+;; runtime (the positional-folding class), which faulted the builder.
+(defun %jit-thunk-size () 48)
+(defun %jit-bridge-cap () 4096)
+
+(defun %jit-bridge-resolve (idx)
+  (let ((nm (if (and *jit-bridge-names* (< idx (length *jit-bridge-names*)))
+                (aref *jit-bridge-names* idx) nil)))
+    (let ((f (and nm (%mvm-resolve-runtime-fn nm))))
+      (if f f (error "jit-bridge: ~A is undefined at call time" nm)))))
+(defun %jit-bridge-0 (idx) (funcall (%jit-bridge-resolve idx)))
+(defun %jit-bridge-1 (idx a) (funcall (%jit-bridge-resolve idx) a))
+(defun %jit-bridge-2 (idx a b) (funcall (%jit-bridge-resolve idx) a b))
+(defun %jit-bridge-3 (idx a b c) (funcall (%jit-bridge-resolve idx) a b c))
+
+(defun %jit-bridge-entry (n)
+  "Untagged native entry of %jit-bridge-N."
+  (let ((f (symbol-function (cond ((= n 0) (quote %jit-bridge-0))
+                                  ((= n 1) (quote %jit-bridge-1))
+                                  ((= n 2) (quote %jit-bridge-2))
+                                  (t (quote %jit-bridge-3))))))
+    (- (%val->word f) 3)))
+
+;; SMALL FUNCTIONS, FEW LIVE TEMPS: the first cut was one big builder whose
+;; first-use init faulted in the baked image while the same forms worked at
+;; the REPL and the builder worked once its tables existed — the MVM
+;; caller-save clobber signature (reference_mvm_caller_save_bug).  Each step
+;; below keeps at most two values live across a call.
+(defun %jit-thunk-new-page ()
+  (let ((pg (%mmap-exec-page 4096)))
+    (let ((base (sap-address (make-sap pg))))
+      (if (< base 4096)
+          nil
+          (progn (setq *jit-thunk-page* base)
+                 (setq *jit-thunk-bump* 0)
+                 base)))))
+
+(defun %jit-bridge-ensure ()
+  "First-use init of the bridge tables; T when usable."
+  (when (null *jit-bridge-names*)
+    (setq *jit-bridge-names* (make-array 4096))
+    (setq *jit-bridge-count* 0))
+  (when (null *jit-thunk-page*)
+    (%jit-thunk-new-page))
+  (if *jit-thunk-page* t nil))
+
+(defun %jit-thunk-alloc ()
+  "Address of a fresh 48-byte thunk slot, or NIL."
+  (when (> (+ *jit-thunk-bump* 48) 4096)
+    (%jit-thunk-new-page))
+  (if (null *jit-thunk-page*)
+      nil
+      (let ((a (+ *jit-thunk-page* *jit-thunk-bump*)))
+        (setq *jit-thunk-bump* (+ *jit-thunk-bump* 48))
+        a)))
+
+(defun %jit-emit-bytes (addr bytes)
+  (let ((k 0))
+    (dolist (b bytes)
+      (setf (mem-ref (+ addr k) :u8) b)
+      (setq k (+ k 1)))
+    k))
+
+(defun %jit-thunk-emit-shift (addr nargs)
+  "Shift args up one register (V0..V3 = RSI RDI R8 R9); return bytes written."
+  (let ((k 0))
+    (when (>= nargs 3) (setq k (+ k (%jit-emit-bytes (+ addr k) (list #x4D #x89 #xC1)))))  ; mov r9,r8
+    (when (>= nargs 2) (setq k (+ k (%jit-emit-bytes (+ addr k) (list #x49 #x89 #xF8)))))  ; mov r8,rdi
+    (when (>= nargs 1) (setq k (+ k (%jit-emit-bytes (+ addr k) (list #x48 #x89 #xF7)))))  ; mov rdi,rsi
+    k))
+
+(defun %jit-thunk-emit-tail (addr k idx nargs)
+  "movabs rsi,<tagged idx>; mov dword [0x10000150],nargs+1; movabs rax,bridge; jmp rax"
+  (%jit-emit-bytes (+ addr k) (list #x48 #xBE))
+  (%jit-write-imm64 addr (+ k 2) (ash idx 1))
+  (%jit-emit-bytes (+ addr k 10) (list #xC7 #x04 #x25 #x50 #x01 #x00 #x10 (+ nargs 1) 0 0 0))
+  (%jit-emit-bytes (+ addr k 21) (list #x48 #xB8))
+  (%jit-write-imm64 addr (+ k 23) (%jit-bridge-entry nargs))
+  (%jit-emit-bytes (+ addr k 31) (list #xFF #xE0))
+  (+ k 33))
+
+(defun %jit-thunk-fill (addr name nargs)
+  (let ((idx *jit-bridge-count*))
+    (setf (aref *jit-bridge-names* idx) name)
+    (setq *jit-bridge-count* (+ idx 1))
+    (%jit-thunk-emit-tail addr (%jit-thunk-emit-shift addr nargs) idx nargs)
+    addr))
+
+(defun %jit-make-bridge-thunk (name nargs)
+  "Build the x64 bridge thunk for a NARGS-arg call to NAME; its address or NIL."
+  (if (or (null nargs) (> nargs 3) (null (%jit-bridge-ensure))
+          (>= *jit-bridge-count* 4096))
+      nil
+      (let ((addr (%jit-thunk-alloc)))
+        (if (null addr) nil (%jit-thunk-fill addr name nargs)))))
+
 (defun %jit-reloc-calls (base relocs rt-table)
   "Patch each out-of-module CALL movabs with the resolved native callee address.
    Returns T if every reloc resolved, NIL if any failed (→ caller falls back)."
@@ -770,6 +886,16 @@
              (word (if fn (%val->word fn) 0))
              (nativep (eql (logand word 15) 3))
              (raw (if nativep (- word 3) 0)))
+        ;; #306 BRIDGE: a resolved-but-non-native callee gets a thunk instead
+        ;; of failing the page (x64 only; nargs from the translator's parallel
+        ;; alist, NIL on aarch64 → falls through to the old reject).
+        (when (and (= raw 0) fn (%jit-bridge-on-p) (not (eq *jit-target-arch* :aarch64)))
+          (let* ((na (assoc (car r) *x64-call-reloc-nargs*))
+                 (th (and na (%jit-make-bridge-thunk name (cdr na)))))
+            (when th
+              (setq raw th)
+              (setq *jit-bridged-sites*
+                    (if *jit-bridged-sites* (+ 1 *jit-bridged-sites*) 1)))))
         (if (> raw 0)
             (%jit-write-imm64 base (car r) raw)
             (progn
@@ -1531,7 +1657,7 @@
 ;;; a NEW native function appears (that is exactly when a queued module's
 ;;; missing callee may have become native).  Success installs natives via the
 ;;; normal path and overwrites the trampolines (last-write-wins).  Bounded:
-;;; at most +jit-retry-max-attempts+ tries per module, queue capped, drain
+;;; at most (%jit-retry-max-attempts) tries per module, queue capped, drain
 ;;; guarded against reentrancy (%jit-install-native-fns is called from the
 ;;; drain itself).
 (defvar *jit-retry-queue* nil
@@ -1542,17 +1668,18 @@
 (defvar *jit-retry-succeeded* nil
   "CENSUS: modules that went native on a retry.  NIL = 0.")
 (defvar *jit-retry-exhausted* nil
-  "CENSUS: modules dropped after +jit-retry-max-attempts+ failures.  NIL = 0.")
-(defconstant +jit-retry-max-attempts+ 4)
-(defconstant +jit-retry-queue-cap+ 256)
-(defconstant +jit-retry-install-gap+ 16
+  "CENSUS: modules dropped after (%jit-retry-max-attempts) failures.  NIL = 0.")
+(defun %jit-retry-max-attempts () 4)
+(defun %jit-retry-queue-cap () 256)
+(defun %jit-retry-install-gap () 16)
+(defvar *jit-retry-doc* nil
   "An entry is re-attempted only after this many NEW native installs since
    its last attempt, so a module whose callee is defined 60 defuns later
    still gets its chance without a translate storm (4 attempts x 16 = 64).")
 
 (defun %jit-retry-enqueue (bc entry ft-list rt-table names)
   "Remember a DEF* module whose page failed, if the queue has room."
-  (when (and names (< (length *jit-retry-queue*) +jit-retry-queue-cap+))
+  (when (and names (< (length *jit-retry-queue*) (%jit-retry-queue-cap)))
     (setq *jit-retry-queue*
           (cons (list 0 bc entry ft-list rt-table names
                       (or *jit-native-defun-count* 0))
@@ -1571,7 +1698,7 @@
                    (ft-list (cadddr e)) (rt-table (car (cddddr e)))
                    (names (cadr (cddddr e)))
                    (last (caddr (cddddr e)))
-                   (je (if (< (- now last) +jit-retry-install-gap+)
+                   (je (if (< (- now last) (%jit-retry-install-gap))
                            nil
                            (%jit-translate-page bc entry ft-list rt-table))))
               (cond
@@ -1580,9 +1707,9 @@
                  (when *jit-page-cache* (setf (gethash bc *jit-page-cache*) je))
                  (setq *jit-retry-succeeded*
                        (if *jit-retry-succeeded* (+ 1 *jit-retry-succeeded*) 1)))
-                ((< (- now last) +jit-retry-install-gap+)
+                ((< (- now last) (%jit-retry-install-gap))
                  (setq keep (cons e keep)))            ; not due yet, untouched
-                ((< (+ 1 attempts) +jit-retry-max-attempts+)
+                ((< (+ 1 attempts) (%jit-retry-max-attempts))
                  (setq keep (cons (list (+ 1 attempts) bc entry ft-list rt-table names now)
                                   keep)))
                 (t

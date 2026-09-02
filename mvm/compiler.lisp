@@ -2171,7 +2171,37 @@
            (dolist (e sub) (push e acc))
            (setq cur (cdr cur))))))))
 
+(defvar *mexp-memo* nil
+  "Per-toplevel-form memo of MACROEXPAND-1-MVM results, keyed by the FORM
+   object's identity key (%FORM-KEY) -> (form expansion).  The compiler's
+   analysis passes (free-var collection, read/mutated-in-lambda scans,
+   block-escape scan, ...) each re-expand every macro form they walk: a bare
+   (dotimes (i 3) i) was expanded 45 times for 17 compile-form calls, four
+   nested LETs 99 times.  Only POSITIVE expansions are memoized (a form that
+   is not a macro today may be one after a DEFMACRO in the same PROGN), the
+   entry is validated by EQ on the stored form (an address key can be reused
+   after GC), it is reset at every MVM-COMPILE-TOPLEVEL, and every writer of
+   a macro table clears it (see %MEXP-MEMO-INVALIDATE).")
+(defun %mexp-memo-invalidate () (setq *mexp-memo* nil))
+(defun %form-key (form)
+  "HOST stub: structural hash (collisions only cost a miss — entries are
+   EQ-validated).  mvm-eval.lisp overrides with the object's address."
+  (sxhash form))
 (defun macroexpand-1-mvm (form)
+  (if (not (consp form))
+      (%macroexpand-1-mvm-raw form)
+      (let* ((k (%form-key form))
+             (memo (or *mexp-memo* (setq *mexp-memo* (make-hash-table :test 'eql))))
+             (e (gethash k memo)))
+        (if (and e (eq (car e) form))
+            (values (cdr e) t)
+            (multiple-value-bind (x p) (%macroexpand-1-mvm-raw form)
+              ;; The in-image return path drops the raw function's second
+              ;; value (callers compare with EQ anyway), so key the memo on
+              ;; "expansion is a different object" rather than on P.
+              (unless (eq x form) (setf (gethash k memo) (cons form x)))
+              (values x p))))))
+(defun %macroexpand-1-mvm-raw (form)
   "Expand one level of macro in FORM, using the MVM macro table.
    Returns (values expanded-form expanded-p).  An expander that returns
    its input unchanged (e.g. a macro that decides this particular call
@@ -2296,6 +2326,7 @@
       (unless *macro-name-table*
         (setq *macro-name-table* (make-hash-table :test 'eql)))
       (setf (gethash hash *macro-name-table*) (string name)))
+    (%mexp-memo-invalidate)
     (setf (gethash hash *macro-table*) expander)))
 
 (defun build-macrolet-expander (mparams mbody)
@@ -2370,6 +2401,7 @@
   "Register standard CL macros needed to compile *runtime-functions*.
    Fast path (template already built): copy it into the current *macro-table*."
   (when *bootstrap-macro-template*
+    (%mexp-memo-invalidate)
     (maphash (lambda (k v) (setf (gethash k *macro-table*) v))
              *bootstrap-macro-template*)
     (return-from register-mvm-bootstrap-macros nil))
@@ -6116,6 +6148,7 @@
          ;; Compile body
          (compile-progn body env dest)
          ;; Restore previous macro bindings
+         (%mexp-memo-invalidate)
          (dolist (saved saved-macros)
            (if (cdr saved)
                (setf (gethash (car saved) *macro-table*) (cdr saved))
@@ -18683,6 +18716,7 @@
 (defun mvm-compile-toplevel (form)
   "Compile a top-level form.
    Handles defun, defvar, defconstant, defmacro, and bare expressions."
+  (setq *mexp-memo* nil)
   ;; Macro-expand top-level forms first
   (let ((expanded (macroexpand-mvm form)))
     (unless (eq expanded form)
@@ -19509,6 +19543,7 @@
                           (lambda (form)
                             (declare (ignore form))
                             nil))
+                        (%mexp-memo-invalidate)
                         (setf (gethash setf-key *macro-table*)
                               setter-sym))))))
 

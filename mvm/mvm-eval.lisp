@@ -11,6 +11,7 @@
 ;; between the functions resolve in-module (bytecode->bytecode) so NO native
 ;; bridge / value marshalling is needed — one representation throughout.  This
 ;; is the 'drop native' model: the interpreter runs everything as bytecode.
+(defvar *mvm-eval-tuple-buffer* nil)
 (defvar *mvm-eval-buffer* nil
   "PERF: persistent 64KB bytecode buffer reused across mvm-eval-forms calls (see
    the reuse site) instead of (make-array 65536) every call — mvm-buffer-used-
@@ -2361,9 +2362,20 @@
         (when (and (consp pend) (car pend) (cdr pend))
           (setq all-ir (cons pend all-ir))))
       (setq all-ir (reverse all-ir))
-      ;; Fresh buffer (do NOT touch *mvm-eval-buffer* — keep mvm-eval-forms's reuse
-      ;; buffer pristine for the oracle interpret path that runs after us).
-      (setq buf (make-mvm-buffer :bytes (make-array 65536)))
+      ;; PERF: a SECOND persistent buffer (do NOT touch *mvm-eval-buffer* — keep
+      ;; mvm-eval-forms's reuse buffer pristine for the oracle interpret path
+      ;; that runs after us).  A fresh (make-array 65536) here cost 335 us of
+      ;; zero-fill on EVERY cacheable form — most of the fixed per-form cost of
+      ;; a load.  mvm-buffer-used-bytes copies the bytecode out, so reuse is safe.
+      (if *mvm-eval-tuple-buffer*
+          (progn
+            (setf (mvm-buffer-position *mvm-eval-tuple-buffer*) 0)
+            (clrhash (mvm-buffer-labels *mvm-eval-tuple-buffer*))
+            (setf (mvm-buffer-fixups *mvm-eval-tuple-buffer*) nil)
+            (setq buf *mvm-eval-tuple-buffer*))
+          (progn
+            (setq buf (make-mvm-buffer :bytes (make-array 65536)))
+            (setq *mvm-eval-tuple-buffer* buf)))
       ;; Pass 1: assign cumulative bytecode offsets + register in *functions*.
       (dolist (e all-ir)
         (let* ((info (car e)) (ir (cdr e))
@@ -3298,3 +3310,8 @@
     (let ((combined (logior (ash (logand h1 +name-hash-hi-mask+) +name-hash-shift+)
                             (logand h2 +name-hash-lo-mask+))))
       (if (= combined 0) 1 combined))))
+
+;;; PERF: in-image identity key for the macroexpansion memo (compiler.lisp's
+;;; host stub uses SXHASH).  The tagged word of the form object; entries are
+;;; EQ-validated so a GC-moved form simply misses.
+(defun %form-key (form) (%val->word form))

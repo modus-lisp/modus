@@ -256,6 +256,7 @@
         (let ((mkey (%macro-sym-key sym)))
           (when mkey
             (%macro-pkg-rem sym mkey)
+            (%mexp-memo-invalidate)
             (remhash mkey *macro-function-table*))))))
   sym)
 
@@ -509,6 +510,7 @@
 
 (defun %macro-pkg-put (sym key fn)
   "Register FN as the expander for SYM's own package under name KEY."
+  (%mexp-memo-invalidate)
   (let ((pn (%macro-sym-pkg-name sym)))
     (when (and pn (stringp key))
       (unless *macro-pkg-table*
@@ -523,6 +525,7 @@
 
 (defun %macro-pkg-rem (sym key)
   "Drop SYM's own-package expander under name KEY (fmakunbound)."
+  (%mexp-memo-invalidate)
   (let ((pn (%macro-sym-pkg-name sym)))
     (when (and pn *macro-pkg-table* (stringp key))
       (let ((al (gethash key *macro-pkg-table*))
@@ -801,6 +804,7 @@
          ;; Dual write: per-package entry for exact resolution, bare entry
          ;; so every legacy bare-name lookup keeps working.
          (%macro-pkg-put sym key real-fn)
+         (%mexp-memo-invalidate)
          (puthash key *macro-function-table* real-fn)
          real-fn)))
     ;; 2-arg shape (sym, fn) — the original contract.
@@ -810,6 +814,7 @@
          (unless *macro-function-table*
            (setq *macro-function-table* (make-hash-table)))
          (%macro-pkg-put sym key fn)
+         (%mexp-memo-invalidate)
          (puthash key *macro-function-table* fn)
          fn)))
     ;; 4+ args — illegal.

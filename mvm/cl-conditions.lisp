@@ -633,6 +633,15 @@
                           (when nm
                             (write-string-serial " NAME=")
                             (write-object nm)))
+                      (t (c2) nil))
+                    ;; A TYPE-ERROR that names only its type is a hollow
+                    ;; diagnostic: say what it got and what it wanted.
+                    (handler-case
+                        (when (typep c 'type-error)
+                          (write-string-serial " DATUM=")
+                          (write-object (type-error-datum c))
+                          (write-string-serial " EXPECTED=")
+                          (write-object (type-error-expected-type c)))
                       (t (c2) nil)))
                   (write-object c))
             (t (c2) (write-string-serial "<report-print-error>"))))

@@ -5560,6 +5560,20 @@
         (let ((val (handler-case (eval form)
                      (t (c)
                         (%report-escaping-condition "load-toplevel-form-swallowed")
+                        ;; NAME THE FORM.  A swallowed toplevel form that reports
+                        ;; only its condition TYPE cost a full round of guessing
+                        ;; (docs/handler-stack-collision.md, the glass-serve
+                        ;; runner): TYPE-ERROR, somewhere in a 300-line script.
+                        ;; The loader holds FORM right here; say its head.
+                        (handler-case
+                            (progn
+                              (write-string-serial "   in toplevel form: ")
+                              (write-object (if (consp form)
+                                                (list (car form)
+                                                      (if (consp (cdr form)) (cadr form) '|...|))
+                                                form))
+                              (write-string-serial (string #\Newline)))
+                          (t (c2) nil))
                         (setq *load-error-condition* c)
                         nil))))
           ;; Opt-in abort (hosted CLI).  Unset/NIL for the ANSI harness, whose

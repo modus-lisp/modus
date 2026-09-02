@@ -220,10 +220,23 @@
                      ;; write the process-wide global; this is a DYNAMIC binding
                      ;; around the body, which is what SBCL's is.
                      (let ((sb-thread:*current-thread* thread))
-                       (setf (car box)
-                             (if arguments
-                                 (apply function arguments)
-                                 (funcall function)))
+                       ;; A CONDITION THAT ESCAPES THE BODY MUST BE NAMED.  Without
+                       ;; this, a worker's unhandled error left the process dead
+                       ;; with exit status 1 and NOT ONE LINE of output -- glass's
+                       ;; per-client thread died that way after a clean RFB
+                       ;; handshake and it cost a full round to even localise.
+                       ;; Report it the way the loader reports a swallowed toplevel
+                       ;; form, mark the box so JOIN-THREAD can see the death, and
+                       ;; let it propagate exactly as before.
+                       (handler-bind ((error (lambda (c)
+                                              (setq *current-condition* c)
+                                              (%report-escaping-condition
+                                               "sb-thread-body-unhandled")
+                                              (setf (cdr box) :died))))
+                         (setf (car box)
+                               (if arguments
+                                   (apply function arguments)
+                                   (funcall function))))
                        (setf (cdr box) t))
                      0))
              (slot (%make-native-thread body)))

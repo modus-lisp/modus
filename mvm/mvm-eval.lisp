@@ -1798,7 +1798,15 @@
               (cond
                 ((and je (cadr (cddddr je)))
                  (%jit-install-native-fns (car je) (cadr (cddddr je)) names)
-                 (when *jit-page-cache* (setf (gethash bc *jit-page-cache*) je))
+                 ;; The retried page MUST be in *jit-page-cache*: that is what
+                 ;; %jit-refresh-all-pages sweeps to re-bake const-pool
+                 ;; immediates after a GC.  Create the cache if %jit-entry-for
+                 ;; has not yet (a `when` here skipped the store on early
+                 ;; boots, leaving the page with STALE literals after the next
+                 ;; collection — a GC-timing-dependent FILE-ERROR under KVM).
+                 (unless *jit-page-cache*
+                   (setq *jit-page-cache* (make-hash-table :test (quote eq))))
+                 (setf (gethash bc *jit-page-cache*) je)
                  (setq *jit-retry-succeeded*
                        (if *jit-retry-succeeded* (+ 1 *jit-retry-succeeded*) 1)))
                 ((< (- now last) (%jit-retry-install-gap))

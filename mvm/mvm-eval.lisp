@@ -1745,6 +1745,7 @@
    page failed to build.  Boots NIL (defvars don't init) — that is the empty
    queue.")
 (defvar *jit-retry-busy* nil "Reentrancy guard for %jit-retry-drain.")
+(defvar *jit-retry-off* nil "Kill switch: (setq *jit-retry-off* t) disables the retry queue.")
 (defvar *jit-retry-succeeded* nil
   "CENSUS: modules that went native on a retry.  NIL = 0.")
 (defvar *jit-retry-exhausted* nil
@@ -1759,7 +1760,8 @@
 
 (defun %jit-retry-enqueue (bc entry ft-list rt-table names)
   "Remember a DEF* module whose page failed, if the queue has room."
-  (when (and names (< (length *jit-retry-queue*) (%jit-retry-queue-cap)))
+  (when (and names (not *jit-retry-off*)
+             (< (length *jit-retry-queue*) (%jit-retry-queue-cap)))
     (setq *jit-retry-queue*
           (cons (list 0 bc entry ft-list rt-table names
                       (or *jit-native-defun-count* 0)

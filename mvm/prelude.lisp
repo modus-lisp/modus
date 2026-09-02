@@ -1890,6 +1890,61 @@
     (puthash name-hash tbl value)
     value))
 
+(defun %gv-cell (%gv-key)
+  "The (key . value) pair for global KEY (a name-hash fixnum) in the globals
+   table, or NIL if absent / table not yet built.  HOT PATH: this is the
+   compiled read/write of every special variable (compile-variable-ref and
+   compile-setq emit %GV-REF / %GV-SET).  A tight probe of the existing
+   table — same bucket layout as GETHASH's fixnum path (see %HT-HASH) — with
+   none of GETHASH's generality: a special read went 112 ns -> ~25 ns.  Falls
+   back to NIL (= use the slow path) while the table is still small (no
+   bucket vector yet)."
+  (let ((%gv-ht (mem-ref #x10000080 :u64)))
+    ;; EQ, not EQL: EQL is a full function here, and any callee of this probe
+    ;; that reads a special re-enters %GV-REF -> %GV-CELL (boot stack overflow).
+    (if (or (eq %gv-ht 0) (not (consp %gv-ht)))
+        nil
+        (let* ((%gv-c (cdr %gv-ht))
+               (%gv-holder (and (consp %gv-c) (car (cdr (cdr (cdr (cdr (cdr %gv-c))))))))
+               (%gv-vec (and %gv-holder (car %gv-holder))))
+          (if (or (null %gv-vec) (fixnump %gv-vec))
+              (%gv-cell-slow %gv-key %gv-ht)
+              (let* ((%gv-k (if (< %gv-key 0) (- %gv-key) %gv-key))
+                     (%gv-h (logand (logxor %gv-k (logxor (ash %gv-k -8) (ash %gv-k -16)))
+                                (- (%prim-array-length %gv-vec) 1)))
+                     (%gv-cur (%word-aref %gv-vec %gv-h)))
+                (loop
+                  (when (null %gv-cur) (return nil))
+                  (let ((%gv-e (car %gv-cur)))
+                    (when (eq (car %gv-e) %gv-key) (return (cdr %gv-e))))
+                  (setq %gv-cur (cdr %gv-cur)))))))))
+
+(defun %gv-cell-slow (%gv-key %gv-ht)
+  "Linear-alist probe for a globals table that has no bucket index yet."
+  (let ((%gv-cur (car %gv-ht)))
+    (loop
+      (when (null %gv-cur) (return nil))
+      (let ((%gv-pair (car %gv-cur)))
+        (when (eq (car %gv-pair) %gv-key) (return %gv-pair)))
+      (setq %gv-cur (cdr %gv-cur)))))
+
+(defun %gv-ref (%gv-key)
+  "Compiled special-variable READ: value of global KEY, NIL if absent
+   (SYMBOL-VALUE's contract for an integer key).  Locals are %GV-prefixed on
+   purpose: a plain name that is also a known global would compile as a
+   DYNAMIC bind, which calls %GV-SET, which calls this — infinite recursion
+   at boot (seen with the first version)."
+  (let ((%gv-cl (%gv-cell %gv-key)))
+    (if %gv-cl (cdr %gv-cl) nil)))
+
+(defun %gv-set (%gv-key %gv-val)
+  "Compiled special-variable WRITE: update in place when the global exists,
+   else insert through SET-SYMBOL-VALUE (which also creates the table)."
+  (let ((%gv-cl (%gv-cell %gv-key)))
+    (if %gv-cl
+        (progn (set-cdr %gv-cl %gv-val) %gv-val)
+        (set-symbol-value %gv-key %gv-val))))
+
 ;;; ============================================================
 ;;; Interned Symbols
 ;;; ============================================================

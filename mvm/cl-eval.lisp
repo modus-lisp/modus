@@ -1236,8 +1236,9 @@
    UNBOUND-VARIABLE with :name SYM (the ORIGINAL symbol, via the mvm-eval quote
    pool) so (cell-error-name c) is EQ to the source symbol
    (cell-error-name.1, eval.error.4)."
-  (if (%boundp-by-hash hash)
-      (symbol-value hash)
+  (let ((cell (%gv-cell hash)))
+   (if cell
+      (cdr cell)
       (let ((c (%make-condition 'unbound-variable (list :name sym))))
         ;; Publish + run handler-bind stack first, then longjmp to the
         ;; nearest handler-case — same sequence as %eval-sym-lookup.
@@ -1248,7 +1249,7 @@
               nil
               (if (%error-handler-active-p)
                   (%hc-longjmp)
-                  nil))))))
+                  nil)))))))
 
 (defun %do-funcall (fn args)
   "Call FN with ARGS list."

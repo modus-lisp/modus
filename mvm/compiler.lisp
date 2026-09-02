@@ -1999,7 +1999,7 @@
    always <= +FIXNUM-MAX+ = 2^62-1 there, so the first branch always wins and
    the emitted IR is bit-identical to before this existed."
   (if (<= name-hash +fixnum-max+)
-      `(set-symbol-value ,name-hash ,tmp-var)
+      `(%gv-set ,name-hash ,tmp-var)
       `(setq ,name ,tmp-var)))
 
 (defun %global-name-key (sym)
@@ -5386,7 +5386,7 @@
              ;; so this is byte-identical for the ANSI build — gated on
              ;; *mvm-emit-halves* (T only in build-generic.lisp / mvm-eval; OFF for ANSI).
              (when *mvm-emit-halves* (emit-ir :set-nargs 1))
-             (emit-ir :call "SYMBOL-VALUE" 1)
+             (emit-ir :call "%GV-REF" 1)
              (unless (= dest +vreg-vr+)
                (emit-ir :mov dest +vreg-vr+)))))
       (t
@@ -5409,7 +5409,7 @@
            (let ((hash (%global-name-key name)))
              (emit-li-tagged +vreg-v0+ hash)  ; fixnum-safe hash (mvm-eval :li-halves)
              (when *mvm-emit-halves* (emit-ir :set-nargs 1))  ; mvm-eval bridge nargs
-             (emit-ir :call "SYMBOL-VALUE" 1)
+             (emit-ir :call "%GV-REF" 1)
              (unless (= dest +vreg-vr+)
                (emit-ir :mov dest +vreg-vr+))))))))
 
@@ -5938,7 +5938,7 @@
            ;; special is package-qualified).  NAME-HASH stays BARE for the
            ;; *GLOBALS* membership set and %NOTE-RUNTIME-SPECIAL, which only
            ;; answer "is this name a known global".
-           (compile-form `(set-symbol-value ,(%global-var-bind-key var-name) ,value-form)
+           (compile-form `(%gv-set ,(%global-var-bind-key var-name) ,value-form)
                          env dest))
          (compile-quote var-name dest)))
       ;; FLET — compile local functions, bodies see only parent env (no mutual recursion)
@@ -6845,7 +6845,12 @@
                        (setq *catch-value* nil)
                        (setq *catch-values* nil)
                        (if %c-vs (values-list %c-vs) %c-v))
-                     (error %c-cnd)))))
+                     ;; Not our tag.  A throw in flight (direct longjmp, no
+                     ;; condition built) re-throws by longjmp to the next
+                     ;; frame; anything else is a real condition -> re-signal.
+                     (if (if *catch-active* (%error-handler-active-p) nil)
+                         (%hc-longjmp)
+                         (error %c-cnd))))))
           env dest)))
 
       ;; THROW — (throw tag value) — set globals, signal error to unwind
@@ -6863,7 +6868,12 @@
              (setq *catch-value* (car %t-vals))
              (setq *catch-values* %t-vals)
              (setq *catch-active* t)
-             (error "throw"))
+             ;; Same fast path as %NLX-THROW: with a handler-case frame armed,
+             ;; longjmp straight to it instead of building a SIMPLE-ERROR and
+             ;; running the whole signal path (15.7 us -> tens of ns).
+             (if (%error-handler-active-p)
+                 (%hc-longjmp)
+                 (error "throw")))
           env dest)))
 
       ;; %NLX-THROW — (%nlx-throw tag value) — internal non-local-exit
@@ -8434,7 +8444,7 @@
                        ;; package's special saved NIL (nothing lives at the
                        ;; bare key) and then restored that NIL over the real
                        ;; value on exit — battery row special.after-rebind.
-                       (list sv `(symbol-value ,(%global-var-bind-key spec))))
+                       (list sv `(%gv-ref ,(%global-var-bind-key spec))))
                      save-vars specials))
            ;; Per-special TEMP names — carry the init value without
            ;; creating a lexical binding under the special's own name.
@@ -8453,13 +8463,13 @@
                                    :key (lambda (b)
                                           (symbol-name (if (consp b) (car b) b)))
                                    :test #'string=)
-                         (push `(set-symbol-value ,(%global-var-bind-key spec) ,tmp)
+                         (push `(%gv-set ,(%global-var-bind-key spec) ,tmp)
                                acc)))
                      specials temp-vars)
                (nreverse acc)))
            (restore-forms
              (mapcar (lambda (sv spec)
-                       `(set-symbol-value ,(%global-var-bind-key spec) ,sv))
+                       `(%gv-set ,(%global-var-bind-key spec) ,sv))
                      save-vars specials))
            (stripped-body (strip-declares body)))
       ;; NON-LOCAL EXIT (#240, 2026-08-08): the restore MUST run on every
@@ -8512,7 +8522,7 @@
                                   (if pos
                                       (list rb
                                             (list (%mvm-gensym "SPECSET")
-                                                  `(set-symbol-value
+                                                  `(%gv-set
                                                     ,(%global-var-bind-key (nth pos specials))
                                                     ,(nth pos temp-vars))))
                                       (list rb)))))
@@ -8787,7 +8797,7 @@
       (emit-ir :mov +vreg-v1+ dest))
     (emit-li-tagged +vreg-v0+ hash)  ; fixnum-safe hash (mvm-eval :li-halves)
     (when *mvm-emit-halves* (emit-ir :set-nargs 2))  ; mvm-eval bridge nargs
-    (emit-ir :call "SET-SYMBOL-VALUE" 2)
+    (emit-ir :call "%GV-SET" 2)
     (unless (= dest +vreg-vr+)
       (emit-ir :mov dest +vreg-vr+))))
 

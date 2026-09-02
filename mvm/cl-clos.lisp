@@ -293,7 +293,16 @@
   "Register CLOS class NAME with SLOT-NAMES list and SUPERS.
    SLOT-NAMES is the directly-declared list; the effective slots are
    computed by walking the CPL and unioning names — most-specific class
-   first.  This gives instances enough storage for inherited slots."
+   first.  This gives instances enough storage for inherited slots.
+
+   The directly-declared list is also recorded in *CLOS-DIRECT-SLOTS* HERE,
+   not only in the DEFCLASS macroexpansion.  The macro was the sole caller of
+   %REGISTER-CLOS-DIRECT-SLOTS, so a class built by calling %DEFCLASS directly
+   — which the ANSI smoke tests and every internal bootstrap class do — had no
+   direct-slot entry at all, and CLASS-DIRECT-SLOTS answered NIL for it.  This
+   is the definition point and SLOT-NAMES is already in hand, so the record
+   belongs here; the macro's own call is now redundant but harmless."
+  (%register-clos-direct-slots name slot-names)
   (let* ((cpl (%compute-cpl name (if (null supers) '(standard-object) supers)))
          ;; Effective slots: this class's slots + each ancestor's slots
          ;; (de-duplicated, in CPL order).  Walk cpl skipping the leading
@@ -1998,24 +2007,41 @@
 ;;; MOP accessors — class introspection
 ;;; ============================================================
 
+(defun %clos-name-to-class (n)
+  "Resolve a stored class NAME to the class OBJECT the MOP is specified to hand
+   back.  Storage stays name-keyed — cheap, and what every internal CPL walk
+   wants — so only the AMOP accessors pay this, and only at the boundary.
+   FIND-CLASS supplies the cached %CLASS-PROXY for T, STANDARD-OBJECT and the
+   built-ins, which is the same object CLASS-OF returns for them.  Anything that
+   resolves to no class at all is passed through unchanged rather than dropped."
+  (or (%find-clos-class n)
+      (and (symbolp n) (find-class n nil))
+      n))
+
 (defun class-precedence-list (cls)
-  "Return the CPL of CLS as a list of class names (most-specific first,
-   ending in T).  Per MOP / AMOP §5.5.1 this should be a list of class
-   objects, but our CPL is name-keyed; tests only check the structure."
+  "Return the CPL of CLS as a list of class OBJECTS, most-specific first, ending
+   in the class T — AMOP §5.5.1.
+
+   This used to return the stored NAMES, with a docstring conceding the
+   deviation on the grounds that `tests only check the structure'.  They did,
+   because they were ours: modus's own smoke tests asserted (member 'smoke-shape
+   cpl) and so pinned the wrong answer in place.  A caller doing the portable
+   thing — (mapcar #'class-name (class-precedence-list c)) — got a list of NILs."
   (cond
-    ((%clos-class-p cls) (aref cls 4))
+    ((%clos-class-p cls) (mapcar #'%clos-name-to-class (aref cls 4)))
     ((symbolp cls)
      (let ((c (%find-clos-class cls)))
-       (if c (aref c 4) (%builtin-cpl cls))))
+       (mapcar #'%clos-name-to-class (if c (aref c 4) (%builtin-cpl cls)))))
     (t nil)))
 
 (defun class-direct-superclasses (cls)
-  "Return the direct superclasses of CLS as a list of class names."
+  "Return the direct superclasses of CLS as a list of class OBJECTS (AMOP).
+   Name-keyed in storage, resolved here — see %CLOS-NAME-TO-CLASS."
   (cond
-    ((%clos-class-p cls) (aref cls 3))
+    ((%clos-class-p cls) (mapcar #'%clos-name-to-class (aref cls 3)))
     ((symbolp cls)
      (let ((c (%find-clos-class cls)))
-       (if c (aref c 3) nil)))
+       (if c (mapcar #'%clos-name-to-class (aref c 3)) nil)))
     (t nil)))
 
 (defun class-direct-subclasses (cls)
@@ -2033,18 +2059,34 @@
     acc))
 
 (defun class-direct-slots (cls)
-  "Return the direct slots declared on CLS — for modus this means the
-   effective-slot list (we don't track 'direct' vs 'inherited' separately)."
+  "Return the slots CLS declares ITSELF — not the inherited ones.
+
+   This used to return (aref cls 2), the EFFECTIVE slot list, on the grounds
+   that modus does not track direct vs inherited.  It does: %DEFCLASS records
+   every directly-declared name in *CLOS-DIRECT-SLOTS* (see
+   %REGISTER-CLOS-DIRECT-SLOTS), because %SLOT-CLASS-OWNER needs it to resolve
+   CLHS 7.5.2 allocation shadowing.  So the data was already there and this
+   function was the only thing not reading it: for (defclass d (b) (x)) it
+   answered with b's slots too, and CLASS-SLOTS — which is defined as this
+   function — was accidentally the correct one of the pair."
+  (let ((name (cond ((%clos-class-p cls) (aref cls 1))
+                    ((symbolp cls) cls)
+                    (t nil))))
+    (if name (%direct-slots-for name) nil)))
+
+(defun class-slots (cls)
+  "Return the EFFECTIVE slots of CLS: its own plus every inherited one.
+
+   Reads the effective list %DEFCLASS computed and stored in the class array.
+   Formerly this delegated to CLASS-DIRECT-SLOTS, which was harmless only
+   because that function also returned the effective list; now that
+   CLASS-DIRECT-SLOTS answers its own question, this must read slot 2 itself."
   (cond
     ((%clos-class-p cls) (aref cls 2))
     ((symbolp cls)
      (let ((c (%find-clos-class cls)))
        (if c (aref c 2) nil)))
     (t nil)))
-
-(defun class-slots (cls)
-  "Return effective slots — same as class-direct-slots in modus."
-  (class-direct-slots cls))
 
 (defun compute-class-precedence-list (cls)
   "MOP function: recompute the CPL.  We just return the stored CPL."
@@ -2069,6 +2111,14 @@
 (defun finalize-inheritance (cls)
   "MOP no-op — modus finalizes inheritance at %defclass time."
   cls)
+
+(defun validate-superclass (class superclass)
+  "AMOP: may CLASS have SUPERCLASS as a superclass?  Modus has one class
+   metaclass, so the answer is always T — there is no metaclass mismatch to
+   detect.  Defined so portable code that consults it before DEFCLASS gets an
+   answer rather than an undefined function."
+  (declare (ignore class superclass))
+  t)
 
 (defun standard-instance-access (instance location)
   "MOP raw slot access by LOCATION (integer slot index).  Returns
@@ -4691,16 +4741,51 @@
       (%gf-set-methods gf (cons method (%gf-methods gf))))
     orig))
 
+;;; Generic-function metaobject accessors (AMOP).  The data has always been in
+;;; the GF descriptor (%GF-NAME / %GF-METHODS / %GF-LAMBDA-LIST); these are the
+;;; portable names for it.  Each accepts either the GF descriptor array, the
+;;; dispatch closure (#'name shape), or the name — the same three designators
+;;; COMPUTE-APPLICABLE-METHODS already takes, so a caller need not know which
+;;; one it is holding.
+(defun %gf-designator (gf who)
+  "Resolve GF to a %generic-function descriptor, or signal naming WHO."
+  (cond ((%gf-p gf) gf)
+        ((symbolp gf) (or (%find-gf gf)
+                          (error "~a: no generic function named ~s" who gf)))
+        (t (or (%fn-to-gf gf)
+               (error "~a: ~s is not a generic function" who gf)))))
+
+(defun generic-function-name (gf)
+  "AMOP: the name of GF."
+  (%gf-name (%gf-designator gf 'generic-function-name)))
+
+(defun generic-function-methods (gf)
+  "AMOP: the list of methods installed on GF."
+  (%gf-methods (%gf-designator gf 'generic-function-methods)))
+
+(defun generic-function-lambda-list (gf)
+  "AMOP: the lambda list GF was declared with."
+  (%gf-lambda-list (%gf-designator gf 'generic-function-lambda-list)))
+
 (defun method-qualifiers (m)
   "Return qualifiers of METHOD M."
   (let ((q (%method-qualifier m)))
     (if q (list q) nil)))
 
 (defun method-specializers (m)
-  "Return specializer class objects for METHOD M."
+  "Return specializer class objects for METHOD M.
+
+   FIND-CLASS is the fallback, not the bare symbol: for a built-in specializer
+   like INTEGER, %FIND-CLOS-CLASS finds nothing and the name alone came back,
+   so CLASS-NAME on it answered NIL — the caller got a list that was class
+   objects in some positions and symbols in others.  FIND-CLASS hands out the
+   CACHED %CLASS-PROXY for built-in and condition types, which is what CLASS-OF
+   returns for them and what CLASS-NAME understands.  A designator that is no
+   class at all (an EQL specializer) still passes through untouched."
   (mapcar (lambda (s)
-            (let ((cls (%find-clos-class s)))
-              (or cls s)))
+            (or (%find-clos-class s)
+                (and (symbolp s) (find-class s nil))
+                s))
           (%method-specializers m)))
 
 ;;; MOP-ish method accessors that ANSI tests probe.
@@ -4896,7 +4981,14 @@
 ;;; definitions, so most of these return the symbol unchanged.
 
 (defun slot-definition-name (slot)         slot)
-(defun slot-definition-allocation (slot)   (declare (ignore slot)) :instance)
+(defun slot-definition-allocation (slot)
+  "Always :INSTANCE, and this is a limitation of the representation rather than
+   a claim about SLOT.  Modus DOES track :ALLOCATION :CLASS slots, per class, in
+   *CLOS-CLASS-SLOTS* (%CLASS-SLOTS-FOR) — but a slot definition here is a bare
+   SYMBOL, which names no owning class, so this function cannot reach that
+   registry.  Ask the class instead: (member name (%class-slots-for class-name))."
+  (declare (ignore slot))
+  :instance)
 (defun slot-definition-initargs (slot)     (declare (ignore slot)) nil)
 (defun slot-definition-initform (slot)     (declare (ignore slot)) nil)
 (defun slot-definition-initfunction (slot) (declare (ignore slot)) nil)

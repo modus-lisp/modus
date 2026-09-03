@@ -104,11 +104,17 @@
 ;;; file; there is deliberately no default, so a new wrapper that forgets it
 ;;; fails loudly here instead of silently building a Pi image.
 (declaim (special *cl-repl-platform*))
-(unless (member *cl-repl-platform* '(:rpi :virt))
-  (error "build-cl-repl-common: *CL-REPL-PLATFORM* is ~S; want :RPI or :VIRT."
+(unless (member *cl-repl-platform* '(:rpi :virt :x64))
+  (error "build-cl-repl-common: *CL-REPL-PLATFORM* is ~S; want :RPI, :VIRT or :X64."
          *cl-repl-platform*))
 (defvar *cl-repl-rpi-p*  (eq *cl-repl-platform* :rpi))
 (defvar *cl-repl-virt-p* (eq *cl-repl-platform* :virt))
+;; :X64 — the bare-metal x86-64 QEMU-pc image (mvm/build-x64-cl-repl.lisp).
+;; Same thin-head contract as :VIRT; the x86 arms are marked at each
+;; DIVERGENCE site below.  *CL-REPL-VIRT-P* keeps its aarch64-only meaning.
+(defvar *cl-repl-x64-p*  (eq *cl-repl-platform* :x64))
+(defvar *cl-repl-qemu-p* (or *cl-repl-virt-p* *cl-repl-x64-p*)
+  "T for the two QEMU machines (virt, pc): E1000 over PCI, user-mode net.")
 
 ;;; MVM infrastructure, loaded HERE rather than only by build-cli-common: the
 ;;; board's USB/PCI net stack is READ into the *CLI-BARE-METAL-NET-SOURCE* slot
@@ -118,7 +124,9 @@
                        (directory-namestring (truename *load-truename*))))
 
 (format t "~%=== Building bare-metal ~A CL REPL image ===~%"
-        (if *cl-repl-virt-p* "AArch64 QEMU-virt" "RPi 3B"))
+        (cond (*cl-repl-virt-p* "AArch64 QEMU-virt")
+              (*cl-repl-x64-p*  "x86-64 QEMU-pc")
+              (t "RPi 3B")))
 
 ;;; Source readers.  Deliberately %RPI--prefixed rather than reusing
 ;;; build-cli-common's READ-FILE-TEXT / MVM-TEXT: those do not exist yet (this
@@ -150,7 +158,7 @@
 ;;; ARCH SLOTS — bare-metal AArch64 (BCM2837 / BCM2710A1)
 ;;; ============================================================
 
-(defvar *cli-arch* :aarch64)
+(defvar *cli-arch* (if *cl-repl-x64-p* :x64 :aarch64))
 
 ;;; BARE-METAL SEAM.  No OS: no Linux syscalls, no fds, no argv, no
 ;;; cli-toplevel.  The tarball pipeline is kept (untar -> parse .asd ->
@@ -231,9 +239,16 @@
 ;;; MODUS_VIRT_JIT=0 forces :virt back to interpret-only for triage/bisect;
 ;;; MODUS_VIRT_JIT=1 is the default and matches :rpi.
 (defvar *jit-on*
-  (or (not *cl-repl-virt-p*)
-      (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_VIRT_JIT")))
-        (not (and v (string= v "0"))))))
+  (cond
+    ;; :X64 bare metal: JIT OFF by default (translate-x64's exec pages come
+    ;; from mmap(2) in linux mode; the bare-metal bump allocator the aarch64
+    ;; arm has is not ported yet).  MODUS_X64_JIT=1 opts in for the port work.
+    (*cl-repl-x64-p*
+     (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_X64_JIT")))
+       (and v (string= v "1"))))
+    ((not *cl-repl-virt-p*) t)
+    (t (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_VIRT_JIT")))
+         (not (and v (string= v "0")))))))
 
 ;;; MODUS_YIELD_NOP=1 — translate the YIELD opcode as NOP instead of SEV+WFE.
 ;;; YIELD sits at EVERY compiled loop back-edge, including mvm-interpret's own
@@ -309,7 +324,17 @@
 ;;; file is COMPILED INTO THE IMAGE; adding a comment there changed the emitted
 ;;; image from offset #x89 onward (GENERIC-MULTIPLY's code included), which
 ;;; destroys any ability to attribute a behaviour change to a one-form edit.
-(defvar *cli-arch-syscall-source* "
+(defvar *cli-arch-syscall-source*
+  (if *cl-repl-x64-p*
+      "
+;; BARE METAL x86-64: HLT in a loop — wakes on any IRQ and halts again.
+(defun halt ()
+  (loop (hlt)))
+(defun sys-exit (code)
+  (let ((c code)) c)
+  (halt))
+"
+      "
 ;; BARE METAL: no process model.  WFI in a loop (TRAP #x0304 = WFI on
 ;; AArch64) wakes on any IRQ and immediately WFIs again — effectively idle.
 ;; The x64 sibling uses (loop (hlt)); this is the same shape on ARM.
@@ -318,7 +343,7 @@
 (defun sys-exit (code)
   (let ((c code)) c)
   (halt))
-")
+"))
 
 ;;; ARCH SLOT: baked ahead of kernel-main.  The hosted CLIs put their JIT/argv
 ;;; probe apparatus here; a bare board puts its console and its collector's
@@ -382,12 +407,17 @@
 ;;; why boot time would be the wrong place, and for the full guard list).  This
 ;;; slot therefore contributes exactly one line of its own.
 (defvar *cli-arch-override-source*
-  (concatenate 'string
-    (string #\Newline)
-    (%rpi-mvm-text "lib/fdt.lisp")
-    "
+  (if *cl-repl-x64-p*
+      ;; x86 QEMU-pc: no device tree; nothing to read MODUS_* knobs from yet.
+      "
+(defun %cli-getenv (name) nil)
+"
+      (concatenate 'string
+        (string #\Newline)
+        (%rpi-mvm-text "lib/fdt.lisp")
+        "
 (defun %cli-getenv (name) (%bootargs-lookup (%fdt-bootargs) name))
-"))
+")))
 
 ;;; DIVERGENCE 2 — WHO ZEROES THE BSS-EQUIVALENT SLOTS.
 ;;;
@@ -495,7 +525,29 @@
 ")
 
 ;;; ARCH SLOT: hardware setup that must precede the FIRST allocation.
+(defvar *cl-repl-x64-kernel-prologue* "
+  (setf (mem-ref #x10000080 :u64) 0)   ; global variable table head
+  (setf (mem-ref #x10000088 :u64) 0)   ; symbol intern table
+  (setf (mem-ref #x10000090 :u64) 0)   ; MV count
+  (setf (mem-ref #x10000098 :u64) 0)   ; MV values
+  (setf (mem-ref #x10000C30 :u64) 0)   ; fault diag slots
+  (setf (mem-ref #x10000C38 :u64) 0)
+  (setf (mem-ref #x10000C40 :u64) 0)
+  (setf (mem-ref #x10000C48 :u64) 0)
+  (setf (mem-ref #x10000C50 :u64) 0)
+  (setf (mem-ref #x10000C58 :u64) 0)
+  (setf (mem-ref #x10000DA0 :u64) 0)   ; safepoint boundary
+  (write-string-serial \"MODUS-CL\")
+  (write-char-serial 10)
+")
+
+;;; :X64 arm of DIVERGENCE 2 — boot-x64.lisp's stub writes the MCGC config page
+;;; itself (mcgc-store #x10000E00 ...) before kernel-main; only the runtime's
+;;; own BSS-equivalent slots need zeroing (the list the retired standalone
+;;; build-x64-cl-repl.lisp driver zeroed).
 (defvar *cli-arch-kernel-prologue*
+ (if *cl-repl-x64-p*
+  *cl-repl-x64-kernel-prologue*
   (if *cl-repl-virt-p*
       *cl-repl-virt-kernel-prologue*
       "
@@ -556,7 +608,7 @@
   ;; which a BCM2837 does not have (it uses the BCM interrupt controller), and
   ;; nothing in this image needs interrupts — the REPL polls the UART.
 
-"))
+")))
 
 ;;; ARCH SLOT: spliced immediately AFTER (init-all-globals) and before the shared
 ;;; ANSI-constant block.  Its documented purpose is the *cstr-scratch* /
@@ -578,7 +630,26 @@
 ;;; happens at a point where a fault would be attributable, rather than inside
 ;;; an installer's handler-case.  Wrapped, because a diagnostic must never be
 ;;; the thing that stops a boot.
-(defvar *cli-arch-io-scratch-source* "  (setq *cstr-scratch* #x0FE00000)
+(defvar *cli-arch-io-scratch-source*
+  (if *cl-repl-x64-p*
+      "  (setq *cstr-scratch* #x0FE00000)
+  (setq *io-buf-addr*  #x0FF00000)
+  (setq *scratch-mmapped* nil)
+  (setq *filesystem* nil)
+  (setq *default-pathname-defaults* \"/\")
+  (setq *gensym-counter* 0)
+  (setq *gentemp-counter* 0)
+  (setq internal-time-units-per-second 1000000)
+  (setq most-positive-fixnum  4611686018427387903)
+  (setq most-negative-fixnum -4611686018427387904)
+  (%init-standard-chars)
+  (%init-boole-constants)
+  (%init-clos-protocol)
+  (setq *serial-repl-buf* nil)
+  (setq *serial-repl-len* 0)
+  (setq *serial-repl-cap* 0)
+"
+      "  (setq *cstr-scratch* #x0FE00000)
   (setq *io-buf-addr*  #x0FF00000)
   (setq *scratch-mmapped* nil)
   (setq *filesystem* nil)
@@ -607,7 +678,7 @@
   (setq *serial-repl-buf* nil)
   (setq *serial-repl-len* 0)
   (setq *serial-repl-cap* 0)
-")
+"))
 
 ;;; ============================================================
 ;;; NET BUILD (MODUS_NET_BUILD=1) — #209 rung 2: HTTP over the board's NIC
@@ -676,7 +747,7 @@
 (defvar *ssh-build-p*
   (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_SSH_BUILD")))
     (and v (string= v "1"))))
-(when (and *ssh-build-p* *cl-repl-virt-p*)
+(when (and *ssh-build-p* *cl-repl-qemu-p*)
   (error "MODUS_SSH_BUILD=1 is :RPI-only — the actor/SSH address map is Pi ~
           DRAM.  See the DIVERGENCE 5 comment in build-cl-repl-common.lisp."))
 
@@ -834,6 +905,10 @@
 (defvar *net-nic-source*
   (if (not *net-build-p*)
       ""
+      (if *cl-repl-x64-p*
+          (concatenate 'string
+            (%rpi-net-text "arch-x86-cl.lisp")     (string #\Newline)
+            (%rpi-net-text "e1000.lisp")           (string #\Newline))
       (if *cl-repl-virt-p*
           (concatenate 'string
             ;; QEMU virt: PCI ECAM + E1000.  arch-aarch64-cl.lisp also carries
@@ -864,7 +939,7 @@
             ;; defuns override the CDC-ECM ones (last-defun-wins) — on real
             ;; RTL8153 silicon the ECM config NAKs all bulk-IN, so the NIC is
             ;; driven in vendor config 1 with an explicit RX enable.
-            (%rpi-net-text "r8152.lisp")         (string #\Newline)))))
+            (%rpi-net-text "r8152.lisp")         (string #\Newline))))))
 
 (defvar *net-source*
   (if *net-build-p*
@@ -1153,7 +1228,7 @@
 ;;; test, so the abort arm keys on the DHCP result instead: an all-zero IP after
 ;;; dhcp-client means nothing answered and there is no point fetching.
 (defvar *net-pipeline-defun-source*
-  (if *cl-repl-virt-p*
+  (if *cl-repl-qemu-p*
       "(defun run-net-pipeline ()
   (write-string-serial \"NET-PIPELINE-START\") (write-char-serial 10)
   ;; 1. PCI bring-up: assign BARs (no firmware did it), then probe the E1000.
@@ -1271,7 +1346,7 @@
 ;;; caller CALLs the baked one, which carries the right UART — so only the
 ;;; intrinsics diverge, which is why it survived this long.
 (defvar *rpi-jit-coinit-override*
-  (if *jit-on*
+  (if (and *jit-on* (not *cl-repl-x64-p*))
       (let* ((chain (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_RPI_CHAINLOAD")))
                       (and v (string= v "1"))))
              (mini (and (not *cl-repl-virt-p*)
@@ -1451,11 +1526,60 @@
 ;;;     base re-runs the boot preamble, which rebuilds the page tables under the
 ;;;     live MMU and kills the machine in a recursive fetch abort.  With the
 ;;;     guard it longjmps to the armed handler-case instead.
-(if *cl-repl-virt-p*
-    (mvm-load "boot/boot-aarch64.lisp")
-    (mvm-load "boot/boot-rpi-cl.lisp"))
+(cond
+  (*cl-repl-virt-p* (mvm-load "boot/boot-aarch64.lisp"))
+  (*cl-repl-x64-p*  (mvm-load "boot/boot-x64.lisp"))
+  (t                (mvm-load "boot/boot-rpi-cl.lisp")))
 
 (in-package :modus.mvm)
+
+;;; DIVERGENCE 6/7 (:X64 arm) — the x86-64 boot descriptor and console.
+;;; Verbatim from the retired standalone build-x64-cl-repl.lisp: the stack top
+;;; moves to 512 MB (the 8 MB default sits inside a 60 MB image), data pages
+;;; above the heap base are NX, the x64 translator is installed in BARE-METAL
+;;; mode (no Linux syscalls: serial goes to COM1 port I/O), the collector is
+;;; on, and the native-code offset is measured from the boot preamble the
+;;; descriptor emits (multiboot header + 32-bit boot + 64-bit entry).
+(when cl-user::*cl-repl-x64-p*
+  (setf modus.mvm::*x64-stack-top-override* #x20000000)
+  (setf modus.mvm::*x64-nx-data-enable* t)
+  (funcall (intern "INSTALL-X64-TRANSLATOR" "MODUS.MVM.X64"))
+  (setf modus.mvm.x64::*x64-linux-mode* nil)
+  (setf modus.mvm.x64::*x64-gc-enabled* t)
+  (setf modus.mvm.x64::*x64-native-code-offset*
+        (let ((buf (make-mvm-buffer))
+              (desc (x64-boot-descriptor)))
+          (funcall (getf desc :multiboot-header-fn) buf)
+          (funcall (getf desc :boot32-fn) buf)
+          (funcall (getf desc :kernel64-entry-fn) buf)
+          (let ((n (+ 5 (length (mvm-buffer-used-bytes buf)))))
+            (format t "~%Bare-metal boot preamble: ~D bytes (native code offset)~%" n)
+            n)))
+  (format t "~&;; CONSOLE: COM1 via port I/O (x86-64 QEMU-pc)~%"))
+
+(defun %x64-memory-map-asserts (image)
+  "Build-time memory-map asserts for the :X64 image (DIVERGENCE 9 arm)."
+  (let* ((image-bytes (length (kernel-image-image-bytes image)))
+         (image-lo    #x100000)
+         (image-hi    (+ image-lo image-bytes))
+         (net-lo      #x0C000000)
+         (net-hi      #x0C113000)
+         (scratch-lo  #x0FE00000)
+         (heap-lo     #x10000000))
+    (when (>= image-hi net-lo)
+      (error "BUILD-TIME ASSERT: image [~X..~X] (~,1F MB) reaches the E1000 DMA ~
+              region at ~X." image-lo image-hi (/ image-bytes 1024.0 1024.0) net-lo))
+    (when (>= net-hi scratch-lo)
+      (error "BUILD-TIME ASSERT: E1000 region end ~X reaches the scratch buffers ~
+              at ~X." net-hi scratch-lo))
+    (format t "~%QEMU pc memory map (identity, 4 GB):~%")
+    (format t "  image      ~8,'0X .. ~8,'0X  (~,2F MB)~%"
+            image-lo image-hi (/ image-bytes 1024.0 1024.0))
+    (format t "  net/DMA    ~8,'0X .. ~8,'0X  (E1000 rings + state)~%" net-lo net-hi)
+    (format t "  scratch    ~8,'0X / ~8,'0X  (cstr / io-buf)~%" scratch-lo #x0FF00000)
+    (format t "  heap       ~8,'0X .. ~8,'0X  (MCGC data), meta ~8,'0X~%"
+            heap-lo #x1DFFF000 #x1E000000)
+    (format t "  stack top  ~8,'0X            (grows down)~%" #x20000000)))
 
 (when cl-user::*cl-repl-virt-p*
   (setf modus.mvm::*aarch64-fixpoint-nil-value* #xDEAD0001)
@@ -1494,7 +1618,8 @@
 ;; Install the AArch64 translator in BARE-METAL mode (*aarch64-linux-mode* is
 ;; NIL by default), so TRAP #x0300/#x0301 emit UART MMIO rather than Linux
 ;; syscalls — which is exactly what write-char-serial / read-char-serial need.
-(install-aarch64-translator)
+(unless cl-user::*cl-repl-x64-p*
+  (install-aarch64-translator))
 
 ;;; DIVERGENCE 7 — the console.
 ;;;
@@ -1526,7 +1651,9 @@
 ;; because `read-char-serial' hardcoded PL011's UARTFR+0x18/RXFE-bit-4.  That
 ;; is FIXED (1e84418): the RX ready-poll is now parameterized via
 ;; *aarch64-serial-rx-poll*, exactly mirroring the TX side.
-(if cl-user::*cl-repl-virt-p*
+(if cl-user::*cl-repl-x64-p*
+    nil
+ (if cl-user::*cl-repl-virt-p*
     (format t "~&;; CONSOLE: PL011 via the fixpoint boot descriptor, VA 20000000 ~
                -> PA 09000000 (QEMU virt)~%")
     (progn
@@ -1554,7 +1681,7 @@
             (setf *aarch64-serial-width* 0)
             (setf *aarch64-serial-tx-poll* nil)
             (setf *aarch64-serial-rx-poll* '(#x18 4 :tbnz))
-            (format t "~&;; CONSOLE: PL011 UART0 0x3F201000 (QEMU raspi3b)~%")))))
+            (format t "~&;; CONSOLE: PL011 UART0 0x3F201000 (QEMU raspi3b)~%"))))))
 
 ;; No GICv2 on a BCM2837, and nothing here needs interrupts (the REPL polls
 ;; the UART), so leave *aarch64-setup-irq-enable* NIL — the QEMU-virt bare
@@ -1736,17 +1863,21 @@
 )
 
 (format t "~%Compiling bare-metal ~A CL REPL image (~D chars)...~%"
-        (if cl-user::*cl-repl-virt-p* "AArch64 QEMU-virt" "RPi")
+        (cond (cl-user::*cl-repl-virt-p* "AArch64 QEMU-virt")
+              (cl-user::*cl-repl-x64-p* "x86-64 QEMU-pc")
+              (t "RPi"))
         (length cl-user::*full-source*))
 
 ;;; DIVERGENCE 8 — BUILD-IMAGE :TARGET and the default output path.
 ;;; MODUS_CL_REPL_OUT overrides either one.
-(let ((image (build-image :target (if cl-user::*cl-repl-virt-p* :fixpoint :rpi)
+(let ((image (build-image :target (cond (cl-user::*cl-repl-virt-p* :fixpoint)
+                                        (cl-user::*cl-repl-x64-p* :x86-64)
+                                        (t :rpi))
                           :source-text cl-user::*full-source*)))
   (let ((path (or #+sbcl (sb-ext:posix-getenv "MODUS_CL_REPL_OUT")
-                  (if cl-user::*cl-repl-virt-p*
-                      "/tmp/modus-aarch64-cl-repl.bin"
-                      "/tmp/piboot/kernel8.img"))))
+                  (cond (cl-user::*cl-repl-virt-p* "/tmp/modus-aarch64-cl-repl.bin")
+                        (cl-user::*cl-repl-x64-p* "/tmp/modus-x64-cl-repl.bin")
+                        (t "/tmp/piboot/kernel8.img")))))
     (ensure-directories-exist path)
     (with-open-file (out path :direction :output
                               :element-type '(unsigned-byte 8)
@@ -1766,7 +1897,9 @@
     ;; 496 MB a Pi Zero 2 W actually gives the ARM, while QEMU virt is capped by
     ;; the fixpoint page tables and by -m 512.  Two assert blocks, therefore.
     ;; ------------------------------------------------------------------
-    (if cl-user::*cl-repl-virt-p*
+    (cond
+      (cl-user::*cl-repl-x64-p* (%x64-memory-map-asserts image))
+      (cl-user::*cl-repl-virt-p*
         ;; ---- QEMU virt (fixpoint MMU) ----------------------------------
         ;; Image loads at VA 0x80000 and grows UP; the stack grows DOWN from
         ;; +TDK-STACK-VA+ (0x08000000) and the Cheney heap starts at 0x09000000.
@@ -1835,18 +1968,25 @@
                 (error "BUILD-TIME ASSERT: E1000 region end ~X is at/above ~X, the ~
                         end of QEMU virt -m 512 DRAM." net-hi dram-end))
               (format t "  net/DMA    ~8,'0X .. ~8,'0X  (PA-identity, E1000 rings + state)~%"
-                      net-lo net-hi))))
+                      net-lo net-hi)))))
         ;; ---- Raspberry Pi 3B / Zero 2 W --------------------------------
-        (%rpi-memory-map-asserts image))
+      (t (%rpi-memory-map-asserts image)))
     (format t "~%Run: ~A~%"
-            (if cl-user::*cl-repl-virt-p*
+            (cond
+              (cl-user::*cl-repl-x64-p*
+                (format nil "qemu-system-x86_64 -m 512 -kernel ~A -display none -serial stdio -no-reboot~A"
+                        path
+                        (if cl-user::*net-build-p*
+                            " -device e1000,netdev=net0 -netdev user,id=net0"
+                            "")))
+              (cl-user::*cl-repl-virt-p*
                 (format nil "qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 512 -kernel ~A -nographic -no-reboot~A"
                         path
                         (if cl-user::*net-build-p*
                             " -device e1000,netdev=net0,romfile=,rombar=0 -netdev user,id=net0"
-                            ""))
-                (format nil "qemu-system-aarch64 -M raspi3b -kernel ~A -serial stdio -serial null -display none -no-reboot~A"
+                            "")))
+              (t (format nil "qemu-system-aarch64 -M raspi3b -kernel ~A -serial stdio -serial null -display none -no-reboot~A"
                         path
                         (if cl-user::*net-build-p*
                             " -device usb-net,netdev=net0 -netdev user,id=net0"
-                            ""))))))
+                            "")))))))

@@ -958,10 +958,15 @@
              (word (if fn (%val->word fn) 0))
              (nativep (eql (logand word 15) 3))
              (raw (if nativep (- word 3) 0)))
-        ;; #306 BRIDGE: a resolved-but-non-native callee gets a thunk instead
-        ;; of failing the page (x64 only; nargs from the translator's parallel
-        ;; alist, NIL on aarch64 → falls through to the old reject).
-        (when (and (= raw 0) fn (%jit-bridge-on-p) (not (eq *jit-target-arch* :aarch64)))
+        ;; #306 BRIDGE: a non-native OR NOT-YET-DEFINED callee gets a thunk
+        ;; instead of failing the page (x64 only; nargs from the translator's
+        ;; parallel alist, NIL on aarch64 → falls through to the old reject).
+        ;; Late binding like SBCL's fdefn cell: the thunk resolves by name at
+        ;; CALL time and signals UNDEFINED-FUNCTION then if still unbound —
+        ;; exactly what the interpreter fallback would have done, but the
+        ;; rest of the page runs native (14 unresolved forward references
+        ;; rejected 14 pages of an alexandria quickload).
+        (when (and (= raw 0) (%jit-bridge-on-p) (not (eq *jit-target-arch* :aarch64)))
           (let* ((na (assoc (car r) *x64-call-reloc-nargs*))
                  (th (and na (%jit-make-bridge-thunk name (cdr na)))))
             (when th
@@ -1592,8 +1597,9 @@
                  (fn (and name (%mvm-resolve-runtime-fn name)))
                  (word (if fn (%val->word fn) 0))
                  (addr (if (eql (logand word 15) 3) (- word 3) 0)))
-            ;; #306 BRIDGE (aarch64 arm): non-native callee -> per-site thunk.
-            (when (and (= addr 0) fn (%jit-bridge-on-p))
+            ;; #306 BRIDGE (aarch64 arm): non-native or not-yet-defined callee
+            ;; -> per-site thunk (late binding, see the x64 arm).
+            (when (and (= addr 0) (%jit-bridge-on-p))
               (let* ((na (assoc (car r) *aarch64-call-reloc-nargs*))
                      (th (and na (%jit-make-bridge-thunk-aarch64 name (cdr na)))))
                 (when th

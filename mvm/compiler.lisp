@@ -5489,7 +5489,7 @@
 ;;; *SYM-NAME-TABLE* coverage tightens it further.
 
 (defparameter *hash-dispatch-names*
-  '(
+  '("WITH-OPEN-STREAM" 
     "STI" "MUL26HI" "ON" "COMMON-LISP-USER"
     "BEING" "DO" "MAKE-PACKAGE" "MACROLET"
     "PRESENT-SYMBOL" "%MAKE-SYMBOL" "CCASE" "TAGBODY"
@@ -6162,6 +6162,20 @@
        (let ((spec (cadr form))
              (body (cddr form)))
          (compile-form `(let ((,(car spec) (open ,@(cdr spec))))
+                          (unwind-protect (progn ,@body)
+                            (when ,(car spec) (close ,(car spec)))))
+                       env dest)))
+      ;; WITH-OPEN-STREAM — CLHS 21.2: bind VAR to STREAM, run the body, close
+      ;; the stream on ANY exit.  Was MISSING: alexandria's with-open-file*
+      ;; expands into it, so every page using with-input-from-file /
+      ;; with-output-to-file compiled it as a CALL to an unknown function
+      ;; (with the binding list as a call too) and fell back to the
+      ;; interpreter — 10 of the 14 unresolved-callee fallbacks of a
+      ;; quickload, identical on x64 and aarch64.
+      ((= op-name #.(compute-name-hash "WITH-OPEN-STREAM"))
+       (let ((spec (cadr form))
+             (body (cddr form)))
+         (compile-form `(let ((,(car spec) ,(cadr spec)))
                           (unwind-protect (progn ,@body)
                             (when ,(car spec) (close ,(car spec)))))
                        env dest)))

@@ -196,6 +196,7 @@
           (setq *setf-expanders-pkg* (make-hash-table :test 'eql)))
         (setf (gethash h *setf-expanders-pkg*)
               (%reg-pkg-alist-put (gethash h *setf-expanders-pkg*) p expander))))
+    (%mexp-memo-invalidate)   ; a SETF form expanded before this registration is stale
     (setf (gethash h *setf-expanders*) expander)))
 
 (defun mvm-find-setf-expander (name)

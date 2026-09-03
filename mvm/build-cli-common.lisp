@@ -450,6 +450,19 @@
        ""
        "  (setq *x64-jit-constvec-full-p* t)
 ")
+   ;; Bare-metal x64: the runtime JIT must mirror the BARE baked code, not the
+   ;; hosted-Linux defaults set above.  linux-mode is nil (R14 holds the absolute
+   ;; bare alloc limit, not an mmap-relative offset), and the cons-kind scan_word
+   ;; reject stays OFF -- +mcgc-kindbitmap-delta+ is a Linux layout constant that
+   ;; addresses a wrong, uninitialised region on bare, so a JIT'd reject would
+   ;; drop live objects across a collection (see build-cl-repl-common's build-time
+   ;; *ws5-force-no-kindcheck*; without this the JIT re-enabled it at runtime and
+   ;; the alexandria install corrupted).
+   (if *cli-bare-metal*
+       "  (setq *x64-linux-mode* nil)
+  (setq *ws5-force-no-kindcheck* t)
+"
+       "")
    "  t)
 (in-package :modus.mvm)
 ")))

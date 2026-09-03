@@ -1315,7 +1315,34 @@
                         rd)))
 
 (defun a64-load-imm64 (buf rd imm64)
-  "Load a 64-bit immediate into Xd using minimal MOVZ/MOVK sequence."
+  "Load a 64-bit immediate into Xd using minimal MOVZ/MOVK sequence.
+   PERF: a non-negative FIXNUM immediate (the common case: tagged fixnums,
+   heap/BSS addresses, offsets) takes an allocation-free path — the general
+   path below masks with the BIGNUM literal #xFFFFFFFFFFFFFFFF, which turned
+   every immediate into bignum limb shifting (28% of a Pi 5 quickload's
+   samples) plus two lists and a closure.  Output is identical: for a value
+   below 2^62 whose low 48 bits are not all ones the MOVN alternative never
+   wins, so it is MOVZ + MOVK per non-zero halfword either way (verified
+   byte-identical against the general path on the host)."
+  (if (and (integerp imm64) (>= imm64 0) (< imm64 4611686018427387904)
+           ;; low three halfwords all ones -> MOVN can win; keep the general path
+           (/= (logand imm64 #xFFFFFFFFFFFF) #xFFFFFFFFFFFF))
+      (let ((hw0 (logand imm64 #xFFFF))
+            (hw1 (logand (ash imm64 -16) #xFFFF))
+            (hw2 (logand (ash imm64 -32) #xFFFF))
+            (hw3 (logand (ash imm64 -48) #xFFFF))
+            (started nil))
+        (if (= imm64 0)
+            (a64-movz buf rd 0 0)
+            (progn
+              (when (/= hw0 0) (a64-movz buf rd hw0 0) (setq started t))
+              (when (/= hw1 0) (if started (a64-movk buf rd hw1 1) (progn (a64-movz buf rd hw1 1) (setq started t))))
+              (when (/= hw2 0) (if started (a64-movk buf rd hw2 2) (progn (a64-movz buf rd hw2 2) (setq started t))))
+              (when (/= hw3 0) (if started (a64-movk buf rd hw3 3) (a64-movz buf rd hw3 3))))))
+      (a64-load-imm64-general buf rd imm64)))
+
+(defun a64-load-imm64-general (buf rd imm64)
+  "General (bignum / negative two's-complement) case of A64-LOAD-IMM64."
   (let* ((val (logand imm64 #xFFFFFFFFFFFFFFFF))
          (hw0 (logand val #xFFFF))
          (hw1 (logand (ash val -16) #xFFFF))

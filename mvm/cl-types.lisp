@@ -3005,6 +3005,54 @@
 ;; intern site than this file's literal.  Both native MVM symbols
 ;; (1 slot) and CL symbols (3 slots) store compute-name-hash(name) at
 ;; slot 0, so equal slot-0 hashes ≡ same name even when objects differ.
+;;; Literal name hashes used by the TYPEP chain below (compute-name-hash of
+;;; the upcased type name).  A #.(compute-name-hash ...) read-time eval is NOT
+;;; allowed in image-only sources: build-ansi-common's symbol-name scan reads
+;;; them under the default package, the unbound function aborts the whole
+;;; scan, and every later symbol loses its name in the gate image.
+;;;   ARRAY                  10588126
+;;;   ATOM                   383129664
+;;;   BASE-CHAR              154532791
+;;;   BASE-STRING            296661226
+;;;   BIGNUM                 222680133
+;;;   BIT                    496243224
+;;;   BIT-VECTOR             524100924
+;;;   BOOLEAN                531098243
+;;;   CHARACTER              33307206
+;;;   CONS                   67772926
+;;;   DOUBLE-FLOAT           451082095
+;;;   EXTENDED-CHAR          249817149
+;;;   FIXNUM                 56757342
+;;;   FLOAT                  334057727
+;;;   FUNCTION               402801909
+;;;   GENERIC-FUNCTION       357975417
+;;;   INTEGER                218724929
+;;;   LIST                   250628549
+;;;   LONG-FLOAT             133316320
+;;;   METHOD                 38548584
+;;;   METHOD-COMBINATION     87270964
+;;;   NULL                   394857196
+;;;   NUMBER                 31983940
+;;;   RATIO                  500762750
+;;;   RATIONAL               192209213
+;;;   REAL                   2583293
+;;;   SEQUENCE               24777128
+;;;   SHORT-FLOAT            403998624
+;;;   SIGNED-BYTE            398241362
+;;;   SIMPLE-ARRAY           448780229
+;;;   SIMPLE-BASE-STRING     15127857
+;;;   SIMPLE-BIT-VECTOR      73449743
+;;;   SIMPLE-STRING          446812473
+;;;   SIMPLE-VECTOR          295137229
+;;;   SINGLE-FLOAT           245082776
+;;;   STANDARD-CHAR          223466737
+;;;   STANDARD-GENERIC-FUNCTION 267254943
+;;;   STANDARD-METHOD        437104782
+;;;   STANDARD-OBJECT        205458436
+;;;   STRING                 484323690
+;;;   SYMBOL                 156527617
+;;;   UNSIGNED-BYTE          237688881
+;;;   VECTOR                 116440318
 (defun %typename-is (tn hash)
   "True iff TN is a symbol whose stored name hash is HASH.  Replaces
    (%typename-eq tn 'integer): in image code each quoted symbol literal is a
@@ -3162,72 +3210,72 @@
     ((not (consp type))
      (let ((tn type))
        (cond
-         ((%typename-is tn #.(compute-name-hash "INTEGER")) (integerp obj))
-         ((%typename-is tn #.(compute-name-hash "FIXNUM")) (integerp obj))
+         ((%typename-is tn 218724929) (integerp obj))
+         ((%typename-is tn 56757342) (integerp obj))
          ;; MVM has no real bignum tower — all integers are 63-bit
          ;; fixnums. Reporting BIGNUM as NIL traps tests like the
          ;; (loop while (not (typep x 'bignum)) do (setf x (* x x)))
          ;; pattern in an infinite squaring loop until SIGALRM fires.
          ;; Treat anything beyond the 32-bit fixnum range that other
          ;; CL impls use as "bignum" so that loop exits.
-         ((%typename-is tn #.(compute-name-hash "BIGNUM"))
+         ((%typename-is tn 222680133)
           (and (integerp obj)
                (or (> obj 1073741823) (< obj -1073741824))))
-         ((%typename-is tn #.(compute-name-hash "REAL")) (or (integerp obj) (floatp-impl obj) (ratiop obj)))
-         ((%typename-is tn #.(compute-name-hash "RATIONAL")) (or (integerp obj) (ratiop obj)))
-         ((%typename-is tn #.(compute-name-hash "NUMBER")) (or (integerp obj) (floatp-impl obj) (ratiop obj)))
-         ((%typename-is tn #.(compute-name-hash "FLOAT")) (floatp-impl obj))
-         ((%typename-is tn #.(compute-name-hash "SINGLE-FLOAT")) (floatp-impl obj))
-         ((%typename-is tn #.(compute-name-hash "DOUBLE-FLOAT")) (floatp-impl obj))
-         ((%typename-is tn #.(compute-name-hash "SHORT-FLOAT")) (floatp-impl obj))
-         ((%typename-is tn #.(compute-name-hash "LONG-FLOAT")) (floatp-impl obj))
-         ((%typename-is tn #.(compute-name-hash "RATIO")) (ratiop obj))
-         ((%typename-is tn #.(compute-name-hash "CONS")) (consp obj))
-         ((%typename-is tn #.(compute-name-hash "LIST")) (or (null obj) (consp obj)))
-         ((%typename-is tn #.(compute-name-hash "NULL")) (null obj))
+         ((%typename-is tn 2583293) (or (integerp obj) (floatp-impl obj) (ratiop obj)))
+         ((%typename-is tn 192209213) (or (integerp obj) (ratiop obj)))
+         ((%typename-is tn 31983940) (or (integerp obj) (floatp-impl obj) (ratiop obj)))
+         ((%typename-is tn 334057727) (floatp-impl obj))
+         ((%typename-is tn 245082776) (floatp-impl obj))
+         ((%typename-is tn 451082095) (floatp-impl obj))
+         ((%typename-is tn 403998624) (floatp-impl obj))
+         ((%typename-is tn 133316320) (floatp-impl obj))
+         ((%typename-is tn 500762750) (ratiop obj))
+         ((%typename-is tn 67772926) (consp obj))
+         ((%typename-is tn 250628549) (or (null obj) (consp obj)))
+         ((%typename-is tn 394857196) (null obj))
          ;; (typep x 'symbol) — `(integerp obj)` was a leftover from when
          ;; native MVM symbols were stored as bare hash fixnums.  Real
          ;; symbols today are heap objects (subtag #x50); use symbolp.
-         ((%typename-is tn #.(compute-name-hash "SYMBOL")) (symbolp obj))
-         ((%typename-is tn #.(compute-name-hash "STRING")) (stringp obj))
-         ((%typename-is tn #.(compute-name-hash "SIMPLE-STRING")) (stringp obj))
-         ((%typename-is tn #.(compute-name-hash "BASE-STRING")) (stringp obj))
-         ((%typename-is tn #.(compute-name-hash "SIMPLE-BASE-STRING")) (stringp obj))
-         ((%typename-is tn #.(compute-name-hash "CHARACTER")) (characterp obj))
-         ((%typename-is tn #.(compute-name-hash "BASE-CHAR")) (characterp obj))
+         ((%typename-is tn 156527617) (symbolp obj))
+         ((%typename-is tn 484323690) (stringp obj))
+         ((%typename-is tn 446812473) (stringp obj))
+         ((%typename-is tn 296661226) (stringp obj))
+         ((%typename-is tn 15127857) (stringp obj))
+         ((%typename-is tn 33307206) (characterp obj))
+         ((%typename-is tn 154532791) (characterp obj))
          ;; CLHS: extended-char is disjoint from base-char.  Modus only
          ;; has base characters, so this is always NIL.  extended-char.3
          ;; verifies the disjointness.
-         ((%typename-is tn #.(compute-name-hash "EXTENDED-CHAR")) nil)
+         ((%typename-is tn 249817149) nil)
          ;; CLHS: standard-char = #\Newline + #\Space..#\~ — narrower than
          ;; character.  standard-char.5.body collects (typep c 'standard-char)
          ;; where (standard-char-p c) is nil and expects empty list.
-         ((%typename-is tn #.(compute-name-hash "STANDARD-CHAR"))
+         ((%typename-is tn 223466737)
           (and (characterp obj)
                (let ((cc (char-code obj)))
                  (if (= cc 10) t (and (>= cc 32) (<= cc 126))))))
-         ((%typename-is tn #.(compute-name-hash "ATOM")) (not (consp obj)))
+         ((%typename-is tn 383129664) (not (consp obj)))
          ((eq tn t) t)
          ((null tn) nil)
-         ((%typename-is tn #.(compute-name-hash "BOOLEAN")) (or (null obj) (eq obj t)))
+         ((%typename-is tn 531098243) (or (null obj) (eq obj t)))
          ;; (typep x 'bit) — must be 0 or 1 AS AN INTEGER.  Without the
          ;; integerp guard `(= obj 0)` runs `=` on arbitrary values
          ;; (strings, conses, fn-addrs) which goes wrong fast.
-         ((%typename-is tn #.(compute-name-hash "BIT")) (and (integerp obj) (or (= obj 0) (= obj 1))))
-         ((%typename-is tn #.(compute-name-hash "BIT-VECTOR")) (bit-vector-p obj))
-         ((%typename-is tn #.(compute-name-hash "SIMPLE-BIT-VECTOR")) (simple-bit-vector-p obj))
+         ((%typename-is tn 496243224) (and (integerp obj) (or (= obj 0) (= obj 1))))
+         ((%typename-is tn 524100924) (bit-vector-p obj))
+         ((%typename-is tn 73449743) (simple-bit-vector-p obj))
          ;; Array/vector predicates: route through arrayp (which now
          ;; recognises cons-wrappers and native MDA).  simple-vector
          ;; requires non-string element type; simple-array tracks
          ;; non-adjustable.  Modus mostly upgrades everything to T so
          ;; the distinctions are coarse.
-         ((%typename-is tn #.(compute-name-hash "ARRAY")) (arrayp obj))
-         ((%typename-is tn #.(compute-name-hash "SIMPLE-ARRAY"))
+         ((%typename-is tn 10588126) (arrayp obj))
+         ((%typename-is tn 448780229)
           (and (arrayp obj)
                (not (and (consp obj) (eql (car obj) 8765432)))))
-         ((%typename-is tn #.(compute-name-hash "VECTOR"))
+         ((%typename-is tn 116440318)
           (and (arrayp obj) (= (array-rank obj) 1)))
-         ((%typename-is tn #.(compute-name-hash "SIMPLE-VECTOR"))
+         ((%typename-is tn 295137229)
           ;; CL: simple-vector = simple 1-D array of T.  In Modus the
           ;; element type isn't tracked at the object level for the
           ;; general case, so we can't strictly distinguish (vector T)
@@ -3248,20 +3296,20 @@
          ;; ARRAYP is checked FIRST because Modus' adjustable/displaced
          ;; array wrappers are CONS-shaped — a `(consp obj)' test would
          ;; accept an adjustable rank-2 array before the rank test ran.
-         ((%typename-is tn #.(compute-name-hash "SEQUENCE"))
+         ((%typename-is tn 24777128)
           (if (arrayp obj)
               (= (array-rank obj) 1)
               (or (null obj) (consp obj))))
-         ((%typename-is tn #.(compute-name-hash "UNSIGNED-BYTE")) (and (integerp obj) (>= obj 0)))
-         ((%typename-is tn #.(compute-name-hash "SIGNED-BYTE")) (integerp obj))
-         ((%typename-is tn #.(compute-name-hash "FUNCTION")) (or (functionp obj) (%generic-function-p obj)))
-         ((%typename-is tn #.(compute-name-hash "GENERIC-FUNCTION")) (%generic-function-p obj))
-         ((%typename-is tn #.(compute-name-hash "STANDARD-GENERIC-FUNCTION")) (%generic-function-p obj))
-         ((%typename-is tn #.(compute-name-hash "STANDARD-METHOD")) (%standard-method-p obj))
-         ((%typename-is tn #.(compute-name-hash "METHOD")) (%standard-method-p obj))
-         ((%typename-is tn #.(compute-name-hash "METHOD-COMBINATION")) (%mc-p obj))
+         ((%typename-is tn 237688881) (and (integerp obj) (>= obj 0)))
+         ((%typename-is tn 398241362) (integerp obj))
+         ((%typename-is tn 402801909) (or (functionp obj) (%generic-function-p obj)))
+         ((%typename-is tn 357975417) (%generic-function-p obj))
+         ((%typename-is tn 267254943) (%generic-function-p obj))
+         ((%typename-is tn 437104782) (%standard-method-p obj))
+         ((%typename-is tn 38548584) (%standard-method-p obj))
+         ((%typename-is tn 87270964) (%mc-p obj))
          ;; CLOS instance check
-         ((%typename-is tn #.(compute-name-hash "STANDARD-OBJECT")) (%clos-instance-p obj))
+         ((%typename-is tn 205458436) (%clos-instance-p obj))
          ;; User-defined CLOS class: check if obj is a CLOS instance and
          ;; tn is in obj's class precedence list (so typep recognizes
          ;; subclasses correctly).

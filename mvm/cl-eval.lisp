@@ -2366,13 +2366,6 @@
       (when (eq (car cur) key) (return (cadr cur)))
       (setq cur (cddr cur)))))
 
-(defun %kw-named-p (x hash)
-  "True iff X is a keyword (or symbol) whose stored name hash is HASH.  Lets
-   baked runtime code test for a specific keyword WITHOUT evaluating a
-   keyword literal (each literal is a %INTERN-KEYWORD table lookup per
-   evaluation in image code)."
-  (and (symbolp x) (not (null x)) (not (eq x t)) (eq (%word-aref x 0) hash)))
-
 (defun %validate-kw-list (kw-rest declared)
   "Walk KW-REST (caller's &key plist).  Signal program-error if any
    indicator is not EQ to a declared key, unless the plist itself
@@ -2383,7 +2376,7 @@
     (loop
       (when (null cur) (return nil))
       (when (null (cdr cur)) (return nil))
-      (when (and (%kw-named-p (car cur) #.(compute-name-hash "ALLOW-OTHER-KEYS")) (cadr cur))
+      (when (and (eq (car cur) :allow-other-keys) (cadr cur))
         (setq allow t)
         (return nil))
       (setq cur (cddr cur)))
@@ -2394,7 +2387,7 @@
           (when (null (cdr cur))
             (error "odd-length keyword argument list"))
           (let ((k (car cur)))
-            (unless (or (%kw-named-p k #.(compute-name-hash "ALLOW-OTHER-KEYS"))
+            (unless (or (eq k :allow-other-keys)
                         (%kw-in-list-p k declared))
               (error "unknown keyword argument: ~S" k)))
           (setq cur (cddr cur)))))))

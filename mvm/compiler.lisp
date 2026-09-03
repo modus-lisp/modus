@@ -6894,7 +6894,8 @@
              (body-forms (cddr form)))
          (compile-form
           `(let* ((%c-tag ,tag-form)
-                  (*catch-tags* (cons %c-tag *catch-tags*)))  ; dynamic: THROW's fast path needs a live tag
+                  (*catch-tags* (cons %c-tag *catch-tags*)))
+             (declare (special *catch-tags*))  ; a real dynamic bind (task #248): THROW's fast path reads it
              (%handler-case-catch (progn ,@body-forms)
                (t (%c-cnd)
                  (if (if *catch-active* (eql *catch-tag* %c-tag) nil)

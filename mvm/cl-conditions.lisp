@@ -575,6 +575,16 @@
 ;; NIL means "no list recorded"; the CATCH expansion then falls back to
 ;; *CATCH-VALUE* so any thrower that predates this still works.
 (defvar *catch-values* nil)
+(defvar *catch-tags* nil
+  "Tags of the dynamically active CATCH frames (innermost first).  CATCH binds
+   it (escape-safe dynamic binding); THROW takes its direct-longjmp fast path
+   only when its tag is on this list.")
+(defun %catch-tag-active-p (tag)
+  (let ((cur *catch-tags*))
+    (loop
+      (when (null cur) (return nil))
+      (when (eq (car cur) tag) (return t))
+      (setq cur (cdr cur)))))
 
 ;;; ============================================================
 ;;; Unhandled-condition escape report (diagnostic, purely additive)

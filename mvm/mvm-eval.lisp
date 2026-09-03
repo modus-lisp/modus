@@ -3287,6 +3287,11 @@
 ;;; profile.  This override (spliced after compiler.lisp) restores the raw
 ;;; %PRIM-AREF loop with inline ASCII upcasing.  Bit-identical result.
 (defun compute-name-hash (name-string)
+  ;; A wrapped (multi-dimensional / adjustable / base-char) string stores its
+  ;; characters behind a #x34 header: %PRIM-AREF would read the wrapper's
+  ;; slots (find-symbol.17 / shadow.8 build names with MAKE-ARRAY
+  ;; :element-type 'base-char).  Flatten it first.
+  (when (%mda-p name-string) (setq name-string (%flat-string name-string)))
   (let ((h1 40389) (h2 48879)          ; #x9DC5 / #xBEEF
         (len (array-length name-string))
         (i 0))

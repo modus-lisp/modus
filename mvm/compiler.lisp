@@ -6893,7 +6893,8 @@
        (let ((tag-form (cadr form))
              (body-forms (cddr form)))
          (compile-form
-          `(let ((%c-tag ,tag-form))
+          `(let* ((%c-tag ,tag-form)
+                  (*catch-tags* (cons %c-tag *catch-tags*)))  ; dynamic: THROW's fast path needs a live tag
              (%handler-case-catch (progn ,@body-forms)
                (t (%c-cnd)
                  (if (if *catch-active* (eql *catch-tag* %c-tag) nil)
@@ -6939,7 +6940,10 @@
              ;; longjmp straight to it instead of building a SIMPLE-ERROR and
              ;; running the whole signal path (15.7 us -> tens of ns).  The
              ;; marker tells intervening frames this is a throw, not an error.
-             (if (%error-handler-active-p)
+             ;; Only when a CATCH with this tag is dynamically active: a throw to
+             ;; a nonexistent tag must signal CONTROL-ERROR from here (catch.16),
+             ;; not unwind to some unrelated handler-case carrying the marker.
+             (if (if (%error-handler-active-p) (%catch-tag-active-p %t-tag) nil)
                  (progn (setq *current-condition* :%throw-in-flight) (%hc-longjmp))
                  (error "throw")))
           env dest)))

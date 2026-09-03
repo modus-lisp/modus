@@ -712,11 +712,21 @@
         (code-char (+ code 32))
         ch)))
 
+(defun %flat-string (s)
+  "A plain #x31 copy of string S (S may be a wrapped/MDA string), char codes
+   normalised — for raw %PRIM-AREF loops that must not see a wrapper."
+  (let* ((len (array-length s)) (flat (%make-string-array len)) (i 0))
+    (loop
+      (when (>= i len) (return flat))
+      (%prim-aset flat i (%ensure-char-code (aref s i)))
+      (setq i (+ i 1)))))
+
 (defun string-upcase (str)
   "Return a new string with all characters uppercased.
    Uses %make-string-array so the result is actually a string (subtag),
    and converts char-upcase's returned character back to a fixnum char-code
    to match the convention that string slots hold fixnum char-codes."
+  (when (%mda-p str) (setq str (%flat-string str)))
   (let ((len (array-length str))
         (result (%make-string-array (array-length str))))
     (let ((i 0))

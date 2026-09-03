@@ -45,13 +45,11 @@
 ;; ============================================================
 ;; Timing / serial / entropy
 ;; ============================================================
-;; Reading the POST diagnostic port is the classic ~1us I/O-bus delay and has
-;; no side effect (reading the COM1 data port would CONSUME a received byte).
-;; Same shape as the aarch64 adapter: a RAM read spin, NOT a port-0x80 read.
-;; Each `in` is a QEMU PIO exit that takes the big lock; 500 DHCP polls x 5000
-;; of them starved the iothread that flushes slirp's queued reply into the RX
-;; ring, so the OFFER landed only after the poll loop had given up (DHCP:F
-;; with RDH=1 and the offer sitting in descriptor 0).
+;; A RAM-read spin (the classic ~1 us bus delay), no port I/O.  A port-0x80
+;; spin here (5000 PIO exits per call) held the QEMU big lock and starved the
+;; iothread that flushes slirp's queued reply into the RX ring, so the OFFER
+;; landed only after the poll loop gave up.  Keep it a pure RAM read; the DHCP
+;; post-reset settle is handled by re-running the client in run-net-pipeline.
 (defun io-delay ()
   (dotimes (d 5000) (mem-ref #x0C060000 :u8)))
 

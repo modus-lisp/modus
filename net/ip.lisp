@@ -1298,7 +1298,14 @@
     (%serial-byte 68) (%serial-byte 72) (%serial-byte 67) (%serial-byte 80) (%serial-byte 58)
     (%serial-byte 68) (%serial-byte 10)
     (let ((got-offer 0))
-      (dotimes (try 500)
+      ;; Wide window.  On QEMU's e1000 model the first reply after a NIC reset
+      ;; lands far out (a fixed post-reset settle; STATUS.LU is already up) —
+      ;; measured ~1840 polls on the faster x64 loop, past the old 500-poll
+      ;; window.  A larger cap keeps the window open; aarch64 exits early on the
+      ;; first offer so this is a no-op there.  Do NOT re-send DISCOVER inside
+      ;; the loop: slirp defers its pending OFFER on each new DISCOVER, so a
+      ;; retransmit keeps pushing the reply out and the window never catches it.
+      (dotimes (try 2500)
         (when (zerop got-offer)
           (io-delay)
           (let ((pkt-len (e1000-receive)))
@@ -1328,7 +1335,7 @@
             (%serial-byte 68) (%serial-byte 72) (%serial-byte 67) (%serial-byte 80) (%serial-byte 58)
             (%serial-byte 82) (%serial-byte 10)
             (let ((got-ack 0))
-              (dotimes (try 500)
+              (dotimes (try 2500)
                 (when (zerop got-ack)
                   (io-delay)
                   (let ((pkt-len (e1000-receive)))

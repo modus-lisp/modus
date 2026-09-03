@@ -1060,7 +1060,7 @@
 ;; means a defvar initform never runs at boot).  MODUS_NET_URL overrides it.
 (defvar *net-url-source*
   (if *net-build-p*
-      (format nil "~%(defun %net-fetch-url () ~S)~%(defun %lib-call-expr () ~S)~%"
+      (format nil "~%(defun %net-fetch-url () ~S)~%(defun %lib-call-expr () ~S)~%(defun %ql-http-base () ~S)~%"
               (or #+sbcl (sb-ext:posix-getenv "MODUS_NET_URL")
                   "http://10.0.2.2:8080/sha1.tar")
               ;; #263 rung 3: the expression evaluated AFTER the fetched system
@@ -1068,7 +1068,13 @@
               ;; reader cannot read `sha1:sha1-hex' (no SHA1 package until the
               ;; library loads).  Override with MODUS_LIB_EXPR.
               (or #+sbcl (sb-ext:posix-getenv "MODUS_LIB_EXPR")
-                  "(sha1:sha1-hex \"abc\")"))
+                  "(sha1:sha1-hex \"abc\")")
+              ;; Base URL for bare-metal ql:quickload: <base><name>.tar is
+              ;; fetched over HTTP and installed from the in-memory bytes.  Also
+              ;; a defun (limitation #7).  Default is the :8086 proxy that mirrors
+              ;; the Quicklisp dist (sha1.tar, alexandria.tar, ...).
+              (or #+sbcl (sb-ext:posix-getenv "MODUS_QL_BASE")
+                  "http://10.0.2.2:8086/"))
       ""))
 
 ;; The rung-2 pipeline: bring the USB NIC up, DHCP for an address, fetch a
@@ -1213,6 +1219,47 @@
               t)))
     (t (c) (write-string-serial \"LIB-ERR\") (write-char-serial 10) nil)))
 
+;; --- bare-metal ql:quickload over the network -------------------------------
+;; The true `ql:quickload' front-end for the bare image.  Mirrors
+;; modus-quicklisp/setup.lisp's %ql-quickload (keyword/string/symbol designator
+;; -> <base><name>.tar -> install-tarball) but with an HTTP FETCH backend
+;; (net-fetch-bytes -> install-tarball-from-bytes) in place of the filesystem
+;; read, because bare metal has no filesystem.  ql-net-setup makes `ql:quickload'
+;; nameable at the REPL; run-net-pipeline calls it once the NIC/DHCP are up.
+(defun %ql-name-string (name)
+  (cond ((stringp name) name)
+        ((symbolp name) (string-downcase (symbol-name name)))
+        (t (princ-to-string name))))
+
+(defun %ql-quickload-net (name)
+  (let* ((nm (%ql-name-string name))
+         (url (concatenate 'string (%ql-http-base) nm \".tar\")))
+    (write-string-serial \"; ql:quickload \") (write-string-serial nm)
+    (write-string-serial \" <- \") (write-string-serial url) (write-char-serial 10)
+    (let ((tb (net-fetch-bytes url)))
+      (if (null tb)
+          (progn (write-string-serial \"; ql:quickload fetch failed\")
+                 (write-char-serial 10)
+                 (error \"ql:quickload: fetch failed\"))
+          (progn
+            (write-string-serial \"FETCHED bytes=\") (print-dec (cdr tb))
+            (write-char-serial 10)
+            (install-tarball-from-bytes (car tb) nm)
+            nm)))))
+
+(defun ql-net-setup ()
+  (handler-case
+      (progn
+        (unless (find-package \"QL\") (make-package \"QL\" :use (list \"CL\")))
+        (let ((sym (intern \"QUICKLOAD\" \"QL\")))
+          (export sym \"QL\")
+          (setf (symbol-function sym) (function %ql-quickload-net)))
+        (write-string-serial \"; ql:quickload ready (base \")
+        (write-string-serial (%ql-http-base)) (write-string-serial \")\")
+        (write-char-serial 10)
+        t)
+    (t (c) (write-string-serial \"; ql-net-setup failed\") (write-char-serial 10) nil)))
+
 ")
 
 ;;; DIVERGENCE 4 — the NIC bring-up, and only that.  Both arms print the same
@@ -1236,7 +1283,15 @@
   (handler-case (pci-assign-bars) (t (c) nil))
   (handler-case (e1000-probe) (t (c) nil))
   ;; 2. DHCP.  Prints DHCP:D / DHCP:O / DHCP:R / DHCP:A itself.
-  (handler-case (dhcp-client) (t (c) nil))
+  ;;    Retry: on QEMU's e1000 model the first DISCOVER after a NIC reset draws
+  ;;    a reply only after a fixed post-reset settle (STATUS.LU is already up),
+  ;;    which the poll window can miss under TCG; a second DISCOVER once the NIC
+  ;;    has cycled is answered immediately.  Re-run the client until it has an
+  ;;    address (state+0x18) or the attempts run out.  The failing attempts also
+  ;;    burn the settle time, so a later one hits the fast path.
+  (dotimes (attempt 8)
+    (when (zerop (mem-ref (+ (e1000-state-base) #x18) :u8))
+      (handler-case (dhcp-client) (t (c) nil))))
   (let ((state (e1000-state-base)))
     (write-string-serial \"IP=\")
     (print-dec (mem-ref (+ state #x18) :u8)) (write-char-serial 46)
@@ -1249,7 +1304,11 @@
     ;;    (rung 3) install it, load it, and call a function from it.
     (if (zerop (mem-ref (+ state #x18) :u8))
         (progn (write-string-serial \"NET-PIPELINE-ABORT\") (write-char-serial 10))
-        (net-install-and-call (%net-fetch-url))))
+        (progn
+          ;; NIC + DHCP are up: make `ql:quickload' nameable at the REPL, then
+          ;; run the baked sha1 self-test (evidence the install path works).
+          (handler-case (ql-net-setup) (t (c) nil))
+          (net-install-and-call (%net-fetch-url)))))
   (write-string-serial \"NET-PIPELINE-DONE\") (write-char-serial 10))
 "
       "(defun run-net-pipeline ()
@@ -1546,6 +1605,18 @@
   (funcall (intern "INSTALL-X64-TRANSLATOR" "MODUS.MVM.X64"))
   (setf modus.mvm.x64::*x64-linux-mode* nil)
   (setf modus.mvm.x64::*x64-gc-enabled* t)
+  ;; Disable the CONS-KIND bitmap scan_word reject on bare x64.  The kind bitmap
+  ;; base is [bitmap_base] + +mcgc-kindbitmap-delta+, and that delta (#xFE4000)
+  ;; is a LINUX-x64 layout constant — boot-x64.lisp lays the GC metadata out
+  ;; differently, so on bare the check reads a wrong, uninitialised region and
+  ;; falsely rejects valid conservative roots, dropping live objects across a
+  ;; collection (symbols came back with empty name strings; the alexandria
+  ;; install then died with read/eval errors, sooner the more GCs ran).  The
+  ;; object-start bitmap (correctly based on the config word) still validates
+  ;; roots, which is sufficient.  Enable the kind check here only once the delta
+  ;; is made layout-agnostic for bare (a config word filled by boot-x64).  The
+  ;; SET side is left as a dead no-op (its bits are never read).
+  (setf modus.mvm.x64::*ws5-force-no-kindcheck* t)
   (setf modus.mvm.x64::*x64-native-code-offset*
         (let ((buf (make-mvm-buffer))
               (desc (x64-boot-descriptor)))

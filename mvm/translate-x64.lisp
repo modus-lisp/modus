@@ -4410,7 +4410,7 @@
    truncation-via-cons-tagged-scratch corruption).  DEFAULT NIL.
 
    The kind bitmap lives at [+mcgc-cfg-bitmap-addr+] + +mcgc-kindbitmap-delta+
-   (#x804000) — a LINUX-x64 layout constant (boot-linux-x64.lisp asserts it).
+   (#xFE4000) — a LINUX-x64 layout constant (boot-linux-x64.lisp asserts it).
    Bare-metal x64 (boot-x64.lisp, e.g. build-x64) lays the
    metadata out DIFFERENTLY, so that delta is wrong there.  Until the base is
    made layout-agnostic (a config word filled by each boot, or a lazy compute

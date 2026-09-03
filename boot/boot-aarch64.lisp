@@ -1244,6 +1244,22 @@
     ;; emits the single MOVZ the legacy sequence used (byte-identical).
     (emit-aarch64-load-imm64 buf x26 *aarch64-fixpoint-nil-value*)
 
+    ;; 17b. x28 = the native MCGC GC trampoline's absolute VA (same as
+    ;; boot-rpi-cl.lisp and emit-linux-aarch64-entry).  BAKED code reaches the
+    ;; trampoline with a short-range BL (*aarch64-gc-trampoline-call-via-bl*),
+    ;; but the RUNTIME JIT's coinit flips via-bl off and every JIT'd gc-check
+    ;; is a `BLR x28` -- and this entry never loaded x28, so on QEMU virt the
+    ;; first JIT'd allocation to cross the heap limit branched through
+    ;; whatever the mutator had left in x28 (the wild-indirect-call class the
+    ;; Pi image hit on 2026-08-20; bare x64 found the same "runtime JIT does
+    ;; not mirror the baked GC config" gap on 2026-09-03).  MOVZ/MOVK pair
+    ;; patched post-link by cross.lisp::apply-aarch64-x28-trampoline-patch.
+    (when modus.mvm::*aarch64-gc-native-mcgc*
+      (setf modus.mvm::*aarch64-x28-load-patch-offset*
+            (* (modus.mvm::a64-current-index buf) 4))
+      (emit-aarch64-movz buf 28 0 0)      ; placeholder (lo16)
+      (emit-aarch64-movk buf 28 0 16))    ; placeholder (hi16 lsl 16)
+
     ;; 18. Set TPIDR_EL1 = per-CPU data VA
     (emit-aarch64-load-imm64 buf x16 +tdk-percpu-va+)
     (emit-aarch64-u32 buf #xD518D090)            ; MSR TPIDR_EL1, X16

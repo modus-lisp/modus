@@ -5749,7 +5749,13 @@
   ;; WS4-AA64 #160 Stage 1: when *aarch64-gc-native-mcgc*, emit the NATIVE
   ;; Cheney collector at the trampoline label (no Lisp %gc-collect needed);
   ;; otherwise the Lisp-%gc-collect-calling trampoline below (unchanged).
-  (when (and *aarch64-gc-native-mcgc* *aarch64-gc-trampoline-label*)
+  ;; Runtime JIT pages call the BAKED trampoline through x28 (via-bl off), so
+  ;; a per-page copy is dead code: ~1 ms and a few KB per page (measured
+  ;; 2026-09-03, 269 of 302 pages), emitted against runtime flag values that
+  ;; need not match the baked ones.  Emit it only where it can be called.
+  (when (and *aarch64-gc-native-mcgc* *aarch64-gc-trampoline-label*
+             (not (and *aarch64-jit-mode*
+                       (not *aarch64-gc-trampoline-call-via-bl*))))
     (emit-aarch64-native-gc-trampoline buf))
   (when (and (not *aarch64-gc-native-mcgc*)
              *aarch64-gc-trampoline-label*

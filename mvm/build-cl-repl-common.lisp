@@ -1321,7 +1321,12 @@
         (progn (write-string-serial \"NET-PIPELINE-ABORT\") (write-char-serial 10))
         (progn
           ;; 2. DHCP.  Prints DHCP:D / DHCP:O / DHCP:R / DHCP:A itself.
-          (handler-case (dhcp-client) (t (c) nil))
+          ;;    Same retry as the QEMU arm: the host side of a CDC-ECM link
+          ;;    (dnsmasq on the gadget interface) can miss the first
+          ;;    DISCOVER while its interface is still coming up.
+          (dotimes (attempt 8)
+            (when (zerop (mem-ref (+ (e1000-state-base) #x18) :u8))
+              (handler-case (dhcp-client) (t (c) nil))))
           (let ((state (e1000-state-base)))
             (write-string-serial \"IP=\")
             (print-dec (mem-ref (+ state #x18) :u8)) (write-char-serial 46)
@@ -1429,6 +1434,12 @@
   (setq *aarch64-gc-native-mcgc* t)
   (setq *aarch64-gc-trampoline-call-via-bl* nil)
   (setq *aarch64-gc-trampoline-label* 1)
+  ;; Mirror the BAKED alloc-overshoot guard band (build-cl-repl-common sets
+  ;; *aarch64-gc-limit-guard* #x800000 for the image build).  The in-image
+  ;; value is the defvar's 0, so anything the runtime translator emits that
+  ;; reads it -- a trampoline exit -- would hand the mutator an UNGUARDED
+  ;; limit.  Bare x64 lost alexandria to exactly this class (283cccf).
+  (setq *aarch64-gc-limit-guard* #x800000)
   ;; *aarch64-gc-bitmap-enabled* at runtime: MUST be T — while NIL, objects
   ;; allocated by JIT'd code carry no object-start/cons-kind bit and the
   ;; native GC's bitmap gate (applied by scan_word to EVERY scanned word,

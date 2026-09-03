@@ -430,14 +430,26 @@
     ;; same address space is shared, so we start the alloc pointer past
     ;; the metadata reservation.  Anything below 0x10001000 is metadata.
     ;;
-    ;; Heap split into two Cheney semispaces of ~112MB each:
-    ;;   from-space: [0x10001000, 0x17000000)
-    ;;   to-space:   [0x17000000, 0x1DFFF000)
-    ;;   space_size: 0x06FFF000
-    ;; R14 = from_start + space_size = 0x16FFF000, so the FIRST overflow
+    ;; Heap split into two Cheney semispaces of ~103MB each, with a ~16MB
+    ;; OVERSHOOT GUARD below the metadata region:
+    ;;   from-space: [0x10001000, 0x16800000)
+    ;;   to-space:   [0x16800000, 0x1CFFF000)
+    ;;   guard:      [0x1CFFF000, 0x1E000000)  (~16.8MB, mapped, unused)
+    ;;   space_size: 0x067FF000
+    ;; R14 = from_start + space_size = 0x16800000, so the FIRST overflow
     ;; trips the GC trampoline at the correct from-space boundary.
-    ;; Without this, the trampoline reads zero metadata and ALL HELL
-    ;; BREAKS LOOSE (see comment block below for GC metadata init).
+    ;;
+    ;; The guard is NOT optional — it is x64-linux's +linux-x64-gc-guard+ (16MB)
+    ;; applied to bare.  The gc-check is POST-allocation: R12 overshoots R14 by up
+    ;; to a whole object.  In the FIRST semispace that overshoot lands in the
+    ;; (mapped) second semispace and is harmless; in the SECOND semispace, without
+    ;; a guard it runs off the end onto the GC config page at 0x1E000000 and
+    ;; corrupts from_start/to_start/space_size/bitmap — every later collection then
+    ;; uses garbage geometry (empty-name symbols, wild copies).  Bare shipped with
+    ;; the second from_end (0x1DFFF000) only 4KB below the metadata, so any alloc
+    ;; that outgrew the first semispace and reached the second corrupted it — the
+    ;; JIT (heavier allocation) hit this on the alexandria install; the interpreter
+    ;; stayed inside the first semispace and never did.
     ;; mov r12, 0x10001000
     (mvm-emit-byte buf #x49)          ; REX.WB
     (mvm-emit-byte buf #xBC)          ; mov r12, imm64
@@ -445,10 +457,10 @@
     (mvm-emit-u32 buf 0)
 
     ;; R14 = from-space end (alloc limit).
-    ;; mov r14, 0x17000000
+    ;; mov r14, 0x16800000
     (mvm-emit-byte buf #x49)          ; REX.WB
     (mvm-emit-byte buf #xBE)          ; mov r14, imm64
-    (mvm-emit-u32 buf #x17000000)
+    (mvm-emit-u32 buf #x16800000)
     (mvm-emit-u32 buf 0)
 
     ;; Initialize GC metadata at 0x10000040..0x10000058.  The x64 GC
@@ -470,17 +482,17 @@
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xB8)
     (mvm-emit-u32 buf #x10001000) (mvm-emit-u32 buf 0)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x07)
-    ;; Slot 0x10000048 = to_start = 0x17000000
+    ;; Slot 0x10000048 = to_start = 0x16800000  (from_start + space_size)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
     (mvm-emit-u32 buf #x10000048) (mvm-emit-u32 buf 0)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xB8)
-    (mvm-emit-u32 buf #x17000000) (mvm-emit-u32 buf 0)
+    (mvm-emit-u32 buf #x16800000) (mvm-emit-u32 buf 0)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x07)
-    ;; Slot 0x10000050 = space_size = 0x06FFF000
+    ;; Slot 0x10000050 = space_size = 0x067FF000  (leaves the ~16MB guard)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
     (mvm-emit-u32 buf #x10000050) (mvm-emit-u32 buf 0)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xB8)
-    (mvm-emit-u32 buf #x06FFF000) (mvm-emit-u32 buf 0)
+    (mvm-emit-u32 buf #x067FF000) (mvm-emit-u32 buf 0)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x07)
     ;; Slot 0x10000058 = stack_base = top of stack (GC conservative-root
     ;; scan upper bound; must match the effective stack top).

@@ -6910,9 +6910,12 @@
                        (setq *catch-values* nil)
                        (if %c-vs (values-list %c-vs) %c-v))
                      ;; Not our tag.  A throw in flight (direct longjmp, no
-                     ;; condition built) re-throws by longjmp to the next
-                     ;; frame; anything else is a real condition -> re-signal.
-                     (if (if *catch-active* (%error-handler-active-p) nil)
+                     ;; condition built — THROW marks it with the keyword
+                     ;; below, since *CATCH-ACTIVE* alone can be stale: probe
+                     ;; 8447, a real TYPE-ERROR unwinding through a CATCH was
+                     ;; hijacked) re-throws by longjmp to the next frame;
+                     ;; anything else is a real condition -> re-signal.
+                     (if (if (eq %c-cnd :%throw-in-flight) (%error-handler-active-p) nil)
                          (%hc-longjmp)
                          (error %c-cnd))))))
           env dest)))
@@ -6934,9 +6937,10 @@
              (setq *catch-active* t)
              ;; Same fast path as %NLX-THROW: with a handler-case frame armed,
              ;; longjmp straight to it instead of building a SIMPLE-ERROR and
-             ;; running the whole signal path (15.7 us -> tens of ns).
+             ;; running the whole signal path (15.7 us -> tens of ns).  The
+             ;; marker tells intervening frames this is a throw, not an error.
              (if (%error-handler-active-p)
-                 (%hc-longjmp)
+                 (progn (setq *current-condition* :%throw-in-flight) (%hc-longjmp))
                  (error "throw")))
           env dest)))
 

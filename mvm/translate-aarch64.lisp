@@ -307,6 +307,20 @@
    offset.  Bound freshly to nil per JIT translation; empty for any hazard-free
    (rt-empty) module, so flag-off / hazard-free translation is byte-identical.")
 
+(defvar *a64-jit-page-reject* nil
+  "#307: set by the translator when a RUNTIME-JIT page cannot be built (today:
+   a handler-case/SETJMP op with no handler-stack helper labels).  The caller
+   (%jit-translate-page-1-aarch64) binds this to NIL, and returns NIL for an
+   INTERPRET FALLBACK if it comes back set.
+
+   WHY A FLAG AND NOT AN ERROR: this rejection used to `error', relying on the
+   handler-case in %jit-translate-page to degrade it to a fallback.  That is
+   circular — the very condition being reported is that handler frames are
+   unreliable in this configuration — and it was observed ESCAPING to toplevel
+   and killing `ql:quickload' on hosted aarch64 (2026-09-04, native Pi 5,
+   reproduced at BOTH heap sizes).  A flag cannot be swallowed and cannot
+   escape.")
+
 (defvar *aarch64-fn-addr-relocs* nil
   "WS4 aarch64 Stage 4.  List of (movz-quad-native-byte-offset . synthetic-mvm-
    offset) for OUT-OF-MODULE #'NAME value-loads (op-fn-addr to a synthetic
@@ -2502,8 +2516,11 @@
                 ;; pushes real frames.  Until the helpers are reachable from JIT pages,
                 ;; REJECT the page: the translate guard turns this into an interpret
                 ;; fallback, whose emulated handler stack is correct.
+                ;; #307: reject the PAGE via a flag the caller checks, never by
+                ;; signalling — see *a64-jit-page-reject*.  Emission continues so
+                ;; the buffer stays well-formed; the caller discards it.
                 (when (and *aarch64-jit-mode* (null *aarch64-handler-push-label*))
-                  (error "aarch64 JIT: handler-case in a JIT page needs the handler-stack helpers (#307) -- interpreting"))
+                  (setq *a64-jit-page-reject* t))
                 ;; SETJMP: Save SP, FP (X29), return-IP to 0x10000180/188/190.
                 ;; First call: return NIL (=X26=0) in X0.  On longjmp:
                 ;; execution resumes here with X0 = T (#xDEAD1009).

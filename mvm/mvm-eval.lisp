@@ -1488,9 +1488,15 @@
   ;; explicitly here (JIT-only; the host image builds set their own value
   ;; host-side and never call this function).
   (setq *aarch64-fn-align-offset* 0)
+  (setq *a64-jit-page-reject* nil)
   (let ((ftbl (make-hash-table :test (quote eql))))
     (let ((i 0)) (dolist (e ft-list) (setf (gethash i ftbl) (cadr e)) (setq i (+ i 1))))
     (multiple-value-bind (nbuf fn-map) (translate-mvm-to-aarch64 bc ftbl)
+      ;; #307 page rejection (flag, not a condition — see *a64-jit-page-reject*).
+      (when *a64-jit-page-reject*
+        (setq *jit-fallback-count*
+              (if *jit-fallback-count* (+ 1 *jit-fallback-count*) 1))
+        (return-from %jit-translate-page-1-aarch64 nil))
       ;; ============================================================
       ;; GC-SAFETY GATE (R-CONST-BAKED) — aarch64 port of the x64 gate in
       ;; %jit-translate-page-1.  See that function's long comment for the four

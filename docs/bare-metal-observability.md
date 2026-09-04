@@ -68,7 +68,25 @@ rebuild, no U-Boot `mw.q`. For virt, VA `0x0xxxxxxx` == file offset.
 ## The gap: real hardware has no gdbstub
 
 The board (Pi Zero 2 W, BCM2710A1, Cortex-A53, running at **EL2**) has no
-equivalent. Two ways to close it, cheapest first.
+equivalent.
+
+**PREFER SERIAL. It is the only channel every target already has** — COM1 on
+bare x64, PL011 / mini-UART on aarch64, the i386 images too — so a serial-based
+answer is written once and works on every board we bring up, including ones
+that do not exist yet. GPIO trace pins and JTAG below are Pi-specific escape
+hatches: reach for them when serial cannot answer the question (a wedge with
+interrupts off, or a fault before our vectors are installed), not as the
+default.
+
+Ordered by generality, not just by cost:
+
+| approach | channel | portable? |
+|---|---|---|
+| per-item markers | serial | yes — do this always |
+| timer-IRQ PC sampler | serial readout | yes (timer/IRQ setup is per-arch) |
+| in-image gdbstub | serial | yes — the general answer |
+| GPIO trace pins | GPIO | Pi only |
+| JTAG | SWD/JTAG pins | Pi only, needs wiring |
 
 ### Option A — timer-interrupt PC sampler (recommended first)
 
@@ -100,13 +118,19 @@ Sketch:
 Cost: real, but bounded, and it pays for itself the first time a board step
 goes quiet. It also generalises to every future bare-metal target.
 
-### Option B — a real gdbstub in the image
+### Option B — a real gdbstub in the image (the GENERAL answer)
 
 Implement the GDB remote serial protocol over the UART: packet framing,
-`g`/`m`/`c`/`s`, breakpoints. Gives interactive debugging identical to the QEMU
-experience. Much larger (packet parser, register marshalling) and it needs the
-UART, which is also the console — so it wants a second UART or a multiplexing
-scheme. Worth it only after Option A proves insufficient.
+`g`/`m`/`c`/`s`, breakpoints. This is the one that generalises — the same stub
+serves bare x64 (COM1), aarch64 (PL011 / mini-UART) and i386, and it gives
+exactly the experience that settled the virt question above, on hardware where
+QEMU cannot help.
+
+It is larger (packet parser, register marshalling), and it shares the UART with
+the console. Do NOT require a second UART — multiplex instead: a magic escape
+sequence on the console switches the port into gdb-stub mode and `D`/detach
+switches it back, which is standard practice for embedded stubs and keeps the
+one-cable setup we already have on every target.
 
 ### Option C' — GPIO trace pins (cheapest of all, do this alongside A)
 

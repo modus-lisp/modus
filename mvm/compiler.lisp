@@ -12649,13 +12649,38 @@
 (defun %e2-name-names-gf-p (name)
   "mvm-eval ONLY (see compile-function-ref): true if NAME currently names a
    GENERIC FUNCTION.  Guarded so the HOST build (no %generic-function-p) and
-   any image without cl-clos.lisp both answer NIL and keep the baked paths."
-  (handler-case
-      (and (fboundp (quote %generic-function-p))
-           (fboundp name)
-           (%generic-function-p (symbol-function name))
-           t)
-    (t (c) nil)))
+   any image without cl-clos.lisp both answer NIL and keep the baked paths.
+
+   NO HANDLER-CASE HERE, DELIBERATELY.  This runs for EVERY `#'NAME' the
+   compiler sees, and a handler-case in the body makes the aarch64 runtime JIT
+   REJECT this function's page (the #307 guard, 9957d33) so it runs
+   INTERPRETED -- turning every sharp-quote compile into an interpreted
+   handler-frame push/pop.  FBOUNDP already guards SYMBOL-FUNCTION, so nothing
+   here can signal.  (The handler-case was measured NOT to be the Pi Zero 2 W
+   regression -- a Pi 5 A/B was within 1% -- but it is still wrong to put one
+   on this path.)
+
+   DO NOT "OPTIMISE" THIS TO %GF-P -- TRIED, IT BREAKS THE FIX.  What
+   SYMBOL-FUNCTION returns for a generic function is NOT a gf-object; %gf-p
+   answers NIL on it and the whole fix silently stops working (measured:
+   quickload back to SIMPLE-ERROR, ALEXANDRIA:FLATTEN undefined).  It is
+   matched by %generic-function-p's THIRD branch,
+   `(member x *gf-stub-closures*)'.
+
+   That branch IS a linear scan, and it runs for EVERY `#'NAME' the
+   compiler sees, and %generic-function-p falls through to
+   `(member x *gf-stub-closures*)' -- a LINEAR SCAN -- for every value that is
+   NOT a gf-object, i.e. for every ORDINARY function reference in the file.
+   %gf-p is its cheap FIRST test and is exactly what SYMBOL-FUNCTION of a
+   generic function answers T to; the stub-closures branch only matters for raw
+   fn-addr values, which SYMBOL-FUNCTION never returns.  Suspected cause of the
+   board regression: 3 files took 5567 s where they took ~5 s before the GF
+   fix, while hosted hardware absorbed the scan and showed nothing."
+  (and (fboundp (quote %generic-function-p))
+       (symbolp name)
+       (fboundp name)
+       (%generic-function-p (symbol-function name))
+       t))
 
 (defun %e2-fn-in-module-p (name)
   "mvm-eval ONLY (see compile-function-ref): true if NAME (a string) names a

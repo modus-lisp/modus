@@ -1200,6 +1200,35 @@
     ;; resources and then branch to native code via offset map.
     ;; ================================================================
 
+    ;; 14b. ZERO THE RUNTIME METADATA WINDOW (the BSS stand-in).
+    ;; Port of boot-rpi-cl.lisp step 0 — the QEMU-virt entry never had it, and
+    ;; that is a REAL gap, not a stylistic one: MEASURED 2026-09-04 with QEMU's
+    ;; own uninitialised-DRAM model
+    ;;   -object memory-backend-file,id=pmem,size=512M,mem-path=<random>,share=off
+    ;;   -machine virt,memory-backend=pmem
+    ;; this image emits ZERO bytes — no banner, no MODUS-CL, a silent spin —
+    ;; while the SAME poison with only 0x10000000..0x10200000 pre-zeroed boots
+    ;; to the REPL.  Bisected by zeroing regions of the poison FILE (for virt,
+    ;; VA 0x0xxxxxxx == file offset, since VA = PA - 0x40000000): zeroing the
+    ;; HEAP alone does NOT help, zeroing this window alone DOES.  QEMU normally
+    ;; zero-fills guest RAM, which is exactly why this hid for the life of the
+    ;; image — a green QEMU run licenses nothing about uninitialised memory.
+    ;;
+    ;; MUST run here: after the MMU is on (VA 0x10000000 -> PA 0x50000000) and
+    ;; BEFORE step 19c's emit-aarch64-code-bounds-init, which writes
+    ;; code_base/code_end into this same window and must not be clobbered.
+    ;; The Lisp-side enumerated slot list in *cli-arch-kernel-prologue* becomes
+    ;; redundant but stays harmless (it runs later and stores the same zeros).
+    (emit-aarch64-load-imm64 buf x16 #x10000000)
+    (emit-aarch64-load-imm64 buf x17 #x10001000)
+    (let ((zloop (a64-current-index buf)))
+      (a64-stur buf +a64-xzr+ x16 0)
+      (a64-add-imm buf x16 x16 8)
+      (a64-cmp-reg buf x16 x17)
+      (a64-bcond buf #b0011 (- zloop (a64-current-index buf))))   ; b.lo
+    (emit-aarch64-load-imm64 buf x16 #x10010000)
+    (a64-stur buf +a64-xzr+ x16 0)
+
     ;; 15. Set stack pointer to +tdk-stack-va+.
     ;; RAW-ADDR-AUDIT: SP gets a raw VA, not a Lisp value.  See the
     ;; defconstant for the layout-fragility caveat — every byte that

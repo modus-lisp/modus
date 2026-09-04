@@ -12619,11 +12619,43 @@
         ;; already compiled, being compiled right now, OR declared later in it
         ;; (the forward-reference arm, task #244).  Out-of-module #'CAR etc.
         ;; keep the op-FN-ADDR native object resolution.
+        ;; A GENERIC FUNCTION must be read from SYMBOL-FUNCTION at RUNTIME.
+        ;; Both baked paths below resolve NAME through the COMPILE-TIME function
+        ;; table, which for a GF holds the compiled dispatch/method function --
+        ;; a plain function -- while (symbol-function 'NAME) holds the GF OBJECT.
+        ;; They disagree, so `#'NAME' yields the wrong object and
+        ;; `(funcall #'NAME x)' dies while `(NAME x)' works.
+        ;; MEASURED inside the compiled QL-DIST::ENABLED-DISTS (native Pi 5,
+        ;; 2026-09-04, real quicklisp client):
+        ;;   SQ-TYPE=FUNCTION  GFP-SQ=0  FN-SQ=1        ; #'enabledp
+        ;;   SF-TYPE=STANDARD-GENERIC-FUNCTION GFP-SF=1 ; (symbol-function ...)
+        ;;   EQ=0
+        ;; i.e. a REAL function, but NOT the GF and not even a registered
+        ;; gf-stub.  That is what blocks ql:quickload on aarch64 (inside
+        ;; FIND-SYSTEM), and why JIT-off works -- the interpreter reads
+        ;; symbol-function.  CLHS agrees: #'F is the function F NAMES, and for a
+        ;; GF that is the GF object.  Emitting the lookup is also the only
+        ;; correct answer for a value that must stay EQ to symbol-function.
         (if (and *mvm-eval-runtime-p*
                  (symbolp name)
-                 (%e2-fn-in-module-p resolved-name))
-            (compile-make-closure (list 'function resolved-name) 'nil env dest)
-            (emit-ir :li-func dest resolved-name)))))
+                 (%e2-name-names-gf-p name))
+            (compile-form (list 'symbol-function (list 'quote name)) env dest)
+            (if (and *mvm-eval-runtime-p*
+                     (symbolp name)
+                     (%e2-fn-in-module-p resolved-name))
+                (compile-make-closure (list 'function resolved-name) 'nil env dest)
+                (emit-ir :li-func dest resolved-name))))))
+
+(defun %e2-name-names-gf-p (name)
+  "mvm-eval ONLY (see compile-function-ref): true if NAME currently names a
+   GENERIC FUNCTION.  Guarded so the HOST build (no %generic-function-p) and
+   any image without cl-clos.lisp both answer NIL and keep the baked paths."
+  (handler-case
+      (and (fboundp (quote %generic-function-p))
+           (fboundp name)
+           (%generic-function-p (symbol-function name))
+           t)
+    (t (c) nil)))
 
 (defun %e2-fn-in-module-p (name)
   "mvm-eval ONLY (see compile-function-ref): true if NAME (a string) names a

@@ -246,7 +246,17 @@
     (*cl-repl-x64-p*
      (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_X64_JIT")))
        (and v (string= v "1"))))
-    ((not *cl-repl-virt-p*) t)
+    ;; :RPI — JIT on by default; MODUS_RPI_JIT=0 builds it OFF.  The knob
+    ;; exists because the aarch64 JIT early-binds `#'NAME' (compile-function-ref
+    ;; -> :li-func, resolved once when the page is built), so a name CLOS later
+    ;; redefines -- every generic function -- leaves the page holding a stale
+    ;; object.  That is what blocks ql:quickload: QL-DIST::ENABLED-DISTS calls
+    ;; (funcall #'enabledp d) and gets the pre-CLOS gf stub.  Measured on a
+    ;; native Pi 5 2026-09-04: JIT ON dies in FIND-SYSTEM; JIT OFF completes
+    ;; `ql:quickload :alexandria' in 613 s with flatten/curry correct.
+    ((not *cl-repl-virt-p*)
+     (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_RPI_JIT")))
+       (not (and v (string= v "0")))))
     (t (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_VIRT_JIT")))
          (not (and v (string= v "0")))))))
 

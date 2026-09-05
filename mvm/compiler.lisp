@@ -4782,43 +4782,79 @@
                 (when (null cur) (return nil))
                 (let ((key (car cur)) (val (cadr cur)))
                   (cond
+                    ;; CLHS 7.6.2 / DEFCLASS: :reader/:writer/:accessor define
+                    ;; METHODS on the GENERIC FUNCTION of that name.  Emit the GF
+                    ;; dispatcher (so compiled DIRECT calls dispatch too) and
+                    ;; register the accessor as a method at execution time
+                    ;; (%clos-maybe-accessor-method creates the GF if absent).
+                    ;; The old plain (defun NAME (obj) (slot-value ...)) made two
+                    ;; classes sharing an accessor name collide by last-defun-wins
+                    ;; for compiled calls -- a collision CL cannot produce
+                    ;; (quicklisp: release's NAME on slot PROJECT-NAME shadowed
+                    ;; dist's NAME).  DEFSTRUCT accessors stay ordinary functions.
                     ((and (symbolp key) (string= (symbol-name key) "READER"))
+                     ;; FIXED arity: an accessor method is (obj) / (nv obj), and
+                     ;; CLHS 7.6.4 makes the GF congruent with it -- so no &rest
+                     ;; (a (defun (setf x) (&rest a) ...) dispatcher arrived with
+                     ;; a=NIL: "called with 0 args, lambda-list wants 2").
+                     ;; Build: a native DEFUN (baked direct calls bind to it).
+                     ;; Runtime (mvm-eval): a fixed-arity CLOSURE dispatcher --
+                     ;; no compile per accessor per class (3 mvm-eval'd defuns
+                     ;; per :accessor made dist.lisp take 17.8 s to load), and a
+                     ;; stable object the persistence trampoline never replaces,
+                     ;; so (typep #'NAME 'generic-function) holds.  Same
+                     ;; build/runtime split DEFGENERIC uses for its stub.
                      (setq extra-defuns
-                           (cons `(defun ,val (obj) (slot-value obj ',sname))
+                           (cons (if *mvm-eval-runtime-p*
+                                     `(%install-accessor-dispatcher ',val ':reader)
+                                     `(defun ,val (obj) (%gf-dispatch ',val (list obj))))
                                  extra-defuns))
-                     ;; CLHS 7.6.2: when NAME is already GENERIC, the reader
-                     ;; must be a METHOD on that GF — the defgeneric's stub
-                     ;; registration otherwise shadows the plain defun (uiop
-                     ;; defgeneric-then-defclass idiom; asdf component-name,
-                     ;; gauntlet form 241).  No-op when no GF exists.
                      (setq extra-defuns
                            (cons `(%clos-maybe-accessor-method
                                    ',val ',class-name ',sname ':reader)
                                  extra-defuns)))
                     ((and (symbolp key) (string= (symbol-name key) "WRITER"))
                      (setq extra-defuns
-                           (cons `(defun ,val (nv obj) (set-slot-value obj ',sname nv))
+                           (cons (if *mvm-eval-runtime-p*
+                                     `(%install-accessor-dispatcher ',val ':writer)
+                                     `(defun ,val (nv obj) (%gf-dispatch ',val (list nv obj))))
                                  extra-defuns))
                      (setq extra-defuns
                            (cons `(%clos-maybe-accessor-method
                                    ',val ',class-name ',sname ':writer)
                                  extra-defuns)))
                     ((and (symbolp key) (string= (symbol-name key) "ACCESSOR"))
-                     ;; reader NAME + setter SET-NAME (what compiler.lisp's
-                     ;; SETF fallback emits for (setf (NAME obj) v)).
+                     ;; reader GF NAME + writer GF (SETF NAME), both as methods.
                      (setq extra-defuns
-                           (cons `(defun ,val (obj) (slot-value obj ',sname))
+                           (cons (if *mvm-eval-runtime-p*
+                                     `(%install-accessor-dispatcher ',val ':reader)
+                                     `(defun ,val (obj) (%gf-dispatch ',val (list obj))))
                                  extra-defuns))
                      (setq extra-defuns
                            (cons `(%clos-maybe-accessor-method
                                    ',val ',class-name ',sname ':reader)
                                  extra-defuns))
+                     (setq extra-defuns
+                           (cons (if *mvm-eval-runtime-p*
+                                     `(%install-accessor-dispatcher '(setf ,val) ':writer)
+                                     `(defun (setf ,val) (nv obj)
+                                        (%gf-dispatch '(setf ,val) (list nv obj))))
+                                 extra-defuns))
+                     (setq extra-defuns
+                           (cons `(%clos-maybe-accessor-method
+                                   '(setf ,val) ',class-name ',sname ':writer)
+                                 extra-defuns))
+                     ;; Legacy SET-NAME: what compiler.lisp's SETF fallback emits
+                     ;; for (setf (NAME obj) v) when no setf-function is known at
+                     ;; that compile point.  Forward to the (SETF NAME) GF.
                      (let ((set-name (intern (concatenate 'string "SET-"
                                                           (symbol-name val))
                                              (or (find-package "MODUS.MVM") *package*))))
                        (setq extra-defuns
-                             (cons `(defun ,set-name (obj nv)
-                                      (set-slot-value obj ',sname nv))
+                             (cons (if *mvm-eval-runtime-p*
+                                       `(%install-accessor-dispatcher ',set-name ':setter ',val)
+                                       `(defun ,set-name (obj nv)
+                                          (%gf-dispatch '(setf ,val) (list nv obj))))
                                    extra-defuns))))
                     ((and (symbolp key) (string= (symbol-name key) "INITARG"))
                      (setq initarg-pairs

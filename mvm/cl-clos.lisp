@@ -575,43 +575,53 @@
       (setq i (+ i 1)))
     new))
 
+(defun %install-accessor-dispatcher (name kind &optional gf-name)
+  "Runtime (mvm-eval) DEFCLASS accessor support: install a FIXED-ARITY
+   closure that dispatches the generic function NAME, and register it as a GF
+   stub.  KIND :reader -> (obj); :writer -> (nv obj); :setter -> the legacy
+   SET-NAME entry (obj nv) forwarding to the (SETF GF-NAME) generic function.
+   A closure, not an eval'd defun: no compile per accessor per class, and a
+   stable object the persistence trampoline never swaps out, so
+   (typep #'NAME 'generic-function) stays T.  The build-time expansion emits
+   a native DEFUN instead (baked direct calls must bind to something)."
+  (let ((fn (cond
+              ((eq kind ':reader) (lambda (obj) (%gf-dispatch name (list obj))))
+              ((eq kind ':writer) (lambda (nv obj) (%gf-dispatch name (list nv obj))))
+              (t (let ((target (list 'setf gf-name)))
+                   (lambda (obj nv) (%gf-dispatch target (list nv obj))))))))
+    (set-symbol-function name fn)
+    (when (consp name) (%install-setf-gf-alias name fn))
+    (unless (eq kind ':setter) (%register-gf-fn fn name))
+    fn))
+
 (defun %clos-maybe-accessor-method (fn-name class-name slot-name kind)
-  "DEFCLASS reader/writer/accessor support for names that are GENERIC
-   (CLHS 7.6.2: defclass :reader/:accessor/:writer define METHODS on the
-   generic function of that name).  Modus's DEFCLASS macro emits plain
-   accessor DEFUNs; when a DEFGENERIC of the same name exists (uiop's
-   idiom: (defgeneric component-name (component)) then (defclass component
-   … :accessor component-name) in the same with-upgradability block), the
-   defgeneric's dispatch-stub registration runs AFTER the module's
-   trampoline install and shadows the defun — every call then dispatched
-   an EMPTY GF (asdf register-system → component-name, gauntlet form 241).
-   Called from the DEFCLASS expansion at execution time: if a GF exists,
-   register the accessor as a method specialized on CLASS-NAME; else no-op
-   (the plain defun serves).  KIND :writer gets (new-value obj) params."
+  "DEFCLASS :reader/:writer/:accessor support (CLHS 7.6.2): the accessor is
+   a METHOD on the generic function FN-NAME, specialized on CLASS-NAME; the
+   GF is created (with the accessor's lambda list) when it does not exist.
+   FN-NAME is a symbol or a (SETF NAME) list.  KIND :writer gets
+   (new-value obj) params.  The DEFCLASS expansion emits the GF dispatcher
+   defun alongside this call, so both compiled direct calls and runtime
+   symbol calls dispatch -- two classes sharing an accessor name each get
+   their own method instead of colliding by last-defun-wins (task #278;
+   made structural while baking quicklisp)."
   (let ((gf (%find-gf fn-name)))
     (when (null gf)
-      ;; CLHS 7.6.2: accessors ARE methods on a (possibly implicitly
-      ;; created) generic function.  With only the plain defun, two
-      ;; classes sharing an accessor NAME hit last-defun-wins:
-      ;; quicklisp's RELEASE (:accessor name -> slot PROJECT-NAME) was
-      ;; shadowed by a later class's NAME accessor reading slot NAME ->
-      ;; "no slot named NAME in class RELEASE" (task #278).  Create the
-      ;; GF and install its dispatch stub (replacing the plain defun);
-      ;; every subsequent class's accessor adds its own method.
-      (%defgeneric fn-name (if (eq kind ':writer) '(nv obj) '(obj)) nil)
+      (let ((saved *gf-stub-reuse-fbound*))
+        (setq *gf-stub-reuse-fbound* t)
+        (%defgeneric fn-name (if (eq kind ':writer) '(nv obj) '(obj)) nil)
+        (setq *gf-stub-reuse-fbound* saved))
       (setq gf (%find-gf fn-name)))
     (when gf
-      ;; ALWAYS (re)install the dispatch stub: the DEFCLASS expansion
-      ;; emits the plain accessor DEFUN right before this call, so each
-      ;; new class's defun CLOBBERS the stub a previous class installed —
-      ;; (kname instance-of-first-class) then read the LAST class's slot
-      ;; ("no slot named SLOT-B in class KA" minimal repro, task #278).
-      (%gf-install-dispatch-stub fn-name)
       (if (eq kind ':writer)
           (%defmethod fn-name nil (list 't class-name)
                       (lambda (nv obj) (set-slot-value obj slot-name nv)))
           (%defmethod fn-name nil (list class-name)
-                      (lambda (obj) (slot-value obj slot-name))))))
+                      (lambda (obj) (slot-value obj slot-name))))
+      ;; The DEFCLASS expansion's dispatcher DEFUN (emitted just before this
+      ;; call) is the current definition; when the GF already existed no stub
+      ;; re-install happens, so register it here or (typep #'NAME
+      ;; 'generic-function) reads NIL for every class after the first.
+      (handler-case (%register-gf-fn (fdefinition fn-name) fn-name) (t (c) nil))))
   nil)
 
 (defun %clos-make-initform-thunk (f)
@@ -4315,8 +4325,15 @@
              ;; %lambda-list-has-rest-or-key, which also returns T for &optional)
              (variadic (or (> (nth 1 sh) 0) (nth 2 sh) (nth 3 sh)))
              (n (length args)))
-        (when (< n req) (%signal-program-error))
-        (when (and (not variadic) (> n req)) (%signal-program-error))))))
+        (when (or (< n req) (and (not variadic) (> n req)))
+          ;; %signal-program-error carries no message (it bypasses
+          ;; make-condition); say WHICH gf and the counts on the console first.
+          (write-string-serial "PROGRAM-ERROR: generic function ")
+          (write-string-serial (handler-case (princ-to-string (%gf-name gf)) (t (c) "?")))
+          (write-string-serial " called with ") (print-dec n)
+          (write-string-serial " args, lambda-list wants ") (print-dec req)
+          (write-char-serial 10)
+          (%signal-program-error))))))
 
 (defun %gf-dispatch (name args)
   "Dispatch generic function NAME with ARGS.
@@ -4419,6 +4436,12 @@
     (when entry
       (%find-gf (cdr entry)))))
 
+(defvar *gf-stub-reuse-fbound* nil
+  "When T, %make-gf-stub reuses an already-fbound definition of a symbol GF
+   name as the dispatch stub instead of eval'ing a fresh defun.  Set by
+   %clos-maybe-accessor-method, whose DEFCLASS expansion installs the
+   dispatcher just before creating the GF.")
+
 (defun %make-gf-stub (gf-name)
   "Build a runtime gf-dispatch closure that captures GF-NAME.  Returns
    a closure (subtag #x52) suitable for set-symbol-function.
@@ -4459,13 +4482,21 @@
       (let ((stub (lambda (&rest args) (%gf-dispatch gf-name args))))
         (%register-gf-fn stub gf-name)
         stub)
+      (if (and *gf-stub-reuse-fbound* (fboundp gf-name))
+          ;; DEFCLASS accessor path: the expansion already installed a
+          ;; (fixed-arity) dispatcher for GF-NAME -- reuse it rather than
+          ;; EVAL+JIT a redundant one per accessor per class (that eval made
+          ;; class-heavy loads ~4x slower: quicklisp's progress.lisp 8.6 s).
+          (let ((fn (fdefinition gf-name)))
+            (%register-gf-fn fn gf-name)
+            fn)
       (progn
         (eval (list (quote defun) gf-name (list (quote &rest) (quote %gfdsp-args))
                     (list (quote %gf-dispatch) (list (quote quote) gf-name)
                           (quote %gfdsp-args))))
         (let ((fn (symbol-function gf-name)))
           (%register-gf-fn fn gf-name)
-          fn))))
+          fn)))))
 
 ;;; ============================================================
 ;;; call-next-method / next-method-p

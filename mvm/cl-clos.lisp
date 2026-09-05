@@ -4326,7 +4326,10 @@
    CLHS 7.6.6.4 (the :around chain ordering is NOT affected)."
   (let ((gf (%find-gf name)))
     (when (null gf)
-      (error "undefined generic function"))
+      ;; Name it, like "no applicable method for generic function ~S" below:
+      ;; a bare "undefined generic function" is unactionable when a library
+      ;; defines dozens of GFs (found while baking the quicklisp client).
+      (error "undefined generic function ~S" name))
     ;; CLHS 7.6.4: validate the supplied arg count against the GF's
     ;; required-parameter count BEFORE method selection — too few/many
     ;; required args is a program-error, not a no-applicable-method.
@@ -4446,12 +4449,23 @@
   ;; the board's CLOS-heavy (cabstack) slowness.  The defun sets GF-NAME's
   ;; symbol-function itself; we return that fn (registered so
   ;; typep 'generic-function still holds).
-  (eval (list (quote defun) gf-name (list (quote &rest) (quote %gfdsp-args))
-              (list (quote %gf-dispatch) (list (quote quote) gf-name)
-                    (quote %gfdsp-args))))
-  (let ((fn (symbol-function gf-name)))
-    (%register-gf-fn fn gf-name)
-    fn))
+  ;; SETF-named GFs -- (setf preference), (setf documentation) -- keep the
+  ;; closure: a list is not a symbol, `(defun (setf x) ...)' registers under
+  ;; the normalized SETF-X key and SYMBOL-FUNCTION of the list then signals
+  ;; UNDEFINED-FUNCTION (SETF PREFERENCE), aborting the whole load that
+  ;; defined it.  Found baking quicklisp's dist.lisp; the native-defun fast
+  ;; path only ever mattered for the symbol case anyway.
+  (if (not (symbolp gf-name))
+      (let ((stub (lambda (&rest args) (%gf-dispatch gf-name args))))
+        (%register-gf-fn stub gf-name)
+        stub)
+      (progn
+        (eval (list (quote defun) gf-name (list (quote &rest) (quote %gfdsp-args))
+                    (list (quote %gf-dispatch) (list (quote quote) gf-name)
+                          (quote %gfdsp-args))))
+        (let ((fn (symbol-function gf-name)))
+          (%register-gf-fn fn gf-name)
+          fn))))
 
 ;;; ============================================================
 ;;; call-next-method / next-method-p

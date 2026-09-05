@@ -4393,9 +4393,22 @@
    so COMPUTE-APPLICABLE-METHODS / FIND-METHOD / ADD-METHOD /
    REMOVE-METHOD can resolve the dispatch closure back to its GF
    (defgeneric.35 / find-method.lsp etc.)."
-  (let ((stub (lambda (&rest args) (%gf-dispatch gf-name args))))
-    (%register-gf-fn stub gf-name)
-    stub))
+  ;; Install a NATIVE dispatch DEFUN (GF-NAME spliced as a LITERAL, exactly like
+  ;; the build-time DEFGENERIC expansion) rather than a capturing closure.  A
+  ;; closure callee cannot be baked by the JIT, so every call to a runtime GF
+  ;; paid ~9 us of per-call resolution -- HALF the dispatch cost, and 2x what a
+  ;; build-time GF costs (measured Pi5: `(mm x)` 18 us vs funcall-the-closure
+  ;; 9 us; a runtime DEFUN call is 0.09 us).  A native defun with the name as a
+  ;; literal resolves free, so this halves runtime-GF call cost -- the root of
+  ;; the board's CLOS-heavy (cabstack) slowness.  The defun sets GF-NAME's
+  ;; symbol-function itself; we return that fn (registered so
+  ;; typep 'generic-function still holds).
+  (eval (list (quote defun) gf-name (list (quote &rest) (quote %gfdsp-args))
+              (list (quote %gf-dispatch) (list (quote quote) gf-name)
+                    (quote %gfdsp-args))))
+  (let ((fn (symbol-function gf-name)))
+    (%register-gf-fn fn gf-name)
+    fn))
 
 ;;; ============================================================
 ;;; call-next-method / next-method-p

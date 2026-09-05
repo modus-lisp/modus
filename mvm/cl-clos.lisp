@@ -2242,6 +2242,24 @@
   "True iff SYM is a symbol whose name is NAME (case-sensitive)."
   (and (symbolp sym) (string= (symbol-name sym) name)))
 
+(defvar *ll-shape-memo* nil
+  "eq-hash memo: lambda-list object -> its parsed %lambda-list-shape.  A GF's
+   lambda-list is set once and never mutated, so caching by object identity
+   needs no invalidation (a redefined GF gets a fresh ll object -> fresh key).
+   %gf-check-arity + %gf-check-keys run on EVERY generic call and each re-parsed
+   the lambda-list (string= over the LL keywords) -- ~4 us/call on the Pi Zero
+   2 W, a big slice of the residual %gf-dispatch cost.")
+(defun %lambda-list-shape-cached (ll)
+  (if (null ll) nil
+      (progn
+        (when (null *ll-shape-memo*)
+          (setq *ll-shape-memo* (make-hash-table :test (function eq))))
+        (let ((hit (gethash ll *ll-shape-memo*)))
+          (if hit hit
+              (let ((sh (%lambda-list-shape ll)))
+                (puthash ll *ll-shape-memo* sh)
+                sh))))))
+
 (defun %lambda-list-shape (ll)
   "Return (req-count optional-count has-rest has-key has-allow-other-keys).
    Used for CLHS 7.6.4 method-vs-GF congruence checks."
@@ -3781,6 +3799,28 @@
 
 (defun %gf-dispatch-standard (gf args applicable)
   "Standard method combination: :around > :before + primary + :after."
+  ;; FAST PATH: one applicable PRIMARY method, no aux methods, no system
+  ;; default-primary to splice.  Skips the run-primary closure alloc +
+  ;; multiple-value-list of the general path; *%next-methods*=NIL so
+  ;; CALL-NEXT-METHOD errors correctly.  This is every single-method GF -- the
+  ;; pagetree/cabinet device layer.  Gated OFF when the GF has a default primary
+  ;; (then a lone user primary still needs the synthetic tail, CLHS 7.6.6.2).
+  (when (and (consp applicable)
+             (null (cdr applicable))
+             (null (%method-qualifier (car applicable)))
+             (not (%has-default-primary-p (%gf-name gf))))
+    (let ((m (car applicable))
+          (saved-gf *%current-gf*)
+          (saved-nm *%next-methods*)
+          (saved-args *%current-gf-args*))
+      (setq *%current-gf* gf)
+      (setq *%next-methods* nil)
+      (setq *%current-gf-args* args)
+      (return-from %gf-dispatch-standard
+        (multiple-value-prog1 (apply (%method-fn m) args)
+          (setq *%current-gf* saved-gf)
+          (setq *%next-methods* saved-nm)
+          (setq *%current-gf-args* saved-args)))))
   ;; Record the GF being dispatched so CALL-NEXT-METHOD can recompute the
   ;; applicable-method set on replacement args (CLHS 7.6.6.2).  Save/restore
   ;; for nested GF calls from within method bodies.
@@ -4142,7 +4182,7 @@
    (defgeneric.error.20/21)."
   (let ((ll (%gf-lambda-list gf)))
     (when ll
-      (let ((shape (%lambda-list-shape ll)))
+      (let ((shape (%lambda-list-shape-cached ll)))
         (when (and (nth 3 shape) (not (nth 4 shape)))
           ;; Skip required + optional args to reach the keyword portion.
           (let ((skip (+ (nth 0 shape) (nth 1 shape)))
@@ -4269,9 +4309,12 @@
    unknown)."
   (let ((ll (%gf-lambda-list gf)))
     (when ll
-      (let ((req (%lambda-list-required-count ll))
-            (variadic (%lambda-list-has-rest-or-key ll))
-            (n (length args)))
+      (let* ((sh (%lambda-list-shape-cached ll))
+             (req (nth 0 sh))
+             ;; variadic = &optional / &rest / &key present (matches the old
+             ;; %lambda-list-has-rest-or-key, which also returns T for &optional)
+             (variadic (or (> (nth 1 sh) 0) (nth 2 sh) (nth 3 sh)))
+             (n (length args)))
         (when (< n req) (%signal-program-error))
         (when (and (not variadic) (> n req)) (%signal-program-error))))))
 

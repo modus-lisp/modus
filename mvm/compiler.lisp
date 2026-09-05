@@ -12679,8 +12679,31 @@
   (and (fboundp (quote %generic-function-p))
        (symbolp name)
        (fboundp name)
-       (%generic-function-p (symbol-function name))
-       t))
+       (let ((memo (and (boundp (quote *e2-gf-name-memo*)) *e2-gf-name-memo*)))
+         (when (null memo)
+           (setq memo (make-hash-table :test (quote eq)))
+           (setq *e2-gf-name-memo* memo))
+         (let ((hit (gethash name memo)))
+           (cond
+             ((eq hit :yes) t)
+             ((eq hit :no) nil)
+             (t (let ((v (if (%generic-function-p (symbol-function name)) t nil)))
+                  (puthash name memo (if v :yes :no))
+                  v)))))))
+
+(defvar *e2-gf-name-memo* nil
+  "mvm-eval ONLY: memo for %e2-name-names-gf-p, keyed by function NAME.
+
+   WHY: %generic-function-p's third branch is `(member x *gf-stub-closures*)',
+   a LINEAR SCAN, and the check runs for EVERY `#'NAME' the compiler sees --
+   so every ORDINARY function reference paid a full scan.  Hosted hardware
+   absorbed it; a 1 GHz A53 did not (suspected cause of the Pi Zero 2 W load
+   slowdown).  %gf-p is NOT a valid substitute -- see the note above.
+
+   INVALIDATION: cl-clos.lisp clears this at the two points where the answer
+   can change -- when a named GF is created (*generic-functions*) and when a
+   stub is registered (%register-gf-fn) -- with a BOUNDP-guarded setq, so an
+   image whose defvars have not run is simply un-memoized rather than wrong.")
 
 (defun %e2-fn-in-module-p (name)
   "mvm-eval ONLY (see compile-function-ref): true if NAME (a string) names a

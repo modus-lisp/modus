@@ -2755,6 +2755,12 @@
          (when lambda-list
            (%gf-set-lambda-list gf lambda-list))
          (setq *generic-functions* (cons (cons name gf) *generic-functions*))
+         ;; A new named GF changes the answer %e2-name-names-gf-p memoized --
+         ;; but only for THIS name.  Nuking the whole table made the memo
+         ;; useless during a CLOS-heavy load (genera-shim registers constantly,
+         ;; so every sharp-quote fell back to the linear scan again).
+         (when (and (boundp (quote *e2-gf-name-memo*)) *e2-gf-name-memo*)
+           (remhash name *e2-gf-name-memo*))
          gf)))))
 
 ;; Make a method record: (qualifier specializer-list . fn)
@@ -4347,7 +4353,13 @@
    When GF-NAME is supplied (or recoverable from a closure's body),
    also record the fn → name mapping for reverse lookup."
   (unless (member val *gf-stub-closures*)
-    (setq *gf-stub-closures* (cons val *gf-stub-closures*)))
+    (setq *gf-stub-closures* (cons val *gf-stub-closures*))
+    ;; Same reason as the *generic-functions* site.  Only GF-NAME's entry can
+    ;; change; with no name we cannot be precise, so fall back to a full clear.
+    (when (and (boundp (quote *e2-gf-name-memo*)) *e2-gf-name-memo*)
+      (if gf-name
+          (remhash gf-name *e2-gf-name-memo*)
+          (setq *e2-gf-name-memo* nil))))
   (when gf-name
     (let ((existing (assoc val *gf-fn-to-name*)))
       (when (null existing)

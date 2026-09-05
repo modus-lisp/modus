@@ -970,7 +970,12 @@
     ;; %gc-read64/%gc-stack-base (from gc.lisp, already in *all-runtime-source*).
     ;; Other hosted builds adopt this toplevel by baking this file and calling
     ;; (cli-toplevel) from kernel-main.
-    (mvm-text "lib/cli-toplevel.lisp"))
+    (mvm-text "lib/cli-toplevel.lisp")
+    (string #\Newline)
+    ;; SAVE-AND-DIE: heap snapshot (save-and-die PATH) and the `--core PATH'
+    ;; restore kernel-main runs before boot init.  Hosted only: it is read(2)/
+    ;; write(2) over the fixed-address heap.
+    (mvm-text "lib/save-image.lisp"))
       ""))
 
 ;;; What the image actually bakes: libraries first, then platform.  Hosted
@@ -1090,6 +1095,17 @@
   ;; (aarch64 zeroes the runtime-metadata BSS slots and reserves the GC
   ;; object-start bitmap here; on x64 the boot preamble already did it).
   *cli-arch-kernel-prologue*
+  ;; SAVE-AND-DIE restore (lib/save-image.lisp).  `modus --core FILE ...' reads
+  ;; a heap snapshot IN PLACE OF the boot init below: the snapshot carries every
+  ;; table init-symbol-table onward would build, so it must land first, and the
+  ;; arch prologue above has already mapped this process's bitmaps.  Hosted only.
+  (if *cli-bare-metal* ""
+      "  (when (%core-requested-p)
+    (%restore-image)
+    (%core-post-restore)
+    (handler-case (cli-toplevel) (t (c) (sys-exit 1)))
+    (sys-exit 0))
+")
   ;; ---- SHARED boot init.  Identical on every arch, and the whole reason this
   ;; ---- file exists: task #245 (the missing (init-all-globals)) lived here.
   "  (init-symbol-table)

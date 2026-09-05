@@ -305,6 +305,14 @@
       (when (null args) (return nil))
       (let ((arg (car args)))
         (cond
+          ;; --core FILE: consumed by kernel-main BEFORE this toplevel ran (the
+          ;; snapshot restore, lib/save-image.lisp); only skip it here.  Anywhere
+          ;; but argv[1] it did nothing, so say so rather than run un-restored.
+          ((%cli-flag-p arg "--core")
+           (unless (%core-requested-p)
+             (%cli-line "Modus: --core must be the first argument")
+             (sys-exit 1))
+           (setq args (cddr args)))
           ;; --eval / -e FORM
           ((or (%cli-flag-p arg "--eval") (%cli-flag-p arg "-e"))
            (setq args (cdr args))

@@ -12,6 +12,15 @@
 ;;; ============================================================
 
 (defconstant +linux-aarch64-load-addr+ #x400000)
+(defconstant +linux-aarch64-fixed-heap-base+ #x2000000000
+  "Where the boot stub asks (MAP_FIXED_NOREPLACE) for the heap: above the
+   ELF's ~1 GB BSS tail (0x10000000 + heap size), far below the stack and the
+   default mmap area.  Every process getting the same base is what lets a
+   save-and-die snapshot restore in place (lib/save-image.lisp).")
+(defconstant +linux-aarch64-jit-arena-base+ #x3000000000
+  "Fixed RWX arena the %mmap-exec-page trap bump-allocates JIT pages (and the
+   GC bitmaps) from; see the stub.  Its bump word is 0x10000F58.")
+(defconstant +linux-aarch64-jit-arena-size+ #x20000000)   ; 512 MB of VA
 (defconstant +linux-aarch64-heap-addr+ #x10000000)
 (defconstant +linux-aarch64-heap-size+ #x38000000)   ; 896 MB
 (defconstant +linux-aarch64-heap-alloc-start+ #x200)
@@ -308,16 +317,55 @@
   ;;   x0=hint=0x10000000, x1=size, x2=PROT_RW(3), x3=MAP_PRIV|ANON(0x22),
   ;;   x4=-1, x5=0, x8=222(mmap).  SVC #0.
   (check-aarch64-gc-guard-invariant)
-  (emit-aarch64-load-imm64 buf 0 #x10000000)
+  ;; SAVE-AND-DIE (lib/save-image.lisp) needs the heap at the SAME address in
+  ;; every process, so a snapshot restores with no relocation.  First try
+  ;; MAP_FIXED_NOREPLACE (0x100000) at +linux-aarch64-fixed-heap-base+; if the
+  ;; kernel returns anything else (address taken, or a pre-4.17 kernel that
+  ;; ignores the flag and picks its own), fall through to the historical hint
+  ;; mmap.  Restore then refuses with `heap base differs' instead of guessing.
+  (emit-aarch64-load-imm64 buf 0 +linux-aarch64-fixed-heap-base+)
   (emit-aarch64-load-imm64 buf 1 +linux-aarch64-heap-size+)
   (emit-aarch64-load-imm64 buf 2 3)
-  (emit-aarch64-load-imm64 buf 3 #x22)
+  (emit-aarch64-load-imm64 buf 3 #x100022)   ; MAP_PRIV|ANON|FIXED_NOREPLACE
   (emit-aarch64-load-imm64 buf 4 #xFFFFFFFFFFFFFFFF)
   (emit-aarch64-load-imm64 buf 5 0)
   (emit-aarch64-load-imm64 buf 8 222)
   (emit-aarch64-u32 buf #xD4000001)   ; SVC #0
+  (emit-aarch64-load-imm64 buf 16 +linux-aarch64-fixed-heap-base+)
+  (emit-aarch64-u32 buf #xEB10001F)   ; CMP x0, x16
+  (let ((beq-at (a64-buffer-position buf)))
+    (emit-aarch64-u32 buf 0)          ; B.EQ <past the fallback>, patched below
+    (emit-aarch64-load-imm64 buf 0 #x10000000)
+    (emit-aarch64-load-imm64 buf 1 +linux-aarch64-heap-size+)
+    (emit-aarch64-load-imm64 buf 2 3)
+    (emit-aarch64-load-imm64 buf 3 #x22)
+    (emit-aarch64-load-imm64 buf 4 #xFFFFFFFFFFFFFFFF)
+    (emit-aarch64-load-imm64 buf 5 0)
+    (emit-aarch64-load-imm64 buf 8 222)
+    (emit-aarch64-u32 buf #xD4000001)   ; SVC #0
+    (setf (aref (a64-buffer-code buf) beq-at)
+          (logior #x54000000 (ash (- (a64-buffer-position buf) beq-at) 5))))
   ;; MOV x22, x0  (heap base → x22)
   (emit-aarch64-u32 buf #xAA0003F6)
+
+  ;; The JIT exec arena (SAVE-AND-DIE), AFTER x22 has the heap base (this block clobbers x0): one fixed RWX mapping the
+  ;; %mmap-exec-page trap bump-allocates from, so JIT pages and the GC bitmaps
+  ;; sit at the same addresses in every process.  Bump word at 0x10000F58 =
+  ;; arena base on success, 0 if the kernel refused (the trap then falls back
+  ;; to mmap(NULL)).  MAP_NORESERVE: it is address space, not memory.
+  (emit-aarch64-load-imm64 buf 0 +linux-aarch64-jit-arena-base+)
+  (emit-aarch64-load-imm64 buf 1 +linux-aarch64-jit-arena-size+)
+  (emit-aarch64-load-imm64 buf 2 7)          ; PROT_READ|WRITE|EXEC
+  (emit-aarch64-load-imm64 buf 3 #x104022)   ; PRIV|ANON|NORESERVE|FIXED_NOREPLACE
+  (emit-aarch64-load-imm64 buf 4 #xFFFFFFFFFFFFFFFF)
+  (emit-aarch64-load-imm64 buf 5 0)
+  (emit-aarch64-load-imm64 buf 8 222)
+  (emit-aarch64-u32 buf #xD4000001)   ; SVC #0
+  (emit-aarch64-load-imm64 buf 16 +linux-aarch64-jit-arena-base+)
+  (emit-aarch64-u32 buf #xEB10001F)   ; CMP x0, x16
+  (emit-aarch64-u32 buf #x9A9F0000)   ; CSEL x0, x0, xzr, EQ
+  (emit-aarch64-load-imm64 buf 17 #x10000F58)
+  (emit-aarch64-u32 buf #xF9000220)   ; STR x0, [x17]
 
   ;; Save argc/argv at heap base for Lisp reachability.
   ;; STR x19, [x22, #0]

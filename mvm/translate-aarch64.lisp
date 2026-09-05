@@ -2406,11 +2406,38 @@
                 (a64-lsl-imm buf +a64-x0+ +a64-x0+ 1))
                ((and *aarch64-linux-mode* (= code #x0531))
                 ;; %MMAP-EXEC-PAGE (WS4 JIT exec-memory primitive; arch-neutral
-                ;; trap — x64 uses the same #x0531).  mmap(NULL, size,
-                ;; PROT_RWX=7, MAP_PRIVATE|MAP_ANON=0x22, -1, 0).
-                ;; V0(x0)=size(tagged); result = address (tagged).  mmap = 222.
-                ;; Same shape as #x0504 (mmap-shared) but PROT_RWX + PRIVATE.
-                (a64-asr-imm buf +a64-x1+ +a64-x0+ 1)   ; x1 = size
+                ;; trap — x64 uses the same #x0531).  V0(x0)=size(tagged);
+                ;; result = address (tagged).
+                ;;
+                ;; SAVE-AND-DIE (lib/save-image.lisp): when the boot stub mapped
+                ;; the fixed RWX JIT arena, its bump word at 0x10000F58 is
+                ;; non-zero and pages are bump-allocated from it exactly like
+                ;; the bare-metal arm below — so every process puts its JIT
+                ;; pages (and the GC bitmaps, which come through this trap) at
+                ;; the same addresses, and a snapshot can carry [arena, bump)
+                ;; verbatim.  Bump word 0 (no arena: an older stub, or the
+                ;; kernel refused the fixed mapping) falls back to the
+                ;; historical mmap(NULL, size, PROT_RWX=7, MAP_PRIVATE|MAP_ANON
+                ;; =0x22, -1, 0); mmap = 222.
+                (a64-asr-imm buf +a64-x1+ +a64-x0+ 1)        ; x1 = size
+                (a64-add-imm buf +a64-x1+ +a64-x1+ 15)
+                (a64-lsr-imm buf +a64-x1+ +a64-x1+ 4)
+                (a64-lsl-imm buf +a64-x1+ +a64-x1+ 4)        ; 16-align size
+                (a64-load-imm64 buf +a64-x9+ #x10000F58)     ; x9  = &bump
+                (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0)  ; x10 = cur
+                (let ((cbz-at (a64-current-index buf)))
+                  (a64-emit buf 0)                           ; CBZ x10 -> fallback
+                  (a64-add-reg buf +a64-x12+ +a64-x10+ +a64-x1+ 0 0) ; new = cur+size
+                  (a64-str-unsigned buf +a64-x12+ +a64-x9+ 0)
+                  (a64-lsl-imm buf +a64-x0+ +a64-x10+ 1)     ; tagged result
+                  (let ((b-at (a64-current-index buf)))
+                    (a64-emit buf 0)                         ; B -> done
+                    (setf (aref (a64-buffer-code buf) cbz-at)
+                          (logior #xB4000000
+                                  (ash (- (a64-current-index buf) cbz-at) 5)
+                                  +a64-x10+))
+                    ;; fallback: x0 still holds the tagged size.
+                    (a64-asr-imm buf +a64-x1+ +a64-x0+ 1)   ; x1 = size
                 (a64-movz buf +a64-x0+ 0 0)             ; x0 = NULL
                 (a64-movz buf +a64-x2+ 7 0)             ; x2 = PROT_READ|WRITE|EXEC
                 (a64-movz buf +a64-x3+ #x22 0)          ; x3 = MAP_PRIVATE|MAP_ANON
@@ -2418,7 +2445,9 @@
                 (a64-movz buf +a64-x5+ 0 0)             ; x5 = offset
                 (a64-movz buf +a64-x8+ 222 0)
                 (a64-svc buf 0)
-                (a64-lsl-imm buf +a64-x0+ +a64-x0+ 1))  ; tag result
+                (a64-lsl-imm buf +a64-x0+ +a64-x0+ 1)  ; tag result
+                    (setf (aref (a64-buffer-code buf) b-at)
+                          (logior #x14000000 (- (a64-current-index buf) b-at))))))
                ((= code #x0531)
                 ;; BARE-METAL %MMAP-EXEC-PAGE: no mmap — bump-allocate from the
                 ;; reserved JIT code region [0x14000000, 0x18000000).  The

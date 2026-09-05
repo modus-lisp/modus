@@ -726,6 +726,9 @@
       (progn
         (%string-to-cstr path-str *cstr-scratch*)
         (%aarch64-openat *cstr-scratch* 0 0))))
+;; SAVE-AND-DIE (lib/save-image.lisp): open the core file by RAW path address,
+;; before any global or string exists.  Same openat shape as the block below.
+(defun %core-open-path-at (addr) (%aarch64-openat addr 0 0))
 (defun %sys-open-wronly (path-str)
   (if (%cab-on)
       (progn (%cab :create path-str) (%cab-fd-open path-str 0))

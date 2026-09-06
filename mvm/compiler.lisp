@@ -15573,22 +15573,37 @@
    Conclusion: the documented \"fn-addrs at vaddr ???05 misclassify
    as characters\" fragility class is structurally impossible — the
    OR-3 tagging guarantees fn low-nibble ≠ 5."
+  ;; STAY IN THE WORD DOMAIN END TO END.  (x & #xFF) == tag is computed as
+  ;; ((x & #xFF) ^ tag) == 0 with :test, NOT as :and followed by :cmp.  The
+  ;; native translators don't care, but mvm-interpret stores every register
+  ;; result as a VALUE (reg-set = %word->val): the raw low byte of an OBJECT
+  ;; pointer ends in the object tag nibble (…9), so after the :and the
+  ;; register held a fake object pointer near address 0xC0, and :cmp — which
+  ;; compares register VALUES and asks (integerp a) to support bignums —
+  ;; dereferenced it to read a subtag: SIGSEGV, surfacing as a bare
+  ;; SIMPLE-ERROR from `(characterp <any object>)' under the interpreter (JIT
+  ;; off — i.e. all of bare metal).  Fixnums masked to an even byte, conses to
+  ;; a …1 byte (never dereferenced), real characters to exactly 5, which is why
+  ;; only symbols/strings/vectors/floats tripped it.  :test consumes its
+  ;; operands as WORDS (reg-get) and only sets flags, so no raw word ever
+  ;; reaches a value-domain consumer.  This was what broke quicklisp's
+  ;; http.lisp: acase -> etypecase with a `character' clause -> (typep k
+  ;; 'character) -> this primop, at DEFINITION time of next-line-pos.
   (let ((true-label (make-compiler-label))
         (end-label (make-compiler-label))
-        (temp (alloc-temp-reg))
-        (temp2 (alloc-temp-reg)))
+        (temp (alloc-temp-reg)))
     (compile-form arg env dest)
     (emit-ir :li temp #xFF)
     (emit-ir :and dest dest temp)
-    (emit-ir :li temp2 +char-tag+)
-    (emit-ir :cmp dest temp2)
+    (emit-ir :li temp +char-tag+)
+    (emit-ir :xor dest dest temp)
+    (emit-ir :test dest dest)
     (emit-ir :beq true-label)
     (compile-nil dest)
     (emit-ir :br end-label)
     (emit-ir-label true-label)
     (compile-t dest)
     (emit-ir-label end-label)
-    (free-temp-reg)
     (free-temp-reg)))
 
 ;;; ============================================================

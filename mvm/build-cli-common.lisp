@@ -69,7 +69,8 @@
                   *cli-arch-kernel-prologue* *cli-arch-io-scratch-source*
                   *cli-arch-kernel-epilogue* *cli-arch-override-source*
                   *cli-bare-metal* *cli-bare-metal-tarball*
-                  *cli-bare-metal-net-source* *cli-omit-ansi-bridge*))
+                  *cli-bare-metal-net-source* *cli-omit-ansi-bridge*
+                  *cli-arch-core-resume*))
 
 ;;; BARE-METAL SEAM.  DEFVAR, so a wrapper that binds these BEFORE loading this
 ;;; file keeps its value and everything else defaults to the hosted behaviour —
@@ -102,6 +103,9 @@
 (defvar *cli-bare-metal* nil)
 (defvar *cli-bare-metal-tarball* nil)
 (defvar *cli-bare-metal-net-source* "")
+;;; SAVE-AND-DIE on bare metal: what a restored process runs INSTEAD of boot
+;;; init (its toplevel: serial REPL + halt).  "" = no bare-metal core support.
+(defvar *cli-arch-core-resume* "")
 
 ;;; BRING-UP CULL, not part of the bare-metal seam: T drops mvm/ansi-bridge.lisp
 ;;; (~1.7 MB of source -> ~3.5 MB of image) from *BRIDGE-SOURCE*.  It exists for
@@ -939,7 +943,13 @@
     (mvm-text "lib/tar.lisp")
     (string #\Newline)
     (%cli-strip-chipz (read-file-text (merge-pathnames "lib/install-tarball.lisp"
-                                                       *modus-base*))))
+                                                       *modus-base*)))
+    (string #\Newline)
+    ;; SAVE-AND-DIE: heap snapshot (save-and-die PATH) and the restore that
+    ;; kernel-main runs before boot init.  Lives here, not in the hosted layer,
+    ;; because the bare-metal Pi image is its whole point (docs/save-and-die.md);
+    ;; the arch slots supply the I/O seams (a file on Linux, a RAM range there).
+    (mvm-text "lib/save-image.lisp"))
       ""))
 
 ;;; THE HOSTED PLATFORM LAYER — Linux syscalls, hosted targets only.
@@ -970,12 +980,7 @@
     ;; %gc-read64/%gc-stack-base (from gc.lisp, already in *all-runtime-source*).
     ;; Other hosted builds adopt this toplevel by baking this file and calling
     ;; (cli-toplevel) from kernel-main.
-    (mvm-text "lib/cli-toplevel.lisp")
-    (string #\Newline)
-    ;; SAVE-AND-DIE: heap snapshot (save-and-die PATH) and the `--core PATH'
-    ;; restore kernel-main runs before boot init.  Hosted only: it is read(2)/
-    ;; write(2) over the fixed-address heap.
-    (mvm-text "lib/save-image.lisp"))
+    (mvm-text "lib/cli-toplevel.lisp"))
       ""))
 
 ;;; What the image actually bakes: libraries first, then platform.  Hosted
@@ -1099,13 +1104,21 @@
   ;; a heap snapshot IN PLACE OF the boot init below: the snapshot carries every
   ;; table init-symbol-table onward would build, so it must land first, and the
   ;; arch prologue above has already mapped this process's bitmaps.  Hosted only.
-  (if *cli-bare-metal* ""
-      "  (when (%core-requested-p)
+  (cond ((not *cli-bare-metal*)
+         "  (when (%core-requested-p)
     (%restore-image)
     (%core-post-restore)
     (handler-case (cli-toplevel) (t (c) (sys-exit 1)))
     (sys-exit 0))
 ")
+        ;; Bare metal: the core is a RAM range the boot loader placed; the
+        ;; arch says what a restored process runs instead of boot init.
+        ((string= *cli-arch-core-resume* "") "")
+        (t (concatenate 'string "  (when (%core-requested-p)
+    (%restore-image)
+    (%core-post-restore)
+" *cli-arch-core-resume* "    )
+")))
   ;; ---- SHARED boot init.  Identical on every arch, and the whole reason this
   ;; ---- file exists: task #245 (the missing (init-all-globals)) lived here.
   "  (init-symbol-table)

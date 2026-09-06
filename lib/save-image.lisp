@@ -27,10 +27,15 @@
 ;;;; JIT PAGES travel too: the stub maps one fixed RWX arena and the
 ;;;; %mmap-exec-page trap bump-allocates from it (bump word 0x10000F58), so
 ;;;; JIT'd code -- absolute addresses into the fixed image, the fixed heap and
-;;;; the arena itself -- is valid verbatim in the next process.  The GC bitmaps
-;;;; come through the same trap, so they are inside the arena and need no
-;;;; separate slices.  A process WITHOUT an arena (kernel refused the mapping)
-;;;; can still save with the JIT off, and refuses to save with it on.
+;;;; the arena itself -- is valid verbatim in the next process.  The bitmap
+;;;; slices are always written too: on hosted aarch64 they happen to sit inside
+;;;; the arena (redundant, harmless); on the Pi they are at their own fixed
+;;;; addresses.  A process WITHOUT an arena (kernel refused the mapping) can
+;;;; still save with the JIT off, and refuses to save with it on.
+;;;;
+;;;; BARE METAL has no file: the core is a RAM range (Pi: 0x18000000) that the
+;;;; boot loader places next to the kernel, and the seams below become word
+;;;; copies over a cursor -- see build-cl-repl-common.lisp.
 ;;;;
 ;;;; USE:
 ;;;;   modus --eval '(ql:quickload :sha1)' --eval '(save-and-die "ql.core")'
@@ -56,10 +61,39 @@
    +linux-aarch64-jit-arena-base+).  Arch builds without one override to 0."
   #x3000000000)
 
+(defun %core-jit-bump-slot ()
+  "Address of the arena's RAW bump word (the trap reads it).  Hosted aarch64:
+   0x10000F58; the Pi overrides to its own (%jit-exec-bump)."
+  #x10000F58)
+
 (defun %core-jit-arena-bump ()
   "Current bump pointer of the arena, or 0 when this process has none.  The
-   word at 0x10000F58 is RAW (the trap reads it), so the :u64 load is halved."
-  (* 2 (mem-ref #x10000F58 :u64)))
+   bump word is RAW, so the :u64 load is halved."
+  (* 2 (mem-ref (%core-jit-bump-slot) :u64)))
+
+(defun %core-jit-lossy-p ()
+  "True when a snapshot would silently drop live JIT code pages: the JIT is on
+   and produced pages the core cannot carry.  Hosted aarch64 carries them in
+   the fixed arena, so this is only true when the arena is absent (kernel
+   refused the fixed mapping).  Arches whose JIT emits no pages (bare aarch64
+   translates nothing) override this to NIL."
+  (and (%jit-enabled-p) (= (%core-jit-arena-bump) 0)))
+
+;;; ---- the I/O seams: a core is a FILE on Linux, a RAM range on bare metal --
+;;; `fd' is opaque to the shared code: a Linux descriptor here, the address of
+;;; a cursor word in the bare-metal overrides (build-cl-repl-common.lisp).
+
+(defun %core-open-out (path)
+  "Create the core sink for PATH; negative on failure."
+  (%sys-open-wronly path))
+
+(defun %core-open-in ()
+  "Open the core source for restore: argv[2], read through the raw pointer
+   the stub stored at heap-base+32 (STR x21,[x22,#32]) -- no string exists yet."
+  (%core-open-path-at (* 2 (mem-ref (+ (- (%gc-from-start) 512) 32) :u64))))
+
+(defun %core-close (fd)
+  (syscall3 3 fd 0 0))
 
 (defun %core-open-path-at (addr)
   "Open the NUL-terminated path at raw address ADDR for reading.  x86-64
@@ -111,8 +145,8 @@
    the 4 KB metadata window, the live heap range and the two bitmap slices.
    Returns the number of live heap bytes saved.  Refuses while the JIT is on
    (see the file header)."
-  (when (and (%jit-enabled-p) (= (%core-jit-arena-bump) 0))
-    (error "save-image: the JIT is on but this process has no fixed exec arena; (setq *use-jit* nil) before loading what you want baked"))
+  (when (%core-jit-lossy-p)
+    (error "save-image: the JIT produced code pages this process cannot snapshot (no fixed exec arena); (setq *use-jit* nil) before loading what you want baked"))
   (finish-output)
   (let* ((from (%gc-force-to-space-0))
          (free (get-alloc-ptr))
@@ -121,11 +155,9 @@
          (alo (%core-jit-arena-lo))
          (abump (%core-jit-arena-bump))
          (hdr *io-buf-addr*)
-         (fd (%sys-open-wronly path)))
+         (fd (%core-open-out path)))
     (when (< fd 0)
       (error "save-image: cannot create ~A" path))
-    ;; With an arena the bitmaps live inside it and travel with it.
-    (when (> abump 0) (setq blen 0))
     (setf (mem-ref hdr :u64) (%core-magic))
     (setf (mem-ref (+ hdr 8) :u64) from)
     (setf (mem-ref (+ hdr 16) :u64) (%gc-to-start))
@@ -143,7 +175,7 @@
     (%core-write-all fd (+ (%gc-cons-bitmap-base) boff) blen)
     (when (> abump 0)
       (%core-write-all fd alo (- abump alo)))
-    (%sys-close fd)
+    (%core-close fd)
     (- free from)))
 
 (defun save-and-die (path)
@@ -180,8 +212,7 @@
    for what is and is not restored.  Returns the restored allocation pointer."
   (let* ((from (%gc-from-start))
          (base (- from 512))                          ; heap-alloc-start
-         (argv2 (* 2 (mem-ref (+ base 32) :u64)))     ; stub: STR x21,[x22,#32]
-         (fd (%core-open-path-at argv2))
+         (fd (%core-open-in))
          (hdr (+ base 256))                           ; below from_start: never live
          (stage #x0FF00000))                          ; the io-buf BSS page
     (when (< fd 0) (%core-die "core: cannot open the core file"))
@@ -222,10 +253,14 @@
         ;; halved value so the machine word is the address) and an I-cache
         ;; invalidate over the code we just read in.
         (%core-slice fd alo (- abump alo))
-        (setf (mem-ref #x10000F58 :u64) (ash abump -1))
+        (setf (mem-ref (%core-jit-bump-slot) :u64) (ash abump -1))
         (%jit-icache-flush alo (- abump alo)))
-      (syscall3 3 fd 0 0)
+      ;; Publish the alloc pointer BEFORE anything that allocates -- %core-close
+      ;; prints CORE-END via print-dec, which conses; until this runs, the
+      ;; pointer is still the fresh boot's (heap base), so that string would
+      ;; land ON TOP of the just-restored data at the low heap and corrupt it.
       (set-alloc-ptr free)
+      (%core-close fd)
       free)))
 
 (defun %core-post-restore ()

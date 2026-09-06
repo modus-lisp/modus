@@ -416,6 +416,78 @@
 ;;; The parse is LAZY — first call, then cached (see lib/fdt.lisp's header for
 ;;; why boot time would be the wrong place, and for the full guard list).  This
 ;;; slot therefore contributes exactly one line of its own.
+;;; SAVE-AND-DIE on the Pi (lib/save-image.lisp, docs/save-and-die.md).  There
+;;; is no file: the core is the RAM range at +core-addr+ = 0x18000000 (free
+;;; DRAM above the JIT region, below the 448 MiB the board has), placed there
+;;; by the boot loader (U-Boot `tftpboot 0x18000000 ql.core', QEMU
+;;; `-device loader,file=…,addr=0x18000000') and detected by its magic word.
+;;; The shared code's `fd' is the address of a cursor word here; read/write
+;;; are 8-byte word copies (no allocation, exact bits — a u64 load/store pair
+;;; round-trips a tagged pointer), padded to 8 so every section starts
+;;; aligned.  The Pi's arena is the JIT region [%jit-exec-lo, bump) with the
+;;; bump word at %jit-exec-bump; the bitmaps are at their own fixed addresses
+;;; and travel as slices.  Saving ends with CORE-END=<addr> on serial so a
+;;; QEMU harness can dump exactly [0x18000000, addr) through the gdbstub.
+(defvar *cl-repl-rpi-core-source* "
+(defun %core-addr () #x18000000)
+(defun %core-cursor-slot () #x10000F60)
+(defun %core-requested-p ()
+  ;; The magic is a HEADER FIELD written with (setf (mem-ref .. :u64) magic),
+  ;; i.e. deposited as magic<<1, so read it the same halving way -- NOT the
+  ;; bit-exact %gc-read64 the raw cursor uses.
+  (= (mem-ref (%core-addr) :u64) (%core-magic)))
+(defun %core-open-in ()
+  (%gc-write64 (%core-cursor-slot) (%core-addr))
+  (%core-cursor-slot))
+(defun %core-open-out (path)
+  (%gc-write64 (%core-cursor-slot) (%core-addr))
+  (%core-cursor-slot))
+(defun %core-close (fd)
+  (write-string-serial \"CORE-END=\")
+  (print-dec (%gc-read64 fd))
+  (write-char-serial 10)
+  0)
+(defun %core-copy-words (dst src nbytes)
+  ;; Bit-EXACT 64-bit copy, NBYTES rounded up to 8.  Two :u32 halves, NOT one
+  ;; :u64: a :u64 load returns raw>>1 and a :u64 store writes value<<1, so a
+  ;; tagged pointer (odd low bits) loses its low bit and the whole heap
+  ;; corrupts.  A :u32 load's <<1 and a :u32 store's >>1 cancel, so the half
+  ;; round-trips exactly, and neither half ever materialises a >=2^62 word (no
+  ;; bignum, no allocation mid-restore).  The fd cursor is a RAW address word,
+  ;; so read it with %gc-read64, not mem-ref.
+  (let ((i 0) (padded (logand (+ nbytes 7) -8)))
+    (loop
+      (when (>= i padded) (return padded))
+      (setf (mem-ref (+ dst i) :u32)     (mem-ref (+ src i) :u32))
+      (setf (mem-ref (+ dst i 4) :u32)   (mem-ref (+ src i 4) :u32))
+      (setq i (+ i 8)))))
+(defun %core-read-all (fd addr len)
+  (let ((src (%gc-read64 fd)) (padded (logand (+ len 7) -8)))
+    (%core-copy-words addr src len)
+    (%gc-write64 fd (+ src padded))
+    len))
+(defun %core-write-all (fd addr len)
+  (let ((dst (%gc-read64 fd)) (padded (logand (+ len 7) -8)))
+    (%core-copy-words dst addr len)
+    (%gc-write64 fd (+ dst padded))
+    len))
+(defun %core-open-path-at (addr) -1)
+;; The bare-aa64 JIT translates nothing (263/263 fall back to the interpreter),
+;; so there are NO JIT code pages in the live heap to preserve, and the exec
+;; region's bump word is never initialised.  Report no arena: the conservative-
+;; root bitmaps (at their own fixed 0x05000000/0x05100000, NOT inside any arena)
+;; travel as slices through the shared save/restore path instead.
+;; No JIT arena is carried: the save session runs with the JIT off (bare-aa64
+;; translates nothing anyway), so heap fn objects are pure bytecode with no
+;; absolute code pointers into the exec region.  The conservative-root bitmaps
+;; (at 0x05000000/0x05100000, NOT in any arena) travel as slices.
+(defun %core-jit-arena-bump () 0)
+(defun %core-jit-lossy-p () nil)
+(defun %core-die (msg)
+  (write-string-serial msg) (write-char-serial 10) (halt))
+(defun %core-post-restore () nil)
+")
+
 (defvar *cli-arch-override-source*
   (if *cl-repl-x64-p*
       ;; x86 QEMU-pc: no device tree; nothing to read MODUS_* knobs from yet.
@@ -427,7 +499,12 @@
         (%rpi-mvm-text "lib/fdt.lisp")
         "
 (defun %cli-getenv (name) (%bootargs-lookup (%fdt-bootargs) name))
-")))
+"
+        (if *cl-repl-rpi-p* *cl-repl-rpi-core-source* ""))))
+
+
+
+
 
 ;;; DIVERGENCE 2 — WHO ZEROES THE BSS-EQUIVALENT SLOTS.
 ;;;
@@ -1531,6 +1608,20 @@
 ;;; ARCH SLOT: the toplevel entry / probe program.  The hosted CLIs hand off to
 ;;; cli-toplevel here; this image runs the same E2SMOKE self-check the bare ANSI
 ;;; gate runs, then the net pipeline, then the serial REPL.
+;;; What a restored Pi process runs instead of boot init: straight to the
+;;; toplevel the epilogue would have reached (no E2SMOKE; the net pipeline
+;;; only when the build auto-starts it).
+(defvar *cli-arch-core-resume*
+  (if *cl-repl-rpi-p*
+      (concatenate 'string
+        "    (write-string-serial \"CORE-RESTORED\") (write-char-serial 10)
+"       *net-pipeline-call*
+        "    (setq *use-jit* nil)
+    (handler-case (cl-serial-repl) (t (c) nil))
+    (halt)
+")
+      ""))
+
 (defvar *cli-arch-kernel-epilogue*
   (concatenate 'string "
   ;; --- in-image self-check ------------------------------------------------

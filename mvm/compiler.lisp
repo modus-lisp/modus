@@ -9702,12 +9702,34 @@
          (and (>= (length nm) 6)
               (string= nm "%CELL-" :end1 6)))))
 
+(defun %lambda-list-default-forms (params)
+  "Return the list of default / init expressions in a lambda-list: the CADR of
+   every (var init …) entry.  Covers &optional defaults, &key defaults (incl.
+   the ((:kw var) init) shape — CADR is still the init), and &aux inits.  These
+   forms can reference enclosing lexicals, so a FLET/LABELS whose local fn has
+   such a default needs closure semantics just as much as one whose body does."
+  (let ((result nil))
+    (dolist (p params)
+      (when (and (consp p) (consp (cdr p)))
+        (push (cadr p) result)))
+    (nreverse result)))
+
 (defun %flet-functions-capture-vars-p (defs env)
-  "Return T if any function body in DEFS references a variable bound in
-   ENV's chain — the FLET/LABELS needs closure semantics so the captured
-   value reaches the local function.  Skips function-name refs (mutual
-   recursion targets) by walking only variable refs via
+  "Return T if any function body OR lambda-list default in DEFS references a
+   variable bound in ENV's chain — the FLET/LABELS needs closure semantics so
+   the captured value reaches the local function.  Skips function-name refs
+   (mutual recursion targets) by walking only variable refs via
    %collect-free-vars.
+
+   The DEFAULT scan is not optional: the non-capture path compiles each local
+   function as a standalone GLOBAL function, so an &optional/&key default that
+   names an enclosing lexical compiled as a global symbol-value read — NIL for
+   any lexical — while a bare (lambda (&optional (i v)) …) captured it
+   correctly.  `(defun r (v) (labels ((f (&optional (i v)) i)) (f)))' returned
+   NIL instead of V; it drives quicklisp http.lisp's NEXT-LINE-POS /
+   PROCESS-HEADER.  All param names are excluded from the default scan, so a
+   default that references an EARLIER parameter (CLHS 3.4.1) is not mistaken
+   for an outer capture.
 
    HISTORY (2026-06-10, probes 9864/9867): this used to fire ONLY for
    %CELL- prefixed vars (cell-rewrite artifacts), on the theory that
@@ -9726,8 +9748,12 @@
       (when (and (consp def) (consp (cdr def)))
         (let* ((fparams (cadr def))
                (param-names (%extract-lambda-param-names fparams))
-               (free (%collect-free-vars-list (cddr def) param-names env nil)))
-          (when free
+               (free (%collect-free-vars-list (cddr def) param-names env nil))
+               (dflt-free (unless free
+                            (%collect-free-vars-list
+                             (%lambda-list-default-forms fparams)
+                             param-names env nil))))
+          (when (or free dflt-free)
             (setq any-captures t)))))
     any-captures))
 

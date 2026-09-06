@@ -175,6 +175,17 @@ The rig: `/home/claude/cabfs/core/t1.sh` (trivial save/restore) and `t2.sh`
 
 ## The board
 
+**★ VALIDATED ON REAL SILICON (Pi Zero 2 W, 2026-09-06):** produced a core
+under QEMU from the exact chainload board binary (trampoline at 0x80000 jumps
+to the image at 0x300000; the board build talks to the mini-UART, which
+qemu-system-aarch64 `-M raspi3b` maps to its SECOND `-serial`), then netbooted
+kernel+core to the board (U-Boot `tftpboot 0x18000000 ql.core; tftpboot
+0x300000 kernel; go 0x300000`, scripts/netboot-core.py).  The board printed
+`MODUS-CL` then `CORE-RESTORED` (restore before boot init -- no E2SMOKE, no
+reload) and evaluated the restored CLOS surface: `(dist2 *p*)`=>25,
+`(px *p*)`=>3, and dispatch on a NEW instance of the restored class
+`(dist2 (make-instance 'pt :x 6 :y 8))`=>100.
+
 **Validated under QEMU `-M raspi3b` (fa9fa1e):** a core carrying a defvar, a
 defun, a defclass with accessors, a defmethod, a macro and an instance
 restores in ~2 s (vs ~30 s normal boot) and every form evaluates correctly at

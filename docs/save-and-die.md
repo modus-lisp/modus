@@ -150,7 +150,20 @@ The rig: `/home/claude/cabfs/core/t1.sh` (trivial save/restore) and `t2.sh`
   fault is a silent spin, not a SIGSEGV — attach `gdb-multiarch` AFTER the
   `!!FAULT` line prints and dump memory from the spinning guest.
 
-## Found on the way (open)
+## Found on the way (items 1 and 2 FIXED on 2026-09-06)
+
+**Resolution.**  Item 1 (the FLET/LABELS default-capture) is fixed in
+307b253 (`%flet-functions-capture-vars-p` now also scans lambda-list
+defaults; acceptance gate NET=0).  Item 2 turned out to be a second, unrelated
+bug, fixed in 3c6023f: `compile-characterp` emitted `:and #xFF; :cmp 5`, and
+under `mvm-interpret` — which stores every result as a VALUE — an object
+pointer's masked low byte (`…9`, the object tag nibble) became a fake object
+pointer that `:cmp`'s `integerp` dereferenced (SIGSEGV → bare SIMPLE-ERROR).
+Only JIT-off, i.e. all of bare metal; it broke quicklisp's `acase` → `etypecase`
+with a `character` clause.  Now `((x & #xFF) ^ 5) == 0` via `:xor` + `:test`
+stays in the word domain.  With both fixes the `http.lisp` walk defines all 89
+forms with no failures.  Rule: never hand a word-domain intermediate to a
+value-domain op under the interpreter.  The original notes follow.
 
 1. **Compiler bug, every arch, JIT on or off:** a `labels`/`flet` local
    function whose `&optional`/`&key` *default* references an enclosing lexical

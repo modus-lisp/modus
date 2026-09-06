@@ -186,6 +186,17 @@ reload) and evaluated the restored CLOS surface: `(dist2 *p*)`=>25,
 `(px *p*)`=>3, and dispatch on a NEW instance of the restored class
 `(dist2 (make-instance 'pt :x 6 :y 8))`=>100.
 
+**★★ REAL LIBRARY ON REAL SILICON (2026-09-06):** alexandria installed from
+its tarball (the exact `alexandria.tar` the board loads over its own network,
+placed in RAM under QEMU at 0x1A000000 and fed to `install-tarball-from-bytes`)
+into a 6.4 MB core, netbooted to the board.  The board printed `CORE-RESTORED`
+and alexandria was live with NO reinstall: `(find-package "ALEXANDRIA")`=>1,
+`(alexandria:flatten '(1 (2 (3 4)) 5))`=>(1 2 3 4 5), `(alexandria:iota 6)`=>
+(0 1 2 3 4 5).  The install itself took 325 s interpreted under TCG; from the
+core it is seconds.  This is the "quickload in seconds" payoff via the tarball
+path (ql:quickload's own client is still blocked by the http.lisp compiler bug
+below).
+
 **Validated under QEMU `-M raspi3b` (fa9fa1e):** a core carrying a defvar, a
 defun, a defclass with accessors, a defmethod, a macro and an instance
 restores in ~2 s (vs ~30 s normal boot) and every form evaluates correctly at

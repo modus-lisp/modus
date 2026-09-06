@@ -1,8 +1,9 @@
 # save-and-die: heap snapshots for Modus
 
-Written 2026-09-06, the day after the first working core.  Status: **landed
-for the hosted Linux/AArch64 CLI** (commit a6085d2); x64 and the Pi Zero 2 W
-board are the loose ends listed at the bottom, in priority order.
+Written 2026-09-06.  Status: **landed for the hosted Linux/AArch64 CLI**
+(a6085d2) **and for the bare-metal Pi image, validated under QEMU raspi3b**
+(fa9fa1e).  The remaining loose ends are the real board (the RAM-core
+round-trip) and x64 stub parity, at the bottom.
 
 ## Why
 
@@ -131,6 +132,23 @@ The rig: `/home/claude/cabfs/core/t1.sh` (trivial save/restore) and `t2.sh`
   after `MOV x22, x0` captures the heap base.  Getting that wrong pointed the
   heap registers at the arena and died on a NULL `car` — `gdb-multiarch` on
   `qemu-aarch64-static -g` read it off x22 in one shot.
+- **The RAM copy MUST be bit-exact (bare metal).**  `mem-ref :u64` type-puns
+  the tagged word: a fixnum loads>>1 / stores<<1, a pointer keeps its low tag
+  bits.  A `:u64` word-copy therefore loses the low bit of every tagged
+  pointer and corrupts the whole heap.  Copy two `:u32` halves instead (the
+  load's `<<1` and store's `>>1` cancel, exact, and no `>=2^62` word is ever
+  materialised so it never conses); use `%gc-read64`/`%gc-write64` for the raw
+  cursor word.  The header round-trips regardless because it is written and
+  read through the same `mem-ref` on both sides.
+- **Publish the alloc pointer before ANYTHING conses (bare metal).**
+  `%core-close` prints `CORE-END=` via `print-dec`, which allocates; if that
+  runs before `(set-alloc-ptr free)`, the alloc pointer is still the fresh
+  boot's (heap base) and the string lands on the just-restored globals table,
+  so the next global read faults in `%gv-cell`.  Symptom that pinned it:
+  offline the core's bucket vector was intact, but the LIVE restored heap had
+  fresh objects sitting exactly where the vector should be.  On bare metal a
+  fault is a silent spin, not a SIGSEGV — attach `gdb-multiarch` AFTER the
+  `!!FAULT` line prints and dump memory from the spinning guest.
 
 ## Found on the way (open)
 
@@ -157,6 +175,14 @@ The rig: `/home/claude/cabfs/core/t1.sh` (trivial save/restore) and `t2.sh`
 
 ## The board
 
+**Validated under QEMU `-M raspi3b` (fa9fa1e):** a core carrying a defvar, a
+defun, a defclass with accessors, a defmethod, a macro and an instance
+restores in ~2 s (vs ~30 s normal boot) and every form evaluates correctly at
+the REPL, including method dispatch on a NEW instance of the restored class
+(5^2+12^2 = 169).  Two bare-metal bugs were fixed getting there — see
+"Things that will bite".  What remains is the RAM-core round-trip on real
+silicon.
+
 The bare-metal Pi image already has both fixed regions the model needs —
 that is why this design was chosen over relocation:
 
@@ -171,12 +197,21 @@ that is why this design was chosen over relocation:
 
 Plan, in order:
 
-1. **Deliver the core with the kernel.**  No filesystem exists at restore
-   time, so the core is a second TFTP file: `tftpboot 0x18000000 ql.core`
-   before `tftpboot 0x300000 modus.img; go 0x300000`.  The board build's
-   restore reads from that address instead of `read(2)` — the only arch slot
-   that changes is `%core-slice` (a copy loop) and "is a core present" (magic
-   at `0x18000000`) in place of `--core`.
+1. **Deliver the core with the kernel** — DONE in the image.  No filesystem
+   exists at restore time, so the core is a second TFTP file: `tftpboot
+   0x18000000 ql.core` before `tftpboot 0x300000 modus.img; go 0x300000`.  The
+   board build reads from that address instead of `read(2)`; the arch slots
+   (`%core-open-in`/`%core-read-all`/`%core-copy-words`, `%core-requested-p`
+   on the magic at `0x18000000`) are in build-cl-repl-common.lisp.
+
+   **THE OPEN PROBLEM: getting the core OFF the board as a file to TFTP back.**
+   `save-and-die` writes the core to `0x18000000` in RAM and halts; there is
+   no gdbstub on real silicon to dump it (that is how QEMU validation cheats).
+   Candidate: after `%save-image` writes `[0x18000000, end)`, DON'T halt —
+   stream that RAM range to modus-pi over the board's own TCP/HTTP stack (a
+   POST, or a raw send), and modus-pi saves it as `ql.core`.  Then netboot
+   again with it.  A "dump a RAM range over the network" form is the one new
+   piece; the send path is the same one `net-install-and-call` fetches over.
 2. **Save on the board's geometry.**  A core must match the image that
    restores it, so the saving run is the *board image* itself: boot, load the
    client from the tarball path (the one command that already works on

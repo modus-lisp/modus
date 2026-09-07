@@ -59,6 +59,34 @@
 ;; and real Pi Zero 2 W hardware does not.
 (setf *aarch64-serial-rx-poll* '(#x14 0 :tbz))
 
+;; TURNKEY SSH KEY: when MODUS_SSH_AUTH_KEY_HEX is set (64 hex chars = the raw
+;; 32-byte Ed25519 public key), bake it as the server's single authorized key
+;; and enable real public-key auth in net/ssh.lisp (ssh-handle-userauth).  The
+;; key bytes go to e1000-state-base+0x750 (little-endian u32s, matching the
+;; host-key baking) and the enable flag to +0x770.  Unset => the image keeps
+;; its legacy "accept any" behavior and is byte-identical to before.
+;; scripts/build-turnkey-ssh.sh derives the hex from an `ssh-ed25519' pubkey.
+(defvar *auth-key-source*
+  (let ((hex (sb-ext:posix-getenv "MODUS_SSH_AUTH_KEY_HEX")))
+    (if (and hex (= (length hex) 64))
+        (let ((bytes (make-array 32)))
+          (dotimes (i 32)
+            (setf (aref bytes i)
+                  (parse-integer hex :start (* i 2) :end (+ (* i 2) 2) :radix 16)))
+          (with-output-to-string (s)
+            (format s "  (let ((state (e1000-state-base)))~%")
+            (dotimes (j 8)
+              (let ((w (logior (aref bytes (* j 4))
+                               (ash (aref bytes (+ (* j 4) 1)) 8)
+                               (ash (aref bytes (+ (* j 4) 2)) 16)
+                               (ash (aref bytes (+ (* j 4) 3)) 24))))
+                (format s "    (setf (mem-ref (+ state #x~X) :u32) #x~X)~%"
+                        (+ #x750 (* j 4)) w)))
+            (format s "    (setf (mem-ref (+ state #x770) :u32) 1))")))
+        "")))
+(when (plusp (length *auth-key-source*))
+  (format t "Baking authorized SSH key (real Ed25519 pubkey auth enabled)~%"))
+
 (let* ((ssh-main (format nil "~{~A~%~}"
                         (list
                          "(defun kernel-main ()"
@@ -124,6 +152,9 @@
                          "    (setf (mem-ref (+ state #x74C) :u32) #x29DA598B)"
                          "    (setf (mem-ref (+ state #x624) :u32) 1))"
                          "  (%serial-byte 91) (%serial-byte 57) (%serial-byte 93)"
+                         ;; Authorized SSH client key (empty string unless
+                         ;; MODUS_SSH_AUTH_KEY_HEX was set for this build).
+                         *auth-key-source*
                          ;; Pre-compute ed25519 host key derivatives (s, prefix)
                          ;; This saves ~5s of crypto during SSH key exchange
                          "  (pre-compute-host-sign)"

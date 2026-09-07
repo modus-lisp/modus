@@ -754,6 +754,101 @@
       (aset reply (+ (+ 9 algo-len) i) (aref pk i)))
     (ssh-send-payload ssh reply (array-length reply))))
 
+;; ================================================================
+;; Public-key authentication (real Ed25519 verification)
+;; ================================================================
+;; The authorized public key (32 raw bytes) and an enable flag are baked into
+;; fixed GLOBAL memory by the build (mvm/build-pizero2w-ssh.lisp), just past
+;; the host key (host privkey +0x710, host pubkey +0x730):
+;;   +0x750: authorized-key(32)   +0x770: auth-enabled flag(u32)
+;; Flag 0 => legacy "accept any" behavior (unchanged).  Flag 1 => only a
+;; `publickey' request whose key MATCHES the baked key AND whose signature
+;; VERIFIES is accepted; none/password are rejected.
+(defun ssh-auth-key-addr () (+ (e1000-state-base) #x750))
+(defun ssh-auth-enabled-p ()
+  (not (zerop (mem-ref (+ (e1000-state-base) #x770) :u32))))
+
+;; Send SSH_MSG_USERAUTH_FAILURE advertising "publickey" as the only method
+;; (partial-success = FALSE), so the client retries with its key rather than
+;; falling back to none/password.
+(defun ssh-send-auth-failure (ssh)
+  (let ((reply (make-array 15)))
+    (aset reply 0 51)         ; SSH_MSG_USERAUTH_FAILURE
+    (ssh-put-u32 reply 1 9)   ; name-list length = "publickey"
+    (aset reply 5 112) (aset reply 6 117) (aset reply 7 98)  (aset reply 8 108)   ; publ
+    (aset reply 9 105) (aset reply 10 99) (aset reply 11 107)                     ; ic k
+    (aset reply 12 101) (aset reply 13 121)                                       ; ey
+    (aset reply 14 0)        ; partial success = FALSE
+    (ssh-send-payload ssh reply 15)))
+
+;; Raw 32-byte Ed25519 key inside an SSH publickey blob:
+;;   string("ssh-ed25519")  = u32(11) + 11 bytes  (offsets 0..14)
+;;   string(key)            = u32(32) + 32 bytes   (key begins at offset 19)
+;; T iff those 32 bytes equal the baked authorized key.
+(defun ssh-key-authorized-p (pk-blob pklen)
+  (if (< pklen 51)
+      ()
+      (let ((base (ssh-auth-key-addr)) (ok 1) (i 0))
+        (loop
+          (if (>= i 32)
+              (return (not (zerop ok)))
+              (progn
+                (unless (eq (aref pk-blob (+ 19 i)) (mem-ref (+ base i) :u8))
+                  (setq ok 0))
+                (setq i (+ i 1))))))))
+
+;; Extract the 64-byte Ed25519 signature from the payload's signature field at
+;; OFF: string( string("ssh-ed25519") + string(64-byte-sig) ).  NIL if malformed.
+(defun ssh-extract-ed25519-sig (payload off)
+  (let ((o (+ off 4)))                  ; skip outer sig-blob length
+    (let ((alen (ssh-get-u32 payload o)))
+      (setq o (+ o 4 alen))             ; skip string("ssh-ed25519")
+      (let ((siglen (ssh-get-u32 payload o)))
+        (setq o (+ o 4))
+        (if (eq siglen 64)
+            (let ((sig (make-array 64)) (i 0))
+              (loop
+                (if (>= i 64)
+                    (return sig)
+                    (progn (aset sig i (aref payload (+ o i))) (setq i (+ i 1))))))
+            ())))))
+
+;; Rebuild the RFC 4252 §7 signed data:
+;;   string(session_id) byte(50) string(user) string(service)
+;;   string("publickey") boolean(1) string(algo) string(pk-blob)
+;; session_id is the 32 bytes at ssh+0x030.
+(defun ssh-build-userauth-signed (ssh user ulen svc slen algo alen pkb pklen)
+  (let ((total (+ (+ 4 32) 1 (+ 4 ulen) (+ 4 slen) (+ 4 9) 1 (+ 4 alen) (+ 4 pklen)))
+        (o 0))
+    (let ((b (make-array total)))
+      ;; session id
+      (ssh-put-u32 b 0 32) (setq o 4)
+      (let ((i 0)) (loop (if (>= i 32) (return ())
+                             (progn (aset b (+ o i) (mem-ref (+ ssh #x30 i) :u8)) (setq i (+ i 1))))))
+      (setq o (+ o 32))
+      ;; SSH_MSG_USERAUTH_REQUEST
+      (aset b o 50) (setq o (+ o 1))
+      ;; user
+      (ssh-put-u32 b o ulen) (setq o (+ o 4))
+      (let ((i 0)) (loop (if (>= i ulen) (return ()) (progn (aset b (+ o i) (aref user i)) (setq i (+ i 1)))))) (setq o (+ o ulen))
+      ;; service
+      (ssh-put-u32 b o slen) (setq o (+ o 4))
+      (let ((i 0)) (loop (if (>= i slen) (return ()) (progn (aset b (+ o i) (aref svc i)) (setq i (+ i 1)))))) (setq o (+ o slen))
+      ;; "publickey"
+      (ssh-put-u32 b o 9) (setq o (+ o 4))
+      (aset b o 112) (aset b (+ o 1) 117) (aset b (+ o 2) 98) (aset b (+ o 3) 108)
+      (aset b (+ o 4) 105) (aset b (+ o 5) 99) (aset b (+ o 6) 107) (aset b (+ o 7) 101) (aset b (+ o 8) 121)
+      (setq o (+ o 9))
+      ;; boolean TRUE
+      (aset b o 1) (setq o (+ o 1))
+      ;; algo
+      (ssh-put-u32 b o alen) (setq o (+ o 4))
+      (let ((i 0)) (loop (if (>= i alen) (return ()) (progn (aset b (+ o i) (aref algo i)) (setq i (+ i 1)))))) (setq o (+ o alen))
+      ;; pk-blob
+      (ssh-put-u32 b o pklen) (setq o (+ o 4))
+      (let ((i 0)) (loop (if (>= i pklen) (return ()) (progn (aset b (+ o i) (aref pkb i)) (setq i (+ i 1)))))) (setq o (+ o pklen))
+      b)))
+
 ;; Send CHANNEL_OPEN_CONFIRM
 (defun ssh-send-channel-confirm (ssh cli-chan srv-chan)
   (let ((reply (make-array 17)))
@@ -926,22 +1021,41 @@
                                                                   ()
                                                                   ())))))))))))))))))))))))
 
+;; Second pass of publickey auth WITH a baked key: verify the signature over
+;; the reconstructed RFC 4252 §7 blob, against the (already key-matched) baked
+;; authorized key.  SIGOFF is the payload offset of the signature field.
+(defun ssh-userauth-verify (ssh payload sigoff uoff ulen soff slen algo alen pk-blob pklen)
+  (let ((sig (ssh-extract-ed25519-sig payload sigoff)))
+    (if (null sig)
+        (ssh-send-auth-failure ssh)
+        (let ((user (make-array ulen))
+              (svc (make-array slen)))
+          (dotimes (i ulen) (aset user i (aref payload (+ uoff i))))
+          (dotimes (i slen) (aset svc i (aref payload (+ soff i))))
+          (let ((signed (ssh-build-userauth-signed ssh user ulen svc slen algo alen pk-blob pklen))
+                (authkey (make-array 32)))
+            (ssh-mem-load authkey (ssh-auth-key-addr) 32)
+            (if (ed25519-verify authkey sig signed (array-length signed))
+                (progn
+                  (ssh-send-auth-success ssh)
+                  (setf (mem-ref (+ ssh #x10) :u32) 1))
+                (ssh-send-auth-failure ssh)))))))
+
 ;; Handle USERAUTH_REQUEST
 (defun ssh-handle-userauth (ssh payload plen)
-  ;; Parse: username(string) + service(string) + method(string) + ...
+  ;; Parse: byte(50) username(string) service(string) method(string) ...
   (let ((off 1))
-    ;; Skip username
     (let ((ulen (ssh-get-u32 payload off)))
-      (setq off (+ off 4 ulen))
-      ;; Skip service name
-      (let ((slen (ssh-get-u32 payload off)))
-        (setq off (+ off 4 slen))
-        ;; Method name
-        (let ((mlen (ssh-get-u32 payload off)))
-          (setq off (+ off 4))
-          ;; Check if method is "publickey" (9 bytes)
-          (if (eq mlen 9)
-              (if (eq (aref payload off) 112) ; 'p'ublickey
+      (let ((uoff (+ off 4)))
+        (setq off (+ off 4 ulen))
+        (let ((slen (ssh-get-u32 payload off)))
+          (let ((soff (+ off 4)))
+            (setq off (+ off 4 slen))
+            ;; Method name
+            (let ((mlen (ssh-get-u32 payload off)))
+              (setq off (+ off 4))
+              ;; publickey?  (method == "publickey", 9 bytes, first char 'p')
+              (if (and (eq mlen 9) (eq (aref payload off) 112))
                   (progn
                     (setq off (+ off mlen))
                     ;; has-signature boolean
@@ -960,20 +1074,25 @@
                             (let ((pk-blob (make-array pklen)))
                               (dotimes (i pklen)
                                 (aset pk-blob i (aref payload (+ off i))))
-                              (setq off (+ off pklen))
-                              (if (zerop has-sig)
-                                  ;; First pass: send PK_OK
-                                  (ssh-send-auth-pk-ok ssh algo alen pk-blob pklen)
-                                  ;; Second pass: verify signature and accept
-                                  (progn
-                                    (ssh-send-auth-success ssh)
-                                    (setf (mem-ref (+ ssh #x10) :u32) 1)
-                                    ;; Send welcome banner via channel data later
-                                    ))))))))
-                  ;; Not publickey method
-                  (ssh-send-auth-success ssh))
-              ;; Accept any method for simplicity
-              (ssh-send-auth-success ssh)))))))
+                              (setq off (+ off pklen))  ; off now = signature field
+                              (if (ssh-auth-enabled-p)
+                                  ;; ENFORCE: key must match; 2nd pass must verify
+                                  (if (ssh-key-authorized-p pk-blob pklen)
+                                      (if (zerop has-sig)
+                                          (ssh-send-auth-pk-ok ssh algo alen pk-blob pklen)
+                                          (ssh-userauth-verify ssh payload off uoff ulen soff slen
+                                                               algo alen pk-blob pklen))
+                                      (ssh-send-auth-failure ssh))
+                                  ;; LEGACY (no key baked): accept, unchanged
+                                  (if (zerop has-sig)
+                                      (ssh-send-auth-pk-ok ssh algo alen pk-blob pklen)
+                                      (progn
+                                        (ssh-send-auth-success ssh)
+                                        (setf (mem-ref (+ ssh #x10) :u32) 1))))))))))
+                  ;; Not publickey: reject when a key is baked, else accept.
+                  (if (ssh-auth-enabled-p)
+                      (ssh-send-auth-failure ssh)
+                      (ssh-send-auth-success ssh))))))))))
 
 ;; Handle Ctrl-D: send Bye, channel EOF, channel CLOSE
 (defun ssh-handle-ctrl-d (ssh)

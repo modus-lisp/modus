@@ -499,6 +499,20 @@
         (%rpi-mvm-text "lib/fdt.lisp")
         "
 (defun %cli-getenv (name) (%bootargs-lookup (%fdt-bootargs) name))
+;;; THE CLOCK ON BARE METAL.  ansi-bridge.lisp's GET-INTERNAL-REAL-TIME and
+;;; GET-UNIVERSAL-TIME wrap a Linux syscall in a handler-case, expecting the
+;;; bare-metal case to fall through to a counter.  It cannot: an SVC with no
+;;; OS is a synchronous exception, and on a Pi that is the silent `!!FAULT'
+;;; spin (ESR 0x56000000 = EC 0x15, SVC from AArch64) -- the fault was
+;;; measured at GET-INTERNAL-REAL-TIME+0xbc inside a restored quicklisp core.
+;;; Nothing on the board may reach syscall3; route both to the CNTVCT
+;;; counter, exactly as %timer-universal-time's docstring says a bare-metal
+;;; build must select explicitly.  Milliseconds, so internal-time-units-per-
+;;; second (1000) matches the hosted definition.
+(defun get-internal-real-time ()
+  (let ((hz (cntfrq)))
+    (if (and (integerp hz) (> hz 0)) (floor (* (rdtsc) 1000) hz) 0)))
+(defun get-universal-time () (%timer-universal-time))
 "
         (if *cl-repl-rpi-p* *cl-repl-rpi-core-source* ""))))
 

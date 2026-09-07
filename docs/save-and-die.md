@@ -150,6 +150,44 @@ The rig: `/home/claude/cabfs/core/t1.sh` (trivial save/restore) and `t2.sh`
   fault is a silent spin, not a SIGSEGV — attach `gdb-multiarch` AFTER the
   `!!FAULT` line prints and dump memory from the spinning guest.
 
+## The real quicklisp client from a core, on the board (2026-09-07)
+
+With both compiler fixes in the image, a core produced under QEMU from the
+chainload binary carrying the cabinet filesystem, a populated `/ql/` (the
+`qlall.tar` quicklisp home: client sources, dist metadata, `alexandria.tgz`)
+and the **whole quicklisp client loaded** restored on the Pi Zero 2 W:
+`CORE-RESTORED`, `(length (ql-dist:all-dists))` = 1 in 11 s,
+`(quicklisp:setup)` → 1 enabled dist in 65 s — the client is live on silicon
+with no network and no recompile.  Producing that core took 58 min of QEMU
+(everything interpreted); a core can then be restored, edited at the REPL
+and re-saved in ~3 min.
+
+What `ql:quickload` of an *uninstalled* release costs on the board: the
+client's own pure-Lisp deflate + minitar + compile, all interpreted (the bare
+aarch64 JIT translates nothing).  Hosted aarch64 under TCG with the archive
+on the host filesystem did not finish in 40 min; a 30 min form timeout on the
+A53 was therefore never enough, and PC-sampling the QEMU gdbstub showed the
+interpreter computing, not spinning.  The SBCL answer applies: install and
+load the library into the core under QEMU, so `quickload` on the board finds
+the release installed and the system loaded and returns in seconds.
+
+Traps met on the way, each worth an hour: `qlall.tar` shipped a stale
+`prelude.lisp` whose `*quicklisp-home*` was a HOST path (0 dists → setup
+tried `install-dist` from the network → `RESOLVE-NAME`, hosted-only);
+the serial printer garbles `simple-base-string`s, so check cabinet names by
+char code; the 64 MB kernel TFTP can die mid-transfer on the RTL8153
+(`Rx: failed to receive: -5`) — kill the runner and relaunch; and
+`get-internal-real-time` was a Linux syscall on bare metal (fixed, below).
+`scripts/netboot-core2.py` waits for the REPL prompt per form instead of a
+fixed delay.
+
+**Bare-metal clock (9b1f84d).**  `ansi-bridge.lisp`'s
+`get-internal-real-time`/`get-universal-time` issue a Linux syscall inside a
+`handler-case` meant to catch the bare-metal case; an SVC with no OS is a
+synchronous exception, so the fallback never runs and the board spins
+silently (ESR `0x56000000`).  The aarch64 bare override now uses CNTVCT
+(`(rdtsc)`/`(cntfrq)`, milliseconds) and `%timer-universal-time`.
+
 ## Found on the way (items 1 and 2 FIXED on 2026-09-06)
 
 **Resolution.**  Item 1 (the FLET/LABELS default-capture) is fixed in

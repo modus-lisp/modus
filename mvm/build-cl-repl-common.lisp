@@ -472,16 +472,31 @@
     (%gc-write64 fd (+ dst padded))
     len))
 (defun %core-open-path-at (addr) -1)
-;; The bare-aa64 JIT translates nothing (263/263 fall back to the interpreter),
-;; so there are NO JIT code pages in the live heap to preserve, and the exec
-;; region's bump word is never initialised.  Report no arena: the conservative-
-;; root bitmaps (at their own fixed 0x05000000/0x05100000, NOT inside any arena)
-;; travel as slices through the shared save/restore path instead.
-;; No JIT arena is carried: the save session runs with the JIT off (bare-aa64
-;; translates nothing anyway), so heap fn objects are pure bytecode with no
-;; absolute code pointers into the exec region.  The conservative-root bitmaps
-;; (at 0x05000000/0x05100000, NOT in any arena) travel as slices.
-(defun %core-jit-arena-bump () 0)
+;; CARRY THE JIT ARENA.  The old comment here claimed the bare-aa64 JIT
+;; translates nothing so no exec pages exist -- that is FALSE on this image:
+;; a client load drove the exec bump to ~0x140D0000, and a heap function whose
+;; code pointer landed in that region became a DANGLING raw fn-pointer once the
+;; core (which did not carry the arena) was restored -- `blr' into a zeroed
+;; page, the silent !!FAULT that stopped the alexandria install at a
+;; funcall-of-a-loader-closure.  So the Pi carries [%jit-exec-lo, bump) exactly
+;; as hosted carries its arena; the shared save/restore does the rest (writes
+;; the arena, restores it, sets the bump word, IC-invalidates).  The
+;; conservative-root bitmaps stay separate (fixed 0x05000000/0x05100000) and
+;; still travel as slices.  bump is RANGE-VALIDATED: an uninitialised or
+;; garbage bump word reports 0 (no arena) rather than a runaway length.
+(defun %core-jit-arena-lo () (%jit-exec-lo))
+(defun %core-jit-bump-slot () (%jit-exec-bump))
+(defun %core-jit-arena-bump ()
+  ;; The exec REGION always exists on the Pi (plain executable DRAM), but the
+  ;; bump WORD is only initialised by the trap's first %mmap-exec-page.  Report
+  ;; the region base for an uninitialised / out-of-range bump so (a) a fresh
+  ;; restored process passes the shared restore guard (which dies on bump 0),
+  ;; and (b) a save before any JIT writes an EMPTY arena rather than a runaway
+  ;; length.  A valid in-range bump means real JIT pages -> carry [lo,bump).
+  (let ((b (%gc-read64 (%jit-exec-bump))))
+    (if (and (integerp b) (>= b (%jit-exec-lo)) (< b (%jit-exec-hi)))
+        b
+        (%jit-exec-lo))))
 (defun %core-jit-lossy-p () nil)
 (defun %core-die (msg)
   (write-string-serial msg) (write-char-serial 10) (halt))

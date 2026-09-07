@@ -484,19 +484,26 @@
 ;; conservative-root bitmaps stay separate (fixed 0x05000000/0x05100000) and
 ;; still travel as slices.  bump is RANGE-VALIDATED: an uninitialised or
 ;; garbage bump word reports 0 (no arena) rather than a runaway length.
-(defun %core-jit-arena-lo () (%jit-exec-lo))
+;; When the image is built MODUS_RPI_JIT=0 the exec-region accessors
+;; (%jit-exec-bump / -lo / -hi) are UNRESOLVED and return the NIL sentinel, so
+;; every one is guarded with integerp: a non-integer means no JIT and therefore
+;; no arena (report 0), NOT `%gc-read64 NIL' -> mem-ref of NIL's machine word
+;; (0xDEAD0001>>1 = 0x6F568000) -> data abort inside %save-image.  A
+;; JIT-enabled image returns real integers and carries [lo,bump) as before.
+(defun %core-jit-arena-lo () (let ((l (%jit-exec-lo))) (if (integerp l) l 0)))
 (defun %core-jit-bump-slot () (%jit-exec-bump))
 (defun %core-jit-arena-bump ()
-  ;; The exec REGION always exists on the Pi (plain executable DRAM), but the
-  ;; bump WORD is only initialised by the trap's first %mmap-exec-page.  Report
-  ;; the region base for an uninitialised / out-of-range bump so (a) a fresh
-  ;; restored process passes the shared restore guard (which dies on bump 0),
-  ;; and (b) a save before any JIT writes an EMPTY arena rather than a runaway
-  ;; length.  A valid in-range bump means real JIT pages -> carry [lo,bump).
-  (let ((b (%gc-read64 (%jit-exec-bump))))
-    (if (and (integerp b) (>= b (%jit-exec-lo)) (< b (%jit-exec-hi)))
-        b
-        (%jit-exec-lo))))
+  ;; JIT off: no region, no arena -> 0.  JIT on: the exec REGION always exists
+  ;; (plain executable DRAM) but the bump WORD is only set by the trap's first
+  ;; %mmap-exec-page, so report the region base for an uninitialised / out-of-
+  ;; range bump (a fresh restore then passes the shared guard, which dies on 0,
+  ;; and a pre-JIT save writes an EMPTY arena, never a runaway length); a valid
+  ;; in-range bump means real JIT pages -> carry [lo,bump).
+  (let ((slot (%jit-exec-bump)) (lo (%jit-exec-lo)) (hi (%jit-exec-hi)))
+    (if (and (integerp slot) (integerp lo) (integerp hi))
+        (let ((b (%gc-read64 slot)))
+          (if (and (integerp b) (>= b lo) (< b hi)) b lo))
+        0)))
 (defun %core-jit-lossy-p () nil)
 (defun %core-die (msg)
   (write-string-serial msg) (write-char-serial 10) (halt))

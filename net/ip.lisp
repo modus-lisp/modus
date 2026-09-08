@@ -773,9 +773,15 @@
           (when (not (= conn (- 0 1)))
             (net-deliver-data conn buf pkt-len tcp-flags))))))
 
+;; Hot-plug hook: no-op by default so every net image compiles and runs
+;; unchanged.  net/usb-netdev.lisp overrides it (loaded later, last-defun-wins)
+;; to re-bind the USB NIC driver on a connect/disconnect edge.
+(defun usb-netdev-hotplug-poll () nil)
+
 (defun net-actor-main ()
   (loop
     (io-delay)
+    (usb-netdev-hotplug-poll)
     (let ((pkt-len (e1000-receive)))
       (if (zerop pkt-len)
           (yield)

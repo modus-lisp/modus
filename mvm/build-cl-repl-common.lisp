@@ -985,6 +985,53 @@
             (aset arr (+ 2 rl) 10)
             (ssh-send-string ssh arr (+ rl 3))))))))"
         (string #\Newline)
+        ;; SHELL-path fix (completes the interactive SSH loop): the active
+        ;; ssh-do-eval-expr (net/aarch64-overrides.lisp) used eval-sexp (the
+        ;; DELETED tree-walker) + buf-read-list (the legacy repl-source reader),
+        ;; so interactive SSH input evaluated to NOTHING (only the prompt came
+        ;; back).  Loaded LAST => wins last-defun-wins.  The edited line is the
+        ;; raw bytes at ssh-ipc-base+0x28, length edit-line-len; route through the
+        ;; SAME CL stack as exec (ssh-eval-line: read-from-string -> eval ->
+        ;; prin1-to-string -> channel data).
+        "(defun ssh-do-eval-expr (ssh)
+    (let ((len (edit-line-len)))
+      (when (> len 0)
+        (let ((cmd (make-array len)))
+          (dotimes (i len)
+            (aset cmd i (mem-ref (+ (+ (ssh-ipc-base) #x28) i) :u8)))
+          (ssh-eval-line ssh cmd len)))))"
+        (string #\Newline)
+        ;; INTERACTIVE-shell fix: the stock ssh-handle-channel-data drives bytes
+        ;; through the aarch64-overrides line editor (handle-edit-byte + edit
+        ;; state) which does not integrate with this image, so typed/piped input
+        ;; never reached eval (only the prompt came back; exec worked because it
+        ;; bypasses the editor).  Override it (loaded after ssh.lisp) to
+        ;; accumulate raw channel bytes in ssh-ipc scratch (0x60500 count /
+        ;; 0x60510 buf, both zeroed by ssh-boot, above ssh.lisp's <=0x60450) and,
+        ;; on CR/LF, eval the line through the SAME proven CL path as exec
+        ;; (ssh-eval-line) and reprompt.  EXEC is untouched (it never calls this).
+        "(defun ssh-handle-channel-data (ssh payload plen)
+    (let ((data-len (ssh-get-u32 payload 5))
+          (naddr (+ (ssh-ipc-base) #x60500))
+          (baddr (+ (ssh-ipc-base) #x60510)))
+      (let ((i 0))
+        (loop
+          (when (>= i data-len) (return nil))
+          (let ((b (aref payload (+ 9 i))))
+            (if (or (eq b 10) (eq b 13))
+                (let ((n (mem-ref naddr :u32)))
+                  (when (> n 0)
+                    (let ((cmd (make-array n)))
+                      (dotimes (k n) (aset cmd k (mem-ref (+ baddr k) :u8)))
+                      (ssh-eval-line ssh cmd n)))
+                  (setf (mem-ref naddr :u32) 0)
+                  (ssh-send-prompt ssh))
+                (let ((n (mem-ref naddr :u32)))
+                  (when (< n 4000)
+                    (setf (mem-ref (+ baddr n) :u8) b)
+                    (setf (mem-ref naddr :u32) (+ n 1))))))
+          (setq i (+ i 1))))))"
+        (string #\Newline)
         ;; One-shot single-threaded SSH bring-up: zero the Normal-WB scratch
         ;; (uninitialised DRAM on real HW), adopt the NIC, static IP 10.0.0.2,
         ;; register listen port 22, crypto pre-compute, actor/mailbox init, then
@@ -994,7 +1041,7 @@
   (let ((s (e1000-state-base))) (dotimes (i 1024) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
   (let ((s (ssh-ipc-base))) (dotimes (i 76800) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
   (let ((s (ssh-conn-base))) (dotimes (i 8192) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
-  (e1000-probe)
+  (net-usb-probe)
   (setf (mem-ref (+ (e1000-state-base) 24) :u32) 33554442)
   (setf (mem-ref (+ (e1000-state-base) 28) :u32) 16777226)
   (setf (mem-ref (+ (ssh-ipc-base) #x60438) :u32) 22)
@@ -1007,7 +1054,14 @@
   (actor-init)
   (write-string-serial \"NETUP\") (write-char-serial 10)
   (net-actor-main))"
-        (string #\Newline))
+        (string #\Newline)
+        ;; usb-netdev.lisp LAST: runtime USB NIC binding + hot-plug.  Its
+        ;; e1000-send/receive/rx-buf DISPATCHERS win over r8152's forwarders
+        ;; (last-defun-wins), net-usb-probe (called by ssh-boot above) picks the
+        ;; driver at runtime (RTL8153 -> r8152, else CDC-ECM) and latches it, and
+        ;; the real usb-netdev-hotplug-poll overrides ip.lisp's no-op stub so the
+        ;; net-actor-main loop re-binds on a USB connect/disconnect edge.
+        (%rpi-net-text "usb-netdev.lisp")         (string #\Newline))
       ""))
 
 ;;; DIVERGENCE 3 — the arch adapter + the NIC driver.  Everything downstream of

@@ -121,7 +121,15 @@
 ;; Probe: adopt U-Boot's running device (no init, no enumerate)
 ;; ============================================================
 
-(defun e1000-probe ()
+;; Thin e1000-* forwarders (see net/cdc-ether.lisp): keep last-defun-wins
+;; behaviour for images without net/usb-netdev.lisp; shadowed by the dispatcher
+;; where usb-netdev.lisp is loaded.
+(defun e1000-send (buf len) (r8152-send buf len))
+(defun e1000-receive () (r8152-receive))
+(defun e1000-rx-buf () (r8152-rx-buf))
+(defun e1000-probe () (r8152-probe))
+
+(defun r8152-probe ()
   (let ((addr (r8152-find-addr)))
     (if (zerop addr)
         (progn (write-string-serial "R8152:NOTFOUND") (write-char-serial 10) 0)
@@ -158,7 +166,7 @@
 ;; NIC interface — vendor descriptor framing
 ;; ============================================================
 
-(defun e1000-send (buf len)
+(defun r8152-send (buf len)
   ;; 8-byte tx_desc {len | TX_FS(1<<31) | TX_LS(1<<30), 0} then the frame.
   (let ((tx (e1000-tx-buf-base)))
     (setf (mem-ref tx :u32) (logior len #xC0000000))
@@ -171,9 +179,9 @@
                                  0 tx (+ len 8) (usb-bulk-out-mps))))
       (if (eq r 1) 1 0))))
 
-(defun e1000-rx-buf () (+ (cdc-rx-buf-addr) 24))   ; skip the 24-byte rx_desc
+(defun r8152-rx-buf () (+ (cdc-rx-buf-addr) 24))   ; skip the 24-byte rx_desc
 
-(defun e1000-receive ()
+(defun r8152-receive ()
   ;; DEFERRED RE-ARM (state+0x48 = rearm-pending): the old code re-armed the
   ;; next bulk-IN into the SAME single rx buffer immediately on completion —
   ;; before the caller copied the frame out.  Back-to-back TCP segments then

@@ -194,7 +194,7 @@
 ;; Send raw Ethernet frame from byte array.
 ;; buf: Lisp byte array, len: frame length in bytes.
 ;; Returns 1 on success, 0 on failure.
-(defun e1000-send (buf len)
+(defun cdcether-send (buf len)
   (let ((tx-buf (cdc-tx-buf-addr)))
     ;; Copy from Lisp array to DMA buffer
     (let ((i 0))
@@ -207,7 +207,7 @@
       (if (eq result 1) 1 0))))
 
 ;; Check for received packet. Returns length or 0 if none.
-(defun e1000-receive ()
+(defun cdcether-receive ()
   ;; Read HCTSIZ BEFORE polling — the poll may start a new transfer,
   ;; overwriting the register. We need the remaining bytes from the
   ;; completed transfer to compute the actual received length.
@@ -224,13 +224,20 @@
 
 ;; Get pointer to current RX buffer data (physical address).
 ;; Called after e1000-receive returns non-zero.
-(defun e1000-rx-buf ()
+(defun cdcether-rx-buf ()
   (cdc-rx-buf-addr))
 
-;; Find NIC and initialize. Main entry point (same name as e1000.lisp).
-;; On RPi, this initializes USB + CDC Ethernet instead of PCI + E1000.
-(defun e1000-probe ()
+;; Find NIC and initialize. On RPi this initializes USB + CDC Ethernet.
+(defun cdcether-probe ()
   (cdc-ether-init))
+
+;; Thin e1000-* forwarders: images WITHOUT net/usb-netdev.lisp keep today's
+;; behaviour (cdc-ether IS the NIC).  Where usb-netdev.lisp is loaded (LAST),
+;; its dispatchers win last-defun-wins and these are shadowed.
+(defun e1000-send (buf len) (cdcether-send buf len))
+(defun e1000-receive () (cdcether-receive))
+(defun e1000-rx-buf () (cdcether-rx-buf))
+(defun e1000-probe () (cdcether-probe))
 
 ;; ============================================================
 ;; E1000 register stubs (called by ip.lisp init functions)

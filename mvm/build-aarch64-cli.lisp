@@ -282,6 +282,33 @@
 ;;; the aarch64 GC-poison repro) with no x64 counterpart, and folding them into
 ;;; the shared file would put arch-specific debug apparatus in every image.
 (defvar *cli-arch-kernel-epilogue* "
+  ;; #210 rung 1 (aarch64 lineage): CROSS-EMIT self-host dispatch.  `modus
+  ;; --compile IN OUT' emits a hosted Linux/x64 ELF; `--compile-aarch64 IN OUT'
+  ;; emits a hosted Linux/AArch64 ELF; both drive the cross-emit tooling
+  ;; (x64-asm + translate-x64 + cross + both boot descriptors) spliced into
+  ;; *full-source* before kernel-main by build-aarch64-cli.lisp.  Checked FIRST
+  ;; so a compile run never touches the probe apparatus or cli-toplevel; on no
+  ;; match this LET falls through and the normal boot continues unchanged.
+  (let ((av (handler-case (%cli-collect-argv) (t (c) nil))))
+    (when (and (consp av) (consp (cdr av)) (stringp (car (cdr av)))
+               (string= (car (cdr av)) \"--compile-aarch64\"))
+      (handler-case
+          (progn (%selfhost-compile-file-aa64 (nth 2 av) (nth 3 av)) (sys-exit 0))
+        (t (c) (progn (write-string-serial \"modus --compile-aarch64: error type=\")
+                      (handler-case (write-object (type-of c)) (t (c2) (write-string-serial \"?type\")))
+                      (write-string-serial \" cond=\")
+                      (handler-case (write-object c) (t (c3) (write-string-serial \"?cond\")))
+                      (write-char-serial 10) (sys-exit 1)))))
+    (when (and (consp av) (consp (cdr av)) (stringp (car (cdr av)))
+               (string= (car (cdr av)) \"--compile\"))
+      (handler-case
+          (progn (%selfhost-compile-file (nth 2 av) (nth 3 av)) (sys-exit 0))
+        (t (c) (progn (write-string-serial \"modus --compile: error type=\")
+                      (handler-case (write-object (type-of c)) (t (c2) (write-string-serial \"?type\")))
+                      (write-string-serial \" cond=\")
+                      (handler-case (write-object c) (t (c3) (write-string-serial \"?cond\")))
+                      (write-char-serial 10) (sys-exit 1))))))
+
   ;; ISOLATED pure-cons GC milestone (argv 33333) — runs BEFORE any JIT/mvm-eval
   ;; probe so its collection count is UNAMBIGUOUS (Stage-1 native-GC milestone).
   (when (eql (%parse-decimal-at-fixed-208) 33333)
@@ -811,6 +838,443 @@
 
 (load (merge-pathnames "build-cli-common.lisp"
                        (directory-namestring (truename *load-truename*))))
+
+;;; ============================================================
+;;; #210 RUNG 1 — CROSS-EMIT SEED for the AArch64 CLI lineage.
+;;;
+;;; Bake the x64 native tooling + the cross-compilation pipeline + BOTH Linux
+;;; boot descriptors into THIS aarch64 image, so a Modus process running under
+;;; qemu-aarch64-static (or on a Pi) can `--compile' a Lisp program to a hosted
+;;; Linux/x64 ELF and `--compile-aarch64' it to a hosted Linux/AArch64 ELF.
+;;;
+;;; The AArch64 translator (translate-aarch64) is ALREADY baked by
+;;; build-cli-common (its JIT block) and is NOT re-baked here.  What this block
+;;; adds is exactly what build-modus-selfhost.lisp bakes for the x64 seed, minus
+;;; the aarch64 translator itself:
+;;;   x64-asm.lisp, translate-x64.lisp, %init-x64-translator,
+;;;   the AArch64 boot-encoder helpers, a RENAMED aarch64 cross-emit co-init
+;;;   (%init-selfhost-aa64-emit — NOT %init-aarch64-translator, so the image's
+;;;   own runtime-JIT co-init is untouched), target.lisp, cross.lisp,
+;;;   boot-linux-x64.lisp, boot-linux-aarch64.lisp, %init-selfhost-targets, and
+;;;   the %selfhost-compile-file[-aa64] entry points.
+;;;
+;;; All the text transforms below (trims, the emit-bytes rename, the cross.lisp
+;;; :into-buf SETQ fix) are ported verbatim from build-modus-selfhost.lisp so
+;;; the emitted child ELFs are byte-identical to the proven x64 seed's.
+;;; ============================================================
+
+;; Extract named toplevel (defun NAME …) forms (paren-balanced, string/comment
+;; aware) — the AArch64 boot-encoder helpers live in a bare-metal boot file we
+;; do not want to bake whole.  Verbatim from build-modus-selfhost.lisp.
+(defun %ce-extract-toplevel-defuns (text names)
+  (let ((out ""))
+    (dolist (name names out)
+      (let* ((needle (concatenate 'string "(defun " name " "))
+             (start (search needle text)))
+        (unless start
+          (error "#210: could not extract ~A from boot-aarch64.lisp" name))
+        (let ((depth 0) (i start) (end nil) (len (length text)) (in-str nil))
+          (loop while (< i len) do
+            (let ((ch (char text i)))
+              (cond ((and in-str (char= ch #\\)) (incf i))
+                    ((char= ch #\") (setf in-str (not in-str)))
+                    (in-str)
+                    ((char= ch #\;)
+                     (loop while (and (< i len) (char/= (char text i) #\Newline))
+                           do (incf i)))
+                    ((char= ch #\() (incf depth))
+                    ((char= ch #\)) (decf depth)
+                     (when (zerop depth) (setf end (1+ i)) (return)))))
+            (incf i))
+          (unless end (error "#210: unbalanced defun ~A" name))
+          (setf out (concatenate 'string out (subseq text start end)
+                                 (string #\Newline) (string #\Newline))))))))
+
+(defun %ce-replace-all (text needle replacement)
+  (let ((out "") (pos 0))
+    (loop
+      (let ((p (search needle text :start2 pos)))
+        (if p
+            (progn (setf out (concatenate 'string out (subseq text pos p) replacement))
+                   (setf pos (+ p (length needle))))
+            (return (concatenate 'string out (subseq text pos))))))))
+
+;;; --- x64 instruction encoder (modus.asm) — shrink code buffer -------------
+(defvar *ce-x64-asm-source* (mvm-text "mvm/x64-asm.lisp"))
+(let ((needle "(bytes (make-array 100663296 :element-type '(unsigned-byte 8)))")
+      (repl   "(bytes (make-array 1048576 :element-type '(unsigned-byte 8)))"))
+  (let ((p (search needle *ce-x64-asm-source*)))
+    (unless p (error "#210: could not find x64-asm code-buffer 96MB default"))
+    (setf *ce-x64-asm-source*
+          (concatenate 'string (subseq *ce-x64-asm-source* 0 p) repl
+                       (subseq *ce-x64-asm-source* (+ p (length needle)))))))
+
+;;; --- MVM->x64 translator (modus.mvm.x64) — trim host-only install tail ----
+(defvar *ce-translate-x64-source* (mvm-text "mvm/translate-x64.lisp"))
+(let ((pos (search "(defun install-x64-translator" *ce-translate-x64-source*)))
+  (unless pos (error "#210: could not find install-x64-translator strip marker"))
+  (setf *ce-translate-x64-source*
+        (concatenate 'string (subseq *ce-translate-x64-source* 0 pos)
+                     modus.mvm::*build-package-reset-text*)))
+
+;;; --- x64 translator co-init (verbatim from build-modus-selfhost) ----------
+(defvar *ce-x64-coinit-source* "
+(in-package :modus.asm)
+(defun %init-x64-translator ()
+  (setq *registers*
+        (list (list (quote rax)  0 64 nil) (list (quote rcx)  1 64 nil)
+              (list (quote rdx)  2 64 nil) (list (quote rbx)  3 64 nil)
+              (list (quote rsp)  4 64 nil) (list (quote rbp)  5 64 nil)
+              (list (quote rsi)  6 64 nil) (list (quote rdi)  7 64 nil)
+              (list (quote r8)   8 64 t)   (list (quote r9)   9 64 t)
+              (list (quote r10) 10 64 t)   (list (quote r11) 11 64 t)
+              (list (quote r12) 12 64 t)   (list (quote r13) 13 64 t)
+              (list (quote r14) 14 64 t)   (list (quote r15) 15 64 t)
+              (list (quote eax)  0 32 nil) (list (quote ecx)  1 32 nil)
+              (list (quote edx)  2 32 nil) (list (quote ebx)  3 32 nil)
+              (list (quote esp)  4 32 nil) (list (quote ebp)  5 32 nil)
+              (list (quote esi)  6 32 nil) (list (quote edi)  7 32 nil)
+              (list (quote r8d)  8 32 t)   (list (quote r9d)  9 32 t)
+              (list (quote r10d) 10 32 t)  (list (quote r11d) 11 32 t)
+              (list (quote r12d) 12 32 t)  (list (quote r13d) 13 32 t)
+              (list (quote r14d) 14 32 t)  (list (quote r15d) 15 32 t)
+              (list (quote al)   0 8 nil)  (list (quote cl)   1 8 nil)
+              (list (quote dl)   2 8 nil)  (list (quote bl)   3 8 nil)
+              (list (quote spl)  4 8 t)    (list (quote bpl)  5 8 t)
+              (list (quote sil)  6 8 t)    (list (quote dil)  7 8 t)
+              (list (quote r8b)  8 8 t)    (list (quote r9b)  9 8 t)
+              (list (quote r10b) 10 8 t)   (list (quote r11b) 11 8 t)
+              (list (quote r12b) 12 8 t)   (list (quote r13b) 13 8 t)
+              (list (quote r14b) 14 8 t)   (list (quote r15b) 15 8 t)))
+  (setq *condition-codes*
+        (list (cons :o 0)  (cons :no 1)  (cons :b 2)   (cons :ae 3)
+              (cons :e 4)   (cons :ne 5)  (cons :be 6)  (cons :a 7)
+              (cons :s 8)   (cons :ns 9)  (cons :p 10)  (cons :np 11)
+              (cons :l 12)  (cons :ge 13) (cons :le 14) (cons :g 15)
+              (cons :z 4)   (cons :nz 5)  (cons :c 2)   (cons :nc 3)
+              (cons :nae 2) (cons :nb 3)  (cons :nbe 7) (cons :na 6)
+              (cons :nge 12)(cons :nl 13) (cons :ng 14) (cons :nle 15)))
+  (let ((v (make-array 23)))
+    (aset v 0 (quote rsi))  (aset v 1 (quote rdi))
+    (aset v 2 (quote r8))   (aset v 3 (quote r9))
+    (aset v 4 (quote rbx))  (aset v 5 (quote rcx))
+    (aset v 6 (quote rdx))  (aset v 7 (quote r10))
+    (aset v 8 (quote r11))
+    (aset v 9 nil)  (aset v 10 nil) (aset v 11 nil) (aset v 12 nil)
+    (aset v 13 nil) (aset v 14 nil) (aset v 15 nil) (aset v 22 nil)
+    (aset v 16 (quote rax)) (aset v 17 (quote r12))
+    (aset v 18 (quote r14)) (aset v 19 (quote r15))
+    (aset v 20 (quote rsp)) (aset v 21 (quote rbp))
+    (setq *vreg-to-x64* v))
+  (setq *x64-native-code-offset* 397)
+  (setq *x64-linux-mode* t)
+  (setq *x64-gc-enabled* t)
+  (setq *mcgc-kind-bitmap-enabled* t)
+  (setq *ws5-force-no-kindcheck* nil)
+  (setq *linux-x64-r14-offset* #x38000000)
+  t)
+(in-package :modus.mvm)
+")
+
+;;; --- AArch64 boot-encoder helpers (extracted from boot-aarch64.lisp) ------
+(defvar *ce-aa64-boot-encoder-source*
+  (let ((text (let ((p (merge-pathnames "boot/boot-aarch64.lisp" *modus-base*)))
+                (modus.mvm::check-parses p)
+                (read-file-text p))))
+    (modus.mvm::%build-package-scoped-source
+     (concatenate 'string
+                  ";;; #210: extracted from boot/boot-aarch64.lisp"
+                  (string #\Newline)
+                  (%ce-extract-toplevel-defuns
+                   text '("emit-aarch64-u32" "emit-aarch64-movz"
+                          "emit-aarch64-movk" "emit-aarch64-load-imm64"))))))
+
+;;; --- AArch64 cross-emit co-init.  RENAMED to %init-selfhost-aa64-emit so it
+;;; does NOT clobber build-cli-common's runtime-JIT %init-aarch64-translator.
+;;; Body ported from build-modus-selfhost's %init-aarch64-translator; configures
+;;; the aarch64 emit for a WHOLE-PROGRAM (non-JIT, GC-off) linux-aarch64 child.
+(defvar *ce-aa64-coinit-source* "
+(defun %a64-target-emit-prologue (target buf) (a64-emit-prologue buf))
+(defun %a64-target-emit-epilogue (target buf) (a64-emit-epilogue buf))
+(defun %init-selfhost-aa64-emit ()
+  (let ((v (make-array 23)))
+    (aset v 0 0)   (aset v 1 1)   (aset v 2 2)   (aset v 3 3)
+    (aset v 4 19)  (aset v 5 20)  (aset v 6 21)  (aset v 7 22)
+    (aset v 8 23)
+    (aset v 9 nil)  (aset v 10 nil) (aset v 11 nil) (aset v 12 nil)
+    (aset v 13 nil) (aset v 14 nil) (aset v 15 nil)
+    (aset v 16 0)  (aset v 17 24) (aset v 18 25) (aset v 19 26)
+    (aset v 20 31) (aset v 21 29) (aset v 22 nil)
+    (setq *a64-vreg-to-phys* v))
+  (setq *aarch64-serial-width* 0)
+  (setq *aarch64-linux-mode* t)
+  (setq *aarch64-stack-align-16* t)
+  (setq *aarch64-fn-align-offset* 120)
+  (setq *linux-aarch64-r25-offset* #x38000000)
+  (setq *linux-aarch64-gc-midpoint* #x1C000000)
+  (setq *linux-aarch64-gc-metadata-shl* nil)
+  (setq *aarch64-gc-bitmap-enabled* nil)
+  (setq *aarch64-gc-native-mcgc* nil)
+  (setq *aarch64-force-absolute-inmodule-calls* nil)
+  (setq *aarch64-sched-lock-addr* nil)
+  (setq *aarch64-setup-irq-enable* nil)
+  (setq *aarch64-jit-mode* nil)
+  (setq *aarch64-translate-into-buf* nil)
+  ;; NOTE: unlike the x64 seed (whose boot never runs the aarch64 JIT), THIS
+  ;; image's boot ran %jit-boot-init, which leaves the runtime aarch64 JIT armed
+  ;; (*aarch64-gc-trampoline-label*=1, *aarch64-jit-constvec-p*=t, native-mcgc on)
+  ;; and the parent's live GC depends on that.  Forcing those emit knobs OFF here
+  ;; to match the seed's byte layout makes the running parent's emit inconsistent
+  ;; and SIGTRAPs mid-assemble, so they are LEFT as boot set them.  The emitted
+  ;; aarch64 child is still correct (runs YYYYYY) but is NOT byte-identical to the
+  ;; x64-seed's aarch64 child — a benign codegen-config divergence, not a bug.
+  t)
+")
+
+;;; --- target descriptors (target.lisp) -------------------------------------
+(defvar *ce-target-source* (mvm-text "mvm/target.lisp"))
+
+;;; --- cross-compilation pipeline (cross.lisp) — trim host TEST tail + the
+;;; :into-buf special-binding SETQ fix (both verbatim from build-modus-selfhost).
+(defvar *ce-cross-source* (mvm-text "mvm/cross.lisp"))
+(let ((cut-start (search "(defun write-kernel-image" *ce-cross-source*))
+      (cut-end   (search "(defun read-all-forms" *ce-cross-source*)))
+  (unless (and cut-start cut-end (< cut-start cut-end))
+    (error "#210: could not locate cross.lisp write-kernel-image..read-all-forms cut"))
+  (setf *ce-cross-source*
+        (concatenate 'string (subseq *ce-cross-source* 0 cut-start)
+                     (subseq *ce-cross-source* cut-end))))
+(let ((needle "  (let ((translator (target-translate-fn target))
+        (modus.mvm::*aarch64-translate-into-buf* into-buf))")
+      (repl   "  (let ((translator (target-translate-fn target)))
+    (setq modus.mvm::*aarch64-translate-into-buf* into-buf)"))
+  (let ((p (search needle *ce-cross-source*)))
+    (unless p (error "#210: could not find translate-module-to-native :into-buf LET"))
+    (setf *ce-cross-source*
+          (concatenate 'string (subseq *ce-cross-source* 0 p) repl
+                       (subseq *ce-cross-source* (+ p (length needle)))))))
+
+;;; --- linux-x64 boot descriptor: strip the FIRST top-level eval-when assert
+;;; block, and rename its EMIT-BYTES (def + calls) to %LINUX-BOOT-EMIT-BYTES so
+;;; it doesn't shadow x64-asm's EMIT-BYTES under last-defun-wins.
+(defvar *ce-boot-x64-source* (mvm-text "boot/boot-linux-x64.lisp"))
+(let ((aw-start (search "(eval-when (:compile-toplevel" *ce-boot-x64-source*)))
+  (when aw-start
+    (let ((depth 0) (i aw-start) (end nil) (len (length *ce-boot-x64-source*)))
+      (loop while (< i len) do
+        (let ((ch (char *ce-boot-x64-source* i)))
+          (cond ((char= ch #\() (incf depth))
+                ((char= ch #\)) (decf depth)
+                 (when (zerop depth) (setf end (1+ i)) (return)))))
+        (incf i))
+      (when end
+        (setf *ce-boot-x64-source*
+              (concatenate 'string (subseq *ce-boot-x64-source* 0 aw-start)
+                           (subseq *ce-boot-x64-source* end)))))))
+(setf *ce-boot-x64-source*
+      (%ce-replace-all (%ce-replace-all *ce-boot-x64-source*
+                                        "(defun emit-bytes " "(defun %linux-boot-emit-bytes ")
+                       "(emit-bytes " "(%linux-boot-emit-bytes "))
+
+;;; --- linux-aarch64 boot descriptor: strip the guarded %sanitize-symbol-name
+;;; (boot-linux-x64 defines it unconditionally, baked first).  No emit-bytes.
+(defvar *ce-boot-aa64-source* (mvm-text "boot/boot-linux-aarch64.lisp"))
+(let ((start (search "(unless (fboundp '%sanitize-symbol-name)" *ce-boot-aa64-source*)))
+  (unless start (error "#210: could not find the %sanitize-symbol-name fboundp guard"))
+  (let ((depth 0) (i start) (end nil)
+        (len (length *ce-boot-aa64-source*)) (in-str nil))
+    (loop while (< i len) do
+      (let ((ch (char *ce-boot-aa64-source* i)))
+        (cond ((and in-str (char= ch #\\)) (incf i))
+              ((char= ch #\") (setf in-str (not in-str)))
+              (in-str)
+              ((char= ch #\() (incf depth))
+              ((char= ch #\)) (decf depth)
+               (when (zerop depth) (setf end (1+ i)) (return)))))
+      (incf i))
+    (unless end (error "#210: unbalanced fboundp guard block"))
+    (setf *ce-boot-aa64-source*
+          (concatenate 'string (subseq *ce-boot-aa64-source* 0 start)
+                       (subseq *ce-boot-aa64-source* end)))))
+
+;;; --- register BOTH targets in-image (verbatim from build-modus-selfhost's
+;;; %init-selfhost-targets, using the RENAMED aarch64 prologue/epilogue shims).
+(defvar *ce-target-coinit-source* "
+(defun %init-selfhost-targets ()
+  (setq *targets* (make-hash-table :test (quote eq)))
+  (setq *target-x86-64*
+        (make-target
+         :name :x86-64 :word-size 8 :endianness :little
+         :reg-map (vector :rsi :rdi :r8 :r9 :rbx :rcx :rdx :r10
+                          :r11 nil nil nil nil nil nil nil
+                          :rax :r12 :r14 :r15 :rsp :rbp nil)
+         :n-phys-regs 16 :callee-saved (list 4 21) :arg-regs (list 0 1 2 3)
+         :scratch-regs (list 5 6 7 8) :max-inline-regs 8 :page-size 4096
+         :translate-fn nil :emit-prologue nil :emit-epilogue nil :emit-boot nil
+         :float-support :native
+         :features (list :has-io-ports t :has-lapic t :has-sipi t)))
+  (setf (target-translate-fn  *target-x86-64*) (function translate-mvm-to-x64))
+  (setf (target-emit-prologue *target-x86-64*) (function emit-function-prologue))
+  (setf (target-emit-epilogue *target-x86-64*) (function emit-function-epilogue))
+  (register-target *target-x86-64*)
+  (setq *target-aarch64*
+        (make-target
+         :name :aarch64 :word-size 8 :endianness :little
+         :reg-map (vector :x0 :x1 :x2 :x3 :x19 :x20 :x21 :x22
+                          :x23 nil nil nil nil nil nil nil
+                          :x0 :x24 :x25 :x26 :sp :x29 nil)
+         :n-phys-regs 31 :callee-saved (list 4 5 6 7 8) :arg-regs (list 0 1 2 3)
+         :scratch-regs (list 5 6 7 8) :max-inline-regs 8 :page-size 4096
+         :translate-fn nil :emit-prologue nil :emit-epilogue nil :emit-boot nil
+         :features (list :has-gic t :has-psci t)))
+  (setf (target-translate-fn  *target-aarch64*) (function translate-mvm-to-aarch64))
+  (setf (target-emit-prologue *target-aarch64*) (function %a64-target-emit-prologue))
+  (setf (target-emit-epilogue *target-aarch64*) (function %a64-target-emit-epilogue))
+  (register-target *target-aarch64*)
+  t)
+")
+
+;;; --- the --compile / --compile-aarch64 entry points -----------------------
+;;; %selfhost-ensure-init sets the Active-Limitation-#7 globals build-image
+;;; needs in-image, then wires the x64 translator + both targets.  Called at the
+;;; top of each entry so an image whose boot didn't set them still self-compiles.
+(defvar *ce-entries-source* "
+(defun %selfhost-ensure-init ()
+  (setq *reader-missing-package-lenient* t)
+  (setq *gensym-counter* 0)
+  (setq *kw-rest-counter* 0)
+  (setq *nonlocal-block-tag-counter* 0)
+  (setq *ws5-str-bake-min* 0)
+  (when (null *setf-expanders*)
+    (setq *setf-expanders* (make-hash-table :test (quote eql))))
+  (%init-x64-translator)
+  (%init-selfhost-targets)
+  t)
+(defun %ce-sys-close (fd) (syscall3 3 fd 0 0))
+(defun %ce-slurp-text (path)
+  (let ((s (open path :direction :input)))
+    (if (null s) nil
+        (let ((n (file-length s)))
+          (let ((buf (%make-string-array n)))
+            (let ((got (read-sequence buf s)))
+              (close s)
+              (if (< got n) (subseq buf 0 got) buf)))))))
+;; open(path, O_WRONLY|O_CREAT|O_TRUNC=577, 0755=493) via AArch64 openat.
+(defun %ce-open-exec (path)
+  (%string-to-cstr path *cstr-scratch*)
+  (%aarch64-openat *cstr-scratch* 577 493))
+(defun %ce-write-bytes (fd bytes)
+  (let ((n (length bytes)) (off 0))
+    (loop
+      (when (>= off n) (return nil))
+      (let ((chunk (if (< (- n off) 65536) (- n off) 65536)) (j 0))
+        (loop
+          (when (>= j chunk) (return nil))
+          (setf (mem-ref (+ *io-buf-addr* j) :u8) (aref bytes (+ off j)))
+          (setq j (+ j 1)))
+        (%sys-write-raw fd *io-buf-addr* chunk)
+        (setq off (+ off chunk))))))
+(defun %ce-emit-image (image out label)
+  (let ((bytes (kernel-image-image-bytes image))
+        (fd (%ce-open-exec out)))
+    (if (< fd 0)
+        (progn (write-string-serial \"modus: cannot write \")
+               (write-string-serial out) (write-char-serial 10) (sys-exit 1))
+        (progn
+          (%ce-write-bytes fd bytes)
+          (%ce-sys-close fd)
+          (write-string-serial \"modus: wrote \")
+          (print-dec (length bytes))
+          (write-string-serial \" bytes to \")
+          (write-string-serial out)
+          (write-string-serial label)
+          (write-char-serial 10)))))
+(defun %selfhost-compile-file (in out)
+  (%selfhost-ensure-init)
+  (let ((src (%ce-slurp-text in)))
+    (if (null src)
+        (progn (write-string-serial \"modus --compile: cannot read \")
+               (write-string-serial in) (write-char-serial 10) (sys-exit 1))
+        (progn
+          (setq *static-build-p* t)
+          (setq *mvm-emit-halves* nil)
+          (setq *mvm-eval-runtime-p* nil)
+          (%ce-emit-image (build-image :target :linux-x64 :source-text src)
+                          out \"\")))))
+(defun %selfhost-compile-file-aa64 (in out)
+  (%selfhost-ensure-init)
+  (%init-selfhost-aa64-emit)
+  (let ((src (%ce-slurp-text in)))
+    (if (null src)
+        (progn (write-string-serial \"modus --compile-aarch64: cannot read \")
+               (write-string-serial in) (write-char-serial 10) (sys-exit 1))
+        (progn
+          (setq *static-build-p* t)
+          (setq *mvm-emit-halves* nil)
+          (setq *mvm-eval-runtime-p* nil)
+          (%ce-emit-image (build-image :target :linux-aarch64 :source-text src)
+                          out \" (linux-aarch64)\")))))
+")
+
+;;; Assemble the whole cross-emit block in dependency order and SPLICE it into
+;;; *full-source* immediately BEFORE (defun kernel-main …).  It must precede
+;;; kernel-main because the epilogue's dispatch calls %selfhost-compile-file*,
+;;; and forward references across the build blob do NOT resolve (they emit a NIL
+;;; sentinel — see build-cli-common's *genera-source* placement note).
+(defvar *ce-cross-emit-source*
+  (concatenate 'string
+    (string #\Newline) ";;; ==== #210 cross-emit tooling (build-aarch64-cli) ====" (string #\Newline)
+    *ce-x64-asm-source*         (string #\Newline)
+    *ce-translate-x64-source*   (string #\Newline)
+    *ce-x64-coinit-source*      (string #\Newline)
+    *ce-aa64-boot-encoder-source* (string #\Newline)
+    *ce-aa64-coinit-source*     (string #\Newline)
+    *ce-target-source*          (string #\Newline)
+    *ce-cross-source*           (string #\Newline)
+    *ce-boot-x64-source*        (string #\Newline)
+    *ce-boot-aa64-source*       (string #\Newline)
+    *ce-target-coinit-source*   (string #\Newline)
+    *ce-entries-source*         (string #\Newline)))
+
+;; #210: shrink make-mvm-buffer's default bytes array from 128 MB to 1 MB, so the
+;; in-image build-image (compile-source-to-module -> mvm-compile-all -> Phase 3
+;; `(make-mvm-buffer)`) does not blow the heap.  mvm-eval never hit this — it uses
+;; the persistent 64 KB *mvm-eval-buffer* — but build-image's Phase-3 allocates the
+;; struct default, and a 134217728-element alloc overran the heap (surfaced as
+;; #(TYPE-ERROR NIL) in Phase-3 first pass).  Verbatim from build-modus-selfhost's
+;; *isa-source* shrink; output-neutral (only the USED prefix is emitted) and
+;; aarch64-image-only (this patches the already-assembled *full-source*).
+(let ((needle "(bytes (make-array 134217728 :element-type '(unsigned-byte 8)))")
+      (repl   "(bytes (make-array 1048576 :element-type '(unsigned-byte 8)))"))
+  (let ((p (search needle cl-user::*full-source*)))
+    (unless p (error "#210: could not find mvm-buffer 128MB default to shrink"))
+    (setf cl-user::*full-source*
+          (concatenate 'string (subseq cl-user::*full-source* 0 p) repl
+                       (subseq cl-user::*full-source* (+ p (length needle)))))))
+
+(let ((marker "(defun kernel-main ()"))
+  (let ((p (search marker cl-user::*full-source*)))
+    (unless p (error "#210: could not find (defun kernel-main () splice marker"))
+    (setf cl-user::*full-source*
+          (concatenate 'string (subseq cl-user::*full-source* 0 p)
+                       *ce-cross-emit-source* (string #\Newline)
+                       (subseq cl-user::*full-source* p)))))
+
+;;; Re-run the blob read check on the augmented source: my appended block lands
+;;; AFTER build-cli-common's own check, and the build reader is lenient (it would
+;;; silently DROP an unbalanced form and fault on a NIL sentinel at runtime).
+(let* ((log (with-output-to-string (*standard-output*)
+              (modus.mvm::read-all-forms-with-locations cl-user::*full-source*)))
+       (skips (let ((n 0) (pos 0))
+                (loop
+                  (let ((p (search "SKIP read at line" log :start2 pos)))
+                    (unless p (return n))
+                    (incf n) (setq pos (+ p 17)))))))
+  (if (zerop skips)
+      (format t "~&#210 cross-emit: blob read check OK (~D chars added)~%"
+              (length *ce-cross-emit-source*))
+      (error "~&#210 CROSS-EMIT BLOB READ CHECK FAILED: ~D unreadable form(s).~%~A"
+             skips log)))
 
 ;;; ============================================================
 ;;; Build the Linux/AArch64 ELF (same target machinery as the gate wrapper)

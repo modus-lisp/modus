@@ -21,75 +21,75 @@
 ;;;   0x480064: usb-dma-base
 ;;;   0x480068: dwc2-base
 (defun init-arch-addrs ()
-  (let ((arch (td-read-u32 #x500008)))
+  (let ((arch (td-read-u32 #x3000008)))
     (cond
       ((= arch 0) ;; x64
-       (td-write-u32 #x500040 #x05060000)
-       (td-write-u32 #x500044 #x05080000)
-       (td-write-u32 #x500048 #x300000)
-       (td-write-u32 #x50004C #x05000000)
-       (td-write-u32 #x500050 #x05001000)
-       (td-write-u32 #x500054 #x05041000)
-       (td-write-u32 #x500058 #x05041400)
-       (td-write-u32 #x50005C 0)        ;; pci-mode=0 (port I/O)
-       (td-write-u32 #x500060 #x05090000)
-       (td-write-u32 #x500064 #x05000000)
-       (td-write-u32 #x500068 0))
+       (td-write-u32 #x3000040 #x05060000)
+       (td-write-u32 #x3000044 #x05080000)
+       (td-write-u32 #x3000048 #x04000000)  ;; ssh-ipc (was 0x300000 — now inside the ~15 MB image)
+       (td-write-u32 #x300004C #x05000000)
+       (td-write-u32 #x3000050 #x05001000)
+       (td-write-u32 #x3000054 #x05041000)
+       (td-write-u32 #x3000058 #x05041400)
+       (td-write-u32 #x300005C 0)        ;; pci-mode=0 (port I/O)
+       (td-write-u32 #x3000060 #x05090000)
+       (td-write-u32 #x3000064 #x05000000)
+       (td-write-u32 #x3000068 0))
       ((= arch 1) ;; aarch64
-       (td-write-u32 #x500040 #x41060000)
-       (td-write-u32 #x500044 #x41080000)
-       (td-write-u32 #x500048 #x41100000)
-       (td-write-u32 #x50004C #x41000000)
-       (td-write-u32 #x500050 #x41001000)
-       (td-write-u32 #x500054 #x41041000)
-       (td-write-u32 #x500058 #x41041400)
-       (td-write-u32 #x50005C 1)        ;; pci-mode=1 (ECAM)
-       (td-write-u32 #x500060 #x41090000)
-       (td-write-u32 #x500064 #x41000000)
-       (td-write-u32 #x500068 0))
+       (td-write-u32 #x3000040 #x41060000)
+       (td-write-u32 #x3000044 #x41080000)
+       (td-write-u32 #x3000048 #x41100000)
+       (td-write-u32 #x300004C #x41000000)
+       (td-write-u32 #x3000050 #x41001000)
+       (td-write-u32 #x3000054 #x41041000)
+       (td-write-u32 #x3000058 #x41041400)
+       (td-write-u32 #x300005C 1)        ;; pci-mode=1 (ECAM)
+       (td-write-u32 #x3000060 #x41090000)
+       (td-write-u32 #x3000064 #x41000000)
+       (td-write-u32 #x3000068 0))
       ((= arch 2) ;; i386
        ;; Fixpoint image extends to 0x480040 — all state must be AFTER image
        ;; (standalone i386 uses 0x200000 but fixpoint image is 3.5MB)
-       (td-write-u32 #x500040 #x500000)   ;; state-base (was 0x200000)
-       (td-write-u32 #x500044 #x580000)   ;; ssh-conn (was 0x280000)
-       (td-write-u32 #x500048 #x600000)   ;; ssh-ipc (was 0x300000)
-       (td-write-u32 #x50004C #x490000)   ;; rx-desc (was 0x180000)
-       (td-write-u32 #x500050 #x491000)   ;; rx-buf (was 0x181000)
-       (td-write-u32 #x500054 #x4D1000)   ;; tx-desc (was 0x1C1000)
-       (td-write-u32 #x500058 #x4D1400)   ;; tx-buf (was 0x1C1400)
-       (td-write-u32 #x50005C 2)           ;; pci-mode=2 (none)
-       (td-write-u32 #x500060 #x690000)   ;; usb-ring (was 0x290000)
-       (td-write-u32 #x500064 #x490000)   ;; usb-dma (was 0x180000)
-       (td-write-u32 #x500068 0))
+       (td-write-u32 #x3000040 #x3000000)   ;; state-base (was 0x200000)
+       (td-write-u32 #x3000044 #x580000)   ;; ssh-conn (was 0x280000)
+       (td-write-u32 #x3000048 #x600000)   ;; ssh-ipc (was 0x300000)
+       (td-write-u32 #x300004C #x490000)   ;; rx-desc (was 0x180000)
+       (td-write-u32 #x3000050 #x491000)   ;; rx-buf (was 0x181000)
+       (td-write-u32 #x3000054 #x4D1000)   ;; tx-desc (was 0x1C1000)
+       (td-write-u32 #x3000058 #x4D1400)   ;; tx-buf (was 0x1C1400)
+       (td-write-u32 #x300005C 2)           ;; pci-mode=2 (none)
+       (td-write-u32 #x3000060 #x690000)   ;; usb-ring (was 0x290000)
+       (td-write-u32 #x3000064 #x490000)   ;; usb-dma (was 0x180000)
+       (td-write-u32 #x3000068 0))
       ((= arch 3) ;; arm32
-       (td-write-u32 #x500040 #x01060000)
-       (td-write-u32 #x500044 #x01080000)
-       (td-write-u32 #x500048 #x01100000)
-       (td-write-u32 #x50004C #x01000000)
-       (td-write-u32 #x500050 #x01001000)
-       (td-write-u32 #x500054 #x01041000)
-       (td-write-u32 #x500058 #x01041400)
-       (td-write-u32 #x50005C 2)        ;; pci-mode=2 (none)
-       (td-write-u32 #x500060 #x01090000)
-       (td-write-u32 #x500064 #x01000000)
-       (td-write-u32 #x500068 #x3F980000)))
+       (td-write-u32 #x3000040 #x01060000)
+       (td-write-u32 #x3000044 #x01080000)
+       (td-write-u32 #x3000048 #x01100000)
+       (td-write-u32 #x300004C #x01000000)
+       (td-write-u32 #x3000050 #x01001000)
+       (td-write-u32 #x3000054 #x01041000)
+       (td-write-u32 #x3000058 #x01041400)
+       (td-write-u32 #x300005C 2)        ;; pci-mode=2 (none)
+       (td-write-u32 #x3000060 #x01090000)
+       (td-write-u32 #x3000064 #x01000000)
+       (td-write-u32 #x3000068 #x3F980000)))
     ;; Set buf-read-u32 high-byte mask: 0x3F (63) on 32-bit, 0xFF (255) on 64-bit
     ;; Stored at 0x48006C as single byte, read via mem-ref :u8 (no function call)
-    (setf (mem-ref #x50006C :u8) (if (>= arch 2) 63 255))
+    (setf (mem-ref #x300006C :u8) (if (>= arch 2) 63 255))
     ;; Set is-32-bit flag: 1 on 32-bit (i386/arm32), 0 on 64-bit (x64/aarch64)
     ;; Used by dispatch wrappers via mem-ref :u8 (no function call, no register clobber)
-    (setf (mem-ref #x50006D :u8) (if (>= arch 2) 1 0))))
+    (setf (mem-ref #x300006D :u8) (if (>= arch 2) 1 0))))
 
-(defun e1000-state-base () (td-read-u32 #x500040))
-(defun e1000-rx-desc-base () (td-read-u32 #x50004C))
-(defun e1000-rx-buf-base () (td-read-u32 #x500050))
-(defun e1000-tx-desc-base () (td-read-u32 #x500054))
-(defun e1000-tx-buf-base () (td-read-u32 #x500058))
-(defun ssh-conn-base () (td-read-u32 #x500044))
-(defun ssh-ipc-base () (td-read-u32 #x500048))
-(defun usb-ring-base () (td-read-u32 #x500060))
-(defun usb-dma-base () (td-read-u32 #x500064))
-(defun dwc2-base () (td-read-u32 #x500068))
+(defun e1000-state-base () (td-read-u32 #x3000040))
+(defun e1000-rx-desc-base () (td-read-u32 #x300004C))
+(defun e1000-rx-buf-base () (td-read-u32 #x3000050))
+(defun e1000-tx-desc-base () (td-read-u32 #x3000054))
+(defun e1000-tx-buf-base () (td-read-u32 #x3000058))
+(defun ssh-conn-base () (td-read-u32 #x3000044))
+(defun ssh-ipc-base () (td-read-u32 #x3000048))
+(defun usb-ring-base () (td-read-u32 #x3000060))
+(defun usb-dma-base () (td-read-u32 #x3000064))
+(defun dwc2-base () (td-read-u32 #x3000068))
 
 ;;; PCI dispatch — uses pci-mode set at boot
 ;;; Mode 0: x64 port I/O (0xCF8/0xCFC)
@@ -115,7 +115,7 @@
               (+ #x4010000000 (logior f e)))))))))
 
 (defun pci-config-read (bus dev fn reg)
-  (let ((mode (td-read-u32 #x50005C)))
+  (let ((mode (td-read-u32 #x300005C)))
     (if (= mode 0)
         ;; x64: port I/O
         (let ((addr (pci-config-addr-x64 bus dev fn reg)))
@@ -126,7 +126,7 @@
           (mem-ref addr :u32)))))
 
 (defun pci-config-write (bus dev fn reg val)
-  (let ((mode (td-read-u32 #x50005C)))
+  (let ((mode (td-read-u32 #x300005C)))
     (if (= mode 0)
         ;; x64: port I/O
         (let ((addr (pci-config-addr-x64 bus dev fn reg)))
@@ -163,7 +163,7 @@
 ;;; NIC driver dispatch - all architectures use e1000-send/receive interface
 ;;; but we dispatch to the right implementation based on architecture
 (defun e1000-send (buf len)
-  (let ((arch (td-read-u32 #x500008)))
+  (let ((arch (td-read-u32 #x3000008)))
     (cond
       ((= arch 2)
        (write-char-serial 83) ;; S (send)
@@ -187,7 +187,7 @@
       (write-char-serial 93)  ;; ]
       )))
 (defun e1000-receive ()
-  (let ((arch (td-read-u32 #x500008)))
+  (let ((arch (td-read-u32 #x3000008)))
     (cond
       ((= arch 2)
        (setq *ne2k-dbg-cnt* (+ *ne2k-dbg-cnt* 1))
@@ -203,7 +203,7 @@
       (t (e1000-hw-receive)))))             ;; x64/aarch64
 
 (defun e1000-rx-buf ()
-  (let ((arch (td-read-u32 #x500008)))
+  (let ((arch (td-read-u32 #x3000008)))
     (cond
       ((= arch 2) (ne2k-rx-host))           ;; i386
       ((= arch 3) (cdc-rx-buf-addr))        ;; arm32
@@ -275,7 +275,7 @@
           (e1000-init)))))
 
 (defun e1000-probe ()
-  (let ((arch (td-read-u32 #x500008)))
+  (let ((arch (td-read-u32 #x3000008)))
     (write-char-serial 80) ;; P
     (cond
       ((= arch 2) (progn (ne2k-reset) (ne2k-init)))  ;; i386
@@ -359,12 +359,12 @@
   (init-arch-addrs)
   ;; NIC initialization (dispatch selects driver based on my-architecture)
   (write-char-serial 91) (write-char-serial 49) (write-char-serial 93) ;; [1]
-  (let ((arch (td-read-u32 #x500008)))
+  (let ((arch (td-read-u32 #x3000008)))
     (if (or (= arch 2) (= arch 3))
         nil  ;; i386: no PCI (NE2000 ISA); arm32: no PCI (DWC2 USB)
         (pci-assign-bars)))
   (write-char-serial 91) (write-char-serial 50) (write-char-serial 93) ;; [2]
-  (let ((arch (td-read-u32 #x500008)))
+  (let ((arch (td-read-u32 #x3000008)))
     (cond
       ((= arch 3)
        ;; arm32: DWC2 + CDC-Ether (full init: DWC2, USB enum, CDC state, bulk IN)
@@ -379,7 +379,7 @@
   (ed25519-init)
   (write-char-serial 91) (write-char-serial 54) (write-char-serial 93) ;; [6]
   (write-char-serial 10)
-  (let ((arch (td-read-u32 #x500008)))
+  (let ((arch (td-read-u32 #x3000008)))
     (if (= arch 3)
         nil  ;; arm32: skip DHCP (USB network is always up)
         (dhcp-client)))
@@ -492,7 +492,7 @@
 ;;; renamed source still call the bare buf-read-u32, not c64-buf-read-u32.
 ;;; So these bare overrides are what c64-fe-mul etc. actually use.
 (defun buf-read-u32 (buf off)
-  (let ((b0 (logand (aref buf off) (mem-ref #x50006C :u8))))
+  (let ((b0 (logand (aref buf off) (mem-ref #x300006C :u8))))
     (let ((b1 (aref buf (+ off 1))))
       (let ((b2 (aref buf (+ off 2))))
         (let ((b3 (aref buf (+ off 3))))
@@ -504,7 +504,7 @@
         (logior (ash hi 8) lo)))))
 (defun buf-read-u32-mem (addr off)
   (let ((a0 (+ addr off)))
-    (let ((b0 (logand (mem-ref a0 :u8) (mem-ref #x50006C :u8))))
+    (let ((b0 (logand (mem-ref a0 :u8) (mem-ref #x300006C :u8))))
       (let ((b1 (mem-ref (+ a0 1) :u8)))
         (let ((b2 (mem-ref (+ a0 2) :u8)))
           (let ((b3 (mem-ref (+ a0 3) :u8)))
@@ -513,10 +513,10 @@
   (let ((b0 (aref buf offset)))
     (let ((b1 (aref buf (+ offset 1))))
       (let ((b2 (aref buf (+ offset 2))))
-        (let ((b3 (logand (aref buf (+ offset 3)) (mem-ref #x50006C :u8))))
+        (let ((b3 (logand (aref buf (+ offset 3)) (mem-ref #x300006C :u8))))
           (flat-logior4 b0 (ash b1 8) (ash b2 16) (ash b3 24)))))))
 (defun ssh-get-u32 (arr off)
-  (let ((b0 (logand (aref arr off) (mem-ref #x50006C :u8))))
+  (let ((b0 (logand (aref arr off) (mem-ref #x300006C :u8))))
     (let ((b1 (aref arr (+ off 1))))
       (let ((b2 (aref arr (+ off 2))))
         (let ((b3 (aref arr (+ off 3))))
@@ -575,10 +575,10 @@
 ;;; AArch64/ARM32: ARM virtual timer (~1ms at 62.5MHz), timer-rearm + WFI.
 ;;; Cross-compile mode: busy-wait (speed matters more than CPU efficiency).
 (defun io-delay ()
-  (let ((mode (td-read-u32 #x500038)))
+  (let ((mode (td-read-u32 #x3000038)))
     (if (= mode 1)
         ;; SSH mode: sleep until timer/interrupt (~1ms)
-        (let ((arch (td-read-u32 #x500008)))
+        (let ((arch (td-read-u32 #x3000008)))
           (if (= arch 3)
               ;; ARM32: timer-rearm + WFI
               (progn (timer-rearm) (wfi))
@@ -593,7 +593,7 @@
 ;;; Flat htonl — BARE override (replaces dispatch wrapper).
 ;;; Uses config mask at 0x48006C for byte 0 (63 on 32-bit, 255 on 64-bit).
 (defun htonl (v)
-  (let ((b0 (logand v (mem-ref #x50006C :u8))))
+  (let ((b0 (logand v (mem-ref #x300006C :u8))))
     (let ((b1 (logand (ash v -8) 255)))
       (let ((b2 (logand (ash v -16) 255)))
         (let ((b3 (logand (ash v -24) 255)))
@@ -1303,7 +1303,7 @@
   (let ((d dst))
     (let ((ff f))
       (let ((gg g))
-        (if (>= (mem-ref #x50006D :u8) 1)
+        (if (>= (mem-ref #x300006D :u8) 1)
             (c32-fe-mul d ff gg)
             (fe-mul-split d ff gg))))))
 
@@ -1441,7 +1441,7 @@
   ;; Must save args to let bindings before mem-ref (ARM32 VR=V0 aliasing)
   (let ((s scalar))
     (let ((p point))
-      (if (>= (mem-ref #x50006D :u8) 1)
+      (if (>= (mem-ref #x300006D :u8) 1)
           (c32-ed-scalar-mult s p)
           (let ((result (cons (cons (fe-from-int 0) (fe-from-int 1))
                               (cons (fe-from-int 1) (fe-from-int 0)))))
@@ -1850,7 +1850,7 @@
   ;; Must save args to let bindings before mem-ref (ARM32 VR=V0 aliasing)
   (let ((kk k))
     (let ((uu u))
-      (if (>= (mem-ref #x50006D :u8) 1)
+      (if (>= (mem-ref #x300006D :u8) 1)
           (c32-x25519 kk uu)
           (let ((s (x25519-alloc-state)))
             (x25519-alloc-state2 s)

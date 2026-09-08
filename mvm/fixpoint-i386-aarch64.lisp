@@ -1411,7 +1411,7 @@
       ;; 3. B instruction to kernel-main at 0x1000
       (write-char-serial 75)
       ;; Read kernel-main hash from running kernel's metadata at VA 0x500000
-      (let ((km-hash (td-read-u32 #x500028)))
+      (let ((km-hash (td-read-u32 #x3000028)))
         (print-dec km-hash) (write-char-serial 10)
         (let ((km-native-off (gethash km-hash fn-map)))
           (write-char-serial 79)
@@ -1435,7 +1435,7 @@
       ;; 4. Copy native code (starts at 0x1004)
       (write-char-serial 78)
       ;; Store native-code-offset in running kernel's scratch area
-      (td-write-u32 #x500050 (img-pos)) ; 0x300050
+      (td-write-u32 #x3000050 (img-pos)) ; 0x300050
       (let ((i 0))
         (loop
           (when (>= i native-size) (return nil))
@@ -1456,8 +1456,8 @@
         ;; 6. Append function table — raw byte copy from source image
         ;; (avoids u32 overflow for name hashes with byte 3 >= 0x80 on i386)
         (let ((ft-img-offset (img-pos))
-              (src-ft-addr (+ (td-read-u32 #x500030) (td-read-u32 #x500014)))
-              (ft-count (td-read-u32 #x500018)))
+              (src-ft-addr (+ (td-read-u32 #x3000030) (td-read-u32 #x3000014)))
+              (ft-count (td-read-u32 #x3000018)))
           (let ((total-ft-bytes (* ft-count 12))
                 (bi 0))
             (loop
@@ -1490,19 +1490,19 @@
             ;; fn-table-count
             (img-patch-u32 (+ md-img-off 24) ft-count)
             ;; native-code-offset
-            (img-patch-u32 (+ md-img-off 28) (td-read-u32 #x500050))
+            (img-patch-u32 (+ md-img-off 28) (td-read-u32 #x3000050))
             ;; native-code-length
             (img-patch-u32 (+ md-img-off 32) native-size)
             ;; preamble-size = 0x1000
             (img-patch-u32 (+ md-img-off 36) 4096)
             ;; kernel-main-hash-lo — raw byte copy (avoids u32 overflow on i386)
             (let ((dst-base (+ #x08000000 md-img-off 40)))
-              (setf (mem-ref dst-base :u8) (mem-ref #x500028 :u8))
-              (setf (mem-ref (+ dst-base 1) :u8) (mem-ref #x500029 :u8))
-              (setf (mem-ref (+ dst-base 2) :u8) (mem-ref #x50002A :u8))
-              (setf (mem-ref (+ dst-base 3) :u8) (mem-ref #x50002B :u8)))
+              (setf (mem-ref dst-base :u8) (mem-ref #x3000028 :u8))
+              (setf (mem-ref (+ dst-base 1) :u8) (mem-ref #x3000029 :u8))
+              (setf (mem-ref (+ dst-base 2) :u8) (mem-ref #x300002A :u8))
+              (setf (mem-ref (+ dst-base 3) :u8) (mem-ref #x300002B :u8)))
             ;; kernel-main native offset
-            (let ((km-native-off (gethash (td-read-u32 #x500028) fn-map)))
+            (let ((km-native-off (gethash (td-read-u32 #x3000028) fn-map)))
               (if km-native-off
                   (img-patch-u32 (+ md-img-off 44) km-native-off)
                   (img-patch-u32 (+ md-img-off 44) 0)))

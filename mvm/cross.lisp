@@ -556,8 +556,15 @@
 
    AArch64 MOVZ/MOVK encoding has imm16 at bits [20:5] of the 32-bit
    instruction word.  We read the existing instruction word, clear
-   bits [20:5], OR in the new imm16, write back."
-  (let ((patches (and (boundp '*aarch64-fn-addr-patches*)
+   bits [20:5], OR in the new imm16, write back.
+
+   ARCH GUARD: these are AArch64 MOVZ/MOVK patches — they are meaningless
+   for any other target and CORRUPT it (a stale *aarch64-fn-addr-patches*
+   from an earlier translation would otherwise stamp imm16 fields onto x64
+   code, e.g. turning a `jne rel32` into a wild branch).  Only apply when
+   the image target is AArch64/RPi."
+  (let ((patches (and (member (getf boot-descriptor :arch) '(:aarch64 :rpi))
+                      (boundp '*aarch64-fn-addr-patches*)
                       *aarch64-fn-addr-patches*)))
     (when patches
       (let* ((native-image-offset (or (kernel-image-native-image-offset image) 0))
@@ -630,9 +637,13 @@
      code_end  = code_base + native-code-length
    into slots 0x10000160 / 0x10000168, matching the x64 emit-code-
    bounds-init contract that functionp (cl-eval.lisp) consumes."
-  (let ((cb-off (and (boundp 'modus.mvm::*aarch64-code-base-patch-offset*)
+  ;; ARCH GUARD (same class as apply-aarch64-fn-addr-patches): only apply to
+  ;; an AArch64/RPi target — a stale patch-offset must never touch x64 code.
+  (let ((cb-off (and (member (getf boot-descriptor :arch) '(:aarch64 :rpi))
+                     (boundp 'modus.mvm::*aarch64-code-base-patch-offset*)
                      modus.mvm::*aarch64-code-base-patch-offset*))
-        (ce-off (and (boundp 'modus.mvm::*aarch64-code-end-patch-offset*)
+        (ce-off (and (member (getf boot-descriptor :arch) '(:aarch64 :rpi))
+                     (boundp 'modus.mvm::*aarch64-code-end-patch-offset*)
                      modus.mvm::*aarch64-code-end-patch-offset*)))
     (when (and cb-off ce-off boot-descriptor)
       (let* ((declared-load-addr (or (getf boot-descriptor :load-addr) 0))
@@ -1452,6 +1463,12 @@
   (let ((forms nil)
         (lines nil)
         (line-count 1)
+        ;; Newlines counted so far, and the position through which we counted.
+        ;; Counting from the string start for EVERY form is O(n^2) over a large
+        ;; blob (SBCL/CCL's fast native COUNT hides it; ABCL's does not — 132 s
+        ;; on the 5 MB CLI blob).  Advance incrementally instead: same result,
+        ;; O(n) total.
+        (prev-pos 0)
         ;; Read in :MODUS.MVM so #.<reader-eval> of MVM constants (interp.lisp's
         ;; (#.+op-nop+ ...) case keys) resolves in the package where load-mvm
         ;; bound them.  Symbols are name-hashed by the compiler (package-
@@ -1460,7 +1477,8 @@
     (with-input-from-string (stream source-text)
       (loop
         (let ((pos (file-position stream)))
-          (setf line-count (1+ (count #\Newline source-text :end pos)))
+          (incf line-count (count #\Newline source-text :start prev-pos :end pos))
+          (setf prev-pos pos)
           (let ((form (handler-case (read stream nil :eof)
                         (error (e)
                           (format t "  SKIP read at line ~D: ~A~%" line-count e)

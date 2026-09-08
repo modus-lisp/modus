@@ -39,9 +39,9 @@
 
 (defun img-emit-boot-preamble ()
   ;; Preamble size stored at metadata +0x24 = address 0x300024
-  (let ((size (td-read-u32 #x500024))
+  (let ((size (td-read-u32 #x3000024))
         (i 0))
-    (let ((load-addr (td-read-u32 #x500030)))
+    (let ((load-addr (td-read-u32 #x3000030)))
       (loop
         (when (>= i size) (return i))
         (img-emit (mem-ref (+ load-addr i) :u8))
@@ -78,14 +78,14 @@
       (write-char-serial 10)
       ;; 3. Emit JMP rel32 to kernel-main
       ;; Kernel-main native offset from metadata +0x2C
-      (let ((km-offset (td-read-u32 #x50002C)))
+      (let ((km-offset (td-read-u32 #x300002C)))
         (let ((jmp-pos (img-pos)))
           (img-emit #xE9)
           (img-emit-u32 km-offset)
           ;; 4. Copy native code from code-buffer
           (write-char-serial 78) ;; N
           ;; Save code-start position in diagnostic slot for metadata
-          (td-write-u32 #x500050 (img-pos))
+          (td-write-u32 #x3000050 (img-pos))
           (let ((i 0))
             (loop
               (when (>= i native-size) (return nil))
@@ -125,7 +125,7 @@
               (write-char-serial 10)
               ;; 7. Write fixpoint metadata at offset 0x400000 (= VA 0x500000 for x64)
               ;; All values as u32 LE
-              (let ((md-img-off #x400000))
+              (let ((md-img-off #x2F00000))
                 ;; magic MVMT = 0x544D564D
                 (img-patch-u32 md-img-off #x544D564D)
                 ;; version = 1
@@ -141,14 +141,14 @@
                 ;; fn-table-count
                 (img-patch-u32 (+ md-img-off 24) ft-count)
                 ;; native-code-offset (saved in diagnostic slot)
-                (img-patch-u32 (+ md-img-off 28) (td-read-u32 #x500050))
+                (img-patch-u32 (+ md-img-off 28) (td-read-u32 #x3000050))
                 ;; native-code-length
                 (img-patch-u32 (+ md-img-off 32) native-size)
                 ;; preamble-size (same as running kernel)
-                (let ((preamble (td-read-u32 #x500024)))
+                (let ((preamble (td-read-u32 #x3000024)))
                   (img-patch-u32 (+ md-img-off 36) preamble))
                 ;; kernel-main-hash-lo (copy from running kernel)
-                (let ((km-hash (td-read-u32 #x500028)))
+                (let ((km-hash (td-read-u32 #x3000028)))
                   (img-patch-u32 (+ md-img-off 40) km-hash))
                 ;; kernel-main-native-offset
                 (img-patch-u32 (+ md-img-off 44) km-offset)
@@ -159,7 +159,7 @@
                 ;; mode (default: 0=cross-compile, overridden by host script)
                 (img-patch-u32 (+ md-img-off 56) 0))
               ;; 8. Patch multiboot header: load_end_addr, bss_end_addr
-              (let ((total-size (+ #x400000 64)))
+              (let ((total-size (+ #x2F00000 64)))
                 (let ((load-end (+ #x100000 total-size)))
                   (img-patch-u32 20 load-end)
                   (img-patch-u32 24 load-end))
@@ -275,7 +275,7 @@
       ;; Step 3: Translate and assemble based on target
       (write-char-serial 83) (write-char-serial 51) (write-char-serial 58)
       (write-char-serial 10)
-      (let ((my-arch (td-read-u32 #x500008)))
+      (let ((my-arch (td-read-u32 #x3000008)))
         ;; Dispatch: target 0=x64, 1=aarch64, 2=i386, 3=arm32
         (cond
           ((= my-arch 3)

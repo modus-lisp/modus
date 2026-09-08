@@ -101,6 +101,19 @@
                       s)
         (terpri s)))))
 
+;; Shrink the x64 code-buffer default 96 MB → 1 MB (same transform the self-host
+;; build does).  The fixpoint now self-translates 4417 functions IN-IMAGE with a
+;; live GC; a 96 MB default per make-code-buffer instantly fills a ~104 MB Cheney
+;; semispace and the alloc pointer runs off into the GC config page.  1 MB +
+;; grow-on-demand is what build-modus-selfhost uses.
+(let ((needle "(bytes (make-array 100663296 :element-type '(unsigned-byte 8)))")
+      (repl   "(bytes (make-array 1048576 :element-type '(unsigned-byte 8)))"))
+  (let ((p (search needle *mvm-source-text*)))
+    (when p
+      (setf *mvm-source-text*
+            (concatenate 'string (subseq *mvm-source-text* 0 p) repl
+                         (subseq *mvm-source-text* (+ p (length needle))))))))
+
 ;;; ============================================================
 ;;; Source preprocessing (SBCL-side)
 ;;; Fixes &key calls, macrolet, constants for bare-metal MVM compilation
@@ -172,6 +185,30 @@
         (length *fixpoint-extra-modules*)
         (if *fixpoint-ssh-mode* " + SSH" ""))
 
+;; CL runtime — the fixpoint's compiler code (prelude + translators + cross) has
+;; drifted to depend on the full runtime: generic arithmetic (generic-add,
+;; bignum-ash, numeric-*), the array runtime (%mda-*/%wrapper-*/%aset-*), the
+;; condition system (%signal-*) and funcall dispatch (%funcall-*).  Without
+;; these, every such call was UNRESOLVED and defaulted to bytecode offset 0 =
+;; the module's first function (SPIN-DELAY), so boot hung the moment
+;; init-*opcode-table*'s gethash touched generic hashing.  Bake the same runtime
+;; set (and order) build-cli-common does so those calls resolve.
+(defvar *fixpoint-runtime-source*
+  (concatenate 'string
+    (mvm-text "mvm/gc.lisp")           (string #\Newline)
+    (mvm-text "mvm/cl-sequences.lisp") (string #\Newline)
+    (mvm-text "mvm/cl-streams.lisp")   (string #\Newline)
+    (mvm-text "mvm/cl-fileio.lisp")    (string #\Newline)
+    (mvm-text "mvm/cl-printer.lisp")   (string #\Newline)
+    (mvm-text "mvm/cl-reader.lisp")    (string #\Newline)
+    (mvm-text "mvm/cl-eval.lisp")      (string #\Newline)
+    (mvm-text "mvm/cl-clos.lisp")      (string #\Newline)
+    (mvm-text "mvm/cl-types.lisp")     (string #\Newline)
+    (mvm-text "mvm/cl-packages.lisp")  (string #\Newline)
+    (mvm-text "mvm/cl-conditions.lisp") (string #\Newline)
+    (mvm-text "mvm/ansi-bridge.lisp")  (string #\Newline)))
+(format t "Fixpoint runtime source: ~D chars~%" (length *fixpoint-runtime-source*))
+
 ;;; ============================================================
 ;;; Generate opcode table init source (in cl-user, before package switch)
 ;;; ============================================================
@@ -185,6 +222,11 @@
   (let ((ot modus.mvm::*opcode-table*)
         (count 0))
     (with-output-to-string (s)
+      ;; init-opcode-entries (generated below) calls (%make-opcode-info code
+      ;; name operands desc) — a POSITIONAL constructor.  Only the &key
+      ;; defstruct constructor MAKE-OPCODE-INFO exists, so define the positional
+      ;; wrapper here (otherwise the call is unresolved → offset 0 = SPIN-DELAY).
+      (format s "(defun %make-opcode-info (code name operands desc)~%  (make-opcode-info :code code :name name :operands operands :description desc))~%")
       (format s "(defun init-opcode-entries ()~%")
       (cl:maphash (lambda (code info)
                     (incf count)
@@ -232,6 +274,14 @@
 (funcall (intern "INSTALL-I386-TRANSLATOR" "MODUS.MVM.I386"))
 (install-armv7-rpi-translator)
 
+;; Enable the x64 Cheney GC (same as build-x64/build-generic-cli).  The fixpoint
+;; now bakes the full CL runtime and self-translates 4417 functions, allocating
+;; ~230 MB+ — with GC OFF the alloc pointer R12 ran past the from-space limit
+;; R14 into garbage (ENSURE-LABEL-AT read a wild pointer mid-translation).  With
+;; it on, each alloc gets a gc-check and %gc-collect (baked from gc.lisp) is
+;; wired into the trampoline.  Host-build codegen flag → Gen0's native code.
+(setf modus.mvm.x64::*x64-gc-enabled* t)
+
 ;; init-opcode-entries source was generated above (before in-package switch)
 ;; to avoid maphash compiler-macro conflict in modus.mvm package.
 ;; (See *opcode-init-source* defvar near top of this section)
@@ -247,6 +297,10 @@
                (string #\Newline)
                ;; Networking source (only when --ssh)
                (or cl-user::*net-source-text* "")
+               (string #\Newline)
+               ;; CL runtime (generic arith, arrays, conditions, funcall) —
+               ;; see *fixpoint-runtime-source* note above.
+               cl-user::*fixpoint-runtime-source*
                (string #\Newline)
                ;; MVM system source
                cl-user::*mvm-source-text*
@@ -265,6 +319,24 @@
   ;; Boot code also sets this up, but setup-irq ensures it works for all
   ;; generations regardless of boot path. Safe to call twice.
   (setup-irq)
+  ;; ---- CL runtime bring-up (the shared boot init build-cli-common does).
+  ;; The fixpoint now bakes the full CL runtime (generic arith, arrays,
+  ;; conditions, hash tables), and that runtime reads the symbol/keyword/package
+  ;; tables + defvar globals — which must be initialised FIRST, or the very
+  ;; first gethash/puthash/intern writes through uninitialised state (a -1
+  ;; pointer → page fault).  Order mirrors the CLI's kernel-main.
+  (init-symbol-table)
+  (write-char-serial 82) (write-char-serial 49) (write-char-serial 10)  ; R1
+  (init-keyword-table)
+  (%init-packages)
+  (setq *error-output* *standard-output*)   ; bare-metal: no fd-2 stream
+  (write-char-serial 82) (write-char-serial 50) (write-char-serial 10)  ; R2
+  (%init-condition-types)
+  (%init-reader)
+  (%init-symbol-function-table)
+  (write-char-serial 82) (write-char-serial 51) (write-char-serial 10)  ; R3
+  (init-all-globals)
+  (write-char-serial 82) (write-char-serial 52) (write-char-serial 10)  ; R4
   ;; Initialize MVM runtime tables
   (write-char-serial 73) (write-char-serial 49) (write-char-serial 10)
   (init-*gensym-counter*)
@@ -306,7 +378,7 @@
   (init-*arm32-vreg-map*)
   (write-char-serial 73) (write-char-serial 57) (write-char-serial 10)
   ;; Check mode: 0=cross-compile, 1=SSH server, 2=REPL
-  (let ((mode (td-read-u32 #x500038)))
+  (let ((mode (td-read-u32 #x3000038)))
     (write-char-serial 77) (write-char-serial 61) ;; M=
     (print-dec mode) (write-char-serial 10)
     (cond
@@ -318,7 +390,7 @@
        (repl (cons nil nil)))
       (t
        ;; Cross-compile mode: read target from metadata
-       (let ((target (td-read-u32 #x500034)))
+       (let ((target (td-read-u32 #x3000034)))
          (build-image-cross target)))))
   (write-char-serial 68) (write-char-serial 10)
   ;; Drop to REPL
@@ -551,8 +623,12 @@
          ;; x64: loaded at PA 0x100000, identity mapped, so VA = 0x100000
          ;; aarch64: loaded at PA 0x40080000, MMU maps VA=PA-0x40000000, so VA = 0x80000
          (load-addr (case gen0-arch (:x64 #x100000) (:aarch64 #x80000)))
-         ;; Metadata image offset: chosen so VA = load-addr + offset = 0x500000
-         (metadata-offset (case gen0-arch (:x64 #x400000) (:aarch64 #x480000)))
+         ;; Metadata image offset: chosen so VA = load-addr + offset = 0x2000000
+         ;; (32 MB), well above the ~15 MB image.  Was 0x500000 (5 MB), which
+         ;; the grown image overran (#252).  The 182 metadata reads in the baked
+         ;; fixpoint source were moved 0x5000xx -> 0x20000xx to match; the ssh-ipc
+         ;; buffer and the stack were relocated above the image too (below).
+         (metadata-offset (case gen0-arch (:x64 #x2F00000) (:aarch64 #x2F80000)))
          (jmp-size (case gen0-arch (:x64 5) (:aarch64 4)))
          (output-path (case gen0-arch
                         (:x64     "/tmp/fixpoint-gen0.elf")
@@ -567,6 +643,13 @@
     (setq *aarch64-serial-width* 0)
     (setq *aarch64-serial-tx-poll* nil)
     (setq *aarch64-sched-lock-addr* nil))
+
+  ;; x64: the initial stack top (0x800000, 8 MB) now sits INSIDE the ~15 MB
+  ;; image, so relocate it to 512 MB — the same override the large ANSI x64
+  ;; build uses (build-x64.lisp).  Above the image, the 32 MB metadata, the
+  ;; 128 MB Gen1 build buffer, and the 256 MB heap.
+  (when (eq gen0-arch :x64)
+    (setf modus.mvm::*x64-stack-top-override* #x20000000))
 
   (let ((boot-desc (get-boot-descriptor boot-target)))
     (let ((image (assemble-kernel-image module (find-target build-target)

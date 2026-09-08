@@ -81,12 +81,12 @@
 ;;; LI bytecode format: [opcode:1][reg:1][imm64:8] = 10 bytes total.
 (defun i386-translate-li-raw (buf state bytecode pos)
   (let ((new-pos (+ pos 10)))
-    (td-write-u32 #x2000060 new-pos)
+    (td-write-u32 #x3000060 new-pos)
     (let ((label (gethash pos (i386-translate-state-label-map state))))
       (when label
         (i386-emit-label buf label)))
-    (td-write-u32 #x200004C 17)
-    (td-write-u32 #x2000048 pos)
+    (td-write-u32 #x300004C 17)
+    (td-write-u32 #x3000048 pos)
     (let ((vd (logand (aref bytecode (+ pos 1)) 31)))
       (let ((imm-pos (+ pos 2)))
         (cond
@@ -115,14 +115,14 @@
       ;; All other opcodes: normal decode path
       (let ((decoded (decode-instruction bytecode pos)))
         (let ((new-pos (cdr (cdr decoded))))
-          (td-write-u32 #x2000060 new-pos)
+          (td-write-u32 #x3000060 new-pos)
           (let ((label (gethash pos (i386-translate-state-label-map state))))
             (when label
               (i386-emit-label buf label)))
           (let ((opcode (car decoded)))
             (let ((operands (car (cdr decoded))))
-              (td-write-u32 #x200004C opcode)
-              (td-write-u32 #x2000048 pos)
+              (td-write-u32 #x300004C opcode)
+              (td-write-u32 #x3000048 pos)
               (i386-translate-insn state opcode operands new-pos)))
           new-pos))))
 
@@ -1171,15 +1171,15 @@
         ;; Translate each function — use single reusable state
         (write-char-serial 84) (write-char-serial 10) ;; T
         ;; Reset all diagnostic addresses
-        (td-write-u32 #x2000040 0)
-        (td-write-u32 #x2000044 0)
-        (td-write-u32 #x2000048 0)
-        (td-write-u32 #x200004C 0)
-        (td-write-u32 #x2000050 0)
-        (td-write-u32 #x2000054 0)
-        (td-write-u32 #x2000058 0)
-        (td-write-u32 #x200005C 0)
-        (td-write-u32 #x2000060 0)
+        (td-write-u32 #x3000040 0)
+        (td-write-u32 #x3000044 0)
+        (td-write-u32 #x3000048 0)
+        (td-write-u32 #x300004C 0)
+        (td-write-u32 #x3000050 0)
+        (td-write-u32 #x3000054 0)
+        (td-write-u32 #x3000058 0)
+        (td-write-u32 #x300005C 0)
+        (td-write-u32 #x3000060 0)
         ;; Print alloc pointer before translation
         (write-char-serial 65) ;; A
         (write-char-serial 80) ;; P
@@ -1211,7 +1211,7 @@
                       (loop
                         (when (>= pos limit) (return nil))
                         (i386-translate-one-insn buf state bytecode pos)
-                        (setq pos (td-read-u32 #x2000060)))))))
+                        (setq pos (td-read-u32 #x3000060)))))))
             (when (zerop (mod i 50))
               (write-char-serial 46)) ;; progress dot every 50 functions
             (setq rest-ft (cdr rest-ft))
@@ -1264,14 +1264,14 @@
         (write-char-serial 80) ;; P
         (print-dec boot-size) (write-char-serial 10)
         ;; 3. Emit JMP rel32 to kernel-main
-        (let ((km-hash (td-read-u32 #x2000028)))
+        (let ((km-hash (td-read-u32 #x3000028)))
           (let ((km-native-off (gethash km-hash fn-map)))
             (let ((km-offset (if km-native-off km-native-off 0)))
               (img-emit 233)  ;; 0xE9 = JMP rel32
               (img-emit-u32 km-offset))))
         ;; 4. Copy native code
         (write-char-serial 78) ;; N
-        (td-write-u32 #x2000050 (img-pos))
+        (td-write-u32 #x3000050 (img-pos))
         (let ((i 0))
           (loop
             (when (>= i native-size) (return nil))
@@ -1293,8 +1293,8 @@
           ;; 6. Append function table — raw byte copy from source image
           ;; (avoids u32 overflow for name hashes with byte 3 >= 0x80 on i386)
           (let ((ft-img-offset (img-pos))
-                (src-ft-addr (+ (td-read-u32 #x2000030) (td-read-u32 #x2000014)))
-                (ft-count (td-read-u32 #x2000018)))
+                (src-ft-addr (+ (td-read-u32 #x3000030) (td-read-u32 #x3000014)))
+                (ft-count (td-read-u32 #x3000018)))
             (let ((total-ft-bytes (* ft-count 12))
                   (bi 0))
               (loop
@@ -1304,7 +1304,7 @@
             (write-char-serial 10)
             (print-dec ft-count) (write-char-serial 10)
             ;; 7. Write metadata at offset 0x400000 (VA = 0x100000 + 0x400000 = 0x500000)
-            (let ((md-img-off #x1F00000))
+            (let ((md-img-off #x2F00000))
               ;; magic MVMT = 0x544D564D — write as individual bytes
               ;; (0x544D564D > 2^30, overflows i386 30-bit fixnum)
               (let ((base (+ #x08000000 md-img-off)))
@@ -1319,17 +1319,17 @@
               (img-patch-u32 (+ md-img-off 16) bc-len)
               (img-patch-u32 (+ md-img-off 20) ft-img-offset)
               (img-patch-u32 (+ md-img-off 24) ft-count)
-              (img-patch-u32 (+ md-img-off 28) (td-read-u32 #x2000050))
+              (img-patch-u32 (+ md-img-off 28) (td-read-u32 #x3000050))
               (img-patch-u32 (+ md-img-off 32) native-size)
               (img-patch-u32 (+ md-img-off 36) boot-size)
               ;; kernel-main-hash-lo — raw byte copy (avoids u32 overflow on i386)
               (let ((dst-base (+ #x08000000 md-img-off 40)))
-                (setf (mem-ref dst-base :u8) (mem-ref #x2000028 :u8))
-                (setf (mem-ref (+ dst-base 1) :u8) (mem-ref #x2000029 :u8))
-                (setf (mem-ref (+ dst-base 2) :u8) (mem-ref #x200002A :u8))
-                (setf (mem-ref (+ dst-base 3) :u8) (mem-ref #x200002B :u8)))
+                (setf (mem-ref dst-base :u8) (mem-ref #x3000028 :u8))
+                (setf (mem-ref (+ dst-base 1) :u8) (mem-ref #x3000029 :u8))
+                (setf (mem-ref (+ dst-base 2) :u8) (mem-ref #x300002A :u8))
+                (setf (mem-ref (+ dst-base 3) :u8) (mem-ref #x300002B :u8)))
               ;; kernel-main native offset
-              (let ((km-native-off (gethash (td-read-u32 #x2000028) fn-map)))
+              (let ((km-native-off (gethash (td-read-u32 #x3000028) fn-map)))
                 (if km-native-off
                     (img-patch-u32 (+ md-img-off 44) km-native-off)
                     (img-patch-u32 (+ md-img-off 44) 0)))
@@ -1339,7 +1339,7 @@
               (img-patch-u32 (+ md-img-off 52) 0)
               (img-patch-u32 (+ md-img-off 56) 0))
             ;; 8. Patch multiboot header: load_end_addr, bss_end_addr
-            (let ((total-size (+ #x1F00000 64)))
+            (let ((total-size (+ #x2F00000 64)))
               (let ((load-end (+ #x100000 total-size)))
                 (img-patch-u32 20 load-end)
                 (img-patch-u32 24 load-end))
@@ -1398,7 +1398,7 @@
 ;;; 30-bit fixnum. Return XOR checksum instead (diagnostic only, not
 ;;; used for fixpoint comparison — SHA256 of full image is the proof).
 (defun td-fnv-native (bytes size)
-  (let ((my-arch (td-read-u32 #x2000008)))
+  (let ((my-arch (td-read-u32 #x3000008)))
     (if (= my-arch 2)
         ;; i386 host: XOR checksum (FNV constants overflow)
         (let ((xsum 0) (j 0))

@@ -33,27 +33,27 @@
   (write-char-serial 82) (write-char-serial 58)
   ;; Print current function index from diagnostic address
   (write-char-serial 102) ;; f
-  (print-dec (td-read-u32 #x2000040))
+  (print-dec (td-read-u32 #x3000040))
   ;; Print step checkpoint
   (write-char-serial 115) ;; s
-  (print-dec (td-read-u32 #x2000044))
+  (print-dec (td-read-u32 #x3000044))
   ;; Print current bytecode position
   (write-char-serial 64) ;; @
-  (print-dec (td-read-u32 #x2000048))
+  (print-dec (td-read-u32 #x3000048))
   ;; Print opcode
   (write-char-serial 111) ;; o
-  (print-dec (td-read-u32 #x200004C))
+  (print-dec (td-read-u32 #x300004C))
   ;; Print new-pos
   (write-char-serial 110) ;; n
-  (print-dec (td-read-u32 #x2000050))
+  (print-dec (td-read-u32 #x3000050))
   ;; Print MOV operands
   (write-char-serial 32) (write-char-serial 100) ;; d
-  (print-dec (td-read-u32 #x2000054))
+  (print-dec (td-read-u32 #x3000054))
   (write-char-serial 47) ;; /
-  (print-dec (td-read-u32 #x2000058))
+  (print-dec (td-read-u32 #x3000058))
   ;; Print completion marker
   (write-char-serial 32) (write-char-serial 99) ;; c
-  (print-dec (td-read-u32 #x200005C))
+  (print-dec (td-read-u32 #x300005C))
   ;; Print msg value (if fixnum, print as number; helps identify which error)
   (write-char-serial 32) (write-char-serial 109) ;; m
   (print-dec msg)
@@ -92,9 +92,9 @@
 
 ;;; Fixpoint: read embedded MVM bytecode into an array
 (defun td-read-bytecode ()
-  (let ((img-base (td-read-u32 #x2000030)))
-    (let ((bc-off (td-read-u32 #x200000C)))
-      (let ((bc-len (td-read-u32 #x2000010)))
+  (let ((img-base (td-read-u32 #x3000030)))
+    (let ((bc-off (td-read-u32 #x300000C)))
+      (let ((bc-len (td-read-u32 #x3000010)))
         (if (zerop bc-len)
             nil
             (let ((addr (+ img-base bc-off)))
@@ -108,9 +108,9 @@
 ;;; Fixpoint: read embedded function table as a list of (name offset length)
 ;;; Function table entries are 12 bytes each (3 x u32 LE)
 (defun td-read-fn-table-list ()
-  (let ((img-base (td-read-u32 #x2000030)))
-    (let ((ft-off (td-read-u32 #x2000014)))
-      (let ((ft-count (td-read-u32 #x2000018)))
+  (let ((img-base (td-read-u32 #x3000030)))
+    (let ((ft-off (td-read-u32 #x3000014)))
+      (let ((ft-count (td-read-u32 #x3000018)))
         (if (zerop ft-count)
             nil
             (let ((addr (+ img-base ft-off)))

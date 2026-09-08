@@ -39,8 +39,8 @@
                                               (logior (ash (logand offset #x7FFFF) 5)
                                                       cond-bits))))
                          ;; Check for bad bit4: write to scratch and check
-                         (setf (mem-ref #x2000078 :u64) new-word)
-                         (let ((check-b0 (mem-ref #x2000078 :u8)))
+                         (setf (mem-ref #x3000078 :u64) new-word)
+                         (let ((check-b0 (mem-ref #x3000078 :u8)))
                            (when (not (zerop (logand check-b0 #x20)))
                              (when (<= fix-bcond 5)
                                (write-char-serial 33) ;; !
@@ -272,10 +272,10 @@
 ;;; so they read wrong values. Fix: store buf at memory address 0x300058.
 
 (defun set-current-a64-buf (buf)
-  (setf (mem-ref #x2000058 :u64) buf))
+  (setf (mem-ref #x3000058 :u64) buf))
 
 (defun get-current-a64-buf ()
-  (mem-ref #x2000058 :u64))
+  (mem-ref #x3000058 :u64))
 
 ;;; Override ensure-src: reads buf from fixed memory instead of broken closure
 (defun ensure-src (vreg scratch)
@@ -299,7 +299,7 @@
     (loop
       (when (>= pos limit) (return nil))
       ;; Write diagnostic
-      (td-write-u32 #x2000048 pos)
+      (td-write-u32 #x3000048 pos)
       ;; Set label if this offset has one
       (let ((label (gethash pos mvm-to-native-label)))
         (when label
@@ -309,7 +309,7 @@
         (let ((opcode (car decoded))
               (operands (car (cdr decoded)))
               (new-pos (cdr (cdr decoded))))
-          (td-write-u32 #x200004C opcode)
+          (td-write-u32 #x300004C opcode)
           ;; Build a decoded-mvm-insn struct
           (let ((insn (make-decoded-mvm-insn)))
             (set-decoded-mvm-insn-offset insn pos)
@@ -389,7 +389,7 @@
                 (i 0))
             (loop
               (when (>= i n-functions) (return nil))
-              (td-write-u32 #x2000040 i)
+              (td-write-u32 #x3000040 i)
               (let ((entry (car rest-ft)))
                 (let ((name (car entry))
                       (offset (car (cdr entry)))
@@ -457,16 +457,16 @@
                 (when (>= di diag-n) (return nil))
                 (let ((w (aref diag-code di)))
                   ;; Write tagged word to scratch address, read bytes
-                  (setf (mem-ref #x2000070 :u64) w)
+                  (setf (mem-ref #x3000070 :u64) w)
                   ;; :u64 writes raw tagged bits. Now read byte 3 (bits [31:24] of tagged)
                   ;; Tagged = untagged << 1, so byte 3 of tagged is different from untagged.
                   ;; For untagged 0x54000001, tagged 0xA8000002:
                   ;; byte0=0x02, byte1=0x00, byte2=0x00, byte3=0xA8
                   ;; We want to check untagged byte3 = 0x54. That's tagged byte3 = 0xA8.
-                  (let ((tb3 (mem-ref #x2000073 :u8)))
+                  (let ((tb3 (mem-ref #x3000073 :u8)))
                     (when (= tb3 #xA8)
                       ;; Check bit 4 of untagged byte0 = bit 5 of tagged byte0
-                      (let ((tb0 (mem-ref #x2000070 :u8)))
+                      (let ((tb0 (mem-ref #x3000070 :u8)))
                         (if (zerop (logand tb0 #x20))
                             (setq dg (+ dg 1))
                             (let ((dummy2 (+ 0 0)))
@@ -525,7 +525,7 @@
       ;; The boot preamble branches to offset 0x1000 (instruction 1024).
       ;; We emit a B instruction here that jumps forward to kernel-main.
       (write-char-serial 75) ;; K
-      (let ((km-hash (td-read-u32 #x2000028)))
+      (let ((km-hash (td-read-u32 #x3000028)))
         (print-dec km-hash) (write-char-serial 10)
         (let ((km-native-off (gethash km-hash fn-map)))
           (write-char-serial 79) ;; O
@@ -552,7 +552,7 @@
                 (img-emit-u32 #xD503201F)))))
       ;; 4. Copy native code (starts at 0x1004)
       (write-char-serial 78) ;; N
-      (td-write-u32 #x2000050 (img-pos))
+      (td-write-u32 #x3000050 (img-pos))
       (let ((i 0))
         (loop
           (when (>= i native-size) (return nil))
@@ -591,7 +591,7 @@
           ;; QEMU virt loads raw binary at PA 0x40080000 (not 0x40000000).
           ;; MMU maps VA = PA - 0x40000000, so image start VA = 0x80000.
           ;; Metadata VA must be 0x500000, so image offset = 0x500000 - 0x80000 = 0x440000.
-          (let ((md-img-off #x1F80000))
+          (let ((md-img-off #x2F80000))
             ;; magic MVMT
             (img-patch-u32 md-img-off #x544D564D)
             ;; version = 1
@@ -607,16 +607,16 @@
             ;; fn-table-count
             (img-patch-u32 (+ md-img-off 24) ft-count)
             ;; native-code-offset
-            (img-patch-u32 (+ md-img-off 28) (td-read-u32 #x2000050))
+            (img-patch-u32 (+ md-img-off 28) (td-read-u32 #x3000050))
             ;; native-code-length
             (img-patch-u32 (+ md-img-off 32) native-size)
             ;; preamble-size = 0x1000 (4096, AArch64 boot preamble)
             (img-patch-u32 (+ md-img-off 36) #x1000)
             ;; kernel-main-hash-lo (copy from running kernel)
-            (let ((km-hash (td-read-u32 #x2000028)))
+            (let ((km-hash (td-read-u32 #x3000028)))
               (img-patch-u32 (+ md-img-off 40) km-hash))
             ;; kernel-main native offset (look up in fn-map)
-            (let ((km-native-off (gethash (td-read-u32 #x2000028) fn-map)))
+            (let ((km-native-off (gethash (td-read-u32 #x3000028) fn-map)))
               (if km-native-off
                   (img-patch-u32 (+ md-img-off 44) km-native-off)
                   (img-patch-u32 (+ md-img-off 44) 0)))
@@ -628,7 +628,7 @@
             ;; mode (default: 0=cross-compile, overridden by host script)
             (img-patch-u32 (+ md-img-off 56) 0))
           ;; Total size must cover metadata at 0x440000
-          (let ((total-size (+ #x1F80000 64)))
+          (let ((total-size (+ #x2F80000 64)))
             (write-char-serial 65) (write-char-serial 49) ;; A1
             (write-char-serial 61) ;; =
             (print-dec total-size) (write-char-serial 10)
@@ -669,7 +669,7 @@
         (print-dec boot-size) (write-char-serial 10)
         ;; 3. Emit JMP rel32 to kernel-main
         ;; Look up kernel-main native offset from fn-map
-        (let ((km-hash (td-read-u32 #x2000028)))
+        (let ((km-hash (td-read-u32 #x3000028)))
           (let ((km-label (gethash km-hash fn-map)))
             (let ((km-offset 0))
               (when km-label
@@ -679,7 +679,7 @@
               (img-emit-u32 km-offset))))
         ;; 4. Copy native code
         (write-char-serial 78) ;; N
-        (td-write-u32 #x2000050 (img-pos))
+        (td-write-u32 #x3000050 (img-pos))
         (let ((i 0))
           (loop
             (when (>= i native-size) (return nil))
@@ -715,7 +715,7 @@
             (write-char-serial 10)
             (print-dec ft-count) (write-char-serial 10)
             ;; 7. Write metadata at offset 0x400000 (= VA 0x500000 for x64)
-            (let ((md-img-off #x1F80000))
+            (let ((md-img-off #x2F80000))
               ;; magic
               (img-patch-u32 md-img-off #x544D564D)
               (img-patch-u32 (+ md-img-off 4) 1)
@@ -725,11 +725,11 @@
               (img-patch-u32 (+ md-img-off 16) bc-len)
               (img-patch-u32 (+ md-img-off 20) ft-img-offset)
               (img-patch-u32 (+ md-img-off 24) ft-count)
-              (img-patch-u32 (+ md-img-off 28) (td-read-u32 #x2000050))
+              (img-patch-u32 (+ md-img-off 28) (td-read-u32 #x3000050))
               (img-patch-u32 (+ md-img-off 32) native-size)
               (img-patch-u32 (+ md-img-off 36) boot-size)
               ;; kernel-main-hash-lo
-              (let ((km-hash (td-read-u32 #x2000028)))
+              (let ((km-hash (td-read-u32 #x3000028)))
                 (img-patch-u32 (+ md-img-off 40) km-hash)
                 ;; kernel-main-native-offset
                 (let ((km-label (gethash km-hash fn-map)))
@@ -743,7 +743,7 @@
               ;; mode (default: 0=cross-compile, overridden by host script)
               (img-patch-u32 (+ md-img-off 56) 0))
             ;; 8. Patch multiboot header
-            (let ((total-size (+ #x1F80000 64)))
+            (let ((total-size (+ #x2F80000 64)))
               (let ((load-end (+ #x100000 total-size)))
                 (img-patch-u32 20 load-end)
                 (img-patch-u32 24 load-end))

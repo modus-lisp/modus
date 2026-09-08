@@ -139,7 +139,7 @@
     ("spin-lock" 1 (addr))
     ("spin-unlock" 1 (addr))
     ;; Architecture adapter base addresses: NOT dispatched.
-    ;; Replaced by boot-time config-block readers (td-read-u32 #x2000040+)
+    ;; Replaced by boot-time config-block readers (td-read-u32 #x3000040+)
     ;; in *fixpoint-extra-source*. Do not add to *override-fns*.
     ;; NOTE: make-array/aref/aset/array-length/try-alloc-obj/tag-as-object
     ;; are NOT dispatched. The MVM compiler recognizes make-array/aref/aset/
@@ -199,13 +199,13 @@
 
 ;; Generate dispatch wrappers: (defun NAME (args) (if (>= flag 1) (c32-NAME args) (c64-NAME args)))
 ;; Flag is at 0x48006D, read via mem-ref :u8 (compiler intrinsic, no function call).
-;; CRITICAL: Previous version used (td-read-u32 #x2000008) which is a FUNCTION CALL that
+;; CRITICAL: Previous version used (td-read-u32 #x3000008) which is a FUNCTION CALL that
 ;; clobbers argument registers (RSI, RDI, R8, R9 on x64) before passing them to the
 ;; actual c64/c32 function. mem-ref :u8 is an opcode — no register clobber.
 ;; TODO: Replace with boot-time JMP patching once all translators support FN-ADDR opcode.
 ;; Generate dispatch wrappers that save args to let bindings before reading
 ;; the config flag. This is CRITICAL for ARM32 where VR (accumulator, r0)
-;; aliases V0 (first arg, r0). Without let bindings, (mem-ref #x200006D :u8)
+;; aliases V0 (first arg, r0). Without let bindings, (mem-ref #x300006D :u8)
 ;; writes to r0, clobbering the first argument before it reaches the c32/c64 call.
 ;; On x64 (VR=RAX, V0=RSI) and i386 (VR=EAX, V0=ESI) this isn't needed but
 ;; the let bindings are harmless and make the wrapper correct on all architectures.
@@ -224,11 +224,11 @@
                                collect (format nil "_a~D" i)))
              (c64-saved (if c64-arity (subseq saved-args 0 c64-arity) saved-args)))
         (if (zerop max-arity)
-            (format s "(defun ~A () (if (>= (mem-ref #x200006D :u8) 1) (c32-~A) (c64-~A)))~%"
+            (format s "(defun ~A () (if (>= (mem-ref #x300006D :u8) 1) (c32-~A) (c64-~A)))~%"
                     name name name)
             (progn
               ;; Emit: (defun NAME (args...) (let ((_a0 arg0)) (let ((_a1 arg1)) ...
-              ;;           (if (>= (mem-ref #x200006D :u8) 1)
+              ;;           (if (>= (mem-ref #x300006D :u8) 1)
               ;;               (c32-NAME _a0 _a1 ...) (c64-NAME _a0 _a1 ...)))))
               (format s "(defun ~A (~{~A~^ ~})~%" name args)
               ;; Nested let bindings to save all args to frame slots
@@ -236,7 +236,7 @@
                     for sa in saved-args
                     do (format s "  (let ((~A ~A))~%" sa arg))
               ;; The dispatch check — now safe because args are in frame slots
-              (format s "  (if (>= (mem-ref #x200006D :u8) 1)~%")
+              (format s "  (if (>= (mem-ref #x300006D :u8) 1)~%")
               (format s "      (c32-~A~{ ~A~})~%" name saved-args)
               (format s "      (c64-~A~{ ~A~})" name c64-saved)
               ;; Close: if + all let forms + defun = 1 + max-arity + 1

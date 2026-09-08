@@ -101,6 +101,19 @@
                       s)
         (terpri s)))))
 
+;; Shrink the x64 code-buffer default 96 MB → 1 MB (same transform the self-host
+;; build does).  The fixpoint now self-translates 4417 functions IN-IMAGE with a
+;; live GC; a 96 MB default per make-code-buffer instantly fills a ~104 MB Cheney
+;; semispace and the alloc pointer runs off into the GC config page.  1 MB +
+;; grow-on-demand is what build-modus-selfhost uses.
+(let ((needle "(bytes (make-array 100663296 :element-type '(unsigned-byte 8)))")
+      (repl   "(bytes (make-array 1048576 :element-type '(unsigned-byte 8)))"))
+  (let ((p (search needle *mvm-source-text*)))
+    (when p
+      (setf *mvm-source-text*
+            (concatenate 'string (subseq *mvm-source-text* 0 p) repl
+                         (subseq *mvm-source-text* (+ p (length needle))))))))
+
 ;;; ============================================================
 ;;; Source preprocessing (SBCL-side)
 ;;; Fixes &key calls, macrolet, constants for bare-metal MVM compilation
@@ -261,6 +274,14 @@
 (funcall (intern "INSTALL-I386-TRANSLATOR" "MODUS.MVM.I386"))
 (install-armv7-rpi-translator)
 
+;; Enable the x64 Cheney GC (same as build-x64/build-generic-cli).  The fixpoint
+;; now bakes the full CL runtime and self-translates 4417 functions, allocating
+;; ~230 MB+ — with GC OFF the alloc pointer R12 ran past the from-space limit
+;; R14 into garbage (ENSURE-LABEL-AT read a wild pointer mid-translation).  With
+;; it on, each alloc gets a gc-check and %gc-collect (baked from gc.lisp) is
+;; wired into the trampoline.  Host-build codegen flag → Gen0's native code.
+(setf modus.mvm.x64::*x64-gc-enabled* t)
+
 ;; init-opcode-entries source was generated above (before in-package switch)
 ;; to avoid maphash compiler-macro conflict in modus.mvm package.
 ;; (See *opcode-init-source* defvar near top of this section)
@@ -357,7 +378,7 @@
   (init-*arm32-vreg-map*)
   (write-char-serial 73) (write-char-serial 57) (write-char-serial 10)
   ;; Check mode: 0=cross-compile, 1=SSH server, 2=REPL
-  (let ((mode (td-read-u32 #x2000038)))
+  (let ((mode (td-read-u32 #x3000038)))
     (write-char-serial 77) (write-char-serial 61) ;; M=
     (print-dec mode) (write-char-serial 10)
     (cond
@@ -369,7 +390,7 @@
        (repl (cons nil nil)))
       (t
        ;; Cross-compile mode: read target from metadata
-       (let ((target (td-read-u32 #x2000034)))
+       (let ((target (td-read-u32 #x3000034)))
          (build-image-cross target)))))
   (write-char-serial 68) (write-char-serial 10)
   ;; Drop to REPL
@@ -607,7 +628,7 @@
          ;; the grown image overran (#252).  The 182 metadata reads in the baked
          ;; fixpoint source were moved 0x5000xx -> 0x20000xx to match; the ssh-ipc
          ;; buffer and the stack were relocated above the image too (below).
-         (metadata-offset (case gen0-arch (:x64 #x1F00000) (:aarch64 #x1F80000)))
+         (metadata-offset (case gen0-arch (:x64 #x2F00000) (:aarch64 #x2F80000)))
          (jmp-size (case gen0-arch (:x64 5) (:aarch64 4)))
          (output-path (case gen0-arch
                         (:x64     "/tmp/fixpoint-gen0.elf")

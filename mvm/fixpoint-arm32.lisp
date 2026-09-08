@@ -1214,7 +1214,7 @@
           (img-emit 0)))
       ;; 3. B instruction at 0x100 to jump to kernel-main
       (write-char-serial 75) ;; K
-      (let ((km-hash (td-read-u32 #x2000028)))
+      (let ((km-hash (td-read-u32 #x3000028)))
         (print-dec km-hash) (write-char-serial 10)
         (let ((km-native-off (gethash km-hash fn-map)))
           (write-char-serial 79) ;; O
@@ -1241,7 +1241,7 @@
                 (img-emit 0) (img-emit 0) (img-emit 160) (img-emit 225)))))
       ;; 4. Copy native code (starts at 0x104)
       (write-char-serial 78) ;; N
-      (td-write-u32 #x2000050 (img-pos))
+      (td-write-u32 #x3000050 (img-pos))
       (let ((i 0))
         (loop
           (when (>= i native-size) (return nil))
@@ -1288,15 +1288,15 @@
             (img-patch-u32 (+ md-img-off 16) bc-len)
             (img-patch-u32 (+ md-img-off 20) ft-img-offset)
             (img-patch-u32 (+ md-img-off 24) ft-count)
-            (img-patch-u32 (+ md-img-off 28) (td-read-u32 #x2000050))
+            (img-patch-u32 (+ md-img-off 28) (td-read-u32 #x3000050))
             (img-patch-u32 (+ md-img-off 32) native-size)
             ;; preamble-size = 0x100 (256 bytes)
             (img-patch-u32 (+ md-img-off 36) 256)
             ;; kernel-main-hash-lo (copy from running kernel)
-            (let ((km-hash (td-read-u32 #x2000028)))
+            (let ((km-hash (td-read-u32 #x3000028)))
               (img-patch-u32 (+ md-img-off 40) km-hash))
             ;; kernel-main native offset
-            (let ((km-native-off (gethash (td-read-u32 #x2000028) fn-map)))
+            (let ((km-native-off (gethash (td-read-u32 #x3000028) fn-map)))
               (if km-native-off
                   (img-patch-u32 (+ md-img-off 44) km-native-off)
                   (img-patch-u32 (+ md-img-off 44) 0)))
@@ -1430,7 +1430,7 @@
 
 ;;; Override td-fnv-native: use XOR checksum on arm32 host too
 (defun td-fnv-native (bytes size)
-  (let ((my-arch (td-read-u32 #x2000008)))
+  (let ((my-arch (td-read-u32 #x3000008)))
     (if (>= my-arch 2)
         ;; i386/arm32 host: XOR checksum (FNV constants overflow 30/31-bit fixnum)
         (let ((xsum 0) (j 0))
@@ -1449,7 +1449,7 @@
 
 ;;; Override emit-u64 for arm32 host: high32 always 0
 (defun emit-u64 (buf value)
-  (if (>= (td-read-u32 #x2000008) 2)
+  (if (>= (td-read-u32 #x3000008) 2)
       ;; i386/arm32 host: high32 always 0
       (progn (emit-u32 buf value)
              (emit-byte buf 0) (emit-byte buf 0)

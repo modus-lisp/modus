@@ -26,16 +26,20 @@
 ;; + ip + crypto + ssh + overrides
 ;; Note: e1000.lisp is NOT loaded — cdc-ether.lisp provides the same interface
 (defvar *net-source*
-  (format nil "~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%"
+  (format nil "~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%"
           (read-file-text (merge-pathnames "arch-raspi3b.lisp" *net-dir*))
           (read-file-text (merge-pathnames "dwc2.lisp" *net-dir*))
           (read-file-text (merge-pathnames "usb.lisp" *net-dir*))
           (read-file-text (merge-pathnames "cdc-ether.lisp" *net-dir*))
+          (read-file-text (merge-pathnames "r8152.lisp" *net-dir*))
           (read-file-text (merge-pathnames "ip.lisp" *net-dir*))
           (read-file-text (merge-pathnames "crypto.lisp" *net-dir*))
           (read-file-text (merge-pathnames "crypto-fast.lisp" *net-dir*))
           (read-file-text (merge-pathnames "ssh.lisp" *net-dir*))
-          (read-file-text (merge-pathnames "aarch64-overrides.lisp" *net-dir*))))
+          (read-file-text (merge-pathnames "aarch64-overrides.lisp" *net-dir*))
+          ;; MUST be last: its e1000-* dispatchers + usb-netdev-hotplug-poll
+          ;; win last-defun-wins over the drivers' forwarders and ip.lisp's stub.
+          (read-file-text (merge-pathnames "usb-netdev.lisp" *net-dir*))))
 
 ;;; ============================================================
 ;;; Build RPi SSH image (raspi3b + DWC2 USB + CDC Ethernet)
@@ -55,8 +59,9 @@
                          "(defun kernel-main ()"
                          ;; No PCI on RPi — pci-assign-bars is a no-op
                          "  (pci-assign-bars)"
-                         ;; Initialize USB + CDC Ethernet (replaces e1000-probe)
-                         "  (cdc-ether-init)"
+                         ;; Runtime USB NIC bind: RTL8153 if present, else CDC-ECM
+                         ;; (net/usb-netdev.lisp).  Latches the driver + arms hot-plug.
+                         "  (net-usb-probe)"
                          ;; "  (dwc2-enable-host-irq)"
                          "  (%serial-byte 91) (%serial-byte 49) (%serial-byte 93)"
                          "  (sha256-init)"

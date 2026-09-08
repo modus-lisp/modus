@@ -588,7 +588,12 @@
              ;; offset 0 → raw byte K lives at vaddr load-addr+120+K.
              ;; So fn-addr constants must add the wrap header too.
              (wrap-header (wrap-header-size-for-boot boot-descriptor))
-             (load-addr (+ declared-load-addr image-load-offset wrap-header))
+             ;; :code-vaddr-base (when set) relinks native code at a fixed
+             ;; canonical VA independent of the physical load address; the
+             ;; boot stub MMU-maps that VA onto wherever the image landed, so
+             ;; ONE image runs at any load address.  Unset => VA=PA as before.
+             (load-addr (or (getf boot-descriptor :code-vaddr-base)
+                            (+ declared-load-addr image-load-offset wrap-header)))
              ;; Build bytecode-offset → native-offset lookup.
              (bc-to-native (make-hash-table :test 'eql)))
         (dolist (fn-info (mvm-module-function-table module))
@@ -639,7 +644,8 @@
                   #x80000
                   0))
              (wrap-header (wrap-header-size-for-boot boot-descriptor))
-             (load-addr (+ declared-load-addr image-load-offset wrap-header))
+             (load-addr (or (getf boot-descriptor :code-vaddr-base)
+                            (+ declared-load-addr image-load-offset wrap-header)))
              (native-image-offset (or (kernel-image-native-image-offset image) 0))
              (native-code-length (length (kernel-image-native-code image)))
              (code-base (+ load-addr native-image-offset))
@@ -723,7 +729,8 @@
                   #x80000
                   0))
              (wrap-header (wrap-header-size-for-boot boot-descriptor))
-             (pool-vaddr (+ load-addr image-load-offset wrap-header
+             (pool-vaddr (+ (or (getf boot-descriptor :code-vaddr-base)
+                                (+ load-addr image-load-offset wrap-header))
                             pool-offset-in-raw)))
         (dolist (patch patches)
           (let* ((native-pos (car patch))
@@ -945,7 +952,8 @@
                          (not (eq elf-fmt :linux-aarch64)))
                     #x80000 0))
                (wrap-header (wrap-header-size-for-boot boot-descriptor))
-               (veneer-base-va (+ declared-load-addr image-load-offset wrap-header)))
+               (veneer-base-va (or (getf boot-descriptor :code-vaddr-base)
+                                   (+ declared-load-addr image-load-offset wrap-header))))
           (modus.mvm::a64-resolve-fixups aarch64-unified-buf veneer-base-va))
         ;; Extract bytes and split.  boot-code includes the entry jump (1 word
         ;; B, or 3 words MOVZ/MOVK/BR under the long-range flag) at its tail;
@@ -1125,8 +1133,10 @@
                              (not (eq elf-fmt :linux-aarch64)))
                         #x80000 0))
                    (wrap-header (wrap-header-size-for-boot boot-descriptor))
-                   (tramp-va (+ declared-load-addr image-load-offset
-                                wrap-header (* label-word 4)))
+                   (tramp-va (+ (or (getf boot-descriptor :code-vaddr-base)
+                                    (+ declared-load-addr image-load-offset
+                                       wrap-header))
+                                (* label-word 4)))
                    (off *aarch64-x28-load-patch-offset*))
               (patch-aarch64-mov-imm16 raw-bytes off
                                        (logand tramp-va #xFFFF))
@@ -1153,7 +1163,8 @@
                            (not (eq elf-fmt :linux-aarch64)))
                       #x80000 0))
                  (wrap-header (wrap-header-size-for-boot boot-descriptor))
-                 (base-va (+ declared-load-addr image-load-offset wrap-header))
+                 (base-va (or (getf boot-descriptor :code-vaddr-base)
+                              (+ declared-load-addr image-load-offset wrap-header)))
                  (labels (a64-buffer-labels aarch64-unified-buf)))
             (dolist (patch *aarch64-inmodule-call-patches*)
               (let* ((movz-word (car patch))

@@ -110,11 +110,21 @@
 ;; Kept for source compatibility; the GPU-loaded value.
 (defconstant +rpi-cl-load-addr+     #x00000000)
 
+;; --- link-address unification (one image, any load address) -----------------
+;; Native code is linked at a fixed CANONICAL VA; the boot stub detects the
+;; actual physical load address (GPU 0x80000, U-Boot netboot 0x300000, ...) and
+;; MMU-maps the canonical window onto it, so :load-addr / chainload no longer
+;; change what gets baked and ONE image runs everywhere.  0x30000000 is above
+;; the Pi's 512MB DRAM (purely virtual — cannot alias any PA or data region)
+;; and is 32-bit MOVZ/MOVK-encodable, so the fn-addr patch shape is unchanged.
+;; cross.lisp bakes fn/pool/veneer/code-bounds VAs from this via :code-vaddr-base.
+(defconstant +rpi-cl-code-vaddr-base+ #x30000000)
+
 (defconstant +rpi-cl-pl011-base+    #x3F201000)  ; BCM2837 UART0 (PL011)
-;; VBAR must track the image base: run address + 0x800.
+;; VBAR is a canonical-VA offset (image base + 0x800), MMU-mapped to the load PA.
 (defvar *rpi-cl-vbar*
-  (+ *rpi-cl-load-addr* #x80000 #x800)
-  "Vector table VA = actual run address + 0x800.")
+  (+ +rpi-cl-code-vaddr-base+ #x800)
+  "Vector table VA = canonical image base + 0x800.")
 (defconstant +rpi-cl-vbar+          #x00080800)  ; GPU-loaded value
 (defconstant +rpi-cl-native-off+    #x00001000)  ; native code at image + 0x1000
 
@@ -328,6 +338,13 @@
     ;; the firmware path demonstrably does not share.  Cost is one bit in a mask
     ;; that was already being written.
     ;; X0 (firmware DTB pointer) is preserved; scratch = x9/x10/x11/x16/x17.
+    ;;
+    ;; --- LINK UNIFY: capture the physical load address FIRST ---------------
+    ;; This is instruction 0, so ADR reads PC == the PA the loader placed raw
+    ;; byte 0 at (0x80000 GPU, 0x300000 U-Boot netboot, ...).  x20 holds it
+    ;; through the preamble (untouched by sanitize/table-build) for the 4KB
+    ;; canonical-VA remap below.  x20 is otherwise unused by this stub.
+    (emit-aarch64-u32 buf #x10000014)              ; adr x20, #0  -> x20 = load-PA
     (emit-aarch64-load-imm64 buf x16 0)
     (emit-aarch64-load-imm64 buf x17 #x20000000)
     (let ((clean-loop (a64-current-index buf)))
@@ -402,6 +419,41 @@
       (emit-aarch64-u32 buf #x8B0B01CE)            ; add x14, x14, x11
       (a64-cmp-reg buf 13 8)
       (a64-bcond buf #b0011 (- fill (a64-current-index buf))))
+    ;; --- LINK UNIFY: 4KB remap of the canonical code window --------------
+    ;; Map canonical VA [0x30000000, 0x38000000) (128 MB, the linked code
+    ;; window) -> [load-PA, +128 MB) at 4 KB granularity.  The load delta is
+    ;; 4 KB- but not 2 MB-aligned, so blocks won't do; L3 pages will.  x20 =
+    ;; load-PA (captured at instruction 0).  L3 tables live at 0x06000000
+    ;; (above the <=66 MB image, below the 0x08000000 stack).  This overwrites
+    ;; the identity L2 entries 384..447 — that VA range (768-896 MB) is beyond
+    ;; DRAM and unused otherwise, so no identity mapping is lost.  The physical
+    ;; load region stays identity-mapped by the 2 MB fill above, so the stub
+    ;; survives MMU-enable and only THEN branches to the canonical entry.
+    ;; Fill 64 L3 tables x 512 pages = 32768 page descriptors.
+    (emit-aarch64-load-imm64 buf 9  #x06000000)    ; x9 = L3 walker (PA)
+    (emit-aarch64-load-imm64 buf 10 #x06040000)    ; x10 = L3 end (64*4KB)
+    (a64-mov-reg buf 11 20)                         ; x11 = pa = load-PA
+    (emit-aarch64-load-imm64 buf 13 #x1000)         ; x13 = 4KB stride
+    ;; NB: temp is x14, NOT x12 — x12 holds the TTBR0 base (0x70000) set above
+    ;; and consumed by `msr ttbr0_el2, x12` below; clobbering it wedges the MMU.
+    (let ((l3 (a64-current-index buf)))
+      (a64-add-imm buf 14 11 #x703)                 ; x14 = pa | 0x703 (page: AF|SH|AttrIdx0|valid)
+      (a64-stur buf 14 9 0)                          ; [x9] = descriptor
+      (emit-aarch64-u32 buf #x8B0D016B)              ; add x11, x11, x13  (pa += 4KB)
+      (a64-add-imm buf 9 9 8)                         ; x9 += 8
+      (a64-cmp-reg buf 9 10)
+      (a64-bcond buf #b0011 (- l3 (a64-current-index buf))))  ; b.lo -> next page
+    ;; Point L2[384..447] at those L3 tables (table descriptor = L3pa | 3).
+    (emit-aarch64-load-imm64 buf 9  #x00071C00)    ; &L2[384] = 0x71000 + 384*8
+    (emit-aarch64-load-imm64 buf 10 #x00071E00)    ; &L2[448]
+    (emit-aarch64-load-imm64 buf 11 #x06000003)    ; L3[0] pa | 3 (table desc)
+    (emit-aarch64-load-imm64 buf 13 #x1000)        ; next-L3-table stride
+    (let ((l2 (a64-current-index buf)))
+      (a64-stur buf 11 9 0)                          ; L2[i] = table desc
+      (emit-aarch64-u32 buf #x8B0D016B)              ; add x11, x11, x13
+      (a64-add-imm buf 9 9 8)
+      (a64-cmp-reg buf 9 10)
+      (a64-bcond buf #b0011 (- l2 (a64-current-index buf))))
     ;; MAIR: attr0 = 0xFF (Normal WB R/W-allocate), attr1 = 0x00 (Device-
     ;; nGnRnE).  TCR_EL2 0x80803520 = RES1 | T0SZ=32 (4GB VA, start L1,
     ;; 4KB granule) | IRGN0=ORGN0=WB-WA | SH0=inner | PS=4GB.
@@ -659,7 +711,13 @@
         (error "boot-rpi-cl: preamble overflowed its ~D-instruction budget ~
                 (position ~D, native code starts at instruction ~D)"
                (/ #x800 4) cur (/ +rpi-cl-native-off+ 4)))
-      (emit-aarch64-u32 buf (logior (ash #b000101 26) (logand skip #x3FFFFFF)))
+      ;; LINK UNIFY: enter native code at its CANONICAL VA (the MMU is on now),
+      ;; so PC lives in the same VA space as every baked fn/data address.  An
+      ;; absolute jump, not the old relative B — that would enter at the identity
+      ;; load-PA alias and leave PC out of the [code_base, code_end) VA range.
+      (emit-aarch64-load-imm64 buf 16 (+ +rpi-cl-code-vaddr-base+
+                                         +rpi-cl-native-off+))
+      (emit-aarch64-u32 buf #xD61F0200)              ; br x16 -> canonical native entry
       (let ((pad (- (/ #x800 4) (a64-buffer-position buf))))
         (when (minusp pad)
           (error "boot-rpi-cl: preamble ran into the exception vectors at 0x800"))
@@ -679,6 +737,9 @@
   (list :arch :aarch64
         :entry-fn #'emit-rpi-cl-entry
         :load-addr *rpi-cl-load-addr*
+        ;; Relink native code at the canonical VA; the stub MMU-maps it onto the
+        ;; real load PA, so this one image boots at 0x80000 or 0x300000 alike.
+        :code-vaddr-base +rpi-cl-code-vaddr-base+
         :stack-top +rpi-cl-stack-top+
         :cons-base +rpi-cl-heap-base+
         :general-base (+ +rpi-cl-heap-mid+ #x01000000)

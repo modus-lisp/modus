@@ -134,6 +134,20 @@
    NIL (safe default: pure interpret)."
   (and (boundp (quote *use-jit*)) *use-jit*))
 
+(defvar *jit-hot-only* t
+  "RETRY-ON-HOT.  When T (default), a form is INTERPRETED on its FIRST eval and
+   only JIT-translated when it is eval'd AGAIN (a cache hit -> %mvm-eval-run-tuple).
+   Keeps one-shot LOAD forms (ql:quickload / quicklisp:setup are thousands of
+   run-once top-level forms, most non-cacheable DEFUNs) on the fast interpret
+   path instead of paying ~1ms/form of page translation they never recoup, while
+   genuinely repeated forms still get native.  NIL = old eager behavior (JIT on
+   first eval).  Read via %jit-hot-only-p (a bare special setq does not reliably
+   propagate to mvm-eval's compiled read in-image, same as %jit-enabled-p).")
+
+(defun %jit-hot-only-p ()
+  "T = JIT only on the SECOND+ eval of a form (retry-on-hot); see *jit-hot-only*."
+  (if (boundp (quote *jit-hot-only*)) *jit-hot-only* t))
+
 (defvar *jit-inhibit* nil
   "CLASS-3 dynamic JIT inhibit.  When non-nil, %jit-active-p forces the mvm-eval
    seam onto the INTERPRET path regardless of %jit-enabled-p.  Needed because
@@ -2774,7 +2788,15 @@
                             ;; the MV out-of-range residual — but NOT on a user condition
                             ;; raised once native code is running.
                             ;; %jit-active-p honors *jit-inhibit* (Class 3).
-                            (if (%jit-active-p)
+                            ;; RETRY-ON-HOT: with *jit-hot-only* (default T), a
+                            ;; form's FIRST eval (this fresh-compile / cache-MISS
+                            ;; path) INTERPRETS; it is JIT'd only when eval'd AGAIN,
+                            ;; via the cache-HIT run-tuple path above (~2247), which
+                            ;; stays gated on %jit-active-p alone.  One-shot LOAD
+                            ;; forms (never re-eval'd; DEFUNs aren't even cacheable)
+                            ;; thus never pay JIT translation — fast loading — while
+                            ;; repeated forms go native on the second run.
+                            (if (and (%jit-active-p) (not (%jit-hot-only-p)))
                                 (handler-case
                                     (%mvm-eval-jit-run bc entry (reverse ft-list)
                                                     fn-table rt-table lam-offsets nil

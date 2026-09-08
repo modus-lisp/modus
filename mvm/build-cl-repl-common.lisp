@@ -1706,8 +1706,22 @@
       (concatenate 'string
         "    (write-string-serial \"CORE-RESTORED\") (write-char-serial 10)
 "       *net-pipeline-call*
-        "    (setq *use-jit* nil)
-    (handler-case (cl-serial-repl) (t (c) nil))
+        ;; SHIP JIT=1: a restored core adopts the SAME JIT default as a fresh
+        ;; boot (*jit-on*) instead of being forced OFF.  The historical forced-
+        ;; OFF is retired now that all three of its reasons are resolved:
+        ;;   (a) retry-on-hot keeps one-shot LOAD forms interpreted, so JIT=1 no
+        ;;       longer taxes ql:quickload (was ~10x slower; now interpret-speed);
+        ;;   (b) cores carry the JIT exec arena (43efbe0) — no dangling fn-pointer
+        ;;       on restore;
+        ;;   (c) a restored ql core under *use-jit*=t was board-validated
+        ;;       (quickload alexandria; flatten/iota correct, native-count 0).
+        ;; MODUS_RPI_JIT=0 builds still restore JIT-off (*jit-on* NIL).
+        (if *jit-on*
+            "    (setq *use-jit* t)
+"
+            "    (setq *use-jit* nil)
+")
+        "    (handler-case (cl-serial-repl) (t (c) nil))
     (halt)
 ")
       ""))

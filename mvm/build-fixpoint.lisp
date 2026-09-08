@@ -306,7 +306,7 @@
   (init-*arm32-vreg-map*)
   (write-char-serial 73) (write-char-serial 57) (write-char-serial 10)
   ;; Check mode: 0=cross-compile, 1=SSH server, 2=REPL
-  (let ((mode (td-read-u32 #x500038)))
+  (let ((mode (td-read-u32 #x2000038)))
     (write-char-serial 77) (write-char-serial 61) ;; M=
     (print-dec mode) (write-char-serial 10)
     (cond
@@ -318,7 +318,7 @@
        (repl (cons nil nil)))
       (t
        ;; Cross-compile mode: read target from metadata
-       (let ((target (td-read-u32 #x500034)))
+       (let ((target (td-read-u32 #x2000034)))
          (build-image-cross target)))))
   (write-char-serial 68) (write-char-serial 10)
   ;; Drop to REPL
@@ -551,8 +551,12 @@
          ;; x64: loaded at PA 0x100000, identity mapped, so VA = 0x100000
          ;; aarch64: loaded at PA 0x40080000, MMU maps VA=PA-0x40000000, so VA = 0x80000
          (load-addr (case gen0-arch (:x64 #x100000) (:aarch64 #x80000)))
-         ;; Metadata image offset: chosen so VA = load-addr + offset = 0x500000
-         (metadata-offset (case gen0-arch (:x64 #x400000) (:aarch64 #x480000)))
+         ;; Metadata image offset: chosen so VA = load-addr + offset = 0x2000000
+         ;; (32 MB), well above the ~15 MB image.  Was 0x500000 (5 MB), which
+         ;; the grown image overran (#252).  The 182 metadata reads in the baked
+         ;; fixpoint source were moved 0x5000xx -> 0x20000xx to match; the ssh-ipc
+         ;; buffer and the stack were relocated above the image too (below).
+         (metadata-offset (case gen0-arch (:x64 #x1F00000) (:aarch64 #x1F80000)))
          (jmp-size (case gen0-arch (:x64 5) (:aarch64 4)))
          (output-path (case gen0-arch
                         (:x64     "/tmp/fixpoint-gen0.elf")
@@ -567,6 +571,13 @@
     (setq *aarch64-serial-width* 0)
     (setq *aarch64-serial-tx-poll* nil)
     (setq *aarch64-sched-lock-addr* nil))
+
+  ;; x64: the initial stack top (0x800000, 8 MB) now sits INSIDE the ~15 MB
+  ;; image, so relocate it to 512 MB — the same override the large ANSI x64
+  ;; build uses (build-x64.lisp).  Above the image, the 32 MB metadata, the
+  ;; 128 MB Gen1 build buffer, and the 256 MB heap.
+  (when (eq gen0-arch :x64)
+    (setf modus.mvm::*x64-stack-top-override* #x20000000))
 
   (let ((boot-desc (get-boot-descriptor boot-target)))
     (let ((image (assemble-kernel-image module (find-target build-target)

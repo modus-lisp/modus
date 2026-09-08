@@ -1452,6 +1452,12 @@
   (let ((forms nil)
         (lines nil)
         (line-count 1)
+        ;; Newlines counted so far, and the position through which we counted.
+        ;; Counting from the string start for EVERY form is O(n^2) over a large
+        ;; blob (SBCL/CCL's fast native COUNT hides it; ABCL's does not — 132 s
+        ;; on the 5 MB CLI blob).  Advance incrementally instead: same result,
+        ;; O(n) total.
+        (prev-pos 0)
         ;; Read in :MODUS.MVM so #.<reader-eval> of MVM constants (interp.lisp's
         ;; (#.+op-nop+ ...) case keys) resolves in the package where load-mvm
         ;; bound them.  Symbols are name-hashed by the compiler (package-
@@ -1460,7 +1466,8 @@
     (with-input-from-string (stream source-text)
       (loop
         (let ((pos (file-position stream)))
-          (setf line-count (1+ (count #\Newline source-text :end pos)))
+          (incf line-count (count #\Newline source-text :start prev-pos :end pos))
+          (setf prev-pos pos)
           (let ((form (handler-case (read stream nil :eof)
                         (error (e)
                           (format t "  SKIP read at line ~D: ~A~%" line-count e)

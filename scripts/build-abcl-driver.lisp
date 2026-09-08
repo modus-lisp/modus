@@ -36,35 +36,8 @@
   (error (e) (format t "~&LOAD-MVM ERROR: ~A~%" e) (ext:quit :status 2)))
 (%compile-modus)
 
-;; 1b. O(n) override of read-all-forms-with-locations.  The shipped version
-;; counts newlines from string-start for EVERY form → O(n^2); harmless under
-;; SBCL/CCL's fast native COUNT but pathological under ABCL over the 5 MB blob
-;; (and the 17 MB gate blob).  Count only the delta between form positions.
-;; Semantically identical; a worthwhile upstream fix in mvm/cross.lisp too.
-(defun modus.mvm::read-all-forms-with-locations (source-text)
-  (let ((forms nil) (lines nil) (line-count 1) (prev-pos 0)
-        (*package* (or (find-package :modus.mvm) *package*)))
-    (with-input-from-string (stream source-text)
-      (loop
-        (let ((pos (file-position stream)))
-          (incf line-count (count #\Newline source-text :start prev-pos :end pos))
-          (setf prev-pos pos)
-          (let ((form (handler-case (read stream nil :eof)
-                        (error (e)
-                          (format t "  SKIP read at line ~D: ~A~%" line-count e)
-                          (loop for ch = (read-char stream nil nil)
-                                while (and ch (char/= ch #\Newline)))
-                          :skip))))
-            (when (eq form :eof) (return))
-            (unless (eq form :skip)
-              (when (and (consp form) (symbolp (car form))
-                         (string= (symbol-name (car form)) "IN-PACKAGE") (cdr form))
-                (let ((pkg (find-package (string (cadr form)))))
-                  (when pkg (setq *package* pkg))))
-              (push form forms)
-              (push line-count lines))))))
-    (cons (nreverse forms) (coerce (nreverse lines) 'vector))))
-(compile 'modus.mvm::read-all-forms-with-locations)
+;; (read-all-forms-with-locations used to be O(n^2) and was overridden here;
+;; it is now O(n) in mvm/cross.lisp itself, so no host-side override is needed.)
 
 ;; 2. Skip the build script's re-load of load-mvm (already loaded + compiled).
 (let ((real #'cl:load))

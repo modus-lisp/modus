@@ -172,6 +172,30 @@
         (length *fixpoint-extra-modules*)
         (if *fixpoint-ssh-mode* " + SSH" ""))
 
+;; CL runtime — the fixpoint's compiler code (prelude + translators + cross) has
+;; drifted to depend on the full runtime: generic arithmetic (generic-add,
+;; bignum-ash, numeric-*), the array runtime (%mda-*/%wrapper-*/%aset-*), the
+;; condition system (%signal-*) and funcall dispatch (%funcall-*).  Without
+;; these, every such call was UNRESOLVED and defaulted to bytecode offset 0 =
+;; the module's first function (SPIN-DELAY), so boot hung the moment
+;; init-*opcode-table*'s gethash touched generic hashing.  Bake the same runtime
+;; set (and order) build-cli-common does so those calls resolve.
+(defvar *fixpoint-runtime-source*
+  (concatenate 'string
+    (mvm-text "mvm/gc.lisp")           (string #\Newline)
+    (mvm-text "mvm/cl-sequences.lisp") (string #\Newline)
+    (mvm-text "mvm/cl-streams.lisp")   (string #\Newline)
+    (mvm-text "mvm/cl-fileio.lisp")    (string #\Newline)
+    (mvm-text "mvm/cl-printer.lisp")   (string #\Newline)
+    (mvm-text "mvm/cl-reader.lisp")    (string #\Newline)
+    (mvm-text "mvm/cl-eval.lisp")      (string #\Newline)
+    (mvm-text "mvm/cl-clos.lisp")      (string #\Newline)
+    (mvm-text "mvm/cl-types.lisp")     (string #\Newline)
+    (mvm-text "mvm/cl-packages.lisp")  (string #\Newline)
+    (mvm-text "mvm/cl-conditions.lisp") (string #\Newline)
+    (mvm-text "mvm/ansi-bridge.lisp")  (string #\Newline)))
+(format t "Fixpoint runtime source: ~D chars~%" (length *fixpoint-runtime-source*))
+
 ;;; ============================================================
 ;;; Generate opcode table init source (in cl-user, before package switch)
 ;;; ============================================================
@@ -185,6 +209,11 @@
   (let ((ot modus.mvm::*opcode-table*)
         (count 0))
     (with-output-to-string (s)
+      ;; init-opcode-entries (generated below) calls (%make-opcode-info code
+      ;; name operands desc) — a POSITIONAL constructor.  Only the &key
+      ;; defstruct constructor MAKE-OPCODE-INFO exists, so define the positional
+      ;; wrapper here (otherwise the call is unresolved → offset 0 = SPIN-DELAY).
+      (format s "(defun %make-opcode-info (code name operands desc)~%  (make-opcode-info :code code :name name :operands operands :description desc))~%")
       (format s "(defun init-opcode-entries ()~%")
       (cl:maphash (lambda (code info)
                     (incf count)
@@ -248,6 +277,10 @@
                ;; Networking source (only when --ssh)
                (or cl-user::*net-source-text* "")
                (string #\Newline)
+               ;; CL runtime (generic arith, arrays, conditions, funcall) —
+               ;; see *fixpoint-runtime-source* note above.
+               cl-user::*fixpoint-runtime-source*
+               (string #\Newline)
                ;; MVM system source
                cl-user::*mvm-source-text*
                (string #\Newline)
@@ -265,6 +298,24 @@
   ;; Boot code also sets this up, but setup-irq ensures it works for all
   ;; generations regardless of boot path. Safe to call twice.
   (setup-irq)
+  ;; ---- CL runtime bring-up (the shared boot init build-cli-common does).
+  ;; The fixpoint now bakes the full CL runtime (generic arith, arrays,
+  ;; conditions, hash tables), and that runtime reads the symbol/keyword/package
+  ;; tables + defvar globals — which must be initialised FIRST, or the very
+  ;; first gethash/puthash/intern writes through uninitialised state (a -1
+  ;; pointer → page fault).  Order mirrors the CLI's kernel-main.
+  (init-symbol-table)
+  (write-char-serial 82) (write-char-serial 49) (write-char-serial 10)  ; R1
+  (init-keyword-table)
+  (%init-packages)
+  (setq *error-output* *standard-output*)   ; bare-metal: no fd-2 stream
+  (write-char-serial 82) (write-char-serial 50) (write-char-serial 10)  ; R2
+  (%init-condition-types)
+  (%init-reader)
+  (%init-symbol-function-table)
+  (write-char-serial 82) (write-char-serial 51) (write-char-serial 10)  ; R3
+  (init-all-globals)
+  (write-char-serial 82) (write-char-serial 52) (write-char-serial 10)  ; R4
   ;; Initialize MVM runtime tables
   (write-char-serial 73) (write-char-serial 49) (write-char-serial 10)
   (init-*gensym-counter*)

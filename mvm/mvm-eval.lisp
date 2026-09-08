@@ -1638,23 +1638,37 @@
                             *jit-blocked-callees*)))
                   (when (eql why 0) (setq why 1))
                   (setq ok nil)))))
-        ;; Out-of-module #'NAME fn-addr relocations (full TAGGED fn word).
+        ;; Out-of-module #'NAME fn-addr relocations (a #'NAME used as a VALUE:
+        ;; funcall / apply / mapcar #'name).
+        ;;
+        ;; LATE-BIND FIX (MODUS_RPI_JIT=1 vs CLOS).  The old code BAKED the
+        ;; resolved tagged fn word into the MOVZ quad here — it resolved #'NAME
+        ;; ONCE, at page-build.  A name that CLOS defines or redefines AFTER the
+        ;; page is built (every generic function; any forward reference) is then
+        ;; frozen as a STALE object.  That is precisely what made the aarch64 JIT
+        ;; die in ql:quickload: QL-DIST::ENABLED-DISTS does (funcall #'enabledp d),
+        ;; the page had baked the pre-CLOS `enabledp' stub, and dispatch went to
+        ;; the stub instead of the installed GF — the measured reason the board
+        ;; shipped MODUS_RPI_JIT=0.  The INTERPRETER's op-fn-addr (interp.lisp)
+        ;; re-resolves the name via %mvm-resolve-runtime-fn on EVERY execution, so
+        ;; it is always late-bound and correct (why JIT-off completes ql).  Match
+        ;; it: never bake — FAIL the page so this one form interprets (a page /
+        ;; setup failure BEFORE any native code runs, so no double-execution).
+        ;; Only forms that take a #'NAME as a value fall back; regular calls (crel,
+        ;; #306 bridge) and in-module #'local closures (lrel, below) still JIT.
+        ;; Keeping these forms NATIVE via a nargs-generic late-binding thunk
+        ;; (%jit-make-bridge-thunk-aarch64 is nargs-specific today) is the follow-on.
         (dolist (r frel)
-          (let* ((name (gethash (cdr r) rt-table))
-                 (fn (and name (%mvm-resolve-runtime-fn name)))
-                 (word (if fn (%val->word fn) 0)))
-            (if (> word 0)
-                (%jit-write-movz-quad base (car r) word)
-                (progn
-                  (setq *jit-r-reloc-fnaddr-fail*
-                        (if *jit-r-reloc-fnaddr-fail*
-                            (+ 1 *jit-r-reloc-fnaddr-fail*) 1))
-                  (when (and name (boundp (quote *jit-census-on*)) *jit-census-on*
-                             (boundp (quote *jit-blocked-fnaddrs*)))
-                    (setq *jit-blocked-fnaddrs*
-                          (%jit-census-note name *jit-blocked-fnaddrs*)))
-                  (when (eql why 0) (setq why 2))
-                  (setq ok nil)))))
+          (let ((name (gethash (cdr r) rt-table)))
+            (setq *jit-r-reloc-fnaddr-fail*
+                  (if *jit-r-reloc-fnaddr-fail*
+                      (+ 1 *jit-r-reloc-fnaddr-fail*) 1))
+            (when (and name (boundp (quote *jit-census-on*)) *jit-census-on*
+                       (boundp (quote *jit-blocked-fnaddrs*)))
+              (setq *jit-blocked-fnaddrs*
+                    (%jit-census-note name *jit-blocked-fnaddrs*)))
+            (when (eql why 0) (setq why 2))
+            (setq ok nil)))
         ;; WS5: IN-MODULE fn-addr relocations.  These are the sites that build a
         ;; CLOSURE (make-closure stores the lambda's fn-addr in slot 0) and any
         ;; #'LOCAL-FN value-load.  The whole-image path defers them to

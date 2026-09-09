@@ -5987,9 +5987,17 @@
          ;; (kernel-image-entry-point arithmetic, JMP/B emission, etc.)
          ;; doesn't have to know whether the buffer was shared.
          (translated-start-idx (a64-buffer-position buf))
-         ;; Expose to trap-time code (e.g. fn-addr patch site recorder)
-         ;; via dynamic variable; see *aarch64-translated-start-idx*.
-         (*aarch64-translated-start-idx* translated-start-idx)
+         ;; *aarch64-translated-start-idx* is SETQ'd in the body below, NOT
+         ;; LET*-bound here.  op-fn-addr (a deep callee) reads it to record each
+         ;; fn-addr patch site RELATIVE to the translated region.  IN-IMAGE a
+         ;; compiled LET of a special does not reach that deep callee (same
+         ;; limitation as the :into-buf / genarith bugs), so it read the global
+         ;; (NIL->0), mis-recorded absolute byte-positions, and
+         ;; apply-aarch64-fn-addr-patches double-counted the boot preamble ->
+         ;; nested-lambda closure code-slots left unpatched (0 -> OR-3 -> 0x3 ->
+         ;; blr 0 -> SIGSEGV on funcall).  A global SETQ reaches the callee
+         ;; in-image.  Byte-neutral host-side: the LET* already propagated there
+         ;; and nothing reads the var after the translate returns.
          (insns (decode-mvm-stream bytecode))
          (offset-map (build-offset-to-index-map insns))
          (mvm-to-native-label (make-hash-table :test 'equal))
@@ -6000,6 +6008,10 @@
          ;; Track function entry positions: bytecode-offset → native-byte-offset
          (fn-entry-offsets (make-hash-table :test 'eql))
          (fn-bc-offsets (make-hash-table :test 'eql)))
+
+    ;; Expose to trap-time code (op-fn-addr patch-site recorder) via a global
+    ;; SETQ, not a LET* binding — see the note at translated-start-idx above.
+    (setq *aarch64-translated-start-idx* translated-start-idx)
 
     ;; Pre-register function entry points in the label table
     (when function-table

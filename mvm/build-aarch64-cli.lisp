@@ -1274,29 +1274,15 @@
           (concatenate 'string (subseq cl-user::*full-source* 0 p) repl
                        (subseq cl-user::*full-source* (+ p (length needle)))))))
 
-;; #211/#7 NESTED-LAMBDA fn-addr fix for the in-image --compile-aarch64 path.
-;; translate-mvm-to-aarch64 LET*-binds *aarch64-translated-start-idx* around the
-;; whole translation; op-fn-addr reads it (deep callee) to record fn-addr patch
-;; sites as offsets RELATIVE to where translated code starts in the unified
-;; buffer.  In-image a compiled LET of a special does NOT reach the deep callee
-;; (the same limitation the :into-buf / genarith patches address), so op-fn-addr
-;; read the GLOBAL (NIL -> 0) and recorded the ABSOLUTE byte-pos.  apply-aarch64-
-;; fn-addr-patches then ADDS native-image-offset again -> double-counts the boot
-;; preamble -> patches the wrong word, leaving the lambda's code slot an
-;; UNPATCHED MOVZ/MOVK 0 (OR-3 = 0x3) -> `funcall f` does `sub x16,#3; blr 0` ->
-;; SIGSEGV.  Host-side the LET* propagates, so shipping (rpi/gate) images and the
-;; seed's own image are correct; the bug is unique to the in-image build-image.
-;; SCOPED FIX (baked copy only, no shared-file change): rewrite that ONE let*
-;; binding into a global SETQ so op-fn-addr reads the correct value in-image.
-;; Byte-neutral for JIT pages (translated-start-idx = 0 there, matching the old
-;; NIL->0).  See the shared-fix alternative in the report.
-(let ((needle "(*aarch64-translated-start-idx* translated-start-idx)")
-      (repl   "(%mvm-tsi-ignore (setq *aarch64-translated-start-idx* translated-start-idx))"))
-  (let ((p (search needle cl-user::*full-source*)))
-    (unless p (error "#211: could not find *aarch64-translated-start-idx* let* binding to SETQ-ify"))
-    (setf cl-user::*full-source*
-          (concatenate 'string (subseq cl-user::*full-source* 0 p) repl
-                       (subseq cl-user::*full-source* (+ p (length needle)))))))
+;; #211/#7 NESTED-LAMBDA fn-addr fix: the in-image --compile-aarch64 path emitted
+;; closures with an unpatched (0 -> OR-3 -> 0x3) code slot, so `funcall f` did
+;; `blr 0` -> SIGSEGV.  Root cause: translate-mvm-to-aarch64 LET*-bound
+;; *aarch64-translated-start-idx*, and in-image a compiled LET of a special does
+;; not reach the deep op-fn-addr callee, so it read the global (NIL->0) and the
+;; fn-addr patch offset was double-counted.  This is now fixed AT THE SOURCE
+;; (translate-aarch64.lisp SETQs the global instead of LET*-binding it), so the
+;; former scoped *full-source* text-transform here is no longer needed and has
+;; been removed (its needle no longer exists).
 
 (let ((marker "(defun kernel-main ()"))
   (let ((p (search marker cl-user::*full-source*)))

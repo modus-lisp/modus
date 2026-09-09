@@ -16705,12 +16705,55 @@
       ((null (cdr form))
        (compile-form `(error "MAKE-ARRAY requires a dimensions argument") env dest))
       ;; Multi-dim or 0-dim quoted list, OR any kwargs present: defer
-      ;; to the runtime defun.
+      ;; to the runtime defun — as a DIRECT named call, not
+      ;; `(funcall (function make-array) …)`.  The #'MAKE-ARRAY VALUE that
+      ;; funcall form produced was an out-of-module fn-addr reference in every
+      ;; JIT'd form: on aarch64 it was refused outright (the whole form
+      ;; interpreted — 118 of reel's 121 fn-addr rejects), and even with the
+      ;; late-binding thunk it cost a &rest+apply round trip per call, twice
+      ;; per vp8-idct block.  compile-call resolves MAKE-ARRAY by name to the
+      ;; build-time native defun (a plain :call / crel, patched directly) and
+      ;; takes its static-rest pre-pack path for the kwargs.  compile-call does
+      ;; not re-dispatch special forms, so this cannot recurse into here.
+      ;; SOLE kwarg :element-type naming a type the runtime stores as a
+      ;; plain tagged-word array anyway: emit the inline 1-D path.  The
+      ;; runtime defun returns a BARE simple-vector with array-element-type
+      ;; T for these (it records nothing — only u8 spellings get the packed
+      ;; #x11 vector and character types a string), so the inline result is
+      ;; indistinguishable.  Measured on a Pi 5: the runtime path cost
+      ;; 14.4 us per call vs 0.05 us inline, and reel's vp8-idct allocates
+      ;; two `(make-array 16 :element-type '(signed-byte 32))` per 4x4 block
+      ;; — 78% of the transform's time.  WHITELIST, not blacklist: anything
+      ;; not listed keeps the runtime call, so the u8 / character
+      ;; representations (%u8-element-type-p: (unsigned-byte 8), (mod 256),
+      ;; (integer 0 255)) can never be inlined by mistake.
+      ((and (not multi)
+            (consp kwargs) (null (cddr kwargs))
+            (eq (car kwargs) :element-type)
+            (%inline-generic-element-type-p (cadr kwargs)))
+       (compile-make-array-1d dim-form env dest))
       ((or multi kwargs)
-       (compile-form `(funcall (function make-array) ,dim-form ,@kwargs)
-                     env dest))
+       (compile-call 'make-array (cons dim-form kwargs) env dest))
       ;; Plain dim, no kwargs — emit the fast inline path.
       (t (compile-make-array-1d dim-form env dest)))))
+
+(defun %inline-generic-element-type-p (form)
+  "True for a QUOTED element-type that Modus stores as a generic tagged-word
+   array: (signed-byte 32|64), (unsigned-byte 16|32|64), fixnum, integer, t.
+   Deliberately excludes every u8 spelling and every character type."
+  ;; Compare by NAME (like name-eq elsewhere in this file): a source symbol
+  ;; read at runtime into a library's package need not be EQ to this file's
+  ;; baked literal, and an EQ miss here would only make the shortcut inert.
+  (and (consp form) (symbolp (car form)) (string= (symbol-name (car form)) "QUOTE")
+       (consp (cdr form)) (null (cddr form))
+       (let ((ty (cadr form)))
+         (or (and (symbolp ty)
+                  (member (symbol-name ty) '("T" "FIXNUM" "INTEGER") :test #'string=))
+             (and (consp ty) (symbolp (car ty)) (consp (cdr ty)) (null (cddr ty))
+                  (integerp (cadr ty))
+                  (let ((n (symbol-name (car ty))) (w (cadr ty)))
+                    (or (and (string= n "SIGNED-BYTE")   (member w '(32 64)))
+                        (and (string= n "UNSIGNED-BYTE") (member w '(16 32 64))))))))))
 
 (defun compile-make-string-array (size-form env dest)
   "Like compile-make-array but with string subtag #x31.

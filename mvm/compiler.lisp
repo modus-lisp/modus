@@ -8342,7 +8342,15 @@
                 `(set-car ,(cell-var-name var)
                          (+ (car ,(cell-var-name var))
                             ,(cell-rewrite-form delta boxed-vars lambda-params)))
-                `(incf ,var ,(cell-rewrite-form delta boxed-vars lambda-params)))))
+                ;; Non-symbol place, e.g. (incf (aref v n) w): rewrite the PLACE
+                ;; too, exactly as the SETF case does, so a boxed var used as an
+                ;; index inside it becomes (car %CELL-n).  Macro expansion runs
+                ;; AFTER this pass, so an unrewritten place leaves incf's
+                ;; expansion referencing the bare var -> UNBOUND-VARIABLE inside
+                ;; the closure (found by reel's find-near-mvs: (incf (aref cnt n) w)
+                ;; in an flet where n is let-bound and (incf n)'d).
+                `(incf ,(cell-rewrite-form var boxed-vars lambda-params)
+                       ,(cell-rewrite-form delta boxed-vars lambda-params)))))
          ;; (decf var delta) — if var is boxed, rewrite to setcar + car + -
          ((and (symbolp op) (string= (symbol-name op) "DECF"))
           (let ((var (cadr form))
@@ -8351,7 +8359,9 @@
                 `(set-car ,(cell-var-name var)
                          (- (car ,(cell-var-name var))
                             ,(cell-rewrite-form delta boxed-vars lambda-params)))
-                `(decf ,var ,(cell-rewrite-form delta boxed-vars lambda-params)))))
+                ;; Same as INCF: rewrite a non-symbol place's subforms.
+                `(decf ,(cell-rewrite-form var boxed-vars lambda-params)
+                       ,(cell-rewrite-form delta boxed-vars lambda-params)))))
          ;; (push value place) — if place is a boxed var, rewrite to
          ;; (set-car %CELL-V (cons value (car %CELL-V))).  The map-into /
          ;; mapcar-with-side-effects tests pass closures shaped exactly

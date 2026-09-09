@@ -292,6 +292,41 @@ Pi 5, same clip: **30 frames in 0.99 s = 30 fps**; inter frames 31 ms
 (macroblock loop 24, loop filter 4, copy 6), keyframe 68 ms.  Frame-0
 checksum 7133244 bit-exact on both arches throughout.
 
+## Type promises on globals, inline EVERY/SOME, word copies: 33 fps
+
+The next attribution read: macroblock loop 22 ms (token parsing 7.4, motion
+compensation 4.9, residual add 5, mode parsing 3.7), loop filter 4, copy 4 —
+no single item left, so three small general fixes:
+
+- `(declaim (type … *global*))` is now honoured for **globals** (reel
+  declaims its coefficient tables — `+coeff-bands+`, `+coeff-scan+`, the
+  quantiser lookups, the trees and probabilities — but references them as
+  globals, so every access in the token loop was still the four-way
+  dispatch).  The compiled `(proclaim …)` form is swallowed by
+  `compile-form`'s DECLAIM/PROCLAIM no-op clause, so the recorder hangs off
+  that clause, not the `proclaim` function; a lexical of the same name is
+  never typed by the global's promise.
+- `(every #'p v)` / `(some #'p v)` over a declared simple array compile to
+  an index loop, with `zerop`/`plusp`/`minusp` as inline compares — the
+  per-block test now costs no calls at all.
+- `%bulk-copy-u8` moves eight bytes at a time through raw word loads on the
+  packed data (byte K of an object with word W lives at W+7+K; nothing in
+  the loop allocates), including disjoint ranges of the same object.
+
+Pi 5: **30 frames in 0.90 s = 33 fps**, inter 28 ms, keyframe 65 ms.
+
+And the ANSI gate caught a real bug of the arithmetic tier: `minus.8`
+(13982) faulted because `%expr-width` reported `(ash 1 1000)` as 1002 bits
+and the trust logic read *any known width* as "this operand is a fixnum" —
+`(- (ash 1 1000))` became a tag-less subtract on a bignum pointer.  A
+computed width beyond 63 bits now comes back as NIL, which every consumer
+already treats as "not provably a fixnum".
+
+What remains between 33 and 60 fps is uniform per-operation cost: every
+variable read is a frame load and every binary op is ~12 instructions.  The
+next step is register allocation across a basic block, not another dispatch
+fix.
+
 ## Related
 
 - `docs/calling-convention-design.md` — the tagged-word / tag-3 native function discipline this relies on.

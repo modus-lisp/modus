@@ -2239,6 +2239,40 @@
             (list 'block fn let-form)
             let-form)))))
 
+;;; ---- (declaim (type T *global*)) — honoured at runtime ----------------------
+(defvar *global-dtypes* nil
+  "Alist (name-hash . type) from runtime (proclaim '(type T v …)): the declared
+   type of a GLOBAL variable, read by %var-dtype wherever a lexical binding's
+   dtype is read (typed array access, width inference).  A declaim is a
+   promise, as in SBCL: the variable must hold what it says.")
+
+(defun %global-dtype (sym)
+  (and sym (symbolp sym) *global-dtypes*
+       (cdr (assoc (normalize-name sym) *global-dtypes*))))
+
+(defun %var-dtype (form env)
+  "Declared type of the variable FORM: its lexical binding's dtype when it has
+   a binding (NIL if that binding is undeclared — never fall through to a
+   global of the same name), else the global's proclaimed type."
+  (and form (symbolp form)
+       (let ((b (and env (env-lookup env form))))
+         (if b (binding-dtype b) (%global-dtype form)))))
+
+(defun %declaim-note-type (form)
+  "Record (type TYPE v …) specs of a DECLAIM/PROCLAIM form for global variables."
+  (dolist (spec (cdr form))
+    (let ((s (if (and (consp spec) (name-eq (car spec) "QUOTE") (consp (cdr spec)))
+                 (cadr spec)
+                 spec)))
+      (when (and (consp s) (symbolp (car s)) (name-eq (car s) "TYPE") (consp (cdr s)))
+        (let ((ty (%resolve-declared-type (cadr s))))
+          (dolist (v (cddr s))
+            (when (and v (symbolp v))
+              (let ((h (normalize-name v)))
+                (setq *global-dtypes*
+                      (cons (cons h ty)
+                            (remove h *global-dtypes* :key (function car))))))))))))
+
 (defun name-eq (sym name-string)
   "Check if SYM's name matches NAME-STRING via hash comparison"
   (and (symbolp sym)
@@ -7218,7 +7252,9 @@
        ;; Still a runtime no-op, but DECLAIM/PROCLAIM carry the optimize
        ;; policy, so read the level out on the way past.
        (%declaim-note-optimize form)
-       (when *mvm-eval-runtime-p* (%declaim-note-inline form))
+       (when *mvm-eval-runtime-p*
+         (%declaim-note-inline form)
+         (%declaim-note-type form))
        (compile-nil dest))
 
       (t (compile-call op (cdr form) env dest)))))
@@ -17037,9 +17073,8 @@
 (defun %declared-generic-array-var-p (form env)
   "True when FORM is a variable whose binding carries a generic
    (simple-array ET …) declaration — the raw word-slot path is valid."
-  (and (symbolp form) env
-       (let ((b (env-lookup env form)))
-         (and b (%generic-simple-array-decl-p (binding-dtype b))))))
+  (and (symbolp form)
+       (%generic-simple-array-decl-p (%var-dtype form env))))
 
 (defun %resolve-declared-type (ty)
   "Expand a declared type NAME through the runtime deftype table so that
@@ -17117,24 +17152,30 @@
 
 (defun %expr-width (form env)
   "Estimated bit width of FORM's integer value, or NIL when it is not
-   provably a fixnum-typed expression.  Widths above 62 mean 'a fixnum by
-   declaration but of unknown magnitude' and disable the overflow-safe op."
+   provably a FIXNUM-valued expression.  Every consumer reads a non-NIL
+   width as 'this value is a fixnum' (tag tests are skipped on it), so a
+   computed width beyond a fixnum's 63 bits — (ash 1 1000), a product of
+   two wide operands — must come back as NIL.  Before this cap ANSI
+   minus.8's `(- (ash 1 1000))` became a tag-less subtract on a bignum
+   pointer (gate7/gate8 lost 13982)."
+  (let ((w (%expr-width-1 form env)))
+    (and w (<= w 63) w)))
+
+(defun %expr-width-1 (form env)
+  "The uncapped estimate behind %expr-width."
   (cond
     ((integerp form)
      (let ((w (+ 1 (integer-length (abs form))))) (and (<= w 62) w)))
     ((symbolp form)
-     (and form env
-          (let ((b (env-lookup env form)))
-            (and b (%decl-int-width (binding-dtype b))))))
+     (and form (%decl-int-width (%var-dtype form env))))
     ((not (consp form)) nil)
     ((not (symbolp (car form))) nil)
     (t
      (let ((op (symbol-name (car form))) (args (cdr form)))
        (cond
          ((string= op "AREF")
-          (and (consp args) (symbolp (car args)) env
-               (let ((b (env-lookup env (car args))))
-                 (and b (%decl-array-elt-width (binding-dtype b))))))
+          (and (consp args) (symbolp (car args))
+               (%decl-array-elt-width (%var-dtype (car args) env))))
          ((or (string= op "+") (string= op "-"))
           (and (consp args)
                (let ((w (%expr-width (car args) env)))
@@ -17228,9 +17269,8 @@
   "True when FORM is a variable declared (simple-array (unsigned-byte 8) …):
    emit the packed-byte primitives directly, skipping the wrapper/string/mda
    dispatch AND the runtime #x11 subtag test."
-  (and (symbolp form) env
-       (let ((b (env-lookup env form)))
-         (and b (%u8-simple-array-decl-p (binding-dtype b))))))
+  (and (symbolp form)
+       (%u8-simple-array-decl-p (%var-dtype form env))))
 
 (defun compile-make-string-array (size-form env dest)
   "Like compile-make-array but with string subtag #x31.
@@ -17609,6 +17649,39 @@
         (let ((*inline-active* (cons (%inline-name-key fn) *inline-active*)))
           (declare (special *inline-active*))
           (return-from compile-call (compile-form x env dest))))))
+  ;; (every #'F v) / (some #'F v) over a DECLARED simple array: an inline
+  ;; index loop instead of the generic sequence function funcalling F per
+  ;; element through the #'NAME thunk.  reel tests every 4x4 block with
+  ;; (every #'zerop blk) — 24 blocks per macroblock.  Only the two-argument
+  ;; form with a (function NAME) predicate and a variable operand.
+  (when (and *mvm-eval-runtime-p* (symbolp fn)
+             (or (name-eq fn "EVERY") (name-eq fn "SOME"))
+             (consp args) (consp (cdr args)) (null (cddr args))
+             (consp (car args)) (symbolp (caar args)) (name-eq (caar args) "FUNCTION")
+             (consp (cdar args)) (symbolp (cadar args)) (cadar args)
+             (symbolp (cadr args))
+             (or (%declared-generic-array-var-p (cadr args) env)
+                 (%declared-u8-array-var-p (cadr args) env)))
+    (let* ((pred (cadar args))
+           (v (cadr args))
+           (everyp (name-eq fn "EVERY"))
+           (i (%mvm-gensym "%EVI")) (n (%mvm-gensym "%EVN")) (r (%mvm-gensym "%EVR"))
+           (elt (list 'aref v i))
+           ;; the sign predicates become inline compares on the typed element
+           (test (cond ((name-eq pred "ZEROP") (list '= elt 0))
+                       ((name-eq pred "PLUSP") (list '> elt 0))
+                       ((name-eq pred "MINUSP") (list '< elt 0))
+                       (t (list pred elt)))))
+      (return-from compile-call
+        (compile-form
+         (list 'let (list (list n (list 'length v)) (list r (if everyp t nil)))
+               (list 'declare (list 'type 'fixnum n))
+               (list 'dotimes (list i n)
+                     (if everyp
+                         (list 'unless test (list 'setq r nil) (list 'return nil))
+                         (list 'when test (list 'setq r t) (list 'return nil))))
+               r)
+         env dest))))
   ;; Typed shortcuts for the helpers the ABS macro expands to: a known-width
   ;; integer expression (see %expr-width) is never complex, and negating one
   ;; of <= 61 bits cannot overflow, so (- 0 x) takes the plain :sub.  Each
@@ -19721,7 +19794,9 @@
      ;; Same as the expression-level clause: a runtime no-op, but the
      ;; optimize policy is read out first (see *compile-safety*).
      (%declaim-note-optimize form)
-     (when *mvm-eval-runtime-p* (%declaim-note-inline form))
+     (when *mvm-eval-runtime-p*
+       (%declaim-note-inline form)
+       (%declaim-note-type form))
      nil)
 
     ;; (eval-when (situations...) body...) — compile body as top-level forms

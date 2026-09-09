@@ -1027,6 +1027,7 @@
     ;; compiler expands calls to a declaimed-inline DEFUN in place; see
     ;; %inline-expansion in compiler.lisp).  Other kinds stay no-ops.
     (%declaim-note-inline (list 'declaim decl))
+    (%declaim-note-type (list 'declaim decl))
     nil))
 
 (defun declaim (&rest decls)

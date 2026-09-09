@@ -672,18 +672,37 @@
   (and (%u8-bare-p dst) (%u8-bare-p src)))
 
 (defun %bulk-copy-u8 (dst dstart src sstart n)
-  "Byte copy SRC[sstart…] → DST[dstart…], memmove semantics like %bulk-copy."
-  (if (and (eq dst src) (> dstart sstart))
-      (let ((i (- n 1)))
-        (loop
-          (when (< i 0) (return dst))
-          (%u8-set dst (+ dstart i) (%u8-ref src (+ sstart i)))
-          (setq i (- i 1))))
-      (let ((i 0))
-        (loop
-          (when (>= i n) (return dst))
-          (%u8-set dst (+ dstart i) (%u8-ref src (+ sstart i)))
-          (setq i (+ i 1))))))
+  "Byte copy SRC[sstart…] → DST[dstart…], memmove semantics like %bulk-copy.
+   Distinct objects (or a same-object copy that moves DOWN) go eight bytes
+   at a time through raw word loads/stores on the packed data — the object
+   pointer is tag 9 and the data starts 16 bytes past the header, so byte
+   K lives at raw address (word - 9 + 16 + K) = word + 7 + K.  Nothing in
+   the loop allocates, so the raw addresses cannot move under it.  Hosted
+   x64 / aarch64 both allow unaligned 64-bit access."
+  (declare (type fixnum dstart sstart n))
+  (cond
+    ;; same object, destination above the source AND the ranges overlap:
+    ;; copy descending, byte-wise.  Disjoint ranges take the word path.
+    ((and (eq dst src) (> dstart sstart) (< (- dstart sstart) n))
+     (let ((i (- n 1)))
+       (declare (type fixnum i))
+       (loop
+         (when (< i 0) (return dst))
+         (%u8-set dst (+ dstart i) (%u8-ref src (+ sstart i)))
+         (setq i (- i 1)))))
+    (t
+     (let ((i 0)
+           (da (+ (%val->word dst) 7 dstart))
+           (sa (+ (%val->word src) 7 sstart)))
+       (declare (type fixnum i da sa))
+       (loop
+         (when (> (+ i 8) n) (return))
+         (setf (mem-ref (+ da i) :u64) (mem-ref (+ sa i) :u64))
+         (setq i (+ i 8)))
+       (loop
+         (when (>= i n) (return dst))
+         (%u8-set dst (+ dstart i) (%u8-ref src (+ sstart i)))
+         (setq i (+ i 1)))))))
 
 (defun %bulk-copy (dst dstart src sstart n)
   "Copy N elements SRC[sstart…] → DST[dstart…] by raw word slots.

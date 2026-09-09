@@ -200,6 +200,98 @@ fixnums is still tag-checked with overflow promotion — the binding type slot
 now makes a raw-op path a contained change; and every local is spilled to
 the frame.  Profile and plan: session memory `reference_reel_perf_profile`.
 
+## The thunk's own cost, and the cache that removed it (2026-09-09, later)
+
+With the decoder native and the per-op tiers in (typed arithmetic, leaf
+operands, LET width inference — commit `2d4d824`), a direct per-phase timing
+of an inter frame on the Pi 5 (`/home/claude/cabfs/hdmi/pi-phase.lisp`,
+`pi-mb.lisp` — copies of `decode-frame` / `decode-macroblocks` with timers,
+because a `(setf (symbol-function …))` wrapper is *not seen* by native
+callers) attributed **92 % of the frame to the residual-add phase**: 150–267
+ms of a 181 ms frame in `decode-macroblocks`, of which `add-inter-residual`
+was 1249 of 1364 ms over seven frames.  Motion compensation measured
+≤ 20 ms, the loop filter 15 ms, the bordered-plane copy 16 ms, the bool
+decoder ~4 ms (0.215 µs/bit).
+
+The phase is `(unless (every #'zerop blk) …)` on every 4×4 block: 24 blocks
+per macroblock, 16 element calls each — ~92,000 calls per frame through the
+`#'ZEROP` thunk, and each of those took the thunk's slow path: store the
+name index, branch to `%jit-bridge-any (&rest args)`, cons the argument list,
+`apply`.  The thunk that made the function native had made every element
+call cost a few microseconds.
+
+The fix keeps the late binding and adds a cache.  The thunk now begins
+
+```
+ 0: ldr x16, [pc, #72]     ; cached native target (raw code address)
+ 4: cbz x16, +8            ; 0 = not cached: slow path
+ 8: br  x16                ; direct: arguments, nargs slot and LR untouched
+12: (the previous sequence: idx → slot, br %jit-bridge-any)
+72: cache word
+```
+
+`%jit-bridge-any` fills the word when the resolved target is a tag-3 native
+function (a heap closure keeps taking the slow path), and every writer of
+`*symbol-function-table*` (`defun`, `fmakunbound`, the native installer, the
+trampoline path, the CLOS accessor alias) calls
+`%jit-fnaddr-thunk-invalidate`, which zeroes the word, so a later
+redefinition is followed on the next call.  `thunk-cache.lisp` checks both
+properties: 5,760 blocks of `every #'zerop` take 35 ms under QEMU-TCG, and a
+saved `#'tf` sees a later `(defun tf …)` and an `fmakunbound` + `defun`.
+
+One trap, worth recording because it surfaces as a bare `#(SIMPLE-ERROR
+NIL)` (a recovered fault carries no condition): a Lisp
+`(setf (mem-ref slot :u64) v)` stores `v`'s **tagged** form (a fixnum is
+`n<<1`), while the thunk's `ldr` reads the raw bits, so storing the address
+branched to twice the address.  The cache stores `(ash raw -1)`; the file's
+`RAW-ADDR-AUDIT` note has the convention.
+
+Pi 5, same 320×180 clip: **30 frames in 1.63 s = 18 fps**; inter frames
+181 → **52 ms**; keyframe 89 ms (it has no zero-block test in its path and is
+now the outlier).  x64 is unchanged — it bakes `#'NAME` addresses and never
+had the slow path (nor the late binding).
+
+## After the thunk: three more tiers to 30 fps (2026-09-09, late)
+
+With the residual-add phase gone, direct per-phase timing of an inter frame
+read: macroblock loop 23 ms, loop filter 15 ms, bordered plane copy 16 ms
+(of 52).  Each became its own fix on the Modus side:
+
+- **u8 block paths for `replace` / `fill`** (`dd8e138`).  `%bulk-copy`
+  deliberately excludes byte-packed vectors (its word copier would read eight
+  elements per slot), so reel's row-by-row plane copy fell to the generic
+  element loop.  A byte-wise sibling (`%bulk-copy-u8`, memmove semantics) and
+  a byte `fill` took the copy 16 → 5 ms.  (Aside: a top-level probe *loop*
+  is interpreted unless the probe sets `*jit-hot-only*` to NIL — every
+  iteration then costs ~5 µs, which made `length` and `replace` look 40 µs a
+  call.  They are ~0.  Set it in timing probes.)
+- **`(declaim (inline f))` honoured at runtime** (`bb1f957`).  The runtime
+  `declaim` macro expanded to NIL and a runtime `proclaim` *macro* shadowed
+  the real function, so no declaration reached the compiler.  reel declaims
+  exactly its hot leaves inline — `bool-bit`, `treed-read`, `clamp255`,
+  `c8`, `%adjust`, `%edge-ok`, `%hev` … — and the loop filter called six of
+  them per filtered line.  Calls to a declaimed-inline DEFUN with only
+  required parameters now expand in place as a LET with the parameters
+  renamed to fresh symbols (the body's own declarations land on the LET,
+  where the typed fast paths read them).  With it, `abs` on a typed operand
+  no longer costs two runtime calls (`%complex-p` of a known-width integer
+  is NIL; negating a ≤ 61-bit value is a plain subtract).  Loop filter
+  15 → 4 ms.
+- **An x64-only fault the inliner exposed.**  Once `bool-bit`'s body sat
+  inside an `aref` index, its `loop while … do` — which `expand-cl-loop`
+  turns into a `(setq #:nat%N t)` termination flag, i.e. a *global* store —
+  reached `%compile-setq-global`, whose `%GV-SET` call saved none of the live
+  expression temps.  x64's V5–V8 are caller-saved (aarch64's are x19–x23,
+  callee-saved), so the held array register came back as garbage and the
+  keyframe decode died in the error signaller.  Bisected with two new
+  compiler knobs (`*inline-never*`, `*inline-only-in*`) and a probe-local
+  copy of one reel file down to a six-line shape; the call now saves its
+  temps exactly as `compile-call` does.
+
+Pi 5, same clip: **30 frames in 0.99 s = 30 fps**; inter frames 31 ms
+(macroblock loop 24, loop filter 4, copy 6), keyframe 68 ms.  Frame-0
+checksum 7133244 bit-exact on both arches throughout.
+
 ## Related
 
 - `docs/calling-convention-design.md` — the tagged-word / tag-3 native function discipline this relies on.

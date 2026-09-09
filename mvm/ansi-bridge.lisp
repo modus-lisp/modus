@@ -5017,8 +5017,21 @@
         ;; Character element type with no other wrapping returns the
         ;; underlying string directly so STRINGP / EQUAL string ops work.
         (cond
+          ;; Plain 1-D, no wrapping kwargs, and a GENERIC element type — T,
+          ;; or any declared type that is neither a u8 spelling nor a
+          ;; character type ((signed-byte 32), fixnum, …): return the bare
+          ;; tagged-word vector.  The MDA wrapper carried NOTHING for these
+          ;; (array-element-type already answered T through it) but put every
+          ;; aref on the slow wrapper branch — and it made
+          ;;   (make-array 4 :element-type '(signed-byte 32) :initial-contents …)
+          ;; a DIFFERENT representation from the same call without the fill
+          ;; kwarg (which the compiler now inlines as a bare vector).  reel's
+          ;; VP8 probability/tree tables are exactly this shape; the declared-
+          ;; array fast path (compile-aref on a declared (simple-array
+          ;; (signed-byte 32))) read their wrapper headers as elements.
           ((and (= rank 1) (not (consp dim))
-                (not fp) (not adj) (not disp) (eq etype t))
+                (not fp) (not adj) (not disp)
+                (or (eq etype t) (and (not char-elt) (not u8-elt))))
            data)
           ((and (= rank 1) (not (consp dim))
                 (not fp) (not adj) (not disp) char-elt)

@@ -16819,6 +16819,13 @@
                      :key #'binding-name :test #'equal)))
         (when b (setf (binding-dtype b) (cdr pair)))))))
 
+(defvar *decl-fastpath-check* nil
+  "DIAGNOSTIC.  When T at compile time, the declared-array fast path emits a
+   runtime guard that signals a descriptive error naming the variable if it
+   does not hold a bare word array (cons wrapper / mda / string), instead of
+   the raw access — turns a SIGSEGV into 'which declaration lied'.  Set from
+   the REPL before loading the library under test; NIL in production.")
+
 (defun %declared-generic-array-var-p (form env)
   "True when FORM is a variable whose binding carries a generic
    (simple-array ET …) declaration — the raw word-slot path is valid."
@@ -16991,6 +16998,13 @@
   ;; DECLARED (simple-array <generic> …) variable: raw word-slot access, no
   ;; wrapper/string/mda dispatch.  See %declared-generic-array-var-p.
   (when (%declared-generic-array-var-p arr-form env)
+    (when *decl-fastpath-check*
+      (let ((tmp (alloc-temp-reg)))
+        (compile-form
+         `(when (or (consp ,arr-form) (%mda-p ,arr-form) (%prim-stringp ,arr-form))
+            (error "decl-fastpath aref: ~a is not a bare array: ~a" (quote ,arr-form) ,arr-form))
+         env tmp)
+        (free-temp-reg)))
     (return-from compile-aref (compile-word-aref arr-form idx-form env dest)))
   (let ((g-arr (%mvm-gensym "AREFA"))
         (g-idx (%mvm-gensym "AREFI"))
@@ -17053,6 +17067,13 @@
   ;; DECLARED (simple-array <generic> …) variable: raw word-slot store, no
   ;; wrapper/string/mda dispatch and no char->code coercion (never a string).
   (when (%declared-generic-array-var-p arr-form env)
+    (when *decl-fastpath-check*
+      (let ((tmp (alloc-temp-reg)))
+        (compile-form
+         `(when (or (consp ,arr-form) (%mda-p ,arr-form) (%prim-stringp ,arr-form))
+            (error "decl-fastpath aset: ~a is not a bare array: ~a" (quote ,arr-form) ,arr-form))
+         env tmp)
+        (free-temp-reg)))
     (return-from compile-aset
       (compile-word-aset arr-form idx-form val-form env dest)))
   (let ((g-arr (%mvm-gensym "ASETA"))

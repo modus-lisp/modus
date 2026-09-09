@@ -164,6 +164,15 @@ The one remaining fallback is a non-hot module; the transforms and both
 macroblock loops are native.  `/home/claude/cabfs/hdmi/thunk-regress.lisp`,
 `fnaddr-validate.lisp`.
 
+On real silicon (a Raspberry Pi 5, Cortex-A76, the linux-aarch64 CLI run
+natively — no emulation): `515 defuns native, 1 fallback`; the 320×180 clip
+decodes **30 frames in 8.85 s = 3 fps** (keyframe 341 ms, inter frames
+≈271 ms).  Before this fix the same run had not finished one keyframe after
+several minutes.  What remains between 3 and 60 fps is native code *quality*
+(every local spilled to the frame, generic tag-checked arithmetic on
+`(signed-byte 32)` data, two `make-array`s per `vp8-idct` call), not JIT
+coverage — a codegen campaign, not a correctness one.
+
 ## Related
 
 - `docs/calling-convention-design.md` — the tagged-word / tag-3 native function discipline this relies on.

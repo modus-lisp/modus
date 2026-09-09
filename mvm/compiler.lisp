@@ -16961,7 +16961,7 @@
   (cond ((null ty) nil)
         ((symbolp ty)
          (let ((n (symbol-name ty)))
-           (cond ((string= n "FIXNUM") 62)
+           (cond ((string= n "FIXNUM") 63)   ; 62 magnitude bits + sign
                  ((string= n "BIT") 1)
                  (t nil))))
         ((and (consp ty) (symbolp (car ty)) (consp (cdr ty)) (integerp (cadr ty)))
@@ -17022,10 +17022,17 @@
                (let ((w (%expr-width (car args) env)) (k (cadr args)))
                  (and w (if (< k 0) (max 1 (+ w k)) (+ w k))))))
          ((string= op "LOGAND")
+          ;; Widths include the sign, so LOGAND only narrows when an operand
+          ;; is known NON-NEGATIVE (a literal mask >= 0: result in [0, mask]).
+          ;; Two negatives AND to a negative as wide as the wider one —
+          ;; (logand x -1) is x — so with no sign information the bound is
+          ;; MAX, never MIN (a MIN here once let a bignum reach a plain add).
           (and (consp args) (consp (cdr args)) (null (cddr args))
-               (let ((w (%expr-width (car args) env)) (c (cadr args)))
+               (let ((a (car args)) (c (cadr args)))
                  (cond ((and (integerp c) (>= c 0)) (+ 1 (integer-length c)))
-                       (t (let ((wc (%expr-width c env))) (and w wc (min w wc))))))))
+                       ((and (integerp a) (>= a 0)) (+ 1 (integer-length a)))
+                       (t (let ((w (%expr-width a env)) (wc (%expr-width c env)))
+                            (and w wc (max w wc))))))))
          ((string= op "THE")
           (and (consp args) (consp (cdr args)) (%decl-int-width (car args))))
          (t nil))))))

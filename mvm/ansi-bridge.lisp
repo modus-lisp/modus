@@ -1023,6 +1023,10 @@
          (when (eq kind 'ftype) (%signal-type-error))
          (error "proclaim: malformed declaration spec ~S" decl))
         (t (setq cur (cdr cur)))))
+    ;; The spec is well-formed: INLINE / NOTINLINE are acted on (the runtime
+    ;; compiler expands calls to a declaimed-inline DEFUN in place; see
+    ;; %inline-expansion in compiler.lisp).  Other kinds stay no-ops.
+    (%declaim-note-inline (list 'declaim decl))
     nil))
 
 (defun declaim (&rest decls)

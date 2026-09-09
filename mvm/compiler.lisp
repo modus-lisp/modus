@@ -2132,6 +2132,113 @@
              (setq *compile-safety* 3))
             (t nil)))))))
 
+;;; ---- (declaim (inline f)) — honoured at runtime (mvm-eval) -----------------
+;;;
+;;; A name declaimed INLINE whose later DEFUN has only required parameters is
+;;; recorded (params + body, declarations included); a call with matching
+;;; arity then compiles as
+;;;     (let ((p1' a1) (p2' a2) …) <declares> <body>)       [+ (block f …)
+;;;                                                          when the body
+;;;                                                          RETURN-FROMs f]
+;;; with the parameters renamed to fresh symbols throughout the body, so a
+;;; caller variable of the same name is never captured and the body's own
+;;; type declarations land on the LET (the typed fast paths read them).
+;;; Recursion is cut by *inline-active*; &optional/&rest/&key definitions are
+;;; never inlined; a NOTINLINE declaim retracts.  Runtime only: the image
+;;; build ignores it, so its output does not move.  Known limitation (SBCL
+;;; inlines in the definition's lexical environment): a body reference to a
+;;; global that the CALLER shadows with a lexical of the same name would see
+;;; the caller's variable — small leaf functions read their parameters.
+(defvar *inline-declared* nil "Names (strings) currently declaimed INLINE.")
+(defvar *inline-fn-defs* nil "Alist name-string -> (params . body) for inlinable defuns.")
+(defvar *inline-active* nil "Names whose expansion is being compiled (recursion guard).")
+(defvar *inline-never* nil
+  "DIAGNOSTIC: names (strings) never recorded for inlining even when declaimed
+   — set from the REPL before loading a library to bisect a suspected
+   expansion.  NIL in production.")
+(defvar *inline-expansions* 0 "DIAGNOSTIC: calls expanded in place so far.")
+(defvar *inline-only-in* nil
+  "DIAGNOSTIC: when non-NIL, calls are expanded only inside the DEFUNs named
+   here (strings, compared with *current-function-name*) — bisects which
+   caller a bad expansion lives in.  NIL in production.")
+
+(defun %inline-name-key (name)
+  (cond ((stringp name) name)
+        ((symbolp name) (%rt-fn-name name))
+        (t nil)))
+
+(defun %declaim-note-inline (form)
+  "Record (inline f …) / (notinline f …) specs of a DECLAIM/PROCLAIM form."
+  (dolist (spec (cdr form))
+    (let ((s (if (and (consp spec) (name-eq (car spec) "QUOTE") (consp (cdr spec)))
+                 (cadr spec)
+                 spec)))
+      (when (and (consp s) (symbolp (car s)))
+        (cond
+          ((name-eq (car s) "INLINE")
+           (dolist (f (cdr s))
+             (let ((k (%inline-name-key f)))
+               (when (and k (not (member k *inline-declared* :test (function string=))))
+                 (setq *inline-declared* (cons k *inline-declared*))))))
+          ((name-eq (car s) "NOTINLINE")
+           (dolist (f (cdr s))
+             (let ((k (%inline-name-key f)))
+               (when k
+                 (setq *inline-declared* (remove k *inline-declared* :test (function string=)))
+                 (setq *inline-fn-defs* (remove k *inline-fn-defs* :key (function car) :test (function string=)))))))
+          (t nil))))))
+
+(defun %inline-record-defun (name params body)
+  "DEFUN of a declaimed-inline NAME with only required params: keep its
+   definition for call-site expansion (the newest definition wins)."
+  (let ((k (%inline-name-key name)))
+    (when (and k (member k *inline-declared* :test (function string=))
+               (not (member k *inline-never* :test (function string=)))
+               (listp params)
+               (every (lambda (p) (and (symbolp p) p
+                                       (let ((n (symbol-name p)))
+                                         (not (and (> (length n) 0) (char= (char n 0) #\&))))))
+                      params))
+      (setq *inline-fn-defs*
+            (cons (cons k (cons params body))
+                  (remove k *inline-fn-defs* :key (function car) :test (function string=)))))))
+
+(defun %subst-syms (alist tree)
+  "Replace every symbol in TREE that has an entry in ALIST (eq) by its value."
+  (cond ((symbolp tree) (let ((e (assoc tree alist :test (function eq)))) (if e (cdr e) tree)))
+        ((consp tree) (cons (%subst-syms alist (car tree)) (%subst-syms alist (cdr tree))))
+        (t tree)))
+
+(defun %tree-has-return-from (tree name)
+  (and (consp tree)
+       (or (and (symbolp (car tree)) (name-eq (car tree) "RETURN-FROM")
+                (consp (cdr tree)) (symbolp (cadr tree))
+                (string= (symbol-name (cadr tree)) (symbol-name name)))
+           (%tree-has-return-from (car tree) name)
+           (%tree-has-return-from (cdr tree) name))))
+
+(defun %inline-expansion (fn args)
+  "The LET form that replaces a call (FN . ARGS), or NIL when FN is not
+   inlinable here (not recorded, arity mismatch, or already being expanded)."
+  (let* ((k (%inline-name-key fn))
+         (def (and k *inline-fn-defs*
+                   (assoc k *inline-fn-defs* :test (function string=)))))
+    (when (and def (listp args)
+               (not (member k *inline-active* :test (function string=)))
+               (< (length *inline-active*) 4)
+               (= (length args) (length (cadr def))))
+      (let* ((params (cadr def))
+             (body (cddr def))
+             ;; variables resolve by NAME hash, so the fresh names carry a
+             ;; prefix no source variable uses
+             (fresh (mapcar (lambda (p) (%mvm-gensym (concatenate 'string "%INL-" (symbol-name p))))
+                            params))
+             (nbody (%subst-syms (mapcar (function cons) params fresh) body))
+             (let-form (cons 'let (cons (mapcar (function list) fresh args) nbody))))
+        (if (%tree-has-return-from nbody fn)
+            (list 'block fn let-form)
+            let-form)))))
+
 (defun name-eq (sym name-string)
   "Check if SYM's name matches NAME-STRING via hash comparison"
   (and (symbolp sym)
@@ -5829,7 +5936,10 @@
          (when *mvm-eval-runtime-p*
            (setq *e2-persist-defuns*
                  (cons (if (symbolp name) (%rt-fn-name name) (string name))
-                       *e2-persist-defuns*)))
+                       *e2-persist-defuns*))
+           ;; (declaim (inline NAME)) seen earlier: keep the definition for
+           ;; call-site expansion (see %inline-expansion).
+           (%inline-record-defun name params body))
          (let* ((rest-pos (position '&rest params))
                 (opt-pos  (position '&optional params))
                 (key-pos  (position '&key params))
@@ -7108,6 +7218,7 @@
        ;; Still a runtime no-op, but DECLAIM/PROCLAIM carry the optimize
        ;; policy, so read the level out on the way past.
        (%declaim-note-optimize form)
+       (when *mvm-eval-runtime-p* (%declaim-note-inline form))
        (compile-nil dest))
 
       (t (compile-call op (cdr form) env dest)))))
@@ -8939,15 +9050,34 @@
    = NIL because the defvar's setq never wrote.)  Byte-equivalent register
    end-state on the native build; only the staging opcodes differ."
   (let ((hash (%global-name-key var)))
-    ;; Stage V1 = value FIRST (V1 differs from V0, so this can't clobber the
-    ;; hash we load next).  If dest IS V1 the :mov is a self-move (harmless).
-    (unless (= dest +vreg-v1+)
-      (emit-ir :mov +vreg-v1+ dest))
-    (emit-li-tagged +vreg-v0+ hash)  ; fixnum-safe hash (mvm-eval :li-halves)
-    (when *mvm-emit-halves* (emit-ir :set-nargs 2))  ; mvm-eval bridge nargs
-    (emit-ir :call "%GV-SET" 2)
-    (unless (= dest +vreg-vr+)
-      (emit-ir :mov dest +vreg-vr+))))
+    ;; Live expression temps V5..V(4+n-1) are caller-saved on x64 (V4 is RBX,
+    ;; callee-saved): save them around the runtime CALL exactly as
+    ;; compile-call does, skipping DEST (it receives the result).  Without
+    ;; this, a global SETQ inside an expression that holds temps — the
+    ;; (setq #:nat%N t) termination flag expand-cl-loop emits for
+    ;; `loop while … do`, sitting inside an AREF index — clobbered the held
+    ;; array register: a fault on x64 only (aarch64 temps are x19..x23,
+    ;; callee-saved).  See reference_mvm_caller_save_bug.
+    (let ((save-count (min *temp-reg-counter* 12)))
+      (when (> save-count 1)
+        (let ((r (+ +vreg-v4+ 1)))
+          (loop (when (>= r (+ +vreg-v4+ save-count)) (return))
+            (unless (= r dest) (emit-ir :push r))
+            (setq r (+ r 1)))))
+      ;; Stage V1 = value FIRST (V1 differs from V0, so this can't clobber the
+      ;; hash we load next).  If dest IS V1 the :mov is a self-move (harmless).
+      (unless (= dest +vreg-v1+)
+        (emit-ir :mov +vreg-v1+ dest))
+      (emit-li-tagged +vreg-v0+ hash)  ; fixnum-safe hash (mvm-eval :li-halves)
+      (when *mvm-emit-halves* (emit-ir :set-nargs 2))  ; mvm-eval bridge nargs
+      (emit-ir :call "%GV-SET" 2)
+      (unless (= dest +vreg-vr+)
+        (emit-ir :mov dest +vreg-vr+))
+      (when (> save-count 1)
+        (let ((r (+ +vreg-v4+ save-count -1)))
+          (loop (when (< r (+ +vreg-v4+ 1)) (return))
+            (unless (= r dest) (emit-ir :pop r))
+            (setq r (- r 1))))))))
 
 ;;; ============================================================
 ;;; Lambda
@@ -17466,6 +17596,34 @@
    to prevent clobbering live variables in those registers."
   ;; Guard: args must be a proper list
   (unless (listp args) (setf args (list args)))
+  ;; (declaim (inline FN)) at runtime: expand the call in place.
+  (when (and *mvm-eval-runtime-p* (symbolp fn) *inline-fn-defs*
+             (null (env-lookup-fn env (%rt-fn-name fn)))   ; a local FLET/LABELS FN wins
+             (or (null *inline-only-in*)                    ; DIAGNOSTIC caller whitelist
+                 (and (stringp *current-function-name*)
+                      (member *current-function-name* *inline-only-in*
+                              :test (function string-equal)))))
+    (let ((x (%inline-expansion fn args)))
+      (when x
+        (setq *inline-expansions* (+ *inline-expansions* 1))
+        (let ((*inline-active* (cons (%inline-name-key fn) *inline-active*)))
+          (declare (special *inline-active*))
+          (return-from compile-call (compile-form x env dest))))))
+  ;; Typed shortcuts for the helpers the ABS macro expands to: a known-width
+  ;; integer expression (see %expr-width) is never complex, and negating one
+  ;; of <= 61 bits cannot overflow, so (- 0 x) takes the plain :sub.  Each
+  ;; ABS on a typed operand otherwise costs two runtime calls — seven per
+  ;; line of the VP8 loop filter.
+  (when (and (symbolp fn) (consp args) (null (cdr args)))
+    (let ((w (%expr-width (car args) env)))
+      (when w
+        (cond ((name-eq fn "%COMPLEX-P")
+               (compile-form (car args) env dest)      ; keep the evaluation
+               (return-from compile-call (compile-nil dest)))
+              ((and (name-eq fn "GENERIC-NEGATE-INT") (<= w 61))
+               (return-from compile-call
+                 (compile-form (list '- 0 (car args)) env dest)))
+              (t nil)))))
   ;; &rest transformation: if the target function has &rest, cons up extra args
   ;; &optional padding: if fewer args than params, pad with NIL
   ;; Arity check (narrow): if called with 0 args on a function with
@@ -19419,7 +19577,11 @@
          (when *mvm-eval-runtime-p*
            (setq *e2-persist-defuns*
                  (cons (if (symbolp name) (%rt-fn-name name) (string name))
-                       *e2-persist-defuns*)))
+                       *e2-persist-defuns*))
+           ;; (declaim (inline NAME)) seen earlier: keep the definition for
+           ;; call-site expansion (see %inline-expansion).  Runtime DEFUNs
+           ;; arrive here (mvm-eval-forms → mvm-compile-toplevel).
+           (%inline-record-defun name params body))
          ;; Detect &rest, &optional, &key before preprocessing strips them
          ;; so we can compute required-count for arity checks.
          (let* ((rest-pos (position '&rest params))
@@ -19559,6 +19721,7 @@
      ;; Same as the expression-level clause: a runtime no-op, but the
      ;; optimize policy is read out first (see *compile-safety*).
      (%declaim-note-optimize form)
+     (when *mvm-eval-runtime-p* (%declaim-note-inline form))
      nil)
 
     ;; (eval-when (situations...) body...) — compile body as top-level forms

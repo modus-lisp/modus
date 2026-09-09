@@ -270,8 +270,12 @@
     "(defmacro locally (&rest body) (cons 'progn body))"
     "(defmacro the (type form) form)"
     "(defmacro declare (&rest decls) nil)"
-    "(defmacro proclaim (form) nil)"
-    "(defmacro declaim (&rest decls) nil)"
+    ;; PROCLAIM is a real function (ansi-bridge.lisp): it validates the spec
+    ;; and records INLINE / NOTINLINE.  A macro here shadowed it with NIL.
+    "(defmacro declaim (&rest decls)
+       ;; each spec goes through PROCLAIM, which validates it and records
+       ;; INLINE / NOTINLINE for the runtime compiler
+       (cons 'progn (mapcar (lambda (d) (list 'proclaim (list 'quote d))) decls)))"
     ;; CHECK-TYPE used to expand to NIL — a NO-OP.  Every runtime-eval'd
     ;; library that guards its arguments with CHECK-TYPE therefore ran on with
     ;; the bad value.  That is not merely a missing error: alexandria's

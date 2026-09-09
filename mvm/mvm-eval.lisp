@@ -966,13 +966,61 @@
 (defun %jit-bridge-any (&rest args)
   "Late-bound target of a #'NAME value thunk: resolve the name whose index the
    thunk stored in the fn-addr slot, then apply it to the caller's arguments."
-  (apply (%jit-bridge-resolve (mem-ref #x10000178 :u32)) args))
+  (let* ((idx (mem-ref #x10000178 :u32))
+         (f (%jit-bridge-resolve idx)))
+    ;; Cache a NATIVE target (tag-3 code word) in the thunk so the next call
+    ;; branches straight to it; a heap function (interpreted closure, tag 9)
+    ;; keeps taking this path.  Cleared by %jit-fnaddr-thunk-invalidate on
+    ;; redefinition.
+    (let ((word (%val->word f)))
+      (when (eql (logand word 15) 3)
+        (let* ((nm (aref *jit-bridge-names* idx))
+               (h (and (stringp nm) *jit-fnaddr-thunks*
+                       (assoc nm *jit-fnaddr-thunks* :test (function string=)))))
+          ;; RAW-ADDR-AUDIT: the thunk's LDR reads the slot's RAW bits, and a
+          ;; Lisp (setf (mem-ref … :u64)) stores the value's tagged form
+          ;; (fixnum n is stored as n<<1), so store HALF the (4-aligned)
+          ;; address — its raw bits are then exactly the entry address.
+          ;; Storing the address itself branched to twice it (a recovered
+          ;; fault, surfacing as #(SIMPLE-ERROR NIL)).
+          (when h (setf (mem-ref (%jit-fnaddr-thunk-cache-slot (cdr h)) :u64)
+                        (ash (- word 3) -1))))))
+    (apply f args)))
 (defun %jit-bridge-any-entry ()
   (- (%val->word (symbol-function (quote %jit-bridge-any))) 3))
+(defun %jit-fnaddr-thunk-cache-slot (addr)
+  "Byte offset of the cached native target inside a #'NAME thunk (the 96-byte
+   slot is 16-aligned, so +72 is an 8-aligned data word after the 68 bytes
+   of code).  0 = not cached: take the slow path."
+  (+ addr 72))
+
+(defun %jit-fnaddr-thunk-invalidate (name)
+  "A DEFUN / (setf symbol-function) of NAME: drop the cached native target of
+   its #'NAME thunk so the next call re-resolves — late binding is what the
+   thunk exists for.  No-op when NAME has no thunk (and on x64, which bakes)."
+  (let ((h (and (stringp name) *jit-fnaddr-thunks*
+                (assoc name *jit-fnaddr-thunks* :test (function string=)))))
+    (when h (setf (mem-ref (%jit-fnaddr-thunk-cache-slot (cdr h)) :u64) 0))))
+
 (defun %jit-fnaddr-thunk-fill-aarch64 (addr name)
+  ;; Layout:   0: ldr x16, [pc+72]   cached native target (raw code address)
+  ;;           4: cbz x16, +8        not cached -> slow path
+  ;;           8: br  x16            direct: args / nargs / LR untouched
+  ;;          12: slow: movz/movk x17 <- idx; movz/movk x16 <- slot;
+  ;;              str w17,[x16]; movz/movk x16 <- %jit-bridge-any; br x16
+  ;;          72: cache word (8 bytes), 0 until %jit-bridge-any fills it.
+  ;; The cached call costs 3 instructions instead of an &rest cons + APPLY
+  ;; per call — (every #'zerop blk) ran the slow path once PER ELEMENT.
   (let ((idx *jit-bridge-count*) (k 0))
     (setf (aref *jit-bridge-names* idx) name)
     (setq *jit-bridge-count* (+ idx 1))
+    (%jit-emit-word32 (+ addr k) #x58000250)          ; ldr x16, [pc, #72]
+    (setq k (+ k 4))
+    (%jit-emit-word32 (+ addr k) #xB4000050)          ; cbz x16, +8
+    (setq k (+ k 4))
+    (%jit-emit-word32 (+ addr k) #xD61F0200)          ; br x16
+    (setq k (+ k 4))
+    (setf (mem-ref (%jit-fnaddr-thunk-cache-slot addr) :u64) 0)
     (%jit-emit-quad-placeholder (+ addr k) 17)
     (%jit-write-movz-quad addr k idx)
     (setq k (+ k 16))
@@ -1333,6 +1381,7 @@
             (when (eql (logand addr 15) 0)
               (let ((fn (%word->val (logior addr 3))))
                 (when (boundp (quote *symbol-function-table*))
+                  (%jit-fnaddr-thunk-invalidate nm)
                   (puthash nm *symbol-function-table* fn))
                 (when (boundp (quote *native-sym-function-table*))
                   (puthash (compute-name-hash nm) *native-sym-function-table* fn))
@@ -2838,6 +2887,7 @@
                       ;; nothing was actually stored — every later resolve of PF
                       ;; returned NIL, so the trampoline never ran.)
                       (when (boundp (quote *symbol-function-table*))
+                        (%jit-fnaddr-thunk-invalidate pn)
                         (puthash pn *symbol-function-table* tramp))
                       (when (boundp (quote *native-sym-function-table*))
                         (puthash (compute-name-hash pn)

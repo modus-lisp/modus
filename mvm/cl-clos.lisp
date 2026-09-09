@@ -2892,6 +2892,7 @@
             (wrapper (lambda (&rest args)
                        (%setf-alias-reorder-call gf-name args))))
         (unless *symbol-function-table* (%sft-init))
+        (%jit-fnaddr-thunk-invalidate alias)
         (puthash alias *symbol-function-table* wrapper)
         (when *native-sym-function-table*
           (puthash hash *native-sym-function-table* wrapper))

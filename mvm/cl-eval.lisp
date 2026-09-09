@@ -183,6 +183,7 @@
       (unless *symbol-function-table*
         (%sft-init))
       (when (> (length name) 0)
+        (%jit-fnaddr-thunk-invalidate name)   ; a #'NAME thunk must re-resolve
         (puthash name *symbol-function-table* fn))
       (when *native-sym-function-table*
         (puthash hash *native-sym-function-table* fn))
@@ -242,6 +243,7 @@
                      (when cur (setq cur (cdr cur))))))
         (return-from fmakunbound sym))
       (when (and (> (length name) 0) *symbol-function-table*)
+        (%jit-fnaddr-thunk-invalidate name)
         (remhash name *symbol-function-table*))
       (when *native-sym-function-table*
         (remhash hash *native-sym-function-table*))

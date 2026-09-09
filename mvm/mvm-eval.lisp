@@ -929,6 +929,78 @@
       (let ((addr (%jit-thunk-alloc-aarch64)))
         (if (null addr) nil (%jit-thunk-fill-aarch64 addr name nargs)))))
 
+;;; NARGS-GENERIC LATE-BINDING #'NAME THUNK (aarch64) — the follow-on the frel
+;;; comment below names.  A `#'NAME` used as a VALUE (funcall / apply / every /
+;;; mapcar #'name, or the keyword MAKE-ARRAY expansion's `#'MAKE-ARRAY`) used to
+;;; FAIL the whole page on aarch64 — correct (never bake a stale address) but it
+;;; interpreted every such form.  Measured on reel's VP8 decoder: 118 of 121
+;;; fn-addr failures were `#'MAKE-ARRAY`, taking vp8-idct / vp8-iwht /
+;;; decode-key-frame / decode-macroblocks off the native path (idct ~70 ms a
+;;; call under TCG vs microseconds native).
+;;;
+;;; The existing nargs-SPECIFIC thunk shifts x0..x3 to make room for the name
+;;; index in x0 and bumps nargs — so it needs the arity at build time and cannot
+;;; serve a value that may be called with any arity.  This thunk instead passes
+;;; the index OUT-OF-BAND: it writes idx to a fixed slot through scratch x17 and
+;;; `br`s to %JIT-BRIDGE-ANY with every argument register, the caller's stack
+;;; pushes and the nargs slot UNTOUCHED.  The bridge's own &rest prologue then
+;;; collects exactly the caller's arguments (the #x0530 copy, cap 64) and
+;;; APPLYs the name resolved AT CALL TIME — late-bound on every call, which is
+;;; also the correct behaviour for a name CLOS redefines later (the staleness
+;;; that got the board shipped MODUS_RPI_JIT=0).  Closure-vs-native entry is
+;;; delegated to Lisp FUNCALL, so no hand-written dispatch.
+;;;
+;;; Reentrancy: the slot is written by the thunk immediately before the branch
+;;; and read by the bridge's body before it makes any call; nothing intervenes
+;;; (cooperative, single-threaded).  Slot #x10000178 is the free 8 bytes in the
+;;; convention block (#x150 nargs … #x1D0 all taken; #x1F0 is the write-char
+;;; scratch).  One thunk per NAME, cached, so `#'foo` from many pages shares an
+;;; address.  Layout (14 words, in a 96-byte slot):
+;;;   movz/movk x17 <- idx (raw)         4 words
+;;;   movz/movk x16 <- #x10000178        4 words
+;;;   str  w17, [x16]                    B9000211
+;;;   movz/movk x16 <- bridge-any entry  4 words
+;;;   br   x16                           D61F0200
+(defun %jit-fnaddr-idx-slot () #x10000178)
+(defvar *jit-fnaddr-thunks* nil "Alist NAME-string -> thunk address (one per name).")
+(defun %jit-bridge-any (&rest args)
+  "Late-bound target of a #'NAME value thunk: resolve the name whose index the
+   thunk stored in the fn-addr slot, then apply it to the caller's arguments."
+  (apply (%jit-bridge-resolve (mem-ref #x10000178 :u32)) args))
+(defun %jit-bridge-any-entry ()
+  (- (%val->word (symbol-function (quote %jit-bridge-any))) 3))
+(defun %jit-fnaddr-thunk-fill-aarch64 (addr name)
+  (let ((idx *jit-bridge-count*) (k 0))
+    (setf (aref *jit-bridge-names* idx) name)
+    (setq *jit-bridge-count* (+ idx 1))
+    (%jit-emit-quad-placeholder (+ addr k) 17)
+    (%jit-write-movz-quad addr k idx)
+    (setq k (+ k 16))
+    (%jit-emit-quad-placeholder (+ addr k) 16)
+    (%jit-write-movz-quad addr k (%jit-fnaddr-idx-slot))
+    (setq k (+ k 16))
+    (%jit-emit-word32 (+ addr k) #xB9000211)          ; str w17, [x16]
+    (setq k (+ k 4))
+    (%jit-emit-quad-placeholder (+ addr k) 16)
+    (%jit-write-movz-quad addr k (%jit-bridge-any-entry))
+    (setq k (+ k 16))
+    (%jit-emit-word32 (+ addr k) #xD61F0200)          ; br x16
+    (%jit-icache-flush addr 96)
+    addr))
+(defun %jit-make-fnaddr-thunk-aarch64 (name)
+  "Thunk address (16-aligned, so |3 is a valid tag-3 word) for #'NAME, or NIL."
+  (let ((hit (and (stringp name) (assoc name *jit-fnaddr-thunks* :test (function string=)))))
+    (if hit
+        (cdr hit)
+        (if (or (null name) (null (%jit-bridge-ensure)) (>= *jit-bridge-count* 4096))
+            nil
+            (let ((addr (%jit-thunk-alloc-aarch64)))
+              (if (null addr)
+                  nil
+                  (let ((a (%jit-fnaddr-thunk-fill-aarch64 addr name)))
+                    (setq *jit-fnaddr-thunks* (cons (cons name a) *jit-fnaddr-thunks*))
+                    a)))))))
+
 (defun %jit-reloc-calls (base relocs rt-table)
   "Patch each out-of-module CALL movabs with the resolved native callee address.
    Returns T if every reloc resolved, NIL if any failed (→ caller falls back)."
@@ -1673,16 +1745,27 @@
         ;; Keeping these forms NATIVE via a nargs-generic late-binding thunk
         ;; (%jit-make-bridge-thunk-aarch64 is nargs-specific today) is the follow-on.
         (dolist (r frel)
-          (let ((name (gethash (cdr r) rt-table)))
-            (setq *jit-r-reloc-fnaddr-fail*
-                  (if *jit-r-reloc-fnaddr-fail*
-                      (+ 1 *jit-r-reloc-fnaddr-fail*) 1))
-            (when (and name (boundp (quote *jit-census-on*)) *jit-census-on*
-                       (boundp (quote *jit-blocked-fnaddrs*)))
-              (setq *jit-blocked-fnaddrs*
-                    (%jit-census-note name *jit-blocked-fnaddrs*)))
-            (when (eql why 0) (setq why 2))
-            (setq ok nil)))
+          (let* ((name (gethash (cdr r) rt-table))
+                 ;; NARGS-GENERIC LATE-BINDING THUNK (see %jit-make-fnaddr-thunk-
+                 ;; aarch64): the #'NAME value becomes a stable tag-3 word in the
+                 ;; exec thunk page that re-resolves NAME on every call — never a
+                 ;; baked object, so no staleness, and the form stays NATIVE.
+                 ;; Was: fail the page unconditionally (118/121 of reel's fn-addr
+                 ;; rejects were `#'MAKE-ARRAY` from the keyword expansion).
+                 (th (and name (%jit-bridge-on-p)
+                          (%jit-make-fnaddr-thunk-aarch64 name))))
+            (if th
+                (%jit-write-movz-quad base (car r) (logior th 3))
+                (progn
+                  (setq *jit-r-reloc-fnaddr-fail*
+                        (if *jit-r-reloc-fnaddr-fail*
+                            (+ 1 *jit-r-reloc-fnaddr-fail*) 1))
+                  (when (and name (boundp (quote *jit-census-on*)) *jit-census-on*
+                             (boundp (quote *jit-blocked-fnaddrs*)))
+                    (setq *jit-blocked-fnaddrs*
+                          (%jit-census-note name *jit-blocked-fnaddrs*)))
+                  (when (eql why 0) (setq why 2))
+                  (setq ok nil)))))
         ;; WS5: IN-MODULE fn-addr relocations.  These are the sites that build a
         ;; CLOSURE (make-closure stores the lambda's fn-addr in slot 0) and any
         ;; #'LOCAL-FN value-load.  The whole-image path defers them to
@@ -2190,6 +2273,17 @@
                 (if *jit-r-page-nil* (+ 1 *jit-r-page-nil*) 1))
           (setq *jit-fallback-count*
                 (if *jit-fallback-count* (+ 1 *jit-fallback-count*) 1))
+          ;; DIAGNOSTIC: record WHICH module fell back and WHY, so a library
+          ;; load can be profiled for translator gaps by name (persist-names =
+          ;; the DEFUNs this top-level form defines; *jit-last-condition* = the
+          ;; translate-time signal the guard converted).  Hot-path fallbacks are
+          ;; what keep a native-installed library from running at native speed —
+          ;; found chasing reel's VP8 decoder (~45 of 505 fns fell back and
+          ;; dominated decode time).  Read via (boundp '*jit-fallback-names*).
+          (setq *jit-fallback-names*
+                (cons (list persist-names
+                            (if (boundp (quote *jit-last-condition*)) *jit-last-condition* nil))
+                      (if (boundp (quote *jit-fallback-names*)) *jit-fallback-names* nil)))
           ;; #306: a DEF* module whose page failed — remember it for retry once
           ;; more callees have gone native (see *jit-retry-queue*).
           (when (and persist-names (%jit-native-defuns-p))

@@ -660,6 +660,31 @@
            (%prim-stringp src)
            (not (%prim-stringp src)))))
 
+(defun %u8-bare-p (x)
+  "True for a plain byte-packed (subtag #x11) u8 vector: no fill-pointer /
+   displaced wrapper (a cons) and no %mda-p header."
+  (and x (not (consp x)) (not (%mda-p x)) (eq (obj-subtag x) #x11)))
+
+(defun %bulk-copy-u8-ok-p (dst src)
+  "Both plain u8 vectors: copy bytes with %u8-ref / %u8-set (the word
+   copier's #x11 exclusion, done right instead of falling to the generic
+   element loop — a bordered 320x180 frame copy took 16 ms that way)."
+  (and (%u8-bare-p dst) (%u8-bare-p src)))
+
+(defun %bulk-copy-u8 (dst dstart src sstart n)
+  "Byte copy SRC[sstart…] → DST[dstart…], memmove semantics like %bulk-copy."
+  (if (and (eq dst src) (> dstart sstart))
+      (let ((i (- n 1)))
+        (loop
+          (when (< i 0) (return dst))
+          (%u8-set dst (+ dstart i) (%u8-ref src (+ sstart i)))
+          (setq i (- i 1))))
+      (let ((i 0))
+        (loop
+          (when (>= i n) (return dst))
+          (%u8-set dst (+ dstart i) (%u8-ref src (+ sstart i)))
+          (setq i (+ i 1))))))
+
 (defun %bulk-copy (dst dstart src sstart n)
   "Copy N elements SRC[sstart…] → DST[dstart…] by raw word slots.
    Caller must have checked %bulk-copy-ok-p and the bounds.

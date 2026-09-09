@@ -3818,6 +3818,9 @@
         ;; fresh list of the ENTIRE source window (one cons per element,
         ;; 4096 of them for a 4 KB string) purely to be overlap-safe; that
         ;; allocation, not the copying, is most of its cost.
+        (when (%bulk-copy-u8-ok-p seq1 seq2)
+          (%bulk-copy-u8 seq1 start1 seq2 start2 count)
+          (return-from replace seq1))
         (when (%bulk-copy-ok-p seq1 seq2)
           (%bulk-copy seq1 start1 seq2 start2 count)
           (return-from replace seq1))

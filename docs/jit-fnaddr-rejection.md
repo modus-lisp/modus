@@ -168,10 +168,26 @@ On real silicon (a Raspberry Pi 5, Cortex-A76, the linux-aarch64 CLI run
 natively — no emulation): `515 defuns native, 1 fallback`; the 320×180 clip
 decodes **30 frames in 8.85 s = 3 fps** (keyframe 341 ms, inter frames
 ≈271 ms).  Before this fix the same run had not finished one keyframe after
-several minutes.  What remains between 3 and 60 fps is native code *quality*
-(every local spilled to the frame, generic tag-checked arithmetic on
-`(signed-byte 32)` data, two `make-array`s per `vp8-idct` call), not JIT
-coverage — a codegen campaign, not a correctness one.
+several minutes.
+
+A follow-on (`ac59dd4`, branch `mka-inline`) removed the other cost the
+census exposed: the keyword `make-array` expansion.  It now compiles to a
+direct call, and for element types the runtime stores as a plain word array
+anyway (`(signed-byte 32)` etc. — it returns a bare simple-vector with
+element-type `T`) to the 0.05 µs inline allocation instead of a 14.4 µs
+runtime call.  `vp8-idct` dropped a further 11× (it allocated two such arrays
+per block); on the Pi 5 the clip now decodes **30 frames in 6.9 s = 4 fps**,
+keyframe **139 ms**, inter frames 213 ms.
+
+What remains between 4 and 60 fps is *uniform per-operation* native code
+cost, not any one function: on this build an `aref` costs ~1.8 empty calls
+(a runtime wrapper check plus a u8-vs-word subtag dispatch on every access,
+even where the source declares `(simple-array (signed-byte 32))`), arithmetic
+is tag-checked with overflow promotion, every local is spilled to the frame,
+and `bool-bit` — a full call per decoded bit, ~100k per keyframe — costs ~9
+empty calls.  A frame is ~1–2M such operations.  Honoring declared array and
+fixnum types in the emitters is the first, most contained step; the profile
+and plan are in the session memory (`reference_reel_perf_profile`).
 
 ## Related
 

@@ -1124,7 +1124,12 @@
             ;; defuns override the CDC-ECM ones (last-defun-wins) — on real
             ;; RTL8153 silicon the ECM config NAKs all bulk-IN, so the NIC is
             ;; driven in vendor config 1 with an explicit RX enable.
-            (%rpi-net-text "r8152.lisp")         (string #\Newline))))))
+            (%rpi-net-text "r8152.lisp")         (string #\Newline)
+            ;; hdmi-fb.lisp: modus's DISPLAY PATH — VideoCore HDMI framebuffer +
+            ;; the glass blit seam.  Independent of the NIC (self-contained
+            ;; hdmi-* defuns over mem-ref + the property mailbox at 0x3F00B880);
+            ;; spliced here because board builds are always net builds.
+            (%rpi-net-text "hdmi-fb.lisp")       (string #\Newline))))))
 
 (defvar *net-source*
   (if *net-build-p*

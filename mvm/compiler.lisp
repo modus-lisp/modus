@@ -16803,7 +16803,7 @@
          (dolist (d (cdar b))
            (when (and (consp d) (symbolp (car d)) (string= (symbol-name (car d)) "TYPE")
                       (consp (cdr d)))
-             (let ((ty (cadr d)))
+             (let ((ty (%resolve-declared-type (cadr d))))
                (dolist (v (cddr d))
                  (when (symbolp v) (setq out (cons (cons v ty) out)))))))
          (setq b (cdr b)))
@@ -16832,6 +16832,39 @@
   (and (symbolp form) env
        (let ((b (env-lookup env form)))
          (and b (%generic-simple-array-decl-p (binding-dtype b))))))
+
+(defun %resolve-declared-type (ty)
+  "Expand a declared type NAME through the runtime deftype table so that
+   (declare (type u8vec x)) — reel's spelling, `(deftype u8vec ()
+   '(simple-array (unsigned-byte 8) (*)))` — is seen as the simple-array it
+   names.  %expand-deftype is an image-side function (mvm-eval.lisp); when it
+   is not fbound (host-side image build) or it signals, the raw TY is kept,
+   which just leaves the fast paths inert for that variable."
+  (if (and (symbolp ty) ty (fboundp (quote %expand-deftype)))
+      (handler-case
+          (let ((x (funcall (quote %expand-deftype) ty)))
+            (if (consp x) x ty))
+        (error () ty))
+      ty))
+
+(defun %u8-simple-array-decl-p (ty)
+  "True for a declared (simple-array (unsigned-byte 8) …) — the byte-packed
+   #x11 vector, whose element access is %u8-ref / %u8-set."
+  (and (consp ty) (symbolp (car ty))
+       (string= (symbol-name (car ty)) "SIMPLE-ARRAY")
+       (consp (cdr ty))
+       (let ((et (cadr ty)))
+         (and (consp et) (symbolp (car et)) (consp (cdr et)) (null (cddr et))
+              (string= (symbol-name (car et)) "UNSIGNED-BYTE")
+              (eql (cadr et) 8)))))
+
+(defun %declared-u8-array-var-p (form env)
+  "True when FORM is a variable declared (simple-array (unsigned-byte 8) …):
+   emit the packed-byte primitives directly, skipping the wrapper/string/mda
+   dispatch AND the runtime #x11 subtag test."
+  (and (symbolp form) env
+       (let ((b (env-lookup env form)))
+         (and b (%u8-simple-array-decl-p (binding-dtype b))))))
 
 (defun compile-make-string-array (size-form env dest)
   "Like compile-make-array but with string subtag #x31.
@@ -16995,6 +17028,19 @@
   (when *compile-plain-arrays*
     ;; Image without the CL array runtime: flat word-slot arrays only.
     (return-from compile-aref (compile-word-aref arr-form idx-form env dest)))
+  ;; DECLARED (simple-array (unsigned-byte 8) …) variable: the packed-byte
+  ;; primitive directly — no wrapper/string/mda dispatch and no runtime #x11
+  ;; subtag test.  reel's pixel planes (u8vec) — the 6-tap motion-comp
+  ;; filter's inner loop — are exactly this.
+  (when (%declared-u8-array-var-p arr-form env)
+    (when *decl-fastpath-check*
+      (let ((tmp (alloc-temp-reg)))
+        (compile-form
+         `(unless (and (not (consp ,arr-form)) (eq (obj-subtag ,arr-form) #x11))
+            (error "decl-fastpath u8-aref: ~a is not a packed u8 vector: ~a" (quote ,arr-form) ,arr-form))
+         env tmp)
+        (free-temp-reg)))
+    (return-from compile-aref (compile-u8-ref arr-form idx-form env dest)))
   ;; DECLARED (simple-array <generic> …) variable: raw word-slot access, no
   ;; wrapper/string/mda dispatch.  See %declared-generic-array-var-p.
   (when (%declared-generic-array-var-p arr-form env)
@@ -17064,6 +17110,18 @@
   (when *compile-plain-arrays*
     (return-from compile-aset
       (compile-word-aset arr-form idx-form val-form env dest)))
+  ;; DECLARED (simple-array (unsigned-byte 8) …) variable: the packed-byte
+  ;; store directly (VAL's low byte; returns VAL like aset).
+  (when (%declared-u8-array-var-p arr-form env)
+    (when *decl-fastpath-check*
+      (let ((tmp (alloc-temp-reg)))
+        (compile-form
+         `(unless (and (not (consp ,arr-form)) (eq (obj-subtag ,arr-form) #x11))
+            (error "decl-fastpath u8-aset: ~a is not a packed u8 vector: ~a" (quote ,arr-form) ,arr-form))
+         env tmp)
+        (free-temp-reg)))
+    (return-from compile-aset
+      (compile-u8-set arr-form idx-form val-form env dest)))
   ;; DECLARED (simple-array <generic> …) variable: raw word-slot store, no
   ;; wrapper/string/mda dispatch and no char->code coercion (never a string).
   (when (%declared-generic-array-var-p arr-form env)

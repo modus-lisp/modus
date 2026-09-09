@@ -1,0 +1,94 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Modus in the browser</title>
+<style>
+  html, body { height: 100%; margin: 0; background: #111; color: #ddd; font: 14px/1.35 ui-monospace, Menlo, Consolas, monospace; }
+  #term { box-sizing: border-box; height: calc(100% - 2.2em); padding: 8px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+  #bar { height: 2.2em; display: flex; align-items: center; gap: 8px; padding: 0 8px; background: #222; border-top: 1px solid #333; }
+  #in { flex: 1; background: #000; color: #eee; border: 1px solid #444; padding: 3px 6px; font: inherit; }
+  #status { color: #8a8; min-width: 14em; }
+  .log { color: #789; }
+  .err { color: #e77; }
+</style>
+</head>
+<body>
+<div id="term"></div>
+<div id="bar">
+  <span id="status">loading…</span>
+  <input id="in" placeholder="type a form and press Enter" autocomplete="off" spellcheck="false" disabled>
+</div>
+<script>
+(async () => {
+  const term = document.getElementById('term');
+  const input = document.getElementById('in');
+  const status = document.getElementById('status');
+  const dec = new TextDecoder();
+  const say = (text, cls) => {
+    const s = document.createElement('span');
+    if (cls) s.className = cls;
+    s.textContent = text;
+    term.appendChild(s);
+    term.scrollTop = term.scrollHeight;
+  };
+  if (!crossOriginIsolated) {
+    say('This page must be served cross-origin isolated (COOP/COEP headers) so the worker can block on stdin. Use web/serve.js.\n', 'err');
+    status.textContent = 'not isolated';
+    return;
+  }
+  const fetchBytes = async (url, label) => {
+    status.textContent = 'fetching ' + label + '…';
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    let stream = r.body;
+    if (url.endsWith('.gz')) stream = stream.pipeThrough(new DecompressionStream('gzip'));
+    return await new Response(stream).arrayBuffer();
+  };
+  const mvmw = await fetchBytes('modus.mvmw', 'bytecode');
+  if (!mvmw) { say('modus.mvmw not found: run sbcl --script mvm/build-web.lisp\n', 'err'); return; }
+  const core = await fetchBytes('modus.core.gz', 'core');
+  if (!core) say('(no core snapshot: cold boot takes a long time)\n', 'log');
+
+  // stdin ring buffer shared with the worker
+  const RING = 65536, HDR = 16;
+  const sab = new SharedArrayBuffer(HDR + RING);
+  const ctl = new Int32Array(sab, 0, 4);
+  const ring = new Uint8Array(sab, HDR);
+  const enc = new TextEncoder();
+  const feed = (text) => {
+    const bytes = enc.encode(text);
+    let tail = Atomics.load(ctl, 1);
+    for (const b of bytes) {
+      const next = (tail + 1) % RING;
+      while (next === Atomics.load(ctl, 0)) { /* full: spin briefly */ }
+      ring[tail] = b; tail = next;
+    }
+    Atomics.store(ctl, 1, tail);
+    Atomics.notify(ctl, 1);
+  };
+
+  const worker = new Worker('worker.js');
+  worker.onmessage = (ev) => {
+    const m = ev.data;
+    if (m.type === 'stdout') say(dec.decode(m.bytes));
+    else if (m.type === 'log') say(m.text + '\n', 'log');
+    else if (m.type === 'waiting') { status.textContent = 'ready'; input.disabled = false; input.focus(); }
+    else if (m.type === 'exit') { say(`\n[modus exited with code ${m.code}]\n`, 'log'); status.textContent = 'exited'; input.disabled = true; }
+    else if (m.type === 'fault') { say('\n' + m.text + '\n', 'err'); status.textContent = 'faulted'; input.disabled = true; }
+  };
+  input.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Enter') return;
+    const line = input.value + '\n';
+    input.value = '';
+    say(line);
+    status.textContent = 'running…';
+    feed(line);
+  });
+  status.textContent = 'starting…';
+  worker.postMessage({ type: 'start', mvmw, core, stdin: sab, argv: ['modus'], env: ['HOME=/home/web'],
+                       semispace: 128 << 20, files: [] }, [mvmw].concat(core ? [core] : []));
+})();
+</script>
+</body>
+</html>

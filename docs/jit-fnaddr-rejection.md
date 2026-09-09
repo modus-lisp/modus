@@ -179,15 +179,26 @@ runtime call.  `vp8-idct` dropped a further 11× (it allocated two such arrays
 per block); on the Pi 5 the clip now decodes **30 frames in 6.9 s = 4 fps**,
 keyframe **139 ms**, inter frames 213 ms.
 
-What remains between 4 and 60 fps is *uniform per-operation* native code
-cost, not any one function: on this build an `aref` costs ~1.8 empty calls
-(a runtime wrapper check plus a u8-vs-word subtag dispatch on every access,
-even where the source declares `(simple-array (signed-byte 32))`), arithmetic
-is tag-checked with overflow promotion, every local is spilled to the frame,
-and `bool-bit` — a full call per decoded bit, ~100k per keyframe — costs ~9
-empty calls.  A frame is ~1–2M such operations.  Honoring declared array and
-fixnum types in the emitters is the first, most contained step; the profile
-and plan are in the session memory (`reference_reel_perf_profile`).
+What remained was *uniform per-operation* native code cost, not any one
+function.  The first tier of that is now done (`0144cb3`, `cfeed1b`,
+`2dd2ff4`, branch `decl-fastpath`): the compiler had no type-declaration
+tracking at all, so every `aref` ran a four-way wrapper/string/mda dispatch
+even where the source declared `(simple-array (signed-byte 32))`.  Bindings
+now carry the declared type (deftype names like reel's `u8vec`/`fxvec`
+resolved through the runtime deftype table), and a declared generic array
+takes the raw word-slot access while a declared `(unsigned-byte 8)` array
+takes the packed-byte primitives directly.  That exposed a runtime bug of
+its own — `make-array` wrapped every typed generic array in an MDA header
+(`type-of` hides it; test with `%mda-p`), which put all of reel's tables on
+the slow branch — fixed alongside.  Declared array access is 2.5–7× faster;
+on the Pi 5 the clip now decodes **30 frames in 6.3 s = 5 fps**, keyframe
+**114 ms** (from 341 before any of this), inter frames 196 ms.
+
+What remains between 5 and 60 fps: `bool-bit` is a full call per decoded
+bit (~9 empty calls, ~100k per keyframe) — inline it; arithmetic on declared
+fixnums is still tag-checked with overflow promotion — the binding type slot
+now makes a raw-op path a contained change; and every local is spilled to
+the frame.  Profile and plan: session memory `reference_reel_perf_profile`.
 
 ## Related
 

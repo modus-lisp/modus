@@ -1051,7 +1051,8 @@
   location           ; :reg / :stack / :symbol-macro
   reg                ; virtual register number if :reg
   stack-slot         ; stack slot index if :stack
-  expansion)         ; replacement form when :symbol-macro
+  expansion          ; replacement form when :symbol-macro
+  dtype)             ; declared type form from (declare (type T var)), or NIL
 
 (defstruct compiled-module
   (bytecode (make-array 0 :element-type '(unsigned-byte 8)))
@@ -8782,6 +8783,8 @@
     ;; Fix stack-depth in the final env
     (setf (compile-env-stack-depth new-env)
           (+ (compile-env-stack-depth env) n-bindings))
+    ;; (declare (type …)) forms at the head of BODY scope over these bindings.
+    (%apply-declared-types new-env body)
     ;; Compile body in new environment
     (compile-progn body new-env dest)
     ;; Deallocate frame space
@@ -8859,6 +8862,8 @@
     ;; Final env has correct stack depth
     (setf (compile-env-stack-depth new-env)
           (+ (compile-env-stack-depth env) n-bindings))
+    ;; (declare (type …)) forms at the head of BODY scope over these bindings.
+    (%apply-declared-types new-env body)
     ;; Compile body
     (compile-progn body new-env dest)
     ;; Deallocate
@@ -16737,23 +16742,89 @@
       ;; Plain dim, no kwargs — emit the fast inline path.
       (t (compile-make-array-1d dim-form env dest)))))
 
-(defun %inline-generic-element-type-p (form)
-  "True for a QUOTED element-type that Modus stores as a generic tagged-word
+(defun %generic-element-type-p (ty)
+  "True for an element-type TY that Modus stores as a generic tagged-word
    array: (signed-byte 32|64), (unsigned-byte 16|32|64), fixnum, integer, t.
-   Deliberately excludes every u8 spelling and every character type."
-  ;; Compare by NAME (like name-eq elsewhere in this file): a source symbol
-  ;; read at runtime into a library's package need not be EQ to this file's
-  ;; baked literal, and an EQ miss here would only make the shortcut inert.
+   Deliberately excludes every u8 spelling (packed #x11 vector) and every
+   character type (string).  Compared by NAME (like name-eq elsewhere in
+   this file): a source symbol read at runtime into a library's package need
+   not be EQ to this file's baked literal, and an EQ miss would only make a
+   fast path inert."
+  (or (and (symbolp ty)
+           (member (symbol-name ty) '("T" "FIXNUM" "INTEGER") :test #'string=))
+      (and (consp ty) (symbolp (car ty)) (consp (cdr ty)) (null (cddr ty))
+           (integerp (cadr ty))
+           (let ((n (symbol-name (car ty))) (w (cadr ty)))
+             (or (and (string= n "SIGNED-BYTE")   (member w '(32 64)))
+                 (and (string= n "UNSIGNED-BYTE") (member w '(16 32 64))))))))
+
+(defun %inline-generic-element-type-p (form)
+  "True for a QUOTED generic element-type form, (quote TY) — see
+   %generic-element-type-p."
   (and (consp form) (symbolp (car form)) (string= (symbol-name (car form)) "QUOTE")
        (consp (cdr form)) (null (cddr form))
-       (let ((ty (cadr form)))
-         (or (and (symbolp ty)
-                  (member (symbol-name ty) '("T" "FIXNUM" "INTEGER") :test #'string=))
-             (and (consp ty) (symbolp (car ty)) (consp (cdr ty)) (null (cddr ty))
-                  (integerp (cadr ty))
-                  (let ((n (symbol-name (car ty))) (w (cadr ty)))
-                    (or (and (string= n "SIGNED-BYTE")   (member w '(32 64)))
-                        (and (string= n "UNSIGNED-BYTE") (member w '(16 32 64))))))))))
+       (%generic-element-type-p (cadr form))))
+
+;;; DECLARED-TYPE FAST PATH for array access.  compile-aref / compile-aset
+;;; expand EVERY (aref a i) into a four-way runtime dispatch (%mda-p →
+;;; consp wrapper → %prim-stringp → %prim-aref) so that wrappers, strings and
+;;; multi-dim arrays are handled transparently.  On a variable the source has
+;;; DECLARED `(simple-array ET …)` with ET a generic element type (the array
+;;; is then a bare tagged-word vector — see %generic-element-type-p and the
+;;; runtime make-array, which records nothing for these), that dispatch is
+;;; pure overhead: measured at ~half of an aref's cost, on ~1–2M accesses per
+;;; 320×180 VP8 frame.  So: capture (declare (type T v…)) into the binding
+;;; (binding-dtype) at the three body-processing points (lambda params, LET,
+;;; LET*), and let the accessors emit the raw word-slot path
+;;; (compile-word-aref/aset) for such variables.  Opt-in by declaration —
+;;; undeclared code compiles exactly as before.  As in every CL, a
+;;; declaration that lies is undefined behaviour here (the raw path does not
+;;; re-check); u8 and character declarations are NOT accepted (they need the
+;;; packed / string representations).
+(defun %generic-simple-array-decl-p (ty)
+  "True for a declared type (simple-array ET …) whose ET is generic."
+  (and (consp ty) (symbolp (car ty))
+       (string= (symbol-name (car ty)) "SIMPLE-ARRAY")
+       (consp (cdr ty))
+       (%generic-element-type-p (cadr ty))))
+
+(defun %declared-types (body)
+  "Alist (VAR . TYPE-FORM) from the leading (declare (type TYPE v1 v2 …) …)
+   forms of BODY — the same forms strip-declares removes, including those
+   after a leading docstring.  Only the explicit TYPE spelling is read."
+  (let ((out nil) (b body) (seen-doc nil))
+    (loop
+      (cond
+        ((not (consp b)) (return out))
+        ((and (stringp (car b)) (cdr b) (not seen-doc))
+         (setq seen-doc t) (setq b (cdr b)))
+        ((and (consp (car b)) (symbolp (caar b))
+              (string= (symbol-name (caar b)) "DECLARE"))
+         (dolist (d (cdar b))
+           (when (and (consp d) (symbolp (car d)) (string= (symbol-name (car d)) "TYPE")
+                      (consp (cdr d)))
+             (let ((ty (cadr d)))
+               (dolist (v (cddr d))
+                 (when (symbolp v) (setq out (cons (cons v ty) out)))))))
+         (setq b (cdr b)))
+        (t (return out))))))
+
+(defun %apply-declared-types (env body)
+  "Stamp binding-dtype on the CURRENT frame's bindings named by BODY's
+   leading type declarations (a declaration scopes over the form that binds
+   the variable, so only this frame, never a parent's)."
+  (when env
+    (dolist (pair (%declared-types body))
+      (let ((b (find (car pair) (compile-env-bindings env)
+                     :key #'binding-name :test #'equal)))
+        (when b (setf (binding-dtype b) (cdr pair)))))))
+
+(defun %declared-generic-array-var-p (form env)
+  "True when FORM is a variable whose binding carries a generic
+   (simple-array ET …) declaration — the raw word-slot path is valid."
+  (and (symbolp form) env
+       (let ((b (env-lookup env form)))
+         (and b (%generic-simple-array-decl-p (binding-dtype b))))))
 
 (defun compile-make-string-array (size-form env dest)
   "Like compile-make-array but with string subtag #x31.
@@ -16917,6 +16988,10 @@
   (when *compile-plain-arrays*
     ;; Image without the CL array runtime: flat word-slot arrays only.
     (return-from compile-aref (compile-word-aref arr-form idx-form env dest)))
+  ;; DECLARED (simple-array <generic> …) variable: raw word-slot access, no
+  ;; wrapper/string/mda dispatch.  See %declared-generic-array-var-p.
+  (when (%declared-generic-array-var-p arr-form env)
+    (return-from compile-aref (compile-word-aref arr-form idx-form env dest)))
   (let ((g-arr (%mvm-gensym "AREFA"))
         (g-idx (%mvm-gensym "AREFI"))
         (g-raw (%mvm-gensym "AREFR")))
@@ -16973,6 +17048,11 @@
    Routes wrapper inputs through %wrapper-aset.  Multi-subscript
    forms go via compile-aset-form below."
   (when *compile-plain-arrays*
+    (return-from compile-aset
+      (compile-word-aset arr-form idx-form val-form env dest)))
+  ;; DECLARED (simple-array <generic> …) variable: raw word-slot store, no
+  ;; wrapper/string/mda dispatch and no char->code coercion (never a string).
+  (when (%declared-generic-array-var-p arr-form env)
     (return-from compile-aset
       (compile-word-aset arr-form idx-form val-form env dest)))
   (let ((g-arr (%mvm-gensym "ASETA"))
@@ -18192,6 +18272,10 @@
                                     :stack-slot i)
                      (compile-env-bindings env))
                (setf (compile-env-stack-depth env) (1+ i)))
+
+      ;; (declare (type …)) forms at the head of the body scope over the
+      ;; parameters bound above (declared-type fast paths read binding-dtype).
+      (%apply-declared-types env body)
 
       ;; For functions with &rest: also spill V_i to slot_i for any
       ;; arg register beyond the declared param count.  The dynamic

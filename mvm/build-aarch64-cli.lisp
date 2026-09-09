@@ -1212,6 +1212,28 @@
           (setq *static-build-p* t)
           (setq *mvm-emit-halves* nil)
           (setq *mvm-eval-runtime-p* nil)
+          ;; #210 DDC Gap A fix (cross-HOST aarch64 reproducibility).
+          ;; ROOT CAUSE: the aarch64 checked-arith slow path (add/sub/mul
+          ;; overflow) has a RUNTIME-JIT arm that resolves GENERIC-ADD/SUBTRACT/
+          ;; MULTIPLY to the PARENT image's address via %mvm-resolve-runtime-fn
+          ;; and bakes it as an absolute MOVZ/MOVK/BLR.  That arm is gated on
+          ;; *aarch64-jit-mode*, which mvm-eval.lisp:1492 (%jit-translate-page-1-
+          ;; aarch64) SETQs T globally and never restores.  During the child's
+          ;; build-image, constant-folding of the width-constants via mvm-eval
+          ;; JITs a hot form → flips *aarch64-jit-mode* T → the whole-program
+          ;; aarch64 translate then bakes the PARENT's GENERIC-* VAs.  Those VAs
+          ;; differ per host (the seed IMAGE layout differs SBCL/CCL/ABCL), so
+          ;; the emitted child diverges across hosts (4 words).  The x64 target
+          ;; has no such parent-resolving arith arm, so it stays reproducible.
+          ;; FIX: turn the JIT seam off for the duration of the emit (%jit-
+          ;; enabled-p reads *use-jit*), so folding INTERPRETS (never flips
+          ;; jit-mode) and the whole-program translate sees jit-mode NIL → it
+          ;; emits a plain wrapping add/sub/mul (the overflow slow path is never
+          ;; taken for in-fixnum PROG, and a standalone child has no in-module
+          ;; GENERIC-* to call anyway — exactly what the x64 path does).  The
+          ;; second setq is belt-and-suspenders against any later flip.
+          (setq *use-jit* nil)
+          (setq *aarch64-jit-mode* nil)
           (%ce-emit-image (build-image :target :linux-aarch64 :source-text src)
                           out \" (linux-aarch64)\")))))
 ")

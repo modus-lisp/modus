@@ -8724,7 +8724,8 @@
               (compile-form `(let ,combined-bindings ,@new-body) env dest)
               (compile-form `(progn ,@new-body) env dest))))))
   (check-frame-overflow (length bindings) "let" env)
-  (let ((body (strip-declares body))
+  (let ((decl-body body)               ; unstripped: the (declare (type …)) scan below needs it
+        (body (strip-declares body))
         (n-bindings (length bindings))
         (new-env env)
         (save-temps nil))
@@ -8784,7 +8785,10 @@
     (setf (compile-env-stack-depth new-env)
           (+ (compile-env-stack-depth env) n-bindings))
     ;; (declare (type …)) forms at the head of BODY scope over these bindings.
-    (%apply-declared-types new-env body)
+    (%apply-declared-types new-env decl-body)
+    ;; Undeclared bindings: infer a width from the init form (LET inits see
+    ;; the OUTER env) when the variable is never assigned in the body.
+    (%infer-let-widths new-env bindings decl-body env)
     ;; Compile body in new environment
     (compile-progn body new-env dest)
     ;; Deallocate frame space
@@ -8825,7 +8829,8 @@
         (return-from compile-let*
           (compile-form `(let* ,new-bindings ,@new-body) env dest)))))
   (check-frame-overflow (length bindings) "let*" env)
-  (let ((body (strip-declares body))
+  (let ((decl-body body)               ; unstripped: the (declare (type …)) scan below needs it
+        (body (strip-declares body))
         (n-bindings (length bindings))
         (new-env env))
     (when (> n-bindings 0)
@@ -8863,7 +8868,11 @@
     (setf (compile-env-stack-depth new-env)
           (+ (compile-env-stack-depth env) n-bindings))
     ;; (declare (type …)) forms at the head of BODY scope over these bindings.
-    (%apply-declared-types new-env body)
+    (%apply-declared-types new-env decl-body)
+    ;; Undeclared bindings: infer a width from the init form (LET* inits see
+    ;; the earlier bindings, so look up in the new env) when the variable
+    ;; is never assigned in the body.
+    (%infer-let-widths new-env bindings decl-body new-env)
     ;; Compile body
     (compile-progn body new-env dest)
     ;; Deallocate
@@ -12615,14 +12624,22 @@
          (result-form (caddr spec)))
     (compile-form
      (list 'block nil
-           (list 'let
+           (list* 'let
                  (list (list var 0))
+                 ;; A literal count bounds VAR at compile time: declare it so
+                 ;; the counter's own (1+ var) and any index arithmetic on it
+                 ;; take the typed fast path (the width estimator reads the
+                 ;; (integer 0 N) declaration; see %decl-int-width).
+                 (append
+                  (when (and (integerp count-form) (>= count-form 0))
+                    (list (list 'declare (list 'type (list 'integer 0 count-form) var))))
+                  (list
                  (list 'loop
                        (list 'if (list '< var count-form)
                              (list 'progn
                                    (cons 'tagbody body)
                                    (list 'setq var (list '1+ var)))
-                             (list 'return (or result-form nil))))))
+                             (list 'return (or result-form nil))))))))
      env dest)))
 
 ;;; ============================================================
@@ -13977,6 +13994,15 @@
   ;; bignum-incomplete code paths (logand/format on bignums).
   ;; :mul promotion was also attempted but breaks interp-closures
   ;; in a way I couldn't isolate; left disabled until investigated.
+  ;; TYPED FAST PATH (see *arith-trust*): both operands provably fixnums and
+  ;; the result provably ≤ 61 bits → the plain op, nothing else.
+  (when (and *arith-trust* (cadr *arith-trust*))
+    (emit-ir (cond ((eq fast-op :add-checked) :add)
+                   ((eq fast-op :sub-checked) :sub)
+                   ((eq fast-op :mul-checked) :mul)
+                   (t fast-op))
+             dest dest temp)
+    (return-from emit-arith-pair))
   (let* ((checked-op nil)
          (tag-temp   (alloc-temp-reg))
          (one-temp   (alloc-temp-reg))
@@ -13990,10 +14016,13 @@
          (caller-live (max 0 (- *temp-reg-counter* 2)))
          ;; cap 12 (V5..V15): match compile-call for mvm-eval flat-regfile safety.
          (save-count  (min caller-live 12)))
-    (emit-ir :or   tag-temp dest temp)
-    (emit-ir :li   one-temp 1)
-    (emit-ir :test tag-temp one-temp)
-    (emit-ir :bne  slow-label)
+    ;; TAG-SAFE pair (both operands provably fixnums, result may still
+    ;; overflow): skip the tag test, keep the checked op + slow path.
+    (unless (and *arith-trust* (car *arith-trust*))
+      (emit-ir :or   tag-temp dest temp)
+      (emit-ir :li   one-temp 1)
+      (emit-ir :test tag-temp one-temp)
+      (emit-ir :bne  slow-label))
     ;; Fast path.
     (cond
       (checked-op
@@ -14041,7 +14070,7 @@
     (free-temp-reg)
     (free-temp-reg)))
 
-(defun %compile-arith-arg-step-e2 (arg env dest fast-op generic-name)
+(defun %compile-arith-arg-step-e2 (arg env dest fast-op generic-name &optional trust)
   "mvm-eval (WS3 flip) pairwise-arith step that does NOT hold a temp register
    across the recursive operand compile.  The build-time scheme allocates
    the temp BEFORE compiling ARG, so a right-nested chain
@@ -14054,13 +14083,26 @@
    unconditionally under mvm-eval (*mvm-eval-runtime-p*), and at build time
    as the overflow fallback when the temp budget is nearly exhausted
    (see %temps-must-spill-p)."
-  (emit-ir :push dest)
-  (compile-form arg env dest)
-  (let ((temp (alloc-temp-reg)))
-    (emit-ir :mov temp dest)
-    (emit-ir :pop dest)
-    (emit-arith-pair fast-op generic-name dest temp)
-    (free-temp-reg)))
+  (if (%leaf-operand-p arg env)
+      ;; Leaf right operand (variable / literal): a pure load into the temp
+      ;; cannot disturb DEST, so no push/mov/pop round trip is needed.
+      (let ((temp (alloc-temp-reg)))
+        (compile-form arg env temp)
+        (let ((*arith-trust* trust))
+          (declare (special *arith-trust*))
+          (emit-arith-pair fast-op generic-name dest temp))
+        (free-temp-reg))
+      (progn
+        (emit-ir :push dest)
+        (compile-form arg env dest)
+        (let ((temp (alloc-temp-reg)))
+          (emit-ir :mov temp dest)
+          (emit-ir :pop dest)
+          ;; TRUST (typed-arithmetic fast path) scopes the emitter call only.
+          (let ((*arith-trust* trust))
+            (declare (special *arith-trust*))
+            (emit-arith-pair fast-op generic-name dest temp))
+          (free-temp-reg)))))
 
 (defun %temps-must-spill-p (&optional (held 1))
   "Overflow gate for every construct that HOLDS temp registers across a
@@ -14094,6 +14136,7 @@
 
 (defun compile-add (args env dest)
   "Compile (+ args...).  Fixnum fast path; ratio/mixed via GENERIC-ADD."
+  (setq args (%swap-commutative-args args env))
   (let ((anf (and args (cdr args) (anf-normalize-arith-args '+ args env))))
     (cond
       ((null args) (compile-integer 0 dest))
@@ -14103,18 +14146,28 @@
       (anf (compile-form anf env dest))
       (t
        (compile-form (car args) env dest)
-       (dolist (arg (cdr args))
-         (check-arith-nesting '+ arg)   ; backstop — ANF above handles the hit
-         (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
-             (let ((*arith-push-depth* (1+ *arith-push-depth*)))
-               (%compile-arith-arg-step-e2 arg env dest :add-checked "GENERIC-ADD"))
-             (let ((temp (alloc-temp-reg))
-                   (*arith-push-depth* (1+ *arith-push-depth*)))
-               (emit-ir :push dest)
-               (compile-form arg env temp)
-               (emit-ir :pop dest)
-               (emit-arith-pair :add-checked "GENERIC-ADD" dest temp)
-               (free-temp-reg))))))))
+       ;; Typed-arithmetic fast path: track the running LHS width and bind
+       ;; *arith-trust* per pair (see %expr-width / emit-arith-pair).
+       (let ((lw (%expr-width (car args) env)))
+         (dolist (arg (cdr args))
+           (check-arith-nesting '+ arg)   ; backstop — ANF above handles the hit
+           ;; Trust is bound ONLY around the emitter call (never around the
+           ;; operand's own compilation, whose nested arithmetic must judge
+           ;; its own operands).
+           (let ((trust (%arith-trust-for lw (%expr-width arg env) :add)))
+             (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
+                 (let ((*arith-push-depth* (1+ *arith-push-depth*)))
+                   (%compile-arith-arg-step-e2 arg env dest :add-checked "GENERIC-ADD" trust))
+                 (let ((temp (alloc-temp-reg))
+                       (*arith-push-depth* (1+ *arith-push-depth*)))
+                   (emit-ir :push dest)
+                   (compile-form arg env temp)
+                   (emit-ir :pop dest)
+                   (let ((*arith-trust* trust))
+                     (declare (special *arith-trust*))
+                     (emit-arith-pair :add-checked "GENERIC-ADD" dest temp))
+                   (free-temp-reg)))
+             (setq lw (and trust (caddr trust))))))))))
 
 (defun compile-sub (args env dest)
   "Compile (- args...).  Unary `(- x)` lowers to `(- 0 x)` so bignum/ratio/
@@ -14139,18 +14192,24 @@
            (compile-form anf env dest)
            (progn
              (compile-form (car args) env dest)
-             (dolist (arg (cdr args))
-               (check-arith-nesting '- arg)   ; backstop — ANF above handles the hit
-               (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
-                   (let ((*arith-push-depth* (1+ *arith-push-depth*)))
-                     (%compile-arith-arg-step-e2 arg env dest :sub-checked "GENERIC-SUBTRACT"))
-                   (let ((temp (alloc-temp-reg))
-                         (*arith-push-depth* (1+ *arith-push-depth*)))
-                     (emit-ir :push dest)
-                     (compile-form arg env temp)
-                     (emit-ir :pop dest)
-                     (emit-arith-pair :sub-checked "GENERIC-SUBTRACT" dest temp)
-                     (free-temp-reg))))))))))
+             ;; Typed-arithmetic fast path (see compile-plus).
+             (let ((lw (%expr-width (car args) env)))
+               (dolist (arg (cdr args))
+                 (check-arith-nesting '- arg)   ; backstop — ANF above handles the hit
+                 (let ((trust (%arith-trust-for lw (%expr-width arg env) :sub)))
+                   (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
+                       (let ((*arith-push-depth* (1+ *arith-push-depth*)))
+                         (%compile-arith-arg-step-e2 arg env dest :sub-checked "GENERIC-SUBTRACT" trust))
+                       (let ((temp (alloc-temp-reg))
+                             (*arith-push-depth* (1+ *arith-push-depth*)))
+                         (emit-ir :push dest)
+                         (compile-form arg env temp)
+                         (emit-ir :pop dest)
+                         (let ((*arith-trust* trust))
+                           (declare (special *arith-trust*))
+                           (emit-arith-pair :sub-checked "GENERIC-SUBTRACT" dest temp))
+                         (free-temp-reg)))
+                   (setq lw (and trust (caddr trust))))))))))))
 
 (defun compile-mul (args env dest)
   "Compile (* args...).  Uses emit-arith-pair so non-fixnum operands
@@ -14165,6 +14224,7 @@
    in a way I haven't yet isolated; leaving the fast :mul in place
    for now and noting the gap.  generic-multiply itself does promote
    via bignum-mul so the slow path is correct."
+  (setq args (%swap-commutative-args args env))
   (cond
     ((null args) (compile-integer 1 dest))
     ((null (cdr args)) (compile-form (car args) env dest))
@@ -14174,18 +14234,26 @@
            (compile-form anf env dest)
            (progn
              (compile-form (car args) env dest)
-             (dolist (arg (cdr args))
-               (check-arith-nesting '* arg)   ; backstop — ANF above handles the hit
-               (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
-                   (let ((*arith-push-depth* (1+ *arith-push-depth*)))
-                     (%compile-arith-arg-step-e2 arg env dest :mul-checked "GENERIC-MULTIPLY"))
-                   (let ((temp (alloc-temp-reg))
-                         (*arith-push-depth* (1+ *arith-push-depth*)))
-                     (emit-ir :push dest)
-                     (compile-form arg env temp)
-                     (emit-ir :pop dest)
-                     (emit-arith-pair :mul-checked "GENERIC-MULTIPLY" dest temp)
-                     (free-temp-reg))))))))))
+             ;; Typed-arithmetic fast path (see compile-plus).  Product width
+             ;; is the SUM of operand widths, so only small operands reach
+             ;; the unchecked :mul (e.g. an s32 times a 16-bit constant).
+             (let ((lw (%expr-width (car args) env)))
+               (dolist (arg (cdr args))
+                 (check-arith-nesting '* arg)   ; backstop — ANF above handles the hit
+                 (let ((trust (%arith-trust-for lw (%expr-width arg env) :mul)))
+                   (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
+                       (let ((*arith-push-depth* (1+ *arith-push-depth*)))
+                         (%compile-arith-arg-step-e2 arg env dest :mul-checked "GENERIC-MULTIPLY" trust))
+                       (let ((temp (alloc-temp-reg))
+                             (*arith-push-depth* (1+ *arith-push-depth*)))
+                         (emit-ir :push dest)
+                         (compile-form arg env temp)
+                         (emit-ir :pop dest)
+                         (let ((*arith-trust* trust))
+                           (declare (special *arith-trust*))
+                           (emit-arith-pair :mul-checked "GENERIC-MULTIPLY" dest temp))
+                         (free-temp-reg)))
+                   (setq lw (and trust (caddr trust))))))))))))
 
 (defun compile-mul26lo (args env dest)
   "Compile (mul26lo a b) — low 26 bits of untag(a)*untag(b), tagged.
@@ -14583,19 +14651,29 @@
           (setf a-temp (alloc-temp-reg))
           (setf tag-temp (alloc-temp-reg))
           (compile-form a env dest)
-          (emit-ir :push dest)
-          (compile-form b env a-temp)
-          (emit-ir :pop dest)))
+          (if (%leaf-operand-p b env)
+              ;; Leaf right operand: a pure load into A-TEMP, no push/pop.
+              (compile-form b env a-temp)
+              (progn
+                (emit-ir :push dest)
+                (compile-form b env a-temp)
+                (emit-ir :pop dest)))))
     ;; Tag check: (dest | a-temp) & 1 == 0  ⇒ both fixnums (low bit 0).
     ;; :bnnull tests against NIL (≠NIL→branch), so we use :cmp + :bne.
-    (emit-ir :or  tag-temp dest a-temp)
-    (let ((one-temp (alloc-temp-reg)))
-      (emit-ir :li  one-temp 1)
-      (emit-ir :and tag-temp tag-temp one-temp)
-      (emit-ir :li  one-temp 0)
-      (emit-ir :cmp tag-temp one-temp)
-      (free-temp-reg))
-    (emit-ir :bne slow-label)
+    ;; Typed fast path: when both operands are provably fixnum-typed
+    ;; expressions (declared variables, typed aref, literals — see
+    ;; %expr-width) the tag test is skipped; the slow path stays emitted
+    ;; but unreachable.  The dotimes (< var count) test is one of these
+    ;; per iteration of every loop.
+    (unless (and (%expr-width a env) (%expr-width b env))
+      (emit-ir :or  tag-temp dest a-temp)
+      (let ((one-temp (alloc-temp-reg)))
+        (emit-ir :li  one-temp 1)
+        (emit-ir :and tag-temp tag-temp one-temp)
+        (emit-ir :li  one-temp 0)
+        (emit-ir :cmp tag-temp one-temp)
+        (free-temp-reg))
+      (emit-ir :bne slow-label))
     ;; Fast path: tagged-fixnum compare.
     (emit-ir :cmp dest a-temp)
     (emit-ir branch-op true-label)
@@ -16857,6 +16935,157 @@
          (and (consp et) (symbolp (car et)) (consp (cdr et)) (null (cddr et))
               (string= (symbol-name (car et)) "UNSIGNED-BYTE")
               (eql (cadr et) 8)))))
+
+;;; TYPED-ARITHMETIC FAST PATH.  emit-arith-pair compiles every + - * as a
+;;; tag test on BOTH operands (or/li/test/bne, ~4 instrs) followed by the
+;;; overflow-CHECKED op bracketed by push/pop with a bvs slow path (~5 more)
+;;; — ~9 instructions plus a memory round trip where two (signed-byte 32)
+;;; operands need ONE add.  With declarations now tracked in the binding
+;;; (binding-dtype) the operand FORMS can be typed at compile time: a bit
+;;; WIDTH is estimated per expression — literal → its magnitude's width,
+;;; declared (signed-byte n)/(unsigned-byte n)/fixnum variable → n / 62,
+;;; (aref v i) of a declared s32 / u8 array → 32 / 8, (+ a b) (- a b) →
+;;; max+1, (* a b) → sum, (ash x -k) → minus k, (logand x c) → min with c —
+;;; NIL when any leaf is untyped.  A pair whose two widths are both known is
+;;; TAG-SAFE (skip the tag test); if the combined width stays ≤ 61 bits it is
+;;; also OVERFLOW-SAFE (use the plain :add/:sub/:mul — no push/pop/bvs).
+;;; Threaded to the emitter through *arith-trust* bound around each pair
+;;; step by compile-plus / compile-sub / compile-mul.  Untyped code compiles
+;;; exactly as before.  As with the array fast paths, a declaration that
+;;; lies is undefined behaviour (the width of a declared s32 is trusted).
+(defvar *arith-trust* nil
+  "NIL, or (TAG-SAFE-P OVERFLOW-SAFE-P RESULT-WIDTH) for the pair being emitted.")
+
+(defun %decl-int-width (ty)
+  "Bit width (incl. sign) a declared integer type TY guarantees, or NIL."
+  (cond ((null ty) nil)
+        ((symbolp ty)
+         (let ((n (symbol-name ty)))
+           (cond ((string= n "FIXNUM") 62)
+                 ((string= n "BIT") 1)
+                 (t nil))))
+        ((and (consp ty) (symbolp (car ty)) (consp (cdr ty)) (integerp (cadr ty)))
+         (let ((n (symbol-name (car ty))) (w (cadr ty)))
+           (cond ((string= n "SIGNED-BYTE")   (and (<= w 62) w))
+                 ((string= n "UNSIGNED-BYTE") (and (<= w 61) (+ w 1)))
+                 ;; (integer LO HI) with both bounds literal (the dotimes
+                 ;; counter declaration): width covers the larger magnitude.
+                 ((and (string= n "INTEGER") (consp (cddr ty)) (integerp (caddr ty)))
+                  (let ((w2 (+ 1 (max (integer-length (abs w))
+                                      (integer-length (abs (caddr ty)))))))
+                    (and (<= w2 62) w2)))
+                 (t nil))))
+        (t nil)))
+
+(defun %decl-array-elt-width (ty)
+  "Element width for a declared (simple-array ET …), or NIL."
+  (and (consp ty) (symbolp (car ty)) (string= (symbol-name (car ty)) "SIMPLE-ARRAY")
+       (consp (cdr ty))
+       (let ((et (cadr ty)))
+         (cond ((and (symbolp et) (string= (symbol-name et) "T")) nil)
+               (t (%decl-int-width et))))))
+
+(defun %expr-width (form env)
+  "Estimated bit width of FORM's integer value, or NIL when it is not
+   provably a fixnum-typed expression.  Widths above 62 mean 'a fixnum by
+   declaration but of unknown magnitude' and disable the overflow-safe op."
+  (cond
+    ((integerp form)
+     (let ((w (+ 1 (integer-length (abs form))))) (and (<= w 62) w)))
+    ((symbolp form)
+     (and form env
+          (let ((b (env-lookup env form)))
+            (and b (%decl-int-width (binding-dtype b))))))
+    ((not (consp form)) nil)
+    ((not (symbolp (car form))) nil)
+    (t
+     (let ((op (symbol-name (car form))) (args (cdr form)))
+       (cond
+         ((string= op "AREF")
+          (and (consp args) (symbolp (car args)) env
+               (let ((b (env-lookup env (car args))))
+                 (and b (%decl-array-elt-width (binding-dtype b))))))
+         ((or (string= op "+") (string= op "-"))
+          (and (consp args)
+               (let ((w (%expr-width (car args) env)))
+                 (dolist (a (cdr args) w)
+                   (let ((wa (%expr-width a env)))
+                     (if (and w wa) (setq w (+ 1 (max w wa))) (return nil)))))))
+         ((string= op "*")
+          (and (consp args)
+               (let ((w (%expr-width (car args) env)))
+                 (dolist (a (cdr args) w)
+                   (let ((wa (%expr-width a env)))
+                     (if (and w wa) (setq w (+ w wa)) (return nil)))))))
+         ((string= op "ASH")
+          (and (consp args) (consp (cdr args)) (integerp (cadr args))
+               (let ((w (%expr-width (car args) env)) (k (cadr args)))
+                 (and w (if (< k 0) (max 1 (+ w k)) (+ w k))))))
+         ((string= op "LOGAND")
+          (and (consp args) (consp (cdr args)) (null (cddr args))
+               (let ((w (%expr-width (car args) env)) (c (cadr args)))
+                 (cond ((and (integerp c) (>= c 0)) (+ 1 (integer-length c)))
+                       (t (let ((wc (%expr-width c env))) (and w wc (min w wc))))))))
+         ((string= op "THE")
+          (and (consp args) (consp (cdr args)) (%decl-int-width (car args))))
+         (t nil))))))
+
+(defun %arith-trust-for (w1 w2 op)
+  "*arith-trust* value for a pair with operand widths W1 W2 under OP
+   (:add :sub :mul), or NIL when either width is unknown."
+  (and w1 w2
+       (let ((rw (if (eq op :mul) (+ w1 w2) (+ 1 (max w1 w2)))))
+         (list t (<= rw 61) rw))))
+
+(defun %leaf-operand-p (form env)
+  "True when compiling FORM into a fresh temp register is a pure load that
+   cannot disturb any other register or the stack: an integer literal, or a
+   lexical variable held in this frame (:stack / :reg binding — never a
+   symbol-macro, a special, or a global).  Binary-op emitters use this to
+   skip the push/pop that otherwise guards the left operand across the
+   right operand's compile — the dominant per-op cost in tight loops (the
+   6-tap filter spent 37 push/pop pairs per pixel)."
+  (cond ((integerp form) t)
+        ((and form (symbolp form) env)
+         (let ((b (env-lookup env form)))
+           (and b (member (binding-location b) (list :stack :reg)))))
+        (t nil)))
+
+(defun %swap-commutative-args (args env)
+  "For a 2-operand commutative op whose FIRST operand is a leaf and whose
+   second is not, return the operands swapped so the leaf compiles second
+   (where %leaf-operand-p removes the push/pop).  Evaluation order only
+   matters if the non-leaf assigns the leaf variable, which
+   collect-setq-vars-in-body detects (a :stack binding cannot be assigned
+   by a callee — captured variables are copied by value, and a mutated
+   capture is boxed into a cell binding, which is not a leaf)."
+  (if (and (consp args) (consp (cdr args)) (null (cddr args))
+           (%leaf-operand-p (car args) env)
+           (not (%leaf-operand-p (cadr args) env))
+           (or (integerp (car args))
+               (null (collect-setq-vars-in-body (cadr args) (list (car args))))))
+      (list (cadr args) (car args))
+      args))
+
+(defun %infer-let-widths (frame-env bindings body init-env)
+  "Width inference for LET/LET* bindings that carry no declaration: a
+   binding whose init form has a provable width (%expr-width, evaluated in
+   INIT-ENV) and which is never assigned anywhere in BODY (closures
+   included) gets a synthetic (signed-byte W) dtype, so the typed
+   arithmetic / comparison fast paths see it.  Covers the MIN/MAX macro
+   temps, (let ((p (+ s c))) …) index temps and the dotimes count variable."
+  (when frame-env
+    (dolist (binding bindings)
+      (let* ((var (if (consp binding) (car binding) binding))
+             (init (if (consp binding) (cadr binding) nil)))
+        (when (and var (symbolp var) init)
+          (let ((b (find var (compile-env-bindings frame-env)
+                         :key #'binding-name :test #'equal)))
+            (when (and b (null (binding-dtype b)))
+              (let ((w (%expr-width init init-env)))
+                (when (and w (<= w 62)
+                           (null (collect-setq-vars-in-body (cons 'progn body) (list var))))
+                  (setf (binding-dtype b) (list 'signed-byte w)))))))))))
 
 (defun %declared-u8-array-var-p (form env)
   "True when FORM is a variable declared (simple-array (unsigned-byte 8) …):

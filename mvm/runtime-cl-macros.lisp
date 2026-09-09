@@ -162,11 +162,23 @@
               (count-form (cadr spec))
               (result (caddr spec))
               (n (gensym \"DT\")))
-         (list 'let (list (list var 0) (list n count-form))
-               (list 'loop
-                 (list 'when (list '>= var n) (list 'return result))
-                 (cons 'progn body)
-                 (list 'setq var (list '+ var 1))))))"
+         ;; A literal count bounds VAR and N at compile time: declare both
+         ;; (integer 0 COUNT) so the per-iteration (>= var n) and (+ var 1)
+         ;; take the typed fast path (no tag test; see the compiler's
+         ;; %expr-width / %decl-int-width).
+         (list* 'let (list (list var 0) (list n count-form))
+               (append
+                (if (and (integerp count-form) (>= count-form 0))
+                    (list (list 'declare (list 'type (list 'integer 0 count-form) var n)))
+                    ;; VAR is always a fixnum: it counts 0..COUNT one step per
+                    ;; iteration, so exceeding a fixnum would take 2^62
+                    ;; iterations.  N is NOT declared (a bignum count is legal).
+                    (list (list 'declare (list 'type 'fixnum var))))
+                (list
+                 (list 'loop
+                   (list 'when (list '>= var n) (list 'return result))
+                   (cons 'progn body)
+                   (list 'setq var (list '+ var 1))))))))"
 
     "(defmacro case (key &rest clauses)
        (let ((kv (gensym \"CASE\")))

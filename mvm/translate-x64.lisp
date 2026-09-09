@@ -1245,12 +1245,13 @@
                     (loop-label (make-label))
                     (nocap-label (make-label)))
                 (emit-jcc buf :l done-label)
-                ;; cmp eax, 32
-                (emit-bytes buf #x83 #xF8 #x20)
+                ;; cmp eax, 64   (CALL-ARGUMENTS-LIMIT; was 32 — see
+                ;; emit-rest-prologue's variable-index loop for 33..64)
+                (emit-bytes buf #x83 #xF8 #x40)
                 ;; jle nocap
                 (emit-jcc buf :le nocap-label)
-                ;; mov eax, 32
-                (emit-bytes buf #xB8 #x20 #x00 #x00 #x00)
+                ;; mov eax, 64
+                (emit-bytes buf #xB8 #x40 #x00 #x00 #x00)
                 (emit-label buf nocap-label)
                 ;; sub eax, 4
                 (emit-bytes buf #x83 #xE8 #x04)
@@ -3166,23 +3167,32 @@
                 (vobj (second operands))
                 (vidx (third operands))
                 (d (dest-phys-or-scratch vd)))
-           ;; Compute address in scratch: Vidx*4
+           ;; Compute address in scratch: Vidx*4  (= real_idx*8)
            (let ((pidx (vreg-phys vidx)))
              (if pidx
                  (emit-mov-reg-reg buf +scratch-reg+ pidx)
                  (emit-load-vreg buf vidx +scratch-reg+)))
            (emit-shl-reg-imm buf +scratch-reg+ 2)
-           ;; Add Vobj
-           (let ((pobj (vreg-phys vobj)))
-             (if pobj
-                 (emit-add-reg-reg buf +scratch-reg+ pobj)
-                 (progn
-                   (emit-push buf 'r13)
-                   (emit-load-vreg buf vobj 'r13)
-                   (emit-add-reg-reg buf +scratch-reg+ 'r13)
-                   (emit-pop buf 'r13))))
-           ;; Load from [scratch + 7]
-           (emit-mov-reg-mem buf d +scratch-reg+ 7)
+           (if (= vobj +vreg-vfp+)
+               ;; VARIABLE-INDEX FRAME SLOT load: d = [rbp - 96 - real_idx*8].
+               ;; Mirrors the constant-index VFP case in +op-obj-ref+ (frame
+               ;; slots grow downward from +frame-slot-base+).  This is what
+               ;; makes emit-rest-prologue's >32 loop able to walk frame slots.
+               (progn
+                 (emit-neg-reg buf +scratch-reg+)              ; -real_idx*8
+                 (emit-add-reg-reg buf +scratch-reg+ 'rbp)     ; rbp - real_idx*8
+                 (emit-mov-reg-mem buf d +scratch-reg+ +frame-slot-base+))
+               ;; Normal object element: [Vobj + real_idx*8 + 7]
+               (progn
+                 (let ((pobj (vreg-phys vobj)))
+                   (if pobj
+                       (emit-add-reg-reg buf +scratch-reg+ pobj)
+                       (progn
+                         (emit-push buf 'r13)
+                         (emit-load-vreg buf vobj 'r13)
+                         (emit-add-reg-reg buf +scratch-reg+ 'r13)
+                         (emit-pop buf 'r13))))
+                 (emit-mov-reg-mem buf d +scratch-reg+ 7)))
            (maybe-store-scratch buf vd)))
 
         ((op= +op-aset+)

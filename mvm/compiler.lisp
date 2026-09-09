@@ -17930,8 +17930,34 @@
                        (emit-ir :cons list-reg val-reg list-reg))
               (emit-ir :br built-label)
               (emit-ir-label next-label)))
-          ;; Fallthrough: nargs > req+max-k — conservative NIL.
-          (emit-ir :mov list-reg +vreg-vn+))
+          ;; Fallthrough: nargs > req+max-k (i.e. > req+32).  Instead of the
+          ;; old conservative-NIL (which silently truncated every &rest call
+          ;; past 32 args — Modus's de-facto CALL-ARGUMENTS-LIMIT), build the
+          ;; rest list with a LOOP over frame slots [req .. nargs-1] using a
+          ;; variable-index :aref on VFP.  The #x0530 trap above has already
+          ;; copied the overflow args into those frame slots (its cap raised
+          ;; from 32 to 64 in the interp + both translators), so slot i holds
+          ;; arg i uniformly for i < 64.  This
+          ;; adds a fixed ~8-instruction loop (NOT an O(n^2) unrolled ladder),
+          ;; so it does not bloat the image, and the fast ≤32 ladder above is
+          ;; left byte-identical (no layout shift on the common path).
+          (let ((loop-top (make-compiler-label))
+                (loop-end (make-compiler-label))
+                (one-reg  (alloc-temp-reg)))
+            (emit-ir :mov list-reg +vreg-vn+)            ; list = NIL
+            (emit-ir :li one-reg (ash 1 1))              ; tagged 1 (inline :shl)
+            (emit-ir :sub nargs-reg nargs-reg one-reg)   ; idx = nargs - 1
+            (emit-ir :li cmp-reg (ash req 1))            ; tagged req bound
+            (emit-ir-label loop-top)
+            (emit-ir :cmp nargs-reg cmp-reg)             ; idx vs req
+            (emit-ir :blt loop-end)                      ; idx < req → done
+            (emit-ir :aref val-reg +vreg-vfp+ nargs-reg) ; val = frame[idx]
+            (emit-ir :gc-check)
+            (emit-ir :cons list-reg val-reg list-reg)    ; list = (cons val list)
+            (emit-ir :sub nargs-reg nargs-reg one-reg)   ; idx--
+            (emit-ir :br loop-top)
+            (emit-ir-label loop-end)
+            (free-temp-reg)))                            ; one-reg
         (emit-ir-label built-label)
         ;; Store the built list into slot[req] — the &rest param's slot.
         (emit-ir :stack-store list-reg req))

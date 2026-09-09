@@ -3948,7 +3948,31 @@
            (a28 (and r28 (car r28))) (r29 (and r28 (cdr r28)))
            (a29 (and r29 (car r29))) (r30 (and r29 (cdr r29)))
            (a30 (and r30 (car r30))) (r31 (and r30 (cdr r30)))
-           (a31 (and r31 (car r31))) (r32 (and r31 (cdr r31))))
+           (a31 (and r31 (car r31))) (r32 (and r31 (cdr r31)))
+           ;; Ladder extended 32 → 48 (CALL-ARGUMENTS-LIMIT).  reel's 47-slot
+           ;; DEC struct constructor is a >32-arg call reached through this
+           ;; runtime APPLY (the interp bridge's `(apply fn args)` with a
+           ;; variable fn); the old 32 cap truncated it, corrupting slots 32+.
+           ;; Capped at 48 (not higher) because this let* binds a0..aN + r1..rN+1
+           ;; = 2N+2 slots, and *let-binding-limit* is 120: 48 → 96 bindings is
+           ;; safe, 64 → 128 overflowed the frame and broke boot.  This is ONE
+           ;; function, so the extra cases cost O(1) image size.
+           (a32 (and r32 (car r32))) (r33 (and r32 (cdr r32)))
+           (a33 (and r33 (car r33))) (r34 (and r33 (cdr r33)))
+           (a34 (and r34 (car r34))) (r35 (and r34 (cdr r34)))
+           (a35 (and r35 (car r35))) (r36 (and r35 (cdr r35)))
+           (a36 (and r36 (car r36))) (r37 (and r36 (cdr r36)))
+           (a37 (and r37 (car r37))) (r38 (and r37 (cdr r37)))
+           (a38 (and r38 (car r38))) (r39 (and r38 (cdr r38)))
+           (a39 (and r39 (car r39))) (r40 (and r39 (cdr r39)))
+           (a40 (and r40 (car r40))) (r41 (and r40 (cdr r40)))
+           (a41 (and r41 (car r41))) (r42 (and r41 (cdr r41)))
+           (a42 (and r42 (car r42))) (r43 (and r42 (cdr r42)))
+           (a43 (and r43 (car r43))) (r44 (and r43 (cdr r43)))
+           (a44 (and r44 (car r44))) (r45 (and r44 (cdr r44)))
+           (a45 (and r45 (car r45))) (r46 (and r45 (cdr r45)))
+           (a46 (and r46 (car r46))) (r47 (and r46 (cdr r46)))
+           (a47 (and r47 (car r47))) (r48 (and r47 (cdr r47))))
       (cond
         ((null all-args) (funcall fn))
         ((null r1) (funcall fn a0))
@@ -3983,7 +4007,23 @@
         ((null r30) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29))
         ((null r31) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30))
         ((null r32) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30 a31))
-        (t (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30 a31))))))
+        ((null r33) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30 a31 a32))
+        ((null r34) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30 a31 a32 a33))
+        ((null r35) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30 a31 a32 a33 a34))
+        ((null r36) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30 a31 a32 a33 a34 a35))
+        ((null r37) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30 a31 a32 a33 a34 a35 a36))
+        ((null r38) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30 a31 a32 a33 a34 a35 a36 a37))
+        ((null r39) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30 a31 a32 a33 a34 a35 a36 a37 a38))
+        ((null r40) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30 a31 a32 a33 a34 a35 a36 a37 a38 a39))
+        ((null r41) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30 a31 a32 a33 a34 a35 a36 a37 a38 a39 a40))
+        ((null r42) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30 a31 a32 a33 a34 a35 a36 a37 a38 a39 a40 a41))
+        ((null r43) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30 a31 a32 a33 a34 a35 a36 a37 a38 a39 a40 a41 a42))
+        ((null r44) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30 a31 a32 a33 a34 a35 a36 a37 a38 a39 a40 a41 a42 a43))
+        ((null r45) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30 a31 a32 a33 a34 a35 a36 a37 a38 a39 a40 a41 a42 a43 a44))
+        ((null r46) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30 a31 a32 a33 a34 a35 a36 a37 a38 a39 a40 a41 a42 a43 a44 a45))
+        ((null r47) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30 a31 a32 a33 a34 a35 a36 a37 a38 a39 a40 a41 a42 a43 a44 a45 a46))
+        ((null r48) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30 a31 a32 a33 a34 a35 a36 a37 a38 a39 a40 a41 a42 a43 a44 a45 a46 a47))
+        (t (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30 a31 a32 a33 a34 a35 a36 a37 a38 a39 a40 a41 a42 a43 a44 a45 a46 a47))))))
 
 ;;; FUNCALL AS A FUNCTION OBJECT.
 ;;;

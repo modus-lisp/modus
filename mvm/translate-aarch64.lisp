@@ -2027,8 +2027,28 @@
                     (loop for i from 4 below code
                           for src-offset = (+ 80 (* (- i 4) arg-stride))
                           for dst-offset = (+ +a64-frame-slot-base+ (* i -8))
-                          do (a64-ldur buf +a64-x16+ +a64-x29+ src-offset)
-                             (a64-stur buf +a64-x16+ +a64-x29+ dst-offset)))))
+                          ;; LDUR/STUR carry a SIGNED imm9 (-256..255).  A
+                          ;; function with enough params runs SRC past +255 and
+                          ;; DST past -256 (src grows +stride/arg, dst shrinks
+                          ;; -8/arg); the bare imm9 then silently wrapped, so
+                          ;; every arg past ~slot 24-30 landed in the wrong
+                          ;; frame slot.  This is the >32-ARG STRUCT-CTOR bug:
+                          ;; reel's 42-slot DEC ctor is a fixed-arity call, so
+                          ;; its high slots were built from garbage → type BIT →
+                          ;; "fill: not a sequence".  Materialise the address in
+                          ;; x17 (ADD/SUB imm12, ample for any real arity) when
+                          ;; the offset is outside imm9, exactly as the obj-ref/
+                          ;; obj-set wide path does.  x16 is the value temp.
+                          do (if (<= src-offset 255)
+                                 (a64-ldur buf +a64-x16+ +a64-x29+ src-offset)
+                                 (progn
+                                   (a64-add-imm buf +a64-x17+ +a64-x29+ src-offset)
+                                   (a64-ldur buf +a64-x16+ +a64-x17+ 0)))
+                             (if (>= dst-offset -256)
+                                 (a64-stur buf +a64-x16+ +a64-x29+ dst-offset)
+                                 (progn
+                                   (a64-sub-imm buf +a64-x17+ +a64-x29+ (- dst-offset))
+                                   (a64-stur buf +a64-x16+ +a64-x17+ 0)))))))
                ((< code #x0300)
                 ;; Frame-alloc/frame-free: NOP for now
                 nil)
@@ -2773,13 +2793,14 @@
                 ;; b.lt done — placeholder; back-patched after loop end.
                 (let ((blt-idx (a64-current-index buf)))
                   (a64-emit buf 0)   ; B.LT placeholder
-                  ;; cmp w9, #24
-                  (a64-cmp-imm buf 9 24)
-                  ;; b.le nocap (skip "mov w9, 24")
+                  ;; cmp w9, #64  (CALL-ARGUMENTS-LIMIT; was 24 — 33..64 handled
+                  ;; by emit-rest-prologue's variable-index :aref loop)
+                  (a64-cmp-imm buf 9 64)
+                  ;; b.le nocap (skip "mov w9, 64")
                   (let ((ble-idx (a64-current-index buf)))
                     (a64-emit buf 0)   ; B.LE placeholder
-                    ;; movz w9, #24 — w9 = 24 (caps high nargs)
-                    (a64-movz buf 9 24 0)
+                    ;; movz w9, #64 — w9 = 64 (caps high nargs)
+                    (a64-movz buf 9 64 0)
                     ;; nocap:
                     (let ((nocap-idx (a64-current-index buf)))
                       ;; patch ble → nocap
@@ -4024,12 +4045,22 @@
           ;; gives real_idx*8 in the address computation.
           ((= op +op-aref+)
            (let* ((vd (vr 0))
-                  (pobj (ensure-src (vr 1) +a64-x16+))
+                  (vobj (vr 1))
                   (pidx (ensure-src (vr 2) +a64-x17+))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
-             (a64-add-imm buf +a64-x16+ pobj 7)
-             (a64-add-reg buf +a64-x16+ +a64-x16+ pidx 0 2)
-             (a64-ldur buf pd +a64-x16+ 0)
+             (if (= vobj +vreg-vfp+)
+                 ;; VARIABLE-INDEX FRAME SLOT load: addr = x29 - real_idx*8 + base
+                 ;; (frame-slot-base = -64).  Mirrors the constant-index VFP case
+                 ;; in +op-obj-ref+; lets emit-rest-prologue's >32 loop walk frame
+                 ;; slots.  pidx is a tagged fixnum (real*2); <<2 gives real*8.
+                 (progn
+                   (a64-lsl-imm buf +a64-x16+ pidx 2)                       ; x16 = real_idx*8
+                   (a64-sub-reg buf +a64-x16+ +a64-x29+ +a64-x16+ 0 0)      ; x16 = x29 - real_idx*8
+                   (a64-ldur buf pd +a64-x16+ +a64-frame-slot-base+))       ; [x16 - 64]
+                 (let ((pobj (ensure-src (vr 1) +a64-x16+)))
+                   (a64-add-imm buf +a64-x16+ pobj 7)
+                   (a64-add-reg buf +a64-x16+ +a64-x16+ pidx 0 2)
+                   (a64-ldur buf pd +a64-x16+ 0)))
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 

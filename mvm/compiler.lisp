@@ -3004,6 +3004,12 @@
          ;; (max) — CLHS requires at least one arg, signal program-error.
          '(error "MAX requires at least one argument"))
         ((null (cddr form)) (cadr form))
+        ;; one INTEGER-LITERAL operand: a compare-and-select primitive (see
+        ;; the %MAX-LIT hook in compile-call) — no LET temps, no frame traffic
+        ((and (null (cdddr form)) (integerp (caddr form)))
+         `(%max-lit ,(cadr form) ,(caddr form)))
+        ((and (null (cdddr form)) (integerp (cadr form)))
+         `(%max-lit ,(caddr form) ,(cadr form)))
         ((null (cdddr form))                               ; exactly 2 args
          (let ((tmp (%mvm-gensym "MAX"))
                (tmp2 (%mvm-gensym "MAXB")))
@@ -3019,6 +3025,10 @@
         ((null (cdr form))
          '(error "MIN requires at least one argument"))
         ((null (cddr form)) (cadr form))
+        ((and (null (cdddr form)) (integerp (caddr form)))
+         `(%min-lit ,(cadr form) ,(caddr form)))
+        ((and (null (cdddr form)) (integerp (cadr form)))
+         `(%min-lit ,(caddr form) ,(cadr form)))
         ((null (cdddr form))                               ; exactly 2 args
          (let ((tmp (%mvm-gensym "MIN"))
                (tmp2 (%mvm-gensym "MINB")))
@@ -8888,6 +8898,99 @@
                      ,@restore-forms))
                 env dest)))))))
 
+;;; ------------------------------------------------------------
+;;; Register promotion of loop-local LET variables (aarch64 runtime JIT)
+;;;
+;;; Every local lives in a frame slot, so `(aref v (+ 16 i))` is a frame load
+;;; of V, a frame load of I, the add, the aref, then a frame store of the
+;;; result — and the next statement loads them all again.  An out-of-order
+;;; core (Pi 5's A76) hides those load-use latencies; the in-order A53 of
+;;; the Pi Zero 2 W stalls on each one, and the same VP8 kernels ran ~15×
+;;; slower there.  This keeps the variables of a hot LET in V4–V8 instead:
+;;; on aarch64 those are x19–x23, which Modus's own prologue saves and
+;;; restores, so a promoted value survives calls, the generic-arithmetic
+;;; slow paths and the GC trampoline.  The promoted register is simply a
+;;; temp held for the LET body's extent (temps are a stack discipline that
+;;; never resets mid-function), so body expressions allocate above it.
+;;;
+;;; Conditions: a RUNTIME compile with the aarch64 back-end (x64's V4–V8
+;;; are caller-clobbered, so x64 keeps the frame-slot path and the ANSI
+;;; gate is untouched); the LET body contains a loop or is itself inside
+;;; one (only hot scopes, so the five registers go to inner loops); and the
+;;; body is provably safe after macroexpansion — no lambda/flet/labels (a
+;;; closure would capture a register), no catch/unwind-protect/handler
+;;; frames (a longjmp back INTO the scope would not restore the register).
+;;; Specials never reach compile-let; cell-boxed variables were rewritten
+;;; away above; a promoted variable that runs out of physical registers
+;;; (V9+ are spill slots) stays in its frame slot.
+
+(defvar *promote-loop-depth* 0
+  "Number of enclosing LOOP bodies being compiled (see compile-loop).")
+
+(defvar *promote-inhibit* nil
+  "Bound to T by the runtime compile entry when it retries a form whose
+   first compile ran out of temporaries with promotion on.")
+
+(defparameter *promote-forbidden-ops*
+  '("LAMBDA" "FLET" "LABELS" "MACROLET" "CATCH" "UNWIND-PROTECT" "HANDLER-CASE"
+    "HANDLER-BIND" "RESTART-CASE" "RESTART-BIND" "IGNORE-ERRORS"
+    "WITH-SIMPLE-RESTART" "PROGV" "THE-ENVIRONMENT"))
+
+(defparameter *promote-loop-ops* '("LOOP" "DOTIMES" "DOLIST" "DO" "DO*"))
+
+(defvar *promote-locals* nil
+  "Opt-in switch for register promotion.  Off by default: on the Pi 5's
+   out-of-order A76 the promoted registers cost more in temp pressure
+   (deeper expressions spill past V8, guarded fast paths engage sooner)
+   than the saved frame loads are worth — 30 frames went 495 → 596 ms.
+   The in-order A53 of the Pi Zero 2 W is the case it is for; the board
+   session sets it before installing a library.")
+
+(defun %promote-locals-p ()
+  (and *promote-locals*
+       *mvm-eval-runtime-p*
+       (boundp (quote *jit-target-arch*))
+       (eq (symbol-value (quote *jit-target-arch*)) :aarch64)))
+
+(defvar *promote-walk-loop-seen* nil)
+
+(defun %promote-walk (form depth)
+  "T when FORM (macroexpanded as it goes) contains none of the forbidden
+   operators.  Sets *promote-walk-loop-seen* when a loop form appears."
+  (cond
+    ((atom form) t)
+    ((> depth 60) nil)
+    (t
+     (let ((op (car form)))
+       (cond
+         ((consp op) nil)                     ; ((lambda …) …)
+         ((not (symbolp op)) t)
+         ((name-eq op "QUOTE") t)
+         ((name-eq op "FUNCTION")
+          (and (consp (cdr form)) (symbolp (cadr form))))
+         ((member (symbol-name op) *promote-forbidden-ops* :test #'string=) nil)
+         (t
+          (when (member (symbol-name op) *promote-loop-ops* :test #'string=)
+            (setq *promote-walk-loop-seen* t))
+          (multiple-value-bind (exp expanded) (%macroexpand-1-mvm-raw form)
+            (if expanded
+                (%promote-walk exp (+ depth 1))
+                (let ((r (cdr form)))
+                  (loop (when (not (consp r)) (return t))
+                        (unless (%promote-walk (car r) (+ depth 1)) (return nil))
+                        (setq r (cdr r))))))))))))
+
+(defun %let-promotion-plan (body)
+  "For a LET body: :promote when its variables may live in registers, else NIL."
+  (and (%promote-locals-p)
+       (let ((*promote-walk-loop-seen* nil))
+         (declare (special *promote-walk-loop-seen*))
+         (let ((safe (handler-case (%promote-walk (cons 'progn body) 0)
+                       (error () nil))))
+           (and safe
+                (or (> *promote-loop-depth* 0) *promote-walk-loop-seen*)
+                :promote)))))
+
 (defun compile-let (bindings body env dest)
   "Compile (let ((var val)*) body*).
    All values are evaluated in the outer environment, then bound."
@@ -8929,11 +9032,14 @@
               (compile-form `(let ,combined-bindings ,@new-body) env dest)
               (compile-form `(progn ,@new-body) env dest))))))
   (check-frame-overflow (length bindings) "let" env)
-  (let ((decl-body body)               ; unstripped: the (declare (type …)) scan below needs it
-        (body (strip-declares body))
-        (n-bindings (length bindings))
-        (new-env env)
-        (save-temps nil))
+  (let* ((decl-body body)              ; unstripped: the (declare (type …)) scan below needs it
+         (body (strip-declares body))
+         (n-bindings (length bindings))
+         (new-env env)
+         (save-temps nil)
+         (promote-plan (and (> n-bindings 0) (%let-promotion-plan body)))
+         (promoted-regs (make-array (max n-bindings 1) :initial-element nil))
+         (n-promoted 0))
     ;; Phase 1: Evaluate all values in original env, store to temp regs
     ;; We use a set of temp regs (or stack slots for > 5 bindings)
     (when (> n-bindings 0)
@@ -8960,27 +9066,45 @@
       (let ((i 0))
         (dolist (binding bindings)
           (let ((val (if (consp binding) (cadr binding) nil)))
-            (if (and (%temps-must-spill-p) (numberp dest))
-                (progn
-                  (compile-form val reserve-env dest)
-                  (let ((slot (+ (compile-env-stack-depth env) i)))
-                    (emit-ir :stack-store dest slot)))
-                (let ((temp (alloc-temp-reg)))
-                  (compile-form val reserve-env temp)
-                  (let ((slot (+ (compile-env-stack-depth env) i)))
-                    (emit-ir :stack-store temp slot))
-                  (free-temp-reg)))
+            (cond
+              ;; Register promotion: the init goes straight into a temp that
+              ;; stays allocated for the whole body (freed at the end below).
+              ;; Only while a PHYSICAL register is still free (V4–V8).
+              ;; At most three promoted registers live at once (V4–V6):
+              ;; a promoted variable holds its temp for the whole body, and
+              ;; the pool (V4–V15, 12 slots) must still fit the deepest
+              ;; expression inside (add-residual overflowed at five).
+              ((and promote-plan
+                    (not *promote-inhibit*)
+                    (<= (+ +vreg-v4+ *temp-reg-counter*) +vreg-v6+))
+               (let ((reg (alloc-temp-reg)))
+                 (compile-form val reserve-env reg)
+                 (setf (aref promoted-regs i) reg)
+                 (setq n-promoted (+ n-promoted 1))))
+              ((and (%temps-must-spill-p) (numberp dest))
+               (compile-form val reserve-env dest)
+               (let ((slot (+ (compile-env-stack-depth env) i)))
+                 (emit-ir :stack-store dest slot)))
+              (t
+               (let ((temp (alloc-temp-reg)))
+                 (compile-form val reserve-env temp)
+                 (let ((slot (+ (compile-env-stack-depth env) i)))
+                   (emit-ir :stack-store temp slot))
+                 (free-temp-reg))))
             (setq i (+ i 1))))))
-    ;; Phase 2: Build new environment with stack bindings
+    ;; Phase 2: Build new environment with stack (or register) bindings
     (let ((i 0))
       (dolist (binding bindings)
-        (let ((var (if (consp binding) (car binding) binding)))
+        (let ((var (if (consp binding) (car binding) binding))
+              (reg (aref promoted-regs i)))
           (setq new-env
                 (make-compile-env
-                 :bindings (cons (make-binding
-                                  :name var
-                                  :location :stack
-                                  :stack-slot (+ (compile-env-stack-depth env) i))
+                 :bindings (cons (if reg
+                                     (make-binding :name var :location :reg :reg reg)
+                                     (make-binding
+                                      :name var
+                                      :location :stack
+                                      :stack-slot (+ (compile-env-stack-depth env) i)))
                                 (compile-env-bindings new-env))
                  :stack-depth (+ (compile-env-stack-depth env) n-bindings)
                  :parent (compile-env-parent new-env)
@@ -8996,6 +9120,8 @@
     (%infer-let-widths new-env bindings decl-body env)
     ;; Compile body in new environment
     (compile-progn body new-env dest)
+    ;; Release the promoted registers (they were the top-most temps).
+    (dotimes (k n-promoted) (free-temp-reg))
     ;; Deallocate frame space
     (when (> n-bindings 0)
       (emit-ir :frame-free n-bindings))))
@@ -10241,6 +10367,13 @@
 ;;; NAMED LOOP is wrapping us.
 
 (defun compile-loop (body env dest)
+  "Simple LOOP: tracks the loop nesting depth for register promotion of
+   LET variables bound inside the body (see %let-promotion-plan)."
+  (let ((*promote-loop-depth* (+ *promote-loop-depth* 1)))
+    (declare (special *promote-loop-depth*))
+    (%compile-loop-1 body env dest)))
+
+(defun %compile-loop-1 (body env dest)
   "Compile (loop forms...) - either simple infinite loop or CL-style loop.
    Per CLHS, an unnamed LOOP establishes an implicit BLOCK NIL; we push
    a fresh (NIL exit dest) onto *block-labels* so compile-return finds
@@ -15476,6 +15609,24 @@
   ;; compile-variable-ref, far too late for this dispatch.  See %const-int-value.
   (let ((count (%const-int-value count-form)))
   (cond
+    ;; TYPED operand (provable width W) at a runtime compile: a right shift
+    ;; can neither see a bignum nor overflow, and a left shift with W+count
+    ;; ≤ 62 cannot overflow — emit the bare shift.  reel's `(ash sum -7)`
+    ;; per filtered pixel carried the bignum test and a cold call otherwise.
+    ((and count (<= count 30) *mvm-eval-runtime-p*
+          (%cg-on-p (quote *cg-typed-ash*))
+          (let ((w (%expr-width value-form env)))
+            (and w (or (< count 0) (<= (+ w count) 62)))))
+     (compile-form value-form env dest)
+     (if (>= count 0)
+         (when (> count 0) (emit-ir :shl dest dest count))
+         (progn
+           (emit-ir :sar dest dest (- count))
+           (let ((temp (alloc-temp-reg)))
+             (emit-ir :li temp 2)
+             (emit-ir :neg temp temp)
+             (emit-ir :and dest dest temp)
+             (free-temp-reg)))))
     ;; Small constant shift (≤ 30 bits left, any right) — inline, but GUARDED.
     ;;
     ;; ACTIVE LIMITATION #8: the inline :shl/:sar shifts the TAGGED WORD.  That
@@ -17466,6 +17617,19 @@
         (when (and var (symbolp var) init)
           (let ((b (find var (compile-env-bindings frame-env)
                          :key #'binding-name :test #'equal)))
+            ;; A binding DECLARED fixnum whose init has a provably narrower
+            ;; width and which is never assigned: the inference is sound on
+            ;; its own, so take the narrower type — `(let ((p (+ s c)))
+            ;; (declare (type fixnum p)) … (aref ref (- p 2)))` otherwise
+            ;; carries an overflow check on every index (reel's mc-filter).
+            (when (and b (binding-dtype b)
+                       (%cg-on-p (quote *cg-narrow-fixnum*))
+                       (symbolp (binding-dtype b))
+                       (string= (symbol-name (binding-dtype b)) "FIXNUM"))
+              (let ((w (%expr-width init init-env)))
+                (when (and w (<= w 62)
+                           (null (collect-setq-vars-in-body (cons 'progn body) (list var))))
+                  (setf (binding-dtype b) (list 'signed-byte w)))))
             (when (and b (null (binding-dtype b)))
               (let ((w (%expr-width init init-env))
                     ;; a typed struct slot read, or an alias of a declared
@@ -17589,6 +17753,25 @@
         (free-temp-reg))))
 
 (defun compile-word-aset (arr-form idx-form val-form env dest)
+  ;; Value first when ARR and IDX are lexical leaves — see compile-u8-set.
+  (when (%store-value-first-ok-p arr-form idx-form val-form env dest)
+    (return-from compile-word-aset
+      (let ((val-reg (alloc-temp-reg)))        ; see compile-u8-set: never DEST
+        (compile-form val-form env val-reg)
+        (if (integerp idx-form)
+            (let ((arr-reg (alloc-temp-reg)))
+              (compile-form arr-form env arr-reg)
+              (emit-ir :obj-set arr-reg idx-form val-reg)
+              (free-temp-reg))
+            (let ((arr-reg (alloc-temp-reg))
+                  (idx-reg (alloc-temp-reg)))
+              (compile-form arr-form env arr-reg)
+              (compile-form idx-form env idx-reg)
+              (emit-ir :aset arr-reg idx-reg val-reg)
+              (free-temp-reg)
+              (free-temp-reg)))
+        (emit-ir :mov dest val-reg)
+        (free-temp-reg))))
   (if (integerp idx-form)
       (let ((arr-reg (alloc-temp-reg))
             (val-reg (alloc-temp-reg)))
@@ -17672,20 +17855,73 @@
     (free-temp-reg)
     (free-temp-reg)))
 
+(defun %lexical-leaf-p (form env)
+  "An integer literal or a lexical variable (stack or register binding):
+   loading it into a temp touches no other register, so it may be
+   evaluated AFTER a value expression without changing what either sees."
+  (or (integerp form)
+      (and form (symbolp form)
+           (let ((b (env-lookup env form)))
+             (and b (member (binding-location b) '(:stack :reg)))))))
+
+;;; Runtime switches for the four codegen changes of 2026-09-10 (each
+;;; defaults ON via %cg-on-p, which treats an unset global as ON); a probe
+;;; can turn one off before loading a library to bisect a miscompile
+;;; without a rebuild.
+(defvar *cg-value-first* :on)
+(defvar *cg-minmax-lit* :on)
+(defvar *cg-typed-ash* :on)
+(defvar *cg-narrow-fixnum* :on)
+(defun %cg-on-p (name)
+  (let ((v (and (boundp name) (symbol-value name))))
+    (not (eq v :off))))
+
+(defun %store-value-first-ok-p (arr-form idx-form val-form env dest)
+  "May (aset ARR IDX VAL) evaluate VAL before ARR and IDX?  Only when both
+   are lexical leaves that VAL never assigns — `(setf (aref a i) (incf i))`
+   must store at the OLD i."
+  (and *mvm-eval-runtime-p* (numberp dest)
+       (%cg-on-p (quote *cg-value-first*))
+       (%lexical-leaf-p arr-form env) (%lexical-leaf-p idx-form env)
+       (null (collect-setq-vars-in-body
+              val-form
+              (remove-if-not #'symbolp (list arr-form idx-form))))))
+
 (defun compile-u8-set (arr-form idx-form val-form env dest)
   "Compile (%u8-set arr idx val) — store VAL's low byte into a u8 vector.
-   Returns VAL (like aset)."
-  (let ((arr-reg (alloc-temp-reg))
-        (idx-reg (alloc-temp-reg))
-        (val-reg (alloc-temp-reg)))
-    (compile-form arr-form env arr-reg)
-    (compile-form idx-form env idx-reg)
-    (compile-form val-form env val-reg)
-    (emit-ir :u8-set arr-reg idx-reg val-reg)
-    (emit-ir :mov dest val-reg)
-    (free-temp-reg)
-    (free-temp-reg)
-    (free-temp-reg)))
+   Returns VAL (like aset).  When ARR and IDX are lexical leaves the VALUE
+   is compiled first, straight into DEST, so its expression starts with
+   every physical temp free: with array and index temps allocated first,
+   reel's six-tap sum overflowed V4–V8 and every product went through a
+   spill slot."
+  ;; The value goes into a fresh TEMP, never straight into DEST: on x64 VR is
+  ;; rax, which the translator also uses as scratch inside the store op, so a
+  ;; value parked in VR was clobbered before the store read it (u8 stores of
+  ;; garbage across the x64 battery).  Allocating the value temp FIRST still
+  ;; gives its expression the lowest registers.
+  (if (%store-value-first-ok-p arr-form idx-form val-form env dest)
+      (let ((val-reg (alloc-temp-reg)))
+        (compile-form val-form env val-reg)
+        (let ((arr-reg (alloc-temp-reg))
+              (idx-reg (alloc-temp-reg)))
+          (compile-form arr-form env arr-reg)
+          (compile-form idx-form env idx-reg)
+          (emit-ir :u8-set arr-reg idx-reg val-reg)
+          (emit-ir :mov dest val-reg)
+          (free-temp-reg)
+          (free-temp-reg))
+        (free-temp-reg))
+      (let ((arr-reg (alloc-temp-reg))
+            (idx-reg (alloc-temp-reg))
+            (val-reg (alloc-temp-reg)))
+        (compile-form arr-form env arr-reg)
+        (compile-form idx-form env idx-reg)
+        (compile-form val-form env val-reg)
+        (emit-ir :u8-set arr-reg idx-reg val-reg)
+        (emit-ir :mov dest val-reg)
+        (free-temp-reg)
+        (free-temp-reg)
+        (free-temp-reg))))
 
 ;;; AREF / ASET / ARRAY-LENGTH — wrapper-aware front-ends.
 ;;;
@@ -17992,6 +18228,34 @@
   ;; directly (%prim-array-length) — the generic LENGTH is a 30 ns
   ;; wrapper/MDA/list dispatch, and the FILL expansion below defaults its
   ;; END to it.
+  ;; (%min-lit X L) / (%max-lit X L) — what the MIN/MAX macros emit for a
+  ;; literal integer operand.  With X of provable width (a fixnum) at a
+  ;; runtime compile: X into DEST, then compare with the tagged literal and
+  ;; conditionally move — one temp, no LET, no frame traffic.  Otherwise
+  ;; the generic single-evaluation expansion.
+  (when (and (symbolp fn) (or (name-eq fn "%MIN-LIT") (name-eq fn "%MAX-LIT"))
+             (consp args) (consp (cdr args)) (null (cddr args)) (integerp (cadr args)))
+    (let ((x (car args)) (lit (cadr args)) (minp (name-eq fn "%MIN-LIT")))
+      (if (and *mvm-eval-runtime-p* (numberp dest)
+               (%cg-on-p (quote *cg-minmax-lit*))
+               (%expr-width x env)
+               (<= (integer-length lit) 61))
+          (let ((tmp (alloc-temp-reg))
+                (skip (make-compiler-label)))
+            (compile-form x env dest)
+            (emit-li-tagged tmp lit)
+            (emit-ir :cmp dest tmp)
+            (emit-ir (if minp :blt :bgt) skip)       ; keep X when it already wins
+            (emit-ir :mov dest tmp)
+            (emit-ir-label skip)
+            (free-temp-reg)
+            (return-from compile-call nil))
+          (let ((g (%mvm-gensym (if minp "MIN" "MAX"))))
+            (return-from compile-call
+              (compile-form
+               (list 'let (list (list g x))
+                     (list 'if (list (if minp '< '>) g lit) g lit))
+               env dest))))))
   (when (and *mvm-eval-runtime-p* (symbolp fn) (name-eq fn "LENGTH")
              (consp args) (null (cdr args)) (symbolp (car args))
              (or (%declared-generic-array-var-p (car args) env)
@@ -20000,13 +20264,27 @@
       (cons info ir))))
 
 (defun mvm-compile-toplevel (form)
+  "Compile a top-level form.  Register promotion (see %let-promotion-plan)
+   is opportunistic: if a form runs out of temporaries with it on, the form
+   is compiled again with promotion inhibited."
+  (if (and (%promote-locals-p) (not *promote-inhibit*))
+      (handler-case (%mvm-compile-toplevel-1 form)
+        (error (e)
+          (if (search "out of temporary" (handler-case (format nil "~a" e) (error () "")))
+              (let ((*promote-inhibit* t))
+                (declare (special *promote-inhibit*))
+                (%mvm-compile-toplevel-1 form))
+              (error e))))
+      (%mvm-compile-toplevel-1 form)))
+
+(defun %mvm-compile-toplevel-1 (form)
   "Compile a top-level form.
    Handles defun, defvar, defconstant, defmacro, and bare expressions."
   (setq *mexp-memo* nil)
   ;; Macro-expand top-level forms first
   (let ((expanded (macroexpand-mvm form)))
     (unless (eq expanded form)
-      (return-from mvm-compile-toplevel (mvm-compile-toplevel expanded))))
+      (return-from %mvm-compile-toplevel-1 (mvm-compile-toplevel expanded))))
   (cond
     ;; (progn form*) at top level — process each sub-form.  Collect ALL
     ;; sub-results into :multi-result: the previous keep-last-only logic

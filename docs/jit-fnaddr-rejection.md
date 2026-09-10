@@ -359,7 +359,17 @@ arrays read their data vector row-major.  Pi 5: **30 frames in 0.63 s =
 48 fps**, inter 19 ms, keyframe 47 ms.  The measurement recipe lives in
 the memory note `reference_pi_perf_profiling_recipe`.
 
-What remains between 48 and 60 fps is, this time measured, mostly reel's
+Two follow-ons: keyword-form `replace`/`fill` on declared arrays compile
+to bounded operations (`f8b898e`; a per-byte inline loop first showed up
+*slower* than the word-at-a-time `%bulk-copy-u8` it had replaced — an
+expansion must not regress a good runtime primitive, so the u8 case now
+emits that call), and a LET/LET* binding inherits the full declared type
+of a typed struct-slot read or of a declared variable it aliases
+(`decode-residue`'s `(let* ((ay (d-above-y d))) …)` over `fxvec` slots was
+still generic).  Pi 5: **30 frames in 0.59 s = 51 fps**, inter 18 ms,
+keyframe 45 ms.
+
+What remains between 51 and 60 fps is, this time measured, mostly reel's
 kernels themselves (`add-residual`, the loop-filter edges, `mc-filter`,
 `decode-residue`/`get-coeffs`, ~65 %) at ~12 instructions per binary op
 with every local in a frame slot — register allocation across a basic

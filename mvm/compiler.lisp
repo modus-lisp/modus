@@ -2312,9 +2312,13 @@
   (cond ((symbolp form) (%var-dtype form env))
         ((and (consp form) (symbolp (car form)) (consp (cdr form)) (null (cddr form))
               (symbolp (cadr form)))
+         ;; The RESULT of an accessor call has the slot's declared type
+         ;; whether or not the argument is declared: an undeclared argument
+         ;; goes through the checked accessor, which signals on a non-struct,
+         ;; so a value that comes back is that slot's.  (Inlining the read
+         ;; itself still requires the declaration — see compile-call.)
          (let ((info (%struct-accessor-info (car form))))
-           (and info (%declared-struct-p (cadr form) env (third info))
-                (fifth info)
+           (and info (fifth info)
                 (%resolve-declared-type (fifth info)))))
         (t nil)))
 

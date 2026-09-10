@@ -14579,8 +14579,76 @@
    HELD would exceed it."
   (> (+ *temp-reg-counter* held) 8))
 
+;;; ------------------------------------------------------------
+;;; Single-float arithmetic fast path (SIMD plan, layer 1b part 2a)
+;;;
+;;; When every operand of + - * / is provably a SINGLE-FLOAT, emit the
+;;; :fadd/:fmul/:fsub/:fdiv opcode (double math, boxed) followed by
+;;; :fround32 (narrow to single) directly, per left-associated pair —
+;;; skipping the GENERIC-ADD/-MULTIPLY runtime dispatch (%ieee-float-p +
+;;; %any-to-float x2 + %float-result-type + the call + %as-result-float).
+;;; Each result still boxes; unboxed FP registers are part 2b.  CL single-
+;;; float arithmetic rounds to single at every step, which round-after-each-
+;;; pair reproduces exactly.
+
+(defun %expr-single-float-p (form env)
+  "T when FORM is provably a SINGLE-FLOAT at compile time."
+  (cond
+    ;; a single-float literal in the source
+    ((typep form 'single-float) t)
+    ((and (consp form) (name-eq (car form) "QUOTE") (consp (cdr form))
+          (typep (cadr form) 'single-float)) t)
+    ;; declared single-float variable, or a single-float struct slot
+    ((symbolp form)
+     (let ((ty (%expr-dtype form env)))
+       (and (symbolp ty) ty (string= (symbol-name ty) "SINGLE-FLOAT"))))
+    ((consp form)
+     (let ((op (car form)))
+       (cond
+         ((not (symbolp op)) nil)
+         ;; (aref V i…) of a declared (simple-array single-float …)
+         ((and (name-eq op "AREF") (consp (cdr form)))
+          (%declared-f32-array-var-p (cadr form) env))
+         ;; float op of float operands
+         ((and (member (symbol-name op) '("+" "-" "*" "/") :test #'string=)
+               (consp (cdr form)))
+          (every (lambda (a) (%expr-single-float-p a env)) (cdr form)))
+         ;; struct accessor whose slot type is single-float
+         (t (let ((ty (%expr-dtype form env)))
+              (and (symbolp ty) ty (string= (symbol-name ty) "SINGLE-FLOAT")))))))
+    (t nil)))
+
+(defun %float-arith-op (op-name)
+  (cond ((string= op-name "+") :fadd)
+        ((string= op-name "-") :fsub)
+        ((string= op-name "*") :fmul)
+        ((string= op-name "/") :fdiv)))
+
+(defun %compile-single-float-arith (op-name args env dest)
+  "Left-fold ARGS with the single-float op OP-NAME (a string), emitting
+   :f<op> + :fround32 per pair.  Requires (>= (length args) 2) and every
+   operand single-float (caller-checked)."
+  (let ((firop (%float-arith-op op-name)))
+    (compile-form (car args) env dest)
+    (dolist (arg (cdr args))
+      (let ((temp (alloc-temp-reg)))
+        (emit-ir :push dest)
+        (compile-form arg env temp)
+        (emit-ir :pop dest)
+        (emit-ir :gc-check)
+        (emit-ir firop dest dest temp)   ; boxed DOUBLE product
+        (emit-ir :gc-check)
+        (emit-ir :fround32 dest dest)    ; narrow to boxed single
+        (free-temp-reg)))))
+
+(defun %single-float-arith-applicable-p (args env)
+  (and (consp args) (consp (cdr args))
+       (every (lambda (a) (%expr-single-float-p a env)) args)))
+
 (defun compile-add (args env dest)
   "Compile (+ args...).  Fixnum fast path; ratio/mixed via GENERIC-ADD."
+  (when (%single-float-arith-applicable-p args env)
+    (return-from compile-add (%compile-single-float-arith "+" args env dest)))
   (setq args (%swap-commutative-args args env))
   (let ((anf (and args (cdr args) (anf-normalize-arith-args '+ args env))))
     (cond
@@ -14624,6 +14692,8 @@
    `-` entry's lambda list is `(arg1 &rest more)`; 0 args is invalid).
    Previously returned 0 silently, which made minus.lsp test 13974 fail
    because the test EXPECTS the (error ...) branch to fire."
+  (when (%single-float-arith-applicable-p args env)
+    (return-from compile-sub (%compile-single-float-arith "-" args env dest)))
   (cond
     ((null args)
      (compile-form `(error "- requires at least one argument") env dest))
@@ -14669,6 +14739,8 @@
    in a way I haven't yet isolated; leaving the fast :mul in place
    for now and noting the gap.  generic-multiply itself does promote
    via bignum-mul so the slow path is correct."
+  (when (%single-float-arith-applicable-p args env)
+    (return-from compile-mul (%compile-single-float-arith "*" args env dest)))
   (setq args (%swap-commutative-args args env))
   (cond
     ((null args) (compile-integer 1 dest))
@@ -14803,6 +14875,11 @@
    operands are integers; otherwise falls through to the old :div IR.
    This avoids the regression cascade that surfaces when EXACT-DIVIDE
    is invoked on floats (its (mod a b) check goes wrong)."
+  ;; Single-float division: :fdiv + :fround32 per pair (part 2a).  This is
+  ;; also the first REAL float division — the integer-truncate path below
+  ;; never handled float operands.
+  (when (%single-float-arith-applicable-p args env)
+    (return-from compile-div (%compile-single-float-arith "/" args env dest)))
   (when (null args)
     (compile-form `(error "/ requires at least one argument") env dest)
     (return-from compile-div nil))

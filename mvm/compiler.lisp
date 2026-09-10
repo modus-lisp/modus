@@ -17508,7 +17508,10 @@
                      ((and (symbolp op) (or (name-eq op "SETQ") (name-eq op "SETF")))
                       (let ((rest (cdr f)))
                         (loop
-                          (when (or (null rest) (null (cdr rest))) (return))
+                          ;; consp, not null: source forms can be DOTTED —
+                          ;; (loop for (k . v) in pairs …) is a destructuring
+                          ;; pattern, unquoted, and it reaches this walker.
+                          (when (or (not (consp rest)) (not (consp (cdr rest)))) (return))
                           (let ((place (car rest)) (val (cadr rest)))
                             (cond
                               ((eq place var)
@@ -17528,7 +17531,10 @@
                                    :test #'string=)
                            (mentions-p (cdr f)))
                       (setq bad t))
-                     (t (dolist (sub (cdr f)) (walk sub))
+                     (t (let ((r (cdr f)))
+                          (loop (when (not (consp r)) (return))
+                                (walk (car r))
+                                (setq r (cdr r))))
                         (when (consp op) (walk op))))))))
       (walk (cons 'progn body))
       (if bad nil max-w))))

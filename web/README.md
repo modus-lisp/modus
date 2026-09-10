@@ -63,7 +63,19 @@ because the worker blocks on stdin with `Atomics.wait`.
   interpreted (fib 20: 71 s → 1.2 s).  Function values are
   `(phys-index << 4) | 3`; the module's own bytecode is relocated the same
   way at load.
-- Not supported: threads (`%spawn-thread`), sockets, port I/O.
+- I/O.  Files: node uses real descriptors; the browser has an in-memory
+  filesystem rooted at `/home/web` — drop files on the page (or use the
+  picker) and they appear at the next prompt, and every file the program
+  writes is offered as a download in the bar.  Network: the image's
+  socket layer (`socket`/`connect`/`write`/`read`/`close`, plus a private
+  syscall 4242 for name resolution) is answered as one HTTP request per
+  connection, so `(http-get "http://host/path")` works: node performs it
+  with curl, the browser with `fetch` on the page thread (subject to CORS;
+  same-origin and CORS-enabled hosts work, port 443 maps to https).  The
+  C-string and I/O scratch buffers are moved into the BSS block
+  (`*cli-arch-io-scratch-source*`) because the x64 defaults fall inside the
+  interpreter's heap arena.
+- Not supported: threads (`%spawn-thread`), listening sockets, port I/O.
 
 ## Debugging flags (`run-node.js`)
 

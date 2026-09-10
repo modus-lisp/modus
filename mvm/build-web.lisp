@@ -175,9 +175,9 @@
 ;;;   MODUS_NO_JIT=1 sbcl --dynamic-space-size 8192 --script mvm/build-web.lisp
 ;;;   -> web/modus.mvmw  (override with MODUS_WEB_OUT)
 ;;;
-;;; MODUS_NO_JIT=1 is required: the runtime JIT needs executable pages and
-;;; native calls, which the interpreter does not provide; with it off
-;;; mvm-eval falls back to mvm-interpret, which is pure Lisp.
+;;; MODUS_NO_JIT=1 keeps the x64 native translator out of the image; the web
+;;; JIT arm (see the override slot above) then runs eval'd bytecode directly
+;;; on the JS interpreter instead of through mvm-interpret.
 
 (in-package :modus.mvm)
 
@@ -221,6 +221,98 @@
 
 (unless (null cl-user::*jit-on*)
   (error "build-web: run with MODUS_NO_JIT=1 — the web target has no runtime JIT"))
+;;; *jit-boot-source* is assembled LAST so its %jit-enabled-p wins; for the web
+;;; target the JIT is on (the arm is the interpreter itself), so win once more.
+;;; The web JIT arm.  It REPLACES mvm-eval.lisp's %jit-translate-page-1 and
+;;; %jit-install-native-fns, so it must come after them (last-defun-wins) — the
+;;; arch override slot is compiled before stage 2, so it goes here instead.
+(setq cl-user::*full-source*
+      (concatenate 'string cl-user::*full-source* "
+;; ---- the web JIT arm -------------------------------------------------
+;; The x64 JIT translates an eval'd module to native code in an exec page.
+;; Here the JS interpreter executes MVM bytecode directly, so the page IS the
+;; bytecode: copy it in, hand the JS side a table of resolved out-of-module
+;; callees (BSS 0x10000D48) and the quote-constant vector (0x10000D40), and let
+;; %jit-icache-flush relocate the page in place.  Constants are read through
+;; the vector at run time, so nothing bakes a heap address and no GC gate is
+;; needed.  Function values are (phys-index << 4) | 3, phys = addr - 0x10000000.
+(defun %jit-enabled-p () t)
+(defvar *web-jit-consts* nil)
+(defvar *web-jit-consts-synced* nil)
+(defun %web-sync-consts ()
+  (let ((n (if (boundp (quote *e2-const-count*)) *e2-const-count* 0))
+        (vec *web-jit-consts*)
+        (synced (if *web-jit-consts-synced* *web-jit-consts-synced* 0)))
+    (when (or (null vec) (> n (array-length vec)))
+      (let ((new (make-array (if (< (* 2 n) 256) 256 (* 2 n)))) (i 0))
+        (when vec
+          (loop (when (>= i (array-length vec)) (return nil))
+                (aset new i (aref vec i))
+                (setq i (+ i 1))))
+        (setq vec new)
+        (setq *web-jit-consts* new)))
+    (let ((i synced))
+      (loop (when (>= i n) (return nil))
+            (aset vec i (gethash i *e2-const-pool*))
+            (setq i (+ i 1))))
+    (setq *web-jit-consts-synced* n)
+    (setf (mem-ref #x10000D40 :u64) vec)))
+(defun %jit-translate-page-1 (bc ft-list rt-table)
+  (let* ((nlen (length bc))
+         (psize (+ nlen 4096))
+         (page (%mmap-exec-page psize))
+         (base (sap-address (make-sap page)))
+         (eoff nil) (fnoffs nil))
+    (when (< base 4096)
+      (setq *jit-r-mmap-fail* (if *jit-r-mmap-fail* (+ 1 *jit-r-mmap-fail*) 1))
+      (return-from %jit-translate-page-1 nil))
+    (let ((k 0))
+      (loop (when (>= k nlen) (return nil))
+            (setf (mem-ref (+ base k) :u8) (aref bc k))
+            (setq k (+ k 1))))
+    (let* ((n (hash-table-count rt-table))
+           (tab (make-array (if (< n 1) 1 n)))
+           (ok t) (k 0))
+      (loop (when (>= k n) (return nil))
+            (let* ((name (gethash (+ #x40000000 k) rt-table))
+                   (fn (and name (%mvm-resolve-runtime-fn name)))
+                   (word (if fn (%val->word fn) 0)))
+              (if (eql (logand word 15) 3)
+                  (aset tab k fn)
+                  (progn
+                    (if fn
+                        (setq *jit-r-reloc-call-nonnative*
+                              (if *jit-r-reloc-call-nonnative* (+ 1 *jit-r-reloc-call-nonnative*) 1))
+                        (setq *jit-r-reloc-call-unresolved*
+                              (if *jit-r-reloc-call-unresolved* (+ 1 *jit-r-reloc-call-unresolved*) 1)))
+                    (setq ok nil))))
+            (setq k (+ k 1)))
+      (unless ok (return-from %jit-translate-page-1 nil))
+      (setf (mem-ref #x10000D48 :u64) tab))
+    (%web-sync-consts)
+    (%jit-icache-flush base nlen)
+    (unless (eql (mem-ref #x10000D50 :u64) 0)
+      (return-from %jit-translate-page-1 nil))
+    (dolist (e ft-list)
+      (let ((nm (car e)) (off (cadr e)))
+        (when (string-equal nm \"%MVM-EVAL-THUNK\") (setq eoff off))
+        (setq fnoffs (cons (cons nm off) fnoffs))))
+    (list base (if eoff eoff 0) nil (%gc-count) psize (reverse fnoffs))))
+(defun %jit-install-native-fns (base fnoffs names)
+  (let ((n 0))
+    (dolist (e fnoffs)
+      (let ((nm (car e)))
+        (when (member nm names :test (function string=))
+          (let ((fn (%word->val (logior (* (- (+ base (cdr e)) #x10000000) 16) 3))))
+            (when (boundp (quote *symbol-function-table*))
+              (puthash nm *symbol-function-table* fn))
+            (when (boundp (quote *native-sym-function-table*))
+              (puthash (compute-name-hash nm) *native-sym-function-table* fn))
+            (setq n (+ n 1))))))
+    (setq *jit-native-defun-count*
+          (if *jit-native-defun-count* (+ *jit-native-defun-count* n) n))
+    n))
+"))
 (format t "~%Compiling web (x86-64 word) module (~D chars)...~%"
         (length cl-user::*full-source*))
 (let ((target (find-target :x86-64)))

@@ -14294,9 +14294,18 @@
    unconditionally under mvm-eval (*mvm-eval-runtime-p*), and at build time
    as the overflow fallback when the temp budget is nearly exhausted
    (see %temps-must-spill-p)."
-  (if (%leaf-operand-p arg env)
-      ;; Leaf right operand (variable / literal): a pure load into the temp
-      ;; cannot disturb DEST, so no push/mov/pop round trip is needed.
+  (if (let ((leaf (%leaf-operand-p arg env)))
+        ;; A leaf, or a pure typed expression, compiled into a fresh temp
+        ;; cannot disturb DEST — with one x64 caveat: the translator's
+        ;; scratch register is rax, which is also VR, and a SPILL temp
+        ;; (V9+) or an :aref is written through it.  So when DEST is VR the
+        ;; shortcut is taken only for a leaf landing in a physical temp
+        ;; (V4..V8); otherwise DEST is a callee-saved / spilled vreg and the
+        ;; scratch traffic is harmless.
+        (and (or leaf (%pure-simple-expr-p arg env))
+             (or (/= dest +vreg-vr+)
+                 (and leaf (< *temp-reg-counter* 5)))))
+      ;; Leaf / pure right operand: no push/mov/pop round trip is needed.
       (let ((temp (alloc-temp-reg)))
         (compile-form arg env temp)
         (let ((*arith-trust* trust))
@@ -14862,7 +14871,10 @@
           (setf a-temp (alloc-temp-reg))
           (setf tag-temp (alloc-temp-reg))
           (compile-form a env dest)
-          (if (%leaf-operand-p b env)
+          (if (and (%leaf-operand-p b env)
+                   ;; x64: a spill A-TEMP is written through rax = VR (see
+                   ;; %compile-arith-arg-step-e2); keep the push/pop then
+                   (or (/= dest +vreg-vr+) (< a-temp (+ +vreg-v4+ 5))))
               ;; Leaf right operand: a pure load into A-TEMP, no push/pop.
               (compile-form b env a-temp)
               (progn
@@ -17275,6 +17287,39 @@
          (let ((b (env-lookup env form)))
            (and b (member (binding-location b) (list :stack :reg)))))
         (t nil)))
+
+(defun %pure-simple-expr-p (form env)
+  "FORM compiles to straight-line typed code: a leaf, a typed aref of a
+   declared array with a pure index, or + - * / ash on typed operands (tag
+   test skipped; any overflow slow path is a CALL that saves the live
+   temps).  Used to skip the push/pop that guards a binary op's left operand
+   across the right operand's compile — only when DEST is not VR, see
+   %compile-arith-arg-step-e2 (x64's scratch register is also VR)."
+  (cond ((%leaf-operand-p form env) t)
+        ((not (consp form)) nil)
+        ((not (symbolp (car form))) nil)
+        (t (let ((op (symbol-name (car form))) (args (cdr form)))
+             (cond
+               ((string= op "AREF")
+                (and (consp args) (consp (cdr args)) (null (cddr args))
+                     (symbolp (car args))
+                     (or (%declared-generic-array-var-p (car args) env)
+                         (%declared-u8-array-var-p (car args) env))
+                     (%pure-simple-expr-p (cadr args) env)))
+               ((or (string= op "+") (string= op "-") (string= op "*"))
+                (and (consp args) (consp (cdr args)) (null (cddr args))
+                     ;; typed operands: the op is tag-safe; its overflow slow
+                     ;; path (a CALL that saves the live temps) is harmless
+                     ;; because the shortcut is never taken with DEST = VR
+                     (%expr-width (car args) env) (%expr-width (cadr args) env)
+                     (%pure-simple-expr-p (car args) env)
+                     (%pure-simple-expr-p (cadr args) env)))
+               ((string= op "ASH")
+                (and (consp args) (consp (cdr args)) (null (cddr args))
+                     (integerp (cadr args)) (<= (cadr args) 30) (>= (cadr args) -30)
+                     (%expr-width (car args) env)
+                     (%pure-simple-expr-p (car args) env)))
+               (t nil))))))
 
 (defun %swap-commutative-args (args env)
   "For a 2-operand commutative op whose FIRST operand is a leaf and whose

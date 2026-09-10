@@ -21,6 +21,8 @@ for (let i = 0; i < args.length; i++) {
   else if (a === '--trace') opts.trace = parseInt(args[++i], 10);
   else if (a === '--debug') opts.debug = true;
   else if (a === '--profile') opts.profile = true;
+  else if (a === '--no-compile') opts.compile = false;
+  else if (a === '--compile-threshold') opts.compileThreshold = parseInt(args[++i], 10);
   else if (a === '--trace-from') opts.traceFrom = parseInt(args[++i], 10);
   else if (a === '--trace-count') opts.traceCount = parseInt(args[++i], 10);
   else if (a === '--trace-regs') opts.traceRegs = true;
@@ -37,7 +39,7 @@ for (let i = 0; i < args.length; i++) {
 const mod = loadModule(new Uint8Array(fs.readFileSync(opts.mvmw)));
 const env = Object.entries(process.env).map(([k, v]) => `${k}=${v}`);
 const host = new NodeHost();
-const vm = new MVM(mod, host, { argv, env, trace: opts.trace, debug: opts.debug, maxSteps: opts.maxSteps, traceFrom: opts.traceFrom, traceCount: opts.traceCount, traceRegs: opts.traceRegs, profile: opts.profile, semispace: opts.semi << 20 });
+const vm = new MVM(mod, host, { argv, env, trace: opts.trace, debug: opts.debug, maxSteps: opts.maxSteps, compile: opts.compile, compileThreshold: opts.compileThreshold, traceFrom: opts.traceFrom, traceCount: opts.traceCount, traceRegs: opts.traceRegs, profile: opts.profile, semispace: opts.semi << 20 });
 if (opts.watch) { const f = vm.byName.get(opts.watch); if (!f) throw new Error('no fn ' + opts.watch); vm.watchAt = f.off; vm.watchLeft = 60; }
 const t0 = Date.now();
 let code = 0;
@@ -71,5 +73,8 @@ try {
   else { process.stderr.write('MVM internal error at ' + vm.where() + ' (step ' + vm.steps + ')\n  ' + vm.backtrace().join('\n  ') + '\n'); throw e; }
 }
 if (opts.profile) host.log(vm.profileReport(40));
+if (vm.dcount.size) host.log('[dynamic delegated: ' + [...vm.dcount.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12).map(([o, n]) => '0x' + o.toString(16) + ':' + n).join(' ') + ']');
+if (opts.trace && vm.compileStats.delegated.size) host.log('[delegated ops: ' + [...vm.compileStats.delegated.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12).map(([o, n]) => '0x' + o.toString(16) + ':' + n).join(' ') + ']');
+if (opts.trace) host.log(`[compiled ${vm.compileStats.fns} fns / ${vm.compileStats.insns} insns, ${vm.compileStats.failed} failed, ${vm.compileStats.ms | 0} ms]`);
 if (opts.trace) host.log(`[exit ${code}: ${vm.steps} steps, ${vm.gcCount} gcs, ${Date.now() - t0}ms]`);
 process.exitCode = code;

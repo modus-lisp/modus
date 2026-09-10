@@ -67,9 +67,10 @@ for (let v = 9; v <= 15; v++) ROFF[v] = -40 - 8 * (v - 9);
 const IX0 = -4, IX1 = -6, IX2 = -8, IX3 = -282, IX4 = -2;
 
 const RET_SENTINEL = -1;
+const DBG = (typeof process !== 'undefined' && process.env) ? process.env : {};
 const FN_UNRESOLVED = 0xFFFFFFF0;
 
-class LongJmp { constructor(esp) { this.esp = esp; } }
+class LongJmp { constructor(esp, ip) { this.esp = esp; this.ip = ip; } }
 class MvmExit { constructor(code) { this.code = code; } }
 class MvmFault extends Error {}
 
@@ -214,6 +215,14 @@ class MVM {
     // close) is answered here as one HTTP request per connection, which the
     // host performs with whatever it has (fetch, curl).  Name resolution comes
     // through the private syscall 4242 and returns a fake IPv4 we can map back.
+    this.compiled = new Map();                // phys entry -> JS function, or null (not translatable)
+    this.resumeL = 0;
+    this.dcount = new Map();
+    this.contF = []; this.contL = []; this.contE = []; this.contDepth = 0;
+    this.compileOn = opts.compile !== false;
+    this.compileThreshold = opts.compileThreshold || 20;
+    this.callCounts = new Map();
+    this.compileStats = { fns: 0, insns: 0, failed: 0, ms: 0, delegated: new Map() };
     this.socks = new Map();
     this.nextSockFd = 1000;
     this.fakeIps = new Map(); this.ipNames = new Map();
@@ -361,6 +370,8 @@ class MVM {
     }
     this.fault('bad vreg ' + v);
   }
+  rd32(p) { const c = this.m8; return c[p] | (c[p + 1] << 8) | (c[p + 2] << 16) | (c[p + 3] << 24); }
+  setRegR(v) { this.setReg(v, RL, RH); }
   push(lo, hi) { this.esp -= 8; const i = (this.esp - VBASE) >> 2; this.m32[i] = lo; this.m32[i + 1] = hi; }
   pop() { const i = (this.esp - VBASE) >> 2; RL = this.m32[i]; RH = this.m32[i + 1]; this.esp += 8; return RL; }
 
@@ -574,7 +585,7 @@ class MVM {
     this.push(this.ebp, 0);
     this.ebp = this.esp;
     this.esp -= FRAME_SIZE;
-    if (this.esp < STACK_ADDR + 4096) this.fault('stack overflow');
+    if (this.esp < STACK_ADDR + 4096) { this.esp = this.ebp; this.ebp = this.pop(); this.pop(); this.memFault('stack overflow'); }
     const b = (this.ebp - VBASE) >> 2;
     m32[b + IX0] = a0l; m32[b + IX0 + 1] = a0h; m32[b + IX1] = a1l; m32[b + IX1 + 1] = a1h;
     m32[b + IX2] = a2l; m32[b + IX2 + 1] = a2h; m32[b + IX3] = a3l; m32[b + IX3 + 1] = a3h;
@@ -622,8 +633,7 @@ class MVM {
       if (i < args.length) this.setReg(i, args[i][0], args[i][1]); else this.setReg(i, NIL, 0);
     }
     this.st32(A_NARGS, args.length);
-    this.doCall(fn.off, RET_SENTINEL);
-    this.run();
+    this.callFn(fn.off);
     const rl = this.vrl, rh = this.vrh;
     m32[b + IX0] = saved[0]; m32[b + IX0 + 1] = saved[1]; m32[b + IX1] = saved[2]; m32[b + IX1 + 1] = saved[3];
     m32[b + IX2] = saved[4]; m32[b + IX2 + 1] = saved[5]; m32[b + IX3] = saved[6]; m32[b + IX3 + 1] = saved[7];
@@ -672,7 +682,7 @@ class MVM {
     const b = (ebp - VBASE) >> 2;
     this.m32[b + IX4] = v4l; this.m32[b + IX4 + 1] = v4h;
     this.vrl = TV; this.vrh = 0;
-    throw new LongJmp(esp);
+    throw new LongJmp(esp, ip);
   }
 
   // -- traps (translate-x64 hosted arms) -------------------------------------
@@ -723,8 +733,7 @@ class MVM {
       case 0x0532: {                          // %jit-call: run a page function to completion
         const phys = this.arg(0) - VBASE;
         if (phys < JIT_PHYS || phys >= JIT_END - VBASE) this.fault(`%jit-call outside the exec region: 0x${this.arg(0).toString(16)}`);
-        this.doCall(phys, RET_SENTINEL);
-        this.run();                           // VR holds the result; the caller's frame is intact
+        this.callFn(phys);                    // VR holds the result; the caller's frame is intact
         return;
       }
       case 0x0533: {                          // %jit-icache-flush base len: relocate the page
@@ -870,14 +879,6 @@ class MVM {
   }
 
   loop() {
-    const code = this.code, m32 = this.m32, m8 = this.m8, self = this;
-    const heapEnd = this.heapEnd;
-    const rd32 = (p) => (code[p] | (code[p + 1] << 8) | (code[p + 2] << 16) | (code[p + 3] << 24));
-    const IX = (v) => (self.ebp + ROFF[v] - VBASE) >> 2;
-    const RLO = (v) => (v < 16 ? m32[IX(v)] : self.rlo(v));
-    const RHI = (v) => (v < 16 ? m32[IX(v) + 1] : self.rhi(v));
-    const W = (v, lo, hi) => { if (v < 16) { const i = IX(v); m32[i] = lo; m32[i + 1] = hi; } else self.setReg(v, lo, hi); };
-    const WR = (v) => W(v, RL, RH);
     let pc = this.pc;
     for (;;) {
       if (this.trace) {
@@ -887,6 +888,19 @@ class MVM {
         else if (this.prof && (this.steps & 255) === 0) { const f = this.fnAt(pc); if (f) this.prof.set(-f.off - 1, (this.prof.get(-f.off - 1) || 0) + 1); }
         else if ((this.steps & 0x3FFFFFF) === 0) { this.pc = pc; const bt = this.backtrace(200); this.host.log(`[${this.steps} steps, gc ${this.gcCount}, heap ${(this.va - this.heapBase) >> 10}K, depth ${bt.length}] ${bt.slice(0, 4).join(' < ')} ... ${bt.slice(-4).join(' < ')}`); }
       }
+      pc = this.execInsn(pc);
+      if (pc === RET_SENTINEL) return;
+    }
+  }
+
+  // Execute the instruction at PC; return the next pc (RET_SENTINEL when the
+  // activation that started this loop has returned).  Calls into a callee
+  // that has a compiled form run it to completion here.
+  execInsn(pc) {
+    const code = this.code, m32 = this.m32, m8 = this.m8;
+    const heapEnd = this.heapEnd;
+    // no per-call closures here: this runs once per instruction
+    {
       const op = code[pc];
       this.pc = pc;
       switch (op) {
@@ -897,34 +911,34 @@ class MVM {
           this.trap(c, pc + 3);
           pc += 3; break;
         }
-        case 0x10: { const s = code[pc + 2]; W(code[pc + 1], RLO(s), RHI(s)); pc += 3; break; }        // mov
-        case 0x11: W(code[pc + 1], rd32(pc + 2), rd32(pc + 6)); pc += 10; break;                       // li imm64
-        case 0x12: { const s = code[pc + 1]; this.push(RLO(s), RHI(s)); pc += 2; break; }              // push
-        case 0x13: this.pop(); WR(code[pc + 1]); pc += 2; break;                                        // pop
+        case 0x10: { const s = code[pc + 2]; this.setReg(code[pc + 1], this.rlo(s), this.rhi(s)); pc += 3; break; }        // mov
+        case 0x11: this.setReg(code[pc + 1], this.rd32(pc + 2), this.rd32(pc + 6)); pc += 10; break;                       // li imm64
+        case 0x12: { const s = code[pc + 1]; this.push(this.rlo(s), this.rhi(s)); pc += 2; break; }              // push
+        case 0x13: this.pop(); this.setRegR(code[pc + 1]); pc += 2; break;                                        // pop
         case 0x14: {                                                                                     // li-const
-          const idx = rd32(pc + 2);
+          const idx = this.rd32(pc + 2);
           if (pc >= JIT_PHYS) {                                                                          // mvm-eval quote pool
             const vec = this.ldlo(A_WEB_CONSTS);
             if (vec === 0) this.fault('li-const in a page with no constant vector');
             const a = vec + 7 + 8 * idx;
-            W(code[pc + 1], this.ldlo(a), this.ldhi(a));
+            this.setReg(code[pc + 1], this.ldlo(a), this.ldhi(a));
           } else {
             const off = this.mod.addrTable[idx] | 0;
-            W(code[pc + 1], off === 0 ? 0 : (POOL_ADDR + off), 0);
+            this.setReg(code[pc + 1], off === 0 ? 0 : (POOL_ADDR + off), 0);
           }
           pc += 10; break;
         }
-        case 0x20: { const a = code[pc + 2], b = code[pc + 3]; add64(RLO(a), RHI(a), RLO(b), RHI(b)); WR(code[pc + 1]); pc += 4; break; }
-        case 0x21: { const a = code[pc + 2], b = code[pc + 3]; sub64(RLO(a), RHI(a), RLO(b), RHI(b)); WR(code[pc + 1]); pc += 4; break; }
+        case 0x20: { const a = code[pc + 2], b = code[pc + 3]; add64(this.rlo(a), this.rhi(a), this.rlo(b), this.rhi(b)); this.setRegR(code[pc + 1]); pc += 4; break; }
+        case 0x21: { const a = code[pc + 2], b = code[pc + 3]; sub64(this.rlo(a), this.rhi(a), this.rlo(b), this.rhi(b)); this.setRegR(code[pc + 1]); pc += 4; break; }
         case 0x22: {                                                                                     // mul: (a>>1)*b wrap
           const a = code[pc + 2], b = code[pc + 3];
-          sar64(RLO(a), RHI(a), 1);
-          mul64(RL, RH, RLO(b), RHI(b)); WR(code[pc + 1]); pc += 4; break;
+          sar64(this.rlo(a), this.rhi(a), 1);
+          mul64(RL, RH, this.rlo(b), this.rhi(b)); this.setRegR(code[pc + 1]); pc += 4; break;
         }
         case 0x23: case 0x24: {                                                                          // div / mod (truncating)
           const a = code[pc + 2], b = code[pc + 3];
-          sar64(RLO(a), RHI(a), 1); const xl = RL, xh = RH;
-          sar64(RLO(b), RHI(b), 1); const yl = RL, yh = RH;
+          sar64(this.rlo(a), this.rhi(a), 1); const xl = RL, xh = RH;
+          sar64(this.rlo(b), this.rhi(b), 1); const yl = RL, yh = RH;
           if (yl === 0 && yh === 0) this.memFault('division by zero');
           if (fits53(xl, xh) && fits53(yl, yh)) {
             const x = toNum(xl, xh), y = toNum(yl, yh);
@@ -934,167 +948,180 @@ class MVM {
             const X = toBig(xl, xh), Y = toBig(yl, yh);
             fromBig((op === 0x23 ? X / Y : X % Y) << 1n);
           }
-          WR(code[pc + 1]); pc += 4; break;
+          this.setRegR(code[pc + 1]); pc += 4; break;
         }
-        case 0x25: { const s = code[pc + 2]; sub64(0, 0, RLO(s), RHI(s)); WR(code[pc + 1]); pc += 3; break; }   // neg
-        case 0x26: { const d = code[pc + 1]; add64(RLO(d), RHI(d), 2, 0); WR(d); pc += 2; break; }
-        case 0x27: { const d = code[pc + 1]; sub64(RLO(d), RHI(d), 2, 0); WR(d); pc += 2; break; }
-        case 0x28: { const a = code[pc + 2], b = code[pc + 3]; W(code[pc + 1], RLO(a) & RLO(b), RHI(a) & RHI(b)); pc += 4; break; }
-        case 0x29: { const a = code[pc + 2], b = code[pc + 3]; W(code[pc + 1], RLO(a) | RLO(b), RHI(a) | RHI(b)); pc += 4; break; }
-        case 0x2A: { const a = code[pc + 2], b = code[pc + 3]; W(code[pc + 1], RLO(a) ^ RLO(b), RHI(a) ^ RHI(b)); pc += 4; break; }
-        case 0x2B: { const s = code[pc + 2]; shl64(RLO(s), RHI(s), code[pc + 3]); WR(code[pc + 1]); pc += 4; break; }
-        case 0x2C: { const s = code[pc + 2]; shr64(RLO(s), RHI(s), code[pc + 3]); WR(code[pc + 1]); pc += 4; break; }
-        case 0x2D: { const s = code[pc + 2]; sar64(RLO(s), RHI(s), code[pc + 3]); WR(code[pc + 1]); pc += 4; break; }
-        case 0x2F: { const s = code[pc + 2]; shl64(RLO(s), RHI(s), RLO(code[pc + 3]) & 63); WR(code[pc + 1]); pc += 4; break; }
-        case 0x32: { const s = code[pc + 2]; sar64(RLO(s), RHI(s), RLO(code[pc + 3]) & 63); WR(code[pc + 1]); pc += 4; break; }
+        case 0x25: { const s = code[pc + 2]; sub64(0, 0, this.rlo(s), this.rhi(s)); this.setRegR(code[pc + 1]); pc += 3; break; }   // neg
+        case 0x26: { const d = code[pc + 1]; add64(this.rlo(d), this.rhi(d), 2, 0); this.setRegR(d); pc += 2; break; }
+        case 0x27: { const d = code[pc + 1]; sub64(this.rlo(d), this.rhi(d), 2, 0); this.setRegR(d); pc += 2; break; }
+        case 0x28: { const a = code[pc + 2], b = code[pc + 3]; this.setReg(code[pc + 1], this.rlo(a) & this.rlo(b), this.rhi(a) & this.rhi(b)); pc += 4; break; }
+        case 0x29: { const a = code[pc + 2], b = code[pc + 3]; this.setReg(code[pc + 1], this.rlo(a) | this.rlo(b), this.rhi(a) | this.rhi(b)); pc += 4; break; }
+        case 0x2A: { const a = code[pc + 2], b = code[pc + 3]; this.setReg(code[pc + 1], this.rlo(a) ^ this.rlo(b), this.rhi(a) ^ this.rhi(b)); pc += 4; break; }
+        case 0x2B: { const s = code[pc + 2]; shl64(this.rlo(s), this.rhi(s), code[pc + 3]); this.setRegR(code[pc + 1]); pc += 4; break; }
+        case 0x2C: { const s = code[pc + 2]; shr64(this.rlo(s), this.rhi(s), code[pc + 3]); this.setRegR(code[pc + 1]); pc += 4; break; }
+        case 0x2D: { const s = code[pc + 2]; sar64(this.rlo(s), this.rhi(s), code[pc + 3]); this.setRegR(code[pc + 1]); pc += 4; break; }
+        case 0x2F: { const s = code[pc + 2]; shl64(this.rlo(s), this.rhi(s), this.rlo(code[pc + 3]) & 63); this.setRegR(code[pc + 1]); pc += 4; break; }
+        case 0x32: { const s = code[pc + 2]; sar64(this.rlo(s), this.rhi(s), this.rlo(code[pc + 3]) & 63); this.setRegR(code[pc + 1]); pc += 4; break; }
         case 0x2E: {                                                                                     // ldb pos size
           const s = code[pc + 2], pos = code[pc + 3], size = code[pc + 4];
-          shr64(RLO(s), RHI(s), pos);
+          shr64(this.rlo(s), this.rhi(s), pos);
           if (size < 32) { RL &= (1 << size) - 1; RH = 0; }
           else if (size === 32) RH = 0;
           else if (size < 64) RH &= (1 << (size - 32)) - 1;
-          WR(code[pc + 1]); pc += 5; break;
+          this.setRegR(code[pc + 1]); pc += 5; break;
         }
-        case 0x30: { const a = code[pc + 1], b = code[pc + 2]; this.cmp = cmp64(RLO(a), RHI(a), RLO(b), RHI(b)); pc += 3; break; }
-        case 0x31: { const a = code[pc + 1], b = code[pc + 2]; const lo = RLO(a) & RLO(b), hi = RHI(a) & RHI(b);
+        case 0x30: { const a = code[pc + 1], b = code[pc + 2]; this.cmp = cmp64(this.rlo(a), this.rhi(a), this.rlo(b), this.rhi(b)); pc += 3; break; }
+        case 0x31: { const a = code[pc + 1], b = code[pc + 2]; const lo = this.rlo(a) & this.rlo(b), hi = this.rhi(a) & this.rhi(b);
                      this.cmp = (lo === 0 && hi === 0) ? 0 : (hi < 0 ? -1 : 1); pc += 3; break; }
-        case 0x40: pc = pc + 5 + rd32(pc + 1); break;
-        case 0x41: pc = this.cmp === 0 ? pc + 5 + rd32(pc + 1) : pc + 5; break;
-        case 0x42: pc = this.cmp !== 0 ? pc + 5 + rd32(pc + 1) : pc + 5; break;
-        case 0x43: pc = this.cmp < 0 ? pc + 5 + rd32(pc + 1) : pc + 5; break;
-        case 0x44: pc = this.cmp >= 0 ? pc + 5 + rd32(pc + 1) : pc + 5; break;
-        case 0x45: pc = this.cmp <= 0 ? pc + 5 + rd32(pc + 1) : pc + 5; break;
-        case 0x46: pc = this.cmp > 0 ? pc + 5 + rd32(pc + 1) : pc + 5; break;
-        case 0x47: { const s = code[pc + 1]; pc = (RLO(s) === NIL && RHI(s) === 0) ? pc + 6 + rd32(pc + 2) : pc + 6; break; }
-        case 0x48: { const s = code[pc + 1]; pc = (RLO(s) !== NIL || RHI(s) !== 0) ? pc + 6 + rd32(pc + 2) : pc + 6; break; }
+        case 0x40: pc = pc + 5 + this.rd32(pc + 1); break;
+        case 0x41: pc = this.cmp === 0 ? pc + 5 + this.rd32(pc + 1) : pc + 5; break;
+        case 0x42: pc = this.cmp !== 0 ? pc + 5 + this.rd32(pc + 1) : pc + 5; break;
+        case 0x43: pc = this.cmp < 0 ? pc + 5 + this.rd32(pc + 1) : pc + 5; break;
+        case 0x44: pc = this.cmp >= 0 ? pc + 5 + this.rd32(pc + 1) : pc + 5; break;
+        case 0x45: pc = this.cmp <= 0 ? pc + 5 + this.rd32(pc + 1) : pc + 5; break;
+        case 0x46: pc = this.cmp > 0 ? pc + 5 + this.rd32(pc + 1) : pc + 5; break;
+        case 0x47: { const s = code[pc + 1]; pc = (this.rlo(s) === NIL && this.rhi(s) === 0) ? pc + 6 + this.rd32(pc + 2) : pc + 6; break; }
+        case 0x48: { const s = code[pc + 1]; pc = (this.rlo(s) !== NIL || this.rhi(s) !== 0) ? pc + 6 + this.rd32(pc + 2) : pc + 6; break; }
         case 0x50: case 0x51: {                                                                          // car / cdr: bare deref
-          const s = code[pc + 2], lo = RLO(s), hi = RHI(s);
+          const s = code[pc + 2], lo = this.rlo(s), hi = this.rhi(s);
           const a = lo + (op === 0x50 ? -1 : 7);
           if (hi !== 0 || (lo & 7) !== 1 || a < VBASE || a >= heapEnd) this.memFault((op === 0x50 ? 'car' : 'cdr') + ` of non-cons 0x${(lo >>> 0).toString(16)}`);
           const i = (a - VBASE) >> 2;
-          W(code[pc + 1], m32[i], m32[i + 1]); pc += 3; break;
+          this.setReg(code[pc + 1], m32[i], m32[i + 1]); pc += 3; break;
         }
-        case 0x52: { const a = code[pc + 2], b = code[pc + 3]; W(code[pc + 1], this.allocCons(RLO(a), RHI(a), RLO(b), RHI(b)), 0); pc += 4; break; }
+        case 0x52: { const a = code[pc + 2], b = code[pc + 3]; this.setReg(code[pc + 1], this.allocCons(this.rlo(a), this.rhi(a), this.rlo(b), this.rhi(b)), 0); pc += 4; break; }
         case 0x53: case 0x54: {                                                                          // setcar / setcdr
-          const c = code[pc + 1], lo = RLO(c), hi = RHI(c), s = code[pc + 2];
+          const c = code[pc + 1], lo = this.rlo(c), hi = this.rhi(c), s = code[pc + 2];
           const a = lo + (op === 0x53 ? -1 : 7);
           if (hi !== 0 || (lo & 7) !== 1 || a < VBASE || a >= heapEnd) this.memFault(`rplac on non-cons 0x${(lo >>> 0).toString(16)}`);
           const i = (a - VBASE) >> 2;
-          m32[i] = RLO(s); m32[i + 1] = RHI(s); pc += 3; break;
+          m32[i] = this.rlo(s); m32[i + 1] = this.rhi(s); pc += 3; break;
         }
-        case 0x55: { const s = code[pc + 2], lo = RLO(s); W(code[pc + 1], (!(lo === NIL && RHI(s) === 0) && (lo & 0xF) === 1) ? TV : NIL, 0); pc += 3; break; }
-        case 0x56: { const s = code[pc + 2], lo = RLO(s); W(code[pc + 1], (!(lo === NIL && RHI(s) === 0) && (lo & 0xF) === 1) ? NIL : TV, 0); pc += 3; break; }
+        case 0x55: { const s = code[pc + 2], lo = this.rlo(s); this.setReg(code[pc + 1], (!(lo === NIL && this.rhi(s) === 0) && (lo & 0xF) === 1) ? TV : NIL, 0); pc += 3; break; }
+        case 0x56: { const s = code[pc + 2], lo = this.rlo(s); this.setReg(code[pc + 1], (!(lo === NIL && this.rhi(s) === 0) && (lo & 0xF) === 1) ? NIL : TV, 0); pc += 3; break; }
         case 0x60: {                                                                                     // alloc-obj count subtag
           const count = code[pc + 2] | (code[pc + 3] << 8), subtag = code[pc + 4];
-          W(code[pc + 1], this.allocObj(count, subtag, true), 0); pc += 5; break;
+          this.setReg(code[pc + 1], this.allocObj(count, subtag, true), 0); pc += 5; break;
         }
         case 0x61: {                                                                                     // obj-ref Vd Vobj idx
           const vobj = code[pc + 2], idx = code[pc + 3];
           let a;
           if (vobj === 21) a = this.ebp + SLOT_BASE - 8 * idx;
-          else { const lo = RLO(vobj); a = lo + 7 + 8 * idx; if (RHI(vobj) !== 0 || a < VBASE || a >= heapEnd) this.memFault(`obj-ref on 0x${(lo >>> 0).toString(16)}`); }
+          else { const lo = this.rlo(vobj); a = lo + 7 + 8 * idx; if (this.rhi(vobj) !== 0 || a < VBASE || a >= heapEnd) this.memFault(`obj-ref on 0x${(lo >>> 0).toString(16)}`); }
           const i = (a - VBASE) >> 2;
-          W(code[pc + 1], m32[i], m32[i + 1]); pc += 4; break;
+          this.setReg(code[pc + 1], m32[i], m32[i + 1]); pc += 4; break;
         }
         case 0x62: {                                                                                     // obj-set Vobj idx Vs
           const vobj = code[pc + 1], idx = code[pc + 2], s = code[pc + 3];
           let a;
           if (vobj === 21) a = this.ebp + SLOT_BASE - 8 * idx;
-          else { const lo = RLO(vobj); a = lo + 7 + 8 * idx; if (RHI(vobj) !== 0 || a < VBASE || a >= heapEnd) this.memFault(`obj-set on 0x${(lo >>> 0).toString(16)}`); }
+          else { const lo = this.rlo(vobj); a = lo + 7 + 8 * idx; if (this.rhi(vobj) !== 0 || a < VBASE || a >= heapEnd) this.memFault(`obj-set on 0x${(lo >>> 0).toString(16)}`); }
           const i = (a - VBASE) >> 2;
-          m32[i] = RLO(s); m32[i + 1] = RHI(s); pc += 4; break;
+          m32[i] = this.rlo(s); m32[i + 1] = this.rhi(s); pc += 4; break;
         }
-        case 0x63: W(code[pc + 1], (RLO(code[pc + 2]) & 0xF) << 1, 0); pc += 3; break;                  // obj-tag
+        case 0x63: this.setReg(code[pc + 1], (this.rlo(code[pc + 2]) & 0xF) << 1, 0); pc += 3; break;                  // obj-tag
         case 0x64: {                                                                                     // obj-subtag (guarded)
-          const s = code[pc + 2], lo = RLO(s), hi = RHI(s);
+          const s = code[pc + 2], lo = this.rlo(s), hi = this.rhi(s);
           let r = 0;
           if ((lo & 0xF) === 9 && hi === 0 && lo !== TV && lo - 9 >= VBASE && lo - 9 < heapEnd) r = (m32[(lo - 9 - VBASE) >> 2] & 0xFF) << 1;
-          W(code[pc + 1], r, 0); pc += 3; break;
+          this.setReg(code[pc + 1], r, 0); pc += 3; break;
         }
         case 0x65: {                                                                                     // aref Vd Vobj Vidx
           const o = code[pc + 2], x = code[pc + 3];
-          const a = RLO(o) + RLO(x) * 4 + 7;
-          if (RHI(o) !== 0 || a < VBASE || a >= heapEnd) this.memFault('aref');
+          const a = this.rlo(o) + this.rlo(x) * 4 + 7;
+          if (this.rhi(o) !== 0 || a < VBASE || a >= heapEnd) this.memFault('aref');
           const i = (a - VBASE) >> 2;
-          W(code[pc + 1], m32[i], m32[i + 1]); pc += 4; break;
+          this.setReg(code[pc + 1], m32[i], m32[i + 1]); pc += 4; break;
         }
         case 0x66: {                                                                                     // aset Vobj Vidx Vs
           const o = code[pc + 1], x = code[pc + 2], s = code[pc + 3];
-          const a = RLO(o) + RLO(x) * 4 + 7;
-          if (RHI(o) !== 0 || a < VBASE || a >= heapEnd) this.memFault('aset');
+          const a = this.rlo(o) + this.rlo(x) * 4 + 7;
+          if (this.rhi(o) !== 0 || a < VBASE || a >= heapEnd) this.memFault('aset');
           const i = (a - VBASE) >> 2;
-          m32[i] = RLO(s); m32[i + 1] = RHI(s); pc += 4; break;
+          m32[i] = this.rlo(s); m32[i + 1] = this.rhi(s); pc += 4; break;
         }
         case 0x67: {                                                                                     // array-len (guarded)
-          const s = code[pc + 2], lo = RLO(s), hi = RHI(s);
+          const s = code[pc + 2], lo = this.rlo(s), hi = this.rhi(s);
           if ((lo & 0xF) === 9 && hi === 0 && lo !== TV && lo - 9 >= VBASE && lo - 9 < heapEnd) {
             const i = (lo - 9 - VBASE) >> 2;
             const cl = m32[i] >>> 8, ch = m32[i + 1];
-            shl64(cl | (ch << 24), ch >>> 8, 1); WR(code[pc + 1]);
-          } else W(code[pc + 1], 0, 0);
+            shl64(cl | (ch << 24), ch >>> 8, 1); this.setRegR(code[pc + 1]);
+          } else this.setReg(code[pc + 1], 0, 0);
           pc += 3; break;
         }
-        case 0x68: { const c = code[pc + 2]; W(code[pc + 1], this.allocObj(toNum(RLO(c), RHI(c)), 0x32, true), 0); pc += 3; break; }
+        case 0x68: { const c = code[pc + 2]; this.setReg(code[pc + 1], this.allocObj(toNum(this.rlo(c), this.rhi(c)), 0x32, true), 0); pc += 3; break; }
         case 0x70: {                                                                                     // load Vd Vaddr width
-          const s = code[pc + 2], a = RLO(s), w = code[pc + 3] & 3;
-          if (RHI(s) !== 0 || a < VBASE || a >= heapEnd) this.memFault(`load 0x${(a >>> 0).toString(16)}`);
-          if (w === 0) W(code[pc + 1], m8[a - VBASE], 0);
-          else if (w === 1) W(code[pc + 1], this.ld16(a), 0);
-          else if (w === 2) W(code[pc + 1], (a & 3) === 0 ? m32[(a - VBASE) >> 2] : this.dv.getInt32(a - VBASE, true), 0);
-          else if ((a & 3) === 0) { const i = (a - VBASE) >> 2; W(code[pc + 1], m32[i], m32[i + 1]); }
-          else W(code[pc + 1], this.dv.getInt32(a - VBASE, true), this.dv.getInt32(a - VBASE + 4, true));
+          const s = code[pc + 2], a = this.rlo(s), w = code[pc + 3] & 3;
+          if (this.rhi(s) !== 0 || a < VBASE || a >= heapEnd) this.memFault(`load 0x${(a >>> 0).toString(16)}`);
+          if (w === 0) this.setReg(code[pc + 1], m8[a - VBASE], 0);
+          else if (w === 1) this.setReg(code[pc + 1], this.ld16(a), 0);
+          else if (w === 2) this.setReg(code[pc + 1], (a & 3) === 0 ? m32[(a - VBASE) >> 2] : this.dv.getInt32(a - VBASE, true), 0);
+          else if ((a & 3) === 0) { const i = (a - VBASE) >> 2; this.setReg(code[pc + 1], m32[i], m32[i + 1]); }
+          else this.setReg(code[pc + 1], this.dv.getInt32(a - VBASE, true), this.dv.getInt32(a - VBASE + 4, true));
           pc += 4; break;
         }
         case 0x71: {                                                                                     // store Vaddr Vs width
-          const d = code[pc + 1], s = code[pc + 2], a = RLO(d), w = code[pc + 3] & 3;
-          if (RHI(d) !== 0 || a < VBASE || a >= heapEnd) this.memFault(`store 0x${(a >>> 0).toString(16)}`);
-          if (w === 0) m8[a - VBASE] = RLO(s) & 0xFF;
-          else if (w === 1) this.st16(a, RLO(s) & 0xFFFF);
-          else if (w === 2) { if ((a & 3) === 0) m32[(a - VBASE) >> 2] = RLO(s); else this.dv.setInt32(a - VBASE, RLO(s), true); }
-          else if ((a & 3) === 0) { const i = (a - VBASE) >> 2; m32[i] = RLO(s); m32[i + 1] = RHI(s); }
-          else { this.dv.setInt32(a - VBASE, RLO(s), true); this.dv.setInt32(a - VBASE + 4, RHI(s), true); }
+          const d = code[pc + 1], s = code[pc + 2], a = this.rlo(d), w = code[pc + 3] & 3;
+          if (this.rhi(d) !== 0 || a < VBASE || a >= heapEnd) this.memFault(`store 0x${(a >>> 0).toString(16)}`);
+          if (w === 0) m8[a - VBASE] = this.rlo(s) & 0xFF;
+          else if (w === 1) this.st16(a, this.rlo(s) & 0xFFFF);
+          else if (w === 2) { if ((a & 3) === 0) m32[(a - VBASE) >> 2] = this.rlo(s); else this.dv.setInt32(a - VBASE, this.rlo(s), true); }
+          else if ((a & 3) === 0) { const i = (a - VBASE) >> 2; m32[i] = this.rlo(s); m32[i + 1] = this.rhi(s); }
+          else { this.dv.setInt32(a - VBASE, this.rlo(s), true); this.dv.setInt32(a - VBASE + 4, this.rhi(s), true); }
           pc += 4; break;
         }
         case 0x72: pc += 1; break;
-        case 0x80: { this.doCall(rd32(pc + 1) >>> 0, pc + 5); pc = this.pc; break; }
-        case 0x81: { const s = code[pc + 1]; const t = this.fnAddrToOffset(RLO(s), RHI(s)); this.doCall(t, pc + 2); pc = this.pc; break; }
-        case 0x82: { this.doRet(); pc = this.pc; if (pc === RET_SENTINEL) return; break; }
-        case 0x83: { this.doTailcall(rd32(pc + 1) >>> 0); pc = this.pc; break; }
-        case 0x88: { const base = this.bump(16); this.zero(base, base + 16); this.markStart(base); this.markCons(base); W(code[pc + 1], base | 1, 0); pc += 2; break; }
+        case 0x80: case 0x81: {
+          const t = op === 0x80 ? this.rd32(pc + 1) >>> 0 : this.fnAddrToOffset(this.rlo(code[pc + 1]), this.rhi(code[pc + 1]));
+          const next = pc + (op === 0x80 ? 5 : 2);
+          const f = this.compiledFor(t);
+          if (f) { this.push(RET_SENTINEL, 0); this.enter(t); this.drive(f); pc = next; }   // compiled callee pops its own frame
+          else { this.doCall(t, next); pc = this.pc; }
+          break;
+        }
+        case 0x82: { this.doRet(); pc = this.pc; break; }
+        case 0x83: {
+          const t = this.rd32(pc + 1) >>> 0;
+          this.doTailcall(t);
+          const f = this.compiledFor(t);
+          if (f) { this.drive(f); pc = this.pc; }                             // returns to our caller's pc
+          else pc = this.pc;
+          break;
+        }
+        case 0x88: { const base = this.bump(16); this.zero(base, base + 16); this.markStart(base); this.markCons(base); this.setReg(code[pc + 1], base | 1, 0); pc += 2; break; }
         case 0x89: { if (this.va >= this.vl) this.gc(); pc += 1; break; }
         case 0x8A: pc += 2; break;
         case 0x8B: pc += 1; break;
         case 0x90: case 0x91: this.fault('save-ctx/restore-ctx not supported');
         case 0x92: pc += 1; break;
         case 0x93: {                                                                                     // atomic-xchg
-          const x = code[pc + 2], a = RLO(x), s = code[pc + 3];
-          if (RHI(x) !== 0 || a < VBASE || a >= heapEnd) this.memFault('xchg');
+          const x = code[pc + 2], a = this.rlo(x), s = code[pc + 3];
+          if (this.rhi(x) !== 0 || a < VBASE || a >= heapEnd) this.memFault('xchg');
           const i = (a - VBASE) >> 2, ol = m32[i], oh = m32[i + 1];
-          m32[i] = RLO(s); m32[i + 1] = RHI(s);
-          W(code[pc + 1], ol, oh); pc += 4; break;
+          m32[i] = this.rlo(s); m32[i + 1] = this.rhi(s);
+          this.setReg(code[pc + 1], ol, oh); pc += 4; break;
         }
         case 0xA0: case 0xA1: case 0xA2: case 0xA3: case 0xA4: this.fault('port I/O / halt / cli / sti not supported');
         case 0xA5: case 0xA6: this.fault('percpu ops not supported');
-        case 0xA7: { const t = rd32(pc + 2) >>> 0; W(code[pc + 1], t === FN_UNRESOLVED ? NIL : ((t << 4) | 3), 0); pc += 6; break; }
+        case 0xA7: { const t = this.rd32(pc + 2) >>> 0; this.setReg(code[pc + 1], t === FN_UNRESOLVED ? NIL : ((t << 4) | 3), 0); pc += 6; break; }
         case 0xA8: case 0xA9: {                                                                          // mul26lo / mul26hi
           const a = code[pc + 2], b = code[pc + 3];
-          sar64(RLO(a), RHI(a), 1); const xl = RL, xh = RH;
-          sar64(RLO(b), RHI(b), 1); const yl = RL, yh = RH;
+          sar64(this.rlo(a), this.rhi(a), 1); const xl = RL, xh = RH;
+          sar64(this.rlo(b), this.rhi(b), 1); const yl = RL, yh = RH;
           const p = toBig(xl, xh) * toBig(yl, yh);
           fromBig(op === 0xA8 ? ((p & 0x3FFFFFFn) << 1n) : (((p >> 26n) & 0xFFFFFFFFFFFFFFFFn) << 1n));
-          WR(code[pc + 1]); pc += 4; break;
+          this.setRegR(code[pc + 1]); pc += 4; break;
         }
         case 0xAA: case 0xAB: {                                                                          // mul64lo / mul64hi (raw unsigned)
           const a = code[pc + 2], b = code[pc + 3];
-          const p = BigInt.asUintN(64, toBig(RLO(a), RHI(a))) * BigInt.asUintN(64, toBig(RLO(b), RHI(b)));
-          fromBig(op === 0xAA ? p : (p >> 64n)); WR(code[pc + 1]); pc += 4; break;
+          const p = BigInt.asUintN(64, toBig(this.rlo(a), this.rhi(a))) * BigInt.asUintN(64, toBig(this.rlo(b), this.rhi(b)));
+          fromBig(op === 0xAA ? p : (p >> 64n)); this.setRegR(code[pc + 1]); pc += 4; break;
         }
         case 0xAC: {                                                                                     // acc128 Vaddr Vlo Vhi
-          const x = code[pc + 1], a = RLO(x), l = code[pc + 2], h = code[pc + 3];
-          if (RHI(x) !== 0 || a < VBASE || a >= heapEnd) this.memFault('acc128');
+          const x = code[pc + 1], a = this.rlo(x), l = code[pc + 2], h = code[pc + 3];
+          if (this.rhi(x) !== 0 || a < VBASE || a >= heapEnd) this.memFault('acc128');
           const i = (a - VBASE) >> 2;
           const cur = BigInt.asUintN(64, toBig(m32[i], m32[i + 1])) | (BigInt.asUintN(64, toBig(m32[i + 2], m32[i + 3])) << 64n);
-          const add = BigInt.asUintN(64, toBig(RLO(l), RHI(l))) | (BigInt.asUintN(64, toBig(RLO(h), RHI(h))) << 64n);
+          const add = BigInt.asUintN(64, toBig(this.rlo(l), this.rhi(l))) | (BigInt.asUintN(64, toBig(this.rlo(h), this.rhi(h))) << 64n);
           const r = BigInt.asUintN(128, cur + add);
           fromBig(r & 0xFFFFFFFFFFFFFFFFn); m32[i] = RL; m32[i + 1] = RH;
           fromBig(r >> 64n); m32[i + 2] = RL; m32[i + 3] = RH;
@@ -1102,7 +1129,7 @@ class MVM {
         }
         case 0xAD: case 0xAE: case 0xAF: {                                                               // mul/add/sub-checked
           const vd = code[pc + 1], a = code[pc + 2], b = code[pc + 3];
-          const al = RLO(a), ah = RHI(a), bl = RLO(b), bh = RHI(b);
+          const al = this.rlo(a), ah = this.rhi(a), bl = this.rlo(b), bh = this.rhi(b);
           let ovf = false, gen;
           if (op === 0xAE) { add64(al, ah, bl, bh); ovf = ((ah ^ RH) & (bh ^ RH)) < 0; gen = this.genAdd; }
           else if (op === 0xAF) { sub64(al, ah, bl, bh); ovf = ((ah ^ bh) & (ah ^ RH)) < 0; gen = this.genSub; }
@@ -1117,79 +1144,374 @@ class MVM {
               fromBig(p);
             }
           }
-          if (!ovf || !gen) WR(vd);
-          else { this.callLisp(gen, [[al, ah], [bl, bh]]); WR(vd); }
+          if (!ovf || !gen) this.setRegR(vd);
+          else { this.callLisp(gen, [[al, ah], [bl, bh]]); this.setRegR(vd); }
           pc += 4; break;
         }
         case 0xB0: {                                                                                     // sap-new
           const s = code[pc + 2];
-          const base = this.bump(16); this.st64(base, 0x116, 0); this.st64(base + 8, RLO(s), RHI(s)); this.markStart(base);
-          W(code[pc + 1], base | 9, 0); pc += 3; break;
+          const base = this.bump(16); this.st64(base, 0x116, 0); this.st64(base + 8, this.rlo(s), this.rhi(s)); this.markStart(base);
+          this.setReg(code[pc + 1], base | 9, 0); pc += 3; break;
         }
         case 0xB1: case 0xB2: case 0xB3: {
           const s = code[pc + 2], o = code[pc + 3];
-          sar64(RLO(o), RHI(o), 1);
-          const a = this.ldlo(RLO(s) - 9 + 8) + RL;
+          sar64(this.rlo(o), this.rhi(o), 1);
+          const a = this.ldlo(this.rlo(s) - 9 + 8) + RL;
           if (a < VBASE || a >= heapEnd) this.memFault('sap-ref');
-          if (op === 0xB1) W(code[pc + 1], m8[a - VBASE] << 1, 0);
-          else if (op === 0xB2) { fromNum(this.dv.getUint32(a - VBASE, true) * 2); WR(code[pc + 1]); }
-          else { const i = (a - VBASE) >> 2; W(code[pc + 1], m32[i], m32[i + 1]); }
+          if (op === 0xB1) this.setReg(code[pc + 1], m8[a - VBASE] << 1, 0);
+          else if (op === 0xB2) { fromNum(this.dv.getUint32(a - VBASE, true) * 2); this.setRegR(code[pc + 1]); }
+          else { const i = (a - VBASE) >> 2; this.setReg(code[pc + 1], m32[i], m32[i + 1]); }
           pc += 4; break;
         }
         case 0xB4: case 0xB5: case 0xB6: {
           const s = code[pc + 1], o = code[pc + 2], v = code[pc + 3];
-          sar64(RLO(o), RHI(o), 1);
-          const a = this.ldlo(RLO(s) - 9 + 8) + RL;
+          sar64(this.rlo(o), this.rhi(o), 1);
+          const a = this.ldlo(this.rlo(s) - 9 + 8) + RL;
           if (a < VBASE || a >= heapEnd) this.memFault('sap-set');
-          if (op === 0xB4) m8[a - VBASE] = (RLO(v) >> 1) & 0xFF;
-          else if (op === 0xB5) { sar64(RLO(v), RHI(v), 1); this.dv.setInt32(a - VBASE, RL, true); }
-          else { const i = (a - VBASE) >> 2; m32[i] = RLO(v); m32[i + 1] = RHI(v); }
+          if (op === 0xB4) m8[a - VBASE] = (this.rlo(v) >> 1) & 0xFF;
+          else if (op === 0xB5) { sar64(this.rlo(v), this.rhi(v), 1); this.dv.setInt32(a - VBASE, RL, true); }
+          else { const i = (a - VBASE) >> 2; m32[i] = this.rlo(v); m32[i + 1] = this.rhi(v); }
           pc += 4; break;
         }
-        case 0xB7: { const s = code[pc + 2]; const a = RLO(s) - 9 + 8; shl64(this.ldlo(a), this.ldhi(a), 1); WR(code[pc + 1]); pc += 3; break; }
+        case 0xB7: { const s = code[pc + 2]; const a = this.rlo(s) - 9 + 8; shl64(this.ldlo(a), this.ldhi(a), 1); this.setRegR(code[pc + 1]); pc += 3; break; }
         case 0xB8: this.st64(A_MVCOUNT, code[pc + 1] << 1, 0); pc += 2; break;
-        case 0xB9: { const c = code[pc + 2]; W(code[pc + 1], this.allocObj(toNum(RLO(c), RHI(c)), 0x31, false), 0); pc += 3; break; }
-        case 0xBA: { const s = code[pc + 1]; this.st64(A_CENV, RLO(s), RHI(s)); pc += 2; break; }
-        case 0xBB: W(code[pc + 1], this.ldlo(A_CENV), this.ldhi(A_CENV)); pc += 2; break;
+        case 0xB9: { const c = code[pc + 2]; this.setReg(code[pc + 1], this.allocObj(toNum(this.rlo(c), this.rhi(c)), 0x31, false), 0); pc += 3; break; }
+        case 0xBA: { const s = code[pc + 1]; this.st64(A_CENV, this.rlo(s), this.rhi(s)); pc += 2; break; }
+        case 0xBB: this.setReg(code[pc + 1], this.ldlo(A_CENV), this.ldhi(A_CENV)); pc += 2; break;
         case 0xBC: this.st32(A_NARGS, code[pc + 1]); pc += 2; break;
-        case 0xBD: W(code[pc + 1], this.ld32(A_NARGS) << 1, 0); pc += 2; break;
+        case 0xBD: this.setReg(code[pc + 1], this.ld32(A_NARGS) << 1, 0); pc += 2; break;
         case 0xBE: case 0xBF: case 0xC0: case 0xC1: {
-          const x = this.floatVal(RLO(code[pc + 2])), y = this.floatVal(RLO(code[pc + 3]));
+          const x = this.floatVal(this.rlo(code[pc + 2])), y = this.floatVal(this.rlo(code[pc + 3]));
           const r = op === 0xBE ? x + y : op === 0xBF ? x - y : op === 0xC0 ? x * y : x / y;
-          W(code[pc + 1], this.allocFloat(r), 0); pc += 4; break;
+          this.setReg(code[pc + 1], this.allocFloat(r), 0); pc += 4; break;
         }
-        case 0xC2: { const s = code[pc + 2]; sar64(RLO(s), RHI(s), 1); W(code[pc + 1], this.allocFloat(toNum(RL, RH)), 0); pc += 3; break; }
+        case 0xC2: { const s = code[pc + 2]; sar64(this.rlo(s), this.rhi(s), 1); this.setReg(code[pc + 1], this.allocFloat(toNum(RL, RH)), 0); pc += 3; break; }
         case 0xC3: {                                                                                     // ftoi (cvttsd2si)
-          const d = this.floatVal(RLO(code[pc + 2]));
+          const d = this.floatVal(this.rlo(code[pc + 2]));
           const t = Math.trunc(d);
           if (Number.isFinite(t) && t >= -9223372036854775808 && t < 9223372036854775808) {
             if (Math.abs(t) < 4503599627370496) fromNum(t * 2); else fromBig(BigInt(t) << 1n);
           } else { RL = 0; RH = 0; }
-          WR(code[pc + 1]); pc += 3; break;
+          this.setRegR(code[pc + 1]); pc += 3; break;
         }
-        case 0xC4: { const x = this.floatVal(RLO(code[pc + 1])), y = this.floatVal(RLO(code[pc + 2])); this.cmp = x < y ? -1 : x > y ? 1 : 0; pc += 3; break; }
+        case 0xC4: { const x = this.floatVal(this.rlo(code[pc + 1])), y = this.floatVal(this.rlo(code[pc + 2])); this.cmp = x < y ? -1 : x > y ? 1 : 0; pc += 3; break; }
         case 0xC5: case 0xC6: {
-          const a = code[pc + 2], b = code[pc + 3], al = RLO(a), ah = RHI(a), bl = RLO(b), bh = RHI(b);
+          const a = code[pc + 2], b = code[pc + 3], al = this.rlo(a), ah = this.rhi(a), bl = this.rlo(b), bh = this.rhi(b);
           if (op === 0xC5) { add64(al, ah, bl, bh); this.ovf = ((ah ^ RH) & (bh ^ RH)) < 0; }
           else { sub64(al, ah, bl, bh); this.ovf = ((ah ^ bh) & (ah ^ RH)) < 0; }
-          WR(code[pc + 1]); pc += 4; break;
+          this.setRegR(code[pc + 1]); pc += 4; break;
         }
-        case 0xC7: pc = this.ovf ? pc + 5 + rd32(pc + 1) : pc + 5; break;
+        case 0xC7: pc = this.ovf ? pc + 5 + this.rd32(pc + 1) : pc + 5; break;
         case 0xC8: {                                                                                     // alloc-u8 (tagged count)
-          const c = code[pc + 2]; sar64(RLO(c), RHI(c), 1); const n = toNum(RL, RH), total = align16(16 + n);
+          const c = code[pc + 2]; sar64(this.rlo(c), this.rhi(c), 1); const n = toNum(RL, RH), total = align16(16 + n);
           const base = this.bump(total); this.zero(base + 8, base + total);
           this.st64(base, ((n << 8) | 0x11) | 0, Math.floor(n / 16777216) | 0); this.markStart(base);
-          W(code[pc + 1], base | 9, 0); pc += 3; break;
+          this.setReg(code[pc + 1], base | 9, 0); pc += 3; break;
         }
-        case 0xC9: { const arr = code[pc + 2], x = code[pc + 3]; const a = RLO(arr) + (RLO(x) >> 1) + 7;
-                     if (RHI(arr) !== 0 || a < VBASE || a >= heapEnd) this.memFault('u8-ref');
-                     W(code[pc + 1], m8[a - VBASE] << 1, 0); pc += 4; break; }
-        case 0xCA: { const arr = code[pc + 1], x = code[pc + 2]; const a = RLO(arr) + (RLO(x) >> 1) + 7;
-                     if (RHI(arr) !== 0 || a < VBASE || a >= heapEnd) this.memFault('u8-set');
-                     m8[a - VBASE] = (RLO(code[pc + 3]) >> 1) & 0xFF; pc += 4; break; }
+        case 0xC9: { const arr = code[pc + 2], x = code[pc + 3]; const a = this.rlo(arr) + (this.rlo(x) >> 1) + 7;
+                     if (this.rhi(arr) !== 0 || a < VBASE || a >= heapEnd) this.memFault('u8-ref');
+                     this.setReg(code[pc + 1], m8[a - VBASE] << 1, 0); pc += 4; break; }
+        case 0xCA: { const arr = code[pc + 1], x = code[pc + 2]; const a = this.rlo(arr) + (this.rlo(x) >> 1) + 7;
+                     if (this.rhi(arr) !== 0 || a < VBASE || a >= heapEnd) this.memFault('u8-set');
+                     m8[a - VBASE] = (this.rlo(code[pc + 3]) >> 1) & 0xFF; pc += 4; break; }
         default: this.fault(`unknown opcode 0x${op.toString(16)}`);
       }
     }
+    return pc;
+  }
+
+  // Overflowing checked arithmetic: the generic (bignum) entry, or wrap if
+  // the module has none.  Result in RL/RH.
+  checkedSlow(op, al, ah, bl, bh) {
+    const gen = op === 0xAE ? this.genAdd : op === 0xAF ? this.genSub : this.genMul;
+    if (op === 0xAD) {
+      sar64(al, ah, 1);
+      const p = toBig(RL, RH) * toBig(bl, bh);
+      if (p === BigInt.asIntN(64, p) || !gen) { fromBig(p); return; }
+    } else if (!gen) { if (op === 0xAE) add64(al, ah, bl, bh); else sub64(al, ah, bl, bh); return; }
+    this.callLisp(gen, [[al, ah], [bl, bh]]);
+  }
+
+  // -- calls from JS: compiled or interpreted ----------------------------------
+  // Push a return marker, build the callee frame, run the callee to completion.
+  // A compiled callee pops its own frame; the interpreter's RET does the same.
+  callFn(t) {
+    this.push(RET_SENTINEL, 0);
+    this.enter(t);
+    const f = this.compiledFor(t);
+    if (f) this.drive(f);
+    else this.run();
+  }
+  // The driver: runs translated functions without JS recursion.  A translated
+  // function returns -1 when it has returned (frame already popped), or
+  // target*2 (+1 for a tail call) when it wants to call; the driver keeps the
+  // continuation (function, resume label, frame) stack itself.  Interpreted
+  // callees run in a nested run() and pop their own frame.  A longjmp unwinds
+  // the continuation stack to the frame it targets.
+  drive(f) {
+    // continuation stack: three parallel arrays, no per-call allocation
+    const cf = this.contF, cl = this.contL, ce = this.contE;
+    const base = this.contDepth;
+    let d = base;
+    let L = 0, ebp = this.ebp;
+    try {
+      for (;;) {
+        let r;
+        try { r = f(this, L); }
+        catch (e) {
+          if (!(e instanceof LongJmp)) throw e;
+          // find the frame the longjmp restored, in this driver's segment
+          let found = false;
+          if (ebp === this.ebp && f.RES && f.RES[e.ip] !== undefined) { L = f.RES[e.ip]; found = true; }
+          while (!found && d > base) {
+            d--;
+            if (ce[d] === this.ebp && cf[d].RES && cf[d].RES[e.ip] !== undefined) { f = cf[d]; L = cf[d].RES[e.ip]; ebp = ce[d]; found = true; }
+          }
+          if (!found) throw e;
+          continue;
+        }
+        if (r < 0) {                            // returned
+          if (d === base) return;
+          d--; f = cf[d]; L = cl[d]; ebp = ce[d];
+          continue;
+        }
+        const t = r >> 1;
+        if ((r & 1) === 0) {
+          if (d >= cf.length) { cf.push(null); cl.push(0); ce.push(0); }
+          cf[d] = f; cl[d] = this.resumeL; ce[d] = ebp; d++;
+        }
+        const g = this.compiledFor(t);
+        if (g) { f = g; L = 0; ebp = this.ebp; }
+        else {
+          this.contDepth = d;
+          this.run();                           // interpreted callee, pops its frame
+          if (d === base) return;
+          d--; f = cf[d]; L = cl[d]; ebp = ce[d];
+        }
+      }
+    } finally { this.contDepth = base; }
+  }
+  // Translate a function once it has been called a few times: the module has
+  // thousands of functions (some with 10k-instruction &rest ladders) and
+  // generating + parsing JS for cold ones costs more than interpreting them.
+  compiledFor(t) {
+    if (!this.compileOn || this.trace > 1) return null;
+    const f = this.compiled.get(t);
+    if (f !== undefined) return f;
+    const n = (this.callCounts.get(t) || 0) + 1;
+    if (n < this.compileThreshold) { this.callCounts.set(t, n); return null; }
+    const t0 = performance.now();
+    const g = this.compileFn(t);
+    this.compileStats.ms += performance.now() - t0;
+    this.compiled.set(t, g);
+    return g;
+  }
+
+  // -- bytecode -> JS translation ---------------------------------------------
+  // One bytecode function becomes one JS function: its basic blocks are cases
+  // of a switch driven by a label variable, registers stay in the memory
+  // frame (so GC roots and longjmp are exactly as for interpreted code), the
+  // hot opcodes are open-coded and everything else is delegated to
+  // execInsn().  Calls run the callee to completion as a JS call; RET pops
+  // the frame and returns.  A function containing SETJMP gets a catch that
+  // resumes at the recorded block when a longjmp lands in its frame.
+  compileFn(entry) {
+    const m8 = this.m8;
+    const rd32 = (p) => (m8[p] | (m8[p + 1] << 8) | (m8[p + 2] << 16) | (m8[p + 3] << 24));
+    // 1. explore the control-flow graph
+    const starts = new Set([entry]);
+    const seen = new Set();
+    const work = [entry];
+    const insns = [];                          // [pc, op, len]
+    let hasSetjmp = false;
+    while (work.length) {
+      let pc = work.pop();
+      while (!seen.has(pc)) {
+        seen.add(pc);
+        const op = m8[pc], len = INSN_LEN[op];
+        if (len === 0) { this.compileStats.failed++; return null; }
+        insns.push([pc, op, len]);
+        if (op >= 0x40 && op <= 0x46 || op === 0xC7) {
+          const t = pc + len + rd32(pc + 1); starts.add(t); work.push(t);
+          if (op === 0x40) break;
+          starts.add(pc + len);
+        } else if (op === 0x47 || op === 0x48) {
+          const t = pc + len + rd32(pc + 2); starts.add(t); work.push(t); starts.add(pc + len);
+        } else if (op === 0x82 || op === 0x83) break;
+        else if (op === 0x80 || op === 0x81) starts.add(pc + len);
+        else if (op === 0x02 && (m8[pc + 1] | (m8[pc + 2] << 8)) === 0x0510) { hasSetjmp = true; starts.add(pc + len); }
+        else if (op === 0x90 || op === 0x91 || op === 0xA2 || op === 0x01) { this.compileStats.failed++; return null; }
+        pc += len;
+      }
+    }
+    insns.sort((a, b) => a[0] - b[0]);
+    const label = new Map(); let nl = 0;
+    for (const [pc] of insns) if (starts.has(pc)) label.set(pc, nl++);
+    // 2. emit
+    const OFF = (v) => (ROFF[v] >> 2);
+    const lo = (v) => v < 16 ? `m32[fb+(${OFF(v)})]` : v === 16 ? 'vm.vrl' : v === 17 ? 'vm.va' : v === 18 ? 'vm.vl' : v === 19 ? `${NIL}` : v === 20 ? 'vm.esp' : v === 21 ? 'vm.ebp' : 'vm.pc';
+    const hi = (v) => v < 16 ? `m32[fb+(${OFF(v) + 1})]` : v === 16 ? 'vm.vrh' : '0';
+    const W = (v, l, h) => v < 16 ? `m32[fb+(${OFF(v)})]=${l};m32[fb+(${OFF(v) + 1})]=${h};` : v === 16 ? `vm.vrl=${l};vm.vrh=${h};` : `vm.setReg(${v},${l},${h});`;
+    const WR = (v) => W(v, 'RL', 'RH');
+    const J = (t) => `{L=${label.get(t)};continue;}`;
+    const chk = (l, h, a, what) => `if(${h}!==0||${a}<${VBASE}||${a}>=HE)vm.memFault(${JSON.stringify(what)});`;
+    let out = '';
+    for (const [pc, op, len] of insns) {
+      if (label.has(pc)) out += `case ${label.get(pc)}:\n`;
+      const b1 = m8[pc + 1], b2 = m8[pc + 2], b3 = m8[pc + 3], b4 = m8[pc + 4];
+      const P = `vm.pc=${pc};`;
+      switch (op) {
+        case 0x00: break;
+        case 0x02: {
+          const c = b1 | (b2 << 8);
+          if (c < 0x100 && c <= 4) break;                                   // frame-enter, nothing to copy
+          if (c >= 0x100 && c < 0x300) break;
+          out += `${P}vm.trap(${c},${pc + len});`;
+          if (c === 0x0510) out += `fb=(vm.ebp-${VBASE})>>2;`;
+          break;
+        }
+        case 0x10: out += W(b1, lo(b2), hi(b2)); break;
+        case 0x11: out += W(b1, `${rd32(pc + 2)}`, `${rd32(pc + 6)}`); break;
+        case 0x12: out += `vm.push(${lo(b1)},${hi(b1)});`; break;
+        case 0x13: out += `vm.pop();${WR(b1)}`; break;
+        case 0x20: out += `add64(${lo(b2)},${hi(b2)},${lo(b3)},${hi(b3)});${WR(b1)}`; break;
+        case 0x21: out += `sub64(${lo(b2)},${hi(b2)},${lo(b3)},${hi(b3)});${WR(b1)}`; break;
+        case 0x22: out += `sar64(${lo(b2)},${hi(b2)},1);mul64(RL,RH,${lo(b3)},${hi(b3)});${WR(b1)}`; break;
+        case 0x25: out += `sub64(0,0,${lo(b2)},${hi(b2)});${WR(b1)}`; break;
+        case 0x26: out += `add64(${lo(b1)},${hi(b1)},2,0);${WR(b1)}`; break;
+        case 0x27: out += `sub64(${lo(b1)},${hi(b1)},2,0);${WR(b1)}`; break;
+        case 0x28: out += W(b1, `${lo(b2)}&${lo(b3)}`, `${hi(b2)}&${hi(b3)}`); break;
+        case 0x29: out += W(b1, `${lo(b2)}|${lo(b3)}`, `${hi(b2)}|${hi(b3)}`); break;
+        case 0x2A: out += W(b1, `${lo(b2)}^${lo(b3)}`, `${hi(b2)}^${hi(b3)}`); break;
+        case 0x2B: out += `shl64(${lo(b2)},${hi(b2)},${b3});${WR(b1)}`; break;
+        case 0x2C: out += `shr64(${lo(b2)},${hi(b2)},${b3});${WR(b1)}`; break;
+        case 0x2D: out += `sar64(${lo(b2)},${hi(b2)},${b3});${WR(b1)}`; break;
+        case 0x30: out += `cmp=cmp64(${lo(b1)},${hi(b1)},${lo(b2)},${hi(b2)});`; break;
+        case 0x31: out += `{const l=${lo(b1)}&${lo(b2)},h=${hi(b1)}&${hi(b2)};cmp=(l===0&&h===0)?0:(h<0?-1:1);}`; break;
+        case 0x14: {
+          const idx = rd32(pc + 2);
+          if (pc >= JIT_PHYS) out += `{const v=vm.ldlo(${A_WEB_CONSTS});if(v===0)vm.fault('li-const: no constant vector');const a=v+${7 + 8 * idx};${W(b1, 'vm.ldlo(a)', 'vm.ldhi(a)')}}`;
+          else { const off = this.mod.addrTable[idx] | 0; out += W(b1, `${off === 0 ? 0 : POOL_ADDR + off}`, '0'); }
+          break;
+        }
+        case 0x68: out += `${P}${W(b1, `vm.allocObj(toNum(${lo(b2)},${hi(b2)}),0x32,true)`, '0')}`; break;
+        case 0xB9: out += `${P}${W(b1, `vm.allocObj(toNum(${lo(b2)},${hi(b2)}),0x31,false)`, '0')}`; break;
+        case 0xC9: out += `${P}{const a=${lo(b2)}+(${lo(b3)}>>1)+7;${chk(lo(b2), hi(b2), 'a', 'u8-ref')}${W(b1, `m8[a-${VBASE}]<<1`, '0')}}`; break;
+        case 0xCA: out += `${P}{const a=${lo(b1)}+(${lo(b2)}>>1)+7;${chk(lo(b1), hi(b1), 'a', 'u8-set')}m8[a-${VBASE}]=(${lo(b3)}>>1)&255;}`; break;
+        case 0x40: out += J(pc + len + rd32(pc + 1)); break;
+        case 0x41: out += `if(cmp===0)${J(pc + len + rd32(pc + 1))}`; break;
+        case 0x42: out += `if(cmp!==0)${J(pc + len + rd32(pc + 1))}`; break;
+        case 0x43: out += `if(cmp<0)${J(pc + len + rd32(pc + 1))}`; break;
+        case 0x44: out += `if(cmp>=0)${J(pc + len + rd32(pc + 1))}`; break;
+        case 0x45: out += `if(cmp<=0)${J(pc + len + rd32(pc + 1))}`; break;
+        case 0x46: out += `if(cmp>0)${J(pc + len + rd32(pc + 1))}`; break;
+        case 0x47: out += `if(${lo(b1)}===${NIL}&&${hi(b1)}===0)${J(pc + len + rd32(pc + 2))}`; break;
+        case 0x48: out += `if(${lo(b1)}!==${NIL}||${hi(b1)}!==0)${J(pc + len + rd32(pc + 2))}`; break;
+        case 0x50: case 0x51: {
+          const d = op === 0x50 ? -1 : 7;
+          out += `${P}{const l=${lo(b2)},a=l+(${d});if(${hi(b2)}!==0||(l&7)!==1||a<${VBASE}||a>=HE)vm.memFault('car/cdr of non-cons');const i=(a-${VBASE})>>2;${W(b1, 'm32[i]', 'm32[i+1]')}}`;
+          break;
+        }
+        case 0x52: out += `${P}${W(b1, `vm.allocCons(${lo(b2)},${hi(b2)},${lo(b3)},${hi(b3)})`, '0')}`; break;
+        case 0x53: case 0x54: {
+          const d = op === 0x53 ? -1 : 7;
+          out += `${P}{const l=${lo(b1)},a=l+(${d});if(${hi(b1)}!==0||(l&7)!==1||a<${VBASE}||a>=HE)vm.memFault('rplac on non-cons');const i=(a-${VBASE})>>2;m32[i]=${lo(b2)};m32[i+1]=${hi(b2)};}`;
+          break;
+        }
+        case 0x55: out += `{const l=${lo(b2)};${W(b1, `(!(l===${NIL}&&${hi(b2)}===0)&&(l&15)===1)?${TV}:${NIL}`, '0')}}`; break;
+        case 0x56: out += `{const l=${lo(b2)};${W(b1, `(!(l===${NIL}&&${hi(b2)}===0)&&(l&15)===1)?${NIL}:${TV}`, '0')}}`; break;
+        case 0x60: out += `${P}${W(b1, `vm.allocObj(${b2 | (b3 << 8)},${b4},true)`, '0')}`; break;
+        case 0x61: {
+          if (b2 === 21) out += `{const i=fb+(${(SLOT_BASE >> 2) - 2 * b3});${W(b1, 'm32[i]', 'm32[i+1]')}}`;
+          else out += `${P}{const a=${lo(b2)}+${7 + 8 * b3};${chk(lo(b2), hi(b2), 'a', 'obj-ref')}const i=(a-${VBASE})>>2;${W(b1, 'm32[i]', 'm32[i+1]')}}`;
+          break;
+        }
+        case 0x62: {
+          if (b1 === 21) out += `{const i=fb+(${(SLOT_BASE >> 2) - 2 * b2});m32[i]=${lo(b3)};m32[i+1]=${hi(b3)};}`;
+          else out += `${P}{const a=${lo(b1)}+${7 + 8 * b2};${chk(lo(b1), hi(b1), 'a', 'obj-set')}const i=(a-${VBASE})>>2;m32[i]=${lo(b3)};m32[i+1]=${hi(b3)};}`;
+          break;
+        }
+        case 0x63: out += W(b1, `(${lo(b2)}&15)<<1`, '0'); break;
+        case 0x64: out += `{const l=${lo(b2)};let r=0;if((l&15)===9&&${hi(b2)}===0&&l!==${TV}&&l-9>=${VBASE}&&l-9<HE)r=(m32[(l-9-${VBASE})>>2]&255)<<1;${W(b1, 'r', '0')}}`; break;
+        case 0x65: out += `${P}{const a=${lo(b2)}+${lo(b3)}*4+7;${chk(lo(b2), hi(b2), 'a', 'aref')}const i=(a-${VBASE})>>2;${W(b1, 'm32[i]', 'm32[i+1]')}}`; break;
+        case 0x66: out += `${P}{const a=${lo(b1)}+${lo(b2)}*4+7;${chk(lo(b1), hi(b1), 'a', 'aset')}const i=(a-${VBASE})>>2;m32[i]=${lo(b3)};m32[i+1]=${hi(b3)};}`; break;
+        case 0x67: out += `{const l=${lo(b2)};if((l&15)===9&&${hi(b2)}===0&&l!==${TV}&&l-9>=${VBASE}&&l-9<HE){const i=(l-9-${VBASE})>>2,cl=m32[i]>>>8,ch=m32[i+1];shl64(cl|(ch<<24),ch>>>8,1);${WR(b1)}}else{${W(b1, '0', '0')}}}`; break;
+        case 0x70: {
+          const w = b3 & 3;
+          out += `${P}{const a=${lo(b2)};${chk(lo(b2), hi(b2), 'a', 'load')}`;
+          if (w === 0) out += W(b1, `m8[a-${VBASE}]`, '0');
+          else if (w === 1) out += W(b1, `vm.ld16(a)`, '0');
+          else if (w === 2) out += W(b1, `((a&3)===0?m32[(a-${VBASE})>>2]:vm.dv.getInt32(a-${VBASE},true))`, '0');
+          else out += `if((a&3)===0){const i=(a-${VBASE})>>2;${W(b1, 'm32[i]', 'm32[i+1]')}}else{${W(b1, `vm.dv.getInt32(a-${VBASE},true)`, `vm.dv.getInt32(a-${VBASE}+4,true)`)}}`;
+          out += '}';
+          break;
+        }
+        case 0x71: {
+          const w = b3 & 3;
+          out += `${P}{const a=${lo(b1)};${chk(lo(b1), hi(b1), 'a', 'store')}`;
+          if (w === 0) out += `m8[a-${VBASE}]=${lo(b2)}&255;`;
+          else if (w === 1) out += `vm.st16(a,${lo(b2)}&65535);`;
+          else if (w === 2) out += `if((a&3)===0)m32[(a-${VBASE})>>2]=${lo(b2)};else vm.dv.setInt32(a-${VBASE},${lo(b2)},true);`;
+          else out += `if((a&3)===0){const i=(a-${VBASE})>>2;m32[i]=${lo(b2)};m32[i+1]=${hi(b2)};}else{vm.dv.setInt32(a-${VBASE},${lo(b2)},true);vm.dv.setInt32(a-${VBASE}+4,${hi(b2)},true);}`;
+          out += '}';
+          break;
+        }
+        case 0x72: case 0x8A: case 0x8B: case 0x92: break;
+        case 0x80: case 0x81: {
+          const t = op === 0x80 ? `${rd32(pc + 1) >>> 0}` : `vm.fnAddrToOffset(${lo(b1)},${hi(b1)})`;
+          out += `${P}{const t=${t};vm.resumeL=${label.get(pc + len)};vm.push(${RET_SENTINEL},0);vm.enter(t);return t*2;}`;
+          break;
+        }
+        case 0x82: out += `vm.doRet();return -1;`; break;
+        case 0x83: out += `${P}{const t=${rd32(pc + 1) >>> 0};vm.doTailcall(t);return t*2+1;}`; break;
+        case 0x88: out += `${P}{const b=vm.bump(16);vm.zero(b,b+16);vm.markStart(b);vm.markCons(b);${W(b1, 'b|1', '0')}}`; break;
+        case 0x89: out += `if(vm.va>=vm.vl){${P}vm.gc();}`; break;
+        case 0xA7: { const t = rd32(pc + 2) >>> 0; out += W(b1, `${t === FN_UNRESOLVED ? NIL : ((t << 4) | 3)}`, '0'); break; }
+        case 0xB8: out += `vm.st64(${A_MVCOUNT},${b1 << 1},0);`; break;
+        case 0xBA: out += `vm.st64(${A_CENV},${lo(b1)},${hi(b1)});`; break;
+        case 0xBB: out += W(b1, `vm.ldlo(${A_CENV})`, `vm.ldhi(${A_CENV})`); break;
+        case 0xBC: out += `vm.st32(${A_NARGS},${b1});`; break;
+        case 0xBD: out += W(b1, `vm.ld32(${A_NARGS})<<1`, '0'); break;
+        case 0xC5: case 0xC6: {
+          const f = op === 0xC5 ? 'add64' : 'sub64';
+          const ov = op === 0xC5 ? `((ah^RH)&(bh^RH))<0` : `((ah^bh)&(ah^RH))<0`;
+          out += `{const ah=${hi(b2)},bh=${hi(b3)};${f}(${lo(b2)},ah,${lo(b3)},bh);ovf=${ov};${WR(b1)}}`;
+          break;
+        }
+        case 0xC7: out += `if(ovf)${J(pc + len + rd32(pc + 1))}`; break;
+        case 0xAE: case 0xAF: if (DBG.MVM_NOCHK || DBG.MVM_NOCHK_AE) { out += `${P}vm.execInsn(${pc});fb=(vm.ebp-${VBASE})>>2;`; break; } {  // add/sub-checked: fast path inline, overflow -> generic
+          const f = op === 0xAE ? 'add64' : 'sub64';
+          const ov = op === 0xAE ? `((ah^RH)&(bh^RH))<0` : `((ah^bh)&(ah^RH))<0`;
+          out += `{const al=${lo(b2)},ah=${hi(b2)},bl=${lo(b3)},bh=${hi(b3)};${f}(al,ah,bl,bh);if(${ov}){${P}vm.checkedSlow(${op},al,ah,bl,bh);fb=(vm.ebp-${VBASE})>>2;}${WR(b1)}}`;
+          break;
+        }
+        case 0xAD: if (DBG.MVM_NOCHK || DBG.MVM_NOCHK_AD) { out += `${P}vm.execInsn(${pc});fb=(vm.ebp-${VBASE})>>2;`; break; } {
+          out += `{const al=${lo(b2)},ah=${hi(b2)},bl=${lo(b3)},bh=${hi(b3)};sar64(al,ah,1);const xl=RL,xh=RH;if(xh===(xl>>31)&&bh===(bl>>31)&&xl>-0x4000000&&xl<0x4000000&&bl>-0x4000000&&bl<0x4000000)fromNum(xl*bl);else{${P}vm.checkedSlow(${op},al,ah,bl,bh);fb=(vm.ebp-${VBASE})>>2;}${WR(b1)}}`;
+          break;
+        }
+        default:
+          // everything else runs through the interpreter's executor; ops that
+          // set flags publish them in vm.cmp / vm.ovf
+          out += `${P}vm.execInsn(${pc});`;
+          if (DBG.MVM_DCOUNT) out += `vm.dcount.set(${op},(vm.dcount.get(${op})||0)+1);`;
+          this.compileStats.delegated.set(op, (this.compileStats.delegated.get(op) || 0) + 1);
+          if (op === 0x31 || op === 0xC4) out += `cmp=vm.cmp;`;
+          out += `fb=(vm.ebp-${VBASE})>>2;`;
+          break;
+      }
+      out += '\n';
+      if (op === 0x82 || op === 0x83 || op === 0x40 || op === 0x80 || op === 0x81) out += `vm.fault('fell off a block');\n`;
+    }
+    out += `default: vm.fault('bad block label '+L);\n`;
+    const body = `let fb=(vm.ebp-${VBASE})>>2;const HE=vm.heapEnd;let cmp=0,ovf=false;for(;;)switch(L){\n${out}}`;
+    if (DBG.MVM_DUMPCHK && body.includes('checkedSlow') && !this.dumped) { this.dumped = true; this.host.log(`[compiled ${this.where(entry)}]\n${body}`); }
+    if (DBG.MVM_DUMP && this.where(entry).startsWith(DBG.MVM_DUMP)) this.host.log(`[compiled ${this.where(entry)}]\n${body}`);
+    let f;
+    try { f = eval(`(function(vm,L){const m32=vm.m32,m8=vm.m8;${body}})`); }
+    catch (e) { this.host.log(`[compile ${this.where(entry)}: ${e.message}]`); this.compileStats.failed++; return null; }
+    if (hasSetjmp) { f.RES = {}; for (const [pc, l] of label) f.RES[pc] = l; }
+    this.compileStats.fns++; this.compileStats.insns += insns.length;
+    return f;
   }
 
   // -- snapshots ------------------------------------------------------------

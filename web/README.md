@@ -22,7 +22,7 @@ Cheney semispace heap, x64 object and frame layouts, the x64 trap table).
 ## Build and run
 
 ```sh
-# 1. the bytecode module (~3 min; the JIT must be off, it needs native code)
+# 1. the bytecode module (~3 min; MODUS_NO_JIT keeps the x64 translator out)
 MODUS_NO_JIT=1 sbcl --dynamic-space-size 8192 --script mvm/build-web.lisp
 
 # 2. a core snapshot, so nobody waits for the boot (~8 min once)
@@ -53,9 +53,17 @@ because the worker blocks on stdin with `Atomics.wait`.
 - A bad dereference (`car` of a fixnum) does what the native SIGSEGV stub
   does: longjmp through the armed `handler-case` with T, which is how it
   becomes a `TYPE-ERROR`.
-- Not supported: threads (`%spawn-thread`), the runtime JIT, sockets, port I/O.
-  `mvm-eval` falls back to the image's own bytecode interpreter, so
-  user-defined functions run doubly interpreted and are slow (fib 20 ≈ 70 s).
+- The image's runtime JIT seam is served by a web arm (`build-web.lisp`,
+  appended last so it wins): an eval'd module's bytecode is copied into an
+  exec page inside linear memory, `%jit-icache-flush` relocates its call and
+  fn-addr operands in place (out-of-module callees through a table the Lisp
+  side resolves), quoted constants are read through a GC-updated vector at
+  run time, and `%jit-call` runs the page on this interpreter.  So
+  user-defined functions run at interpreter speed instead of doubly
+  interpreted (fib 20: 71 s → 1.2 s).  Function values are
+  `(phys-index << 4) | 3`; the module's own bytecode is relocated the same
+  way at load.
+- Not supported: threads (`%spawn-thread`), sockets, port I/O.
 
 ## Debugging flags (`run-node.js`)
 

@@ -38,7 +38,7 @@ const mod = loadModule(new Uint8Array(fs.readFileSync(opts.mvmw)));
 const env = Object.entries(process.env).map(([k, v]) => `${k}=${v}`);
 const host = new NodeHost();
 const vm = new MVM(mod, host, { argv, env, trace: opts.trace, debug: opts.debug, maxSteps: opts.maxSteps, traceFrom: opts.traceFrom, traceCount: opts.traceCount, traceRegs: opts.traceRegs, profile: opts.profile, semispace: opts.semi << 20 });
-if (opts.watch) { const f = mod.byName.get(opts.watch); if (!f) throw new Error('no fn ' + opts.watch); vm.watchAt = f.off; vm.watchLeft = 60; }
+if (opts.watch) { const f = vm.byName.get(opts.watch); if (!f) throw new Error('no fn ' + opts.watch); vm.watchAt = f.off; vm.watchLeft = 60; }
 const t0 = Date.now();
 let code = 0;
 let resumed = false;
@@ -51,7 +51,7 @@ if (opts.core) {
   if (opts.trace) host.log(`[restored ${opts.core} in ${Date.now() - t0}ms]`);
 }
 if (opts.saveCore) {
-  const fn = mod.byName.get(opts.snapshotAt || 'CLI-TOPLEVEL');
+  const fn = vm.byName.get(opts.snapshotAt || 'CLI-TOPLEVEL');
   if (!fn) throw new Error('no such function to snapshot at: ' + opts.snapshotAt);
   vm.snapAt = fn.off;
   vm.onSnapshot = () => {

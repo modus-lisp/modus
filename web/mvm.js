@@ -20,10 +20,23 @@ const TV  = 0xDEAD1009 | 0;
 const VBASE      = 0x10000000;            // lowest virtual address we model
 const BSS_END    = 0x10020000;
 const POOL_ADDR  = 0x10020000;            // constant pool (strings) lives here
-const STACK_ADDR = 0x10800000;
+const CODE_ADDR  = 0x10200000;            // the module's bytecode, executed in place
+const JIT_ADDR   = 0x11000000;            // exec pages handed out by %mmap-exec-page / mmap
+const JIT_END    = 0x12000000;
+const STACK_ADDR = 0x12000000;
 const STACK_SIZE = 0x00800000;            // 8 MB
 const ARGV_AREA  = 0x00010000;            // top of the stack region: initial argv/envp
-const HEAP_ADDR  = 0x11000000;
+const HEAP_ADDR  = 0x12800000;
+// pc values are PHYSICAL indices into memory (virtual - VBASE); a function
+// value is (phys << 4) | 3.
+const CODE_PHYS  = CODE_ADDR - VBASE, JIT_PHYS = JIT_ADDR - VBASE;
+const A_WEB_CONSTS = 0x10000D40, A_WEB_RELOCS = 0x10000D48, A_WEB_RELOC_STATUS = 0x10000D50;
+// instruction lengths by opcode (mvm.lisp operand specs); 0 = unknown
+const INSN_LEN = new Uint8Array(256);
+for (const [ops, n] of [[[0x00,0x01,0x72,0x82,0x89,0x8B,0x92,0xA2,0xA3,0xA4],1],[[0x02,0x10,0x25,0x30,0x31,0x50,0x51,0x53,0x54,0x55,0x56,0x63,0x64,0x67,0x68,0xB0,0xB7,0xB9,0xC2,0xC3,0xC4,0xC8],3],
+  [[0x11,0x14],10],[[0x12,0x13,0x26,0x27,0x81,0x88,0x8A,0x90,0x91,0xB8,0xBA,0xBB,0xBC,0xBD],2],
+  [[0x20,0x21,0x22,0x23,0x24,0x28,0x29,0x2A,0x2B,0x2C,0x2D,0x2F,0x32,0x52,0x61,0x62,0x65,0x66,0x70,0x71,0x93,0xA5,0xA6,0xA8,0xA9,0xAA,0xAB,0xAC,0xAD,0xAE,0xAF,0xB1,0xB2,0xB3,0xB4,0xB5,0xB6,0xBE,0xBF,0xC0,0xC1,0xC5,0xC6,0xC9,0xCA],4],
+  [[0x2E,0x60,0x40,0x41,0x42,0x43,0x44,0x45,0x46,0x80,0x83,0xA0,0xA1,0xC7],5],[[0x47,0x48,0xA7],6]]) for (const o of ops) INSN_LEN[o] = n;
 const ALLOC_START_OFF = 0x400;            // boot-linux-x64: +linux-x64-heap-alloc-start+
 const GUARD      = 0x01000000;            // 16 MB overshoot guard
 
@@ -163,7 +176,6 @@ class MVM {
   constructor(mod, host, opts = {}) {
     this.mod = mod;
     this.host = host;
-    this.code = mod.code;
     this.trace = opts.trace || 0;
     this.maxSteps = opts.maxSteps || 0;
     this.traceFrom = opts.traceFrom || 0; this.traceCount = opts.traceCount || 0; this.traceRegs = !!opts.traceRegs;
@@ -184,7 +196,12 @@ class MVM {
     this.startBmp = new Uint8Array(granules >> 3);
     this.consBmp = new Uint8Array(granules >> 3);
     this.pageBase = this.heapBase + ALLOC_START_OFF;
-    this.mmapNext = this.heapEnd;
+    this.mmapNext = JIT_ADDR;
+    this.code = this.m8;                      // pc indexes memory directly
+    // the module's functions at their physical addresses
+    this.fnsPhys = mod.fns.map((f) => ({ ...f, off: f.off + CODE_PHYS }));
+    this.byName = new Map(); for (const f of this.fnsPhys) this.byName.set(f.name, f);
+    this.sorted = this.fnsPhys.slice().sort((a, b) => a.off - b.off);
     this.gcCount = 0;
     this.steps = 0;
     this.vrl = 0; this.vrh = 0;               // VR (RAX)
@@ -194,9 +211,9 @@ class MVM {
     this.snapAt = -1;
     this.onSnapshot = null;
     this.watchAt = -1; this.watchLeft = 0;
-    this.genAdd = mod.byName.get('GENERIC-ADD');
-    this.genSub = mod.byName.get('GENERIC-SUBTRACT');
-    this.genMul = mod.byName.get('GENERIC-MULTIPLY');
+    this.genAdd = this.byName.get('GENERIC-ADD');
+    this.genSub = this.byName.get('GENERIC-SUBTRACT');
+    this.genMul = this.byName.get('GENERIC-MULTIPLY');
     this.initMemory(opts.argv || ['modus'], opts.env || []);
   }
 
@@ -246,10 +263,48 @@ class MVM {
     put(0);
     this.st64(A_GC_STACKB, this.stackTop, 0);
   }
+  // Copy the module's bytecode to CODE_ADDR and turn its function-relative
+  // call/fn-addr operands into physical addresses (the same rewrite a JIT page
+  // gets in relocate()).
+  installModule() {
+    if (POOL_ADDR + this.mod.pool.length > CODE_ADDR) throw new Error('constant pool too large');
+    if (CODE_PHYS + this.mod.code.length > JIT_PHYS) throw new Error('module bytecode too large');
+    this.putBytes(POOL_ADDR, this.mod.pool);
+    this.m8.set(this.mod.code, CODE_PHYS);
+    if (!this.relocate(CODE_PHYS, this.mod.code.length, CODE_PHYS, false)) throw new Error('module relocation failed');
+  }
+  // Rewrite call / tailcall / fn-addr operands of the code in [phys, phys+len):
+  // in-module offsets become phys + offset; synthetic runtime-call offsets
+  // (>= 0x40000000, from mvm-eval's rt-table) resolve through the table the
+  // Lisp side left at A_WEB_RELOCS (element k = tagged fn word for k).
+  relocate(phys, len, base, synthetic) {
+    const m8 = this.m8, end = phys + len;
+    let p = phys;
+    const tab = synthetic ? this.ldlo(A_WEB_RELOCS) : 0;
+    while (p < end) {
+      const op = m8[p], n = INSN_LEN[op];
+      if (n === 0) { this.host.log(`[relocate: unknown opcode 0x${op.toString(16)} at phys 0x${p.toString(16)}]`); return false; }
+      if (op === 0x80 || op === 0x83 || op === 0xA7) {
+        const at = p + (op === 0xA7 ? 2 : 1);
+        const imm = (m8[at] | (m8[at + 1] << 8) | (m8[at + 2] << 16) | (m8[at + 3] << 24)) >>> 0;
+        let t;
+        if (imm === FN_UNRESOLVED) t = imm;
+        else if (imm >= 0x40000000) {
+          if (!synthetic) return false;
+          const k = imm - 0x40000000;
+          const wl = this.ldlo(tab + 7 + 8 * k), wh = this.ldhi(tab + 7 + 8 * k);
+          if (wh !== 0 || (wl & 0xF) !== 3) return false;
+          t = (wl - 3) >>> 4;
+        } else t = base + imm;
+        m8[at] = t & 0xFF; m8[at + 1] = (t >>> 8) & 0xFF; m8[at + 2] = (t >>> 16) & 0xFF; m8[at + 3] = (t >>> 24) & 0xFF;
+      }
+      p += n;
+    }
+    return true;
+  }
   initMemory(argv, env) {
     this.stageArgv(argv, env);
-    this.putBytes(POOL_ADDR, this.mod.pool);
-    if (POOL_ADDR + this.mod.pool.length > STACK_ADDR) throw new Error('constant pool too large');
+    this.installModule();
     const from = this.heapBase + ALLOC_START_OFF;
     const spaceSize = this.semi - ALLOC_START_OFF;
     this.st64(this.heapBase, argv.length, 0);
@@ -304,7 +359,7 @@ class MVM {
 
   // -- diagnostics ----------------------------------------------------------
   fnAt(pc) {
-    const s = this.mod.sorted;
+    const s = this.sorted;
     let lo = 0, hi = s.length - 1, best = null;
     while (lo <= hi) {
       const mid = (lo + hi) >> 1;
@@ -313,6 +368,7 @@ class MVM {
     return best;
   }
   where(pc = this.pc) {
+    if (pc >= JIT_PHYS) return `jit@0x${(pc + VBASE).toString(16)}`;
     const f = this.fnAt(pc);
     return f ? `${f.name}+${pc - f.off}` : `@${pc}`;
   }
@@ -384,7 +440,9 @@ class MVM {
     return `0x${(lo >>> 0).toString(16)}`;
   }
   fault(msg) {
-    throw new MvmFault(`${msg} at ${this.where()} (step ${this.steps})\n  ` + this.backtrace().join('\n  '));
+    const bt = this.backtrace(100000);
+    const shown = bt.length > 40 ? bt.slice(0, 20).concat([`... ${bt.length - 40} more frames ...`], bt.slice(-20)) : bt;
+    throw new MvmFault(`${msg} at ${this.where()} (step ${this.steps})\n  ` + shown.join('\n  '));
   }
   // A bad dereference.  Native takes SIGSEGV and the handler stub longjmps
   // through the armed handler-case (with T in RAX), which is how (car 5)
@@ -655,8 +713,20 @@ class MVM {
         }
         return;
       }
-      case 0x0533: case 0x0534: return;
-      case 0x0532: this.fault('%jit-call is not supported here');
+      case 0x0532: {                          // %jit-call: run a page function to completion
+        const phys = this.arg(0) - VBASE;
+        if (phys < JIT_PHYS || phys >= JIT_END - VBASE) this.fault(`%jit-call outside the exec region: 0x${this.arg(0).toString(16)}`);
+        this.doCall(phys, RET_SENTINEL);
+        this.run();                           // VR holds the result; the caller's frame is intact
+        return;
+      }
+      case 0x0533: {                          // %jit-icache-flush base len: relocate the page
+        const base = this.arg(0), len = this.arg(1);
+        const ok = this.relocate(base - VBASE, len, base - VBASE, true);
+        this.st64(A_WEB_RELOC_STATUS, ok ? 0 : 2, 0);
+        return;
+      }
+      case 0x0534: return;
       case 0x0540: this.fault('threads are not supported here (%spawn-thread)');
       default: this.fault(`unimplemented trap 0x${codeNum.toString(16)}`);
     }
@@ -664,7 +734,9 @@ class MVM {
   arg(v) { sar64(this.rlo(v), this.rhi(v), 1); return toNum(RL, RH); }
   mmap(size) {
     const a = this.mmapNext;
-    this.mmapNext += align16(size);
+    const n = (size + 4095) & ~4095;
+    if (a + n > JIT_END) return -12;          // ENOMEM
+    this.mmapNext += n;
     return a;
   }
 
@@ -768,8 +840,15 @@ class MVM {
         case 0x13: this.pop(); WR(code[pc + 1]); pc += 2; break;                                        // pop
         case 0x14: {                                                                                     // li-const
           const idx = rd32(pc + 2);
-          const off = this.mod.addrTable[idx] | 0;
-          W(code[pc + 1], off === 0 ? 0 : (POOL_ADDR + off), 0);
+          if (pc >= JIT_PHYS) {                                                                          // mvm-eval quote pool
+            const vec = this.ldlo(A_WEB_CONSTS);
+            if (vec === 0) this.fault('li-const in a page with no constant vector');
+            const a = vec + 7 + 8 * idx;
+            W(code[pc + 1], this.ldlo(a), this.ldhi(a));
+          } else {
+            const off = this.mod.addrTable[idx] | 0;
+            W(code[pc + 1], off === 0 ? 0 : (POOL_ADDR + off), 0);
+          }
           pc += 10; break;
         }
         case 0x20: { const a = code[pc + 2], b = code[pc + 3]; add64(RLO(a), RHI(a), RLO(b), RHI(b)); WR(code[pc + 1]); pc += 4; break; }
@@ -1059,6 +1138,7 @@ class MVM {
       [POOL_ADDR, POOL_ADDR + this.mod.pool.length],
       [this.esp, STACK_ADDR + STACK_SIZE],
       [fromStart, this.va],
+      [JIT_ADDR, this.mmapNext],
     ];
     const g0 = (fromStart - this.pageBase) >> 4, g1 = (this.va - this.pageBase) >> 4;
     return {
@@ -1075,6 +1155,7 @@ class MVM {
     if (core.version !== 2) throw new Error('core version mismatch');
     if (core.semi !== this.semi) throw new Error(`core was made with a ${core.semi >> 20} MB semispace`);
     this.m8.fill(0);
+    this.installModule();
     for (const r of core.ranges) this.m8.set(r.bytes, r.addr - VBASE);
     this.startBmp.fill(0); this.consBmp.fill(0);
     this.startBmp.set(core.bitmaps.startBmp, core.bitmaps.g0 >> 3);
@@ -1118,7 +1199,7 @@ class MVM {
   // -- top level ------------------------------------------------------------
   main(resumed = false) {
     if (!resumed) {
-      const km = this.mod.byName.get('KERNEL-MAIN');
+      const km = this.byName.get('KERNEL-MAIN');
       if (!km) throw new Error('no KERNEL-MAIN in module');
       // a pseudo-frame for the boot stub so enter() has registers to copy
       this.ebp = this.esp;

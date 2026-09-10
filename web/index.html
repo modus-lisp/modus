@@ -21,11 +21,13 @@
 </div>
 <script>
 (async () => {
+  console.log('page script start; isolated=' + crossOriginIsolated);
   const term = document.getElementById('term');
   const input = document.getElementById('in');
   const status = document.getElementById('status');
   const dec = new TextDecoder();
   const say = (text, cls) => {
+    console.log((cls ? cls + ': ' : '') + text.replace(/\n$/, ''));
     const s = document.createElement('span');
     if (cls) s.className = cls;
     s.textContent = text;
@@ -68,12 +70,15 @@
     Atomics.notify(ctl, 1);
   };
 
+  // hooks for scripted drivers (web/t/headless.js)
+  window.modusFeed = feed;
+  window.modusClose = () => { Atomics.store(ctl, 2, 1); Atomics.notify(ctl, 1); };
   const worker = new Worker('worker.js');
   worker.onmessage = (ev) => {
     const m = ev.data;
     if (m.type === 'stdout') say(dec.decode(m.bytes));
     else if (m.type === 'log') say(m.text + '\n', 'log');
-    else if (m.type === 'waiting') { status.textContent = 'ready'; input.disabled = false; input.focus(); }
+    else if (m.type === 'waiting') { status.textContent = 'ready'; input.disabled = false; input.focus(); console.log('log: [ready]'); }
     else if (m.type === 'exit') { say(`\n[modus exited with code ${m.code}]\n`, 'log'); status.textContent = 'exited'; input.disabled = true; }
     else if (m.type === 'fault') { say('\n' + m.text + '\n', 'err'); status.textContent = 'faulted'; input.disabled = true; }
   };
@@ -86,8 +91,12 @@
     feed(line);
   });
   status.textContent = 'starting…';
-  worker.postMessage({ type: 'start', mvmw, core, stdin: sab, argv: ['modus'], env: ['HOME=/home/web'],
-                       semispace: 128 << 20, files: [] }, [mvmw].concat(core ? [core] : []));
+  // ?eval=FORM (repeatable) runs forms and exits, like the CLI; otherwise the REPL.
+  const argv = ['modus'];
+  for (const [k, v] of new URLSearchParams(location.search)) if (k === 'eval') argv.push('--eval', v);
+  if (argv.length > 1) argv.push('--quit');
+  worker.postMessage({ type: 'start', mvmw, core, stdin: sab, argv, env: ['HOME=/home/web'],
+                       semispace: 256 << 20, files: [] }, [mvmw].concat(core ? [core] : []));
 })();
 </script>
 </body>

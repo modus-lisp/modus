@@ -17366,6 +17366,39 @@
                      (%pure-simple-expr-p (car args) env)))
                (t nil))))))
 
+(defun %kw-plist-p (plist names)
+  "True when PLIST is an even-length list of KEYWORD VALUE pairs whose
+   keyword names are all in NAMES (strings) — no :allow-other-keys, no
+   duplicates checked here (a caller repeating a keyword gets the first,
+   as CL specifies)."
+  (let ((p plist))
+    (loop
+      (cond ((null p) (return t))
+            ((not (consp p)) (return nil))
+            ((not (consp (cdr p))) (return nil))
+            ((not (and (symbolp (car p)) (car p)
+                       (keywordp-name-p (car p))
+                       (member (symbol-name (car p)) names :test (function string=))))
+             (return nil))
+            (t (setq p (cddr p)))))))
+
+(defun keywordp-name-p (sym)
+  "SYM reads as a keyword literal: a keyword object, or a symbol the reader
+   produced in the KEYWORD package (the runtime reader may hand the compiler
+   either shape)."
+  (or (keywordp sym)
+      (let ((pk (symbol-package sym)))
+        (and pk (string= (package-name pk) "KEYWORD")))))
+
+(defun %kw-plist-get (plist name)
+  "The VALUE form after keyword NAME (a string) in PLIST, or NIL."
+  (let ((p plist))
+    (loop
+      (when (or (null p) (not (consp (cdr p)))) (return nil))
+      (when (and (symbolp (car p)) (string= (symbol-name (car p)) name))
+        (return (cadr p)))
+      (setq p (cddr p)))))
+
 (defun %swap-commutative-args (args env)
   "For a 2-operand commutative op whose FIRST operand is a leaf and whose
    second is not, return the operands swapped so the leaf compiles second
@@ -17845,17 +17878,68 @@
   ;; ~200 instructions of overhead on the 16-element coefficient blocks a
   ;; VP8 macroblock clears 25 times.  Two-argument form only.
   (when (and *mvm-eval-runtime-p* (symbolp fn) (name-eq fn "FILL")
-             (consp args) (consp (cdr args)) (null (cddr args))
+             (consp args) (consp (cdr args))
              (symbolp (car args))
              (or (%declared-generic-array-var-p (car args) env)
-                 (%declared-u8-array-var-p (car args) env)))
-    (let ((v (car args)) (x (%mvm-gensym "%FLX")) (i (%mvm-gensym "%FLI")) (n (%mvm-gensym "%FLN")))
+                 (%declared-u8-array-var-p (car args) env))
+             (%kw-plist-p (cddr args) (list "START" "END")))
+    (let* ((v (car args))
+           (kw (cddr args))
+           (start (or (%kw-plist-get kw "START") 0))
+           (end (or (%kw-plist-get kw "END") (list 'length v)))
+           (x (%mvm-gensym "%FLX")) (i (%mvm-gensym "%FLI"))
+           (s (%mvm-gensym "%FLS")) (e (%mvm-gensym "%FLE")))
       (return-from compile-call
         (compile-form
-         (list 'let (list (list x (cadr args)) (list n (list 'length v)))
-               (list 'declare (list 'type 'fixnum n))
-               (list 'dotimes (list i n) (list 'setf (list 'aref v i) x))
+         (list 'let (list (list x (cadr args)) (list s start) (list e end))
+               (list 'declare (list 'type 'fixnum s e))
+               (list 'let (list (list i s))
+                     (list 'declare (list 'type 'fixnum i))
+                     (list 'loop (list 'when (list '>= i e) (list 'return nil))
+                           (list 'setf (list 'aref v i) x)
+                           (list 'setq i (list '+ i 1))))
                v)
+         env dest))))
+  ;; (replace dst src :start1 :end1 :start2 :end2) on two variables declared
+  ;; the same kind of simple array: the bounded element loop directly —
+  ;; the runtime REPLACE parses keywords (re-interning its own literals per
+  ;; call) and dispatches before its first store; reel's bordered plane
+  ;; copy makes ~700 such calls per frame.  memmove order for a same-object
+  ;; overlap that moves up.
+  (when (and *mvm-eval-runtime-p* (symbolp fn) (name-eq fn "REPLACE")
+             (consp args) (consp (cdr args))
+             (symbolp (car args)) (symbolp (cadr args))
+             (or (and (%declared-u8-array-var-p (car args) env)
+                      (%declared-u8-array-var-p (cadr args) env))
+                 (and (%declared-generic-array-var-p (car args) env)
+                      (%declared-generic-array-var-p (cadr args) env)))
+             (%kw-plist-p (cddr args) (list "START1" "END1" "START2" "END2")))
+    (let* ((d (car args)) (sv (cadr args)) (kw (cddr args))
+           (s1 (or (%kw-plist-get kw "START1") 0))
+           (e1 (or (%kw-plist-get kw "END1") (list 'length d)))
+           (s2 (or (%kw-plist-get kw "START2") 0))
+           (e2 (or (%kw-plist-get kw "END2") (list 'length sv)))
+           (vs1 (%mvm-gensym "%RS1")) (ve1 (%mvm-gensym "%RE1"))
+           (vs2 (%mvm-gensym "%RS2")) (ve2 (%mvm-gensym "%RE2"))
+           (n (%mvm-gensym "%RN")) (i (%mvm-gensym "%RI")))
+      (return-from compile-call
+        (compile-form
+         (list 'let (list (list vs1 s1) (list ve1 e1) (list vs2 s2) (list ve2 e2))
+               (list 'declare (list 'type 'fixnum vs1 ve1 vs2 ve2))
+               (list 'let (list (list n (list 'min (list '- ve1 vs1) (list '- ve2 vs2))))
+                     (list 'declare (list 'type 'fixnum n))
+                     (list 'if (list 'and (list 'eq d sv) (list '> vs1 vs2) (list '< (list '- vs1 vs2) n))
+                           (list 'let (list (list i (list '- n 1)))
+                                 (list 'declare (list 'type 'fixnum i))
+                                 (list 'loop (list 'when (list '< i 0) (list 'return nil))
+                                       (list 'setf (list 'aref d (list '+ vs1 i)) (list 'aref sv (list '+ vs2 i)))
+                                       (list 'setq i (list '- i 1))))
+                           (list 'let (list (list i 0))
+                                 (list 'declare (list 'type 'fixnum i))
+                                 (list 'loop (list 'when (list '>= i n) (list 'return nil))
+                                       (list 'setf (list 'aref d (list '+ vs1 i)) (list 'aref sv (list '+ vs2 i)))
+                                       (list 'setq i (list '+ i 1))))))
+               d)
          env dest))))
   ;; Struct slot access on a DECLARED struct argument: (acc x) → the slot
   ;; read, (set-acc x v) → the slot write, in place (see *struct-accessors*).

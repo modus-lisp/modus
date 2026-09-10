@@ -17128,11 +17128,14 @@
 ;;; re-check); u8 and character declarations are NOT accepted (they need the
 ;;; packed / string representations).
 (defun %generic-simple-array-decl-p (ty)
-  "True for a declared type (simple-array ET …) whose ET is generic."
-  (and (consp ty) (symbolp (car ty))
-       (string= (symbol-name (car ty)) "SIMPLE-ARRAY")
-       (consp (cdr ty))
-       (%generic-element-type-p (cadr ty))))
+  "True for a declared type (simple-array ET …) whose ET is generic, and for
+   SIMPLE-VECTOR / (simple-vector N) — a plain word-slot vector of T."
+  (or (and (symbolp ty) ty (string= (symbol-name ty) "SIMPLE-VECTOR"))
+      (and (consp ty) (symbolp (car ty))
+           (or (string= (symbol-name (car ty)) "SIMPLE-VECTOR")
+               (and (string= (symbol-name (car ty)) "SIMPLE-ARRAY")
+                    (consp (cdr ty))
+                    (%generic-element-type-p (cadr ty)))))))
 
 (defun %declared-types (body)
   "Alist (VAR . TYPE-FORM) from the leading (declare (type TYPE v1 v2 …) …)
@@ -17430,10 +17433,18 @@
           (let ((b (find var (compile-env-bindings frame-env)
                          :key #'binding-name :test #'equal)))
             (when (and b (null (binding-dtype b)))
-              (let ((w (%expr-width init init-env)))
-                (when (and w (<= w 62)
+              (let ((w (%expr-width init init-env))
+                    ;; a typed struct slot read, or an alias of a declared
+                    ;; variable: the binding takes that declared type (an
+                    ;; array type makes its arefs typed — decode-residue's
+                    ;; (let* ((ay (d-above-y d))) …) over fxvec slots)
+                    (ty (%expr-dtype init init-env)))
+                (when (and (or w ty)
                            (null (collect-setq-vars-in-body (cons 'progn body) (list var))))
-                  (setf (binding-dtype b) (list 'signed-byte w)))))))))))
+                  (setf (binding-dtype b)
+                        (cond (ty ty)
+                              ((<= w 62) (list 'signed-byte w))
+                              (t nil))))))))))))
 
 (defun %declared-u8-array-var-p (form env)
   "True when FORM is a variable declared (simple-array (unsigned-byte 8) …):
@@ -17921,13 +17932,18 @@
            (e2 (or (%kw-plist-get kw "END2") (list 'length sv)))
            (vs1 (%mvm-gensym "%RS1")) (ve1 (%mvm-gensym "%RE1"))
            (vs2 (%mvm-gensym "%RS2")) (ve2 (%mvm-gensym "%RE2"))
-           (n (%mvm-gensym "%RN")) (i (%mvm-gensym "%RI")))
+           (n (%mvm-gensym "%RN")) (i (%mvm-gensym "%RI"))
+           (u8p (%declared-u8-array-var-p d env)))
       (return-from compile-call
         (compile-form
          (list 'let (list (list vs1 s1) (list ve1 e1) (list vs2 s2) (list ve2 e2))
                (list 'declare (list 'type 'fixnum vs1 ve1 vs2 ve2))
                (list 'let (list (list n (list 'min (list '- ve1 vs1) (list '- ve2 vs2))))
                      (list 'declare (list 'type 'fixnum n))
+                     (if u8p
+                         ;; bytes: the word-at-a-time copier (memmove semantics
+                         ;; inside), one call per row — faster than a byte loop
+                         (list '%bulk-copy-u8 d vs1 sv vs2 n)
                      (list 'if (list 'and (list 'eq d sv) (list '> vs1 vs2) (list '< (list '- vs1 vs2) n))
                            (list 'let (list (list i (list '- n 1)))
                                  (list 'declare (list 'type 'fixnum i))
@@ -17938,7 +17954,7 @@
                                  (list 'declare (list 'type 'fixnum i))
                                  (list 'loop (list 'when (list '>= i n) (list 'return nil))
                                        (list 'setf (list 'aref d (list '+ vs1 i)) (list 'aref sv (list '+ vs2 i)))
-                                       (list 'setq i (list '+ i 1))))))
+                                       (list 'setq i (list '+ i 1)))))))
                d)
          env dest))))
   ;; Struct slot access on a DECLARED struct argument: (acc x) → the slot

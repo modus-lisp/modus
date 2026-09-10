@@ -2777,14 +2777,23 @@
                               (char-code item)
                               item))
               (i start))
-         (if (and (integerp store-item) (%u8-bare-p seq))
-             ;; plain u8 vector: byte stores, no per-element dispatch
-             (loop (when (>= i eff-end) (return seq))
-               (%u8-set seq i store-item)
-               (setq i (+ i 1)))
-             (loop (when (>= i eff-end) (return seq))
-               (aset seq i store-item)
-               (setq i (+ i 1))))))
+         (cond
+           ((and (integerp store-item) (%u8-bare-p seq))
+            ;; plain u8 vector: byte stores, no per-element dispatch
+            (loop (when (>= i eff-end) (return seq))
+              (%u8-set seq i store-item)
+              (setq i (+ i 1))))
+           ((and (not (stringp seq)) (%bulk-copy-ok-p seq seq))
+            ;; plain word-slot array (general or typed-generic, not a
+            ;; string / wrapper / mda): raw slot stores — a VP8 macroblock
+            ;; clears 25 coefficient blocks this way
+            (loop (when (>= i eff-end) (return seq))
+              (%word-aset seq i store-item)
+              (setq i (+ i 1))))
+           (t
+            (loop (when (>= i eff-end) (return seq))
+              (aset seq i store-item)
+              (setq i (+ i 1)))))))
       (t (error "fill: not a sequence")))))
 
 (defun map-into (result fn &rest seqs)

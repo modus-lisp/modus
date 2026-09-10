@@ -5579,11 +5579,19 @@
   ;; comparing :CONC-NAME), and the ANSI gate lost 289 tests (structures,
   ;; defmethod, documentation ...).  The intern call is keyed by NAME HASH
   ;; and is pool-independent.
-  (emit-li-tagged +vreg-v0+ (normalize-name kw))
-  (when *mvm-emit-halves* (emit-ir :set-nargs 1))  ; mvm-eval bridge needs nargs (see compile-quote symbol case)
-  (emit-ir :call "%INTERN-KEYWORD" 1)
-  (unless (= dest +vreg-vr+)
-    (emit-ir :mov dest +vreg-vr+)))
+  (if (and *mvm-eval-runtime-p* (not *static-build-p*) (fboundp (quote %intern-keyword)))
+      ;; Runtime compile: the keyword object exists (or is created) NOW and is
+      ;; interned for good, so bake it as a pool constant — a `:foo' literal
+      ;; cost a %INTERN-KEYWORD call (a GETHASH) on EVERY evaluation, ~8% of
+      ;; a VP8 frame in reel's keyword-argument calls.  Same EQ guarantee.
+      (emit-ir :li-const dest (%e2-const-register
+                               (funcall (quote %intern-keyword) (normalize-name kw))))
+      (progn
+        (emit-li-tagged +vreg-v0+ (normalize-name kw))
+        (when *mvm-emit-halves* (emit-ir :set-nargs 1))  ; mvm-eval bridge needs nargs (see compile-quote symbol case)
+        (emit-ir :call "%INTERN-KEYWORD" 1)
+        (unless (= dest +vreg-vr+)
+          (emit-ir :mov dest +vreg-vr+)))))
 
 ;;; ------ Variable Reference ------
 
@@ -5635,9 +5643,8 @@
            ;; returned NIL for absent entries, silently conflating "unbound"
            ;; with "bound to NIL".  The quoted symbol rides the mvm-eval const
            ;; pool, so the condition's :name is EQ to the source symbol.
-           (compile-form `(%e2-symbol-value-checked ,(%global-name-key name)
-                                                    (quote ,name))
-                         env dest)
+           ;; (Cell known at compile time → in-place read, see the helper.)
+           (%compile-global-read-runtime name env dest)
            (let ((hash (%global-name-key name)))
              (emit-li-tagged +vreg-v0+ hash)  ; fixnum-safe hash (mvm-eval :li-halves)
              ;; mvm-eval bridge reads (mvm-nargs) args; a manual :call needs an
@@ -5665,9 +5672,7 @@
        (setf (gethash (normalize-name name) *globals*) t)
        (if (and *mvm-eval-runtime-p* (not *static-build-p*))  ; WS5: reproduce modus2-sb (static reads) for FNMAP crash-mapping
            ;; Same checked read as the registered-global branch above.
-           (compile-form `(%e2-symbol-value-checked ,(%global-name-key name)
-                                                    (quote ,name))
-                         env dest)
+           (%compile-global-read-runtime name env dest)
            (let ((hash (%global-name-key name)))
              (emit-li-tagged +vreg-v0+ hash)  ; fixnum-safe hash (mvm-eval :li-halves)
              (when *mvm-emit-halves* (emit-ir :set-nargs 1))  ; mvm-eval bridge nargs
@@ -9118,6 +9123,30 @@
        (setf (gethash (normalize-name var) *globals*) t)
        (%compile-setq-global var dest)))))
 
+(defun %runtime-global-cell (name)
+  "At a RUNTIME compile: the (key . value) pair of global NAME in the globals
+   table, or NIL when it does not exist yet (or at build time).  puthash /
+   %gv-set update that pair in place and the table never replaces pairs, so
+   a pair baked into compiled code stays the live cell.  makunbound is a
+   no-op today, so 'cell exists' is exactly 'bound'."
+  (and *mvm-eval-runtime-p* (not *static-build-p*)
+       (fboundp (quote %gv-cell))
+       (let ((c (funcall (quote %gv-cell) (%global-name-key name))))
+         (and (consp c) c))))
+
+(defun %compile-global-read-runtime (name env dest)
+  "Runtime global READ.  With the cell known at compile time: li-const of
+   the pair + cdr — no call, no table probe (%GV-CELL / GETHASH were 12% of
+   a VP8 frame).  Otherwise the checked call (UNBOUND-VARIABLE semantics)."
+  (let ((cell (%runtime-global-cell name)))
+    (if cell
+        (progn
+          (emit-ir :li-const dest (%e2-const-register cell))
+          (emit-ir :cdr dest dest))
+        (compile-form `(%e2-symbol-value-checked ,(%global-name-key name)
+                                                 (quote ,name))
+                      env dest))))
+
 (defun %compile-setq-global (var dest)
   "Emit the global-store for (setq VAR <value-already-in-DEST>).  The value
    was compiled into DEST by compile-setq before the dispatch.  Moves it to V1
@@ -9139,26 +9168,39 @@
     ;; `loop while … do`, sitting inside an AREF index — clobbered the held
     ;; array register: a fault on x64 only (aarch64 temps are x19..x23,
     ;; callee-saved).  See reference_mvm_caller_save_bug.
-    (let ((save-count (min *temp-reg-counter* 12)))
-      (when (> save-count 1)
-        (let ((r (+ +vreg-v4+ 1)))
-          (loop (when (>= r (+ +vreg-v4+ save-count)) (return))
-            (unless (= r dest) (emit-ir :push r))
-            (setq r (+ r 1)))))
-      ;; Stage V1 = value FIRST (V1 differs from V0, so this can't clobber the
-      ;; hash we load next).  If dest IS V1 the :mov is a self-move (harmless).
-      (unless (= dest +vreg-v1+)
-        (emit-ir :mov +vreg-v1+ dest))
-      (emit-li-tagged +vreg-v0+ hash)  ; fixnum-safe hash (mvm-eval :li-halves)
-      (when *mvm-emit-halves* (emit-ir :set-nargs 2))  ; mvm-eval bridge nargs
-      (emit-ir :call "%GV-SET" 2)
-      (unless (= dest +vreg-vr+)
-        (emit-ir :mov dest +vreg-vr+))
-      (when (> save-count 1)
-        (let ((r (+ +vreg-v4+ save-count -1)))
-          (loop (when (< r (+ +vreg-v4+ 1)) (return))
-            (unless (= r dest) (emit-ir :pop r))
-            (setq r (- r 1))))))))
+    (let ((cell (%runtime-global-cell var))
+          (save-count (min *temp-reg-counter* 12)))
+      (cond
+        ;; Runtime compile with the global's cell known: store in place —
+        ;; li-const of the pair + setcdr (write barrier), no call, no probe.
+        ;; The value stays in DEST (a SETQ returns it).
+        ;; (x64: a spill temp is written through rax = VR, so with DEST = VR
+        ;; the temp must be physical — otherwise take the call path.)
+        ((and cell (or (/= dest +vreg-vr+) (< *temp-reg-counter* 5)))
+         (let ((tmp (alloc-temp-reg)))
+           (emit-ir :li-const tmp (%e2-const-register cell))
+           (emit-ir :setcdr tmp dest)
+           (free-temp-reg)))
+        (t
+         (when (> save-count 1)
+           (let ((r (+ +vreg-v4+ 1)))
+             (loop (when (>= r (+ +vreg-v4+ save-count)) (return))
+               (unless (= r dest) (emit-ir :push r))
+               (setq r (+ r 1)))))
+         ;; Stage V1 = value FIRST (V1 differs from V0, so this can't clobber
+         ;; the hash we load next).  If dest IS V1 the :mov is a self-move.
+         (unless (= dest +vreg-v1+)
+           (emit-ir :mov +vreg-v1+ dest))
+         (emit-li-tagged +vreg-v0+ hash)  ; fixnum-safe hash (mvm-eval :li-halves)
+         (when *mvm-emit-halves* (emit-ir :set-nargs 2))  ; mvm-eval bridge nargs
+         (emit-ir :call "%GV-SET" 2)
+         (unless (= dest +vreg-vr+)
+           (emit-ir :mov dest +vreg-vr+))
+         (when (> save-count 1)
+           (let ((r (+ +vreg-v4+ save-count -1)))
+             (loop (when (< r (+ +vreg-v4+ 1)) (return))
+               (unless (= r dest) (emit-ir :pop r))
+               (setq r (- r 1))))))))))
 
 ;;; ============================================================
 ;;; Lambda
@@ -12049,7 +12091,10 @@
                        (if ,%nat-var
                            ,natural-form
                            ,%bv-var))))
-                 (t inner2)))
+                 ;; The termination tests still SETQ the flag; without this
+                 ;; binding it was an unbound gensym, i.e. a GLOBAL hash-table
+                 ;; write on every exit of every `loop while … do`.
+                 (t `(let ((,%nat-var nil)) ,inner2))))
              ;; INITIALLY runs once before the loop body, after WITH bindings
              (with-init (if initially
                             `(progn ,@initially ,result)
@@ -17591,6 +17636,27 @@
          (arr (car args))
          (subs (cdr args)))
     (cond
+      ;; Two subscripts on a variable declared (simple-array ET (D1 D2)) with
+      ;; a literal row length: row-major index into the MDA's data vector in
+      ;; place — %aref-multi went through APPLY on every access (reel's
+      ;; six-tap filter reads its coefficient table this way).  A declared
+      ;; simple-array is never displaced, so the data vector is the store.
+      ((and (symbolp arr) (consp subs) (consp (cdr subs)) (null (cddr subs))
+            (let ((ty (%expr-dtype arr env)))
+              (and (consp ty) (symbolp (car ty))
+                   (string= (symbol-name (car ty)) "SIMPLE-ARRAY")
+                   (consp (cdr ty)) (consp (cddr ty)) (consp (caddr ty))
+                   (consp (cdr (caddr ty))) (null (cddr (caddr ty)))
+                   (integerp (cadr (caddr ty))))))
+       (let* ((ty (%expr-dtype arr env))
+              (et (cadr ty))
+              (d2 (cadr (caddr ty)))
+              (idx (list '+ (list '* (car subs) d2) (cadr subs)))
+              (data (list '%prim-aref arr 6)))         ; %mda-data
+         (compile-form (if (%u8-simple-array-decl-p (list 'simple-array et (list '*)))
+                           (list '%u8-ref data idx)
+                           (list '%word-aref data idx))
+                       env dest)))
       ((null subs)
        ;; 0-sub aref on a 0-dim MDA → slot 0 of data.  %aref-multi-public
        ;; lifts a string-MDA element to a CHARACTER (CL conformance).
@@ -17772,6 +17838,24 @@
                          (list 'unless test (list 'setq r nil) (list 'return nil))
                          (list 'when test (list 'setq r t) (list 'return nil))))
                r)
+         env dest))))
+  ;; (fill v item) on a variable declared a simple array: an inline typed
+  ;; store loop.  The runtime FILL parses &rest keywords, dispatches on the
+  ;; sequence kind and probes the array's header before its first store —
+  ;; ~200 instructions of overhead on the 16-element coefficient blocks a
+  ;; VP8 macroblock clears 25 times.  Two-argument form only.
+  (when (and *mvm-eval-runtime-p* (symbolp fn) (name-eq fn "FILL")
+             (consp args) (consp (cdr args)) (null (cddr args))
+             (symbolp (car args))
+             (or (%declared-generic-array-var-p (car args) env)
+                 (%declared-u8-array-var-p (car args) env)))
+    (let ((v (car args)) (x (%mvm-gensym "%FLX")) (i (%mvm-gensym "%FLI")) (n (%mvm-gensym "%FLN")))
+      (return-from compile-call
+        (compile-form
+         (list 'let (list (list x (cadr args)) (list n (list 'length v)))
+               (list 'declare (list 'type 'fixnum n))
+               (list 'dotimes (list i n) (list 'setf (list 'aref v i) x))
+               v)
          env dest))))
   ;; Struct slot access on a DECLARED struct argument: (acc x) → the slot
   ;; read, (set-acc x v) → the slot write, in place (see *struct-accessors*).

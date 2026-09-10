@@ -339,10 +339,31 @@ VR) changed nothing on the Pi.  That is the useful negative result: on an
 out-of-order core the remaining cost is not the instruction count inside
 expression chains.
 
-What remains between 37 and 60 fps is uniform per-operation cost: every
-variable read is a frame load and every binary op is ~12 instructions.  The
-next step is register allocation across a basic block, not another dispatch
-fix.
+That conclusion was wrong, and a sampling profile said so.  `perf` on the
+Pi 5 (with a symbol map dumped from `*symbol-function-table*` and samples
+filtered to those under `DECODE-FRAME`) put only ~45 % of the decode in
+reel's kernels.  The rest was runtime library work the phase timers and
+op histograms could not see: every global-variable reference probing the
+globals table by hash (`%GV-CELL`/`GETHASH`), `expand-cl-loop`'s unbound
+termination-flag gensym turning every `loop while` exit into a *global*
+write, `FILL`'s generic element loop plus ~200 instructions of keyword
+parsing on each 16-element coefficient block, keyword literals re-interned
+(a `GETHASH`) on every evaluation, and rank-2 declared `aref`s through
+`APPLY`.  Each became a general fix (`8bd9962` and after): a runtime-
+compiled global read/write bakes the `(key . value)` pair as a constant
+and does `cdr`/`setcdr` in place; the loop flag is LET-bound; `fill` on a
+declared array is an inline typed loop and `replace`/`fill` with
+`:start`/`:end` keywords on declared arrays compile to bounded loops with
+no keyword parsing; keyword literals compile to constants; rank-2 declared
+arrays read their data vector row-major.  Pi 5: **30 frames in 0.63 s =
+48 fps**, inter 19 ms, keyframe 47 ms.  The measurement recipe lives in
+the memory note `reference_pi_perf_profiling_recipe`.
+
+What remains between 48 and 60 fps is, this time measured, mostly reel's
+kernels themselves (`add-residual`, the loop-filter edges, `mc-filter`,
+`decode-residue`/`get-coeffs`, ~65 %) at ~12 instructions per binary op
+with every local in a frame slot — register allocation across a basic
+block — plus `decode-residue`'s untyped inner `(aref (aref yc b) i)`.
 
 ## Related
 

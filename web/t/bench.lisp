@@ -1,0 +1,17 @@
+(defun fib (n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
+(defun tak (x y z) (if (not (< y x)) z (tak (tak (1- x) y z) (tak (1- y) z x) (tak (1- z) x y))))
+(defun b-sort () (length (let ((l nil)) (dotimes (i 100000) (push (* i i) l)) (sort l (function <)))))
+(defun b-format () (length (with-output-to-string (s) (dotimes (i 3000) (format s "~a,~a;" i (* i 2))))))
+(defun b-hash () (let ((h (make-hash-table :test (quote equal)))) (dotimes (i 10000) (setf (gethash (format nil "key~a" i) h) i)) (hash-table-count h)))
+(defun b-read () (length (read-from-string (with-output-to-string (s) (write-char #\( s) (dotimes (i 3000) (format s "(~a x ~a) " i i)) (write-char #\) s)))))
+(defmacro timed (name form)
+  `(let ((t0 (get-internal-real-time)))
+     ,form ,form
+     (let ((t1 (get-internal-real-time))) ,form
+       (format t "~a: ~a ms~%" ,name (round (- (get-internal-real-time) t1) 1000)))))
+(timed "fib27" (fib 27))
+(timed "tak" (tak 18 12 6))
+(timed "sort100k" (b-sort))
+(timed "format3k" (b-format))
+(timed "hash10k" (b-hash))
+(timed "read3k" (b-read))

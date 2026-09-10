@@ -76,7 +76,14 @@
 ;; File-I/O scratch.  Both 64-bit ports park these just BELOW the heap base
 ;; (0x10000000), inside the ELF's own mapped BSS tail.  i386 cannot: its heap
 ;; is at 0x30000000 and 0x0FE00000 is unmapped there.
-(defvar *cli-arch-io-scratch-source* "")
+(defvar *cli-arch-io-scratch-source*
+";; WEB: the x64 defaults (#x1DF00000 / #x1DE00000) fall inside the JS machine's
+;; heap arena.  Park the C-string scratch and the 4 KB I/O page in the BSS
+;; block, which is mapped, GC-scanned harmlessly, and below every heap address.
+  (setq *cstr-scratch* #x10010000)
+  (setq *io-buf-addr*  #x10014000)
+  (setq *scratch-mmapped* t)
+")
 
 ;; x86-64 toplevel entry.  No baked probe program — this is a shipping CLI.
 (defvar *cli-arch-kernel-epilogue*
@@ -298,6 +305,14 @@
         (when (string-equal nm \"%MVM-EVAL-THUNK\") (setq eoff off))
         (setq fnoffs (cons (cons nm off) fnoffs))))
     (list base (if eoff eoff 0) nil (%gc-count) psize (reverse fnoffs))))
+;; ---- web networking -------------------------------------------------------
+;; The browser has no sockets.  Name resolution goes to the host through a
+;; private syscall number (4242: host string -> a fake IPv4 the host remembers),
+;; and the socket calls that follow (41 socket, 42 connect, 1 write, 0 read,
+;; 3 close) are answered by the host as an HTTP fetch of the request it sees.
+(defun %host-string-to-ip (host)
+  (%string-to-cstr host *cstr-scratch*)
+  (syscall3 4242 *cstr-scratch* (length host) 0))
 (defun %jit-install-native-fns (base fnoffs names)
   (let ((n 0))
     (dolist (e fnoffs)

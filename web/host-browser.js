@@ -10,10 +10,18 @@ const ENOENT = -2, EBADF = -9, EEXIST = -17, ENOTDIR = -20, EISDIR = -21, EINVAL
 // stdin ring: Int32Array header [head, tail, closed] then bytes
 const RING_HDR = 16;
 
+// http SAB: Int32 header [state, length] then bytes.  state: 0 idle, 1 request
+// posted, 2 response ready.  inbox SAB (files dropped on the page):
+// Int32 header [seq, length] then records [nameLen u32][name][dataLen u32][data].
 class BrowserHost {
-  constructor(stdinSab, post) {
+  constructor(stdinSab, post, httpSab, inboxSab) {
     this.ctl = new Int32Array(stdinSab, 0, 4);
     this.ring = new Uint8Array(stdinSab, RING_HDR);
+    this.httpCtl = httpSab ? new Int32Array(httpSab, 0, 4) : null;
+    this.httpBuf = httpSab ? new Uint8Array(httpSab, 16) : null;
+    this.inboxCtl = inboxSab ? new Int32Array(inboxSab, 0, 4) : null;
+    this.inboxBuf = inboxSab ? new Uint8Array(inboxSab, 16) : null;
+    this.inboxSeen = 0;
     this.post = post;
     this.files = new Map();          // path -> { data: Uint8Array, mtime }
     this.dirs = new Set(['/', '/tmp', '/home', '/home/web']);
@@ -23,6 +31,38 @@ class BrowserHost {
     this.outLen = 0;
   }
   log(s) { this.post({ type: 'log', text: s }); }
+  // Ask the page to fetch; block until the response bytes are in the SAB.
+  httpRequest(url, method, headers, body) {
+    if (!this.httpCtl) throw new Error('no http channel');
+    this.flush();
+    Atomics.store(this.httpCtl, 0, 1);
+    this.post({ type: 'http', url, method, headers, body });
+    while (Atomics.load(this.httpCtl, 0) !== 2) Atomics.wait(this.httpCtl, 0, 1);
+    const n = Atomics.load(this.httpCtl, 1);
+    const out = this.httpBuf.slice(0, n);
+    Atomics.store(this.httpCtl, 0, 0);
+    return out;
+  }
+  // Files the page dropped into the inbox since we last looked.
+  drainInbox() {
+    if (!this.inboxCtl) return;
+    const seq = Atomics.load(this.inboxCtl, 0);
+    if (seq === this.inboxSeen) return;
+    const len = Atomics.load(this.inboxCtl, 1);
+    const dv = new DataView(this.inboxBuf.buffer, this.inboxBuf.byteOffset, len);
+    let p = 0;
+    while (p + 8 <= len) {
+      const nl = dv.getUint32(p, true); p += 4;
+      const name = new TextDecoder().decode(this.inboxBuf.slice(p, p + nl)); p += nl;
+      const dl = dv.getUint32(p, true); p += 4;
+      this.addFile(name, this.inboxBuf.slice(p, p + dl)); p += dl;
+      this.log(`[file: ${name}, ${dl} bytes]`);
+    }
+    this.inboxSeen = seq;
+    Atomics.store(this.inboxCtl, 1, 0);
+    Atomics.store(this.inboxCtl, 2, 1);          // tell the page it may write again
+    Atomics.notify(this.inboxCtl, 2);
+  }
   now() { return performance.now(); }
   getpid() { return 4242; }
 
@@ -55,13 +95,14 @@ class BrowserHost {
     file.data.set(m8.subarray(off, off + len), f.pos);
     file.len = Math.max(file.len, end);
     file.mtime = (Date.now() / 1000) | 0;
-    f.pos = end;
+    f.pos = end; f.wrote = true;
     return len;
   }
   read(fd, m8, off, len) {
     if (fd === 0) {
       this.flush();
       for (;;) {
+        this.drainInbox();
         const head = Atomics.load(this.ctl, 0), tail = Atomics.load(this.ctl, 1);
         if (head !== tail) {
           let n = 0;
@@ -118,7 +159,13 @@ class BrowserHost {
     this.fds.set(fd, { path, pos: (flags & 0x400) ? file.len : 0 });
     return fd;
   }
-  close(fd) { if (!this.fds.has(fd)) return EBADF; this.fds.delete(fd); return 0; }
+  close(fd) {
+    const f = this.fds.get(fd);
+    if (!f) return EBADF;
+    this.fds.delete(fd);
+    if (f.wrote) { const file = this.files.get(f.path); if (file) this.post({ type: 'file', path: f.path, bytes: file.data.slice(0, file.len) }); }
+    return 0;
+  }
   lseek(fd, off, whence) {
     const f = this.fds.get(fd); if (!f) return EBADF;
     const len = f.dir ? 0 : this.files.get(f.path).len;

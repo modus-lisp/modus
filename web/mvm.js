@@ -210,6 +210,13 @@ class MVM {
     this.cmp = 0; this.ovf = false;
     this.snapAt = -1;
     this.onSnapshot = null;
+    // sockets: the image's hosted-sockets layer (socket/connect/write/read/
+    // close) is answered here as one HTTP request per connection, which the
+    // host performs with whatever it has (fetch, curl).  Name resolution comes
+    // through the private syscall 4242 and returns a fake IPv4 we can map back.
+    this.socks = new Map();
+    this.nextSockFd = 1000;
+    this.fakeIps = new Map(); this.ipNames = new Map();
     this.watchAt = -1; this.watchLeft = 0;
     this.genAdd = this.byName.get('GENERIC-ADD');
     this.genSub = this.byName.get('GENERIC-SUBTRACT');
@@ -740,16 +747,72 @@ class MVM {
     return a;
   }
 
+  // -- sockets as HTTP requests --------------------------------------------
+  resolveHost(name) {
+    if (!this.fakeIps.has(name)) {
+      const n = this.fakeIps.size + 1;                  // 10.77.x.y
+      const ip = (10 << 24) | (77 << 16) | (((n >> 8) & 0xFF) << 8) | (n & 0xFF);
+      this.fakeIps.set(name, ip >>> 0); this.ipNames.set(ip >>> 0, name);
+    }
+    return this.fakeIps.get(name);
+  }
+  sockRead(sk, m8, off, len) {
+    if (!sk.resp) {
+      // first read: the request is complete; perform it
+      const req = new Uint8Array(sk.req.reduce((a, b) => a + b.length, 0));
+      let p = 0; for (const b of sk.req) { req.set(b, p); p += b.length; }
+      const text = new TextDecoder('latin1').decode(req);
+      const m = /^([A-Z]+) (\S+) HTTP\/1\.[01]\r?\n([\s\S]*?)\r?\n\r?\n([\s\S]*)$/.exec(text);
+      if (!m) return -104;                               // ECONNRESET
+      const headers = {};
+      for (const line of m[3].split(/\r?\n/)) { const i = line.indexOf(':'); if (i > 0) headers[line.slice(0, i).trim()] = line.slice(i + 1).trim(); }
+      const host = sk.host || headers.Host || headers.host || `${sk.ip}`;
+      const scheme = sk.port === 443 ? 'https' : 'http';
+      const url = `${scheme}://${host}${(sk.port === 80 || sk.port === 443) ? '' : ':' + sk.port}${m[2]}`;
+      try { sk.resp = this.host.httpRequest(url, m[1], headers, m[4]); }
+      catch (e) { this.host.log(`[http: ${e.message || e}]`); sk.resp = new TextEncoder().encode(`HTTP/1.0 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n`); }
+      sk.pos = 0;
+    }
+    const n = Math.min(len, sk.resp.length - sk.pos);
+    m8.set(sk.resp.subarray(sk.pos, sk.pos + n), off);
+    sk.pos += n;
+    return n;
+  }
+
   // Linux x86-64 numbering, the subset the hosted CLI uses.
   syscall(nr, a1, a2, a3, a4, a5, a6) {
     const h = this.host;
     const inMem = (a, n) => a >= VBASE && a + n <= this.heapEnd;
+    const sk = (nr === 0 || nr === 1 || nr === 3 || nr === 42) ? this.socks.get(a1) : undefined;
     switch (nr) {
       case 60: case 231: throw new MvmExit(a1);
-      case 0: return inMem(a2, a3) ? h.read(a1, this.m8, a2 - VBASE, a3) : -14;
-      case 1: return inMem(a2, a3) ? h.write(a1, this.m8, a2 - VBASE, a3) : -14;
+      case 0: if (!inMem(a2, a3)) return -14;
+              return sk ? this.sockRead(sk, this.m8, a2 - VBASE, a3) : h.read(a1, this.m8, a2 - VBASE, a3);
+      case 1: if (!inMem(a2, a3)) return -14;
+              if (sk) { sk.req.push(this.m8.slice(a2 - VBASE, a2 - VBASE + a3)); return a3; }
+              return h.write(a1, this.m8, a2 - VBASE, a3);
       case 2: return h.open(this.cstr(a1), a2, a3);
-      case 3: return h.close(a1);
+      case 3: if (sk) { this.socks.delete(a1); return 0; } return h.close(a1);
+      case 41: {                                 // socket(AF_INET, type, 0)
+        if (a1 !== 2) return -97;                // EAFNOSUPPORT
+        const fd = this.nextSockFd++;
+        this.socks.set(fd, { type: a2, req: [], resp: null, pos: 0, host: null, ip: 0, port: 0 });
+        return fd;
+      }
+      case 42: {                                 // connect(fd, sockaddr_in*, len)
+        if (!sk) return -9;
+        const port = (this.m8[a2 - VBASE + 2] << 8) | this.m8[a2 - VBASE + 3];
+        const ip = ((this.m8[a2 - VBASE + 4] << 24) | (this.m8[a2 - VBASE + 5] << 16) | (this.m8[a2 - VBASE + 6] << 8) | this.m8[a2 - VBASE + 7]) >>> 0;
+        sk.port = port; sk.ip = ip;
+        sk.host = this.ipNames.get(ip) || `${ip >>> 24}.${(ip >>> 16) & 255}.${(ip >>> 8) & 255}.${ip & 255}`;
+        return 0;
+      }
+      case 7: return 1;                          // poll: always ready
+      case 54: case 55: return 0;                // setsockopt / getsockopt
+      case 4242: {                               // web: resolve host name -> fake IPv4
+        const name = this.cstr(a1);
+        return name ? this.resolveHost(name) : 0;
+      }
       case 4: case 5: {                          // stat / fstat: st_size@48, st_mtime@88
         const st = nr === 4 ? h.stat(this.cstr(a1)) : h.fstat(a1);
         if (typeof st === 'number') return st;

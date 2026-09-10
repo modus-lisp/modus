@@ -56,7 +56,13 @@ inp.on('data', (d) => {
       const text = m.params.args.map((a) => a.value !== undefined ? String(a.value) : a.description || '').join(' ');
       console.log(text);
       if (text === 'log: [ready]') {
-        const line = script.shift();
+        // a script line "@file NAME:CONTENT" drops a file into the page's inbox first
+        let line = script.shift();
+        while (line !== undefined && line.startsWith('@file ')) {
+          const k = line.indexOf(':');
+          send('Runtime.evaluate', { expression: `modusAddFile(${JSON.stringify(line.slice(6, k))}, ${JSON.stringify(line.slice(k + 1))})` }, sessionId);
+          line = script.shift();
+        }
         if (line !== undefined) send('Runtime.evaluate', { expression: `modusFeed(${JSON.stringify(line + '\n')})` }, sessionId);
         else send('Runtime.evaluate', { expression: 'modusClose()' }, sessionId);
       }

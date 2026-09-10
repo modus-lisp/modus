@@ -3,6 +3,7 @@
 // node: real file descriptors via the fs module, blocking stdin reads.
 
 const fs = require('fs');
+const { execFileSync } = require('child_process');
 
 const ENOENT = -2, EBADF = -9, EACCES = -13, EEXIST = -17, ENOTDIR = -20, EISDIR = -21, EINVAL = -22;
 
@@ -26,6 +27,15 @@ class NodeHost {
     this.stdoutBuf = [];
   }
   log(s) { fs.writeSync(2, s + '\n'); }
+  // One HTTP request, synchronously, via curl; returns the raw response
+  // (status line + headers + body) the image's HTTP/1.0 client expects.
+  httpRequest(url, method, headers, body) {
+    const args = ['-sS', '-i', '-L', '--max-time', '30', '-X', method];
+    for (const [k, v] of Object.entries(headers)) if (!/^(host|connection|content-length)$/i.test(k)) args.push('-H', `${k}: ${v}`);
+    if (body && body.length) args.push('--data-binary', body);
+    args.push(url);
+    return new Uint8Array(execFileSync('curl', args, { maxBuffer: 64 << 20 }));
+  }
   now() { return performance.now(); }
   getpid() { return process.pid; }
 

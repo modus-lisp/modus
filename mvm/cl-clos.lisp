@@ -5301,6 +5301,21 @@
       (setq cur-d (cdr cur-d))
       (setq cur-s (cdr cur-s)))))
 
+;; A single-subscript element access that also knows the packed
+;; single-float vector (#x12).  compile-prim-aref stays lean (u8/word only,
+;; every struct-slot access goes through it), so the #x12 case lives here,
+;; on the MDA / displaced / multi-subscript path where a packed vector is
+;; reached as raw data.  (%prim-aref of a #x12 vector would read a lane as
+;; a word — a displaced view onto a single-float array read 0.)
+(defun %elt-ref1 (a i)
+  (if (and (not (consp a)) (not (%mda-p a)) (eq (obj-subtag a) #x12))
+      (%f32-aref a i)
+      (%prim-aref a i)))
+(defun %elt-set1 (a i v)
+  (if (and (not (consp a)) (not (%mda-p a)) (eq (obj-subtag a) #x12))
+      (%f32-aset a i v)
+      (%prim-aset a i v)))
+
 (defun %aref-multi (a &rest subs)
   "Multi-subscript AREF.  For an MDA (subtag #x34), compute row-major
    index from SUBS + the MDA's dims, then ref the underlying data
@@ -5319,15 +5334,15 @@
            (let ((off (%mda-offset a)))
              (if (%mda-p disp)
                  (apply #'%aref-multi disp (+ idx off) nil)
-                 (%prim-aref disp (+ idx off))))
-           (%prim-aref (%mda-data a) idx))))
+                 (%elt-ref1 disp (+ idx off))))
+           (%elt-ref1 (%mda-data a) idx))))
     ;; Non-MDA — single-sub semantic only.
     ((null (cdr subs))
-     (if (consp a) (%wrapper-aref a (car subs)) (%prim-aref a (car subs))))
+     (if (consp a) (%wrapper-aref a (car subs)) (%elt-ref1 a (car subs))))
     ;; Multi-sub on a non-MDA: shouldn't normally happen.  Take the
     ;; first sub as the index (matches the historical pre-MDA
     ;; behavior where multi-sub forms got the trailing subs dropped).
-    (t (if (consp a) (%wrapper-aref a (car subs)) (%prim-aref a (car subs))))))
+    (t (if (consp a) (%wrapper-aref a (car subs)) (%elt-ref1 a (car subs))))))
 
 (defun %aref2 (a i j)
   "Two-subscript AREF without &rest/APPLY: the common rank-2 case (a
@@ -5391,17 +5406,17 @@
            (let ((off (%mda-offset a)))
              (if (%mda-p disp)
                  (apply #'%aset-multi disp sto (+ idx off) nil)
-                 (%prim-aset disp (+ idx off) sto)))
-           (%prim-aset (%mda-data a) idx sto))
+                 (%elt-set1 disp (+ idx off) sto)))
+           (%elt-set1 (%mda-data a) idx sto))
        val))
     ;; Non-MDA single-sub.
     ((null (cdr subs))
      (let ((sto (%aset-store-val a val)))
-       (if (consp a) (%wrapper-aset a (car subs) sto) (%prim-aset a (car subs) sto)))
+       (if (consp a) (%wrapper-aset a (car subs) sto) (%elt-set1 a (car subs) sto)))
      val)
     (t
      (let ((sto (%aset-store-val a val)))
-       (if (consp a) (%wrapper-aset a (car subs) sto) (%prim-aset a (car subs) sto)))
+       (if (consp a) (%wrapper-aset a (car subs) sto) (%elt-set1 a (car subs) sto)))
      val)))
 
 (defun array-dimension (a n)
@@ -5993,6 +6008,10 @@
        (if (%bulk-copy-ok-p r seq)
            (progn (%bulk-copy r 0 seq 0 (length seq)) r)
            (dotimes (i (length seq) r) (aset r i (aref seq i))))))
+    ;; packed single-float vector (subtag #x12) copies to a packed one
+    ((and (not (%mda-p seq)) (eql (obj-subtag seq) #x12))
+     (let ((r (%make-f32-vector (length seq))))
+       (dotimes (i (length seq) r) (aset r i (aref seq i)))))
     (t (let ((r (make-array (length seq))))
          (if (%bulk-copy-ok-p r seq)
              (progn (%bulk-copy r 0 seq 0 (length seq)) r)

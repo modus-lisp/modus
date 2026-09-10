@@ -35,6 +35,7 @@
 (defconstant +subtag-simple-vector+ #x01)
 (defconstant +subtag-string+ #x10)
 (defconstant +subtag-u8-vector+ #x11)
+(defconstant +subtag-f32-vector+ #x12)   ; packed (simple-array single-float (*)): 4-byte IEEE32 lanes, no pointers
 (defconstant +subtag-u64-vector+ #x14)
 (defconstant +subtag-sap+ #x16)
 (defconstant +subtag-bignum+ #x30)

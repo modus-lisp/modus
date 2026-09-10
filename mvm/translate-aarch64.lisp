@@ -4180,6 +4180,118 @@
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
+          ;; ---- ALLOC-F32 Vd, Vcount ----  packed single-float vector (#x12):
+          ;; header (N << 8) | #x12 with N in ELEMENTS, pad, N 4-byte lanes at
+          ;; +16; size = align16(16 + 4N).  Same zeroing as :alloc-u8.
+          ((= op +op-alloc-f32+)
+           (let* ((vd (vr 0))
+                  (pcount (ensure-src (vr 1) +a64-x17+))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (emit-aarch64-gc-mark-start buf)
+             (a64-asr-imm buf +a64-x9+ pcount 1)              ; x9 = N
+             (a64-lsl-imm buf +a64-x16+ +a64-x9+ 8)           ; x16 = N << 8
+             (a64-movz buf +a64-x10+ #x12 0)                  ; subtag
+             (a64-orr-reg buf +a64-x16+ +a64-x16+ +a64-x10+)
+             (a64-stur buf +a64-x16+ +a64-x24+ 0)             ; header
+             (a64-lsl-imm buf +a64-x9+ +a64-x9+ 2)            ; x9 = 4N bytes
+             (a64-add-imm buf +a64-x16+ +a64-x9+ 7)
+             (a64-lsr-imm buf +a64-x16+ +a64-x16+ 3)
+             (a64-lsl-imm buf +a64-x16+ +a64-x16+ 3)             ; (4N+7) & ~7
+             (a64-add-reg buf +a64-x16+ +a64-x24+ +a64-x16+ 0 0)
+             (a64-add-imm buf +a64-x16+ +a64-x16+ 16)            ; zero end
+             (a64-add-imm buf +a64-x10+ +a64-x24+ 8)             ; cursor
+             (let ((loop-start (a64-current-index buf)))
+               (a64-stur buf +a64-xzr+ +a64-x10+ 0)
+               (a64-add-imm buf +a64-x10+ +a64-x10+ 8)
+               (a64-cmp-reg buf +a64-x10+ +a64-x16+)
+               (a64-bcond buf #b0011 (- loop-start (a64-current-index buf))))
+             (a64-add-imm buf pd +a64-x24+ 9)                 ; result = base | tag9
+             (a64-add-imm buf +a64-x17+ +a64-x9+ 31)          ; align16(16 + 4N)
+             (a64-lsr-imm buf +a64-x17+ +a64-x17+ 4)
+             (a64-lsl-imm buf +a64-x17+ +a64-x17+ 4)
+             (a64-add-reg buf +a64-x24+ +a64-x24+ +a64-x17+ 0 0)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- F32-REF Vd, Varr, Vidx ----  the lane's 32 bits, tagged.
+          ;; Address = Varr + 7 + 4*real_idx.  LDUR W, [x9, #7].
+          ((= op +op-f32-ref+)
+           (let* ((vd (vr 0))
+                  (parr (ensure-src (vr 1) +a64-x16+))
+                  (pidx (ensure-src (vr 2) +a64-x17+))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (a64-asr-imm buf +a64-x9+ pidx 1)                ; x9 = real_idx
+             (a64-add-reg buf +a64-x9+ parr +a64-x9+ 0 2)     ; x9 = Varr + 4*idx
+             ;; LDUR W<pd>, [x9, #7] = 0xB8400000 | (7<<12) | (x9<<5) | pd
+             (a64-emit buf (logior #xB8407000 (ash +a64-x9+ 5) pd))
+             (a64-lsl-imm buf pd pd 1)                        ; tag
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- F32-SET Varr, Vidx, Vval ----  STUR W, [x10, #7]
+          ((= op +op-f32-set+)
+           (let* ((parr (ensure-src (vr 0) +a64-x16+))
+                  (pidx (ensure-src (vr 1) +a64-x17+))
+                  (pval (ensure-src (vr 2) +a64-x9+)))
+             (a64-asr-imm buf +a64-x10+ pidx 1)
+             (a64-add-reg buf +a64-x10+ parr +a64-x10+ 0 2)   ; x10 = Varr + 4*idx
+             (a64-asr-imm buf +a64-x11+ pval 1)               ; untagged bits
+             ;; STUR W11, [x10, #7] = 0xB8000000 | (7<<12) | (x10<<5) | 11
+             (a64-emit buf (logior #xB8007000 (ash +a64-x10+ 5) +a64-x11+))))
+
+          ;; ---- F32-LOAD Vd, Varr, Vidx ----  lane → FCVT D,S → boxed single
+          ((= op +op-f32-load+)
+           (let* ((vd (vr 0))
+                  (parr (ensure-src (vr 1) +a64-x16+))
+                  (pidx (ensure-src (vr 2) +a64-x17+))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (a64-asr-imm buf +a64-x9+ pidx 1)
+             (a64-add-reg buf +a64-x9+ parr +a64-x9+ 0 2)     ; x9 = Varr + 4*idx
+             (a64-emit buf (logior #xB8407000 (ash +a64-x9+ 5) +a64-x10+)) ; LDUR W10, [x9,#7]
+             (a64-emit buf (logior #x1E270000 (ash +a64-x10+ 5) 0))        ; FMOV S0, W10
+             (a64-emit buf (logior #x1E22C000 0))                          ; FCVT D0, S0
+             (a64-fmov-x-d buf +a64-x9+ 0)                    ; x9 = double bits
+             (emit-aarch64-gc-mark-start buf)
+             (a64-movz buf +a64-x10+ #x464 0)                 ; header: 4 slots, subtag #x64
+             (a64-stur buf +a64-x10+ +a64-x24+ 0)
+             (a64-float-store-bits buf +a64-x24+ +a64-x9+ +a64-x10+)
+             (a64-add-imm buf pd +a64-x24+ 9)
+             (a64-add-imm buf +a64-x24+ +a64-x24+ 48)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- F32-STORE Varr, Vidx, Vval ----  boxed float → FCVT S,D → lane
+          ((= op +op-f32-store+)
+           (let* ((parr (ensure-src (vr 0) +a64-x16+))
+                  (pidx (ensure-src (vr 1) +a64-x17+))
+                  (pval (ensure-src (vr 2) +a64-x11+)))
+             (a64-float-load-bits buf pval +a64-x9+ +a64-x10+) ; x9 = payload bits
+             (a64-fmov-d-x buf 0 +a64-x9+)                    ; D0 ← bits
+             (a64-emit buf (logior #x1E624000 0))              ; FCVT S0, D0
+             (a64-emit buf (logior #x1E260000 (ash 0 5) +a64-x11+)) ; FMOV W11, S0
+             (a64-asr-imm buf +a64-x10+ pidx 1)
+             (a64-add-reg buf +a64-x10+ parr +a64-x10+ 0 2)   ; x10 = Varr + 4*idx
+             (a64-emit buf (logior #xB8007000 (ash +a64-x10+ 5) +a64-x11+)))) ; STUR W11, [x10,#7]
+
+          ;; ---- FROUND32 Vd, Vs ----  payload → FCVT S,D → FCVT D,S → boxed single
+          ((= op +op-fround32+)
+           (let* ((vd (vr 0))
+                  (ps (ensure-src (vr 1) +a64-x16+))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (a64-float-load-bits buf ps +a64-x9+ +a64-x10+)
+             (a64-fmov-d-x buf 0 +a64-x9+)
+             (a64-emit buf (logior #x1E624000 0))              ; FCVT S0, D0
+             (a64-emit buf (logior #x1E22C000 0))              ; FCVT D0, S0
+             (a64-fmov-x-d buf +a64-x9+ 0)
+             (emit-aarch64-gc-mark-start buf)
+             (a64-movz buf +a64-x10+ #x464 0)
+             (a64-stur buf +a64-x10+ +a64-x24+ 0)
+             (a64-float-store-bits buf +a64-x24+ +a64-x9+ +a64-x10+)
+             (a64-add-imm buf pd +a64-x24+ 9)
+             (a64-add-imm buf +a64-x24+ +a64-x24+ 48)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
           ;; ---- U8-REF Vd, Varr, Vidx ----  (load one byte from a u8 vector)
           ;; Byte address = (Varr - 9) + 16 + real_idx = Varr + 7 + real_idx.
           ;; Vidx is a TAGGED fixnum (real_idx*2); result is a TAGGED fixnum
@@ -5326,10 +5438,15 @@
       (a64-lsr-imm buf +a64-x15+ +a64-x13+ 8)            ; x15 = count
       (a64-lsl-imm buf +a64-x9+ +a64-x13+ 56) (a64-lsr-imm buf +a64-x9+ +a64-x9+ 56) ; x9 = subtag
       (a64-cmp-imm buf +a64-x9+ #x11)
-      (let ((u8sz (incf *mvm-label-counter*)) (hadsz (incf *mvm-label-counter*)))
+      (let ((u8sz (incf *mvm-label-counter*)) (hadsz (incf *mvm-label-counter*))
+            (f32sz (incf *mvm-label-counter*)))
         (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i u8sz :bcond))
+        (a64-cmp-imm buf +a64-x9+ #x12)                  ; f32-vector: 4 bytes/lane
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i f32sz :bcond))
         (a64-lsl-imm buf +a64-x15+ +a64-x15+ 3) (a64-add-imm buf +a64-x15+ +a64-x15+ 16) ; (count+2)*8 = count*8+16
         (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i hadsz :b))
+        (a64-set-label buf f32sz)
+        (a64-lsl-imm buf +a64-x15+ +a64-x15+ 2)          ; f32: count*4 bytes, then the u8 formula
         (a64-set-label buf u8sz)
         (a64-add-imm buf +a64-x15+ +a64-x15+ 16)         ; u8: 16 + count(bytes)
         (a64-set-label buf hadsz))
@@ -5514,6 +5631,7 @@
           (is-cons (incf *mvm-label-counter*))
           (leafskip (incf *mvm-label-counter*))
           (u8sz2 (incf *mvm-label-counter*))
+          (f32sz2 (incf *mvm-label-counter*))
           (haveslots (incf *mvm-label-counter*))
           (sloop (incf *mvm-label-counter*))
           (sdone2 (incf *mvm-label-counter*)))
@@ -5538,15 +5656,19 @@
       (a64-add-imm buf +a64-x18+ +a64-x26+ 16)             ; x18 = slot cursor (obj+16)
       (a64-cmp-imm buf +a64-x14+ #x11)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i u8sz2 :bcond))
+      (a64-cmp-imm buf +a64-x14+ #x12)                     ; f32-vector: 4 bytes/lane
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i f32sz2 :bcond))
       (a64-add-imm buf +a64-x9+ +a64-x16+ 16)              ; general: count*8+16
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i haveslots :b))
+      (a64-set-label buf f32sz2)
+      (a64-lsl-imm buf +a64-x15+ +a64-x15+ 2)              ; count*4
       (a64-set-label buf u8sz2)
       (a64-add-imm buf +a64-x9+ +a64-x15+ 16)              ; u8: 16+count(bytes)
       (a64-set-label buf haveslots)
       (a64-add-imm buf +a64-x9+ +a64-x9+ 15) (a64-lsr-imm buf +a64-x9+ +a64-x9+ 4) (a64-lsl-imm buf +a64-x9+ +a64-x9+ 4) ; align16
       (a64-add-reg buf +a64-x24+ +a64-x26+ +a64-x9+ 0 0)   ; x24 = next object pos (preserved)
       (a64-add-reg buf +a64-x26+ +a64-x18+ +a64-x16+ 0 0)  ; x26 = slot_end = obj+16+count*8
-      (dolist (st (list #x10 #x11 #x14 #x16 #x30 #x31 #x60 #x64 #x65 #x66))
+      (dolist (st (list #x10 #x11 #x12 #x14 #x16 #x30 #x31 #x60 #x64 #x65 #x66))
         (a64-cmp-imm buf +a64-x14+ st)
         (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i leafskip :bcond)))
       ;; pointer-bearing: scan slots [x18 .. slot_end=x26)

@@ -2716,6 +2716,8 @@
     ;; (UNSIGNED-BYTE 8) and near-equivalents upgrade to (UNSIGNED-BYTE 8)
     ;; — Modus stores these in a byte-packed vector (subtag #x11).
     ((%u8-element-type-p type) '(unsigned-byte 8))
+    ;; SINGLE-FLOAT (and SHORT-FLOAT) — the packed #x12 vector.
+    ((%f32-element-type-p type) 'single-float)
     ;; Everything else is stored as a general (T) element.
     (t t)))
 
@@ -2764,6 +2766,8 @@
     ;; Byte-packed (unsigned-byte 8) vector (subtag #x11): element-type
     ;; (unsigned-byte 8), NOT T → not a simple-vector.
     ((eql (obj-subtag x) #x11) nil)
+    ;; Packed single-float vector (subtag #x12): element-type SINGLE-FLOAT.
+    ((eql (obj-subtag x) #x12) nil)
     ;; Native multi-dim header: only rank-1, T-element, plain vectors qualify.
     ((%mda-p x)
      (and (eql (%mda-rank x) 1)
@@ -4729,6 +4733,9 @@
     ((readtablep obj) 'readtable)
     ((random-state-p obj) 'random-state)
     ((symbolp obj) (if (keywordp obj) 'keyword 'symbol))
+    ;; packed single-float vector (subtag #x12)
+    ((and (not (consp obj)) (not (%mda-p obj)) (eql (obj-subtag obj) #x12))
+     (list 'simple-array 'single-float (list (length obj))))
     ((vectorp obj) 'simple-vector)
     ((arrayp obj) 'array)
     (t t)))
@@ -4907,6 +4914,11 @@
      t)
     (t nil)))
 
+(defun %f32-element-type-p (etype)
+  "True if ETYPE upgrades to SINGLE-FLOAT (the packed #x12 vector):
+   single-float and short-float (which upgrades to single)."
+  (or (eq etype 'single-float) (eq etype 'short-float)))
+
 (defun %make-u8-vector (n)
   "Allocate a byte-packed (unsigned-byte 8) vector of N bytes (subtag
    #x11), payload zero-initialised by the alloc-u8 opcode."
@@ -4993,11 +5005,22 @@
              ;; smaller than the general tagged-word array.  Only for real
              ;; u8 element types; everything else is unchanged.
              (u8-elt (and etype-set (%u8-element-type-p etype)))
+             ;; Packed single-float storage (subtag #x12), 4 bytes per lane —
+             ;; ONLY for the bare simple 1-D vector.  A fill-pointer /
+             ;; adjustable / displaced / multi-dim array is an MDA wrapper
+             ;; whose accessors read the data vector with the raw word
+             ;; primitives, so those keep the generic store (element type is
+             ;; still reported from the MDA header).  gate18 lost 18 tests
+             ;; to wrapped packed data.
+             (f32-elt (and etype-set (%f32-element-type-p etype)
+                           (= rank 1) (not (consp dim))
+                           (not fp) (not adj) (not disp)))
              (data (cond
                      ;; :initial-element — fill every slot.
                      (ie-p
                       (let* ((a (cond (char-elt (%make-string-array total))
                                       (u8-elt (%make-u8-vector total))
+                                      (f32-elt (%make-f32-vector total))
                                       (t (make-array total))))
                              (store (if (and char-elt (characterp ie))
                                         (char-code ie) ie))
@@ -5010,10 +5033,12 @@
                      (ic-p
                       (let ((a (cond (char-elt (%make-string-array total))
                                      (u8-elt (%make-u8-vector total))
+                                     (f32-elt (%make-f32-vector total))
                                      (t (make-array total)))))
                         (%mda-fill-contents-flat a ic dim-list)))
                      (char-elt (%make-string-array total))
                      (u8-elt (%make-u8-vector total))
+                     (f32-elt (%make-f32-vector total))
                      (t (make-array total)))))
         ;; Decide return shape.  Phase 2a: wrap in MDA whenever rank ≠ 1,
         ;; or any non-trivial kwarg appeared, or the dim was passed as
@@ -5036,7 +5061,11 @@
           ;; (signed-byte 32))) read their wrapper headers as elements.
           ((and (= rank 1) (not (consp dim))
                 (not fp) (not adj) (not disp)
-                (or (eq etype t) (and (not char-elt) (not u8-elt))))
+                (or (eq etype t) (and (not char-elt) (not u8-elt) (not f32-elt))))
+           data)
+          ;; Plain 1-D single-float vector: the packed #x12 object itself.
+          ((and (= rank 1) (not (consp dim))
+                (not fp) (not adj) (not disp) f32-elt)
            data)
           ((and (= rank 1) (not (consp dim))
                 (not fp) (not adj) (not disp) char-elt)
@@ -5891,7 +5920,9 @@
          ;; A byte-packed u8 vector (subtag #x11) has element-type
          ;; (unsigned-byte 8), so it is NOT a simple-vector.
          ((eq tn 'simple-vector) (and (or (arrayp obj) (stringp obj))
-                                      (not (eql (obj-subtag obj) #x11))))
+                                      (not (eql (obj-subtag obj) #x11))
+                                      ;; packed single-float vector (#x12)
+                                      (not (eql (obj-subtag obj) #x12))))
          ((eq tn 'bit-vector)    (arrayp obj))
          ((eq tn 'simple-bit-vector) (arrayp obj))
          ;; CLHS 4.3: the SEQUENCE system class is exactly (or list vector).
@@ -6118,7 +6149,7 @@
                        (t obj))))
           (and (not (or (fixnump obj) (characterp obj) (consp obj) (null obj)))
                (or (= (obj-subtag obj) #x31) (= (obj-subtag obj) #x32)
-                   (= (obj-subtag obj) #x11))
+                   (= (obj-subtag obj) #x11) (= (obj-subtag obj) #x12))
                (let* ((et (and (cdr type) (cadr type)))
                       (sz-given (and (cddr type) t))
                       (sz (and (cddr type) (caddr type)))
@@ -6127,6 +6158,9 @@
                       ;; Byte-packed (unsigned-byte 8) vector (subtag #x11):
                       ;; element type is exactly (UNSIGNED-BYTE 8), NOT T.
                       (is-u8      (= (obj-subtag obj) #x11))
+                      ;; Packed single-float vector (subtag #x12): element
+                      ;; type is exactly SINGLE-FLOAT, NOT T.
+                      (is-f32     (= (obj-subtag obj) #x12))
                       (is-bitvec  (and is-array
                                        (> (array-length obj) 0)
                                        (bit-vector-p obj)))
@@ -6152,6 +6186,16 @@
                                   (or (eq (car et) 'signed-byte)
                                       (eq (car et) 'integer)
                                       (eq (car et) 'mod)))
+                             t)
+                            (t nil)))
+                         ;; f32 vector: single-float and its float/real/number
+                         ;; supertypes; NOT T / character / integer types.
+                         (is-f32
+                          (cond
+                            ((or (null et) (eq et '*)) t)
+                            ((or (eq et 'single-float) (eq et 'short-float)
+                                 (eq et 'float) (eq et 'real)
+                                 (eq et 'number) (eq et 'atom))
                              t)
                             (t nil)))
                          ((or (null et) (eq et '*) (eq et t))

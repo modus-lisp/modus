@@ -2325,12 +2325,10 @@
 
 (defun %round-to-single (f)
   "Round the IEEE-double payload of float F to single-float (24-bit)
-   precision, round-to-nearest-even, returning a SINGLE-FLOAT-tagged
-   (#x61) object whose payload is the nearest single value re-expressed
-   as a 64-bit double (low 29 mantissa bits zero — what the Dragon4
-   printer path expects).  Zero / subnormal / inf / nan pass through
-   retagged (not rounded).  HI stored sign-extended to match the SSE2
-   float-store convention (translate-x64.lisp)."
+   precision, round-to-nearest-even, returning a SINGLE-FLOAT-tagged box.
+   (The native :fround32 opcode is correct on x64 but its aarch64 twin is
+   deferred with the rest of the native f32 conversions; this Lisp version
+   is the one in service.)"
   (let* ((hi   (%float-hi32 f))
          (lo   (%float-lo32 f))
          (sign (logand (ash hi -31) 1))
@@ -3132,6 +3130,13 @@
     ;; exactly (UNSIGNED-BYTE 8), NOT T.  Matches integer-family element
     ;; specs that are supertypes of (unsigned-byte 8); rejects T /
     ;; character / bit.
+    ;; Packed single-float vector (subtag #x12): element type is exactly
+    ;; SINGLE-FLOAT; matches the float/real/number supertypes, not T.
+    ((eql (obj-subtag arr) #x12)
+     (or (null elt) (eq elt '*)
+         (%typename-eq elt 'single-float) (%typename-eq elt 'short-float)
+         (%typename-eq elt 'float) (%typename-eq elt 'real)
+         (%typename-eq elt 'number) (%typename-eq elt 'atom)))
     ((eql (obj-subtag arr) #x11)
      (cond
        ;; (unsigned-byte 8) — exact.
@@ -3286,6 +3291,7 @@
           (and (arrayp obj) (= (array-rank obj) 1)
                (not (stringp obj))
                (not (eql (obj-subtag obj) #x11))
+               (not (eql (obj-subtag obj) #x12))
                (not (and (consp obj) (eql (car obj) 8765432)))))
          ;; CLHS 4.3 / the SEQUENCE system class: sequence = the union of
          ;; LIST and VECTOR.  A multi-dimensional array is an ARRAY but NOT

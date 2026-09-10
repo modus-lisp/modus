@@ -487,6 +487,7 @@
    #x61..#x63 are NON-float pointer-bearing objects, so they are NOT leaves."
   (if (= subtag #x10) t
    (if (= subtag #x11) t
+   (if (= subtag #x12) t
     (if (= subtag #x14) t
      (if (= subtag #x16) t
       (if (= subtag #x30) t
@@ -494,7 +495,7 @@
         (if (= subtag #x64) t
          (if (= subtag #x65) t
           (if (= subtag #x66) t
-           nil))))))))))
+           nil)))))))))))
 
 (defun %gc-clear-bitmap-range (range-start size)
   "Zero the object-start AND cons-kind bitmap bits for [RANGE-START,

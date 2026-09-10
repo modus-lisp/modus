@@ -2703,6 +2703,178 @@
            (emit-lea buf d +scratch-reg+ #x09)
            (maybe-store-scratch buf vd)))
 
+        ((op= +op-alloc-f32+)
+         ;; (alloc-f32 Vd Vcount) — packed single-float vector (subtag #x12).
+         ;; Same shape as +op-alloc-u8+: header (N << 8) | #x12 with N in
+         ;; ELEMENTS, 8-byte pad, then N 4-byte lanes at +16; size =
+         ;; align16(16 + 4N).  Payload zeroed for the flat scan.
+         (let* ((vd (first operands))
+                (vcount (second operands))
+                (d (dest-phys-or-scratch vd))
+                (pc (vreg-phys vcount)))
+           (emit-push buf 'r12)
+           (if pc
+               (emit-mov-reg-reg buf +scratch-reg+ pc)
+               (emit-load-vreg buf vcount +scratch-reg+))
+           (emit-sar-reg-imm buf +scratch-reg+ 1)   ; scratch = N
+           (emit-push buf +scratch-reg+)
+           (emit-shl-reg-imm buf +scratch-reg+ 8)
+           (emit-or-reg-imm buf +scratch-reg+ #x12)  ; f32-vector subtag
+           (emit-mov-mem-reg buf 'r12 +scratch-reg+ 0)
+           (emit-mcgc-set-start-bit buf 'r12)
+           (emit-pop buf +scratch-reg+)              ; scratch = N
+           (emit-shl-reg-imm buf +scratch-reg+ 2)    ; 4N bytes
+           (emit-add-reg-imm buf +scratch-reg+ 16)
+           (emit-add-reg-imm buf +scratch-reg+ 15)
+           (emit-and-reg-imm buf +scratch-reg+ -16)
+           (emit-add-reg-reg buf 'r12 +scratch-reg+)
+           (emit-pop buf +scratch-reg+)              ; base
+           (emit-push buf 'rcx)
+           (emit-push buf 'rdx)
+           (emit-lea buf 'rcx +scratch-reg+ 8)
+           (emit-bytes buf #x48 #x31 #xD2)            ; xor rdx, rdx
+           (emit-zero-word-range buf 'rcx 'r12 'rdx)
+           (emit-pop buf 'rdx)
+           (emit-pop buf 'rcx)
+           (emit-lea buf d +scratch-reg+ #x09)
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-f32-ref+)
+         ;; (f32-ref Vd Varr Vidx) — the lane's 32 bits as a tagged fixnum.
+         ;; Address = Varr + 7 + 4*real_idx.
+         (let* ((vd (first operands))
+                (varr (second operands))
+                (vidx (third operands))
+                (d (dest-phys-or-scratch vd)))
+           (let ((pidx (vreg-phys vidx)))
+             (if pidx
+                 (emit-mov-reg-reg buf +scratch-reg+ pidx)
+                 (emit-load-vreg buf vidx +scratch-reg+)))
+           (emit-sar-reg-imm buf +scratch-reg+ 1)
+           (emit-shl-reg-imm buf +scratch-reg+ 2)    ; 4 * real_idx
+           (let ((pobj (vreg-phys varr)))
+             (if pobj
+                 (emit-add-reg-reg buf +scratch-reg+ pobj)
+                 (progn
+                   (emit-push buf 'r13)
+                   (emit-load-vreg buf varr 'r13)
+                   (emit-add-reg-reg buf +scratch-reg+ 'r13)
+                   (emit-pop buf 'r13))))
+           (emit-bytes buf #x8B #x40 #x07)        ; mov eax, dword [rax+7] (zero-extends)
+           (emit-bytes buf #x48 #x01 #xC0)        ; add rax, rax (tag)
+           (emit-mov-reg-reg buf d 'rax)
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-f32-set+)
+         ;; (f32-set Varr Vidx Vval) — store the low 32 bits of the untagged
+         ;; value.  Clobbers only RAX (R13 saved/restored), like +op-u8-set+.
+         (let* ((varr (first operands))
+                (vidx (second operands))
+                (vval (third operands)))
+           (let ((pidx (vreg-phys vidx)))
+             (if pidx
+                 (emit-mov-reg-reg buf +scratch-reg+ pidx)
+                 (emit-load-vreg buf vidx +scratch-reg+)))
+           (emit-sar-reg-imm buf +scratch-reg+ 1)
+           (emit-shl-reg-imm buf +scratch-reg+ 2)
+           (let ((pobj (vreg-phys varr)))
+             (if pobj
+                 (emit-add-reg-reg buf +scratch-reg+ pobj)
+                 (progn
+                   (emit-push buf 'r13)
+                   (emit-load-vreg buf varr 'r13)
+                   (emit-add-reg-reg buf +scratch-reg+ 'r13)
+                   (emit-pop buf 'r13))))
+           (emit-push buf 'r13)
+           (let ((pv (vreg-phys vval)))
+             (if pv
+                 (emit-mov-reg-reg buf 'r13 pv)
+                 (emit-load-vreg buf vval 'r13)))
+           (emit-sar-reg-imm buf 'r13 1)          ; untag
+           ;; mov [rax+7], r13d  →  44 89 68 07
+           (emit-bytes buf #x44 #x89 #x68 #x07)
+           (emit-pop buf 'r13)))
+
+        ((op= +op-f32-load+)
+         ;; (f32-load Vd Varr Vidx) — lane → CVTSS2SD → fresh boxed
+         ;; single-float (#x64).  Same boxing tail as +op-fadd+.
+         (let* ((vd (first operands))
+                (varr (second operands))
+                (vidx (third operands)))
+           (let ((pidx (vreg-phys vidx)))
+             (if pidx
+                 (emit-mov-reg-reg buf +scratch-reg+ pidx)
+                 (emit-load-vreg buf vidx +scratch-reg+)))
+           (emit-sar-reg-imm buf +scratch-reg+ 1)
+           (emit-shl-reg-imm buf +scratch-reg+ 2)
+           (let ((pobj (vreg-phys varr)))
+             (if pobj
+                 (emit-add-reg-reg buf +scratch-reg+ pobj)
+                 (progn
+                   (emit-push buf 'r13)
+                   (emit-load-vreg buf varr 'r13)
+                   (emit-add-reg-reg buf +scratch-reg+ 'r13)
+                   (emit-pop buf 'r13))))
+           (emit-bytes buf #x8B #x40 #x07)            ; mov eax, dword [rax+7]
+           (emit-bytes buf #x66 #x0F #x6E #xC0)       ; movd xmm0, eax
+           (emit-bytes buf #xF3 #x0F #x5A #xC0)       ; cvtss2sd xmm0, xmm0
+           (emit-mov-reg-imm buf 'rcx #x464)          ; (count=4)<<8 | subtag #x64 single
+           (emit-mov-mem-reg buf 'r12 'rcx 0)
+           (emit-bytes buf #x66 #x48 #x0F #x7E #xC1)  ; movq rcx, xmm0
+           (emit-float-store-bits buf 'r12 'rcx 'rdx)
+           (emit-mcgc-set-start-bit buf 'r12)
+           (let ((d (dest-phys-or-scratch vd)))
+             (emit-lea buf d 'r12 9)
+             (emit-add-reg-imm buf 'r12 48)
+             (maybe-store-scratch buf vd))))
+
+        ((op= +op-f32-store+)
+         ;; (f32-store Varr Vidx Vval) — boxed float payload → CVTSD2SS →
+         ;; 32-bit lane.  Clobbers rax/rcx/rdx (like +op-fadd+), R13 saved.
+         (let* ((varr (first operands))
+                (vidx (second operands))
+                (vval (third operands)))
+           (emit-load-vreg buf vval 'rax)
+           (emit-float-load-bits buf 'rax 'rcx 'rdx)   ; rcx = payload bits
+           (emit-bytes buf #x66 #x48 #x0F #x6E #xC1)  ; movq xmm0, rcx
+           (emit-bytes buf #xF2 #x0F #x5A #xC0)       ; cvtsd2ss xmm0, xmm0
+           (emit-bytes buf #x66 #x0F #x7E #xC1)       ; movd ecx, xmm0
+           (let ((pidx (vreg-phys vidx)))
+             (if pidx
+                 (emit-mov-reg-reg buf +scratch-reg+ pidx)
+                 (emit-load-vreg buf vidx +scratch-reg+)))
+           (emit-sar-reg-imm buf +scratch-reg+ 1)
+           (emit-shl-reg-imm buf +scratch-reg+ 2)
+           (let ((pobj (vreg-phys varr)))
+             (if pobj
+                 (emit-add-reg-reg buf +scratch-reg+ pobj)
+                 (progn
+                   (emit-push buf 'r13)
+                   (emit-load-vreg buf varr 'r13)
+                   (emit-add-reg-reg buf +scratch-reg+ 'r13)
+                   (emit-pop buf 'r13))))
+           (emit-bytes buf #x89 #x48 #x07)))          ; mov [rax+7], ecx
+
+        ((op= +op-fround32+)
+         ;; (fround32 Vd Vs) — payload → CVTSD2SS → CVTSS2SD → fresh boxed
+         ;; single-float.  Replaces the Lisp %round-to-single.
+         (let* ((vd (first operands))
+                (vs (second operands)))
+           (emit-load-vreg buf vs 'rax)
+           (emit-float-load-bits buf 'rax 'rcx 'rdx)
+           (emit-bytes buf #x66 #x48 #x0F #x6E #xC1)  ; movq xmm0, rcx
+           (emit-bytes buf #xF2 #x0F #x5A #xC0)       ; cvtsd2ss xmm0, xmm0
+           (emit-bytes buf #xF3 #x0F #x5A #xC0)       ; cvtss2sd xmm0, xmm0
+           (emit-mov-reg-imm buf 'rcx #x464)
+           (emit-mov-mem-reg buf 'r12 'rcx 0)
+           (emit-bytes buf #x66 #x48 #x0F #x7E #xC1)  ; movq rcx, xmm0
+           (emit-float-store-bits buf 'r12 'rcx 'rdx)
+           (emit-mcgc-set-start-bit buf 'r12)
+           (let ((d (dest-phys-or-scratch vd)))
+             (emit-lea buf d 'r12 9)
+             (emit-add-reg-imm buf 'r12 48)
+             (maybe-store-scratch buf vd))))
+
         ((op= +op-u8-ref+)
          ;; (u8-ref Vd Varr Vidx) — load one byte from a u8 vector.
          ;; Byte address = (Varr - 9) + 16 + real_idx.
@@ -5629,17 +5801,23 @@
       ;; word-size path.  All other subtags fall through unchanged (purely
       ;; additive).
       (let ((u8-size (make-label))
+            (f32-size (make-label))
             (size-done (make-label)))
         (emit-mov-reg-reg buf 'r9 'rax)          ; r9 = header
         (emit-and-reg-imm buf 'r9 #xFF)          ; r9 = subtag byte
         (emit-cmp-reg-imm buf 'r9 #x11)          ; u8-vector?
         (emit-jcc buf :e u8-size)
+        (emit-cmp-reg-imm buf 'r9 #x12)          ; f32-vector? (4 bytes/lane)
+        (emit-jcc buf :e f32-size)
         ;; ---- General (word) object: size = (count + 2) * 8, align 16 ----
         (emit-add-reg-imm buf 'r8 2)             ; count + 2
         (emit-shl-reg-imm buf 'r8 3)             ; * 8
         (emit-add-reg-imm buf 'r8 15)            ; + 15
         (emit-and-reg-imm buf 'r8 -16)           ; & ~15 (align to 16)
         (emit-jmp buf size-done)
+        ;; ---- f32 vector: byte count = 4N, then the u8 formula ----
+        (emit-label buf f32-size)
+        (emit-shl-reg-imm buf 'r8 2)
         ;; ---- u8 vector: size = align16(16 + N) ----
         (emit-label buf u8-size)
         (emit-add-reg-imm buf 'r8 16)            ; 16 (header + padding) + N
@@ -6614,16 +6792,21 @@
       ;; still holds the header; R9 is free in this (pinning) copy variant
       ;; too.  Purely additive — non-#x11 objects use the word formula.
       (let ((u8-size (make-label))
+            (f32-size (make-label))
             (size-done (make-label)))
         (emit-mov-reg-reg buf 'r9 'rax)
         (emit-and-reg-imm buf 'r9 #xFF)
         (emit-cmp-reg-imm buf 'r9 #x11)
         (emit-jcc buf :e u8-size)
+        (emit-cmp-reg-imm buf 'r9 #x12)
+        (emit-jcc buf :e f32-size)
         (emit-add-reg-imm buf 'r8 2)
         (emit-shl-reg-imm buf 'r8 3)
         (emit-add-reg-imm buf 'r8 15)
         (emit-and-reg-imm buf 'r8 -16)
         (emit-jmp buf size-done)
+        (emit-label buf f32-size)
+        (emit-shl-reg-imm buf 'r8 2)
         (emit-label buf u8-size)
         (emit-add-reg-imm buf 'r8 16)
         (emit-add-reg-imm buf 'r8 15)

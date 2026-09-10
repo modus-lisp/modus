@@ -1710,6 +1710,52 @@
                    (%obj-elt-set obj idx (svref regs vs)))
                  (setf pc npc3)))))
 
+          ;; Packed single-float vector (subtag #x12): the interpreter defers
+          ;; to the natively compiled runtime helpers (prelude) so the object
+          ;; it produces is the real #x12 vector native code expects.
+          (#.+op-alloc-f32+
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (vcount npc2) (fetch-reg bc npc)
+               (reg-set regs vd (%val->word
+                                 (%make-f32-vector (%word->val (reg-get regs vcount)))))
+               (setf pc npc2))))
+
+          (#.+op-f32-ref+
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (vobj npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vidx npc3) (fetch-reg bc npc2)
+                 (setf (svref regs vd)
+                       (%f32-bits-ref-rt (svref regs vobj) (svref regs vidx)))
+                 (setf pc npc3)))))
+
+          (#.+op-f32-set+
+           (multiple-value-bind (vobj npc) (fetch-reg bc pc)
+             (multiple-value-bind (vidx npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vs npc3) (fetch-reg bc npc2)
+                 (%f32-bits-set-rt (svref regs vobj) (svref regs vidx) (svref regs vs))
+                 (setf pc npc3)))))
+
+          (#.+op-f32-load+
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (vobj npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vidx npc3) (fetch-reg bc npc2)
+                 (setf (svref regs vd)
+                       (%f32-aref (svref regs vobj) (svref regs vidx)))
+                 (setf pc npc3)))))
+
+          (#.+op-f32-store+
+           (multiple-value-bind (vobj npc) (fetch-reg bc pc)
+             (multiple-value-bind (vidx npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vs npc3) (fetch-reg bc npc2)
+                 (%f32-aset (svref regs vobj) (svref regs vidx) (svref regs vs))
+                 (setf pc npc3)))))
+
+          (#.+op-fround32+
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (vs npc2) (fetch-reg bc npc)
+               (setf (svref regs vd) (%round-to-single (svref regs vs)))
+               (setf pc npc2))))
+
           (#.+op-aref+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vobj npc2) (fetch-reg bc npc)

@@ -656,6 +656,8 @@
        (not (%mda-p dst)) (not (%mda-p src))
        (not (eq (obj-subtag dst) #x11))
        (not (eq (obj-subtag src) #x11))
+       (not (eq (obj-subtag dst) #x12))
+       (not (eq (obj-subtag src) #x12))
        (if (%prim-stringp dst)
            (%prim-stringp src)
            (not (%prim-stringp src)))))
@@ -727,8 +729,12 @@
 
 (defun copy-seq (array)
   "Copy an array, returning a new array with the same elements."
-  (let ((len (array-length array))
-        (result (make-array (array-length array))))
+  (let* ((len (array-length array))
+         ;; a packed single-float vector copies to a packed one
+         (result (if (and array (not (consp array)) (not (%mda-p array))
+                          (eq (obj-subtag array) #x12))
+                     (%make-f32-vector len)
+                     (make-array (array-length array)))))
     (if (%bulk-copy-ok-p result array)
         (%bulk-copy result 0 array 0 len)
         (let ((i 0))
@@ -1041,6 +1047,98 @@
 (defun %float-lo32 (f)
   "Low 32 IEEE bits of boxed float F, UNSIGNED (0..2^32-1)."
   (logior (ash (%prim-aref f 2) 16) (%prim-aref f 3)))
+
+;;; ---- Packed single-float vectors (subtag #x12) ------------------------
+;;; The lanes hold raw IEEE32 bits; Modus's single-float VALUE is still the
+;;; boxed 4-slot object with an IEEE64 payload (numeric tower N1), so every
+;;; aref widens 32→64 and every aset narrows 64→32 with round-to-nearest-even
+;;; (the double payload of a single-float need not be exactly representable
+;;; after arithmetic).  These stay until floats are unboxed (docs/simd-plan.md).
+
+(defun %make-f32-vector (n)
+  "Allocate a packed single-float vector of N lanes, zero-filled (= 0.0f0)."
+  (%alloc-f32 n))
+
+(defun %f32-bits-ref-rt (a i) (%f32-bits-ref a i))
+(defun %f32-bits-set-rt (a i bits) (%f32-bits-set a i bits))
+
+(defun %bits->single (b)
+  "IEEE32 bit pattern B (0..2^32-1) → a fresh boxed single-float."
+  (let* ((s (ash b -31))
+         (e8 (logand (ash b -23) 255))
+         (m23 (logand b 8388607))
+         (hi 0) (lo 0))
+    (cond
+      ((= e8 0)
+       (if (= m23 0)
+           (setq hi (ash s 31) lo 0)                    ; ±0.0
+           ;; subnormal single → normal double: shift the mantissa up
+           (let ((e -126) (m m23))
+             (loop (when (>= m 8388608) (return nil))
+                   (setq m (ash m 1)) (setq e (- e 1)))
+             (let* ((mant52 (ash (logand m 8388607) 29))
+                    (exp11 (+ e 1023)))
+               (setq hi (logior (ash s 31) (ash exp11 20) (ash mant52 -32))
+                     lo (logand mant52 4294967295))))))
+      ((= e8 255)                                       ; inf / nan
+       (let ((mant52 (ash m23 29)))
+         (setq hi (logior (ash s 31) (ash 2047 20) (ash mant52 -32))
+               lo (logand mant52 4294967295))))
+      (t
+       (let* ((mant52 (ash m23 29))
+              (exp11 (+ (- e8 127) 1023)))
+         (setq hi (logior (ash s 31) (ash exp11 20) (ash mant52 -32))
+               lo (logand mant52 4294967295)))))
+    (%float-set-bits (%make-single2) hi lo)))
+
+(defun %single->bits (f)
+  "Boxed float F (any float subtag) → the nearest IEEE32 bit pattern,
+   round-to-nearest-even; overflow → ±infinity."
+  (let* ((hi (%float-hi32 f)) (lo (%float-lo32 f))
+         (s (ash hi -31))
+         (exp11 (logand (ash hi -20) 2047))
+         (mant52 (logior (ash (logand hi 1048575) 32) lo)))
+    (cond
+      ((= exp11 2047)                                   ; inf / nan
+       (logior (ash s 31) (ash 255 23) (if (= mant52 0) 0 4194304)))
+      ((and (= exp11 0) (= mant52 0)) (ash s 31))       ; ±0.0
+      (t
+       (let* ((e (if (= exp11 0) -1022 (- exp11 1023))) ; unbiased
+              (full (if (= exp11 0) mant52 (logior mant52 4503599627370496))))
+         ;; normalize a double subnormal (cannot reach single's range anyway)
+         (cond
+           ((> e 127) (logior (ash s 31) (ash 255 23)))
+           ((< e -150) (ash s 31))                       ; below single subnormals
+           (t
+            ;; drop DROP low bits of FULL (53 significant bits) to a 24-bit
+            ;; significand; single subnormals drop more.
+            (let* ((drop (if (< e -126) (+ 29 (- -126 e)) 29))
+                   (q (ash full (- drop)))
+                   (rem (logand full (- (ash 1 drop) 1)))
+                   (half (ash 1 (- drop 1))))
+              (when (or (> rem half) (and (= rem half) (oddp q)))
+                (setq q (+ q 1)))
+              (cond
+                ((< e -126)                             ; subnormal result
+                 (if (>= q 8388608)
+                     (logior (ash s 31) (ash 1 23))     ; rounded up to the smallest normal
+                     (logior (ash s 31) q)))
+                (t
+                 (when (>= q 16777216) (setq q (ash q -1) e (+ e 1)))
+                 (if (> e 127)
+                     (logior (ash s 31) (ash 255 23))
+                     (logior (ash s 31) (ash (+ e 127) 23) (logand q 8388607)))))))))))))
+
+;; Element access goes through the bit-level Lisp conversions (correct on
+;; every arch, ~2-8 us).  The native fcvt opcodes (:f32-load / :f32-store /
+;; :fround32) are defined and correct as DIRECT primitives on x64, but the
+;; generic aref/aset dispatch through them and the aarch64 store are still
+;; buggy — deferred to a follow-up (see docs/simd-plan.md, layer 1b).
+(defun %f32-aref (a i) (%bits->single (%f32-bits-ref a i)))
+(defun %f32-aset (a i x)
+  "Store float X into lane I of the packed vector A; returns X."
+  (%f32-bits-set a i (%single->bits (if (floatp x) x (float x 1.0f0))))
+  x)
 
 (defun %float-set-bits (f hi lo)
   "Store the 32-bit halves HI/LO into boxed float F as four 16-bit chunks.
@@ -2305,9 +2403,17 @@
       ;; returns a STRING, not a general char-vector (aref/aset now move
       ;; characters; %make-string-array keeps the result string-typed).
       (let* ((len (- end start))
-             (result (if (stringp seq)
-                         (%make-string-array len)
-                         (make-array len))))
+             ;; Preserve the specialized element type: a subseq of a packed
+             ;; u8 (#x11) / single-float (#x12) vector is the same packed
+             ;; type, so (array-element-type (subseq v …)) matches V
+             ;; (ANSI subseq.specialized-vector.2).
+             (result (cond
+                       ((stringp seq) (%make-string-array len))
+                       ((and (not (consp seq)) (not (%mda-p seq))
+                             (eq (obj-subtag seq) #x11)) (%make-u8-vector len))
+                       ((and (not (consp seq)) (not (%mda-p seq))
+                             (eq (obj-subtag seq) #x12)) (%make-f32-vector len))
+                       (t (make-array len)))))
         (let ((i 0))
           (if (%bulk-copy-ok-p result seq)
               (progn (%bulk-copy result 0 seq start len) result)

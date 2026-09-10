@@ -1,0 +1,138 @@
+# Bringing mill's vector capability to Modus
+
+`github.com/modus-lisp/mill` runs ONNX graphs in pure CL at 2.7× realtime on
+one EPYC core. Most of that came from a SIMD layer that is deliberately
+tiny (`src/simd.lisp`): seven operations and a lane count —
+
+    +f32-lanes+            4 on NEON, 8 on AVX2, 1 for the scalar reference
+    f32v-pack              the vector type (float32x4_t / f32.8 / single-float)
+    f32v-ref a i           unaligned lane load, SETF-able → lane store
+    f32v-broadcast x       one scalar in every lane
+    f32v-broadcast-ref a i element I of A in every lane
+    f32v+ f32v- f32v* f32v/
+    f32v-done              VZEROUPPER on x86, nothing elsewhere
+    do-vectorized (iv is n) vector-body scalar-body
+
+— with one admission rule: an operation must be a single NEON instruction
+(`vld1q vdupq vaddq vsubq vmulq vdivq`). Every kernel is written in those
+names, the lanes=1 arm is the same source with the width turned down (it
+reproduces chord's 205,568 samples byte for byte against the AVX2 build),
+and there is deliberately no FMA because it changes summation order. A port
+is those seven names plus a constant; the kernels do not change.
+
+On SBCL the seven names are macros over `sb-simd-avx2`. That is the only
+SBCL-specific part, and it is exactly the part Modus has to supply.
+
+## What Modus has today
+
+- A single-float is a **boxed** heap object (subtag `#x64`, four slots
+  sharing the double's IEEE payload). There is no unboxed float anywhere.
+- `:fadd :fsub :fmul :fdiv :ftoi :fcmp` exist in the ISA, and each
+  **allocates** its result (x64 lowers to ADDSD etc. on the payload, then
+  boxes). So `(* weight x)` in a loop is an allocation per iteration; the
+  Pi Zero measurements show what heap allocation in an inner loop costs.
+- `(make-array n :element-type 'single-float)` is a generic **word array of
+  boxed floats**. There is no packed 4-bytes-per-element float store; the
+  packed kinds are u8 (subtag `#x11`) and word arrays.
+- The register file is fully allocated (GPRs V0–V8 physical, V9–V15 spill),
+  and the register-promotion experiment of 2026-09-10 showed the GPR pool
+  cannot spare anything. The **vector unit is untouched**: q0–q31 on
+  aarch64, xmm0–15 on x64 are free.
+
+So mill's *scalar* arm would already run allocation-bound here, and the
+vector arm needs storage, registers and instructions that do not exist.
+Three layers, each useful on its own and each a prerequisite for the next.
+
+## Layer 1 — packed single-float arrays and unboxed float locals
+
+1. **Storage.** A new packed subtag for `(simple-array single-float (*))`,
+   4 bytes per element, GC-opaque like u8 (no pointer slots). `make-array`
+   with `:element-type 'single-float` allocates it; `aref`/`aset` on a
+   declared `(simple-array single-float …)` variable compile to a raw
+   32-bit load/store (`%f32-ref`/`%f32-set`), the same shape as the u8 fast
+   path. The generic AREF/ASET dispatch learns the subtag so undeclared
+   access still works. Double-float arrays can follow later (8-byte lanes);
+   mill and chord/stave are f32 throughout.
+2. **Unboxed float values.** A binding declared `single-float` (or inferred
+   from an `%f32-ref`) is an **unboxed** value: on aarch64 it lives in an
+   `s`/`d` register or a frame slot as raw bits; arithmetic on two unboxed
+   floats emits `fmul s, s, s` with no allocation. Boxing happens only when
+   the value escapes (stored into a generic place, passed to an undeclared
+   callee, returned). This is the float twin of the fixnum typed tier that
+   took reel from 3 to 60 fps, and it is what makes mill's scalar arm — the
+   correctness reference every kernel is checked against — run at a speed
+   worth having. Gate: mill's lanes=1 build on Modus x64 must reproduce its
+   golden waveform, and the ANSI float chapters must stay green.
+
+## Layer 2 — vector registers and lane operations in the ISA
+
+1. **Register class.** A second register file in the ISA: `Q0–Q7`
+   (128-bit). They never hold pointers, so the GC ignores them; they are
+   caller-clobbered, so a vector value lives in a Q register only inside a
+   call-free region (the `do-vectorized` body, which is how mill's kernels
+   are written anyway) and is otherwise spilled to a 16-byte frame slot
+   pair. Vector temps do not compete with the GPR temp pool — the reason
+   GPR promotion lost — because they are a separate pool.
+2. **Opcodes** (element kinds encoded in the opcode, 128-bit lanes):
+
+       :vld  q, base, idx      lane load, unaligned (f32x4 / s32x4 / s16x8 / u8x16)
+       :vst  q, base, idx      lane store
+       :vdup q, gpr            broadcast (f32 from an unboxed float; ints from a fixnum)
+       :vadd :vsub :vmul :vdiv q, q, q   per element kind (no FMA, by mill's rule)
+       :vmovl / :vmovn          widen u8→s16, s16→s32 and narrow with saturation
+       :vmla                    multiply-accumulate (integer only; needed by reel)
+       :vext / :vshr            lane extract and shift-right-narrow
+
+   The first eight are mill's contract; the integer widen/narrow/MLA set is
+   what VP8's six-tap filter (u8 taps × s16 coefficients, `>> 7`, clamp) and
+   the IDCT need, and they are also single NEON instructions (`uxtl`,
+   `sqrshrun`, `mla`, `ext`).
+3. **Back-ends.** aarch64: direct NEON encodings (the translator already
+   has the scalar `fadd d` family; the vector forms are the same encoding
+   family with the `Q` bit). x64: SSE2/SSE4.1 for 128-bit lanes
+   (`movups addps mulps pmullw pmaddwd packuswb`), no VEX so no
+   transition-penalty story to manage. The **interpreter** implements each
+   opcode over a 16-byte scratch: that is the lanes=1 reference in the
+   Modus world, and it is what the ANSI/JIT differential harness compares
+   against. Other translators (riscv, ppc, i386, 68k, arm32) reject the
+   opcodes → interpret, as they do for unknown ops today.
+4. **Compiler surface.** Primitive forms `(%vld.f32x4 a i)`,
+   `(setf (%vld.f32x4 a i) q)`, `(%vdup.f32 x)`, `(%vadd.f32x4 p q)` …
+   compile to the opcodes; a LET binding whose init is a vector primitive
+   (or declared `(vector-pack f32 4)`) gets a `:qreg` binding. The safety
+   walker from the promotion work (no calls / no NLX in the body) decides
+   whether the binding can stay in a register for the body's extent.
+
+## Layer 3 — mill on Modus, and reel
+
+- `mill/src/simd.lisp` gains a `#+modus` arm: `+f32-lanes+` 4, and the
+  seven macros expand to the Layer-2 primitives. `f32v-done` is `nil`.
+  Nothing else in mill changes; its node-by-node golden compare is the
+  acceptance test. The scalar arm on Modus is Layer 1 alone.
+- reel's `mc-filter`, `%edge-*` and `vp8-idct` get integer-lane versions
+  written in the same discipline (a vector body and a scalar remainder from
+  one expression), which is where the Pi Zero's 5 fps becomes real-time:
+  the six-tap filter is 16 pixels per instruction group instead of one
+  pixel per ~40 memory-bound instructions.
+
+## Order and cost
+
+| step | what | scope | gate |
+|---|---|---|---|
+| 1a | packed f32 arrays | tags, make-array, aref/aset fast path, GC skip, printer | ANSI arrays chapter; probe |
+| 1b | unboxed float locals + fmul/fadd without boxing | compiler typed tier, aarch64+x64 float regs | ANSI float chapters; mill lanes=1 golden |
+| 2a | Q register class + f32x4 ops (mill's eight) | mvm.lisp, interp, translate-aarch64, translate-x64, compiler | JIT-vs-interpret differential on vector probes |
+| 2b | integer lanes + widen/narrow/MLA | same files | reel bit-exact (YSUM) with vector kernels |
+| 3 | mill `#+modus` arm; reel vector kernels | library repos | mill golden compare; reel YSUM; Pi 5 and Zero timings |
+
+Step 1a is a day; 1b is the largest single piece (it touches the typed
+arithmetic tier and both translators' register conventions); 2a is
+mechanical once 1b's unboxed-float register story exists; 2b is a bounded
+set of encodings. Nothing here is x64-specific and nothing needs FFI, which
+keeps the "no C underneath" property that mill and Modus both hold.
+
+Recommendation: do 1a and 1b first and measure mill's scalar arm on Modus
+against SBCL's scalar arm. That number says how much of the gap is boxing
+(likely most of it) before any vector instruction exists, and it makes the
+Layer-2 gain measurable as a ratio against a real baseline, the same way
+reel was taken from 3 to 60 fps: profile, name the cost, remove it.

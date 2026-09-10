@@ -95,6 +95,10 @@
    #:mvm-aref #:mvm-aset #:mvm-array-len
    #:+op-alloc-array+ #:mvm-alloc-array
    #:mvm-alloc-u8 #:mvm-u8-ref #:mvm-u8-set
+   #:+op-alloc-f32+ #:+op-f32-ref+ #:+op-f32-set+
+   #:mvm-alloc-f32 #:mvm-f32-ref #:mvm-f32-set
+   #:+op-f32-load+ #:+op-f32-store+ #:+op-fround32+
+   #:mvm-f32-load #:mvm-f32-store #:mvm-fround32
    #:mvm-load #:mvm-store #:mvm-fence
    #:mvm-call #:mvm-call-ind #:mvm-ret #:mvm-tailcall
    #:mvm-alloc-cons #:mvm-gc-check #:mvm-gc-check-n #:mvm-gc-check-r
@@ -442,6 +446,17 @@
 (defconstant +op-alloc-u8+ #xC8) ; (alloc-u8 Vd Vs) - allocate u8 vector, N bytes = Vs (tagged fixnum)
 (defconstant +op-u8-ref+   #xC9) ; (u8-ref Vd Varr Vidx) - load byte at raw+16+idx → tagged fixnum
 (defconstant +op-u8-set+   #xCA) ; (u8-set Varr Vidx Vval) - store low byte of Vval (tagged) at raw+16+idx
+;; Packed single-float vector (subtag #x12): header count = ELEMENTS, 4 bytes
+;; each at raw+16, object size = align16(16 + 4N).  f32-ref/f32-set move the
+;; raw IEEE32 bits as a tagged fixnum; boxing to/from a single-float object is
+;; the runtime's (%bits->single / %single->bits) until floats are unboxed.
+(defconstant +op-alloc-f32+ #xCB) ; (alloc-f32 Vd Vs) - allocate f32 vector of N elements = Vs (tagged)
+(defconstant +op-f32-ref+   #xCC) ; (f32-ref Vd Varr Vidx) - load 32 bits at raw+16+4*idx → tagged fixnum
+(defconstant +op-f32-set+   #xCD) ; (f32-set Varr Vidx Vval) - store low 32 bits of Vval (tagged) at raw+16+4*idx
+;; Native lane <-> boxed float conversions (no Lisp-side bit twiddling):
+(defconstant +op-f32-load+  #xCE) ; (f32-load Vd Varr Vidx) - lane → fcvt s→d → fresh boxed single-float (#x64)
+(defconstant +op-f32-store+ #xCF) ; (f32-store Varr Vidx Vval) - boxed float payload → fcvt d→s → lane
+(defconstant +op-fround32+  #xD0) ; (fround32 Vd Vs) - boxed float → rounded to single precision → fresh boxed single
 
 ;;; ============================================================
 ;;; Opcode Metadata Table
@@ -623,6 +638,14 @@
 (defopcode :alloc-u8 #xC8 (:reg :reg)      "Allocate u8 vector (subtag #x11), N bytes in reg")
 (defopcode :u8-ref   #xC9 (:reg :reg :reg) "Load byte from u8 vector → tagged fixnum")
 (defopcode :u8-set   #xCA (:reg :reg :reg) "Store byte into u8 vector (value tagged fixnum)")
+
+;; Packed single-float vector (subtag #x12), raw IEEE32 bits in and out.
+(defopcode :alloc-f32 #xCB (:reg :reg)      "Allocate f32 vector (subtag #x12), N elements in reg")
+(defopcode :f32-ref   #xCC (:reg :reg :reg) "Load 32-bit lane from f32 vector → tagged fixnum bits")
+(defopcode :f32-set   #xCD (:reg :reg :reg) "Store low 32 bits of tagged fixnum into f32 vector lane")
+(defopcode :f32-load  #xCE (:reg :reg :reg) "Lane of f32 vector → fresh boxed single-float (allocates)")
+(defopcode :f32-store #xCF (:reg :reg :reg) "Boxed float → single precision → f32 vector lane")
+(defopcode :fround32  #xD0 (:reg :reg)      "Boxed float rounded to single precision → fresh boxed single (allocates)")
 
 ;;; ============================================================
 ;;; Memory Width Constants
@@ -1054,6 +1077,24 @@
 
 (defun mvm-u8-set (buf varr vidx vval)
   (encode-instruction buf +op-u8-set+ varr vidx vval))
+
+(defun mvm-alloc-f32 (buf vd vs)
+  (encode-instruction buf +op-alloc-f32+ vd vs))
+
+(defun mvm-f32-ref (buf vd varr vidx)
+  (encode-instruction buf +op-f32-ref+ vd varr vidx))
+
+(defun mvm-f32-set (buf varr vidx vval)
+  (encode-instruction buf +op-f32-set+ varr vidx vval))
+
+(defun mvm-f32-load (buf vd varr vidx)
+  (encode-instruction buf +op-f32-load+ vd varr vidx))
+
+(defun mvm-f32-store (buf varr vidx vval)
+  (encode-instruction buf +op-f32-store+ varr vidx vval))
+
+(defun mvm-fround32 (buf vd vs)
+  (encode-instruction buf +op-fround32+ vd vs))
 
 ;; Memory
 (defun mvm-load (buf vd vaddr width)

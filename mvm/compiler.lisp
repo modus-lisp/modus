@@ -50,6 +50,7 @@
 (defconstant +subtag-string+ #x31)
 (defconstant +subtag-array+  #x32)
 (defconstant +subtag-u8-vector+ #x11)   ; byte-packed (unsigned-byte 8) vector
+(defconstant +subtag-f32-vector+ #x12)  ; packed single-float vector (4-byte IEEE32 lanes)
 (defconstant +subtag-ratio+  #x33)   ; 2-slot: numerator, denominator
 (defconstant +subtag-mda+    #x34)   ; 7-slot multi-dim array header:
                                      ; [rank dims fp displaced-to disp-offset
@@ -6949,6 +6950,18 @@
        (compile-u8-ref (cadr form) (caddr form) env dest))
       ((= op-name #.(compute-name-hash "%U8-SET"))
        (compile-u8-set (cadr form) (caddr form) (cadddr form) env dest))
+      ((= op-name #.(compute-name-hash "%ALLOC-F32"))
+       (compile-alloc-f32 (cadr form) env dest))
+      ((= op-name #.(compute-name-hash "%F32-BITS-REF"))
+       (compile-f32-ref (cadr form) (caddr form) env dest))
+      ((= op-name #.(compute-name-hash "%F32-BITS-SET"))
+       (compile-f32-set (cadr form) (caddr form) (cadddr form) env dest))
+      ((= op-name #.(compute-name-hash "%F32-LOAD"))
+       (compile-f32-load (cadr form) (caddr form) env dest))
+      ((= op-name #.(compute-name-hash "%F32-STORE"))
+       (compile-f32-store (cadr form) (caddr form) (cadddr form) env dest))
+      ((= op-name #.(compute-name-hash "%FROUND32"))
+       (compile-fround32 (cadr form) env dest))
       ((= op-name #.(compute-name-hash "%WORD-AREF"))
        (compile-word-aref (cadr form) (caddr form) env dest))
       ((= op-name #.(compute-name-hash "%WORD-ASET"))
@@ -16035,6 +16048,10 @@
     (emit-ir :li temp2 (ash +subtag-u8-vector+ +fixnum-shift+))
     (emit-ir :cmp temp temp2)
     (emit-ir :beq true-label)
+    ;; Packed single-float vector (subtag #x12).
+    (emit-ir :li temp2 (ash +subtag-f32-vector+ +fixnum-shift+))
+    (emit-ir :cmp temp temp2)
+    (emit-ir :beq true-label)
     (emit-ir-label false-label)
     (compile-nil dest)
     (emit-ir :br end-label)
@@ -17379,6 +17396,18 @@
         (error () ty))
       ty))
 
+(defun %f32-simple-array-decl-p (ty)
+  "True for a declared (simple-array single-float …) — the packed #x12
+   vector, whose element access is %f32-aref / %f32-aset."
+  (and (consp ty) (symbolp (car ty))
+       (string= (symbol-name (car ty)) "SIMPLE-ARRAY")
+       (consp (cdr ty))
+       (let ((et (cadr ty)))
+         (and (symbolp et) et (string= (symbol-name et) "SINGLE-FLOAT")))))
+
+(defun %declared-f32-array-var-p (form env)
+  (and form (symbolp form) (%f32-simple-array-decl-p (%expr-dtype form env))))
+
 (defun %u8-simple-array-decl-p (ty)
   "True for a declared (simple-array (unsigned-byte 8) …) — the byte-packed
    #x11 vector, whose element access is %u8-ref / %u8-set."
@@ -17845,6 +17874,78 @@
     (emit-ir :alloc-u8 dest cnt-reg)
     (free-temp-reg)))
 
+;;; Packed single-float vector (subtag #x12) primitives — the same trio as
+;;; the u8 vector, one 32-bit lane per element.  %F32-BITS-REF / -SET move
+;;; the raw IEEE32 bits as a tagged fixnum; %f32-aref / %f32-aset (prelude)
+;;; box and unbox them until floats are unboxed (docs/simd-plan.md, layer 1b).
+(defun compile-alloc-f32 (count-form env dest)
+  "Compile (%alloc-f32 N) — allocate a packed single-float vector of N lanes."
+  (let ((cnt-reg (alloc-temp-reg)))
+    (compile-form count-form env cnt-reg)
+    (emit-ir :gc-check)
+    (emit-ir :alloc-f32 dest cnt-reg)
+    (free-temp-reg)))
+
+(defun compile-f32-ref (arr-form idx-form env dest)
+  "Compile (%f32-bits-ref arr idx) — the lane's raw IEEE32 bits as a fixnum."
+  (let ((arr-reg (alloc-temp-reg))
+        (idx-reg (alloc-temp-reg)))
+    (compile-form arr-form env arr-reg)
+    (compile-form idx-form env idx-reg)
+    (emit-ir :f32-ref dest arr-reg idx-reg)
+    (free-temp-reg)
+    (free-temp-reg)))
+
+(defun compile-f32-set (arr-form idx-form val-form env dest)
+  "Compile (%f32-bits-set arr idx bits) — store the low 32 bits of BITS into
+   the lane.  Returns BITS."
+  (let ((val-reg (alloc-temp-reg)))
+    (compile-form val-form env val-reg)
+    (let ((arr-reg (alloc-temp-reg))
+          (idx-reg (alloc-temp-reg)))
+      (compile-form arr-form env arr-reg)
+      (compile-form idx-form env idx-reg)
+      (emit-ir :f32-set arr-reg idx-reg val-reg)
+      (emit-ir :mov dest val-reg)
+      (free-temp-reg)
+      (free-temp-reg))
+    (free-temp-reg)))
+
+(defun compile-f32-load (arr-form idx-form env dest)
+  "Compile (%f32-load arr idx) — the lane as a fresh boxed single-float
+   (native fcvt; allocates the 4-slot box)."
+  (let ((arr-reg (alloc-temp-reg))
+        (idx-reg (alloc-temp-reg)))
+    (compile-form arr-form env arr-reg)
+    (compile-form idx-form env idx-reg)
+    (emit-ir :gc-check)
+    (emit-ir :f32-load dest arr-reg idx-reg)
+    (free-temp-reg)
+    (free-temp-reg)))
+
+(defun compile-f32-store (arr-form idx-form val-form env dest)
+  "Compile (%f32-store arr idx float) — narrow the boxed float's payload to
+   single precision and store the lane.  Returns FLOAT."
+  (let ((val-reg (alloc-temp-reg)))
+    (compile-form val-form env val-reg)
+    (let ((arr-reg (alloc-temp-reg))
+          (idx-reg (alloc-temp-reg)))
+      (compile-form arr-form env arr-reg)
+      (compile-form idx-form env idx-reg)
+      (emit-ir :f32-store arr-reg idx-reg val-reg)
+      (emit-ir :mov dest val-reg)
+      (free-temp-reg)
+      (free-temp-reg))
+    (free-temp-reg)))
+
+(defun compile-fround32 (val-form env dest)
+  "Compile (%fround32 float) — a fresh single-float box holding the payload
+   rounded to single precision (cvtsd2ss / fcvt), replacing the Lisp-side
+   %round-to-single that every float result went through."
+  (compile-form val-form env dest)
+  (emit-ir :gc-check)
+  (emit-ir :fround32 dest dest))
+
 (defun compile-u8-ref (arr-form idx-form env dest)
   "Compile (%u8-ref arr idx) — load a byte (tagged fixnum) from a u8 vector."
   (let ((arr-reg (alloc-temp-reg))
@@ -17956,6 +18057,11 @@
          env tmp)
         (free-temp-reg)))
     (return-from compile-aref (compile-u8-ref arr-form idx-form env dest)))
+  ;; DECLARED (simple-array single-float …): the packed f32 lane, boxed by
+  ;; the runtime wrapper (no subtag dispatch).
+  (when (%declared-f32-array-var-p arr-form env)
+    (return-from compile-aref
+      (compile-form (list '%f32-aref arr-form idx-form) env dest)))
   ;; DECLARED (simple-array <generic> …) variable: raw word-slot access, no
   ;; wrapper/string/mda dispatch.  See %declared-generic-array-var-p.
   (when (%declared-generic-array-var-p arr-form env)
@@ -17995,6 +18101,10 @@
            (let ((,g-raw (%wrapper-aref ,g-arr ,g-idx)))
              (if (%wrapper-stringp ,g-arr) (code-char ,g-raw) ,g-raw)))
           ((%prim-stringp ,g-arr) (code-char (%prim-aref ,g-arr ,g-idx)))
+          ;; packed single-float vector (#x12): the PUBLIC aref boxes the
+          ;; lane here, so %prim-aref (header/slot access everywhere in the
+          ;; runtime) stays a two-way u8/word dispatch with no call.
+          ((eq (obj-subtag ,g-arr) #x12) (%f32-aref ,g-arr ,g-idx))
           (t (%prim-aref ,g-arr ,g-idx))))
      env dest)))
 
@@ -18062,6 +18172,9 @@
         (free-temp-reg)))
     (return-from compile-aset
       (compile-u8-set arr-form idx-form val-form env dest)))
+  (when (%declared-f32-array-var-p arr-form env)
+    (return-from compile-aset
+      (compile-form (list '%f32-aset arr-form idx-form val-form) env dest)))
   ;; DECLARED (simple-array <generic> …) variable: raw word-slot store, no
   ;; wrapper/string/mda dispatch and no char->code coercion (never a string).
   (when (%declared-generic-array-var-p arr-form env)
@@ -18104,6 +18217,8 @@
                  (%prim-aset (%mda-data ,g-arr) ,g-idx ,g-sto)))
            ,g-val)
           ((consp ,g-arr) (%wrapper-aset ,g-arr ,g-idx ,g-sto) ,g-val)
+          ;; packed single-float vector (#x12): narrow and store the lane
+          ((eq (obj-subtag ,g-arr) #x12) (%f32-aset ,g-arr ,g-idx ,g-val))
           (t (%prim-aset ,g-arr ,g-idx ,g-sto) ,g-val)))
      env dest)))
 
@@ -18259,7 +18374,8 @@
   (when (and *mvm-eval-runtime-p* (symbolp fn) (name-eq fn "LENGTH")
              (consp args) (null (cdr args)) (symbolp (car args))
              (or (%declared-generic-array-var-p (car args) env)
-                 (%declared-u8-array-var-p (car args) env)))
+                 (%declared-u8-array-var-p (car args) env)
+                 (%declared-f32-array-var-p (car args) env)))
     (return-from compile-call
       (compile-form (list '%prim-array-length (car args)) env dest)))
   (when (and *mvm-eval-runtime-p* (symbolp fn) (name-eq fn "FILL")
@@ -19649,6 +19765,12 @@
       (:aset  4)
       (:u8-ref 4)
       (:u8-set 4)
+      (:alloc-f32 3)
+      (:f32-ref 4)
+      (:f32-set 4)
+      (:f32-load 4)
+      (:f32-store 4)
+      (:fround32 3)
       (:add   4)
       (:sub   4)
       (:adds  4)
@@ -19911,6 +20033,18 @@
           (:u8-set
            ;; (u8-set arr idx src)
            (mvm-u8-set buf (second insn) (third insn) (fourth insn)))
+          (:alloc-f32
+           (mvm-alloc-f32 buf (second insn) (third insn)))
+          (:f32-ref
+           (mvm-f32-ref buf (second insn) (third insn) (fourth insn)))
+          (:f32-set
+           (mvm-f32-set buf (second insn) (third insn) (fourth insn)))
+          (:f32-load
+           (mvm-f32-load buf (second insn) (third insn) (fourth insn)))
+          (:f32-store
+           (mvm-f32-store buf (second insn) (third insn) (fourth insn)))
+          (:fround32
+           (mvm-fround32 buf (second insn) (third insn)))
 
           ;; ---- 3-reg instructions ----
           (:add

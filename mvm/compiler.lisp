@@ -723,7 +723,7 @@
                         ;; everything emitted before the lambda) — mvm-eval of
                         ;; a capturing closure then ran a frame-less thunk
                         ;; that STACK-LOADed a 0 VFP → SIGSEGV (WS4 oracle).
-                        "*IR-BUFFER*" "*TEMP-REG-COUNTER*"
+                        "*IR-BUFFER*" "*TEMP-REG-COUNTER*" "*FP-REG-COUNTER*"
                         "*CURRENT-FUNCTION-NAME*" "*FUNCTION-RETURN-LABEL*"
                         "*UWP-CLEANUPS*" "*LOOP-EXIT-UWP-SEQ*"
                         "*ARITH-PUSH-DEPTH*"))
@@ -801,6 +801,11 @@
    the prefix scan caught user-defined defuns like INIT-SYMBOL-TABLE
    (a boot helper, not a defvar thunk) and re-called them at the
    wrong time, breaking things.")
+
+(defvar *fp-reg-counter* 0
+  "Next free unboxed single-float FP vreg (F0..F5 = xmm2..7 / s2..7), a pool
+   SEPARATE from the GPR temps.  Reset with *temp-reg-counter*.")
+(defconstant +fp-reg-max+ 6)
 
 (defvar *temp-reg-counter* 0
   "Next temporary register to allocate (cycles through V4-V15)")
@@ -1217,7 +1222,8 @@
 
 (defun reset-temp-regs ()
   "Reset the temporary register counter"
-  (setf *temp-reg-counter* 0))
+  (setf *temp-reg-counter* 0)
+  (setf *fp-reg-counter* 0))
 
 (defun alloc-temp-reg ()
   "Allocate the next temporary register (V4-V15).
@@ -14628,6 +14634,16 @@
   "Left-fold ARGS with the single-float op OP-NAME (a string), emitting
    :f<op> + :fround32 per pair.  Requires (>= (length args) 2) and every
    operand single-float (caller-checked)."
+  ;; Unboxed tree (part 2b): the whole expression in FP registers, boxed
+  ;; ONCE at the end instead of twice per pair.
+  (let ((tree (cons (%float-op-symbol op-name) args)))
+    (when (%fp-tree-fits-p tree env)
+      (let ((fd (alloc-fp-reg)))
+        (compile-float-unboxed tree env fd)
+        (emit-ir :gc-check)
+        (emit-ir :fp-box dest fd)
+        (free-fp-reg))
+      (return-from %compile-single-float-arith nil)))
   (let ((firop (%float-arith-op op-name)))
     (compile-form (car args) env dest)
     (dolist (arg (cdr args))
@@ -14641,9 +14657,127 @@
         (emit-ir :fround32 dest dest)    ; narrow to boxed single
         (free-temp-reg)))))
 
+(defun %float-op-symbol (op-name)
+  "The CL operator symbol for OP-NAME, so a rebuilt (op . args) form is
+   recognised by name-eq / symbol-name the way source forms are."
+  (cond ((string= op-name "+") '+)
+        ((string= op-name "-") '-)
+        ((string= op-name "*") '*)
+        (t '/)))
+
 (defun %single-float-arith-applicable-p (args env)
   (and (consp args) (consp (cdr args))
        (every (lambda (a) (%expr-single-float-p a env)) args)))
+
+;;; ------------------------------------------------------------
+;;; Unboxed single-float expression trees (layer 1b part 2b)
+;;;
+;;; A call-free tree of single-float literals, declared single-float
+;;; variables, arefs of declared (simple-array single-float (*)) with simple
+;;; indices, and + - * / of those compiles into the FP register pool
+;;; (F0..F5 = xmm2..7 / s2..7): leaves are unboxed once, arithmetic is
+;;; single-precision in registers, and the tree boxes ONCE at its boundary
+;;; (or not at all when it feeds a packed-lane store).  Anything else —
+;;; a call, an undeclared operand, a computed index — keeps the boxed
+;;; fast path above.  FP registers are caller-clobbered, hence call-free.
+
+;; *fp-reg-counter* / +fp-reg-max+ are defined beside *temp-reg-counter*.
+
+(defun alloc-fp-reg ()
+  (let ((r *fp-reg-counter*))
+    (when (>= r +fp-reg-max+)
+      (error "MVM compiler: out of FP registers (need >6)"))
+    (incf *fp-reg-counter*)
+    r))
+(defun free-fp-reg ()
+  (when (> *fp-reg-counter* 0) (decf *fp-reg-counter*)))
+
+(defun %simple-index-form-p (f)
+  "An index form that compiles call-free: a variable, an integer, or
+   + - * 1+ 1- LOGAND ASH of those."
+  (cond ((symbolp f) t)
+        ((integerp f) t)
+        ((and (consp f) (symbolp (car f)))
+         (and (member (symbol-name (car f)) '("+" "-" "*" "1+" "1-" "LOGAND" "ASH")
+                      :test #'string=)
+              (every #'%simple-index-form-p (cdr f))))
+        (t nil)))
+
+(defun %fp-unary-normalize (form)
+  "(- x) → (* -1.0f0 x) [exact], (/ x) → (/ 1.0f0 x), (+ x)/(* x) → x."
+  (if (and (consp form) (symbolp (car form)) (consp (cdr form)) (null (cddr form)))
+      (let ((n (symbol-name (car form))))
+        (cond ((string= n "-") (list '* -1.0f0 (cadr form)))   ; negation is exact
+              ((string= n "/") (list (car form) 1.0f0 (cadr form)))
+              ((or (string= n "+") (string= n "*")) (cadr form))
+              (t form)))
+      form))
+
+(defun %fp-tree-need (form env)
+  "FP registers needed to evaluate FORM unboxed, or NIL when FORM is not a
+   call-free single-float tree."
+  (let ((form (%fp-unary-normalize form)))
+    (cond
+      ((typep form 'single-float) 1)
+      ((and (consp form) (name-eq (car form) "QUOTE") (consp (cdr form))
+            (typep (cadr form) 'single-float)) 1)
+      ((symbolp form) (and (%expr-single-float-p form env) 1))
+      ((and (consp form) (symbolp (car form)))
+       (cond
+         ((name-eq (car form) "AREF")
+          (and (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
+               (%declared-f32-array-var-p (cadr form) env)
+               (%simple-index-form-p (caddr form))
+               1))
+         ((and (member (symbol-name (car form)) '("+" "-" "*" "/") :test #'string=)
+               (consp (cdr form)) (consp (cddr form)))
+          (let ((worst (%fp-tree-need (cadr form) env)))
+            (and worst
+                 (dolist (a (cddr form) worst)
+                   (let ((n (%fp-tree-need a env)))
+                     (unless n (return nil))
+                     (setq worst (max worst (1+ n))))))))
+         (t nil)))
+      (t nil))))
+
+(defun %fp-arith-op (name)
+  (cond ((string= name "+") :fp-add)
+        ((string= name "-") :fp-sub)
+        ((string= name "*") :fp-mul)
+        (t :fp-div)))
+
+(defun compile-float-unboxed (form env fd)
+  "Compile the single-float tree FORM (caller checked %fp-tree-need) into
+   FP vreg FD, unboxed."
+  (let ((form (%fp-unary-normalize form)))
+    (cond
+      ;; leaf literal / variable: the boxed value, unboxed once
+      ((or (typep form 'single-float) (symbolp form)
+           (and (consp form) (name-eq (car form) "QUOTE")))
+       (let ((tmp (alloc-temp-reg)))
+         (compile-form form env tmp)
+         (emit-ir :fp-unbox fd tmp)
+         (free-temp-reg)))
+      ((name-eq (car form) "AREF")
+       (let ((ta (alloc-temp-reg)) (ti (alloc-temp-reg)))
+         (compile-form (cadr form) env ta)
+         (compile-form (caddr form) env ti)
+         (emit-ir :fp-lane-load fd ta ti)
+         (free-temp-reg) (free-temp-reg)))
+      (t
+       (let ((op (%fp-arith-op (symbol-name (car form)))))
+         (compile-float-unboxed (cadr form) env fd)
+         (dolist (arg (cddr form))
+           (let ((ft (alloc-fp-reg)))
+             (compile-float-unboxed arg env ft)
+             (emit-ir op fd fd ft)
+             (free-fp-reg))))))))
+
+(defun %fp-tree-fits-p (form env)
+  "True when FORM is an unboxable tree that fits the FP pool from the
+   current allocation point."
+  (let ((need (%fp-tree-need form env)))
+    (and need (<= (+ *fp-reg-counter* need) +fp-reg-max+))))
 
 (defun compile-add (args env dest)
   "Compile (+ args...).  Fixnum fast path; ratio/mixed via GENERIC-ADD."
@@ -18250,6 +18384,23 @@
     (return-from compile-aset
       (compile-u8-set arr-form idx-form val-form env dest)))
   (when (%declared-f32-array-var-p arr-form env)
+    ;; Unboxed value tree → straight into the lane (part 2b): ZERO boxes
+    ;; unless the store's value is itself used.  Array and index are
+    ;; compiled first so the value tree runs with no FP register live
+    ;; across a possibly-calling index form.
+    (when (%fp-tree-fits-p val-form env)
+      (let ((ta (alloc-temp-reg)) (ti (alloc-temp-reg)))
+        (compile-form arr-form env ta)
+        (compile-form idx-form env ti)
+        (let ((fd (alloc-fp-reg)))
+          (compile-float-unboxed val-form env fd)
+          (emit-ir :fp-lane-store ta ti fd)
+          (when dest
+            (emit-ir :gc-check)
+            (emit-ir :fp-box dest fd))
+          (free-fp-reg))
+        (free-temp-reg) (free-temp-reg))
+      (return-from compile-aset nil))
     (return-from compile-aset
       (compile-form (list '%f32-aset arr-form idx-form val-form) env dest)))
   ;; DECLARED (simple-array <generic> …) variable: raw word-slot store, no
@@ -19581,6 +19732,7 @@
          (*current-function-name* (if (symbolp name) (symbol-name name)
                                       (string name)))
          (*temp-reg-counter* 0)
+         (*fp-reg-counter* 0)
          (return-label (make-compiler-label))
          (*function-return-label* return-label)
          ;; Reset per-function dynamic state so nested FLET/lambda bodies
@@ -19848,6 +20000,14 @@
       (:f32-load 4)
       (:f32-store 4)
       (:fround32 3)
+      (:fp-unbox 3)
+      (:fp-box 3)
+      (:fp-lane-load 4)
+      (:fp-lane-store 4)
+      (:fp-add 4)
+      (:fp-sub 4)
+      (:fp-mul 4)
+      (:fp-div 4)
       (:add   4)
       (:sub   4)
       (:adds  4)
@@ -20122,6 +20282,14 @@
            (mvm-f32-store buf (second insn) (third insn) (fourth insn)))
           (:fround32
            (mvm-fround32 buf (second insn) (third insn)))
+          (:fp-unbox (mvm-fp-unbox buf (second insn) (third insn)))
+          (:fp-box (mvm-fp-box buf (second insn) (third insn)))
+          (:fp-lane-load (mvm-fp-lane-load buf (second insn) (third insn) (fourth insn)))
+          (:fp-lane-store (mvm-fp-lane-store buf (second insn) (third insn) (fourth insn)))
+          (:fp-add (mvm-fp-add buf (second insn) (third insn) (fourth insn)))
+          (:fp-sub (mvm-fp-sub buf (second insn) (third insn) (fourth insn)))
+          (:fp-mul (mvm-fp-mul buf (second insn) (third insn) (fourth insn)))
+          (:fp-div (mvm-fp-div buf (second insn) (third insn) (fourth insn)))
 
           ;; ---- 3-reg instructions ----
           (:add

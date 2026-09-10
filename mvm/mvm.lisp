@@ -99,6 +99,10 @@
    #:mvm-alloc-f32 #:mvm-f32-ref #:mvm-f32-set
    #:+op-f32-load+ #:+op-f32-store+ #:+op-fround32+
    #:mvm-f32-load #:mvm-f32-store #:mvm-fround32
+   #:+op-fp-unbox+ #:+op-fp-box+ #:+op-fp-lane-load+ #:+op-fp-lane-store+
+   #:+op-fp-add+ #:+op-fp-sub+ #:+op-fp-mul+ #:+op-fp-div+
+   #:mvm-fp-unbox #:mvm-fp-box #:mvm-fp-lane-load #:mvm-fp-lane-store
+   #:mvm-fp-add #:mvm-fp-sub #:mvm-fp-mul #:mvm-fp-div
    #:mvm-load #:mvm-store #:mvm-fence
    #:mvm-call #:mvm-call-ind #:mvm-ret #:mvm-tailcall
    #:mvm-alloc-cons #:mvm-gc-check #:mvm-gc-check-n #:mvm-gc-check-r
@@ -457,6 +461,20 @@
 (defconstant +op-f32-load+  #xCE) ; (f32-load Vd Varr Vidx) - lane → fcvt s→d → fresh boxed single-float (#x64)
 (defconstant +op-f32-store+ #xCF) ; (f32-store Varr Vidx Vval) - boxed float payload → fcvt d→s → lane
 (defconstant +op-fround32+  #xD0) ; (fround32 Vd Vs) - boxed float → rounded to single precision → fresh boxed single
+;; Unboxed single-float register class (SIMD plan, layer 1b part 2b).  An
+;; FP vreg F0..F5 is an index into a SEPARATE pool: xmm2..xmm7 on x64,
+;; s2..s7 on aarch64 (both caller-saved and clear of the fadd scratch
+;; xmm0/1, d0/1).  Values are UNBOXED IEEE single-precision; every op
+;; rounds to single, which is CL single-float semantics.  FP vregs live only
+;; inside a call-free expression tree (a call clobbers them).
+(defconstant +op-fp-unbox+      #xD1) ; (fp-unbox Fd Vsrc)         boxed float → single in Fd
+(defconstant +op-fp-box+        #xD2) ; (fp-box Vd Fs)             single in Fs → fresh boxed single-float (allocates)
+(defconstant +op-fp-lane-load+  #xD3) ; (fp-lane-load Fd Varr Vidx) packed f32 lane → Fd (no conversion)
+(defconstant +op-fp-lane-store+ #xD4) ; (fp-lane-store Varr Vidx Fs) Fs → packed f32 lane
+(defconstant +op-fp-add+        #xD5) ; (fp-add Fd Fa Fb)          single-precision arithmetic
+(defconstant +op-fp-sub+        #xD6)
+(defconstant +op-fp-mul+        #xD7)
+(defconstant +op-fp-div+        #xD8)
 
 ;;; ============================================================
 ;;; Opcode Metadata Table
@@ -646,6 +664,14 @@
 (defopcode :f32-load  #xCE (:reg :reg :reg) "Lane of f32 vector → fresh boxed single-float (allocates)")
 (defopcode :f32-store #xCF (:reg :reg :reg) "Boxed float → single precision → f32 vector lane")
 (defopcode :fround32  #xD0 (:reg :reg)      "Boxed float rounded to single precision → fresh boxed single (allocates)")
+(defopcode :fp-unbox      #xD1 (:reg :reg)      "Boxed float → unboxed single in FP vreg")
+(defopcode :fp-box        #xD2 (:reg :reg)      "Unboxed single in FP vreg → fresh boxed single-float (allocates)")
+(defopcode :fp-lane-load  #xD3 (:reg :reg :reg) "Packed f32 lane → FP vreg")
+(defopcode :fp-lane-store #xD4 (:reg :reg :reg) "FP vreg → packed f32 lane")
+(defopcode :fp-add        #xD5 (:reg :reg :reg) "FP vreg single add")
+(defopcode :fp-sub        #xD6 (:reg :reg :reg) "FP vreg single sub")
+(defopcode :fp-mul        #xD7 (:reg :reg :reg) "FP vreg single mul")
+(defopcode :fp-div        #xD8 (:reg :reg :reg) "FP vreg single div")
 
 ;;; ============================================================
 ;;; Memory Width Constants
@@ -1095,6 +1121,19 @@
 
 (defun mvm-fround32 (buf vd vs)
   (encode-instruction buf +op-fround32+ vd vs))
+
+(defun mvm-fp-unbox (buf fd vsrc)
+  (encode-instruction buf +op-fp-unbox+ fd vsrc))
+(defun mvm-fp-box (buf vd fs)
+  (encode-instruction buf +op-fp-box+ vd fs))
+(defun mvm-fp-lane-load (buf fd varr vidx)
+  (encode-instruction buf +op-fp-lane-load+ fd varr vidx))
+(defun mvm-fp-lane-store (buf varr vidx fs)
+  (encode-instruction buf +op-fp-lane-store+ varr vidx fs))
+(defun mvm-fp-add (buf fd fa fb) (encode-instruction buf +op-fp-add+ fd fa fb))
+(defun mvm-fp-sub (buf fd fa fb) (encode-instruction buf +op-fp-sub+ fd fa fb))
+(defun mvm-fp-mul (buf fd fa fb) (encode-instruction buf +op-fp-mul+ fd fa fb))
+(defun mvm-fp-div (buf fd fa fb) (encode-instruction buf +op-fp-div+ fd fa fb))
 
 ;; Memory
 (defun mvm-load (buf vd vaddr width)

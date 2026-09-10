@@ -2801,6 +2801,7 @@
          (let* ((vd (first operands))
                 (varr (second operands))
                 (vidx (third operands)))
+           (emit-push buf 'rcx) (emit-push buf 'rdx)     ; V5/V6 homes — preserve
            (let ((pidx (vreg-phys vidx)))
              (if pidx
                  (emit-mov-reg-reg buf +scratch-reg+ pidx)
@@ -2823,9 +2824,15 @@
            (emit-bytes buf #x66 #x48 #x0F #x7E #xC1)  ; movq rcx, xmm0
            (emit-float-store-bits buf 'r12 'rcx 'rdx)
            (emit-mcgc-set-start-bit buf 'r12)
+           ;; result via RAX so the saved rcx/rdx (a vreg may be homed
+           ;; there) can be restored BEFORE the destination is written.
+           (emit-lea buf 'rax 'r12 9)
+           (emit-add-reg-imm buf 'r12 48)
+           (emit-pop buf 'rdx) (emit-pop buf 'rcx)
+           ;; VR (the return register) is neither mapped nor a spill: it IS
+           ;; rax, so only move when the destination is a real register.
            (let ((d (dest-phys-or-scratch vd)))
-             (emit-lea buf d 'r12 9)
-             (emit-add-reg-imm buf 'r12 48)
+             (unless (eq d 'rax) (emit-mov-reg-reg buf d 'rax))
              (maybe-store-scratch buf vd))))
 
         ((op= +op-f32-store+)
@@ -2836,6 +2843,7 @@
          (let* ((varr (first operands))
                 (vidx (second operands))
                 (vval (third operands)))
+           (emit-push buf 'rcx) (emit-push buf 'rdx)     ; V5/V6 homes — preserve
            (emit-load-vreg buf varr 'rax) (emit-push buf 'rax)   ; save arr ptr
            (emit-load-vreg buf vidx 'rax) (emit-push buf 'rax)   ; save idx
            (emit-load-vreg buf vval 'rax)
@@ -2848,13 +2856,15 @@
            (emit-shl-reg-imm buf +scratch-reg+ 2)
            (emit-pop buf 'rdx)                         ; rdx = arr ptr
            (emit-add-reg-reg buf +scratch-reg+ 'rdx)   ; rax = arr + 4*idx
-           (emit-bytes buf #x89 #x48 #x07)))          ; mov [rax+7], ecx
+           (emit-bytes buf #x89 #x48 #x07)            ; mov [rax+7], ecx
+           (emit-pop buf 'rdx) (emit-pop buf 'rcx)))
 
         ((op= +op-fround32+)
          ;; (fround32 Vd Vs) — payload → CVTSD2SS → CVTSS2SD → fresh boxed
          ;; single-float.  Replaces the Lisp %round-to-single.
          (let* ((vd (first operands))
                 (vs (second operands)))
+           (emit-push buf 'rcx) (emit-push buf 'rdx)     ; V5/V6 homes — preserve
            (emit-load-vreg buf vs 'rax)
            (emit-float-load-bits buf 'rax 'rcx 'rdx)
            (emit-bytes buf #x66 #x48 #x0F #x6E #xC1)  ; movq xmm0, rcx
@@ -2865,10 +2875,101 @@
            (emit-bytes buf #x66 #x48 #x0F #x7E #xC1)  ; movq rcx, xmm0
            (emit-float-store-bits buf 'r12 'rcx 'rdx)
            (emit-mcgc-set-start-bit buf 'r12)
+           ;; result via RAX so the saved rcx/rdx (a vreg may be homed
+           ;; there) can be restored BEFORE the destination is written.
+           (emit-lea buf 'rax 'r12 9)
+           (emit-add-reg-imm buf 'r12 48)
+           (emit-pop buf 'rdx) (emit-pop buf 'rcx)
+           ;; VR (the return register) is neither mapped nor a spill: it IS
+           ;; rax, so only move when the destination is a real register.
            (let ((d (dest-phys-or-scratch vd)))
-             (emit-lea buf d 'r12 9)
-             (emit-add-reg-imm buf 'r12 48)
+             (unless (eq d 'rax) (emit-mov-reg-reg buf d 'rax))
              (maybe-store-scratch buf vd))))
+
+        ;; ==== Unboxed single-float FP register class (F0..F5 = xmm2..xmm7) ====
+        ;; xmm0 is scratch.  rcx/rdx are V5/V6 homes, so any op that runs
+        ;; float-load-bits / the box tail saves and restores them.
+
+        ((op= +op-fp-unbox+)
+         ;; (fp-unbox Fd Vsrc) — boxed float payload → CVTSD2SS xmmD, xmm0
+         (let* ((fd (+ 2 (first operands)))
+                (vsrc (second operands)))
+           (emit-load-vreg buf vsrc 'rax)
+           (emit-push buf 'rcx) (emit-push buf 'rdx)
+           (emit-float-load-bits buf 'rax 'rcx 'rdx)
+           (emit-bytes buf #x66 #x48 #x0F #x6E #xC1)                  ; movq xmm0, rcx
+           (emit-bytes buf #xF2 #x0F #x5A (logior #xC0 (ash fd 3)))    ; cvtsd2ss xmmD, xmm0
+           (emit-pop buf 'rdx) (emit-pop buf 'rcx)))
+
+        ((op= +op-fp-box+)
+         ;; (fp-box Vd Fs) — CVTSS2SD xmm0, xmmS → fresh boxed single (#x464)
+         (let* ((vd (first operands))
+                (fs (+ 2 (second operands))))
+           (emit-push buf 'rcx) (emit-push buf 'rdx)
+           (emit-bytes buf #xF3 #x0F #x5A (logior #xC0 fs))             ; cvtss2sd xmm0, xmmS
+           (emit-mov-reg-imm buf 'rcx #x464)
+           (emit-mov-mem-reg buf 'r12 'rcx 0)
+           (emit-bytes buf #x66 #x48 #x0F #x7E #xC1)                  ; movq rcx, xmm0
+           (emit-float-store-bits buf 'r12 'rcx 'rdx)
+           (emit-mcgc-set-start-bit buf 'r12)
+           (emit-lea buf 'rax 'r12 9)
+           (emit-add-reg-imm buf 'r12 48)
+           (emit-pop buf 'rdx) (emit-pop buf 'rcx)
+           ;; VR (the return register) is neither mapped nor a spill: it IS
+           ;; rax, so only move when the destination is a real register.
+           (let ((d (dest-phys-or-scratch vd)))
+             (unless (eq d 'rax) (emit-mov-reg-reg buf d 'rax))
+             (maybe-store-scratch buf vd))))
+
+        ((op= +op-fp-lane-load+)
+         ;; (fp-lane-load Fd Varr Vidx) — MOVSS xmmD, [arr + 4*idx + 7]
+         (let* ((fd (+ 2 (first operands)))
+                (varr (second operands))
+                (vidx (third operands)))
+           (emit-load-vreg buf vidx +scratch-reg+)
+           (emit-sar-reg-imm buf +scratch-reg+ 1)
+           (emit-shl-reg-imm buf +scratch-reg+ 2)
+           (let ((pobj (vreg-phys varr)))
+             (if pobj
+                 (emit-add-reg-reg buf +scratch-reg+ pobj)
+                 (progn
+                   (emit-push buf 'r13)
+                   (emit-load-vreg buf varr 'r13)
+                   (emit-add-reg-reg buf +scratch-reg+ 'r13)
+                   (emit-pop buf 'r13))))
+           (emit-bytes buf #xF3 #x0F #x10 (logior #x40 (ash fd 3)) #x07)))  ; movss xmmD, [rax+7]
+
+        ((op= +op-fp-lane-store+)
+         ;; (fp-lane-store Varr Vidx Fs) — MOVSS [arr + 4*idx + 7], xmmS
+         (let* ((varr (first operands))
+                (vidx (second operands))
+                (fs (+ 2 (third operands))))
+           (emit-load-vreg buf vidx +scratch-reg+)
+           (emit-sar-reg-imm buf +scratch-reg+ 1)
+           (emit-shl-reg-imm buf +scratch-reg+ 2)
+           (let ((pobj (vreg-phys varr)))
+             (if pobj
+                 (emit-add-reg-reg buf +scratch-reg+ pobj)
+                 (progn
+                   (emit-push buf 'r13)
+                   (emit-load-vreg buf varr 'r13)
+                   (emit-add-reg-reg buf +scratch-reg+ 'r13)
+                   (emit-pop buf 'r13))))
+           (emit-bytes buf #xF3 #x0F #x11 (logior #x40 (ash fs 3)) #x07)))  ; movss [rax+7], xmmS
+
+        ((or (op= +op-fp-add+) (op= +op-fp-sub+) (op= +op-fp-mul+) (op= +op-fp-div+))
+         ;; (fp-<op> Fd Fa Fb) — single-precision: xmm0 ← B; D ← A; D op= xmm0
+         (let* ((fd (+ 2 (first operands)))
+                (fa (+ 2 (second operands)))
+                (fb (+ 2 (third operands)))
+                (sse (cond ((op= +op-fp-add+) #x58)     ; ADDSS
+                           ((op= +op-fp-sub+) #x5C)     ; SUBSS
+                           ((op= +op-fp-mul+) #x59)     ; MULSS
+                           (t                 #x5E))))  ; DIVSS
+           (emit-bytes buf #x0F #x28 (logior #xC0 fb))                       ; movaps xmm0, xmmB
+           (unless (= fd fa)
+             (emit-bytes buf #x0F #x28 (logior #xC0 (ash fd 3) fa)))         ; movaps xmmD, xmmA
+           (emit-bytes buf #xF3 #x0F sse (logior #xC0 (ash fd 3)))))         ; opss xmmD, xmm0
 
         ((op= +op-u8-ref+)
          ;; (u8-ref Vd Varr Vidx) — load one byte from a u8 vector.
@@ -3029,6 +3130,7 @@
                                   ((op= +op-fsub+) #x5C)   ; SUBSD
                                   ((op= +op-fmul+) #x59)   ; MULSD
                                   (t                #x5E)))) ; DIVSD
+           (emit-push buf 'rcx) (emit-push buf 'rdx)     ; V5/V6 homes — preserve
            ;; Stack-save operands.
            (emit-load-vreg buf va 'rax)
            (emit-push buf 'rax)
@@ -3062,9 +3164,15 @@
            ;; MCGC object-start bit (R12 still = float base).
            (emit-mcgc-set-start-bit buf 'r12)
            ;; Result tagged pointer = R12 + 9; advance R12 by 48 bytes.
+           ;; result via RAX so the saved rcx/rdx (a vreg may be homed
+           ;; there) can be restored BEFORE the destination is written.
+           (emit-lea buf 'rax 'r12 9)
+           (emit-add-reg-imm buf 'r12 48)
+           (emit-pop buf 'rdx) (emit-pop buf 'rcx)
+           ;; VR (the return register) is neither mapped nor a spill: it IS
+           ;; rax, so only move when the destination is a real register.
            (let ((d (dest-phys-or-scratch vd)))
-             (emit-lea buf d 'r12 9)
-             (emit-add-reg-imm buf 'r12 48)
+             (unless (eq d 'rax) (emit-mov-reg-reg buf d 'rax))
              (maybe-store-scratch buf vd))))
 
         ((op= +op-itof+)

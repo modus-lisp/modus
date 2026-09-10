@@ -778,6 +778,7 @@
 ;; resumed.  Defvar defaults NIL at boot — exactly the wanted initial state.
 (defvar *mvm-last-mv* nil)
 
+
 (defun %mvm-collect-mv-secs (state mvc)
   "Read the MVC-1 SECONDARY values (indices 0..MVC-2) from the simulated
    MV-value slots (#x10000098 + i*8), in order.  Reads back-to-front so
@@ -818,7 +819,12 @@
   (let* ((state (make-mvm-state))
          (bc bytecode) (pc entry-point) (len (length bc))
          (ftab (or function-table (vector)))
-         (regs (mvm-regs state)))
+         (regs (mvm-regs state))
+         ;; Unboxed single-float FP register file (F0..F5) for the interpreter
+         ;; arm — a LOCAL, not a defvar: images that never run
+         ;; init-all-globals (the ANSI corpus runner) left a global unbound and
+         ;; the arm faulted (gate23: plus.25 / plus.reassociation.1).
+         (fregs (make-array 6 :initial-element 0.0f0)))
     (declare (type fixnum pc len) (type simple-vector regs) (ignorable ftab))
     (reg-set-nil regs +vreg-vn+)  ; VN holds the canonical NIL immediate
     (reg-set regs +vreg-vpc+ pc)
@@ -1757,6 +1763,46 @@
                ;; (which is (%fround32 …) and would re-enter this op).
                (setf (svref regs vd) (%round-to-single-lisp (svref regs vs)))
                (setf pc npc2))))
+
+          ;; ---- Unboxed single-float FP register class (reference arm) ----
+          ;; FP vregs live in fregs as host single-floats.  They are
+          ;; only ever live inside a call-free expression tree, so one
+          ;; global file is safe across nested interpreter entries.
+          (#.+op-fp-unbox+
+           (multiple-value-bind (fd npc) (fetch-reg bc pc)
+             (multiple-value-bind (vs npc2) (fetch-reg bc npc)
+               (setf (svref fregs fd) (coerce (svref regs vs) 'single-float))
+               (setf pc npc2))))
+          (#.+op-fp-box+
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (fs npc2) (fetch-reg bc npc)
+               (setf (svref regs vd) (svref fregs fs))
+               (setf pc npc2))))
+          (#.+op-fp-lane-load+
+           (multiple-value-bind (fd npc) (fetch-reg bc pc)
+             (multiple-value-bind (varr npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vidx npc3) (fetch-reg bc npc2)
+                 (setf (svref fregs fd)
+                       (%f32-aref-rt (svref regs varr) (svref regs vidx)))
+                 (setf pc npc3)))))
+          (#.+op-fp-lane-store+
+           (multiple-value-bind (varr npc) (fetch-reg bc pc)
+             (multiple-value-bind (vidx npc2) (fetch-reg bc npc)
+               (multiple-value-bind (fs npc3) (fetch-reg bc npc2)
+                 (%f32-aset-rt (svref regs varr) (svref regs vidx) (svref fregs fs))
+                 (setf pc npc3)))))
+          ((#.+op-fp-add+ #.+op-fp-sub+ #.+op-fp-mul+ #.+op-fp-div+)
+           (multiple-value-bind (fd npc) (fetch-reg bc pc)
+             (multiple-value-bind (fa npc2) (fetch-reg bc npc)
+               (multiple-value-bind (fb npc3) (fetch-reg bc npc2)
+                 (let ((a (svref fregs fa)) (b (svref fregs fb)))
+                   (setf (svref fregs fd)
+                         (coerce (cond ((= opcode #.+op-fp-add+) (+ a b))
+                                       ((= opcode #.+op-fp-sub+) (- a b))
+                                       ((= opcode #.+op-fp-mul+) (* a b))
+                                       (t (/ a b)))
+                                 'single-float)))
+                 (setf pc npc3)))))
 
           (#.+op-aref+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)

@@ -4297,6 +4297,63 @@
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
+          ;; ==== Unboxed single-float FP register class (F0..F5 = s2..s7) ====
+          ;; The a64 vreg homes are x0-x3/x19-x23 and the float scratch is
+          ;; x9/x10/x16/x17 + d0, so these ops are clobber-safe by
+          ;; construction.  gc-set-bit clobbers x9..x13 — always FIRST.
+
+          ;; ---- FP-UNBOX Fd, Vsrc ----  boxed float payload → FCVT S(2+d), D0
+          ((= op +op-fp-unbox+)
+           (let* ((fd (+ 2 (vr 0)))
+                  (ps (ensure-src (vr 1) +a64-x16+)))
+             (a64-float-load-bits buf ps +a64-x9+ +a64-x10+)
+             (a64-fmov-d-x buf 0 +a64-x9+)
+             (a64-emit buf (logior #x1E624000 (ash 0 5) fd))))          ; FCVT Sd, D0
+
+          ;; ---- FP-BOX Vd, Fs ----  FCVT D0, S(2+s) → fresh boxed single
+          ((= op +op-fp-box+)
+           (let* ((vd (vr 0))
+                  (fs (+ 2 (vr 1)))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (emit-aarch64-gc-mark-start buf)                            ; first: clobbers x9..x13
+             (a64-emit buf (logior #x1E22C000 (ash fs 5) 0))             ; FCVT D0, Ss
+             (a64-fmov-x-d buf +a64-x9+ 0)
+             (a64-movz buf +a64-x10+ #x464 0)
+             (a64-stur buf +a64-x10+ +a64-x24+ 0)
+             (a64-float-store-bits buf +a64-x24+ +a64-x9+ +a64-x10+)
+             (a64-add-imm buf pd +a64-x24+ 9)
+             (a64-add-imm buf +a64-x24+ +a64-x24+ 48)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- FP-LANE-LOAD Fd, Varr, Vidx ----  LDUR S(2+d), [x9,#7]
+          ((= op +op-fp-lane-load+)
+           (let* ((fd (+ 2 (vr 0)))
+                  (parr (ensure-src (vr 1) +a64-x16+))
+                  (pidx (ensure-src (vr 2) +a64-x17+)))
+             (a64-asr-imm buf +a64-x9+ pidx 1)
+             (a64-add-reg buf +a64-x9+ parr +a64-x9+ 0 2)
+             (a64-emit buf (logior #xBC407000 (ash +a64-x9+ 5) fd))))
+
+          ;; ---- FP-LANE-STORE Varr, Vidx, Fs ----  STUR S(2+s), [x10,#7]
+          ((= op +op-fp-lane-store+)
+           (let* ((parr (ensure-src (vr 0) +a64-x16+))
+                  (pidx (ensure-src (vr 1) +a64-x17+))
+                  (fs (+ 2 (vr 2))))
+             (a64-asr-imm buf +a64-x10+ pidx 1)
+             (a64-add-reg buf +a64-x10+ parr +a64-x10+ 0 2)
+             (a64-emit buf (logior #xBC007000 (ash +a64-x10+ 5) fs))))
+
+          ;; ---- FP-ADD/SUB/MUL/DIV Fd, Fa, Fb ----  F<op> Sd, Sn, Sm (single)
+          ((or (= op +op-fp-add+) (= op +op-fp-sub+)
+               (= op +op-fp-mul+) (= op +op-fp-div+))
+           (let* ((fd (+ 2 (vr 0))) (fa (+ 2 (vr 1))) (fb (+ 2 (vr 2)))
+                  (base (cond ((= op +op-fp-add+) #x1E202800)
+                              ((= op +op-fp-sub+) #x1E203800)
+                              ((= op +op-fp-mul+) #x1E200800)
+                              (t                  #x1E201800))))
+             (a64-emit buf (logior base (ash fb 16) (ash fa 5) fd))))
+
           ;; ---- U8-REF Vd, Varr, Vidx ----  (load one byte from a u8 vector)
           ;; Byte address = (Varr - 9) + 16 + real_idx = Varr + 7 + real_idx.
           ;; Vidx is a TAGGED fixnum (real_idx*2); result is a TAGGED fixnum

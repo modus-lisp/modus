@@ -332,6 +332,13 @@ every intra-predicted pixel had cost an accessor call plus a generic `aref`;
 `bool-bit` carried six `bd-*` calls per decoded bit.  Pi 5: **30 frames in
 0.80 s = 37 fps**, inter 25 ms, keyframe 55 ms.
 
+A last instruction-count slice (`2f2411e` — pure typed right operands skip
+the push/pop guard, and a guard for an x64 hazard in the earlier leaf
+shortcut: a spilled temp or an `aref` is written through rax, which is also
+VR) changed nothing on the Pi.  That is the useful negative result: on an
+out-of-order core the remaining cost is not the instruction count inside
+expression chains.
+
 What remains between 37 and 60 fps is uniform per-operation cost: every
 variable read is a frame load and every binary op is ~12 instructions.  The
 next step is register allocation across a basic block, not another dispatch

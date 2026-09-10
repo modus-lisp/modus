@@ -529,11 +529,19 @@
 ;;; measured at GET-INTERNAL-REAL-TIME+0xbc inside a restored quicklisp core.
 ;;; Nothing on the board may reach syscall3; route both to the CNTVCT
 ;;; counter, exactly as %timer-universal-time's docstring says a bare-metal
-;;; build must select explicitly.  Milliseconds, so internal-time-units-per-
-;;; second (1000) matches the hosted definition.
+;;; build must select explicitly.  MICROSECONDS: the boot init below sets
+;;; internal-time-units-per-second to 1000000 (the hosted definition), and
+;;; this used to return milliseconds against it — every bare-metal timing
+;;; read 1000× too small (a 20 s reel decode on the Zero 2 W reported as
+;;; 20 ms, 2026-09-10).  Split the division so the product never leaves
+;;; the fixnum range: CNTVCT at 19.2/54 MHz × 10^6 overflows 62 bits in days.
 (defun get-internal-real-time ()
   (let ((hz (cntfrq)))
-    (if (and (integerp hz) (> hz 0)) (floor (* (rdtsc) 1000) hz) 0)))
+    (if (and (integerp hz) (> hz 0))
+        (let ((ticks (rdtsc)))
+          (+ (* (floor ticks hz) 1000000)
+             (floor (* (mod ticks hz) 1000000) hz)))
+        0)))
 (defun get-universal-time () (%timer-universal-time))
 "
         (if *cl-repl-rpi-p* *cl-repl-rpi-core-source* ""))))

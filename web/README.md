@@ -63,6 +63,26 @@ because the worker blocks on stdin with `Atomics.wait`.
   interpreted (fib 20: 71 s → 1.2 s).  Function values are
   `(phys-index << 4) | 3`; the module's own bytecode is relocated the same
   way at load.
+- Translation to JS.  A bytecode function called more than a threshold
+  (`--compile-threshold`, default 20) is translated into JS: basic blocks
+  become `switch` cases, V0–V8 live in JS locals and are spilled to the
+  memory frame around calls, traps, collections and delegated
+  instructions, V9–V15 and the frame slots stay in memory, so the GC and
+  longjmp see exactly what they see for interpreted code.  A driver loop
+  runs translated functions without JS recursion (a Lisp call never grows
+  the JS stack), large functions are emitted as chunks small enough for
+  V8 to optimize, and cold or untranslatable code stays interpreted; the
+  two mix freely.  Steady state, node, `web/t/bench.lisp`:
+
+  | | interpreted | translated |
+  |---|---|---|
+  | fib 27 | 712 ms | 98 ms |
+  | tak 18 12 6 | 69 ms | 13 ms |
+  | sort 100k fixnums with `#'<` | 1433 ms | 645 ms |
+  | format 3000 pairs to a string | 3126 ms | 1118 ms |
+  | 10k string keys into an EQUAL table | 7455 ms | 2485 ms |
+  | read a 3000-element list from a string | 11035 ms | 3639 ms |
+
 - I/O.  Files: node uses real descriptors; the browser has an in-memory
   filesystem rooted at `/home/web` — drop files on the page (or use the
   picker) and they appear at the next prompt, and every file the program

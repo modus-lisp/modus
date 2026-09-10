@@ -217,6 +217,7 @@ class MVM {
     // through the private syscall 4242 and returns a fake IPv4 we can map back.
     this.compiled = new Map();                // phys entry -> JS function, or null (not translatable)
     this.resumeL = 0;
+    this.nextF = undefined;
     this.dcount = new Map();
     this.contF = []; this.contL = []; this.contE = []; this.contDepth = 0;
     this.compileOn = opts.compile !== false;
@@ -1280,7 +1281,8 @@ class MVM {
           if (d >= cf.length) { cf.push(null); cl.push(0); ce.push(0); }
           cf[d] = f; cl[d] = this.resumeL; ce[d] = ebp; d++;
         }
-        const g = this.compiledFor(t);
+        let g = this.nextF;
+        if (g === undefined) g = this.compiledFor(t); else this.nextF = undefined;
         if (g) { f = g; L = 0; ebp = this.ebp; }
         else {
           this.contDepth = d;
@@ -1347,17 +1349,54 @@ class MVM {
     insns.sort((a, b) => a[0] - b[0]);
     const label = new Map(); let nl = 0;
     for (const [pc] of insns) if (starts.has(pc)) label.set(pc, nl++);
+    // V8 will not optimize a function whose bytecode is huge, and the image
+    // has 10k-instruction &rest ladders, so a function is emitted as chunks
+    // of blocks; a jump across chunks spills the registers and returns to the
+    // dispatcher with the target label.
+    const CHUNK = DBG.MVM_CHUNK ? parseInt(DBG.MVM_CHUNK, 10) : 150;
+    const labelChunk = new Map(); let nch = 0, acc = 0;
+    for (const [pc] of insns) {
+      if (label.has(pc)) { if (acc >= CHUNK) { nch++; acc = 0; } labelChunk.set(label.get(pc), nch); }
+      acc++;
+    }
+    nch++;
     // 2. emit
+    // V0-V8 live in JS locals (the native build's register set); V9-V15 and
+    // the frame slots stay in memory.  Locals are spilled to the frame
+    // before anything that reads registers from memory, runs other code or
+    // may move objects (calls, traps, GC, delegated instructions), and
+    // reloaded after; a (re)entry of the function reloads them too.
     const OFF = (v) => (ROFF[v] >> 2);
-    const lo = (v) => v < 16 ? `m32[fb+(${OFF(v)})]` : v === 16 ? 'vm.vrl' : v === 17 ? 'vm.va' : v === 18 ? 'vm.vl' : v === 19 ? `${NIL}` : v === 20 ? 'vm.esp' : v === 21 ? 'vm.ebp' : 'vm.pc';
-    const hi = (v) => v < 16 ? `m32[fb+(${OFF(v) + 1})]` : v === 16 ? 'vm.vrh' : '0';
-    const W = (v, l, h) => v < 16 ? `m32[fb+(${OFF(v)})]=${l};m32[fb+(${OFF(v) + 1})]=${h};` : v === 16 ? `vm.vrl=${l};vm.vrh=${h};` : `vm.setReg(${v},${l},${h});`;
+    const NLOC = 9;
+    const lo = (v) => v < NLOC ? `r${v}l` : v < 16 ? `m32[fb+(${OFF(v)})]` : v === 16 ? 'vm.vrl' : v === 17 ? 'vm.va' : v === 18 ? 'vm.vl' : v === 19 ? `${NIL}` : v === 20 ? 'vm.esp' : v === 21 ? 'vm.ebp' : 'vm.pc';
+    const hi = (v) => v < NLOC ? `r${v}h` : v < 16 ? `m32[fb+(${OFF(v) + 1})]` : v === 16 ? 'vm.vrh' : '0';
+    const W = (v, l, h) => v < NLOC ? `r${v}l=${l};r${v}h=${h};` : v < 16 ? `m32[fb+(${OFF(v)})]=${l};m32[fb+(${OFF(v) + 1})]=${h};` : v === 16 ? `vm.vrl=${l};vm.vrh=${h};` : `vm.setReg(${v},${l},${h});`;
+    let STORE = '', LOAD = '', STORE5 = '', DECL = '';
+    for (let v = 0; v < NLOC; v++) {
+      STORE += `m32[fb+(${OFF(v)})]=r${v}l;m32[fb+(${OFF(v) + 1})]=r${v}h;`;
+      LOAD += `r${v}l=m32[fb+(${OFF(v)})];r${v}h=m32[fb+(${OFF(v) + 1})];`;
+      if (v <= 4) STORE5 += `m32[fb+(${OFF(v)})]=r${v}l;m32[fb+(${OFF(v) + 1})]=r${v}h;`;
+      DECL += `let r${v}l=0,r${v}h=0;`;
+    }
+    // V0-V3 and V5-V8 are caller-saved on the native machine, so after a
+    // call only V4 is meaningful; a fresh entry needs V0-V4 (args, rbx).
+    const ENTRY = `if(L===0){${[0, 1, 2, 3, 4].map((v) => `r${v}l=m32[fb+(${OFF(v)})];r${v}h=m32[fb+(${OFF(v) + 1})];`).join('')}}else{r4l=m32[fb+(${OFF(4)})];r4h=m32[fb+(${OFF(4) + 1})];}`;
     const WR = (v) => W(v, 'RL', 'RH');
-    const J = (t) => `{L=${label.get(t)};continue;}`;
+    let curChunk = 0;
+    const J = (t) => { const l = label.get(t); return labelChunk.get(l) === curChunk ? `{L=${l};continue;}` : `{${STORE}return ${-(2 + l)};}`; };
     const chk = (l, h, a, what) => `if(${h}!==0||${a}<${VBASE}||${a}>=HE)vm.memFault(${JSON.stringify(what)});`;
+    const outs = new Array(nch).fill('');
     let out = '';
+    const sites = []; let nsite = 0;
     for (const [pc, op, len] of insns) {
-      if (label.has(pc)) out += `case ${label.get(pc)}:\n`;
+      if (label.has(pc)) {
+        const l = label.get(pc), ch = labelChunk.get(l);
+        if (ch !== curChunk) {                 // chunk boundary: fall through becomes a transfer
+          out += `{${STORE}return ${-(2 + l)};}\n`;
+          outs[curChunk] = out; out = ''; curChunk = ch;
+        }
+        out += `case ${l}:\n`;
+      }
       const b1 = m8[pc + 1], b2 = m8[pc + 2], b3 = m8[pc + 3], b4 = m8[pc + 4];
       const P = `vm.pc=${pc};`;
       switch (op) {
@@ -1366,8 +1405,7 @@ class MVM {
           const c = b1 | (b2 << 8);
           if (c < 0x100 && c <= 4) break;                                   // frame-enter, nothing to copy
           if (c >= 0x100 && c < 0x300) break;
-          out += `${P}vm.trap(${c},${pc + len});`;
-          if (c === 0x0510) out += `fb=(vm.ebp-${VBASE})>>2;`;
+          out += `${P}${STORE}vm.trap(${c},${pc + len});fb=(vm.ebp-${VBASE})>>2;${LOAD}`;
           break;
         }
         case 0x10: out += W(b1, lo(b2), hi(b2)); break;
@@ -1458,14 +1496,20 @@ class MVM {
         }
         case 0x72: case 0x8A: case 0x8B: case 0x92: break;
         case 0x80: case 0x81: {
-          const t = op === 0x80 ? `${rd32(pc + 1) >>> 0}` : `vm.fnAddrToOffset(${lo(b1)},${hi(b1)})`;
-          out += `${P}{const t=${t};vm.resumeL=${label.get(pc + len)};vm.push(${RET_SENTINEL},0);vm.enter(t);return t*2;}`;
+          if (op === 0x80) {
+            const t = rd32(pc + 1) >>> 0;
+            const c = `c${nsite++}`;
+            sites.push(c);
+            out += `${P}${STORE5}vm.resumeL=${label.get(pc + len)};if(${c}===undefined)${c}=vm.compiledFor(${t});vm.nextF=${c};vm.push(${RET_SENTINEL},0);vm.enter(${t});return ${t * 2};`;
+          } else {
+            out += `${P}${STORE5}{const t=vm.fnAddrToOffset(${lo(b1)},${hi(b1)});vm.resumeL=${label.get(pc + len)};vm.push(${RET_SENTINEL},0);vm.enter(t);return t*2;}`;
+          }
           break;
         }
         case 0x82: out += `vm.doRet();return -1;`; break;
-        case 0x83: out += `${P}{const t=${rd32(pc + 1) >>> 0};vm.doTailcall(t);return t*2+1;}`; break;
+        case 0x83: out += `${P}${STORE5}{const t=${rd32(pc + 1) >>> 0};vm.doTailcall(t);return t*2+1;}`; break;
         case 0x88: out += `${P}{const b=vm.bump(16);vm.zero(b,b+16);vm.markStart(b);vm.markCons(b);${W(b1, 'b|1', '0')}}`; break;
-        case 0x89: out += `if(vm.va>=vm.vl){${P}vm.gc();}`; break;
+        case 0x89: out += `if(vm.va>=vm.vl){${P}${STORE}vm.gc();${LOAD}}`; break;
         case 0xA7: { const t = rd32(pc + 2) >>> 0; out += W(b1, `${t === FN_UNRESOLVED ? NIL : ((t << 4) | 3)}`, '0'); break; }
         case 0xB8: out += `vm.st64(${A_MVCOUNT},${b1 << 1},0);`; break;
         case 0xBA: out += `vm.st64(${A_CENV},${lo(b1)},${hi(b1)});`; break;
@@ -1479,35 +1523,42 @@ class MVM {
           break;
         }
         case 0xC7: out += `if(ovf)${J(pc + len + rd32(pc + 1))}`; break;
-        case 0xAE: case 0xAF: if (DBG.MVM_NOCHK || DBG.MVM_NOCHK_AE) { out += `${P}vm.execInsn(${pc});fb=(vm.ebp-${VBASE})>>2;`; break; } {  // add/sub-checked: fast path inline, overflow -> generic
+        case 0xAE: case 0xAF: if (DBG.MVM_NOCHK || DBG.MVM_NOCHK_AE) { out += `${P}${STORE}vm.execInsn(${pc});${LOAD}`; break; } {  // add/sub-checked: fast path inline, overflow -> generic
           const f = op === 0xAE ? 'add64' : 'sub64';
           const ov = op === 0xAE ? `((ah^RH)&(bh^RH))<0` : `((ah^bh)&(ah^RH))<0`;
-          out += `{const al=${lo(b2)},ah=${hi(b2)},bl=${lo(b3)},bh=${hi(b3)};${f}(al,ah,bl,bh);if(${ov}){${P}vm.checkedSlow(${op},al,ah,bl,bh);fb=(vm.ebp-${VBASE})>>2;}${WR(b1)}}`;
+          out += `{const al=${lo(b2)},ah=${hi(b2)},bl=${lo(b3)},bh=${hi(b3)};${f}(al,ah,bl,bh);if(${ov}){${P}${STORE}vm.checkedSlow(${op},al,ah,bl,bh);${LOAD}}${WR(b1)}}`;
           break;
         }
-        case 0xAD: if (DBG.MVM_NOCHK || DBG.MVM_NOCHK_AD) { out += `${P}vm.execInsn(${pc});fb=(vm.ebp-${VBASE})>>2;`; break; } {
-          out += `{const al=${lo(b2)},ah=${hi(b2)},bl=${lo(b3)},bh=${hi(b3)};sar64(al,ah,1);const xl=RL,xh=RH;if(xh===(xl>>31)&&bh===(bl>>31)&&xl>-0x4000000&&xl<0x4000000&&bl>-0x4000000&&bl<0x4000000)fromNum(xl*bl);else{${P}vm.checkedSlow(${op},al,ah,bl,bh);fb=(vm.ebp-${VBASE})>>2;}${WR(b1)}}`;
+        case 0xAD: if (DBG.MVM_NOCHK || DBG.MVM_NOCHK_AD) { out += `${P}${STORE}vm.execInsn(${pc});${LOAD}`; break; } {
+          out += `{const al=${lo(b2)},ah=${hi(b2)},bl=${lo(b3)},bh=${hi(b3)};sar64(al,ah,1);const xl=RL,xh=RH;if(xh===(xl>>31)&&bh===(bl>>31)&&xl>-0x4000000&&xl<0x4000000&&bl>-0x4000000&&bl<0x4000000)fromNum(xl*bl);else{${P}${STORE}vm.checkedSlow(${op},al,ah,bl,bh);${LOAD}}${WR(b1)}}`;
           break;
         }
         default:
           // everything else runs through the interpreter's executor; ops that
           // set flags publish them in vm.cmp / vm.ovf
-          out += `${P}vm.execInsn(${pc});`;
+          out += `${P}${STORE}vm.execInsn(${pc});${LOAD}`;
           if (DBG.MVM_DCOUNT) out += `vm.dcount.set(${op},(vm.dcount.get(${op})||0)+1);`;
           this.compileStats.delegated.set(op, (this.compileStats.delegated.get(op) || 0) + 1);
           if (op === 0x31 || op === 0xC4) out += `cmp=vm.cmp;`;
-          out += `fb=(vm.ebp-${VBASE})>>2;`;
           break;
       }
       out += '\n';
       if (op === 0x82 || op === 0x83 || op === 0x40 || op === 0x80 || op === 0x81) out += `vm.fault('fell off a block');\n`;
     }
-    out += `default: vm.fault('bad block label '+L);\n`;
-    const body = `let fb=(vm.ebp-${VBASE})>>2;const HE=vm.heapEnd;let cmp=0,ovf=false;for(;;)switch(L){\n${out}}`;
+    outs[curChunk] = out;
+    const ENTRYX = `if(L===0){${[0, 1, 2, 3, 4].map((v) => `r${v}l=m32[fb+(${OFF(v)})];r${v}h=m32[fb+(${OFF(v) + 1})];`).join('')}}else{${LOAD}}`;
+    const mk = (o, i) => `function(vm,L){const m32=vm.m32,m8=vm.m8;let fb=(vm.ebp-${VBASE})>>2;const HE=vm.heapEnd;let cmp=0,ovf=false;${DECL}${i === 0 && nch === 1 ? ENTRY : ENTRYX}for(;;)switch(L){\n${o}default: vm.fault('bad block label '+L);\n}}`;
+    let body;
+    if (nch === 1) body = `return ${mk(outs[0], 0)};`;
+    else {
+      const lc = []; for (const [l, c] of labelChunk) lc[l] = c;
+      body = `const CH=[${outs.map(mk).join(',')}];const LC=[${lc.join(',')}];return function(vm,L){for(;;){const r=CH[LC[L]](vm,L);if(r>=-1)return r;L=-2-r;}};`;
+    }
     if (DBG.MVM_DUMPCHK && body.includes('checkedSlow') && !this.dumped) { this.dumped = true; this.host.log(`[compiled ${this.where(entry)}]\n${body}`); }
     if (DBG.MVM_DUMP && this.where(entry).startsWith(DBG.MVM_DUMP)) this.host.log(`[compiled ${this.where(entry)}]\n${body}`);
     let f;
-    try { f = eval(`(function(vm,L){const m32=vm.m32,m8=vm.m8;${body}})`); }
+    const decl = sites.length ? `let ${sites.map((c) => c + '=undefined').join(',')};` : '';
+    try { f = eval(`(function(){${decl}${body}})()`); }
     catch (e) { this.host.log(`[compile ${this.where(entry)}: ${e.message}]`); this.compileStats.failed++; return null; }
     if (hasSetjmp) { f.RES = {}; for (const [pc, l] of label) f.RES[pc] = l; }
     this.compileStats.fns++; this.compileStats.insns += insns.length;

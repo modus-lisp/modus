@@ -2273,6 +2273,51 @@
                       (cons (cons h ty)
                             (remove h *global-dtypes* :key (function car))))))))))))
 
+;;; ---- typed struct slot access -------------------------------------------
+;;; DEFSTRUCT records every accessor: (acc-hash setter-hash struct-str index
+;;; slot-type).  A call (ACC x) or (SET-ACC x v) whose argument X is DECLARED
+;;; that struct (a lexical or global type promise) compiles to the slot read /
+;;; write in place — no call, no subtag / length check (the declaration is
+;;; the promise, as in SBCL) — and the slot's :TYPE feeds the typed array and
+;;; width paths through %expr-dtype: (aref (pl-data pl) i) with PL declared
+;;; PLANE and the slot typed U8VEC takes the byte path.
+(defvar *struct-accessors* nil
+  "Alist acc-name-hash -> (setter-hash struct-name-string slot-index slot-type).")
+
+(defun %struct-accessor-note (acc-name setter-name struct-str index slot-type)
+  (let ((h (compute-name-hash acc-name)))
+    (setq *struct-accessors*
+          (cons (list h (compute-name-hash setter-name) struct-str index slot-type)
+                (remove h *struct-accessors* :key (function car))))))
+
+(defun %struct-accessor-info (sym)
+  "The record for accessor symbol SYM, or NIL."
+  (and sym (symbolp sym) *struct-accessors*
+       (assoc (normalize-name sym) *struct-accessors*)))
+
+(defun %struct-setter-info (sym)
+  "The record whose SETTER is symbol SYM, or NIL."
+  (and sym (symbolp sym) *struct-accessors*
+       (let ((h (normalize-name sym)))
+         (find h *struct-accessors* :key (function cadr)))))
+
+(defun %declared-struct-p (form env struct-str)
+  "True when FORM is a variable declared to be the struct named STRUCT-STR."
+  (let ((ty (%var-dtype form env)))
+    (and ty (symbolp ty) (string= (symbol-name ty) struct-str))))
+
+(defun %expr-dtype (form env)
+  "Declared type of FORM: a variable's (lexical or global) declaration, or the
+   slot type of an accessor call on a declared struct argument."
+  (cond ((symbolp form) (%var-dtype form env))
+        ((and (consp form) (symbolp (car form)) (consp (cdr form)) (null (cddr form))
+              (symbolp (cadr form)))
+         (let ((info (%struct-accessor-info (car form))))
+           (and info (%declared-struct-p (cadr form) env (third info))
+                (fifth info)
+                (%resolve-declared-type (fifth info)))))
+        (t nil)))
+
 (defun name-eq (sym name-string)
   "Check if SYM's name matches NAME-STRING via hash comparison"
   (and (symbolp sym)
@@ -17073,8 +17118,7 @@
 (defun %declared-generic-array-var-p (form env)
   "True when FORM is a variable whose binding carries a generic
    (simple-array ET …) declaration — the raw word-slot path is valid."
-  (and (symbolp form)
-       (%generic-simple-array-decl-p (%var-dtype form env))))
+  (%generic-simple-array-decl-p (%expr-dtype form env)))
 
 (defun %resolve-declared-type (ty)
   "Expand a declared type NAME through the runtime deftype table so that
@@ -17158,7 +17202,10 @@
    two wide operands — must come back as NIL.  Before this cap ANSI
    minus.8's `(- (ash 1 1000))` became a tag-less subtract on a bignum
    pointer (gate7/gate8 lost 13982)."
-  (let ((w (%expr-width-1 form env)))
+  (let ((w (or (%expr-width-1 form env)
+               ;; (acc x) on a declared struct: the slot's declared type
+               (and (consp form)
+                    (let ((ty (%expr-dtype form env))) (and ty (%decl-int-width ty)))))))
     (and w (<= w 63) w)))
 
 (defun %expr-width-1 (form env)
@@ -17174,8 +17221,8 @@
      (let ((op (symbol-name (car form))) (args (cdr form)))
        (cond
          ((string= op "AREF")
-          (and (consp args) (symbolp (car args))
-               (%decl-array-elt-width (%var-dtype (car args) env))))
+          (and (consp args)
+               (%decl-array-elt-width (%expr-dtype (car args) env))))
          ((or (string= op "+") (string= op "-"))
           (and (consp args)
                (let ((w (%expr-width (car args) env)))
@@ -17269,8 +17316,7 @@
   "True when FORM is a variable declared (simple-array (unsigned-byte 8) …):
    emit the packed-byte primitives directly, skipping the wrapper/string/mda
    dispatch AND the runtime #x11 subtag test."
-  (and (symbolp form)
-       (%u8-simple-array-decl-p (%var-dtype form env))))
+  (%u8-simple-array-decl-p (%expr-dtype form env)))
 
 (defun compile-make-string-array (size-form env dest)
   "Like compile-make-array but with string subtag #x31.
@@ -17682,6 +17728,19 @@
                          (list 'when test (list 'setq r t) (list 'return nil))))
                r)
          env dest))))
+  ;; Struct slot access on a DECLARED struct argument: (acc x) → the slot
+  ;; read, (set-acc x v) → the slot write, in place (see *struct-accessors*).
+  (when (and *mvm-eval-runtime-p* (symbolp fn) *struct-accessors* (consp args))
+    (let ((info (%struct-accessor-info fn)))
+      (when (and info (null (cdr args)) (symbolp (car args))
+                 (%declared-struct-p (car args) env (third info)))
+        (return-from compile-call
+          (compile-form (list '%prim-aref (car args) (fourth info)) env dest))))
+    (let ((info (%struct-setter-info fn)))
+      (when (and info (consp (cdr args)) (null (cddr args)) (symbolp (car args))
+                 (%declared-struct-p (car args) env (third info)))
+        (return-from compile-call
+          (compile-form (list '%prim-aset (car args) (fourth info) (cadr args)) env dest)))))
   ;; Typed shortcuts for the helpers the ABS macro expands to: a known-width
   ;; integer expression (see %expr-width) is never complex, and negating one
   ;; of <= 61 bits cannot overflow, so (- 0 x) takes the plain :sub.  Each
@@ -19980,6 +20039,19 @@
             (own-slot-defaults (mapcar (lambda (s)
                                          (if (consp s) (cadr s) nil))
                                        raw-slots))
+            ;; the :TYPE option of each own slot (NIL when absent) — a typed
+            ;; slot read on a DECLARED struct argument feeds the typed
+            ;; array / width fast paths (see %struct-accessor-note)
+            (own-slot-types (mapcar (lambda (s)
+                                      (and (consp s)
+                                           (let ((opts (cddr s)))
+                                             (loop
+                                               (when (or (null opts) (null (cdr opts))) (return nil))
+                                               (when (and (symbolp (car opts))
+                                                          (string= (symbol-name (car opts)) "TYPE"))
+                                                 (return (cadr opts)))
+                                               (setq opts (cddr opts))))))
+                                    raw-slots))
             ;; DEFSTRUCT :INCLUDE (CLHS 3.4.6): the parent's effective slots
             ;; come FIRST in the layout; the child generates accessors with
             ;; its OWN conc-name for the inherited slots too.  Look the parent
@@ -20011,6 +20083,8 @@
                                              :initial-element nil))))
             ;; Effective (inherited then own) slot lists used everywhere.
             (slot-names (append parent-slot-names own-slot-names))
+            (slot-types (append (mapcar (lambda (p) (declare (ignore p)) nil) parent-slot-names)
+                                own-slot-types))
             (slot-defaults (append parent-slot-defaults own-slot-defaults))
             (slot-ro (append parent-slot-ro own-slot-ro))
             (nslots (length slot-names))
@@ -20367,6 +20441,10 @@
                                    (%signal-type-error))
                                (%signal-type-error)))
                         forms-to-compile)
+                  ;; compile-time record: a call on an argument DECLARED to be
+                  ;; this struct reads the slot in place (see compile-call)
+                  (%struct-accessor-note acc-name (format nil "SET-~A" acc-name)
+                                         struct-str (+ 2 i) (nth i slot-types))
                   (let* ((setter-name (format nil "SET-~A" acc-name))
                          ;; NOTE — CHECKED-STORE is bound HERE, as a plain
                          ;; top-level backquote, and spliced below as a bare

@@ -369,7 +369,15 @@ of a typed struct-slot read or of a declared variable it aliases
 still generic).  Pi 5: **30 frames in 0.59 s = 51 fps**, inter 18 ms,
 keyframe 45 ms.
 
-What remains between 51 and 60 fps is, this time measured, mostly reel's
+With the u8 `replace` expansion emitting the word-at-a-time copier
+(`d45a17b`): **30 frames in 0.53 s = 56 fps** — inter frames 16 ms (62 fps
+on their own), keyframe 43 ms.  The average is now keyframe-bound:
+`(43 + 29×16)/30 ≈ 16.9 ms`, i.e. 59 fps, so the last step is the
+keyframe's intra path, where `reconstruct-bpred`/`-luma16`/`-chroma` never
+declare their decoder argument and so read their plane through a checked
+accessor call plus a generic `aref` per pixel.
+
+What remains between 56 and 60 fps is, this time measured, mostly reel's
 kernels themselves (`add-residual`, the loop-filter edges, `mc-filter`,
 `decode-residue`/`get-coeffs`, ~65 %) at ~12 instructions per binary op
 with every local in a frame slot — register allocation across a basic

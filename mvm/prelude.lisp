@@ -1129,16 +1129,18 @@
                      (logior (ash s 31) (ash 255 23))
                      (logior (ash s 31) (ash (+ e 127) 23) (logand q 8388607)))))))))))))
 
-;; Element access goes through the bit-level Lisp conversions (correct on
-;; every arch, ~2-8 us).  The native fcvt opcodes (:f32-load / :f32-store /
-;; :fround32) are defined and correct as DIRECT primitives on x64, but the
-;; generic aref/aset dispatch through them and the aarch64 store are still
-;; buggy — deferred to a follow-up (see docs/simd-plan.md, layer 1b).
-(defun %f32-aref (a i) (%bits->single (%f32-bits-ref a i)))
+;; Element access uses the NATIVE fcvt conversion opcodes (:f32-load /
+;; :f32-store — cvtss2sd/cvtsd2ss on x64, fcvt on aarch64); the bit-level
+;; Lisp conversions above (%bits->single / %single->bits) remain the
+;; interpreter arm and the reference the probe cross-checks against.
+(defun %f32-aref (a i) (%f32-load a i))
 (defun %f32-aset (a i x)
   "Store float X into lane I of the packed vector A; returns X."
-  (%f32-bits-set a i (%single->bits (if (floatp x) x (float x 1.0f0))))
+  (%f32-store a i (if (floatp x) x (float x 1.0f0)))
   x)
+(defun %f32-aref-rt (a i) (%bits->single (%f32-bits-ref a i)))
+(defun %f32-aset-rt (a i x)
+  (%f32-bits-set a i (%single->bits (if (floatp x) x (float x 1.0f0)))) x)
 
 (defun %float-set-bits (f hi lo)
   "Store the 32-bit halves HI/LO into boxed float F as four 16-bit chunks.

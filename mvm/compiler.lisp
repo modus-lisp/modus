@@ -18061,7 +18061,7 @@
   ;; the runtime wrapper (no subtag dispatch).
   (when (%declared-f32-array-var-p arr-form env)
     (return-from compile-aref
-      (compile-form (list '%f32-aref arr-form idx-form) env dest)))
+      (compile-f32-load arr-form idx-form env dest)))
   ;; DECLARED (simple-array <generic> …) variable: raw word-slot access, no
   ;; wrapper/string/mda dispatch.  See %declared-generic-array-var-p.
   (when (%declared-generic-array-var-p arr-form env)

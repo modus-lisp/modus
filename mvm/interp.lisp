@@ -1753,7 +1753,9 @@
           (#.+op-fround32+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
-               (setf (svref regs vd) (%round-to-single (svref regs vs)))
+               ;; interpreter arm — the Lisp reference, NOT %round-to-single
+               ;; (which is (%fround32 …) and would re-enter this op).
+               (setf (svref regs vd) (%round-to-single-lisp (svref regs vs)))
                (setf pc npc2))))
 
           (#.+op-aref+

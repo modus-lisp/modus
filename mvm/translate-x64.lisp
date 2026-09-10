@@ -2830,29 +2830,24 @@
 
         ((op= +op-f32-store+)
          ;; (f32-store Varr Vidx Vval) — boxed float payload → CVTSD2SS →
-         ;; 32-bit lane.  Clobbers rax/rcx/rdx (like +op-fadd+), R13 saved.
+         ;; 32-bit lane.  float-load-bits clobbers rcx/rdx, so ALL THREE
+         ;; operands are stack-saved first (like +op-fadd+ saves its two):
+         ;; the array/index vregs may themselves be homed in rcx/rdx.
          (let* ((varr (first operands))
                 (vidx (second operands))
                 (vval (third operands)))
+           (emit-load-vreg buf varr 'rax) (emit-push buf 'rax)   ; save arr ptr
+           (emit-load-vreg buf vidx 'rax) (emit-push buf 'rax)   ; save idx
            (emit-load-vreg buf vval 'rax)
            (emit-float-load-bits buf 'rax 'rcx 'rdx)   ; rcx = payload bits
            (emit-bytes buf #x66 #x48 #x0F #x6E #xC1)  ; movq xmm0, rcx
            (emit-bytes buf #xF2 #x0F #x5A #xC0)       ; cvtsd2ss xmm0, xmm0
-           (emit-bytes buf #x66 #x0F #x7E #xC1)       ; movd ecx, xmm0
-           (let ((pidx (vreg-phys vidx)))
-             (if pidx
-                 (emit-mov-reg-reg buf +scratch-reg+ pidx)
-                 (emit-load-vreg buf vidx +scratch-reg+)))
+           (emit-bytes buf #x66 #x0F #x7E #xC1)       ; movd ecx, xmm0 (ecx = single bits)
+           (emit-pop buf +scratch-reg+)               ; rax = idx
            (emit-sar-reg-imm buf +scratch-reg+ 1)
            (emit-shl-reg-imm buf +scratch-reg+ 2)
-           (let ((pobj (vreg-phys varr)))
-             (if pobj
-                 (emit-add-reg-reg buf +scratch-reg+ pobj)
-                 (progn
-                   (emit-push buf 'r13)
-                   (emit-load-vreg buf varr 'r13)
-                   (emit-add-reg-reg buf +scratch-reg+ 'r13)
-                   (emit-pop buf 'r13))))
+           (emit-pop buf 'rdx)                         ; rdx = arr ptr
+           (emit-add-reg-reg buf +scratch-reg+ 'rdx)   ; rax = arr + 4*idx
            (emit-bytes buf #x89 #x48 #x07)))          ; mov [rax+7], ecx
 
         ((op= +op-fround32+)

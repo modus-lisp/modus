@@ -2324,11 +2324,16 @@
     (t                       (let ((o (%make-float2)))  (%float-set-bits o hi lo)))))
 
 (defun %round-to-single (f)
-  "Round the IEEE-double payload of float F to single-float (24-bit)
-   precision, round-to-nearest-even, returning a SINGLE-FLOAT-tagged box.
-   (The native :fround32 opcode is correct on x64 but its aarch64 twin is
-   deferred with the rest of the native f32 conversions; this Lisp version
-   is the one in service.)"
+  "Round the IEEE-double payload of float F to single-float precision,
+   returning a fresh SINGLE-FLOAT box.  NATIVE :fround32 (cvtsd2ss/cvtss2sd
+   on x64, fcvt d<->s on aarch64) — the Lisp bit version below
+   (%round-to-single-lisp) is the interpreter arm and the reference; it
+   cost ~4.7 us per float result (shifts >= 31 bits went through
+   bignum-ash), on EVERY float operation via %as-result-float."
+  (%fround32 f))
+
+(defun %round-to-single-lisp (f)
+  "Reference / interpreter implementation of %round-to-single."
   (let* ((hi   (%float-hi32 f))
          (lo   (%float-lo32 f))
          (sign (logand (ash hi -31) 1))

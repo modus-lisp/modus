@@ -4245,13 +4245,15 @@
                   (parr (ensure-src (vr 1) +a64-x16+))
                   (pidx (ensure-src (vr 2) +a64-x17+))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
+             ;; Set the object-start bit for x24 FIRST — gc-set-bit clobbers
+             ;; x9..x13, so it must run before the value bits land in x9.
+             (emit-aarch64-gc-mark-start buf)
              (a64-asr-imm buf +a64-x9+ pidx 1)
              (a64-add-reg buf +a64-x9+ parr +a64-x9+ 0 2)     ; x9 = Varr + 4*idx
              (a64-emit buf (logior #xB8407000 (ash +a64-x9+ 5) +a64-x10+)) ; LDUR W10, [x9,#7]
              (a64-emit buf (logior #x1E270000 (ash +a64-x10+ 5) 0))        ; FMOV S0, W10
              (a64-emit buf (logior #x1E22C000 0))                          ; FCVT D0, S0
              (a64-fmov-x-d buf +a64-x9+ 0)                    ; x9 = double bits
-             (emit-aarch64-gc-mark-start buf)
              (a64-movz buf +a64-x10+ #x464 0)                 ; header: 4 slots, subtag #x64
              (a64-stur buf +a64-x10+ +a64-x24+ 0)
              (a64-float-store-bits buf +a64-x24+ +a64-x9+ +a64-x10+)
@@ -4278,12 +4280,15 @@
            (let* ((vd (vr 0))
                   (ps (ensure-src (vr 1) +a64-x16+))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
+             ;; gc-set-bit clobbers x9..x13 — but ps may itself be x16 and the
+             ;; float-load-bits reads through it, so set the start bit first
+             ;; (x24 is stable) and only then compute the value into x9.
+             (emit-aarch64-gc-mark-start buf)
              (a64-float-load-bits buf ps +a64-x9+ +a64-x10+)
              (a64-fmov-d-x buf 0 +a64-x9+)
              (a64-emit buf (logior #x1E624000 0))              ; FCVT S0, D0
              (a64-emit buf (logior #x1E22C000 0))              ; FCVT D0, S0
              (a64-fmov-x-d buf +a64-x9+ 0)
-             (emit-aarch64-gc-mark-start buf)
              (a64-movz buf +a64-x10+ #x464 0)
              (a64-stur buf +a64-x10+ +a64-x24+ 0)
              (a64-float-store-bits buf +a64-x24+ +a64-x9+ +a64-x10+)

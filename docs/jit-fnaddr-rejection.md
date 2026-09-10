@@ -322,7 +322,17 @@ and the trust logic read *any known width* as "this operand is a fixnum" —
 computed width beyond 63 bits now comes back as NIL, which every consumer
 already treats as "not provably a fixnum".
 
-What remains between 33 and 60 fps is uniform per-operation cost: every
+One more promise-driven tier followed (`85cd19b`): **typed struct slot
+access**.  `defstruct` now records every accessor with its struct, slot
+index and `:type`; a call `(acc x)` or `(setf (acc x) v)` whose argument is
+*declared* that struct compiles to the slot read/write in place — no call,
+no subtag/length check — and the slot's type feeds the array and width
+paths.  reel's `pget` is `(aref (pl-data pl) …)` on a declared `plane`, so
+every intra-predicted pixel had cost an accessor call plus a generic `aref`;
+`bool-bit` carried six `bd-*` calls per decoded bit.  Pi 5: **30 frames in
+0.80 s = 37 fps**, inter 25 ms, keyframe 55 ms.
+
+What remains between 37 and 60 fps is uniform per-operation cost: every
 variable read is a frame load and every binary op is ~12 instructions.  The
 next step is register allocation across a basic block, not another dispatch
 fix.

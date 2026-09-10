@@ -12,7 +12,7 @@ const path = require('path');
 const { MVM, loadModule, MvmFault } = require('./mvm.js');
 const { NodeHost } = require('./host-node.js');
 
-const opts = { mvmw: path.join(__dirname, 'modus.mvmw'), trace: 0, debug: false, semi: 128 };
+const opts = { mvmw: path.join(__dirname, 'modus.mvmw'), trace: 0, debug: false, semi: 256 };
 const argv = ['modus'];
 const args = process.argv.slice(2);
 for (let i = 0; i < args.length; i++) {
@@ -21,6 +21,10 @@ for (let i = 0; i < args.length; i++) {
   else if (a === '--trace') opts.trace = parseInt(args[++i], 10);
   else if (a === '--debug') opts.debug = true;
   else if (a === '--profile') opts.profile = true;
+  else if (a === '--trace-from') opts.traceFrom = parseInt(args[++i], 10);
+  else if (a === '--trace-count') opts.traceCount = parseInt(args[++i], 10);
+  else if (a === '--trace-regs') opts.traceRegs = true;
+  else if (a === '--watch') opts.watch = args[++i];
   else if (a === '--max-steps') opts.maxSteps = parseInt(args[++i], 10);
   else if (a === '--semi') opts.semi = parseInt(args[++i], 10);
   else if (a === '--save-core') opts.saveCore = args[++i];
@@ -33,7 +37,8 @@ for (let i = 0; i < args.length; i++) {
 const mod = loadModule(new Uint8Array(fs.readFileSync(opts.mvmw)));
 const env = Object.entries(process.env).map(([k, v]) => `${k}=${v}`);
 const host = new NodeHost();
-const vm = new MVM(mod, host, { argv, env, trace: opts.trace, debug: opts.debug, maxSteps: opts.maxSteps, profile: opts.profile, semispace: opts.semi << 20 });
+const vm = new MVM(mod, host, { argv, env, trace: opts.trace, debug: opts.debug, maxSteps: opts.maxSteps, traceFrom: opts.traceFrom, traceCount: opts.traceCount, traceRegs: opts.traceRegs, profile: opts.profile, semispace: opts.semi << 20 });
+if (opts.watch) { const f = mod.byName.get(opts.watch); if (!f) throw new Error('no fn ' + opts.watch); vm.watchAt = f.off; vm.watchLeft = 60; }
 const t0 = Date.now();
 let code = 0;
 let resumed = false;

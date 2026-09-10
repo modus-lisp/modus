@@ -377,11 +377,56 @@ keyframe's intra path, where `reconstruct-bpred`/`-luma16`/`-chroma` never
 declare their decoder argument and so read their plane through a checked
 accessor call plus a generic `aref` per pixel.
 
-What remains between 56 and 60 fps is, this time measured, mostly reel's
-kernels themselves (`add-residual`, the loop-filter edges, `mc-filter`,
-`decode-residue`/`get-coeffs`, ~65 %) at ~12 instructions per binary op
-with every local in a frame slot — register allocation across a basic
-block — plus `decode-residue`'s untyped inner `(aref (aref yc b) i)`.
+## 60 fps: the last eight per cent was library residue, named by its caller
+
+At 56 fps the profile put ~90 % of decode samples in reel's kernels and
+~8 % in the runtime library.  Eight per cent of 532 ms is ~40 ms, and the
+60 fps line is 500 ms, so the residue *was* the gap.  Attributing each
+library leaf to its first reel caller (a sampling-profile bucketing that
+prints `LEAF <- CALLER`) named the sites; each again became a general fix:
+
+- `multiple-value-bind` over an inlined body ending in `(values …)` binds
+  the values directly instead of through the MV count and value slots
+  (the loop filter's `%adjust` returns three values per filtered line),
+  and the runtime `dotimes` increment is a plain typed add.  **526 ms =
+  57 fps.**
+- `read-inter-modes` and `decode-split-mv` index plain `defparameter`
+  tables — `(aref +mode-contexts+ i j)` with no declaration — which went
+  through `%aref-multi`'s `&rest` list and `APPLY` (`APPLY`, `RPLACD`,
+  `APPEND`, `NREVERSE` all showed under those two callers).  Undeclared
+  rank-2 `aref`/`(setf aref)` now call fixed-arity `%aref2`/`%aset2`, which
+  serve a non-displaced two-dimensional MDA in place and defer everything
+  else to the general path.
+- `(length v)` on a variable declared a simple array compiles to the
+  header count.  The generic `LENGTH` is a 30 ns wrapper/MDA/list
+  dispatch (the whole surrounding function was 5 ns), and the inline
+  `fill` expansion defaulted its end bound to it — so `zero16` in
+  `decode-residue` and the three `fill`s in `find-near-mvs` paid it.
+- A LET variable that *is* assigned, but only ever from forms of provable
+  width that do not mention the variable (`bool-bit`'s `bit`: `0`, then
+  `(setf bit 1)`), now gets the widest of those widths as its type, so
+  `(ash bit i)` in `read-mv-component` stops reaching `bignum-ash` (its
+  limb shifter had been visible in the profile).  Assignments through
+  `incf`, `psetq`, `(setf (values …))`, or anything self-referential
+  disqualify the variable, and a bignum-valued assignment has no width.
+
+Pi 5: **30 frames in 0.496 s = 60 fps**, inter 15 ms, keyframe 37 ms,
+frame-0 Y checksum still 7133244 on both architectures.
+
+The probe written for the rank-2 change found a pre-existing bug on the
+way: the *compile-time* `setf` expansion for `aref` kept only the first
+subscript, so `(setf (aref a i j) v)` inside any function stored at flat
+index `i` (the same form at toplevel took the runtime `setf` macro, which
+passed all of them).  reel's tables are read-only, so the decoder never
+tripped it; it is fixed with the rest.
+
+What remains above 60 fps is reel's kernels themselves (`add-residual`,
+the loop-filter edges, `mc-filter`, `decode-residue`/`get-coeffs`) at
+~12 instructions per binary op with every local in a frame slot —
+register allocation across a basic block.  One narrower item: the ISA
+has `:shlv`/`:sarv` (shift by register) but no translator implements
+them, so a variable-count `ash` with provably bounded operands still
+takes the runtime call.
 
 ## Related
 

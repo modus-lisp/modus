@@ -3529,9 +3529,13 @@
                 ;; (setf (cdr x) v) → (set-cdr x v)
                 ((and (consp place) (name-eq (car place) "CDR"))
                  `(set-cdr ,(cadr place) ,value))
-                ;; (setf (aref a i) v) → (aset a i v)
+                ;; (setf (aref a i …) v) → (aset a i … v).  ALL subscripts:
+                ;; this used to keep only the first, so a rank-2
+                ;; (setf (aref a i j) v) inside a function stored at row I
+                ;; of the flat data — the same form at toplevel took the
+                ;; runtime SETF macro, which was right.
                 ((and (consp place) (name-eq (car place) "AREF"))
-                 `(aset ,(cadr place) ,(caddr place) ,value))
+                 `(aset ,@(cdr place) ,value))
                 ;; (setf (gethash k h) v)     → (puthash k h v)
                 ;; (setf (gethash k h d) v)   → evaluate D for side effect.
                 ;;     ANSI demands left-to-right evaluation of K, H, D, V
@@ -13302,6 +13306,32 @@
        the form.  No stale count can leak in.
    (b) otherwise → reset the count to 1 BEFORE the form (so a form that
        stores nothing still reads as single-valued) and read it after."
+  ;; An inlined function body — a LET whose variables are all %INL- gensyms
+  ;; — whose last form is (values a b …) of matching arity: bind the values
+  ;; directly instead of going through the MV count / value slots.
+  ;; (%adjust in reel's loop filter returns three values per filtered
+  ;; line.)  The gensym names cannot be referenced by BODY, so hoisting
+  ;; BODY under the LET is hygienic; evaluation order is unchanged.
+  (when (and vars (consp form) (symbolp (car form))
+             (or (name-eq (car form) "LET") (name-eq (car form) "LET*"))
+             (consp (cdr form)) (listp (cadr form))
+             (every (lambda (b) (let ((v (if (consp b) (car b) b)))
+                                  (and (symbolp v) v
+                                       (let ((n (symbol-name v)))
+                                         (and (> (length n) 5) (string= (subseq n 0 5) "%INL-"))))))
+                    (cadr form))
+             (consp (cddr form)))
+    (let* ((lbody (cddr form))
+           (last (car (last lbody))))
+      (when (and (consp last) (symbolp (car last)) (name-eq (car last) "VALUES")
+                 (= (length (cdr last)) (length vars))
+                 (every (lambda (v) (and (symbolp v) v)) vars))
+        (return-from compile-multiple-value-bind
+          (compile-form
+           (append (list (car form) (cadr form))
+                   (butlast lbody)
+                   (list (cons 'let (cons (mapcar (function list) vars (cdr last)) body))))
+           env dest)))))
   (when (null vars)
     (return-from compile-multiple-value-bind
       (compile-form `(progn ,form ,@body) env dest)))
@@ -17443,12 +17473,65 @@
                     ;; array type makes its arefs typed — decode-residue's
                     ;; (let* ((ay (d-above-y d))) …) over fxvec slots)
                     (ty (%expr-dtype init init-env)))
-                (when (and (or w ty)
-                           (null (collect-setq-vars-in-body (cons 'progn body) (list var))))
-                  (setf (binding-dtype b)
-                        (cond (ty ty)
-                              ((<= w 62) (list 'signed-byte w))
-                              (t nil))))))))))))
+                (cond
+                  ((and (or w ty)
+                        (null (collect-setq-vars-in-body (cons 'progn body) (list var))))
+                   (setf (binding-dtype b)
+                         (cond (ty ty)
+                               ((<= w 62) (list 'signed-byte w))
+                               (t nil))))
+                  ;; Assigned, but only ever from forms of provable width
+                  ;; that do not mention the variable itself (a flag set to
+                  ;; 0/1, a mode code): the binding is as wide as the widest
+                  ;; of its init and its assignments.  bool-bit's `bit`.
+                  ((and w (<= w 62))
+                   (let ((aw (%setq-value-widths var body frame-env)))
+                     (when (and aw (integerp aw) (<= (max w aw) 62))
+                       (setf (binding-dtype b)
+                             (list 'signed-byte (max w aw)))))))))))))))
+
+(defun %setq-value-widths (var body env)
+  "Walk BODY for every assignment to VAR.  Returns the maximum %expr-width
+   over their value forms, or NIL if any assignment is not a plain
+   SETQ/SETF of VAR, has no provable width, or mentions VAR itself
+   (INCF, PSETQ, MULTIPLE-VALUE-SETQ, PUSH … all disqualify).  T when VAR
+   is never assigned is not returned — the caller handles that case."
+  (let ((max-w nil) (bad nil))
+    (labels ((mentions-p (f)
+               (cond ((eq f var) t)
+                     ((consp f) (or (mentions-p (car f)) (mentions-p (cdr f))))
+                     (t nil)))
+             (walk (f)
+               (when (and (consp f) (not bad))
+                 (let ((op (car f)))
+                   (cond
+                     ((and (symbolp op) (or (name-eq op "SETQ") (name-eq op "SETF")))
+                      (let ((rest (cdr f)))
+                        (loop
+                          (when (or (null rest) (null (cdr rest))) (return))
+                          (let ((place (car rest)) (val (cadr rest)))
+                            (cond
+                              ((eq place var)
+                               (let ((vw (if (mentions-p val) nil (%expr-width val env))))
+                                 (if vw
+                                     (setq max-w (if max-w (max max-w vw) vw))
+                                     (setq bad t))))
+                              ;; (setf (values … var …) …) and friends
+                              ((mentions-p place) (setq bad t)))
+                            (walk val))
+                          (setq rest (cddr rest)))))
+                     ((and (symbolp op) (name-eq op "QUOTE")) nil)
+                     ((and (symbolp op)
+                           (member (symbol-name op)
+                                   '("INCF" "DECF" "PSETQ" "PSETF" "MULTIPLE-VALUE-SETQ"
+                                     "PUSH" "POP" "ROTATEF" "SHIFTF" "SETQ-DEFAULT")
+                                   :test #'string=)
+                           (mentions-p (cdr f)))
+                      (setq bad t))
+                     (t (dolist (sub (cdr f)) (walk sub))
+                        (when (consp op) (walk op))))))))
+      (walk (cons 'progn body))
+      (if bad nil max-w))))
 
 (defun %declared-u8-array-var-p (form env)
   "True when FORM is a variable declared (simple-array (unsigned-byte 8) …):
@@ -17711,6 +17794,10 @@
        (compile-form `(%aref-multi-public ,arr) env dest))
       ((null (cdr subs))
        (compile-aref arr (car subs) env dest))
+      ((null (cddr subs))
+       ;; Undeclared rank-2: a fixed-arity runtime path (no &rest list, no
+       ;; APPLY) — reel's mode/partition tables are plain defparameters.
+       (compile-form `(%aref2 ,arr ,(car subs) ,(cadr subs)) env dest))
       (t
        (compile-form `(%aref-multi-public ,arr ,@subs) env dest)))))
 
@@ -17810,7 +17897,10 @@
                 (return nil))
                (t (push (car cur) subs)
                   (setq cur (cdr cur))))))
-         (compile-form `(%aset-multi ,arr ,val ,@(nreverse subs)) env dest))))))
+         (let ((subs (nreverse subs)))
+           (if (and (consp subs) (consp (cdr subs)) (null (cddr subs)))
+               (compile-form `(%aset2 ,arr ,val ,(car subs) ,(cadr subs)) env dest)
+               (compile-form `(%aset-multi ,arr ,val ,@subs) env dest))))))))
 
 (defun compile-array-length (arr-form env dest)
   "Compile (array-length array). Routes wrapper inputs through
@@ -17892,6 +17982,16 @@
   ;; sequence kind and probes the array's header before its first store —
   ;; ~200 instructions of overhead on the 16-element coefficient blocks a
   ;; VP8 macroblock clears 25 times.  Two-argument form only.
+  ;; (length v) on a variable declared a simple array: the header count
+  ;; directly (%prim-array-length) — the generic LENGTH is a 30 ns
+  ;; wrapper/MDA/list dispatch, and the FILL expansion below defaults its
+  ;; END to it.
+  (when (and *mvm-eval-runtime-p* (symbolp fn) (name-eq fn "LENGTH")
+             (consp args) (null (cdr args)) (symbolp (car args))
+             (or (%declared-generic-array-var-p (car args) env)
+                 (%declared-u8-array-var-p (car args) env)))
+    (return-from compile-call
+      (compile-form (list '%prim-array-length (car args)) env dest)))
   (when (and *mvm-eval-runtime-p* (symbolp fn) (name-eq fn "FILL")
              (consp args) (consp (cdr args))
              (symbolp (car args))

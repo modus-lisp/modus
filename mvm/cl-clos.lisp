@@ -5329,6 +5329,31 @@
     ;; behavior where multi-sub forms got the trailing subs dropped).
     (t (if (consp a) (%wrapper-aref a (car subs)) (%prim-aref a (car subs))))))
 
+(defun %aref2 (a i j)
+  "Two-subscript AREF without &rest/APPLY: the common rank-2 case (a
+   non-displaced native MDA with exactly two dims) is served in place;
+   everything else — displaced, string data (needs the char lift), or a
+   non-MDA — goes through %aref-multi-public unchanged."
+  (if (and (%mda-p a) (null (%mda-displaced a)))
+      (let ((dims (%mda-dims a)))
+        (if (and (consp dims) (consp (cdr dims)) (null (cddr dims))
+                 (fixnump i) (fixnump j)
+                 (not (%prim-stringp (%mda-data a))))
+            (%prim-aref (%mda-data a) (+ (* i (cadr dims)) j))
+            (%aref-multi-public a i j)))
+      (%aref-multi-public a i j)))
+
+(defun %aset2 (a val i j)
+  "Two-subscript ASET counterpart of %aref2; returns VAL."
+  (if (and (%mda-p a) (null (%mda-displaced a)))
+      (let ((dims (%mda-dims a)))
+        (if (and (consp dims) (consp (cdr dims)) (null (cddr dims))
+                 (fixnump i) (fixnump j)
+                 (not (%prim-stringp (%mda-data a))))
+            (progn (%prim-aset (%mda-data a) (+ (* i (cadr dims)) j) val) val)
+            (%aset-multi a val i j)))
+      (%aset-multi a val i j)))
+
 (defun %aref-multi-public (a &rest subs)
   "Public multi-subscript AREF: like %aref-multi but lifts a string-typed
    element (raw char-CODE in the u8 store) to a CHARACTER, matching the

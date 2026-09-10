@@ -178,7 +178,10 @@
                  (list 'loop
                    (list 'when (list '>= var n) (list 'return result))
                    (cons 'progn body)
-                   (list 'setq var (list '+ var 1))))))))"
+                   ;; the counter cannot reach 2^60 iterations: bound it so
+                   ;; the increment compiles to a plain add (no overflow
+                   ;; check) in every loop
+                   (list 'setq var (list '+ (list 'the (list 'integer 0 576460752303423487) var) 1))))))))"
 
     "(defmacro case (key &rest clauses)
        (let ((kv (gensym \"CASE\")))

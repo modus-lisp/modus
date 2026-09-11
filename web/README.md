@@ -19,6 +19,26 @@ Cheney semispace heap, x64 object and frame layouts, the x64 trap table).
 | `modus.mvmw` | generated: bytecode + function table + constant pool (~13 MB) |
 | `modus.core.gz` | generated: a core snapshot taken at CLI-TOPLEVEL (~1 MB) |
 
+## GitHub Pages
+
+The REPL runs as a static site. GitHub Pages cannot send the COOP/COEP headers
+that `SharedArrayBuffer` (and thus the blocking stdin) needs, so
+`coi-serviceworker.js` installs a service worker that re-serves same-origin
+responses with those headers and reloads once; the second load is
+cross-origin isolated. This is verified against a header-less server
+(`node web/serve.js --no-coi`), which is exactly the Pages condition.
+
+Deploy (pushes an orphan `gh-pages` branch of just the browser files plus the
+gzipped `modus.mvmw.gz` ~1.3 MB and `modus.core.gz` ~0.9 MB):
+
+```sh
+web/deploy-pages.sh                 # origin gh-pages
+```
+
+Then in the repo: **Settings → Pages → Deploy from a branch → `gh-pages` /
+(root)**. The REPL appears at `https://<user>.github.io/<repo>/`, boots from
+the core in well under a second, and needs no server.
+
 ## Build and run
 
 ```sh
@@ -34,6 +54,7 @@ node web/run-node.js --core web/modus.core.gz            # REPL on stdin
 
 # 4. run in a browser
 node web/serve.js 18080     # then open http://localhost:18080/
+node web/serve.js 18080 --no-coi   # emulate GitHub Pages (no COOP/COEP; the service worker supplies them)
 node web/t/headless.js 'http://localhost:18080/?eval=(print%20(*%206%207))'
 ```
 

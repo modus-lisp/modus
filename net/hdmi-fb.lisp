@@ -52,50 +52,16 @@
 (defun hdmi-rd (addr) (mem-ref addr :u32))
 (defun hdmi-wr (addr val) (setf (mem-ref addr :u32) val))
 
-;;; --- fb-init: ask the VC for a WIDTHxHEIGHT 32bpp HDMI framebuffer ----------
-;;; Returns the ARM-physical framebuffer address (non-zero) on success, 0 on a
-;;; mailbox timeout / refusal.  On success hdmi-fb-state holds addr/size/pitch.
-(defun hdmi-fb-init (width height)
-  (let ((buf (hdmi-mbox-buf)))
-    ;; zero 128 bytes of tag buffer
-    (let ((j 0)) (loop (when (>= j 128) (return nil))
-                   (hdmi-wr (+ buf j) 0) (setq j (+ j 4))))
-    (hdmi-wr (+ buf 0) 128)            ; total size
-    (hdmi-wr (+ buf 4) 0)              ; request
-    (hdmi-wr (+ buf 8)  #x00048003) (hdmi-wr (+ buf 12) 8) (hdmi-wr (+ buf 16) 0)
-    (hdmi-wr (+ buf 20) width) (hdmi-wr (+ buf 24) height)          ; phys wh
-    (hdmi-wr (+ buf 28) #x00048004) (hdmi-wr (+ buf 32) 8) (hdmi-wr (+ buf 36) 0)
-    (hdmi-wr (+ buf 40) width) (hdmi-wr (+ buf 44) height)          ; virt wh
-    (hdmi-wr (+ buf 48) #x00048005) (hdmi-wr (+ buf 52) 4) (hdmi-wr (+ buf 56) 0)
-    (hdmi-wr (+ buf 60) 32)                                          ; depth
-    (hdmi-wr (+ buf 64) #x00048006) (hdmi-wr (+ buf 68) 4) (hdmi-wr (+ buf 72) 0)
-    (hdmi-wr (+ buf 76) 0)                                           ; pixel order BGR
-    (hdmi-wr (+ buf 80) #x00040001) (hdmi-wr (+ buf 84) 8) (hdmi-wr (+ buf 88) 0)
-    (hdmi-wr (+ buf 92) 16) (hdmi-wr (+ buf 96) 0)                   ; allocate (align 16)
-    (hdmi-wr (+ buf 100) #x00040008) (hdmi-wr (+ buf 104) 4) (hdmi-wr (+ buf 108) 0)
-    ;; buf+112 = pitch result ; buf+116 = end tag (0)
-    ;; send: wait MAIL1 not full, write (bus-buf | chan 8)
-    (let ((i 0)) (loop (when (> i 1000000) (return 0))
-                   (when (zerop (logand (hdmi-rd (+ (hdmi-mbox-base) #x38)) #x80000000))
-                     (return nil))
-                   (setq i (+ i 1))))
-    (hdmi-wr (hdmi-mbox-write) (logior (hdmi-mbox-buf-bus) 8))
-    ;; receive: wait MAIL0 not empty, drain
-    (let ((i 0)) (loop (when (> i 1000000) (return 0))
-                   (when (zerop (logand (hdmi-rd (hdmi-mbox-status)) #x40000000))
-                     (hdmi-rd (hdmi-mbox-read)) (return nil))
-                   (setq i (+ i 1))))
-    ;; parse: allocate-buffer base at buf+92, size buf+96, pitch buf+112
-    (let ((fb-bus (hdmi-rd (+ buf 92)))
-          (size   (hdmi-rd (+ buf 96)))
-          (pitch  (hdmi-rd (+ buf 112))))
-      (let ((fb (logand fb-bus #x3FFFFFFF)))   ; bus -> ARM phys
-        (hdmi-wr (+ (hdmi-fb-state) 0) fb)
-        (hdmi-wr (+ (hdmi-fb-state) 4) size)
-        (hdmi-wr (+ (hdmi-fb-state) 8) pitch)
-        (hdmi-wr (+ (hdmi-fb-state) 12) width)
-        (hdmi-wr (+ (hdmi-fb-state) 16) height)
-        fb))))
+;;; --- framebuffer allocation is NOT baked here (deliberately) ----------------
+;;; hdmi-fb-init used to do the simple-FB mailbox allocate, but it is redundant
+;;; with fbtall (net/hdmi-runtime.lisp, pushed at runtime), which does the same
+;;; property-tag dance AND writes hdmi-fb-state, and it was a footgun: called on
+;;; a bare boot (before any allocate) its two mailbox spin-waits could hang the
+;;; VideoCore mailbox and wedge the board.  The real display path we are moving
+;;; to is the HVS hardware overlay (scaled YUV scanout from a stable address),
+;;; not this simple linear-RGB framebuffer, so there is no reason to bake a
+;;; simple-FB allocator.  fbtall owns runtime allocation; the accessors below
+;;; just read hdmi-fb-state, which fbtall populates.
 
 (defun hdmi-fb-addr ()  (hdmi-rd (+ (hdmi-fb-state) 0)))
 (defun hdmi-fb-pitch () (hdmi-rd (+ (hdmi-fb-state) 8)))

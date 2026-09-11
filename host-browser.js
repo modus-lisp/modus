@@ -1,0 +1,211 @@
+'use strict';
+// host-browser.js — host interface for running the interpreter inside a Web
+// Worker.  Console output goes to the page via postMessage; stdin is a ring
+// buffer in a SharedArrayBuffer the page fills, and the worker blocks on it
+// with Atomics.wait (so the page must be served cross-origin isolated).
+// Files live in an in-memory filesystem seeded by the page.
+
+const ENOENT = -2, EBADF = -9, EEXIST = -17, ENOTDIR = -20, EISDIR = -21, EINVAL = -22, EACCES = -13;
+
+// stdin ring: Int32Array header [head, tail, closed] then bytes
+const RING_HDR = 16;
+
+// http SAB: Int32 header [state, length] then bytes.  state: 0 idle, 1 request
+// posted, 2 response ready.  inbox SAB (files dropped on the page):
+// Int32 header [seq, length] then records [nameLen u32][name][dataLen u32][data].
+class BrowserHost {
+  constructor(stdinSab, post, httpSab, inboxSab) {
+    this.ctl = new Int32Array(stdinSab, 0, 4);
+    this.ring = new Uint8Array(stdinSab, RING_HDR);
+    this.httpCtl = httpSab ? new Int32Array(httpSab, 0, 4) : null;
+    this.httpBuf = httpSab ? new Uint8Array(httpSab, 16) : null;
+    this.inboxCtl = inboxSab ? new Int32Array(inboxSab, 0, 4) : null;
+    this.inboxBuf = inboxSab ? new Uint8Array(inboxSab, 16) : null;
+    this.inboxSeen = 0;
+    this.post = post;
+    this.files = new Map();          // path -> { data: Uint8Array, mtime }
+    this.dirs = new Set(['/', '/tmp', '/home', '/home/web']);
+    this.fds = new Map();
+    this.nextFd = 3;
+    this.outBuf = [];
+    this.outLen = 0;
+  }
+  log(s) { this.post({ type: 'log', text: s }); }
+  // Ask the page to fetch; block until the response bytes are in the SAB.
+  httpRequest(url, method, headers, body) {
+    if (!this.httpCtl) throw new Error('no http channel');
+    this.flush();
+    Atomics.store(this.httpCtl, 0, 1);
+    this.post({ type: 'http', url, method, headers, body });
+    while (Atomics.load(this.httpCtl, 0) !== 2) Atomics.wait(this.httpCtl, 0, 1);
+    const n = Atomics.load(this.httpCtl, 1);
+    const out = this.httpBuf.slice(0, n);
+    Atomics.store(this.httpCtl, 0, 0);
+    return out;
+  }
+  // Files the page dropped into the inbox since we last looked.
+  drainInbox() {
+    if (!this.inboxCtl) return;
+    const seq = Atomics.load(this.inboxCtl, 0);
+    if (seq === this.inboxSeen) return;
+    const len = Atomics.load(this.inboxCtl, 1);
+    const dv = new DataView(this.inboxBuf.buffer, this.inboxBuf.byteOffset, len);
+    let p = 0;
+    while (p + 8 <= len) {
+      const nl = dv.getUint32(p, true); p += 4;
+      const name = new TextDecoder().decode(this.inboxBuf.slice(p, p + nl)); p += nl;
+      const dl = dv.getUint32(p, true); p += 4;
+      this.addFile(name, this.inboxBuf.slice(p, p + dl)); p += dl;
+      this.log(`[file: ${name}, ${dl} bytes]`);
+    }
+    this.inboxSeen = seq;
+    Atomics.store(this.inboxCtl, 1, 0);
+    Atomics.store(this.inboxCtl, 2, 1);          // tell the page it may write again
+    Atomics.notify(this.inboxCtl, 2);
+  }
+  now() { return performance.now(); }
+  getpid() { return 4242; }
+
+  flush() {
+    if (this.outLen === 0) return;
+    const all = new Uint8Array(this.outLen);
+    let p = 0; for (const b of this.outBuf) { all.set(b, p); p += b.length; }
+    this.outBuf = []; this.outLen = 0;
+    this.post({ type: 'stdout', bytes: all }, [all.buffer]);
+  }
+  writeByte(fd, b) { this.write(fd, Uint8Array.of(b), 0, 1); }
+  readByte(fd) { const b = new Uint8Array(1); return this.read(fd, b, 0, 1) === 1 ? b[0] : -1; }
+
+  write(fd, m8, off, len) {
+    if (fd === 1 || fd === 2) {
+      this.outBuf.push(m8.slice(off, off + len)); this.outLen += len;
+      if (this.outLen > 4096 || m8[off + len - 1] === 10) this.flush();
+      return len;
+    }
+    const f = this.fds.get(fd);
+    if (!f || f.dir) return EBADF;
+    const file = this.files.get(f.path);
+    const end = f.pos + len;
+    if (end > file.data.length) {
+      const nd = new Uint8Array(Math.max(end, file.data.length * 2));
+      nd.set(file.data); file.data = nd.subarray(0, end);
+      // keep the buffer, but track logical length
+      file.data = nd; file.len = end;
+    }
+    file.data.set(m8.subarray(off, off + len), f.pos);
+    file.len = Math.max(file.len, end);
+    file.mtime = (Date.now() / 1000) | 0;
+    f.pos = end; f.wrote = true;
+    return len;
+  }
+  read(fd, m8, off, len) {
+    if (fd === 0) {
+      this.flush();
+      for (;;) {
+        this.drainInbox();
+        const head = Atomics.load(this.ctl, 0), tail = Atomics.load(this.ctl, 1);
+        if (head !== tail) {
+          let n = 0;
+          let h = head;
+          while (n < len && h !== tail) { m8[off + n++] = this.ring[h]; h = (h + 1) % this.ring.length; }
+          Atomics.store(this.ctl, 0, h);
+          Atomics.notify(this.ctl, 0);
+          return n;
+        }
+        if (Atomics.load(this.ctl, 2)) return 0;         // closed
+        this.post({ type: 'waiting' });
+        Atomics.wait(this.ctl, 1, tail);
+      }
+    }
+    const f = this.fds.get(fd);
+    if (!f || f.dir) return EBADF;
+    const file = this.files.get(f.path);
+    const n = Math.max(0, Math.min(len, file.len - f.pos));
+    m8.set(file.data.subarray(f.pos, f.pos + n), off);
+    f.pos += n;
+    return n;
+  }
+  norm(path) {
+    if (!path.startsWith('/')) path = '/home/web/' + path;
+    const parts = [];
+    for (const seg of path.split('/')) {
+      if (seg === '' || seg === '.') continue;
+      if (seg === '..') parts.pop(); else parts.push(seg);
+    }
+    return '/' + parts.join('/');
+  }
+  addFile(path, bytes) {
+    path = this.norm(path);
+    this.files.set(path, { data: bytes, len: bytes.length, mtime: (Date.now() / 1000) | 0 });
+    let d = path; while ((d = d.slice(0, d.lastIndexOf('/'))) !== '') this.dirs.add(d);
+  }
+  open(path, flags, mode) {
+    path = this.norm(path);
+    const acc = flags & 3;
+    if (this.dirs.has(path)) {
+      if (acc !== 0) return EISDIR;
+      const fd = this.nextFd++; this.fds.set(fd, { path, pos: 0, dir: true }); return fd;
+    }
+    let file = this.files.get(path);
+    if (!file) {
+      if (!(flags & 0x40)) return ENOENT;
+      const parent = path.slice(0, path.lastIndexOf('/')) || '/';
+      if (!this.dirs.has(parent)) return ENOENT;
+      file = { data: new Uint8Array(256), len: 0, mtime: (Date.now() / 1000) | 0 };
+      this.files.set(path, file);
+    } else if ((flags & 0x40) && (flags & 0x80)) return EEXIST;
+    if (flags & 0x200) file.len = 0;
+    const fd = this.nextFd++;
+    this.fds.set(fd, { path, pos: (flags & 0x400) ? file.len : 0 });
+    return fd;
+  }
+  close(fd) {
+    const f = this.fds.get(fd);
+    if (!f) return EBADF;
+    this.fds.delete(fd);
+    if (f.wrote) { const file = this.files.get(f.path); if (file) this.post({ type: 'file', path: f.path, bytes: file.data.slice(0, file.len) }); }
+    return 0;
+  }
+  lseek(fd, off, whence) {
+    const f = this.fds.get(fd); if (!f) return EBADF;
+    const len = f.dir ? 0 : this.files.get(f.path).len;
+    if (whence === 0) f.pos = off; else if (whence === 1) f.pos += off; else if (whence === 2) f.pos = len + off; else return EINVAL;
+    return f.pos;
+  }
+  unlink(path) { path = this.norm(path); if (!this.files.delete(path)) return ENOENT; return 0; }
+  rename(a, b) {
+    a = this.norm(a); b = this.norm(b);
+    const f = this.files.get(a); if (!f) return ENOENT;
+    this.files.delete(a); this.files.set(b, f); return 0;
+  }
+  mkdir(path) { path = this.norm(path); if (this.dirs.has(path) || this.files.has(path)) return EEXIST; this.dirs.add(path); return 0; }
+  access(path) { path = this.norm(path); return (this.files.has(path) || this.dirs.has(path)) ? 0 : ENOENT; }
+  stat(path) {
+    path = this.norm(path);
+    const f = this.files.get(path);
+    if (f) return { size: f.len, mtime: f.mtime };
+    if (this.dirs.has(path)) return { size: 4096, mtime: 0 };
+    return ENOENT;
+  }
+  fstat(fd) {
+    const f = this.fds.get(fd); if (!f) return EBADF;
+    if (f.dir) return { size: 4096, mtime: 0 };
+    const file = this.files.get(f.path); return { size: file.len, mtime: file.mtime };
+  }
+  getdents(fd) {
+    const f = this.fds.get(fd); if (!f) return EBADF;
+    if (!f.dir) return ENOTDIR;
+    if (f.listed) return [];
+    f.listed = true;
+    const out = [{ name: '.', ino: 1, type: 4 }, { name: '..', ino: 1, type: 4 }];
+    const prefix = f.path === '/' ? '/' : f.path + '/';
+    let ino = 2;
+    for (const p of this.files.keys()) if (p.startsWith(prefix) && !p.slice(prefix.length).includes('/')) out.push({ name: p.slice(prefix.length), ino: ino++, type: 8 });
+    for (const d of this.dirs) if (d !== f.path && d.startsWith(prefix) && !d.slice(prefix.length).includes('/')) out.push({ name: d.slice(prefix.length), ino: ino++, type: 4 });
+    return out;
+  }
+  getdentsConsumed() {}
+}
+
+if (typeof module !== 'undefined' && module.exports) module.exports = { BrowserHost, RING_HDR };
+else if (typeof self !== 'undefined') { self.BrowserHost = BrowserHost; self.RING_HDR = RING_HDR; }

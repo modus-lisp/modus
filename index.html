@@ -1,0 +1,185 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Modus in the browser</title>
+<!-- Cross-origin isolation on hosts (GitHub Pages) that cannot set COOP/COEP
+     headers.  Must load before the app script. -->
+<script src="coi-serviceworker.js"></script>
+<style>
+  html, body { height: 100%; margin: 0; background: #111; color: #ddd; font: 14px/1.35 ui-monospace, Menlo, Consolas, monospace; }
+  #term { box-sizing: border-box; height: calc(100% - 2.2em); padding: 8px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+  #bar { height: 2.2em; display: flex; align-items: center; gap: 8px; padding: 0 8px; background: #222; border-top: 1px solid #333; }
+  #in { flex: 1; background: #000; color: #eee; border: 1px solid #444; padding: 3px 6px; font: inherit; }
+  #status { color: #8a8; min-width: 14em; }
+  #files { color: #aac; font-size: 12px; }
+  #files a { color: #9cf; margin-right: 8px; }
+  #drop { color: #667; font-size: 12px; margin-left: auto; }
+  body.dragging #term { outline: 2px dashed #6a6; outline-offset: -4px; }
+  .log { color: #789; }
+  .err { color: #e77; }
+</style>
+</head>
+<body>
+<div id="term"></div>
+<div id="bar">
+  <span id="status">loading…</span>
+  <input id="in" placeholder="type a form and press Enter" autocomplete="off" spellcheck="false" disabled>
+  <span id="files"></span>
+  <label id="drop">drop files here or <input id="pick" type="file" multiple style="width:5em"></label>
+</div>
+<script>
+(async () => {
+  console.log('page script start; isolated=' + crossOriginIsolated);
+  const term = document.getElementById('term');
+  const input = document.getElementById('in');
+  const status = document.getElementById('status');
+  const dec = new TextDecoder();
+  const say = (text, cls) => {
+    console.log((cls ? cls + ': ' : '') + text.replace(/\n$/, ''));
+    const s = document.createElement('span');
+    if (cls) s.className = cls;
+    s.textContent = text;
+    term.appendChild(s);
+    term.scrollTop = term.scrollHeight;
+  };
+  if (!crossOriginIsolated) {
+    // coi-serviceworker.js registers a worker and reloads once; the reloaded
+    // page is isolated.  Wait quietly for that unless it reported it cannot.
+    if (window.coiStatus === 'unavailable') {
+      say('This page needs cross-origin isolation (COOP/COEP), which requires either\n'
+        + 'those response headers or a service worker over https. Neither is available\n'
+        + 'here. Serve with web/serve.js, or open the GitHub Pages URL over https.\n', 'err');
+      status.textContent = 'not isolated';
+    } else {
+      status.textContent = 'enabling cross-origin isolation…';
+    }
+    return;
+  }
+  // Try BASE.gz first (GitHub Pages ships gzipped artifacts), then BASE
+  // (local dev via serve.js has the plain files).
+  const fetchBytes = async (base, label) => {
+    status.textContent = 'fetching ' + label + '…';
+    for (const url of [base + '.gz', base]) {
+      const r = await fetch(url);
+      if (!r.ok) continue;
+      let stream = r.body;
+      if (url.endsWith('.gz')) stream = stream.pipeThrough(new DecompressionStream('gzip'));
+      return await new Response(stream).arrayBuffer();
+    }
+    return null;
+  };
+  const mvmw = await fetchBytes('modus.mvmw', 'bytecode');
+  if (!mvmw) { say('modus.mvmw not found: run sbcl --script mvm/build-web.lisp\n', 'err'); return; }
+  const core = await fetchBytes('modus.core', 'core');
+  if (!core) say('(no core snapshot: cold boot takes a long time)\n', 'log');
+
+  // http relay: the worker parks a request here and blocks; we fetch it.
+  const HTTP_CAP = 16 << 20;
+  const httpSab = new SharedArrayBuffer(16 + HTTP_CAP);
+  const httpCtl = new Int32Array(httpSab, 0, 4), httpBuf = new Uint8Array(httpSab, 16);
+  const serveHttp = async (m) => {
+    let raw;
+    try {
+      const r = await fetch(m.url, { method: m.method, headers: Object.fromEntries(Object.entries(m.headers).filter(([k]) => !/^(host|connection|content-length)$/i.test(k))), body: m.body || undefined, redirect: 'follow' });
+      const body = new Uint8Array(await r.arrayBuffer());
+      let head = `HTTP/1.0 ${r.status} ${r.statusText || 'OK'}\r\n`;
+      r.headers.forEach((v, k) => { if (!/^(transfer-encoding|content-encoding|content-length)$/i.test(k)) head += `${k}: ${v}\r\n`; });
+      head += `Content-Length: ${body.length}\r\n\r\n`;
+      const hb = enc.encode(head);
+      raw = new Uint8Array(hb.length + body.length); raw.set(hb); raw.set(body, hb.length);
+    } catch (e) {
+      raw = enc.encode(`HTTP/1.0 502 Bad Gateway\r\nX-Error: ${String(e.message || e).replace(/[\r\n]/g, ' ')}\r\nContent-Length: 0\r\n\r\n`);
+    }
+    const n = Math.min(raw.length, HTTP_CAP);
+    httpBuf.set(raw.subarray(0, n));
+    Atomics.store(httpCtl, 1, n);
+    Atomics.store(httpCtl, 0, 2);
+    Atomics.notify(httpCtl, 0);
+  };
+
+  // inbox: files dropped on the page, picked up by the worker at its next read
+  const INBOX_CAP = 32 << 20;
+  const inboxSab = new SharedArrayBuffer(16 + INBOX_CAP);
+  const inboxCtl = new Int32Array(inboxSab, 0, 4), inboxBuf = new Uint8Array(inboxSab, 16);
+  const addFile = (name, bytes) => {
+    const nb = enc.encode(name);
+    let p = Atomics.load(inboxCtl, 1);
+    if (p + 8 + nb.length + bytes.length > INBOX_CAP) { say(`[inbox full, ${name} dropped]\n`, 'err'); return; }
+    const dv = new DataView(inboxSab, 16);
+    dv.setUint32(p, nb.length, true); p += 4; inboxBuf.set(nb, p); p += nb.length;
+    dv.setUint32(p, bytes.length, true); p += 4; inboxBuf.set(bytes, p); p += bytes.length;
+    Atomics.store(inboxCtl, 1, p);
+    Atomics.add(inboxCtl, 0, 1);
+    say(`[queued ${name}, ${bytes.length} bytes; picked up at the next prompt]\n`, 'log');
+  };
+  window.modusAddFile = (name, text) => addFile(name, enc.encode(text));
+  const takeFiles = async (list) => { for (const f of list) addFile(f.name, new Uint8Array(await f.arrayBuffer())); };
+  document.getElementById('pick').addEventListener('change', (ev) => takeFiles(ev.target.files));
+  document.body.addEventListener('dragover', (ev) => { ev.preventDefault(); document.body.classList.add('dragging'); });
+  document.body.addEventListener('dragleave', () => document.body.classList.remove('dragging'));
+  document.body.addEventListener('drop', (ev) => { ev.preventDefault(); document.body.classList.remove('dragging'); takeFiles(ev.dataTransfer.files); });
+
+  // files the program wrote: offered as downloads
+  const filesEl = document.getElementById('files');
+  const offerFile = (path, bytes) => {
+    const name = path.slice(path.lastIndexOf('/') + 1);
+    let a = filesEl.querySelector(`a[data-path="${CSS.escape(path)}"]`);
+    if (!a) { a = document.createElement('a'); a.dataset.path = path; a.download = name; filesEl.appendChild(a); }
+    if (a.href) URL.revokeObjectURL(a.href);
+    a.href = URL.createObjectURL(new Blob([bytes]));
+    a.textContent = `${name} (${bytes.length}b)`;
+    console.log(`log: [wrote ${path}, ${bytes.length} bytes]`);
+  };
+
+  // stdin ring buffer shared with the worker
+  const RING = 65536, HDR = 16;
+  const sab = new SharedArrayBuffer(HDR + RING);
+  const ctl = new Int32Array(sab, 0, 4);
+  const ring = new Uint8Array(sab, HDR);
+  const enc = new TextEncoder();
+  const feed = (text) => {
+    const bytes = enc.encode(text);
+    let tail = Atomics.load(ctl, 1);
+    for (const b of bytes) {
+      const next = (tail + 1) % RING;
+      while (next === Atomics.load(ctl, 0)) { /* full: spin briefly */ }
+      ring[tail] = b; tail = next;
+    }
+    Atomics.store(ctl, 1, tail);
+    Atomics.notify(ctl, 1);
+  };
+
+  // hooks for scripted drivers (web/t/headless.js)
+  window.modusFeed = feed;
+  window.modusClose = () => { Atomics.store(ctl, 2, 1); Atomics.notify(ctl, 1); };
+  const worker = new Worker('worker.js');
+  worker.onmessage = (ev) => {
+    const m = ev.data;
+    if (m.type === 'stdout') say(dec.decode(m.bytes));
+    else if (m.type === 'log') say(m.text + '\n', 'log');
+    else if (m.type === 'waiting') { status.textContent = 'ready'; input.disabled = false; input.focus(); console.log('log: [ready]'); }
+    else if (m.type === 'exit') { say(`\n[modus exited with code ${m.code}]\n`, 'log'); status.textContent = 'exited'; input.disabled = true; }
+    else if (m.type === 'fault') { say('\n' + m.text + '\n', 'err'); status.textContent = 'faulted'; input.disabled = true; }
+    else if (m.type === 'http') { status.textContent = 'fetching ' + m.url; serveHttp(m); }
+    else if (m.type === 'file') offerFile(m.path, m.bytes);
+  };
+  input.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Enter') return;
+    const line = input.value + '\n';
+    input.value = '';
+    say(line);
+    status.textContent = 'running…';
+    feed(line);
+  });
+  status.textContent = 'starting…';
+  // ?eval=FORM (repeatable) runs forms and exits, like the CLI; otherwise the REPL.
+  const argv = ['modus'];
+  for (const [k, v] of new URLSearchParams(location.search)) if (k === 'eval') argv.push('--eval', v);
+  if (argv.length > 1) argv.push('--quit');
+  worker.postMessage({ type: 'start', mvmw, core, stdin: sab, http: httpSab, inbox: inboxSab, argv, env: ['HOME=/home/web'],
+                       semispace: 256 << 20, files: [] }, [mvmw].concat(core ? [core] : []));
+})();
+</script>
+</body>
+</html>

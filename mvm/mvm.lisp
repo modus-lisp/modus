@@ -107,6 +107,7 @@
    #:+op-v4-add+ #:+op-v4-sub+ #:+op-v4-mul+ #:+op-v4-div+
    #:mvm-v4-lane-load #:mvm-v4-lane-store #:mvm-v4-dup #:mvm-v4-dup-lane-load
    #:mvm-v4-add #:mvm-v4-sub #:mvm-v4-mul #:mvm-v4-div
+   #:+op-fp-mov+ #:mvm-fp-mov
    #:mvm-load #:mvm-store #:mvm-fence
    #:mvm-call #:mvm-call-ind #:mvm-ret #:mvm-tailcall
    #:mvm-alloc-cons #:mvm-gc-check #:mvm-gc-check-n #:mvm-gc-check-r
@@ -490,6 +491,7 @@
 (defconstant +op-v4-sub+           #xDE)
 (defconstant +op-v4-mul+           #xDF)
 (defconstant +op-v4-div+           #xE0)
+(defconstant +op-fp-mov+           #xE1) ; (fp-mov Fd Fs)  full 128-bit register copy (scalar or vector)
 
 ;;; ============================================================
 ;;; Opcode Metadata Table
@@ -695,6 +697,7 @@
 (defopcode :v4-sub           #xDE (:reg :reg :reg) "f32x4 sub")
 (defopcode :v4-mul           #xDF (:reg :reg :reg) "f32x4 mul")
 (defopcode :v4-div           #xE0 (:reg :reg :reg) "f32x4 div")
+(defopcode :fp-mov           #xE1 (:reg :reg)      "FP vreg copy (128-bit)")
 
 ;;; ============================================================
 ;;; Memory Width Constants
@@ -1166,6 +1169,7 @@
 (defun mvm-v4-sub (buf fd fa fb) (encode-instruction buf +op-v4-sub+ fd fa fb))
 (defun mvm-v4-mul (buf fd fa fb) (encode-instruction buf +op-v4-mul+ fd fa fb))
 (defun mvm-v4-div (buf fd fa fb) (encode-instruction buf +op-v4-div+ fd fa fb))
+(defun mvm-fp-mov (buf fd fs) (encode-instruction buf +op-fp-mov+ fd fs))
 
 ;; Memory
 (defun mvm-load (buf vd vaddr width)

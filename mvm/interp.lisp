@@ -1851,6 +1851,12 @@
                    (setf (svref fregs fd) r))
                  (setf pc npc3)))))
 
+          (#.+op-fp-mov+
+           (multiple-value-bind (fd npc) (fetch-reg bc pc)
+             (multiple-value-bind (fs npc2) (fetch-reg bc npc)
+               (setf (svref fregs fd) (svref fregs fs))
+               (setf pc npc2))))
+
           (#.+op-aref+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vobj npc2) (fetch-reg bc npc)

@@ -3029,6 +3029,12 @@
              (emit-bytes buf #x0F #x28 (logior #xC0 (ash fd 3) fa)))         ; movaps xmmD, xmmA
            (emit-bytes buf #x0F sse (logior #xC0 (ash fd 3)))))              ; opps xmmD, xmm0
 
+        ((op= +op-fp-mov+)
+         ;; (fp-mov Fd Fs) — movaps xmmD, xmmS (scalar or 4-lane; 128-bit copy)
+         (let* ((fd (+ 2 (first operands))) (fs (+ 2 (second operands))))
+           (unless (= fd fs)
+             (emit-bytes buf #x0F #x28 (logior #xC0 (ash fd 3) fs)))))
+
         ((op= +op-u8-ref+)
          ;; (u8-ref Vd Varr Vidx) — load one byte from a u8 vector.
          ;; Byte address = (Varr - 9) + 16 + real_idx.

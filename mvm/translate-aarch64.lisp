@@ -4401,6 +4401,12 @@
                               (t                  #x6E20FC00))))
              (a64-emit buf (logior base (ash fb 16) (ash fa 5) fd))))
 
+          ;; ---- FP-MOV Fd, Fs ----  ORR Vd.16B, Vs.16B, Vs.16B (128-bit copy)
+          ((= op +op-fp-mov+)
+           (let* ((fd (+ 2 (vr 0))) (fs (+ 2 (vr 1))))
+             (unless (= fd fs)
+               (a64-emit buf (logior #x4EA01C00 (ash fs 16) (ash fs 5) fd)))))
+
           ;; ---- U8-REF Vd, Varr, Vidx ----  (load one byte from a u8 vector)
           ;; Byte address = (Varr - 9) + 16 + real_idx = Varr + 7 + real_idx.
           ;; Vidx is a TAGGED fixnum (real_idx*2); result is a TAGGED fixnum

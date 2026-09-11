@@ -724,6 +724,7 @@
                         ;; a capturing closure then ran a frame-less thunk
                         ;; that STACK-LOADed a 0 VFP → SIGSEGV (WS4 oracle).
                         "*IR-BUFFER*" "*TEMP-REG-COUNTER*" "*FP-REG-COUNTER*"
+                        "*UNUSED-VALUE-FORM*" "*SETQ-VALUE-UNUSED*"
                         "*CURRENT-FUNCTION-NAME*" "*FUNCTION-RETURN-LABEL*"
                         "*UWP-CLEANUPS*" "*LOOP-EXIT-UWP-SEQ*"
                         "*ARITH-PUSH-DEPTH*"))
@@ -805,6 +806,42 @@
 (defvar *fp-reg-counter* 0
   "Next free unboxed single-float FP vreg (F0..F5 = xmm2..7 / s2..7), a pool
    SEPARATE from the GPR temps.  Reset with *temp-reg-counter*.")
+
+(defvar *fp-locals-force* nil
+  "Diagnostic: let the FP-locals analysis run outside runtime mode (host
+   compiler tests).  Production leaves it NIL.")
+
+(defvar *unused-value-form* nil
+  "The statement form (EQ) whose value the enclosing PROGN / LOOP / TAGBODY
+   is discarding.  compile-progn binds it for every non-last form, the simple
+   LOOP and TAGBODY for every form; compile-form carries it across
+   macroexpansion; a discarded PROGN / WHEN / UNLESS passes it to its own
+   forms.  Only the SETQ dispatch consults it, and only for that identical
+   form: a SETQ of an FP-resident local then skips boxing the assignment's
+   value into DEST (every statement in a body shares DEST, so DEST alone
+   cannot say whether a value is used).  DEFVAR'd here, before any LET of it.")
+(defun %compile-statement (form env dest)
+  "Compile FORM as a DISCARDED statement (its value is not used): binds the
+   *unused-value-form* mark around the compile.  A separate one-binding
+   function on purpose — an inner dynamic LET nested under another special
+   binding in the same function was invisible to callees in the self-hosted
+   image (tagbody / loop marks never reached compile-form)."
+  (let ((*unused-value-form* form))
+    (compile-form form env dest)))
+
+(defvar *setq-value-unused* nil
+  "Bound by the SETQ dispatch: T when the SETQ form being compiled is the
+   discarded statement named by *UNUSED-VALUE-FORM*.")
+(defvar *fp-diag* nil
+  "Diagnostic counters for the discarded-statement chain: 0 tagbody marks,
+   1 loop marks, 2 when/unless marks, 3 compile-form carry-overs, 4 SETQ
+   dispatches seeing the mark, 5 FP setq hooks that skipped the box.  NIL
+   unless a probe sets it to (make-array 6 :initial-element 0): the compiler
+   runs during boot before globals are initialised, so this must never be
+   touched unguarded (a defvar initform array killed the image at boot).")
+(defun %fp-diag-bump (i)
+  (when (and (boundp (quote *fp-diag*)) *fp-diag*)
+    (setf (aref *fp-diag* i) (+ (aref *fp-diag* i) 1))))
 (defconstant +fp-reg-max+ 6)
 
 (defvar *temp-reg-counter* 0
@@ -1550,7 +1587,7 @@
    :fn-names (compile-env-fn-names env)))
 
 (defun env-extend-stack (env name)
-  "Allocate a stack slot for NAME, return (values new-env slot-index)"
+  "Allocate a stack slot for NAME, return the cons (NEW-ENV . SLOT-INDEX)."
   (let* ((slot (compile-env-stack-depth env))
          (new-env (make-compile-env
                    :bindings (cons (make-binding :name name
@@ -5288,8 +5325,14 @@
   (let ((form (if (and (consp form) (eq (car form) 'sb-int:quasiquote))
                   (expand-backquote (cadr form))
                   form)))
-  ;; Macro expand
-  (let ((form (macroexpand-mvm form)))
+  ;; Macro expand.  If the INCOMING form is the discarded statement marked
+  ;; by compile-progn / LOOP / TAGBODY, carry the mark over to the expanded
+  ;; object (macroexpand-mvm may return a fresh cons), so the SETQ / PROGN /
+  ;; WHEN dispatch below sees it (*unused-value-form* is identity-keyed).
+  (let* ((%stmt-unused (eq form *unused-value-form*))
+         (form (macroexpand-mvm form)))
+   (when %stmt-unused (%fp-diag-bump 3))
+   (let ((*unused-value-form* (if %stmt-unused form *unused-value-form*)))
     (cond
       ;; NIL
       ((null form)
@@ -5370,7 +5413,7 @@
       ;; Unrecognized — warn and compile as nil
       (t
        (format t "  WARN: cannot compile ~S, using nil~%" form)
-       (compile-nil dest))))))
+       (compile-nil dest)))))))
 
 ;;; ------ Self-Evaluating Literals ------
 
@@ -5630,6 +5673,10 @@
           (let ((src (binding-reg binding)))
             (unless (= src dest)
               (emit-ir :mov dest src))))
+         ;; FP-resident local read in an untyped context: box it.  (Two
+         ;; single-key clauses: the in-image ECASE does not take key lists.)
+         (:fpreg (%emit-fpreg-box dest binding))
+         (:fpvreg (%emit-fpreg-box dest binding))
          (:stack
           ;; Load from stack slot: load [VFP - (slot+1)*8]
           (emit-ir :stack-load dest (binding-stack-slot binding)))
@@ -5892,8 +5939,18 @@
             (consp (caddr form)) (eq (car (caddr form)) 'quote)
             (symbolp (cadr (caddr form))) (%typep-fold-pred (cadr (caddr form))))
        (compile-form (list (%typep-fold-pred (cadr (caddr form))) (cadr form)) env dest))
-      ((= op-name 463569520)       (compile-if (cdr form) env dest))  ; IF
-      ((= op-name 28734859)    (compile-progn (cdr form) env dest))  ; PROGN
+      ((= op-name 463569520)                                           ; IF
+       (if (eq form *unused-value-form*)
+           (compile-if-unused (cdr form) env dest)
+           (compile-if (cdr form) env dest)))
+      ((= op-name 28734859)                                          ; PROGN
+       ;; A PROGN that is itself a discarded statement discards EVERY one of
+       ;; its forms (the dotimes expansion wraps the body in one); mark each.
+       (if (and (cdr form) (eq form *unused-value-form*))
+           (dolist (f (cdr form))
+             (let ((*unused-value-form* f))
+               (compile-form f env dest)))
+           (compile-progn (cdr form) env dest)))
       ((= op-name 536263002)  ; LET
        (let* ((bindings (cadr form))
               (body (cddr form))
@@ -5951,19 +6008,33 @@
       ((= op-name 260934892)  ; SETQ
        ;; CLHS 5.1.2.5: (setq var1 val1 var2 val2 ...) — multiple pairs allowed.
        ;; Compile all but the LAST pair with dest=ignored; LAST pair uses dest.
-       (let ((pairs (cdr form)))
+       (let ((pairs (cdr form))
+             ;; this SETQ's own value is discarded iff it is the statement
+             ;; compile-progn / the LOOP body marked (see *unused-value-form*)
+             (unused (eq form *unused-value-form*)))
          (cond
            ((null pairs) (compile-nil dest))
-           ((null (cddr pairs)) (compile-setq (car pairs) (cadr pairs) env dest))
+           ((null (cddr pairs))
+            (when unused (%fp-diag-bump 4))
+            (let ((*setq-value-unused* unused))
+              (compile-setq (car pairs) (cadr pairs) env dest)))
            (t
             (let ((cur pairs))
               (loop (when (null (cdddr cur)) (return))
-                (compile-setq (car cur) (cadr cur) env dest)
+                (let ((*setq-value-unused* t))          ; non-last pair: never used
+                  (compile-setq (car cur) (cadr cur) env dest))
                 (setq cur (cddr cur)))
-              (compile-setq (car cur) (cadr cur) env dest))))))
+              (let ((*setq-value-unused* unused))
+                (compile-setq (car cur) (cadr cur) env dest)))))))
       ((= op-name 80380232)   (compile-lambda (cadr form) (cddr form) env dest))  ; LAMBDA
-      ((= op-name 226908395)     (compile-when (cdr form) env dest))  ; WHEN
-      ((= op-name 64017389)   (compile-unless (cdr form) env dest))  ; UNLESS
+      ((= op-name 226908395)                                          ; WHEN
+       (if (eq form *unused-value-form*)
+           (compile-when-unused (cdr form) env dest)
+           (compile-when (cdr form) env dest)))
+      ((= op-name 64017389)                                           ; UNLESS
+       (if (eq form *unused-value-form*)
+           (compile-unless-unused (cdr form) env dest)
+           (compile-unless (cdr form) env dest)))
       ((= op-name 521850251)     (compile-loop (cdr form) env dest))  ; LOOP
       ;; %NAMED-LOOP — expand-cl-loop wraps NAMED LOOPs as
       ;; (%NAMED-LOOP NAME BODY).  Establishes (block NAME …) AND binds
@@ -8024,6 +8095,24 @@
       ;; Join
       (emit-ir-label end-label))))
 
+(defun compile-if-unused (args env dest)
+  "compile-if for an IF that is a DISCARDED statement: both branches are
+   discarded statements too, compiled through %compile-statement (the
+   one-binding marker helper).  WHEN/UNLESS are macros expanding to IF, so
+   this is what carries a discarded WHEN's mark to its body."
+  (destructuring-bind (test then &optional else) args
+    (let ((else-label (make-compiler-label))
+          (end-label (make-compiler-label)))
+      (compile-form test env dest)
+      (emit-ir :bnull dest else-label)
+      (%compile-statement then env dest)
+      (emit-ir :br end-label)
+      (emit-ir-label else-label)
+      (if else
+          (%compile-statement else env dest)
+          (compile-nil dest))
+      (emit-ir-label end-label))))
+
 ;;; ============================================================
 ;;; Progn
 ;;; ============================================================
@@ -8037,10 +8126,14 @@
               do (let ((form (car remaining))
                        (rest (cdr remaining)))
                    (if rest
-                       ;; Not the last form: compile for effect, result discarded
-                       (compile-form form env dest)
+                       ;; Not the last form: compile for effect, result discarded.
+                       ;; *UNUSED-VALUE-FORM* names THIS statement so a SETQ of
+                       ;; an FP-resident local can skip boxing its value.
+                       (let ((*unused-value-form* form))
+                         (compile-form form env dest))
                        ;; Last form: result goes to DEST
-                       (compile-form form env dest))
+                       (let ((*unused-value-form* nil))
+                         (compile-form form env dest)))
                    (setq remaining rest))))))
 
 ;;; ============================================================
@@ -9021,6 +9114,218 @@
                 (or (> *promote-loop-depth* 0) *promote-walk-loop-seen*)
                 :promote)))))
 
+;;; ------------------------------------------------------------
+;;; FP-register-resident declared locals (SIMD plan, layer 2c)
+;;;
+;;; A LET variable declared SINGLE-FLOAT (or F32V-PACK / (simple-array
+;;; single-float (4))) whose whole scope is CALL-FREE lives in an FP vreg
+;;; (:fpreg / :fpvreg) instead of a frame slot: its init lands in the
+;;; register, SETQ of a float/vector tree writes the register directly, a
+;;; tree reads it with a register move, and it boxes only where it escapes
+;;; (an untyped reference).  This is what keeps an accumulator loop out of
+;;; the allocator — mill's matmul lesson (fifty times).
+;;;
+;;; Call-free is the whole safety argument: FP registers are caller-
+;;; clobbered, so any CALL executed in the scope would destroy them.  The
+;;; walker below is a WHITELIST — anything it does not recognise as inline
+;;; codegen makes the scope ineligible (the variables then take the normal
+;;; boxed path, which is always correct).  The GC trampoline is the one
+;;; non-call transfer that can run inside a scope; nothing in the GC path
+;;; emits FP-pool code, so the pool survives a collection by construction.
+
+(defun %fp-type-kind (ty)
+  ":scalar for SINGLE-FLOAT, :vector for F32V-PACK / (simple-array
+   single-float (4)), else NIL."
+  (let ((ty (%resolve-declared-type ty)))
+    (cond ((and (symbolp ty) ty (string= (symbol-name ty) "SINGLE-FLOAT")) :scalar)
+          ((and (symbolp ty) ty (string= (symbol-name ty) "F32V-PACK")) :vector)
+          ((and (consp ty) (symbolp (car ty))
+                (string= (symbol-name (car ty)) "SIMPLE-ARRAY")
+                (consp (cdr ty)) (symbolp (cadr ty))
+                (string= (symbol-name (cadr ty)) "SINGLE-FLOAT")
+                (equal (caddr ty) '(4)))
+           :vector)
+          (t nil))))
+
+(defparameter *fp-scope-transparent-ops*
+  '("PROGN" "IF" "WHEN" "UNLESS" "AND" "OR" "BLOCK" "RETURN-FROM" "RETURN"
+    "TAGBODY" "GO" "THE" "LOCALLY" "DECLARE" "NOT" "NULL"))
+(defparameter *fp-scope-fixnum-ops*
+  '("+" "-" "*" "1+" "1-" "<" ">" "<=" ">=" "=" "/=" "LOGAND" "LOGIOR" "ASH"
+    "MIN" "MAX" "ZEROP" "PLUSP" "MINUSP" "EQ" "EQL"))
+
+(defun %fp-scope-extend-let (env bindings body)
+  "A scratch env with the LET's variables as frame bindings carrying their
+   declared types (and FIXNUM for an integer-literal / width-typed init),
+   so the walker can judge arithmetic on them."
+  (let ((new env))
+    (dolist (b bindings)
+      (let ((var (if (consp b) (car b) b))
+            (init (if (and (consp b) (consp (cdr b))) (cadr b) nil)))
+        ;; env-extend-stack returns (NEW-ENV . SLOT) — a cons, despite its
+        ;; docstring's "values"; the image's checked accessors caught the
+        ;; mismatch (the host's unchecked ones did not).
+        (let ((r (env-extend-stack new var)))
+          (setq new (car r))
+          ;; %expr-width is only defined on symbols / compound forms
+          (when (or (integerp init)
+                    (and (or (and init (symbolp init)) (consp init))
+                         (%expr-width init env)))
+            (let ((bb (car (compile-env-bindings new))))
+              (setf (binding-dtype bb) 'fixnum))))))
+    (%apply-declared-types new body)
+    new))
+
+(defun %fp-scope-call-free-p (form env depth)
+  "T when FORM compiles to code that executes no CALL (conservative whitelist)."
+  (cond
+    ((> depth 80) nil)
+    ((atom form) t)
+    (t
+     (let ((op (car form)))
+       (cond
+         ((consp op) nil)
+         ((not (symbolp op)) t)
+         (t
+          (let ((n (symbol-name op)))
+            (cond
+              ((string= n "QUOTE") t)
+              ((member n *fp-scope-transparent-ops* :test #'string=)
+               (every (lambda (f) (%fp-scope-call-free-p f env (1+ depth))) (cdr form)))
+              ((or (string= n "LET") (string= n "LET*"))
+               (and (consp (cdr form))
+                    (let ((inner (%fp-scope-extend-let env (cadr form) (cddr form))))
+                      (and (every (lambda (b)
+                                    (or (atom b) (null (cdr b))
+                                        (%fp-scope-call-free-p (cadr b) (if (string= n "LET*") inner env) (1+ depth))))
+                                  (cadr form))
+                           (every (lambda (f) (%fp-scope-call-free-p f inner (1+ depth)))
+                                  (strip-declares (cddr form)))))))
+              ;; The simple LOOP (every subform a cons — no loop keywords) is
+              ;; compiled natively; walk its body.  An extended LOOP (for /
+              ;; collect …) has symbol subforms and is rejected.
+              ((string= n "LOOP")
+               (and (every #'consp (cdr form))
+                    (every (lambda (f) (%fp-scope-call-free-p f env (1+ depth))) (cdr form))))
+              ;; INCF / DECF of a lexical width-typed variable by an integer or
+              ;; width-typed delta compiles inline.
+              ((or (string= n "INCF") (string= n "DECF"))
+               (and (consp (cdr form)) (symbolp (cadr form))
+                    (env-lookup env (cadr form))
+                    (%expr-width (cadr form) env)
+                    (or (null (cddr form))
+                        (let ((d (caddr form)))
+                          (or (integerp d)
+                              (and (or (and d (symbolp d)) (consp d)) (%expr-width d env)))))))
+              ;; DOTIMES is compiled natively (no macro to expand): a fixnum
+              ;; counter over a width-typed count, body walked with the
+              ;; counter bound as FIXNUM.
+              ((string= n "DOTIMES")
+               (and (consp (cdr form)) (consp (cadr form))
+                    (symbolp (caadr form)) (consp (cdadr form))
+                    (let ((count (cadadr form)))
+                      (or (integerp count)
+                          (and (or (and count (symbolp count)) (consp count))
+                               (%expr-width count env))))
+                    (let ((inner (%fp-scope-extend-let env (list (list (caadr form) 0)) nil)))
+                      (every (lambda (f) (%fp-scope-call-free-p f inner (1+ depth)))
+                             (append (cddadr form) (strip-declares (cddr form)))))))
+              ((string= n "SETQ")
+               (and (consp (cdr form)) (symbolp (cadr form))
+                    (env-lookup env (cadr form))            ; lexical only (a global setq calls)
+                    (consp (cddr form)) (null (cdddr form))
+                    (%fp-scope-call-free-p (caddr form) env (1+ depth))))
+              ;; float / vector trees compile inline (all-float operands)
+              ((%fp-tree-need form env) t)
+              ((%v4-tree-need form env) t)
+              ((string= n "%F32V-SET")
+               (and (consp (cdr form)) (consp (cddr form)) (consp (cdddr form))
+                    (%declared-f32-array-var-p (cadr form) env)
+                    (%simple-index-form-p (caddr form))
+                    (%v4-tree-need (cadddr form) env)
+                    t))
+              ((string= n "AREF")
+               (and (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
+                    (symbolp (cadr form))
+                    (or (%declared-f32-array-var-p (cadr form) env)
+                        (%declared-generic-array-var-p (cadr form) env))
+                    (%simple-index-form-p (caddr form))))
+              ((string= n "SETF")
+               ;; (setf (aref A i) v): declared A, simple i; an f32 store needs
+               ;; a fitting float tree (else it CALLS %f32-aset)
+               (and (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
+                    (let ((place (cadr form)) (val (caddr form)))
+                      (and (consp place) (symbolp (car place)) (name-eq (car place) "AREF")
+                           (consp (cdr place)) (consp (cddr place)) (null (cdddr place))
+                           (symbolp (cadr place)) (%simple-index-form-p (caddr place))
+                           (cond ((%declared-f32-array-var-p (cadr place) env)
+                                  (and (%fp-tree-need val env) t))
+                                 ((%declared-generic-array-var-p (cadr place) env)
+                                  (%fp-scope-call-free-p val env (1+ depth)))
+                                 (t nil))))))
+              ;; fixnum arithmetic / comparison: every operand width-typed
+              ((member n *fp-scope-fixnum-ops* :test #'string=)
+               (every (lambda (a)
+                        (and (%fp-scope-call-free-p a env (1+ depth))
+                             (or (integerp a)
+                                 (and (or (and a (symbolp a)) (consp a))
+                                      (%expr-width a env)))))
+                      (cdr form)))
+              ;; a macro: expand and judge the expansion
+              (t (multiple-value-bind (exp expanded) (%macroexpand-1-mvm-raw form)
+                   (and expanded (%fp-scope-call-free-p exp env (1+ depth)))))))))))))
+
+;; *fp-locals-force*, *unused-value-form* and *setq-value-unused* are
+;; defined at the top of the file, beside *temp-reg-counter*: a special must
+;; be DEFVAR'd before its first LET in file order, or the host compile binds
+;; it lexically and the value never reaches the reader.
+
+(defun %let-fp-kinds (bindings decl-body body env)
+  "For a LET: an array of :scalar / :vector / NIL per binding when at least
+   one variable is a declared float/vector local AND the body is call-free
+   AND *mvm-eval-runtime-p*; else NIL."
+  (when (and (or *mvm-eval-runtime-p* *fp-locals-force*) (consp bindings))
+    (let* ((pairs (%declared-types decl-body))
+           (kinds (make-array (length bindings) :initial-element nil))
+           (any nil) (i 0))
+      (dolist (b bindings)
+        (let* ((var (if (consp b) (car b) b))
+               (pair (find var pairs :key #'car :test #'equal))
+               (k (and pair (%fp-type-kind (cdr pair)))))
+          (when k (setf (aref kinds i) k) (setq any t)))
+        (setq i (+ i 1)))
+      (and any
+           ;; any failure in the analysis = not eligible (always safe)
+           (handler-case
+               (let ((scope (%fp-scope-extend-let env bindings decl-body)))
+                 (every (lambda (f) (%fp-scope-call-free-p f scope 0)) body))
+             (error () nil))
+           kinds))))
+
+(defun %compile-init-into-fpreg (val env f kind)
+  "Land VAL (evaluated in ENV) in FP vreg F as an unboxed KIND value."
+  (if (eq kind :scalar)
+      (if (%fp-tree-fits-p val env)
+          (compile-float-unboxed val env f)
+          (let ((tmp (alloc-temp-reg)))
+            (compile-form val env tmp)
+            (emit-ir :fp-unbox f tmp)
+            (free-temp-reg)))
+      (if (%v4-tree-fits-p val env)
+          (compile-v4-unboxed val env f)
+          (let ((tmp (alloc-temp-reg)) (tz (alloc-temp-reg)))
+            (compile-form val env tmp)
+            (compile-integer 0 tz)
+            (emit-ir :v4-lane-load f tmp tz)
+            (free-temp-reg) (free-temp-reg)))))
+
+(defun %emit-fpreg-box (dest binding)
+  "DEST ← the boxed value of the FP-resident BINDING."
+  (if (eq (binding-location binding) :fpvreg)
+      (%emit-v4-box dest (binding-reg binding))
+      (progn (emit-ir :gc-check)
+             (emit-ir :fp-box dest (binding-reg binding)))))
+
 (defun compile-let (bindings body env dest)
   "Compile (let ((var val)*) body*).
    All values are evaluated in the outer environment, then bound."
@@ -9069,7 +9374,11 @@
          (save-temps nil)
          (promote-plan (and (> n-bindings 0) (%let-promotion-plan body)))
          (promoted-regs (make-array (max n-bindings 1) :initial-element nil))
-         (n-promoted 0))
+         (n-promoted 0)
+         ;; FP-register-resident float/vector locals (layer 2c)
+         (fp-kinds (and (> n-bindings 0) (%let-fp-kinds bindings decl-body body env)))
+         (fp-regs (make-array (max n-bindings 1) :initial-element nil))
+         (n-fp 0))
     ;; Phase 1: Evaluate all values in original env, store to temp regs
     ;; We use a set of temp regs (or stack slots for > 5 bindings)
     (when (> n-bindings 0)
@@ -9104,6 +9413,14 @@
               ;; a promoted variable holds its temp for the whole body, and
               ;; the pool (V4–V15, 12 slots) must still fit the deepest
               ;; expression inside (add-residual overflowed at five).
+              ;; FP-resident local: the init lands unboxed in an FP vreg that
+              ;; stays allocated for the whole body (freed at the end below).
+              ((and fp-kinds (aref fp-kinds i)
+                    (< *fp-reg-counter* +fp-reg-max+))
+               (let ((f (alloc-fp-reg)))
+                 (%compile-init-into-fpreg val reserve-env f (aref fp-kinds i))
+                 (setf (aref fp-regs i) f)
+                 (setq n-fp (+ n-fp 1))))
               ((and promote-plan
                     (not *promote-inhibit*)
                     (<= (+ +vreg-v4+ *temp-reg-counter*) +vreg-v6+))
@@ -9129,12 +9446,18 @@
               (reg (aref promoted-regs i)))
           (setq new-env
                 (make-compile-env
-                 :bindings (cons (if reg
-                                     (make-binding :name var :location :reg :reg reg)
-                                     (make-binding
-                                      :name var
-                                      :location :stack
-                                      :stack-slot (+ (compile-env-stack-depth env) i)))
+                 :bindings (cons (cond
+                                   ((aref fp-regs i)
+                                    (make-binding :name var
+                                                  :location (if (eq (aref fp-kinds i) :vector) :fpvreg :fpreg)
+                                                  :reg (aref fp-regs i)))
+                                   (reg
+                                    (make-binding :name var :location :reg :reg reg))
+                                   (t
+                                    (make-binding
+                                     :name var
+                                     :location :stack
+                                     :stack-slot (+ (compile-env-stack-depth env) i))))
                                 (compile-env-bindings new-env))
                  :stack-depth (+ (compile-env-stack-depth env) n-bindings)
                  :parent (compile-env-parent new-env)
@@ -9152,6 +9475,7 @@
     (compile-progn body new-env dest)
     ;; Release the promoted registers (they were the top-most temps).
     (dotimes (k n-promoted) (free-temp-reg))
+    (dotimes (k n-fp) (free-fp-reg))
     ;; Deallocate frame space
     (when (> n-bindings 0)
       (emit-ir :frame-free n-bindings))))
@@ -9264,6 +9588,18 @@
     (return-from compile-setq
       (compile-form `(setf ,(gethash (normalize-name var) *global-symbol-macros*) ,val)
                     env dest)))
+  ;; FP-resident local (layer 2c): the value tree lands in the register
+  ;; directly; a non-tree value is boxed then unboxed; DEST (the setq
+  ;; value) is boxed only when wanted.
+  (let ((fb (env-lookup env var)))
+    (when (and fb (member (binding-location fb) '(:fpreg :fpvreg)))
+      (%compile-init-into-fpreg val env (binding-reg fb)
+                                (if (eq (binding-location fb) :fpvreg) :vector :scalar))
+      ;; box the assignment's value only when some consumer will read DEST
+      (if (and dest (not *setq-value-unused*))
+          (%emit-fpreg-box dest fb)
+          (%fp-diag-bump 5))
+      (return-from compile-setq nil)))
   (compile-form val env dest)
   (let ((binding (env-lookup env var)))
     (cond
@@ -10355,11 +10691,29 @@
         (body (cdr args)))
     (compile-if (list test (cons 'progn body)) env dest)))
 
+(defun compile-when-unused (args env dest)
+  "compile-when for a WHEN that is a DISCARDED statement: its body PROGN is
+   discarded too, so the fresh PROGN cons is marked (the test form can never
+   match it).  A separate one-binding function — see %compile-statement."
+  (let* ((test (car args))
+         (pb (cons 'progn (cdr args))))
+    (%fp-diag-bump 2)
+    (let ((*unused-value-form* pb))
+      (compile-if (list test pb) env dest))))
+
 (defun compile-unless (args env dest)
   "Compile (unless test body...) -> (if test nil (progn body...))"
   (let ((test (car args))
         (body (cdr args)))
     (compile-if (list test nil (cons 'progn body)) env dest)))
+
+(defun compile-unless-unused (args env dest)
+  "compile-unless for a discarded UNLESS statement (see compile-when-unused)."
+  (let* ((test (car args))
+         (pb (cons 'progn (cdr args))))
+    (%fp-diag-bump 2)
+    (let ((*unused-value-form* pb))
+      (compile-if (list test nil pb) env dest))))
 
 ;;; ============================================================
 ;;; Loop / Return
@@ -10475,8 +10829,16 @@
                              *block-labels*))))
             ;; Loop entry
             (emit-ir-label loop-label)
-            ;; Compile loop body
-            (compile-progn body env dest)
+            ;; Compile loop body.  A simple LOOP never yields a body value, so
+            ;; EVERY statement is a discarded one (see *unused-value-form*).
+            (if (null body)
+                (compile-nil dest)
+                (let ((rest body))
+                  (loop while rest
+                        do (let ((form (car rest)))
+                             (%fp-diag-bump 1)
+                             (%compile-statement form env dest))
+                           (setq rest (cdr rest)))))
             ;; Yield/preemption check
             (emit-ir :yield)
             ;; Jump back to loop start
@@ -13004,12 +13366,18 @@
         (push (cons item (cons (make-compiler-label) tb-seq))
               *tagbody-tags*)))
     ;; Second pass: compile
-    (dolist (item body)
-      (if (%tagbody-tag-p item)
-          ;; It's a tag: emit label
-          (emit-ir-label (cadr (assoc item *tagbody-tags* :test #'eql)))
-          ;; It's a form: compile it
-          (compile-form item env dest)))
+    (let ((rest body))
+      (loop while rest
+            do (let ((item (car rest)))
+                 (if (%tagbody-tag-p item)
+                     ;; It's a tag: emit label
+                     (emit-ir-label (cadr (assoc item *tagbody-tags* :test #'eql)))
+                     ;; It's a form: compile it.  A TAGBODY form is a statement
+                     ;; by definition — its value is always discarded.
+                     (progn
+                       (%fp-diag-bump 0)
+                       (%compile-statement item env dest))))
+               (setq rest (cdr rest))))
     ;; Tagbody returns nil
     (compile-nil dest)))
 
@@ -14762,6 +15130,11 @@
    FP vreg FD, unboxed."
   (let ((form (%fp-unary-normalize form)))
     (cond
+      ;; an FP-resident local: a register move, no unbox
+      ((and (symbolp form)
+            (let ((b (env-lookup env form))) (and b (eq (binding-location b) :fpreg))))
+       (let ((b (env-lookup env form)))
+         (unless (= (binding-reg b) fd) (emit-ir :fp-mov fd (binding-reg b)))))
       ;; leaf literal / variable: the boxed value, unboxed once
       ((or (typep form 'single-float) (symbolp form)
            (and (consp form) (name-eq (car form) "QUOTE")))
@@ -14855,6 +15228,10 @@
 (defun compile-v4-unboxed (form env fd)
   "Compile the vector tree FORM (caller checked %v4-tree-need) into FP vreg FD."
   (cond
+    ((and (symbolp form)                             ; FP-resident vector local
+          (let ((b (env-lookup env form))) (and b (eq (binding-location b) :fpvreg))))
+     (let ((b (env-lookup env form)))
+       (unless (= (binding-reg b) fd) (emit-ir :fp-mov fd (binding-reg b)))))
     ((symbolp form)                                  ; boxed 4-lane variable
      (let ((tv (alloc-temp-reg)) (tz (alloc-temp-reg)))
        (compile-form form env tv)
@@ -20155,6 +20532,7 @@
       (:v4-sub 4)
       (:v4-mul 4)
       (:v4-div 4)
+      (:fp-mov 3)
       (:add   4)
       (:sub   4)
       (:adds  4)
@@ -20445,6 +20823,7 @@
           (:v4-sub (mvm-v4-sub buf (second insn) (third insn) (fourth insn)))
           (:v4-mul (mvm-v4-mul buf (second insn) (third insn) (fourth insn)))
           (:v4-div (mvm-v4-div buf (second insn) (third insn) (fourth insn)))
+          (:fp-mov (mvm-fp-mov buf (second insn) (third insn)))
 
           ;; ---- 3-reg instructions ----
           (:add

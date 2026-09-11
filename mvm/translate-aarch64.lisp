@@ -4354,6 +4354,53 @@
                               (t                  #x1E201800))))
              (a64-emit buf (logior base (ash fb 16) (ash fa 5) fd))))
 
+          ;; ==== f32x4 vector class on the FP vregs (F0..F5 = v2..v7.4s) ====
+          ;; Encodings assembler-verified (ldur/stur q, fadd/fsub/fmul/fdiv .4s,
+          ;; dup .4s, ld1r).
+
+          ;; ---- V4-LANE-LOAD Fd, Varr, Vidx ----  LDUR Qd, [x9,#7]
+          ((= op +op-v4-lane-load+)
+           (let* ((fd (+ 2 (vr 0)))
+                  (parr (ensure-src (vr 1) +a64-x16+))
+                  (pidx (ensure-src (vr 2) +a64-x17+)))
+             (a64-asr-imm buf +a64-x9+ pidx 1)
+             (a64-add-reg buf +a64-x9+ parr +a64-x9+ 0 2)
+             (a64-emit buf (logior #x3CC07000 (ash +a64-x9+ 5) fd))))
+
+          ;; ---- V4-LANE-STORE Varr, Vidx, Fs ----  STUR Qs, [x10,#7]
+          ((= op +op-v4-lane-store+)
+           (let* ((parr (ensure-src (vr 0) +a64-x16+))
+                  (pidx (ensure-src (vr 1) +a64-x17+))
+                  (fs (+ 2 (vr 2))))
+             (a64-asr-imm buf +a64-x10+ pidx 1)
+             (a64-add-reg buf +a64-x10+ parr +a64-x10+ 0 2)
+             (a64-emit buf (logior #x3C807000 (ash +a64-x10+ 5) fs))))
+
+          ;; ---- V4-DUP Fd, Fs ----  DUP Vd.4S, Vs.S[0]
+          ((= op +op-v4-dup+)
+           (let* ((fd (+ 2 (vr 0))) (fs (+ 2 (vr 1))))
+             (a64-emit buf (logior #x4E040400 (ash fs 5) fd))))
+
+          ;; ---- V4-DUP-LANE-LOAD Fd, Varr, Vidx ----  x9 = lane addr; LD1R {Vd.4S}, [x9]
+          ((= op +op-v4-dup-lane-load+)
+           (let* ((fd (+ 2 (vr 0)))
+                  (parr (ensure-src (vr 1) +a64-x16+))
+                  (pidx (ensure-src (vr 2) +a64-x17+)))
+             (a64-asr-imm buf +a64-x9+ pidx 1)
+             (a64-add-reg buf +a64-x9+ parr +a64-x9+ 0 2)
+             (a64-add-imm buf +a64-x9+ +a64-x9+ 7)
+             (a64-emit buf (logior #x4D40C800 (ash +a64-x9+ 5) fd))))
+
+          ;; ---- V4-ADD/SUB/MUL/DIV Fd, Fa, Fb ----  F<op> Vd.4S, Va.4S, Vb.4S
+          ((or (= op +op-v4-add+) (= op +op-v4-sub+)
+               (= op +op-v4-mul+) (= op +op-v4-div+))
+           (let* ((fd (+ 2 (vr 0))) (fa (+ 2 (vr 1))) (fb (+ 2 (vr 2)))
+                  (base (cond ((= op +op-v4-add+) #x4E20D400)
+                              ((= op +op-v4-sub+) #x4EA0D400)
+                              ((= op +op-v4-mul+) #x6E20DC00)
+                              (t                  #x6E20FC00))))
+             (a64-emit buf (logior base (ash fb 16) (ash fa 5) fd))))
+
           ;; ---- U8-REF Vd, Varr, Vidx ----  (load one byte from a u8 vector)
           ;; Byte address = (Varr - 9) + 16 + real_idx = Varr + 7 + real_idx.
           ;; Vidx is a TAGGED fixnum (real_idx*2); result is a TAGGED fixnum

@@ -606,6 +606,21 @@
   (emit-shr-reg-imm buf tmp 48)
   (emit-or-reg-reg buf acc tmp))
 
+(defun emit-f32-lane-addr (buf varr vidx)
+  "RAX ← Varr + 4*idx (the tagged pointer; the lane is at [rax+7]).  Only RAX
+   and R13 (saved) are touched, so no live vreg is disturbed."
+  (emit-load-vreg buf vidx +scratch-reg+)
+  (emit-sar-reg-imm buf +scratch-reg+ 1)
+  (emit-shl-reg-imm buf +scratch-reg+ 2)
+  (let ((pobj (vreg-phys varr)))
+    (if pobj
+        (emit-add-reg-reg buf +scratch-reg+ pobj)
+        (progn
+          (emit-push buf 'r13)
+          (emit-load-vreg buf varr 'r13)
+          (emit-add-reg-reg buf +scratch-reg+ 'r13)
+          (emit-pop buf 'r13)))))
+
 (defun emit-float-store-bits (buf base src tmp)
   "Split the 64-bit IEEE bit pattern in SRC into four tagged 16-bit chunks and
    store them into slots 0..3 of the object whose RAW base is BASE (offsets
@@ -2970,6 +2985,49 @@
            (unless (= fd fa)
              (emit-bytes buf #x0F #x28 (logior #xC0 (ash fd 3) fa)))         ; movaps xmmD, xmmA
            (emit-bytes buf #xF3 #x0F sse (logior #xC0 (ash fd 3)))))         ; opss xmmD, xmm0
+
+        ;; ==== f32x4 vector class on the FP vregs (F0..F5 = xmm2..xmm7) ====
+        ;; Encodings assembler-verified (movups/addps…/shufps/movss).
+
+        ((op= +op-v4-lane-load+)
+         ;; (v4-lane-load Fd Varr Vidx) — MOVUPS xmmD, [arr + 4*idx + 7]
+         (let* ((fd (+ 2 (first operands))))
+           (emit-f32-lane-addr buf (second operands) (third operands))
+           (emit-bytes buf #x0F #x10 (logior #x40 (ash fd 3)) #x07)))
+
+        ((op= +op-v4-lane-store+)
+         ;; (v4-lane-store Varr Vidx Fs) — MOVUPS [arr + 4*idx + 7], xmmS
+         (let* ((fs (+ 2 (third operands))))
+           (emit-f32-lane-addr buf (first operands) (second operands))
+           (emit-bytes buf #x0F #x11 (logior #x40 (ash fs 3)) #x07)))
+
+        ((op= +op-v4-dup+)
+         ;; (v4-dup Fd Fs) — movaps D, S ; shufps D, D, 0
+         (let* ((fd (+ 2 (first operands))) (fs (+ 2 (second operands))))
+           (unless (= fd fs)
+             (emit-bytes buf #x0F #x28 (logior #xC0 (ash fd 3) fs)))
+           (emit-bytes buf #x0F #xC6 (logior #xC0 (ash fd 3) fd) #x00)))
+
+        ((op= +op-v4-dup-lane-load+)
+         ;; (v4-dup-lane-load Fd Varr Vidx) — movss D, [lane] ; shufps D, D, 0
+         (let* ((fd (+ 2 (first operands))))
+           (emit-f32-lane-addr buf (second operands) (third operands))
+           (emit-bytes buf #xF3 #x0F #x10 (logior #x40 (ash fd 3)) #x07)
+           (emit-bytes buf #x0F #xC6 (logior #xC0 (ash fd 3) fd) #x00)))
+
+        ((or (op= +op-v4-add+) (op= +op-v4-sub+) (op= +op-v4-mul+) (op= +op-v4-div+))
+         ;; (v4-<op> Fd Fa Fb) — packed single: xmm0 ← B; D ← A; D op= xmm0
+         (let* ((fd (+ 2 (first operands)))
+                (fa (+ 2 (second operands)))
+                (fb (+ 2 (third operands)))
+                (sse (cond ((op= +op-v4-add+) #x58)     ; ADDPS
+                           ((op= +op-v4-sub+) #x5C)     ; SUBPS
+                           ((op= +op-v4-mul+) #x59)     ; MULPS
+                           (t                 #x5E))))  ; DIVPS
+           (emit-bytes buf #x0F #x28 (logior #xC0 fb))                       ; movaps xmm0, xmmB
+           (unless (= fd fa)
+             (emit-bytes buf #x0F #x28 (logior #xC0 (ash fd 3) fa)))         ; movaps xmmD, xmmA
+           (emit-bytes buf #x0F sse (logior #xC0 (ash fd 3)))))              ; opps xmmD, xmm0
 
         ((op= +op-u8-ref+)
          ;; (u8-ref Vd Varr Vidx) — load one byte from a u8 vector.

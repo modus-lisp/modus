@@ -1804,6 +1804,53 @@
                                  'single-float)))
                  (setf pc npc3)))))
 
+          ;; ---- f32x4 vector class (reference arm): an FP slot holds a
+          ;; 4-element host vector of single-floats.
+          (#.+op-v4-lane-load+
+           (multiple-value-bind (fd npc) (fetch-reg bc pc)
+             (multiple-value-bind (varr npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vidx npc3) (fetch-reg bc npc2)
+                 (let ((a (svref regs varr)) (i (svref regs vidx)))
+                   (setf (svref fregs fd)
+                         (vector (%f32-aref-rt a i) (%f32-aref-rt a (+ i 1))
+                                 (%f32-aref-rt a (+ i 2)) (%f32-aref-rt a (+ i 3)))))
+                 (setf pc npc3)))))
+          (#.+op-v4-lane-store+
+           (multiple-value-bind (varr npc) (fetch-reg bc pc)
+             (multiple-value-bind (vidx npc2) (fetch-reg bc npc)
+               (multiple-value-bind (fs npc3) (fetch-reg bc npc2)
+                 (let ((a (svref regs varr)) (i (svref regs vidx)) (v (svref fregs fs)))
+                   (%f32-aset-rt a i (svref v 0)) (%f32-aset-rt a (+ i 1) (svref v 1))
+                   (%f32-aset-rt a (+ i 2) (svref v 2)) (%f32-aset-rt a (+ i 3) (svref v 3)))
+                 (setf pc npc3)))))
+          (#.+op-v4-dup+
+           (multiple-value-bind (fd npc) (fetch-reg bc pc)
+             (multiple-value-bind (fs npc2) (fetch-reg bc npc)
+               (let ((x (svref fregs fs)))
+                 (setf (svref fregs fd) (vector x x x x)))
+               (setf pc npc2))))
+          (#.+op-v4-dup-lane-load+
+           (multiple-value-bind (fd npc) (fetch-reg bc pc)
+             (multiple-value-bind (varr npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vidx npc3) (fetch-reg bc npc2)
+                 (let ((x (%f32-aref-rt (svref regs varr) (svref regs vidx))))
+                   (setf (svref fregs fd) (vector x x x x)))
+                 (setf pc npc3)))))
+          ((#.+op-v4-add+ #.+op-v4-sub+ #.+op-v4-mul+ #.+op-v4-div+)
+           (multiple-value-bind (fd npc) (fetch-reg bc pc)
+             (multiple-value-bind (fa npc2) (fetch-reg bc npc)
+               (multiple-value-bind (fb npc3) (fetch-reg bc npc2)
+                 (let ((a (svref fregs fa)) (b (svref fregs fb)) (r (make-array 4)))
+                   (dotimes (k 4)
+                     (setf (svref r k)
+                           (coerce (cond ((= opcode #.+op-v4-add+) (+ (svref a k) (svref b k)))
+                                         ((= opcode #.+op-v4-sub+) (- (svref a k) (svref b k)))
+                                         ((= opcode #.+op-v4-mul+) (* (svref a k) (svref b k)))
+                                         (t (/ (svref a k) (svref b k))))
+                                   'single-float)))
+                   (setf (svref fregs fd) r))
+                 (setf pc npc3)))))
+
           (#.+op-aref+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vobj npc2) (fetch-reg bc npc)

@@ -103,6 +103,10 @@
    #:+op-fp-add+ #:+op-fp-sub+ #:+op-fp-mul+ #:+op-fp-div+
    #:mvm-fp-unbox #:mvm-fp-box #:mvm-fp-lane-load #:mvm-fp-lane-store
    #:mvm-fp-add #:mvm-fp-sub #:mvm-fp-mul #:mvm-fp-div
+   #:+op-v4-lane-load+ #:+op-v4-lane-store+ #:+op-v4-dup+ #:+op-v4-dup-lane-load+
+   #:+op-v4-add+ #:+op-v4-sub+ #:+op-v4-mul+ #:+op-v4-div+
+   #:mvm-v4-lane-load #:mvm-v4-lane-store #:mvm-v4-dup #:mvm-v4-dup-lane-load
+   #:mvm-v4-add #:mvm-v4-sub #:mvm-v4-mul #:mvm-v4-div
    #:mvm-load #:mvm-store #:mvm-fence
    #:mvm-call #:mvm-call-ind #:mvm-ret #:mvm-tailcall
    #:mvm-alloc-cons #:mvm-gc-check #:mvm-gc-check-n #:mvm-gc-check-r
@@ -475,6 +479,17 @@
 (defconstant +op-fp-sub+        #xD6)
 (defconstant +op-fp-mul+        #xD7)
 (defconstant +op-fp-div+        #xD8)
+;; f32x4 VECTOR class (SIMD plan, layer 2a): the same FP vregs F0..F5 hold a
+;; 128-bit vector (xmm2..7 / v2..7.4s).  A vector's BOXED form is a packed
+;; single-float vector of length 4 (subtag #x12), so box/unbox are lane ops.
+(defconstant +op-v4-lane-load+     #xD9) ; (v4-lane-load Fd Varr Vidx)   4 lanes from index (unaligned)
+(defconstant +op-v4-lane-store+    #xDA) ; (v4-lane-store Varr Vidx Fs)
+(defconstant +op-v4-dup+           #xDB) ; (v4-dup Fd Fs)                scalar single in Fs → all 4 lanes
+(defconstant +op-v4-dup-lane-load+ #xDC) ; (v4-dup-lane-load Fd Varr Vidx) lane idx → all 4 lanes
+(defconstant +op-v4-add+           #xDD) ; (v4-<op> Fd Fa Fb)            elementwise single precision
+(defconstant +op-v4-sub+           #xDE)
+(defconstant +op-v4-mul+           #xDF)
+(defconstant +op-v4-div+           #xE0)
 
 ;;; ============================================================
 ;;; Opcode Metadata Table
@@ -672,6 +687,14 @@
 (defopcode :fp-sub        #xD6 (:reg :reg :reg) "FP vreg single sub")
 (defopcode :fp-mul        #xD7 (:reg :reg :reg) "FP vreg single mul")
 (defopcode :fp-div        #xD8 (:reg :reg :reg) "FP vreg single div")
+(defopcode :v4-lane-load     #xD9 (:reg :reg :reg) "4 packed f32 lanes → FP vreg (unaligned)")
+(defopcode :v4-lane-store    #xDA (:reg :reg :reg) "FP vreg → 4 packed f32 lanes")
+(defopcode :v4-dup           #xDB (:reg :reg)      "scalar single in FP vreg → all 4 lanes")
+(defopcode :v4-dup-lane-load #xDC (:reg :reg :reg) "one packed f32 lane → all 4 lanes of FP vreg")
+(defopcode :v4-add           #xDD (:reg :reg :reg) "f32x4 add")
+(defopcode :v4-sub           #xDE (:reg :reg :reg) "f32x4 sub")
+(defopcode :v4-mul           #xDF (:reg :reg :reg) "f32x4 mul")
+(defopcode :v4-div           #xE0 (:reg :reg :reg) "f32x4 div")
 
 ;;; ============================================================
 ;;; Memory Width Constants
@@ -1134,6 +1157,15 @@
 (defun mvm-fp-sub (buf fd fa fb) (encode-instruction buf +op-fp-sub+ fd fa fb))
 (defun mvm-fp-mul (buf fd fa fb) (encode-instruction buf +op-fp-mul+ fd fa fb))
 (defun mvm-fp-div (buf fd fa fb) (encode-instruction buf +op-fp-div+ fd fa fb))
+
+(defun mvm-v4-lane-load (buf fd varr vidx) (encode-instruction buf +op-v4-lane-load+ fd varr vidx))
+(defun mvm-v4-lane-store (buf varr vidx fs) (encode-instruction buf +op-v4-lane-store+ varr vidx fs))
+(defun mvm-v4-dup (buf fd fs) (encode-instruction buf +op-v4-dup+ fd fs))
+(defun mvm-v4-dup-lane-load (buf fd varr vidx) (encode-instruction buf +op-v4-dup-lane-load+ fd varr vidx))
+(defun mvm-v4-add (buf fd fa fb) (encode-instruction buf +op-v4-add+ fd fa fb))
+(defun mvm-v4-sub (buf fd fa fb) (encode-instruction buf +op-v4-sub+ fd fa fb))
+(defun mvm-v4-mul (buf fd fa fb) (encode-instruction buf +op-v4-mul+ fd fa fb))
+(defun mvm-v4-div (buf fd fa fb) (encode-instruction buf +op-v4-div+ fd fa fb))
 
 ;; Memory
 (defun mvm-load (buf vd vaddr width)

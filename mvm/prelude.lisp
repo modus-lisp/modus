@@ -1138,6 +1138,38 @@
   "Store float X into lane I of the packed vector A; returns X."
   (%f32-store a i (if (floatp x) x (float x 1.0f0)))
   x)
+;;; ---- f32x4 vectors (SIMD plan, layer 2a) -----------------------------
+;;; The VALUE form of a 4-lane vector is a packed single-float vector of
+;;; length 4.  These are the runtime (boxed, correct-everywhere) definitions;
+;;; the compiler inlines the same names into the FP-register vector ops when
+;;; they appear in a call-free tree over declared arrays.
+(defun %f32v-ref (a i)
+  "Lanes A[i..i+3] as a fresh 4-lane vector (unaligned)."
+  (let ((v (%make-f32-vector 4)))
+    (%f32-aset v 0 (%f32-aref a i)) (%f32-aset v 1 (%f32-aref a (+ i 1)))
+    (%f32-aset v 2 (%f32-aref a (+ i 2))) (%f32-aset v 3 (%f32-aref a (+ i 3)))
+    v))
+(defun %f32v-set (a i v)
+  "Store the 4 lanes of V at A[i..i+3]; returns V."
+  (%f32-aset a i (%f32-aref v 0)) (%f32-aset a (+ i 1) (%f32-aref v 1))
+  (%f32-aset a (+ i 2) (%f32-aref v 2)) (%f32-aset a (+ i 3) (%f32-aref v 3))
+  v)
+(defun %f32v-broadcast (x)
+  (let ((v (%make-f32-vector 4)))
+    (%f32-aset v 0 x) (%f32-aset v 1 x) (%f32-aset v 2 x) (%f32-aset v 3 x) v))
+(defun %f32v-broadcast-ref (a i) (%f32v-broadcast (%f32-aref a i)))
+(defun %f32v-map2 (f v w)
+  (let ((r (%make-f32-vector 4)))
+    (%f32-aset r 0 (funcall f (%f32-aref v 0) (%f32-aref w 0)))
+    (%f32-aset r 1 (funcall f (%f32-aref v 1) (%f32-aref w 1)))
+    (%f32-aset r 2 (funcall f (%f32-aref v 2) (%f32-aref w 2)))
+    (%f32-aset r 3 (funcall f (%f32-aref v 3) (%f32-aref w 3)))
+    r))
+(defun %f32v+ (v w) (%f32v-map2 #'+ v w))
+(defun %f32v- (v w) (%f32v-map2 #'- v w))
+(defun %f32v* (v w) (%f32v-map2 #'* v w))
+(defun %f32v/ (v w) (%f32v-map2 #'/ v w))
+
 (defun %f32-aref-rt (a i) (%bits->single (%f32-bits-ref a i)))
 (defun %f32-aset-rt (a i x)
   (%f32-bits-set a i (%single->bits (if (floatp x) x (float x 1.0f0)))) x)

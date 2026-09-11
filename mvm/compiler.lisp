@@ -6968,6 +6968,17 @@
        (compile-f32-store (cadr form) (caddr form) (cadddr form) env dest))
       ((= op-name #.(compute-name-hash "%FROUND32"))
        (compile-fround32 (cadr form) env dest))
+      ;; f32x4 vector contract (layer 2a): unboxed in FP registers when the
+      ;; form is a call-free tree over declared arrays, else the prelude defun.
+      ((or (= op-name #.(compute-name-hash "%F32V-REF"))
+           (= op-name #.(compute-name-hash "%F32V-SET"))
+           (= op-name #.(compute-name-hash "%F32V-BROADCAST"))
+           (= op-name #.(compute-name-hash "%F32V-BROADCAST-REF"))
+           (= op-name #.(compute-name-hash "%F32V+"))
+           (= op-name #.(compute-name-hash "%F32V-"))
+           (= op-name #.(compute-name-hash "%F32V*"))
+           (= op-name #.(compute-name-hash "%F32V/")))
+       (compile-v4-form form env dest))
       ((= op-name #.(compute-name-hash "%WORD-AREF"))
        (compile-word-aref (cadr form) (caddr form) env dest))
       ((= op-name #.(compute-name-hash "%WORD-ASET"))
@@ -14779,6 +14790,134 @@
   (let ((need (%fp-tree-need form env)))
     (and need (<= (+ *fp-reg-counter* need) +fp-reg-max+))))
 
+;;; ------------------------------------------------------------
+;;; f32x4 vector trees (SIMD plan, layer 2a)
+;;;
+;;; mill's contract in Modus terms: %f32v-ref (4 lanes from an index,
+;;; unaligned, setf-able via %f32v-set), %f32v-broadcast, %f32v-broadcast-ref,
+;;; %f32v+ - * /.  A vector VALUE is a 4-lane packed single-float array.  A
+;;; call-free tree of those over declared arrays compiles into the FP
+;;; register pool exactly like the scalar float trees; it boxes once at the
+;;; boundary (a fresh 4-lane #x12) or not at all when it feeds %f32v-set.
+
+(defun %v4-op-name-p (sym name)
+  (and (symbolp sym) (string= (symbol-name sym) name)))
+
+(defun %declared-f32v-var-p (form env)
+  "A variable declared f32v-pack or (simple-array single-float (4))."
+  (and (symbolp form)
+       (let ((ty (%var-dtype form env)))
+         (or (and (symbolp ty) ty (string= (symbol-name ty) "F32V-PACK"))
+             (and (consp ty) (symbolp (car ty))
+                  (string= (symbol-name (car ty)) "SIMPLE-ARRAY")
+                  (consp (cdr ty)) (symbolp (cadr ty))
+                  (string= (symbol-name (cadr ty)) "SINGLE-FLOAT")
+                  (equal (caddr ty) '(4)))))))
+
+(defun %v4-tree-need (form env)
+  "FP registers needed to evaluate the vector tree FORM unboxed, or NIL."
+  (cond
+    ((symbolp form) (and (%declared-f32v-var-p form env) 1))
+    ((and (consp form) (symbolp (car form)))
+     (let ((n (symbol-name (car form))))
+       (cond
+         ((string= n "%F32V-REF")
+          (and (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
+               (%declared-f32-array-var-p (cadr form) env)
+               (%simple-index-form-p (caddr form))
+               1))
+         ((string= n "%F32V-BROADCAST-REF")
+          (and (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
+               (%declared-f32-array-var-p (cadr form) env)
+               (%simple-index-form-p (caddr form))
+               1))
+         ((string= n "%F32V-BROADCAST")
+          (and (consp (cdr form)) (null (cddr form))
+               (%fp-tree-need (cadr form) env)))          ; scalar tree, same regs
+         ((member n '("%F32V+" "%F32V-" "%F32V*" "%F32V/") :test #'string=)
+          (and (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
+               (let ((a (%v4-tree-need (cadr form) env))
+                     (b (%v4-tree-need (caddr form) env)))
+                 (and a b (max a (1+ b))))))
+         (t nil))))
+    (t nil)))
+
+(defun %v4-tree-fits-p (form env)
+  (let ((need (%v4-tree-need form env)))
+    (and need (<= (+ *fp-reg-counter* need) +fp-reg-max+))))
+
+(defun %v4-arith-op (name)
+  (cond ((string= name "%F32V+") :v4-add)
+        ((string= name "%F32V-") :v4-sub)
+        ((string= name "%F32V*") :v4-mul)
+        (t :v4-div)))
+
+(defun compile-v4-unboxed (form env fd)
+  "Compile the vector tree FORM (caller checked %v4-tree-need) into FP vreg FD."
+  (cond
+    ((symbolp form)                                  ; boxed 4-lane variable
+     (let ((tv (alloc-temp-reg)) (tz (alloc-temp-reg)))
+       (compile-form form env tv)
+       (compile-integer 0 tz)
+       (emit-ir :v4-lane-load fd tv tz)
+       (free-temp-reg) (free-temp-reg)))
+    (t
+     (let ((n (symbol-name (car form))))
+       (cond
+         ((or (string= n "%F32V-REF") (string= n "%F32V-BROADCAST-REF"))
+          (let ((ta (alloc-temp-reg)) (ti (alloc-temp-reg)))
+            (compile-form (cadr form) env ta)
+            (compile-form (caddr form) env ti)
+            (emit-ir (if (string= n "%F32V-REF") :v4-lane-load :v4-dup-lane-load) fd ta ti)
+            (free-temp-reg) (free-temp-reg)))
+         ((string= n "%F32V-BROADCAST")
+          (compile-float-unboxed (cadr form) env fd)  ; scalar single into FD
+          (emit-ir :v4-dup fd fd))
+         (t
+          (let ((op (%v4-arith-op n)))
+            (compile-v4-unboxed (cadr form) env fd)
+            (let ((ft (alloc-fp-reg)))
+              (compile-v4-unboxed (caddr form) env ft)
+              (emit-ir op fd fd ft)
+              (free-fp-reg)))))))))
+
+(defun %emit-v4-box (dest fd)
+  "DEST ← a fresh 4-lane packed single-float vector holding FD's lanes."
+  (let ((tv (alloc-temp-reg)) (tn (alloc-temp-reg)))
+    (compile-integer 4 tn)
+    (emit-ir :gc-check)
+    (emit-ir :alloc-f32 tv tn)
+    (compile-integer 0 tn)
+    (emit-ir :v4-lane-store tv tn fd)
+    (emit-ir :mov dest tv)
+    (free-temp-reg) (free-temp-reg)))
+
+(defun compile-v4-form (form env dest)
+  "A %f32v-* call: unboxed when it is (or stores) a fitting vector tree,
+   otherwise the ordinary call to the prelude definition."
+  (let ((n (symbol-name (car form))))
+    (cond
+      ((string= n "%F32V-SET")                    ; (%f32v-set A i tree)
+       (if (and (consp (cdr form)) (consp (cddr form)) (consp (cdddr form))
+                (%declared-f32-array-var-p (cadr form) env)
+                (%v4-tree-fits-p (cadddr form) env))
+           (let ((ta (alloc-temp-reg)) (ti (alloc-temp-reg)))
+             (compile-form (cadr form) env ta)
+             (compile-form (caddr form) env ti)
+             (let ((fd (alloc-fp-reg)))
+               (compile-v4-unboxed (cadddr form) env fd)
+               (emit-ir :v4-lane-store ta ti fd)
+               (when dest (%emit-v4-box dest fd))
+               (free-fp-reg))
+             (free-temp-reg) (free-temp-reg))
+           (compile-call (car form) (cdr form) env dest)))
+      ((%v4-tree-fits-p form env)
+       (let ((fd (alloc-fp-reg)))
+         (compile-v4-unboxed form env fd)
+         (%emit-v4-box dest fd)
+         (free-fp-reg)))
+      (t (compile-call (car form) (cdr form) env dest)))))
+
 (defun compile-add (args env dest)
   "Compile (+ args...).  Fixnum fast path; ratio/mixed via GENERIC-ADD."
   (when (%single-float-arith-applicable-p args env)
@@ -20008,6 +20147,14 @@
       (:fp-sub 4)
       (:fp-mul 4)
       (:fp-div 4)
+      (:v4-lane-load 4)
+      (:v4-lane-store 4)
+      (:v4-dup 3)
+      (:v4-dup-lane-load 4)
+      (:v4-add 4)
+      (:v4-sub 4)
+      (:v4-mul 4)
+      (:v4-div 4)
       (:add   4)
       (:sub   4)
       (:adds  4)
@@ -20290,6 +20437,14 @@
           (:fp-sub (mvm-fp-sub buf (second insn) (third insn) (fourth insn)))
           (:fp-mul (mvm-fp-mul buf (second insn) (third insn) (fourth insn)))
           (:fp-div (mvm-fp-div buf (second insn) (third insn) (fourth insn)))
+          (:v4-lane-load (mvm-v4-lane-load buf (second insn) (third insn) (fourth insn)))
+          (:v4-lane-store (mvm-v4-lane-store buf (second insn) (third insn) (fourth insn)))
+          (:v4-dup (mvm-v4-dup buf (second insn) (third insn)))
+          (:v4-dup-lane-load (mvm-v4-dup-lane-load buf (second insn) (third insn) (fourth insn)))
+          (:v4-add (mvm-v4-add buf (second insn) (third insn) (fourth insn)))
+          (:v4-sub (mvm-v4-sub buf (second insn) (third insn) (fourth insn)))
+          (:v4-mul (mvm-v4-mul buf (second insn) (third insn) (fourth insn)))
+          (:v4-div (mvm-v4-div buf (second insn) (third insn) (fourth insn)))
 
           ;; ---- 3-reg instructions ----
           (:add

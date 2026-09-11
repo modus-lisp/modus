@@ -8,7 +8,9 @@ const fs = require('fs');
 const path = require('path');
 
 const root = __dirname;
-const port = parseInt(process.argv[2] || '8080', 10);
+const args = process.argv.slice(2);
+const noCoi = args.includes('--no-coi');   // emulate GitHub Pages: no COOP/COEP headers
+const port = parseInt(args.find((a) => !a.startsWith('--')) || '8080', 10);
 const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.mvmw': 'application/octet-stream', '.gz': 'application/octet-stream' };
 
 http.createServer((req, res) => {
@@ -16,11 +18,11 @@ http.createServer((req, res) => {
   if (p === '/') p = '/index.html';
   const file = path.join(root, path.normalize(p));
   if (!file.startsWith(root) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) { res.writeHead(404); res.end('not found'); return; }
-  res.writeHead(200, {
-    'Content-Type': types[path.extname(file)] || 'application/octet-stream',
-    'Cross-Origin-Opener-Policy': 'same-origin',
-    'Cross-Origin-Embedder-Policy': 'require-corp',
-    'Cache-Control': 'no-cache',
-  });
+  const headers = { 'Content-Type': types[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-cache' };
+  if (!noCoi) {
+    headers['Cross-Origin-Opener-Policy'] = 'same-origin';
+    headers['Cross-Origin-Embedder-Policy'] = 'require-corp';
+  }
+  res.writeHead(200, headers);
   fs.createReadStream(file).pipe(res);
-}).listen(port, () => console.log(`serving ${root} on http://localhost:${port}/`));
+}).listen(port, () => console.log(`serving ${root} on http://localhost:${port}/${noCoi ? ' (no COOP/COEP — Pages emulation)' : ''}`));

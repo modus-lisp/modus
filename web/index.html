@@ -3,6 +3,9 @@
 <head>
 <meta charset="utf-8">
 <title>Modus in the browser</title>
+<!-- Cross-origin isolation on hosts (GitHub Pages) that cannot set COOP/COEP
+     headers.  Must load before the app script. -->
+<script src="coi-serviceworker.js"></script>
 <style>
   html, body { height: 100%; margin: 0; background: #111; color: #ddd; font: 14px/1.35 ui-monospace, Menlo, Consolas, monospace; }
   #term { box-sizing: border-box; height: calc(100% - 2.2em); padding: 8px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
@@ -41,21 +44,34 @@
     term.scrollTop = term.scrollHeight;
   };
   if (!crossOriginIsolated) {
-    say('This page must be served cross-origin isolated (COOP/COEP headers) so the worker can block on stdin. Use web/serve.js.\n', 'err');
-    status.textContent = 'not isolated';
+    // coi-serviceworker.js registers a worker and reloads once; the reloaded
+    // page is isolated.  Wait quietly for that unless it reported it cannot.
+    if (window.coiStatus === 'unavailable') {
+      say('This page needs cross-origin isolation (COOP/COEP), which requires either\n'
+        + 'those response headers or a service worker over https. Neither is available\n'
+        + 'here. Serve with web/serve.js, or open the GitHub Pages URL over https.\n', 'err');
+      status.textContent = 'not isolated';
+    } else {
+      status.textContent = 'enabling cross-origin isolation…';
+    }
     return;
   }
-  const fetchBytes = async (url, label) => {
+  // Try BASE.gz first (GitHub Pages ships gzipped artifacts), then BASE
+  // (local dev via serve.js has the plain files).
+  const fetchBytes = async (base, label) => {
     status.textContent = 'fetching ' + label + '…';
-    const r = await fetch(url);
-    if (!r.ok) return null;
-    let stream = r.body;
-    if (url.endsWith('.gz')) stream = stream.pipeThrough(new DecompressionStream('gzip'));
-    return await new Response(stream).arrayBuffer();
+    for (const url of [base + '.gz', base]) {
+      const r = await fetch(url);
+      if (!r.ok) continue;
+      let stream = r.body;
+      if (url.endsWith('.gz')) stream = stream.pipeThrough(new DecompressionStream('gzip'));
+      return await new Response(stream).arrayBuffer();
+    }
+    return null;
   };
   const mvmw = await fetchBytes('modus.mvmw', 'bytecode');
   if (!mvmw) { say('modus.mvmw not found: run sbcl --script mvm/build-web.lisp\n', 'err'); return; }
-  const core = await fetchBytes('modus.core.gz', 'core');
+  const core = await fetchBytes('modus.core', 'core');
   if (!core) say('(no core snapshot: cold boot takes a long time)\n', 'log');
 
   // http relay: the worker parks a request here and blocks; we fetch it.

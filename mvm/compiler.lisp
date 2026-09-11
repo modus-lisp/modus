@@ -2419,6 +2419,35 @@
    after GC), it is reset at every MVM-COMPILE-TOPLEVEL, and every writer of
    a macro table clears it (see %MEXP-MEMO-INVALIDATE).")
 (defun %mexp-memo-invalidate () (setq *mexp-memo* nil))
+
+;;; The memo is keyed by the form's ADDRESS in the image, and the copying
+;;; collector moves every form: after a GC every entry MISSED (the EQ
+;;; validation kept hits honest but nothing found them), so each analysis
+;;; pass re-expanded the whole tree, whose expansions allocate, which
+;;; brings the next GC sooner — mill's matmul-core (12 kernel macro arms)
+;;; took >50 minutes to compile while its pre-expanded form took 1 s.
+;;; Re-key the live entries whenever the collection count changes.
+(defvar *mexp-memo-gc* -1
+  "The %GC-COUNT at which *MEXP-MEMO* was last (re)keyed.")
+(defun %mexp-memo-epoch ()
+  (if (fboundp (quote %gc-count)) (funcall (quote %gc-count)) 0))
+(defun %mexp-memo-rekey ()
+  "Rebuild the address-keyed memo from its (form . expansion) entries — the
+   forms are live objects the collector has already moved."
+  (let ((old *mexp-memo*)
+        (new (make-hash-table :test 'eql)))
+    (when old
+      (maphash (lambda (k e) (declare (ignore k))
+                 (setf (gethash (%form-key (car e)) new) e))
+               old))
+    (setq *mexp-memo* new)))
+(defun %mexp-memo-sync ()
+  "Call before a memo lookup: re-key after a collection."
+  (let ((g (%mexp-memo-epoch)))
+    (unless (eql g *mexp-memo-gc*)
+      (when *mexp-memo* (%mexp-memo-rekey))
+      (setq *mexp-memo-gc* g))))
+
 (defun %form-key (form)
   "HOST stub: structural hash (collisions only cost a miss — entries are
    EQ-validated).  mvm-eval.lisp overrides with the object's address."
@@ -2426,7 +2455,7 @@
 (defun macroexpand-1-mvm (form)
   (if (not (consp form))
       (%macroexpand-1-mvm-raw form)
-      (let* ((k (%form-key form))
+      (let* ((k (progn (%mexp-memo-sync) (%form-key form)))
              (memo (or *mexp-memo* (setq *mexp-memo* (make-hash-table :test 'eql))))
              (e (gethash k memo)))
         (if (and e (eq (car e) form))
@@ -9271,9 +9300,11 @@
                                  (and (or (and a (symbolp a)) (consp a))
                                       (%expr-width a env)))))
                       (cdr form)))
-              ;; a macro: expand and judge the expansion
-              (t (multiple-value-bind (exp expanded) (%macroexpand-1-mvm-raw form)
-                   (and expanded (%fp-scope-call-free-p exp env (1+ depth)))))))))))))
+              ;; a macro: expand and judge the expansion.  (%macroexpand-1-mvm-raw
+              ;; returns the CONS (expansion . expanded-p), not values.)
+              (t (let ((r (%macroexpand-1-mvm-raw form)))
+                   (and (consp r) (cdr r)
+                        (%fp-scope-call-free-p (car r) env (1+ depth)))))))))))))
 
 ;; *fp-locals-force*, *unused-value-form* and *setq-value-unused* are
 ;; defined at the top of the file, beside *temp-reg-counter*: a special must
@@ -10937,6 +10968,30 @@
              (cl-loop-keyword-p (cadr rest)))
     (cons (car rest) (cdr rest))))
 
+(defun %loop-iter-intro-kw-p (x)
+  "True when X is a token that INTRODUCES an iteration value (IN / ON /
+   ACROSS / = / FROM / UPFROM / DOWNFROM / TO / UPTO / DOWNTO / ABOVE /
+   BELOW / BY / BEING / THEN).  These are deliberately absent from
+   CL-LOOP-KEYWORD-P (so a value form headed by one is not mistaken for a
+   clause boundary), which is exactly why the FOR type-spec heuristic must
+   test for them separately — see its call site."
+  (and (symbolp x)
+       (let ((h (normalize-name x)))
+         (or (= h 516392248)    ; IN
+             (= h 202641342)    ; ON
+             (= h 18430408)     ; ACROSS
+             (= h 190453506)    ; =
+             (= h 220023313)    ; FROM
+             (= h 528235156)    ; UPFROM
+             (= h 358174843)    ; DOWNFROM
+             (= h 418976108)    ; TO
+             (= h 23755929)     ; UPTO
+             (= h 404037478)    ; DOWNTO
+             (= h 372946816)    ; ABOVE
+             (= h 128223996)    ; BELOW
+             (= h 517285148)    ; BY
+             (= h 262800624)))))  ; BEING
+
 (defun %loop-simple-type-spec-p (x)
   "CLHS 6.1.1.7 simple-type-spec — the four type specs that may appear
    BARE (no OF-TYPE) directly after a FOR/AS/WITH variable:
@@ -11332,7 +11387,16 @@
              ;;  (b) the pre-existing heuristic: any non-keyword symbol whose
              ;;      FOLLOWING token IS a loop keyword (so we don't eat an
              ;;      iter form like `IN (foo)`).
+             ;; The FOLLOWING-token heuristic (b) must NOT fire when
+             ;; (car rest) is itself an iteration-INTRODUCING token (IN / ON /
+             ;; ACROSS / = / FROM / …): those are absent from cl-loop-keyword-p
+             ;; on purpose, so `(loop for a IN as …)` — a list variable that
+             ;; happens to be the keyword AS — read `in` as a type spec, ate
+             ;; it, and then parsed `as collect` as a new clause, emitting a
+             ;; bare infinite `(loop AS …)`.  mill's matmul kernels loop over
+             ;; a variable literally named AS, so every kernel expansion hung.
              (when (and rest (cdr rest)
+                        (not (%loop-iter-intro-kw-p (car rest)))
                         (or (%loop-simple-type-spec-p (car rest))
                             (and (symbolp (car rest))
                                  (not (cl-loop-keyword-p (car rest)))

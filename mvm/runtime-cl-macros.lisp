@@ -137,11 +137,21 @@
                                 ((null result-forms) nil)
                                 ((null (cdr result-forms)) (car result-forms))
                                 (t (cons 'progn result-forms)))))
-             (list 'block 'nil
-                   (list 'let* (nreverse vars)
-                         (cons 'loop
-                               (cons (list 'when test (list 'return result-form))
-                                     (append body step-setqs)))))))))"
+             ;; Leading (declare ...) forms go on the LET*, not into the LOOP
+             ;; body where a declaration is illegal and was silently dropped
+             ;; (so a DO var declared in the body compiled untyped).
+             (let ((decls nil) (rest body))
+               (loop (unless (and rest (consp (car rest)) (symbolp (caar rest))
+                                  (string= (symbol-name (caar rest)) \"DECLARE\"))
+                       (return nil))
+                     (setq decls (cons (car rest) decls))
+                     (setq rest (cdr rest)))
+               (list 'block 'nil
+                     (cons 'let* (cons (nreverse vars)
+                           (append (nreverse decls)
+                                   (list (cons 'loop
+                                         (cons (list 'when test (list 'return result-form))
+                                               (append rest step-setqs)))))))))))))"
 
     "(defmacro do* (var-specs end-spec &rest body)
        (cons 'do (cons var-specs (cons end-spec body))))"
@@ -174,6 +184,16 @@
                     ;; iteration, so exceeding a fixnum would take 2^62
                     ;; iterations.  N is NOT declared (a bignum count is legal).
                     (list (list 'declare (list 'type 'fixnum var))))
+                ;; The body's own leading declarations belong on this LET too
+                ;; (inside the LOOP's PROGN they were silently dropped).
+                (let ((decls nil) (rest body))
+                  (loop (unless (and rest (consp (car rest)) (symbolp (caar rest))
+                                     (string= (symbol-name (caar rest)) \"DECLARE\"))
+                          (return nil))
+                        (setq decls (cons (car rest) decls))
+                        (setq rest (cdr rest)))
+                  (setq body rest)
+                  (nreverse decls))
                 (list
                  (list 'loop
                    (list 'when (list '>= var n) (list 'return result))

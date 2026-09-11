@@ -832,6 +832,29 @@
 (defvar *setq-value-unused* nil
   "Bound by the SETQ dispatch: T when the SETQ form being compiled is the
    discarded statement named by *UNUSED-VALUE-FORM*.")
+
+;;; Compile-context ring trace.  A 24-slot ring of the operator names
+;;; compile-form has entered, newest last, so the temp-register overflow
+;;; error can say WHERE in the tree it happened — the image compiler cannot
+;;; be traced from outside (native callers ignore redefinition), and the
+;;; host compiler does not reproduce every in-image divergence.  Lazily
+;;; created (a defvar-initialised array touched at boot kills the image).
+(defvar *cf-trace* nil)
+(defvar *cf-trace-i* 0)
+(defun %cf-trace-note (form)
+  ;; Both lazily initialised: a defvar initform does not run at boot, so
+  ;; *cf-trace-i* arrives NIL in the image (see Active Limitation #7).
+  (unless *cf-trace* (setq *cf-trace* (make-array 24 :initial-element nil)))
+  (unless (integerp *cf-trace-i*) (setq *cf-trace-i* 0))
+  (setf (aref *cf-trace* (mod *cf-trace-i* 24)) (if (consp form) (car form) form))
+  (setq *cf-trace-i* (1+ *cf-trace-i*)))
+(defun %cf-trace-dump ()
+  (if *cf-trace*
+      (let ((out nil))
+        (dotimes (k 24 (nreverse out))
+          (let ((e (aref *cf-trace* (mod (+ *cf-trace-i* k) 24))))
+            (when e (push e out)))))
+      nil))
 (defvar *fp-diag* nil
   "Diagnostic counters for the discarded-statement chain: 0 tagbody marks,
    1 loop marks, 2 when/unless marks, 3 compile-form carry-overs, 4 SETQ
@@ -1268,7 +1291,8 @@
    translator automatically maps to stack frame locations."
   (let ((reg (+ +vreg-v4+ *temp-reg-counter*)))
     (when (> reg +vreg-v15+)
-      (error "MVM compiler: out of temporary registers (need >12)"))
+      (error "MVM compiler: out of temporary registers (need >12) temps=~a fp=~a recent=~a"
+             *temp-reg-counter* *fp-reg-counter* (%cf-trace-dump)))
     (incf *temp-reg-counter*)
     reg))
 
@@ -4171,6 +4195,19 @@
     (lambda (form)
       `(progn ,@(cdr form))))
 
+  ;; DO/DO*/DOTIMES body declarations: CLHS puts them on the implicit
+  ;; binding form, so they must be hoisted above the loop's TAGBODY.
+  (defun %leading-declares (body)
+    (let ((out nil))
+      (loop while (and body (consp (car body)) (symbolp (caar body))
+                       (string= (symbol-name (caar body)) "DECLARE"))
+            do (push (car body) out) (setq body (cdr body)))
+      (nreverse out)))
+  (defun %strip-leading-declares (body)
+    (loop while (and body (consp (car body)) (symbolp (caar body))
+                     (string= (symbol-name (caar body)) "DECLARE"))
+          do (setq body (cdr body)))
+    body)
   ;; DO — (do ((var init step)...) (end-test result...) body...)
   (mvm-define-macro "DO"
     (lambda (form)
@@ -4201,10 +4238,15 @@
                                   (declare (ignore s))
                                   (%mvm-gensym (concatenate 'string "DO-" (symbol-name v))))
                                 vars steps))
+          ;; Leading (declare ...) forms belong on the LET, not inside the
+          ;; TAGBODY (where a declaration is illegal and was silently dropped —
+          ;; so `(do ((i 0 (+ i 4))) (...) (declare (type fixnum i)) ...)`
+          ;; compiled I untyped; mill's do-vectorized kernels hit this).
           `(let ,(mapcar #'list vars inits)
+             ,@(%leading-declares body)
              (loop
                (when ,test (return (progn ,@(or results '(nil)))))
-               (tagbody ,@body)
+               (tagbody ,@(%strip-leading-declares body))
                ,@(let ((bind nil) (assign nil))
                    (dolist (pair (mapcar #'list vars steps tmpvars))
                      (let ((v (car pair)) (s (cadr pair)) (tv (caddr pair)))
@@ -4233,9 +4275,10 @@
               (test (car end-clause))
               (results (cdr end-clause)))
           `(let* ,(mapcar #'list vars inits)
+             ,@(%leading-declares body)
              (loop
                (when ,test (return (progn ,@(or results '(nil)))))
-               (tagbody ,@body)
+               (tagbody ,@(%strip-leading-declares body))
                ,@(remove nil
                    (mapcar (lambda (v s) (when (car s) `(setq ,v ,(cadr s))))
                            vars steps))))))))
@@ -5360,6 +5403,7 @@
   ;; WHEN dispatch below sees it (*unused-value-form* is identity-keyed).
   (let* ((%stmt-unused (eq form *unused-value-form*))
          (form (macroexpand-mvm form)))
+   (%cf-trace-note form)
    (when %stmt-unused (%fp-diag-bump 3))
    (let ((*unused-value-form* (if %stmt-unused form *unused-value-form*)))
     (cond
@@ -13492,11 +13536,15 @@
                  (append
                   (when (and (integerp count-form) (>= count-form 0))
                     (list (list 'declare (list 'type (list 'integer 0 count-form) var))))
+                  ;; The body's own leading declarations (e.g. a type for VAR
+                  ;; when the count is not a literal) belong on this LET too;
+                  ;; inside the TAGBODY they were silently dropped.
+                  (%leading-declares body)
                   (list
                  (list 'loop
                        (list 'if (list '< var count-form)
                              (list 'progn
-                                   (cons 'tagbody body)
+                                   (cons 'tagbody (%strip-leading-declares body))
                                    (list 'setq var (list '1+ var)))
                              (list 'return (or result-form nil))))))))
      env dest)))
@@ -15141,9 +15189,13 @@
   (cond ((symbolp f) t)
         ((integerp f) t)
         ((and (consp f) (symbolp (car f)))
-         (and (member (symbol-name (car f)) '("+" "-" "*" "1+" "1-" "LOGAND" "ASH")
-                      :test #'string=)
-              (every #'%simple-index-form-p (cdr f))))
+         (cond
+           ;; (THE type index) — mill writes every index as (the dim ...)
+           ((and (string= (symbol-name (car f)) "THE") (consp (cdr f)) (consp (cddr f)))
+            (%simple-index-form-p (caddr f)))
+           (t (and (member (symbol-name (car f)) '("+" "-" "*" "1+" "1-" "LOGAND" "ASH")
+                           :test #'string=)
+                   (every #'%simple-index-form-p (cdr f))))))
         (t nil)))
 
 (defun %fp-unary-normalize (form)
@@ -15156,10 +15208,19 @@
               (t form)))
       form))
 
+(defun %tree-expand (form)
+  "See through USER macros before a tree walker inspects an operator name:
+   mill spells its kernels with F32V+ / F32V-REF macros that expand to the
+   %F32V-* primitives, and a walker that only looked at the raw head never
+   recognised such a subtree — every mill vector expression silently took
+   the BOXED generic-call path (and a 6-deep chain then overflowed the temp
+   registers inside a loop).  Memoised (%mexp-memo), so this is cheap."
+  (if (consp form) (macroexpand-mvm form) form))
+
 (defun %fp-tree-need (form env)
   "FP registers needed to evaluate FORM unboxed, or NIL when FORM is not a
    call-free single-float tree."
-  (let ((form (%fp-unary-normalize form)))
+  (let ((form (%fp-unary-normalize (%tree-expand form))))
     (cond
       ((typep form 'single-float) 1)
       ((and (consp form) (name-eq (car form) "QUOTE") (consp (cdr form))
@@ -15192,7 +15253,7 @@
 (defun compile-float-unboxed (form env fd)
   "Compile the single-float tree FORM (caller checked %fp-tree-need) into
    FP vreg FD, unboxed."
-  (let ((form (%fp-unary-normalize form)))
+  (let ((form (%fp-unary-normalize (%tree-expand form))))
     (cond
       ;; an FP-resident local: a register move, no unbox
       ((and (symbolp form)
@@ -15207,9 +15268,12 @@
          (emit-ir :fp-unbox fd tmp)
          (free-temp-reg)))
       ((name-eq (car form) "AREF")
-       (let ((ta (alloc-temp-reg)) (ti (alloc-temp-reg)))
-         (compile-form (cadr form) env ta)
+       ;; index first (the recursing operand), then the array variable —
+       ;; never two temps held across a recursion (spill-gate discipline).
+       (let ((ti (alloc-temp-reg)) (ta nil))
          (compile-form (caddr form) env ti)
+         (setq ta (alloc-temp-reg))
+         (compile-form (cadr form) env ta)
          (emit-ir :fp-lane-load fd ta ti)
          (free-temp-reg) (free-temp-reg)))
       (t
@@ -15253,6 +15317,7 @@
 
 (defun %v4-tree-need (form env)
   "FP registers needed to evaluate the vector tree FORM unboxed, or NIL."
+  (let ((form (%tree-expand form)))
   (cond
     ((symbolp form) (and (%declared-f32v-var-p form env) 1))
     ((and (consp form) (symbolp (car form)))
@@ -15277,7 +15342,7 @@
                      (b (%v4-tree-need (caddr form) env)))
                  (and a b (max a (1+ b))))))
          (t nil))))
-    (t nil)))
+    (t nil))))
 
 (defun %v4-tree-fits-p (form env)
   (let ((need (%v4-tree-need form env)))
@@ -15291,6 +15356,7 @@
 
 (defun compile-v4-unboxed (form env fd)
   "Compile the vector tree FORM (caller checked %v4-tree-need) into FP vreg FD."
+  (let ((form (%tree-expand form)))
   (cond
     ((and (symbolp form)                             ; FP-resident vector local
           (let ((b (env-lookup env form))) (and b (eq (binding-location b) :fpvreg))))
@@ -15306,11 +15372,17 @@
      (let ((n (symbol-name (car form))))
        (cond
          ((or (string= n "%F32V-REF") (string= n "%F32V-BROADCAST-REF"))
-          (let ((ta (alloc-temp-reg)) (ti (alloc-temp-reg)))
-            (compile-form (cadr form) env ta)
+          ;; Index FIRST (the only operand that recurses), then the array —
+          ;; a declared array VARIABLE, a flat load.  Holding two temps
+          ;; across the index recursion broke the %temps-must-spill-p
+          ;; budget (leaf emitters may hold at most a 3-temp window).
+          (let ((ti (alloc-temp-reg)))
             (compile-form (caddr form) env ti)
-            (emit-ir (if (string= n "%F32V-REF") :v4-lane-load :v4-dup-lane-load) fd ta ti)
-            (free-temp-reg) (free-temp-reg)))
+            (let ((ta (alloc-temp-reg)))
+              (compile-form (cadr form) env ta)
+              (emit-ir (if (string= n "%F32V-REF") :v4-lane-load :v4-dup-lane-load) fd ta ti)
+              (free-temp-reg))
+            (free-temp-reg)))
          ((string= n "%F32V-BROADCAST")
           (compile-float-unboxed (cadr form) env fd)  ; scalar single into FD
           (emit-ir :v4-dup fd fd))
@@ -15320,7 +15392,7 @@
             (let ((ft (alloc-fp-reg)))
               (compile-v4-unboxed (caddr form) env ft)
               (emit-ir op fd fd ft)
-              (free-fp-reg)))))))))
+              (free-fp-reg))))))))))
 
 (defun %emit-v4-box (dest fd)
   "DEST ← a fresh 4-lane packed single-float vector holding FD's lanes."
@@ -15342,15 +15414,35 @@
        (if (and (consp (cdr form)) (consp (cddr form)) (consp (cdddr form))
                 (%declared-f32-array-var-p (cadr form) env)
                 (%v4-tree-fits-p (cadddr form) env))
-           (let ((ta (alloc-temp-reg)) (ti (alloc-temp-reg)))
-             (compile-form (cadr form) env ta)
-             (compile-form (caddr form) env ti)
-             (let ((fd (alloc-fp-reg)))
-               (compile-v4-unboxed (cadddr form) env fd)
-               (emit-ir :v4-lane-store ta ti fd)
-               (when dest (%emit-v4-box dest fd))
-               (free-fp-reg))
-             (free-temp-reg) (free-temp-reg))
+           ;; Tree FIRST (nothing held: the vector tree is call-free and the
+           ;; index side-effect-free, so this order is unobservable), then
+           ;; index, then the array variable — never two temps held across
+           ;; the tree recursion.
+           (if (%simple-index-form-p (caddr form))
+               ;; call-free index: the tree cannot be clobbered by a call in
+               ;; the index, so nothing is held across the tree recursion
+               (let ((fd (alloc-fp-reg)))
+                 (compile-v4-unboxed (cadddr form) env fd)
+                 (let ((ti (alloc-temp-reg)))
+                   (compile-form (caddr form) env ti)
+                   (let ((ta (alloc-temp-reg)))
+                     (compile-form (cadr form) env ta)
+                     (emit-ir :v4-lane-store ta ti fd)
+                     (free-temp-reg))
+                   (free-temp-reg))
+                 (when dest (%emit-v4-box dest fd))
+                 (free-fp-reg))
+               ;; a possibly-calling index: evaluate it (and the array) before
+               ;; any FP register is live, as before
+               (let ((ta (alloc-temp-reg)) (ti (alloc-temp-reg)))
+                 (compile-form (cadr form) env ta)
+                 (compile-form (caddr form) env ti)
+                 (let ((fd (alloc-fp-reg)))
+                   (compile-v4-unboxed (cadddr form) env fd)
+                   (emit-ir :v4-lane-store ta ti fd)
+                   (when dest (%emit-v4-box dest fd))
+                   (free-fp-reg))
+                 (free-temp-reg) (free-temp-reg)))
            (compile-call (car form) (cdr form) env dest)))
       ((%v4-tree-fits-p form env)
        (let ((fd (alloc-fp-reg)))
@@ -18969,17 +19061,34 @@
     ;; compiled first so the value tree runs with no FP register live
     ;; across a possibly-calling index form.
     (when (%fp-tree-fits-p val-form env)
-      (let ((ta (alloc-temp-reg)) (ti (alloc-temp-reg)))
-        (compile-form arr-form env ta)
-        (compile-form idx-form env ti)
-        (let ((fd (alloc-fp-reg)))
-          (compile-float-unboxed val-form env fd)
-          (emit-ir :fp-lane-store ta ti fd)
-          (when dest
-            (emit-ir :gc-check)
-            (emit-ir :fp-box dest fd))
-          (free-fp-reg))
-        (free-temp-reg) (free-temp-reg))
+      (if (%simple-index-form-p idx-form)
+          ;; call-free index: value tree FIRST with nothing held, then index,
+          ;; then the array variable (spill-gate discipline: never two temps
+          ;; held across the tree recursion)
+          (let ((fd (alloc-fp-reg)))
+            (compile-float-unboxed val-form env fd)
+            (let ((ti (alloc-temp-reg)))
+              (compile-form idx-form env ti)
+              (let ((ta (alloc-temp-reg)))
+                (compile-form arr-form env ta)
+                (emit-ir :fp-lane-store ta ti fd)
+                (free-temp-reg))
+              (free-temp-reg))
+            (when dest
+              (emit-ir :gc-check)
+              (emit-ir :fp-box dest fd))
+            (free-fp-reg))
+          (let ((ta (alloc-temp-reg)) (ti (alloc-temp-reg)))
+            (compile-form arr-form env ta)
+            (compile-form idx-form env ti)
+            (let ((fd (alloc-fp-reg)))
+              (compile-float-unboxed val-form env fd)
+              (emit-ir :fp-lane-store ta ti fd)
+              (when dest
+                (emit-ir :gc-check)
+                (emit-ir :fp-box dest fd))
+              (free-fp-reg))
+            (free-temp-reg) (free-temp-reg)))
       (return-from compile-aset nil))
     (return-from compile-aset
       (compile-form (list '%f32-aset arr-form idx-form val-form) env dest)))

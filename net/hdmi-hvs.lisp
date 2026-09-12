@@ -149,10 +149,15 @@
    it is immune to interpret-vs-JIT speed) until the HVS reads 32-bit.  Returns T
    if the window opened within MS milliseconds, NIL on timeout."
   (let ((deadline (+ (get-internal-real-time)
-                     (truncate (* ms internal-time-units-per-second) 1000))))
+                     (truncate (* ms internal-time-units-per-second) 1000)))
+        (i 0))
     (loop
       (when (not (hvs-8bit-p)) (return t))
-      (when (> (get-internal-real-time) deadline) (return nil)))))
+      (when (> (get-internal-real-time) deadline) (return nil))
+      ;; hard iteration cap — a belt-and-suspenders guard so a stuck/unadvancing
+      ;; timer can NEVER hang the routine (a hang here wedged the board once).
+      (when (> i 200000000) (return nil))
+      (setq i (+ i 1)))))
 
 (defun hvs-active-channel ()
   "Which display channel the firmware left ENABLEd (bit31 of DISPCTRLX).  Meaningful
@@ -200,6 +205,27 @@
   (hvs-slot-wr (+ slot 6) pitch)
   (hvs-slot-wr (+ slot 7) #x80000000))
 
+(defun hvs-drive ()
+  "Drive our dlist NOW.  Call ONLY when the 32-bit window is open (hvs-8bit-p is
+   NIL).  Fills the scratch buffer, composes a unity RGBA8888 plane over a GREEN
+   background on the firmware's active channel, and points the channel at it.
+   Split out of hvs-overlay-on so a caller can poll the window itself (e.g. over
+   serial) instead of relying on an in-routine spin-wait."
+  (let* ((ch (hvs-active-channel)) (bw 320) (bh 180) (sx 800) (sy 450)
+         (buf #x12000000) (slot 900) (bk (+ #x44 (* ch #x10))) (lst (+ #x20 (* ch 4))))
+    (hvs-fill buf (* bw bh) #x00FF00FF)
+    (memory-barrier)
+    (hvs-plane slot
+               (logior #x40000000 (ash 7 24) #x10 7)
+               (logior #xFF000000 (ash sy 12) sx)
+               (logior (ash bh 16) bw)
+               (logior #xC0000000 buf)
+               (* bw 4))
+    (hvs-wr bk (logior #x01000000 #x00FF00))
+    (hvs-wr lst slot)
+    (list :chan ch :dispctrl (hvs-rd #x00) :dispctrlx (hvs-dispctrlx ch)
+          :displist (hvs-displist ch) :ctl0 (hvs-slot-rd slot))))
+
 (defun hvs-overlay-on ()
   "MILESTONE 1: atomically take the HVS from the firmware and DRIVE it ourselves.
    Releases the FB, catches the 32-bit window, fills a small scratch buffer, and
@@ -209,7 +235,7 @@
    hold the window with no interactive round-trip.  :win :no-window means the
    firmware never handed over (display untouched)."
   (hvs-rel-fb)
-  (if (not (hvs-wait-window 3000))
+  (if (not (hvs-wait-window 12000))
       (list :win :no-window)
       (let* ((ch (hvs-active-channel)) (bw 320) (bh 180) (sx 800) (sy 450)
              (buf #x12000000) (slot 900) (bk (+ #x44 (* ch #x10))) (lst (+ #x20 (* ch 4))))
@@ -221,7 +247,7 @@
                    (logior (ash bh 16) bw)                  ; POS2: srcH|srcW
                    (logior #xC0000000 buf)                  ; PTR0: uncached VC bus alias
                    (* bw 4))                                ; SRC_PITCH bytes
-        (hvs-wr bk (logior #x01000000 #x002020))     ; DISPBKGND: FILL | dark teal
+        (hvs-wr bk (logior #x01000000 #x00FF00))     ; DISPBKGND: FILL | GREEN (low byte 0 -> 8-bit miss shows black, 32-bit shows green)
         (hvs-wr lst slot)                            ; point channel's dlist at ours (latches next frame)
         (list :win :open :chan ch :slot slot :dispctrl (hvs-rd #x00)
               :dispctrlx (hvs-dispctrlx ch) :bkgnd (hvs-rd bk)

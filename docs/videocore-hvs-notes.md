@@ -182,6 +182,53 @@ pushing over SSH. Fix the plane render (coherency: fill via the uncached alias o
 add a cache clean; verify CTL0 WORDS/format/pixel-order against a real dumped
 firmware plane once we can hold the window with our own dlist).
 
+### Session 3 continued — the window-open is NON-DETERMINISTIC (the real blocker)
+
+Extensive board work with `hvs-drive` (split out of `hvs-overlay-on` so the caller
+polls the window instead of an in-routine spin-wait) and a serial-console driver
+(the mini-UART is independent of the RTL8153, so it survives a release — the right
+way to drive this). Findings:
+
+- **The release → 32-bit-window handover is NOT reliably reproducible.** On the
+  boot right after the user's **dongle power-cycle** (recJ), releases opened the
+  window repeatedly (`0x9A0F00FF`). On later warm-netboot boots (recN), the window
+  **never opened** across many releases — with or without `(ssh-boot)` (USB/net up),
+  fresh boot or not. So it is neither USB-init-gated nor a simple one-shot.
+- **Leading theory:** a warm U-Boot netboot does NOT cold-reset the VideoCore
+  firmware/display block. An earlier **hung `hvs-overlay-on`** (a non-terminating
+  `hvs-wait-window` when the timer didn't advance — since hardened with an iteration
+  cap) appears to have left the VC in a state where the FB-release handover no longer
+  fires, and warm netboots inherit it. recJ worked because the dongle power-cycle
+  (closer to a real reset) preceded it. **A full COLD power-cycle of the Zero (not
+  just the dongle) is likely required to restore the deterministic-handover state.**
+- **`hvs-wait-window` hung the board once** (timer didn't advance → infinite spin →
+  no serial echo → wedge). Fixed with a hard iteration cap. Lesson: any on-board
+  spin MUST have a non-time bound too.
+- **Serial-console parsing gotcha:** the SSH REPL prefixes results with `= `, the
+  SERIAL REPL prints the bare value (`12`, `T`, `NIL`) then `> `. A poll parser that
+  looked for `= ` silently matched nothing and missed an open window. Parse the bare
+  value over serial (`"NIL" in out`).
+- **Confirmed twice:** driving the HVS at 32-bit changes the HDMI output (console
+  gone → solid fill). We have NOT yet shown a *chosen* color (green) because the
+  window has not opened on a boot where the correct drive was queued.
+
+**Where this leaves it.** The ARM-side FB-release handover is real but
+non-deterministic on this firmware/rig, which makes interactive milestone work
+unreliable. Two ways forward, in order of preference:
+1. **Pin the deterministic trigger.** Get a clean state (COLD power-cycle the Zero),
+   then on that boot run the baked/serial `rel-fb` + poll(correct) + `hvs-drive` and
+   confirm GREEN. If cold-boot reliably opens the window, bake the routine and the
+   plane work proceeds. If it is still flaky, investigate the firmware/EDID/HDMI
+   state that gates the handover.
+2. **VPU-side (`lk-overlay`).** If the ARM handover stays non-deterministic, run the
+   display component on the VideoCore VPU where the HVS is natively 32-bit and no
+   firmware handover is needed. Bigger, but deterministic.
+
+Also still open (independent of the above): the unity **plane** did not render (only
+the background fill) — needs the buffer coherent (no runtime `dc-cvac` primitive
+exists; use an uncached buffer region or add a cache-clean) and the dlist
+CTL0/format/pixel-order verified against a real dumped firmware plane.
+
 ### The two real paths (SUPERSEDED — kept for context; the small path above wins)
 
 1. **ARM owns the whole display pipeline** (real vc4-style): boot with the

@@ -42,24 +42,156 @@ Register/display-list reference: `videocore-hvs-overlay.md`. Driver + primitives
    **twice** we read a clean, real `DISPCTRL = 0x9A0F00FF` (ENABLE bit set) — proof
    the ARM *can* reach the live HVS. But it is **non-deterministic**.
 
-## Where it stops: partial bus, needs the VCHIQ handover
+## Where it stops: the HVS is 8-bit-wide to the ARM (CORRECTED 2026-09-13)
 
-The reproducible behavior is **byte-partial**: a `u32` write to an HVS register
-latches only its **low 8 bits**, and reads return `0x646F43` in the top 24
-(`write 0x42 → read 0x646F4342`, `0x123 → …23`, `0x456 → …56`). That signature —
-low byte works, high 24 fixed, with rare clean full reads — is a display
-peripheral bus that is only *partway* connected to the ARM.
+**The 2026-09-12 "byte-partial, non-deterministic, needs VCHIQ" conclusion was
+WRONG on the evidence.** Re-decoding the probe logs (they print DECIMAL) and
+re-probing on the live board settles it precisely:
 
-Linux gets clean, stable access because full KMS completes a **firmware handover
-over VCHIQ** (the VideoCore message channel) that fully hands the display block to
-the ARM. The property **mailbox** (all `hdmi-fb.lisp`/`hdmi-hvs.lisp` implement)
-can power and clock the block but cannot perform that handover. So:
+- Every HVS register reads back **`0x646472` in bits[31:8]** and the **low byte
+  of the last value written** in bits[7:0]. Fully **deterministic** (identical
+  reads ×3; `hvsstab`/`hvsconfirm`). `DISPCTRL`=`0x646472FF`, write `0xCAFEBABE`
+  → `0x646472BE`, write `0x123` → `0x64647223`, etc. The banked
+  "occasional clean 0x9A0F00FF" was a misread of this same pattern (low byte `FF`).
+- It is **not a floating bus-keeper**: reading V3D (`0xDEADBEEF`) or the system
+  timer immediately before an HVS read does NOT drag the HVS top-24 — it stays
+  fixed `0x646472`. The HVS block itself drives that constant.
+- **Byte-addressing does not help.** `:u8` reads of lanes 1/2/3 return the fixed
+  `0x72,0x64,0x64`; `:u8` writes to lanes 1/2/3 are ignored. Only **byte lane 0**
+  is a real, writable register.
+- It is **HVS-window-specific, not an ARM-bus limit**: the mailbox, the system
+  timer, and V3D (`0x3FC00000`, reads full-width `0xDEADBEEF`) all do clean
+  32-bit ARM access through the same Device-nGnRnE mapping. So it is **not** our
+  MMU/cache/mem-ref codegen — those are proven good at the same instant.
 
-- **Proven:** the ARM can partially reach the HVS on this hardware (byte writes
-  latch; occasional full real reads). Feasibility is not in question.
-- **Not achieved:** stable 32-bit read/write, which the overlay build needs.
-- **The one barrier left:** the VCHIQ handshake, or running the display code on
-  the VPU (the `lk-overlay` approach). Both are project-sized, not more poking.
+Net: **in the KMS+cma-64 state the ARM can drive only bit[7:0] of any HVS
+register; lanes 1–3 are dead.** That kills the byte-wise workaround AND the
+"compose a scaled-YUV plane on top of the firmware simple-FB" plan — you cannot
+write a 32-bit dlist slot pointer or a CTL0 word through an 8-bit hole.
+
+### The crux mystery (this is the thing to crack next)
+
+Mainline Linux `vc4` on VideoCore IV (Pi 0–3) gets **full 32-bit** HVS access
+with **no VCHIQ, no clock enable, no power-domain call** — it just `ioremap`s
+`0x3f400000` and writes `SCALER_DISPCTRL` directly (verified against
+raspberrypi/linux `vc4_hvs.c`: the `clk_get`/`clk_prepare_enable` path is
+`gen >= VC4_GEN_5` / BCM2711 only; VC-IV relies on always-on firmware clocking
+and direct MMIO). We access the **same address, same Device attributes, same
+power state** and get 8-bit. So the difference is some **software/handover state**
+Linux establishes that we don't — NOT a hardware barrier and NOT VCHIQ. Cracking
+*why Linux gets 32-bit here* is cheaper than committing to a full driver and
+unblocks everything. Power-domain pokes (`hvs-display-on`) did **not** change the
+8-bit behavior (`hvspd.log`), so it is not the firmware power/clock interface.
+
+### CRUX CRACKED (2026-09-13): firmware FB ownership gates HVS width
+
+Tested on the live board (10.0.0.2). Issuing the property-mailbox
+**`FRAMEBUFFER_RELEASE` (tag `0x00048001`)** flips the HVS from the 8-bit view to
+**genuine 32-bit ARM access**: immediately after release the ARM read
+`DISPCTRL=0x9A0F00FF` (ENABLE set), `DISPCTRLX0=0x00000000`, `DISPLIST2=0x02340612`
+— real register values, not the `0x646472` byte-lane artifact. So the barrier was
+never VCHIQ and never a hardware wall: **the firmware owning a console framebuffer
+is what pins the HVS to an 8-bit ARM view; release it and the ARM owns the real
+32-bit HVS.** This matches mainline vc4 exactly (it releases the firmware FB, then
+programs the HVS directly).
+
+**It is transient.** Release-then-only-*read* and the firmware reclaims the idle
+display within a second or two (reads revert to `0x646472xx`). The cure is what
+vc4 does: **release + immediately DRIVE** — write our dlist and keep an HVS channel
+enabled so the display is never idle, so there is nothing for the firmware to
+reclaim. Repeated release without a fresh firmware FB is a near-no-op (the FB is a
+one-shot; re-owning needs a firmware re-alloc or a fresh boot).
+
+**Consequence — the overlay is the SMALL path, not "path A".** We do NOT need to
+own HDMI timing or the pixelvalve (firmware set those up and keeps them). We only:
+release the FB, compose a dlist (re-emit the firmware FB plane if we still want it,
++ our scaled YUV plane), point `SCALER_DISPLISTx` at it, enable the channel, and
+refresh Y/U/V per frame. That is exactly the mechanical build in
+`videocore-hvs-overlay.md`, now unblocked. Reference sequence in `net/hdmi-hvs.lisp`
+`rel-fb`-style FRAMEBUFFER_RELEASE + the dlist emit.
+
+### Follow-up probing (2026-09-13, session 2) — timing + a hard operational constraint
+
+Tried to catch a 32-bit window and dump the firmware's live dlist. Learned three
+things that shape the build:
+
+1. **The handover is ASYNCHRONOUS.** The `FRAMEBUFFER_RELEASE` mailbox returns
+   immediately, but the HVS does not become 32-bit until **~1 second later**, and
+   the firmware then **reclaims** it ~1 s after that. So a read in the *same form*
+   right after `rel-fb` still sees 8-bit (`0x646472xx`); Run 1 only caught 32-bit
+   because its read was in a *separate* ev ~1–2 s later. To catch it you must
+   **release, then spin-wait until `DISPCTRL`'s top 24 bits ≠ 0x646472**, then act
+   inside the ~1 s window.
+2. **Guard every HVS-address dereference.** A dump helper computed a SRAM address
+   from a `DISPLACT` slot value and dereferenced it; when that read came back as
+   8-bit garbage (`~1.68e9`), the address was ~6.7e9 → `mem-ref` fault → board
+   wedged. Bound-check slots (`0 ≤ slot < 4096`) before reading SRAM. With the
+   guard the board survives an all-8-bit dump cleanly.
+3. **HARD CONSTRAINT: `rel-fb` + lingering-idle destabilizes the RTL8153 network.**
+   Every probe that released the FB and then *dawdled* (spin-waiting, multi-read,
+   or re-`fbtall`) lost the board's network (ARP FAILED, SSH dead) within seconds,
+   needing a full netboot to recover. The firmware's reclaim/reconfigure after an
+   idle release appears to disrupt the shared USB/power the RTL8153 rides. **So the
+   overlay cannot be built by interactive SSH iteration across the window** — the
+   release + drive must be **one atomic in-image routine** that releases, waits for
+   the window, writes our dlist, and enables the channel *before* the network/
+   firmware disruption matters, and keeps the display driven so nothing reclaims.
+   This is the correct architecture regardless (it is exactly what vc4 does).
+
+**Revised build plan:** a single baked `hvs-overlay-on` in `net/hdmi-hvs.lisp`:
+release → spin until 32-bit → (read the live dlist ONCE, now that the window is
+ours and held) → compose our dlist (FB plane + scaled YUV plane) in unused SRAM →
+point `SCALER_DISPLISTx` at it → keep the channel enabled. Because it drives the
+HVS the instant the window opens, the firmware never sees an idle display to
+reclaim, and there is no SSH round-trip inside the fragile window. Test via a
+freshly baked image (or one-shot pushed defun called ONCE), never interactive
+multi-step probing.
+
+### Milestone 1 attempt (2026-09-13, session 3) — WE DROVE THE HVS FROM THE ARM
+
+Wrote the atomic release-and-drive routine in `net/hdmi-hvs.lisp`
+(`hvs-rel-fb`, `hvs-8bit-p`, `hvs-wait-window`, `hvs-active-channel`, `hvs-fill`,
+`hvs-plane`, `hvs-overlay-on`) and ran it on the board. Results:
+
+- **Confirmed on hardware:** a release opens the 32-bit window (`DISPCTRL` reads
+  the real `0x9A0F00FF`), and it is **re-triggerable** (not strictly one-shot).
+- **WE CHANGED THE HDMI OUTPUT.** After releasing and writing to the HVS at 32-bit,
+  the console vanished and the screen showed a **solid color** (webcam-confirmed).
+  That is the core capability proven end-to-end: the ARM drives the HVS and it
+  reaches the display. (`docs`/scratch webcam grab.)
+- **The plane did NOT render yet** — only a solid fill (background) showed, no
+  320x180 magenta rect. The unity-plane dlist (`hvs-plane`) needs debugging: the
+  CTL0/POS/PTR/pitch layout, the PIXEL_ORDER field, and/or cache coherency of the
+  scratch buffer at `0x12000000` (cached DRAM vs the HVS's uncached read).
+- **`hvs-wait-window` timing:** 3000 ms sometimes misses — the async handover is
+  variable and can take longer; a slower spaced-read sequence caught the window.
+  Bump the wait and/or make it more robust.
+- **CONFIRMED HARD CONSTRAINT (again):** even a near-atomic drive lost the RTL8153
+  network within seconds of the release. The firmware disrupts the shared USB a few
+  seconds after release no matter what we do. **Therefore SSH iteration after a
+  release is impossible** — the overlay (and its debugging) must run as ONE BAKED
+  in-image routine, observed via the webcam, NOT driven step-by-step over SSH.
+  Recovery from each attempt is a full netboot (and the RTL8153 sometimes needs a
+  physical dongle power-cycle).
+
+**Next:** bake `net/hdmi-hvs.lisp` into the board image (add it to
+`build-cl-repl-common.lisp`'s baked sources), have `kernel-main`/`ssh-boot` OR a
+one-shot form call `hvs-overlay-on` after boot, netboot once, and read the result
+off the webcam. Iterate the plane dlist by rebuilding (reliable) rather than
+pushing over SSH. Fix the plane render (coherency: fill via the uncached alias or
+add a cache clean; verify CTL0 WORDS/format/pixel-order against a real dumped
+firmware plane once we can hold the window with our own dlist).
+
+### The two real paths (SUPERSEDED — kept for context; the small path above wins)
+
+1. **ARM owns the whole display pipeline** (real vc4-style): boot with the
+   firmware relinquishing display, ARM drives HVS + pixelvalve + HDMI. Biggest,
+   but it is the "deep VideoCore integration" path and the honest route to 60 fps.
+2. **VPU-side display component** (`librerpi/lk-overlay`): the HVS is natively
+   32-bit on the VPU. A small VPU program owns the overlay; ARM feeds YUV.
+
+Both are project-sized. Neither is VCHIQ. The immediate next move is the crux
+probe, not either big build.
 
 ## To resume
 

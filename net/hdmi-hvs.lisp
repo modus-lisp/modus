@@ -25,10 +25,12 @@
 
 (defun hvs-base () #x3F400000)
 (defun hvs-rd (off) (mem-ref (+ (hvs-base) off) :u32))
+(defun hvs-wr (off val) (setf (mem-ref (+ (hvs-base) off) :u32) val))
 ;; dlist SRAM: slot index -> absolute address.
 (defun hvs-dlist-sram () (+ (hvs-base) #x2000))       ; 0x3F402000
 (defun hvs-slot-addr (slot) (+ (hvs-dlist-sram) (* slot 4)))
 (defun hvs-slot-rd (slot) (mem-ref (hvs-slot-addr slot) :u32))
+(defun hvs-slot-wr (slot val) (setf (mem-ref (hvs-slot-addr slot) :u32) val))
 
 ;; Per-channel register addresses (x in 0..2).
 (defun hvs-displist (x) (hvs-rd (+ #x20 (* x 4))))    ; SCALER_DISPLISTx: next-dlist slot
@@ -125,3 +127,102 @@
    domains).  Yields only PARTIAL HVS access — see the note above."
   (hvs-clock-state 4 t) (hvs-clock-state 16 t) (hvs-clock-state 9 t)
   (hvs-power-domain 3 t) (hvs-power-domain 5 t) (hvs-power-domain 7 t))
+
+;;; --- MILESTONE 1: atomic release-and-drive (2026-09-13) ----------------------
+;;; The firmware pins the HVS to an 8-bit ARM view while it owns the framebuffer
+;;; (reads come back 0x646472xx, only bit[7:0] is a real register).  The property
+;;; mailbox FRAMEBUFFER_RELEASE hands the block over at full 32-bit — but the
+;;; handover is ASYNCHRONOUS (~1s) and the firmware RECLAIMS an idle display ~1s
+;;; later, AND lingering released-idle destabilizes the RTL8153 net.  So driving
+;;; the HVS cannot be an interactive multi-step dance: it must be ONE atomic
+;;; routine that releases, waits for the 32-bit window, then immediately writes our
+;;; dlist and keeps the channel enabled, so nothing idle is left to reclaim.  This
+;;; is exactly what mainline vc4 does.  See docs/videocore-hvs-notes.md.
+
+(defun hvs-8bit-p ()
+  "T while the HVS still reads the firmware-owned 8-bit byte-lane artifact (top 24
+   bits stuck at 0x646472).  NIL once the ARM owns it at full 32-bit."
+  (= (logand (hvs-rd #x00) #xFFFFFF00) #x64647200))
+
+(defun hvs-wait-window (ms)
+  "After a FB release, wait (bounded by REAL time via get-internal-real-time, so
+   it is immune to interpret-vs-JIT speed) until the HVS reads 32-bit.  Returns T
+   if the window opened within MS milliseconds, NIL on timeout."
+  (let ((deadline (+ (get-internal-real-time)
+                     (truncate (* ms internal-time-units-per-second) 1000))))
+    (loop
+      (when (not (hvs-8bit-p)) (return t))
+      (when (> (get-internal-real-time) deadline) (return nil)))))
+
+(defun hvs-active-channel ()
+  "Which display channel the firmware left ENABLEd (bit31 of DISPCTRLX).  Meaningful
+   only while the window is open (32-bit).  Defaults to 0 if none reads enabled."
+  (cond ((not (zerop (logand (hvs-dispctrlx 0) #x80000000))) 0)
+        ((not (zerop (logand (hvs-dispctrlx 1) #x80000000))) 1)
+        ((not (zerop (logand (hvs-dispctrlx 2) #x80000000))) 2)
+        (t 0)))
+
+(defun hvs-rel-fb ()
+  "Property-mailbox FRAMEBUFFER_RELEASE (tag 0x00048001): hand the display block
+   from the firmware to the ARM.  Asynchronous — must be paired with hvs-wait-window
+   and an immediate dlist write (see hvs-overlay-on)."
+  (let ((buf (hdmi-mbox-buf)))
+    (hdmi-wr (+ buf 0) 24) (hdmi-wr (+ buf 4) 0)
+    (hdmi-wr (+ buf 8) #x00048001) (hdmi-wr (+ buf 12) 0)
+    (hdmi-wr (+ buf 16) 0) (hdmi-wr (+ buf 20) 0)
+    (let ((i 0)) (loop (when (> i 1000000) (return 0))
+      (when (zerop (logand (hdmi-rd (+ (hdmi-mbox-base) #x38)) #x80000000)) (return nil))
+      (setq i (+ i 1))))
+    (hdmi-wr (hdmi-mbox-write) (logior (hdmi-mbox-buf-bus) 8))
+    (let ((i 0)) (loop (when (> i 1000000) (return 0))
+      (when (zerop (logand (hdmi-rd (hdmi-mbox-status)) #x40000000))
+        (hdmi-rd (hdmi-mbox-read)) (return nil))
+      (setq i (+ i 1))))
+    (hdmi-rd (+ buf 16))))
+
+(defun hvs-fill (phys n color)
+  "Fill N consecutive u32 words at physical PHYS with COLOR (a 0xAARRGGBB word)."
+  (let ((i 0))
+    (loop (when (>= i n) (return nil))
+      (setf (mem-ref (+ phys (* i 4)) :u32) color)
+      (setq i (+ i 1)))))
+
+(defun hvs-plane (slot ctl0 pos0 pos2 ptr pitch)
+  "Write a 7-dword unity plane entry + END terminator into the dlist SRAM at SLOT.
+   Word order (VC-IV unity, POS1 omitted): CTL0, POS0, POS2, POS3-scratch, PTR0,
+   ptr-context, SRC_PITCH, then END(bit31)."
+  (hvs-slot-wr (+ slot 0) ctl0)
+  (hvs-slot-wr (+ slot 1) pos0)
+  (hvs-slot-wr (+ slot 2) pos2)
+  (hvs-slot-wr (+ slot 3) #xC0C0C0C0)
+  (hvs-slot-wr (+ slot 4) ptr)
+  (hvs-slot-wr (+ slot 5) #xC0C0C0C0)
+  (hvs-slot-wr (+ slot 6) pitch)
+  (hvs-slot-wr (+ slot 7) #x80000000))
+
+(defun hvs-overlay-on ()
+  "MILESTONE 1: atomically take the HVS from the firmware and DRIVE it ourselves.
+   Releases the FB, catches the 32-bit window, fills a small scratch buffer, and
+   composes a unity RGBA8888 plane (a 320x180 magenta rect, centered on 1920x1080)
+   over a dark background on the firmware's active channel.  If it holds — the
+   screen shows the rect and the board stays reachable — we own the HVS and can
+   hold the window with no interactive round-trip.  :win :no-window means the
+   firmware never handed over (display untouched)."
+  (hvs-rel-fb)
+  (if (not (hvs-wait-window 3000))
+      (list :win :no-window)
+      (let* ((ch (hvs-active-channel)) (bw 320) (bh 180) (sx 800) (sy 450)
+             (buf #x12000000) (slot 900) (bk (+ #x44 (* ch #x10))) (lst (+ #x20 (* ch 4))))
+        (hvs-fill buf (* bw bh) #x00FF00FF)          ; magenta rect content
+        (memory-barrier)
+        (hvs-plane slot
+                   (logior #x40000000 (ash 7 24) #x10 7)   ; CTL0: VALID|WORDS(7)|UNITY|FMT7(RGBA8888)
+                   (logior #xFF000000 (ash sy 12) sx)       ; POS0: ALPHA|START_Y|START_X
+                   (logior (ash bh 16) bw)                  ; POS2: srcH|srcW
+                   (logior #xC0000000 buf)                  ; PTR0: uncached VC bus alias
+                   (* bw 4))                                ; SRC_PITCH bytes
+        (hvs-wr bk (logior #x01000000 #x002020))     ; DISPBKGND: FILL | dark teal
+        (hvs-wr lst slot)                            ; point channel's dlist at ours (latches next frame)
+        (list :win :open :chan ch :slot slot :dispctrl (hvs-rd #x00)
+              :dispctrlx (hvs-dispctrlx ch) :bkgnd (hvs-rd bk)
+              :displist (hvs-displist ch) :ctl0 (hvs-slot-rd slot)))))

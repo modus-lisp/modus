@@ -89,3 +89,39 @@
           :planes (if active-chan
                       (hvs-walk (hvs-displact active-chan) 12)
                       :no-enabled-channel))))
+
+;;; --- power / clock enable via the property mailbox --------------------------
+;;; In full KMS the firmware hands the display to the ARM but leaves it
+;;; UNPOWERED/UNCLOCKED, expecting the OS driver to bring it up.  These poke the
+;;; firmware SET_DOMAIN_STATE / SET_CLOCK_STATE tags to power+clock the display
+;;; block.  They gave us PARTIAL HVS access — a u32 write latches only its low 8
+;;; bits, reads return 0x646F43 in the top 24, with the occasional clean full
+;;; read of a real DISPCTRL (0x9A0F00FF, ENABLE set).  NOT stable 32-bit access:
+;;; that needs the full KMS firmware handover over VCHIQ, which the property
+;;; mailbox cannot do.  See docs/videocore-hvs-notes.md for the whole story.
+;;; Domain IDs: VIDEO_SCALER=3 (the HVS), HDMI=5, VEC=7.  Clock IDs: CORE=4,
+;;; PIXEL=9, DISP=16 (HVS rides the always-on CORE clock per Linux's vc4).
+(defun hvs-mbox-2 (tag a b)
+  "One property-mailbox tag carrying a 2-word value {A,B}; returns (resp0 resp1)."
+  (let ((buf (hdmi-mbox-buf)))
+    (hdmi-wr (+ buf 0) 32) (hdmi-wr (+ buf 4) 0)
+    (hdmi-wr (+ buf 8) tag) (hdmi-wr (+ buf 12) 8) (hdmi-wr (+ buf 16) 8)
+    (hdmi-wr (+ buf 20) a) (hdmi-wr (+ buf 24) b) (hdmi-wr (+ buf 28) 0)
+    (let ((i 0)) (loop (when (> i 1000000) (return 0))
+                   (when (zerop (logand (hdmi-rd (+ (hdmi-mbox-base) #x38)) #x80000000)) (return nil))
+                   (setq i (+ i 1))))
+    (hdmi-wr (hdmi-mbox-write) (logior (hdmi-mbox-buf-bus) 8))
+    (let ((i 0)) (loop (when (> i 1000000) (return 0))
+                   (when (zerop (logand (hdmi-rd (hdmi-mbox-status)) #x40000000))
+                     (hdmi-rd (hdmi-mbox-read)) (return nil))
+                   (setq i (+ i 1))))
+    (list (hdmi-rd (+ buf 20)) (hdmi-rd (+ buf 24)))))
+
+(defun hvs-power-domain (dom on) (hvs-mbox-2 #x00038030 dom (if on 3 0)))  ; SET_DOMAIN_STATE, bit1=wait
+(defun hvs-clock-state  (clk on) (hvs-mbox-2 #x00038001 clk (if on 1 0)))   ; SET_CLOCK_STATE
+
+(defun hvs-display-on ()
+  "Power+clock the display block (CORE/DISP/PIXEL clocks; VIDEO_SCALER/HDMI/VEC
+   domains).  Yields only PARTIAL HVS access — see the note above."
+  (hvs-clock-state 4 t) (hvs-clock-state 16 t) (hvs-clock-state 9 t)
+  (hvs-power-domain 3 t) (hvs-power-domain 5 t) (hvs-power-domain 7 t))

@@ -61,6 +61,24 @@ node web/t/headless.js 'http://localhost:18080/?eval=(print%20(*%206%207))'
 The page must be served cross-origin isolated (`serve.js` sets the headers)
 because the worker blocks on stdin with `Atomics.wait`.
 
+## Deep links
+
+The page reads the location **hash** so a URL can set things up and drop you at
+a live prompt:
+
+- `#eval=FORM` — evaluate FORM at startup (repeatable, ordered).
+- `#load=URL`  — fetch URL (relative to the page or absolute; CORS applies)
+  into the in-memory filesystem and `LOAD` it (repeatable, ordered).
+
+Encode with `encodeURIComponent`, e.g.
+`.../repl/#eval=%28print%20%28%2B%201%202%29%29`. Hash actions run and then the
+REPL stays interactive. The query string `?eval=FORM` is the batch form: it runs
+and exits (used by the test harness).
+
+Gotcha: the page fetches `modus.mvmw.gz` before the plain file, so after
+rebuilding the module regenerate the gzip (`gzip -kf web/modus.mvmw`, which
+`deploy-pages.sh` does) or the browser will keep loading the stale image.
+
 ## What the interpreter does and does not do
 
 - Every vreg lives in the frame (per-frame copies), so callee-saved registers

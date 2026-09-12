@@ -328,6 +328,36 @@
           (if *jit-native-defun-count* (+ *jit-native-defun-count* n) n))
     n))
 "))
+(setq cl-user::*full-source*
+      (concatenate 'string cl-user::*full-source* "
+;; MOTD: list the interfaces this image exposes.  From the image's side the
+;; host is opaque, so name it for what it is - a generic JavaScript bridge.
+;; (Overrides cli-toplevel's one-line banner; last-defun-wins.)
+(defun %cli-repl (banner-p)
+  (when banner-p
+    (%cli-line \"Modus - Common Lisp, self-hosted on the MVM.\")
+    (%cli-line \"I/O is a generic JavaScript host bridge (no OS underneath):\")
+    (%cli-line \"  console  - this REPL, standard input and output over the bridge\")
+    (%cli-line \"  files    - open / with-open-file / load, on the bridge filesystem\")
+    (%cli-line \"  network  - (http-get \\\"https://host/path\\\") and the socket layer, over bridge HTTP\")
+    (%cli-line \"Ctrl-D (EOF) to exit.\"))
+  (let ((in (%make-file-stream-full 0 0))
+        (eof (list 'eof)))
+    (loop
+      (%cli-msg \"> \")
+      (let ((form (handler-case (read in nil eof)
+                    (t (c)
+                      (%cli-line \"READ-ERROR\")
+                      eof))))
+        (when (eq form eof) (%cli-nl) (return-from %cli-repl nil))
+        (handler-case
+            (let ((v (eval form)))
+              (write-object v) (%cli-nl))
+          (t (c)
+            (%cli-msg \"ERROR: \")
+            (handler-case (write-object c) (t (c2) (%cli-msg \"<condition>\")))
+            (%cli-nl)))))))
+"))
 (format t "~%Compiling web (x86-64 word) module (~D chars)...~%"
         (length cl-user::*full-source*))
 (let ((target (find-target :x86-64)))

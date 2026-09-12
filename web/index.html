@@ -173,12 +173,35 @@
     feed(line);
   });
   status.textContent = 'starting…';
-  // ?eval=FORM (repeatable) runs forms and exits, like the CLI; otherwise the REPL.
+  // Deep links.  decodeURIComponent (not URLSearchParams) so a literal '+'
+  // survives — Lisp forms are full of it; encode links with encodeURIComponent.
+  const parseParams = (str) => str.split('&').filter(Boolean).map((part) => {
+    const eq = part.indexOf('=');
+    return eq < 0 ? [decodeURIComponent(part), ''] : [decodeURIComponent(part.slice(0, eq)), decodeURIComponent(part.slice(eq + 1))];
+  });
+  // ?eval=FORM (repeatable): batch — run and exit (used by the test harness).
+  // #eval=FORM / #load=URL (repeatable, ordered): run at startup, then stay in
+  //   the REPL, so a shared link sets things up and leaves you at a live prompt.
+  //   load fetches the URL (relative to this page, or absolute; CORS applies)
+  //   into the in-memory FS and LOADs it.
   const argv = ['modus'];
-  for (const [k, v] of new URLSearchParams(location.search)) if (k === 'eval') argv.push('--eval', v);
-  if (argv.length > 1) argv.push('--quit');
+  const files = [];
+  let quit = false;
+  for (const [k, v] of parseParams(location.search.slice(1))) if (k === 'eval') { argv.push('--eval', v); quit = true; }
+  for (const [k, v] of parseParams(location.hash.slice(1))) {
+    if (k === 'eval') argv.push('--eval', v);
+    else if (k === 'load') {
+      status.textContent = 'fetching ' + v + '…';
+      const buf = await fetch(v).then((r) => r.ok ? r.arrayBuffer() : null).catch(() => null);
+      if (!buf) { say('link load: could not fetch ' + v + '\n', 'err'); continue; }
+      const path = '/home/web/link-' + files.length + '.lisp';
+      files.push({ path, bytes: buf });
+      argv.push('--load', path);
+    }
+  }
+  if (quit) argv.push('--quit');
   worker.postMessage({ type: 'start', mvmw, core, stdin: sab, http: httpSab, inbox: inboxSab, argv, env: ['HOME=/home/web'],
-                       semispace: 256 << 20, files: [] }, [mvmw].concat(core ? [core] : []));
+                       semispace: 256 << 20, files }, [mvmw].concat(core ? [core] : []).concat(files.map((f) => f.bytes)));
 })();
 </script>
 </body>

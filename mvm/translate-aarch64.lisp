@@ -4446,6 +4446,13 @@
                    ((= sub 1) (a64-emit buf (logior #x2E212800 (ash fs 5) fd)))   ; SQXTUN Vd.8B, Vs.8H
                    ((= sub 2) (a64-emit buf (logior #x0F10A400 (ash fs 5) fd)))   ; SXTL Vd.4S, Vs.4H
                    ((= sub 3) (a64-emit buf (logior #x0E612800 (ash fs 5) fd)))   ; XTN Vd.4H, Vs.4S
+                   ((= sub 5) (a64-emit buf (logior #x4F10A400 (ash fs 5) fd)))   ; SXTL2 Vd.4S, Vs.8H
+                   ((= sub 6) (a64-emit buf (logior #x6F08A400 (ash fs 5) fd)))   ; UXTL2 Vd.8H, Vs.16B
+                   ((= sub 7) (a64-emit buf (logior #x4E612800 (ash fs 5) fd)))   ; XTN2 Vd.8H, Vs.4S
+                   ((= sub 8) (a64-emit buf (logior #x0E614800 (ash fs 5) fd)))   ; SQXTN Vd.4H, Vs.4S
+                   ((= sub 9) (a64-emit buf (logior #x4E614800 (ash fs 5) fd)))   ; SQXTN2 Vd.8H, Vs.4S
+                   ((= sub 10) (a64-emit buf (logior #x0F08A400 (ash fs 5) fd)))  ; SXTL Vd.8H, Vs.8B (s8->s16)
+                   ((= sub 11) (a64-emit buf (logior #x4E60B800 (ash fs 5) fd)))  ; ABS Vd.8H, Vs.8H
                    (t (unless (= fd fs)
                         (a64-emit buf (logior #x4EA01C00 (ash fs 16) (ash fs 5) fd)))))))
           ;; ---- VI-SHIFT Fd, Fs, sub, n ----  immediate shifts (immh:immb in bits 22:16)
@@ -4455,7 +4462,8 @@
                                          ((= sub 1) (logior #x4F000400 (ash (- 32 n) 16)))   ; SSHR Vd.8H, #n
                                          ((= sub 2) (logior #x4F005400 (ash (+ 16 n) 16)))   ; SHL Vd.8H, #n
                                          ((= sub 3) (logior #x4F000400 (ash (- 16 n) 16)))   ; SSHR Vd.16B, #n
-                                         (t (logior #x4F000400 (ash (- 64 n) 16))))          ; SSHR Vd.4S, #n
+                                         ((= sub 4) (logior #x4F000400 (ash (- 64 n) 16)))   ; SSHR Vd.4S, #n
+                                         (t (logior #x0F009C00 (ash (- 32 n) 16))))          ; SQRSHRN Vd.4H, Vs.4S, #n
                                    (ash fs 5) fd))))
           ;; ---- VI-BIN Fd, Fa, Fb, sub ----  table; mla/mls/bsl accumulate into Fd
           ((= op +op-vi-bin+)
@@ -4465,7 +4473,9 @@
                           (5 #x4E60B400) (6 #x6E60B400) (7 #x6E207400) (8 #x6E203C00) (9 #x4E201C00)
                           (10 #x4EA01C00) (11 #x6E201C00) (12 #x6E601C00) (13 #x4E200C00) (14 #x4E202C00)
                           (15 #x4E208400) (16 #x6E208400) (17 #x4EA08400) (18 #x6EA08400) (19 #x4EA09C00)
-                          (20 #x0E402800) (21 #x0E406800) (22 #x0E403800) (t #x0E407800))))
+                          (20 #x0E402800) (21 #x0E406800) (22 #x0E403800) (23 #x0E407800)
+                          (24 #x4E606C00) (25 #x4E606400) (26 #x6E206C00) (27 #x6E206400)
+                          (t #x0E407800))))
              (a64-emit buf (logior base (ash fb 16) (ash fa 5) fd))))
           ;; ---- VI-MOVI Fd, kind, val ----  MOVI Vd.16B / Vd.8H, #val  (abc:defgh split)
           ((= op +op-vi-movi+)

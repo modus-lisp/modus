@@ -404,6 +404,10 @@
       ((= sub 14) (dotimes (k 16) (%vlane-set v k 1 (%vlane-sat (- (%vlane-get a k 1 t) (%vlane-get b k 1 t)) -128 127))))  ; sqsub s8
       ((= sub 15) (dotimes (k 16) (%vlane-set v k 1 (+ (aref a k) (aref b k)))))                 ; add u8 (wrap)
       ((= sub 16) (dotimes (k 16) (%vlane-set v k 1 (- (aref a k) (aref b k)))))                 ; sub u8 (wrap)
+      ((= sub 24) (dotimes (k 8) (%vlane-set v k 2 (min (%vlane-get a k 2 t) (%vlane-get b k 2 t)))))  ; smin s16
+      ((= sub 25) (dotimes (k 8) (%vlane-set v k 2 (max (%vlane-get a k 2 t) (%vlane-get b k 2 t)))))  ; smax s16
+      ((= sub 26) (dotimes (k 16) (setf (aref v k) (min (aref a k) (aref b k)))))                 ; umin u8
+      ((= sub 27) (dotimes (k 16) (setf (aref v k) (max (aref a k) (aref b k)))))                 ; umax u8
       ((<= sub 19) (dotimes (k 4)                                                             ; s32x4 add sub mul
                      (let ((x (%vlane-get a k 4 t)) (y (%vlane-get b k 4 t)))
                        (%vlane-set v k 4 (cond ((= sub 17) (+ x y)) ((= sub 18) (- x y)) (t (* x y)))))))
@@ -1956,6 +1960,17 @@
                          ((= sub 1) (dotimes (k 8) (setf (aref v k) (%vlane-sat (%vlane-get s k 2 t) 0 255)))) ; sqxtun 8h->8b
                          ((= sub 2) (dotimes (k 4) (%vlane-set v k 4 (%vlane-get s k 2 t))))                 ; sxtl 4h->4s
                          ((= sub 3) (dotimes (k 4) (%vlane-set v k 2 (%vlane-get s k 4 t))))                 ; xtn 4s->4h
+                         ((= sub 5) (dotimes (k 4) (%vlane-set v k 4 (%vlane-get s (+ k 4) 2 t))))           ; sxtl2 8h(hi)->4s
+                         ((= sub 6) (dotimes (k 8) (%vlane-set v k 2 (aref s (+ k 8)))))                     ; uxtl2 16b(hi)->8h
+                         ((= sub 7) (let ((d (svref fregs fd)))                                              ; xtn2 4s->8h(hi), low kept
+                                      (dotimes (k 8) (setf (aref v k) (aref d k)))
+                                      (dotimes (k 4) (%vlane-set v (+ k 4) 2 (%vlane-get s k 4 t)))))
+                         ((= sub 8) (dotimes (k 4) (%vlane-set v k 2 (%vlane-sat (%vlane-get s k 4 t) -32768 32767)))) ; sqxtn
+                         ((= sub 9) (let ((d (svref fregs fd)))                                              ; sqxtn2
+                                      (dotimes (k 8) (setf (aref v k) (aref d k)))
+                                      (dotimes (k 4) (%vlane-set v (+ k 4) 2 (%vlane-sat (%vlane-get s k 4 t) -32768 32767)))))
+                         ((= sub 10) (dotimes (k 8) (%vlane-set v k 2 (%vlane-get s k 1 t))))          ; sxtl8 s8->s16
+                         ((= sub 11) (dotimes (k 8) (%vlane-set v k 2 (abs (%vlane-get s k 2 t)))))       ; abs s16
                          (t (dotimes (k 16) (setf (aref v k) (aref s k)))))                            ; mov
                    (setf (svref fregs fd) v))
                  (setf pc npc3)))))
@@ -1970,7 +1985,9 @@
                            ((= sub 1) (dotimes (k 8) (%vlane-set v k 2 (ash (%vlane-get s k 2 t) (- n)))))   ; sshr 8h
                            ((= sub 2) (dotimes (k 8) (%vlane-set v k 2 (ash (%vlane-get s k 2 t) n))))       ; shl 8h
                            ((= sub 3) (dotimes (k 16) (%vlane-set v k 1 (ash (%vlane-get s k 1 t) (- n)))))  ; sshr 16b
-                           (t (dotimes (k 4) (%vlane-set v k 4 (ash (%vlane-get s k 4 t) (- n))))))          ; sshr 4s
+                           ((= sub 4) (dotimes (k 4) (%vlane-set v k 4 (ash (%vlane-get s k 4 t) (- n)))))   ; sshr 4s
+                           (t (dotimes (k 4)                                                                   ; sqrshrn 4s->4h #n
+                                (%vlane-set v k 2 (%vlane-sat (ash (+ (%vlane-get s k 4 t) (ash 1 (- n 1))) (- n)) -32768 32767)))))
                      (setf (svref fregs fd) v))
                    (setf pc npc4))))))
           (#.+op-vi-bin+

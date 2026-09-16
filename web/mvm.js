@@ -1309,6 +1309,21 @@ class MVM {
     return g;
   }
 
+  // Force a function (by exact name) to be translated now, ignoring the
+  // call-count threshold.  Used to pre-warm the introspection RPC so the very
+  // first completion is fast (a fresh core has an empty translation cache).
+  forceCompile(name) {
+    const f = this.byName.get(name);
+    if (!f) return false;
+    if (this.compiled.get(f.off) === undefined) this.compiled.set(f.off, this.compileFn(f.off));
+    return this.compiled.get(f.off) != null;
+  }
+  forceCompileMatching(re) {
+    let n = 0;
+    for (const f of this.mod.fns) if (re.test(f.name) && this.forceCompile(f.name)) n++;
+    return n;
+  }
+
   // -- bytecode -> JS translation ---------------------------------------------
   // One bytecode function becomes one JS function: its basic blocks are cases
   // of a switch driven by a label variable, registers stay in the memory

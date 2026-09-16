@@ -14,13 +14,19 @@ const RING_HDR = 16;
 // posted, 2 response ready.  inbox SAB (files dropped on the page):
 // Int32 header [seq, length] then records [nameLen u32][name][dataLen u32][data].
 class BrowserHost {
-  constructor(stdinSab, post, httpSab, inboxSab) {
+  constructor(stdinSab, post, httpSab, inboxSab, querySab) {
     this.ctl = new Int32Array(stdinSab, 0, 4);
     this.ring = new Uint8Array(stdinSab, RING_HDR);
     this.httpCtl = httpSab ? new Int32Array(httpSab, 0, 4) : null;
     this.httpBuf = httpSab ? new Uint8Array(httpSab, 16) : null;
     this.inboxCtl = inboxSab ? new Int32Array(inboxSab, 0, 4) : null;
     this.inboxBuf = inboxSab ? new Uint8Array(inboxSab, 16) : null;
+    // introspection RPC: [state, id, reqLen] Int32 header then request bytes
+    // ([op:u8][arg...]).  Serviced while blocked in read(0); the answer is a
+    // structured-clone message, not a SAB.
+    this.queryCtl = querySab ? new Int32Array(querySab, 0, 4) : null;
+    this.queryBuf = querySab ? new Uint8Array(querySab, 16) : null;
+    this.vm = null; this.webRpc = undefined;
     this.inboxSeen = 0;
     this.post = post;
     this.files = new Map();          // path -> { data: Uint8Array, mtime }
@@ -63,6 +69,41 @@ class BrowserHost {
     Atomics.store(this.inboxCtl, 2, 1);          // tell the page it may write again
     Atomics.notify(this.inboxCtl, 2);
   }
+  // Run the baked %web-rpc for a page request, re-entrantly on the idle VM
+  // (same mechanism as callLisp for checked arithmetic).  Request bytes are
+  // copied into the image's fixed request buffer; the response is read back
+  // from its fixed result buffer and posted to the page.
+  serviceQuery() {
+    if (!this.queryCtl || !this.vm) return;
+    if (Atomics.load(this.queryCtl, 0) !== 1) return;
+    const X = self.MVM_EXPORTS, VBASE = X.VBASE;
+    const WEB_REQ = 0x10016000, WEB_RES = 0x10017000;
+    const id = Atomics.load(this.queryCtl, 1);
+    const reqLen = Atomics.load(this.queryCtl, 2);
+    const vm = this.vm, m8 = vm.m8;
+    m8.set(this.queryBuf.subarray(0, reqLen), WEB_REQ - VBASE);   // [op][arg...]
+    m8[WEB_REQ - VBASE + reqLen] = 0;                             // NUL-terminate arg
+    if (this.webRpc === undefined) this.webRpc = vm.byName.get('%WEB-RPC') || null;
+    let bytes = new Uint8Array(0), error = null;
+    if (!this.webRpc) error = 'no %WEB-RPC in image';
+    else {
+      // Snapshot the machine registers: a fault inside the query must not
+      // corrupt the REPL read we are suspended in.
+      const sEsp = vm.esp, sEbp = vm.ebp, sPc = vm.pc, sVrl = vm.vrl, sVrh = vm.vrh;
+      try {
+        vm.callLisp(this.webRpc, []);
+        const len = vm.ldlo(WEB_RES) >>> 1;   // :u64 stored the tagged word (cur<<1)
+        const n = Math.min(len, 30000);
+        bytes = m8.slice((WEB_RES + 8) - VBASE, (WEB_RES + 8) - VBASE + n);
+      } catch (e) {
+        error = String(e && e.message || e);
+        vm.esp = sEsp; vm.ebp = sEbp; vm.pc = sPc; vm.vrl = sVrl; vm.vrh = sVrh;
+      }
+    }
+    Atomics.store(this.queryCtl, 0, 0);
+    Atomics.notify(this.queryCtl, 0);
+    this.post({ type: 'query-result', id, bytes, error }, error ? [] : [bytes.buffer]);
+  }
   now() { return performance.now(); }
   getpid() { return 4242; }
 
@@ -103,6 +144,7 @@ class BrowserHost {
       this.flush();
       for (;;) {
         this.drainInbox();
+        this.serviceQuery();
         const head = Atomics.load(this.ctl, 0), tail = Atomics.load(this.ctl, 1);
         if (head !== tail) {
           let n = 0;

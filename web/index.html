@@ -18,6 +18,22 @@
   body.dragging #term { outline: 2px dashed #6a6; outline-offset: -4px; }
   .log { color: #789; }
   .err { color: #e77; }
+  #compl { position: fixed; z-index: 10; background: #1a1a1a; border: 1px solid #555; max-height: 42vh; overflow-y: auto; font-size: 13px; display: none; box-shadow: 0 -4px 12px #0008; }
+  #compl div { padding: 1px 8px; white-space: pre; cursor: pointer; }
+  #compl div.sel { background: #2b4; color: #000; }
+  #extoggle { cursor: pointer; color: #9c9; user-select: none; }
+  #explorer { position: fixed; top: 0; right: 0; bottom: 2.2em; width: 320px; background: #161616; border-left: 1px solid #333; display: none; flex-direction: column; z-index: 5; }
+  #explorer.open { display: flex; }
+  #exfilter { margin: 6px; background: #000; color: #eee; border: 1px solid #444; padding: 3px 6px; font: inherit; }
+  #exlist { flex: 1; overflow-y: auto; font-size: 13px; }
+  #exlist div { padding: 1px 8px; cursor: pointer; white-space: pre; }
+  #exlist div:hover { background: #222; }
+  #exdetail { border-top: 1px solid #333; padding: 8px; font-size: 12px; min-height: 6em; }
+  #exdetail .k { display: inline-block; padding: 0 6px; border-radius: 3px; font-size: 11px; color: #eee; }
+  #exdetail .k.function { background: #24506b; } #exdetail .k.macro { background: #6b4a24; }
+  #exdetail .k.special-operator { background: #5b2b6b; } #exdetail .k.variable { background: #2b6b3b; } #exdetail .k.unknown { background: #444; }
+  #exdetail button { margin: 6px 6px 0 0; background: #333; color: #ddd; border: 1px solid #555; padding: 2px 8px; cursor: pointer; font: inherit; }
+  body.explorer #term { margin-right: 320px; }
 </style>
 </head>
 <body>
@@ -25,8 +41,15 @@
 <div id="bar">
   <span id="status">loading…</span>
   <input id="in" placeholder="type a form and press Enter" autocomplete="off" spellcheck="false" disabled>
+  <span id="extoggle" title="symbol explorer">&#9776; symbols</span>
   <span id="files"></span>
   <label id="drop">drop files here or <input id="pick" type="file" multiple style="width:5em"></label>
+</div>
+<div id="compl"></div>
+<div id="explorer">
+  <input id="exfilter" placeholder="filter symbols…" autocomplete="off" spellcheck="false">
+  <div id="exlist"></div>
+  <div id="exdetail">click a symbol to inspect it</div>
 </div>
 <script>
 (async () => {
@@ -163,14 +186,144 @@
     else if (m.type === 'fault') { say('\n' + m.text + '\n', 'err'); status.textContent = 'faulted'; input.disabled = true; }
     else if (m.type === 'http') { status.textContent = 'fetching ' + m.url; serveHttp(m); }
     else if (m.type === 'file') offerFile(m.path, m.bytes);
+    else if (m.type === 'query-result') { if (window.modusQueryResult) window.modusQueryResult(m); }
   };
+  // --- introspection query channel (completion + explorer) -----------------
+  // The worker services these while blocked reading stdin (see host-browser).
+  const QCAP = 16384;
+  const querySab = new SharedArrayBuffer(16 + QCAP);
+  const queryCtl = new Int32Array(querySab, 0, 4);   // [state, id, reqLen]
+  const queryBuf = new Uint8Array(querySab, 16);
+  let queryId = 0, qInFlight = null;
+  const qQueued = new Map();                          // tag -> {op, arg, resolve}
+  const pumpQuery = () => {
+    if (qInFlight || Atomics.load(queryCtl, 0) !== 0) return;
+    const e = qQueued.entries().next();
+    if (e.done) return;
+    const [, q] = e.value; qQueued.delete(e.value[0]);
+    const argBytes = enc.encode(q.arg);
+    if (argBytes.length + 2 > QCAP) { q.resolve(''); return pumpQuery(); }
+    queryBuf[0] = q.op.charCodeAt(0);
+    queryBuf.set(argBytes, 1);
+    Atomics.store(queryCtl, 1, ++queryId);
+    Atomics.store(queryCtl, 2, 1 + argBytes.length);
+    Atomics.store(queryCtl, 0, 1);
+    Atomics.notify(ctl, 1);                           // wake the worker if idle in read
+    qInFlight = { id: queryId, resolve: q.resolve };
+  };
+  // Ask the image; coalesces by TAG (latest wins) so fast typing doesn't queue.
+  const query = (op, arg, tag) => new Promise((resolve) => {
+    const t = tag || ('u' + (++queryId));
+    const prev = qQueued.get(t); if (prev) prev.resolve('');
+    qQueued.set(t, { op, arg, resolve });
+    pumpQuery();
+  });
+  window.modusQuery = query;   // test hook
+  window.modusQueryResult = (m) => {
+    if (qInFlight && m.id === qInFlight.id) { const r = qInFlight; qInFlight = null; r.resolve(m.error ? '' : dec.decode(m.bytes)); pumpQuery(); }
+  };
+
+  // --- tab completion on the REPL input -----------------------------------
+  const compl = document.getElementById('compl');
+  let cItems = [], cSel = -1, cToken = '';
+  const TOKEN_RE = /[A-Za-z0-9\-*+/<>=!?%&.:$_]+$/;
+  const curToken = () => { const m = TOKEN_RE.exec(input.value.slice(0, input.selectionStart)); return m ? m[0] : ''; };
+  const closeCompl = () => { compl.style.display = 'none'; cItems = []; cSel = -1; };
+  const renderCompl = () => {
+    if (!cItems.length) { closeCompl(); return; }
+    compl.innerHTML = '';
+    cItems.forEach((name, i) => {
+      const d = document.createElement('div'); d.textContent = name;
+      if (i === cSel) d.className = 'sel';
+      d.addEventListener('mousedown', (ev) => { ev.preventDefault(); acceptCompl(i); });
+      compl.appendChild(d);
+    });
+    const r = input.getBoundingClientRect();
+    compl.style.left = r.left + 'px';
+    compl.style.width = Math.max(220, r.width) + 'px';
+    compl.style.bottom = (window.innerHeight - r.top) + 'px';
+    compl.style.display = 'block';
+    const sel = compl.querySelector('.sel'); if (sel) sel.scrollIntoView({ block: 'nearest' });
+  };
+  const acceptCompl = (i) => {
+    const name = cItems[i]; if (name === undefined) return;
+    const start = input.selectionStart - cToken.length;
+    input.value = input.value.slice(0, start) + name + input.value.slice(input.selectionStart);
+    const pos = start + name.length; input.setSelectionRange(pos, pos);
+    closeCompl(); input.focus();
+  };
+  let cTimer = null;
+  const doComplete = async () => {
+    const tok = curToken(); cToken = tok;
+    if (tok.length < 1 || tok.length > 80) { closeCompl(); return; }
+    const text = await query('c', tok, 'compl');
+    if (curToken() !== tok) return;                   // user moved on
+    cItems = (text ? text.split('\n').filter(Boolean).map((s) => s.toLowerCase()) : []).slice(0, 200);
+    cSel = cItems.length ? 0 : -1;
+    renderCompl();
+  };
+  input.addEventListener('input', () => { clearTimeout(cTimer); cTimer = setTimeout(doComplete, 70); });
+  input.addEventListener('blur', () => setTimeout(closeCompl, 120));
+
   input.addEventListener('keydown', (ev) => {
-    if (ev.key !== 'Enter') return;
-    const line = input.value + '\n';
-    input.value = '';
-    say(line);
-    status.textContent = 'running…';
-    feed(line);
+    const open = compl.style.display === 'block' && cItems.length;
+    if (ev.key === 'Tab') { ev.preventDefault(); if (open) acceptCompl(cSel < 0 ? 0 : cSel); else doComplete(); return; }
+    if (open && (ev.key === 'ArrowDown' || ev.key === 'ArrowUp')) {
+      ev.preventDefault();
+      cSel = (cSel + (ev.key === 'ArrowDown' ? 1 : cItems.length - 1)) % cItems.length;
+      renderCompl(); return;
+    }
+    if (ev.key === 'Escape') { if (open) { ev.preventDefault(); closeCompl(); } return; }
+    if (ev.key === 'Enter') {
+      if (open && cSel >= 0) { ev.preventDefault(); acceptCompl(cSel); return; }
+      const line = input.value + '\n';
+      input.value = ''; closeCompl();
+      say(line); status.textContent = 'running…'; feed(line);
+    }
+  });
+
+  // --- symbol explorer ----------------------------------------------------
+  const explorer = document.getElementById('explorer');
+  const exFilter = document.getElementById('exfilter');
+  const exList = document.getElementById('exlist');
+  const exDetail = document.getElementById('exdetail');
+  let exTimer = null;
+  const exSearch = async () => {
+    const q = exFilter.value.trim();
+    const text = q.length ? await query('a', q, 'exf') : '';
+    const names = text ? text.split('\n').filter(Boolean) : [];
+    exList.innerHTML = '';
+    if (!names.length) { exList.innerHTML = '<div style="color:#667;padding:6px">' + (q.length ? 'no matches' : 'type to search symbols') + '</div>'; return; }
+    names.slice(0, 500).forEach((name) => {
+      const d = document.createElement('div'); d.textContent = name.toLowerCase();
+      d.addEventListener('click', () => exDescribe(name));
+      exList.appendChild(d);
+    });
+  };
+  exFilter.addEventListener('input', () => { clearTimeout(exTimer); exTimer = setTimeout(exSearch, 130); });
+  const exDescribe = async (name) => {
+    const nm = name.toLowerCase();
+    exDetail.textContent = 'describing ' + nm + '…';
+    const text = await query('d', name, 'exd');
+    const info = {};
+    for (const line of text.split('\n')) { const t = line.indexOf('\t'); if (t > 0) info[line.slice(0, t)] = line.slice(t + 1); }
+    const kind = info.kind || 'unknown';
+    exDetail.innerHTML = '';
+    const h = document.createElement('div');
+    h.innerHTML = '<b></b> <span class="k"></span>';
+    h.querySelector('b').textContent = nm;
+    const ks = h.querySelector('.k'); ks.className = 'k ' + kind; ks.textContent = kind;
+    exDetail.appendChild(h);
+    if (info.value !== undefined) { const v = document.createElement('div'); v.style.marginTop = '4px'; v.style.wordBreak = 'break-all'; v.textContent = 'value: ' + info.value; exDetail.appendChild(v); }
+    const mkBtn = (label, fn) => { const b = document.createElement('button'); b.textContent = label; b.addEventListener('click', fn); exDetail.appendChild(b); };
+    mkBtn('insert', () => { const p = input.selectionStart; input.value = input.value.slice(0, p) + nm + input.value.slice(p); input.setSelectionRange(p + nm.length, p + nm.length); input.focus(); });
+    mkBtn('describe', () => { const l = "(describe '" + nm + ")\n"; say(l); status.textContent = 'running…'; feed(l); });
+    if (kind === 'variable') mkBtn('value', () => { const l = nm + '\n'; say(l); status.textContent = 'running…'; feed(l); });
+  };
+  document.getElementById('extoggle').addEventListener('click', () => {
+    const open = explorer.classList.toggle('open');
+    document.body.classList.toggle('explorer', open);
+    if (open) { exFilter.focus(); exSearch(); }
   });
   status.textContent = 'starting…';
   // Deep links.  decodeURIComponent (not URLSearchParams) so a literal '+'
@@ -200,7 +353,7 @@
     }
   }
   if (quit) argv.push('--quit');
-  worker.postMessage({ type: 'start', mvmw, core, stdin: sab, http: httpSab, inbox: inboxSab, argv, env: ['HOME=/home/web'],
+  worker.postMessage({ type: 'start', mvmw, core, stdin: sab, http: httpSab, inbox: inboxSab, query: querySab, argv, env: ['HOME=/home/web'],
                        semispace: 256 << 20, files }, [mvmw].concat(core ? [core] : []).concat(files.map((f) => f.bytes)));
 })();
 </script>

@@ -133,6 +133,28 @@ restore, behind the load spinner.  Regenerate `warmset.js` after any module
 rebuild: `DUMP_COMPILED=warmset.tmp node web/run-node.js --core web/modus.core.gz
 --load web/samples/gui.lisp … --quit` then wrap the JSON as `self.MVM_WARMSET`.
 
+## Quicklisp (offline, bundled)
+
+`ql:quickload` is ready at the prompt.  The page auto-loads
+`modus-quicklisp/setup.lisp` at boot (the browser analogue of a `~/.modusrc`
+`(load …)`), which defines the `QL` package over the image's baked
+`install-tarball` pipeline (untar → parse the `.asd` → topo-sort → load).  It is
+**offline** — a system is a plain `.tar` under `systems/`, not a network fetch:
+
+```lisp
+> (ql:quickload :sha1)          ; untars systems/sha1.tar and loads it
+> (sha1:sha1-hex "abc")         ; => "A9993E364706816ABA3E25717850C26C9CD0D89D"
+```
+
+Bundle more systems by dropping `<name>.tar` in `systems/` and listing the name
+in `index.html`'s startup staging.  The image is a CL subset, so real libraries
+are hit-or-miss — small, portable ones work.  Two caveats: compiling a library
+takes a while (the interpreter is doing real work), and reference a package
+(`sha1:…`) only *after* the `quickload` that creates it — naming it earlier in
+the same form makes the reader hang on the not-yet-existing package.  Networked
+`ql:quickload` from a real dist is out: no ql client bootstrap, and
+quicklisp.org isn't cross-origin-isolation friendly.
+
 ## What the interpreter does and does not do
 
 - Every vreg lives in the frame (per-frame copies), so callee-saved registers

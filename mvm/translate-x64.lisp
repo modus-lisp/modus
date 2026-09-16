@@ -653,6 +653,10 @@
 ;;; Instruction Translation
 ;;; ============================================================
 
+(defun x64-fpp (n)
+  "FP vreg N -> xmm: 0-5 -> xmm2..7, 6-11 -> xmm8..13 (caller-saved)."
+  (if (< n 6) (+ n 2) (+ 8 (- n 6))))
+
 (defun translate-instruction (state opcode operands mvm-next-pos)
   "Translate a single MVM instruction into x86-64 code.
    OPCODE is the numeric MVM opcode.
@@ -2907,7 +2911,7 @@
 
         ((op= +op-fp-unbox+)
          ;; (fp-unbox Fd Vsrc) — boxed float payload → CVTSD2SS xmmD, xmm0
-         (let* ((fd (+ 2 (first operands)))
+         (let* ((fd (x64-fpp (first operands)))
                 (vsrc (second operands)))
            (emit-load-vreg buf vsrc 'rax)
            (emit-push buf 'rcx) (emit-push buf 'rdx)
@@ -2919,7 +2923,7 @@
         ((op= +op-fp-box+)
          ;; (fp-box Vd Fs) — CVTSS2SD xmm0, xmmS → fresh boxed single (#x464)
          (let* ((vd (first operands))
-                (fs (+ 2 (second operands))))
+                (fs (x64-fpp (second operands))))
            (emit-push buf 'rcx) (emit-push buf 'rdx)
            (emit-bytes buf #xF3 #x0F #x5A (logior #xC0 fs))             ; cvtss2sd xmm0, xmmS
            (emit-mov-reg-imm buf 'rcx #x464)
@@ -2938,7 +2942,7 @@
 
         ((op= +op-fp-lane-load+)
          ;; (fp-lane-load Fd Varr Vidx) — MOVSS xmmD, [arr + 4*idx + 7]
-         (let* ((fd (+ 2 (first operands)))
+         (let* ((fd (x64-fpp (first operands)))
                 (varr (second operands))
                 (vidx (third operands)))
            (emit-load-vreg buf vidx +scratch-reg+)
@@ -2958,7 +2962,7 @@
          ;; (fp-lane-store Varr Vidx Fs) — MOVSS [arr + 4*idx + 7], xmmS
          (let* ((varr (first operands))
                 (vidx (second operands))
-                (fs (+ 2 (third operands))))
+                (fs (x64-fpp (third operands))))
            (emit-load-vreg buf vidx +scratch-reg+)
            (emit-sar-reg-imm buf +scratch-reg+ 1)
            (emit-shl-reg-imm buf +scratch-reg+ 2)
@@ -2974,9 +2978,9 @@
 
         ((or (op= +op-fp-add+) (op= +op-fp-sub+) (op= +op-fp-mul+) (op= +op-fp-div+))
          ;; (fp-<op> Fd Fa Fb) — single-precision: xmm0 ← B; D ← A; D op= xmm0
-         (let* ((fd (+ 2 (first operands)))
-                (fa (+ 2 (second operands)))
-                (fb (+ 2 (third operands)))
+         (let* ((fd (x64-fpp (first operands)))
+                (fa (x64-fpp (second operands)))
+                (fb (x64-fpp (third operands)))
                 (sse (cond ((op= +op-fp-add+) #x58)     ; ADDSS
                            ((op= +op-fp-sub+) #x5C)     ; SUBSS
                            ((op= +op-fp-mul+) #x59)     ; MULSS
@@ -2991,35 +2995,35 @@
 
         ((op= +op-v4-lane-load+)
          ;; (v4-lane-load Fd Varr Vidx) — MOVUPS xmmD, [arr + 4*idx + 7]
-         (let* ((fd (+ 2 (first operands))))
+         (let* ((fd (x64-fpp (first operands))))
            (emit-f32-lane-addr buf (second operands) (third operands))
            (emit-bytes buf #x0F #x10 (logior #x40 (ash fd 3)) #x07)))
 
         ((op= +op-v4-lane-store+)
          ;; (v4-lane-store Varr Vidx Fs) — MOVUPS [arr + 4*idx + 7], xmmS
-         (let* ((fs (+ 2 (third operands))))
+         (let* ((fs (x64-fpp (third operands))))
            (emit-f32-lane-addr buf (first operands) (second operands))
            (emit-bytes buf #x0F #x11 (logior #x40 (ash fs 3)) #x07)))
 
         ((op= +op-v4-dup+)
          ;; (v4-dup Fd Fs) — movaps D, S ; shufps D, D, 0
-         (let* ((fd (+ 2 (first operands))) (fs (+ 2 (second operands))))
+         (let* ((fd (x64-fpp (first operands))) (fs (x64-fpp (second operands))))
            (unless (= fd fs)
              (emit-bytes buf #x0F #x28 (logior #xC0 (ash fd 3) fs)))
            (emit-bytes buf #x0F #xC6 (logior #xC0 (ash fd 3) fd) #x00)))
 
         ((op= +op-v4-dup-lane-load+)
          ;; (v4-dup-lane-load Fd Varr Vidx) — movss D, [lane] ; shufps D, D, 0
-         (let* ((fd (+ 2 (first operands))))
+         (let* ((fd (x64-fpp (first operands))))
            (emit-f32-lane-addr buf (second operands) (third operands))
            (emit-bytes buf #xF3 #x0F #x10 (logior #x40 (ash fd 3)) #x07)
            (emit-bytes buf #x0F #xC6 (logior #xC0 (ash fd 3) fd) #x00)))
 
         ((or (op= +op-v4-add+) (op= +op-v4-sub+) (op= +op-v4-mul+) (op= +op-v4-div+))
          ;; (v4-<op> Fd Fa Fb) — packed single: xmm0 ← B; D ← A; D op= xmm0
-         (let* ((fd (+ 2 (first operands)))
-                (fa (+ 2 (second operands)))
-                (fb (+ 2 (third operands)))
+         (let* ((fd (x64-fpp (first operands)))
+                (fa (x64-fpp (second operands)))
+                (fb (x64-fpp (third operands)))
                 (sse (cond ((op= +op-v4-add+) #x58)     ; ADDPS
                            ((op= +op-v4-sub+) #x5C)     ; SUBPS
                            ((op= +op-v4-mul+) #x59)     ; MULPS
@@ -3031,7 +3035,7 @@
 
         ((op= +op-fp-mov+)
          ;; (fp-mov Fd Fs) — movaps xmmD, xmmS (scalar or 4-lane; 128-bit copy)
-         (let* ((fd (+ 2 (first operands))) (fs (+ 2 (second operands))))
+         (let* ((fd (x64-fpp (first operands))) (fs (x64-fpp (second operands))))
            (unless (= fd fs)
              (emit-bytes buf #x0F #x28 (logior #xC0 (ash fd 3) fs)))))
 

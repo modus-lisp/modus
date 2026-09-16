@@ -865,7 +865,7 @@
 (defun %fp-diag-bump (i)
   (when (and (boundp (quote *fp-diag*)) *fp-diag*)
     (setf (aref *fp-diag* i) (+ (aref *fp-diag* i) 1))))
-(defconstant +fp-reg-max+ 6)
+(defconstant +fp-reg-max+ 12)  ; v2-v7 + v16-v21 (aa64) / xmm2-7 + xmm8-13 (x64); all caller-saved, scopes are call-free
 
 (defvar *temp-reg-counter* 0
   "Next temporary register to allocate (cycles through V4-V15)")
@@ -9606,10 +9606,16 @@
         (return-from compile-let*
           (compile-form `(let* ,new-bindings ,@new-body) env dest)))))
   (check-frame-overflow (length bindings) "let*" env)
-  (let ((decl-body body)               ; unstripped: the (declare (type …)) scan below needs it
-        (body (strip-declares body))
-        (n-bindings (length bindings))
-        (new-env env))
+  (let* ((decl-body body)               ; unstripped: the (declare (type …)) scan below needs it
+         (body (strip-declares body))
+         (n-bindings (length bindings))
+         ;; FP/vector register kinds per binding (SINGLE-FLOAT/F32V-PACK/VI-PACK),
+         ;; same as compile-let.  A let* init can reference an earlier binding, so
+         ;; an fp-resident var must carry its DTYPE (vi-pack / f32v-pack) in the
+         ;; env for the later init's vector-tree recognition to see it.
+         (fp-kinds (and (> n-bindings 0) (%let-fp-kinds bindings decl-body body env)))
+         (n-fp 0)
+         (new-env env))
     (when (> n-bindings 0)
       (emit-ir :frame-alloc n-bindings))
     ;; Evaluate sequentially, extending env each time
@@ -9618,28 +9624,44 @@
         (let ((var (if (consp binding) (car binding) binding))
               (val (if (consp binding) (cadr binding) nil))
               (slot (+ (compile-env-stack-depth env) i)))
-          ;; Same spill-on-overflow as compile-let's init loop: under
-          ;; temp pressure compile the init into the dead DEST instead
-          ;; of holding a temp across the recursion.
-          (if (and (%temps-must-spill-p) (numberp dest))
-              (progn
-                (compile-form val new-env dest)
-                (emit-ir :stack-store dest slot))
-              (let ((temp (alloc-temp-reg)))
-                (compile-form val new-env temp)
-                (emit-ir :stack-store temp slot)
-                (free-temp-reg)))
-          ;; Extend environment with this new binding
-          (setq new-env
-                (make-compile-env
-                 :bindings (cons (make-binding
-                                  :name var
-                                  :location :stack
-                                  :stack-slot slot)
-                                (compile-env-bindings new-env))
-                 :stack-depth (+ (compile-env-stack-depth env) (+ i 1))
-                 :parent (compile-env-parent new-env)
-                 :fn-names (compile-env-fn-names new-env)))
+          (cond
+            ;; FP/vector-resident binding
+            ((and fp-kinds (aref fp-kinds i) (< *fp-reg-counter* +fp-reg-max+))
+             (let* ((kind (aref fp-kinds i))
+                    (f (alloc-fp-reg))
+                    (dty (case kind (:ivector 'vi-pack) (:vector 'f32v-pack) (t 'single-float))))
+               (%compile-init-into-fpreg val new-env f kind)
+               (setq n-fp (+ n-fp 1))
+               (setq new-env
+                     (make-compile-env
+                      :bindings (cons (make-binding
+                                       :name var
+                                       :location (if (member kind '(:vector :ivector)) :fpvreg :fpreg)
+                                       :reg f :dtype dty)
+                                      (compile-env-bindings new-env))
+                      :stack-depth (+ (compile-env-stack-depth env) (+ i 1))
+                      :parent (compile-env-parent new-env)
+                      :fn-names (compile-env-fn-names new-env)))))
+            (t
+             ;; Same spill-on-overflow as compile-let's init loop.
+             (if (and (%temps-must-spill-p) (numberp dest))
+                 (progn
+                   (compile-form val new-env dest)
+                   (emit-ir :stack-store dest slot))
+                 (let ((temp (alloc-temp-reg)))
+                   (compile-form val new-env temp)
+                   (emit-ir :stack-store temp slot)
+                   (free-temp-reg)))
+             (setq new-env
+                   (make-compile-env
+                    :bindings (cons (make-binding
+                                     :name var
+                                     :location :stack
+                                     :stack-slot slot)
+                                    (compile-env-bindings new-env))
+                    :stack-depth (+ (compile-env-stack-depth env) (+ i 1))
+                    :parent (compile-env-parent new-env)
+                    :fn-names (compile-env-fn-names new-env)))))
           (setq i (+ i 1)))))
     ;; Final env has correct stack depth
     (setf (compile-env-stack-depth new-env)
@@ -9652,7 +9674,8 @@
     (%infer-let-widths new-env bindings decl-body new-env)
     ;; Compile body
     (compile-progn body new-env dest)
-    ;; Deallocate
+    ;; Release fp registers, then the frame
+    (dotimes (k n-fp) (free-fp-reg))
     (when (> n-bindings 0)
       (emit-ir :frame-free n-bindings))))
 

@@ -888,7 +888,7 @@
          ;; arm — a LOCAL, not a defvar: images that never run
          ;; init-all-globals (the ANSI corpus runner) left a global unbound and
          ;; the arm faulted (gate23: plus.25 / plus.reassociation.1).
-         (fregs (make-array 6 :initial-element 0.0f0)))
+         (fregs (make-array 12 :initial-element 0.0f0)))
     (declare (type fixnum pc len) (type simple-vector regs) (ignorable ftab))
     (reg-set-nil regs +vreg-vn+)  ; VN holds the canonical NIL immediate
     (reg-set regs +vreg-vpc+ pc)

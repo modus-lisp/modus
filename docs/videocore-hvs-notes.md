@@ -417,11 +417,69 @@ block at 0x12000000 = [addr,0,lo,0,hi,0] as u32s; `(%jit-call p)`. `lo` lands in
 the 8-aligned register at `addr` in full. Proper primitive to follow: a pair-store
 width in `a64-str-width` (STP helpers exist) + compiler plumbing (`%setf-mem-ref`).
 
+**The hangs, explained.** Every "mysterious" wedge this session (`hvs-drive`,
+`hvs-overlay-on`, the plane attempt) ran a 230 KB `hvs-fill` at 0x12000000 or
+0x12100000. That range is NOT free: `build-cl-repl-common.lisp` places
+`percpu-data-base` at 0x12000000 and `sched-lock-addr` at 0x12000200 — the
+actor/SSH address map (per-CPU data, scheduler lock, actor stacks, crypto
+scratch) occupies 0x12000000–0x16000000. The fill stomped the runtime. Rule:
+**every buffer and scratch block comes from `(%mmap-exec-page n)`** (the JIT
+arena [0x14000000, 0x18000000), guaranteed free, Normal-WB); compute the STP
+routine's scratch address into `MOVZ X3,#hi16,LSL#16 ; MOVK X3,#lo16` instead of
+hard-coding 0x12000000.
+
 Remaining to first pixels: a PLANE in SRAM (word-writable) → a coherent pixel
 buffer (no dc-cvac primitive, but `%jit-icache-flush` = DC CVAU to PoU; point PTR0
 through the L2-cached VC alias 0x40000000|phys) → and scanout: the monitor showed
 no backlight after the handoff, so PV2 (0x3F807000) / HDMI (0x3F902000) may need
 re-enabling — both 8-aligned, so STP-writable the same way.
+
+### Scanout after display-done: what the firmware tears down, and the mode
+
+With the HVS channel enabled and a correct plane in SRAM (descriptor reads back
+word-for-word; `DISPLIST0` swapped), `DISPLACT0` still stayed 0 — the HVS only
+advances a channel when the downstream pixelvalve pulls, and the whole scanout
+chain had been shut off by NOTIFY_DISPLAY_DONE. Inventory (all measured):
+
+- **Pixel clock OFF:** firmware clock 9 (PIXEL) `GET_CLOCK_STATE`=(9 0),
+  `GET_CLOCK_RATE`=(9 0). vc4's first act is `clk_set_rate`+enable through the
+  firmware clock driver. `SET_CLOCK_RATE` = tag 0x38002 (3 words: clock, rate,
+  skip_turbo) → `(mb3 229378 9 RATE 0)` turns it on (state → (9 1)).
+- **The mode is 1920x1200, not 1080p.** The firmware's PV timings are intact:
+  `PV_HORZA=0x500020` (HBP 80, HSYNC 32), `PV_HORZB=0x300780` (HFP 48, HACTIVE
+  1920), `PV_VERTA=0x1a0006` (VBP 26, VSYNC 6), `PV_VERTB=0x304b0` (VFP 3, VACTIVE
+  1200) → 2080x1235 total → **154 MHz** at 60 Hz (CVT-RB 1920x1200), not 148.5.
+- **Pixelvalve gated:** `PV_V_CONTROL=0x2` (CONTINUOUS, VIDEN clear);
+  `PV_CONTROL=0x177005` (EN | clk_select=HDMI | WAIT_HSTART|TRIGGER_UNDERFLOW|
+  CLR_AT_START | fifo/format) left configured. vc4 order: PV_CONTROL with
+  FIFO_CLR → |= EN → PV_V_CONTROL |= VIDEN. VIDEN/EN/FIFO_CLR are bits 0-1 → the
+  byte-0 u32 write reaches them even though PV_V_CONTROL is at a 4-mod-8 offset.
+- **Two register blocks** on VC-IV: the HDMI core at 0x7e902000 (ARM 0x3F902000:
+  SW_RESET_CONTROL 0x004, FIFO_CTL 0x05c, RAM_PACKET_CONFIG 0x0a0,
+  SCHEDULER_CONTROL 0x0c0, TX_PHY_RESET_CTL 0x2c0, TX_PHY_CTL0 0x2c4) and the
+  **HD block at 0x7e808000 (ARM 0x3F808000: M_CTL 0x00c, VID_CTL 0x038,
+  CSC_CTL 0x040)**. "HDMI+0x38" is the wrong block for VID_CTL.
+- **Encoder cleared** (matches vc4_hdmi_encoder_disable): `HD_VID_CTL` had ENABLE
+  clear (read 0x100000), `SCHEDULER_CONTROL=0xcb028` (MODE_HDMI bit 0 clear,
+  HDMI_ACTIVE bit 1 clear; MANUAL_FORMAT bit 15 + IGNORE_VSYNC_PREDICTS bit 5
+  still set), `RAM_PACKET_CONFIG` not enabled. Re-enable: `VID_CTL ←
+  ENABLE|UNDERFLOW_ENABLE|FRAME_COUNTER_RESET|CLRRGB|BLANK_INSERT_EN = 0xE0C00000`
+  via STP (reads back 0xc0880000 — FRAME_COUNTER_RESET self-clears, bit 22 RO,
+  bit 19 status), `SCHEDULER_CONTROL |= MODE_HDMI` (byte-0 write), then wait
+  `HDMI_ACTIVE`, then `RAM_PACKET_CONFIG ← 0x10000` (bit 16 → STP).
+- **PHY held in reset and range-powered-down:** `TX_PHY_RESET_CTL=0x1ff`,
+  `TX_PHY_CTL0=0x8e000000` (bit 25 = RNG_PWRDN set). vc4 phy_init: RESET_CTL ← 0xf,
+  udelay, ← 0 (byte-0 writes suffice). phy_rng_enable clears CTL0 bit 25 — BUT
+  TX_PHY_CTL0 is at 0x2c4 (4-mod-8): unreachable by u32 (byte 0 only) and by STP
+  (it is the dropped hi word of an STP at 0x2c0). Candidate: a NEON `ST1 {V0.4S},
+  [X0]` — a 16-byte transaction whose element alignment is 4, legal at 0x2c4, whose
+  low quarter is exactly the four bytes of CTL0. Untested; only needed if
+  HDMI_ACTIVE refuses to assert with RNG powered down.
+- Also in vc4's pre-configure: `SW_RESET_CONTROL ← HDMI|FORMAT_DETECT (0x3) then 0`;
+  `HD_M_CTL ← SW_RST (0x4), 0, ENABLE (0x1)`; `FIFO_CTL |= MASTER_SLAVE_N (bit 0)`.
+- Webcam note: the "blue screen" was **U-Boot's console framebuffer** (blue
+  background, white text, U-Boot logo) persisting into Modus until `rel-fb` blanks
+  it — not a camera artifact. Pure black with no backlight glow = no signal.
 
 ### VERDICT (2026-09-16, REVISED ABOVE — kept for the record): the ARM-side FRAMEBUFFER_RELEASE-ONLY path cannot render
 

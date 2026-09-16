@@ -148,16 +148,15 @@
   "After a FB release, wait (bounded by REAL time via get-internal-real-time, so
    it is immune to interpret-vs-JIT speed) until the HVS reads 32-bit.  Returns T
    if the window opened within MS milliseconds, NIL on timeout."
-  (let ((deadline (+ (get-internal-real-time)
-                     (truncate (* ms internal-time-units-per-second) 1000)))
-        (i 0))
+  ;; Bound by the BCM SYSTEM TIMER (0x3F003004, a free-running 1 MHz microsecond
+  ;; counter) rather than get-internal-real-time — the latter did NOT advance on
+  ;; some boots, so the routine ground for minutes on the iteration cap.  The
+  ;; system timer always advances; (logand ... #xFFFFFFFF) handles its 32-bit wrap.
+  (let ((start (mem-ref #x3F003004 :u32)) (lim (* ms 1000)))
     (loop
       (when (not (hvs-8bit-p)) (return t))
-      (when (> (get-internal-real-time) deadline) (return nil))
-      ;; hard iteration cap — a belt-and-suspenders guard so a stuck/unadvancing
-      ;; timer can NEVER hang the routine (a hang here wedged the board once).
-      (when (> i 200000000) (return nil))
-      (setq i (+ i 1)))))
+      (when (> (logand (- (mem-ref #x3F003004 :u32) start) #xFFFFFFFF) lim)
+        (return nil)))))
 
 (defun hvs-active-channel ()
   "Which display channel the firmware left ENABLEd (bit31 of DISPCTRLX).  Meaningful
@@ -271,3 +270,16 @@
         (hvs-wr #x20 900)                            ; DISPLIST0 = slot 900
         (list :ctrl (hvs-rd #x00) :bg (hvs-rd #x44)
               :slot (hvs-slot-rd 900) :dl (hvs-rd #x20)))))
+
+(defun hvs-rt ()
+  "DRIVE-ONLY diagnostic — no release, no spin-wait, so it CANNOT hang (the atomic
+   hvs-regtest/hvs-overlay-on reliably wedge the board).  The caller polls DISPCTRL
+   over serial and calls this the instant the window is open.  Writes DISPBKGND + a
+   SRAM slot + DISPLIST, then reads DISPCTRL ALONGSIDE them in one form: if :ctrl is
+   32-bit (window still open) yet :bg / :dl read back 0x646472xx while :slot is the
+   full 0x80000000, control-register writes genuinely don't stick -> ARM-side path
+   cannot render."
+  (hvs-wr #x44 (logior #x01000000 #x00FF00))
+  (hvs-slot-wr 900 #x80000000)
+  (hvs-wr #x20 900)
+  (list :ctrl (hvs-rd #x00) :bg (hvs-rd #x44) :slot (hvs-slot-rd 900) :dl (hvs-rd #x20)))

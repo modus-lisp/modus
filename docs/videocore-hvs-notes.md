@@ -268,6 +268,52 @@ serial REPL prints BARE values (`42`, `T`, `NIL`) with a `> ` prompt, no `= `
 prefix; transmitting a long form costs ~1.4 s (12 ms/char) — which is why detect-
 then-drive must be ONE on-board form, never two serial round-trips.
 
+### VERDICT (2026-09-16): the ARM-side FRAMEBUFFER_RELEASE path CANNOT render
+
+After exhaustive board testing with the user watching the physical monitor, the
+ARM-side release path is a dead end for actually putting pixels up:
+
+- A release **blanks the display — the screen is DARK, always** (confirmed at the
+  monitor; earlier "solid color" grabs were a webcam blue-cast artifact).
+- It grants a **transient 32-bit READ of DISPCTRL** (`0x9a0c0fff`/`0x9A0F00FF`) and
+  **32-bit dlist-SRAM writes** (a slot reliably holds `0x80000000`).
+- But **control-register WRITES never render.** `hvs-rt` and direct probes: writing
+  `DISPBKGND` (FILL|green) and `DISPLIST`→(END-only dlist) back-to-back in a
+  confirmed-open window leaves the screen DARK. Readbacks always revert to
+  `0x646472xx` (a write also appears to close the DISPCTRL read-window: pure reads
+  held it 10 s in sd6, the first write reverted it). So we can build a dlist in
+  SRAM but cannot commit it (point a channel at it) from the ARM.
+- Likely cause: `FRAMEBUFFER_RELEASE` tears down scanout / leaves the channel
+  disabled, OR the register-write bus is byte-narrow regardless of the read-window.
+  Either way the effect is the same — no ARM-side render. This fits that mainline
+  vc4 never uses FRAMEBUFFER_RELEASE to take over; it does a full modeset
+  (ioremap + program HVS/PV/HDMI/clocks directly), which the firmware-owned Zero
+  does not expose to the ARM the way it does on a KMS-driven Linux.
+
+Also confirmed: the window is non-deterministic and per-boot-limited; the atomic
+on-board drivers (`hvs-overlay-on`, `hvs-regtest`) reliably WEDGE the board (a
+control-register write inside the routine hangs it / the wait grinds), whereas the
+decomposed serial approach (`hvs-rt`, poll-then-fire) does not hang. `wait-window`
+now bounds on the BCM system timer (0x3F003004) since get-internal-real-time did
+not advance on some boots.
+
+**RECOMMENDATION.** Stop pursuing the ARM-side FRAMEBUFFER_RELEASE overlay. The two
+realistic routes to real pixels on the Zero:
+1. **VPU-side (librerpi/lk-overlay).** The HVS is natively fully accessible from
+   the VideoCore VPU — no firmware handover, no byte-narrow bus. Run a small display
+   component there; the ARM feeds it YUV. This is the most promising path and is a
+   distinct, sizeable workstream (build/load a VPU program).
+2. **Full ARM-side vc4-style modeset.** Reproduce what Linux does — own HVS + PV +
+   HDMI + clocks from scratch, without relying on the firmware FB. Largest effort;
+   and the byte-narrow-write observation suggests the firmware may not even expose
+   the register block writably to the ARM in the firmware-owned boot mode, so this
+   may require booting the firmware in a mode that hands the display to the ARM
+   (the KMS-equivalent) first.
+
+The 60 fps VP8-on-screen goal is therefore blocked on a VPU-side or full-modeset
+effort, not on more mailbox/register poking. The blit-side perf work
+(reference_reel_perf_profile) remains independently valid.
+
 ### The two real paths (SUPERSEDED — kept for context; the small path above wins)
 
 1. **ARM owns the whole display pipeline** (real vc4-style): boot with the

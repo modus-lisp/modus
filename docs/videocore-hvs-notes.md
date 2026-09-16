@@ -268,7 +268,162 @@ serial REPL prints BARE values (`42`, `T`, `NIL`) with a `> ` prompt, no `= `
 prefix; transmitting a long form costs ~1.4 s (12 ms/char) — which is why detect-
 then-drive must be ONE on-board form, never two serial round-trips.
 
-### VERDICT (2026-09-16): the ARM-side FRAMEBUFFER_RELEASE path CANNOT render
+### Session 5 (2026-09-16) — "what would Linux do?": the REAL handoff, and the last wall
+
+The VERDICT below is REVISED by this session. Asking what Linux actually does
+(reading `vc4_drv.c`, not just `vc4_hvs.c`) found the step we had never sent:
+
+- **`RPI_FIRMWARE_NOTIFY_DISPLAY_DONE` (property tag `0x00030066`, zero-length
+  payload).** `vc4_drm_bind()` sends it (after `drm_aperture_remove_framebuffers`,
+  BEFORE binding the HVS) to tell the firmware the ARM is taking over the display.
+  `FRAMEBUFFER_RELEASE` only frees the buffer — the firmware's own VPU display
+  service keeps running and re-asserts, which is exactly the "transient window that
+  closes on write" we measured. After NOTIFY_DISPLAY_DONE: `DISPCTRL` reads
+  `0x9a0c0000` STABLY (low 12 bits — the firmware's irq/status enables — cleared)
+  and **no longer reverts on a write**. The firmware is quiescent. (Tag resp word
+  read 0/0xAAAAAAAA — don't trust that; the hardware effect is unambiguous.)
+- **Then power+clock bring the register file alive.** Earlier negative results for
+  SET_DOMAIN_STATE/SET_CLOCK_STATE were taken while the firmware was still fighting.
+  Post-notify: VIDEO_SCALER domain (mbox id 3) + CORE clock (4) → every HVS register
+  reads a clean 32-bit value (the `0x646472xx` "ddr" filler is GONE; e.g. 0x44 →
+  `0x00000000`, 0x20 → `0x00000084`). HDMI domain (5) → the pixelvalve
+  (`PV2_CONTROL` `0x70697805` "pix"-filler → real `0x177005`, EN set) and HDMI core
+  (`0x0` → `0x600`) come alive too. So the `0x646472`/`"pix"` pattern = an
+  UNPOWERED/unclocked block's read signature [byte][3-char block tag], not a bus
+  keeper.
+- **THE LAST WALL — write width.** With everything quiescent and powered, ARM
+  WRITES to any HVS register latch ONLY byte 0: `DISPCTRL` (`0x9a0d00ff` → upper
+  byte unchanged), `DISPCTRLX0` (`0x80780438` → `0x38`), `DISPLIST0` (`900`/0x384 →
+  `0x84`), `DISPBKGND` (`0x0100ff00` → `0x0`). Uniform, and unchanged by every
+  firmware lever (notify; domains 3/5/7/10; clocks 4/9/5; SET_DISPLAY_POWER).
+  Byte-wise `:u8` stores to lanes 1–3 don't latch either (`:u8` IS a real STRB —
+  verified in translate-aarch64 — though the primitive showed a lossy RMW quirk on
+  SRAM). Meanwhile the dlist SRAM at +0x2000 — SAME 2 MB MMU block, SAME attribute,
+  SAME instruction — takes full 32-bit writes. V3D never woke (`0xDEADBEEF` even
+  with domain 10 + clock 5), so it couldn't serve as a second-block discriminator.
+- Reads are full-width, so `DISPCTRL` bits 8–11 reading back `0x0` after a write
+  of `0xf` are just read-only status bits — real register behaviour, not narrowness.
+- Monitor: pure black with no backlight after the handoff (scanout stops; Linux
+  re-enables PV+HDMI). We powered PV/HDMI; they read real values.
+
+**Diagnosis of the wall.** Same store instruction → full word into the SRAM, byte 0
+into the register file 0x2000 bytes away. That is the VC-side SLAVE treating the
+identical transaction differently — and the two slaves are different kinds: the
+dlist SRAM is a plain memory slave, the register file sits behind an APB bridge. A
+bridge can legitimately downsize a STRONGLY-ORDERED write (`Device-nGnRnE`, which
+boot-rpi-cl.lisp uses: MAIR attr1 = 0x00) while passing a normal device write
+(`Device-nGnRE`, MAIR 0x04 — what Linux `ioremap` uses) full-width. That single
+attribute is the LAST structural difference between our write and Linux's at the
+moment it hits the bus, and it explains every observation (mailbox and SRAM work:
+different slaves). It cannot be changed at runtime (needs `msr mair_el2`; no Lisp
+primitive) → **NEXT TEST: rebuild with MAIR attr1 = 0x04 (nGnRE) and rerun
+notify → power/clock → register write.** If writes go full-width, the ARM-side
+overlay is UNBLOCKED (the dlist is already word-writable; PV/HDMI are powered). If
+still byte-0, the remaining candidates are EL2-vs-EL1 or a genuine ARM-aperture
+limit → VPU-side.
+
+Recipe that now gives a stable, alive HVS (all over serial; forms in
+net/hdmi-hvs.lisp + a cloned `hvs-notify-done` = rel-fb with tag 196710):
+`(hvs-rel-fb)` → `(hvs-notify-done)` → `(mb2 229424 3 3)` `(mb2 229377 4 1)` →
+(optional `(mb2 229424 5 3)` for PV/HDMI) → registers read real 32-bit.
+
+**VALIDATED (session 5, later): the write wall is an exact 4:1 downsizing.** With the
+HVS alive, a 64-bit store latches exactly 2 bytes where a 32-bit store latches 1 —
+confirmed with PREDICTED values on two registers: `(setf (mem-ref DISPLIST0 :u64)
+450)` (`:u64` stores the tagged word, 450<<1 = 0x384) read back exactly `0x384`;
+`(setf (mem-ref DISPCTRLX0 :u64) 21845)` (→0xAAAA) read back exactly `0xaaaa`. The
+bridge keeps the LOW QUARTER of each write. Consequences: (1) a 128-bit store
+(`STP Xt1,Xt2` — `a64-stp-offset` exists in translate-aarch64) should latch a full
+32-bit register even under nGnRnE — a fallback primitive if the attribute isn't the
+cause; (2) 16-bit writes already suffice for `DISPLIST` (slot < 4096) but NOT for
+`DISPCTRLX.ENABLE` (bit 31) or `DISPBKGND.FILL` (bit 24), so a render needs one of
+the two 32-bit paths. Wide stores are NEIGHBOR-SAFE: a `DISPLIST1` sentinel (0x55)
+survived a 64-bit store to `DISPLIST0` — dropped upper bytes are discarded, not
+zeroed. GOTCHA: `:u64` stores to Device memory MUST be 8-byte aligned — a 64-bit
+store to 0x24 was a silent alignment fault that wedged the board (0x20/0x40 fine).
+
+**Bring-up sequencing that works reliably** (a notify sent a fixed 1 s after the
+release, without waiting, failed once): `(hvs-rel-fb)` → POLL `DISPCTRL` until it
+leaves `0x646472xx` (the async handover; poll 0 sometimes, ~1.2 s typical) →
+`(hvs-notify-done)` → `(mb2 229424 3 3)` → `(mb2 229377 4 1)` → registers alive.
+
+**Two images now exist:** `board-demo6.img.gz` (nGnRnE, the one all the above was
+measured on) and `board-demo7.img.gz` (built 2026-09-16 from the same tree with
+boot-rpi-cl.lisp MAIR attr1 = 0x04 / Device-nGnRE; `mvm/build-rpi-cl-repl.lisp`,
+MODUS_NET_BUILD=1 MODUS_RPI_MINIUART=1, no SSH — serial-driven; 63,715,600 bytes,
+`tmp/piboot/kernel8.img`). The decisive test = the same bring-up + a plain 32-bit
+register write on demo7: full 32 bits → the attribute was the cause; still 8 bits →
+build the STP primitive.
+
+**nGnRE REFUTED (demo7).** The Device-nGnRE image boots and drives the board
+identically, and with the register file reading clean a u32 write of `0x184` to
+`DISPLIST0` still read back `0x384` (byte 1 untouched); `DISPCTRLX0 ← 0x80780438`
+read `0x38` with visible zero upper bytes; u64 → `0xaaaa` (4:1 intact). The
+memory attribute is NOT the cause — the 4:1 downsizing is the bridge's own
+behaviour. boot-rpi-cl.lisp reverted to nGnRnE (comment records the experiment).
+Note: right after bring-up the non-DISPCTRL registers can transiently read the
+`0x646472` filler for a few seconds before going clean — re-read before judging.
+
+**Alignment corollary of the 4:1 model.** Device memory faults on misaligned
+accesses (a u64 store to 0x24 silently wedged the board), so a register at a
+4-mod-8 offset (0x04, 0x0c, 0x24, 0x2c, 0x34, 0x44 = DISPBKGND, 0x4c, 0x54, 0x64)
+can ONLY ever be reached by a 32-bit store → 8 bits. `DISPBKGND.FILL` (bit 24) is
+therefore unreachable from the ARM: **background fill is out; render colour with a
+PLANE**, whose whole descriptor (CTL0/POS/PTR/pitch) lives in the fully
+word-writable dlist SRAM. The two registers a render needs are both 8-aligned:
+`DISPLIST0` (0x20; slot < 4096 fits the 16 bits a u64 gives) and `DISPCTRLX0`
+(0x40; needs bit 31 → a 128-bit store).
+
+**The 128-bit vehicle, no rebuild:** `(%mmap-exec-page 4096)` → poke raw
+AArch64 words with `(setf (mem-ref … :u32) w)` → `(%jit-icache-flush p 4096)` →
+`(%jit-call p)`. Hand-assembled routine (args via a scratch block at 0x12000000
+= [addr,0,lo,0,hi,0] as u32s): `MOVZ X3,#0x1200,LSL#16` (D2A24003); `LDR X0,[X3]`
+(F9400060); `LDR X1,[X3,#8]` (F9400461); `LDR X2,[X3,#16]` (F9400862);
+`STP X1,X2,[X0]` (A9000801); `RET` (D65F03C0). Prediction from 4:1: STP at 0x40
+latches `DISPCTRLX0` in full (low 32 of the 128-bit write); bytes 4-15 dropped, so
+`DISPBKGND` (0x44) untouched. A proper primitive later = a pair-store width in
+`a64-str-width` (STP helpers already exist) plus compiler plumbing for two values.
+Pixel-buffer coherency for the plane: no dc-cvac primitive, but `%jit-icache-flush`
+does `DC CVAU` (clean to PoU) over a range — try PTR0 via the L2-cached VC alias
+(0x40000000|phys) + that clean, instead of the uncached 0xC0000000 alias.
+
+### ★★★ BREAKTHROUGH (2026-09-16): a 128-bit STP latches a FULL 32-bit HVS register
+
+The 4:1 extrapolation was right. Via the exec-page vehicle above, the hand-assembled
+`STP X1,X2,[X0]` at `DISPCTRLX0` (0x40) took it from `0xaaaa` to **`0x80780438`**
+(ENABLE | 1920x1080) — all four bytes — with pre/post markers in the scratch block
+proving the routine ran straight through the STP (no bus abort), and `DISPBKGND`
+(0x44, the dropped upper quarter) untouched. **The ARM CAN fully program every
+8-aligned HVS register.** Channel 0 is enabled and scanning our dlist.
+
+**GOTCHA that cost several attempts: the JIT-exec traps have NO interpreter arm.**
+`%jit-icache-flush` / `%jit-call` typed at the REPL are evaluated by the
+INTERPRETER (the JIT is hot-form only, `*jit-hot-only*` T) — the compiled MVM op
+sequence runs, but the `:trap` does nothing there, so the flush returned its base,
+`%jit-call` returned 0, and a `MOVZ X0,#0x1234; RET` callee "didn't run".
+`(setq *jit-hot-only* nil)` makes every form JIT-compile (native trap executes;
+`*jit-fallback-count*` stayed 0) and it all works. `%mmap-exec-page` works either
+way because the JIT machinery itself calls it natively (its bump pointer advances
+with every hot form, which is why my consecutive pages weren't 4 KB apart).
+(`%mmap-exec-page` result printed as `4096` once = my parser catching the echoed
+argument; the real pages are in [0x14000000, 0x18000000).)
+
+**Working recipe for a full 32-bit register write (demo6 OR demo7, serial):**
+`(setq *jit-hot-only* nil)`; `p=(%mmap-exec-page 4096)`; poke words
+`D2A24003 F9400060 F9400461 F9400862 A9000801 D65F03C0` (MOVZ X3,#0x1200,LSL#16;
+LDR X0,[X3]; LDR X1,[X3,#8]; LDR X2,[X3,#16]; STP X1,X2,[X0]; RET) with
+`(setf (mem-ref (+ p 4i) :u32) w)`; `(%jit-icache-flush p 4096)`; write the scratch
+block at 0x12000000 = [addr,0,lo,0,hi,0] as u32s; `(%jit-call p)`. `lo` lands in
+the 8-aligned register at `addr` in full. Proper primitive to follow: a pair-store
+width in `a64-str-width` (STP helpers exist) + compiler plumbing (`%setf-mem-ref`).
+
+Remaining to first pixels: a PLANE in SRAM (word-writable) → a coherent pixel
+buffer (no dc-cvac primitive, but `%jit-icache-flush` = DC CVAU to PoU; point PTR0
+through the L2-cached VC alias 0x40000000|phys) → and scanout: the monitor showed
+no backlight after the handoff, so PV2 (0x3F807000) / HDMI (0x3F902000) may need
+re-enabling — both 8-aligned, so STP-writable the same way.
+
+### VERDICT (2026-09-16, REVISED ABOVE — kept for the record): the ARM-side FRAMEBUFFER_RELEASE-ONLY path cannot render
 
 After exhaustive board testing with the user watching the physical monitor, the
 ARM-side release path is a dead end for actually putting pixels up:
@@ -346,6 +501,24 @@ with the firmware FB plane + a scaled YUV plane (format 8, BT.601 CSC
   the plain board back for other work.
 - Netboot from modus-pi: `python3 ~/netboot-gz.py --img board-demo6.img.gz
   --send '(ssh-boot)' --send-delay 240`; wait for NETUP; `ssh test@10.0.0.2`.
+- **modus-pi's SD root fills up** (it hit 100% / 2.5 MB free on 2026-09-16). The
+  failure signature is subtle: `scp` reports a bare "write remote: Failure" but
+  leaves a file of the EXPECTED SIZE that is nonetheless corrupt (`gzip -t` →
+  "invalid compressed data"), and `netboot-gz.py` dies at its first `print`
+  (`OSError: No space left`) leaving a 0-byte log and no process — which looks like
+  a mysterious launch failure. ALWAYS `gzip -t` / md5-verify an uploaded image
+  before it goes into `/srv/tftp`, and upload with a `cat` pipe (clean error) rather
+  than scp. Freed 65 MB by deleting the RAW `/srv/tftp/board-demo.img` (its exact
+  `.gz` twin is what netboot uses); `board-nojit.img` + `board-ql-nojit.core`
+  (quickload milestone), `board-hdmi.img`, `reel-demo.mp4` deliberately kept. `/tmp`
+  on modus-pi is tmpfs — usable as RAM staging.
+- Images: `board-demo6.img.gz` (nGnRnE, all the register-width measurements),
+  `board-demo7.img.gz` (Device-nGnRE, MAIR attr1=0x04; serial-only, no SSH;
+  built from `mvm/build-rpi-cl-repl.lisp` with MODUS_NET_BUILD=1
+  MODUS_RPI_MINIUART=1 MODUS_CL_REPL_OUT=tmp/piboot/kernel8.img; gzip -9; md5
+  3c968af84b515d8bd19070281873ff3a). Serial-driven workflow: netboot with
+  `--send-delay 6` (no `(ssh-boot)`), kill netboot-gz once "MODUS-CL" shows, then
+  drive /dev/ttyAMA0 directly (bare-value REPL output, no `= `).
 - HVS probes are RUNTIME-PUSHED (only use `mem-ref` + baked mailbox helpers), no
   rebake: push `net/hdmi-hvs.lisp`'s defuns, then `(hvs-display-on)` `(hvs-dump)`.
 - Image build (has HVS reachable, mailbox, USB net): branch `hdmi-on-main`

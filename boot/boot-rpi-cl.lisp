@@ -455,7 +455,14 @@
       (a64-cmp-reg buf 9 10)
       (a64-bcond buf #b0011 (- l2 (a64-current-index buf))))
     ;; MAIR: attr0 = 0xFF (Normal WB R/W-allocate), attr1 = 0x00 (Device-
-    ;; nGnRnE).  TCR_EL2 0x80803520 = RES1 | T0SZ=32 (4GB VA, start L1,
+    ;; nGnRnE).  NOTE (2026-09-16, HVS investigation): attr1 = 0x04 (Device-
+    ;; nGnRE, what Linux ioremap uses) was tried as a fix for ARM writes to the
+    ;; HVS register file latching only byte 0 (while the dlist SRAM in the SAME
+    ;; 2 MB block took full words).  It booted and ran fine but changed NOTHING
+    ;; about the write width (a u32 write of 0x184 still read back 0x384), so the
+    ;; downsizing is the bridge's own behaviour, not the memory attribute.
+    ;; Reverted to the proven nGnRnE.  See docs/videocore-hvs-notes.md "Session 5".
+    ;; TCR_EL2 0x80803520 = RES1 | T0SZ=32 (4GB VA, start L1,
     ;; 4KB granule) | IRGN0=ORGN0=WB-WA | SH0=inner | PS=4GB.
     (emit-aarch64-u32 buf #xD5033F9F)              ; dsb sy — tables visible
     (emit-aarch64-load-imm64 buf 15 #xFF)

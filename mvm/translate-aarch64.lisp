@@ -4407,6 +4407,89 @@
              (unless (= fd fs)
                (a64-emit buf (logior #x4EA01C00 (ash fs 16) (ash fs 5) fd)))))
 
+          ;; ==== INTEGER LANE class (SIMD 2b) on the same F vregs (v2..v7) ====
+          ;; Every encoding below assembler-verified (aarch64-linux-gnu-as,
+          ;; 2026-09-16; scratchpad neon.s/neon2.s).  Byte address of lane 0 of
+          ;; a u8 array at byte index Vidx (TAGGED) is Varr + (Vidx>>1) + 7.
+          ;; ---- VI-LD Fd, Varr, Vidx, width ----  LDUR S/D/Qd, [x9,#7]
+          ((= op +op-vi-ld+)
+           (let* ((fd (+ 2 (vr 0)))
+                  (parr (ensure-src (vr 1) +a64-x16+))
+                  (pidx (ensure-src (vr 2) +a64-x17+))
+                  (w (vr 3)))
+             (a64-asr-imm buf +a64-x9+ pidx 1)
+             (a64-add-reg buf +a64-x9+ parr +a64-x9+ 0 0)
+             (a64-emit buf (logior (cond ((= w 4) #xBC407000) ((= w 8) #xFC407000) (t #x3CC07000))
+                                   (ash +a64-x9+ 5) fd))))
+          ;; ---- VI-ST Varr, Vidx, Fs, width ----  STUR S/D/Qs, [x10,#7]
+          ((= op +op-vi-st+)
+           (let* ((parr (ensure-src (vr 0) +a64-x16+))
+                  (pidx (ensure-src (vr 1) +a64-x17+))
+                  (fs (+ 2 (vr 2)))
+                  (w (vr 3)))
+             (a64-asr-imm buf +a64-x10+ pidx 1)
+             (a64-add-reg buf +a64-x10+ parr +a64-x10+ 0 0)
+             (a64-emit buf (logior (cond ((= w 4) #xBC007000) ((= w 8) #xFC007000) (t #x3C807000))
+                                   (ash +a64-x10+ 5) fs))))
+          ;; ---- VI-DUP Fd, Vsrc, kind ----  x9 = untagged; DUP Vd.16B/8H/4S, W9
+          ((= op +op-vi-dup+)
+           (let* ((fd (+ 2 (vr 0)))
+                  (ps (ensure-src (vr 1) +a64-x16+))
+                  (kind (vr 2)))
+             (a64-asr-imm buf +a64-x9+ ps 1)
+             (a64-emit buf (logior (cond ((= kind 1) #x4E010C00) ((= kind 2) #x4E020C00) (t #x4E040C00))
+                                   (ash +a64-x9+ 5) fd))))
+          ;; ---- VI-UN Fd, Fs, sub ----  uxtl / sqxtun / sxtl / xtn / mov
+          ((= op +op-vi-un+)
+           (let* ((fd (+ 2 (vr 0))) (fs (+ 2 (vr 1))) (sub (vr 2)))
+             (cond ((= sub 0) (a64-emit buf (logior #x2F08A400 (ash fs 5) fd)))   ; UXTL Vd.8H, Vs.8B
+                   ((= sub 1) (a64-emit buf (logior #x2E212800 (ash fs 5) fd)))   ; SQXTUN Vd.8B, Vs.8H
+                   ((= sub 2) (a64-emit buf (logior #x0F10A400 (ash fs 5) fd)))   ; SXTL Vd.4S, Vs.4H
+                   ((= sub 3) (a64-emit buf (logior #x0E612800 (ash fs 5) fd)))   ; XTN Vd.4H, Vs.4S
+                   (t (unless (= fd fs)
+                        (a64-emit buf (logior #x4EA01C00 (ash fs 16) (ash fs 5) fd)))))))
+          ;; ---- VI-SHIFT Fd, Fs, sub, n ----  immediate shifts (immh:immb in bits 22:16)
+          ((= op +op-vi-shift+)
+           (let* ((fd (+ 2 (vr 0))) (fs (+ 2 (vr 1))) (sub (vr 2)) (n (vr 3)))
+             (a64-emit buf (logior (cond ((= sub 0) (logior #x2F008C00 (ash (- 16 n) 16)))   ; SQRSHRUN Vd.8B, Vs.8H, #n
+                                         ((= sub 1) (logior #x4F000400 (ash (- 32 n) 16)))   ; SSHR Vd.8H, #n
+                                         ((= sub 2) (logior #x4F005400 (ash (+ 16 n) 16)))   ; SHL Vd.8H, #n
+                                         ((= sub 3) (logior #x4F000400 (ash (- 16 n) 16)))   ; SSHR Vd.16B, #n
+                                         (t (logior #x4F000400 (ash (- 64 n) 16))))          ; SSHR Vd.4S, #n
+                                   (ash fs 5) fd))))
+          ;; ---- VI-BIN Fd, Fa, Fb, sub ----  table; mla/mls/bsl accumulate into Fd
+          ((= op +op-vi-bin+)
+           (let* ((fd (+ 2 (vr 0))) (fa (+ 2 (vr 1))) (fb (+ 2 (vr 2))) (sub (vr 3))
+                  (base (case sub
+                          (0 #x4E608400) (1 #x6E608400) (2 #x4E609C00) (3 #x4E609400) (4 #x6E609400)
+                          (5 #x4E60B400) (6 #x6E60B400) (7 #x6E207400) (8 #x6E203C00) (9 #x4E201C00)
+                          (10 #x4EA01C00) (11 #x6E201C00) (12 #x6E601C00) (13 #x4E200C00) (14 #x4E202C00)
+                          (15 #x4E208400) (16 #x6E208400) (17 #x4EA08400) (18 #x6EA08400) (19 #x4EA09C00)
+                          (20 #x0E402800) (21 #x0E406800) (22 #x0E403800) (t #x0E407800))))
+             (a64-emit buf (logior base (ash fb 16) (ash fa 5) fd))))
+          ;; ---- VI-MOVI Fd, kind, val ----  MOVI Vd.16B / Vd.8H, #val  (abc:defgh split)
+          ((= op +op-vi-movi+)
+           (let* ((fd (+ 2 (vr 0))) (kind (vr 1)) (val (vr 2)))
+             (a64-emit buf (logior (if (= kind 1) #x4F00E400 #x4F008400)
+                                   (ash (logand (ash val -5) 7) 16) (ash (logand val 31) 5) fd))))
+          ;; ---- VI-UMOV Vd, Fs, kind, lane ----  UMOV W9, Vs.B/H/S[lane]; tag; store
+          ((= op +op-vi-umov+)
+           (let* ((vd (vr 0)) (fs (+ 2 (vr 1))) (kind (vr 2)) (lane (vr 3))
+                  (imm5 (cond ((= kind 1) (logior (ash lane 1) 1))
+                              ((= kind 2) (logior (ash lane 2) 2))
+                              (t (logior (ash lane 3) 4))))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (a64-emit buf (logior #x0E003C00 (ash imm5 16) (ash fs 5) +a64-x9+))
+             (a64-lsl-imm buf pd +a64-x9+ 1)
+             (unless (a64-phys-reg vd) (store-dst pd vd))))
+          ;; ---- VI-LANE Fd, Fa, Fb, sub, lane ----  8H by-element; lane bits H=11 L=21 M=20
+          ((= op +op-vi-lane+)
+           (let* ((fd (+ 2 (vr 0))) (fa (+ 2 (vr 1))) (fb (+ 2 (vr 2))) (sub (vr 3)) (lane (vr 4))
+                  (base (case sub (0 #x6F400000) (1 #x6F404000) (2 #x4F408000) (3 #x4F40C000) (t #x4F40D000)))
+                  (lbits (logior (ash (logand (ash lane -2) 1) 11) (ash (logand (ash lane -1) 1) 21)
+                                 (ash (logand lane 1) 20))))
+             (a64-emit buf (logior base lbits (ash fb 16) (ash fa 5) fd))))
+
           ;; ---- U8-REF Vd, Varr, Vidx ----  (load one byte from a u8 vector)
           ;; Byte address = (Varr - 9) + 16 + real_idx = Varr + 7 + real_idx.
           ;; Vidx is a TAGGED fixnum (real_idx*2); result is a TAGGED fixnum

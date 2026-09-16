@@ -108,6 +108,10 @@
    #:mvm-v4-lane-load #:mvm-v4-lane-store #:mvm-v4-dup #:mvm-v4-dup-lane-load
    #:mvm-v4-add #:mvm-v4-sub #:mvm-v4-mul #:mvm-v4-div
    #:+op-fp-mov+ #:mvm-fp-mov
+   #:+op-vi-ld+ #:+op-vi-st+ #:+op-vi-dup+ #:+op-vi-un+ #:+op-vi-shift+
+   #:+op-vi-bin+ #:+op-vi-movi+ #:+op-vi-umov+ #:+op-vi-lane+
+   #:mvm-vi-ld #:mvm-vi-st #:mvm-vi-dup #:mvm-vi-un #:mvm-vi-shift
+   #:mvm-vi-bin #:mvm-vi-movi #:mvm-vi-umov #:mvm-vi-lane
    #:mvm-load #:mvm-store #:mvm-fence
    #:mvm-call #:mvm-call-ind #:mvm-ret #:mvm-tailcall
    #:mvm-alloc-cons #:mvm-gc-check #:mvm-gc-check-n #:mvm-gc-check-r
@@ -492,6 +496,20 @@
 (defconstant +op-v4-mul+           #xDF)
 (defconstant +op-v4-div+           #xE0)
 (defconstant +op-fp-mov+           #xE1) ; (fp-mov Fd Fs)  full 128-bit register copy (scalar or vector)
+;; INTEGER LANE class (SIMD plan, layer 2b — reel's kernels): the same F vregs
+;; hold 16 bytes read as u8x16 / s8x16 / s16x8 / s32x4 depending on the op.  No
+;; boxed form: integer vectors exist only in registers and packed u8 arrays.
+;; Each opcode is one NEON instruction; the sub-operation is an :imm8 selector so
+;; the family stays small (see the translator/interpreter arms for the tables).
+(defconstant +op-vi-ld+    #xE2) ; (vi-ld Fd Varr Vidx width)   width 4/8/16 bytes from a u8 array at byte index
+(defconstant +op-vi-st+    #xE3) ; (vi-st Varr Vidx Fs width)
+(defconstant +op-vi-dup+   #xE4) ; (vi-dup Fd Vsrc kind)         fixnum → all lanes; kind 1=16b 2=8h 4=4s
+(defconstant +op-vi-un+    #xE5) ; (vi-un Fd Fs op)              0 uxtl 8b→8h  1 sqxtun 8h→8b  2 sxtl 4h→4s  3 xtn 4s→4h  4 mov
+(defconstant +op-vi-shift+ #xE6) ; (vi-shift Fd Fs op n)         0 sqrshrun 8h→8b #n  1 sshr 8h  2 shl 8h  3 sshr 16b  4 sshr 4s
+(defconstant +op-vi-bin+   #xE7) ; (vi-bin Fd Fa Fb op)          see *vi-bin-ops*: add/sub/mul/mla/mls/sqdmulh/uabd/cmhs/and/orr/eor/bsl/sqadd/sqsub/…
+(defconstant +op-vi-movi+  #xE8) ; (vi-movi Fd kind val)         immediate 0..255 into every lane; kind 1=16b 2=8h
+(defconstant +op-vi-umov+  #xE9) ; (vi-umov Vd Fs kind lane)     one lane → fixnum; kind 1=b 2=h 4=s
+(defconstant +op-vi-lane+  #xEA) ; (vi-lane Fd Fa Fb op lane)    8h by-element: 0 mla 1 mls 2 mul 3 sqdmulh 4 sqrdmulh, Fb.h[lane]
 
 ;;; ============================================================
 ;;; Opcode Metadata Table
@@ -698,6 +716,15 @@
 (defopcode :v4-mul           #xDF (:reg :reg :reg) "f32x4 mul")
 (defopcode :v4-div           #xE0 (:reg :reg :reg) "f32x4 div")
 (defopcode :fp-mov           #xE1 (:reg :reg)      "FP vreg copy (128-bit)")
+(defopcode :vi-ld    #xE2 (:reg :reg :reg :imm8)       "u8 array bytes → FP vreg lanes (width 4/8/16)")
+(defopcode :vi-st    #xE3 (:reg :reg :reg :imm8)       "FP vreg lanes → u8 array bytes (width 4/8/16)")
+(defopcode :vi-dup   #xE4 (:reg :reg :imm8)            "fixnum → every lane (kind 1/2/4 bytes)")
+(defopcode :vi-un    #xE5 (:reg :reg :imm8)            "lane unary: uxtl/sqxtun/sxtl/xtn/mov")
+(defopcode :vi-shift #xE6 (:reg :reg :imm8 :imm8)      "lane shift by immediate: sqrshrun/sshr/shl")
+(defopcode :vi-bin   #xE7 (:reg :reg :reg :imm8)       "lane binary op (table)")
+(defopcode :vi-movi  #xE8 (:reg :imm8 :imm8)           "immediate byte → every lane")
+(defopcode :vi-umov  #xE9 (:reg :reg :imm8 :imm8)      "one lane → fixnum")
+(defopcode :vi-lane  #xEA (:reg :reg :reg :imm8 :imm8) "s16x8 by-element mla/mls/mul/sqdmulh/sqrdmulh")
 
 ;;; ============================================================
 ;;; Memory Width Constants
@@ -1170,6 +1197,16 @@
 (defun mvm-v4-mul (buf fd fa fb) (encode-instruction buf +op-v4-mul+ fd fa fb))
 (defun mvm-v4-div (buf fd fa fb) (encode-instruction buf +op-v4-div+ fd fa fb))
 (defun mvm-fp-mov (buf fd fs) (encode-instruction buf +op-fp-mov+ fd fs))
+
+(defun mvm-vi-ld (buf fd varr vidx width) (encode-instruction buf +op-vi-ld+ fd varr vidx width))
+(defun mvm-vi-st (buf varr vidx fs width) (encode-instruction buf +op-vi-st+ varr vidx fs width))
+(defun mvm-vi-dup (buf fd vsrc kind) (encode-instruction buf +op-vi-dup+ fd vsrc kind))
+(defun mvm-vi-un (buf fd fs op) (encode-instruction buf +op-vi-un+ fd fs op))
+(defun mvm-vi-shift (buf fd fs op n) (encode-instruction buf +op-vi-shift+ fd fs op n))
+(defun mvm-vi-bin (buf fd fa fb op) (encode-instruction buf +op-vi-bin+ fd fa fb op))
+(defun mvm-vi-movi (buf fd kind val) (encode-instruction buf +op-vi-movi+ fd kind val))
+(defun mvm-vi-umov (buf vd fs kind lane) (encode-instruction buf +op-vi-umov+ vd fs kind lane))
+(defun mvm-vi-lane (buf fd fa fb op lane) (encode-instruction buf +op-vi-lane+ fd fa fb op lane))
 
 ;; Memory
 (defun mvm-load (buf vd vaddr width)

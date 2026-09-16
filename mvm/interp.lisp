@@ -363,6 +363,66 @@
 
 (declaim (inline fetch-byte fetch-reg fetch-u16 fetch-s32 fetch-u32 fetch-u64 fetch-li-value))
 
+;;; ---- integer-lane reference helpers (SIMD 2b).  A lane value is a 16-byte
+;;; u8 vector; KIND is the lane width in bytes (1/2/4); lanes are little-endian.
+;;; Pure fixnum arithmetic, no runtime calls: an interpreter arm must not
+;;; re-enter an opcode (see the fround32 note).
+(defun %vlane-new () (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+(defun %vlane-get (v k kind signed)
+  "Lane K of KIND bytes; SIGNED = two's complement."
+  (let ((u 0) (i (* k kind)))
+    (dotimes (b kind) (setq u (logior u (ash (aref v (+ i b)) (* 8 b)))))
+    (if (and signed (logbitp (- (* 8 kind) 1) u)) (- u (ash 1 (* 8 kind))) u)))
+(defun %vlane-set (v k kind x)
+  "Store X into lane K of KIND bytes, wrapping modulo 2^(8*kind)."
+  (let ((i (* k kind)) (u (logand x (- (ash 1 (* 8 kind)) 1))))
+    (dotimes (b kind) (setf (aref v (+ i b)) (logand (ash u (- (* 8 b))) 255)))
+    v))
+(defun %vlane-sat (x lo hi) (if (< x lo) lo (if (> x hi) hi x)))
+(defun %vlane-sqdmulh (a b round)
+  ;; (2*a*b [+ 2^15]) >> 16, saturated to s16 (only -32768*-32768 overflows)
+  (%vlane-sat (ash (+ (* 2 a b) (if round 32768 0)) -16) -32768 32767))
+(defun %vlane-bin (sub d a b)
+  "The :vi-bin table.  D is the destination's OLD value (accumulator ops)."
+  (let ((v (%vlane-new)))
+    (cond
+      ((<= sub 6)                                     ; s16x8: add sub mul mla mls sqdmulh sqrdmulh
+       (dotimes (k 8)
+         (let ((x (%vlane-get a k 2 t)) (y (%vlane-get b k 2 t)) (acc (%vlane-get d k 2 t)))
+           (%vlane-set v k 2 (cond ((= sub 0) (+ x y)) ((= sub 1) (- x y)) ((= sub 2) (* x y))
+                                ((= sub 3) (+ acc (* x y))) ((= sub 4) (- acc (* x y)))
+                                ((= sub 5) (%vlane-sqdmulh x y nil)) (t (%vlane-sqdmulh x y t)))))))
+      ((= sub 7) (dotimes (k 16) (setf (aref v k) (abs (- (aref a k) (aref b k))))))          ; uabd u8
+      ((= sub 8) (dotimes (k 16) (setf (aref v k) (if (>= (aref a k) (aref b k)) 255 0))))    ; cmhs u8
+      ((= sub 9) (dotimes (k 16) (setf (aref v k) (logand (aref a k) (aref b k)))))           ; and
+      ((= sub 10) (dotimes (k 16) (setf (aref v k) (logior (aref a k) (aref b k)))))          ; orr
+      ((= sub 11) (dotimes (k 16) (setf (aref v k) (logxor (aref a k) (aref b k)))))          ; eor
+      ((= sub 12) (dotimes (k 16)                                                             ; bsl: d = (d&a) | (~d&b)
+                    (setf (aref v k) (logior (logand (aref d k) (aref a k))
+                                             (logand (logxor (aref d k) 255) (aref b k))))))
+      ((= sub 13) (dotimes (k 16) (%vlane-set v k 1 (%vlane-sat (+ (%vlane-get a k 1 t) (%vlane-get b k 1 t)) -128 127))))  ; sqadd s8
+      ((= sub 14) (dotimes (k 16) (%vlane-set v k 1 (%vlane-sat (- (%vlane-get a k 1 t) (%vlane-get b k 1 t)) -128 127))))  ; sqsub s8
+      ((= sub 15) (dotimes (k 16) (%vlane-set v k 1 (+ (aref a k) (aref b k)))))                 ; add u8 (wrap)
+      ((= sub 16) (dotimes (k 16) (%vlane-set v k 1 (- (aref a k) (aref b k)))))                 ; sub u8 (wrap)
+      ((<= sub 19) (dotimes (k 4)                                                             ; s32x4 add sub mul
+                     (let ((x (%vlane-get a k 4 t)) (y (%vlane-get b k 4 t)))
+                       (%vlane-set v k 4 (cond ((= sub 17) (+ x y)) ((= sub 18) (- x y)) (t (* x y)))))))
+      (t (dotimes (k 4)                                                                       ; trn1/trn2/zip1/zip2 .4h (low 8 bytes)
+           (let ((x (cond ((= sub 20) (if (evenp k) (%vlane-get a k 2 nil) (%vlane-get b (- k 1) 2 nil)))
+                          ((= sub 21) (if (evenp k) (%vlane-get a (+ k 1) 2 nil) (%vlane-get b k 2 nil)))
+                          ((= sub 22) (if (evenp k) (%vlane-get a (ash k -1) 2 nil) (%vlane-get b (ash k -1) 2 nil)))
+                          (t (if (evenp k) (%vlane-get a (+ 2 (ash k -1)) 2 nil) (%vlane-get b (+ 2 (ash k -1)) 2 nil))))))
+             (%vlane-set v k 2 x)))))
+    v))
+(defun %vlane-lane (sub d a b lane)
+  "The :vi-lane table: s16x8 by-element with B.h[LANE]."
+  (let ((v (%vlane-new)) (y (%vlane-get b lane 2 t)))
+    (dotimes (k 8)
+      (let ((x (%vlane-get a k 2 t)) (acc (%vlane-get d k 2 t)))
+        (%vlane-set v k 2 (cond ((= sub 0) (+ acc (* x y))) ((= sub 1) (- acc (* x y))) ((= sub 2) (* x y))
+                             ((= sub 3) (%vlane-sqdmulh x y nil)) (t (%vlane-sqdmulh x y t))))))
+    v))
+
 (defun fetch-byte (bc pc)
   (values (aref bc pc) (1+ pc)))
 
@@ -1856,6 +1916,94 @@
              (multiple-value-bind (fs npc2) (fetch-reg bc npc)
                (setf (svref fregs fd) (svref fregs fs))
                (setf pc npc2))))
+
+          ;; ---- INTEGER LANE class (SIMD plan 2b, reference arm): an FP slot
+          ;; holds a 16-byte u8 vector; each op reads it as the lane kind the
+          ;; NEON instruction would (little-endian lanes).  These arms ARE the
+          ;; semantics the native arms are checked against, so every wrap /
+          ;; saturation / rounding rule is spelled out here (%vi-* helpers).
+          (#.+op-vi-ld+
+           (multiple-value-bind (fd npc) (fetch-reg bc pc)
+             (multiple-value-bind (varr npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vidx npc3) (fetch-reg bc npc2)
+                 (multiple-value-bind (w npc4) (fetch-byte bc npc3)
+                   (let ((a (svref regs varr)) (i (svref regs vidx)) (v (%vlane-new)))
+                     (dotimes (k w) (setf (aref v k) (%u8-ref a (+ i k))))
+                     (setf (svref fregs fd) v))
+                   (setf pc npc4))))))
+          (#.+op-vi-st+
+           (multiple-value-bind (varr npc) (fetch-reg bc pc)
+             (multiple-value-bind (vidx npc2) (fetch-reg bc npc)
+               (multiple-value-bind (fs npc3) (fetch-reg bc npc2)
+                 (multiple-value-bind (w npc4) (fetch-byte bc npc3)
+                   (let ((a (svref regs varr)) (i (svref regs vidx)) (v (svref fregs fs)))
+                     (dotimes (k w) (%u8-set a (+ i k) (aref v k))))
+                   (setf pc npc4))))))
+          (#.+op-vi-dup+
+           (multiple-value-bind (fd npc) (fetch-reg bc pc)
+             (multiple-value-bind (vs npc2) (fetch-reg bc npc)
+               (multiple-value-bind (kind npc3) (fetch-byte bc npc2)
+                 (let ((x (svref regs vs)) (v (%vlane-new)))
+                   (dotimes (k (floor 16 kind)) (%vlane-set v k kind x))
+                   (setf (svref fregs fd) v))
+                 (setf pc npc3)))))
+          (#.+op-vi-un+
+           (multiple-value-bind (fd npc) (fetch-reg bc pc)
+             (multiple-value-bind (fs npc2) (fetch-reg bc npc)
+               (multiple-value-bind (sub npc3) (fetch-byte bc npc2)
+                 (let ((s (svref fregs fs)) (v (%vlane-new)))
+                   (cond ((= sub 0) (dotimes (k 8) (%vlane-set v k 2 (aref s k))))                       ; uxtl 8b->8h
+                         ((= sub 1) (dotimes (k 8) (setf (aref v k) (%vlane-sat (%vlane-get s k 2 t) 0 255)))) ; sqxtun 8h->8b
+                         ((= sub 2) (dotimes (k 4) (%vlane-set v k 4 (%vlane-get s k 2 t))))                 ; sxtl 4h->4s
+                         ((= sub 3) (dotimes (k 4) (%vlane-set v k 2 (%vlane-get s k 4 t))))                 ; xtn 4s->4h
+                         (t (dotimes (k 16) (setf (aref v k) (aref s k)))))                            ; mov
+                   (setf (svref fregs fd) v))
+                 (setf pc npc3)))))
+          (#.+op-vi-shift+
+           (multiple-value-bind (fd npc) (fetch-reg bc pc)
+             (multiple-value-bind (fs npc2) (fetch-reg bc npc)
+               (multiple-value-bind (sub npc3) (fetch-byte bc npc2)
+                 (multiple-value-bind (n npc4) (fetch-byte bc npc3)
+                   (let ((s (svref fregs fs)) (v (%vlane-new)))
+                     (cond ((= sub 0) (dotimes (k 8)                                                  ; sqrshrun 8h->8b #n
+                                        (setf (aref v k) (%vlane-sat (ash (+ (%vlane-get s k 2 t) (ash 1 (- n 1))) (- n)) 0 255))))
+                           ((= sub 1) (dotimes (k 8) (%vlane-set v k 2 (ash (%vlane-get s k 2 t) (- n)))))   ; sshr 8h
+                           ((= sub 2) (dotimes (k 8) (%vlane-set v k 2 (ash (%vlane-get s k 2 t) n))))       ; shl 8h
+                           ((= sub 3) (dotimes (k 16) (%vlane-set v k 1 (ash (%vlane-get s k 1 t) (- n)))))  ; sshr 16b
+                           (t (dotimes (k 4) (%vlane-set v k 4 (ash (%vlane-get s k 4 t) (- n))))))          ; sshr 4s
+                     (setf (svref fregs fd) v))
+                   (setf pc npc4))))))
+          (#.+op-vi-bin+
+           (multiple-value-bind (fd npc) (fetch-reg bc pc)
+             (multiple-value-bind (fa npc2) (fetch-reg bc npc)
+               (multiple-value-bind (fb npc3) (fetch-reg bc npc2)
+                 (multiple-value-bind (sub npc4) (fetch-byte bc npc3)
+                   (setf (svref fregs fd) (%vlane-bin sub (svref fregs fd) (svref fregs fa) (svref fregs fb)))
+                   (setf pc npc4))))))
+          (#.+op-vi-movi+
+           (multiple-value-bind (fd npc) (fetch-reg bc pc)
+             (multiple-value-bind (kind npc2) (fetch-byte bc npc)
+               (multiple-value-bind (val npc3) (fetch-byte bc npc2)
+                 (let ((v (%vlane-new)))
+                   (dotimes (k (floor 16 kind)) (%vlane-set v k kind val))
+                   (setf (svref fregs fd) v))
+                 (setf pc npc3)))))
+          (#.+op-vi-umov+
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (fs npc2) (fetch-reg bc npc)
+               (multiple-value-bind (kind npc3) (fetch-byte bc npc2)
+                 (multiple-value-bind (lane npc4) (fetch-byte bc npc3)
+                   (setf (svref regs vd) (%vlane-get (svref fregs fs) lane kind nil))
+                   (setf pc npc4))))))
+          (#.+op-vi-lane+
+           (multiple-value-bind (fd npc) (fetch-reg bc pc)
+             (multiple-value-bind (fa npc2) (fetch-reg bc npc)
+               (multiple-value-bind (fb npc3) (fetch-reg bc npc2)
+                 (multiple-value-bind (sub npc4) (fetch-byte bc npc3)
+                   (multiple-value-bind (lane npc5) (fetch-byte bc npc4)
+                     (setf (svref fregs fd)
+                           (%vlane-lane sub (svref fregs fd) (svref fregs fa) (svref fregs fb) lane))
+                     (setf pc npc5)))))))
 
           (#.+op-aref+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)

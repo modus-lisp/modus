@@ -7123,6 +7123,10 @@
            (= op-name #.(compute-name-hash "%F32V*"))
            (= op-name #.(compute-name-hash "%F32V/")))
        (compile-v4-form form env dest))
+      ;; integer-lane primitives (layer 2b): stores, lane extracts; a vector
+      ;; value at expression level is an error (see compile-vi-form).
+      ((%vil-op-p (car form))
+       (compile-vi-form form env dest))
       ((= op-name #.(compute-name-hash "%WORD-AREF"))
        (compile-word-aref (cadr form) (caddr form) env dest))
       ((= op-name #.(compute-name-hash "%WORD-ASET"))
@@ -9212,6 +9216,7 @@
   (let ((ty (%resolve-declared-type ty)))
     (cond ((and (symbolp ty) ty (string= (symbol-name ty) "SINGLE-FLOAT")) :scalar)
           ((and (symbolp ty) ty (string= (symbol-name ty) "F32V-PACK")) :vector)
+          ((and (symbolp ty) ty (string= (symbol-name ty) "VI-PACK")) :vector)   ; integer lanes (2b)
           ((and (consp ty) (symbolp (car ty))
                 (string= (symbol-name (car ty)) "SIMPLE-ARRAY")
                 (consp (cdr ty)) (symbolp (cadr ty))
@@ -9317,6 +9322,16 @@
                     (%simple-index-form-p (caddr form))
                     (%v4-tree-need (cadddr form) env)
                     t))
+              ;; integer-lane stores / lane extracts compile inline (2b)
+              ((%vil-lookup n *vi-st-ops*)
+               (and (consp (cdr form)) (consp (cddr form)) (consp (cdddr form)) (null (cddddr form))
+                    (%declared-u8-array-var-p (cadr form) env)
+                    (%simple-index-form-p (caddr form))
+                    (%vil-tree-need (cadddr form) env)
+                    t))
+              ((%vil-lookup n *vi-umov-ops*)
+               (and (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
+                    (integerp (caddr form)) (%vil-tree-need (cadr form) env) t))
               ((string= n "AREF")
                (and (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
                     (symbolp (cadr form))
@@ -15319,7 +15334,7 @@
   "FP registers needed to evaluate the vector tree FORM unboxed, or NIL."
   (let ((form (%tree-expand form)))
   (cond
-    ((symbolp form) (and (%declared-f32v-var-p form env) 1))
+    ((symbolp form) (and (or (%declared-f32v-var-p form env) (%declared-vi-var-p form env)) 1))
     ((and (consp form) (symbolp (car form)))
      (let ((n (symbol-name (car form))))
        (cond
@@ -15341,6 +15356,7 @@
                (let ((a (%v4-tree-need (cadr form) env))
                      (b (%v4-tree-need (caddr form) env)))
                  (and a b (max a (1+ b))))))
+         ((%vil-op-p (car form)) (%vil-tree-need form env))   ; integer lanes (2b)
          (t nil))))
     (t nil))))
 
@@ -15362,12 +15378,15 @@
           (let ((b (env-lookup env form))) (and b (eq (binding-location b) :fpvreg))))
      (let ((b (env-lookup env form)))
        (unless (= (binding-reg b) fd) (emit-ir :fp-mov fd (binding-reg b)))))
+    ((and (symbolp form) (%declared-vi-var-p form env))   ; integer vector variable (2b): resident or error
+     (compile-vi-unboxed form env fd))
     ((symbolp form)                                  ; boxed 4-lane variable
      (let ((tv (alloc-temp-reg)) (tz (alloc-temp-reg)))
        (compile-form form env tv)
        (compile-integer 0 tz)
        (emit-ir :v4-lane-load fd tv tz)
        (free-temp-reg) (free-temp-reg)))
+    ((%vil-op-p (car form)) (compile-vi-unboxed form env fd))   ; integer lanes (2b)
     (t
      (let ((n (symbol-name (car form))))
        (cond
@@ -15450,6 +15469,200 @@
          (%emit-v4-box dest fd)
          (free-fp-reg)))
       (t (compile-call (car form) (cdr form) env dest)))))
+
+;;; ------------------------------------------------------------
+;;; INTEGER LANE trees (SIMD plan, layer 2b — reel's kernels)
+;;;
+;;; The same FP register pool holds 16 bytes read as u8x16 / s8x16 / s16x8 /
+;;; s32x4.  There is NO boxed form: an integer vector exists only in a
+;;; register (a LET binding declared VI-PACK, kept :fpvreg by the same
+;;; call-free-scope rule as f32x4), or in the bytes of a declared u8 array via
+;;; %vi-ld*/%vi-st*.  A vector value that would have to escape (returned,
+;;; passed, stored generically) is a compile ERROR, not a silent box.  Every
+;;; primitive is one NEON instruction; the interpreter arm is the reference.
+;;;   loads/stores  (%vi-ld4 A i) (%vi-ld8 A i) (%vi-ld16 A i)   A declared u8, i byte index
+;;;                 (%vi-st4 A i tree) (%vi-st8 …) (%vi-st16 …)
+;;;   broadcast     (%vi-dup8 x) (%vi-dup16 x) (%vi-dup32 x)     x a call-free fixnum form
+;;;   immediates    (%vi-movi8 v) (%vi-movi16 v)                  0..255
+;;;   unary         (%vi-uxtl q) (%vi-sqxtun q) (%vi-sxtl q) (%vi-xtn q)
+;;;   shifts        (%vi-sqrshrun q n) (%vi-sshr16 q n) (%vi-shl16 q n) (%vi-sshr8 q n) (%vi-sshr32 q n)
+;;;   binary        (%vi-add16 a b) … see *vi-bin-ops*
+;;;   accumulate    (%vi-mla16 acc a b) (%vi-mls16 acc a b) (%vi-bsl mask a b)
+;;;   by-element    (%vi-mla16l acc a b lane) (%vi-mls16l acc a b lane)
+;;;                 (%vi-mul16l a b lane) (%vi-sqdmulh16l a b lane) (%vi-sqrdmulh16l a b lane)
+;;;   extract       (%vi-umov8 q lane) (%vi-umov16 q lane) (%vi-umov32 q lane) -> fixnum (unsigned)
+
+(defparameter *vi-bin-ops*
+  '(("%VI-ADD16" . 0) ("%VI-SUB16" . 1) ("%VI-MUL16" . 2) ("%VI-SQDMULH16" . 5) ("%VI-SQRDMULH16" . 6)
+    ("%VI-UABD8" . 7) ("%VI-CMHS8" . 8) ("%VI-AND" . 9) ("%VI-ORR" . 10) ("%VI-EOR" . 11)
+    ("%VI-SQADD8" . 13) ("%VI-SQSUB8" . 14) ("%VI-ADD8" . 15) ("%VI-SUB8" . 16)
+    ("%VI-ADD32" . 17) ("%VI-SUB32" . 18) ("%VI-MUL32" . 19)
+    ("%VI-TRN1" . 20) ("%VI-TRN2" . 21) ("%VI-ZIP1" . 22) ("%VI-ZIP2" . 23)))
+(defparameter *vi-acc-ops* '(("%VI-MLA16" . 3) ("%VI-MLS16" . 4) ("%VI-BSL" . 12)))
+(defparameter *vi-lane-acc-ops* '(("%VI-MLA16L" . 0) ("%VI-MLS16L" . 1)))
+(defparameter *vi-lane-ops* '(("%VI-MUL16L" . 2) ("%VI-SQDMULH16L" . 3) ("%VI-SQRDMULH16L" . 4)))
+(defparameter *vi-un-ops* '(("%VI-UXTL" . 0) ("%VI-SQXTUN" . 1) ("%VI-SXTL" . 2) ("%VI-XTN" . 3)))
+(defparameter *vi-shift-ops* '(("%VI-SQRSHRUN" . 0) ("%VI-SSHR16" . 1) ("%VI-SHL16" . 2) ("%VI-SSHR8" . 3) ("%VI-SSHR32" . 4)))
+(defparameter *vi-ld-ops* '(("%VI-LD4" . 4) ("%VI-LD8" . 8) ("%VI-LD16" . 16)))
+(defparameter *vi-st-ops* '(("%VI-ST4" . 4) ("%VI-ST8" . 8) ("%VI-ST16" . 16)))
+(defparameter *vi-dup-ops* '(("%VI-DUP8" . 1) ("%VI-DUP16" . 2) ("%VI-DUP32" . 4)))
+(defparameter *vi-movi-ops* '(("%VI-MOVI8" . 1) ("%VI-MOVI16" . 2)))
+(defparameter *vi-umov-ops* '(("%VI-UMOV8" . 1) ("%VI-UMOV16" . 2) ("%VI-UMOV32" . 4)))
+
+(defun %vil-lookup (n table)
+  (let ((e (assoc n table :test (function string=)))) (and e (cdr e))))
+
+(defun %vil-op-p (sym)
+  "Cheap gate for compile-form's dispatch: a symbol whose name starts %VI-."
+  (and (symbolp sym)
+       (let ((s (symbol-name sym)))
+         (and (> (length s) 4) (char= (char s 0) #\%) (char= (char s 1) #\V)
+              (char= (char s 2) #\I) (char= (char s 3) #\-)))))
+
+(defun %declared-vi-var-p (form env)
+  (and (symbolp form)
+       (let ((ty (%var-dtype form env)))
+         (and (symbolp ty) ty (string= (symbol-name ty) "VI-PACK")))))
+
+(defun %vil-tree-need (form env)
+  "FP registers needed to evaluate the integer-lane tree FORM, or NIL."
+  (let ((form (%tree-expand form)))
+    (cond
+      ((symbolp form) (and (%declared-vi-var-p form env) 1))
+      ((and (consp form) (symbolp (car form)) (%vil-op-p (car form)))
+       (let* ((n (symbol-name (car form))) (a (cdr form)) (na (length a)))
+         (cond
+           ((%vil-lookup n *vi-ld-ops*)
+            (and (= na 2) (%declared-u8-array-var-p (car a) env) (%simple-index-form-p (cadr a)) 1))
+           ((%vil-lookup n *vi-dup-ops*) (and (= na 1) (%simple-index-form-p (car a)) 1))
+           ((%vil-lookup n *vi-movi-ops*) (and (= na 1) (integerp (car a)) (<= 0 (car a) 255) 1))
+           ((%vil-lookup n *vi-un-ops*) (and (= na 1) (%vil-tree-need (car a) env)))
+           ((%vil-lookup n *vi-shift-ops*)
+            (and (= na 2) (integerp (cadr a)) (<= 1 (cadr a) 32) (%vil-tree-need (car a) env)))
+           ((%vil-lookup n *vi-bin-ops*)
+            (and (= na 2)
+                 (let ((x (%vil-tree-need (car a) env)) (y (%vil-tree-need (cadr a) env)))
+                   (and x y (max x (1+ y))))))
+           ((%vil-lookup n *vi-acc-ops*)
+            (and (= na 3)
+                 (let ((x (%vil-tree-need (car a) env)) (y (%vil-tree-need (cadr a) env))
+                       (z (%vil-tree-need (caddr a) env)))
+                   (and x y z (max x (1+ y) (+ 2 z))))))
+           ((%vil-lookup n *vi-lane-acc-ops*)
+            (and (= na 4) (integerp (cadddr a)) (<= 0 (cadddr a) 7)
+                 (let ((x (%vil-tree-need (car a) env)) (y (%vil-tree-need (cadr a) env))
+                       (z (%vil-tree-need (caddr a) env)))
+                   (and x y z (max x (1+ y) (+ 2 z))))))
+           ((%vil-lookup n *vi-lane-ops*)
+            (and (= na 3) (integerp (caddr a)) (<= 0 (caddr a) 7)
+                 (let ((x (%vil-tree-need (car a) env)) (y (%vil-tree-need (cadr a) env)))
+                   (and x y (max x (1+ y))))))
+           (t nil))))
+      (t nil))))
+
+(defun compile-vi-unboxed (form env fd)
+  "Compile the integer-lane tree FORM (caller checked %vil-tree-need) into FP vreg FD."
+  (let ((form (%tree-expand form)))
+    (cond
+      ((symbolp form)
+       (let ((b (env-lookup env form)))
+         (if (and b (eq (binding-location b) :fpvreg))
+             (unless (= (binding-reg b) fd) (emit-ir :fp-mov fd (binding-reg b)))
+             (error "integer vector variable ~S is not register-resident (its scope is not call-free)" form))))
+      (t
+       (let* ((n (symbol-name (car form))) (a (cdr form)) (k nil))
+         (cond
+           ((setq k (%vil-lookup n *vi-ld-ops*))
+            (let ((ti (alloc-temp-reg)))                 ; index FIRST (the only recursing operand)
+              (compile-form (cadr a) env ti)
+              (let ((ta (alloc-temp-reg)))
+                (compile-form (car a) env ta)
+                (emit-ir :vi-ld fd ta ti k)
+                (free-temp-reg))
+              (free-temp-reg)))
+           ((setq k (%vil-lookup n *vi-dup-ops*))
+            (let ((tx (alloc-temp-reg)))
+              (compile-form (car a) env tx)
+              (emit-ir :vi-dup fd tx k)
+              (free-temp-reg)))
+           ((setq k (%vil-lookup n *vi-movi-ops*)) (emit-ir :vi-movi fd k (car a)))
+           ((setq k (%vil-lookup n *vi-un-ops*))
+            (compile-vi-unboxed (car a) env fd) (emit-ir :vi-un fd fd k))
+           ((setq k (%vil-lookup n *vi-shift-ops*))
+            (compile-vi-unboxed (car a) env fd) (emit-ir :vi-shift fd fd k (cadr a)))
+           ((setq k (%vil-lookup n *vi-bin-ops*))
+            (compile-vi-unboxed (car a) env fd)
+            (let ((ft (alloc-fp-reg)))
+              (compile-vi-unboxed (cadr a) env ft)
+              (emit-ir :vi-bin fd fd ft k)
+              (free-fp-reg)))
+           ((setq k (%vil-lookup n *vi-acc-ops*))     ; Fd = acc; Fd op= a, b
+            (compile-vi-unboxed (car a) env fd)
+            (let ((f1 (alloc-fp-reg)))
+              (compile-vi-unboxed (cadr a) env f1)
+              (let ((f2 (alloc-fp-reg)))
+                (compile-vi-unboxed (caddr a) env f2)
+                (emit-ir :vi-bin fd f1 f2 k)
+                (free-fp-reg))
+              (free-fp-reg)))
+           ((setq k (%vil-lookup n *vi-lane-acc-ops*))
+            (compile-vi-unboxed (car a) env fd)
+            (let ((f1 (alloc-fp-reg)))
+              (compile-vi-unboxed (cadr a) env f1)
+              (let ((f2 (alloc-fp-reg)))
+                (compile-vi-unboxed (caddr a) env f2)
+                (emit-ir :vi-lane fd f1 f2 k (cadddr a))
+                (free-fp-reg))
+              (free-fp-reg)))
+           ((setq k (%vil-lookup n *vi-lane-ops*))     ; (op a b lane): Fd = a op b[lane]
+            (compile-vi-unboxed (car a) env fd)
+            (let ((ft (alloc-fp-reg)))
+              (compile-vi-unboxed (cadr a) env ft)
+              (emit-ir :vi-lane fd fd ft k (caddr a))
+              (free-fp-reg)))
+           (t (error "compile-vi-unboxed: not a vector primitive: ~S" (car form)))))))))
+
+(defun %vil-tree-fits-p (form env)
+  (let ((need (%vil-tree-need form env)))
+    (and need (<= (+ *fp-reg-counter* need) +fp-reg-max+))))
+
+(defun compile-vi-form (form env dest)
+  "A %vi-* call at expression level: a store, a lane extract, or an error —
+   an integer vector cannot escape into a generic value."
+  (let* ((n (symbol-name (car form))) (a (cdr form)) (k nil))
+    (cond
+      ((setq k (%vil-lookup n *vi-st-ops*))            ; (%vi-stN A i tree)
+       (unless (and (= (length a) 3) (%declared-u8-array-var-p (car a) env)
+                    (%vil-tree-fits-p (caddr a) env))
+         (error "~A: needs a declared u8 array, a call-free index and a fitting vector tree: ~S" n form))
+       (if (%simple-index-form-p (cadr a))
+           (let ((fd (alloc-fp-reg)))                  ; tree first (nothing held), then index, then array
+             (compile-vi-unboxed (caddr a) env fd)
+             (let ((ti (alloc-temp-reg)))
+               (compile-form (cadr a) env ti)
+               (let ((ta (alloc-temp-reg)))
+                 (compile-form (car a) env ta)
+                 (emit-ir :vi-st ta ti fd k)
+                 (free-temp-reg))
+               (free-temp-reg))
+             (free-fp-reg))
+           (let ((ta (alloc-temp-reg)) (ti (alloc-temp-reg)))
+             (compile-form (car a) env ta)
+             (compile-form (cadr a) env ti)
+             (let ((fd (alloc-fp-reg)))
+               (compile-vi-unboxed (caddr a) env fd)
+               (emit-ir :vi-st ta ti fd k)
+               (free-fp-reg))
+             (free-temp-reg) (free-temp-reg)))
+       (when dest (compile-nil dest)))
+      ((setq k (%vil-lookup n *vi-umov-ops*))          ; (%vi-umovN tree lane) -> fixnum
+       (unless (and (= (length a) 2) (integerp (cadr a)) (%vil-tree-fits-p (car a) env))
+         (error "~A: needs a fitting vector tree and a literal lane: ~S" n form))
+       (let ((fd (alloc-fp-reg)))
+         (compile-vi-unboxed (car a) env fd)
+         (when dest (emit-ir :vi-umov dest fd k (cadr a)))
+         (free-fp-reg)))
+      (t (error "integer vector value escapes (only %vi-st*, %vi-umov* and VI-PACK lets may consume one): ~S" form)))))
 
 (defun compile-add (args env dest)
   "Compile (+ args...).  Fixnum fast path; ratio/mixed via GENERIC-ADD."
@@ -20706,6 +20919,15 @@
       (:v4-mul 4)
       (:v4-div 4)
       (:fp-mov 3)
+      (:vi-ld 5)
+      (:vi-st 5)
+      (:vi-dup 4)
+      (:vi-un 4)
+      (:vi-shift 5)
+      (:vi-bin 5)
+      (:vi-movi 4)
+      (:vi-umov 5)
+      (:vi-lane 6)
       (:add   4)
       (:sub   4)
       (:adds  4)
@@ -20997,6 +21219,15 @@
           (:v4-mul (mvm-v4-mul buf (second insn) (third insn) (fourth insn)))
           (:v4-div (mvm-v4-div buf (second insn) (third insn) (fourth insn)))
           (:fp-mov (mvm-fp-mov buf (second insn) (third insn)))
+          (:vi-ld (mvm-vi-ld buf (second insn) (third insn) (fourth insn) (fifth insn)))
+          (:vi-st (mvm-vi-st buf (second insn) (third insn) (fourth insn) (fifth insn)))
+          (:vi-dup (mvm-vi-dup buf (second insn) (third insn) (fourth insn)))
+          (:vi-un (mvm-vi-un buf (second insn) (third insn) (fourth insn)))
+          (:vi-shift (mvm-vi-shift buf (second insn) (third insn) (fourth insn) (fifth insn)))
+          (:vi-bin (mvm-vi-bin buf (second insn) (third insn) (fourth insn) (fifth insn)))
+          (:vi-movi (mvm-vi-movi buf (second insn) (third insn) (fourth insn)))
+          (:vi-umov (mvm-vi-umov buf (second insn) (third insn) (fourth insn) (fifth insn)))
+          (:vi-lane (mvm-vi-lane buf (second insn) (third insn) (fourth insn) (fifth insn) (sixth insn)))
 
           ;; ---- 3-reg instructions ----
           (:add

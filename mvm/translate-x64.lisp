@@ -4334,6 +4334,12 @@
                (emit-mov-reg-imm buf d #xDEAD0001)))
            (maybe-store-scratch buf vd)))
 
+        ;; ---- INTEGER LANE class (SIMD 2b): no SSE arm yet.  SIGNAL, so the
+        ;; runtime JIT's %jit-translate-page returns NIL and the module runs
+        ;; through the interpreter's reference arm — never a runtime trap.
+        ((and (>= opcode +op-vi-ld+) (<= opcode +op-vi-lane+))
+         (error "MVM x64: integer-lane opcode #x~X not implemented (interpret)" opcode))
+
         ;; ============================================
         ;; Unknown Opcode
         ;; ============================================

@@ -55,23 +55,34 @@ inp.on('data', (d) => {
     else if (m.method === 'Runtime.consoleAPICalled') {
       const text = m.params.args.map((a) => a.value !== undefined ? String(a.value) : a.description || '').join(' ');
       console.log(text);
-      if (text === 'log: [ready]') {
-        // a script line "@file NAME:CONTENT" drops a file into the page's inbox first
-        let line = script.shift();
-        while (line !== undefined && line.startsWith('@file ')) {
-          const k = line.indexOf(':');
-          send('Runtime.evaluate', { expression: `modusAddFile(${JSON.stringify(line.slice(6, k))}, ${JSON.stringify(line.slice(k + 1))})` }, sessionId);
-          line = script.shift();
-        }
-        if (line !== undefined) send('Runtime.evaluate', { expression: `modusFeed(${JSON.stringify(line + '\n')})` }, sessionId);
-        else send('Runtime.evaluate', { expression: 'modusClose()' }, sessionId);
-      }
+      if (text === 'log: [ready]') { void processReady(); }
       if (/^\[modus exited|^err: |^log: \[modus exited/.test(text) || text.includes('[modus exited')) setTimeout(() => finish(0), 200);
     } else if (m.method === 'Runtime.exceptionThrown') {
       console.log('EXCEPTION: ' + JSON.stringify(m.params.exceptionDetails).slice(0, 500));
     }
   }
 });
+let readyBusy = false;
+async function processReady() {
+  if (readyBusy) return; readyBusy = true;
+  try {
+    // "@file NAME:CONTENT" drops a file; "@js EXPR" runs JS in the page and
+    // AWAITS its result; any other line is typed at the REPL.
+    let line = script.shift();
+    while (line !== undefined && (line.startsWith('@file ') || line.startsWith('@js '))) {
+      if (line.startsWith('@file ')) {
+        const k = line.indexOf(':');
+        await send('Runtime.evaluate', { expression: `modusAddFile(${JSON.stringify(line.slice(6, k))}, ${JSON.stringify(line.slice(k + 1))})` }, sessionId);
+      } else {
+        const r = await send('Runtime.evaluate', { expression: line.slice(4), awaitPromise: true, returnByValue: true }, sessionId).catch((e) => ({ error: e.message }));
+        console.log('@js => ' + JSON.stringify(r && r.result ? r.result.value : (r && r.error)));
+      }
+      line = script.shift();
+    }
+    if (line !== undefined) await send('Runtime.evaluate', { expression: `modusFeed(${JSON.stringify(line + '\n')})` }, sessionId);
+    else await send('Runtime.evaluate', { expression: 'modusClose()' }, sessionId);
+  } finally { readyBusy = false; }
+}
 (async () => {
   const { targetId } = await send('Target.createTarget', { url: 'about:blank' });
   sessionId = (await send('Target.attachToTarget', { targetId, flatten: true })).sessionId;

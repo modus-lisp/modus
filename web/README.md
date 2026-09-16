@@ -79,6 +79,31 @@ Gotcha: the page fetches `modus.mvmw.gz` before the plain file, so after
 rebuilding the module regenerate the gzip (`gzip -kf web/modus.mvmw`, which
 `deploy-pages.sh` does) or the browser will keep loading the stale image.
 
+## Completion and the symbol explorer
+
+The page can introspect the *live* image, not a static list. A tiny compiled
+RPC baked into the build (`%web-rpc`) reads a request from a fixed memory
+buffer and writes a text response to another: `c` prefix-complete, `a`
+substring-apropos (both walk `*sym-name-table*`, all ~9000 interned names),
+and `d` describe (kind — special-operator / macro / function / variable /
+unknown — plus a bounded printed value).
+
+The worker can't take a message while it's blocked reading stdin, so it
+services the request re-entrantly from inside that idle read (the same
+mechanism `callLisp` uses for checked arithmetic), woken by an
+`Atomics.notify` on the stdin control; the machine registers are saved and
+restored around the call so a bad query can't corrupt the REPL. The small
+helpers are pre-translated at startup so the first completion is quick.
+
+- **Tab / live dropdown** on the REPL input: prefix completion, arrow keys,
+  Enter/Tab to accept, Esc to dismiss.
+- **Symbol explorer** (the `☰ symbols` button): a substring filter, the
+  matching symbols, and a detail pane with the kind badge, the value, and
+  buttons to insert the name or run `(describe …)` in the REPL.
+
+Because it queries the live image, runtime `defun`s and `defvar`s are
+completed and described immediately.
+
 ## What the interpreter does and does not do
 
 - Every vreg lives in the frame (per-frame copies), so callee-saved registers

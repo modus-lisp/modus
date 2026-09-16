@@ -70,7 +70,7 @@
   (gui-reset)
   (gui-panel "Calculator")
   (gui-el "calc" "root" "div")
-  (gui-style "calc" "width:252px;margin:26px auto;user-select:none")
+  (gui-style "calc" "width:min(300px,92vw);margin:22px auto;user-select:none")
   (gui-el "disp" "calc" "div")
   (gui-text "disp" "0")
   (gui-style "disp" "background:#0b0b0d;color:#4caf50;font:30px monospace;text-align:right;padding:16px;border-radius:10px;margin-bottom:8px;overflow:hidden;white-space:nowrap")

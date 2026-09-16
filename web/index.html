@@ -223,11 +223,15 @@
       if (txt == null) { say('sample: could not fetch samples/' + f + '\n', 'err'); return; }
       addFile('/home/web/' + f, enc.encode(txt));
     }
-    // *jit-inhibit* keeps LOAD from eagerly JIT-compiling every defun (a cold
-    // core restore has no warm compiler); the sample's functions still compile
-    // on their own once they run hot, so this only speeds up loading.
+    // Feed the load and the run as SEPARATE top-level forms, not one (progn …):
+    // the REPL reads-then-evals one form at a time, so a package a loaded file
+    // creates (e.g. :sha1 via ql:quickload) exists before the run form that names
+    // it is even read.  Wrapping them together would read the whole thing first
+    // and choke on the not-yet-existing package.  *jit-inhibit* keeps LOAD from
+    // eagerly JIT-compiling every defun (a cold restore has no warm compiler).
     const loads = need.map((f) => '(load "/home/web/' + f + '")').join(' ');
-    feed('(progn (let ((*jit-inhibit* t)) ' + loads + ') ' + run + ')\n');
+    feed('(let ((*jit-inhibit* t)) ' + loads + ')\n');
+    if (run) feed(run + '\n');
   };
   let svCurrent = null;
   const svShowList = () => {

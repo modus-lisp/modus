@@ -342,21 +342,29 @@
     (%cli-line \"  network  - (http-get \\\"https://host/path\\\") and the socket layer, over bridge HTTP\")
     (%cli-line \"Ctrl-D (EOF) to exit.\"))
   (let ((in (%make-file-stream-full 0 0))
-        (eof (list 'eof)))
+        (eof (list 'eof))
+        (rerr (list 'rerr)))
     (loop
       (%cli-msg \"> \")
       (let ((form (handler-case (read in nil eof)
-                    (t (c)
-                      (%cli-line \"READ-ERROR\")
-                      eof))))
-        (when (eq form eof) (%cli-nl) (return-from %cli-repl nil))
-        (handler-case
-            (let ((v (eval form)))
-              (write-object v) (%cli-nl))
-          (t (c)
-            (%cli-msg \"ERROR: \")
-            (handler-case (write-object c) (t (c2) (%cli-msg \"<condition>\")))
-            (%cli-nl)))))))
+                    (t (c) rerr))))
+        (cond
+          ;; A read error (bad token, unknown package like `foo:bar' before FOO
+          ;; exists, unbalanced input) must NOT end the session — it used to
+          ;; return EOF and fall through to the exit below, so one typo killed
+          ;; the REPL.  Report it, drop the rest of the line so the next prompt
+          ;; starts clean instead of re-reading the garbage, and keep going.
+          ((eq form rerr)
+           (%cli-line \"READ-ERROR\")
+           (read-line in nil eof))   ; drop the rest of the offending line
+          ((eq form eof) (%cli-nl) (return-from %cli-repl nil))
+          (t (handler-case
+                 (let ((v (eval form)))
+                   (write-object v) (%cli-nl))
+               (t (c)
+                 (%cli-msg \"ERROR: \")
+                 (handler-case (write-object c) (t (c2) (%cli-msg \"<condition>\")))
+                 (%cli-nl)))))))))
 "))
 (setq cl-user::*full-source*
       (concatenate 'string cl-user::*full-source* "

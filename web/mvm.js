@@ -231,6 +231,36 @@ class MVM {
     this.genAdd = this.byName.get('GENERIC-ADD');
     this.genSub = this.byName.get('GENERIC-SUBTRACT');
     this.genMul = this.byName.get('GENERIC-MULTIPLY');
+    // Memoize keyword interning.  Profiling LOAD/eval shows %INTERN-KEYWORD
+    // called ~777k times for only ~175 distinct fixnum keys while reading one
+    // file -- each call drags the whole symbol hash-table cascade (%HT-*,
+    // %HT-H-STRCMP, GETHASH), which dominates the cold-restore interpreter and
+    // makes every form typed at the REPL laggy.  Interning is idempotent, so we
+    // cache it: install a JS stand-in as the function's "compiled" entry (the
+    // universal call dispatch goes through compiledFor, which returns it).  On a
+    // hit we set VR and return exactly like a compiled fn; on a miss we run the
+    // real body once (interpreted) and remember its result.  The key is a
+    // fixnum (GC-stable); the cached keyword is a heap object that a GC moves,
+    // so gc() drops the cache.
+    this._ikCache = new Map();
+    const ik = this.byName.get('%INTERN-KEYWORD');
+    if (ik && this.compileOn) {
+      const self = this;
+      this.compiled.set(ik.off, function (vm) {
+        const m32 = vm.m32, b = (vm.ebp - VBASE) >> 2;
+        const a0l = m32[b + IX0], a0h = m32[b + IX0 + 1];
+        if ((a0l & 1) === 0) {                        // fixnum arg => GC-stable key
+          // numeric key (name-hashes are < 2^53), no per-call string alloc
+          const key = a0h * 4294967296 + (a0l >>> 0);
+          const hit = self._ikCache.get(key);
+          if (hit !== undefined) { vm.vrl = hit[0]; vm.vrh = hit[1]; vm.doRet(); return -1; }
+          vm.run();                                   // run the real body once
+          self._ikCache.set(key, [vm.vrl, vm.vrh]);
+          return -1;
+        }
+        vm.run(); return -1;                          // non-fixnum arg: don't cache
+      });
+    }
     this.initMemory(opts.argv || ['modus'], opts.env || []);
   }
 
@@ -514,6 +544,7 @@ class MVM {
 
   // -- garbage collector: Cheney copy with conservative validated roots ------
   gc() {
+    if (this._ikCache) this._ikCache.clear();   // cached keyword addresses move
     const m32 = this.m32;
     const fromStart = this.ldlo(A_GC_FROM);
     const spaceSize = this.ldlo(A_GC_SIZE);
@@ -861,6 +892,10 @@ class MVM {
         h.getdentsConsumed(a1, n);
         return total;
       }
+      // --- GUI bridge (browser): Lisp drives the DOM / a WebGL canvas -------
+      case 5000: if (a2 > 0 && inMem(a1, a2) && h.guiSend) h.guiSend(this.m8, a1 - VBASE, a2); return 0;   // send command bytes
+      case 5001: return (h.guiPoll && inMem(a1, a2)) ? h.guiPoll(this.m8, a1 - VBASE, a2) : 0;              // drain events -> bytes
+      case 5002: if (h.guiWait) h.guiWait(a1); return 0;                                                    // block up to a1 ms
       default:
         h.log(`[mvm: unsupported syscall ${nr}]`);
         return -38;
@@ -1283,7 +1318,7 @@ class MVM {
         }
         let g = this.nextF;
         if (g === undefined) g = this.compiledFor(t); else this.nextF = undefined;
-        if (g) { f = g; L = 0; ebp = this.ebp; }
+        if (g) { this.contDepth = d; f = g; L = 0; ebp = this.ebp; }   // keep contDepth live: a JS stand-in (e.g. the intern memo) may run() a nested activation
         else {
           this.contDepth = d;
           this.run();                           // interpreted callee, pops its frame

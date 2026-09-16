@@ -32,7 +32,10 @@ function findChrome() {
   return cands[0];
 }
 
-const chrome = spawn(findChrome(), ['--headless', '--no-sandbox', '--disable-gpu', '--remote-debugging-pipe', 'about:blank'],
+const chrome = spawn(findChrome(), ['--headless', '--no-sandbox',
+                     // software WebGL, so canvas samples (the game) render in headless too
+                     '--enable-unsafe-swiftshader', '--use-gl=angle', '--use-angle=swiftshader',
+                     '--remote-debugging-pipe', 'about:blank'],
                      { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
 const out = chrome.stdio[3], inp = chrome.stdio[4];
 let nextId = 1, buf = '';

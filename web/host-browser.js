@@ -14,7 +14,7 @@ const RING_HDR = 16;
 // posted, 2 response ready.  inbox SAB (files dropped on the page):
 // Int32 header [seq, length] then records [nameLen u32][name][dataLen u32][data].
 class BrowserHost {
-  constructor(stdinSab, post, httpSab, inboxSab, querySab) {
+  constructor(stdinSab, post, httpSab, inboxSab, querySab, guiSab) {
     this.ctl = new Int32Array(stdinSab, 0, 4);
     this.ring = new Uint8Array(stdinSab, RING_HDR);
     this.httpCtl = httpSab ? new Int32Array(httpSab, 0, 4) : null;
@@ -27,6 +27,10 @@ class BrowserHost {
     this.queryCtl = querySab ? new Int32Array(querySab, 0, 4) : null;
     this.queryBuf = querySab ? new Uint8Array(querySab, 16) : null;
     this.vm = null; this.webRpc = undefined;
+    // GUI event ring: [head, tail, closed] Int32 header, then bytes.  The page
+    // pushes event lines; Lisp drains them via guiPoll / blocks via guiWait.
+    this.guiCtl = guiSab ? new Int32Array(guiSab, 0, 4) : null;
+    this.guiRing = guiSab ? new Uint8Array(guiSab, 16) : null;
     this.inboxSeen = 0;
     this.post = post;
     this.files = new Map();          // path -> { data: Uint8Array, mtime }
@@ -105,6 +109,23 @@ class BrowserHost {
     this.post({ type: 'query-result', id, bytes, error }, error ? [] : [bytes.buffer]);
   }
   now() { return performance.now(); }
+  // Lisp -> page: forward a batch of GUI command bytes.
+  guiSend(m8, off, len) { this.post({ type: 'gui', bytes: m8.slice(off, off + len) }); }
+  // page -> Lisp: copy queued event bytes into image memory, return the count.
+  guiPoll(m8, off, max) {
+    if (!this.guiCtl) return 0;
+    const head = Atomics.load(this.guiCtl, 0), tail = Atomics.load(this.guiCtl, 1), cap = this.guiRing.length;
+    let n = 0, h = head;
+    while (n < max && h !== tail) { m8[off + n++] = this.guiRing[h]; h = (h + 1) % cap; }
+    Atomics.store(this.guiCtl, 0, h);
+    return n;
+  }
+  // Block up to MS for an event (efficient game loop / event wait).
+  guiWait(ms) {
+    if (!this.guiCtl) return;
+    const tail = Atomics.load(this.guiCtl, 1);
+    if (Atomics.load(this.guiCtl, 0) === tail) Atomics.wait(this.guiCtl, 1, tail, ms > 0 ? ms : 1000);
+  }
   getpid() { return 4242; }
 
   flush() {

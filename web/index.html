@@ -21,7 +21,11 @@
   #compl { position: fixed; z-index: 10; background: #1a1a1a; border: 1px solid #555; max-height: 42vh; overflow-y: auto; font-size: 13px; display: none; box-shadow: 0 -4px 12px #0008; }
   #compl div { padding: 1px 8px; white-space: pre; cursor: pointer; }
   #compl div.sel { background: #2b4; color: #000; }
-  #extoggle { cursor: pointer; color: #9c9; user-select: none; }
+  #extoggle, #samptoggle { cursor: pointer; color: #9c9; user-select: none; }
+  #sampmenu { position: absolute; z-index: 20; background: #1b1b1f; border: 1px solid #444; border-radius: 6px; padding: 4px; display: none; }
+  #sampmenu button { display: block; width: 100%; text-align: left; background: none; border: none; color: #ddd; padding: 6px 12px; cursor: pointer; font: inherit; border-radius: 4px; }
+  #sampmenu button:hover { background: #33343a; }
+  #sampmenu .desc { color: #778; font-size: 11px; }
   #explorer { position: fixed; top: 0; right: 0; bottom: 2.2em; width: 320px; background: #161616; border-left: 1px solid #333; display: none; flex-direction: column; z-index: 5; }
   #explorer.open { display: flex; }
   #exfilter { margin: 6px; background: #000; color: #eee; border: 1px solid #444; padding: 3px 6px; font: inherit; }
@@ -34,6 +38,16 @@
   #exdetail .k.special-operator { background: #5b2b6b; } #exdetail .k.variable { background: #2b6b3b; } #exdetail .k.unknown { background: #444; }
   #exdetail button { margin: 6px 6px 0 0; background: #333; color: #ddd; border: 1px solid #555; padding: 2px 8px; cursor: pointer; font: inherit; }
   body.explorer #term { margin-right: 320px; }
+  #gui { position: fixed; inset: 0; background: #0c0c0c; z-index: 20; display: none; flex-direction: column; }
+  #gui.open { display: flex; }
+  #guibar { height: 2em; display: flex; align-items: center; gap: 8px; padding: 0 10px; background: #222; border-bottom: 1px solid #333; }
+  #guititle { color: #cdc; flex: 1; }
+  #guiclose { cursor: pointer; color: #e88; padding: 0 6px; }
+  #guihint { color: #667; font-size: 12px; }
+  #guibody { flex: 1; position: relative; overflow: auto; }
+  #guiroot { padding: 16px; color: #ddd; }
+  #glcanvas { display: none; position: absolute; inset: 0; margin: auto; background: #000; }
+  #guiroot button { font: inherit; }
 </style>
 </head>
 <body>
@@ -42,14 +56,23 @@
   <span id="status">loading…</span>
   <input id="in" placeholder="type a form and press Enter" autocomplete="off" spellcheck="false" disabled>
   <span id="extoggle" title="symbol explorer">&#9776; symbols</span>
+  <span id="samptoggle" title="run a sample program">&#9654; samples</span>
   <span id="files"></span>
   <label id="drop">drop files here or <input id="pick" type="file" multiple style="width:5em"></label>
 </div>
 <div id="compl"></div>
+<div id="sampmenu">
+  <button data-file="calc.lisp" data-run="(calc)">Calculator<div class="desc">a DOM calculator</div></button>
+  <button data-file="snake.lisp" data-run="(snake)">Snake<div class="desc">a WebGL game — arrow keys</div></button>
+</div>
 <div id="explorer">
   <input id="exfilter" placeholder="filter symbols…" autocomplete="off" spellcheck="false">
   <div id="exlist"></div>
   <div id="exdetail">click a symbol to inspect it</div>
+</div>
+<div id="gui">
+  <div id="guibar"><span id="guititle">GUI</span><span id="guihint">Esc to exit</span><span id="guiclose">&#10005;</span></div>
+  <div id="guibody"><div id="guiroot"></div><canvas id="glcanvas"></canvas></div>
 </div>
 <script>
 (async () => {
@@ -137,6 +160,31 @@
     say(`[queued ${name}, ${bytes.length} bytes; picked up at the next prompt]\n`, 'log');
   };
   window.modusAddFile = (name, text) => addFile(name, enc.encode(text));
+  // --- sample programs: fetch gui.lisp + the sample, LOAD both, then run ----
+  const sampMenu = document.getElementById('sampmenu');
+  const samptoggle = document.getElementById('samptoggle');
+  samptoggle.addEventListener('click', () => {
+    const open = sampMenu.style.display === 'block';
+    if (open) { sampMenu.style.display = 'none'; return; }
+    const r = samptoggle.getBoundingClientRect();
+    sampMenu.style.left = r.left + 'px'; sampMenu.style.top = (r.bottom + 4) + 'px';
+    sampMenu.style.display = 'block';
+  });
+  const runSample = async (file, run) => {
+    sampMenu.style.display = 'none';
+    status.textContent = 'loading sample ' + file + '…';
+    for (const f of ['gui.lisp', file]) {
+      const txt = await fetch('samples/' + f).then((r) => r.ok ? r.text() : null).catch(() => null);
+      if (txt == null) { say('sample: could not fetch samples/' + f + '\n', 'err'); return; }
+      addFile('/home/web/' + f, enc.encode(txt));
+    }
+    // *jit-inhibit* keeps LOAD from eagerly JIT-compiling every defun (a cold
+    // core restore has no warm compiler); the sample's functions still compile
+    // on their own once they run hot, so this only speeds up loading.
+    feed('(progn (let ((*jit-inhibit* t)) (load "/home/web/gui.lisp") (load "/home/web/' + file + '")) ' + run + ')\n');
+  };
+  for (const b of sampMenu.querySelectorAll('button'))
+    b.addEventListener('click', () => runSample(b.dataset.file, b.dataset.run));
   const takeFiles = async (list) => { for (const f of list) addFile(f.name, new Uint8Array(await f.arrayBuffer())); };
   document.getElementById('pick').addEventListener('change', (ev) => takeFiles(ev.target.files));
   document.body.addEventListener('dragover', (ev) => { ev.preventDefault(); document.body.classList.add('dragging'); });
@@ -187,6 +235,7 @@
     else if (m.type === 'http') { status.textContent = 'fetching ' + m.url; serveHttp(m); }
     else if (m.type === 'file') offerFile(m.path, m.bytes);
     else if (m.type === 'query-result') { if (window.modusQueryResult) window.modusQueryResult(m); }
+    else if (m.type === 'gui') { try { if (window.modusApplyGui) window.modusApplyGui(m.bytes); } catch (e) { say('\n[gui: ' + (e && e.message || e) + ']\n', 'err'); } }
   };
   // --- introspection query channel (completion + explorer) -----------------
   // The worker services these while blocked reading stdin (see host-browser).
@@ -325,6 +374,124 @@
     document.body.classList.toggle('explorer', open);
     if (open) { exFilter.focus(); exSearch(); }
   });
+  // --- GUI bridge: Lisp (in the worker) drives the DOM and a WebGL canvas ---
+  // Lisp sends command lines (syscall 5000) that we apply here; input events
+  // are pushed into a SharedArrayBuffer ring that Lisp drains (5001) / waits on
+  // (5002).  Commands and events are tab-separated text lines.
+  const GRING = 65536;
+  const guiSab = new SharedArrayBuffer(16 + GRING);
+  const guiCtl = new Int32Array(guiSab, 0, 4);   // [head, tail, closed]
+  const guiRing = new Uint8Array(guiSab, 16);
+  const pushEvent = (line) => {
+    const bytes = enc.encode(line + '\n');
+    let tail = Atomics.load(guiCtl, 1);
+    for (const b of bytes) { const next = (tail + 1) % GRING; if (next === Atomics.load(guiCtl, 0)) return; guiRing[tail] = b; tail = next; }
+    Atomics.store(guiCtl, 1, tail); Atomics.notify(guiCtl, 1);
+  };
+
+  const guiPanel = document.getElementById('gui');
+  const guiRoot = document.getElementById('guiroot');
+  const guiTitle = document.getElementById('guititle');
+  const glcanvas = document.getElementById('glcanvas');
+  const guiEls = new Map();                       // id -> element
+  const el = (id) => (id === '' || id === 'root') ? guiRoot : guiEls.get(id);
+  let rafOn = false, lastT = 0, keysOn = false;
+  const openPanel = () => { guiPanel.classList.add('open'); };
+  const closePanel = () => {
+    guiPanel.classList.remove('open');
+    if (rafOn) { rafOn = false; }
+    setKeys(false);
+    glcanvas.style.display = 'none';
+  };
+  document.getElementById('guiclose').addEventListener('click', () => { pushEvent('key\tEscape\t1'); pushEvent('key\tEscape\t0'); closePanel(); });
+
+  const tickLoop = (t) => {
+    if (!rafOn) return;
+    const dt = lastT ? (t - lastT) : 16; lastT = t;
+    pushEvent('tick\t' + Math.round(dt));
+    requestAnimationFrame(tickLoop);
+  };
+  const setKeys = (on) => {
+    if (on === keysOn) return; keysOn = on;
+    if (on) { window.addEventListener('keydown', onKey); window.addEventListener('keyup', onKey); }
+    else { window.removeEventListener('keydown', onKey); window.removeEventListener('keyup', onKey); }
+  };
+  const GAME_KEYS = new Set(['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', ' ', 'Enter']);
+  function onKey(ev) {
+    if (!guiPanel.classList.contains('open')) return;
+    if (GAME_KEYS.has(ev.key)) ev.preventDefault();
+    pushEvent('key\t' + (ev.key === ' ' ? 'Space' : ev.key) + '\t' + (ev.type === 'keydown' ? 1 : 0));
+  }
+
+  // --- a tiny WebGL renderer: colored quads (2 triangles each) --------------
+  let gl = null, glProg = null, glBuf = null, glLoc = null, glW = 0, glH = 0, glBg = [0, 0, 0];
+  const glInit = (w, h) => {
+    glcanvas.width = w; glcanvas.height = h; glcanvas.style.display = 'block'; glW = w; glH = h;
+    if (gl) return;
+    try {
+      gl = glcanvas.getContext('webgl', { antialias: true, alpha: false }) || glcanvas.getContext('experimental-webgl');
+      if (!gl) { say('\n[gui: WebGL unavailable]\n', 'err'); return; }
+      const vs = 'attribute vec2 p; attribute vec3 c; varying vec3 vc; void main(){ vc=c; gl_Position=vec4(p,0.0,1.0); }';
+      const fs = 'precision mediump float; varying vec3 vc; void main(){ gl_FragColor=vec4(vc,1.0); }';
+      const sh = (t, src) => { const s = gl.createShader(t); gl.shaderSource(s, src); gl.compileShader(s); return s; };
+      glProg = gl.createProgram(); gl.attachShader(glProg, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(glProg, sh(gl.FRAGMENT_SHADER, fs));
+      gl.linkProgram(glProg);
+      if (!gl.getProgramParameter(glProg, gl.LINK_STATUS)) { say('\n[gui: WebGL shader link failed]\n', 'err'); gl = null; return; }
+      gl.useProgram(glProg);
+      glBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, glBuf);
+      glLoc = { p: gl.getAttribLocation(glProg, 'p'), c: gl.getAttribLocation(glProg, 'c') };
+      gl.enableVertexAttribArray(glLoc.p); gl.enableVertexAttribArray(glLoc.c);
+    } catch (e) { say('\n[gui: WebGL init failed: ' + (e && e.message || e) + ']\n', 'err'); gl = null; }
+  };
+  const glDrawSprites = (data) => {
+    if (!gl || gl.isContextLost()) return;
+    try {
+    // data: "x,y,w,h,r,g,b;..." pixels (origin top-left), colors 0-255
+    const quads = data ? data.split(';').filter(Boolean) : [];
+    const verts = new Float32Array(quads.length * 6 * 5);   // 6 verts * (x,y,r,g,b)
+    let o = 0;
+    const toClipX = (x) => (x / glW) * 2 - 1, toClipY = (y) => 1 - (y / glH) * 2;
+    for (const q of quads) {
+      const a = q.split(','); const x = +a[0], y = +a[1], w = +a[2], h = +a[3], r = +a[4] / 255, g = +a[5] / 255, b = +a[6] / 255;
+      const x0 = toClipX(x), y0 = toClipY(y), x1 = toClipX(x + w), y1 = toClipY(y + h);
+      const P = [[x0, y0], [x1, y0], [x0, y1], [x0, y1], [x1, y0], [x1, y1]];
+      for (const [px, py] of P) { verts[o++] = px; verts[o++] = py; verts[o++] = r; verts[o++] = g; verts[o++] = b; }
+    }
+    gl.viewport(0, 0, glW, glH);
+    gl.clearColor(glBg[0] / 255, glBg[1] / 255, glBg[2] / 255, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.bindBuffer(gl.ARRAY_BUFFER, glBuf); gl.bufferData(gl.ARRAY_BUFFER, verts, gl.DYNAMIC_DRAW);
+    gl.vertexAttribPointer(glLoc.p, 2, gl.FLOAT, false, 20, 0);
+    gl.vertexAttribPointer(glLoc.c, 3, gl.FLOAT, false, 20, 8);
+    gl.drawArrays(gl.TRIANGLES, 0, quads.length * 6);
+    } catch (e) { say('\n[gui: WebGL draw failed: ' + (e && e.message || e) + ']\n', 'err'); gl = null; }
+  };
+
+  const applyGui = (bytes) => {
+    const text = dec.decode(bytes);
+    for (const line of text.split('\n')) {
+      if (!line) continue;
+      const f = line.split('\t'), cmd = f[0];
+      if (cmd === 'reset') { guiRoot.innerHTML = ''; guiEls.clear(); glcanvas.style.display = 'none'; openPanel(); }
+      else if (cmd === 'panel') { guiTitle.textContent = f[1] || 'GUI'; openPanel(); }
+      else if (cmd === 'el') {
+        const e = document.createElement(f[3] || 'div'); e.dataset.guiid = f[1];
+        (el(f[2]) || guiRoot).appendChild(e); guiEls.set(f[1], e);
+      }
+      else if (cmd === 'text') { const e = el(f[1]); if (e) e.textContent = f.slice(2).join('\t'); }
+      else if (cmd === 'class') { const e = el(f[1]); if (e) e.className = f.slice(2).join('\t'); }
+      else if (cmd === 'style') { const e = el(f[1]); if (e) e.style.cssText = f.slice(2).join('\t'); }
+      else if (cmd === 'attr') { const e = el(f[1]); if (e) e.setAttribute(f[2], f.slice(3).join('\t')); }
+      else if (cmd === 'on') { const e = el(f[1]); const id = f[1], evn = f[2]; if (e) e.addEventListener(evn, () => pushEvent((evn === 'click' ? 'click' : 'evt') + '\t' + id)); }
+      else if (cmd === 'canvas') { glInit(+f[1] || 640, +f[2] || 480); }
+      else if (cmd === 'bg') { glBg = [+f[1] || 0, +f[2] || 0, +f[3] || 0]; }
+      else if (cmd === 'sprites') { glDrawSprites(f.slice(1).join('\t')); }
+      else if (cmd === 'animate') { const on = f[1] === '1'; if (on && !rafOn) { rafOn = true; lastT = 0; requestAnimationFrame(tickLoop); } else if (!on) rafOn = false; }
+      else if (cmd === 'keys') { setKeys(f[1] === '1'); }
+      else if (cmd === 'close') { closePanel(); }
+    }
+  };
+  window.modusApplyGui = applyGui;   // worker.onmessage calls this
+
   status.textContent = 'starting…';
   // Deep links.  decodeURIComponent (not URLSearchParams) so a literal '+'
   // survives — Lisp forms are full of it; encode links with encodeURIComponent.
@@ -353,7 +520,7 @@
     }
   }
   if (quit) argv.push('--quit');
-  worker.postMessage({ type: 'start', mvmw, core, stdin: sab, http: httpSab, inbox: inboxSab, query: querySab, argv, env: ['HOME=/home/web'],
+  worker.postMessage({ type: 'start', mvmw, core, stdin: sab, http: httpSab, inbox: inboxSab, query: querySab, gui: guiSab, argv, env: ['HOME=/home/web'],
                        semispace: 256 << 20, files }, [mvmw].concat(core ? [core] : []).concat(files.map((f) => f.bytes)));
 })();
 </script>

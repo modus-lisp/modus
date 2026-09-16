@@ -72,6 +72,12 @@ try {
   if (e instanceof MvmFault) { process.stderr.write('MVM FAULT: ' + e.message + '\n'); code = 70; }
   else { process.stderr.write('MVM internal error at ' + vm.where() + ' (step ' + vm.steps + ')\n  ' + vm.backtrace().join('\n  ') + '\n'); throw e; }
 }
+if (process.env.DUMP_COMPILED) {
+  const off2name = new Map(); for (const f of vm.fnsPhys) off2name.set(f.off, f.name);
+  const names = [...vm.compiled.entries()].filter(([, f]) => f).map(([off]) => off2name.get(off)).filter(Boolean).sort();
+  require('fs').writeFileSync(process.env.DUMP_COMPILED, JSON.stringify(names, null, 0));
+  host.log(`[dumped ${names.length} compiled fn names to ${process.env.DUMP_COMPILED}]`);
+}
 if (opts.profile) host.log(vm.profileReport(40));
 if (vm.dcount.size) host.log('[dynamic delegated: ' + [...vm.dcount.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12).map(([o, n]) => '0x' + o.toString(16) + ':' + n).join(' ') + ']');
 if (opts.trace && vm.compileStats.delegated.size) host.log('[delegated ops: ' + [...vm.compileStats.delegated.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12).map(([o, n]) => '0x' + o.toString(16) + ':' + n).join(' ') + ']');

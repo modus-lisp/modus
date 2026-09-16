@@ -37,6 +37,8 @@ class NodeHost {
     return new Uint8Array(execFileSync('curl', args, { maxBuffer: 64 << 20 }));
   }
   now() { return performance.now(); }
+  // GUI bridge is browser-only; no-ops under node so samples don't crash.
+  guiSend() {} guiPoll() { return 0; } guiWait(ms) { return 0; }
   getpid() { return process.pid; }
 
   writeByte(fd, b) { this.write(fd, Uint8Array.of(b), 0, 1); }

@@ -2,7 +2,7 @@
 // worker.js — runs the MVM interpreter off the main thread.
 //
 // Messages in:  { type: 'start', mvmw: ArrayBuffer, core: ArrayBuffer|null,
-//                 stdin/http/inbox/query: SharedArrayBuffer,
+//                 stdin/http/inbox/query/gui: SharedArrayBuffer,
 //                 argv: [...], env: [...],
 //                 files: [{ path, bytes }] }
 // Messages out: { type: 'stdout', bytes }, { type: 'log', text },
@@ -10,7 +10,7 @@
 //               { type: 'http', url, method, headers, body }, { type: 'file', path, bytes },
 //               { type: 'query-result', id, op, bytes }
 
-importScripts('mvm.js', 'host-browser.js');
+importScripts('mvm.js', 'host-browser.js', 'warmset.js');
 const X = self.MVM_EXPORTS;
 
 self.onmessage = (ev) => {
@@ -20,7 +20,7 @@ self.onmessage = (ev) => {
   try {
     const t0 = performance.now();
     const mod = X.loadModule(new Uint8Array(msg.mvmw));
-    const host = new BrowserHost(msg.stdin, post, msg.http, msg.inbox, msg.query);
+    const host = new BrowserHost(msg.stdin, post, msg.http, msg.inbox, msg.query, msg.gui);
     for (const f of msg.files || []) host.addFile(f.path, new Uint8Array(f.bytes));
     const vm = new X.MVM(mod, host, { argv: msg.argv, env: msg.env, semispace: msg.semispace, trace: msg.trace | 0 });
     host.vm = vm;   // for the introspection RPC serviced while idle in read
@@ -35,6 +35,16 @@ self.onmessage = (ev) => {
       resumed = true;
     }
     post({ type: 'log', text: `[modus: ${resumed ? 'core restored' : 'cold boot'} in ${Math.round(performance.now() - t0)}ms]` });
+    // Warm the compiler/reader/eval hot set (see warmset.js).  A core restore has
+    // an empty JS-translation cache, so the first form typed or file loaded would
+    // otherwise JS-translate ~345 functions AND run them interpreted until they
+    // cross the compile threshold.  Doing it up front (behind the load spinner)
+    // makes the first REPL interaction as fast as later ones.
+    if (resumed && self.MVM_WARMSET) {
+      const tw = performance.now();
+      let n = 0; for (const name of self.MVM_WARMSET) { try { if (vm.forceCompile(name)) n++; } catch (e) {} }
+      post({ type: 'log', text: `[warmed ${n}/${self.MVM_WARMSET.length} fns in ${Math.round(performance.now() - tw)}ms]` });
+    }
     let code;
     try {
       code = vm.main(resumed);

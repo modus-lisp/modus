@@ -103,6 +103,44 @@ Three layers, each useful on its own and each a prerequisite for the next.
    walker from the promotion work (no calls / no NLX in the body) decides
    whether the binding can stay in a register for the body's extent.
 
+### Layer 2b, refined from reel's kernels (2026-09-16)
+
+The A53 per-phase profile of the eager core (docs/videocore-hvs-notes.md)
+puts 62% of an inter frame in three kernels — IDCT+add-residual 30 ms, the
+loop filter 40 ms, MC 18 ms of 141 — so the integer lane set is chosen
+from those three bodies (`transform.lisp`, `intra.lisp add-residual`,
+`loopfilter.lisp %edge-*`, `inter.lisp mc-filter`), each op one NEON
+instruction, each with an interpreter arm over a 16-byte scratch:
+
+    lane kinds        u8x8 u8x16 s8x16 s16x4 s16x8 (s32x4 for the IDCT products)
+    memory            :vld8 :vld16 :vst8 :vst16   u8 array + index, unaligned
+                      (:vld4/:vst4 for add-residual's 4-pixel rows)
+    broadcast         :vdup.s16 gpr -> s16x8, :vdup.u8 gpr -> u8x16
+    widen / narrow    :uxtl u8x8->s16x8, :sxtl s16x4->s32x4
+                      :sqxtun s16x8->u8x8 (saturate to 0..255)
+                      :sqrshrun s16x8->u8x8 #n (round, shift, saturate: the
+                        `(max 0 (min 255 (ash (+ x 64) -7)))` of mc-filter)
+                      :xtn s32x4->s16x4
+    arithmetic        :vadd :vsub (s16, s32, u8)  :vmul :vmla :vmls s16x8 by
+                      a broadcast scalar (the six taps)  :sqdmulh s16 by
+                      constant (IDCT 35468/20091 with the >>16)  :vshr/:vshl
+                      immediate  :sqadd :sqsub s8x16 (loop filter adjust)
+    compare / select  :uabd u8  :cmhs/:cmhi u8 (masks)  :vand :vorr :veor
+                      :vbsl  (the loop filter's %edge-ok / %hev gates as
+                      lane masks; `eor #x80` is the signed/unsigned trick)
+    shuffle           :trn1/:trn2 :zip1/:zip2 s16x4 (the 4x4 IDCT transpose)
+
+Register model for the first cut: Q0–Q7 caller-clobbered; a LET binding
+whose init is a vector primitive is a `:qreg` binding and stays in a Q
+register while its scope is call-free (the promotion work's safety
+walker), else it spills to a 16-byte frame slot pair; vector expression
+trees allocate Q temps depth-first.  The loop filter needs ~10 live
+vectors per edge, so spills are part of the first cut, not later.
+Kernel order by measured weight: mc-filter (self-contained, biggest
+single expression), add-residual + IDCT, then the three %edge-* kernels.
+Gate for each: reel's YSUM bit-exact against the scalar build, and the
+JIT-vs-interpret differential on the vector probes.
+
 ## Layer 3 — mill on Modus, and reel
 
 - `mill/src/simd.lisp` gains a `#+modus` arm: `+f32-lanes+` 4, and the

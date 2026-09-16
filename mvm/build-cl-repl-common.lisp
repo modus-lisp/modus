@@ -1464,6 +1464,36 @@
 ;;; sets up the rings.  Unlike cdc-ether-init it has no success return value to
 ;;; test, so the abort arm keys on the DHCP result instead: an all-zero IP after
 ;;; dhcp-client means nothing answered and there is no point fetching.
+;; MODUS_NET_STATIC=1 — the RPi auto-pipeline uses a STATIC IP (10.0.0.2, GW
+;; 10.0.0.1) instead of DHCP.  The Anker r8152 link to modus-pi has no DHCP
+;; server on the 10.0.0.x subnet (dhcp-client draws a stale 10.0.2.x lease from
+;; elsewhere and the fetch TCP:F's), while a static address matches ssh-boot's
+;; own working configuration.  Used to auto-install an app tarball (e.g. reel)
+;; at boot, before net-actor-main, then drop to the serial REPL.
+(defvar *net-static-p*
+  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_NET_STATIC")))
+    (and v (string= v "1"))))
+
+(defvar *net-rpi-addr-block*
+  (if *net-static-p*
+      ;; static 10.0.0.2 / GW 10.0.0.1 (bytes as ssh-boot writes them)
+      "(setf (mem-ref (+ (e1000-state-base) 24) :u32) 33554442)
+          (setf (mem-ref (+ (e1000-state-base) 28) :u32) 16777226)"
+      "(dotimes (attempt 8)
+            (when (zerop (mem-ref (+ (e1000-state-base) #x18) :u8))
+              (handler-case (dhcp-client) (t (c) nil))))"))
+
+;; The RPi pipeline's NIC bring-up.  cdc-ether-init "succeeds" (returns 1) on
+;; the Anker RTL8153 but never passes traffic (TCP:F on every fetch); the r8152
+;; adopt lives in usb-netdev.lisp's net-usb-probe, which only SSH builds carry.
+;; When it is present, use it — zeroing the NIC/IP state first, as ssh-boot does
+;; (bare-metal DRAM is garbage) — and report 1 so the pipeline proceeds.
+(defvar *net-rpi-nic-init*
+  (if *ssh-build-p*
+      "(progn (let ((s (e1000-state-base))) (dotimes (i 1024) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
+                        (net-usb-probe) 1)"
+      "(cdc-ether-init)"))
+
 (defvar *net-pipeline-defun-source*
   (if *cl-repl-qemu-p*
       "(defun run-net-pipeline ()
@@ -1501,22 +1531,17 @@
           (net-install-and-call (%net-fetch-url)))))
   (write-string-serial \"NET-PIPELINE-DONE\") (write-char-serial 10))
 "
-      "(defun run-net-pipeline ()
+      (format nil "(defun run-net-pipeline ()
   (write-string-serial \"NET-PIPELINE-START\") (write-char-serial 10)
   ;; 1. DWC2 host controller + USB enumeration + CDC Ethernet.
   ;;    Prints DWC2:OK / PORT:xx / USB:vvvv:pppp / MAC:.. / CDC:OK itself.
-  (let ((r (handler-case (cdc-ether-init) (t (c) 0))))
+  (let ((r (handler-case ~A (t (c) 0))))
     (write-string-serial \"CDC-INIT=\") (print-dec r) (write-char-serial 10)
     (if (zerop r)
         (progn (write-string-serial \"NET-PIPELINE-ABORT\") (write-char-serial 10))
         (progn
-          ;; 2. DHCP.  Prints DHCP:D / DHCP:O / DHCP:R / DHCP:A itself.
-          ;;    Same retry as the QEMU arm: the host side of a CDC-ECM link
-          ;;    (dnsmasq on the gadget interface) can miss the first
-          ;;    DISCOVER while its interface is still coming up.
-          (dotimes (attempt 8)
-            (when (zerop (mem-ref (+ (e1000-state-base) #x18) :u8))
-              (handler-case (dhcp-client) (t (c) nil))))
+          ;; 2. Address: DHCP, or a baked STATIC 10.0.0.2 (MODUS_NET_STATIC=1).
+          ~A
           (let ((state (e1000-state-base)))
             (write-string-serial \"IP=\")
             (print-dec (mem-ref (+ state #x18) :u8)) (write-char-serial 46)
@@ -1529,7 +1554,7 @@
           ;;    (rung 3) install it, load it, and call a function from it.
           (net-install-and-call (%net-fetch-url)))))
   (write-string-serial \"NET-PIPELINE-DONE\") (write-char-serial 10))
-"))
+" *net-rpi-nic-init* *net-rpi-addr-block*)))
 
 (defvar *net-driver-source*
   (if *net-build-p*

@@ -92,6 +92,56 @@ net/hdmi-hvs.lisp (hand-assembled words, exec-page vehicle, X0-X3 + Q0/Q1 only).
   hvs-scaled-plane in net/hdmi-hvs.lisp.  Sources: Linux v6.6 vc4_plane.c /
   vc4_hvs.c / vc4_regs.h.
 
+## Board transport lessons (2026-09-16, the reel-on-HVS attempt — read before
+## driving the Zero again; each of these cost a power cycle)
+* `pkill -f netboot-gz` inside a `bash -c "... python3 netboot-gz.py ..."` kills
+  the launching shell itself — the pattern matches the shell's OWN argv (the
+  python invocation text is in it).  Bracketing `[n]etboot` does NOT help there.
+  Anchor: `pkill -f "^python3 -u netboot"`, or launch with a plain
+  `(setsid nohup python3 -u netboot-gz.py … &)` and never pkill in the same
+  command.  Symptom: "netboot never starts", empty logs.
+* Two readers on /dev/ttyAMA0 = the other one eats the bytes (pyserial then
+  raises "device reports readiness to read but returned no data").  netboot-gz
+  holds the port after `go` (send-delay); stop it before reading the boot trace.
+  A host-side background task that gets memory-killed mid-write leaves U-Boot
+  with a HALF-TYPED `go 0x300` — finish it with `000⏎` (the image is already
+  unzipped at 0x300000).
+* U-Boot autoboots the STALE SD image ("Hit any key to stop autoboot: 0") if the
+  CR spam misses the window; the monitor shows "64921864 bytes read … Starting
+  application" and netboot prints nothing.  Just re-run netboot (RUN-pin reset).
+* Serial REPL prints BARE values; the SSH exec path prints `= value`.  A regex
+  written for one silently fails on the other.  Tag every serial read:
+  `(list TAG form)` → `\(TAG (.+?)\)`.  The `)))))` unstick makes the NEXT form
+  READ-ERROR — send a throwaway `(+ 0 0)` before probing.
+* "Never send input during boot": a second `go` injected while Modus boots
+  wedges the reader; nothing recovers it but a reboot.  An idle REPL prints
+  nothing on a passive read — empty ≠ dead; send-then-read is the only test.
+* `*jit-hot-only* NIL` BEFORE `net-install-and-call` makes the reel install
+  eager-JIT everything: 16 MINUTES on the A53 (and the r8152 dies meanwhile).
+  Install at the default, flip the flag only for timing loops.
+* THE NETWORK: outbound TX from the r8152 works ONLY under ssh-boot (ping,
+  fetch, SSH all fine).  With the same driver bound (`usb-netdev-get`=2, MAC
+  right, `e1000-send`→1) at the serial REPL, NOTHING reaches the wire (tcpdump
+  on modus-pi eth0: zero packets) — ARP never resolves, every fetch `TCP:F`.
+  Tried and ruled out: static IP/GW byte order (state+0x1C is LE bytes, the
+  `GW=1.0.0.10` print is the printer's quirk), ssh-seed-random, zeroing the
+  ssh-ipc/conn regions, priming with 600 receive polls, cdc-ether-init vs
+  net-usb-probe (cdc "succeeds" but is the wrong driver; net-usb-probe only
+  exists in MODUS_SSH_BUILD=1 images), a second net-usb-probe (→ NOTFOUND: the
+  device is already claimed; `(usb-netdev-set 2)` restores the binding).  Still
+  unknown what in ssh-boot/net-actor-main enables TX — chase with tcpdump +
+  bisecting ssh-boot's body next time.  Build knobs added: MODUS_NET_STATIC=1
+  (pipeline uses 10.0.0.2/10.0.0.1 instead of DHCP) and the pipeline adopts via
+  net-usb-probe in SSH builds (*net-rpi-nic-init*).
+* ssh-boot's single-connection server WEDGES on an interactive (-tt) shell
+  channel (ping ok, port 22 times out) — use exec-mode `ssh host "(form)"` per
+  form; `net-actor-main` polls between calls so the NIC stays alive.  A long
+  synchronous eval (the install) stops all polling: no ping replies until it
+  returns.
+* Working demo flow: demo9 (NET+SSH build, MODUS_NET_NOAUTO=1) → netboot →
+  `(ssh-boot)` over serial → exec-mode forms (rh_run.py / rh_session.sh on
+  modus-pi; hvs-all-forms.txt = flatten2.lisp of net/hdmi-hvs.lisp).
+
 ★★★★ 60 Hz ON SCREEN, MEASURED (same day): two NC 640x360 buffers, per frame
   fill (0.84 ms) -> u32 write of the scaled plane's PTR0 (slot 2005, window NC)
   -> spin on HD FRAME_COUNT (0x3F808068).  300 frames = 5.002 s, 600 = 10.005 s

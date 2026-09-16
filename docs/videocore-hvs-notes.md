@@ -67,8 +67,30 @@ net/hdmi-hvs.lisp (hand-assembled words, exec-page vehicle, X0-X3 + Q0/Q1 only).
   (the sanity gate "descriptor == (b<<21)|0x701" is what saved the second run);
   the ')))))' unstick burst makes the NEXT form READ-ERROR, so send a throwaway
   form before probing; MRS Rt is bits[4:0] — D53C2000 is X0, not X1.
-  NEXT: the HVS scaled plane (render 640x360 in ~1 ms, hardware upscales, same
-  1 us flip) = full-screen video at zero CPU cost. The HVS hardware-scaled overlay (compose our own plane
+★★★★ THE 4:1 CRUX SOLVED + HARDWARE-SCALED PLANE ON SCREEN (same day).
+  The byte-narrow HVS writes were the DEVICE WRITE PATH, not the HVS: with the
+  HVS's 2 MB block remapped Normal-Non-Cacheable (descriptor 0x405 -> 0x409, same
+  MAIR/TLBI as hvs-map-nc) a plain u32 store latches ALL 32 BITS at ANY slot
+  (slot 2201 := 0x12345678, read back under Device).  Under Device: u32 -> 1 byte,
+  u64 -> 2 bytes, STP -> the low 32 bits of each 64-bit beat (so my "pairs" were
+  interleaved: X1 at +0, X2 at +8, odd slots untouched).  READS under NC are
+  garbage (four identical words; DISPLACT1 read 0), so: (hvs-window-nc t) ->
+  u32 writes (SRAM AND registers, incl. DISPLIST1 at 0x24) -> (hvs-window-nc nil)
+  -> verify.  All 28 words (11-word Mitchell-Netravali kernel at slot 2100 + 17-word
+  scaled plane at 2000) read back exact; DISPLIST1 := 2000 -> DISPLACT1 = 2000.
+  RESULT: a 640x360 RGBA source (red / green band / 80x60 white box / blue) PPF-
+  upscaled by the HVS to the full 1920x1200, geometry exact.  Full-screen video is
+  now ~1 ms of CPU per frame (render 640x360 into an NC buffer) + a PTR0 flip.
+  Plane recipe (vc4_plane_mode_set, non-unity RGB, PPF/PPF): ctl0 = fw ctl0 minus
+  UNITY/SIZE/SCL, SIZE=16; pos0 = 0xFF000000|y<<12|x; pos1 = dh<<16|dw; pos2 =
+  ALPHA_MODE_FIXED(1<<30)|sh<<16|sw  (alpha mode 0 = per-pixel -> our alpha-0
+  pixels would be INVISIBLE); pos3 ctx; ptr0 (0xC0000000|phys); ctx; pitch; LBM 0;
+  H-PPF = AGC(1<<30)|((sw<<16)/dw)<<8; V-PPF likewise; ctx; kernel slot x4; END.
+  Kernel: coefficients 0,-2,-6,-8,-10,-8,-3,2,18,50,82,119,155,187,213,227 packed
+  3 x 9-bit per word (6 words, last = (c15,c15,0)), uploaded as words 0-5 then
+  4,3,2,1,0.  Code: hvs-window-nc / hvs-slot-wr32 / hvs-upload-kernel /
+  hvs-scaled-plane in net/hdmi-hvs.lisp.  Sources: Linux v6.6 vc4_plane.c /
+  vc4_hvs.c / vc4_regs.h. The HVS hardware-scaled overlay (compose our own plane
 on channel 1's dlist, or add a scaled YUV plane) remains the path to zero-CPU
 scaling, but is no longer on the critical path to "pixels up".
 

@@ -491,3 +491,90 @@
   (let ((a (%mmap-exec-page 9216000)) (b (%mmap-exec-page 9216000)))
     (hvs-map-nc a 9216000) (hvs-map-nc b 9216000)
     (list a b)))
+
+;;; --- THE 4:1 CRUX, SOLVED (2026-09-16): it was the Device write path ----------
+;;; With the HVS window mapped Device-nGnRnE (the boot default) a u32 store
+;;; latches ONE byte, a u64 two, a 128-bit STP the low 32 bits of each 64-bit
+;;; beat — so 4-mod-8 slots were unreachable.  With the HVS's 2 MB block
+;;; temporarily mapped Normal-Non-Cacheable, a plain u32 store latches ALL 32
+;;; bits at ANY slot (slot 2201 = 0x12345678 read back under Device).  READS
+;;; under the NC mapping are garbage (Normal-memory reads get merged into
+;;; bursts the bridge does not serve; DISPLACT1 read 0), so the protocol is:
+;;;   (hvs-window-nc t) -> u32 writes -> (hvs-window-nc nil) -> read/verify.
+;;; The PTR0 flip (an even slot) still works under Device via hvs-flip.
+
+(defvar *hvs-attr* nil)   ; (code mairw-entry scratch)
+
+(defun hvs-window-nc (nc)
+  "Map the HVS's 2 MB block Normal-NC (NC true) or back to Device (NC nil)."
+  (when (null *hvs-attr*)
+    (let* ((code (%mmap-exec-page 4096)) (scr (+ code 256)) (p code))
+      (dolist (w (hvs-mair-words scr)) (setf (mem-ref p :u32) w) (setq p (+ p 4)))
+      (%jit-icache-flush code 256)
+      (setq *hvs-attr* (list code code scr))))
+  (let* ((l2 (logand (mem-ref #x70000 :u32) (lognot #xFFF)))
+         (blk (ash (hvs-base) -21)) (e (+ l2 (* 8 blk))))
+    (hvs-scr-u64 e (logior (ash blk 21) (if nc #x409 #x405)))
+    (%jit-icache-flush e 8)
+    (hvs-scr-u64 (caddr *hvs-attr*) #x4400FF)
+    (%jit-call (cadr *hvs-attr*))))
+
+(defun hvs-slot-wr32 (slot w)
+  "Write a full 32-bit dlist word.  Caller brackets with (hvs-window-nc t/nil)."
+  (setf (mem-ref (+ (hvs-base) #x2000 (* slot 4)) :u32) w))
+
+;;; --- HARDWARE-SCALED PLANE (2026-09-16): 640x360 -> 1920x1200 on screen -------
+;;; Word order per Linux vc4_plane_mode_set (non-unity RGB, PPF both axes):
+;;;   ctl0 (VALID|SIZE=16|format/order bits from the firmware plane, UNITY clear,
+;;;   SCL0=SCL1=0 H-PPF/V-PPF), pos0 (alpha 0xFF, x, y), pos1 (dst h<<16|w),
+;;;   pos2 (ALPHA_MODE_FIXED<<30 | src h<<16 | w), pos3 ctx, ptr0, ptr ctx,
+;;;   pitch, LBM base (0), H-PPF (AGC|(src<<16/dst)<<8), V-PPF, ctx,
+;;;   4 x kernel offset, then END.  The PPF kernel (Mitchell-Netravali B=C=1/3,
+;;;   11 words: 6 linear-phase words then the first 5 reversed) lives in dlist
+;;;   SRAM at *hvs-kernel-slot*.  Switch the channel with DISPLIST1 (0x24).
+
+(defvar *hvs-kernel-slot* 2100)
+(defvar *hvs-plane-slot* 2000)
+
+(defun hvs-ppf-word (c0 c1 c2)
+  (logior (logand c0 #x1ff) (ash (logand c1 #x1ff) 9) (ash (logand c2 #x1ff) 18)))
+
+(defun hvs-upload-kernel ()
+  "Upload the 11-word PPF kernel at *hvs-kernel-slot* (window must be NC)."
+  (let* ((c '(0 -2 -6 -8 -10 -8 -3 2 18 50 82 119 155 187 213 227))
+         (k6 (list (hvs-ppf-word (nth 0 c) (nth 1 c) (nth 2 c))
+                   (hvs-ppf-word (nth 3 c) (nth 4 c) (nth 5 c))
+                   (hvs-ppf-word (nth 6 c) (nth 7 c) (nth 8 c))
+                   (hvs-ppf-word (nth 9 c) (nth 10 c) (nth 11 c))
+                   (hvs-ppf-word (nth 12 c) (nth 13 c) (nth 14 c))
+                   (hvs-ppf-word (nth 15 c) (nth 15 c) 0)))
+         (i 0))
+    (loop (when (>= i 11) (return nil))
+      (hvs-slot-wr32 (+ *hvs-kernel-slot* i) (nth (if (< i 6) i (- 10 i)) k6))
+      (setq i (+ i 1)))))
+
+(defun hvs-scaled-plane (phys sw sh pitch dw dh)
+  "Compose at *hvs-plane-slot* a plane scanning the SWxSH RGBA buffer at PHYS,
+   PPF-upscaled by the HVS to DWxDH at (0,0), and switch channel 1 to it.
+   Copies format/order/alpha bits from the firmware's own plane."
+  (let* ((fw (hvs-rd (+ (hvs-base) #x34)))
+         (fctl0 (hvs-rd (+ (hvs-base) #x2000 (* fw 4))))
+         (fpos0 (hvs-rd (+ (hvs-base) #x2000 (* (+ fw 1) 4))))
+         (fpos2 (hvs-rd (+ (hvs-base) #x2000 (* (+ fw 2) 4))))
+         (ppf-h (logior (ash 1 30) (ash (floor (* 65536 sw) dw) 8)))
+         (ppf-v (logior (ash 1 30) (ash (floor (* 65536 sh) dh) 8)))
+         (ks *hvs-kernel-slot*)
+         (words (list (logior (logand fctl0 (lognot (logior #x10 #x3F000000 (ash 7 5) (ash 7 8))))
+                              (ash 16 24))
+                      (logand fpos0 #xFF000000)
+                      (logior (ash dh 16) dw)
+                      (logior (logand fpos2 #xF0000000) (ash sh 16) sw)
+                      #xC0C0C0C0 (logior #xC0000000 phys) #xC0C0C0C0 pitch
+                      0 ppf-h ppf-v #xC0C0C0C0 ks ks ks ks #x80000000))
+         (i 0))
+    (hvs-window-nc t)
+    (hvs-upload-kernel)
+    (dolist (w words) (hvs-slot-wr32 (+ *hvs-plane-slot* i) w) (setq i (+ i 1)))
+    (setf (mem-ref (+ (hvs-base) #x24) :u32) *hvs-plane-slot*)   ; DISPLIST1
+    (hvs-window-nc nil)
+    (hvs-rd (+ (hvs-base) #x34))))

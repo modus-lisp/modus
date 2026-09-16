@@ -361,3 +361,33 @@
 (defun hvs-frame (src)
   "Blit one full 1920x1200 RGBA frame at SRC onto the live scanout (~52 ms)."
   (hvs-ncopy (hvs-scanout-fb) src 9216000))
+
+;;; --- HARDWARE DOUBLE BUFFER (2026-09-16) ---------------------------------------
+;;; The HVS re-reads its display list every frame, and the live plane's PTR0 word
+;;; sits at an 8-aligned dlist slot (1636+4 -> 0x3F4039A0), so ONE 128-bit STP
+;;; retargets the scanout to another buffer at the next vsync.  Measured: 1-2 us.
+;;; The buffer must be coherent (hvs-nfill/hvs-ncopy, or a non-cacheable mapping)
+;;; and is given as a bus address (0xC0000000 | phys), like the firmware's own.
+;;; Routine: ldr x0,[x3]; ldr x1,[x3,#8]; ldr x2,[x3,#16]; stp x1,x2,[x0]; dsb; ret
+;;; scratch: [PTR0 reg addr][bus addr][0xC0C0C0C0 (ptr-context scratch word)]
+
+(defvar *hvs-flip* nil)   ; (entry scratch)
+
+(defun hvs-flip-init ()
+  (let* ((code (%mmap-exec-page 4096)) (scr (+ code 256))
+         (words (list (logior #xD2800003 (ash (logand scr #xFFFF) 5))
+                      (logior #xF2A00003 (ash (logand (ash scr -16) #xFFFF) 5))
+                      #xF9400060 #xF9400461 #xF9400862 #xA9000801 #xD5033F9F #xD65F03C0))
+         (p code))
+    (dolist (w words) (setf (mem-ref p :u32) w) (setq p (+ p 4)))
+    (%jit-icache-flush code 64)
+    (let ((slot (hvs-rd (+ (hvs-base) #x34))))
+      (hvs-scr-u64 scr (+ (hvs-base) #x2000 (* (+ slot 4) 4)))
+      (hvs-scr-u64 (+ scr 16) #xC0C0C0C0))
+    (setq *hvs-flip* (list code scr))))
+
+(defun hvs-flip (phys)
+  "Scan out the coherent 1920x1200 RGBA buffer at PHYS from the next vsync (~1 us)."
+  (when (null *hvs-flip*) (hvs-flip-init))
+  (hvs-scr-u64 (+ (cadr *hvs-flip*) 8) (logior #xC0000000 phys))
+  (%jit-call (car *hvs-flip*)))

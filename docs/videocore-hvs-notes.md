@@ -29,9 +29,21 @@ firmware already has everything on):
   fb = (PTR0 & 0x3FFFFFFF)                              ; framebuffer phys (pitch 7680, RGBA8888, 1920x1200)
   (hvs-fill (+ fb (* row pitch) (* x 4)) width color)  ; draw
 This IS the flat 0x00RRGGBB buffer glass/reel/the whole media stack target — the
-display seam is now real. hvs-fill is fast with (setq *jit-hot-only* nil) (JITs the
-loop); a full-screen fill should use a native STP/DC-CVAU blit for 60 fps, but the
-FB is located and writable. The HVS hardware-scaled overlay (compose our own plane
+display seam is now real.
+
+FULL-SCREEN NUMBERS (same day, BCM system timer, 1920x1200 RGBA = 9.2 MB):
+  compiled u32 loop (hvs-fill / baked hdmi-fill-rect)   227 ms  (45 MB/s)  — loop-bound,
+       ~100 ns/pixel, NOT memory: the FB (0x1e330000) is in the Normal-WB range, and the
+       cached writes leave dirty lines the HVS never sees (red speckle under a green fill;
+       %jit-icache-flush cleans to PoU only — the HVS reads at PoC).
+  native STP-Q fill + DC CVAC per line (hvs-nfill)      19.4 ms (475 MB/s)
+  native LDP/STP-Q copy src->FB + DC CVAC (hvs-ncopy)   52 ms   (176 MB/s), coherent
+       edge to edge (striped 9.2 MB source rendered uniformly, zero speckle).
+So a full 1920x1200 CPU blit tops out ~19 fps; a reel-sized frame (e.g. 640x360 =
+0.9 MB) is ~5 ms. To fill the screen at 60 fps the HVS must do the upscale: compose
+our own scaled plane on channel 1's dlist (hardware YUV->RGB + scale, zero CPU).
+Code: hvs-scanout-fb / hvs-blit-init / hvs-nfill / hvs-ncopy / hvs-frame in
+net/hdmi-hvs.lisp (hand-assembled words, exec-page vehicle, X0-X3 + Q0/Q1 only). The HVS hardware-scaled overlay (compose our own plane
 on channel 1's dlist, or add a scaled YUV plane) remains the path to zero-CPU
 scaling, but is no longer on the critical path to "pixels up".
 

@@ -283,3 +283,81 @@
   (hvs-slot-wr 900 #x80000000)
   (hvs-wr #x20 900)
   (list :ctrl (hvs-rd #x00) :bg (hvs-rd #x44) :slot (hvs-slot-rd 900) :dl (hvs-rd #x20)))
+
+;;; --- NATIVE BLIT into the firmware's live scanout FB (2026-09-16) ------------
+;;; The compiled u32-per-iteration loops (hvs-fill, hdmi-fill-rect) cost ~100 ns
+;;; per pixel — 227 ms for a 1920x1200 frame — and leave dirty lines the HVS
+;;; never sees (it reads DRAM at the PoC; %jit-icache-flush only cleans to the
+;;; PoU).  These two routines are hand-assembled AArch64 poked into an exec page
+;;; (the same vehicle as the 128-bit STP register writes): 64 bytes/iteration
+;;; through Q0/Q1 with a DC CVAC per line, DSB at the end.  Only X0-X3 and Q0/Q1
+;;; are touched, so nothing the JIT keeps live is clobbered.  Measured on the
+;;; Zero 2 W (BCM system timer): FILL 9.2 MB = 19.4 ms (475 MB/s); COPY 9.2 MB
+;;; src->FB = 52 ms (176 MB/s).  Args travel through a scratch block:
+;;;   fill: [dst u64][len u64][16-byte pixel pattern]      len multiple of 64
+;;;   copy: [dst u64][src u64][len u64]                    len multiple of 64
+;;; Requires (setq *jit-hot-only* nil) — %jit-call has no interpreter arm.
+
+(defun hvs-scanout-fb ()
+  "Physical address of the firmware's LIVE scanout framebuffer: PTR0 of the
+   active plane on the channel the pixelvalve is fed from (channel 1 on this
+   firmware), alias bits stripped.  Pitch is plane word 6 (7680 for 1920x1200)."
+  (let ((slot (hvs-rd (+ (hvs-base) #x34))))          ; DISPLACT1
+    (logand (hvs-rd (+ (hvs-base) #x2000 (* (+ slot 4) 4))) #x3FFFFFFF)))
+
+(defun hvs-blit-words (kind scr)
+  "Instruction words for KIND (:fill or :copy) reading its args at SCR."
+  (let ((movz (logior #xD2800003 (ash (logand scr #xFFFF) 5)))
+        (movk (logior #xF2A00003 (ash (logand (ash scr -16) #xFFFF) 5))))
+    (if (eq kind :fill)
+        ;; ldr x0,[x3]; ldr x1,[x3,#8]; ldr q0,[x3,#16]
+        ;; L: stp q0,q0,[x0]; stp q0,q0,[x0,#32]; dc cvac,x0; add x0,#64; subs x1,#64; b.ne L
+        ;; dsb sy; ret
+        (list movz movk #xF9400060 #xF9400461 #x3DC00460
+              #xAD000000 #xAD010000 #xD50B7A20 #x91010000 #xF1010021 #x54FFFF61
+              #xD5033F9F #xD65F03C0)
+        ;; ldr x0,[x3]; ldr x1,[x3,#8]; ldr x2,[x3,#16]
+        ;; L: ldp q0,q1,[x1]; stp q0,q1,[x0]; ldp q0,q1,[x1,#32]; stp q0,q1,[x0,#32]
+        ;;    dc cvac,x0; add x0,#64; add x1,#64; subs x2,#64; b.ne L
+        ;; dsb sy; ret
+        (list movz movk #xF9400060 #xF9400461 #xF9400862
+              #xAD400420 #xAD000400 #xAD410420 #xAD010400
+              #xD50B7A20 #x91010000 #x91010021 #xF1010042 #x54FFFF01
+              #xD5033F9F #xD65F03C0))))
+
+(defvar *hvs-blit* nil)   ; (code-page scratch fill-entry copy-entry)
+
+(defun hvs-blit-init ()
+  "Assemble both routines into a fresh exec page; returns (code scr fill copy)."
+  (let* ((code (%mmap-exec-page 4096)) (scr (%mmap-exec-page 4096))
+         (fill code) (copy (+ code 256)))
+    (let ((p fill)) (dolist (w (hvs-blit-words :fill scr))
+                      (setf (mem-ref p :u32) w) (setq p (+ p 4))))
+    (let ((p copy)) (dolist (w (hvs-blit-words :copy scr))
+                      (setf (mem-ref p :u32) w) (setq p (+ p 4))))
+    (%jit-icache-flush code 512)
+    (setq *hvs-blit* (list code scr fill copy))))
+
+(defun hvs-scr-u64 (a v)
+  (setf (mem-ref a :u32) (logand v #xFFFFFFFF))
+  (setf (mem-ref (+ a 4) :u32) (logand (ash v -32) #xFFFFFFFF)))
+
+(defun hvs-nfill (dst bytes color)
+  "Native fill: BYTES (multiple of 64) at DST with 0x00RRGGBB COLOR, coherent."
+  (when (null *hvs-blit*) (hvs-blit-init))
+  (let ((scr (cadr *hvs-blit*)))
+    (hvs-scr-u64 scr dst) (hvs-scr-u64 (+ scr 8) bytes)
+    (let ((i 0)) (loop (when (>= i 4) (return nil))
+      (setf (mem-ref (+ scr 16 (* i 4)) :u32) color) (setq i (+ i 1))))
+    (%jit-call (caddr *hvs-blit*))))
+
+(defun hvs-ncopy (dst src bytes)
+  "Native copy: BYTES (multiple of 64) from SRC to DST, DST made coherent."
+  (when (null *hvs-blit*) (hvs-blit-init))
+  (let ((scr (cadr *hvs-blit*)))
+    (hvs-scr-u64 scr dst) (hvs-scr-u64 (+ scr 8) src) (hvs-scr-u64 (+ scr 16) bytes)
+    (%jit-call (cadddr *hvs-blit*))))
+
+(defun hvs-frame (src)
+  "Blit one full 1920x1200 RGBA frame at SRC onto the live scanout (~52 ms)."
+  (hvs-ncopy (hvs-scanout-fb) src 9216000))

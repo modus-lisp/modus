@@ -481,6 +481,41 @@ chain had been shut off by NOTIFY_DISPLAY_DONE. Inventory (all measured):
   background, white text, U-Boot logo) persisting into Modus until `rel-fb` blanks
   it — not a camera artifact. Pure black with no backlight glow = no signal.
 
+**The actual scanout blocker: the HSM clock.** `CM_HSMCTL` (0x3F101088) and
+`CM_HSMDIV` (0x3F10108c) both read 0 after display-done — the HDMI state-machine
+clock is stopped, so `HDMI_ACTIVE` can never assert and `HD_FRAME_COUNT` stays 0
+regardless of encoder/PV/PHY state. vc4 programs it directly in CPRMAN
+(clk-bcm2835: parent PLLD_PER = 500 MHz, target 163,682,864 Hz → DIVI 3, MASH 1).
+There is no firmware mailbox clock id for HSM. Negatives on the way here:
+`SET_DISPLAY_POWER` (0x48019) is accepted for display 0 and does nothing (display
+2 → invalid); a 16-byte NEON `ST1 {V0.4S}` at the 4-mod-8 `TX_PHY_CTL0` RAN (pre/
+post markers) but latched nothing — NEON stores are not a way to reach 4-mod-8
+words. CPRMAN writes need the 0x5a password in bits 31:24; for the 4-mod-8
+`CM_HSMDIV` the plan is a `STP W1,W2` (a 64-bit transaction legal at 4-byte
+alignment; low quarter = 16 bits, enough for DIVI=3|DIVF) with 0x5a in the
+unlatched top byte in case the password check is combinational on the data bus.
+Note `PHY RNG_PWRDN` (CTL0 bit 25) is cleared by vc4 in post_crtc_powerup, i.e.
+AFTER the HDMI_ACTIVE wait, so it is not what gates ACTIVE.
+
+**CORRECTION: CPRMAN is INVISIBLE to the ARM here.** `CM_VPUCTL`, `CM_VPUDIV`,
+`CM_PERIACTL`, `A2W_PLLD_CTRL`, `A2W_PLLD_PER` ALL read 0 — impossible on a running
+system (the VPU runs the firmware on that clock) — and writes (STP-X full-width,
+STP-W, u32 byte-0, with the 0x5a password) leave `CM_HSMCTL` at 0. So "HSM = 0"
+was never a measurement: the ARM has no access to the clock manager in this boot
+state and cannot program HSM at all. Under a Linux KMS boot the ARM does reach
+CPRMAN (clk-bcm2835), so this is another firmware-state difference — unresolved.
+
+**What actually kills scanout is NOTIFY_DISPLAY_DONE**, not the release: after
+`rel-fb` alone the webcam still showed backlight (a black frame = signal present);
+only after the notify did it go to no-signal. The notify was only ever sent to stop
+the firmware "fighting" HVS writes — and the fight was largely the unpowered-block
+read signature + the bridge write-width, both since explained. **Next experiment
+(fresh boot, NO notify):** `rel-fb` → VIDEO_SCALER domain + CORE clock → check the
+HVS reads real → build the plane in SRAM → STP `DISPCTRLX0` enable (the firmware
+disables channel 0 on release: it read 0x00000000 right after the first release)
+→ u64 `DISPLIST0` → watch `DISPLACT0`/`HD_FRAME_COUNT` and the monitor, and watch
+whether the firmware re-powers the block down or re-writes the channel.
+
 ### VERDICT (2026-09-16, REVISED ABOVE — kept for the record): the ARM-side FRAMEBUFFER_RELEASE-ONLY path cannot render
 
 After exhaustive board testing with the user watching the physical monitor, the

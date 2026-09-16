@@ -167,11 +167,16 @@
     const open = sampMenu.style.display === 'block';
     if (open) { sampMenu.style.display = 'none'; return; }
     const r = samptoggle.getBoundingClientRect();
-    sampMenu.style.left = r.left + 'px'; sampMenu.style.top = (r.bottom + 4) + 'px';
+    // the bar is at the bottom of the window, so open the menu upward
+    sampMenu.style.left = r.left + 'px'; sampMenu.style.top = 'auto';
+    sampMenu.style.bottom = (window.innerHeight - r.top + 4) + 'px';
     sampMenu.style.display = 'block';
   });
   const runSample = async (file, run) => {
     sampMenu.style.display = 'none';
+    // if a sample is already running, its event loop is blocking the REPL; ask it
+    // to exit (same as the panel's close) so the new LOAD can actually run.
+    if (document.getElementById('gui').classList.contains('open')) document.getElementById('guiclose').click();
     status.textContent = 'loading sample ' + file + '…';
     for (const f of ['gui.lisp', file]) {
       const txt = await fetch('samples/' + f).then((r) => r.ok ? r.text() : null).catch(() => null);
@@ -490,7 +495,13 @@
       else if (cmd === 'close') { closePanel(); }
     }
   };
-  window.modusApplyGui = applyGui;   // worker.onmessage calls this
+  // Coalesce the command batches that arrive as separate messages (a UI build
+  // is ~25 of them) and apply them once per animation frame, so the panel paints
+  // whole instead of flickering element-by-element.  Frame cadence also suits the
+  // game's per-frame sprite pushes.
+  let guiQ = [], guiSched = false;
+  const guiFlush = () => { guiSched = false; const q = guiQ; guiQ = []; for (const b of q) { try { applyGui(b); } catch (e) { say('\n[gui: ' + (e && e.message || e) + ']\n', 'err'); } } };
+  window.modusApplyGui = (bytes) => { guiQ.push(bytes); if (!guiSched) { guiSched = true; requestAnimationFrame(guiFlush); } };
 
   status.textContent = 'starting…';
   // Deep links.  decodeURIComponent (not URLSearchParams) so a literal '+'

@@ -104,6 +104,35 @@ helpers are pre-translated at startup so the first completion is quick.
 Because it queries the live image, runtime `defun`s and `defvar`s are
 completed and described immediately.
 
+## Sample library (`samples/`)
+
+Graphical Lisp samples that drive the page's DOM and a WebGL canvas — no image
+rebuild, they run on three custom syscalls (`5000` send a command batch, `5001`
+poll input events, `5002` block for an event) dispatched entirely in `mvm.js`.
+The **▶ samples** button in the bar fetches `samples/gui.lisp` plus a sample and
+loads them; or `(load "…/gui.lisp")` then `(load "…/calc.lisp")` and run it.
+
+- `gui.lisp` — the bridge: `gui-reset`/`gui-el`/`gui-text`/`gui-style`/`gui-on`
+  build DOM, `gui-canvas`/`gui-bg`/`gui-sprites` drive a colored-quad WebGL
+  renderer, and `gui-wait`/`gui-events` are the event loop (click / key / a
+  per-frame tick).  Commands and events are tab-separated text lines.
+- `calc.lisp` — `(calc)` opens a DOM calculator; Esc closes it.
+- `snake.lisp` — `(snake)` is a WebGL game (arrows to steer, Space to restart,
+  Esc to quit), self-paced from the worker clock.
+
+## Startup speed
+
+A cold core restore has an empty JS-translation cache, so the first thing you
+evaluate would otherwise translate ~345 compiler/reader functions on demand and
+run them interpreted until they get hot.  Two things address that: keyword
+interning is memoized in `mvm.js` (the compiler re-interns the same `:foo`
+literals millions of times through the symbol hash table — the profiler showed
+`%INTERN-KEYWORD` / `%HT-*` dominating a load; the memo drops the hash traffic
+~9×), and the worker force-compiles the hot set (`warmset.js`) right after the
+restore, behind the load spinner.  Regenerate `warmset.js` after any module
+rebuild: `DUMP_COMPILED=warmset.tmp node web/run-node.js --core web/modus.core.gz
+--load web/samples/gui.lisp … --quit` then wrap the JSON as `self.MVM_WARMSET`.
+
 ## What the interpreter does and does not do
 
 - Every vreg lives in the frame (per-frame copies), so callee-saved registers

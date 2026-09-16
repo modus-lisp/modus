@@ -197,3 +197,32 @@ fewer instructions — an optimisation, the current form is the correctness
 baseline.  NEXT by profile weight: add-residual + vp8-idct (30 ms/frame), then
 the loop-filter %edge-* kernels (40 ms).  ANSI gate still owed on ab6a927
 before any of Layer 2b nears main.
+
+### Layer 2b progress + findings (2026-09-16 late)
+
+Infrastructure DONE and verified: the integer-lane ISA (opcodes #xE2-#xEA plus
+smin/smax/umin/umax/abs/sxtl8), the interpreter reference arms, assembler-
+verified NEON, %vi-* primitives, the VI-PACK :ivector register class, a 12-wide
+vector pool (v2-v7 + v16-v21 / xmm2-7 + xmm8-13, caller-saved; scopes are
+call-free), and let* fp/vector bindings (compile-let* now matches compile-let and
+carries dtype for cross-references).  Two-arms verified on the Pi 5.
+
+Kernels:
+- mc-filter (six-tap MC): bit-exact 1152 cases, 1.5x on the A76.  THE win so far.
+- %edge-simple (loop filter, simple mode): bit-exact, but ~1x.  Lesson: it is a
+  LIGHT kernel (4 samples, one gate) AND the simple-mode filter, off the hot path
+  for normal streams.  Splitting it into a per-8 sub-function added call overhead.
+
+The real loop-filter cost (40 ms/frame) is %edge-mb + %edge-sub — the NORMAL
+filter: the interior gate (%edge-ok / %hev) plus multi-weight adjustment (mb: 3
+weights over p2..q2).  Heavy like mc-filter, so a real vector payoff, and now
+register-feasible with the 12-wide pool.  These are the next targets, then
+vp8-idct (needs .4s transpose ops — trn1/2 zip1/2 .4S — not yet in the ISA; the
+4x4 transpose between the column and row passes).
+
+MEASUREMENT PITFALL re-learned: a light kernel wrapped in a per-N sub-function
+call shows no speedup even when native; inline the lane body into the edge loop.
+And always bench inside a native defun (the top-level dotimes is interpreted).
+
+Owed before main: ANSI gate on the compiler changes (bfa461b/e1ad202), and the
+A53 measurement of the combined kernels via a fresh reel core.

@@ -1390,6 +1390,74 @@
           (if *jit-native-defun-count* (+ *jit-native-defun-count* n) n))
     n))
 
+;;; ---------------------------------------------------------------------------
+;;; JIT-EAGER — compile every still-interpreted runtime DEFUN to native, on
+;;; demand.  With *jit-hot-only* T (the default) a DEFUN keeps its interpreter
+;;; trampoline forever: DEFUNs are never re-eval'd, so retry-on-hot never fires
+;;; for them.  That is right for fast loading but wrong for a heap that is about
+;;; to be SNAPSHOT (save-and-die): a core saved that way restores every library
+;;; function as bytecode, and the bare-metal interpreter arms are not the native
+;;; ones (found on the Zero 2 W: the interpreted %mmap-exec-page echoes its
+;;; argument).  Loading with *jit-hot-only* NIL instead pays eager translation
+;;; for EVERY top-level form of the load (16 min for reel on an A53).
+;;;
+;;; So: the trampoline installer records each DEFUN's compiled module — the
+;;; same bc/entry/tables %mvm-eval-jit-run would translate — in
+;;; *jit-module-registry*, and JIT-EAGER walks it, builds each module's exec
+;;; page ONCE (%jit-translate-page: the flip-safe guard, so a translator gap is
+;;; a counted skip, never an error) and publishes its DEFUNs as native with
+;;; %jit-install-native-fns, exactly as a hot-only-NIL load would have.  The
+;;; page is not entered (no %jit-call), so nothing runs and no side effect
+;;; repeats.  Call it before %save-image, or after restoring a bytecode core.
+;;; The registry is a heap hash table, so it travels in the core too.
+
+(defvar *jit-module-registry* nil
+  "NAME (string) -> (bc entry ft-list fn-table rt-table lam-offsets persist-names)
+   for every runtime DEFUN installed as an interpreter trampoline.  Boots NIL
+   (defvars don't init); %jit-register-module creates it lazily.")
+
+(defun %jit-register-module (names bc entry ft-list fn-table rt-table lam-offsets)
+  (when (and (boundp (quote *jit-module-registry*)) (null *jit-module-registry*))
+    (setq *jit-module-registry* (make-hash-table :test (function equal))))
+  (when (boundp (quote *jit-module-registry*))
+    (let ((m (list bc entry ft-list fn-table rt-table lam-offsets names)))
+      (dolist (nm names) (puthash nm *jit-module-registry* m)))))
+
+(defun %jit-fn-native-p (name)
+  (let ((f (%mvm-resolve-runtime-fn name)))
+    (and f (eql (logand (%val->word f) 15) 3))))
+
+(defun jit-eager ()
+  "Translate every registered runtime DEFUN that is still an interpreter
+   trampoline to native code and publish it.  Returns (INSTALLED MODULES
+   FAILED): functions published, modules translated, modules whose page could
+   not be built (they keep their trampolines).  Needs the JIT active."
+  (if (not (and (%jit-active-p) (boundp (quote *jit-module-registry*))
+                *jit-module-registry*))
+      (list 0 0 0)
+      (let ((pending nil) (installed 0) (modules 0) (failed 0) (done nil))
+        ;; collect first: publishing mutates the tables we would otherwise walk
+        (maphash (lambda (nm m)
+                   (when (not (%jit-fn-native-p nm))
+                     (when (not (member m pending :test (function eq)))
+                       (setq pending (cons m pending)))))
+                 *jit-module-registry*)
+        (dolist (m pending)
+          (when (not (member (car m) done :test (function eq)))
+            (setq done (cons (car m) done))
+            (let ((je (%jit-translate-page (car m) (cadr m) (reverse (caddr m))
+                                           (car (cddddr m)))))
+              (if (and je (cadr (cddddr je)))
+                  (progn
+                    (setq modules (+ modules 1))
+                    (setq installed
+                          (+ installed
+                             (%jit-install-native-fns (car je) (cadr (cddddr je))
+                                                      (car (cddr (cddddr m)))))))
+                  (setq failed (+ failed 1))))))
+        (when (> installed 0) (%jit-retry-drain))
+        (list installed modules failed))))
+
 (defun %jit-translate-page-1 (bc ft-list rt-table)
   "Inner: translate BC → native x64, mmap an exec page, copy bytes, relocate
    calls + patch consts.  Returns a jit-entry list (base eoff cpatches
@@ -2876,6 +2944,10 @@
                       (when (and %prev *jit-page-cache*
                                  (eql (logand (%val->word %prev) 15) 3))
                         (clrhash *jit-page-cache*)))
+                    ;; JIT-EAGER: remember this module so the DEFUN can be
+                    ;; compiled native later without re-evaluating anything.
+                    (%jit-register-module persist-names bc entry ft-list
+                                          fn-table rt-table lam-offsets)
                     (let ((tramp (%mvm-make-trampoline
                                    bc fn-table rt-table
                                    (function-info-bytecode-offset (car e))

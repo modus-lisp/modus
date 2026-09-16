@@ -252,3 +252,22 @@
         (list :win :open :chan ch :slot slot :dispctrl (hvs-rd #x00)
               :dispctrlx (hvs-dispctrlx ch) :bkgnd (hvs-rd bk)
               :displist (hvs-displist ch) :ctl0 (hvs-slot-rd slot)))))
+
+(defun hvs-regtest ()
+  "DIAGNOSTIC — the make-or-break question.  In a confirmed-open window, do the HVS
+   CONTROL registers hold 32-bit writes, or only the dlist SRAM?  Atomic (no serial
+   gap): release, spin to the window, then write DISPBKGND + a SRAM slot + DISPLIST
+   and read all three back.  If :bg / :dl come back 0x646472xx (byte-narrow) while
+   :slot is the full 0x80000000, then control-register writes DON'T stick even in
+   the window -> we can build a dlist in SRAM but cannot point a channel at it, and
+   the ARM-side FRAMEBUFFER_RELEASE path cannot render.  Run it as the FIRST release
+   after a COLD power-cycle (the window is reliable only then)."
+  (hvs-rel-fb)
+  (if (not (hvs-wait-window 9000))
+      (list :no-window)
+      (progn
+        (hvs-wr #x44 (logior #x01000000 #x00FF00))   ; DISPBKGND(0) green
+        (hvs-slot-wr 900 #x80000000)                 ; SRAM slot 900 = END word
+        (hvs-wr #x20 900)                            ; DISPLIST0 = slot 900
+        (list :ctrl (hvs-rd #x00) :bg (hvs-rd #x44)
+              :slot (hvs-slot-rd 900) :dl (hvs-rd #x20)))))

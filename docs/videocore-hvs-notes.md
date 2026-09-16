@@ -229,6 +229,45 @@ the background fill) — needs the buffer coherent (no runtime `dc-cvac` primiti
 exists; use an uncached buffer region or add a cache-clean) and the dlist
 CTL0/format/pixel-order verified against a real dumped firmware plane.
 
+### Session 4 (2026-09-16) — CORRECTION: nothing has rendered; SRAM ≠ registers
+
+Two honest corrections from the user watching the physical monitor:
+
+- **The screen has been DARK the whole time.** The "solid blue/fill" in earlier
+  webcam grabs was a camera artifact — "always has been." So the claim that we
+  "drove the HVS to a solid color" is WRONG. What actually happens: a release
+  BLANKS the firmware framebuffer (screen goes black); we have **never rendered a
+  single pixel of our own**. Proven capability so far = FB-release (dark) + a
+  transient 32-bit DISPCTRL read + 32-bit dlist-SRAM writes. That's it.
+- **The dlist SRAM takes 32-bit writes, but the HVS control registers apparently do
+  NOT hold them** — even when DISPCTRL reads 32-bit. Decomposed drive (sd7/sd8): at
+  a moment DISPCTRL read `0x9a0c0fff`, a SRAM slot write read back the full
+  `0x80000000`, but DISPBKGND (0x44) and DISPLIST (0x20) writes read back
+  `0x646472xx` (byte-narrow). If real, this is fatal to the ARM-side path: you can
+  build a dlist in SRAM but cannot point a channel at it. CAVEAT: those register
+  reads happened ~1.4 s after detection (serial transmission of the drive form),
+  so it MIGHT be the window closing mid-form, not a fundamental register-write
+  limit. `hvs-regtest` (added to net/hdmi-hvs.lisp) settles it atomically.
+
+- **The window exhausts per boot.** It opens reliably only for the first few
+  releases right after a COLD power-cycle (sd6: stable ~10 s). After that,
+  releases return no-window (confirmed: `hvs-overlay-on` and 4× `hvs-regtest` all
+  `:no-window` later in the same boot). So each definitive test needs a fresh cold
+  boot, and the test must be the FIRST release.
+
+**THE ONE DECISIVE TEST:** cold power-cycle the Zero, netboot, push the forms
+(pushing defuns does NOT consume the window), then call `(hvs-regtest)` as the
+first release. Read `:bg` and `:dl`:
+  - 32-bit (e.g. `:bg` = 0x0100FF00-ish, `:dl` = 900) → control-register writes DO
+    stick; the ARM-side overlay is viable; remaining work is rendering/coherency.
+  - `0x646472xx` → control-register writes never stick in the window → the ARM-side
+    FRAMEBUFFER_RELEASE path is a dead end; go VPU-side (lk-overlay) or full vc4.
+
+Serial-drive facts locked in: mini-UART survives a release (RTL8153 dies); the
+serial REPL prints BARE values (`42`, `T`, `NIL`) with a `> ` prompt, no `= `
+prefix; transmitting a long form costs ~1.4 s (12 ms/char) — which is why detect-
+then-drive must be ONE on-board form, never two serial round-trips.
+
 ### The two real paths (SUPERSEDED — kept for context; the small path above wins)
 
 1. **ARM owns the whole display pipeline** (real vc4-style): boot with the

@@ -862,3 +862,27 @@ with the firmware FB plane + a scaled YUV plane (format 8, BT.601 CSC
   (jit-eager) -> (52 52 0), idempotent.  ANSI gate NOT yet run on e490440.
   So the standing budget for "60 fps on the Zero" is now: 137 ms decode ->
   16.7 ms = 8.2x, all of it decoder codegen on an in-order A53.
+
+## A53 per-phase decode profile, eager core (2026-09-16, night) — the NEON map
+reel.decode::zp-run (phase-forms.txt: timer copies of decode-frame /
+decode-macroblocks — wrappers are inert), 30 frames of small.ivf (320x180 = 240
+MBs), µs, on reel-eager.core:
+  (FRAMES 30 KEYFRAME (KEYFRAME-WHOLE 333094)
+   INTER-SUM-HDR-MB-LF-RF (25616 2845028 1152073 81870)
+   MB-PHASES-ALL (MODES 517829 RESIDUE 713531 PREDICT 535091 ADD-RESIDUAL 859010))
+Per INTER frame (29 frames, ~141 ms):
+  macroblock loop   98 ms   = add-residual (IDCT+add) 29.6 | residue (token/bool
+                              decode) 24.6 | predict (intra/MC) 18.4 | modes 17.9
+                              | loop overhead ~7.5
+  loop filter       40 ms
+  rframe copy        2.8 ms
+  header             0.9 ms
+  keyframe         333 ms (2.4x an inter frame)
+Reading: lane arithmetic (IDCT+add 30, loop filter 40, MC/predict 18) is ~88 ms =
+62% and is NEON's natural home (u8x16 / s16x8); the bool decoder (residue +
+modes ≈ 43 ms) is serial, scalar, and needs codegen (register allocation, a
+specialised bool-bit) — a perfect NEON alone lands near ~55-60 ms/frame
+(~17 fps); 60 fps needs the scalar side ~3x too.  First Layer-2 ops, by
+weight: s16x8 IDCT butterflies + saturating u8 add (add-residual), the
+loop-filter edge kernels (u8x16 compare/select/saturate), then the 6-tap MC
+widening multiply-add.

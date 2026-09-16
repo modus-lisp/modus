@@ -2,6 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Modus in the browser</title>
 <!-- Cross-origin isolation on hosts (GitHub Pages) that cannot set COOP/COEP
      headers.  Must load before the app script. -->
@@ -46,8 +47,21 @@
   #guihint { color: #667; font-size: 12px; }
   #guibody { flex: 1; position: relative; overflow: auto; }
   #guiroot { padding: 16px; color: #ddd; }
-  #glcanvas { display: none; position: absolute; inset: 0; margin: auto; background: #000; }
+  #glcanvas { display: none; position: absolute; inset: 0; margin: auto; background: #000; width: min(480px, 94vw, 82vh); height: min(480px, 94vw, 82vh); touch-action: none; }
   #guiroot button { font: inherit; }
+  /* Touch controls for the game (shown only when a sample turns keys on). */
+  #touchhint { display: none; position: absolute; left: 0; right: 0; bottom: 8px; text-align: center; color: #778; font-size: 12px; pointer-events: none; }
+  @media (pointer: coarse) { body.touchgame #touchhint { display: block; } }
+  /* Narrow screens (phones): drop desktop-only chrome, make panels full-width. */
+  @media (max-width: 640px) {
+    html, body { font-size: 15px; }
+    #status, #drop { display: none; }
+    #bar { gap: 10px; }
+    #explorer { width: 100%; }
+    body.explorer #term { margin-right: 0; }
+    #compl { max-height: 38vh; }
+    #guiroot { padding: 10px; }
+  }
 </style>
 </head>
 <body>
@@ -72,7 +86,7 @@
 </div>
 <div id="gui">
   <div id="guibar"><span id="guititle">GUI</span><span id="guihint">Esc to exit</span><span id="guiclose">&#10005;</span></div>
-  <div id="guibody"><div id="guiroot"></div><canvas id="glcanvas"></canvas></div>
+  <div id="guibody"><div id="guiroot"></div><canvas id="glcanvas"></canvas><div id="touchhint">swipe to steer · tap to start / restart · ✕ to quit</div></div>
 </div>
 <script>
 (async () => {
@@ -418,14 +432,41 @@
   };
   const setKeys = (on) => {
     if (on === keysOn) return; keysOn = on;
-    if (on) { window.addEventListener('keydown', onKey); window.addEventListener('keyup', onKey); }
-    else { window.removeEventListener('keydown', onKey); window.removeEventListener('keyup', onKey); }
+    if (on) {
+      window.addEventListener('keydown', onKey); window.addEventListener('keyup', onKey);
+      guiPanel.addEventListener('touchstart', onTouchStart, { passive: true });
+      guiPanel.addEventListener('touchmove', onTouchMove, { passive: false });
+      guiPanel.addEventListener('touchend', onTouchEnd);
+      document.body.classList.add('touchgame');
+    } else {
+      window.removeEventListener('keydown', onKey); window.removeEventListener('keyup', onKey);
+      guiPanel.removeEventListener('touchstart', onTouchStart);
+      guiPanel.removeEventListener('touchmove', onTouchMove);
+      guiPanel.removeEventListener('touchend', onTouchEnd);
+      document.body.classList.remove('touchgame');
+    }
   };
   const GAME_KEYS = new Set(['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', ' ', 'Enter']);
   function onKey(ev) {
     if (!guiPanel.classList.contains('open')) return;
     if (GAME_KEYS.has(ev.key)) ev.preventDefault();
     pushEvent('key\t' + (ev.key === ' ' ? 'Space' : ev.key) + '\t' + (ev.type === 'keydown' ? 1 : 0));
+  }
+  // Touch controls: swipe = a discrete arrow press, tap = Space (start/restart).
+  const sendKey = (name) => { pushEvent('key\t' + name + '\t1'); pushEvent('key\t' + name + '\t0'); };
+  let touchStart = null;
+  function onTouchStart(ev) { if (ev.touches.length !== 1) return; const t = ev.touches[0]; touchStart = { x: t.clientX, y: t.clientY }; }
+  function onTouchMove(ev) { if (touchStart) ev.preventDefault(); }   // don't scroll the page mid-swipe
+  function onTouchEnd(ev) {
+    if (!touchStart) return;
+    const t = ev.changedTouches && ev.changedTouches[0];
+    if (t) {
+      const dx = t.clientX - touchStart.x, dy = t.clientY - touchStart.y, adx = Math.abs(dx), ady = Math.abs(dy);
+      if (adx < 24 && ady < 24) sendKey('Space');
+      else if (adx > ady) sendKey(dx > 0 ? 'ArrowRight' : 'ArrowLeft');
+      else sendKey(dy > 0 ? 'ArrowDown' : 'ArrowUp');
+    }
+    touchStart = null;
   }
 
   // --- a tiny WebGL renderer: colored quads (2 triangles each) --------------

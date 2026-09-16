@@ -174,3 +174,26 @@ against SBCL's scalar arm. That number says how much of the gap is boxing
 (likely most of it) before any vector instruction exists, and it makes the
 Layer-2 gain measurable as a ratio against a real baseline, the same way
 reel was taken from 3 to 60 fps: profile, name the cost, remove it.
+
+### Layer 2b — LANDED and first kernel bit-exact (2026-09-16)
+
+The integer-lane ISA is in (`ab6a927`): opcodes `#xE2`–`#xEA`, interpreter
+reference arms, assembler-verified NEON encodings (aarch64-linux-gnu-as), the
+`%vi-*` compiler primitives, and the `VI-PACK` register-resident LET class on
+the existing FP vregs (v2..v7).  A vector value cannot escape (compile error);
+x64 signals so the module falls to the interpreter reference.  `tests/simd/
+vi-probe.lisp`: 13 probes pass on the Pi 5 both JIT (NEON) and MODUS_NO_JIT=1.
+
+First kernel: reel's six-tap `mc-filter` (`reel/src/decode/inter-neon.lisp`,
+`#+modus`, last-defun-wins; commit reel `edef631`).  **Bit-exact with the
+scalar kernel across 1152 cases** (every fx/fy, block sizes 16x16/8x8/4x4/8x4/
+4x8/16x8, random + extreme + ramp data).  A76 both-axes x4000: 16x16 395->260
+ms (1.52x), 8x8 291->248, 4x4 261->244.  The A76 is out-of-order so the scalar
+path was already well-scheduled; the in-order A53 (the Zero, the target) should
+gain more — a fresh reel core with inter-neon + a phase re-profile is the owed
+measurement.  The kernel widens u8->s16->s32 and multiplies in s32 (two halves
+per 8 pixels); a smlal-based accumulate (s16xs16->s32 widening MLA) would be
+fewer instructions — an optimisation, the current form is the correctness
+baseline.  NEXT by profile weight: add-residual + vp8-idct (30 ms/frame), then
+the loop-filter %edge-* kernels (40 ms).  ANSI gate still owed on ab6a927
+before any of Layer 2b nears main.

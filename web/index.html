@@ -202,6 +202,7 @@
   const SAMPLES = [
     { file: 'calc.lisp', run: '(calc)', title: 'Calculator', desc: 'a DOM calculator' },
     { file: 'snake.lisp', run: '(snake)', title: 'Snake', desc: 'a WebGL game — swipe or arrow keys' },
+    { file: 'quicklisp.lisp', run: '', title: 'Quicklisp', desc: 'load a library with ql:quickload (offline)', bare: true },
   ];
   const sampView = document.getElementById('sampview');
   const svCode = document.getElementById('svcode');
@@ -209,12 +210,15 @@
   const svWhich = document.getElementById('svwhich');
   const srcCache = {};
   const fetchSrc = (f) => (f in srcCache ? Promise.resolve(srcCache[f]) : fetch('samples/' + f).then((r) => r.ok ? r.text() : null).catch(() => null).then((t) => (srcCache[f] = t)));
-  const runSample = async (file, run) => {
+  const runSample = async (file, run, bare) => {
     // if a sample is already running, its event loop is blocking the REPL; ask it
     // to exit (same as the panel's close) so the new LOAD can actually run.
     if (document.getElementById('gui').classList.contains('open')) document.getElementById('guiclose').click();
     status.textContent = 'loading sample ' + file + '…';
-    for (const f of ['gui.lisp', file]) {
+    // "bare" samples (e.g. the Quicklisp demo) run in the REPL and do not need
+    // the gui.lisp bridge.
+    const need = bare ? [file] : ['gui.lisp', file];
+    for (const f of need) {
       const txt = await fetchSrc(f);
       if (txt == null) { say('sample: could not fetch samples/' + f + '\n', 'err'); return; }
       addFile('/home/web/' + f, enc.encode(txt));
@@ -222,7 +226,8 @@
     // *jit-inhibit* keeps LOAD from eagerly JIT-compiling every defun (a cold
     // core restore has no warm compiler); the sample's functions still compile
     // on their own once they run hot, so this only speeds up loading.
-    feed('(progn (let ((*jit-inhibit* t)) (load "/home/web/gui.lisp") (load "/home/web/' + file + '")) ' + run + ')\n');
+    const loads = need.map((f) => '(load "/home/web/' + f + '")').join(' ');
+    feed('(progn (let ((*jit-inhibit* t)) ' + loads + ') ' + run + ')\n');
   };
   let svCurrent = null;
   const svShowList = () => {
@@ -239,6 +244,7 @@
   const svShowSource = async (s, which) => {
     svCurrent = s; which = which || s.file;
     sampView.classList.add('source'); svTitle.textContent = s.title;
+    svWhich.style.display = s.bare ? 'none' : '';   // bare samples don't use gui.lisp
     svWhich.classList.toggle('on', which === 'gui.lisp');
     svCode.textContent = 'loading…';
     const src = await fetchSrc(which);
@@ -248,7 +254,7 @@
   document.getElementById('svclose').addEventListener('click', () => sampView.classList.remove('open'));
   document.getElementById('svback').addEventListener('click', svShowList);
   svWhich.addEventListener('click', () => { if (svCurrent) svShowSource(svCurrent, svWhich.classList.contains('on') ? svCurrent.file : 'gui.lisp'); });
-  document.getElementById('svrun').addEventListener('click', () => { sampView.classList.remove('open'); if (svCurrent) runSample(svCurrent.file, svCurrent.run); });
+  document.getElementById('svrun').addEventListener('click', () => { sampView.classList.remove('open'); if (svCurrent) runSample(svCurrent.file, svCurrent.run, svCurrent.bare); });
   const takeFiles = async (list) => { for (const f of list) addFile(f.name, new Uint8Array(await f.arrayBuffer())); };
   document.getElementById('pick').addEventListener('change', (ev) => takeFiles(ev.target.files));
   document.body.addEventListener('dragover', (ev) => { ev.preventDefault(); document.body.classList.add('dragging'); });

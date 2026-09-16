@@ -812,3 +812,34 @@ with the firmware FB plane + a scaled YUV plane (format 8, BT.601 CSC
 - Image build (has HVS reachable, mailbox, USB net): branch `hdmi-on-main`
   (HDMI-display commits cherry-picked onto main) via `cabfs/core/build-board.sh`
   (12 GB SBCL build), gzip → `board-demo6.img.gz`, put in `/srv/tftp` on modus-pi.
+
+★★★★ REEL FRAMES ON THE HVS-SCALED PLANE — THE WHOLE PIPELINE (2026-09-16, late)
+  Core route (see "THE ROUTE THAT WORKS" above), native core built with
+  `*jit-on* T` + `*jit-hot-only* NIL` under QEMU (9.5 MB: reel + 71 HVS/demo
+  forms + small.ivf; 3.4 MB of native code), `netboot-core-gz.py --core
+  reel-native2.core --img board-demo9.img.gz` → CORE-RESTORED in ~2 s, then over
+  serial (docs/reel-on-zero/rh_core3.py):
+    (rh-init)         -> two NC 2 MB buffers in the arena above the restored code
+    (rh-first-frame)  -> (320 180 384 192 0): decoded 320x180, Y stride 384,
+                         chroma stride 192, planes copied into the NC buffer and a
+                         YUV420 3-plane PPF plane switched in — ON SCREEN
+                         (docs/reel-on-zero/first-frame-on-hvs.jpg)
+    (rh-play nil)     -> (FRAMES 30 TOTAL-MS 14547 DECODE-MS 14538 COPY-MS 7 FPS 2)
+    (rh-play t)       -> (FRAMES 30 TOTAL-MS 14858 DECODE-MS 14602 COPY-MS 7 FPS 2)
+  DISPLAY COST: 0.23 ms/frame (three plane copies + three PTR writes) — the HVS
+  does colour conversion and the 6x upscale; the display side of "VP8 at 60 fps"
+  is closed.  DECODE: 485 ms/frame on this core — the entire budget, and 2x
+  SLOWER than the 224 ms/frame measured on 2026-09-10 with reel JIT'd on the
+  board (board-demo4, 90-frame clip).  *jit-native-count* 311, fallback 1, so it
+  is native; suspects: different clip, QEMU-side JIT missing a runtime switch,
+  or the core's global-type promises.  NEXT: profile/bisect that 2x, then the
+  A53 decode campaign (the 224 ms itself is 13x off 16.7 ms).
+  Traps that each cost a boot: a core saved JIT-OFF has bytecode defuns whose
+  interpreter-arm %mmap-exec-page ECHOES its argument (buffers at 0x200000 →
+  wrote over low memory); a core-native caller NEVER sees an on-board
+  redefinition (rebuild the core, don't mix units); `hvs-rd` compiled under QEMU
+  faults on `(+ (hvs-base) #x34)` (address left tagged: FAR 0x7e800034) while
+  stores at computed addresses are fine — the trailing DISPLACT1 read was
+  dropped from rh-yuv-plane; resetting the arena bump after pushing forms
+  overlays the code you just compiled; the 9.5 MB core TFTP outruns a 60 s
+  wait — poll for "go", never kill the netboot on a timer.

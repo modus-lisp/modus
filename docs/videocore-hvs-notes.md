@@ -141,6 +141,36 @@ net/hdmi-hvs.lisp (hand-assembled words, exec-page vehicle, X0-X3 + Q0/Q1 only).
 * Working demo flow: demo9 (NET+SSH build, MODUS_NET_NOAUTO=1) → netboot →
   `(ssh-boot)` over serial → exec-mode forms (rh_run.py / rh_session.sh on
   modus-pi; hvs-all-forms.txt = flatten2.lisp of net/hdmi-hvs.lisp).
+  BUT the reel install over SSH is ~16 min on the A53 at DEFAULT hot-only too
+  (measured 953 s, then No route to host) — the NIC never survives it.
+* THE ROUTE THAT WORKS: the CORE.  Run the exact board kernel under
+  `qemu-system-aarch64 -M raspi3b -kernel tramp.bin -device loader,file=
+  kernel8.img,addr=0x300000 -device loader,file=reel.tar,addr=0x1A000000
+  -device loader,file=small.ivf,addr=0x1B000000 -serial null -serial
+  unix:q.sock,server,nowait -s` (tramp.bin = `MOVZ X1,#0x30,LSL#16; BR X1` =
+  D2A00601 D61F0020), drive the SECOND serial over the unix socket
+  (scratchpad qinstall.py/qsave.py): ramv the tarball from RAM,
+  install-tarball-from-bytes, push the 71 HVS/demo forms, ramv the clip into
+  *rh-ivf*, `(%save-image "x")`, then gdb-multiarch `dump binary memory` of
+  [0x18000000, +size).  Netboot with netboot-core-gz.py (--core: tftp the core
+  to 0x18000000 instead of the `mw.q` clear) → `CORE-RESTORED` in ~2 s, REEL +
+  forms + clip present at a serial REPL, NO network at all.  Gotchas:
+  - under QEMU `CORE-END=` printed the byte COUNT (4103084 for a 7.65 MB
+    core); on the board it prints the cursor (0x18000000+size).  Trust neither:
+    dump 16 MB and trim at the last non-zero byte (that RAM starts zeroed).
+    Header fields are stored <<1 (from 0x09000000, live 7.5 MB).
+  - A core saved with the JIT OFF restores every defun as BYTECODE: they run
+    in the interpreter, whose bare-metal arm of the exec-page trap ECHOES ITS
+    ARGUMENT — `(rh-init)` got buffers at 0x200000 (= the size) and the first
+    frame wrote over low memory (board dead).  A top-level `(%mmap-exec-page
+    4096)` (JIT'd form) works fine.  Save with `*jit-on* T` (the Pi core
+    carries the arena: %core-jit-lossy-p → NIL) so reel + the HVS forms are
+    native — also the only way the decode timing means anything.
+  - Wait for "Modus CL REPL" before sending ANYTHING to the QEMU serial; a
+    reader left mid-form echoes input but never evaluates (parens burst fixes).
+  - Host-side `ser.write(b"unzip 0x08000000 …")` bursts DROP CHARACTERS into
+    U-Boot ("unzip 0x00", "go 0x300"): pace every byte (4 ms) — patched into
+    netboot-gz.py / netboot-core-gz.py.
 
 ★★★★ 60 Hz ON SCREEN, MEASURED (same day): two NC 640x360 buffers, per frame
   fill (0.84 ms) -> u32 write of the scaled plane's PTR0 (slot 2005, window NC)

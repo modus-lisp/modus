@@ -578,3 +578,33 @@
     (setf (mem-ref (+ (hvs-base) #x24) :u32) *hvs-plane-slot*)   ; DISPLIST1
     (hvs-window-nc nil)
     (hvs-rd (+ (hvs-base) #x34))))
+
+;;; --- 60 Hz PROVEN (2026-09-16): render 640x360 -> flip -> vsync -------------
+;;; hvs-anim ran 600 frames in 10.005 s = 59.97 fps with HD FRAME_COUNT advancing
+;;; exactly one per frame (no drops); CPU cost 0.84 ms/frame (the NC fill).  The
+;;; camera saw the colour sweep.  The HVS window stays NC for the run (u32 flip
+;;; of the scaled plane's PTR0 at slot 2005); FRAME_COUNT is in the HD block
+;;; (0x3F808068, a different 2 MB block, still Device, so reads stay valid).
+
+(defun hvs-vsync ()
+  "Spin until the HDMI frame counter ticks; returns the spin count (-1 = timeout)."
+  (let ((f (mem-ref #x3F808068 :u32)) (i 0))
+    (loop (when (/= (mem-ref #x3F808068 :u32) f) (return i))
+      (when (> i 2000000) (return -1))
+      (setq i (+ i 1)))))
+
+(defun hvs-anim (n a b)
+  "Demo: N frames alternating NC 640x360 buffers A/B on the scaled plane.
+   Returns (microseconds frames-scanned-out).  Requires *jit-hot-only* NIL."
+  (hvs-window-nc t)
+  (let ((i 0) (t0 (mem-ref #x3F003004 :u32)) (f0 (mem-ref #x3F808068 :u32))
+        (p0 (+ (hvs-base) #x2000 (* (+ *hvs-plane-slot* 5) 4))))
+    (loop (when (>= i n) (return nil))
+      (let ((buf (if (evenp i) a b))
+            (col (logior (ash (logand (* i 2) 255) 16) (ash (logand (- 255 (* i 2)) 255) 8) 64)))
+        (hvs-nfill-nc buf 921600 col)
+        (setf (mem-ref p0 :u32) (logior #xC0000000 buf))
+        (hvs-vsync))
+      (setq i (+ i 1)))
+    (hvs-window-nc nil)
+    (list (- (mem-ref #x3F003004 :u32) t0) (- (mem-ref #x3F808068 :u32) f0))))

@@ -90,7 +90,17 @@ net/hdmi-hvs.lisp (hand-assembled words, exec-page vehicle, X0-X3 + Q0/Q1 only).
   3 x 9-bit per word (6 words, last = (c15,c15,0)), uploaded as words 0-5 then
   4,3,2,1,0.  Code: hvs-window-nc / hvs-slot-wr32 / hvs-upload-kernel /
   hvs-scaled-plane in net/hdmi-hvs.lisp.  Sources: Linux v6.6 vc4_plane.c /
-  vc4_hvs.c / vc4_regs.h. The HVS hardware-scaled overlay (compose our own plane
+  vc4_hvs.c / vc4_regs.h.
+
+★★★★ 60 Hz ON SCREEN, MEASURED (same day): two NC 640x360 buffers, per frame
+  fill (0.84 ms) -> u32 write of the scaled plane's PTR0 (slot 2005, window NC)
+  -> spin on HD FRAME_COUNT (0x3F808068).  300 frames = 5.002 s, 600 = 10.005 s
+  (59.97 fps), FRAME_COUNT +1 per frame = zero drops.  Camera video tiled at
+  0.5 s spacing shows the colour sweep.  Code: hvs-vsync / hvs-anim.  The display
+  side of "VP8 at 60 fps on the Zero 2 W" is DONE: budget per frame ≈ 16.7 ms
+  minus 0.84 ms render = ~15.8 ms for the decoder to produce a 640x360 frame into
+  the back buffer (YUV->RGB in the HVS is the next optimisation: a YUV420 plane
+  drops even the CPU colour conversion). The HVS hardware-scaled overlay (compose our own plane
 on channel 1's dlist, or add a scaled YUV plane) remains the path to zero-CPU
 scaling, but is no longer on the critical path to "pixels up".
 

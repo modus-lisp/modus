@@ -36,7 +36,7 @@
 (defun snake ()
   (let ((g 20) (cell 24))
     (gui-reset)
-    (gui-panel "Snake - arrow keys to steer, Space to restart, Esc to quit")
+    (gui-panel "Snake - swipe or arrow keys, tap or Space to restart")
     (gui-canvas (* g cell) (* g cell))
     (gui-bg 18 18 26)
     (gui-keys t)

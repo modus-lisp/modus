@@ -202,6 +202,7 @@
   const SAMPLES = [
     { file: 'calc.lisp', run: '(calc)', title: 'Calculator', desc: 'a DOM calculator' },
     { file: 'snake.lisp', run: '(snake)', title: 'Snake', desc: 'a WebGL game — swipe or arrow keys' },
+    { file: 'opengl.lisp', run: '(glcube)', title: 'OpenGL cube', desc: 'cl-opengl immediate mode bridged to WebGL' },
     { file: 'quicklisp.lisp', run: '', title: 'Quicklisp', desc: 'load a library with ql:quickload (offline)', bare: true },
   ];
   const sampView = document.getElementById('sampview');
@@ -526,22 +527,24 @@
 
   // --- a tiny WebGL renderer: colored quads (2 triangles each) --------------
   let gl = null, glProg = null, glBuf = null, glLoc = null, glW = 0, glH = 0, glBg = [0, 0, 0];
+  let glmProg = null, glmBuf = null, glmLoc = null;   // general "gl" (mvp) pipeline
   const glInit = (w, h) => {
     glcanvas.width = w; glcanvas.height = h; glcanvas.style.display = 'block'; glW = w; glH = h;
     if (gl) return;
     try {
-      gl = glcanvas.getContext('webgl', { antialias: true, alpha: false }) || glcanvas.getContext('experimental-webgl');
+      gl = glcanvas.getContext('webgl', { antialias: true, alpha: false, preserveDrawingBuffer: true }) || glcanvas.getContext('experimental-webgl');
       if (!gl) { say('\n[gui: WebGL unavailable]\n', 'err'); return; }
-      const vs = 'attribute vec2 p; attribute vec3 c; varying vec3 vc; void main(){ vc=c; gl_Position=vec4(p,0.0,1.0); }';
-      const fs = 'precision mediump float; varying vec3 vc; void main(){ gl_FragColor=vec4(vc,1.0); }';
       const sh = (t, src) => { const s = gl.createShader(t); gl.shaderSource(s, src); gl.compileShader(s); return s; };
-      glProg = gl.createProgram(); gl.attachShader(glProg, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(glProg, sh(gl.FRAGMENT_SHADER, fs));
-      gl.linkProgram(glProg);
-      if (!gl.getProgramParameter(glProg, gl.LINK_STATUS)) { say('\n[gui: WebGL shader link failed]\n', 'err'); gl = null; return; }
-      gl.useProgram(glProg);
-      glBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, glBuf);
+      const link = (vs, fs) => { const p = gl.createProgram(); gl.attachShader(p, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(p); if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error('link: ' + gl.getProgramInfoLog(p)); return p; };
+      const fs = 'precision mediump float; varying vec3 vc; void main(){ gl_FragColor=vec4(vc,1.0); }';
+      // 2D sprite pipeline (the game)
+      glProg = link('attribute vec2 p; attribute vec3 c; varying vec3 vc; void main(){ vc=c; gl_Position=vec4(p,0.0,1.0); }', fs);
+      glBuf = gl.createBuffer();
       glLoc = { p: gl.getAttribLocation(glProg, 'p'), c: gl.getAttribLocation(glProg, 'c') };
-      gl.enableVertexAttribArray(glLoc.p); gl.enableVertexAttribArray(glLoc.c);
+      // general gl pipeline: a 4x4 modelview-projection, 3D position + colour
+      glmProg = link('attribute vec3 p; attribute vec3 c; uniform mat4 mvp; varying vec3 vc; void main(){ vc=c; gl_Position=mvp*vec4(p,1.0); }', fs);
+      glmBuf = gl.createBuffer();
+      glmLoc = { p: gl.getAttribLocation(glmProg, 'p'), c: gl.getAttribLocation(glmProg, 'c'), mvp: gl.getUniformLocation(glmProg, 'mvp') };
     } catch (e) { say('\n[gui: WebGL init failed: ' + (e && e.message || e) + ']\n', 'err'); gl = null; }
   };
   const glDrawSprites = (data) => {
@@ -558,13 +561,37 @@
       const P = [[x0, y0], [x1, y0], [x0, y1], [x0, y1], [x1, y0], [x1, y1]];
       for (const [px, py] of P) { verts[o++] = px; verts[o++] = py; verts[o++] = r; verts[o++] = g; verts[o++] = b; }
     }
-    gl.viewport(0, 0, glW, glH);
+    gl.viewport(0, 0, glW, glH); gl.disable(gl.DEPTH_TEST); gl.useProgram(glProg);
     gl.clearColor(glBg[0] / 255, glBg[1] / 255, glBg[2] / 255, 1); gl.clear(gl.COLOR_BUFFER_BIT);
     gl.bindBuffer(gl.ARRAY_BUFFER, glBuf); gl.bufferData(gl.ARRAY_BUFFER, verts, gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(glLoc.p); gl.enableVertexAttribArray(glLoc.c);
     gl.vertexAttribPointer(glLoc.p, 2, gl.FLOAT, false, 20, 0);
     gl.vertexAttribPointer(glLoc.c, 3, gl.FLOAT, false, 20, 8);
     gl.drawArrays(gl.TRIANGLES, 0, quads.length * 6);
     } catch (e) { say('\n[gui: WebGL draw failed: ' + (e && e.message || e) + ']\n', 'err'); gl = null; }
+  };
+  // --- general OpenGL-style pipeline: cl-opengl immediate mode bridged to WebGL.
+  //     glclear r g b  -> clear colour+depth;  gldraw MODE MVP16 VERTS -> draw.
+  const glClearGL = (r, g, b) => {
+    if (!gl || gl.isContextLost()) return;
+    gl.viewport(0, 0, glW, glH); gl.enable(gl.DEPTH_TEST);
+    gl.clearColor(r, g, b, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  };
+  const glDrawGL = (mode, mvp, data) => {
+    if (!gl || gl.isContextLost() || !glmProg) return;
+    try {
+      const parts = data ? data.split(';').filter(Boolean) : [];
+      if (!parts.length) return;
+      const verts = new Float32Array(parts.length * 6);   // x,y,z,r,g,b
+      let o = 0; for (const v of parts) { const a = v.split(','); for (let i = 0; i < 6; i++) verts[o++] = +a[i]; }
+      gl.useProgram(glmProg); gl.enable(gl.DEPTH_TEST);
+      gl.uniformMatrix4fv(glmLoc.mvp, false, new Float32Array(mvp));
+      gl.bindBuffer(gl.ARRAY_BUFFER, glmBuf); gl.bufferData(gl.ARRAY_BUFFER, verts, gl.DYNAMIC_DRAW);
+      gl.enableVertexAttribArray(glmLoc.p); gl.enableVertexAttribArray(glmLoc.c);
+      gl.vertexAttribPointer(glmLoc.p, 3, gl.FLOAT, false, 24, 0);
+      gl.vertexAttribPointer(glmLoc.c, 3, gl.FLOAT, false, 24, 12);
+      gl.drawArrays(mode === 'lines' ? gl.LINES : gl.TRIANGLES, 0, parts.length);
+    } catch (e) { say('\n[gui: gl draw failed: ' + (e && e.message || e) + ']\n', 'err'); }
   };
 
   const applyGui = (bytes) => {
@@ -586,6 +613,8 @@
       else if (cmd === 'canvas') { glInit(+f[1] || 640, +f[2] || 480); }
       else if (cmd === 'bg') { glBg = [+f[1] || 0, +f[2] || 0, +f[3] || 0]; }
       else if (cmd === 'sprites') { glDrawSprites(f.slice(1).join('\t')); }
+      else if (cmd === 'glclear') { glClearGL(+f[1], +f[2], +f[3]); }
+      else if (cmd === 'gldraw') { glDrawGL(f[1], f[2].split(',').map(Number), f[3] || ''); }
       else if (cmd === 'animate') { const on = f[1] === '1'; if (on && !rafOn) { rafOn = true; lastT = 0; requestAnimationFrame(tickLoop); } else if (!on) rafOn = false; }
       else if (cmd === 'keys') { setKeys(f[1] === '1'); }
       else if (cmd === 'close') { closePanel(); }

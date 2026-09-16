@@ -9,6 +9,37 @@ zero per-frame CPU. This doc records how far that got and exactly where it stops
 Register/display-list reference: `videocore-hvs-overlay.md`. Driver + primitives:
 `net/hdmi-hvs.lisp`.
 
+### ★★★★ PIXELS ON SCREEN (2026-09-16): write the firmware's LIVE scanout FB
+
+The pragmatic win, cleaner than any HVS-takeover: do NOT send NOTIFY_DISPLAY_DONE.
+The firmware then keeps the ENTIRE display pipeline running (HVS + PV + HDMI +
+clocks) — `HD_FRAME_COUNT` increments, `PV_V_CONTROL=0x3`. It scans out on **HVS
+CHANNEL 1** (not 0): `DISPCTRLX1 (0x50)=0x807804b0` (ENABLE|1920x1200),
+`DISPLACT1 (0x34)=0x664`=slot 1636 (that is why driving channel 0 never appeared —
+channel 0 is disconnected from the pixelvalve). The active dlist at slot 1636 is a
+unity RGBA8888 full-screen plane; its **PTR0 (slot 1636+4) is the live framebuffer
+bus address**. Strip the alias (`phys = ptr & 0x3FFFFFFF`) and write 0x00RRGGBB
+pixels straight into that DRAM — they appear on the HDMI output IMMEDIATELY. Proven:
+a green block drawn at (200,200) showed on the monitor over the U-Boot console.
+
+RECIPE (serial, forms loaded, no notify, no STP, no power pokes needed — the
+firmware already has everything on):
+  read DISPLACT1 = (mem-ref 0x3F400034 :u32)          ; active dlist slot
+  read plane[slot..slot+6] in SRAM at 0x3F402000+slot*4 ; PTR0 = plane[4], pitch=plane[6]
+  fb = (PTR0 & 0x3FFFFFFF)                              ; framebuffer phys (pitch 7680, RGBA8888, 1920x1200)
+  (hvs-fill (+ fb (* row pitch) (* x 4)) width color)  ; draw
+This IS the flat 0x00RRGGBB buffer glass/reel/the whole media stack target — the
+display seam is now real. hvs-fill is fast with (setq *jit-hot-only* nil) (JITs the
+loop); a full-screen fill should use a native STP/DC-CVAU blit for 60 fps, but the
+FB is located and writable. The HVS hardware-scaled overlay (compose our own plane
+on channel 1's dlist, or add a scaled YUV plane) remains the path to zero-CPU
+scaling, but is no longer on the critical path to "pixels up".
+
+CAMERA: continuous autofocus + auto-exposure made every earlier grab unreadable.
+Fixed values that read the console text crisply: focus_automatic_continuous=0
+focus_absolute=55, auto_exposure=1 (Manual) exposure_time_absolute=300 gain=48
+backlight_compensation=0. (v4l2-ctl -d /dev/video0 -c ...)
+
 ## The ladder (each rung is a real result)
 
 1. **Firmware-owned display (default) → the ARM cannot touch the HVS.** We boot
@@ -515,6 +546,21 @@ HVS reads real → build the plane in SRAM → STP `DISPCTRLX0` enable (the firm
 disables channel 0 on release: it read 0x00000000 right after the first release)
 → u64 `DISPLIST0` → watch `DISPLACT0`/`HD_FRAME_COUNT` and the monitor, and watch
 whether the firmware re-powers the block down or re-writes the channel.
+
+**TOOLING LESSON — "echo but no eval" is usually a STUCK READER, not a wedge.**
+Several recent "board hangs" (serial echoes the line, prints no value, no `> `)
+were the REPL reader sitting inside an unterminated form: input sent while the
+kernel was still booting (after the `MODUS-CL` banner but before the prompt) or a
+half-delivered form from a killed script leaves an open paren, and every later
+line just extends it. Sending a burst of `)))))))` produced
+`ERROR: UNDEFINED-FUNCTION ... > ` and the REPL answered again immediately. Rules:
+(1) after a boot, wait for the actual `> ` prompt (not the banner) before sending;
+(2) before declaring a wedge, send `)))))))\r\n` then probe `(+ 21 21)`; (3) run
+long board sequences as a DETACHED runner on modus-pi (`nohup setsid script`) that
+logs to a file, and poll the file — a killed ssh loses stdout and half-delivers a
+form. Real faults do exist (e.g. a misaligned u64 store), but check the reader
+first. Also: the webcam runs continuous autofocus; set
+`focus_automatic_continuous=0` and a fixed `focus_absolute` for readable text.
 
 ### VERDICT (2026-09-16, REVISED ABOVE — kept for the record): the ARM-side FRAMEBUFFER_RELEASE-ONLY path cannot render
 

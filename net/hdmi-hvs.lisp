@@ -391,3 +391,103 @@
   (when (null *hvs-flip*) (hvs-flip-init))
   (hvs-scr-u64 (+ (cadr *hvs-flip*) 8) (logior #xC0000000 phys))
   (%jit-call (car *hvs-flip*)))
+
+;;; --- NON-CACHEABLE BACK BUFFERS: the general fast case (2026-09-16) -----------
+;;; With the back buffer mapped Normal-Non-Cacheable the CPU's STP stream goes
+;;; straight to DRAM through the write buffer: no DC CVAC pass, nothing for the
+;;; HVS to miss.  Measured on the Zero 2 W: full 1920x1200 fill 9.75 ms (the
+;;; DRAM ceiling), 640x360 fill 0.99 ms, cached->NC copy 15.5 ms full / 1.2 ms
+;;; for 640x360, flip 1 us.  Remap at runtime (EL2; the boot's identity table
+;;; has L1 at 0x70000 and 2 MB L2 blocks, MAIR attr0=Normal-WB attr1=Device):
+;;;   1. DC CIVAC every line of the range (a stale dirty line evicted later
+;;;      would land on top of NC writes),
+;;;   2. rewrite each 2 MB block descriptor from AttrIdx0 (0x701) to AttrIdx2
+;;;      (0x709) and clean the table lines,
+;;;   3. MAIR_EL2 := 0x4400FF (attr2 = 0x44 Normal NC), TLBI ALLE2, DSB, ISB.
+;;; Everything in the touched 2 MB blocks becomes NC, so give buffers their own
+;;; blocks (mmap 9.2 MB each; the tail of a neighbour just gets slower).
+
+(defun hvs-civac-words (scr)
+  ;; ldr x0,[x3]; ldr x1,[x3,#8]; L: dc civac,x0; add x0,#64; subs x1,#64; b.ne L; dsb; ret
+  (list (logior #xD2800003 (ash (logand scr #xFFFF) 5))
+        (logior #xF2A00003 (ash (logand (ash scr -16) #xFFFF) 5))
+        #xF9400060 #xF9400461 #xD50B7E20 #x91010000 #xF1010021 #x54FFFFA1
+        #xD5033F9F #xD65F03C0))
+
+(defun hvs-mair-words (scr)
+  ;; ldr x0,[x3]; dsb sy; msr mair_el2,x0; tlbi alle2; dsb sy; isb; ret
+  (list (logior #xD2800003 (ash (logand scr #xFFFF) 5))
+        (logior #xF2A00003 (ash (logand (ash scr -16) #xFFFF) 5))
+        #xF9400060 #xD5033F9F #xD51CA200 #xD50C871F #xD5033F9F #xD5033FDF #xD65F03C0))
+
+(defun hvs-map-nc (phys bytes)
+  "Remap the 2 MB blocks covering [PHYS, PHYS+BYTES) Normal-Non-Cacheable.
+   Returns the number of blocks remapped, or NIL if a descriptor is not the
+   identity Normal-WB block the boot installs (then nothing is touched)."
+  (let* ((code (%mmap-exec-page 4096)) (scr (+ code 512))
+         (civac code) (mairw (+ code 256))
+         (l2 (logand (mem-ref #x70000 :u32) (lognot #xFFF)))
+         (b0 (ash phys -21)) (b1 (ash (+ phys bytes -1) -21)) (b b0) (ok t))
+    (let ((p civac)) (dolist (w (hvs-civac-words scr)) (setf (mem-ref p :u32) w) (setq p (+ p 4))))
+    (let ((p mairw)) (dolist (w (hvs-mair-words (+ scr 16))) (setf (mem-ref p :u32) w) (setq p (+ p 4))))
+    (%jit-icache-flush code 512)
+    (loop (when (> b b1) (return nil))
+      (when (/= (mem-ref (+ l2 (* 8 b)) :u32) (logior (ash b 21) #x701)) (setq ok nil))
+      (setq b (+ b 1)))
+    (when ok
+      (hvs-scr-u64 scr (ash b0 21))
+      (hvs-scr-u64 (+ scr 8) (ash (- (+ b1 1) b0) 21))
+      (%jit-call civac)
+      (setq b b0)
+      (loop (when (> b b1) (return nil))
+        (setf (mem-ref (+ l2 (* 8 b)) :u32) (logior (ash b 21) #x709))
+        (setq b (+ b 1)))
+      (%jit-icache-flush (+ l2 (* 8 b0)) (* 8 (- (+ b1 1) b0)))
+      (hvs-scr-u64 (+ scr 16) #x4400FF)
+      (%jit-call mairw)
+      (- (+ b1 1) b0))))
+
+(defun hvs-blit-nc-words (kind scr)
+  "Like hvs-blit-words but without the DC CVAC — for NC destinations."
+  (let ((movz (logior #xD2800003 (ash (logand scr #xFFFF) 5)))
+        (movk (logior #xF2A00003 (ash (logand (ash scr -16) #xFFFF) 5))))
+    (if (eq kind :fill)
+        (list movz movk #xF9400060 #xF9400461 #x3DC00460
+              #xAD000000 #xAD010000 #x91010000 #xF1010021 #x54FFFF81
+              #xD5033F9F #xD65F03C0)
+        (list movz movk #xF9400060 #xF9400461 #xF9400862
+              #xAD400420 #xAD000400 #xAD410420 #xAD010400
+              #x91010000 #x91010021 #xF1010042 #x54FFFF21
+              #xD5033F9F #xD65F03C0))))
+
+(defvar *hvs-blit-nc* nil)   ; (code scratch fill-entry copy-entry)
+
+(defun hvs-blit-nc-init ()
+  (let* ((code (%mmap-exec-page 4096)) (scr (+ code 512)) (fill code) (copy (+ code 256)))
+    (let ((p fill)) (dolist (w (hvs-blit-nc-words :fill scr)) (setf (mem-ref p :u32) w) (setq p (+ p 4))))
+    (let ((p copy)) (dolist (w (hvs-blit-nc-words :copy scr)) (setf (mem-ref p :u32) w) (setq p (+ p 4))))
+    (%jit-icache-flush code 512)
+    (setq *hvs-blit-nc* (list code scr fill copy))))
+
+(defun hvs-nfill-nc (dst bytes color)
+  "Fill an NC-mapped buffer: 9.2 MB in 9.75 ms, 640x360 in 0.99 ms."
+  (when (null *hvs-blit-nc*) (hvs-blit-nc-init))
+  (let ((scr (cadr *hvs-blit-nc*)))
+    (hvs-scr-u64 scr dst) (hvs-scr-u64 (+ scr 8) bytes)
+    (let ((i 0)) (loop (when (>= i 4) (return nil))
+      (setf (mem-ref (+ scr 16 (* i 4)) :u32) color) (setq i (+ i 1))))
+    (%jit-call (caddr *hvs-blit-nc*))))
+
+(defun hvs-ncopy-nc (dst src bytes)
+  "Copy a cached source into an NC-mapped buffer: 9.2 MB in 15.5 ms."
+  (when (null *hvs-blit-nc*) (hvs-blit-nc-init))
+  (let ((scr (cadr *hvs-blit-nc*)))
+    (hvs-scr-u64 scr dst) (hvs-scr-u64 (+ scr 8) src) (hvs-scr-u64 (+ scr 16) bytes)
+    (%jit-call (cadddr *hvs-blit-nc*))))
+
+(defun hvs-double-buffer ()
+  "Allocate two NC 1920x1200 back buffers; returns (a b).  Render into one with
+   hvs-nfill-nc/hvs-ncopy-nc, then (hvs-flip it) — present costs ~1 us."
+  (let ((a (%mmap-exec-page 9216000)) (b (%mmap-exec-page 9216000)))
+    (hvs-map-nc a 9216000) (hvs-map-nc b 9216000)
+    (list a b)))

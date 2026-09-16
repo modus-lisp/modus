@@ -39,11 +39,36 @@ FULL-SCREEN NUMBERS (same day, BCM system timer, 1920x1200 RGBA = 9.2 MB):
   native STP-Q fill + DC CVAC per line (hvs-nfill)      19.4 ms (475 MB/s)
   native LDP/STP-Q copy src->FB + DC CVAC (hvs-ncopy)   52 ms   (176 MB/s), coherent
        edge to edge (striped 9.2 MB source rendered uniformly, zero speckle).
-So a full 1920x1200 CPU blit tops out ~19 fps; a reel-sized frame (e.g. 640x360 =
-0.9 MB) is ~5 ms. To fill the screen at 60 fps the HVS must do the upscale: compose
-our own scaled plane on channel 1's dlist (hardware YUV->RGB + scale, zero CPU).
 Code: hvs-scanout-fb / hvs-blit-init / hvs-nfill / hvs-ncopy / hvs-frame in
-net/hdmi-hvs.lisp (hand-assembled words, exec-page vehicle, X0-X3 + Q0/Q1 only). The HVS hardware-scaled overlay (compose our own plane
+net/hdmi-hvs.lisp (hand-assembled words, exec-page vehicle, X0-X3 + Q0/Q1 only).
+
+★ HARDWARE DOUBLE BUFFER + NON-CACHEABLE BACK BUFFERS — the general fast case
+(same day).  Two facts make presenting effectively free:
+  * the HVS re-reads its dlist every frame and the live plane's PTR0 word is at an
+    8-ALIGNED slot (1636+4 -> 0x3F4039A0), so one 128-bit STP retargets the scanout
+    to any coherent buffer at the next vsync: hvs-flip = 1-2 us (orange/stripes/
+    orange swaps captured).
+  * the raw STP stream is 9.65 ms per 9.2 MB (955 MB/s, the DRAM ceiling; same into
+    RAM or the FB) and the DC CVAC clean pass is another 9.7 ms — pure overhead.
+    Mapping the back buffer Normal-NON-CACHEABLE removes it: hvs-map-nc rewrites the
+    2 MB L2 block descriptors (L1 hardwired at 0x70000, EL2 — MRS TTBR0_EL2 = 0x70000
+    confirmed) from AttrIdx0/0x701 to AttrIdx2/0x709 after a DC CIVAC sweep, then
+    MAIR_EL2 := 0x4400FF + TLBI ALLE2 + DSB/ISB.  Board stays alive; the NC buffer's
+    cyan fill appeared on screen with NO clean, zero speckle.
+  NUMBERS (BCM timer):   full 1920x1200        640x360
+    NC fill (no clean)      9.75 ms             0.99 ms
+    cached -> NC copy      15.5 ms              1.2 ms
+    flip                    1 us                1 us
+  (DC CVAC on an NC line still costs the full instruction time — 19.4 ms — so never
+  use the cleaning routines on NC memory.)  API: (hvs-double-buffer) -> (a b), render
+  with hvs-nfill-nc / hvs-ncopy-nc, present with (hvs-flip buf).
+  LESSONS: tag every serial read ((list TAG form) + regex) — a lagging echo once
+  parsed stale lines as a TTBR and nearly wrote page tables at a garbage address
+  (the sanity gate "descriptor == (b<<21)|0x701" is what saved the second run);
+  the ')))))' unstick burst makes the NEXT form READ-ERROR, so send a throwaway
+  form before probing; MRS Rt is bits[4:0] — D53C2000 is X0, not X1.
+  NEXT: the HVS scaled plane (render 640x360 in ~1 ms, hardware upscales, same
+  1 us flip) = full-screen video at zero CPU cost. The HVS hardware-scaled overlay (compose our own plane
 on channel 1's dlist, or add a scaled YUV plane) remains the path to zero-CPU
 scaling, but is no longer on the critical path to "pixels up".
 

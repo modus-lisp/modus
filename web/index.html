@@ -197,6 +197,7 @@
     say(`[queued ${name}, ${bytes.length} bytes; picked up at the next prompt]\n`, 'log');
   };
   window.modusAddFile = (name, text) => addFile(name, enc.encode(text));
+  window.modusAddFileBytes = (name, u8) => addFile(name, u8);   // binary drop (e.g. a .tar for ql:quickload)
   // --- samples browser: read a sample's source, then run it -----------------
   const SAMPLES = [
     { file: 'calc.lisp', run: '(calc)', title: 'Calculator', desc: 'a DOM calculator' },
@@ -613,6 +614,22 @@
       const path = '/home/web/link-' + files.length + '.lisp';
       files.push({ path, bytes: buf });
       argv.push('--load', path);
+    }
+  }
+  // Quicklisp: stage the loader + bundled systems so `ql:quickload` is ready at
+  // the prompt — the browser analogue of putting (load ".../setup.lisp") in
+  // ~/.modusrc.  It is OFFLINE: (ql:quickload :sha1) untars a bundled .tar via
+  // the baked install-tarball pipeline; no network/CORS involved.  Skipped for
+  // the batch ?eval harness so those runs stay fast.
+  if (!quit) {
+    const setup = await fetch('ql-setup.lisp').then((r) => r.ok ? r.arrayBuffer() : null).catch(() => null);
+    if (setup) {
+      files.push({ path: '/home/web/ql-setup.lisp', bytes: setup });
+      for (const sys of ['sha1']) {
+        const tar = await fetch('systems/' + sys + '.tar').then((r) => r.ok ? r.arrayBuffer() : null).catch(() => null);
+        if (tar) files.push({ path: '/home/web/systems/' + sys + '.tar', bytes: tar });
+      }
+      argv.splice(1, 0, '--eval', '(let ((*jit-inhibit* t)) (load "/home/web/ql-setup.lisp"))');
     }
   }
   if (quit) argv.push('--quit');

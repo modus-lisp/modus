@@ -18,7 +18,7 @@ cd "$here"
 [ -f modus.core.gz ] || { echo "modus.core.gz missing — make it: node web/run-node.js --trace 1 --save-core web/modus.core.gz --eval '(print 1)' --quit" >&2; exit 1; }
 gzip -9 -k -f modus.mvmw            # refresh modus.mvmw.gz from the current module
 
-files=(index.html coi-serviceworker.js mvm.js host-browser.js worker.js warmset.js modus.mvmw.gz modus.core.gz)
+files=(index.html coi-serviceworker.js mvm.js host-browser.js worker.js warmset.js ql-setup.lisp modus.mvmw.gz modus.core.gz)
 for f in "${files[@]}"; do [ -f "$f" ] || { echo "missing $f" >&2; exit 1; }; done
 
 tmp="$(mktemp -d)"
@@ -31,6 +31,7 @@ git rm -rf --quiet . >/dev/null 2>&1 || true
 find . -maxdepth 1 -mindepth 1 ! -name .git -exec rm -rf {} +
 for f in "${files[@]}"; do cp "$here/$f" .; done
 mkdir -p samples; cp "$here"/samples/*.lisp samples/   # sample library for the ▶ samples menu
+mkdir -p systems; cp "$here"/systems/*.tar systems/    # bundled ql:quickload systems (offline)
 touch .nojekyll
 cat > README.md <<'MD'
 # Modus REPL (GitHub Pages)

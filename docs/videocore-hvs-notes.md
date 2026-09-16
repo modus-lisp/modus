@@ -843,3 +843,22 @@ with the firmware FB plane + a scaled YUV plane (format 8, BT.601 CSC
   dropped from rh-yuv-plane; resetting the arena bump after pushing forms
   overlays the code you just compiled; the 9.5 MB core TFTP outruns a 60 s
   wait — poll for "go", never kill the netboot on a timer.
+
+★★★★★ JIT-EAGER (e490440) — the core route done right (2026-09-16, night)
+  `(jit-eager)` compiles every still-interpreted runtime DEFUN to native from
+  the module registry the trampoline installer now keeps, without re-evaluating
+  anything.  Recipe: install reel at the DEFAULT *jit-hot-only* T (4 min under
+  QEMU instead of 16-min-class eager loading), push the forms, `(jit-eager)`
+  -> 633 native defuns (4.25 MB of code), `(%save-image …)` -> 12.1 MB core
+  (reel-eager.core; the CORE-END print showed "4" — read the cursor slot
+  0x10000F60 / dump-and-trim instead).  On the Zero (demo12 + reel-eager.core):
+    (rh-first-frame) -> (320 180 384 192 0), on screen
+    (rh-play nil)    -> (FRAMES 30 TOTAL-MS 4129 DECODE-MS 4122 COPY-MS 6 FPS 7)
+    (rh-play t)      -> (FRAMES 30 TOTAL-MS 4397 DECODE-MS 4196 COPY-MS 6 FPS 6)
+  DECODE 137 ms/frame — 3.5x faster than the hot-only-NIL core (485 ms) and
+  faster than the 224 ms measured with reel loaded on the board itself; the
+  eager-at-load path evidently leaves worse code (or fallbacks) than translating
+  finished modules afterwards.  Display 0.2 ms/frame.  Hosted x64 check:
+  (jit-eager) -> (52 52 0), idempotent.  ANSI gate NOT yet run on e490440.
+  So the standing budget for "60 fps on the Zero" is now: 137 ms decode ->
+  16.7 ms = 8.2x, all of it decoder codegen on an in-order A53.

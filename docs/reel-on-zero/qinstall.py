@@ -18,7 +18,7 @@ rd_until(r"never",1.5); s.sendall(b")))))))))\r\n(+ 0 0)\r\n"); rd_until(r"never
 q("(+ 20 22)")
 q("(setq *jit-on* t)"); v=q("*jit-on*")
 if v!="T": print("JIT NOT ON — abort"); raise SystemExit(1)
-q("(setq *jit-hot-only* nil)")
+q("*jit-hot-only*")
 q("(setq *tar-block-size* 512)")
 if q('(if (find-package "REEL") 1 0)')!="1":
     q("(if (fboundp (quote ramv)) 1 0)")

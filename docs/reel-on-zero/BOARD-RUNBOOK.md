@@ -23,15 +23,25 @@ its failure mode observed; the gotchas are the ones that actually bit.
 From the modus tree (branch with your changes):
 
 ```
-MODUS_SSH_BUILD=1 MODUS_RPI_CHAINLOAD=1 \
+MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1 MODUS_RPI_CHAINLOAD=1 \
   sbcl --dynamic-space-size 8192 --script mvm/build-rpi-cl-repl.lisp
 gzip -kf /tmp/piboot/kernel8.img          # -> kernel8.img.gz (~5 MB from a ~62 MB raw)
 ```
 
-- **`MODUS_SSH_BUILD=1` is mandatory** for anything network: it bakes
-  `ssh-boot`, `net-install-and-call`, `net-fetch-bytes`. Without it you get a
-  serial-only REPL and `(ssh-boot)` answers `UNDEFINED-FUNCTION`. It is
-  RPi-only (the actor/SSH address map is Pi DRAM; the build refuses it on QEMU).
+- **Both `MODUS_NET_BUILD=1` and `MODUS_SSH_BUILD=1` are mandatory** for
+  anything network. `MODUS_NET_BUILD` gates the whole `*net-source*` block
+  (NIC driver, ip.lisp, http-client); the SSH transport (`ssh-boot`,
+  `net-install-and-call`, `net-fetch-bytes`) is spliced **inside** that block
+  under `MODUS_SSH_BUILD`, so `MODUS_SSH_BUILD=1` alone is silently a no-op —
+  the image comes out byte-identical to a no-network build. Without them you
+  get a serial-only REPL and `(ssh-boot)` answers `UNDEFINED-FUNCTION`.
+  SSH is RPi-only (the actor/SSH address map is Pi DRAM; QEMU builds refuse it).
+- **Verify the stack is in before you netboot** — it costs seconds and saves a
+  boot cycle: `strings kernel8.img | grep -c ssh-boot` must be non-zero, and
+  `cmp` against your previous image must report a difference. The build log
+  prints nothing about these flags.
+- `MODUS_NET_STATIC=1` / `MODUS_NET_NOAUTO=1` are for a boot-time auto-install
+  pipeline; the explicit `(ssh-boot)` path here does not need them.
 - `MODUS_RPI_CHAINLOAD=1` is the load-address-agnostic chainloader layout the
   netboot `go 0x300000` expects.
 - Optional trims: `MODUS_RPI_NO_BLOB=1`, `MODUS_RPI_NO_BRIDGE=1` (smaller image).

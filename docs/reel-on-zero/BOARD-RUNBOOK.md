@@ -415,6 +415,38 @@ nothing touches the A53 PMU. What works:
 - The 1 MHz timer wraps every 71 min; mask differences with
   `(logand (- t1 t0) #xFFFFFFFF)`.
 
+### A53 rules that decide tuning (BCM2710A1, Cortex-A53 @ 1 GHz, AArch64)
+
+- **In-order, dual-issue with restrictions, 8-stage pipe.** Nothing hides
+  latency for you: a serial NEON dependency chain (`mul → add → narrow`
+  consumed next instruction) idles the pipe. Interleave 2–3 independent
+  chains; interleave scalar address math with SIMD (integer+ASIMD pairs can
+  dual-issue; two ASIMD ops mostly cannot — effective ≈ 1 ASIMD op/cycle).
+- **128-bit forms often cost ~2× a 64-bit form's throughput.** `.8h`/`.8b`
+  (what our kernels use) is the right default; measure `.16b` vs two `.8b`.
+- Branch mispredict ≈ 8 cycles; the bool/entropy decoder pays it constantly.
+  NEON does nothing for that stage — it is scalar, branchy and serial, and on
+  this core it is expected to be the real bottleneck (A76 profile: 12%).
+- `umov`/`fmov` NEON→GP in an inner loop is a latency stall, not free.
+- **Thermal throttling is silent**: bare metal, no heatsink — re-read the
+  clock (`hdmi-arm-clock`) and `GET_TEMPERATURE` (tag `#x30006`, milli-°C)
+  after every long pass; a number taken while throttled is poison.
+- Baseline to beat: libvpx `vpx_dsp/arm/*_neon.c` (A53-tuned).
+
+### PMU (PMUv3: cycle counter + 6 event counters), `serial-pmu.py`
+
+All from EL2 via `%jit-call` stubs (assembled words, return in x0 = VR):
+`pmu-init` sets `PMCR_EL0 = E|C` and `PMCNTENSET_EL0 = cycle`; `pmu-cycles`
+reads `PMCCNTR_EL0`; `(pmu-event-setup n ev)` selects counter n for event ev
+(`PMSELR`/`PMXEVTYPER`/`PMCNTENSET`); `(pmu-event-read n)`. Events that
+matter: `0x08` INST_RETIRED (+cycles → IPC; low IPC on a NEON loop = stalling),
+`0x23`/`0x24` frontend/backend stall (the primary split: MC/deblock skew
+backend, bool decode skews frontend), `0x03`/`0x04` L1D refill/access (high
+access, low refill, high backend = load-port bound: restructure loads),
+`0x10` BR_MIS_PRED (the entropy stage's leak), `0x74` ASE_SPEC (proves the
+kernel issues SIMD at all). Cycle counts are clock-invariant; ns claims are
+not. Read `CTR_EL0`/`CCSIDR_EL1` for the real cache geometry.
+
 ## 7. Serial-only fallback (no `MODUS_SSH_BUILD`)
 
 The serial REPL prints **bare values** (no `= `). Tag every form so a reply can

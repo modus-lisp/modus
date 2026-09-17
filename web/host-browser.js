@@ -109,8 +109,15 @@ class BrowserHost {
     this.post({ type: 'query-result', id, bytes, error }, error ? [] : [bytes.buffer]);
   }
   now() { return performance.now(); }
-  // Lisp -> page: forward a batch of GUI command bytes.
-  guiSend(m8, off, len) { this.post({ type: 'gui', bytes: m8.slice(off, off + len) }); }
+  // Lisp -> page: forward a batch of GUI command bytes, plus a snapshot of the
+  // binary float scratch (0x10015000, VBASE 0x10000000 -> m8 offset 0x15000).  A
+  // `gldrawlist ... f OFF` command carries a matrix as raw IEEE-754 doubles at
+  // OFF in that buffer, so the page reinterprets bytes as a Float64Array with no
+  // text formatting/parsing on either side.  Snapshotting here (not on the page)
+  // is essential: linear memory is reused the instant this call returns.
+  guiSend(m8, off, len) {
+    this.post({ type: 'gui', bytes: m8.slice(off, off + len), floats: m8.slice(0x15000, 0x15800).buffer });
+  }
   // page -> Lisp: copy queued event bytes into image memory, return the count.
   guiPoll(m8, off, max) {
     if (!this.guiCtl) return 0;

@@ -117,8 +117,22 @@
 ;; page's per-animation-frame coalescer cannot split a clear from its draws.
 (defvar *frame* "")
 (defun %emit (line) (setq *frame* (concatenate 'string *frame* line (string (code-char 10)))))
-(defun flush () (when (> (length *frame*) 0) (cl-user::gui-cmd *frame*) (setq *frame* "")))
+(defun flush () (when (> (length *frame*) 0) (cl-user::gui-cmd *frame*) (setq *frame* "") (setq *foff* 0)))
 (defun %num (n) (write-to-string n))
+
+;; Native float bridge: instead of formatting the mvp matrix to a decimal string
+;; every frame (the expensive path), write each element's raw IEEE-754 double
+;; bits into a scratch buffer and let the page reinterpret those bytes as a
+;; Float64Array.  ieee-float-{lo,hi}32 give the two 32-bit halves of the double;
+;; mem-ref :u32 writes them little-endian, so the 8 bytes are a valid LE double.
+(defconstant +fbuf+ #x10015000)   ; scratch below the gui command buffer; snapshot in host-browser.js guiSend
+(defvar *foff* 0)                 ; rolling byte offset into +fbuf+, reset each flush
+(defun %fput (addr x)
+  (setf (cl-user::mem-ref addr :u32) (cl-user::ieee-float-lo32 x))
+  (setf (cl-user::mem-ref (+ addr 4) :u32) (cl-user::ieee-float-hi32 x)))
+(defun %mvp-bin (m off)           ; write m's 16 doubles at +fbuf+ + off; return off
+  (dotimes (i 16) (%fput (+ +fbuf+ off (* i 8)) (aref m i)))
+  off)
 
 ;; Display lists: cache geometry on the page ONCE (new-list ... end-list), then
 ;; each frame draw it with just the current matrix (call-list) — so the Lisp side
@@ -130,7 +144,10 @@
 (defun new-list (id &optional mode) (declare (ignore mode)) (setq *cap* id))
 (defun end-list () (setq *cap* nil))
 (defun call-list (id)
-  (%emit (concatenate 'string "gldrawlist" (%t) (%num id) (%t) (%mvp (m* *proj* *mv*)))))
+  (let ((off *foff*))
+    (%mvp-bin (m* *proj* *mv*) off)
+    (setq *foff* (+ off 128))
+    (%emit (concatenate 'string "gldrawlist" (%t) (%num id) (%t) "f" (%t) (%num off)))))
 
 (defun end ()
   (let ((tv (%tri *prim* (reverse *vs*))))

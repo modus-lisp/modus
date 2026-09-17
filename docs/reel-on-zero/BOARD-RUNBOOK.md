@@ -578,7 +578,8 @@ from modus-pi, no serial baking), `bench.lisp` (SBCL), `modus-bench.lisp`
 Linux reported `hw perfevents: armv8_cortex_a53 PMU driver, 7 counters` — the
 event counters our bare-metal probe could not get to count. Next initramfs
 addition: `perf`, for a sampling profile of SBCL and of Modus-hosted on the
-exact silicon.
+exact silicon. `vpxbench.c` (libvpx, single thread; `gcc -O2 vpxbench.c -lvpx`
+on modus-pi, push binary + `libvpx.so.9` over the wire) is the C floor.
 
 ## 7. Serial-only fallback (no `MODUS_SSH_BUILD`)
 
@@ -631,7 +632,7 @@ Two more rules, learned the hard way (2026-09-17, cost a 34-minute silent run):
 | + literal lane constants as MOVI/MVNI (modus `ba3ac19`, `reel-movi.core`) | decode **64.4 ms/frame**, loop filter 8 (unchanged at 1 ms resolution): the 62 DUP→MOVI conversions are correct but worth ~0.5 ms — the h8 kernel's time is in its ~200 real vector ops and the FP-MOV/reload traffic, not the constants. |
 | **+ LET* declared-type stamping (modus `17a71c0`, gate PASS NET=0; `reel-let.core`, 2026-09-17 late)** | decode **60.5 ms/frame** (5443/90 = 16.5 fps): MB loop 54 → 50 (luma16 14 → 12, chroma 11 → 10, glue), loop filter 8, **bool decoder still 15** — its state is `setq`-mutated, so no binding ever gets a trusted width; that is the register/frame-slot half of the codegen fix. |
 | **+ residual skip (reel `80a88c2`+`c02883c`: per-block NZ/AC flags, zero blocks skip IDCT+add, DC-only path; `reel-let3.core`, 2026-09-17 late)** | decode **49.2 ms/frame** (4427/90 = **20.3 fps**): MB loop 50 → 39 (luma16 12 → 4, chroma 10 → 7), residue 16, loop filter 8, copy 2. Intra paths had been running the IDCT + add on all 24 blocks of every MB. (First attempt with bit masks: 119 ms — see the variable-count ASH trap in §6e.) |
-| **SAME-SILICON LADDER (Zero 2 W, A53 @ 1 GHz, cam.ivf, 2026-09-17 late; Linux netbooted on the same rig, §6f)** | **SBCL 2.5.2: 18.4 ms/frame (54 fps)**; Modus hosted aarch64 CLI on that Linux: **52 ms/frame**; Modus bare-metal core (`reel-let3.core`): **49.2 ms/frame**. vp8-std: SBCL 12.6, Modus-Linux 43 (SBCL x86 on the build host: 1.29). So the bare-metal environment costs nothing (52 vs 49) and the entire gap is codegen: **Modus = 2.7× SBCL on identical silicon** — the honest compiler-gap figure. |
+| **SAME-SILICON LADDER (Zero 2 W, A53 @ 1 GHz, cam.ivf, 2026-09-17 late; Linux netbooted on the same rig, §6f)** | **SBCL 2.5.2: 18.4 ms/frame (54 fps)**; Modus hosted aarch64 CLI on that Linux: **52 ms/frame**; Modus bare-metal core (`reel-let3.core`): **49.2 ms/frame**. vp8-std: SBCL 12.6, Modus-Linux 43 (SBCL x86 on the build host: 1.29). So the bare-metal environment costs nothing (52 vs 49) and the entire gap is codegen: **Modus = 2.7× SBCL on identical silicon** — the honest compiler-gap figure. **libvpx 1.15.0 (C+NEON, `zlinux/vpxbench.c`, threads=1) on the same A53: cam.ivf 1.39 ms/frame (721 fps), vp8-std 1.07** (Pi 5 A76: 0.27 / 0.23). Full ladder on the Zero: libvpx 1.39 → SBCL 18.4 (13×) → Modus 49.2 (35×). |
 | same, fast HVS path (`rh-play`, 2 MB-aligned `rh-init`) | **76.6 ms/frame total = 13 fps** (decode 6876 + copy 14 ms per 90); decode unchanged after `rh-init` (6885) and after play (6847) — the 272 ms was the pre-fix `rh-init` |
 
 **CORRECTION (2026-09-17 late):** the 137 ms figure was on `small.ivf`

@@ -307,6 +307,19 @@ Loading reel over serial is impractical (163 KB at 4 ms/byte); use §6.
 | scalar, on-board JIT, hot-only-NIL load | ~224 ms |
 | scalar, QEMU-built native core, jit-eager | ~137 ms |
 | scalar phase profile (eager core) | MB loop 98 (IDCT+add 30, tokens 25, MC 18, modes 18), loop filter 40, copy 3 |
+| **NEON + linkage cells, QEMU core (`reel-lc.core`, tree at `841f8ef`+), 2026-09-17** | **209 ms** (18774 ms / 90, three passes within 0.5%; `reel-demo-pass 4`, DECODE-MS) |
+
+The 209 ms NEON figure is **slower than the 137 ms scalar core**. Not yet
+explained: the SIMD-2b series changed codegen for the whole image, and
+whether the NEON kernels are actually reached in that core (via the cells) has
+not been verified on the board. Treat it as a regression to bisect, not a
+NEON result.
+
+**QEMU-compiled core + HVS: re-push `rh-yuv-plane` before `rh-first-frame`.**
+Compiled under QEMU, `rh-yuv-plane`'s trailing HVS register read mis-tags the
+address and the first frame faults at FAR `0x7e800034` (the HVS *bus*
+address, unmapped). `rh_core6.py` / `serial-fast.py` re-define it over serial
+without that read first; then `rh-init` → `rh-first-frame` → `rh-play` work.
 
 A76 (modus-pi hosted CLI) for scale: scalar 26 ms → NEON 24 ms on cam.ivf;
 scalar 13.3 → NEON 12.0 ms on the libvpx vector vp80-00-comprehensive-006.

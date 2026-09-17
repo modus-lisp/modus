@@ -267,6 +267,12 @@ qemu-system-aarch64 -M raspi3b -kernel kernel8.img \
   (`ldur w18,[x17,#20]; tbz w18,#0,…` with x17 = `0x3F215040`).
 - `-serial unix:…,server,nowait` drops output emitted before a client
   connects; start the driver as soon as the socket exists.
+- **Boot to the REPL takes minutes under TCG** (the 62 MB image, E2SMOKE,
+  init). 25 s in, only the first boot warnings have printed. A driver that
+  waits 300 s for `Modus CL REPL`, gives up, and starts sending forms is
+  talking to a half-booted guest and gets empty replies for everything —
+  indistinguishable from a wrong serial. Wait ≥ 1500 s for the banner and
+  send nothing before it (`qcore.py`).
 - Silence is never evidence: `gdb-multiarch -batch -ex 'target remote :1234'
   -ex 'info registers pc' -ex 'x/3i $pc'` tells you in seconds whether the
   guest is spinning, faulted, or waiting for input. A stale QEMU from an old

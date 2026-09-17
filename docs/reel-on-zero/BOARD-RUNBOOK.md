@@ -451,6 +451,25 @@ access, low refill, high backend = load-port bound: restructure loads),
 kernel issues SIMD at all). Cycle counts are clock-invariant; ns claims are
 not. Read `CTR_EL0`/`CCSIDR_EL1` for the real cache geometry.
 
+**Status 2026-09-17 late (measured):**
+- **Cycle counter WORKS** — but only after `PMCCFILTR_EL0.NSH` (bit 27) is
+  set: the reset value does not count at EL2, so PMCCNTR read 0 until
+  `pmu-init` wrote `0x08000000` there. Calibration: a JIT'd
+  `(dotimes (i n) (setq s (+ s i)))` costs **28 cycles/iteration** on the A53
+  (that is the tagged-arithmetic + overflow-check + GC-safepoint loop shape).
+  Temperature 45–47 °C at 1 GHz throughout — no throttling.
+- **Event counters DO NOT COUNT, and it is not a programming error we can
+  find from software** (`serial-pmu2.py` read-back after setup: `PMCNTENSET`
+  = 0x80000003, `PMEVTYPER0` = 0x08000008 (NSH|INST_RETIRED), `PMSELR` = 0,
+  `PMCR` = 0x41023001 (E=1, N=6), `PMCEID0` = 0x6800F97F (INST_RETIRED and
+  BR_MIS_PRED implemented), `MDCR_EL2` = 0x86 (HPME=1, HPMN=6, i.e. every
+  counter in the PMCR.E range), ISB after every PMSELR write — and
+  `PMEVCNTR0` stays 0 across 100k iterations). Open. Candidates not yet
+  checked: something the firmware/U-Boot left in `MDCR_EL3`/secure debug
+  authentication that gates event counting but not the cycle counter.
+  Until then: per-stage CYCLES via `pmu-cycles` (equivalent to `rdtsc`×52 at
+  1 GHz; both exist), no IPC/branch-miss split.
+
 ## 7. Serial-only fallback (no `MODUS_SSH_BUILD`)
 
 The serial REPL prints **bare values** (no `= `). Tag every form so a reply can

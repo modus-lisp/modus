@@ -40,8 +40,28 @@ gzip -kf /tmp/piboot/kernel8.img          # -> kernel8.img.gz (~5 MB from a ~62 
   boot cycle: `strings kernel8.img | grep -c ssh-boot` must be non-zero, and
   `cmp` against your previous image must report a difference. The build log
   prints nothing about these flags.
-- `MODUS_NET_STATIC=1` / `MODUS_NET_NOAUTO=1` are for a boot-time auto-install
-  pipeline; the explicit `(ssh-boot)` path here does not need them.
+- **`MODUS_NET_NOAUTO=1` is also mandatory for the `(ssh-boot)` path.**
+  `MODUS_NET_BUILD` enables a boot-time auto-install pipeline
+  (`NET-PIPELINE-START` in the serial log: DHCP, fetch a tarball, drop to the
+  REPL). On the Zero it gets a garbage lease (`IP=10.0.2.15 GW=2.2.0.10`),
+  logs `TCP:F TCP:F LIB-FETCH-FAIL`, and leaves the NIC's TCP state poisoned.
+  `(ssh-boot)` then still reaches `NETUP` and the board answers **ping**, but
+  every SSH connection dies: the first attempts close during key exchange
+  (`ssh -vv` ends at `expecting SSH2_MSG_KEX_ECDH_REPLY`, then `Connection
+  closed by 10.0.0.2`), later ones time out at TCP connect, and the serial
+  console prints nothing. Every prior working boot log has
+  `NET-PIPELINE-START` count 0. `MODUS_NET_STATIC=1` is the other half of that
+  auto-install pipeline; leave both alone for this flow.
+
+So the full, verified flag set is:
+
+```
+MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1 MODUS_NET_NOAUTO=1 MODUS_RPI_CHAINLOAD=1
+```
+
+Read the serial log after `go`: the sequence must be `E2SMOKE-END` →
+`Modus CL REPL` → your `(ssh-boot)` → `NETUP`, with **no** `NET-PIPELINE-START`
+in between.
 - `MODUS_RPI_CHAINLOAD=1` is the load-address-agnostic chainloader layout the
   netboot `go 0x300000` expects.
 - Optional trims: `MODUS_RPI_NO_BLOB=1`, `MODUS_RPI_NO_BRIDGE=1` (smaller image).
@@ -156,6 +176,13 @@ $SSH '(reel-demo-load "http://10.0.0.1:8099/cam.ivf")'
 $SSH '(reel-demo-pass 4)'   # -> (FRAMES n TOTAL-MS t DECODE-MS d FPS f)
 ```
 
+- **Gate on the first reply.** `(+ 2 3)` must print `= 5` before anything
+  else is sent. The `run` helper (and `zero-measure.sh`) discards SSH stderr,
+  so a dead SSH server looks like thirty silently-empty forms and a
+  `MEASURE DONE` banner with no numbers. If `= 5` is missing: `ssh -vv` from
+  modus-pi shows where the handshake stops, and `serial-ssh-diag.py`
+  (captures `/dev/ttyAMA0` while opening one SSH connection) shows whether
+  the board faults or is simply silent.
 - **`DECODE-MS` is the number**: pure decode time, blit and flush excluded.
   Run `(reel-demo-pass 4)` three times; the first includes JIT warm-up.
 - SSH replies print as `= value`; `zero-measure.sh` greps `^= `.

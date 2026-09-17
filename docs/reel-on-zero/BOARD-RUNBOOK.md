@@ -101,9 +101,12 @@ So the full, verified flag set is:
 MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1 MODUS_NET_NOAUTO=1 MODUS_RPI_CHAINLOAD=1
 ```
 
-Read the serial log after `go`: the sequence must be `E2SMOKE-END` →
-`Modus CL REPL` → your `(ssh-boot)` → `NETUP`, with **no** `NET-PIPELINE-START`
-in between.
+Read the serial log after `go`: the sequence must be
+`ARMCLK=600000000->1000000000` → `E2SMOKE-END` → `Modus CL REPL` → your
+`(ssh-boot)` → `NETUP`, with **no** `NET-PIPELINE-START` in between. If the
+`ARMCLK` line is missing the image predates 694ea12 and every timing from it
+is at 600 MHz; if it prints `600000000->600000000` the mailbox request was
+refused — do not measure on that boot.
 - `MODUS_RPI_CHAINLOAD=1` is the load-address-agnostic chainloader layout the
   netboot `go 0x300000` expects.
 - Optional trims: `MODUS_RPI_NO_BLOB=1`, `MODUS_RPI_NO_BRIDGE=1` (smaller image).

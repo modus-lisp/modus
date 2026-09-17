@@ -597,3 +597,15 @@ without that read first; then `rh-init` → `rh-first-frame` → `rh-play` work.
 
 A76 (modus-pi hosted CLI) for scale: scalar 26 ms → NEON 24 ms on cam.ivf;
 scalar 13.3 → NEON 12.0 ms on the libvpx vector vp80-00-comprehensive-006.
+
+**Zero vs A76 micro-benchmarks (2026-09-17, `uarch.lisp` / `serial-uarch.py`,
+same JIT'd code):** add-loop 5M 81 → 367 ms (4.5×), sum 16 KB L1-resident
+×1000 226 → 847 (3.7×), sum 1 MB streaming ×16 226 → 870 (3.8×), copy 16 MB
+46 → 203 (4.4×).  A uniform ~4× with L1-resident and DRAM-streaming equal is
+a 1 GHz in-order A53 vs a 2.4 GHz A76 with **caches working**; uncached
+memory would be 20–50×.  So the decoder's 9× (24 vs 218 ms) is not cache,
+alignment or SMPEN — something in the decode is Zero-specific (leading
+suspect: reel functions left interpreted after the QEMU `jit-eager`, which
+reported 7 failed modules; `serial-native.py` lists them).  A native stub
+that reads system registers via `%jit-call` faults the REPL — read the
+mailbox clock BEFORE any such probe.

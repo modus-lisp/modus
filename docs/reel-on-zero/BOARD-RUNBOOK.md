@@ -467,6 +467,15 @@ both sides. The frame spills (103 OBJ-REF) are the second half; (3) hold
 operand vectors across trees (register-resident let* bindings that survive
 the tree evaluator); (4) an s8 16-lane loop-filter kernel.
 
+**Never put a variable-count `(ash 1 idx)` on a per-block path.** CLAUDE.md
+says it: variable-count ASH routes to the runtime `bignum-ash` — ~2 µs on
+the A53. The first residual-skip cut built bit masks with `(logior m (ash 1
+idx))` / `(logtest m (ash 1 idx))` per block and DOUBLED the decoder (60.5 →
+119 ms/frame; residue 15 → 30, chroma 10 → 29). The hosted A76 hid it
+completely (9345 → 9463 ms). 25-byte `u8vec` flag arrays cost nothing.
+Corollary: any per-block/per-pixel change must be judged on the A53, and a
+flat A76 number is not evidence of anything.
+
 ### A53 rules that decide tuning (BCM2710A1, Cortex-A53 @ 1 GHz, AArch64)
 
 - **In-order, dual-issue with restrictions, 8-stage pipe.** Nothing hides
@@ -568,6 +577,7 @@ Two more rules, learned the hard way (2026-09-17, cost a 34-minute silent run):
 | **vertical edges by NEON 8x8 byte transpose (reel `aa32fa5`, modus `ba3ac19` TRN ops, `reel-trn.core`, 2026-09-17 late)** | decode **64.9 ms/frame** (5840/90 = 15.4 fps), **loop filter 8** (from 18; residue 15, MB loop 54 unchanged). The vertical half went ~12 → ~2 ms. |
 | + literal lane constants as MOVI/MVNI (modus `ba3ac19`, `reel-movi.core`) | decode **64.4 ms/frame**, loop filter 8 (unchanged at 1 ms resolution): the 62 DUP→MOVI conversions are correct but worth ~0.5 ms — the h8 kernel's time is in its ~200 real vector ops and the FP-MOV/reload traffic, not the constants. |
 | **+ LET* declared-type stamping (modus `17a71c0`, gate PASS NET=0; `reel-let.core`, 2026-09-17 late)** | decode **60.5 ms/frame** (5443/90 = 16.5 fps): MB loop 54 → 50 (luma16 14 → 12, chroma 11 → 10, glue), loop filter 8, **bool decoder still 15** — its state is `setq`-mutated, so no binding ever gets a trusted width; that is the register/frame-slot half of the codegen fix. |
+| **+ residual skip (reel `80a88c2`+`c02883c`: per-block NZ/AC flags, zero blocks skip IDCT+add, DC-only path; `reel-let3.core`, 2026-09-17 late)** | decode **49.2 ms/frame** (4427/90 = **20.3 fps**): MB loop 50 → 39 (luma16 12 → 4, chroma 10 → 7), residue 16, loop filter 8, copy 2. Intra paths had been running the IDCT + add on all 24 blocks of every MB. (First attempt with bit masks: 119 ms — see the variable-count ASH trap in §6e.) |
 | same, fast HVS path (`rh-play`, 2 MB-aligned `rh-init`) | **76.6 ms/frame total = 13 fps** (decode 6876 + copy 14 ms per 90); decode unchanged after `rh-init` (6885) and after play (6847) — the 272 ms was the pre-fix `rh-init` |
 
 **CORRECTION (2026-09-17 late):** the 137 ms figure was on `small.ivf`

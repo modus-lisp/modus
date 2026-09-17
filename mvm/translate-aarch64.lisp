@@ -4599,6 +4599,15 @@
                 (a64-movk buf +a64-x16+ 0 1)   ; placeholder addr[31:16] LSL 16
                 (a64-movk buf +a64-x16+ 0 2)   ; placeholder addr[47:32] LSL 32
                 (a64-movk buf +a64-x16+ 0 3)   ; placeholder addr[63:48] LSL 48
+                ;; LINKAGE CELL: when on, the movz quad is patched with the
+                ;; callee's stable CELL address (not its code address); this LDR
+                ;; loads the cell's current contents (the live native entry) into
+                ;; x16 so a redefinition that repoints the cell is seen here.
+                ;; The reloc site (movz-byte-off) is BEFORE this LDR, so adding
+                ;; it does not disturb the quad the patch targets.  Emit and
+                ;; patch read the same *jit-linkage-cells*, so they agree.
+                (when (and (boundp (quote *jit-linkage-cells*)) *jit-linkage-cells*)
+                  (a64-ldr-unsigned buf +a64-x16+ +a64-x16+ 0))
                 (a64-blr buf +a64-x16+))
                (t
                 (format t "~&  AARCH64 CALL: NO LABEL for target-offset=~D — emitting SVC #x0511 trap~%"

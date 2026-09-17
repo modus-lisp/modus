@@ -649,6 +649,12 @@
     (setf (mem-ref #x10000F10 :u64) 0)
     (setq *aarch64-jit-constvec-p* t))
   (setq *use-jit* t)
+  ;; LINKAGE CELLS (proper CL late binding for out-of-module native CALLs):
+  ;; route each caller's call through a stable per-name cell so a callee
+  ;; (re)definition is seen by all callers.  Set here to defeat Limitation 7
+  ;; (the defvar initform does not run at boot).  Unconditional — independent of
+  ;; the GC-bitmap guard above.
+  (setq *jit-linkage-cells* t)
   t)
 (defun %jit-enabled-p () (and (boundp (quote *use-jit*)) *use-jit*))
 "))))

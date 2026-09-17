@@ -409,6 +409,66 @@
                (setq v (ash v -8))
                (setq j (+ j 1))))))
 
+;;; ---------------------------------------------------------------------------
+;;; LINKAGE CELLS — proper CL late binding for out-of-module native CALLs.
+;;;
+;;; Historically a native caller baked the callee's native address at page
+;;; build (crel), so a later (re)definition of the callee was invisible: the
+;;; caller kept calling the old code (the native-callers-ignore-redefinition
+;;; drop-in gap).  A LINKAGE CELL is a stable u64 holding the callee's CURRENT
+;;; native code address.  The aarch64 crel emits `MOVZ x16,<cell>; LDR x16,[x16];
+;;; BLR x16` — the caller loads the target from the cell at every call, so
+;;; repointing the cell on (re)definition makes all callers, present and future,
+;;; see the new code.  This is SBCL's fdefn mechanism.  Gated by
+;;; *jit-linkage-cells*; the aarch64 translator's crel emit and the aarch64 crel
+;;; patch below BOTH read it and MUST agree per page (they do — same dynamic
+;;; extent inside %jit-translate-page).  aarch64 only for now (x64 crel unchanged).
+;;; ---------------------------------------------------------------------------
+
+(defvar *jit-linkage-cells* nil
+  "When T, out-of-module native CALLs route through a stable per-name LINKAGE
+   CELL so a callee (re)definition is seen by all callers (proper CL late
+   binding).  When NIL/unbound, the callee address is baked at page build (early
+   binding, historical).  Set T at runtime by %jit-boot-init (Limitation 7).")
+
+(defvar *jit-lcell-table* nil
+  "name(string) -> cell address (a stable u64 in an %mmap-exec-page arena).")
+(defvar *jit-lcell-next* 0 "bump pointer into the current cell arena page.")
+(defvar *jit-lcell-end* 0 "end of the current cell arena page.")
+
+(defun %jit-linkage-cell (name)
+  "Return the stable u64 cell address holding NAME's current native code
+   address, creating it (zero-initialised) on first request.  NIL only if the
+   arena page could not be mapped."
+  (when (null *jit-lcell-table*)
+    (setq *jit-lcell-table* (make-hash-table :test (function equal))))
+  (let ((c (gethash name *jit-lcell-table*)))
+    (if c
+        c
+        (progn
+          (when (>= *jit-lcell-next* *jit-lcell-end*)
+            (let ((p (%mmap-exec-page 4096)))
+              (if (< p 4096)
+                  (return-from %jit-linkage-cell nil)
+                  (setq *jit-lcell-next* p *jit-lcell-end* (+ p 4096)))))
+          (let ((cell *jit-lcell-next*))
+            (setq *jit-lcell-next* (+ cell 8))
+            (setf (mem-ref cell :u64) 0)
+            (puthash name *jit-lcell-table* cell)
+            cell)))))
+
+(defun %jit-lcell-set (name addr)
+  "Point NAME's linkage cell at ADDR (untagged native code address).  Called on
+   (re)definition (%jit-install-native-fns) so existing callers pick up the new
+   code.  No-op unless linkage cells are on."
+  (when (and (boundp (quote *jit-linkage-cells*)) *jit-linkage-cells*)
+    (let ((cell (%jit-linkage-cell name)))
+      ;; RAW-ADDR: a Lisp (setf (mem-ref … :u64)) stores the value's TAGGED form
+      ;; (fixnum n -> n<<1), and the caller's LDR reads the slot's RAW bits, so
+      ;; store HALF the (16-aligned) address — its raw bits are then exactly ADDR.
+      ;; Storing ADDR itself makes the BLR branch to 2*ADDR (#(SIMPLE-ERROR NIL)).
+      (when cell (setf (mem-ref cell :u64) (ash addr -1))))))
+
 (defun %jit-write-movz-quad (base off word)
   "WS4-S5 (aarch64): patch a MOVZ/MOVK quad (4 consecutive 32-bit words) at
    BASE+OFF with the 4 imm16 halves of WORD.  Register-agnostic: reads each
@@ -1385,6 +1445,10 @@
                   (puthash nm *symbol-function-table* fn))
                 (when (boundp (quote *native-sym-function-table*))
                   (puthash (compute-name-hash nm) *native-sym-function-table* fn))
+                ;; LINKAGE CELL: repoint NM's cell at the new native code so
+                ;; every already-built caller that calls through the cell picks
+                ;; up this (re)definition — proper CL late binding.
+                (%jit-lcell-set nm addr)
                 (setq n (+ n 1))))))))
     (setq *jit-native-defun-count*
           (if *jit-native-defun-count* (+ *jit-native-defun-count* n) n))
@@ -1847,7 +1911,23 @@
                   (setq *jit-bridged-sites*
                         (if *jit-bridged-sites* (+ 1 *jit-bridged-sites*) 1)))))
             (if (> addr 0)
-                (%jit-write-movz-quad base (car r) addr)
+                ;; LINKAGE CELL: point the caller's movz quad at NAME's stable
+                ;; cell (the emitted `LDR x16,[x16]` dereferences it at call
+                ;; time), and make the cell hold the current native address.  A
+                ;; later redefinition repoints the cell, so this caller follows.
+                ;; The emit added the LDR iff *jit-linkage-cells* is on, so the
+                ;; two MUST match — when on, a cell is mandatory (an arena-alloc
+                ;; failure rejects the page rather than baking a raw addr the LDR
+                ;; would wrongly dereference).
+                (if (and (boundp (quote *jit-linkage-cells*)) *jit-linkage-cells*)
+                    (let ((cell (%jit-linkage-cell name)))
+                      (if cell
+                          ;; store HALF the addr (mem-ref :u64 tags fixnums n->n<<1;
+                          ;; the caller's LDR reads raw bits) so [cell] == ADDR.
+                          (progn (setf (mem-ref cell :u64) (ash addr -1))
+                                 (%jit-write-movz-quad base (car r) cell))
+                          (progn (when (eql why 0) (setq why 1)) (setq ok nil))))
+                    (%jit-write-movz-quad base (car r) addr))
                 (progn
                   ;; CENSUS (x64 parity): "resolved but it is a HEAP closure —
                   ;; a runtime DEFUN" is a completely different blocker from

@@ -2607,6 +2607,19 @@
   (%register-pkg-by-hash (find-package "COMMON-LISP-USER"))
   (make-package "KEYWORD" :use nil)
   (%register-pkg-by-hash (find-package "KEYWORD"))
+  ;; MODUS: the home for GENERIC runtime functionality that is part of the
+  ;; system itself, not of any specific image's runtime API (jit-eager and
+  ;; peers).  A CL-user program reaches it as MODUS:JIT-EAGER.  The
+  ;; symbol-function table is keyed by name string, so exporting the symbol here
+  ;; makes MODUS:JIT-EAGER resolve to the same registered function.
+  ;; MODUS: the home for GENERIC runtime functionality that belongs to the
+  ;; system, not to any specific image's runtime API (jit-eager and peers).  The
+  ;; package is created HERE (early, so the reader can resolve MODUS:… symbols);
+  ;; the FUNCTION bindings are done later in kernel-main (%init-modus-package),
+  ;; once the symbol-function table is populated.
+  (make-package "MODUS" :use nil)
+  (%register-pkg-by-hash (find-package "MODUS"))
+  (export (intern "JIT-EAGER" (find-package "MODUS")) (find-package "MODUS"))
   (setq *package* (find-package "CL-USER"))
   ;; Set up test packages from packages00-aux.lsp
   (%defpackage-impl "FS-A" (list (list :use) (list :nicknames "FS-Q") (list :export "FOO")))

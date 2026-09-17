@@ -1263,6 +1263,9 @@
   ;; general library primitive, NOT ql wiring — the QL package + ql:quickload
   ;; come only from a runtime (load) of modus-quicklisp/setup.lisp.
   (setq *tar-block-size* 512)
+  ;; Bind the MODUS package's generic runtime functions (jit-eager…).  After
+  ;; init-all-globals and function install, so the symbol-function table has them.
+  (handler-case (%init-modus-package) (t (c) nil))
   ;; WS5 rung 2: initialize the native JIT if it was baked (MODUS_USE_JIT=1).
   ;; %jit-boot-init is baked to a no-op when JIT is off, or to the translator
   ;; table co-init + (setq *use-jit* t) when JIT is on.  Wrapped so a JIT-init

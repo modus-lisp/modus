@@ -1427,11 +1427,10 @@
   (let ((f (%mvm-resolve-runtime-fn name)))
     (and f (eql (logand (%val->word f) 15) 3))))
 
-(defun jit-eager ()
+(defun %jit-eager-all ()
   "Translate every registered runtime DEFUN that is still an interpreter
    trampoline to native code and publish it.  Returns (INSTALLED MODULES
-   FAILED): functions published, modules translated, modules whose page could
-   not be built (they keep their trampolines).  Needs the JIT active."
+   FAILED).  Needs the JIT active."
   (if (not (and (%jit-active-p) (boundp (quote *jit-module-registry*))
                 *jit-module-registry*))
       (list 0 0 0)
@@ -1457,6 +1456,44 @@
                   (setq failed (+ failed 1))))))
         (when (> installed 0) (%jit-retry-drain))
         (list installed modules failed))))
+
+(defun %init-modus-package ()
+  "Bind the MODUS package's generic runtime functions.  Called from kernel-main
+   AFTER the symbol-function table is populated (the package itself is created
+   early in %init-packages so the reader can name MODUS:… symbols).  A call to a
+   non-CL-USER symbol resolves via its QUALIFIED name string, so both the
+   symbol's function cell and the qualified SFT key are set."
+  (let ((p (find-package "MODUS")))
+    (when p
+      (dolist (nm (list "JIT-EAGER"))
+        (let ((fn (%mvm-resolve-runtime-fn nm)))
+          (when fn
+            (let ((dst (intern nm p)))
+              (set-symbol-function dst fn)
+              (when (boundp (quote *symbol-function-table*))
+                (puthash (concatenate (quote string) "MODUS::" nm)
+                         *symbol-function-table* fn)))))))))
+
+(defun jit-eager (&rest form)
+  "Compile-ahead the runtime JIT.  With no argument, translate every registered
+   runtime DEFUN that is still an interpreter trampoline to native code and
+   return (INSTALLED MODULES FAILED).
+
+   With one argument FORM (a quoted form), FIRST make every DEFUN native, THEN
+   compile and run FORM natively and return its value.  Because the callees are
+   already native when FORM is compiled, FORM's call sites relocate to the
+   native entry points instead of interpreter trampolines — so a driver form
+   (a benchmark loop, a decode) runs fully native, not through the trampolines a
+   normally-JIT'd caller bakes for runtime-defined callees.  This is the honest
+   way to time or run native code that calls runtime DEFUNs."
+  (let ((counts (%jit-eager-all)))
+    (if (null form)
+        counts
+        ;; FORM given: run it with the JIT forced on and not hot-gated, so this
+        ;; single eval JITs and binds its calls to the natives just published.
+        (let ((*jit-hot-only* nil))
+          (declare (special *jit-hot-only*))
+          (eval (car form))))))
 
 (defun %jit-translate-page-1 (bc ft-list rt-table)
   "Inner: translate BC → native x64, mmap an exec page, copy bytes, relocate

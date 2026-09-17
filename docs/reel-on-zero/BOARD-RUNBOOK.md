@@ -369,6 +369,18 @@ qemu-system-aarch64 -M raspi3b -kernel kernel8.img \
   the few modules the QEMU pass missed; keep it, but it is not what fixed
   the slowness above.
 
+**Two driver traps that each cost a board cycle on 2026-09-17:**
+- **`CORE-END` regex race.** `rd_until(r"CORE-END=\d+")` returns as soon as
+  the FIRST digits arrive; `CORE-END=41` was read from `CORE-END=415417424`,
+  the gdb dump was 41 bytes, and the netboot "restored" an empty core (REPL
+  never answers). Require a terminator: `CORE-END=\d+[^0-9]`, and check the
+  dumped core is > 1 MB before staging it (`qcore*.py` and the chains do now).
+- **`pkill -f` / `pgrep -f` self-match, third time.** The bracket trick
+  (`qcore[5]`) protects only against the pattern itself; if the SAME command
+  line spells the target anywhere else (`sed … qcore5.py`, a `grep`, the launch
+  text), the pattern matches your own shell and kills it (exit 144). Put the
+  kill in its own command with no literal target elsewhere on the line.
+
 ## 6d. Kernel-porting lessons (NEON layer 2b, 2026-09-17)
 
 - **Only u8 arrays are packed.** `(signed-byte 32)`, `(signed-byte 16)` and

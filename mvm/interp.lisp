@@ -411,6 +411,10 @@
       ((<= sub 19) (dotimes (k 4)                                                             ; s32x4 add sub mul
                      (let ((x (%vlane-get a k 4 t)) (y (%vlane-get b k 4 t)))
                        (%vlane-set v k 4 (cond ((= sub 17) (+ x y)) ((= sub 18) (- x y)) (t (* x y)))))))
+      ((= sub 28) (dotimes (k 8) (setf (aref v k) (if (evenp k) (aref a k) (aref b (- k 1))))))      ; trn1 .8b
+      ((= sub 29) (dotimes (k 8) (setf (aref v k) (if (evenp k) (aref a (+ k 1)) (aref b k)))))      ; trn2 .8b
+      ((= sub 30) (%vlane-set v 0 4 (%vlane-get a 0 4 nil)) (%vlane-set v 1 4 (%vlane-get b 0 4 nil)))  ; trn1 .2s
+      ((= sub 31) (%vlane-set v 0 4 (%vlane-get a 1 4 nil)) (%vlane-set v 1 4 (%vlane-get b 1 4 nil)))  ; trn2 .2s
       (t (dotimes (k 4)                                                                       ; trn1/trn2/zip1/zip2 .4h (low 8 bytes)
            (let ((x (cond ((= sub 20) (if (evenp k) (%vlane-get a k 2 nil) (%vlane-get b (- k 1) 2 nil)))
                           ((= sub 21) (if (evenp k) (%vlane-get a (+ k 1) 2 nil) (%vlane-get b k 2 nil)))
@@ -2001,8 +2005,10 @@
            (multiple-value-bind (fd npc) (fetch-reg bc pc)
              (multiple-value-bind (kind npc2) (fetch-byte bc npc)
                (multiple-value-bind (val npc3) (fetch-byte bc npc2)
-                 (let ((v (%vlane-new)))
-                   (dotimes (k (floor 16 kind)) (%vlane-set v k kind val))
+                 (let ((v (%vlane-new))
+                       (kind2 (if (= kind 3) 2 kind))                       ; kind 3 = MVNI .8H: lanes = ~val
+                       (val2 (if (= kind 3) (logand (lognot val) 65535) val)))
+                   (dotimes (k (floor 16 kind2)) (%vlane-set v k kind2 val2))
                    (setf (svref fregs fd) v))
                  (setf pc npc3)))))
           (#.+op-vi-umov+

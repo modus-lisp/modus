@@ -87,4 +87,28 @@
 (defun t9 () (%vi-umov16 (%vi-sshr16 (%vi-shl16 (%vi-dup16 -300) 2) 3) 5))
 (check "9 shl16/sshr16 signed value" (let ((u (t9))) (if (>= u 32768) (- u 65536) u)) (ash (- (* 300 4)) -3))
 
+;; 10. trn1-8/trn2-8 (.8B) and trn1-32/trn2-32 (.2S): the 64-bit transposes; high half is zero
+(defun t10 (a b dst)
+  (declare (type (simple-array (unsigned-byte 8) (*)) a b dst))
+  (%vi-st8 dst 0 (%vi-trn1-8 (%vi-ld8 a 0) (%vi-ld8 b 0)))
+  (%vi-st8 dst 8 (%vi-trn2-8 (%vi-ld8 a 0) (%vi-ld8 b 0)))
+  (%vi-st8 dst 16 (%vi-trn1-32 (%vi-ld8 a 0) (%vi-ld8 b 0)))
+  (%vi-st8 dst 24 (%vi-trn2-32 (%vi-ld8 a 0) (%vi-ld8 b 0))))
+(let ((a (u8v 8)) (b (u8v 8)) (dst (u8v 32)))
+  (dotimes (i 8) (setf (aref a i) (+ 10 i) (aref b i) (+ 20 i)))
+  (t10 a b dst)
+  (check "10 trn1-8/trn2-8/trn1-32/trn2-32" (bytes dst 32)
+         '(10 20 12 22 14 24 16 26  11 21 13 23 15 25 17 27  10 11 12 13 20 21 22 23  14 15 16 17 24 25 26 27)))
+
+;; 11. literal lane constants compile to MOVI / MVNI immediates (dup16 -1, -128, 200; dup8 7)
+(defun t11 (dst)
+  (declare (type (simple-array (unsigned-byte 8) (*)) dst))
+  (%vi-st16 dst 0 (%vi-dup16 -1))
+  (%vi-st16 dst 16 (%vi-add16 (%vi-dup16 -128) (%vi-dup16 200)))
+  (%vi-st16 dst 32 (%vi-dup8 7)))
+(let ((dst (u8v 48)))
+  (t11 dst)
+  (check "11 dup const -> movi/mvni" (list (s16-load dst 0) (s16-load dst 14) (s16-load dst 16) (s16-load dst 30) (aref dst 32) (aref dst 47))
+         (list -1 -1 72 72 7 7)))
+
 (format t "~%VI-PROBE ~a~%" (if (zerop *fails*) "ALL PASS" (format nil "~a FAILURES" *fails*)))

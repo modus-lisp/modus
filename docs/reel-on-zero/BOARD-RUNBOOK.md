@@ -419,6 +419,33 @@ nothing touches the A53 PMU. What works:
   registry. Half a day; it would be the first true profile of the A53.
 - `get-internal-real-time` is a plain fixnum µs count; no wrap masking needed.
 
+### What the compiler emits for a NEON kernel (read before writing another one)
+
+`(disassemble '(lambda …))` on the hosted CLI prints the MVM bytecode the JIT
+translates (2026-09-17, `%edge-mb-h8` per 8 lines): real work = 110 VI-BIN +
+42 VI-UN + 19 VI-SHIFT + 26 VI-LD + 6 VI-ST (~200), carried by **71 VI-DUP**
+(every `(%vi-dup16 CONST)` re-materialised at each use as LI + frame load +
+DUP), 32 FP-MOV from the tree evaluation model, and 73 OBJ-REF + 62 LI of
+scalar overhead — ~440 instructions where libvpx's
+`vp8_mbloop_filter_vertical_edge_y_neon` spends ~60 for 16 lines. The
+transpose helper is the same story: 96 vector ops carrying ~216 overhead ops
+(each 4-op tree reloads its array and index from frame slots), and every
+declared-`fixnum` local is still tag-tested (`BOR/TEST`, fallback `CALL` to
+generic arithmetic) and spilled (`OBJ-SET VFP n`).
+
+libvpx (`vp8/common/arm/neon/mbloopfilter_neon.c`) does the same algorithm:
+`vld1_u8` per row, the same three-stage `vtrn` network (u32→u16→u8 order),
+filter, transpose back, `vst1_u8` per row. Two differences: it keeps all 16
+rows and 12 temporaries in registers (full 32-register file; our pool is 12,
+hence memory between stages, 8 rows per pass), and its filter runs in 8-bit
+lanes with saturating s8 arithmetic (16 lanes/op) where ours widens to s16×8.
+
+Fixes in order of payoff: (1) literal lane constants as MOVI/MVNI immediates
+(landed 2026-09-17, compiler dup path); (2) keep declared-fixnum locals in
+registers without tag checks (the bool decoder's problem too); (3) hold
+operand vectors across trees (register-resident let* bindings that survive
+the tree evaluator); (4) an s8 16-lane loop-filter kernel.
+
 ### A53 rules that decide tuning (BCM2710A1, Cortex-A53 @ 1 GHz, AArch64)
 
 - **In-order, dual-issue with restrictions, 8-stage pipe.** Nothing hides

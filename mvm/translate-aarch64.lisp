@@ -4478,12 +4478,13 @@
                           (15 #x4E208400) (16 #x6E208400) (17 #x4EA08400) (18 #x6EA08400) (19 #x4EA09C00)
                           (20 #x0E402800) (21 #x0E406800) (22 #x0E403800) (23 #x0E407800)
                           (24 #x4E606C00) (25 #x4E606400) (26 #x6E206C00) (27 #x6E206400)
+                          (28 #x0E002800) (29 #x0E006800) (30 #x0E802800) (31 #x0E806800)   ; TRN1/TRN2 .8B, TRN1/TRN2 .2S
                           (t #x0E407800))))
              (a64-emit buf (logior base (ash fb 16) (ash fa 5) fd))))
           ;; ---- VI-MOVI Fd, kind, val ----  MOVI Vd.16B / Vd.8H, #val  (abc:defgh split)
           ((= op +op-vi-movi+)
            (let* ((fd (fpp (vr 0))) (kind (vr 1)) (val (vr 2)))
-             (a64-emit buf (logior (if (= kind 1) #x4F00E400 #x4F008400)
+             (a64-emit buf (logior (cond ((= kind 1) #x4F00E400) ((= kind 3) #x6F008400) (t #x4F008400))   ; MOVI .16B / MVNI .8H / MOVI .8H
                                    (ash (logand (ash val -5) 7) 16) (ash (logand val 31) 5) fd))))
           ;; ---- VI-UMOV Vd, Fs, kind, lane ----  UMOV W9, Vs.B/H/S[lane]; tag; store
           ((= op +op-vi-umov+)

@@ -291,6 +291,11 @@ qemu-system-aarch64 -M raspi3b -kernel kernel8.img \
   name returns NIL even when the function is native.
 - The core carries forms and clip but not board state: run `(init)` (HDMI
   mailbox framebuffer) on the board before `reel-demo-pass`.
+- **`(jit-eager)` on the board after the core restore is mandatory before
+  any timing**, even though it reports only `(3 3 4)`. Same core, same
+  clip: `rh-play` without it = 3309 ms/frame; with it = 218 ms/frame
+  (`reel-demo-pass` 209). A restored core's decode path is not fully native
+  until that call runs.
 
 ## 7. Serial-only fallback (no `MODUS_SSH_BUILD`)
 

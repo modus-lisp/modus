@@ -7,7 +7,7 @@
   (:use :cl)
   (:export :clear-color :clear :matrix-mode :load-identity :push-matrix
            :pop-matrix :translate :rotate :scale :ortho :perspective
-           :begin :end :vertex :color :flush
+           :begin :end :vertex :color :flush :gen-lists :new-list :end-list :call-list
            :+projection+ :+modelview+ :+triangles+ :+quads+ :+lines+))
 (in-package :gl)
 
@@ -83,7 +83,18 @@
 
 ;;; --- send to the WebGL bridge ----------------------------------------------
 (defun %t () (string (code-char 9)))
-(defun %f (x) (format nil "~f" (float x 1.0)))
+;; A JS-parseable decimal with 4 fractional digits, WITHOUT format ~f: float
+;; printing (Steele-White) is the single most expensive thing this demo does per
+;; frame, so we round to fixed-point and print integers instead.
+(defun %f (x)
+  (let* ((x (float x 1.0))
+         (neg (< x 0.0))
+         (n (round (* (if neg (- x) x) 10000.0)))
+         (ip (floor n 10000))
+         (fp (mod n 10000))
+         (fs (write-to-string fp)))
+    (concatenate 'string (if neg "-" "") (write-to-string ip) "."
+                 (make-string (- 4 (length fs)) :initial-element #\0) fs)))
 (defun %mvp (m)
   (let ((s (%f (aref m 0)))) (dotimes (i 15) (setq s (concatenate 'string s "," (%f (aref m (1+ i)))))) s))
 (defun %verts (vs)
@@ -107,9 +118,25 @@
 (defvar *frame* "")
 (defun %emit (line) (setq *frame* (concatenate 'string *frame* line (string (code-char 10)))))
 (defun flush () (when (> (length *frame*) 0) (cl-user::gui-cmd *frame*) (setq *frame* "")))
+(defun %num (n) (write-to-string n))
+
+;; Display lists: cache geometry on the page ONCE (new-list ... end-list), then
+;; each frame draw it with just the current matrix (call-list) — so the Lisp side
+;; rebuilds only the mvp per frame, not the whole vertex stream.  This is what
+;; keeps the demo fast even before the matrix code JIT-warms.
+(defvar *cap* nil)      ; the list id currently being compiled, or NIL
+(defvar *list-ctr* 0)
+(defun gen-lists (n) (declare (ignore n)) (incf *list-ctr*))
+(defun new-list (id &optional mode) (declare (ignore mode)) (setq *cap* id))
+(defun end-list () (setq *cap* nil))
+(defun call-list (id)
+  (%emit (concatenate 'string "gldrawlist" (%t) (%num id) (%t) (%mvp (m* *proj* *mv*)))))
+
 (defun end ()
-  (let ((tv (%tri *prim* (reverse *vs*))) (mvp (m* *proj* *mv*)))
-    (%emit (concatenate 'string "gldraw" (%t) (car tv) (%t) (%mvp mvp) (%t) (%verts (cdr tv))))))
+  (let ((tv (%tri *prim* (reverse *vs*))))
+    (if *cap*
+        (%emit (concatenate 'string "gllist" (%t) (%num *cap*) (%t) (car tv) (%t) (%verts (cdr tv))))
+        (%emit (concatenate 'string "gldraw" (%t) (car tv) (%t) (%mvp (m* *proj* *mv*)) (%t) (%verts (cdr tv)))))))
 (defun clear-color (r g b) (setq *cc* (list (float r 1.0) (float g 1.0) (float b 1.0))))
 (defun clear (&rest bits) (declare (ignore bits))
   (%emit (concatenate 'string "glclear" (%t) (%f (first *cc*)) (%t) (%f (second *cc*)) (%t) (%f (third *cc*)))))
@@ -133,23 +160,22 @@
 
 (defun glcube ()
   (gui-reset)
-  (gui-panel "OpenGL cube - cl-opengl immediate mode -> WebGL.  Esc to quit")
+  (gui-panel "OpenGL cube - cl-opengl display list -> WebGL.  Esc to quit")
   (gui-canvas 480 480)
   (gui-keys t)
-  (let ((angle 0.0) (done nil))
+  (let ((cube (gl:gen-lists 1)) (angle 0.0) (done nil))
+    (gl:new-list cube :compile) (draw-cube) (gl:end-list)   ; geometry uploaded ONCE
     (loop
       (when done (gui-keys nil) (gui-close) (return :bye))
-      (gui-wait 30)
+      (gui-wait 24)
       (dolist (ev (gui-events)) (when (key-down-p ev "Escape") (setq done t)))
       (setq angle (+ angle 1.6))
       (gl:clear-color 0.05 0.05 0.09)
       (gl:clear)
-      (gl:matrix-mode gl:+projection+) (gl:load-identity)
-      (gl:perspective 45.0 1.0 0.1 100.0)
+      (gl:matrix-mode gl:+projection+) (gl:load-identity) (gl:perspective 45.0 1.0 0.1 100.0)
       (gl:matrix-mode gl:+modelview+) (gl:load-identity)
-      (gl:translate 0.0 0.0 -5.0)
-      (gl:rotate angle 1.0 0.6 0.35)
-      (draw-cube)
+      (gl:translate 0.0 0.0 -5.0) (gl:rotate angle 1.0 0.6 0.35)
+      (gl:call-list cube)          ; per frame: just the matrix
       (gl:flush))))
 
 (format t "opengl.lisp loaded - run (glcube)~%")

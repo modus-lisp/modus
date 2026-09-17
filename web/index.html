@@ -593,6 +593,28 @@
       gl.drawArrays(mode === 'lines' ? gl.LINES : gl.TRIANGLES, 0, parts.length);
     } catch (e) { say('\n[gui: gl draw failed: ' + (e && e.message || e) + ']\n', 'err'); }
   };
+  // Display lists: cache geometry once (gllist), then draw it each frame with
+  // just a matrix (gldrawlist) — so the Lisp side rebuilds only the mvp, not the
+  // whole vertex stream, every frame.
+  const glLists = {};
+  const glCacheList = (id, mode, data) => {
+    const parts = data ? data.split(';').filter(Boolean) : [];
+    const verts = new Float32Array(parts.length * 6);
+    let o = 0; for (const v of parts) { const a = v.split(','); for (let i = 0; i < 6; i++) verts[o++] = +a[i]; }
+    glLists[id] = { mode, verts, n: parts.length };
+  };
+  const glDrawList = (id, mvp) => {
+    const L = glLists[id]; if (!gl || gl.isContextLost() || !glmProg || !L) return;
+    try {
+      gl.useProgram(glmProg); gl.enable(gl.DEPTH_TEST);
+      gl.uniformMatrix4fv(glmLoc.mvp, false, new Float32Array(mvp));
+      gl.bindBuffer(gl.ARRAY_BUFFER, glmBuf); gl.bufferData(gl.ARRAY_BUFFER, L.verts, gl.DYNAMIC_DRAW);
+      gl.enableVertexAttribArray(glmLoc.p); gl.enableVertexAttribArray(glmLoc.c);
+      gl.vertexAttribPointer(glmLoc.p, 3, gl.FLOAT, false, 24, 0);
+      gl.vertexAttribPointer(glmLoc.c, 3, gl.FLOAT, false, 24, 12);
+      gl.drawArrays(L.mode === 'lines' ? gl.LINES : gl.TRIANGLES, 0, L.n);
+    } catch (e) { say('\n[gui: gl list draw failed: ' + (e && e.message || e) + ']\n', 'err'); }
+  };
 
   const applyGui = (bytes) => {
     const text = dec.decode(bytes);
@@ -615,6 +637,8 @@
       else if (cmd === 'sprites') { glDrawSprites(f.slice(1).join('\t')); }
       else if (cmd === 'glclear') { glClearGL(+f[1], +f[2], +f[3]); }
       else if (cmd === 'gldraw') { glDrawGL(f[1], f[2].split(',').map(Number), f[3] || ''); }
+      else if (cmd === 'gllist') { glCacheList(f[1], f[2], f[3] || ''); }
+      else if (cmd === 'gldrawlist') { glDrawList(f[1], f[2].split(',').map(Number)); }
       else if (cmd === 'animate') { const on = f[1] === '1'; if (on && !rafOn) { rafOn = true; lastT = 0; requestAnimationFrame(tickLoop); } else if (!on) rafOn = false; }
       else if (cmd === 'keys') { setKeys(f[1] === '1'); }
       else if (cmd === 'close') { closePanel(); }

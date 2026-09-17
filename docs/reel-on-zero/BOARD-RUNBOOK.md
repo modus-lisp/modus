@@ -454,6 +454,36 @@ and `serial-pt.py` (read the L2 block entry for the buffer's VA and print its
 PA) settle it. If PA ≠ VA, the fix is to program the plane with the PA (or
 allocate display buffers from an identity-mapped region).
 
+`serial-white.py` result: **the screen went white.** Filling the same NC
+buffer's planes with Y=235/U=V=128 through the same blit and the same plane
+descriptor displays correctly, so VA = PA for the arena, the descriptor is
+right, and the blit reaches DRAM. (The page-table probe is moot and its
+numbers are unusable: `mem-ref :u64` of a descriptor prints as a tagged
+value.) The fault is between the decoded planes and that buffer:
+`rh-copy-planes` → `hvs-ncopy-nc`. Re-reading the garbage frame with this in
+hand: a strip of real rows on top, then the 0xFF the buffer already held —
+**the copy writes only a prefix of each plane.** The earlier CPU readback
+that "proved the copy correct" sampled row 32, inside that prefix.
+`rh-ceil64` is correct hosted; `serial-copy.py` pre-fills the buffer with a
+known byte, runs `rh-copy-planes`, and reads Y at rows 0…240 and the U/V
+starts against the source arrays to locate where the copy stops.
+
+`serial-copy.py` result: the copy is **complete and correct** — Y rows 0, 32,
+60, 100, 150, 200, 240 and the U/V starts all equal the source arrays
+(`rh-ceil64` right on the board too). So the "prefix" reading was wrong as
+well. Through the CPU's view the buffer holds the whole frame; the HVS shows
+that buffer when filled white; the HVS shows garbage for the frame. The only
+difference left between the two writes is the **cache**: if the block's
+non-cacheable remap (`hvs-map-nc`) is not actually in effect, the blit's
+stores sit in L2, the CPU reads them back from L2 (looks perfect) and the
+HVS reads stale DRAM — the pink 0xFF. Yesterday's buffers sat at
+`0x14880000`; today's blocks (`0x144…`, `0x14C…`) also hold JIT pages and
+the linkage cells, and a remap of a block that contains executing code may
+not take. `serial-cvac.py` runs the frame copy through `hvs-ncopy` (the
+cache-cleaning `DC CVAC` variant) on the live session and photographs both;
+a correct frame there both confirms the mechanism and is a usable fix
+(clean after the copy, or give display buffers their own 2 MB blocks).
+
 `serial-probe4.py` result: the **baked** `%net-fnv1a` returns 65470874 /
 1325675142 / 71127839 over 4096 / 65536 / 151295 bytes of the clip —
 host-identical, no fault. So the hypothesis above is wrong as stated: the

@@ -332,14 +332,14 @@ uninitialised NC buffer / unwritten chroma, with `jit-eager` or without.
 Decode is correct, so the decoded planes are not reaching the NC display
 buffers (`rh-copy-planes` → `rh-yuv-plane`), or the plane descriptor points
 elsewhere. `serial-probe.py` reads the NC buffer back after the copy.
-Result: source Y row `154 131 83 …`, NC buffer after `rh-copy-planes` =
-`154 154 154 154 154 154 154 154` — byte 0 copied, everything after it a
-broadcast of byte 0. Destination and source resolve correctly, so the fault
-is in the hand-assembled NC copy loop (`hvs-blit-nc-words :copy`, literal
-`LDP/STP q0,q1` words stored with `(setf (mem-ref p :u32) w)`, several
-≥ 2³¹) or in the NC mapping. `serial-probe2.py` reads the words back from
-the exec page and repeats the copy via `hvs-ncopy` and a `mem-ref` byte loop
-to separate the two.
+RETRACTED finding: the first probe read `154 ×8` at the buffer/array START
+and called it a broadcast. It is the plane's 32-pixel LEFT BORDER (each row
+begins with `+border+` copies of its first pixel); the visible pixels start at
+`picture-y-offset`. `serial-probe2.py` confirmed the blit's instruction words
+in the exec page equal the literal list, and the identical `mem-ref` loop is
+correct on the hosted CLI in every arm. **Compare at the visible offset**
+(`ptrs` returned by `rh-copy-planes` = `buf + y-offset`), never at the array
+start. Display fault still open; see `serial-probe3.py`.
 
 **QEMU-compiled core + HVS: re-push `rh-yuv-plane` before `rh-first-frame`.**
 Compiled under QEMU, `rh-yuv-plane`'s trailing HVS register read mis-tags the

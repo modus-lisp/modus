@@ -244,12 +244,40 @@ BUT the loop-filter CLI benchmarks were confounded and must not be trusted:
   inlined function (no runtime cross-calls) or the whole decoder from a jit-eager
   core, where the decode path's calls are all resolved native at build.
 
-NEXT (the honest number): rebuild the reel core with inter-neon + loopfilter-neon
-+ jit-eager, netboot to the Zero, re-run the A53 phase profile.  That measures
-MC + loop filter in the real decode with native cross-calls — the fps that
-matters.  %edge-mb (macroblock edge, 3-weight) is the remaining loop-filter
+### Honest CLI numbers (2026-09-17) — NEON edge-sub beats scalar, 1.65x on A76
+
+`modus:jit-eager` now takes an optional FORM (commit 0808b85): it makes every
+registered runtime DEFUN native, THEN compiles+runs FORM with the JIT forced on,
+so FORM's call sites bind to the native entries instead of trampolines.  With
+that, the loop-filter kernels measure clean on the Pi 5 (A76), 200000 calls:
+
+| kernel                         | time    | per call |
+|--------------------------------|---------|----------|
+| scalar `%edge-sub`             | ~231 ms | 1.15 us  |
+| NEON `%edge-sub` (calls h8)    | ~139 ms | 0.69 us  |
+| NEON `%edge-sub-h8` (raw)      | ~129 ms | 0.65 us  |
+
+NEON is **1.65x** scalar, and `%edge-sub` ≈ `%edge-sub-h8` proves the internal
+runtime-defun->runtime-defun call binds NATIVE (%jit-retry-drain works) — the
+earlier "nested calls interpret" fear was wrong.
+
+TWO measurement artifacts, now controlled, produced every earlier ~1x / ~40 us
+result — do not repeat them:
+1. an intermediate `bench-*` fn adds a trampoline layer with a ~40 us floor.
+   Time the kernel call INLINE in the jit-eager FORM, never via a helper.
+2. `jit-eager` re-runs `%jit-eager-all` (translate ALL modules) on EVERY call,
+   so the one-time translate cost lands on whichever FORM you time first.  Do a
+   bare `(modus:jit-eager)` warmup, THEN time each FORM.
+`jit-eager -> (46 46 4)`: the 4 non-native modules are `%INIT-GENERA-COMPAT` and
+three ASDF fns (pre-existing, unrelated), NOT the NEON kernels — every reel
+kernel translates, translate-err-count 0.
+
+NEXT (the fps that matters): rebuild the reel core with inter-neon +
+loopfilter-neon + jit-eager, netboot to the Zero, re-run the A53 phase profile.
+The A53 win should exceed the A76's 1.65x (weak scalar, relatively stronger
+NEON).  %edge-mb (macroblock edge, 3-weight) is the remaining loop-filter
 kernel; vp8-idct needs .4s transpose ops.
 
-Also: jit-eager is a runtime entry point in CL-USER like the rest of the Modus
-runtime API (ssh-boot, net-install-and-call…); a MODUS runtime package for the
-whole surface is a worthwhile separate cleanup.
+Also: jit-eager now lives in the MODUS package (0808b85).  A MODUS runtime
+package for the whole CL-USER runtime surface (ssh-boot, net-install-and-call…)
+is a worthwhile separate cleanup.

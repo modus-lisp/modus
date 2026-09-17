@@ -453,8 +453,17 @@ hence memory between stages, 8 rows per pass), and its filter runs in 8-bit
 lanes with saturating s8 arithmetic (16 lanes/op) where ours widens to s16×8.
 
 Fixes in order of payoff: (1) literal lane constants as MOVI/MVNI immediates
-(landed 2026-09-17, compiler dup path); (2) keep declared-fixnum locals in
-registers without tag checks (the bool decoder's problem too); (3) hold
+(landed 2026-09-17, compiler dup path; worth ~0.5 ms on the A53); (2) keep
+declared-fixnum locals in registers without tag checks (the bool decoder's
+problem too) — FIRST HALF LANDED 17a71c0: `compile-let*` stamped declared
+types only after all inits were compiled, so `(let* ((a …) (b (+ a k)))
+(declare (type fixnum a b)))` tag-tested `(+ a k)`; now each binding is
+stamped as it is made (declared type, else inferred width). `%lf-vtrans-in`:
+the 7 BOR/TEST/BNE triples are gone (ADD-CHECKED + overflow branch stay —
+trust is tag-only unless the result provably fits 61 bits); A76 full decode
+9707 → 9345 ms/48 frames. Acceptance gate 88580e3 → 17a71c0 (covers the
+TRN/MOVI commit too): PASS, NET=0 (17533 both), CHUNK-CRASH 0, FILE-WEDGE 30
+both sides. The frame spills (103 OBJ-REF) are the second half; (3) hold
 operand vectors across trees (register-resident let* bindings that survive
 the tree evaluator); (4) an s8 16-lane loop-filter kernel.
 

@@ -413,6 +413,16 @@ descriptor stores latch partially — slots whose old SRAM value already
 matched read "right". `serial-lit2.py` calls the restored `hvs-mair-words` /
 `hvs-blit-nc-words` and compares with host truth, then a fresh copy.
 
+`serial-lit2.py` result: the core-restored `hvs-mair-words`,
+`hvs-blit-nc-words` and `hvs-ppf-word` return the host-true words and are
+native. Large-literal materialisation is correct in restored pages too.
+**Word construction is now exonerated in every form** (fresh, `let*`, hosted,
+restored). What is left is the store itself under the NC window —
+`serial-win.py` writes known words to spare dlist slots under
+`(hvs-window-nc t)`, reads back under Device, and also tries a plain Device
+store, to see whether the remap takes and the stores land whole in a core
+session.
+
 `serial-probe4.py` result: the **baked** `%net-fnv1a` returns 65470874 /
 1325675142 / 71127839 over 4096 / 65536 / 151295 bytes of the clip —
 host-identical, no fault. So the hypothesis above is wrong as stated: the

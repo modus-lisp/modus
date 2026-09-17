@@ -176,6 +176,12 @@ $SSH '(reel-demo-load "http://10.0.0.1:8099/cam.ivf")'
 $SSH '(reel-demo-pass 4)'   # -> (FRAMES n TOTAL-MS t DECODE-MS d FPS f)
 ```
 
+- **Keep a serial tap running during every SSH phase**
+  (`serial-tap.py /home/modus/serial-install.log &`, killed before the serial
+  driver takes the port). A bare-metal fault is a silent spin; without the tap
+  a crash during `net-install-and-call` and a NIC wedge look identical (SSH
+  form never returns, board dark). The tap is the only place `FAULT`/`ESR` or
+  a load error will show up. `board-flow.sh` does this.
 - **Gate on the first reply.** `(+ 2 3)` must print `= 5` before anything
   else is sent. The `run` helper (and `zero-measure.sh`) discards SSH stderr,
   so a dead SSH server looks like thirty silently-empty forms and a

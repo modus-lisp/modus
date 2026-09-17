@@ -399,21 +399,25 @@ nothing touches the A53 PMU. What works:
 
 - **Wrapper timers (since linkage cells, 841f8ef).** Capture each coarse
   function's original with `symbol-function`, redefine it as a wrapper that
-  reads the 1 MHz system timer (`(mem-ref #x3F003004 :u32)`) around a
+  reads `(get-internal-real-time)` (CNTVCT-based, 1 000 000 units/s) around a
   `funcall` of the original, and accumulate. The decoder's precompiled
-  callers now hit the wrapper (before linkage cells they did not — that is
-  why `pi-mb.lisp` had to be a COPY of `decode-macroblocks` with `tick`
-  accumulators). Keep granularity at the macroblock level (≈240 calls/frame,
-  ~1 ms/frame overhead); a wrapper on a per-pixel kernel distorts everything.
+  callers now hit the wrapper — VERIFIED on the core 2026-09-17: a stub
+  `loop-filter-frame` was entered 90×/90 frames and decode fell 79.6 → 58.3
+  ms/frame (before linkage cells they did not — that is why `pi-mb.lisp` had
+  to be a COPY of `decode-macroblocks` with `tick` accumulators). Keep
+  granularity at the macroblock level (≈240 calls/frame, ~1 ms/frame
+  overhead); a wrapper on a per-pixel kernel distorts everything.
   `serial-prof.py` does this over serial on a live core.
+  **Do not use the BCM system timer (`(mem-ref #x3F003004 :u32)`): it reads
+  0 on this image** (native and interpreted alike; the first profile run
+  produced thirteen zeros that way).
 - The Pi 5 `perf` profile (`prof.lisp` + `perf-bucket.py`) is the fine-grained
   reference; the A53's phase split differs (in-order core), so use the board
   wrappers to weight it.
 - **Not yet built:** a PC-sampling profiler — an EL2 generic-timer interrupt
   capturing `ELR_EL2` into a ring, bucketed by the symbol map plus the JIT
   registry. Half a day; it would be the first true profile of the A53.
-- The 1 MHz timer wraps every 71 min; mask differences with
-  `(logand (- t1 t0) #xFFFFFFFF)`.
+- `get-internal-real-time` is a plain fixnum µs count; no wrap masking needed.
 
 ### A53 rules that decide tuning (BCM2710A1, Cortex-A53 @ 1 GHz, AArch64)
 
@@ -454,6 +458,25 @@ be matched: send `(list 4711 FORM)` and regex for `(4711 …)`. A stuck reader
 is freed by sending `)))))))))` then a throwaway `(+ 0 0)` (the next form
 after the unstick reads as an error). See `rh_core6.py` for a working driver.
 Loading reel over serial is impractical (163 KB at 4 ms/byte); use §6.
+
+**After every core restore, send `(init)` before the first `reel-demo-pass`.**
+`play-ivf` draws into the HDMI mailbox framebuffer that `(init)` allocates; on
+a freshly restored core that state is gone, and the first pass faults the
+board silently (three netboots lost to this on 2026-09-17 while the wrappers
+were being blamed). `serial-prof.py` / `serial-bisect.py` now send it.
+
+Two more rules, learned the hard way (2026-09-17, cost a 34-minute silent run):
+
+- **Never send a bare `(in-package :x)` over serial.** Its value is the
+  package object and the REPL prints the WHOLE symbol table (tens of KB at
+  115200 baud = many seconds). Any form sent "blind" during that print is
+  swallowed. `*package*` also stays switched for every later line. Qualify
+  names (`reel.decode::foo`) instead, or wrap: `(progn (in-package :x) nil)`.
+- **Never send forms blind with a fixed settle.** Every form goes through the
+  tagged `ev` and is matched before the next one is sent. A driver that
+  writes N forms then waits for the first tagged value will "hang" for the
+  sum of its timeouts when one definition was lost. `serial-prof.py` is the
+  reference shape.
 
 ## Baselines to compare against (A53, cam.ivf 320x180)
 

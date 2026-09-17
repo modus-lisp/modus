@@ -320,6 +320,27 @@ whether the NEON kernels are actually reached in that core (via the cells) has
 not been verified on the board. Treat it as a regression to bisect, not a
 NEON result.
 
+**Decode on the A53 with that core is CORRECT** (`serial-check.py`): frame-0
+`(w h Σy Σu first-8-Y)` on the board = `(320 180 9035032 2267981 (154 131 83
+112 125 130 58 92))`, identical to the hosted decode that is MD5-exact vs
+libvpx. So the slowness is real work done slowly, and the display fault
+below is not a decode fault.
+
+**Display shows garbage with that core** (`rh-first-frame` → HVS plane): a
+strip of RGB noise over a pink field with a faint periodic pattern =
+uninitialised NC buffer / unwritten chroma, with `jit-eager` or without.
+Decode is correct, so the decoded planes are not reaching the NC display
+buffers (`rh-copy-planes` → `rh-yuv-plane`), or the plane descriptor points
+elsewhere. `serial-probe.py` reads the NC buffer back after the copy.
+Result: source Y row `154 131 83 …`, NC buffer after `rh-copy-planes` =
+`154 154 154 154 154 154 154 154` — byte 0 copied, everything after it a
+broadcast of byte 0. Destination and source resolve correctly, so the fault
+is in the hand-assembled NC copy loop (`hvs-blit-nc-words :copy`, literal
+`LDP/STP q0,q1` words stored with `(setf (mem-ref p :u32) w)`, several
+≥ 2³¹) or in the NC mapping. `serial-probe2.py` reads the words back from
+the exec page and repeats the copy via `hvs-ncopy` and a `mem-ref` byte loop
+to separate the two.
+
 **QEMU-compiled core + HVS: re-push `rh-yuv-plane` before `rh-first-frame`.**
 Compiled under QEMU, `rh-yuv-plane`'s trailing HVS register read mis-tags the
 address and the first frame faults at FAR `0x7e800034` (the HVS *bus*

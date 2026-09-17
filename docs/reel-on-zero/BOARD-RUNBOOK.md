@@ -220,6 +220,37 @@ $SSH '(reel-demo-pass 4)'   # -> (FRAMES n TOTAL-MS t DECODE-MS d FPS f)
   Interpreted DEFUNs cost ~5 µs per loop iteration, so a measurement taken
   before `jit-eager` is meaningless.
 
+## 6b. Reading a `!!FAULT` line
+
+`!!FAULT E<esr> L<elr> F<far> S<sp>`. ESR `0x96000005` = data abort from
+EL1, translation fault; `0x86…` would be an instruction abort. The kernel is
+linked at the canonical VA `0x30000000` (`+rpi-cl-code-vaddr-base+`), so
+`ELR − 0x30000000` is the file offset in the raw `kernel8.img`, and
+
+```
+aarch64-linux-gnu-objdump -D -b binary -m aarch64 --adjust-vma=0x30000000 \
+    --start-address=$((ELR-0x40)) --stop-address=$((ELR+0x20)) kernel8.img
+```
+
+shows the faulting instruction. A build with `MODUS_SYMMAP=path` (same source
+⇒ byte-identical image, so it applies retroactively) names the function; its
+VAs are host-layout (`virtual-addr − native-offset` gives the code base), so
+match by native offset, not by the board VA.
+
+**OPEN (2026-09-17): `net-install-and-call` faults on the Zero with this
+image, scalar or NEON tarball alike, linkage cells on or off.** Tarball
+arrives intact; the `%net-fnv1a` verification loop runs ~60 KB, then faults at
+`ldur x17,[x19,#-9]` inside `GENERIC-MULTIPLY` — the header read of a
+tag-9 object — with x19 a garbage pointer that differs run to run. The hash
+accumulator never leaves fixnum range, so `*` should never reach generic
+multiply: `h` was corrupted mid-loop. The identical function is correct on the
+hosted aarch64 CLI, interpreted and native. Not the NEON files, not linkage
+cells; a bare-metal, timing/data-dependent corruption (GC-timing or the
+stale-DRAM class) somewhere in `e490440..0808b85` (jit-eager, SIMD 2b). The
+last image known to install over the network predates that series. Until it
+is bisected, put reel on the board via the QEMU core route (§8), which does
+not run this path.
+
 ## 7. Serial-only fallback (no `MODUS_SSH_BUILD`)
 
 The serial REPL prints **bare values** (no `= `). Tag every form so a reply can

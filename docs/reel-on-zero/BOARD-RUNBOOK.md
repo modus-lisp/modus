@@ -339,7 +339,32 @@ begins with `+border+` copies of its first pixel); the visible pixels start at
 in the exec page equal the literal list, and the identical `mem-ref` loop is
 correct on the hosted CLI in every arm. **Compare at the visible offset**
 (`ptrs` returned by `rh-copy-planes` = `buf + y-offset`), never at the array
-start. Display fault still open; see `serial-probe3.py`.
+start. `serial-probe3.py` result: NC buffer at the visible pointer =
+`(154 131 83 112 125 130 58 92)` = the decoded pixels — **the copy is
+correct**; the plane-scale arithmetic `ppf` = 1076537856 (host-identical);
+a JIT'd FNV over 4096 bytes = 65470874 (host-identical). So decode, copy and
+JIT'd integer arithmetic are all right on the board.
+
+What both open faults have in common is that they live in **baked** code
+(`%net-fnv1a` — canonical-VA PC — and the HVS descriptor writers
+`hvs-slot-wr32` / `hvs-upload-kernel` / `hvs-window-nc` in
+`net/hdmi-hvs.lisp`), compiled at build time by the new tree, whereas every
+passing probe above was JIT-compiled at runtime. Working hypothesis: a
+build-time codegen regression in `e490440..0808b85` that the runtime JIT
+does not share. `serial-probe4.py` calls the baked `%net-fnv1a` directly
+over 4 KB / 64 KB / the full clip against host truths.
+
+`serial-probe4.py` result: the **baked** `%net-fnv1a` returns 65470874 /
+1325675142 / 71127839 over 4096 / 65536 / 151295 bytes of the clip —
+host-identical, no fault. So the hypothesis above is wrong as stated: the
+baked loop is fine on a heap array called from the REPL. The install fault
+is specific to its context — the buffer `net-fetch-bytes` returns and a
+loop running with the net actor blocked — and the display fault is specific
+to the HVS descriptor path. Neither reproduces in isolation; both are
+parked. Every isolated probe on this core passes: decode (frame-0 stats),
+NC copy (visible offset), JIT'd and baked integer arithmetic, FNV full-length.
+The actionable regression is the **timing** (209 ms vs 137 ms), and that
+bisects on the hosted aarch64 CLI with `drv-neon.lisp` — no board needed.
 
 **QEMU-compiled core + HVS: re-push `rh-yuv-plane` before `rh-first-frame`.**
 Compiled under QEMU, `rh-yuv-plane`'s trailing HVS register read mis-tags the

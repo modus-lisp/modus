@@ -496,6 +496,21 @@ DISPLIST/active channel, plane pointers, offsets, strides, L2 entry, buffer
 readback, the firmware plane's own control words) for a full numeric diff
 against the new session — whatever differs is the cause.
 
+`serial-cmp.py` result: yesterday's session writes **identical** dlist words
+(only buffer addresses differ) and its readback shows the same HVS-owned
+slots; `hvs-all-forms.txt` is byte-identical between the two cores. And its
+photo under this probe is **colour bars** — the picture in the 2026-09-16
+19:52 photo. That is `small.ivf` (63792 bytes, what `qsave.py` loads), not
+cam.ivf. **The two sessions have never displayed the same clip**: the
+known-good core shows small.ivf; every new-core run shows cam.ivf. So the
+question may be "why does cam.ivf render as noise + pink" rather than "what
+regressed". A uniform white fill cannot reveal a stride/format problem;
+`serial-grad.py` writes a vertical luma gradient and a left/right split at
+the visible pointer of the same plane and photographs each — clean structure
+means the geometry is right and the fault is specific to the decoded data.
+(`*hvs-kernel-slot*` is unbound in yesterday's core: its forms define it
+differently — a probe artifact, not the cause.)
+
 `serial-probe4.py` result: the **baked** `%net-fnv1a` returns 65470874 /
 1325675142 / 71127839 over 4096 / 65536 / 151295 bytes of the clip —
 host-identical, no fault. So the hypothesis above is wrong as stated: the

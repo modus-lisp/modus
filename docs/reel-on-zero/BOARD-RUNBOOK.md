@@ -595,6 +595,19 @@ address and the first frame faults at FAR `0x7e800034` (the HVS *bus*
 address, unmapped). `rh_core6.py` / `serial-fast.py` re-define it over serial
 without that read first; then `rh-init` → `rh-first-frame` → `rh-play` work.
 
+**THE ZERO RAN AT 600 MHz (found 2026-09-17).** The firmware hands the ARM
+over at its idle clock; Linux's cpufreq governor is what raises it, and
+bare-metal Modus never asked. Mailbox `GET_CLOCK_RATE`(3) = 600000000 vs
+`GET_MAX_CLOCK_RATE`(3) = 1000000000. `SET_CLOCK_RATE`(3, max) in the same
+session: cam.ivf decode **208.6 → 125.6 ms/frame** (= 1000/600). Every
+bare-metal Zero number in this file above this line was taken at 600 MHz;
+scale accordingly. The image now raises the clock in kernel-main before
+`E2SMOKE` (`hdmi-arm-clock-max` in `net/hdmi-fb.lisp`) and prints
+`ARMCLK=<was>-><now>` on serial — **check that line on every boot**. All
+reel functions were confirmed native on the core (0 non-native), so the
+remaining Zero/A76 ratio (~5×) is architecture: a 1 GHz in-order core on
+branchy, call-heavy decode code, vs ~2.5× on straight loops.
+
 A76 (modus-pi hosted CLI) for scale: scalar 26 ms → NEON 24 ms on cam.ivf;
 scalar 13.3 → NEON 12.0 ms on the libvpx vector vp80-00-comprehensive-006.
 

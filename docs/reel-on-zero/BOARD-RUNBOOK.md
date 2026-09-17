@@ -398,7 +398,10 @@ Loading reel over serial is impractical (163 KB at 4 ms/byte); use §6.
 | scalar, on-board JIT, hot-only-NIL load | ~224 ms |
 | scalar, QEMU-built native core, jit-eager | ~137 ms |
 | scalar phase profile (eager core) | MB loop 98 (IDCT+add 30, tokens 25, MC 18, modes 18), loop filter 40, copy 3 |
-| **NEON + linkage cells, QEMU core (`reel-lc.core`, tree at `841f8ef`+), 2026-09-17** | **209 ms** (18774 ms / 90, three passes within 0.5%; `reel-demo-pass 4`, DECODE-MS) |
+| **NEON + linkage cells, QEMU core (`reel-lc.core`, tree at `841f8ef`+), 2026-09-17** | **209 ms** (18774 ms / 90, three passes within 0.5%; `reel-demo-pass 4`, DECODE-MS) — **at 600 MHz** |
+| same core, clock raised to 1 GHz | 125.6 ms |
+| **all cuts (reel `0423bfc`+`28e58c6`+`9f135bb`), `reel-clk.core`, 600 MHz** | 126.5 ms |
+| **all cuts, 1 GHz — current best, 2026-09-17** | **76.5 ms** (6947/6887/6886 ms per 90; `rh-play` in the same session reports 272 ms decode — under investigation) |
 
 **CORRECTION (2026-09-17 late):** the 137 ms figure was on `small.ivf`
 (`qsave.py` loads 63792 bytes = small.ivf), not cam.ivf. Rebooted with

@@ -540,6 +540,46 @@ not. Read `CTR_EL0`/`CCSIDR_EL1` for the real cache geometry.
   Until then: per-stage CYCLES via `pmu-cycles` (equivalent to `rdtsc`×52 at
   1 GHz; both exist), no IPC/branch-miss split.
 
+## 6f. Linux on the Zero over the same rig (the SBCL reference, and `perf`)
+
+`docs/reel-on-zero/zlinux/`: `build-initrd.sh` (busybox + the Pi 5's SBCL 2.5.2
++ its libs + reel + clips + benches → `initrd.gz`), `init` (network variant:
+`r8152.ko`, `eth0 10.0.0.2`, `nc -ll -p 2323 -e /bin/sh` — a shell on the
+wire, so everything after boot is `printf 'cmd; exit\n' | nc 10.0.0.2 2323`
+from modus-pi, no serial baking), `bench.lisp` (SBCL), `modus-bench.lisp`
+(hosted CLI), `netboot-linux.py` (U-Boot: TFTP RPi OS `kernel8.img` → `unzip`
+→ 0x01000000; initrd → 0x03000000; stock `bcm2710-rpi-zero-2-w.dtb` →
+0x02f00000 patched in U-Boot; `booti`). Kernel 6.18.39+rpt-rpi-v8 boots to
+4 cores at 1 000 000 kHz in ~7 s. Every one of these cost a boot:
+
+1. The firmware's fixed-up DTB at `fdt_addr` has BAD MAGIC by the time the
+   prompt appears (it sits where U-Boot relocates) — TFTP the stock dtb.
+2. The stock dtb's memory node is zero: `fdt memory 0 <size from bdinfo>`.
+3. The PL011 (`serial@7e201000`, wired to Bluetooth) probes, takes GPIO14/15,
+   and becomes `ttyAMA1`: `fdt set … status disabled`.
+4. The mini-UART's 8250 probe FAILS without the firmware's clock fixups and
+   its error path disables the AUX clock — killing the earlycon too: set
+   `serial@7e215040` status disabled (stock says okay) so no driver touches it.
+5. With nothing claiming the AUX clock, `clk: Disabling unused clocks` kills
+   the earlycon at ~5 s: `clk_ignore_unused` on the command line.
+6. No tty exists for the mini-UART, so userspace output goes through
+   `/dev/kmsg` (with `earlycon=uart8250,mmio32,0x3f215040 keep_bootcon`).
+7. `busybox --install -s /bin` first thing in `init`, or `insmod`/`ifconfig`/`nc`
+   are "not found" and you learn it one applet at a time.
+8. A remote `tar` without `-h` ships library SYMLINKS; `cp -L` of a dangling
+   link fails silently → `libzstd.so.1: cannot open` on the target. Copy the
+   `readlink -f` targets. (Replacing `libc.so.6` under a running dynamic
+   busybox kills the shell spawner — fix the tree and reboot instead.)
+9. The hosted Modus CLI mmaps a fixed 896 MB heap; on 415 MB of RAM the
+   kernel refuses it (`__vm_enough_memory … not enough memory`) and the stub
+   segfaults: `echo 1 > /proc/sys/vm/overcommit_memory` first. (A knob for the
+   heap size is owed.)
+
+Linux reported `hw perfevents: armv8_cortex_a53 PMU driver, 7 counters` — the
+event counters our bare-metal probe could not get to count. Next initramfs
+addition: `perf`, for a sampling profile of SBCL and of Modus-hosted on the
+exact silicon.
+
 ## 7. Serial-only fallback (no `MODUS_SSH_BUILD`)
 
 The serial REPL prints **bare values** (no `= `). Tag every form so a reply can
@@ -591,6 +631,7 @@ Two more rules, learned the hard way (2026-09-17, cost a 34-minute silent run):
 | + literal lane constants as MOVI/MVNI (modus `ba3ac19`, `reel-movi.core`) | decode **64.4 ms/frame**, loop filter 8 (unchanged at 1 ms resolution): the 62 DUP→MOVI conversions are correct but worth ~0.5 ms — the h8 kernel's time is in its ~200 real vector ops and the FP-MOV/reload traffic, not the constants. |
 | **+ LET* declared-type stamping (modus `17a71c0`, gate PASS NET=0; `reel-let.core`, 2026-09-17 late)** | decode **60.5 ms/frame** (5443/90 = 16.5 fps): MB loop 54 → 50 (luma16 14 → 12, chroma 11 → 10, glue), loop filter 8, **bool decoder still 15** — its state is `setq`-mutated, so no binding ever gets a trusted width; that is the register/frame-slot half of the codegen fix. |
 | **+ residual skip (reel `80a88c2`+`c02883c`: per-block NZ/AC flags, zero blocks skip IDCT+add, DC-only path; `reel-let3.core`, 2026-09-17 late)** | decode **49.2 ms/frame** (4427/90 = **20.3 fps**): MB loop 50 → 39 (luma16 12 → 4, chroma 10 → 7), residue 16, loop filter 8, copy 2. Intra paths had been running the IDCT + add on all 24 blocks of every MB. (First attempt with bit masks: 119 ms — see the variable-count ASH trap in §6e.) |
+| **SAME-SILICON LADDER (Zero 2 W, A53 @ 1 GHz, cam.ivf, 2026-09-17 late; Linux netbooted on the same rig, §6f)** | **SBCL 2.5.2: 18.4 ms/frame (54 fps)**; Modus hosted aarch64 CLI on that Linux: **52 ms/frame**; Modus bare-metal core (`reel-let3.core`): **49.2 ms/frame**. vp8-std: SBCL 12.6, Modus-Linux 43 (SBCL x86 on the build host: 1.29). So the bare-metal environment costs nothing (52 vs 49) and the entire gap is codegen: **Modus = 2.7× SBCL on identical silicon** — the honest compiler-gap figure. |
 | same, fast HVS path (`rh-play`, 2 MB-aligned `rh-init`) | **76.6 ms/frame total = 13 fps** (decode 6876 + copy 14 ms per 90); decode unchanged after `rh-init` (6885) and after play (6847) — the 272 ms was the pre-fix `rh-init` |
 
 **CORRECTION (2026-09-17 late):** the 137 ms figure was on `small.ivf`

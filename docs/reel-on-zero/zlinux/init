@@ -1,0 +1,16 @@
+#!/bin/sh
+export PATH=/bin:/usr/bin
+/bin/busybox --install -s /bin
+mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev 2>/dev/null
+say() { echo "ZL: $*" > /dev/kmsg; }
+say "=== ZLINUX UP === $(grep -m1 -E 'model name|Hardware|Model' /proc/cpuinfo) cpus=$(nproc)"
+for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -f $g ] && echo performance > $g; done
+[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq ] && say "cpu0 kHz: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq) (max $(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq))" || say "no cpufreq"
+insmod /lib/modules/r8152.ko 2>&1 | while read l; do say "insmod: $l"; done
+i=0; while [ $i -lt 40 ] && ! ifconfig eth0 >/dev/null 2>&1; do sleep 0.5; i=$((i+1)); done
+ifconfig eth0 10.0.0.2 netmask 255.255.255.0 up 2>&1 | while read l; do say "ifconfig: $l"; done
+say "eth0: $(ifconfig eth0 2>&1 | grep -E 'inet |HWaddr' | tr -s ' ' | tr '\n' ' ')"
+# shell server: every connection to 2323 gets /bin/sh (stdin/stdout on the socket)
+nc -ll -p 2323 -e /bin/sh &
+say "=== NET UP: nc -ll -p 2323 -e /bin/sh ==="
+while true; do sleep 60; done

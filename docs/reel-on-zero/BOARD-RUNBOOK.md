@@ -282,7 +282,15 @@ qemu-system-aarch64 -M raspi3b -kernel kernel8.img \
   `(%save-image "x.core")` → `CORE-END=<end>`, and
   `gdb … dump binary memory x.core 0x18000000 <end>`. Netboot with
   `netboot-core-gz.py --img <image>.gz --core x.core` (core in `/srv/tftp`).
-  `qcore.py` is the whole thing.
+  `qcore.py` is the whole thing (2026-09-17: install ≈ minutes, `jit-eager`
+  308 s under TCG, core 12.7 MB).
+- `(jit-eager)` returns `(INSTALLED MODULES FAILED)`; a handful of FAILED is
+  normal (`%INIT-GENERA-COMPAT` and three ASDF fns never translate).
+- `%jit-fn-native-p` keys by the SFT name string: a non-`CL-USER` symbol
+  needs its **qualified** name (`"REEL.DECODE::DECODE-FRAME"`); the bare
+  name returns NIL even when the function is native.
+- The core carries forms and clip but not board state: run `(init)` (HDMI
+  mailbox framebuffer) on the board before `reel-demo-pass`.
 
 ## 7. Serial-only fallback (no `MODUS_SSH_BUILD`)
 

@@ -203,6 +203,7 @@
     { file: 'calc.lisp', run: '(calc)', title: 'Calculator', desc: 'a DOM calculator' },
     { file: 'snake.lisp', run: '(snake)', title: 'Snake', desc: 'a WebGL game — swipe or arrow keys' },
     { file: 'opengl.lisp', run: '(glcube)', title: 'OpenGL cube', desc: 'cl-opengl immediate mode bridged to WebGL' },
+    { file: 'boids.lisp', run: '(boids)', title: 'Boids', desc: 'flocking in 3D — instanced cl-opengl draws', deps: ['opengl.lisp'] },
     { file: 'quicklisp.lisp', run: '', title: 'Quicklisp', desc: 'load a library with ql:quickload (offline)', bare: true },
   ];
   const sampView = document.getElementById('sampview');
@@ -211,14 +212,14 @@
   const svWhich = document.getElementById('svwhich');
   const srcCache = {};
   const fetchSrc = (f) => (f in srcCache ? Promise.resolve(srcCache[f]) : fetch('samples/' + f).then((r) => r.ok ? r.text() : null).catch(() => null).then((t) => (srcCache[f] = t)));
-  const runSample = async (file, run, bare) => {
+  const runSample = async (file, run, bare, deps) => {
     // if a sample is already running, its event loop is blocking the REPL; ask it
     // to exit (same as the panel's close) so the new LOAD can actually run.
     if (document.getElementById('gui').classList.contains('open')) document.getElementById('guiclose').click();
     status.textContent = 'loading sample ' + file + '…';
     // "bare" samples (e.g. the Quicklisp demo) run in the REPL and do not need
-    // the gui.lisp bridge.
-    const need = bare ? [file] : ['gui.lisp', file];
+    // the gui.lisp bridge.  deps (e.g. opengl.lisp for boids) load before the file.
+    const need = bare ? [file] : ['gui.lisp', ...(deps || []), file];
     for (const f of need) {
       const txt = await fetchSrc(f);
       if (txt == null) { say('sample: could not fetch samples/' + f + '\n', 'err'); return; }
@@ -259,7 +260,7 @@
   document.getElementById('svclose').addEventListener('click', () => sampView.classList.remove('open'));
   document.getElementById('svback').addEventListener('click', svShowList);
   svWhich.addEventListener('click', () => { if (svCurrent) svShowSource(svCurrent, svWhich.classList.contains('on') ? svCurrent.file : 'gui.lisp'); });
-  document.getElementById('svrun').addEventListener('click', () => { sampView.classList.remove('open'); if (svCurrent) runSample(svCurrent.file, svCurrent.run, svCurrent.bare); });
+  document.getElementById('svrun').addEventListener('click', () => { sampView.classList.remove('open'); if (svCurrent) runSample(svCurrent.file, svCurrent.run, svCurrent.bare, svCurrent.deps); });
   const takeFiles = async (list) => { for (const f of list) addFile(f.name, new Uint8Array(await f.arrayBuffer())); };
   document.getElementById('pick').addEventListener('change', (ev) => takeFiles(ev.target.files));
   document.body.addEventListener('dragover', (ev) => { ev.preventDefault(); document.body.classList.add('dragging'); });
@@ -601,19 +602,39 @@
     const parts = data ? data.split(';').filter(Boolean) : [];
     const verts = new Float32Array(parts.length * 6);
     let o = 0; for (const v of parts) { const a = v.split(','); for (let i = 0; i < 6; i++) verts[o++] = +a[i]; }
-    glLists[id] = { mode, verts, n: parts.length };
+    // upload once into the list's own GL buffer; draws just bind + set the matrix
+    const buf = (glLists[id] && glLists[id].buf) || (gl && gl.createBuffer());
+    if (gl && buf) { gl.bindBuffer(gl.ARRAY_BUFFER, buf); gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW); }
+    glLists[id] = { mode, buf, n: parts.length };
+  };
+  const glDrawBuf = (L, mvp) => {
+    gl.useProgram(glmProg); gl.enable(gl.DEPTH_TEST);
+    gl.uniformMatrix4fv(glmLoc.mvp, false, mvp instanceof Float32Array ? mvp : new Float32Array(mvp));
+    gl.bindBuffer(gl.ARRAY_BUFFER, L.buf);
+    gl.enableVertexAttribArray(glmLoc.p); gl.enableVertexAttribArray(glmLoc.c);
+    gl.vertexAttribPointer(glmLoc.p, 3, gl.FLOAT, false, 24, 0);
+    gl.vertexAttribPointer(glmLoc.c, 3, gl.FLOAT, false, 24, 12);
+    gl.drawArrays(L.mode === 'lines' ? gl.LINES : gl.TRIANGLES, 0, L.n);
   };
   const glDrawList = (id, mvp) => {
-    const L = glLists[id]; if (!gl || gl.isContextLost() || !glmProg || !L) return;
-    try {
-      gl.useProgram(glmProg); gl.enable(gl.DEPTH_TEST);
-      gl.uniformMatrix4fv(glmLoc.mvp, false, new Float32Array(mvp));
-      gl.bindBuffer(gl.ARRAY_BUFFER, glmBuf); gl.bufferData(gl.ARRAY_BUFFER, L.verts, gl.DYNAMIC_DRAW);
-      gl.enableVertexAttribArray(glmLoc.p); gl.enableVertexAttribArray(glmLoc.c);
-      gl.vertexAttribPointer(glmLoc.p, 3, gl.FLOAT, false, 24, 0);
-      gl.vertexAttribPointer(glmLoc.c, 3, gl.FLOAT, false, 24, 12);
-      gl.drawArrays(L.mode === 'lines' ? gl.LINES : gl.TRIANGLES, 0, L.n);
-    } catch (e) { say('\n[gui: gl list draw failed: ' + (e && e.message || e) + ']\n', 'err'); }
+    const L = glLists[id]; if (!gl || gl.isContextLost() || !glmProg || !L || !L.buf) return;
+    try { glDrawBuf(L, mvp); } catch (e) { say('\n[gui: gl list draw failed: ' + (e && e.message || e) + ']\n', 'err'); }
+  };
+  // Column-major 4x4 multiply, for instanced draws: the page holds proj*view and
+  // multiplies each object's model matrix on the GPU-bound side, so the Lisp
+  // side ships one cheap per-object model matrix (no matrix multiply at all).
+  let glPV = null;
+  const mul4 = (a, b) => {
+    const r = new Float32Array(16);
+    for (let c = 0; c < 4; c++) for (let row = 0; row < 4; row++) {
+      let s = 0; for (let k = 0; k < 4; k++) s += a[k * 4 + row] * b[c * 4 + k];
+      r[c * 4 + row] = s;
+    }
+    return r;
+  };
+  const glDrawModel = (id, model) => {
+    const L = glLists[id]; if (!gl || gl.isContextLost() || !glmProg || !L || !L.buf || !glPV) return;
+    try { glDrawBuf(L, mul4(glPV, model)); } catch (e) { say('\n[gui: gl model draw failed: ' + (e && e.message || e) + ']\n', 'err'); }
   };
 
   const applyGui = (bytes, floats) => {
@@ -643,6 +664,8 @@
         const mvp = (f[2] === 'f' && mats) ? mats.subarray(+f[3] >> 3, (+f[3] >> 3) + 16) : f[2].split(',').map(Number);
         glDrawList(f[1], mvp);
       }
+      else if (cmd === 'glpv') { if (mats) glPV = mats.slice(+f[2] >> 3, (+f[2] >> 3) + 16); }   // cache proj*view for instanced draws
+      else if (cmd === 'gldrawmodel') { if (mats) glDrawModel(f[1], mats.subarray(+f[3] >> 3, (+f[3] >> 3) + 16)); }
       else if (cmd === 'animate') { const on = f[1] === '1'; if (on && !rafOn) { rafOn = true; lastT = 0; requestAnimationFrame(tickLoop); } else if (!on) rafOn = false; }
       else if (cmd === 'keys') { setKeys(f[1] === '1'); }
       else if (cmd === 'close') { closePanel(); }

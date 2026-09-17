@@ -8,6 +8,7 @@
   (:export :clear-color :clear :matrix-mode :load-identity :push-matrix
            :pop-matrix :translate :rotate :scale :ortho :perspective
            :begin :end :vertex :color :flush :gen-lists :new-list :end-list :call-list
+           :pv! :draw-model :fbuf-slot :pack-at :clear-cmd :pv-line :model-line :blit
            :+projection+ :+modelview+ :+triangles+ :+quads+ :+lines+))
 (in-package :gl)
 
@@ -160,6 +161,37 @@
     (%mvp-bin (m* *proj* *mv*) off)
     (setq *foff* (+ off 128))
     (%emit (concatenate 'string "gldrawlist" (%t) (%num id) (%t) "f" (%t) (%num off)))))
+
+;; Instanced draws (for boids): the page holds proj*view and multiplies each
+;; object's model matrix itself, so the Lisp side never does a per-object m*.
+;; Each matrix occupies a 128-byte slot in +fbuf+ (16 doubles); the caller picks
+;; slots so they don't collide within a frame.  pv! reserves slot 0.
+;; The command LINE for a given (id, slot) is identical every frame -- only the
+;; matrix bytes change -- so build each line once and cache it.  Rebuilding it
+;; (write-to-string + concatenate) per object per frame dominated the render cost.
+(defun fbuf-slot (i) (* i 128))
+(defvar *pvcmd* nil)
+(defvar *mcmd* (make-hash-table :test 'eql))
+(defun pv! (m)   ; set proj*view for the frame (slot 0)
+  (%mvp-bin m 0)
+  (%emit (or *pvcmd* (setq *pvcmd* (concatenate 'string "glpv" (%t) "f" (%t) "0")))))
+(defun draw-model (id m slot)   ; draw list ID with model matrix M at the given slot
+  (%mvp-bin m (* slot 128))
+  (let ((key (+ (* id 1000) slot)))
+    (%emit (or (gethash key *mcmd*)
+               (setf (gethash key *mcmd*)
+                     (concatenate 'string "gldrawmodel" (%t) (%num id) (%t) "f" (%t) (%num (* slot 128))))))))
+
+;; When the whole command stream is constant across frames (fixed ids + slots)
+;; and only the matrix bytes change -- e.g. a boid flock -- pack the matrices
+;; into their slots, then blit a precomputed command block in one shot.  These
+;; build the (invariant) command LINES; the caller joins them with newlines once.
+(defun pack-at (m slot) (%mvp-bin m (* slot 128)))
+(defun clear-cmd (r g b)
+  (concatenate 'string "glclear" (%t) (%f (float r 1.0d0)) (%t) (%f (float g 1.0d0)) (%t) (%f (float b 1.0d0))))
+(defun pv-line () (concatenate 'string "glpv" (%t) "f" (%t) "0"))
+(defun model-line (id slot) (concatenate 'string "gldrawmodel" (%t) (%num id) (%t) "f" (%t) (%num (* slot 128))))
+(defun blit (block) (setq *frame* block) (flush))
 
 (defun end ()
   (let ((tv (%tri *prim* (reverse *vs*))))

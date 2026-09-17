@@ -116,7 +116,7 @@ class BrowserHost {
   // text formatting/parsing on either side.  Snapshotting here (not on the page)
   // is essential: linear memory is reused the instant this call returns.
   guiSend(m8, off, len) {
-    this.post({ type: 'gui', bytes: m8.slice(off, off + len), floats: m8.slice(0x15000, 0x15800).buffer });
+    this.post({ type: 'gui', bytes: m8.slice(off, off + len), floats: m8.slice(0x15000, 0x16000).buffer });
   }
   // page -> Lisp: copy queued event bytes into image memory, return the count.
   guiPoll(m8, off, max) {

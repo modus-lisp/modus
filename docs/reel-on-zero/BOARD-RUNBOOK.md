@@ -251,6 +251,33 @@ last image known to install over the network predates that series. Until it
 is bisected, put reel on the board via the QEMU core route (§8), which does
 not run this path.
 
+## 6c. The same image under QEMU raspi3b (core route, debugging)
+
+```
+qemu-system-aarch64 -M raspi3b -kernel kernel8.img \
+  -serial null -serial unix:q.sock,server,nowait -display none -no-reboot \
+  -device loader,file=reel.tar,addr=0x1a000000 -device loader,file=clip.ivf,addr=0x1b000000 \
+  -gdb tcp::1234
+```
+
+- **The board image talks on the mini-UART, which is QEMU raspi3b's SECOND
+  `-serial`.** The first is the PL011. Wire the first to `null`; a driver on
+  a socket attached to the first serial sees no banner and every form returns
+  empty while the guest sits in the mini-UART RX poll
+  (`ldur w18,[x17,#20]; tbz w18,#0,…` with x17 = `0x3F215040`).
+- `-serial unix:…,server,nowait` drops output emitted before a client
+  connects; start the driver as soon as the socket exists.
+- Silence is never evidence: `gdb-multiarch -batch -ex 'target remote :1234'
+  -ex 'info registers pc' -ex 'x/3i $pc'` tells you in seconds whether the
+  guest is spinning, faulted, or waiting for input. A stale QEMU from an old
+  session can hold :1234 (`ss -ltnp | grep 1234`).
+- Tar and clip are read out of RAM with `ramv` (`(ramv #x1a000000 <bytes>)`),
+  installed with `install-tarball-from-bytes`; then `jit-eager`,
+  `(%save-image "x.core")` → `CORE-END=<end>`, and
+  `gdb … dump binary memory x.core 0x18000000 <end>`. Netboot with
+  `netboot-core-gz.py --img <image>.gz --core x.core` (core in `/srv/tftp`).
+  `qcore.py` is the whole thing.
+
 ## 7. Serial-only fallback (no `MODUS_SSH_BUILD`)
 
 The serial REPL prints **bare values** (no `= `). Tag every form so a reply can

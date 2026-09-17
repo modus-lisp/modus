@@ -361,14 +361,20 @@ correct**; the plane-scale arithmetic `ppf` = 1076537856 (host-identical);
 a JIT'd FNV over 4096 bytes = 65470874 (host-identical). So decode, copy and
 JIT'd integer arithmetic are all right on the board.
 
-What both open faults have in common is that they live in **baked** code
-(`%net-fnv1a` — canonical-VA PC — and the HVS descriptor writers
-`hvs-slot-wr32` / `hvs-upload-kernel` / `hvs-window-nc` in
-`net/hdmi-hvs.lisp`), compiled at build time by the new tree, whereas every
-passing probe above was JIT-compiled at runtime. Working hypothesis: a
-build-time codegen regression in `e490440..0808b85` that the runtime JIT
-does not share. `serial-probe4.py` calls the baked `%net-fnv1a` directly
-over 4 KB / 64 KB / the full clip against host truths.
+**CORRECTION: the HVS functions are NOT baked into the board image.**
+`net/hdmi-hvs.lisp` is not part of `build-rpi-cl-repl`; on a plain image
+`(fboundp 'hvs-base)` → 0 and `*jit-on*` is unbound. Every HVS function
+exists only as a pushed form (`hvs-all-forms.txt`), JIT-compiled at runtime
+and, in a core, `jit-eager`'d under QEMU. So the whole display path is
+runtime-compiled code, and the one thing that differs between yesterday's
+working core and the new one on that path is linkage cells. (The
+`serial-static.py` probe was therefore invalid on both images: `??` on every
+form was `UNDEFINED-FUNCTION HVS-BASE`, and my driver's short tail hid the
+error — on a miss, print the whole reply.) `serial-dlist.py` reads the
+plane's dlist words back under the Device window after `rh-first-frame` to
+compare with what `rh-yuv-plane` should have written.
+`serial-probe4.py` calls the baked `%net-fnv1a` directly over 4 KB / 64 KB /
+the full clip against host truths.
 
 `serial-probe4.py` result: the **baked** `%net-fnv1a` returns 65470874 /
 1325675142 / 71127839 over 4096 / 65536 / 151295 bytes of the clip —

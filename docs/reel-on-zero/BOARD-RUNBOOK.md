@@ -192,8 +192,27 @@ $SSH '(reel-demo-pass 4)'   # -> (FRAMES n TOTAL-MS t DECODE-MS d FPS f)
   use `measure-only.sh` (everything after netboot) instead of re-netbooting.
 - `net-install-and-call` blocks the net actor while it loads, so the link
   looks dead during the install — that is expected, wait for it.
-- Set `*jit-hot-only*` NIL **before** the install, or the DEFUNs stay
-  interpreter trampolines (~5 µs per interpreted loop iteration).
+- **Do NOT set `*jit-hot-only*` NIL before the install.** With it NIL,
+  `net-install-and-call` eager-JITs every reel DEFUN as it loads (~16 min on
+  the A53) while `net-actor-main` is blocked, so USB polling stops, the host
+  side hits its NETDEV watchdog, and the board ends up with no ping, no SSH
+  and a dead serial console — a wedge that needs a reset (GPIO via
+  `netboot-gz.py`, or a power cycle if U-Boot then shows the RTL8153 as
+  `Device NOT ready`). Observed 2026-09-17: three good replies, then silence.
+- The order that works, and why (`board-flow.sh` + `serial-measure.py`):
+  1. **While the NIC is alive (SSH, default hot-only):** install reel (fast —
+     trampolines), push `demo-forms.txt`, `hvs-all-forms.txt`,
+     `reel-hvs-forms.txt`, `(init)`, and fetch the clip(s) into memory with
+     `reel-demo-load` / `rh-load`. Everything that needs the network happens
+     here.
+  2. **Then over serial** (nothing needs the network any more):
+     `(setq *jit-hot-only* nil)`, `(jit-eager)` — natively compiles every
+     registered reel DEFUN (the trampoline registry), the ~16 min the install
+     must not spend — then `(reel-demo-pass 4)` ×3 for `DECODE-MS`, then
+     `(rh-init)`, `(rh-first-frame)`, `(rh-play nil)` with the webcam
+     recording. Tagged forms, long timeouts (see §7).
+  Interpreted DEFUNs cost ~5 µs per loop iteration, so a measurement taken
+  before `jit-eager` is meaningless.
 
 ## 7. Serial-only fallback (no `MODUS_SSH_BUILD`)
 

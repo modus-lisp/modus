@@ -423,6 +423,18 @@ restored). What is left is the store itself under the NC window —
 store, to see whether the remap takes and the stores land whole in a core
 session.
 
+`serial-win.py` result: in the core session `(hvs-window-nc t)` populates
+`*hvs-attr*`, three known words written with `hvs-slot-wr32` read back whole
+under Device (`3233857728 305419896 305419896`), and even a plain
+Device-mapped store reads back whole. **Construction, literals, remap and
+stores are all correct.** That leaves my *expected* list for the
+`serial-dlist.py` readback as the suspect — it assumed a fixed
+`picture-y-offset` (12320) while the pointer arithmetic in the readback
+implies a different offset for that decode. `serial-diff.py` removes the
+assumption: same boot, `rh-yuv-plane` writes, an identical twin returns its
+`words`, the dlist is read back, and the two are diffed element by element,
+with a photo taken between.
+
 `serial-probe4.py` result: the **baked** `%net-fnv1a` returns 65470874 /
 1325675142 / 71127839 over 4096 / 65536 / 151295 bytes of the clip —
 host-identical, no fault. So the hypothesis above is wrong as stated: the

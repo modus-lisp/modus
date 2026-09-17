@@ -400,6 +400,19 @@ state a plain image never has — so a form JIT'd after the restore may emit
 constant-vector loads against a root/vector that is not the one its
 constants were placed in.
 
+`serial-lit-core.py` result: in the core session a **fresh** `words` defun
+is correct before and after `jit-eager`, and the hosted CLI is correct for
+the exact `let*` shape of `rh-yuv-plane` (`letstar.lisp`). So every way of
+*constructing* the words is right; the corruption is on the **write** path:
+`hvs-slot-wr32` / `hvs-window-nc` / `hvs-upload-kernel` are QEMU-compiled,
+core-restored functions built from large literals (the MAIR/blit instruction
+words `#xD5033F9F …`, `#x2000`). Hypothesis: large literals inside
+core-restored pages resolve wrong after the restore (the fresh-on-board pages
+are fine), so the MAIR exec page holds garbage, the NC remap never takes, and
+descriptor stores latch partially — slots whose old SRAM value already
+matched read "right". `serial-lit2.py` calls the restored `hvs-mair-words` /
+`hvs-blit-nc-words` and compares with host truth, then a fresh copy.
+
 `serial-probe4.py` result: the **baked** `%net-fnv1a` returns 65470874 /
 1325675142 / 71127839 over 4096 / 65536 / 151295 bytes of the clip —
 host-identical, no fault. So the hypothesis above is wrong as stated: the

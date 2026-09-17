@@ -484,6 +484,18 @@ cache-cleaning `DC CVAC` variant) on the live session and photographs both;
 a correct frame there both confirms the mechanism and is a usable fix
 (clean after the copy, or give display buffers their own 2 MB blocks).
 
+`serial-cvac.py` result: **still garbage** with the cache-cleaning copy, and
+the buffer's L2 entry reads `0x14C00709` (attribute index 2 = the NC remap
+is in effect). Cache theory dead. State of evidence in the new core session:
+descriptor = intended (verified word by word), buffer contents in DRAM =
+decoded planes (verified at rows 0…240 and U/V), NC remap in effect, blit
+reaches DRAM, and a white fill through the very same buffer + plane
+displays. No single-variable theory survives. `serial-cmp.py` runs the
+identical probe on yesterday's image + core (dlist words, kernel words,
+DISPLIST/active channel, plane pointers, offsets, strides, L2 entry, buffer
+readback, the firmware plane's own control words) for a full numeric diff
+against the new session — whatever differs is the cause.
+
 `serial-probe4.py` result: the **baked** `%net-fnv1a` returns 65470874 /
 1325675142 / 71127839 over 4096 / 65536 / 151295 bytes of the clip —
 host-identical, no fault. So the hypothesis above is wrong as stated: the

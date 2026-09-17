@@ -314,11 +314,27 @@ Loading reel over serial is impractical (163 KB at 4 ms/byte); use §6.
 | scalar phase profile (eager core) | MB loop 98 (IDCT+add 30, tokens 25, MC 18, modes 18), loop filter 40, copy 3 |
 | **NEON + linkage cells, QEMU core (`reel-lc.core`, tree at `841f8ef`+), 2026-09-17** | **209 ms** (18774 ms / 90, three passes within 0.5%; `reel-demo-pass 4`, DECODE-MS) |
 
-The 209 ms NEON figure is **slower than the 137 ms scalar core**. Not yet
-explained: the SIMD-2b series changed codegen for the whole image, and
-whether the NEON kernels are actually reached in that core (via the cells) has
-not been verified on the board. Treat it as a regression to bisect, not a
-NEON result.
+**CORRECTION (2026-09-17 late):** the 137 ms figure was on `small.ivf`
+(`qsave.py` loads 63792 bytes = small.ivf), not cam.ivf. Rebooted with
+yesterday's own `board-demo12.img.gz` + `reel-eager.core`, `rh-play` on
+cam.ivf today = **217 ms/frame** — identical to the NEON core's 218. So there
+is **no timing regression**; there is also no NEON gain on this clip on the
+A53. Compare like with like: same clip, same driver, same boot recipe.
+
+**The display regression IS real:** yesterday's image + core show cam.ivf's
+frames correctly on the HVS plane today (the clip is a webcam view of a dark
+room with a laptop terminal — do not mistake the decoded frame for the
+board's console); the new image + core show noise + pink. `hvs-all-forms.txt`
+is semantically identical to the baked `net/hdmi-hvs.lisp` (only docstrings /
+hex spelling differ), so late binding to stale pushed forms is not it.
+Hosted checks on the new tree of JIT'd `mem-ref :u32` stores of words ≥ 2³¹
+are exact. `serial-static.py` isolates the baked HVS writers with a
+solid-colour scaled plane and no reel at all.
+
+**Trap:** `(%mmap-exec-page N)` evaluated at top level or in an interpreted
+defun ECHOES N (interpreter arm). Get pages from a JIT'd defun
+(`*jit-hot-only*` NIL before the defun) or a baked one; a probe that got
+"page 4096" and then faulted on every `mem-ref` tested nothing.
 
 **Decode on the A53 with that core is CORRECT** (`serial-check.py`): frame-0
 `(w h Σy Σu first-8-Y)` on the board = `(320 180 9035032 2267981 (154 131 83

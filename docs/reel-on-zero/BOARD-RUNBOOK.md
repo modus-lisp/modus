@@ -476,6 +476,19 @@ completely (9345 → 9463 ms). 25-byte `u8vec` flag arrays cost nothing.
 Corollary: any per-block/per-pixel change must be judged on the A53, and a
 flat A76 number is not evidence of anything.
 
+**CORRECTION (2026-09-17 late): every hosted-A76 "DECODE-MS" figure quoted
+in this file from `md5time-*.lisp` (9502, 9707, 9345, 9423, 9463 ms per 48
+frames) is NOT decode time.** `internal-time-units-per-second` is 1000 on the
+hosted CLI and the harness spent 6.6 s in a `read-byte` loop loading the
+100 KB clip plus ~1 s writing I420, around ~0.3 s of decoding. Decode-only on
+the Pi 5 (`pi5-decode-only.lisp`, 3 passes, `modus-lc4-aa64`, tree at reel
+c02883c): **vp8-std 6.4 ms/frame, cam.ivf 9.1 ms/frame (~110 fps)**. So the
+A76 "no change" verdicts for the loop-filter and let* cuts were noise, and the
+"~150× slower than SBCL" remark was wrong: SBCL (x86, this host) decodes
+vp8-std at 1.29 ms/frame, Modus on the A76 at 6.4 — about 5×. The Zero at
+49.2 ms/frame is ~5.4× the Pi 5, consistent with the cores. Judge A76 changes
+with `pi5-decode-only.lisp`, never with the MD5 harness's clock.
+
 ### A53 rules that decide tuning (BCM2710A1, Cortex-A53 @ 1 GHz, AArch64)
 
 - **In-order, dual-issue with restrictions, 8-stage pipe.** Nothing hides

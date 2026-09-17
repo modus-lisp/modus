@@ -435,6 +435,25 @@ assumption: same boot, `rh-yuv-plane` writes, an identical twin returns its
 `words`, the dlist is read back, and the two are diffed element by element,
 with a photo taken between.
 
+`serial-diff.py` result: written list and readback are identical in every
+slot **except the six `#xC0C0C0C0` placeholders**, which read back as the
+three pointer words again plus small context values — those slots are
+**owned by the HVS** (it writes its per-plane context there after scanout).
+RETRACTED: the "literal words wrong" finding of `serial-dlist.py` was a
+misread of hardware-written slots. The descriptor is exactly what we intend.
+
+Reading the screen itself: a uniform pink YUV field is what the HVS renders
+from **all-0xFF memory** (Y=U=V=255 → magenta); the noise strip on top is a
+short run of real bytes before it. So the HVS is dereferencing a physical
+region that is not our buffer, while the CPU sees the right bytes at the same
+address: the plane pointer is built from the buffer's **VA** (JIT arena,
+`0x144xxxxx`) as if VA = PA. Yesterday's 20 MB image held that identity; the
+new 62 MB image (net + SSH stack) may map the arena elsewhere.
+`serial-white.py` (fill Y/U/V solid white through the same buffer and plane)
+and `serial-pt.py` (read the L2 block entry for the buffer's VA and print its
+PA) settle it. If PA ≠ VA, the fix is to program the plane with the PA (or
+allocate display buffers from an identity-mapped region).
+
 `serial-probe4.py` result: the **baked** `%net-fnv1a` returns 65470874 /
 1325675142 / 71127839 over 4096 / 65536 / 151295 bytes of the clip —
 host-identical, no fault. So the hypothesis above is wrong as stated: the

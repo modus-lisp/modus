@@ -15,9 +15,9 @@ tr -d '\0' < /home/modus/nb-measure.log | grep -aE "tftpboot try|Bytes transferr
 tr -d '\0' < /home/modus/nb-measure.log | grep -q NETUP || { echo "NO NETUP — abort"; exit 2; }
 for i in $(seq 1 30); do ping -c1 -W1 10.0.0.2 >/dev/null 2>&1 && { echo "PING ok"; break; }; sleep 2; done
 SSH="ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20 -o PreferredAuthentications=password -o PubkeyAuthentication=no test@10.0.0.2"
-run() { echo "--- $(echo "$1" | cut -c1-70)"; timeout ${2:-60} $SSH "$1" 2>/dev/null </dev/null | tr -d '\0' | grep -aE "^= " | cut -c1-200; }
+run() { echo "--- $(echo "$1" | cut -c1-70)"; timeout ${2:-60} $SSH "$1" 2>/dev/null </dev/null | tr -d '\0\r' | grep -aE "^= " | cut -c1-200; }
 echo "=== install reel ==="
-R0=$(timeout 60 $SSH '(+ 2 3)' 2>&1 </dev/null | tr -d '\0' | grep -aE '^= ' | head -1)
+R0=$(timeout 60 $SSH '(+ 2 3)' 2>&1 </dev/null | tr -d '\0\r' | grep -aE '^= ' | head -1)
 echo "--- (+ 2 3) => ${R0:-<no reply>}"
 [ "$R0" = "= 5" ] || { echo "SSH DEAD (no '= 5') — abort; run ssh -vv / serial-ssh-diag.py"; exit 3; }
 run '(setq *jit-hot-only* nil)'

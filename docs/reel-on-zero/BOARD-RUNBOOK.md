@@ -185,7 +185,11 @@ $SSH '(reel-demo-pass 4)'   # -> (FRAMES n TOTAL-MS t DECODE-MS d FPS f)
   the board faults or is simply silent.
 - **`DECODE-MS` is the number**: pure decode time, blit and flush excluded.
   Run `(reel-demo-pass 4)` three times; the first includes JIT warm-up.
-- SSH replies print as `= value`; `zero-measure.sh` greps `^= `.
+- SSH replies print as `= value` **followed by `\r\n`**; strip NULs and CRs
+  (`tr -d '\0\r'`) before comparing, or `[ "$R" = "= 5" ]` fails on `= 5\r`
+  and a working board looks dead. `zero-measure.sh` greps `^= `.
+- If the netboot succeeded but a later step failed, the board is still up:
+  use `measure-only.sh` (everything after netboot) instead of re-netbooting.
 - `net-install-and-call` blocks the net actor while it loads, so the link
   looks dead during the install — that is expected, wait for it.
 - Set `*jit-hot-only*` NIL **before** the install, or the DEFUNs stay

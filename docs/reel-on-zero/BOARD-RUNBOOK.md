@@ -459,11 +459,18 @@ is freed by sending `)))))))))` then a throwaway `(+ 0 0)` (the next form
 after the unstick reads as an error). See `rh_core6.py` for a working driver.
 Loading reel over serial is impractical (163 KB at 4 ms/byte); use §6.
 
-**After every core restore, send `(init)` before the first `reel-demo-pass`.**
-`play-ivf` draws into the HDMI mailbox framebuffer that `(init)` allocates; on
-a freshly restored core that state is gone, and the first pass faults the
-board silently (three netboots lost to this on 2026-09-17 while the wrappers
-were being blamed). `serial-prof.py` / `serial-bisect.py` now send it.
+**After every core restore, send `(init)` AND `(jit-eager)` before the first
+`reel-demo-pass`.** `play-ivf` draws into the HDMI mailbox framebuffer that
+`(init)` allocates, and `(jit-eager)` re-links the restored core (it reports
+`(4 4 4)` and takes seconds — it is NOT merely harmless: with `(init)` alone
+the first pass still faults the board silently). Five netboots were lost to
+this on 2026-09-17 while the timing wrappers were being blamed; the bisect
+(`serial-bisect.py`) with the full prelude ran base + 3 wrappers cleanly.
+`serial-prof.py` / `serial-bisect.py` send both. **And use `(reel-demo-pass 1)`
+on a restored core:** `(reel-demo-pass 4)` (4× scaled draw) faulted the board
+after `(init)`+`(jit-eager)` on two boots where scale 1 ran 14 passes clean
+(`serial-bisect2.py`); the scale-4 draw path's dependency is not identified.
+Decode-ms is scale-independent, so nothing is lost.
 
 Two more rules, learned the hard way (2026-09-17, cost a 34-minute silent run):
 
@@ -489,6 +496,7 @@ Two more rules, learned the hard way (2026-09-17, cost a 34-minute silent run):
 | same core, clock raised to 1 GHz | 125.6 ms |
 | **all cuts (reel `0423bfc`+`28e58c6`+`9f135bb`), `reel-clk.core`, 600 MHz** | 126.5 ms |
 | **all cuts, 1 GHz — current best, 2026-09-17** | **76.5 ms** (6947/6887/6886 ms per 90) |
+| **A53 PHASE SPLIT, all cuts, 1 GHz, wrapper timers (`serial-bisect2.py`, 2026-09-17 late; decode 77.5 ms/frame, +3% wrapper overhead)** | **MB loop 54** = decode-residue (bool/tokens+dequant) **15**, reconstruct-luma16 **14**, reconstruct-chroma **11**, predict-inter-mb 2, add-inter-residual 2, read-inter-modes 2, read-intra-modes 1, read-mb-modes 0, bpred 0 (none in clip), ~7 unattributed per-MB glue; **loop filter 20** (mb-filter-params 1); ref copy 2; header/rest ~1.5. Intra reconstruction (luma16+chroma = 25) + loop filter (20) + bool decoder (15) = 60 of 77.5. |
 | same, fast HVS path (`rh-play`, 2 MB-aligned `rh-init`) | **76.6 ms/frame total = 13 fps** (decode 6876 + copy 14 ms per 90); decode unchanged after `rh-init` (6885) and after play (6847) — the 272 ms was the pre-fix `rh-init` |
 
 **CORRECTION (2026-09-17 late):** the 137 ms figure was on `small.ivf`

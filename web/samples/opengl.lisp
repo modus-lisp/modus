@@ -64,18 +64,30 @@
 (defvar *prim* :triangles)
 (defvar *vs*   nil)
 (defvar *cc*   (list 0.0d0 0.0d0 0.0d0))
+;; Track whether each matrix is currently the identity, so the FIRST transform
+;; after load-identity is a plain store (I*M = M) instead of a 4x4 multiply.  The
+;; cube does perspective-on-identity and translate-on-identity every frame, so
+;; this drops the per-frame m* count from 4 to 2.
+(defvar *proj-id* t)
+(defvar *mv-id*   t)
 
 (defun cget () (if (eq *mm* :projection) *proj* *mv*))
 (defun cset (m) (if (eq *mm* :projection) (setq *proj* m) (setq *mv* m)))
+(defun cmul (m)   ; current := (if identity M else current*M); no longer identity
+  (if (eq *mm* :projection)
+      (setq *proj* (if *proj-id* m (m* *proj* m)) *proj-id* nil)
+      (setq *mv*   (if *mv-id*   m (m* *mv*   m)) *mv-id*   nil)))
 (defun matrix-mode (m) (setq *mm* m))
-(defun load-identity () (cset (midentity)))
+(defun load-identity ()
+  (if (eq *mm* :projection) (setq *proj* (midentity) *proj-id* t) (setq *mv* (midentity) *mv-id* t)))
 (defun push-matrix () (if (eq *mm* :projection) (push (copy-seq *proj*) *pstk*) (push (copy-seq *mv*) *mstk*)))
-(defun pop-matrix () (if (eq *mm* :projection) (setq *proj* (pop *pstk*)) (setq *mv* (pop *mstk*))))
-(defun translate (x y z) (cset (m* (cget) (m-translate x y z))))
-(defun rotate (deg x y z) (cset (m* (cget) (m-rotate deg x y z))))
-(defun scale (x y z) (cset (m* (cget) (m-scale x y z))))
-(defun perspective (fovy aspect near far) (cset (m* (cget) (m-perspective fovy aspect near far))))
-(defun ortho (l r b top near far) (cset (m* (cget) (m-ortho l r b top near far))))
+(defun pop-matrix ()  ; identity state of the restored matrix is unknown -> assume not
+  (if (eq *mm* :projection) (setq *proj* (pop *pstk*) *proj-id* nil) (setq *mv* (pop *mstk*) *mv-id* nil)))
+(defun translate (x y z) (cmul (m-translate x y z)))
+(defun rotate (deg x y z) (cmul (m-rotate deg x y z)))
+(defun scale (x y z) (cmul (m-scale x y z)))
+(defun perspective (fovy aspect near far) (cmul (m-perspective fovy aspect near far)))
+(defun ortho (l r b top near far) (cmul (m-ortho l r b top near far)))
 (defun color (r g b) (setq *col* (list (float r 1.0d0) (float g 1.0d0) (float b 1.0d0))))
 (defun begin (mode) (setq *prim* mode *vs* nil))
 (defun vertex (x y &optional (z 0.0d0))
@@ -154,9 +166,15 @@
     (if *cap*
         (%emit (concatenate 'string "gllist" (%t) (%num *cap*) (%t) (car tv) (%t) (%verts (cdr tv))))
         (%emit (concatenate 'string "gldraw" (%t) (car tv) (%t) (%mvp (m* *proj* *mv*)) (%t) (%verts (cdr tv)))))))
-(defun clear-color (r g b) (setq *cc* (list (float r 1.0d0) (float g 1.0d0) (float b 1.0d0))))
-(defun clear (&rest bits) (declare (ignore bits))
-  (%emit (concatenate 'string "glclear" (%t) (%f (first *cc*)) (%t) (%f (second *cc*)) (%t) (%f (third *cc*)))))
+;; The clear colour is almost always constant across frames, so cache its command
+;; line and only rebuild it (3 %f calls) when the colour actually changes.
+(defvar *cc-str* "glclear")
+(defun clear-color (r g b)
+  (let ((nc (list (float r 1.0d0) (float g 1.0d0) (float b 1.0d0))))
+    (unless (equal nc *cc*)
+      (setq *cc* nc
+            *cc-str* (concatenate 'string "glclear" (%t) (%f (first nc)) (%t) (%f (second nc)) (%t) (%f (third nc)))))))
+(defun clear (&rest bits) (declare (ignore bits)) (%emit *cc-str*))
 
 ;;; --- the demo: a rotating colored cube (in CL-USER) ------------------------
 (in-package :cl-user)
@@ -182,17 +200,22 @@
   (gui-keys t)
   (let ((cube (gl:gen-lists 1)) (angle 0.0d0) (done nil))
     (gl:new-list cube :compile) (draw-cube) (gl:end-list)   ; geometry uploaded ONCE
+    ;; Projection and camera are constant, so set them ONCE outside the loop and
+    ;; fold the camera translate into the projection matrix (perspective*translate).
+    ;; The per-frame modelview is then just the rotation on a fresh identity -- a
+    ;; plain store, no multiply -- so the whole frame costs a single 4x4 m*.
+    (gl:matrix-mode gl:+projection+) (gl:load-identity)
+    (gl:perspective 45.0d0 1.0d0 0.1d0 100.0d0) (gl:translate 0.0d0 0.0d0 -5.0d0)
+    (gl:matrix-mode gl:+modelview+)
     (loop
       (when done (gui-keys nil) (gui-close) (return :bye))
-      (gui-wait 24)
+      (gui-wait 16)
       (dolist (ev (gui-events)) (when (key-down-p ev "Escape") (setq done t)))
       (setq angle (+ angle 1.6d0))
       (gl:clear-color 0.05d0 0.05d0 0.09d0)
       (gl:clear)
-      (gl:matrix-mode gl:+projection+) (gl:load-identity) (gl:perspective 45.0d0 1.0d0 0.1d0 100.0d0)
-      (gl:matrix-mode gl:+modelview+) (gl:load-identity)
-      (gl:translate 0.0d0 0.0d0 -5.0d0) (gl:rotate angle 1.0d0 0.6d0 0.35d0)
-      (gl:call-list cube)          ; per frame: just the matrix
+      (gl:load-identity) (gl:rotate angle 1.0d0 0.6d0 0.35d0)   ; modelview = rotation only
+      (gl:call-list cube)          ; per frame: one m* (proj*camera) * rotation
       (gl:flush))))
 
 (format t "opengl.lisp loaded - run (glcube)~%")

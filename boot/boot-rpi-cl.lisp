@@ -475,7 +475,16 @@
     (emit-aarch64-u32 buf #xD5033FDF)              ; isb
     (emit-aarch64-u32 buf #xD5384249)              ; mrs x9, CurrentEL
     (emit-aarch64-u32 buf #xF100213F)              ; cmp x9, #8
-    (a64-bcond buf #b0001 6)                       ; b.ne +6 — enable EL2 only
+    (a64-bcond buf #b0001 10)                      ; b.ne +10 — enable EL2 only
+    ;; CPUECTLR_EL1.SMPEN (bit 6) — on Cortex-A53 the data caches take no
+    ;; effect until this is set; Linux sets it in __cpu_setup, U-Boot may or
+    ;; may not, the firmware-direct path never does.  Found 2026-09-17: the
+    ;; Zero 2 W ran the same decoder 9x slower than its clock ratio to an
+    ;; A76 explains.  Set it BEFORE the SCTLR enable below.
+    (emit-aarch64-u32 buf #xD539F22A)              ; mrs x10, s3_1_c15_c2_1 (CPUECTLR_EL1)
+    (emit-aarch64-u32 buf #xB27A014A)              ; orr x10, x10, #0x40 (SMPEN)
+    (emit-aarch64-u32 buf #xD519F22A)              ; msr s3_1_c15_c2_1, x10
+    (emit-aarch64-u32 buf #xD5033FDF)              ; isb
     (emit-aarch64-u32 buf #xD53C100A)              ; mrs x10, sctlr_el2
     (emit-aarch64-u32 buf #xD28200AB)              ; movz x11, #0x1005 (M|C|I)
     (emit-aarch64-u32 buf #xAA0B014A)              ; orr x10, x10, x11

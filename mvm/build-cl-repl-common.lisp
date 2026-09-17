@@ -1687,6 +1687,11 @@
   ;; %jit-constvec treats 0 as no-vector-installed, which is the safe state.
   (setf (mem-ref #x10000F10 :u64) 0)
   (setq *aarch64-jit-constvec-p* t)
+  ;; LINKAGE CELLS: proper CL late binding for out-of-module native CALLs, so a
+  ;; callee (re)definition (e.g. reel's -neon.lisp kernels replacing the scalar
+  ;; ones) is seen by precompiled callers.  Set here to defeat Limitation 7 on
+  ;; the board image, exactly as the sibling JIT flags above.
+  (setq *jit-linkage-cells* t)
   ~A
   ;; Seed the exec-page bump pointer THROUGH the same accessors the trap's
   ;; bare-metal arm reads, not through the Pi literals.  On :virt the literals
@@ -1771,6 +1776,14 @@
   ;; interpret works (including a defun in one form called from a later one)
   ;; BEFORE handing the machine to the user.  add=3 sqr=25 defcall=49
   ;; persist-call=36 persist-fn=45.
+  ;; ARM clock: the firmware hands over at its idle clock (600 MHz on a Zero 2 W);
+  ;; ask for the maximum before anything is timed.  Bounded mailbox spins, so
+  ;; QEMU (which answers 0) and a build without hdmi-fb.lisp cannot hang here.
+  (when (fboundp (quote hdmi-arm-clock-max))
+    (handler-case (let ((r (hdmi-arm-clock-max)))
+                    (write-string-serial \"ARMCLK=\") (print-dec (car r)) (write-string-serial \"->\")
+                    (print-dec (cadr r)) (write-char-serial 10))
+      (t (c) nil)))
   (write-string-serial \"E2SMOKE-START\") (write-char-serial 10)
   (write-string-serial \"add=\")
   (print-dec (handler-case (mvm-eval (quote (+ 1 2))) (t (c) -1)))

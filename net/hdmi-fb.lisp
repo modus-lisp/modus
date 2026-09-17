@@ -109,3 +109,41 @@
 ;;; step that QEMU-raspi3b could not.
 (defun hdmi-present ()
   (memory-barrier))
+
+;;; ---- ARM clock ---------------------------------------------------------
+;;; The firmware hands the ARM over at its IDLE clock (600 MHz on a Zero 2 W;
+;;; GET_CLOCK_RATE said 600000000 against a GET_MAX of 1000000000).  Linux's
+;;; cpufreq governor is what normally raises it; a bare-metal image must ask.
+;;; Found 2026-09-17: the reel decoder ran 1.67x slower than the same core at
+;;; its rated clock — every bare-metal Zero timing before this was at 600 MHz.
+;;; Property tags: GET_CLOCK_RATE #x30002, GET_MAX_CLOCK_RATE #x30004,
+;;; SET_CLOCK_RATE #x38002; clock id 3 = ARM.  Same mailbox protocol as the
+;;; framebuffer requests above.
+
+(defun hdmi-mbox-property-1 (tag a b)
+  "One property request with a 3-word value buffer (A B unused-or-0); returns the first
+   response word.  Blocks until the mailbox answers (bounded spins, as the FB path)."
+  (let ((buf (hdmi-mbox-buf)))
+    (hdmi-wr (+ buf 0) 36) (hdmi-wr (+ buf 4) 0)
+    (hdmi-wr (+ buf 8) tag) (hdmi-wr (+ buf 12) 12) (hdmi-wr (+ buf 16) 0)
+    (hdmi-wr (+ buf 20) a) (hdmi-wr (+ buf 24) b) (hdmi-wr (+ buf 28) 0)
+    (hdmi-wr (+ buf 32) 0)
+    (let ((i 0))
+      (loop (when (> i 1000000) (return nil))
+            (when (zerop (logand (hdmi-rd (+ (hdmi-mbox-base) #x18)) #x80000000)) (return nil))
+            (setq i (+ i 1))))
+    (hdmi-wr (hdmi-mbox-write) (logior (hdmi-mbox-buf-bus) 8))
+    (let ((i 0))
+      (loop (when (> i 1000000) (return nil))
+            (when (zerop (logand (hdmi-rd (hdmi-mbox-status)) #x40000000))
+              (hdmi-rd (hdmi-mbox-read)) (return nil))
+            (setq i (+ i 1))))
+    (hdmi-rd (+ buf 24))))
+
+(defun hdmi-arm-clock () (hdmi-mbox-property-1 #x30002 3 0))
+(defun hdmi-arm-clock-max-rate () (hdmi-mbox-property-1 #x30004 3 0))
+(defun hdmi-arm-clock-max ()
+  "Raise the ARM clock to the firmware's maximum; returns (was now)."
+  (let ((was (hdmi-arm-clock)) (max (hdmi-arm-clock-max-rate)))
+    (when (and (> max 0) (< was max)) (hdmi-mbox-property-1 #x38002 3 max))
+    (list was (hdmi-arm-clock))))

@@ -9615,7 +9615,14 @@
          ;; env for the later init's vector-tree recognition to see it.
          (fp-kinds (and (> n-bindings 0) (%let-fp-kinds bindings decl-body body env)))
          (n-fp 0)
-         (new-env env))
+         (new-env env)
+         ;; Declared types of THIS let*'s variables, scanned once up front so
+         ;; each binding is stamped as soon as it exists: a later init that
+         ;; uses an earlier fixnum-declared variable must see the declaration
+         ;; (stamping only after the loop left every `(let* ((a …) (b (+ a k)))
+         ;; (declare (type fixnum a b)))' with a tag test on (+ a k)).
+         (decl-types (%declared-types decl-body))
+         (later-inits (mapcar (lambda (b) (if (consp b) (cadr b) nil)) bindings)))
     (when (> n-bindings 0)
       (emit-ir :frame-alloc n-bindings))
     ;; Evaluate sequentially, extending env each time
@@ -9661,7 +9668,21 @@
                                     (compile-env-bindings new-env))
                     :stack-depth (+ (compile-env-stack-depth env) (+ i 1))
                     :parent (compile-env-parent new-env)
-                    :fn-names (compile-env-fn-names new-env)))))
+                    :fn-names (compile-env-fn-names new-env)))
+             ;; Eager dtype for the binding just made (see decl-types above):
+             ;; the declaration if there is one, else a provable init width
+             ;; when the variable is never assigned in the later inits or body.
+             (let ((bb (car (compile-env-bindings new-env)))
+                   (p (assoc var decl-types :test #'equal)))
+               (cond
+                 (p (setf (binding-dtype bb) (cdr p)))
+                 ((and val (or (integerp val) (symbolp val) (consp val)))
+                  (let ((w (%expr-width val new-env)))
+                    (when (and w (<= w 62)
+                               (null (collect-setq-vars-in-body
+                                      (cons 'progn (append (nthcdr (+ i 1) later-inits) body))
+                                      (list var))))
+                      (setf (binding-dtype bb) (list 'signed-byte w)))))))))
           (setq i (+ i 1)))))
     ;; Final env has correct stack depth
     (setf (compile-env-stack-depth new-env)

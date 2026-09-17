@@ -226,3 +226,30 @@ And always bench inside a native defun (the top-level dotimes is interpreted).
 
 Owed before main: ANSI gate on the compiler changes (bfa461b/e1ad202), and the
 A53 measurement of the combined kernels via a fresh reel core.
+
+### Measurement reality (2026-09-16 night) — NEON is fast; the CLI bench lied
+
+Settled with a micro-bench: `(defun vloop (d n) (dotimes (k n) (%vi-st16 d 0
+(%vi-add16 (%vi-ld16 d 0) (%vi-dup16 1)))))` runs 5,000,000 iterations in 62 ms
+on the Pi 5 = ~3 ns per vi op = genuine native NEON (interpreted would be
+~12,000 ms).  So the lane ops are fast and mc-filter's 1.5x was real native.
+
+BUT the loop-filter CLI benchmarks were confounded and must not be trusted:
+- `(funcall SYMBOL ...)` calls the interpreter TRAMPOLINE, not the native code,
+  even after the function is native — always call the bench fn directly.
+- a native caller's baked call to a runtime-defined callee does NOT update when
+  the callee later goes native (jit-eager / redefinition invisibility), so a
+  `bench -> %edge-sub -> %edge-sub-h8` chain interprets the inner calls (~34 us
+  /call, flat scalar vs vector).  The clean measurement is either a single
+  inlined function (no runtime cross-calls) or the whole decoder from a jit-eager
+  core, where the decode path's calls are all resolved native at build.
+
+NEXT (the honest number): rebuild the reel core with inter-neon + loopfilter-neon
++ jit-eager, netboot to the Zero, re-run the A53 phase profile.  That measures
+MC + loop filter in the real decode with native cross-calls — the fps that
+matters.  %edge-mb (macroblock edge, 3-weight) is the remaining loop-filter
+kernel; vp8-idct needs .4s transpose ops.
+
+Also: jit-eager is a runtime entry point in CL-USER like the rest of the Modus
+runtime API (ssh-boot, net-install-and-call…); a MODUS runtime package for the
+whole surface is a worthwhile separate cleanup.

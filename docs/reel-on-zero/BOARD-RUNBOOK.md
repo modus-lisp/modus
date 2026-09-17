@@ -391,6 +391,30 @@ qemu-system-aarch64 -M raspi3b -kernel kernel8.img \
   The `[q]emu` bracket only protects the pkill's own line. Kill stale
   processes in a separate command, then launch.
 
+## 6e. Profiling ON the board
+
+There is no sampling profiler on bare metal: `perf` exists only on the Pi 5's
+Linux; the board image has no IRQ handling (its IRQ vector is `B .`) and
+nothing touches the A53 PMU. What works:
+
+- **Wrapper timers (since linkage cells, 841f8ef).** Capture each coarse
+  function's original with `symbol-function`, redefine it as a wrapper that
+  reads the 1 MHz system timer (`(mem-ref #x3F003004 :u32)`) around a
+  `funcall` of the original, and accumulate. The decoder's precompiled
+  callers now hit the wrapper (before linkage cells they did not — that is
+  why `pi-mb.lisp` had to be a COPY of `decode-macroblocks` with `tick`
+  accumulators). Keep granularity at the macroblock level (≈240 calls/frame,
+  ~1 ms/frame overhead); a wrapper on a per-pixel kernel distorts everything.
+  `serial-prof.py` does this over serial on a live core.
+- The Pi 5 `perf` profile (`prof.lisp` + `perf-bucket.py`) is the fine-grained
+  reference; the A53's phase split differs (in-order core), so use the board
+  wrappers to weight it.
+- **Not yet built:** a PC-sampling profiler — an EL2 generic-timer interrupt
+  capturing `ELR_EL2` into a ring, bucketed by the symbol map plus the JIT
+  registry. Half a day; it would be the first true profile of the A53.
+- The 1 MHz timer wraps every 71 min; mask differences with
+  `(logand (- t1 t0) #xFFFFFFFF)`.
+
 ## 7. Serial-only fallback (no `MODUS_SSH_BUILD`)
 
 The serial REPL prints **bare values** (no `= `). Tag every form so a reply can

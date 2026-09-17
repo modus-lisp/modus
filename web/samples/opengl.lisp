@@ -13,40 +13,40 @@
 
 ;;; --- 4x4 matrices, column-major (WebGL order) ------------------------------
 (defun midentity ()
-  (make-array 16 :initial-contents '(1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0
-                                     0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0)))
+  (make-array 16 :initial-contents '(1.0d0 0.0d0 0.0d0 0.0d0 0.0d0 1.0d0 0.0d0 0.0d0
+                                     0.0d0 0.0d0 1.0d0 0.0d0 0.0d0 0.0d0 0.0d0 1.0d0)))
 (defun m* (a b)
   (let ((r (make-array 16)))
     (dotimes (col 4)
       (dotimes (row 4)
-        (let ((s 0.0))
+        (let ((s 0.0d0))
           (dotimes (k 4) (incf s (* (aref a (+ row (* k 4))) (aref b (+ k (* col 4))))))
           (setf (aref r (+ row (* col 4))) s))))
     r))
-(defun d2r (d) (* d (/ 3.14159265358979 180.0)))
+(defun d2r (d) (* d (/ 3.14159265358979d0 180.0d0)))
 (defun m-translate (x y z)
-  (let ((m (midentity))) (setf (aref m 12) (float x 1.0) (aref m 13) (float y 1.0) (aref m 14) (float z 1.0)) m))
+  (let ((m (midentity))) (setf (aref m 12) (float x 1.0d0) (aref m 13) (float y 1.0d0) (aref m 14) (float z 1.0d0)) m))
 (defun m-scale (x y z)
-  (let ((m (midentity))) (setf (aref m 0) (float x 1.0) (aref m 5) (float y 1.0) (aref m 10) (float z 1.0)) m))
+  (let ((m (midentity))) (setf (aref m 0) (float x 1.0d0) (aref m 5) (float y 1.0d0) (aref m 10) (float z 1.0d0)) m))
 (defun m-rotate (deg x y z)
   (let* ((a (d2r deg)) (c (cos a)) (s (sin a))
          (len (sqrt (+ (* x x) (* y y) (* z z)))) (x (/ x len)) (y (/ y len)) (z (/ z len))
-         (ic (- 1.0 c)) (m (midentity)))
+         (ic (- 1.0d0 c)) (m (midentity)))
     (setf (aref m 0) (+ c (* x x ic))   (aref m 1) (+ (* y x ic) (* z s)) (aref m 2) (- (* z x ic) (* y s))
           (aref m 4) (- (* x y ic) (* z s)) (aref m 5) (+ c (* y y ic))   (aref m 6) (+ (* z y ic) (* x s))
           (aref m 8) (+ (* x z ic) (* y s)) (aref m 9) (- (* y z ic) (* x s)) (aref m 10) (+ c (* z z ic)))
     m))
 (defun m-perspective (fovy aspect near far)
-  (let* ((f (/ 1.0 (tan (/ (d2r fovy) 2.0)))) (nf (/ 1.0 (- near far)))
-         (m (make-array 16 :initial-element 0.0)))
+  (let* ((f (/ 1.0d0 (tan (/ (d2r fovy) 2.0d0)))) (nf (/ 1.0d0 (- near far)))
+         (m (make-array 16 :initial-element 0.0d0)))
     (setf (aref m 0) (/ f aspect) (aref m 5) f (aref m 10) (* (+ far near) nf)
-          (aref m 11) -1.0 (aref m 14) (* 2.0 far near nf))
+          (aref m 11) -1.0d0 (aref m 14) (* 2.0d0 far near nf))
     m))
 (defun m-ortho (l r b top near far)
-  (let ((m (make-array 16 :initial-element 0.0)))
-    (setf (aref m 0) (/ 2.0 (- r l)) (aref m 5) (/ 2.0 (- top b)) (aref m 10) (/ -2.0 (- far near))
+  (let ((m (make-array 16 :initial-element 0.0d0)))
+    (setf (aref m 0) (/ 2.0d0 (- r l)) (aref m 5) (/ 2.0d0 (- top b)) (aref m 10) (/ -2.0d0 (- far near))
           (aref m 12) (- (/ (+ r l) (- r l))) (aref m 13) (- (/ (+ top b) (- top b)))
-          (aref m 14) (- (/ (+ far near) (- far near))) (aref m 15) 1.0)
+          (aref m 14) (- (/ (+ far near) (- far near))) (aref m 15) 1.0d0)
     m))
 
 ;;; --- immediate-mode state --------------------------------------------------
@@ -60,10 +60,10 @@
 (defvar *mm*   :modelview)
 (defvar *pstk* nil)
 (defvar *mstk* nil)
-(defvar *col*  (list 1.0 1.0 1.0))
+(defvar *col*  (list 1.0d0 1.0d0 1.0d0))
 (defvar *prim* :triangles)
 (defvar *vs*   nil)
-(defvar *cc*   (list 0.0 0.0 0.0))
+(defvar *cc*   (list 0.0d0 0.0d0 0.0d0))
 
 (defun cget () (if (eq *mm* :projection) *proj* *mv*))
 (defun cset (m) (if (eq *mm* :projection) (setq *proj* m) (setq *mv* m)))
@@ -76,10 +76,10 @@
 (defun scale (x y z) (cset (m* (cget) (m-scale x y z))))
 (defun perspective (fovy aspect near far) (cset (m* (cget) (m-perspective fovy aspect near far))))
 (defun ortho (l r b top near far) (cset (m* (cget) (m-ortho l r b top near far))))
-(defun color (r g b) (setq *col* (list (float r 1.0) (float g 1.0) (float b 1.0))))
+(defun color (r g b) (setq *col* (list (float r 1.0d0) (float g 1.0d0) (float b 1.0d0))))
 (defun begin (mode) (setq *prim* mode *vs* nil))
-(defun vertex (x y &optional (z 0.0))
-  (push (list (float x 1.0) (float y 1.0) (float z 1.0) (first *col*) (second *col*) (third *col*)) *vs*))
+(defun vertex (x y &optional (z 0.0d0))
+  (push (list (float x 1.0d0) (float y 1.0d0) (float z 1.0d0) (first *col*) (second *col*) (third *col*)) *vs*))
 
 ;;; --- send to the WebGL bridge ----------------------------------------------
 (defun %t () (string (code-char 9)))
@@ -87,9 +87,9 @@
 ;; printing (Steele-White) is the single most expensive thing this demo does per
 ;; frame, so we round to fixed-point and print integers instead.
 (defun %f (x)
-  (let* ((x (float x 1.0))
-         (neg (< x 0.0))
-         (n (round (* (if neg (- x) x) 10000.0)))
+  (let* ((x (float x 1.0d0))
+         (neg (< x 0.0d0))
+         (n (round (* (if neg (- x) x) 10000.0d0)))
          (ip (floor n 10000))
          (fp (mod n 10000))
          (fs (write-to-string fp)))
@@ -154,7 +154,7 @@
     (if *cap*
         (%emit (concatenate 'string "gllist" (%t) (%num *cap*) (%t) (car tv) (%t) (%verts (cdr tv))))
         (%emit (concatenate 'string "gldraw" (%t) (car tv) (%t) (%mvp (m* *proj* *mv*)) (%t) (%verts (cdr tv)))))))
-(defun clear-color (r g b) (setq *cc* (list (float r 1.0) (float g 1.0) (float b 1.0))))
+(defun clear-color (r g b) (setq *cc* (list (float r 1.0d0) (float g 1.0d0) (float b 1.0d0))))
 (defun clear (&rest bits) (declare (ignore bits))
   (%emit (concatenate 'string "glclear" (%t) (%f (first *cc*)) (%t) (%f (second *cc*)) (%t) (%f (third *cc*)))))
 
@@ -167,12 +167,12 @@
 
 (defun draw-cube ()
   (gl:begin gl:+quads+)
-  (%cube-quad 1.0 0.35 0.35  -1.0 -1.0  1.0   1.0 -1.0  1.0   1.0  1.0  1.0  -1.0  1.0  1.0) ; front
-  (%cube-quad 0.35 1.0 0.45  -1.0 -1.0 -1.0  -1.0  1.0 -1.0   1.0  1.0 -1.0   1.0 -1.0 -1.0) ; back
-  (%cube-quad 0.4 0.5 1.0    -1.0  1.0 -1.0  -1.0  1.0  1.0   1.0  1.0  1.0   1.0  1.0 -1.0) ; top
-  (%cube-quad 1.0 0.85 0.3   -1.0 -1.0 -1.0   1.0 -1.0 -1.0   1.0 -1.0  1.0  -1.0 -1.0  1.0) ; bottom
-  (%cube-quad 1.0 0.5 0.9     1.0 -1.0 -1.0   1.0  1.0 -1.0   1.0  1.0  1.0   1.0 -1.0  1.0) ; right
-  (%cube-quad 0.4 0.9 1.0    -1.0 -1.0 -1.0  -1.0 -1.0  1.0  -1.0  1.0  1.0  -1.0  1.0 -1.0) ; left
+  (%cube-quad 1.0d0 0.35d0 0.35d0  -1.0d0 -1.0d0  1.0d0   1.0d0 -1.0d0  1.0d0   1.0d0  1.0d0  1.0d0  -1.0d0  1.0d0  1.0d0) ; front
+  (%cube-quad 0.35d0 1.0d0 0.45d0  -1.0d0 -1.0d0 -1.0d0  -1.0d0  1.0d0 -1.0d0   1.0d0  1.0d0 -1.0d0   1.0d0 -1.0d0 -1.0d0) ; back
+  (%cube-quad 0.4d0 0.5d0 1.0d0    -1.0d0  1.0d0 -1.0d0  -1.0d0  1.0d0  1.0d0   1.0d0  1.0d0  1.0d0   1.0d0  1.0d0 -1.0d0) ; top
+  (%cube-quad 1.0d0 0.85d0 0.3d0   -1.0d0 -1.0d0 -1.0d0   1.0d0 -1.0d0 -1.0d0   1.0d0 -1.0d0  1.0d0  -1.0d0 -1.0d0  1.0d0) ; bottom
+  (%cube-quad 1.0d0 0.5d0 0.9d0     1.0d0 -1.0d0 -1.0d0   1.0d0  1.0d0 -1.0d0   1.0d0  1.0d0  1.0d0   1.0d0 -1.0d0  1.0d0) ; right
+  (%cube-quad 0.4d0 0.9d0 1.0d0    -1.0d0 -1.0d0 -1.0d0  -1.0d0 -1.0d0  1.0d0  -1.0d0  1.0d0  1.0d0  -1.0d0  1.0d0 -1.0d0) ; left
   (gl:end))
 
 (defun glcube ()
@@ -180,18 +180,18 @@
   (gui-panel "OpenGL cube - cl-opengl display list -> WebGL.  Esc to quit")
   (gui-canvas 480 480)
   (gui-keys t)
-  (let ((cube (gl:gen-lists 1)) (angle 0.0) (done nil))
+  (let ((cube (gl:gen-lists 1)) (angle 0.0d0) (done nil))
     (gl:new-list cube :compile) (draw-cube) (gl:end-list)   ; geometry uploaded ONCE
     (loop
       (when done (gui-keys nil) (gui-close) (return :bye))
       (gui-wait 24)
       (dolist (ev (gui-events)) (when (key-down-p ev "Escape") (setq done t)))
-      (setq angle (+ angle 1.6))
-      (gl:clear-color 0.05 0.05 0.09)
+      (setq angle (+ angle 1.6d0))
+      (gl:clear-color 0.05d0 0.05d0 0.09d0)
       (gl:clear)
-      (gl:matrix-mode gl:+projection+) (gl:load-identity) (gl:perspective 45.0 1.0 0.1 100.0)
+      (gl:matrix-mode gl:+projection+) (gl:load-identity) (gl:perspective 45.0d0 1.0d0 0.1d0 100.0d0)
       (gl:matrix-mode gl:+modelview+) (gl:load-identity)
-      (gl:translate 0.0 0.0 -5.0) (gl:rotate angle 1.0 0.6 0.35)
+      (gl:translate 0.0d0 0.0d0 -5.0d0) (gl:rotate angle 1.0d0 0.6d0 0.35d0)
       (gl:call-list cube)          ; per frame: just the matrix
       (gl:flush))))
 

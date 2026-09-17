@@ -376,6 +376,20 @@ compare with what `rh-yuv-plane` should have written.
 `serial-probe4.py` calls the baked `%net-fnv1a` directly over 4 KB / 64 KB /
 the full clip against host truths.
 
+**`serial-dlist.py` result (the first real signature):** reading the plane's
+30 dlist words back under the Device window after `rh-first-frame` on the
+new core: every *computed* word is right (control `0x5C000008`, position,
+`sw/sh`, strides, all `ppf` scale words, kernel slots, `0x80000000`), but
+every slot that should hold the **literal `#xC0C0C0C0`** holds garbage or a
+neighbouring pointer-like value (6 of 6), and the three `#xC0000000|ptr`
+words are wrong. The same `words` defun JIT'd on the hosted aarch64 CLI
+(`litrepro.lisp`) yields all 29 words correctly. `rh-yuv-plane` was
+re-pushed and JIT-compiled ON THE BOARD, so this is board-side JIT
+materialisation of large literals in the new tree, not the core restore.
+The constant-vector path (`e9a5aeb`, Aug 30) predates yesterday's working
+image, so it is not the change itself. `serial-lit.py` runs the same defun on
+the plain image (no reel, no core) — a 5-minute bisect probe.
+
 `serial-probe4.py` result: the **baked** `%net-fnv1a` returns 65470874 /
 1325675142 / 71127839 over 4096 / 65536 / 151295 bytes of the clip —
 host-identical, no fault. So the hypothesis above is wrong as stated: the

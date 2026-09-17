@@ -42,7 +42,9 @@ print("=== save ===",flush=True)
 s.sendall(b'(%save-image "reel-lc.core")\r\n'); out=rd_until(r"CORE-END=\d+",1800.0)
 m=re.search(r"CORE-END=(\d+)",out)
 if not m: print("NO CORE-END:",out[-300:]); sys.exit(1)
-end=int(m.group(1)); print("  core 0x18000000..%#x (%.1f MB)"%(end,(end-0x18000000)/1e6),flush=True)
+end=int(m.group(1))
+if end < 0x18000000: end = 0x18000000 + end   # CORE-END is sometimes a byte COUNT, not an end address
+print("  core 0x18000000..%#x (%.1f MB)"%(end,(end-0x18000000)/1e6),flush=True)
 g=subprocess.run(["gdb-multiarch","-q","-batch","-ex","set architecture aarch64","-ex","target remote :1234",
    "-ex","dump binary memory %s/reel-lc.core 0x18000000 %d"%(S,end),"-ex","detach"],capture_output=True,text=True)
 print("  gdb:",(g.stdout+g.stderr).strip()[-160:],flush=True)

@@ -348,6 +348,13 @@ qemu-system-aarch64 -M raspi3b -kernel kernel8.img \
   name returns NIL even when the function is native.
 - The core carries forms and clip but not board state: run `(init)` (HDMI
   mailbox framebuffer) on the board before `reel-demo-pass`.
+- **`CORE-END=` is sometimes an END ADDRESS and sometimes a BYTE COUNT.**
+  One QEMU save printed `415353680` (= `0x18C1CB50`, an address); the next,
+  same code, printed `41542766` (below `0x18000000`). Treat a value below
+  the core base as a count: dump `0x18000000 … 0x18000000+N`. A driver that
+  assumes an address computes a negative range and gdb refuses. QEMU keeps
+  the saved image in memory after the driver exits — when detached
+  (`setsid nohup`) you can re-dump without rebuilding.
 - **`(jit-eager)` on the board after the core restore is mandatory before
   any timing**, even though it reports only `(3 3 4)`. Same core, same
   clip: `rh-play` without it = 3309 ms/frame; with it = 218 ms/frame

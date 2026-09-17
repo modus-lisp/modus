@@ -640,6 +640,15 @@ reel functions were confirmed native on the core (0 non-native), so the
 remaining Zero/A76 ratio (~5×) is architecture: a 1 GHz in-order core on
 branchy, call-heavy decode code, vs ~2.5× on straight loops.
 
+**A core-restore boot skips kernel-main's init** (`*cli-arch-core-resume*`
+runs instead), so cores built against images before the resume-path fix come
+up at 600 MHz even though the image prints `ARMCLK=` on a fresh boot — the
+serial driver must send `(hdmi-arm-clock-max)` before timing (`serial-measure2.py`
+does). Verified 2026-09-17: `reel-clk.core` (all cuts: typed reconstruct,
+packed-s16 IDCT + NEON adders, NEON %edge-mb) on the Zero **at 600 MHz =
+126.5 ms/frame** (3 passes: 11471/11384/11389 ms per 90), vs 208.6 this
+morning on the same clock — 1.65×, matching the A76's 24 → 14 ms.
+
 A76 (modus-pi hosted CLI) for scale: scalar 26 ms → NEON 24 ms on cam.ivf;
 scalar 13.3 → NEON 12.0 ms on the libvpx vector vp80-00-comprehensive-006.
 

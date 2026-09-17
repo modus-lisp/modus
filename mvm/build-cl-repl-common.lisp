@@ -1748,6 +1748,14 @@
   (if *cl-repl-rpi-p*
       (concatenate 'string
         "    (write-string-serial \"CORE-RESTORED\") (write-char-serial 10)
+    ;; A restored core skips boot init, so raise the ARM clock here too (the
+    ;; firmware idles at 600 MHz on a Zero 2 W); same guarded call as the
+    ;; fresh-boot path before E2SMOKE.
+    (when (fboundp (quote hdmi-arm-clock-max))
+      (handler-case (let ((r (hdmi-arm-clock-max)))
+                      (write-string-serial \"ARMCLK=\") (print-dec (car r)) (write-string-serial \"->\")
+                      (print-dec (cadr r)) (write-char-serial 10))
+        (t (c) nil)))
 "       *net-pipeline-call*
         ;; SHIP JIT=1: a restored core adopts the SAME JIT default as a fresh
         ;; boot (*jit-on*) instead of being forced OFF.  The historical forced-

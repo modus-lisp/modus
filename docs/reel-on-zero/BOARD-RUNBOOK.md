@@ -18,6 +18,48 @@ its failure mode observed; the gotchas are the ones that actually bit.
 | netboot driver | `/home/modus/netboot-gz.py` (retries TFTP over the flaky RTL8153) |
 | measurement forms | `/home/modus/demo-forms.txt` (HDMI init, `play-ivf`, `reel-demo-pass`) |
 
+## 0. The narrow path: build → deploy → tweak
+
+This is the whole loop. Do it in this order, check each marker, and do not
+improvise around a failed step — every detour taken so far led to a wrong
+conclusion about the hardware.
+
+```
+edit modus            → build image (15 min)  → strings|grep ssh-boot ≠ 0 → gzip
+edit reel             → rebuild tar (seconds)   (or push the changed defun live)
+stage                 → sudo -n cp → /srv/tftp  → ls -la /srv/tftp/<img>   (MUST print)
+serve                 → python3 -m http.server 8099 in /home/modus (tar + clips)
+boot                  → netboot-gz.py --img <img> --send '(ssh-boot)' ; markers below
+sanity                → ssh test@10.0.0.2 '(+ 2 3)'  →  "= 5\r"
+tweak                 → push forms over SSH (NIC alive) / serial; late binding is real now
+measure               → reel-demo-pass / rh-play over serial after (jit-eager)
+```
+
+What to rebuild for a given change:
+
+| you changed | rebuild | redeploy |
+|---|---|---|
+| a Lisp function (reel or demo/HVS forms) | nothing | push the defun over SSH/serial — with linkage cells the board's precompiled callers pick it up |
+| reel source that the tar carries | `tar cf` (seconds) | re-serve; `net-install-and-call` again, or the core route |
+| anything in modus (compiler, JIT, runtime, boot) | `build-rpi-cl-repl.lisp` (15 min) | gzip → `sudo -n cp` → `ls` → netboot |
+| the clip | nothing | drop it in `/home/modus`, `reel-demo-load` / `rh-load` |
+
+### Symptom → meaning (read this before blaming the board)
+
+| what you see | what it means | what to do |
+|---|---|---|
+| U-Boot: `TFTP error: 'File not found' (1)` right after `host 10.0.0.1 is alive` | **the file is not in `/srv/tftp`**. Nothing is flaky. The dir is root-owned; a plain `cp` failed silently | `sudo -n cp … /srv/tftp/ && ls -la /srv/tftp/<img>`; only retry the boot once `ls` prints it |
+| `scanning bus usb@7e980000 for devices... Device NOT ready` / `Request Sense returned 02 3A 00` during `usb start` | the RTL8153 enumerating slowly. **Normal**; every successful boot today printed it | nothing — the script's ping/`usb reset` loop handles it |
+| `Rx: failed to receive: -5` inside a transfer | the dongle dropped packets mid-TFTP | the script retries with `usb stop/start`, up to `--tftp-tries` |
+| `=== TFTP FAILED after retries ===` **with** the file staged | the dongle is wedged | power-cycle the Zero (the physical switch); a GPIO reset does not clear it |
+| `U-Boot>` prompt right after reset | autoboot was interrupted by input on the serial line | for netboot that is **intended** (see §4); for a normal boot it means something else is writing to `/dev/ttyAMA0` — a leftover tap or driver |
+| `Modus CL REPL` then `(ssh-boot)` → `UNDEFINED-FUNCTION` | the image has no network stack | rebuild with `MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1` |
+| `NET-PIPELINE-START … TCP:F … LIB-FETCH-FAIL` before the REPL | the boot-time auto pipeline ran and poisoned TCP; ping works, SSH dies at KEX | rebuild with `MODUS_NET_NOAUTO=1` |
+| `NETUP`, ping OK, SSH `(+ 2 3)` prints nothing | you compared `= 5` against `= 5\r`, or SSH really is dead | strip `\r`; if still empty, `ssh -vv` and `serial-ssh-diag.py` |
+| a form returns `??` / empty in a serial driver | the REPL answered with an ERROR your regex did not match, or the guest is still booting | print the whole reply; wait for the banner first |
+| silence after `go` | nothing — the guest may be booting (minutes under TCG), spinning, or waiting for input | gdb on QEMU; on the board, send-then-read one tagged form; never infer from silence |
+| a "garbage" frame on the HVS | possibly the clip | render the same frame with the hosted decoder and look at it first |
+
 ## 1. Build the board image
 
 From the modus tree (branch with your changes):
@@ -123,8 +165,20 @@ Then confirm the link from modus-pi: `ping -c1 -W1 10.0.0.2`.
 
 - **The wrapper only summarizes at the end.** While it runs, watch the live
   log: `tr -d '\0' < nb.log | grep -aE 'tftpboot try|Bytes transferred|Uncompressed|Modus CL|NETUP|FAULT|ESR'`.
-- **Never type into the serial port while Modus is booting** — input during
-  boot wedges the reader.
+- **Serial input has two opposite rules, by phase.** U-Boot's autoboot
+  window is 2 s (`Hit any key to stop autoboot: 2 0`); `netboot-gz.py`
+  deliberately streams `\r` for the first 9 s after the GPIO reset
+  precisely to interrupt it and land on `U-Boot>` — the repeated blank
+  `U-Boot>` prompts in the log are those carriage returns, not a problem.
+  After `go 0x300000`, the opposite: **send nothing until `Modus CL REPL`
+  appears** — a byte that arrives while Modus initialises its reader wedges
+  it (symptom: a live board that answers nothing). If a plain reset (no
+  netboot) lands on `U-Boot>` instead of booting, some process was writing
+  to the port during those 2 s.
+- **One reader on `/dev/ttyAMA0` at a time.** `netboot-gz.py`, the serial
+  drivers and `serial-tap.py` all open the port; two at once split the bytes
+  and both see garbage. Kill the tap before a driver starts, and never run a
+  driver while `netboot-gz.py` is still in its `--send-delay` wait.
 - `Device NOT ready` / `Request Sense 02 3A 00` from the DWC2 scan is the
   RTL8153 dongle; the retry loop usually clears it, a wedged dongle needs a
   **full power cycle** of the Zero (the physical switch), not a GPIO reset.

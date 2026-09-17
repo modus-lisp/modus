@@ -342,6 +342,18 @@ defun ECHOES N (interpreter arm). Get pages from a JIT'd defun
 libvpx. So the slowness is real work done slowly, and the display fault
 below is not a decode fault.
 
+**RESOLVED 2026-09-17: there was no display fault.** The hosted decoder
+(MD5-exact vs libvpx) renders cam.ivf frame 0 as exactly the "noise strip
+over a pink field" the board showed (`cam0.png`): that IS the clip's first
+frame. Yesterday's core carries `small.ivf` (colour bars); the new core
+carries `cam.ivf`; the two were never showing the same picture. Every probe
+below passed because the pipeline was correct: descriptor, buffer, remap,
+blit, stride/format (a luma gradient and a left/right split both render
+cleanly on the new core). **Rule: before calling a board frame "garbage",
+render the same frame with the hosted decoder and look at it.** That one
+step would have saved the entire investigation below, which is kept as a
+record of what each probe establishes.
+
 **Display shows garbage with that core** (`rh-first-frame` → HVS plane): a
 strip of RGB noise over a pink field with a faint periodic pattern =
 uninitialised NC buffer / unwritten chroma, with `jit-eager` or without.

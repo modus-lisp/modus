@@ -354,6 +354,28 @@ qemu-system-aarch64 -M raspi3b -kernel kernel8.img \
   (`reel-demo-pass` 209). A restored core's decode path is not fully native
   until that call runs.
 
+## 6d. Kernel-porting lessons (NEON layer 2b, 2026-09-17)
+
+- **Only u8 arrays are packed.** `(signed-byte 32)`, `(signed-byte 16)` and
+  `(unsigned-byte 16)` arrays are 8-byte tagged words (`layout.lisp`: 1 → 2,
+  −2 → …FC). A lane load of such an array reads tagged fixnums, so a
+  kernel can be *fast and wrong* (add-residual: 17 ms, 400/400 mismatches).
+  Route non-byte data through a u8 scratch (`vp8-idct-s16`).
+- `%vi-ld*/%vi-st*` need a **declared u8 array**, a call-free index and a
+  tree that fits the 12-register pool; a deep `bsl(bsl(…))` store tree fails
+  the checker — reload cheap operands with `%vld` at use instead of binding
+  them (`%edge-mb-h8` went from 8 bindings to 5).
+- **Match the scalar's operation order exactly**: `c8((27w+63)>>7)` is not
+  `c8(27w+63)>>7`. The first `%edge-mb` passed 24 synthetic cases and failed
+  the libvpx MD5 at frame 9 because those cases' `hthr` 0–2 never reached the
+  non-hev branch. **A bit-exact probe must span every threshold regime; the
+  libvpx vector MD5 is the real gate** — run it for every kernel.
+- Python `%`-formatting eats `%v` in `%vc8` — use `.replace`.
+- `pkill -f PATTERN` also matches a shell whose command string merely
+  *contains* PATTERN later — e.g. the QEMU launch line in the same `bash -c`.
+  The `[q]emu` bracket only protects the pkill's own line. Kill stale
+  processes in a separate command, then launch.
+
 ## 7. Serial-only fallback (no `MODUS_SSH_BUILD`)
 
 The serial REPL prints **bare values** (no `= `). Tag every form so a reply can

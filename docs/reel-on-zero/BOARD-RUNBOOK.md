@@ -355,11 +355,19 @@ qemu-system-aarch64 -M raspi3b -kernel kernel8.img \
   assumes an address computes a negative range and gdb refuses. QEMU keeps
   the saved image in memory after the driver exits — when detached
   (`setsid nohup`) you can re-dump without rebuilding.
-- **`(jit-eager)` on the board after the core restore is mandatory before
-  any timing**, even though it reports only `(3 3 4)`. Same core, same
-  clip: `rh-play` without it = 3309 ms/frame; with it = 218 ms/frame
-  (`reel-demo-pass` 209). A restored core's decode path is not fully native
-  until that call runs.
+- **`hvs-map-nc` remaps whole 2 MB blocks, and `rh-init` used to allocate
+  the display buffers inside the JIT arena right behind reel's native code
+  — so after `rh-init` the decoder EXECUTED FROM NON-CACHEABLE MEMORY.**
+  Found 2026-09-17 by timing `reel-demo-pass` in one session: 76.5 ms/frame
+  on the fresh boot, 273 ms after `rh-init`/`rh-play`, unchanged by
+  `(hvs-window-nc t/nil)`. This is what every "slow after restore" reading
+  was (3309 vs 218, 272 vs 76.5), not `jit-eager`. Fix: `rh-init` rounds a
+  6 MB allocation up to a 2 MB boundary so each buffer owns a whole block
+  with no code in it (`reel-hvs-forms.txt`). Rule: **never remap a 2 MB
+  block that can hold JIT pages; align display buffers to 2 MB.**
+- `(jit-eager)` after a core restore still costs only seconds and republishes
+  the few modules the QEMU pass missed; keep it, but it is not what fixed
+  the slowness above.
 
 ## 6d. Kernel-porting lessons (NEON layer 2b, 2026-09-17)
 

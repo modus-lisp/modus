@@ -390,6 +390,16 @@ The constant-vector path (`e9a5aeb`, Aug 30) predates yesterday's working
 image, so it is not the change itself. `serial-lit.py` runs the same defun on
 the plain image (no reel, no core) — a 5-minute bisect probe.
 
+`serial-lit.py` on the plain new image: **all 29 words correct**, constvec
+root (`#x10000F10`) reads 0 ⇒ literals baked. So board-side JIT literal
+materialisation is fine on a fresh image; the garbage is specific to the
+**core-restored session**. Mechanism under test (`serial-lit-core.py`):
+`*aarch64-jit-constvec-p*` is a heap global and comes back T from the QEMU
+save, but the constant-vector root is a BSS word that boot re-zeroes — a
+state a plain image never has — so a form JIT'd after the restore may emit
+constant-vector loads against a root/vector that is not the one its
+constants were placed in.
+
 `serial-probe4.py` result: the **baked** `%net-fnv1a` returns 65470874 /
 1325675142 / 71127839 over 4096 / 65536 / 151295 bytes of the clip —
 host-identical, no fault. So the hypothesis above is wrong as stated: the

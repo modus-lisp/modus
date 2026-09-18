@@ -640,6 +640,40 @@ movz/movk address quads, per-access untag/add sequences) does not fit the
 work has two payoffs that compound: fewer instructions and smaller code.
 The interlock figures are what an unscheduled in-order stream costs.
 
+### Arm PMUv3 plugin (per-region counters in-process), built for the A53
+
+Clones: `/home/claude/PMUv3_plugin` (ARM-software/PMUv3_plugin @ 8770511, with
+`src/pmuv3_plugin_bundle.c` replaced by the Cortex-A53 bundle set — copy kept
+at `zlinux/pmuv3_plugin_bundle_a53.c`) and `/home/modus/PMUv3_plugin` on the
+Pi 5, where it is built natively (no aarch64 gcc here). It needs libperf/libapi
+from a kernel tree; a sparse checkout of `raspberrypi/linux rpi-6.18.y` at
+`/home/modus/linux-source` (~80 MB) is enough:
+
+```
+git clone --depth 1 --filter=blob:none --sparse https://github.com/raspberrypi/linux -b rpi-6.18.y linux-source
+git -C linux-source sparse-checkout set include/uapi include/linux include/asm-generic \
+    tools/build tools/include tools/arch tools/lib/api tools/lib/perf tools/lib/subcmd tools/scripts scripts
+sudo apt-get install libelf-dev zlib1g-dev
+make -C linux-source/tools/lib/perf && make -C linux-source/tools/lib/api
+make LINUX_SRC=/home/modus/linux-source          # output in out/ (BUILD_DIR=out), not build/
+```
+
+Traps: libperf wants `scripts/Makefile.asm-headers` (add `scripts`); its
+`tools/include/asm/barrier.h` resolves to **`tools/arch/arm64/...`** — if you
+add the KERNEL `arch/arm64/include` instead, you get the kernel header and a
+`linux/kasan-checks.h` error; `tools/arch` is the one to add. The rdpmc fast
+path (`cap_user_rdpmc`) needs `echo 1 > /proc/sys/kernel/perf_user_access`
+(the Zero's initramfs `init` sets it); otherwise it falls back to `read(2)`.
+The stock 15 bundles are Neoverse events (`INST_SPEC` 0x1B, `STALL_*`
+0x23/0x24, 0x2x–0x7x) — none of which exist on the A53 (`PMCEID0`
+0x67FFBFFF, `PMCEID1` 0). The A53 set: 0 retired-instruction mix, 1 branches,
+2 L1I, 3 L1D/TLB, 4 L2/bus, **5 IQ-empty stalls (0xE0–0xE3), 6 interlock/LSU
+stalls (0xE4–0xE8)**, 7 summary (cycles, inst, L1I/L1D/L2 refills, mispred),
+8 "why is IPC low" (inst, 0xE1, 0xE5, 0xE4, 0xE7), 9 memory/bus; 10–14 alias
+7. Six events max per bundle (6 counters; CPU_CYCLES takes one). Test
+binaries link libperf/libapi statically and `libelf.so.1`/`libz.so.1`
+dynamically — those two ship in the initramfs with them.
+
 ## 7. Serial-only fallback (no `MODUS_SSH_BUILD`)
 
 The serial REPL prints **bare values** (no `= `). Tag every form so a reply can

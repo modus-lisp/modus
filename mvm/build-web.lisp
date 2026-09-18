@@ -163,32 +163,25 @@
             (and (eql (%complex-real a) (%complex-real b))
                  (eql (%complex-imag a) (%complex-imag b))))
            (t nil))))))
-;; Hash tables: 4096 buckets instead of 256 (the two functions that agree on
-;; the bucket count).
-(defun %ht-hash (key strcmp?)
-  (cond
-    ((stringp key)
-     (if strcmp?
-         (let ((h 2166136261) (len (array-length key)) (i 0))
-           (loop
-             (when (>= i len) (return nil))
-             (setq h (logand (* (logxor h (%prim-aref key i)) 16777619) #xFFFFFFFF))
-             (setq i (+ i 1)))
-           (logand (logxor h (ash h -12)) 4095))
-         (%ht-nohash)))
-    ((fixnump key)  (logand (logxor key (ash key -12)) 4095))
-    ((characterp key) (logand (char-code key) 4095))
-    ((null key) 17)
-    ((eq key t) 19)
-    ((%cl-sym-p key) (logand (%cl-sym-hash key) 4095))
-    ((%native-mvm-sym-p key) (logand (%native-mvm-sym-hash key) 4095))
-    (t (%ht-nohash))))
-(defun %ht-new-bucket-vec ()
-  (let ((vec (make-array 4096)) (i 0))
-    (loop
-      (when (>= i 4096) (return vec))
-      (%ht-vec-set vec i nil)
-      (setq i (+ i 1)))))
+;; NO HASH-TABLE OVERRIDE HERE ANY MORE, and the reason is worth the paragraph.
+;; This slot used to carry a `%ht-hash (key strcmp?)' / `%ht-new-bucket-vec ()'
+;; pair that pinned every bucket index at 4096 slots instead of prelude.lisp's
+;; then-fixed 256 — a straight win on an interpreter.  fa2b77a (GETHASH was the
+;; in-image wall) then made the index GROWABLE and changed both signatures:
+;; %HT-HASH takes a MASK and %HT-NEW-BUCKET-VEC takes a bucket COUNT.  The
+;; overrides kept the old arity, so `(%ht-new-bucket-vec n)' ignored n and
+;; handed back 4096 buckets forever — and PUTHASH rebuilds the index whenever
+;; `count > 2 * (array-length vec)', a condition a fixed 4096 can never clear.
+;; Past 8192 entries every single insert therefore re-indexed the entire table:
+;; the boot spent ~4 of its ~4.85 billion steps inside %HT-REBUILD-INDEX,
+;; allocating ~45 MB of bucket vectors per 67M steps (12 collections of a
+;; 256 MB semispace just to boot), and the tables that cross 8192 are exactly
+;; the ones boot fills — *SYM-NAME-TABLE* alone holds ~9000 names.
+;; Mainline now sizes the index to the next power of two at or above 2x the
+;; entry count (min 256, max 65536), which is what this override was
+;; hand-rolling at one fixed size, so deleting it is both the fix and the
+;; feature.  A web-only copy of a shared algorithm is a liability across a
+;; rebase; %GV-CELL's inlined copy of this same hash was the previous casualty.
 "))
 
 (load (merge-pathnames "build-cli-common.lisp"

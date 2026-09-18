@@ -222,6 +222,15 @@ quicklisp.org isn't cross-origin-isolation friendly.
 ## Web-only source overrides (`build-web.lisp`)
 
 Same answers, cheaper on an interpreter: `eql` exits early for the non-numeric
-cases, and hash tables use 4096 buckets instead of 256.  The i386 image was
+cases.  (There used to be a 4096-bucket hash-table override here too; mainline
+grew a growable index in fa2b77a and the stale copy then re-indexed every table
+on every insert — see the paragraph where it used to live.)  The i386 image was
 tried first and abandoned: its 30-bit fixnums push interning and hashing
 through the bignum tower.
+
+The arch slots also pin the file-I/O scratch addresses (`*cstr-scratch*`,
+`*io-buf-addr*`) into the BSS block **twice**: once in the kernel prologue, so
+they are right from the first instruction, and again after `init-all-globals`,
+which re-runs cl-fileio's defvar thunks.  Both defaults the shared boot text
+leaves in place — `#x0FF00000` and `#x1DE00000` — are fatal here: one is below
+`VBASE` and one is inside the heap arena.

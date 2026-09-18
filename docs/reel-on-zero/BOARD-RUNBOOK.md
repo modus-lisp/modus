@@ -581,6 +581,37 @@ addition: `perf`, for a sampling profile of SBCL and of Modus-hosted on the
 exact silicon. `vpxbench.c` (libvpx, single thread; `gcc -O2 vpxbench.c -lvpx`
 on modus-pi, push binary + `libvpx.so.9` over the wire) is the C floor.
 
+### A53 PMU counters per decoder (`zlinux/pstat.c`, steady state, 2026-09-18)
+
+`pstat PID SECONDS` attaches raw A53 events to a running pid via
+`perf_event_open` (no `perf` needed): 0x11 cycles, 0x08 INST_RETIRED, 0x03/0x04
+L1D refill/access, 0x10/0x12 branches, 0x01/0x14 L1I, 0x17 L2 refill, and the
+Cortex-A53 implementation-defined stall events 0xE0–0xE8 (IQ-empty and its
+causes; interlocks other/load/store; LSU busy; store-buffer full). The
+ARMv8.1 generic stall events 0x23/0x24 are NOT implemented on the A53 (read 0).
+Sample only after the decoder is in its loop (`measure3.sh` waits for SBCL's
+compile and for Modus's `eager=` line — Modus takes ~370 s to load reel and
+jit-eager on the A53; a sample taken during that phase is the compiler).
+
+| cam.ivf, A53 @ 1 GHz | SBCL 2.5.2 | Modus hosted (same Linux) |
+|---|---|---|
+| ms/frame | 18.4 | 52 |
+| IPC | 0.89 | 0.71 |
+| instructions/frame (IPC × cycles) | ~16 M | ~37 M |
+| L1D miss / access | 0.44% | 0.25% |
+| branch mispredict | 2.7% | 1.9% |
+| **L1I refills per k-inst** | 2.0 | **38** |
+| **cycles stalled, IQ empty on I-cache miss** | 1.5% | **30%** |
+| interlock stalls (other / load) | 13.6% / 12.3% | 6.0% / 7.0% |
+| LSU busy | 3.0% | 3.6% |
+
+Reading: Modus executes ~2.3× the instructions AND loses 30% of its cycles
+to instruction-cache misses — the JIT's code (718-instruction functions,
+movz/movk address quads, per-access untag/add sequences) does not fit the
+32 KB L1I; SBCL's does. Data-side behaviour is fine for both. So the codegen
+work has two payoffs that compound: fewer instructions and smaller code.
+The interlock figures are what an unscheduled in-order stream costs.
+
 ## 7. Serial-only fallback (no `MODUS_SSH_BUILD`)
 
 The serial REPL prints **bare values** (no `= `). Tag every form so a reply can

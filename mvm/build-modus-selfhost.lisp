@@ -559,7 +559,8 @@
     (aset v 13 8) (aset v 14 nil) (aset v 15 nil)
     (aset v 16 0)  (aset v 17 24) (aset v 18 25) (aset v 19 26)
     (aset v 20 31) (aset v 21 29) (aset v 22 nil)
-    (setq *a64-vreg-to-phys* v))
+    (setq *a64-vreg-to-phys* v)
+  (setq *a64-x18-base* t))   ; x18 = convention base (translate-aarch64), a defvar whose init never runs in-image
   ;; (b) `(defvar … 0)` knobs that actually read NIL in-image.
   (setq *aarch64-serial-width* 0)
   ;; (c) Linux/AArch64 emitter config — the in-image equivalent of

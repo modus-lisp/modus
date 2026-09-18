@@ -407,7 +407,8 @@
     (aset map 13 8) (aset map 14 nil) (aset map 15 nil)
     (aset map 16 0) (aset map 17 24) (aset map 18 25) (aset map 19 26)
     (aset map 20 31) (aset map 21 29) (aset map 22 nil)
-    (setq *a64-vreg-to-phys* map))
+    (setq *a64-vreg-to-phys* map)
+  (setq *a64-x18-base* t))   ; x18 = convention base (translate-aarch64), a defvar whose init never runs in-image
   ;; *mvm-label-counter* is a (defvar … 0) whose init-thunk does NOT run at boot
   ;; (CLAUDE.md item 7) → nil at runtime; translate-aarch64's (incf …) would
   ;; crash.  The compiler doesn't use it, so no earlier path initialised it.

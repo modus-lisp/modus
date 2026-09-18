@@ -59,6 +59,8 @@
     (emit-aarch64-movz buf x24 #x0400 16)
     (emit-aarch64-movz buf x25 #x0500 16)
     (emit-aarch64-movz buf x26 0 0)
+    ;; x18 = convention-block base #x10000000 (translate-aarch64 *a64-x18-base*)
+    (emit-aarch64-movz buf 18 #x1000 16)
     ;; 4. TPIDR_EL1
     (emit-aarch64-movz buf x16 #x0200 16)
     (emit-aarch64-u32 buf #xD518D090)

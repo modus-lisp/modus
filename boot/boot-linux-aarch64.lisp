@@ -431,6 +431,8 @@
   ;; sentinel" with x potentially-0.  Sentinel-substitution worked
   ;; case by case but kept needing fresh patches; this fixes the root.
   (emit-aarch64-load-imm64 buf 26 #xDEAD0001)
+  ;; x18 = convention-block base #x10000000 (translate-aarch64 *a64-x18-base*)
+  (emit-aarch64-load-imm64 buf 18 #x10000000)
 
   ;; NATIVE MCGC: reserve x28 = the GC trampoline's absolute VA, loaded once
   ;; at boot, so every gc-check fire site is a single range-unlimited

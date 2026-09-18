@@ -1642,7 +1642,8 @@
     (aset map 13 8) (aset map 14 nil) (aset map 15 nil)
     (aset map 16 0) (aset map 17 24) (aset map 18 25) (aset map 19 26)
     (aset map 20 31) (aset map 21 29) (aset map 22 nil)
-    (setq *a64-vreg-to-phys* map))
+    (setq *a64-vreg-to-phys* map)
+  (setq *a64-x18-base* t))   ; x18 = convention base (translate-aarch64), a defvar whose init never runs in-image
   (when (null *mvm-label-counter*) (setq *mvm-label-counter* 0))
   (setq *aarch64-stack-align-16* nil)
   (setq *aarch64-linux-mode* nil)

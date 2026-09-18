@@ -8201,6 +8201,11 @@
   (cond ((integerp x) (and (<= (integer-length x) 61) (+ 1 (integer-length x))))
         ((or (and x (symbolp x)) (consp x)) (%expr-width x env))
         (t nil)))
+(defun %operand-reg (form env)
+  "The register of FORM when it is a variable held in a local register, else NIL."
+  (and form (symbolp form)
+       (let ((b (env-lookup env form)))
+         (and b (eq (binding-location b) :reg) (binding-reg b)))))
 (defun %compile-test-branch (test env dest false-label)
   "Compile TEST so that control falls through when it is true and branches
    to FALSE-LABEL when it is false.  DEST is scratch."
@@ -8216,16 +8221,22 @@
           (name-eq (car test) "ZEROP") (%expr-width (cadr test) env))
      (%compile-test-branch (list '= (cadr test) 0) env dest false-label))
     ((%fusable-compare test env)
-     (let ((bop (%fusable-compare test env))
-           (a (cadr test)) (b (caddr test)))
-       (compile-form a env dest)
-       (let ((temp (alloc-temp-reg)))
-         (if (%leaf-operand-p b env)
-             (compile-form b env temp)
-             (progn (emit-ir :push dest) (compile-form b env temp) (emit-ir :pop dest)))
-         (emit-ir :cmp dest temp)
+     ;; Operand-direct: a comparison operand that lives in a register (a
+     ;; promoted local) is compared in place — no MOV into DEST / a temp.
+     (let* ((bop (%fusable-compare test env))
+            (a (cadr test)) (b (caddr test))
+            (ra (%operand-reg a env)) (rb (%operand-reg b env)))
+       (unless ra (compile-form a env dest))
+       (let ((temp (and (not rb) (alloc-temp-reg))))
+         (when temp
+           (if (%leaf-operand-p b env)
+               (compile-form b env temp)
+               (if ra
+                   (compile-form b env temp)
+                   (progn (emit-ir :push dest) (compile-form b env temp) (emit-ir :pop dest)))))
+         (emit-ir :cmp (or ra dest) (or rb temp))
          (emit-ir (%inverse-branch bop) false-label)
-         (free-temp-reg))))
+         (when temp (free-temp-reg)))))
     (t
      (compile-form test env dest)
      (emit-ir :bnull dest false-label))))
@@ -15204,7 +15215,7 @@
 ;;; Arithmetic Operations
 ;;; ============================================================
 
-(defun emit-arith-pair (fast-op generic-name dest temp)
+(defun emit-arith-pair (fast-op generic-name dest temp &optional (src1 dest))
   "Tag-checked pairwise arithmetic.  When dest and temp are both tagged
    fixnums (low bit zero) we use FAST-OP inline.  Otherwise we call
    GENERIC-NAME (a runtime helper that handles ratios / mixed types).
@@ -15232,12 +15243,16 @@
   ;; in a way I couldn't isolate; left disabled until investigated.
   ;; TYPED FAST PATH (see *arith-trust*): both operands provably fixnums and
   ;; the result provably ≤ 61 bits → the plain op, nothing else.
+  ;; FIRST-OPERAND DIRECT (2026-09-18): SRC1 is the register holding the left
+  ;; operand (DEST when it was compiled there, as before; a promoted local's
+  ;; own register when the caller passed it).  Every READ of the left operand
+  ;; in this function goes through SRC1; DEST is only written.
   (when (and *arith-trust* (cadr *arith-trust*))
     (emit-ir (cond ((eq fast-op :add-checked) :add)
                    ((eq fast-op :sub-checked) :sub)
                    ((eq fast-op :mul-checked) :mul)
                    (t fast-op))
-             dest dest temp)
+             dest src1 temp)
     (return-from emit-arith-pair))
   (let* ((checked-op nil)
          (tag-temp   (alloc-temp-reg))
@@ -15255,7 +15270,7 @@
     ;; TAG-SAFE pair (both operands provably fixnums, result may still
     ;; overflow): skip the tag test, keep the checked op + slow path.
     (unless (and *arith-trust* (car *arith-trust*))
-      (emit-ir :or   tag-temp dest temp)
+      (emit-ir :or   tag-temp src1 temp)
       (emit-ir :li   one-temp 1)
       (emit-ir :test tag-temp one-temp)
       (emit-ir :bne  slow-label))
@@ -15266,7 +15281,7 @@
        ;; truncated value before falling into the slow path.  PUSH/POP
        ;; on both x86 and AArch64 are flag-preserving.
        (emit-ir :push dest)
-       (emit-ir checked-op dest dest temp)
+       (emit-ir checked-op dest src1 temp)
        (emit-ir :bvs overflow-label)
        ;; Success: drop the saved copy by popping into a dead temp.
        (emit-ir :pop tag-temp)
@@ -15275,7 +15290,7 @@
        (emit-ir :pop dest)             ; restore original a
        (emit-ir :br slow-label))
       (t
-       (emit-ir fast-op dest dest temp)
+       (emit-ir fast-op dest src1 temp)
        (emit-ir :br end-label)))
     ;; Slow path.
     (emit-ir-label slow-label)
@@ -15291,7 +15306,7 @@
             do (unless (or (= r dest) (= r temp)
                            (= r tag-temp) (= r one-temp))
                  (emit-ir :push r))))
-    (emit-ir :mov +vreg-v0+ dest)
+    (emit-ir :mov +vreg-v0+ src1)
     (emit-ir :mov +vreg-v1+ temp)
     (emit-ir :set-nargs 2)
     (emit-ir :call generic-name 2)
@@ -15306,7 +15321,7 @@
     (free-temp-reg)
     (free-temp-reg)))
 
-(defun %compile-arith-arg-step-e2 (arg env dest fast-op generic-name &optional trust)
+(defun %compile-arith-arg-step-e2 (arg env dest fast-op generic-name &optional trust (src1 dest))
   "mvm-eval (WS3 flip) pairwise-arith step that does NOT hold a temp register
    across the recursive operand compile.  The build-time scheme allocates
    the temp BEFORE compiling ARG, so a right-nested chain
@@ -15327,7 +15342,7 @@
     (when (and rb (/= (binding-reg rb) dest))
       (let ((*arith-trust* trust))
         (declare (special *arith-trust*))
-        (emit-arith-pair fast-op generic-name dest (binding-reg rb)))
+        (emit-arith-pair fast-op generic-name dest (binding-reg rb) src1))
       (return-from %compile-arith-arg-step-e2 nil)))
   (if (let ((leaf (%leaf-operand-p arg env)))
         ;; A leaf, or a pure typed expression, compiled into a fresh temp
@@ -15345,18 +15360,18 @@
         (compile-form arg env temp)
         (let ((*arith-trust* trust))
           (declare (special *arith-trust*))
-          (emit-arith-pair fast-op generic-name dest temp))
+          (emit-arith-pair fast-op generic-name dest temp src1))
         (free-temp-reg))
       (progn
-        (emit-ir :push dest)
+        (when (= src1 dest) (emit-ir :push dest))   ; left operand in a register: nothing to save
         (compile-form arg env dest)
         (let ((temp (alloc-temp-reg)))
           (emit-ir :mov temp dest)
-          (emit-ir :pop dest)
+          (when (= src1 dest) (emit-ir :pop dest))
           ;; TRUST (typed-arithmetic fast path) scopes the emitter call only.
           (let ((*arith-trust* trust))
             (declare (special *arith-trust*))
-            (emit-arith-pair fast-op generic-name dest temp))
+            (emit-arith-pair fast-op generic-name dest temp src1))
           (free-temp-reg)))))
 
 (defun %temps-must-spill-p (&optional (held 1))
@@ -15997,19 +16012,18 @@
       ;; temporaries instead of refusing to compile the program.
       (anf (compile-form anf env dest))
       (t
-       (compile-form (car args) env dest)
+       (let ((src1 (%first-operand-reg (car args) env dest)))
+         (unless src1 (compile-form (car args) env dest))
        ;; Typed-arithmetic fast path: track the running LHS width and bind
        ;; *arith-trust* per pair (see %expr-width / emit-arith-pair).
        (let ((lw (%expr-width (car args) env)))
          (dolist (arg (cdr args))
            (check-arith-nesting '+ arg)   ; backstop — ANF above handles the hit
-           ;; Trust is bound ONLY around the emitter call (never around the
-           ;; operand's own compilation, whose nested arithmetic must judge
-           ;; its own operands).
            (let ((trust (%arith-trust-for lw (%expr-width arg env) :add)))
              (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
                  (let ((*arith-push-depth* (1+ *arith-push-depth*)))
-                   (%compile-arith-arg-step-e2 arg env dest :add-checked "GENERIC-ADD" trust))
+                   (%compile-arith-arg-step-e2 arg env dest :add-checked "GENERIC-ADD" trust (or src1 dest))
+                   (setq src1 nil))
                  (let ((temp (alloc-temp-reg))
                        (*arith-push-depth* (1+ *arith-push-depth*)))
                    (emit-ir :push dest)
@@ -16019,7 +16033,17 @@
                      (declare (special *arith-trust*))
                      (emit-arith-pair :add-checked "GENERIC-ADD" dest temp))
                    (free-temp-reg)))
-             (setq lw (and trust (caddr trust))))))))))
+             (setq lw (and trust (caddr trust)))))))))))
+
+(defun %first-operand-reg (form env dest)
+  "The register of a promoted local FORM when the pairwise emitter may read
+   the left operand from it directly (runtime compile only — the build-time
+   path still evaluates the left operand into DEST), else NIL.  DEST itself
+   returns NIL: that is the ordinary in-place case."
+  (and *mvm-eval-runtime-p* form (symbolp form)
+       (let ((b (env-lookup env form)))
+         (and b (eq (binding-location b) :reg) (/= (binding-reg b) dest)
+              (binding-reg b)))))
 
 (defun compile-sub (args env dest)
   "Compile (- args...).  Unary `(- x)` lowers to `(- 0 x)` so bignum/ratio/
@@ -16044,8 +16068,8 @@
      (let ((anf (anf-normalize-arith-args '- args env)))
        (if anf
            (compile-form anf env dest)
-           (progn
-             (compile-form (car args) env dest)
+           (let ((src1 (%first-operand-reg (car args) env dest)))
+             (unless src1 (compile-form (car args) env dest))
              ;; Typed-arithmetic fast path (see compile-plus).
              (let ((lw (%expr-width (car args) env)))
                (dolist (arg (cdr args))
@@ -16053,7 +16077,8 @@
                  (let ((trust (%arith-trust-for lw (%expr-width arg env) :sub)))
                    (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
                        (let ((*arith-push-depth* (1+ *arith-push-depth*)))
-                         (%compile-arith-arg-step-e2 arg env dest :sub-checked "GENERIC-SUBTRACT" trust))
+                         (%compile-arith-arg-step-e2 arg env dest :sub-checked "GENERIC-SUBTRACT" trust (or src1 dest))
+                         (setq src1 nil))
                        (let ((temp (alloc-temp-reg))
                              (*arith-push-depth* (1+ *arith-push-depth*)))
                          (emit-ir :push dest)
@@ -20076,18 +20101,30 @@
       ;; Under temp pressure even that 1 held temp is too many (deeply
       ;; nested arg trees stack one per call level): compile into the
       ;; dead V0 instead, keeping the counter flat (see %temps-must-spill-p).
-      (dotimes (i reg-count)
-        (if (%temps-must-spill-p)
-            (progn
-              (compile-form (nth i args) env +vreg-v0+)
-              (emit-ir :push +vreg-v0+))
-            (let ((temp (alloc-temp-reg)))
-              (compile-form (nth i args) env temp)
-              (emit-ir :push temp)
-              (free-temp-reg))))
-      ;; Pop into arg registers (LIFO: last pushed = highest reg, pop first)
-      (loop for i from (1- reg-count) downto 0
-            do (emit-ir :pop (+ +vreg-v0+ i))))
+      ;; DIRECT ARGUMENT MOVES (2026-09-18): when every register argument is a
+      ;; leaf (an integer or a lexical variable in a frame slot / local
+      ;; register) it is compiled straight into its argument register — a
+      ;; leaf's compile writes nothing but its destination, and V0-V3 never
+      ;; hold a binding, so nothing is clobbered.  The push/pop round trip
+      ;; (four instructions per argument on aarch64) stays for anything else.
+      (if (let ((ok t))
+            (dotimes (i reg-count) (unless (%leaf-operand-p (nth i args) env) (setq ok nil)))
+            ok)
+          (dotimes (i reg-count)
+            (compile-form (nth i args) env (+ +vreg-v0+ i)))
+          (progn
+            (dotimes (i reg-count)
+              (if (%temps-must-spill-p)
+                  (progn
+                    (compile-form (nth i args) env +vreg-v0+)
+                    (emit-ir :push +vreg-v0+))
+                  (let ((temp (alloc-temp-reg)))
+                    (compile-form (nth i args) env temp)
+                    (emit-ir :push temp)
+                    (free-temp-reg))))
+            ;; Pop into arg registers (LIFO: last pushed = highest reg, pop first)
+            (loop for i from (1- reg-count) downto 0
+                  do (emit-ir :pop (+ +vreg-v0+ i))))))
 
     ;; Tell the callee's &rest prologue (if any) what to do.  Direct
     ;; calls to known &rest functions get a sentinel 255 to mean 'we

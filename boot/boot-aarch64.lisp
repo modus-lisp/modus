@@ -177,6 +177,8 @@
     (emit-aarch64-movz buf x25 #x4500 16)
     ;; x26 = NIL = 0 (already zero from QEMU reset, but be explicit)
     (emit-aarch64-movz buf x26 0 0)
+    ;; x18 = convention-block base #x10000000 (translate-aarch64 *a64-x18-base*)
+    (emit-aarch64-movz buf 18 #x1000 16)
 
     ;; 4. Set TPIDR_EL1 = BSP per-CPU data base (0x41200000)
     (emit-aarch64-movz buf x16 #x4120 16)     ; x16 = 0x41200000
@@ -887,6 +889,7 @@
       (emit-aarch64-movk buf 18 #x1DEA 48)
       ;; CMP x17,x18 ; B.NE cold  (patched below)
       (emit-aarch64-u32 buf #xEB12023F)          ; CMP x17,x18 (SUBS XZR,x17,x18)
+      (emit-aarch64-movz buf 18 #x1000 16)       ; x18 back to the convention base (translate-aarch64 *a64-x18-base*)
       (let ((bne-idx (a64-buffer-position buf)))
         (emit-aarch64-u32 buf 0)                 ; B.NE placeholder
         ;; ---- RE-ENTRY RECOVERY (mirrors vector entry 4) ----

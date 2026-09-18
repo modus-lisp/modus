@@ -555,10 +555,24 @@ not. Read `CTR_EL0`/`CCSIDR_EL1` for the real cache geometry.
   architecture, EL and boot path are fine; the block is in Modus's runtime
   environment. Refuted along the way: EL3/`SPME` (we are at EL2), "CPU0's PMU
   disabled" (all cores count under Linux), Modus boot writing PMU regs (it
-  writes none). Leading candidate: the **ARM clock** — every Modus PMU test
-  ran after the resume path raised the core to 1 GHz through the firmware
-  mailbox; the payload ran at the firmware's 600 MHz idle clock. Test: run
-  the Modus event probe at 600 MHz and at 1 GHz.
+  writes none).
+- **2026-09-18, two more candidates REFUTED by payload (`zlinux/pmu-wfe.s`,
+  `zlinux/pmu-clk.s`, `go-pmu-*.py`):** (1) the **ARM clock** — `pmu-clk.s`
+  raises the core to 1 GHz through the property mailbox first (SET_CLOCK_RATE
+  0x38002 answers 0x3B9ACA00, GET_CLOCK_RATE reads it back) and still counts
+  `PMEVCNTR0` 0x2D0003. (2) **`SEV;WFE` in the loop** (Modus's YIELD, emitted
+  in every JIT'd loop iteration): `pmu-wfe.s` counts 0x4B0003 = 5 instr × 1 M
+  iterations at 0x82BC0B cycles (8.6 cycles/iteration, so the WFE with the
+  event register set costs ~5 cycles — a separate performance note). What
+  the Arm ARM pseudocode (`AArch64.PMUCycle`/`PMUSwIncrement`) settles: the
+  per-counter filter gate `CountPMUEvents(idx)` is shared by SW_INCR and
+  hardware events, and SW_INCR *does* count under Modus, so the gate is open —
+  what is missing under Modus is event GENERATION, not filtering. Remaining
+  differences between the counting payload and Modus: Modus's own EL2 page
+  tables/MAIR (0x4400FF) and VBAR, and the exact `msr` sequence Modus emits
+  (PMSELR/PMXEVTYPER path). Next decisive test: the payload's exact sequence
+  embedded as a stub in the Modus image (the earlier in-stub attempt's stores
+  never landed — fix that first).
 - **Meanwhile the working tool is Modus HOSTED on the Zero's Linux** (§6f,
   within 6% of bare metal): `perf_event_open` is a syscall Modus can issue
   itself, so per-phase INST_RETIRED / L1I-refill / stall counters around the
@@ -687,6 +701,43 @@ the plugin's branch region on the A53 shows IPC 1.17, IQ-empty 12.5% of
 cycles, matching proportions. Next: wrap the decoders' phases — `vpxbench`
 directly (C), SBCL via sb-alien to `libpmuv3_plugin_bundle.so`, Modus hosted
 via its own raw-syscall `perf_event_open` (or the same .so if FFI is simpler).
+
+### pstat from INSIDE hosted Modus (`zlinux/modus-pmu.lisp`, 2026-09-18)
+
+No C, no FFI: `perf_event_open` + `ioctl` + `read` as raw syscalls from Lisp.
+`(pmu-start '(#x11 #x08 …))` opens one fd per A53 raw event (user-only,
+disabled → reset → enable), `(pmu-stop)` returns the counts; `pmu-read` on a
+live fd is the snapshot primitive the phase wrappers use
+(`zlinux/modus-pmu-phases.lisp` wraps the same 13 functions as
+`serial-prof.py`, accumulating counter DELTAS per phase, ~2 µs per read).
+
+- **Validated against `pstat`** (`modus-pmu-decode.lisp`, cam.ivf, 90 frames):
+  37.36 M inst/frame, IPC 0.73, 51.5 M cycles/frame (= 51.5 ms at 1 GHz) vs
+  pstat's process-wide 37 M / 0.71 / 52 ms. Decode-region-only rates: L1I
+  refill 22/kinst, L1D miss 0.63/kinst, branch mispredict 4.9/kinst, L2 refill
+  0.55/kinst; stalls IQ-empty-on-I-miss 20.8 %, interlock-load 9.0 %,
+  interlock-other 9.1 %, LSU-busy 3.2 % of cycles (the process-wide 30 %
+  I-miss figure includes the load phase).
+- **Trap 10 (compiler, hosted aarch64): `syscall6` was never a generic 6-arg
+  syscall there.** `compile-syscall6` emitted trap 0x0507, which
+  `translate-aarch64` hard-wires to `unlinkat` — so `(syscall6 298 …)` DELETED
+  a file instead of opening a counter. Fixed at 1e8996a: a generic 0x050B arm
+  (x64 aliases it) plus the shared `*aarch64-linux-syscall-remap*` table,
+  which gained `ioctl` 16→29 and `perf_event_open` 298→241. A missing remap
+  entry is a WRONG syscall, silently. Smoke on x86 returns EACCES (perf
+  paranoid) — that is the marshalling proof.
+- **Trap 11: any constant `ash` count > 30 ALLOCATES** (routes to runtime
+  `bignum-ash`, CLAUDE.md limitation 8) — `(ash hi 32)` in a per-call counter
+  read filled the heap; use `(ash (ash hi 2) 30)`.
+- **Trap 12: hosted Modus is OOM-killed on the Zero once BOTH semispaces are
+  resident.** The shipping CLI has 128 MB semispaces; from-space is never
+  `madvise`d back, so RSS climbs to ~256 MB after the first flip, and the
+  Zero has ~250 MB free after the 105 MB tmpfs root (`Killed`, anon-rss
+  244 MB, `dmesg`). Loading reel + jit-eager crosses that. Fix used: build the
+  CLI with `MODUS_GC_MIDPOINT=4000000` (64 MB semispaces → RSS ≤ ~130 MB);
+  the proper fix is an `MADV_DONTNEED` of from-space after each flip in the
+  aarch64 GC trampoline (owed). Busybox `sh` has no `PIPESTATUS`: redirect to
+  a file and `echo $?`.
 
 ## 7. Serial-only fallback (no `MODUS_SSH_BUILD`)
 

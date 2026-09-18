@@ -17,7 +17,8 @@
 (defun pmu-ctl (fd op) (syscall3 16 fd op 0))        ; ops: reset #x2403 enable #x2400 disable #x2401
 (defun pmu-read (fd)
   (syscall3 0 fd *io-buf-addr* 8)
-  (logior (mem-ref *io-buf-addr* :u32) (ash (mem-ref (+ *io-buf-addr* 4) :u32) 32)))
+  ;; two shifts <=30 stay inline (:shl); a constant count >30 routes to runtime bignum-ash, which ALLOCATES per call
+  (logior (mem-ref *io-buf-addr* :u32) (ash (ash (mem-ref (+ *io-buf-addr* 4) :u32) 2) 30)))
 (defun pmu-close (fd) (syscall3 3 fd 0 0))
 (defvar *pmu-fds* nil)
 (defun pmu-start (events)

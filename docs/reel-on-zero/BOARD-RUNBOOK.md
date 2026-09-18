@@ -811,8 +811,9 @@ SBCL reference run (`promote-probe.lisp` / `probe-ref.out`). Same-day commits
 | + fused compare-and-branch in `if` (fixnum `< > <= >= = /=`, `not`, `zerop`) | 30.01 M | 17.72 M | 201 (38) |
 | + five local registers V9–V13 = x6 x7 x4 x5 x8, promotion of let/let*/params; YIELD as NOP on hosted Linux | 29.47 M | 11.51 M | 200 (37) |
 | + operand-direct right operands, `setq` straight into the variable's register | **29.34 M** | **11.42 M** | **197 (32)** |
+| + reel: bool-decoder slot/local widths declared tightly (`(unsigned-byte 9/17/31/4)`, prob u8; reel `110ac55`) | **28.46 M** | **10.83 M** | **149** |
 
-That is −21 % instructions and −47 % cycles on the A76 (the cycle drop is mostly
+That is −24 % instructions and −50 % cycles on the A76 (the cycle drop is mostly
 the SEV+WFE yield: 18 cycles per loop back-edge). What each piece is:
 
 - **Struct accessors.** `(bd-range bd)` on a declared `bool-dec` compiled to
@@ -850,6 +851,18 @@ the SEV+WFE yield: 18 cycles per loop back-edge). What each piece is:
 - **Validation that catches compiler bugs:** JIT-vs-interpreter diffs cannot
   (same bytecode both sides). Diff against SBCL (`sed '1d' promote-probe.lisp`,
   run under sbcl) and keep the reel MD5.
+- **Second predicate bug, same family:** a ONE-argument value node passed the
+  spine check, but `compile-sub` rewrites `(- v)` as `(- 0 v)` and evaluates
+  the 0 into the destination first — `(setf v (- v))` in get-coeffs zeroed
+  every negative coefficient. It only showed up when a narrower slot type let
+  get-coeffs promote at all (the checked-add slow paths had pushed it over the
+  temp budget and into the promotion-inhibited retry before), so a reel
+  declaration change "broke" decoding while the compiler was at fault. Rule:
+  when a source change breaks MD5, run it with `*promote-locals*` NIL first.
+- **`tests/jit-diff.lisp` cannot currently run on x64:** it dies at its own
+  "undefined function inside handler-case" probe (`JD-NO-SUCH-FUNCTION-XYZ`
+  escapes as a load error) on the pre-change binary too — a pre-existing
+  runtime issue, not this work; the ANSI gate is the arbiter.
 
 Still on the table, in payoff order: (1) reel-side declarations — `range`/
 `value`/`prob` are `fixnum` (63-bit) slots, so `(- range 1)` may legally be a

@@ -3924,13 +3924,36 @@
 ;;; milliseconds.  (glass's RFB sender is one of those.)  The counter is
 ;;; still the LAST resort, because a clock that stands still is worse than
 ;;; one that ticks in the wrong unit, but it is no longer the only answer.
+(defconstant +clock-monotonic+ 1)
+(defconstant +clock-process-cputime+ 2)
+
+(defun %clock-gettime-ns (clk)
+  "clock_gettime(2) CLK as whole nanoseconds, or 0 where the syscall is not
+   there (bare metal, where the handler-case catches the trap).
+
+   THE DEFAULT IS A REAL CLOCK, not 0.  net/hosted-sync.lisp overrides the two
+   seams below with the per-CPU-scratch versions, but it is linked only into
+   the hosted images: the four ANSI gate runners and the bare-metal REPLs never
+   see it, and with a 0 default those images fall through to the call counter —
+   which is what GET-INTERNAL-REAL-TIME used to be, and what ansi
+   get-internal-time 4-7 fail on.  So the seam answers with the plain syscall
+   over this thread's own I/O page, and the override merely makes the timespec
+   per-CPU."
+  (let* ((buf (%fs-io-page))
+         (rc (handler-case (syscall3 228 clk buf 0) (t (c) -1))))
+    (if (and (integerp rc) (= rc 0))
+        (let ((sec  (mem-ref buf :u32))
+              (nsec (mem-ref (+ buf 8) :u32)))
+          (+ (* sec 1000000000) nsec))
+        0)))
+
 (defun %irt-ns ()
   "Monotonic elapsed nanoseconds, or 0 if this target has no clock."
-  0)
+  (%clock-gettime-ns +clock-monotonic+))
 
 (defun %irun-ns ()
   "Consumed CPU nanoseconds, or 0 if this target has no clock."
-  0)
+  (%clock-gettime-ns +clock-process-cputime+))
 
 (defvar internal-time-units-per-second 1000000)
 

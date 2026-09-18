@@ -38,7 +38,7 @@ measure               → reel-demo-pass / rh-play over serial after (jit-eager)
 What to rebuild for a given change:
 
 | you changed | rebuild | redeploy |
-|---|---|---|
+|---|---|---|---|
 | a Lisp function (reel or demo/HVS forms) | nothing | push the defun over SSH/serial — with linkage cells the board's precompiled callers pick it up |
 | reel source that the tar carries | `tar cf` (seconds) | re-serve; `net-install-and-call` again, or the core route |
 | anything in modus (compiler, JIT, runtime, boot) | `build-rpi-cl-repl.lisp` (15 min) | gzip → `sudo -n cp` → `ls` → netboot |
@@ -593,19 +593,23 @@ Sample only after the decoder is in its loop (`measure3.sh` waits for SBCL's
 compile and for Modus's `eager=` line — Modus takes ~370 s to load reel and
 jit-eager on the A53; a sample taken during that phase is the compiler).
 
-| cam.ivf, A53 @ 1 GHz | SBCL 2.5.2 | Modus hosted (same Linux) |
+| cam.ivf, A53 @ 1 GHz | libvpx 1.15 (C+NEON) | SBCL 2.5.2 | Modus hosted (same Linux) |
 |---|---|---|
-| ms/frame | 18.4 | 52 |
-| IPC | 0.89 | 0.71 |
-| instructions/frame (IPC × cycles) | ~16 M | ~37 M |
-| L1D miss / access | 0.44% | 0.25% |
-| branch mispredict | 2.7% | 1.9% |
-| **L1I refills per k-inst** | 2.0 | **38** |
-| **cycles stalled, IQ empty on I-cache miss** | 1.5% | **30%** |
-| interlock stalls (other / load) | 13.6% / 12.3% | 6.0% / 7.0% |
-| LSU busy | 3.0% | 3.6% |
+| ms/frame | 1.39 | 18.4 | 52 |
+| IPC | 0.82 | 0.89 | 0.71 |
+| **instructions/frame (IPC × cycles)** | **~1.1 M** | **~16 M** | **~37 M** |
+| L1D miss / access | 1.48% | 0.44% | 0.25% |
+| branch mispredict | 7.9% | 2.7% | 1.9% |
+| **L1I refills per k-inst** | 1.4 | 2.0 | **38** |
+| **cycles stalled, IQ empty on I-cache miss** | 2.3% | 1.5% | **30%** |
+| interlock stalls (other / load / store) | 9.1 / 4.5 / 1.3% | 13.6 / 12.3 / 0% | 6.0 / 7.0 / 0% |
+| LSU busy / store-buffer full | 7.9% / 5.8% | 3.0% / 0.6% | 3.6% / 0.6% |
 
-Reading: Modus executes ~2.3× the instructions AND loses 30% of its cycles
+Reading: the whole ladder is INSTRUCTION COUNT at near-identical IPC — libvpx
+~1.1 M per frame, SBCL 16 M (14×), Modus 37 M (33×). libvpx's 7.9% branch
+mispredicts are the bool decoder's inherent entropy (it is 1.4 ms/frame
+regardless); its stalls are memory/LSU because little else remains. Modus
+executes ~2.3× SBCL's instructions AND loses 30% of its cycles
 to instruction-cache misses — the JIT's code (718-instruction functions,
 movz/movk address quads, per-access untag/add sequences) does not fit the
 32 KB L1I; SBCL's does. Data-side behaviour is fine for both. So the codegen

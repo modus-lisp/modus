@@ -2974,6 +2974,40 @@
 (defun %loop-ge (a b)
   (if (and (fixnump a) (fixnump b)) (>= a b) (numeric->= a b)))
 
+;; LOOP list accumulation (CLHS 6.1.3) — FORWARD, with a tail pointer.
+;; COLLECT/APPEND/NCONC share one accumulator and one tail cons, so each step
+;; is O(1) and the list is in iteration order at every moment, including when
+;; user code reads an INTO variable from inside the loop.  The reversed
+;; accumulator this replaced could not carry a DOTTED tail: reversing a list
+;; whose last cdr is an atom loses it, and `(loop for x in '(a b) nconc
+;; (cons x 'foo))' must answer (a b . foo).
+
+(defun %loop-last-cons (l)
+  "The last CONS of L, or NIL when L is not a cons.  A dotted tail is an atom,
+   so this stops at the cons that HOLDS it and the caller leaves its tail
+   pointer where it was — nothing may be linked after a dotted end."
+  (if (consp l)
+      (let ((x l))
+        (loop (when (not (consp (cdr x))) (return x))
+              (setq x (cdr x))))
+      nil))
+
+(defun %loop-copy-seg (l)
+  "A fresh copy of L's top-level conses, keeping a dotted tail.  APPEND may
+   neither destroy its argument nor share its spine; NCONC may do both and
+   passes its segment straight through without calling this."
+  (if (consp l)
+      (let ((head nil) (tail nil) (rest l))
+        (loop
+          (when (not (consp rest))
+            (when rest (set-cdr tail rest))
+            (return head))
+          (let ((c (cons (car rest) nil)))
+            (if tail (set-cdr tail c) (setq head c))
+            (setq tail c)
+            (setq rest (cdr rest)))))
+      l))
+
 ;;; ============================================================
 ;;; Compound typep for ANSI tests
 ;;; ============================================================

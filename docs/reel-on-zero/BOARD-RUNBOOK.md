@@ -561,8 +561,15 @@ not. Read `CTR_EL0`/`CCSIDR_EL1` for the real cache geometry.
   U-Boot's `booti` runs `cleanup_before_linux` (caches/MMU off) and `go` does
   not. Decisive tests left: (1) read `ID_AA64DFR0_EL1` raw at EL1 on CPU0
   from a kernel module under that Linux; (2) read it from a bare `go` payload
-  that executes nothing but the `mrs`. Until then bare-metal hardware-event
-  counting is OPEN; cycles work (`PMCCFILTR.NSH`), `PMSWINC` works.
+  that executes nothing but the `mrs`. **DONE (2026-09-18, `zlinux/dfr0.s`):
+  a 235-byte payload run by the same `go` prints `ID_AA64DFR0` =
+  0x10305106 (PMUVer 1), `PMCEID0` = 0x67FFBFFF, PMCR 0x41033000, EL2 — a
+  full PMU. Modus on the same path reads 0x10305006 and 0x6800F97F. Two
+  CONSTANT ID registers cannot differ, so Modus's sysreg READS are what is
+  wrong (MIDR comes through exactly, so it is value-dependent).** Next:
+  capture the raw `mrs` result through memory (`serial-idm.py`) to split the
+  JIT-call return/tagging path from the read itself. Until then bare-metal
+  hardware-event counting is OPEN; cycles work (`PMCCFILTR.NSH`), `PMSWINC` works.
 - **Meanwhile the working tool is Modus HOSTED on the Zero's Linux** (§6f,
   within 6% of bare metal): `perf_event_open` is a syscall Modus can issue
   itself, so per-phase INST_RETIRED / L1I-refill / stall counters around the

@@ -1970,6 +1970,34 @@
   (a64-ldp-offset buf +a64-x2+ +a64-x3+ +a64-sp+ 16)
   (a64-ldp-post   buf +a64-x0+ +a64-x1+ +a64-sp+ 32))
 
+(defparameter *aarch64-linux-syscall-remap*
+  ;; x86-64 syscall number -> AArch64 generic-ABI number, for the generic
+  ;; 3-arg (0x0502) and 6-arg (0x050B) syscall traps.  A MISSING ENTRY IS A
+  ;; WRONG SYSCALL (see the comment at the 0x0502 arm).
+  '(( 0 . 63)    ; read
+                                  ( 1 . 64)    ; write
+                                  ( 3 . 57)    ; close
+                                  ( 5 . 80)    ; fstat
+                                  ( 8 . 62)    ; lseek
+                                  ( 9 . 222)   ; mmap
+                                  (39 . 172)   ; getpid
+                                  (41 . 198)   ; socket
+                                  (42 . 203)   ; connect
+                                  (43 . 202)   ; accept
+                                  (49 . 200)   ; bind
+                                  (50 . 201)   ; listen
+                                  (60 . 93)    ; exit
+                                  (93 . 93)    ; exit_group (idempotent)
+                                  (217 . 61)   ; getdents64
+                                  ;; clock_gettime — GET-INTERNAL-REAL-TIME.
+                                  ;; Unmapped, x64's 228 would land on aa64
+                                  ;; 228 (sched_getaffinity): no fault, just
+                                  ;; a wrong answer, which is exactly how the
+                                  ;; socket syscalls hid for so long.
+                                  (228 . 113)
+     (16 . 29)    ; ioctl
+     (298 . 241)) ; perf_event_open)
+
 (defun translate-mvm-insn (insn buf mvm-to-native-label)
   "Translate a single decoded MVM instruction, emitting AArch64
    native code into BUF. MVM-TO-NATIVE-LABEL maps MVM byte offsets
@@ -2272,27 +2300,7 @@
                   ;; reached the server fine.  When adding a syscall to the
                   ;; hosted layer, ADD IT HERE TOO or it silently calls
                   ;; something else.
-                  (dolist (pair '(( 0 . 63)    ; read
-                                  ( 1 . 64)    ; write
-                                  ( 3 . 57)    ; close
-                                  ( 5 . 80)    ; fstat
-                                  ( 8 . 62)    ; lseek
-                                  ( 9 . 222)   ; mmap
-                                  (39 . 172)   ; getpid
-                                  (41 . 198)   ; socket
-                                  (42 . 203)   ; connect
-                                  (43 . 202)   ; accept
-                                  (49 . 200)   ; bind
-                                  (50 . 201)   ; listen
-                                  (60 . 93)    ; exit
-                                  (93 . 93)    ; exit_group (idempotent)
-                                  (217 . 61)   ; getdents64
-                                  ;; clock_gettime — GET-INTERNAL-REAL-TIME.
-                                  ;; Unmapped, x64's 228 would land on aa64
-                                  ;; 228 (sched_getaffinity): no fault, just
-                                  ;; a wrong answer, which is exactly how the
-                                  ;; socket syscalls hid for so long.
-                                  (228 . 113)))
+                  (dolist (pair *aarch64-linux-syscall-remap*)
                     ;; CMP x8, #x64-num; CSEL x8, #aarch64-num, x8, EQ
                     (let ((from (car pair))
                           (to   (cdr pair)))
@@ -2309,6 +2317,33 @@
                                             +a64-x8+)))))
                 (a64-svc buf 0)                       ; SVC #0
                 (a64-lsl-imm buf +a64-x0+ +a64-x0+ 1)) ; tag result
+               ((and *aarch64-linux-mode* (= code #x050B))
+                ;; Generic 6-arg Linux syscall (compile-syscall6) — AArch64 ABI.
+                ;;   Inputs: V0..V6 = num,a1..a6 (tagged) = x0,x1,x2,x3,x19,x20,x21.
+                ;;   Output: V0 = x0 = result (tagged).  Same remap as 0x0502.
+                ;; (0x0507 is unlinkat on AArch64, so syscall6 could never be the
+                ;; generic call here before this arm existed.)
+                (a64-asr-imm buf +a64-x9+  +a64-x1+  1)   ; a1
+                (a64-asr-imm buf +a64-x10+ +a64-x2+  1)   ; a2
+                (a64-asr-imm buf +a64-x12+ +a64-x3+  1)   ; a3
+                (a64-asr-imm buf +a64-x13+ +a64-x19+ 1)   ; a4
+                (a64-asr-imm buf +a64-x14+ +a64-x20+ 1)   ; a5
+                (a64-asr-imm buf +a64-x15+ +a64-x21+ 1)   ; a6
+                (a64-asr-imm buf +a64-x8+  +a64-x0+  1)   ; syscall# untag
+                (dolist (pair *aarch64-linux-syscall-remap*)          ; x11 is the remap temp
+                  (let ((from (car pair)) (to (cdr pair)))
+                    (a64-cmp-imm buf +a64-x8+ from)
+                    (a64-movz buf +a64-x11+ (logand to #xFFFF) 0)
+                    (when (> to #xFFFF) (a64-movk buf +a64-x11+ (logand (ash to -16) #xFFFF) 1))
+                    (a64-emit buf (logior #x9A800000 (ash +a64-x8+ 16) (ash +cc-eq+ 12) (ash +a64-x11+ 5) +a64-x8+))))
+                (a64-mov-reg buf +a64-x0+ +a64-x9+)
+                (a64-mov-reg buf +a64-x1+ +a64-x10+)
+                (a64-mov-reg buf +a64-x2+ +a64-x12+)
+                (a64-mov-reg buf +a64-x3+ +a64-x13+)
+                (a64-mov-reg buf +a64-x4+ +a64-x14+)
+                (a64-mov-reg buf +a64-x5+ +a64-x15+)
+                (a64-svc buf 0)
+                (a64-lsl-imm buf +a64-x0+ +a64-x0+ 1))
                ((= code #x0503)
                 ;; Raw 3-arg Linux syscall — args passed untagged as-is.
                 ;;   V0=x0=syscall#(tagged), V1-V3 = raw args.

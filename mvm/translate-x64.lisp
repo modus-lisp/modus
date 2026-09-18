@@ -845,7 +845,7 @@
               (emit-bytes buf #x41 #x58)         ; pop r8
               (emit-bytes buf #x5A)              ; pop rdx
               (emit-bytes buf #x5F))             ; pop rdi
-             ((= code #x0507)
+             ((or (= code #x0507) (= code #x050B))
               ;; Generic 6-arg Linux syscall (compile-syscall6).  Sources are
               ;; V0..V6 = num,a1,a2,a3,a4,a5,a6 (physical rsi,rdi,r8,r9,rbx,
               ;; rcx,rdx), all tagged fixnums.  Marshal into the x86-64 syscall

@@ -17846,7 +17846,7 @@
   (emit-ir :pop +vreg-v2+)
   (emit-ir :pop +vreg-v1+)
   (emit-ir :pop +vreg-v0+)
-  (emit-ir :trap #x0507)
+  (emit-ir :trap #x050B)      ; generic 6-arg syscall on BOTH arches (0x0507 is unlinkat on aarch64)
   (emit-ir :mov dest +vreg-v0+))
 
 (defun compile-aarch64-fileio-trap (trap-code args env dest)

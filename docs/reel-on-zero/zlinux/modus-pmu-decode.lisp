@@ -1,0 +1,25 @@
+;;; whole-decode counters from inside hosted Modus, to validate against pstat (A53: ~37 M inst/frame on cam.ivf)
+(load "/reel/modus-pmu.lisp")
+(defvar *dir* "/reel/")
+(dolist (f '("packages" "decode/tables" "decode/bool" "decode/transform" "decode/intra" "decode/loopfilter" "decode/inter-tables" "decode/inter"))
+  (load (concatenate 'string *dir* f ".lisp")))
+(load "/reel/decode/intra-neon.lisp") (load "/reel/decode/inter-neon.lisp") (load "/reel/decode/loopfilter-neon.lisp")
+(format t "eager=~a~%" (jit-eager))
+(defun rfb (path) (with-open-file (s path :element-type '(unsigned-byte 8))
+  (let* ((n (file-length s)) (v (make-array n :element-type '(unsigned-byte 8)))) (dotimes (i n) (setf (aref v i) (read-byte s))) v)))
+(defun le32 (v o) (logior (aref v o) (ash (aref v (+ o 1)) 8) (ash (aref v (+ o 2)) 16) (ash (aref v (+ o 3)) 24)))
+(defun decode-all (ivf) (let ((vd (reel:make-decoder)) (off 32) (n 0)) (loop (when (>= (+ off 12) (length ivf)) (return)) (let* ((sz (le32 ivf off)) (s (+ off 12)) (e (+ s sz))) (reel:decode-frame vd ivf :start s :end e) (setq off e) (incf n))) n))
+(let ((ivf (rfb "/reel/cam.ivf")))
+  (decode-all ivf)
+  ;; bundle 7 (summary): cycles, inst, L1I refill, L1D refill, br mispred, L2 refill — 6 counters
+  (pmu-start (list #x11 #x08 #x01 #x03 #x10 #x17))
+  (let ((n (decode-all ivf)) (v (pmu-stop)))
+    (format t "PMU-DECODE frames=~a cycles/frame=~a inst/frame=~a IPC=~,2f L1I-refill/kinst=~,2f L1D-miss/kinst=~,2f brmis/kinst=~,2f L2-refill/kinst=~,2f~%"
+            n (round (first v) n) (round (second v) n) (/ (second v) (max 1 (first v)))
+            (/ (* 1000.0 (third v)) (second v)) (/ (* 1000.0 (fourth v)) (second v)) (/ (* 1000.0 (fifth v)) (second v)) (/ (* 1000.0 (sixth v)) (second v))))
+  ;; bundle 8 ("why is IPC low"): inst, IQ-empty-icmiss, ilock-load, ilock-other, LSU-busy + cycles
+  (pmu-start (list #x11 #x08 #xE1 #xE5 #xE4 #xE7))
+  (let ((n (decode-all ivf)) (v (pmu-stop)))
+    (format t "PMU-STALLS frames=~a IQ-empty-icmiss=~,1f%% ilock-load=~,1f%% ilock-other=~,1f%% LSU-busy=~,1f%% of cycles~%"
+            n (/ (* 100.0 (third v)) (first v)) (/ (* 100.0 (fourth v)) (first v)) (/ (* 100.0 (fifth v)) (first v)) (/ (* 100.0 (sixth v)) (first v)))))
+(format t "PMU-DECODE DONE~%")

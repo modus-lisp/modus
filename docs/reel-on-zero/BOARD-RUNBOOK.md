@@ -674,6 +674,20 @@ stalls (0xE4–0xE8)**, 7 summary (cycles, inst, L1I/L1D/L2 refills, mispred),
 binaries link libperf/libapi statically and `libelf.so.1`/`libz.so.1`
 dynamically — those two ship in the initramfs with them.
 
+**Status 2026-09-18: works end-to-end on the Zero's Linux** — all ten A53
+bundles open, count and write CSVs via `c_single_region_test`/
+`c_multi_region_test` (in the initramfs; rdpmc path with
+`perf_user_access=1`). Two plugin fixes were needed (branch `a53-zero2w` in
+the clone; copies in `zlinux/`): the CSV **headers** and **rows** were
+hardcoded per bundle number in `pmuv3_processing.c` (fixed field counts, stale
+names — the symptom was A53 values wearing Neoverse labels, 4 of 6 columns,
+and no CSV at all for bundles whose stock size was 7 > the A53's 6 counters);
+both now derive from the live `event_names`/`num_events`. Sanity vs `pstat`:
+the plugin's branch region on the A53 shows IPC 1.17, IQ-empty 12.5% of
+cycles, matching proportions. Next: wrap the decoders' phases — `vpxbench`
+directly (C), SBCL via sb-alien to `libpmuv3_plugin_bundle.so`, Modus hosted
+via its own raw-syscall `perf_event_open` (or the same .so if FFI is simpler).
+
 ## 7. Serial-only fallback (no `MODUS_SSH_BUILD`)
 
 The serial REPL prints **bare values** (no `= `). Tag every form so a reply can

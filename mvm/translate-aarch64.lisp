@@ -3675,12 +3675,17 @@
                (store-dst pd vd))))
 
           ;; ---- SHLV Vd, Vs, Vc ---- (shift left by register)
+          ;; SHLV / SARV are VALUE-level like the interpreter (mvm.lisp): the
+          ;; count register holds a TAGGED fixnum, untagged here; shifting the
+          ;; tagged word by the untagged count keeps the tag for SHLV, and the
+          ;; compiler clears the low bit after SARV.
           ((= op +op-shlv+)
            (let* ((vd (vr 0))
                   (ps (ensure-src (vr 1) +a64-x16+))
                   (pc (ensure-src (vr 2) +a64-x17+))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
-             (a64-lslv buf pd ps pc)
+             (a64-asr-imm buf +a64-x17+ pc 1)          ; untag the count
+             (a64-lslv buf pd ps +a64-x17+)
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
@@ -3690,7 +3695,8 @@
                   (ps (ensure-src (vr 1) +a64-x16+))
                   (pc (ensure-src (vr 2) +a64-x17+))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
-             (a64-asrv buf pd ps pc)
+             (a64-asr-imm buf +a64-x17+ pc 1)          ; untag the count
+             (a64-asrv buf pd ps +a64-x17+)
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 

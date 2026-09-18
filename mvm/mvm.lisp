@@ -575,7 +575,7 @@
 (defopcode :shl    #x2B (:reg :reg :imm8)     "Shift left by immediate")
 (defopcode :shr    #x2C (:reg :reg :imm8)     "Logical shift right by immediate")
 (defopcode :sar    #x2D (:reg :reg :imm8)     "Arithmetic shift right by immediate")
-(defopcode :shlv   #x2F (:reg :reg :reg)      "Shift left by register")
+(defopcode :shlv   #x2F (:reg :reg :reg)      "Shift left by register (VALUE-level: Vc holds a tagged count; aarch64 untags it, x64 arm still shifts by the raw word — unused there)")
 (defopcode :sarv   #x32 (:reg :reg :reg)      "Arithmetic shift right by register")
 (defopcode :ldb    #x2E (:reg :reg :imm8 :imm8) "Bit field extract (pos, size)")
 

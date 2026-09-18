@@ -17047,6 +17047,28 @@
                        (emit-arith-pair :xor "GENERIC-LOGXOR" dest temp)
                        (free-temp-reg)))))))))))
 
+(defun %unsigned-small-max (form env)
+  "2^n - 1 when FORM is a variable declared (unsigned-byte n) with n <= 6, else NIL."
+  (let ((ty (%expr-dtype form env)))
+    (and (consp ty) (symbolp (car ty)) (string= (symbol-name (car ty)) "UNSIGNED-BYTE")
+         (consp (cdr ty)) (integerp (cadr ty)) (<= 0 (cadr ty) 6)
+         (- (ash 1 (cadr ty)) 1))))
+(defun %var-shift-plan (value-form count-form env)
+  "(:left . COUNT-FORM) / (:right . N-FORM) when a variable-count ASH may use
+   the register shift, else NIL (see compile-ash)."
+  (let ((w (%expr-width value-form env)))
+    (when w
+      (cond
+        ((and count-form (or (symbolp count-form)))
+         (let ((mx (%unsigned-small-max count-form env)))
+           (and mx (<= (+ w mx) 62) (cons :left count-form))))
+        ((and (consp count-form) (symbolp (car count-form)) (name-eq (car count-form) "-")
+              (consp (cdr count-form)))
+         (let ((n (cond ((null (cddr count-form)) (cadr count-form))
+                        ((and (eql (cadr count-form) 0) (consp (cddr count-form)) (null (cdddr count-form))) (caddr count-form))
+                        (t nil))))
+           (and n (symbolp n) (%unsigned-small-max n env) (cons :right n))))
+        (t nil)))))
 (defun compile-ash (value-form count-form env dest)
   "Compile (ash value count) - arithmetic shift.
    Positive count = left shift, negative = right shift.
@@ -17063,6 +17085,31 @@
   ;; compile-variable-ref, far too late for this dispatch.  See %const-int-value.
   (let ((count (%const-int-value count-form)))
   (cond
+    ;; VARIABLE COUNT WITH A PROVEN RANGE (2026-09-18, aarch64 runtime): a count
+    ;; declared (unsigned-byte n), n <= 6, on a value of proven width W with
+    ;; W + 2^n - 1 <= 62 (left) or any W (right, written (ash x (- n)) or
+    ;; (ash x (- 0 n))) compiles to the register shift SHLV / SARV instead of
+    ;; the runtime bignum-ash call.  libvpx-style bool decoding is
+    ;; `range <<= norm[range]` — a variable shift per decoded bit.
+    ((and (null count) *mvm-eval-runtime-p*
+          (boundp (quote *jit-target-arch*)) (eq (symbol-value (quote *jit-target-arch*)) :aarch64)
+          (%cg-on-p (quote *cg-typed-ash*))
+          (%var-shift-plan value-form count-form env))
+     (let* ((plan (%var-shift-plan value-form count-form env))
+            (dir (car plan)) (cform (cdr plan)))
+       (compile-form value-form env dest)
+       (let ((temp (alloc-temp-reg)))
+         (if (%leaf-operand-p cform env)
+             (compile-form cform env temp)
+             (progn (emit-ir :push dest) (compile-form cform env temp) (emit-ir :pop dest)))
+         (if (eq dir :left)
+             (emit-ir :shl-var dest dest temp)
+             (progn
+               (emit-ir :sar-var dest dest temp)
+               (emit-ir :li temp 2)
+               (emit-ir :neg temp temp)
+               (emit-ir :and dest dest temp)))
+         (free-temp-reg))))
     ;; TYPED operand (provable width W) at a runtime compile: a right shift
     ;; can neither see a bignum nor overflow, and a left shift with W+count
     ;; ≤ 62 cannot overflow — emit the bare shift.  reel's `(ash sum -7)`

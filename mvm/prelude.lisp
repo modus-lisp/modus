@@ -2101,15 +2101,28 @@
                (%gv-vec (and %gv-holder (car %gv-holder))))
           (if (or (null %gv-vec) (fixnump %gv-vec))
               (%gv-cell-slow %gv-key %gv-ht)
-              (let* ((%gv-k (if (< %gv-key 0) (- %gv-key) %gv-key))
-                     (%gv-h (logand (logxor %gv-k (logxor (ash %gv-k -8) (ash %gv-k -16)))
-                                (- (%prim-array-length %gv-vec) 1)))
-                     (%gv-cur (%word-aref %gv-vec %gv-h)))
-                (loop
-                  (when (null %gv-cur) (return nil))
-                  (let ((%gv-e (car %gv-cur)))
-                    (when (eq (car %gv-e) %gv-key) (return (cdr %gv-e))))
-                  (setq %gv-cur (cdr %gv-cur)))))))))
+              ;; ONE HASH FUNCTION, CALLED — never a second copy of the mix.
+              ;; This used to inline %HT-HASH's fixnum arithmetic for speed.
+              ;; The copy and the original are the same source and still
+              ;; disagreed once compiled: on the JS MVM (web/mvm.js) the same
+              ;; key and mask gave bucket 0x74F here and 0x8DE in %HT-HASH, so
+              ;; every global read missed its bucket, %GV-SET re-inserted
+              ;; instead of updating, and *SYMBOL-FUNCTION-TABLE* read back NIL
+              ;; at boot.  %HT-BUCKET-FIND and %HT-BUCKET-PUT already state the
+              ;; rule this violated: both call THIS function, so they cannot
+              ;; diverge.  A duplicated hash is a latent bug on any target
+              ;; whose codegen differs at the two sites.
+              (let ((%gv-h (%ht-hash %gv-key nil
+                                     (- (%prim-array-length %gv-vec) 1))))
+                (if (fixnump %gv-h)
+                    (let ((%gv-cur (%word-aref %gv-vec %gv-h)))
+                      (loop
+                        (when (null %gv-cur) (return nil))
+                        (let ((%gv-e (car %gv-cur)))
+                          (when (eq (car %gv-e) %gv-key) (return (cdr %gv-e))))
+                        (setq %gv-cur (cdr %gv-cur))))
+                    ;; :NOHASH — not a bucketable key; the alist is the answer
+                    (%gv-cell-slow %gv-key %gv-ht))))))))
 
 (defun %gv-cell-slow (%gv-key %gv-ht)
   "Linear-alist probe for a globals table that has no bucket index yet."

@@ -539,37 +539,26 @@ not. Read `CTR_EL0`/`CCSIDR_EL1` for the real cache geometry.
   authentication that gates event counting but not the cycle counter.
   Until then: per-stage CYCLES via `pmu-cycles` (equivalent to `rdtsc`×52 at
   1 GHz; both exist), no IPC/branch-miss split.
-- **2026-09-18 bisection (`serial-pmu3..6.py`, `serial-id.py`):** `CurrentEL`
-  = EL2 (so not the EL3/`MDCR_EL3.SPME` theory); `DBGAUTHSTATUS_EL1` = 0xFF
-  (NIDEN high); `MDCR_EL2` = 0x86 (HPME, HPMN=6); Linux's exact ordering
-  (E=0 → `PMCNTENCLR` → `PMEVTYPER0` direct → `PMCNTENSET` → E=1) changes
-  nothing; **`PMSWINC` increments count (3/3) while every hardware event —
-  0x08, 0x1B, 0x04, 0x11, 0x10, 0x03 — stays at 0 over 100k iterations.**
-  So the counter mechanism works and the hardware event sources are gated.
-  And `ID_AA64DFR0_EL1` reads **0x10305006 = PMUVer 0 ("no PMU")** on the
-  bare-metal board (twice; MIDR 0x410FD034 = A53 r0p4) — the documented value
-  is 0x10305106, and Linux's `arm_pmuv3` refuses to probe on PMUVer 0 yet ran
-  7 counters on this silicon. First real environment difference. Working
-  hypothesis (REFUTED 2026-09-18): "CPU0's PMU is disabled" — under Linux,
-  `vpxbench` pinned to CPU0, CPU1 and CPU2 count identically (IPC 0.88, all
-  events), and Linux's own `__init_el2_debug` zeroes `MDCR_EL2` on a core that
-  reads PMUVer 0, so Linux read PMUVer ≥ 1 on CPU0 at EL2 while Modus reads 0
-  on CPU0 at EL2. The Modus boot writes no PMU/MDCR/HCR register (decoded
-  every `msr` in `boot-rpi-cl.lisp`: SCTLR/MAIR/TCR/TTBR0/VBAR/CPTR_EL2,
-  SCTLR/CPACR/VBAR_EL1, TPIDR_EL0, CPUECTLR). So the contradiction stands: the
-  same fixed ID register reads differently by boot path (`booti` vs `go`) —
-  U-Boot's `booti` runs `cleanup_before_linux` (caches/MMU off) and `go` does
-  not. Decisive tests left: (1) read `ID_AA64DFR0_EL1` raw at EL1 on CPU0
-  from a kernel module under that Linux; (2) read it from a bare `go` payload
-  that executes nothing but the `mrs`. **DONE (2026-09-18, `zlinux/dfr0.s`):
-  a 235-byte payload run by the same `go` prints `ID_AA64DFR0` =
-  0x10305106 (PMUVer 1), `PMCEID0` = 0x67FFBFFF, PMCR 0x41033000, EL2 — a
-  full PMU. Modus on the same path reads 0x10305006 and 0x6800F97F. Two
-  CONSTANT ID registers cannot differ, so Modus's sysreg READS are what is
-  wrong (MIDR comes through exactly, so it is value-dependent).** Next:
-  capture the raw `mrs` result through memory (`serial-idm.py`) to split the
-  JIT-call return/tagging path from the read itself. Until then bare-metal
-  hardware-event counting is OPEN; cycles work (`PMCCFILTR.NSH`), `PMSWINC` works.
+- **2026-09-18 bisection (`serial-pmu3..6.py`, `serial-id.py`, `serial-idm.py`,
+  `zlinux/dfr0.s`, `zlinux/pmu.s`):** `CurrentEL` = EL2; `DBGAUTHSTATUS_EL1` =
+  0xFF; `MDCR_EL2` = 0x86 after our init (6 before); Linux's exact enable
+  ordering changes nothing; **`PMSWINC` increments count while every hardware
+  event (0x08, 0x1B, 0x04, 0x11, 0x10, 0x03) stays 0** over 100k JIT'd
+  iterations. ID registers are SANE and Modus reads them correctly
+  (memory-captured and return-path values agree with a bare payload):
+  `ID_AA64DFR0` = 0x10305106 (PMUVer 1), `PMCEID0` = 0x67FFBFFF, MIDR
+  0x410FD034 — an earlier "PMUVer 0 / 0x6800F97F" claim in this file was a
+  decimal→hex slip, retracted. **A 399-byte bare payload run by the same
+  U-Boot `go` (`pmu.s`: PMCR P|C|LC, clears, PMCCFILTR NSH, PMEVTYPER0 =
+  INST_RETIRED|NSH, PMCNTENSET, E=1, spin) COUNTS: PMEVCNTR0 0x2D0003,
+  PMCCNTR 0x28BCE1, NSH=0 control 0, MDCR_EL2 6, HCR_EL2 0x22.** So the
+  architecture, EL and boot path are fine; the block is in Modus's runtime
+  environment. Refuted along the way: EL3/`SPME` (we are at EL2), "CPU0's PMU
+  disabled" (all cores count under Linux), Modus boot writing PMU regs (it
+  writes none). Leading candidate: the **ARM clock** — every Modus PMU test
+  ran after the resume path raised the core to 1 GHz through the firmware
+  mailbox; the payload ran at the firmware's 600 MHz idle clock. Test: run
+  the Modus event probe at 600 MHz and at 1 GHz.
 - **Meanwhile the working tool is Modus HOSTED on the Zero's Linux** (§6f,
   within 6% of bare metal): `perf_event_open` is a syscall Modus can issue
   itself, so per-phase INST_RETIRED / L1I-refill / stall counters around the

@@ -1,8 +1,11 @@
 /* vpxbench: decode an IVF (VP8) file N times with libvpx, single thread, report ms/frame. */
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#define _GNU_SOURCE
+#include <sched.h>
 #include <vpx/vpx_decoder.h>
 #include <vpx/vp8dx.h>
 static double now_ms(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1000.0+t.tv_nsec/1e6;}
@@ -18,9 +21,11 @@ static int decode_all(const unsigned char*buf,long len,unsigned long*ysum){
     off+=12+sz;n++;}
   vpx_codec_destroy(&c);return n;}
 int main(int argc,char**argv){
+  if(getenv("VPX_CPU")){cpu_set_t s;CPU_ZERO(&s);CPU_SET(atoi(getenv("VPX_CPU")),&s);if(sched_setaffinity(0,sizeof s,&s))perror("setaffinity");}
+
   for(int a=1;a<argc;a++){FILE*f=fopen(argv[a],"rb");if(!f){perror(argv[a]);return 1;}
     fseek(f,0,SEEK_END);long len=ftell(f);fseek(f,0,SEEK_SET);unsigned char*buf=malloc(len);fread(buf,1,len,f);fclose(f);
     unsigned long ysum=0;int n=decode_all(buf,len,&ysum);
-    double t0=now_ms();for(int k=0;k<5;k++)n=decode_all(buf,len,NULL);double ms=now_ms()-t0;
-    printf("VPXBENCH %s: %d frames x5 in %.0f ms => %.2f ms/frame (%.1f fps) [libvpx %s, threads=1, ysum=%lu]\n",argv[a],n,ms,ms/(5.0*n),5.0*n*1000/ms,vpx_codec_version_str(),ysum);free(buf);}
+    double t0=now_ms();int P=getenv("VPX_PASSES")?atoi(getenv("VPX_PASSES")):5;for(int k=0;k<P;k++)n=decode_all(buf,len,NULL);double ms=now_ms()-t0;
+    printf("VPXBENCH %s: %d frames x%d in %.0f ms => %.2f ms/frame (%.1f fps) [libvpx %s, threads=1, ysum=%lu]\n",argv[a],n,P,ms,ms/((double)P*n),(double)P*n*1000/ms,vpx_codec_version_str(),ysum);free(buf);}
   return 0;}

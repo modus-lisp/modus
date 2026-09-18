@@ -31,7 +31,8 @@ rd_until(r"never",2.0)
 ev("(progn (in-package :cl-user) (package-name *package*))")
 ev("(setq *jit-hot-only* nil)")
 ev("(list :armclk (hdmi-arm-clock-max))",30.0)
-ev("(init)",180.0)   # HDMI framebuffer: play-ivf draws; without it a restored core faults silently on the first pass
+ev("(init)",180.0)
+ev("(list :eager (jit-eager))",900.0)   # re-link the restored core (the working session always ran it)   # HDMI framebuffer: play-ivf draws; without it a restored core faults silently on the first pass
 ev("(list :base (reel-demo-pass 1))",120.0)
 ev("(progn (defvar reel.decode::*o-loopf* (symbol-function (quote reel.decode::loop-filter-frame))) (defvar reel.decode::*t-loopf* 0) :ok-loopf)",10.0)
 ev("(progn (defun reel.decode::loop-filter-frame (vd key) (let ((t0 (rdtsc))) (multiple-value-prog1 (funcall reel.decode::*o-loopf* vd key) (setq reel.decode::*t-loopf* (+ reel.decode::*t-loopf* (- (rdtsc) t0)))))) :def-loopf)",20.0)

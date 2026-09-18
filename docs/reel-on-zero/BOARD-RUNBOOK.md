@@ -797,6 +797,68 @@ live fd is the snapshot primitive the phase wrappers use
   aarch64 `#'NAME` late-binding thunk (f0047a8) — a function value captured
   in a separate form survives redefinition on both arches, JIT on or off.
 
+## 6g. The compiler side: register-resident locals and hot-loop codegen (2026-09-18)
+
+Measured on the Pi 5 (A76, hosted CLI, cam.ivf 90 frames, `zlinux/modus-pmu-decode.lisp`),
+each row cumulative; MD5 48/48 at every step; every probe shape diffed against an
+SBCL reference run (`promote-probe.lisp` / `probe-ref.out`). Same-day commits
+`a1095b7` + `3a129d3` (branch hdmi-on-main).
+
+| change | inst/frame | cycles/frame | bool-bit loop, inst/iter |
+|---|---|---|---|
+| start of day (49.2 ms/frame on the Zero) | 37.33 M | 21.65 M | 227 (46 for the empty loop) |
+| declared-struct slot read/write = ONE `obj-ref` (`%word-aref`, not `%prim-aref`'s subtag dispatch) | 31.56 M | 19.33 M | 227 |
+| + fused compare-and-branch in `if` (fixnum `< > <= >= = /=`, `not`, `zerop`) | 30.01 M | 17.72 M | 201 (38) |
+| + five local registers V9–V13 = x6 x7 x4 x5 x8, promotion of let/let*/params; YIELD as NOP on hosted Linux | 29.47 M | 11.51 M | 200 (37) |
+| + operand-direct right operands, `setq` straight into the variable's register | **29.34 M** | **11.42 M** | **197 (32)** |
+
+That is −21 % instructions and −47 % cycles on the A76 (the cycle drop is mostly
+the SEV+WFE yield: 18 cycles per loop back-edge). What each piece is:
+
+- **Struct accessors.** `(bd-range bd)` on a declared `bool-dec` compiled to
+  `%prim-aref` — ~20 instructions with a u8/word subtag test, two frame slots
+  and a trap — where one `ldur` does; bool-bit has eight per call. Two lines in
+  `compile-call`.
+- **Local registers.** aarch64 had 15 scratch registers holding nothing. x6/x7
+  (unused) and x4/x5/x8 (only the syscall/exit/signal trap arms used them) are
+  now callee-saved BY MODUS CONVENTION: every prologue saves them (112-byte
+  save area; overflow args moved with it), the tailcall epilogue restores them,
+  SETJMP parks them in their spill slots and the landing reloads them, SAVE-CTX/
+  RESTORE-CTX push/pop them, the trap arms listed in `*a64-local-scratch-traps*`
+  save x4/x5/x8 around themselves, and the interpreter snapshots V4–V13 across
+  in-module calls (it preserved NOTHING before — found by the recursion probe).
+  The compiler's promotion (`%promote-locals-p`, on by default for the aarch64
+  runtime JIT) binds a function's hottest LET/LET*/parameter variables to them,
+  ranked by loop-weighted reference count; temps skip them; on x64 the same
+  bytecode leaves V9–V13 as spill slots. The old promotion into the shared temp
+  pool was a measured LOSS (+1.1 M inst/frame) and stays gone.
+- **The walker.** `%promote-walk` rejected every body containing a COND (a
+  clause's head is a list → mistaken for `((lambda …))`), and LET/LET*/MVB/DO
+  binding lists — so reel's bool decoder promoted nothing at all until fixed.
+- **Fusion.** `(if (< a b) …)` materialized T/NIL then BNULL'd it: nine
+  instructions for a three-instruction test.
+- **Setq into the register** needs an evaluation-order proof: `%setq-direct-
+  safe-p` — the variable is the leftmost leaf and every other operand on the
+  spine is a leaf, because `%swap-commutative-args` moves a non-leaf second
+  operand FIRST (`(setq acc (+ acc (f x)))` → the call landed in acc's
+  register before acc was read). The first version used RETURN-FROM out of a
+  LABELS function, which the self-hosted compiler does not honor, so it
+  accepted everything; the miscompiled code included the `six` NEON macro's
+  EXPANDER, which then produced a tree the store checker rejected — the
+  "needs a declared u8 array … fitting vector tree" error was this bug in
+  disguise. Rule: no RETURN-FROM inside LABELS in compiler.lisp.
+- **Validation that catches compiler bugs:** JIT-vs-interpreter diffs cannot
+  (same bytecode both sides). Diff against SBCL (`sed '1d' promote-probe.lisp`,
+  run under sbcl) and keep the reel MD5.
+
+Still on the table, in payoff order: (1) reel-side declarations — `range`/
+`value`/`prob` are `fixnum` (63-bit) slots, so `(- range 1)` may legally be a
+bignum and keeps its tag test; `(unsigned-byte 17)` etc. would let the
+compiler drop them; (2) the arithmetic operand-into-VR moves on the FIRST
+operand (`ADD-CHECKED dest src1 src2` is expressible, the emitter still routes
+through dest); (3) code size for the A53's I-cache (the never-taken generic
+fallbacks are emitted inline after every arithmetic op).
+
 ## 7. Serial-only fallback (no `MODUS_SSH_BUILD`)
 
 The serial REPL prints **bare values** (no `= `). Tag every form so a reply can

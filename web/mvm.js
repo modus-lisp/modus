@@ -37,6 +37,15 @@ for (const [ops, n] of [[[0x00,0x01,0x72,0x82,0x89,0x8B,0x92,0xA2,0xA3,0xA4],1],
   [[0x11,0x14],10],[[0x12,0x13,0x26,0x27,0x81,0x88,0x8A,0x90,0x91,0xB8,0xBA,0xBB,0xBC,0xBD],2],
   [[0x20,0x21,0x22,0x23,0x24,0x28,0x29,0x2A,0x2B,0x2C,0x2D,0x2F,0x32,0x52,0x61,0x62,0x65,0x66,0x70,0x71,0x93,0xA5,0xA6,0xA8,0xA9,0xAA,0xAB,0xAC,0xAD,0xAE,0xAF,0xB1,0xB2,0xB3,0xB4,0xB5,0xB6,0xBE,0xBF,0xC0,0xC1,0xC5,0xC6,0xC9,0xCA],4],
   [[0x2E,0x60,0x40,0x41,0x42,0x43,0x44,0x45,0x46,0x80,0x83,0xA0,0xA1,0xC7],5],[[0x47,0x48,0xA7],6]]) for (const o of ops) INSN_LEN[o] = n;
+// Opcodes added to the ISA after this file was written.  RELOCATION walks the
+// module bytecode by these lengths, so a missing entry is not a slow path, it
+// is `module relocation failed' at boot — which is exactly what the SIMD block
+// did.  The size-aware GC checks execute (below); the f32/v4/vi SIMD block is
+// length-only and falls to the interpreter's unknown-opcode fault if a
+// function that actually uses it is ever called in the browser.
+for (const [ops, n] of [[[0x8D,0xCB,0xD0,0xD1,0xD2,0xDB,0xE1],3],
+  [[0xCC,0xCD,0xCE,0xCF,0xD3,0xD4,0xD5,0xD6,0xD7,0xD8,0xD9,0xDA,0xDC,0xDD,0xDE,0xDF,0xE0,0xE4,0xE5,0xE8],4],
+  [[0x8C,0xE2,0xE3,0xE6,0xE7,0xE9],5],[[0xEA],6]]) for (const o of ops) INSN_LEN[o] = n;
 const ALLOC_START_OFF = 0x400;            // boot-linux-x64: +linux-x64-heap-alloc-start+
 const GUARD      = 0x01000000;            // 16 MB overshoot guard
 
@@ -1125,6 +1134,19 @@ class MVM {
         }
         case 0x88: { const base = this.bump(16); this.zero(base, base + 16); this.markStart(base); this.markCons(base); this.setReg(code[pc + 1], base | 1, 0); pc += 2; break; }
         case 0x89: { if (this.va >= this.vl) this.gc(); pc += 1; break; }
+        // Size-aware GC checks (ALLOC-CHECK-PLAN).  Plain 0x89 tests VA<VL
+        // BEFORE an allocation whose size it does not know, so the alloc that
+        // follows a passing check can overshoot VL by the whole object; these
+        // two carry the size and check VA+nbytes.  Same arithmetic as
+        // translate-x64: +32 covers the header, the pad and the alignment
+        // overshoot, and the per-kind shift is load-bearing — kind 0's count
+        // was already untagged by the compiler, kind 1's is still tagged, and
+        // untagging an untagged count halves it and UNDER-checks.
+        case 0x8C: { const n = this.rd32(pc + 1) >>> 0;
+                     if (this.va + n >= this.vl) this.gc(); pc += 5; break; }
+        case 0x8D: { const c = this.rlo(code[pc + 1]), kind = code[pc + 2];
+                     const nbytes = (kind === 0 ? c * 8 : c >> 1) + 32;
+                     if (this.va + nbytes >= this.vl) this.gc(); pc += 3; break; }
         case 0x8A: pc += 2; break;
         case 0x8B: pc += 1; break;
         case 0x90: case 0x91: this.fault('save-ctx/restore-ctx not supported');

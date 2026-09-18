@@ -10,7 +10,10 @@
 #      output path is shared — two concurrent builds would clobber it).
 #   3. Builds ONE clean image (build-generic-cli) at the fix ref — the build
 #      taxonomy check: a gate runner building says nothing about the 25
-#      shipping images.
+#      shipping images.  Then builds the WEB module (mvm/build-web.lisp) and
+#      boots it under node: the JS MVM in web/mvm.js is a third execution
+#      engine and this is the only thing that keeps it from rotting.
+#      MODUS_GATE_NO_WEB=1 skips it; it self-skips without node.
 #   4. Runs the 64-shard sweep (same method BOTH sides — ID sets are only
 #      comparable same-run/same-method) via the inlined n-shard runner.
 #   5. Verdict:
@@ -100,6 +103,44 @@ echo "-- building one clean image at fix ref (build taxonomy check) --"
   > "$FIX_WT/tmp/cli-build.log" 2>&1 )
 if [ ! -x "$FIX_WT/tmp/modus-cli" ]; then
   echo "FAIL: clean image (build-generic-cli) failed at fix ref"; exit 1; fi
+
+# The JS MVM is a THIRD execution engine (native translators, the in-image
+# interpreter, and web/mvm.js), and nothing else in this gate exercises it.  It
+# rotted silently once already: the opcode-length table stopped at the ISA of
+# the day, so the SIMD block and the size-aware GC checks made every module fail
+# RELOCATION before an instruction ran, and a later hash-table rework broke the
+# boot on top of that.  Both were found only when someone tried the browser
+# months later.  This stage is cheap — one module build plus one boot — and it
+# is a RATCHET: it reports while the engine is mid-repair and becomes fatal the
+# day it boots, because a silent third engine is how the rot happened.
+# Skip with MODUS_GATE_NO_WEB=1 (and it self-skips where node is absent).
+if [ -z "$MODUS_GATE_NO_WEB" ] && [ -f "$FIX_WT/mvm/build-web.lisp" ] && command -v node >/dev/null 2>&1; then
+  echo "-- web: JS MVM module build + boot smoke at fix ref --"
+  ( cd "$FIX_WT" && MODUS_NO_JIT=1 MODUS_WEB_OUT="$FIX_WT/tmp/modus.mvmw" \
+    sbcl --dynamic-space-size 8192 --script mvm/build-web.lisp \
+    > "$FIX_WT/tmp/web-build.log" 2>&1 )
+  if [ ! -s "$FIX_WT/tmp/modus.mvmw" ]; then
+    echo "FAIL: web module (build-web.lisp) failed at fix ref (see tmp/web-build.log)"; exit 1; fi
+  # --no-compile keeps it to the JS interpreter: the JS JIT delegates unknown
+  # opcodes to it, so the interpreter is the arm that must be complete.
+  WEBOUT=$( cd "$FIX_WT" && timeout 900 node web/run-node.js --mvmw "$FIX_WT/tmp/modus.mvmw" \
+    --no-compile --eval '(print (* 6 7))' --quit 2>&1 )
+  if echo "$WEBOUT" | grep -q '^42'; then
+    echo "web: BOOT-OK (JS MVM evaluated (* 6 7))"
+  else
+    # RATCHET, not yet fatal.  The browser engine is mid-repair: the opcode
+    # table and the duplicated globals hash are fixed and boot now reaches
+    # %INIT-MAKE-LOAD-FORM, where MVM-EVAL-FORMS hits `longjmp with no handler
+    # armed' — the third distinct gap the 324-commit drift left.  Until that
+    # one is closed this stage REPORTS so the drift stays visible and nobody
+    # has to rediscover it; flip the `exit 1' back on the day it boots, which
+    # is the whole point of having the stage at all.
+    echo "WARN: web image did not boot at fix ref (ratchet: not yet fatal)"
+    echo "$WEBOUT" | grep -aE 'FAULT|Error|unknown opcode|relocation' | head -3
+  fi
+else
+  echo "-- web: skipped (MODUS_GATE_NO_WEB, no build-web.lisp, or no node) --"
+fi
 
 echo "-- running 64-shard sweeps (both sides, same method) --"
 BLINE=$(run_shards "$BASE_WT/tmp/ansi-gate-bin" "$WORKDIR/base.pass" base)

@@ -9974,6 +9974,14 @@
    first version of this predicate silently accepted everything.)"
   (cond ((atom f) (and f (symbolp f) (name-equal f var)))
         ((not (consp (cdr f))) nil)
+        ;; A ONE-argument node is trusted only for 1+ / 1-: unary `-' and `/'
+        ;; are compiled as (- 0 x) / (/ 1 x), which evaluate the constant into
+        ;; DEST before reading x — `(setf v (- v))' in reel's get-coeffs zeroed
+        ;; every negative coefficient (2026-09-18).
+        ((and (null (cddr f))
+              (not (and (symbolp (car f))
+                        (or (name-eq (car f) "1+") (name-eq (car f) "1-")))))
+         nil)
         (t (let ((ok t) (rest (cddr f)))
              (loop (when (not (consp rest)) (return))
                    (unless (%leaf-operand-p (car rest) env) (setq ok nil) (return))

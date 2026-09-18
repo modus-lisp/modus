@@ -111,9 +111,11 @@ if [ ! -x "$FIX_WT/tmp/modus-cli" ]; then
 # RELOCATION before an instruction ran, and a later hash-table rework broke the
 # boot on top of that.  Both were found only when someone tried the browser
 # months later.  This stage is cheap — one module build plus one boot — and it
-# is a RATCHET: it reports while the engine is mid-repair and becomes fatal the
-# day it boots, because a silent third engine is how the rot happened.
+# is a RATCHET: it reported while the engine was mid-repair and is FATAL as of
+# the day it booted, because a silent third engine is how the rot happened.
 # Skip with MODUS_GATE_NO_WEB=1 (and it self-skips where node is absent).
+# The 900 s budget is for the INTERPRETER arm: the boot is ~8.5 min under
+# --no-compile (~43 s with the JS translator on), so this is not slack.
 if [ -z "$MODUS_GATE_NO_WEB" ] && [ -f "$FIX_WT/mvm/build-web.lisp" ] && command -v node >/dev/null 2>&1; then
   echo "-- web: JS MVM module build + boot smoke at fix ref --"
   ( cd "$FIX_WT" && MODUS_NO_JIT=1 MODUS_WEB_OUT="$FIX_WT/tmp/modus.mvmw" \
@@ -128,15 +130,16 @@ if [ -z "$MODUS_GATE_NO_WEB" ] && [ -f "$FIX_WT/mvm/build-web.lisp" ] && command
   if echo "$WEBOUT" | grep -q '^42'; then
     echo "web: BOOT-OK (JS MVM evaluated (* 6 7))"
   else
-    # RATCHET, not yet fatal.  The browser engine is mid-repair: the opcode
-    # table and the duplicated globals hash are fixed and boot now reaches
-    # %INIT-MAKE-LOAD-FORM, where MVM-EVAL-FORMS hits `longjmp with no handler
-    # armed' — the third distinct gap the 324-commit drift left.  Until that
-    # one is closed this stage REPORTS so the drift stays visible and nobody
-    # has to rediscover it; flip the `exit 1' back on the day it boots, which
-    # is the whole point of having the stage at all.
-    echo "WARN: web image did not boot at fix ref (ratchet: not yet fatal)"
+    # RATCHET CLOSED.  All four gaps the 324-commit drift left are fixed — the
+    # opcode-length table, %GV-CELL's duplicated globals hash, the file-I/O
+    # staging page that was unmapped for the first half of boot, and the stale
+    # bucket-count override that re-indexed every table on every insert — so
+    # the engine boots and this is fatal again.  That is the whole point of
+    # having the stage: the next drift stops a gate instead of being found by
+    # someone opening the browser months later.
+    echo "FAIL: web image did not boot at fix ref (JS MVM)"
     echo "$WEBOUT" | grep -aE 'FAULT|Error|unknown opcode|relocation' | head -3
+    exit 1
   fi
 else
   echo "-- web: skipped (MODUS_GATE_NO_WEB, no build-web.lisp, or no node) --"

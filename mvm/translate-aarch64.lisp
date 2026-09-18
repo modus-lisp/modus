@@ -2188,14 +2188,14 @@
                    (a64-load-imm64 buf +a64-x17+ *aarch64-serial-base*)
                    (when *aarch64-serial-tx-poll*
                      (destructuring-bind (offset bit polarity) *aarch64-serial-tx-poll*
-                       (a64-ldr-width buf 18 +a64-x17+ offset 2)
+                       (a64-ldr-width buf +a64-x15+ +a64-x17+ offset 2)   ; x15: x18 is the convention base
                        (let ((opcode (ecase polarity
                                        (:tbz  #b00110110)
                                        (:tbnz #b00110111))))
                          (a64-emit buf (logior (ash opcode 24)
                                                (ash bit 19)
                                                (ash (logand -1 #x3FFF) 5)
-                                               18)))))
+                                               +a64-x15+)))))
                    (a64-str-width buf +a64-x16+ +a64-x17+ 0 *aarch64-serial-width*))))
                ((= code #x0301)
                 ;; Serial read: poll UART until a byte is available,
@@ -2209,10 +2209,10 @@
                 ;; load UART base into x17
                 (a64-load-imm64 buf +a64-x17+ *aarch64-serial-base*)
                 ;; poll loop (2 instructions), flag read at width 2 like TX:
-                ;;   ldr w18, [x17, #offset]
+                ;;   ldr w15, [x17, #offset]
                 (destructuring-bind (offset bit polarity) *aarch64-serial-rx-poll*
-                  (a64-ldr-width buf 18 +a64-x17+ offset 2)
-                  ;;   tb(n)z x18, #bit, -4    ; loop while not-ready
+                  (a64-ldr-width buf +a64-x15+ +a64-x17+ offset 2)   ; x15: x18 is the convention base
+                  ;;   tb(n)z x15, #bit, -4    ; loop while not-ready
                   ;; TB(N)Z encoding: b5|011011|op|b40|imm14|Rt
                   (let ((opcode (ecase polarity
                                   (:tbz  #b00110110)
@@ -2220,7 +2220,7 @@
                     (a64-emit buf (logior (ash opcode 24)
                                           (ash bit 19)
                                           (ash (logand -1 #x3FFF) 5)  ; imm14 = -1
-                                          18))))
+                                          +a64-x15+))))
                 ;; read data register at the configured width (0 = byte for
                 ;; PL011, 2 = 32-bit for the mini UART's AUX_MU_IO_REG)
                 (a64-ldr-width buf +a64-x0+ +a64-x17+ 0 *aarch64-serial-width*)

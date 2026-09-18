@@ -539,6 +539,24 @@ not. Read `CTR_EL0`/`CCSIDR_EL1` for the real cache geometry.
   authentication that gates event counting but not the cycle counter.
   Until then: per-stage CYCLES via `pmu-cycles` (equivalent to `rdtsc`×52 at
   1 GHz; both exist), no IPC/branch-miss split.
+- **2026-09-18 bisection (`serial-pmu3..6.py`, `serial-id.py`):** `CurrentEL`
+  = EL2 (so not the EL3/`MDCR_EL3.SPME` theory); `DBGAUTHSTATUS_EL1` = 0xFF
+  (NIDEN high); `MDCR_EL2` = 0x86 (HPME, HPMN=6); Linux's exact ordering
+  (E=0 → `PMCNTENCLR` → `PMEVTYPER0` direct → `PMCNTENSET` → E=1) changes
+  nothing; **`PMSWINC` increments count (3/3) while every hardware event —
+  0x08, 0x1B, 0x04, 0x11, 0x10, 0x03 — stays at 0 over 100k iterations.**
+  So the counter mechanism works and the hardware event sources are gated.
+  And `ID_AA64DFR0_EL1` reads **0x10305006 = PMUVer 0 ("no PMU")** on the
+  bare-metal board (twice; MIDR 0x410FD034 = A53 r0p4) — the documented value
+  is 0x10305106, and Linux's `arm_pmuv3` refuses to probe on PMUVer 0 yet ran
+  7 counters on this silicon. First real environment difference. Working
+  hypothesis: U-Boot hands Modus to CPU0 and the firmware's EL3 stub leaves
+  CPU0's PMU disabled; Linux's perf counted across all cores. Test: pin a
+  benchmark to CPU0 vs CPU1 under Linux and sample each.
+- **Meanwhile the working tool is Modus HOSTED on the Zero's Linux** (§6f,
+  within 6% of bare metal): `perf_event_open` is a syscall Modus can issue
+  itself, so per-phase INST_RETIRED / L1I-refill / stall counters around the
+  existing phase wrappers are buildable there without the EL2 mystery.
 
 ## 6f. Linux on the Zero over the same rig (the SBCL reference, and `perf`)
 

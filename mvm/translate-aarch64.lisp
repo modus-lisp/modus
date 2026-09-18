@@ -1996,7 +1996,7 @@
                                   ;; socket syscalls hid for so long.
                                   (228 . 113)
      (16 . 29)    ; ioctl
-     (298 . 241)) ; perf_event_open)
+     (298 . 241))) ; perf_event_open
 
 (defun translate-mvm-insn (insn buf mvm-to-native-label)
   "Translate a single decoded MVM instruction, emitting AArch64

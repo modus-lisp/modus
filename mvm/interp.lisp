@@ -2343,7 +2343,16 @@
                  ;; `(funcall f) (funcall f)` lost f on the 2nd read).  op-ret
                  ;; restores VFP from the frame.
                  (progn
-                   (push (list npc (mvm-stack state) (svref regs +vreg-vfp+))
+                   ;; CALLEE-SAVED REGISTERS (2026-09-18): native code preserves
+                   ;; V4-V8 (x19-x23) and the local registers V9/V10 (x6/x7)
+                   ;; through the callee's prologue/epilogue, and the compiler's
+                   ;; register promotion relies on that (a promoted local is
+                   ;; live across calls).  Snapshot V4..V10 into the frame and
+                   ;; restore them at RET so the interpreter is faithful to the
+                   ;; ISA (found by the promotion probe: recursion clobbered the
+                   ;; caller's promoted locals under MODUS_NO_JIT).
+                   (push (list npc (mvm-stack state) (svref regs +vreg-vfp+)
+                               (subseq regs +vreg-v4+ (+ +vreg-v13+ 1)))
                          (mvm-call-stack state))
                    (setf pc (if (< target (length ftab)) (aref ftab target) target))))))
 
@@ -2393,7 +2402,8 @@
                  ;; Save VFP in the frame (see op-CALL) so a local re-read in
                  ;; the caller after this call survives the callee's frame.
                  ((integerp target)
-                  (push (list npc (mvm-stack state) (svref regs +vreg-vfp+))
+                  (push (list npc (mvm-stack state) (svref regs +vreg-vfp+)
+                              (subseq regs +vreg-v4+ (+ +vreg-v13+ 1)))   ; callee-saved V4..V13, see op-call
                         (mvm-call-stack state))
                   (setf pc target))
                  ;; Higher-order mvm-eval bridge: a resolved native function object
@@ -2450,7 +2460,10 @@
                  ;; caller's frame, not the (now-dead) callee's.
                  (setf pc (first frame))
                  (setf (mvm-stack state) (second frame))
-                 (setf (svref regs +vreg-vfp+) (third frame)))
+                 (setf (svref regs +vreg-vfp+) (third frame))
+                 ;; restore the callee-saved range V4..V13 (see op-call)
+                 (when (fourth frame)
+                   (replace regs (fourth frame) :start1 +vreg-v4+)))
                (setf (mvm-halted state) t)))
 
           (#.+op-tailcall+

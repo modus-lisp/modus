@@ -508,7 +508,25 @@
     (setf (aref map +vreg-v6+) +a64-x21+)
     (setf (aref map +vreg-v7+) +a64-x22+)
     (setf (aref map +vreg-v8+) +a64-x23+)
-    ;; V9-V15 spill (nil)
+    ;; V9/V10 → x6/x7: LOCAL REGISTERS (2026-09-18).  x6/x7 held nothing in
+    ;; this translator (their only prior appearance was the GC trampoline's
+    ;; own save/restore), so they are made callee-saved BY MODUS CONVENTION:
+    ;; every prologue saves them at [sp,#64] and every epilogue restores them
+    ;; (the save area had 16 free bytes), SAVE-CTX/RESTORE-CTX push/pop them,
+    ;; SETJMP parks them in their old spill slots and the landing reloads
+    ;; them, and syscall traps never touch them (x0-x5, x8).  The compiler's
+    ;; register promotion binds a function's hottest locals/params to them
+    ;; (see %promote-locals-p) so temps keep V4-V8; on x64 V9/V10 stay spill
+    ;; slots, so the same bytecode is correct there (just unpromoted).
+    (setf (aref map +vreg-v9+)  +a64-x6+)
+    (setf (aref map +vreg-v10+) +a64-x7+)
+    ;; V11-V13 → x4/x5/x8: three more local registers.  AAPCS scratch, used
+    ;; by this translator only inside the syscall/exit/signal trap arms,
+    ;; which now save and restore them (a64-local-scratch-trap-p).
+    (setf (aref map +vreg-v11+) +a64-x4+)
+    (setf (aref map +vreg-v12+) +a64-x5+)
+    (setf (aref map +vreg-v13+) +a64-x8+)
+    ;; V14-V15 spill (nil)
     ;; Special registers
     (setf (aref map +vreg-vr+)  +a64-x0+)    ; return = x0
     (setf (aref map +vreg-va+)  +a64-x24+)   ; alloc pointer
@@ -528,7 +546,7 @@
   "Return the frame-relative offset for a spilled virtual register.
    Spill slots begin at [FP, #-64] and grow downward.
    Returns NIL for non-spilled registers."
-  (when (and (>= vreg +vreg-v9+) (<= vreg +vreg-v15+))
+  (when (and (>= vreg +vreg-v14+) (<= vreg +vreg-v15+))
     (* (- vreg +vreg-v9+) -8)))
 
 (defun a64-resolve-reg (vreg scratch)
@@ -1777,7 +1795,7 @@
       (phys
        (unless (= phys phys-dest)
          (a64-mov-reg buf phys-dest phys)))
-      ((and (>= vreg +vreg-v9+) (<= vreg +vreg-v15+))
+      ((and (>= vreg +vreg-v14+) (<= vreg +vreg-v15+))
        (a64-load-spill buf phys-dest vreg))
       (t
        (error "AArch64: cannot load virtual register ~D" vreg)))))
@@ -1790,7 +1808,7 @@
       (phys
        (unless (= phys phys-src)
          (a64-mov-reg buf phys phys-src)))
-      ((and (>= vreg +vreg-v9+) (<= vreg +vreg-v15+))
+      ((and (>= vreg +vreg-v14+) (<= vreg +vreg-v15+))
        (a64-store-spill buf phys-src vreg))
       (t
        (error "AArch64: cannot store to virtual register ~D" vreg)))))
@@ -1799,6 +1817,33 @@
 ;;; Prologue / Epilogue
 ;;; ============================================================
 
+(defconstant +a64-save-area+ 112
+  "Bytes of the callee-save area a prologue pushes: FP/LR, x19-x23, x27, and
+   the five local registers x6/x7/x4/x5/x8 (V9-V13).  Overflow arguments
+   live above it at [FP + +a64-save-area+ + k*stride].")
+(defun a64-emit-local-regs-save (buf)
+  "Save the local registers (V9-V13 = x6 x7 x4 x5 x8) into the save area."
+  (a64-stp-offset buf +a64-x6+ +a64-x7+ +a64-sp+ 64)
+  (a64-stp-offset buf +a64-x4+ +a64-x5+ +a64-sp+ 80)
+  (a64-stp-offset buf +a64-x8+ +a64-xzr+ +a64-sp+ 96))
+(defun a64-emit-local-regs-restore (buf)
+  (a64-ldp-offset buf +a64-x6+ +a64-x7+ +a64-sp+ 64)
+  (a64-ldp-offset buf +a64-x4+ +a64-x5+ +a64-sp+ 80)
+  (a64-ldr-unsigned buf +a64-x8+ +a64-sp+ 96))
+(defparameter *a64-local-scratch-traps*
+  '(#x0300 #x0301 #x0500 #x0502 #x050B #x0503 #x0504 #x0505 #x0506 #x0507
+    #x0508 #x0509 #x050A #x0531 #x0534 #x0520)
+  "Trap codes whose expansion clobbers x4/x5/x8 (syscall arguments and the
+   syscall number).  Those are local registers V11-V13 now, so the trap op
+   saves them around these arms.  SETJMP/LONGJMP and the overflow-arg copy
+   (#x0530) read SP and are NOT wrapped; they do not touch these registers.")
+(defun a64-local-scratch-trap-p (code) (member code *a64-local-scratch-traps*))
+(defun a64-save-local-scratch (buf)
+  (a64-stp-pre buf +a64-x4+ +a64-x5+ +a64-sp+ -32)
+  (a64-stp-offset buf +a64-x8+ +a64-xzr+ +a64-sp+ 16))
+(defun a64-restore-local-scratch (buf)
+  (a64-ldr-unsigned buf +a64-x8+ +a64-sp+ 16)
+  (a64-ldp-post buf +a64-x4+ +a64-x5+ +a64-sp+ 32))
 (defun a64-emit-prologue (buf)
   "Emit the standard function prologue:
      STP x29, x30, [sp, #-80]!
@@ -1817,7 +1862,7 @@
    but a caller that itself was called by something expects its own
    x27 to survive the inner call."
   ;; Save FP and LR, allocate save area
-  (a64-stp-pre buf +a64-x29+ +a64-x30+ +a64-sp+ -80)
+  (a64-stp-pre buf +a64-x29+ +a64-x30+ +a64-sp+ (- +a64-save-area+))
   ;; Set up frame pointer: ADD x29, SP, #0
   ;; (Cannot use a64-mov-reg because ORR encodes reg 31 as XZR, not SP)
   (a64-add-imm buf +a64-x29+ +a64-sp+ 0)
@@ -1827,6 +1872,8 @@
   (a64-stp-offset buf +a64-x21+ +a64-x22+ +a64-sp+ 32)
   ;; Save x23 paired with x27 (CENV).  Replaces the previous xzr slot.
   (a64-stp-offset buf +a64-x23+ +a64-x27+ +a64-sp+ 48)
+  ;; x6/x7/x4/x5/x8 = V9-V13, callee-saved by Modus convention (see *a64-vreg-to-phys*)
+  (a64-emit-local-regs-save buf)
   ;; Allocate space for spill slots and frame locals below FP
   (a64-sub-imm buf +a64-sp+ +a64-sp+ +a64-locals-frame-size+))
 
@@ -1842,13 +1889,14 @@
    restored — see prologue docstring."
   ;; Deallocate spill/frame-slot area
   (a64-add-imm buf +a64-sp+ +a64-sp+ +a64-locals-frame-size+)
-  ;; Restore callee-saved registers (x19-x23, x27)
+  ;; Restore callee-saved registers (x19-x23, x27, and x6/x7 = V9/V10)
   ;; x24/x25/x26 are global alloc/limit/nil — do NOT restore
+  (a64-emit-local-regs-restore buf)
   (a64-ldp-offset buf +a64-x23+ +a64-x27+ +a64-sp+ 48)
   (a64-ldp-offset buf +a64-x21+ +a64-x22+ +a64-sp+ 32)
   (a64-ldp-offset buf +a64-x19+ +a64-x20+ +a64-sp+ 16)
   ;; Restore FP/LR and deallocate save area
-  (a64-ldp-post buf +a64-x29+ +a64-x30+ +a64-sp+ 80)
+  (a64-ldp-post buf +a64-x29+ +a64-x30+ +a64-sp+ +a64-save-area+)
   (a64-ret buf))
 
 ;;; ============================================================
@@ -2031,6 +2079,7 @@
           ;; ---- TRAP ----
           ((= op +op-trap+)
            (let ((code (vr 0)))
+             (when (a64-local-scratch-trap-p code) (a64-save-local-scratch buf))
              (cond
                ((< code #x0100)
                 ;; Frame-enter: emit function prologue
@@ -2056,7 +2105,7 @@
                 (when (> code 4)
                   (let ((arg-stride (if *aarch64-stack-align-16* 16 8)))
                     (loop for i from 4 below code
-                          for src-offset = (+ 80 (* (- i 4) arg-stride))
+                          for src-offset = (+ +a64-save-area+ (* (- i 4) arg-stride))
                           for dst-offset = (+ +a64-frame-slot-base+ (* i -8))
                           ;; LDUR/STUR carry a SIGNED imm9 (-256..255).  A
                           ;; function with enough params runs SRC past +255 and
@@ -2646,6 +2695,16 @@
                   (a64-movz buf +a64-x16+ #xFFF0 0)
                   (a64-movk buf +a64-x16+ #x1000 1)
                   (a64-ldr-unsigned buf +a64-x30+ +a64-x16+ 0))
+                ;; x6/x7 (V9/V10 local registers) are not in the jmpbuf: park
+                ;; them in this frame's (otherwise unused) V9/V10 spill slots
+                ;; and reload them at the landing point below, on both the
+                ;; first-call and the longjmp path.  A thrower's chain
+                ;; clobbers them freely (its epilogues never run).
+                (a64-store-spill buf +a64-x6+ +vreg-v9+)
+                (a64-store-spill buf +a64-x7+ +vreg-v10+)
+                (a64-store-spill buf +a64-x4+ +vreg-v11+)
+                (a64-store-spill buf +a64-x5+ +vreg-v12+)
+                (a64-store-spill buf +a64-x8+ +vreg-v13+)
                 (a64-load-imm64 buf +a64-x16+ #x10000180)
                 (a64-add-imm buf +a64-x17+ +a64-sp+ 0)        ; mov x17, sp
                 (a64-str-unsigned buf +a64-x17+ +a64-x16+ 0)
@@ -2657,6 +2716,11 @@
                   (a64-mov-reg buf +a64-x0+ +a64-x26+)         ; first-time return = NIL
                   ;; AFTER this point execution falls through.  ADR target is here.
                   (let ((return-idx (a64-current-index buf)))
+                    (a64-load-spill buf +a64-x6+ +vreg-v9+)
+                    (a64-load-spill buf +a64-x7+ +vreg-v10+)
+                    (a64-load-spill buf +a64-x4+ +vreg-v11+)
+                    (a64-load-spill buf +a64-x5+ +vreg-v12+)
+                    (a64-load-spill buf +a64-x8+ +vreg-v13+)
                     (let* ((byte-off (* (- return-idx adr-idx) 4))
                            (immlo (logand byte-off 3))
                            (immhi (logand (ash byte-off -2) #x7FFFF)))
@@ -2849,7 +2913,7 @@
                     ;; sub w9, w9, #4
                     (a64-sub-imm buf 9 9 4)
                     ;; add x10, x29, #80 — src ptr
-                    (a64-add-imm buf 10 +a64-x29+ 80)
+                    (a64-add-imm buf 10 +a64-x29+ +a64-save-area+)
                     ;; sub x11, x29, #96 — dst ptr
                     (a64-sub-imm buf 11 +a64-x29+ 96)
                     ;; loop:
@@ -3076,7 +3140,8 @@
 
                (t
                 ;; Real CPU trap
-                (a64-svc buf code)))))
+                (a64-svc buf code)))
+             (when (a64-local-scratch-trap-p code) (a64-restore-local-scratch buf))))
 
           ;; ---- MOV Vd, Vs ----
           ((= op +op-mov+)
@@ -4731,10 +4796,13 @@
                ;; Deallocate spill/frame-slot area and restore callee-saved regs
                ;; x24/x25/x26 are global state — NOT restored
                (a64-add-imm buf +a64-sp+ +a64-sp+ +a64-locals-frame-size+)
+               ;; the local registers too: the tail target's prologue would
+               ;; otherwise save OUR values and hand them back to our caller
+               (a64-emit-local-regs-restore buf)
                (a64-ldp-offset buf +a64-x23+ +a64-xzr+ +a64-sp+ 48)
                (a64-ldp-offset buf +a64-x21+ +a64-x22+ +a64-sp+ 32)
                (a64-ldp-offset buf +a64-x19+ +a64-x20+ +a64-sp+ 16)
-               (a64-ldp-post buf +a64-x29+ +a64-x30+ +a64-sp+ 80)
+               (a64-ldp-post buf +a64-x29+ +a64-x30+ +a64-sp+ +a64-save-area+)
                ;; TAIL JUMP to the target (B, or absolute BR under the gate
                ;; long-range flag — a cross-function tailcall can exceed B's
                ;; +/-128MB reach in the >128MB image; x30 already restored so
@@ -4904,10 +4972,14 @@
           ((= op +op-save-ctx+)
            (let* ((vd (vr 0))
                   (pa (ensure-src vd +a64-x0+)))
-             ;; 1. Push extra callee-saved to stack (48 bytes, 16-byte aligned)
-             (a64-stp-pre buf +a64-x20+ +a64-x21+ +a64-sp+ -48)
+             ;; 1. Push extra callee-saved to stack (64 bytes, 16-byte aligned):
+             ;;    x20-x23, FP/LR, and x6/x7 (V9/V10 local registers)
+             (a64-stp-pre buf +a64-x20+ +a64-x21+ +a64-sp+ -96)
              (a64-stp-offset buf +a64-x22+ +a64-x23+ +a64-sp+ 16)
              (a64-stp-offset buf +a64-x29+ +a64-x30+ +a64-sp+ 32)
+             (a64-stp-offset buf +a64-x6+ +a64-x7+ +a64-sp+ 48)
+             (a64-stp-offset buf +a64-x4+ +a64-x5+ +a64-sp+ 64)
+             (a64-stp-offset buf +a64-x8+ +a64-xzr+ +a64-sp+ 80)
              ;; 2. Save SP (post-push) to save area [pa+0x00]
              (a64-add-imm buf +a64-x16+ +a64-sp+ 0)   ; MOV x16, SP
              (a64-str-unsigned buf +a64-x16+ pa 0)     ; [pa+0x00] = SP
@@ -4950,9 +5022,12 @@
                      (setf (aref (a64-buffer-code buf) b-idx)
                            (logior (ash #b000101 26)
                                    (logand (- pop-idx b-idx) #x3FFFFFF)))
+                     (a64-ldr-unsigned buf +a64-x8+ +a64-sp+ 80)
+                     (a64-ldp-offset buf +a64-x4+ +a64-x5+ +a64-sp+ 64)
+                     (a64-ldp-offset buf +a64-x6+ +a64-x7+ +a64-sp+ 48)
                      (a64-ldp-offset buf +a64-x29+ +a64-x30+ +a64-sp+ 32)
                      (a64-ldp-offset buf +a64-x22+ +a64-x23+ +a64-sp+ 16)
-                     (a64-ldp-post buf +a64-x20+ +a64-x21+ +a64-sp+ 48)
+                     (a64-ldp-post buf +a64-x20+ +a64-x21+ +a64-sp+ 96)
                      ;; 10. Store result (x0) into Vd
                      (store-dst +a64-x0+ vd)))))))
 

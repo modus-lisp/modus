@@ -960,8 +960,8 @@
     (aset v 4 (quote rbx))  (aset v 5 (quote rcx))
     (aset v 6 (quote rdx))  (aset v 7 (quote r10))
     (aset v 8 (quote r11))
-    (aset v 9 nil)  (aset v 10 nil) (aset v 11 nil) (aset v 12 nil)
-    (aset v 13 nil) (aset v 14 nil) (aset v 15 nil) (aset v 22 nil)
+    (aset v 9 6)  (aset v 10 7) (aset v 11 4) (aset v 12 5)
+    (aset v 13 8) (aset v 14 nil) (aset v 15 nil) (aset v 22 nil)
     (aset v 16 (quote rax)) (aset v 17 (quote r12))
     (aset v 18 (quote r14)) (aset v 19 (quote r15))
     (aset v 20 (quote rsp)) (aset v 21 (quote rbp))
@@ -1001,13 +1001,16 @@
     (aset v 0 0)   (aset v 1 1)   (aset v 2 2)   (aset v 3 3)
     (aset v 4 19)  (aset v 5 20)  (aset v 6 21)  (aset v 7 22)
     (aset v 8 23)
-    (aset v 9 nil)  (aset v 10 nil) (aset v 11 nil) (aset v 12 nil)
-    (aset v 13 nil) (aset v 14 nil) (aset v 15 nil)
+    (aset v 9 6)  (aset v 10 7) (aset v 11 4) (aset v 12 5)
+    (aset v 13 8) (aset v 14 nil) (aset v 15 nil)
     (aset v 16 0)  (aset v 17 24) (aset v 18 25) (aset v 19 26)
     (aset v 20 31) (aset v 21 29) (aset v 22 nil)
     (setq *a64-vreg-to-phys* v))
   (setq *aarch64-serial-width* 0)
   (setq *aarch64-linux-mode* t)
+  ;; Hosted Linux preempts; YIELD (every loop back-edge) as SEV+WFE cost 18
+  ;; cycles per iteration on the A76 (measured 2026-09-18), so the JIT emits NOP.
+  (setq *aarch64-yield-nop* t)
   (setq *aarch64-stack-align-16* t)
   (setq *aarch64-fn-align-offset* 120)
   (setq *linux-aarch64-r25-offset* #x38000000)
@@ -1288,6 +1291,7 @@
 
 (setf *aarch64-stack-align-16* t)
 (setf *aarch64-linux-mode* t)
+(setf *aarch64-yield-nop* t)   ; build-time translation too (see the co-init note)
 (setf *aarch64-fn-align-offset* 120)
 ;; WS4-AA64 #160: ENABLE GC on this Linux CLI image.  Three knobs:
 ;;   (a) *linux-aarch64-gc-metadata-shl* t — store GC metadata <<1 (the latent

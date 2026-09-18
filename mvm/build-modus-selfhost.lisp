@@ -253,8 +253,8 @@
     ;; explicitly.  Otherwise (vreg-phys 9) yields 0 and DEST-PHYS-OR-SCRATCH s
     ;; (or (vreg-phys v) +scratch-reg+) picks 0 (truthy), so emit-mov-reg-mem gets
     ;; register 0 and reg-info fails with Unknown register 0 on every spilled obj-ref.
-    (aset v 9 nil)  (aset v 10 nil) (aset v 11 nil) (aset v 12 nil)
-    (aset v 13 nil) (aset v 14 nil) (aset v 15 nil) (aset v 22 nil)
+    (aset v 9 6)  (aset v 10 7) (aset v 11 4) (aset v 12 5)
+    (aset v 13 8) (aset v 14 nil) (aset v 15 nil) (aset v 22 nil)
     (aset v 16 (quote rax)) (aset v 17 (quote r12))
     (aset v 18 (quote r14)) (aset v 19 (quote r15))
     (aset v 20 (quote rsp)) (aset v 21 (quote rbp))
@@ -555,8 +555,8 @@
     (aset v 0 0)   (aset v 1 1)   (aset v 2 2)   (aset v 3 3)
     (aset v 4 19)  (aset v 5 20)  (aset v 6 21)  (aset v 7 22)
     (aset v 8 23)
-    (aset v 9 nil)  (aset v 10 nil) (aset v 11 nil) (aset v 12 nil)
-    (aset v 13 nil) (aset v 14 nil) (aset v 15 nil)
+    (aset v 9 6)  (aset v 10 7) (aset v 11 4) (aset v 12 5)
+    (aset v 13 8) (aset v 14 nil) (aset v 15 nil)
     (aset v 16 0)  (aset v 17 24) (aset v 18 25) (aset v 19 26)
     (aset v 20 31) (aset v 21 29) (aset v 22 nil)
     (setq *a64-vreg-to-phys* v))

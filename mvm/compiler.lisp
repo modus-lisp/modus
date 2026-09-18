@@ -723,7 +723,7 @@
                         ;; everything emitted before the lambda) — mvm-eval of
                         ;; a capturing closure then ran a frame-less thunk
                         ;; that STACK-LOADed a 0 VFP → SIGSEGV (WS4 oracle).
-                        "*IR-BUFFER*" "*TEMP-REG-COUNTER*" "*FP-REG-COUNTER*"
+                        "*IR-BUFFER*" "*TEMP-REG-COUNTER*" "*FP-REG-COUNTER*" "*LOCAL-VREGS-FREE*"
                         "*UNUSED-VALUE-FORM*" "*SETQ-VALUE-UNUSED*"
                         "*CURRENT-FUNCTION-NAME*" "*FUNCTION-RETURN-LABEL*"
                         "*UWP-CLEANUPS*" "*LOOP-EXIT-UWP-SEQ*"
@@ -1285,11 +1285,34 @@
   (setf *temp-reg-counter* 0)
   (setf *fp-reg-counter* 0))
 
+;;; LOCAL REGISTERS (2026-09-18).  V9/V10 are physical on aarch64 (x6/x7,
+;;; callee-saved by Modus convention — see *a64-vreg-to-phys*) and are
+;;; reserved for a function's hottest locals/parameters (register
+;;; promotion, %promote-locals-p).  While promotion is active the temp
+;;; allocator skips them, so temps keep V4-V8 (+ V11-V15 spill); when the
+;;; runtime compile retries with *promote-inhibit* (out of temporaries) they
+;;; rejoin the temp pool.  On x64 they are spill slots either way.
+(defparameter *local-vregs* (list +vreg-v9+ +vreg-v10+ +vreg-v11+ +vreg-v12+ +vreg-v13+))   ; aarch64: x6 x7 x4 x5 x8
+(defvar *local-vregs-free* nil
+  "Free list of local registers for the function being compiled (bound per
+   function in mvm-compile-function-internal; NIL outside one).")
+(defun %temp-vreg-for (count)
+  "The vreg the COUNT-th allocated temporary lives in."
+  (if (%local-vregs-active-p)
+      (let ((k 0) (v +vreg-v4+))
+        (loop
+          (when (> v +vreg-v15+) (return (+ +vreg-v15+ 1)))   ; out of range → caller errors
+          (unless (member v *local-vregs*)
+            (when (= k count) (return v))
+            (setq k (+ k 1)))
+          (setq v (+ v 1))))
+      (+ +vreg-v4+ count)))
 (defun alloc-temp-reg ()
   "Allocate the next temporary register (V4-V15).
    V4-V8 map to physical registers; V9-V15 are spill slots that the
-   translator automatically maps to stack frame locations."
-  (let ((reg (+ +vreg-v4+ *temp-reg-counter*)))
+   translator automatically maps to stack frame locations (aarch64: V9/V10
+   are the local registers and are skipped while promotion is active)."
+  (let ((reg (%temp-vreg-for *temp-reg-counter*)))
     (when (> reg +vreg-v15+)
       (error "MVM compiler: out of temporary registers (need >12) temps=~a fp=~a recent=~a"
              *temp-reg-counter* *fp-reg-counter* (%cf-trace-dump)))
@@ -8152,15 +8175,67 @@
 ;;; If
 ;;; ============================================================
 
+;;; FUSED COMPARE-AND-BRANCH (2026-09-18).  `(if (< a b) …)` used to
+;;; materialize T/NIL (cmp; bcc; mov NIL; b; mov T) and then BNULL that value
+;;; (cmp x26; b.eq) — nine aarch64 instructions for a loop test that is three.
+;;; When both operands are provably fixnums (%expr-width, the same rule
+;;; compile-compare-2 uses to skip its tag test) the test compiles to
+;;; `cmp a b; b<inverse> else-label` directly.  (not X)/(null X) invert;
+;;; (zerop X) is (= X 0).
+(defparameter *fused-compare-ops*
+  '(("<" . :blt) (">" . :bgt) ("<=" . :ble) (">=" . :bge) ("=" . :beq) ("/=" . :bne)))
+(defun %inverse-branch (op)
+  (cond ((eq op :blt) :bge) ((eq op :bge) :blt) ((eq op :bgt) :ble)
+        ((eq op :ble) :bgt) ((eq op :beq) :bne) (t :beq)))
+(defun %fusable-compare (test env)
+  "The branch-op for TEST when it is a 2-operand fixnum comparison the
+   fused path may compile, else NIL."
+  (and (consp test) (symbolp (car test)) (consp (cdr test)) (consp (cddr test))
+       (null (cdddr test))
+       (let ((e (assoc (symbol-name (car test)) *fused-compare-ops* :test #'string=)))
+         (and e
+              (%test-operand-width (cadr test) env) (%test-operand-width (caddr test) env)
+              (cdr e)))))
+(defun %test-operand-width (x env)
+  "%expr-width extended to integer literals (a fixnum literal is a fixnum)."
+  (cond ((integerp x) (and (<= (integer-length x) 61) (+ 1 (integer-length x))))
+        ((or (and x (symbolp x)) (consp x)) (%expr-width x env))
+        (t nil)))
+(defun %compile-test-branch (test env dest false-label)
+  "Compile TEST so that control falls through when it is true and branches
+   to FALSE-LABEL when it is false.  DEST is scratch."
+  (cond
+    ((and (consp test) (symbolp (car test)) (consp (cdr test)) (null (cddr test))
+          (or (name-eq (car test) "NOT") (name-eq (car test) "NULL")))
+     ;; (not X): X true ⇒ branch to FALSE-LABEL; X false ⇒ fall through.
+     (let ((through (make-compiler-label)))
+       (%compile-test-branch (cadr test) env dest through)
+       (emit-ir :br false-label)
+       (emit-ir-label through)))
+    ((and (consp test) (symbolp (car test)) (consp (cdr test)) (null (cddr test))
+          (name-eq (car test) "ZEROP") (%expr-width (cadr test) env))
+     (%compile-test-branch (list '= (cadr test) 0) env dest false-label))
+    ((%fusable-compare test env)
+     (let ((bop (%fusable-compare test env))
+           (a (cadr test)) (b (caddr test)))
+       (compile-form a env dest)
+       (let ((temp (alloc-temp-reg)))
+         (if (%leaf-operand-p b env)
+             (compile-form b env temp)
+             (progn (emit-ir :push dest) (compile-form b env temp) (emit-ir :pop dest)))
+         (emit-ir :cmp dest temp)
+         (emit-ir (%inverse-branch bop) false-label)
+         (free-temp-reg))))
+    (t
+     (compile-form test env dest)
+     (emit-ir :bnull dest false-label))))
+
 (defun compile-if (args env dest)
   "Compile (if test then &optional else)"
   (destructuring-bind (test then &optional else) args
     (let ((else-label (make-compiler-label))
           (end-label (make-compiler-label)))
-      ;; Compile test into dest
-      (compile-form test env dest)
-      ;; Branch to else if nil
-      (emit-ir :bnull dest else-label)
+      (%compile-test-branch test env dest else-label)
       ;; Then branch
       (compile-form then env dest)
       (emit-ir :br end-label)
@@ -8180,8 +8255,7 @@
   (destructuring-bind (test then &optional else) args
     (let ((else-label (make-compiler-label))
           (end-label (make-compiler-label)))
-      (compile-form test env dest)
-      (emit-ir :bnull dest else-label)
+      (%compile-test-branch test env dest else-label)
       (%compile-statement then env dest)
       (emit-ir :br end-label)
       (emit-ir-label else-label)
@@ -9138,19 +9212,21 @@
 
 (defparameter *promote-loop-ops* '("LOOP" "DOTIMES" "DOLIST" "DO" "DO*"))
 
-(defvar *promote-locals* nil
-  "Opt-in switch for register promotion.  Off by default: on the Pi 5's
-   out-of-order A76 the promoted registers cost more in temp pressure
-   (deeper expressions spill past V8, guarded fast paths engage sooner)
-   than the saved frame loads are worth — 30 frames went 495 → 596 ms.
-   The in-order A53 of the Pi Zero 2 W is the case it is for; the board
-   session sets it before installing a library.")
+(defvar *promote-locals* t
+  "Register promotion of locals/parameters into the DEDICATED local
+   registers (V9/V10 = x6/x7 on aarch64).  The earlier design promoted into
+   the shared temp pool (V4-V6) and was a net loss on the A76 (temp pressure:
+   30 frames 495 → 596 ms, +1.1 M instructions/frame on reel), so it was
+   opt-in; dedicated registers do not touch the temp pool, so it is on.")
 
 (defun %promote-locals-p ()
   (and *promote-locals*
        *mvm-eval-runtime-p*
        (boundp (quote *jit-target-arch*))
        (eq (symbol-value (quote *jit-target-arch*)) :aarch64)))
+(defun %local-vregs-active-p ()
+  "Local registers (V9/V10) are reserved for promotion in this compile."
+  (and (%promote-locals-p) (not *promote-inhibit*)))
 
 (defvar *promote-walk-loop-seen* nil)
 
@@ -9164,11 +9240,50 @@
      (let ((op (car form)))
        (cond
          ((consp op) nil)                     ; ((lambda …) …)
-         ((not (symbolp op)) t)
+         ;; A non-symbol head is not a call (a CASE clause key, a literal): the
+         ;; children still have to be walked.
+         ((not (symbolp op)) (%promote-walk-list (cdr form) depth))
          ((name-eq op "QUOTE") t)
          ((name-eq op "FUNCTION")
           (and (consp (cdr form)) (symbolp (cadr form))))
          ((member (symbol-name op) *promote-forbidden-ops* :test #'string=) nil)
+         ;; COND clauses are lists of forms whose head is the TEST form — not
+         ;; calls.  (Before this every body with a COND was rejected as a
+         ;; ((lambda …) …) shape, which is why reel's bool decoder never
+         ;; promoted anything.)
+         ((name-eq op "COND")
+          (let ((r (cdr form)))
+            (loop (when (not (consp r)) (return t))
+                  (unless (%promote-walk-list (car r) (+ depth 1)) (return nil))
+                  (setq r (cdr r)))))
+         ;; Binding forms: the binding list is not a form.  LET/LET*: walk each
+         ;; init; MULTIPLE-VALUE-BIND: skip the variable list; DO/DO*: walk
+         ;; each (var init step)'s init and step, then the end-test clause.
+         ((or (name-eq op "LET") (name-eq op "LET*"))
+          (and (consp (cdr form))
+               (let ((b (cadr form)) (ok t))
+                 (loop (when (not (consp b)) (return))
+                       (let ((e (car b)))
+                         (when (and (consp e) (consp (cdr e))
+                                    (not (%promote-walk (cadr e) (+ depth 1))))
+                           (setq ok nil) (return)))
+                       (setq b (cdr b)))
+                 ok)
+               (%promote-walk-list (cddr form) depth)))
+         ((name-eq op "MULTIPLE-VALUE-BIND")
+          (and (consp (cdr form)) (%promote-walk-list (cddr form) depth)))
+         ((or (name-eq op "DO") (name-eq op "DO*"))
+          (setq *promote-walk-loop-seen* t)
+          (and (consp (cdr form)) (consp (cddr form))
+               (let ((b (cadr form)) (ok t))
+                 (loop (when (not (consp b)) (return))
+                       (let ((e (car b)))
+                         (when (and (consp e) (not (%promote-walk-list (cdr e) (+ depth 1))))
+                           (setq ok nil) (return)))
+                       (setq b (cdr b)))
+                 ok)
+               (%promote-walk-list (caddr form) depth)
+               (%promote-walk-list (cdddr form) depth)))
          (t
           (when (member (symbol-name op) *promote-loop-ops* :test #'string=)
             (setq *promote-walk-loop-seen* t))
@@ -9180,6 +9295,12 @@
                         (unless (%promote-walk (car r) (+ depth 1)) (return nil))
                         (setq r (cdr r))))))))))))
 
+(defun %promote-walk-list (forms depth)
+  "T when every form of the list FORMS passes %promote-walk."
+  (let ((r forms))
+    (loop (when (not (consp r)) (return t))
+          (unless (%promote-walk (car r) (+ depth 1)) (return nil))
+          (setq r (cdr r)))))
 (defun %let-promotion-plan (body)
   "For a LET body: :promote when its variables may live in registers, else NIL."
   (and (%promote-locals-p)
@@ -9187,9 +9308,42 @@
          (declare (special *promote-walk-loop-seen*))
          (let ((safe (handler-case (%promote-walk (cons 'progn body) 0)
                        (error () nil))))
-           (and safe
-                (or (> *promote-loop-depth* 0) *promote-walk-loop-seen*)
-                :promote)))))
+           ;; With dedicated registers a promoted binding costs nothing (its
+           ;; init lands in the register instead of a frame slot), so a loop
+           ;; is no longer required — safety is the only condition.
+           (and safe :promote)))))
+
+(defun %var-ref-weight (var form)
+  "Static reference weight of VAR in FORM: each occurrence counts 1, times 8
+   per enclosing loop form (LOOP/DOTIMES/DOLIST/DO/DO*).  Quoted forms are
+   skipped.  An approximation on the unexpanded tree — good enough to rank a
+   LET's variables for the two local registers."
+  (labels ((walk (f w)
+             (cond ((and (symbolp f) f (name-equal f var)) w)
+                   ((atom f) 0)
+                   ((and (symbolp (car f)) (name-eq (car f) "QUOTE")) 0)
+                   (t (let ((w2 (if (and (symbolp (car f))
+                                         (member (symbol-name (car f)) *promote-loop-ops*
+                                                 :test #'string=))
+                                    (* w 8) w))
+                            (s 0) (r f))
+                        (loop (when (not (consp r)) (return s))
+                              (setq s (+ s (walk (car r) w2)))
+                              (setq r (cdr r))))))))
+    (walk form 1)))
+
+(defun %promotion-choice (vars body k)
+  "Up to K of VARS, by descending %var-ref-weight in BODY, each referenced at
+   least twice (a single read is no better in a register than in its slot)."
+  (if (or (<= k 0) (null vars))
+      nil
+      (let ((scored (mapcar (lambda (v) (cons v (%var-ref-weight v body))) vars)))
+        (setq scored (sort scored #'> :key #'cdr))
+        (let ((out nil) (n 0))
+          (dolist (p scored)
+            (when (and (< n k) (>= (cdr p) 2))
+              (push (car p) out) (setq n (+ n 1))))
+          out))))
 
 ;;; ------------------------------------------------------------
 ;;; FP-register-resident declared locals (SIMD plan, layer 2c)
@@ -9465,8 +9619,12 @@
          (new-env env)
          (save-temps nil)
          (promote-plan (and (> n-bindings 0) (%let-promotion-plan body)))
+         (promote-set (and promote-plan (not *promote-inhibit*)
+                           (%promotion-choice
+                            (mapcar (lambda (b) (if (consp b) (car b) b)) bindings)
+                            (cons 'progn body) (length *local-vregs-free*))))
          (promoted-regs (make-array (max n-bindings 1) :initial-element nil))
-         (n-promoted 0)
+         (promoted-list nil)
          ;; FP-register-resident float/vector locals (layer 2c)
          (fp-kinds (and (> n-bindings 0) (%let-fp-kinds bindings decl-body body env)))
          (fp-regs (make-array (max n-bindings 1) :initial-element nil))
@@ -9513,13 +9671,16 @@
                  (%compile-init-into-fpreg val reserve-env f (aref fp-kinds i))
                  (setf (aref fp-regs i) f)
                  (setq n-fp (+ n-fp 1))))
-              ((and promote-plan
-                    (not *promote-inhibit*)
-                    (<= (+ +vreg-v4+ *temp-reg-counter*) +vreg-v6+))
-               (let ((reg (alloc-temp-reg)))
+              ;; Register promotion into a DEDICATED local register (V9/V10):
+              ;; the init lands in the register, which holds the variable
+              ;; for the whole body and is returned to the free list below.
+              ((and promote-set *local-vregs-free*
+                    (member (if (consp binding) (car binding) binding) promote-set
+                            :test #'name-equal))
+               (let ((reg (pop *local-vregs-free*)))
                  (compile-form val reserve-env reg)
                  (setf (aref promoted-regs i) reg)
-                 (setq n-promoted (+ n-promoted 1))))
+                 (push reg promoted-list)))
               ((and (%temps-must-spill-p) (numberp dest))
                (compile-form val reserve-env dest)
                (let ((slot (+ (compile-env-stack-depth env) i)))
@@ -9565,8 +9726,8 @@
     (%infer-let-widths new-env bindings decl-body env)
     ;; Compile body in new environment
     (compile-progn body new-env dest)
-    ;; Release the promoted registers (they were the top-most temps).
-    (dotimes (k n-promoted) (free-temp-reg))
+    ;; Return the promoted local registers to the function's free list.
+    (dolist (r promoted-list) (push r *local-vregs-free*))
     (dotimes (k n-fp) (free-fp-reg))
     ;; Deallocate frame space
     (when (> n-bindings 0)
@@ -9622,7 +9783,17 @@
          ;; (stamping only after the loop left every `(let* ((a …) (b (+ a k)))
          ;; (declare (type fixnum a b)))' with a tag test on (+ a k)).
          (decl-types (%declared-types decl-body))
-         (later-inits (mapcar (lambda (b) (if (consp b) (cadr b) nil)) bindings)))
+         (later-inits (mapcar (lambda (b) (if (consp b) (cadr b) nil)) bindings))
+         ;; Register promotion (see compile-let): a later init may read an
+         ;; earlier binding, so the ranking covers the inits too.
+         (promote-set (and (> n-bindings 0) *local-vregs-free*
+                           (%let-promotion-plan (append later-inits body))
+                           (not *promote-inhibit*)
+                           (%promotion-choice
+                            (mapcar (lambda (b) (if (consp b) (car b) b)) bindings)
+                            (cons 'progn (append later-inits body))
+                            (length *local-vregs-free*))))
+         (promoted-list nil))
     (when (> n-bindings 0)
       (emit-ir :frame-alloc n-bindings))
     ;; Evaluate sequentially, extending env each time
@@ -9650,21 +9821,31 @@
                       :parent (compile-env-parent new-env)
                       :fn-names (compile-env-fn-names new-env)))))
             (t
-             ;; Same spill-on-overflow as compile-let's init loop.
-             (if (and (%temps-must-spill-p) (numberp dest))
-                 (progn
-                   (compile-form val new-env dest)
-                   (emit-ir :stack-store dest slot))
-                 (let ((temp (alloc-temp-reg)))
-                   (compile-form val new-env temp)
-                   (emit-ir :stack-store temp slot)
-                   (free-temp-reg)))
+             (let ((preg (and promote-set *local-vregs-free*
+                              (member var promote-set :test #'name-equal)
+                              (pop *local-vregs-free*))))
+               (cond
+                 (preg
+                  ;; Promoted: the init lands in the local register.
+                  (compile-form val new-env preg)
+                  (push preg promoted-list))
+                 ;; Same spill-on-overflow as compile-let's init loop.
+                 ((and (%temps-must-spill-p) (numberp dest))
+                  (compile-form val new-env dest)
+                  (emit-ir :stack-store dest slot))
+                 (t
+                  (let ((temp (alloc-temp-reg)))
+                    (compile-form val new-env temp)
+                    (emit-ir :stack-store temp slot)
+                    (free-temp-reg))))
              (setq new-env
                    (make-compile-env
-                    :bindings (cons (make-binding
-                                     :name var
-                                     :location :stack
-                                     :stack-slot slot)
+                    :bindings (cons (if preg
+                                        (make-binding :name var :location :reg :reg preg)
+                                        (make-binding
+                                         :name var
+                                         :location :stack
+                                         :stack-slot slot))
                                     (compile-env-bindings new-env))
                     :stack-depth (+ (compile-env-stack-depth env) (+ i 1))
                     :parent (compile-env-parent new-env)
@@ -9682,7 +9863,7 @@
                                (null (collect-setq-vars-in-body
                                       (cons 'progn (append (nthcdr (+ i 1) later-inits) body))
                                       (list var))))
-                      (setf (binding-dtype bb) (list 'signed-byte w)))))))))
+                      (setf (binding-dtype bb) (list 'signed-byte w))))))))))
           (setq i (+ i 1)))))
     ;; Final env has correct stack depth
     (setf (compile-env-stack-depth new-env)
@@ -9695,7 +9876,8 @@
     (%infer-let-widths new-env bindings decl-body new-env)
     ;; Compile body
     (compile-progn body new-env dest)
-    ;; Release fp registers, then the frame
+    ;; Release local registers, fp registers, then the frame
+    (dolist (r promoted-list) (push r *local-vregs-free*))
     (dotimes (k n-fp) (free-fp-reg))
     (when (> n-bindings 0)
       (emit-ir :frame-free n-bindings))))
@@ -9736,6 +9918,22 @@
           (%emit-fpreg-box dest fb)
           (%fp-diag-bump 5))
       (return-from compile-setq nil)))
+  ;; SETQ INTO A REGISTER-RESIDENT VARIABLE (2026-09-18): when VAL can be
+  ;; evaluated with the variable's own register as the destination — the
+  ;; variable is read at most once in VAL and that read is the first leaf
+  ;; evaluated (the leftmost spine: `(setq acc (+ acc p))`, `(setq p (logand
+  ;; (+ p 37) 255))`), so nothing in VAL reads it after the register has been
+  ;; overwritten — the value lands in the register directly: an accumulate
+  ;; step becomes ONE add instead of mov/add/mov.  `(setq a (- b a))` reads A
+  ;; after B would have clobbered the register, so it keeps the VR route.
+  (let ((rb (env-lookup env var)))
+    (when (and rb (eq (binding-location rb) :reg)
+               (%setq-direct-safe-p var val))
+      (let ((reg (binding-reg rb)))
+        (compile-form val env reg)
+        (when (and dest (/= dest reg) (not *setq-value-unused*))
+          (emit-ir :mov dest reg))
+        (return-from compile-setq nil))))
   (compile-form val env dest)
   (let ((binding (env-lookup env var)))
     (cond
@@ -9758,6 +9956,28 @@
        (format *error-output* "~&  WARN: implicit global setq ~A~%" var)
        (setf (gethash (normalize-name var) *globals*) t)
        (%compile-setq-global var dest)))))
+
+(defun %setq-direct-safe-p (var val)
+  "True when VAL may be compiled with VAR's register as its destination: VAR
+   occurs at most once in VAL and, if it occurs, it is the leftmost leaf
+   (the first thing evaluated).  Quoted subforms are opaque."
+  (labels ((count-occ (f)
+             (cond ((and (symbolp f) f (name-equal f var)) 1)
+                   ((atom f) 0)
+                   ((and (symbolp (car f)) (name-eq (car f) "QUOTE")) 0)
+                   (t (let ((s 0) (r f))
+                        (loop (when (not (consp r)) (return s))
+                              (setq s (+ s (count-occ (car r))))
+                              (setq r (cdr r)))))))
+           (leftmost (f)
+             (cond ((atom f) f)
+                   ((consp (cdr f)) (leftmost (cadr f)))
+                   (t nil))))
+    (let ((n (count-occ val)))
+      (or (= n 0)
+          (and (= n 1)
+               (let ((l (leftmost val)))
+                 (and l (symbolp l) (name-equal l var))))))))
 
 (defun %runtime-global-cell (name)
   "At a RUNTIME compile: the (key . value) pair of global NAME in the globals
@@ -15077,6 +15297,16 @@
    unconditionally under mvm-eval (*mvm-eval-runtime-p*), and at build time
    as the overflow fallback when the temp budget is nearly exhausted
    (see %temps-must-spill-p)."
+  ;; OPERAND-DIRECT (2026-09-18): a right operand held in a register (a
+  ;; promoted local/parameter) is used as the pair's source in place — no
+  ;; temp, no MOV.  emit-arith-pair only READS its TEMP operand.
+  (let ((rb (and arg (symbolp arg)
+                 (let ((b (env-lookup env arg))) (and b (eq (binding-location b) :reg) b)))))
+    (when (and rb (/= (binding-reg rb) dest))
+      (let ((*arith-trust* trust))
+        (declare (special *arith-trust*))
+        (emit-arith-pair fast-op generic-name dest (binding-reg rb)))
+      (return-from %compile-arith-arg-step-e2 nil)))
   (if (let ((leaf (%leaf-operand-p arg env)))
         ;; A leaf, or a pure typed expression, compiled into a fresh temp
         ;; cannot disturb DEST — with one x64 caveat: the translator's
@@ -19649,15 +19879,21 @@
   ;; read, (set-acc x v) → the slot write, in place (see *struct-accessors*).
   (when (and *mvm-eval-runtime-p* (symbolp fn) *struct-accessors* (consp args))
     (let ((info (%struct-accessor-info fn)))
+      ;; A struct instance is a plain word array (subtag #x32, defstruct's
+      ;; constructor is MAKE-ARRAY), never byte-packed, so the read is ONE
+      ;; :obj-ref with a constant slot index (%word-aref) — not %prim-aref,
+      ;; whose u8/word subtag dispatch cost ~20 instructions, two frame
+      ;; slots and a trap per slot access (measured on reel's bool decoder:
+      ;; eight accesses per BOOL-BIT).
       (when (and info (null (cdr args)) (symbolp (car args))
                  (%declared-struct-p (car args) env (third info)))
         (return-from compile-call
-          (compile-form (list '%prim-aref (car args) (fourth info)) env dest))))
+          (compile-form (list '%word-aref (car args) (fourth info)) env dest))))
     (let ((info (%struct-setter-info fn)))
       (when (and info (consp (cdr args)) (null (cddr args)) (symbolp (car args))
                  (%declared-struct-p (car args) env (third info)))
         (return-from compile-call
-          (compile-form (list '%prim-aset (car args) (fourth info) (cadr args)) env dest)))))
+          (compile-form (list '%word-aset (car args) (fourth info) (cadr args)) env dest)))))
   ;; Typed shortcuts for the helpers the ABS macro expands to: a known-width
   ;; integer expression (see %expr-width) is never complex, and negating one
   ;; of <= 61 bits cannot overflow, so (- 0 x) takes the plain :sub.  Each
@@ -20703,6 +20939,8 @@
                                       (string name)))
          (*temp-reg-counter* 0)
          (*fp-reg-counter* 0)
+         ;; The two local registers are per function (see *local-vregs*).
+         (*local-vregs-free* (if (%local-vregs-active-p) (copy-list *local-vregs*) nil))
          (return-label (make-compiler-label))
          (*function-return-label* return-label)
          ;; Reset per-function dynamic state so nested FLET/lambda bodies
@@ -20774,18 +21012,35 @@
            (env (make-compile-env :stack-depth nreg-params
                                   :bindings nil
                                   :parent parent-env)))
-      ;; Save register params to stack and build environment
-      (loop for param in params
-            for i from 0
-            while (< i +max-reg-args+)
-            for areg = (+ +vreg-v0+ i)
-            do ;; Store arg register to stack slot
-               (emit-ir :stack-store areg i)
-               ;; Add binding to environment
-               (push (make-binding :name param
-                                    :location :stack
-                                    :stack-slot i)
-                     (compile-env-bindings env)))
+      ;; Save register params to stack and build environment.  PARAMETER
+      ;; PROMOTION: a fixed-arity function (no &optional/&rest prologue that
+      ;; reads the slots) whose body is promotion-safe keeps its hottest
+      ;; register-passed parameters in the local registers instead.
+      (let ((param-set (and *local-vregs-free*
+                            (null rest-slot)
+                            (or (null opt-count) (zerop opt-count))
+                            (<= (length params) +max-reg-args+)
+                            (%let-promotion-plan body)
+                            (%promotion-choice params (cons 'progn body)
+                                               (length *local-vregs-free*)))))
+        (loop for param in params
+              for i from 0
+              while (< i +max-reg-args+)
+              for areg = (+ +vreg-v0+ i)
+              do (if (and param-set *local-vregs-free*
+                          (member param param-set :test #'name-equal))
+                     (let ((reg (pop *local-vregs-free*)))
+                       (emit-ir :mov reg areg)
+                       (push (make-binding :name param :location :reg :reg reg)
+                             (compile-env-bindings env)))
+                     (progn
+                       ;; Store arg register to stack slot
+                       (emit-ir :stack-store areg i)
+                       ;; Add binding to environment
+                       (push (make-binding :name param
+                                           :location :stack
+                                           :stack-slot i)
+                             (compile-env-bindings env))))))
 
       ;; Handle excess arguments (already on caller's stack)
       (loop for param in (nthcdr +max-reg-args+ params)

@@ -511,11 +511,14 @@
   (let ((map (make-array 23)))
     (aset map 0 0) (aset map 1 1) (aset map 2 2) (aset map 3 3)
     (aset map 4 19) (aset map 5 20) (aset map 6 21) (aset map 7 22) (aset map 8 23)
-    (aset map 9 nil) (aset map 10 nil) (aset map 11 nil) (aset map 12 nil)
-    (aset map 13 nil) (aset map 14 nil) (aset map 15 nil)
+    (aset map 9 6) (aset map 10 7) (aset map 11 4) (aset map 12 5)
+    (aset map 13 8) (aset map 14 nil) (aset map 15 nil)
     (aset map 16 0) (aset map 17 24) (aset map 18 25) (aset map 19 26)
     (aset map 20 31) (aset map 21 29) (aset map 22 nil)
     (setq *a64-vreg-to-phys* map))
+  ;; Hosted Linux preempts: YIELD (every loop back-edge) as SEV+WFE cost 18 cycles
+  ;; per iteration on the A76 (2026-09-18), so the runtime JIT emits NOP for it.
+  (setq *aarch64-yield-nop* t)
   ;; *mvm-label-counter* is a (defvar ... 0) whose init-thunk does NOT run at
   ;; boot (CLAUDE.md item 7) -> nil at runtime; translate-aarch64's (incf ...)
   ;; would crash.  The compiler does not use it, so nothing else initialises it.

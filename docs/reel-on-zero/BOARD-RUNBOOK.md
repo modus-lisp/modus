@@ -550,9 +550,19 @@ not. Read `CTR_EL0`/`CCSIDR_EL1` for the real cache geometry.
   bare-metal board (twice; MIDR 0x410FD034 = A53 r0p4) — the documented value
   is 0x10305106, and Linux's `arm_pmuv3` refuses to probe on PMUVer 0 yet ran
   7 counters on this silicon. First real environment difference. Working
-  hypothesis: U-Boot hands Modus to CPU0 and the firmware's EL3 stub leaves
-  CPU0's PMU disabled; Linux's perf counted across all cores. Test: pin a
-  benchmark to CPU0 vs CPU1 under Linux and sample each.
+  hypothesis (REFUTED 2026-09-18): "CPU0's PMU is disabled" — under Linux,
+  `vpxbench` pinned to CPU0, CPU1 and CPU2 count identically (IPC 0.88, all
+  events), and Linux's own `__init_el2_debug` zeroes `MDCR_EL2` on a core that
+  reads PMUVer 0, so Linux read PMUVer ≥ 1 on CPU0 at EL2 while Modus reads 0
+  on CPU0 at EL2. The Modus boot writes no PMU/MDCR/HCR register (decoded
+  every `msr` in `boot-rpi-cl.lisp`: SCTLR/MAIR/TCR/TTBR0/VBAR/CPTR_EL2,
+  SCTLR/CPACR/VBAR_EL1, TPIDR_EL0, CPUECTLR). So the contradiction stands: the
+  same fixed ID register reads differently by boot path (`booti` vs `go`) —
+  U-Boot's `booti` runs `cleanup_before_linux` (caches/MMU off) and `go` does
+  not. Decisive tests left: (1) read `ID_AA64DFR0_EL1` raw at EL1 on CPU0
+  from a kernel module under that Linux; (2) read it from a bare `go` payload
+  that executes nothing but the `mrs`. Until then bare-metal hardware-event
+  counting is OPEN; cycles work (`PMCCFILTR.NSH`), `PMSWINC` works.
 - **Meanwhile the working tool is Modus HOSTED on the Zero's Linux** (§6f,
   within 6% of bare metal): `perf_event_open` is a syscall Modus can issue
   itself, so per-phase INST_RETIRED / L1I-refill / stall counters around the

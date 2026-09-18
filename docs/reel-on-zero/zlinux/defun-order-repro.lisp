@@ -1,0 +1,6 @@
+(defun target-fn (a b) (values (+ a b) (- a b)))
+(progn (defvar *o1* (symbol-function (quote target-fn))) (format t "1 same-progn old-eq-new ~a~%" (eq *o1* (symbol-function (quote target-fn)))) (finish-output) (defun target-fn (a b) (list :w1 a b)))
+(format t "2 after progn: old-eq-new ~a~%" (eq *o1* (symbol-function (quote target-fn)))) (finish-output)
+(defvar *o2* (symbol-function (quote target-fn)))
+(defun target-fn (a b) (list :w2 a b))
+(format t "3 separate forms: old-eq-new ~a~%" (eq *o2* (symbol-function (quote target-fn)))) (finish-output)

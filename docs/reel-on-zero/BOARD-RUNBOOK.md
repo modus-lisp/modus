@@ -718,6 +718,41 @@ live fd is the snapshot primitive the phase wrappers use
   0.55/kinst; stalls IQ-empty-on-I-miss 20.8 %, interlock-load 9.0 %,
   interlock-other 9.1 %, LSU-busy 3.2 % of cycles (the process-wide 30 %
   I-miss figure includes the load phase).
+- **PER-PHASE COUNTERS ON THE ZERO (A53 @1 GHz, cam.ivf 90 frames, hosted
+  Modus, `modus-pmu-phases.lisp`, 2026-09-18).** Wrapper overhead 12 %
+  (60.2 M cycles/frame wrapped vs 51.5 unwrapped); kcyc/frame ≈ µs/frame.
+  Nested phases are inclusive (MBLOOP contains the first ten rows).
+
+  | phase | kcyc/fr | kinst/fr | IPC | L1I refill/ki | L1D miss/ki | br-mis/ki | L2/ki |
+  |---|---|---|---|---|---|---|---|
+  | RESIDUE (tokens+IDCT+add) | 17284 | 12397 | 0.72 | 24.9 | 0.93 | 6.8 | 0.23 |
+  | CHROMA | 7237 | 6055 | 0.84 | 10.0 | 0.92 | 3.2 | 0.25 |
+  | LUMA16 | 4542 | 3966 | 0.87 | 11.3 | 1.22 | 3.7 | 0.30 |
+  | INTERMODES | 2781 | 1247 | 0.45 | 67.1 | 2.28 | 21.6 | 3.68 |
+  | INTERPRED (MC) | 2252 | 1368 | 0.61 | 21.7 | 3.52 | 7.3 | 1.92 |
+  | LFPARAMS | 1469 | 724 | 0.49 | 79.6 | 3.35 | 4.0 | 0.62 |
+  | INTERRES | 1229 | 905 | 0.74 | 17.4 | 1.67 | 5.9 | 0.60 |
+  | INTRAMODES | 1183 | 540 | 0.46 | 81.4 | 3.44 | 17.5 | 1.22 |
+  | BPRED | 335 | 282 | 0.84 | 7.1 | 0.51 | 3.9 | 0.29 |
+  | MBMODES | 208 | 133 | 0.64 | 36.5 | 1.70 | 14.1 | 0.37 |
+  | MBLOOP (all of the above + glue) | 46678 | 32690 | 0.70 | 26.7 | 1.76 | 7.1 | 0.55 |
+  | LOOPF (loop filter) | 10373 | 6718 | 0.65 | 27.1 | 1.64 | 1.8 | 0.30 |
+  | REFCOPY | 1703 | 1730 | 1.02 | 0.3 | 0.46 | 1.0 | 1.49 |
+
+  Reading: (1) instruction count is first-order everywhere (32.7 M in the MB
+  loop alone vs libvpx's ~1.1 M for the whole frame); (2) the I-cache is the
+  second-order wall — 25–80 L1I refills per thousand instructions in every
+  decode phase (a refill every ~40 instructions in the mode parsers), i.e.
+  the JIT'd working set does not fit the A53's L1I and the mode/param
+  parsers (IPC 0.45–0.49) are fetch-bound; (3) the bool-decoder phases carry
+  the branch-mispredict load (INTERMODES 21.6, INTRAMODES 17.5, RESIDUE 6.8
+  per kinst) — data-dependent tree walks, the same shape libvpx has but on
+  30× fewer instructions; (4) data misses are a non-issue (≤ 3.5 L1D/ki).
+  Same table on the Pi 5 (A76): IPC 1.3–2.6 and 6–58 L1I/ki — the A76 hides
+  the fetch stalls the A53 cannot. Compiler targets, in order: instructions
+  per access (frame reloads — the 5-instruction vector access, 103 OBJ-REF
+  reloads per bool-decode) and CODE SIZE, then branch shape in the bool
+  decoder.
 - **Trap 10 (compiler, hosted aarch64): `syscall6` was never a generic 6-arg
   syscall there.** `compile-syscall6` emitted trap 0x0507, which
   `translate-aarch64` hard-wires to `unlinkat` — so `(syscall6 298 …)` DELETED
@@ -729,6 +764,17 @@ live fd is the snapshot primitive the phase wrappers use
 - **Trap 11: any constant `ash` count > 30 ALLOCATES** (routes to runtime
   `bignum-ash`, CLAUDE.md limitation 8) — `(ash hi 32)` in a per-call counter
   read filled the heap; use `(ash (ash hi 2) 30)`.
+- **Per-call costs that matter in a wrapper** (Pi 5, A76, instructions per
+  call, `zlinux/mvp*.lisp` shape): bare 2-arg call 108; `aref`/`setf aref`
+  on an UNDECLARED array reached through a special ~230 per access (a
+  6-element accumulate loop: 5545) vs a `(declare (type (simple-array
+  (signed-byte 32) (*)) …))` local: 381 for the same loop — and that element
+  type is the compiler's inline whitelist, stored as plain tagged words, so
+  cycle totals past 2^32 are NOT truncated; `multiple-value-prog1` ~1200 on
+  top of `prog1`; one grouped `read(2)` of six counters ~600; a `funcall` of a
+  captured native function value is NOT slow (that was cleared by probe).
+  The wrapper set now costs 12 % (42.0 M vs 37.3 M inst/frame on the Pi 5);
+  the first version cost 65 % and hid the answer.
 - **Trap 12: hosted Modus is OOM-killed on the Zero once BOTH semispaces are
   resident.** The shipping CLI has 128 MB semispaces; from-space is never
   `madvise`d back, so RSS climbs to ~256 MB after the first flip, and the
@@ -738,6 +784,18 @@ live fd is the snapshot primitive the phase wrappers use
   the proper fix is an `MADV_DONTNEED` of from-space after each flip in the
   aarch64 GC trampoline (owed). Busybox `sh` has no `PIPESTATUS`: redirect to
   a file and `echo $?`.
+- **Trap 13 (Modus bug, both arches): DEFUNs inside ONE top-level form are
+  installed when the module loads, BEFORE the form's earlier subforms run.**
+  `(progn (defvar *o* (symbol-function 'f)) (defun f … (funcall *o* …)))` —
+  the standard advice/profiling wrapper — captures the NEW `f` and recurses
+  until the stack overflows (`SIGSEGV` in `%GV-CELL` under
+  `%E2-SYMBOL-VALUE-CHECKED`, sp at the stack floor). SBCL evaluates the
+  PROGN sequentially. `serial-prof.py` was immune because it sends the
+  defvar and the defun as separate forms; `modus-pmu-phases.lisp` now does the
+  same (`%capture-original` is its own eval). 3-line repro in memory
+  `reference_defun_installed_before_form_runs`. Cleared along the way: the
+  aarch64 `#'NAME` late-binding thunk (f0047a8) — a function value captured
+  in a separate form survives redefinition on both arches, JIT on or off.
 
 ## 7. Serial-only fallback (no `MODUS_SSH_BUILD`)
 

@@ -500,12 +500,23 @@ class MVM {
   fault(msg) {
     const bt = this.backtrace(100000);
     const shown = bt.length > 40 ? bt.slice(0, 20).concat([`... ${bt.length - 40} more frames ...`], bt.slice(-20)) : bt;
-    throw new MvmFault(`${msg} at ${this.where()} (step ${this.steps})\n  ` + shown.join('\n  '));
+    // THE FAULT IS RARELY WHERE THE TROUBLE STARTED.  A recovered SEGV turns
+    // into a longjmp, the unwind runs unwind-protect cleanups, and what finally
+    // stops the machine ("longjmp with no handler armed") names the LAST frame
+    // of that unwind, not the bad dereference that began it.  The recovered
+    // faults are rare and bounded, so keep the last few and print them here:
+    // they are the difference between a one-line answer and a boot-length bisect.
+    const segv = this.segvLog && this.segvLog.length
+      ? `\n-- recovered SEGVs, oldest first --\n  ` + this.segvLog.join('\n  ') : '';
+    throw new MvmFault(`${msg} at ${this.where()} (step ${this.steps})\n  ` + shown.join('\n  ') + segv);
   }
   // A bad dereference.  Native takes SIGSEGV and the handler stub longjmps
   // through the armed handler-case (with T in RAX), which is how (car 5)
   // becomes a TYPE-ERROR.  Nothing armed: the process dies with 139.
   memFault(what) {
+    if (!this.segvLog) this.segvLog = [];
+    this.segvLog.push(`${what} at ${this.where()} < ` + this.backtrace(8).slice(1).join(' < '));
+    if (this.segvLog.length > 8) this.segvLog.shift();
     if (this.ldlo(A_JMPBUF) !== 0) { if (this.trace) this.host.log(`[segv: ${what} at ${this.where()}]`); this.longjmp(); }
     this.fault(`SIGSEGV: ${what}`);
   }

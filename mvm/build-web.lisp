@@ -66,16 +66,50 @@
 ;; code addrs are < 4GB so :u32 (tagged load) is exact.
 (defun %hc-frame-ip (n) (mem-ref (+ #x10000408 (* 32 n) 16) :u32))
 (defun %hc-cur-ip () (mem-ref #x10000190 :u32))
+;; THE RAW I/O STAGING PAGE IS A FIXED BSS PAGE HERE, and saying so at this
+;; seam is what makes it true for the WHOLE life of the image.  *IO-BUF-ADDR*
+;; is a global, and a global is only as good as the last thing that wrote it:
+;; kernel-main's shared boot text sets #x0FF00000 (build-cli-common.lisp's
+;; known-dead pair), INIT-ALL-GLOBALS then re-runs cl-fileio.lisp's defvar
+;; thunk and restores #x1DE00000, and only the arch io-scratch slot BELOW —
+;; which lands after INIT-ALL-GLOBALS, deliberately — puts #x10014000 back.
+;; On x64 all three are mapped BSS so the churn is invisible.  On this machine
+;; #x0FF00000 is BELOW the modelled address space (mvm.js VBASE) and
+;; #x1DE00000 is INSIDE the heap arena, so the two intermediate values are an
+;; unmapped page and a live-heap page.  That is not theoretical: boot reaches
+;; %INIT-MAKE-LOAD-FORM -> ... -> EVAL long before the slot runs, and
+;; compile-variable-ref's implicit-global arm FORMATs a WARN to *ERROR-OUTPUT*
+;; (see the bare-metal seam in build-cli-common.lisp, task #212 — the same
+;; warning, the same early-boot window, one layer down), so %FS-WRITE-CHAR ->
+;; %SYS-WRITE-BYTE-1 stored a byte at #x0FF00000 and faulted.
+;; %FS-IO-PAGE is the seam cl-fileio.lisp names for exactly this question and
+;; net/hosted-sync.lisp already overrides for per-CPU pages; the driver is the
+;; LAST source block in the image, so this definition wins over both.  The web
+;; target has no threads (%SPAWN-THREAD is unsupported), so one fixed page is
+;; the whole answer, and it cannot be un-set by a defvar thunk or by boot order.
+(defun %fs-io-page () #x10014000)
 ")
 
 ;; x86-64 needs no pre-init hardware setup: boot/boot-linux-x64.lisp has already
 ;; zeroed the runtime-metadata BSS slots by the time kernel-main runs, and the
-;; MCGC object-start bitmap is reserved host-side.
-(defvar *cli-arch-kernel-prologue* "")
+;; MCGC object-start bitmap is reserved host-side.  WEB: pin the file-I/O
+;; scratch addresses from the FIRST instruction of kernel-main, for the reason
+;; spelled out at %FS-IO-PAGE above — the shared boot text's #x0FE00000 /
+;; #x0FF00000 pair is unmapped here, and *CSTR-SCRATCH* is read as a bare
+;; global (no seam to override), so the only place to be early enough is here.
+(defvar *cli-arch-kernel-prologue*
+"  (setq *cstr-scratch* #x10010000)
+  (setq *io-buf-addr*  #x10014000)
+  (setq *scratch-mmapped* t)
+")
 
 ;; File-I/O scratch.  Both 64-bit ports park these just BELOW the heap base
 ;; (0x10000000), inside the ELF's own mapped BSS tail.  i386 cannot: its heap
 ;; is at 0x30000000 and 0x0FE00000 is unmapped there.
+;; This slot lands AFTER (init-all-globals), which is why it is still needed
+;; even though the prologue above has already set the same two addresses: the
+;; defvar thunks restore cl-fileio.lisp's #x1DF00000 / #x1DE00000, and both of
+;; those are inside this machine's heap arena.
 (defvar *cli-arch-io-scratch-source*
 ";; WEB: the x64 defaults (#x1DF00000 / #x1DE00000) fall inside the JS machine's
 ;; heap arena.  Park the C-string scratch and the 4 KB I/O page in the BSS

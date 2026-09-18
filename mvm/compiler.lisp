@@ -9675,6 +9675,7 @@
               ;; the init lands in the register, which holds the variable
               ;; for the whole body and is returned to the free list below.
               ((and promote-set *local-vregs-free*
+                    (not (and fp-kinds (aref fp-kinds i)))   ; FP-kind values never go to a GPR
                     (member (if (consp binding) (car binding) binding) promote-set
                             :test #'name-equal))
                (let ((reg (pop *local-vregs-free*)))
@@ -9822,6 +9823,7 @@
                       :fn-names (compile-env-fn-names new-env)))))
             (t
              (let ((preg (and promote-set *local-vregs-free*
+                              (not (and fp-kinds (aref fp-kinds i)))   ; FP-kind values never go to a GPR
                               (member var promote-set :test #'name-equal)
                               (pop *local-vregs-free*))))
                (cond
@@ -9928,7 +9930,7 @@
   ;; after B would have clobbered the register, so it keeps the VR route.
   (let ((rb (env-lookup env var)))
     (when (and rb (eq (binding-location rb) :reg)
-               (%setq-direct-safe-p var val))
+               (%setq-direct-safe-p var val env))
       (let ((reg (binding-reg rb)))
         (compile-form val env reg)
         (when (and dest (/= dest reg) (not *setq-value-unused*))
@@ -9957,27 +9959,39 @@
        (setf (gethash (normalize-name var) *globals*) t)
        (%compile-setq-global var dest)))))
 
-(defun %setq-direct-safe-p (var val)
-  "True when VAL may be compiled with VAR's register as its destination: VAR
-   occurs at most once in VAL and, if it occurs, it is the leftmost leaf
-   (the first thing evaluated).  Quoted subforms are opaque."
-  (labels ((count-occ (f)
-             (cond ((and (symbolp f) f (name-equal f var)) 1)
-                   ((atom f) 0)
-                   ((and (symbolp (car f)) (name-eq (car f) "QUOTE")) 0)
-                   (t (let ((s 0) (r f))
-                        (loop (when (not (consp r)) (return s))
-                              (setq s (+ s (count-occ (car r))))
-                              (setq r (cdr r)))))))
-           (leftmost (f)
-             (cond ((atom f) f)
-                   ((consp (cdr f)) (leftmost (cadr f)))
-                   (t nil))))
-    (let ((n (count-occ val)))
-      (or (= n 0)
-          (and (= n 1)
-               (let ((l (leftmost val)))
-                 (and l (symbolp l) (name-equal l var))))))))
+(defun %setq-direct-count-occ (var f)
+  (cond ((and (symbolp f) f (name-equal f var)) 1)
+        ((atom f) 0)
+        ((and (symbolp (car f)) (name-eq (car f) "QUOTE")) 0)
+        (t (let ((s 0) (r f))
+             (loop (when (not (consp r)) (return s))
+                   (setq s (+ s (%setq-direct-count-occ var (car r))))
+                   (setq r (cdr r)))))))
+(defun %setq-direct-spine-ok (var f env)
+  "F is a node on the leftmost spine: its first argument continues the
+   spine, every other argument must be a leaf.  (No RETURN-FROM out of a
+   LABELS here: the self-hosted compiler does not honor that block, and the
+   first version of this predicate silently accepted everything.)"
+  (cond ((atom f) (and f (symbolp f) (name-equal f var)))
+        ((not (consp (cdr f))) nil)
+        (t (let ((ok t) (rest (cddr f)))
+             (loop (when (not (consp rest)) (return))
+                   (unless (%leaf-operand-p (car rest) env) (setq ok nil) (return))
+                   (setq rest (cdr rest)))
+             (and ok (%setq-direct-spine-ok var (cadr f) env))))))
+(defun %setq-direct-safe-p (var val env)
+  "True when VAL may be compiled with VAR's register as its destination.
+   VAR occurs at most once in VAL; if it occurs it is the leftmost leaf, and
+   every OTHER operand of every node on that leftmost spine is a leaf (an
+   integer or a lexical variable).  The leaf condition is what makes the
+   evaluation order certain: %swap-commutative-args moves a NON-leaf second
+   operand ahead of a leaf first operand, which would evaluate that operand
+   into VAR's register before VAR is read — the `(setq acc (+ acc (f x)))'
+   miscompile of 2026-09-18 — and a leaf compiled into a temp can clobber
+   nothing.  Quoted subforms are opaque."
+  (let ((n (%setq-direct-count-occ var val)))
+    (or (= n 0)
+        (and (= n 1) (%setq-direct-spine-ok var val env)))))
 
 (defun %runtime-global-cell (name)
   "At a RUNTIME compile: the (key . value) pair of global NAME in the globals
@@ -21021,8 +21035,14 @@
                             (or (null opt-count) (zerop opt-count))
                             (<= (length params) +max-reg-args+)
                             (%let-promotion-plan body)
-                            (%promotion-choice params (cons 'progn body)
-                                               (length *local-vregs-free*)))))
+                            (let ((decls (%declared-types body)))
+                              (%promotion-choice
+                               (remove-if (lambda (pm)
+                                            (let ((d (assoc pm decls :test #'equal)))
+                                              (and d (%fp-type-kind (cdr d)))))
+                                          params)
+                               (cons 'progn body)
+                               (length *local-vregs-free*))))))
         (loop for param in params
               for i from 0
               while (< i +max-reg-args+)

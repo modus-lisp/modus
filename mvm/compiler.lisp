@@ -9343,18 +9343,63 @@
                               (setq r (cdr r))))))))
     (walk form 1)))
 
+(defun %inner-let-candidates (body)
+  "((var . weight) …) for every variable bound by a LET/LET* nested anywhere
+   in BODY (macroexpanded), weighted like %var-ref-weight over its own let
+   body and multiplied by 8 per loop form enclosing that let.  These compete
+   with an outer let's own variables for the local registers: reel's token
+   loop binds the bool decoder's value/range/count in a nested (macro) let
+   inside an outer let of five, and the outer let used to take all five
+   registers on the strength of its loop-counter references while the
+   variables read forty times per token stayed in frame slots."
+  (let ((out nil))
+    (labels ((walk (f mult depth)
+               (cond ((atom f) nil)
+                     ((> depth 60) nil)
+                     ((not (symbolp (car f))) (walk-list f mult depth))
+                     ((name-eq (car f) "QUOTE") nil)
+                     ((or (name-eq (car f) "LET") (name-eq (car f) "LET*"))
+                      (when (and (consp (cdr f)) (listp (cadr f)))
+                        (let ((lbody (cons 'progn (cddr f))))
+                          (dolist (b (cadr f))
+                            (let ((v (if (consp b) (car b) b)))
+                              (when (and v (symbolp v))
+                                (push (cons v (* mult (%var-ref-weight v lbody))) out))))))
+                      (walk-list (cdr f) mult depth))
+                     ((member (symbol-name (car f)) *promote-loop-ops* :test #'string=)
+                      (walk-list (cdr f) (* mult 8) depth))
+                     (t (walk-list (cdr f) mult depth))))
+             (walk-list (l mult depth)
+               (loop (when (not (consp l)) (return))
+                     (walk (car l) mult (+ depth 1))
+                     (setq l (cdr l)))))
+      (walk (%tree-expand body) 1 0))
+    out))
+
 (defun %promotion-choice (vars body k)
   "Up to K of VARS, by descending %var-ref-weight in BODY, each referenced at
-   least twice (a single read is no better in a register than in its slot)."
+   least twice (a single read is no better in a register than in its slot).
+   The ranking is over the MACROEXPANDED body and includes the variables of
+   every nested LET (%inner-let-candidates): an outer variable is promoted
+   only when it is among the K heaviest of the whole function, so registers
+   are left for a heavier inner binding (which its own LET then takes)."
   (if (or (<= k 0) (null vars))
       nil
-      (let ((scored (mapcar (lambda (v) (cons v (%var-ref-weight v body))) vars)))
-        (setq scored (sort scored #'> :key #'cdr))
-        (let ((out nil) (n 0))
-          (dolist (p scored)
-            (when (and (< n k) (>= (cdr p) 2))
-              (push (car p) out) (setq n (+ n 1))))
-          out))))
+      (let* ((xbody (%tree-expand body))
+             (scored (mapcar (lambda (v) (cons v (%var-ref-weight v xbody))) vars))
+             (all (sort (append (copy-list scored) (%inner-let-candidates body)) #'> :key #'cdr))
+             (winners nil) (n 0))
+        ;; the K heaviest variables of the function, outer or inner
+        (dolist (p all)
+          (when (and (< n k) (>= (cdr p) 2))
+            (push p winners) (setq n (+ n 1))))
+        ;; this let's variables among them, heaviest first
+        (let ((out nil))
+          (dolist (p (sort (copy-list scored) #'> :key #'cdr))
+            (when (and (>= (cdr p) 2)
+                       (member p winners :test (lambda (a b) (and (eq (car a) (car b)) (= (cdr a) (cdr b))))))
+              (push (car p) out)))
+          (nreverse out)))))
 
 ;;; ------------------------------------------------------------
 ;;; FP-register-resident declared locals (SIMD plan, layer 2c)
@@ -18998,9 +19043,29 @@
                    (let ((wa (%expr-width a env)))
                      (if (and w wa) (setq w (+ w wa)) (return nil)))))))
          ((string= op "ASH")
-          (and (consp args) (consp (cdr args)) (integerp (cadr args))
-               (let ((w (%expr-width (car args) env)) (k (cadr args)))
-                 (and w (if (< k 0) (max 1 (+ w k)) (+ w k))))))
+          (and (consp args) (consp (cdr args))
+               (if (integerp (cadr args))
+                   (let ((w (%expr-width (car args) env)) (k (cadr args)))
+                     (and w (if (< k 0) (max 1 (+ w k)) (+ w k))))
+                   ;; a VARIABLE count with a proven small range (the shape
+                   ;; compile-ash turns into a register shift): a left shift
+                   ;; by at most 2^n-1 widens by that, a right shift never
+                   ;; widens.  This is a property of the value, so it holds
+                   ;; whichever way the shift is compiled.
+                   (let ((plan (%var-shift-plan (car args) (cadr args) env)))
+                     (and plan
+                          (let ((w (%expr-width (car args) env)))
+                            (and w (if (eq (car plan) :left)
+                                       (+ w (%unsigned-small-max (cdr plan) env))
+                                       w))))))))
+         ((or (string= op "LOGIOR") (string= op "LOGXOR"))
+          ;; two's-complement OR/XOR of values that fit in W1/W2 signed bits
+          ;; fits in MAX(W1,W2) signed bits
+          (and (consp args)
+               (let ((w (%expr-width (car args) env)))
+                 (dolist (a (cdr args) w)
+                   (let ((wa (%expr-width a env)))
+                     (if (and w wa) (setq w (max w wa)) (return nil)))))))
          ((string= op "LOGAND")
           ;; Widths include the sign, so LOGAND only narrows when an operand
           ;; is known NON-NEGATIVE (a literal mask >= 0: result in [0, mask]).

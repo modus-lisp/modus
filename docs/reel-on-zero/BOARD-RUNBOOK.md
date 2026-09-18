@@ -903,6 +903,81 @@ generic fallbacks are emitted inline after every arithmetic op; SBCL parks
 them after the `ret`); (4) check-on-store for typed struct slots so reads
 need no tests at all.
 
+### Round 3 — the decoder's shape, measured against libvpx's (2026-09-18)
+
+"Still shaving when the C algorithm shows a ton of meat": this round moved
+reel's decoder toward libvpx's structure and kept only what the Pi 5 counter
+confirmed. Same binary (`modus-aa64-lr14`) for every step, `pd5.lisp` for
+inst/frame, MD5 48/48 on Modus AND under SBCL for every commit.
+
+| step (reel commit) | inst/frame | cycles/frame |
+|---|---|---|
+| start (f5112af, hygiene) | 24.19 M | 9.30 M |
+| token loop expanded under ONE per-MB `with-bd-cache` (libvpx `decode_mb_tokens` shape) | **27.63 M — reverted** | — |
+| `get-coeffs` reads `+coeff-bands+`/`+coeff-scan+` once; `scatter-y2` typed | 23.11 M | 8.96 M |
+| clear-on-consume coefficient blocks (IDCT column pass and `dc-of` zero what they read; no per-block/per-skip zeroing) | 20.28 M | 8.02 M |
+| NEON `predict-block` (intra-neon.lisp) | 17.00 M | 6.96 M |
+| typed locals in `decode-macroblocks`, typed clears in `find-near-mvs`, DUP8 border fill (d1a3419) | **16.14 M** | **6.62 M** |
+
+What each number taught:
+
+- **One big function loses on Modus.** libvpx keeps the bool decoder in
+  registers across all 25 blocks of a macroblock; expanding `get-coeffs` as
+  a macro inside `decode-residue` did the same on paper and cost +14%: five
+  local registers cannot hold the hot locals of a 4x-expanded function, so
+  the promotion that made `get-coeffs` fast (value/range/count in x4–x8)
+  fell back to frame slots. Small hot functions with their own register
+  budget beat one large one until the register file grows.
+- **A special-variable read is a hash probe.** `+coeff-bands+` in the token
+  loop was a `%GV-REF → %GV-CELL` call per token (~40 instructions); hoisting
+  two tables into locals was −4.5% of the whole frame. Every `+table+` inside
+  a hot loop is this. Compiler lever (not done): resolve the global's cell at
+  JIT time and emit `ldr` from the cell (SBCL's symbol-value slot) — the cell
+  is a stable cons, so it is the same trick as linkage cells.
+- **Zero on consume, not on entry.** 25 `zero16` per macroblock (and 25 more
+  for every skipped MB) became zero stores in the common case: the IDCT
+  clears the block it transforms, `dc-of` clears the DC it reads, `scatter-y2`
+  clears the Y2 block. The invariant "every block is zero between
+  macroblocks" is what MD5 48/48 under SBCL checks (the SBCL run uses the
+  same source, so it validates the algorithm independently of the JIT).
+- **NEON intra prediction** was the largest single win (−16%): the scalar
+  version indexed the plane per pixel through `pidx`. The `%vi-*` tree
+  checker has rules worth knowing before the next kernel: a vector value may
+  only be consumed by `%vi-st*`/`%vi-umov*` or bound by a `let` declared
+  `(type vi-pack v)`; that let must sit at a leaf (no loop inside its body —
+  reload per row instead, the loads are L1 hits); scalar operands of
+  `%vi-dup8/16` must be plain variables, not `(aref …)` forms.
+- **An `aref` through an undeclared struct slot is `%MDA-P`** (2.9% of
+  cycles were the generic array predicate). `perf report -S %MDA-P -G` names
+  the callers; typed `let` locals at function entry fix each one.
+- **`FILL` is a runtime loop**, three calls per inter MB in `find-near-mvs`.
+
+Compiler follow-ups this round exposed (`dis-bit.lisp` on the Pi 5 — pass a
+LAMBDA to `disassemble`, DEFUN objects retain no bytecode): one cached
+`bd-bit*` is ~60 bytecodes with ~20 frame loads/stores because only five
+locals are register-resident; `(logior value (ash byte bc))` compiled a tag
+test plus a `GENERIC-LOGIOR` fallback because `%expr-width` knew nothing
+about variable-count `ash` or `logior` — fixed in the modus tree (width
+inference through `%var-shift-plan` and max-width for LOGIOR/LOGXOR, probe
+T16 vs SBCL; neutral on cam.ivf, the refill branch is rare) and the promotion
+ranking now covers the MACROEXPANDED whole function (`%inner-let-candidates`:
+an outer let's variable takes a register only when it is among the five
+heaviest of the function, so the bool decoder's value/range/count in the
+nested `with-bd-cache` let win over the outer loop's flags): 16.14 M → 15.81 M
+inst/frame, 6.62 M → 6.41 M cycles (`modus-aa64-lr17`, probe == SBCL in JIT
+and interpreter, MD5 48/48). Both compiler changes still owe the ANSI gate.
+x28 is a candidate sixth local register: it is only the GC
+trampoline's own scratch (saved/restored inside it) plus the `blr x28` at
+the gc-check site, which could use x17.
+
+Profile after this round (perf6, Pi 5, `prof6.lisp` = prof4 + intra-neon):
+`GET-COEFFS` 18.8% (the bool decoder proper), loop filter ~20% (the two
+edge kernels 9%, the vertical-edge transposes 8.3%), `PLANE->RFRAME-PLANE`
+5.7% (libvpx swaps buffers; reel still copies three planes and extends
+borders per frame — decoding straight into the bordered reference buffer is
+the structural fix), `DECODE-RESIDUE` 4.7%, `VP8-IDCT-S16` 4.4% (scalar;
+a NEON IDCT needs the 4x4 transpose), `MC-FILTER` 4.4%, `FIND-NEAR-MVS` 3.2%.
+
 ## 7. Serial-only fallback (no `MODUS_SSH_BUILD`)
 
 The serial REPL prints **bare values** (no `= `). Tag every form so a reply can

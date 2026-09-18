@@ -812,10 +812,11 @@ SBCL reference run (`promote-probe.lisp` / `probe-ref.out`). Same-day commits
 | + five local registers V9–V13 = x6 x7 x4 x5 x8, promotion of let/let*/params; YIELD as NOP on hosted Linux | 29.47 M | 11.51 M | 200 (37) |
 | + operand-direct right operands, `setq` straight into the variable's register | **29.34 M** | **11.42 M** | **197 (32)** |
 | + reel: bool-decoder slot/local widths declared tightly (`(unsigned-byte 9/17/31/4)`, prob u8; reel `110ac55`) | **28.46 M** | **10.83 M** | **149** |
+| + x18 = convention-block base (slot addresses fold to one `add`, SET-NARGS/GET-NARGS/SET-MV-COUNT address `[x18,#off]`); first-operand-direct `+`/`-`; operand-direct fused compares; leaf call arguments straight into V0–V3 (modus `a034ac3`) | **27.96 M** | **10.76 M** | **146 (29)** |
 
 **On the Zero (bare metal, A53 @ 1 GHz, cam.ivf, core `reel-lr9.core` from modus `a898bfa` + reel `110ac55`, `lr9-board.sh`): DECODE-MS 3304–3365 / 90 frames = 36.7 ms/frame = 27 fps, from 49.2 ms (20 fps). −25 %, in line with the −24 % instructions; the A76's extra cycle drop was the hosted-only WFE yield.**
 
-That is −24 % instructions and −50 % cycles on the A76 (the cycle drop is mostly
+That is −25 % instructions and −50 % cycles on the A76 (the cycle drop is mostly
 the SEV+WFE yield: 18 cycles per loop back-edge). What each piece is:
 
 - **Struct accessors.** `(bd-range bd)` on a declared `bool-dec` compiled to
@@ -866,13 +867,41 @@ the SEV+WFE yield: 18 cycles per loop back-edge). What each piece is:
   escapes as a load error) on the pre-change binary too — a pre-existing
   runtime issue, not this work; the ANSI gate is the arbiter.
 
-Still on the table, in payoff order: (1) reel-side declarations — `range`/
-`value`/`prob` are `fixnum` (63-bit) slots, so `(- range 1)` may legally be a
-bignum and keeps its tag test; `(unsigned-byte 17)` etc. would let the
-compiler drop them; (2) the arithmetic operand-into-VR moves on the FIRST
-operand (`ADD-CHECKED dest src1 src2` is expressible, the emitter still routes
-through dest); (3) code size for the A53's I-cache (the never-taken generic
-fallbacks are emitted inline after every arithmetic op).
+**The SBCL comparison that set this round's agenda** (SBCL 2.5.2 aarch64
+`disassemble` of the typed `bool-bit` vs Modus's JIT output for the same
+function, `sbcl-dis.lisp` / `native-call.lisp` on the Pi 5): SBCL's whole
+function is ~60 instructions, Modus's inlined copy was ~340. The gap, by
+class: frame traffic (45 `ldur` + 31 `stur` vs 10 + 6), constants (40 `movk`
++ 60 immediate `mov`s — almost all of them CALL overhead: the nargs-slot
+address and the linkage-cell address quads, not arithmetic literals), 72
+register shuffles through VR, type checks on use instead of SBCL's
+check-on-store-trust-on-load, `UBFIZ`-class bit tricks, and the generic
+fallbacks emitted inline where SBCL parks `BRK` stubs after the `ret`. A
+2-argument call plus return was 108 instructions (SBCL ~10).
+
+**x18 convention** (`*a64-x18-base*`, translate-aarch64): x18 holds
+#x10000000 at every point native Lisp runs — all three aarch64 boot stubs set
+it (hosted, QEMU virt, Pi), the SETJMP landing re-materializes it, the
+fixpoint re-entry guard restores it, syscalls/GC trampoline/handler helpers
+preserve it, and its former scratch uses moved to x14/x15. The GC trampoline
+(x18 is its slot cursor) and the signal stub use the general immediate
+loader. A `defvar` whose init never runs in-image: the five register-map
+co-inits set it, like `*a64-vreg-to-phys*`. Image 67.7 → 63.3 MB from the
+folded addresses alone.
+
+Parked with the numbers to justify it: the `dotimes` counter step still goes
+through VR (`MOV VR Vk; ADD VR VR #2; MOV Vk VR`, two instructions per
+iteration) although the identical hand-written `(setq k (1+ k))` compiles
+direct — the difference appears only with the inferred counter width and was
+not found in the time boxed for it.
+
+Still on the table, in payoff order: (1) the same declaration tightening in
+the token and mode parsers that the bool decoder got; (2) the linkage-cell
+address quad (4 `movz/movk` + `ldr` + `blr` per call: a per-function literal
+pool would make it 3); (3) code size for the A53's I-cache (the never-taken
+generic fallbacks are emitted inline after every arithmetic op; SBCL parks
+them after the `ret`); (4) check-on-store for typed struct slots so reads
+need no tests at all.
 
 ## 7. Serial-only fallback (no `MODUS_SSH_BUILD`)
 

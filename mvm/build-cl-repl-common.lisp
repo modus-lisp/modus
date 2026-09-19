@@ -2102,7 +2102,7 @@
 ;; the pre-split mvm/build-rpi-cl-repl.lisp; it lives here now, kept :RPI-only
 ;; so the :virt sibling is unchanged.)
 #+sbcl
-(when (eq *cl-repl-platform* :rpi)
+(when cl-user::*cl-repl-rpi-p*          ; CL-USER:: — this is past (in-package :modus.mvm)
   (let ((v (sb-ext:posix-getenv "MODUS_RPI_GC_SHIM")))
     (when (and v (> (length v) 0) (not (string= v "0")))
       (setf *aarch64-gc-native-mcgc* nil)

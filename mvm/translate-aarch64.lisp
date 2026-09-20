@@ -843,7 +843,7 @@
    Scratch x9..x13 (dead across MVM opcodes; alloc opcodes use x16/x17 + phys
    vregs, never x9..x13).  Guarded: base == 0 (pre-init / disabled) skips the
    write.  AND/LSLV/LDRB/STRB encodings assembler-verified."
-  (a64-load-imm64 buf +a64-x10+ cfg-bitmap-addr)
+  (a64-load-conv-addr buf +a64-x10+ cfg-bitmap-addr)
   (a64-ldr-unsigned buf +a64-x11+ +a64-x10+ 0)
   (a64-asr-imm buf +a64-x11+ +a64-x11+ 1)            ; x11 = bitmap_base
   (a64-cmp-imm buf +a64-x11+ 0)
@@ -851,7 +851,7 @@
     (let ((idx (a64-current-index buf)))
       (a64-bcond buf +cc-eq+ 0)                       ; base==0 → skip
       (a64-add-fixup buf idx skip :bcond))
-    (a64-load-imm64 buf +a64-x10+ #x10000E00)
+    (a64-load-conv-addr buf +a64-x10+ #x10000E00)
     (a64-ldr-unsigned buf +a64-x9+ +a64-x10+ 0)
     (a64-asr-imm buf +a64-x9+ +a64-x9+ 1)             ; x9 = page_base
     (a64-sub-reg buf +a64-x9+ +a64-x24+ +a64-x9+ 0 0) ; x9 = addr - page_base
@@ -1372,10 +1372,6 @@
    below 2^62 whose low 48 bits are not all ones the MOVN alternative never
    wins, so it is MOVZ + MOVK per non-zero halfword either way (verified
    byte-identical against the general path on the host)."
-  (when (and *a64-x18-base* (integerp imm64)
-             (>= imm64 +a64-conv-base+) (< imm64 (+ +a64-conv-base+ #x1000)))
-    (a64-add-imm buf rd +a64-x18+ (- imm64 +a64-conv-base+))
-    (return-from a64-load-imm64 nil))
   (if (and (integerp imm64) (>= imm64 0) (< imm64 4611686018427387904)
            ;; low three halfwords all ones -> MOVN can win; keep the general path
            (/= (logand imm64 #xFFFFFFFFFFFF) #xFFFFFFFFFFFF))
@@ -1392,6 +1388,30 @@
               (when (/= hw2 0) (if started (a64-movk buf rd hw2 2) (progn (a64-movz buf rd hw2 2) (setq started t))))
               (when (/= hw3 0) (if started (a64-movk buf rd hw3 3) (a64-movz buf rd hw3 3))))))
       (a64-load-imm64-general buf rd imm64)))
+
+(defun a64-load-conv-addr (buf rd addr)
+  "Materialise ADDR, which the CALLER asserts is an ADDRESS in the convention
+   block, into Xd — as `ADD Xd, X18, #off' when x18 holds the base.
+
+   THE ASSERTION IS THE POINT.  This fold used to live inside A64-LOAD-IMM64,
+   which sees only a 64-bit machine word and cannot tell an address from a
+   tagged Lisp integer that happens to look like one.  Tagged fixnums are
+   value<<1, so the ordinary constant #x08000000 HAS the machine word
+   #x10000000 — and +OP-LI+, the opcode that materialises data, went through
+   that same path.  One such constant sat on the Pi's boot path:
+   kernel-main's (%gc-init … #x08000000) passes it as the collector's
+   conservative stack-scan base, so with x18 not yet established the root
+   window became [SP, 0) — empty on a downward stack — and the collector
+   scanned no stack at all.  See boot/boot-rpi-cl.lisp.
+
+   So the fold is no longer inferred from the value.  A caller that knows it
+   is naming a convention slot says so by calling THIS; everything else takes
+   the plain MOVZ/MOVK sequence, which is correct for any word.  Missing a
+   call site here costs two instructions, never correctness."
+  (if (and *a64-x18-base* (integerp addr)
+           (>= addr +a64-conv-base+) (< addr (+ +a64-conv-base+ #x1000)))
+      (a64-add-imm buf rd +a64-x18+ (- addr +a64-conv-base+))
+      (a64-load-imm64 buf rd addr)))
 
 (defun a64-load-imm64-general (buf rd imm64)
   "General (bignum / negative two's-complement) case of A64-LOAD-IMM64."
@@ -1994,7 +2014,7 @@
   (a64-mov-reg buf +a64-x0+ +a64-x9+)
   (a64-mov-reg buf +a64-x1+ +a64-x10+)
   ;; NARGS = 2 at the fixed convention slot (32-bit store).
-  (a64-load-imm64 buf +a64-x17+ #x10000150)
+  (a64-load-conv-addr buf +a64-x17+ #x10000150)
   (a64-movz buf +a64-x16+ 2 0)
   (a64-str-width buf +a64-x16+ +a64-x17+ 0 2)
   ;; Call via fn-addr-patched MOVZ+MOVK+BLR.
@@ -2029,7 +2049,7 @@
   (a64-emit-load-vreg buf +a64-x10+ vb)
   (a64-mov-reg buf +a64-x0+ +a64-x9+)
   (a64-mov-reg buf +a64-x1+ +a64-x10+)
-  (a64-load-imm64 buf +a64-x17+ #x10000150)
+  (a64-load-conv-addr buf +a64-x17+ #x10000150)
   (a64-movz buf +a64-x16+ 2 0)
   (a64-str-width buf +a64-x16+ +a64-x17+ 0 2)
   (a64-load-imm64 buf +a64-x16+ entry)
@@ -2174,7 +2194,7 @@
                    ;;   mov x8, #64          ; write
                    ;;   svc #0
                    (a64-asr-imm buf +a64-x16+ +a64-x0+ 1)
-                   (a64-load-imm64 buf +a64-x17+ #x100001F0)
+                   (a64-load-conv-addr buf +a64-x17+ #x100001F0)
                    ;; strb w16, [x17] — encoding 0x39000000 | (0 << 10) | (17 << 5) | 16
                    (a64-emit buf (logior #x39000000 (ash 17 5) 16))
                    (a64-load-imm64 buf +a64-x0+ 1)
@@ -2436,7 +2456,7 @@
                 ;; what we want for fork-file's per-file timeout — the
                 ;; child gets killed, parent wait4 returns, we move on.
                 (a64-asr-imm buf +a64-x10+ +a64-x0+ 1)  ; x10 = seconds untag
-                (a64-load-imm64 buf +a64-x9+ #x10000280)
+                (a64-load-conv-addr buf +a64-x9+ #x10000280)
                 (a64-str-unsigned buf +a64-xzr+ +a64-x9+ 0)   ; it_interval.tv_sec
                 (a64-str-unsigned buf +a64-xzr+ +a64-x9+ 8)   ; it_interval.tv_usec
                 (a64-str-unsigned buf +a64-x10+ +a64-x9+ 16)  ; it_value.tv_sec = N
@@ -2550,7 +2570,7 @@
                 (a64-add-imm buf +a64-x1+ +a64-x1+ 15)
                 (a64-lsr-imm buf +a64-x1+ +a64-x1+ 4)
                 (a64-lsl-imm buf +a64-x1+ +a64-x1+ 4)        ; 16-align size
-                (a64-load-imm64 buf +a64-x9+ #x10000F58)     ; x9  = &bump
+                (a64-load-conv-addr buf +a64-x9+ #x10000F58)     ; x9  = &bump
                 (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0)  ; x10 = cur
                 (let ((cbz-at (a64-current-index buf)))
                   (a64-emit buf 0)                           ; CBZ x10 -> fallback
@@ -2589,10 +2609,10 @@
                 (a64-add-imm buf +a64-x1+ +a64-x1+ 15)
                 (a64-lsr-imm buf +a64-x1+ +a64-x1+ 4)
                 (a64-lsl-imm buf +a64-x1+ +a64-x1+ 4)        ; 16-align size
-                (a64-load-imm64 buf +a64-x9+ (%jit-exec-bump))  ; x9  = &bump
+                (a64-load-conv-addr buf +a64-x9+ (%jit-exec-bump))  ; x9  = &bump
                 (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0)  ; x10 = cur
-                (a64-load-imm64 buf +a64-x11+ (%jit-exec-lo)) ; x11 = lo
-                (a64-load-imm64 buf +a64-x12+ (%jit-exec-hi)) ; x12 = hi
+                (a64-load-conv-addr buf +a64-x11+ (%jit-exec-lo)) ; x11 = lo
+                (a64-load-conv-addr buf +a64-x12+ (%jit-exec-hi)) ; x12 = hi
                 ;; CSEL Xd, Xn, Xm, cond: Xd = cond ? Xn : Xm — Rn is bits 5-9,
                 ;; Rm bits 16-20.  (First cut had Rn/Rm swapped: the garbage-
                 ;; reset arm was a no-op and the valid-pointer arm clobbered to
@@ -2725,7 +2745,7 @@
                 (a64-store-spill buf +a64-x4+ +vreg-v11+)
                 (a64-store-spill buf +a64-x5+ +vreg-v12+)
                 (a64-store-spill buf +a64-x8+ +vreg-v13+)
-                (a64-load-imm64 buf +a64-x16+ #x10000180)
+                (a64-load-conv-addr buf +a64-x16+ #x10000180)
                 (a64-add-imm buf +a64-x17+ +a64-sp+ 0)        ; mov x17, sp
                 (a64-str-unsigned buf +a64-x17+ +a64-x16+ 0)
                 (a64-str-unsigned buf +a64-x29+ +a64-x16+ 8)
@@ -2778,8 +2798,8 @@
                 (cond
                   (*aarch64-handler-pop-label*
                    ;; Read current 180/188/190 → scratch 0xC10/C18/C20.
-                   (a64-load-imm64 buf +a64-x16+ #x10000180)
-                   (a64-load-imm64 buf +a64-x17+ #x10000C10)
+                   (a64-load-conv-addr buf +a64-x16+ #x10000180)
+                   (a64-load-conv-addr buf +a64-x17+ #x10000C10)
                    (a64-ldr-unsigned buf +a64-x15+ +a64-x16+ 0)
                    (a64-str-unsigned buf +a64-x15+ +a64-x17+ 0)
                    (a64-ldr-unsigned buf +a64-x15+ +a64-x16+ 8)
@@ -2794,7 +2814,7 @@
                    ;; flag — helper is tail-emitted, out of BL reach at >128MB).
                    (a64-emit-call-label buf *aarch64-handler-pop-label*)
                    ;; Restore inner SP/FP/IP from scratch.
-                   (a64-load-imm64 buf +a64-x17+ #x10000C10)
+                   (a64-load-conv-addr buf +a64-x17+ #x10000C10)
                    (a64-ldr-unsigned buf +a64-x16+ +a64-x17+ 0)
                    (a64-add-imm buf +a64-sp+ +a64-x16+ 0)
                    (a64-ldr-unsigned buf +a64-x29+ +a64-x17+ 8)
@@ -2802,7 +2822,7 @@
                    (a64-load-imm64 buf +a64-x0+ #xDEAD1009)
                    (a64-br buf +a64-x16+))
                   (t
-                   (a64-load-imm64 buf +a64-x16+ #x10000180)
+                   (a64-load-conv-addr buf +a64-x16+ #x10000180)
                    (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ 0)  ; saved SP
                    (a64-add-imm buf +a64-sp+ +a64-x17+ 0)
                    (a64-ldr-unsigned buf +a64-x29+ +a64-x16+ 8)  ; FP
@@ -2836,15 +2856,15 @@
                    (a64-movk buf +a64-x16+ #x1000 1)
                    (a64-ldr-unsigned buf +a64-x30+ +a64-x16+ 0))
                   (t
-                   (a64-load-imm64 buf +a64-x16+ #x10000180)
+                   (a64-load-conv-addr buf +a64-x16+ #x10000180)
                    (a64-str-unsigned buf +a64-xzr+ +a64-x16+ 0))))
                ((= code #x0513)
                 ;; SAVE-OUTER: copy slot 0x10000180/188/190 → 0x100001A0/1A8/1B0.
                 ;; Used by fork-file to establish a "fallback" handler that
                 ;; the IRQ deadline can longjmp to even when slot 180 has
                 ;; been zeroed by a per-test CLEAR-HANDLER.
-                (a64-load-imm64 buf +a64-x16+ #x10000180)
-                (a64-load-imm64 buf +a64-x17+ #x100001C0)
+                (a64-load-conv-addr buf +a64-x16+ #x10000180)
+                (a64-load-conv-addr buf +a64-x17+ #x100001C0)
                 (a64-ldr-unsigned buf +a64-x15+ +a64-x16+ 0)
                 (a64-str-unsigned buf +a64-x15+ +a64-x17+ 0)
                 (a64-ldr-unsigned buf +a64-x15+ +a64-x16+ 8)
@@ -2854,7 +2874,7 @@
                ((= code #x0514)
                 ;; CLEAR-OUTER: zero slot 0x100001C0 so the IRQ handler
                 ;; falls through to "no handler".
-                (a64-load-imm64 buf +a64-x16+ #x100001C0)
+                (a64-load-conv-addr buf +a64-x16+ #x100001C0)
                 (a64-str-unsigned buf +a64-xzr+ +a64-x16+ 0))
                ((= code #x0515)
                 ;; RESTORE-OUTER: copy slot 0x100001C0/1C8/1D0 → 0x10000180/188/190.
@@ -2864,8 +2884,8 @@
                 ;; SAVE-OUTER (#x0513).  Use case: between per-test
                 ;; handler-cases inside fork-file's thunk, where the
                 ;; previous test's CLEAR-HANDLER zeroed slot 180.
-                (a64-load-imm64 buf +a64-x16+ #x100001C0)
-                (a64-load-imm64 buf +a64-x17+ #x10000180)
+                (a64-load-conv-addr buf +a64-x16+ #x100001C0)
+                (a64-load-conv-addr buf +a64-x17+ #x10000180)
                 (a64-ldr-unsigned buf +a64-x15+ +a64-x16+ 0)
                 (a64-str-unsigned buf +a64-x15+ +a64-x17+ 0)
                 (a64-ldr-unsigned buf +a64-x15+ +a64-x16+ 8)
@@ -2903,7 +2923,7 @@
                 ;;   add x10, x10, #8; sub x11, x11, #8; sub w9, w9, #1
                 ;;   b loop
                 ;; done:
-                (a64-load-imm64 buf +a64-x17+ #x10000150)
+                (a64-load-conv-addr buf +a64-x17+ #x10000150)
                 ;; ldr w9, [x17] — read 32-bit nargs (zero-extends to x9)
                 (a64-ldr-width buf 9 +a64-x17+ 0 2)
                 ;; cmp w9, #5  (32-bit subs-imm form: SF=0)
@@ -5341,7 +5361,7 @@
              (a64-movz buf +a64-x16+ (logand n #xFFFF) 0)
              (if *a64-x18-base*
                  (a64-str32-unsigned buf +a64-x16+ +a64-x18+ #x150)
-                 (progn (a64-load-imm64 buf +a64-x17+ #x10000150)
+                 (progn (a64-load-conv-addr buf +a64-x17+ #x10000150)
                         (a64-str-width buf +a64-x16+ +a64-x17+ 0 2)))))  ; size=2 = 32-bit STR
 
           ;; ---- GET-NARGS Vd ----
@@ -5351,7 +5371,7 @@
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
              (if *a64-x18-base*
                  (a64-ldr32-unsigned buf pd +a64-x18+ #x150)
-                 (progn (a64-load-imm64 buf +a64-x17+ #x10000150)
+                 (progn (a64-load-conv-addr buf +a64-x17+ #x10000150)
                         (a64-ldr-width buf pd +a64-x17+ 0 2)))  ; size=2 = 32-bit LDR (zero-extends)
              (a64-lsl-imm buf pd pd 1)              ; tag as fixnum (shl 1)
              (unless (a64-phys-reg vd)
@@ -5411,7 +5431,7 @@
              (a64-load-imm64 buf +a64-x16+ tagged)
              (if *a64-x18-base*
                  (a64-str-unsigned buf +a64-x16+ +a64-x18+ #x90)
-                 (progn (a64-load-imm64 buf +a64-x17+ #x10000090)
+                 (progn (a64-load-conv-addr buf +a64-x17+ #x10000090)
                         (a64-str-unsigned buf +a64-x16+ +a64-x17+ 0)))))
 
           ;; ---- SET-CENV Vs ----
@@ -5595,13 +5615,13 @@
   (setf *aarch64-code-base-patch-offset* (* (a64-buffer-position buf) 4))
   (a64-movz buf +a64-x16+ 0 0)              ; placeholder (lo16)
   (a64-movk buf +a64-x16+ 0 1)              ; placeholder (hi16 lsl 16)
-  (a64-load-imm64 buf +a64-x17+ #x10000160)
+  (a64-load-conv-addr buf +a64-x17+ #x10000160)
   (a64-str-unsigned buf +a64-x16+ +a64-x17+ 0)
   ;; ---- code_end ----
   (setf *aarch64-code-end-patch-offset* (* (a64-buffer-position buf) 4))
   (a64-movz buf +a64-x16+ 0 0)              ; placeholder (lo16)
   (a64-movk buf +a64-x16+ 0 1)              ; placeholder (hi16 lsl 16)
-  (a64-load-imm64 buf +a64-x17+ #x10000168)
+  (a64-load-conv-addr buf +a64-x17+ #x10000168)
   (a64-str-unsigned buf +a64-x16+ +a64-x17+ 0))
 
 ;;; ============================================================
@@ -6540,7 +6560,7 @@
     ;; raw u32 slot 0x10000150; only matters if the callee has an
     ;; arity check, but emit it for parity with the standard call
     ;; sequence).
-    (a64-load-imm64 buf +a64-x17+ #x10000150)
+    (a64-load-conv-addr buf +a64-x17+ #x10000150)
     (a64-movz buf +a64-x16+ 0 0)
     ;; STUR w16, [x17] — 32-bit store; reuse a64-emit raw.
     (a64-emit buf (logior #xB8000010                ; STUR Wt, [Xn, #imm9]

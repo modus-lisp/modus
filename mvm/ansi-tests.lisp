@@ -5113,11 +5113,15 @@
                   (class-name (class-of c))) 'smoke-circle)
 
   ;; --- CPL ---
-  (deftest 5020 (let ((cpl (class-precedence-list (find-class 'smoke-circle))))
+  ;; CPL is a list of class OBJECTS (AMOP 5.5.1), so these member-tests go
+  ;; through CLASS-NAME.  They formerly compared names directly, which is what
+  ;; kept CLASS-PRECEDENCE-LIST returning names long after its docstring
+  ;; recorded that as a deviation.
+  (deftest 5020 (let ((cpl (mapcar #'class-name (class-precedence-list (find-class 'smoke-circle)))))
                   (notnot (member 'smoke-shape cpl))) t)
-  (deftest 5021 (let ((cpl (class-precedence-list (find-class 'smoke-circle))))
+  (deftest 5021 (let ((cpl (mapcar #'class-name (class-precedence-list (find-class 'smoke-circle)))))
                   (notnot (member 'standard-object cpl))) t)
-  (deftest 5022 (let ((cpl (class-precedence-list (find-class 'smoke-circle))))
+  (deftest 5022 (let ((cpl (mapcar #'class-name (class-precedence-list (find-class 'smoke-circle)))))
                   (notnot (member 't cpl))) t)
 
   ;; --- defmethod dispatch (most-specific wins) ---
@@ -5217,7 +5221,7 @@
       (deftest 5141 (notnot (typep (%make-instance 'smoke-D) 'smoke-B)) t)
       (deftest 5142 (notnot (typep (%make-instance 'smoke-D) 'smoke-C)) t)
       ;; CPL contains smoke-A (don't be strict about exact tail order)
-      (deftest 5143 (let ((cpl (class-precedence-list (find-class 'smoke-D))))
+      (deftest 5143 (let ((cpl (mapcar #'class-name (class-precedence-list (find-class 'smoke-D)))))
                       (notnot (member 'smoke-A cpl))) t))
     (t (c) nil))
 
@@ -5241,7 +5245,7 @@
 
   ;; --- class-direct-superclasses / class-direct-subclasses ---
   (handler-case
-    (deftest 5170 (class-direct-superclasses (find-class 'smoke-circle))
+    (deftest 5170 (mapcar #'class-name (class-direct-superclasses (find-class 'smoke-circle)))
                   '(smoke-shape))
     (t (c) (%record-test-fail-or-emit 5170)))
   (handler-case

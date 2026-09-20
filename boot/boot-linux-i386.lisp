@@ -540,19 +540,19 @@
   ;; [0x10000040] from_start = heap + alloc_start
   (i386l-bytes buf #x89 #xC1)
   (i386l-bytes buf #x81 #xC1) (i386l-le32 buf +linux-i386-heap-alloc-start+)
-  (i386l-mov-abs-reg buf #x10000040 1)
+  (i386l-mov-abs-reg buf +gc-from-start-addr+ 1)
   ;; [0x10000048] to_start = heap + midpoint
   (i386l-bytes buf #x89 #xC1)
   (i386l-bytes buf #x81 #xC1) (i386l-le32 buf +linux-i386-gc-midpoint+)
-  (i386l-mov-abs-reg buf #x10000048 1)
+  (i386l-mov-abs-reg buf +gc-to-start-addr+ 1)
   ;; [0x10000050] space_size
-  (i386l-mov-abs-imm buf #x10000050
+  (i386l-mov-abs-imm buf +gc-space-size-addr+
                      (- +linux-i386-gc-midpoint+ +linux-i386-heap-alloc-start+))
   ;; [0x10000058] stack_base = our RELOCATED stack top
   (i386l-mov-reg-imm buf 1 (- (+ +linux-i386-stack-addr+ +linux-i386-stack-size+) 16))
-  (i386l-mov-abs-reg buf #x10000058 1)
+  (i386l-mov-abs-reg buf +gc-stack-base-addr+ 1)
   ;; [0x10000060] gc_count = 0
-  (i386l-mov-abs-imm buf #x10000060 0)
+  (i386l-mov-abs-imm buf +gc-count-addr+ 0)
 
   ;; --- Object-start + cons-kind bitmaps ---------------------------------
   ;; gc.lisp's %gc-bitmap-init cannot be used on i386: it allocates via

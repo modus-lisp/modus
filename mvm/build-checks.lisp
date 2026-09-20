@@ -1288,6 +1288,25 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
 ;;; oracle — so it is excluded BY NAME, not by a pattern.  Keep that list at
 ;;; three or fewer; a growing exclusion list means this check is being worked
 ;;; around rather than used.
+;;;
+;;; THE FOURTH AND FIFTH, AND WHY THEY ARE A DIFFERENT CASE ENTIRELY.
+;;; net/sb-thread-shim.lisp and net/sb-sys-shim.lisp define the SB-THREAD,
+;;; SB-BSD-SOCKETS, SB-POSIX, SB-SYS and SB-ALIEN surfaces that glass asks
+;;; modus for.  The on-demand stub trick above cannot help: those packages are
+;;; NOT missing on the host, they are SBCL'"'"'S OWN AND LOCKED, so merely READING
+;;; `sb-thread::threadp'"'"' interns into a locked package and signals
+;;;
+;;;     Lock on package SB-THREAD violated when interning THREADP
+;;;
+;;; before a single form is evaluated.  Unlocking SBCL'"'"'s packages to read a
+;;; file is a larger and worse change than excluding two files.
+;;;
+;;; WHAT COVERS THEM INSTEAD, because "excluded" must not mean "unread": both
+;;; files are read AND EVALUATED at every boot of the built image by
+;;; %INSTALL-SB-SHIMS, and test/hosted-sb-thread.lisp fails if the install did
+;;; not happen.  So the #252 class — a "quoted phrase" inside a string literal —
+;;; is caught by the image itself on the very next run, which is a stricter
+;;; reader than this sweep and the one that actually has to read them.
 (defvar *gck-parse-sweep-root*
   (and *load-truename*
        (make-pathname :directory (butlast (pathname-directory *load-truename*))
@@ -1296,7 +1315,8 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
 
 (defvar *gck-parse-sweep-dirs* '("boot" "lib" "mvm" "net" "runtime"))
 
-(defvar *gck-parse-sweep-exclusions* '("install-tarball")
+(defvar *gck-parse-sweep-exclusions*
+  '("install-tarball" "sb-thread-shim" "sb-sys-shim")
   "Pathname-names (no directory, no type) excluded from CHECK E.  See the
    FALSE POSITIVES note above; each entry needs a reason there.")
 
@@ -1535,3 +1555,98 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
               (check-compiler-warns hist (nreverse unknown)))
             result))))
 
+
+;;; ------------------------------------------------------------------
+;;; CHECK G. THE GC REGION CONSTANTS SPAN HOST AND IMAGE SOURCE
+;;; ------------------------------------------------------------------
+;;; mvm/compiler.lisp OWNS the GC region layout (+GC-REGION-ADDR+,
+;;; +GC-REGION-0-BASE+, +GC-OFF-*+).  Three translators and four boot
+;;; descriptors read those constants directly, because they are HOST source.
+;;; mvm/gc.lisp cannot: it is IMAGE source, compiled by Modus's own compiler
+;;; from text, so its copies of those two addresses are literals.
+;;;
+;;; That is the +MV-COUNT-ADDR+ shape all over again — two layers agreeing
+;;; about a number by convention — so it is checked rather than trusted.  A
+;;; drift here is silent and catastrophic in a specific way: the collector and
+;;; the mutator would disagree about WHICH REGION is active, and the collector
+;;; would evacuate one heap while the allocator bumped through another.
+;;;
+;;; The second half of the check is the one that catches a half-finished edit:
+;;; gc.lisp must contain NO absolute address of a region-0 metadata FIELD.
+;;; Every field access has to go through (+ (%gc-region) OFFSET); an accessor
+;;; left pointing at #x10000050 would read region 0's semispace size no matter
+;;; which region was being collected.  (#x10000040 itself is legitimate — it is
+;;; the region-0 default %gc-region falls back to.)
+(defun check-gc-region-literals ()
+  (let* ((path (merge-pathnames "mvm/gc.lisp" cl-user::*modus-base*))
+         (text (with-open-file (s path :direction :input)
+                 (let ((buf (make-string (file-length s))))
+                   (subseq buf 0 (read-sequence buf s)))))
+         (want-region (format nil "#x~8,'0X" +gc-region-addr+))
+         (want-zero   (format nil "#x~8,'0X" +gc-region-0-base+))
+         (want-percpu (format nil "#x~8,'0X" +gc-region-percpu-addr+))
+         (problems nil))
+    (flet ((has (str) (search str text :test #'char-equal)))
+      (unless (has want-region)
+        (push (format nil "mvm/gc.lisp does not mention the active-region word ~A ~
+                           (+GC-REGION-ADDR+); %gc-region/%gc-set-region have drifted"
+                      want-region)
+              problems))
+      (unless (has want-zero)
+        (push (format nil "mvm/gc.lisp does not mention the region-0 base ~A ~
+                           (+GC-REGION-0-BASE+); %gc-region's zero default has drifted"
+                      want-zero)
+              problems))
+      ;; STAGE 3.  The active-region word is now the CPU-0 entry of a per-CPU
+      ;; array, and which form is used is decided by a gate word that mvm/gc.lisp
+      ;; can only spell as a literal.  A drift here is the worst kind: the Lisp
+      ;; side would read one cell and translate-x64's trampoline another, so the
+      ;; collector and the mutator would disagree about which heap is live.
+      (unless (has want-percpu)
+        (push (format nil "mvm/gc.lisp does not mention the per-CPU gate word ~A ~
+                           (+GC-REGION-PERCPU-ADDR+); %gc-region-cell has drifted"
+                      want-percpu)
+              problems))
+      ;; THE PER-COLLECTION SCRATCH BLOCK.  Same shape, same failure mode: the
+      ;; config word's address is a HOST constant and an IMAGE literal, and a
+      ;; drift means one CPU's collector writes another's forwarded-value word.
+      (unless (has (format nil "#x~8,'0X" +gc-scratch-cfg-addr+))
+        (push (format nil "mvm/gc.lisp does not mention the GC scratch config ~
+                           word ~8,'0X (+GC-SCRATCH-CFG-ADDR+); ~
+                           %gc-scratch-cell/%gc-scratch-init have drifted"
+                      +gc-scratch-cfg-addr+)
+              problems))
+      ;; And the three per-collection words must no longer be reachable as
+      ;; literals: every use goes through the SC argument %gc-collect resolves
+      ;; once.  0x10000100 itself is legitimate — it is the zero-config default
+      ;; %gc-scratch-cell falls back to, exactly as #x10000040 is for regions —
+      ;; but +8 and +16 must be gone, or half the collector is still shared.
+      (dolist (off '(8 16))
+        (let ((abs (format nil "#x~8,'0X" (+ #x10000100 off))))
+          (when (has abs)
+            (push (format nil "mvm/gc.lisp still uses the ABSOLUTE scratch word ~
+                               ~A; per-collection state must be (+ SC ~D)"
+                          abs off)
+                  problems))))
+      (unless (search (format nil "(percpu-ref ~D)" +gc-percpu-cpu-id-off+) text
+                      :test #'char-equal)
+        (push (format nil "mvm/gc.lisp does not read the per-CPU :CPU-ID slot as ~
+                           (percpu-ref ~D) (+GC-PERCPU-CPU-ID-OFF+); %gc-region-cell ~
+                           would index the per-CPU active-region table by the wrong slot"
+                      +gc-percpu-cpu-id-off+)
+              problems))
+      (dolist (off (list +gc-off-to-start+ +gc-off-space-size+ +gc-off-stack-base+
+                         +gc-off-count+ +gc-off-saved-sp+ +gc-off-saved-alloc+
+                         +gc-off-saved-limit+))
+        (let ((abs (format nil "#x~8,'0X" (+ +gc-region-0-base+ off))))
+          (when (has abs)
+            (push (format nil "mvm/gc.lisp still uses the ABSOLUTE region-0 field ~
+                               address ~A; metadata access must be ~
+                               (+ (%gc-region) #x~2,'0X)"
+                          abs off)
+                  problems)))))
+    (when problems
+      (error "~&CHECK G (gc region constants) FAILED:~{~%  - ~A~}~%" (nreverse problems)))
+    t))
+
+(check-gc-region-literals)

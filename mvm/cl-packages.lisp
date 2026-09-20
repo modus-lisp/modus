@@ -862,24 +862,37 @@
                           (values found :inherited)
                           (values nil nil))))))))))))
 
-(defun intern (name &rest pkg-arg)
-  "Intern symbol named NAME in package PKG.
-   Returns (values symbol status).
-   CLHS: one or two args; a third positional arg signals program-error
-   (intern.error.2)."
-  (when (and pkg-arg (cdr pkg-arg))
-    (%signal-program-error))
-  (let ((pkg (%resolve-package (if pkg-arg (car pkg-arg) *package*)))
-        (name-str (%pkg-string-designator name)))
-    (if (null pkg)
-        (values nil nil)
+(defun %cl-intern-in (pkg name-str)
+  "The body of CL:INTERN, run UNDER THE RUNTIME-TABLE LOCK by the wrapper
+   below.  Returns (LIST symbol status) — a list, not VALUES, so the wrapper
+   can release the lock between computing the answer and returning it.
+
+   WHY THE LOCK, measured rather than argued: this create branch allocates the
+   CL symbol, its name string's symtab entry and the package-symtab cons in
+   the CALLING thread's active region and links them into region-0 structures
+   (the shared intern table at 0x10000088 AND the package object's own
+   symtab).  On a worker, that is the campaign's D1 — `region 0 -> worker'
+   +44 at K=20, every run, test/hosted-intern-layers.lisp — and the pointers
+   dangle at the worker's first collection.  Under the lock, every one of
+   those allocations lands in the lock arena (net/hosted-sync.lisp, B-LITE):
+   region-0 address space, immortal, co-located with the tables that point at
+   it.  An earlier note recorded that bracketing a CL:INTERN call site with
+   %RT-ENTER/%RT-LEAVE by hand reproduced the lethal signature at K=1 — that
+   was the two-mutators-one-frontier collision the arena has since removed,
+   not a property of the bracketing.
+
+   NOTHING IN HERE MAY SIGNAL: a longjmp out of a held lock leaves it held
+   and the region hopped.  The three things that CAN signal on this path —
+   the arg-count check, package resolution and the string designator — run in
+   the WRAPPER, before the lock."
+  (progn
         ;; Check if already present
         (let ((ext-entry (%symtab-find-in pkg 3 name-str)))
           (if ext-entry
-              (values (cdr ext-entry) :external)
+              (list (cdr ext-entry) :external)
               (let ((int-entry (%symtab-find-in pkg 2 name-str)))
                 (if int-entry
-                    (values (cdr int-entry) :internal)
+                    (list (cdr int-entry) :internal)
                     ;; Check inherited
                     (let ((found nil)
                           (use (%pkg-use-list pkg)))
@@ -891,8 +904,25 @@
                             (return nil)))
                         (setq use (cdr use)))
                       (if found
-                          (values found :inherited)
-                          ;; Create new symbol
+                          (list found :inherited)
+                          ;; Create new symbol.
+                          ;;
+                          ;; THE NAME IS COPIED FIRST, AND THE COPY IS THE
+                          ;; POINT, NOT A TIDINESS: NAME-STR was allocated by
+                          ;; the CALLER, in the caller's region — a worker's,
+                          ;; when a worker interns — and every branch below
+                          ;; STORES it into region-0-side structures (the
+                          ;; symbol's name slot, the package symtabs' keys).
+                          ;; Stored uncopied, each fresh worker intern left ~2
+                          ;; region-0 -> worker references (measured: +41 at
+                          ;; K=20 with the lock alone), which dangle at the
+                          ;; worker's first collection.  We are UNDER THE
+                          ;; RUNTIME LOCK here, so this COPY-SEQ allocates in
+                          ;; the lock arena beside everything that points at
+                          ;; it.  The found/inherited paths above store
+                          ;; nothing and stay copy-free — copying on the hot
+                          ;; found path would burn immortal arena per lookup.
+                          (let ((name-str (copy-seq name-str)))
                           (if (and (find-package "KEYWORD")
                                    (eq pkg (find-package "KEYWORD")))
                               ;; Keyword package: route through %INTERN-KEYWORD
@@ -906,7 +936,7 @@
                                           (compute-name-hash name-str))))
                                 (%pkg-set-external pkg
                                   (%symtab-add (%pkg-external pkg) name-str kw))
-                                (values kw :external))
+                                (list kw :external))
                               ;; Regular (non-keyword) package: per-CLHS
                               ;; per-package distinct symbols.  See
                               ;; SYMBOLS_PLAN.md.  We allocate a fresh
@@ -1006,7 +1036,29 @@
                                   (%cl-sym-set-package sym pkg))
                                 (%pkg-set-internal pkg
                                   (%symtab-add (%pkg-internal pkg) name-str sym))
-                                (values sym nil))))))))))))
+                                (list sym nil))))))))))))
+
+(defun intern (name &rest pkg-arg)
+  "Intern symbol named NAME in package PKG.
+   Returns (values symbol status).
+   CLHS: one or two args; a third positional arg signals program-error
+   (intern.error.2).
+
+   LOCKED, like %INTERN-SYMBOL-PKG and for the same reason — see
+   %CL-INTERN-IN above.  Everything that can SIGNAL (the arg-count check,
+   package resolution, the string designator) runs HERE, before the lock, so
+   no longjmp can escape a held lock."
+  (when (and pkg-arg (cdr pkg-arg))
+    (%signal-program-error))
+  (let ((pkg (%resolve-package (if pkg-arg (car pkg-arg) *package*)))
+        (name-str (%pkg-string-designator name)))
+    (if (null pkg)
+        (values nil nil)
+        (progn
+          (%rt-enter)
+          (let ((r (%cl-intern-in pkg name-str)))
+            (%rt-leave)
+            (values (car r) (car (cdr r))))))))
 
 ;;; --- export / unexport ---
 
@@ -1695,9 +1747,29 @@
   (when (eq name-or-hash t) (return-from symbol-value t))
   (let ((key (if (integerp name-or-hash)
                  name-or-hash
-                 (%sym-global-key name-or-hash)))
-        (tbl (%globals-table)))
-    (if (and tbl key) (values (gethash key tbl)) nil)))
+                 (%sym-global-key name-or-hash))))
+    ;; THIS THREAD'S OWN DYNAMIC BINDINGS COME FIRST.  Prelude's SYMBOL-VALUE
+    ;; carries the same three lines and the same comment; BOTH need them,
+    ;; because this override is the one that actually runs in any image with a
+    ;; package system (last-defun-wins) and prelude's is the one that runs in
+    ;; the images without one.  Gate = the word %RT-ENTER tests, so an image
+    ;; that never declared itself threaded pays one 32-bit load and a branch;
+    ;; the main thread of a threaded image has window base 0 and pays two more
+    ;; before reaching the identical code.  See PER-THREAD DYNAMIC BINDINGS in
+    ;; mvm/prelude.lisp for why a worker's binding may not go in the table.
+    ;; KEY CAN BE NIL HERE (%SYM-GLOBAL-KEY answers NIL for a non-symbol), and
+    ;; NIL is the immediate #xDEAD0001, which a value slot could legitimately
+    ;; hold — so a NIL key must never be handed to the scan or it could match
+    ;; some other binding's value word and return that binding's value.
+    (unless (or (null key) (eql (mem-ref #x10000DB8 :u32) 0))
+      (let ((blk (%dynb-block)))
+        (unless (eql blk 0)
+          (let ((a (%dynb-find key (- (%dynb-next blk) 16)
+                               (- (%dynb-depth blk) 1))))
+            (unless (eql a 0)
+              (return-from symbol-value (values (mem-ref a :u64))))))))
+    (let ((tbl (%globals-table)))
+      (if (and tbl key) (values (gethash key tbl)) nil))))
 
 (defun boundp (sym)
   "True if SYM has a value in the global symbol-value alist (#x10000080).
@@ -2018,7 +2090,12 @@
     (loop
       (when (null vc) (return nil))
       (when (null vlc) (return nil))
-      (set-symbol-value (%progv-hash (car vc)) (car vlc))
+      ;; %DYNBIND, not SET-SYMBOL-VALUE: PROGV establishes a dynamic BINDING,
+      ;; so on a worker thread it must land in that thread's own storage
+      ;; rather than in region 0's globals table — the same reason
+      ;; COMPILE-LET-WITH-SPECIALS emits it.  Identical to the old call on
+      ;; every unarmed thread.
+      (%dynbind (%progv-hash (car vc)) (car vlc))
       (setq vc (cdr vc))
       (setq vlc (cdr vlc)))))
 
@@ -2028,6 +2105,9 @@
     (loop
       (when (null cur) (return nil))
       (let ((p (car cur)))
-        (set-symbol-value (car p) (cdr p)))
+        ;; The %DYNBIND above's counterpart.  %DYNUNBIND truncates this
+        ;; thread's binding stack to the entry it finds, so restoring in
+        ;; binding order (which is the order %PROGV-SAVE built) is correct.
+        (%dynunbind (car p) (cdr p)))
       (setq cur (cdr cur)))))
 

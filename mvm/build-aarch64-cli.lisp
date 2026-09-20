@@ -28,7 +28,11 @@
 
 (defvar *cli-arch* :aarch64)
 
-;;; exit_group is syscall 93 on the AArch64 generic ABI (60 on x86-64).
+;;; ABI FACT, corrected: on the AArch64 generic ABI 93 is `exit' (calling
+;;; THREAD only) and 94 is `exit_group' (the process).  This slot used 93, which
+;;; is indistinguishable from 94 in a single-threaded image and a permanent HANG
+;;; once a second thread exists: the leader becomes an unreapable zombie and a
+;;; parked sibling is never woken.  x86-64 had the identical bug (60 vs 231).
 ;;;
 ;;; KNOWN BUG, NOT a divergence: every NONZERO exit this image produces is
 ;;; DOUBLED (`(sys-exit 1)' -> rc 2), because the value reaching the SVC is
@@ -42,9 +46,9 @@
 (defvar *cli-arch-syscall-source* "
 (defun sys-exit (code)
   (let ((c code))
-    (syscall3 93 c 0 0)))
+    (syscall3 94 c 0 0)))
 (defun halt ()
-  (syscall3 93 1 0 0))
+  (syscall3 94 1 0 0))
 ")
 
 ;;; AArch64 diagnostic + WS4-JIT probe apparatus, baked ahead of kernel-main.

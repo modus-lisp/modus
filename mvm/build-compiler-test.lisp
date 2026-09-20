@@ -323,6 +323,19 @@
   (puthash name-hash (mem-ref 3670016 :u64) value)
   value)
 
+;;; %DYNBIND / %DYNUNBIND -- what COMPILE-LET-WITH-SPECIALS now emits for a
+;;; special's bind and restore instead of SET-SYMBOL-VALUE.  This image has no
+;;; threads and no per-thread window, so they ARE the shallow bind; they exist
+;;; here so the emitted calls resolve rather than landing on %UNRESOLVED-FN,
+;;; which would silently turn every (let ((*x* ...)) ...) into a no-op.
+(defun %dynbind (name-hash value)
+  (puthash name-hash (mem-ref 3670016 :u64) value)
+  value)
+
+(defun %dynunbind (name-hash value)
+  (puthash name-hash (mem-ref 3670016 :u64) value)
+  value)
+
 ;;; ============================================================
 ;;; Symbol representation adapter
 ;;; Bare-metal reader produces (cons 9999 char-codes) for symbols.

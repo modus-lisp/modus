@@ -1044,7 +1044,7 @@
                         ;; everything emitted before the lambda) — mvm-eval of
                         ;; a capturing closure then ran a frame-less thunk
                         ;; that STACK-LOADed a 0 VFP → SIGSEGV (WS4 oracle).
-                        "*IR-BUFFER*" "*TEMP-REG-COUNTER*" "*FP-REG-COUNTER*" "*LOCAL-VREGS-FREE*"
+                        "*IR-BUFFER*" "*DEFERRED-TAILS*" "*TEMP-REG-COUNTER*" "*FP-REG-COUNTER*" "*LOCAL-VREGS-FREE*"
                         "*UNUSED-VALUE-FORM*" "*SETQ-VALUE-UNUSED*"
                         "*CURRENT-FUNCTION-NAME*" "*FUNCTION-RETURN-LABEL*"
                         "*UWP-CLEANUPS*" "*LOOP-EXIT-UWP-SEQ*"
@@ -1897,6 +1897,36 @@
 (defun emit-ir-label (label-id)
   "Emit a label marker in the IR stream"
   (push (list :label label-id) *ir-buffer*))
+
+(defvar *deferred-tails* nil
+  "IR fragments to be emitted AFTER this function's RET, newest first.
+
+   THE NEVER-TAKEN PATH DOES NOT BELONG IN THE STRAIGHT LINE.  Every
+   tag-checked arithmetic pair emits a slow path — save the live temps, move
+   the operands into the argument registers, call the generic helper, restore
+   — and until now it sat inline, jumped over by the fast path.  It is the
+   arm that essentially never runs, and on a Cortex-A53 with a 32 KB L1 it is
+   paying twice: once for the icache line it occupies and once for the
+   straight-line branch around it.  30%% of the decoder's cycles are stalled
+   on instruction fetch.  SBCL parks these blocks after the RET; so does this
+   now.  The fragments are captured as IR, not as closures, so nothing about
+   register or label state can drift between capture and flush.")
+
+(defun emit-deferred-tail (thunk)
+  "Run THUNK with a FRESH IR buffer and stash what it emitted for the flush
+   after RET.  Returns nothing the caller needs: the code is not here."
+  (let* ((*ir-buffer* nil)
+         (ignore (funcall thunk))
+         (frag (reverse *ir-buffer*)))
+    (declare (ignore ignore))
+    (push frag *deferred-tails*))
+  nil)
+
+(defun flush-deferred-tails ()
+  "Emit every parked fragment, oldest first, in the order they were parked."
+  (dolist (frag (reverse *deferred-tails*))
+    (dolist (insn frag) (push insn *ir-buffer*)))
+  (setq *deferred-tails* nil))
 
 (defun get-ir-instructions ()
   "Return the IR instructions in forward order.
@@ -15803,33 +15833,41 @@
        (emit-ir :pop dest)             ; restore original a
        (emit-ir :br slow-label))
       (t
-       (emit-ir fast-op dest src1 temp)
-       (emit-ir :br end-label)))
+       ;; No branch over the slow path any more — it is parked past the RET,
+       ;; so the fast path simply FALLS THROUGH to END-LABEL below.  That is
+       ;; one branch saved at every tag-checked arithmetic site in the image.
+       (emit-ir fast-op dest src1 temp)))
     ;; Slow path.
-    (emit-ir-label slow-label)
-    ;; Save caller-saved temps live in V5..V(4+save-count-1), skipping
-    ;; dest (it'll be overwritten by the call result), temp (already
-    ;; been preserved by the caller's push/pop dest pattern, but our
-    ;; :mov V1 temp will reload it from its phys reg right before the
-    ;; call so we DON'T need to save it here), and the two tag-check
-    ;; temps (we don't need them after the cmp).  Push pattern matches
-    ;; compile-call's (line 6014) save logic.
-    (when (> save-count 1)
-      (loop for r from (+ +vreg-v4+ 1) below (+ +vreg-v4+ save-count)
-            do (unless (or (= r dest) (= r temp)
-                           (= r tag-temp) (= r one-temp))
-                 (emit-ir :push r))))
-    (emit-ir :mov +vreg-v0+ src1)
-    (emit-ir :mov +vreg-v1+ temp)
-    (emit-ir :set-nargs 2)
-    (emit-ir :call generic-name 2)
-    (emit-ir :mov dest +vreg-vr+)
-    ;; Restore in reverse order, matching the push set above.
-    (when (> save-count 1)
-      (loop for r from (+ +vreg-v4+ save-count -1) downto (+ +vreg-v4+ 1)
-            do (unless (or (= r dest) (= r temp)
-                           (= r tag-temp) (= r one-temp))
-                 (emit-ir :pop r))))
+    ;; THE SLOW PATH IS PARKED AFTER THE RET, not laid down here — see
+    ;; *DEFERRED-TAILS*.  It ends by branching BACK to END-LABEL, which by
+    ;; then sits above it.
+    (emit-deferred-tail
+     (lambda ()
+       (emit-ir-label slow-label)
+       ;; Save caller-saved temps live in V5..V(4+save-count-1), skipping
+       ;; dest (it'll be overwritten by the call result), temp (already
+       ;; been preserved by the caller's push/pop dest pattern, but our
+       ;; :mov V1 temp will reload it from its phys reg right before the
+       ;; call so we DON'T need to save it here), and the two tag-check
+       ;; temps (we don't need them after the cmp).  Push pattern matches
+       ;; compile-call's (line 6014) save logic.
+       (when (> save-count 1)
+         (loop for r from (+ +vreg-v4+ 1) below (+ +vreg-v4+ save-count)
+               do (unless (or (= r dest) (= r temp)
+                              (= r tag-temp) (= r one-temp))
+                    (emit-ir :push r))))
+       (emit-ir :mov +vreg-v0+ src1)
+       (emit-ir :mov +vreg-v1+ temp)
+       (emit-ir :set-nargs 2)
+       (emit-ir :call generic-name 2)
+       (emit-ir :mov dest +vreg-vr+)
+       ;; Restore in reverse order, matching the push set above.
+       (when (> save-count 1)
+         (loop for r from (+ +vreg-v4+ save-count -1) downto (+ +vreg-v4+ 1)
+               do (unless (or (= r dest) (= r temp)
+                              (= r tag-temp) (= r one-temp))
+                    (emit-ir :pop r))))
+       (emit-ir :br end-label)))
     (emit-ir-label end-label)
     (free-temp-reg)
     (free-temp-reg)))
@@ -21612,6 +21650,10 @@
                                           (%block-runtime-catch-unsafe-p body)
                                         (t (c) :walker-signaled)))))
          (*ir-buffer* nil)
+         ;; same scope as *IR-BUFFER*: parked blocks belong to THIS function,
+         ;; and a fragment that leaked into the next one would carry labels
+         ;; that function never defines
+         (*deferred-tails* nil)
          (*current-function-name* (if (symbolp name) (symbol-name name)
                                       (string name)))
          (*temp-reg-counter* 0)
@@ -21797,6 +21839,10 @@
     ;; Function epilogue
     (emit-ir :frame-leave)
     (emit-ir :ret)
+
+    ;; Parked never-taken blocks go HERE, past the RET — nothing falls into
+    ;; them and the straight line does not carry them through the icache.
+    (flush-deferred-tails)
 
     ;; Build function-info
     (let ((ir (get-ir-instructions)))

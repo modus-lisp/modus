@@ -637,6 +637,34 @@
                                         modus.mvm::*aarch64-gc-limit-guard*))
     (emit-aarch64-load-imm64 buf x26 *rpi-cl-nil-value*)
 
+    ;; x18 = the CONVENTION BASE, #x10000000.  Every other AArch64 boot in the
+    ;; tree establishes it (boot-rpi.lisp 62, boot-aarch64.lisp 180,
+    ;; boot-linux-aarch64.lisp 434); this file — the one the CL REPL image
+    ;; boots through — never did, and x18 therefore held whatever the firmware
+    ;; left in it (0 under QEMU raspi3b).
+    ;;
+    ;; IT IS NOT AN OPTIONAL OPTIMISATION.  translate-aarch64's A64-LOAD-IMM64
+    ;; folds ANY immediate in [#x10000000, #x10001000) into `ADD Xd, X18, #off'
+    ;; whenever *A64-X18-BASE* is set — and this image sets it
+    ;; (build-cl-repl-common.lisp).  The fold is applied to the machine word,
+    ;; so it catches DATA as well as addresses: a tagged fixnum is value<<1, so
+    ;; the perfectly ordinary constant #x08000000 has the machine word
+    ;; #x10000000 and was loaded as `x18 + 0'.
+    ;;
+    ;; That is exactly one constant in the boot path, and it was the worst one
+    ;; possible: kernel-main's (%gc-init #x09000000 #x07000000 #x08000000)
+    ;; passes #x08000000 as the CONSERVATIVE STACK SCAN BASE.  With x18 = 0 the
+    ;; collector's root window became [SP, 0) — empty on a downward stack — so
+    ;; the native Cheney trampoline scanned the global tables and NOT ONE STACK
+    ;; WORD.  Anything live only through a local died at the next collection.
+    ;; The image booted anyway because early boot collects at most once and
+    ;; roots almost everything from the intern tables; it showed up the moment
+    ;; boot did real work, as `!! form eval error' with the loader's own FORM
+    ;; local already reclaimed, and every mvm-eval afterwards on a corrupt heap.
+    ;; The other three %GC-INIT fields survived because they are runtime
+    ;; arithmetic, not literals, and so are never folded.
+    (emit-aarch64-load-imm64 buf 18 #x10000000)
+
     ;; NATIVE MCGC + runtime JIT: reserve x28 = the GC trampoline's absolute
     ;; VA, exactly as emit-linux-aarch64-entry does (see the comment there and
     ;; *aarch64-x28-load-patch-offset*).  BAKED bare-metal code keeps its

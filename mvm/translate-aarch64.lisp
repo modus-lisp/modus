@@ -290,22 +290,23 @@
   "WS4 aarch64 Stage 3.  Non-nil only inside the runtime-JIT driver around a
    translate-mvm-to-aarch64 call.  Under it, op-call to a SYNTHETIC runtime
    offset (>= #x40000000 — a function NOT in this module, resolved by NAME via
-   the rt-table) emits a RELOCATABLE absolute call (a MOVZ/MOVK quad → x16;
-   BLR x16) and records the patch site in *aarch64-call-relocs*, instead of the
+   the rt-table) emits a RELOCATABLE call (ADRP + LDR x16 through the callee's
+   linkage cell, or a MOVZ/MOVK quad → x16 when cells are off; then BLR x16)
+   and records the patch site in *aarch64-call-relocs*, instead of the
    SVC #x0511 undefined-call trap.  Nil at image-build time → whole-image
    codegen unchanged (byte-identical to pre-Stage-3).")
 
 (defvar *aarch64-call-reloc-nargs* nil
-  "#306 BRIDGE: alist (movz-byte-off . nargs) parallel to *aarch64-call-relocs*.")
+  "#306 BRIDGE: alist (call-site-byte-off . nargs) parallel to *aarch64-call-relocs*.")
 (defvar *aarch64-last-set-nargs* nil
   "The most recent :set-nargs immediate seen by the translator (JIT mode).")
 (defvar *aarch64-call-relocs* nil
-  "WS4 aarch64 Stage 3.  List of (movz-quad-native-byte-offset . synthetic-mvm-
+  "WS4 aarch64 Stage 3.  List of (call-site-native-byte-offset . synthetic-mvm-
    offset) collected during a JIT translation.  At JIT time the driver resolves
    synthetic-offset → name (rt-table) → raw native address (%mvm-resolve-
-   runtime-fn, untagged), then rewrites the 4 MOVZ/MOVK imm16 fields at that
-   offset.  Bound freshly to nil per JIT translation; empty for any hazard-free
-   (rt-empty) module, so flag-off / hazard-free translation is byte-identical.")
+   runtime-fn, untagged), then rewrites the address-load instructions at that
+   offset (%JIT-PATCH-CALL-SITE).  Bound freshly to nil per JIT translation;
+   empty for any hazard-free (rt-empty) module, so flag-off / hazard-free translation is byte-identical.")
 
 (defvar *a64-jit-page-reject* nil
   "#307: set by the translator when a RUNTIME-JIT page cannot be built (today:
@@ -1335,6 +1336,20 @@
                         (ash #b100101 23)
                         (ash (logand hw 3) 21)
                         (ash (logand imm16 #xFFFF) 5)
+                        rd)))
+
+(defun a64-adrp (buf rd imm21)
+  "ADRP Xd, #imm21  — Xd := (PC & ~0xFFF) + (imm21 << 12).
+
+   Encoding: bit31=1, bits30:29=immlo (the low 2 bits of the signed 21-bit
+   page delta), bits28:24=0b10000, bits23:5=immhi (the remaining 19), Rd in
+   4:0.  IMM21 is the SIGNED page delta, i.e. (page(target)-page(pc))>>12;
+   range ±2^20 pages = ±4 GB.  Emitted with 0 as a placeholder and patched
+   once the page's runtime address is known (see %JIT-WRITE-CALL-ADRP)."
+  (a64-emit buf (logior (ash 1 31)
+                        (ash (logand imm21 3) 29)
+                        (ash #b10000 24)
+                        (ash (logand (ash imm21 -2) #x7FFFF) 5)
                         rd)))
 
 (defun a64-movn (buf rd imm16 hw)
@@ -4749,24 +4764,44 @@
                ;; as the BL label path).  Args/nargs are already staged by the
                ;; compiler's preceding IR, exactly as for the label path.
                ((and *aarch64-jit-mode* (>= target-offset #x40000000))
-                (let ((movz-byte-off (* (- (a64-current-index buf)
+                (let ((site-byte-off (* (- (a64-current-index buf)
                                            (or *aarch64-translated-start-idx* 0))
                                         4)))
-                  (push (cons movz-byte-off target-offset) *aarch64-call-relocs*)
-                  (push (cons movz-byte-off *aarch64-last-set-nargs*) *aarch64-call-reloc-nargs*))
-                (a64-movz buf +a64-x16+ 0 0)   ; placeholder addr[15:0]  LSL 0
-                (a64-movk buf +a64-x16+ 0 1)   ; placeholder addr[31:16] LSL 16
-                (a64-movk buf +a64-x16+ 0 2)   ; placeholder addr[47:32] LSL 32
-                (a64-movk buf +a64-x16+ 0 3)   ; placeholder addr[63:48] LSL 48
-                ;; LINKAGE CELL: when on, the movz quad is patched with the
-                ;; callee's stable CELL address (not its code address); this LDR
-                ;; loads the cell's current contents (the live native entry) into
-                ;; x16 so a redefinition that repoints the cell is seen here.
-                ;; The reloc site (movz-byte-off) is BEFORE this LDR, so adding
-                ;; it does not disturb the quad the patch targets.  Emit and
-                ;; patch read the same *jit-linkage-cells*, so they agree.
-                (when (and (boundp (quote *jit-linkage-cells*)) *jit-linkage-cells*)
-                  (a64-ldr-unsigned buf +a64-x16+ +a64-x16+ 0))
+                  (push (cons site-byte-off target-offset) *aarch64-call-relocs*)
+                  (push (cons site-byte-off *aarch64-last-set-nargs*) *aarch64-call-reloc-nargs*))
+                ;; LINKAGE CELL (the shipping configuration): the callee is
+                ;; reached through a stable per-name u64 cell, so a later
+                ;; redefinition that repoints the cell is seen here.  The cell
+                ;; lives in the same %mmap-exec-page arena as this code page, so
+                ;; it is reachable PC-relatively:
+                ;;     ADRP x16, page(cell)
+                ;;     LDR  x16, [x16, #lo12(cell)]
+                ;;     BLR  x16
+                ;; THREE instructions where this used to spend SIX (a MOVZ/MOVK
+                ;; quad materialising the cell's absolute address, then the same
+                ;; LDR and BLR).  Calls are the densest thing in JIT'd code and
+                ;; the A53 stalls 30% of its cycles on instruction fetch, so the
+                ;; three words saved at every site are paid back twice: fewer
+                ;; instructions retired and less icache pressure.  ADRP reaches
+                ;; ±4 GB, which is four orders of magnitude more than the
+                ;; distance between two pages of one arena; %JIT-WRITE-CALL-ADRP
+                ;; still CHECKS it and rejects the page (→ interpret) rather
+                ;; than emit a wild branch if that ever stops being true.
+                ;;
+                ;; Cells OFF is early binding with the callee's code address
+                ;; baked in — a main-image address, which is NOT within ADRP
+                ;; range of an mmap'd page — so that mode keeps the absolute
+                ;; MOVZ/MOVK quad.  Emit and patch read the same
+                ;; *jit-linkage-cells* within one page, so they agree.
+                (if (and (boundp (quote *jit-linkage-cells*)) *jit-linkage-cells*)
+                    (progn
+                      (a64-adrp buf +a64-x16+ 0)              ; placeholder page delta
+                      (a64-ldr-unsigned buf +a64-x16+ +a64-x16+ 0)) ; placeholder lo12
+                    (progn
+                      (a64-movz buf +a64-x16+ 0 0)   ; placeholder addr[15:0]  LSL 0
+                      (a64-movk buf +a64-x16+ 0 1)   ; placeholder addr[31:16] LSL 16
+                      (a64-movk buf +a64-x16+ 0 2)   ; placeholder addr[47:32] LSL 32
+                      (a64-movk buf +a64-x16+ 0 3))) ; placeholder addr[63:48] LSL 48
                 (a64-blr buf +a64-x16+))
                (t
                 (format t "~&  AARCH64 CALL: NO LABEL for target-offset=~D — emitting SVC #x0511 trap~%"

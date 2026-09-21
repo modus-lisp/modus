@@ -231,6 +231,12 @@
 (defvar *jit-r-lrel-fail* nil
   "SITE count: an IN-MODULE fn-addr (closure slot-0 / #'LOCAL) reloc failed —
    fn-map had no native offset, or the entry was not 16-byte aligned.")
+(defvar *jit-r-crel-encode-fail* nil
+  "SITE count (aarch64): an out-of-module CALL reloc resolved to a real address
+   but could not be ENCODED — no linkage-cell arena page, or the cell sits
+   further than ADRP's ±4 GB from the code page.  Expected to stay 0; a nonzero
+   value means the call sequence fell back to interpretation and is the signal
+   to revisit the PC-relative call shape.")
 (defvar *jit-r-eoff-nil* nil
   "PAGE count: fn-map held no native offset for the module's ENTRY function, so
    there was nothing to call even though every reloc resolved.")
@@ -518,6 +524,78 @@
         (setf (mem-ref (+ base (+ wo 2)) :u8) (logand (ash nw -16) 255))
         (setf (mem-ref (+ base (+ wo 3)) :u8) (logand (ash nw -24) 255)))
       (setq k (+ k 1)))))
+
+(defun %jit-write-word32 (base off w)
+  "Store the 32-bit instruction W at BASE+OFF, little-endian."
+  (setf (mem-ref (+ base off) :u8) (logand w 255))
+  (setf (mem-ref (+ base (+ off 1)) :u8) (logand (ash w -8) 255))
+  (setf (mem-ref (+ base (+ off 2)) :u8) (logand (ash w -16) 255))
+  (setf (mem-ref (+ base (+ off 3)) :u8) (logand (ash w -24) 255)))
+
+(defun %jit-write-call-adrp (base off target)
+  "Patch the two-instruction PC-relative address load at BASE+OFF so that x16
+   holds the 64-bit word stored at TARGET:
+
+     [off+0]  ADRP x16, page(TARGET)
+     [off+4]  LDR  x16, [x16, #lo12(TARGET)]
+
+   (the BLR x16 the translator emitted at off+8 needs no patch).  The aarch64
+   counterpart of %JIT-WRITE-MOVZ-QUAD for out-of-module CALL sites, and three
+   words shorter at every one of them.
+
+   Returns T on success and NIL — having written NOTHING — when the site cannot
+   be encoded, which is the caller's signal to reject the page and let the form
+   interpret.  Two ways that happens, both checked rather than assumed, because
+   a wrong immediate here is a wild branch (and on bare metal a silent spin):
+     - the signed page delta does not fit ADRP's 21 bits (±4 GB), or
+     - TARGET is not 8-byte aligned, which LDR's scaled imm12 cannot express.
+   Both hold comfortably for a linkage cell (8-byte bump-allocated out of the
+   same %mmap-exec-page arena as the code page), which is why this is the right
+   shape for the call sequence and not for, say, a main-image code address."
+  (let* ((pc (+ base off))
+         (delta (ash (- (- target (logand target 4095))
+                        (- pc (logand pc 4095)))
+                     -12))
+         (lo12 (logand target 4095)))
+    (if (or (< delta -1048576) (> delta 1048575)
+            (not (eql (logand lo12 7) 0)))
+        nil
+        (progn
+          ;; ADRP x16, #delta : 1 immlo(2) 10000 immhi(19) Rd(5)
+          (%jit-write-word32 base off
+                             (logior #x90000000
+                                     (ash (logand delta 3) 29)
+                                     (ash (logand (ash delta -2) #x7FFFF) 5)
+                                     16))
+          ;; LDR x16, [x16, #lo12] : 1111100101 imm12 Rn Rt, imm12 = lo12/8
+          (%jit-write-word32 base (+ off 4)
+                             (logior #xF9400000
+                                     (ash (ash lo12 -3) 10)
+                                     (ash 16 5)
+                                     16))
+          t))))
+
+(defun %jit-patch-call-site (base off name addr)
+  "Patch ONE out-of-module CALL relocation site at BASE+OFF so it calls ADDR
+   (an untagged native code address) for callee NAME.  Returns T on success,
+   NIL if the caller must reject the page.
+
+   THE SINGLE PLACE that knows the shape the translator emitted, so the two can
+   never disagree: with *JIT-LINKAGE-CELLS* on the translator emitted ADRP+LDR
+   and this points them at NAME's stable cell (and stores ADDR in it); with
+   cells off it emitted an absolute MOVZ/MOVK quad and this fills it with ADDR.
+   Every patcher — the production JIT driver and the build's aa64s3/s4 probes —
+   goes through here."
+  (if (and (boundp (quote *jit-linkage-cells*)) *jit-linkage-cells*)
+      (let ((cell (%jit-linkage-cell name)))
+        (if cell
+            ;; store HALF the addr: a Lisp (setf (mem-ref … :u64)) stores the
+            ;; value's TAGGED form (n -> n<<1) and the emitted LDR reads the
+            ;; slot's RAW bits, so [cell] then reads back as exactly ADDR.
+            (progn (setf (mem-ref cell :u64) (ash addr -1))
+                   (%jit-write-call-adrp base off cell))
+            nil))
+      (progn (%jit-write-movz-quad base off addr) t)))
 
 (defun %jit-patch-consts (base cpatches)
   "Bake each live const-pool object's tagged native word into its movabs imm64.
@@ -1930,23 +2008,20 @@
                   (setq *jit-bridged-sites*
                         (if *jit-bridged-sites* (+ 1 *jit-bridged-sites*) 1)))))
             (if (> addr 0)
-                ;; LINKAGE CELL: point the caller's movz quad at NAME's stable
-                ;; cell (the emitted `LDR x16,[x16]` dereferences it at call
-                ;; time), and make the cell hold the current native address.  A
-                ;; later redefinition repoints the cell, so this caller follows.
-                ;; The emit added the LDR iff *jit-linkage-cells* is on, so the
-                ;; two MUST match — when on, a cell is mandatory (an arena-alloc
-                ;; failure rejects the page rather than baking a raw addr the LDR
-                ;; would wrongly dereference).
-                (if (and (boundp (quote *jit-linkage-cells*)) *jit-linkage-cells*)
-                    (let ((cell (%jit-linkage-cell name)))
-                      (if cell
-                          ;; store HALF the addr (mem-ref :u64 tags fixnums n->n<<1;
-                          ;; the caller's LDR reads raw bits) so [cell] == ADDR.
-                          (progn (setf (mem-ref cell :u64) (ash addr -1))
-                                 (%jit-write-movz-quad base (car r) cell))
-                          (progn (when (eql why 0) (setq why 1)) (setq ok nil))))
-                    (%jit-write-movz-quad base (car r) addr))
+                ;; LINKAGE CELL: point the caller's ADRP/LDR pair at NAME's
+                ;; stable cell (the LDR dereferences it at call time) and make
+                ;; the cell hold the current native address.  A later
+                ;; redefinition repoints the cell, so this caller follows.
+                ;; %JIT-PATCH-CALL-SITE owns the shape and reads the same
+                ;; *jit-linkage-cells* the emit did, so the two cannot disagree;
+                ;; NIL back means "cannot encode" (no cell arena, or an ADRP
+                ;; page delta out of range) and rejects the page rather than
+                ;; leaving a wild branch behind.
+                (unless (%jit-patch-call-site base (car r) name addr)
+                  (setq *jit-r-crel-encode-fail*
+                        (if *jit-r-crel-encode-fail* (+ 1 *jit-r-crel-encode-fail*) 1))
+                  (when (eql why 0) (setq why 1))
+                  (setq ok nil))
                 (progn
                   ;; CENSUS (x64 parity): "resolved but it is a HEAP closure —
                   ;; a runtime DEFUN" is a completely different blocker from

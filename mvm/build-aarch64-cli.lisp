@@ -168,7 +168,10 @@
                  (fn (and name (%mvm-resolve-runtime-fn name)))
                  (word (if fn (%val->word fn) 0))
                  (addr (if (eql (logand word 15) 3) (- word 3) 0)))
-            (if (> addr 0) (%jit-patch-quad base (car r) addr) (setq ok nil))))
+            ;; Production patcher, not an open-coded quad: see the aa64s3 note.
+            (if (and (> addr 0) (%jit-patch-call-site base (car r) name addr))
+                nil
+                (setq ok nil))))
         ;; Out-of-module #'NAME fn-addr relocations (full TAGGED fn word).
         (dolist (r frel)
           (let* ((name (gethash (cdr r) rt-table))
@@ -418,27 +421,15 @@
                        (name (gethash synth rt-table))
                        (fn (and name (%mvm-resolve-runtime-fn name)))
                        (addr (if fn (- (%val->word fn) 3) 0)))
-                  (if (> addr 0)
-                      (let ((w0 (logior #xD2800010 (ash (logand addr #xFFFF) 5)))
-                            (w1 (logior #xF2A00010 (ash (logand (ash addr -16) #xFFFF) 5)))
-                            (w2 (logior #xF2C00010 (ash (logand (ash addr -32) #xFFFF) 5)))
-                            (w3 (logior #xF2E00010 (ash (logand (ash addr -48) #xFFFF) 5))))
-                        (setf (mem-ref (+ base moff) :u8) (logand w0 255))
-                        (setf (mem-ref (+ base (+ moff 1)) :u8) (logand (ash w0 -8) 255))
-                        (setf (mem-ref (+ base (+ moff 2)) :u8) (logand (ash w0 -16) 255))
-                        (setf (mem-ref (+ base (+ moff 3)) :u8) (logand (ash w0 -24) 255))
-                        (setf (mem-ref (+ base (+ moff 4)) :u8) (logand w1 255))
-                        (setf (mem-ref (+ base (+ moff 5)) :u8) (logand (ash w1 -8) 255))
-                        (setf (mem-ref (+ base (+ moff 6)) :u8) (logand (ash w1 -16) 255))
-                        (setf (mem-ref (+ base (+ moff 7)) :u8) (logand (ash w1 -24) 255))
-                        (setf (mem-ref (+ base (+ moff 8)) :u8) (logand w2 255))
-                        (setf (mem-ref (+ base (+ moff 9)) :u8) (logand (ash w2 -8) 255))
-                        (setf (mem-ref (+ base (+ moff 10)) :u8) (logand (ash w2 -16) 255))
-                        (setf (mem-ref (+ base (+ moff 11)) :u8) (logand (ash w2 -24) 255))
-                        (setf (mem-ref (+ base (+ moff 12)) :u8) (logand w3 255))
-                        (setf (mem-ref (+ base (+ moff 13)) :u8) (logand (ash w3 -8) 255))
-                        (setf (mem-ref (+ base (+ moff 14)) :u8) (logand (ash w3 -16) 255))
-                        (setf (mem-ref (+ base (+ moff 15)) :u8) (logand (ash w3 -24) 255)))
+                  ;; Go through the PRODUCTION patcher (%jit-patch-call-site):
+                  ;; it is the one place that knows which shape the translator
+                  ;; emitted for a crel site — ADRP/LDR through a linkage cell,
+                  ;; or an absolute MOVZ/MOVK quad — and this probe exists to
+                  ;; validate production, so it must not re-implement either.
+                  ;; It open-coded the quad, which stopped being the emitted
+                  ;; shape when the call sequence went PC-relative.
+                  (if (and (> addr 0) (%jit-patch-call-site base moff name addr))
+                      nil
                       (setq ok nil))))
               (%jit-icache-flush base (* nwords 4))
               (write-char-serial 32)

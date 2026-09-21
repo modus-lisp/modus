@@ -746,6 +746,12 @@
     ;; misclassify a raw fn-addr; boot-rpi.lisp emits no such block.
     (emit-aarch64-code-bounds-init buf)
 
+    ;; #307: record the handler-stack PUSH/POP helpers' VAs in
+    ;; 0x10000F90/F98 so a RUNTIME-JIT page can call them.  Without this the
+    ;; JIT rejects every page containing an unwind-protect, a handler-case or
+    ;; a dynamic binding and interprets it instead.
+    (emit-aarch64-handler-va-init buf)
+
     ;; --- 7. Branch to native code, then pad out to the vector table ------
     ;; a64-buffer-position counts 32-bit INSTRUCTIONS (unified buffer since
     ;; 8048454), so no /4 on the position — only on the byte target.

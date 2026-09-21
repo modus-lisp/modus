@@ -683,6 +683,15 @@
     ;; this costs one store and keeps the hosted and bare-metal init identical.
     (setf (mem-ref #x10000F10 :u64) 0)
     (setq *aarch64-jit-constvec-p* t))
+  ;; #307: a runtime-JIT page may arm a REAL handler frame only if this image's
+  ;; boot stub recorded the push/pop helpers' VAs.  Gate on the slot itself
+  ;; rather than on a build-time flag -- a zero there means an image linked
+  ;; before the boot stub learned to write it, and BLR-ing through a zero is a
+  ;; wild branch.  Without this the JIT rejects every page containing an
+  ;; unwind-protect / handler-case / dynamic binding: the pure loop is 1 ms per
+  ;; 200k iterations and the unwind-protect loop was 7824 ms.
+  (when (> (mem-ref #x10000F90 :u64) 0)
+    (setq *aarch64-jit-handler-va-slots-p* t))
   (setq *use-jit* t)
   ;; LINKAGE CELLS (proper CL late binding for out-of-module native CALLs):
   ;; route each caller's call through a stable per-name cell so a callee

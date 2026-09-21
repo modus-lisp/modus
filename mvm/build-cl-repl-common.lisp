@@ -1693,6 +1693,15 @@
   ;; ones) is seen by precompiled callers.  Set here to defeat Limitation 7 on
   ;; the board image, exactly as the sibling JIT flags above.
   (setq *jit-linkage-cells* t)
+  ;; #307: let a runtime-JIT page arm a REAL handler frame by calling the
+  ;; image's push/pop helpers through the VA slots the boot stub recorded,
+  ;; instead of rejecting the page.  Gated on the slot, not on a build flag:
+  ;; zero means this image predates the boot-stub block and BLR through a zero
+  ;; is a wild branch, which on bare metal is a silent spin.  Every function
+  ;; containing an unwind-protect, a handler-case or a dynamic binding was
+  ;; being interpreted without this.
+  (when (> (mem-ref #x10000F90 :u64) 0)
+    (setq *aarch64-jit-handler-va-slots-p* t))
   ~A
   ;; Seed the exec-page bump pointer THROUGH the same accessors the trap's
   ;; bare-metal arm reads, not through the Pi literals.  On :virt the literals

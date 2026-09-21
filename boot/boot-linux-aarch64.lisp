@@ -450,6 +450,14 @@
     (modus.mvm::a64-movz buf modus.mvm::+a64-x28+ 0 0)   ; placeholder (lo16)
     (modus.mvm::a64-movk buf modus.mvm::+a64-x28+ 0 1))  ; placeholder (hi16 lsl 16)
 
+  ;; #307: record the handler-stack PUSH/POP helpers' absolute VAs into
+  ;; 0x10000F90/F98.  A runtime-JIT page has no labels and so cannot BL these
+  ;; helpers; reading the VA out of a fixed slot lets it arm a REAL handler
+  ;; frame instead of being rejected and interpreted.  Same MOVZ/MOVK
+  ;; placeholder convention as the x28 load above; no-op when the helper
+  ;; labels are unbound, so the boot stub stays byte-identical there.
+  (modus.mvm::emit-aarch64-handler-va-init buf)
+
   ;; x29 (FP) = SP
   (emit-aarch64-u32 buf #x910003FD))
 

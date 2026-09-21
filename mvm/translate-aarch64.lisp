@@ -409,6 +409,52 @@
 (defvar *aarch64-code-end-patch-offset* nil
   "Companion to *aarch64-code-base-patch-offset* for code_end.")
 
+;;; ---- #307: the handler-stack helpers, reachable from a RUNTIME-JIT page ----
+;;;
+;;; The push/pop helpers (emit-aarch64-handler-helpers) live in the main image
+;;; and the AOT translator reaches them by LABEL.  A runtime-JIT page is an
+;;; mmap'd (or bump-allocated) page emitted long after the image was linked; it
+;;; has no labels, so the #x0510/#x0511/#x0512 arms used to emit NO frame
+;;; push/pop at all and the page had to be rejected (see *a64-jit-page-reject*)
+;;; -- which made every function containing an unwind-protect, a handler-case or
+;;; a dynamic binding INTERPRET, for a measured ~4000x on the hosted aarch64 CLI.
+;;;
+;;; The fix is the GC trampoline's precedent, one level of indirection further:
+;;; the boot stub records each helper's absolute VA into a fixed convention slot
+;;; (emit-aarch64-handler-va-init below, patched post-link by cross.lisp), and a
+;;; JIT page calls it with `ADD x16,x18,#off; LDR x16,[x16]; BLR x16'.  The
+;;; helpers are position-independent -- they name only absolute convention
+;;; addresses (0x10000180 and the 0x10010000 frame stack), touch only x9..x13,
+;;; and RET -- so calling one from a foreign page is exactly the same call the
+;;; image makes to itself.  ONE implementation of the frame logic, both arms.
+(defconstant +a64-handler-push-va-slot+ #x10000F90
+  "Convention slot holding the absolute VA of the handler-stack PUSH helper.
+   In the documented BSS gap: the per-region table ends at 0x10000F88 and the
+   hosted scheduler lock starts at 0x10000FC0.  Zero (the BSS default) means
+   `this image did not wire the helpers up', and the JIT then rejects the page
+   rather than BLR-ing through a null.")
+
+(defconstant +a64-handler-pop-va-slot+ #x10000F98
+  "Companion to +a64-handler-push-va-slot+ for the POP helper.")
+
+(defvar *aarch64-handler-push-va-patch-offset* nil
+  "Byte offset (in raw-bytes, pre-ELF-wrap) of the MOVZ that materialises the
+   PUSH helper's VA in emit-aarch64-handler-va-init.  MOVZ at offset (lo16),
+   MOVK at offset+4 (hi16 lsl 16) -- the same convention the fn-addr, code-
+   bounds and x28 patchers use.  Filled in by cross.lisp once
+   a64-resolve-fixups has given the helper labels their word indices.  Nil
+   between builds.")
+
+(defvar *aarch64-handler-pop-va-patch-offset* nil
+  "Companion to *aarch64-handler-push-va-patch-offset* for the POP helper.")
+
+(defvar *aarch64-jit-handler-va-slots-p* nil
+  "RUNTIME flag (Limitation 7: set by the image's JIT init, never by a build-
+   time setf) asserting that this image's boot stub populated
+   +a64-handler-push-va-slot+/+a64-handler-pop-va-slot+.  Only then may a
+   JIT page call the handler helpers indirectly; otherwise the #x0510 arm
+   rejects the page and the form interprets, which is correct if slow.")
+
 (defvar *aarch64-x28-load-patch-offset* nil
   "Byte offset (in raw-bytes, pre-ELF-wrap) of the MOVZ that loads the
    native-MCGC trampoline VA into x28 in emit-linux-aarch64-entry.  Only
@@ -642,6 +688,68 @@
       (let ((idx (a64-current-index buf)))
         (if tail (a64-b buf 0) (a64-bl buf 0))
         (a64-add-fixup buf idx label-id (if tail :b :bl)))))
+
+(defun a64-emit-handler-helper-call (buf which)
+  "#307.  Emit a call to the per-fork handler-stack helper named by WHICH
+   (:PUSH or :POP).  Returns T if a call was emitted and NIL if this
+   configuration cannot reach the helper at all -- the caller must then reject
+   the page, because emitting the jmpbuf save WITHOUT the matching frame
+   push/pop is the disarmed-outer-handler bug (#307), i.e. a silently escaping
+   error, which is far worse than interpreting the form.
+
+   TWO WAYS TO GET THERE, and which one applies is a property of the emit, not
+   of the code being emitted:
+     BAKED IMAGE -- the helper is a LABEL in the same unified buffer, so
+       a64-emit-call-label's BL (or the gate's absolute MOVZ/MOVK quad) reaches
+       it.  Byte-identical to the pre-#307 emit.
+     RUNTIME JIT -- there are no labels; read the helper's VA out of the
+       convention slot the boot stub filled in (emit-aarch64-handler-va-init)
+       and BLR it.  This is the GC trampoline's arrangement, minus the reserved
+       register: the trampoline gets x28 because its call site is the HOT path
+       of every allocation, while a handler frame is armed once per
+       handler-case, so a load from a fixed slot is the right trade and costs no
+       register.
+   x16 is ABI scratch and dead at all three call sites (each one has already
+   parked the caller's x30 in 0x10000FF0, or is about to BR away).  The helper
+   itself touches only x9..x13 and RETs, which is what makes it callable from a
+   foreign page without any further save/restore."
+  (let ((label (if (eq which :push)
+                   *aarch64-handler-push-label*
+                   *aarch64-handler-pop-label*)))
+    (cond
+      (label (a64-emit-call-label buf label) t)
+      ((and *aarch64-jit-mode* *aarch64-jit-handler-va-slots-p*)
+       (a64-load-conv-addr buf +a64-x16+ (if (eq which :push)
+                                             +a64-handler-push-va-slot+
+                                             +a64-handler-pop-va-slot+))
+       (a64-ldr-unsigned buf +a64-x16+ +a64-x16+ 0)
+       (a64-blr buf +a64-x16+)
+       t)
+      (t nil))))
+
+(defun a64-emit-handler-helper-call-framed (buf which)
+  "A64-EMIT-HANDLER-HELPER-CALL wrapped in the caller-x30 save/restore through
+   scratch slot 0x10000FF0.  Both the call and the branch-and-link inside it
+   clobber x30, and the trap arms that use this one (SETJMP's push,
+   CLEAR-HANDLER's pop) still have to RET to their caller afterwards.  Emits
+   NOTHING and returns NIL when the helper is unreachable, so a rejecting
+   caller is left with a well-formed buffer."
+  (let ((probe (if (eq which :push)
+                   (or *aarch64-handler-push-label*
+                       (and *aarch64-jit-mode* *aarch64-jit-handler-va-slots-p*))
+                   (or *aarch64-handler-pop-label*
+                       (and *aarch64-jit-mode* *aarch64-jit-handler-va-slots-p*)))))
+    (when probe
+      ;; save caller x30 to 0x10000FF0
+      (a64-movz buf +a64-x16+ #xFFF0 0)
+      (a64-movk buf +a64-x16+ #x1000 1)
+      (a64-str-unsigned buf +a64-x30+ +a64-x16+ 0)
+      (a64-emit-handler-helper-call buf which)
+      ;; restore caller x30
+      (a64-movz buf +a64-x16+ #xFFF0 0)
+      (a64-movk buf +a64-x16+ #x1000 1)
+      (a64-ldr-unsigned buf +a64-x30+ +a64-x16+ 0)
+      t)))
 
 (defun %a64-check-branch-range (type offset index)
   "Assert OFFSET (in 32-bit instruction units) fits the encoding range
@@ -2841,18 +2949,6 @@
                 ;; reclaimed (and reclaim is runtime-gated off anyway) — no-op.
                 (a64-movz buf +a64-x0+ 0 0))
                ((= code #x0510)
-                ;; #307: a RUNTIME-JIT page (no handler-stack helper labels) cannot arm a
-                ;; handler frame -- it only saves into the single global jmpbuf at
-                ;; #x10000180, so any inner handler-case that returns normally leaves this
-                ;; one DISARMED and the next error escapes (error-no-armed-handler).  x64
-                ;; pushes real frames.  Until the helpers are reachable from JIT pages,
-                ;; REJECT the page: the translate guard turns this into an interpret
-                ;; fallback, whose emulated handler stack is correct.
-                ;; #307: reject the PAGE via a flag the caller checks, never by
-                ;; signalling — see *a64-jit-page-reject*.  Emission continues so
-                ;; the buffer stays well-formed; the caller discards it.
-                (when (and *aarch64-jit-mode* (null *aarch64-handler-push-label*))
-                  (setq *a64-jit-page-reject* t))
                 ;; SETJMP: Save SP, FP (X29), return-IP to 0x10000180/188/190.
                 ;; First call: return NIL (=X26=0) in X0.  On longjmp:
                 ;; execution resumes here with X0 = T (#xDEAD1009).
@@ -2878,19 +2974,18 @@
                 ;; via scratch slot 0x10000FF0 (unused elsewhere).
                 ;; CLEAR-HANDLER and LONGJMP (later steps) will pop the
                 ;; outer triple back into 180/188/190.
-                (when *aarch64-handler-push-label*
-                  ;; save caller x30 to 0x10000FF0
-                  (a64-movz buf +a64-x16+ #xFFF0 0)
-                  (a64-movk buf +a64-x16+ #x1000 1)
-                  (a64-str-unsigned buf +a64-x30+ +a64-x16+ 0)
-                  ;; Call handler_push (BL, or absolute under the gate long-range
-                  ;; flag — the helper is tail-emitted, out of BL reach in the
-                  ;; >128MB image).  x16 is dead here (x30 already stored above).
-                  (a64-emit-call-label buf *aarch64-handler-push-label*)
-                  ;; restore caller x30
-                  (a64-movz buf +a64-x16+ #xFFF0 0)
-                  (a64-movk buf +a64-x16+ #x1000 1)
-                  (a64-ldr-unsigned buf +a64-x30+ +a64-x16+ 0))
+                ;;
+                ;; #307: a RUNTIME-JIT page has no labels, so it reaches the
+                ;; same helper through the VA slot the boot stub filled in.
+                ;; If NEITHER route exists the page must be REJECTED -- a
+                ;; jmpbuf save with no frame push leaves the OUTER handler-case
+                ;; disarmed and the next error escapes.  Rejection travels as a
+                ;; flag the caller checks, never as a signal (see
+                ;; *a64-jit-page-reject*: the condition being reported IS that
+                ;; handler frames are unreliable here).  Emission continues
+                ;; either way so the buffer stays well-formed.
+                (unless (a64-emit-handler-helper-call-framed buf :push)
+                  (setq *a64-jit-page-reject* t))
                 ;; x6/x7 (V9/V10 local registers) are not in the jmpbuf: park
                 ;; them in this frame's (otherwise unused) V9/V10 spill slots
                 ;; and reload them at the landing point below, on both the
@@ -2952,7 +3047,8 @@
                 ;; is zero the pop helper writes zeros — same as the
                 ;; pre-Phase-3 LONGJMP-then-CLEAR semantics.
                 (cond
-                  (*aarch64-handler-pop-label*
+                  ((or *aarch64-handler-pop-label*
+                       (and *aarch64-jit-mode* *aarch64-jit-handler-va-slots-p*))
                    ;; Read current 180/188/190 → scratch 0xC10/C18/C20.
                    (a64-load-conv-addr buf +a64-x16+ #x10000180)
                    (a64-load-conv-addr buf +a64-x17+ #x10000C10)
@@ -2966,9 +3062,9 @@
                    ;; with outer (or zeros if depth==0).  No need to
                    ;; preserve x30 here: we BR to scratch-IP at the end
                    ;; rather than returning.
-                   ;; Call handler_pop (BL, or absolute under the gate long-range
-                   ;; flag — helper is tail-emitted, out of BL reach at >128MB).
-                   (a64-emit-call-label buf *aarch64-handler-pop-label*)
+                   ;; Call handler_pop (BL by label in a baked image, or through
+                   ;; the VA slot from a runtime-JIT page — #307).
+                   (a64-emit-handler-helper-call buf :pop)
                    ;; Restore inner SP/FP/IP from scratch.
                    (a64-load-conv-addr buf +a64-x17+ #x10000C10)
                    (a64-ldr-unsigned buf +a64-x16+ +a64-x17+ 0)
@@ -2999,18 +3095,10 @@
                 ;; Fall back to the simple STR XZR if helpers aren't
                 ;; registered (non-unified caller or pre-Phase-3 build).
                 (cond
-                  (*aarch64-handler-pop-label*
-                   ;; save caller x30 to 0x10000FF0 (slot reserved for
-                   ;; trap-time LR scratch by Phase 3(b)).
-                   (a64-movz buf +a64-x16+ #xFFF0 0)
-                   (a64-movk buf +a64-x16+ #x1000 1)
-                   (a64-str-unsigned buf +a64-x30+ +a64-x16+ 0)
-                   ;; Call handler_pop (BL, or absolute under the gate long-range
-                   ;; flag — helper is tail-emitted, out of BL reach at >128MB).
-                   (a64-emit-call-label buf *aarch64-handler-pop-label*)
-                   (a64-movz buf +a64-x16+ #xFFF0 0)
-                   (a64-movk buf +a64-x16+ #x1000 1)
-                   (a64-ldr-unsigned buf +a64-x30+ +a64-x16+ 0))
+                  ;; save caller x30 to 0x10000FF0 (slot reserved for trap-time
+                  ;; LR scratch by Phase 3(b)), call handler_pop by label or —
+                  ;; from a runtime-JIT page — through the VA slot (#307).
+                  ((a64-emit-handler-helper-call-framed buf :pop))
                   (t
                    (a64-load-conv-addr buf +a64-x16+ #x10000180)
                    (a64-str-unsigned buf +a64-xzr+ +a64-x16+ 0))))
@@ -5818,6 +5906,34 @@
   (a64-movk buf +a64-x16+ 0 1)              ; placeholder (hi16 lsl 16)
   (a64-load-conv-addr buf +a64-x17+ #x10000168)
   (a64-str-unsigned buf +a64-x16+ +a64-x17+ 0))
+
+(defun emit-aarch64-handler-va-init (buf)
+  "#307.  Emit the boot-stub block that records the handler-stack PUSH and POP
+   helpers' absolute VAs into +a64-handler-push-va-slot+ / -pop-va-slot, so a
+   RUNTIME-JIT page can reach them (`LDR x16,[slot]; BLR x16') the way baked
+   code reaches them by label.
+
+   Same shape, and the same post-link patch convention, as
+   emit-aarch64-code-bounds-init: MOVZ (lo16) + MOVK (hi16 lsl 16) into x16,
+   STR through x17.  The offsets recorded here are *byte* offsets into the
+   unified buffer; cross.lisp::apply-aarch64-handler-va-patches fills the
+   immediates once a64-resolve-fixups has placed the helper labels.
+
+   NO-OP WHEN THE HELPERS ARE NOT BEING EMITTED.  emit-aarch64-handler-helpers
+   only emits them when both labels are bound, so this block only makes sense
+   inside the same dynamic extent; otherwise we leave the slots at their BSS
+   zero, which is exactly the `do not JIT a handler frame' state."
+  (when (and *aarch64-handler-push-label* *aarch64-handler-pop-label*)
+    (setf *aarch64-handler-push-va-patch-offset* (* (a64-buffer-position buf) 4))
+    (a64-movz buf +a64-x16+ 0 0)              ; placeholder (lo16)
+    (a64-movk buf +a64-x16+ 0 1)              ; placeholder (hi16 lsl 16)
+    (a64-load-conv-addr buf +a64-x17+ +a64-handler-push-va-slot+)
+    (a64-str-unsigned buf +a64-x16+ +a64-x17+ 0)
+    (setf *aarch64-handler-pop-va-patch-offset* (* (a64-buffer-position buf) 4))
+    (a64-movz buf +a64-x16+ 0 0)
+    (a64-movk buf +a64-x16+ 0 1)
+    (a64-load-conv-addr buf +a64-x17+ +a64-handler-pop-va-slot+)
+    (a64-str-unsigned buf +a64-x16+ +a64-x17+ 0)))
 
 ;;; ============================================================
 ;;; WS4-AA64 #160 STAGE 1: NATIVE Cheney GC trampoline

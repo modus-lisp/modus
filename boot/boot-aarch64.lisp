@@ -1317,6 +1317,11 @@
     ;; functionp's fallback path.
     (emit-aarch64-code-bounds-init buf)
 
+    ;; 19c'. #307: record the handler-stack PUSH/POP helpers' VAs so a
+    ;; RUNTIME-JIT page (which has no labels) can call the same helpers the
+    ;; baked code BLs to.  No-op unless the helper labels are bound.
+    (emit-aarch64-handler-va-init buf)
+
     ;; 19d. Boot-completed magic for the re-entry guard (Phase 0).  MMU
     ;; is on; VA 0x50000FF0 → PA 0x50000FF0 via the identity L1[1] block.
     (when *aarch64-fixpoint-reentry-guard*

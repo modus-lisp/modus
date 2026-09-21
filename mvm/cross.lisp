@@ -1155,6 +1155,58 @@
                                        (logand (ash tramp-va -16) #xFFFF))
               ;; Reset for next build.
               (setf *aarch64-x28-load-patch-offset* nil))))
+        ;; #307 AArch64 handler-helper VA patches: the boot stub
+        ;; (emit-aarch64-handler-va-init) left two MOVZ+MOVK placeholder pairs
+        ;; that store the handler-stack PUSH/POP helpers' absolute VAs into the
+        ;; convention slots 0x10000F90/F98.  A RUNTIME-JIT page has no labels,
+        ;; so that slot is the ONLY way it can reach the same frame push/pop the
+        ;; baked code BLs to; without it the JIT has to reject every page
+        ;; containing an unwind-protect / handler-case / dynamic binding.
+        ;; Address arithmetic is identical to the x28 trampoline patch above —
+        ;; the unified a64-buffer's byte layout IS raw-bytes, so a resolved
+        ;; label's word-index * 4 is its image offset, and no function tag is
+        ;; applied because BLR takes a raw code address.
+        (when (and (boundp 'modus.mvm::*aarch64-handler-push-va-patch-offset*)
+                   modus.mvm::*aarch64-handler-push-va-patch-offset*
+                   modus.mvm::*aarch64-handler-pop-va-patch-offset*
+                   aarch64-unified-buf aarch64-push-label aarch64-pop-label
+                   boot-descriptor)
+          (let ((push-word (gethash aarch64-push-label
+                                    (a64-buffer-labels aarch64-unified-buf)))
+                (pop-word  (gethash aarch64-pop-label
+                                    (a64-buffer-labels aarch64-unified-buf))))
+            ;; An unresolved label here would leave a ZERO in the slot, which
+            ;; the runtime reads as "helpers not wired up" and degrades to
+            ;; interpreting — safe, but silently slow, so say so loudly.
+            (unless (and push-word pop-word)
+              (error "handler-va-patch: handler helper labels ~A/~A unresolved"
+                     aarch64-push-label aarch64-pop-label))
+            (let* ((declared-load-addr (or (getf boot-descriptor :load-addr) 0))
+                   (arch (getf boot-descriptor :arch))
+                   (elf-fmt (getf boot-descriptor :elf-format))
+                   (image-load-offset
+                    (if (and (member arch '(:aarch64 :rpi))
+                             (not (eq elf-fmt :linux-aarch64)))
+                        #x80000 0))
+                   (wrap-header (wrap-header-size-for-boot boot-descriptor))
+                   (base-va (or (getf boot-descriptor :code-vaddr-base)
+                                (+ declared-load-addr image-load-offset
+                                   wrap-header)))
+                   (push-va (+ base-va (* push-word 4)))
+                   (pop-va  (+ base-va (* pop-word 4)))
+                   (p-off modus.mvm::*aarch64-handler-push-va-patch-offset*)
+                   (q-off modus.mvm::*aarch64-handler-pop-va-patch-offset*))
+              (patch-aarch64-mov-imm16 raw-bytes p-off
+                                       (logand push-va #xFFFF))
+              (patch-aarch64-mov-imm16 raw-bytes (+ p-off 4)
+                                       (logand (ash push-va -16) #xFFFF))
+              (patch-aarch64-mov-imm16 raw-bytes q-off
+                                       (logand pop-va #xFFFF))
+              (patch-aarch64-mov-imm16 raw-bytes (+ q-off 4)
+                                       (logand (ash pop-va -16) #xFFFF))
+              ;; Reset for next build.
+              (setf modus.mvm::*aarch64-handler-push-va-patch-offset* nil)
+              (setf modus.mvm::*aarch64-handler-pop-va-patch-offset* nil))))
         ;; AArch64 absolute in-module call patches (gate long-range): each
         ;; +op-call+ site that emitted MOVZ/MOVK x16,VA; BLR x16 under
         ;; *aarch64-force-absolute-inmodule-calls* recorded (movz-abs-word-index

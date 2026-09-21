@@ -489,13 +489,23 @@
     (%read-token-from stream ch rt
                       (or (eq syn :single-escape) (eq syn :multiple-escape)))))
 
-(defun %read-check-macro (ch)
-  "Check if CH is a macro character. Returns macro fn or nil."
+(defun %read-check-macro-rt (ch rt)
+  "Check if CH is a macro character in RT. Returns macro fn or nil.
+   The readtable is a PARAMETER so a caller that is about to dispatch on
+   *READTABLE* anyway can read the variable once instead of twice: every
+   %read-internal iteration used to read it here and again to pass it to
+   the dispatcher, and an out-of-line global read is a call plus a hash
+   probe.  Both reads happened before any reader macro ran, so they could
+   not have disagreed."
   (let ((code (char-code ch)))
     (if (< code 128)
-        (let ((entry (aref (%rt-macros *readtable*) code)))
+        (let ((entry (aref (%rt-macros rt) code)))
           (if (consp entry) (car entry) nil))
         nil)))
+
+(defun %read-check-macro (ch)
+  "Check if CH is a macro character in *READTABLE*. Returns macro fn or nil."
+  (%read-check-macro-rt ch *readtable*))
 
 (defun %read-internal (stream eof-error-p eof-value recursive-p)
   "Internal read function.
@@ -514,10 +524,14 @@
     (let ((ch (%read-skip-whitespace stream)))
       (when (null ch)
         (return (if eof-error-p (%reader-error "end of file during read") eof-value)))
-      (let* ((macro-fn (%read-check-macro ch))
+      ;; ONE *READTABLE* read per form, re-done on every iteration of this
+      ;; loop: a reader macro is user code and may rebind or assign the
+      ;; variable, so the value is not carried across a dispatch.
+      (let* ((rt *readtable*)
+             (macro-fn (%read-check-macro-rt ch rt))
              (result (if macro-fn
-                         (%read-macro-dispatch-simple macro-fn ch stream *readtable*)
-                         (%read-as-token ch stream *readtable*))))
+                         (%read-macro-dispatch-simple macro-fn ch stream rt)
+                         (%read-as-token ch stream rt))))
         (if (eq result *rdr-no-value*)
             (let ((next (%read-skip-whitespace stream)))
               (cond
@@ -533,13 +547,14 @@
 
 (defun %read-after-ws2 (ch stream eof-error-p eof-value)
   "Dispatch after whitespace skip."
-  (let ((macro-fn (%read-check-macro ch)))
+  (let* ((rt *readtable*)
+         (macro-fn (%read-check-macro-rt ch rt)))
     (if (null macro-fn)
-        (%read-as-token ch stream *readtable*)
+        (%read-as-token ch stream rt)
         (if (eq macro-fn :semicolon)
             (progn (%skip-line-comment stream)
                    (%read-internal stream eof-error-p eof-value nil))
-            (%read-macro-dispatch-simple macro-fn ch stream *readtable*)))))
+            (%read-macro-dispatch-simple macro-fn ch stream rt)))))
 
 (defun %read-macro-dispatch-simple (fn ch stream rt)
   "Handle common macro character types."

@@ -380,10 +380,22 @@
 
 ;;; Print a symbol to stream respecting all print variables
 (defun %print-symbol-to-stream (sym stream)
-  (let ((escape *print-escape*)
-        (case *print-case*)
-        (gensym *print-gensym*)
-        (readably *print-readably*))
+  ;; ONE read each.  RC (the readtable case) is computed here rather than
+  ;; separately in each of the four terminal branches below — all four need
+  ;; it and all four computed it identically.  CUR-PKG replaces three
+  ;; separate reads of *PACKAGE* (the %pkg-p guard, the %pkg-find-sym
+  ;; argument and the qualifier decision).  Hoisting them over the whole
+  ;; body is safe because NOTHING this function calls can run user code:
+  ;; %print-char bottoms out in %write-char-to-stream, a closed dispatch on
+  ;; the stream type with no user-function arm, and the package/symbol
+  ;; accessors are slot reads.
+  (let* ((escape *print-escape*)
+         (case *print-case*)
+         (gensym *print-gensym*)
+         (readably *print-readably*)
+         (rt *readtable*)
+         (rc (if (and rt (readtablep rt)) (readtable-case rt) :upcase))
+         (cur-pkg *package*))
     ;; Native keyword (subtag #x53): just emit ":NAME" — no package qualifier
     ;; logic.  The CL-symbol path below handles KEYWORD-package CL symbols
     ;; via the qualifier branch (pkg-name = "" when KEYWORD).
@@ -405,10 +417,8 @@
                (= (obj-subtag sym) 83))   ; #x53 keyword
       (when (or escape readably)
         (%print-char 58 stream))          ; :
-      (let* ((name (symbol-name sym))
-             (rt   *readtable*)
-             (rc   (if (and rt (readtablep rt)) (readtable-case rt) :upcase)))
-        (%print-symbol-name-maybe-escape name stream *print-case* rc escape readably))
+      (let ((name (symbol-name sym)))
+        (%print-symbol-name-maybe-escape name stream case rc escape readably))
       (return-from %print-symbol-to-stream nil))
     (let* ((cl-sym-p (%cl-sym-p sym))
            (name (if cl-sym-p (%cl-sym-name sym) (symbol-name sym)))
@@ -419,11 +429,11 @@
            (native-accessible
              (and (not cl-sym-p) (not (null sym)) (not (eq sym t))
                   (stringp name) (> (array-length name) 0)
-                  (%pkg-p *package*)
-                  (let ((found (%pkg-find-sym name *package*)))
+                  (%pkg-p cur-pkg)
+                  (let ((found (%pkg-find-sym name cur-pkg)))
                     (and found t)))))
       ;; Determine if we need package qualifier
-      (let ((cur-pkg *package*))
+      (progn
         (let ((need-qualifier
                (if (or escape readably)
                    ;; Need qualifier if symbol not accessible in current pkg
@@ -489,9 +499,7 @@
                   (or readably (and escape gensym)))
              (%print-char 35 stream) ; #
              (%print-char 58 stream) ; :
-             (let* ((rt *readtable*)
-                    (rc (if (and rt (readtablep rt)) (readtable-case rt) :upcase)))
-               (%print-symbol-name-maybe-escape name stream case rc escape readably)))
+             (%print-symbol-name-maybe-escape name stream case rc escape readably))
             ;; Package-qualified
             (need-qualifier
              (let ((pkg-name (if (%pkg-p pkg) (package-name pkg) "")))
@@ -505,14 +513,10 @@
                      (%print-char 58 stream)  ; :
                      (progn (%print-char 58 stream)  ; ::
                             (%print-char 58 stream))))
-               (let* ((rt *readtable*)
-                    (rc (if (and rt (readtablep rt)) (readtable-case rt) :upcase)))
-               (%print-symbol-name-maybe-escape name stream case rc escape readably))))
+               (%print-symbol-name-maybe-escape name stream case rc escape readably)))
             ;; No qualifier needed
             (t
-             (let* ((rt *readtable*)
-                    (rc (if (and rt (readtablep rt)) (readtable-case rt) :upcase)))
-               (%print-symbol-name-maybe-escape name stream case rc escape readably)))))))))
+             (%print-symbol-name-maybe-escape name stream case rc escape readably))))))))
 
 ;;; Check if symbol is external in package.
 ;;; The external table is the per-package SYMTAB, an ALIST of
@@ -616,15 +620,16 @@
   (declare (special *print-length* *print-level* *print-base* *print-radix*
                     *print-case* *print-escape* *print-readably*
                     *print-gensym* *print-array*))
-  (let ((plen *print-length*)
-        (plev *print-level*)
-        (pbase *print-base*)
-        (pradix *print-radix*)
-        (pcase *print-case*)
-        (pescape *print-escape*)
-        (preadably *print-readably*)
-        (pgensym *print-gensym*)
-        (parray *print-array*))
+  ;; ONLY *print-readably* is read unconditionally — every branch needs it,
+  ;; because it overrides ESCAPE.  The other eight used to be read here too,
+  ;; so printing a fixnum paid nine out-of-line %GV-REF hash probes to use
+  ;; two of them.  Each is now read in the arm that uses it; no arm reads a
+  ;; variable it does not use, and every arm reads its variables before it
+  ;; emits anything.  This is not a semantic change: nothing between this
+  ;; point and any of those reads can run user code (see the comment on the
+  ;; recursive calls below), so the value read late is the value that would
+  ;; have been read early.
+  (let ((preadably *print-readably*))
     ;; *print-readably* overrides *print-escape*
     (when preadably (setq escape t))
     (cond
@@ -632,16 +637,17 @@
       ;; under :downcase / :capitalize the printed form must follow.
       ;; (:capitalize on "NIL" → "Nil", which needs per-word handling.)
       ((null obj)
-       (cond
-         ((eq pcase :downcase)
-          (%print-char 110 stream) (%print-char 105 stream) (%print-char 108 stream))
-         ((eq pcase :capitalize)
-          (%print-char 78 stream) (%print-char 105 stream) (%print-char 108 stream))
-         (t
-          (%print-char 78 stream) (%print-char 73 stream) (%print-char 76 stream))))
+       (let ((pcase *print-case*))
+         (cond
+           ((eq pcase :downcase)
+            (%print-char 110 stream) (%print-char 105 stream) (%print-char 108 stream))
+           ((eq pcase :capitalize)
+            (%print-char 78 stream) (%print-char 105 stream) (%print-char 108 stream))
+           (t
+            (%print-char 78 stream) (%print-char 73 stream) (%print-char 76 stream)))))
       ;; T
       ((eq obj t)
-       (%print-char (if (eq pcase :downcase) 116 84) stream))
+       (%print-char (if (eq *print-case* :downcase) 116 84) stream))
       ;; Character
       ((characterp obj)
        (if escape
@@ -670,20 +676,23 @@
            (%print-char (char-code obj) stream)))
       ;; Integer (fixnum or bignum — both route through %print-integer-in-base)
       ((or (fixnump obj) (bignump obj))
-       (when pradix (%print-radix-prefix pbase stream))
-       (%print-integer-in-base obj pbase stream)
-       ;; Base 10 with *print-radix* uses TRAILING dot, not a prefix.
-       (when (and pradix (= pbase 10))
-         (%print-char 46 stream)))
+       (let ((pbase *print-base*)
+             (pradix *print-radix*))
+         (when pradix (%print-radix-prefix pbase stream))
+         (%print-integer-in-base obj pbase stream)
+         ;; Base 10 with *print-radix* uses TRAILING dot, not a prefix.
+         (when (and pradix (= pbase 10))
+           (%print-char 46 stream))))
       ;; Float
       ((floatp-impl obj)
        ;; Use standard float printing
        (%print-float-to-stream obj stream escape))
       ;; Ratio
       ((ratiop obj)
-       (%print-integer-in-base (ratio-numerator obj) pbase stream)
-       (%print-char 47 stream)  ; /
-       (%print-integer-in-base (ratio-denominator obj) pbase stream))
+       (let ((pbase *print-base*))
+         (%print-integer-in-base (ratio-numerator obj) pbase stream)
+         (%print-char 47 stream)  ; /
+         (%print-integer-in-base (ratio-denominator obj) pbase stream)))
       ;; Complex — 3-slot array with %complex-marker in slot 0.  Format
       ;; as #C(REAL IMAG) per CLHS.  Detect BEFORE the generic array
       ;; printer (which would emit #(%COMPLEX-MARKER 1 2)).
@@ -765,7 +774,7 @@
       ;; Multi-dim array wrapper: (cons 9867654 (cons DIMS FLAT-ARR))
       ((and (consp obj) (eql (car obj) 9867654) (consp (cdr obj)))
        (cond
-         ((not parray)
+         ((not *print-array*)
           (%print-char 35 stream)
           (%print-char 60 stream)
           (%print-string-raw "Array" stream)
@@ -780,7 +789,7 @@
       ;; downstream stringp branch handles it.
       ((%mda-p obj)
        (cond
-         ((not parray)
+         ((not *print-array*)
           (%print-char 35 stream)
           (%print-char 60 stream)
           (%print-string-raw "Array" stream)
@@ -819,7 +828,9 @@
        ;; 22.1.3.4 says objects at depth N>=*print-level* print as #.
        ;; (print-level.3 / .4 pass plev=0 and expect the top-level
        ;; object itself to be elided.)
-       (cond
+       (let ((plev *print-level*)
+             (plen *print-length*))
+        (cond
          ((and plev (>= (or level 0) plev))
           (%print-char 35 stream))   ; #
          ;; *print-length* = 0: print "(...)" — don't show the car.
@@ -830,6 +841,13 @@
           (%print-string-raw "..." stream)
           (%print-char 41 stream))   ; )
          (t
+          ;; PLEN/PLEV are read ONCE for the whole list, not per element.
+          ;; The per-element recursion below re-enters %write-obj, which
+          ;; re-reads every variable, so a rebinding made while printing an
+          ;; element is honoured by the NEXT element's own read — what is
+          ;; reused here is only the truncation budget of THIS list, which
+          ;; CLHS 22.1.3.5/.4 describe in terms of the single enclosing
+          ;; object anyway.
           (let ((next-level (if (null level) 1 (+ level 1))))
             (%print-char 40 stream)  ; (
             (%write-obj (car obj) stream next-level escape)
@@ -856,15 +874,17 @@
                    (%write-obj (car tail) stream next-level escape)
                    (setq tail (cdr tail))
                    (setq count (+ count 1))))))
-            (%print-char 41 stream)))))  ; )
+            (%print-char 41 stream))))))  ; )
       ;; Array/string (non-cons)
       ((arrayp obj)
-       (cond
+       (let ((plev *print-level*)
+             (plen *print-length*))
+        (cond
          ;; *print-level* elision applies to arrays too: at depth
          ;; >= plev, print as "#" with no element walk.  (print-level.3)
          ((and plev (>= (or level 0) plev))
           (%print-char 35 stream))   ; #
-         ((not parray)
+         ((not *print-array*)
           ;; Print as unreadable
           (%print-char 35 stream)
           (%print-char 60 stream)
@@ -885,7 +905,7 @@
                  (%write-obj (aref obj i) stream
                              (if (null level) 1 (+ level 1)) escape)
                  (setq i (+ i 1))))
-             (%print-char 41 stream)))))  ; ) — close let, t, cond, arrayp
+             (%print-char 41 stream))))))  ; ) — close let, t, cond, let, arrayp
       ;; Anything else — SAY WHAT IT IS.  A bare "#<?>" carried no information
       ;; at all, and this arm is exactly where a broken object arrives: a
       ;; condition whose type-name slot has gone bad prints through here, and

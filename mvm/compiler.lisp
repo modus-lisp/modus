@@ -6164,19 +6164,9 @@
            ;; pool, so the condition's :name is EQ to the source symbol.
            ;; (Cell known at compile time → in-place read, see the helper.)
            (%compile-global-read-runtime name env dest)
-           (let ((hash (%global-name-key name)))
-             (emit-li-tagged +vreg-v0+ hash)  ; fixnum-safe hash (mvm-eval :li-halves)
-             ;; mvm-eval bridge reads (mvm-nargs) args; a manual :call needs an
-             ;; explicit :set-nargs or the bridge pulls a STALE count and the
-             ;; native SYMBOL-VALUE gets the wrong arg → a bare global read = NIL
-             ;; under mvm-eval (this is what blocked handler-case's *current-condition*
-             ;; type-dispatch, WS3).  Native fixed-arg SYMBOL-VALUE ignores nargs,
-             ;; so this is byte-identical for the ANSI build — gated on
-             ;; *mvm-emit-halves* (T only in build-generic.lisp / mvm-eval; OFF for ANSI).
-             (when *mvm-emit-halves* (emit-ir :set-nargs 1))
-             (emit-ir :call "%GV-REF" 1)
-             (unless (= dest +vreg-vr+)
-               (emit-ir :mov dest +vreg-vr+)))))
+           ;; Build time: the cached cell load (see %COMPILE-GLOBAL-READ-AOT),
+           ;; falling back to the historic %GV-REF call.
+           (%compile-global-read-aot name env dest)))
       (t
        ;; Implicit global — treat as dynamic variable (auto-register)
        ;; WS5 #203 gap 1: to *ERROR-OUTPUT*, not stdout, and with ~& so it can
@@ -6192,12 +6182,7 @@
        (if (and *mvm-eval-runtime-p* (not *static-build-p*))  ; WS5: reproduce modus2-sb (static reads) for FNMAP crash-mapping
            ;; Same checked read as the registered-global branch above.
            (%compile-global-read-runtime name env dest)
-           (let ((hash (%global-name-key name)))
-             (emit-li-tagged +vreg-v0+ hash)  ; fixnum-safe hash (mvm-eval :li-halves)
-             (when *mvm-emit-halves* (emit-ir :set-nargs 1))  ; mvm-eval bridge nargs
-             (emit-ir :call "%GV-REF" 1)
-             (unless (= dest +vreg-vr+)
-               (emit-ir :mov dest +vreg-vr+))))))))
+           (%compile-global-read-aot name env dest))))))
 
 ;;; ------ Compound Form Dispatch ------
 
@@ -10472,6 +10457,115 @@
        (fboundp (quote %gv-cell))
        (let ((c (funcall (quote %gv-cell) (%global-name-key name))))
          (and (consp c) c))))
+
+;;; ============================================================
+;;; AOT special-variable reads: the cell-pointer cache
+;;; ============================================================
+;;;
+;;; A RUNTIME compile can bake the global's (key . value) pair straight into
+;;; the code (%RUNTIME-GLOBAL-CELL below): the cell already exists, so the read
+;;; is a constant load and a CDR.  An AHEAD-OF-TIME compile cannot — the
+;;; globals hash table is built at boot, long after the bytes are emitted — so
+;;; every AOT read of a special fell through to a CALL of %GV-REF, which calls
+;;; %GV-CELL, which hashes the key and walks a bucket chain.  Measured on the
+;;; scalar benchmark that is ~413 instructions for ONE special read, 27.8% of
+;;; all printer instructions and 8.6% of all reader instructions (the hash
+;;; probe underneath bills separately, to GETHASH).
+;;;
+;;; What is missing at build time is not the cell, it is a NAME for the cell.
+;;; So give it one: a build-time slot index, and a runtime vector of cells
+;;; indexed by it.  The read becomes
+;;;
+;;;     v = [+GV-CACHE-ROOT+]        ; a fixed BSS word, a GC root
+;;;     c = v[SLOT]                  ; :obj-ref, constant index
+;;;     if (consp c) -> (cdr c)      ; ~8 instructions warm
+;;;     else         -> (%gv-ref-fill KEY SLOT)
+;;;
+;;; and the fill path does exactly what the old call did, plus memoising the
+;;; cell it found.  SEMANTICS ARE UNCHANGED BY CONSTRUCTION: the value is
+;;; still `(if cell (cdr cell) nil)`, which is %GV-REF's contract.  Nothing is
+;;; pre-created, so BOUNDP does not start answering T for every global the
+;;; build happened to see (which is what a static per-global value cell would
+;;; have done, and why this is not that — see the commit message).
+;;;
+;;; The cached pointer stays live because the cache vector is an ORDINARY HEAP
+;;; OBJECT reached from a fixed root word, so the collector forwards its
+;;; elements like any other slot; and it stays CORRECT because the globals
+;;; table updates pairs in place and never replaces them (%GV-SET / PUTHASH /
+;;; SET-SYMBOL-VALUE all SET-CDR the existing pair, MAKUNBOUND is a no-op, and
+;;; nothing REMHASHes that table).  A global that does not exist yet is not
+;;; cached, so one created later by SETQ is found on the next read.
+;;;
+;;; Build time only.  An IN-IMAGE compile must not hand out slots: its
+;;; *GV-CACHE-INDEX* is empty, so it would assign slot 0 to some other name
+;;; and alias it onto whatever the build put there.  Hence the
+;;; (not *mvm-eval-runtime-p*) gate at the use site.
+(defconstant +gv-cache-root+ #x10000FA0
+  "Fixed BSS word holding the global-cell cache vector.  Free: the per-region
+   table stops at #x10000F88, boot-linux-aarch64's call thunks own F90/F98,
+   the scheduler locks start at #x10000FC0, and no TLS window covers #xFA0.")
+(defconstant +gv-cache-size+ 16384
+  "Slots in the cache vector.  The tree has ~1500 defvar/defparameter names;
+   the ANSI corpus adds more.  Past this the compiler simply stops handing out
+   slots and those reads keep the old %GV-REF call.")
+
+(defvar *gv-cache-enabled* t
+  "NIL restores the plain %GV-REF call at every AOT special read.")
+(defvar *gv-cache-index* nil
+  "Build-wide map global name-key -> cache slot.  NOT reset per module: two
+   modules in one image must agree on what slot 3 means.")
+(defvar *gv-cache-count* 0)
+
+(defun %gv-cache-slot (key)
+  "The cache slot for global KEY (a name-hash), assigning one on first sight.
+   NIL when the table is full."
+  (unless *gv-cache-index*
+    (setq *gv-cache-index* (make-hash-table :test 'eql)))
+  (let ((hit (gethash key *gv-cache-index*)))
+    (cond (hit hit)
+          ((< *gv-cache-count* +gv-cache-size+)
+           (let ((i *gv-cache-count*))
+             (setf (gethash key *gv-cache-index*) i)
+             (setq *gv-cache-count* (+ i 1))
+             i))
+          (t nil))))
+
+(defun %compile-global-read-cached (key slot env dest)
+  "Emit the cached AOT read of the global named by KEY at cache SLOT."
+  (compile-form
+   `(let* ((%gv-cache-vec (mem-ref ,+gv-cache-root+ :u64))
+           (%gv-cache-hit (if (fixnump %gv-cache-vec)
+                              nil
+                              (%word-aref %gv-cache-vec ,slot))))
+      ;; CONSP, not a null test: the vector is zero-initialised and 0 is a
+      ;; FIXNUM, which is true.  Only a real pair may be CDR'd.
+      (if (consp %gv-cache-hit)
+          (cdr %gv-cache-hit)
+          (%gv-ref-fill ,key ,slot)))
+   env dest))
+
+(defun %compile-global-read-aot (name env dest)
+  "The build-time global READ.  Cached cell load when a slot is available,
+   otherwise the historic %GV-REF call, byte-for-byte."
+  (let ((key (%global-name-key name)))
+    (let ((slot (and *gv-cache-enabled*
+                     (not *mvm-eval-runtime-p*)
+                     (%gv-cache-slot key))))
+      (if slot
+          (%compile-global-read-cached key slot env dest)
+          (progn
+            (emit-li-tagged +vreg-v0+ key)  ; fixnum-safe hash (mvm-eval :li-halves)
+            ;; mvm-eval bridge reads (mvm-nargs) args; a manual :call needs an
+            ;; explicit :set-nargs or the bridge pulls a STALE count and the
+            ;; native SYMBOL-VALUE gets the wrong arg → a bare global read = NIL
+            ;; under mvm-eval (this is what blocked handler-case's
+            ;; *current-condition* type-dispatch, WS3).  Native fixed-arg
+            ;; SYMBOL-VALUE ignores nargs, so this is byte-identical for the
+            ;; ANSI build — gated on *mvm-emit-halves*.
+            (when *mvm-emit-halves* (emit-ir :set-nargs 1))
+            (emit-ir :call "%GV-REF" 1)
+            (unless (= dest +vreg-vr+)
+              (emit-ir :mov dest +vreg-vr+)))))))
 
 (defun %compile-global-read-runtime (name env dest)
   "Runtime global READ.  With the cell known at compile time: li-const of

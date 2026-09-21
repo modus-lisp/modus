@@ -244,7 +244,13 @@
       (%core-slice fd #x10000170 8)       ; package-by-hash table
       (%core-slice fd stage #xD98)        ; 0x178..0xF10: argv, bitmap cfg, stats
       (%core-slice fd #x10000F10 8)       ; JIT constant-vector root
-      (%core-slice fd stage #xE8)         ; 0xF18..0x1000
+      (%core-slice fd stage #x88)         ; 0xF18..0xFA0
+      ;; The global-cell cache vector + its init guard.  In place, not staged:
+      ;; the cells it points at live in the heap slice that follows and are
+      ;; restored at the same addresses, so a restored image that dropped this
+      ;; word would read every special through the SAVING process's pairs.
+      (%core-slice fd #x10000FA0 16)      ; global-cell cache root + guard
+      (%core-slice fd stage #x50)         ; 0xFB0..0x1000
       (%core-slice fd from (- free from))
       (%core-slice fd (+ (%gc-bitmap-base) boff) blen)
       (%core-slice fd (+ (%gc-cons-bitmap-base) boff) blen)

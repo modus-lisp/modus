@@ -6355,6 +6355,7 @@
     ;; ---- fixed global roots ----
     (flet ((scan-fixed (addr) (a64-load-imm64-general buf +a64-x9+ addr)
                        (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))))
+      (scan-fixed #x10000FA0)      ; global-cell cache vector (%GV-REF-FILL)
       (scan-fixed #x10000080)      ; globals hash-table
       (scan-fixed #x10000088)      ; symbol intern table
       (scan-fixed #x10000148)      ; keyword intern table

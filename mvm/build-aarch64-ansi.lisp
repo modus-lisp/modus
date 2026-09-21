@@ -1201,6 +1201,12 @@
   ;;   0x10000D40..DA0 — fork-file snapshot + safepoint-boundary slots
   ;;   0x10010000 — handler-stack depth (emit-aarch64-handler-helpers)
   (setf (mem-ref #x10000080 :u64) 0)
+  ;; The global-cell cache root + its init guard.  Hosted, the kernel zeroes
+  ;; the BSS; on bare metal this window is ordinary RAM and a non-fixnum
+  ;; garbage word here would be dereferenced as the cache vector by the first
+  ;; compiled special read.
+  (setf (mem-ref #x10000FA0 :u64) 0)
+  (setf (mem-ref #x10000FA8 :u64) 0)
   (setf (mem-ref #x10000088 :u64) 0)
   (setf (mem-ref #x10000090 :u64) 0)
   (setf (mem-ref #x10000098 :u64) 0)

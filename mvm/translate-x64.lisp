@@ -6166,6 +6166,11 @@
     (emit-gc-dbg-char buf #x73)          ; 's' — stack scan done
 
     ;; ---- Scan globals roots ----
+    ;; The global-cell cache vector (prelude %GV-REF-FILL / compiler.lisp
+    ;; %COMPILE-GLOBAL-READ-AOT).  Every compiled special read loads its cell
+    ;; THROUGH this word, so it is forwarded exactly like the constvec root.
+    (emit-mov-reg-imm buf 'rax #x10000FA0)
+    (emit-call buf scan-word-label)
     ;; Globals alist at 0x10000080
     (emit-mov-reg-imm buf 'rax #x10000080)
     (emit-call buf scan-word-label)
@@ -7131,6 +7136,7 @@
     (emit-mov-reg-abs buf 'rcx +mcgc-cfg-from-end-addr+)
 
     ;; ================= P2a: forward PRECISE roots into the to-run ===========
+    (emit-mov-reg-imm buf 'rax #x10000FA0) (emit-call buf scan-word-label)  ; global-cell cache
     (emit-mov-reg-imm buf 'rax #x10000080) (emit-call buf scan-word-label)
     (emit-mov-reg-imm buf 'rax #x10000088) (emit-call buf scan-word-label)
     (emit-mov-reg-imm buf 'rax #x10000148) (emit-call buf scan-word-label)

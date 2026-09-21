@@ -2413,6 +2413,56 @@
   (let ((%gv-cl (%gv-cell %gv-key)))
     (if %gv-cl (cdr %gv-cl) nil)))
 
+;;; ---- The global-cell cache (see the block comment above
+;;; ---- %COMPILE-GLOBAL-READ-AOT in mvm/compiler.lisp) ----
+;;;
+;;; #x10000FA0 holds a vector of 16384 cells, indexed by a slot the COMPILER
+;;; assigned to each global name at build time.  An AOT read loads the vector,
+;;; loads its slot, and CDRs the pair; only a miss reaches here.  The literals
+;;; are spelled out rather than shared through a constant because prelude and
+;;; compiler are compiled as separate units and a defconstant that disagreed
+;;; would alias two globals onto one slot silently.
+
+(defun %gv-cache-init-once ()
+  "Create the cache vector, at most once.  The guard word at #x10000FA8 is
+   what makes this safe to call from the miss path: MAKE-ARRAY itself reads
+   specials, and each of those reads misses and calls back in here, so an
+   unguarded version recurses until the stack ends."
+  (when (eq (mem-ref #x10000FA8 :u64) 0)
+    (setf (mem-ref #x10000FA8 :u64) 2)   ; tagged fixnum 1
+    ;; NIL-filled, not merely zero-filled.  ALLOC-ARRAY zero-inits to FIXNUM 0
+    ;; on the arches that have the zero-init (x64, i386); the read site's CONSP
+    ;; test rejects a 0 anyway, but a bare-metal arena that is not zeroed would
+    ;; otherwise hand the read a word that could be cons-TAGGED garbage, and a
+    ;; cached pointer is exactly the thing that must never be garbage.
+    ;; Publish the vector LAST: until #x10000FA0 is non-fixnum every read takes
+    ;; the miss path, which is what makes the fill loop's own special reads
+    ;; (and MAKE-ARRAY's) safe.
+    (let ((%gv-cv (make-array 16384)) (%gv-i 0))
+      (loop
+        (when (>= %gv-i 16384) (return nil))
+        (%ht-vec-set %gv-cv %gv-i nil)
+        (setq %gv-i (+ %gv-i 1)))
+      (setf (mem-ref #x10000FA0 :u64) %gv-cv))))
+
+(defun %gv-ref-fill (%gv-key %gv-slot)
+  "AOT special-variable read, slow path: the value of global KEY, NIL when it
+   has no cell — %GV-REF's contract exactly — memoising the cell in cache slot
+   SLOT when there is one.  A global with no cell is NOT cached, so one created
+   later by SETQ is picked up by the next read."
+  (let ((%gv-cv (mem-ref #x10000FA0 :u64)))
+    (if (fixnump %gv-cv)
+        (progn (%gv-cache-init-once) (%gv-ref %gv-key))
+        (let ((%gv-cl (%gv-cell %gv-key)))
+          (if (consp %gv-cl)
+              ;; The store is bound, not sequenced: a variable-index ASET in a
+              ;; non-last position compiles with dest=nil and may not land
+              ;; (CLAUDE.md Active Limitation 2) — %HT-VEC-SET does the same.
+              (let ((%gv-st (%word-aset %gv-cv %gv-slot %gv-cl)))
+                %gv-st
+                (cdr %gv-cl))
+              nil)))))
+
 (defun %gv-set (%gv-key %gv-val)
   "Compiled special-variable WRITE: update in place when the global exists,
    else insert through SET-SYMBOL-VALUE (which also creates the table)."

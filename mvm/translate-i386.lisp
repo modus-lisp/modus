@@ -2019,7 +2019,8 @@
       (i386-emit-label buf sd))
 
     ;; --- fixed global roots (same set the x64 trampoline scans) ---
-    (dolist (a (list #x10000080     ; global special-variable alist
+    (dolist (a (list #x10000FA0     ; global-cell cache vector (%GV-REF-FILL)
+                     #x10000080     ; global special-variable alist
                      #x10000088     ; symbol intern table
                      #x10000148     ; keyword intern table
                      #x10000170))   ; package-by-hash table

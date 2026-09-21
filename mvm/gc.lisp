@@ -1072,8 +1072,11 @@
    once — see THE GLOBALS ROOT SET UNDER CONCURRENT COLLECTION above, which is
    the argument in full, including the one hazard (a concurrent MUTATOR) that
    it does not cover and cannot."
-  ;; The globals alist head pointer itself
-  (let ((fp (%gc-forward-slot #x10000080 from-start from-size free-ptr sc)))
+  ;; The global-cell cache vector: compiled special reads load their cell
+  ;; through it (prelude %GV-REF-FILL), so it is a root like any other.
+  (let ((fp (%gc-forward-slot #x10000FA0 from-start from-size free-ptr sc)))
+    ;; The globals alist head pointer itself
+    (setq fp (%gc-forward-slot #x10000080 from-start from-size fp sc))
     ;; The symbol intern table head pointer
     (setq fp (%gc-forward-slot #x10000088 from-start from-size fp sc))
     ;; The keyword intern table (0x10000148) and package-by-hash table

@@ -787,6 +787,12 @@
   ;; (boot-x64.lisp already zeroes 0x10000180 handler-case state,
   ;;  0x10000400 handler-stack depth, and 0x10000C70 deadline counter.)
   (setf (mem-ref #x10000080 :u64) 0)
+  ;; The global-cell cache root + its init guard.  Hosted, the kernel zeroes
+  ;; the BSS; on bare metal this window is ordinary RAM and a non-fixnum
+  ;; garbage word here would be dereferenced as the cache vector by the first
+  ;; compiled special read.
+  (setf (mem-ref #x10000FA0 :u64) 0)
+  (setf (mem-ref #x10000FA8 :u64) 0)
   (setf (mem-ref #x10000088 :u64) 0)
   (setf (mem-ref #x10000090 :u64) 0)
   (setf (mem-ref #x10000098 :u64) 0)

@@ -603,6 +603,11 @@
 
 (defun a64-set-label (buf label-id)
   "Record the current position as the target of LABEL-ID."
+  ;; A label is a basic-block boundary: control can arrive here from anywhere,
+  ;; so nothing the block-local frame-slot cache believes survives it.  Putting
+  ;; the flush HERE rather than at the call sites is what makes the list of
+  ;; boundaries complete -- every label in the translator goes through here.
+  (a64-slot-cache-flush)
   (setf (gethash label-id (a64-buffer-labels buf))
         (a64-buffer-position buf)))
 
@@ -1876,6 +1881,81 @@
       (progn (a64-fp-addr buf scratch off)
              (a64-stur buf rt scratch 0))))
 
+;;; --- Block-local frame-slot -> vreg cache ---
+;;;
+;;; The compiler re-reads a local from its frame slot at every use: on the
+;;; decoder's hot path 38 of 47 frame loads re-read a slot that was already
+;;; loaded or stored earlier in the SAME basic block.  This tracks which frame
+;;; slots are currently live in a virtual register so a redundant OBJ-REF can
+;;; be dropped entirely (the value is already in the destination) or demoted
+;;; from a load to a register move.
+;;;
+;;; The cache is PURELY BLOCK-LOCAL and invalidation is deliberately blunt:
+;;; only opcodes on *A64-SLOT-CACHE-SAFE-OPS* -- each audited to write exactly
+;;; one vreg (operand 0) and to emit no branch, label or call -- keep it alive,
+;;; and everything else, plus every label, prologue and epilogue, drops the
+;;; whole thing.  Entries name VREGS, never scratch registers, so a value the
+;;; translator parked in x16/x17 is never claimed to survive.
+(defparameter *a64-slot-cache* nil
+  "Alist (frame-slot-index . PHYSICAL-REGISTER) valid within the current
+   basic block.  Keyed on the PHYSICAL register, never on the vreg: the vreg
+   file is not injective.  +VREG-VR+ (16) and +VREG-V0+ (0) are BOTH x0, so a
+   vreg-keyed cache believes `MOV VR, Vx' -- the move in front of every
+   return -- leaves V0 alone, and hands the next reader of a slot cached in
+   V0 the returned value instead.  Physical keys cannot express that mistake.")
+(defparameter *a64-slot-cache-on* t
+  "NIL disables the block-local frame-slot cache (rollback knob).")
+(defparameter *a64-slot-cache-free* 0)
+(defparameter *a64-slot-cache-mov* 0)
+
+(defun a64-slot-cache-flush () (setf *a64-slot-cache* nil))
+
+(defun a64-slot-cache-drop (slot phys)
+  "Drop every entry naming SLOT or PHYS (either may be NIL = don't match)."
+  (let ((keep nil))
+    (dolist (e *a64-slot-cache*)
+      (unless (or (and slot (eql (car e) slot))
+                  (and phys (eql (cdr e) phys)))
+        (push e keep)))
+    (setf *a64-slot-cache* keep)))
+
+(defun a64-slot-cache-kill-vreg (vreg)
+  "Invalidate whatever VREG's destination write clobbers.  A write to the
+   frame pointer moves every slot, so that drops the lot."
+  (when *a64-slot-cache*
+    (if (or (eql vreg +vreg-vfp+) (eql vreg +vreg-vsp+))
+        (a64-slot-cache-flush)
+        (let ((p (a64-phys-reg vreg)))
+          (when p (a64-slot-cache-drop nil p))))))
+
+(defun a64-slot-cache-get (slot)
+  (and *a64-slot-cache-on* (cdr (assoc slot *a64-slot-cache*))))
+
+(defun a64-slot-cache-put (slot vreg)
+  "Record that VREG's physical register holds frame slot SLOT.  A spilled
+   vreg lives in memory, not a register, so it is not recorded."
+  (when *a64-slot-cache-on*
+    (let ((p (a64-phys-reg vreg)))
+      ;; V0-V13 and VR are ordinary value registers.  VA/VL/VN/VSP/VFP are
+      ;; machine state, never a copy of a frame slot.
+      (when (and p (<= vreg +vreg-vr+))
+        (a64-slot-cache-drop slot p)
+        (push (cons slot p) *a64-slot-cache*)))))
+
+(defparameter *a64-slot-cache-safe-ops*
+  (list +op-mov+ +op-li+ +op-li-const+
+        +op-add+ +op-sub+ +op-adds+ +op-subs+
+        +op-and+ +op-or+ +op-xor+
+        +op-shl+ +op-shr+ +op-sar+ +op-shlv+ +op-sarv+ +op-ldb+
+        +op-car+ +op-cdr+ +op-obj-tag+ +op-array-len+
+        +op-pop+ +op-obj-ref+ +op-obj-set+)
+  "Opcodes whose aarch64 arm writes at most operand 0's vreg and emits no
+   branch, label or call.  Every OTHER opcode flushes the slot cache.")
+
+(defparameter *a64-slot-cache-noder-ops* (list +op-cmp+ +op-test+ +op-push+)
+  "Opcodes that write NO vreg at all: they only set flags or touch the
+   operand stack, so the cache survives them untouched.")
+
 (defun a64-frame-slot-offset (idx)
   "x29-relative byte offset of frame slot IDX."
   (a64-fp-off (+ +a64-frame-slot-base+ (* idx -8))))
@@ -1966,6 +2046,8 @@
    in the closure-dispatch path overwrites it on the path TO a callee,
    but a caller that itself was called by something expects its own
    x27 to survive the inner call."
+  ;; Entering a new function: nothing the caller's block knew is true here.
+  (a64-slot-cache-flush)
   ;; Save FP and LR, allocate save area
   (a64-stp-pre buf +a64-x29+ +a64-x30+ +a64-sp+ (- +a64-save-area+))
   ;; Save callee-saved registers (x19-x23, x27)
@@ -1993,6 +2075,7 @@
      RET
    Note: x24/x25/x26 are NOT restored (global state).  x27 (CENV) IS
    restored — see prologue docstring."
+  (a64-slot-cache-flush)
   ;; Deallocate spill/frame-slot area
   (a64-add-imm buf +a64-sp+ +a64-sp+ +a64-locals-frame-size+)
   ;; Restore callee-saved registers (x19-x23, x27, and x6/x7 = V9/V10)
@@ -2172,6 +2255,17 @@
              (fpp (n)
                "FP vreg N -> physical NEON reg: 0-5 -> v2..v7, 6-11 -> v16..v21 (caller-saved)."
                (if (< n 6) (+ n 2) (+ 16 (- n 6)))))
+
+        ;; Block-local frame-slot cache upkeep.  Done BEFORE the arm runs,
+        ;; which is equivalent to after: only the OBJ-REF frame arm CONSULTS
+        ;; the cache, and it maintains its own entry.
+        (cond
+          ((member op *a64-slot-cache-noder-ops*) nil)   ; writes no vreg
+          ((or (= op +op-obj-ref+) (= op +op-obj-set+)) nil) ; maintained in-arm
+          ((member op *a64-slot-cache-safe-ops*)
+           ;; Audited single-destination arm: only operand 0's vreg dies.
+           (a64-slot-cache-kill-vreg (nth 0 args)))
+          (t (a64-slot-cache-flush)))
 
         (cond
           ;; ---- NOP ----
@@ -4147,10 +4241,30 @@
                  ;; Frame slot access: x29 is the frame BOTTOM, so the slot is
                  ;; at a positive offset and LDR's scaled imm12 reaches it in
                  ;; ONE instruction for every slot the 1024-byte frame has.
-                 (a64-fp-load buf pd (a64-frame-slot-offset idx))
+                 ;; If the block-local cache already knows the slot is in a
+                 ;; register, the load is redundant: free when that register
+                 ;; IS the destination, a MOV otherwise.
+                 (let* ((cp (a64-slot-cache-get idx))
+                        (vdp (a64-phys-reg vd)))
+                   (cond
+                     ((and cp vdp (= cp vdp))                 ; already there
+                      (setq *a64-slot-cache-free* (+ 1 *a64-slot-cache-free*)))
+                     ((and cp vdp)                            ; move, not load
+                      (setq *a64-slot-cache-mov* (+ 1 *a64-slot-cache-mov*))
+                      (a64-mov-reg buf vdp cp))
+                     (t (a64-fp-load buf pd (a64-frame-slot-offset idx))))
+                   ;; The destination register just changed, so whatever slot
+                   ;; the cache thought IT held is stale -- this has to happen
+                   ;; even when PUT declines to record the new binding, which
+                   ;; is exactly the case that broke: an OBJ-REF into VR
+                   ;; writes x0, and x0 is also V0.
+                   (a64-slot-cache-kill-vreg vd)
+                   (a64-slot-cache-put idx vd))
                  ;; Normal object slot access — tag=9 layout, slot N at
-                 ;; tagged + N*8 + 7 (= raw + 16 + N*8).
-                 (let* ((pobj (ensure-src vobj +a64-x16+))
+                 ;; tagged + N*8 + 7 (= raw + 16 + N*8).  This writes VD, so
+                 ;; whatever frame slot the cache thought VD held is stale.
+                 (let* ((pobj (progn (a64-slot-cache-kill-vreg vd)
+                                     (ensure-src vobj +a64-x16+)))
                         (offset (+ (* idx 8) 7)))
                    (if (and (>= offset -256) (<= offset 255))
                        (a64-ldur buf pd pobj offset)
@@ -4168,7 +4282,12 @@
                   (ps (ensure-src (vr 2) +a64-x17+)))
              (if (= vobj +vreg-vfp+)
                  ;; Frame slot store — positive offset from the frame bottom.
-                 (a64-fp-store buf ps (a64-frame-slot-offset idx))
+                 ;; The stored register now holds the slot, so a following
+                 ;; read of it needs no load at all.
+                 (progn
+                   (a64-fp-store buf ps (a64-frame-slot-offset idx))
+                   (a64-slot-cache-drop idx nil)
+                   (a64-slot-cache-put idx (vr 2)))
                  ;; Normal object slot store — tag=9 layout, slot N at +N*8+7.
                  ;;
                  ;; The large-offset address temp MUST NOT be x16.  `pobj` IS
@@ -6741,6 +6860,7 @@
   (setf *aarch64-last-set-nargs* nil)
   (setf *aarch64-fn-addr-relocs* nil)
   (setf *aarch64-fn-addr-local-relocs* nil)
+  (a64-slot-cache-flush)   ; never inherit a previous translation's state
   (let* ((buf (or *aarch64-translate-into-buf* (make-a64-buffer)))
          ;; Index (instruction units) where translated code starts within
          ;; buf.  Zero when buf is a fresh one; non-zero when we're

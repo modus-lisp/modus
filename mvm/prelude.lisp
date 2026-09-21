@@ -2447,21 +2447,28 @@
 
 (defun %gv-ref-fill (%gv-key %gv-slot)
   "AOT special-variable read, slow path: the value of global KEY, NIL when it
-   has no cell — %GV-REF's contract exactly — memoising the cell in cache slot
-   SLOT when there is one.  A global with no cell is NOT cached, so one created
-   later by SETQ is picked up by the next read."
+   has no cell -- %GV-REF's contract exactly -- memoising the cell in cache
+   slot SLOT when there is one.  A global with no cell is NOT cached, so one
+   created later by SETQ is picked up by the next read.
+   The slot is re-checked before probing: the inline read already did, so that
+   costs one load there, and it is what makes the CALL-only emission
+   (*GV-CACHE-MODE* :call) a real fallback rather than a slowdown."
   (let ((%gv-cv (mem-ref #x10000FA0 :u64)))
     (if (fixnump %gv-cv)
         (progn (%gv-cache-init-once) (%gv-ref %gv-key))
-        (let ((%gv-cl (%gv-cell %gv-key)))
-          (if (consp %gv-cl)
-              ;; The store is bound, not sequenced: a variable-index ASET in a
-              ;; non-last position compiles with dest=nil and may not land
-              ;; (CLAUDE.md Active Limitation 2) — %HT-VEC-SET does the same.
-              (let ((%gv-st (%word-aset %gv-cv %gv-slot %gv-cl)))
-                %gv-st
-                (cdr %gv-cl))
-              nil)))))
+        (let ((%gv-hit (%word-aref %gv-cv %gv-slot)))
+          (if (consp %gv-hit)
+              (cdr %gv-hit)
+              (let ((%gv-cl (%gv-cell %gv-key)))
+                (if (consp %gv-cl)
+                    ;; The store is BOUND, not sequenced: a variable-index
+                    ;; ASET in a non-last position compiles with dest=nil and
+                    ;; may not land (CLAUDE.md Active Limitation 2) --
+                    ;; %HT-VEC-SET does the same.
+                    (let ((%gv-st (%word-aset %gv-cv %gv-slot %gv-cl)))
+                      %gv-st
+                      (cdr %gv-cl))
+                    nil)))))))
 
 (defun %gv-set (%gv-key %gv-val)
   "Compiled special-variable WRITE: update in place when the global exists,

@@ -10510,11 +10510,20 @@
    slots and those reads keep the old %GV-REF call.")
 
 (defvar *gv-cache-enabled* t
-  "NIL restores the plain %GV-REF call at every AOT special read.")
+  "NIL restores the plain %GV-REF call at every AOT special read.
+   MODUS_NO_GVCACHE=1 at BUILD time is the rollback.")
+(defvar *gv-cache-only* nil
+  "Triage: when set, a list of NAME STRINGS that alone get a cached read.")
+(defvar *gv-cache-lo* nil)
+(defvar *gv-cache-hi* nil
+  "Triage window: only slots in [LO,HI) are emitted cached.  Slots are still
+   ASSIGNED for every global, so indices are stable across a bisect.")
 (defvar *gv-cache-index* nil
   "Build-wide map global name-key -> cache slot.  NOT reset per module: two
    modules in one image must agree on what slot 3 means.")
 (defvar *gv-cache-count* 0)
+(defvar *gv-cache-names* nil
+  "Triage: name-key -> source name, for reading a bisect's answer back.")
 
 (defun %gv-cache-slot (key)
   "The cache slot for global KEY (a name-hash), assigning one on first sight.
@@ -10530,27 +10539,105 @@
              i))
           (t nil))))
 
+(defvar *gv-cache-mode* :inline
+  "MODUS_GVCACHE_MODE.  :INLINE is production.  :CALL emits only the
+   %GV-REF-FILL call -- same memoisation, no inline load -- which separates a
+   defect in the emitted load from one in the fill path, and is a slower but
+   still ~10x fallback if the inline load is ever in doubt.")
+
 (defun %compile-global-read-cached (key slot env dest)
-  "Emit the cached AOT read of the global named by KEY at cache SLOT."
-  (compile-form
-   `(let* ((%gv-cache-vec (mem-ref ,+gv-cache-root+ :u64))
-           (%gv-cache-hit (if (fixnump %gv-cache-vec)
-                              nil
-                              (%word-aref %gv-cache-vec ,slot))))
-      ;; CONSP, not a null test: the vector is zero-initialised and 0 is a
-      ;; FIXNUM, which is true.  Only a real pair may be CDR'd.
-      (if (consp %gv-cache-hit)
-          (cdr %gv-cache-hit)
-          (%gv-ref-fill ,key ,slot)))
-   env dest))
+  "Emit the cached AOT read of the global named by KEY at cache SLOT.
+
+   Emitted as IR DIRECTLY, not by recursing into COMPILE-FORM on a source
+   template.  The template version worked on its own and broke the in-image
+   compiler once enough sites used it: COMPILE-FORM on a LET* inside a
+   variable reference pulls in FRAME-ALLOC/FRAME-FREE, a redundant CONSP
+   guard on the CDR (with a %SIGNAL-TYPE-ERROR arm), and two extra frame
+   slots at EVERY read — about 30 IR nodes where ten will do, and +11% on
+   the image against +5.5% for this.  Hand-emitting keeps a variable
+   reference what it has always been: a few instructions that touch one temp
+   and the destination, and nothing else."
+  (when (eq *gv-cache-mode* :call)
+    (return-from %compile-global-read-cached
+      (compile-form (list '%gv-ref-fill key slot) env dest)))
+  (let ((save-count (min *temp-reg-counter* 12))
+        (miss (make-compiler-label))
+        (done (make-compiler-label)))
+    ;; ONE temp, with DEST as the second scratch.  Register pressure is the
+    ;; budget here: a variable reference can sit arbitrarily deep inside an
+    ;; expression that already holds temps, and V9.. are frame spills, so a
+    ;; second fresh temp would spill at the busiest sites (measured peak at a
+    ;; read site: 4 temps, i.e. the one temp lands at V8 at worst).
+    ;;
+    ;; Caller-save wraps the WHOLE sequence rather than just the miss call.
+    ;; The call needs it either way (see %COMPILE-SETQ-GLOBAL, where omitting
+    ;; it faulted on x64 only); wrapping the whole thing costs nothing extra
+    ;; because most sites hold no temps at all and emit no push.
+    (when (> save-count 1)
+      (let ((r (+ +vreg-v4+ 1)))
+        (loop (when (>= r (+ +vreg-v4+ save-count)) (return))
+          (unless (= r dest) (emit-ir :push r))
+          (setq r (+ r 1)))))
+    (let ((cell (alloc-temp-reg)))
+      ;; cell = [+GV-CACHE-ROOT+]  (the cache vector, or 0 before boot built it)
+      (emit-li-tagged cell +gv-cache-root+)
+      (emit-ir :shr cell cell +fixnum-shift+)
+      (emit-ir :load cell cell (car (memory-width-code :u64)))
+      ;; A raw 0 is a FIXNUM (low bit clear): no vector yet -> miss.
+      (emit-ir :li dest 1)
+      (emit-ir :test cell dest)
+      (emit-ir :beq miss)
+      ;; The slot index rides an IMM8 in :OBJ-REF, so only the first 256
+      ;; globals can name their slot inline; the rest take the register-index
+      ;; form.  This is the whole defect the first three attempts chased: a
+      ;; cached read of slot 289 (*ARITH-TRUST*) silently returned slot 33
+      ;; (*PRINT-ESCAPE*), so the compiler saw a print flag where it expected
+      ;; a trust pair and (CADR it) signalled TYPE-ERROR.
+      (if (%obj-slot-imm-p slot)
+          (emit-ir :obj-ref dest cell slot)
+          (progn (emit-li-tagged dest slot)
+                 (emit-ir :aref dest cell dest)))
+      ;; CONSP, not a null test: an unfilled slot reads back as FIXNUM 0.
+      (emit-ir :consp cell dest)
+      (emit-ir :bnull cell miss)
+      (emit-ir :cdr dest dest)
+      ;; A read yields exactly ONE value, and the old emission said so by
+      ;; accident: it was a CALL, and %GV-REF's epilogue reset MV-COUNT.  The
+      ;; miss path still gets that reset from %GV-REF-FILL's own epilogue, so
+      ;; saying it here keeps the two paths -- and the pre-change behaviour --
+      ;; identical.
+      (emit-ir :set-mv-count 1)
+      (emit-ir :br done)
+      (emit-ir-label miss)
+      (emit-li-tagged +vreg-v0+ key)
+      (emit-li-tagged +vreg-v1+ slot)
+      (when *mvm-emit-halves* (emit-ir :set-nargs 2))
+      (emit-ir :call "%GV-REF-FILL" 2)
+      (unless (= dest +vreg-vr+)
+        (emit-ir :mov dest +vreg-vr+))
+      (emit-ir-label done)
+      (when (> save-count 1)
+        (let ((r (+ +vreg-v4+ save-count -1)))
+          (loop (when (< r (+ +vreg-v4+ 1)) (return))
+            (unless (= r dest) (emit-ir :pop r))
+            (setq r (- r 1)))))
+      (free-temp-reg))))
 
 (defun %compile-global-read-aot (name env dest)
   "The build-time global READ.  Cached cell load when a slot is available,
    otherwise the historic %GV-REF call, byte-for-byte."
   (let ((key (%global-name-key name)))
+    (unless *gv-cache-names* (setq *gv-cache-names* (make-hash-table :test 'eql)))
+    (unless (gethash key *gv-cache-names*)
+      (setf (gethash key *gv-cache-names*) name))
     (let ((slot (and *gv-cache-enabled*
                      (not *mvm-eval-runtime-p*)
                      (%gv-cache-slot key))))
+      (when (and slot *gv-cache-only*
+                 (not (member (string name) *gv-cache-only* :test #'string=)))
+        (setq slot nil))
+      (when (and slot *gv-cache-lo* (< slot *gv-cache-lo*)) (setq slot nil))
+      (when (and slot *gv-cache-hi* (>= slot *gv-cache-hi*)) (setq slot nil))
       (if slot
           (%compile-global-read-cached key slot env dest)
           (progn
@@ -19958,8 +20045,16 @@
 ;;; dispatch, so u8 code must not reach them.  compile-prim-aref/aset wrap
 ;;; these with a runtime #x11 subtag check that routes byte-packed u8
 ;;; vectors to %u8-ref/%u8-set instead.
+(defun %obj-slot-imm-p (idx)
+  "True when IDX may ride in an :OBJ-REF / :OBJ-SET slot operand.  That
+   operand is an IMM8 (mvm.lisp: `(obj-ref Vd Vobj idx:imm8)`), so slot 256
+   and up does not fit and the encoder does not say so -- it wrapped, and a
+   read of slot 289 returned slot 33.  Anything wider must take the
+   register-index form (:AREF / :ASET), which is correct at any width."
+  (and (integerp idx) (<= 0 idx 255)))
+
 (defun compile-word-aref (arr-form idx-form env dest)
-  (if (integerp idx-form)
+  (if (%obj-slot-imm-p idx-form)
       (let ((arr-reg (alloc-temp-reg)))
         (compile-form arr-form env arr-reg)
         (emit-ir :obj-ref dest arr-reg idx-form)
@@ -19978,7 +20073,7 @@
     (return-from compile-word-aset
       (let ((val-reg (alloc-temp-reg)))        ; see compile-u8-set: never DEST
         (compile-form val-form env val-reg)
-        (if (integerp idx-form)
+        (if (%obj-slot-imm-p idx-form)
             (let ((arr-reg (alloc-temp-reg)))
               (compile-form arr-form env arr-reg)
               (emit-ir :obj-set arr-reg idx-form val-reg)
@@ -19992,7 +20087,7 @@
               (free-temp-reg)))
         (emit-ir :mov dest val-reg)
         (free-temp-reg))))
-  (if (integerp idx-form)
+  (if (%obj-slot-imm-p idx-form)
       (let ((arr-reg (alloc-temp-reg))
             (val-reg (alloc-temp-reg)))
         (compile-form arr-form env arr-reg)

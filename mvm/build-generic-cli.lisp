@@ -308,6 +308,18 @@
       (format t "  native code: ~D bytes -> ~A.native~%"
               (length (kernel-image-native-code image)) path))
     #+sbcl (sb-ext:run-program "/bin/chmod" (list "+x" path) :wait t)
+    (format t "~%;; gv-cache: ~D global slots assigned~%"
+            (symbol-value (find-symbol "*GV-CACHE-COUNT*" :modus.mvm)))
+    (let ((d (sb-ext:posix-getenv "MODUS_GVCACHE_DUMP"))
+          (ix (symbol-value (find-symbol "*GV-CACHE-INDEX*" :modus.mvm)))
+          (nm (symbol-value (find-symbol "*GV-CACHE-NAMES*" :modus.mvm))))
+      (when (and d (plusp (length d)) ix)
+        (with-open-file (o d :direction :output :if-exists :supersede)
+          (let ((rows nil))
+            (maphash (lambda (k v) (push (cons v k) rows)) ix)
+            (dolist (r (sort rows #'< :key #'car))
+              (format o "~D ~A ~A~%" (car r) (cdr r)
+                      (gethash (cdr r) nm)))))))
     (format t "~%Wrote ~D bytes to ~A~%"
             (length (kernel-image-image-bytes image)) path)
     (format t "Usage: ~A <script.lisp>~%" path)))

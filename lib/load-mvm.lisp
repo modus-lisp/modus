@@ -71,4 +71,36 @@
 ;; BUILD-IMAGE.  See mvm/build-checks.lisp.
 (mvm-load "mvm/build-checks.lisp")
 
+;; HOST-ONLY knobs for the AOT special-variable cell cache (compiler.lisp,
+;; %COMPILE-GLOBAL-READ-AOT).  Read here rather than in compiler.lisp because
+;; that file is also image source and must never call POSIX-GETENV.
+;;   MODUS_NO_GVCACHE=1     rollback: every AOT special read is a %GV-REF call
+;;   MODUS_GVCACHE_LO/HI=N  triage: only slots in [LO,HI) are emitted cached
+;;   MODUS_GVCACHE_ONLY=A,B triage: only these global names are cached
+;;   MODUS_GVCACHE_DUMP=F   triage: write the slot -> name table to F
+;;   MODUS_GVCACHE_MODE=call  triage: emit only the fill call, no inline load
+(let ((off (sb-ext:posix-getenv "MODUS_NO_GVCACHE"))
+      (md  (sb-ext:posix-getenv "MODUS_GVCACHE_MODE")))
+  (when (and off (plusp (length off)) (not (string= off "0")))
+    (setf (symbol-value (find-symbol "*GV-CACHE-ENABLED*" :modus.mvm)) nil)
+    (format t ";; MODUS_NO_GVCACHE: AOT special reads use the %GV-REF call~%"))
+  (dolist (k '("MODUS_GVCACHE_LO" "MODUS_GVCACHE_HI"))
+    (let ((v (sb-ext:posix-getenv k)))
+      (when (and v (plusp (length v)))
+        (setf (symbol-value (find-symbol (if (search "_LO" k) "*GV-CACHE-LO*" "*GV-CACHE-HI*") :modus.mvm))
+              (parse-integer v))
+        (format t ";; ~A=~A~%" k v))))
+  (let ((o (sb-ext:posix-getenv "MODUS_GVCACHE_ONLY")))
+    (when (and o (plusp (length o)))
+      (setf (symbol-value (find-symbol "*GV-CACHE-ONLY*" :modus.mvm))
+            (let ((r nil) (start 0))
+              (loop for i = (position #\, o :start start)
+                    do (push (subseq o start i) r)
+                       (if i (setq start (1+ i)) (return (nreverse r))))))
+      (format t ";; MODUS_GVCACHE_ONLY=~A~%" o)))
+  (when (and md (plusp (length md)))
+    (setf (symbol-value (find-symbol "*GV-CACHE-MODE*" :modus.mvm))
+          (intern (string-upcase md) :keyword))
+    (format t ";; MODUS_GVCACHE_MODE=~A~%" md)))
+
 )  ; end with-compilation-unit

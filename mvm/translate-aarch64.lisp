@@ -1829,18 +1829,68 @@
    frame slots. 1024 bytes provides ~120 frame slots for local variables,
    sufficient for deeply nested crypto functions like fe-mul (~80 slots).")
 
+;;; --- Frame addressing: x29 points at the BOTTOM of the locals region ---
+;;;
+;;; Historically x29 was the top of the frame and every local lived at a
+;;; NEGATIVE offset from it, which forces LDUR/STUR (unscaled, signed imm9,
+;;; reach +/-256) and therefore costs a second instruction — an address
+;;; materialised into x16 — for every slot past the 24th.
+;;;
+;;; The prologue now sets x29 AFTER carving the locals region, so x29 sits
+;;; +A64-FP-BIAS+ bytes lower and every local is at a POSITIVE offset, in
+;;; reach of LDR/STR's unsigned imm12 (scaled by 8 => 32 KB).  The memory
+;;; layout is BYTE-IDENTICAL to before: only the value of the base register
+;;; changed.  That is deliberate — the GC's conservative stack scan, the
+;;; SETJMP jmpbuf, SAVE-CTX/RESTORE-CTX and the overflow-argument area all
+;;; describe the same words they always did.
+(defconstant +a64-fp-bias+ 1024
+  "Bytes x29 sits BELOW the old frame top (= +a64-locals-frame-size+).
+   A64-FP-OFF converts a legacy frame-top-relative offset to an x29-relative
+   one.  Kept as its own constant so every conversion site names the bias.")
+
+(defun a64-fp-off (top-relative-offset)
+  "Convert a (negative) frame-top-relative offset to an x29-relative one."
+  (+ top-relative-offset +a64-fp-bias+))
+
+(defun a64-fp-scaled-p (off)
+  "Can OFF be encoded directly in LDR/STR Xt, [x29, #imm12]?"
+  (and (>= off 0) (<= off 32760) (zerop (mod off 8))))
+
+(defun a64-fp-addr (buf rd off)
+  "Materialise x29 + OFF into RD for offsets outside the scaled imm12 form."
+  (if (>= off 0)
+      (a64-add-imm buf rd +a64-x29+ off)
+      (a64-sub-imm buf rd +a64-x29+ (- off))))
+
+(defun a64-fp-load (buf rt off)
+  "Load [x29 + OFF] into RT, one instruction whenever the offset encodes."
+  (if (a64-fp-scaled-p off)
+      (a64-ldr-unsigned buf rt +a64-x29+ off)
+      (progn (a64-fp-addr buf +a64-x16+ off)
+             (a64-ldur buf rt +a64-x16+ 0))))
+
+(defun a64-fp-store (buf rt off &optional (scratch +a64-x16+))
+  "Store RT into [x29 + OFF], one instruction whenever the offset encodes."
+  (if (a64-fp-scaled-p off)
+      (a64-str-unsigned buf rt +a64-x29+ off)
+      (progn (a64-fp-addr buf scratch off)
+             (a64-stur buf rt scratch 0))))
+
+(defun a64-frame-slot-offset (idx)
+  "x29-relative byte offset of frame slot IDX."
+  (a64-fp-off (+ +a64-frame-slot-base+ (* idx -8))))
+
 (defun a64-spill-slot-offset (vreg)
-  "Compute the FP-relative offset for a spilled vreg (V9-V15).
-   Returns a negative offset suitable for LDUR/STUR."
-  (+ +a64-spill-base-offset+ (* (- vreg +vreg-v9+) -8)))
+  "Compute the x29-relative offset for a spilled vreg (V9-V15)."
+  (a64-fp-off (+ +a64-spill-base-offset+ (* (- vreg +vreg-v9+) -8))))
 
 (defun a64-load-spill (buf phys-dest vreg)
   "Load a spilled virtual register from its frame slot into PHYS-DEST."
-  (a64-ldur buf phys-dest +a64-x29+ (a64-spill-slot-offset vreg)))
+  (a64-ldr-unsigned buf phys-dest +a64-x29+ (a64-spill-slot-offset vreg)))
 
 (defun a64-store-spill (buf phys-src vreg)
   "Store PHYS-SRC into the frame spill slot for VREG."
-  (a64-stur buf phys-src +a64-x29+ (a64-spill-slot-offset vreg)))
+  (a64-str-unsigned buf phys-src +a64-x29+ (a64-spill-slot-offset vreg)))
 
 (defun a64-emit-load-vreg (buf phys-dest vreg)
   "Ensure VREG is in PHYS-DEST. If VREG maps to a physical register,
@@ -1918,9 +1968,6 @@
    x27 to survive the inner call."
   ;; Save FP and LR, allocate save area
   (a64-stp-pre buf +a64-x29+ +a64-x30+ +a64-sp+ (- +a64-save-area+))
-  ;; Set up frame pointer: ADD x29, SP, #0
-  ;; (Cannot use a64-mov-reg because ORR encodes reg 31 as XZR, not SP)
-  (a64-add-imm buf +a64-x29+ +a64-sp+ 0)
   ;; Save callee-saved registers (x19-x23, x27)
   ;; x24/x25/x26 are global alloc/limit/nil — must persist across calls
   (a64-stp-offset buf +a64-x19+ +a64-x20+ +a64-sp+ 16)
@@ -1929,8 +1976,12 @@
   (a64-stp-offset buf +a64-x23+ +a64-x27+ +a64-sp+ 48)
   ;; x6/x7/x4/x5/x8 = V9-V13, callee-saved by Modus convention (see *a64-vreg-to-phys*)
   (a64-emit-local-regs-save buf)
-  ;; Allocate space for spill slots and frame locals below FP
-  (a64-sub-imm buf +a64-sp+ +a64-sp+ +a64-locals-frame-size+))
+  ;; Allocate space for spill slots and frame locals below the save area
+  (a64-sub-imm buf +a64-sp+ +a64-sp+ +a64-locals-frame-size+)
+  ;; Set up frame pointer LAST, at the BOTTOM of the locals region, so every
+  ;; local is at a positive (scaled-imm12-encodable) offset from it.
+  ;; (Cannot use a64-mov-reg because ORR encodes reg 31 as XZR, not SP)
+  (a64-add-imm buf +a64-x29+ +a64-sp+ 0))
 
 (defun a64-emit-epilogue (buf)
   "Emit the standard function epilogue:
@@ -2160,8 +2211,12 @@
                 (when (> code 4)
                   (let ((arg-stride (if *aarch64-stack-align-16* 16 8)))
                     (loop for i from 4 below code
-                          for src-offset = (+ +a64-save-area+ (* (- i 4) arg-stride))
-                          for dst-offset = (+ +a64-frame-slot-base+ (* i -8))
+                          ;; x29 is the frame BOTTOM, so BOTH the incoming
+                          ;; overflow area (above the save area) and the frame
+                          ;; slots are at positive offsets from it.
+                          for src-offset = (a64-fp-off (+ +a64-save-area+
+                                                          (* (- i 4) arg-stride)))
+                          for dst-offset = (a64-frame-slot-offset i)
                           ;; LDUR/STUR carry a SIGNED imm9 (-256..255).  A
                           ;; function with enough params runs SRC past +255 and
                           ;; DST past -256 (src grows +stride/arg, dst shrinks
@@ -2174,16 +2229,8 @@
                           ;; x17 (ADD/SUB imm12, ample for any real arity) when
                           ;; the offset is outside imm9, exactly as the obj-ref/
                           ;; obj-set wide path does.  x16 is the value temp.
-                          do (if (<= src-offset 255)
-                                 (a64-ldur buf +a64-x16+ +a64-x29+ src-offset)
-                                 (progn
-                                   (a64-add-imm buf +a64-x17+ +a64-x29+ src-offset)
-                                   (a64-ldur buf +a64-x16+ +a64-x17+ 0)))
-                             (if (>= dst-offset -256)
-                                 (a64-stur buf +a64-x16+ +a64-x29+ dst-offset)
-                                 (progn
-                                   (a64-sub-imm buf +a64-x17+ +a64-x29+ (- dst-offset))
-                                   (a64-stur buf +a64-x16+ +a64-x17+ 0)))))))
+                          do (a64-fp-load buf +a64-x16+ src-offset)
+                             (a64-fp-store buf +a64-x16+ dst-offset +a64-x17+)))))
                ((< code #x0300)
                 ;; Frame-alloc/frame-free: NOP for now
                 nil)
@@ -2968,10 +3015,11 @@
                               (logior #x54000000 (ash imm19 5) #b1101)))) ; LE
                     ;; sub w9, w9, #4
                     (a64-sub-imm buf 9 9 4)
-                    ;; add x10, x29, #80 — src ptr
-                    (a64-add-imm buf 10 +a64-x29+ +a64-save-area+)
-                    ;; sub x11, x29, #96 — dst ptr
-                    (a64-sub-imm buf 11 +a64-x29+ 96)
+                    ;; add x10, x29, #(bias + save-area) — src ptr.  x29 is the
+                    ;; frame BOTTOM, so the incoming overflow area is above it.
+                    (a64-add-imm buf 10 +a64-x29+ (a64-fp-off +a64-save-area+))
+                    ;; add x11, x29, #(slot 4) — dst ptr
+                    (a64-add-imm buf 11 +a64-x29+ (a64-frame-slot-offset 4))
                     ;; loop:
                     (let ((loop-idx (a64-current-index buf)))
                       ;; cbz w9, done — 32-bit CBZ
@@ -4096,14 +4144,10 @@
                   (idx (vr 2))
                   (pd (or (a64-phys-reg vd) +a64-x17+)))
              (if (= vobj +vreg-vfp+)
-                 ;; Frame slot access: use FP-relative offset below spill area
-                 (let ((offset (+ +a64-frame-slot-base+ (* idx -8))))
-                   (if (and (>= offset -256) (<= offset 255))
-                       (a64-ldur buf pd +a64-x29+ offset)
-                       ;; Large offset: SUB x16, x29, #abs_offset; LDUR pd, [x16]
-                       (progn
-                         (a64-sub-imm buf +a64-x16+ +a64-x29+ (- offset))
-                         (a64-ldur buf pd +a64-x16+ 0))))
+                 ;; Frame slot access: x29 is the frame BOTTOM, so the slot is
+                 ;; at a positive offset and LDR's scaled imm12 reaches it in
+                 ;; ONE instruction for every slot the 1024-byte frame has.
+                 (a64-fp-load buf pd (a64-frame-slot-offset idx))
                  ;; Normal object slot access — tag=9 layout, slot N at
                  ;; tagged + N*8 + 7 (= raw + 16 + N*8).
                  (let* ((pobj (ensure-src vobj +a64-x16+))
@@ -4123,14 +4167,8 @@
                   (idx (vr 1))
                   (ps (ensure-src (vr 2) +a64-x17+)))
              (if (= vobj +vreg-vfp+)
-                 ;; Frame slot store: use FP-relative offset below spill area
-                 (let ((offset (+ +a64-frame-slot-base+ (* idx -8))))
-                   (if (and (>= offset -256) (<= offset 255))
-                       (a64-stur buf ps +a64-x29+ offset)
-                       ;; Large offset: SUB x16, x29, #abs_offset; STUR ps, [x16]
-                       (progn
-                         (a64-sub-imm buf +a64-x16+ +a64-x29+ (- offset))
-                         (a64-stur buf ps +a64-x16+ 0))))
+                 ;; Frame slot store — positive offset from the frame bottom.
+                 (a64-fp-store buf ps (a64-frame-slot-offset idx))
                  ;; Normal object slot store — tag=9 layout, slot N at +N*8+7.
                  ;;
                  ;; The large-offset address temp MUST NOT be x16.  `pobj` IS
@@ -4228,8 +4266,11 @@
                  ;; slots.  pidx is a tagged fixnum (real*2); <<2 gives real*8.
                  (progn
                    (a64-lsl-imm buf +a64-x16+ pidx 2)                       ; x16 = real_idx*8
-                   (a64-sub-reg buf +a64-x16+ +a64-x29+ +a64-x16+ 0 0)      ; x16 = x29 - real_idx*8
-                   (a64-ldur buf pd +a64-x16+ +a64-frame-slot-base+))       ; [x16 - 64]
+                   ;; x29 is the frame BOTTOM now: slot 0 is at +a64-frame-slot-offset 0,
+                   ;; and slot N is that MINUS N*8.
+                   (a64-add-imm buf +a64-x17+ +a64-x29+ (a64-frame-slot-offset 0))
+                   (a64-sub-reg buf pd +a64-x17+ +a64-x16+ 0 0)
+                   (a64-ldur buf pd pd 0))
                  (let ((pobj (ensure-src (vr 1) +a64-x16+)))
                    (a64-add-imm buf +a64-x16+ pobj 7)
                    (a64-add-reg buf +a64-x16+ +a64-x16+ pidx 0 2)

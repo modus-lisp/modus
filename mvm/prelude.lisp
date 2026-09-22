@@ -2349,6 +2349,13 @@
     (unless tbl
       (setq tbl (make-hash-table))
       (setf (mem-ref #x10000080 :u64) tbl))
+    ;; A pair that does not exist yet is about to be CREATED, and a memoised
+    ;; pointer to some earlier pair for this key would then address a cell the
+    ;; table no longer consults.  Drop the memo before the insert.  The cache
+    ;; word is tested FIRST so an image built without the cache (the default)
+    ;; pays one load and a branch here, not a table probe per insert.
+    (unless (fixnump (mem-ref #x10000FA0 :u64))
+      (unless (%gv-cell name-hash) (%gv-cache-flush)))
     (puthash name-hash tbl value))
   (%rt-leave)
   value)
@@ -2445,6 +2452,19 @@
         (setq %gv-i (+ %gv-i 1)))
       (setf (mem-ref #x10000FA0 :u64) %gv-cv))))
 
+(defun %gv-cache-flush ()
+  "Drop every memoised cell.  Called whenever a global's pair is CREATED,
+   which is the only event that can make a memoised pointer point at a pair
+   the table no longer consults."
+  (let ((%gv-cv (mem-ref #x10000FA0 :u64)))
+    (if (fixnump %gv-cv)
+        nil
+        (let ((%gv-i 0))
+          (loop
+            (when (>= %gv-i 16384) (return nil))
+            (%ht-vec-set %gv-cv %gv-i nil)
+            (setq %gv-i (+ %gv-i 1)))))))
+
 (defun %gv-ref-fill (%gv-key %gv-slot)
   "AOT special-variable read, slow path: the value of global KEY, NIL when it
    has no cell -- %GV-REF's contract exactly -- memoising the cell in cache
@@ -2457,7 +2477,7 @@
     (if (fixnump %gv-cv)
         (progn (%gv-cache-init-once) (%gv-ref %gv-key))
         (let ((%gv-hit (%word-aref %gv-cv %gv-slot)))
-          (if (consp %gv-hit)
+          (if (if (consp %gv-hit) (eq (car %gv-hit) %gv-key) nil)
               (cdr %gv-hit)
               (let ((%gv-cl (%gv-cell %gv-key)))
                 (if (consp %gv-cl)
@@ -2476,7 +2496,7 @@
   (let ((%gv-cl (%gv-cell %gv-key)))
     (if %gv-cl
         (progn (set-cdr %gv-cl %gv-val) %gv-val)
-        (set-symbol-value %gv-key %gv-val))))
+        (progn (%gv-cache-flush) (set-symbol-value %gv-key %gv-val)))))
 
 ;;; ============================================================
 ;;; Interned Symbols

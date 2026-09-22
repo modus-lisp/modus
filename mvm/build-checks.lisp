@@ -1518,6 +1518,26 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
                (if (consp fl) (car fl) fl)
                :lines (and (consp fl) (cdr fl)))))))))
 
+(defun %gck-gv-cache-report ()
+  "One line per build: how many globals got an AOT cell-cache slot
+   (compiler.lisp, %COMPILE-GLOBAL-READ-AOT), and optionally the whole
+   slot -> name table.  The count is the number that matters when a cached
+   read misbehaves: MODUS_GVCACHE_LO/HI bisect over exactly this range, and
+   MODUS_GVCACHE_DUMP=<file> turns a slot number back into a variable name."
+  (let ((cnt (symbol-value (find-symbol "*GV-CACHE-COUNT*" :modus.mvm)))
+        (ix  (symbol-value (find-symbol "*GV-CACHE-INDEX*" :modus.mvm)))
+        (nm  (symbol-value (find-symbol "*GV-CACHE-NAMES*" :modus.mvm)))
+        (dump (sb-ext:posix-getenv "MODUS_GVCACHE_DUMP")))
+    (format t "~&;; gv-cache: ~D global slots assigned~%" cnt)
+    (when (and dump (plusp (length dump)) ix)
+      (with-open-file (o dump :direction :output :if-exists :supersede)
+        (let ((rows nil))
+          (maphash (lambda (k v) (push (cons v k) rows)) ix)
+          (dolist (r (sort rows #'< :key #'car))
+            (format o "~D ~A ~A~%" (car r) (cdr r)
+                    (and nm (gethash (cdr r) nm))))))
+      (format t ";; gv-cache: slot table written to ~A~%" dump))))
+
 (unless *build-image-unwrapped*
   (setf *build-image-unwrapped* #'build-image)
   (setf (fdefinition 'build-image)
@@ -1553,6 +1573,7 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
             (declare (ignorable nunknown %pre))
             (%gck-guard "check-compiler-warns"
               (check-compiler-warns hist (nreverse unknown)))
+            (%gck-guard "gv-cache-report" (%gck-gv-cache-report))
             result))))
 
 

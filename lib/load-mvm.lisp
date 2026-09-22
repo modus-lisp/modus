@@ -74,13 +74,19 @@
 ;; HOST-ONLY knobs for the AOT special-variable cell cache (compiler.lisp,
 ;; %COMPILE-GLOBAL-READ-AOT).  Read here rather than in compiler.lisp because
 ;; that file is also image source and must never call POSIX-GETENV.
-;;   MODUS_NO_GVCACHE=1     rollback: every AOT special read is a %GV-REF call
+;;   MODUS_GVCACHE=1        opt IN (the cache is OFF by default -- see the
+;;                          docstring of *GV-CACHE-ENABLED* for why)
+;;   MODUS_NO_GVCACHE=1     force off, even if MODUS_GVCACHE is set
 ;;   MODUS_GVCACHE_LO/HI=N  triage: only slots in [LO,HI) are emitted cached
 ;;   MODUS_GVCACHE_ONLY=A,B triage: only these global names are cached
 ;;   MODUS_GVCACHE_DUMP=F   triage: write the slot -> name table to F
 ;;   MODUS_GVCACHE_MODE=call  triage: emit only the fill call, no inline load
-(let ((off (sb-ext:posix-getenv "MODUS_NO_GVCACHE"))
+(let ((on  (sb-ext:posix-getenv "MODUS_GVCACHE"))
+      (off (sb-ext:posix-getenv "MODUS_NO_GVCACHE"))
       (md  (sb-ext:posix-getenv "MODUS_GVCACHE_MODE")))
+  (when (and on (plusp (length on)) (not (string= on "0")))
+    (setf (symbol-value (find-symbol "*GV-CACHE-ENABLED*" :modus.mvm)) t)
+    (format t ";; MODUS_GVCACHE: AOT special reads use the cached cell~%"))
   (when (and off (plusp (length off)) (not (string= off "0")))
     (setf (symbol-value (find-symbol "*GV-CACHE-ENABLED*" :modus.mvm)) nil)
     (format t ";; MODUS_NO_GVCACHE: AOT special reads use the %GV-REF call~%"))

@@ -10509,9 +10509,32 @@
    the ANSI corpus adds more.  Past this the compiler simply stops handing out
    slots and those reads keep the old %GV-REF call.")
 
-(defvar *gv-cache-enabled* t
-  "NIL restores the plain %GV-REF call at every AOT special read.
-   MODUS_NO_GVCACHE=1 at BUILD time is the rollback.")
+(defvar *gv-cache-enabled* nil
+  "DEFAULT OFF, and the default is the honest part of this change.
+
+   With it ON the cached read is measurably right and measurably faster on
+   every SHIPPING image: the 24-line semantics probe (tests/gvref-probe.lisp)
+   is identical to the pre-change binary with the JIT on and off, the Pi 5
+   promote-probe is identical to its stored reference both ways, the reel md5
+   gate is 48/48, the bare-metal aarch64 self-test prints its exact expected
+   line, and the scalar benchmark on a Pi 5 goes 4572.60 -> 3713.36 M
+   instructions per rep (-18.8%, 12.33x SBCL -> 10.01x).
+
+   With it ON the ANSI GATE-RUNNER image -- which bakes the test corpus,
+   forks per file and churns the globals table far harder than any shipping
+   image -- loses 215 tests and gains 6 over six special-variable-heavy
+   ranges (5975 passes on main, which re-runs bit-identically, so this is
+   signal and not noise).  The emitted code is NOT the problem and that was
+   measured, not assumed: with the identical inline sequence emitted at every
+   site and the MEMOISATION alone disabled -- %GV-REF-FILL still probing but
+   no longer storing the cell -- the same six ranges come back 0 regressions
+   and 0 gains against main.  So a memoised pair goes stale in that image, by
+   a route this work did not find; validating the pair's CAR against the key
+   (which the emitted code does, and which turned an outright SIGSEGV in the
+   harness's fork/wait into correct behaviour) catches some of it and not all.
+
+   Turn it on with MODUS_GVCACHE=1 at BUILD time.  Do not turn it on by
+   default until the gate-runner image is 0/0.")
 (defvar *gv-cache-only* nil
   "Triage: when set, a list of NAME STRINGS that alone get a cached read.")
 (defvar *gv-cache-lo* nil)
@@ -10563,7 +10586,7 @@
   (let ((save-count (min *temp-reg-counter* 12))
         (miss (make-compiler-label))
         (done (make-compiler-label)))
-    ;; ONE temp, with DEST as the second scratch.  Register pressure is the
+    ;; Two temps, with DEST as a third scratch.  Register pressure is the
     ;; budget here: a variable reference can sit arbitrarily deep inside an
     ;; expression that already holds temps, and V9.. are frame spills, so a
     ;; second fresh temp would spill at the busiest sites (measured peak at a
@@ -10578,7 +10601,8 @@
         (loop (when (>= r (+ +vreg-v4+ save-count)) (return))
           (unless (= r dest) (emit-ir :push r))
           (setq r (+ r 1)))))
-    (let ((cell (alloc-temp-reg)))
+    (let ((cell (alloc-temp-reg))
+          (want (alloc-temp-reg)))
       ;; cell = [+GV-CACHE-ROOT+]  (the cache vector, or 0 before boot built it)
       (emit-li-tagged cell +gv-cache-root+)
       (emit-ir :shr cell cell +fixnum-shift+)
@@ -10600,6 +10624,20 @@
       ;; CONSP, not a null test: an unfilled slot reads back as FIXNUM 0.
       (emit-ir :consp cell dest)
       (emit-ir :bnull cell miss)
+      ;; AND THE PAIR MUST STILL CARRY THIS KEY.  A cached pointer is only as
+      ;; good as the invariant behind it, and in the ANSI gate-runner image --
+      ;; which forks per file and collects far harder than the CLI does -- a
+      ;; slot was measured holding a cons that was not this global's pair at
+      ;; all: the harness's *WSTATUS-ADDR* read back as something that was not
+      ;; an address, and (setf (mem-ref <that> :u32) 0) took the process down
+      ;; at the first fork/wait.  Checking the CAR turns any such surprise into
+      ;; an ordinary slow-path lookup instead of a wrong answer, for three
+      ;; instructions.  It is the same check an SBCL inline cache makes, and
+      ;; for the same reason.
+      (emit-ir :car cell dest)
+      (emit-li-tagged want key)
+      (emit-ir :cmp cell want)
+      (emit-ir :bne miss)
       (emit-ir :cdr dest dest)
       ;; A read yields exactly ONE value, and the old emission said so by
       ;; accident: it was a CALL, and %GV-REF's epilogue reset MV-COUNT.  The
@@ -10621,6 +10659,7 @@
           (loop (when (< r (+ +vreg-v4+ 1)) (return))
             (unless (= r dest) (emit-ir :pop r))
             (setq r (- r 1)))))
+      (free-temp-reg)
       (free-temp-reg))))
 
 (defun %compile-global-read-aot (name env dest)

@@ -7472,6 +7472,20 @@
        (compile-prim-array-length (cadr form) env dest))
       ((= op-name #.(compute-name-hash "%PRIM-STRINGP"))
        (compile-prim-stringp (cadr form) env dest))
+      ;; %MDA-P is a two-test predicate written as a six-arm COND, and it is
+      ;; called 77 times from the sequence, string and array paths -- on a
+      ;; scalar benchmark it billed ~9% of everything the printer and reader
+      ;; executed, essentially all of it call overhead.  Its source body
+      ;; (null / T / fixnum / cons / character, then (= (obj-subtag x) #x34))
+      ;; is EXACTLY "object tag and this subtag": every one of those five
+      ;; early arms is a value whose tag nibble is not +TAG-OBJECT+, and
+      ;; :OBJ-TAG answers for all of them without dereferencing.  So the
+      ;; inline emission is the same predicate, not an approximation of it.
+      ;; The DEFUN stays (cl-clos.lisp) -- #'%MDA-P and every interpreted
+      ;; caller still reach it; this only changes what a COMPILED call site
+      ;; emits, exactly as %PRIM-STRINGP above does.
+      ((= op-name #.(compute-name-hash "%MDA-P"))
+       (compile-object-subtype-p (cadr form) env dest +subtag-mda+))
       ((= op-name #.(compute-name-hash "%MAKE-ARRAY-RAW"))
        (compile-make-array-raw (cadr form) env dest))
       ((= op-name #.(compute-name-hash "%ALLOC-U8"))

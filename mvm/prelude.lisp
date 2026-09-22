@@ -2252,12 +2252,26 @@
 (defun %dynbind (key val)
   "Establish a dynamic binding of the global named by KEY (a name hash).
    A drop-in replacement for the SET-SYMBOL-VALUE that COMPILE-LET-WITH-
-   SPECIALS used to emit, and identical to it on every unarmed thread."
+   SPECIALS used to emit, and identical to it on every unarmed thread.
+
+   THE SHALLOW ARM GOES THROUGH %GV-SET, NOT SET-SYMBOL-VALUE.  The two
+   agree on every path that reaches here -- %GV-SET is SET-SYMBOL-VALUE
+   with the in-place update the compiled SETQ of a special already uses --
+   but SET-SYMBOL-VALUE reaches the table through the GENERIC PUTHASH while
+   %GV-SET probes the same bucket layout directly with %GV-CELL, which is
+   the difference between ~25 ns and a full hash-table store.  A LET of a
+   special paid that twice, once to install and once to restore, and a
+   dynamic binding is not a rare operation: it is every WITH-* macro in the
+   system.  Both arms that get here have already established that this
+   thread has no per-thread binding block (the word is clear, or the block
+   is 0 because this is the main thread of an armed image), which is
+   exactly the condition under which SET-SYMBOL-VALUE's own per-thread
+   prologue is a no-op."
   (if (eql (mem-ref #x10000DB8 :u32) 0)
-      (set-symbol-value key val)
+      (%gv-set key val)
       (let ((blk (%dynb-block)))
         (if (eql blk 0)
-            (set-symbol-value key val)
+            (%gv-set key val)
             (let ((d (%dynb-depth blk))
                   (a (%dynb-next blk)))
               (if (>= d 58)
@@ -2275,10 +2289,10 @@
    deep path ignores, because the deep path's outer value is still sitting in
    the entry below the one it truncates away."
   (if (eql (mem-ref #x10000DB8 :u32) 0)
-      (set-symbol-value key saved)
+      (%gv-set key saved)
       (let ((blk (%dynb-block)))
         (if (eql blk 0)
-            (set-symbol-value key saved)
+            (%gv-set key saved)
             (let ((d (%dynb-depth blk)))
               (if (<= d 0)
                   saved

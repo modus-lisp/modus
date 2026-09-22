@@ -60,19 +60,34 @@ NIC driver: x86-64 and AArch64 virt use Intel E1000 (PCI). RPi uses DWC2 USB —
 
 ### MVM architectures
 
-All 9 architectures compile and produce correct output (factorial 3628800) in QEMU. x86-64, AArch64, i386, and ARM32 have full runtime support with SSH.
+**Three architectures are supported: x86-64, AArch64, i386.** Six more have a
+working code generator. The distinction matters and is easy to blur, so the
+tiers below say what evidence stands behind each claim.
+
+| Tier | What it means | Architectures |
+|------|---------------|---------------|
+| **Supported** | Boots to a REPL and does work — evaluates forms, accepts SSH, runs libraries. Exercised regularly. | x86-64, AArch64 (virt + RPi), i386 |
+| **Runs, ungated** | Claims the same runtime surface and takes part in the cross-architecture fixpoint proof, but no routine check would notice if it broke. | ARM32 |
+| **Code generator only** | The translator emits a binary that boots far enough to print one correct computation (factorial 3628800) over serial, and stops. Evidence the back end works. NOT a usable system: no REPL, no networking, nothing else claimed. | RISC-V 64, PPC64, PPC32, 68k |
+
+**None of this is gated by an automated boot test yet.** "Supported" currently
+means a person ran it and it worked, not that a regression would be caught. A
+binary that halts with the right number is not a booted system, and until a gate
+boots each target and requires an answer it could not have guessed, every row
+above is a report rather than a guarantee. That gate is the open work; the tier
+table is what is honestly true meanwhile.
 
 | Architecture | Bits | Endian | Translator | Boot | QEMU target | Status |
 |-------------|:----:|:------:|:----------:|:----:|-------------|--------|
-| x86-64      | 64 | little | translate-x64.lisp    | boot-x64.lisp    | `qemu-system-x86_64`    | Full (REPL, SSH, actors, self-hosting) |
-| AArch64     | 64 | little | translate-aarch64.lisp | boot-aarch64.lisp | `qemu-system-aarch64 -M virt` | Full (REPL, SSH, actors) |
-| AArch64 RPi | 64 | little | translate-aarch64.lisp | boot-rpi.lisp    | `qemu-system-aarch64 -M raspi3b` | Full (REPL, SSH, USB HID, real hardware) |
-| i386        | 32 | little | translate-i386.lisp   | boot-i386.lisp   | `qemu-system-i386`      | Full (REPL, SSH, self-hosting, real hardware) |
-| ARM32       | 32 | little | translate-arm32.lisp  | boot-arm32.lisp  | `qemu-system-arm -M raspi2b` | Full (REPL, SSH) |
-| RISC-V 64   | 64 | little | translate-riscv.lisp  | boot-riscv.lisp  | `qemu-system-riscv64`   | Serial output |
-| PPC64       | 64 | big    | translate-ppc.lisp    | boot-ppc64.lisp  | `qemu-system-ppc64`     | Serial output |
-| PPC32       | 32 | big    | translate-ppc.lisp    | boot-ppc32.lisp  | `qemu-system-ppc`       | Serial output |
-| 68k         | 32 | big    | translate-68k.lisp    | boot-68k.lisp    | `qemu-system-m68k -M an5206` | Serial output |
+| x86-64      | 64 | little | translate-x64.lisp    | boot-x64.lisp    | `qemu-system-x86_64`    | Supported (REPL, SSH, actors, self-hosting) |
+| AArch64     | 64 | little | translate-aarch64.lisp | boot-aarch64.lisp | `qemu-system-aarch64 -M virt` | Supported (REPL, SSH, actors) |
+| AArch64 RPi | 64 | little | translate-aarch64.lisp | boot-rpi.lisp    | `qemu-system-aarch64 -M raspi3b` | Supported (REPL, SSH, USB HID, real hardware) |
+| i386        | 32 | little | translate-i386.lisp   | boot-i386.lisp   | `qemu-system-i386`      | Supported (REPL, SSH, self-hosting, real hardware) |
+| ARM32       | 32 | little | translate-arm32.lisp  | boot-arm32.lisp  | `qemu-system-arm -M raspi2b` | Runs, ungated (REPL, SSH; in the fixpoint chain) |
+| RISC-V 64   | 64 | little | translate-riscv.lisp  | boot-riscv.lisp  | `qemu-system-riscv64`   | Code generator only (serial, one computation) |
+| PPC64       | 64 | big    | translate-ppc.lisp    | boot-ppc64.lisp  | `qemu-system-ppc64`     | Code generator only (serial, one computation) |
+| PPC32       | 32 | big    | translate-ppc.lisp    | boot-ppc32.lisp  | `qemu-system-ppc`       | Code generator only (serial, one computation) |
+| 68k         | 32 | big    | translate-68k.lisp    | boot-68k.lisp    | `qemu-system-m68k -M an5206` | Code generator only (serial, one computation) |
 
 ### Cross-architecture fixpoint
 

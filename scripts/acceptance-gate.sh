@@ -116,7 +116,7 @@ if [ ! -x "$FIX_WT/tmp/modus-cli" ]; then
 # Skip with MODUS_GATE_NO_WEB=1 (and it self-skips where node is absent).
 # The 900 s budget is for the INTERPRETER arm: the boot is ~8.5 min under
 # --no-compile (~43 s with the JS translator on), so this is not slack.
-if [ -z "$MODUS_GATE_NO_WEB" ] && [ -f "$FIX_WT/mvm/build-web.lisp" ] && command -v node >/dev/null 2>&1; then
+if [ -z "${MODUS_GATE_NO_WEB:-}" ] && [ -f "$FIX_WT/mvm/build-web.lisp" ] && command -v node >/dev/null 2>&1; then
   echo "-- web: JS MVM module build + boot smoke at fix ref --"
   ( cd "$FIX_WT" && MODUS_NO_JIT=1 MODUS_WEB_OUT="$FIX_WT/tmp/modus.mvmw" \
     sbcl --dynamic-space-size 8192 --script mvm/build-web.lisp \

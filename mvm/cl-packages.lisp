@@ -483,11 +483,65 @@
            (when clu (return-from find-package clu))))
        (find-package-1 name-str)))))
 
+(defun %pkg-name-or-nickname-p (pkg name-str)
+  "T iff NAME-STR is PKG's primary name or one of its nicknames, under
+   STRING-EQUAL — i.e. exactly what the %ALL-PACKAGES walk below accepts."
+  (let ((nm (%pkg-name pkg)))
+    (and nm
+         (or (string-equal nm name-str)
+             (let ((cur (%pkg-nicknames pkg)) (found nil))
+               (loop
+                 (when (or (null cur) found) (return found))
+                 (when (string-equal (car cur) name-str) (setq found t))
+                 (setq cur (cdr cur))))))))
+
+(defun %find-package-indexed (name-str)
+  "FIND-PACKAGE-1's fast path: the pkg-by-hash table at #x10000170.
+
+   That table already exists and is already a GC root — %INTERN-SYMBOL-PKG
+   uses it to turn a compile-time package-hash into a package object without
+   walking *ALL-PACKAGES*.  It is keyed by COMPUTE-NAME-HASH of the primary
+   name AND of every nickname, which is precisely the key FIND-PACKAGE-1
+   needs, so the walk had no reason to be a walk.
+
+   THE HIT IS VERIFIED, and the verification is not belt-and-braces.  Three
+   things can put a package in that table that the walk would not return,
+   and the NAME check rejects all three:
+
+     - the CL-TEST alias.  %INIT-PACKAGES deliberately splices
+       hash of CL-TEST -> COMMON-LISP-USER so compiled ANSI-test symbol
+       literals resolve, WITHOUT adding CL-TEST to the nickname list of
+       CL-USER (cl-symbols.lsp asserts that list holds CL-USER alone).
+       Public FIND-PACKAGE handles that alias itself, above; FIND-PACKAGE-1
+       must not.
+     - DELETE-PACKAGE, which sets the package's name and nicknames to NIL
+       and drops it from *ALL-PACKAGES* but leaves the hash entries behind.
+       %PKG-NAME-OR-NICKNAME-P requires a non-NIL name, the same guard the
+       walk applies.
+     - RENAME-PACKAGE, which moves the name without touching the table.
+       The old key no longer matches; the new one is simply not indexed and
+       falls through to the walk.
+
+   Plus the ordinary one: COMPUTE-NAME-HASH is a hash, so a collision must
+   not be allowed to answer.  A miss is never a wrong answer — it costs the
+   walk that used to happen unconditionally."
+  (let ((tab (mem-ref #x10000170 :u64)))
+    (when tab
+      (let ((pkg (gethash (compute-name-hash name-str) tab)))
+        (when (and pkg (%pkg-p pkg) (%pkg-name-or-nickname-p pkg name-str))
+          pkg)))))
+
 (defun find-package-1 (name-str)
   "Internal find-package: walks *all-packages* matching primary name
    then nicknames against NAME-STRING via string-equal.  Split out so
    the public FIND-PACKAGE can short-circuit the CL-TEST alias check
-   without polluting CL-USER's nickname list."
+   without polluting CL-USER's nickname list.
+
+   Indexed first (see %FIND-PACKAGE-INDEXED); the walk is the fallback for
+   anything the index does not carry."
+  (when (null name-str) (return-from find-package-1 nil))
+  (let ((hit (%find-package-indexed name-str)))
+    (when hit (return-from find-package-1 hit)))
   (let ((cur *all-packages*))
     (loop
       (when (null cur) (return nil))

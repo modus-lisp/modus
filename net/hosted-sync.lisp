@@ -1439,6 +1439,31 @@
         ;; section behaves exactly as before this change.
         (%rt-arena-carve)
         (setf (mem-ref (%rt-gate-addr) :u32) 1)
+        ;; AND COMPILE THE COMPAT SURFACE, because from here on it is hot and
+        ;; it is BYTECODE.  net/cooperative-atomics.lisp and the SB-* shims
+        ;; are baked as SOURCE and evaluated at boot -- they have to be, the
+        ;; host owns those package names -- so every function in them is an
+        ;; interpreter trampoline.  Measured on the x64 CLI: a call to
+        ;; %ATOMICS-LOCK-ADDR, whose entire body is the constant #x10000FE0,
+        ;; costs 18 us unarmed and 113 us with the gate ARMED, against 0.003
+        ;; us for the identical one-line function redefined with the JIT
+        ;; engaged.  Six thousand times, on the function a spinlock calls
+        ;; three times per acquire.  That is why four threads x 20000
+        ;; %ATOMIC-INCFs could not finish: 96 s at K=2000 and no worker
+        ;; joining, against 7 s and an exact 8000 with the surface compiled.
+        ;;
+        ;; HERE and not at boot, because the cost is real: JIT-EAGER is 0.58 s
+        ;; for the 127 modules a fresh image carries, and a single-threaded
+        ;; `modus --eval' must not pay it.  %RT-THREADS-ON is the explicit act
+        ;; this file's own docstring describes -- a program that declares it
+        ;; will run Lisp on a second thread is exactly the program that is
+        ;; about to call this surface at rate, and it pays once.
+        ;; MODUS_NO_EAGER_THREADS=1 is the rollback; a failure to compile is
+        ;; not a failure to arm, so it is swallowed.
+        (let ((off (%cli-getenv "MODUS_NO_EAGER_THREADS")))
+          (if (and off (> (length off) 0) (not (string= off "0")))
+              0
+              (handler-case (progn (jit-eager) 0) (t (c) 0))))
         1)))
 
 (defun %rt-threads-off ()

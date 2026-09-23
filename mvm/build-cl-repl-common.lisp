@@ -104,8 +104,9 @@
 ;;; file; there is deliberately no default, so a new wrapper that forgets it
 ;;; fails loudly here instead of silently building a Pi image.
 (declaim (special *cl-repl-platform*))
-(unless (member *cl-repl-platform* '(:rpi :virt :x64))
-  (error "build-cl-repl-common: *CL-REPL-PLATFORM* is ~S; want :RPI, :VIRT or :X64."
+(unless (member *cl-repl-platform* '(:rpi :virt :x64 :i386))
+  (error "build-cl-repl-common: *CL-REPL-PLATFORM* is ~S; want :RPI, :VIRT, ~
+          :X64 or :I386."
          *cl-repl-platform*))
 (defvar *cl-repl-rpi-p*  (eq *cl-repl-platform* :rpi))
 (defvar *cl-repl-virt-p* (eq *cl-repl-platform* :virt))
@@ -113,6 +114,13 @@
 ;; Same thin-head contract as :VIRT; the x86 arms are marked at each
 ;; DIVERGENCE site below.  *CL-REPL-VIRT-P* keeps its aarch64-only meaning.
 (defvar *cl-repl-x64-p*  (eq *cl-repl-platform* :x64))
+;; :I386 — the bare-metal 32-bit x86 QEMU-pc image (mvm/build-i386-cl-repl.lisp).
+;; Same thin-head contract as :X64, and the same console: translate-i386's bare
+;; path already emits COM1 port I/O for the serial traps (#x0300 write, #x0301
+;; read) whenever *I386-LINUX-MODE* is NIL, which is its default.  Networking is
+;; deliberately NOT wired up — DIVERGENCE 3/4/5 have no :I386 arm — so this
+;; image is the REPL and nothing else.
+(defvar *cl-repl-i386-p* (eq *cl-repl-platform* :i386))
 (defvar *cl-repl-qemu-p* (or *cl-repl-virt-p* *cl-repl-x64-p*)
   "T for the two QEMU machines (virt, pc): E1000 over PCI, user-mode net.")
 
@@ -240,6 +248,9 @@
 ;;; MODUS_VIRT_JIT=1 is the default and matches :rpi.
 (defvar *jit-on*
   (cond
+    ;; :I386 — there is no i386 JIT at all, so this is not a default, it is the
+    ;; only option.  Stated as its own arm rather than falling through.
+    (*cl-repl-i386-p* nil)
     ;; :X64 bare metal: JIT OFF by default (translate-x64's exec pages come
     ;; from mmap(2) in linux mode; the bare-metal bump allocator the aarch64
     ;; arm has is not ported yet).  MODUS_X64_JIT=1 opts in for the port work.
@@ -684,11 +695,33 @@
   (write-char-serial 10)
 ")
 
+;;; :I386 arm of DIVERGENCE 2.  Same slots as the :X64 prologue, but written
+;;; :U32 — a 32-bit target has no business storing :U64, and on i386
+;;; compile-mem-ref splits a promoting width into two halves.  (That split is
+;;; buggy for a general value — it writes the LOW half into both — but zero is
+;;; zero either way, and being explicit costs nothing.)  Each 64-bit slot is
+;;; zeroed as two words so the upper half cannot be left as garbage.
+(defvar *cl-repl-i386-kernel-prologue*
+  (with-output-to-string (s)
+    (dolist (addr '(#x10000080     ; global variable table head
+                    #x10000088     ; symbol intern table
+                    #x10000090     ; MV count
+                    #x10000098     ; MV values
+                    #x10000C30 #x10000C38 #x10000C40   ; fault diag slots
+                    #x10000C48 #x10000C50 #x10000C58
+                    #x10000DA0))   ; safepoint boundary
+      (format s "  (setf (mem-ref #x~X :u32) 0)~%" addr)
+      (format s "  (setf (mem-ref #x~X :u32) 0)~%" (+ addr 4)))
+    (format s "  (write-string-serial \"MODUS-CL\")~%")
+    (format s "  (write-char-serial 10)~%")))
+
 ;;; :X64 arm of DIVERGENCE 2 — boot-x64.lisp's stub writes the MCGC config page
 ;;; itself (mcgc-store #x10000E00 ...) before kernel-main; only the runtime's
 ;;; own BSS-equivalent slots need zeroing (the list the retired standalone
 ;;; build-x64-cl-repl.lisp driver zeroed).
 (defvar *cli-arch-kernel-prologue*
+ (if *cl-repl-i386-p*
+  *cl-repl-i386-kernel-prologue*
  (if *cl-repl-x64-p*
   *cl-repl-x64-kernel-prologue*
   (if *cl-repl-virt-p*
@@ -751,7 +784,7 @@
   ;; which a BCM2837 does not have (it uses the BCM interrupt controller), and
   ;; nothing in this image needs interrupts — the REPL polls the UART.
 
-")))
+")))) ; i386 / x64 / virt / rpi
 
 ;;; ARCH SLOT: spliced immediately AFTER (init-all-globals) and before the shared
 ;;; ANSI-constant block.  Its documented purpose is the *cstr-scratch* /
@@ -1889,6 +1922,32 @@
 
 (in-package :modus.mvm)
 
+;;; DIVERGENCE 6/7 (:I386 arm) — the 32-bit x86 boot descriptor and console.
+;;;
+;;; Much shorter than the :X64 arm, and the reason is that i386 needs no mode
+;;; switch: boot-i386.lisp's descriptor is a multiboot header plus one entry
+;;; stub, where x86-64 has header + 32-bit boot + 64-bit entry and therefore a
+;;; native-code offset to measure.  i386's *I386-NATIVE-CODE-OFFSET* stays 0.
+;;;
+;;; The console needs no arm at all: translate-i386's serial traps (#x0300
+;;; write, #x0301 read) emit COM1 port I/O whenever *I386-LINUX-MODE* is NIL,
+;;; and NIL is its default.  It is set explicitly here anyway, because the
+;;; hosted i386 CLI build sets it to T in the same image-building process and a
+;;; default is a poor thing to rely on across two builds in one session.
+(when cl-user::*cl-repl-i386-p*
+  ;; LAYOUT.  The default i386 map puts the stack top at 4 MB and cons space at
+  ;; 8 MB; this image is ~37 MB at load address 1 MB, so both would sit INSIDE
+  ;; it.  Measured before these overrides existed: the banner printed and the
+  ;; image died before the REPL.  Mirrors the :X64 arm, which moves its stack to
+  ;; 512 MB for the same reason.  Needs -m 512.
+  (setf (symbol-value (intern "*I386-STACK-TOP-OVERRIDE*" "MODUS.MVM")) #x18000000)   ; 384 MB
+  (setf (symbol-value (intern "*I386-CONS-BASE-OVERRIDE*" "MODUS.MVM")) #x08000000)   ; 128 MB
+  (setf (symbol-value (intern "*I386-GENERAL-BASE-OVERRIDE*" "MODUS.MVM")) #x10000000) ; 256 MB
+  (funcall (intern "INSTALL-I386-TRANSLATOR" "MODUS.MVM.I386"))
+  (setf (symbol-value (intern "*I386-LINUX-MODE*" "MODUS.MVM.I386")) nil)
+  (setf (symbol-value (intern "*I386-NATIVE-CODE-OFFSET*" "MODUS.MVM.I386")) 0)
+  (format t "~&;; CONSOLE: COM1 via port I/O (i386 QEMU-pc)~%"))
+
 ;;; DIVERGENCE 6/7 (:X64 arm) — the x86-64 boot descriptor and console.
 ;;; Verbatim from the retired standalone build-x64-cl-repl.lisp: the stack top
 ;;; moves to 512 MB (the 8 MB default sits inside a 60 MB image), data pages
@@ -2019,7 +2078,13 @@
 ;; because `read-char-serial' hardcoded PL011's UARTFR+0x18/RXFE-bit-4.  That
 ;; is FIXED (1e84418): the RX ready-poll is now parameterized via
 ;; *aarch64-serial-rx-poll*, exactly mirroring the TX side.
-(if cl-user::*cl-repl-x64-p*
+;; :I386 and :X64 both consume no console setup here — their serial is COM1
+;; port I/O emitted by their own translators.  :I386 has to be named
+;; EXPLICITLY: without it the cond fell through to the :RPI arm, which set a
+;; BCM2835 mini-UART base on an x86 image.  The build printed both
+;; "CONSOLE: COM1 via port I/O" and "CONSOLE: PL011 UART0 0x3F201000", which is
+;; how it was caught — two consoles for one image is always a fall-through.
+(if (or cl-user::*cl-repl-x64-p* cl-user::*cl-repl-i386-p*)
     nil
  (if cl-user::*cl-repl-virt-p*
     (format t "~&;; CONSOLE: PL011 via the fixpoint boot descriptor, VA 20000000 ~
@@ -2259,11 +2324,13 @@
 ;;; MODUS_CL_REPL_OUT overrides either one.
 (let ((image (build-image :target (cond (cl-user::*cl-repl-virt-p* :fixpoint)
                                         (cl-user::*cl-repl-x64-p* :x86-64)
+                                        (cl-user::*cl-repl-i386-p* :i386)
                                         (t :rpi))
                           :source-text cl-user::*full-source*)))
   (let ((path (or #+sbcl (sb-ext:posix-getenv "MODUS_CL_REPL_OUT")
                   (cond (cl-user::*cl-repl-virt-p* "/tmp/modus-aarch64-cl-repl.bin")
                         (cl-user::*cl-repl-x64-p* "/tmp/modus-x64-cl-repl.bin")
+                        (cl-user::*cl-repl-i386-p* "/tmp/modus-i386-cl-repl.bin")
                         (t "/tmp/piboot/kernel8.img")))))
     (ensure-directories-exist path)
     (with-open-file (out path :direction :output
@@ -2285,6 +2352,41 @@
     ;; the fixpoint page tables and by -m 512.  Two assert blocks, therefore.
     ;; ------------------------------------------------------------------
     (cond
+      ;; ---- i386 (QEMU pc, multiboot) ----------------------------------
+      ;; The bound here is not a guess: the FIRST i386 CL image built (37 MB at
+      ;; load address 1 MB, so 1..38 MB) had the default stack top at 4 MB and
+      ;; cons base at 8 MB, i.e. BOTH inside itself.  It printed its banner over
+      ;; COM1 and died before reaching the REPL.  That is a build-time fact and
+      ;; belongs in a build-time assert, not in a boot log.
+      (cl-user::*cl-repl-i386-p*
+       (let* ((image-bytes (length (kernel-image-image-bytes image)))
+              (load-addr   #x100000)
+              (image-end   (+ load-addr image-bytes))
+              (stack-top   (symbol-value (intern "*I386-STACK-TOP-OVERRIDE*" "MODUS.MVM")))
+              (cons-base   (symbol-value (intern "*I386-CONS-BASE-OVERRIDE*" "MODUS.MVM")))
+              (general     (symbol-value (intern "*I386-GENERAL-BASE-OVERRIDE*" "MODUS.MVM")))
+              (stack-top   (or stack-top #x400000))
+              (cons-base   (or cons-base #x800000))
+              (general     (or general  #x7800000)))
+         (format t "~&;; i386 map: image ~,1F MB (1 MB .. ~,1F MB), cons ~,1F MB, ~
+                   general ~,1F MB, stack top ~,1F MB~%"
+                 (/ image-bytes 1048576.0) (/ image-end 1048576.0)
+                 (/ cons-base 1048576.0) (/ general 1048576.0)
+                 (/ stack-top 1048576.0))
+         (when (< cons-base image-end)
+           (error "i386 layout: cons base ~:D is INSIDE the image (1 MB .. ~:D). ~
+                   The allocator would write over the running code.  Raise ~
+                   *I386-CONS-BASE-OVERRIDE*." cons-base image-end))
+         (when (< general cons-base)
+           (error "i386 layout: general heap ~:D is below cons base ~:D."
+                  general cons-base))
+         (when (< stack-top image-end)
+           (error "i386 layout: stack top ~:D is INSIDE the image (1 MB .. ~:D). ~
+                   Pushes would shred native code.  Raise ~
+                   *I386-STACK-TOP-OVERRIDE*." stack-top image-end))
+         (when (<= stack-top general)
+           (error "i386 layout: stack top ~:D is not above the general heap ~:D; ~
+                   the stack grows DOWN into it." stack-top general))))
       (cl-user::*cl-repl-x64-p* (%x64-memory-map-asserts image))
       (cl-user::*cl-repl-virt-p*
         ;; ---- QEMU virt (fixpoint MMU) ----------------------------------

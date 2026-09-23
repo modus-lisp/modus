@@ -2593,14 +2593,31 @@
 
           (#.+op-yield+ nil) ; preemption: no-op
 
+          ;; REAL memory and a REAL exchange -- see the MEM-READ-BYTE block
+          ;; above.  This arm was the last opcode still keying
+          ;; (MVM-MEMORY STATE), the per-STATE hash table task #272 removed
+          ;; from LOAD/STORE for manufacturing false passes, and here the
+          ;; false pass was worse than a lost write: %ATOMICS-ACQUIRE tests
+          ;; `(zerop (xchg-mem a 1))', an unwritten hash answers 0 forever,
+          ;; so EVERY thread took the lock and net/cooperative-atomics.lisp's
+          ;; spinlock excluded nothing at all.  It is evaluated at boot from a
+          ;; baked source string, so it runs HERE and not through a
+          ;; translator.
+          ;;
+          ;; XCHG-MEM, not a load and a store.  A load/store pair would fix
+          ;; the visibility and leave the operation non-atomic, which for a
+          ;; spinlock is the same bug wearing a better disguise: two threads
+          ;; both read 0 and both take it.  In the image this compiles to the
+          ;; primop (translate-x64 emits LOCK XCHG), because MVM-INTERPRET is
+          ;; itself compiled by the MVM compiler; on the bootstrapping host
+          ;; SBCL has no such function and no bootstrap path reaches this
+          ;; opcode.
           (#.+op-atomic-xchg+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vaddr npc2) (fetch-reg bc npc)
                (multiple-value-bind (vs npc3) (fetch-reg bc npc2)
-                 (let* ((addr (reg-get regs vaddr))
-                        (old (gethash addr (mvm-memory state) 0)))
-                   (reg-set regs vd old)
-                   (setf (gethash addr (mvm-memory state)) (reg-get regs vs)))
+                 (let ((old (xchg-mem (reg-get regs vaddr) (reg-get regs vs))))
+                   (reg-set regs vd old))
                  (setf pc npc3)))))
 
           ;; --- I/O and System ---

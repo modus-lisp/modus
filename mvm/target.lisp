@@ -307,11 +307,12 @@
    :name :68k
    :word-size 4
    :endianness :big
-   :reg-map #(:d0 :d1 :d2 :d3       ; V0-V3 (args, data regs)
-              :d4 :d5 :d6 :d7       ; V4-V7 (callee-saved)
+   ;; D0/D1 are reserved as the translator's scratch — see *68k-vreg-map*.
+   :reg-map #(:d2 :d3 :d4 :d5       ; V0-V3 (args, data regs)
+              :d6 :d7 nil nil       ; V4-V5 (callee-saved), V6-V7 spill
               nil nil nil nil         ; V8-V11 (spill)
               nil nil nil nil         ; V12-V15 (spill)
-              :d0                     ; VR (aliases V0)
+              :d2                     ; VR (aliases V0)
               :a2                     ; VA (address reg)
               :a3                     ; VL (address reg)
               :a4                     ; VN (address reg)
@@ -319,10 +320,10 @@
               :a6                     ; VFP (FP)
               nil)                    ; VPC
    :n-phys-regs 16  ; 8 data + 8 address
-   :callee-saved '(4 5 6 7)
+   :callee-saved '(4 5)
    :arg-regs '(0 1 2 3)
    :scratch-regs nil
-   :max-inline-regs 7
+   :max-inline-regs 6
    :page-size 4096
    :translate-fn nil
    :emit-prologue nil

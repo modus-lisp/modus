@@ -650,6 +650,50 @@
       (ppc-emit-std buf rs ra offset)
       (ppc-emit-stw buf rs ra offset)))
 
+;;; ============================================================
+;;; Convention slots (nargs / cenv / mv-count)
+;;; ============================================================
+;;;
+;;; Same shape as i386's absolute-slot block: the caller writes, the callee
+;;; reads, single-threaded cooperative execution makes that exactly as correct
+;;; as x64's spare physical registers.  The base differs per mode because the
+;;; two PPC targets load at different addresses -- ppc32 at 0 (cons space at
+;;; 16MB), ppc64 at 0x20000000 (stack top 0x20400000, cons at 0x24000000) --
+;;; so each base sits in mapped RAM clear of stack and heap.
+(defparameter *ppc-globals-base* #x00900000
+  "Base of the PPC absolute-address convention slot block; set per target by
+   install-ppc-translator / install-ppc32-translator.")
+
+(defparameter *ppc-mvcount-addr* modus.mvm::+mv-count-addr+
+  "Where :set-mv-count writes.
+
+   ppc64 uses the SHARED contract address (#x10000090) that compiler-emitted
+   mem-refs and shared CL source also read -- see the long note in
+   translate-i386.lisp about a target that relocates this slot and leaves the
+   one writer with zero readers.
+
+   ppc32 CANNOT: boot-ppc32.lisp maps only the low 64MB (its stack top is
+   0x03F00000, 'within 64MB RAM') and the e500's TLBs are software-managed, so
+   a store to 0x10000090 raises a data-storage exception -- measured, DEAR =
+   0x10000090.  It therefore gets a private slot, with the consequence stated
+   plainly: MULTIPLE-VALUE forms reading the shared literal will not see what
+   :set-mv-count wrote, so multiple values are not yet correct on ppc32.  The
+   real fix is a per-target +mv-count-addr+, which is a change to shared code.")
+
+(defun ppc-nargs-addr ()   (+ *ppc-globals-base* #x00))
+(defun ppc-cenv-addr ()    (+ *ppc-globals-base* #x10))
+(defun ppc-mvcount-addr () *ppc-mvcount-addr*)
+
+(defun ppc-emit-store-abs (buf src-reg addr)
+  "Store SRC-REG to absolute ADDR, using scratch2 to hold the address."
+  (ppc-emit-li buf +ppc-scratch2+ addr)
+  (ppc-emit-store-word buf src-reg +ppc-scratch2+ 0))
+
+(defun ppc-emit-load-abs (buf rt addr)
+  "Load from absolute ADDR into RT, using scratch2 to hold the address."
+  (ppc-emit-li buf +ppc-scratch2+ addr)
+  (ppc-emit-load-word buf rt +ppc-scratch2+ 0))
+
 (defun ppc-emit-cmp-word (buf ra rb)
   "Compare words (cmpd or cmpw depending on *ppc-64-bit*)."
   (if *ppc-64-bit*
@@ -994,7 +1038,16 @@
                  (ppc-store-vreg buf vd +ppc-scratch1+))))))
 
       ;;; --- Arithmetic ---
-      (#.+op-add+
+      ((#.+op-add+ #.+op-add-checked+)
+       ;; :ADD-CHECKED shares this clause.  The checked opcodes mean "tagged
+       ;; arithmetic that promotes to a bignum on overflow"; implementing the
+       ;; promotion needs the generic-arith slow path, which these back ends do
+       ;; not have yet.  Falling back to plain WRAPPING arithmetic is exactly
+       ;; what translate-x64 and translate-i386 do when a module has no
+       ;; generic-arith entry (see *i386-checked-arith-slowpath*), so this is
+       ;; the documented degrade rather than a new invention -- and it is a
+       ;; large step up from the previous behaviour, which was to trap.
+
        (let ((vd (first operands))
              (va (second operands))
              (vb (third operands)))
@@ -1005,7 +1058,16 @@
              (unless (ppc-vreg-phys vd)
                (ppc-store-vreg buf vd pd))))))
 
-      (#.+op-sub+
+      ((#.+op-sub+ #.+op-sub-checked+)
+       ;; :SUB-CHECKED shares this clause.  The checked opcodes mean "tagged
+       ;; arithmetic that promotes to a bignum on overflow"; implementing the
+       ;; promotion needs the generic-arith slow path, which these back ends do
+       ;; not have yet.  Falling back to plain WRAPPING arithmetic is exactly
+       ;; what translate-x64 and translate-i386 do when a module has no
+       ;; generic-arith entry (see *i386-checked-arith-slowpath*), so this is
+       ;; the documented degrade rather than a new invention -- and it is a
+       ;; large step up from the previous behaviour, which was to trap.
+
        (let ((vd (first operands))
              (va (second operands))
              (vb (third operands)))
@@ -1018,7 +1080,16 @@
              (unless (ppc-vreg-phys vd)
                (ppc-store-vreg buf vd pd))))))
 
-      (#.+op-mul+
+      ((#.+op-mul+ #.+op-mul-checked+)
+       ;; :MUL-CHECKED shares this clause.  The checked opcodes mean "tagged
+       ;; arithmetic that promotes to a bignum on overflow"; implementing the
+       ;; promotion needs the generic-arith slow path, which these back ends do
+       ;; not have yet.  Falling back to plain WRAPPING arithmetic is exactly
+       ;; what translate-x64 and translate-i386 do when a module has no
+       ;; generic-arith entry (see *i386-checked-arith-slowpath*), so this is
+       ;; the documented degrade rather than a new invention -- and it is a
+       ;; large step up from the previous behaviour, which was to trap.
+
        (let ((vd (first operands))
              (va (second operands))
              (vb (third operands)))
@@ -1688,6 +1759,40 @@
          (let ((ps (vreg-or-scratch vs +ppc-scratch1+)))
            (ppc-emit-store-word buf ps +ppc-r13+ offset))))
 
+      ;;; --- Calling-convention slots ---
+      ;; These fell into the OTHERWISE trap below.  :set-nargs precedes every
+      ;; call, so the first function call in any image executed `tw 31,0,0`.
+      ;; nargs is stored RAW; :get-nargs tags it (<<1) on the way out.
+      (#.+op-set-nargs+
+       (let ((n (logand (first operands) #xFF)))
+         (ppc-emit-li buf +ppc-scratch1+ n)
+         (ppc-emit-store-abs buf +ppc-scratch1+ (ppc-nargs-addr))))
+
+      (#.+op-get-nargs+
+       (let ((vd (first operands)))
+         (ppc-emit-load-abs buf +ppc-scratch1+ (ppc-nargs-addr))
+         (ppc-emit-addi buf +ppc-scratch2+ 0 1)
+         (ppc-emit-shift-left buf +ppc-scratch1+ +ppc-scratch1+ +ppc-scratch2+)
+         (ppc-store-vreg buf vd +ppc-scratch1+)))
+
+      (#.+op-set-cenv+
+       (let ((ps (vreg-or-scratch (first operands) +ppc-scratch1+)))
+         (ppc-emit-store-abs buf ps (ppc-cenv-addr))))
+
+      (#.+op-get-cenv+
+       (let ((vd (first operands)))
+         (ppc-emit-load-abs buf +ppc-scratch1+ (ppc-cenv-addr))
+         (ppc-store-vreg buf vd +ppc-scratch1+)))
+
+      (#.+op-set-mv-count+
+       ;; TAGGED, and at the SHARED contract address (#x10000090) that
+       ;; compiler-emitted mem-refs and shared CL source also read -- see the
+       ;; long note in translate-i386.lisp about what happens when a target
+       ;; relocates this slot and leaves the one writer with zero readers.
+       (let ((tagged (ash (first operands) 1)))
+         (ppc-emit-li buf +ppc-scratch1+ tagged)
+         (ppc-emit-store-abs buf +ppc-scratch1+ (ppc-mvcount-addr))))
+
       (otherwise
        ;; Unknown opcode: emit a trap
        (ppc-emit-tw buf 31 0 0)))))
@@ -1770,8 +1875,21 @@
     ;; Resolve label fixups
     (ppc-fixup-labels buf)
 
-    ;; Convert to byte vector
-    (ppc-buffer-to-bytes buf)))
+    ;; Report where each function actually LANDED.  Without this second
+    ;; value cross.lisp estimates a function's native offset proportionally
+    ;; from its bytecode offset — right only when there is one function, and
+    ;; mid-prologue otherwise.  Each function entry already has a label from
+    ;; the first pass; ppc-emit-label recorded its byte position.
+    (let ((fn-map (make-hash-table :test 'eql)))
+      (when function-table
+        (maphash (lambda (idx mvm-offset)
+                   (declare (ignore idx))
+                   (let* ((label (gethash mvm-offset label-map))
+                          (pos (and label (gethash label (ppc-buffer-labels buf)))))
+                     (when pos
+                       (setf (gethash mvm-offset fn-map) pos))))
+                 function-table))
+      (values (ppc-buffer-to-bytes buf) fn-map))))
 
 ;;; ============================================================
 ;;; Installer
@@ -1787,6 +1905,8 @@
 
 (defun install-ppc-translator ()
   "Install the PPC64 translator into the target descriptor."
+  (setf *ppc-globals-base* #x20900000    ; ppc64 loads at 0x20000000
+        *ppc-mvcount-addr* modus.mvm::+mv-count-addr+)
   (let ((target *target-ppc64*))
     (setf (target-translate-fn target)
           (lambda (bytecode function-table)
@@ -1803,6 +1923,10 @@
 
 (defun install-ppc32-translator ()
   "Install the PPC32 translator into the target descriptor."
+  ;; ppc32 loads at 0; cons space starts at 16MB, so 9MB is clear RAM.
+  ;; mv-count must stay inside the 64MB the boot TLBs map -- see its docstring.
+  (setf *ppc-globals-base* #x00900000
+        *ppc-mvcount-addr* (+ #x00900000 #x20))
   (let ((target *target-ppc32*))
     (setf (target-translate-fn target)
           (lambda (bytecode function-table)

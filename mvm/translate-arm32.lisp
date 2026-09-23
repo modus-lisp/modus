@@ -146,21 +146,81 @@
 ;;; Buffer stores instruction words; converted to LE bytes at end.
 
 (defstruct arm32-buffer
-  (code (make-array 262144))            ; fixed-size, position tracks fill
+  (code (make-array 262144))            ; initial capacity; arm32-emit doubles on overflow
   (labels (make-hash-table :test 'eql))
   (fixups nil)
   (div-label nil)    ; label ID for software divide routine
   (position 0))      ; current instruction index (word count)
 
 (defun arm32-emit (buf word)
-  "Emit a 32-bit ARM instruction."
-  (let ((pos (arm32-buffer-position buf)))
-    (setf (aref (arm32-buffer-code buf) pos) (logand word #xFFFFFFFF))
+  "Emit a 32-bit ARM instruction, doubling the code array on overflow.
+
+   The fixed 262144-entry array was not a budget, it was a cliff: the SSH
+   image overran it and the translator aborted mid-emit with `Invalid index
+   262144`, so the build produced a PARTIAL image (caught only because
+   check-compiler-warns refuses a degraded build).  Same fix class as
+   a64-emit's -- see its comment for the in-image stale-local GC hazard,
+   which does not apply here because this translator runs under SBCL."
+  (let ((pos (arm32-buffer-position buf))
+        (code (arm32-buffer-code buf)))
+    (when (>= pos (length code))
+      (let ((new (make-array (* 2 (length code)))))
+        (replace new code)
+        (setf (arm32-buffer-code buf) new)
+        (setf code new)))
+    (setf (aref code pos) (logand word #xFFFFFFFF))
     (setf (arm32-buffer-position buf) (+ pos 1))))
 
 (defun arm32-current-index (buf)
   "Current instruction index (word count)."
   (arm32-buffer-position buf))
+
+;;; ============================================================
+;;; Convention slots (nargs / cenv / mv-count)
+;;; ============================================================
+;;;
+;;; ARM32 did not implement :set-nargs / :get-nargs / :set-cenv / :get-cenv /
+;;; :set-mv-count at all.  It got away with it because this translator's
+;;; unknown-opcode case emitted a NOP -- so a missing opcode was not a
+;;; failure, it was SILENCE.  Simple direct calls survived (nothing reads
+;;; nargs), but anything using &optional/&rest, a closure environment, or
+;;; multiple values read a slot nobody had ever written.
+;;;
+;;; Same absolute-slot shape as i386/ppc/68k.  The base is per-variant because
+;;; the three ARM32 targets load at different addresses; R12 (IP) is the
+;;; translator scratch and is outside the vreg map, so it is safe here.
+(defparameter *arm32-globals-base* #x00600000
+  "Base of the ARM32 absolute-address convention slot block; set per variant
+   by install-arm32-translator / -armv7- / -armv7-rpi-.")
+(defparameter *arm32-mvcount-addr* modus.mvm::+mv-count-addr+
+  "Where :set-mv-count writes.  The SHARED contract address (#x10000090) when
+   that is mapped RAM -- true on raspi2b, whose RAM starts at 0 -- but QEMU's
+   `virt` board puts RAM at 0x40000000, where #x10000090 is not memory at all,
+   so the plain armv7 variant takes a private slot and, with it, the documented
+   consequence that multiple values are not yet correct there.")
+
+(defun arm32-nargs-addr ()   (+ *arm32-globals-base* #x00))
+(defun arm32-cenv-addr ()    (+ *arm32-globals-base* #x08))
+(defun arm32-mvcount-addr () *arm32-mvcount-addr*)
+
+(defun arm32-emit-store-abs (buf src-reg addr)
+  "Store SRC-REG to absolute ADDR.
+
+   LR holds the address, but LR is also the LINK REGISTER, so it is saved and
+   restored around the store.  Parking the address in LR bare cost recursion:
+   `(down (1- n))` returned into a slot address instead of its caller.  R12 is
+   the other scratch and is already carrying the value."
+  (arm32-str-pre buf +arm-lr+ +arm-sp+ -4)          ; push LR
+  (arm32-load-imm32 buf +arm-lr+ (logand addr #xFFFFFFFF))
+  (arm32-str buf src-reg +arm-lr+ 0)
+  (arm32-ldr-post buf +arm-lr+ +arm-sp+ 4))         ; pop LR
+
+(defun arm32-emit-load-abs (buf rd addr)
+  "Load from absolute ADDR into RD.  LR saved/restored — see the store above."
+  (arm32-str-pre buf +arm-lr+ +arm-sp+ -4)
+  (arm32-load-imm32 buf +arm-lr+ (logand addr #xFFFFFFFF))
+  (arm32-ldr buf rd +arm-lr+ 0)
+  (arm32-ldr-post buf +arm-lr+ +arm-sp+ 4))
 
 (defun arm32-emit-label (buf label-id)
   "Record that LABEL-ID is at the current code position."
@@ -1012,19 +1072,46 @@
 
         ;;; --- Arithmetic ---
 
-        (#.+op-add+
+        ((#.+op-add+ #.+op-add-checked+)
+         ;; :ADD-CHECKED shares this clause.  The checked opcodes mean "tagged
+         ;; arithmetic that promotes to a bignum on overflow"; implementing the
+         ;; promotion needs the generic-arith slow path, which these back ends do
+         ;; not have yet.  Falling back to plain WRAPPING arithmetic is exactly
+         ;; what translate-x64 and translate-i386 do when a module has no
+         ;; generic-arith entry (see *i386-checked-arith-slowpath*), so this is
+         ;; the documented degrade rather than a new invention -- and it is a
+         ;; large step up from the previous behaviour, which was to trap.
+
          (let ((vd (vreg 0)))
            (with-src2 (pa (vreg 1) +arm-r12+) (pb (vreg 2) +arm-lr+)
              (arm32-add buf +arm-r12+ pa pb)
              (arm32-store-vreg buf +arm-r12+ vd))))
 
-        (#.+op-sub+
+        ((#.+op-sub+ #.+op-sub-checked+)
+         ;; :SUB-CHECKED shares this clause.  The checked opcodes mean "tagged
+         ;; arithmetic that promotes to a bignum on overflow"; implementing the
+         ;; promotion needs the generic-arith slow path, which these back ends do
+         ;; not have yet.  Falling back to plain WRAPPING arithmetic is exactly
+         ;; what translate-x64 and translate-i386 do when a module has no
+         ;; generic-arith entry (see *i386-checked-arith-slowpath*), so this is
+         ;; the documented degrade rather than a new invention -- and it is a
+         ;; large step up from the previous behaviour, which was to trap.
+
          (let ((vd (vreg 0)))
            (with-src2 (pa (vreg 1) +arm-r12+) (pb (vreg 2) +arm-lr+)
              (arm32-sub buf +arm-r12+ pa pb)
              (arm32-store-vreg buf +arm-r12+ vd))))
 
-        (#.+op-mul+
+        ((#.+op-mul+ #.+op-mul-checked+)
+         ;; :MUL-CHECKED shares this clause.  The checked opcodes mean "tagged
+         ;; arithmetic that promotes to a bignum on overflow"; implementing the
+         ;; promotion needs the generic-arith slow path, which these back ends do
+         ;; not have yet.  Falling back to plain WRAPPING arithmetic is exactly
+         ;; what translate-x64 and translate-i386 do when a module has no
+         ;; generic-arith entry (see *i386-checked-arith-slowpath*), so this is
+         ;; the documented degrade rather than a new invention -- and it is a
+         ;; large step up from the previous behaviour, which was to trap.
+
          ;; Tagged: (a<<1) * (b<<1) = (a*b)<<2, need (a*b)<<1
          ;; So: untag one, multiply, result is correctly tagged
          ;; ASR r12, Pa, #1 ; MUL rd, r12, Pb
@@ -1715,8 +1802,52 @@
            ;; Store result
            (arm32-store-vreg buf +arm-r12+ vd)))
 
+        ;;; --- Calling-convention slots ---
+        ;; nargs is stored RAW; :get-nargs tags it (<<1) on the way out.
+        (#.+op-set-nargs+
+         (let ((n (logand (vreg 0) #xFF)))
+           (arm32-load-imm32 buf +arm-r12+ n)
+           (arm32-emit-store-abs buf +arm-r12+ (arm32-nargs-addr))))
+
+        (#.+op-get-nargs+
+         (let* ((vd (vreg 0))
+                (pd (or (arm32-phys-reg vd) +arm-r12+)))
+           (arm32-emit-load-abs buf pd (arm32-nargs-addr))
+           (arm32-lsl-imm buf pd pd 1)          ; tag as fixnum
+           (unless (arm32-phys-reg vd)
+             (arm32-str buf +arm-r12+ +arm-r11+ (arm32-spill-offset vd)))))
+
+        (#.+op-set-cenv+
+         (let* ((vs (vreg 0))
+                (ps (arm32-phys-reg vs)))
+           (unless ps
+             (arm32-ldr buf +arm-r12+ +arm-r11+ (arm32-spill-offset vs))
+             (setf ps +arm-r12+))
+           (arm32-emit-store-abs buf ps (arm32-cenv-addr))))
+
+        (#.+op-get-cenv+
+         (let* ((vd (vreg 0))
+                (pd (or (arm32-phys-reg vd) +arm-r12+)))
+           (arm32-emit-load-abs buf pd (arm32-cenv-addr))
+           (unless (arm32-phys-reg vd)
+             (arm32-str buf +arm-r12+ +arm-r11+ (arm32-spill-offset vd)))))
+
+        (#.+op-set-mv-count+
+         (let ((tagged (ash (vreg 0) 1)))
+           (arm32-load-imm32 buf +arm-r12+ tagged)
+           (arm32-emit-store-abs buf +arm-r12+ (arm32-mvcount-addr))))
+
         (otherwise
-         ;; Unknown opcode: emit NOP
+         ;; Unknown opcode: emit NOP.
+         ;;
+         ;; THIS IS A SILENT FAILURE and should become a trap.  Every other
+         ;; translator makes an unimplemented opcode loud -- riscv emits
+         ;; `li a7,<opcode>; ebreak`, ppc a `tw`, 68k an ILLEGAL -- so a gap
+         ;; shows up as a stopped machine with the opcode in a register.  Here
+         ;; it shows up as nothing, which is why the five convention opcodes
+         ;; above went missing for so long without anyone noticing.  Changing
+         ;; it is a behaviour change for the existing REPL/SSH images, so it
+         ;; wants its own gated step rather than riding along with this one.
          (arm32-nop buf))))))
 
 ;;; ============================================================
@@ -1817,6 +1948,8 @@
 
 (defun install-arm32-translator ()
   "Install the ARM32 (ARMv5) translator into the target descriptor."
+  (setf *arm32-globals-base* #x00600000
+        *arm32-mvcount-addr* modus.mvm::+mv-count-addr+)
   (let ((target *target-arm32*))
     (setf (target-translate-fn target) #'translate-mvm-to-arm32)
     (setf (target-emit-prologue target)
@@ -1831,6 +1964,8 @@
 
 (defun install-armv7-translator ()
   "Install the ARMv7-A translator into the target descriptor."
+  (setf *arm32-globals-base* #x40600000
+        *arm32-mvcount-addr* (+ #x40600000 #x20))
   (let ((target *target-armv7*))
     (setf (target-translate-fn target)
           (lambda (bytecode function-table)
@@ -1847,6 +1982,8 @@
 
 (defun install-armv7-rpi-translator ()
   "Install the ARMv7-A RPi translator (PL011 UART at 0x3F201000)."
+  (setf *arm32-globals-base* #x00600000
+        *arm32-mvcount-addr* modus.mvm::+mv-count-addr+)
   (let ((target *target-armv7-rpi*))
     (setf (target-translate-fn target)
           (lambda (bytecode function-table)

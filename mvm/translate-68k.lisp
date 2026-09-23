@@ -78,17 +78,23 @@
   number) ; 0-7
 
 (defparameter *68k-vreg-map*
-  (vector (make-m68k-reg :type :data :number +68k-d0+)     ; V0
-          (make-m68k-reg :type :data :number +68k-d1+)     ; V1
-          (make-m68k-reg :type :data :number +68k-d2+)     ; V2
-          (make-m68k-reg :type :data :number +68k-d3+)     ; V3
-          (make-m68k-reg :type :data :number +68k-d4+)     ; V4
-          (make-m68k-reg :type :data :number +68k-d5+)     ; V5
-          (make-m68k-reg :type :data :number +68k-d6+)     ; V6
-          (make-m68k-reg :type :data :number +68k-d7+)     ; V7
+  ;; D0 and D1 are the TRANSLATOR'S SCRATCH and must not also be allocatable.
+  ;; They used to be V0/V1, and ~200 emit sites load a vreg into D0 to work on
+  ;; it -- so any op touching a vreg clobbered V0 while it was live.  The
+  ;; visible symptom: `(setf (mem-ref addr :u8) v)` stored (addr >> 2) instead
+  ;; of v, because the address untag ran through D0 after the value had been
+  ;; placed there.  Sliding the window to D2..D7 makes every existing scratch
+  ;; use correct at once, at the cost of two inline vregs (V6/V7 now spill).
+  (vector (make-m68k-reg :type :data :number +68k-d2+)     ; V0
+          (make-m68k-reg :type :data :number +68k-d3+)     ; V1
+          (make-m68k-reg :type :data :number +68k-d4+)     ; V2
+          (make-m68k-reg :type :data :number +68k-d5+)     ; V3
+          (make-m68k-reg :type :data :number +68k-d6+)     ; V4
+          (make-m68k-reg :type :data :number +68k-d7+)     ; V5
+          nil nil           ; V6-V7 (spill -- D0/D1 are reserved scratch)
           nil nil nil nil   ; V8-V11 (spill)
           nil nil nil nil   ; V12-V15 (spill)
-          (make-m68k-reg :type :data :number +68k-d0+)     ; VR (aliases V0)
+          (make-m68k-reg :type :data :number +68k-d2+)     ; VR (aliases V0)
           (make-m68k-reg :type :address :number +68k-a2+)  ; VA
           (make-m68k-reg :type :address :number +68k-a3+)  ; VL
           (make-m68k-reg :type :address :number +68k-a4+)  ; VN
@@ -548,6 +554,36 @@
 
 ;;; --- Shifts ---
 
+;;; ============================================================
+;;; Convention slots (nargs / cenv / mv-count)
+;;; ============================================================
+;;;
+;;; Same absolute-slot shape as i386: the caller writes, the callee reads.
+;;; The block sits at 6MB -- above the image (loaded at 64KB) and below the
+;;; downward stack (top 8MB), so it is clear of both stack and heap (cons at
+;;; 9MB, general at 10MB).  A1 carries the address; D0/D1 are the reserved
+;;; translator scratch (see *68k-vreg-map*).
+(defparameter *68k-globals-base* #x00600000
+  "Base of the 68k absolute-address convention slot block.")
+(defun m68k-nargs-addr ()   (+ *68k-globals-base* #x00))
+(defun m68k-cenv-addr ()    (+ *68k-globals-base* #x08))
+;;; SHARED contract address, as on x64/aarch64/i386/ppc64: compiler-emitted
+;;; mem-refs and shared CL source read #x10000090 directly.  It is 256MB in,
+;;; so the 68k images must be run with at least that much RAM -- the harness
+;;; passes -m 512.  Unlike RISC-V (where it lands in UART MMIO) and ppc32
+;;; (outside the mapped TLBs), on m68k virt it is ordinary RAM.
+(defun m68k-mvcount-addr () modus.mvm::+mv-count-addr+)
+
+(defun m68k-emit-store-abs (buf dn addr)
+  "Store data register DN to absolute ADDR (address parked in A1)."
+  (m68k-emit-move-imm-an buf addr +68k-a1+)
+  (m68k-emit-move-dn-an-ind buf dn +68k-a1+))
+
+(defun m68k-emit-load-abs (buf dn addr)
+  "Load from absolute ADDR into data register DN (address parked in A1)."
+  (m68k-emit-move-imm-an buf addr +68k-a1+)
+  (m68k-emit-move-an-ind-dn buf +68k-a1+ dn))
+
 (defun m68k-emit-lsl-imm (buf dn count)
   "LSL.L #count, Dn (logical shift left)"
   ;; Format: 1110 count(3) 1 10 i/r=0 01 reg
@@ -868,10 +904,15 @@
    First slots are for saving callee-saved regs.")
 
 (defun m68k-spill-offset (vreg)
-  "Calculate the A6-relative offset for a spilled virtual register."
+  "Calculate the A6-relative offset for a spilled virtual register.
+
+   V6 and V7 spill now too: D0/D1 are reserved as the translator's scratch
+   (see *68k-vreg-map*), which cost two inline registers.  Slots are laid out
+   by vreg index from V6, so V8..V15 keep moving down as before, two slots
+   further along -- the frame reserves room for all of them."
   (cond
-    ((and (>= vreg 8) (<= vreg 15))
-     (+ +68k-spill-base-offset+ (* (- vreg 8) -4)))
+    ((and (>= vreg 6) (<= vreg 15))
+     (+ +68k-spill-base-offset+ (* (- vreg 6) -4)))
     (t (error "68k: unexpected spill for vreg ~D" vreg))))
 
 (defun m68k-vreg-phys (vreg)
@@ -1134,7 +1175,16 @@
               (m68k-store-vreg buf vd +68k-d0+))))))
 
       ;;; --- Arithmetic ---
-      (#.+op-add+
+      ((#.+op-add+ #.+op-add-checked+)
+       ;; :ADD-CHECKED shares this clause.  The checked opcodes mean "tagged
+       ;; arithmetic that promotes to a bignum on overflow"; implementing the
+       ;; promotion needs the generic-arith slow path, which these back ends do
+       ;; not have yet.  Falling back to plain WRAPPING arithmetic is exactly
+       ;; what translate-x64 and translate-i386 do when a module has no
+       ;; generic-arith entry (see *i386-checked-arith-slowpath*), so this is
+       ;; the documented degrade rather than a new invention -- and it is a
+       ;; large step up from the previous behaviour, which was to trap.
+
        (let ((vd (first operands))
              (va (second operands))
              (vb (third operands)))
@@ -1146,7 +1196,16 @@
            (m68k-emit-add-dn-dn buf db +68k-d0+)
            (m68k-store-vreg buf vd +68k-d0+))))
 
-      (#.+op-sub+
+      ((#.+op-sub+ #.+op-sub-checked+)
+       ;; :SUB-CHECKED shares this clause.  The checked opcodes mean "tagged
+       ;; arithmetic that promotes to a bignum on overflow"; implementing the
+       ;; promotion needs the generic-arith slow path, which these back ends do
+       ;; not have yet.  Falling back to plain WRAPPING arithmetic is exactly
+       ;; what translate-x64 and translate-i386 do when a module has no
+       ;; generic-arith entry (see *i386-checked-arith-slowpath*), so this is
+       ;; the documented degrade rather than a new invention -- and it is a
+       ;; large step up from the previous behaviour, which was to trap.
+
        (let ((vd (first operands))
              (va (second operands))
              (vb (third operands)))
@@ -1157,7 +1216,16 @@
              (m68k-emit-sub-dn-dn buf db +68k-d0+)
              (m68k-store-vreg buf vd +68k-d0+)))))
 
-      (#.+op-mul+
+      ((#.+op-mul+ #.+op-mul-checked+)
+       ;; :MUL-CHECKED shares this clause.  The checked opcodes mean "tagged
+       ;; arithmetic that promotes to a bignum on overflow"; implementing the
+       ;; promotion needs the generic-arith slow path, which these back ends do
+       ;; not have yet.  Falling back to plain WRAPPING arithmetic is exactly
+       ;; what translate-x64 and translate-i386 do when a module has no
+       ;; generic-arith entry (see *i386-checked-arith-slowpath*), so this is
+       ;; the documented degrade rather than a new invention -- and it is a
+       ;; large step up from the previous behaviour, which was to trap.
+
        (let ((vd (first operands))
              (va (second operands))
              (vb (third operands)))
@@ -1848,6 +1916,37 @@
          (m68k-load-vreg buf +68k-d0+ vs)
          (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a0+)))
 
+      ;;; --- Calling-convention slots ---
+      ;; These fell into the OTHERWISE branch below, which emits ILLEGAL.
+      ;; :set-nargs precedes every call, so the first call in any image
+      ;; executed an illegal instruction.
+      ;; nargs is stored RAW; :get-nargs tags it (<<1) on the way out.
+      (#.+op-set-nargs+
+       (let ((n (logand (first operands) #xFF)))
+         (m68k-emit-move-imm-dn buf n +68k-d0+)
+         (m68k-emit-store-abs buf +68k-d0+ (m68k-nargs-addr))))
+
+      (#.+op-get-nargs+
+       (let ((vd (first operands)))
+         (m68k-emit-load-abs buf +68k-d0+ (m68k-nargs-addr))
+         (m68k-emit-lsl-imm buf +68k-d0+ 1)     ; tag as fixnum
+         (m68k-store-vreg buf vd +68k-d0+)))
+
+      (#.+op-set-cenv+
+       (let ((vs (first operands)))
+         (m68k-load-vreg buf +68k-d0+ vs)
+         (m68k-emit-store-abs buf +68k-d0+ (m68k-cenv-addr))))
+
+      (#.+op-get-cenv+
+       (let ((vd (first operands)))
+         (m68k-emit-load-abs buf +68k-d0+ (m68k-cenv-addr))
+         (m68k-store-vreg buf vd +68k-d0+)))
+
+      (#.+op-set-mv-count+
+       (let ((tagged (ash (first operands) 1)))
+         (m68k-emit-move-imm-dn buf tagged +68k-d0+)
+         (m68k-emit-store-abs buf +68k-d0+ (m68k-mvcount-addr))))
+
       (otherwise
        ;; Unknown opcode: ILLEGAL
        (m68k-emit-illegal buf)))))
@@ -1922,8 +2021,19 @@
     ;; Resolve labels
     (m68k-fixup-labels buf)
 
-    ;; Convert to byte vector
-    (m68k-buffer-to-bytes buf)))
+    ;; Report where each function actually LANDED — see the same change in
+    ;; translate-ppc.lisp.  Without it cross.lisp guesses proportionally and
+    ;; the entry jump lands mid-prologue as soon as there are two functions.
+    (let ((fn-map (make-hash-table :test 'eql)))
+      (when function-table
+        (maphash (lambda (idx mvm-offset)
+                   (declare (ignore idx))
+                   (let* ((label (gethash mvm-offset label-map))
+                          (pos (and label (gethash label (m68k-buffer-labels buf)))))
+                     (when pos
+                       (setf (gethash mvm-offset fn-map) pos))))
+                 function-table))
+      (values (m68k-buffer-to-bytes buf) fn-map))))
 
 ;;; ============================================================
 ;;; Installer

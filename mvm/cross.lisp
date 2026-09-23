@@ -1028,7 +1028,53 @@
               ;; and patched after translation in the block above).
               ;; jmp-size stays 0 — native-image-offset = boot-code-length.
               ((and (member arch '(:aarch64 :rpi)) aarch64-unified-p)
-               nil))))
+               nil)
+              ;; RISC-V / PPC / 68k had NO entry jump at all.  The boot stub
+              ;; fell straight through into whichever function the module
+              ;; happened to emit FIRST, which is kernel-main only when
+              ;; kernel-main is the only function -- with a second defun ahead
+              ;; of it the image quietly ran the wrong code and then off the
+              ;; end.  (That is why a one-function probe reached its stores on
+              ;; ppc32 and a two-function one did not.)  Each arch gets the
+              ;; same single PC-relative branch x86 and ARM already had.
+              ((eq arch :riscv64)
+               ;; JAL x0, imm  (J-type, opcode 0x6F, rd=0).  The immediate is
+               ;; scrambled: imm[20|10:1|11|19:12].  Target = PC + offset, and
+               ;; native code starts 4 bytes past this instruction.
+               (let* ((off (+ entry-native-offset 4))
+                      (insn (logior #x6F
+                                    (ash (logand (ash off -12) #xFF) 12)
+                                    (ash (logand (ash off -11) #x1) 20)
+                                    (ash (logand (ash off -1) #x3FF) 21)
+                                    (ash (logand (ash off -20) #x1) 31))))
+                 (mvm-emit-byte final-buf (logand insn #xFF))
+                 (mvm-emit-byte final-buf (logand (ash insn -8) #xFF))
+                 (mvm-emit-byte final-buf (logand (ash insn -16) #xFF))
+                 (mvm-emit-byte final-buf (logand (ash insn -24) #xFF))
+                 (setq jmp-size 4)))
+              ((member arch '(:ppc64 :ppc32))
+               ;; b target  (I-form, opcode 18, AA=0, LK=0): the 24-bit LI
+               ;; field is the word-aligned displacement from THIS
+               ;; instruction.  Big-endian, so the bytes go out high first.
+               (let* ((off (+ entry-native-offset 4))
+                      (insn (logior #x48000000 (logand off #x03FFFFFC))))
+                 (mvm-emit-byte final-buf (logand (ash insn -24) #xFF))
+                 (mvm-emit-byte final-buf (logand (ash insn -16) #xFF))
+                 (mvm-emit-byte final-buf (logand (ash insn -8) #xFF))
+                 (mvm-emit-byte final-buf (logand insn #xFF))
+                 (setq jmp-size 4)))
+              ((eq arch :68k)
+               ;; BRA.L (0x60FF + 32-bit displacement, 68020+/ColdFire).
+               ;; The displacement is measured from the EXTENSION WORD at
+               ;; +2, and native code starts at +6, so it is offset + 4.
+               (let ((disp (+ entry-native-offset 4)))
+                 (mvm-emit-byte final-buf #x60)
+                 (mvm-emit-byte final-buf #xFF)
+                 (mvm-emit-byte final-buf (logand (ash disp -24) #xFF))
+                 (mvm-emit-byte final-buf (logand (ash disp -16) #xFF))
+                 (mvm-emit-byte final-buf (logand (ash disp -8) #xFF))
+                 (mvm-emit-byte final-buf (logand disp #xFF))
+                 (setq jmp-size 6))))))
         ;; Native code
         (let ((code-offset (mvm-buffer-position final-buf)))
           (setf (kernel-image-native-image-offset image) code-offset)

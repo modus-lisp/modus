@@ -466,28 +466,77 @@
        (when (/= lo12-sext 0)
          (rv-emit-addi buf rd rd (logand lo12-sext #xFFF)))))
 
-    ;; Case 3: full 64-bit immediate - build in stages
+    ;; Case 3: full 64-bit immediate — shift-and-add, no scratch register.
+    ;;
+    ;; TWO BUGS LIVED IN THE OLD `lui scratch,hi20; add rd,rd,scratch` form:
+    ;;
+    ;;   1. The scratch was hard-coded to t0, and every caller of this path
+    ;;      passes t0 AS RD -- so the LUI destroyed the high half that had just
+    ;;      been shifted into place, leaving twice the low half.
+    ;;   2. LUI SIGN-EXTENDS on RV64.  Any low half with bit 31 set (which is
+    ;;      every virt DRAM address, since DRAM starts at 0x80000000) came out
+    ;;      as 0xFFFFFFFF_8......, so the store faulted on a nonsense address.
+    ;;
+    ;; Building the value as one signed-32 head plus three NON-NEGATIVE
+    ;; sub-2048 ADDI chunks avoids both: ADDI's immediate is never negative
+    ;; here, so nothing sign-extends, and RD is the only register touched.
+    ;; Fixed six instructions, so the two-pass size measurement stays stable.
     (t
      (let* ((val (if (minusp imm64) (logand imm64 #xFFFFFFFFFFFFFFFF) imm64))
-            ;; Split into chunks working from the top
             (hi32 (logand (ash val -32) #xFFFFFFFF))
-            (lo32 (logand val #xFFFFFFFF)))
-       ;; Load upper 32 bits
+            (lo32 (logand val #xFFFFFFFF))
+            (c-a (logand (ash lo32 -21) #x7FF))   ; bits 31..21  (11 bits)
+            (c-b (logand (ash lo32 -10) #x7FF))   ; bits 20..10  (11 bits)
+            (c-c (logand lo32 #x3FF)))            ; bits  9..0   (10 bits)
+       ;; Upper 32 bits via the signed-32 path (recursion terminates: case 2).
        (rv-emit-li buf rd (if (logbitp 31 hi32)
                               (- hi32 #x100000000)
                               hi32))
-       ;; Shift left by 32
-       (rv-emit-slli buf rd rd 32)
-       ;; Add lower 32 bits: split into lui-range + addi-range
-       (let* ((lo12 (logand lo32 #xFFF))
-              (lo12-sext (if (>= lo12 #x800) (- lo12 #x1000) lo12))
-              (hi20 (logand (ash (- lo32 (logand lo12-sext #xFFFFFFFF)) -12) #xFFFFF)))
-         (when (/= hi20 0)
-           ;; Load hi20 into scratch, shift left 12, add
-           (rv-emit-lui buf +rv-t0+ hi20)
-           (rv-emit-add buf rd rd +rv-t0+))
-         (when (/= lo12-sext 0)
-           (rv-emit-addi buf rd rd (logand lo12-sext #xFFF))))))))
+       (rv-emit-slli buf rd rd 11)
+       (rv-emit-addi buf rd rd c-a)
+       (rv-emit-slli buf rd rd 11)
+       (rv-emit-addi buf rd rd c-b)
+       (rv-emit-slli buf rd rd 10)
+       (rv-emit-addi buf rd rd c-c)))))
+
+;;; ============================================================
+;;; Convention slots (nargs / cenv / mv-count)
+;;; ============================================================
+;;;
+;;; x64 and aarch64 keep these in spare PHYSICAL registers.  RISC-V has spare
+;;; registers too, but the i386 translator already established the portable
+;;; shape -- fixed absolute slots written by the caller and read by the callee
+;;; -- and single-threaded cooperative execution makes a memory slot exactly as
+;;; correct as a register.  Mirroring i386 keeps one contract to reason about.
+;;;
+;;; Placed at 0x80700000: inside virt's DRAM, above the page tables
+;;; (0x80500000) and well below wired memory (0x82000000), so it collides with
+;;; neither the downward stack (top 0x80400000) nor the heap.
+(defparameter *rv-globals-base* #x80700000
+  "Base of the RISC-V absolute-address convention slot block.")
+(defparameter *rv-nargs-addr* (+ #x80700000 #x00))
+(defparameter *rv-cenv-addr*  (+ #x80700000 #x08))
+;;; MV-COUNT DIVERGES FROM THE SHARED CONTRACT ADDRESS, AND MUST.
+;;; modus.mvm::+mv-count-addr+ is #x10000090, baked into compiler-emitted
+;;; mem-refs and into shared CL source.  On QEMU virt that address is not RAM
+;;; at all -- it is INSIDE the NS16550 UART's MMIO window at 0x10000000 -- so
+;;; honouring the shared address would turn every epilogue's "I returned one
+;;; value" reset into a UART register write.  A private slot is therefore the
+;;; only safe choice here, with the consequence stated plainly: MULTIPLE-VALUE
+;;; forms that read the shared literal will NOT see what :set-mv-count wrote,
+;;; so multiple values are not yet correct on RISC-V.  Fixing that properly
+;;; means making +mv-count-addr+ per-target, which is a change to shared code.
+(defparameter *rv-mvcount-addr* (+ #x80700000 #x10))
+
+(defun rv-emit-store-abs (buf src-reg addr)
+  "Store the 64-bit SRC-REG to absolute ADDR (via t1, so t0 stays free)."
+  (rv-emit-li buf +rv-t1+ addr)
+  (rv-emit-sd buf src-reg +rv-t1+ 0))
+
+(defun rv-emit-load-abs (buf rd addr)
+  "Load 64 bits from absolute ADDR into RD (via t1)."
+  (rv-emit-li buf +rv-t1+ addr)
+  (rv-emit-ld buf rd +rv-t1+ 0))
 
 (defun rv-emit-j (buf offset)
   "J offset (unconditional jump, jal x0, offset)"
@@ -660,21 +709,48 @@
 
       ;; ---- Arithmetic (tagged fixnums: value << 1 | 0) ----
       ;; For add/sub the tag bits cancel out: (a<<1) + (b<<1) = (a+b)<<1
-      (#.+op-add+
+      ((#.+op-add+ #.+op-add-checked+)
+       ;; :ADD-CHECKED shares this clause.  The checked opcodes mean "tagged
+       ;; arithmetic that promotes to a bignum on overflow"; implementing the
+       ;; promotion needs the generic-arith slow path, which these back ends do
+       ;; not have yet.  Falling back to plain WRAPPING arithmetic is exactly
+       ;; what translate-x64 and translate-i386 do when a module has no
+       ;; generic-arith entry (see *i386-checked-arith-slowpath*), so this is
+       ;; the documented degrade rather than a new invention -- and it is a
+       ;; large step up from the previous behaviour, which was to trap.
+
        (let* ((vd (vreg 0))
               (ra (resolve (vreg 1)))
               (rb (resolve2 (vreg 2))))
          (rv-emit-add buf +rv-t0+ ra rb)
          (store-result vd +rv-t0+)))
 
-      (#.+op-sub+
+      ((#.+op-sub+ #.+op-sub-checked+)
+       ;; :SUB-CHECKED shares this clause.  The checked opcodes mean "tagged
+       ;; arithmetic that promotes to a bignum on overflow"; implementing the
+       ;; promotion needs the generic-arith slow path, which these back ends do
+       ;; not have yet.  Falling back to plain WRAPPING arithmetic is exactly
+       ;; what translate-x64 and translate-i386 do when a module has no
+       ;; generic-arith entry (see *i386-checked-arith-slowpath*), so this is
+       ;; the documented degrade rather than a new invention -- and it is a
+       ;; large step up from the previous behaviour, which was to trap.
+
        (let* ((vd (vreg 0))
               (ra (resolve (vreg 1)))
               (rb (resolve2 (vreg 2))))
          (rv-emit-sub buf +rv-t0+ ra rb)
          (store-result vd +rv-t0+)))
 
-      (#.+op-mul+
+      ((#.+op-mul+ #.+op-mul-checked+)
+       ;; :MUL-CHECKED shares this clause.  The checked opcodes mean "tagged
+       ;; arithmetic that promotes to a bignum on overflow"; implementing the
+       ;; promotion needs the generic-arith slow path, which these back ends do
+       ;; not have yet.  Falling back to plain WRAPPING arithmetic is exactly
+       ;; what translate-x64 and translate-i386 do when a module has no
+       ;; generic-arith entry (see *i386-checked-arith-slowpath*), so this is
+       ;; the documented degrade rather than a new invention -- and it is a
+       ;; large step up from the previous behaviour, which was to trap.
+
        ;; Tagged multiply: untag one operand first.
        ;; (a<<1) * (b>>1) = a*b << 1 (preserves single tag bit)
        (let* ((vd (vreg 0))
@@ -1260,6 +1336,41 @@
                (rv-emit-add buf +rv-t0+ +rv-tp+ +rv-t0+)
                (rv-emit-sd buf rs +rv-t0+ 0)))))
 
+      ;; ---- Calling-convention slots ----
+      ;; These used to fall into the OTHERWISE trap below, which emits
+      ;; `li a7,<opcode>; ebreak`.  :set-nargs is emitted before EVERY call,
+      ;; so the first function call in any image trapped -- that is why an
+      ;; arithmetic-only probe ran and a two-function one did not.
+
+      ;; nargs is stored RAW (untagged); :get-nargs tags it on the way out so
+      ;; the tagged IR world can compare it against :li values.  Same
+      ;; convention as i386.
+      (#.+op-set-nargs+
+       (let ((n (logand (vreg 0) #xFF)))
+         (rv-emit-li buf +rv-t2+ n)
+         (rv-emit-store-abs buf +rv-t2+ *rv-nargs-addr*)))
+
+      (#.+op-get-nargs+
+       (let ((vd (vreg 0)))
+         (rv-emit-load-abs buf +rv-t0+ *rv-nargs-addr*)
+         (rv-emit-slli buf +rv-t0+ +rv-t0+ 1)   ; tag as fixnum
+         (store-result vd +rv-t0+)))
+
+      (#.+op-set-cenv+
+       (let ((rs (resolve (vreg 0) +rv-t2+)))
+         (rv-emit-store-abs buf rs *rv-cenv-addr*)))
+
+      (#.+op-get-cenv+
+       (let ((vd (vreg 0)))
+         (rv-emit-load-abs buf +rv-t0+ *rv-cenv-addr*)
+         (store-result vd +rv-t0+)))
+
+      (#.+op-set-mv-count+
+       ;; The count is stored TAGGED (<<1), matching i386/x64.
+       (let ((tagged (ash (vreg 0) 1)))
+         (rv-emit-li buf +rv-t2+ tagged)
+         (rv-emit-store-abs buf +rv-t2+ *rv-mvcount-addr*)))
+
       ;; ---- Unknown opcode ----
       (otherwise
        ;; Emit trap for unrecognized instruction
@@ -1382,7 +1493,24 @@
           (translate-mvm-insn-riscv final-buf opcode operands next-pc
                                     :label-map label-map
                                     :function-table native-fn-table)))
-      final-buf)))
+      (setf (gethash mvm-len label-map) (rv-current-offset final-buf))
+      ;; Re-derive the function map from PASS 2's positions and RETURN it.
+      ;; This map was already being built (from pass 1) and then dropped on
+      ;; the floor: the second value was never returned, so cross.lisp fell
+      ;; into its proportional-estimate branch and GUESSED each function's
+      ;; native offset from its bytecode offset.  With one function the guess
+      ;; is 0 and happens to be right; with two it lands mid-prologue and the
+      ;; image executes garbage.  Keyed by bytecode offset, which is the form
+      ;; cross.lisp looks up second (the aarch64 shape).
+      (let ((fn-map (make-hash-table :test 'eql)))
+        (when function-table
+          (maphash (lambda (idx mvm-offset)
+                     (declare (ignore idx))
+                     (let ((native-offset (gethash mvm-offset label-map)))
+                       (when native-offset
+                         (setf (gethash mvm-offset fn-map) native-offset))))
+                   function-table))
+        (values final-buf fn-map)))))
 
 ;;; ============================================================
 ;;; Target Descriptor Installation

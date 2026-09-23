@@ -17198,14 +17198,26 @@
     ((null (cdr args))
      (compile-form `(let ((%tv ,(car args)))
                       (cond
-                        ((integerp %tv) %tv)
+                        ;; CLHS: TRUNCATE always returns TWO values, and an
+                        ;; integer's remainder is 0.  Returning the integer
+                        ;; alone left MV-COUNT at 1, so
+                        ;; (multiple-value-list (truncate 100)) was (100)
+                        ;; where it must be (100 0).
+                        ((integerp %tv) (values %tv 0))
                         ;; Float / ratio: q toward zero, remainder = n - q
                         ;; (CLHS returns 2 values).  %trunc1-generic
                         ;; produces the FLOAT remainder for IEEE floats so
                         ;; (multiple-value-list (truncate 5.5)) → (5 0.5).
                         ((%ieee-float-p %tv) (%trunc1-generic %tv))
+                        ;; A RATIO'S REMAINDER IS A RATIO.  Truncating
+                        ;; numerator by denominator gives the right QUOTIENT
+                        ;; and an INTEGER remainder belonging to that division,
+                        ;; not to this one: (truncate 79/10) answered (7 9)
+                        ;; where CLHS wants (7 9/10).  The remainder is what is
+                        ;; left of the original number.
                         ((ratiop %tv)
-                         (truncate (aref %tv 0) (aref %tv 1)))
+                         (let ((%tq (truncate (aref %tv 0) (aref %tv 1))))
+                           (values %tq (- %tv %tq))))
                         (t (float-truncate-to-integer %tv))))
                     env dest))
     ;; 2-arg form: (truncate a b) → quotient q = a÷b toward zero plus
@@ -17330,13 +17342,37 @@
             (free-temp-reg)
             (free-temp-reg)
             (free-temp-reg)))
-        (let ((n-temp    (alloc-temp-reg))
+        (let ((save-count (min *temp-reg-counter* 12))
+              (n-temp    (alloc-temp-reg))
               (d-temp    (alloc-temp-reg))
               (q-temp    (alloc-temp-reg))
               (r-temp    (alloc-temp-reg))
               (addr-temp (alloc-temp-reg)))
           (compile-form a env n-temp)
           (compile-form b env d-temp)
+          ;; SAVE THE CALLER'S LIVE TEMPS, not just our own.  :DIV and :MOD
+          ;; clobber physical RAX/RDX/RCX (IDIV's fixed registers), and the
+          ;; two pushes below protect only the three vregs this function
+          ;; allocated -- ANY OTHER live vreg that happens to map onto one of
+          ;; those physicals is destroyed with nothing to put it back.
+          ;;
+          ;; That is not hypothetical, and the victim was the interpreter.
+          ;; mvm/interp.lisp's +OP-DIV+ arm is
+          ;;     (setf (svref regs vd) (truncate a b))
+          ;; and the quotient was computed CORRECTLY and then stored through
+          ;; a clobbered destination, so the right answer landed in the wrong
+          ;; register and VD kept stale junk.  Every interpreted
+          ;; (truncate a b) in the CLI image answered garbage -- a constant 9
+          ;; in most shapes -- while FLOOR, CEILING, ROUND, MOD, REM and /
+          ;; were all correct, and while the SAME operands through :MOD two
+          ;; instructions later gave the right remainder.  Downstream:
+          ;; sb-bsd-sockets:socket-name read #(0 0 0 9) where the kernel had
+          ;; written 7F 00 00 01.
+          (when (> save-count 1)
+            (let ((r (+ +vreg-v4+ 1)))
+              (loop (when (>= r (+ +vreg-v4+ save-count)) (return))
+                (unless (= r dest) (emit-ir :push r))
+                (setq r (+ r 1)))))
           ;; quotient: :div clobbers RAX/RDX/RCX, so save operands around it
           (emit-ir :push n-temp)
           (emit-ir :push d-temp)
@@ -17354,6 +17390,11 @@
           (emit-ir :li r-temp (ash 2 +fixnum-shift+))
           (emit-ir :store addr-temp r-temp (%mv-width))
           (emit-ir :mov dest q-temp)
+          (when (> save-count 1)
+            (let ((r (+ +vreg-v4+ save-count -1)))
+              (loop (when (< r (+ +vreg-v4+ 1)) (return))
+                (unless (= r dest) (emit-ir :pop r))
+                (setq r (- r 1)))))
           (free-temp-reg)
           (free-temp-reg)
           (free-temp-reg)

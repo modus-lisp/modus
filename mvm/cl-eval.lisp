@@ -1265,6 +1265,14 @@
    UNBOUND-VARIABLE with :name SYM (the ORIGINAL symbol, via the mvm-eval quote
    pool) so (cell-error-name c) is EQ to the source symbol
    (cell-error-name.1, eval.error.4)."
+  ;; THIS THREAD'S OWN DYNAMIC BINDINGS COME FIRST.  %DYNBIND puts a worker's
+  ;; binding in that thread's storage rather than in the globals table, so a
+  ;; read that goes straight to the table reads through the binding it is
+  ;; inside.  Same question, same helper, as %GV-REF and the baked-cell read.
+  (unless (eql (mem-ref #x10000DB8 :u32) 0)
+    (let ((a (%dynb-value-addr hash)))
+      (unless (eql a 0)
+        (return-from %e2-symbol-value-checked (mem-ref a :u64)))))
   (let ((cell (%gv-cell hash)))
    (if cell
       (cdr cell)

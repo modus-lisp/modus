@@ -60,38 +60,89 @@ NIC driver: x86-64 and AArch64 virt use Intel E1000 (PCI). RPi uses DWC2 USB —
 
 ### MVM architectures
 
-**Three architectures are supported: x86-64, AArch64, i386.** Six more have a
-working code generator. The distinction matters and is easy to blur, so the
-tiers below say what evidence stands behind each claim.
+**Eight of the nine run compiled Lisp in QEMU, verified.** The ninth, AArch64
+RPi, shares AArch64's translator and is blocked by the RPi family's build
+failure (#209), not by its back end. What none of them has yet is a payload
+worth booting into — the two sections below are kept apart deliberately,
+because conflating "the code generator works" with "the system works" is how
+the claims in this file went wrong before.
 
-| Tier | What it means | Architectures |
-|------|---------------|---------------|
-| **Supported** | Boots to a REPL and does work — evaluates forms, accepts SSH, runs libraries. Exercised regularly. | x86-64, AArch64 (virt + RPi), i386 |
-| **Runs, ungated** | Claims the same runtime surface and takes part in the cross-architecture fixpoint proof, but no routine check would notice if it broke. | ARM32 |
-| **Code generator only** | The translator emits a binary that boots far enough to print one correct computation (factorial 3628800) over serial, and stops. Evidence the back end works. NOT a usable system: no REPL, no networking, nothing else claimed. | RISC-V 64, PPC64, PPC32, 68k |
+#### Back end — measured
 
-**None of this is gated by an automated boot test yet.** "Supported" currently
-means a person ran it and it worked, not that a regression would be caught. A
-binary that halts with the right number is not a booted system, and until a gate
-boots each target and requires an answer it could not have guessed, every row
-above is a report rather than a guarantee. That gate is the open work; the tier
-table is what is honestly true meanwhile.
+Every architecture below boots in QEMU, runs compiled Lisp, and returns the
+right answer for a 14-rung ladder: a call, add/multiply, a branch, an argument,
+recursion, `(factorial 10)`, `cons`/`car`/`cdr`, a loop with an early return,
+three live variables, arrays, byte vectors, strings and SAPs. The answer is
+read back out of guest memory over QMP and compared to an expected value —
+"the image wrote something" is not a pass. **112/112 as of 5b187e4.**
 
-| Architecture | Bits | Endian | Translator | Boot | QEMU target | Status |
-|-------------|:----:|:------:|:----------:|:----:|-------------|--------|
-| x86-64      | 64 | little | translate-x64.lisp    | boot-x64.lisp    | `qemu-system-x86_64`    | Supported (REPL, SSH, actors, self-hosting) |
-| AArch64     | 64 | little | translate-aarch64.lisp | boot-aarch64.lisp | `qemu-system-aarch64 -M virt` | Supported (REPL, SSH, actors) |
-| AArch64 RPi | 64 | little | translate-aarch64.lisp | boot-rpi.lisp    | `qemu-system-aarch64 -M raspi3b` | Supported (REPL, SSH, USB HID, real hardware) |
-| i386        | 32 | little | translate-i386.lisp   | boot-i386.lisp   | `qemu-system-i386`      | Supported (REPL, SSH, self-hosting, real hardware) |
-| ARM32       | 32 | little | translate-arm32.lisp  | boot-arm32.lisp  | `qemu-system-arm -M raspi2b` | Runs, ungated (REPL, SSH; in the fixpoint chain) |
-| RISC-V 64   | 64 | little | translate-riscv.lisp  | boot-riscv.lisp  | `qemu-system-riscv64`   | Code generator only (serial, one computation) |
-| PPC64       | 64 | big    | translate-ppc.lisp    | boot-ppc64.lisp  | `qemu-system-ppc64`     | Code generator only (serial, one computation) |
-| PPC32       | 32 | big    | translate-ppc.lisp    | boot-ppc32.lisp  | `qemu-system-ppc`       | Code generator only (serial, one computation) |
-| 68k         | 32 | big    | translate-68k.lisp    | boot-68k.lisp    | `qemu-system-m68k -M an5206` | Code generator only (serial, one computation) |
+| Architecture | Bits | Endian | Translator | QEMU target | Opcodes | Ladder |
+|-------------|:----:|:------:|:----------:|-------------|:-------:|:------:|
+| x86-64      | 64 | little | translate-x64.lisp     | `qemu-system-x86_64`                  | 137/144 | 14/14 |
+| AArch64     | 64 | little | translate-aarch64.lisp | `qemu-system-aarch64 -M virt`         | 138/144 | 14/14 |
+| i386        | 32 | little | translate-i386.lisp    | `qemu-system-i386`                    | 102/144 | 14/14 |
+| ARM32       | 32 | little | translate-arm32.lisp   | `qemu-system-arm -M raspi2b`          |  92/144 | 14/14 |
+| RISC-V 64   | 64 | little | translate-riscv.lisp   | `qemu-system-riscv64 -M virt`         |  92/144 | 14/14 |
+| PPC64       | 64 | big    | translate-ppc.lisp     | `qemu-system-ppc64 -M powernv`        |  92/144 | 14/14 |
+| PPC32       | 32 | big    | translate-ppc.lisp     | `qemu-system-ppc -M ppce500`          |  92/144 | 14/14 |
+| 68k         | 32 | big    | translate-68k.lisp     | `qemu-system-m68k -M virt`            |  92/144 | 14/14 |
+| AArch64 RPi | 64 | little | translate-aarch64.lisp | `qemu-system-aarch64 -M raspi3b`      | (shared) | not in the ladder |
+
+The opcode counts are the honest measure of how much of the ISA each back end
+covers, but they are a poor proxy for capability and should not be read as a
+ranking: AArch64 carries 138 and was, until 5b187e4, missing two opcodes i386
+has. The ten i386 implements that the four 92s do not are the seven float ops,
+`:fn-addr`, `:li-const` and `:bvs` — each blocked on something specific rather
+than merely unwritten (floats need the FPU enabled in each boot stub, which
+i386 itself does not do; `:li-const` is only ever emitted by the in-image
+compiler; `:bvs` is a design question on RISC-V, which has no condition flags).
+
+#### Payload — the actual gap
+
+A back end that computes correctly is not a system. As of today:
+
+- **The legacy `repl-source.lisp` REPL evaluates a bare symbol and nothing
+  else.** `(+ 1 2)` echoes and never returns — on x86-64 and AArch64 alike.
+  This is the second Lisp rotting, not an architecture problem, and it is the
+  argument for #204.
+- **SSH is unproven on every target.** See `GATE-RESULT-run-cells.md`: all six
+  ssh cells are CANNOT PROVE, and the failure is in the payload, not the
+  launcher.
+- **The real CL does work, on one architecture.** `x64/bare/qemu/cl-repl` is
+  bare metal running the actual CL (#204) and evaluates `(+ 1 2)` to `3`.
+
+So the path to a usable system runs through the payload — retiring the second
+Lisp and putting every image on CL/mvm — not through more back-end work. The
+back-end work was the prerequisite: the real CL cannot run on 68k until 68k can
+allocate a cons, which it could not until 5b187e4.
+
+#### What is and is not gated
+
+The ladder above is a measurement taken by hand, not a gate: nothing in CI runs
+it, so every row is a report rather than a guarantee. Landing it as a gate is
+open work. The history here is worth keeping in view — "all 9 architectures
+compile and produce correct output (factorial 3628800) in QEMU" stood in this
+file for months, and not one of those images had a serial output path to print
+with.
 
 ### Cross-architecture fixpoint
 
-The fixpoint proof verifies that the MVM compiler produces identical output regardless of which architecture runs it. The chain (`scripts/run-fixpoint-i386.sh`) runs 8 QEMU steps across x64, AArch64, i386, and ARM32 to verify SHA256 equalities — proving byte-identical native code regardless of host architecture. This includes i386 self-hosting (i386 compiles itself), cross-compilation between all four architectures, and SSH over the fixpoint chain.
+The fixpoint proof verifies that the MVM compiler produces identical output
+regardless of which architecture runs it. The chain
+(`scripts/run-fixpoint-i386.sh`) runs 8 QEMU steps across **three**
+architectures — x64, AArch64 and i386 — verifying SHA256 equalities, and
+includes i386 self-hosting (i386 compiles itself) plus cross-compilation among
+those three.
+
+Two corrections to what this section used to say. **ARM32 is not in that
+chain**: it appears only in `scripts/run-fixpoint-ssh.sh`, which drives real
+boards over SSH and does not run here. And there is no "SSH over the fixpoint
+chain" — `run-fixpoint-i386.sh` extracts each generation over QMP `pmemsave`,
+never over the network.
+
+The chain does not currently complete from a clean checkout: step 0
+(`mvm/build-fixpoint.lisp`) heap-exhausts under SBCL's default dynamic space.
+`build.lisp` lists the `multi/fixpoint` cell as BROKEN for this reason.
 
 ## Building and running
 

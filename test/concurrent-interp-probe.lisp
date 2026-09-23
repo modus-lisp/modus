@@ -50,6 +50,30 @@
 ;;;; So the interpreter's two shared globals are not it, and wrapping the
 ;;;; thread body in a dynamic binding is not a free thing to do.
 ;;;;
+;;;; THE THREAD STACKS ARE EXACTLY ADJACENT AND THERE IS NO GUARD PAGE.
+;;;; Measured: slot2's base is slot3's TOP to the byte, at 256 KB and again
+;;;; at 8 MB.  A stack grows DOWN, so an overflow does not fault -- it
+;;;; silently overwrites the live frames of the neighbouring thread.  That is
+;;;; a real latent defect independent of everything else here.
+;;;;
+;;;; Adding one PROT_NONE page under each stack (mmap size+4096, mprotect the
+;;;; low page, base = raw+4096) takes this probe's funcall arm from 8 of 20 to
+;;;; 17 of 20 -- a 4x drop in the failure rate that is NOT explained, and must
+;;;; not be read as a fix.  It also REGRESSES test/hosted-sb-thread.lisp from
+;;;; 44 of 44 to a hang or a SIGSEGV after 34 checks, so it is not landable as
+;;;; written.
+;;;;
+;;;; AND THE THING BOTH FAILED CANDIDATES HAVE IN COMMON, which is the best
+;;;; lead here: the per-thread *MVM-LAST-MV* binding and the stack guard page
+;;;; break hosted-sb-thread at the SAME section -- "A JIT-COMPILED THREAD BODY
+;;;; THAT UNWINDS".  Two unrelated changes to a worker's stack and bindings
+;;;; both land there.  CLAUDE.md records the matching boundary: the compiler
+;;;; baked into the image keeps *TLS-WINDOW* NIL, so a body compiled by the
+;;;; RUNTIME JIT emits ABSOLUTE per-thread-window accesses -- identical on the
+;;;; main thread, whose window base is 0, and wrong on a worker.  A worker
+;;;; unwinding through JIT-compiled code is reading another thread's handler
+;;;; frames.  Start there.
+;;;;
 ;;;; AND ONE THING THAT DOES MOVE IT, which is where to look next: spawning
 ;;;; through SB-THREAD:MAKE-THREAD faults where %MAKE-NATIVE-THREAD with the
 ;;;; identical body does not (0 of 6 against 6 of 6), and shim-spawn with a

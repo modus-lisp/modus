@@ -295,6 +295,40 @@ baselines in `mvm/build-checks.lisp` (`:unresolved-function . 40`, line ~1069)
 **with a comment naming what was absorbed and why**. Bumping a baseline without
 naming its contents just relocates the problem.
 
+## The architecture ladder — does every back end still run code?
+
+```bash
+scripts/arch-ladder-gate.sh                 # every arch, every rung
+scripts/arch-ladder-gate.sh riscv64 68k     # just these
+ARCH_LADDER_JOBS=16 scripts/arch-ladder-gate.sh
+```
+
+Boots a real image per (architecture, rung) in QEMU and reads the answer back
+out of guest memory over QMP `pmemsave` — the same extraction
+`run-fixpoint-i386.sh` uses. No UART driver, no interrupt controller, no boot
+work: just what QEMU needs to load the image and start it. **An architecture
+passes only when every rung returns the right VALUE**; "the image wrote
+something" is not a pass.
+
+Rungs live in `test/arch-rungs/`, each with a header saying what it isolates
+and, where one was found through it, which bug. Add a rung by dropping a file
+there that defines `probe`; the gate wraps it.
+
+Two properties worth preserving if you touch this:
+
+- **The gate proves it can fail.** It first runs one rung with a deliberately
+  wrong expected value and requires that to FAIL, refusing to run the ladder
+  otherwise. This whole area exists because "all 9 architectures compile and
+  produce correct output (factorial 3628800) in QEMU" stood in the README for
+  months while five of those images had no serial output path to print with.
+- **The probe address must stay clear of the heap.** i386's was
+  `+i386-cons-base+` exactly, so any allocating rung wrote an object header
+  over the answer. See the table in `scripts/arch-ladder.py`.
+
+When a rung fails, `--keep` leaves the built image and payload behind, and
+`scripts/arch-ladder.py` documents the per-arch QEMU machine choices (ppc64
+needs `powernv`, not `pseries`; 68k needs `virt`, not `an5206`).
+
 ## Build Commands
 
 All builds: `sbcl --script <build-script>`

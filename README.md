@@ -118,12 +118,23 @@ allocate a cons, which it could not until 5b187e4.
 
 #### What is and is not gated
 
-The ladder above is a measurement taken by hand, not a gate: nothing in CI runs
-it, so every row is a report rather than a guarantee. Landing it as a gate is
-open work. The history here is worth keeping in view — "all 9 architectures
-compile and produce correct output (factorial 3628800) in QEMU" stood in this
-file for months, and not one of those images had a serial output path to print
-with.
+The ladder is a gate you can run:
+
+```bash
+scripts/arch-ladder-gate.sh                 # every arch, every rung
+scripts/arch-ladder-gate.sh riscv64 68k     # just these
+```
+
+**It proves it can fail before it claims anything.** The first thing it does is
+run one rung with a deliberately wrong expected value and require that to FAIL;
+if the control passes it refuses to run the ladder at all. A gate nobody has
+seen fail is not evidence — which is the lesson this table was built out of.
+"All 9 architectures compile and produce correct output (factorial 3628800) in
+QEMU" stood in this file for months, and not one of those images had a serial
+output path to print with.
+
+It is not yet wired into CI, and an architecture whose `qemu-system-*` is not
+installed is reported as SKIP rather than silently dropped.
 
 ### Cross-architecture fixpoint
 

@@ -2306,6 +2306,32 @@
 
    FN TAKES NO ARGUMENTS, which is not a restriction on generality: a closure
    carries whatever it captured, and that is how a thread gets its state."
+  ;; COMPILE WHAT THE CHILD WILL RUN, BEFORE IT RUNS IT.  Two threads
+  ;; executing INTERPRETED code concurrently faults -- measured, and measured
+  ;; as the thing that decides it: test/hosted-sb-thread.lisp's negative
+  ;; control (two threads racing an unlocked counter) SIGSEGVs 5 runs of 5 on
+  ;; every binary back to cf6f234, and a single (JIT-EAGER) immediately before
+  ;; those threads spawn makes the identical workload 3 of 3 clean.  One
+  ;; thread alone is clean at any shape; MODUS_NO_JIT=1 faults; a 16 MB worker
+  ;; stack faults, so it is neither contention on a lock nor stack depth.
+  ;;
+  ;; %RT-THREADS-ON already does this once, when a program declares it will
+  ;; run Lisp on a second thread.  That is not enough on its own: anything
+  ;; DEFINED after that point -- which is most of a script, and all of a
+  ;; library loaded at runtime -- is still an interpreter trampoline when the
+  ;; child picks it up.  Here it costs only what is new (6 modules in that
+  ;; test, and (0 0 0) when nothing has been defined since), so a program
+  ;; spawning in a loop pays once.
+  ;;
+  ;; THIS IS A MITIGATION AND NOT THE CURE, and it is worth being plain about
+  ;; that: the defect is that concurrent interpretation is unsafe, and this
+  ;; only arranges for there to be less of it.  Ruled out as causes so far:
+  ;; worker stack size, %MVM-LAST-MV and %NLX-STATE-SERIAL (both bound
+  ;; per-thread by hand, no change), and the JIT itself.
+  (let ((off (%cli-getenv "MODUS_NO_EAGER_THREADS")))
+    (if (and off (> (length off) 0) (not (string= off "0")))
+        0
+        (handler-case (progn (jit-eager) 0) (t (c) 0))))
   (let ((tt (%thr-table)))
     (if (zerop tt)
         -2

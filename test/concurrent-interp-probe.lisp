@@ -33,6 +33,23 @@
 ;;;;   * sharing the callees — two threads running DISJOINT function sets
 ;;;;     fault just the same.
 ;;;;
+;;;; RUN IT WITH MODUS_NO_EAGER_THREADS=1.  %MAKE-NATIVE-THREAD compiles what
+;;;; is still bytecode before it spawns -- the shipping MITIGATION for this
+;;;; very defect -- so on a current image every arm passes and this measures
+;;;; nothing.  That trap has already produced one wrong "fixed": a candidate
+;;;; was measured on a MITIGATED binary, scored 8 of 8, and changed nothing.
+;;;; The runner sets the variable; if you drive the probe by hand, set it.
+;;;;
+;;;; ALSO REFUTED, on the un-mitigated binary and by rate: giving each thread
+;;;; its own *MVM-LAST-MV* (a dynamic binding around the body in
+;;;; %THR-TRAMPOLINE, which DOES cover the trampoline's read-after-return that
+;;;; an in-body binding misses).  2 of 6 before, 3 of 6 after -- noise.  And
+;;;; binding *NLX-STATE-SERIAL* the same way turns the SIGSEGV into a HANG,
+;;;; while binding the MV cell alone crashes test/hosted-sb-thread.lisp at its
+;;;; JIT-compiled-body-that-unwinds section (44 of 44 -> SIGSEGV after 34).
+;;;; So the interpreter's two shared globals are not it, and wrapping the
+;;;; thread body in a dynamic binding is not a free thing to do.
+;;;;
 ;;;; AND ONE THING THAT DOES MOVE IT, which is where to look next: spawning
 ;;;; through SB-THREAD:MAKE-THREAD faults where %MAKE-NATIVE-THREAD with the
 ;;;; identical body does not (0 of 6 against 6 of 6), and shim-spawn with a

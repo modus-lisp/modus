@@ -97,24 +97,33 @@ than merely unwritten (floats need the FPU enabled in each boot stub, which
 i386 itself does not do; `:li-const` is only ever emitted by the in-image
 compiler; `:bvs` is a design question on RISC-V, which has no condition flags).
 
-#### Payload — the actual gap
+#### Payload — one generic image, everything else loaded
 
-A back end that computes correctly is not a system. As of today:
+A back end that computes correctly is not a system. The direction is **not** a
+per-feature image per architecture; it is one generic image per architecture
+running the real CL, with everything else — SSH, test runners, tools — arriving
+as source it LOADs at runtime. `build-generic` is that shape hosted (boot, LOAD
+`argv[1]`, exit); `build-x64-cl-repl` is that shape on bare metal, a multiboot
+image whose REPL is the actual CL — reader, `eval` = mvm-eval, printer — over
+COM1 via `lib/serial-repl.lisp`. It evaluates `(+ 1 2)` to `3`, and it is the
+declared replacement for `build-x64-repl` and `build-x64-console-repl`.
+
+Read the state of the old payloads in that light:
 
 - **The legacy `repl-source.lisp` REPL evaluates a bare symbol and nothing
-  else.** `(+ 1 2)` echoes and never returns — on x86-64 and AArch64 alike.
-  This is the second Lisp rotting, not an architecture problem, and it is the
-  argument for #204.
-- **SSH is unproven on every target.** See `GATE-RESULT-run-cells.md`: all six
-  ssh cells are CANNOT PROVE, and the failure is in the payload, not the
-  launcher.
-- **The real CL does work, on one architecture.** `x64/bare/qemu/cl-repl` is
-  bare metal running the actual CL (#204) and evaluates `(+ 1 2)` to `3`.
+  else** — `(+ 1 2)` echoes and never returns, on x86-64 and AArch64 alike.
+  That is the second Lisp rotting, and #204 deletes it rather than repairing
+  it. The broken RPi family builds `*repl-source*` too; the second Lisp and the
+  broken cell overlap heavily.
+- **The baked SSH payload is unproven everywhere** (`GATE-RESULT-run-cells.md`
+  marks all six ssh cells CANNOT PROVE). Under this strategy that matters much
+  less than it looks: a baked SSH image is the thing being retired, not the
+  thing being fixed. SSH becomes source the generic image loads.
 
-So the path to a usable system runs through the payload — retiring the second
-Lisp and putting every image on CL/mvm — not through more back-end work. The
-back-end work was the prerequisite: the real CL cannot run on 68k until 68k can
-allocate a cons, which it could not until 5b187e4.
+So the remaining work is to bring the CL image up on the other seven
+architectures, not to port seven payloads. The back-end work was its
+prerequisite — the real CL cannot run on 68k until 68k can allocate a cons,
+which it could not until 5b187e4.
 
 #### What is and is not gated
 

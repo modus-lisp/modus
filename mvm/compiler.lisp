@@ -6324,7 +6324,7 @@
   "Predicate symbol for a standard type name TYPEP can fold to, else NIL."
   (let ((n (symbol-name type-sym)))
     (cond ((string= n "INTEGER") 'integerp)
-          ((string= n "FIXNUM") 'integerp)
+          ((string= n "FIXNUM") 'fixnump)
           ((string= n "CONS") 'consp)
           ((string= n "LIST") 'listp)
           ((string= n "NULL") 'null)
@@ -15087,6 +15087,8 @@
           (and (cddr form) (%mv-tail-cannot-set-count-p (car (last form)))))
          ((or (string= op "WHEN") (string= op "UNLESS"))
           (and (cddr form) (%mv-tail-cannot-set-count-p (car (last form)))))
+         ((string= op "MULTIPLE-VALUE-BIND")
+          (and (cdddr form) (%mv-tail-cannot-set-count-p (car (last form)))))
          ;; AND / OR: only the LAST subform is in tail position (CLHS 5.1 —
          ;; the non-last ones contribute their primary value only).  Degenerate
          ;; (and) / (or) yield T / NIL: single.
@@ -15349,6 +15351,70 @@
           ;; multi-values via its own (values …) tail.  The callee's
           ;; own epilogue handles single-value resets.
           (t t))))))
+
+;;; A function whose tail MIXES a multiple-value producer with a single-valued
+;;; arm used to leak a stale MV count out of the single-valued arm.
+;;; TAIL-FORM-IS-VALUES-P answers T for the whole body as soon as ONE tail leaf
+;;; may produce values (any named call counts), so the epilogue skips its
+;;; count=1 store for EVERY path, including the inline ones:
+;;;   ISQRT's tail is (if extra (%program-error ...) <loop returning x>) — the
+;;;   call arm made the epilogue skip the clamp, and the loop arm returned x
+;;;   with TRUNCATE's count of 2 still in the buffer: (isqrt 1) => 1, 0.
+;;; %MV-CLAMP-TAIL pushes the clamp down to the leaves: it walks the tail
+;;; through the value-transparent forms and wraps each leaf the predicate
+;;; itself calls single-valued (NIL) in a count=1 store — the same judgement
+;;; the epilogue already trusts, applied per path instead of per function.
+;;; Leaves it cannot see into (calls, VALUES, APPLY, AND/OR) are left alone.
+(defun %mv-clamp-leaf (form)
+  (let ((g (%mvm-gensym "MVONE")))
+    `(let ((,g ,form))
+       (setf (mem-ref ,+mv-count-addr+ :u64) 1)
+       ,g)))
+
+(defun %mv-clamp-body (forms)
+  "FORMS with its LAST form clamped, unless that form is a declaration."
+  (if (null forms)
+      forms
+      (let ((lst (car (last forms))))
+        (if (and (consp lst) (symbolp (car lst))
+                 (string= (symbol-name (car lst)) "DECLARE"))
+            forms
+            (append (butlast forms) (list (%mv-clamp-tail lst)))))))
+
+(defun %mv-clamp-tail (form)
+  (cond
+    ((not (tail-form-is-values-p (list form))) (%mv-clamp-leaf form))
+    ((or (atom form) (not (symbolp (car form)))) form)
+    (t
+     (let ((op (symbol-name (car form))))
+       (cond
+         ((string= op "IF")
+          (if (and (cdr form) (cddr form) (null (cddddr form)))
+              (list (car form) (cadr form)
+                    (%mv-clamp-tail (caddr form))
+                    (%mv-clamp-tail (cadddr form)))
+              form))
+         ((string= op "PROGN") (cons (car form) (%mv-clamp-body (cdr form))))
+         ((or (string= op "LET") (string= op "LET*")
+              (string= op "WHEN") (string= op "UNLESS")
+              (string= op "BLOCK"))
+          (if (cddr form)
+              (cons (car form) (cons (cadr form) (%mv-clamp-body (cddr form))))
+              form))
+         ((string= op "MULTIPLE-VALUE-BIND")
+          (if (cdddr form)
+              (cons (car form)
+                    (cons (cadr form)
+                          (cons (caddr form) (%mv-clamp-body (cdddr form)))))
+              form))
+         ((string= op "COND")
+          (cons (car form)
+                (mapcar (lambda (clause)
+                          (if (and (consp clause) (cdr clause))
+                              (cons (car clause) (%mv-clamp-body (cdr clause)))
+                              clause))
+                        (cdr form))))
+         (t form))))))
 
 (defun loop-body-has-mv-return-p (forms)
   "Walk FORMS looking for any (return X) or (return-from N X) where X is a
@@ -22209,10 +22275,20 @@
       ;; Cross-unit RETURN-FROM <fname> present: route through an explicit
       ;; BLOCK so compile-block installs the runtime catch frame (see
       ;; fn-blk-catch-p above).
-      (if fn-blk-catch-p
-          (compile-form (cons 'block (cons name (strip-declares body)))
-                        env +vreg-vr+)
-          (compile-progn (strip-declares body) env +vreg-vr+)))
+      ;; When the epilogue below will NOT clamp the MV count (the tail may
+      ;; produce values), clamp each provably single-valued tail path
+      ;; instead — see %MV-CLAMP-TAIL.
+      (let ((cbody (let ((sb (strip-declares body)))
+                     (if (and (tail-form-is-values-p sb)
+                              (not (string= *current-function-name* "VALUES"))
+                              (not (string= *current-function-name* "VALUES-LIST"))
+                              (not (string= *current-function-name* "%MV-RETURNING")))
+                         (%mv-clamp-body sb)
+                         sb))))
+        (if fn-blk-catch-p
+            (compile-form (cons 'block (cons name cbody))
+                          env +vreg-vr+)
+            (compile-progn cbody env +vreg-vr+))))
 
     ;; Set MV count=1 for non-values functions (Genera-style).
     ;; Skip for functions that manually manage the MV buffer (e.g., VALUES, VALUES-LIST).

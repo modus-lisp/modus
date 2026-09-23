@@ -118,6 +118,23 @@
 ;; garbage — collapsing `(+ -3 4611686018427387900)` to -7 under mvm-eval while
 ;; native was correct.  Taking the slot VALUE straight into %fixnum-+ avoids
 ;; the extra shift entirely, so the wrap happens exactly once, in hardware.
+;; Bitwise AND/OR/XOR on two register VALUES.  For two fixnums the word op is
+;; the value op (2a op 2b = 2(a op b) for and/or/xor), so compute it in value
+;; space: the reg-get round trip is %val->word, a SHL that overflows for
+;; |value| >= 2^61, which made (logior 0 most-positive-fixnum) => -1 under
+;; mvm-interpret while native was right.  Anything else (a pointer word) keeps
+;; the word-level path.
+(defun %mvm-bitop-words (op a b)
+  (if (and (typep a 'fixnum) (typep b 'fixnum))
+      (cond ((eql op 0) (logand a b))
+            ((eql op 1) (logior a b))
+            (t (logxor a b)))
+      (%word->val
+       (let ((wa (%val->word a)) (wb (%val->word b)))
+         (cond ((eql op 0) (logand wa wb))
+               ((eql op 1) (logior wa wb))
+               (t (logxor wa wb)))))))
+
 (declaim (inline %mvm-wrap-tagword-add %mvm-wrap-tagword-sub))
 (defun %mvm-wrap-tagword-add (a b) (%fixnum-+ a b))
 (defun %mvm-wrap-tagword-sub (a b) (%fixnum-- a b))
@@ -1413,7 +1430,11 @@
           (#.+op-neg+ ; -(a<<1) = (-a)<<1
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
-               (reg-set regs vd (- (reg-get regs vs))) (setf pc npc2))))
+               (let ((a (svref regs vs)))
+                 (if (typep a 'fixnum)
+                     (setf (svref regs vd) (%fixnum-- 0 a))
+                     (reg-set regs vd (- (reg-get regs vs)))))
+               (setf pc npc2))))
 
           (#.+op-inc+ ; tagged +1 = raw +2
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
@@ -1428,21 +1449,24 @@
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (va npc2) (fetch-reg bc npc)
                (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
-                 (reg-set regs vd (logand (reg-get regs va) (reg-get regs vb)))
+                 (setf (svref regs vd)
+                       (%mvm-bitop-words 0 (svref regs va) (svref regs vb)))
                  (setf pc npc3)))))
 
           (#.+op-or+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (va npc2) (fetch-reg bc npc)
                (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
-                 (reg-set regs vd (logior (reg-get regs va) (reg-get regs vb)))
+                 (setf (svref regs vd)
+                       (%mvm-bitop-words 1 (svref regs va) (svref regs vb)))
                  (setf pc npc3)))))
 
           (#.+op-xor+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (va npc2) (fetch-reg bc npc)
                (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
-                 (reg-set regs vd (logxor (reg-get regs va) (reg-get regs vb)))
+                 (setf (svref regs vd)
+                       (%mvm-bitop-words 2 (svref regs va) (svref regs vb)))
                  (setf pc npc3)))))
 
           ;; SHL IS WORD-LEVEL, exactly like SHR/SAR below and exactly like the
@@ -1504,18 +1528,25 @@
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
                (multiple-value-bind (amt npc3) (fetch-byte bc npc2)
-                 (let ((w (reg-get regs vs)))
+                 (let ((w (reg-get regs vs)) (a (svref regs vs)))
+                   (if (and (typep a 'fixnum) (>= a 0) (>= amt 1))
+                       (reg-set regs vd (ash a (- 1 amt)))
                    (reg-set regs vd
                             (if (>= w 0)
                                 (ash w (- amt))
-                                (ash (logand w #xFFFFFFFFFFFFFFFF) (- amt)))))
+                                (ash (logand w #xFFFFFFFFFFFFFFFF) (- amt))))))
                  (setf pc npc3)))))
 
           (#.+op-sar+ ; arithmetic shift right — word-level
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
                (multiple-value-bind (amt npc3) (fetch-byte bc npc2)
-                 (reg-set regs vd (ash (reg-get regs vs) (- amt)))
+                 (let ((a (svref regs vs)))
+                   ;; Fixnum VALUE a has word 2a; (2a)>>amt = a>>(amt-1),
+                   ;; exact and in range — the reg-get round trip is not.
+                   (if (and (typep a 'fixnum) (>= amt 1))
+                       (reg-set regs vd (ash a (- 1 amt)))
+                       (reg-set regs vd (ash (reg-get regs vs) (- amt)))))
                  (setf pc npc3)))))
 
           (#.+op-shlv+ ; shift left by register
@@ -2321,12 +2352,14 @@
                            ;; count slot (#x10000090) holds the WORD of the fixnum
                            ;; count — match a normal (setf (mem-ref ... :u64) n),
                            ;; which stores (reg-get) = %val->word of the fixnum.
-                           (mem-write state #x10000090 (%val->word nvals) 3)
-                           ;; secondaries (value 1+) -> #x10000098 + i*8, as words.
+                           (mem-write-value state #x10000090 nvals 3)
+                           ;; secondaries (value 1+) -> #x10000098 + i*8, stored
+                           ;; as VALUES (op-store's path).  The old %val->word
+                           ;; SHL overflowed for |v| >= 2^61, so (floor 1 mnf)'s
+                           ;; remainder -4611686018427387903 came back as 1.
                            (let ((i 0))
                              (dolist (v (cdr vals))
-                               (mem-write state (+ #x10000098 (* i 8))
-                                          (%val->word v) 3)
+                               (mem-write-value state (+ #x10000098 (* i 8)) v 3)
                                (incf i)))))
                        ;; Unresolved runtime name: signal UNDEFINED-FUNCTION
                        ;; (CL semantics — `(eval '(no-such-fn))` must signal).

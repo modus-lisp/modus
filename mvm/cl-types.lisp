@@ -1708,8 +1708,12 @@
      ;; floor on num/denom so the toward-negative-infinity adjustment
      ;; fires.  Plain (truncate ratio) goes toward zero, giving the
      ;; wrong direction for negative ratios.
-     (cond ((integerp n) n)
-           ((ratiop n) (floor (aref n 0) (aref n 1)))
+     ;; Two values, like every other arm: (floor 5) => 5, 0.  The ratio
+     ;; arm's remainder is n - q (a RATIO), not the integer remainder of
+     ;; num/den: (floor 1/3) => 0, 1/3.
+     (cond ((integerp n) (values n 0))
+           ((ratiop n) (let ((q (floor (aref n 0) (aref n 1))))
+                         (values q (- n q))))
            ;; Float: q = ⌊n⌋ (toward -inf), r = n - q (a FLOAT in [0,1)).
            ((%ieee-float-p n)
             (let* ((tz (%float-to-int n))          ; toward zero
@@ -1731,8 +1735,9 @@
 (defun ceiling (n &rest rest)
   (cond
     ((null rest)
-     (cond ((integerp n) n)
-           ((ratiop n) (ceiling (aref n 0) (aref n 1)))
+     (cond ((integerp n) (values n 0))
+           ((ratiop n) (let ((q (ceiling (aref n 0) (aref n 1))))
+                         (values q (- n q))))
            ;; Float: q = ⌈n⌉ (toward +inf), r = n - q (a FLOAT in (-1,0]).
            ((%ieee-float-p n)
             (let* ((tz (%float-to-int n))
@@ -1793,8 +1798,12 @@
              ;; |r| < |d|/2: keep truncation
              ((< (* 2 abs-r) abs-d) (values q r))
              ;; tie: round to even q
+             ;; The step is away from zero in the direction of the TRUE
+             ;; quotient's sign — negative iff r and d differ in sign — not
+             ;; r's sign: (round 3 -2) => -2, -1 (was 0, 3).
              (t (if (oddp q)
-                    (if (< r 0) (values (- q 1) (+ r d))
+                    (if (if (< d 0) (> r 0) (< r 0))
+                        (values (- q 1) (+ r d))
                         (values (+ q 1) (- r d)))
                     (values q r))))))))))
 
@@ -2149,9 +2158,13 @@
   (let* ((g (gcd-impl num den))
          (n (%rat-exact-div num g))
          (d (%rat-exact-div den g)))
-    (when (and (not (bignump d)) (< d 0))
+    ;; Lift the sign for a BIGNUM denominator too: most-negative-fixnum is a
+    ;; bignum here, so (/ 1 most-negative-fixnum) came out 1/-4611686018427387904.
+    (when (if (bignump d)
+              (if (big-bignum-p d) (< (%bb-sign d) 0) (< (bignum-hi d) 0))
+              (< d 0))
       (setq n (generic-negate-int n))
-      (setq d (- 0 d)))
+      (setq d (generic-negate-int d)))
     (if (and (not (bignump d)) (= d 1)) n (make-ratio-obj n d))))
 
 ;; Boundary-safe fixnum negate.  `(- 0 n)` is the compiler's inline

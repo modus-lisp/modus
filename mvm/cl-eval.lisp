@@ -2739,10 +2739,12 @@
          (if (= sign -1)
              ;; Negative two's complement: lo' = 2^62 - lo when lo > 0;
              ;; carry into hi.  Same logic as %bignum-negate-parts.
-             (if (= lo 0)
-                 (make-bignum 0 hi)
-                 (make-bignum (%fixnum-+ 1 (logxor lo +fixnum-max+))
-                              (%fixnum-- hi 1)))
+             ;; Demote whatever fits (the helper keeps MNF a bignum).
+             (bignum-to-fixnum-if-possible
+              (if (= lo 0)
+                  (make-bignum 0 hi)
+                  (make-bignum (%fixnum-+ 1 (logxor lo +fixnum-max+))
+                               (%fixnum-- hi 1))))
              (bignum-to-fixnum-if-possible (make-bignum lo hi)))))
       ;; 3+ limbs: allocate a big-bignum.
       (t
@@ -2813,9 +2815,17 @@
     (t
      (let ((hi (bignum-hi b)) (lo (bignum-lo b)))
        (if (= hi 0) lo
-           (if (and (= hi -1) (>= lo +fixnum-half+))
-               ;; lo - 2^62 for lo in [2^61, 2^62-1] = a negative fixnum in
-               ;; [-2^61, -1].  Compute via raw (logior lo -2^62) — NOT
+           (if (and (= hi -1) (> lo 0))
+               ;; lo - 2^62 for lo in [1, 2^62-1] is a negative fixnum in
+               ;; (-2^62, -1].  (This once required lo >= 2^61, which left
+               ;; every value in (-2^62, -2^61) an un-demoted bignum:
+               ;; (fixnump (- 0 (expt 2 61) 1)) was NIL.)
+               ;; lo = 0 is most-negative-fixnum itself, and it STAYS a
+               ;; bignum: the runtime is built on MNF never being a fixnum
+               ;; (compile-integer materialises the literal as a bignum; the
+               ;; printer, negation and friends assume (- n) of a fixnum
+               ;; fits).  Demoting it SIGSEGVs (* -2 (expt 2 61)).
+               ;; Compute via raw (logior lo -2^62) — NOT
                ;; (- lo 4611686018427387904): 2^62 is a BIGNUM literal, so `-`
                ;; (now :sub-checked) would route back through generic-subtract
                ;; -> bignum-sub -> bignum-add -> here again = infinite

@@ -1072,7 +1072,17 @@
 
         ;;; --- Arithmetic ---
 
-        ((#.+op-add+ #.+op-add-checked+)
+        ((#.+op-add+ #.+op-add-checked+ #.+op-adds+)
+         ;; :ADDS shares this clause.  :adds/:subs are "arithmetic that also sets
+         ;; the overflow flag", for a following :bvs to branch on.  The result
+         ;; they compute is identical to :add/:sub -- translate-i386 uses the
+         ;; very same code for both pairs -- so the value is right here too.
+         ;; What is NOT provided is :bvs, which still traps: these back ends do
+         ;; not promote on overflow (see the :add-checked note), so a :bvs that
+         ;; silently fell through would be a quiet wrong answer rather than a
+         ;; visible gap.  RISC-V has no condition flags at all, so a faithful
+         ;; :bvs there needs the operands, not a flag -- that is a real design
+         ;; question, and it should stay loud until someone answers it.
          ;; :ADD-CHECKED shares this clause.  The checked opcodes mean "tagged
          ;; arithmetic that promotes to a bignum on overflow"; implementing the
          ;; promotion needs the generic-arith slow path, which these back ends do
@@ -1087,7 +1097,17 @@
              (arm32-add buf +arm-r12+ pa pb)
              (arm32-store-vreg buf +arm-r12+ vd))))
 
-        ((#.+op-sub+ #.+op-sub-checked+)
+        ((#.+op-sub+ #.+op-sub-checked+ #.+op-subs+)
+         ;; :SUBS shares this clause.  :adds/:subs are "arithmetic that also sets
+         ;; the overflow flag", for a following :bvs to branch on.  The result
+         ;; they compute is identical to :add/:sub -- translate-i386 uses the
+         ;; very same code for both pairs -- so the value is right here too.
+         ;; What is NOT provided is :bvs, which still traps: these back ends do
+         ;; not promote on overflow (see the :add-checked note), so a :bvs that
+         ;; silently fell through would be a quiet wrong answer rather than a
+         ;; visible gap.  RISC-V has no condition flags at all, so a faithful
+         ;; :bvs there needs the operands, not a flag -- that is a real design
+         ;; question, and it should stay loud until someone answers it.
          ;; :SUB-CHECKED shares this clause.  The checked opcodes mean "tagged
          ;; arithmetic that promotes to a bignum on overflow"; implementing the
          ;; promotion needs the generic-arith slow path, which these back ends do
@@ -1631,7 +1651,15 @@
            ;; Bump: ADD r9, r9, #16
            (arm32-add-imm buf +arm-r9+ +arm-r9+ 0 16)))
 
-        (#.+op-gc-check+
+        ((#.+op-gc-check+ #.+op-gc-check-n+ #.+op-gc-check-r+)
+         ;; :GC-CHECK-N and :GC-CHECK-R share this clause.  They carry an
+         ;; allocation SIZE (a constant, or a runtime value) so a back end can
+         ;; check `VA + n < VL` rather than `VA < VL`.  None of x64, i386 or
+         ;; aarch64 uses the size either -- translate-i386 routes all three to
+         ;; the same plain VA-vs-VL comparison -- so doing the same here matches
+         ;; the reference back ends exactly.  What it replaces is worse than an
+         ;; imprecise check: RISC-V/PPC/68k TRAPPED on these opcodes, and
+         ;; make-array emits :gc-check-n, so no array could be allocated at all.
          ;; CMP r9(VA), r10(VL); trap if VA >= VL
          (arm32-cmp buf +arm-r9+ +arm-r10+)
          ;; BKPTCS #1  (if unsigned >=)
@@ -1800,6 +1828,91 @@
            ;; Restore r4
            (arm32-pop buf (ash 1 4))    ; POP {r4}
            ;; Store result
+           (arm32-store-vreg buf +arm-r12+ vd)))
+
+        ;;; --- Byte vectors and strings ---
+        ;; Tag 2 and a 4-byte header, so the payload starts at obj - 2 + 4 =
+        ;; obj + 2 -- the same +2 the existing :aref uses.  R12 and LR are the
+        ;; translator scratch (LR is saved by the prologue, which is why the
+        ;; existing :alloc-array already uses it here).
+        (#.+op-alloc-u8+
+         (let ((vd (vreg 0))
+               (vcount (vreg 1)))
+           (arm32-load-vreg buf +arm-r12+ vcount)
+           (arm32-asr-imm buf +arm-r12+ +arm-r12+ 1)     ; N = count >> 1
+           (arm32-mov buf +arm-lr+ +arm-r12+)            ; keep N
+           (arm32-lsl-imm buf +arm-r12+ +arm-r12+ 8)
+           (arm32-orr-imm buf +arm-r12+ +arm-r12+ 0 #x11)  ; u8-vector subtag
+           (arm32-str buf +arm-r12+ +arm-r9+ 0)
+           (arm32-orr-imm buf +arm-r12+ +arm-r9+ 0 2)    ; result = VA | 2
+           (arm32-store-vreg buf +arm-r12+ vd)
+           ;; bytes = align16(N + 4)
+           (arm32-add-imm buf +arm-lr+ +arm-lr+ 0 19)    ; N + 4 + 15
+           (arm32-bic-imm buf +arm-lr+ +arm-lr+ 0 15)
+           (arm32-add buf +arm-r9+ +arm-r9+ +arm-lr+)))
+
+        (#.+op-alloc-string+
+         ;; One character CODE per WORD; count already UNTAGGED.
+         (let ((vd (vreg 0))
+               (vcount (vreg 1)))
+           (arm32-load-vreg buf +arm-r12+ vcount)
+           (arm32-mov buf +arm-lr+ +arm-r12+)
+           (arm32-lsl-imm buf +arm-r12+ +arm-r12+ 8)
+           (arm32-orr-imm buf +arm-r12+ +arm-r12+ 0 #x31)  ; string subtag
+           (arm32-str buf +arm-r12+ +arm-r9+ 0)
+           (arm32-orr-imm buf +arm-r12+ +arm-r9+ 0 2)
+           (arm32-store-vreg buf +arm-r12+ vd)
+           ;; bytes = align16((count + 1) * 4)
+           (arm32-add-imm buf +arm-lr+ +arm-lr+ 0 1)
+           (arm32-lsl-imm buf +arm-lr+ +arm-lr+ 2)
+           (arm32-add-imm buf +arm-lr+ +arm-lr+ 0 15)
+           (arm32-bic-imm buf +arm-lr+ +arm-lr+ 0 15)
+           (arm32-add buf +arm-r9+ +arm-r9+ +arm-lr+)))
+
+        (#.+op-u8-ref+
+         (let ((vd (vreg 0)))
+           (arm32-load-vreg buf +arm-r12+ (vreg 2))      ; idx (tagged)
+           (arm32-asr-imm buf +arm-r12+ +arm-r12+ 1)
+           (arm32-load-vreg buf +arm-lr+ (vreg 1))       ; arr
+           (arm32-add buf +arm-r12+ +arm-r12+ +arm-lr+)
+           (arm32-ldrb buf +arm-r12+ +arm-r12+ 2)
+           (arm32-lsl-imm buf +arm-r12+ +arm-r12+ 1)     ; tag as fixnum
+           (arm32-store-vreg buf +arm-r12+ vd)))
+
+        (#.+op-u8-set+
+         ;; (u8-set Varr Vidx Vval) — Vidx and Vval both TAGGED.  The value is
+         ;; parked on the stack while R12/LR build the address, the same way
+         ;; the existing :aset does it.
+         (progn
+           (arm32-load-vreg buf +arm-r12+ (vreg 2))      ; value (tagged)
+           (arm32-asr-imm buf +arm-r12+ +arm-r12+ 1)
+           (arm32-str-pre buf +arm-r12+ +arm-sp+ -4)
+           (arm32-load-vreg buf +arm-r12+ (vreg 1))      ; idx (tagged)
+           (arm32-asr-imm buf +arm-r12+ +arm-r12+ 1)
+           (arm32-load-vreg buf +arm-lr+ (vreg 0))       ; arr
+           (arm32-add buf +arm-r12+ +arm-r12+ +arm-lr+)
+           (arm32-ldr-post buf +arm-lr+ +arm-sp+ 4)      ; value back
+           (arm32-strb buf +arm-lr+ +arm-r12+ 2)))
+
+        ;;; --- System area pointers ---
+        ;; One-slot object, subtag #x16: header (1<<8)|#x16 then the raw
+        ;; address.  Tag 2 and a 4-byte header, so the slot reads at obj + 2.
+        (#.+op-sap-new+
+         (let ((vd (vreg 0)))
+           (arm32-load-vreg buf +arm-lr+ (vreg 1))       ; payload first
+           (arm32-load-imm32 buf +arm-r12+ #x116)
+           (arm32-str buf +arm-r12+ +arm-r9+ 0)
+           (arm32-str buf +arm-lr+ +arm-r9+ 4)
+           (arm32-orr-imm buf +arm-r12+ +arm-r9+ 0 2)
+           (arm32-store-vreg buf +arm-r12+ vd)
+           (arm32-add-imm buf +arm-r9+ +arm-r9+ 0 16)))
+
+        (#.+op-sap-addr+
+         ;; Raw address out, TAGGED as a fixnum (as on x64/i386).
+         (let ((vd (vreg 0)))
+           (arm32-load-vreg buf +arm-r12+ (vreg 1))
+           (arm32-ldr buf +arm-r12+ +arm-r12+ 2)
+           (arm32-lsl-imm buf +arm-r12+ +arm-r12+ 1)
            (arm32-store-vreg buf +arm-r12+ vd)))
 
         ;;; --- Calling-convention slots ---

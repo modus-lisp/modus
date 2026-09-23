@@ -4318,6 +4318,38 @@
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
+          ;; ---- SAP-NEW Vd, Vaddr / SAP-ADDR Vd, Vsap ----
+          ;; AArch64 did not implement these AT ALL, though i386 and x64 both
+          ;; do -- the opcode gap between the back ends is not a simple
+          ;; ordering by size.  A SAP is a one-slot object, subtag #x16:
+          ;; header (1<<8)|#x16 then the raw address, one 16-byte granule.
+          ((= op +op-sap-new+)
+           (let* ((vd (vr 0))
+                  (vaddr (vr 1))
+                  (pd (or (a64-phys-reg vd) +a64-x16+))
+                  (pa (ensure-src vaddr +a64-x17+)))
+             (emit-aarch64-gc-mark-start buf)   ; x24 = new object base
+             (a64-load-imm64 buf +a64-x16+ #x116)
+             (a64-stur buf +a64-x16+ +a64-x24+ 0)
+             (a64-stur buf pa +a64-x24+ 8)
+             ;; Tagged result = alloc_ptr + 9 (object tag, as in :alloc-obj).
+             (a64-add-imm buf pd +a64-x24+ 9)
+             (a64-add-imm buf +a64-x24+ +a64-x24+ 16)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ((= op +op-sap-addr+)
+           ;; Raw address out, TAGGED as a fixnum (as on x64/i386) so it can
+           ;; be handed to a syscall that untags every argument.
+           (let* ((vd (vr 0))
+                  (vsap (vr 1))
+                  (pd (or (a64-phys-reg vd) +a64-x17+))
+                  (ps (ensure-src vsap +a64-x16+)))
+             (a64-ldur buf pd ps (- 8 9))       ; slot 0 at sap - 9 + 8
+             (a64-lsl-imm buf pd pd 1)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
           ;; ---- OBJ-REF Vd, Vobj, idx:imm8 ----
           ;; Load slot: LDR Vd, [Vobj + idx*8 - tag_offset]
           ((= op +op-obj-ref+)

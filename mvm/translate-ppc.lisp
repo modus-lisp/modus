@@ -108,11 +108,28 @@
    168 bytes used + 32 frame slots = 200, rounded to 208 for 8-byte alignment.")
 
 (defconstant +ppc-frame-slot-base+ 208
-  "VFP-relative offset for frame slot 0 (local variables via obj-ref VFP).
+  "VFP-relative offset for frame slot 0 on PPC64 (locals via obj-ref VFP).
    Frame slots are at VFP + frame-slot-base + idx*word_size.
-   This is above all spill slots to avoid overlap.
-   (PPC64: spill ends at 128+10*8=208; PPC32: spill ends at 128+10*4=168;
-    using 208 for both is safe and keeps the constant simple.)")
+   PPC64: spill ends at 128+10*8=208, and 208+8*8=272 fits the 336-byte frame.")
+
+(defconstant +ppc32-frame-slot-base+ 168
+  "Same, for PPC32 — and it is NOT 208.
+
+   Sharing the PPC64 constant put frame slot 0 at VFP+208 on a frame that is
+   208 bytes TOTAL: every local written through a frame slot landed outside
+   its own frame, on top of the caller's save area.  One `let` binding stayed
+   in a register and survived; a parameter plus two bindings did not, and
+   `(defun f (n) (let ((a 5) (b 2)) (+ a b)))` crashed ppc32 while the same
+   source passed on all seven other targets — including ppc64, which shares
+   this translator.
+
+   +ppc32-frame-size+'s own docstring already assumed this value (\"168 bytes
+   used + 32 frame slots = 200, rounded to 208\"); only the constant
+   disagreed.  Spill ends at 128+10*4=168, and 168+8*4=200 fits 208.")
+
+(defun ppc-frame-slot-base ()
+  "VFP-relative offset of frame slot 0 for the target being emitted."
+  (if *ppc-64-bit* +ppc-frame-slot-base+ +ppc32-frame-slot-base+))
 
 (defun ppc-word-size ()
   "Return the current word size (4 or 8)."
@@ -226,7 +243,17 @@
           (logand d #xFFFF)))
 
 (defun ppc-ds-form (opcode rt ra ds xo)
-  "Encode DS-form: opcode RT, DS(RA) - for ld/std"
+  "Encode DS-form: opcode RT, DS(RA) - for ld/std.
+
+   The DS field holds displacement/4 — the low two bits are the XO field —
+   so a displacement that is not a multiple of 4 CANNOT be encoded.  This
+   used to (ash ds -2) it away silently, which turned an offset of -1 (what
+   `ws - +tag-object+` comes to on ppc64: 8 - 9) into -4 and read the wrong
+   word.  Refuse instead: the caller must fold the tag into the base
+   register, which is what :obj-ref already does."
+  (assert (zerop (logand ds 3)) (ds)
+          "PPC DS-form displacement ~D is not a multiple of 4 — ld/std cannot ~
+           encode it.  Fold the object tag into the base register first." ds)
   (logior (ash (logand opcode #x3F) 26)
           (ash (logand rt #x1F) 21)
           (ash (logand ra #x1F) 16)
@@ -1038,7 +1065,17 @@
                  (ppc-store-vreg buf vd +ppc-scratch1+))))))
 
       ;;; --- Arithmetic ---
-      ((#.+op-add+ #.+op-add-checked+)
+      ((#.+op-add+ #.+op-add-checked+ #.+op-adds+)
+       ;; :ADDS shares this clause.  :adds/:subs are "arithmetic that also sets
+       ;; the overflow flag", for a following :bvs to branch on.  The result
+       ;; they compute is identical to :add/:sub -- translate-i386 uses the
+       ;; very same code for both pairs -- so the value is right here too.
+       ;; What is NOT provided is :bvs, which still traps: these back ends do
+       ;; not promote on overflow (see the :add-checked note), so a :bvs that
+       ;; silently fell through would be a quiet wrong answer rather than a
+       ;; visible gap.  RISC-V has no condition flags at all, so a faithful
+       ;; :bvs there needs the operands, not a flag -- that is a real design
+       ;; question, and it should stay loud until someone answers it.
        ;; :ADD-CHECKED shares this clause.  The checked opcodes mean "tagged
        ;; arithmetic that promotes to a bignum on overflow"; implementing the
        ;; promotion needs the generic-arith slow path, which these back ends do
@@ -1058,7 +1095,17 @@
              (unless (ppc-vreg-phys vd)
                (ppc-store-vreg buf vd pd))))))
 
-      ((#.+op-sub+ #.+op-sub-checked+)
+      ((#.+op-sub+ #.+op-sub-checked+ #.+op-subs+)
+       ;; :SUBS shares this clause.  :adds/:subs are "arithmetic that also sets
+       ;; the overflow flag", for a following :bvs to branch on.  The result
+       ;; they compute is identical to :add/:sub -- translate-i386 uses the
+       ;; very same code for both pairs -- so the value is right here too.
+       ;; What is NOT provided is :bvs, which still traps: these back ends do
+       ;; not promote on overflow (see the :add-checked note), so a :bvs that
+       ;; silently fell through would be a quiet wrong answer rather than a
+       ;; visible gap.  RISC-V has no condition flags at all, so a faithful
+       ;; :bvs there needs the operands, not a flag -- that is a real design
+       ;; question, and it should stay loud until someone answers it.
        ;; :SUB-CHECKED shares this clause.  The checked opcodes mean "tagged
        ;; arithmetic that promotes to a bignum on overflow"; implementing the
        ;; promotion needs the generic-arith slow path, which these back ends do
@@ -1522,11 +1569,17 @@
            (if (= vobj +vreg-vfp+)
                ;; Frame slot access: use safe VFP-relative offset above spill area
                (ppc-emit-load-word buf pd +ppc-r31+
-                                   (+ +ppc-frame-slot-base+ (* idx ws)))
+                                   (+ (ppc-frame-slot-base) (* idx ws)))
                ;; Normal object slot access
                (let ((pobj (vreg-or-scratch vobj +ppc-scratch1+)))
-                 (ppc-emit-addi buf +ppc-r0+ pobj (logand (- +tag-object+) #xFFFF))
-                 (ppc-emit-load-word buf pd +ppc-r0+ (* (1+ idx) ws))))
+                 ;; R0 CANNOT BE A BASE REGISTER ON POWERPC.  In a D-form load or
+               ;; store, rA=0 means the literal value zero, not the contents of
+               ;; r0 -- so `addi r0,pobj,-9; lwz pd,off(r0)` did not read the
+               ;; object at all, it read absolute address `off`.  The address
+               ;; goes in r12 instead.
+                 (ppc-emit-addi buf +ppc-scratch2+ pobj
+                                (logand (- +tag-object+) #xFFFF))
+                 (ppc-emit-load-word buf pd +ppc-scratch2+ (* (1+ idx) ws))))
            (unless (ppc-vreg-phys vd)
              (ppc-store-vreg buf vd pd)))))
 
@@ -1539,12 +1592,17 @@
                ;; Frame slot store: use safe VFP-relative offset above spill area
                (let ((ps (vreg-or-scratch vs +ppc-scratch1+)))
                  (ppc-emit-store-word buf ps +ppc-r31+
-                                      (+ +ppc-frame-slot-base+ (* idx ws))))
+                                      (+ (ppc-frame-slot-base) (* idx ws))))
                ;; Normal object slot store
-               (let ((pobj (vreg-or-scratch vobj +ppc-scratch1+))
-                     (ps (vreg-or-scratch vs +ppc-scratch2+)))
-                 (ppc-emit-addi buf +ppc-r0+ pobj (logand (- +tag-object+) #xFFFF))
-                 (ppc-emit-store-word buf ps +ppc-r0+ (* (1+ idx) ws)))))))
+               ;; See the r0-is-not-a-base note in :obj-ref above.  The
+               ;; address is finished into r12 FIRST, which frees r11 for the
+               ;; value even when the object itself arrived there.
+               (let ((pobj (vreg-or-scratch vobj +ppc-scratch1+)))
+                 (ppc-emit-addi buf +ppc-scratch2+ pobj
+                                (logand (- +tag-object+) #xFFFF))
+                 (let ((ps (vreg-or-scratch vs +ppc-scratch1+)))
+                   (ppc-emit-store-word buf ps +ppc-scratch2+
+                                        (* (1+ idx) ws))))))))
 
       (#.+op-obj-tag+
        (let ((vd (first operands))
@@ -1654,7 +1712,15 @@
            (unless (ppc-vreg-phys vd)
              (ppc-store-vreg buf vd pd)))))
 
-      (#.+op-gc-check+
+      ((#.+op-gc-check+ #.+op-gc-check-n+ #.+op-gc-check-r+)
+       ;; :GC-CHECK-N and :GC-CHECK-R share this clause.  They carry an
+       ;; allocation SIZE (a constant, or a runtime value) so a back end can
+       ;; check `VA + n < VL` rather than `VA < VL`.  None of x64, i386 or
+       ;; aarch64 uses the size either -- translate-i386 routes all three to
+       ;; the same plain VA-vs-VL comparison -- so doing the same here matches
+       ;; the reference back ends exactly.  What it replaces is worse than an
+       ;; imprecise check: RISC-V/PPC/68k TRAPPED on these opcodes, and
+       ;; make-array emits :gc-check-n, so no array could be allocated at all.
        (let ((gc-label (mvm-make-label))
              (ok-label (mvm-make-label)))
          (ppc-emit-cmpl-word buf +ppc-r19+ +ppc-r20+)
@@ -1758,6 +1824,198 @@
              (vs (second operands)))
          (let ((ps (vreg-or-scratch vs +ppc-scratch1+)))
            (ppc-emit-store-word buf ps +ppc-r13+ offset))))
+
+      ;;; --- Arrays ---
+      ;; Object layout as alloc-obj/obj-ref already use it here: tag 9
+      ;; (+tag-object+), header word at obj-9, element k at obj-9 + (1+k)*ws.
+      ;; The index arrives TAGGED (2k), so k*ws == tagged*(ws/2) and the
+      ;; element sits at obj + tagged*(ws/2) + ws - 9.
+      (#.+op-alloc-array+
+       ;; (alloc-array Vd Vcount) — Vcount is UNTAGGED (the compiler SAR'd it).
+       (let* ((vd (first operands))
+              (pc (vreg-or-scratch (second operands) +ppc-scratch1+))
+              (ws (ppc-word-size))
+              (pd (or (ppc-vreg-phys vd) +ppc-scratch1+)))
+         ;; header = (count << 8) | #x32   (array subtag, as on i386)
+         (ppc-emit-addi buf +ppc-scratch2+ 0 8)
+         (ppc-emit-shift-left buf +ppc-r0+ pc +ppc-scratch2+)
+         (ppc-emit-ori buf +ppc-r0+ +ppc-r0+ #x32)
+         (ppc-emit-store-word buf +ppc-r0+ +ppc-r19+ 0)
+         ;; bytes = align16((count + 1) * ws), computed in r0
+         (ppc-emit-addi buf +ppc-r0+ pc 1)
+         (ppc-emit-addi buf +ppc-scratch2+ 0 (if (= ws 8) 3 2))
+         (ppc-emit-shift-left buf +ppc-r0+ +ppc-r0+ +ppc-scratch2+)
+         (ppc-emit-addi buf +ppc-r0+ +ppc-r0+ 15)
+         (ppc-emit-andi-dot buf +ppc-r0+ +ppc-r0+ #xFFF0)
+         ;; result = VA | 9, then bump VA (order matters: VA is still the base)
+         (ppc-emit-ori buf pd +ppc-r19+ +tag-object+)
+         (ppc-emit-add buf +ppc-r19+ +ppc-r19+ +ppc-r0+)
+         (unless (ppc-vreg-phys vd)
+           (ppc-store-vreg buf vd pd))))
+
+      (#.+op-aref+
+       (let* ((vd (first operands))
+              (pobj (vreg-or-scratch (second operands) +ppc-scratch1+))
+              (pidx (vreg-or-scratch (third operands) +ppc-scratch2+))
+              (ws (ppc-word-size))
+              (pd (or (ppc-vreg-phys vd) +ppc-scratch1+)))
+         ;; Address in r12 — r0 is not a base register (see :obj-ref).
+         (ppc-emit-addi buf +ppc-r0+ 0 (if (= ws 8) 2 1))
+         (ppc-emit-shift-left buf +ppc-scratch2+ pidx +ppc-r0+)
+         (ppc-emit-add buf +ppc-scratch2+ +ppc-scratch2+ pobj)
+         ;; Tag folded into the BASE, so the displacement stays a clean
+         ;; multiple of the word size — ld's DS field cannot hold -1.
+         (ppc-emit-addi buf +ppc-scratch2+ +ppc-scratch2+
+                        (logand (- +tag-object+) #xFFFF))
+         (ppc-emit-load-word buf pd +ppc-scratch2+ ws)
+         (unless (ppc-vreg-phys vd)
+           (ppc-store-vreg buf vd pd))))
+
+      (#.+op-aset+
+       ;; (aset Vobj Vidx Vs)
+       (let* ((pobj (vreg-or-scratch (first operands) +ppc-scratch1+))
+              (pidx (vreg-or-scratch (second operands) +ppc-scratch2+))
+              (ws (ppc-word-size))
+              (pval (ppc-vreg-phys (third operands))))
+         ;; Address in r12 — r0 is not a base register (see :obj-ref).
+         (ppc-emit-addi buf +ppc-r0+ 0 (if (= ws 8) 2 1))
+         (ppc-emit-shift-left buf +ppc-scratch2+ pidx +ppc-r0+)
+         (ppc-emit-add buf +ppc-scratch2+ +ppc-scratch2+ pobj)
+         ;; The value is loaded LAST, into r11, which the address no longer
+         ;; needs, so computing the address cannot clobber it.
+         (let ((pv (or pval
+                       (progn (ppc-load-vreg buf +ppc-scratch1+ (third operands))
+                              +ppc-scratch1+))))
+           ;; Tag folded into the BASE — see :aref.
+           (ppc-emit-addi buf +ppc-scratch2+ +ppc-scratch2+
+                          (logand (- +tag-object+) #xFFFF))
+           (ppc-emit-store-word buf pv +ppc-scratch2+ ws))))
+
+      (#.+op-array-len+
+       ;; count = (header >> 8) & 0xFFFFFF, returned TAGGED.
+       (let* ((vd (first operands))
+              (pobj (vreg-or-scratch (second operands) +ppc-scratch1+))
+              (ws (ppc-word-size))
+              (bits (* 8 ws))
+              (pd (or (ppc-vreg-phys vd) +ppc-scratch1+)))
+         (ppc-emit-addi buf +ppc-scratch2+ pobj
+                        (logand (- +tag-object+) #xFFFF))
+         (ppc-emit-load-word buf pd +ppc-scratch2+ 0)
+         (ppc-emit-addi buf +ppc-r0+ 0 8)
+         (ppc-emit-shift-right buf pd pd +ppc-r0+)
+         ;; mask to 24 bits by shifting out and back
+         (ppc-emit-addi buf +ppc-r0+ 0 (- bits 24))
+         (ppc-emit-shift-left buf pd pd +ppc-r0+)
+         (ppc-emit-addi buf +ppc-r0+ 0 (- bits 24))
+         (ppc-emit-shift-right buf pd pd +ppc-r0+)
+         (ppc-emit-addi buf +ppc-r0+ 0 1)
+         (ppc-emit-shift-left buf pd pd +ppc-r0+)   ; tag as fixnum
+         (unless (ppc-vreg-phys vd)
+           (ppc-store-vreg buf vd pd))))
+
+      ;;; --- Byte vectors and strings ---
+      ;; Payload starts right after the header word, at obj - 9 + ws.
+      ;; Shapes mirror translate-i386, including which operands arrive
+      ;; TAGGED: :alloc-u8 untags its count here, :alloc-string's has already
+      ;; been SAR'd by the compiler.
+      (#.+op-alloc-u8+
+       (let* ((vd (first operands))
+              (pc (vreg-or-scratch (second operands) +ppc-scratch1+))
+              (ws (ppc-word-size))
+              (pd (or (ppc-vreg-phys vd) +ppc-scratch1+)))
+         (ppc-emit-shift-right-arith-imm buf +ppc-scratch2+ pc 1)   ; N
+         (ppc-emit-addi buf +ppc-r0+ 0 8)
+         (ppc-emit-shift-left buf +ppc-r0+ +ppc-scratch2+ +ppc-r0+)
+         (ppc-emit-ori buf +ppc-r0+ +ppc-r0+ #x11)                  ; u8 subtag
+         (ppc-emit-store-word buf +ppc-r0+ +ppc-r19+ 0)
+         ;; bytes = align16(N + ws)
+         (ppc-emit-addi buf +ppc-r0+ +ppc-scratch2+ ws)
+         (ppc-emit-addi buf +ppc-r0+ +ppc-r0+ 15)
+         (ppc-emit-andi-dot buf +ppc-r0+ +ppc-r0+ #xFFF0)
+         (ppc-emit-ori buf pd +ppc-r19+ +tag-object+)
+         (ppc-emit-add buf +ppc-r19+ +ppc-r19+ +ppc-r0+)
+         (unless (ppc-vreg-phys vd)
+           (ppc-store-vreg buf vd pd))))
+
+      (#.+op-alloc-string+
+       ;; One character CODE per WORD.
+       (let* ((vd (first operands))
+              (pc (vreg-or-scratch (second operands) +ppc-scratch1+))
+              (ws (ppc-word-size))
+              (pd (or (ppc-vreg-phys vd) +ppc-scratch1+)))
+         (ppc-emit-addi buf +ppc-scratch2+ 0 8)
+         (ppc-emit-shift-left buf +ppc-r0+ pc +ppc-scratch2+)
+         (ppc-emit-ori buf +ppc-r0+ +ppc-r0+ #x31)                  ; string subtag
+         (ppc-emit-store-word buf +ppc-r0+ +ppc-r19+ 0)
+         (ppc-emit-addi buf +ppc-r0+ pc 1)
+         (ppc-emit-addi buf +ppc-scratch2+ 0 (if (= ws 8) 3 2))
+         (ppc-emit-shift-left buf +ppc-r0+ +ppc-r0+ +ppc-scratch2+)
+         (ppc-emit-addi buf +ppc-r0+ +ppc-r0+ 15)
+         (ppc-emit-andi-dot buf +ppc-r0+ +ppc-r0+ #xFFF0)
+         (ppc-emit-ori buf pd +ppc-r19+ +tag-object+)
+         (ppc-emit-add buf +ppc-r19+ +ppc-r19+ +ppc-r0+)
+         (unless (ppc-vreg-phys vd)
+           (ppc-store-vreg buf vd pd))))
+
+      (#.+op-u8-ref+
+       (let* ((vd (first operands))
+              (parr (vreg-or-scratch (second operands) +ppc-scratch1+))
+              (pidx (vreg-or-scratch (third operands) +ppc-scratch2+))
+              (ws (ppc-word-size))
+              (pd (or (ppc-vreg-phys vd) +ppc-scratch1+)))
+         ;; Address in r12 — r0 is not a base register (see :obj-ref).
+         (ppc-emit-shift-right-arith-imm buf +ppc-scratch2+ pidx 1)
+         (ppc-emit-add buf +ppc-scratch2+ +ppc-scratch2+ parr)
+         (ppc-emit-lbz buf pd +ppc-scratch2+ (- ws +tag-object+))
+         (ppc-emit-addi buf +ppc-r0+ 0 1)
+         (ppc-emit-shift-left buf pd pd +ppc-r0+)                   ; tag
+         (unless (ppc-vreg-phys vd)
+           (ppc-store-vreg buf vd pd))))
+
+      (#.+op-u8-set+
+       ;; (u8-set Varr Vidx Vval) — Vidx and Vval both TAGGED.
+       (let* ((parr (vreg-or-scratch (first operands) +ppc-scratch1+))
+              (pidx (vreg-or-scratch (second operands) +ppc-scratch2+))
+              (ws (ppc-word-size)))
+         ;; Address in r12 — r0 is not a base register (see :obj-ref).
+         (ppc-emit-shift-right-arith-imm buf +ppc-scratch2+ pidx 1)
+         (ppc-emit-add buf +ppc-scratch2+ +ppc-scratch2+ parr)
+         ;; Value loaded LAST, into r11, and untagged in r0 (a fine VALUE
+         ;; register — only the BASE position treats r0 as zero).
+         (let ((pv (or (ppc-vreg-phys (third operands))
+                       (progn (ppc-load-vreg buf +ppc-scratch1+ (third operands))
+                              +ppc-scratch1+))))
+           (ppc-emit-shift-right-arith-imm buf +ppc-r0+ pv 1)
+           (ppc-emit-stb buf +ppc-r0+ +ppc-scratch2+ (- ws +tag-object+)))))
+
+      ;;; --- System area pointers ---
+      ;; One-slot object, subtag #x16: header (1<<8)|#x16 then the raw address.
+      (#.+op-sap-new+
+       (let* ((vd (first operands))
+              (pa (vreg-or-scratch (second operands) +ppc-scratch1+))
+              (ws (ppc-word-size))
+              (pd (or (ppc-vreg-phys vd) +ppc-scratch1+)))
+         (ppc-emit-li buf +ppc-r0+ #x116)
+         (ppc-emit-store-word buf +ppc-r0+ +ppc-r19+ 0)
+         (ppc-emit-store-word buf pa +ppc-r19+ ws)
+         (ppc-emit-ori buf pd +ppc-r19+ +tag-object+)
+         (ppc-emit-addi buf +ppc-r19+ +ppc-r19+ 16)
+         (unless (ppc-vreg-phys vd)
+           (ppc-store-vreg buf vd pd))))
+
+      (#.+op-sap-addr+
+       ;; Raw address out, TAGGED as a fixnum (as on x64/i386).
+       (let* ((vd (first operands))
+              (ps (vreg-or-scratch (second operands) +ppc-scratch1+))
+              (ws (ppc-word-size))
+              (pd (or (ppc-vreg-phys vd) +ppc-scratch1+)))
+         (ppc-emit-addi buf +ppc-scratch2+ ps
+                        (logand (- +tag-object+) #xFFFF))
+         (ppc-emit-load-word buf pd +ppc-scratch2+ ws)
+         (ppc-emit-addi buf +ppc-r0+ 0 1)
+         (ppc-emit-shift-left buf pd pd +ppc-r0+)
+         (unless (ppc-vreg-phys vd)
+           (ppc-store-vreg buf vd pd))))
 
       ;;; --- Calling-convention slots ---
       ;; These fell into the OTHERWISE trap below.  :set-nargs precedes every

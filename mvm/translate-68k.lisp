@@ -979,14 +979,23 @@
 ;;; Prologue / Epilogue
 ;;; ============================================================
 
-(defconstant +68k-frame-slot-base+ -64
+(defconstant +68k-frame-slot-base+ -72
   "A6-relative offset for frame slot 0 (local variables via obj-ref VFP).
    Frame slots grow downward: slot N is at A6 + frame-slot-base - N*4.
-   This is below all spill slots (which end at A6-60) to avoid overlap.")
 
-(defconstant +68k-frame-size+ 96
-  "Stack frame size: 60 bytes spill area + 32 bytes frame slots = 92,
-   rounded to 96 for alignment.")
+   This MUST stay below the last spill slot.  Reserving D0/D1 as the
+   translator's scratch pushed V6 and V7 out of registers and into the spill
+   area, which grew it by 8 bytes (it now ends at A6-68 rather than A6-60).
+   The old -64 base then overlapped the V14/V15 spill slots: a local and a
+   spilled vreg shared a word, and `(cons 40 2)` returned through a smashed
+   pointer -- the 68k ran off to an odd PC (0x006f4001) and took an address
+   error.  Move the base down by the same 8 bytes the spill area gained.")
+
+(defconstant +68k-frame-size+ 128
+  "Stack frame size: 68 bytes spill area (V6-V15) + 56 bytes of frame slots
+   (14 slots from A6-72 down to A6-124) = 124, rounded to 128.
+   Grown from 96 alongside the frame-slot base above; at 96 the slots would
+   have run off the bottom of the frame instead of merely colliding.")
 
 (defun m68k-emit-prologue (buf)
   "Emit 68k function prologue. LINK + save callee-saved registers."
@@ -1175,7 +1184,17 @@
               (m68k-store-vreg buf vd +68k-d0+))))))
 
       ;;; --- Arithmetic ---
-      ((#.+op-add+ #.+op-add-checked+)
+      ((#.+op-add+ #.+op-add-checked+ #.+op-adds+)
+       ;; :ADDS shares this clause.  :adds/:subs are "arithmetic that also sets
+       ;; the overflow flag", for a following :bvs to branch on.  The result
+       ;; they compute is identical to :add/:sub -- translate-i386 uses the
+       ;; very same code for both pairs -- so the value is right here too.
+       ;; What is NOT provided is :bvs, which still traps: these back ends do
+       ;; not promote on overflow (see the :add-checked note), so a :bvs that
+       ;; silently fell through would be a quiet wrong answer rather than a
+       ;; visible gap.  RISC-V has no condition flags at all, so a faithful
+       ;; :bvs there needs the operands, not a flag -- that is a real design
+       ;; question, and it should stay loud until someone answers it.
        ;; :ADD-CHECKED shares this clause.  The checked opcodes mean "tagged
        ;; arithmetic that promotes to a bignum on overflow"; implementing the
        ;; promotion needs the generic-arith slow path, which these back ends do
@@ -1196,7 +1215,17 @@
            (m68k-emit-add-dn-dn buf db +68k-d0+)
            (m68k-store-vreg buf vd +68k-d0+))))
 
-      ((#.+op-sub+ #.+op-sub-checked+)
+      ((#.+op-sub+ #.+op-sub-checked+ #.+op-subs+)
+       ;; :SUBS shares this clause.  :adds/:subs are "arithmetic that also sets
+       ;; the overflow flag", for a following :bvs to branch on.  The result
+       ;; they compute is identical to :add/:sub -- translate-i386 uses the
+       ;; very same code for both pairs -- so the value is right here too.
+       ;; What is NOT provided is :bvs, which still traps: these back ends do
+       ;; not promote on overflow (see the :add-checked note), so a :bvs that
+       ;; silently fell through would be a quiet wrong answer rather than a
+       ;; visible gap.  RISC-V has no condition flags at all, so a faithful
+       ;; :bvs there needs the operands, not a flag -- that is a real design
+       ;; question, and it should stay loud until someone answers it.
        ;; :SUB-CHECKED shares this clause.  The checked opcodes mean "tagged
        ;; arithmetic that promotes to a bignum on overflow"; implementing the
        ;; promotion needs the generic-arith slow path, which these back ends do
@@ -1797,12 +1826,29 @@
          (m68k-emit-addq-an buf +68k-a2+ 8)
          (m68k-store-vreg buf vd +68k-d0+)))
 
-      (#.+op-gc-check+
-       ;; Compare A2 (VA) against A3 (VL)
-       (m68k-emit-cmpa-an buf +68k-a2+ +68k-a3+)
+      ((#.+op-gc-check+ #.+op-gc-check-n+ #.+op-gc-check-r+)
+       ;; :GC-CHECK-N and :GC-CHECK-R share this clause.  They carry an
+       ;; allocation SIZE (a constant, or a runtime value) so a back end can
+       ;; check `VA + n < VL` rather than `VA < VL`.  None of x64, i386 or
+       ;; aarch64 uses the size either -- translate-i386 routes all three to
+       ;; the same plain VA-vs-VL comparison -- so doing the same here matches
+       ;; the reference back ends exactly.  What it replaces is worse than an
+       ;; imprecise check: RISC-V/PPC/68k TRAPPED on these opcodes, and
+       ;; make-array emits :gc-check-n, so no array could be allocated at all.
+       ;; Room remains while VA (A2, alloc pointer) is below VL (A3, limit).
+       ;;
+       ;; THE OPERAND ORDER WAS REVERSED AND THE TEST RAN BACKWARDS.
+       ;; m68k-emit-cmpa-an takes (src dst) and emits CMPA.L src,dst, which
+       ;; computes dst - src; carry is the BORROW, so it is set when dst <
+       ;; src.  Comparing (A2, A3) therefore computed A3 - A2 and set carry
+       ;; when VL < VA -- out of memory -- and the branch treated that as the
+       ;; OK case.  Every allocation with room available fell through to the
+       ;; ILLEGAL instead: `(cons 42 0)` trapped on the first cons, which is
+       ;; why 68k passed arithmetic and recursion but could not build a pair.
+       ;; Comparing (A3, A2) computes A2 - A3, so carry set means VA < VL.
+       (m68k-emit-cmpa-an buf +68k-a3+ +68k-a2+)
        (let ((ok-label (mvm-make-label)))
-         ;; If A2 < A3 (unsigned), still room
-         (m68k-emit-bcc-word buf +68k-cc-cs+ ok-label)  ; CS = carry set = A3 > A2
+         (m68k-emit-bcc-word buf +68k-cc-cs+ ok-label)  ; CS = VA < VL = room
          ;; GC needed: trap
          (m68k-emit-illegal buf)
          (m68k-emit-label buf ok-label)))
@@ -1915,6 +1961,177 @@
          (m68k-emit-move-imm-an buf offset +68k-a0+)
          (m68k-load-vreg buf +68k-d0+ vs)
          (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a0+)))
+
+      ;;; --- Arrays ---
+      ;; Object layout as obj-ref already uses it here: tag 9 (+tag-object+),
+      ;; header longword at obj-9, element k at obj-9 + (1+k)*4.  The index
+      ;; arrives TAGGED (2k), so k*4 == tagged*2 and the element sits at
+      ;; obj + tagged*2 - 5.  D0/D1 are the reserved scratch, A0 the address
+      ;; scratch, A2 the alloc pointer (VA).
+      (#.+op-alloc-array+
+       ;; (alloc-array Vd Vcount) — Vcount is UNTAGGED (the compiler SAR'd it).
+       (let ((vd (first operands))
+             (vcount (second operands)))
+         ;; D1 = count (kept); D0 = header, stored at (A2).
+         (m68k-load-vreg buf +68k-d1+ vcount)
+         (m68k-emit-move-dn-dn buf +68k-d1+ +68k-d0+)
+         (m68k-emit-lsl-imm buf +68k-d0+ 8)
+         (m68k-emit-ori buf +68k-d0+ #x32)             ; array subtag
+         (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a2+)
+         ;; D0 = VA | 9 — the RESULT, taken before the pointer is bumped.
+         (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
+         (m68k-emit-ori buf +68k-d0+ +tag-object+)
+         (m68k-store-vreg buf vd +68k-d0+)
+         ;; D1 = align16((count + 1) * 4), then A2 += D1.
+         (m68k-emit-addi buf +68k-d1+ 1)
+         (m68k-emit-lsl-imm buf +68k-d1+ 2)
+         (m68k-emit-addi buf +68k-d1+ 15)
+         (m68k-emit-andi buf +68k-d1+ (logand (lognot 15) #xFFFFFFFF))
+         (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
+         (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a2+)))
+
+      (#.+op-aref+
+       (let ((vd (first operands))
+             (vobj (second operands))
+             (vidx (third operands)))
+         (m68k-load-vreg buf +68k-d0+ vidx)
+         (m68k-emit-lsl-imm buf +68k-d0+ 1)            ; tagged*2 = k*4
+         (m68k-load-vreg buf +68k-d1+ vobj)
+         (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)   ; D0 += Vobj
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+         (m68k-emit-move-disp-dn buf +68k-a0+ (- 4 +tag-object+) +68k-d0+)
+         (m68k-store-vreg buf vd +68k-d0+)))
+
+      (#.+op-aset+
+       ;; (aset Vobj Vidx Vs).  The address is finished into A0 FIRST, so the
+       ;; value can then own D0 without either clobbering the other.
+       (let ((vobj (first operands))
+             (vidx (second operands))
+             (vs (third operands)))
+         (m68k-load-vreg buf +68k-d0+ vidx)
+         (m68k-emit-lsl-imm buf +68k-d0+ 1)
+         (m68k-load-vreg buf +68k-d1+ vobj)
+         (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+         (m68k-load-vreg buf +68k-d0+ vs)
+         (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a0+ (- 4 +tag-object+))))
+
+      (#.+op-array-len+
+       ;; count = (header >> 8) & 0xFFFFFF, returned TAGGED.
+       (let ((vd (first operands))
+             (vobj (second operands)))
+         (m68k-load-vreg buf +68k-d0+ vobj)
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+         (m68k-emit-move-disp-dn buf +68k-a0+ (- +tag-object+) +68k-d0+)
+         (m68k-emit-lsr-imm buf +68k-d0+ 8)
+         (m68k-emit-andi buf +68k-d0+ #xFFFFFF)
+         (m68k-emit-lsl-imm buf +68k-d0+ 1)            ; tag as fixnum
+         (m68k-store-vreg buf vd +68k-d0+)))
+
+      ;;; --- Byte vectors and strings ---
+      ;; Payload starts right after the header longword, at obj - 9 + 4, i.e.
+      ;; obj - 5.  The 68k has no byte move with a displacement here, so the
+      ;; -5 is folded into the address before it reaches A0.  Shapes mirror
+      ;; translate-i386, including which operands arrive TAGGED.
+      (#.+op-alloc-u8+
+       (let ((vd (first operands))
+             (vcount (second operands)))
+         (m68k-load-vreg buf +68k-d1+ vcount)
+         (m68k-emit-asr-imm buf +68k-d1+ 1)              ; N = count >> 1
+         (m68k-emit-move-dn-dn buf +68k-d1+ +68k-d0+)
+         (m68k-emit-lsl-imm buf +68k-d0+ 8)
+         (m68k-emit-ori buf +68k-d0+ #x11)               ; u8-vector subtag
+         (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a2+)
+         ;; result = VA | 9, taken BEFORE the pointer is bumped
+         (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
+         (m68k-emit-ori buf +68k-d0+ +tag-object+)
+         (m68k-store-vreg buf vd +68k-d0+)
+         ;; bytes = align16(N + 4)
+         (m68k-emit-addi buf +68k-d1+ 19)                ; N + 4 + 15
+         (m68k-emit-andi buf +68k-d1+ (logand (lognot 15) #xFFFFFFFF))
+         (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
+         (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a2+)))
+
+      (#.+op-alloc-string+
+       ;; One character CODE per WORD; count already UNTAGGED by the compiler.
+       (let ((vd (first operands))
+             (vcount (second operands)))
+         (m68k-load-vreg buf +68k-d1+ vcount)
+         (m68k-emit-move-dn-dn buf +68k-d1+ +68k-d0+)
+         (m68k-emit-lsl-imm buf +68k-d0+ 8)
+         (m68k-emit-ori buf +68k-d0+ #x31)               ; string subtag
+         (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a2+)
+         (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
+         (m68k-emit-ori buf +68k-d0+ +tag-object+)
+         (m68k-store-vreg buf vd +68k-d0+)
+         ;; bytes = align16((count + 1) * 4)
+         (m68k-emit-addi buf +68k-d1+ 1)
+         (m68k-emit-lsl-imm buf +68k-d1+ 2)
+         (m68k-emit-addi buf +68k-d1+ 15)
+         (m68k-emit-andi buf +68k-d1+ (logand (lognot 15) #xFFFFFFFF))
+         (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
+         (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a2+)))
+
+      (#.+op-u8-ref+
+       (let ((vd (first operands))
+             (varr (second operands))
+             (vidx (third operands)))
+         (m68k-load-vreg buf +68k-d0+ vidx)
+         (m68k-emit-asr-imm buf +68k-d0+ 1)
+         (m68k-load-vreg buf +68k-d1+ varr)
+         (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
+         (m68k-emit-subi buf +68k-d0+ 5)                 ; tag 9 - header 4
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+         (m68k-emit-move-byte-an-ind-dn buf +68k-a0+ +68k-d0+)
+         (m68k-emit-andi buf +68k-d0+ #xFF)              ; MOVE.B leaves the top
+         (m68k-emit-lsl-imm buf +68k-d0+ 1)              ; tag as fixnum
+         (m68k-store-vreg buf vd +68k-d0+)))
+
+      (#.+op-u8-set+
+       ;; (u8-set Varr Vidx Vval) — Vidx and Vval both TAGGED.  The address is
+       ;; finished into A0 first, so the value can then own D0.
+       (let ((varr (first operands))
+             (vidx (second operands))
+             (vval (third operands)))
+         (m68k-load-vreg buf +68k-d0+ vidx)
+         (m68k-emit-asr-imm buf +68k-d0+ 1)
+         (m68k-load-vreg buf +68k-d1+ varr)
+         (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
+         (m68k-emit-subi buf +68k-d0+ 5)
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+         (m68k-load-vreg buf +68k-d0+ vval)
+         (m68k-emit-asr-imm buf +68k-d0+ 1)
+         (m68k-emit-move-byte-dn-an-ind buf +68k-d0+ +68k-a0+)))
+
+      ;;; --- System area pointers ---
+      ;; One-slot object, subtag #x16: header (1<<8)|#x16 then the raw address.
+      (#.+op-sap-new+
+       (let ((vd (first operands))
+             (vaddr (second operands)))
+         ;; Payload first — the allocation sequence below owns D0.
+         (m68k-load-vreg buf +68k-d1+ vaddr)
+         (m68k-emit-move-imm-dn buf #x116 +68k-d0+)
+         (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a2+)
+         (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a2+ 4)
+         (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
+         (m68k-emit-ori buf +68k-d0+ +tag-object+)
+         (m68k-store-vreg buf vd +68k-d0+)
+         (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
+         (m68k-emit-addi buf +68k-d0+ 16)
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a2+)))
+
+      (#.+op-sap-addr+
+       ;; Raw address out, TAGGED as a fixnum (as on x64/i386).
+       (let ((vd (first operands))
+             (vsap (second operands)))
+         (m68k-load-vreg buf +68k-d0+ vsap)
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+         (m68k-emit-move-disp-dn buf +68k-a0+ (- 4 +tag-object+) +68k-d0+)
+         (m68k-emit-lsl-imm buf +68k-d0+ 1)
+         (m68k-store-vreg buf vd +68k-d0+)))
 
       ;;; --- Calling-convention slots ---
       ;; These fell into the OTHERWISE branch below, which emits ILLEGAL.

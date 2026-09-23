@@ -709,7 +709,17 @@
 
       ;; ---- Arithmetic (tagged fixnums: value << 1 | 0) ----
       ;; For add/sub the tag bits cancel out: (a<<1) + (b<<1) = (a+b)<<1
-      ((#.+op-add+ #.+op-add-checked+)
+      ((#.+op-add+ #.+op-add-checked+ #.+op-adds+)
+       ;; :ADDS shares this clause.  :adds/:subs are "arithmetic that also sets
+       ;; the overflow flag", for a following :bvs to branch on.  The result
+       ;; they compute is identical to :add/:sub -- translate-i386 uses the
+       ;; very same code for both pairs -- so the value is right here too.
+       ;; What is NOT provided is :bvs, which still traps: these back ends do
+       ;; not promote on overflow (see the :add-checked note), so a :bvs that
+       ;; silently fell through would be a quiet wrong answer rather than a
+       ;; visible gap.  RISC-V has no condition flags at all, so a faithful
+       ;; :bvs there needs the operands, not a flag -- that is a real design
+       ;; question, and it should stay loud until someone answers it.
        ;; :ADD-CHECKED shares this clause.  The checked opcodes mean "tagged
        ;; arithmetic that promotes to a bignum on overflow"; implementing the
        ;; promotion needs the generic-arith slow path, which these back ends do
@@ -725,7 +735,17 @@
          (rv-emit-add buf +rv-t0+ ra rb)
          (store-result vd +rv-t0+)))
 
-      ((#.+op-sub+ #.+op-sub-checked+)
+      ((#.+op-sub+ #.+op-sub-checked+ #.+op-subs+)
+       ;; :SUBS shares this clause.  :adds/:subs are "arithmetic that also sets
+       ;; the overflow flag", for a following :bvs to branch on.  The result
+       ;; they compute is identical to :add/:sub -- translate-i386 uses the
+       ;; very same code for both pairs -- so the value is right here too.
+       ;; What is NOT provided is :bvs, which still traps: these back ends do
+       ;; not promote on overflow (see the :add-checked note), so a :bvs that
+       ;; silently fell through would be a quiet wrong answer rather than a
+       ;; visible gap.  RISC-V has no condition flags at all, so a faithful
+       ;; :bvs there needs the operands, not a flag -- that is a real design
+       ;; question, and it should stay loud until someone answers it.
        ;; :SUB-CHECKED shares this clause.  The checked opcodes mean "tagged
        ;; arithmetic that promotes to a bignum on overflow"; implementing the
        ;; promotion needs the generic-arith slow path, which these back ends do
@@ -1208,7 +1228,15 @@
          (rv-emit-addi buf +rv-s8+ +rv-s8+ 16)   ; bump alloc
          (store-result vd +rv-t0+)))
 
-      (#.+op-gc-check+
+      ((#.+op-gc-check+ #.+op-gc-check-n+ #.+op-gc-check-r+)
+       ;; :GC-CHECK-N and :GC-CHECK-R share this clause.  They carry an
+       ;; allocation SIZE (a constant, or a runtime value) so a back end can
+       ;; check `VA + n < VL` rather than `VA < VL`.  None of x64, i386 or
+       ;; aarch64 uses the size either -- translate-i386 routes all three to
+       ;; the same plain VA-vs-VL comparison -- so doing the same here matches
+       ;; the reference back ends exactly.  What it replaces is worse than an
+       ;; imprecise check: RISC-V/PPC/68k TRAPPED on these opcodes, and
+       ;; make-array emits :gc-check-n, so no array could be allocated at all.
        ;; Compare VA (alloc pointer) with VL (alloc limit)
        ;; If VA >= VL, call GC
        ;; blt VA, VL, +8  (skip ecall if below limit)
@@ -1335,6 +1363,141 @@
                (rv-emit-li buf +rv-t0+ offset)
                (rv-emit-add buf +rv-t0+ +rv-tp+ +rv-t0+)
                (rv-emit-sd buf rs +rv-t0+ 0)))))
+
+      ;; ---- Arrays ----
+      ;; Object layout, as alloc-obj/obj-ref already use it on this target:
+      ;; tag 2, header word at obj-2, element k at obj-2 + (1+k)*8.  The index
+      ;; arrives TAGGED (2k), so k*8 == tagged*4 and the element sits at
+      ;; obj + tagged*4 + 6 -- which is 8-aligned, since obj is raw+2.
+      (#.+op-alloc-array+
+       ;; (alloc-array Vd Vcount) — Vcount is UNTAGGED (the compiler SAR'd it).
+       (let* ((vd (vreg 0))
+              (rc (resolve (vreg 1) +rv-t2+)))
+         ;; header = (count << 8) | #x32   (array subtag, as on i386/arm32)
+         (rv-emit-slli buf +rv-t0+ rc 8)
+         (rv-emit-addi buf +rv-t0+ +rv-t0+ #x32)
+         (rv-emit-sd buf +rv-t0+ +rv-s8+ 0)
+         ;; bytes = align16((count + 1) * 8)
+         (rv-emit-addi buf +rv-t1+ rc 1)
+         (rv-emit-slli buf +rv-t1+ +rv-t1+ 3)
+         (rv-emit-addi buf +rv-t1+ +rv-t1+ 15)
+         (rv-emit-andi buf +rv-t1+ +rv-t1+ -16)
+         ;; result = VA + 2 (VA stays 16-aligned, so ADDI is exact tagging)
+         (rv-emit-addi buf +rv-t0+ +rv-s8+ 2)
+         (rv-emit-add buf +rv-s8+ +rv-s8+ +rv-t1+)
+         (store-result vd +rv-t0+)))
+
+      (#.+op-aref+
+       (let* ((vd (vreg 0))
+              (robj (resolve (vreg 1)))
+              (ridx (resolve2 (vreg 2))))
+         (rv-emit-slli buf +rv-t2+ ridx 2)
+         (rv-emit-add buf +rv-t2+ +rv-t2+ robj)
+         (rv-emit-ld buf +rv-t2+ +rv-t2+ 6)
+         (store-result vd +rv-t2+)))
+
+      (#.+op-aset+
+       ;; (aset Vobj Vidx Vs).  The value is materialised BEFORE t1 is reused
+       ;; as the address, and neither resolve target can be t1.
+       (let* ((robj (resolve (vreg 0)))
+              (rval (rv-vreg-or-load buf (vreg 2) +rv-t2+))
+              (ridx (rv-vreg-or-load buf (vreg 1) +rv-t1+)))
+         (rv-emit-slli buf +rv-t1+ ridx 2)
+         (rv-emit-add buf +rv-t1+ +rv-t1+ robj)
+         (rv-emit-sd buf rval +rv-t1+ 6)))
+
+      (#.+op-array-len+
+       ;; count = (header >> 8) & 0xFFFFFF, returned TAGGED.
+       (let* ((vd (vreg 0))
+              (robj (resolve (vreg 1))))
+         (rv-emit-ld buf +rv-t0+ robj -2)
+         (rv-emit-srli buf +rv-t0+ +rv-t0+ 8)
+         (rv-emit-slli buf +rv-t0+ +rv-t0+ 40)   ; mask to 24 bits
+         (rv-emit-srli buf +rv-t0+ +rv-t0+ 40)
+         (rv-emit-slli buf +rv-t0+ +rv-t0+ 1)    ; tag as fixnum
+         (store-result vd +rv-t0+)))
+
+      ;; ---- Byte vectors and strings ----
+      ;; Payload starts right after the header word, at obj - 2 + 8 = obj + 6.
+      ;; Mirrors translate-i386's shapes exactly, including which operands
+      ;; arrive TAGGED: :alloc-u8 takes a tagged count and untags it here,
+      ;; while :alloc-string's count has already been SAR'd by the compiler
+      ;; (see the :alloc-array/:alloc-string note in cross.lisp).
+      (#.+op-alloc-u8+
+       (let* ((vd (vreg 0))
+              (rc (resolve (vreg 1) +rv-t2+)))
+         (rv-emit-srai buf +rv-t2+ rc 1)              ; N = count >> 1
+         ;; header = (N << 8) | #x11   (u8-vector subtag)
+         (rv-emit-slli buf +rv-t0+ +rv-t2+ 8)
+         (rv-emit-addi buf +rv-t0+ +rv-t0+ #x11)
+         (rv-emit-sd buf +rv-t0+ +rv-s8+ 0)
+         ;; bytes = align16(N + 8)  — header word plus the byte payload
+         (rv-emit-addi buf +rv-t1+ +rv-t2+ 8)
+         (rv-emit-addi buf +rv-t1+ +rv-t1+ 15)
+         (rv-emit-andi buf +rv-t1+ +rv-t1+ -16)
+         (rv-emit-addi buf +rv-t0+ +rv-s8+ 2)
+         (rv-emit-add buf +rv-s8+ +rv-s8+ +rv-t1+)
+         (store-result vd +rv-t0+)))
+
+      (#.+op-alloc-string+
+       ;; One character CODE per WORD, as on every other target.
+       (let* ((vd (vreg 0))
+              (rc (resolve (vreg 1) +rv-t2+)))
+         (rv-emit-slli buf +rv-t0+ rc 8)
+         (rv-emit-addi buf +rv-t0+ +rv-t0+ #x31)      ; string subtag
+         (rv-emit-sd buf +rv-t0+ +rv-s8+ 0)
+         (rv-emit-addi buf +rv-t1+ rc 1)
+         (rv-emit-slli buf +rv-t1+ +rv-t1+ 3)
+         (rv-emit-addi buf +rv-t1+ +rv-t1+ 15)
+         (rv-emit-andi buf +rv-t1+ +rv-t1+ -16)
+         (rv-emit-addi buf +rv-t0+ +rv-s8+ 2)
+         (rv-emit-add buf +rv-s8+ +rv-s8+ +rv-t1+)
+         (store-result vd +rv-t0+)))
+
+      (#.+op-u8-ref+
+       ;; (u8-ref Vd Varr Vidx) — Vidx TAGGED, result TAGGED.
+       (let* ((vd (vreg 0))
+              (rarr (resolve (vreg 1)))
+              (ridx (resolve2 (vreg 2))))
+         (rv-emit-srai buf +rv-t2+ ridx 1)
+         (rv-emit-add buf +rv-t2+ +rv-t2+ rarr)
+         (rv-emit-lbu buf +rv-t2+ +rv-t2+ 6)
+         (rv-emit-slli buf +rv-t2+ +rv-t2+ 1)
+         (store-result vd +rv-t2+)))
+
+      (#.+op-u8-set+
+       ;; (u8-set Varr Vidx Vval) — Vidx and Vval both TAGGED.
+       ;; The address lands in t1 and the untagged value in t2, so neither
+       ;; can be the other's input.
+       (let* ((rarr (resolve (vreg 0)))
+              (ridx (rv-vreg-or-load buf (vreg 1) +rv-t1+))
+              (rval (rv-vreg-or-load buf (vreg 2) +rv-t2+)))
+         (rv-emit-srai buf +rv-t1+ ridx 1)
+         (rv-emit-add buf +rv-t1+ +rv-t1+ rarr)
+         (rv-emit-srai buf +rv-t2+ rval 1)
+         (rv-emit-sb buf +rv-t2+ +rv-t1+ 6)))
+
+      ;; ---- System area pointers ----
+      ;; A SAP is a one-slot object, subtag #x16: header (1<<8)|#x16 then the
+      ;; raw address.  Header plus slot is exactly one 16-byte granule here.
+      (#.+op-sap-new+
+       (let* ((vd (vreg 0))
+              (raddr (resolve (vreg 1) +rv-t2+)))
+         (rv-emit-li buf +rv-t0+ #x116)
+         (rv-emit-sd buf +rv-t0+ +rv-s8+ 0)
+         (rv-emit-sd buf raddr +rv-s8+ 8)
+         (rv-emit-addi buf +rv-t0+ +rv-s8+ 2)
+         (rv-emit-addi buf +rv-s8+ +rv-s8+ 16)
+         (store-result vd +rv-t0+)))
+
+      (#.+op-sap-addr+
+       ;; Raw address out, TAGGED as a fixnum (as on x64/i386) so it can be
+       ;; handed to a syscall that untags every argument.
+       (let* ((vd (vreg 0))
+              (rsap (resolve (vreg 1))))
+         (rv-emit-ld buf +rv-t0+ rsap 6)
+         (rv-emit-slli buf +rv-t0+ +rv-t0+ 1)
+         (store-result vd +rv-t0+)))
 
       ;; ---- Calling-convention slots ----
       ;; These used to fall into the OTHERWISE trap below, which emits

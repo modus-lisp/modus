@@ -3868,27 +3868,129 @@
             (dolist (form forms)
               (when (and (consp form)
                          (member (car form) '(defun defmacro)))
-                (handler-case (eval form) (error () nil))))
-            ;; Macroexpand def-print-test, def-pprint-test, def-format-test,
-            ;; def-adjust-array-test, etc. into deftest forms before processing
+                (handler-case (eval form) (error () nil)))
+              ;; ...and the file's own variables, which a load-time test
+              ;; generator below may iterate (cons-test-05's *cons-accessors*:
+              ;; 80 tests).  Only when unbound on the host, so no build
+              ;; variable of the same name can be clobbered.
+              (when (and (consp form)
+                         (member (car form) '(defvar defparameter))
+                         (symbolp (cadr form))
+                         (cddr form)
+                         (not (boundp (cadr form))))
+                (handler-case (eval (list 'defvar (cadr form) (caddr form)))
+                  (error () nil))))
+            ;; Tests GENERATED AT LOAD TIME -- a top-level LOOP/DOLIST/... that
+            ;; builds each deftest with a backquote and EVALs it (cons-test-05's
+            ;; C*R setters, cxr, set-syntax-from-char's per-character traits):
+            ;; 249 tests SBCL registers that were emitted here as one opaque
+            ;; runtime loop.  Run the generator on the HOST with a temporary
+            ;; DEFTEST that records its whole form, and emit what it recorded.
+            ;; Only forms that call EVAL and mention DEFTEST or a *-TEST macro
+            ;; are tried, and a form is replaced only if it produced tests.
+            (labels ((mentions (tree pred)
+                       (cond ((symbolp tree) (funcall pred tree))
+                             ((consp tree) (or (mentions (car tree) pred)
+                                               (mentions (cdr tree) pred)))
+                             (t nil)))
+                     (generator-p (form)
+                       (and (consp form) (symbolp (car form))
+                            (member (symbol-name (car form))
+                                    '("LOOP" "DOLIST" "DOTIMES" "LET" "LET*" "MAPC")
+                                    :test #'string=)
+                            (mentions form (lambda (s) (string= (symbol-name s) "EVAL")))
+                            (mentions form (lambda (s)
+                                             (let ((n (symbol-name s)))
+                                               (or (string= n "DEFTEST")
+                                                   (and (> (length n) 5)
+                                                        (string= (subseq n (- (length n) 5)) "-TEST")))))))))
+              (setf forms
+                    (mapcan
+                     (lambda (form)
+                       (if (not (generator-p form))
+                           (list form)
+                           (let ((captured nil)
+                                 (old (and (fboundp 'deftest) (macro-function 'deftest))))
+                             (declare (special captured))
+                             (setf (macro-function 'deftest)
+                                   (lambda (whole env)
+                                     (declare (ignore env) (special captured))
+                                     (push (copy-tree whole) captured)
+                                     nil))
+                             (unwind-protect
+                                  (handler-case
+                                      (let ((*standard-output* (make-broadcast-stream))
+                                            (*error-output* (make-broadcast-stream)))
+                                        (eval form))
+                                    (error () (setf captured nil)))
+                               (if old
+                                   (setf (macro-function 'deftest) old)
+                                   (fmakunbound 'deftest)))
+                             (if captured
+                                 (progn (format t "    GENERATED ~D test(s) from a top-level ~A~%"
+                                                (length captured) (car form))
+                                        (nreverse captured))
+                                 (list form)))))
+                     forms)))
+            ;; (unless <implementation property> (deftest ...) ...) -- splice
+            ;; the tests out unconditionally.  The census baseline is SBCL,
+            ;; where these guards (eql 0.0 -0.0), (typep #'cons
+            ;; 'generic-function) are false, i.e. the tests apply; a guarded
+            ;; form was otherwise emitted opaque and its tests never existed.
             (setf forms
                   (mapcan (lambda (form)
-                            (if (and (consp form)
-                                     (member (car form) '(def-print-test def-pprint-test
-                                                          def-format-test def-ppblock-test
-                                                          def-adjust-array-test
-                                                          def-adjust-array-fp-test)))
-                                (handler-case
-                                  (let ((expanded (macroexpand-1 form)))
-                                    ;; def-format-test expands to (progn deftest deftest)
-                                    (if (and (consp expanded) (eq (car expanded) 'progn))
-                                        (cdr expanded)
-                                        (list expanded)))
-                                  (error (e)
-                                    (format t "    SKIP-MACRO ~A: ~A~%" (car form) e)
-                                    nil))
+                            (if (and (consp form) (symbolp (car form))
+                                     (member (symbol-name (car form)) '("WHEN" "UNLESS")
+                                             :test #'string=)
+                                     (some (lambda (f) (and (consp f) (eq (car f) 'deftest)))
+                                           (cddr form)))
+                                (copy-list (cddr form))
                                 (list form)))
                           forms))
+            ;; Macroexpand TEST-GENERATING macros into deftest forms before
+            ;; processing.  This used to be a fixed list (def-print-test,
+            ;; def-format-test, def-adjust-array-test, ...), so a test macro
+            ;; DEFINED IN THE TEST FILE ITSELF -- def-open-test, def-env-tests,
+            ;; def-cond-cpl-test, def-read-sequence-test, ... -- was emitted as
+            ;; a bare call and its tests never existed: 907 tests across
+            ;; open/read-suppress/read-sequence/syntax/... that SBCL registers
+            ;; from this same corpus (tmp/fw census, 2026-09-23).  Now any
+            ;; top-level form headed by a non-CL host macro is expanded, and
+            ;; PROGN / EVAL-WHEN results are spliced; the expansion is used only
+            ;; if it yields at least one DEFTEST, so every other macro call is
+            ;; emitted exactly as before.
+            (labels ((test-macro-p (form)
+                       (and (consp form) (symbolp (car form))
+                            (not (eq (car form) 'deftest))
+                            (not (eq (symbol-package (car form))
+                                     (find-package "COMMON-LISP")))
+                            (macro-function (car form))))
+                     (flatten (form depth)
+                       ;; -> list of top-level forms FORM stands for
+                       (cond
+                         ((> depth 20) (list form))
+                         ((and (consp form) (eq (car form) 'progn))
+                          (mapcan (lambda (f) (flatten f (1+ depth))) (cdr form)))
+                         ((and (consp form) (eq (car form) 'eval-when))
+                          (mapcan (lambda (f) (flatten f (1+ depth))) (cddr form)))
+                         ((test-macro-p form)
+                          (let ((e (macroexpand-1 form)))
+                            (if (equal e form) (list form) (flatten e (1+ depth)))))
+                         (t (list form)))))
+              (setf forms
+                    (mapcan (lambda (form)
+                              (if (test-macro-p form)
+                                  (handler-case
+                                      (let ((flat (flatten form 0)))
+                                        (if (some (lambda (f) (and (consp f) (eq (car f) 'deftest)))
+                                                  flat)
+                                            flat
+                                            (list form)))
+                                    (error (e)
+                                      (format t "    SKIP-MACRO ~A: ~A~%" (car form) e)
+                                      (list form)))
+                                  (list form)))
+                            forms)))
             ;; Re-run select rewriters after macroexpansion.  Use the
             ;; per-form catching mapcar-safe so a single comma-bearing
             ;; macro body doesn't drop the whole file.
@@ -4400,6 +4502,34 @@
       (return-from load-ansi-aux nil))
     (push filename *ansi-aux-loaded*)
     (format t "  Loading aux: ~A~%" filename)
+    ;; HOST-ONLY pass, independent of what is emitted below: read form by
+    ;; form WITH RECOVERY and define this file's macros (and helper defuns
+    ;; the host lacks) so test files can EXPAND them.  The emission path
+    ;; below reads the whole file inside one handler-case, and this corpus
+    ;; (the EusLisp fork) has `#.(coerce (concatenate string ...) string)' in
+    ;; ansi-aux.lsp -- an unquoted STRING that fails at READ time -- so the
+    ;; whole file was skipped and DEF-FOLD-TEST & co. never existed on the
+    ;; host: ~240 tests (list.fold, remove, count, find, ...) emitted as bare
+    ;; macro calls.  Emission is deliberately unchanged: the image's copies of
+    ;; these helpers come from ansi-bridge.lisp.
+    (with-open-file (s path :direction :input)
+      (let ((*package* (find-package :cl-user)) (*read-eval* t))
+        (loop
+          (let ((form (handler-case (read s nil :eof)
+                        (error ()
+                          ;; resync: drop the rest of this line, then skip to
+                          ;; the next line that starts a top-level form
+                          (read-line s nil)
+                          (loop (let ((c (peek-char nil s nil :eof)))
+                                  (when (or (eq c :eof) (char= c #\()) (return))
+                                  (read-line s nil)))
+                          :bad))))
+            (cond ((eq form :eof) (return))
+                  ((and (consp form)
+                        (or (eq (car form) 'defmacro)
+                            (and (eq (car form) 'defun) (symbolp (cadr form))
+                                 (not (fboundp (cadr form))))))
+                   (handler-case (eval form) (error () nil))))))))
     (handler-case
       (let ((forms nil))
         (with-open-file (s path :direction :input)
@@ -4733,10 +4863,10 @@
   '("do.lsp" "dolist.lsp" "dostar.lsp" "dotimes.lsp" "load.lsp" "loop.lsp" "loop1.lsp" "loop10.lsp" "loop11.lsp" "loop12.lsp" "loop13.lsp" "loop14.lsp" "loop15.lsp" "loop16.lsp" "loop17.lsp" "loop2.lsp" "loop3.lsp" "loop4.lsp" "loop5.lsp" "loop6.lsp" "loop7.lsp" "loop8.lsp" "loop9.lsp" ))
 
 (load-ansi-chapter "/home/claude/modus/tmp/ansi-test/printer/"
-  '("copy-pprint-dispatch.lsp" "pprint-dispatch.lsp" "pprint-exit-if-list-exhausted.lsp" "pprint-fill.lsp" "pprint-indent.lsp" "pprint-linear.lsp" "pprint-logical-block.lsp" "pprint-newline.lsp" "pprint-tab.lsp" "pprint-tabular.lsp" "pprint.lsp" "prin1-to-string.lsp" "prin1.lsp" "princ-to-string.lsp" "princ.lsp" "print-array.lsp" "print-bit-vector.lsp" "print-characters.lsp" "print-complex.lsp" "print-cons.lsp" "print-floats.lsp" "print-integers.lsp" "print-length.lsp" "print-level.lsp" "print-lines.lsp" "print-pathname.lsp" "print-random-state.lsp" "print-ratios.lsp" "print-strings.lsp" "print-structure.lsp" "print-symbols.lsp" "print-unreadable-object.lsp" "print-vector.lsp" "print.lsp" "printer-control-vars.lsp" "write-to-string.lsp" "write.lsp" ))
+  '("print-backquote.lsp" "copy-pprint-dispatch.lsp" "pprint-dispatch.lsp" "pprint-exit-if-list-exhausted.lsp" "pprint-fill.lsp" "pprint-indent.lsp" "pprint-linear.lsp" "pprint-logical-block.lsp" "pprint-newline.lsp" "pprint-tab.lsp" "pprint-tabular.lsp" "pprint.lsp" "prin1-to-string.lsp" "prin1.lsp" "princ-to-string.lsp" "princ.lsp" "print-array.lsp" "print-bit-vector.lsp" "print-characters.lsp" "print-complex.lsp" "print-cons.lsp" "print-floats.lsp" "print-integers.lsp" "print-length.lsp" "print-level.lsp" "print-lines.lsp" "print-pathname.lsp" "print-random-state.lsp" "print-ratios.lsp" "print-strings.lsp" "print-structure.lsp" "print-symbols.lsp" "print-unreadable-object.lsp" "print-vector.lsp" "print.lsp" "printer-control-vars.lsp" "write-to-string.lsp" "write.lsp" ))
 
 (load-ansi-chapter "/home/claude/modus/tmp/ansi-test/printer/format/"
-  '("format-a.lsp" "format-ampersand.lsp" "format-b.lsp" "format-brace.lsp" "format-c.lsp" "format-circumflex.lsp" "format-conditional.lsp" "format-d.lsp" "format-f.lsp" "format-goto.lsp" "format-justify.lsp" "format-logical-block.lsp" "format-newline.lsp" "format-o.lsp" "format-p.lsp" "format-page.lsp" "format-paren.lsp" "format-percent.lsp" "format-question.lsp" "format-r.lsp" "format-s.lsp" "format-t.lsp" "format-tilde.lsp" "format-x.lsp" "formatter-c.lsp" ))
+  '("format-a.lsp" "format-ampersand.lsp" "format-b.lsp" "format-brace.lsp" "format-c.lsp" "format-circumflex.lsp" "format-conditional.lsp" "format-d.lsp" "format-f.lsp" "format-goto.lsp" "format-i.lsp" "format-justify.lsp" "format-logical-block.lsp" "format-newline.lsp" "format-o.lsp" "format-p.lsp" "format-page.lsp" "format-paren.lsp" "format-percent.lsp" "format-question.lsp" "format-r.lsp" "format-s.lsp" "format-slash.lsp" "format-t.lsp" "format-tilde.lsp" "format-underscore.lsp" "format-x.lsp" "formatter-c.lsp" ))
 
 (load-ansi-chapter "/home/claude/modus/tmp/ansi-test/streams/"
   '("broadcast-stream-streams.lsp" "clear-input.lsp" "clear-output.lsp" "concatenated-stream-streams.lsp" "echo-stream-input-stream.lsp" "echo-stream-output-stream.lsp" "file-length.lsp" "file-position.lsp" "file-string-length.lsp" "finish-output.lsp" "force-output.lsp" "fresh-line.lsp" "get-output-stream-string.lsp" "input-stream-p.lsp" "interactive-stream-p.lsp" "listen.lsp" "load.lsp" "make-broadcast-stream.lsp" "make-concatenated-stream.lsp" "make-echo-stream.lsp" "make-string-input-stream.lsp" "make-string-output-stream.lsp" "make-synonym-stream.lsp" "make-two-way-stream.lsp" "open-stream-p.lsp" "open.lsp" "output-stream-p.lsp" "peek-char.lsp" "read-byte.lsp" "read-char-no-hang.lsp" "read-char.lsp" "read-line.lsp" "read-sequence.lsp" "stream-element-type.lsp" "stream-error-stream.lsp" "stream-external-format.lsp" "streamp.lsp" "synonym-stream-symbol.lsp" "terpri.lsp" "two-way-stream-input-stream.lsp" "two-way-stream-output-stream.lsp" "unread-char.lsp" "with-input-from-string.lsp" "with-open-file.lsp" "with-open-stream.lsp" "with-output-to-string.lsp" "write-char.lsp" "write-line.lsp" "write-sequence.lsp" "write-string.lsp" ))
@@ -4770,3 +4900,9 @@
 
 (load-ansi-chapter "/home/claude/modus/tmp/ansi-test/objects/"
   '("add-method.lsp" "allocate-instance.lsp" "call-next-method.lsp" "change-class.lsp" "class-name.lsp" "class-of.lsp" "compute-applicable-methods.lsp" "defclass-01.lsp" "defclass-02.lsp" "defclass-03.lsp" "defclass-errors.lsp" "defclass-forward-reference.lsp" "defclass.lsp" "defgeneric-method-combination-and.lsp" "defgeneric-method-combination-append.lsp" "defgeneric-method-combination-aux.lsp" "defgeneric-method-combination-list.lsp" "defgeneric-method-combination-max.lsp" "defgeneric-method-combination-min.lsp" "defgeneric-method-combination-nconc.lsp" "defgeneric-method-combination-or.lsp" "defgeneric-method-combination-plus.lsp" "defgeneric-method-combination-progn.lsp" "defgeneric.lsp" "define-method-combination-long-form.lsp" "define-method-combination.lsp" "defmethod.lsp" "ensure-generic-function.lsp" "find-class.lsp" "find-method.lsp" "load.lsp" "make-instance.lsp" "make-instances-obsolete.lsp" "make-load-form-saving-slots.lsp" "make-load-form.lsp" "method-qualifiers.lsp" "next-method-p.lsp" "no-applicable-method.lsp" "no-next-method.lsp" "reinitialize-instance.lsp" "remove-method.lsp" "shared-initialize.lsp" "slot-boundp.lsp" "slot-exists-p.lsp" "slot-makunbound.lsp" "slot-missing.lsp" "slot-unbound.lsp" "slot-value.lsp" "unbound-slot.lsp" "update-instance-for-different-class.lsp" "with-accessors.lsp" "with-slots.lsp" ))
+
+;; misc/: misc.lsp (509 compiler regression forms from the CMUCL/SBCL bug
+;; history) and misc-cmucl-type-prop.lsp were never in any chapter list, so
+;; 541 tests SBCL registers from this corpus did not exist in the gate.
+(load-ansi-chapter "/home/claude/modus/tmp/ansi-test/misc/"
+  '("misc.lsp" "misc-cmucl-type-prop.lsp" ))

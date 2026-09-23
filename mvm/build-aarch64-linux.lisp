@@ -357,7 +357,7 @@
                      ~%                  ;; Child exited cleanly but ran zero tests (thunk was~
                      ~%                  ;; a no-op — bad compilation of TYPECASE/PPRINT/etc).~
                      ~%                  ;; Stamp all remaining so the chunk isn't silently lost.~
-                     ~%                  ((and (= wstat 0) (= child-last 0) (> last-id 0))~
+                     ~%                  ((and (= wstat 0) (= child-last 0) (> last-id 0) (>= last-id first-id))~
                      ~%                   (%report-file-wedge file-name first-id last-id \"zero-tests\")~
                      ~%                   (%stamp-remaining-fails first-id last-id)~
                      ~%                   (setq done t))~

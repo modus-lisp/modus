@@ -340,8 +340,11 @@
                      ~%                           (setq done t)))))~
                      ~%                  ;; Child exited cleanly but ran zero tests (thunk was~
                      ~%                  ;; a no-op — bad compilation of TYPECASE/PPRINT/etc).~
+                     ~%                  ;; Only when the file HAS tests: an empty range (last =~
+                     ~%                  ;; first-1: load.lsp, aux-only files) is not a wedge, and~
+                     ~%                  ;; used to be all 30 of FILE-WEDGE=30.~
                      ~%                  ;; Stamp all remaining so the chunk isn't silently lost.~
-                     ~%                  ((and (= wstat 0) (= child-last 0) (> last-id 0))~
+                     ~%                  ((and (= wstat 0) (= child-last 0) (> last-id 0) (>= last-id first-id))~
                      ~%                   (%report-file-wedge file-name first-id last-id \"zero-tests\")~
                      ~%                   (%stamp-remaining-fails first-id last-id)~
                      ~%                   (setq done t))~

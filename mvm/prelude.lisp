@@ -2252,9 +2252,29 @@
 (defun %dynbind (key val)
   "Establish a dynamic binding of the global named by KEY (a name hash).
    A drop-in replacement for the SET-SYMBOL-VALUE that COMPILE-LET-WITH-
-   SPECIALS used to emit, and identical to it on every unarmed thread."
+   SPECIALS used to emit, and identical to it on every unarmed thread.
+
+   THE UNARMED ARM GOES THROUGH %GV-SET, NOT SET-SYMBOL-VALUE.  %GV-SET is
+   SET-SYMBOL-VALUE with the in-place update the compiled SETQ of a special
+   already uses: it probes the globals table's bucket layout directly with
+   %GV-CELL and SET-CDRs the pair, where SET-SYMBOL-VALUE reaches the same
+   table through the generic PUTHASH.  A LET of a special paid that twice,
+   once to install and once to restore, and a dynamic binding is not a rare
+   operation -- it is every WITH-* macro in the system.
+
+   ONLY THE UNARMED ARM, and the narrowing is measured rather than cautious.
+   The arm below it -- threads declared, but this thread has no binding
+   block, i.e. the main thread of an armed image -- looks equally safe and
+   is not: substituting %GV-SET there as well makes test/hosted-dynbind.lisp
+   die with a READER-ERROR the moment the worker starts, on a build where
+   every other change in the tree passes it.  The mechanism was not chased,
+   so the honest statement is that SET-SYMBOL-VALUE does something on that
+   path that this does not (it takes %RT-ENTER / %RT-LEAVE, which is both a
+   lock and a region hop) and that the difference matters once a second
+   thread exists.  The arm that IS taken has established that the image
+   never declared threads at all, where there is nothing for either to do."
   (if (eql (mem-ref #x10000DB8 :u32) 0)
-      (set-symbol-value key val)
+      (%gv-set key val)
       (let ((blk (%dynb-block)))
         (if (eql blk 0)
             (set-symbol-value key val)
@@ -2275,7 +2295,7 @@
    deep path ignores, because the deep path's outer value is still sitting in
    the entry below the one it truncates away."
   (if (eql (mem-ref #x10000DB8 :u32) 0)
-      (set-symbol-value key saved)
+      (%gv-set key saved)
       (let ((blk (%dynb-block)))
         (if (eql blk 0)
             (set-symbol-value key saved)

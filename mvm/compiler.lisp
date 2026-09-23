@@ -10594,6 +10594,12 @@
    the image against +5.5% for this.  Hand-emitting keeps a variable
    reference what it has always been: a few instructions that touch one temp
    and the destination, and nothing else."
+  ;; NOT GUARDED FOR THREADS, and it must be before it is ever switched on:
+  ;; this emits an inline load of the cached pair with no arming-word test,
+  ;; so on a worker it would read THROUGH that thread's own dynamic binding
+  ;; exactly as the baked-cell read did before %COMPILE-GLOBAL-READ-BAKED
+  ;; grew its guard.  Harmless today because *GV-CACHE-ENABLED* is NIL, and
+  ;; one more thing to settle before it stops being.
   (when (eq *gv-cache-mode* :call)
     (return-from %compile-global-read-cached
       (compile-form (list '%gv-ref-fill key slot) env dest)))
@@ -10713,12 +10719,73 @@
    a VP8 frame).  Otherwise the checked call (UNBOUND-VARIABLE semantics)."
   (let ((cell (%runtime-global-cell name)))
     (if cell
-        (progn
-          (emit-ir :li-const dest (%e2-const-register cell))
-          (emit-ir :cdr dest dest))
+        (%compile-global-read-baked (%global-name-key name) cell dest)
         (compile-form `(%e2-symbol-value-checked ,(%global-name-key name)
                                                  (quote ,name))
                       env dest))))
+
+(defun %compile-global-read-baked (key cell dest)
+  "The baked-cell read, GUARDED on whether this image has declared threads.
+
+   Baking the (key . value) pair into the code is right for one thread and
+   WRONG the moment there are two: %DYNBIND puts a worker's binding in that
+   thread's own storage and not in the globals table, so a read that goes
+   straight to the baked pair reads THROUGH the binding it is standing
+   inside.  That is not hypothetical -- it is what made
+   test/hosted-dynbind.lisp's worker score 4626 of 8191 while the same
+   battery on main scored 8191: the binding was established (the per-thread
+   depth moved, %DYNB-FIND hit, SYMBOL-VALUE returned the bound object) and
+   every COMPILED reference to the special read the global anyway.
+
+   So the fast path keeps its two instructions and pays one 32-bit load and
+   a compare in front of them -- the same word, and the same tax, that
+   %RT-ENTER and %DYNBIND already charge every image.  When it is non-zero
+   the read goes through %GV-REF, which consults this thread's bindings
+   first.  An image that never declares threads therefore behaves exactly as
+   it did, and one that does is CORRECT rather than fast and wrong.
+
+   Emitted as IR, not as a source template: a variable reference must stay a
+   few instructions touching one temp and the destination, or every special
+   read in runtime-compiled code drags a frame in behind it."
+  (let ((save-count (min *temp-reg-counter* 12))
+        (slow (make-compiler-label))
+        (done (make-compiler-label)))
+    ;; Caller-save around the whole sequence: the slow arm is a CALL, and
+    ;; most read sites hold no temps and so emit no push at all.
+    (when (> save-count 1)
+      (let ((r (+ +vreg-v4+ 1)))
+        (loop (when (>= r (+ +vreg-v4+ save-count)) (return))
+          (unless (= r dest) (emit-ir :push r))
+          (setq r (+ r 1)))))
+    (let ((w (alloc-temp-reg)))
+      ;; w = (mem-ref #x10000DB8 :u32); DEST is the second scratch until the
+      ;; result lands in it.
+      (emit-li-tagged dest #x10000DB8)
+      (emit-ir :shr dest dest +fixnum-shift+)
+      (emit-ir :load w dest (car (memory-width-code :u32)))
+      (emit-ir :li dest 0)
+      (emit-ir :cmp w dest)
+      (emit-ir :bne slow)
+      (emit-ir :li-const dest (%e2-const-register cell))
+      (emit-ir :cdr dest dest)
+      ;; A read yields exactly one value; the slow arm gets this from
+      ;; %GV-REF's own epilogue, so both arms agree and so does the
+      ;; pre-change emission, which was reached the same way.
+      (emit-ir :set-mv-count 1)
+      (emit-ir :br done)
+      (emit-ir-label slow)
+      (emit-li-tagged +vreg-v0+ key)
+      (when *mvm-emit-halves* (emit-ir :set-nargs 1))
+      (emit-ir :call "%GV-REF" 1)
+      (unless (= dest +vreg-vr+)
+        (emit-ir :mov dest +vreg-vr+))
+      (emit-ir-label done)
+      (when (> save-count 1)
+        (let ((r (+ +vreg-v4+ save-count -1)))
+          (loop (when (< r (+ +vreg-v4+ 1)) (return))
+            (unless (= r dest) (emit-ir :pop r))
+            (setq r (- r 1)))))
+      (free-temp-reg))))
 
 (defun %compile-setq-global (var dest)
   "Emit the global-store for (setq VAR <value-already-in-DEST>).  The value
@@ -10749,10 +10816,49 @@
         ;; The value stays in DEST (a SETQ returns it).
         ;; (x64: a spill temp is written through rax = VR, so with DEST = VR
         ;; the temp must be physical — otherwise take the call path.)
+        ;; GUARDED on whether this image has declared threads, for exactly the
+        ;; reason %COMPILE-GLOBAL-READ-BAKED is: %DYNBIND puts a worker's
+        ;; binding in that thread's own storage, so a SETQ that stores
+        ;; straight into the baked pair writes THROUGH the binding it is
+        ;; standing inside -- and leaves the process-wide cell holding the
+        ;; worker's value after the worker is gone.  Measured as bits 16 and
+        ;; 32 of test/hosted-dynbind.lisp and its *DA*-on-main check.  The
+        ;; armed arm calls %GV-SET, which consults this thread's bindings
+        ;; first; an unarmed image pays one 32-bit load and a compare.
         ((and cell (or (/= dest +vreg-vr+) (< *temp-reg-counter* 5)))
-         (let ((tmp (alloc-temp-reg)))
+         (let ((tmp (alloc-temp-reg))
+               (zed (alloc-temp-reg))
+               (slow (make-compiler-label))
+               (done (make-compiler-label)))
+           (emit-li-tagged tmp #x10000DB8)
+           (emit-ir :shr tmp tmp +fixnum-shift+)
+           (emit-ir :load tmp tmp (car (memory-width-code :u32)))
+           (emit-ir :li zed 0)
+           (emit-ir :cmp tmp zed)
+           (emit-ir :bne slow)
            (emit-ir :li-const tmp (%e2-const-register cell))
            (emit-ir :setcdr tmp dest)
+           (emit-ir :br done)
+           (emit-ir-label slow)
+           (when (> save-count 1)
+             (let ((r (+ +vreg-v4+ 1)))
+               (loop (when (>= r (+ +vreg-v4+ save-count)) (return))
+                 (unless (= r dest) (emit-ir :push r))
+                 (setq r (+ r 1)))))
+           (unless (= dest +vreg-v1+)
+             (emit-ir :mov +vreg-v1+ dest))
+           (emit-li-tagged +vreg-v0+ hash)
+           (when *mvm-emit-halves* (emit-ir :set-nargs 2))
+           (emit-ir :call "%GV-SET" 2)
+           (unless (= dest +vreg-vr+)
+             (emit-ir :mov dest +vreg-vr+))
+           (when (> save-count 1)
+             (let ((r (+ +vreg-v4+ save-count -1)))
+               (loop (when (< r (+ +vreg-v4+ 1)) (return))
+                 (unless (= r dest) (emit-ir :pop r))
+                 (setq r (- r 1)))))
+           (emit-ir-label done)
+           (free-temp-reg)
            (free-temp-reg)))
         (t
          (when (> save-count 1)

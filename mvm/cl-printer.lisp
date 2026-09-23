@@ -1308,6 +1308,20 @@
   ;; CLHS: a malformed (odd-length) or unrecognised keyword tail signals
   ;; PROGRAM-ERROR (write-to-string.error.2/3).
   (unless (%write-kwargs-valid-p args) (%signal-program-error))
+  ;; NO KEYWORD ARGS -- which is how WRITE-TO-STRING is almost always called,
+  ;; and how PRIN1-TO-STRING and PRINC-TO-STRING always call it.  The general
+  ;; path below reads ten printer specials into lexicals, scans an empty
+  ;; argument list, and then dynamically REBINDS all ten to the values it has
+  ;; just read out of them.  Binding a special to its own value is a no-op
+  ;; that costs a global write and an unwind-protect frame apiece, and the
+  ;; printer never assigns a *PRINT-* variable (the only SETQs of those names
+  ;; in the tree are cl-reader.lisp's boot-time defaults), so the bindings
+  ;; cannot be observed.  Two reads, and go.
+  (when (null args)
+    (return-from write-to-string
+      (let ((s (make-string-output-stream)))
+        (%write-obj obj s nil (if *print-readably* t *print-escape*))
+        (get-output-stream-string s))))
   (let ((s (make-string-output-stream)))
     ;; Parse keyword args
     (let ((escape *print-escape*)
@@ -1379,6 +1393,12 @@
 ;;; Write OBJ to STREAM, respecting *print-* vars and keyword args
 (defun %write-to-stream-with-keys (obj stream args)
   "Write OBJ to STREAM with keyword arg overrides."
+  ;; Same no-args fast path as WRITE-TO-STRING above, and for the same
+  ;; reason: with no overrides the ten bindings below each bind a special to
+  ;; the value it already holds.
+  (when (null args)
+    (return-from %write-to-stream-with-keys
+      (%write-obj obj stream nil (if *print-readably* t *print-escape*))))
   (let ((escape *print-escape*)
         (base *print-base*)
         (radix *print-radix*)

@@ -2252,9 +2252,29 @@
 (defun %dynbind (key val)
   "Establish a dynamic binding of the global named by KEY (a name hash).
    A drop-in replacement for the SET-SYMBOL-VALUE that COMPILE-LET-WITH-
-   SPECIALS used to emit, and identical to it on every unarmed thread."
+   SPECIALS used to emit, and identical to it on every unarmed thread.
+
+   THE UNARMED ARM GOES THROUGH %GV-SET, NOT SET-SYMBOL-VALUE.  %GV-SET is
+   SET-SYMBOL-VALUE with the in-place update the compiled SETQ of a special
+   already uses: it probes the globals table's bucket layout directly with
+   %GV-CELL and SET-CDRs the pair, where SET-SYMBOL-VALUE reaches the same
+   table through the generic PUTHASH.  A LET of a special paid that twice,
+   once to install and once to restore, and a dynamic binding is not a rare
+   operation -- it is every WITH-* macro in the system.
+
+   ONLY THE UNARMED ARM, and the narrowing is measured rather than cautious.
+   The arm below it -- threads declared, but this thread has no binding
+   block, i.e. the main thread of an armed image -- looks equally safe and
+   is not: substituting %GV-SET there as well makes test/hosted-dynbind.lisp
+   die with a READER-ERROR the moment the worker starts, on a build where
+   every other change in the tree passes it.  The mechanism was not chased,
+   so the honest statement is that SET-SYMBOL-VALUE does something on that
+   path that this does not (it takes %RT-ENTER / %RT-LEAVE, which is both a
+   lock and a region hop) and that the difference matters once a second
+   thread exists.  The arm that IS taken has established that the image
+   never declared threads at all, where there is nothing for either to do."
   (if (eql (mem-ref #x10000DB8 :u32) 0)
-      (set-symbol-value key val)
+      (%gv-set key val)
       (let ((blk (%dynb-block)))
         (if (eql blk 0)
             (set-symbol-value key val)
@@ -2275,7 +2295,7 @@
    deep path ignores, because the deep path's outer value is still sitting in
    the entry below the one it truncates away."
   (if (eql (mem-ref #x10000DB8 :u32) 0)
-      (set-symbol-value key saved)
+      (%gv-set key saved)
       (let ((blk (%dynb-block)))
         (if (eql blk 0)
             (set-symbol-value key saved)
@@ -2411,14 +2431,53 @@
         (when (eq (car %gv-pair) %gv-key) (return %gv-pair)))
       (setq %gv-cur (cdr %gv-cur)))))
 
+(defun %dynb-value-addr (key)
+  "Address of THIS THREAD's innermost dynamic binding of KEY, or 0.
+
+   The one place the three COMPILED read paths ask the question, so they
+   cannot drift apart again -- which is exactly what happened: %DYNBIND puts
+   a worker's binding in that thread's own storage, SYMBOL-VALUE was taught
+   to look there, and the compiled reads (which is what a reference to a
+   special in compiled code actually becomes) were not.  The gate is the
+   word %RT-ENTER and %DYNBIND already test, so an unarmed image pays one
+   32-bit load and a branch."
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      0
+      (let ((blk (%dynb-block)))
+        (if (eql blk 0)
+            0
+            (%dynb-find key (- (%dynb-next blk) 16) (- (%dynb-depth blk) 1))))))
+
 (defun %gv-ref (%gv-key)
   "Compiled special-variable READ: value of global KEY, NIL if absent
    (SYMBOL-VALUE's contract for an integer key).  Locals are %GV-prefixed on
    purpose: a plain name that is also a known global would compile as a
    DYNAMIC bind, which calls %GV-SET, which calls this — infinite recursion
-   at boot (seen with the first version)."
-  (let ((%gv-cl (%gv-cell %gv-key)))
-    (if %gv-cl (cdr %gv-cl) nil)))
+   at boot (seen with the first version).
+
+   THIS THREAD'S OWN DYNAMIC BINDINGS COME FIRST, for the same reason
+   SYMBOL-VALUE consults them: %DYNBIND puts a worker's binding in that
+   thread's own storage and NOT in the globals table, so a read that goes
+   straight to the table does not see the binding it is inside.  This is the
+   COMPILED read — what every reference to a special in compiled code
+   becomes — so without this the per-thread mechanism is established by the
+   binding and then ignored by every reader of it.  The gate is the word
+   %RT-ENTER and %DYNBIND already test: an image that never declared itself
+   threaded pays one 32-bit load and a branch and reaches the identical line
+   below, and the main thread of a threaded image pays two more and reaches
+   it too, because its window base is zero."
+  ;; The arming-word test is INLINE, not inside the helper: a CALL here is not
+  ;; "one load and a branch", and this is the read every reference to a
+  ;; special in compiled code becomes.  Measured with the helper called
+  ;; unconditionally: PRIN1-TO-STRING +30%.
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      (let ((%gv-cl (%gv-cell %gv-key)))
+        (if %gv-cl (cdr %gv-cl) nil))
+      (let ((%gv-a (%dynb-value-addr %gv-key)))
+        (if (eql %gv-a 0)
+            (let ((%gv-cl (%gv-cell %gv-key)))
+              (if %gv-cl (cdr %gv-cl) nil))
+            (mem-ref %gv-a :u64)))))
 
 ;;; ---- The global-cell cache (see the block comment above
 ;;; ---- %COMPILE-GLOBAL-READ-AOT in mvm/compiler.lisp) ----
@@ -2492,11 +2551,33 @@
 
 (defun %gv-set (%gv-key %gv-val)
   "Compiled special-variable WRITE: update in place when the global exists,
-   else insert through SET-SYMBOL-VALUE (which also creates the table)."
-  (let ((%gv-cl (%gv-cell %gv-key)))
-    (if %gv-cl
-        (progn (set-cdr %gv-cl %gv-val) %gv-val)
-        (progn (%gv-cache-flush) (set-symbol-value %gv-key %gv-val)))))
+   else insert through SET-SYMBOL-VALUE (which also creates the table).
+
+   A SETQ OF A SPECIAL THIS THREAD HAS BOUND MUST HIT THAT BINDING, which is
+   the rule SET-SYMBOL-VALUE already states and this -- the COMPILED write,
+   i.e. what every SETQ of a special in compiled code becomes -- did not
+   follow.  The read twin of the same omission is in %GV-REF.  Without it a
+   worker's (let ((*x* 1)) (setq *x* 9) ...) wrote 9 into the PROCESS-WIDE
+   cell, so the binding did not see its own assignment and main was left
+   holding 9 after the worker exited: bits 16 and 32 of
+   test/hosted-dynbind.lisp, plus its *DA*-on-main check.
+
+   Assignment to a special this thread has NOT bound still writes the shared
+   table.  That is a different operation with its own open cross-region
+   story, and it is not what a LET does."
+  ;; Inline gate, as in %GV-REF: a call on the store path is not free either.
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      (let ((%gv-cl (%gv-cell %gv-key)))
+        (if %gv-cl
+            (progn (set-cdr %gv-cl %gv-val) %gv-val)
+            (progn (%gv-cache-flush) (set-symbol-value %gv-key %gv-val))))
+      (let ((%gv-a (%dynb-value-addr %gv-key)))
+        (if (eql %gv-a 0)
+            (let ((%gv-cl (%gv-cell %gv-key)))
+              (if %gv-cl
+                  (progn (set-cdr %gv-cl %gv-val) %gv-val)
+                  (progn (%gv-cache-flush) (set-symbol-value %gv-key %gv-val))))
+            (progn (setf (mem-ref %gv-a :u64) %gv-val) %gv-val)))))
 
 ;;; ============================================================
 ;;; Interned Symbols

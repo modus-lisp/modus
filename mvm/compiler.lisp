@@ -15382,9 +15382,19 @@
             (append (butlast forms) (list (%mv-clamp-tail lst)))))))
 
 (defun %mv-clamp-tail (form)
+  ;; Structural first: descend the value-transparent forms whether or not the
+  ;; predicate calls them single-valued, so the clamp lands on the innermost
+  ;; leaf.  An ATOM leaf gets the store BEFORE it (it cannot touch the count),
+  ;; which adds no binding; only a compound inline leaf is wrapped in a LET.
+  ;; (Wrapping a whole single-valued LET in a new LET's INITFORM made the
+  ;; build-time compile of %READ-SHARPSIGN's #N= clause fail -- every #1=
+  ;; read signalled -- while a runtime compile of the same text was fine.
+  ;; Not root-caused; this shape avoids it.)
   (cond
-    ((not (tail-form-is-values-p (list form))) (%mv-clamp-leaf form))
-    ((or (atom form) (not (symbolp (car form)))) form)
+    ((atom form)
+     `(progn (setf (mem-ref ,+mv-count-addr+ :u64) 1) ,form))
+    ((not (symbolp (car form)))
+     (if (tail-form-is-values-p (list form)) form (%mv-clamp-leaf form)))
     (t
      (let ((op (symbol-name (car form))))
        (cond
@@ -15394,13 +15404,20 @@
                     (%mv-clamp-tail (caddr form))
                     (%mv-clamp-tail (cadddr form)))
               form))
-         ((string= op "PROGN") (cons (car form) (%mv-clamp-body (cdr form))))
-         ((or (string= op "LET") (string= op "LET*")
-              (string= op "WHEN") (string= op "UNLESS")
-              (string= op "BLOCK"))
+         ((string= op "PROGN")
+          (if (cdr form) (cons (car form) (%mv-clamp-body (cdr form))) form))
+         ((or (string= op "LET") (string= op "LET*") (string= op "BLOCK"))
           (if (cddr form)
               (cons (car form) (cons (cadr form) (%mv-clamp-body (cddr form))))
               form))
+         ;; WHEN/UNLESS fall out with an implicit NIL: spell it as IF so that
+         ;; path is clamped too.
+         ((and (or (string= op "WHEN") (string= op "UNLESS")) (cddr form))
+          (let ((body (%mv-clamp-tail (cons 'progn (cddr form))))
+                (none (%mv-clamp-tail nil)))
+            (if (string= op "WHEN")
+                (list 'if (cadr form) body none)
+                (list 'if (cadr form) none body))))
          ((string= op "MULTIPLE-VALUE-BIND")
           (if (cdddr form)
               (cons (car form)
@@ -15414,6 +15431,7 @@
                               (cons (car clause) (%mv-clamp-body (cdr clause)))
                               clause))
                         (cdr form))))
+         ((not (tail-form-is-values-p (list form))) (%mv-clamp-leaf form))
          (t form))))))
 
 (defun loop-body-has-mv-return-p (forms)

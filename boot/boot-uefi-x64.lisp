@@ -926,10 +926,12 @@
       (mvm-emit-byte buf #xFA)
 
       ;; ---- Diagnostic: Caps Lock LED ON = past ExitBootServices ----
-      (emit-uefi-set-kbd-leds buf 4)  ; bit 2 = Caps Lock
-
       ;; ---- Diagnostic beep: 2 short beeps = we got past ExitBootServices ----
-      (emit-uefi-beep-pattern buf)
+      ;; Both are port I/O.  In an SNP build they are skipped: no #VC handler
+      ;; of ours is installed yet (boot-uefi-snp.lisp).
+      (unless *x64-snp-mode*
+        (emit-uefi-set-kbd-leds buf 4)  ; bit 2 = Caps Lock
+        (emit-uefi-beep-pattern buf))
 
       ;; Deallocate the UEFI frame
       (uefi-emit-add-rsp buf frame-size))
@@ -962,7 +964,10 @@
   (emit-uefi-font-data buf)
   (emit-uefi-scancode-tables buf)
 
-  ;; ---- Page tables at 0x500000: identity-map first 4GB ----
+  ;; ---- SEV-SNP: detect, learn the C-bit (boot-uefi-snp.lisp) ----
+  (when *x64-snp-mode* (emit-snp-detect buf))
+
+  ;; ---- Page tables at +x64-page-tables-addr+: identity-map first 4GB ----
   ;; Clear 28KB (7 pages: PML4 + PDPT + 4×PD)
   (uefi-emit-mov-reg-imm64 buf +rdi+ +x64-page-tables-addr+)
   (uefi-emit-mov-reg-imm64 buf +rcx+ (* 7 4096))
@@ -970,9 +975,12 @@
   (mvm-emit-byte buf #xFC)   ; CLD
   (mvm-emit-byte buf #xF3)   ; REP
   (mvm-emit-byte buf #xAA)   ; STOSB
+  ;; SNP: RBX = C-bit mask (0 when not active), OR'd into every entry below
+  (when *x64-snp-mode* (emit-snp-load-cbit-rbx buf))
 
   ;; PML4[0] = &PDPT | 3 (present + writable)
   (uefi-emit-mov-reg-imm64 buf +rax+ (+ +x64-page-tables-addr+ #x1003))
+  (when *x64-snp-mode* (emit-snp-or-rax-rbx buf))
   (uefi-emit-mov-reg-imm64 buf +rdi+ +x64-page-tables-addr+)
   ;; mov [rdi], rax
   (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x07)
@@ -980,6 +988,7 @@
   ;; PDPT[0..3] = &PD[0..3] | 3
   (dotimes (i 4)
     (uefi-emit-mov-reg-imm64 buf +rax+ (+ +x64-page-tables-addr+ #x2000 (* i #x1000) 3))
+    (when *x64-snp-mode* (emit-snp-or-rax-rbx buf))
     ;; mov [rdi + 0x1000 + i*8], rax
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89)
     (mvm-emit-byte buf #x87)  ; ModRM: mod=10, reg=rax, rm=rdi
@@ -995,6 +1004,8 @@
     (uefi-emit-mov-reg-reg buf +rax+ +rdx+)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x0D)  ; or rax, imm32
     (mvm-emit-u32 buf #x83)
+    ;; SNP: C-bit on every entry except the shared 2MB page
+    (when *x64-snp-mode* (emit-snp-pd-entry-fixup buf))
     ;; mov [rdi], rax
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x07)
     ;; add rdi, 8
@@ -1010,8 +1021,9 @@
       (mvm-emit-byte buf #x0F) (mvm-emit-byte buf #x85)  ; JNZ rel32
       (mvm-emit-u32 buf (logand rel #xFFFFFFFF))))
 
-  ;; Load CR3
+  ;; Load CR3 (SNP: the PML4 page is encrypted, so CR3 carries the C-bit too)
   (uefi-emit-mov-reg-imm64 buf +rax+ +x64-page-tables-addr+)
+  (when *x64-snp-mode* (emit-snp-or-rax-rbx buf))
   (mvm-emit-byte buf #x0F) (mvm-emit-byte buf #x22) (mvm-emit-byte buf #xD8) ; mov cr3, rax
 
   ;; ---- GDT at 0x600 ----
@@ -1062,6 +1074,9 @@
   (mvm-emit-byte buf #x8E) (mvm-emit-byte buf #xE0)  ; mov fs, ax
   (mvm-emit-byte buf #x8E) (mvm-emit-byte buf #xE8)  ; mov gs, ax
 
+  ;; ---- SEV-SNP: shared region, GHCB, #VC handler + IDT ----
+  (when *x64-snp-mode* (emit-snp-post-cr3 buf))
+
   ;; ---- Stack at 0x800000 ----
   (uefi-emit-mov-reg-imm64 buf +rsp+ +x64-stack-top+)
 
@@ -1072,6 +1087,8 @@
   (emit-x64-out buf #x3F9 #x00)   ; divisor high = 0
   (emit-x64-out buf #x3FB #x03)   ; 8N1, DLAB off
   (emit-x64-out buf #x3FA #xC7)   ; enable FIFO
+  ;; SNP :TEST — drive port I/O through the #VC handler (prints VC+wi5)
+  (when *x64-snp-mode* (emit-snp-selftest buf))
 
   ;; ---- Runtime registers ----
   ;; R15 = NIL
@@ -1133,7 +1150,8 @@
   (emit-uefi-vga-clear buf)
 
   ;; ---- Diagnostic: all LEDs ON = about to jump to kernel ----
-  (emit-uefi-set-kbd-leds buf 7)  ; bits 0+1+2 = Scroll+Num+Caps
+  (unless *x64-snp-mode*
+    (emit-uefi-set-kbd-leds buf 7))  ; bits 0+1+2 = Scroll+Num+Caps
 
   ;; ---- Jump to kernel at 0x100000 (absolute) ----
   ;; Kernel data was copied to 0x100000 by rep movsb above.

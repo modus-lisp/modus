@@ -50,6 +50,7 @@
 (mvm-load "boot/boot-i386.lisp")
 (mvm-load "boot/boot-68k.lisp")
 (mvm-load "boot/boot-arm32.lisp")
+(mvm-load "boot/boot-uefi-snp.lisp")
 (mvm-load "boot/boot-uefi-x64.lisp")
 
 ;; Architecture translators

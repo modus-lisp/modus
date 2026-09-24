@@ -2517,8 +2517,27 @@
     (let ((final-buf (make-rv-buffer)))
       (dolist (insn insns)
         (destructuring-bind (mvm-pc opcode operands next-pc) insn
-          ;; Update label-map with final positions
-          (setf (gethash mvm-pc label-map) (rv-current-offset final-buf))
+          ;; PASS 1'S MAP IS THE AUTHORITY.  This used to REWRITE the entry with
+          ;; pass 2's position, which quietly mixes the two passes: a BACKWARD
+          ;; branch then resolves against a pass-2 offset while a FORWARD branch
+          ;; (whose target pass 2 has not reached yet) resolves against pass 1's.
+          ;; That is only harmless while every instruction measures identically in
+          ;; both passes — exactly the property a variable-size emitter breaks.
+          ;;
+          ;; So instead of rewriting, CHECK.  A size that differs between passes is
+          ;; now a NAMED BUILD FAILURE carrying the opcode, rather than a wild
+          ;; branch 92 KB into another function discovered by reading a 31 MB
+          ;; instruction trace.  That is how op-call's distance-dependent sizing was
+          ;; found, and it cost hours; this assertion would have printed it.
+          (let ((expected (gethash mvm-pc label-map))
+                (actual (rv-current-offset final-buf)))
+            (unless (eql expected actual)
+              (error "riscv two-pass size mismatch at mvm-pc ~D (opcode #x~2,'0X): ~
+                      pass 1 measured offset ~D, pass 2 is at ~D (delta ~D).  Some ~
+                      emitter's SIZE depends on a value that differs between the ~
+                      passes — most often a DISTANCE, since pass 1 builds the label ~
+                      and function maps while measuring."
+                     mvm-pc opcode expected actual (- actual expected))))
           ;; Pass next-pc for branch offset computation (MVM offsets are from end of insn)
           (translate-mvm-insn-riscv final-buf opcode operands next-pc
                                     :label-map label-map

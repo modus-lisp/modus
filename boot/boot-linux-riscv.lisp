@@ -130,6 +130,39 @@
   ;; THIS REGISTER and so is self-consistent at any value; the real image can,
   ;; the moment anything meets a baked NIL literal.
   (rv-emit-li buf +rv-s10+ +nil-value+)
+  ;; --- THE NIL PAGE.  (car nil) and (cdr nil) DEREFERENCE #xDEAD0000.
+  ;;
+  ;; +NIL-VALUE+ is #xDEAD0001 and its low nibble is 1 — the CONS TAG.  That is
+  ;; deliberate: it lets car/cdr of NIL be a plain load rather than a guarded one,
+  ;; at the price of needing a page at #xDEAD0000.  mvm/build-x64-linux.lisp maps
+  ;; exactly this page with the comment "car nil must not segfault", and
+  ;; mvm/mvm-eval.lisp names the failure shape: "unmapped #xDEAD0000 header ->
+  ;; SIGSEGV".
+  ;;
+  ;; The hosted x64 CLI does NOT map it and works, so this is not universal — it
+  ;; depends on which paths through the shared source an image actually takes.
+  ;; This port takes one that does: measured, the real CL image faults at
+  ;; si_addr=0xdead0000, which is precisely NIL-1, i.e. RISC-V's `ld rd,-1(rs)'.
+  ;; Four kilobytes is cheaper than auditing every car in 3 million instructions.
+  ;;
+  ;; FILLED WITH NIL, not zeroed, so (car nil) and (cdr nil) answer NIL rather
+  ;; than a fixnum 0 that would then be walked as a list.
+  (rv-emit-li buf +rv-a0+ #xDEAD0000)
+  (rv-emit-li buf +rv-a1+ 4096)
+  (rv-emit-li buf +rv-a2+ 3)                   ; PROT_READ|PROT_WRITE
+  (rv-emit-li buf +rv-a3+ #x32)                ; MAP_PRIVATE|ANONYMOUS|FIXED
+  (rv-emit-li buf +rv-a4+ -1)
+  (rv-emit-li buf +rv-a5+ 0)
+  (rv-emit-li buf +rv-a7+ +rv-sys-mmap+)
+  (rv-emit-ecall buf)
+  ;; Fill it with NIL: 512 doublewords from the RETURNED address.
+  (rv-emit-mv buf +rv-t1+ +rv-a0+)
+  (rv-emit-li buf +rv-t2+ 512)
+  ;; loop: sd s10,0(t1); addi t1,t1,8; addi t2,t2,-1; bne t2,x0,-12
+  (rv-emit-sd buf +rv-s10+ +rv-t1+ 0)
+  (rv-emit-addi buf +rv-t1+ +rv-t1+ 8)
+  (rv-emit-addi buf +rv-t2+ +rv-t2+ -1)
+  (rv-emit-bne buf +rv-t2+ +rv-x0+ -12)
   ;; --- Cheney metadata at the shared absolute slots 0x10000040..0x10000060.
   ;;     RAW addresses, matching what the native collector expects (the
   ;;     address<<1 convention gc.lisp once needed is gone).

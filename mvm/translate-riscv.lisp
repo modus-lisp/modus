@@ -773,7 +773,33 @@
   "Convention slots for the HOSTED port, inside the mmap'd heap and above the
    Cheney metadata at #x10000040.  Same choice boot-linux-i386.lisp makes for
    the same reason (its comment names 0x10000A00 the i386 global slot block).")
-(defun rv-nargs-addr () (+ *rv-globals-base* #x00))
+(defun rv-nargs-addr ()
+  "THE NARGS SLOT IS THE SHARED CONTRACT ADDRESS #x10000150 IN HOSTED MODE, not
+   globals_base+0, and that is a correctness requirement rather than tidiness.
+
+   mvm/cl-eval.lisp reads the RAW LITERAL #x10000150 in two places — the macro
+   expander shims, which check `(= nargs 2)'.  A back end that writes nargs
+   anywhere else leaves those reads looking at a word nothing ever wrote, so the
+   comparison is against zero and every (funcall (macro-function 'X) form env)
+   signals PROGRAM-ERROR.  This is the i386 #260 defect, whose fix (route the
+   shims through the %GET-NARGS primitive) is written but NOT merged, because it
+   converted four ladder libraries from exit 0 to exit 139 for reasons still
+   unfound.  Rather than inherit an unmerged fix, this port does what #261 did for
+   mv-count: a convention slot that SHARED SOURCE reads lives at the shared
+   address, full stop.
+
+   HOW IT PRESENTED, because the symptom names nothing: the real CL image built,
+   booted, ran ~885 blocks, and died building the string \"force-output requires 0
+   or 1 arguments\" — an ARITY error, because the &rest prologue read a stale nargs
+   and made a list with too many elements.  The error reporter then faulted at
+   si_addr=0x56, so the visible failure was a wild pointer two layers below the
+   cause.  Reconstructing that string out of the instruction trace (the stores are
+   tagged character codes) is what turned it into a one-line fix.
+
+   #x10000150 is inside the mmap'd heap and below the allocator start, exactly
+   where the shared low-memory map puts it.  BARE metal keeps globals_base+0: no
+   shared-source read reaches it there, and #x10000150 is UART MMIO on virt."
+  (if *riscv-linux-mode* #x10000150 (+ *rv-globals-base* #x00)))
 (defun rv-cenv-addr ()  (+ *rv-globals-base* #x08))
 ;;; MV-COUNT DIVERGES FROM THE SHARED CONTRACT ADDRESS, AND MUST.
 ;;; modus.mvm::+mv-count-addr+ is #x10000090, baked into compiler-emitted
@@ -1653,10 +1679,30 @@
               (rel-offset (if target-offset
                               (- target-offset (rv-current-offset buf))
                               0)))
-         ;; For nearby calls, use jal directly; for far calls, use auipc+jalr
-         (if (and (>= rel-offset -1048576) (<= rel-offset 1048575))
-             (rv-emit-jal buf +rv-ra+ rel-offset)
-             (rv-emit-call buf rel-offset))))
+         ;; ALWAYS the two-instruction form.  NEVER size this by distance.
+         ;;
+         ;; This used to be `if the offset fits in JAL's +/-1 MB, emit 4 bytes,
+         ;; else emit 8' — and that is a PASS-DEPENDENT SIZE, which corrupts the
+         ;; whole label map.  Pass 1 measures sizes while BUILDING the function
+         ;; table, so a call whose target is not yet known measures with
+         ;; rel-offset 0 (short); pass 2 knows the real distance and may emit
+         ;; long.  One call that changes size shifts every native offset after
+         ;; it, and every branch that resolves through the map then lands in the
+         ;; wrong place.
+         ;;
+         ;; MEASURED, and the shape is worth remembering: the real CL image ran
+         ;; ~885 blocks and then a plain `j' inside MAKE-ARRAY jumped 92 KB
+         ;; BACKWARD into the middle of SLOT-VALUE, onto an instruction that
+         ;; happened to be an ECALL — so the visible failure was a nonsense
+         ;; mmap(NULL, 956301312, MAP_FIXED) returning EPERM, then a SIGSEGV at
+         ;; si_addr=0x56.  Three layers between the cause and the symptom.
+         ;;
+         ;; Invisible on every ladder image, because a few-KB image has every
+         ;; call inside +/-1 MB, so both passes agree on 4 bytes.  Same cliff
+         ;; class as the code buffer, the conditional branch and the entry jump:
+         ;; a SIZE that depends on a DISTANCE is a bug in a two-pass assembler
+         ;; unless the passes are iterated to a fixpoint.
+         (rv-emit-call buf rel-offset)))
 
       ;; ---- Double-precision floating point ----
       ;;

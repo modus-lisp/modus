@@ -224,6 +224,14 @@
 
 (in-package :modus.mvm)
 
+;; MODUS_SYMMAP=path writes a tab-separated virtual-address -> name map beside
+;; the image.  It is what turns a `-d in_asm' trace's raw PC into the name of the
+;; function that faulted, which in 31 MB is the difference between a bisect and a
+;; guess.  Same knob build-generic-cli.lisp has.
+(let ((sm (sb-ext:posix-getenv "MODUS_SYMMAP")))
+  (when (and sm (> (length sm) 0))
+    (setf *write-symmap-path* sm)))
+
 (setf *riscv-unimpl-ops* nil)
 (install-riscv-translator)
 (riscv-set-linux-mode t)

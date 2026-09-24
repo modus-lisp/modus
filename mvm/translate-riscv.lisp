@@ -262,6 +262,49 @@
   "MULHU rd, rs1, rs2 -- high XLEN bits of the UNSIGNED product."
   (rv-emit-u32 buf (rv-encode-r-type #x01 rs2 rs1 #x3 rd #x33)))
 
+;;; --- RV64D: double-precision floating point (opcode 0x53) ---
+;;;
+;;; FP R-type: funct7[31:25] | rs2[24:20] | rs1[19:15] | rm[14:12] | rd[11:7] | 0x53
+;;; RM is the rounding mode: 0 = RNE (nearest-even, the IEEE default) and
+;;; 1 = RTZ (toward zero), which is what a float->int TRUNCATION needs.
+;;;
+;;; THE FPU HAS TO BE ON.  RISC-V gates every FP instruction on mstatus.FS: if FS
+;;; is 0 the instruction is ILLEGAL, not slow.  Linux sets FS for userspace, so
+;;; the hosted port needs nothing; a BARE-metal image must set it in its boot
+;;; stub, which boot-riscv.lisp does not yet do.  That is the same reason
+;;; CLAUDE.md gives for the float opcodes being unimplemented everywhere.
+(defun rv-emit-fp-r (buf funct7 rs2 rs1 rm rd)
+  (rv-emit-u32 buf (logior (ash (logand funct7 #x7F) 25)
+                           (ash (logand rs2 #x1F) 20)
+                           (ash (logand rs1 #x1F) 15)
+                           (ash (logand rm #x7) 12)
+                           (ash (logand rd #x1F) 7)
+                           #x53)))
+
+(defun rv-emit-fadd-d (buf fd fs1 fs2) (rv-emit-fp-r buf #x01 fs2 fs1 0 fd))
+(defun rv-emit-fsub-d (buf fd fs1 fs2) (rv-emit-fp-r buf #x05 fs2 fs1 0 fd))
+(defun rv-emit-fmul-d (buf fd fs1 fs2) (rv-emit-fp-r buf #x09 fs2 fs1 0 fd))
+(defun rv-emit-fdiv-d (buf fd fs1 fs2) (rv-emit-fp-r buf #x0D fs2 fs1 0 fd))
+
+(defun rv-emit-fmv-d-x (buf fd rs1)
+  "FMV.D.X fd, rs1 -- move 64 raw bits from an INTEGER register into an FP one.
+   RV64 ONLY: on RV32 there is no 64-bit integer register to move from, so a
+   32-bit port has to bounce the value through memory with FLD instead."
+  (rv-emit-fp-r buf #x79 0 rs1 0 fd))
+
+(defun rv-emit-fmv-x-d (buf rd fs1)
+  "FMV.X.D rd, fs1 -- move 64 raw bits from an FP register into an integer one."
+  (rv-emit-fp-r buf #x71 0 fs1 0 rd))
+
+(defun rv-emit-fcvt-d-l (buf fd rs1)
+  "FCVT.D.L fd, rs1 -- signed 64-bit integer to double."
+  (rv-emit-fp-r buf #x69 2 rs1 0 fd))
+
+(defun rv-emit-fcvt-l-d (buf rd fs1)
+  "FCVT.L.D rd, fs1, rtz -- double to signed 64-bit integer, TRUNCATING toward
+   zero, which is what :ftoi is specified to do."
+  (rv-emit-fp-r buf #x61 2 fs1 1 rd))
+
 (defun rv-emit-div (buf rd rs1 rs2)
   "DIV rd, rs1, rs2 (signed divide)"
   (rv-emit-u32 buf (rv-encode-r-type #x01 rs2 rs1 #x4 rd #x33)))
@@ -1348,6 +1391,64 @@
              (rv-emit-jal buf +rv-ra+ rel-offset)
              (rv-emit-call buf rel-offset))))
 
+      ;; ---- Double-precision floating point ----
+      ;;
+      ;; A double is a FOUR-SLOT object, subtag #x60, whose 64 IEEE bits live as
+      ;; four TAGGED 16-BIT CHUNKS — slot k holds bits (63-16k)..(48-16k) — because
+      ;; a raw 64-bit pattern does not fit in a slot that carries a 62-bit fixnum.
+      ;; Exactly translate-x64's representation; the only difference here is WHERE
+      ;; the slots are, since this target tags objects with 2 and has no padding
+      ;; word: slot k is at tagged + (1+k)*word - 2, i.e. +6/+14/+22/+30.
+      ;;
+      ;; RV32 IS DELIBERATELY EXCLUDED.  FMV.D.X moves 64 bits between an integer
+      ;; and an FP register and there is no 64-bit integer register on RV32; the
+      ;; port would have to bounce through memory.  Emitting it anyway would be an
+      ;; illegal instruction, so the arms below trap on RV32 rather than pretend.
+      ((#.+op-fadd+ #.+op-fsub+ #.+op-fmul+ #.+op-fdiv+)
+       (if (not *riscv-64-bit*)
+           (progn (rv-emit-addi buf +rv-a7+ +rv-x0+ opcode) (rv-emit-ebreak buf))
+           (let* ((vd (vreg 0))
+                  (ra (resolve (vreg 1)))
+                  (rb (resolve2 (vreg 2))))
+             ;; Unbox both operands into f0 and f1.
+             (rv-float-load-bits buf ra +rv-t0+ +rv-t1+)
+             (rv-emit-fmv-d-x buf 0 +rv-t0+)
+             (rv-float-load-bits buf rb +rv-t0+ +rv-t1+)
+             (rv-emit-fmv-d-x buf 1 +rv-t0+)
+             (cond ((= opcode +op-fadd+) (rv-emit-fadd-d buf 0 0 1))
+                   ((= opcode +op-fsub+) (rv-emit-fsub-d buf 0 0 1))
+                   ((= opcode +op-fmul+) (rv-emit-fmul-d buf 0 0 1))
+                   (t                    (rv-emit-fdiv-d buf 0 0 1)))
+             (rv-emit-fmv-x-d buf +rv-t0+ 0)
+             (rv-float-box buf +rv-t0+ +rv-t1+ +rv-t2+)
+             (store-result vd +rv-t2+))))
+
+      (#.+op-itof+
+       ;; Tagged integer -> a fresh double.  The value arrives TAGGED, so it is
+       ;; untagged with an arithmetic shift first: FCVT.D.L converts the integer
+       ;; VALUE, not its tagged encoding.
+       (if (not *riscv-64-bit*)
+           (progn (rv-emit-addi buf +rv-a7+ +rv-x0+ opcode) (rv-emit-ebreak buf))
+           (let* ((vd (vreg 0))
+                  (rs (resolve (vreg 1))))
+             (rv-emit-srai buf +rv-t0+ rs 1)
+             (rv-emit-fcvt-d-l buf 0 +rv-t0+)
+             (rv-emit-fmv-x-d buf +rv-t0+ 0)
+             (rv-float-box buf +rv-t0+ +rv-t1+ +rv-t2+)
+             (store-result vd +rv-t2+))))
+
+      (#.+op-ftoi+
+       ;; Double -> tagged integer, truncating toward zero (FCVT.L.D with rm=RTZ).
+       (if (not *riscv-64-bit*)
+           (progn (rv-emit-addi buf +rv-a7+ +rv-x0+ opcode) (rv-emit-ebreak buf))
+           (let* ((vd (vreg 0))
+                  (rs (resolve (vreg 1))))
+             (rv-float-load-bits buf rs +rv-t0+ +rv-t1+)
+             (rv-emit-fmv-d-x buf 0 +rv-t0+)
+             (rv-emit-fcvt-l-d buf +rv-t0+ 0)
+             (rv-emit-slli buf +rv-t0+ +rv-t0+ 1)      ; tag as a fixnum
+             (store-result vd +rv-t0+))))
+
       (#.+op-fn-addr+
        ;; (fn-addr Vd target:imm32) — the native address of a function, TAGGED
        ;; with +tag-function+ (3), which is how funcall dispatch and FUNCTIONP
@@ -1785,6 +1886,48 @@
 ;;; ============================================================
 ;;; Function Prologue / Epilogue
 ;;; ============================================================
+
+(defun rv-float-load-bits (buf ptr acc tmp)
+  "Reassemble the four tagged 16-bit chunks of the double whose TAGGED pointer is
+   in PTR into the 64-bit IEEE pattern in ACC.  TMP is clobbered.
+
+   Each `slli 48 / srli N' pair both MASKS the chunk to 16 bits and positions it,
+   so a slot carrying junk above bit 15 cannot corrupt its neighbour — the same
+   reason translate-x64's version shifts rather than ands."
+  (let ((ws (rv-word-size)))
+    ;; slot 0 -> bits 63..48
+    (rv-emit-load-word buf acc ptr (- ws 2))
+    (rv-emit-srai buf acc acc 1)
+    (rv-emit-slli buf acc acc 48)
+    ;; slots 1..3 -> bits 47..32, 31..16, 15..0
+    (loop for k from 1 to 3
+          do (rv-emit-load-word buf tmp ptr (- (* (1+ k) ws) 2))
+             (rv-emit-srai buf tmp tmp 1)
+             (rv-emit-slli buf tmp tmp 48)
+             (rv-emit-srli buf tmp tmp (* 16 k))
+             (rv-emit-or buf acc acc tmp))))
+
+(defun rv-float-box (buf bits tmp out)
+  "Allocate a fresh double object holding the 64 IEEE bits in BITS, leaving its
+   TAGGED pointer in OUT.  TMP is clobbered; BITS is preserved.
+
+   Header is (count=4)<<8 | subtag #x60, then the four tagged 16-bit chunks.  The
+   allocation is FIVE words (header + 4 slots) rounded up to the granule, so the
+   bump pointer stays aligned and the tag of 2 remains exact."
+  (let* ((ws (rv-word-size))
+         (g (rv-granule))
+         (bytes (logand (+ (* 5 ws) (1- g)) (lognot (1- g)))))
+    (rv-emit-li buf tmp (logior #x60 (ash 4 8)))
+    (rv-emit-store-word buf tmp +rv-s8+ 0)
+    ;; chunk k = bits (63-16k)..(48-16k), stored TAGGED.
+    (loop for k from 0 to 3
+          do (rv-emit-srli buf tmp bits (- 48 (* 16 k)))
+             (rv-emit-slli buf tmp tmp 48)         ; mask to 16 bits
+             (rv-emit-srli buf tmp tmp 48)
+             (rv-emit-slli buf tmp tmp 1)          ; tag as a fixnum
+             (rv-emit-store-word buf tmp +rv-s8+ (* (1+ k) ws)))
+    (rv-emit-addi buf out +rv-s8+ 2)               ; tag 2 = object
+    (rv-emit-addi buf +rv-s8+ +rv-s8+ bytes)))
 
 (defun rv-emit-prologue (buf frame-size)
   "Emit a RISC-V function prologue.

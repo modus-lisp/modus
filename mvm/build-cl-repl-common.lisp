@@ -1940,9 +1940,40 @@
   ;; it.  Measured before these overrides existed: the banner printed and the
   ;; image died before the REPL.  Mirrors the :X64 arm, which moves its stack to
   ;; 512 MB for the same reason.  Needs -m 512.
-  (setf (symbol-value (intern "*I386-STACK-TOP-OVERRIDE*" "MODUS.MVM")) #x18000000)   ; 384 MB
-  (setf (symbol-value (intern "*I386-CONS-BASE-OVERRIDE*" "MODUS.MVM")) #x08000000)   ; 128 MB
-  (setf (symbol-value (intern "*I386-GENERAL-BASE-OVERRIDE*" "MODUS.MVM")) #x10000000) ; 256 MB
+  ;; NO COLLECTOR ON BARE i386 YET, so VL is headroom rather than a semispace
+  ;; boundary.  translate-i386.lisp: *I386-GC-COLLECT-LABEL* is
+  ;; (and *i386-gc-enabled* *i386-linux-mode* ...), so every :gc-check on bare
+  ;; metal compiles to `int $0x31' with no IDT entry behind it.  Measured: the
+  ;; first build reached the banner and then v=31 -> #GP -> double -> triple
+  ;; fault.  Until the collector is wired (its own job — GC metadata, the two
+  ;; bitmaps, a stack base below 2^30), the image must simply never exhaust VL
+  ;; during boot.  128 MB of cons space for an image that interns a few tens of
+  ;; thousands of symbols; -m 512 gives room for all of it.
+  ;; MEASURED, not guessed: with VL at 192 MB the image died with VA =
+  ;; 0x0BFFFFF1, fifteen bytes short of the limit — it really does consume more
+  ;; than 128 MB of cons space before it reaches the prompt.  x64's heap is
+  ;; 224 MB for the same payload.  448 MB here, and the image wants -m 1024.
+  ;; Every address stays below 2^30 because gc.lisp's metadata convention and
+  ;; the 30-bit fixnum tagging both require it.
+  ;;
+  ;; WITH THAT HEADROOM THE GC TRAP IS GONE AND THE NEXT BLOCKER APPEARS:
+  ;; handler-case.  Traps #x0510 SETJMP, #x0511 LONGJMP and #x0512
+  ;; CLEAR-HANDLER are hosted-only (the jmp_buf and handler stack live in the
+  ;; hosted BSS), and translate-i386.lisp lists all three as deliberately NOT
+  ;; safe to no-op because each either produces a value or transfers control.
+  ;; The real CL uses handler-case pervasively — reader, eval and the REPL loop
+  ;; all wrap in it — so the image reaches one immediately and takes the
+  ;; unimplemented-trap reporter (INT3 on bare metal; measured as v=03 at
+  ;; IP 0x0195f6f5, about 6.5 MB further into the code than the GC trap was).
+  ;;
+  ;; So a bare i386 CL REPL needs, in order: (1) this headroom, done; (2)
+  ;; setjmp/longjmp/clear-handler against a jmp_buf and handler stack at fixed
+  ;; bare-metal addresses; (3) eventually the collector, for sustained use
+  ;; rather than boot.  `strings' on the image lists every trap it still cannot
+  ;; service: #x0310 #x0311 #x0500 #x0502 #x0510 #x0511 #x0512 #x0531.
+  (setf (symbol-value (intern "*I386-CONS-BASE-OVERRIDE*" "MODUS.MVM")) #x04000000)    ;  64 MB
+  (setf (symbol-value (intern "*I386-GENERAL-BASE-OVERRIDE*" "MODUS.MVM")) #x20000000) ; 512 MB
+  (setf (symbol-value (intern "*I386-STACK-TOP-OVERRIDE*" "MODUS.MVM")) #x3C000000)    ; 960 MB
   (funcall (intern "INSTALL-I386-TRANSLATOR" "MODUS.MVM.I386"))
   (setf (symbol-value (intern "*I386-LINUX-MODE*" "MODUS.MVM.I386")) nil)
   (setf (symbol-value (intern "*I386-NATIVE-CODE-OFFSET*" "MODUS.MVM.I386")) 0)

@@ -34,9 +34,49 @@ Hence two routes, both kept open:
 
 `mvm/build-fixpoint.lisp` (the multi-arch SSH Gen0, task #252) **builds again
 on this tree** — a 49 MB Gen0 at metadata VA 0x3000000 — so the build-time
-wall my earlier note recorded is gone; whether that Gen0 still reaches its
-fixpoint under `run-fixpoint-ssh.sh` was not re-run here.  It is a different
-artifact from the payload anyway.
+wall my earlier note recorded is gone.  `run-fixpoint-ssh.sh x64 x64` was
+re-run: the plain Gen0 boots under QEMU, prints its bring-up markers through
+`b0`, and never emits Gen1 (timeout at 400 s); the SSH-mode Gen0 build dies
+host-side in SBCL (the runner keeps only a backtrace tail).  So #252 has
+moved from a build-time wall to a runtime one.  It is a different artifact
+from the payload; the DDC'd payload is `--compile-uefi`'s output above.
+
+## Making the bare image DDC'd: `modus-sh --compile-uefi`
+
+`mvm/build-modus-selfhost.lisp` now bakes `boot/boot-uefi-snp.lisp`,
+`boot/boot-x64.lisp` and `boot/boot-uefi-x64.lisp` next to the Linux boot
+descriptor it already carried, and gains
+
+    modus-sh --compile-uefi <full-source.lisp> <out.efi> [0|test|1]
+
+which compiles the CL image's exact source text — dumped by the SBCL build with
+`MODUS_DDC_DUMP_SOURCE=path` — to the `:uefi-x64-cl` image inside Modus, with
+build-cl-repl-common's x64 knobs set verbatim (stack top, NX, bare translator
+mode, GC on, kind-check off, native-code offset from the UEFI preamble) plus
+the hosted `--compile`'s static-emit trio, JIT off first.
+`test/run-uefi-ddc.sh` runs SBCL build → modus-sh build → two in-image compiles
+and compares the bytes: SBCL vs modus-sh (the fixpoint) and run vs run.  The
+md5 of the modus-sh output is the DDC'd hash for `-kernel`.
+
+**Result, 2026-09-24:** the whole pipeline runs and the in-image compile is
+**reproducible run to run** (two `--compile-uefi` runs, identical md5), but it
+is **not yet the fixpoint**: the in-image translator fails on one instruction
+(`(mov V9 V6)` in `REDUCE`, `Unknown register: 6`) and emits a partial
+9.95 MB image against SBCL's 41.2 MB.  Bisected in the same session:
+
+* the modus-sh built on 2026-09-08 (`/home/claude/modus-mhost/tmp/fixpoint-hosts/modus-sh-sbcl`)
+  compiles this exact source text cleanly to a 36.9 MB hosted ELF;
+* today's modus-sh fails identically on the hosted target, and **with none
+  of the boot files baked** (`MODUS_SH_BOOT_FILES=""`).
+
+So the self-host of a full-size source regressed on main between 2026-09-08
+and 2026-09-24, in the in-image compiler/translator, independently of this
+work; `scripts/ws5-gate.sh`'s self-compile check only compiles a small
+program and did not see it.  A `git bisect run` over the 339 commits with the
+fixed source text was started (`tmp/bisect-probe.sh`; verdicts in
+`tmp/bisect/verdicts.txt`).  Once that lands, the remaining question is
+byte-identity of the UEFI image between SBCL and modus-sh, which the same
+script answers.
 
 ## The plan
 

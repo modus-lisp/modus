@@ -374,6 +374,36 @@
                             "(defun emit-bytes " "(defun %linux-boot-emit-bytes ")
                   "(emit-bytes " "(%linux-boot-emit-bytes ")))
 
+;;; --- bare-metal / UEFI x64 boot emitters, for `--compile-uefi` (DDC) ---
+;; boot/boot-x64.lisp (multiboot header, boot32, kernel64 entry, IDT/PIC/PIT,
+;; per-CPU layout), boot/boot-uefi-x64.lisp (the UEFI entry stub, PE32+ wrap,
+;; :uefi-x64-cl descriptor) and boot/boot-uefi-snp.lisp (SEV-SNP hooks).  Pure
+;; byte emitters over mvm-buffer, same as boot-linux-x64; no name collides with
+;; anything else baked here (checked 2026-09-24).  Order matters: snp defines
+;; *x64-snp-mode*, which boot-x64's interrupt setup and the UEFI stub test.
+(defvar *boot-x64-bare-files*
+  ;; Bisect knob: MODUS_SH_BOOT_FILES = comma list of the files to bake
+  ;; ("snp,x64,uefi" = all, "" = none — the pre-2026-09-24 image).
+  (let ((v (sb-ext:posix-getenv "MODUS_SH_BOOT_FILES")))
+    (if (null v) '("snp" "x64" "uefi")
+        (let ((out nil) (start 0))
+          (loop for i from 0 to (length v)
+                do (when (or (= i (length v)) (char= (char v i) #\,))
+                     (when (> i start) (push (subseq v start i) out))
+                     (setq start (1+ i))))
+          (nreverse out)))))
+(defvar *boot-x64-bare-sources*
+  (apply #'concatenate 'string
+         (mapcar (lambda (k)
+                   (concatenate 'string
+                                (mvm-text (cond ((string= k "snp") "boot/boot-uefi-snp.lisp")
+                                                ((string= k "x64") "boot/boot-x64.lisp")
+                                                ((string= k "uefi") "boot/boot-uefi-x64.lisp")
+                                                (t (error "MODUS_SH_BOOT_FILES: ~A" k))))
+                                (string #\Newline)))
+                 *boot-x64-bare-files*)))
+(format t "~&;; modus-sh: baked bare/UEFI boot files: ~S~%" *boot-x64-bare-files*)
+
 ;;; ============================================================
 ;;; #210 RUNG 1: bake the AARCH64 build tooling into the SAME image.
 ;;;
@@ -783,6 +813,7 @@
     *cross-source*                  (string #\Newline)
     *boot-linux-desc-source*        (string #\Newline)
     *boot-linux-aa64-desc-source*   (string #\Newline)
+    *boot-x64-bare-sources*         (string #\Newline)
     *selfhost-target-coinit-source* (string #\Newline)))
 
 (defvar *stage2-test-source* "
@@ -1339,6 +1370,55 @@
                   (print-dec (length bytes))
                   (write-string-serial \" bytes to \")
                   (write-string-serial out) (write-char-serial 10)))))))))
+
+;; ---- DDC: modus --compile-uefi <in.lisp> <out.efi> [snp-mode] ----------------
+;; Compile the CL image's full source text (dumped by build-cl-repl-common with
+;; MODUS_DDC_DUMP_SOURCE) to the SAME PE32+ image mvm/build-uefi-cl-repl.lisp
+;; produces under SBCL — the artifact an SEV-SNP launch measures via -kernel.
+;; The knobs below are build-cl-repl-common's :X64 arm, verbatim, plus the
+;; static-emit trio the hosted --compile forces.  SNP-MODE: \"0\"/absent, \"test\",
+;; or \"1\".  The JIT is switched OFF first: the translator is put into
+;; bare-metal mode for the OUTPUT, and a JIT'd form compiled meanwhile would
+;; carry bare-metal traps into THIS Linux process.
+(defun %selfhost-compile-file-uefi (in out mode)
+  (let ((src (%selfhost-slurp-text in)))
+    (if (null src)
+        (progn (write-string-serial \"modus --compile-uefi: cannot read \")
+               (write-string-serial in) (write-char-serial 10) (sys-exit 1))
+       (progn
+        (setq *use-jit* nil)
+        (setq *static-build-p* t)
+        (setq *mvm-emit-halves* nil)
+        (setq *mvm-eval-runtime-p* nil)
+        (setq *x64-snp-mode* (cond ((or (null mode) (string= mode \"\") (string= mode \"0\")) nil)
+                                   ((string-equal mode \"test\") :test)
+                                   (t :snp)))
+        (setq *snp-shared-base* #x0C000000)
+        (setq *x64-stack-top-override* #x20000000)
+        (setq *x64-nx-data-enable* t)
+        (setq *x64-linux-mode* nil)
+        (setq *x64-gc-enabled* t)
+        (setq *ws5-force-no-kindcheck* t)
+        (setq *x64-native-code-offset* (+ 5 (uefi-cl-preamble-length)))
+        (write-string-serial \"modus --compile-uefi: snp-mode \")
+        (write-object *x64-snp-mode*)
+        (write-string-serial \" native offset \")
+        (print-dec *x64-native-code-offset*)
+        (write-char-serial 10)
+        (let ((image (build-image :target :uefi-x64-cl :source-text src)))
+          (let ((bytes (kernel-image-image-bytes image))
+                (fd (%selfhost-open-exec out)))
+            (if (< fd 0)
+                (progn (write-string-serial \"modus --compile-uefi: cannot write \")
+                       (write-string-serial out) (write-char-serial 10) (sys-exit 1))
+                (progn
+                  (%selfhost-write-bytes fd bytes)
+                  (%sys-close fd)
+                  (write-string-serial \"modus: wrote \")
+                  (print-dec (length bytes))
+                  (write-string-serial \" bytes to \")
+                  (write-string-serial out) (write-char-serial 10)))))))))
+
 ;; ---- #210 RUNG 1: modus --compile-aarch64 <in.lisp> <out> -----------------
 ;; The CROSS-ARCH emit.  Identical in shape to %selfhost-compile-file above,
 ;; but drives the AArch64 translator baked into this same x64 image and asks
@@ -1538,6 +1618,19 @@
   ;; native Linux ELF and exits; otherwise fall through to the normal CLI.
   (let ((av (handler-case (%cli-collect-argv) (t (c) nil))))
     (if (and (consp av) (consp (cdr av)) (stringp (car (cdr av)))
+             (string= (car (cdr av)) \"--compile-uefi\"))
+        (handler-case
+            (progn (%selfhost-compile-file-uefi (nth 2 av) (nth 3 av) (nth 4 av)) (sys-exit 0))
+          (t (c) (progn (write-string-serial \"modus --compile-uefi: error at \")
+                        (handler-case (write-object *current-source-location*)
+                          (t (c3) (write-string-serial \"?loc\")))
+                        (write-string-serial \" cond-type=\")
+                        (handler-case (write-object (type-of c))
+                          (t (c4) (write-string-serial \"?type\")))
+                        (write-string-serial \" cond=\")
+                        (handler-case (write-object c) (t (c2) (write-string-serial \"<unprintable>\")))
+                        (write-char-serial 10) (sys-exit 1))))
+    (if (and (consp av) (consp (cdr av)) (stringp (car (cdr av)))
              (string= (car (cdr av)) \"--compile-aarch64\"))
         ;; #210 rung 1 cross-arch emit.  Checked BEFORE \"--compile\" because
         ;; STRING= is exact (not a prefix test), but keeping it first also
@@ -1566,7 +1659,7 @@
                         (write-string-serial \" cond=\")
                         (handler-case (write-object c) (t (c2) (write-string-serial \"<unprintable>\")))
                         (write-char-serial 10) (sys-exit 1))))
-        (handler-case (cli-toplevel) (t (c) (sys-exit 1)))))))
+        (handler-case (cli-toplevel) (t (c) (sys-exit 1))))))))
 ")
 
 (defvar *all-runtime-source*

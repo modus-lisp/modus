@@ -2267,6 +2267,18 @@
 
 ;;; DIVERGENCE 8 — BUILD-IMAGE :TARGET and the default output path.
 ;;; MODUS_CL_REPL_OUT overrides either one.
+;; DDC: MODUS_DDC_DUMP_SOURCE=path writes the EXACT text build-image is about
+;; to compile AND still builds, so `modus-sh --compile-uefi path OUT` can
+;; reproduce this image from inside Modus (test/run-uefi-ddc.sh compares the
+;; bytes).  Not build-cli-common's MODUS_DUMP_FULL_SOURCE: that one exits
+;; before this file appends its own arms, so its text is not what we compile.
+#+sbcl
+(let ((p (sb-ext:posix-getenv "MODUS_DDC_DUMP_SOURCE")))
+  (when (and p (plusp (length p)))
+    (with-open-file (o p :direction :output :if-exists :supersede)
+      (write-string cl-user::*full-source* o))
+    (format t "~&;; DDC: full source text (~D chars) written to ~A~%"
+            (length cl-user::*full-source*) p)))
 (let ((image (build-image :target (cond (cl-user::*cl-repl-virt-p* :fixpoint)
                                         (cl-user::*cl-repl-uefi-p* :uefi-x64-cl)
                                         (cl-user::*cl-repl-x64-p* :x86-64)

@@ -1240,10 +1240,20 @@
    the stub is ~3 KB with SNP :test, ~2.7 KB without.")
 
 (defun emit-uefi-cl-entry (buf)
-  (let ((*uefi-gdt-layout* :boot-x64)
-        (*uefi-console-tables* nil)
-        (*uefi-stub-pad* +uefi-cl-stub-pad+))
-    (emit-uefi-entry-stub buf))
+  ;; SETQ + restore, not LET: this file is also baked into modus-sh for
+  ;; --compile-uefi, and the in-image compiler binds a LET of a special
+  ;; LEXICALLY unless it is registered (build-checks LET-OF-UNREGISTERED-
+  ;; SPECIAL) — the callee would then read the old values.
+  (let ((old-layout *uefi-gdt-layout*)
+        (old-tables *uefi-console-tables*)
+        (old-pad *uefi-stub-pad*))
+    (setq *uefi-gdt-layout* :boot-x64)
+    (setq *uefi-console-tables* nil)
+    (setq *uefi-stub-pad* +uefi-cl-stub-pad+)
+    (emit-uefi-entry-stub buf)
+    (setq *uefi-gdt-layout* old-layout)
+    (setq *uefi-console-tables* old-tables)
+    (setq *uefi-stub-pad* old-pad))
   ;; boot-x64's 64-bit entry, at runtime VA 0x100000.  Its own NOP padding
   ;; aligns (buffer length + 5) to 16; the stub pad is a multiple of 16, so
   ;; the alignment it computes on the whole buffer holds at runtime too.

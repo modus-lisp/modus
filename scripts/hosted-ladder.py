@@ -77,7 +77,7 @@ def run_cell(arch, rung_path, expect, keep=False):
                        cwd=REPO, env=env, capture_output=True, text=True,
                        timeout=1800)
     if not os.path.exists(binfile):
-        return False, "BUILD FAILED: " + (b.stderr or b.stdout)[-300:]
+        return "BUILD", "BUILD FAILED: " + (b.stderr or b.stdout)[-300:]
     # The image is WRITTEN, not created executable, and qemu-user resolves its
     # argument as a program: a non-executable file is rejected SILENTLY with
     # exit 1 and not one word on stderr.  That cost a debugging cycle; chmod
@@ -86,13 +86,17 @@ def run_cell(arch, rung_path, expect, keep=False):
     try:
         r = subprocess.run([qemu, binfile], capture_output=True, timeout=120)
     except subprocess.TimeoutExpired:
-        return False, "TIMEOUT"
+        return "RUN", "TIMEOUT"
     if len(r.stdout) < 4:
-        return False, f"SHORT OUTPUT ({len(r.stdout)} bytes, rc={r.returncode}) {r.stderr[-120:]!r}"
+        return "RUN", f"SHORT OUTPUT ({len(r.stdout)} bytes, rc={r.returncode}) {r.stderr[-120:]!r}"
     got = int.from_bytes(r.stdout[:4], "little")
     if not keep:
         subprocess.run(["rm", "-rf", tmpdir])
-    return (got == expect), f"{'=' if got == expect else '!='} {got} (want {expect})"
+    # THREE OUTCOMES, NOT TWO.  "PASS", "WRONG" (it ran and answered something
+    # else) and the failure kinds above are different facts, and the control
+    # below is only meaningful if it can tell them apart.
+    return ("PASS" if got == expect else "WRONG"), \
+           f"{'=' if got == expect else '!='} {got} (want {expect})"
 
 
 def main():
@@ -107,23 +111,32 @@ def main():
 
     failures = 0
     for arch in arches:
-        # THE GATE MUST PROVE IT CAN FAIL.  One rung with a deliberately wrong
-        # expected value runs FIRST, and a ladder that cannot fail is not
-        # evidence of anything -- the reason this discipline exists is that
-        # "all architectures produce correct output" stood in the README for
-        # months while five of the images had no way to print.
-        ok, why = run_cell(arch, rungs[0], expected_of(rungs[0]) + 1)
-        if ok:
+        # THE GATE MUST PROVE IT CAN FAIL, AND FAIL FOR THE RIGHT REASON.  One
+        # rung runs FIRST with a deliberately wrong expected value, and the
+        # required outcome is "WRONG" -- it BUILT, it RAN, and the comparison
+        # rejected the answer.
+        #
+        # Accepting any failure here is not a control.  Measured: a broken
+        # build makes every cell BUILD-FAIL, and a control that counts that as
+        # "failed as required" then certifies a harness in which nothing works
+        # at all.  scripts/arch-ladder-gate.sh printed exactly that -- "the gate
+        # can fail" above 14 BUILD-FAILs -- which is how this was found.
+        outcome, why = run_cell(arch, rungs[0], expected_of(rungs[0]) + 1)
+        if outcome == "PASS":
             print(f"{arch}: POSITIVE CONTROL PASSED — the ladder cannot fail; refusing to run")
             return 2
-        print(f"{arch}: positive control failed as required ({why})")
+        if outcome != "WRONG":
+            print(f"{arch}: POSITIVE CONTROL DID NOT RUN ({outcome}: {why}) — "
+                  f"a control that cannot answer proves nothing; refusing to run")
+            return 2
+        print(f"{arch}: positive control answered WRONG as required ({why})")
         for r in rungs:
             exp = expected_of(r)
-            ok, why = run_cell(arch, r, exp, keep)
-            if not ok:
+            outcome, why = run_cell(arch, r, exp, keep)
+            if outcome != "PASS":
                 failures += 1
             print(f"  {os.path.basename(r):<24} {arch:<8} "
-                  f"{'PASS' if ok else 'FAIL':<5} {why}")
+                  f"{outcome if outcome != 'WRONG' else 'FAIL':<5} {why}")
     print(f"\nhosted ladder: {failures} failed")
     return 0 if failures == 0 else 1
 

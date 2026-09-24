@@ -23,7 +23,9 @@ Two rules this file exists to enforce, both learned the hard way:
 
 Usage:
     scripts/arch-ladder.py <arch> <rung.lisp> --expect=<n> [--keep]
-Exit code is 0 on PASS, 1 on any failure.
+Exit code: 0 PASS (or SKIP), 3 the image ran and answered WRONG, 1 anything
+else (build failure, dead image, timeout).  3 is separate because the gate's
+positive control must require a WRONG ANSWER, not merely a non-zero exit.
 """
 import json, os, socket, subprocess, sys, tempfile, time
 
@@ -179,7 +181,13 @@ def main():
         return 1
     if got != expect:
         print(f"{arch:8s} WRONG     got {got} want {expect}")
-        return 1
+        # EXIT 3 IS ITS OWN ANSWER: the image BUILT, it RAN, and the comparison
+        # rejected the value.  A build failure and a dead image both exit 1, and
+        # the gate's positive control needs to tell them apart -- a control that
+        # "fails" because nothing compiled certifies a harness in which nothing
+        # works.  That is not hypothetical: a broken build once printed
+        # "positive control failed as required" above 14 BUILD-FAILs.
+        return 3
     print(f"{arch:8s} PASS      {os.path.basename(rung)} = {got}")
     return 0
 

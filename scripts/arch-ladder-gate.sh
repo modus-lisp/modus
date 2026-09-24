@@ -53,12 +53,25 @@ expected_for() {
 # ---- positive control: the gate must be able to fail -----------------------
 CONTROL_ARCH=$(echo "$ARCHES" | tr ' ' '\n' | head -1)
 echo "positive control: $CONTROL_ARCH r01-call expecting the WRONG answer (43)"
-if scripts/arch-ladder.py "$CONTROL_ARCH" "$RUNGS_DIR/r01-call.lisp" --expect=43 >/dev/null 2>&1; then
+# THE CONTROL MUST FAIL FOR THE RIGHT REASON.  Exit 3 means the image BUILT, it
+# RAN, and the comparison rejected the value.  Accepting any non-zero exit is
+# not a control: a broken build makes every cell BUILD-FAIL and exits 1, and
+# this line then printed "the gate can fail" above 14 of them — certifying a
+# harness in which nothing worked at all.  Measured, not hypothetical.
+scripts/arch-ladder.py "$CONTROL_ARCH" "$RUNGS_DIR/r01-call.lisp" --expect=43 >/dev/null 2>&1
+control_rc=$?
+if [ "$control_rc" -eq 0 ]; then
   echo "GATE BROKEN: the positive control PASSED with a wrong expected value."
   echo "Nothing below would mean anything; refusing to run the ladder."
   exit 2
 fi
-echo "positive control failed as required — the gate can fail"
+if [ "$control_rc" -ne 3 ]; then
+  echo "GATE BROKEN: the positive control did not RUN (exit $control_rc — build"
+  echo "failure, dead image or missing emulator, not a wrong answer)."
+  echo "A control that cannot answer proves nothing; refusing to run the ladder."
+  exit 2
+fi
+echo "positive control answered WRONG as required — the gate can fail"
 echo
 
 # ---- the ladder -----------------------------------------------------------

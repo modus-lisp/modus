@@ -52,6 +52,11 @@
     ;; indistinguishable from "file not found".  A hosted image that cannot be
     ;; run looks exactly like a hosted image that is broken, which is how this
     ;; cost a debugging cycle on the RV32 bring-up.
-    (sb-posix:chmod out #o755)
+    ;; FIND-SYMBOL, not SB-POSIX:CHMOD.  check-source-parses READS every
+    ;; first-party file in the tree, and at read time the sb-posix contrib has
+    ;; not been required, so the qualified name is an unreadable symbol and the
+    ;; whole build fails the parse sweep -- on files that have nothing to do
+    ;; with the target being built.
+    (funcall (find-symbol "CHMOD" "SB-POSIX") out #o755)
     (format t "Wrote ~D bytes to ~A~%" (length (kernel-image-image-bytes image)) out)
     (format t "Run: qemu-riscv64-static ~A~%" out)))

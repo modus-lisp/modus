@@ -329,6 +329,62 @@ When a rung fails, `--keep` leaves the built image and payload behind, and
 `scripts/arch-ladder.py` documents the per-arch QEMU machine choices (ppc64
 needs `powernv`, not `pseries`; 68k needs `virt`, not `an5206`).
 
+### The HOSTED ladder — the same rungs, seconds per cell
+
+```bash
+scripts/hosted-ladder.py riscv32            # one port, all 14 rungs
+scripts/hosted-ladder.py --all
+```
+
+A hosted image has a console, so the oracle is four bytes on stdout rather than
+a QMP read of guest memory: ~35 s per cell against ~6 min, and no machine to
+boot. Same two rules — `--expect` is mandatory and a deliberately-wrong control
+runs first — because they are what makes either harness evidence.
+
+Only the ports whose build script takes a SOURCE FILE are in it (`riscv64`,
+`riscv32`, `arm32`). The hosted x64/aarch64/i386 images come from the CLI
+lineage and bake a whole runtime, so grading them this way would measure
+something else; they have `./modus` and the ANSI gate.
+
+**`qemu-*-static` REJECTS A NON-EXECUTABLE FILE SILENTLY** — exit 1, nothing on
+stderr, indistinguishable from "file not found". `build-image` writes mode 644,
+so a freshly built hosted image does not run until it is chmod'd; the harness
+does it so no caller can hit it. Same class as the i386 `binfmt_misc` trap.
+
+### RV32: one RISC-V back end, two widths
+
+`*riscv-64-bit*` (PPC's model) selects the width and `install-riscv32-translator`
+clears it; every width-dependent value is DERIVED — `rv-word-size`, `rv-granule`
+(a word PAIR, so tags 1 and 2 stay exact), `rv-word-shift`, `rv-index-shift`,
+`rv-mask24-shift`, `rv-mask26-shift`, and `rv-shamt` as the backstop.
+
+**Three RV32 facts that are not "narrower", each of which was a bug first:**
+- **`SLLI`'s shamt field is FIVE bits.** A shamt of 40 sets bit 25, which is
+  funct7 — so it is not a wrong shift, it is a reserved instruction. This is why
+  the mask-to-24-bits idiom needs `rv-mask24-shift` and not a constant.
+- **`AMOSWAP.D` does not exist**; funct3 is the ACCESS WIDTH, so emitting 011 on
+  RV32 is illegal rather than merely wide.
+- **`#x80000000` is an ordinary RV32 value outside signed-32**, so `rv-emit-li`'s
+  64-bit shift-and-add chain would run and build what the register cannot hold.
+  It now re-reads every immediate as signed-32 when the width is 32.
+
+`mul26hi` is the one arm that needs an extra instruction rather than a different
+constant: two 26-bit operands make a 52-bit product, so RV32 brings the high
+half down with `MULHU`. (ppc32's equivalent uses `mullw` and silently truncates
+— a real defect there, out of scope here.)
+
+**Found while porting, and NOT an RV32 bug:** `+WIDTH-TLS-BIT+` was unmasked in
+RISC-V's `op-load`/`op-store`. Widths 4..7 are 0..3 plus "per-thread window
+slot", and an unmatched `CASE` emits NOTHING — so a window-marked store was a
+silent no-op. i386 and aarch64 mask it; RISC-V now does too.
+
+**STILL OPEN on RV64 hosted:** `+linux-riscv-heap-alloc-start+` is `#x200`,
+which is exactly where that port's entry stub writes ARGC — so its first
+allocation lands on the argc slot. Latent only because no payload there reads
+argc yet. RV32 starts at `#x2000`, clear of the whole fixed low block (metadata
+`#x40`, globals `#x80`, MV `#x90..#x138`, argc `#x200`, handler frames
+`#x400..#xC2F`, per-CPU mode `#xFF8`).
+
 ## Build Commands
 
 All builds: `sbcl --script <build-script>`

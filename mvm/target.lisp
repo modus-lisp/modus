@@ -117,6 +117,43 @@
    :features '(:has-sbi t :has-plic t)))
 
 ;;; ============================================================
+;;; RISC-V 32 Target (RV32I/M) — the EMBEDDED RISC-V
+;;; ============================================================
+;;;
+;;; Same register map, same translator, 4-byte words.  RV32 is not a smaller
+;;; RV64: SLLI's shift-amount field is 5 bits rather than 6, AMOSWAP.D and the
+;;; whole *W instruction family do not exist, and the object/cons granule is a
+;;; word pair (8 bytes, not 16).  TRANSLATE-RISCV.LISP derives all of that from
+;;; *RISCV-64-BIT*, which INSTALL-RISCV32-TRANSLATOR sets.
+(defparameter *target-riscv32*
+  (make-target
+   :name :riscv32
+   :word-size 4
+   :endianness :little
+   :reg-map #(:a0 :a1 :a2 :a3        ; V0-V3 (args) = x10-x13
+              :s0 :s1 :s2 :s3        ; V4-V7 (callee-saved) = x8,x9,x18,x19
+              :s4 :s5 :s6 :s7        ; V8-V11 (callee-saved) = x20-x23
+              nil nil nil nil         ; V12-V15 (spill)
+              :a0                     ; VR (aliases V0)
+              :s8                     ; VA = x24
+              :s9                     ; VL = x25
+              :s10                    ; VN = x26
+              :sp                     ; VSP = x2
+              :fp                     ; VFP = x8 (alias of s0)
+              nil)                    ; VPC
+   :n-phys-regs 32
+   :callee-saved '(4 5 6 7 8 9 10 11)
+   :arg-regs '(0 1 2 3)
+   :scratch-regs '(5 6 7 8)
+   :max-inline-regs 11
+   :page-size 4096
+   :translate-fn nil
+   :emit-prologue nil
+   :emit-epilogue nil
+   :emit-boot nil
+   :features '(:32-bit t :has-sbi t :has-plic t)))
+
+;;; ============================================================
 ;;; AArch64 Target
 ;;; ============================================================
 ;;;
@@ -450,6 +487,7 @@
 ;; Register all built-in targets
 (register-target *target-x86-64*)
 (register-target *target-riscv64*)
+(register-target *target-riscv32*)
 (register-target *target-aarch64*)
 (register-target *target-ppc64*)
 (register-target *target-ppc32*)

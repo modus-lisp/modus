@@ -16,6 +16,7 @@
 ;; it here is the price of that; a better home would be a shared elf.lisp.
 (mvm-load "boot/boot-linux-aarch64.lisp")
 (mvm-load "boot/boot-linux-riscv.lisp")
+(require :sb-posix)
 (in-package :modus.mvm)
 
 (install-riscv-translator)
@@ -46,5 +47,11 @@
     (with-open-file (o out :direction :output :element-type '(unsigned-byte 8)
                            :if-exists :supersede)
       (write-sequence (kernel-image-image-bytes image) o))
+    ;; MAKE IT EXECUTABLE.  qemu-user resolves its argument as a PROGRAM, and a
+    ;; non-executable file is rejected SILENTLY -- exit 1, nothing on stderr,
+    ;; indistinguishable from "file not found".  A hosted image that cannot be
+    ;; run looks exactly like a hosted image that is broken, which is how this
+    ;; cost a debugging cycle on the RV32 bring-up.
+    (sb-posix:chmod out #o755)
     (format t "Wrote ~D bytes to ~A~%" (length (kernel-image-image-bytes image)) out)
     (format t "Run: qemu-riscv64-static ~A~%" out)))

@@ -83,6 +83,7 @@ read back out of guest memory over QMP and compared to an expected value —
 | i386        | 32 | little | translate-i386.lisp    | `qemu-system-i386`                    | 102/144 | 14/14 |
 | ARM32       | 32 | little | translate-arm32.lisp   | `qemu-system-arm -M raspi2b`          |  92/144 | 14/14 |
 | RISC-V 64   | 64 | little | translate-riscv.lisp   | `qemu-system-riscv64 -M virt`         |  92/144 | 14/14 |
+| RISC-V 32   | 32 | little | translate-riscv.lisp   | hosted only so far (see below)        | (shared) | 14/14 hosted |
 | PPC64       | 64 | big    | translate-ppc.lisp     | `qemu-system-ppc64 -M powernv`        |  92/144 | 14/14 |
 | PPC32       | 32 | big    | translate-ppc.lisp     | `qemu-system-ppc -M ppce500`          |  92/144 | 14/14 |
 | 68k         | 32 | big    | translate-68k.lisp     | `qemu-system-m68k -M virt`            |  92/144 | 14/14 |
@@ -144,6 +145,49 @@ output path to print with.
 
 It is not yet wired into CI, and an architecture whose `qemu-system-*` is not
 installed is reported as SKIP rather than silently dropped.
+
+#### Hosted Linux ports — the same rungs in seconds, not ninety minutes
+
+Bare metal needs a boot stub, an FPU enable, a collector bring-up and a UART
+driver before an image can say anything. Hosted Linux needs none of it: `mmap`
+supplies memory, `write(2)` is the console, and a fault is a signal. So a
+hosted port reaches a working image far sooner, and — because it has a console —
+the same fourteen rungs can be graded by reading four bytes off stdout instead
+of booting a machine and reading guest memory over QMP.
+
+| Port | ELF | Build | Run | Hosted ladder |
+|------|-----|-------|-----|:-------------:|
+| Linux/RV64  | ELF64-LE, EM_RISCV | `mvm/build-riscv-linux.lisp`   | `qemu-riscv64-static` | 14/14 |
+| Linux/RV32  | ELF32-LE, EM_RISCV | `mvm/build-riscv32-linux.lisp` | `qemu-riscv32-static` | 14/14 |
+| Linux/ARM32 | ELF32-LE, EM_ARM   | `mvm/build-arm32-linux.lisp`   | `qemu-arm-static`     | not yet run |
+
+```bash
+scripts/hosted-ladder.py riscv32            # one port, all rungs
+scripts/hosted-ladder.py --all              # every hosted port with a source build
+```
+
+It carries the full-system harness's two rules unchanged: the expected value is
+mandatory, and one rung runs first with a deliberately wrong expectation and
+must FAIL. That is not ceremony — `r13-sap` on RV32 returned a clean, plausible
+**0**, because a 4-byte read past a granule boundary landed on zeroed heap. A
+harness that accepted "the image printed something" would have called it a pass.
+
+**RV32 is the embedded RISC-V** — GD32VF103, ESP32-C3, CH32V, the SiFive E
+cores — and it shares the whole back end with RV64 on the PPC dual-width model:
+one translator, `*riscv-64-bit*` set by the installer, everything width-
+dependent derived from it. Three things are not merely narrower there, and each
+was a bug before it was a comment: `SLLI`'s shift-amount field is **five** bits,
+so the RV64 mask-to-24-bits distance of 40 sets bit 25 (funct7) and is a
+reserved instruction rather than a shift; `AMOSWAP.D` does not exist, because
+funct3 encodes the access width; and `#x80000000` is an ordinary RV32 value that
+nonetheless falls outside signed-32, so the 64-bit immediate chain would run and
+build a value the register cannot hold.
+
+One hosted trap worth knowing before it costs an afternoon: **`qemu-*-static`
+rejects a non-executable file silently, with exit 1 and nothing on stderr** —
+indistinguishable from "file not found". The builds write mode 644, so a first
+run looks like a broken image. Same shape as the i386 `binfmt_misc` trap
+documented in CLAUDE.md.
 
 ### Cross-architecture fixpoint
 

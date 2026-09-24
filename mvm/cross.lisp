@@ -235,7 +235,7 @@
      (let ((name (target-name target)))
        (handler-case
            (ecase name
-             (:riscv64
+             ((:riscv64 :riscv32)
               ;; rv-buffer has bytes slot with position tracking fill
               (rv-buffer-to-bytes buf))
              (:aarch64  (a64-buffer-to-bytes buf))
@@ -1037,8 +1037,9 @@
               ;; end.  (That is why a one-function probe reached its stores on
               ;; ppc32 and a two-function one did not.)  Each arch gets the
               ;; same single PC-relative branch x86 and ARM already had.
-              ((eq arch :riscv64)
-               ;; JAL x0, imm  (J-type, opcode 0x6F, rd=0).  The immediate is
+              ((member arch '(:riscv64 :riscv32))
+               ;; JAL x0, imm  (J-type, opcode 0x6F, rd=0).  Same encoding at
+               ;; both widths -- JAL is RV32I, not an RV64 addition.  The immediate is
                ;; scrambled: imm[20|10:1|11|19:12].  Target = PC + offset, and
                ;; native code starts 4 bytes past this instruction.
                (let* ((off (+ entry-native-offset 4))
@@ -1322,6 +1323,14 @@
                        raw-bytes
                        (or (getf boot-descriptor :load-addr) #x10000)
                        :bss-end (getf boot-descriptor :bss-end)))
+                    ((eq (getf boot-descriptor :elf-format) :linux-riscv32)
+                     ;; RV32 is ELF32, so it goes through the ELF32 wrapper and
+                     ;; carries no symbol/function table -- the ELF64 writer is
+                     ;; what emits those, and nothing on this port reads them.
+                     (wrap-in-elf32-le-riscv
+                       raw-bytes
+                       (or (getf boot-descriptor :load-addr) #x10000)
+                       :bss-end (getf boot-descriptor :bss-end)))
                     ((eq (getf boot-descriptor :elf-format) :linux-riscv)
                      (wrap-in-elf64-le-riscv raw-bytes
                                              (or (getf boot-descriptor :load-addr) #x400000)
@@ -1412,6 +1421,7 @@
     (:linux-x64 :x86-64)
     (:linux-aarch64 :aarch64)
     (:linux-riscv :riscv64)
+    (:linux-riscv32 :riscv32)
     ;; ARMv7, not the ARMv5 :arm32 descriptor: INSTALL-ARMV7-TRANSLATOR is what
     ;; the hosted build installs (movw/movt make 32-bit immediates one pair of
     ;; instructions instead of a literal pool), and it is what qemu-arm and any
@@ -1498,6 +1508,7 @@
     (:linux-x64 (linux-x64-boot-descriptor))
     (:linux-aarch64 (linux-aarch64-boot-descriptor))
     (:linux-riscv (linux-riscv-boot-descriptor))
+    (:linux-riscv32 (linux-riscv32-boot-descriptor))
     (:linux-arm32 (linux-arm32-boot-descriptor))
     (:linux-i386 (linux-i386-boot-descriptor))
     (:x64-console (x64-console-boot-descriptor))

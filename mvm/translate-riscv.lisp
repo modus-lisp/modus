@@ -258,6 +258,10 @@
   "MULH rd, rs1, rs2 (multiply high, signed x signed)"
   (rv-emit-u32 buf (rv-encode-r-type #x01 rs2 rs1 #x1 rd #x33)))
 
+(defun rv-emit-mulhu (buf rd rs1 rs2)
+  "MULHU rd, rs1, rs2 -- high XLEN bits of the UNSIGNED product."
+  (rv-emit-u32 buf (rv-encode-r-type #x01 rs2 rs1 #x3 rd #x33)))
+
 (defun rv-emit-div (buf rd rs1 rs2)
   "DIV rd, rs1, rs2 (signed divide)"
   (rv-emit-u32 buf (rv-encode-r-type #x01 rs2 rs1 #x4 rd #x33)))
@@ -288,17 +292,26 @@
   "SLTI rd, rs1, imm12 (set less than immediate, signed)"
   (rv-emit-u32 buf (rv-encode-i-type imm12 rs1 #x2 rd #x13)))
 
+(defun rv-shamt (shamt)
+  "Mask an immediate shift amount to the SHAMT FIELD OF THIS WIDTH: 6 bits on
+   RV64, 5 on RV32.  The extra bit is not merely ignored on RV32 -- bit 25 is
+   part of the funct7 field there, so a shamt of 40 does not shift by 8, it
+   decodes as a reserved instruction.  Every width-dependent shift distance in
+   this file goes through a derived helper (RV-WORD-SHIFT, RV-MASK24-SHIFT,
+   RV-MASK26-SHIFT); this is the backstop for the rest."
+  (logand shamt (if *riscv-64-bit* #x3F #x1F)))
+
 (defun rv-emit-slli (buf rd rs1 shamt)
-  "SLLI rd, rs1, shamt (shift left logical immediate, RV64: shamt is 6 bits)"
-  (rv-emit-u32 buf (rv-encode-i-type (logand shamt #x3F) rs1 #x1 rd #x13)))
+  "SLLI rd, rs1, shamt (shift left logical immediate)"
+  (rv-emit-u32 buf (rv-encode-i-type (rv-shamt shamt) rs1 #x1 rd #x13)))
 
 (defun rv-emit-srli (buf rd rs1 shamt)
   "SRLI rd, rs1, shamt (shift right logical immediate)"
-  (rv-emit-u32 buf (rv-encode-i-type (logand shamt #x3F) rs1 #x5 rd #x13)))
+  (rv-emit-u32 buf (rv-encode-i-type (rv-shamt shamt) rs1 #x5 rd #x13)))
 
 (defun rv-emit-srai (buf rd rs1 shamt)
   "SRAI rd, rs1, shamt (shift right arithmetic immediate)"
-  (rv-emit-u32 buf (rv-encode-i-type (logior #x400 (logand shamt #x3F))
+  (rv-emit-u32 buf (rv-encode-i-type (logior #x400 (rv-shamt shamt))
                                       rs1 #x5 rd #x13)))
 
 ;; --- RV64 I-type word ops (opcode #b0011011 = #x1B) ---
@@ -308,6 +321,57 @@
   (rv-emit-u32 buf (rv-encode-i-type imm12 rs1 #x0 rd #x1B)))
 
 ;; --- Load instructions (opcode #b0000011 = #x03) ---
+
+(defparameter *riscv-64-bit* t
+  "T for RV64, NIL for RV32.  Same shape as *PPC-64-BIT*: one translator, two
+   word sizes, chosen by the installer.
+
+   RV32 IS THE EMBEDDED RISC-V.  RV64 is what servers and QEMU virt run; the
+   parts that cost ten cents — CH32V003, ESP32-C3 — are RV32IMC.  A 3 KB bare
+   image that computes is only interesting if it can be flashed onto one of
+   those, and that means emitting 4-byte words and a 30-bit fixnum tower, which
+   the MVM already derives from (TARGET-WORD-SIZE ...).")
+
+(defun rv-word-size ()
+  "Current word size in bytes: 8 on RV64, 4 on RV32."
+  (if *riscv-64-bit* 8 4))
+
+(defun rv-index-shift ()
+  "Shift that turns a TAGGED index (2k) into a word byte-offset (k*word):
+   log2(word) - 1.  2 on RV64, 1 on RV32."
+  (if *riscv-64-bit* 2 1))
+
+(defun rv-word-shift ()
+  "Shift that multiplies a count by the word size: 3 on RV64, 2 on RV32."
+  (if *riscv-64-bit* 3 2))
+
+(defun rv-granule ()
+  "Allocation granule: TWO words, so the bump pointer stays word-pair aligned
+   and a tag of 1 (cons) or 2 (object) is exact.  16 on RV64, 8 on RV32."
+  (* 2 (rv-word-size)))
+
+(defun rv-mask26-shift ()
+  "Shift-out/shift-back distance that masks a value to its low 26 bits:
+   register width minus 26.  38 on RV64, 6 on RV32."
+  (- (* 8 (rv-word-size)) 26))
+
+(defun rv-mask24-shift ()
+  "Shift-out/shift-back distance that masks a value to its low 24 bits:
+   register width minus 24.  40 on RV64, 8 on RV32.  RV32's SLLI takes a 5-bit
+   shamt, so 40 is not merely wrong there — it is unencodable."
+  (- (* 8 (rv-word-size)) 24))
+
+(defun rv-emit-store-word (buf rs2 rs1 imm12)
+  "Store one Lisp word: SD on RV64, SW on RV32."
+  (if *riscv-64-bit*
+      (rv-emit-sd buf rs2 rs1 imm12)
+      (rv-emit-sw buf rs2 rs1 imm12)))
+
+(defun rv-emit-load-word (buf rd rs1 imm12)
+  "Load one Lisp word: LD on RV64, LW on RV32."
+  (if *riscv-64-bit*
+      (rv-emit-ld buf rd rs1 imm12)
+      (rv-emit-lw buf rd rs1 imm12)))
 
 (defun rv-emit-ld (buf rd rs1 imm12)
   "LD rd, imm12(rs1) (load doubleword, 64-bit)"
@@ -426,16 +490,22 @@
 
 ;; --- Atomic (A extension, opcode #b0101111 = #x2F) ---
 
-(defun rv-emit-amoswap-d (buf rd rs2 rs1 aqrl)
-  "AMOSWAP.D rd, rs2, (rs1) with acquire/release bits.
-   AQRL: bit1=aq, bit0=rl."
+(defun rv-emit-amoswap (buf rd rs2 rs1 aqrl)
+  "AMOSWAP.D (RV64) / AMOSWAP.W (RV32) rd, rs2, (rs1) with acquire/release.
+   AQRL: bit1=aq, bit0=rl.  AMOSWAP.D DOES NOT EXIST ON RV32 -- funct3 is the
+   access width, so emitting 011 there is an illegal instruction, not a wider
+   swap."
   (rv-emit-u32 buf (logior (ash #x01 27)              ; funct5 = 00001
                             (ash (logand aqrl #x3) 25) ; aq/rl
                             (ash (logand rs2 #x1F) 20)
                             (ash (logand rs1 #x1F) 15)
-                            (ash #x3 12)               ; funct3 = 011 (doubleword)
+                            (ash (if *riscv-64-bit* #x3 #x2) 12) ; width: D or W
                             (ash (logand rd #x1F) 7)
                             #x2F)))
+
+(defun rv-emit-amoswap-d (buf rd rs2 rs1 aqrl)
+  "Deprecated name kept for callers; dispatches on width."
+  (rv-emit-amoswap buf rd rs2 rs1 aqrl))
 
 ;; --- Pseudo-instructions ---
 
@@ -452,6 +522,11 @@
    - Small values (fits in 12-bit signed): addi rd, x0, imm
    - 32-bit values: lui + addi
    - Large values: lui + addi + slli + addi (up to 6 instructions for full 64-bit)"
+  ;; RV32: every immediate IS 32 bits.  Re-read it as signed-32 so cases 1 and 2
+  ;; cover the whole range and the 64-bit chain below is unreachable.
+  (unless *riscv-64-bit*
+    (let ((v (logand imm64 #xFFFFFFFF)))
+      (setf imm64 (if (logbitp 31 v) (- v #x100000000) v))))
   (cond
     ;; Case 1: fits in signed 12-bit [-2048, 2047]
     ((and (>= imm64 -2048) (<= imm64 2047))
@@ -549,14 +624,14 @@
 ;;; target is chosen before translation, not when this file loads.
 
 (defun rv-emit-store-abs (buf src-reg addr)
-  "Store the 64-bit SRC-REG to absolute ADDR (via t1, so t0 stays free)."
+  "Store SRC-REG (one WORD, 8 or 4 bytes) to absolute ADDR via t1, so t0 stays free."
   (rv-emit-li buf +rv-t1+ addr)
-  (rv-emit-sd buf src-reg +rv-t1+ 0))
+  (rv-emit-store-word buf src-reg +rv-t1+ 0))
 
 (defun rv-emit-load-abs (buf rd addr)
-  "Load 64 bits from absolute ADDR into RD (via t1)."
+  "Load one WORD (8 or 4 bytes) from absolute ADDR into RD (via t1)."
   (rv-emit-li buf +rv-t1+ addr)
-  (rv-emit-ld buf rd +rv-t1+ 0))
+  (rv-emit-load-word buf rd +rv-t1+ 0))
 
 (defun rv-emit-j (buf offset)
   "J offset (unconditional jump, jal x0, offset)"
@@ -627,7 +702,7 @@
         phys
         ;; Spilled: load from stack frame (safe FP-relative offsets)
         (progn
-          (rv-emit-ld buf target-phys +rv-fp+ (rv-spill-offset vreg))
+          (rv-emit-load-word buf target-phys +rv-fp+ (rv-spill-offset vreg))
           target-phys))))
 
 (defun rv-store-vreg (buf vreg phys)
@@ -638,7 +713,7 @@
         (when (/= dest phys)
           (rv-emit-mv buf dest phys))
         ;; Spilled: store to stack frame (safe FP-relative offsets)
-        (rv-emit-sd buf phys +rv-fp+ (rv-spill-offset vreg)))))
+        (rv-emit-store-word buf phys +rv-fp+ (rv-spill-offset vreg)))))
 
 ;;; ============================================================
 ;;; MVM -> RISC-V Translation
@@ -748,12 +823,12 @@
        (let ((rs (resolve (vreg 0))))
          ;; addi sp, sp, -8; sd rs, 0(sp)
          (rv-emit-addi buf +rv-sp+ +rv-sp+ -8)
-         (rv-emit-sd buf rs +rv-sp+ 0)))
+         (rv-emit-store-word buf rs +rv-sp+ 0)))
 
       (#.+op-pop+
        (let ((vd (vreg 0)))
          ;; ld t0, 0(sp); addi sp, sp, 8
-         (rv-emit-ld buf +rv-t0+ +rv-sp+ 0)
+         (rv-emit-load-word buf +rv-t0+ +rv-sp+ 0)
          (rv-emit-addi buf +rv-sp+ +rv-sp+ 8)
          (store-result vd +rv-t0+)))
 
@@ -838,9 +913,10 @@
          (rv-emit-srai buf +rv-t0+ ra 1)        ; untag a
          (rv-emit-srai buf +rv-t1+ rb 1)        ; untag b
          (rv-emit-mul buf +rv-t0+ +rv-t0+ +rv-t1+) ; 64-bit result
-         ;; Mask to 26 bits: SLLI 38, SRLI 38 (clears bits 26+)
-         (rv-emit-slli buf +rv-t0+ +rv-t0+ 38)
-         (rv-emit-srli buf +rv-t0+ +rv-t0+ 38)
+         ;; Mask to 26 bits (the low 26 of the product are in the low word
+         ;; on both widths, so this arm needs no high half)
+         (rv-emit-slli buf +rv-t0+ +rv-t0+ (rv-mask26-shift))
+         (rv-emit-srli buf +rv-t0+ +rv-t0+ (rv-mask26-shift))
          (rv-emit-slli buf +rv-t0+ +rv-t0+ 1)   ; retag
          (store-result vd +rv-t0+)))
 
@@ -851,8 +927,20 @@
               (rb (resolve2 (vreg 2))))
          (rv-emit-srai buf +rv-t0+ ra 1)        ; untag a
          (rv-emit-srai buf +rv-t1+ rb 1)        ; untag b
-         (rv-emit-mul buf +rv-t0+ +rv-t0+ +rv-t1+) ; 64-bit result
-         (rv-emit-srli buf +rv-t0+ +rv-t0+ 26)  ; shift right 26
+         ;; Bits 26+ need the FULL product.  On RV64 one MUL holds it; on RV32
+         ;; the product of two 26-bit operands is up to 52 bits, so the high
+         ;; half must be brought down -- MULHU is what makes this arm correct
+         ;; on 32 bits rather than silently truncated.
+         (if *riscv-64-bit*
+             (progn
+               (rv-emit-mul buf +rv-t0+ +rv-t0+ +rv-t1+)
+               (rv-emit-srli buf +rv-t0+ +rv-t0+ 26))
+             (progn
+               (rv-emit-mulhu buf +rv-t2+ +rv-t0+ +rv-t1+)  ; high 32
+               (rv-emit-mul buf +rv-t0+ +rv-t0+ +rv-t1+)    ; low 32
+               (rv-emit-srli buf +rv-t0+ +rv-t0+ 26)
+               (rv-emit-slli buf +rv-t2+ +rv-t2+ 6)
+               (rv-emit-or buf +rv-t0+ +rv-t0+ +rv-t2+)))
          (rv-emit-slli buf +rv-t0+ +rv-t0+ 1)   ; retag
          (store-result vd +rv-t0+)))
 
@@ -1055,14 +1143,14 @@
        ;; ld rd, -1(rs)  -- untag cons pointer (subtract tag), load car
        (let* ((vd (vreg 0))
               (rs (resolve (vreg 1))))
-         (rv-emit-ld buf +rv-t0+ rs -1)
+         (rv-emit-load-word buf +rv-t0+ rs -1)
          (store-result vd +rv-t0+)))
 
       (#.+op-cdr+
-       ;; ld rd, 7(rs)  -- untag cons (-1), offset to cdr (+8) = +7
+       ;; ld rd, ws-1(rs)  -- untag cons (-1), offset to cdr (+ws)
        (let* ((vd (vreg 0))
               (rs (resolve (vreg 1))))
-         (rv-emit-ld buf +rv-t0+ rs 7)
+         (rv-emit-load-word buf +rv-t0+ rs (1- (rv-word-size)))
          (store-result vd +rv-t0+)))
 
       (#.+op-cons+
@@ -1071,23 +1159,23 @@
        (let* ((vd (vreg 0))
               (ra (resolve (vreg 1)))          ; car
               (rb (resolve2 (vreg 2))))        ; cdr
-         (rv-emit-sd buf ra +rv-s8+ 0)          ; store car at alloc ptr
-         (rv-emit-sd buf rb +rv-s8+ 8)          ; store cdr at alloc ptr + 8
+         (rv-emit-store-word buf ra +rv-s8+ 0)          ; store car at alloc ptr
+         (rv-emit-store-word buf rb +rv-s8+ (rv-word-size))  ; cdr at alloc ptr + word
          (rv-emit-addi buf +rv-t0+ +rv-s8+ 1)   ; tag: cons tag = 1
-         (rv-emit-addi buf +rv-s8+ +rv-s8+ 16)  ; bump alloc pointer
+         (rv-emit-addi buf +rv-s8+ +rv-s8+ (rv-granule))  ; bump alloc pointer
          (store-result vd +rv-t0+)))
 
       (#.+op-setcar+
        ;; Store value into car slot: sd vs, -1(vd)
        (let ((rd (resolve (vreg 0)))
              (rs (resolve2 (vreg 1))))
-         (rv-emit-sd buf rs rd -1)))
+         (rv-emit-store-word buf rs rd -1)))
 
       (#.+op-setcdr+
-       ;; Store value into cdr slot: sd vs, 7(vd)
+       ;; Store value into cdr slot: sd vs, ws-1(vd)
        (let ((rd (resolve (vreg 0)))
              (rs (resolve2 (vreg 1))))
-         (rv-emit-sd buf rs rd 7)))
+         (rv-emit-store-word buf rs rd (1- (rv-word-size)))))
 
       (#.+op-consp+
        ;; Check if lowest bit of tag is 1 (cons tag)
@@ -1125,11 +1213,13 @@
        (let* ((vd (vreg 0))
               (size-words (vreg 1))
               (subtag (vreg 2))
-              ;; Align to 16 bytes to keep cons alloc pointer aligned
-              (total-bytes (logand (+ (* (1+ size-words) 8) 15) (lognot 15))))
+              ;; Align to the granule to keep the cons alloc pointer aligned
+              (g (rv-granule))
+              (total-bytes (logand (+ (* (1+ size-words) (rv-word-size)) (1- g))
+                                   (lognot (1- g)))))
          ;; Build and store header
          (rv-emit-li buf +rv-t0+ (logior (ash size-words 8) subtag))
-         (rv-emit-sd buf +rv-t0+ +rv-s8+ 0)
+         (rv-emit-store-word buf +rv-t0+ +rv-s8+ 0)
          ;; Tag pointer: object tag = 2
          (rv-emit-addi buf +rv-t0+ +rv-s8+ 2)
          ;; Bump alloc pointer
@@ -1143,17 +1233,17 @@
               (idx (vreg 2)))
          (if (= vobj +vreg-vfp+)
              ;; Frame slot access: use safe FP-relative offset below spill area
-             (let ((off (+ +rv-frame-slot-base+ (* idx -8))))
-               (rv-emit-ld buf +rv-t0+ +rv-fp+ off))
+             (let ((off (+ +rv-frame-slot-base+ (* idx (- (rv-word-size))))))
+               (rv-emit-load-word buf +rv-t0+ +rv-fp+ off))
              ;; Normal object slot access
              (let* ((robj (resolve vobj))
-                    (offset (- (* (1+ idx) 8) 2)))  ; (1+idx)*8 - tag
+                    (offset (- (* (1+ idx) (rv-word-size)) 2)))  ; (1+idx)*word - tag
                (if (and (>= offset -2048) (<= offset 2047))
-                   (rv-emit-ld buf +rv-t0+ robj offset)
+                   (rv-emit-load-word buf +rv-t0+ robj offset)
                    (progn
                      (rv-emit-li buf +rv-t0+ offset)
                      (rv-emit-add buf +rv-t0+ robj +rv-t0+)
-                     (rv-emit-ld buf +rv-t0+ +rv-t0+ 0)))))
+                     (rv-emit-load-word buf +rv-t0+ +rv-t0+ 0)))))
          (store-result vd +rv-t0+)))
 
       (#.+op-obj-set+
@@ -1163,17 +1253,17 @@
               (rs (resolve2 (vreg 2))))
          (if (= vobj +vreg-vfp+)
              ;; Frame slot store: use safe FP-relative offset below spill area
-             (let ((off (+ +rv-frame-slot-base+ (* idx -8))))
-               (rv-emit-sd buf rs +rv-fp+ off))
+             (let ((off (+ +rv-frame-slot-base+ (* idx (- (rv-word-size))))))
+               (rv-emit-store-word buf rs +rv-fp+ off))
              ;; Normal object slot store
              (let* ((robj (resolve vobj))
-                    (offset (- (* (1+ idx) 8) 2)))
+                    (offset (- (* (1+ idx) (rv-word-size)) 2)))
                (if (and (>= offset -2048) (<= offset 2047))
-                   (rv-emit-sd buf rs robj offset)
+                   (rv-emit-store-word buf rs robj offset)
                    (progn
                      (rv-emit-li buf +rv-t0+ offset)
                      (rv-emit-add buf +rv-t0+ robj +rv-t0+)
-                     (rv-emit-sd buf rs +rv-t0+ 0)))))))
+                     (rv-emit-store-word buf rs +rv-t0+ 0)))))))
 
       (#.+op-obj-tag+
        ;; Extract 3-bit tag from pointer
@@ -1187,31 +1277,40 @@
        (let* ((vd (vreg 0))
               (rs (resolve (vreg 1))))
          ;; Untag pointer (object tag=2), load header at offset 0
-         (rv-emit-ld buf +rv-t0+ rs -2)
+         (rv-emit-load-word buf +rv-t0+ rs -2)
          (rv-emit-andi buf +rv-t0+ +rv-t0+ #xFF)
          (store-result vd +rv-t0+)))
 
       ;; ---- Memory (raw) ----
       (#.+op-load+
+       ;; MASK +WIDTH-TLS-BIT+ (widths 4..7 are 0..3 plus "this is a per-thread
+       ;; window slot").  RISC-V has no per-thread window, so the bit is
+       ;; dropped -- exactly as translate-i386 and translate-aarch64 do.  It is
+       ;; masked rather than ignored because an unmatched CASE here emits
+       ;; NOTHING, and a load that silently emits nothing is a wrong value.
+       ;;
+       ;; Width 3 is :u64.  On RV32 it degrades to a 32-bit access, which is
+       ;; what the other 32-bit back ends do; the compiler splits a promoting
+       ;; width into halves on a 30-bit tower anyway.
        (let* ((vd (vreg 0))
               (raddr (resolve (vreg 1)))
-              (width (vreg 2)))
+              (width (logand (vreg 2) 3)))
          (case width
            (0 (rv-emit-lbu buf +rv-t0+ raddr 0))   ; u8
            (1 (rv-emit-lh buf +rv-t0+ raddr 0))     ; u16
            (2 (rv-emit-lw buf +rv-t0+ raddr 0))     ; u32
-           (3 (rv-emit-ld buf +rv-t0+ raddr 0)))    ; u64
+           (3 (rv-emit-load-word buf +rv-t0+ raddr 0)))    ; u64 (one word)
          (store-result vd +rv-t0+)))
 
       (#.+op-store+
        (let* ((raddr (resolve (vreg 0)))
               (rs (resolve2 (vreg 1)))
-              (width (vreg 2)))
+              (width (logand (vreg 2) 3)))   ; +WIDTH-TLS-BIT+: see op-load
          (case width
            (0 (rv-emit-sb buf rs raddr 0))
            (1 (rv-emit-sh buf rs raddr 0))
            (2 (rv-emit-sw buf rs raddr 0))
-           (3 (rv-emit-sd buf rs raddr 0)))))
+           (3 (rv-emit-store-word buf rs raddr 0)))))
 
       (#.+op-fence+
        ;; Full memory barrier: fence iorw, iorw
@@ -1248,19 +1347,19 @@
                                  0))
               (total-frame (+ +rv-local-frame-size+ 112)))
          ;; Restore callee-saved registers
-         (rv-emit-ld buf +rv-ra+  +rv-sp+ (- total-frame 8))
-         (rv-emit-ld buf +rv-fp+  +rv-sp+ (- total-frame 16))
-         (rv-emit-ld buf +rv-s1+  +rv-sp+ (- total-frame 24))
-         (rv-emit-ld buf +rv-s2+  +rv-sp+ (- total-frame 32))
-         (rv-emit-ld buf +rv-s3+  +rv-sp+ (- total-frame 40))
-         (rv-emit-ld buf +rv-s4+  +rv-sp+ (- total-frame 48))
-         (rv-emit-ld buf +rv-s5+  +rv-sp+ (- total-frame 56))
-         (rv-emit-ld buf +rv-s6+  +rv-sp+ (- total-frame 64))
-         (rv-emit-ld buf +rv-s7+  +rv-sp+ (- total-frame 72))
-         (rv-emit-ld buf +rv-s8+  +rv-sp+ (- total-frame 80))
-         (rv-emit-ld buf +rv-s9+  +rv-sp+ (- total-frame 88))
-         (rv-emit-ld buf +rv-s10+ +rv-sp+ (- total-frame 96))
-         (rv-emit-ld buf +rv-s11+ +rv-sp+ (- total-frame 104))
+         (rv-emit-load-word buf +rv-ra+  +rv-sp+ (- total-frame 8))
+         (rv-emit-load-word buf +rv-fp+  +rv-sp+ (- total-frame 16))
+         (rv-emit-load-word buf +rv-s1+  +rv-sp+ (- total-frame 24))
+         (rv-emit-load-word buf +rv-s2+  +rv-sp+ (- total-frame 32))
+         (rv-emit-load-word buf +rv-s3+  +rv-sp+ (- total-frame 40))
+         (rv-emit-load-word buf +rv-s4+  +rv-sp+ (- total-frame 48))
+         (rv-emit-load-word buf +rv-s5+  +rv-sp+ (- total-frame 56))
+         (rv-emit-load-word buf +rv-s6+  +rv-sp+ (- total-frame 64))
+         (rv-emit-load-word buf +rv-s7+  +rv-sp+ (- total-frame 72))
+         (rv-emit-load-word buf +rv-s8+  +rv-sp+ (- total-frame 80))
+         (rv-emit-load-word buf +rv-s9+  +rv-sp+ (- total-frame 88))
+         (rv-emit-load-word buf +rv-s10+ +rv-sp+ (- total-frame 96))
+         (rv-emit-load-word buf +rv-s11+ +rv-sp+ (- total-frame 104))
          ;; Deallocate frame
          (rv-emit-addi buf +rv-sp+ +rv-sp+ total-frame)
          ;; Jump to target
@@ -1275,7 +1374,7 @@
        ;; addi vd, VA, 1 (tag); addi VA, VA, 16
        (let ((vd (vreg 0)))
          (rv-emit-addi buf +rv-t0+ +rv-s8+ 1)    ; tagged cons pointer
-         (rv-emit-addi buf +rv-s8+ +rv-s8+ 16)   ; bump alloc
+         (rv-emit-addi buf +rv-s8+ +rv-s8+ (rv-granule))  ; bump alloc
          (store-result vd +rv-t0+)))
 
       ((#.+op-gc-check+ #.+op-gc-check-n+ #.+op-gc-check-r+)
@@ -1304,33 +1403,33 @@
        ;; Save all callee-saved registers to the stack frame
        ;; This is used for actor context switching
        (rv-emit-addi buf +rv-sp+ +rv-sp+ -96)  ; 12 regs * 8 bytes
-       (rv-emit-sd buf +rv-ra+  +rv-sp+ 88)
-       (rv-emit-sd buf +rv-s0+  +rv-sp+ 80)
-       (rv-emit-sd buf +rv-s1+  +rv-sp+ 72)
-       (rv-emit-sd buf +rv-s2+  +rv-sp+ 64)
-       (rv-emit-sd buf +rv-s3+  +rv-sp+ 56)
-       (rv-emit-sd buf +rv-s4+  +rv-sp+ 48)
-       (rv-emit-sd buf +rv-s5+  +rv-sp+ 40)
-       (rv-emit-sd buf +rv-s6+  +rv-sp+ 32)
-       (rv-emit-sd buf +rv-s7+  +rv-sp+ 24)
-       (rv-emit-sd buf +rv-s8+  +rv-sp+ 16)
-       (rv-emit-sd buf +rv-s9+  +rv-sp+ 8)
-       (rv-emit-sd buf +rv-s10+ +rv-sp+ 0))
+       (rv-emit-store-word buf +rv-ra+  +rv-sp+ 88)
+       (rv-emit-store-word buf +rv-s0+  +rv-sp+ 80)
+       (rv-emit-store-word buf +rv-s1+  +rv-sp+ 72)
+       (rv-emit-store-word buf +rv-s2+  +rv-sp+ 64)
+       (rv-emit-store-word buf +rv-s3+  +rv-sp+ 56)
+       (rv-emit-store-word buf +rv-s4+  +rv-sp+ 48)
+       (rv-emit-store-word buf +rv-s5+  +rv-sp+ 40)
+       (rv-emit-store-word buf +rv-s6+  +rv-sp+ 32)
+       (rv-emit-store-word buf +rv-s7+  +rv-sp+ 24)
+       (rv-emit-store-word buf +rv-s8+  +rv-sp+ 16)
+       (rv-emit-store-word buf +rv-s9+  +rv-sp+ 8)
+       (rv-emit-store-word buf +rv-s10+ +rv-sp+ 0))
 
       (#.+op-restore-ctx+
        ;; Restore all callee-saved registers from the stack frame
-       (rv-emit-ld buf +rv-ra+  +rv-sp+ 88)
-       (rv-emit-ld buf +rv-s0+  +rv-sp+ 80)
-       (rv-emit-ld buf +rv-s1+  +rv-sp+ 72)
-       (rv-emit-ld buf +rv-s2+  +rv-sp+ 64)
-       (rv-emit-ld buf +rv-s3+  +rv-sp+ 56)
-       (rv-emit-ld buf +rv-s4+  +rv-sp+ 48)
-       (rv-emit-ld buf +rv-s5+  +rv-sp+ 40)
-       (rv-emit-ld buf +rv-s6+  +rv-sp+ 32)
-       (rv-emit-ld buf +rv-s7+  +rv-sp+ 24)
-       (rv-emit-ld buf +rv-s8+  +rv-sp+ 16)
-       (rv-emit-ld buf +rv-s9+  +rv-sp+ 8)
-       (rv-emit-ld buf +rv-s10+ +rv-sp+ 0)
+       (rv-emit-load-word buf +rv-ra+  +rv-sp+ 88)
+       (rv-emit-load-word buf +rv-s0+  +rv-sp+ 80)
+       (rv-emit-load-word buf +rv-s1+  +rv-sp+ 72)
+       (rv-emit-load-word buf +rv-s2+  +rv-sp+ 64)
+       (rv-emit-load-word buf +rv-s3+  +rv-sp+ 56)
+       (rv-emit-load-word buf +rv-s4+  +rv-sp+ 48)
+       (rv-emit-load-word buf +rv-s5+  +rv-sp+ 40)
+       (rv-emit-load-word buf +rv-s6+  +rv-sp+ 32)
+       (rv-emit-load-word buf +rv-s7+  +rv-sp+ 24)
+       (rv-emit-load-word buf +rv-s8+  +rv-sp+ 16)
+       (rv-emit-load-word buf +rv-s9+  +rv-sp+ 8)
+       (rv-emit-load-word buf +rv-s10+ +rv-sp+ 0)
        (rv-emit-addi buf +rv-sp+ +rv-sp+ 96))
 
       (#.+op-yield+
@@ -1359,7 +1458,7 @@
            (0 (rv-emit-lbu buf +rv-t1+ +rv-t0+ 0))
            (1 (rv-emit-lh buf +rv-t1+ +rv-t0+ 0))
            (2 (rv-emit-lw buf +rv-t1+ +rv-t0+ 0))
-           (3 (rv-emit-ld buf +rv-t1+ +rv-t0+ 0)))
+           (3 (rv-emit-load-word buf +rv-t1+ +rv-t0+ 0)))
          (store-result vd +rv-t1+)))
 
       (#.+op-io-write+
@@ -1372,7 +1471,7 @@
            (0 (rv-emit-sb buf rs +rv-t0+ 0))
            (1 (rv-emit-sh buf rs +rv-t0+ 0))
            (2 (rv-emit-sw buf rs +rv-t0+ 0))
-           (3 (rv-emit-sd buf rs +rv-t0+ 0)))))
+           (3 (rv-emit-store-word buf rs +rv-t0+ 0)))))
 
       (#.+op-halt+
        ;; WFI loop: wfi; j -4 (loop back to wfi)
@@ -1396,11 +1495,11 @@
        (let* ((vd (vreg 0))
               (offset (vreg 1)))
          (if (and (>= offset -2048) (<= offset 2047))
-             (rv-emit-ld buf +rv-t0+ +rv-tp+ offset)
+             (rv-emit-load-word buf +rv-t0+ +rv-tp+ offset)
              (progn
                (rv-emit-li buf +rv-t0+ offset)
                (rv-emit-add buf +rv-t0+ +rv-tp+ +rv-t0+)
-               (rv-emit-ld buf +rv-t0+ +rv-t0+ 0)))
+               (rv-emit-load-word buf +rv-t0+ +rv-t0+ 0)))
          (store-result vd +rv-t0+)))
 
       (#.+op-percpu-set+
@@ -1408,11 +1507,11 @@
        (let* ((offset (vreg 0))
               (rs (resolve (vreg 1))))
          (if (and (>= offset -2048) (<= offset 2047))
-             (rv-emit-sd buf rs +rv-tp+ offset)
+             (rv-emit-store-word buf rs +rv-tp+ offset)
              (progn
                (rv-emit-li buf +rv-t0+ offset)
                (rv-emit-add buf +rv-t0+ +rv-tp+ +rv-t0+)
-               (rv-emit-sd buf rs +rv-t0+ 0)))))
+               (rv-emit-store-word buf rs +rv-t0+ 0)))))
 
       ;; ---- Arrays ----
       ;; Object layout, as alloc-obj/obj-ref already use it on this target:
@@ -1426,13 +1525,14 @@
          ;; header = (count << 8) | #x32   (array subtag, as on i386/arm32)
          (rv-emit-slli buf +rv-t0+ rc 8)
          (rv-emit-addi buf +rv-t0+ +rv-t0+ #x32)
-         (rv-emit-sd buf +rv-t0+ +rv-s8+ 0)
-         ;; bytes = align16((count + 1) * 8)
+         (rv-emit-store-word buf +rv-t0+ +rv-s8+ 0)
+         ;; bytes = align-to-granule((count + 1) * word)
          (rv-emit-addi buf +rv-t1+ rc 1)
-         (rv-emit-slli buf +rv-t1+ +rv-t1+ 3)
-         (rv-emit-addi buf +rv-t1+ +rv-t1+ 15)
-         (rv-emit-andi buf +rv-t1+ +rv-t1+ -16)
-         ;; result = VA + 2 (VA stays 16-aligned, so ADDI is exact tagging)
+         (rv-emit-slli buf +rv-t1+ +rv-t1+ (rv-word-shift))
+         (rv-emit-addi buf +rv-t1+ +rv-t1+ (1- (rv-granule)))
+         (rv-emit-andi buf +rv-t1+ +rv-t1+ (- (rv-granule)))
+         ;; result = VA + 2 (VA stays granule-aligned -- 16 on RV64, 8 on RV32 --
+         ;; so tag 2 is exact at both widths)
          (rv-emit-addi buf +rv-t0+ +rv-s8+ 2)
          (rv-emit-add buf +rv-s8+ +rv-s8+ +rv-t1+)
          (store-result vd +rv-t0+)))
@@ -1441,9 +1541,9 @@
        (let* ((vd (vreg 0))
               (robj (resolve (vreg 1)))
               (ridx (resolve2 (vreg 2))))
-         (rv-emit-slli buf +rv-t2+ ridx 2)
+         (rv-emit-slli buf +rv-t2+ ridx (rv-index-shift))
          (rv-emit-add buf +rv-t2+ +rv-t2+ robj)
-         (rv-emit-ld buf +rv-t2+ +rv-t2+ 6)
+         (rv-emit-load-word buf +rv-t2+ +rv-t2+ (- (rv-word-size) 2))
          (store-result vd +rv-t2+)))
 
       (#.+op-aset+
@@ -1452,18 +1552,18 @@
        (let* ((robj (resolve (vreg 0)))
               (rval (rv-vreg-or-load buf (vreg 2) +rv-t2+))
               (ridx (rv-vreg-or-load buf (vreg 1) +rv-t1+)))
-         (rv-emit-slli buf +rv-t1+ ridx 2)
+         (rv-emit-slli buf +rv-t1+ ridx (rv-index-shift))
          (rv-emit-add buf +rv-t1+ +rv-t1+ robj)
-         (rv-emit-sd buf rval +rv-t1+ 6)))
+         (rv-emit-store-word buf rval +rv-t1+ (- (rv-word-size) 2))))
 
       (#.+op-array-len+
        ;; count = (header >> 8) & 0xFFFFFF, returned TAGGED.
        (let* ((vd (vreg 0))
               (robj (resolve (vreg 1))))
-         (rv-emit-ld buf +rv-t0+ robj -2)
+         (rv-emit-load-word buf +rv-t0+ robj -2)
          (rv-emit-srli buf +rv-t0+ +rv-t0+ 8)
-         (rv-emit-slli buf +rv-t0+ +rv-t0+ 40)   ; mask to 24 bits
-         (rv-emit-srli buf +rv-t0+ +rv-t0+ 40)
+         (rv-emit-slli buf +rv-t0+ +rv-t0+ (rv-mask24-shift))  ; mask to 24 bits
+         (rv-emit-srli buf +rv-t0+ +rv-t0+ (rv-mask24-shift))
          (rv-emit-slli buf +rv-t0+ +rv-t0+ 1)    ; tag as fixnum
          (store-result vd +rv-t0+)))
 
@@ -1480,11 +1580,11 @@
          ;; header = (N << 8) | #x11   (u8-vector subtag)
          (rv-emit-slli buf +rv-t0+ +rv-t2+ 8)
          (rv-emit-addi buf +rv-t0+ +rv-t0+ #x11)
-         (rv-emit-sd buf +rv-t0+ +rv-s8+ 0)
-         ;; bytes = align16(N + 8)  — header word plus the byte payload
-         (rv-emit-addi buf +rv-t1+ +rv-t2+ 8)
-         (rv-emit-addi buf +rv-t1+ +rv-t1+ 15)
-         (rv-emit-andi buf +rv-t1+ +rv-t1+ -16)
+         (rv-emit-store-word buf +rv-t0+ +rv-s8+ 0)
+         ;; bytes = align-to-granule(N + word) — header word plus the byte payload
+         (rv-emit-addi buf +rv-t1+ +rv-t2+ (rv-word-size))
+         (rv-emit-addi buf +rv-t1+ +rv-t1+ (1- (rv-granule)))
+         (rv-emit-andi buf +rv-t1+ +rv-t1+ (- (rv-granule)))
          (rv-emit-addi buf +rv-t0+ +rv-s8+ 2)
          (rv-emit-add buf +rv-s8+ +rv-s8+ +rv-t1+)
          (store-result vd +rv-t0+)))
@@ -1495,11 +1595,11 @@
               (rc (resolve (vreg 1) +rv-t2+)))
          (rv-emit-slli buf +rv-t0+ rc 8)
          (rv-emit-addi buf +rv-t0+ +rv-t0+ #x31)      ; string subtag
-         (rv-emit-sd buf +rv-t0+ +rv-s8+ 0)
+         (rv-emit-store-word buf +rv-t0+ +rv-s8+ 0)
          (rv-emit-addi buf +rv-t1+ rc 1)
-         (rv-emit-slli buf +rv-t1+ +rv-t1+ 3)
-         (rv-emit-addi buf +rv-t1+ +rv-t1+ 15)
-         (rv-emit-andi buf +rv-t1+ +rv-t1+ -16)
+         (rv-emit-slli buf +rv-t1+ +rv-t1+ (rv-word-shift))
+         (rv-emit-addi buf +rv-t1+ +rv-t1+ (1- (rv-granule)))
+         (rv-emit-andi buf +rv-t1+ +rv-t1+ (- (rv-granule)))
          (rv-emit-addi buf +rv-t0+ +rv-s8+ 2)
          (rv-emit-add buf +rv-s8+ +rv-s8+ +rv-t1+)
          (store-result vd +rv-t0+)))
@@ -1511,7 +1611,7 @@
               (ridx (resolve2 (vreg 2))))
          (rv-emit-srai buf +rv-t2+ ridx 1)
          (rv-emit-add buf +rv-t2+ +rv-t2+ rarr)
-         (rv-emit-lbu buf +rv-t2+ +rv-t2+ 6)
+         (rv-emit-lbu buf +rv-t2+ +rv-t2+ (- (rv-word-size) 2))
          (rv-emit-slli buf +rv-t2+ +rv-t2+ 1)
          (store-result vd +rv-t2+)))
 
@@ -1525,19 +1625,19 @@
          (rv-emit-srai buf +rv-t1+ ridx 1)
          (rv-emit-add buf +rv-t1+ +rv-t1+ rarr)
          (rv-emit-srai buf +rv-t2+ rval 1)
-         (rv-emit-sb buf +rv-t2+ +rv-t1+ 6)))
+         (rv-emit-sb buf +rv-t2+ +rv-t1+ (- (rv-word-size) 2))))
 
       ;; ---- System area pointers ----
       ;; A SAP is a one-slot object, subtag #x16: header (1<<8)|#x16 then the
-      ;; raw address.  Header plus slot is exactly one 16-byte granule here.
+      ;; raw address.  Header plus slot is exactly ONE GRANULE at either width.
       (#.+op-sap-new+
        (let* ((vd (vreg 0))
               (raddr (resolve (vreg 1) +rv-t2+)))
          (rv-emit-li buf +rv-t0+ #x116)
-         (rv-emit-sd buf +rv-t0+ +rv-s8+ 0)
-         (rv-emit-sd buf raddr +rv-s8+ 8)
+         (rv-emit-store-word buf +rv-t0+ +rv-s8+ 0)
+         (rv-emit-store-word buf raddr +rv-s8+ (rv-word-size))
          (rv-emit-addi buf +rv-t0+ +rv-s8+ 2)
-         (rv-emit-addi buf +rv-s8+ +rv-s8+ 16)
+         (rv-emit-addi buf +rv-s8+ +rv-s8+ (rv-granule))
          (store-result vd +rv-t0+)))
 
       (#.+op-sap-addr+
@@ -1545,7 +1645,11 @@
        ;; handed to a syscall that untags every argument.
        (let* ((vd (vreg 0))
               (rsap (resolve (vreg 1))))
-         (rv-emit-ld buf +rv-t0+ rsap 6)
+         ;; Payload offset is WORD - TAG, not a constant 6: the SAP's one slot
+         ;; sits immediately after its header word, and the pointer in hand is
+         ;; already tag-2.  Reading 6 on RV32 reads PAST the slot and returns 0,
+         ;; which is what r13-sap measured.
+         (rv-emit-load-word buf +rv-t0+ rsap (- (rv-word-size) 2))
          (rv-emit-slli buf +rv-t0+ +rv-t0+ 1)
          (store-result vd +rv-t0+)))
 
@@ -1602,20 +1706,20 @@
     ;; Allocate stack frame
     (rv-emit-addi buf +rv-sp+ +rv-sp+ (- total-frame))
     ;; Save return address and frame pointer
-    (rv-emit-sd buf +rv-ra+ +rv-sp+ (- total-frame 8))
-    (rv-emit-sd buf +rv-fp+ +rv-sp+ (- total-frame 16))
+    (rv-emit-store-word buf +rv-ra+ +rv-sp+ (- total-frame 8))
+    (rv-emit-store-word buf +rv-fp+ +rv-sp+ (- total-frame 16))
     ;; Save callee-saved registers (s1-s11 used by MVM)
-    (rv-emit-sd buf +rv-s1+  +rv-sp+ (- total-frame 24))
-    (rv-emit-sd buf +rv-s2+  +rv-sp+ (- total-frame 32))
-    (rv-emit-sd buf +rv-s3+  +rv-sp+ (- total-frame 40))
-    (rv-emit-sd buf +rv-s4+  +rv-sp+ (- total-frame 48))
-    (rv-emit-sd buf +rv-s5+  +rv-sp+ (- total-frame 56))
-    (rv-emit-sd buf +rv-s6+  +rv-sp+ (- total-frame 64))
-    (rv-emit-sd buf +rv-s7+  +rv-sp+ (- total-frame 72))
-    (rv-emit-sd buf +rv-s8+  +rv-sp+ (- total-frame 80))
-    (rv-emit-sd buf +rv-s9+  +rv-sp+ (- total-frame 88))
-    (rv-emit-sd buf +rv-s10+ +rv-sp+ (- total-frame 96))
-    (rv-emit-sd buf +rv-s11+ +rv-sp+ (- total-frame 104))
+    (rv-emit-store-word buf +rv-s1+  +rv-sp+ (- total-frame 24))
+    (rv-emit-store-word buf +rv-s2+  +rv-sp+ (- total-frame 32))
+    (rv-emit-store-word buf +rv-s3+  +rv-sp+ (- total-frame 40))
+    (rv-emit-store-word buf +rv-s4+  +rv-sp+ (- total-frame 48))
+    (rv-emit-store-word buf +rv-s5+  +rv-sp+ (- total-frame 56))
+    (rv-emit-store-word buf +rv-s6+  +rv-sp+ (- total-frame 64))
+    (rv-emit-store-word buf +rv-s7+  +rv-sp+ (- total-frame 72))
+    (rv-emit-store-word buf +rv-s8+  +rv-sp+ (- total-frame 80))
+    (rv-emit-store-word buf +rv-s9+  +rv-sp+ (- total-frame 88))
+    (rv-emit-store-word buf +rv-s10+ +rv-sp+ (- total-frame 96))
+    (rv-emit-store-word buf +rv-s11+ +rv-sp+ (- total-frame 104))
     ;; Set up frame pointer
     (rv-emit-addi buf +rv-fp+ +rv-sp+ total-frame)))
 
@@ -1623,19 +1727,19 @@
   "Emit a RISC-V function epilogue. Restores callee-saved registers and returns."
   (let ((total-frame (+ frame-size 112)))
     ;; Restore callee-saved registers
-    (rv-emit-ld buf +rv-ra+  +rv-sp+ (- total-frame 8))
-    (rv-emit-ld buf +rv-fp+  +rv-sp+ (- total-frame 16))
-    (rv-emit-ld buf +rv-s1+  +rv-sp+ (- total-frame 24))
-    (rv-emit-ld buf +rv-s2+  +rv-sp+ (- total-frame 32))
-    (rv-emit-ld buf +rv-s3+  +rv-sp+ (- total-frame 40))
-    (rv-emit-ld buf +rv-s4+  +rv-sp+ (- total-frame 48))
-    (rv-emit-ld buf +rv-s5+  +rv-sp+ (- total-frame 56))
-    (rv-emit-ld buf +rv-s6+  +rv-sp+ (- total-frame 64))
-    (rv-emit-ld buf +rv-s7+  +rv-sp+ (- total-frame 72))
-    (rv-emit-ld buf +rv-s8+  +rv-sp+ (- total-frame 80))
-    (rv-emit-ld buf +rv-s9+  +rv-sp+ (- total-frame 88))
-    (rv-emit-ld buf +rv-s10+ +rv-sp+ (- total-frame 96))
-    (rv-emit-ld buf +rv-s11+ +rv-sp+ (- total-frame 104))
+    (rv-emit-load-word buf +rv-ra+  +rv-sp+ (- total-frame 8))
+    (rv-emit-load-word buf +rv-fp+  +rv-sp+ (- total-frame 16))
+    (rv-emit-load-word buf +rv-s1+  +rv-sp+ (- total-frame 24))
+    (rv-emit-load-word buf +rv-s2+  +rv-sp+ (- total-frame 32))
+    (rv-emit-load-word buf +rv-s3+  +rv-sp+ (- total-frame 40))
+    (rv-emit-load-word buf +rv-s4+  +rv-sp+ (- total-frame 48))
+    (rv-emit-load-word buf +rv-s5+  +rv-sp+ (- total-frame 56))
+    (rv-emit-load-word buf +rv-s6+  +rv-sp+ (- total-frame 64))
+    (rv-emit-load-word buf +rv-s7+  +rv-sp+ (- total-frame 72))
+    (rv-emit-load-word buf +rv-s8+  +rv-sp+ (- total-frame 80))
+    (rv-emit-load-word buf +rv-s9+  +rv-sp+ (- total-frame 88))
+    (rv-emit-load-word buf +rv-s10+ +rv-sp+ (- total-frame 96))
+    (rv-emit-load-word buf +rv-s11+ +rv-sp+ (- total-frame 104))
     ;; Deallocate stack frame and return
     (rv-emit-addi buf +rv-sp+ +rv-sp+ total-frame)
     (rv-emit-ret buf)))
@@ -1790,7 +1894,20 @@
 (defun install-riscv-translator ()
   "Install the RISC-V translator into the target descriptor.
    Sets translate-fn, emit-prologue, and emit-epilogue on *target-riscv64*."
+  (setf *riscv-64-bit* t)
   (setf (target-translate-fn *target-riscv64*) #'translate-mvm-to-riscv)
   (setf (target-emit-prologue *target-riscv64*) #'riscv-emit-prologue-fn)
   (setf (target-emit-epilogue *target-riscv64*) #'riscv-emit-epilogue-fn)
   *target-riscv64*)
+
+(defun install-riscv32-translator ()
+  "Install the SAME translator on *TARGET-RISCV32*, with *RISCV-64-BIT* off.
+   The width is a property of the INSTALL, not of the call, so a build that
+   installs RV32 cannot later emit an RV64 instruction by accident -- and
+   INSTALL-RISCV-TRANSLATOR sets the flag back, so the two installers are
+   order-independent."
+  (setf *riscv-64-bit* nil)
+  (setf (target-translate-fn *target-riscv32*) #'translate-mvm-to-riscv)
+  (setf (target-emit-prologue *target-riscv32*) #'riscv-emit-prologue-fn)
+  (setf (target-emit-epilogue *target-riscv32*) #'riscv-emit-epilogue-fn)
+  *target-riscv32*)

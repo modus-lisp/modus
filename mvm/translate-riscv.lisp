@@ -1530,33 +1530,52 @@
              (rs (resolve2 (vreg 1))))
          (rv-emit-store-word buf rs rd (1- (rv-word-size)))))
 
+      ;; PREDICATES MUST ANSWER NIL OR T, NEVER A RAW 0/1.
+      ;;
+      ;; These two returned 0 for false and #x16 for true, with a comment that
+      ;; admitted the muddle ("Result: tagged boolean... Actually, simplify: store
+      ;; raw boolean result as fixnum").  Every CALLER tests the result against VN
+      ;; -- `bne s1, s10' -- so neither value is ever NIL and (CONSP x) WAS ALWAYS
+      ;; TRUE on this target.
+      ;;
+      ;; Measured consequence: the real CL image walked a cdr chain in
+      ;; %CDR-IS-ARRAY-OR-WRAPPER-P straight off the end and faulted taking the
+      ;; cdr of 0.  No ladder rung caught it because none uses CONSP -- r08-cons
+      ;; calls car/cdr directly -- which is the same "a rung per OPCODE, not per
+      ;; data type" gap that hid :setcar on PowerPC.
+      ;;
+      ;; T IS MATERIALISED BEFORE THE BRANCH.  +T-VALUE+ is #xDEAD1009, which
+      ;; RV-EMIT-LI builds in several instructions, and a multi-instruction
+      ;; sequence inside a hand-counted branch span is how the handler triple's
+      ;; first version went wrong.  So both answers are in registers first and the
+      ;; branch skips exactly one MV.
       (#.+op-consp+
-       ;; Check if lowest bit of tag is 1 (cons tag)
-       ;; andi t0, vs, 0x07; slti t0, t0, 2; xori t0, t0, 1 ... no, simpler:
-       ;; andi t0, vs, 0x07; addi t1, x0, 1; beq/set
-       ;; Result: tagged boolean. We return VN (NIL) for false, or a non-NIL for true.
        (let* ((vd (vreg 0))
               (rs (resolve (vreg 1))))
-         ;; Extract low 3 tag bits, compare with cons tag (1)
-         (rv-emit-andi buf +rv-t0+ rs #x07)
-         (rv-emit-addi buf +rv-t1+ +rv-x0+ 1)    ; cons tag = 1
-         (rv-emit-sub buf +rv-t0+ +rv-t0+ +rv-t1+)
-         (rv-emit-seqz buf +rv-t0+ +rv-t0+)        ; 1 if equal (is cons)
-         ;; Convert to tagged boolean: 0 -> NIL, 1 -> tagged T
-         ;; Use conditional move: if t0=0 -> VN, else -> tagged T value
-         (rv-emit-beq buf +rv-t0+ +rv-x0+ 8)      ; skip next if not cons
-         (rv-emit-li buf +rv-t0+ #x16)              ; tagged T (0x0B << 1 | tag...)
-         ;; Actually, simplify: store raw boolean result as fixnum
+         ;; TEST RS BEFORE TOUCHING t0.  RESOLVE hands back t0 when the vreg is
+         ;; SPILLED, so writing the default answer into t0 first would destroy the
+         ;; argument -- and NIL is #xDEAD0001, whose low three bits are 1, THE CONS
+         ;; TAG, so the answer would then be T for everything.  Exactly the
+         ;; always-true bug this arm was rewritten to fix, one register apart.
+         (rv-emit-li buf +rv-t2+ +t-value+)
+         (rv-emit-andi buf +rv-t1+ rs #x07)         ; read RS while it is still RS
+         (rv-emit-addi buf +rv-t3+ +rv-x0+ 1)       ; cons tag
+         (rv-emit-mv buf +rv-t0+ +rv-s10+)          ; default NIL
+         (rv-emit-bne buf +rv-t1+ +rv-t3+ 8)        ; not a cons -> keep NIL
+         (rv-emit-mv buf +rv-t0+ +rv-t2+)           ; is a cons -> T
          (store-result vd +rv-t0+)))
 
       (#.+op-atom+
-       ;; Atom = not consp. Same as consp but inverted.
+       ;; ATOM is the exact inverse: T unless the tag says cons.
        (let* ((vd (vreg 0))
               (rs (resolve (vreg 1))))
-         (rv-emit-andi buf +rv-t0+ rs #x07)
-         (rv-emit-addi buf +rv-t1+ +rv-x0+ 1)
-         (rv-emit-sub buf +rv-t0+ +rv-t0+ +rv-t1+)
-         (rv-emit-snez buf +rv-t0+ +rv-t0+)        ; 1 if NOT cons
+         ;; Same ordering requirement as :consp — read RS before writing t0.
+         (rv-emit-li buf +rv-t2+ +t-value+)
+         (rv-emit-andi buf +rv-t1+ rs #x07)
+         (rv-emit-addi buf +rv-t3+ +rv-x0+ 1)
+         (rv-emit-mv buf +rv-t0+ +rv-t2+)           ; default T
+         (rv-emit-bne buf +rv-t1+ +rv-t3+ 8)        ; not a cons -> keep T
+         (rv-emit-mv buf +rv-t0+ +rv-s10+)          ; is a cons -> NIL
          (store-result vd +rv-t0+)))
 
       ;; ---- Object operations ----

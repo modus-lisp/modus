@@ -109,7 +109,12 @@
 ;;; Multiple-value return storage (fixed addresses in BSS/globals area)
 ;;; MV-COUNT at 0x600010: number of values returned (tagged fixnum)
 ;;; MV-VALUES at 0x600020: array of up to 20 extra values (0x600020..0x6000C0)
-(defconstant +mv-count-addr+ #x10000090)
+;;; +MV-COUNT-ADDR+ / +MV-VALUES-ADDR+ now live in mvm/target.lisp, set PER
+;;; TARGET by SET-TARGET-FIXNUM-BITS-FOR and injected into every compilation by
+;;; WIDTH-CONSTANTS-SOURCE — the same dual-life shape as +FIXNUM-BITS+.  They
+;;; were DEFCONSTANTs here fixed at #x10000090/#x10000098, which is not memory
+;;; on riscv64 (UART MMIO) or ppc32 (outside the mapped TLBs).  See the comment
+;;; block above their definition for how that surfaced.
 
 ;;; ---- THE GC METADATA BLOCK IS A REGION CONTROL BLOCK ----------------------
 ;;;
@@ -321,7 +326,8 @@
 (defconstant +gc-saved-alloc-addr+ (+ +gc-region-0-base+ +gc-off-saved-alloc+))
 (defconstant +gc-saved-limit-addr+ (+ +gc-region-0-base+ +gc-off-saved-limit+))
 
-(defconstant +mv-values-addr+ #x10000098)
+;;; +MV-VALUES-ADDR+ is defined in mvm/target.lisp — see the note at the old
+;;; +MV-COUNT-ADDR+ site above.
 
 ;;; Closure environment storage (fixed address for passing env to closure functions)
 ;;; Place after MV-VALUES area: 0x10000098 + 20*8 = 0x10000138, align to 0x10000140

@@ -533,6 +533,36 @@
    Set by BUILD-IMAGE from the target's word size; 62 for 64-bit, 30 for
    32-bit.  Everything else derives from this one knob.")
 
+;;; MULTIPLE-VALUE TRANSFER SLOTS — PER TARGET, and they have to be.
+;;;
+;;; These were a pair of DEFCONSTANTs in compiler.lisp fixed at #x10000090 /
+;;; #x10000098, and three separate families of code baked that literal:
+;;; compiler.lisp's own MULTIPLE-VALUE-BIND / VALUES / NTH-VALUE expansions,
+;;; five hand-written sites in shared CL source (prelude, cl-eval, cl-clos,
+;;; gc), and each back end's :set-mv-count.
+;;;
+;;; #x10000090 IS NOT MEMORY ON EVERY TARGET.  On QEMU riscv virt it is inside
+;;; the NS16550 UART's MMIO window (+riscv-uart-base+ = #x10000000), and on
+;;; ppc32 it is outside the 64 MB the boot TLBs map (stack top #x03F00000).
+;;; The two back ends therefore pointed their :set-mv-count somewhere mapped,
+;;; which made the writer and the readers disagree — documented at the time as
+;;; "multiple values are not yet correct there".
+;;;
+;;; That latent divergence became a boot failure when the compiler started
+;;; clamping the MV count at every single-valued tail leaf: the emitted
+;;; `(setf (mem-ref #x10000090 :u64) 1)' now runs on the ordinary return path,
+;;; so `(defun down (n) (if (< n 1) 42 (down (1- n))))' stored into UART
+;;; registers on riscv64 and took a data-storage exception on ppc32, while the
+;;; six targets whose slot really is RAM carried on passing.
+;;;
+;;; One value per target, set by SET-TARGET-FIXNUM-BITS-FOR and injected into
+;;; every compilation by WIDTH-CONSTANTS-SOURCE, so all three families read the
+;;; same number by construction rather than by everyone remembering.
+(defparameter +mv-count-addr+  #x10000090
+  "Address of the multiple-values COUNT slot for the target being compiled.")
+(defparameter +mv-values-addr+ #x10000098
+  "Base of the multiple-values vector; the count slot's word plus one.")
+
 (defparameter +fixnum-bits+      62)
 (defparameter +fixnum-max+       4611686018427387903)
 (defparameter +fixnum-min+       -4611686018427387903)
@@ -655,9 +685,33 @@
   bits)
 
 (defun set-target-fixnum-bits-for (target)
-  "Derive the numeric width (and endianness) from TARGET."
+  "Derive the numeric width, endianness and MV-slot addresses from TARGET."
   (setf *target-big-endian-p* (eq (target-endianness target) :big))
+  (multiple-value-bind (mvc mvv) (mv-slot-addrs-for target)
+    (setf +mv-count-addr+ mvc
+          +mv-values-addr+ mvv))
   (set-target-fixnum-bits (- (* 8 (target-word-size target)) 2)))
+
+(defun mv-slot-addrs-for (target)
+  "The (COUNT VALUES) multiple-value slot addresses for TARGET.
+
+   #x10000090 is the historical pair and is correct wherever that address is
+   ordinary RAM — x86-64, AArch64, i386, ARM32 (RAM from 0 on raspi2b), PPC64
+   and 68k.  The two exceptions are not preferences, they are memory maps:
+
+     riscv64  #x10000090 is inside the NS16550 UART MMIO window at
+              +riscv-uart-base+ #x10000000.  Moved into DRAM, alongside the
+              other convention slots the RISC-V back end keeps at #x80700000.
+     ppc32    #x10000090 is past the 64 MB boot-ppc32.lisp's TLBs map (its
+              stack top is #x03F00000).  Moved into the mapped low region,
+              alongside the PPC convention slots at #x00900000.
+
+   A target absent from this table gets the historical pair, which is the right
+   default: it is what every working image already used."
+  (case (target-name target)
+    (:riscv64 (values #x80700010 #x80700018))
+    (:ppc32   (values #x00900020 #x00900028))
+    (t        (values #x10000090 #x10000098))))
 
 (defun width-constants-source ()
   "The width DEFCONSTANT block, as source text, with the CURRENT target's
@@ -685,10 +739,13 @@
      (defconstant +name-hash-bits+ ~D)~%~
      (defconstant +name-hash-shift+ ~D)~%~
      (defconstant +name-hash-hi-mask+ ~D)~%~
-     (defconstant +name-hash-lo-mask+ ~D)~%"
+     (defconstant +name-hash-lo-mask+ ~D)~%~
+     (defconstant +mv-count-addr+ ~D)~%~
+     (defconstant +mv-values-addr+ ~D)~%"
     +fixnum-bits+ +fixnum-max+ +fixnum-min+ +fixnum-limit+ +fixnum-neg-limit+
     +fixnum-half+ +fixnum-neg-half+ +fixnum-half-max+ +limb-bits+ +limb-bits-1+
     +limb-split-bits+ +neg-limb-bits+ +neg-limb-bits-1+ +fixnum-read-guard+
     +small-bignum-bits+ +half-limb-bits+ +neg-half-limb-bits+
     +half-limb-mask+
-    +name-hash-bits+ +name-hash-shift+ +name-hash-hi-mask+ +name-hash-lo-mask+))
+    +name-hash-bits+ +name-hash-shift+ +name-hash-hi-mask+ +name-hash-lo-mask+
+    +mv-count-addr+ +mv-values-addr+))

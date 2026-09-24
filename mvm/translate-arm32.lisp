@@ -192,16 +192,14 @@
 (defparameter *arm32-globals-base* #x00600000
   "Base of the ARM32 absolute-address convention slot block; set per variant
    by install-arm32-translator / -armv7- / -armv7-rpi-.")
-(defparameter *arm32-mvcount-addr* modus.mvm::+mv-count-addr+
-  "Where :set-mv-count writes.  The SHARED contract address (#x10000090) when
-   that is mapped RAM -- true on raspi2b, whose RAM starts at 0 -- but QEMU's
-   `virt` board puts RAM at 0x40000000, where #x10000090 is not memory at all,
-   so the plain armv7 variant takes a private slot and, with it, the documented
-   consequence that multiple values are not yet correct there.")
-
+;;; The MV-count slot is +MV-COUNT-ADDR+, set per target in mvm/target.lisp and
+;;; injected into every compilation.  ARM32's value is the historical
+;;; #x10000090: on raspi2b RAM starts at 0, so that address really is memory.
+;;; (The plain `virt' board puts RAM at #x40000000 and would need its own entry
+;;; in MV-SLOT-ADDRS-FOR before a CL image could run there.)
 (defun arm32-nargs-addr ()   (+ *arm32-globals-base* #x00))
 (defun arm32-cenv-addr ()    (+ *arm32-globals-base* #x08))
-(defun arm32-mvcount-addr () *arm32-mvcount-addr*)
+(defun arm32-mvcount-addr () +mv-count-addr+)
 
 (defun arm32-emit-store-abs (buf src-reg addr)
   "Store SRC-REG to absolute ADDR.
@@ -2061,8 +2059,7 @@
 
 (defun install-arm32-translator ()
   "Install the ARM32 (ARMv5) translator into the target descriptor."
-  (setf *arm32-globals-base* #x00600000
-        *arm32-mvcount-addr* modus.mvm::+mv-count-addr+)
+  (setf *arm32-globals-base* #x00600000)
   (let ((target *target-arm32*))
     (setf (target-translate-fn target) #'translate-mvm-to-arm32)
     (setf (target-emit-prologue target)
@@ -2077,8 +2074,7 @@
 
 (defun install-armv7-translator ()
   "Install the ARMv7-A translator into the target descriptor."
-  (setf *arm32-globals-base* #x40600000
-        *arm32-mvcount-addr* (+ #x40600000 #x20))
+  (setf *arm32-globals-base* #x40600000)
   (let ((target *target-armv7*))
     (setf (target-translate-fn target)
           (lambda (bytecode function-table)
@@ -2095,8 +2091,7 @@
 
 (defun install-armv7-rpi-translator ()
   "Install the ARMv7-A RPi translator (PL011 UART at 0x3F201000)."
-  (setf *arm32-globals-base* #x00600000
-        *arm32-mvcount-addr* modus.mvm::+mv-count-addr+)
+  (setf *arm32-globals-base* #x00600000)
   (let ((target *target-armv7-rpi*))
     (setf (target-translate-fn target)
           (lambda (bytecode function-table)

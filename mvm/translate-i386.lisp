@@ -190,7 +190,11 @@
 ;;; multiple values read PHANTOM secondaries out of #x10000098.  Symptom:
 ;;; `(multiple-value-list (typep 1 'integer))` => ("T" T) on i386 vs (T) on x64.
 ;;; Keep this EQ to modus.mvm::+mv-count-addr+; it must not be relocated.
-(defparameter *mvcount-addr* modus.mvm::+mv-count-addr+)  ; SHARED, see above
+;;; Read modus.mvm::+MV-COUNT-ADDR+ at EMISSION time through this function, not
+;;; once at load time: it is now set PER TARGET (mvm/target.lisp), and a
+;;; DEFPARAMETER here would freeze whichever value happened to be current when
+;;; this file loaded.  i386's own value is the historical #x10000090.
+(defun mvcount-addr () modus.mvm::+mv-count-addr+)
 (defparameter *gc-page-base-addr* #x618)  ; raw from_start, for the bit-set
 (defparameter *gc-startbmp-addr*  #x61C)  ; raw object-start bitmap base
 (defparameter *gc-consbmp-addr*   #x620)  ; raw cons-kind bitmap base
@@ -205,7 +209,7 @@
         *vn-addr*      (+ base #x08)
         *nargs-addr*   (+ base #x0C)
         *cenv-addr*    (+ base #x10)
-        ;; base+#x14 stays RESERVED (do not reuse): *mvcount-addr* is a shared
+        ;; base+#x14 stays RESERVED (do not reuse): (mvcount-addr) is a shared
         ;; contract address, never relocated.  See its defparameter above.
         *gc-page-base-addr* (+ base #x18)
         *gc-startbmp-addr*  (+ base #x1C)
@@ -4234,7 +4238,7 @@
          (let ((tagged (ash (first operands) 1)))
            (i386-emit-byte buf #xC7)
            (i386-emit-byte buf (i386-modrm #b00 0 5))
-           (i386-emit-u32 buf *mvcount-addr*)
+           (i386-emit-u32 buf (mvcount-addr))
            (i386-emit-u32 buf tagged)))
 
         ;; ---- ALLOC-STRING Vd, Vcount ----

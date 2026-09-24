@@ -1007,7 +1007,7 @@
 
 (defun %mv-to-list (primary)
   "Collect multiple values into a list. PRIMARY is the first value."
-  (let ((count (mem-ref #x10000090 :u64)))
+  (let ((count (mem-ref +mv-count-addr+ :u64)))
     (if (zerop count)
         nil
         (if (= count 1)
@@ -1016,7 +1016,7 @@
                   (i (- count 2)))
               (loop
                 (when (< i 0) (return (cons primary result)))
-                (setq result (cons (mem-ref (+ #x10000098 (* i 8)) :u64) result))
+                (setq result (cons (mem-ref (+ +mv-values-addr+ (* i 8)) :u64) result))
                 (setq i (- i 1))))))))
 
 ;;; ============================================================
@@ -2022,12 +2022,12 @@
 (defun values (&rest args)
   "Return multiple values. Sets MV buffer for count and extra values."
   (let ((n (length args)))
-    (setf (mem-ref #x10000090 :u64) n)
+    (setf (mem-ref +mv-count-addr+ :u64) n)
     (let ((cur (if (null args) nil (cdr args)))
           (idx 0))
       (loop
         (when (null cur) (return nil))
-        (setf (mem-ref (+ #x10000098 (* idx 8)) :u64) (car cur))
+        (setf (mem-ref (+ +mv-values-addr+ (* idx 8)) :u64) (car cur))
         (setq idx (+ idx 1))
         (setq cur (cdr cur))))
     (if (null args) nil (car args))))

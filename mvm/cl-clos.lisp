@@ -6213,10 +6213,10 @@
     ;; FORM has already been evaluated, MV slots populated.  Read from
     ;; the MV-values area at 0x10000098+.
     ((<= n 15)
-     (let ((mv-count (ash (mem-ref #x10000090 :u64) -1)))
+     (let ((mv-count (ash (mem-ref +mv-count-addr+ :u64) -1)))
        (if (>= n mv-count)
            nil
-           (let ((bits (mem-ref (+ #x10000098 (* n 8)) :u64)))
+           (let ((bits (mem-ref (+ +mv-values-addr+ (* n 8)) :u64)))
              (ash bits -1)))))
     (t nil)))
 (defun copy-symbol (sym &optional copy-props)

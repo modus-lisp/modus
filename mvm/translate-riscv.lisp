@@ -526,7 +526,12 @@
 ;;; forms that read the shared literal will NOT see what :set-mv-count wrote,
 ;;; so multiple values are not yet correct on RISC-V.  Fixing that properly
 ;;; means making +mv-count-addr+ per-target, which is a change to shared code.
-(defparameter *rv-mvcount-addr* (+ #x80700000 #x10))
+;;; The MV-count slot is NO LONGER private to this back end.  It is
+;;; +MV-COUNT-ADDR+, set per target in mvm/target.lisp (RISC-V's value is
+;;; #x80700010, in DRAM, because #x10000090 is UART MMIO on virt) and injected
+;;; into every compilation, so compiler-expanded mem-refs, shared CL source and
+;;; this :set-mv-count all name the same word.  Read it at EMISSION time: the
+;;; target is chosen before translation, not when this file loads.
 
 (defun rv-emit-store-abs (buf src-reg addr)
   "Store the 64-bit SRC-REG to absolute ADDR (via t1, so t0 stays free)."
@@ -1532,7 +1537,7 @@
        ;; The count is stored TAGGED (<<1), matching i386/x64.
        (let ((tagged (ash (vreg 0) 1)))
          (rv-emit-li buf +rv-t2+ tagged)
-         (rv-emit-store-abs buf +rv-t2+ *rv-mvcount-addr*)))
+         (rv-emit-store-abs buf +rv-t2+ +mv-count-addr+)))
 
       ;; ---- Unknown opcode ----
       (otherwise

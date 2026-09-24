@@ -1104,12 +1104,12 @@
     ;; is exact for any plausible count.  Historically this read the halved
     ;; :u64 value and shifted again, yielding count/2 — the extras scan was
     ;; silently short by half.
-    (let ((count (ash (%gc-word-lo #x10000090) -1)))
+    (let ((count (ash (%gc-word-lo +mv-count-addr+) -1)))
       (when (>= count 2)
         (let ((i 0))
           (loop
             (when (>= i (- count 1)) (return))
-            (setq fp (%gc-forward-slot (+ #x10000098 (* i 8))
+            (setq fp (%gc-forward-slot (+ +mv-values-addr+ (* i 8))
                                        from-start from-size fp sc))
             (setq i (+ i 1))))))
     fp))

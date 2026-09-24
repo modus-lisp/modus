@@ -5,6 +5,13 @@
 #   scripts/arch-ladder-gate.sh                 # every arch, every rung
 #   scripts/arch-ladder-gate.sh riscv64 68k     # only these architectures
 #   ARCH_LADDER_JOBS=8 scripts/arch-ladder-gate.sh
+#   ARCH_LADDER_CELL_TIMEOUT=900 scripts/arch-ladder-gate.sh   # per-cell cap
+#
+# PER-CELL TIMEOUT.  Each cell is capped (default 1800s) because the harness's
+# own build timeout is an hour: without this, one wedged build stalls a whole
+# 16-wide batch and the run looks stuck rather than failed.  A cell that
+# produces no output is reported TIMEOUT, not left blank — a blank line would be
+# counted as neither pass nor skip and would quietly shrink the denominator.
 #
 # Each rung boots a real image in QEMU and reads its answer back out of guest
 # memory over QMP (see scripts/arch-ladder.py for why memory and not serial).
@@ -60,7 +67,11 @@ for a in $ARCHES; do
     echo "$a $r $(expected_for "$r")"
   done
 done | xargs -P "$JOBS" -n 3 bash -c '
-  line=$(scripts/arch-ladder.py "$0" "$1" --expect="$2" 2>&1 | tail -1)
+  line=$(timeout "${ARCH_LADDER_CELL_TIMEOUT:-1800}" \
+           scripts/arch-ladder.py "$0" "$1" --expect="$2" 2>&1 | tail -1)
+  # A cell that produced nothing timed out: say so rather than writing a blank
+  # line that the verdict would then count as neither pass nor skip.
+  [ -z "$line" ] && line="$(printf "%-8s TIMEOUT   no result within %ss" "$0" "${ARCH_LADDER_CELL_TIMEOUT:-1800}")"
   printf "%-22s %s\n" "$(basename "$1" .lisp)" "$line" >> '"$OUT"'
 '
 

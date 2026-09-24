@@ -691,25 +691,15 @@
   "Base of the PPC absolute-address convention slot block; set per target by
    install-ppc-translator / install-ppc32-translator.")
 
-(defparameter *ppc-mvcount-addr* modus.mvm::+mv-count-addr+
-  "Where :set-mv-count writes.
-
-   ppc64 uses the SHARED contract address (#x10000090) that compiler-emitted
-   mem-refs and shared CL source also read -- see the long note in
-   translate-i386.lisp about a target that relocates this slot and leaves the
-   one writer with zero readers.
-
-   ppc32 CANNOT: boot-ppc32.lisp maps only the low 64MB (its stack top is
-   0x03F00000, 'within 64MB RAM') and the e500's TLBs are software-managed, so
-   a store to 0x10000090 raises a data-storage exception -- measured, DEAR =
-   0x10000090.  It therefore gets a private slot, with the consequence stated
-   plainly: MULTIPLE-VALUE forms reading the shared literal will not see what
-   :set-mv-count wrote, so multiple values are not yet correct on ppc32.  The
-   real fix is a per-target +mv-count-addr+, which is a change to shared code.")
-
+;;; The MV-count slot is +MV-COUNT-ADDR+, set per target in mvm/target.lisp
+;;; (ppc32's value is #x00900020, inside the 64 MB boot-ppc32.lisp maps; ppc64
+;;; keeps the historical #x10000090) and injected into every compilation, so the
+;;; compiler's expansions, shared CL source and this :set-mv-count all name the
+;;; same word.  This used to be a per-installer private slot, which made the
+;;; writer and readers disagree on ppc32.
 (defun ppc-nargs-addr ()   (+ *ppc-globals-base* #x00))
 (defun ppc-cenv-addr ()    (+ *ppc-globals-base* #x10))
-(defun ppc-mvcount-addr () *ppc-mvcount-addr*)
+(defun ppc-mvcount-addr () +mv-count-addr+)
 
 (defun ppc-emit-store-abs (buf src-reg addr)
   "Store SRC-REG to absolute ADDR, using scratch2 to hold the address."
@@ -2163,8 +2153,8 @@
 
 (defun install-ppc-translator ()
   "Install the PPC64 translator into the target descriptor."
-  (setf *ppc-globals-base* #x20900000    ; ppc64 loads at 0x20000000
-        *ppc-mvcount-addr* modus.mvm::+mv-count-addr+)
+  ;; ppc64 loads at 0x20000000, so its convention slots sit just above.
+  (setf *ppc-globals-base* #x20900000)
   (let ((target *target-ppc64*))
     (setf (target-translate-fn target)
           (lambda (bytecode function-table)
@@ -2183,8 +2173,7 @@
   "Install the PPC32 translator into the target descriptor."
   ;; ppc32 loads at 0; cons space starts at 16MB, so 9MB is clear RAM.
   ;; mv-count must stay inside the 64MB the boot TLBs map -- see its docstring.
-  (setf *ppc-globals-base* #x00900000
-        *ppc-mvcount-addr* (+ #x00900000 #x20))
+  (setf *ppc-globals-base* #x00900000)
   (let ((target *target-ppc32*))
     (setf (target-translate-fn target)
           (lambda (bytecode function-table)

@@ -5724,6 +5724,27 @@
       (%prim-aset a 4 0)
       a)))
 
+(defun %adjust-mda-0d (a args)
+  "ADJUST-ARRAY of a rank-0 MDA to rank 0 (see ADJUST-ARRAY)."
+  (let ((displaced-to nil) (displaced-offset 0)
+        (init-contents :unset) (cur args))
+    (loop (when (null cur) (return nil))
+      (let ((k (car cur)) (v (cadr cur)))
+        (cond
+          ((eq k :displaced-to)            (setq displaced-to v))
+          ((eq k :displaced-index-offset)  (setq displaced-offset v))
+          ((eq k :initial-contents)        (setq init-contents v))))
+      (setq cur (cddr cur)))
+    (if displaced-to
+        (progn (%prim-aset a 3 displaced-to)
+               (%prim-aset a 4 displaced-offset))
+        (let ((new-data (make-array 1)))
+          (aset new-data 0 (if (eq init-contents :unset) (aref a) init-contents))
+          (%prim-aset a 6 new-data)
+          (%prim-aset a 3 nil) (%prim-aset a 4 0)))
+    (%prim-aset a 1 nil)
+    a))
+
 (defun %adjust-mda-1d (a new-size args)
   "Adjust a rank-1 MDA in place: realloc data when growing, copy old
    contents, honor :initial-element / :initial-contents / :fill-pointer
@@ -5825,6 +5846,12 @@
              (>= (%mda-rank a) 2)
              (not (member :displaced-to args)))
     (return-from adjust-array (%adjust-mda-nd a new-size args)))
+  ;; Rank 0 -> rank 0 (NEW-SIZE is the empty dimension list).  One element:
+  ;; kept, or replaced by :INITIAL-CONTENTS (for rank 0 that IS the element),
+  ;; or displaced.  It used to reach the rank-1 path with a NIL size and loop
+  ;; on (>= i nil) forever -- the upstream ansi-test hung at ADJUST-ARRAY.17.
+  (when (and (%mda-p a) (null new-size) (= (%mda-rank a) 0))
+    (return-from adjust-array (%adjust-mda-0d a args)))
   (when (consp new-size) (setq new-size (car new-size)))
   (when (%mda-p a)
     (let ((rank (%mda-rank a)))

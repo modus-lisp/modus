@@ -24,7 +24,12 @@ set -u
 SHARDS=${SHARDS:-32}
 BINARY=${BINARY:-/home/claude/modus/tmp/modus-ansi-test}
 FIRST=10001
-LAST=27709   # one past last test id
+# Last corpus id comes from the build's own ranges file (next to the binary);
+# 27708 is only the historical fallback -- the corpus grew to ~29531 when the
+# census closed (2026-09-23), and a fixed bound silently drops the tail.
+ANSI_HI=$(awk 'BEGIN{m=0} $2+0>m{m=$2+0} END{print m}' "$(dirname "$BINARY")/ansi-file-ranges.txt" 2>/dev/null)
+[ -n "$ANSI_HI" ] && [ "$ANSI_HI" -gt 10001 ] || ANSI_HI=27708
+LAST=$((ANSI_HI + 1))   # one past last test id
 
 if [ ! -x "$BINARY" ]; then
   echo "no binary at $BINARY" >&2
@@ -68,7 +73,7 @@ elapsed=$(( $(date +%s) - start_time ))
 echo "# all shards done in ${elapsed}s"
 
 # Aggregate.
-grep -ah '' "$OUTDIR"/shard-*.out | awk '
+grep -ah '' "$OUTDIR"/shard-*.out | awk -v hi="$ANSI_HI" '
   # ID buckets:
   #   1     ..  9999  — Modus pre-ANSI custom tests (probes, smoke).
   #   10001 .. 27708  — the ANSI suite (the headline number).
@@ -87,7 +92,7 @@ grep -ah '' "$OUTDIR"/shard-*.out | awk '
     if (match(key, /^P:[0-9]+$/)) {
       id = substr(key, 3) + 0
       if      (id <= 9999)                 { custom_pass[id] = 1 }
-      else if (id >= 10001 && id <= 27708) { ansi_pass[id]   = 1 }
+      else if (id >= 10001 && id <= hi) { ansi_pass[id]   = 1 }
       else                                 { extra_pass[id]  = 1 }
     } else {
       sym_pass[key] = 1
@@ -102,7 +107,7 @@ grep -ah '' "$OUTDIR"/shard-*.out | awk '
     if (match(rest, /^[0-9]+( |$)/)) {
       id = rest + 0
       if      (id <= 9999)                 { custom_fail[id] = 1 }
-      else if (id >= 10001 && id <= 27708) { ansi_fail[id]   = 1 }
+      else if (id >= 10001 && id <= hi) { ansi_fail[id]   = 1 }
       else                                 { extra_fail[id]  = 1 }
     } else {
       sym_fail[rest] = 1

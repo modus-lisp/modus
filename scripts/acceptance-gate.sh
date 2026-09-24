@@ -42,7 +42,12 @@ FIX_REF="${2:?usage: acceptance-gate.sh <base-ref> <fix-ref> [workdir]}"
 WORKDIR="${3:-/tmp/modus-gate}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 NSH="${NSH:-64}"
-START=10001; END=27800
+START=10001; END_DEFAULT=27800
+# END is per BINARY: the corpus runs from 10001 to the last id its build
+# assigned, read from that build's own tmp/ansi-file-ranges.txt.  A fixed END
+# silently dropped everything past it once the corpus grew (2026-09-23: the
+# full-corpus runner ends at 29531, and 27800 cut off objects/pathnames/misc
+# on one side only).
 
 mkdir -p "$WORKDIR" || exit 2
 
@@ -64,6 +69,10 @@ build_gate () { # worktree-dir -> builds tmp/ansi-gate-bin inside it
 
 run_shards () { # bin out tag -> prints "tag: passed=N CHUNK-CRASH=c FILE-WEDGE=f"
   local BIN="$1" OUT="$2" TAG="$3"
+  local RANGES END
+  RANGES="$(dirname "$BIN")/ansi-file-ranges.txt"
+  END=$(awk 'BEGIN{m=0} $2+0>m{m=$2+0} END{print m}' "$RANGES" 2>/dev/null)
+  [ -n "$END" ] && [ "$END" -gt "$START" ] || END=$END_DEFAULT
   local SPAN=$(( (END-START+NSH)/NSH ))
   rm -f "$OUT".shard.* "$OUT"
   local pids=()
@@ -79,7 +88,7 @@ run_shards () { # bin out tag -> prints "tag: passed=N CHUNK-CRASH=c FILE-WEDGE=
   local CC FW
   CC=$(cat "$OUT".shard.* | grep -ac "CHUNK-CRASH")
   FW=$(cat "$OUT".shard.* | grep -ac "FILE-WEDGE")
-  echo "$TAG: passed=$(wc -l < "$OUT") CHUNK-CRASH=$CC FILE-WEDGE=$FW (NSH=$NSH)"
+  echo "$TAG: passed=$(wc -l < "$OUT") CHUNK-CRASH=$CC FILE-WEDGE=$FW (NSH=$NSH, ids $START..$END)"
 }
 
 echo "== acceptance gate: base=$BASE_REF fix=$FIX_REF workdir=$WORKDIR =="

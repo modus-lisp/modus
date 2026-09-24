@@ -33,8 +33,11 @@ BIN="${MODUS_ANSI_OUT:-/home/claude/modus/tmp/modus-ansi-test}"
 echo "ansi-summary: running $BIN" >&2
 "$BIN" > "$OUT" 2>&1
 status=$?
+# Last corpus id from the build's own ranges file (27708 = historical fallback).
+ANSI_HI=$(awk 'BEGIN{m=0} $2+0>m{m=$2+0} END{print m}' "$(dirname "$BIN")/ansi-file-ranges.txt" 2>/dev/null)
+[ -n "$ANSI_HI" ] && [ "$ANSI_HI" -gt 10001 ] || ANSI_HI=27708
 
-awk '
+awk -v hi="$ANSI_HI" '
   # ID buckets (same scheme as ansi-shard.sh):
   #   1     ..  9999  — custom pre-ANSI Modus tests
   #   10001 .. 27708  — ANSI suite (the headline)
@@ -49,7 +52,7 @@ awk '
     if (match($0, /^P:[0-9]+$/)) {
       id = substr($0, 3) + 0
       if      (id <= 9999)                 { cust_p++ }
-      else if (id >= 10001 && id <= 27708) { pass++ }
+      else if (id >= 10001 && id <= hi) { pass++ }
       else                                 { ex_p++ }
     }
   }
@@ -58,7 +61,7 @@ awk '
     if (match(rest, /^[0-9]+( |$)/)) {
       id = rest + 0
       if      (id <= 9999)                 { cust_f++ }
-      else if (id >= 10001 && id <= 27708) { fails++ }
+      else if (id >= 10001 && id <= hi) { fails++ }
       else                                 { ex_f++ }
     }
   }

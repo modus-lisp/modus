@@ -35,11 +35,13 @@ OUTDIR=$(mktemp -d -t ansi-sample.XXXX)
 echo "# sampling $N tests, seed=$SEED, parallel=$SHARDS"
 echo "# output dir: $OUTDIR"
 
-# Emit N distinct random IDs in [10001, 27708].
-awk -v n="$N" -v seed="$SEED" '
+# Emit N distinct random IDs in [10001, last corpus id].
+ANSI_HI=$(awk 'BEGIN{m=0} $2+0>m{m=$2+0} END{print m}' "$(dirname "$BINARY")/ansi-file-ranges.txt" 2>/dev/null)
+[ -n "$ANSI_HI" ] && [ "$ANSI_HI" -gt 10001 ] || ANSI_HI=27708
+awk -v n="$N" -v seed="$SEED" -v top="$ANSI_HI" '
 BEGIN {
   srand(seed)
-  lo = 10001; hi = 27708
+  lo = 10001; hi = top
   count = 0
   while (count < n) {
     id = lo + int(rand() * (hi - lo + 1))

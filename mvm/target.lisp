@@ -93,8 +93,17 @@
    :name :riscv64
    :word-size 8
    :endianness :little
+   ;; V4 IS s11, NOT s0.  s0 IS THE FRAME POINTER on RISC-V (x8, fp and s0 are
+   ;; one register), so a V4 mapped to s0 would alias VFP and any function using
+   ;; both would read its frame pointer as a local.  translate-riscv.lisp's
+   ;; *RISCV-REG-MAP* has always said s11 and carries that comment; THIS table
+   ;; said s0 and disagreed with it.  Nothing broke, because only the TRANSLATOR
+   ;; emits code and the compiler reads this map only to decide whether a vreg is
+   ;; in a register at all (both answers are non-NIL) — but two maps that
+   ;; disagree is a trap for whoever next derives a fact from this one.
+   ;; THE TRANSLATOR IS THE AUTHORITY.
    :reg-map #(:a0 :a1 :a2 :a3        ; V0-V3 (args) = x10-x13
-              :s0 :s1 :s2 :s3        ; V4-V7 (callee-saved) = x8,x9,x18,x19
+              :s11 :s1 :s2 :s3       ; V4-V7 (callee-saved) = x27,x9,x18,x19
               :s4 :s5 :s6 :s7        ; V8-V11 (callee-saved) = x20-x23
               nil nil nil nil         ; V12-V15 (spill)
               :a0                     ; VR (aliases V0)
@@ -130,8 +139,17 @@
    :name :riscv32
    :word-size 4
    :endianness :little
+   ;; V4 IS s11, NOT s0.  s0 IS THE FRAME POINTER on RISC-V (x8, fp and s0 are
+   ;; one register), so a V4 mapped to s0 would alias VFP and any function using
+   ;; both would read its frame pointer as a local.  translate-riscv.lisp's
+   ;; *RISCV-REG-MAP* has always said s11 and carries that comment; THIS table
+   ;; said s0 and disagreed with it.  Nothing broke, because only the TRANSLATOR
+   ;; emits code and the compiler reads this map only to decide whether a vreg is
+   ;; in a register at all (both answers are non-NIL) — but two maps that
+   ;; disagree is a trap for whoever next derives a fact from this one.
+   ;; THE TRANSLATOR IS THE AUTHORITY.
    :reg-map #(:a0 :a1 :a2 :a3        ; V0-V3 (args) = x10-x13
-              :s0 :s1 :s2 :s3        ; V4-V7 (callee-saved) = x8,x9,x18,x19
+              :s11 :s1 :s2 :s3       ; V4-V7 (callee-saved) = x27,x9,x18,x19
               :s4 :s5 :s6 :s7        ; V8-V11 (callee-saved) = x20-x23
               nil nil nil nil         ; V12-V15 (spill)
               :a0                     ; VR (aliases V0)

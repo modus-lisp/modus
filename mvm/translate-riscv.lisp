@@ -848,6 +848,45 @@
             (rv-emit-lbu buf +rv-t0+ +rv-sp+ 0)
             (rv-emit-addi buf +rv-sp+ +rv-sp+ 16)
             (rv-emit-slli buf +rv-a0+ +rv-t0+ 1))      ; tag as fixnum
+           ((and (= code #x0502) *riscv-linux-mode*)
+            ;; GENERIC 3-ARG SYSCALL.  V0 = number, V1..V3 = args, all TAGGED;
+            ;; result comes back TAGGED in V0.  V0..V3 are a0..a3 here, so the
+            ;; number has to move OUT of a0 before the args shift DOWN into it —
+            ;; hence t0 first, and the shifts strictly left-to-right.
+            ;;
+            ;; NO NUMBER REMAPPING, deliberately.  translate-aarch64's version of
+            ;; this trap carries a cmp/csel chain that rewrites x86-64 syscall
+            ;; numbers into generic-ABI ones, because cl-fileio.lisp hardcodes the
+            ;; x86-64 table.  i386 instead OVERRIDES the %sys-* functions in its
+            ;; arch slot with the right numbers, which keeps the ABI knowledge in
+            ;; one readable place instead of a branch chain in the code generator.
+            ;; This port follows i386.
+            (rv-emit-srai buf +rv-t0+ +rv-a0+ 1)        ; t0 = syscall number
+            (rv-emit-srai buf +rv-a0+ +rv-a1+ 1)        ; a0 = arg1
+            (rv-emit-srai buf +rv-a1+ +rv-a2+ 1)        ; a1 = arg2
+            (rv-emit-srai buf +rv-a2+ +rv-a3+ 1)        ; a2 = arg3
+            (rv-emit-mv buf +rv-a7+ +rv-t0+)
+            (rv-emit-ecall buf)
+            (rv-emit-slli buf +rv-a0+ +rv-a0+ 1))       ; tag the result
+           ((and (= code #x050B) *riscv-linux-mode*)
+            ;; GENERIC 6-ARG SYSCALL.  V0 = number, V1..V6 = args 1..6, tagged.
+            ;; This is what lets the arch slot express openat/unlinkat/mkdirat/
+            ;; renameat/newfstatat — the asm-generic ABI dropped open/stat/unlink
+            ;; in favour of *at forms that take FOUR arguments, one more than
+            ;; syscall3 carries.  AArch64 added five dedicated traps for them
+            ;; (#x0506..#x050A); one general trap covers the same ground.
+            ;;
+            ;; V4/V5/V6 are s11/s1/s2 — NOT s0, which is the frame pointer.
+            (rv-emit-srai buf +rv-t0+ +rv-a0+ 1)        ; t0 = syscall number
+            (rv-emit-srai buf +rv-a0+ +rv-a1+ 1)        ; a0 = arg1
+            (rv-emit-srai buf +rv-a1+ +rv-a2+ 1)        ; a1 = arg2
+            (rv-emit-srai buf +rv-a2+ +rv-a3+ 1)        ; a2 = arg3
+            (rv-emit-srai buf +rv-a3+ +rv-s11+ 1)       ; a3 = arg4 (V4)
+            (rv-emit-srai buf +rv-a4+ +rv-s1+ 1)        ; a4 = arg5 (V5)
+            (rv-emit-srai buf +rv-a5+ +rv-s2+ 1)        ; a5 = arg6 (V6)
+            (rv-emit-mv buf +rv-a7+ +rv-t0+)
+            (rv-emit-ecall buf)
+            (rv-emit-slli buf +rv-a0+ +rv-a0+ 1))       ; tag the result
            ((and (= code #x0500) *riscv-linux-mode*)
             ;; HOSTED: exit(status), status arriving TAGGED in V0.
             (rv-emit-srai buf +rv-a0+ +rv-a0+ 1)

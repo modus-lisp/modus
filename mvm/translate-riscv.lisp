@@ -341,6 +341,23 @@
    log2(word) - 1.  2 on RV64, 1 on RV32."
   (if *riscv-64-bit* 2 1))
 
+(defvar *riscv-li-const-patches* nil
+  "List of (NATIVE-BYTE-OFFSET . POOL-INDEX) recorded by +OP-LI-CONST+.
+
+   Each entry says: at NATIVE-BYTE-OFFSET there is a FIVE-INSTRUCTION
+   shift-and-add chain whose three ADDI immediate fields must be patched with
+   the tagged constant-pool address of slot POOL-INDEX, once the image layout is
+   final.  cross.lisp's APPLY-LI-CONST-PATCHES does it, exactly as it does for
+   x64's MOVABS immediate and AArch64's MOVZ/MOVK quad.
+
+   WHY A CHAIN AND NOT `LUI + ADDI'.  LUI SIGN-EXTENDS ON RV64, so any address
+   with bit 31 set -- every bare-metal DRAM address, since QEMU virt starts DRAM
+   at 0x80000000 -- would come out as 0xFFFFFFFF_8.......  The chain builds the
+   value from three NON-NEGATIVE sub-2048 chunks (11 + 11 + 10 bits = 32), so
+   nothing sign-extends and each field is independent, which is what makes it
+   patchable at all.  Same split RV-EMIT-LI's 64-bit case uses, and it is the
+   same bug that case was rebuilt to avoid.")
+
 (defun rv-word-shift ()
   "Shift that multiplies a count by the word size: 3 on RV64, 2 on RV32."
   (if *riscv-64-bit* 3 2))
@@ -1331,10 +1348,81 @@
              (rv-emit-jal buf +rv-ra+ rel-offset)
              (rv-emit-call buf rel-offset))))
 
+      (#.+op-fn-addr+
+       ;; (fn-addr Vd target:imm32) — the native address of a function, TAGGED
+       ;; with +tag-function+ (3), which is how funcall dispatch and FUNCTIONP
+       ;; tell it from a cons (tag 1) or an object (tag 9).
+       ;;
+       ;; RISC-V has AUIPC, so this is a clean two-instruction PC-relative
+       ;; materialisation -- no literal pool and none of i386's call/pop dance.
+       ;; AUIPC's PC is the address of the AUIPC ITSELF, so the displacement is
+       ;; measured from this instruction's own offset.
+       ;;
+       ;; The 0x800 in the split is the standard AUIPC+ADDI correction: ADDI's
+       ;; immediate is SIGN-extended, so when lo12 >= 0x800 the high part must be
+       ;; pre-incremented or the result is 4096 too low.
+       ;;
+       ;; OR-3 IS EXACT HERE because every instruction this back end emits is
+       ;; four bytes, so a function's native offset is always a multiple of 4 and
+       ;; the low two bits are free.  :call-ind below subtracts the same 3.
+       ;;
+       ;; Fixed three instructions, so the two-pass size measurement is stable.
+       (let* ((vd (vreg 0))
+              (target-idx (vreg 1))
+              (target-offset (if function-table
+                                 (gethash target-idx function-table)
+                                 0))
+              (rel (if target-offset
+                       (- target-offset (rv-current-offset buf))
+                       0))
+              (hi20 (ash (+ rel #x800) -12))
+              (lo12 (- rel (ash hi20 12))))
+         (rv-emit-auipc buf +rv-t0+ (logand hi20 #xFFFFF))
+         (rv-emit-addi buf +rv-t0+ +rv-t0+ (logand lo12 #xFFF))
+         (rv-emit-ori buf +rv-t0+ +rv-t0+ +tag-function+)
+         (store-result vd +rv-t0+)))
+
+      (#.+op-li-const+
+       ;; (li-const Vd idx) — load the TAGGED address of constant-pool slot IDX.
+       ;;
+       ;; The address is not known until the image is assembled, so this emits a
+       ;; FIXED-SIZE placeholder and records the site; see
+       ;; *RISCV-LI-CONST-PATCHES* for why the shape is a shift-and-add chain
+       ;; rather than the obvious LUI+ADDI.
+       ;;
+       ;; Five instructions, ALWAYS, so the two-pass size measurement is stable
+       ;; and the patcher knows exactly where the three ADDI words are: at
+       ;; +0, +8 and +16 from the start of the sequence.
+       (let* ((vd (vreg 0))
+              (idx (vreg 1))
+              (start (rv-current-offset buf)))
+         ;; V = (a << 21) | (b << 10) | c, i.e. ((a << 11) | b) << 10 | c.
+         ;; THE SECOND SHIFT IS 10, NOT 11 — the chunk widths are 11/11/10 and
+         ;; each SLLI must be the width of everything still to come, not the
+         ;; width of the chunk just added.
+         (rv-emit-addi buf +rv-t0+ +rv-x0+ 0)      ; chunk a  <- patched
+         (rv-emit-slli buf +rv-t0+ +rv-t0+ 11)
+         (rv-emit-addi buf +rv-t0+ +rv-t0+ 0)      ; chunk b  <- patched
+         (rv-emit-slli buf +rv-t0+ +rv-t0+ 10)
+         (rv-emit-addi buf +rv-t0+ +rv-t0+ 0)      ; chunk c  <- patched
+         (push (cons start idx) *riscv-li-const-patches*)
+         (store-result vd +rv-t0+)))
+
       (#.+op-call-ind+
-       ;; Indirect call via register
+       ;; Indirect call through a register holding a TAGGED function pointer
+       ;; (tag 3 — see :fn-addr).  The tag must be stripped before the jump.
+       ;;
+       ;; THIS IS HALF OF A PAIR.  Until :fn-addr existed here, nothing on this
+       ;; target produced a tagged function pointer, so the bare JALR was
+       ;; accidentally right; with :fn-addr it would jump THREE BYTES into the
+       ;; function, which on RISC-V is not even an instruction boundary.
+       ;;
+       ;; Stripping into t1 rather than in place: RESOLVE may hand back a live
+       ;; vreg, and a funcall inside a loop would otherwise untag the caller's
+       ;; own copy of the function pointer once per iteration.
        (let ((rs (resolve (vreg 0))))
-         (rv-emit-jalr buf +rv-ra+ rs 0)))
+         (rv-emit-addi buf +rv-t1+ rs (- +tag-function+))
+         (rv-emit-jalr buf +rv-ra+ +rv-t1+ 0)))
 
       (#.+op-ret+
        (rv-emit-epilogue buf +rv-local-frame-size+))
@@ -1760,6 +1848,7 @@
      Pass 1: Decode all MVM instructions, measure native code sizes,
              build a map from MVM bytecode offsets to native code offsets.
      Pass 2: Emit native code using the label map for branch resolution."
+  (setf *riscv-li-const-patches* nil)
   (let* ((label-map (make-hash-table :test 'eql))
          (native-fn-table (make-hash-table :test 'eql))
          (mvm-len (length bytecode))

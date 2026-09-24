@@ -730,6 +730,47 @@
           +mv-values-addr+ mvv))
   (set-target-fixnum-bits (- (* 8 (target-word-size target)) 2)))
 
+(defun target-object-tag (target)
+  "The low-nibble TAG this target's translator puts on an object pointer.
+
+   THE AUTHORITY IS THE TRANSLATOR'S :ALLOC-OBJ / :OBJ-REF PAIR, not this table —
+   these values are transcribed from it and a translator that changes its tag
+   must change this too.  Measured from each file:
+
+     9  x64, aarch64, i386, ppc32/64, 68k    (+TAG-OBJECT+, the shared value)
+     2  riscv32/64, arm32/armv7
+
+   RISC-V AND ARM32 ARE NOT BEING SLOPPY.  Tag 9 needs the low FOUR bits free,
+   i.e. 16-byte object alignment; RV32's allocation granule is a word PAIR, which
+   is EIGHT bytes, so 9 does not fit and 2 does.  The divergence is a
+   consequence of 32-bit word sizes, not a preference."
+  (case (target-name target)
+    ((:riscv64 :riscv32 :arm32 :armv7 :armv7-rpi) 2)
+    (t 9)))
+
+(defun target-object-data-offset (target)
+  "Bytes from an object's RAW (untagged) base to the first data slot.
+
+   Two words on x64 and AArch64 — a header word and a PADDING word, so data
+   starts at raw+16 — and ONE word everywhere else, where the first slot follows
+   the header immediately.  Transcribed from each translator's :obj-ref slot
+   arithmetic, which is the authority:
+
+     x64      (* idx 8) + 7 from the TAGGED pointer, tag 9  ->  raw + 16 + idx*8
+     i386     (* (1+ idx) 4) after stripping the tag        ->  raw +  4 + idx*4
+     ppc      (* (1+ idx) ws) after stripping the tag       ->  raw + ws + idx*ws
+     riscv    (* (1+ idx) ws) - 2 from the tagged pointer   ->  raw + ws + idx*ws
+     arm32    2 + idx*4 from the tagged pointer, tag 2      ->  raw +  4 + idx*4
+
+   THIS MATTERED BECAUSE THE CONSTANT POOL BAKED x64's LAYOUT FOR EVERYONE.  A
+   pooled string read on RISC-V came back with length 0: the reader looked for the
+   header one word before where the pool had put it, and for the tag 9 the pool
+   had OR'd in rather than the 2 the target uses."
+  (let ((ws (target-word-size target)))
+    (case (target-name target)
+      ((:x86-64 :aarch64 :rpi) (* 2 ws))
+      (t ws))))
+
 (defun ppc-linux-mode-p ()
   "T when the PPC back end is in hosted mode.  Looked up by name rather than
    referenced directly because target.lisp is loaded BEFORE the translators, so

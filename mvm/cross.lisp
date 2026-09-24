@@ -283,25 +283,40 @@
                 ;; Each heap object is 16-byte aligned at its header.
                 (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
                       do (mvm-emit-byte buf 0))
-                (let ((obj-offset (mvm-buffer-position buf))
-                      (len (length constant)))
-                  (cond
-                    ((= word-size 8)
-                     ;; 64-bit layout: header (8B) | padding (8B) | N tagged char slots (8B each)
-                     ;; Header: (count << 8) | subtag-string (#x31).
-                     ;; Matches alloc-obj's runtime header format and the
-                     ;; (count + 2) * 8 align-16 alloc-size convention.
-                     (mvm-emit-u64 buf (logior #x31 (ash len 8)))
-                     (mvm-emit-u64 buf 0)
-                     (loop for c across constant
-                           do (mvm-emit-u64 buf (ash (char-code c) 1)))
-                     (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
-                           do (mvm-emit-byte buf 0))
-                     ;; Tagged offset: object tag (#x09) on the header address.
-                     (setf (aref addr-table idx) (logior obj-offset #x09)))
-                    (t
-                     ;; 32-bit: not yet supported; leave addr=0 and emit 0 word.
-                     (mvm-emit-u32 buf 0)))))
+                (let* ((obj-offset (mvm-buffer-position buf))
+                       (len (length constant))
+                       ;; THE LAYOUT AND THE TAG ARE TARGET FACTS, not x64's.
+                       ;; This function baked `header | padding | slots' with tag
+                       ;; #x09 for every target, which is right on x64 and
+                       ;; AArch64 and wrong on the other seven: i386/ppc/68k put
+                       ;; the first slot one word after the header (no padding),
+                       ;; and riscv/arm32 additionally tag objects with 2 rather
+                       ;; than 9, because tag 9 needs 16-byte alignment and a
+                       ;; 32-bit granule is 8.
+                       ;;
+                       ;; Measured before the fix: a pooled string read on RISC-V
+                       ;; reported length 0 — the header was looked for one word
+                       ;; before where it sat, through the wrong tag.
+                       (tag (target-object-tag target))
+                       (data-off (target-object-data-offset target))
+                       (pad-words (1- (/ data-off word-size))))
+                  ;; Header: (count << 8) | subtag-string (#x31), matching
+                  ;; alloc-obj's runtime header format, then however many
+                  ;; padding words this target's layout puts before the data.
+                  (if (= word-size 8)
+                      (mvm-emit-u64 buf (logior #x31 (ash len 8)))
+                      (mvm-emit-u32 buf (logior #x31 (ash len 8))))
+                  (dotimes (i pad-words)
+                    (if (= word-size 8) (mvm-emit-u64 buf 0) (mvm-emit-u32 buf 0)))
+                  ;; One TAGGED character code per word, as every target's
+                  ;; :alloc-string does.
+                  (loop for c across constant
+                        do (if (= word-size 8)
+                               (mvm-emit-u64 buf (ash (char-code c) 1))
+                               (mvm-emit-u32 buf (ash (char-code c) 1))))
+                  (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
+                        do (mvm-emit-byte buf 0))
+                  (setf (aref addr-table idx) (logior obj-offset tag))))
                (t
                 ;; Non-string constants in the table are unexpected for now —
                 ;; primitives are inlined by compile-quote, and other
@@ -694,6 +709,19 @@
     (setf (aref raw-bytes (+ file-pos 2)) (logand (ash patched -16) #xFF))
     (setf (aref raw-bytes (+ file-pos 3)) (logand (ash patched -24) #xFF))))
 
+(defun patch-riscv-addi-imm12 (raw-bytes pos imm12)
+  "Write IMM12 into the I-type immediate field of the 4-byte little-endian
+   RISC-V instruction at POS.  The immediate is bits 31..20; everything below is
+   left alone, so this rewrites only the field."
+  (let ((w (logior (aref raw-bytes pos)
+                   (ash (aref raw-bytes (+ pos 1)) 8)
+                   (ash (aref raw-bytes (+ pos 2)) 16)
+                   (ash (aref raw-bytes (+ pos 3)) 24))))
+    (setf w (logior (logand w #x000FFFFF)
+                    (ash (logand imm12 #xFFF) 20)))
+    (dotimes (i 4)
+      (setf (aref raw-bytes (+ pos i)) (logand (ash w (* i -8)) #xFF)))))
+
 (defun apply-li-const-patches (raw-bytes image module boot-descriptor
                                 pool-addr-table native-code)
   "Walk the architecture-specific LI-CONST patch list and write tagged
@@ -720,6 +748,11 @@
                           (let ((s (find-symbol "*I386-LI-CONST-PATCHES*"
                                                 :modus.mvm.i386)))
                             (and s (boundp s) (symbol-value s)))))
+                    ;; RISC-V (both widths): a five-instruction shift-and-add
+                    ;; chain with three patchable ADDI immediates.
+                    ((member arch '(:riscv64 :riscv32))
+                     (and (boundp 'modus.mvm::*riscv-li-const-patches*)
+                          (symbol-value 'modus.mvm::*riscv-li-const-patches*)))
                     (t nil))))
     (when patches
       (let* ((native-image-offset (or (kernel-image-native-image-offset image) 0))
@@ -765,6 +798,27 @@
                (dotimes (i 4)
                  (setf (aref raw-bytes (+ file-pos i))
                        (logand (ash tagged-addr (* i -8)) #xFF))))
+              ((member arch '(:riscv64 :riscv32))
+               ;; RISC-V: three ADDI immediates at +0, +8 and +16, holding
+               ;; bits 31..21, 20..10 and 9..0 of the address.  Each chunk is
+               ;; NON-NEGATIVE and under 2048, so ADDI's sign-extension never
+               ;; fires -- which is the whole reason for this shape rather than
+               ;; LUI+ADDI (LUI sign-extends on RV64, and every bare-metal DRAM
+               ;; address has bit 31 set).
+               ;;
+               ;; FAIL LOUDLY rather than truncate: the chain carries exactly 32
+               ;; bits, and every RISC-V image in this tree loads well inside
+               ;; that.  A target that someday does not must change the chain,
+               ;; not discover a silently wrong constant.
+               (unless (< tagged-addr (ash 1 32))
+                 (error "riscv li-const: pool address #x~X exceeds the 32 bits ~
+                         the patch chain carries" tagged-addr))
+               (patch-riscv-addi-imm12 raw-bytes file-pos
+                                       (logand (ash tagged-addr -21) #x7FF))
+               (patch-riscv-addi-imm12 raw-bytes (+ file-pos 8)
+                                       (logand (ash tagged-addr -10) #x7FF))
+               (patch-riscv-addi-imm12 raw-bytes (+ file-pos 16)
+                                       (logand tagged-addr #x3FF)))
               (t
                ;; x64: little-endian 8-byte MOVABS immediate write.
                (dotimes (i 8)

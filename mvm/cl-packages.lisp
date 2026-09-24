@@ -410,7 +410,9 @@
   (let ((result nil) (cur table))
     (loop
       (when (null cur) (return (nreverse result)))
-      (if (string-equal (car (car cur)) name-string)
+      ;; STRING=, not STRING-EQUAL: symbol names are case-sensitive, and
+      ;; uninterning |a| must not also remove A.
+      (if (string= (car (car cur)) name-string)
           (setq cur (cdr cur))
           (progn
             (setq result (cons (car cur) result))

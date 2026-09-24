@@ -530,7 +530,7 @@
   (if (%pkg-p pkg)
       (let ((name (if (%cl-sym-p sym) (%cl-sym-name sym) (symbol-name sym))))
         (and name
-             (%symtab-find (%pkg-external pkg) name)
+             (%symtab-find-in pkg 3 name)
              t))
       nil))
 
@@ -541,12 +541,14 @@
   (when (and (%cl-sym-p s) (string-equal (%cl-sym-name s) *%find-sym-name*))
     (setq *%find-sym-result* s)))
 (defun %pkg-find-sym (name pkg)
+  "The symbol NAME is ACCESSIBLE as in PKG, or NIL -- CLHS 22.1.3.3.1's
+   question is exactly FIND-SYMBOL's.  This used to walk EVERY accessible
+   symbol of PKG through %DO-SYMBOLS-FN, comparing CASE-INSENSITIVELY, once
+   per symbol printed: with the full ansi-test loaded (CL-TEST holds tens of
+   thousands of symbols) printing one list of CL symbols from CL-TEST ran for
+   many minutes.  FIND-SYMBOL is indexed and case-sensitive."
   (if (%pkg-p pkg)
-      (progn
-        (setq *%find-sym-name* name)
-        (setq *%find-sym-result* nil)
-        (%do-symbols-fn #'%find-sym-match pkg)
-        *%find-sym-result*)
+      (find-symbol name pkg)
       nil))
 
 ;;; Print a multi-dim array: emit "#NA" then a nested-list literal whose

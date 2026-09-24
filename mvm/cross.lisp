@@ -1317,6 +1317,11 @@
                        raw-bytes
                        (or (getf boot-descriptor :load-addr) #x08048000)
                        :bss-end (getf boot-descriptor :bss-end)))
+                    ((eq (getf boot-descriptor :elf-format) :linux-arm32)
+                     (wrap-in-elf32-le-arm
+                       raw-bytes
+                       (or (getf boot-descriptor :load-addr) #x10000)
+                       :bss-end (getf boot-descriptor :bss-end)))
                     ((eq (getf boot-descriptor :elf-format) :linux-riscv)
                      (wrap-in-elf64-le-riscv raw-bytes
                                              (or (getf boot-descriptor :load-addr) #x400000)
@@ -1407,6 +1412,11 @@
     (:linux-x64 :x86-64)
     (:linux-aarch64 :aarch64)
     (:linux-riscv :riscv64)
+    ;; ARMv7, not the ARMv5 :arm32 descriptor: INSTALL-ARMV7-TRANSLATOR is what
+    ;; the hosted build installs (movw/movt make 32-bit immediates one pair of
+    ;; instructions instead of a literal pool), and it is what qemu-arm and any
+    ;; ARM Linux worth targeting emulate.
+    (:linux-arm32 :armv7)
     (:linux-i386 :i386)
     (:x64-console :x86-64)
     (:i386-console :i386)
@@ -1488,6 +1498,7 @@
     (:linux-x64 (linux-x64-boot-descriptor))
     (:linux-aarch64 (linux-aarch64-boot-descriptor))
     (:linux-riscv (linux-riscv-boot-descriptor))
+    (:linux-arm32 (linux-arm32-boot-descriptor))
     (:linux-i386 (linux-i386-boot-descriptor))
     (:x64-console (x64-console-boot-descriptor))
     (:i386-console (i386-console-boot-descriptor))

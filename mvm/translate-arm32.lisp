@@ -972,8 +972,44 @@
                            (arm32-str buf +arm-r12+ +arm-sp+ dst-off)))))
              ((< code #x0300)
               nil) ; frame-alloc/frame-free: NOP for now
+             ((and (= code #x0300) *arm32-linux-mode*)
+              ;; HOSTED: serial write becomes write(1, &byte, 1).  write(2)
+              ;; wants an address, so the byte goes on the stack; r0 must be
+              ;; freed for the fd, so the char is untagged into r12 FIRST.
+              ;; R7 IS ALSO V7 in *arm32-vreg-map*, so the syscall number
+              ;; would clobber a live virtual register — save and restore it.
+              ;; (The RISC-V arm needs no equivalent: a7 is outside its map.)
+              (arm32-asr-imm buf +arm-r12+ +arm-r0+ 1)
+              (arm32-str-pre buf +arm-r7+ +arm-sp+ -8)     ; save V7
+              (arm32-str-pre buf +arm-r12+ +arm-sp+ -8)    ; the byte itself
+              (arm32-mov buf +arm-r1+ +arm-sp+)            ; buf = sp
+              (arm32-mov-imm buf +arm-r0+ 0 1)             ; fd = stdout
+              (arm32-mov-imm buf +arm-r2+ 0 1)             ; count = 1
+              (arm32-load-imm32 buf +arm-r7+ +arm-linux-sys-write+)
+              (arm32-svc buf)
+              (arm32-add-imm buf +arm-sp+ +arm-sp+ 0 8)    ; drop the byte
+              (arm32-ldr-post buf +arm-r7+ +arm-sp+ 8))    ; restore V7
+             ((and (= code #x0301) *arm32-linux-mode*)
+              ;; HOSTED: serial read becomes read(0, &byte, 1), returning the
+              ;; byte TAGGED in r0 — same contract as the bare PL011 arm.
+              (arm32-str-pre buf +arm-r7+ +arm-sp+ -8)     ; save V7 (see write)
+              (arm32-sub-imm buf +arm-sp+ +arm-sp+ 0 8)
+              (arm32-mov buf +arm-r1+ +arm-sp+)
+              (arm32-mov-imm buf +arm-r0+ 0 0)             ; fd = stdin
+              (arm32-mov-imm buf +arm-r2+ 0 1)
+              (arm32-load-imm32 buf +arm-r7+ +arm-linux-sys-read+)
+              (arm32-svc buf)
+              (arm32-ldrb buf +arm-r0+ +arm-sp+ 0)
+              (arm32-add-imm buf +arm-sp+ +arm-sp+ 0 8)
+              (arm32-ldr-post buf +arm-r7+ +arm-sp+ 8)     ; restore V7
+              (arm32-lsl-imm buf +arm-r0+ +arm-r0+ 1))     ; tag as fixnum
+             ((and (= code #x0500) *arm32-linux-mode*)
+              ;; HOSTED: exit(status), status arriving TAGGED in r0.
+              (arm32-asr-imm buf +arm-r0+ +arm-r0+ 1)
+              (arm32-load-imm32 buf +arm-r7+ +arm-linux-sys-exit+)
+              (arm32-svc buf))
              ((= code #x0300)
-              ;; Serial write: V0 (r0) has tagged fixnum char
+              ;; BARE METAL: serial write: V0 (r0) has tagged fixnum char
               ;; ASR r12, r0, #1  (untag)
               (arm32-asr-imm buf +arm-r12+ +arm-r0+ 1)
               ;; Load UART base into r14 (LR is scratch after prologue)
@@ -2056,6 +2092,39 @@
 ;;; ============================================================
 ;;; Installer
 ;;; ============================================================
+
+(defparameter *arm32-linux-mode* nil
+  "When true the target is a HOSTED Linux/ARM EABI ELF rather than bare metal:
+   the serial traps become write(2)/read(2) and the exit trap becomes exit(2).
+   Counterpart of *X64-LINUX-MODE*, *I386-LINUX-MODE* and *RISCV-LINUX-MODE*.
+
+   ARM EABI PUTS THE SYSCALL NUMBER IN R7, not in the SVC immediate — `svc #0'
+   with r7 = number and arguments in r0..r6.  (The obsolete OABI encoded the
+   number in the instruction; kernels still accept it but nothing should emit
+   it.)  The numbers below are ARM's own table, close to i386's but not RV64's:
+   write is 4 here and 64 there.")
+
+(defconstant +arm-linux-sys-exit+  1)
+(defconstant +arm-linux-sys-read+  3)
+(defconstant +arm-linux-sys-write+ 4)
+(defconstant +arm-linux-sys-mmap2+ 192
+  "mmap2, whose 6th argument is the offset in 4096-byte PAGES, not bytes.
+   Harmless at offset 0, which is all an anonymous mapping needs.")
+
+(defun arm32-svc (buf)
+  "SVC #0 — the EABI syscall instruction (0xEF000000)."
+  (arm32-emit buf #xEF000000))
+
+(defun arm32-set-linux-mode (on)
+  "Turn hosted mode on or off, moving the convention slots with it.
+
+   One function so the mode and the addresses cannot drift apart: the RISC-V
+   port learned that the hard way — its slot block lived at a bare-metal DRAM
+   address and the first hosted image SIGSEGV'd on the first :set-nargs.  ARM32
+   bare uses #x00600000 (RAM from 0 on raspi2b); hosted puts the block inside
+   the mmap'd heap."
+  (setf *arm32-linux-mode* (and on t))
+  (setf *arm32-globals-base* (if on #x10000A00 #x00600000)))
 
 (defun install-arm32-translator ()
   "Install the ARM32 (ARMv5) translator into the target descriptor."

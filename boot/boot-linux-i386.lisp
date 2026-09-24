@@ -347,8 +347,8 @@
 ;;; ELF32 little-endian wrapper (EM_386)
 ;;; ============================================================
 
-(defun wrap-in-elf32-le-i386 (raw-bytes load-addr &key bss-end)
-  "Wrap RAW-BYTES in a minimal ELF32-LE i386 executable: one ELF header
+(defun wrap-in-elf32-le-i386 (raw-bytes load-addr &key bss-end (machine 3))
+  "Wrap RAW-BYTES in a minimal ELF32-LE executable: one ELF header
    (52 bytes) + one PT_LOAD program header (32 bytes) = 84 bytes, matching
    WRAP-HEADER-SIZE-FOR-BOOT's :linux-i386 arm.
 
@@ -359,7 +359,13 @@
    NOTE the ELF32 program-header field ORDER differs from ELF64:
      ELF32: type offset vaddr paddr filesz memsz flags align
      ELF64: type flags  offset vaddr paddr  filesz memsz align
-   Getting that wrong yields a segment the kernel silently refuses to map."
+   Getting that wrong yields a segment the kernel silently refuses to map.
+
+   MACHINE defaults to 3 (EM_386), which leaves i386 output byte-identical; 40
+   is EM_ARM.  Named for i386 because that is what it was written for, but the
+   only thing architecture-specific in an ELF32-LE header is e_machine — the
+   same reason WRAP-IN-ELF64-LE-AA64 now takes a :MACHINE.  A third copy of
+   this function would be a third place for the field order above to rot."
   (let* ((ehdr-size 52)
          (phdr-size 32)
          (header-total (+ ehdr-size phdr-size))
@@ -378,7 +384,7 @@
     (i386l-bytes buf 0)                 ; EI_OSABI  = SYSV
     (dotimes (i 8) (mvm-emit-byte buf 0))  ; EI_ABIVERSION + padding
     (i386l-le16 buf 2)                  ; e_type    = ET_EXEC
-    (i386l-le16 buf 3)                  ; e_machine = EM_386
+    (i386l-le16 buf machine)            ; EM_386 by default, 40 = EM_ARM
     (i386l-le32 buf 1)                  ; e_version
     (i386l-le32 buf entry-point)        ; e_entry
     (i386l-le32 buf ehdr-size)          ; e_phoff

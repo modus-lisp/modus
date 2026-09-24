@@ -95,9 +95,11 @@
   ;; --- argc / argv off the stack, into callee-saved regs that survive ecall
   (rv-emit-ld buf +rv-s2+ +rv-sp+ 0)     ; s2 = argc
   (rv-emit-ld buf +rv-s3+ +rv-sp+ 16)    ; s3 = argv[1]
-  ;; --- argc at the shared absolute slot 0x10000200
-  (rv-emit-li buf +rv-t0+ #x10000200)
-  (rv-emit-sw buf +rv-s2+ +rv-t0+ 0)
+  ;; --- mmap FIRST: the argc slot at #x10000200 is INSIDE the heap mapping.
+  ;;     This port wrote it before mmap and worked, but only by accident — its
+  ;;     ELF asks for a 896 MB BSS that happens to cover the address.  The ARM32
+  ;;     port, whose ELF does not, SIGSEGV'd at si_addr=0x10000200 on the same
+  ;;     ordering.  Map before writing and neither depends on the accident.
   ;; --- mmap the heap: MAP_FIXED so save-image can rely on the address
   ;;     mmap(addr, len, PROT_READ|WRITE, MAP_PRIVATE|ANON|FIXED, -1, 0)
   (rv-emit-li buf +rv-a0+ +linux-riscv-heap-addr+)
@@ -112,6 +114,9 @@
   ;; using the RETURN VALUE keeps a failed mapping visible as a wild pointer
   ;; rather than silently writing to an address nobody mapped.
   (rv-emit-mv buf +rv-s4+ +rv-a0+)
+  ;; --- NOW argc, inside the mapping the line above just made.
+  (rv-emit-li buf +rv-t0+ #x10000200)
+  (rv-emit-sw buf +rv-s2+ +rv-t0+ 0)
   ;; --- MVM allocation registers: s8 = alloc pointer, s9 = limit, s10 = NIL
   (rv-emit-li buf +rv-t0+ +linux-riscv-heap-alloc-start+)
   (rv-emit-add buf +rv-s8+ +rv-s4+ +rv-t0+)

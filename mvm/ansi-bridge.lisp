@@ -1226,59 +1226,59 @@
 ;;; far more complex (40-page spec); we cover the common-case calls.
 
 (defun pprint-newline (kind &rest args)
-  "Emit a newline.  KIND is :linear / :fill / :miser / :mandatory —
-   modus treats all the same (just newline)."
-  (declare (ignore kind))
-  (let ((stream (if args (car args) nil)))
-    (write-char-to-stream (code-char 10) (%resolve-output-stream stream)))
-  nil)
+  "CLHS 22.4 PPRINT-NEWLINE: a conditional newline of KIND (:LINEAR :FILL
+   :MISER :MANDATORY) in the innermost logical block on STREAM, decided by
+   the layout engine (cl-printer.lisp) when that block closes.  Outside a
+   logical block, or with *PRINT-PRETTY* false, it does nothing."
+  (unless (or (eq kind :linear) (eq kind :fill) (eq kind :miser) (eq kind :mandatory))
+    (%signal-type-error))
+  (%ppx-op (if args (car args) nil) (list :nl kind)))
 
 (defun pprint-tab (kind colnum colinc &rest args)
-  "Emit COLINC spaces if at COLNUM (approximate — we just emit COLINC
-   spaces since modus doesn't track current column)."
-  (declare (ignore kind colnum))
-  (let ((stream (if args (car args) nil))
-        (n (if (>= colinc 0) colinc 0)))
-    (dotimes (i n)
-      (write-char-to-stream (code-char 32) (%resolve-output-stream stream))))
-  nil)
+  "CLHS 22.4 PPRINT-TAB (:LINE :SECTION :LINE-RELATIVE :SECTION-RELATIVE)."
+  (unless (or (eq kind :line) (eq kind :section)
+              (eq kind :line-relative) (eq kind :section-relative))
+    (%signal-type-error))
+  (%ppx-op (if args (car args) nil) (list :tab kind colnum colinc)))
 
 (defun pprint-indent (relative-to n &rest args)
-  "No-op — modus doesn't carry a logical-block-relative indent state."
-  (declare (ignore relative-to n args))
-  nil)
+  "CLHS 22.4 PPRINT-INDENT: :BLOCK = N past the block's start column,
+   :CURRENT = N past the current column.  Ignored in miser style."
+  (unless (or (eq relative-to :block) (eq relative-to :current))
+    (%signal-type-error))
+  (%ppx-op (if args (car args) nil) (list :ind relative-to (floor n))))
 
-(defun %pprint-seq (stream object colon-p)
-  "PPRINT-FILL / -LINEAR / -TABULAR without line breaking (there is no
-   layout engine yet).  CLHS 22.4: a non-list OBJECT is printed as if by
-   WRITE; a list prints its elements separated by spaces, inside parens when
-   COLON-P.  The old stubs DOLISTed OBJECT unconditionally (TYPE-ERROR on a
-   non-list) and never printed the parens, so every ~/pprint-linear/ call
-   failed: format-slash 0/19."
+(defun %pprint-seq (stream object colon-p kind tabsize)
+  "PPRINT-FILL / -LINEAR / -TABULAR, as CLHS 22.4 defines them: a logical
+   block (parenthesised when COLON-P) whose elements are separated by a
+   space, a tab to the next TABSIZE column (tabular only) and a KIND
+   conditional newline.  A non-list OBJECT is printed as if by WRITE."
   (let ((s (%resolve-output-stream stream)))
     (if (not (listp object))
         (write-to-stream object s)
-        (progn
-          (when colon-p (write-char-to-stream (code-char 40) s))
-          (let ((first t))
-            (dolist (e object)
-              (unless first (write-char-to-stream (code-char 32) s))
-              (setq first nil)
-              (write-to-stream e s)))
-          (when colon-p (write-char-to-stream (code-char 41) s)))))
+        (let ((cap (%pp-begin s object (if colon-p "(" "") nil)))
+          (catch :%pp-tag
+            (%pprint-exit-fn)
+            (loop
+              (write-to-stream (%pprint-pop-fn) cap)
+              (%pprint-exit-fn)
+              (write-char-to-stream (code-char 32) cap)
+              (when tabsize (pprint-tab :section-relative 0 tabsize cap))
+              (pprint-newline kind cap)))
+          (%pp-end cap (if colon-p ")" "")))))
   nil)
 
 (defun pprint-fill (stream object &optional (colon-p t) at-sign-p)
   (declare (ignore at-sign-p))
-  (%pprint-seq stream object colon-p))
+  (%pprint-seq stream object colon-p :fill nil))
 
 (defun pprint-linear (stream object &optional (colon-p t) at-sign-p)
   (declare (ignore at-sign-p))
-  (%pprint-seq stream object colon-p))
+  (%pprint-seq stream object colon-p :linear nil))
 
-(defun pprint-tabular (stream object &optional (colon-p t) at-sign-p tabsize)
-  (declare (ignore at-sign-p tabsize))
-  (%pprint-seq stream object colon-p))
+(defun pprint-tabular (stream object &optional (colon-p t) at-sign-p (tabsize 16))
+  (declare (ignore at-sign-p))
+  (%pprint-seq stream object colon-p :fill (or tabsize 16)))
 
 (defvar *%pprint-dispatch-table* nil)
 

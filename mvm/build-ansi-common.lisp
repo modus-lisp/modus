@@ -2011,6 +2011,9 @@
 ;; rewrite (raw special form in diff mode; %with-restarts otherwise).
 (defvar *mvm-eval-diff-mode*)
 
+(defvar *pplb-counter* 0
+  "Numbers the interned variables the PPRINT-LOGICAL-BLOCK rewrite emits.")
+
 (defun rewrite-reader-forms (form)
   "Walk form tree, rewriting reader-related forms for MVM."
   (cond
@@ -2178,47 +2181,40 @@
          ;; state machine.  The simple branch (write prefix; body; write
          ;; suffix) is far less code, so it compiles cleanly even deep
          ;; inside the giant per-file run-ansi-FOO function.
-         (let ((iterates (%pplb-body-iterates-p (cddr form))))
+         ;; ONE expansion for every block: the layout engine
+         ;; (cl-printer.lisp %PP-BEGIN / %PP-END) needs the body's output,
+         ;; so the USER'S stream variable is rebound to the block's stream
+         ;; (CLHS: NIL = *standard-output*, T = *terminal-io*).  The old
+         ;; "simple" form wrote prefix/body/suffix straight through and
+         ;; bound only a gensym, so no conditional newline could ever be
+         ;; laid out.  A non-list object is printed with WRITE and the body
+         ;; is not run (CLHS 22.4).
+         ;; INTERNED unique names, not GENSYMs: this expansion is PRINTED into
+         ;; the generated source and READ back, and each printed #:PPL123
+         ;; reads as a DIFFERENT symbol -- the reference never reached its
+         ;; binding and the block object read as NIL.
+         (let* ((n (incf *pplb-counter*))
+                (stream-sym (cond ((null stream-raw) '*standard-output*)
+                                  ((eq stream-raw t) '*terminal-io*)
+                                  (t stream-raw)))
+                (lvar (intern (format nil "%PPLB-OBJ-~D" n)))
+                (svar (intern (format nil "%PPLB-STREAM-~D" n))))
            (if (and have-prefix have-per-line)
                `(error "pprint-logical-block: both :prefix and :per-line-prefix supplied")
-               (if iterates
-                   ;; Full state-machine form.
-                   `(let ((,svar (%resolve-output-stream ,stream-expr)))
-                      (declare (special *print-level*))
-                      (if (let ((lvl *print-level*))
-                            (and lvl (integerp lvl) (>= (length *%pp-ctx*) lvl)))
-                          (write-string "#" ,svar)
-                          (let ((,svar (%pprint-lb-begin
-                                        ,svar ,list-arg
-                                        ,(if have-prefix prefix nil)
-                                        ,(if have-per-line per-line nil))))
+               `(let ((,svar (%resolve-output-stream ,stream-expr))
+                      (,lvar ,list-arg))
+                  (if (%pp-level-exceeded-p)
+                      (write-string "#" ,svar)
+                      (if (not (listp ,lvar))
+                          (write ,lvar :stream ,svar)
+                          (let ((,stream-sym (%pprint-lb-begin
+                                              ,svar ,lvar
+                                              ,(if have-prefix prefix nil)
+                                              ,(if have-per-line per-line nil))))
                             (catch :%pp-tag
-                              ,@(or body `((write ,list-arg :stream ,svar))))
-                            (%pprint-lb-end ,svar ,suffix)))
-                      nil)
-                   ;; Simple form: write prefix, run body, write suffix —
-                   ;; deliberately as close to the old lean stub as possible
-                   ;; (raw stream, no helper calls / LET / DECLARE) so it
-                   ;; compiles cleanly deep inside the giant per-file
-                   ;; run-ansi-FOO function.  CLHS: prefix/suffix omitted when
-                   ;; the block object is not a list — guarded inline by
-                   ;; %pp-list-arg-p.  *print-level* "#" truncation: depth is
-                   ;; tracked by %pp-level-deep-p / a bump of *%pp-level*
-                   ;; around the body (setq save/restore keeps it lean).
-                   `(if (%pp-level-deep-p)
-                        (write-string "#" ,stream-expr)
-                        (progn
-                          (setq *%pp-level* (+ 1 (or *%pp-level* 0)))
-                          ,@(when (or have-prefix have-per-line)
-                              `((when (%pp-list-arg-p ,list-arg)
-                                  (write-string ,(if have-prefix prefix per-line)
-                                                ,stream-expr))))
-                          ,@(or body `((write ,list-arg :stream ,stream-expr)))
-                          ,@(when suffix
-                              `((when (%pp-list-arg-p ,list-arg)
-                                  (write-string ,suffix ,stream-expr))))
-                          (setq *%pp-level* (- (or *%pp-level* 1) 1))
-                          nil))))))))
+                              ,@(or body `((write ,lvar :stream ,stream-sym))))
+                            (%pprint-lb-end ,stream-sym ,suffix))))
+                  nil))))))
     ;; (pprint-exit-if-list-exhausted) → runtime helper (throws to %pp-tag)
     ((and (eq (car form) 'pprint-exit-if-list-exhausted) (null (cdr form)))
      '(%pprint-exit-fn))

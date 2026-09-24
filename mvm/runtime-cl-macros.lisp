@@ -425,6 +425,32 @@
                    (cons 'progn body))
                  (list 'setq cur (list 'cdr cur))))))))"
 
+    ;; CLHS 22.4 PPRINT-LOGICAL-BLOCK.  The layout itself is runtime code
+    ;; in cl-printer.lisp (%PPRINT-LB-BEGIN / -END); this binds the user's
+    ;; stream variable to the block's stream so the body's output and its
+    ;; PPRINT-NEWLINEs are captured in order.  It used to be a do-nothing
+    ;; FUNCTION in the shipped image (only the ANSI corpus rewriter knew it).
+    "(defmacro pprint-logical-block (spec &rest body)
+       (let* ((ss (car spec))
+              (sym (cond ((null ss) '*standard-output*) ((eq ss t) '*terminal-io*) (t ss)))
+              (obj (cadr spec))
+              (kw (cddr spec))
+              (sv (gensym \"PPS\"))
+              (lv (gensym \"PPL\")))
+         `(let ((,sv (%resolve-output-stream ,sym)) (,lv ,obj))
+            (if (%pp-level-exceeded-p)
+                (write-string \"#\" ,sv)
+                (if (not (listp ,lv))
+                    (write ,lv :stream ,sv)
+                    (let ((,sym (%pprint-lb-begin ,sv ,lv ,(getf kw :prefix) ,(getf kw :per-line-prefix))))
+                      (catch :%pp-tag ,@body)
+                      (%pprint-lb-end ,sym ,(getf kw :suffix)))))
+            nil)))"
+
+    "(defmacro pprint-pop () '(%pprint-pop-fn))"
+
+    "(defmacro pprint-exit-if-list-exhausted () '(%pprint-exit-fn))"
+
     "(defmacro do-all-symbols (spec &rest body)
        (let ((var (car spec))
              (result (and (cdr spec) (cadr spec)))

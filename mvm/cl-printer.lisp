@@ -1628,29 +1628,14 @@
   nil)
 
 (defun %pprint-lb-begin (stream list prefix per-line-prefix)
-  "Begin a logical block: validate (per-line-)prefix, push a fresh state
-   onto *%pp-ctx*, write the prefix, and return the resolved stream."
-  (%pp-check-string prefix)
-  (%pp-check-string per-line-prefix)
-  (let ((s (%resolve-output-stream stream))
-        (st (make-array 4)))
-    (aset st 0 s)
-    (aset st 1 list)
-    (aset st 2 0)
-    (aset st 3 (%pp-list-arg-p list))
-    (setq *%pp-ctx* (cons st *%pp-ctx*))
-    (let ((p (or prefix per-line-prefix)))
-      (when (and p (> (length p) 0))
-        (write-string p s)))
-    s))
+  "Begin a logical block; returns the stream the BODY must write to.  See
+   %PP-BEGIN (the layout engine below)."
+  (%pp-begin stream list prefix per-line-prefix))
 
 (defun %pprint-lb-end (stream suffix)
-  "End a logical block: write SUFFIX and pop the block state."
-  (%pp-check-string suffix)
-  (when (and suffix (> (length suffix) 0))
-    (write-string suffix stream))
-  (when *%pp-ctx* (setq *%pp-ctx* (cdr *%pp-ctx*)))
-  nil)
+  "End a logical block (writes nothing itself: the suffix is laid out with
+   the rest of the block when the outermost block closes)."
+  (%pp-end stream suffix))
 
 (defun %pprint-pop-fn ()
   "pprint-pop: return the next element of the current logical block's
@@ -1719,6 +1704,313 @@
            (write-string "..." (aref st 0))
            (throw :%pp-tag nil))))))
   nil)
+
+;;; ============================================================
+;;; Pretty-printer LAYOUT ENGINE (CLHS 22.2).
+;;;
+;;; The outermost logical block on a stream CAPTURES: its body writes to a
+;;; private string-output stream, and every block start/end, conditional
+;;; newline, indentation and tab is recorded as a TOKEN between the runs of
+;;; captured text.  When the outermost block closes, the whole block is
+;;; known, so the break decisions are made by a small tree renderer instead
+;;; of streaming XP: linear/fill/miser/mandatory newlines, :block/:current
+;;; indentation, per-line prefixes, the four pprint-tab kinds, miser style,
+;;; *print-right-margin* (default 80), *print-miser-width* and *print-lines*.
+;;; A literal #\Newline in the body is a :LITERAL break (mandatory, keeps
+;;; trailing blanks, re-emits only the per-line prefixes) as in SBCL.
+;;; Before this, logical blocks wrote straight through and every
+;;; pprint-newline was an unconditional newline (or nothing).
+;;;
+;;; capture record  #(target capture-stream tokens(reversed) depth start-col)
+;;; tokens          (:text . "s") (:start prefix per-line-prefix)
+;;;                 (:end suffix) (:nl kind) (:ind kind n) (:tab kind n inc)
+;;; ============================================================
+
+(defvar *%ppx-stack* nil)
+
+(defun %ppx-current (stream)
+  "The capture record whose private stream is STREAM, or NIL."
+  (let ((c *%ppx-stack*))
+    (loop
+      (when (null c) (return nil))
+      (when (eq (aref (car c) 1) stream) (return (car c)))
+      (setq c (cdr c)))))
+
+(defun %ppx-flush (rec)
+  (let ((txt (get-output-stream-string (aref rec 1))))
+    (when (> (length txt) 0)
+      (aset rec 2 (cons (cons :text txt) (aref rec 2))))))
+
+(defun %ppx-record (rec tok)
+  (%ppx-flush rec)
+  (aset rec 2 (cons tok (aref rec 2))))
+
+(defun %pp-level-exceeded-p ()
+  "T when a new logical block would exceed *PRINT-LEVEL* (prints as #)."
+  (let ((lvl (symbol-value '*print-level*)))
+    (and lvl (integerp lvl) (>= (length *%pp-ctx*) lvl))))
+
+(defun %pp-begin (stream obj prefix per-line-prefix)
+  (%pp-check-string prefix)
+  (%pp-check-string per-line-prefix)
+  (let* ((s (%resolve-output-stream stream))
+         (rec (%ppx-current s)))
+    (when (null rec)
+      (setq rec (make-array 5))
+      (aset rec 0 s)
+      (aset rec 1 (make-string-output-stream))
+      (aset rec 2 nil)
+      (aset rec 3 0)
+      (aset rec 4 (or (%stream-column s) 0))
+      (setq *%ppx-stack* (cons rec *%ppx-stack*)))
+    (%ppx-record rec (list :start prefix per-line-prefix))
+    (aset rec 3 (+ (aref rec 3) 1))
+    (let ((st (make-array 4)))
+      (aset st 0 (aref rec 1))
+      (aset st 1 obj)
+      (aset st 2 0)
+      (aset st 3 (%pp-list-arg-p obj))
+      (setq *%pp-ctx* (cons st *%pp-ctx*)))
+    (aref rec 1)))
+
+(defun %pp-end (cap suffix)
+  (%pp-check-string suffix)
+  (when *%pp-ctx* (setq *%pp-ctx* (cdr *%pp-ctx*)))
+  (let ((rec (%ppx-current cap)))
+    (when rec
+      (%ppx-record rec (list :end suffix))
+      (aset rec 3 (- (aref rec 3) 1))
+      (when (<= (aref rec 3) 0)
+        (setq *%ppx-stack* (remove rec *%ppx-stack*))
+        (%ppx-layout rec))))
+  nil)
+
+(defun %ppx-op (stream tok)
+  "Record TOK if STREAM is inside a logical block and *PRINT-PRETTY* is
+   true; outside one, conditional newlines/indentation/tabs do nothing.
+   (The printer variables are read with SYMBOL-VALUE throughout: they are
+   DEFVARed in cl-reader.lisp, which loads after this file.)"
+  (let ((rec (%ppx-current (%resolve-output-stream stream))))
+    (when (and rec (symbol-value '*print-pretty*))
+      (%ppx-record rec tok)))
+  nil)
+
+;;; --- token list -> tree ---------------------------------------------
+
+(defun %ppx-split-text (str items)
+  "Push STR onto ITEMS (reversed), turning each #\Newline into a :LITERAL
+   break."
+  (let ((start 0) (n (length str)) (i 0))
+    (loop
+      (when (>= i n) (return nil))
+      (when (= (char-code (char str i)) 10)
+        (when (> i start) (setq items (cons (subseq str start i) items)))
+        (setq items (cons (list :nl :literal) items))
+        (setq start (+ i 1)))
+      (setq i (+ i 1)))
+    (when (< start n) (setq items (cons (subseq str start n) items)))
+    items))
+
+(defun %ppx-parse-block (start cur)
+  "START is the :start token; CUR a one-cell holder of the remaining
+   tokens.  Returns #(:block prefix per-line-prefix suffix items)."
+  (let ((items nil) (suffix nil))
+    (loop
+      (let ((toks (car cur)))
+        (when (null toks) (return nil))
+        (let ((tok (car toks)))
+          (rplaca cur (cdr toks))
+          (cond ((eq (car tok) :end) (setq suffix (cadr tok)) (return nil))
+                ((eq (car tok) :start)
+                 (setq items (cons (%ppx-parse-block tok cur) items)))
+                ((eq (car tok) :text)
+                 (setq items (%ppx-split-text (cdr tok) items)))
+                (t (setq items (cons tok items)))))))
+    (let ((b (make-array 5)))
+      (aset b 0 :block)
+      (aset b 1 (cadr start))
+      (aset b 2 (caddr start))
+      (aset b 3 suffix)
+      (aset b 4 (nreverse items))
+      b)))
+
+(defun %ppx-hard-nl-p (item)
+  (and (consp item) (eq (car item) :nl)
+       (or (eq (cadr item) :mandatory) (eq (cadr item) :literal))))
+
+(defun %ppx-width (item)
+  "Flat width of ITEM; a mandatory/literal break anywhere inside makes it
+   too wide for any line."
+  (cond ((stringp item) (length item))
+        ((consp item) (if (%ppx-hard-nl-p item) 1000000 0))
+        (t (let ((w (+ (length (or (aref item 1) (aref item 2) ""))
+                       (length (or (aref item 3) "")))))
+             (dolist (x (aref item 4)) (setq w (+ w (%ppx-width x))))
+             w))))
+
+(defun %ppx-seg-width (items tail)
+  "Width of ITEMS up to the next conditional newline; TAIL is added when
+   the end of the block is reached first."
+  (let ((w 0) (cur items))
+    (loop
+      (when (null cur) (return (+ w tail)))
+      (let ((x (car cur)))
+        (when (and (consp x) (eq (car x) :nl))
+          (return (if (%ppx-hard-nl-p x) (+ w 1000000) w)))
+        (setq w (+ w (%ppx-width x))))
+      (setq cur (cdr cur)))))
+
+;;; --- rendering -------------------------------------------------------
+;;; R = #(target line(rev codes) col lines margin miser-width frames print-lines
+;;;       stopped) -- STOPPED is set once *print-lines* truncates, and every
+;;;       later write is dropped.
+;;; frame = #(prefix-col per-line-prefix start indent suffix linear-break miser)
+
+(defun %ppx-put (r code)
+  (unless (aref r 8)
+    (aset r 1 (cons code (aref r 1)))
+    (aset r 2 (+ (aref r 2) 1))))
+
+(defun %ppx-puts (r str)
+  (let ((i 0) (n (length str)))
+    (loop
+      (when (>= i n) (return nil))
+      (%ppx-put r (char-code (char str i)))
+      (setq i (+ i 1)))))
+
+(defun %ppx-pad (r n)
+  (let ((i 0))
+    (loop
+      (when (>= i n) (return nil))
+      (%ppx-put r 32)
+      (setq i (+ i 1)))))
+
+(defun %ppx-emit-line (r newline-p)
+  (let ((target (aref r 0)))
+    (dolist (c (reverse (aref r 1))) (%print-char c target))
+    (when newline-p (%print-char 10 target)))
+  (aset r 1 nil))
+
+(defun %ppx-break (r literal-p)
+  (let ((plines (aref r 7)))
+    (when (and (not (aref r 8)) plines (integerp plines) (>= (+ (aref r 3) 1) plines))
+      ;; CLHS *print-lines*: " .." then every pending suffix, then nothing.
+      (%ppx-puts r " ..")
+      (dolist (f (aref r 6)) (when (aref f 4) (%ppx-puts r (aref f 4))))
+      (aset r 8 t)))
+  (when (aref r 8) (return-from %ppx-break nil))
+  (unless literal-p
+    (let ((l (aref r 1)))
+      (loop (if (and l (= (car l) 32)) (setq l (cdr l)) (return nil)))
+      (aset r 1 l)))
+  (%ppx-emit-line r t)
+  (aset r 3 (+ (aref r 3) 1))
+  (aset r 2 0)
+  (dolist (f (reverse (aref r 6)))
+    (when (aref f 1)
+      (%ppx-pad r (- (aref f 0) (aref r 2)))
+      (%ppx-puts r (aref f 1))))
+  (unless literal-p
+    (let ((f (car (aref r 6))))
+      (when f (%ppx-pad r (- (aref f 3) (aref r 2)))))))
+
+(defun %ppx-tab (r it sec-start)
+  (let* ((kind (cadr it))
+         (colnum (or (caddr it) 0))
+         (colinc (or (cadddr it) 0))
+         (sectionp (or (eq kind :section) (eq kind :section-relative)))
+         (relp (or (eq kind :line-relative) (eq kind :section-relative)))
+         (cur (- (aref r 2) (if sectionp sec-start 0)))
+         (target cur))
+    (if relp
+        (progn
+          (setq target (+ cur colnum))
+          (when (> colinc 1)
+            (let ((m (mod target colinc)))
+              (when (> m 0) (setq target (+ target (- colinc m)))))))
+        (cond ((< cur colnum) (setq target colnum))
+              ((> colinc 0)
+               (setq target (+ colnum (* colinc (+ 1 (floor (- cur colnum) colinc))))))
+              (t nil)))
+    (%ppx-pad r (- target cur))))
+
+(defun %ppx-render-block (r b trailing)
+  (let* ((prefix (aref b 1))
+         (plp (aref b 2))
+         (suffix (aref b 3))
+         (sufw (length (or suffix "")))
+         (margin (aref r 4))
+         (mw (aref r 5))
+         (f (make-array 7)))
+    (aset f 0 (aref r 2))
+    (%ppx-puts r (or prefix plp ""))
+    (aset f 1 plp)
+    (aset f 2 (aref r 2))
+    (aset f 3 (aref r 2))
+    (aset f 4 suffix)
+    (aset f 5 (> (+ (aref f 0) (%ppx-width b) trailing) margin))
+    (aset f 6 (and mw (integerp mw) (>= (aref f 2) (- margin mw))))
+    (aset r 6 (cons f (aref r 6)))
+    (let ((sec-start (aref r 2)) (sec-lines (aref r 3)) (rest (aref b 4)))
+      (loop
+        (when (null rest) (return nil))
+        (let ((it (car rest)))
+          (cond
+            ((stringp it) (%ppx-puts r it))
+            ((consp it)
+             (let ((k (car it)))
+               (cond
+                 ((eq k :nl)
+                  (let* ((kind (cadr it))
+                         (br (cond
+                               ((or (eq kind :mandatory) (eq kind :literal)) t)
+                               ((eq kind :linear) (aref f 5))
+                               ((eq kind :miser) (and (aref f 6) (aref f 5)))
+                               ((eq kind :fill)
+                                (or (> (+ (aref r 2)
+                                          (%ppx-seg-width (cdr rest) (+ sufw trailing)))
+                                       margin)
+                                    (> (aref r 3) sec-lines)
+                                    (and (aref f 6) (aref f 5))))
+                               (t nil))))
+                    (when br (%ppx-break r (eq kind :literal)))
+                    (setq sec-start (aref r 2))
+                    (setq sec-lines (aref r 3))))
+                 ((eq k :ind)
+                  (unless (aref f 6)
+                    (aset f 3 (max 0 (+ (if (eq (cadr it) :block) (aref f 2) (aref r 2))
+                                        (caddr it))))))
+                 ((eq k :tab) (%ppx-tab r it sec-start))
+                 (t nil))))
+            (t (%ppx-render-block r it (%ppx-seg-width (cdr rest) (+ sufw trailing))))))
+        (setq rest (cdr rest))))
+    (%ppx-puts r (or suffix ""))
+    (aset r 6 (cdr (aref r 6)))))
+
+(defun %ppx-layout (rec)
+  (%ppx-flush rec)
+  (let* ((cur (list (reverse (aref rec 2))))
+         (blocks nil)
+         (r (make-array 9)))
+    (loop
+      (let ((ts (car cur)))
+        (when (null ts) (return nil))
+        (let ((tok (car ts)))
+          (rplaca cur (cdr ts))
+          (when (eq (car tok) :start)
+            (setq blocks (cons (%ppx-parse-block tok cur) blocks))))))
+    (aset r 0 (aref rec 0))
+    (aset r 1 nil)
+    (aset r 2 (aref rec 4))
+    (aset r 3 0)
+    (aset r 4 (let ((m (symbol-value '*print-right-margin*)))
+                (if (and m (integerp m)) m 80)))
+    (aset r 5 (symbol-value '*print-miser-width*))
+    (aset r 6 nil)
+    (aset r 7 (symbol-value '*print-lines*))
+    (aset r 8 nil)
+    (dolist (b (nreverse blocks)) (%ppx-render-block r b 0))
+    (%ppx-emit-line r nil)))
 
 (defun pprint (obj &rest stream-arg)
   "Pretty-print OBJ (stub: same as prin1 + newline)."
@@ -2126,6 +2418,14 @@
 ;;;   plain ~T is absolute: pad to column colnum; if already at/past it, pad to
 ;;;     the next multiple of colinc past colnum.
 (defun %fmt-tabulate (colnum colinc atp colonp stream)
+  ;; Inside a pretty-printing logical block ~T is PPRINT-TAB (CLHS 22.3.6.1):
+  ;; ~T :line, ~@T :line-relative, ~:T :section, ~:@T :section-relative.
+  (when (and (%ppx-current stream) (symbol-value '*print-pretty*))
+    (pprint-tab (if colonp
+                    (if atp :section-relative :section)
+                    (if atp :line-relative :line))
+                (if colnum colnum 1) (if colinc colinc 1) stream)
+    (return-from %fmt-tabulate nil))
   (if colonp
       nil  ; ~:T outside a logical block: no-op
       (let ((cn (if colnum colnum 1))
@@ -2753,25 +3053,109 @@
                      (setq pos len))))
               (t (setq pos (+ p 1)))))))))
 
-(defun %format-logical-block (stream body arg-list colonp atp)
-  "Render a ~<...~:> logical block (CLHS 22.3.5.2), Tier-1 (margin 100, so
-   no fill/linear/miser column engine — ~_/~I are no-ops and this reduces to
-   prefix + body + suffix concatenation).
+(defun %format-close-angle-at-p (control close-pos len)
+  "T if the ~> close at CLOSE-POS carried an @ modifier (~:@> = fill mode)."
+  (let ((p (+ close-pos 1)) (saw-at nil))
+    (loop
+      (when (>= p len) (return saw-at))
+      (let ((c (%prim-aref control p)))
+        (cond
+          ((= c 64) (setq saw-at t) (setq p (+ p 1)))
+          ((= c 62) (return saw-at))
+          ((or (and (>= c 48) (<= c 57)) (= c 45) (= c 44) (= c 118) (= c 86)
+               (= c 35) (= c 58) (= c 39))
+           (setq p (+ p 1)))
+          (t (return saw-at)))))))
 
-   COLONP = the ~:< open modifier (colon-default prefix/suffix \"(\"/\")\");
-   ATP    = the ~@< open modifier (iterate the WHOLE arg-list rather than a
-            single list arg).
+(defun %format-first-sep-atp (body)
+  "T if the FIRST top-level ~; in BODY is ~@; -- in a logical block that
+   makes the prefix a PER-LINE prefix (CLHS 22.3.5.2)."
+  (let ((len (array-length body)) (pos 0))
+    (loop
+      (when (>= pos len) (return nil))
+      (if (/= (%prim-aref body pos) 126)
+          (setq pos (+ pos 1))
+          (let ((p (+ pos 1)) (dch nil) (at nil))
+            (loop
+              (when (>= p len) (return nil))
+              (let ((c (%prim-aref body p)))
+                (cond
+                  ((= c 39) (setq p (+ p 2)))
+                  ((= c 64) (setq at t) (setq p (+ p 1)))
+                  ((or (and (>= c 48) (<= c 57)) (= c 45) (= c 44)
+                       (= c 118) (= c 86) (= c 35) (= c 58))
+                   (setq p (+ p 1)))
+                  (t (setq dch c) (return nil)))))
+            (cond
+              ((null dch) (return nil))
+              ((= dch 59) (return at))
+              ((= dch 60)
+               (let ((close (%format-find-close-angle body (+ p 1) len)))
+                 (setq pos (if close (%format-close-angle-end body close len) len))))
+              ((= dch 123)
+               (let ((close (%format-find-close-brace body (+ p 1) len)))
+                 (setq pos (if close (%format-close-brace-end body close len) len))))
+              (t (setq pos (+ p 1)))))))))
 
-   BODY is split on top-level ~; into 1-3 segments:
-     1 seg  → (body)                — prefix/suffix default
-     2 segs → (prefix body)         — explicit prefix, suffix default
-     3 segs → (prefix body suffix)  — both explicit
-   An explicit (possibly empty) prefix/suffix segment overrides the colon
-   default.  Returns the remaining (unconsumed) arg-list."
+(defun %format-insert-fill-newlines (body)
+  "~:@> fill mode (CLHS 22.3.5.2): a ~:_ after every group of blanks
+   immediately contained in BODY (not inside a directive, and not the blanks
+   a ~<Newline> directive leaves)."
+  (let ((out (make-string-output-stream))
+        (len (array-length body)) (pos 0))
+    (loop
+      (when (>= pos len) (return nil))
+      (let ((c (%prim-aref body pos)))
+        (cond
+          ((= c 126)
+           ;; copy the whole directive (through a nested ~<..~> / ~{..~})
+           (let ((p (+ pos 1)) (dch nil))
+             (loop
+               (when (>= p len) (return nil))
+               (let ((d (%prim-aref body p)))
+                 (cond
+                   ((= d 39) (setq p (+ p 2)))
+                   ((or (and (>= d 48) (<= d 57)) (= d 45) (= d 44)
+                        (= d 118) (= d 86) (= d 35) (= d 58) (= d 64))
+                    (setq p (+ p 1)))
+                   (t (setq dch d) (return nil)))))
+             (let ((end (cond ((null dch) len)
+                              ((= dch 60)
+                               (let ((close (%format-find-close-angle body (+ p 1) len)))
+                                 (if close (%format-close-angle-end body close len) len)))
+                              ((= dch 123)
+                               (let ((close (%format-find-close-brace body (+ p 1) len)))
+                                 (if close (%format-close-brace-end body close len) len)))
+                              (t (+ p 1)))))
+               (let ((k pos))
+                 (loop (when (>= k (min end len)) (return nil))
+                   (%print-char (%prim-aref body k) out) (setq k (+ k 1))))
+               ;; ~<Newline> swallows the following blanks itself
+               (when (and dch (= dch 10))
+                 (loop (when (or (>= end len) (/= (%prim-aref body end) 32)) (return nil))
+                   (%print-char 32 out) (setq end (+ end 1))))
+               (setq pos end))))
+          ((= c 32)
+           (loop (when (or (>= pos len) (/= (%prim-aref body pos) 32)) (return nil))
+             (%print-char 32 out) (setq pos (+ pos 1)))
+           (%print-char 126 out) (%print-char 58 out) (%print-char 95 out))
+          (t (%print-char c out) (setq pos (+ pos 1))))))
+    (get-output-stream-string out)))
+
+(defun %format-logical-block (stream body arg-list colonp atp &optional fillp)
+  "Render a ~<...~:> logical block (CLHS 22.3.5.2) as a real pretty-printer
+   logical block (%PP-BEGIN / %PP-END): ~_ ~I ~T inside it are laid out.
+
+   COLONP = ~:< (default prefix/suffix \"(\"/\")\"); ATP = ~@< (the block's
+   list is the WHOLE remaining arg-list); FILLP = closed with ~:@> (a fill
+   newline after every blank group).  BODY splits on top-level ~; into
+   (body), (prefix body) or (prefix body suffix); a prefix ended by ~@; is a
+   PER-LINE prefix.  Returns the remaining (unconsumed) arg-list."
   (declare (special *format-iter-escape*))
   (let* ((segs (%format-split-segments body))
          (nsegs (length segs))
-         (prefix nil) (suffix nil) (inner nil))
+         (prefix nil) (suffix nil) (inner nil)
+         (per-line (and (>= nsegs 2) (%format-first-sep-atp body))))
     (cond
       ((>= nsegs 3)
        (setq prefix (nth 0 segs))
@@ -2787,38 +3171,27 @@
       (error "Logical-block (~~<...~~:>) prefix must not contain directives."))
     (when (and suffix (%format-segment-has-directive suffix))
       (error "Logical-block (~~<...~~:>) suffix must not contain directives."))
+    (when fillp (setq inner (%format-insert-fill-newlines inner)))
+    (when (and colonp (null prefix)) (setq prefix "("))
+    (when (and colonp (null suffix)) (setq suffix ")"))
     ;; ~@< iterates over the WHOLE remaining arg-list; otherwise the block
-    ;; consumes exactly one arg which must be a list.  CLHS 22.3.5.2: in the
-    ;; non-~@< case, if that arg is a non-list atom it is printed with ~A and
-    ;; the prefix/suffix/body are skipped entirely.
-    (if atp
+    ;; consumes exactly one arg, and a non-list atom is printed with ~A with
+    ;; the prefix/suffix/body skipped.
+    (if (and (not atp) (car arg-list) (not (consp (car arg-list))))
         (progn
-          ;; Apply colon defaults only when the segment is absent.
-          (when (and colonp (null prefix)) (setq prefix "("))
-          (when (and colonp (null suffix)) (setq suffix ")"))
-          (when prefix (%print-string-raw prefix stream))
-          ;; CLHS 22.3.5.2: a ~^ inside the block terminates the block body
-          ;; but the prefix/suffix are STILL printed and the ENCLOSING format
-          ;; continues normally.  Save/clear the iter-escape flag so it does
-          ;; not leak out and abort the surrounding ~{...~} / outer block.
+          (princ-to-stream (car arg-list) stream)
+          (cdr arg-list))
+        (let* ((sub (if atp arg-list (car arg-list)))
+               (cap (%pp-begin stream sub
+                               (if per-line nil prefix)
+                               (if per-line prefix nil)))
+               (rest-args nil))
+          ;; CLHS 22.3.5.2: ~^ inside the block ends the body only.
           (setq *format-iter-escape* nil)
-          (setq arg-list (%format-impl stream inner arg-list))
+          (setq rest-args (%format-impl cap inner sub))
           (setq *format-iter-escape* nil)
-          (when suffix (%print-string-raw suffix stream)))
-        (let ((sub (car arg-list)))
-          (setq arg-list (cdr arg-list))
-          (if (and sub (not (consp sub)))
-              ;; Non-list atom: ~A it, no prefix/suffix.
-              (princ-to-stream sub stream)
-              (progn
-                (when (and colonp (null prefix)) (setq prefix "("))
-                (when (and colonp (null suffix)) (setq suffix ")"))
-                (when prefix (%print-string-raw prefix stream))
-                (setq *format-iter-escape* nil)
-                (%format-impl stream inner sub)
-                (setq *format-iter-escape* nil)
-                (when suffix (%print-string-raw suffix stream))))))
-    arg-list))
+          (%pp-end cap suffix)
+          (if atp rest-args (cdr arg-list))))))
 
 (defun %format-justify-overflow-width (body)
   "If the FIRST top-level segment of justification BODY is terminated by a
@@ -3818,7 +4191,8 @@
                          (progn (%print-char 126 stream) (%print-char dir stream))
                          (let* ((body (%substring control i close))
                                 (new-i (%format-close-angle-end control close len))
-                                (lb (%format-close-angle-colon-p control close len)))
+                                (lb (%format-close-angle-colon-p control close len))
+                                (lb-fill (and lb (%format-close-angle-at-p control close len))))
                            ;; CLHS 22.3.5.2 cross-directive errors (apply to
                            ;; both variants, scanned over the whole control):
                            ;; a ~<...~:;...~> simple-justify may not co-occur
@@ -3830,7 +4204,7 @@
                                ;; Logical-block variant (~<...~:>).
                                (setq arg-list
                                      (%format-logical-block stream body arg-list
-                                                            colonp atp))
+                                                            colonp atp lb-fill))
                                ;; Simple justification (~<...~>).
                                (progn
                                  ;; ~W, ~_, ~I are not permitted in a justify
@@ -3903,12 +4277,19 @@
                        ;; correctly resumes after each sublist's ~^.
                        (setq *format-iter-escape* (if colonp :outer t))
                        (return arg-list))))
-                  ;; ~_ — conditional newline (pprint, ignore)
-                  ((= dir 95) nil)
-                  ;; ~I — indent (pprint; no layout engine yet, so a no-op).
-                  ;; It takes NO format argument (CLHS 22.3.5.3); this arm
-                  ;; used to consume one, shifting every later directive.
-                  ((= dir 73) nil)
+                  ;; ~_ — conditional newline (CLHS 22.3.5.1): ~_ linear,
+                  ;; ~:_ fill, ~@_ miser, ~:@_ mandatory.
+                  ((= dir 95)
+                   (pprint-newline (cond ((and colonp atp) :mandatory)
+                                         (colonp :fill)
+                                         (atp :miser)
+                                         (t :linear))
+                                   stream))
+                  ;; ~I / ~:I — PPRINT-INDENT :block / :current by PARAM1
+                  ;; (default 0).  It takes NO format argument (CLHS
+                  ;; 22.3.5.3); this arm used to consume one.
+                  ((or (= dir 73) (= dir 105))
+                   (pprint-indent (if colonp :current :block) (or param1 0) stream))
                   ;; ~/ — call function
                   ((= dir 47)
                    ;; Find end of function name (next /)

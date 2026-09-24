@@ -525,6 +525,15 @@
   "BLE target"
   (ppc-emit-bc buf +ppc-bo-false+ +ppc-bi-gt+ label-id))
 
+(defun ppc-emit-sc (buf)
+  "SC -- system call.  SC-form, opcode 17, with bit 30 set: 0x44000002.
+   Linux/PowerPC passes the syscall number in r0 and arguments in r3..r8, and
+   returns in r3.  An error is signalled by CR0.SO rather than by a negative
+   return, so a caller that only checks the sign cannot see errno on this
+   architecture -- nothing here checks either, but it is the difference that
+   matters if something starts to."
+  (ppc-emit-word buf #x44000002))
+
 (defun ppc-emit-blr (buf)
   "BLR - branch to link register (return) (XL-form, opcode 19, XO=16)"
   (ppc-emit-word buf (ppc-xl-form 19 +ppc-bo-always+ 0 16)))
@@ -690,6 +699,32 @@
 (defparameter *ppc-globals-base* #x00900000
   "Base of the PPC absolute-address convention slot block; set per target by
    install-ppc-translator / install-ppc32-translator.")
+
+(defparameter *ppc-linux-mode* nil
+  "T when building a HOSTED Linux/PPC image rather than a bare-metal one.
+
+   PPC64 AND PPC32 ARE NOT ONE TARGET EACH -- bare and hosted are different
+   memory maps.  Bare ppc32 keeps its convention slots at #x00900000 (inside the
+   64 MB boot-ppc32.lisp's TLBs map) and writes the console byte to an e500 UART
+   at #xE0004500; bare ppc64 uses #x20900000 and a powernv LPC UART.  Under Linux
+   neither UART exists in our address space and neither slot base is mapped, so
+   PPC-SET-LINUX-MODE moves the slots into the mmap'd heap and the console byte
+   becomes write(2).")
+
+(defparameter *ppc-hosted-globals-base* #x10000A00
+  "Convention slots for the HOSTED ports, inside the mmap'd heap and above the
+   Cheney metadata at #x10000040 -- the same address the RISC-V and i386 hosted
+   ports pick, for the same reason.")
+
+;;; Linux/PowerPC syscall numbers.  The table is the SAME at both widths (unlike
+;;; x86, where 32- and 64-bit numbering diverge completely), and it is not the
+;;; asm-generic table RISC-V uses either: write is 4 here and 64 there.
+;;; 90 is sys_mmap taking SIX REGISTER arguments -- PowerPC does not have i386's
+;;; old_mmap-through-a-pointer calling convention, so no argument block is needed.
+(defconstant +ppc-linux-sys-exit+   1)
+(defconstant +ppc-linux-sys-read+   3)
+(defconstant +ppc-linux-sys-write+  4)
+(defconstant +ppc-linux-sys-mmap+  90)
 
 ;;; The MV-count slot is +MV-COUNT-ADDR+, set per target in mvm/target.lisp
 ;;; (ppc32's value is #x00900020, inside the 64 MB boot-ppc32.lisp maps; ppc64
@@ -975,6 +1010,41 @@
            ((< code #x0300)
             ;; Frame-alloc/frame-free: NOP for now
             nil)
+           ((and (= code #x0300) *ppc-linux-mode*)
+            ;; HOSTED: the serial write becomes write(1, &byte, 1).  The byte
+            ;; goes on the stack because write(2) wants an ADDRESS, and it is
+            ;; untagged into r11 FIRST because r3 has to be freed for the fd.
+            ;;
+            ;; -16 of stack below r1 is scratch by the PowerPC ABI, but the byte
+            ;; is stored at 0(r1) AFTER the bump, i.e. inside the frame this
+            ;; sequence owns -- writing below r1 without moving it is what the
+            ;; ABI permits a leaf to do and a syscall is not a leaf.
+            (ppc-emit-shift-right-arith-imm buf +ppc-r11+ +ppc-r3+ 1)
+            (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ (logand -16 #xFFFF))
+            (ppc-emit-stb buf +ppc-r11+ +ppc-r1+ 0)
+            (ppc-emit-li buf +ppc-r3+ 1)               ; fd = stdout
+            (ppc-emit-mr buf +ppc-r4+ +ppc-r1+)        ; buf
+            (ppc-emit-li buf +ppc-r5+ 1)               ; count
+            (ppc-emit-li buf +ppc-r0+ +ppc-linux-sys-write+)
+            (ppc-emit-sc buf)
+            (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ 16))
+           ((and (= code #x0301) *ppc-linux-mode*)
+            ;; HOSTED: serial read becomes read(0, &byte, 1), and the byte comes
+            ;; back TAGGED in V0 (r3) so the contract matches the bare arm.
+            (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ (logand -16 #xFFFF))
+            (ppc-emit-li buf +ppc-r3+ 0)               ; fd = stdin
+            (ppc-emit-mr buf +ppc-r4+ +ppc-r1+)
+            (ppc-emit-li buf +ppc-r5+ 1)
+            (ppc-emit-li buf +ppc-r0+ +ppc-linux-sys-read+)
+            (ppc-emit-sc buf)
+            (ppc-emit-lbz buf +ppc-r11+ +ppc-r1+ 0)
+            (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ 16)
+            (ppc-emit-add buf +ppc-r3+ +ppc-r11+ +ppc-r11+))   ; tag: x*2
+           ((and (= code #x0500) *ppc-linux-mode*)
+            ;; HOSTED: exit(status), status arriving TAGGED in V0.
+            (ppc-emit-shift-right-arith-imm buf +ppc-r3+ +ppc-r3+ 1)
+            (ppc-emit-li buf +ppc-r0+ +ppc-linux-sys-exit+)
+            (ppc-emit-sc buf))
            ((= code #x0300)
             ;; Serial write: V0 (r3) contains tagged fixnum char code
             (if *ppc-64-bit*
@@ -1479,21 +1549,35 @@
              (unless (ppc-vreg-phys vd)
                (ppc-store-vreg buf vd pd))))))
 
+      ;; R0 IS NOT A BASE REGISTER.  In a D-form load or store, rA=0 means the
+      ;; LITERAL VALUE ZERO, not the contents of r0 -- so `addi r0,obj,-tag;
+      ;; stw val,0(r0)' does not store into the cons, it stores to ABSOLUTE
+      ;; ADDRESS 0.  These two wrote there on every PowerPC image ever built.
+      ;;
+      ;; It went unseen because bare ppc32 loads at address 0 with RAM from 0:
+      ;; the store landed on the image's own first words and nothing read them
+      ;; again.  The HOSTED port has nothing mapped at 0, so it is a SIGSEGV --
+      ;; which is how this was found, and is the argument for hosted ports as a
+      ;; correctness instrument rather than just a convenience.
+      ;;
+      ;; The address goes in SCRATCH1: PS comes from vreg-or-scratch with
+      ;; scratch2 as its fallback, so PS can never BE scratch1, and PD is dead
+      ;; the moment the address is formed.
       (#.+op-setcar+
        (let ((vd (first operands))
              (vs (second operands)))
          (let ((pd (vreg-or-scratch vd +ppc-scratch1+))
                (ps (vreg-or-scratch vs +ppc-scratch2+)))
-           (ppc-emit-addi buf +ppc-r0+ pd (logand (- +tag-cons+) #xFFFF))
-           (ppc-emit-store-word buf ps +ppc-r0+ 0))))
+           (ppc-emit-addi buf +ppc-scratch1+ pd (logand (- +tag-cons+) #xFFFF))
+           (ppc-emit-store-word buf ps +ppc-scratch1+ 0))))
 
       (#.+op-setcdr+
        (let ((vd (first operands))
              (vs (second operands)))
          (let ((pd (vreg-or-scratch vd +ppc-scratch1+))
                (ps (vreg-or-scratch vs +ppc-scratch2+)))
-           (ppc-emit-addi buf +ppc-r0+ pd (logand (- +tag-cons+) #xFFFF))
-           (ppc-emit-store-word buf ps +ppc-r0+ (ppc-word-size)))))
+           (ppc-emit-addi buf +ppc-scratch1+ pd (logand (- +tag-cons+) #xFFFF))
+           (ppc-emit-store-word buf ps +ppc-scratch1+ (ppc-word-size)))))
 
       (#.+op-consp+
        (let ((vd (first operands))
@@ -1611,8 +1695,15 @@
              (vs (second operands)))
          (let ((ps (vreg-or-scratch vs +ppc-scratch1+)))
            (let ((pd (or (ppc-vreg-phys vd) +ppc-scratch1+)))
-             (ppc-emit-addi buf +ppc-r0+ ps (logand (- +tag-object+) #xFFFF))
-             (ppc-emit-load-word buf pd +ppc-r0+ 0)       ; load header
+             ;; R0 IS NOT A BASE REGISTER -- see :setcar.  `lwz pd,0(r0)' read
+             ;; ABSOLUTE ADDRESS 0 instead of the object header, so every subtag
+             ;; dispatch (%prim-aref's u8 check among them) branched on whatever
+             ;; happened to be at address 0.  SCRATCH2 holds the address: PS is
+             ;; scratch1-or-a-vreg and PD is scratch1-or-a-vreg, so neither can
+             ;; be scratch2, and the address is dead after the load -- which is
+             ;; why the tag-shift below may reuse scratch2.
+             (ppc-emit-addi buf +ppc-scratch2+ ps (logand (- +tag-object+) #xFFFF))
+             (ppc-emit-load-word buf pd +ppc-scratch2+ 0)   ; load header
              (ppc-emit-shift-right-arith-imm buf pd pd 8)  ; shift right 8
              (ppc-emit-andi-dot buf pd pd #xFF)             ; mask 8 bits
              ;; Tag as fixnum
@@ -2150,6 +2241,21 @@
          (limit (or end (ppc-buffer-word-count buf))))
     (loop for i from start below limit
           do (format t "  ~4,'0X: ~8,'0X~%" (* i 4) (aref words i)))))
+
+(defun ppc-set-linux-mode (on)
+  "Turn hosted mode on or off, moving the convention slots with it.  One
+   function so the two cannot drift apart: an unmapped slot base is a SIGSEGV on
+   the first :set-nargs, which is emitted before EVERY call, so the first
+   function call in the image dies rather than something subtle later.
+
+   The bare base depends on which PPC target is installed, so this must be
+   called AFTER install-ppc-translator / install-ppc32-translator; turning the
+   mode OFF restores from *PPC-64-BIT*, which those installers have set."
+  (setf *ppc-linux-mode* (and on t))
+  (setf *ppc-globals-base*
+        (cond (on *ppc-hosted-globals-base*)
+              (*ppc-64-bit* #x20900000)
+              (t            #x00900000))))
 
 (defun install-ppc-translator ()
   "Install the PPC64 translator into the target descriptor."

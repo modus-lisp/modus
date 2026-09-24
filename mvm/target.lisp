@@ -730,6 +730,14 @@
           +mv-values-addr+ mvv))
   (set-target-fixnum-bits (- (* 8 (target-word-size target)) 2)))
 
+(defun ppc-linux-mode-p ()
+  "T when the PPC back end is in hosted mode.  Looked up by name rather than
+   referenced directly because target.lisp is loaded BEFORE the translators, so
+   *PPC-LINUX-MODE* does not exist yet when this file is read."
+  (and (find-package "MODUS.MVM")
+       (let ((sym (find-symbol "*PPC-LINUX-MODE*" "MODUS.MVM")))
+         (and sym (boundp sym) (symbol-value sym) t))))
+
 (defun mv-slot-addrs-for (target)
   "The (COUNT VALUES) multiple-value slot addresses for TARGET.
 
@@ -757,7 +765,16 @@
                          (and sym (boundp sym) (symbol-value sym))))
                   (values #x10000090 #x10000098)
                   (values #x80700010 #x80700018)))
-    (:ppc32   (values #x00900020 #x00900028))
+    ;; ppc32/ppc64 BARE vs HOSTED, the same split riscv64 has and for the same
+    ;; reason: RESOLVE-TARGET-ARCH maps :linux-ppc32 to :ppc32, so (target-name
+    ;; ...) cannot tell them apart, and the bare addresses are not mapped under
+    ;; Linux.  The hosted pair is the shared one, inside the mmap'd heap.
+    ((:ppc32 :ppc64)
+     (if (ppc-linux-mode-p)
+         (values #x10000090 #x10000098)
+         (if (eq (target-name target) :ppc32)
+             (values #x00900020 #x00900028)
+             (values #x10000090 #x10000098))))
     (t        (values #x10000090 #x10000098))))
 
 (defun width-constants-source ()

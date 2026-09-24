@@ -565,6 +565,32 @@
 ;;; translator scratch (see *68k-vreg-map*).
 (defparameter *68k-globals-base* #x00600000
   "Base of the 68k absolute-address convention slot block.")
+
+(defparameter *68k-linux-mode* nil
+  "T when building a HOSTED Linux/m68k image rather than a bare-metal one.
+   Bare and hosted are different memory maps: #x00600000 is ordinary RAM on
+   `virt' and is NOT MAPPED under Linux, and the Goldfish TTY at
+   +M68K-UART-BASE+ does not exist in our address space there.
+   M68K-SET-LINUX-MODE moves the slots and turns the console byte into write(2).")
+
+(defparameter *68k-hosted-globals-base* #x10000A00
+  "Convention slots for the HOSTED port, inside the mmap'd heap and above the
+   Cheney metadata at #x10000040 — the address every hosted port picks.")
+
+;;; Linux/m68k syscall numbers.  This is the ORIGINAL Linux table (the one i386
+;;; also uses) and not the asm-generic one: write is 4 here, 64 on RISC-V.
+;;; 192 is mmap2, whose sixth argument is an offset in PAGES; it is used in
+;;; preference to 90 (old_mmap) because old_mmap takes a POINTER to a block of
+;;; six arguments in d1 rather than the arguments themselves.
+;;;
+;;; THE ARGUMENT REGISTERS ARE d1,d2,d3,d4,d5,a0 — five data registers and then
+;;; an ADDRESS register, which is why a six-argument syscall needs a0 here and
+;;; nothing else in this file does.  The number goes in d0 and the result comes
+;;; back in d0.
+(defconstant +68k-linux-sys-exit+   1)
+(defconstant +68k-linux-sys-read+   3)
+(defconstant +68k-linux-sys-write+  4)
+(defconstant +68k-linux-sys-mmap2+ 192)
 (defun m68k-nargs-addr ()   (+ *68k-globals-base* #x00))
 (defun m68k-cenv-addr ()    (+ *68k-globals-base* #x08))
 ;;; SHARED contract address, as on x64/aarch64/i386/ppc64: compiler-emitted
@@ -1068,10 +1094,54 @@
            ((< code #x0300)
             ;; Frame-alloc/frame-free: NOP for now
             nil)
+           ((and (= code #x0300) *68k-linux-mode*)
+            ;; HOSTED: the serial write becomes write(1, &byte, 1).
+            ;;
+            ;; write(2) wants an ADDRESS, so the untagged byte is PUSHED and the
+            ;; buffer is 3(a7) — THREE, not zero: m68k is BIG-ENDIAN, so the low
+            ;; byte of a pushed longword is the LAST of its four bytes.  Passing
+            ;; a7 itself would print the high byte of the char, which for any
+            ;; ASCII character is 0.
+            (m68k-emit-move-dn-dn buf +68k-d2+ +68k-d1+)   ; V0 -> scratch
+            (m68k-emit-asr-imm buf +68k-d1+ 1)             ; untag
+            (m68k-emit-push-dn buf +68k-d1+)
+            (m68k-emit-lea-disp buf +68k-a7+ 3 +68k-a0+)   ; a0 = &low byte
+            (m68k-emit-move-imm-dn buf 1 +68k-d1+)         ; arg1: fd = stdout
+            (m68k-emit-move-an-dn buf +68k-a0+ +68k-d2+)   ; arg2: buf
+            (m68k-emit-move-imm-dn buf 1 +68k-d3+)         ; arg3: count
+            (m68k-emit-move-imm-dn buf +68k-linux-sys-write+ +68k-d0+)
+            (m68k-emit-trap buf 0)
+            (m68k-emit-addq-an buf +68k-a7+ 4))            ; pop the byte
+           ((and (= code #x0301) *68k-linux-mode*)
+            ;; HOSTED: read(0, &byte, 1); the byte comes back TAGGED in V0 (d2),
+            ;; matching the bare arm's contract.  Same 3(a7) big-endian offset.
+            (m68k-emit-move-imm-dn buf 0 +68k-d1+)         ; make room (value
+            (m68k-emit-push-dn buf +68k-d1+)               ; irrelevant)
+            (m68k-emit-lea-disp buf +68k-a7+ 3 +68k-a0+)
+            (m68k-emit-move-imm-dn buf 0 +68k-d1+)         ; arg1: fd = stdin
+            (m68k-emit-move-an-dn buf +68k-a0+ +68k-d2+)   ; arg2: buf
+            (m68k-emit-move-imm-dn buf 1 +68k-d3+)         ; arg3: count
+            (m68k-emit-move-imm-dn buf +68k-linux-sys-read+ +68k-d0+)
+            (m68k-emit-trap buf 0)
+            (m68k-emit-move-imm-dn buf 0 +68k-d2+)
+            (m68k-emit-lea-disp buf +68k-a7+ 3 +68k-a0+)
+            (m68k-emit-move-byte-an-ind-dn buf +68k-a0+ +68k-d2+)
+            (m68k-emit-addq-an buf +68k-a7+ 4)
+            (m68k-emit-lsl-imm buf +68k-d2+ 1))            ; tag as fixnum
+           ((and (= code #x0500) *68k-linux-mode*)
+            ;; HOSTED: exit(status), status arriving TAGGED in V0 (d2).
+            (m68k-emit-move-dn-dn buf +68k-d2+ +68k-d1+)
+            (m68k-emit-asr-imm buf +68k-d1+ 1)
+            (m68k-emit-move-imm-dn buf +68k-linux-sys-exit+ +68k-d0+)
+            (m68k-emit-trap buf 0))
            ((= code #x0300)
-            ;; Serial write: V0 (D0) contains tagged fixnum char code
-            ;; move.l d0, d1 (copy V0 to scratch)
-            (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d1+)
+            ;; BARE METAL: serial write.  V0 IS D2, NOT D0 — this arm read D0
+            ;; until 2026-09-24, left behind when *68K-VREG-MAP* slid the window
+            ;; to D2..D7 (D0/D1 became reserved scratch).  The arch ladder cannot
+            ;; see it: its oracle is guest MEMORY, not serial output, so the one
+            ;; path that would notice is the one no test on this target uses.
+            ;; move.l d2, d1 (copy V0 to scratch)
+            (m68k-emit-move-dn-dn buf +68k-d2+ +68k-d1+)
             ;; asr.l #1, d1 (untag fixnum)
             (m68k-emit-asr-imm buf +68k-d1+ 1)
             ;; movea.l #uart_base, a0
@@ -2263,6 +2333,14 @@
          (limit (or end (m68k-buffer-word-count buf))))
     (loop for i from start below limit
           do (format t "  ~4,'0X: ~4,'0X~%" (* i 2) (aref words i)))))
+
+(defun m68k-set-linux-mode (on)
+  "Turn hosted mode on or off, moving the convention slots with it.  One
+   function so the two cannot drift apart: an unmapped slot base is a SIGSEGV on
+   the first :set-nargs, which precedes EVERY call, so the first function call in
+   the image dies rather than something subtle later."
+  (setf *68k-linux-mode* (and on t))
+  (setf *68k-globals-base* (if on *68k-hosted-globals-base* #x00600000)))
 
 (defun install-68k-translator ()
   "Install the 68k translator into the target descriptor."

@@ -372,6 +372,44 @@ symbol does not exist until the sb-posix contrib is required — which a load-ti
 sweep and kills builds *for unrelated targets*. Use
 `(funcall (find-symbol "CHMOD" "SB-POSIX") out #o755)`.
 
+### AN UNMAPPED ZERO PAGE IS AN ORACLE — three PowerPC r0-as-base bugs
+
+**R0 IS NOT A BASE REGISTER ON POWERPC.**  In a D-form load or store, `rA=0`
+means the LITERAL VALUE ZERO, not the contents of r0.  So
+
+    addi r0, obj, -9        ; r0 = obj - tag-object
+    lwz  r3, 0(r0)          ; reads ABSOLUTE ADDRESS 0
+
+Three sites in `translate-ppc.lisp` did exactly that, in every PowerPC image ever
+built:
+
+| site | effect |
+|---|---|
+| `:obj-subtag` | read address 0 instead of the object header, so EVERY subtag dispatch (including `%prim-aref`'s u8-vector check) branched on whatever was at 0 |
+| `:setcar` | STORED to absolute address 0 |
+| `:setcdr` | STORED to absolute address 4 (or 8 on ppc64) |
+
+**Bare ppc32 loads at address 0 with RAM from 0**, so the stray stores landed on
+the image's own first words and the stray load read them back.  Nothing faulted.
+The HOSTED port has nothing mapped at zero, so it is an immediate SIGSEGV —
+which is how this was found.  *That* is the argument for hosted ports as a
+correctness instrument and not merely a convenience: the unmapped zero page is an
+oracle bare metal cannot provide.
+
+**AND THE LADDER COULD NOT HAVE CAUGHT THE STORE HALF AT ALL.**  For fourteen
+rungs across eight architectures, NOTHING MUTATED A CONS — `r08-cons` is
+`(let ((l (cons 40 2))) (+ (car l) (cdr l)))`, which only reads.  `r15-cons-mutate`
+now exercises `:setcar`/`:setcdr`.  The generalisable lesson is **a rung per
+OPCODE PAIR, not per data type**: "cons" looked covered because allocation and
+reading were.
+
+The fix puts the address in a real scratch register, and which one is not
+arbitrary — `:setcar`/`:setcdr` use scratch1 because their VALUE operand comes
+from `vreg-or-scratch` with scratch2 as its fallback and so can never BE
+scratch1; `:obj-subtag` uses scratch2 because both its operands are
+scratch1-or-a-vreg, and the address is dead after the load, which is what lets
+the tag-shift reuse scratch2.
+
 ### RV32: one RISC-V back end, two widths
 
 `*riscv-64-bit*` (PPC's model) selects the width and `install-riscv32-translator`

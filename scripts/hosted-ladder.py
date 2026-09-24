@@ -37,6 +37,13 @@ ARCHES = {
   "riscv64": ("mvm/build-riscv-linux.lisp",   "MODUS_RISCV_LINUX_OUT",   "qemu-riscv64-static"),
   "riscv32": ("mvm/build-riscv32-linux.lisp", "MODUS_RISCV32_LINUX_OUT", "qemu-riscv32-static"),
   "arm32":   ("mvm/build-arm32-linux.lisp",   "MODUS_ARM32_LINUX_OUT",   "qemu-arm-static"),
+  # BIG-ENDIAN.  The oracle is endian-NEUTRAL by construction: the payload emits
+  # its four bytes one at a time, low byte first, through write-char-serial, so
+  # nothing here depends on the target's byte order — which is the whole reason
+  # these three could join without touching the harness.
+  "ppc64":   ("mvm/build-ppc64-linux.lisp",   "MODUS_PPC64_LINUX_OUT",   "qemu-ppc64-static"),
+  "ppc32":   ("mvm/build-ppc32-linux.lisp",   "MODUS_PPC32_LINUX_OUT",   "qemu-ppc-static"),
+  "68k":     ("mvm/build-68k-linux.lisp",     "MODUS_68K_LINUX_OUT",     "qemu-m68k-static"),
 }
 
 

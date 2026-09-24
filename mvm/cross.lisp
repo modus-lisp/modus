@@ -1422,6 +1422,12 @@
     (:linux-aarch64 :aarch64)
     (:linux-riscv :riscv64)
     (:linux-riscv32 :riscv32)
+    ;; The big-endian hosted ports.  No new ELF wrapper: their descriptors
+    ;; carry :elf-machine/:elf-class and fall through to the GENERIC arm of the
+    ;; wrapper dispatch, which is big-endian already.
+    (:linux-ppc64 :ppc64)
+    (:linux-ppc32 :ppc32)
+    (:linux-68k :68k)
     ;; ARMv7, not the ARMv5 :arm32 descriptor: INSTALL-ARMV7-TRANSLATOR is what
     ;; the hosted build installs (movw/movt make 32-bit immediates one pair of
     ;; instructions instead of a literal pool), and it is what qemu-arm and any
@@ -1509,6 +1515,9 @@
     (:linux-aarch64 (linux-aarch64-boot-descriptor))
     (:linux-riscv (linux-riscv-boot-descriptor))
     (:linux-riscv32 (linux-riscv32-boot-descriptor))
+    (:linux-ppc64 (linux-ppc64-boot-descriptor))
+    (:linux-ppc32 (linux-ppc32-boot-descriptor))
+    (:linux-68k (linux-68k-boot-descriptor))
     (:linux-arm32 (linux-arm32-boot-descriptor))
     (:linux-i386 (linux-i386-boot-descriptor))
     (:x64-console (x64-console-boot-descriptor))

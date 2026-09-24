@@ -122,7 +122,14 @@
   (rv-emit-add buf +rv-s8+ +rv-s4+ +rv-t0+)
   (rv-emit-li buf +rv-t0+ +linux-riscv-gc-midpoint+)
   (rv-emit-add buf +rv-s9+ +rv-s4+ +rv-t0+)
-  (rv-emit-li buf +rv-s10+ 0)            ; NIL = 0, as on every other target
+  ;; VN = NIL.  #xDEAD0001 (+NIL-VALUE+), NOT zero.  The three hosted ports that
+  ;; run the real CL image — x64, AArch64, i386 — all load this immediate, and the
+  ;; compiler knows the value: mvm/compiler.lisp defines +NIL-VALUE+ and reasons
+  ;; about its low byte (0x01) when it classifies immediates.  A minimal ladder
+  ;; payload cannot tell the difference, because every NIL test compares against
+  ;; THIS REGISTER and so is self-consistent at any value; the real image can,
+  ;; the moment anything meets a baked NIL literal.
+  (rv-emit-li buf +rv-s10+ +nil-value+)
   ;; --- Cheney metadata at the shared absolute slots 0x10000040..0x10000060.
   ;;     RAW addresses, matching what the native collector expects (the
   ;;     address<<1 convention gc.lisp once needed is gone).

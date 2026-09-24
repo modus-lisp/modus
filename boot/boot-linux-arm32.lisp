@@ -93,7 +93,10 @@
     (arm32-add buf +arm-r9+ +arm-r6+ +arm-r12+)
     (arm32-load-imm32 buf +arm-r12+ +linux-arm32-gc-midpoint+)
     (arm32-add buf +arm-r10+ +arm-r6+ +arm-r12+)
-    (arm32-mov-imm buf +arm-r8+ 0 0)              ; NIL = 0, as everywhere else
+    ;; VN = NIL = +NIL-VALUE+ (#xDEAD0001), not zero — see boot-linux-riscv.lisp.
+    ;; ARM32 cannot load it as a rotated immediate, so it goes through the same
+    ;; movw/movt pair every other 32-bit constant here uses.
+    (arm32-load-imm32 buf +arm-r8+ +nil-value+)
     ;; Cheney metadata at the shared absolute slots, RAW addresses.
     (arm32-load-imm32 buf +arm-lr+ #x10000040)
     (arm32-str buf +arm-r9+ +arm-lr+ 0)           ; [0x40] from_start

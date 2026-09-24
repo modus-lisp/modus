@@ -135,7 +135,8 @@
     (rv-emit-add buf +rv-s8+ +rv-s4+ +rv-t0+)
     (rv-emit-li buf +rv-t0+ +linux-riscv32-gc-midpoint+)
     (rv-emit-add buf +rv-s9+ +rv-s4+ +rv-t0+)
-    (rv-emit-li buf +rv-s10+ 0)                 ; NIL = 0, as on every target
+    ;; VN = NIL = +NIL-VALUE+, not zero — see boot-linux-riscv.lisp.
+    (rv-emit-li buf +rv-s10+ +nil-value+)
     ;; --- Cheney metadata, at the heap-relative block this port uses.  RAW
     ;;     addresses, matching what the collector expects.
     (rv-emit-li buf +rv-t1+ (+ +linux-riscv32-heap-addr+ #x40))

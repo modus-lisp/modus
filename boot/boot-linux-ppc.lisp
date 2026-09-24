@@ -112,7 +112,8 @@
     (ppc-emit-add buf +ppc-r19+ +ppc-r16+ +ppc-r11+)
     (ppc-emit-li buf +ppc-r11+ +linux-ppc-gc-midpoint+)
     (ppc-emit-add buf +ppc-r20+ +ppc-r16+ +ppc-r11+)
-    (ppc-emit-li buf +ppc-r21+ 0)                ; NIL = 0, as on every target
+    ;; VN = NIL = +NIL-VALUE+, not zero — see boot-linux-riscv.lisp.
+    (ppc-emit-li buf +ppc-r21+ +nil-value+)
     ;; --- Cheney metadata at the heap-relative block, RAW addresses.
     (ppc-emit-li buf +ppc-r11+ (+ +linux-ppc-heap-addr+ #x40))
     (ppc-emit-store-word buf +ppc-r19+ +ppc-r11+ 0)             ; from_start

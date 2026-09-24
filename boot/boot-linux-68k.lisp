@@ -99,7 +99,8 @@
     (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d1+)
     (m68k-emit-addi buf +68k-d1+ +linux-68k-gc-midpoint+)
     (m68k-emit-move-dn-an buf +68k-d1+ +68k-a3+)          ; VL
-    (m68k-emit-move-imm-an buf 0 +68k-a4+)                ; VN = NIL = 0
+    ;; VN = NIL = +NIL-VALUE+, not zero — see boot-linux-riscv.lisp.
+    (m68k-emit-move-imm-an buf +nil-value+ +68k-a4+)
     ;; --- Cheney metadata, RAW addresses, at the heap-relative block
     (m68k-emit-move-imm-an buf (+ +linux-68k-heap-addr+ #x40) +68k-a0+)
     (m68k-emit-move-an-dn buf +68k-a2+ +68k-d1+)

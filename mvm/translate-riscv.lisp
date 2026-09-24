@@ -93,9 +93,26 @@
   (fixups nil))    ; list of (byte-position label-id type)
 
 (defun rv-emit-u32 (buf word)
-  "Emit a 32-bit instruction word (little-endian) to the RISC-V code buffer."
+  "Emit a 32-bit instruction word (little-endian), DOUBLING the byte array when
+   it would overflow.
+
+   THE FIXED 131072-BYTE ARRAY WAS NOT A BUDGET, IT WAS A CLIFF.  The real CL
+   image's native code is about 36 MB, so the translator aborted mid-emit with
+   `Invalid index 131072' and the build printed `giving up on translator, using
+   partial result' — a PARTIAL IMAGE that would have been written and shipped.
+   It was caught only because check-compiler-warns refuses a degraded build,
+   which is exactly the silent-degradation class that check exists for.
+
+   Same fix, same class, as ARM32-EMIT's 262144 cliff (fixed earlier in this
+   campaign) and A64-EMIT's.  Four spare bytes of headroom because one call
+   writes four."
   (let ((bytes (rv-buffer-bytes buf))
         (pos (rv-buffer-position buf)))
+    (when (>= (+ pos 4) (length bytes))
+      (let ((new (make-array (* 2 (length bytes)) :initial-element 0)))
+        (replace new bytes)
+        (setf (rv-buffer-bytes buf) new)
+        (setf bytes new)))
     (setf (aref bytes pos)       (logand word #xFF))
     (setf (aref bytes (+ pos 1)) (logand (ash word -8) #xFF))
     (setf (aref bytes (+ pos 2)) (logand (ash word -16) #xFF))
@@ -448,6 +465,34 @@
    log2(word) - 1.  2 on RV64, 1 on RV32."
   (if *riscv-64-bit* 2 1))
 
+(defparameter *riscv-record-unimpl* t
+  "Record every MVM opcode and trap code that reaches this translator's default
+   arm, in *RISCV-UNIMPL-OPS*.
+
+   i386 learned this the hard way and says why: a silent placeholder is the worst
+   failure mode when bringing a target up, because the image BUILDS CLEAN and
+   then dies with no explanation.  Worse here, because the real CL image is 40 MB
+   and one unimplemented opcode buried in it is not something you find by
+   reading.  The census turns that into a list.")
+
+(defvar *riscv-unimpl-ops* nil
+  "Hash of key -> count.  An opcode is its own number; a TRAP is #x10000 + its
+   code, so the two cannot collide in one table.")
+
+(defun rv-note-unimpl (key)
+  (when *riscv-record-unimpl*
+    (let ((tbl (or *riscv-unimpl-ops*
+                   (setf *riscv-unimpl-ops* (make-hash-table :test 'eql)))))
+      (incf (gethash key tbl 0)))))
+
+(defun riscv-unimplemented-report ()
+  "Alist of (key . count) for everything that fell through to the default arm
+   during the last translation, most frequent first.  Keys >= #x10000 are traps."
+  (let ((acc nil))
+    (when *riscv-unimpl-ops*
+      (maphash (lambda (k v) (push (cons k v) acc)) *riscv-unimpl-ops*))
+    (sort acc #'> :key #'cdr)))
+
 (defvar *riscv-li-const-patches* nil
   "List of (NATIVE-BYTE-OFFSET . POOL-INDEX) recorded by +OP-LI-CONST+.
 
@@ -757,6 +802,39 @@
   (rv-emit-li buf +rv-t1+ addr)
   (rv-emit-load-word buf rd +rv-t1+ 0))
 
+(defun rv-emit-branch-far (buf kind rs1 rs2 offset)
+  "Emit a conditional branch that can reach ANYWHERE within JAL range, as the
+   INVERTED condition skipping an unconditional jump:
+
+       <inverted> rs1, rs2, +8
+       jal  x0, offset-4
+
+   WHY THIS IS UNCONDITIONALLY TWO INSTRUCTIONS, never one when one would fit.
+   RISC-V's B-type immediate reaches +/-4 KB; the real CL image needs 18792 bytes
+   from one branch alone, so the short form is not always available.  But sizing
+   the choice per-branch is NOT SAFE in this translator: pass 1 builds the label
+   map WHILE measuring, so an early branch sees no target yet and measures SHORT,
+   while pass 2 sees the real far target and emits LONG -- and every offset after
+   it is then wrong.  A fixed size cannot disagree with itself.
+
+   The cost is 4 bytes per conditional branch.  The alternative is a convergence
+   loop over the whole module, which is the right answer for a code-size-sensitive
+   back end and not worth it here.
+
+   The JAL's displacement is measured from the JAL, which sits 4 bytes after the
+   branch OFFSET was measured from -- hence offset-4."
+  (let ((inverted (ecase kind
+                    ;; The inverse of each test, because the jump is what the
+                    ;; ORIGINAL condition should reach.
+                    (:beq :bne) (:bne :beq)
+                    (:blt :bge) (:bge :blt))))
+    (ecase inverted
+      (:beq (rv-emit-beq buf rs1 rs2 8))
+      (:bne (rv-emit-bne buf rs1 rs2 8))
+      (:blt (rv-emit-blt buf rs1 rs2 8))
+      (:bge (rv-emit-bge buf rs1 rs2 8)))
+    (rv-emit-j buf (- offset 4))))
+
 (defun rv-emit-j (buf offset)
   "J offset (unconditional jump, jal x0, offset)"
   (rv-emit-jal buf +rv-x0+ offset))
@@ -1049,7 +1127,9 @@
             ;; sb t0, 0(t1) (store byte to UART data register)
             (rv-emit-sb buf +rv-t0+ +rv-t1+ 0))
            (t
-            ;; Real CPU trap: ecall with code in a7
+            ;; An unhandled TRAP CODE.  Recorded as #x10000+code so the build
+            ;; report distinguishes "this opcode is missing" from "this trap is".
+            (rv-note-unimpl (+ #x10000 code))
             (rv-emit-addi buf +rv-a7+ +rv-x0+ code)
             (rv-emit-ecall buf)))))
 
@@ -1334,39 +1414,39 @@
        (let* ((mvm-offset (vreg 0))
               (target-pc (+ mvm-pc mvm-offset))
               (native-off (branch-offset target-pc)))
-         (rv-emit-beq buf *rv-last-cmp-rs1* *rv-last-cmp-rs2* native-off)))
+         (rv-emit-branch-far buf :beq *rv-last-cmp-rs1* *rv-last-cmp-rs2* native-off)))
 
       (#.+op-bne+
        (let* ((mvm-offset (vreg 0))
               (target-pc (+ mvm-pc mvm-offset))
               (native-off (branch-offset target-pc)))
-         (rv-emit-bne buf *rv-last-cmp-rs1* *rv-last-cmp-rs2* native-off)))
+         (rv-emit-branch-far buf :bne *rv-last-cmp-rs1* *rv-last-cmp-rs2* native-off)))
 
       (#.+op-blt+
        (let* ((mvm-offset (vreg 0))
               (target-pc (+ mvm-pc mvm-offset))
               (native-off (branch-offset target-pc)))
-         (rv-emit-blt buf *rv-last-cmp-rs1* *rv-last-cmp-rs2* native-off)))
+         (rv-emit-branch-far buf :blt *rv-last-cmp-rs1* *rv-last-cmp-rs2* native-off)))
 
       (#.+op-bge+
        (let* ((mvm-offset (vreg 0))
               (target-pc (+ mvm-pc mvm-offset))
               (native-off (branch-offset target-pc)))
-         (rv-emit-bge buf *rv-last-cmp-rs1* *rv-last-cmp-rs2* native-off)))
+         (rv-emit-branch-far buf :bge *rv-last-cmp-rs1* *rv-last-cmp-rs2* native-off)))
 
       (#.+op-ble+
        ;; BLE a,b = BGE b,a (swap operands)
        (let* ((mvm-offset (vreg 0))
               (target-pc (+ mvm-pc mvm-offset))
               (native-off (branch-offset target-pc)))
-         (rv-emit-bge buf *rv-last-cmp-rs2* *rv-last-cmp-rs1* native-off)))
+         (rv-emit-branch-far buf :bge *rv-last-cmp-rs2* *rv-last-cmp-rs1* native-off)))
 
       (#.+op-bgt+
        ;; BGT a,b = BLT b,a (swap operands)
        (let* ((mvm-offset (vreg 0))
               (target-pc (+ mvm-pc mvm-offset))
               (native-off (branch-offset target-pc)))
-         (rv-emit-blt buf *rv-last-cmp-rs2* *rv-last-cmp-rs1* native-off)))
+         (rv-emit-branch-far buf :blt *rv-last-cmp-rs2* *rv-last-cmp-rs1* native-off)))
 
       (#.+op-bnull+
        ;; Branch if register equals VN (NIL)
@@ -1374,7 +1454,7 @@
               (mvm-offset (vreg 1))
               (target-pc (+ mvm-pc mvm-offset))
               (native-off (branch-offset target-pc)))
-         (rv-emit-beq buf rs +rv-s10+ native-off)))
+         (rv-emit-branch-far buf :beq rs +rv-s10+ native-off)))
 
       (#.+op-bnnull+
        ;; Branch if register is not VN (NIL)
@@ -1382,7 +1462,7 @@
               (mvm-offset (vreg 1))
               (target-pc (+ mvm-pc mvm-offset))
               (native-off (branch-offset target-pc)))
-         (rv-emit-bne buf rs +rv-s10+ native-off)))
+         (rv-emit-branch-far buf :bne rs +rv-s10+ native-off)))
 
       ;; ---- List operations ----
       (#.+op-car+
@@ -2066,7 +2146,9 @@
 
       ;; ---- Unknown opcode ----
       (otherwise
-       ;; Emit trap for unrecognized instruction
+       ;; Unrecognised opcode: trap with the number in a7, and RECORD it so a
+       ;; build reports the gap instead of shipping a landmine.
+       (rv-note-unimpl opcode)
        (rv-emit-addi buf +rv-a7+ +rv-x0+ opcode)
        (rv-emit-ebreak buf)))))
 

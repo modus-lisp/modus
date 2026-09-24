@@ -260,6 +260,14 @@
           ;; an i386 JIT arm lands; it is tracked as an open item, not a fact
           ;; about the hardware.
           ((eq *cli-arch* :i386) nil)
+          ;; RISC-V: no in-image JIT, for the same reason as i386 — there is no
+          ;; runtime PROT_EXEC page primitive on its trap table (#x0530/#x0531
+          ;; are unimplemented), so baking the translator would leave
+          ;; %jit-translate-page failing every form: the same interpret path plus
+          ;; a megabyte of dead code.  mvm-eval's JIT seam falls back cleanly, so
+          ;; the image is CORRECT, just slower.  Removing this line is the whole
+          ;; change when a RISC-V JIT arm lands.
+          ((eq *cli-arch* :riscv64) nil)
           ((and no (> (length no) 0)) nil)           ; MODUS_NO_JIT → rollback to interpret
           (v (or (string= v "1") (string-equal v "t") (string-equal v "yes")))  ; explicit
           ;; WS5 #206: DEFAULT is ON again.  It was turned OFF in 2d95d3e
@@ -583,8 +591,10 @@
        (or *translate-aarch64-source* "")  (string #\Newline)
        (or *aarch64-jit-coinit-source* "") (string #\Newline)))
     ;; i386: no in-image JIT translator — see the *JIT-ON* comment above.
-    ((eq *cli-arch* :i386) "")
-    (t (error "build-cli-common: unknown *cli-arch* ~S (want :x64, :aarch64 or :i386)"
+    ;; i386 / riscv64: no in-image JIT translator — see the *JIT-ON* comment.
+    ((member *cli-arch* '(:i386 :riscv64)) "")
+    (t (error "build-cli-common: unknown *cli-arch* ~S ~
+               (want :x64, :aarch64, :i386 or :riscv64)"
               *cli-arch*))))
 
 ;;; ARCH SLOT — boot hook + JIT gate.  Appended LAST so its %jit-enabled-p wins

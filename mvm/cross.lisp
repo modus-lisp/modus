@@ -1092,21 +1092,41 @@
               ;; ppc32 and a two-function one did not.)  Each arch gets the
               ;; same single PC-relative branch x86 and ARM already had.
               ((member arch '(:riscv64 :riscv32))
-               ;; JAL x0, imm  (J-type, opcode 0x6F, rd=0).  Same encoding at
-               ;; both widths -- JAL is RV32I, not an RV64 addition.  The immediate is
-               ;; scrambled: imm[20|10:1|11|19:12].  Target = PC + offset, and
-               ;; native code starts 4 bytes past this instruction.
-               (let* ((off (+ entry-native-offset 4))
-                      (insn (logior #x6F
-                                    (ash (logand (ash off -12) #xFF) 12)
-                                    (ash (logand (ash off -11) #x1) 20)
-                                    (ash (logand (ash off -1) #x3FF) 21)
-                                    (ash (logand (ash off -20) #x1) 31))))
-                 (mvm-emit-byte final-buf (logand insn #xFF))
-                 (mvm-emit-byte final-buf (logand (ash insn -8) #xFF))
-                 (mvm-emit-byte final-buf (logand (ash insn -16) #xFF))
-                 (mvm-emit-byte final-buf (logand (ash insn -24) #xFF))
-                 (setq jmp-size 4)))
+               ;; AUIPC t0, hi20 ; JALR x0, lo12(t0) — a PC-relative jump that
+               ;; reaches +/-2 GB.
+               ;;
+               ;; THIS WAS A SINGLE `JAL x0, imm' AND THAT IS A 1 MB CLIFF.  JAL's
+               ;; J-type immediate is 21 bits signed, so it reaches +/-1 MB; the
+               ;; real CL image puts kernel-main about 1.5 MB into 31 MB of native
+               ;; code, the immediate WRAPPED, and the boot stub's last instruction
+               ;; jumped BACKWARD out of the image:
+               ;;
+               ;;     0x400108:  j  -571748   # 0x3747a4   <- unmapped, SIGSEGV
+               ;;
+               ;; Every ladder image is a few KB, so every one of them was inside
+               ;; the cliff and this was invisible until the first big image.  Note
+               ;; the shape of the failure: not a diagnostic, a wild branch — the
+               ;; whole boot stub traces perfectly and then leaves.
+               ;;
+               ;; The 0x800 in the split is the standard AUIPC+lo12 correction:
+               ;; JALR's offset is SIGN-extended, so a lo12 >= 0x800 must be
+               ;; borrowed from the high part.  t0 is free here — the stub has
+               ;; finished with it and translated code has not started.
+               (let* ((off (+ entry-native-offset 8))   ; two instructions now
+                      (hi20 (ash (+ off #x800) -12))
+                      (lo12 (- off (ash hi20 12)))
+                      (auipc (logior #x17 (ash 5 7)          ; rd = x5 = t0
+                                     (ash (logand hi20 #xFFFFF) 12)))
+                      (jalr (logior #x67 (ash 0 7)           ; rd = x0
+                                    (ash 0 12)               ; funct3 = 0
+                                    (ash 5 15)               ; rs1 = t0
+                                    (ash (logand lo12 #xFFF) 20))))
+                 (dolist (insn (list auipc jalr))
+                   (mvm-emit-byte final-buf (logand insn #xFF))
+                   (mvm-emit-byte final-buf (logand (ash insn -8) #xFF))
+                   (mvm-emit-byte final-buf (logand (ash insn -16) #xFF))
+                   (mvm-emit-byte final-buf (logand (ash insn -24) #xFF)))
+                 (setq jmp-size 8)))
               ((member arch '(:ppc64 :ppc32))
                ;; b target  (I-form, opcode 18, AA=0, LK=0): the 24-bit LI
                ;; field is the word-aligned displacement from THIS

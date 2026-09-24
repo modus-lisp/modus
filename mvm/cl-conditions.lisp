@@ -1149,15 +1149,25 @@
               ;; hard crashes.  setq leaks on a non-local exit, but that leak
               ;; is repaired at the next fresh-signal entry by
               ;; %heal-handler-bind-skip.
+              ;;
+              ;; ESCAPE-SAFE RESTORE: the restore now runs in an
+              ;; UNWIND-PROTECT cleanup (lexical save, setq restore -- the
+              ;; shape %with-handler-bind's pop has used since 279f2cc), so
+              ;; a handler that exits by RETURN-FROM / THROW puts both back.
+              ;; The lazy heal could not cover it: it only rewinds once the
+              ;; handler-bind stack is EMPTY, and under LOAD it never is, so
+              ;; after the first escaping handler every later signal skipped
+              ;; its innermost handlers -- the second
+              ;; (block b (handler-bind ((error (lambda (c) (return-from b ..)))) ..))
+              ;; in a script escaped, and so did rt's DO-ENTRY on the second
+              ;; erroring test of the real ansi-test.
               (let ((saved *handler-bind-effective-skip*)
                     (saved-depth *signal-walk-depth*))
                 (setq *handler-bind-effective-skip* (+ frame-idx 1))
                 (setq *signal-walk-depth* (+ saved-depth 1))
-                (funcall hfn cond-obj)
-                ;; Handler returned normally — restore so a later handler
-                ;; in this same loop sees the right scope.
-                (setq *signal-walk-depth* saved-depth)
-                (setq *handler-bind-effective-skip* saved))))))
+                (unwind-protect (funcall hfn cond-obj)
+                  (setq *signal-walk-depth* saved-depth)
+                  (setq *handler-bind-effective-skip* saved)))))))
       (setq cur (cdr cur))
       (setq frame-idx (+ frame-idx 1)))
     nil))

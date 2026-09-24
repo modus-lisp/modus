@@ -1248,6 +1248,43 @@
     (%signal-type-error))
   (%ppx-op (if args (car args) nil) (list :ind relative-to (floor n))))
 
+;;; ansi-aux.lsp helpers.  That file cannot be emitted into the image (it
+;;; fails at READ time in this corpus), and these four were defined nowhere
+;;; else: every call compiled to an undefined function that returned NIL --
+;;; class-precedence-lists alone lost 62 tests to IS-NONCONTIGUOUS-SUBLIST-OF.
+(defun is-noncontiguous-sublist-of (list1 list2)
+  "T if the elements of LIST1 appear in LIST2 in order, not necessarily
+   adjacent."
+  (let ((rest list2))
+    (dolist (x list1 t)
+      (loop
+        (when (null rest) (return-from is-noncontiguous-sublist-of nil))
+        (let ((y (car rest)))
+          (setq rest (cdr rest))
+          (when (eql x y) (return nil)))))))
+
+(defun is-similar (x y)
+  "3.2.4.2.2 similarity, as ansi-aux.lsp's IS-SIMILAR* decides it."
+  (cond
+    ((and (symbolp x) (symbolp y))
+     (if (null (symbol-package x))
+         (and (null (symbol-package y))
+              (equal (symbol-name x) (symbol-name y)))
+         (eq x y)))
+    ((and (numberp x) (numberp y)) (= x y))
+    (t (equal x y))))
+
+(defun make-list-expr (args)
+  "(LIST . ARGS) as an expression that evades CALL-ARGUMENTS-LIMIT."
+  (if (cddddr args)
+      (list 'list* (first args) (second args) (third args) (fourth args)
+            (make-list-expr (cddddr args)))
+      (cons 'list args)))
+
+(defun make-displaced-array (n displacement)
+  (make-array n :displaced-to (symbol-value '*displaced*)
+                :displaced-index-offset displacement))
+
 (defun %pprint-seq (stream object colon-p kind tabsize)
   "PPRINT-FILL / -LINEAR / -TABULAR, as CLHS 22.4 defines them: a logical
    block (parenthesised when COLON-P) whose elements are separated by a

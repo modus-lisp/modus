@@ -1750,6 +1750,13 @@
   (let ((lvl (symbol-value '*print-level*)))
     (and lvl (integerp lvl) (>= (length *%pp-ctx*) lvl))))
 
+(defun %ppx-simple (str)
+  "STR as a simple string (a prefix/suffix may carry a fill pointer, CLHS
+   allows any string -- pprint-logical-block.8), or NIL."
+  (if str (let ((out (make-string-output-stream))) (write-string str out)
+               (get-output-stream-string out))
+      nil))
+
 (defun %pp-begin (stream obj prefix per-line-prefix)
   (%pp-check-string prefix)
   (%pp-check-string per-line-prefix)
@@ -1763,7 +1770,7 @@
       (aset rec 3 0)
       (aset rec 4 (or (%stream-column s) 0))
       (setq *%ppx-stack* (cons rec *%ppx-stack*)))
-    (%ppx-record rec (list :start prefix per-line-prefix))
+    (%ppx-record rec (list :start (%ppx-simple prefix) (%ppx-simple per-line-prefix)))
     (aset rec 3 (+ (aref rec 3) 1))
     (let ((st (make-array 4)))
       (aset st 0 (aref rec 1))
@@ -1778,7 +1785,7 @@
   (when *%pp-ctx* (setq *%pp-ctx* (cdr *%pp-ctx*)))
   (let ((rec (%ppx-current cap)))
     (when rec
-      (%ppx-record rec (list :end suffix))
+      (%ppx-record rec (list :end (%ppx-simple suffix)))
       (aset rec 3 (- (aref rec 3) 1))
       (when (<= (aref rec 3) 0)
         (setq *%ppx-stack* (remove rec *%ppx-stack*))

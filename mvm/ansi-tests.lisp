@@ -4682,6 +4682,20 @@
   ;; RETURN-FROM.  Fix: re-propagate when *%eval-escape-stack* is non-empty
   ;; so the matching BLOCK pops its own descriptor.  IGNORE-ERRORS expands
   ;; to HANDLER-CASE, so it is covered too.
+  ;; A lexical RETURN-FROM out of an UNWIND-PROTECT in EVAL'd code must run
+  ;; the cleanup.  In images that skip INIT-ALL-GLOBALS (this runner) the
+  ;; compiler's u-p bookkeeping defvars were uninitialised and it did not --
+  ;; which then leaked every handler-case barrier a RETURN-FROM left.
+  (rt-run-test 8490
+    (progn (setq *uwp-probe-8490* nil)
+           (eval '(block b (unwind-protect (return-from b 1) (setq *uwp-probe-8490* :ran))))
+           *uwp-probe-8490*)
+    :ran)
+  (rt-run-test 8491
+    (let ((n (length *handler-bind-stack*)))
+      (eval '(block b (handler-case (return-from b 1) (error () 2))))
+      (- (length *handler-bind-stack*) n))
+    0)
   (rt-run-test 8500
     (handler-case
         (eval '(block b

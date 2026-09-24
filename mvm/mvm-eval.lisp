@@ -2896,6 +2896,15 @@
   ;; in-image (same reason as *mvm-emit-halves* above).  Native builds never
   ;; call mvm-eval-forms, so the global stays NIL at build time.
   (setq *mvm-eval-runtime-p* t)
+  ;; The UNWIND-PROTECT bookkeeping the compiler keeps in two defvars must
+  ;; hold real values.  Images that never run INIT-ALL-GLOBALS (the ANSI gate
+  ;; runners) left them uninitialised, so a lexical RETURN-FROM out of an
+  ;; UNWIND-PROTECT in EVAL'd code saw no cleanup to run and skipped it.
+  ;; Only repaired when invalid, so a nested compile keeps the outer state.
+  (unless (and (boundp '*uwp-seq-counter*) (integerp *uwp-seq-counter*))
+    (setq *uwp-seq-counter* 0))
+  (unless (and (boundp '*uwp-cleanups*) (listp *uwp-cleanups*))
+    (setq *uwp-cleanups* nil))
   ;; LAZY opcode-table init.  encode-instruction (mvm.lisp) reads *opcode-table*
   ;; for each instruction's operand spec during Pass-2 emit; with a NIL table
   ;; (the ANSI image skips init-all-globals, so the defparameter init thunk

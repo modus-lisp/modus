@@ -136,8 +136,12 @@ scripts/arch-ladder-gate.sh riscv64 68k     # just these
 ```
 
 **It proves it can fail before it claims anything.** The first thing it does is
-run one rung with a deliberately wrong expected value and require that to FAIL;
-if the control passes it refuses to run the ladder at all. A gate nobody has
+run one rung with a deliberately wrong expected value and require the harness to
+report that the image *built, ran, and answered wrong* — a distinct exit code, so
+a control that "fails" merely because nothing compiled is rejected rather than
+believed. (That is not a hypothetical: a broken build once printed "the gate can
+fail" above fourteen BUILD-FAILs.) If the control passes, or cannot answer at
+all, it refuses to run the ladder. A gate nobody has
 seen fail is not evidence — which is the lesson this table was built out of.
 "All 9 architectures compile and produce correct output (factorial 3628800) in
 QEMU" stood in this file for months, and not one of those images had a serial

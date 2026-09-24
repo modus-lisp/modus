@@ -316,11 +316,25 @@ there that defines `probe`; the gate wraps it.
 
 Two properties worth preserving if you touch this:
 
-- **The gate proves it can fail.** It first runs one rung with a deliberately
-  wrong expected value and requires that to FAIL, refusing to run the ladder
-  otherwise. This whole area exists because "all 9 architectures compile and
-  produce correct output (factorial 3628800) in QEMU" stood in the README for
-  months while five of those images had no serial output path to print with.
+- **The gate proves it can fail, AND THAT THE CONTROL ANSWERED.** It first runs
+  one rung with a deliberately wrong expected value and requires
+  `arch-ladder.py` to exit **3** — meaning the image BUILT, it RAN, and the
+  comparison rejected the value. Any other non-zero exit makes it refuse the
+  ladder. Accepting "non-zero" was wrong and was **measured wrong**: a bad
+  `sb-posix:chmod` broke `check-source-parses` for every target, and the gate
+  printed *"positive control failed as required — the gate can fail"* above 14
+  BUILD-FAILs, certifying a harness in which nothing compiled. This whole area
+  exists because "all 9 architectures compile and produce correct output
+  (factorial 3628800) in QEMU" stood in the README for months while five of
+  those images had no serial output path to print with.
+- **A NEGATIVE CONTROL MUST BREAK SOMETHING THAT IS ACTUALLY LOAD-BEARING.**
+  The first attempt at testing the above appended a broken form to the END of
+  `test/arch-ladder-build.lisp` — and the gate reported a clean 14/14, because
+  `load-as-source` has already written the image by the time it reads that far.
+  Inject the break AFTER `(in-package :modus.mvm)`, i.e. before the work, or the
+  control is measuring nothing. Verified both ways: broken build -> `arch-ladder.py`
+  1 (not 3), gate 2 with the reason named, `hosted-ladder.py` 2; healthy tree ->
+  riscv64 14/14 with the control answering WRONG.
 - **The probe address must stay clear of the heap.** i386's was
   `+i386-cons-base+` exactly, so any allocating rung wrote an object header
   over the answer. See the table in `scripts/arch-ladder.py`.
@@ -350,6 +364,13 @@ something else; they have `./modus` and the ANSI gate.
 stderr, indistinguishable from "file not found". `build-image` writes mode 644,
 so a freshly built hosted image does not run until it is chmod'd; the harness
 does it so no caller can hit it. Same class as the i386 `binfmt_misc` trap.
+
+**AND THE CHMOD THAT CLOSES IT CANNOT BE SPELLED `sb-posix:chmod`.**
+`check-source-parses` READS all 201 first-party files before any build, and that
+symbol does not exist until the sb-posix contrib is required — which a load-time
+`(require :sb-posix)` does too late. The qualified name therefore fails the parse
+sweep and kills builds *for unrelated targets*. Use
+`(funcall (find-symbol "CHMOD" "SB-POSIX") out #o755)`.
 
 ### RV32: one RISC-V back end, two widths
 

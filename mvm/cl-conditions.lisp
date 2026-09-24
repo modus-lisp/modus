@@ -2338,6 +2338,10 @@
     ;; does (string-equal version nil) and that error was the whole reason
     ;; ql-http could not build an HTTP request on any arch (#293).
     ((null x) "NIL")
+    ;; ...and T, the other immediate symbol: (string t) returned T itself,
+    ;; so every name built from it failed -- ansi-test's struct-test-65
+    ;; (a slot named T) could not even be defined.
+    ((eq x t) "T")
     ((%cl-sym-p x) (%cl-sym-name x))
     ((characterp x)
      (let ((s (%make-string-array 1)))
@@ -2632,6 +2636,31 @@
   (%register-pkg-by-hash (find-package "MODUS"))
   (export (intern "JIT-EAGER" (find-package "MODUS")) (find-package "MODUS"))
   (setq *package* (find-package "CL-USER"))
+  ;; The runtime DEFPACKAGE macro.  It used to be installed only as a side
+  ;; effect of SET-UP-PACKAGES (which also makes test packages A/B/Q), and
+  ;; boot-evaluated sources need it -- without it the image died at boot.
+  (%register-defpackage-macro)
+  ;; (The ANSI-harness packages -- A/B/Q, packages00-aux's FS-A..DS4 and the
+  ;; CL-TEST alias -- are NOT part of a generic image any more: see
+  ;; %INIT-ANSI-TEST-SCAFFOLDING, called only by the gate runners.)
+  (dolist (p *all-packages*) (%register-pkg-by-hash p))
+  ;; Register every standard CL symbol as external in the COMMON-LISP
+  ;; package. ANSI cl-symbols.lsp (978 tests) asserts each standard
+  ;; name is :external; without this they all report :internal / nil.
+  (%export-standard-cl-symbols))
+
+;;; The list of standard CL symbol names is consumed by
+;;; %export-standard-cl-symbols to populate the COMMON-LISP package.
+;;; Wrapped as a defun (not defvar) so the literal is built fresh each
+;;; call — MVM doesn't run defvar init-thunks at boot.
+
+(defun %init-ansi-test-scaffolding ()
+  "Test-harness packages for the BAKED ANSI gate runners only
+   (build-x64-linux / -x64 / -aarch64-ansi / -aarch64-linux / build-generic):
+   packages00-aux.lsp's FS-A..DS4, and CL-TEST as an alias of CL-USER (the
+   corpus is read in CL-USER at build time).  A shipped image runs test
+   suites UNMODIFIED, loaded at runtime, and they create their own packages
+   -- the alias made the real ansi-test's CL-TEST *be* CL-USER."
   ;; Set up test packages from packages00-aux.lsp
   (%defpackage-impl "FS-A" (list (list :use) (list :nicknames "FS-Q") (list :export "FOO")))
   (%defpackage-impl "FS-B" (list (list :use "FS-A") (list :export "BAR")))
@@ -2661,15 +2690,7 @@
         (cl-user (find-package "COMMON-LISP-USER")))
     (when (and tab cl-user)
       (puthash (compute-name-hash "CL-TEST") tab cl-user)))
-  ;; Register every standard CL symbol as external in the COMMON-LISP
-  ;; package. ANSI cl-symbols.lsp (978 tests) asserts each standard
-  ;; name is :external; without this they all report :internal / nil.
-  (%export-standard-cl-symbols))
-
-;;; The list of standard CL symbol names is consumed by
-;;; %export-standard-cl-symbols to populate the COMMON-LISP package.
-;;; Wrapped as a defun (not defvar) so the literal is built fresh each
-;;; call — MVM doesn't run defvar init-thunks at boot.
+  nil)
 (defun %standard-cl-symbol-names ()
   '(
     "&ALLOW-OTHER-KEYS" "&AUX" "&BODY" "&ENVIRONMENT" "&KEY" "&OPTIONAL"

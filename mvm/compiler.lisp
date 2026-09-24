@@ -784,6 +784,17 @@
       (setq *mvm-emit-halves* saved-halves))))
 
 
+(defvar *%defun-deferred* nil
+  "T while compiling code that runs only CONDITIONALLY (an IF branch -- and so
+   WHEN/UNLESS/COND/AND/OR/CASE) or only when CALLED (a LAMBDA body).  A DEFUN
+   reached there takes effect when execution reaches it: CLHS evaluates
+   forms in order, so a DEFUN of F guarded by (unless (fboundp 'f) ...) must not replace an
+   existing F.  The in-image persistence path installed EVERY compiled DEFUN
+   when its module loaded -- even under (when nil ...) -- which is how the
+   unmodified ansi-test's compile-and-load.lsp replaced COMPILE-FILE-PATHNAME
+   with its own fallback.  Saved/restored with SETQ, not LET (see
+   *MVM-GENSYM-COUNTER*).")
+
 (defvar *e2-persist-defuns* nil
   "COMPILER-RECORDED DEFUN PERSISTENCE (in-image ONLY, *mvm-eval-runtime-p*
    gated).  mvm-eval-forms' pre-scan walks the RAW forms for top-level DEFUNs to
@@ -6521,6 +6532,38 @@
       ;; expansion).  Now we recognise nested DEFUN like the toplevel
       ;; path does and yield NIL into DEST (defun's value isn't used in
       ;; expression contexts).  Probe 9795 captures the original bug.
+      ;; DEFUN reached where it runs only conditionally or when called (see
+      ;; *%DEFUN-DEFERRED*), or inside a function body other than the eval
+      ;; thunk: it takes effect when EXECUTED -- install a closure then.
+      ((and (= op-name 238798923)   ; DEFUN
+            *mvm-eval-runtime-p*
+            (symbolp (cadr form))
+            (consp (cddr form))
+            (or *%defun-deferred*
+                (and (stringp *current-function-name*)
+                     (not (string= *current-function-name* "%MVM-EVAL-THUNK")))
+                ;; LET-over-DEFUN: the persist path installs the function
+                ;; with an EMPTY environment, so a DEFUN of F reading X inside (let ((x 5)) ...)
+                ;; read X unbound.  A closure captures it.
+                (and env (compile-env-bindings env))))
+       (let* ((name (cadr form))
+              (ll (caddr form))
+              (body (cdddr form))
+              (decls nil))
+         ;; leading docstring / declarations stay outside the BLOCK
+         (loop
+           (cond ((and (stringp (car body)) (cdr body)) (setq body (cdr body)))
+                 ((and (consp (car body)) (symbolp (caar body))
+                       (string= (symbol-name (caar body)) "DECLARE"))
+                  (setq decls (cons (car body) decls)) (setq body (cdr body)))
+                 (t (return nil))))
+         (compile-form
+          (list 'progn
+                (list 'set-symbol-function (list 'quote name)
+                      (append (list 'lambda ll) (reverse decls)
+                              (list (append (list 'block name) body))))
+                (list 'quote name))
+          env dest)))
       ((= op-name 238798923)   ; DEFUN
        (let* ((raw-name (cadr form))
               (params   (caddr form))
@@ -8618,14 +8661,17 @@
     (let ((else-label (make-compiler-label))
           (end-label (make-compiler-label)))
       (%compile-test-branch test env dest else-label)
-      ;; Then branch
-      (compile-form then env dest)
-      (emit-ir :br end-label)
-      ;; Else branch
-      (emit-ir-label else-label)
-      (if else
-          (compile-form else env dest)
-          (compile-nil dest))
+      (let ((%dd-saved *%defun-deferred*))
+        (setq *%defun-deferred* t)
+        ;; Then branch
+        (compile-form then env dest)
+        (emit-ir :br end-label)
+        ;; Else branch
+        (emit-ir-label else-label)
+        (if else
+            (compile-form else env dest)
+            (compile-nil dest))
+        (setq *%defun-deferred* %dd-saved))
       ;; Join
       (emit-ir-label end-label))))
 
@@ -8638,12 +8684,15 @@
     (let ((else-label (make-compiler-label))
           (end-label (make-compiler-label)))
       (%compile-test-branch test env dest else-label)
-      (%compile-statement then env dest)
-      (emit-ir :br end-label)
-      (emit-ir-label else-label)
-      (if else
-          (%compile-statement else env dest)
-          (compile-nil dest))
+      (let ((%dd-saved *%defun-deferred*))
+        (setq *%defun-deferred* t)
+        (%compile-statement then env dest)
+        (emit-ir :br end-label)
+        (emit-ir-label else-label)
+        (if else
+            (%compile-statement else env dest)
+            (compile-nil dest))
+        (setq *%defun-deferred* %dd-saved))
       (emit-ir-label end-label))))
 
 ;;; ============================================================
@@ -11380,6 +11429,15 @@
           (cons (list '&rest args-var) inner))))))
 
 (defun compile-lambda (params body env dest)
+  "Compile (lambda (params) body*) with *%DEFUN-DEFERRED* set: a DEFUN in a
+   lambda body takes effect only when the body runs.  See %COMPILE-LAMBDA-1."
+  (let ((%dd-saved *%defun-deferred*))
+    (setq *%defun-deferred* t)
+    (let ((%dd-result (%compile-lambda-1 params body env dest)))
+      (setq *%defun-deferred* %dd-saved)
+      %dd-result)))
+
+(defun %compile-lambda-1 (params body env dest)
   "Compile (lambda (params) body*).
    Creates a named function for the lambda body. Registers it in the
    function table so FN-ADDR can resolve the bytecode offset to a
@@ -11394,7 +11452,7 @@
    host/native build path is byte-identical."
   (when (and *mvm-eval-runtime-p* (%macro-lambda-list-p params))
     (let ((tx (%transform-macro-lambda-list params body)))
-      (return-from compile-lambda
+      (return-from %compile-lambda-1
         (compile-lambda (car tx) (cdr tx) env dest))))
   ;; &key transform is ON for lambdas (T = allow-key-transform).  The
   ;; transform rewrites a (&key ...) lambda into a &rest catch var + a
@@ -24222,6 +24280,7 @@
     ;; LET here would make every %MVM-GENSYM read 0 and return the SAME name.
     ;; (Same reason *init-thunk-names* is not let-bound — see the note below.)
     (setq *mvm-gensym-counter* 0)
+    (setq *%defun-deferred* nil)
     ;; NOTE: *init-thunk-names* is intentionally NOT let-bound here.  It is
     ;; PUSH-mutated from the defvar/defparameter handler in mvm-compile-toplevel
     ;; (a DIFFERENT function called during phase 1) and read back below to

@@ -787,6 +787,7 @@
   ;; Initialize package system (creates CL, CL-USER, KEYWORD, test packages)
   ;; %init-packages's last step IS %export-standard-cl-symbols.
   (%init-packages)
+  (%init-ansi-test-scaffolding)   ; test packages + CL-TEST alias: harness images only
 
   ;; Initialize standard streams
   (%init-streams)
@@ -1286,6 +1287,19 @@
 (defun %sys-open-create-excl (path-str)
   (%string-to-cstr path-str *cstr-scratch*)
   (%aarch64-openat *cstr-scratch* 193 420))
+;; getcwd(2) is syscall 17 here (cl-fileio's default is x86-64's 79).
+(defun %sys-getcwd ()
+  (let* ((buf *io-buf-addr*)
+         (ret (syscall3 17 buf 1000 0)))
+    (if (<= ret 0)
+        nil
+        (let ((out (make-string-output-stream)) (i 0))
+          (loop
+            (let ((c (mem-ref (+ buf i) :u8)))
+              (when (or (= c 0) (>= i 1000)) (return nil))
+              (%print-char c out))
+            (setq i (+ i 1)))
+          (get-output-stream-string out)))))
 (defun %sys-unlink (path-str)
   (%string-to-cstr path-str *cstr-scratch*)
   (%aarch64-unlinkat *cstr-scratch* 0 0))

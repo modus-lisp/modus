@@ -188,6 +188,19 @@
 (defun %sys-read-raw (fd buf-addr count) (syscall3 3 fd buf-addr count))
 (defun %sys-write-raw (fd buf-addr count) (syscall3 4 fd buf-addr count))
 (defun %sys-lseek (fd offset whence) (syscall3 19 fd offset whence))
+;; getcwd(2) is syscall 183 here (cl-fileio's default is x86-64's 79).
+(defun %sys-getcwd ()
+  (let* ((buf *io-buf-addr*)
+         (ret (syscall3 183 buf 1000 0)))
+    (if (<= ret 0)
+        nil
+        (let ((out (make-string-output-stream)) (i 0))
+          (loop
+            (let ((c (mem-ref (+ buf i) :u8)))
+              (when (or (= c 0) (>= i 1000)) (return nil))
+              (%print-char c out))
+            (setq i (+ i 1)))
+          (get-output-stream-string out)))))
 (defun %sys-unlink (path-str)
   (%string-to-cstr path-str *cstr-scratch*)
   (syscall3 10 *cstr-scratch* 0 0))

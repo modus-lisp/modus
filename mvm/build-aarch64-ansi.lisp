@@ -1279,6 +1279,7 @@
   ;; Initialize package system (creates CL, CL-USER, KEYWORD, test packages)
   ;; %init-packages's last step IS %export-standard-cl-symbols.
   (%init-packages)
+  (%init-ansi-test-scaffolding)   ; test packages + CL-TEST alias: harness images only
 
   ;; Initialize standard streams
   (%init-streams)

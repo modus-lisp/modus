@@ -1482,11 +1482,51 @@
     (if (%sys-stat-exists path) path nil)))
 
 ;;; --- truename ---
+(defun %sys-getcwd ()
+  "The process's current directory as a string, or NIL.  getcwd(2) is
+   syscall 79 on x86-64; the i386 and aarch64 CLIs override this."
+  (if (%cab-on)
+      "/"
+      (let* ((buf (%fs-io-page))
+             (ret (syscall3 79 buf 4000 0)))
+        (if (<= ret 0)
+            nil
+            (let ((out (make-string-output-stream)) (i 0))
+              (loop
+                (let ((c (mem-ref (+ buf i) :u8)))
+                  (when (or (= c 0) (>= i 4000)) (return nil))
+                  (%print-char c out))
+                (setq i (+ i 1)))
+              (get-output-stream-string out))))))
+
+(defun %absolute-path-string (path)
+  "PATH (a namestring) made absolute against the current directory."
+  (if (and (> (length path) 0) (= (char-code (char path 0)) 47))
+      path
+      (let ((cwd (%sys-getcwd)))
+        (if (null cwd)
+            path
+            (let ((rel (if (and (> (length path) 1)
+                                (= (char-code (char path 0)) 46)
+                                (= (char-code (char path 1)) 47))
+                           (subseq path 2)
+                           path)))
+              (concatenate 'string cwd
+                           (if (and (> (length cwd) 0)
+                                    (= (char-code (char cwd (- (length cwd) 1))) 47))
+                               "" "/")
+                           rel))))))
+
 (defun truename (x)
-  "Return the truename of a file (simplified: just return path)."
+  "CLHS 20.2: the truename of the file X names -- an ABSOLUTE pathname.
+   Signals FILE-ERROR when there is no such file.  (It used to return the
+   argument's relative namestring and signal SIMPLE-ERROR; a relative
+   *LOAD-TRUENAME* made the unmodified ansi-test merge a chapter directory
+   onto itself: objects/objects/...)"
   (let ((path (%resolve-path (pathname x))))
-    (if (%sys-stat-exists path) path
-        (error "File does not exist: ~A" path))))
+    (if (%sys-stat-exists path)
+        (pathname (%absolute-path-string path))
+        (error 'file-error :pathname x))))
 
 ;;; --- delete-file ---
 (defun delete-file (x)

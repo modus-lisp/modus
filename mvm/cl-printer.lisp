@@ -4126,7 +4126,17 @@
                                    (setq pos2 p)
                                    (let ((nc (%prim-aref control p)))
                                      (cond
-                                       ((= nc 91) (setq depth (+ depth 1)) (setq pos2 (+ p 1)))
+                                       ;; Every bracketing directive nests,
+                                       ;; not just ~[: a ~; or ~:; inside a
+                                       ;; nested ~<...~>, ~{...~} or ~(...~)
+                                       ;; belongs to THAT construct.  RT's own
+                                       ;; report, ~@[~<~%~:; ~:@(~S~)~>~], split
+                                       ;; at the justification's ~:; and printed
+                                       ;; "~<" + newline for every test.
+                                       ((or (= nc 91) (= nc 60) (= nc 123) (= nc 40))
+                                        (setq depth (+ depth 1)) (setq pos2 (+ p 1)))
+                                       ((or (= nc 62) (= nc 125) (= nc 41))
+                                        (setq depth (- depth 1)) (setq pos2 (+ p 1)))
                                        ((= nc 93)
                                         (setq depth (- depth 1))
                                         (cond

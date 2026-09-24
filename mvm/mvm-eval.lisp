@@ -2988,6 +2988,7 @@
       ;; name (post-macroexpansion) onto it.  setq, not let (compiled let of
       ;; a special is unreliable in-image — see *mvm-emit-halves*).
       (setq *e2-persist-defuns* nil)
+      (setq *%defun-deferred* nil)
       ;; Task #244: publish the pre-scanned module defun names for the
       ;; duration of the compile loop, so `#'LATER-FN' inside an EARLIER
       ;; function of this same module is recognised as in-module and

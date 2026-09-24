@@ -5769,7 +5769,8 @@
                        (setq *load-error-condition* c)
                        eof-marker))))
         (when (eq form eof-marker) (return t))
-        (let ((val (handler-case (eval form)
+        (let ((val (handler-case (handler-bind ((warning #'%load-report-warning))
+                                   (eval form))
                      (t (c)
                         (%report-escaping-condition "load-toplevel-form-swallowed")
                         (setq *load-error-condition* c)
@@ -5785,6 +5786,20 @@
               (t (c) nil)))
           (setq result val))))
     result))
+
+(defun %load-report-warning (c)
+  "An unhandled WARNING during LOAD: report it and let the form CONTINUE
+   (CLHS 9.2 WARN).  The per-form HANDLER-CASE below has a T clause, which
+   also caught warnings -- aborting the rest of the form and reporting the
+   warning as an UNHANDLED-ESCAPE (the real ansi-test's 'Redefining test'
+   warning did exactly that)."
+  (handler-case
+      (let ((out (symbol-value '*error-output*)))
+        (write-string "WARNING: " out)
+        (princ c out)
+        (write-char (code-char 10) out))
+    (t (e) nil))
+  (muffle-warning c))
 
 (defun %load-bind-pkg-rt-stream (stream verbose print)
   "%LOAD-FROM-STREAM with *PACKAGE* and *READTABLE* BOUND around it, per
@@ -5854,8 +5869,11 @@
                   (t (error 'file-error :pathname path))))
                (t
                 (unwind-protect
-                     (let ((*load-pathname* path)
-                           (*load-truename* path)
+                     ;; CLHS 23.2: *LOAD-PATHNAME* is (pathname (merge-pathnames
+                     ;; filespec)); *LOAD-TRUENAME* is its (absolute) truename.
+                     (let ((*load-pathname* (pathname (merge-pathnames path)))
+                           (*load-truename* (handler-case (truename path)
+                                              (t (c) (pathname path))))
                            (*load-print* print)
                            (*load-verbose* verbose))
                        (declare (special *load-pathname* *load-truename*

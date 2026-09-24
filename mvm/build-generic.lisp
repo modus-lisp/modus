@@ -523,6 +523,7 @@
   (init-symbol-table)
   (init-keyword-table)
   (%init-packages)
+  (%init-ansi-test-scaffolding)   ; test packages + CL-TEST alias: harness images only
   (%init-streams)
   (%init-reader)
   (%init-condition-types)

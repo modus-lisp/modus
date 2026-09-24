@@ -801,6 +801,22 @@
          (%make-closure #'%interp-macro-shim (cons raw nil)))
         (t (%make-closure #'%macro-expander-shim (cons raw nil)))))))
 
+(defun %shadows-cl-name-p (sym)
+  "T when SYM is NOT a COMMON-LISP symbol but has the name of an external
+   one -- e.g. ansi-test's CL-TEST::HANDLER-CASE, which shadows
+   CL:HANDLER-CASE and is defined as (let () (cl:handler-case ...)).  Such a
+   macro must be registered ONLY per package: the bare-name entry is the
+   fallback every lookup of the CL macro lands on, and overwriting it made
+   CL:HANDLER-CASE expand to the user macro, which expands to
+   CL:HANDLER-CASE ... until the stack overflowed (SIGSEGV loading the
+   unmodified suite's universe.lsp)."
+  (let ((pn (%macro-sym-pkg-name sym)))
+    (and pn
+         (not (string= pn "COMMON-LISP"))
+         (multiple-value-bind (s status) (find-symbol (symbol-name sym) "COMMON-LISP")
+           (declare (ignore s))
+           (eq status :external)))))
+
 (defun set-macro-function (sym fn &rest env)
   "Install FN as the macro expander for SYM.  Accepts CL symbols, native
    MVM #x50 symbols (keyed by symbol object itself when symbol-name is
@@ -829,7 +845,8 @@
          ;; so every legacy bare-name lookup keeps working.
          (%macro-pkg-put sym key real-fn)
          (%mexp-memo-invalidate)
-         (puthash key *macro-function-table* real-fn)
+         (unless (%shadows-cl-name-p sym)
+           (puthash key *macro-function-table* real-fn))
          real-fn)))
     ;; 2-arg shape (sym, fn) — the original contract.
     ((null env)
@@ -839,7 +856,8 @@
            (setq *macro-function-table* (make-hash-table)))
          (%macro-pkg-put sym key fn)
          (%mexp-memo-invalidate)
-         (puthash key *macro-function-table* fn)
+         (unless (%shadows-cl-name-p sym)
+           (puthash key *macro-function-table* fn))
          fn)))
     ;; 4+ args — illegal.
     (t (%signal-program-error))))
@@ -1908,6 +1926,11 @@
          (dotimes (i len) (aset s i (wrapper-aref x i)))
          s)))
     ((%prim-stringp x) x)
+    ;; NIL and T are symbols -- string designators for "NIL" and "T" (CLHS
+    ;; glossary).  They are immediates, not heap symbols, so no later arm
+    ;; recognised them: (string-upcase t) was "".
+    ((null x) "NIL")
+    ((eq x t) "T")
     ((%cl-sym-p x) (%cl-sym-name x))
     ((characterp x)
      (let ((s (%make-string-array 1)))
@@ -4062,43 +4085,139 @@
   nil)
 
 ;;; ============================================================
-;;; COMPILE-FILE — CLHS §compile-file: compile FILE (a pathname
-;;; designator) and produce an output file.  Modus does not implement
-;;; FASL compilation; this is a "honest stub" that:
-;;;   (a) signals when called with 0 args (compile-file.error.1)
-;;;   (b) signals when given a nonexistent input file (compile-file.36)
-;;; Both are CLHS-mandated error cases.  Adding a real defun lets the
-;;; compiler's compile-call arity check fire and lets us perform the
-;;; nonexistent-file check at runtime.  Without a defun, calls resolve
-;;; to %UNRESOLVED-FN (silently returns NIL), so HANDLER-CASE never
-;;; sees the error.
-(defun compile-file (file &rest args)
-  "Stub: signal FILE-ERROR if FILE does not exist; otherwise signal an
-   error indicating compile-file is not implemented.  We don't actually
-   compile.  Modus's runtime compile pipeline lives in mvm/cross.lisp on
-   the build host, not in the runtime image."
-  (declare (ignore args))
-  ;; Nonexistent-file check first so compile-file.36 catches the
-  ;; expected FILE-ERROR.
-  (let ((s (handler-case (open file :direction :input)
-             (t (c) nil))))
-    (if s
-        (progn (close s)
-               ;; File exists but we can't compile it.  Signal a
-               ;; generic error so the user knows.
-               (error "compile-file: runtime compile not implemented"))
-        ;; File doesn't exist — signal file-error.
-        (error "compile-file: nonexistent file"))))
+;;; COMPILE-FILE — CLHS 3.2.4 / compile-file.
+;;;
+;;; Modus has no FASL format: code loaded at runtime is compiled by LOAD
+;;; itself (mvm-eval).  So the "compiled file" is the source TEXT, copied
+;;; verbatim to the output file, which LOAD then processes like any other.
+;;; That is a conforming COMPILE-FILE -- CLHS requires an output file that
+;;; LOAD can load -- and it performs the compile-time side effects CLHS
+;;; 3.2.3.1 requires while READING the input: top-level IN-PACKAGE /
+;;; DEFPACKAGE and (EVAL-WHEN (:COMPILE-TOPLEVEL ...)) bodies are evaluated
+;;; at compile time, with *COMPILE-FILE-PATHNAME* / -TRUENAME* bound.
+;;; Returns (values output-truename warnings-p failure-p).
+;;;
+;;; It used to be a stub that always signalled, which is why the unmodified
+;;; ansi-test's own loader (compile-and-load of rt.lsp) could not start.
+;;; ============================================================
 
-;;; COMPILE-FILE-PATHNAME — CLHS §compile-file-pathname: returns the
-;;; output truename a corresponding COMPILE-FILE would write.  Modus
-;;; doesn't produce FASLs, but tests still call this for the merged
-;;; pathname.  Return the input as a fake "compiled" pathname.
+(defvar *compile-file-pathname* nil)
+(defvar *compile-file-truename* nil)
+(defvar *compile-print* nil)
+(defvar *compile-verbose* nil)
+(defvar *macroexpand-hook* 'funcall)
+(defvar *debugger-hook* nil)
+(defvar *break-on-signals* nil)
+;; REPL history variables (CLHS 25.1.1): standard, so they must be bound.
+(defvar - nil)
+(defvar + nil)
+(defvar ++ nil)
+(defvar +++ nil)
+(defvar * nil)
+(defvar ** nil)
+(defvar *** nil)
+(defvar / nil)
+(defvar // nil)
+(defvar /// nil)
+
 (defun compile-file-pathname (file &rest args)
-  "Stub: return FILE unchanged.  Real impl would substitute a .fas
-   extension."
-  (declare (ignore args))
-  file)
+  "The pathname COMPILE-FILE would write: FILE with type \"fasl\", merged
+   under :OUTPUT-FILE when one is given."
+  (let ((out (getf args :output-file))
+        (default (make-pathname :type "fasl" :defaults (merge-pathnames file))))
+    (if out (merge-pathnames out default) default)))
+
+(defun %compile-file-toplevel-effects (form)
+  "CLHS 3.2.3.1: the compile-time effects of a top-level FORM."
+  (when (consp form)
+    (let ((head (car form)))
+      (cond
+        ((and (symbolp head)
+              (or (string= (symbol-name head) "IN-PACKAGE")
+                  (string= (symbol-name head) "DEFPACKAGE")))
+         (eval form))
+        ((and (symbolp head) (string= (symbol-name head) "PROGN"))
+         (dolist (f (cdr form)) (%compile-file-toplevel-effects f)))
+        ((and (symbolp head) (string= (symbol-name head) "EVAL-WHEN")
+              (consp (cdr form)))
+         (let ((situations (cadr form)))
+           (if (or (member :compile-toplevel situations)
+                   (member 'compile situations))
+               (dolist (f (cddr form)) (eval f))
+               (when (or (member :load-toplevel situations)
+                         (member 'load situations))
+                 (dolist (f (cddr form)) (%compile-file-toplevel-effects f))))))
+        (t nil)))))
+
+(defun compile-file (file &rest args)
+  (let* ((in-path (merge-pathnames file))
+         (in-true (truename in-path))          ; FILE-ERROR if absent
+         (out-path (compile-file-pathname in-path :output-file (getf args :output-file)))
+         (*compile-file-pathname* in-path)
+         (*compile-file-truename* in-true)
+         (*package* *package*))
+    (declare (special *compile-file-pathname* *compile-file-truename*))
+    ;; Compile-time effects, in order, with *PACKAGE* tracking IN-PACKAGE.
+    (with-open-file (in in-true :direction :input)
+      (loop
+        (let ((form (read in nil in)))
+          (when (eq form in) (return nil))
+          (%compile-file-toplevel-effects form))))
+    ;; The output: the source text itself.
+    (with-open-file (in in-true :direction :input)
+      (with-open-file (out out-path :direction :output :if-exists :supersede)
+        (loop
+          (let ((line (read-line in nil nil)))
+            (when (null line) (return nil))
+            (write-string line out)
+            (terpri out)))))
+    (values (truename out-path) nil nil)))
+
+;;; Function objects for array accessors the compiler otherwise only
+;;; inlines, so #'AREF / (FUNCALL 'SVREF ...) / (APPLY #'AREF ...) work.
+;;; The calls inside are compiled inline, so none of these recurses.
+(defun aref (array &rest subscripts)
+  (if (and subscripts (null (cdr subscripts)))
+      (aref array (car subscripts))
+      (apply #'%aref-multi-public (cons array subscripts))))
+(defun svref (vector index) (svref vector index))
+(defun arrayp (object) (arrayp object))
+(defun array-in-bounds-p (array &rest subscripts)
+  (let ((dims (array-dimensions array)))
+    (unless (= (length dims) (length subscripts))
+      (error "ARRAY-IN-BOUNDS-P: ~D subscripts for an array of rank ~D"
+             (length subscripts) (length dims)))
+    (let ((ok t) (d dims) (sub subscripts))
+      (loop
+        (when (null d) (return ok))
+        (let ((i (car sub)))
+          (unless (and (integerp i) (>= i 0) (< i (car d))) (setq ok nil)))
+        (setq d (cdr d))
+        (setq sub (cdr sub))))))
+
+;;; Y-OR-N-P / YES-OR-NO-P (CLHS 21.2): ask on *QUERY-IO* until answered.
+(defun %yes-no-query (args full-word-p)
+  (let ((io (or (symbol-value '*query-io*) (symbol-value '*terminal-io*)
+                (symbol-value '*standard-output*))))
+    (loop
+      (when (car args)
+        (fresh-line io)
+        (apply #'format (cons io args)))
+      (write-string (if full-word-p " (yes or no) " " (y or n) ") io)
+      (force-output io)
+      (let ((line (read-line io nil nil)))
+        (when (null line) (return nil))
+        (let ((ans (string-trim " " line)))
+          (cond
+            (full-word-p
+             (cond ((string-equal ans "yes") (return t))
+                   ((string-equal ans "no") (return nil))))
+            ((and (> (length ans) 0) (char-equal (char ans 0) (code-char 121)))
+             (return t))
+            ((and (> (length ans) 0) (char-equal (char ans 0) (code-char 110)))
+             (return nil))))))))
+(defun y-or-n-p (&rest args) (%yes-no-query args nil))
+(defun yes-or-no-p (&rest args) (%yes-no-query args t))
 
 ;;; ============================================================
 ;;; TIME — CLHS §time: evaluate FORM and print timing info to

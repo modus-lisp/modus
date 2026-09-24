@@ -157,7 +157,13 @@ failure.  Please fix mvm/build-checks.lisp.~%" ,name c)
 (defvar *global-check-init-allowlist*
   '(;; INIT-ALL-GLOBALS is the generated aggregate; it is *called* by boot, not
     ;; defined in source, but a build script may also define a shim.
-    "INIT-ALL-GLOBALS")
+    "INIT-ALL-GLOBALS"
+    ;; Deliberately called ONLY by the baked ANSI gate runners (and
+    ;; build-generic): it creates the harness's test packages and the CL-TEST
+    ;; -> CL-USER alias, which a shipped image must NOT have -- the unmodified
+    ;; ansi-test loaded at runtime creates its own CL-TEST.  Unreachable in
+    ;; every other image by design.
+    "%INIT-ANSI-TEST-SCAFFOLDING")
   "Upcased defun-name strings exempt from check B.")
 
 ;;; ------------------------------------------------------------------

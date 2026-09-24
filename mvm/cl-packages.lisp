@@ -452,6 +452,22 @@
 (defun list-all-packages ()
   *all-packages*)
 
+(defun %cl-test-alias-installed-p ()
+  "T only when %INIT-ANSI-TEST-SCAFFOLDING (the BAKED ANSI gate runners) has
+   spliced CL-TEST -> COMMON-LISP-USER into the package-by-hash table.  In a
+   generic image there is no such entry, so the real ansi-test's own
+   (make-package :cl-test) creates a real package; with the alias it
+   returned CL-USER, every DEFTEST it read was Modus's built-in one, and its
+   DO-TESTS found 0 tests.  No special variable and no BOUNDP here: this is
+   FIND-PACKAGE, reached before globals are initialised, and BOUNDP can
+   itself look packages up."
+  (let ((tab (mem-ref #x10000170 :u64)))
+    (and tab
+         (let ((hit (gethash (compute-name-hash "CL-TEST") tab)))
+           (and hit (%pkg-p hit)
+                (let ((nm (%pkg-name hit)))
+                  (and nm (string= nm "COMMON-LISP-USER"))))))))
+
 (defun find-package (name)
   "Find package by name or nickname.
 
@@ -478,7 +494,9 @@
        (when *pkg-any-local-nicknames*
          (let ((local (%pkg-lookup-local-nickname name-str *package*)))
            (when local (return-from find-package local))))
-       (when (and name-str (string-equal name-str "CL-TEST"))
+       (when (and name-str
+                  (string-equal name-str "CL-TEST")
+                  (%cl-test-alias-installed-p))
          (let ((clu (find-package-1 "COMMON-LISP-USER")))
            (when clu (return-from find-package clu))))
        (find-package-1 name-str)))))

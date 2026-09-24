@@ -1133,6 +1133,16 @@
     (loop
       (when (null cur) (return nil))
       (let ((frame (car cur)))
+        ;; A HANDLER-CASE barrier (see %HC-BARRIER-WRAP in compiler.lisp):
+        ;; if its clauses take this condition, it is the most recent
+        ;; applicable handler -- transfer to it now; the older frames below
+        ;; it are never consulted.  Otherwise it is transparent.
+        (when (eq (car frame) :%hc-barrier)
+          (dolist (ty (cdr frame))
+            (when (%type-matches-condition-p ty cond-obj)
+              (setq *current-condition* cond-obj)
+              (%hc-longjmp)))
+          (setq frame nil))
         (dolist (handler frame)
           (let ((htype (car handler))
                 (hfn (cadr handler)))
@@ -1171,6 +1181,17 @@
       (setq cur (cdr cur))
       (setq frame-idx (+ frame-idx 1)))
     nil))
+
+(defun %hc-barrier-push (types)
+  "Push a HANDLER-CASE barrier for TYPES; return the previous stack."
+  (let ((prev *handler-bind-stack*))
+    (setq *handler-bind-stack* (cons (cons :%hc-barrier types) prev))
+    prev))
+
+(defun %hc-barrier-pop (prev)
+  "Restore *HANDLER-BIND-STACK* to PREV (what %HC-BARRIER-PUSH returned)."
+  (setq *handler-bind-stack* prev)
+  nil)
 
 (defun %type-matches-condition-p (type-spec cond-obj)
   "Check if COND-OBJ matches TYPE-SPEC (a condition type name or compound spec)."

@@ -6905,7 +6905,12 @@
        (compile-multiple-value-list (cadr form) env dest))
       ;; HANDLER-CASE — setjmp/longjmp error catching
       ((= op-name 319400726)  ; HANDLER-CASE
-       (compile-handler-case (cadr form) (cddr form) env dest nil))
+       (let ((clauses (cddr form)))
+         (if (and (consp clauses) (equal (car clauses) '(:%no-barrier)))
+             (compile-handler-case (cadr form) (cdr clauses) env dest nil)
+             (if (and *mvm-eval-runtime-p* (%hc-barrier-types clauses))
+                 (compile-form (%hc-barrier-wrap (cadr form) clauses) env dest)
+                 (compile-handler-case (cadr form) clauses env dest nil)))))
       ;; HANDLER-BIND — expand to the runtime %with-handler-bind
       ;; (cl-conditions.lisp).  Same shape the build-time rewriter
       ;; (build-x64-linux.lisp) and the tree-walker (cl-eval.lisp) use,
@@ -8290,6 +8295,47 @@
          env dest)
         (compile-form `(progn ,@body) env dest))))
 
+;;; HANDLER-CASE BARRIERS (CLHS 9.1.4).  Handlers are searched in DYNAMIC
+;;; order, and HANDLER-CASE is a HANDLER-BIND whose handler exits.  Modus keeps
+;;; handler-bind frames on *HANDLER-BIND-STACK* and handler-case frames on the
+;;; setjmp stack, and %SIGNAL-CONDITION only ever saw the first -- so an OUTER
+;;; handler-bind ran BEFORE an inner handler-case (rt's DO-ENTRY aborted every
+;;; test whose own handler-case should have caught its error), and SIGNAL /
+;;; WARN never transferred to a handler-case at all.  A runtime handler-case
+;;; now pushes a BARRIER frame (:%HC-BARRIER . clause-types) onto that stack for
+;;; the extent of its body; the walk stops at the first barrier whose types
+;;; match and longjmps to it.  The UNWIND-PROTECT pops it on every exit
+;;; (normal, lexical, longjmp through), and each clause body pops it FIRST so
+;;; a signal from inside the clause searches the handlers outside the
+;;; handler-case.  (:%NO-BARRIER) marks the inner form so it is not rewritten
+;;; again.  Build-time (image) handler-cases are not rewritten yet.
+(defun %hc-barrier-types (clauses)
+  "The condition type specs of CLAUSES (not :NO-ERROR), or NIL if none."
+  (let ((types nil))
+    (dolist (c clauses)
+      (when (and (consp c)
+                 (not (and (keywordp (car c))
+                           (string= (symbol-name (car c)) "NO-ERROR"))))
+        (push (car c) types)))
+    (nreverse types)))
+
+(defun %hc-barrier-wrap (body clauses)
+  (let ((prev (%mvm-gensym "HCB")))
+    `(let ((,prev (%hc-barrier-push ',(%hc-barrier-types clauses))))
+       (unwind-protect
+           (handler-case ,body
+             (:%no-barrier)
+             ,@(mapcar
+                (lambda (c)
+                  (if (and (consp c)
+                           (not (and (keywordp (car c))
+                                     (string= (symbol-name (car c)) "NO-ERROR"))))
+                      (multiple-value-bind (decls rest) (%split-body-decls (cddr c))
+                        `(,(car c) ,(cadr c) ,@decls (%hc-barrier-pop ,prev) ,@rest))
+                      c))
+                clauses))
+         (%hc-barrier-pop ,prev)))))
+
 (defun compile-handler-case (body-form clauses env dest catch-frame-p)
   "Compile (handler-case body (type (var) handler-forms...))
    Uses setjmp/longjmp: saves state, runs body, catches errors.
@@ -8596,6 +8642,9 @@
                 (let ((,res-var ,protected-form))
                   (%rc-exit ,frame-var)
                   ,res-var)
+              ;; Machinery, not a handler: no barrier, or its T clause would
+              ;; hide every outer HANDLER-BIND from conditions in the body.
+              (:%no-barrier)
               (t (,cnd-var)
                 ,cnd-var
                 (%rc-catch-cleanup ,frame-var)

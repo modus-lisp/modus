@@ -318,7 +318,7 @@
              (list 'error ''type-error :datum place
                    :expected-type (list 'quote type))))"
     "(defmacro ignore-errors (&rest body)
-       (list 'handler-case (cons 'progn body) (list t (list 'c) (list 'values nil 'c))))"
+       (list 'handler-case (cons 'progn body) (list 'error (list 'c) (list 'values nil 'c))))"
     ;; NOT a PROGN: w-s-i-s must bind the whole printer/reader variable set
     ;; (notably *PRINT-CASE* to :UPCASE) around BODY.  Route to the existing
     ;; worker in mvm/cl-reader.lisp, which restores on both the normal and

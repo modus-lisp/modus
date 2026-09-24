@@ -934,6 +934,20 @@
 (defvar *cl-types-that-are-classes-symbols* nil)
 (defvar *cl-type-symbols* nil)
 (defvar *cl-symbol-names* nil)
+;; ...and then the REAL values.  The NIL stubs were not harmless:
+;; class-precedence-lists.lsp builds CLASS-PRECEDENCE-LIST-FOO's methods with
+;; #.(loop for s in *cl-types-that-are-classes-symbols* ...) at READ time, so
+;; a NIL list defined a generic function with no methods and all 71 of its
+;; tests failed (full-corpus census, 2026-09-23).  Only DEFPARAMETER forms are
+;; taken; the stubs above remain the fallback if the file cannot be read.
+(with-open-file (s "/home/claude/modus/tmp/ansi-test/auxiliary/cl-symbol-names.lsp"
+                   :if-does-not-exist nil)
+  (when s
+    (let ((*package* (find-package :cl-user)))
+      (loop (let ((f (handler-case (read s nil :eof) (error () :eof))))
+              (when (eq f :eof) (return))
+              (when (and (consp f) (eq (car f) 'defparameter))
+                (handler-case (eval f) (error () nil))))))))
 
 ;; Counter for generating unique slot-unbound method function names
 (defvar *slot-unbound-method-counter* 0)
@@ -4229,9 +4243,15 @@
                                   ;; unregistered (defclass-01 class-11/12).  Push
                                   ;; the WHOLE wrapper into init-forms so run-init-FILE
                                   ;; executes it and the captures resolve at runtime.
+                                  ;; SETQ/SETF too: defclass.lsp's
+                                  ;; DEFCLASS-WITH-TESTS expands to
+                                  ;; (setq *class-X-returned-by-defclass*
+                                  ;;       (defclass X ...)), so the class was
+                                  ;; never registered and 22 of its 23 tests
+                                  ;; failed (full-corpus census, 2026-09-23).
                                   (member (car form)
                                           '(let let* flet labels locally
-                                            symbol-macrolet macrolet))
+                                            symbol-macrolet macrolet setq setf))
                                   (%form-has-clos-reg-p form)
                                   ;; A reader/writer/accessor expands to a
                                   ;; nested (defun …); hoisting it into a

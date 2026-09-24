@@ -1248,26 +1248,37 @@
   (declare (ignore relative-to n args))
   nil)
 
-(defun pprint-fill (stream list &rest args)
-  "Print LIST elements separated by spaces, breaking onto newlines
-   if needed.  We approximate: just print space-separated."
-  (declare (ignore args))
-  (let ((s (%resolve-output-stream stream))
-        (first t))
-    (dolist (e list)
-      (unless first
-        (write-char-to-stream (code-char 32) s))
-      (setq first nil)
-      (write-to-stream e s)))
+(defun %pprint-seq (stream object colon-p)
+  "PPRINT-FILL / -LINEAR / -TABULAR without line breaking (there is no
+   layout engine yet).  CLHS 22.4: a non-list OBJECT is printed as if by
+   WRITE; a list prints its elements separated by spaces, inside parens when
+   COLON-P.  The old stubs DOLISTed OBJECT unconditionally (TYPE-ERROR on a
+   non-list) and never printed the parens, so every ~/pprint-linear/ call
+   failed: format-slash 0/19."
+  (let ((s (%resolve-output-stream stream)))
+    (if (not (listp object))
+        (write-to-stream object s)
+        (progn
+          (when colon-p (write-char-to-stream (code-char 40) s))
+          (let ((first t))
+            (dolist (e object)
+              (unless first (write-char-to-stream (code-char 32) s))
+              (setq first nil)
+              (write-to-stream e s)))
+          (when colon-p (write-char-to-stream (code-char 41) s)))))
   nil)
 
-(defun pprint-linear (stream list &rest args)
-  "Same approximation as pprint-fill — space-separated."
-  (apply #'pprint-fill stream list args))
+(defun pprint-fill (stream object &optional (colon-p t) at-sign-p)
+  (declare (ignore at-sign-p))
+  (%pprint-seq stream object colon-p))
 
-(defun pprint-tabular (stream list &rest args)
-  "Same approximation — space-separated."
-  (apply #'pprint-fill stream list args))
+(defun pprint-linear (stream object &optional (colon-p t) at-sign-p)
+  (declare (ignore at-sign-p))
+  (%pprint-seq stream object colon-p))
+
+(defun pprint-tabular (stream object &optional (colon-p t) at-sign-p tabsize)
+  (declare (ignore at-sign-p tabsize))
+  (%pprint-seq stream object colon-p))
 
 (defvar *%pprint-dispatch-table* nil)
 
@@ -3449,6 +3460,31 @@
 (defun set-cddr (x v) (set-cdr (cdr x) v) v)
 (defun set-caddr (x v) (set-car (cddr x) v) v)
 (defun set-cadddr (x v) (set-car (cdddr x) v) v)
+;; Every other 3- and 4-level C*R place (CLHS 5.1.2.2).  Only CADDR and
+;; CADDDR had setters, so (setf (caaar x) v) called an undefined SET-CAAAR:
+;; 44 cxr / cons-test-05 failures.
+(defun set-caaar (x v) (set-car (caar x) v) v)
+(defun set-caadr (x v) (set-car (cadr x) v) v)
+(defun set-cadar (x v) (set-car (cdar x) v) v)
+(defun set-cdaar (x v) (set-cdr (caar x) v) v)
+(defun set-cdadr (x v) (set-cdr (cadr x) v) v)
+(defun set-cddar (x v) (set-cdr (cdar x) v) v)
+(defun set-cdddr (x v) (set-cdr (cddr x) v) v)
+(defun set-caaaar (x v) (set-car (caaar x) v) v)
+(defun set-caaadr (x v) (set-car (caadr x) v) v)
+(defun set-caadar (x v) (set-car (cadar x) v) v)
+(defun set-caaddr (x v) (set-car (caddr x) v) v)
+(defun set-cadaar (x v) (set-car (cdaar x) v) v)
+(defun set-cadadr (x v) (set-car (cdadr x) v) v)
+(defun set-caddar (x v) (set-car (cddar x) v) v)
+(defun set-cdaaar (x v) (set-cdr (caaar x) v) v)
+(defun set-cdaadr (x v) (set-cdr (caadr x) v) v)
+(defun set-cdadar (x v) (set-cdr (cadar x) v) v)
+(defun set-cdaddr (x v) (set-cdr (caddr x) v) v)
+(defun set-cddaar (x v) (set-cdr (cdaar x) v) v)
+(defun set-cddadr (x v) (set-cdr (cdadr x) v) v)
+(defun set-cdddar (x v) (set-cdr (cddar x) v) v)
+(defun set-cddddr (x v) (set-cdr (cdddr x) v) v)
 
 ;;; ============================================================
 ;;; Random State

@@ -189,6 +189,15 @@
     ;; method (and any STRUCTURE-OBJECT specializer) dispatches on.
     ((%struct-instance-p obj)
      (%struct-cpl obj))
+    ;; Condition: its OWN type and every ancestor from the condition
+    ;; registry, then STANDARD-OBJECT T (kept for make-load-form.6/9, see
+    ;; %type-of-for-dispatch).  The fallback below knew only CONDITION, so a
+    ;; method on ARITHMETIC-ERROR / ERROR / SERIOUS-CONDITION never applied
+    ;; to an arithmetic-error: class-precedence-lists 62 of 71 failed.
+    ((%condition-p obj)
+     (let ((cpl (%condition-all-parents (%condition-type-name obj))))
+       (unless (member 'condition cpl) (setq cpl (append cpl (list 'condition))))
+       (append cpl (list 'standard-object 't))))
     (t
      (%builtin-cpl (%type-of-for-dispatch obj)))))
 
@@ -3655,6 +3664,21 @@
 ;;; Specializer matching
 ;;; ============================================================
 
+(defun %cpl-name-eq (c spec)
+  "EQ, or the same class name across the symbol-flavor drift
+   (%CLOS-CLASS-NAME-EQ).  The CPL of a CONDITION comes from the condition
+   registry, whose names are the runtime's own symbols, while a method's
+   specializer is whatever the caller's reader produced: 'SERIOUS-CONDITION
+   in user code is not EQ to the registry's, so a method on it never
+   applied.  The slot-0 name-hash compare gates the slow path, so the common
+   mismatch costs one AREF each."
+  (or (eq c spec)
+      (and (symbolp c) (symbolp spec)
+           (not (null c)) (not (eq c t))
+           (not (null spec)) (not (eq spec t))
+           (= (aref c 0) (aref spec 0))
+           (%clos-class-name-eq c spec))))
+
 (defun %specializer-matches-p (spec obj)
   "Return true if specializer SPEC matches OBJ.
    SPEC is a class name symbol, (eql val), or t."
@@ -3670,7 +3694,7 @@
          (loop
            (when (null cur) (return found))
            (let ((c (car cur)))
-             (when (eq c spec) (setq found t) (return found))
+             (when (%cpl-name-eq c spec) (setq found t) (return found))
              ;; FRAGILITY DIAG: detect the same-shape sixth bug.
              ;; If two symbols with the same name-hash failed to
              ;; compare eq, that's cross-function intern
@@ -3742,7 +3766,7 @@
                (let ((c cpl))
                  (loop
                    (when (null c) (return nil))
-                   (when (eq (car c) spec) (setq found t) (return nil))
+                   (when (%cpl-name-eq (car c) spec) (setq found t) (return nil))
                    (setq pos (+ pos 1))
                    (setq c (cdr c))))
                (if found
@@ -3766,7 +3790,7 @@
        (let ((c cpl))
          (loop
            (when (null c) (return nil))
-           (when (eq (car c) spec) (setq found t) (return nil))
+           (when (%cpl-name-eq (car c) spec) (setq found t) (return nil))
            (setq pos (+ pos 1))
            (setq c (cdr c))))
        (if found pos 10000)))))

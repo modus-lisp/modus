@@ -17824,6 +17824,78 @@
     (emit-ir-label done-label)
     (free-temp-reg)))
 
+;;; ARITY BAKED FROM AN EARLY DEFINITION.  compile-call decides arity and
+;;; &rest packing from *FUNCTIONS* as it stands when the CALL is compiled, but
+;;; calls bind to the LAST defun of a name.  prelude.lisp's 1-arg stub
+;;; (defun find-symbol (name) nil) is replaced by cl-packages.lisp's
+;;; (name &rest pkg-arg), so every 2-arg FIND-SYMBOL compiled in between -- in
+;;; cl-printer.lisp, cl-reader.lisp, ... -- was compiled to an UNCONDITIONAL
+;;; program-error (AUDIT-ARITY-BAKING below reports exactly these; it was
+;;; opt-in and nothing had fixed them).  Found as FORMAT ~/NAME/ signalling
+;;; PROGRAM-ERROR from AOT code while the identical runtime-compiled code
+;;; worked.  The pre-pass records every name DEFUNed at top level with more
+;;; than one lambda-list SHAPE; calls to those take the forward-reference path.
+(defvar *multi-shape-defuns* nil
+  "NIL or an EQUAL hash of symbol-name -> the FINAL definition's shape
+   (REQUIRED OPTIONAL REST-P KEY-P), set per MVM-COMPILE-ALL.")
+
+(defun %defun-arity-shape (ll)
+  "(REQUIRED OPTIONAL REST-P KEY-P) for a raw lambda list.  (Not named
+   %LAMBDA-LIST-SHAPE: cl-clos.lisp has one, and the compiler is baked into
+   the same image -- last-defun-wins would replace the CLOS version.)"
+  (let ((req 0) (opt 0) (rest-p nil) (key-p nil) (mode :req))
+    (dolist (x (if (listp ll) ll nil))
+      (let ((n (and (symbolp x) x (symbol-name x))))
+        (cond
+          ((and n (string= n "&OPTIONAL")) (setq mode :opt))
+          ((and n (or (string= n "&REST") (string= n "&BODY"))) (setq rest-p t) (setq mode :rest))
+          ((and n (string= n "&KEY")) (setq key-p t) (setq mode :key))
+          ((and n (> (length n) 0) (= (char-code (char n 0)) 38)) (setq mode :other))  ; &
+          ((eq mode :req) (setq req (+ req 1)))
+          ((eq mode :opt) (setq opt (+ opt 1)))
+          (t nil))))
+    (list req opt rest-p key-p)))
+
+(defun %collect-multi-shape-defuns (forms)
+  (let ((seen (make-hash-table :test 'equal))
+        (multi (make-hash-table :test 'equal)))
+    (labels ((walk (f)
+               (when (and (consp f) (symbolp (car f)))
+                 (let ((h (symbol-name (car f))))
+                   (cond
+                     ((or (string= h "PROGN") (string= h "EVAL-WHEN"))
+                      (dolist (g (if (string= h "EVAL-WHEN") (cddr f) (cdr f)))
+                        (walk g)))
+                     ((and (string= h "DEFUN") (consp (cdr f)) (symbolp (cadr f))
+                           (consp (cddr f)))
+                      (let* ((name (symbol-name (cadr f)))
+                             (shape (%defun-arity-shape (caddr f)))
+                             (prev (gethash name seen)))
+                        (when (and prev (not (equal prev shape)))
+                          (setf (gethash name multi) t))
+                        ;; value = the LAST definition's shape, filled below
+                        (setf (gethash name seen) shape))))))))
+      (dolist (f forms) (walk f)))
+    ;; A multi-shape name maps to its FINAL shape, which is what arity is
+    ;; checked against (the callee's prologue does not check required args).
+    (maphash (lambda (k v) (declare (ignore v))
+               (setf (gethash k multi) (gethash k seen)))
+             multi)
+    multi))
+
+(defun %final-shape-arity-error-p (name nargs)
+  "T when NAME is multi-shape and NARGS violates its FINAL definition."
+  (let ((sh (%multi-shape-defun-p name)))
+    (and (consp sh)
+         (or (< nargs (first sh))
+             (and (not (third sh)) (not (fourth sh))
+                  (> nargs (+ (first sh) (second sh))))))))
+
+(defun %multi-shape-defun-p (name)
+  (and *multi-shape-defuns*
+       (or (stringp name) (symbolp name))
+       (gethash (if (stringp name) name (symbol-name name)) *multi-shape-defuns*)))
+
 (defun compile-arity-error (env dest)
   "Emit a 0-arg call to %SIGNAL-PROGRAM-ERROR at runtime — used when an
    inlined CL primitive is called with the wrong number of arguments.
@@ -20884,6 +20956,31 @@
 ;;; Function Call
 ;;; ============================================================
 
+(defun %literal-arg-p (form)
+  "FORM evaluates to itself or a quoted constant: reading it can neither
+   cause nor observe a side effect."
+  (or (null form) (eq form t) (integerp form) (stringp form) (characterp form)
+      (keywordp form)
+      (and (consp form) (symbolp (car form))
+           (string= (symbol-name (car form)) "QUOTE"))))
+
+(defun %call-args-need-ordering-p (args env)
+  "T when compile-call's register/stack split would observably evaluate
+   ARGS out of order.  It evaluates the OVERFLOW args (index >=
+   +MAX-REG-ARGS+) first and the register args after them, so a 5+ argument
+   call whose later args have effects ran them before the earlier ones --
+   CLHS 3.1.2.1.2.3 requires left to right.  Found through the ANSI order-
+   of-evaluation tests (string-upcase / sublis / remove / make-list .order.)
+   once those calls stopped being &rest-packed."
+  (let ((overflow (nthcdr +max-reg-args+ args)))
+    (and overflow
+         (some (lambda (a) (not (or (%literal-arg-p a) (%leaf-operand-p a env))))
+               overflow)
+         ;; ...and something else that could observe or be observed by it
+         (let ((n 0))
+           (dolist (a args) (unless (%literal-arg-p a) (setq n (+ n 1))))
+           (>= n 2)))))
+
 (defun compile-call (fn args env dest)
   "Compile a function call (fn arg1 arg2 ...).
    Register args are saved to the stack during evaluation to avoid
@@ -20892,6 +20989,13 @@
    to prevent clobbering live variables in those registers."
   ;; Guard: args must be a proper list
   (unless (listp args) (setf args (list args)))
+  ;; Left-to-right evaluation for 5+ argument calls: bind the args in a LET
+  ;; (which evaluates its inits in order) and call with the variables, which
+  ;; are leaves -- so this does not recurse.  See %CALL-ARGS-NEED-ORDERING-P.
+  (when (%call-args-need-ordering-p args env)
+    (let ((vars (mapcar (lambda (a) (declare (ignore a)) (%mvm-gensym "ARG")) args)))
+      (return-from compile-call
+        (compile-form (list 'let (mapcar #'list vars args) (cons fn vars)) env dest))))
   ;; (declaim (inline FN)) at runtime: expand the call in place.
   (when (and *mvm-eval-runtime-p* (symbolp fn) *inline-fn-defs*
              (null (env-lookup-fn env (%rt-fn-name fn)))   ; a local FLET/LABELS FN wins
@@ -21097,6 +21201,12 @@
   ;; trailing NIL from a missing arg.  nil here means "use (length args)".
   (let ((static-rest-pack nil)
         (true-nargs nil))
+    (when (and (symbolp fn) (boundp '*functions*) *functions*
+               (not (env-lookup-fn env (%rt-fn-name fn)))
+               (%final-shape-arity-error-p (%rt-fn-name fn) (length args)))
+      ;; Multi-shape name called with an arity its FINAL definition rejects.
+      (compile-arity-error env dest)
+      (return-from compile-call))
     (when (and (symbolp fn) (boundp '*functions*) *functions*)
       (let* ((fn-name (%rt-fn-name fn))
              ;; Check for flet/labels name mapping.  A flet/labels binding
@@ -21105,7 +21215,17 @@
              ;; name at both bind and lookup — see compile-flet's base-name).
              (resolved-fn-name (or (env-lookup-fn env fn-name)
                                    (%fn-key-qualify fn fn-name)))
-             (fn-info (%fn-info-for-key resolved-fn-name)))
+             (fn-info (if (and (%multi-shape-defun-p fn-name)
+                               (not (env-lookup-fn env fn-name)))
+                          ;; Defined more than once with DIFFERENT lambda
+                          ;; lists: the entry here may be an EARLY definition
+                          ;; the final one replaces (last-defun-wins).  Treat
+                          ;; the signature as unknown -- the forward-reference
+                          ;; path: truthful nargs, the callee's own prologue
+                          ;; checks arity and builds &rest.  See
+                          ;; %COLLECT-MULTI-SHAPE-DEFUNS.
+                          nil
+                          (%fn-info-for-key resolved-fn-name))))
         (when fn-info
           (let ((req (function-info-required-count fn-info))
                 (param-count (function-info-param-count fn-info))
@@ -24115,6 +24235,14 @@
 
     ;; Register standard macros (cond, and, or) for this compilation
     (register-mvm-bootstrap-macros)
+    ;; Names DEFUNed more than once with different lambda lists (see
+    ;; *MULTI-SHAPE-DEFUNS*).  SETQ, not LET, for the same in-image reason as
+    ;; *MVM-GENSYM-COUNTER* above.
+    (setq *multi-shape-defuns* (%collect-multi-shape-defuns forms))
+    #+sbcl
+    (when (sb-ext:posix-getenv "MODUS_MULTI_SHAPE_DUMP")
+      (maphash (lambda (k v) (format t "~&;; MULTI-SHAPE ~A final=~S~%" k v))
+               *multi-shape-defuns*))
 
     ;; Phase 1 & 2: Compile all forms to IR
     (let ((form-index 0))

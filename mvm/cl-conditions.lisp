@@ -1898,6 +1898,17 @@
     ;; (subtypep* 'tac-3-ab 'tac-3-a) → (T T) where tac-3-ab inherits A.
     ;; Without this, %subtype-of-p (the static ANSI table) doesn't know
     ;; user classes and returns nil → (NIL T).
+    ;; t1 a user class whose CPL names t2 (STANDARD-OBJECT included, which
+    ;; is not itself a registered class here -- the old guard required BOTH
+    ;; sides registered, so (subtypep 'my-class 'standard-object) fell to
+    ;; the static table and answered NIL: defclass.lsp's *S-ARE-STANDARD-
+    ;; OBJECTS tests).
+    ((and (symbolp t1) (symbolp t2) (%find-clos-class t1)
+          (let ((cpl (aref (%find-clos-class t1) 4)))
+            (or (member t2 cpl :test #'eq)
+                (member t2 cpl :test #'%clos-class-name-eq)
+                (eq t2 'standard-object))))
+     (cons t t))
     ((and (symbolp t1) (symbolp t2) (%find-clos-class t1) (%find-clos-class t2))
      (let* ((c1 (%find-clos-class t1))
             (cpl (aref c1 4)))  ; slot 4 = computed CPL

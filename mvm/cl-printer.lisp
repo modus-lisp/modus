@@ -821,6 +821,20 @@
               ;; %mda-offset is the starting row-major index into it.
               (t (let ((off (if (%mda-displaced obj) (%mda-offset obj) 0)))
                    (%print-md-array-offset dims data off stream level escape))))))))
+      ;; Package and readtable: both are TAGGED CONSES, so the cons case
+      ;; below walked a package into its symbol tables and never returned --
+      ;; (print (find-package "CL-USER")) hung, and so did the syntax.lsp
+      ;; tests that print a SYMBOL-PACKAGE.  CLHS 22.1.3.13: unreadable.
+      ((%pkg-p obj)
+       (%print-char 35 stream) (%print-char 60 stream)
+       (%print-string-raw "PACKAGE " stream)
+       (%print-char 34 stream)
+       (%print-string-raw (package-name obj) stream)
+       (%print-char 34 stream) (%print-char 62 stream))
+      ((readtablep obj)
+       (%print-char 35 stream) (%print-char 60 stream)
+       (%print-string-raw "READTABLE" stream)
+       (%print-char 62 stream))
       ;; Cons (list)
       ((consp obj)
        ;; Check *print-level*.  LEVEL is the current depth — nil from
@@ -3205,6 +3219,45 @@
           (setq i (+ i 1)))
     (get-output-stream-string s)))
 
+(defun %format-call-user-fn (stream control fn-start fn-end arg-list colonp atp
+                             plist)
+  "FORMAT ~/NAME/ (CLHS 22.3.5.4): call NAME with the stream, the next arg,
+   colon-p, at-sign-p and the directive's parameters.  NAME (CONTROL[FN-START
+   ..FN-END)) is read as if upper case; unqualified names are in CL-USER.
+   Returns the remaining arg list.  (It used to skip the argument and print
+   nothing: format-slash 0/19.)  A separate function, not inline in
+   %FORMAT-IMPL: inlined there it made every ~/ signal PROGRAM-ERROR."
+  (let ((pkg-out (make-string-output-stream))
+        (sym-out (make-string-output-stream))
+        (seen-colon nil)
+        (k fn-start))
+    ;; Split at the first ':' ("PKG:NAME" / "PKG::NAME"), upcasing.
+    (loop
+      (when (>= k fn-end) (return nil))
+      (let ((c (%prim-aref control k)))
+        (cond
+          ((and (= c 58) (not seen-colon)) (setq seen-colon t))
+          ((= c 58) nil)
+          (t (%print-char (if (and (>= c 97) (<= c 122)) (- c 32) c)
+                          (if seen-colon sym-out pkg-out)))))
+      (setq k (+ k 1)))
+    (let* ((first-part (get-output-stream-string pkg-out))
+           (second-part (get-output-stream-string sym-out))
+           (pkg (find-package (if seen-colon first-part "COMMON-LISP-USER")))
+           (sym-name (if seen-colon second-part first-part))
+           (sym (and pkg (find-symbol sym-name pkg)))
+           (params (let ((r (reverse plist)))
+                     ;; the directive's parameters, trailing unsupplied ones dropped
+                     (loop (if (and r (null (car r))) (setq r (cdr r)) (return nil)))
+                     (reverse r))))
+      (unless (and sym (fboundp sym))
+        (error "FORMAT ~~/~A/: undefined function" sym-name))
+      (if params
+          (apply (symbol-function sym)
+                 (cons stream (cons (car arg-list) (cons colonp (cons atp params)))))
+          (funcall (symbol-function sym) stream (car arg-list) colonp atp))
+      (cdr arg-list))))
+
 ;;; Main format implementation
 ;;; Returns remaining args (for use by formatter)
 (defun %format-impl (stream control args)
@@ -3852,8 +3905,10 @@
                        (return arg-list))))
                   ;; ~_ — conditional newline (pprint, ignore)
                   ((= dir 95) nil)
-                  ;; ~I — indent (pprint, ignore)
-                  ((= dir 73) (setq arg-list (cdr arg-list)))
+                  ;; ~I — indent (pprint; no layout engine yet, so a no-op).
+                  ;; It takes NO format argument (CLHS 22.3.5.3); this arm
+                  ;; used to consume one, shifting every later directive.
+                  ((= dir 73) nil)
                   ;; ~/ — call function
                   ((= dir 47)
                    ;; Find end of function name (next /)
@@ -3863,8 +3918,16 @@
                        (when (= (%prim-aref control fn-end) 47) (return nil))
                        (setq fn-end (+ fn-end 1)))
                      (setq i (+ fn-end 1))
-                     ;; Skip arg
-                     (setq arg-list (cdr arg-list))))
+                     ;; CLHS 22.3.5.4: call NAME with the stream, the next
+                     ;; arg, colon-p, at-sign-p and the directive's params.
+                     ;; NAME is read as if upper case; an unqualified name
+                     ;; is in CL-USER, "PKG:NAME" / "PKG::NAME" otherwise.
+                     ;; (This used to skip the argument and print nothing:
+                     ;; format-slash 0/19.)
+                     (setq arg-list
+                           (%format-call-user-fn stream control fn-start fn-end
+                                                 arg-list colonp atp
+                                                 (list param1 param2 param3 param4 param5)))))
                   ;; Unknown directive
                   (t
                    (%print-char 126 stream)

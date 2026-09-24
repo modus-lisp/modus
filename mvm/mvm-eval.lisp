@@ -1845,7 +1845,7 @@
             ;; %jit-patch-consts reads the GLOBAL *e2-const-pool*, which is
             ;; only correct at this module's own seam; the cross-page sweep
             ;; (%jit-refresh-all-pages) must patch from the page's OWN pool.
-            (list base eoff cpatches (%gc-count) psize
+            (list base eoff cpatches (%gc-epoch) psize
                   (%jit-fn-native-offsets ft-list fn-map nlen cpatches)
                   *e2-const-pool*))
           nil))))
@@ -2153,7 +2153,7 @@
             ;; differently) and for the measurement.
             ;; 7th = this module's const pool for the cross-page sweep (see the
             ;; x64 creator's comment).
-            (list base eoff cpat (%gc-count) psize
+            (list base eoff cpat (%gc-epoch) psize
                   (%jit-fn-native-offsets-aarch64 ft-list fn-map nlen cpat)
                   *e2-const-pool*)
             nil)))))
@@ -2316,7 +2316,7 @@
    (funcall 'it) => garbage/fault.  Cheap when clean: one %gc-count
    read + eql against the sweep stamp."
   (when (and *jit-page-cache* (not *jit-refresh-busy*))
-    (let ((now (%gc-count)))
+    (let ((now (%gc-epoch)))
       (unless (eql now *jit-all-fresh-stamp*)
         (setq *jit-refresh-busy* t)
         (unwind-protect
@@ -2364,7 +2364,7 @@
     (setq *jit-page-cache* (make-hash-table :test (quote eq))))
   (let ((hit (gethash bc *jit-page-cache*)))
     (if hit
-        (let ((now (%gc-count)))
+        (let ((now (%gc-epoch)))
           (if (eql now (cadddr hit))
               hit
               ;; A GC moved the const-pool objects; re-bake immediates, then

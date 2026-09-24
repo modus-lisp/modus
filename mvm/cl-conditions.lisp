@@ -1480,7 +1480,8 @@
                 (setq *restarts-being-invoked* nil)
                 (values-list r))
               (if (%error-handler-active-p)
-                  (%hc-longjmp)
+                  (progn (when *%escape-trace* (%report-escaping-condition "with-restarts-relongjmp-trace"))
+                         (%hc-longjmp))
                   ;; This (halt) was SILENT — exit(1) with zero output when a
                   ;; condition escapes a %with-restarts frame (warn/cerror/
                   ;; restart-case all route here) and no outer frame is armed.
@@ -1547,6 +1548,7 @@
                (aset rc 0 '%rc-invocation)
                (aset rc 1 nil)
                (setq *current-condition* rc))
+             (when *%escape-trace* (%report-escaping-condition "invoke-restart-bc-trace"))
              (%hc-longjmp))
             ((eq style :case)
              ;; restart-case: run user fn, stash MV result, longjmp.
@@ -1557,6 +1559,9 @@
                  (aset rc 0 'restart-invocation)
                  (aset rc 1 nil)
                  (setq *current-condition* rc))
+               (when *%escape-trace*
+                 (%report-escaping-condition "invoke-restart-case-trace")
+                 (%report-escaping-condition (let ((nm (car r))) (if (symbolp nm) (symbol-name nm) "?"))))
                (%hc-longjmp)))
             (t
              ;; restart-bind: run user fn, re-emit its values.
@@ -2022,9 +2027,13 @@
 
 ;;; invoke-debugger stub
 (defun invoke-debugger (condition)
-  "Stub — just signal the error."
+  "Stub — just signal the error.  Publishes CONDITION first: the longjmp's
+   landing handler-case dispatches on *CURRENT-CONDITION*, and leaving the
+   previous one there reported (and matched) a stale condition."
+  (setq *current-condition* condition)
   (if (%error-handler-active-p)
-      (%hc-longjmp)
+      (progn (when *%escape-trace* (%report-escaping-condition "invoke-debugger-trace"))
+             (%hc-longjmp))
       (progn (%report-escaping-condition "invoke-debugger-no-armed-handler")
              (write-string-serial "DEBUG:") (write-char-serial 10) (halt))))
 

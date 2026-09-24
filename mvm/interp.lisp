@@ -1116,6 +1116,13 @@
                     (setq s (cdr s))
                     (setq i (1+ i))))
                 (setf pc npc))
+               ;; EXIT (#x0500): compile-sys-exit's trap, exit code in V0.  It
+               ;; fell into the FRAME-ALLOC no-op arm below, so a direct
+               ;; (sys-exit N) in evaluated code -- every --script test's
+               ;; verdict line -- did nothing and the process exited 0 at EOF.
+               ;; Here it is compiled native code, so this call really exits.
+               ((= code #x0500)
+                (sys-exit (svref regs +vreg-v0+)))
                ((>= code #x100)
                 ;; FRAME-ALLOC / FRAME-FREE: no-op (frame is over-allocated).
                 (setf pc npc))

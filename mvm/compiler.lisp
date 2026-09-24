@@ -2839,7 +2839,7 @@
 (defvar *mexp-memo-gc* -1
   "The %GC-COUNT at which *MEXP-MEMO* was last (re)keyed.")
 (defun %mexp-memo-epoch ()
-  (if (fboundp (quote %gc-count)) (funcall (quote %gc-count)) 0))
+  (if (fboundp (quote %gc-epoch)) (funcall (quote %gc-epoch)) 0))
 (defun %mexp-memo-rekey ()
   "Rebuild the address-keyed memo from its (form . expansion) entries — the
    forms are live objects the collector has already moved."

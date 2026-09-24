@@ -199,6 +199,16 @@
 (defun %gc-space-size ()   (mem-ref (+ (%gc-region) #x10) :u64))
 (defun %gc-stack-base ()   (mem-ref (+ (%gc-region) #x18) :u64))
 (defun %gc-count ()        (mem-ref (+ (%gc-region) #x20) :u64))
+;; %GC-EPOCH: a value that CHANGES whenever this region collects and is always
+;; an exact FIXNUM -- for caches that only ask "has a collection happened since
+;; I stamped this?".  NOT %GC-COUNT: on x64 the count field is stored raw and a
+;; :u64 read hands those raw bits back AS A TAGGED VALUE, so a count of 9 reads
+;; as an OBJECT pointer to address 0.  The macroexpansion memo compared that
+;; with EQL, EQL went numeric, and %IEEE-FLOAT-P's OBJ-SUBTAG faulted -- from the
+;; ninth collection on, every EVAL in the process failed (the real ansi-test
+;; died in DO-TESTS exactly there).  A tagged :u32 load of the low word is exact
+;; on every target (x64: the count; targets that store it shifted: twice it).
+(defun %gc-epoch ()        (mem-ref (+ (%gc-region) #x20) :u32))
 (defun %gc-saved-rsp ()    (mem-ref (+ (%gc-region) #x28) :u64))
 (defun %gc-saved-r12 ()    (mem-ref (+ (%gc-region) #x30) :u64))
 (defun %gc-saved-r14 ()    (mem-ref (+ (%gc-region) #x38) :u64))

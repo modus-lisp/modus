@@ -709,7 +709,16 @@
    A target absent from this table gets the historical pair, which is the right
    default: it is what every working image already used."
   (case (target-name target)
-    (:riscv64 (values #x80700010 #x80700018))
+    ;; riscv64 BARE only.  #x80700010 is DRAM on virt; under hosted Linux it is
+    ;; not mapped, and the hosted port uses the shared pair inside its mmap'd
+    ;; heap.  *RISCV-LINUX-MODE* is the only thing that distinguishes them here:
+    ;; RESOLVE-TARGET-ARCH maps :linux-riscv to :riscv64, so (target-name ...)
+    ;; cannot tell bare from hosted.
+    (:riscv64 (if (and (find-package "MODUS.MVM")
+                       (let ((sym (find-symbol "*RISCV-LINUX-MODE*" "MODUS.MVM")))
+                         (and sym (boundp sym) (symbol-value sym))))
+                  (values #x10000090 #x10000098)
+                  (values #x80700010 #x80700018)))
     (:ppc32   (values #x00900020 #x00900028))
     (t        (values #x10000090 #x10000098))))
 

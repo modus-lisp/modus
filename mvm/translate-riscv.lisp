@@ -513,9 +513,24 @@
 ;;; (0x80500000) and well below wired memory (0x82000000), so it collides with
 ;;; neither the downward stack (top 0x80400000) nor the heap.
 (defparameter *rv-globals-base* #x80700000
-  "Base of the RISC-V absolute-address convention slot block.")
-(defparameter *rv-nargs-addr* (+ #x80700000 #x00))
-(defparameter *rv-cenv-addr*  (+ #x80700000 #x08))
+  "Base of the RISC-V absolute-address convention slot block.
+
+   #x80700000 IS BARE-METAL ONLY.  It is DRAM on QEMU virt, chosen because the
+   shared #x10000000 block is the NS16550 UART's MMIO window there.  Under
+   hosted Linux neither address is special and #x80700000 is simply NOT MAPPED:
+   INSTALL-RISCV-TRANSLATOR moves this into the mmap'd heap when
+   *RISCV-LINUX-MODE* is set.  Measured before it did — the hosted image
+   mmap'd its heap successfully and then took SIGSEGV at si_addr=0x80700000 on
+   the first :set-nargs, which qemu-riscv64-static -strace named in one line.
+
+   RISCV64 is not one target.  Bare and hosted are different memory maps,
+   and every absolute address this back end bakes has to follow that.")
+(defparameter *rv-hosted-globals-base* #x10000A00
+  "Convention slots for the HOSTED port, inside the mmap'd heap and above the
+   Cheney metadata at #x10000040.  Same choice boot-linux-i386.lisp makes for
+   the same reason (its comment names 0x10000A00 the i386 global slot block).")
+(defun rv-nargs-addr () (+ *rv-globals-base* #x00))
+(defun rv-cenv-addr ()  (+ *rv-globals-base* #x08))
 ;;; MV-COUNT DIVERGES FROM THE SHARED CONTRACT ADDRESS, AND MUST.
 ;;; modus.mvm::+mv-count-addr+ is #x10000090, baked into compiler-emitted
 ;;; mem-refs and into shared CL source.  On QEMU virt that address is not RAM
@@ -673,8 +688,38 @@
            ((< code #x0300)
             ;; Frame-alloc/frame-free: NOP for now
             nil)
+           ((and (= code #x0300) *riscv-linux-mode*)
+            ;; HOSTED: serial write becomes write(1, &byte, 1).  The byte goes
+            ;; on the stack because write(2) wants an address, and a0 has to be
+            ;; freed for the fd — so the char is untagged into t0 FIRST.
+            (rv-emit-srai buf +rv-t0+ +rv-a0+ 1)
+            (rv-emit-addi buf +rv-sp+ +rv-sp+ -16)
+            (rv-emit-sb buf +rv-t0+ +rv-sp+ 0)
+            (rv-emit-li buf +rv-a0+ 1)                 ; fd = stdout
+            (rv-emit-mv buf +rv-a1+ +rv-sp+)           ; buf
+            (rv-emit-li buf +rv-a2+ 1)                 ; count
+            (rv-emit-li buf +rv-a7+ +rv-linux-sys-write+)
+            (rv-emit-ecall buf)
+            (rv-emit-addi buf +rv-sp+ +rv-sp+ 16))
+           ((and (= code #x0301) *riscv-linux-mode*)
+            ;; HOSTED: serial read becomes read(0, &byte, 1); the byte comes
+            ;; back TAGGED in V0 (a0), matching the bare-metal arm's contract.
+            (rv-emit-addi buf +rv-sp+ +rv-sp+ -16)
+            (rv-emit-li buf +rv-a0+ 0)                 ; fd = stdin
+            (rv-emit-mv buf +rv-a1+ +rv-sp+)
+            (rv-emit-li buf +rv-a2+ 1)
+            (rv-emit-li buf +rv-a7+ +rv-linux-sys-read+)
+            (rv-emit-ecall buf)
+            (rv-emit-lbu buf +rv-t0+ +rv-sp+ 0)
+            (rv-emit-addi buf +rv-sp+ +rv-sp+ 16)
+            (rv-emit-slli buf +rv-a0+ +rv-t0+ 1))      ; tag as fixnum
+           ((and (= code #x0500) *riscv-linux-mode*)
+            ;; HOSTED: exit(status), status arriving TAGGED in V0.
+            (rv-emit-srai buf +rv-a0+ +rv-a0+ 1)
+            (rv-emit-li buf +rv-a7+ +rv-linux-sys-exit+)
+            (rv-emit-ecall buf))
            ((= code #x0300)
-            ;; Serial write: V0 (a0) contains tagged fixnum char code
+            ;; BARE METAL: serial write: V0 (a0) contains tagged fixnum char code
             ;; srai t0, a0, 1 (untag)
             (rv-emit-srai buf +rv-t0+ +rv-a0+ 1)
             ;; lui t1, 0x10000 (t1 = 0x10000000, QEMU virt UART base)
@@ -1516,21 +1561,21 @@
       (#.+op-set-nargs+
        (let ((n (logand (vreg 0) #xFF)))
          (rv-emit-li buf +rv-t2+ n)
-         (rv-emit-store-abs buf +rv-t2+ *rv-nargs-addr*)))
+         (rv-emit-store-abs buf +rv-t2+ (rv-nargs-addr))))
 
       (#.+op-get-nargs+
        (let ((vd (vreg 0)))
-         (rv-emit-load-abs buf +rv-t0+ *rv-nargs-addr*)
+         (rv-emit-load-abs buf +rv-t0+ (rv-nargs-addr))
          (rv-emit-slli buf +rv-t0+ +rv-t0+ 1)   ; tag as fixnum
          (store-result vd +rv-t0+)))
 
       (#.+op-set-cenv+
        (let ((rs (resolve (vreg 0) +rv-t2+)))
-         (rv-emit-store-abs buf rs *rv-cenv-addr*)))
+         (rv-emit-store-abs buf rs (rv-cenv-addr))))
 
       (#.+op-get-cenv+
        (let ((vd (vreg 0)))
-         (rv-emit-load-abs buf +rv-t0+ *rv-cenv-addr*)
+         (rv-emit-load-abs buf +rv-t0+ (rv-cenv-addr))
          (store-result vd +rv-t0+)))
 
       (#.+op-set-mv-count+
@@ -1721,6 +1766,26 @@
                               (ash (aref raw (+ pos 2)) 16)
                               (ash (aref raw (+ pos 3)) 24))))
                (format t "  ~4,'0X: ~8,'0X~%" pos w)))))
+
+(defparameter *riscv-linux-mode* nil
+  "When true the target is a HOSTED Linux/RV64 ELF rather than bare metal: the
+   serial traps become write(2)/read(2) and the exit trap becomes exit(2).
+   Counterpart of *X64-LINUX-MODE* and *I386-LINUX-MODE*.
+
+   RV64 USES THE asm-generic SYSCALL NUMBERS, not x86's: read is 63 and write
+   is 64, where x86-64 says 0 and 1.  They are named in boot-linux-riscv.lisp
+   rather than inlined here because the x86 numbers are muscle memory.")
+
+(defconstant +rv-linux-sys-read+  63)
+(defconstant +rv-linux-sys-write+ 64)
+(defconstant +rv-linux-sys-exit+  93)
+
+(defun riscv-set-linux-mode (on)
+  "Turn hosted mode on or off, moving the convention slots with it.  Kept
+   together in one function so the two cannot drift apart — an unmapped slot
+   base is a SIGSEGV on the first call, not a subtle wrong answer."
+  (setf *riscv-linux-mode* (and on t))
+  (setf *rv-globals-base* (if on *rv-hosted-globals-base* #x80700000)))
 
 (defun install-riscv-translator ()
   "Install the RISC-V translator into the target descriptor.

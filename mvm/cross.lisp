@@ -1317,6 +1317,15 @@
                        raw-bytes
                        (or (getf boot-descriptor :load-addr) #x08048000)
                        :bss-end (getf boot-descriptor :bss-end)))
+                    ((eq (getf boot-descriptor :elf-format) :linux-riscv)
+                     (wrap-in-elf64-le-riscv raw-bytes
+                                             (or (getf boot-descriptor :load-addr) #x400000)
+                                             :function-table
+                                             (mvm-module-function-table module)
+                                             :native-image-offset
+                                             (or (kernel-image-native-image-offset image) 0)
+                                             :native-code-length
+                                             (length (kernel-image-native-code image))))
                     ((eq (getf boot-descriptor :elf-format) :linux-aarch64)
                      (wrap-in-elf64-le-aa64 raw-bytes
                                             (or (getf boot-descriptor :load-addr) #x400000)
@@ -1397,6 +1406,7 @@
     (:uefi-x64 :x86-64)
     (:linux-x64 :x86-64)
     (:linux-aarch64 :aarch64)
+    (:linux-riscv :riscv64)
     (:linux-i386 :i386)
     (:x64-console :x86-64)
     (:i386-console :i386)
@@ -1477,6 +1487,7 @@
     (:uefi-x64 (uefi-x64-boot-descriptor))
     (:linux-x64 (linux-x64-boot-descriptor))
     (:linux-aarch64 (linux-aarch64-boot-descriptor))
+    (:linux-riscv (linux-riscv-boot-descriptor))
     (:linux-i386 (linux-i386-boot-descriptor))
     (:x64-console (x64-console-boot-descriptor))
     (:i386-console (i386-console-boot-descriptor))

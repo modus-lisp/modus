@@ -103,6 +103,22 @@ runtime/        Runtime type system
 
 ## ANSI CL Conformance
 
+**THE DENOMINATOR CHANGED 2026-09-23 — the gate now runs the WHOLE corpus.**
+A census (`test/ansi-census/`: load the corpus into SBCL with a recording
+DEFTEST, diff names against the gate build log) found **1,883 of the 19,508
+tests SBCL registers had never been in the gate runner** — not failed, not
+counted: file-local test macros never expanded (907), files in no chapter
+list (625, `misc.lsp` alone 509), load-time `(eval `(deftest …))` generators
+(249), an aux file that failed at READ time so its macros never existed, and
+guarded deftests.  Now 0 missing; the runner holds **19,530** (ids
+10001..29531).  First full-corpus gate: **19,088 / 19,530 = 97.7%** vs the
+old 17,543 / 17,625 on the partial corpus; CHUNK-CRASH 0.  **FILE-WEDGE=30
+was never a wedge** — all 30 were files with an empty id range (22 chapter
+`load.lsp` loaders); it is 0 now.  Every number below this note is on the OLD
+denominator.  Scripts read the last id from the build's
+`ansi-file-ranges.txt`; never hardcode 27708/27800 again.  Newly visible gaps:
+class-precedence-lists 0/71, format-slash 0/19, format-i 0/16, defclass 2/23.
+
 **Real numbers — HARD per-file name-stable comparison (x64 Linux, 2026-06-15):**
 - HEAD passed: **16,489 / 17,465 = 94.4%** (tip 9c6151f)
 - NET vs base b2ae056: **+825** (same 32-shard method both sides; base=15,664 this run)

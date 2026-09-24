@@ -74,19 +74,20 @@ right answer for a 14-rung ladder: a call, add/multiply, a branch, an argument,
 recursion, `(factorial 10)`, `cons`/`car`/`cdr`, a loop with an early return,
 three live variables, arrays, byte vectors, strings and SAPs. The answer is
 read back out of guest memory over QMP and compared to an expected value —
-"the image wrote something" is not a pass. **112/112 as of 5b187e4.**
+"the image wrote something" is not a pass. **120/120** — eight architectures
+x fifteen rungs, with the control answering WRONG first.
 
 | Architecture | Bits | Endian | Translator | QEMU target | Opcodes | Ladder |
 |-------------|:----:|:------:|:----------:|-------------|:-------:|:------:|
-| x86-64      | 64 | little | translate-x64.lisp     | `qemu-system-x86_64`                  | 137/144 | 14/14 |
-| AArch64     | 64 | little | translate-aarch64.lisp | `qemu-system-aarch64 -M virt`         | 138/144 | 14/14 |
-| i386        | 32 | little | translate-i386.lisp    | `qemu-system-i386`                    | 102/144 | 14/14 |
-| ARM32       | 32 | little | translate-arm32.lisp   | `qemu-system-arm -M raspi2b`          |  92/144 | 14/14 |
-| RISC-V 64   | 64 | little | translate-riscv.lisp   | `qemu-system-riscv64 -M virt`         |  92/144 | 14/14 |
-| RISC-V 32   | 32 | little | translate-riscv.lisp   | hosted only so far (see below)        | (shared) | 14/14 hosted |
-| PPC64       | 64 | big    | translate-ppc.lisp     | `qemu-system-ppc64 -M powernv`        |  92/144 | 14/14 |
-| PPC32       | 32 | big    | translate-ppc.lisp     | `qemu-system-ppc -M ppce500`          |  92/144 | 14/14 |
-| 68k         | 32 | big    | translate-68k.lisp     | `qemu-system-m68k -M virt`            |  92/144 | 14/14 |
+| x86-64      | 64 | little | translate-x64.lisp     | `qemu-system-x86_64`                  | 137/144 | 15/15 |
+| AArch64     | 64 | little | translate-aarch64.lisp | `qemu-system-aarch64 -M virt`         | 138/144 | 15/15 |
+| i386        | 32 | little | translate-i386.lisp    | `qemu-system-i386`                    | 102/144 | 15/15 |
+| ARM32       | 32 | little | translate-arm32.lisp   | `qemu-system-arm -M raspi2b`          |  92/144 | 15/15 |
+| RISC-V 64   | 64 | little | translate-riscv.lisp   | `qemu-system-riscv64 -M virt`         |  92/144 | 15/15 |
+| RISC-V 32   | 32 | little | translate-riscv.lisp   | hosted only so far (see below)        | (shared) | 15/15 hosted |
+| PPC64       | 64 | big    | translate-ppc.lisp     | `qemu-system-ppc64 -M powernv`        |  92/144 | 15/15 |
+| PPC32       | 32 | big    | translate-ppc.lisp     | `qemu-system-ppc -M ppce500`          |  92/144 | 15/15 |
+| 68k         | 32 | big    | translate-68k.lisp     | `qemu-system-m68k -M virt`            |  92/144 | 15/15 |
 | AArch64 RPi | 64 | little | translate-aarch64.lisp | `qemu-system-aarch64 -M raspi3b`      | (shared) | not in the ladder |
 
 The opcode counts are the honest measure of how much of the ISA each back end
@@ -161,14 +162,31 @@ of booting a machine and reading guest memory over QMP.
 
 | Port | ELF | Build | Run | Hosted ladder |
 |------|-----|-------|-----|:-------------:|
-| Linux/RV64  | ELF64-LE, EM_RISCV | `mvm/build-riscv-linux.lisp`   | `qemu-riscv64-static` | 14/14 |
-| Linux/RV32  | ELF32-LE, EM_RISCV | `mvm/build-riscv32-linux.lisp` | `qemu-riscv32-static` | 14/14 |
-| Linux/ARM32 | ELF32-LE, EM_ARM   | `mvm/build-arm32-linux.lisp`   | `qemu-arm-static`     | not yet run |
+| Linux/RV64  | ELF64-LE, EM_RISCV | `mvm/build-riscv-linux.lisp`   | `qemu-riscv64-static` | 15/15 |
+| Linux/RV32  | ELF32-LE, EM_RISCV | `mvm/build-riscv32-linux.lisp` | `qemu-riscv32-static` | 15/15 |
+| Linux/ARM32 | ELF32-LE, EM_ARM   | `mvm/build-arm32-linux.lisp`   | `qemu-arm-static`     | 15/15 |
+| Linux/PPC64 | ELF64-**BE**, EM_PPC64 | `mvm/build-ppc64-linux.lisp` | `qemu-ppc64-static`  | 15/15 |
+| Linux/PPC32 | ELF32-**BE**, EM_PPC   | `mvm/build-ppc32-linux.lisp` | `qemu-ppc-static`    | 15/15 |
+| Linux/m68k  | ELF32-**BE**, EM_68K   | `mvm/build-68k-linux.lisp`   | `qemu-m68k-static`   | 15/15 |
 
 ```bash
 scripts/hosted-ladder.py riscv32            # one port, all rungs
 scripts/hosted-ladder.py --all              # every hosted port with a source build
+HOSTED_LADDER_JOBS=12 scripts/hosted-ladder.py 68k
 ```
+
+Cells run in PARALLEL — each has its own temp directory, output path and emulator
+process, so the only thing that was ever sequential about this was the loop.  Six
+ports x fifteen rungs finishes in minutes; the full-system gate needs about ninety.
+
+**THE BIG-ENDIAN PORTS NEEDED NO NEW ELF WRITER.**  `mvm/cross.lisp` already had
+`wrap-in-elf32-be` and `wrap-in-elf64-be` for the bare-metal images, reached by
+the GENERIC arm of the wrapper dispatch — so what these ports needed was the
+right descriptor, not new code.  Their syscall ABIs are the new part: PowerPC
+signals an error in CR0.SO rather than by negating the return, so the "negative
+means errno" test every other port here uses cannot work; and m68k passes
+arguments in `d1,d2,d3,d4,d5` and then **`a0`**, the only mixed argument bank in
+the tree.
 
 It carries the full-system harness's two rules unchanged: the expected value is
 mandatory, and one rung runs first with a deliberately wrong expectation and

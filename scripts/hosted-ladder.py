@@ -15,6 +15,12 @@ pass; --expect is mandatory, exactly as in the full-system harness.
 Byte 0 is written WITHOUT a shift because `(ash x 0)' returns 0 on ARM32, and a
 harness must not depend on the thing it is measuring.
 
+A CELL IS INDEPENDENT BY CONSTRUCTION — its own temp directory, its own output
+path, its own emulator process — so cells run in PARALLEL.  HOSTED_LADDER_JOBS
+sets the width (default: half the cores, since each cell is one sbcl build).
+The work is CPU-bound in a subprocess, so a thread pool is the right shape here:
+the threads only wait on wait().
+
 Usage:
     scripts/hosted-ladder.py <arch> [rung.lisp ...] [--keep]
     scripts/hosted-ladder.py --all
@@ -22,6 +28,7 @@ Usage:
 Exit code is 0 only when every cell passed AND the positive control failed.
 """
 import os, re, subprocess, sys, tempfile
+from concurrent.futures import ThreadPoolExecutor
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUNGS = os.path.join(REPO, "test", "arch-rungs")
@@ -106,6 +113,16 @@ def run_cell(arch, rung_path, expect, keep=False):
            f"{'=' if got == expect else '!='} {got} (want {expect})"
 
 
+def jobs():
+    """How many cells to run at once.  Half the cores by default: each cell is an
+    sbcl build, and leaving headroom keeps this from starving whatever else is on
+    the box — which on a shared machine is the difference between fast and rude."""
+    env = os.environ.get("HOSTED_LADDER_JOBS")
+    if env:
+        return max(1, int(env))
+    return max(1, (os.cpu_count() or 4) // 2)
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = [a for a in sys.argv[1:] if a.startswith("--")]
@@ -137,9 +154,11 @@ def main():
                   f"a control that cannot answer proves nothing; refusing to run")
             return 2
         print(f"{arch}: positive control answered WRONG as required ({why})")
-        for r in rungs:
-            exp = expected_of(r)
-            outcome, why = run_cell(arch, r, exp, keep)
+        n = min(jobs(), len(rungs))
+        with ThreadPoolExecutor(max_workers=n) as pool:
+            results = list(pool.map(
+                lambda r: (r,) + run_cell(arch, r, expected_of(r), keep), rungs))
+        for r, outcome, why in results:
             if outcome != "PASS":
                 failures += 1
             print(f"  {os.path.basename(r):<24} {arch:<8} "

@@ -346,17 +346,22 @@ needs `powernv`, not `pseries`; 68k needs `virt`, not `an5206`).
 ### The HOSTED ladder — the same rungs, seconds per cell
 
 ```bash
-scripts/hosted-ladder.py riscv32            # one port, all 14 rungs
+scripts/hosted-ladder.py riscv32            # one port, all 15 rungs
 scripts/hosted-ladder.py --all
+HOSTED_LADDER_JOBS=12 scripts/hosted-ladder.py 68k
 ```
+
+**CELLS RUN IN PARALLEL** (default: half the cores).  A cell was always
+independent — own temp dir, own output path, own emulator — so the only
+sequential thing was the loop.  Six ports x 15 rungs takes minutes.
 
 A hosted image has a console, so the oracle is four bytes on stdout rather than
 a QMP read of guest memory: ~35 s per cell against ~6 min, and no machine to
 boot. Same two rules — `--expect` is mandatory and a deliberately-wrong control
 runs first — because they are what makes either harness evidence.
 
-Only the ports whose build script takes a SOURCE FILE are in it (`riscv64`,
-`riscv32`, `arm32`). The hosted x64/aarch64/i386 images come from the CLI
+Six ports are in it: `riscv64`, `riscv32`, `arm32`, `ppc64`, `ppc32`, `68k` —
+every one whose build script takes a SOURCE FILE. The hosted x64/aarch64/i386 images come from the CLI
 lineage and bake a whole runtime, so grading them this way would measure
 something else; they have `./modus` and the ANSI gate.
 
@@ -399,7 +404,8 @@ oracle bare metal cannot provide.
 **AND THE LADDER COULD NOT HAVE CAUGHT THE STORE HALF AT ALL.**  For fourteen
 rungs across eight architectures, NOTHING MUTATED A CONS — `r08-cons` is
 `(let ((l (cons 40 2))) (+ (car l) (cdr l)))`, which only reads.  `r15-cons-mutate`
-now exercises `:setcar`/`:setcdr`.  The generalisable lesson is **a rung per
+now exercises `:setcar`/`:setcdr`, and passes on all eight bare targets and all
+six hosted ones.  The generalisable lesson is **a rung per
 OPCODE PAIR, not per data type**: "cons" looked covered because allocation and
 reading were.
 

@@ -3003,7 +3003,36 @@
     (%mexp-memo-invalidate)
     (setf (gethash hash *macro-table*) expander)))
 
-(defun build-macrolet-expander (mparams mbody)
+(defun %env-visible-symbol-macros (env)
+  "The SYMBOL-MACROLET bindings visible in compile-env ENV, innermost first,
+   as ((NAME EXPANSION) ...).  A later (inner) binding of the same name --
+   symbol-macro or variable -- shadows an outer one, so only the first
+   occurrence of each name counts, and it counts only if it is a symbol-macro.
+   CLHS MACROLET: the expander functions are defined in the lexical environment
+   in which the MACROLET form appears, symbol-macrolet definitions included
+   (ansi-test reader/readtable-case.lsp relies on it)."
+  (let ((seen nil) (out nil) (e env))
+    (loop while e do
+      (dolist (b (compile-env-bindings e))
+        (let ((n (binding-name b)))
+          (unless (member n seen :test #'eq)
+            (push n seen)
+            (when (eq (binding-location b) :symbol-macro)
+              (push (list n (binding-expansion b)) out)))))
+      (setq e (compile-env-parent e)))
+    (nreverse out)))
+
+(defun %split-body-decls (body)
+  "Split BODY into (values leading-declarations-and-docstring rest)."
+  (let ((head nil))
+    (loop while (and (consp body)
+                     (or (and (consp (car body)) (symbolp (caar body))
+                              (string= (symbol-name (caar body)) "DECLARE"))
+                         (and (stringp (car body)) (consp (cdr body)))))
+          do (push (pop body) head))
+    (values (nreverse head) body)))
+
+(defun build-macrolet-expander (mparams mbody &optional sym-macros)
   "Build a compile-time macro expander for a MACROLET local macro with
    macro lambda-list MPARAMS and body MBODY.  Returns a one-arg function
    (form) → expansion.
@@ -3045,6 +3074,10 @@
               (progn (push elt rest-params)
                      (setf p (cdr p))))))
       (setf rest-params (nreverse rest-params)))
+    ;; Enclosing SYMBOL-MACROLET bindings are visible to the expander body.
+    (when sym-macros
+      (multiple-value-bind (head rest) (%split-body-decls mbody)
+        (setf mbody (append head (list `(symbol-macrolet ,sym-macros ,@rest))))))
     ;; Rebuild the destructuring pattern.
     (let* ((bindings (append
                       (when (and whole-var (symbolp whole-var))
@@ -6943,7 +6976,8 @@
                   (mparams (cadr mdef))
                   (mbody (cddr mdef))
                   (old (gethash mname *macro-table*))
-                  (expander (build-macrolet-expander mparams mbody)))
+                  (expander (build-macrolet-expander
+                             mparams mbody (%env-visible-symbol-macros env))))
              (push (cons mname old) saved-macros)
              (mvm-define-macro mname expander)))
          ;; Compile body

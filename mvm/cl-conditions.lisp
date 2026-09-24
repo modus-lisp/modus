@@ -338,11 +338,17 @@
     (let ((report-fn (if entry (%cond-reg-report entry) nil)))
       (cond
         ((null report-fn)
-         ;; Default: print type name
-         (write-string-to-stream (symbol-name (%condition-type-name c)) stream))
+         ;; A simple-condition with no :report reports its format control
+         ;; applied to its arguments (CLHS SIMPLE-CONDITION); anything else
+         ;; prints its type name.
+         (let ((fc (handler-case (simple-condition-format-control c) (t (e) nil))))
+           (if fc
+               (apply #'format stream fc
+                      (handler-case (simple-condition-format-arguments c) (t (e) nil)))
+               (write-string (symbol-name (%condition-type-name c)) stream))))
         ((stringp report-fn)
          ;; String report
-         (write-string-to-stream report-fn stream))
+         (write-string report-fn stream))
         (t
          ;; Function report
          (funcall report-fn c stream))))))
@@ -782,11 +788,14 @@
                    "Skip the warning."))
        (lambda () (%signal-condition cond-obj)))
       (unless muffled
-        (write-string-to-stream "WARNING: " *error-output*)
-        (let ((fc (simple-condition-format-control cond-obj)))
-          (when (stringp fc)
-            (write-string-to-stream fc *error-output*)))
-        (write-char-to-stream (code-char 10) *error-output*)))
+        ;; The report, not the bare control string (the old code printed
+        ;; "~a" directives literally, through two helpers defined nowhere).
+        (handler-case
+            (let ((out *error-output*))
+              (write-string "WARNING: " out)
+              (%print-condition cond-obj out)
+              (write-char (code-char 10) out))
+          (t (e) nil))))
     nil))
 
 (defun cerror (continue-format datum &rest args)
@@ -2669,8 +2678,11 @@
   (%defpackage-impl "DS3" (list (list :shadow "B") (list :shadowing-import-from "DS1" "A") (list :use "DS1" "DS2") (list :export "A" "B" "G" "I" "J" "K") (list :intern "L" "M")))
   (%defpackage-impl "DS4" (list (list :shadowing-import-from "DS1" "B") (list :use "DS1" "DS3") (list :intern "X" "Y" "Z") (list :import-from "DS2" "F")))
   (set-up-packages)
-  ;; Create CL-TEST package for reader tests
-  (make-package "CL-TEST" :use (list "CL"))
+  ;; NO (make-package "CL-TEST") here.  It only ever returned CL-USER, via
+  ;; find-package's alias check -- which now requires the hash splice at the
+  ;; end of this function, so run before it, it made a SECOND, real CL-TEST
+  ;; that LIST-ALL-PACKAGES showed and FIND-PACKAGE never returned
+  ;; (package-name.3/.4).  The splice alone is the alias.
   ;; Register every package now in *all-packages* so the pkg-by-hash
   ;; table covers FS-A/B, DS1..4, CL-TEST, and any nicknames.  Walking
   ;; *all-packages* once is cheaper than threading a register call

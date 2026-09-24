@@ -5766,14 +5766,20 @@
                        ;; Record it too: a read error already stops the load,
                        ;; but the caller still needs to know the load FAILED
                        ;; (SBCL exits 1 on a malformed --script).
-                       (setq *load-error-condition* c)
+                       (when *load-abort-on-error*
+                         (setq *load-error-condition* c))
                        eof-marker))))
         (when (eq form eof-marker) (return t))
         (let ((val (handler-case (handler-bind ((warning #'%load-report-warning))
                                    (eval form))
                      (t (c)
                         (%report-escaping-condition "load-toplevel-form-swallowed")
-                        (setq *load-error-condition* c)
+                        ;; Recorded only when the caller asked for abort
+                        ;; semantics: a program that cleared the flag to run
+                        ;; past failing forms must not have a swallowed error
+                        ;; resurface as the OUTER --script's failure.
+                        (when *load-abort-on-error*
+                          (setq *load-error-condition* c))
                         nil))))
           ;; Opt-in abort (hosted CLI).  Unset/NIL for the ANSI harness, whose
           ;; per-file runners depend on continuing past a failed form.

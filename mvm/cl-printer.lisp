@@ -693,6 +693,15 @@
          (%print-integer-in-base (ratio-numerator obj) pbase stream)
          (%print-char 47 stream)  ; /
          (%print-integer-in-base (ratio-denominator obj) pbase stream)))
+      ;; Condition (CLHS 9.1.3): printed WITHOUT escaping, a condition runs
+      ;; its report; escaped, it is unreadable.  Before this, PRINC / ~A of a
+      ;; condition printed its raw two-slot representation.
+      ((and (not preadably) (%condition-p obj))
+       (if escape
+           (progn (%print-string-raw "#<" stream)
+                  (%print-string-raw (symbol-name (%condition-type-name obj)) stream)
+                  (%print-char 62 stream))
+           (%print-condition obj stream)))
       ;; Complex — 3-slot array with %complex-marker in slot 0.  Format
       ;; as #C(REAL IMAG) per CLHS.  Detect BEFORE the generic array
       ;; printer (which would emit #(%COMPLEX-MARKER 1 2)).

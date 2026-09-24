@@ -102,6 +102,70 @@
     (setf (aref bytes (+ pos 3)) (logand (ash word -24) #xFF))
     (setf (rv-buffer-position buf) (+ pos 4))))
 
+(defun rv-patch-branch-here (buf branch-pos)
+  "Back-patch the B-type branch at BRANCH-POS to land at the CURRENT position.
+
+   HAND-COUNTED BRANCH DISTANCES ARE A BUG FACTORY.  The first version of the
+   handler-case triple counted instructions to size its forward branches and was
+   off by three — a silent jump into the middle of a frame copy.  Emitting the
+   branch with a placeholder and patching it from the MEASURED position removes
+   the whole class, and costs one function.
+
+   B-type scrambles the immediate: imm[12|10:5] in bits 31..25 and
+   imm[4:1|11] in bits 11..7, with imm[0] always zero."
+  (let* ((bytes (rv-buffer-bytes buf))
+         (target (rv-buffer-position buf))
+         (off (- target branch-pos))
+         (w (logior (aref bytes branch-pos)
+                    (ash (aref bytes (+ branch-pos 1)) 8)
+                    (ash (aref bytes (+ branch-pos 2)) 16)
+                    (ash (aref bytes (+ branch-pos 3)) 24))))
+    (assert (and (>= off -4096) (< off 4096) (evenp off)) ()
+            "rv-patch-branch-here: offset ~D out of B-type range" off)
+    ;; clear the two immediate fields, then re-scatter
+    (setf w (logand w #x01FFF07F))
+    (setf w (logior w
+                    (ash (logand (ash off -12) #x1) 31)
+                    (ash (logand (ash off -5) #x3F) 25)
+                    (ash (logand (ash off -1) #xF) 8)
+                    (ash (logand (ash off -11) #x1) 7)))
+    (dotimes (i 4)
+      (setf (aref bytes (+ branch-pos i)) (logand (ash w (* i -8)) #xFF)))))
+
+(defun rv-patch-jal-here (buf jal-pos)
+  "Back-patch the J-type JAL at JAL-POS to land at the CURRENT position.
+   J-type immediate: imm[20|10:1|11|19:12] — the same scramble cross.lisp's
+   entry jump builds by hand."
+  (let* ((bytes (rv-buffer-bytes buf))
+         (target (rv-buffer-position buf))
+         (off (- target jal-pos))
+         (w (logior (aref bytes jal-pos)
+                    (ash (aref bytes (+ jal-pos 1)) 8)
+                    (ash (aref bytes (+ jal-pos 2)) 16)
+                    (ash (aref bytes (+ jal-pos 3)) 24))))
+    (assert (and (>= off -1048576) (< off 1048576) (evenp off)) ()
+            "rv-patch-jal-here: offset ~D out of J-type range" off)
+    (setf w (logand w #x00000FFF))
+    (setf w (logior w
+                    (ash (logand (ash off -20) #x1) 31)
+                    (ash (logand (ash off -1) #x3FF) 21)
+                    (ash (logand (ash off -11) #x1) 20)
+                    (ash (logand (ash off -12) #xFF) 12)))
+    (dotimes (i 4)
+      (setf (aref bytes (+ jal-pos i)) (logand (ash w (* i -8)) #xFF)))))
+
+(defun rv-patch-addi-imm (buf pos imm12)
+  "Rewrite the I-type immediate of the instruction at POS.  Used to fill in an
+   AUIPC+ADDI pair's low half once the target offset is known."
+  (let* ((bytes (rv-buffer-bytes buf))
+         (w (logior (aref bytes pos)
+                    (ash (aref bytes (+ pos 1)) 8)
+                    (ash (aref bytes (+ pos 2)) 16)
+                    (ash (aref bytes (+ pos 3)) 24))))
+    (setf w (logior (logand w #x000FFFFF) (ash (logand imm12 #xFFF) 20)))
+    (dotimes (i 4)
+      (setf (aref bytes (+ pos i)) (logand (ash w (* i -8)) #xFF)))))
+
 (defun rv-current-offset (buf)
   "Return the current emission offset in bytes."
   (rv-buffer-position buf))
@@ -848,6 +912,90 @@
             (rv-emit-lbu buf +rv-t0+ +rv-sp+ 0)
             (rv-emit-addi buf +rv-sp+ +rv-sp+ 16)
             (rv-emit-slli buf +rv-a0+ +rv-t0+ 1))      ; tag as fixnum
+           ((= code #x0510)
+            ;; SETJMP.  Stack the outer frame, then save sp / fp / resume-ip and
+            ;; the eight callee-saved V-regs.  Returns NIL the first time; a
+            ;; LONGJMP re-enters at the SAME point with V0 already holding T.
+            ;;
+            ;; The resume address is AUIPC-relative and points at the
+            ;; instruction AFTER the whole block, so both the first call and the
+            ;; longjmp land there — no skip-branch, exactly x64's shape.
+            (rv-emit-handler-push buf)
+            (let ((to-skip (rv-current-offset buf)))
+              ;; A capped push stored no frame, so DO NOT arm: an over-deep
+              ;; handler-case degrades to a transparent no-op rather than
+              ;; overwriting the frame that is still live.
+              (rv-emit-bne buf +rv-t3+ +rv-x0+ 0)              ; patched
+              (rv-emit-li buf +rv-t0+ *rv-jmpbuf-addr*)
+              (rv-emit-store-word buf +rv-sp+ +rv-t0+ 0)
+              (rv-emit-store-word buf +rv-fp+ +rv-t0+ 8)
+              ;; resume-ip: AUIPC gives PC-of-this-instruction, and the landing
+              ;; point is a fixed number of BYTES further on — computed after the
+              ;; fact would need another patcher, so it is counted here and the
+              ;; count is CHECKED by an assert below.
+              (let ((auipc-pos (rv-current-offset buf)))
+                (rv-emit-auipc buf +rv-t1+ 0)
+                (rv-emit-addi buf +rv-t1+ +rv-t1+ 0)           ; patched
+                (rv-emit-store-word buf +rv-t1+ +rv-t0+ 16)
+                (dotimes (i 8)
+                  (rv-emit-store-word buf (rv-resolve-vreg (+ 4 i))
+                                      +rv-t0+ (* 8 (+ 3 i))))
+                (rv-patch-branch-here buf to-skip)
+                ;; First return: NIL, which lives in VN.
+                (rv-emit-mv buf +rv-a0+ +rv-s10+)          ; VN
+                ;; Patch the ADDI so auipc+addi == the address of the NEXT
+                ;; instruction, which is where LONGJMP jumps back to.
+                (let ((delta (- (rv-current-offset buf) auipc-pos)))
+                  (assert (< delta 2048) () "riscv setjmp: resume delta ~D too large" delta)
+                  (rv-patch-addi-imm buf (+ auipc-pos 4) delta)))))
+
+           ((= code #x0511)
+            ;; LONGJMP.  Copy the jmpbuf to scratch FIRST — the pop restores the
+            ;; OUTER frame over it, and we still need the INNER one we are about
+            ;; to jump to.  Then restore and jump with V0 = T.
+            ;;
+            ;; Word 0 == 0 is the "no handler armed" sentinel.  With nothing
+            ;; armed this falls through to a TRAP rather than jumping to address
+            ;; zero, so an unhandled condition is an honest crash at a named
+            ;; instruction instead of a wild branch.
+            (rv-emit-li buf +rv-t0+ *rv-jmpbuf-addr*)
+            (rv-emit-load-word buf +rv-t1+ +rv-t0+ 0)
+            (let ((to-nohandler (rv-current-offset buf)))
+              (rv-emit-beq buf +rv-t1+ +rv-x0+ 0)              ; patched
+              (rv-emit-li buf +rv-t2+ *rv-longjmp-scratch-addr*)
+              (dotimes (i +rv-jmpbuf-words+)
+                (rv-emit-load-word buf +rv-t3+ +rv-t0+ (* 8 i))
+                (rv-emit-store-word buf +rv-t3+ +rv-t2+ (* 8 i)))
+              ;; Zero the LIVE capped count: this unwind passes every capped
+              ;; (strictly inner) frame at once, so their pending absorbs must
+              ;; not fire against an outer pop afterwards.
+              (rv-emit-li buf +rv-t1+ *rv-hstack-capped-addr*)
+              (rv-emit-store-word buf +rv-x0+ +rv-t1+ 0)
+              (rv-emit-handler-pop buf)
+              ;; Restore from the scratch copy.  V0 is loaded LAST but one so
+              ;; nothing below clobbers it, and t2 holds the jump target.
+              (rv-emit-li buf +rv-t0+ *rv-longjmp-scratch-addr*)
+              (dotimes (i 8)
+                (rv-emit-load-word buf (rv-resolve-vreg (+ 4 i))
+                                   +rv-t0+ (* 8 (+ 3 i))))
+              (rv-emit-load-word buf +rv-t2+ +rv-t0+ 16)       ; resume ip
+              (rv-emit-load-word buf +rv-fp+ +rv-t0+ 8)
+              (rv-emit-load-word buf +rv-sp+ +rv-t0+ 0)
+              (rv-emit-li buf +rv-a0+ +t-value+)               ; second return: T
+              (rv-emit-jalr buf +rv-x0+ +rv-t2+ 0)
+              (rv-patch-branch-here buf to-nohandler)
+              ;; No handler armed: trap with the code in a7, so the failure names
+              ;; itself.  mvm-eval prints "LONGJMP with no active handler-case"
+              ;; on the arches that can; this one at least stops HERE.
+              (rv-emit-addi buf +rv-a7+ +rv-x0+ #x0511)
+              (rv-emit-ebreak buf)))
+
+           ((= code #x0512)
+            ;; CLEAR-HANDLER: pop one frame.  V0 carries the handler-case's
+            ;; RESULT at this point, so the pop must not touch it — which is why
+            ;; RV-EMIT-HANDLER-POP works in t0..t6 and never in a0.
+            (rv-emit-handler-pop buf))
+
            ((and (= code #x0502) *riscv-linux-mode*)
             ;; GENERIC 3-ARG SYSCALL.  V0 = number, V1..V3 = args, all TAGGED;
             ;; result comes back TAGGED in V0.  V0..V3 are a0..a3 here, so the
@@ -1925,6 +2073,153 @@
 ;;; ============================================================
 ;;; Function Prologue / Epilogue
 ;;; ============================================================
+
+;;; ============================================================
+;;; handler-case: the SETJMP / LONGJMP / CLEAR-HANDLER triple
+;;; ============================================================
+;;;
+;;; These three traps ARE handler-case, and the real CL image emits 1540 of them
+;;; (clear-handler 709, setjmp 708, longjmp 123 — measured, not guessed).
+;;;
+;;; THE FRAME PUSH AND POP ARE INLINED, where i386 and AArch64 call a helper.
+;;; This translator resolves branches through a label map keyed by BYTECODE
+;;; OFFSET, so it has no way to name an arbitrary emitted label and no
+;;; call-a-helper idiom; adding one is a bigger change than inlining twenty
+;;; instructions.  Cost, stated: ~1400 sites x ~15 instructions x 4 bytes is
+;;; about 84 KB in a 40 MB image.
+;;;
+;;; EVERY BRANCH DISTANCE HERE IS COUNTED BY HAND, in units of whole
+;;; instructions, because every instruction this back end emits is four bytes.
+;;; That is only safe as long as the emitters below stay one instruction each --
+;;; RV-EMIT-LI IS NOT ONE INSTRUCTION and must never appear between a branch and
+;;; its target.  Where an address is needed inside a branched region it is
+;;; materialised BEFORE the branch.
+
+(defparameter *rv-jmpbuf-addr* #x10000180
+  "Twelve words: sp, fp, resume-ip, then V4..V11.
+
+   WHY ALL EIGHT V-REGS.  V4..V11 map to s11,s1..s7 — every one a CALLEE-SAVED
+   register, saved by the prologue of whichever function uses it and restored by
+   that function's EPILOGUE.  A longjmp jumps over those epilogues, so anything
+   the abandoned computation put in them would still be there.  x64 saves only
+   RBX because its V5..V8 are caller-saved and live in frame slots; here they are
+   not, so all eight travel in the jmpbuf.
+
+   VA / VL / VN (s8/s9/s10) are DELIBERATELY ABSENT.  Restoring the allocation
+   pointer would un-allocate everything the abandoned computation built — the
+   condition object among it, which the handler is about to read.")
+(defconstant +rv-jmpbuf-words+ 12)
+(defconstant +rv-jmpbuf-size+ 96)
+
+(defparameter *rv-hstack-depth-addr* #x10000400
+  "Handler-stack depth.  The mmap'd heap is MAP_ANONYMOUS, so it starts at 0.")
+(defparameter *rv-hstack-base-addr* #x10000408
+  "Frame 0.  Frame N is at base + 96*N.")
+(defparameter *rv-hstack-max-depth* 21
+  "Frames that fit between the stack base and #x10000C10, which is where the
+   shared low-memory map puts the longjmp scratch.  21 nested handler-cases; a
+   deeper one is CAPPED (see below) rather than allowed to run off the end.")
+
+(defparameter *rv-longjmp-scratch-addr* #x10000300
+  "Twelve words.  LONGJMP copies the jmpbuf here BEFORE the pop overwrites it --
+   the pop restores the OUTER frame into the jmpbuf, and longjmp still needs the
+   INNER one it is jumping to.  #x300 because #x250..#x3FF is the one free span
+   in the fixed block below the handler stack.")
+(defparameter *rv-hstack-capped-addr* #x10000360
+  "LIVE count of capped pushes.  A capped push stores NO frame, so the
+   CLEAR-HANDLER that textually matches it must ABSORB its pop instead of
+   draining a real frame — otherwise an over-deep handler-case silently pops
+   somebody else's.  LONGJMP zeroes it: it unwinds past every capped (strictly
+   inner) frame at once, so their pending absorbs must not fire against outer
+   pops afterwards.")
+
+(defun rv-emit-handler-push (buf)
+  "Stack the CURRENT jmpbuf so a nested handler-case does not overwrite it.
+   Leaves t3 = 0 if a frame was stored, 1 if the push was CAPPED.
+
+   NESTING IS NOT DEFERRABLE.  SEQUENTIAL handler-cases work with a single-level
+   implementation -- and that is exactly what init-all-globals does, one per init
+   thunk -- so an implementation without this passes the early milestones and
+   fails later, the worst available failure shape.
+
+   Branch distances are BACK-PATCHED from measured positions, never counted."
+  (rv-emit-li buf +rv-t1+ *rv-hstack-depth-addr*)
+  (rv-emit-load-word buf +rv-t2+ +rv-t1+ 0)              ; t2 = depth
+  (rv-emit-addi buf +rv-t3+ +rv-x0+ 1)                   ; assume capped
+  (rv-emit-addi buf +rv-t4+ +rv-x0+ *rv-hstack-max-depth*)
+  ;; Both addresses are materialised BEFORE the branch.  RV-EMIT-LI is
+  ;; multi-instruction; back-patching no longer cares about the count, but
+  ;; keeping LI out of a branched span keeps both arms the shape of the rest
+  ;; of this file.
+  (rv-emit-li buf +rv-t5+ *rv-hstack-base-addr*)
+  (rv-emit-li buf +rv-t6+ *rv-jmpbuf-addr*)
+  (let ((to-capped (rv-current-offset buf)))
+    (rv-emit-bge buf +rv-t2+ +rv-t4+ 0)                  ; patched below
+    ;; dest = base + depth*96, built as 64+32 so nothing here is multi-word
+    (rv-emit-slli buf +rv-t0+ +rv-t2+ 6)
+    (rv-emit-add buf +rv-t5+ +rv-t5+ +rv-t0+)
+    (rv-emit-slli buf +rv-t0+ +rv-t2+ 5)
+    (rv-emit-add buf +rv-t5+ +rv-t5+ +rv-t0+)
+    (dotimes (i +rv-jmpbuf-words+)
+      (rv-emit-load-word buf +rv-t0+ +rv-t6+ (* 8 i))
+      (rv-emit-store-word buf +rv-t0+ +rv-t5+ (* 8 i)))
+    (rv-emit-addi buf +rv-t2+ +rv-t2+ 1)
+    (rv-emit-store-word buf +rv-t2+ +rv-t1+ 0)
+    (rv-emit-addi buf +rv-t3+ +rv-x0+ 0)                 ; stored, not capped
+    (let ((to-done (rv-current-offset buf)))
+      (rv-emit-jal buf +rv-x0+ 0)                        ; patched below
+      (rv-patch-branch-here buf to-capped)
+      ;; --- capped: bump the LIVE capped count, leaving t3 = 1
+      (rv-emit-li buf +rv-t1+ *rv-hstack-capped-addr*)
+      (rv-emit-load-word buf +rv-t0+ +rv-t1+ 0)
+      (rv-emit-addi buf +rv-t0+ +rv-t0+ 1)
+      (rv-emit-store-word buf +rv-t0+ +rv-t1+ 0)
+      (rv-patch-jal-here buf to-done))))
+
+(defun rv-emit-handler-pop (buf)
+  "Restore the top stacked frame into the jmpbuf, or ZERO the jmpbuf when the
+   stack is empty.  Clobbers t0..t6 only.
+
+   THREE ARMS, and the first one is the subtle one: a pop that textually matches
+   a CAPPED push must ABSORB it and touch nothing else.  Draining a real frame
+   there would pop a handler that is still armed — the drain-to-depth-0 class."
+  ;; --- arm 1: capped > 0 ?  absorb and return.
+  (rv-emit-li buf +rv-t1+ *rv-hstack-capped-addr*)
+  (rv-emit-load-word buf +rv-t0+ +rv-t1+ 0)
+  (let ((to-not-capped (rv-current-offset buf)))
+    (rv-emit-beq buf +rv-t0+ +rv-x0+ 0)                  ; patched
+    (rv-emit-addi buf +rv-t0+ +rv-t0+ -1)
+    (rv-emit-store-word buf +rv-t0+ +rv-t1+ 0)
+    (let ((to-done-1 (rv-current-offset buf)))
+      (rv-emit-jal buf +rv-x0+ 0)                        ; patched
+      (rv-patch-branch-here buf to-not-capped)
+      ;; --- arm 2: depth > 0 ?  restore frame[depth-1] into the jmpbuf.
+      (rv-emit-li buf +rv-t1+ *rv-hstack-depth-addr*)
+      (rv-emit-load-word buf +rv-t2+ +rv-t1+ 0)
+      (rv-emit-li buf +rv-t5+ *rv-hstack-base-addr*)
+      (rv-emit-li buf +rv-t6+ *rv-jmpbuf-addr*)
+      (let ((to-empty (rv-current-offset buf)))
+        (rv-emit-beq buf +rv-t2+ +rv-x0+ 0)              ; patched
+        (rv-emit-addi buf +rv-t2+ +rv-t2+ -1)
+        (rv-emit-store-word buf +rv-t2+ +rv-t1+ 0)
+        (rv-emit-slli buf +rv-t0+ +rv-t2+ 6)
+        (rv-emit-add buf +rv-t5+ +rv-t5+ +rv-t0+)
+        (rv-emit-slli buf +rv-t0+ +rv-t2+ 5)
+        (rv-emit-add buf +rv-t5+ +rv-t5+ +rv-t0+)
+        (dotimes (i +rv-jmpbuf-words+)
+          (rv-emit-load-word buf +rv-t0+ +rv-t5+ (* 8 i))
+          (rv-emit-store-word buf +rv-t0+ +rv-t6+ (* 8 i)))
+        (let ((to-done-2 (rv-current-offset buf)))
+          (rv-emit-jal buf +rv-x0+ 0)                    ; patched
+          (rv-patch-branch-here buf to-empty)
+          ;; --- arm 3: empty.  ZERO THE WHOLE JMPBUF, not just word 0.
+          ;; Word 0 = 0 is the "no handler armed" sentinel LONGJMP tests, but
+          ;; leaving the other eleven words holding a dead frame's callee-saved
+          ;; registers would leave stale values for the next restore to load.
+          (dotimes (i +rv-jmpbuf-words+)
+            (rv-emit-store-word buf +rv-x0+ +rv-t6+ (* 8 i)))
+          (rv-patch-jal-here buf to-done-2)
+          (rv-patch-jal-here buf to-done-1))))))
 
 (defun rv-float-load-bits (buf ptr acc tmp)
   "Reassemble the four tagged 16-bit chunks of the double whose TAGGED pointer is

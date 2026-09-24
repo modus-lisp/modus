@@ -52,5 +52,19 @@ case "$LINE" in
   *)      say "FAIL: witness missing or wrong (expected VC+wi5)"; fail=1 ;;
 esac
 tr -d '\r' < $OUT | grep -q '^> ' && say "ok: REPL prompt reached after the self-test" || { say "FAIL: no REPL prompt"; fail=1; }
+# Optional: the REAL CL image through the same path (MODUS_SNP_CL=1; ~5 min,
+# 12 GB SBCL).  Witness: VC+wi5 before the banner, then a form evaluates.
+if [ "${MODUS_SNP_CL:-0}" = 1 ]; then
+  say "building the UEFI-CL :test image"
+  MODUS_UEFI_SNP=test MODUS_NET_BUILD=1 MODUS_CL_REPL_OUT=$PWD/$W/uefi-cl-test.efi \
+    sbcl --dynamic-space-size 12288 --script mvm/build-uefi-cl-repl.lisp > $W/build-cl.log 2>&1 \
+    || { say "FAIL: UEFI-CL build"; fail=1; }
+  if [ -f $W/uefi-cl-test.efi ]; then
+    R=$(OUT=$W/cl-serial.txt TIMEOUT=240 scripts/run-uefi-cl.sh $W/uefi-cl-test.efi '(* 6 7)' 2>/dev/null | tail -1)
+    CLW=$(tr -d '\r' < $W/cl-serial.txt | sed 's/\x1b\[[0-9;=]*[A-Za-z]//g' | grep -o 'VC[^>]*' | head -1)
+    say "UEFI-CL witness '$CLW', (* 6 7) => '$R'"
+    [ "$CLW" = "VC+wi5" ] && [ "$R" = "42" ] && say "ok: UEFI-CL boots via OVMF with the #VC path" || { say "FAIL: UEFI-CL"; fail=1; }
+  fi
+fi
 [ $fail = 0 ] && say "PASS" || say "FAIL"
 exit $fail

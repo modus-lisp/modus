@@ -3,6 +3,41 @@
 Status 2026-09-24: **steps 2 and 3 of the plan are built and exercised as far
 as a non-SNP machine allows.  Nothing has run inside a real SNP guest yet.**
 
+## What is measured, and the DDC constraint (2026-09-24, from the user)
+
+The goal is to attest a **DDC'd hash**: the launch measurement must pin an
+artifact that Modus's own self-hosted compiler reproduces byte-for-byte from
+independent hosts (the SBCL/CCL/ABCL fixpoint, `scripts/run-fixpoint-hosts.sh`).
+
+Two facts narrow the delivery options:
+
+1. **An SNP launch digest covers only pre-launch memory**: the firmware, and
+   with the AmdSev OVMF build the hashes of what QEMU passes as `-kernel`,
+   `-initrd` and `-append` (OVMF's QemuKernelLoaderFs verifies them against a
+   measured hash table).  An EFI application loaded from a disk image — how
+   `scripts/run-uefi-cl.sh` and `test/run-uefi-snp-test.sh` boot today — is
+   **not in the measurement at all**.  The payload must arrive via `-kernel`
+   (AmdSev OVMF boots a `-kernel` argument as a PE/COFF EFI application, which
+   the UEFI images are) or as an IGVM image.
+2. **The DDC'd artifact that exists today is the hosted Linux ELF**:
+   `modus-sh --compile` emits `:linux-x64` only (`mvm/build-modus-selfhost.lisp`).
+   So the bare-metal image is not DDC'd until the in-image compiler can emit
+   the UEFI image from a deterministic source text and reproduce the
+   SBCL-built bytes.
+
+Hence two routes, both kept open:
+
+| route | payload in the digest | DDC status | attestation channel |
+|---|---|---|---|
+| **Linux intermediate** | bzImage + initramfs containing the fixpoint `modus` ELF | DDC'd now (the ELF); kernel/initrd reproducible by the usual means | `/dev/sev-guest` ioctl from hosted modus |
+| **Bare metal (the goal)** | `modus-uefi-cl.efi` via `-kernel` | needs `--compile` to grow a `:uefi-x64-cl` target and match the SBCL build byte-for-byte | GHCB guest request from the #VC-capable image |
+
+`mvm/build-fixpoint.lisp` (the multi-arch SSH Gen0, task #252) **builds again
+on this tree** — a 49 MB Gen0 at metadata VA 0x3000000 — so the build-time
+wall my earlier note recorded is gone; whether that Gen0 still reaches its
+fixpoint under `run-fixpoint-ssh.sh` was not re-run here.  It is a different
+artifact from the payload anyway.
+
 ## The plan
 
 1. **Launch** — boot Modus as the measured payload.  SNP needs firmware, so the
@@ -18,6 +53,27 @@ as a non-SNP machine allows.  Nothing has run inside a real SNP guest yet.**
 5. **Attestation** — request a report over the SNP guest channel (AES-GCM with
    the VMPCK from the secrets page), bind the SSH host key hash in `report_data`.
    NOT STARTED.
+
+## The UEFI-bootable CL image: `mvm/build-uefi-cl-repl.lisp`
+
+The bare-metal CL image (`build-x64-cl-repl`, the real CL stack, E1000 with
+`MODUS_NET_BUILD=1`) wrapped as PE32+: `boot-uefi-x64.lisp`'s entry stub (GDT
+in boot-x64's layout, no console tables, padded to 8 KB) hands over at
+0x100000 to boot-x64's own 64-bit kernel entry, then cross.lisp's JMP and the
+native code — the multiboot image from its 64-bit entry onward.  The
+descriptor is `:uefi-x64-cl` with `:load-addr` = 0x100000 − pad so every VA
+cross.lisp computes is right.  boot-x64's `emit-x64-interrupt-setup` re-adds
+IDT vector 29 after its own LIDT when an SNP mode is on.  The shared 2 MB
+page for this image is 0x0C000000 (its NIC rings), GHCB 0x0C1FF000.
+Boot: `scripts/run-uefi-cl.sh IMAGE.efi '(+ 1 2)'`.
+
+Measured 2026-09-24 (`MODUS_UEFI_SNP=test MODUS_NET_BUILD=1`, 42.5 MB): boots
+under plain OVMF, prints the `VC+wi5` witness before the banner, evaluates
+`(+ 1 2)` → 3 and `(list (lisp-implementation-type) (* 6 7))` → `("Modus" 42)`.
+The toy UEFI image is still byte-identical with the flag off after the stub
+emitter grew its layout knobs.  With an E1000 attached, DHCP gets no lease
+under OVMF — and **neither does the same image booted by multiboot on this
+QEMU 7.2**, so that is environmental/pre-existing, not the UEFI path.
 
 ## What is in the tree
 

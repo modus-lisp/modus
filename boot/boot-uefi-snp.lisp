@@ -38,14 +38,17 @@
   "NIL, :SNP or :TEST — see the file header.")
 
 ;;; ---- Fixed addresses -----------------------------------------------------
-(defconstant +snp-shared-base+  #x05000000
+(defvar *snp-shared-base* #x05000000
   "The ONE 2 MB identity-map page mapped without the C-bit.  Holds the E1000
-   RX/TX rings and buffers (net/arch-x86.lisp: 0x05000000..0x05060000+) and the
-   GHCB.  Chosen so the whole shared set fits in a single PD entry and the 2 MB
-   tables never need a 4 KB split.")
+   RX/TX rings and buffers and the GHCB, so the whole shared set fits in a
+   single PD entry and the 2 MB tables never need a 4 KB split.  Per image:
+   the toy UEFI REPL's NIC adapter (net/arch-x86.lisp) puts the rings at
+   0x05000000; the CL image's (net/arch-x86-cl.lisp) at 0x0C000000..0x0C113000.
+   Set by the build script BEFORE build-image.")
 (defconstant +snp-shared-size+  #x200000)
-(defconstant +snp-ghcb-addr+    #x051FF000
-  "GHCB: the last 4 KB page of the shared region.")
+(defun snp-ghcb-addr ()
+  "GHCB: the last 4 KB page of the shared region."
+  (+ *snp-shared-base* +snp-shared-size+ (- #x1000)))
 (defconstant +snp-idt-addr+     #x18000  "32 entries x 16 bytes, below 0x18200.")
 (defconstant +snp-idtr-addr+    #x18800  "10-byte IDTR scratch.")
 (defconstant +snp-vc-addr+      #x19000  "#VC handler code, copied here from the stub.")
@@ -155,7 +158,7 @@
   (let ((a (make-snp-asm)))
     ;; ---- prologue: save the registers we use; RBX = GHCB
     (sa a #x50 #x51 #x52 #x53 #x56 #x57)                ; push rax rcx rdx rbx rsi rdi
-    (sa a #x48 #xBB) (sa-u64 a +snp-ghcb-addr+)         ; mov rbx, GHCB
+    (sa a #x48 #xBB) (sa-u64 a (snp-ghcb-addr))         ; mov rbx, GHCB
     (sa-mov-rax-rsp a +vcf-err+)                        ; rax = exit code
     (sa a #x48 #x8B #x74 #x24 +vcf-rip+)                ; rsi = faulting RIP
     (sa a #x48 #xFF #x04 #x25) (sa-u32 a +snp-vc-count-addr+)   ; inc qword [count]
@@ -300,7 +303,7 @@
     (ecase mode
       (:snp
        (sa a #xB9) (sa-u32 a +msr-ghcb+)                ; mov ecx, GHCB MSR
-       (sa a #xB8) (sa-u32 a +snp-ghcb-addr+)           ; mov eax, GHCB GPA
+       (sa a #xB8) (sa-u32 a (snp-ghcb-addr))           ; mov eax, GHCB GPA
        (sa a #x31 #xD2) (sa a #x0F #x30)                ; xor edx,edx ; wrmsr
        (sa a #xF3 #x0F #x01 #xD9)                       ; rep vmmcall = VMGEXIT
        (sa a #xC3))
@@ -400,19 +403,47 @@
 (defun emit-snp-pd-entry-fixup (buf)
   "Inside the PD fill loop, after `mov rax,rdx ; or rax,0x83`:
      or rax, rbx                 ; C-bit
-     cmp rdx, +snp-shared-base+  ; the one shared 2 MB page
+     cmp rdx, *snp-shared-base*  ; the one shared 2 MB page
      jne +3
      xor rax, rbx                ; ... gets the C-bit taken back out"
   (emit-snp-or-rax-rbx buf)
   (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x81) (mvm-emit-byte buf #xFA)
-  (mvm-emit-u32 buf +snp-shared-base+)
+  (mvm-emit-u32 buf *snp-shared-base*)
   (mvm-emit-byte buf #x75) (mvm-emit-byte buf #x03)
   (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x31) (mvm-emit-byte buf #xD8))
 
-(defun emit-snp-post-cr3 (buf)
+(defun emit-snp-idt-vector29 (a idt-base code-selector)
+  "Into the SNP-ASM A: write IDT entry 29 of the table at IDT-BASE -> the
+   handler (:snp) or the INT-29 thunk (:test).  Type 0x8E = present, DPL0,
+   interrupt gate.  CODE-SELECTOR is the 64-bit code segment of whatever GDT
+   is live when the entry fires (the UEFI stub's own is 0x08 in the toy
+   layout; boot-x64's is 0x10)."
+  (let* ((target (if (eq *x64-snp-mode* :test) +snp-vc-thunk-addr+ +snp-vc-addr+))
+         (entry (+ idt-base (* 29 16)))
+         (w0 (logior (logand target #xFFFF) (ash code-selector 16)))
+         (w1 (logior (ash #x8E 8) (ash (logand (ash target -16) #xFFFF) 16))))
+    (sa a #x48 #xC7 #xC7) (sa-u32 a entry)                   ; mov rdi, entry
+    (sa a #xC7 #x07) (sa-u32 a w0)                           ; mov dword [rdi],w0
+    (sa a #xC7 #x47 #x04) (sa-u32 a w1)                      ; mov dword [rdi+4],w1
+    (sa a #xC7 #x47 #x08) (sa-u32 a (ash target -32))        ; [rdi+8] = offset hi
+    (sa a #xC7 #x47 #x0C) (sa-u32 a 0)))
+
+(defun emit-snp-readd-vector29 (buf idt-base code-selector)
+  "Into the boot buffer BUF: re-write IDT entry 29 into a table some later boot
+   stage has just loaded over ours (boot-x64's emit-x64-interrupt-setup loads
+   its own 48-entry IDT at +x64-idt-addr+; without this the first port
+   instruction after its LIDT would be a #VC with no gate).  Clobbers RDI."
+  (when *x64-snp-mode*
+    (let ((a (make-snp-asm)))
+      (emit-snp-idt-vector29 a idt-base code-selector)
+      (let ((bytes (sa-finish a)))
+        (loop for b across bytes do (mvm-emit-byte buf b))))))
+
+(defun emit-snp-post-cr3 (buf &optional (code-selector #x08))
   "After CR3/GDT/segments: make the shared region shared, register the GHCB,
    copy the #VC handler into place and load an IDT with vector 29.
-   The PSC/registration part runs only if +snp-active-addr+ is 1."
+   The PSC/registration part runs only if +snp-active-addr+ is 1.
+   CODE-SELECTOR: the live GDT's 64-bit code segment, for the IDT entry."
   (let ((a (make-snp-asm))
         (handler (assemble-vc-handler *x64-snp-mode*)))
     (when (> (length handler) (- +snp-vc-thunk-addr+ +snp-vc-addr+))
@@ -421,7 +452,7 @@
     (sa a #x8B #x04 #x25) (sa-u32 a +snp-active-addr+)         ; mov eax,[active]
     (sa a #x85 #xC0) (sa-jcc a :e :install)                    ; test eax,eax ; jz
     ;; rsi = page cursor over the shared region
-    (sa a #x48 #xC7 #xC6) (sa-u32 a +snp-shared-base+)         ; mov rsi, base
+    (sa a #x48 #xC7 #xC6) (sa-u32 a *snp-shared-base*)         ; mov rsi, base
     (sa-label a :psc-loop)
     ;;   PVALIDATE rsi, 4K, rescind:  rax=va rcx=0 rdx=0 ; F2 0F 01 FF
     (sa a #x48 #x89 #xF0) (sa a #x31 #xC9) (sa a #x31 #xD2)
@@ -439,19 +470,19 @@
     (sa a #x83 #xF9 +ghcb-msr-psc-resp+) (sa-jcc a :ne :fatal) ; must be 0x015
     (sa a #x85 #xD2) (sa-jcc a :ne :fatal)                     ; error code (hi 32) must be 0
     (sa a #x48 #x81 #xC6) (sa-u32 a #x1000)                    ; add rsi,4096
-    (sa a #x48 #x81 #xFE) (sa-u32 a (+ +snp-shared-base+ +snp-shared-size+)) ; cmp rsi,end
+    (sa a #x48 #x81 #xFE) (sa-u32 a (+ *snp-shared-base* +snp-shared-size+)) ; cmp rsi,end
     (sa-jcc a :b :psc-loop)
     ;;   Register the GHCB GPA
     (sa a #xB9) (sa-u32 a +msr-ghcb+)
-    (sa a #xB8) (sa-u32 a (logior +snp-ghcb-addr+ +ghcb-msr-reg-gpa-req+))
+    (sa a #xB8) (sa-u32 a (logior (snp-ghcb-addr) +ghcb-msr-reg-gpa-req+))
     (sa a #x31 #xD2) (sa a #x0F #x30) (sa a #xF3 #x0F #x01 #xD9) (sa a #x0F #x32)
     (sa a #x89 #xC1) (sa a #x81 #xE1) (sa-u32 a #xFFF)
     (sa a #x83 #xF9 +ghcb-msr-reg-gpa-resp+) (sa-jcc a :ne :fatal)
     ;;   Zero the (now shared) GHCB page
-    (sa a #x48 #xC7 #xC7) (sa-u32 a +snp-ghcb-addr+)           ; mov rdi, GHCB
+    (sa a #x48 #xC7 #xC7) (sa-u32 a (snp-ghcb-addr))           ; mov rdi, GHCB
     (sa a #xB9) (sa-u32 a 512) (sa a #x31 #xC0) (sa a #xFC) (sa a #xF3 #x48 #xAB) ; rep stosq
     ;;   GHCB MSR = GHCB GPA for the handler's VMGEXITs
-    (sa a #xB9) (sa-u32 a +msr-ghcb+) (sa a #xB8) (sa-u32 a +snp-ghcb-addr+)
+    (sa a #xB9) (sa-u32 a +msr-ghcb+) (sa a #xB8) (sa-u32 a (snp-ghcb-addr))
     (sa a #x31 #xD2) (sa a #x0F #x30)
     ;;   The GOP framebuffer is hypervisor memory: with the C-bit set on its
     ;;   identity mapping every store would be an MMIO #VC (NPF), which this
@@ -468,17 +499,8 @@
     ;;   clear the IDT (512 bytes)
     (sa a #x48 #xC7 #xC7) (sa-u32 a +snp-idt-addr+)
     (sa a #xB9) (sa-u32 a 64) (sa a #x31 #xC0) (sa a #xF3 #x48 #xAB)   ; 64 x stosq
-    ;;   vector 29 -> handler (:snp) or thunk (:test).  Selector 0x08 = the
-    ;;   stub's 64-bit code segment; type 0x8E = present, DPL0, interrupt gate.
-    (let* ((target (if (eq *x64-snp-mode* :test) +snp-vc-thunk-addr+ +snp-vc-addr+))
-           (entry (+ +snp-idt-addr+ (* 29 16)))
-           (w0 (logior (logand target #xFFFF) (ash #x08 16)))
-           (w1 (logior (ash #x8E 8) (ash (logand (ash target -16) #xFFFF) 16))))
-      (sa a #x48 #xC7 #xC7) (sa-u32 a entry)                   ; mov rdi, entry
-      (sa a #xC7 #x07) (sa-u32 a w0)                           ; mov dword [rdi],w0
-      (sa a #xC7 #x47 #x04) (sa-u32 a w1)                      ; mov dword [rdi+4],w1
-      (sa a #xC7 #x47 #x08) (sa-u32 a (ash target -32))        ; [rdi+8] = offset hi
-      (sa a #xC7 #x47 #x0C) (sa-u32 a 0))
+    ;;   vector 29 -> handler (:snp) or thunk (:test)
+    (emit-snp-idt-vector29 a +snp-idt-addr+ code-selector)
     (when (eq *x64-snp-mode* :test)
       ;;   thunk at +snp-vc-thunk-addr+:  6A 7B (push 0x7B) ; E9 rel32 -> handler
       (let ((rel (logand (- +snp-vc-addr+ (+ +snp-vc-thunk-addr+ 7)) #xFFFFFFFF)))

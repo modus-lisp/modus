@@ -113,6 +113,10 @@
 ;; Same thin-head contract as :VIRT; the x86 arms are marked at each
 ;; DIVERGENCE site below.  *CL-REPL-VIRT-P* keeps its aarch64-only meaning.
 (defvar *cl-repl-x64-p*  (eq *cl-repl-platform* :x64))
+;; :X64 + UEFI — the same image booted through OVMF (mvm/build-uefi-cl-repl.lisp):
+;; PE32+ wrapper, boot-uefi-x64's entry stub in front of boot-x64's kernel64
+;; entry, optional SEV-SNP hooks (boot/boot-uefi-snp.lisp).  Set by the head.
+(defvar *cl-repl-uefi-p* nil)
 (defvar *cl-repl-qemu-p* (or *cl-repl-virt-p* *cl-repl-x64-p*)
   "T for the two QEMU machines (virt, pc): E1000 over PCI, user-mode net.")
 
@@ -1915,14 +1919,20 @@
   ;; SET side is left as a dead no-op (its bits are never read).
   (setf modus.mvm.x64::*ws5-force-no-kindcheck* t)
   (setf modus.mvm.x64::*x64-native-code-offset*
-        (let ((buf (make-mvm-buffer))
-              (desc (x64-boot-descriptor)))
-          (funcall (getf desc :multiboot-header-fn) buf)
-          (funcall (getf desc :boot32-fn) buf)
-          (funcall (getf desc :kernel64-entry-fn) buf)
-          (let ((n (+ 5 (length (mvm-buffer-used-bytes buf)))))
-            (format t "~%Bare-metal boot preamble: ~D bytes (native code offset)~%" n)
-            n)))
+        (if cl-user::*cl-repl-uefi-p*
+            ;; UEFI: at 0x100000 sits the kernel64 entry alone (the stub is
+            ;; below it and is not part of the runtime image).
+            (let ((n (+ 5 (modus.mvm::uefi-cl-preamble-length))))
+              (format t "~%UEFI-CL boot preamble: ~D bytes (native code offset)~%" n)
+              n)
+            (let ((buf (make-mvm-buffer))
+                  (desc (x64-boot-descriptor)))
+              (funcall (getf desc :multiboot-header-fn) buf)
+              (funcall (getf desc :boot32-fn) buf)
+              (funcall (getf desc :kernel64-entry-fn) buf)
+              (let ((n (+ 5 (length (mvm-buffer-used-bytes buf)))))
+                (format t "~%Bare-metal boot preamble: ~D bytes (native code offset)~%" n)
+                n))))
   (format t "~&;; CONSOLE: COM1 via port I/O (x86-64 QEMU-pc)~%"))
 
 (defun %x64-memory-map-asserts (image)
@@ -2258,11 +2268,13 @@
 ;;; DIVERGENCE 8 — BUILD-IMAGE :TARGET and the default output path.
 ;;; MODUS_CL_REPL_OUT overrides either one.
 (let ((image (build-image :target (cond (cl-user::*cl-repl-virt-p* :fixpoint)
+                                        (cl-user::*cl-repl-uefi-p* :uefi-x64-cl)
                                         (cl-user::*cl-repl-x64-p* :x86-64)
                                         (t :rpi))
                           :source-text cl-user::*full-source*)))
   (let ((path (or #+sbcl (sb-ext:posix-getenv "MODUS_CL_REPL_OUT")
                   (cond (cl-user::*cl-repl-virt-p* "/tmp/modus-aarch64-cl-repl.bin")
+                        (cl-user::*cl-repl-uefi-p* "/tmp/modus-uefi-cl.efi")
                         (cl-user::*cl-repl-x64-p* "/tmp/modus-x64-cl-repl.bin")
                         (t "/tmp/piboot/kernel8.img")))))
     (ensure-directories-exist path)

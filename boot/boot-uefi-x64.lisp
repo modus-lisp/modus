@@ -138,6 +138,27 @@
 ;;; UEFI Stub Patch Info (passed from emitter to assembler)
 ;;; ============================================================
 
+(defvar *uefi-gdt-layout* :toy
+  "Which GDT the entry stub installs.
+   :TOY      — 0x08 = 64-bit code, 0x10 = data (the UEFI REPL; the kernel at
+               0x100000 is the toy's own native code).
+   :BOOT-X64 — boot-x64.lisp's layout: 0x08 = 32-bit code, 0x10 = 64-bit code,
+               data selectors NULL.  Required when the stub hands over to
+               emit-x64-kernel64-entry, whose IDT gates name selector 0x10.")
+(defvar *uefi-console-tables* t
+  "Emit the toy console's font / scancode tables and framebuffer clear.  NIL
+   for the CL image: those tables sit at 0x601000, INSIDE a 40 MB kernel copied
+   to 0x100000, and would overwrite it.")
+(defvar *uefi-stub-pad* nil
+  "When an integer, the entry stub is zero-padded to exactly this many bytes
+   and the kernel data copied to 0x100000 starts there (not at the end of the
+   whole boot-code buffer).  Lets a descriptor put more boot code (boot-x64's
+   kernel64 entry) AFTER the stub, at a KNOWN offset, so the image's runtime
+   addresses are load-addr + (image offset - pad) with load-addr = 0x100000 - pad.")
+(defvar *uefi-kernel-data-start* nil
+  "Set by emit-uefi-entry-stub when *uefi-stub-pad* is on: the image offset of
+   the kernel data.  patch-uefi-stub prefers it over the boot-code length.")
+
 (defvar *uefi-lea-patch-pos* nil
   "Position of disp32 in LEA RSI,[RIP+disp32] for kernel data source address.")
 (defvar *uefi-size-patch-pos* nil
@@ -147,6 +168,7 @@
   "Patch the UEFI stub in RAW-BYTES with kernel data offset and size.
    BOOT-CODE-LEN is the byte offset where kernel data starts."
   (when (and *uefi-lea-patch-pos* *uefi-size-patch-pos*)
+    (when *uefi-kernel-data-start* (setq boot-code-len *uefi-kernel-data-start*))
     (let* ((kernel-data-size (- (length raw-bytes) boot-code-len))
            ;; LEA RSI,[RIP+disp32]: RIP = lea-pos + 4, target = boot-code-len
            (lea-disp32 (- boot-code-len (+ *uefi-lea-patch-pos* 4))))
@@ -961,8 +983,9 @@
   (mvm-emit-byte buf #xA4)   ; MOVSB
 
   ;; ---- Emit font data and scancode tables to fixed addresses ----
-  (emit-uefi-font-data buf)
-  (emit-uefi-scancode-tables buf)
+  (when *uefi-console-tables*
+    (emit-uefi-font-data buf)
+    (emit-uefi-scancode-tables buf))
 
   ;; ---- SEV-SNP: detect, learn the C-bit (boot-uefi-snp.lisp) ----
   (when *x64-snp-mode* (emit-snp-detect buf))
@@ -1033,13 +1056,21 @@
   (mvm-emit-byte buf #x31) (mvm-emit-byte buf #xC0)  ; xor eax, eax
   (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xAB)  ; stosq
 
-  ;; Entry 1 (sel 0x08): 64-bit code = 0x00AF9A000000FFFF
-  (uefi-emit-mov-reg-imm64 buf +rax+ #x00AF9A000000FFFF)
-  (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xAB)
-
-  ;; Entry 2 (sel 0x10): data = 0x00CF92000000FFFF
-  (uefi-emit-mov-reg-imm64 buf +rax+ #x00CF92000000FFFF)
-  (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xAB)
+  (ecase *uefi-gdt-layout*
+    (:toy
+     ;; Entry 1 (sel 0x08): 64-bit code = 0x00AF9A000000FFFF
+     (uefi-emit-mov-reg-imm64 buf +rax+ #x00AF9A000000FFFF)
+     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xAB)
+     ;; Entry 2 (sel 0x10): data = 0x00CF92000000FFFF
+     (uefi-emit-mov-reg-imm64 buf +rax+ #x00CF92000000FFFF)
+     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xAB))
+    (:boot-x64
+     ;; Entry 1 (sel 0x08): 32-bit code (unused after this stub)
+     (uefi-emit-mov-reg-imm64 buf +rax+ #x00CF9A000000FFFF)
+     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xAB)
+     ;; Entry 2 (sel 0x10): 64-bit code — boot-x64's kernel selector
+     (uefi-emit-mov-reg-imm64 buf +rax+ #x00AF9A000000FFFF)
+     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xAB)))
 
   ;; GDTR at 0x620: limit(2) + base(8)
   ;; mov word [0x620], 23
@@ -1057,15 +1088,18 @@
   ;; Far return to reload CS with selector 0x08
   ;; push 0x08; lea rax, [rip + N]; push rax; retfq
   ;; N = 1 (push rax) + 2 (retfq 48 CB) = 3
-  (mvm-emit-byte buf #x6A) (mvm-emit-byte buf #x08)  ; push 8
+  (mvm-emit-byte buf #x6A) (mvm-emit-byte buf (uefi-code-selector))  ; push code selector
   (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x8D) (mvm-emit-byte buf #x05)
   (mvm-emit-u32 buf 3)     ; skip: push(1) + lretq(2) = 3
   (uefi-emit-push buf +rax+)
   ;; retfq
   (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xCB)
 
-  ;; Reload data segments with selector 0x10
-  (mvm-emit-byte buf #x66) (mvm-emit-byte buf #xB8) (mvm-emit-u16 buf #x10)
+  ;; Reload data segments: 0x10 (toy layout) or NULL (boot-x64 layout, where
+  ;; 0x10 is code; null SS/DS/ES are legal at CPL0 in 64-bit mode and are
+  ;; exactly what emit-x64-kernel64-entry loads itself)
+  (mvm-emit-byte buf #x66) (mvm-emit-byte buf #xB8)
+  (mvm-emit-u16 buf (if (eq *uefi-gdt-layout* :toy) #x10 0))
   (mvm-emit-byte buf #x8E) (mvm-emit-byte buf #xD8)  ; mov ds, ax
   (mvm-emit-byte buf #x8E) (mvm-emit-byte buf #xC0)  ; mov es, ax
   (mvm-emit-byte buf #x8E) (mvm-emit-byte buf #xD0)  ; mov ss, ax
@@ -1075,7 +1109,7 @@
   (mvm-emit-byte buf #x8E) (mvm-emit-byte buf #xE8)  ; mov gs, ax
 
   ;; ---- SEV-SNP: shared region, GHCB, #VC handler + IDT ----
-  (when *x64-snp-mode* (emit-snp-post-cr3 buf))
+  (when *x64-snp-mode* (emit-snp-post-cr3 buf (uefi-code-selector)))
 
   ;; ---- Stack at 0x800000 ----
   (uefi-emit-mov-reg-imm64 buf +rsp+ +x64-stack-top+)
@@ -1103,6 +1137,7 @@
   ;; ---- Clear framebuffer (if GOP found) ----
   ;; Check fb_valid; skip if 0
   ;; mov eax, [0x600120]
+  (when *uefi-console-tables*
   (mvm-emit-byte buf #x8B) (mvm-emit-byte buf #x04) (mvm-emit-byte buf #x25)
   (mvm-emit-u32 buf +fb-valid-addr+)
   ;; test eax, eax
@@ -1147,7 +1182,7 @@
       (setf (aref (mvm-buffer-bytes buf) (+ jz-patch 3)) (ldb (byte 8 24) (- target (+ jz-patch 4))))))
 
   ;; ---- Clear VGA text screen + disable hardware cursor ----
-  (emit-uefi-vga-clear buf)
+  (emit-uefi-vga-clear buf))
 
   ;; ---- Diagnostic: all LEDs ON = about to jump to kernel ----
   (unless *x64-snp-mode*
@@ -1160,7 +1195,18 @@
   (uefi-emit-mov-reg-imm64 buf +rax+ #x100000)
   ;; jmp rax
   (mvm-emit-byte buf #xFF) (mvm-emit-byte buf #xE0)
+  ;; ---- Optional fixed-size pad (see *uefi-stub-pad*) ----
+  (setf *uefi-kernel-data-start* nil)
+  (when *uefi-stub-pad*
+    (let ((n (mvm-buffer-position buf)))
+      (when (> n *uefi-stub-pad*)
+        (error "UEFI entry stub is ~D bytes, larger than *uefi-stub-pad* ~D" n *uefi-stub-pad*))
+      (dotimes (i (- *uefi-stub-pad* n)) (mvm-emit-byte buf 0))
+      (setf *uefi-kernel-data-start* *uefi-stub-pad*)))
   )
+
+(defun uefi-code-selector ()
+  (ecase *uefi-gdt-layout* (:toy #x08) (:boot-x64 #x10)))
 
 ;;; ============================================================
 ;;; Boot Descriptor
@@ -1173,6 +1219,53 @@
         :entry-fn #'emit-uefi-entry-stub
         :load-addr +x64-kernel-load-addr+
         :stack-top +x64-stack-top+
+        :cons-base +x64-cons-base+
+        :general-base +x64-general-base+))
+
+;;; ============================================================
+;;; UEFI + the REAL CL image (build-x64-cl-repl via OVMF)
+;;; ============================================================
+;;; The stub above, then boot-x64's 64-bit kernel entry (serial, GC metadata,
+;;; MCGC config, IDT/PIC/PIT), then cross.lisp's JMP + native code — i.e. the
+;;; multiboot image's layout from its 64-bit entry onward, so the CL image
+;;; boots via OVMF (and, later, is MEASURED by AmdSev OVMF's -kernel path).
+;;;
+;;; Address arithmetic: the stub is padded to +UEFI-CL-STUB-PAD+ bytes and
+;;; copies everything after itself to 0x100000, so runtime VA = 0x100000 +
+;;; (image offset - pad).  cross.lisp computes VAs as load-addr + offset, hence
+;;; :load-addr = 0x100000 - pad (the "wrap header" is the stub).
+
+(defconstant +uefi-cl-stub-pad+ #x2000
+  "Stub slot size.  Multiple of 16 (constant-pool alignment) and generous:
+   the stub is ~3 KB with SNP :test, ~2.7 KB without.")
+
+(defun emit-uefi-cl-entry (buf)
+  (let ((*uefi-gdt-layout* :boot-x64)
+        (*uefi-console-tables* nil)
+        (*uefi-stub-pad* +uefi-cl-stub-pad+))
+    (emit-uefi-entry-stub buf))
+  ;; boot-x64's 64-bit entry, at runtime VA 0x100000.  Its own NOP padding
+  ;; aligns (buffer length + 5) to 16; the stub pad is a multiple of 16, so
+  ;; the alignment it computes on the whole buffer holds at runtime too.
+  (emit-x64-kernel64-entry buf))
+
+(defun uefi-cl-preamble-length ()
+  "Bytes from 0x100000 to the JMP cross.lisp emits: the kernel64 entry alone.
+   Build scripts set *x64-native-code-offset* to this + 5."
+  (let ((buf (make-mvm-buffer)))
+    (emit-uefi-cl-entry buf)
+    (- (mvm-buffer-position buf) +uefi-cl-stub-pad+)))
+
+(defun uefi-x64-cl-boot-descriptor ()
+  (list :arch :x86-64
+        :uefi t
+        :entry-fn #'emit-uefi-cl-entry
+        :ap-trampoline-fn #'emit-x64-ap-trampoline
+        :serial-init-fn #'x64-init-serial
+        :smp-sequence-fn #'x64-init-smp-sequence
+        :percpu-layout-fn #'x64-percpu-layout
+        :load-addr (- +x64-kernel-load-addr+ +uefi-cl-stub-pad+)
+        :stack-top (x64-effective-stack-top)
         :cons-base +x64-cons-base+
         :general-base +x64-general-base+))
 

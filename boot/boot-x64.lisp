@@ -1086,6 +1086,11 @@
     ;; lidt [rsp]
     (mvm-emit-byte buf #x0F) (mvm-emit-byte buf #x01)
     (mvm-emit-byte buf #x1C) (mvm-emit-byte buf #x24)
+    ;; SEV-SNP (boot-uefi-snp.lisp): this LIDT just replaced the UEFI stub's
+    ;; IDT, whose vector 29 (#VC) made every port instruction work.  Put the
+    ;; gate back into THIS table before the next IN/OUT.  Emits nothing when
+    ;; *x64-snp-mode* is NIL.
+    (emit-snp-readd-vector29 buf idt-base #x10)
     ;; add rsp, 16  (restore stack)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x83)
     (mvm-emit-byte buf #xC4) (mvm-emit-byte buf #x10)

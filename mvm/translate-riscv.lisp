@@ -2156,10 +2156,26 @@
        (rv-emit-addi buf +rv-sp+ +rv-sp+ 96))
 
       (#.+op-yield+
-       ;; Preemption check: read mstatus or timer, branch to scheduler if needed
-       ;; For now, emit ecall as yield trap
-       (rv-emit-addi buf +rv-a7+ +rv-x0+ #x0A)  ; yield syscall number
-       (rv-emit-ecall buf))
+       ;; Preemption check, which the compiler plants at EVERY LOOP BACK-EDGE.
+       ;;
+       ;; HOSTED IT IS A NOP, as translate-x64 makes it under *x64-linux-mode*
+       ;; ("LINUX: NOP (no scheduler, no deadline)") and as i386, ppc, 68k and
+       ;; arm32 make it everywhere.  RISC-V emitted `li a7, 10; ecall' -- a
+       ;; placeholder "yield syscall" -- and on Linux syscall 10 is FGETXATTR.
+       ;; So every iteration of every loop in the image made a real system call
+       ;; that failed with EFAULT on its Lisp-value arguments: 192,180 of them in
+       ;; the first 30 s of boot, seen with `qemu-riscv64-static -strace'.  That
+       ;; was essentially the whole of the real CL image's 866 s boot against
+       ;; x64's 2.7 s -- the same algorithm (package tables measured identical)
+       ;; paying a kernel round trip through qemu's syscall layer per iteration.
+       ;;
+       ;; Bare metal keeps the ecall: there it traps to the machine-mode handler
+       ;; the bare boot installs, and the bare gate passes with it.
+       (if *riscv-linux-mode*
+           (rv-emit-nop buf)
+           (progn
+             (rv-emit-addi buf +rv-a7+ +rv-x0+ #x0A)  ; yield trap number
+             (rv-emit-ecall buf))))
 
       (#.+op-atomic-xchg+
        ;; Atomic exchange: amoswap.d rd, rs, (raddr) with aq+rl

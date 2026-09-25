@@ -58,50 +58,44 @@ the hosted `--compile`'s static-emit trio, JIT off first.
 and compares the bytes: SBCL vs modus-sh (the fixpoint) and run vs run.  The
 md5 of the modus-sh output is the DDC'd hash for `-kernel`.
 
-**Result, 2026-09-25.**  The pipeline runs end to end; the fixpoint does not
-hold yet, and the reasons are now enumerated rather than guessed.
+**Result, 2026-09-25 (end of day).**  The in-image compile now runs end to
+end, is reproducible run to run, boots to its banner, and its per-function
+bytecode matches the host's for standalone code.  It is **not yet the
+fixpoint**, and the remaining gap is now one named thing.
 
-1. **A real x64 self-host regression on main was found and fixed.**  The first
-   in-image compile emitted a 9.95 MB partial image ("Unknown register: 6" on
-   `(mov V9 V6)`).  `git bisect run` over 339 commits with the fixed source text
-   → a1095b7 (2026-09-18): its "register map co-inits in five build scripts"
-   sweep wrote the aarch64 local-register map (6 7 4 5 8) into the two co-inits
-   that build `*vreg-to-x64*` (modus-sh's own x64 emit, and the aarch64 CLI's
-   x64 cross-emit); x64 spills V9..V15 and needs NIL there.  Fixed in both.
-   The hosted `./modus` x64 JIT was never affected (0 fallbacks measured).
-   `scripts/ws5-gate.sh` missed it because its self-compile is a tiny program.
-2. **Constants the host knows, the image does not.**  142 `+OP-*+` /
-   `+GC-REGION-0-BASE+` references compiled as implicit globals in-image (used
-   before their DEFCONSTANT in the stream; SBCL folds them from the host
-   image).  A constants forward block is now prepended to the CL image's text
-   (`%ddc-constants-forward-block`, 229 integer-literal defconstants); the
-   +OP-*+ class is gone.  Still escaping: `+GC-REGION-0-BASE+` (8), and CL's
-   `MOST-POSITIVE-FIXNUM` / `MOST-NEGATIVE-FIXNUM`, which the host folds as CL
-   constants.
-3. **The in-image compile is a different BUILD CONFIGURATION, not just a
-   different compiler.**  `--compile-uefi` forces `*static-build-p*` T (as the
-   hosted `--compile` does), and under that flag every DEFCONSTANT registers an
-   `INIT-+X+` boot thunk (compiler.lisp toplevel DEFCONSTANT clause): the
-   in-image image has 266 INIT thunks and 60 more TOPLEVEL thunks than the
-   SBCL one (5116 vs 4791 named functions after filtering numbered closures),
-   yet is 3.4 MB smaller (37.9 vs 41.2 MB).  For byte identity both sides must
-   run ONE configuration — the `*mvm-eval-runtime-p*` / `*static-build-p*`
-   consolidation already recorded as the WS5 "one flag" work.
-4. **936 call sites resolve to a callee named NIL in-image** (host: 26
-   unresolved, none NIL), so the modus-sh-built image boots to its `MODUS-CL`
-   marker and dies on an undefined function.  A flag-gated trace at the
-   assembler's `:call` site (`*ddc-trace-nil-callee*`) was added but did not
-   fire, so the sites are still unattributed.
-5. **144 bytes of run-to-run nondeterminism** remain, in 4-byte groups inside
-   `%MUL-LIMBS-MAG`, `BIGNUM-EQL`, `%ANY-TO-FLOAT`, `GENERIC-MULTIPLY`,
-   `EMIT-LI-TAGGED`, `COMPILE-FORM` … — the emit-u64 high-dword class recorded
-   in `reference_selfcompile_nondeterminism`, at a site other than the one
-   fixed then (bignum/float immediates).
+Fixed today, each measured (details in the commit messages):
+1. a1095b7 had written the aarch64 local-register map into modus-sh's x64
+   spill table (partial 9.95 MB image) — restored.
+2. `+FIXNUM-MAX+`-class constants reached the compiler through in-image
+   `eval`, whose word conversion overflows at 2^61 — literals are taken as is
+   (144 nondeterministic bytes gone; run 1 == run 2 ever since).
+3. `(intern name :modus.mvm)` returned NIL in-image — 936 init-thunk calls
+   were calls to NIL; the self-compiled image died in INIT-ALL-GLOBALS.
+4. modus-sh had no MODUS.MVM package, so every symbol read into CL-USER and
+   quoted symbols carried the wrong package hash — the host's build-time
+   packages are now mirrored (and un-marked as runtime-born, which otherwise
+   qualified every function key and lost the JMP to kernel-main).
+5. `*static-build-p*` registers an INIT thunk per DEFCONSTANT; the SBCL side
+   of the comparison now builds in that same configuration
+   (`MODUS_STATIC_BUILD=1`) — it boots and evaluates, 35.9 MB.
+6. Instruments: `--dump-mvm` (per-function MVM bytecode in-image),
+   `tmp/mvmdiff/*` host twins, `fncompare2.py` (normalized native diff; the
+   PE section starts at file 0x200, not 0x1000).
 
-So the DDC'd bare-metal payload needs, in order: (4) and (5) fixed in the
-in-image compiler, then (3) decided (one configuration for both builders),
-then `test/run-uefi-ddc.sh` green.  The measurement instrument is done and is
-what found (1).
+**The one remaining cause: the in-image READ of the text drops 114 forms the
+host reads** (`SKIP read at line …` in the compile log; host: 0).  67 are
+`#.(compute-name-hash …)` read-time evaluations that fail with
+`UNDEFINED-FUNCTION MODUS.MVM::COMPUTE-NAME-HASH` — the reader's `#.` goes
+through mvm-eval, which qualifies the function key with the (mirrored,
+runtime-created) MODUS.MVM package while modus-sh's own function is keyed
+bare; the other 47 are the reader resynchronising after those failures.  The
+dropped forms are inside the compiler's own text (lines ~58600–59800), so
+last-defun-wins and the multi-shape table diverge from there, which is why an
+early function like NTH compiles identically in a 300-line prefix but
+differently in the full text.  Adding MODUS.MVM to `%fn-key-system-pkg-name-p`
+did NOT clear it and introduced new qualified keys, so it was reverted; the
+fix belongs in how `#.` evaluation resolves functions in a self-hosting image.
+Bytes then: 3031 of 4876 paired functions still differ, 38.0 vs 35.9 MB.
 
 ## The plan
 

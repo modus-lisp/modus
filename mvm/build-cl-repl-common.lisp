@@ -2281,6 +2281,13 @@
 (defun %ddc-constants-forward-block (text)
   (let ((out (make-string-output-stream)) (n 0) (pos 0))
     (format out "(in-package :modus.mvm)~%;; DDC constants forward block (auto)~%")
+    ;; CL's own limits: the HOST folds these as SBCL constants (whose values
+    ;; happen to equal Modus's 62-bit fixnum range); in-image they read as
+    ;; implicit globals (NIL).  The toplevel DEFCONSTANT clause only records
+    ;; them in *constants* and never redefines a host constant.
+    (format out "(defconstant most-positive-fixnum 4611686018427387903)~%")
+    (format out "(defconstant most-negative-fixnum -4611686018427387904)~%")
+    (incf n 2)
     (loop
       (let ((p (search "(defconstant +" text :start2 pos)))
         (unless p (return))

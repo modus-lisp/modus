@@ -1375,6 +1375,72 @@
                   (write-string-serial \" bytes to \")
                   (write-string-serial out) (write-char-serial 10)))))))))
 
+;; ---- DDC: the compiling image must have the HOST's package structure ----------
+;; READ-ALL-FORMS-WITH-LOCATIONS binds *package* to MODUS.MVM and honours an
+;; (in-package X) only when X exists.  modus-sh had NO MODUS.MVM, so every symbol
+;; of the CL image's text was read into COMMON-LISP-USER: quoted symbols carried
+;; pkg-hash 51798093 (CL-USER) where the host bakes 160425759 (MODUS.MVM), and the
+;; self-compiled image died at boot on the first symbol lookup.  Mirror the
+;; packages lib/load-mvm.lisp gives the host, with their use-lists.
+(defun %selfhost-mirror-host-packages ()
+  (dolist (spec '((\"MODUS.MVM\" \"COMMON-LISP\")
+                  (\"MODUS.ASM\" \"COMMON-LISP\")
+                  (\"MODUS.RUNTIME\")
+                  (\"MODUS.MVM.X64\" \"COMMON-LISP\" \"MODUS.MVM\" \"MODUS.ASM\")
+                  (\"MODUS.MVM.I386\" \"COMMON-LISP\" \"MODUS.MVM\")))
+    (unless (find-package (car spec))
+      (make-package (car spec) :use (cdr spec))
+      ;; MAKE-PACKAGE marks its package RUNTIME-BORN, and the compiler then
+      ;; qualifies every function key of a symbol homed there (PKG::NAME —
+      ;; compiler.lisp %rt-fn-name and its build-time twin), where the host
+      ;; bakes bare names: KERNEL-MAIN came out as MODUS.MVM::KERNEL-MAIN and
+      ;; cross.lisp never found the entry point (no JMP after the boot code).
+      ;; These are the HOST's build-time packages: un-mark them.
+      (when (and (boundp '*runtime-born-pkgs*) *runtime-born-pkgs*)
+        (remhash (compute-name-hash (car spec)) *runtime-born-pkgs*)))))
+
+;; ---- DDC: the compiling image's OWN JIT knobs must not leak into the output ----
+;; modus-sh's boot co-init (build-cli-common) turns on, for its runtime JIT:
+;; *jit-linkage-cells* (late-bound calls => a SET-NARGS store before every call:
+;; the dominant host/image codegen diff, 394 of 541 functions), *tls-window* /
+;; *x64-tls-window* (FS-prefixed window slots), *x64-jit-constvec-p* / -full-p,
+;; *x64-jit-mode*.  The bare SBCL build has all of them at their NIL defaults.
+(defun %selfhost-reset-jit-knobs ()
+  ;; COMPILER STATE TABLES.  mvm-compile-all LET-binds fresh *functions*,
+  ;; *macro-table*, *globals*, ... but in-image a callee reads the GLOBAL, not
+  ;; the caller's LET binding (the file says so itself, for *init-thunk-names*
+  ;; and *mvm-gensym-counter*).  In modus-sh those globals are LIVE RUNTIME
+  ;; state — *macro-table* holds the CLI's 90 runtime macros (LOOP, WHEN,
+  ;; CASE, ...) — so the in-image compile expanded through the runtime macros
+  ;; where the host's compiler uses its built-in handlers: MVM-INTERPRET came
+  ;; out 3.3x larger, (car x) went through the generic call path.  Measured by
+  ;; dumping every compiler special on both sides (tmp/mvmdiff).  Start from
+  ;; the host's empty state; mvm-compile-all re-registers the bootstrap
+  ;; macros itself.  Safe: --compile modes exit afterwards.
+  (setq *functions* (make-hash-table :test 'equal))
+  (setq *function-table* nil)
+  (setq *globals* (make-hash-table :test 'eql))
+  (setq *constants* (make-hash-table :test 'eql))
+  (setq *macro-table* (make-hash-table :test 'eql))
+  (setq *macro-name-table* nil)
+  (setq *bootstrap-macro-template* nil)
+  (setq *hash-dispatch-table* nil)
+  (setq *clhs-standard-specials-hashes* nil)
+  (setq *mexp-memo* nil)
+  (setq *mexp-memo-gc* -1)
+  (setq *pending-flet-ir* nil)
+  (setq *cf-trace* nil)
+  (setq *cf-trace-i* 0)
+  (setq *label-counter* 0)
+  (setq *use-jit* nil)
+  (setq *jit-linkage-cells* nil)
+  (setq *tls-window* nil)
+  (setq *x64-tls-window* nil)
+  (setq *x64-jit-constvec-p* nil)
+  (setq *x64-jit-constvec-full-p* nil)
+  (setq *x64-jit-mode* nil)
+  (setq *jit-xlate-err-info* nil))
+
 ;; ---- DDC: modus --compile-uefi <in.lisp> <out.efi> [snp-mode] ----------------
 ;; Compile the CL image's full source text (dumped by build-cl-repl-common with
 ;; MODUS_DDC_DUMP_SOURCE) to the SAME PE32+ image mvm/build-uefi-cl-repl.lisp
@@ -1390,7 +1456,8 @@
         (progn (write-string-serial \"modus --compile-uefi: cannot read \")
                (write-string-serial in) (write-char-serial 10) (sys-exit 1))
        (progn
-        (setq *use-jit* nil)
+        (%selfhost-mirror-host-packages)
+        (%selfhost-reset-jit-knobs)
         (setq *compile-warn-unresolved* t)   ; log every unresolved callee with its site (DDC triage)
         (setq *ddc-trace-nil-callee* t)      ; compiler.lisp :call assembler — name each NIL-named callee site
         (setq *static-build-p* t)
@@ -1433,6 +1500,27 @@
                   (print-dec (length bytes))
                   (write-string-serial \" bytes to \")
                   (write-string-serial out) (write-char-serial 10)))))))))
+
+;; ---- DDC triage: modus --dump-mvm <in.lisp> — per-function MVM bytecode under
+;; the --compile-uefi knobs, arch-independent, to diff against the host compiler
+;; (tmp/mvmdiff/host-dump.lisp does the same under SBCL).
+(defun %selfhost-dump-mvm (in)
+  (let ((src (%selfhost-slurp-text in)))
+    (if (null src)
+        (progn (write-string-serial \"modus --dump-mvm: cannot read \") (write-string-serial in) (write-char-serial 10) (sys-exit 1))
+        (progn
+          (%selfhost-mirror-host-packages)
+          (%selfhost-reset-jit-knobs)
+          (setq *static-build-p* t)
+          (setq *mvm-emit-halves* nil)
+          (setq *mvm-eval-runtime-p* nil)
+          (setq *x64-linux-mode* nil)
+          (let ((module (compile-source-to-module src :name :probe)))
+            (let ((bc (mvm-module-bytecode module)))
+              (dolist (fi (mvm-module-function-table module))
+                (write-string-serial \"== \") (write-string-serial (string (mvm-function-info-name fi))) (write-char-serial 10)
+                (disassemble-mvm bc :start (mvm-function-info-bytecode-offset fi)
+                                    :end (+ (mvm-function-info-bytecode-offset fi) (mvm-function-info-bytecode-length fi))))))))))
 
 ;; ---- #210 RUNG 1: modus --compile-aarch64 <in.lisp> <out> -----------------
 ;; The CROSS-ARCH emit.  Identical in shape to %selfhost-compile-file above,
@@ -1633,6 +1721,12 @@
   ;; native Linux ELF and exits; otherwise fall through to the normal CLI.
   (let ((av (handler-case (%cli-collect-argv) (t (c) nil))))
     (if (and (consp av) (consp (cdr av)) (stringp (car (cdr av)))
+             (string= (car (cdr av)) \"--dump-mvm\"))
+        (handler-case (progn (%selfhost-dump-mvm (nth 2 av)) (sys-exit 0))
+          (t (c) (progn (write-string-serial \"modus --dump-mvm: error \")
+                        (handler-case (write-object c) (t (c2) (write-string-serial \"<unprintable>\")))
+                        (write-char-serial 10) (sys-exit 1))))
+    (if (and (consp av) (consp (cdr av)) (stringp (car (cdr av)))
              (string= (car (cdr av)) \"--compile-uefi\"))
         (handler-case
             (progn (%selfhost-compile-file-uefi (nth 2 av) (nth 3 av) (nth 4 av)) (sys-exit 0))
@@ -1674,7 +1768,7 @@
                         (write-string-serial \" cond=\")
                         (handler-case (write-object c) (t (c2) (write-string-serial \"<unprintable>\")))
                         (write-char-serial 10) (sys-exit 1))))
-        (handler-case (cli-toplevel) (t (c) (sys-exit 1))))))))
+        (handler-case (cli-toplevel) (t (c) (sys-exit 1)))))))))
 ")
 
 (defvar *all-runtime-source*

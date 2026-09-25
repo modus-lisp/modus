@@ -22,6 +22,14 @@
               ((string-equal v "test") :test)
               (t :snp))))
 (setq modus.mvm::*snp-shared-base* #x0C000000)
+;; DDC triage: MODUS_STATIC_BUILD=1 builds under SBCL with the SAME static-emit
+;; configuration modus-sh --compile-uefi forces, to separate "in-image compiler
+;; bug" from "static configuration breaks this image".
+(when (let ((v (sb-ext:posix-getenv "MODUS_STATIC_BUILD"))) (and v (string= v "1")))
+  (setq modus.mvm::*static-build-p* t)
+  (setq modus.mvm::*mvm-emit-halves* nil)
+  (setq modus.mvm::*mvm-eval-runtime-p* nil)
+  (format t "~&;; DDC: *static-build-p* forced T for this SBCL build~%"))
 (format t "~&;; UEFI-CL: SNP mode ~A, shared page ~X~%"
         modus.mvm::*x64-snp-mode* modus.mvm::*snp-shared-base*)
 (load (merge-pathnames "build-cl-repl-common.lisp"

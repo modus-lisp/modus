@@ -20,7 +20,10 @@ say() { echo "[uefi-ddc] $(date +%H:%M:%S) $*"; }
 t0=$(date +%s)
 
 say "1. SBCL build of the UEFI CL image (snp=$MODE)"
-MODUS_UEFI_SNP=$MODE MODUS_CL_REPL_OUT=$W/sbcl.efi MODUS_DDC_DUMP_SOURCE=$W/full-source.lisp \
+# MODUS_STATIC_BUILD=1: the SBCL side is built in the SAME static-emit configuration
+# modus-sh --compile-uefi forces (measured 2026-09-25: that image boots and evaluates,
+# 939 init thunks, 35.9 MB), so the comparison is like against like.
+MODUS_STATIC_BUILD=1 MODUS_UEFI_SNP=$MODE MODUS_CL_REPL_OUT=$W/sbcl.efi MODUS_DDC_DUMP_SOURCE=$W/full-source.lisp \
   sbcl --dynamic-space-size $DSS --script mvm/build-uefi-cl-repl.lisp > $W/build-sbcl.log 2>&1 \
   || { say "FAIL: SBCL build (see $W/build-sbcl.log)"; exit 1; }
 say "   $(stat -c %s $W/sbcl.efi) bytes, source $(stat -c %s $W/full-source.lisp) chars"

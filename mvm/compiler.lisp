@@ -929,6 +929,9 @@
 (defvar *function-return-label* nil
   "Label for early return from function body (return outside loop)")
 
+(defvar *ddc-trace-nil-callee* nil
+  "DDC triage: when T, the :call assembler names each call site whose callee
+   name is NIL, and the unresolved-calls summary prints each key's type.")
 (defvar *unresolved-calls* (make-hash-table :test 'equal)
   "Tracks unresolved function calls: name-string -> count")
 
@@ -1892,6 +1895,8 @@
 
 (defun emit-ir (op &rest args)
   "Emit an IR instruction to the current buffer"
+  (when (and *ddc-trace-nil-callee* (eq op :call) (equal (car args) "NIL"))
+    (format t "~&  NIL-CALL built in ~A (nargs ~A)~%" *current-function-name* (cadr args)))
   (push (cons op args) *ir-buffer*))
 
 (defun emit-ir-label (label-id)
@@ -23096,8 +23101,7 @@
                  (incf (gethash fn-name *unresolved-calls* 0)))
                ;; DDC triage: an unresolved callee whose NAME is NIL is a call
                ;; the assembler could not even name.  Off unless asked for.
-               (when (and (null fn-name) (boundp '*ddc-trace-nil-callee*)
-                          (symbol-value '*ddc-trace-nil-callee*))
+               (when (and *ddc-trace-nil-callee* (or (null fn-name) (equal fn-name "NIL")))
                  (format t "~&  NIL-CALLEE in ~A at ~A insn ~S~%"
                          *current-function-name* *current-source-location* insn)))
              (mvm-call buf target)))
@@ -23476,7 +23480,16 @@
      (let ((name (cadr form))
            (value-form (caddr form)))
        (when value-form
-         (let ((value (eval value-form)))
+         ;; A self-evaluating literal is taken AS IS.  Identical on the host
+         ;; (EVAL of a literal is the literal); in-image it matters: the
+         ;; interpreter's value->word conversion overflows for |v| >= 2^61, so
+         ;; (eval 4611686018427387903) — +FIXNUM-MAX+ — came back as a wrong
+         ;; object whose heap word was then baked as an immediate, differently
+         ;; in every run (the 144-byte nondeterminism test/run-uefi-ddc.sh saw).
+         (let ((value (if (or (numberp value-form) (stringp value-form)
+                              (characterp value-form) (keywordp value-form))
+                          value-form
+                          (eval value-form))))
            (setf (gethash (normalize-name name) *constants*) value)
            ;; Make available for subsequent eval calls (skip if already a constant)
            (when (and (symbolp name)
@@ -24348,10 +24361,16 @@
     ;; init-all-globals is a safe no-op.  (DIAG count exposes the empty case.)
     (let ((init-calls nil))
       (format t "  init-all-globals: ~D init thunks~%" (length *init-thunk-names*))
-      (dolist (thunk-name (nreverse *init-thunk-names*))
-        (push `(handler-case (,(intern thunk-name :modus.mvm))
-                 (t (c) nil))
-              init-calls))
+      ;; INTERN into MODUS.MVM by designator on the host; IN-IMAGE that
+      ;; designator does not resolve — (intern "X" :modus.mvm) returned NIL in
+      ;; modus-sh — so every thunk call became a call to NIL (936 of them, the
+      ;; self-compiled image died at boot in INIT-ALL-GLOBALS).  Fall back to
+      ;; the current package, which is MODUS.MVM at build time anyway.
+      (let ((pkg (or (find-package :modus.mvm) *package*)))
+        (dolist (thunk-name (nreverse *init-thunk-names*))
+          (push `(handler-case (,(intern thunk-name pkg))
+                   (t (c) nil))
+                init-calls)))
       (let* ((result (mvm-compile-toplevel
                        `(defun init-all-globals ()
                           ,@(nreverse init-calls))))
@@ -24448,7 +24467,10 @@
                 (format t "~%  === ~D unresolved calls to ~D functions (!! NO %%UNRESOLVED-FN STUB — targeting offset 0, this is garbage execution) ===~%"
                         total (length names))))
           (dolist (entry (subseq names 0 (min 200 (length names))))
-            (format t "    ~4D × ~A~%" (car entry) (cdr entry)))
+            (format t "    ~4D × ~A~%" (car entry) (cdr entry))
+            (when *ddc-trace-nil-callee*
+              (format t "           key type ~A~A~%" (type-of (cdr entry))
+                      (if (stringp (cdr entry)) (format nil " len ~D" (length (cdr entry))) ""))))
           (when (> (length names) 200)
             (format t "    ... and ~D more~%" (- (length names) 200)))
           (force-output)))

@@ -2822,7 +2822,14 @@
                      (m-hi+1 (%fixnum-+ m-hi (if (= m-lo +fixnum-limit+) 1 0)))
                      (m-lo-clamped (logand m-lo +fixnum-max+)))
                 (cons -1 (list m-lo-clamped m-hi+1))))))))
-    ((< n 0) (cons -1 (list (%fixnum-- 0 n))))
+    ;; A FIXNUM most-negative-fixnum: native checked arithmetic produces one
+    ;; ((- (1+ mnf) 1) does not overflow the tagged word), although the
+    ;; runtime otherwise keeps MNF a bignum.  Its raw negation wraps back to
+    ;; itself, and a negative "magnitude" limb crashed the process:
+    ;; (* (floor -9223372036854775807 2) 3), upstream ASH.3.  Its magnitude
+    ;; is exactly the limb base, i.e. limbs (0 1).
+    ((< n 0) (let ((m (%fixnum-- 0 n)))
+               (if (< m 0) (cons -1 (list 0 1)) (cons -1 (list m)))))
     ((= n 0) (cons 1 '(0)))
     (t (cons 1 (list n)))))
 

@@ -978,6 +978,115 @@
     (ppc-emit-addi buf out +ppc-r19+ +tag-object+)
     (ppc-emit-addi buf +ppc-r19+ +ppc-r19+ bytes)))
 
+;;; ============================================================
+;;; handler-case: SETJMP (#x0510) / LONGJMP (#x0511) / CLEAR-HANDLER (#x0512)
+;;; ============================================================
+;;;
+;;; A port of translate-riscv's protocol (see the long comment there): one
+;;; live jmpbuf, a stack of saved outer jmpbufs so handler-cases NEST, a depth
+;;; cap past which a push stores nothing and its matching pop is ABSORBED, and
+;;; LONGJMP copying the jmpbuf aside before the pop overwrites it.
+;;;
+;;; JMPBUF = 8 words: r1, r31 (VFP), resume address, then r14..r18 -- V4..V8,
+;;; the callee-saved V-registers, which the epilogues a LONGJMP skips would
+;;; otherwise have restored.  VA/VL/VN are deliberately absent (restoring VA
+;;; would un-allocate the condition object the handler is about to read); V0..V3
+;;; are caller-saved.  Temporaries: r7..r10, r11, r12 and r0 (r0 only as data).
+;;;
+;;; WHERE IT LIVES.  Hosted: the shared contract block at the heap base --
+;;; jmpbuf #x10000180, scratch #x10000300, capped #x10000360, depth #x10000400,
+;;; frames from #x10000408 -- the same addresses as RISC-V.  With 8-word frames,
+;;; 21 of them end at #x10000948 (ppc64), clear of ppc's globals at #x10000A00.
+;;; Bare: the same offsets inside *ppc-globals-base*'s DRAM block, which uses
+;;; only #x00-#x17.  Computed at translate time, after the installers and
+;;; ppc-set-linux-mode have fixed the mode.
+
+(defconstant +ppc-jmpbuf-words+ 8)
+(defparameter *ppc-hstack-max-depth* 21)
+(defun ppc-hbase ()           (if *ppc-linux-mode* #x10000000 *ppc-globals-base*))
+(defun ppc-jmpbuf-addr ()     (+ (ppc-hbase) #x180))
+(defun ppc-lj-scratch-addr () (+ (ppc-hbase) #x300))
+(defun ppc-hcapped-addr ()    (+ (ppc-hbase) #x360))
+(defun ppc-hdepth-addr ()     (+ (ppc-hbase) #x400))
+(defun ppc-hframes-addr ()    (+ (ppc-hbase) #x408))
+
+(defun ppc-emit-slwi (buf ra rs n)
+  "SLWI ra, rs, n  (RLWINM ra, rs, n, 0, 31-n)."
+  (ppc-emit-rlwinm buf ra rs n 0 (- 31 n)))
+
+(defun ppc-emit-frame-addr (buf dst depth-reg)
+  "DST = frames-base + DEPTH-REG * frame-bytes.  Frame bytes are 8 words: 64 on
+   ppc64, 32 on ppc32 -- a power of two, so a shift.  Uses r11."
+  (ppc-emit-li buf dst (ppc-hframes-addr))
+  (ppc-emit-slwi buf +ppc-r11+ depth-reg (if *ppc-64-bit* 6 5))
+  (ppc-emit-add buf dst dst +ppc-r11+))
+
+(defun ppc-emit-copy-words (buf from to)
+  "Copy +ppc-jmpbuf-words+ words from 0(FROM) to 0(TO) through r0."
+  (let ((ws (ppc-word-size)))
+    (dotimes (i +ppc-jmpbuf-words+)
+      (ppc-emit-load-word buf +ppc-r0+ from (* i ws))
+      (ppc-emit-store-word buf +ppc-r0+ to (* i ws)))))
+
+(defun ppc-emit-handler-push (buf)
+  "Stack the CURRENT jmpbuf so a nested handler-case does not overwrite it.
+   Leaves r10 = 0 if a frame was stored, 1 if the push was CAPPED."
+  (let ((capped (mvm-make-label))
+        (done (mvm-make-label)))
+    (ppc-emit-li buf +ppc-r7+ (ppc-hdepth-addr))
+    (ppc-emit-load-word buf +ppc-r8+ +ppc-r7+ 0)          ; r8 = depth
+    (ppc-emit-li buf +ppc-r10+ 1)                         ; assume capped
+    (ppc-emit-cmpi-word buf +ppc-r8+ *ppc-hstack-max-depth*)
+    (ppc-emit-bge buf capped)
+    (ppc-emit-frame-addr buf +ppc-r9+ +ppc-r8+)
+    (ppc-emit-li buf +ppc-r12+ (ppc-jmpbuf-addr))
+    (ppc-emit-copy-words buf +ppc-r12+ +ppc-r9+)
+    (ppc-emit-addi buf +ppc-r8+ +ppc-r8+ 1)
+    (ppc-emit-store-word buf +ppc-r8+ +ppc-r7+ 0)
+    (ppc-emit-li buf +ppc-r10+ 0)                         ; stored
+    (ppc-emit-b buf done)
+    (ppc-emit-label buf capped)
+    (ppc-emit-li buf +ppc-r7+ (ppc-hcapped-addr))         ; bump LIVE capped count
+    (ppc-emit-load-word buf +ppc-r8+ +ppc-r7+ 0)
+    (ppc-emit-addi buf +ppc-r8+ +ppc-r8+ 1)
+    (ppc-emit-store-word buf +ppc-r8+ +ppc-r7+ 0)
+    (ppc-emit-label buf done)))
+
+(defun ppc-emit-handler-pop (buf)
+  "Absorb a capped push, or restore the top stacked frame into the jmpbuf, or
+   ZERO the jmpbuf when the stack is empty.  Never touches r3 (V0), which holds
+   the handler-case's result at a CLEAR-HANDLER."
+  (let ((not-capped (mvm-make-label))
+        (empty (mvm-make-label))
+        (done (mvm-make-label))
+        (ws (ppc-word-size)))
+    ;; arm 1: capped > 0 -- absorb.
+    (ppc-emit-li buf +ppc-r7+ (ppc-hcapped-addr))
+    (ppc-emit-load-word buf +ppc-r8+ +ppc-r7+ 0)
+    (ppc-emit-cmpi-word buf +ppc-r8+ 0)
+    (ppc-emit-beq buf not-capped)
+    (ppc-emit-addi buf +ppc-r8+ +ppc-r8+ -1)
+    (ppc-emit-store-word buf +ppc-r8+ +ppc-r7+ 0)
+    (ppc-emit-b buf done)
+    ;; arm 2: depth > 0 -- restore frame[depth-1] into the jmpbuf.
+    (ppc-emit-label buf not-capped)
+    (ppc-emit-li buf +ppc-r7+ (ppc-hdepth-addr))
+    (ppc-emit-load-word buf +ppc-r8+ +ppc-r7+ 0)
+    (ppc-emit-li buf +ppc-r12+ (ppc-jmpbuf-addr))
+    (ppc-emit-cmpi-word buf +ppc-r8+ 0)
+    (ppc-emit-beq buf empty)
+    (ppc-emit-addi buf +ppc-r8+ +ppc-r8+ -1)
+    (ppc-emit-store-word buf +ppc-r8+ +ppc-r7+ 0)
+    (ppc-emit-frame-addr buf +ppc-r9+ +ppc-r8+)
+    (ppc-emit-copy-words buf +ppc-r9+ +ppc-r12+)
+    (ppc-emit-b buf done)
+    ;; arm 3: empty -- zero the WHOLE jmpbuf (word 0 = 0 is LONGJMP's sentinel).
+    (ppc-emit-label buf empty)
+    (ppc-emit-li buf +ppc-r0+ 0)
+    (dotimes (i +ppc-jmpbuf-words+)
+      (ppc-emit-store-word buf +ppc-r0+ +ppc-r12+ (* i ws)))
+    (ppc-emit-label buf done)))
+
 (defun ppc-emit-li (buf rt imm)
   "Load an immediate into register RT.
    In 64-bit mode, handles full 64-bit values.
@@ -1152,6 +1261,67 @@
            ((< code #x0300)
             ;; Frame-alloc/frame-free: NOP for now
             nil)
+           ((= code #x0510)
+            ;; SETJMP.  Stack the outer jmpbuf, then save r1 / r31 / resume
+            ;; address / r14..r18.  First return is NIL; a LONGJMP re-enters at
+            ;; RESUME with r3 = T.  A CAPPED push arms nothing, so an over-deep
+            ;; handler-case degrades to a transparent no-op.  The resume address
+            ;; comes from `bl .+4; mflr' plus @ha/@l fixups, as +op-fn-addr+.
+            (let ((skip (mvm-make-label))
+                  (resume (mvm-make-label))
+                  (ws (ppc-word-size)))
+              (ppc-emit-handler-push buf)
+              (ppc-emit-cmpi-word buf +ppc-r10+ 0)
+              (ppc-emit-bne buf skip)
+              (ppc-emit-li buf +ppc-r12+ (ppc-jmpbuf-addr))
+              (ppc-emit-store-word buf +ppc-r1+ +ppc-r12+ 0)
+              (ppc-emit-store-word buf +ppc-r31+ +ppc-r12+ ws)
+              (ppc-emit-word buf #x48000005)                    ; bl .+4
+              (ppc-emit-mflr buf +ppc-r9+)
+              (ppc-emit-addis buf +ppc-r9+ +ppc-r9+ 0)
+              (ppc-emit-fixup buf resume :pcrel-ha)
+              (ppc-emit-addi buf +ppc-r9+ +ppc-r9+ 0)
+              (ppc-emit-fixup buf resume :pcrel-lo)
+              (ppc-emit-store-word buf +ppc-r9+ +ppc-r12+ (* 2 ws))
+              (loop for r in (list +ppc-r14+ +ppc-r15+ +ppc-r16+ +ppc-r17+ +ppc-r18+)
+                    for i from 3
+                    do (ppc-emit-store-word buf r +ppc-r12+ (* i ws)))
+              (ppc-emit-label buf skip)
+              (ppc-emit-mr buf +ppc-r3+ +ppc-r21+)              ; first return: NIL
+              (ppc-emit-label buf resume)))
+           ((= code #x0511)
+            ;; LONGJMP.  Copy the jmpbuf aside FIRST (the pop restores the OUTER
+            ;; frame over it, and we are jumping to the INNER one), zero the live
+            ;; capped count (this unwind passes every capped frame at once), pop,
+            ;; then restore and jump with r3 = T.  Word 0 = 0 means nothing is
+            ;; armed: trap, rather than jump to address zero.
+            (let ((nohandler (mvm-make-label))
+                  (ws (ppc-word-size)))
+              (ppc-emit-li buf +ppc-r12+ (ppc-jmpbuf-addr))
+              (ppc-emit-load-word buf +ppc-r7+ +ppc-r12+ 0)
+              (ppc-emit-cmpi-word buf +ppc-r7+ 0)
+              (ppc-emit-beq buf nohandler)
+              (ppc-emit-li buf +ppc-r9+ (ppc-lj-scratch-addr))
+              (ppc-emit-copy-words buf +ppc-r12+ +ppc-r9+)
+              (ppc-emit-li buf +ppc-r7+ (ppc-hcapped-addr))
+              (ppc-emit-li buf +ppc-r0+ 0)
+              (ppc-emit-store-word buf +ppc-r0+ +ppc-r7+ 0)
+              (ppc-emit-handler-pop buf)
+              (ppc-emit-li buf +ppc-r12+ (ppc-lj-scratch-addr))
+              (loop for r in (list +ppc-r14+ +ppc-r15+ +ppc-r16+ +ppc-r17+ +ppc-r18+)
+                    for i from 3
+                    do (ppc-emit-load-word buf r +ppc-r12+ (* i ws)))
+              (ppc-emit-load-word buf +ppc-r0+ +ppc-r12+ (* 2 ws))
+              (ppc-emit-mtctr buf +ppc-r0+)
+              (ppc-emit-load-word buf +ppc-r31+ +ppc-r12+ ws)
+              (ppc-emit-load-word buf +ppc-r1+ +ppc-r12+ 0)
+              (ppc-emit-li buf +ppc-r3+ #xDEAD1009)             ; second return: T
+              (ppc-emit-bctr buf)
+              (ppc-emit-label buf nohandler)
+              (ppc-emit-tw buf 31 0 0)))
+           ((= code #x0512)
+            ;; CLEAR-HANDLER: pop one frame; r3 (the result) is untouched.
+            (ppc-emit-handler-pop buf))
            ((= code #x0530)
             ;; COPY-OVERFLOW-ARGS: the &rest/&key prologue's RUNTIME copy of
             ;; arguments 4.. into frame slots 4.., as translate-x64/i386/riscv

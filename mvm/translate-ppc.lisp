@@ -904,6 +904,80 @@
 ;;; Immediate Loading (32-bit or 64-bit)
 ;;; ============================================================
 
+;;; ---- Floating point (FPRs f0/f1 only; nothing else in this back end uses FPRs)
+
+(defun ppc-emit-lfd (buf frt ra d)
+  "LFD frt, d(ra) -- load a double into an FPR (D-form, opcode 50)."
+  (ppc-emit-word buf (logior (ash 50 26) (ash frt 21) (ash ra 16) (logand d #xFFFF))))
+
+(defun ppc-emit-stfd (buf frs ra d)
+  "STFD frs, d(ra) -- store a double from an FPR (D-form, opcode 54)."
+  (ppc-emit-word buf (logior (ash 54 26) (ash frs 21) (ash ra 16) (logand d #xFFFF))))
+
+(defun ppc-emit-fp-a (buf xo frt fra frb frc)
+  "A-form, primary opcode 63 (double precision)."
+  (ppc-emit-word buf (logior (ash 63 26) (ash frt 21) (ash fra 16) (ash frb 11)
+                             (ash frc 6) (ash xo 1))))
+
+(defun ppc-emit-fadd (buf frt fra frb) (ppc-emit-fp-a buf 21 frt fra frb 0))
+(defun ppc-emit-fsub (buf frt fra frb) (ppc-emit-fp-a buf 20 frt fra frb 0))
+(defun ppc-emit-fdiv (buf frt fra frb) (ppc-emit-fp-a buf 18 frt fra frb 0))
+(defun ppc-emit-fmul (buf frt fra frc)
+  "FMUL takes its second operand in the FRC field, not FRB."
+  (ppc-emit-fp-a buf 25 frt fra 0 frc))
+
+(defun ppc-emit-fp-x (buf xo frt frb)
+  "X-form, primary opcode 63, FRA unused."
+  (ppc-emit-word buf (logior (ash 63 26) (ash frt 21) (ash frb 11) (ash xo 1))))
+
+(defun ppc-emit-fcfid (buf frt frb)  (ppc-emit-fp-x buf 846 frt frb)) ; ppc64 only
+(defun ppc-emit-fctidz (buf frt frb) (ppc-emit-fp-x buf 815 frt frb)) ; ppc64 only
+(defun ppc-emit-fctiwz (buf frt frb) (ppc-emit-fp-x buf 15 frt frb))
+
+(defun ppc-float-unbox (buf ptr fd)
+  "Load the double whose TAGGED pointer is in PTR into FPR FD.
+
+   A boxed double is four TAGGED 16-bit chunks, slot k holding bits
+   (63-16k)..(48-16k).  PowerPC is big-endian, so chunk k is exactly the
+   halfword at byte 2k of the IEEE double in memory: untag each chunk, STH it
+   into a 16-byte stack scratch, then one LFD.  The same route RV32 takes
+   (rv32-float-unbox) -- and the only one on ppc32, which has no 64-bit GPR.
+   The scratch is taken by moving r1 (ppc32 SysV has no red zone).  r0 carries
+   each chunk: a fine data register, never used here as a base.  PTR must not
+   be r0."
+  (let ((ws (ppc-word-size)))
+    (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ -16)
+    (loop for k from 0 to 3
+          ;; LWZ, not the width's load: on ppc64 LD is DS-form and cannot encode
+          ;; the odd displacement a tag-9 pointer gives (8(1+k)-9).  A chunk is
+          ;; under 2^17, so it sits wholly in the slot's LOW word -- bytes 4..7
+          ;; of the big-endian doubleword -- which D-form LWZ reaches at +4.
+          do (ppc-emit-lwz buf +ppc-r0+ ptr (+ (- (* (1+ k) ws) +tag-object+)
+                                               (if *ppc-64-bit* 4 0)))
+             (ppc-emit-srawi buf +ppc-r0+ +ppc-r0+ 1)          ; untag
+             (ppc-emit-sth buf +ppc-r0+ +ppc-r1+ (* 2 k)))
+    (ppc-emit-lfd buf fd +ppc-r1+ 0)
+    (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ 16)))
+
+(defun ppc-float-box (buf fs out)
+  "Box the double in FPR FS as a fresh four-chunk object; its TAGGED pointer
+   lands in OUT (not r0).  STFD to a stack scratch, then LHZ each chunk back,
+   tag it, store it.  Header (4<<8)|#x60, five words rounded to 16 bytes, so
+   the heap pointer stays 16-aligned for the tag scheme."
+  (let* ((ws (ppc-word-size))
+         (bytes (logand (+ (* 5 ws) 15) (lognot 15))))
+    (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ -16)
+    (ppc-emit-stfd buf fs +ppc-r1+ 0)
+    (ppc-emit-li buf +ppc-r0+ (logior #x60 (ash 4 8)))
+    (ppc-emit-store-word buf +ppc-r0+ +ppc-r19+ 0)          ; header at VA
+    (loop for k from 0 to 3
+          do (ppc-emit-lhz buf +ppc-r0+ +ppc-r1+ (* 2 k))
+             (ppc-emit-add buf +ppc-r0+ +ppc-r0+ +ppc-r0+)      ; tag (x2)
+             (ppc-emit-store-word buf +ppc-r0+ +ppc-r19+ (* (1+ k) ws)))
+    (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ 16)
+    (ppc-emit-addi buf out +ppc-r19+ +tag-object+)
+    (ppc-emit-addi buf +ppc-r19+ +ppc-r19+ bytes)))
+
 (defun ppc-emit-li (buf rt imm)
   "Load an immediate into register RT.
    In 64-bit mode, handles full 64-bit values.
@@ -1861,6 +1935,74 @@
              (ppc-emit-bl buf label)
              ;; Unknown target: emit BL with no fixup (will jump to next insn)
              (ppc-emit-bl buf nil))))
+
+      ((#.+op-fadd+ #.+op-fsub+ #.+op-fmul+ #.+op-fdiv+)
+       ;; Double arithmetic: unbox both operands into f0/f1 through memory
+       ;; (ppc-float-unbox), operate, box the result.  The operands are held
+       ;; in r11/r12 (never r0, which the unbox uses to carry chunks).
+       (let* ((vd (first operands))
+              (pa (vreg-or-scratch (second operands) +ppc-scratch1+))
+              (pb (vreg-or-scratch (third operands) +ppc-scratch2+)))
+         (ppc-float-unbox buf pa 0)
+         (ppc-float-unbox buf pb 1)
+         (cond ((= opcode +op-fadd+) (ppc-emit-fadd buf 0 0 1))
+               ((= opcode +op-fsub+) (ppc-emit-fsub buf 0 0 1))
+               ((= opcode +op-fmul+) (ppc-emit-fmul buf 0 0 1))
+               (t                    (ppc-emit-fdiv buf 0 0 1)))
+         (ppc-float-box buf 0 +ppc-scratch1+)
+         (ppc-store-vreg buf vd +ppc-scratch1+)))
+
+      (#.+op-itof+
+       ;; Tagged fixnum -> fresh double.
+       ;;   ppc64: untag, STD to scratch, LFD, FCFID (int64 -> double).
+       ;;   ppc32: there is NO FCFID on 32-bit PowerPC, so the classic trick:
+       ;;     the double with high word #x43300000 and low word (x XOR #x80000000)
+       ;;     is 2^52 + 2^31 + x exactly; subtract 2^52 + 2^31 (the same high
+       ;;     word over #x80000000) and x is left, exactly.
+       (let* ((vd (first operands))
+              (ps (vreg-or-scratch (second operands) +ppc-scratch1+)))
+         (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ -16)
+         (if *ppc-64-bit*
+             (progn
+               (ppc-emit-sradi buf +ppc-r0+ ps 1)
+               (ppc-emit-std buf +ppc-r0+ +ppc-r1+ 0)
+               (ppc-emit-lfd buf 0 +ppc-r1+ 0)
+               (ppc-emit-fcfid buf 0 0))
+             (progn
+               (ppc-emit-srawi buf +ppc-r0+ ps 1)
+               (ppc-emit-addis buf +ppc-scratch2+ 0 #x8000)        ; lis r12,0x8000
+               (ppc-emit-xor buf +ppc-r0+ +ppc-r0+ +ppc-scratch2+)  ; x ^ 0x80000000
+               (ppc-emit-stw buf +ppc-r0+ +ppc-r1+ 4)
+               (ppc-emit-stw buf +ppc-scratch2+ +ppc-r1+ 12)       ; 0x80000000
+               (ppc-emit-addis buf +ppc-scratch2+ 0 #x4330)        ; lis r12,0x4330
+               (ppc-emit-stw buf +ppc-scratch2+ +ppc-r1+ 0)
+               (ppc-emit-stw buf +ppc-scratch2+ +ppc-r1+ 8)
+               (ppc-emit-lfd buf 0 +ppc-r1+ 0)
+               (ppc-emit-lfd buf 1 +ppc-r1+ 8)
+               (ppc-emit-fsub buf 0 0 1)))
+         (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ 16)
+         (ppc-float-box buf 0 +ppc-scratch1+)
+         (ppc-store-vreg buf vd +ppc-scratch1+)))
+
+      (#.+op-ftoi+
+       ;; Double -> tagged fixnum, TRUNCATING (FCTIDZ / FCTIWZ, the Z being
+       ;; round-toward-zero).  The integer comes out in an FPR, so it goes
+       ;; through the scratch once more: STFD, then the low word (ppc32: byte 4,
+       ;; big-endian) or the whole doubleword (ppc64).
+       (let* ((vd (first operands))
+              (ps (vreg-or-scratch (second operands) +ppc-scratch1+)))
+         (ppc-float-unbox buf ps 0)
+         (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ -16)
+         (if *ppc-64-bit*
+             (progn (ppc-emit-fctidz buf 0 0)
+                    (ppc-emit-stfd buf 0 +ppc-r1+ 0)
+                    (ppc-emit-ld buf +ppc-r0+ +ppc-r1+ 0))
+             (progn (ppc-emit-fctiwz buf 0 0)
+                    (ppc-emit-stfd buf 0 +ppc-r1+ 0)
+                    (ppc-emit-lwz buf +ppc-r0+ +ppc-r1+ 4)))
+         (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ 16)
+         (ppc-emit-add buf +ppc-scratch1+ +ppc-r0+ +ppc-r0+)   ; tag (x2)
+         (ppc-store-vreg buf vd +ppc-scratch1+)))
 
       (#.+op-fn-addr+
        ;; (fn-addr Vd target) -- the native address of a function, TAGGED with

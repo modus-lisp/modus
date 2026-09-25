@@ -99,7 +99,10 @@ state the host lacked:
 Rows 14–18 are 9c6a1b2 and the commit after it.  The x64 CLI image is
 affected by 17 (any `#(…)` literal longer than 255 elements was silently
 wrong in every image) and 18 (`embed-source-blob`), and by the reader changes
-in 14–16; the ANSI gate is owed on them.
+in 14–16.  **ANSI gate, 64 shards, same box, base 7a9a87b vs fix 6d311fc,
+per-file name-stable: 18365 = 18365, NET 0, zero regressing files, zero
+gaining files** (this branch's own baseline; the main headline is measured
+on a different tip).
 
 ## The plan
 

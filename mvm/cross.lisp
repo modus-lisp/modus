@@ -93,7 +93,40 @@
                    (compiled-module-to-mvm-module compiled-mod source-text))))
     (when *static-build-p* (format t "  PHASE module-done~%"))
     (setf (mvm-module-name module) name)
+    (maybe-dump-mvm-function module)
     module))
+
+(defun maybe-dump-mvm-function (module)
+  "Print one function's MVM bytecode when MODUS_MVM_DUMP names it.  Inert
+   otherwise: an env knob, like MODUS_SYMMAP.
+
+   WHY THIS IS WORTH A PERMANENT INSTRUMENT.  Every back-end bug found in this
+   port was found by comparing WHAT THE MVM SAID to WHAT THE TARGET EMITTED —
+   and until now only one of those two was readable.  MODUS_SYMMAP plus gdb
+   gives the native side; this gives the side it has to agree with, so a
+   disagreement can be pointed at instead of inferred.  Name substrings match,
+   so MODUS_MVM_DUMP=%GV-CELL prints %GV-CELL and %GV-CELL-SLOW both."
+  (let ((want (sb-posix-getenv-safe "MODUS_MVM_DUMP")))
+    (when (and want (plusp (length want)))
+      (let ((bytes (mvm-module-bytecode module)))
+        (dolist (fi (mvm-module-function-table module))
+          (let ((nm (string (mvm-function-info-name fi))))
+            (when (search want nm)
+              (format t "~&=== MVM ~A  bytecode ~D..~D (~D bytes), params ~D~%"
+                      nm (mvm-function-info-bytecode-offset fi)
+                      (+ (mvm-function-info-bytecode-offset fi)
+                         (mvm-function-info-bytecode-length fi))
+                      (mvm-function-info-bytecode-length fi)
+                      (mvm-function-info-param-count fi))
+              (disassemble-mvm bytes
+                               :start (mvm-function-info-bytecode-offset fi)
+                               :end (+ (mvm-function-info-bytecode-offset fi)
+                                       (mvm-function-info-bytecode-length fi))))))))))
+
+(defun sb-posix-getenv-safe (var)
+  "Read an environment variable without assuming the host package is loaded."
+  (let ((f (find-symbol "POSIX-GETENV" "SB-EXT")))
+    (and f (funcall f var))))
 
 (defun translate-module-to-native (module target &key into-buf)
   "Phase 2: Translate MVM bytecode to native code for TARGET.

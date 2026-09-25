@@ -913,35 +913,71 @@
    Frame slots grow downward: slot N is at FP + frame-slot-base + N*(-8).
    This is below all spill slots (which end at FP-144) to avoid overlap.")
 
-(defconstant +rv-local-frame-size+ 96
-  "Bytes reserved for locals: 4 spill slots (32) + 8 frame slots (64) = 96.
-   Total frame = this + 112 (save area) = 208.")
+(defconstant +rv-local-frame-size+ 1056
+  "Bytes reserved for locals: 4 spill slots (32) + 128 frame slots (1024).
+   Total frame = this + 112 (save area) = 1168.
+
+   ONE HUNDRED TWENTY-EIGHT FRAME SLOTS, THE SAME COUNT AS translate-x64's
+   +frame-slot-base+ AREA -- not eight.  The MVM compiler addresses let-bound
+   locals as `obj-ref VFP <idx>' with an index it chooses per function, and
+   nothing tells the back end a bound; x64 reserves 128 slots (1024 bytes,
+   total frame 1120) precisely because the index is not bounded by anything
+   the translator can see.
+
+   RISC-V reserved EIGHT.  A function with a ninth local then addressed
+   fp-160-8*8 = fp-216, which is BELOW a 208-byte frame -- memory the next
+   CALL's own frame occupies, so the local read back whatever the callee
+   left there.  Measured in the real CL image: %GV-CELL's `%gv-holder' read
+   RAW 0 out of its slot, and 0 is neither NIL (#xDEAD0001) nor cons-tagged,
+   so `(car %gv-holder)' fell into %SIGNAL-TYPE-ERROR -- whose own use of a
+   special re-entered %GV-CELL, giving the infinite mutual recursion that
+   looked like a hang.  %GV-CELL binds eight locals and calls two functions.
+
+   THE 12-BIT IMMEDIATE IS THE CEILING HERE.  Every prologue offset is
+   sp-relative and every slot offset fp-relative, and RISC-V I-type
+   immediates are signed 12-bit: -2048..2047.  Total frame 1168 and the
+   deepest slot at fp-1168 both fit; a larger frame would need the offsets
+   materialised into a register first, so raising this count is not free.")
 
 (defun rv-spill-offset (vreg)
   "Compute the FP-relative offset for a spilled vreg (V12-V15)."
   (+ +rv-spill-base-offset+ (* (- vreg 12) -8)))
+
+(defun rv-vreg-spills-p (vreg)
+  "Does VREG live in a spill slot?  ONLY V12-V15 DO.
+
+   `rv-resolve-vreg' answers NIL for two different things: a vreg that spills
+   (V12-V15) and a vreg that HAS NO LOCATION AT ALL -- VPC, index 22, marked
+   `nil ; VPC -> not mapped' in *riscv-reg-map*, and any index past the map's
+   end.  Treating the second as the first is silent: `rv-spill-offset'
+   extrapolates its arithmetic happily and hands back fp-200 for VPC, which is
+   a REAL, LIVE address inside the frame, so the mistake becomes a load of
+   someone else's local rather than an error.  translate-x64 draws this line
+   explicitly (`vreg-spills-p' is (and (>= vreg 9) (<= vreg 15)) and both
+   emit-load-vreg and emit-store-vreg ERROR otherwise); RISC-V did not."
+  (and (>= vreg 12) (<= vreg 15)))
 
 (defun rv-vreg-or-load (buf vreg target-phys)
   "Resolve VREG to a physical register. If VREG is spilled, load it from
    the frame into TARGET-PHYS (a scratch register) and return TARGET-PHYS.
    Otherwise return the physical register directly."
   (let ((phys (rv-resolve-vreg vreg)))
-    (if phys
-        phys
-        ;; Spilled: load from stack frame (safe FP-relative offsets)
-        (progn
-          (rv-emit-load-word buf target-phys +rv-fp+ (rv-spill-offset vreg))
-          target-phys))))
+    (cond (phys phys)
+          ((rv-vreg-spills-p vreg)
+           (rv-emit-load-word buf target-phys +rv-fp+ (rv-spill-offset vreg))
+           target-phys)
+          (t (error "MVM RISC-V: cannot load vreg ~D -- it has no location" vreg)))))
 
 (defun rv-store-vreg (buf vreg phys)
   "If VREG is spilled, store PHYS back to the frame slot for VREG.
    If VREG is in a register, emit a move if PHYS differs from the target."
   (let ((dest (rv-resolve-vreg vreg)))
-    (if dest
-        (when (/= dest phys)
-          (rv-emit-mv buf dest phys))
-        ;; Spilled: store to stack frame (safe FP-relative offsets)
-        (rv-emit-store-word buf phys +rv-fp+ (rv-spill-offset vreg)))))
+    (cond (dest
+           (when (/= dest phys)
+             (rv-emit-mv buf dest phys)))
+          ((rv-vreg-spills-p vreg)
+           (rv-emit-store-word buf phys +rv-fp+ (rv-spill-offset vreg)))
+          (t (error "MVM RISC-V: cannot store vreg ~D -- it has no location" vreg)))))
 
 ;;; ============================================================
 ;;; MVM -> RISC-V Translation
@@ -1587,12 +1623,26 @@
          ;; argument -- and NIL is #xDEAD0001, whose low three bits are 1, THE CONS
          ;; TAG, so the answer would then be T for everything.  Exactly the
          ;; always-true bug this arm was rewritten to fix, one register apart.
+         ;; AND NIL IS NOT A CONS.  The tag mask is FOUR bits (+tag-mask+ #x0F:
+         ;; cons 0001, function 0011, object 1001) -- a three-bit mask makes
+         ;; +T-VALUE+ #xDEAD1009, whose nibble is 1001, read as 001 and so
+         ;; answer T to (consp T).  And NIL's nibble IS +tag-cons+ by design, so
+         ;; the tag test alone answers T for NIL: x64 compares against R15 and
+         ;; i386 against *vn-addr* before testing the tag for exactly that
+         ;; reason, and translate-i386's own comment records what the omission
+         ;; costs -- `(loop while (consp cur) ... (setq cur (cdr cur)))' never
+         ;; terminates, because (car NIL) is NIL and the walk recurses on NIL
+         ;; forever.  Both answers are in registers before any branch and each
+         ;; branch skips exactly one 4-byte MV, so the arm is size-stable.
          (rv-emit-li buf +rv-t2+ +t-value+)
-         (rv-emit-andi buf +rv-t1+ rs #x07)         ; read RS while it is still RS
-         (rv-emit-addi buf +rv-t3+ +rv-x0+ 1)       ; cons tag
+         (rv-emit-andi buf +rv-t1+ rs #x0F)   ; +tag-mask+   ; read RS while it is still RS
+         (rv-emit-xor buf +rv-t4+ rs +rv-s10+)      ; t4 = 0 iff RS is NIL
+         (rv-emit-addi buf +rv-t3+ +rv-x0+ +tag-cons+)
          (rv-emit-mv buf +rv-t0+ +rv-s10+)          ; default NIL
          (rv-emit-bne buf +rv-t1+ +rv-t3+ 8)        ; not a cons -> keep NIL
-         (rv-emit-mv buf +rv-t0+ +rv-t2+)           ; is a cons -> T
+         (rv-emit-mv buf +rv-t0+ +rv-t2+)           ; cons-tagged -> T
+         (rv-emit-bne buf +rv-t4+ +rv-x0+ 8)        ; not NIL -> that answer stands
+         (rv-emit-mv buf +rv-t0+ +rv-s10+)          ; NIL is an ATOM, not a cons
          (store-result vd +rv-t0+)))
 
       (#.+op-atom+
@@ -1600,12 +1650,17 @@
        (let* ((vd (vreg 0))
               (rs (resolve (vreg 1))))
          ;; Same ordering requirement as :consp — read RS before writing t0.
+         ;; Four-bit mask and the NIL exclusion, both for the reasons given on
+         ;; :consp -- (atom NIL) is T.
          (rv-emit-li buf +rv-t2+ +t-value+)
-         (rv-emit-andi buf +rv-t1+ rs #x07)
-         (rv-emit-addi buf +rv-t3+ +rv-x0+ 1)
+         (rv-emit-andi buf +rv-t1+ rs #x0F)   ; +tag-mask+
+         (rv-emit-xor buf +rv-t4+ rs +rv-s10+)      ; t4 = 0 iff RS is NIL
+         (rv-emit-addi buf +rv-t3+ +rv-x0+ +tag-cons+)
          (rv-emit-mv buf +rv-t0+ +rv-t2+)           ; default T
          (rv-emit-bne buf +rv-t1+ +rv-t3+ 8)        ; not a cons -> keep T
-         (rv-emit-mv buf +rv-t0+ +rv-s10+)          ; is a cons -> NIL
+         (rv-emit-mv buf +rv-t0+ +rv-s10+)          ; cons-tagged -> NIL
+         (rv-emit-bne buf +rv-t4+ +rv-x0+ 8)        ; not NIL -> that answer stands
+         (rv-emit-mv buf +rv-t0+ +rv-t2+)           ; NIL is an atom
          (store-result vd +rv-t0+)))
 
       ;; ---- Object operations ----
@@ -1668,10 +1723,14 @@
                      (rv-emit-store-word buf rs +rv-t0+ 0)))))))
 
       (#.+op-obj-tag+
-       ;; Extract 3-bit tag from pointer
+       ;; Extract the FOUR-bit tag (+tag-mask+) and return it TAGGED as a
+       ;; fixnum, matching translate-x64 and translate-i386 -- both AND with
+       ;; #x0F and then SHL 1.  A three-bit mask cannot tell object (1001)
+       ;; from cons (0001), and an untagged result is read as half its value.
        (let* ((vd (vreg 0))
               (rs (resolve (vreg 1))))
-         (rv-emit-andi buf +rv-t0+ rs #x07)
+         (rv-emit-andi buf +rv-t0+ rs #x0F)   ; +tag-mask+
+         (rv-emit-slli buf +rv-t0+ +rv-t0+ 1)       ; tag as fixnum
          (store-result vd +rv-t0+)))
 
       (#.+op-obj-subtag+

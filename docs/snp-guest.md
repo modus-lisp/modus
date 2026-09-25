@@ -104,6 +104,19 @@ per-file name-stable: 18365 = 18365, NET 0, zero regressing files, zero
 gaining files** (this branch's own baseline; the main headline is measured
 on a different tip).
 
+**And it is a DIVERSE double-compile, not just a self-compile.**  modus-sh was
+built under three different host Lisps — SBCL, CCL 1.12 (`lx86cl64`) and ABCL
+1.9.2 (JVM) — and each `--compile-uefi` of the same source produced the same
+image, md5 `76ec6cfb815bfbced196016636556142`, twice each:
+
+    MODUS_SH=tmp/hosts/modus-sh-ccl  MODUS_DDC_WORK=tmp/uefi-ddc-ccl  test/run-uefi-ddc.sh  # PASS
+    MODUS_SH=tmp/hosts/modus-sh-abcl MODUS_DDC_WORK=tmp/uefi-ddc-abcl test/run-uefi-ddc.sh  # PASS
+
+The three host-built modus-sh binaries differ (46,098,787 / 46,246,457 /
+46,162,657 bytes — host codegen); what they compile does not.  That hash is
+the thing an SNP launch measurement can be checked against, and it no longer
+depends on trusting any one host compiler.
+
 ## The plan
 
 1. **Launch** — boot Modus as the measured payload.  SNP needs firmware, so the

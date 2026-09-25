@@ -143,6 +143,20 @@
   "Return the current word size (4 or 8)."
   (if *ppc-64-bit* 8 4))
 
+(defun ppc-lr-slot ()
+  "r1-relative offset of the saved LR, in THIS function's own frame: the top
+   word, above the last of the 128 frame slots (1240 of 1248 on ppc64, 684 of
+   688 on ppc32).
+
+   LR used to go in the CALLER's linkage slot at old-r1 + 2*ws, the ABI place --
+   but this back end passes arguments 5.. by PUSHING them, and old-r1 + 2*ws is
+   exactly where the third pushed argument (parameter 7) lives.  A fixed-count
+   copy could dodge that by running before the LR store; the &rest copy (trap
+   #x0530) runs in the body, long after, so the only sound fix is to stop
+   writing into the caller's area.  The epilogue and TAILCALL reload LR from
+   here BEFORE popping the frame."
+  (- (ppc-frame-size) (ppc-word-size)))
+
 (defun ppc-frame-size ()
   "Return the current frame size."
   (if *ppc-64-bit* +ppc-frame-size+ +ppc32-frame-size+))
@@ -954,13 +968,10 @@
    every fifth-and-later parameter was an uninitialised slot.  Found on RISC-V
    in the real CL image (COPY-SEQ's fifth argument to %BULK-COPY).
 
-   ORDER MATTERS HERE, UNLIKE ON THE OTHER TARGETS.  LR is saved into the
-   CALLER's linkage slot at old-r1 + 2*ws, and old-r1 + 2*ws is exactly where
-   the third pushed argument (parameter 7) sits.  So the frame is created
-   first, the arguments are copied out from old-r1 = r1 + fs, and only THEN is
-   LR stored -- to the same location as before, which the epilogue still reads
-   after popping the frame.  r0 carries each word: it is a fine data register,
-   only never a BASE (rA=0 reads as literal zero)."
+   Arguments are read from old-r1 = r1 + fs.  LR is saved in this frame
+   (ppc-lr-slot), not the caller's linkage area, which held pushed argument 7.
+   r0 carries each word: a fine data register, only never a BASE (rA=0 reads
+   as literal zero)."
   (let ((ws (ppc-word-size))
         (fs (ppc-frame-size)))
     (when (> nparams 128)
@@ -975,9 +986,9 @@
           do (ppc-emit-load-word buf +ppc-r0+ +ppc-r1+ (+ fs (* (- i 4) ws)))
              (ppc-emit-store-word buf +ppc-r0+ +ppc-r1+
                                   (+ (ppc-frame-slot-base) (* i ws))))
-    ;; Save LR to the caller's linkage slot -- old r1 + 2*ws, now r1 + fs + 2*ws.
+    ;; Save LR in this frame (ppc-lr-slot), never the caller's linkage area.
     (ppc-emit-mflr buf +ppc-r0+)
-    (ppc-emit-store-word buf +ppc-r0+ +ppc-r1+ (+ fs (* 2 ws)))
+    (ppc-emit-store-word buf +ppc-r0+ +ppc-r1+ (ppc-lr-slot))
     ;; Save callee-saved registers
     (let ((base (* 6 ws)))  ; save area starts at 6 words into frame
       (ppc-emit-store-word buf +ppc-r14+ +ppc-r1+ base)
@@ -1013,11 +1024,11 @@
       ;; table malformed from the first global on.  r20 is the alloc LIMIT,
       ;; which a collection legitimately moves, and r21 is a constant.
       (ppc-emit-load-word buf +ppc-r31+ +ppc-r1+ (+ base (* 8 ws))))
+    ;; Restore LR from this frame -- BEFORE the frame is popped.
+    (ppc-emit-load-word buf +ppc-r0+ +ppc-r1+ (ppc-lr-slot))
+    (ppc-emit-mtlr buf +ppc-r0+)
     ;; Restore stack pointer
     (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ fs)
-    ;; Restore LR
-    (ppc-emit-load-word buf +ppc-r0+ +ppc-r1+ (* 2 ws))
-    (ppc-emit-mtlr buf +ppc-r0+)
     ;; Return
     (ppc-emit-blr buf)))
 
@@ -1067,6 +1078,25 @@
            ((< code #x0300)
             ;; Frame-alloc/frame-free: NOP for now
             nil)
+           ((= code #x0530)
+            ;; COPY-OVERFLOW-ARGS: the &rest/&key prologue's RUNTIME copy of
+            ;; arguments 4.. into frame slots 4.., as translate-x64/i386/riscv
+            ;; do.  Unrolled -- for i = 4..31: stop once nargs <= i, else copy
+            ;; one word -- so it needs only the count and r0, no loop state.
+            ;; Argument i is at old-r1 + (i-4)*ws = VFP + fs + (i-4)*ws, which
+            ;; stays intact because LR no longer lives there (ppc-lr-slot).
+            ;; Capped at 32 arguments like the other back ends.
+            (let ((done (mvm-make-label))
+                  (ws (ppc-word-size))
+                  (fs (ppc-frame-size)))
+              (ppc-emit-load-abs buf +ppc-scratch1+ (ppc-nargs-addr))
+              (loop for i from 4 below 32
+                    do (ppc-emit-cmpi-word buf +ppc-scratch1+ i)
+                       (ppc-emit-ble buf done)
+                       (ppc-emit-load-word buf +ppc-r0+ +ppc-r31+ (+ fs (* (- i 4) ws)))
+                       (ppc-emit-store-word buf +ppc-r0+ +ppc-r31+
+                                            (+ (ppc-frame-slot-base) (* i ws))))
+              (ppc-emit-label buf done)))
            ((and (= code #x0300) *ppc-linux-mode*)
             ;; HOSTED: the serial write becomes write(1, &byte, 1).  The byte
             ;; goes on the stack because write(2) wants an ADDRESS, and it is
@@ -1897,11 +1927,11 @@
          (ppc-emit-load-word buf +ppc-r17+ +ppc-r1+ (+ base (* 3 ws)))
          (ppc-emit-load-word buf +ppc-r18+ +ppc-r1+ (+ base (* 4 ws)))
          (ppc-emit-load-word buf +ppc-r31+ +ppc-r1+ (+ base (* 8 ws)))
+         ;; Restore LR from this frame -- BEFORE the frame is popped.
+         (ppc-emit-load-word buf +ppc-r0+ +ppc-r1+ (ppc-lr-slot))
+         (ppc-emit-mtlr buf +ppc-r0+)
          ;; Restore stack
          (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ (ppc-frame-size))
-         ;; Restore LR
-         (ppc-emit-load-word buf +ppc-r0+ +ppc-r1+ (* 2 ws))
-         (ppc-emit-mtlr buf +ppc-r0+)
          ;; Branch to target
          (ppc-emit-b buf label)))
 

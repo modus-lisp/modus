@@ -1123,6 +1123,22 @@
            ((< code #x0300)
             ;; Frame-alloc/frame-free: NOP for now
             nil)
+           ((= code #x0530)
+            ;; COPY-OVERFLOW-ARGS: the &rest/&key prologue's RUNTIME copy of
+            ;; arguments 4.. into frame slots 4.., as translate-x64/i386/riscv
+            ;; do.  Unrolled -- for i = 4..31: stop once nargs <= i, else copy
+            ;; one longword -- so it needs only D0 (the count) and D1.  JSR
+            ;; pushed the return address and LINK the old A6, so argument i is
+            ;; at A6 + 8 + (i-4)*4.  Capped at 32 like the other back ends.
+            (let ((done (mvm-make-label)))
+              (m68k-emit-load-abs buf +68k-d0+ (m68k-nargs-addr))
+              (loop for i from 4 below 32
+                    do (m68k-emit-cmpi buf +68k-d0+ i)
+                       (m68k-emit-ble buf done)
+                       (m68k-emit-move-disp-dn buf +68k-a6+ (+ 8 (* (- i 4) 4)) +68k-d1+)
+                       (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a6+
+                                               (- +68k-frame-slot-base+ (* i 4))))
+              (m68k-emit-label buf done)))
            ((and (= code #x0300) *68k-linux-mode*)
             ;; HOSTED: the serial write becomes write(1, &byte, 1).
             ;;
@@ -1227,10 +1243,17 @@
              ((and pd (not ps) (eq (m68k-reg-type pd) :address))
               (m68k-emit-move-disp-an buf +68k-a6+ (m68k-spill-offset vs)
                                       (m68k-reg-number pd)))
-             ;; Both spill: use D0 as scratch (careful if vd=VR=D0!)
+             ;; Everything else -- both spilled, OR an address-register source
+             ;; into a spilled destination -- through D0 with the general
+             ;; helpers, which handle every register kind.  The old fallback
+             ;; assumed BOTH spilled and asked for the source's spill slot, so
+             ;; `MOV V7 VN' (VN lives in A4, V7 spills) died at build time with
+             ;; "unexpected spill for vreg 19".  That is the first instruction
+             ;; of every &rest ladder with nothing in it, which is how
+             ;; r29-rest-many found it.
              (t
-              (m68k-emit-move-disp-dn buf +68k-a6+ (m68k-spill-offset vs) +68k-d0+)
-              (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a6+ (m68k-spill-offset vd)))))))
+              (m68k-load-vreg buf +68k-d0+ vs)
+              (m68k-store-vreg buf vd +68k-d0+))))))
 
       (#.+op-li+
        (let ((vd (first operands))

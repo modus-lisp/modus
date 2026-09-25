@@ -267,7 +267,7 @@
           ;; a megabyte of dead code.  mvm-eval's JIT seam falls back cleanly, so
           ;; the image is CORRECT, just slower.  Removing this line is the whole
           ;; change when a RISC-V JIT arm lands.
-          ((eq *cli-arch* :riscv64) nil)
+          ((member *cli-arch* '(:riscv64 :riscv32)) nil)
           ((and no (> (length no) 0)) nil)           ; MODUS_NO_JIT → rollback to interpret
           (v (or (string= v "1") (string-equal v "t") (string-equal v "yes")))  ; explicit
           ;; WS5 #206: DEFAULT is ON again.  It was turned OFF in 2d95d3e
@@ -592,9 +592,9 @@
        (or *aarch64-jit-coinit-source* "") (string #\Newline)))
     ;; i386: no in-image JIT translator — see the *JIT-ON* comment above.
     ;; i386 / riscv64: no in-image JIT translator — see the *JIT-ON* comment.
-    ((member *cli-arch* '(:i386 :riscv64)) "")
+    ((member *cli-arch* '(:i386 :riscv64 :riscv32)) "")
     (t (error "build-cli-common: unknown *cli-arch* ~S ~
-               (want :x64, :aarch64, :i386 or :riscv64)"
+               (want :x64, :aarch64, :i386, :riscv64 or :riscv32)"
               *cli-arch*))))
 
 ;;; ARCH SLOT — boot hook + JIT gate.  Appended LAST so its %jit-enabled-p wins

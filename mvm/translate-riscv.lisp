@@ -1129,6 +1129,15 @@
            ((< code #x0300)
             ;; Frame-alloc/frame-free: NOP for now
             nil)
+           ((= code #x0520)
+            ;; INSTALL-SIGNAL-HANDLERS -- a deliberate, named NOP, exactly as on
+            ;; i386 (*i386-safe-nop-traps*): a pure side effect with no result
+            ;; and no control transfer, so skipping it makes a hardware fault
+            ;; fatal instead of recovered into a handler-case -- worse
+            ;; diagnostics, never a wrong value.  Every OTHER unimplemented trap
+            ;; stops loudly.  (x64/aarch64 install SIGSEGV/SIGBUS -> condition;
+            ;; doing that here is real work, not this.)
+            nil)
            ((= code #x0530)
             ;; COPY-OVERFLOW-ARGS -- the &rest/&key prologue's RUNTIME copy of
             ;; arguments 4.. into frame slots 4.., mirroring translate-x64's and
@@ -1334,7 +1343,13 @@
             ;; report distinguishes "this opcode is missing" from "this trap is".
             (rv-note-unimpl (+ #x10000 code))
             (rv-emit-addi buf +rv-a7+ +rv-x0+ code)
-            (rv-emit-ecall buf)))))
+            ;; Hosted, an ECALL here would be a real syscall numbered by the
+            ;; trap code (#x533 = 1331, ...), whose error return lands in a0.
+            ;; EBREAK stops with the code in a7 instead; bare keeps the ecall
+            ;; its machine-mode handler expects.
+            (if *riscv-linux-mode*
+                (rv-emit-ebreak buf)
+                (rv-emit-ecall buf))))))
 
       ;; ---- Data Movement ----
       (#.+op-mov+
@@ -1893,8 +1908,17 @@
               (width (logand (vreg 2) 3)))
          (case width
            (0 (rv-emit-lbu buf +rv-t0+ raddr 0))   ; u8
-           (1 (rv-emit-lh buf +rv-t0+ raddr 0))     ; u16
-           (2 (rv-emit-lw buf +rv-t0+ raddr 0))     ; u32
+           ;; ZERO-EXTENDING loads: these widths are :u16 and :u32.  LH and
+           ;; (on RV64) LW SIGN-extend, so a halfword with bit 15 set, or a word
+           ;; with bit 31 set, read back NEGATIVE.  Found on RV32, where a u32
+           ;; mem-ref is built from two u16 halves: the staged argv pointer
+           ;; #x1000A027 came back as #x1000A027 - #x10000 because its low half
+           ;; #xA027 was sign-extended.  On RV64 the same LW made every u32 at
+           ;; or above 2^31 negative -- latent there, not yet hit.
+           (1 (rv-emit-lhu buf +rv-t0+ raddr 0))    ; u16
+           (2 (if *riscv-64-bit*
+                  (rv-emit-u32 buf (rv-encode-i-type 0 raddr #x6 +rv-t0+ #x03)) ; LWU
+                  (rv-emit-lw buf +rv-t0+ raddr 0)))  ; u32 (RV32: a full word)
            (3 (rv-emit-load-word buf +rv-t0+ raddr 0)))    ; u64 (one word)
          (store-result vd +rv-t0+)))
 
@@ -2170,8 +2194,26 @@
        ;; If VA >= VL, call GC
        ;; blt VA, VL, +8  (skip ecall if below limit)
        ;; ecall            (invoke GC through SBI or trap handler)
-       (rv-emit-blt buf +rv-s8+ +rv-s9+ 8)    ; skip if VA < VL
-       (rv-emit-ecall buf))                     ; trigger GC
+       ;;
+       ;; HOSTED, THE OVER-LIMIT ARM IS A LOUD STOP, NOT AN ECALL.  There is no
+       ;; hosted RISC-V collector yet, so VA >= VL means the heap is exhausted.
+       ;; The bare-metal `ecall' here traps to a machine-mode handler; hosted it
+       ;; was a real SYSCALL with whatever a7 held, the kernel answered ENOSYS
+       ;; (-38) IN a0 -- which is V0 -- and every allocation after the limit
+       ;; silently clobbered a live register.  The hosted RV32 CL image crossed
+       ;; the limit during boot and died far away in BIGNUM-ASH with a0 = -38.
+       ;; EBREAK with a7 = #x0F0 ("heap exhausted") stops at the allocation that
+       ;; ran out, which is where the answer is.  Size-stable: two arms of the
+       ;; same length.
+       (if *riscv-linux-mode*
+           (progn
+             (rv-emit-blt buf +rv-s8+ +rv-s9+ 12)       ; skip if VA < VL
+             (rv-emit-addi buf +rv-a7+ +rv-x0+ #x0F0)   ; heap-exhausted marker
+             (rv-emit-ebreak buf))
+           (progn
+             (rv-emit-blt buf +rv-s8+ +rv-s9+ 8)        ; skip if VA < VL
+             (rv-emit-ecall buf)                        ; trigger GC (bare)
+             (rv-emit-nop buf))))
 
       (#.+op-write-barrier+
        ;; Mark card table dirty for the object.

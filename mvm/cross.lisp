@@ -1537,15 +1537,15 @@
    Rows are sorted by virtual-addr ascending."
   (let* ((load-addr (or (and boot-descriptor (getf boot-descriptor :load-addr))
                         #x400000))
-         ;; ehdr+phdr for the ELF wrapper.  For non-ELF targets this is 0;
-         ;; the image-byte 0 already lives at the load address.
-         (elf-header (cond
-                       ((null boot-descriptor) 0)
-                       ((member (getf boot-descriptor :elf-format)
-                                '(:linux-x64 :linux-aarch64))
-                        120)
-                       ((eq (getf boot-descriptor :elf-format) :linux-i386) 84)
-                       (t 0)))
+         ;; ehdr+phdr for the ELF wrapper -- from WRAP-HEADER-SIZE-FOR-BOOT, the
+         ;; one rule the li-const and fn-addr patchers already use.  This used
+         ;; to be a private copy that knew only x64, aarch64 and i386, so every
+         ;; other ELF target (riscv32, ppc, 68k, arm32) got 0 and its symbol map
+         ;; was shifted by the header size -- 84 bytes on RV32, which put every
+         ;; name 84 bytes before its function and made gdb's frame names lie.
+         (elf-header (if boot-descriptor
+                         (wrap-header-size-for-boot boot-descriptor)
+                         0))
          (nio (or (kernel-image-native-image-offset image) 0))
          (ncl (length (kernel-image-native-code image)))
          (sorted (stable-sort (copy-list function-table)

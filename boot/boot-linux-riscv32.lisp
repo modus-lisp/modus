@@ -49,16 +49,23 @@
   "128 MB: two 64 MB semispaces.  Generous for an embedded target and modest
    for QEMU.  A real microcontroller gets its own, much smaller, numbers; the
    point of naming them is that shrinking is a constant edit, not a port.")
-(defconstant +linux-riscv32-heap-alloc-start+ #x2000
-  "Where the bump allocator starts, as an offset into the heap — NOT the #x200
-   the RV64 hosted port uses.  #x200 is exactly where that port's entry stub
-   writes ARGC, so its first allocation lands on the argc slot; nothing has
-   noticed because no payload on that port reads argc yet.  More generally the
-   whole fixed absolute block the shared runtime owns lives in the first 4 KB of
-   this address (metadata #x40, globals #x80, MV #x90..#x138, intern tables,
-   argc #x200, handler frames #x400..#xC2F, the per-CPU mode word #xFF8), so an
-   allocator starting below #x1000 is allocating on top of it.  Starting at
-   #x2000 costs 8 KB and removes the whole class.")
+;;; ---- Staged argv/envp, below the allocator ----------------------------
+;;; qemu-riscv32 puts the initial stack near #x40800000.  A MEM-REF address is a
+;;; TAGGED fixnum, and on a 32-bit word that stops at 2^29 - 1, so the Lisp side
+;;; cannot read argv off the live stack at all -- the i386 problem exactly.  The
+;;; stub therefore copies the whole vector down, in i386's shape: a pointer
+;;; array argv[0..n-1], NULL, envp[0..m-1], NULL, and a packed string arena.
+(defconstant +linux-riscv32-argv-ptrs+       #x10009000)
+(defconstant +linux-riscv32-argv-ptrs-end+   #x1000A000)
+(defconstant +linux-riscv32-argv-arena+      #x1000A000)
+(defconstant +linux-riscv32-argv-arena-end+  #x1001E000)
+
+(defconstant +linux-riscv32-heap-alloc-start+ #x20000
+  "Where the bump allocator starts, as an offset into the heap.  #x20000, above
+   the fixed runtime block (#x0000-#x0FFF), the CLI scratch pages (#x1000-#x2FFF)
+   and the staged argv (#x9000-#x1DFFF) -- everything below it is owned by
+   something other than the allocator.  (It was #x2000, which was right until
+   the CLI needed a staged argv.)")
 (defconstant +linux-riscv32-gc-midpoint+ #x4000000)   ; 64 MB
 (defconstant +linux-riscv32-gc-guard+ #x400000
   "4 MB past the second semispace.  :gc-check tests the alloc pointer against
@@ -130,6 +137,68 @@
     ;; --- argc where the Lisp side looks for it, inside the fresh mapping
     (rv-emit-li buf +rv-t0+ (+ +linux-riscv32-heap-addr+ #x200))
     (rv-emit-sw buf +rv-s2+ +rv-t0+ 0)
+    ;; --- THE NIL PAGE: (car nil) and (cdr nil) are plain loads from
+    ;;     #xDEAD0000, so it must be mapped and NIL-filled -- as on RV64
+    ;;     (boot-linux-riscv.lisp says why at length).
+    (rv-emit-li buf +rv-a0+ #xDEAD0000)
+    (rv-emit-li buf +rv-a1+ 4096)
+    (rv-emit-li buf +rv-a2+ 3)
+    (rv-emit-li buf +rv-a3+ #x32)
+    (rv-emit-li buf +rv-a4+ -1)
+    (rv-emit-li buf +rv-a5+ 0)
+    (rv-emit-li buf +rv-a7+ +rv32-sys-mmap+)
+    (rv-emit-ecall buf)
+    (rv-emit-li buf +rv-t0+ +nil-value+)
+    (rv-emit-mv buf +rv-t1+ +rv-a0+)
+    (rv-emit-li buf +rv-t2+ 1024)
+    (rv-emit-sw buf +rv-t0+ +rv-t1+ 0)            ; loop: 1024 words of NIL
+    (rv-emit-addi buf +rv-t1+ +rv-t1+ 4)
+    (rv-emit-addi buf +rv-t2+ +rv-t2+ -1)
+    (rv-emit-bne buf +rv-t2+ +rv-x0+ -12)
+    ;; --- STAGE argv/envp below 2^29 (see +linux-riscv32-argv-ptrs+).
+    ;;     t0 = source slot (sp+4 = argv[0]), t1 = destination slot, t2 = arena,
+    ;;     t6 = NULL terminators still to copy (argv's, then envp's).  Each copied
+    ;;     string gets its arena address in the pointer array.  Stops early,
+    ;;     leaving a terminated array, rather than overrun either region.
+    (rv-emit-addi buf +rv-t0+ +rv-sp+ 4)
+    (rv-emit-li buf +rv-t1+ +linux-riscv32-argv-ptrs+)
+    (rv-emit-li buf +rv-t2+ +linux-riscv32-argv-arena+)
+    (rv-emit-addi buf +rv-t6+ +rv-x0+ 2)
+    (rv-emit-li buf +rv-s5+ (- +linux-riscv32-argv-ptrs-end+ 8))
+    (rv-emit-li buf +rv-s6+ (- +linux-riscv32-argv-arena-end+ 4096))
+    (let ((top (rv-current-offset buf)))
+      (rv-emit-lw buf +rv-t3+ +rv-t0+ 0)                  ; next source pointer
+      (rv-emit-addi buf +rv-t0+ +rv-t0+ 4)
+      (let ((to-copy (rv-current-offset buf)))
+        (rv-emit-bne buf +rv-t3+ +rv-x0+ 0)               ; -> copy (patched)
+        ;; a NULL: copy it, and stop after the second one
+        (rv-emit-sw buf +rv-x0+ +rv-t1+ 0)
+        (rv-emit-addi buf +rv-t1+ +rv-t1+ 4)
+        (rv-emit-addi buf +rv-t6+ +rv-t6+ -1)
+        (rv-emit-bne buf +rv-t6+ +rv-x0+ (- top (rv-current-offset buf)))
+        (let ((to-done-1 (rv-current-offset buf)))
+          (rv-emit-jal buf +rv-x0+ 0)                      ; -> done (patched)
+          (rv-patch-branch-here buf to-copy)
+          ;; copy: out of room in either region? terminate and stop.
+          (let ((to-full-1 (rv-current-offset buf)))
+            (rv-emit-bge buf +rv-t1+ +rv-s5+ 0)            ; -> full (patched)
+            (let ((to-full-2 (rv-current-offset buf)))
+              (rv-emit-bge buf +rv-t2+ +rv-s6+ 0)          ; -> full (patched)
+              (rv-emit-sw buf +rv-t2+ +rv-t1+ 0)           ; ptr[k] = arena
+              (rv-emit-addi buf +rv-t1+ +rv-t1+ 4)
+              (let ((cloop (rv-current-offset buf)))
+                (rv-emit-lbu buf +rv-t4+ +rv-t3+ 0)
+                (rv-emit-sb buf +rv-t4+ +rv-t2+ 0)
+                (rv-emit-addi buf +rv-t3+ +rv-t3+ 1)
+                (rv-emit-addi buf +rv-t2+ +rv-t2+ 1)
+                (rv-emit-bne buf +rv-t4+ +rv-x0+ (- cloop (rv-current-offset buf))))
+              (rv-emit-jal buf +rv-x0+ (- top (rv-current-offset buf)))
+              ;; full: two NULLs so both argv and envp read as terminated
+              (rv-patch-branch-here buf to-full-1)
+              (rv-patch-branch-here buf to-full-2)
+              (rv-emit-sw buf +rv-x0+ +rv-t1+ 0)
+              (rv-emit-sw buf +rv-x0+ +rv-t1+ 4)
+              (rv-patch-jal-here buf to-done-1))))))
     ;; --- MVM allocation registers: s8 = alloc pointer, s9 = limit, s10 = NIL
     (rv-emit-li buf +rv-t0+ +linux-riscv32-heap-alloc-start+)
     (rv-emit-add buf +rv-s8+ +rv-s4+ +rv-t0+)

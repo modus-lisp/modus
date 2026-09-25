@@ -2921,6 +2921,14 @@
     (setq *macro-name-table* nil) (setq *bootstrap-macro-template* nil)
     (setq *hash-dispatch-table* nil) (setq *clhs-standard-specials-hashes* nil)
     (setq *mexp-memo* nil) (setq *mexp-memo-gc* -1)
+    ;; And the nested eval is a RUNTIME eval, not part of the static build:
+    ;; with *static-build-p* left T, compile-quote routes the form's own
+    ;; string literals to the SERIALIZED constant table (:li-const idx), but
+    ;; the interpreter resolves that index against the runtime pool, so
+    ;; `#.(compute-name-hash "TYPEP")` hashed whatever object sat at that pool
+    ;; index — every read-time hash in the image came back as the hash of IF
+    ;; (measured under modus-sh --dump-mvm; correct from --eval).
+    (setq *static-build-p* nil)
     (unwind-protect
         (%mvm-eval-forms-1 forms)
       (setq *mvm-emit-halves* s-halves) (setq *mvm-eval-runtime-p* s-rt) (setq *static-build-p* s-static)

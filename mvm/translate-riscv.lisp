@@ -514,6 +514,26 @@
   "Shift that multiplies a count by the word size: 3 on RV64, 2 on RV32."
   (if *riscv-64-bit* 3 2))
 
+(defun rv-object-tag ()
+  "The low-nibble tag on an object pointer: 9 on RV64, 2 on RV32.
+
+   EVERY POINTER TAG MUST BE ODD, and 2 is not.  The shared compiler recognises
+   a fixnum by its low bit alone -- compile-integerp is `test dest, 1' -- because
+   fixnums are value<<1 and every x64 tag (cons 1, function 3, object 9) is odd.
+   It recognises an array or string by comparing OBJ-TAG against +TAG-OBJECT+,
+   which it bakes as 9.  With objects tagged 2, BOTH go wrong for every object
+   in the image: (integerp <string>) is T, because bit 0 of ...2 is clear, and
+   (arrayp <string>) is NIL, because 2 is not 9.  Measured in the real CL image
+   as SYMBOL-NAME taking its INTEGER (gensym) branch for a symbol and
+   CONCATENATE rejecting two well-formed one-character strings as non-sequences.
+
+   RV64 CAN USE 9.  Tag 9 needs the low FOUR address bits free -- 16-byte
+   objects -- and RV64's granule is a word pair, sixteen bytes, exactly as on
+   x64.  RV32's granule is eight bytes, so 9 does not fit there; RV32 keeps 2
+   and with it the same misclassification, which is a named, open gap (as it is
+   on arm32), not something this function fixes."
+  (if *riscv-64-bit* 9 2))
+
 (defun rv-granule ()
   "Allocation granule: TWO words, so the bump pointer stays word-pair aligned
    and a tag of 1 (cons) or 2 (object) is exact.  16 on RV64, 8 on RV32."
@@ -1707,8 +1727,8 @@
          ;; Build and store header
          (rv-emit-li buf +rv-t0+ (logior (ash size-words 8) subtag))
          (rv-emit-store-word buf +rv-t0+ +rv-s8+ 0)
-         ;; Tag pointer: object tag = 2
-         (rv-emit-addi buf +rv-t0+ +rv-s8+ 2)
+         ;; Tag pointer: (rv-object-tag) -- 9 on RV64, 2 on RV32
+         (rv-emit-addi buf +rv-t0+ +rv-s8+ (rv-object-tag))
          ;; Bump alloc pointer
          (rv-emit-addi buf +rv-s8+ +rv-s8+ total-bytes)
          (store-result vd +rv-t0+)))
@@ -1724,7 +1744,7 @@
                (rv-emit-load-word buf +rv-t0+ +rv-fp+ off))
              ;; Normal object slot access
              (let* ((robj (resolve vobj))
-                    (offset (- (* (1+ idx) (rv-word-size)) 2)))  ; (1+idx)*word - tag
+                    (offset (- (* (1+ idx) (rv-word-size)) (rv-object-tag))))  ; (1+idx)*word - tag
                (if (and (>= offset -2048) (<= offset 2047))
                    (rv-emit-load-word buf +rv-t0+ robj offset)
                    (progn
@@ -1744,7 +1764,7 @@
                (rv-emit-store-word buf rs +rv-fp+ off))
              ;; Normal object slot store
              (let* ((robj (resolve vobj))
-                    (offset (- (* (1+ idx) (rv-word-size)) 2)))
+                    (offset (- (* (1+ idx) (rv-word-size)) (rv-object-tag))))
                (if (and (>= offset -2048) (<= offset 2047))
                    (rv-emit-store-word buf rs robj offset)
                    (progn
@@ -1767,9 +1787,33 @@
        ;; Extract 8-bit subtag from header word: load header, andi 0xFF
        (let* ((vd (vreg 0))
               (rs (resolve (vreg 1))))
-         ;; Untag pointer (object tag=2), load header at offset 0
-         (rv-emit-load-word buf +rv-t0+ rs -2)
+         ;; translate-x64's contract, which the shared compiler is written
+         ;; against: a TAGGED fixnum subtag for a real heap object, and 0 for
+         ;; anything else -- never a dereference of a non-object.
+         ;;
+         ;; RISC-V returned the RAW byte, and read the header of whatever it
+         ;; was given.  The compiler compares against TAGGED constants
+         ;; ((ash +subtag-bignum+ +fixnum-shift+) and friends), so a raw
+         ;; subtag never matched -- and worse, an odd one looks like a pointer:
+         ;; %CL-SYM-P's (= (obj-subtag x) #x50) handed = the keyword subtag
+         ;; #x53, whose low nibble 3 is the FUNCTION tag, so = took the generic
+         ;; numeric path and %IEEE-FLOAT-P dereferenced #x53.  SIGSEGV, in the
+         ;; real CL image, the moment object tag 9 let SYMBOL-NAME get that far.
+         ;;
+         ;; T is excluded explicitly: +T-VALUE+ #xDEAD1009 has the object tag's
+         ;; nibble on RV64 but is an immediate, and T-9 is unmapped.  Both
+         ;; answers are in registers before the branches, each branch skips a
+         ;; fixed run, so the arm is size-stable.
+         (rv-emit-li buf +rv-t3+ +t-value+)
+         (rv-emit-andi buf +rv-t1+ rs (if *riscv-64-bit* #x0F #x07)) ; read RS
+         (rv-emit-mv buf +rv-t4+ rs)                  ; keep RS: it may be t0
+         (rv-emit-addi buf +rv-t2+ +rv-x0+ (rv-object-tag))
+         (rv-emit-addi buf +rv-t0+ +rv-x0+ 0)         ; default: subtag 0
+         (rv-emit-bne buf +rv-t1+ +rv-t2+ 20)         ; not an object -> 0
+         (rv-emit-beq buf +rv-t4+ +rv-t3+ 16)         ; T -> 0
+         (rv-emit-load-word buf +rv-t0+ +rv-t4+ (- (rv-object-tag)))
          (rv-emit-andi buf +rv-t0+ +rv-t0+ #xFF)
+         (rv-emit-slli buf +rv-t0+ +rv-t0+ 1)         ; TAGGED fixnum
          (store-result vd +rv-t0+)))
 
       ;; ---- Memory (raw) ----
@@ -2155,7 +2199,7 @@
 
       ;; ---- Arrays ----
       ;; Object layout, as alloc-obj/obj-ref already use it on this target:
-      ;; tag 2, header word at obj-2, element k at obj-2 + (1+k)*8.  The index
+      ;; tag (rv-object-tag) T, header at obj-T, element k at obj-T + (1+k)*word.  The index
       ;; arrives TAGGED (2k), so k*8 == tagged*4 and the element sits at
       ;; obj + tagged*4 + 6 -- which is 8-aligned, since obj is raw+2.
       (#.+op-alloc-array+
@@ -2172,8 +2216,8 @@
          (rv-emit-addi buf +rv-t1+ +rv-t1+ (1- (rv-granule)))
          (rv-emit-andi buf +rv-t1+ +rv-t1+ (- (rv-granule)))
          ;; result = VA + 2 (VA stays granule-aligned -- 16 on RV64, 8 on RV32 --
-         ;; so tag 2 is exact at both widths)
-         (rv-emit-addi buf +rv-t0+ +rv-s8+ 2)
+         ;; so (rv-object-tag) is exact at both widths)
+         (rv-emit-addi buf +rv-t0+ +rv-s8+ (rv-object-tag))
          (rv-emit-add buf +rv-s8+ +rv-s8+ +rv-t1+)
          (store-result vd +rv-t0+)))
 
@@ -2183,7 +2227,7 @@
               (ridx (resolve2 (vreg 2))))
          (rv-emit-slli buf +rv-t2+ ridx (rv-index-shift))
          (rv-emit-add buf +rv-t2+ +rv-t2+ robj)
-         (rv-emit-load-word buf +rv-t2+ +rv-t2+ (- (rv-word-size) 2))
+         (rv-emit-load-word buf +rv-t2+ +rv-t2+ (- (rv-word-size) (rv-object-tag)))
          (store-result vd +rv-t2+)))
 
       (#.+op-aset+
@@ -2194,13 +2238,13 @@
               (ridx (rv-vreg-or-load buf (vreg 1) +rv-t1+)))
          (rv-emit-slli buf +rv-t1+ ridx (rv-index-shift))
          (rv-emit-add buf +rv-t1+ +rv-t1+ robj)
-         (rv-emit-store-word buf rval +rv-t1+ (- (rv-word-size) 2))))
+         (rv-emit-store-word buf rval +rv-t1+ (- (rv-word-size) (rv-object-tag)))))
 
       (#.+op-array-len+
        ;; count = (header >> 8) & 0xFFFFFF, returned TAGGED.
        (let* ((vd (vreg 0))
               (robj (resolve (vreg 1))))
-         (rv-emit-load-word buf +rv-t0+ robj -2)
+         (rv-emit-load-word buf +rv-t0+ robj (- (rv-object-tag)))
          (rv-emit-srli buf +rv-t0+ +rv-t0+ 8)
          (rv-emit-slli buf +rv-t0+ +rv-t0+ (rv-mask24-shift))  ; mask to 24 bits
          (rv-emit-srli buf +rv-t0+ +rv-t0+ (rv-mask24-shift))
@@ -2225,7 +2269,7 @@
          (rv-emit-addi buf +rv-t1+ +rv-t2+ (rv-word-size))
          (rv-emit-addi buf +rv-t1+ +rv-t1+ (1- (rv-granule)))
          (rv-emit-andi buf +rv-t1+ +rv-t1+ (- (rv-granule)))
-         (rv-emit-addi buf +rv-t0+ +rv-s8+ 2)
+         (rv-emit-addi buf +rv-t0+ +rv-s8+ (rv-object-tag))
          (rv-emit-add buf +rv-s8+ +rv-s8+ +rv-t1+)
          (store-result vd +rv-t0+)))
 
@@ -2240,7 +2284,7 @@
          (rv-emit-slli buf +rv-t1+ +rv-t1+ (rv-word-shift))
          (rv-emit-addi buf +rv-t1+ +rv-t1+ (1- (rv-granule)))
          (rv-emit-andi buf +rv-t1+ +rv-t1+ (- (rv-granule)))
-         (rv-emit-addi buf +rv-t0+ +rv-s8+ 2)
+         (rv-emit-addi buf +rv-t0+ +rv-s8+ (rv-object-tag))
          (rv-emit-add buf +rv-s8+ +rv-s8+ +rv-t1+)
          (store-result vd +rv-t0+)))
 
@@ -2251,7 +2295,7 @@
               (ridx (resolve2 (vreg 2))))
          (rv-emit-srai buf +rv-t2+ ridx 1)
          (rv-emit-add buf +rv-t2+ +rv-t2+ rarr)
-         (rv-emit-lbu buf +rv-t2+ +rv-t2+ (- (rv-word-size) 2))
+         (rv-emit-lbu buf +rv-t2+ +rv-t2+ (- (rv-word-size) (rv-object-tag)))
          (rv-emit-slli buf +rv-t2+ +rv-t2+ 1)
          (store-result vd +rv-t2+)))
 
@@ -2265,7 +2309,7 @@
          (rv-emit-srai buf +rv-t1+ ridx 1)
          (rv-emit-add buf +rv-t1+ +rv-t1+ rarr)
          (rv-emit-srai buf +rv-t2+ rval 1)
-         (rv-emit-sb buf +rv-t2+ +rv-t1+ (- (rv-word-size) 2))))
+         (rv-emit-sb buf +rv-t2+ +rv-t1+ (- (rv-word-size) (rv-object-tag)))))
 
       ;; ---- System area pointers ----
       ;; A SAP is a one-slot object, subtag #x16: header (1<<8)|#x16 then the
@@ -2276,7 +2320,7 @@
          (rv-emit-li buf +rv-t0+ #x116)
          (rv-emit-store-word buf +rv-t0+ +rv-s8+ 0)
          (rv-emit-store-word buf raddr +rv-s8+ (rv-word-size))
-         (rv-emit-addi buf +rv-t0+ +rv-s8+ 2)
+         (rv-emit-addi buf +rv-t0+ +rv-s8+ (rv-object-tag))
          (rv-emit-addi buf +rv-s8+ +rv-s8+ (rv-granule))
          (store-result vd +rv-t0+)))
 
@@ -2289,7 +2333,7 @@
          ;; sits immediately after its header word, and the pointer in hand is
          ;; already tag-2.  Reading 6 on RV32 reads PAST the slot and returns 0,
          ;; which is what r13-sap measured.
-         (rv-emit-load-word buf +rv-t0+ rsap (- (rv-word-size) 2))
+         (rv-emit-load-word buf +rv-t0+ rsap (- (rv-word-size) (rv-object-tag)))
          (rv-emit-slli buf +rv-t0+ +rv-t0+ 1)
          (store-result vd +rv-t0+)))
 
@@ -2496,12 +2540,12 @@
    reason translate-x64's version shifts rather than ands."
   (let ((ws (rv-word-size)))
     ;; slot 0 -> bits 63..48
-    (rv-emit-load-word buf acc ptr (- ws 2))
+    (rv-emit-load-word buf acc ptr (- ws (rv-object-tag)))
     (rv-emit-srai buf acc acc 1)
     (rv-emit-slli buf acc acc 48)
     ;; slots 1..3 -> bits 47..32, 31..16, 15..0
     (loop for k from 1 to 3
-          do (rv-emit-load-word buf tmp ptr (- (* (1+ k) ws) 2))
+          do (rv-emit-load-word buf tmp ptr (- (* (1+ k) ws) (rv-object-tag)))
              (rv-emit-srai buf tmp tmp 1)
              (rv-emit-slli buf tmp tmp 48)
              (rv-emit-srli buf tmp tmp (* 16 k))
@@ -2513,7 +2557,7 @@
 
    Header is (count=4)<<8 | subtag #x60, then the four tagged 16-bit chunks.  The
    allocation is FIVE words (header + 4 slots) rounded up to the granule, so the
-   bump pointer stays aligned and the tag of 2 remains exact."
+   bump pointer stays aligned and (rv-object-tag) remains exact."
   (let* ((ws (rv-word-size))
          (g (rv-granule))
          (bytes (logand (+ (* 5 ws) (1- g)) (lognot (1- g)))))
@@ -2526,7 +2570,7 @@
              (rv-emit-srli buf tmp tmp 48)
              (rv-emit-slli buf tmp tmp 1)          ; tag as a fixnum
              (rv-emit-store-word buf tmp +rv-s8+ (* (1+ k) ws)))
-    (rv-emit-addi buf out +rv-s8+ 2)               ; tag 2 = object
+    (rv-emit-addi buf out +rv-s8+ (rv-object-tag)) ; object tag
     (rv-emit-addi buf +rv-s8+ +rv-s8+ bytes)))
 
 (defun rv-emit-prologue (buf frame-size)

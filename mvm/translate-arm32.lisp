@@ -1940,15 +1940,23 @@
          ;; (fn-addr Vd target) -- a function's address TAGGED 3.  PC-relative
          ;; through an inline literal (arm32-emit-pcrel-addr), then ORR 3; ARM
          ;; instructions are 4 bytes, so an entry's low two bits are free.
+         ;; THE OPERAND IS THE TARGET'S BYTECODE OFFSET, not a function index
+         ;; (compiler.lisp's :fn-addr lowering passes function-info-bytecode-
+         ;; offset), and #xFFFFFFF0 is the compiler's sentinel for an undefined
+         ;; name, which must load NIL so FUNCALL signals UNDEFINED-FUNCTION --
+         ;; translate-x64's contract.  An index lookup passed r16 and r29 only
+         ;; because each rung's target was the image's FIRST function, offset 0 =
+         ;; index 0; the whole prelude, pushed through arm32 as a census, found it
+         ;; ("no label for function index 37512").
          (let* ((vd (vreg 0))
-                (idx (vreg 1))
-                ;; arm32 receives the function table as a LIST of (name
-                ;; mvm-offset length), like x64 and i386 -- see cross.lisp's
-                ;; build-translator-fn-table -- so index I is the I-th entry.
-                (mvm-off (second (nth idx function-table)))
-                (label (and mvm-off (gethash mvm-off label-map))))
+                (target (vreg 1))
+                (label (gethash target label-map)))
+           (when (= target #xFFFFFFF0)                   ; undefined name: NIL
+             (arm32-mov buf +arm-r12+ +arm-r8+)
+             (arm32-store-vreg buf +arm-r12+ vd)
+             (return-from arm32-translate-insn nil))
            (unless label
-             (error "ARM32 fn-addr: no label for function index ~D" idx))
+             (error "ARM32 fn-addr: no function at bytecode offset ~D" target))
            (arm32-emit-pcrel-addr buf +arm-r12+ label)
            (arm32-orr-imm buf +arm-r12+ +arm-r12+ 0 +tag-function+)
            (arm32-store-vreg buf +arm-r12+ vd)))
@@ -2346,27 +2354,45 @@
            (arm32-emit-store-abs buf +arm-r12+ (arm32-mvcount-addr))))
 
         (otherwise
-         ;; Unknown opcode: emit NOP.
+         ;; Unknown opcode: TRAP, with the opcode in the instruction.
          ;;
-         ;; THIS IS A SILENT FAILURE and should become a trap.  Every other
-         ;; translator makes an unimplemented opcode loud -- riscv emits
-         ;; `li a7,<opcode>; ebreak`, ppc a `tw`, 68k an ILLEGAL -- so a gap
-         ;; shows up as a stopped machine with the opcode in a register.  Here
-         ;; it shows up as nothing, which is why the five convention opcodes
-         ;; above went missing for so long without anyone noticing.  Changing
-         ;; it is a behaviour change for the existing REPL/SSH images, so it
-         ;; wants its own gated step rather than riding along with this one.
-         (arm32-nop buf))))))
+         ;; This used to be a SILENT NOP, the only translator where a gap was
+         ;; not loud: an unimplemented opcode left its destination holding
+         ;; whatever was there before, so the failure surfaced later and
+         ;; elsewhere as a wrong value -- which is how arm32's doubles "worked"
+         ;; and answered 48 and 1.  Now it is UDF #opcode: the permanently
+         ;; undefined encoding, whose 16-bit immediate (imm12:imm4) carries the
+         ;; MVM opcode, so a stopped machine names the gap, as riscv's
+         ;; `li a7,op; ebreak', ppc's tw and 68k's ILLEGAL already do.  The build
+         ;; also records it (arm32-unimplemented-report).
+         (progn
+           (pushnew opcode *arm32-unimpl-opcodes*)
+           (arm32-emit buf (logior #xE7F000F0
+                                   (ash (logand (ash opcode -4) #xFFF) 8)
+                                   (logand opcode #xF)))))))))
 
 ;;; ============================================================
 ;;; Main Translation Entry Point
 ;;; ============================================================
 
+(defvar *arm32-unimpl-opcodes* nil
+  "MVM opcodes that reached the unknown-opcode arm during the last translation.
+   Each became a UDF that traps at run time; this list lets the build say so
+   first.")
+
+(defun arm32-unimplemented-report ()
+  "Print, and return, the opcodes the last arm32 translation had no arm for."
+  (when *arm32-unimpl-opcodes*
+    (format t "~&  *** arm32 translator gaps (UDF emitted): ~{#x~2,'0X~^ ~} ***~%"
+            (sort (copy-list *arm32-unimpl-opcodes*) #'<)))
+  *arm32-unimpl-opcodes*)
+
 (defun translate-mvm-to-arm32 (bytecode function-table &key (v7 nil))
   "Translate MVM bytecode to ARM32 native code.
    When V7 is T, emit ARMv7-A instructions (SDIV, MOVW/MOVT, DMB, LDREX/STREX).
    Returns an arm32-buffer."
-  (setf *arm32-li-const-patches* nil)
+  (setf *arm32-li-const-patches* nil
+        *arm32-unimpl-opcodes* nil)
   (let* ((*arm32-v7* v7)
          (buf (make-arm32-buffer))
          (label-map (make-hash-table :test 'eql))
@@ -2436,6 +2462,7 @@
 
     ;; Resolve branch fixups
     (arm32-resolve-fixups buf)
+    (arm32-unimplemented-report)
 
     ;; Build fn-map: name → resolved native position
     (let ((fn-map (make-hash-table :test 'equal)))

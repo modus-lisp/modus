@@ -19,5 +19,14 @@
 ;;; fixed physical address, and the image spins.  scripts/arch-ladder.py
 ;;; reads that address back over QMP and compares it to the expected value.
 
+;;; THE TARGET IS DELIBERATELY NOT THE FIRST FUNCTION.  fn-addr's operand is the
+;;; target's BYTECODE OFFSET; the first function in an image sits at offset 0,
+;;; which is also index 0, so a translator that wrongly looked the operand up as
+;;; a function INDEX passed this rung for as long as the target came first --
+;;; which it did, in both r16 and r29, until a census of the whole prelude on
+;;; arm32 found "no label for function index 37512".  FILLER moves the target
+;;; off offset 0 and makes offset and index disagree.
+(defun filler (x) (+ x x x))
+
 (defun add2 (a b) (+ a b))
 (defun probe () (funcall #'add2 40 2))

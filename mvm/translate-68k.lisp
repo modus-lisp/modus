@@ -2046,12 +2046,23 @@
        ;; displacement word itself).  The translator already emits 68020
        ;; instructions (MULS.L/DIVS.L), so this raises no CPU floor.
        ;; Entries are 4-aligned (translate-mvm-to-68k-1), so OR 3 is exact.
+       ;; THE OPERAND IS THE TARGET'S BYTECODE OFFSET, not a function index
+       ;; (compiler.lisp's :fn-addr lowering passes function-info-bytecode-
+       ;; offset), and #xFFFFFFF0 is the compiler's sentinel for an undefined
+       ;; name, which must load NIL so FUNCALL signals UNDEFINED-FUNCTION --
+       ;; translate-x64's contract.  An index lookup passed r16 and r29 only
+       ;; because each rung's target was the image's FIRST function, offset 0 =
+       ;; index 0; the whole prelude, pushed through arm32 as a census, found it
+       ;; ("no label for function index 37512").
        (let* ((vd (first operands))
-              (idx (second operands))
-              (mvm-off (and function-table (gethash idx function-table)))
-              (label (and mvm-off (gethash mvm-off label-map))))
+              (target (second operands))
+              (label (gethash target label-map)))
+         (when (= target #xFFFFFFF0)                     ; undefined name: NIL
+           (m68k-emit-move-an-dn buf +68k-a4+ +68k-d0+)
+           (m68k-store-vreg buf vd +68k-d0+)
+           (return-from m68k-translate-insn nil))
          (unless label
-           (error "68k fn-addr: no label for function index ~D" idx))
+           (error "68k fn-addr: no function at bytecode offset ~D" target))
          (m68k-emit-word buf #x43FB)                     ; LEA (bd.l,PC),A1
          (let ((ext-pos (m68k-buffer-position buf)))
            (m68k-emit-word buf #x0170)                   ; full extension word

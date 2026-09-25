@@ -2059,9 +2059,19 @@
                        0))
               (hi20 (ash (+ rel #x800) -12))
               (lo12 (- rel (ash hi20 12))))
-         (rv-emit-auipc buf +rv-t0+ (logand hi20 #xFFFFF))
-         (rv-emit-addi buf +rv-t0+ +rv-t0+ (logand lo12 #xFFF))
-         (rv-emit-ori buf +rv-t0+ +rv-t0+ +tag-function+)
+         ;; #xFFFFFFF0 is the compiler's UNDEFINED-NAME sentinel: load NIL so
+         ;; FUNCALL signals UNDEFINED-FUNCTION (translate-x64's contract).  A
+         ;; miss used to give rel 0 -- a pointer to this very AUIPC, tagged as a
+         ;; function.  Tested on the operand VALUE, so both passes emit the same
+         ;; three instructions.
+         (if (= target-idx #xFFFFFFF0)
+             (progn (rv-emit-mv buf +rv-t0+ +rv-s10+)
+                    (rv-emit-nop buf)
+                    (rv-emit-nop buf))
+             (progn
+               (rv-emit-auipc buf +rv-t0+ (logand hi20 #xFFFFF))
+               (rv-emit-addi buf +rv-t0+ +rv-t0+ (logand lo12 #xFFF))
+               (rv-emit-ori buf +rv-t0+ +rv-t0+ +tag-function+)))
          (store-result vd +rv-t0+)))
 
       (#.+op-li-const+

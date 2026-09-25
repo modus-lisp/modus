@@ -2187,20 +2187,30 @@
        ;; and OR 3: every instruction is 4 bytes, so a function's address has
        ;; its low two bits free, and BCCTR ignores them, which is why
        ;; +op-call-ind+ below needs no untagging.  Fixed five words.
+       ;; THE OPERAND IS THE TARGET'S BYTECODE OFFSET, not a function index
+       ;; (compiler.lisp's :fn-addr lowering passes function-info-bytecode-
+       ;; offset), and #xFFFFFFF0 is the compiler's sentinel for an undefined
+       ;; name, which must load NIL so FUNCALL signals UNDEFINED-FUNCTION --
+       ;; translate-x64's contract.  An index lookup passed r16 and r29 only
+       ;; because each rung's target was the image's FIRST function, offset 0 =
+       ;; index 0; the whole prelude, pushed through arm32 as a census, found it
+       ;; ("no label for function index 37512").
        (let* ((vd (first operands))
-              (idx (second operands))
-              (mvm-off (and function-table (gethash idx function-table)))
-              (label (and mvm-off (gethash mvm-off label-map)))
+              (target (second operands))
+              (label (gethash target label-map))
               (pd (or (ppc-vreg-phys vd) +ppc-scratch1+)))
-         (unless label
-           (error "PPC fn-addr: no label for function index ~D" idx))
-         (ppc-emit-word buf #x48000005)                 ; bl .+4
-         (ppc-emit-mflr buf pd)
-         (ppc-emit-addis buf pd pd 0)
-         (ppc-emit-fixup buf label :pcrel-ha)
-         (ppc-emit-addi buf pd pd 0)
-         (ppc-emit-fixup buf label :pcrel-lo)
-         (ppc-emit-ori buf pd pd +tag-function+)
+         (cond ((= target #xFFFFFFF0)
+                (ppc-emit-mr buf pd +ppc-r21+))         ; undefined name: NIL
+               ((null label)
+                (error "PPC fn-addr: no function at bytecode offset ~D" target))
+               (t
+                (ppc-emit-word buf #x48000005)          ; bl .+4
+                (ppc-emit-mflr buf pd)
+                (ppc-emit-addis buf pd pd 0)
+                (ppc-emit-fixup buf label :pcrel-ha)
+                (ppc-emit-addi buf pd pd 0)
+                (ppc-emit-fixup buf label :pcrel-lo)
+                (ppc-emit-ori buf pd pd +tag-function+)))
          (unless (ppc-vreg-phys vd)
            (ppc-store-vreg buf vd pd))))
 

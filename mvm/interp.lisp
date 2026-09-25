@@ -740,31 +740,33 @@
 
    Used only at the storage sinks (see %mvm-store-fn-name-p), whose argument
    escapes into a global and outlives the module that built it.  Every other
-   bridge argument keeps the cheap shallow wrap, so this cannot slow the common
-   call path — which matters, because the ANSI gate is shard-timeout sensitive.
+   bridge argument keeps the cheap shallow wrap.
 
    Rewrites IN PLACE (set-car/set-cdr) rather than rebuilding, so object
-   IDENTITY and any other references to the same structure are preserved.  That
-   is safe precisely because the value being replaced is an in-module closure,
-   which is MEANINGLESS outside its defining module — nothing can be relying on
-   the raw form.
+   IDENTITY is preserved; safe because the replaced value is an in-module
+   closure, meaningless outside its defining module.
 
-   BUDGET bounds the walk (node count), which also makes a circular structure
-   terminate; the cdr spine is iterated rather than recursed so a long list
-   cannot blow the stack."
-  (if (or (null v) (<= budget 0))
+   BUDGET bounds the TOTAL number of nodes visited across the whole walk.  It
+   used to be passed DOWN each car as (- left 1), a fresh allowance per
+   branch, so a large nested value with shared substructure -- the ansi-test's
+   *UNIVERSE*, once DEFPARAMETER became a sink -- was walked combinatorially
+   and loading hung.  One shared counter makes the walk linear and bounded."
+  (%mvm-wrap-deep-1 v bc ftab rt lam-offsets (cons budget nil)))
+
+(defun %mvm-wrap-deep-1 (v bc ftab rt lam-offsets left)
+  "Worker for %MVM-WRAP-ESCAPING-DEEP; LEFT is a one-cons shared counter."
+  (if (or (null v) (<= (car left) 0))
       v
       (if (consp v)
-          (let ((node v) (left budget))
+          (let ((node v))
             (loop
-              (when (or (not (consp node)) (<= left 0)) (return nil))
+              (when (or (not (consp node)) (<= (car left) 0)) (return nil))
+              (set-car left (- (car left) 1))
               (let* ((a (car node))
                      (wa (if (consp a)
-                             (%mvm-wrap-escaping-deep a bc ftab rt lam-offsets
-                                                      (- left 1))
+                             (%mvm-wrap-deep-1 a bc ftab rt lam-offsets left)
                              (%mvm-wrap-escaping a bc ftab rt lam-offsets))))
                 (unless (eq wa a) (set-car node wa)))
-              (setq left (- left 1))
               (let ((d (cdr node)))
                 (if (consp d)
                     (setq node d)

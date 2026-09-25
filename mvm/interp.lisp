@@ -777,6 +777,14 @@
             v)
           (%mvm-wrap-escaping v bc ftab rt lam-offsets))))
 
+(defconstant %mvm-arg-wrap-budget 64
+  "How far (in conses) an ordinary native-call argument is searched for
+   in-module closures.  A closure inside a LIST argument used to stay a raw
+   bytecode offset, and the native callee FUNCALLed it into address 0x365:
+   (mapcar #'funcall <list of lambdas>) -- upstream DO.15 / DO*.15 -- and a
+   restart-case :INTERACTIVE lambda inside %RC-ENTER's cell list
+   (RESTART-CASE.33).  Storage sinks keep the larger 1000.")
+
 (defun %mvm-collect-call-args (state regs nargs bc ftab rt lam-offsets &optional no-wrap)
   "Collect the NARGS arguments for a native bridge call, in order
    (arg0 arg1 … arg{nargs-1}), wrapping any escaping mvm-eval lambda value.
@@ -815,17 +823,15 @@
           ;; the argument outlives this module, so wrap it DEEPLY — reaching
           ;; through cons structure — instead of shallowly.  Everything else
           ;; keeps the cheap shallow wrap.
-          (push (if no-wrap
-                    (%mvm-wrap-escaping-deep v bc ftab rt lam-offsets 1000)
-                    (%mvm-wrap-escaping v bc ftab rt lam-offsets))
+          (push (%mvm-wrap-escaping-deep v bc ftab rt lam-offsets
+                                         (if no-wrap 1000 %mvm-arg-wrap-budget))
                 args))))
     ;; Prepend the register args (indices min(nargs,4)-1 … 0) so they lead.
     (let ((i (- (if (> nargs 4) 4 nargs) 1)))
       (loop
         (when (< i 0) (return))
-        (push (if no-wrap
-                  (%mvm-wrap-escaping-deep (svref regs i) bc ftab rt lam-offsets 1000)
-                  (%mvm-wrap-escaping (svref regs i) bc ftab rt lam-offsets))
+        (push (%mvm-wrap-escaping-deep (svref regs i) bc ftab rt lam-offsets
+                                       (if no-wrap 1000 %mvm-arg-wrap-budget))
               args)
         (setq i (- i 1))))
     args))

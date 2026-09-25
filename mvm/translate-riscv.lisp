@@ -2517,9 +2517,8 @@
     (rv-emit-store-word buf +rv-s5+  +rv-sp+ (- total-frame 56))
     (rv-emit-store-word buf +rv-s6+  +rv-sp+ (- total-frame 64))
     (rv-emit-store-word buf +rv-s7+  +rv-sp+ (- total-frame 72))
-    (rv-emit-store-word buf +rv-s8+  +rv-sp+ (- total-frame 80))
-    (rv-emit-store-word buf +rv-s9+  +rv-sp+ (- total-frame 88))
-    (rv-emit-store-word buf +rv-s10+ +rv-sp+ (- total-frame 96))
+    ;; s8 (VA), s9 (VL) and s10 (VN) ARE DELIBERATELY NOT SAVED.  Their three
+    ;; slots at total-frame-80/-88/-96 stay unused; see rv-emit-epilogue.
     (rv-emit-store-word buf +rv-s11+ +rv-sp+ (- total-frame 104))
     ;; Set up frame pointer
     (rv-emit-addi buf +rv-fp+ +rv-sp+ total-frame)))
@@ -2537,9 +2536,32 @@
     (rv-emit-load-word buf +rv-s5+  +rv-sp+ (- total-frame 56))
     (rv-emit-load-word buf +rv-s6+  +rv-sp+ (- total-frame 64))
     (rv-emit-load-word buf +rv-s7+  +rv-sp+ (- total-frame 72))
-    (rv-emit-load-word buf +rv-s8+  +rv-sp+ (- total-frame 80))
-    (rv-emit-load-word buf +rv-s9+  +rv-sp+ (- total-frame 88))
-    (rv-emit-load-word buf +rv-s10+ +rv-sp+ (- total-frame 96))
+    ;; VA, VL AND VN ARE GLOBAL STATE AND MUST NOT BE RESTORED.
+    ;;
+    ;; s8 is VA, THE ALLOCATION POINTER.  Restoring it on return rolls the heap
+    ;; pointer back over everything the callee allocated, so the caller's next
+    ;; CONS is handed memory that is already live.  translate-x64's
+    ;; emit-function-prologue states the rule -- "In kernel mode, R12 (alloc
+    ;; ptr), R14 (alloc limit), R15 (nil) are global state that must NOT be
+    ;; saved/restored.  RBX (V4) is callee-saved" -- and saves RBX alone.
+    ;; RISC-V saved and restored s1-s11, all eleven.
+    ;;
+    ;; MEASURED, in the real CL image, as the FIRST NINE CONSES EVER ALLOCATED.
+    ;; (make-hash-table) with no options builds its table innermost-cons-first:
+    ;; (cons 0 t), then the bucket-holder around it, then six metadata cells,
+    ;; then the table.  Conses 3-9 were correct and conses 1-2 held a
+    ;; (name-hash . value) pair and a one-element list of it -- the alist that
+    ;; SET-SYMBOL-VALUE's puthash built AFTERWARDS, on top of them, because
+    ;; make-hash-table's return had rolled VA back to the start of the heap.
+    ;; %GV-CELL then read the clobbered holder, found a cons where the bucket
+    ;; vector belongs, AREF'd it, got 0 out of unwritten heap, and signalled a
+    ;; type error -- from a function %SIGNAL-TYPE-ERROR itself needs, so the
+    ;; two recursed and the image presented as a hang in init with an empty log.
+    ;; It is also why only ONE global of 683 was ever registered.
+    ;;
+    ;; s9 is VL, the allocation LIMIT, which a collection legitimately moves,
+    ;; and s10 is VN, a constant.  Neither belongs to a frame either.  V4 (s11)
+    ;; is a real virtual register and stays callee-saved, exactly as RBX is.
     (rv-emit-load-word buf +rv-s11+ +rv-sp+ (- total-frame 104))
     ;; Deallocate stack frame and return
     (rv-emit-addi buf +rv-sp+ +rv-sp+ total-frame)

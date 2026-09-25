@@ -1017,11 +1017,16 @@
    pointer -- the 68k ran off to an odd PC (0x006f4001) and took an address
    error.  Move the base down by the same 8 bytes the spill area gained.")
 
-(defconstant +68k-frame-size+ 128
-  "Stack frame size: 68 bytes spill area (V6-V15) + 56 bytes of frame slots
-   (14 slots from A6-72 down to A6-124) = 124, rounded to 128.
-   Grown from 96 alongside the frame-slot base above; at 96 the slots would
-   have run off the bottom of the frame instead of merely colliding.")
+(defconstant +68k-frame-size+ 592
+  "Stack frame size: 68 bytes spill area (V6-V15) + 512 bytes of frame slots
+   (128 slots from A6-72 down to A6-580) = 580, rounded to 592.
+
+   ONE HUNDRED TWENTY-EIGHT SLOTS, NOT FOURTEEN.  The MVM compiler picks the
+   `obj-ref VFP <idx>' index per function and tells the back end no bound,
+   which is why translate-x64 reserves 128; a local past the last reserved
+   slot is addressed BELOW the frame, in memory the next call's frame
+   occupies.  Measured on RISC-V: MAKE-HASH-TABLE's &rest prologue alone
+   reads frame slot 31.  -592 still fits LINK's 16-bit displacement.")
 
 (defun m68k-emit-prologue (buf)
   "Emit 68k function prologue. LINK + save callee-saved registers."
@@ -1030,14 +1035,11 @@
   ;; Save callee-saved data registers D4-D7 using MOVEM
   ;; Predecrement mask is reversed: bit 15=D0, bit 14=D1, ...
   ;; D4=bit 11, D5=bit 10, D6=bit 9, D7=bit 8
-  ;; Also save A2-A4 (VA, VL, VN): A2=bit 5, A3=bit 4, A4=bit 3
+  ;; A2-A4 (VA, VL, VN) ARE NOT SAVED -- see m68k-emit-epilogue.
   (let ((mask (logior (ash 1 11)   ; D4
                       (ash 1 10)   ; D5
                       (ash 1 9)    ; D6
-                      (ash 1 8)    ; D7
-                      (ash 1 5)    ; A2
-                      (ash 1 4)    ; A3
-                      (ash 1 3)))) ; A4
+                      (ash 1 8))))  ; D7
     (m68k-emit-movem-to-predec buf mask)))
 
 (defun m68k-emit-epilogue (buf)
@@ -1045,14 +1047,18 @@
   ;; Restore callee-saved registers with MOVEM (postincrement)
   ;; Normal mask: bit 0=D0, ..., bit 7=D7, bit 8=A0, ...
   ;; D4=bit 4, D5=bit 5, D6=bit 6, D7=bit 7
-  ;; A2=bit 10, A3=bit 11, A4=bit 12
+  ;; A2 (VA), A3 (VL) AND A4 (VN) ARE GLOBAL STATE AND ARE NOT RESTORED.
+  ;; A2 is the ALLOCATION POINTER; restoring it on return rolls the heap
+  ;; pointer back over everything the callee allocated, so the caller's next
+  ;; CONS is handed live memory.  translate-aarch64 names the consequence
+  ;; ("allocations made by callees would be lost on return"); found on RISC-V,
+  ;; where it destroyed the first nine conses of the image.  A3 is the alloc
+  ;; LIMIT, which a collection legitimately moves, and A4 is a constant.  The
+  ;; two masks must stay symmetric, so both dropped the same three.
   (let ((mask (logior (ash 1 4)    ; D4
                       (ash 1 5)    ; D5
                       (ash 1 6)    ; D6
-                      (ash 1 7)    ; D7
-                      (ash 1 10)   ; A2
-                      (ash 1 11)   ; A3
-                      (ash 1 12)))) ; A4
+                      (ash 1 7))))  ; D7
     (m68k-emit-movem-from-postinc buf mask))
   ;; UNLK A6
   (m68k-emit-unlk buf +68k-a6+)

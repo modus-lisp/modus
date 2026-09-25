@@ -99,18 +99,27 @@
 (defvar *ppc-64-bit* t
   "When T, emit PPC64 instructions. When NIL, emit PPC32.")
 
-(defconstant +ppc-frame-size+ 336
-  "PPC64 stack frame size: save area + spill + 8 frame slots.
-   208 bytes used + 64 frame slots = 272, rounded to 336 for 16-byte alignment.")
+(defconstant +ppc-frame-size+ 1248
+  "PPC64 stack frame size: save area + spill + 128 frame slots.
+   208 bytes used + 128*8 = 1232, rounded to 1248 for 16-byte alignment.
 
-(defconstant +ppc32-frame-size+ 208
-  "PPC32 stack frame size: save area + spill + 8 frame slots.
-   168 bytes used + 32 frame slots = 200, rounded to 208 for 8-byte alignment.")
+   ONE HUNDRED TWENTY-EIGHT SLOTS, NOT EIGHT.  The MVM compiler picks the
+   `obj-ref VFP <idx>' index per function and tells the back end no bound,
+   which is why translate-x64 reserves 128 and translate-aarch64 1024 bytes.
+   Eight means a ninth local is addressed BELOW the frame, in the memory the
+   next call's frame occupies.  Measured on RISC-V: MAKE-HASH-TABLE's &rest
+   prologue alone reads frame slot 31.  -1248 still fits the 16-bit D-form
+   displacement that stwu/stdu and the restoring addi use.")
+
+(defconstant +ppc32-frame-size+ 688
+  "PPC32 stack frame size: save area + spill + 128 frame slots.
+   168 bytes used + 128*4 = 680, rounded to 688 for 8-byte alignment.
+   Same 128-slot reasoning as +ppc-frame-size+.")
 
 (defconstant +ppc-frame-slot-base+ 208
   "VFP-relative offset for frame slot 0 on PPC64 (locals via obj-ref VFP).
    Frame slots are at VFP + frame-slot-base + idx*word_size.
-   PPC64: spill ends at 128+10*8=208, and 208+8*8=272 fits the 336-byte frame.")
+   PPC64: spill ends at 128+10*8=208, and 208+128*8=1232 fits the 1248-byte frame.")
 
 (defconstant +ppc32-frame-slot-base+ 168
   "Same, for PPC32 — and it is NOT 208.
@@ -123,9 +132,8 @@
    source passed on all seven other targets — including ppc64, which shares
    this translator.
 
-   +ppc32-frame-size+'s own docstring already assumed this value (\"168 bytes
-   used + 32 frame slots = 200, rounded to 208\"); only the constant
-   disagreed.  Spill ends at 128+10*4=168, and 168+8*4=200 fits 208.")
+   +ppc32-frame-size+'s own docstring already assumed this value; only the constant
+   disagreed.  Spill ends at 128+10*4=168, and 168+128*4=680 fits 688.")
 
 (defun ppc-frame-slot-base ()
   "VFP-relative offset of frame slot 0 for the target being emitted."
@@ -934,9 +942,8 @@
       (ppc-emit-store-word buf +ppc-r16+ +ppc-r1+ (+ base (* 2 ws)))
       (ppc-emit-store-word buf +ppc-r17+ +ppc-r1+ (+ base (* 3 ws)))
       (ppc-emit-store-word buf +ppc-r18+ +ppc-r1+ (+ base (* 4 ws)))
-      (ppc-emit-store-word buf +ppc-r19+ +ppc-r1+ (+ base (* 5 ws)))  ; VA
-      (ppc-emit-store-word buf +ppc-r20+ +ppc-r1+ (+ base (* 6 ws)))  ; VL
-      (ppc-emit-store-word buf +ppc-r21+ +ppc-r1+ (+ base (* 7 ws)))  ; VN
+      ;; r19 (VA), r20 (VL) and r21 (VN) ARE NOT SAVED -- see ppc-emit-epilogue.
+      ;; Their three slots stay unused.
       (ppc-emit-store-word buf +ppc-r31+ +ppc-r1+ (+ base (* 8 ws)))) ; VFP
     ;; Set up frame pointer
     (ppc-emit-mr buf +ppc-r31+ +ppc-r1+)))
@@ -952,9 +959,16 @@
       (ppc-emit-load-word buf +ppc-r16+ +ppc-r1+ (+ base (* 2 ws)))
       (ppc-emit-load-word buf +ppc-r17+ +ppc-r1+ (+ base (* 3 ws)))
       (ppc-emit-load-word buf +ppc-r18+ +ppc-r1+ (+ base (* 4 ws)))
-      (ppc-emit-load-word buf +ppc-r19+ +ppc-r1+ (+ base (* 5 ws)))
-      (ppc-emit-load-word buf +ppc-r20+ +ppc-r1+ (+ base (* 6 ws)))
-      (ppc-emit-load-word buf +ppc-r21+ +ppc-r1+ (+ base (* 7 ws)))
+      ;; VA, VL AND VN ARE GLOBAL STATE AND MUST NOT BE RESTORED.  r19 is the
+      ;; ALLOCATION POINTER; restoring it on return rolls the heap pointer back
+      ;; over everything the callee allocated, so the caller's next CONS is
+      ;; handed memory that is already live.  translate-aarch64 names the
+      ;; consequence ("allocations made by callees would be lost on return")
+      ;; and translate-x64 the rule; both save only their one real callee-saved
+      ;; vreg.  Found on RISC-V, which restored all eleven of s1-s11: it
+      ;; destroyed the first nine conses of the image and left the globals
+      ;; table malformed from the first global on.  r20 is the alloc LIMIT,
+      ;; which a collection legitimately moves, and r21 is a constant.
       (ppc-emit-load-word buf +ppc-r31+ +ppc-r1+ (+ base (* 8 ws))))
     ;; Restore stack pointer
     (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ fs)

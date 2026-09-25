@@ -1724,7 +1724,14 @@
            (t (truncate n))))
     (t
      (let ((d (car rest)))
-       (multiple-value-bind (q r) (truncate n d)
+       ;; |n| < |d| truncates to 0 with remainder n -- no bignum division.
+       ;; A float's exact rational has a denominator up to 2^1074, and
+       ;; (floor (rational 1.4d-45)) cost 52 ms in long division
+       ;; (upstream BIGNUM.FLOAT.COMPARE.4B: 16 s per tiny float).
+       (multiple-value-bind (q r) (if (and (integerp n) (integerp d) (not (eql d 0))
+                                           (< (abs n) (abs d)))
+                                      (values 0 n)
+                                      (truncate n d))
          ;; truncate is toward zero; floor is toward negative infinity.
          ;; If r != 0 and (sign r) != (sign d), q = q - 1, r = r + d.
          (if (and (not (= r 0))
@@ -2425,14 +2432,25 @@
       ((= exponent 2047) 0)
       ;; Subnormal: value = mantissa * 2^(-1022-52) * (-1)^sign
       ((= exponent 0)
-       (%make-rat (* raw-sign mantissa) (ash 1 (+ 1022 52))))
+       (%float-rat-pow2 (* raw-sign mantissa) (+ 1022 52)))
       ;; Normal: value = (2^52 + mantissa) * 2^(exponent-1023-52) * (-1)^sign
       (t
        (let ((m (+ (ash 1 52) mantissa))
              (e (- exponent 1075)))   ; 1023 + 52
          (if (>= e 0)
              (* raw-sign m (ash 1 e))
-             (%make-rat (* raw-sign m) (ash 1 (- 0 e)))))))))
+             (%float-rat-pow2 (* raw-sign m) (- 0 e))))))))
+
+(defun %float-rat-pow2 (m k)
+  "M / 2^K in lowest terms, for a float's mantissa M (|M| < 2^53) and K > 0.
+   The denominator is a power of two, so reducing means stripping M's
+   trailing zero bits -- no bignum GCD, which cost ~50 ms for a denormal's
+   2^1074 denominator."
+  (loop
+    (when (or (<= k 0) (oddp m)) (return nil))
+    (setq m (ash m -1))
+    (setq k (- k 1)))
+  (if (<= k 0) m (make-ratio-obj m (ash 1 k))))
 
 (defun %coerce-numeric (x)
   "Coerce any modus numeric (fixnum / bignum / ratio / modus-float-as-array
@@ -2535,6 +2553,15 @@
 
 (defun generic-add (a b)
   (cond
+    ;; RATIO +/- INTEGER (fixnum OR bignum) first: it used to reach the
+    ;; bignum clause below, so (+ 1/3 (expt 2 70)) was a garbage INTEGER.
+    ;; (num + b*den)/den is already in lowest terms (gcd(num+b*den, den) =
+    ;; gcd(num, den) = 1), so no %MAKE-RAT GCD -- that GCD on a float's
+    ;; 2^1074 denominator cost ~50 ms per (- ratio 0).
+    ((and (ratiop a) (integerp b))
+     (make-ratio-obj (bignum-add (aref a 0) (bignum-mul b (aref a 1))) (aref a 1)))
+    ((and (integerp a) (ratiop b))
+     (make-ratio-obj (bignum-add (bignum-mul a (aref b 1)) (aref b 0)) (aref b 1)))
     ;; Bignum operands route through bignum-add (overflow-safe).
     ((or (bignump a) (bignump b)) (bignum-add a b))
     ;; Fixnum + fixnum: detect potential overflow by operand magnitude
@@ -2593,6 +2620,11 @@
 
 (defun generic-subtract (a b)
   (cond
+    ;; RATIO -/+ INTEGER first -- see GENERIC-ADD.
+    ((and (ratiop a) (integerp b))
+     (make-ratio-obj (bignum-sub (aref a 0) (bignum-mul b (aref a 1))) (aref a 1)))
+    ((and (integerp a) (ratiop b))
+     (make-ratio-obj (bignum-sub (bignum-mul a (aref b 1)) (aref b 0)) (aref b 1)))
     ;; Bignum-aware: bignum-sub handles fixnum/bignum mix.
     ((or (bignump a) (bignump b)) (bignum-sub a b))
     ;; Fixnum - fixnum: mirror generic-add's magnitude guard.  Each operand
@@ -2950,6 +2982,21 @@
       (cond
         ((= sc 0) (return-from numeric-equal-p (= a 0)))
         ((or (= sc 1) (= sc -1)) (return-from numeric-equal-p nil)))))
+  ;; FIXNUM vs a non-zero IEEE float: a fixnum below 2^53 in magnitude is
+  ;; exactly representable, so compare as floats.  The rational path below
+  ;; cross-multiplies by the float's denominator -- 2^149 for a denormal --
+  ;; and cost ~40 ms per compare (upstream BIGNUM.FLOAT.COMPARE.4B ran for
+  ;; minutes on its tiny floats).
+  (when (and (fixnump a) (%ieee-float-p b)
+             (< a 9007199254740992) (> a -9007199254740992))
+    (let ((fa (%float-from-int a)))
+      (return-from numeric-equal-p
+        (not (or (%float-lt-p fa b) (%float-lt-p b fa))))))
+  (when (and (fixnump b) (%ieee-float-p a)
+             (< b 9007199254740992) (> b -9007199254740992))
+    (let ((fb (%float-from-int b)))
+      (return-from numeric-equal-p
+        (not (or (%float-lt-p a fb) (%float-lt-p fb a))))))
   ;; BOTH IEEE floats: compare natively (a = b iff neither a<b nor b<a).
   ;; The coerce-to-rat path below cross-multiplies den ≈ 2^52 operands
   ;; (num_a*den_b ≈ 2^104), overflowing fixnums into bignums and

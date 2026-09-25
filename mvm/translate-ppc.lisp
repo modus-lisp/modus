@@ -934,6 +934,55 @@
 (defun ppc-emit-fctidz (buf frt frb) (ppc-emit-fp-x buf 815 frt frb)) ; ppc64 only
 (defun ppc-emit-fctiwz (buf frt frb) (ppc-emit-fp-x buf 15 frt frb))
 
+;;; ---- SPE embedded double precision (e500v2: NO classic FPU)
+;;;
+;;; ppce500's default core, e500v2, has no FPRs at all -- LFD/FADD are illegal
+;;; there -- but its SPE unit does double precision in the full 64-bit GPRs:
+;;; EFDADD/EFDSUB/EFDMUL/EFDDIV, EFDCFSI (int -> double), EFDCTSIZ (double ->
+;;; int, round toward zero), EVLDD/EVSTDD for the 64-bit load/store.  EVX form:
+;;; 4<<26 | rD<<21 | rA<<16 | rB<<11 | xo.  Doubles live in r9/r10 (free, not in
+;;; the vreg map); the chunk route through the stack scratch is the classic
+;;; path's, only the final load/store differ.
+
+(defparameter *ppc-float-isa* :fpu
+  "Which double-float unit the target CPU has: :FPU (classic FPRs) or :SPE
+   (e500v2's embedded doubles).  Set by the installers from the target, NOT from
+   hosted-vs-bare: install-ppc32-translator's ppce500 is :SPE; the hosted ppc32
+   harness runs qemu-ppc's default CPU, which has an FPU, so ppc-set-linux-mode
+   selects :FPU (a hosted Linux on real e500 silicon would want :SPE).")
+
+(defun ppc-spe-p () (and (not *ppc-64-bit*) (eq *ppc-float-isa* :spe)))
+
+(defun ppc-emit-evx (buf xo rd ra rb)
+  (ppc-emit-word buf (logior (ash 4 26) (ash rd 21) (ash ra 16) (ash rb 11) xo)))
+
+(defun ppc-spe-unbox (buf ptr rd)
+  "Load the double whose TAGGED pointer is in PTR into GPR RD (64-bit, SPE)."
+  (let ((ws (ppc-word-size)))
+    (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ -16)
+    (loop for k from 0 to 3
+          do (ppc-emit-lwz buf +ppc-r0+ ptr (- (* (1+ k) ws) +tag-object+))
+             (ppc-emit-srawi buf +ppc-r0+ +ppc-r0+ 1)
+             (ppc-emit-sth buf +ppc-r0+ +ppc-r1+ (* 2 k)))
+    (ppc-emit-evx buf #x301 rd +ppc-r1+ 0)                  ; evldd rd,0(r1)
+    (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ 16)))
+
+(defun ppc-spe-box (buf rs out)
+  "Box the SPE double in GPR RS; TAGGED pointer to OUT.  As ppc-float-box."
+  (let* ((ws (ppc-word-size))
+         (bytes (logand (+ (* 5 ws) 15) (lognot 15))))
+    (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ -16)
+    (ppc-emit-evx buf #x321 rs +ppc-r1+ 0)                  ; evstdd rs,0(r1)
+    (ppc-emit-li buf +ppc-r0+ (logior #x60 (ash 4 8)))
+    (ppc-emit-store-word buf +ppc-r0+ +ppc-r19+ 0)
+    (loop for k from 0 to 3
+          do (ppc-emit-lhz buf +ppc-r0+ +ppc-r1+ (* 2 k))
+             (ppc-emit-add buf +ppc-r0+ +ppc-r0+ +ppc-r0+)
+             (ppc-emit-store-word buf +ppc-r0+ +ppc-r19+ (* (1+ k) ws)))
+    (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ 16)
+    (ppc-emit-addi buf out +ppc-r19+ +tag-object+)
+    (ppc-emit-addi buf +ppc-r19+ +ppc-r19+ bytes)))
+
 (defun ppc-float-unbox (buf ptr fd)
   "Load the double whose TAGGED pointer is in PTR into FPR FD.
 
@@ -2113,6 +2162,18 @@
        (let* ((vd (first operands))
               (pa (vreg-or-scratch (second operands) +ppc-scratch1+))
               (pb (vreg-or-scratch (third operands) +ppc-scratch2+)))
+        (if (ppc-spe-p)
+         (progn                                               ; e500v2: SPE
+           (ppc-spe-unbox buf pa +ppc-r9+)
+           (ppc-spe-unbox buf pb +ppc-r10+)
+           (ppc-emit-evx buf (cond ((= opcode +op-fadd+) #x2E0)
+                                   ((= opcode +op-fsub+) #x2E1)
+                                   ((= opcode +op-fmul+) #x2E8)
+                                   (t                    #x2E9))
+                         +ppc-r9+ +ppc-r9+ +ppc-r10+)
+           (ppc-spe-box buf +ppc-r9+ +ppc-scratch1+)
+           (ppc-store-vreg buf vd +ppc-scratch1+))
+         (progn
          (ppc-float-unbox buf pa 0)
          (ppc-float-unbox buf pb 1)
          (cond ((= opcode +op-fadd+) (ppc-emit-fadd buf 0 0 1))
@@ -2120,7 +2181,7 @@
                ((= opcode +op-fmul+) (ppc-emit-fmul buf 0 0 1))
                (t                    (ppc-emit-fdiv buf 0 0 1)))
          (ppc-float-box buf 0 +ppc-scratch1+)
-         (ppc-store-vreg buf vd +ppc-scratch1+)))
+         (ppc-store-vreg buf vd +ppc-scratch1+)))))
 
       (#.+op-itof+
        ;; Tagged fixnum -> fresh double.
@@ -2131,6 +2192,13 @@
        ;;     word over #x80000000) and x is left, exactly.
        (let* ((vd (first operands))
               (ps (vreg-or-scratch (second operands) +ppc-scratch1+)))
+        (if (ppc-spe-p)
+         (progn                                               ; e500v2: SPE
+           (ppc-emit-srawi buf +ppc-r0+ ps 1)
+           (ppc-emit-evx buf #x2F1 +ppc-r9+ 0 +ppc-r0+)        ; efdcfsi r9,r0
+           (ppc-spe-box buf +ppc-r9+ +ppc-scratch1+)
+           (ppc-store-vreg buf vd +ppc-scratch1+))
+         (progn
          (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ -16)
          (if *ppc-64-bit*
              (progn
@@ -2152,7 +2220,7 @@
                (ppc-emit-fsub buf 0 0 1)))
          (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ 16)
          (ppc-float-box buf 0 +ppc-scratch1+)
-         (ppc-store-vreg buf vd +ppc-scratch1+)))
+         (ppc-store-vreg buf vd +ppc-scratch1+)))))
 
       (#.+op-ftoi+
        ;; Double -> tagged fixnum, TRUNCATING (FCTIDZ / FCTIWZ, the Z being
@@ -2161,6 +2229,13 @@
        ;; big-endian) or the whole doubleword (ppc64).
        (let* ((vd (first operands))
               (ps (vreg-or-scratch (second operands) +ppc-scratch1+)))
+        (if (ppc-spe-p)
+         (progn                                               ; e500v2: SPE
+           (ppc-spe-unbox buf ps +ppc-r9+)
+           (ppc-emit-evx buf #x2FA +ppc-r0+ 0 +ppc-r9+)        ; efdctsiz r0,r9
+           (ppc-emit-add buf +ppc-scratch1+ +ppc-r0+ +ppc-r0+)
+           (ppc-store-vreg buf vd +ppc-scratch1+))
+         (progn
          (ppc-float-unbox buf ps 0)
          (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ -16)
          (if *ppc-64-bit*
@@ -2172,7 +2247,7 @@
                     (ppc-emit-lwz buf +ppc-r0+ +ppc-r1+ 4)))
          (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ 16)
          (ppc-emit-add buf +ppc-scratch1+ +ppc-r0+ +ppc-r0+)   ; tag (x2)
-         (ppc-store-vreg buf vd +ppc-scratch1+)))
+         (ppc-store-vreg buf vd +ppc-scratch1+)))))
 
       (#.+op-fn-addr+
        ;; (fn-addr Vd target) -- the native address of a function, TAGGED with
@@ -2728,6 +2803,7 @@
    called AFTER install-ppc-translator / install-ppc32-translator; turning the
    mode OFF restores from *PPC-64-BIT*, which those installers have set."
   (setf *ppc-linux-mode* (and on t))
+  (when on (setf *ppc-float-isa* :fpu))       ; qemu-ppc's default CPU has an FPU
   (setf *ppc-globals-base*
         (cond (on *ppc-hosted-globals-base*)
               (*ppc-64-bit* #x20900000)
@@ -2736,7 +2812,8 @@
 (defun install-ppc-translator ()
   "Install the PPC64 translator into the target descriptor."
   ;; ppc64 loads at 0x20000000, so its convention slots sit just above.
-  (setf *ppc-globals-base* #x20900000)
+  (setf *ppc-globals-base* #x20900000
+        *ppc-float-isa* :fpu)
   (let ((target *target-ppc64*))
     (setf (target-translate-fn target)
           (lambda (bytecode function-table)
@@ -2755,7 +2832,8 @@
   "Install the PPC32 translator into the target descriptor."
   ;; ppc32 loads at 0; cons space starts at 16MB, so 9MB is clear RAM.
   ;; mv-count must stay inside the 64MB the boot TLBs map -- see its docstring.
-  (setf *ppc-globals-base* #x00900000)
+  (setf *ppc-globals-base* #x00900000
+        *ppc-float-isa* :spe)                ; ppce500 / e500v2: no classic FPU
   (let ((target *target-ppc32*))
     (setf (target-translate-fn target)
           (lambda (bytecode function-table)

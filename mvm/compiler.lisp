@@ -16220,6 +16220,8 @@
   ;; operand (DEST when it was compiled there, as before; a promoted local's
   ;; own register when the caller passed it).  Every READ of the left operand
   ;; in this function goes through SRC1; DEST is only written.
+  ;; (%arith-trust-for's width limit follows +fixnum-bits+, so this proof is
+  ;; valid at 30 bits too.)
   (when (and *arith-trust* (cadr *arith-trust*))
     (emit-ir (cond ((eq fast-op :add-checked) :add)
                    ((eq fast-op :sub-checked) :sub)
@@ -16247,6 +16249,51 @@
       (emit-ir :li   one-temp 1)
       (emit-ir :test tag-temp one-temp)
       (emit-ir :bne  slow-label))
+    ;; OVERFLOW GUARD ON A 30-BIT TOWER.  Overflow promotion is disabled above
+    ;; (it regressed ANSI on x64, where a 62-bit fixnum rarely overflows).  At
+    ;; 30 bits overflow is ROUTINE -- a ten-digit literal, a hash multiplier --
+    ;; and a silent wrap there broke the reader and the hash tables of the
+    ;; hosted RV32 CL image.  So on a 30-bit target only, operands that COULD
+    ;; take the result out of fixnum range go to the generic function up front:
+    ;; for + and -, |operand| < 2^28 keeps the result inside 2^29; for *,
+    ;; |operand| < 2^14 keeps the product inside 2^28.  Conservative (some
+    ;; safe pairs take the slow path), never wrong, and needs no overflow flag,
+    ;; which RISC-V does not have.  64-bit images compile exactly as before.
+    (when (< +fixnum-bits+ 62)
+      (flet ((in-range-or (x bits miss)
+               ;; branch to MISS unless -2^BITS < x < 2^BITS (x a TAGGED word)
+               (let ((tb (ash (ash 1 bits) +fixnum-shift+)))
+                 (emit-ir :li one-temp tb)
+                 (emit-ir :cmp x one-temp)
+                 (emit-ir :bge miss)
+                 (emit-ir :li one-temp (- tb))
+                 (emit-ir :cmp x one-temp)
+                 (emit-ir :blt miss))))
+        (cond
+          ((member fast-op '(:add :sub :add-checked :sub-checked))
+           (in-range-or src1 (- +fixnum-bits+ 2) slow-label)
+           (in-range-or temp (- +fixnum-bits+ 2) slow-label))
+          ((member fast-op '(:mul :mul-checked))
+           ;; The product fits when the operands' bit lengths sum to at most
+           ;; fixnum-bits - 2.  One fixed split (14+14) sent `(* n (fact n-1))'
+           ;; to GENERIC-MULTIPLY -- correct, but a ladder image has no numeric
+           ;; tower to call, and a real image pays a call per multiply.  Three
+           ;; shapes cover small*small, tiny*medium and medium*tiny inline;
+           ;; only a genuinely large product takes the generic path.
+           (let* ((b (- +fixnum-bits+ 2))
+                  (h (floor b 2))
+                  (tiny (floor b 3))
+                  (shapes (list (list h (- b h)) (list tiny (- b tiny))
+                                (list (- b tiny) tiny)))
+                  (fast (make-compiler-label)))
+             (dolist (sh shapes)
+               (let ((next (make-compiler-label)))
+                 (in-range-or src1 (first sh) next)
+                 (in-range-or temp (second sh) next)
+                 (emit-ir :br fast)
+                 (emit-ir-label next)))
+             (emit-ir :br slow-label)
+             (emit-ir-label fast))))))
     ;; Fast path.
     (cond
       (checked-op
@@ -18759,13 +18806,25 @@
          (w0 (car wt0)))
     (when (and (%mem-width-promotes-p w0 (cdr wt0))
                (not *target-big-endian-p*))
-      (let ((asym (%mvm-gensym "MRA")))
+      ;; ONLY PROMOTE WHEN THE VALUE CAN ACTUALLY LEAVE FIXNUM RANGE.  With
+      ;; hi16 below 2^(fixnum-bits - 17) the result, hi16*2^16 + lo16, is an
+      ;; ordinary fixnum, and an inline constant ASH of that small hi16 is
+      ;; exact.  Always going through BIGNUM-ASH made every u32 read -- %RT-ENTER
+      ;; and %RT-LEAVE read one on EVERY hash-table operation, almost always 0 --
+      ;; run the full limb machinery (sixteen one-bit shifts, each allocating a
+      ;; limb list) to produce a small integer.  On the hosted RV32 CL image,
+      ;; which has no collector yet, that garbage alone exhausted the 64 MB
+      ;; semispace during boot.  Values that really are >= 2^29 still promote.
+      (let ((asym (%mvm-gensym "MRA"))
+            (hsym (%mvm-gensym "MRH")))
         (return-from compile-mem-ref
           (compile-form
             (list 'let (list (list asym addr-form))
-                  (list '+ (list 'bignum-ash
-                                 (list 'mem-ref (list '+ asym 2) :u16) 16)
-                           (list 'mem-ref asym :u16)))
+                  (list 'let (list (list hsym (list 'mem-ref (list '+ asym 2) :u16)))
+                        (list 'if (list '< hsym (ash 1 (- +fixnum-bits+ 17)))
+                              (list '+ (list 'ash hsym 16) (list 'mem-ref asym :u16))
+                              (list '+ (list 'bignum-ash hsym 16)
+                                       (list 'mem-ref asym :u16)))))
             env dest)))))
   (compile-form addr-form env dest)
   ;; Untag address: logical shift right by 1
@@ -20102,7 +20161,10 @@
    (:add :sub :mul), or NIL when either width is unknown."
   (and w1 w2
        (let ((rw (if (eq op :mul) (+ w1 w2) (+ 1 (max w1 w2)))))
-         (list t (<= rw 61) rw))))
+         ;; The result must fit THIS TARGET's fixnum: 61 bits of magnitude on
+         ;; the 62-bit tower (exactly the old constant), 29 on the 30-bit one.
+         ;; A hard 61 made a 30-bit build trust products that overflow.
+         (list t (<= rw (- +fixnum-bits+ 1)) rw))))
 
 (defun %leaf-operand-p (form env)
   "True when compiling FORM into a fresh temp register is a pure load that

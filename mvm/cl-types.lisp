@@ -2570,6 +2570,16 @@
     ;; fast path AND promotes to bignum on overflow.  The naked
     ;; %fixnum-* silently wrapped `(* 2^60 2^60) -> 0' for products
     ;; that exceed 63 bits.
+    ;; 30-BIT TOWER, FIXNUM x FIXNUM: decide EXACTLY whether the product fits
+    ;; before touching the bignum engine.  A 30-bit build sends any `*' it
+    ;; cannot prove small here (see emit-arith-pair), and bignum-mul builds
+    ;; limb lists even for a result that fits -- garbage the hosted RV32 image
+    ;; (no collector yet) could not afford.  |a| <= floor(fixnum-max / |b|)
+    ;; is the exact condition, and both it and the raw product are fixnum ops.
+    ((and (< +fixnum-bits+ 62) (fixnump a) (fixnump b)
+          (let ((aa (if (< a 0) (- 0 a) a)) (bb (if (< b 0) (- 0 b) b)))
+            (or (= bb 0) (<= aa (truncate +fixnum-max+ bb)))))
+     (%fixnum-* a b))
     ((and (or (bignump a) (integerp a)) (or (bignump b) (integerp b)))
      (bignum-mul a b))
     ;; Ratio branches: a ratio's numerator/denominator may itself be a

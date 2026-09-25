@@ -1012,9 +1012,9 @@
                                      ;; (logand <bignum> mask) is lossy, yielding an
                                      ;; inconsistent intern key (must match prelude
                                      ;; %INTERN-SYMBOL-PKG exactly).
-                                     (key (logand (%fixnum-+ name-hash
-                                                     (%fixnum-* pkg-hash +fixnum-half-max+))
-                                                  #x3FFFFFFFFFFFFFFF))
+                                     ;; prelude's %SYMBOL-PKG-KEY: the one
+                                     ;; definition of this key, width-safe.
+                                     (key (%symbol-pkg-key name-hash pkg-hash))
                                      ;; compute-name-hash UPPERCASES before
                                      ;; hashing, so "A" and "a" share KEY.
                                      ;; Only reuse a globally-keyed symbol when

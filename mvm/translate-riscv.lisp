@@ -1052,8 +1052,38 @@
        (let ((code (vreg 0)))
          (cond
            ((< code #x0100)
-            ;; Frame-enter: emit function prologue
-            (rv-emit-prologue buf +rv-local-frame-size+))
+            ;; Frame-enter: CODE is the function's parameter count.  Emit the
+            ;; prologue, then COPY PARAMETERS 5.. INTO FRAME SLOTS 4.. .
+            ;;
+            ;; Only V0-V3 travel in registers.  The caller PUSHes the rest before
+            ;; the CALL, and the compiled body reads parameter i as
+            ;; `obj-ref VFP i' -- so the prologue has to put it there.
+            ;; translate-x64 does exactly this ("If > 4 params, copy overflow args
+            ;; from caller's stack to local frame slots"); RISC-V emitted the
+            ;; prologue and nothing else, so every function with a fifth
+            ;; parameter read it from an UNINITIALISED frame slot.
+            ;;
+            ;; Measured in the real CL image: the first INTERN of %INIT-PACKAGES
+            ;; reaches COPY-SEQ -> (%bulk-copy result 0 array 0 len), and LEN is
+            ;; the fifth argument.  It arrived as stack garbage, so the loop test
+            ;; (>= i n) went down the generic NUMERIC->= path on a non-number and
+            ;; never came true -- the image sat in NUMERIC-VALUE-LESS-P /
+            ;; %IEEE-FLOAT-P forever, 70 functions into boot, printing nothing.
+            ;;
+            ;; LAYOUT.  PUSH is always `addi sp,sp,-8; store' (8 bytes on both
+            ;; widths), the compiler pushes overflow args in reverse so arg 4 is
+            ;; pushed LAST, and JALR puts the return address in ra rather than on
+            ;; the stack.  The prologue sets fp to the caller's sp at the call, so
+            ;; arg i lives at fp + (i-4)*8.  x64's version reads rbp+16+(i-4)*8;
+            ;; its 16 is the return address and saved rbp that RISC-V does not push.
+            (rv-emit-prologue buf +rv-local-frame-size+)
+            (when (> code 128)
+              (error "MVM RISC-V: ~D parameters exceed the 128-slot frame" code))
+            (loop for i from 4 below code
+                  do (rv-emit-load-word buf +rv-t0+ +rv-fp+ (* (- i 4) 8))
+                     (rv-emit-store-word buf +rv-t0+ +rv-fp+
+                                         (+ +rv-frame-slot-base+
+                                            (* i (- (rv-word-size)))))))
            ((< code #x0300)
             ;; Frame-alloc/frame-free: NOP for now
             nil)

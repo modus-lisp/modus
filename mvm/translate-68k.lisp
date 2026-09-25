@@ -1123,6 +1123,64 @@
            ((< code #x0300)
             ;; Frame-alloc/frame-free: NOP for now
             nil)
+           ((= code #x0510)
+            ;; SETJMP.  Stack the outer jmpbuf, then save A7 / A6 / resume
+            ;; address / D4..D7.  First return NIL; LONGJMP re-enters at RESUME
+            ;; with D2 = T.  A capped push arms nothing.  The resume address is
+            ;; LEA (bd.l,PC) with the same hand-referenced :disp32 fixup
+            ;; +op-fn-addr+ uses.
+            (let ((skip (mvm-make-label))
+                  (resume (mvm-make-label)))
+              (m68k-emit-handler-push buf)
+              (m68k-emit-tst buf +68k-d0+)
+              (m68k-emit-bne buf skip)
+              (m68k-emit-move-imm-an buf (m68k-jmpbuf-addr) +68k-a1+)
+              (m68k-emit-move-an-disp buf +68k-a7+ +68k-a1+ 0)
+              (m68k-emit-move-an-disp buf +68k-a6+ +68k-a1+ 4)
+              (m68k-emit-word buf #x41FB)                     ; LEA (bd.l,PC),A0
+              (let ((ext-pos (m68k-buffer-position buf)))
+                (m68k-emit-word buf #x0170)
+                (m68k-emit-word buf 0)
+                (push (list (1- (m68k-buffer-word-count buf)) resume :disp32
+                            (+ ext-pos 2))
+                      (m68k-buffer-fixups buf))
+                (m68k-emit-word buf 0))
+              (m68k-emit-move-an-disp buf +68k-a0+ +68k-a1+ 8)
+              (loop for d in (list +68k-d4+ +68k-d5+ +68k-d6+ +68k-d7+)
+                    for i from 3
+                    do (m68k-emit-move-dn-disp buf d +68k-a1+ (* 4 i)))
+              (m68k-emit-label buf skip)
+              (m68k-emit-move-an-dn buf +68k-a4+ +68k-d2+)      ; first return: NIL
+              (m68k-emit-label buf resume)))
+           ((= code #x0511)
+            ;; LONGJMP.  Copy the jmpbuf aside first, zero the live capped count,
+            ;; pop, then restore and JMP with D2 = T.  Nothing armed (word 0 = 0):
+            ;; ILLEGAL rather than a jump to address zero.
+            (let ((nohandler (mvm-make-label)))
+              (m68k-emit-move-imm-an buf (m68k-jmpbuf-addr) +68k-a1+)
+              (m68k-emit-move-disp-dn buf +68k-a1+ 0 +68k-d0+)
+              (m68k-emit-tst buf +68k-d0+)
+              (m68k-emit-beq buf nohandler)
+              (m68k-emit-move-imm-an buf (m68k-lj-scratch-addr) +68k-a0+)
+              (m68k-emit-copy-words buf +68k-a1+ +68k-a0+)
+              (m68k-emit-move-imm-an buf (m68k-hcapped-addr) +68k-a1+)
+              (m68k-emit-move-imm-dn buf 0 +68k-d0+)
+              (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ 0)
+              (m68k-emit-handler-pop buf)
+              (m68k-emit-move-imm-an buf (m68k-lj-scratch-addr) +68k-a1+)
+              (loop for d in (list +68k-d4+ +68k-d5+ +68k-d6+ +68k-d7+)
+                    for i from 3
+                    do (m68k-emit-move-disp-dn buf +68k-a1+ (* 4 i) d))
+              (m68k-emit-move-disp-an buf +68k-a1+ 8 +68k-a0+)  ; resume
+              (m68k-emit-move-disp-an buf +68k-a1+ 4 +68k-a6+)
+              (m68k-emit-move-disp-an buf +68k-a1+ 0 +68k-a7+)
+              (m68k-emit-move-imm-dn buf #xDEAD1009 +68k-d2+)  ; second return: T
+              (m68k-emit-jmp-an-ind buf +68k-a0+)
+              (m68k-emit-label buf nohandler)
+              (m68k-emit-illegal buf)))
+           ((= code #x0512)
+            ;; CLEAR-HANDLER: pop one frame; D2 (the result) untouched.
+            (m68k-emit-handler-pop buf))
            ((= code #x0530)
             ;; COPY-OVERFLOW-ARGS: the &rest/&key prologue's RUNTIME copy of
             ;; arguments 4.. into frame slots 4.., as translate-x64/i386/riscv
@@ -1938,6 +1996,43 @@
              ;; Unknown target: emit BSR with no fixup
              (m68k-emit-bsr buf nil))))
 
+      ((#.+op-fadd+ #.+op-fsub+ #.+op-fmul+ #.+op-fdiv+)
+       (let ((vd (first operands)))
+         (m68k-load-vreg buf +68k-d0+ (second operands))
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+         (m68k-float-unbox buf 0)
+         (m68k-load-vreg buf +68k-d0+ (third operands))
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+         (m68k-float-unbox buf 1)
+         (m68k-emit-fop buf (cond ((= opcode +op-fadd+) #x22)
+                                  ((= opcode +op-fsub+) #x28)
+                                  ((= opcode +op-fmul+) #x23)
+                                  (t                    #x20))
+                        1 0)                                  ; FP0 op= FP1
+         (m68k-float-box buf 0)
+         (m68k-store-vreg buf vd +68k-d0+)))
+
+      (#.+op-itof+
+       ;; Tagged fixnum -> double: untag, FMOVE.L Dn,FP0 (exact for 32 bits).
+       (let ((vd (first operands)))
+         (m68k-load-vreg buf +68k-d0+ (second operands))
+         (m68k-emit-asr-imm buf +68k-d0+ 1)
+         (m68k-emit-fmove-l-from-dn buf +68k-d0+ 0)
+         (m68k-float-box buf 0)
+         (m68k-store-vreg buf vd +68k-d0+)))
+
+      (#.+op-ftoi+
+       ;; Double -> tagged fixnum, TRUNCATING: FINTRZ first (round toward
+       ;; zero, whatever FPCR's mode), then FMOVE.L of an already-integral value.
+       (let ((vd (first operands)))
+         (m68k-load-vreg buf +68k-d0+ (second operands))
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+         (m68k-float-unbox buf 0)
+         (m68k-emit-fop buf #x03 0 0)                         ; FINTRZ FP0,FP0
+         (m68k-emit-fmove-l-to-dn buf 0 +68k-d0+)
+         (m68k-emit-lsl-imm buf +68k-d0+ 1)                   ; tag
+         (m68k-store-vreg buf vd +68k-d0+)))
+
       (#.+op-fn-addr+
        ;; (fn-addr Vd target) -- a function's native address TAGGED with
        ;; +tag-function+ (3), as funcall dispatch and FUNCTIONP expect.
@@ -2476,6 +2571,181 @@
          (limit (or end (m68k-buffer-word-count buf))))
     (loop for i from start below limit
           do (format t "  ~4,'0X: ~4,'0X~%" (* i 2) (aref words i)))))
+
+;;; ============================================================
+;;; Double floats through the 68881/68882 coprocessor (on-chip on the 68040)
+;;; ============================================================
+;;;
+;;; A boxed double is four TAGGED 16-bit chunks, slot k holding bits
+;;; (63-16k)..(48-16k).  68k is big-endian, so chunk k is the WORD at byte 2k of
+;;; the IEEE double: unbox writes the untagged chunks into a 16-byte stack
+;;; scratch with MOVE.W and loads it with one FMOVE.D; box is FMOVE.D out, then
+;;; each word back, tagged, into the new object -- the route PPC and RV32 take.
+;;; FPU words are emitted raw: opword #xF200 | <ea>, then the command word.
+;;; Only FP0/FP1 are used.
+
+(defun m68k-emit-move-w-dn-disp (buf dn an disp)
+  "MOVE.W Dd, d16(An)"
+  (m68k-emit-word buf (m68k-encode-move-word 3 +ea-mode-an-disp+ an +ea-mode-dn+ dn))
+  (m68k-emit-word buf (logand disp #xFFFF)))
+
+(defun m68k-emit-move-w-disp-dn (buf an disp dn)
+  "MOVE.W d16(An), Dd -- the upper word of Dd is unchanged."
+  (m68k-emit-word buf (m68k-encode-move-word 3 +ea-mode-dn+ dn +ea-mode-an-disp+ an))
+  (m68k-emit-word buf (logand disp #xFFFF)))
+
+(defun m68k-emit-fmove-d-from-sp (buf fpn)
+  "FMOVE.D (A7), FPn"
+  (m68k-emit-word buf #xF217)
+  (m68k-emit-word buf (logior #x5400 (ash fpn 7))))
+
+(defun m68k-emit-fmove-d-to-sp (buf fpn)
+  "FMOVE.D FPn, (A7)"
+  (m68k-emit-word buf #xF217)
+  (m68k-emit-word buf (logior #x7400 (ash fpn 7))))
+
+(defun m68k-emit-fop (buf opmode src dst)
+  "Register-to-register FPU op: FADD #x22, FSUB #x28, FMUL #x23, FDIV #x20,
+   FINTRZ #x03.  DST op= SRC."
+  (m68k-emit-word buf #xF200)
+  (m68k-emit-word buf (logior (ash src 10) (ash dst 7) opmode)))
+
+(defun m68k-emit-fmove-l-from-dn (buf dn fpn)
+  "FMOVE.L Dn, FPn -- signed 32-bit integer to extended/double."
+  (m68k-emit-word buf (logior #xF200 (logand dn 7)))
+  (m68k-emit-word buf (logior #x4000 (ash fpn 7))))
+
+(defun m68k-emit-fmove-l-to-dn (buf fpn dn)
+  "FMOVE.L FPn, Dn -- to a signed 32-bit integer in the current rounding mode;
+   callers FINTRZ first so the value is already integral and exact."
+  (m68k-emit-word buf (logior #xF200 (logand dn 7)))
+  (m68k-emit-word buf (logior #x6000 (ash fpn 7))))
+
+(defun m68k-float-unbox (buf fpn)
+  "Load the double whose TAGGED pointer is in A0 into FPn.  Clobbers D1."
+  (m68k-emit-lea-disp buf +68k-a7+ -16 +68k-a7+)
+  (loop for k from 0 to 3
+        do (m68k-emit-move-disp-dn buf +68k-a0+ (- (* 4 (1+ k)) +tag-object+) +68k-d1+)
+           (m68k-emit-lsr-imm buf +68k-d1+ 1)                 ; untag
+           (m68k-emit-move-w-dn-disp buf +68k-d1+ +68k-a7+ (* 2 k)))
+  (m68k-emit-fmove-d-from-sp buf fpn)
+  (m68k-emit-lea-disp buf +68k-a7+ 16 +68k-a7+))
+
+(defun m68k-float-box (buf fpn)
+  "Box FPn as a fresh four-chunk double; its TAGGED pointer lands in D0.
+   Header (4<<8)|#x60, five longwords rounded to 32 bytes (16-aligned heap).
+   Clobbers D1."
+  (m68k-emit-lea-disp buf +68k-a7+ -16 +68k-a7+)
+  (m68k-emit-fmove-d-to-sp buf fpn)
+  (m68k-emit-move-imm-dn buf (logior #x60 (ash 4 8)) +68k-d1+)
+  (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a2+ 0)            ; header at VA
+  (loop for k from 0 to 3
+        do (m68k-emit-move-imm-dn buf 0 +68k-d1+)
+           (m68k-emit-move-w-disp-dn buf +68k-a7+ (* 2 k) +68k-d1+)
+           (m68k-emit-lsl-imm buf +68k-d1+ 1)                 ; tag
+           (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a2+ (* 4 (1+ k))))
+  (m68k-emit-lea-disp buf +68k-a7+ 16 +68k-a7+)
+  (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
+  (m68k-emit-ori buf +68k-d0+ +tag-object+)
+  (m68k-emit-lea-disp buf +68k-a2+ 32 +68k-a2+))
+
+;;; ============================================================
+;;; handler-case: SETJMP (#x0510) / LONGJMP (#x0511) / CLEAR-HANDLER (#x0512)
+;;; ============================================================
+;;;
+;;; The protocol of translate-riscv / translate-ppc: one live jmpbuf, a stack of
+;;; saved outer jmpbufs so handler-cases NEST, a depth cap (21) past which a
+;;; push stores nothing and its matching pop is ABSORBED, and LONGJMP copying the
+;;; jmpbuf aside before the pop overwrites it.
+;;;
+;;; JMPBUF = 7 longwords: A7, A6 (VFP), resume address, D4..D7 -- V2..V5, the
+;;; callee-saved V-registers the prologue's MOVEM saves and whose epilogues a
+;;; LONGJMP skips.  VA/VL/VN (A2..A4) deliberately absent; V0/V1 (D2/D3) are
+;;; caller-saved.  Frames are 8 longwords (32 bytes, one spare) so a frame
+;;; address is a shift.  Temporaries: D0, D1, A0, A1.
+;;;
+;;; WHERE: hosted, the shared contract block at the heap base (jmpbuf
+;;; #x10000180 ... frames from #x10000408; 21 frames end at #x100006A8, clear of
+;;; the globals at #x10000A00); bare, the same offsets in *68k-globals-base*'s
+;;; block, which otherwise uses only #x00-#x0F.  Computed at translate time.
+
+(defconstant +68k-jmpbuf-words+ 7)
+(defparameter *68k-hstack-max-depth* 21)
+(defun m68k-hbase ()           (if *68k-linux-mode* #x10000000 *68k-globals-base*))
+(defun m68k-jmpbuf-addr ()     (+ (m68k-hbase) #x180))
+(defun m68k-lj-scratch-addr () (+ (m68k-hbase) #x300))
+(defun m68k-hcapped-addr ()    (+ (m68k-hbase) #x360))
+(defun m68k-hdepth-addr ()     (+ (m68k-hbase) #x400))
+(defun m68k-hframes-addr ()    (+ (m68k-hbase) #x408))
+
+(defun m68k-emit-copy-words (buf from-an to-an)
+  "Copy the 7 jmpbuf longwords from 0(FROM-AN) to 0(TO-AN) through D1."
+  (dotimes (i +68k-jmpbuf-words+)
+    (m68k-emit-move-disp-dn buf from-an (* 4 i) +68k-d1+)
+    (m68k-emit-move-dn-disp buf +68k-d1+ to-an (* 4 i))))
+
+(defun m68k-emit-frame-addr (buf dst-an depth-dn)
+  "DST-AN = frames-base + DEPTH-DN * 32.  Clobbers D1."
+  (m68k-emit-move-dn-dn buf depth-dn +68k-d1+)
+  (m68k-emit-lsl-imm buf +68k-d1+ 5)
+  (m68k-emit-addi buf +68k-d1+ (m68k-hframes-addr))
+  (m68k-emit-move-dn-an buf +68k-d1+ dst-an))
+
+(defun m68k-emit-handler-push (buf)
+  "Stack the CURRENT jmpbuf.  Leaves D0 = 0 if a frame was stored, 1 if the
+   push was CAPPED.  Clobbers D0, D1, A0, A1."
+  (let ((capped (mvm-make-label))
+        (done (mvm-make-label)))
+    (m68k-emit-move-imm-an buf (m68k-hdepth-addr) +68k-a1+)
+    (m68k-emit-move-disp-dn buf +68k-a1+ 0 +68k-d0+)        ; D0 = depth
+    (m68k-emit-cmpi buf +68k-d0+ *68k-hstack-max-depth*)
+    (m68k-emit-bge buf capped)
+    (m68k-emit-frame-addr buf +68k-a0+ +68k-d0+)
+    (m68k-emit-addi buf +68k-d0+ 1)
+    (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ 0)        ; depth++
+    (m68k-emit-move-imm-an buf (m68k-jmpbuf-addr) +68k-a1+)
+    (m68k-emit-copy-words buf +68k-a1+ +68k-a0+)
+    (m68k-emit-move-imm-dn buf 0 +68k-d0+)                  ; stored
+    (m68k-emit-bra buf done)
+    (m68k-emit-label buf capped)
+    (m68k-emit-move-imm-an buf (m68k-hcapped-addr) +68k-a1+)
+    (m68k-emit-move-disp-dn buf +68k-a1+ 0 +68k-d0+)
+    (m68k-emit-addi buf +68k-d0+ 1)
+    (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ 0)
+    (m68k-emit-move-imm-dn buf 1 +68k-d0+)                  ; capped
+    (m68k-emit-label buf done)))
+
+(defun m68k-emit-handler-pop (buf)
+  "Absorb a capped push, restore the top stacked frame into the jmpbuf, or ZERO
+   the jmpbuf when the stack is empty.  Never touches D2 (V0), which holds the
+   handler-case's result at a CLEAR-HANDLER.  Clobbers D0, D1, A0, A1."
+  (let ((not-capped (mvm-make-label))
+        (empty (mvm-make-label))
+        (done (mvm-make-label)))
+    (m68k-emit-move-imm-an buf (m68k-hcapped-addr) +68k-a1+)
+    (m68k-emit-move-disp-dn buf +68k-a1+ 0 +68k-d0+)
+    (m68k-emit-tst buf +68k-d0+)
+    (m68k-emit-beq buf not-capped)
+    (m68k-emit-subq buf +68k-d0+ 1)
+    (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ 0)
+    (m68k-emit-bra buf done)
+    (m68k-emit-label buf not-capped)
+    (m68k-emit-move-imm-an buf (m68k-hdepth-addr) +68k-a1+)
+    (m68k-emit-move-disp-dn buf +68k-a1+ 0 +68k-d0+)
+    (m68k-emit-tst buf +68k-d0+)
+    (m68k-emit-beq buf empty)
+    (m68k-emit-subq buf +68k-d0+ 1)
+    (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ 0)        ; depth--
+    (m68k-emit-frame-addr buf +68k-a0+ +68k-d0+)
+    (m68k-emit-move-imm-an buf (m68k-jmpbuf-addr) +68k-a1+)
+    (m68k-emit-copy-words buf +68k-a0+ +68k-a1+)
+    (m68k-emit-bra buf done)
+    (m68k-emit-label buf empty)                             ; zero the whole jmpbuf
+    (m68k-emit-move-imm-an buf (m68k-jmpbuf-addr) +68k-a1+)
+    (m68k-emit-move-imm-dn buf 0 +68k-d1+)
+    (dotimes (i +68k-jmpbuf-words+)
+      (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a1+ (* 4 i)))
+    (m68k-emit-label buf done)))
 
 (defun m68k-set-linux-mode (on)
   "Turn hosted mode on or off, moving the convention slots with it.  One

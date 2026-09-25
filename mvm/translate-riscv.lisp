@@ -953,7 +953,7 @@
   "Physical register holding the second operand of the most recent MVM-CMP.")
 
 (defun translate-mvm-insn-riscv (buf opcode operands mvm-pc
-                                  &key label-map function-table)
+                                  &key (pass2 nil) label-map function-table)
   "Translate a single MVM instruction to RISC-V native code.
    BUF is an rv-buffer. OPCODE and OPERANDS come from decode-instruction.
    MVM-PC is the bytecode offset of this instruction (for branch resolution).
@@ -967,12 +967,42 @@
          (store-result (vreg phys)
            (rv-store-vreg buf vreg phys))
          (branch-offset (mvm-target-pc)
-           ;; Compute native byte offset from current position to target
-           ;; The label-map is populated in the first pass
+           ;; Native byte offset from here to the target, via pass 1's label map.
+           ;;
+           ;; A MISS USED TO RETURN 0, commented "placeholder, fixed up in second
+           ;; pass" — AND THERE IS NO FIXUP PASS.  Offset 0 on a branch is a branch
+           ;; TO ITSELF: an infinite self-loop, one basic block, no diagnostic.
+           ;; That is exactly what the real CL image did — a -d exec census showed
+           ;; ONE block executing 300,000 times while a probe inside the function
+           ;; printed its entry marker and then never reached the first statement of
+           ;; the loop body.
+           ;;
+           ;; Now it is fatal and names the target.  A branch whose destination is
+           ;; not an instruction boundary recorded by the decode pass is a compiler
+           ;; or decoder bug, and silence turned it into a hang 12 MB into a 32 MB
+           ;; image.  Same discipline as the pass-2 size assertion above: make the
+           ;; unrepresentable state a build failure that says which one it is.
            (let ((native-target (gethash mvm-target-pc label-map)))
-             (if native-target
-                 (- native-target (rv-current-offset buf))
-                 0))))  ; placeholder, fixed up in second pass
+             ;; A MISS IS EXPECTED IN PASS 1 AND A BUG IN PASS 2.
+             ;;
+             ;; Pass 1 builds this map as it measures, so a FORWARD branch there
+             ;; legitimately cannot see its target yet — that is what the original
+             ;; "placeholder, fixed up in second pass" comment meant, and returning 0
+             ;; is harmless because pass 1's only product is SIZES, and every emitter
+             ;; here is size-stable (see the pass-2 assertion).
+             ;;
+             ;; In PASS 2 the map is complete, so a miss means a branch to a target
+             ;; that is not an instruction boundary, and returning 0 would emit a
+             ;; branch TO ITSELF: an infinite self-loop, one basic block, no
+             ;; diagnostic.  Verified for this module: the two decoders agree on all
+             ;; 3,006,921 instructions and every observed target IS a boundary, so
+             ;; pass 2 should never miss — and if it ever does, it now says so.
+             (cond (native-target (- native-target (rv-current-offset buf)))
+                   (pass2 (error "riscv PASS 2 branch target ~D is not in the label ~
+                                  map (opcode #x~2,'0X at mvm-pc ~D); a 0 offset here ~
+                                  would branch to itself"
+                                 mvm-target-pc opcode mvm-pc))
+                   (t 0)))))
 
     (case opcode
       ;; ---- Special ----
@@ -2541,7 +2571,8 @@
           ;; Pass next-pc for branch offset computation (MVM offsets are from end of insn)
           (translate-mvm-insn-riscv final-buf opcode operands next-pc
                                     :label-map label-map
-                                    :function-table native-fn-table)))
+                                    :function-table native-fn-table
+                                    :pass2 t)))
       (setf (gethash mvm-len label-map) (rv-current-offset final-buf))
       ;; Re-derive the function map from PASS 2's positions and RETURN it.
       ;; This map was already being built (from pass 1) and then dropped on

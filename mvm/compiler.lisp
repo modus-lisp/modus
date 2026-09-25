@@ -8172,7 +8172,17 @@
                (emit-ir :push arr-slot)
                (compile-quote (aref value i) elem-slot)
                (emit-ir :pop arr-slot)
-               (emit-ir :obj-set arr-slot i elem-slot))
+               ;; :obj-set carries the slot index as imm8, so element 256
+               ;; landed on slot 0 and the tail of a long literal overwrote
+               ;; its head (boot-x64's 347-byte #VC/SIGSEGV stub blob, baked
+               ;; into modus-sh, came out as its own last 91 bytes).  Past
+               ;; 255, index from a register.
+               (if (< i 256)
+                   (emit-ir :obj-set arr-slot i elem-slot)
+                   (let ((idx-slot (alloc-temp-reg)))
+                     (emit-ir :li idx-slot (ash i +fixnum-shift+))
+                     (emit-ir :aset arr-slot idx-slot elem-slot)
+                     (free-temp-reg))))
              (free-temp-reg)))
          (unless (= dest arr-slot)
            (emit-ir :mov dest arr-slot))

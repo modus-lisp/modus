@@ -58,20 +58,22 @@ the hosted `--compile`'s static-emit trio, JIT off first.
 and compares the bytes: SBCL vs modus-sh (the fixpoint) and run vs run.  The
 md5 of the modus-sh output is the DDC'd hash for `-kernel`.
 
-**Result, 2026-09-25 (evening): THE SELF-COMPILED IMAGE BOOTS AND EVALUATES.**
-`modus-sh --compile-uefi` now produces a UEFI CL image that boots under OVMF
-with zero boot errors and answers `(+ 1 2)` → 3 and
-`(list (lisp-implementation-type) (* 6 7))` → `("Modus" 42)`, i.e. Modus
-compiled its own bare-metal image and that image runs.  It is reproducible
-run to run and, against the SBCL build of the same text in the same
-configuration, **5414 of 5437 functions are identical in MVM bytecode** and
-the images are within 16 KB of each other.  Not yet byte-identical.
+**Result, 2026-09-25 (night): THE FIXPOINT IS REAL.**  `test/run-uefi-ddc.sh`
+PASSES: the SBCL static build of the UEFI CL image and `modus-sh --compile-uefi`
+of the same source text are **byte-identical** (md5 `76ec6cfb…`, 35,951,104
+bytes), the in-image compile is reproducible run to run, and the image boots
+under OVMF with zero boot errors and answers `(+ 1 2)` → 3 and
+`(list "Modus" (* 6 7) (car '(a b)))` → `("Modus" 42 A)`.  This is the first
+full-size, payload-grade self-compile in the tree: the artifact that would be
+measured under SEV-SNP is produced identically by SBCL and by Modus itself.
 
 Each divergence was found by the same method — dump every function's MVM
-bytecode on both sides (`modus-sh --dump-mvm`, `tmp/mvmdiff/host-dump-all.lisp`),
-mask layout-dependent operands, take the FIRST differing function in compile
-order — and each turned out to be host state the in-image compile lacked or
-in-image state the host lacked:
+bytecode on both sides (`modus-sh --dump-mvm`, `tmp/mvmdiff/host-dump-all.lisp`,
+`tmp/mvmdiff/bcdiff.py`), mask layout-dependent operands, take the FIRST
+differing function in compile order; once the bytecode matched, compare the
+native image byte-for-byte and read the region the first difference sits in —
+and each turned out to be host state the in-image compile lacked or in-image
+state the host lacked:
 
 | # | divergence | fix |
 |---|---|---|
@@ -88,14 +90,16 @@ in-image state the host lacked:
 | 11 | `#+sbcl` lambda in mvm-compile-all (one closure) | feature-free diagnostic |
 | 12 | Modus `find-package "CL-TEST"` → CL-USER; host NIL | reader switches package only on exact name/nickname |
 | 13 | `sb-impl::comma` / `sb-int:quasiquote` spelled as symbols in compiler.lisp | reached by name at run time |
+| 14 | float literals rounded twice (`%bignum-to-float` then `%float-div`): `1.7976931348623157d308` read as +inf, 14 init thunks differed | `%exact-ratio-to-double` — correctly rounded from the integer ratio, exact power-of-two scaling |
+| 15 | `common-lisp:t` read as a symbol interned in CL, not the constant (COERCE) | qualified T/NIL are the booleans, as in the unqualified branch |
+| 16 | a `#.` evaluated mid-static-build with `*static-build-p*` still T: its string literal took the serialized `:li-const` path and the interpreter read a runtime-pool entry instead — every `#.(compute-name-hash "X")` was the hash of IF | the nested eval runs as a runtime eval |
+| 17 | vector literals past element 255: `:obj-set`'s imm8 index wrapped, so boot-x64's 347-byte fault-stub blob came out as its own last 91 bytes (in modus-sh itself, hence in every image it built) | elements ≥ 256 stored through a register index (`:aset`) |
+| 18 | the source file read as Latin-1 bytes in the image (an em dash = 3 chars) while SBCL reads UTF-8: docstrings in the constant pool were longer, every `LI-CONST` address after them shifted, and the host's embedded source blob was LOSSY (one truncated byte per char) | the image decodes UTF-8 on read; `embed-source-blob` encodes UTF-8 on both sides, so the blob is the file's own bytes |
 
-**Remaining (23 functions):** (a) 14 float-constant init thunks — the in-image
-reader builds `1.7976931348623157d308` as +infinity (`%build-float-from-parts`
-scales by 10^k in floating point; needs an exact integer-scaled conversion);
-(b) COERCE and two compiler walkers compile one quoted symbol differently
-(a `T` interned in COMMON-LISP where the host bakes the constant; `IF` where
-the host has `BLOCK`), context-dependent, not reproduced standalone; (c) one
-FN-ADDR shift downstream of those.  `test/run-uefi-ddc.sh` is the gate.
+Rows 14–18 are 9c6a1b2 and the commit after it.  The x64 CLI image is
+affected by 17 (any `#(…)` literal longer than 255 elements was silently
+wrong in every image) and 18 (`embed-source-blob`), and by the reader changes
+in 14–16; the ANSI gate is owed on them.
 
 ## The plan
 

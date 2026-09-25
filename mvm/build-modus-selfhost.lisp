@@ -1281,8 +1281,39 @@
 ;; Read a Lisp source file, compile+translate+ELF-wrap it entirely in-image
 ;; via build-image (:linux-x64), and write a runnable Linux ELF.  NO SBCL.
 (defun %sys-close (fd) (syscall3 3 fd 0 0))
+(defun %selfhost-utf8-decode (bytes)
+  ;; BYTES is a string holding one Latin-1 char per file byte (the image's
+  ;; file streams do no decoding).  Return the UTF-8 decoding, so a
+  ;; non-ASCII char in a docstring is ONE char exactly as the SBCL host
+  ;; reads it -- a docstring with two em dashes was 4 chars longer in the
+  ;; image's constant pool and shifted every LI-CONST address after it.
+  ;; A malformed lead byte is kept as its Latin-1 char.
+  (let ((n (length bytes)) (i 0) (out (%make-string-array (length bytes))) (j 0))
+    (loop
+      (when (>= i n) (return nil))
+      (let ((b (char-code (aref bytes i))))
+        (cond ((< b #x80) (setf (aref out j) (code-char b)) (setq i (+ i 1)))
+              ((and (= (logand b #xE0) #xC0) (< (+ i 1) n))
+               (setf (aref out j) (code-char (logior (ash (logand b #x1F) 6)
+                                                     (logand (char-code (aref bytes (+ i 1))) #x3F))))
+               (setq i (+ i 2)))
+              ((and (= (logand b #xF0) #xE0) (< (+ i 2) n))
+               (setf (aref out j) (code-char (logior (ash (logand b #x0F) 12)
+                                                     (ash (logand (char-code (aref bytes (+ i 1))) #x3F) 6)
+                                                     (logand (char-code (aref bytes (+ i 2))) #x3F))))
+               (setq i (+ i 3)))
+              ((and (= (logand b #xF8) #xF0) (< (+ i 3) n))
+               (setf (aref out j) (code-char (logior (ash (logand b #x07) 18)
+                                                     (ash (logand (char-code (aref bytes (+ i 1))) #x3F) 12)
+                                                     (ash (logand (char-code (aref bytes (+ i 2))) #x3F) 6)
+                                                     (logand (char-code (aref bytes (+ i 3))) #x3F))))
+               (setq i (+ i 4)))
+              (t (setf (aref out j) (code-char b)) (setq i (+ i 1))))
+        (setq j (+ j 1))))
+    (if (< j n) (subseq out 0 j) out)))
 (defun %selfhost-slurp-text (path)
-  ;; Read PATH's full text into a fresh string (ASCII source: bytes == chars).
+  ;; Read PATH's full text into a fresh string, decoded as UTF-8 (what the
+  ;; SBCL host's reader does with the same file).
   (let ((s (open path :direction :input)))
     (if (null s)
         nil
@@ -1290,7 +1321,7 @@
           (let ((buf (%make-string-array n)))
             (let ((got (read-sequence buf s)))
               (close s)
-              (if (< got n) (subseq buf 0 got) buf)))))))
+              (%selfhost-utf8-decode (if (< got n) (subseq buf 0 got) buf))))))))
 (defun %selfhost-open-exec (path)
   ;; open(path, O_WRONLY|O_CREAT|O_TRUNC, 0755) -> fd
   (%string-to-cstr path *cstr-scratch*)

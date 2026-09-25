@@ -356,11 +356,36 @@
    self-contained reader (Phase 1a).  Suppressed by *EMBED-SOURCE-BLOB* = NIL."
   (let ((buf (make-mvm-buffer))
         (source-text (if *embed-source-blob* source-text "")))
-    ;; Source blob header: [magic:4 | length:4 | text...]
-    (mvm-emit-u32 buf #x4D564D53)  ; "MVMS" magic
-    (mvm-emit-u32 buf (length source-text))
+    ;; Source blob header: [magic:4 | length:4 (BYTES) | utf-8 text...]
+    ;; UTF-8, not one truncated byte per char: the host reads the source as
+    ;; UTF-8 (an em dash in a docstring is ONE char, code #x2014) and used to
+    ;; emit its low byte, while an image reading the same file saw three
+    ;; Latin-1 chars and emitted three bytes -- the two blobs differed by two
+    ;; bytes per non-ASCII char (11178 bytes over the UEFI CL image) and the
+    ;; host's copy was lossy.  Encoding here and decoding on the image side
+    ;; (%selfhost-slurp-text) makes the blob the file's own bytes on both.
+    (let ((nbytes 0))
+      (loop for c across source-text
+            do (let ((code (char-code c)))
+                 (setq nbytes (+ nbytes (cond ((< code #x80) 1) ((< code #x800) 2)
+                                              ((< code #x10000) 3) (t 4))))))
+      (mvm-emit-u32 buf #x4D564D53)  ; "MVMS" magic
+      (mvm-emit-u32 buf nbytes))
     (loop for c across source-text
-          do (mvm-emit-byte buf (char-code c)))
+          do (let ((code (char-code c)))
+               (cond ((< code #x80) (mvm-emit-byte buf code))
+                     ((< code #x800)
+                      (mvm-emit-byte buf (logior #xC0 (ash code -6)))
+                      (mvm-emit-byte buf (logior #x80 (logand code #x3F))))
+                     ((< code #x10000)
+                      (mvm-emit-byte buf (logior #xE0 (ash code -12)))
+                      (mvm-emit-byte buf (logior #x80 (logand (ash code -6) #x3F)))
+                      (mvm-emit-byte buf (logior #x80 (logand code #x3F))))
+                     (t
+                      (mvm-emit-byte buf (logior #xF0 (ash code -18)))
+                      (mvm-emit-byte buf (logior #x80 (logand (ash code -12) #x3F)))
+                      (mvm-emit-byte buf (logior #x80 (logand (ash code -6) #x3F)))
+                      (mvm-emit-byte buf (logior #x80 (logand code #x3F)))))))
     ;; Align to word boundary
     (loop while (/= 0 (mod (mvm-buffer-position buf) (target-word-size target)))
           do (mvm-emit-byte buf 0))

@@ -1582,7 +1582,13 @@
              ;; Tag the pointer
              (ppc-emit-ori buf pd +ppc-r19+ +tag-cons+)
              ;; Bump alloc pointer: VA += 2*ws
-             (ppc-emit-addi buf +ppc-r19+ +ppc-r19+ (* 2 ws))
+             (ppc-emit-addi buf +ppc-r19+ +ppc-r19+ 16)
+             ;; A CONS TAKES SIXTEEN BYTES AT BOTH WIDTHS, not 2*ws.  Objects are
+             ;; rounded to 16 and pointer types are read from the low FOUR bits,
+             ;; so the heap pointer must never sit at 8 mod 16: on ppc32 an odd
+             ;; number of 8-byte conses left it there, and the next object's tag
+             ;; 9 read as nibble 1 (a cons) while the next cons's 1 read as 9.
+             ;; r26-callee-alloc answered 1042 on ppc32 (and riscv32, 68k).
              (unless (ppc-vreg-phys vd)
                (ppc-store-vreg buf vd pd))))))
 
@@ -1843,7 +1849,7 @@
                (ws (ppc-word-size)))
            (ppc-emit-ori buf pd +ppc-r19+ +tag-cons+)
            ;; Bump alloc pointer by 2*ws (cons cell = 2 words)
-           (ppc-emit-addi buf +ppc-r19+ +ppc-r19+ (* 2 ws))
+           (ppc-emit-addi buf +ppc-r19+ +ppc-r19+ 16) ; 16 at both widths
            (unless (ppc-vreg-phys vd)
              (ppc-store-vreg buf vd pd)))))
 

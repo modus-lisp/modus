@@ -515,29 +515,30 @@
   (if *riscv-64-bit* 3 2))
 
 (defun rv-object-tag ()
-  "The low-nibble tag on an object pointer: 9 on RV64, 2 on RV32.
+  "The low-nibble tag on an object pointer: 9, +TAG-OBJECT+, at both widths.
 
-   EVERY POINTER TAG MUST BE ODD, and 2 is not.  The shared compiler recognises
-   a fixnum by its low bit alone -- compile-integerp is `test dest, 1' -- because
-   fixnums are value<<1 and every x64 tag (cons 1, function 3, object 9) is odd.
-   It recognises an array or string by comparing OBJ-TAG against +TAG-OBJECT+,
-   which it bakes as 9.  With objects tagged 2, BOTH go wrong for every object
-   in the image: (integerp <string>) is T, because bit 0 of ...2 is clear, and
-   (arrayp <string>) is NIL, because 2 is not 9.  Measured in the real CL image
-   as SYMBOL-NAME taking its INTEGER (gensym) branch for a symbol and
-   CONCATENATE rejecting two well-formed one-character strings as non-sequences.
+   EVERY POINTER TAG MUST BE ODD.  The shared compiler recognises a fixnum by
+   its low bit alone -- compile-integerp is `test dest, 1' -- and recognises an
+   array or string by comparing OBJ-TAG with a baked +TAG-OBJECT+ of 9.  With
+   objects tagged 2 (as RISC-V once did), (integerp <string>) is T and
+   (stringp <string>) NIL for every object in the image; measured in the real
+   CL image as SYMBOL-NAME taking its integer branch for a symbol.
 
-   RV64 CAN USE 9.  Tag 9 needs the low FOUR address bits free -- 16-byte
-   objects -- and RV64's granule is a word pair, sixteen bytes, exactly as on
-   x64.  RV32's granule is eight bytes, so 9 does not fit there; RV32 keeps 2
-   and with it the same misclassification, which is a named, open gap (as it is
-   on arm32), not something this function fixes."
-  (if *riscv-64-bit* 9 2))
+   Tag 9 needs 16-byte objects, which is why rv-granule is 16 at both widths."
+  9)
 
 (defun rv-granule ()
-  "Allocation granule: TWO words, so the bump pointer stays word-pair aligned
-   and a tag of 1 (cons) or 2 (object) is exact.  16 on RV64, 8 on RV32."
-  (* 2 (rv-word-size)))
+  "Allocation granule: SIXTEEN BYTES AT BOTH WIDTHS.
+
+   Pointer types are read from the low FOUR bits (+tag-mask+ #x0F: cons 0001,
+   function 0011, object 1001), so every heap object must start 16-aligned or
+   bit 3 of its address leaks into the tag.  RV32 used a word pair -- eight
+   bytes -- which left half of all objects at 8 mod 16, where a cons (tag 1)
+   reads as 9 and an object (tag 9) as 1.  That is also why RV32 had been given
+   object tag 2, which the shared compiler cannot use (it needs every pointer
+   tag ODD; see rv-object-tag).  A cons on RV32 now wastes eight bytes; in
+   exchange the tag scheme is the same on every port."
+  16)
 
 (defun rv-mask26-shift ()
   "Shift-out/shift-back distance that masks a value to its low 26 bits:
@@ -1844,7 +1845,7 @@
          ;; answers are in registers before the branches, each branch skips a
          ;; fixed run, so the arm is size-stable.
          (rv-emit-li buf +rv-t3+ +t-value+)
-         (rv-emit-andi buf +rv-t1+ rs (if *riscv-64-bit* #x0F #x07)) ; read RS
+         (rv-emit-andi buf +rv-t1+ rs #x0F)   ; +tag-mask+, read RS
          (rv-emit-mv buf +rv-t4+ rs)                  ; keep RS: it may be t0
          (rv-emit-addi buf +rv-t2+ +rv-x0+ (rv-object-tag))
          (rv-emit-addi buf +rv-t0+ +rv-x0+ 0)         ; default: subtag 0

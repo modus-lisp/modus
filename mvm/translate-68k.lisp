@@ -1693,8 +1693,13 @@
          ;; Tag pointer: result = A2 | +tag-cons+
          (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
          (m68k-emit-ori buf +68k-d0+ +tag-cons+)
-         ;; Bump A2 by 8
-         (m68k-emit-addq-an buf +68k-a2+ 8)
+         ;; Bump A2 by SIXTEEN, not 8.  Objects are rounded to 16 and pointer
+         ;; types are read from the low FOUR bits, so the heap pointer must
+         ;; never sit at 8 mod 16: an odd number of 8-byte conses left it there,
+         ;; and the next object's tag 9 read as nibble 1 (a cons) while the next
+         ;; cons's 1 read as 9.  r26-callee-alloc answered 1042 on 68k (and on
+         ;; riscv32 and ppc32).  ADDQ stops at 8, hence LEA.
+         (m68k-emit-lea-disp buf +68k-a2+ 16 +68k-a2+)
          (m68k-store-vreg buf vd +68k-d0+)))
 
       (#.+op-setcar+
@@ -1932,8 +1937,8 @@
          ;; Tag A2 (VA) as cons pointer
          (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
          (m68k-emit-ori buf +68k-d0+ +tag-cons+)
-         ;; Bump A2 by 8
-         (m68k-emit-addq-an buf +68k-a2+ 8)
+         ;; Bump A2 by 16 -- the same reason as +op-cons+.
+         (m68k-emit-lea-disp buf +68k-a2+ 16 +68k-a2+)
          (m68k-store-vreg buf vd +68k-d0+)))
 
       ((#.+op-gc-check+ #.+op-gc-check-n+ #.+op-gc-check-r+)

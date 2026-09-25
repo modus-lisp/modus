@@ -308,7 +308,19 @@
          (word-size (target-word-size target))
          (constants (mvm-module-constant-table module))
          (n (length constants))
-         (addr-table (make-array n :initial-element 0)))
+         (addr-table (make-array n :initial-element 0))
+         (big (target-big-endian-p target)))
+    ;; POOL WORDS ARE WRITTEN IN THE TARGET'S BYTE ORDER.  mvm-emit-u32/u64 are
+    ;; little-endian, which is right for seven targets and byte-swaps every
+    ;; header and character of a pooled string on ppc and 68k -- found when
+    ;; li-const was first implemented for PowerPC.
+    (flet ((emit-word (val)
+             (let ((nbytes word-size))
+               (if big
+                   (loop for i from (1- nbytes) downto 0
+                         do (mvm-emit-byte buf (logand (ash val (* -8 i)) #xFF)))
+                   (loop for i from 0 below nbytes
+                         do (mvm-emit-byte buf (logand (ash val (* -8 i)) #xFF)))))))
     (loop for constant in constants
           for idx from 0
           do (typecase constant
@@ -336,17 +348,13 @@
                   ;; Header: (count << 8) | subtag-string (#x31), matching
                   ;; alloc-obj's runtime header format, then however many
                   ;; padding words this target's layout puts before the data.
-                  (if (= word-size 8)
-                      (mvm-emit-u64 buf (logior #x31 (ash len 8)))
-                      (mvm-emit-u32 buf (logior #x31 (ash len 8))))
+                  (emit-word (logior #x31 (ash len 8)))
                   (dotimes (i pad-words)
-                    (if (= word-size 8) (mvm-emit-u64 buf 0) (mvm-emit-u32 buf 0)))
+                    (emit-word 0))
                   ;; One TAGGED character code per word, as every target's
                   ;; :alloc-string does.
                   (loop for c across constant
-                        do (if (= word-size 8)
-                               (mvm-emit-u64 buf (ash (char-code c) 1))
-                               (mvm-emit-u32 buf (ash (char-code c) 1))))
+                        do (emit-word (ash (char-code c) 1)))
                   (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
                         do (mvm-emit-byte buf 0))
                   (setf (aref addr-table idx) (logior obj-offset tag))))
@@ -356,10 +364,8 @@
                 ;; compound types haven't been routed through yet.  Emit a
                 ;; single zero so subsequent layout doesn't drift if such an
                 ;; entry creeps in; addr-table[idx] stays 0.
-                (if (= word-size 8)
-                    (mvm-emit-u64 buf 0)
-                    (mvm-emit-u32 buf 0)))))
-    (values (mvm-buffer-used-bytes buf) addr-table)))
+                (emit-word 0))))
+    (values (mvm-buffer-used-bytes buf) addr-table))))
 
 (defun build-nfn-table (module target)
   "Build the NFN (Name-to-Function-Number) table.
@@ -786,6 +792,14 @@
                     ((member arch '(:riscv64 :riscv32))
                      (and (boundp 'modus.mvm::*riscv-li-const-patches*)
                           (symbol-value 'modus.mvm::*riscv-li-const-patches*)))
+                    ;; PowerPC (both widths): a LIS / ORI pair.
+                    ((member arch '(:ppc64 :ppc32))
+                     (and (boundp 'modus.mvm::*ppc-li-const-patches*)
+                          (symbol-value 'modus.mvm::*ppc-li-const-patches*)))
+                    ;; 68k: MOVE.L #imm32,D0.
+                    ((eq arch :68k)
+                     (and (boundp 'modus.mvm::*68k-li-const-patches*)
+                          (symbol-value 'modus.mvm::*68k-li-const-patches*)))
                     (t nil))))
     (when patches
       (let* ((native-image-offset (or (kernel-image-native-image-offset image) 0))
@@ -852,6 +866,28 @@
                                        (logand (ash tagged-addr -10) #x7FF))
                (patch-riscv-addi-imm12 raw-bytes (+ file-pos 16)
                                        (logand tagged-addr #x3FF)))
+              ((member arch '(:ppc64 :ppc32))
+               ;; PowerPC: LIS rT,hi16 at +0 and ORI rT,rT,lo16 at +4.  Both
+               ;; immediates are the LOW halfword of a BIG-ENDIAN instruction
+               ;; word, i.e. bytes +2 and +3.  ORI is a plain OR, so no @ha
+               ;; carry adjustment -- but LIS sign-extends on ppc64, so the
+               ;; address must stay below 2^31 or the constant comes out
+               ;; negative.  Fail loudly rather than load the wrong address.
+               (unless (< tagged-addr (ash 1 31))
+                 (error "ppc li-const: pool address #x~X is not below 2^31, ~
+                         which LIS would sign-extend" tagged-addr))
+               (let ((hi (logand (ash tagged-addr -16) #xFFFF))
+                     (lo (logand tagged-addr #xFFFF)))
+                 (setf (aref raw-bytes (+ file-pos 2)) (ash hi -8)
+                       (aref raw-bytes (+ file-pos 3)) (logand hi #xFF)
+                       (aref raw-bytes (+ file-pos 6)) (ash lo -8)
+                       (aref raw-bytes (+ file-pos 7)) (logand lo #xFF))))
+              ((eq arch :68k)
+               ;; 68k: the 32-bit immediate of MOVE.L #imm32,D0, big-endian,
+               ;; at bytes +2..+5 after the opcode word.
+               (dotimes (i 4)
+                 (setf (aref raw-bytes (+ file-pos 2 i))
+                       (logand (ash tagged-addr (* -8 (- 3 i))) #xFF))))
               (t
                ;; x64: little-endian 8-byte MOVABS immediate write.
                (dotimes (i 8)

@@ -158,6 +158,12 @@
   (position 0)      ; byte position (always word-aligned)
   (word-count 0))   ; word index (position / 4)
 
+(defvar *ppc-li-const-patches* nil
+  "List of (NATIVE-BYTE-OFFSET . POOL-INDEX) recorded by +OP-LI-CONST+: at that
+   offset is a LIS/ORI pair whose two 16-bit immediates cross.lisp's
+   apply-li-const-patches fills with the constant-pool slot's tagged address.
+   Reset at the start of every translation.")
+
 (defun ppc-emit-word (buf word)
   "Emit a 32-bit PPC instruction word."
   (let ((idx (ppc-buffer-word-count buf)))
@@ -195,6 +201,20 @@
           (unless target
             (error "PPC: undefined label ~D" label-id))
           (ecase fixup-type
+            ;; PC-RELATIVE ADDRESS HALVES for +op-fn-addr+.  The sequence is
+            ;;   bl .+4 ; mflr rT ; addis rT,rT,@ha ; addi rT,rT,@l ; ori rT,rT,3
+            ;; and LR holds the address of the MFLR, so both halves are measured
+            ;; from it: one word before the ADDIS, two before the ADDI.  @ha is
+            ;; the high half pre-incremented when the low half's sign bit is set,
+            ;; because ADDI sign-extends its immediate.
+            (:pcrel-ha
+             (let* ((r (- target (* (1- word-idx) 4)))
+                    (ha (logand (ash (+ r #x8000) -16) #xFFFF)))
+               (setf (aref words word-idx) (logior (logand word #xFFFF0000) ha))))
+            (:pcrel-lo
+             (let ((r (- target (* (- word-idx 2) 4))))
+               (setf (aref words word-idx)
+                     (logior (logand word #xFFFF0000) (logand r #xFFFF)))))
             (:branch24
              ;; I-form: bits 6-29 hold offset/4, bit 30=AA, bit 31=LK
              ;; The offset is sign-extended 26-bit, shifted right 2
@@ -1812,6 +1832,49 @@
              ;; Unknown target: emit BL with no fixup (will jump to next insn)
              (ppc-emit-bl buf nil))))
 
+      (#.+op-fn-addr+
+       ;; (fn-addr Vd target) -- the native address of a function, TAGGED with
+       ;; +tag-function+ (3), which is how funcall dispatch and FUNCTIONP tell it
+       ;; from a cons (1) or an object (9).
+       ;;
+       ;; PowerPC has no AUIPC, so the PC comes from `bl .+4; mflr': the branch
+       ;; lands on the very next instruction and leaves its address in LR.
+       ;; Clobbering LR mid-function is safe -- the prologue saved it to memory
+       ;; and the epilogue reloads it from there, and every call clobbers it
+       ;; anyway.  Then @ha/@l of the displacement (fixups :pcrel-ha/:pcrel-lo)
+       ;; and OR 3: every instruction is 4 bytes, so a function's address has
+       ;; its low two bits free, and BCCTR ignores them, which is why
+       ;; +op-call-ind+ below needs no untagging.  Fixed five words.
+       (let* ((vd (first operands))
+              (idx (second operands))
+              (mvm-off (and function-table (gethash idx function-table)))
+              (label (and mvm-off (gethash mvm-off label-map)))
+              (pd (or (ppc-vreg-phys vd) +ppc-scratch1+)))
+         (unless label
+           (error "PPC fn-addr: no label for function index ~D" idx))
+         (ppc-emit-word buf #x48000005)                 ; bl .+4
+         (ppc-emit-mflr buf pd)
+         (ppc-emit-addis buf pd pd 0)
+         (ppc-emit-fixup buf label :pcrel-ha)
+         (ppc-emit-addi buf pd pd 0)
+         (ppc-emit-fixup buf label :pcrel-lo)
+         (ppc-emit-ori buf pd pd +tag-function+)
+         (unless (ppc-vreg-phys vd)
+           (ppc-store-vreg buf vd pd))))
+
+      (#.+op-li-const+
+       ;; (li-const Vd idx) -- the TAGGED address of constant-pool slot IDX, not
+       ;; known until the image is laid out: a fixed LIS/ORI placeholder recorded
+       ;; in *ppc-li-const-patches* and filled by cross.lisp.
+       (let* ((vd (first operands))
+              (idx (second operands))
+              (pd (or (ppc-vreg-phys vd) +ppc-scratch1+)))
+         (push (cons (ppc-current-offset buf) idx) *ppc-li-const-patches*)
+         (ppc-emit-addis buf pd 0 0)                    ; lis pd, hi16
+         (ppc-emit-ori buf pd pd 0)                     ; ori pd, pd, lo16
+         (unless (ppc-vreg-phys vd)
+           (ppc-store-vreg buf vd pd))))
+
       (#.+op-call-ind+
        (let ((vs (first operands)))
          (let ((ps (vreg-or-scratch vs +ppc-scratch1+)))
@@ -2207,6 +2270,7 @@
    BYTECODE is a (vector (unsigned-byte 8)).
    FUNCTION-TABLE maps function indices to bytecode offsets.
    Returns a PPC buffer (convert with ppc-buffer-to-bytes)."
+  (setf *ppc-li-const-patches* nil)
   (let* ((*ppc-64-bit* 64-bit)
          (buf (make-ppc-buffer))
          (label-map (make-hash-table :test 'eql))

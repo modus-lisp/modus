@@ -117,6 +117,12 @@
   (position 0)      ; byte position
   (word-count 0))   ; word index (position / 2)
 
+(defvar *68k-li-const-patches* nil
+  "List of (NATIVE-BYTE-OFFSET . POOL-INDEX) recorded by +OP-LI-CONST+: at that
+   offset is a MOVE.L #imm32,D0 whose 32-bit immediate (bytes +2..+5, big-endian)
+   cross.lisp's apply-li-const-patches fills with the constant-pool slot's
+   tagged address.  Reset at the start of every translation.")
+
 (defun m68k-emit-word (buf word)
   "Emit a 16-bit instruction word."
   (let ((idx (m68k-buffer-word-count buf)))
@@ -1909,10 +1915,58 @@
              ;; Unknown target: emit BSR with no fixup
              (m68k-emit-bsr buf nil))))
 
+      (#.+op-fn-addr+
+       ;; (fn-addr Vd target) -- a function's native address TAGGED with
+       ;; +tag-function+ (3), as funcall dispatch and FUNCTIONP expect.
+       ;;
+       ;; LEA (bd.l,PC),A1 -- the 68020 full-extension-word form, because
+       ;; LEA d16(PC) reaches only +-32 KB and a real image is megabytes.  The
+       ;; extension word #x0170 says: base register PC, index suppressed, 32-bit
+       ;; base displacement, no memory indirection.  The PC it adds is the
+       ;; address of the EXTENSION WORD, so the fixup's reference position is
+       ;; set to that by hand (m68k-emit-fixup would measure from the
+       ;; displacement word itself).  The translator already emits 68020
+       ;; instructions (MULS.L/DIVS.L), so this raises no CPU floor.
+       ;; Entries are 4-aligned (translate-mvm-to-68k-1), so OR 3 is exact.
+       (let* ((vd (first operands))
+              (idx (second operands))
+              (mvm-off (and function-table (gethash idx function-table)))
+              (label (and mvm-off (gethash mvm-off label-map))))
+         (unless label
+           (error "68k fn-addr: no label for function index ~D" idx))
+         (m68k-emit-word buf #x43FB)                     ; LEA (bd.l,PC),A1
+         (let ((ext-pos (m68k-buffer-position buf)))
+           (m68k-emit-word buf #x0170)                   ; full extension word
+           (m68k-emit-word buf 0)                        ; bd high (patched)
+           (push (list (1- (m68k-buffer-word-count buf)) label :disp32
+                       (+ ext-pos 2))
+                 (m68k-buffer-fixups buf))
+           (m68k-emit-word buf 0))                       ; bd low (patched)
+         (m68k-emit-move-an-dn buf +68k-a1+ +68k-d0+)
+         (m68k-emit-ori buf +68k-d0+ +tag-function+)
+         (m68k-store-vreg buf vd +68k-d0+)))
+
+      (#.+op-li-const+
+       ;; (li-const Vd idx) -- the TAGGED address of constant-pool slot IDX, not
+       ;; known until the image is laid out: MOVE.L #0,D0 recorded in
+       ;; *68k-li-const-patches* and filled in by cross.lisp.
+       (let ((vd (first operands))
+             (idx (second operands)))
+         (push (cons (m68k-buffer-position buf) idx) *68k-li-const-patches*)
+         (m68k-emit-word buf #x203C)                     ; MOVE.L #imm32,D0
+         (m68k-emit-long buf 0)
+         (m68k-store-vreg buf vd +68k-d0+)))
+
       (#.+op-call-ind+
        (let ((vs (first operands)))
-         ;; Load target address into A0, then JSR (A0)
-         (m68k-load-vreg-to-an buf +68k-a0+ vs)
+         ;; CLEAR THE FUNCTION TAG, then JSR (A0).  A function value carries tag
+         ;; 3 (+op-fn-addr+), and JSR to an odd address is an ADDRESS ERROR on
+         ;; 68k -- unlike PowerPC, whose BCCTR ignores the low two bits.  AND
+         ;; rather than SUBQ #3 so an untagged (4-aligned) target passes through
+         ;; unchanged too.
+         (m68k-load-vreg buf +68k-d0+ vs)
+         (m68k-emit-andi buf +68k-d0+ #xFFFFFFFC)
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
          (m68k-emit-jsr-an-ind buf +68k-a0+)))
 
       (#.+op-ret+
@@ -2288,12 +2342,17 @@
 ;;; ============================================================
 
 (defun translate-mvm-to-68k (bytecode function-table)
+  (setf *68k-li-const-patches* nil)
+  (translate-mvm-to-68k-1 bytecode function-table))
+
+(defun translate-mvm-to-68k-1 (bytecode function-table)
   "Translate MVM bytecode to Motorola 68000 native code.
    BYTECODE is a (vector (unsigned-byte 8)).
    FUNCTION-TABLE maps function indices to bytecode offsets.
    Returns a byte vector of 68k big-endian machine code."
   (let* ((buf (make-m68k-buffer))
          (label-map (make-hash-table :test 'eql))
+         (fn-entries nil)
          (bc bytecode)
          (len (length bc))
          (pc 0))
@@ -2335,10 +2394,26 @@
     ;; Emit prologue
     (m68k-emit-prologue buf)
 
+    ;; Function-entry MVM offsets, for the alignment below.
+    (setf fn-entries (make-hash-table :test 'eql))
+    (when function-table
+      (maphash (lambda (idx mvm-offset)
+                 (declare (ignore idx))
+                 (setf (gethash mvm-offset fn-entries) t))
+               function-table))
+
     ;; Second pass: translate
     (setf pc 0)
     (loop while (< pc len)
           do (progn
+               ;; FUNCTION ENTRIES ARE 4-ALIGNED.  +op-fn-addr+ ORs the function
+               ;; tag 3 into an entry address, which needs its low two bits free;
+               ;; 68k instructions are 2-byte multiples, so an entry can land at
+               ;; 2 mod 4.  Pad with NOP -- harmless if the previous function
+               ;; could ever fall through, and it cannot (it ends in RTS/branch).
+               (when (and function-table (gethash pc fn-entries))
+                 (loop while (/= 0 (mod (m68k-buffer-position buf) 4))
+                       do (m68k-emit-nop buf)))
                ;; Emit label at current PC before translating
                (let ((label (gethash pc label-map)))
                  (when label

@@ -58,44 +58,44 @@ the hosted `--compile`'s static-emit trio, JIT off first.
 and compares the bytes: SBCL vs modus-sh (the fixpoint) and run vs run.  The
 md5 of the modus-sh output is the DDC'd hash for `-kernel`.
 
-**Result, 2026-09-25 (end of day).**  The in-image compile now runs end to
-end, is reproducible run to run, boots to its banner, and its per-function
-bytecode matches the host's for standalone code.  It is **not yet the
-fixpoint**, and the remaining gap is now one named thing.
+**Result, 2026-09-25 (evening): THE SELF-COMPILED IMAGE BOOTS AND EVALUATES.**
+`modus-sh --compile-uefi` now produces a UEFI CL image that boots under OVMF
+with zero boot errors and answers `(+ 1 2)` → 3 and
+`(list (lisp-implementation-type) (* 6 7))` → `("Modus" 42)`, i.e. Modus
+compiled its own bare-metal image and that image runs.  It is reproducible
+run to run and, against the SBCL build of the same text in the same
+configuration, **5414 of 5437 functions are identical in MVM bytecode** and
+the images are within 16 KB of each other.  Not yet byte-identical.
 
-Fixed today, each measured (details in the commit messages):
-1. a1095b7 had written the aarch64 local-register map into modus-sh's x64
-   spill table (partial 9.95 MB image) — restored.
-2. `+FIXNUM-MAX+`-class constants reached the compiler through in-image
-   `eval`, whose word conversion overflows at 2^61 — literals are taken as is
-   (144 nondeterministic bytes gone; run 1 == run 2 ever since).
-3. `(intern name :modus.mvm)` returned NIL in-image — 936 init-thunk calls
-   were calls to NIL; the self-compiled image died in INIT-ALL-GLOBALS.
-4. modus-sh had no MODUS.MVM package, so every symbol read into CL-USER and
-   quoted symbols carried the wrong package hash — the host's build-time
-   packages are now mirrored (and un-marked as runtime-born, which otherwise
-   qualified every function key and lost the JMP to kernel-main).
-5. `*static-build-p*` registers an INIT thunk per DEFCONSTANT; the SBCL side
-   of the comparison now builds in that same configuration
-   (`MODUS_STATIC_BUILD=1`) — it boots and evaluates, 35.9 MB.
-6. Instruments: `--dump-mvm` (per-function MVM bytecode in-image),
-   `tmp/mvmdiff/*` host twins, `fncompare2.py` (normalized native diff; the
-   PE section starts at file 0x200, not 0x1000).
+Each divergence was found by the same method — dump every function's MVM
+bytecode on both sides (`modus-sh --dump-mvm`, `tmp/mvmdiff/host-dump-all.lisp`),
+mask layout-dependent operands, take the FIRST differing function in compile
+order — and each turned out to be host state the in-image compile lacked or
+in-image state the host lacked:
 
-**The one remaining cause: the in-image READ of the text drops 114 forms the
-host reads** (`SKIP read at line …` in the compile log; host: 0).  67 are
-`#.(compute-name-hash …)` read-time evaluations that fail with
-`UNDEFINED-FUNCTION MODUS.MVM::COMPUTE-NAME-HASH` — the reader's `#.` goes
-through mvm-eval, which qualifies the function key with the (mirrored,
-runtime-created) MODUS.MVM package while modus-sh's own function is keyed
-bare; the other 47 are the reader resynchronising after those failures.  The
-dropped forms are inside the compiler's own text (lines ~58600–59800), so
-last-defun-wins and the multi-shape table diverge from there, which is why an
-early function like NTH compiles identically in a 300-line prefix but
-differently in the full text.  Adding MODUS.MVM to `%fn-key-system-pkg-name-p`
-did NOT clear it and introduced new qualified keys, so it was reverted; the
-fix belongs in how `#.` evaluation resolves functions in a self-hosting image.
-Bytes then: 3031 of 4876 paired functions still differ, 38.0 vs 35.9 MB.
+| # | divergence | fix |
+|---|---|---|
+| 1 | a1095b7 wrote the aarch64 register map into the x64 spill table | restored (partial image → full image) |
+| 2 | constants via in-image EVAL (word conversion overflows at 2^61) | literal DEFCONSTANT initforms taken as is; T/NIL too |
+| 3 | `(intern x :modus.mvm)` → NIL in-image | thunk names interned with a package fallback |
+| 4 | no MODUS.MVM package in modus-sh (all symbols read into CL-USER) | host build-time packages mirrored, un-marked runtime-born |
+| 5 | `#.(compute-name-hash …)` unresolved in-image (bare-keyed baked fn) | runtime resolver falls back from PKG::NAME to NAME |
+| 6 | `#.+op-nop+` UNBOUND in MODUS.MVM → reader split MVM-INTERPRET into 144 forms | the text's integer DEFCONSTANTs pre-bound in MODUS.MVM |
+| 7 | the reader's `#.` leaked mvm-eval's mode flags into the rest of the compile | reader restores them |
+| 8 | nested mvm-eval mid-compile reset the shared compiler globals (gensym, multi-shape, macro tables) | guard: snapshot, swap fresh macro tables, restore |
+| 9 | intern reused a symbol whose package slot was stale (CL-USER) | re-homed on reuse |
+| 10 | SBCL quasiquote structs vs Modus `(backquote …)` lists — every macro body differed | one `expand-backquote` for both representations |
+| 11 | `#+sbcl` lambda in mvm-compile-all (one closure) | feature-free diagnostic |
+| 12 | Modus `find-package "CL-TEST"` → CL-USER; host NIL | reader switches package only on exact name/nickname |
+| 13 | `sb-impl::comma` / `sb-int:quasiquote` spelled as symbols in compiler.lisp | reached by name at run time |
+
+**Remaining (23 functions):** (a) 14 float-constant init thunks — the in-image
+reader builds `1.7976931348623157d308` as +infinity (`%build-float-from-parts`
+scales by 10^k in floating point; needs an exact integer-scaled conversion);
+(b) COERCE and two compiler walkers compile one quoted symbol differently
+(a `T` interned in COMMON-LISP where the host bakes the constant; `IF` where
+the host has `BLOCK`), context-dependent, not reproduced standalone; (c) one
+FN-ADDR shift downstream of those.  `test/run-uefi-ddc.sh` is the gate.
 
 ## The plan
 

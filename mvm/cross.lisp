@@ -1550,8 +1550,16 @@
                          (symbolp (car form))
                          (string= (symbol-name (car form)) "IN-PACKAGE")
                          (cdr form))
-                (let ((pkg (find-package (string (cadr form)))))
-                  (when pkg (setq *package* pkg))))
+                (let* ((pname (string (cadr form)))
+                       (pkg (find-package pname)))
+                  ;; Switch only to a package that really carries that name
+                  ;; (name or nickname).  Modus's own FIND-PACKAGE maps
+                  ;; "CL-TEST" to CL-USER when no CL-TEST exists, which moved a
+                  ;; self-hosting image's reader where the host's (NIL) did not.
+                  (when (and pkg
+                             (or (string= pname (package-name pkg))
+                                 (member pname (package-nicknames pkg) :test #'string=)))
+                    (setq *package* pkg))))
               (push form forms)
               (push line-count lines))))))
     (cons (nreverse forms) (coerce (nreverse lines) 'vector))))

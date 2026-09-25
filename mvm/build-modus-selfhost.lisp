@@ -1441,6 +1441,42 @@
   (setq *x64-jit-mode* nil)
   (setq *jit-xlate-err-info* nil))
 
+;; ---- DDC: bind the text's integer DEFCONSTANTs in MODUS.MVM before READING ----
+;; interp.lisp's CASE keys are #.+op-nop+ etc.: read-time evaluation.  The host
+;; has those constants because lib/load-mvm defined them before the compile;
+;; modus-sh (built without static init thunks) has them bound only on its own
+;; CL-USER symbols, so a MODUS.MVM +OP-NOP+ was UNBOUND, the reader failed
+;; inside (defun mvm-interpret ...) and resynchronised at the next top-level
+;; paren — 144 body fragments became top-level forms and MVM-INTERPRET was
+;; truncated.  Scan SRC textually for \"(defconstant +NAME+ <integer>)\" and SET
+;; each name in MODUS.MVM.  Values are decimal or #x hex on one line.
+(defun %selfhost-prebind-constants (src)
+  (let ((mm (find-package \"MODUS.MVM\")) (pos 0) (n 0) (len (length src)))
+    (loop
+      (let ((p (search \"(defconstant +\" src :start2 pos)))
+        (when (null p) (return))
+        (let* ((ns (+ p 13))
+               (ne (position #\\Space src :start ns))
+               (close (position #\\) src :start p))
+               (nl (position #\\Newline src :start p)))
+          (when (and ne close (< ne close) (or (null nl) (< close nl)))
+            (let* ((name (subseq src ns ne))
+                   (vs (string-trim \" \" (subseq src (+ ne 1) close)))
+                   (val (handler-case
+                            (cond ((zerop (length vs)) nil)
+                                  ((and (> (length vs) 2) (char= (char vs 0) #\\#) (char-equal (char vs 1) #\\x))
+                                   (parse-integer vs :start 2 :radix 16))
+                                  ((or (digit-char-p (char vs 0)) (char= (char vs 0) #\\-))
+                                   (parse-integer vs))
+                                  (t nil))
+                          (error (c) nil))))
+              (when (and val (plusp (length name)))
+                (set (intern name mm) val)
+                (setq n (+ n 1)))))
+          (setq pos (if close (+ close 1) (+ p 1))))))
+    (write-string-serial \"modus: prebound \") (print-dec n) (write-string-serial \" constants in MODUS.MVM\") (write-char-serial 10)
+    n))
+
 ;; ---- DDC: modus --compile-uefi <in.lisp> <out.efi> [snp-mode] ----------------
 ;; Compile the CL image's full source text (dumped by build-cl-repl-common with
 ;; MODUS_DDC_DUMP_SOURCE) to the SAME PE32+ image mvm/build-uefi-cl-repl.lisp
@@ -1457,6 +1493,7 @@
                (write-string-serial in) (write-char-serial 10) (sys-exit 1))
        (progn
         (%selfhost-mirror-host-packages)
+        (%selfhost-prebind-constants src)
         (%selfhost-reset-jit-knobs)
         (setq *compile-warn-unresolved* t)   ; log every unresolved callee with its site (DDC triage)
         (setq *ddc-trace-nil-callee* t)      ; compiler.lisp :call assembler — name each NIL-named callee site
@@ -1510,6 +1547,7 @@
         (progn (write-string-serial \"modus --dump-mvm: cannot read \") (write-string-serial in) (write-char-serial 10) (sys-exit 1))
         (progn
           (%selfhost-mirror-host-packages)
+          (%selfhost-prebind-constants src)
           (%selfhost-reset-jit-knobs)
           (setq *static-build-p* t)
           (setq *mvm-emit-halves* nil)

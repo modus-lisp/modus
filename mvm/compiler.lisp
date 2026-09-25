@@ -5680,17 +5680,63 @@
 ;;;   (SB-INT:QUASIQUOTE (a #S(COMMA :EXPR b :KIND 0) #S(COMMA :EXPR c :KIND 2)))
 ;;; We expand this to explicit list/cons/append calls before compiling.
 
+(defun %bq-list-comma-kind (x)
+  "Modus's OWN reader (cl-reader.lisp) represents backquote as
+   (BACKQUOTE form) with (COMMA x) / (COMMA-AT x) / (COMMA-DOT x) markers,
+   where SBCL's reader gives SB-INT:QUASIQUOTE + SB-IMPL::COMMA structs.  The
+   compiler must lower BOTH through the same EXPAND-BACKQUOTE, or a self-
+   hosting image compiles every backquoted macro body differently from the
+   host build (measured: the only differing probe function was the backquote
+   template).  Returns 0 (unquote), 2 (splice; ,. treated as splice) or NIL."
+  (and (consp x) (consp (cdr x)) (null (cddr x)) (symbolp (car x)) (car x)
+       (let ((n (symbol-name (car x))))
+         (cond ((string= n "COMMA") 0)
+               ((string= n "COMMA-AT") 2)
+               ((string= n "COMMA-DOT") 2)
+               (t nil)))))
+
+;;; SBCL's comma STRUCT and quasiquote SYMBOL are reached BY NAME, never
+;;; spelled as reader symbols: `sb-impl::comma' in this file would read as
+;;; one symbol under SBCL and another under Modus's reader (no SB-IMPL
+;;; package), and these four functions were the last to differ between the
+;;; host build and the self-compile for exactly that reason.  In-image the
+;;; packages do not exist and every helper answers NIL / falls through.
+(defun %sbcl-comma-type ()
+  (let ((p (find-package "SB-IMPL")))
+    (and p (find-symbol "COMMA" p))))
+(defun %sbcl-comma-p (x)
+  (let ((ty (%sbcl-comma-type)))
+    (and ty (not (symbolp x)) (not (consp x)) (typep x ty))))
+(defun %sbcl-comma-slot (x accessor-name)
+  (let* ((p (find-package "SB-IMPL"))
+         (f (and p (find-symbol accessor-name p))))
+    (and f (fboundp f) (funcall (symbol-function f) x))))
+
 (defun bq-comma-p (x)
-  "Check if X is an SBCL comma struct"
-  (typep x 'sb-impl::comma))
+  "Check if X is a comma: an SBCL comma struct or Modus's (COMMA…) marker"
+  (or (%sbcl-comma-p x)
+      (not (null (%bq-list-comma-kind x)))))
 
 (defun bq-comma-expr (x)
-  "Get the expression from an SBCL comma struct"
-  (sb-impl::comma-expr x))
+  "Get the expression from a comma (either representation)"
+  (if (%sbcl-comma-p x)
+      (%sbcl-comma-slot x "COMMA-EXPR")
+      (cadr x)))
 
 (defun bq-comma-kind (x)
-  "Get the kind from an SBCL comma struct (0=unquote, 2=splice)"
-  (sb-impl::comma-kind x))
+  "Get the kind from a comma (0=unquote, 2=splice), either representation"
+  (if (%sbcl-comma-p x)
+      (%sbcl-comma-slot x "COMMA-KIND")
+      (%bq-list-comma-kind x)))
+
+(defun %bq-form-p (form)
+  "A backquote template form in either reader's representation."
+  (and (consp form) (symbolp (car form)) (car form)
+       (let ((n (symbol-name (car form))))
+         (or (string= n "BACKQUOTE")
+             (and (string= n "QUASIQUOTE")
+                  (let ((pk (symbol-package (car form))))
+                    (and pk (string= (package-name pk) "SB-INT"))))))))
 
 (defun expand-backquote (template)
   "Expand a backquote template into explicit list-building code.
@@ -5726,7 +5772,7 @@
                    ((bq-comma-p elt)
                     (push (bq-comma-expr elt) current))
                    ;; Nested backquote
-                   ((and (consp elt) (eq (car elt) 'sb-int:quasiquote))
+                   ((%bq-form-p elt)
                     (push (expand-backquote (cadr elt)) current))
                    ;; Nested list
                    ((consp elt)
@@ -5773,7 +5819,7 @@
   "Compile FORM in environment ENV, placing result in register DEST.
    DEST is a virtual register number."
   ;; Expand backquote before macro expansion
-  (let ((form (if (and (consp form) (eq (car form) 'sb-int:quasiquote))
+  (let ((form (if (%bq-form-p form)
                   (expand-backquote (cadr form))
                   form)))
   ;; Macro expand.  If the INCOMING form is the discarded statement marked
@@ -8865,7 +8911,7 @@
                ;; is a real expression and `(foo ,(setq x 1))' really does mutate x,
                ;; so the boxing decision still needs to see it.  EXPAND-BACKQUOTE is
                ;; what COMPILE-FORM lowers anyway, so this scans what actually runs.
-               (when (and (consp form) (eq (car form) 'sb-int:quasiquote))
+               (when (%bq-form-p form)
                  (scan (expand-backquote (cadr form)) in-lambda)
                  (return-from scan))
                (let ((mx (%cfv-macroexpand form)))
@@ -11074,7 +11120,7 @@
          ;; before lowering anyway, so free-var collection over the
          ;; raw template is the wrong thing.  Reach into the expansion
          ;; via expand-backquote and collect from THAT.
-         ((eq head 'sb-int:quasiquote)
+         ((%bq-form-p form)
           (%collect-free-vars (expand-backquote (cadr form)) bound env acc))
          ;; IN-IMAGE reader backquote: `(setq ,v t) reads as
          ;; (BACKQUOTE (SETQ (COMMA V) T)).  The default element walk would
@@ -17840,6 +17886,8 @@
 ;;; PROGRAM-ERROR from AOT code while the identical runtime-compiled code
 ;;; worked.  The pre-pass records every name DEFUNed at top level with more
 ;;; than one lambda-list SHAPE; calls to those take the forward-reference path.
+(defvar *multi-shape-dump* nil "When T, mvm-compile-all prints the multi-shape defun table.")
+(defun %multi-shape-dump-entry (k v) (format t "~&;; MULTI-SHAPE ~A final=~S~%" k v))
 (defvar *multi-shape-defuns* nil
   "NIL or an EQUAL hash of symbol-name -> the FINAL definition's shape
    (REQUIRED OPTIONAL REST-P KEY-P), set per MVM-COMPILE-ALL.")
@@ -23487,7 +23535,12 @@
          ;; object whose heap word was then baked as an immediate, differently
          ;; in every run (the 144-byte nondeterminism test/run-uefi-ddc.sh saw).
          (let ((value (if (or (numberp value-form) (stringp value-form)
-                              (characterp value-form) (keywordp value-form))
+                              (characterp value-form) (keywordp value-form)
+                              ;; T and NIL are constants too: in-image (eval 't)
+                              ;; answers the CL package's symbol object named T,
+                              ;; not the T constant, and the init thunk then
+                              ;; interned a symbol where the host baked T.
+                              (eq value-form t) (null value-form))
                           value-form
                           (eval value-form))))
            (setf (gethash (normalize-name name) *constants*) value)
@@ -24258,10 +24311,12 @@
     ;; *MULTI-SHAPE-DEFUNS*).  SETQ, not LET, for the same in-image reason as
     ;; *MVM-GENSYM-COUNTER* above.
     (setq *multi-shape-defuns* (%collect-multi-shape-defuns forms))
-    #+sbcl
-    (when (sb-ext:posix-getenv "MODUS_MULTI_SHAPE_DUMP")
-      (maphash (lambda (k v) (format t "~&;; MULTI-SHAPE ~A final=~S~%" k v))
-               *multi-shape-defuns*))
+    ;; Diagnostic dump behind a plain special (set it by hand), not #+sbcl +
+    ;; posix-getenv + a LAMBDA: a feature conditional reads differently under
+    ;; SBCL's reader and Modus's own, and the closure it hid was the one
+    ;; function-count difference between the host build and the self-compile.
+    (when *multi-shape-dump*
+      (maphash #'%multi-shape-dump-entry *multi-shape-defuns*))
 
     ;; Phase 1 & 2: Compile all forms to IR
     (let ((form-index 0))

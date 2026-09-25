@@ -2884,7 +2884,63 @@
                 (puthash off lam-offsets (quote :defun)))))
         (list bc entry (reverse ft-list) fn-table rt-table lam-offsets)))))
 
+(defvar *mvm-eval-nesting-saved* nil)
+
+(defun %mvm-eval-forms-nested-in-static-build (forms)
+  "MVM-EVAL-FORMS entered while a STATIC build is compiling (modus-sh
+   --compile-uefi: a DEFCONSTANT initform, an EVAL-WHEN, anything that reaches
+   EVAL mid-compile).  The nested compile goes through MVM-COMPILE-ALL, which
+   SETQ-resets the compiler's SHARED globals — *mvm-gensym-counter* (every
+   later gensym name, hence every baked name hash), *multi-shape-defuns*
+   (replaced by the nested forms' empty table), *init-thunk-names*, the label
+   counter (closure numbering) — and leaves *mvm-eval-runtime-p* /
+   *mvm-emit-halves* T.  SBCL's EVAL does none of that on the host, so the
+   host and in-image compiles of the same text diverged from the first such
+   form (measured: 578 SET-NARGS-before-CALL and 453 LI-operand differences).
+   Snapshot the lot, run, restore.  Lexical save + SETQ restore, not a special
+   LET (unreliable in-image).  The ordinary runtime REPL path is untouched: it
+   is only taken when *static-build-p* is T on entry."
+  (let ((s-halves *mvm-emit-halves*) (s-rt *mvm-eval-runtime-p*) (s-static *static-build-p*)
+        (s-gensym *mvm-gensym-counter*) (s-label *label-counter*) (s-mlabel *mvm-label-counter*)
+        (s-thunks *init-thunk-names*) (s-multi *multi-shape-defuns*)
+        (s-functions *functions*) (s-fntable *function-table*) (s-consttable *constant-table*)
+        (s-unres *unresolved-calls*) (s-globals *globals*) (s-consts *constants*)
+        (s-persist *e2-persist-defuns*) (s-pending *pending-flet-ir*)
+        (s-ir *ir-buffer*) (s-tails *deferred-tails*) (s-cfn *current-function-name*)
+        (s-temps *temp-reg-counter*) (s-fps *fp-reg-counter*)
+        ;; The MACRO tables too — and SWAPPED for fresh ones, not just saved:
+        ;; the nested compile's register-mvm-bootstrap-macros (runtime-eval
+        ;; mode) registers IN-PACKAGE / DEFPACKAGE / DEFTYPE ... and in-image
+        ;; those writes land in whatever table the global names, so a saved
+        ;; reference alone would come back mutated (measured: 59 in-package
+        ;; thunks the host never compiles).
+        (s-mt *macro-table*) (s-mnt *macro-name-table*) (s-bmt *bootstrap-macro-template*)
+        (s-hdt *hash-dispatch-table*) (s-clhs *clhs-standard-specials-hashes*)
+        (s-memo *mexp-memo*) (s-memogc *mexp-memo-gc*))
+    (setq *macro-table* (make-hash-table :test 'eql))
+    (setq *macro-name-table* nil) (setq *bootstrap-macro-template* nil)
+    (setq *hash-dispatch-table* nil) (setq *clhs-standard-specials-hashes* nil)
+    (setq *mexp-memo* nil) (setq *mexp-memo-gc* -1)
+    (unwind-protect
+        (%mvm-eval-forms-1 forms)
+      (setq *mvm-emit-halves* s-halves) (setq *mvm-eval-runtime-p* s-rt) (setq *static-build-p* s-static)
+      (setq *mvm-gensym-counter* s-gensym) (setq *label-counter* s-label) (setq *mvm-label-counter* s-mlabel)
+      (setq *init-thunk-names* s-thunks) (setq *multi-shape-defuns* s-multi)
+      (setq *functions* s-functions) (setq *function-table* s-fntable) (setq *constant-table* s-consttable)
+      (setq *unresolved-calls* s-unres) (setq *globals* s-globals) (setq *constants* s-consts)
+      (setq *e2-persist-defuns* s-persist) (setq *pending-flet-ir* s-pending)
+      (setq *ir-buffer* s-ir) (setq *deferred-tails* s-tails) (setq *current-function-name* s-cfn)
+      (setq *temp-reg-counter* s-temps) (setq *fp-reg-counter* s-fps)
+      (setq *macro-table* s-mt) (setq *macro-name-table* s-mnt) (setq *bootstrap-macro-template* s-bmt)
+      (setq *hash-dispatch-table* s-hdt) (setq *clhs-standard-specials-hashes* s-clhs)
+      (setq *mexp-memo* s-memo) (setq *mexp-memo-gc* s-memogc))))
+
 (defun mvm-eval-forms (forms)
+  (if *static-build-p*
+      (%mvm-eval-forms-nested-in-static-build forms)
+      (%mvm-eval-forms-1 forms)))
+
+(defun %mvm-eval-forms-1 (forms)
   ;; In-image: emit integer literals as fixnum-safe :li-halves (set the GLOBAL,
   ;; not a let-binding — compiled LET of a special may not establish a dynamic
   ;; binding the compiler's compile-integer reads).  Native builds never call

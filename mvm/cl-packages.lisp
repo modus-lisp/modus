@@ -1031,7 +1031,23 @@
                                        (let ((g (mem-ref #x10000088 :u64)))
                                          (let ((e (and g (gethash key g))))
                                            (and e (string= (symbol-name e) name-str) e))))
-                                     (sym (or existing
+                                     ;; A symbol found under THIS (name, pkg)
+                                     ;; key belongs to PKG by construction.  Its
+                                     ;; package slot can still be stale: a
+                                     ;; compile-time literal ('a in code compiled
+                                     ;; in MODUS.MVM) was interned at boot under
+                                     ;; (A . MODUS.MVM-hash) while no package of
+                                     ;; that name existed yet, so the slot fell
+                                     ;; back to CL-USER.  Re-home it to PKG so
+                                     ;; SYMBOL-PACKAGE and the package hash a
+                                     ;; later compile bakes agree (a self-hosting
+                                     ;; image creating MODUS.MVM at runtime read
+                                     ;; 475 quoted symbols as CL-USER's).
+                                     (sym (or (and existing
+                                                   (progn
+                                                     (unless (eq (%cl-sym-package existing) pkg)
+                                                       (%cl-sym-set-package existing pkg))
+                                                     existing))
                                               (let ((s (%make-cl-symbol name-str)))
                                                 (%cl-sym-set-package s pkg)
                                                 ;; Re-read after alloc — GC may

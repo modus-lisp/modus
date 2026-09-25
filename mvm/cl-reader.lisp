@@ -1620,7 +1620,16 @@
              (*read-suppress* nil)
              ((not *read-eval*)
               (%reader-error "#. read-time eval disabled by *read-eval*"))
-             (t (eval obj)))))
+             ;; EVAL here is mvm-eval, which SETQs *mvm-eval-runtime-p* and
+             ;; *mvm-emit-halves* to T for its own compile and leaves them so
+             ;; ("mvm-eval-leaked", WS5).  A #. met while READING a source text
+             ;; for a static build (modus-sh --compile-uefi: interp.lisp's
+             ;; #.+op-nop+ CASE keys) must not flip the enclosing compile into
+             ;; runtime-eval codegen for every form after it.  Restore both.
+             (t (let ((%rt *mvm-eval-runtime-p*) (%hv *mvm-emit-halves*))
+                  (unwind-protect (eval obj)
+                    (setq *mvm-eval-runtime-p* %rt)
+                    (setq *mvm-emit-halves* %hv)))))))
         ;; #S(struct-type slot1 val1 slot2 val2 ...) — structure literal.
         ;; CLHS 2.4.8.13.  Read the inner list, then call the structure's
         ;; constructor with keyword args.  If a slot symbol is unkeyworded

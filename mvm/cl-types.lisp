@@ -2758,8 +2758,12 @@
          (na (if a-neg (bignum-negate a) a)))
     (let ((mag
             (cond
-              ;; Fast path: divisor magnitude fits in (2^31 - 1).
-              ((and (not (bignump b-mag)) (< b-mag 2147483648))
+              ;; Fast path: %bignum-divmod-fixnum's digit recurrence stays in
+              ;; fixnums for a divisor up to 2^(bits - half): 2^31 on the
+              ;; 62-bit tower (the old literal), 2^15 on the 30-bit one, where
+              ;; the literal 2147483648 is not even a fixnum.
+              ((and (not (bignump b-mag))
+                    (<= b-mag (ash 1 (- +fixnum-bits+ +half-limb-bits+))))
                (car (%bignum-divmod-fixnum na b-mag)))
               ;; General path: doubling-subtract.
               (t (%bignum-trunc-doubling na b-mag)))))

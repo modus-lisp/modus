@@ -49,8 +49,15 @@
 
 ;;; Divide bignum or fixnum N by a small fixnum divisor D (positive).
 ;;; Returns (cons quotient remainder) where remainder is 0..D-1.
-;;; Quotient may collapse to a fixnum.  D ≤ 36 so r-hi*2^31 stays well
-;;; below 2^62 (no internal overflow).
+;;; Quotient may collapse to a fixnum.
+;;;
+;;; WIDTH: every limb is split into two +HALF-LIMB-BITS+ halves (31 on the
+;;; 62-bit tower, 15 on the 30-bit one), so each digit-recurrence step
+;;; r*2^half + half < D*2^half stays a fixnum for any D <= 2^(bits - half).
+;;; This used to spell the split as the literals 31 / 2^31 / 2^31-1 / 2^62-1:
+;;; exactly right at 62 bits and at 30 bits a product of bignums per digit --
+;;; the recursion through TRUNCATE on those bignums is what SEGFAULTED on
+;;; i386 and RV32 for any (print <bignum>), (mod <bignum> 10), (floor ...).
 (defun %bignum-divmod-fixnum (n d)
   "Divide bignum or fixnum N by positive fixnum D ≤ 36.
    Returns (cons quotient remainder).  Handles big-bignum N via
@@ -74,14 +81,14 @@
              (i (- nlimbs 1)))
          (loop (when (< i 0) (return nil))
            (let* ((limb (%bb-limb n i))
-                  (hi (ash limb -31))
-                  (lo (logand limb 2147483647))
+                  (hi (ash limb +neg-half-limb-bits+))
+                  (lo (logand limb +half-limb-mask+))
                   ;; Process high half.
-                  (p1 (+ (* r 2147483648) hi))
+                  (p1 (+ (* r (+ +half-limb-mask+ 1)) hi))
                   (q1 (truncate p1 d))
                   (r1 (mod p1 d))
                   ;; Process low half.
-                  (p2 (+ (* r1 2147483648) lo))
+                  (p2 (+ (* r1 (+ +half-limb-mask+ 1)) lo))
                   (q2 (truncate p2 d))
                   (r2 (mod p2 d)))
              (setq quot-halves (cons q1 quot-halves))
@@ -118,19 +125,19 @@
            (let* ((lo (bignum-lo n))
                   (q-hi (truncate hi d))
                   (r-hi (mod hi d))
-                  (lo-hi31 (ash lo -31))
-                  (lo-lo31 (logand lo 2147483647))
-                  (partial1 (+ (* r-hi 2147483648) lo-hi31))
+                  (lo-hi31 (ash lo +neg-half-limb-bits+))
+                  (lo-lo31 (logand lo +half-limb-mask+))
+                  (partial1 (+ (* r-hi (+ +half-limb-mask+ 1)) lo-hi31))
                   (q1 (truncate partial1 d))
                   (r1 (mod partial1 d))
-                  (partial2 (+ (* r1 2147483648) lo-lo31))
+                  (partial2 (+ (* r1 (+ +half-limb-mask+ 1)) lo-lo31))
                   (q2 (truncate partial2 d))
                   (r2 (mod partial2 d))
-                  (q-lo (+ (ash q1 31) q2))
+                  (q-lo (+ (ash q1 +half-limb-bits+) q2))
                   (q (if (= q-hi 0)
                          q-lo
                          (bignum-to-fixnum-if-possible
-                           (make-bignum (logand q-lo 4611686018427387903) q-hi)))))
+                           (make-bignum (logand q-lo +fixnum-max+) q-hi)))))
              (cons q r2)))))))
 
 ;;; Print bignum or fixnum in given base.  Bignums route through

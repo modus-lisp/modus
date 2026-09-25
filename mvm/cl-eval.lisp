@@ -3447,7 +3447,7 @@
        (+ (* (- nl 1) +limb-bits+) (%fixnum-integer-length top))))
     (t
      (let ((hi (bignum-hi n)))
-       (if (> hi 0) (+ 62 (%fixnum-integer-length hi))
+       (if (> hi 0) (+ +limb-bits+ (%fixnum-integer-length hi))
            (%fixnum-integer-length (bignum-lo n)))))))
 
 (defun integer-length (n)

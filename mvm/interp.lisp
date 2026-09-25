@@ -489,28 +489,34 @@
 
 (defun fetch-li-value (bc pc)
   "Read an 8-byte little-endian LI immediate (a tagged WORD W = value<<1) and
-   return %word->val(W) = floor(W/2) DIRECTLY — without ever forming W itself.
-   W can reach +/-2^63 for a boundary fixnum (|value| >= 2^61); forming it would
-   overflow the in-image 62-bit fixnum range, and fetch-u64's `(* hi-signed
-   2^32)` would then hit the broken in-image bignum MULTIPLY.  Computing the
-   value as `(ash lo -1) + hi_signed*2^31` keeps every term in fixnum range:
-   hi_signed in [-2^31, 2^31-1] so hi_signed*2^31 in [-2^62, 2^62-2^31], and
-   floor(W/2) = floor(lo/2) + hi_signed*2^31.  Matches %word->val(W) (arith SHR)
-   exactly for the full fixnum-value range; for small words (chars, pointers,
-   normal fixnums) it is identical to the old fetch-u64 + %word->val path."
-  (let* ((lo (logior (aref bc pc) (ash (aref bc (+ pc 1)) 8)
-                     (ash (aref bc (+ pc 2)) 16) (ash (aref bc (+ pc 3)) 24)))
-         (hi (logior (aref bc (+ pc 4)) (ash (aref bc (+ pc 5)) 8)
-                     (ash (aref bc (+ pc 6)) 16) (ash (aref bc (+ pc 7)) 24)))
-         (hi-signed (if (>= hi #x80000000) (- hi #x100000000) hi)))
-    ;; hi-signed*2^31 stays in fixnum range EXCEPT when hi-signed = -2^31
-    ;; (the only 32-bit value of magnitude 2^31): then the product is -2^62 and
-    ;; computing it in-image overflows/SEGVs (2^62 isn't a fixnum).  That case is
-    ;; exactly most-negative-fixnum territory; use the baked min-fixnum literal
-    ;; (compiled correctly at host build time) plus the low half instead.
-    (values (if (= hi-signed -2147483648)
-                (+ (ash lo -1) +fixnum-neg-limit+)
-                (+ (ash lo -1) (* hi-signed 2147483648)))
+   return %word->val(W) = floor(W/2) DIRECTLY -- without ever forming W itself,
+   which does not fit a fixnum VALUE for a boundary literal on ANY width: |W|
+   reaches 2^63 on the 62-bit tower, and 2^31 on the 30-bit one, where every
+   literal with |value| >= 2^29 has a word past 2^30.
+
+   Horner's rule over the bytes, MOST significant first:
+     floor(W/2) = ((((hi*256 + b3)*256 + b2)*256 + b1)*128 + floor(b0/2))
+   where hi is bytes 4..7 as a SIGNED 32-bit number.  Each partial result is a
+   floor of the final value by a power of two, so no intermediate is ever
+   larger in magnitude than the answer: nothing overflows unless the answer
+   itself is not a fixnum, and then the checked * and + promote it correctly.
+
+   The old form assembled the low 32 bits with inline shifts, (ash b3 24), and
+   computed hi_signed*2^31 -- both past the fixnum range on a 30-bit tower, so
+   (print 536870912) printed a heap address on i386 and RV32."
+  (let* ((b7 (aref bc (+ pc 7)))
+         (hi (+ (* (+ (* (+ (* (if (>= b7 128) (- b7 256) b7) 256)
+                               (aref bc (+ pc 6)))
+                            256)
+                         (aref bc (+ pc 5)))
+                      256)
+                (aref bc (+ pc 4)))))
+    (values (+ (* (+ (* (+ (* (+ (* hi 256) (aref bc (+ pc 3))) 256)
+                           (aref bc (+ pc 2)))
+                        256)
+                     (aref bc (+ pc 1)))
+                  128)
+               (ash (aref bc pc) -1))
             (+ pc 8))))
 
 ;;; Conditions
@@ -1226,7 +1232,19 @@
                   (reg-set-nil regs vd) (setf pc (+ npc 8)))
                  ((and deadp (= (aref bc (+ npc 1)) #x10) (= (aref bc npc) #x09))
                   (reg-set-t regs vd) (setf pc (+ npc 8)))
-                 ((or (>= hi-signed #x40000000) (< hi-signed #x-40000000))
+                 ;; |W| >= 2^+fixnum-bits+: the word is not a fixnum VALUE, so
+                 ;; reg-set's %word->val would wrap it.  TOP is W>>24 (hi and
+                 ;; byte 3 only), so the test stays in fixnums at every width.
+                 ;; On the 62-bit tower this is exactly the old
+                 ;; `hi-signed outside [-2^30, 2^30)' test; on the 30-bit one
+                 ;; it catches every literal with |value| >= 2^29, which the
+                 ;; old test sent down the wrapping path.
+                 ((let ((top (+ (* hi-signed 256) (aref bc (+ npc 3))))
+                        (lim (ash 1 (- +fixnum-bits+ 24))))
+                    ;; INCLUSIVE below: W = -2^+fixnum-bits+ (value -2^29 at
+                    ;; 30 bits) is a machine word but not a fixnum VALUE here
+                    ;; (+fixnum-min+ is -(2^bits - 1)), so it wraps too.
+                    (or (>= top lim) (<= top (- lim))))
                   (multiple-value-bind (val npc2) (fetch-li-value bc npc)
                     (setf (svref regs vd) val) (setf pc npc2)))
                  (t

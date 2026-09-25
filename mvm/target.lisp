@@ -755,18 +755,18 @@
    these values are transcribed from it and a translator that changes its tag
    must change this too.  Measured from each file:
 
-     9  x64, aarch64, i386, ppc32/64, 68k, riscv32/64 (+TAG-OBJECT+, the shared value)
-     2  arm32/armv7
+     9  every port (+TAG-OBJECT+, the shared value)
 
    RISC-V AND ARM32 ARE NOT BEING SLOPPY.  Tag 9 needs the low FOUR bits free,
    i.e. 16-byte object alignment; RV32's allocation granule is a word PAIR, which
    is EIGHT bytes, so 9 does not fit and 2 does.  The divergence is a
    consequence of 32-bit word sizes, not a preference."
   (case (target-name target)
-    ;; RISC-V MOVED TO 9 at both widths: see rv-object-tag / rv-granule in
-    ;; translate-riscv.lisp -- the shared compiler needs every pointer tag odd,
-    ;; and a 16-byte granule fits 9 on 32-bit as well.  arm32 still uses 2.
-    ((:arm32 :armv7 :armv7-rpi) 2)
+    ;; EVERY PORT IS 9 NOW.  RISC-V (both widths) and arm32 used 2 because
+    ;; 9 needs 16-byte objects; the shared compiler needs every pointer tag
+    ;; odd, so both moved to 9 with a 16-byte granule (rv-object-tag,
+    ;; +arm32-object-tag+).  Kept as a function so a port can diverge again
+    ;; only by saying so here.
     (t 9)))
 
 (defun target-object-data-offset (target)

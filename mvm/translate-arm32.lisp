@@ -884,6 +884,32 @@
 ;;; Prologue / Epilogue
 ;;; ============================================================
 
+;;; ============================================================
+;;; Object tag
+;;; ============================================================
+
+(defconstant +arm32-object-tag+ 9
+  "Low-nibble tag on an object pointer: 9, +TAG-OBJECT+, as on every other port.
+
+   arm32 used 2.  The shared compiler needs every pointer tag ODD: it tests for
+   a fixnum with the low bit alone (compile-integerp is `test x, 1') and for an
+   array or string by comparing OBJ-TAG with a baked +TAG-OBJECT+ of 9.  With
+   tag 2, (integerp <string>) was T and (stringp <string>) NIL for every object
+   -- r28-object-predicates answered 12 here, exactly as it did on RISC-V before
+   that port moved to 9.  Tag 9 needs 16-byte objects; arm32 already rounds
+   objects to 16 and advances conses by 16, so nothing else had to change.")
+
+(defun arm32-slot-base (vobj)
+  "Byte offset from a TAGGED pointer to its slot 0.  Header word at raw+0,
+   slots from raw+4, so slot 0 is at tagged + 4 - tag = tagged - 5.
+
+   VFP IS NOT AN OBJECT.  The prologue sets VFP = SP - 2 so that the old
+   tag-2 slot arithmetic (+2 + idx*4) lands on SP + idx*4, and the spill
+   offsets (arm32-spill-offset, VFP+482 = SP+480) are built on that.  Frame
+   slot access therefore keeps +2, exactly as translate-riscv special-cases
+   VFP in its slot arms, and the frame layout is untouched."
+  (if (= vobj +vreg-vfp+) 2 (- 4 +arm32-object-tag+)))
+
 (defun arm32-emit-prologue (buf)
   "Emit function prologue: save callee-saved regs, set up frame.
    After this, r11 (VFP) = SP - 2 (tagged with object tag 2),
@@ -1501,7 +1527,7 @@
            (arm32-str buf +arm-r12+ +arm-r9+ 0)
            ;; Object tag = 2; pointer = alloc | tag (like i386 uses alloc | 0x09)
            ;; Header at alloc, slots at alloc+4+. OBJ-REF offset = 2 + idx*4.
-           (arm32-orr-imm buf +arm-r12+ +arm-r9+ 0 2)
+           (arm32-orr-imm buf +arm-r12+ +arm-r9+ 0 +arm32-object-tag+)
            (arm32-store-vreg buf +arm-r12+ vd)
            ;; Bump alloc: total = (1 + size) * 4 bytes (header + slots)
            ;; Align to 16 bytes to keep cons alloc pointer aligned
@@ -1533,7 +1559,7 @@
            ;; Store header at [R9] (alloc pointer)
            (arm32-str buf +arm-r12+ +arm-r9+ 0)
            ;; Result: R12 = R9 | 2 (object tag)
-           (arm32-orr-imm buf +arm-r12+ +arm-r9+ 0 2)
+           (arm32-orr-imm buf +arm-r12+ +arm-r9+ 0 +arm32-object-tag+)
            (arm32-store-vreg buf +arm-r12+ vd)
            ;; Compute alloc size from saved count in LR
            ;; total = (count + 1) * 4, aligned to 16
@@ -1551,7 +1577,7 @@
          (let ((vd (vreg 0))
                (idx (vreg 2)))
            (with-src (ps (vreg 1))
-             (let ((off (+ 2 (* idx 4))))
+             (let ((off (+ (arm32-slot-base (vreg 1)) (* idx 4))))
                (arm32-ldr buf +arm-r12+ ps off)
                (arm32-store-vreg buf +arm-r12+ vd)))))
 
@@ -1559,7 +1585,7 @@
          ;; (obj-set Vobj idx Vs)
          (let ((idx (vreg 1)))
            (with-src2 (pobj (vreg 0) +arm-r12+) (ps (vreg 2) +arm-lr+)
-             (let ((off (+ 2 (* idx 4))))
+             (let ((off (+ (arm32-slot-base (vreg 0)) (* idx 4))))
                (arm32-str buf ps pobj off)))))
 
         (#.+op-aref+
@@ -1571,8 +1597,8 @@
              (arm32-lsl-imm buf +arm-r12+ pidx 1)
              ;; R12 = R12 + Vobj
              (arm32-add buf +arm-r12+ +arm-r12+ pobj)
-             ;; LDR R12, [R12, #2]
-             (arm32-ldr buf +arm-r12+ +arm-r12+ 2)
+             ;; LDR R12, [R12, #slot-base]
+             (arm32-ldr buf +arm-r12+ +arm-r12+ (arm32-slot-base (vreg 1)))
              (arm32-store-vreg buf +arm-r12+ vd))))
 
         (#.+op-aset+
@@ -1591,8 +1617,8 @@
            (arm32-add buf +arm-r12+ +arm-r12+ +arm-lr+)
            ;; Restore value from stack
            (arm32-ldr-post buf +arm-lr+ +arm-sp+ 4)
-           ;; STR value, [R12, #2]
-           (arm32-str buf +arm-lr+ +arm-r12+ 2)))
+           ;; STR value, [R12, #slot-base]
+           (arm32-str buf +arm-lr+ +arm-r12+ (arm32-slot-base (vreg 0)))))
 
         (#.+op-array-len+
          ;; (array-len Vd Vobj) — extract element count from header
@@ -1600,8 +1626,8 @@
          ;; Header format: [subtag_half:8][count:24] — count = header >> 8
          (let ((vd (vreg 0)))
            (with-src (ps (vreg 1))
-             ;; SUB R12, Vobj, #2 (strip object tag)
-             (arm32-sub-imm buf +arm-r12+ ps 0 2)
+             ;; SUB R12, Vobj, #tag (strip object tag)
+             (arm32-sub-imm buf +arm-r12+ ps 0 +arm32-object-tag+)
              ;; LDR R12, [R12] (load header word)
              (arm32-ldr buf +arm-r12+ +arm-r12+ 0)
              ;; LSR R12, R12, #8 (count = header >> 8)
@@ -1613,23 +1639,40 @@
              (arm32-store-vreg buf +arm-r12+ vd))))
 
         (#.+op-obj-tag+
-         ;; Extract low 4 bits
+         ;; Low 4 bits, returned as a TAGGED fixnum -- translate-x64 and i386 both
+         ;; AND #x0F then SHL 1, and the compiler compares the result against
+         ;; (ash +tag-object+ +fixnum-shift+).  A raw nibble never matched it.
          (let ((vd (vreg 0)))
            (with-src (ps (vreg 1))
              (arm32-and-imm buf +arm-r12+ ps 0 #xF)
+             (arm32-lsl-imm buf +arm-r12+ +arm-r12+ 1)
              (arm32-store-vreg buf +arm-r12+ vd))))
 
         (#.+op-obj-subtag+
-         ;; Load header word, extract low byte
-         (let ((vd (vreg 0)))
-           (with-src (ps (vreg 1))
-             ;; Untag: SUB r12, ps, #2  (object tag = 2)
-             (arm32-sub-imm buf +arm-r12+ ps 0 2)
-             ;; LDR r12, [r12]  (load header)
-             (arm32-ldr buf +arm-r12+ +arm-r12+ 0)
-             ;; AND r12, r12, #0xFF
-             (arm32-and-imm buf +arm-r12+ +arm-r12+ 0 #xFF)
-             (arm32-store-vreg buf +arm-r12+ vd))))
+         ;; translate-x64's contract, which the compiler is written against: the
+         ;; header's low byte as a TAGGED fixnum for a real heap object, and 0 for
+         ;; anything else.  It used to return the RAW byte and dereference
+         ;; whatever it was given -- a raw subtag never matches the compiler's
+         ;; tagged constants, and an odd one looks like a pointer (on RISC-V,
+         ;; keyword subtag #x53 read as a function and %IEEE-FLOAT-P faulted on
+         ;; it).  T is excluded explicitly: +T-VALUE+ #xDEAD1009 carries the
+         ;; object nibble but is an immediate, and T-9 is unmapped.
+         (let ((vd (vreg 0))
+               (done (mvm-make-label)))
+           (arm32-load-vreg buf +arm-lr+ (vreg 1))            ; LR = value
+           (arm32-load-imm32 buf +arm-r12+ +t-value+)
+           (arm32-cmp buf +arm-lr+ +arm-r12+)                  ; T?
+           (arm32-mov-imm-cond buf +arm-cc-al+ +arm-r12+ 0 0)  ; answer 0 (MOV keeps flags)
+           (arm32-b-cond buf +arm-cc-eq+ done)
+           (arm32-and-imm buf +arm-r12+ +arm-lr+ 0 #xF)
+           (arm32-cmp-imm buf +arm-r12+ 0 +arm32-object-tag+)  ; an object?
+           (arm32-mov-imm-cond buf +arm-cc-al+ +arm-r12+ 0 0)
+           (arm32-b-cond buf +arm-cc-ne+ done)
+           (arm32-ldr buf +arm-r12+ +arm-lr+ (- +arm32-object-tag+)) ; header
+           (arm32-and-imm buf +arm-r12+ +arm-r12+ 0 #xFF)
+           (arm32-lsl-imm buf +arm-r12+ +arm-r12+ 1)           ; TAGGED
+           (arm32-emit-label buf done)
+           (arm32-store-vreg buf +arm-r12+ vd)))
 
         ;;; --- Memory (raw) ---
 
@@ -1899,7 +1942,7 @@
            (arm32-lsl-imm buf +arm-r12+ +arm-r12+ 8)
            (arm32-orr-imm buf +arm-r12+ +arm-r12+ 0 #x11)  ; u8-vector subtag
            (arm32-str buf +arm-r12+ +arm-r9+ 0)
-           (arm32-orr-imm buf +arm-r12+ +arm-r9+ 0 2)    ; result = VA | 2
+           (arm32-orr-imm buf +arm-r12+ +arm-r9+ 0 +arm32-object-tag+)    ; result = VA | 2
            (arm32-store-vreg buf +arm-r12+ vd)
            ;; bytes = align16(N + 4)
            (arm32-add-imm buf +arm-lr+ +arm-lr+ 0 19)    ; N + 4 + 15
@@ -1915,7 +1958,7 @@
            (arm32-lsl-imm buf +arm-r12+ +arm-r12+ 8)
            (arm32-orr-imm buf +arm-r12+ +arm-r12+ 0 #x31)  ; string subtag
            (arm32-str buf +arm-r12+ +arm-r9+ 0)
-           (arm32-orr-imm buf +arm-r12+ +arm-r9+ 0 2)
+           (arm32-orr-imm buf +arm-r12+ +arm-r9+ 0 +arm32-object-tag+)
            (arm32-store-vreg buf +arm-r12+ vd)
            ;; bytes = align16((count + 1) * 4)
            (arm32-add-imm buf +arm-lr+ +arm-lr+ 0 1)
@@ -1930,7 +1973,7 @@
            (arm32-asr-imm buf +arm-r12+ +arm-r12+ 1)
            (arm32-load-vreg buf +arm-lr+ (vreg 1))       ; arr
            (arm32-add buf +arm-r12+ +arm-r12+ +arm-lr+)
-           (arm32-ldrb buf +arm-r12+ +arm-r12+ 2)
+           (arm32-ldrb buf +arm-r12+ +arm-r12+ (- 4 +arm32-object-tag+))
            (arm32-lsl-imm buf +arm-r12+ +arm-r12+ 1)     ; tag as fixnum
            (arm32-store-vreg buf +arm-r12+ vd)))
 
@@ -1947,7 +1990,7 @@
            (arm32-load-vreg buf +arm-lr+ (vreg 0))       ; arr
            (arm32-add buf +arm-r12+ +arm-r12+ +arm-lr+)
            (arm32-ldr-post buf +arm-lr+ +arm-sp+ 4)      ; value back
-           (arm32-strb buf +arm-lr+ +arm-r12+ 2)))
+           (arm32-strb buf +arm-lr+ +arm-r12+ (- 4 +arm32-object-tag+))))
 
         ;;; --- System area pointers ---
         ;; One-slot object, subtag #x16: header (1<<8)|#x16 then the raw
@@ -1958,7 +2001,7 @@
            (arm32-load-imm32 buf +arm-r12+ #x116)
            (arm32-str buf +arm-r12+ +arm-r9+ 0)
            (arm32-str buf +arm-lr+ +arm-r9+ 4)
-           (arm32-orr-imm buf +arm-r12+ +arm-r9+ 0 2)
+           (arm32-orr-imm buf +arm-r12+ +arm-r9+ 0 +arm32-object-tag+)
            (arm32-store-vreg buf +arm-r12+ vd)
            (arm32-add-imm buf +arm-r9+ +arm-r9+ 0 16)))
 
@@ -1966,7 +2009,7 @@
          ;; Raw address out, TAGGED as a fixnum (as on x64/i386).
          (let ((vd (vreg 0)))
            (arm32-load-vreg buf +arm-r12+ (vreg 1))
-           (arm32-ldr buf +arm-r12+ +arm-r12+ 2)
+           (arm32-ldr buf +arm-r12+ +arm-r12+ (- 4 +arm32-object-tag+)) ; slot 0
            (arm32-lsl-imm buf +arm-r12+ +arm-r12+ 1)
            (arm32-store-vreg buf +arm-r12+ vd)))
 

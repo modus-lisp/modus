@@ -1441,11 +1441,28 @@
            (arm32-str buf ps pd 3)))
 
         (#.+op-consp+
-         ;; Check low 4 bits == 1 (cons tag)
+         ;; Check low 4 bits == 1 (cons tag) -- AND EXCLUDE NIL FIRST.
+         ;;
+         ;; NIL's low nibble IS +tag-cons+ by design: that is what lets car/cdr
+         ;; of NIL be a plain load into a NIL-filled page.  So the tag test
+         ;; alone answers T for NIL, and translate-i386's comment records the
+         ;; cost -- `(loop while (consp cur) ... (setq cur (cdr cur)))' never
+         ;; terminates, because (car NIL) hands back NIL and the walk recurses
+         ;; on NIL forever.  r24-nil-atom measured arm32 at 12: the four-bit
+         ;; mask was already right, so (consp T) worked and (consp NIL) did not.
+         ;;
+         ;; Done by FORCING THE TAG TO ZERO when the value is NIL, rather than
+         ;; by a second branch: the CMP goes first (AND does not touch flags,
+         ;; being AND and not ANDS), so `ps' is read exactly once and the arm
+         ;; still works when with-src hands back r12 itself as `ps'.
          (let ((vd (vreg 0)))
            (with-src (ps (vreg 1))
+             ;; CMP ps, r8  (r8 = NIL) -- before ps's last use
+             (arm32-cmp buf ps +arm-r8+)
              ;; AND r12, ps, #0xF
              (arm32-and-imm buf +arm-r12+ ps 0 #xF)
+             ;; MOVEQ r12, #0 -- NIL's tag is forced to a non-cons value
+             (arm32-mov-imm-cond buf +arm-cc-eq+ +arm-r12+ 0 0)
              ;; CMP r12, #1
              (arm32-cmp-imm buf +arm-r12+ 0 1)
              ;; MOVEQ rd, #2 (tagged true = fixnum 1 = 2)
@@ -1455,9 +1472,13 @@
              (arm32-store-vreg buf +arm-r12+ vd))))
 
         (#.+op-atom+
+         ;; The inverse of +op-consp+'s NIL exclusion: (atom NIL) is T.  Same
+         ;; force-the-tag-to-zero trick, for the same reason.
          (let ((vd (vreg 0)))
            (with-src (ps (vreg 1))
+             (arm32-cmp buf ps +arm-r8+)
              (arm32-and-imm buf +arm-r12+ ps 0 #xF)
+             (arm32-mov-imm-cond buf +arm-cc-eq+ +arm-r12+ 0 0)
              (arm32-cmp-imm buf +arm-r12+ 0 1)
              ;; MOVNE rd, #2 (true if NOT cons)
              (arm32-mov-imm-cond buf +arm-cc-ne+ +arm-r12+ 0 2)

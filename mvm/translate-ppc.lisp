@@ -1598,11 +1598,25 @@
              (vs (second operands)))
          (let ((ps (vreg-or-scratch vs +ppc-scratch1+)))
            (let ((pd (or (ppc-vreg-phys vd) +ppc-scratch1+)))
-             (ppc-emit-andi-dot buf +ppc-r0+ ps #xF)
-             (ppc-emit-cmpi-word buf +ppc-r0+ +tag-cons+)
+             ;; NIL MUST BE EXCLUDED BEFORE THE TAG IS TESTED.  NIL's low nibble
+             ;; IS +tag-cons+ by design -- that is what lets car/cdr of NIL be a
+             ;; plain load into a NIL-filled page -- so the tag test alone
+             ;; answers T for NIL.  x64 compares against R15 and i386 against
+             ;; *vn-addr* first; PPC did not, and r24-nil-atom measured the
+             ;; result as 12 on both widths.  translate-i386's comment records
+             ;; what it costs: `(loop while (consp cur) ... (setq cur (cdr cur)))'
+             ;; never terminates, because (car NIL) hands back NIL and the walk
+             ;; recurses on NIL forever.  The four-bit mask below is already
+             ;; right, which is why (consp T) was the half that worked.
              (let ((true-label (mvm-make-label))
+                   (false-label (mvm-make-label))
                    (done-label (mvm-make-label)))
+               (ppc-emit-cmp-word buf ps +ppc-r21+)
+               (ppc-emit-beq buf false-label)
+               (ppc-emit-andi-dot buf +ppc-r0+ ps #xF)
+               (ppc-emit-cmpi-word buf +ppc-r0+ +tag-cons+)
                (ppc-emit-beq buf true-label)
+               (ppc-emit-label buf false-label)
                (ppc-emit-mr buf pd +ppc-r21+)
                (ppc-emit-b buf done-label)
                (ppc-emit-label buf true-label)
@@ -1616,15 +1630,18 @@
              (vs (second operands)))
          (let ((ps (vreg-or-scratch vs +ppc-scratch1+)))
            (let ((pd (or (ppc-vreg-phys vd) +ppc-scratch1+)))
-             (ppc-emit-andi-dot buf +ppc-r0+ ps #xF)
-             (ppc-emit-cmpi-word buf +ppc-r0+ +tag-cons+)
+             ;; The exact inverse of +op-consp+'s NIL exclusion: (atom NIL) is T.
              (let ((true-label (mvm-make-label))
                    (done-label (mvm-make-label)))
+               (ppc-emit-cmp-word buf ps +ppc-r21+)
+               (ppc-emit-beq buf true-label)          ; NIL is an atom
+               (ppc-emit-andi-dot buf +ppc-r0+ ps #xF)
+               (ppc-emit-cmpi-word buf +ppc-r0+ +tag-cons+)
                (ppc-emit-bne buf true-label)
                ;; Is a cons: return NIL
                (ppc-emit-mr buf pd +ppc-r21+)
                (ppc-emit-b buf done-label)
-               ;; Not a cons: return T
+               ;; Not a cons (or NIL): return T
                (ppc-emit-label buf true-label)
                (ppc-emit-addi buf pd 0 +mvm-t+)
                (ppc-emit-label buf done-label))

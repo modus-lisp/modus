@@ -1705,11 +1705,25 @@
          (m68k-load-vreg buf +68k-d0+ vs)
          (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d1+)
          (m68k-emit-andi buf +68k-d1+ #xF)
+         ;; AND NIL IS NOT A CONS.  NIL's low nibble IS +tag-cons+ by design --
+         ;; that is what lets car/cdr of NIL be a plain load into a NIL-filled
+         ;; page -- so the tag test alone answers T for NIL.  translate-i386's
+         ;; comment records the cost: `(loop while (consp cur) ... (setq cur
+         ;; (cdr cur)))' never terminates, because (car NIL) hands back NIL and
+         ;; the walk recurses on NIL forever.  r24-nil-atom measured 68k at 12:
+         ;; the four-bit mask was right, so (consp T) worked and (consp NIL) did
+         ;; not.  D0 still holds the untouched value here (D1 is the masked
+         ;; copy), so CMPA.L against A4 costs one instruction and no register.
          (m68k-emit-cmpi buf +68k-d1+ +tag-cons+)
          (let ((true-label (mvm-make-label))
+               (false-label (mvm-make-label))
                (done-label (mvm-make-label)))
-           (m68k-emit-beq buf true-label)
+           (m68k-emit-bne buf false-label)
+           (m68k-emit-cmpa buf +68k-a4+ +68k-d0+)   ; is the value NIL?
+           (m68k-emit-beq buf false-label)          ; NIL -> not a cons
+           (m68k-emit-bra buf true-label)
            ;; False: load NIL (from A4)
+           (m68k-emit-label buf false-label)
            (m68k-emit-move-an-dn buf +68k-a4+ +68k-d0+)
            (m68k-emit-bra buf done-label)
            ;; True: load T (tagged fixnum 1 = 2)
@@ -1724,10 +1738,13 @@
          (m68k-load-vreg buf +68k-d0+ vs)
          (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d1+)
          (m68k-emit-andi buf +68k-d1+ #xF)
+         ;; The inverse of +op-consp+'s NIL exclusion: (atom NIL) is T.
          (m68k-emit-cmpi buf +68k-d1+ +tag-cons+)
          (let ((true-label (mvm-make-label))
                (done-label (mvm-make-label)))
            (m68k-emit-bne buf true-label)
+           (m68k-emit-cmpa buf +68k-a4+ +68k-d0+)   ; is the value NIL?
+           (m68k-emit-beq buf true-label)           ; NIL is an atom
            ;; Is cons: return NIL
            (m68k-emit-move-an-dn buf +68k-a4+ +68k-d0+)
            (m68k-emit-bra buf done-label)

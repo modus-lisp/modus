@@ -150,6 +150,24 @@
   ;; --- CLI (redundant but safe) ---
   (mvm-emit-byte buf #xFA)                         ; cli
 
+  ;; --- Enable SSE: CR0.EM=0, CR0.MP=1, CR4.OSFXSR|OSXMMEXCPT ---
+  ;; translate-i386 emits SSE2 for doubles (CVTSI2SD, ADDSD, ...).  Out of reset
+  ;; the OS-support bits are clear and the first SSE instruction is #UD; with no
+  ;; IDT yet that escalates to a triple fault, which qemu -no-reboot shows as a
+  ;; BIOS/iPXE banner rather than an error -- so every double-float rung "never
+  ;; reached Lisp" on bare i386.  Hosted Linux sets these for the process; a
+  ;; bare boot must.  Same class as bare ppc64 MSR[FP], the Pi's FPEXC and
+  ;; aarch64's CPACR_EL1.  EAX/EBX hold multiboot values: EBX is untouched here
+  ;; and the EAX magic is not read afterwards.
+  (dolist (b '(#x0F #x20 #xC0                      ; mov eax, cr0
+               #x25 #xFB #xFF #xFF #xFF            ; and eax, ~4      (EM=0)
+               #x83 #xC8 #x02                      ; or  eax, 2       (MP=1)
+               #x0F #x22 #xC0                      ; mov cr0, eax
+               #x0F #x20 #xE0                      ; mov eax, cr4
+               #x0D #x00 #x06 #x00 #x00            ; or  eax, 0x600   (OSFXSR|OSXMMEXCPT)
+               #x0F #x22 #xE0))                    ; mov cr4, eax
+    (mvm-emit-byte buf b))
+
   ;; --- Save multiboot info pointer (EBX) to scratch location ---
   ;; mov [0x500], ebx
   (mvm-emit-byte buf #x89)                         ; mov [disp32], ebx

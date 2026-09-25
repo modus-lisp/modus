@@ -1165,9 +1165,12 @@
        hash))
     ((symbolp object)
      ;; Use name hash if available
-     (if (%cl-sym-p object)
-         (%sxhash-1 (%cl-sym-name object) (+ depth 1))
-         (logand (ash object -1) most-positive-fixnum)))
+     ;; By NAME for every symbol.  Native symbols and keywords (#x50/#x53
+     ;; objects) used (ash object -1) -- ASH of a tagged object pointer
+     ;; takes the bignum path and faulted; (sxhash :foo) killed the process
+     ;; (upstream ansi-test SXHASH.1).  A name hash is also stable, as CLHS
+     ;; requires.
+     (%sxhash-1 (symbol-name object) (+ depth 1)))
     ((consp object)
      ;; Combine car and cdr hashes. Bound the walk so circular conses
      ;; (e.g. (let ((c (list 'a))) (setf (cdr c) c) (sxhash c)) — ANSI

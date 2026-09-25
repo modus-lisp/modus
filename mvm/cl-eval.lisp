@@ -2589,6 +2589,15 @@
      ;; (expt INT/RATIO NEG-INT) yields an integer/ratio.  Also fixes
      ;; scale-float = (* float (expt 2.0d0 int)).
      (/ 1 (expt base (- 0 power))))
+    ;; CLHS EXPT: a zero BASE to a non-integer POWER whose real part is
+    ;; positive is a zero of the contagion type of both -- which is exactly
+    ;; (* base power).  The exp/log path below gave 1 for real zeros and
+    ;; never terminated for a complex zero (upstream EXPT.29 hung).  A
+    ;; non-positive real part is undefined; signal rather than guess.
+    ((and (not (integerp power)) (zerop base))
+     (if (plusp (realpart power))
+         (* base power)
+         (error 'division-by-zero :operation 'expt :operands (list base power))))
     ((ratiop power)
      ;; Approximate via exp(power * log base) — uses our rational
      ;; Taylor-series transcendentals.

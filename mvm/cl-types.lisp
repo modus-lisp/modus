@@ -2929,10 +2929,12 @@
    IEEE float: coerce to rational and recurse."
   ;; Complex operands (CLHS =): (= z1 z2) iff realparts = AND imagparts =.
   ;; A complex vs a real R equals iff imagpart is 0 and realpart = R.
-  ;; Gated on (not fixnump) BOTH so the hot fixnum-compare path never pays
-  ;; the %complex-p type-walk — a fixnum is never a complex.
-  (when (and (not (fixnump a)) (not (fixnump b))
-             (or (%complex-p a) (%complex-p b)))
+  ;; Each side's %complex-p is guarded by its own (not fixnump), so the hot
+  ;; fixnum-compare path never pays the type-walk.  The guard used to
+  ;; require BOTH sides non-fixnum, so a complex against a fixnum -- e.g.
+  ;; ZEROP, which is (= x 0) -- skipped this arm: (zerop #C(0.0 0.0)) was NIL.
+  (when (or (and (not (fixnump a)) (%complex-p a))
+            (and (not (fixnump b)) (%complex-p b)))
     (return-from numeric-equal-p
       (and (numeric-equal-p (realpart a) (realpart b))
            (numeric-equal-p (imagpart a) (imagpart b)))))

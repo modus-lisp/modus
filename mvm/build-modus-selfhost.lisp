@@ -253,8 +253,12 @@
     ;; explicitly.  Otherwise (vreg-phys 9) yields 0 and DEST-PHYS-OR-SCRATCH s
     ;; (or (vreg-phys v) +scratch-reg+) picks 0 (truthy), so emit-mov-reg-mem gets
     ;; register 0 and reg-info fails with Unknown register 0 on every spilled obj-ref.
-    (aset v 9 6)  (aset v 10 7) (aset v 11 4) (aset v 12 5)
-    (aset v 13 8) (aset v 14 nil) (aset v 15 nil) (aset v 22 nil)
+    ;; V9..V13 SPILL on x64 (translate-x64 *vreg-to-x64*).  a1095b7 wrote the aarch64
+    ;; local-register map (6 7 4 5 8) here too: (vreg-phys 9) => 6, and every x64
+    ;; emit of a spilled vreg died with Unknown register: 6 (self-host --compile of
+    ;; a full-size source; found by test/run-uefi-ddc.sh 2026-09-25).
+    (aset v 9 nil) (aset v 10 nil) (aset v 11 nil) (aset v 12 nil)
+    (aset v 13 nil) (aset v 14 nil) (aset v 15 nil) (aset v 22 nil)
     (aset v 16 (quote rax)) (aset v 17 (quote r12))
     (aset v 18 (quote r14)) (aset v 19 (quote r15))
     (aset v 20 (quote rsp)) (aset v 21 (quote rbp))
@@ -1387,6 +1391,8 @@
                (write-string-serial in) (write-char-serial 10) (sys-exit 1))
        (progn
         (setq *use-jit* nil)
+        (setq *compile-warn-unresolved* t)   ; log every unresolved callee with its site (DDC triage)
+        (setq *ddc-trace-nil-callee* t)      ; compiler.lisp :call assembler — name each NIL-named callee site
         (setq *static-build-p* t)
         (setq *mvm-emit-halves* nil)
         (setq *mvm-eval-runtime-p* nil)
@@ -1406,6 +1412,15 @@
         (print-dec *x64-native-code-offset*)
         (write-char-serial 10)
         (let ((image (build-image :target :uefi-x64-cl :source-text src)))
+          (let ((fns (getf (kernel-image-metadata image) :fn-table))
+                (nio (or (kernel-image-native-image-offset image) 0)))
+            (when fns
+              (dolist (fi fns)
+                (write-string-serial \"FNMAP \")
+                (print-dec (+ nio (or (mvm-function-info-native-offset fi) 0)))
+                (write-char-serial 32)
+                (write-string-serial (string (mvm-function-info-name fi)))
+                (write-char-serial 10))))
           (let ((bytes (kernel-image-image-bytes image))
                 (fd (%selfhost-open-exec out)))
             (if (< fd 0)

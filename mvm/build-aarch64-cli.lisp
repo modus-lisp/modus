@@ -961,8 +961,12 @@
     (aset v 4 (quote rbx))  (aset v 5 (quote rcx))
     (aset v 6 (quote rdx))  (aset v 7 (quote r10))
     (aset v 8 (quote r11))
-    (aset v 9 6)  (aset v 10 7) (aset v 11 4) (aset v 12 5)
-    (aset v 13 8) (aset v 14 nil) (aset v 15 nil) (aset v 22 nil)
+    ;; V9..V13 SPILL on x64 (translate-x64 *vreg-to-x64*).  a1095b7 wrote the aarch64
+    ;; local-register map (6 7 4 5 8) here too: (vreg-phys 9) => 6, and every x64
+    ;; emit of a spilled vreg died with Unknown register: 6 (self-host --compile of
+    ;; a full-size source; found by test/run-uefi-ddc.sh 2026-09-25).
+    (aset v 9 nil) (aset v 10 nil) (aset v 11 nil) (aset v 12 nil)
+    (aset v 13 nil) (aset v 14 nil) (aset v 15 nil) (aset v 22 nil)
     (aset v 16 (quote rax)) (aset v 17 (quote r12))
     (aset v 18 (quote r14)) (aset v 19 (quote r15))
     (aset v 20 (quote rsp)) (aset v 21 (quote rbp))

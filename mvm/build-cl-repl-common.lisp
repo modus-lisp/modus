@@ -2267,6 +2267,41 @@
 
 ;;; DIVERGENCE 8 — BUILD-IMAGE :TARGET and the default output path.
 ;;; MODUS_CL_REPL_OUT overrides either one.
+;; DDC: CONSTANTS FORWARD BLOCK.  The MVM compiler folds a +constant+ reference
+;; only if its DEFCONSTANT appeared EARLIER in the source stream; a use before
+;; the definition compiles as a global-variable read (NIL at runtime).  Under
+;; SBCL every constant is already known from the HOST image (lib/load-mvm), so
+;; the host build never sees the problem — but the in-image compiler
+;; (`modus-sh --compile-uefi`) does: 142 constants (+OP-*+ used in a table before
+;; mvm.lisp, +GC-REGION-0-BASE+ used in gc.lisp before compiler.lisp) came out
+;; as implicit globals and the two compilers disagreed.  So prepend every
+;; integer-literal DEFCONSTANT found in the text.  DEFCONSTANT emits no code, so
+;; the SBCL artifact must be byte-identical with this block (verified by
+;; test/run-uefi-ddc.sh's md5 of the SBCL image before/after).
+(defun %ddc-constants-forward-block (text)
+  (let ((out (make-string-output-stream)) (n 0) (pos 0))
+    (format out "(in-package :modus.mvm)~%;; DDC constants forward block (auto)~%")
+    (loop
+      (let ((p (search "(defconstant +" text :start2 pos)))
+        (unless p (return))
+        (let* ((close (position #\) text :start p))
+               (form (and close (subseq text p (1+ close)))))
+          ;; only the simple shape "(defconstant +NAME+ <integer>)" on one line
+          (when (and form (not (find #\Newline form)))
+            (let* ((sp1 (position #\Space form :start 13))
+                   (name (and sp1 (subseq form 13 sp1)))
+                   (rest (and sp1 (string-trim " " (subseq form (1+ sp1) (1- (length form)))))))
+              (when (and name rest (plusp (length rest))
+                         (every (lambda (c) (or (digit-char-p c) (find c "#xXabcdefABCDEF-"))) rest)
+                         (or (digit-char-p (char rest 0)) (char= (char rest 0) #\#) (char= (char rest 0) #\-)))
+                (format out "(defconstant ~A ~A)~%" name rest)
+                (incf n))))
+          (setq pos (if close (1+ close) (1+ p))))))
+    (format t "~&;; DDC: constants forward block: ~D defconstants~%" n)
+    (concatenate 'string (get-output-stream-string out) text)))
+(setq cl-user::*full-source*
+      (modus.mvm::%build-package-scoped-source (%ddc-constants-forward-block cl-user::*full-source*)))
+
 ;; DDC: MODUS_DDC_DUMP_SOURCE=path writes the EXACT text build-image is about
 ;; to compile AND still builds, so `modus-sh --compile-uefi path OUT` can
 ;; reproduce this image from inside Modus (test/run-uefi-ddc.sh compares the

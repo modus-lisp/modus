@@ -23093,7 +23093,13 @@
                                     0)))))
              (unless fn-info
                (when (boundp '*unresolved-calls*)
-                 (incf (gethash fn-name *unresolved-calls* 0))))
+                 (incf (gethash fn-name *unresolved-calls* 0)))
+               ;; DDC triage: an unresolved callee whose NAME is NIL is a call
+               ;; the assembler could not even name.  Off unless asked for.
+               (when (and (null fn-name) (boundp '*ddc-trace-nil-callee*)
+                          (symbol-value '*ddc-trace-nil-callee*))
+                 (format t "~&  NIL-CALLEE in ~A at ~A insn ~S~%"
+                         *current-function-name* *current-source-location* insn)))
              (mvm-call buf target)))
 
           (:call-indirect

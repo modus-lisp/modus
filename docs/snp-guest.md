@@ -58,25 +58,50 @@ the hosted `--compile`'s static-emit trio, JIT off first.
 and compares the bytes: SBCL vs modus-sh (the fixpoint) and run vs run.  The
 md5 of the modus-sh output is the DDC'd hash for `-kernel`.
 
-**Result, 2026-09-24:** the whole pipeline runs and the in-image compile is
-**reproducible run to run** (two `--compile-uefi` runs, identical md5), but it
-is **not yet the fixpoint**: the in-image translator fails on one instruction
-(`(mov V9 V6)` in `REDUCE`, `Unknown register: 6`) and emits a partial
-9.95 MB image against SBCL's 41.2 MB.  Bisected in the same session:
+**Result, 2026-09-25.**  The pipeline runs end to end; the fixpoint does not
+hold yet, and the reasons are now enumerated rather than guessed.
 
-* the modus-sh built on 2026-09-08 (`/home/claude/modus-mhost/tmp/fixpoint-hosts/modus-sh-sbcl`)
-  compiles this exact source text cleanly to a 36.9 MB hosted ELF;
-* today's modus-sh fails identically on the hosted target, and **with none
-  of the boot files baked** (`MODUS_SH_BOOT_FILES=""`).
+1. **A real x64 self-host regression on main was found and fixed.**  The first
+   in-image compile emitted a 9.95 MB partial image ("Unknown register: 6" on
+   `(mov V9 V6)`).  `git bisect run` over 339 commits with the fixed source text
+   → a1095b7 (2026-09-18): its "register map co-inits in five build scripts"
+   sweep wrote the aarch64 local-register map (6 7 4 5 8) into the two co-inits
+   that build `*vreg-to-x64*` (modus-sh's own x64 emit, and the aarch64 CLI's
+   x64 cross-emit); x64 spills V9..V15 and needs NIL there.  Fixed in both.
+   The hosted `./modus` x64 JIT was never affected (0 fallbacks measured).
+   `scripts/ws5-gate.sh` missed it because its self-compile is a tiny program.
+2. **Constants the host knows, the image does not.**  142 `+OP-*+` /
+   `+GC-REGION-0-BASE+` references compiled as implicit globals in-image (used
+   before their DEFCONSTANT in the stream; SBCL folds them from the host
+   image).  A constants forward block is now prepended to the CL image's text
+   (`%ddc-constants-forward-block`, 229 integer-literal defconstants); the
+   +OP-*+ class is gone.  Still escaping: `+GC-REGION-0-BASE+` (8), and CL's
+   `MOST-POSITIVE-FIXNUM` / `MOST-NEGATIVE-FIXNUM`, which the host folds as CL
+   constants.
+3. **The in-image compile is a different BUILD CONFIGURATION, not just a
+   different compiler.**  `--compile-uefi` forces `*static-build-p*` T (as the
+   hosted `--compile` does), and under that flag every DEFCONSTANT registers an
+   `INIT-+X+` boot thunk (compiler.lisp toplevel DEFCONSTANT clause): the
+   in-image image has 266 INIT thunks and 60 more TOPLEVEL thunks than the
+   SBCL one (5116 vs 4791 named functions after filtering numbered closures),
+   yet is 3.4 MB smaller (37.9 vs 41.2 MB).  For byte identity both sides must
+   run ONE configuration — the `*mvm-eval-runtime-p*` / `*static-build-p*`
+   consolidation already recorded as the WS5 "one flag" work.
+4. **936 call sites resolve to a callee named NIL in-image** (host: 26
+   unresolved, none NIL), so the modus-sh-built image boots to its `MODUS-CL`
+   marker and dies on an undefined function.  A flag-gated trace at the
+   assembler's `:call` site (`*ddc-trace-nil-callee*`) was added but did not
+   fire, so the sites are still unattributed.
+5. **144 bytes of run-to-run nondeterminism** remain, in 4-byte groups inside
+   `%MUL-LIMBS-MAG`, `BIGNUM-EQL`, `%ANY-TO-FLOAT`, `GENERIC-MULTIPLY`,
+   `EMIT-LI-TAGGED`, `COMPILE-FORM` … — the emit-u64 high-dword class recorded
+   in `reference_selfcompile_nondeterminism`, at a site other than the one
+   fixed then (bignum/float immediates).
 
-So the self-host of a full-size source regressed on main between 2026-09-08
-and 2026-09-24, in the in-image compiler/translator, independently of this
-work; `scripts/ws5-gate.sh`'s self-compile check only compiles a small
-program and did not see it.  A `git bisect run` over the 339 commits with the
-fixed source text was started (`tmp/bisect-probe.sh`; verdicts in
-`tmp/bisect/verdicts.txt`).  Once that lands, the remaining question is
-byte-identity of the UEFI image between SBCL and modus-sh, which the same
-script answers.
+So the DDC'd bare-metal payload needs, in order: (4) and (5) fixed in the
+in-image compiler, then (3) decided (one configuration for both builders),
+then `test/run-uefi-ddc.sh` green.  The measurement instrument is done and is
+what found (1).
 
 ## The plan
 

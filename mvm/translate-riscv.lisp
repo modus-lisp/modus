@@ -386,6 +386,27 @@
    zero, which is what :ftoi is specified to do."
   (rv-emit-fp-r buf #x61 2 fs1 1 rd))
 
+(defun rv-emit-fcvt-d-w (buf fd rs1)
+  "FCVT.D.W fd, rs1 -- signed 32-bit integer to double.  RV32's FCVT.D.L: a
+   fixnum's value always fits in 32 bits there, so nothing is lost."
+  (rv-emit-fp-r buf #x69 0 rs1 0 fd))
+
+(defun rv-emit-fcvt-w-d (buf rd fs1)
+  "FCVT.W.D rd, fs1, rtz -- double to signed 32-bit integer, truncating."
+  (rv-emit-fp-r buf #x61 0 fs1 1 rd))
+
+(defun rv-emit-lhu (buf rd rs1 imm12)
+  "LHU rd, imm12(rs1) (load halfword unsigned)"
+  (rv-emit-u32 buf (rv-encode-i-type imm12 rs1 #x5 rd #x03)))
+
+(defun rv-emit-fld (buf fd rs1 imm12)
+  "FLD fd, imm12(rs1) -- load a double into an FP register (D extension)."
+  (rv-emit-u32 buf (rv-encode-i-type imm12 rs1 #x3 fd #x07)))
+
+(defun rv-emit-fsd (buf fs2 rs1 imm12)
+  "FSD fs2, imm12(rs1) -- store a double from an FP register (D extension)."
+  (rv-emit-u32 buf (rv-encode-s-type imm12 fs2 rs1 #x3 #x27)))
+
 (defun rv-emit-div (buf rd rs1 rs2)
   "DIV rd, rs1, rs2 (signed divide)"
   (rv-emit-u32 buf (rv-encode-r-type #x01 rs2 rs1 #x4 rd #x33)))
@@ -1935,13 +1956,26 @@
       ;; the slots are, since this target tags objects with 2 and has no padding
       ;; word: slot k is at tagged + (1+k)*word - 2, i.e. +6/+14/+22/+30.
       ;;
-      ;; RV32 IS DELIBERATELY EXCLUDED.  FMV.D.X moves 64 bits between an integer
-      ;; and an FP register and there is no 64-bit integer register on RV32; the
-      ;; port would have to bounce through memory.  Emitting it anyway would be an
-      ;; illegal instruction, so the arms below trap on RV32 rather than pretend.
+      ;; RV32 GOES THROUGH MEMORY.  FMV.D.X / FMV.X.D and FCVT.D.L / FCVT.L.D are
+      ;; RV64-only, so each arm below has an RV32 branch using rv32-float-unbox /
+      ;; rv32-float-box (SH chunks + FLD, FSD + LHU chunks) and the 32-bit
+      ;; converts.  Zfa's FMVH.X.D / FMVP.D.X would do it in registers, but plenty
+      ;; of RV32D hardware lacks Zfa, so it is not the baseline.
       ((#.+op-fadd+ #.+op-fsub+ #.+op-fmul+ #.+op-fdiv+)
        (if (not *riscv-64-bit*)
-           (progn (rv-emit-addi buf +rv-a7+ +rv-x0+ opcode) (rv-emit-ebreak buf))
+           ;; RV32: through memory -- see rv32-float-unbox.  t3 is the chunk
+           ;; scratch because RESOLVE/RESOLVE2 may hand back t0/t1 as ra/rb.
+           (let* ((vd (vreg 0))
+                  (ra (resolve (vreg 1)))
+                  (rb (resolve2 (vreg 2))))
+             (rv32-float-unbox buf ra 0 +rv-t3+)
+             (rv32-float-unbox buf rb 1 +rv-t3+)
+             (cond ((= opcode +op-fadd+) (rv-emit-fadd-d buf 0 0 1))
+                   ((= opcode +op-fsub+) (rv-emit-fsub-d buf 0 0 1))
+                   ((= opcode +op-fmul+) (rv-emit-fmul-d buf 0 0 1))
+                   (t                    (rv-emit-fdiv-d buf 0 0 1)))
+             (rv32-float-box buf 0 +rv-t3+ +rv-t2+)
+             (store-result vd +rv-t2+))
            (let* ((vd (vreg 0))
                   (ra (resolve (vreg 1)))
                   (rb (resolve2 (vreg 2))))
@@ -1963,7 +1997,13 @@
        ;; untagged with an arithmetic shift first: FCVT.D.L converts the integer
        ;; VALUE, not its tagged encoding.
        (if (not *riscv-64-bit*)
-           (progn (rv-emit-addi buf +rv-a7+ +rv-x0+ opcode) (rv-emit-ebreak buf))
+           ;; RV32: FCVT.D.L is RV64-only; a 32-bit fixnum's value fits FCVT.D.W.
+           (let* ((vd (vreg 0))
+                  (rs (resolve (vreg 1))))
+             (rv-emit-srai buf +rv-t0+ rs 1)
+             (rv-emit-fcvt-d-w buf 0 +rv-t0+)
+             (rv32-float-box buf 0 +rv-t3+ +rv-t2+)
+             (store-result vd +rv-t2+))
            (let* ((vd (vreg 0))
                   (rs (resolve (vreg 1))))
              (rv-emit-srai buf +rv-t0+ rs 1)
@@ -1975,7 +2015,13 @@
       (#.+op-ftoi+
        ;; Double -> tagged integer, truncating toward zero (FCVT.L.D with rm=RTZ).
        (if (not *riscv-64-bit*)
-           (progn (rv-emit-addi buf +rv-a7+ +rv-x0+ opcode) (rv-emit-ebreak buf))
+           ;; RV32: unbox through memory, truncate with FCVT.W.D (rm=RTZ).
+           (let* ((vd (vreg 0))
+                  (rs (resolve (vreg 1))))
+             (rv32-float-unbox buf rs 0 +rv-t3+)
+             (rv-emit-fcvt-w-d buf +rv-t0+ 0)
+             (rv-emit-slli buf +rv-t0+ +rv-t0+ 1)      ; tag as a fixnum
+             (store-result vd +rv-t0+))
            (let* ((vd (vreg 0))
                   (rs (resolve (vreg 1))))
              (rv-float-load-bits buf rs +rv-t0+ +rv-t1+)
@@ -2627,6 +2673,47 @@
              (rv-emit-slli buf tmp tmp 1)          ; tag as a fixnum
              (rv-emit-store-word buf tmp +rv-s8+ (* (1+ k) ws)))
     (rv-emit-addi buf out +rv-s8+ (rv-object-tag)) ; object tag
+    (rv-emit-addi buf +rv-s8+ +rv-s8+ bytes)))
+
+(defun rv32-float-unbox (buf ptr fd tmp)
+  "RV32: load the double whose TAGGED pointer is in PTR into FP register FD.
+
+   RV32D HAS NO FMV.D.X -- there is no 64-bit integer register to move from --
+   so the value goes through memory, the standard RV32D route.  And since a
+   boxed double is already four tagged 16-bit chunks, the chunks are written
+   straight into a 16-byte stack scratch with SH (which keeps the low 16 bits,
+   so it also masks) and loaded with one FLD: no 64-bit integer arithmetic,
+   which RV32 cannot do in a register anyway.  Little-endian, so chunk k -- bits
+   (63-16k)..(48-16k) -- lives at byte offset 6-2k.  The scratch is allocated by
+   moving sp, not taken from below it: on hosted Linux a signal frame may be
+   written below sp at any instruction.  TMP must not be PTR."
+  (let ((ws (rv-word-size)))
+    (rv-emit-addi buf +rv-sp+ +rv-sp+ -16)
+    (loop for k from 0 to 3
+          do (rv-emit-load-word buf tmp ptr (- (* (1+ k) ws) (rv-object-tag)))
+             (rv-emit-srai buf tmp tmp 1)                ; untag the chunk
+             (rv-emit-sh buf tmp +rv-sp+ (- 6 (* 2 k))))
+    (rv-emit-fld buf fd +rv-sp+ 0)
+    (rv-emit-addi buf +rv-sp+ +rv-sp+ 16)))
+
+(defun rv32-float-box (buf fs tmp out)
+  "RV32: box the double in FP register FS as a fresh four-chunk object, leaving
+   its TAGGED pointer in OUT.  The inverse of rv32-float-unbox: FSD to a stack
+   scratch, then LHU each 16-bit chunk back out, tag it, and store it in its
+   slot.  Same layout and granule rounding as rv-float-box."
+  (let* ((ws (rv-word-size))
+         (g (rv-granule))
+         (bytes (logand (+ (* 5 ws) (1- g)) (lognot (1- g)))))
+    (rv-emit-addi buf +rv-sp+ +rv-sp+ -16)
+    (rv-emit-fsd buf fs +rv-sp+ 0)
+    (rv-emit-li buf tmp (logior #x60 (ash 4 8)))
+    (rv-emit-store-word buf tmp +rv-s8+ 0)
+    (loop for k from 0 to 3
+          do (rv-emit-lhu buf tmp +rv-sp+ (- 6 (* 2 k)))
+             (rv-emit-slli buf tmp tmp 1)                ; tag as a fixnum
+             (rv-emit-store-word buf tmp +rv-s8+ (* (1+ k) ws)))
+    (rv-emit-addi buf +rv-sp+ +rv-sp+ 16)
+    (rv-emit-addi buf out +rv-s8+ (rv-object-tag))
     (rv-emit-addi buf +rv-s8+ +rv-s8+ bytes)))
 
 (defun rv-emit-prologue (buf frame-size)

@@ -288,6 +288,10 @@
   ;; #306: boot is over — enable the JIT's late-bound call bridge for
   ;; everything the user loads (it stays OFF through boot; see *jit-bridge-on*).
   (setq *jit-bridge-on* t)
+  ;; And NIL is no longer a number: arithmetic on NIL signals TYPE-ERROR from
+  ;; here on (CLHS).  Not during boot -- runtime init code still leans on the
+  ;; raw fallback there; see *%ARITH-STRICT* in mvm/cl-types.lisp.
+  (setq *%arith-strict* t)
   ;; Expose the full argv as *posix-argv* (element 0 = program name).
   (setq *posix-argv* (%cli-collect-argv))
   (let* ((all *posix-argv*)

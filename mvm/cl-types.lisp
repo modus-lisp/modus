@@ -2551,6 +2551,15 @@
          (t (%float-div (%bignum-to-float num) (%bignum-to-float den))))))
     (t n)))
 
+;; When T, arithmetic on NIL signals TYPE-ERROR (CLHS) instead of doing raw
+;; fixnum arithmetic on the tagged word -- (1+ nil) returned a garbage object
+;; that failed somewhere unrelated much later (upstream FORMAT.E.1, via
+;; (1+ (position ...)) on a miss).  Armed by the CLI toplevel once boot is
+;; over: runtime init code still does arithmetic on NIL, and making it an
+;; error from the start broke boot.  Unset (every other image), a compiled
+;; read of it is NIL, so nothing changes there.
+(defvar *%arith-strict* nil)
+
 (defun generic-add (a b)
   (cond
     ;; RATIO +/- INTEGER (fixnum OR bignum) first: it used to reach the
@@ -2589,6 +2598,7 @@
     ((or (%ieee-float-p a) (%ieee-float-p b))
      (%as-result-float (%float-add (%any-to-float a) (%any-to-float b))
                        (%float-result-type a b)))
+    ((and (or (null a) (null b) (characterp a) (characterp b)) *%arith-strict*) (%signal-type-error))
     (t (%fixnum-+ a b))))
 
 (defun generic-multiply (a b)
@@ -2616,6 +2626,7 @@
     ((or (%ieee-float-p a) (%ieee-float-p b))
      (%as-result-float (%float-mul (%any-to-float a) (%any-to-float b))
                        (%float-result-type a b)))
+    ((and (or (null a) (null b) (characterp a) (characterp b)) *%arith-strict*) (%signal-type-error))
     (t (%fixnum-* a b))))
 
 (defun generic-subtract (a b)
@@ -2655,6 +2666,7 @@
     ((or (%ieee-float-p a) (%ieee-float-p b))
      (%as-result-float (%float-sub (%any-to-float a) (%any-to-float b))
                        (%float-result-type a b)))
+    ((and (or (null a) (null b) (characterp a) (characterp b)) *%arith-strict*) (%signal-type-error))
     (t (%fixnum-- a b))))
 
 (defun generic-1+ (x)

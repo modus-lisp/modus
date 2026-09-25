@@ -728,8 +728,9 @@
 ;;;     word in memory is already SP<<1 and the same read yields the REAL SP --
 ;;;     doubling would land at 2*SP, far outside the mapped stack.  So the
 ;;;     aarch64 arm is exactly "do not double".  An argv[i]/envp[i] POINTER is
-;;;     stored RAW by the kernel on BOTH arches, so the shared file's (* 2 ptr)
-;;;     is already correct here.
+;;;     stored RAW by the kernel on BOTH arches; the shared file reads it with
+;;;     %CLI-READ-PTR (two :u32 halves, exact for an odd address), which is
+;;;     correct here unchanged.
 ;;; #283 CABINET SEAM.  These eleven functions OVERRIDE the mvm/cl-fileio.lisp
 ;;; definitions (last-defun-wins, Active Limitation 1) because aarch64 Linux has
 ;;; no open/stat/unlink/rename/mkdir syscalls -- only the *at variants.  The

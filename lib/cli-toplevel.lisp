@@ -63,6 +63,18 @@
         (aset s i (mem-ref (+ addr i) :u8))
         (setq i (+ i 1))))))
 
+(defun %cli-read-ptr (slot)
+  "The C pointer stored at raw byte address SLOT, as an exact integer.
+   NOT (* 2 (mem-ref slot :u64)): a :u64 load hands back the raw word AS the
+   Lisp value, so a char* at an ODD address is not a fixnum at all -- its low
+   bit is a tag bit -- and doubling it either signals or drops that bit.
+   Whether an argv/envp string starts on an odd byte depends on the lengths of
+   every string before it, so a one-character-longer $PWD decided whether this
+   process could read its environment (and with it, whether the genera / sb
+   shims installed at boot).  Two :u32 loads are exact on every little-endian
+   target."
+  (+ (mem-ref slot :u32) (* 4294967296 (mem-ref (+ slot 4) :u32))))
+
 (defun %cli-argc ()
   "The process argc, stored by the boot stub at 0x10000200."
   (mem-ref #x10000200 :u32))
@@ -89,10 +101,10 @@
       ;; mem-ref :u64 returns the raw char* right-shifted by one (the u64-load
       ;; convention: raw bits land in a fixnum whose value = raw>>1); double it
       ;; back to the REAL byte address for %cli-cstr-at.
-      (let ((ptr (mem-ref (+ base (* 8 i)) :u64)))
+      (let ((ptr (%cli-read-ptr (+ base (* 8 i)))))
         (if (eql ptr 0)
             (return (reverse acc))          ; defensive: NULL before argc
-            (push (%cli-cstr-at (* 2 ptr)) acc)))
+            (push (%cli-cstr-at ptr) acc)))
       (setq i (+ i 1)))))
 
 (defun %cli-getenv (name)
@@ -108,9 +120,9 @@
          (plen (length prefix))
          (i 0))
     (loop
-      (let ((ptr (mem-ref (+ envp (* 8 i)) :u64)))
+      (let ((ptr (%cli-read-ptr (+ envp (* 8 i)))))
         (when (eql ptr 0) (return nil))     ; envp NULL terminator
-        (let ((entry (%cli-cstr-at (* 2 ptr))))
+        (let ((entry (%cli-cstr-at ptr)))
           (when (and entry (>= (length entry) plen)
                      (string= (subseq entry 0 plen) prefix))
             (return (subseq entry plen)))))

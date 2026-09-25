@@ -2507,7 +2507,7 @@
 ;;; its target.  Where an address is needed inside a branched region it is
 ;;; materialised BEFORE the branch.
 
-(defparameter *rv-jmpbuf-addr* #x10000180
+(defparameter *rv-jmpbuf-addr* #x80700180  ; BARE default; riscv-set-linux-mode moves it
   "Twelve words: sp, fp, resume-ip, then V4..V11.
 
    WHY ALL EIGHT V-REGS.  V4..V11 map to s11,s1..s7 — every one a CALLEE-SAVED
@@ -2523,21 +2523,21 @@
 (defconstant +rv-jmpbuf-words+ 12)
 (defconstant +rv-jmpbuf-size+ 96)
 
-(defparameter *rv-hstack-depth-addr* #x10000400
+(defparameter *rv-hstack-depth-addr* #x80700400  ; BARE default; riscv-set-linux-mode moves it
   "Handler-stack depth.  The mmap'd heap is MAP_ANONYMOUS, so it starts at 0.")
-(defparameter *rv-hstack-base-addr* #x10000408
+(defparameter *rv-hstack-base-addr* #x80700408  ; BARE default; riscv-set-linux-mode moves it
   "Frame 0.  Frame N is at base + 96*N.")
 (defparameter *rv-hstack-max-depth* 21
   "Frames that fit between the stack base and #x10000C10, which is where the
    shared low-memory map puts the longjmp scratch.  21 nested handler-cases; a
    deeper one is CAPPED (see below) rather than allowed to run off the end.")
 
-(defparameter *rv-longjmp-scratch-addr* #x10000300
+(defparameter *rv-longjmp-scratch-addr* #x80700300  ; BARE default; riscv-set-linux-mode moves it
   "Twelve words.  LONGJMP copies the jmpbuf here BEFORE the pop overwrites it --
    the pop restores the OUTER frame into the jmpbuf, and longjmp still needs the
    INNER one it is jumping to.  #x300 because #x250..#x3FF is the one free span
    in the fixed block below the handler stack.")
-(defparameter *rv-hstack-capped-addr* #x10000360
+(defparameter *rv-hstack-capped-addr* #x80700360  ; BARE default; riscv-set-linux-mode moves it
   "LIVE count of capped pushes.  A capped push stores NO frame, so the
    CLEAR-HANDLER that textually matches it must ABSORB its pop instead of
    draining a real frame — otherwise an over-deep handler-case silently pops
@@ -2950,7 +2950,20 @@
    together in one function so the two cannot drift apart — an unmapped slot
    base is a SIGSEGV on the first call, not a subtle wrong answer."
   (setf *riscv-linux-mode* (and on t))
-  (setf *rv-globals-base* (if on *rv-hosted-globals-base* #x80700000)))
+  (setf *rv-globals-base* (if on *rv-hosted-globals-base* #x80700000))
+  ;; THE HANDLER STACK MOVES WITH THE MODE TOO.  Its hosted addresses are the
+  ;; shared #x10000xxx contract (the hosted CLI reads #x10000180/#x10000400 as
+  ;; literals), and on QEMU virt #x10000000 is the NS16550 UART -- so on bare
+  ;; metal every SETJMP wrote its jmpbuf into MMIO space, and r19-handler passed
+  ;; hosted and failed bare.  Bare keeps the SAME low offsets inside the DRAM
+  ;; convention block at #x80700000, where #x00-#x17 are nargs/cenv/mv-count
+  ;; and #x180-#xC10 is otherwise unused.
+  (let ((base (if on #x10000000 #x80700000)))
+    (setf *rv-jmpbuf-addr*          (+ base #x180)
+          *rv-longjmp-scratch-addr* (+ base #x300)
+          *rv-hstack-capped-addr*   (+ base #x360)
+          *rv-hstack-depth-addr*    (+ base #x400)
+          *rv-hstack-base-addr*     (+ base #x408))))
 
 (defun install-riscv-translator ()
   "Install the RISC-V translator into the target descriptor.

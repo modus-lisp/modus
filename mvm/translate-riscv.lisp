@@ -1107,6 +1107,45 @@
            ((< code #x0300)
             ;; Frame-alloc/frame-free: NOP for now
             nil)
+           ((= code #x0530)
+            ;; COPY-OVERFLOW-ARGS -- the &rest/&key prologue's RUNTIME copy of
+            ;; arguments 4.. into frame slots 4.., mirroring translate-x64's and
+            ;; translate-i386's #x0530 arms.
+            ;;
+            ;; The compiler emits this at the head of every &rest ladder
+            ;; (compile-rest-prologue): the ladder then loads argument k as
+            ;; `obj-ref VFP k' for EVERY k, so arguments past the four register
+            ;; ones have to be in the frame first -- and how many there are is
+            ;; only known at run time, from the nargs slot.  RISC-V had no arm
+            ;; for it at all.  An earlier census wrote it off as "the JIT seam,
+            ;; inert as on i386"; i386 in fact implements it.  Missing, every
+            ;; &key call with more than four arguments parsed its keywords out
+            ;; of uninitialised slots: in the real CL image, "unknown keyword
+            ;; argument" with garbage values while evaluating genera-compat and
+            ;; sb-shims, where x64 reports nothing.
+            ;;
+            ;; Layout as in the fixed-count copy on frame-enter: argument i is
+            ;; at fp + (i-4)*8, slot i at fp + frame-slot-base - i*word.  Capped
+            ;; at 32 arguments, as x64 and i386 cap it (the ladder is unrolled to
+            ;; match).  Every branch skips a fixed run, so the arm is size-stable;
+            ;; n < 5 falls straight out because i starts at 4.
+            (rv-emit-li buf +rv-t3+ (rv-nargs-addr))
+            (rv-emit-load-word buf +rv-t1+ +rv-t3+ 0)          ; n (raw)
+            (rv-emit-addi buf +rv-t2+ +rv-x0+ 32)
+            (rv-emit-bge buf +rv-t2+ +rv-t1+ 8)                ; n <= 32: keep
+            (rv-emit-mv buf +rv-t1+ +rv-t2+)                   ; n = 32
+            (rv-emit-addi buf +rv-t2+ +rv-x0+ 4)               ; i = 4
+            (rv-emit-addi buf +rv-t3+ +rv-fp+ 0)               ; src = fp
+            (rv-emit-addi buf +rv-t4+ +rv-fp+                  ; dst = slot 4
+                          (+ +rv-frame-slot-base+ (* 4 (- (rv-word-size)))))
+            ;; top:
+            (rv-emit-bge buf +rv-t2+ +rv-t1+ 28)               ; i >= n -> done
+            (rv-emit-load-word buf +rv-t0+ +rv-t3+ 0)
+            (rv-emit-store-word buf +rv-t0+ +rv-t4+ 0)
+            (rv-emit-addi buf +rv-t3+ +rv-t3+ 8)               ; pushes are 8 bytes
+            (rv-emit-addi buf +rv-t4+ +rv-t4+ (- (rv-word-size)))
+            (rv-emit-addi buf +rv-t2+ +rv-t2+ 1)
+            (rv-emit-j buf -24))                               ; -> top
            ((and (= code #x0300) *riscv-linux-mode*)
             ;; HOSTED: serial write becomes write(1, &byte, 1).  The byte goes
             ;; on the stack because write(2) wants an address, and a0 has to be

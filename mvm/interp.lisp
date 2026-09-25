@@ -729,7 +729,11 @@
   ;; the shape libraries use for handler/hook tables and method lists.
   (and (stringp name)
        (or (string-equal name "SET-SYMBOL-VALUE")
-           (string-equal name "SET-SYMBOL-FUNCTION"))))
+           (string-equal name "SET-SYMBOL-FUNCTION")
+           ;; DEFVAR / DEFPARAMETER's compiled store.  Not plain %GV-SET: a
+           ;; deep walk on every SETQ of a list would make a push loop on a
+           ;; global quadratic.
+           (string-equal name "%GV-SET-DEF"))))
 
 (defun %mvm-wrap-escaping-deep (v bc ftab rt lam-offsets budget)
   "%MVM-WRAP-ESCAPING, but reaching THROUGH cons structure.

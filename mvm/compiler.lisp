@@ -6837,7 +6837,13 @@
            ;; special is package-qualified).  NAME-HASH stays BARE for the
            ;; *GLOBALS* membership set and %NOTE-RUNTIME-SPECIAL, which only
            ;; answer "is this name a known global".
-           (compile-form `(%gv-set ,(%global-var-bind-key var-name) ,value-form)
+           ;; %GV-SET-DEF, not %GV-SET: the interpreter treats it as a STORAGE
+           ;; SINK and deep-wraps in-module closures inside the value
+           ;; ((defparameter *fs* (list #'(lambda ...)))).  Through plain
+           ;; %GV-SET the closure inside the list stayed a raw bytecode offset
+           ;; and a later FUNCALL jumped to it (upstream BOOLE.1, and the heap
+           ;; corruption that then killed the numbers chapter).
+           (compile-form `(%gv-set-def ,(%global-var-bind-key var-name) ,value-form)
                          env dest))
          (compile-quote var-name dest)))
       ;; FLET — compile local functions, bodies see only parent env (no mutual recursion)

@@ -2567,6 +2567,11 @@
                       (cdr %gv-cl))
                     nil)))))))
 
+(defun %gv-set-def (%gv-key %gv-val)
+  "The DEFVAR/DEFPARAMETER store: %GV-SET under a name the bytecode
+   interpreter recognises as a storage sink (see %MVM-STORE-FN-NAME-P)."
+  (%gv-set %gv-key %gv-val))
+
 (defun %gv-set (%gv-key %gv-val)
   "Compiled special-variable WRITE: update in place when the global exists,
    else insert through SET-SYMBOL-VALUE (which also creates the table).

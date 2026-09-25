@@ -1028,10 +1028,27 @@
    occupies.  Measured on RISC-V: MAKE-HASH-TABLE's &rest prologue alone
    reads frame slot 31.  -592 still fits LINK's 16-bit displacement.")
 
-(defun m68k-emit-prologue (buf)
-  "Emit 68k function prologue. LINK + save callee-saved registers."
+(defun m68k-emit-prologue (buf &optional (nparams 0))
+  "Emit 68k function prologue. LINK, copy parameters 5.. into frame slots 4..,
+   save callee-saved registers.
+
+   NPARAMS is the frame-enter TRAP's code.  Only V0-V3 travel in registers;
+   the caller PUSHes the rest (arg 4 last, a longword each) and the body reads
+   parameter i as `obj-ref VFP i', so they must be copied into the frame --
+   translate-x64/i386/aarch64/arm32 all do it, and this back end did not, so
+   every fifth-and-later parameter was an uninitialised slot.  Found on RISC-V
+   in the real CL image (COPY-SEQ's fifth argument to %BULK-COPY).
+
+   JSR pushed the return address and LINK the old A6, so parameter i is at
+   A6 + 8 + (i-4)*4.  D0 is translator scratch and free here."
+  (when (> nparams 128)
+    (error "MVM 68k: ~D parameters exceed the 128-slot frame" nparams))
   ;; LINK A6, #-frame-size
   (m68k-emit-link buf +68k-a6+ (logand (- +68k-frame-size+) #xFFFF))
+  (loop for i from 4 below nparams
+        do (m68k-emit-move-disp-dn buf +68k-a6+ (+ 8 (* (- i 4) 4)) +68k-d0+)
+           (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a6+
+                                   (- +68k-frame-slot-base+ (* i 4))))
   ;; Save callee-saved data registers D4-D7 using MOVEM
   ;; Predecrement mask is reversed: bit 15=D0, bit 14=D1, ...
   ;; D4=bit 11, D5=bit 10, D6=bit 9, D7=bit 8
@@ -1095,8 +1112,8 @@
        (let ((code (first operands)))
          (cond
            ((< code #x0100)
-            ;; Frame-enter: emit function prologue
-            (m68k-emit-prologue buf))
+            ;; Frame-enter: CODE is the parameter count -- see m68k-emit-prologue.
+            (m68k-emit-prologue buf code))
            ((< code #x0300)
             ;; Frame-alloc/frame-free: NOP for now
             nil)

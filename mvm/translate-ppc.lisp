@@ -923,18 +923,41 @@
 ;;; Prologue / Epilogue
 ;;; ============================================================
 
-(defun ppc-emit-prologue (buf)
-  "Emit function prologue. Saves LR, creates frame, saves callee-saved regs."
+(defun ppc-emit-prologue (buf &optional (nparams 0))
+  "Emit function prologue. Creates the frame, copies parameters 5.. into
+   frame slots 4.., saves LR and the callee-saved regs.
+
+   NPARAMS is the frame-enter TRAP's code.  Only V0-V3 travel in registers;
+   the caller PUSHes the rest (arg 4 last, one word each) and the body reads
+   parameter i as `obj-ref VFP i', so they must be copied into the frame --
+   translate-x64/i386/aarch64/arm32 all do it, and this back end did not, so
+   every fifth-and-later parameter was an uninitialised slot.  Found on RISC-V
+   in the real CL image (COPY-SEQ's fifth argument to %BULK-COPY).
+
+   ORDER MATTERS HERE, UNLIKE ON THE OTHER TARGETS.  LR is saved into the
+   CALLER's linkage slot at old-r1 + 2*ws, and old-r1 + 2*ws is exactly where
+   the third pushed argument (parameter 7) sits.  So the frame is created
+   first, the arguments are copied out from old-r1 = r1 + fs, and only THEN is
+   LR stored -- to the same location as before, which the epilogue still reads
+   after popping the frame.  r0 carries each word: it is a fine data register,
+   only never a BASE (rA=0 reads as literal zero)."
   (let ((ws (ppc-word-size))
         (fs (ppc-frame-size)))
-    ;; Save LR to caller's frame
-    (ppc-emit-mflr buf +ppc-r0+)
-    (ppc-emit-store-word buf +ppc-r0+ +ppc-r1+ (* 2 ws))  ; LR save slot
+    (when (> nparams 128)
+      (error "MVM PPC: ~D parameters exceed the 128-slot frame" nparams))
     ;; Create stack frame: stdu/stwu r1, -framesize(r1)
     (if *ppc-64-bit*
         (ppc-emit-word buf (ppc-ds-form 62 +ppc-r1+ +ppc-r1+
                                         (logand (- fs) #xFFFC) 1))
         (ppc-emit-stwu buf +ppc-r1+ +ppc-r1+ (logand (- fs) #xFFFF)))
+    ;; Parameters 5.. from the caller's pushes (old r1 = r1 + fs) into slots 4..
+    (loop for i from 4 below nparams
+          do (ppc-emit-load-word buf +ppc-r0+ +ppc-r1+ (+ fs (* (- i 4) ws)))
+             (ppc-emit-store-word buf +ppc-r0+ +ppc-r1+
+                                  (+ (ppc-frame-slot-base) (* i ws))))
+    ;; Save LR to the caller's linkage slot -- old r1 + 2*ws, now r1 + fs + 2*ws.
+    (ppc-emit-mflr buf +ppc-r0+)
+    (ppc-emit-store-word buf +ppc-r0+ +ppc-r1+ (+ fs (* 2 ws)))
     ;; Save callee-saved registers
     (let ((base (* 6 ws)))  ; save area starts at 6 words into frame
       (ppc-emit-store-word buf +ppc-r14+ +ppc-r1+ base)
@@ -1019,8 +1042,8 @@
        (let ((code (first operands)))
          (cond
            ((< code #x0100)
-            ;; Frame-enter: emit function prologue
-            (ppc-emit-prologue buf))
+            ;; Frame-enter: CODE is the parameter count -- see ppc-emit-prologue.
+            (ppc-emit-prologue buf code))
            ((< code #x0300)
             ;; Frame-alloc/frame-free: NOP for now
             nil)

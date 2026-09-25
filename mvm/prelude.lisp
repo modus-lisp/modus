@@ -888,7 +888,25 @@
               (if (stringp b)
                   (string= a b)
                   nil)
-              nil))))
+              (%equal-other a b)))))
+
+(defun %equal-other (a b)
+  "EQUAL's remaining CLHS cases, off the cons/string fast path: BIT VECTORS
+   compare element-wise (respecting fill pointers) -- (equal #*01 (copy-seq
+   #*01)) was NIL -- and PATHNAMES compare by namestring."
+  (cond
+    ((bit-vector-p a)
+     (and (bit-vector-p b)
+          (let ((n (length a)))
+            (and (= n (length b))
+                 (let ((i 0) (ok t))
+                   (loop
+                     (when (or (not ok) (>= i n)) (return ok))
+                     (unless (eql (aref a i) (aref b i)) (setq ok nil))
+                     (setq i (+ i 1))))))))
+    ((pathnamep a)
+     (and (pathnamep b) (string= (namestring a) (namestring b))))
+    (t nil)))
 
 ;;; ============================================================
 ;;; Sort (insertion sort — simple, O(n²), stable)

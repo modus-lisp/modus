@@ -317,6 +317,29 @@
        (list 'unless (list 'typep place (list 'quote type))
              (list 'error ''type-error :datum place
                    :expected-type (list 'quote type))))"
+    ;; WITH-HASH-TABLE-ITERATOR (CLHS).  Only the ANSI gate's REWRITER ever
+    ;; expanded it, so the image had none: at runtime the iterator call was an
+    ;; undefined function (upstream ansi-test W-H-T-I.1..11).  Same expansion
+    ;; as the rewriter: snapshot the entries, pop one per call.  The name is a
+    ;; LOCAL MACRO (CLHS) over an FLET named %WHTI-<name> -- interned, because a
+    ;; gensym quoted into the macrolet expander is re-interned when the
+    ;; expander is compiled and would no longer name the FLET.  Exhaustion
+    ;; returns one NIL.
+    "(defmacro with-hash-table-iterator (spec &rest body)
+       (let ((ht (gensym \"WHTI-HT\")) (pairs (gensym \"WHTI-PAIRS\"))
+             (pair (gensym \"WHTI-PAIR\"))
+             (next (intern (concatenate (quote string) \"%WHTI-\" (symbol-name (car spec))))))
+         (list 'let* (list (list ht (cadr spec)) (list pairs (list '%ht-to-alist ht)))
+               (list 'flet
+                     (list (list next nil
+                                 (list 'if (list 'null pairs)
+                                       nil
+                                       (list 'let (list (list pair (list 'car pairs)))
+                                             (list 'setq pairs (list 'cdr pairs))
+                                             (list 'values t (list 'car pair) (list 'cdr pair))))))
+                     (list* 'macrolet
+                            (list (list (car spec) nil (list 'list (list 'quote next))))
+                            body)))))"
     "(defmacro ignore-errors (&rest body)
        (list 'handler-case (cons 'progn body) (list 'error (list 'c) (list 'values nil 'c))))"
     ;; NOT a PROGN: w-s-i-s must bind the whole printer/reader variable set

@@ -11657,6 +11657,34 @@
          ((or (and (symbolp op) (string= (symbol-name op) "QUOTE"))
               (and (integerp op) (= op 338547669)))  ; QUOTE
           form)
+         ;; (macrolet ((m ll . mbody) ...) . body) — a call to a local
+         ;; function can be PRODUCED by a local macro's expansion, where this
+         ;; textual walk cannot see it; the call then named a function the
+         ;; transform had removed (UNDEFINED-FUNCTION: WITH-HASH-TABLE-ITERATOR
+         ;; over a capturing FLET).  So each expander also passes its RESULT
+         ;; through this rewrite, at expansion time.  Names the macrolet
+         ;; itself binds shadow the local functions in its body.
+         ((and (symbolp op) (string= (symbol-name op) "MACROLET")
+               (consp (cdr form)) (listp (cadr form)))
+          (let* ((mnames (mapcar (lambda (d) (if (consp d) (car d) nil)) (cadr form)))
+                 (filtered (loop for n in local-names
+                                 for c in cell-names
+                                 unless (member n mnames :test #'name-equal)
+                                 collect (cons n c)))
+                 (new-locals (mapcar #'car filtered))
+                 (new-cells  (mapcar #'cdr filtered)))
+            `(macrolet
+                 ,(mapcar
+                   (lambda (d)
+                     (if (and (consp d) (consp (cdr d)))
+                         (multiple-value-bind (head rest) (%split-body-decls (cddr d))
+                           `(,(car d) ,(cadr d) ,@head
+                             (%flet-rewrite-calls (progn ,@rest)
+                                                  ',local-names ',cell-names)))
+                         d))
+                   (cadr form))
+               ,@(mapcar (lambda (f) (%flet-rewrite-calls f new-locals new-cells))
+                         (cddr form)))))
          ;; (function NAME) — if NAME is a local, replace with (car cell)
          ((or (and (symbolp op) (string= (symbol-name op) "FUNCTION"))
               (and (integerp op) (= op 402801909)))  ; FUNCTION
@@ -18696,6 +18724,12 @@
     (emit-ir :li temp2 (ash +subtag-string+ +fixnum-shift+))
     (emit-ir :cmp temp temp2)
     (emit-ir :beq true-label)
+    ;; The peeled storage is itself an MDA when the array is DISPLACED to a
+    ;; character array: peel again (displacement is acyclic).  One level
+    ;; only made (stringp displaced-string) NIL (upstream SXHASH.21).
+    (emit-ir :li temp2 (ash +subtag-mda+ +fixnum-shift+))
+    (emit-ir :cmp temp temp2)
+    (emit-ir :beq mda-label)
     ;; False fall-through
     (emit-ir-label false-label)
     (compile-nil dest)

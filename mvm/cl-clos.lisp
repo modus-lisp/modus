@@ -5308,8 +5308,16 @@
    a cons-headed wrapper nor a primitive string.  Returns T iff X is a
    native MDA whose data slot is a string (char-element-typed).  This
    function is only called on guaranteed non-cons inputs."
+  ;; A DISPLACED MDA's storage is its target, which may itself be an MDA
+  ;; (a character array displaced to a character array) -- follow the chain,
+  ;; or (stringp displaced-string) was NIL (upstream SXHASH.21).
   (cond
-    ((%mda-p x) (%prim-stringp (%mda-data x)))
+    ((%mda-p x)
+     (let ((d (%mda-data x)))
+       (cond ((null d) (let ((tg (%mda-displaced x))) (and tg (stringp tg))))
+             ((%prim-stringp d) t)
+             ((%mda-p d) (%mda-stringp d))
+             (t nil))))
     (t nil)))
 
 (defun %array-raw-length (arr)

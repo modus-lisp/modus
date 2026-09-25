@@ -256,6 +256,11 @@
           ;; because PC reads as current_instruction + 8 at execution time
           (let ((offset (- target index 2)))
             (ecase type
+              (:pcrel-word
+               ;; A literal word holding TARGET - PC, where PC is what the ADD
+               ;; right after the literal reads: (literal+1)*4 + 8.  OFFSET is
+               ;; already target - literal - 2 in words, so that is OFFSET - 1.
+               (setf (aref code index) (logand (* 4 (- offset 1)) #xFFFFFFFF)))
               ((:b :bl :b-cond)
                (unless (<= (- (ash 1 23)) offset (1- (ash 1 23)))
                  (error "ARM32 ~A branch offset ~D out of range ~
@@ -885,6 +890,166 @@
 ;;; ============================================================
 
 ;;; ============================================================
+;;; Addresses through inline literals
+;;; ============================================================
+;;;
+;;; `LDR rd,[pc,#0]; B over; .word X; over:' -- version-independent (no
+;;; MOVW/MOVT), one fixed shape for both a PC-relative displacement (fn-addr,
+;;; the SETJMP resume address: a :pcrel-word fixup, then ADD rd,pc,rd) and an
+;;; absolute address cross.lisp patches after layout (li-const).  PC reads as
+;;; the instruction's address + 8, so LDR ...[pc,#0] loads the word two slots on,
+;;; which is the literal; the B with a zero offset field lands just past it.
+
+(defvar *arm32-li-const-patches* nil
+  "List of (NATIVE-BYTE-OFFSET . POOL-INDEX): at that offset is the literal
+   word of an li-const, which cross.lisp's apply-li-const-patches fills with the
+   constant-pool slot's tagged address.  Reset at the start of every
+   translation.")
+
+(defun arm32-emit-literal-load (buf rd)
+  "LDR RD,[pc,#0]; B over; <literal>.  Returns the literal's word index."
+  (arm32-ldr buf rd +arm-pc+ 0)
+  (arm32-emit buf (logior (ash +arm-cc-al+ 28) (ash #b101 25)))    ; B .+8
+  (arm32-emit buf 0)
+  (1- (arm32-current-index buf)))
+
+(defun arm32-emit-pcrel-addr (buf rd label)
+  "RD = the absolute address of LABEL."
+  (let ((lit (arm32-emit-literal-load buf rd)))
+    (push (list lit label :pcrel-word) (arm32-buffer-fixups buf))
+    (arm32-add buf rd +arm-pc+ rd)))
+
+;;; ============================================================
+;;; Double floats through VFP (D registers, ARM encoding)
+;;; ============================================================
+;;;
+;;; A boxed double is four TAGGED 16-bit chunks, slot k holding bits
+;;; (63-16k)..(48-16k).  ARM is little-endian, so chunk k is the halfword at
+;;; byte 6-2k of the IEEE double: unbox STRHs the untagged chunks into a 16-byte
+;;; stack scratch and does one VLDR; box is VSTR plus LDRH x4 -- the route RV32
+;;; takes.  Only D0/D1 and S2 are used.
+
+(defun arm32-float-unbox (buf ptr dd)
+  "Load the double whose TAGGED pointer is in PTR (not r12) into Dd."
+  (arm32-sub-imm buf +arm-sp+ +arm-sp+ 0 16)
+  (loop for k from 0 to 3
+        do (arm32-ldr buf +arm-r12+ ptr (- (* 4 (1+ k)) +arm32-object-tag+))
+           (arm32-lsr-imm buf +arm-r12+ +arm-r12+ 1)          ; untag
+           (arm32-strh buf +arm-r12+ +arm-sp+ (- 6 (* 2 k))))
+  (arm32-emit buf (logior #xED900B00 (ash +arm-sp+ 16) (ash dd 12)))   ; VLDR Dd,[sp]
+  (arm32-add-imm buf +arm-sp+ +arm-sp+ 0 16))
+
+(defun arm32-float-box (buf dd)
+  "Box Dd as a fresh four-chunk double; its TAGGED pointer lands in r12.
+   Header (4<<8)|#x60, five words rounded to 32 bytes (16-aligned heap)."
+  (arm32-sub-imm buf +arm-sp+ +arm-sp+ 0 16)
+  (arm32-emit buf (logior #xED800B00 (ash +arm-sp+ 16) (ash dd 12)))   ; VSTR Dd,[sp]
+  (arm32-load-imm32 buf +arm-r12+ (logior #x60 (ash 4 8)))
+  (arm32-str buf +arm-r12+ +arm-r9+ 0)                                ; header at VA
+  (loop for k from 0 to 3
+        do (arm32-ldrh buf +arm-r12+ +arm-sp+ (- 6 (* 2 k)))
+           (arm32-lsl-imm buf +arm-r12+ +arm-r12+ 1)          ; tag
+           (arm32-str buf +arm-r12+ +arm-r9+ (* 4 (1+ k))))
+  (arm32-add-imm buf +arm-sp+ +arm-sp+ 0 16)
+  (arm32-orr-imm buf +arm-r12+ +arm-r9+ 0 +arm32-object-tag+)
+  (arm32-add-imm buf +arm-r9+ +arm-r9+ 0 32))
+
+;;; ============================================================
+;;; handler-case: SETJMP (#x0510) / LONGJMP (#x0511) / CLEAR-HANDLER (#x0512)
+;;; ============================================================
+;;;
+;;; The protocol of translate-riscv / -ppc / -68k: one live jmpbuf, a stack of
+;;; saved outer jmpbufs so handler-cases nest, a depth cap of 21 past which a
+;;; push stores nothing and its pop is absorbed, LONGJMP copying the jmpbuf aside
+;;; before the pop.  JMPBUF = 7 words: sp, r11 (VFP), resume address, r4..r7
+;;; (V4..V7, callee-saved).  VA/VL/VN (r9/r10/r8) deliberately absent.  Frames
+;;; are 8 words (32 bytes) so a frame address is a shift.
+;;;
+;;; Only r12 and LR are free scratch on ARM, so push and pop save r1..r3 around
+;;; themselves (r0 is V0, the handler-case's result at a CLEAR-HANDLER).
+;;; LONGJMP never returns, so it uses r1..r3 freely.
+;;;
+;;; WHERE: hosted, the shared contract block at the heap base (#x10000180 ...;
+;;; 21 frames end at #x100006A8, clear of the globals at #x10000A00); bare, the
+;;; same offsets in *arm32-globals-base*'s block, which otherwise uses #x00-#x0F.
+
+(defconstant +arm32-jmpbuf-words+ 7)
+(defparameter *arm32-hstack-max-depth* 21)
+(defun arm32-hbase ()           (if *arm32-linux-mode* #x10000000 *arm32-globals-base*))
+(defun arm32-jmpbuf-addr ()     (+ (arm32-hbase) #x180))
+(defun arm32-lj-scratch-addr () (+ (arm32-hbase) #x300))
+(defun arm32-hcapped-addr ()    (+ (arm32-hbase) #x360))
+(defun arm32-hdepth-addr ()     (+ (arm32-hbase) #x400))
+(defun arm32-hframes-addr ()    (+ (arm32-hbase) #x408))
+(defconstant +arm32-r1-r3+ (logior (ash 1 1) (ash 1 2) (ash 1 3)))
+
+(defun arm32-emit-copy-words (buf from to)
+  "Copy the 7 jmpbuf words from [FROM] to [TO] through LR."
+  (dotimes (i +arm32-jmpbuf-words+)
+    (arm32-ldr buf +arm-lr+ from (* 4 i))
+    (arm32-str buf +arm-lr+ to (* 4 i))))
+
+(defun arm32-emit-frame-addr (buf dst depth)
+  "DST = frames-base + DEPTH*32."
+  (arm32-load-imm32 buf dst (arm32-hframes-addr))
+  (arm32-dp-reg buf +arm-dp-add+ dst dst depth :shift-type +arm-shift-lsl+ :shift-amt 5))
+
+(defun arm32-emit-handler-push (buf)
+  "Stack the CURRENT jmpbuf.  Leaves r12 = 0 if a frame was stored, 1 if
+   CAPPED.  Preserves r0..r3."
+  (let ((capped (mvm-make-label)) (done (mvm-make-label)))
+    (arm32-push buf +arm32-r1-r3+)
+    (arm32-load-imm32 buf +arm-r3+ (arm32-hdepth-addr))
+    (arm32-ldr buf +arm-r2+ +arm-r3+ 0)
+    (arm32-cmp-imm buf +arm-r2+ 0 *arm32-hstack-max-depth*)
+    (arm32-b-cond buf +arm-cc-ge+ capped)
+    (arm32-emit-frame-addr buf +arm-r1+ +arm-r2+)
+    (arm32-load-imm32 buf +arm-r12+ (arm32-jmpbuf-addr))
+    (arm32-emit-copy-words buf +arm-r12+ +arm-r1+)
+    (arm32-add-imm buf +arm-r2+ +arm-r2+ 0 1)
+    (arm32-str buf +arm-r2+ +arm-r3+ 0)
+    (arm32-mov-imm buf +arm-r12+ 0 0)
+    (arm32-b buf done)
+    (arm32-emit-label buf capped)
+    (arm32-load-imm32 buf +arm-r3+ (arm32-hcapped-addr))
+    (arm32-ldr buf +arm-r2+ +arm-r3+ 0)
+    (arm32-add-imm buf +arm-r2+ +arm-r2+ 0 1)
+    (arm32-str buf +arm-r2+ +arm-r3+ 0)
+    (arm32-mov-imm buf +arm-r12+ 0 1)
+    (arm32-emit-label buf done)
+    (arm32-pop buf +arm32-r1-r3+)))
+
+(defun arm32-emit-handler-pop (buf)
+  "Absorb a capped push, restore the top stacked frame into the jmpbuf, or zero
+   the jmpbuf when empty.  Preserves r0..r3."
+  (let ((not-capped (mvm-make-label)) (empty (mvm-make-label)) (done (mvm-make-label)))
+    (arm32-push buf +arm32-r1-r3+)
+    (arm32-load-imm32 buf +arm-r3+ (arm32-hcapped-addr))
+    (arm32-ldr buf +arm-r2+ +arm-r3+ 0)
+    (arm32-cmp-imm buf +arm-r2+ 0 0)
+    (arm32-b-cond buf +arm-cc-eq+ not-capped)
+    (arm32-sub-imm buf +arm-r2+ +arm-r2+ 0 1)
+    (arm32-str buf +arm-r2+ +arm-r3+ 0)
+    (arm32-b buf done)
+    (arm32-emit-label buf not-capped)
+    (arm32-load-imm32 buf +arm-r3+ (arm32-hdepth-addr))
+    (arm32-ldr buf +arm-r2+ +arm-r3+ 0)
+    (arm32-load-imm32 buf +arm-r12+ (arm32-jmpbuf-addr))
+    (arm32-cmp-imm buf +arm-r2+ 0 0)
+    (arm32-b-cond buf +arm-cc-eq+ empty)
+    (arm32-sub-imm buf +arm-r2+ +arm-r2+ 0 1)
+    (arm32-str buf +arm-r2+ +arm-r3+ 0)
+    (arm32-emit-frame-addr buf +arm-r1+ +arm-r2+)
+    (arm32-emit-copy-words buf +arm-r1+ +arm-r12+)
+    (arm32-b buf done)
+    (arm32-emit-label buf empty)
+    (arm32-mov-imm buf +arm-lr+ 0 0)
+    (dotimes (i +arm32-jmpbuf-words+)
+      (arm32-str buf +arm-lr+ +arm-r12+ (* 4 i)))
+    (arm32-emit-label buf done)
+    (arm32-pop buf +arm32-r1-r3+)))
+
+;;; ============================================================
 ;;; Object tag
 ;;; ============================================================
 
@@ -998,6 +1163,67 @@
                            (arm32-str buf +arm-r12+ +arm-sp+ dst-off)))))
              ((< code #x0300)
               nil) ; frame-alloc/frame-free: NOP for now
+             ((= code #x0510)
+              ;; SETJMP: stack the outer jmpbuf, save sp / r11 / resume / r4..r7.
+              ;; First return NIL (r8); LONGJMP re-enters at RESUME with r0 = T.
+              (let ((skip (mvm-make-label)) (resume (mvm-make-label)))
+                (arm32-emit-handler-push buf)
+                (arm32-cmp-imm buf +arm-r12+ 0 0)
+                (arm32-b-cond buf +arm-cc-ne+ skip)
+                (arm32-load-imm32 buf +arm-r12+ (arm32-jmpbuf-addr))
+                (arm32-str buf +arm-sp+ +arm-r12+ 0)
+                (arm32-str buf +arm-r11+ +arm-r12+ 4)
+                (arm32-emit-pcrel-addr buf +arm-lr+ resume)
+                (arm32-str buf +arm-lr+ +arm-r12+ 8)
+                (loop for r in (list +arm-r4+ +arm-r5+ +arm-r6+ +arm-r7+)
+                      for i from 3
+                      do (arm32-str buf r +arm-r12+ (* 4 i)))
+                (arm32-emit-label buf skip)
+                (arm32-mov buf +arm-r0+ +arm-r8+)             ; first return: NIL
+                (arm32-emit-label buf resume)))
+             ((= code #x0511)
+              ;; LONGJMP: copy the jmpbuf aside, zero the capped count, pop,
+              ;; restore, jump with r0 = T.  Nothing armed: UDF, not a jump to 0.
+              (let ((nohandler (mvm-make-label)))
+                (arm32-load-imm32 buf +arm-r12+ (arm32-jmpbuf-addr))
+                (arm32-ldr buf +arm-lr+ +arm-r12+ 0)
+                (arm32-cmp-imm buf +arm-lr+ 0 0)
+                (arm32-b-cond buf +arm-cc-eq+ nohandler)
+                (arm32-load-imm32 buf +arm-r1+ (arm32-lj-scratch-addr))
+                (arm32-emit-copy-words buf +arm-r12+ +arm-r1+)
+                (arm32-load-imm32 buf +arm-r2+ (arm32-hcapped-addr))
+                (arm32-mov-imm buf +arm-lr+ 0 0)
+                (arm32-str buf +arm-lr+ +arm-r2+ 0)
+                (arm32-emit-handler-pop buf)
+                (arm32-load-imm32 buf +arm-r12+ (arm32-lj-scratch-addr))
+                (loop for r in (list +arm-r4+ +arm-r5+ +arm-r6+ +arm-r7+)
+                      for i from 3
+                      do (arm32-ldr buf r +arm-r12+ (* 4 i)))
+                (arm32-ldr buf +arm-lr+ +arm-r12+ 8)
+                (arm32-ldr buf +arm-r11+ +arm-r12+ 4)
+                (arm32-ldr buf +arm-sp+ +arm-r12+ 0)
+                (arm32-load-imm32 buf +arm-r0+ #xDEAD1009)     ; second return: T
+                (arm32-bx buf +arm-lr+)
+                (arm32-emit-label buf nohandler)
+                (arm32-emit buf #xE7F000F0)))                  ; UDF
+             ((= code #x0512)
+              ;; CLEAR-HANDLER: pop one frame; r0 (the result) untouched.
+              (arm32-emit-handler-pop buf))
+             ((= code #x0530)
+              ;; COPY-OVERFLOW-ARGS, the &rest/&key prologue's RUNTIME copy of
+              ;; arguments 4.. into frame slots 4.. (x64/i386/riscv/ppc/68k do
+              ;; it).  Addressed from VFP, which is SP-2 as the prologue left it,
+              ;; so it stays right even if the body has pushed: argument k is at
+              ;; [SP+540+4k] = [r11+542+4k] and slot i at [r11+2+4i] -- the layout
+              ;; the fixed-count copy above uses.  Unrolled to 32 arguments.
+              (let ((done (mvm-make-label)))
+                (arm32-emit-load-abs buf +arm-r12+ (arm32-nargs-addr))
+                (loop for i from 4 below 32
+                      do (arm32-cmp-imm buf +arm-r12+ 0 i)
+                         (arm32-b-cond buf +arm-cc-le+ done)
+                         (arm32-ldr buf +arm-lr+ +arm-r11+ (+ 542 (* 4 (- i 4))))
+                         (arm32-str buf +arm-lr+ +arm-r11+ (+ 2 (* 4 i))))
+                (arm32-emit-label buf done)))
              ((and (= code #x0300) *arm32-linux-mode*)
               ;; HOSTED: serial write becomes write(1, &byte, 1).  write(2)
               ;; wants an address, so the byte goes on the stack; r0 must be
@@ -1710,14 +1936,85 @@
                 (label (ensure-label target-pc)))
            (arm32-bl buf label)))
 
+        (#.+op-fn-addr+
+         ;; (fn-addr Vd target) -- a function's address TAGGED 3.  PC-relative
+         ;; through an inline literal (arm32-emit-pcrel-addr), then ORR 3; ARM
+         ;; instructions are 4 bytes, so an entry's low two bits are free.
+         (let* ((vd (vreg 0))
+                (idx (vreg 1))
+                ;; arm32 receives the function table as a LIST of (name
+                ;; mvm-offset length), like x64 and i386 -- see cross.lisp's
+                ;; build-translator-fn-table -- so index I is the I-th entry.
+                (mvm-off (second (nth idx function-table)))
+                (label (and mvm-off (gethash mvm-off label-map))))
+           (unless label
+             (error "ARM32 fn-addr: no label for function index ~D" idx))
+           (arm32-emit-pcrel-addr buf +arm-r12+ label)
+           (arm32-orr-imm buf +arm-r12+ +arm-r12+ 0 +tag-function+)
+           (arm32-store-vreg buf +arm-r12+ vd)))
+
+        (#.+op-li-const+
+         ;; (li-const Vd idx) -- a constant-pool slot's TAGGED address.
+         ;;
+         ;; POSITION-INDEPENDENT: the literal holds the DISTANCE from the ADD
+         ;; that follows it (PC = its address + 8) to the slot, and cross.lisp
+         ;; patches that distance, computed from file offsets alone.  An absolute
+         ;; address was wrong on the bare Pi target: the image is linked for
+         ;; #x8000, where the Raspberry Pi firmware loads kernel7.img, but qemu's
+         ;; raspi2b loads a raw -kernel image at #x10000.  Everything else in the
+         ;; image is PC-relative and ran either way; this read zeros #x8000 bytes
+         ;; off, and r17 answered 2^32-258 (a pooled string of length 0).  Now
+         ;; the same image is right in both places.
+         (let ((vd (vreg 0)))
+           (let ((lit (arm32-emit-literal-load buf +arm-r12+)))
+             (push (cons (* 4 lit) (vreg 1)) *arm32-li-const-patches*))
+           (arm32-add buf +arm-r12+ +arm-pc+ +arm-r12+)
+           (arm32-store-vreg buf +arm-r12+ vd)))
+
+        ((#.+op-fadd+ #.+op-fsub+ #.+op-fmul+ #.+op-fdiv+)
+         (let ((vd (vreg 0)))
+           (arm32-load-vreg buf +arm-lr+ (vreg 1))
+           (arm32-float-unbox buf +arm-lr+ 0)
+           (arm32-load-vreg buf +arm-lr+ (vreg 2))
+           (arm32-float-unbox buf +arm-lr+ 1)
+           (arm32-emit buf (logior (cond ((= opcode +op-fadd+) #xEE300B00)
+                                         ((= opcode +op-fsub+) #xEE300B40)
+                                         ((= opcode +op-fmul+) #xEE200B00)
+                                         (t                    #xEE800B00))
+                                   (ash 0 16) (ash 0 12) 1))   ; D0 = D0 op D1
+           (arm32-float-box buf 0)
+           (arm32-store-vreg buf +arm-r12+ vd)))
+
+        (#.+op-itof+
+         ;; untag; VMOV S2,r12; VCVT.F64.S32 D0,S2.
+         (let ((vd (vreg 0)))
+           (arm32-load-vreg buf +arm-r12+ (vreg 1))
+           (arm32-asr-imm buf +arm-r12+ +arm-r12+ 1)
+           (arm32-emit buf #xEE01CA10)                   ; VMOV S2, r12
+           (arm32-emit buf #xEEB80BC1)                   ; VCVT.F64.S32 D0, S2
+           (arm32-float-box buf 0)
+           (arm32-store-vreg buf +arm-r12+ vd)))
+
+        (#.+op-ftoi+
+         ;; VCVT.S32.F64 with op=1 rounds toward zero -- the TRUNCATION :ftoi needs.
+         (let ((vd (vreg 0)))
+           (arm32-load-vreg buf +arm-lr+ (vreg 1))
+           (arm32-float-unbox buf +arm-lr+ 0)
+           (arm32-emit buf #xEEBD1BC0)                   ; VCVT.S32.F64 S2, D0 (RZ)
+           (arm32-emit buf #xEE11CA10)                   ; VMOV r12, S2
+           (arm32-lsl-imm buf +arm-r12+ +arm-r12+ 1)     ; tag
+           (arm32-store-vreg buf +arm-r12+ vd)))
+
         (#.+op-call-ind+
-         ;; Indirect call: MOV LR, PC; BX Ps
-         ;; MOV LR, PC captures PC+8, which is the instruction after BX
+         ;; Indirect call: BIC the function tag, then MOV LR, PC; BX.
+         ;; A function value carries tag 3 (+op-fn-addr+), and BX to an address
+         ;; with bit 0 set SWITCHES TO THUMB -- so the tag must go first.  BIC
+         ;; rather than SUB so an untagged (4-aligned) target passes unchanged.
+         ;; MOV LR, PC captures PC+8, which is the instruction after BX.
          (with-src (ps (vreg 0))
-           ;; MOV lr, pc
+           (arm32-bic-imm buf +arm-r12+ ps 0 3)
            (arm32-mov buf +arm-lr+ +arm-pc+)
-           ;; BX ps
-           (arm32-bx buf ps)))
+           (arm32-bx buf +arm-r12+)))
 
         (#.+op-ret+
          (arm32-emit-epilogue buf))
@@ -2069,6 +2366,7 @@
   "Translate MVM bytecode to ARM32 native code.
    When V7 is T, emit ARMv7-A instructions (SDIV, MOVW/MOVT, DMB, LDREX/STREX).
    Returns an arm32-buffer."
+  (setf *arm32-li-const-patches* nil)
   (let* ((*arm32-v7* v7)
          (buf (make-arm32-buffer))
          (label-map (make-hash-table :test 'eql))

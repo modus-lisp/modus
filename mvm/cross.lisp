@@ -796,6 +796,11 @@
                     ((member arch '(:ppc64 :ppc32))
                      (and (boundp 'modus.mvm::*ppc-li-const-patches*)
                           (symbol-value 'modus.mvm::*ppc-li-const-patches*)))
+                    ;; ARM32: an inline literal word (translate-arm32's
+                    ;; arm32-emit-literal-load).
+                    ((member arch '(:arm32 :armv7 :armv7-rpi))
+                     (and (boundp 'modus.mvm::*arm32-li-const-patches*)
+                          (symbol-value 'modus.mvm::*arm32-li-const-patches*)))
                     ;; 68k: MOVE.L #imm32,D0.
                     ((eq arch :68k)
                      (and (boundp 'modus.mvm::*68k-li-const-patches*)
@@ -882,6 +887,19 @@
                        (aref raw-bytes (+ file-pos 3)) (logand hi #xFF)
                        (aref raw-bytes (+ file-pos 6)) (ash lo -8)
                        (aref raw-bytes (+ file-pos 7)) (logand lo #xFF))))
+              ((member arch '(:arm32 :armv7 :armv7-rpi))
+               ;; ARM32: the literal holds a PC-RELATIVE distance, not an address
+               ;; (see translate-arm32's li-const: qemu's raspi2b and the real Pi
+               ;; firmware load the same image at different addresses).  The ADD
+               ;; after the literal reads PC = literal + 4 + 8, so the distance is
+               ;; slot - (literal + 12), and with both in raw-byte offsets the load
+               ;; address cancels.  A slot with no heap layout (offset 0) keeps 0.
+               (let ((delta (if (zerop offset)
+                                0
+                                (- (+ pool-offset-in-raw offset) (+ file-pos 12)))))
+                 (dotimes (i 4)
+                   (setf (aref raw-bytes (+ file-pos i))
+                         (logand (ash delta (* -8 i)) #xFF)))))
               ((eq arch :68k)
                ;; 68k: the 32-bit immediate of MOVE.L #imm32,D0, big-endian,
                ;; at bytes +2..+5 after the opcode word.

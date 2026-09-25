@@ -614,7 +614,103 @@
 ;;; Main printer: print OBJ to STREAM respecting all *print-* variables
 ;;; LEVEL: current nesting level (nil = not tracking)
 ;;; ESCAPE: current escape setting
+(defvar *%circ-table* nil
+  "While a *PRINT-CIRCLE* print is in progress: EQ table object -> :SHARED
+   (seen more than once, not yet labelled) or its integer label N.  NIL
+   otherwise.")
+(defvar *%circ-next* 0)
+
+(defun %circ-labelable-p (x)
+  "Only what reaches %WRITE-OBJ-1's plain list / vector arms.  Symbols,
+   packages, readtables, restart cells and the array wrappers are tagged
+   CONSES here, and conditions / complexes / struct instances / MDAs are
+   array-shaped -- none of them may get a #n= label."
+  (cond
+    ((symbolp x) nil)
+    ((consp x)
+     (not (or (%pkg-p x) (readtablep x) (%restart-cell-p x)
+              (eql (car x) 8765432) (eql (car x) 9867654))))
+    ((arrayp x)
+     (not (or (stringp x) (%condition-p x) (%complex-p x)
+              (%struct-instance-p x))))
+    (t nil)))
+
+(defun %circ-scan (x tbl depth)
+  "Mark every cons / non-string array reachable from X that is reached more
+   than once :SHARED in TBL (first sighting records :SEEN).  CDR chains are
+   iterated, CARs recursed; DEPTH bounds the recursion."
+  (loop
+    (when (or (> depth 100000) (not (%circ-labelable-p x))) (return nil))
+    (let ((e (gethash x tbl)))
+      (cond
+        (e (unless (eq e :shared) (setf (gethash x tbl) :shared))
+           (return nil))
+        (t (setf (gethash x tbl) :seen))))
+    (cond
+      ((consp x)
+       (%circ-scan (car x) tbl (+ depth 1))
+       (setq x (cdr x)))
+      ((%mda-p x)
+       ;; A multidimensional (or fill-pointered) array: its ELEMENTS, not its
+       ;; storage vector.  Excluding MDAs let a 2D array containing itself
+       ;; recurse until the stack died (upstream PRINT.ARRAY.CIRCLE.1).
+       (let ((n (array-total-size x)) (i 0))
+         (loop (when (>= i n) (return nil))
+           (%circ-scan (row-major-aref x i) tbl (+ depth 1))
+           (setq i (+ i 1))))
+       (return nil))
+      (t
+       (let ((n (array-length x)) (i 0))
+         (loop (when (>= i n) (return nil))
+           (%circ-scan (aref x i) tbl (+ depth 1))
+           (setq i (+ i 1))))
+       (return nil)))))
+
 (defun %write-obj (obj stream level escape)
+  "*PRINT-CIRCLE* (CLHS 22.1.3) around %WRITE-OBJ-1.  It was only ever BOUND:
+   a circular list hung the printer forever (upstream PRINT.CONS.7 stalled
+   the whole ansi-test), and shared structure never printed as #n= / #n#.
+   The outermost call scans for objects reached twice; every object then
+   gets #n= on its first occurrence and #n# after."
+  (declare (special *print-circle*))
+  (let ((tbl *%circ-table*))
+    (cond
+      (tbl
+       (if (%circ-labelable-p obj)
+           (let ((e (gethash obj tbl)))
+             (cond
+               ((integerp e)
+                (%print-char 35 stream)
+                (%print-integer-in-base e 10 stream)
+                (%print-char 35 stream))
+               ((eq e :shared)
+                (let ((n (+ *%circ-next* 1)))
+                  (setq *%circ-next* n)
+                  (setf (gethash obj tbl) n)
+                  (%print-char 35 stream)
+                  (%print-integer-in-base n 10 stream)
+                  (%print-char 61 stream)
+                  (%write-obj-1 obj stream level escape)))
+               (t (%write-obj-1 obj stream level escape))))
+           (%write-obj-1 obj stream level escape)))
+      ((and (null level) *print-circle* (%circ-labelable-p obj))
+       (let ((scan (make-hash-table :test 'eq)))
+         (%circ-scan obj scan 0)
+         (let ((saved-next *%circ-next*))
+           (setq *%circ-next* 0)
+           (setq *%circ-table* scan)
+           (unwind-protect (%write-obj obj stream level escape)
+             (setq *%circ-table* nil)
+             (setq *%circ-next* saved-next)))))
+      (t (%write-obj-1 obj stream level escape)))))
+
+(defun %circ-tail-labelled-p (tail)
+  "T when TAIL, a cons in CDR position, must print as ' . #n...' because it is
+   shared under an active *PRINT-CIRCLE* print."
+  (let ((tbl *%circ-table*))
+    (and tbl (let ((e (gethash tail tbl))) (or (integerp e) (eq e :shared))))))
+
+(defun %write-obj-1 (obj stream level escape)
   ;; These *print-* vars are declared special so the let below reads them
   ;; via dynamic (symbol-value) lookup rather than lexical/global. Tests
   ;; that do (let ((*print-base* 2)) (prin1 N)) expect the printer to see
@@ -885,7 +981,7 @@
                   ;; *print-length*.  CLHS 22.1.3.5 counts cons-elements
                   ;; only; the final dotted atom is not subject to
                   ;; truncation.  (print-length.4 / .6)
-                  ((not (consp tail))
+                  ((or (not (consp tail)) (%circ-tail-labelled-p tail))
                    (%print-char 32 stream)  ; space
                    (%print-char 46 stream)  ; .
                    (%print-char 32 stream)  ; space
@@ -3595,6 +3691,114 @@
                                      (%print-char padc stream) (setq i (+ i 1)))))
                 (%print-string-raw core stream)))))))
 
+;;; ============================================================
+;;; ~E / ~G floating point (CLHS 22.3.3.2 / 22.3.3.3)
+;;; ============================================================
+
+(defun %fe-shortest (f)
+  "(digits . k): the shortest round-trip digits of non-zero float F, value
+   = 0.<digits> * 10^k (the digits the printer itself uses)."
+  (let* ((dec (%ieee-float-decode-bits f)))
+    (%dragon4-digits (cadr dec) (caddr dec) (if (single-float-p f) 24 53))))
+
+(defun %fe-zero-string (n)
+  (let ((s (make-string-output-stream)) (i 0))
+    (loop (when (>= i n) (return nil)) (%print-char 48 s) (setq i (+ i 1)))
+    (get-output-stream-string s)))
+
+(defun %format-exp-float (x w d e k ovf pad expch atp stream)
+  "~w,d,e,k,overflowchar,padchar,exptcharE.  A rational argument is printed
+   as a single float (CLHS)."
+  (let* ((fx (if (%ieee-float-p x) x (float x 1.0)))
+         (dec (%ieee-float-decode-bits fx))
+         (neg (< (car dec) 0))
+         (zero (eql (cadr dec) 0))
+         (rat (%fmt-real-to-rat fx))
+         (arat (if (< rat 0) (- 0 rat) rat))
+         (k (if k k 1))
+         (e10 0)
+         (ds ""))
+    (cond
+      (d
+       (let ((nsig (if (> k 0) (+ d 1) (+ d k))))
+         (when (< nsig 0) (setq nsig 0))
+         (if zero
+             (setq ds (%fe-zero-string nsig))
+             (progn
+               (setq e10 (- (cdr (%fe-shortest fx)) 1))
+               (loop (when (< arat (%pow10 (+ e10 1))) (return nil)) (setq e10 (+ e10 1)))
+               (loop (when (>= arat (%pow10 e10)) (return nil)) (setq e10 (- e10 1)))
+               (let ((scaled (round (* arat (%pow10 (- (- nsig 1) e10))))))
+                 (when (>= scaled (expt 10 nsig))
+                   (setq e10 (+ e10 1))
+                   (setq scaled (round (* arat (%pow10 (- (- nsig 1) e10))))))
+                 (let ((sd (make-string-output-stream)))
+                   (when (> nsig 0) (%print-zero-padded scaled nsig sd))
+                   (setq ds (get-output-stream-string sd))))))))
+      (zero (setq ds "0"))
+      (t
+       (let* ((dk (%fe-shortest fx))
+              (sd (make-string-output-stream)))
+         (setq e10 (- (cdr dk) 1))
+         (dolist (dg (car dk)) (%print-char (+ 48 dg) sd))
+         (setq ds (get-output-stream-string sd)))))
+    ;; Without D, keep K digits before the point and at least one after.
+    (when (and (null d) (> k 0) (<= (length ds) k))
+      (setq ds (concatenate 'string ds (%fe-zero-string (- (+ k 1) (length ds))))))
+    (let* ((expo (- (+ e10 1) k))
+           (mant (if (> k 0)
+                     (concatenate 'string (subseq ds 0 (min k (length ds))) "."
+                                  (if (> (length ds) k) (subseq ds k) ""))
+                     (concatenate 'string "0." (%fe-zero-string (- 0 k)) ds)))
+           (ed (let ((sx (make-string-output-stream)))
+                 (%print-decimal-to-stream (if (< expo 0) (- 0 expo) expo) sx)
+                 (get-output-stream-string sx)))
+           (ed (if (and e (< (length ed) e))
+                   (concatenate 'string (%fe-zero-string (- e (length ed))) ed)
+                   ed))
+           (mk (if expch
+                   (if (characterp expch) (char-code expch) expch)
+                   (let ((m (%float-print-marker fx))) (if m m 101))))
+           (sign (cond (neg "-") (atp "+") (t "")))
+           (padc (if pad (if (characterp pad) (char-code pad) pad) 32))
+           (ovc (if ovf (if (characterp ovf) (char-code ovf) ovf) nil))
+           (body (concatenate 'string sign mant (string (code-char mk))
+                              (if (< expo 0) "-" "+") ed)))
+      ;; Too wide: drop the leading 0 of "0.", as ~F does.
+      (when (and w (> (length body) w) (> (length mant) 1)
+                 (string= (subseq mant 0 2) "0."))
+        (setq body (concatenate 'string sign (subseq mant 1) (string (code-char mk))
+                                (if (< expo 0) "-" "+") ed)))
+      (if (and ovc (or (and w (> (length body) w))
+                       (and e (> (length ed) e))))
+          (let ((i 0)) (loop (when (>= i (if w w 0)) (return nil))
+                             (%print-char ovc stream) (setq i (+ i 1))))
+          (progn
+            (when (and w (< (length body) w))
+              (let ((i 0)) (loop (when (>= i (- w (length body))) (return nil))
+                                 (%print-char padc stream) (setq i (+ i 1)))))
+            (%print-string-raw body stream))))))
+
+(defun %format-general-float (x w d e k ovf pad expch atp stream)
+  "~w,d,e,k,overflowchar,padchar,exptcharG (CLHS 22.3.3.3): ~F with the
+   exponent's width in trailing spaces when the value suits it, else ~E."
+  (let* ((fx (if (%ieee-float-p x) x (float x 1.0)))
+         (dec (%ieee-float-decode-bits fx))
+         (zero (eql (cadr dec) 0))
+         (dk (if zero nil (%fe-shortest fx)))
+         (n (if zero 0 (cdr dk)))
+         (q (if zero 1 (length (car dk))))
+         (d (if d d (max q (min n 7))))
+         (ee (if e (+ e 2) 4))
+         (ww (if w (- w ee) nil))
+         (dd (- d n)))
+    (if (and (<= 0 dd) (<= dd d))
+        (progn
+          (%format-fixed-float fx ww dd nil ovf pad atp stream)
+          (let ((i 0)) (loop (when (>= i ee) (return nil))
+                             (%print-char 32 stream) (setq i (+ i 1)))))
+        (%format-exp-float x w d e k ovf pad expch atp stream))))
+
 (defun %string-find-char (str ch)
   "Index of first char CH (code) in STR, or NIL."
   (let ((n (length str)) (i 0))
@@ -3677,7 +3881,7 @@
             ;; Parse directive
             (let ((pos (+ i 1))
                   (param1 nil) (param2 nil) (param3 nil) (param4 nil)
-                  (param5 nil)
+                  (param5 nil) (param6 nil) (param7 nil)
                   (colonp nil) (atp nil))
               ;; Parse parameters (comma-separated integers or v/V/# placeholders)
               (let ((params nil) (pcount 0))
@@ -3733,7 +3937,9 @@
                 (setq param2 (if (>= pcount 2) (nth 1 params) nil))
                 (setq param3 (if (>= pcount 3) (nth 2 params) nil))
                 (setq param4 (if (>= pcount 4) (nth 3 params) nil))
-                (setq param5 (if (>= pcount 5) (nth 4 params) nil)))
+                (setq param5 (if (>= pcount 5) (nth 4 params) nil))
+                (setq param6 (if (>= pcount 6) (nth 5 params) nil))
+                (setq param7 (if (>= pcount 7) (nth 6 params) nil)))
               ;; Parse modifiers : and @
               (loop
                 (when (>= pos len) (return nil))
@@ -3847,6 +4053,23 @@
                          (%format-fixed-float n param1 param2 param3
                                               param4 param5 atp stream)
                          ;; Non-real arg: ~F prints it as if by ~A (CLHS 22.3.3.1).
+                         (let ((s (make-string-output-stream))
+                               (*print-escape* nil))
+                           (declare (special *print-escape*))
+                           (%write-obj n s nil nil)
+                           (%print-string-raw (get-output-stream-string s) stream)))))
+                  ;; ~E — exponential float, ~w,d,e,k,ovf,pad,exptcharE
+                  ;; (CLHS 22.3.3.2) and ~G — general float (22.3.3.3).  Both
+                  ;; were MISSING: (format nil "~e" 1.5) returned "~e".
+                  ((or (= dir 69) (= dir 101) (= dir 71) (= dir 103))
+                   (let ((n (car arg-list)))
+                     (setq arg-list (cdr arg-list))
+                     (if (or (integerp n) (ratiop n) (%ieee-float-p n))
+                         (if (or (= dir 69) (= dir 101))
+                             (%format-exp-float n param1 param2 param3 param4
+                                                param5 param6 param7 atp stream)
+                             (%format-general-float n param1 param2 param3 param4
+                                                    param5 param6 param7 atp stream))
                          (let ((s (make-string-output-stream))
                                (*print-escape* nil))
                            (declare (special *print-escape*))

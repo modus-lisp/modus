@@ -340,6 +340,15 @@
                      (list* 'macrolet
                             (list (list (car spec) nil (list 'list (list 'quote next))))
                             body)))))"
+    ;; PRINT-UNREADABLE-OBJECT (CLHS).  Like WITH-HASH-TABLE-ITERATOR it
+    ;; existed only in the ANSI gate's rewriter, so at runtime
+    ;; (print-unreadable-object (x s) ...) compiled as a CALL and the spec list
+    ;; (x s) as a call of X -- upstream PRINT-UNREADABLE-OBJECT.NIL.1 called
+    ;; the fixnum 1 and killed the printer chapter.
+    "(defmacro print-unreadable-object (spec &rest body)
+       (list '%print-unreadable-object (car spec) (cadr spec)
+             (getf (cddr spec) :type) (getf (cddr spec) :identity)
+             (if body (list 'function (cons 'lambda (cons nil body))) nil)))"
     "(defmacro ignore-errors (&rest body)
        (list 'handler-case (cons 'progn body) (list 'error (list 'c) (list 'values nil 'c))))"
     ;; NOT a PROGN: w-s-i-s must bind the whole printer/reader variable set

@@ -36,7 +36,27 @@
    under Linux that window is not mapped into our address space at all.")
 
 (defconstant +linux-riscv-heap-size+ #x38000000)   ; 896 MB
-(defconstant +linux-riscv-heap-alloc-start+ #x200)
+(defconstant +linux-riscv-heap-alloc-start+ #x2000
+  "Where the bump allocator starts, as an offset into the heap.
+
+   #x200 WAS WRONG AND IT COST A DAY.  That is exactly where this stub writes
+   ARGC, and it is inside the whole fixed block the shared runtime owns: metadata
+   #x40, globals #x80, MV #x90..#x138, intern tables #x148/#x170, nargs #x150,
+   the jmpbuf #x180..#x1FF, argc #x200, argv #x208/#x248, the handler stack
+   #x400..#xC0F, the convention slots #xA00, the per-CPU mode word #xFF8.  An
+   allocator starting at #x200 allocates ON TOP OF ALL OF IT.
+
+   I FLAGGED THIS WHEN WRITING THE RV32 PORT and left it, recording it as \"latent
+   only because no payload there reads argc yet\".  The real CL image reads all of
+   it, and the failure was nothing like argc: the GLOBALS TABLE got allocated at
+   #x10000280, the runtime then overwrote it, and an alist cursor came back holding
+   T — neither NIL (so the probe loop never exited) nor a cons (so its
+   consp-guarded advance was skipped), spinning forever without even faulting.
+   Found with gdb-multiarch over qemu's gdbstub: the cursor register held
+   #xDEAD1009 and the table pointer was #x10000281.
+
+   #x2000 matches what boot-linux-riscv32.lisp already does, and leaves
+   #x1000..#x2000 for the CLI's cstr/io scratch.")
 (defconstant +linux-riscv-gc-midpoint+ #x1C000000)
 (defconstant +linux-riscv-gc-guard+ #x1000000
   "16 MB past the second semispace, same as the other hosted ports: :gc-check

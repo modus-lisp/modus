@@ -550,6 +550,21 @@
 ;;; Scratch at 0x100003C0..0x100003F8 sits in the unused gap between the
 ;;; saved initial ESP (0x10000290) and the handler stack.
 
+(defun i386-set-handler-block ()
+  "Place the handler-case block for the current mode.  Hosted: the shared
+   contract addresses at the heap base (#x10000180 jmp_buf ... #x10000408
+   frames), unchanged.  Bare: the SAME low offsets from #x5C0000, free RAM on
+   the Multiboot board -- above the per-CPU block (#x5B0000), below the cons
+   space (8 MB), clear of the stack (down from 4 MB).  #x10000180 is past the
+   end of RAM on a `qemu-system-i386 -m 256' board."
+  (let ((base (if *i386-linux-mode* #x10000000 #x5C0000)))
+    (setf *i386-jmpbuf-addr*          (+ base #x180)
+          *i386-longjmp-scratch-addr* (+ base #x3C0)
+          *i386-hstack-capcount-addr* (+ base #x3F0)
+          *i386-hstack-overflow-addr* (+ base #x3F8)
+          *i386-hstack-depth-addr*    (+ base #x400)
+          *i386-hstack-base-addr*     (+ base #x408))))
+
 (defparameter *i386-jmpbuf-addr* #x10000180
   "Base of the six-word jmp_buf (ESP/EBP/IP/EBX/ESI/EDI).")
 (defconstant +i386-jmpbuf-words+ 6)
@@ -2784,13 +2799,9 @@
              ;; range.  The hazard would be a STALE saved ESP, which is why
              ;; __handler_pop zeroes the whole jmp_buf when the stack empties.
              ;;
-             ;; Bare metal keeps the unimplemented-trap reporter: these
-             ;; addresses are in the HOSTED Linux BSS (0x10000180 is past the
-             ;; end of RAM on a `qemu-system-i386 -m 256` board), and the
-             ;; bare-metal i386 images run mvm/repl-source.lisp, which has no
-             ;; handler-case.  Gating on *i386-linux-mode* also keeps those
-             ;; images byte-identical.
-             ((and (= code #x0510) *i386-linux-mode* *i386-handler-push-label*)
+             ;; Both modes: the block is placed per mode by
+             ;; i386-set-handler-block (bare: #x5C0000 + the same offsets).
+             ((and (= code #x0510) *i386-handler-push-label*)
               (let ((skiparm (i386-make-label))
                     (resume (i386-make-label)))
                 ;; Stack the OUTER frame first; EDX comes back 1 if capped.
@@ -2825,7 +2836,7 @@
                 (i386-emit-mov-reg-abs buf +i386-eax+ *vn-addr*)
                 ;; LONGJMP lands here with EAX already holding the T sentinel.
                 (i386-emit-label buf resume)))
-             ((and (= code #x0511) *i386-linux-mode* *i386-handler-pop-label*)
+             ((and (= code #x0511) *i386-handler-pop-label*)
               ;; LONGJMP.  Read OUR frame out to scratch BEFORE the pop
               ;; overwrites the jmp_buf, then restore and transfer.
               (let ((armed (i386-make-label))
@@ -2860,7 +2871,7 @@
                 ;; (:mov dest VR) takes the handler path.
                 (i386-emit-mov-reg-imm buf +i386-eax+ +i386-mvm-t+)
                 (i386-emit-jmp-reg buf +scratch1+)))
-             ((and (= code #x0512) *i386-linux-mode* *i386-handler-pop-label*)
+             ((and (= code #x0512) *i386-handler-pop-label*)
               ;; CLEAR-HANDLER: pop the outer frame back into the jmp_buf.
               ;; The dispatch's push/pop EAX bracket is what preserves the
               ;; handler-case body's result across this call (dest==VR==EAX);
@@ -4680,15 +4691,15 @@
     ;; that starts with the boot-side init.
     (setf *i386-gc-collect-label*
           (and *i386-gc-enabled* *i386-linux-mode* (i386-make-label)))
-    ;; handler-case helper entry points (TRAP #x0510/#x0511/#x0512).  Hosted
-    ;; Linux only: the jmp_buf and handler stack live in the hosted BSS, which
-    ;; a bare-metal i386 board does not have.  With these NIL the traps fall
-    ;; through to the unimplemented reporter exactly as before, so every
-    ;; bare-metal i386 image stays byte-identical.
-    (setf *i386-handler-push-label*
-          (and *i386-linux-mode* (i386-make-label)))
-    (setf *i386-handler-pop-label*
-          (and *i386-linux-mode* (i386-make-label)))
+    ;; handler-case helper entry points (TRAP #x0510/#x0511/#x0512) -- in
+    ;; BOTH modes now.  They used to be hosted-only, to keep the bare images
+    ;; (REPL/SSH, which have no handler-case) byte-identical; those images are
+    ;; being retired in favour of load scripts on generic images, and the gate
+    ;; left bare i386 as the one port where r19-handler hit an int3.  The block
+    ;; they use moves with the mode (i386-set-handler-block).
+    (i386-set-handler-block)
+    (setf *i386-handler-push-label* (i386-make-label))
+    (setf *i386-handler-pop-label* (i386-make-label))
     ;; Translate each function
     (loop for i from 0 below n-functions
           for entry in function-table

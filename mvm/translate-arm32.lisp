@@ -1528,21 +1528,28 @@
          (let ((vd (vreg 0))
                (amount (vreg 2)))
            (with-src (ps (vreg 1))
-             (arm32-lsl-imm buf +arm-r12+ ps (logand amount 31))
+             (if (>= amount 32)
+                 (arm32-mov-imm buf +arm-r12+ 0 0)   ; wide shift: the result is 0
+                 (arm32-lsl-imm buf +arm-r12+ ps amount))
              (arm32-store-vreg buf +arm-r12+ vd))))
 
         (#.+op-shr+
          (let ((vd (vreg 0))
                (amount (vreg 2)))
            (with-src (ps (vreg 1))
-             (arm32-lsr-imm buf +arm-r12+ ps (logand amount 31))
+             (if (>= amount 32)
+                 (arm32-mov-imm buf +arm-r12+ 0 0)   ; wide shift: the result is 0
+                 (arm32-lsr-imm buf +arm-r12+ ps amount))
              (arm32-store-vreg buf +arm-r12+ vd))))
 
         (#.+op-sar+
          (let ((vd (vreg 0))
                (amount (vreg 2)))
            (with-src (ps (vreg 1))
-             (arm32-asr-imm buf +arm-r12+ ps (logand amount 31))
+             ;; A shift of 32 or more is the sign fill, i.e. ASR #31.  The old
+             ;; (logand amount 31) turned `(ash x -32)' -- mvm-emit-u64's
+             ;; high-word extract -- into a shift by 0.
+             (arm32-asr-imm buf +arm-r12+ ps (min amount 31))
              (arm32-store-vreg buf +arm-r12+ vd))))
 
         (#.+op-shlv+

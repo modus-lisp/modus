@@ -1553,24 +1553,36 @@
          (rv-emit-xor buf +rv-t0+ ra rb)
          (store-result vd +rv-t0+)))
 
+      ;; An IMMEDIATE shift distance can reach or pass the register width -- the
+      ;; compiler inlines (ash x -32) as `:sar 32', which is how mvm-emit-u64
+      ;; extracts the high word.  The shamt field cannot hold it (RV-SHAMT masks
+      ;; 32 to 0 on RV32), so a wide shift must be spelled by its RESULT: SHL and
+      ;; SHR give 0, SAR gives the sign fill, i.e. a shift by width-1.  Before
+      ;; this, `(ash v -32)' on RV32 returned V itself, and every 64-bit MVM
+      ;; immediate the in-image compiler wrote (char literals, quote-pool
+      ;; indices) had its low word duplicated into the high word.
       (#.+op-shl+
        (let* ((vd (vreg 0))
               (rs (resolve (vreg 1)))
               (amt (vreg 2)))
-         (rv-emit-slli buf +rv-t0+ rs amt)
-         (store-result vd +rv-t0+)))
+         (if (>= amt (* 8 (rv-word-size)))
+             (store-result vd +rv-x0+)
+             (progn (rv-emit-slli buf +rv-t0+ rs amt)
+                    (store-result vd +rv-t0+)))))
 
       (#.+op-shr+
        (let* ((vd (vreg 0))
               (rs (resolve (vreg 1)))
               (amt (vreg 2)))
-         (rv-emit-srli buf +rv-t0+ rs amt)
-         (store-result vd +rv-t0+)))
+         (if (>= amt (* 8 (rv-word-size)))
+             (store-result vd +rv-x0+)
+             (progn (rv-emit-srli buf +rv-t0+ rs amt)
+                    (store-result vd +rv-t0+)))))
 
       (#.+op-sar+
        (let* ((vd (vreg 0))
               (rs (resolve (vreg 1)))
-              (amt (vreg 2)))
+              (amt (min (vreg 2) (1- (* 8 (rv-word-size))))))
          (rv-emit-srai buf +rv-t0+ rs amt)
          (store-result vd +rv-t0+)))
 
@@ -1805,8 +1817,15 @@
          (rv-emit-store-word buf +rv-t0+ +rv-s8+ 0)
          ;; Tag pointer: (rv-object-tag) -- 9 on RV64, 2 on RV32
          (rv-emit-addi buf +rv-t0+ +rv-s8+ (rv-object-tag))
-         ;; Bump alloc pointer
-         (rv-emit-addi buf +rv-s8+ +rv-s8+ total-bytes)
+         ;; Bump alloc pointer.  ADDI's immediate is 12 bits SIGNED, and the
+         ;; compiler inlines constant sizes up to 65535 slots: a 4096-char
+         ;; stream buffer is 16400 bytes, which ADDI silently wrapped to 16 --
+         ;; so the stream's own conses were allocated INSIDE its buffer, and
+         ;; every refill's byte count landed on character 7.
+         (if (<= total-bytes 2047)
+             (rv-emit-addi buf +rv-s8+ +rv-s8+ total-bytes)
+             (progn (rv-emit-li buf +rv-t1+ total-bytes)
+                    (rv-emit-add buf +rv-s8+ +rv-s8+ +rv-t1+)))
          (store-result vd +rv-t0+)))
 
       (#.+op-obj-ref+

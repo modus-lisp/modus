@@ -1754,7 +1754,12 @@
              (amt (third operands)))
          (let ((ps (vreg-or-scratch vs +ppc-scratch1+)))
            (let ((pd (or (ppc-vreg-phys vd) +ppc-scratch1+)))
-             (ppc-emit-shift-right-arith-imm buf pd ps amt)
+             ;; Clamp to width-1: srawi's SH field is 5 bits, so `(ash x -32)'
+             ;; would otherwise wrap to a shift by 0.  A wider shift IS the sign
+             ;; fill.  (SHL/SHR above go through a register count, and slw/srw
+             ;; already give 0 for counts 32..63.)
+             (ppc-emit-shift-right-arith-imm buf pd ps
+                                             (min amt (if *ppc-64-bit* 63 31)))
              (unless (ppc-vreg-phys vd)
                (ppc-store-vreg buf vd pd))))))
 
@@ -2033,7 +2038,13 @@
              (ppc-emit-addi buf +ppc-r0+ 0 (logior (ash subtag 8) +tag-object+))
              (ppc-emit-store-word buf +ppc-r0+ +ppc-r19+ 0)
              (ppc-emit-ori buf pd +ppc-r19+ +tag-object+)
-             (ppc-emit-addi buf +ppc-r19+ +ppc-r19+ total-bytes)
+             ;; ADDI's immediate is 16 bits SIGNED; the compiler inlines constant
+             ;; sizes up to 65535 slots, so a large object's bump wrapped and the
+             ;; next allocations landed inside it (the RV32 stream-buffer bug).
+             (if (<= total-bytes 32767)
+                 (ppc-emit-addi buf +ppc-r19+ +ppc-r19+ total-bytes)
+                 (progn (ppc-emit-li buf +ppc-scratch2+ total-bytes)
+                        (ppc-emit-add buf +ppc-r19+ +ppc-r19+ +ppc-scratch2+)))
              (unless (ppc-vreg-phys vd)
                (ppc-store-vreg buf vd pd))))))
 

@@ -45,10 +45,20 @@
    at #x40800390.  #x10000000 plus this heap tops out at #x18400000, well
    inside it; a heap at #x40000000 would be unaddressable by construction.")
 
-(defconstant +linux-riscv32-heap-size+ #x8000000
-  "128 MB: two 64 MB semispaces.  Generous for an embedded target and modest
-   for QEMU.  A real microcontroller gets its own, much smaller, numbers; the
+(defconstant +linux-riscv32-heap-size+ #xF800000
+  "248 MB, ending (with the guard) at #x1FC00000 -- just under #x20000000, the
+   first address a 30-bit tagged fixnum cannot carry to a MEM-REF.  Sized for
+   the REAL CL image, which allocates well over 64 MB just reading its embedded
+   sources.  A real microcontroller gets its own, much smaller, numbers; the
    point of naming them is that shrinking is a constant edit, not a port.")
+
+(defconstant +linux-riscv32-alloc-limit+ #xF800000
+  "Where VL sits, as an offset into the heap: the WHOLE heap, not the midpoint.
+   There is no hosted RISC-V collector yet, so the second semispace is memory
+   no one can ever use -- the CL image exhausted the first 64 MB during boot
+   (EBREAK a7=#xF0 with VA=#x14000040, VL=#x14000000) while 64 MB above it sat
+   idle.  When a collector lands, VL goes back to +LINUX-RISCV32-GC-MIDPOINT+
+   and the metadata block below already describes those two spaces.")
 ;;; ---- Staged argv/envp, below the allocator ----------------------------
 ;;; qemu-riscv32 puts the initial stack near #x40800000.  A MEM-REF address is a
 ;;; TAGGED fixnum, and on a 32-bit word that stops at 2^29 - 1, so the Lisp side
@@ -66,7 +76,7 @@
    and the staged argv (#x9000-#x1DFFF) -- everything below it is owned by
    something other than the allocator.  (It was #x2000, which was right until
    the CLI needed a staged argv.)")
-(defconstant +linux-riscv32-gc-midpoint+ #x4000000)   ; 64 MB
+(defconstant +linux-riscv32-gc-midpoint+ #x7C00000)   ; half the heap
 (defconstant +linux-riscv32-gc-guard+ #x400000
   "4 MB past the second semispace.  :gc-check tests the alloc pointer against
    the limit WITHOUT knowing the size of the allocation that follows, so a large
@@ -202,7 +212,7 @@
     ;; --- MVM allocation registers: s8 = alloc pointer, s9 = limit, s10 = NIL
     (rv-emit-li buf +rv-t0+ +linux-riscv32-heap-alloc-start+)
     (rv-emit-add buf +rv-s8+ +rv-s4+ +rv-t0+)
-    (rv-emit-li buf +rv-t0+ +linux-riscv32-gc-midpoint+)
+    (rv-emit-li buf +rv-t0+ +linux-riscv32-alloc-limit+)
     (rv-emit-add buf +rv-s9+ +rv-s4+ +rv-t0+)
     ;; VN = NIL = +NIL-VALUE+, not zero — see boot-linux-riscv.lisp.
     (rv-emit-li buf +rv-s10+ +nil-value+)
@@ -210,7 +220,9 @@
     ;;     addresses, matching what the collector expects.
     (rv-emit-li buf +rv-t1+ (+ +linux-riscv32-heap-addr+ #x40))
     (rv-emit-store-word buf +rv-s8+ +rv-t1+ 0)   ; [+0x00] from_start
-    (rv-emit-store-word buf +rv-s9+ +rv-t1+ 4)   ; [+0x04] to_start
+    (rv-emit-li buf +rv-t0+ +linux-riscv32-gc-midpoint+)  ; NOT VL: VL is the
+    (rv-emit-add buf +rv-t0+ +rv-s4+ +rv-t0+)             ; whole heap until a
+    (rv-emit-store-word buf +rv-t0+ +rv-t1+ 4)   ; [+0x04] to_start  (collector lands)
     (rv-emit-li buf +rv-t0+ (- +linux-riscv32-gc-midpoint+
                                +linux-riscv32-heap-alloc-start+))
     (rv-emit-store-word buf +rv-t0+ +rv-t1+ 8)   ; [+0x08] space_size

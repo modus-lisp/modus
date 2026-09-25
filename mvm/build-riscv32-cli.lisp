@@ -56,7 +56,10 @@
 ")
 
 (defvar *cli-arch-kernel-epilogue*
-"  ;; --- entry: the SHARED SBCL-faithful CLI toplevel ------------------------
+"  ;; MODUS_MVM_TRACE=1: trace the MVM interpreter for the --eval/--load forms
+  ;; only (boot's embedded sources have already run by now).
+  (when (%cli-getenv \"MODUS_MVM_TRACE\") (setq *mvm-trace* t))
+  ;; --- entry: the SHARED SBCL-faithful CLI toplevel ------------------------
   (handler-case (cli-toplevel) (t (c) (sys-exit 1))))
 ")
 

@@ -982,8 +982,14 @@
                   (setq *mvm-last-mv* nil))
               (return (svref regs +vreg-vr+)))))    ; value directly (boundary-safe)
       (when *mvm-trace*
-        (format t "  TRACE pc=~D op=~D flags=~S vr=~S~%"
-                pc (aref bc pc) (mvm-flags state) (reg-get regs +vreg-vr+)))
+        ;; pc, opcode, flags, then V0..V7 as MACHINE WORDS (hex) -- the words
+        ;; are what the word-level ops see, and a value<->word round trip that
+        ;; goes wrong (the 30-bit tower's failure mode) shows up here directly.
+        (format t "  TRACE pc=~D op=~D flags=~S vr=~X regs=~{~X~^ ~}~%"
+                pc (aref bc pc) (mvm-flags state) (reg-get regs +vreg-vr+)
+                (list (reg-get regs 0) (reg-get regs 1) (reg-get regs 2)
+                      (reg-get regs 3) (reg-get regs 4) (reg-get regs 5)
+                      (reg-get regs 6) (reg-get regs 7))))
       (let ((opcode (aref bc pc))
             ;; %lj — set non-NIL by the condition handler below when a host
             ;; condition signalled DURING this opcode (a bridged `error`/`throw`

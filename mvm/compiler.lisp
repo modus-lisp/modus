@@ -12302,7 +12302,8 @@
   end-form        ; end value (for :from)
   end-test        ; :to, :below, :above, :downto (for :from)
   by-form         ; step amount (for :from)
-  list-var)       ; internal temp var (for :in, :on, :across, :hash-*, :pkg-*)
+  list-var        ; internal temp var (for :in, :on, :across, :hash-*, :pkg-*)
+  and-p)          ; introduced by AND: steps in PARALLEL with its group
 
 (defun %loop-try-of-type (rest)
   "If REST starts with OF-TYPE typespec, return (typespec . new-rest).
@@ -12581,6 +12582,26 @@
       (%loop-it-anaphor else-stmts)
       'it))
 
+(defun %loop-it-subst (rest itg)
+  "CLHS 6.1.6: IT names the test value only as the FORM of the FIRST clause
+   of a WHEN/IF/UNLESS branch (COLLECT IT, RETURN IT, ...).  Replace exactly
+   that token with ITG, the gensym holding the test value; every other IT --
+   including one in a later AND clause -- is the user's own variable."
+  (if (and (consp rest) (consp (cdr rest))
+           (symbolp (car rest)) (symbolp (cadr rest)) (cadr rest)
+           (%mll-name-eq (cadr rest) "IT")
+           (let ((k (car rest)))
+             (or (%mll-name-eq k "COLLECT") (%mll-name-eq k "COLLECTING")
+                 (%mll-name-eq k "APPEND") (%mll-name-eq k "APPENDING")
+                 (%mll-name-eq k "NCONC") (%mll-name-eq k "NCONCING")
+                 (%mll-name-eq k "SUM") (%mll-name-eq k "SUMMING")
+                 (%mll-name-eq k "COUNT") (%mll-name-eq k "COUNTING")
+                 (%mll-name-eq k "MAXIMIZE") (%mll-name-eq k "MAXIMIZING")
+                 (%mll-name-eq k "MINIMIZE") (%mll-name-eq k "MINIMIZING")
+                 (%mll-name-eq k "RETURN"))))
+      (list* (car rest) itg (cddr rest))
+      rest))
+
 (defun %loop-parse-cond-clauses (rest state)
   "Parse a sequence of conditional accumulator/action clauses inside a
    WHEN/IF/UNLESS branch.  Stops at AND/ELSE/END or any non-clause
@@ -12717,6 +12738,36 @@
   (and (consp x) (symbolp (car x)) (null (cdr x))
        (string= (symbol-name (car x)) "%LOOP-ACC-SLOT")))
 
+(defun %loop-type-default (ts)
+  "CLHS 6.1.2.2 default for an uninitialised typed WITH variable: 0 for
+   the integer types, 0.0 for the float types, NIL otherwise.  Compared BY
+   NAME (%MLL-NAME-EQ): the type symbol is the user's, not this file's."
+  (cond
+    ((not (and ts (symbolp ts))) nil)
+    ((or (%mll-name-eq ts "FIXNUM") (%mll-name-eq ts "INTEGER")
+         (%mll-name-eq ts "UNSIGNED-BYTE") (%mll-name-eq ts "SIGNED-BYTE")
+         (%mll-name-eq ts "BIT") (%mll-name-eq ts "NUMBER")
+         (%mll-name-eq ts "REAL") (%mll-name-eq ts "RATIONAL"))
+     0)
+    ((or (%mll-name-eq ts "FLOAT") (%mll-name-eq ts "SHORT-FLOAT")
+         (%mll-name-eq ts "SINGLE-FLOAT") (%mll-name-eq ts "DOUBLE-FLOAT")
+         (%mll-name-eq ts "LONG-FLOAT"))
+     0.0)
+    ((%mll-name-eq ts "STRING") "")
+    (t nil)))
+
+(defun %loop-destr-type-defaults (pat ts)
+  "Walk destructuring PATTERN and its parallel TYPE-SPEC tree together; a
+   list of (var default) for every non-NIL variable.  A symbol TS applies
+   to the whole subtree (`of-type fixnum' for every component)."
+  (cond
+    ((null pat) nil)
+    ((symbolp pat) (list (list pat (%loop-type-default ts))))
+    ((consp pat)
+     (append (%loop-destr-type-defaults (car pat) (if (consp ts) (car ts) ts))
+             (%loop-destr-type-defaults (cdr pat) (if (consp ts) (cdr ts) ts))))
+    (t nil)))
+
 (defun parse-cl-loop (body)
   "Parse loop clauses into a loop-state struct."
   (let ((state (make-loop-state))
@@ -12728,7 +12779,10 @@
       (setf (loop-state-block-name state) (cadr rest))
       (setf rest (cddr rest)))
     (loop while rest do
-      (let ((%acc-n0 (%loop-real-acc-count state)))
+      (let ((%acc-n0 (%loop-real-acc-count state))
+            (%it-n0 (length (loop-state-iterations state)))
+            (%and-tok (and (symbolp (car rest))
+                           (= (normalize-name (car rest)) 460426964))))  ; AND
         (let ((kw (normalize-name (car rest))))
         (cond
           ;; END as a top-level token: defensive no-op (most ENDs are
@@ -12772,12 +12826,20 @@
                    ;; symbol gets bound to the NTHCDR of value-form, not NTH.
                    ((and rest (symbolp (car rest))
                          (= (normalize-name (car rest)) 190453506))  ; =
-                    (let ((value-form (cadr rest))
-                          (g (%mvm-gensym "DSTR")))
+                    (let* ((value-form (cadr rest))
+                           (step-form value-form)
+                           (g (%mvm-gensym "DSTR")))
                       (setf rest (cddr rest))
+                      ;; = init THEN step: the pattern is re-destructured from
+                      ;; STEP on later iterations.  (THEN was never parsed here,
+                      ;; so it and its form were left as stray clause tokens.)
+                      (when (and rest (symbolp (car rest))
+                                 (= (normalize-name (car rest)) 325947496))  ; THEN
+                        (setf step-form (cadr rest))
+                        (setf rest (cddr rest)))
                       (push (make-loop-iter :kind :general :var g
                                             :init-form value-form
-                                            :step-form value-form)
+                                            :step-form step-form)
                             (loop-state-iterations state))
                       (let ((idx 0)
                             (cur components))
@@ -13193,6 +13255,10 @@
           ((= kw 70927509)  ; WITH
            (setf rest (cdr rest))   ; consume WITH
            (let ((group nil)
+                 ;; Destructuring component bindings.  They read the
+                 ;; pattern's gensym, so they bind AFTER the (possibly
+                 ;; parallel, AND-chained) group, never inside it.
+                 (post nil)
                  (and-seen nil))
              (block with-parse
                (loop
@@ -13227,37 +13293,26 @@
                      (setf rest (cdr rest)))
                    ;; No init?  Default per CLHS typed-init: FIXNUM/INT→0,
                    ;; FLOAT-family→0.0, STRING→"", T/etc→NIL.
-                   (when (and (not init-given) type-spec)
-                     (setf init
-                           (cond
-                             ((not (symbolp type-spec)) nil)
-                             ((or (eq type-spec 'fixnum)
-                                  (eq type-spec 'integer)
-                                  (eq type-spec 'unsigned-byte)
-                                  (eq type-spec 'signed-byte)
-                                  (eq type-spec 'bit)
-                                  (eq type-spec 'number))
-                              0)
-                             ((or (eq type-spec 'float)
-                                  (eq type-spec 'short-float)
-                                  (eq type-spec 'single-float)
-                                  (eq type-spec 'double-float)
-                                  (eq type-spec 'long-float))
-                              0.0)
-                             ((eq type-spec 'string) "")
-                             (t nil))))
+                   (when (and (not init-given) type-spec (not (consp var)))
+                     (setf init (%loop-type-default type-spec)))
                    ;; Destructuring WITH: var is a cons pattern.  Expand
                    ;; into a gensym holding the init, then one binding per
                    ;; pattern component using car/cdr/nthcdr accessors.
                    ;; (loop8 21523/21525/21526/21527 etc.)
                    (cond
+                     ((and (consp var) (not init-given))
+                      ;; No init: each component gets the default for ITS
+                      ;; part of a destructured type-spec, e.g.
+                      ;; (a b c) of-type (fixnum float t) => 0 0.0 NIL.
+                      (dolist (b (%loop-destr-type-defaults var type-spec))
+                        (push b group)))
                      ((consp var)
                       (let* ((g (%mvm-gensym "DSTRW"))
                              (pairs (%loop-destr-pairs var g)))
                         (push (list g init) group)
                         (dolist (pair pairs)
                           (when (car pair)   ; skip NIL pattern slots
-                            (push (list (car pair) (cdr pair)) group)))))
+                            (push (list (car pair) (cdr pair)) post)))))
                      (t
                       (push (list var init) group)))
                    (unless (and rest (symbolp (car rest))
@@ -13279,7 +13334,9 @@
                  ((null (cdr g))
                   (push (car g) (loop-state-with-bindings state)))
                  ;; AND-chained, multiple bindings — parallel via LET.
-                 (t (push (cons :and-group g) (loop-state-with-bindings state)))))))
+                 (t (push (cons :and-group g) (loop-state-with-bindings state)))))
+             (dolist (b (nreverse post))
+               (push b (loop-state-with-bindings state)))))
 
           ;; DO body...
           ((or (= kw 28653020) (= kw 414780396))  ; DO DOING
@@ -13409,8 +13466,9 @@
           ;; Binds IT to the test value so clause bodies (e.g. COLLECT IT)
           ;; can reference the cond result per CLHS 6.1.8.1.
           ((or (= kw 226908395) (= kw 463569520))  ; WHEN IF
-           (let ((cond-form (cadr rest)))
-             (setf rest (cddr rest))
+           (let ((cond-form (cadr rest))
+                 (itg (%mvm-gensym "IT")))
+             (setf rest (%loop-it-subst (cddr rest) itg))
              ;; Parse THEN-branch: a chain of AND-separated accumulator clauses.
              (let* ((then-result (%loop-parse-cond-clauses rest state))
                     (then-stmts (car then-result)))
@@ -13419,7 +13477,7 @@
                (let ((else-stmts nil))
                  (when (and rest (symbolp (car rest))
                             (= (normalize-name (car rest)) 483141224))  ; ELSE
-                   (setf rest (cdr rest))
+                   (setf rest (%loop-it-subst (cdr rest) itg))
                    (let ((else-result (%loop-parse-cond-clauses rest state)))
                      (setf else-stmts (car else-result))
                      (setf rest (cdr else-result))))
@@ -13430,7 +13488,7 @@
                  ;; Build the conditional body form and push it.  Bind IT
                  ;; for clause bodies that reference it — the IT they
                  ;; actually wrote (see %LOOP-IT-VAR), not this file's.
-                 (let ((itv (%loop-it-var then-stmts else-stmts)))
+                 (let ((itv itg))
                    (cond
                      ((null then-stmts)
                       ;; Defensive: WHEN/IF with no recognised clause.  Treat
@@ -13490,22 +13548,23 @@
           ;; IT is bound to the test value (per CLHS) so clause bodies can
           ;; reference it.
           ((= kw 64017389)  ; UNLESS
-           (let ((cond-form (cadr rest)))
-             (setf rest (cddr rest))
+           (let ((cond-form (cadr rest))
+                 (itg (%mvm-gensym "IT")))
+             (setf rest (%loop-it-subst (cddr rest) itg))
              (let* ((then-result (%loop-parse-cond-clauses rest state))
                     (then-stmts (car then-result)))
                (setf rest (cdr then-result))
                (let ((else-stmts nil))
                  (when (and rest (symbolp (car rest))
                             (= (normalize-name (car rest)) 483141224))  ; ELSE
-                   (setf rest (cdr rest))
+                   (setf rest (%loop-it-subst (cdr rest) itg))
                    (let ((else-result (%loop-parse-cond-clauses rest state)))
                      (setf else-stmts (car else-result))
                      (setf rest (cdr else-result))))
                  (when (and rest (symbolp (car rest))
                             (= (normalize-name (car rest)) 75674864))  ; END
                    (setf rest (cdr rest)))
-                 (let ((itv (%loop-it-var then-stmts else-stmts)))
+                 (let ((itv itg))
                    (cond
                      ((null then-stmts)
                       (when rest
@@ -13540,7 +13599,14 @@
         ;; each accumulator's code in there, so `collect x do (loop-finish)'
         ;; collects before it finishes (CLHS 6.1.1.4 -- clauses run in order).
         (dotimes (%k (- (%loop-real-acc-count state) %acc-n0))
-          (push (list '%loop-acc-slot) (loop-state-body-forms state)))))
+          (push (list '%loop-acc-slot) (loop-state-body-forms state)))
+        ;; FOR ... AND ...: mark the iteration(s) this clause added, so the
+        ;; generator steps them in parallel with the group (CLHS 6.1.2.1).
+        (when %and-tok
+          (let ((its (loop-state-iterations state)))
+            (dotimes (%k (- (length its) %it-n0))
+              (setf (loop-iter-and-p (car its)) t)
+              (setq its (cdr its)))))))
 
     ;; Reverse accumulated lists
     (setf (loop-state-iterations state) (nreverse (loop-state-iterations state)))
@@ -13758,8 +13824,11 @@
             (when (%loop-acc-list-kind-p (car acc))
               (push (list (%loop-tail-var av) nil) bindings))))))
 
-    ;; Process iterations
+    ;; Process iterations.  GRP-START is the STEP-STMTS length at the head of
+    ;; the current AND group, where an AND-linked THEN form is evaluated.
+    (let ((grp-start 0))
     (dolist (iter iters)
+      (unless (loop-iter-and-p iter) (setq grp-start (length step-stmts)))
       (ecase (loop-iter-kind iter)
         (:from
          (let ((var (loop-iter-var iter))
@@ -13809,7 +13878,8 @@
          (let ((var (loop-iter-var iter))
                (by-fn (loop-iter-by-form iter)))
            (push (list var (loop-iter-init-form iter)) bindings)
-           (push `(if (null ,var) (return-from :%loop-exit nil)) test-forms)
+           ;; ATOM, not NULL: FOR ON stops at a dotted tail (CLHS 6.1.2.1.3).
+           (push `(if (atom ,var) (return-from :%loop-exit nil)) test-forms)
            (if by-fn
                (push `(setq ,var (funcall ,by-fn ,var)) step-stmts)
                (push `(setq ,var (cdr ,var)) step-stmts))))
@@ -13877,7 +13947,20 @@
                             (progn (setq ,var ,(loop-iter-init-form iter))
                                    (setq ,firstv nil)))
                        init-stmts)
-                 (push `(setq ,var ,(loop-iter-step-form iter)) step-stmts)))))
+                 (if (loop-iter-and-p iter)
+                     ;; FOR ... AND v = i THEN s: S sees the group's OLD
+                     ;; values, so evaluate it into a temp BEFORE the group's
+                     ;; first step (STEP-STMTS is reversed: that is position
+                     ;; LEN - GRP-START from the front), assign after.
+                     (let* ((tmp (%mvm-gensym "ANDSTEP"))
+                            (n (- (length step-stmts) grp-start)))
+                       (push (list tmp nil) bindings)
+                       (setq step-stmts
+                             (append (subseq step-stmts 0 n)
+                                     (list `(setq ,tmp ,(loop-iter-step-form iter)))
+                                     (nthcdr n step-stmts)))
+                       (push `(setq ,var ,tmp) step-stmts))
+                     (push `(setq ,var ,(loop-iter-step-form iter)) step-stmts))))))
 
         (:while
          (push `(if (null ,(loop-iter-init-form iter)) (return-from :%loop-exit nil)) test-forms))
@@ -13964,7 +14047,7 @@
            (push (list var nil) bindings)
            (push `(if (null ,lst) (return-from :%loop-exit nil)) test-forms)
            (push `(setq ,var (car ,lst)) init-stmts)
-           (push `(setq ,lst (cdr ,lst)) step-stmts)))))
+           (push `(setq ,lst (cdr ,lst)) step-stmts))))))
 
     ;; Build accumulation body — one chunk per accumulator.
     (let ((acc-body nil)

@@ -124,16 +124,65 @@
 ;; |value| >= 2^61, which made (logior 0 most-positive-fixnum) => -1 under
 ;; mvm-interpret while native was right.  Anything else (a pointer word) keeps
 ;; the word-level path.
+;;; ------------------------------------------------------------
+;;; EXACT WORDS.  The registers hold Lisp VALUES; an op on the machine WORD has
+;;; to get from one to the other.  %val->word / %word->val (REG-GET / REG-SET)
+;;; do that with one native shift, so they only work while the word itself
+;;; fits a Lisp fixnum -- and it does not: a machine word is TWO bits wider
+;;; than a fixnum value.  On the 30-bit tower every fixnum with |v| >= 2^29 has
+;;; a word past 2^30, and REG-GET of it wrapped.  Measured: `(ash 16388 16)`
+;;; in eval'd code printed a heap address on i386 and RV32, and so did every
+;;; tag test (TEST v <word 1>) on such a value.
+;;;
+;;; So: a fixnum's word is computed EXACTLY as (* 2 v) -- generic arithmetic,
+;;; a bignum if need be; a word is WRAPPED to the machine width the way the
+;;; hardware wraps it; and it is stored back EXACTLY: an even word is the
+;;; fixnum w/2, an odd one is built with the native raw add (below).
+;;; Every machine word has an exact form here, including the ones a Lisp
+;;; fixnum cannot hold (an odd word >= 2^30 on the 30-bit tower, e.g. a bignum
+;;; pointer OR'd with a mask in a tag test): the NATIVE raw add builds and
+;;; takes apart any bit pattern.  RAW1 is the register object whose bits are 1.
+(defun %mvm-word (v)
+  "The machine word of register VALUE V, as an exact integer."
+  (if (typep v 'fixnum)
+      (* v 2)
+      ;; V's bits are odd (every non-fixnum is): bits - 1 is an even word, i.e.
+      ;; the fixnum (bits-1)/2, which the raw subtract hands back as one.
+      (+ 1 (* 2 (%fixnum-- v (%word->val 1))))))
+
+(defun %mvm-wrap-word (w)
+  "W wrapped to a signed machine word: +fixnum-bits+ + 2 bits (32 / 64)."
+  (let* ((m (ash 1 (+ +fixnum-bits+ 2)))
+         (r (mod w m)))
+    (if (>= r (ash m -1)) (- r m) r)))
+
+(defun %mvm-word->val (w)
+  "The register object whose machine word is W (exact, machine-width)."
+  (if (evenp w)
+      (ash w -1)
+      ;; fixnum (w-1)/2 has bits w-1; the raw add of RAW1 makes them w.
+      (%fixnum-+ (ash (- w 1) -1) (%word->val 1))))
+
+(defun %mvm-put-word (regs vd w)
+  "Store machine word W (an exact integer, already machine-width) into VD."
+  (setf (svref regs vd) (%mvm-word->val w)))
+
+(defun %mvm-untag-value (v)
+  "untag(word(V)) -- the fixnum V itself when it is one, without a round trip."
+  (if (typep v 'fixnum) v (ash (%mvm-word v) -1)))
+
 (defun %mvm-bitop-words (op a b)
   (if (and (typep a 'fixnum) (typep b 'fixnum))
       (cond ((eql op 0) (logand a b))
             ((eql op 1) (logior a b))
             (t (logxor a b)))
-      (%word->val
-       (let ((wa (%val->word a)) (wb (%val->word b)))
-         (cond ((eql op 0) (logand wa wb))
-               ((eql op 1) (logior wa wb))
-               (t (logxor wa wb)))))))
+      ;; Mixed (a fixnum against a mask/pointer word): exact words, and the
+      ;; result stored by parity -- %val->word of a large fixnum wrapped.
+      (let* ((wa (%mvm-word a)) (wb (%mvm-word b))
+             (w (cond ((eql op 0) (logand wa wb))
+                      ((eql op 1) (logior wa wb))
+                      (t (logxor wa wb)))))
+        (%mvm-word->val w))))
 
 (declaim (inline %mvm-wrap-tagword-add %mvm-wrap-tagword-sub))
 (defun %mvm-wrap-tagword-add (a b) (%fixnum-+ a b))
@@ -1340,9 +1389,15 @@
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (va npc2) (fetch-reg bc npc)
                (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
-                 (reg-set regs vd
-                       (tag-fixnum (* (untag-fixnum (reg-get regs va))
-                                      (untag-fixnum (reg-get regs vb)))))
+                 (let ((a (svref regs va)) (b (svref regs vb)))
+                   (if (and (typep a 'fixnum) (typep b 'fixnum))
+                       ;; the native raw multiply: wraps at the machine word,
+                       ;; which is what :mul means (the exact product through
+                       ;; REG-SET overflowed on the 30-bit tower)
+                       (setf (svref regs vd) (%fixnum-* a b))
+                       (%mvm-put-word regs vd
+                                      (%mvm-wrap-word
+                                       (* 2 (%mvm-untag-value a) (%mvm-untag-value b))))))
                  (setf pc npc3)))))
 
           (#.+op-mul-checked+
@@ -1359,8 +1414,8 @@
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (va npc2) (fetch-reg bc npc)
                (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
-                 (let ((product (* (untag-fixnum (reg-get regs va))
-                                   (untag-fixnum (reg-get regs vb)))))
+                 (let ((product (* (%mvm-untag-value (svref regs va))
+                                   (%mvm-untag-value (svref regs vb)))))
                    (reg-set regs vd (tag-fixnum (logand product #x3FFFFFF))))
                  (setf pc npc3)))))
 
@@ -1369,8 +1424,8 @@
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (va npc2) (fetch-reg bc npc)
                (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
-                 (let ((product (* (untag-fixnum (reg-get regs va))
-                                   (untag-fixnum (reg-get regs vb)))))
+                 (let ((product (* (%mvm-untag-value (svref regs va))
+                                   (%mvm-untag-value (svref regs vb)))))
                    (reg-set regs vd (tag-fixnum (ash product -26))))
                  (setf pc npc3)))))
 
@@ -1460,13 +1515,21 @@
                      (reg-set regs vd (- (reg-get regs vs)))))
                (setf pc npc2))))
 
-          (#.+op-inc+ ; tagged +1 = raw +2
+          (#.+op-inc+ ; tagged +1 = raw +2 -- on the VALUE, wrapping like the word
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
-             (incf (reg-get regs vd) 2) (setf pc npc)))
+             (let ((a (svref regs vd)))
+               (if (typep a 'fixnum)
+                   (setf (svref regs vd) (%fixnum-+ a 1))
+                   (%mvm-put-word regs vd (%mvm-wrap-word (+ (%mvm-word a) 2)))))
+             (setf pc npc)))
 
           (#.+op-dec+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
-             (decf (reg-get regs vd) 2) (setf pc npc)))
+             (let ((a (svref regs vd)))
+               (if (typep a 'fixnum)
+                   (setf (svref regs vd) (%fixnum-- a 1))
+                   (%mvm-put-word regs vd (%mvm-wrap-word (- (%mvm-word a) 2)))))
+             (setf pc npc)))
 
           ;; --- Bitwise ---
           (#.+op-and+
@@ -1517,7 +1580,11 @@
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
                (multiple-value-bind (amt npc3) (fetch-byte bc npc2)
-                 (reg-set regs vd (ash (reg-get regs vs) amt))
+                 ;; Exact word, shifted, WRAPPED to the machine word like the
+                 ;; hardware's SHL.  compile-ash detects left-shift overflow by
+                 ;; shifting back and comparing, which only works if this wraps.
+                 (%mvm-put-word regs vd
+                                (%mvm-wrap-word (ash (%mvm-word (svref regs vs)) amt)))
                  (setf pc npc3)))))
 
           ;; SHR / SAR ARE WORD-LEVEL, exactly as the native translators
@@ -1552,13 +1619,18 @@
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
                (multiple-value-bind (amt npc3) (fetch-byte bc npc2)
-                 (let ((w (reg-get regs vs)) (a (svref regs vs)))
+                 (let ((a (svref regs vs)))
                    (if (and (typep a 'fixnum) (>= a 0) (>= amt 1))
                        (reg-set regs vd (ash a (- 1 amt)))
-                   (reg-set regs vd
-                            (if (>= w 0)
-                                (ash w (- amt))
-                                (ash (logand w #xFFFFFFFFFFFFFFFF) (- amt))))))
+                       ;; A negative word is shifted as the UNSIGNED machine
+                       ;; word -- 32 bits on the 30-bit tower, not a fixed 64.
+                       (let ((w (%mvm-word a)))
+                         (%mvm-put-word regs vd
+                                        (%mvm-wrap-word
+                                         (ash (if (>= w 0)
+                                                  w
+                                                  (logand w (1- (ash 1 (+ +fixnum-bits+ 2)))))
+                                              (- amt)))))))
                  (setf pc npc3)))))
 
           (#.+op-sar+ ; arithmetic shift right — word-level
@@ -1570,25 +1642,26 @@
                    ;; exact and in range — the reg-get round trip is not.
                    (if (and (typep a 'fixnum) (>= amt 1))
                        (reg-set regs vd (ash a (- 1 amt)))
-                       (reg-set regs vd (ash (reg-get regs vs) (- amt)))))
+                       (%mvm-put-word regs vd (ash (%mvm-word a) (- amt)))))
                  (setf pc npc3)))))
 
           (#.+op-shlv+ ; shift left by register
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
                (multiple-value-bind (vc npc3) (fetch-reg bc npc2)
-                 (reg-set regs vd
-                       (tag-fixnum (ash (untag-fixnum (reg-get regs vs))
-                                       (untag-fixnum (reg-get regs vc)))))
+                 (%mvm-put-word regs vd
+                                (%mvm-wrap-word
+                                 (* 2 (ash (%mvm-untag-value (svref regs vs))
+                                           (%mvm-untag-value (svref regs vc))))))
                  (setf pc npc3)))))
 
           (#.+op-sarv+ ; arithmetic shift right by register
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
                (multiple-value-bind (vc npc3) (fetch-reg bc npc2)
-                 (reg-set regs vd
-                       (tag-fixnum (ash (untag-fixnum (reg-get regs vs))
-                                       (- (untag-fixnum (reg-get regs vc))))))
+                 (setf (svref regs vd)
+                       (ash (%mvm-untag-value (svref regs vs))
+                            (- (%mvm-untag-value (svref regs vc)))))
                  (setf pc npc3)))))
 
           (#.+op-ldb+ ; bit field extract
@@ -1596,9 +1669,8 @@
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
                (multiple-value-bind (pos npc3) (fetch-byte bc npc2)
                  (multiple-value-bind (size npc4) (fetch-byte bc npc3)
-                   (reg-set regs vd
-                         (tag-fixnum (ldb (byte size pos)
-                                         (untag-fixnum (reg-get regs vs)))))
+                   (setf (svref regs vd)
+                         (ldb (byte size pos) (%mvm-untag-value (svref regs vs))))
                    (setf pc npc4))))))
 
           ;; --- Comparison ---
@@ -1627,8 +1699,9 @@
           (#.+op-test+
            (multiple-value-bind (va npc) (fetch-reg bc pc)
              (multiple-value-bind (vb npc2) (fetch-reg bc npc)
-               (let ((r (if (and (integerp (reg-get regs va)) (integerp (reg-get regs vb)))
-                            (logand (reg-get regs va) (reg-get regs vb)) 0)))
+               ;; Exact words: `TEST v <word 1>' is the fixnum tag test, and
+               ;; REG-GET of a large fixnum wrapped, so the test lied.
+               (let ((r (logand (%mvm-word (svref regs va)) (%mvm-word (svref regs vb)))))
                  (setf (mvm-flags state)
                        (cond ((zerop r) :eq) ((< r 0) :lt) (t :gt))))
                (setf pc npc2))))

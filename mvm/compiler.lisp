@@ -18186,7 +18186,10 @@
     ((and count (<= count 30) *mvm-eval-runtime-p*
           (%cg-on-p (quote *cg-typed-ash*))
           (let ((w (%expr-width value-form env)))
-            (and w (or (< count 0) (<= (+ w count) 62)))))
+            ;; +fixnum-bits+, not a literal 62: at 30 bits the literal
+            ;; trusted `(ash 16388 16)' (16 + 16 <= 62), emitted a bare SHL,
+            ;; and the product wrapped to -1073479680 in eval'd code.
+            (and w (or (< count 0) (<= (+ w count) +fixnum-bits+)))))
      (compile-form value-form env dest)
      (if (>= count 0)
          (when (> count 0) (emit-ir :shl dest dest count))

@@ -2790,7 +2790,14 @@
                      (m-hi+1 (%fixnum-+ m-hi (if (= m-lo +fixnum-limit+) 1 0)))
                      (m-lo-clamped (logand m-lo +fixnum-max+)))
                 (cons -1 (list m-lo-clamped m-hi+1))))))))
-    ((< n 0) (cons -1 (list (%fixnum-- 0 n))))
+    ((< n 0)
+     ;; A RAW -2^fixnum-bits (a machine word, but outside +fixnum-min+) comes
+     ;; out of raw ops like (logand x -2); negating it wraps back to itself, so
+     ;; its magnitude 2^limb-bits is spelled as limbs (0 1).  Without this the
+     ;; limb came out negative: on i386 `(- (logand x -2))' and `=' against the
+     ;; bignum -2^30 segfaulted for x = -(2^30-1).
+     (let ((m (%fixnum-- 0 n)))
+       (if (< m 0) (cons -1 (list 0 1)) (cons -1 (list m)))))
     ((= n 0) (cons 1 '(0)))
     (t (cons 1 (list n)))))
 

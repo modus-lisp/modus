@@ -4427,6 +4427,15 @@
     ;; required args is a program-error, not a no-applicable-method.
     (%gf-check-arity gf args)
     (let ((applicable (%collect-applicable-methods gf args)))
+      ;; No USER method applies, but the GF has a system primary (the
+      ;; standard-object method of SHARED-INITIALIZE, CHANGE-CLASS, ...):
+      ;; that method is always applicable, so run it.  The default-primary
+      ;; splice in %GF-DISPATCH-STANDARD only runs when SOME method applied,
+      ;; so a user :AFTER method on one class used to leave every OTHER class
+      ;; with "no applicable method" (upstream shared-initialize.1.x,
+      ;; change-class.1.x: the suite specialises these GFs on its own classes).
+      (when (and (null applicable) (%has-default-primary-p name))
+        (return-from %gf-dispatch (%dispatch-default-primary name args)))
       (when (null applicable)
         ;; Name the generic function.  A bare "no applicable method" is
         ;; unactionable when a library defines dozens of GFs — say which

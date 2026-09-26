@@ -238,7 +238,23 @@
           ;; %wrapper-aref returns the raw char CODE; %prim-aset stores it.
           (%prim-aset s i (%wrapper-aref str i))
           (setq i (+ i 1))))
-      str))
+      ;; (Not SIMPLE-STRING-P: it answers T for these.  An ordinary string
+      ;; is subtag #x31; the fill-pointer/adjustable/displaced one is the
+      ;; #x34 MDA header.)
+      (if (and (stringp str) (not (consp str)) (not (= (obj-subtag str) #x31)))
+          ;; Any OTHER non-simple string (the MDA representation that
+          ;; fill-pointer / adjustable / displaced MAKE-ARRAY now builds)
+          ;; went through untouched and %PRIM-AREF read its header as
+          ;; characters: every READ-FROM-STRING of one was a READER-ERROR.
+          ;; Copy it through the public accessors.
+          (let* ((n (length str))
+                 (s (%make-string-array n))
+                 (i 0))
+            (loop
+              (when (>= i n) (return s))
+              (%prim-aset s i (char-code (char str i)))
+              (setq i (+ i 1))))
+          str)))
 
 (defun make-string-input-stream (str &rest args)
   ;; CLHS: (make-string-input-stream string &optional start end).

@@ -392,7 +392,11 @@
 ;; BIT-VECTOR-P + SIMPLE-BIT-VECTOR-P live below at L2195+; the early
 ;; copies here (subtag-walk variant and a nil-stub) silently lost the
 ;; last-defun-wins race.  Removed 2026-06-01 (redefinition audit).
-(defun simple-string-p (x) (stringp x))
+(defun simple-string-p (x)
+  "CLHS: a string that is a SIMPLE-ARRAY -- no fill pointer, not adjustable,
+   not displaced.  It used to be STRINGP, so a fill-pointer string (the
+   #x34 MDA header, or a cons wrapper) passed as simple."
+  (and (stringp x) (not (consp x)) (= (obj-subtag x) #x31)))
 ;;; ============================================================
 ;;; SUBTYPEP — basic ANSI lattice support.
 ;;;

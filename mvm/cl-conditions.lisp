@@ -2138,9 +2138,9 @@
                               ;; symbolp recognizes them (along with other forms above).
                               (symbolp obj)))
          ((eq tn 'string) (stringp obj))
-         ((eq tn 'simple-string) (stringp obj))
+         ((eq tn 'simple-string) (simple-string-p obj))
          ((eq tn 'base-string) (stringp obj))
-         ((eq tn 'simple-base-string) (stringp obj))
+         ((eq tn 'simple-base-string) (simple-string-p obj))
          ((eq tn 'character) (characterp obj))
          ((eq tn 'base-char) (characterp obj))
          ((eq tn 'standard-char) (characterp obj))

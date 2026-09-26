@@ -6037,6 +6037,7 @@
 (defun array-wrapper-p (x)
   "Check if x is a fill-pointer or displaced array wrapper.
    Accepts wrappers around strings AND general arrays."
+  (when *%no-cons-array-wrappers* (return-from array-wrapper-p nil))
   (let ((y (%unadj x)))
     (if (consp y)
         (let ((cdr-y (cdr y)))
@@ -6092,6 +6093,7 @@
 (defun %cdr-is-array-or-wrapper-p (x)
   ;; Use %prim-arrayp internally to avoid recursion through arrayp →
   ;; %wrapper-arrayp → here on every cons cell encountered.
+  (when *%no-cons-array-wrappers* (return-from %cdr-is-array-or-wrapper-p nil))
   (let ((u (cdr x)))
     (cond
       ((null u) nil)
@@ -6111,6 +6113,7 @@
    adjustable, fill-pointer, displaced).  Uses %prim-arrayp internally
    to avoid recursion through arrayp."
   (cond
+    (*%no-cons-array-wrappers* nil)
     ((eql (car w) 8765432) t)
     ((and (eql (car w) 9867654) (consp (cdr w))) t)
     ((and (fixnump (car w)) (%cdr-is-array-or-wrapper-p w)) t)
@@ -6179,6 +6182,7 @@
 ;;; a string.  Handles all wrapper variants by recursing through the layers.
 (defun %wrapper-stringp (w)
   (cond
+    (*%no-cons-array-wrappers* nil)
     ((eql (car w) 8765432)
      (let ((u (cdr w)))
        (if (consp u) (%wrapper-stringp u) (%prim-stringp u))))

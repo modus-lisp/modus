@@ -304,6 +304,9 @@
   ;; here on (CLHS).  Not during boot -- runtime init code still leans on the
   ;; raw fallback there; see *%ARITH-STRICT* in mvm/cl-types.lisp.
   (setq *%arith-strict* t)
+  ;; No CONS-based array wrappers exist in this image (MAKE-ARRAY builds the
+  ;; #x34 MDA header), so a cons shaped like one is the user's cons.
+  (setq *%no-cons-array-wrappers* t)
   ;; Expose the full argv as *posix-argv* (element 0 = program name).
   (setq *posix-argv* (%cli-collect-argv))
   (let* ((all *posix-argv*)

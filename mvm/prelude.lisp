@@ -541,6 +541,17 @@
       (cons (copy-tree (car tree)) (copy-tree (cdr tree)))
       tree))
 
+(defvar *%no-cons-array-wrappers* nil
+  "T in an image whose arrays are never CONS-based wrappers -- the CLI, where
+   MAKE-ARRAY builds every non-simple array as the #x34 MDA header.  There a
+   cons shaped like a wrapper -- (5 . #(1 2)), ((1 . 2) . #(3)) -- is an
+   ordinary user CONS, but the shape predicates below classified it as a
+   fill-pointer / displaced array: (arrayp (cons 5 (vector 1 2))) => T,
+   (length (cons 5 (vector 1 2 3))) => 5, and the printer read raw memory
+   out of it (the upstream random-printer FAULTs).  NIL (the default, and
+   what an image that never sets it reads) keeps the ANSI gate runner's
+   rewriter-built wrappers working.")
+
 (defun %length-cdr-is-array-tail-p (x)
   "True if X is a real array, a string, or a one-cons-deep wrapper around
    one.  Used by LENGTH to disambiguate a fp / displaced wrapper from an
@@ -577,6 +588,8 @@
    eventually pointing at an array/string rather than NIL/list."
   (cond
     ((null seq) 0)
+    ;; No cons-based wrappers in this image: a cons is a list.
+    ((and (consp seq) *%no-cons-array-wrappers*) (list-length seq))
     ((consp seq)
      (cond
        ;; adjustable wrapper marker — always a wrapper, peel and recurse

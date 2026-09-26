@@ -5870,8 +5870,12 @@
                         :error)))
       (cond
         ;; --- Stream filespec ---
+        ;; CLHS LOAD: returns T on success.  It used to return the value of
+        ;; the stream loader (the last form's value), which the upstream
+        ;; LOAD.* helpers reject.
         ((%load-stream-p filespec)
-         (%load-bind-pkg-rt-stream filespec verbose print))
+         (%load-bind-pkg-rt-stream filespec verbose print)
+         t)
         ;; --- Pathname / string filespec ---
         (t
          (let ((path (cond ((stringp filespec) filespec)
@@ -5903,7 +5907,8 @@
                          (write-string path *standard-output*)
                          (write-char #\Newline *standard-output*))
                        (%load-bind-pkg-rt-stream stream verbose print))
-                  (close stream)))))))))))
+                  (close stream))
+                t)))))))))
 
 ;;; ---- Initialization -----------------------------------------------
 

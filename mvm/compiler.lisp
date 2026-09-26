@@ -7100,8 +7100,27 @@
               (var-name (if (symbolp var) (symbol-name var) (format nil "~A" var))))
          ;; Check if second arg is a target string (not supported, just ignore)
          (if (and (cdr spec) (cadr spec) (not (eq (cadr spec) 'nil)))
-             ;; Writing to an existing string — just run body, return nil
-             (compile-form `(let ((,var (make-string-output-stream))) ,@body nil) env dest)
+             ;; CLHS: with a STRING (which must have a fill pointer) the output
+             ;; goes onto it and the form returns the BODY's values.  This used
+             ;; to discard the output and return NIL, so e.g. the upstream
+             ;; COMPILE-FILE/LOAD test helpers -- (multiple-value-list
+             ;; (with-output-to-string (*standard-output* str) (compile-file f)))
+             ;; -- saw (NIL NIL NIL) and every one of those tests failed.
+             (let ((tgt (%mvm-gensym "WOTST"))
+                   (out (%mvm-gensym "WOTSO"))
+                   (i (%mvm-gensym "WOTSI"))
+                   (earmuffs (and (> (length var-name) 2)
+                                  (char= (char var-name 0) #\*)
+                                  (char= (char var-name (1- (length var-name))) #\*))))
+               (compile-form
+                `(let ((,tgt ,(cadr spec))
+                       (,var (make-string-output-stream)))
+                   ,@(when earmuffs `((declare (special ,var))))
+                   (multiple-value-prog1 (progn ,@body)
+                     (let ((,out (get-output-stream-string ,var)))
+                       (dotimes (,i (length ,out))
+                         (vector-push-extend (char ,out ,i) ,tgt)))))
+                env dest))
              ;; Normal case: create stream, run body, return string
              (if (and (> (length var-name) 2)
                       (char= (char var-name 0) #\*)

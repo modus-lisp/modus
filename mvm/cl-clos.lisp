@@ -2858,6 +2858,44 @@
 (defun %method-specializers (m) (cadr m))
 (defun %method-fn (m)           (cddr m))
 
+(defun %gf-existing-plain-function (gf-name)
+  "The ordinary (non-generic) function GF-NAME names right now, or NIL."
+  (and (symbolp gf-name) gf-name (not (eq gf-name t))
+       (null (%find-gf gf-name))
+       (fboundp gf-name)
+       (let ((f (handler-case (fdefinition gf-name) (t (c) nil))))
+         (and (functionp f) (not (typep f 'generic-function)) f))))
+
+(defun %gf-adopt-plain-function (gf-name old n)
+  "DEFMETHOD just turned GF-NAME, which named the ordinary function OLD,
+   into a generic function.  Keep OLD as the least specific method (T on
+   every one of the N required parameters), so the built-in behaviour
+   survives for arguments no user method specialises.  Without it one
+   (defmethod class-name ((x my-class)) ...) -- or DOCUMENTATION, or
+   MAKE-INSTANCE -- took the standard function away from EVERY other
+   argument: \"no applicable method for generic function CLASS-NAME\"."
+  (when (and old (> n 0))
+    (if (%gf-self-dispatching-builtin-p gf-name)
+        ;; This built-in already consults its own GF and runs applicable user
+        ;; methods itself (CLASS-NAME, PRINT-OBJECT, ...).  As a T method it
+        ;; would be applicable to itself and recurse forever; just keep it as
+        ;; the function binding the new GF stub replaced.
+        (set-symbol-function gf-name old)
+        (let ((specs nil))
+          (dotimes (i n) (setq specs (cons t specs)))
+          (%defmethod gf-name nil specs (lambda (&rest args) (apply old args)))))))
+
+(defun %gf-self-dispatching-builtin-p (gf-name)
+  "Built-ins whose body looks up their own generic function and dispatches
+   applicable user methods before falling back (grep: (%find-gf 'NAME))."
+  (dolist (n '("CLASS-NAME" "SLOT-UNBOUND" "SLOT-MISSING" "PRINT-OBJECT"
+               "DESCRIBE-OBJECT" "SHARED-INITIALIZE" "CHANGE-CLASS"
+               "INITIALIZE-INSTANCE" "NO-APPLICABLE-METHOD" "NO-NEXT-METHOD"
+               "UPDATE-INSTANCE-FOR-DIFFERENT-CLASS"
+               "UPDATE-INSTANCE-FOR-REDEFINED-CLASS")
+           nil)
+    (when (%gf-name-is-p gf-name nil n) (return t))))
+
 (defun %defmethod (gf-name qualifier specializers fn)
   "Add or replace a method on a generic function.
    CLHS 7.6.4: method specializers list must have the same length as
@@ -2866,7 +2904,9 @@
    unknown (e.g., the auto-create case from a leading %defmethod)."
   ;; Ensure GF exists
   (when (null (%find-gf gf-name))
-    (%defgeneric gf-name nil nil))
+    (let ((old (%gf-existing-plain-function gf-name)))
+      (%defgeneric gf-name nil nil)
+      (%gf-adopt-plain-function gf-name old (length specializers))))
   (let ((gf (%find-gf gf-name)))
     (let ((decl-ll (%gf-lambda-list gf)))
       (when decl-ll
@@ -3002,7 +3042,9 @@
         (unless (%method-accepts-gf-keys-p gf-ll params)
           (%signal-program-error)))))
   (when (null (%find-gf gf-name))
-    (%defgeneric gf-name (%derive-gf-ll-from-method params) nil))
+    (let ((old (%gf-existing-plain-function gf-name)))
+      (%defgeneric gf-name (%derive-gf-ll-from-method params) nil)
+      (%gf-adopt-plain-function gf-name old (length specializers))))
   ;; Install a runtime dispatch stub in the function cell unless the name
   ;; already has a function (a prior defgeneric/defmethod installed one —
   ;; don't clobber it).  set-symbol-function handles every name flavor

@@ -601,10 +601,38 @@ the boot stub STAGED into the BSS at `0x10009000` rather than the live initial
 stack (4-byte slots, and the kernel stack at `0x40800390` is above the 2^30
 ceiling a tagged `mem-ref` address can express); and `*cstr-scratch*` /
 `*io-buf-addr*`, which must sit in the `0x10004000..0x10009000` BSS window
-because i386's heap is at `0x30000000` and every syscall address travels as a
-tagged fixnum. There is **no in-image JIT** on i386 (`*JIT-ON*` is forced NIL) —
+because every syscall address travels as a tagged fixnum. There is **no in-image JIT** on i386 (`*JIT-ON*` is forced NIL) —
 `translate-i386.lisp` builds the image but has no runtime arm; `mvm-eval` falls
 back to `mvm-interpret`, which is correct, just slower.
+
+**THE i386 CL IMAGE USED TO DIE AT ITS FIRST COLLECTION — three defects, all
+fixed (2026-09-26).**  Any `--script` of ~1300 toplevel forms (each allocates
+~135 KB in mvm-eval, so VA reaches VL at the midpoint), or any collection at all
+with an early `MODUS_I386_VL`.  Found with CORE DUMPS read by gdb-multiarch —
+ptrace is blocked here, but `ulimit -c unlimited` + `gdb -batch -ex core-file`
+needs none.
+1. **The arena crossed 2^30.**  It was mapped at `0x30000000`, so the second
+   semispace was `0x40000000+`; the MVM's value<->word round trip (SHL 1 / SAR 1)
+   turns a pointer at or above 2^30 into another address (`0x4029D319` ->
+   `0xC029D319`), and everything ran until the first flip moved live data up.
+   The arena is now `0x19000000..0x3A000000` (just above our own stack),
+   `MAP_FIXED_NOREPLACE`, with a build-time assert of the invariant.
+2. **`%GC-COUNT` is a :u64 read of a raw count** and hands back a TAGGED value:
+   count 9 read as "an object at address 0", and `%MEXP-MEMO-SYNC`'s EQL on it
+   faulted — every i386 image died at its ninth collection.  `%GC-EPOCH`
+   (gc.lisp, `:u32`) is the always-a-fixnum "did a GC happen" reader; use it.
+3. **The Cheney scan walked to-space WORD BY WORD**, forwarding bytes inside
+   byte vectors — MVM bytecode is one — whenever four of them spelled a tagged
+   from-space address with a start bit.  That was the long-open
+   `MVM: unknown opcode #xNN at PC N` class whose pair "moved with unrelated
+   code".  The walk is typed now: cons-kind bit -> two words; else header ->
+   leaf payloads skipped, exactly COUNT slots otherwise.
+Evidence: a collect-every-8-MB build (`MODUS_I386_VL=8388608
+MODUS_I386_GCSTRESS=8388608`) runs the probe file, `test/word-boundary.lisp`
+and a 3000-form script through 257 collections, and an interpreted
+cons/string/hash-table stress through 6986 with every value intact; the
+default build passes that stress 12 of 12 (6 with ASLR off) where the previous
+build failed 12 of 12.
 
 **RETIRED (2026-08 convergence):** `MODUS_I386_LAYER=1..5` and the ~1300-line
 baked probe suite (`run-i386.sh test/gc/bulk/chain/argv/probe N`, including the

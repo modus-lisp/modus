@@ -2075,7 +2075,7 @@
     ;; invisible-root class as CENV at globals+0x10, which sat unscanned until
     ;; this session.  ESP/EBP/IP are scanned too rather than skipped — the
     ;; stack (0x18000000) and the ELF image (0x08048000) are both BELOW the
-    ;; arena (0x30000000), so scan_word's from-space bounds test rejects them,
+    ;; arena (0x19000000), so scan_word's from-space bounds test rejects them,
     ;; and scanning the block whole keeps any slot added later covered.
     (let ((jl (i386-make-label)) (jd (i386-make-label)))
       (i386-emit-mov-reg-imm buf +i386-ebp+ *i386-jmpbuf-addr*)
@@ -2106,15 +2106,87 @@
       (i386-emit-jmp-rel32 buf hl)
       (i386-emit-label buf hd))
 
-    ;; --- Cheney scan of to-space: [to_start, free_ptr), free_ptr growing ---
-    (let ((cl (i386-make-label)) (cd (i386-make-label)))
+    ;; --- Cheney scan of to-space: [to_start, free_ptr), OBJECT BY OBJECT ---
+    ;; This walked to-space WORD BY WORD, handing every word to scan_word --
+    ;; including the PAYLOAD of byte vectors.  MVM bytecode is a byte vector:
+    ;; any four bytes of an instruction stream (an LI immediate, a branch
+    ;; offset) that happened to spell a tagged from-space address with a start
+    ;; bit were "forwarded", i.e. overwritten, and the interpreter later died
+    ;; on `MVM: unknown opcode #xNN at PC 869' -- the i386 class whose
+    ;; (opcode, PC) pair "moved with unrelated code" because it depended on
+    ;; which addresses the heap happened to hold.
+    ;;
+    ;; Now: the cons-kind bit says CONS (scan car and cdr, 16 bytes);
+    ;; otherwise the granule holds a header, whose size is computed exactly as
+    ;; copy_object computes it, and a LEAF subtag (byte vector, SAP, floats,
+    ;; the raw vectors) has its payload skipped.  Every other object has
+    ;; exactly COUNT slots scanned -- not its alignment padding either.
+    (let ((cl (i386-make-label)) (cd (i386-make-label)) (c-cons (i386-make-label))
+          (c-u8 (i386-make-label)) (c-al (i386-make-label))
+          (c-skip (i386-make-label)) (sl (i386-make-label)))
       (i386-emit-mov-reg-abs buf +i386-ebp+ *i386-gc-to-addr*)
       (i386-emit-label buf cl)
       (i386-emit-cmp-reg-reg buf +i386-ebp+ +i386-esi+)
       (i386-emit-jcc buf :ae cd)
+      ;; BT [consbmp], (ebp - page_base) >> 4   -> CF = cons-kind bit
+      (i386-emit-mov-reg-reg buf +scratch0+ +i386-ebp+)
+      (i386-emit-byte buf #x2B)                                ; SUB ecx, [page_base]
+      (i386-emit-byte buf (i386-modrm #b00 +scratch0+ 5))
+      (i386-emit-u32 buf *gc-page-base-addr*)
+      (i386-emit-shr-reg-imm buf +scratch0+ 4)
+      (i386-emit-mov-reg-abs buf +scratch1+ *gc-consbmp-addr*)
+      (i386-emit-byte buf #x0F) (i386-emit-byte buf #xA3)      ; BT [edx], ecx
+      (i386-emit-byte buf (i386-modrm #b00 +scratch0+ +scratch1+))
+      (i386-emit-jcc buf :b c-cons)
+      ;; -- object: EAX = header, ECX = subtag, EDX = count --
+      (i386-emit-mov-reg-mem buf +i386-eax+ +i386-ebp+ 0)
+      (i386-emit-mov-reg-reg buf +scratch0+ +i386-eax+)
+      (i386-emit-and-reg-imm buf +scratch0+ 255)
+      (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
+      (i386-emit-shr-reg-imm buf +scratch1+ 8)
+      ;; EAX = size (copy_object's rule), then EAX = next object
+      (i386-emit-cmp-reg-imm buf +scratch0+ #x11)
+      (i386-emit-jcc buf :e c-u8)
+      (i386-emit-mov-reg-reg buf +i386-eax+ +scratch1+)
+      (i386-emit-add-reg-imm buf +i386-eax+ 1)
+      (i386-emit-shl-reg-imm buf +i386-eax+ 2)
+      (i386-emit-jmp-rel32 buf c-al)
+      (i386-emit-label buf c-u8)
+      (i386-emit-mov-reg-reg buf +i386-eax+ +scratch1+)
+      (i386-emit-add-reg-imm buf +i386-eax+ 4)
+      (i386-emit-label buf c-al)
+      (i386-emit-add-reg-imm buf +i386-eax+ 15)
+      (i386-emit-and-reg-imm buf +i386-eax+ -16)
+      (i386-emit-add-reg-reg buf +i386-eax+ +i386-ebp+)
+      (i386-emit-push-reg buf +i386-eax+)                      ; [esp] = next
+      ;; leaf subtags: skip the payload
+      (dolist (st '(#x10 #x11 #x12 #x14 #x16 #x60 #x64 #x65 #x66))
+        (i386-emit-cmp-reg-imm buf +scratch0+ st)
+        (i386-emit-jcc buf :e c-skip))
+      ;; slots: [ebp+4, ebp+4+4*count)
+      (i386-emit-shl-reg-imm buf +scratch1+ 2)
+      (i386-emit-add-reg-reg buf +scratch1+ +i386-ebp+)
+      (i386-emit-add-reg-imm buf +scratch1+ 4)
+      (i386-emit-mov-abs-reg buf *i386-gcroot-bound-addr* +scratch1+)
+      (i386-emit-add-reg-imm buf +i386-ebp+ 4)
+      (i386-emit-label buf sl)
+      (i386-emit-cmp-reg-abs buf +i386-ebp+ *i386-gcroot-bound-addr*)
+      (i386-emit-jcc buf :ae c-skip)
       (i386-emit-mov-reg-reg buf +i386-eax+ +i386-ebp+)
       (i386-emit-call-rel32 buf scan-label)
       (i386-emit-add-reg-imm buf +i386-ebp+ 4)
+      (i386-emit-jmp-rel32 buf sl)
+      (i386-emit-label buf c-skip)
+      (i386-emit-pop-reg buf +i386-ebp+)                       ; ebp = next
+      (i386-emit-jmp-rel32 buf cl)
+      ;; -- cons: car at +0, cdr at +4, 16 bytes --
+      (i386-emit-label buf c-cons)
+      (i386-emit-mov-reg-reg buf +i386-eax+ +i386-ebp+)
+      (i386-emit-call-rel32 buf scan-label)
+      (i386-emit-mov-reg-reg buf +i386-eax+ +i386-ebp+)
+      (i386-emit-add-reg-imm buf +i386-eax+ 4)
+      (i386-emit-call-rel32 buf scan-label)
+      (i386-emit-add-reg-imm buf +i386-ebp+ 16)
       (i386-emit-jmp-rel32 buf cl)
       (i386-emit-label buf cd))
 

@@ -199,6 +199,16 @@
 (defun %gc-space-size ()   (mem-ref (+ (%gc-region) #x10) :u64))
 (defun %gc-stack-base ()   (mem-ref (+ (%gc-region) #x18) :u64))
 (defun %gc-count ()        (mem-ref (+ (%gc-region) #x20) :u64))
+(defun %gc-epoch ()
+  "A value that CHANGES at every collection of the active region and is ALWAYS
+   a genuine fixnum -- for callers that only need 'has a GC happened since?'.
+   %GC-COUNT is not that: its :u64 load hands the raw field back as a TAGGED
+   value, so where the count is stored raw (x64, i386) an odd count reads as a
+   bogus pointer.  On i386 a count of 9 read as `an object at address 0', and
+   %MEXP-MEMO-SYNC's EQL on it faulted -- the ninth collection of any i386
+   image died.  The low 32 bits via :u32 are exact everywhere (count on
+   x64/i386, count<<1 on aarch64's shifted metadata; both move every GC)."
+  (mem-ref (+ (%gc-region) #x20) :u32))
 (defun %gc-saved-rsp ()    (mem-ref (+ (%gc-region) #x28) :u64))
 (defun %gc-saved-r12 ()    (mem-ref (+ (%gc-region) #x30) :u64))
 (defun %gc-saved-r14 ()    (mem-ref (+ (%gc-region) #x38) :u64))

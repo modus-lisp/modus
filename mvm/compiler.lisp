@@ -8021,9 +8021,10 @@
            (compile-form (cons 'progn (cddr form)) env dest)
            (compile-nil dest)))
 
-      ((member op-name '(86089372   ; PROVIDE
-                          101258370   ; REQUIRE
-                          62725856  ; PROCLAIM
+      ;; PROVIDE / REQUIRE are NOT here: they are real functions over
+      ;; *MODULES*, and compiling a direct call away made (provide "X")
+      ;; do nothing while (funcall 'provide "X") worked (MODULES.*).
+      ((member op-name '(62725856  ; PROCLAIM
                           102992244))  ; DECLAIM
        ;; Still a runtime no-op, but DECLAIM/PROCLAIM carry the optimize
        ;; policy, so read the level out on the way past.
@@ -23851,8 +23852,6 @@
                                  87368786   ; IMPORT
                                  532181281   ; SHADOW
                                  503730619  ; USE-PACKAGE
-                                 86089372   ; PROVIDE
-                                 101258370   ; REQUIRE
                                  62725856  ; PROCLAIM
                                  102992244))) ; DECLAIM
      ;; Same as the expression-level clause: a runtime no-op, but the

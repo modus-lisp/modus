@@ -52,13 +52,6 @@
    sources.  A real microcontroller gets its own, much smaller, numbers; the
    point of naming them is that shrinking is a constant edit, not a port.")
 
-(defconstant +linux-riscv32-alloc-limit+ #xF800000
-  "Where VL sits, as an offset into the heap: the WHOLE heap, not the midpoint.
-   There is no hosted RISC-V collector yet, so the second semispace is memory
-   no one can ever use -- the CL image exhausted the first 64 MB during boot
-   (EBREAK a7=#xF0 with VA=#x14000040, VL=#x14000000) while 64 MB above it sat
-   idle.  When a collector lands, VL goes back to +LINUX-RISCV32-GC-MIDPOINT+
-   and the metadata block below already describes those two spaces.")
 ;;; ---- Staged argv/envp, below the allocator ----------------------------
 ;;; qemu-riscv32 puts the initial stack near #x40800000.  A MEM-REF address is a
 ;;; TAGGED fixnum, and on a 32-bit word that stops at 2^29 - 1, so the Lisp side
@@ -77,6 +70,11 @@
    something other than the allocator.  (It was #x2000, which was right until
    the CLI needed a staged argv.)")
 (defconstant +linux-riscv32-gc-midpoint+ #x7C00000)   ; half the heap
+(defconstant +linux-riscv32-alloc-limit+
+  (- +linux-riscv32-gc-midpoint+ +rv-gc-overshoot-margin+)
+  "Where VL starts, as an offset into the heap: the first semispace's end less
+   the collector's overshoot margin (see the hosted collector's header in
+   translate-riscv.lisp).  It was the WHOLE heap while no collector existed.")
 (defconstant +linux-riscv32-gc-guard+ #x400000
   "4 MB past the second semispace.  :gc-check tests the alloc pointer against
    the limit WITHOUT knowing the size of the allocation that follows, so a large
@@ -134,7 +132,10 @@
     ;;     fragile here (as it was on RV64, which survived on its 896 MB BSS) —
     ;;     it is an immediate SIGSEGV, which is what the ARM32 port measured.
     (rv-emit-li buf +rv-a0+ +linux-riscv32-heap-addr+)
-    (rv-emit-li buf +rv-a1+ (+ +linux-riscv32-heap-size+ +linux-riscv32-gc-guard+))
+    (rv-emit-li buf +rv-a1+ (+ +linux-riscv32-heap-size+ +linux-riscv32-gc-guard+
+                                ;; + the collector's START and CONS bitmaps
+                                ;; (translate-riscv's allocation-bitmaps header)
+                                (* 2 (rv-hosted-bitmap-bytes +linux-riscv32-heap-size+))))
     (rv-emit-li buf +rv-a2+ 3)                  ; PROT_READ|PROT_WRITE
     (rv-emit-li buf +rv-a3+ #x32)               ; MAP_PRIVATE|ANONYMOUS|FIXED
     (rv-emit-li buf +rv-a4+ -1)                 ; fd

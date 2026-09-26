@@ -443,12 +443,44 @@ RISC-V's `op-load`/`op-store`. Widths 4..7 are 0..3 plus "per-thread window
 slot", and an unmatched `CASE` emits NOTHING — so a window-marked store was a
 silent no-op. i386 and aarch64 mask it; RISC-V now does too.
 
-**STILL OPEN on RV64 hosted:** `+linux-riscv-heap-alloc-start+` is `#x200`,
-which is exactly where that port's entry stub writes ARGC — so its first
-allocation lands on the argc slot. Latent only because no payload there reads
-argc yet. RV32 starts at `#x2000`, clear of the whole fixed low block (metadata
-`#x40`, globals `#x80`, MV `#x90..#x138`, argc `#x200`, handler frames
-`#x400..#xC2F`, per-CPU mode `#xFF8`).
+**RV64's alloc start is `#x2000` now** (it was `#x200`, on top of the argc
+slot); RV32's is `#x20000`, above the staged argv.  Both are clear of the fixed
+low block (metadata `#x40`, globals `#x80`, MV `#x90..#x138`, argc `#x200`,
+handler frames `#x400..#xC2F`, per-CPU mode `#xFF8`).
+
+### Hosted RISC-V has a collector (both widths)
+
+`rv-emit-gc-collector` in `translate-riscv.lisp`: a native Cheney collector,
+one routine for RV32 and RV64, emitted once after the translated code and
+called from every hosted `:gc-check` through `auipc`/`jalr t1`.  Before it, a
+hosted RISC-V image died (`EBREAK`, `a7=#xF0`) the moment its first semispace
+filled.  Four design points, each measured:
+
+- **Roots**: the saved register file (the stack scan starts AT the save frame),
+  the stack, and the WHOLE low convention block `[#x10000000, heap+alloc-start)`
+  -- globals, symbol tables, MV values, jmpbuf and every handler frame -- so a
+  slot added later is covered by construction.
+- **To-space is split by shape**: objects copied UP from `to_start`, conses DOWN
+  from `to_end`, so the Cheney scan always knows whether it is at a header or a
+  cell, and SKIPS leaf payloads (byte vectors, SAPs, floats).  i386 scans
+  to-space word by word and would rewrite a byte pattern that looks like a
+  pointer.
+- **START and CONS bitmaps** (1 bit / 16 bytes each, in the heap's own mapping
+  past the guard, so both bases are compile-time constants).  A tag-9 root is
+  accepted only on a START bit, a tag-1 root only on a CONS bit.  Without them a
+  stale word in one of RISC-V's 128 never-initialised frame slots pointed at
+  what had become a cons whose car is NIL; `#xDEAD0001` read as a header is a
+  14.5M-element vector, and the collector copied 58 MB of garbage.  A
+  frontier-only bound is NOT enough: surviving conses live ABOVE VA.
+- **VL = cons frontier - 1 MB margin**, because `:gc-check` does not know the
+  size of the allocation that follows it.  A larger single allocation is the
+  same residual every port has.
+
+`test/hosted-rungs/h01-gc-survive.lisp` (`scripts/hosted-ladder.py riscv32
+test/hosted-rungs/h01-gc-survive.lisp`) churns 1 GB past a live chain, array and
+16384-slot string; with the stack scan deleted it SIGSEGVs on both widths, and
+the first (frontier-only) cut failed it after 8 collections.  Hosted-only on
+purpose: bare targets have no collector, so it cannot be an arch-ladder rung.
 
 ## Build Commands
 

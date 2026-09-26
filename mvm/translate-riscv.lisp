@@ -644,6 +644,14 @@
   "BGE rs1, rs2, offset (branch if greater or equal, signed)"
   (rv-emit-u32 buf (rv-encode-b-type offset rs2 rs1 #x5 #x63)))
 
+(defun rv-emit-bltu (buf rs1 rs2 offset)
+  "BLTU rs1, rs2, offset (branch if less than, unsigned)"
+  (rv-emit-u32 buf (rv-encode-b-type offset rs2 rs1 #x6 #x63)))
+
+(defun rv-emit-bgeu (buf rs1 rs2 offset)
+  "BGEU rs1, rs2, offset (branch if greater or equal, unsigned)"
+  (rv-emit-u32 buf (rv-encode-b-type offset rs2 rs1 #x7 #x63)))
+
 ;; --- U-type instructions ---
 
 (defun rv-emit-lui (buf rd imm20)
@@ -1716,6 +1724,7 @@
        (let* ((vd (vreg 0))
               (ra (resolve (vreg 1)))          ; car
               (rb (resolve2 (vreg 2))))        ; cdr
+         (rv-emit-alloc-mark buf :cons)
          (rv-emit-store-word buf ra +rv-s8+ 0)          ; store car at alloc ptr
          (rv-emit-store-word buf rb +rv-s8+ (rv-word-size))  ; cdr at alloc ptr + word
          (rv-emit-addi buf +rv-t0+ +rv-s8+ 1)   ; tag: cons tag = 1
@@ -1812,6 +1821,7 @@
               (g (rv-granule))
               (total-bytes (logand (+ (* (1+ size-words) (rv-word-size)) (1- g))
                                    (lognot (1- g)))))
+         (rv-emit-alloc-mark buf :start)
          ;; Build and store header
          (rv-emit-li buf +rv-t0+ (logior (ash size-words 8) subtag))
          (rv-emit-store-word buf +rv-t0+ +rv-s8+ 0)
@@ -2196,6 +2206,7 @@
        ;; Bump-allocate a cons cell into Vd (just reserve 16 bytes)
        ;; addi vd, VA, 1 (tag); addi VA, VA, 16
        (let ((vd (vreg 0)))
+         (rv-emit-alloc-mark buf :cons)
          (rv-emit-addi buf +rv-t0+ +rv-s8+ 1)    ; tagged cons pointer
          (rv-emit-addi buf +rv-s8+ +rv-s8+ (rv-granule))  ; bump alloc
          (store-result vd +rv-t0+)))
@@ -2224,11 +2235,23 @@
        ;; EBREAK with a7 = #x0F0 ("heap exhausted") stops at the allocation that
        ;; ran out, which is where the answer is.  Size-stable: two arms of the
        ;; same length.
+       ;; HOSTED: call the native collector (RV-EMIT-GC-COLLECTOR, emitted
+       ;; once at the end of the translated code) through AUIPC+JALR with t1
+       ;; as the link register -- t1 is per-op scratch and never holds a vreg,
+       ;; and the collector saves and restores every other register.  The
+       ;; pair is 8 bytes at any distance, so pass 1 (which does not know
+       ;; where the collector lands) measures the same size as pass 2.
        (if *riscv-linux-mode*
            (progn
              (rv-emit-blt buf +rv-s8+ +rv-s9+ 12)       ; skip if VA < VL
-             (rv-emit-addi buf +rv-a7+ +rv-x0+ #x0F0)   ; heap-exhausted marker
-             (rv-emit-ebreak buf))
+             (let* ((off (if *rv-gc-collector-offset*
+                             (- *rv-gc-collector-offset* (rv-current-offset buf))
+                             0))
+                    (lo12 (logand off #xFFF))
+                    (lo12-sext (if (>= lo12 #x800) (- lo12 #x1000) lo12))
+                    (hi20 (logand (ash (- off lo12-sext) -12) #xFFFFF)))
+               (rv-emit-auipc buf +rv-t1+ hi20)
+               (rv-emit-jalr buf +rv-t1+ +rv-t1+ (logand lo12-sext #xFFF))))
            (progn
              (rv-emit-blt buf +rv-s8+ +rv-s9+ 8)        ; skip if VA < VL
              (rv-emit-ecall buf)                        ; trigger GC (bare)
@@ -2379,6 +2402,7 @@
        ;; (alloc-array Vd Vcount) — Vcount is UNTAGGED (the compiler SAR'd it).
        (let* ((vd (vreg 0))
               (rc (resolve (vreg 1) +rv-t2+)))
+         (rv-emit-alloc-mark buf :start)
          ;; header = (count << 8) | #x32   (array subtag, as on i386/arm32)
          (rv-emit-slli buf +rv-t0+ rc 8)
          (rv-emit-addi buf +rv-t0+ +rv-t0+ #x32)
@@ -2433,6 +2457,7 @@
       (#.+op-alloc-u8+
        (let* ((vd (vreg 0))
               (rc (resolve (vreg 1) +rv-t2+)))
+         (rv-emit-alloc-mark buf :start)
          (rv-emit-srai buf +rv-t2+ rc 1)              ; N = count >> 1
          ;; header = (N << 8) | #x11   (u8-vector subtag)
          (rv-emit-slli buf +rv-t0+ +rv-t2+ 8)
@@ -2450,6 +2475,7 @@
        ;; One character CODE per WORD, as on every other target.
        (let* ((vd (vreg 0))
               (rc (resolve (vreg 1) +rv-t2+)))
+         (rv-emit-alloc-mark buf :start)
          (rv-emit-slli buf +rv-t0+ rc 8)
          (rv-emit-addi buf +rv-t0+ +rv-t0+ #x31)      ; string subtag
          (rv-emit-store-word buf +rv-t0+ +rv-s8+ 0)
@@ -2490,6 +2516,7 @@
       (#.+op-sap-new+
        (let* ((vd (vreg 0))
               (raddr (resolve (vreg 1) +rv-t2+)))
+         (rv-emit-alloc-mark buf :start)
          (rv-emit-li buf +rv-t0+ #x116)
          (rv-emit-store-word buf +rv-t0+ +rv-s8+ 0)
          (rv-emit-store-word buf raddr +rv-s8+ (rv-word-size))
@@ -2734,6 +2761,7 @@
   (let* ((ws (rv-word-size))
          (g (rv-granule))
          (bytes (logand (+ (* 5 ws) (1- g)) (lognot (1- g)))))
+    (rv-emit-alloc-mark buf :start)
     (rv-emit-li buf tmp (logior #x60 (ash 4 8)))
     (rv-emit-store-word buf tmp +rv-s8+ 0)
     ;; chunk k = bits (63-16k)..(48-16k), stored TAGGED.
@@ -2777,6 +2805,7 @@
          (bytes (logand (+ (* 5 ws) (1- g)) (lognot (1- g)))))
     (rv-emit-addi buf +rv-sp+ +rv-sp+ -16)
     (rv-emit-fsd buf fs +rv-sp+ 0)
+    (rv-emit-alloc-mark buf :start)
     (rv-emit-li buf tmp (logior #x60 (ash 4 8)))
     (rv-emit-store-word buf tmp +rv-s8+ 0)
     (loop for k from 0 to 3
@@ -2859,6 +2888,383 @@
 ;;; Two-Pass Translation
 ;;; ============================================================
 
+;;; ============================================================
+;;; Hosted allocation bitmaps
+;;; ============================================================
+;;;
+;;; TWO bitmaps, one bit per 16-byte granule of the whole hosted heap mapping:
+;;; START (a headered object begins here) and CONS (a cons cell begins here).
+;;; The collector accepts a tag-9 candidate only on a START bit and a tag-1
+;;; candidate only on a CONS bit, so a stale conservative word -- RISC-V frames
+;;; reserve 128 slots nobody initialises -- can neither be read as a header in
+;;; the middle of something else nor as a cons that is really an object.
+;;; MEASURED without them: a stale frame slot held a tag-9 pointer to what was
+;;; by then a CONS whose car is NIL, #xDEAD0001 read as a header is a
+;;; simple-vector of 14.5M elements, and the collector copied 58 MB of garbage
+;;; and overflowed to-space.  Same two bitmaps x64 and i386 carry, for the same
+;;; reason.
+;;;
+;;; They live in the heap's own mapping, just past the guard band, so both
+;;; bases are compile-time constants: nothing to publish, nothing to load.
+
+(defun rv-hosted-heap-geometry ()
+  "(values heap-base heap-size guard) for the width being built, read from its
+   boot file so the translator and the boot stub cannot disagree."
+  (flet ((c (name)
+           (let ((sym (find-symbol name :modus.mvm)))
+             (unless (and sym (boundp sym))
+               (error "hosted RISC-V: ~A is not defined -- boot file not loaded" name))
+             (symbol-value sym))))
+    (if *riscv-64-bit*
+        (values (c "+LINUX-RISCV-HEAP-ADDR+") (c "+LINUX-RISCV-HEAP-SIZE+")
+                (c "+LINUX-RISCV-GC-GUARD+"))
+        (values (c "+LINUX-RISCV32-HEAP-ADDR+") (c "+LINUX-RISCV32-HEAP-SIZE+")
+                (c "+LINUX-RISCV32-GC-GUARD+")))))
+
+(defun rv-hosted-bitmap-bytes (heap-size)
+  "Bytes in ONE bitmap: a bit per 16-byte granule."
+  (/ heap-size 128))
+
+(defun rv-hosted-bitmaps ()
+  "(values start-bitmap cons-bitmap heap-base) as absolute addresses."
+  (multiple-value-bind (base size guard) (rv-hosted-heap-geometry)
+    (let ((start (+ base size guard)))
+      (values start (+ start (rv-hosted-bitmap-bytes size)) base))))
+
+(defun rv-emit-bitmap-bit (buf addr-reg kind op r1 r2 r3)
+  "OP :SET -- set the KIND (:start / :cons) bit for the granule at ADDR-REG.
+   OP :TEST -- leave (byte & mask) in R1, zero iff the bit is clear.
+   Clobbers R1..R3; ADDR-REG is preserved (it must not be one of them)."
+  (multiple-value-bind (start cons base) (rv-hosted-bitmaps)
+    (rv-emit-li buf r1 base)
+    (rv-emit-sub buf r2 addr-reg r1)
+    (rv-emit-srli buf r2 r2 4)                  ; granule index
+    (rv-emit-srli buf r3 r2 3)
+    (rv-emit-li buf r1 (if (eq kind :cons) cons start))
+    (rv-emit-add buf r3 r3 r1)                  ; byte address
+    (rv-emit-andi buf r2 r2 7)
+    (rv-emit-addi buf r1 +rv-x0+ 1)
+    (rv-emit-sll buf r1 r1 r2)                  ; mask
+    (rv-emit-lbu buf r2 r3 0)
+    (ecase op
+      (:set  (rv-emit-or buf r2 r2 r1)
+             (rv-emit-sb buf r2 r3 0))
+      (:test (rv-emit-and buf r1 r2 r1)))))
+
+(defun rv-emit-alloc-mark (buf kind)
+  "Hosted only: mark the allocation that is about to start at VA (s8).  Uses
+   t4..t6, which no allocation site uses (rv32-float-box's temporary is t3)."
+  (when *riscv-linux-mode*
+    (rv-emit-bitmap-bit buf +rv-s8+ kind :set +rv-t4+ +rv-t5+ +rv-t6+)))
+
+;;; ============================================================
+;;; Hosted collector
+;;; ============================================================
+;;;
+;;; A Cheney copying collector in native RISC-V, one routine for both widths
+;;; (every word access is RV-EMIT-LOAD-WORD / RV-EMIT-STORE-WORD).  Called from
+;;; :gc-check on hosted Linux, where it replaced a loud EBREAK: before it, the
+;;; hosted RISC-V images simply died when the first semispace filled.
+;;;
+;;; ROOTS.  (1) The register file: the entry saves x1..x31 on the stack and the
+;;; stack scan starts AT that frame, so every register that holds a pointer is
+;;; forwarded in place and restored forwarded (the aarch64 fc25505 lesson).
+;;; (2) The stack, [sp, stack_base).  (3) The whole low convention block,
+;;; [#x10000000, heap + alloc-start): globals alist, symbol/keyword/package
+;;; tables, MV values, closure env, the handler jmpbuf and EVERY handler-stack
+;;; frame.  Scanning the block whole rather than a list of slots is what keeps a
+;;; slot added later covered by construction -- the i386 CENV invisible-root
+;;; class.  Non-pointer words there (raw addresses, counts, staged argv bytes)
+;;; fail the tag or the from-space range test.
+;;;
+;;; TO-SPACE IS SPLIT BY SHAPE: objects are copied UP from to_start, conses
+;;; DOWN from to_end.  So the Cheney scan always knows what it is looking at --
+;;; a header, or a two-word cell -- and can SKIP leaf payloads (byte vectors,
+;;; SAPs, floats).  i386's collector scans to-space word by word instead, which
+;;; forwards any raw byte pattern that happens to look like a heap pointer, i.e.
+;;; silently rewrites binary data.  The mutator then allocates in the gap
+;;; between the two, which is why VL is the cons frontier minus a margin.
+;;;
+;;; THE MARGIN.  :gc-check tests VA < VL BEFORE an allocation whose size it does
+;;; not know, so an allocation can run past VL by its own size -- on this
+;;; layout, onto live conses.  +RV-GC-OVERSHOOT-MARGIN+ bounds that, the same
+;;; bound i386's 16 MB guard provides; a single allocation larger than it is
+;;; the documented residual on every port (the cure is a size-aware gc-check).
+;;;
+;;; FAILURE IS LOUD.  After a collection that leaves less than the margin free,
+;;; or a to-space overflow mid-copy, the collector EBREAKs with a7 = #xF0 / #xF1
+;;; rather than returning into a heap it cannot keep.
+
+(defconstant +rv-gc-overshoot-margin+ #x100000
+  "Bytes kept free below VL; see the collector header.  1 MB.")
+
+(defparameter *rv-gc-collector-offset* nil
+  "Native offset of the hosted collector while translating (pass 1's end), so
+   every :gc-check can reach it with a fixed-size AUIPC+JALR.  NIL otherwise.")
+
+(defconstant +rv-hosted-convention-base+ #x10000000)
+(defconstant +rv-hosted-gc-meta+ #x10000040
+  "from_start, to_start, space_size, stack_base, gc_count -- one WORD each.")
+
+(defun rv-hosted-root-block-end ()
+  "End of the low convention block = heap + the allocator's start offset, read
+   from the boot file of the width being built so the two cannot drift."
+  (let ((sym (if *riscv-64-bit*
+                 (find-symbol "+LINUX-RISCV-HEAP-ALLOC-START+" :modus.mvm)
+                 (find-symbol "+LINUX-RISCV32-HEAP-ALLOC-START+" :modus.mvm))))
+    (unless (and sym (boundp sym))
+      (error "hosted RISC-V collector: the ~:[RV32~;RV64~] boot file is not ~
+              loaded, so the root block's end is unknown" *riscv-64-bit*))
+    (+ +rv-hosted-convention-base+ (symbol-value sym))))
+
+(defun rv-emit-gc-collector (buf)
+  "Emit the hosted collector.  Entered with t1 = return address."
+  (let* ((w (rv-word-size))
+         (wsh (rv-word-shift))
+         (frame (* 32 w))
+         (scan-calls nil)
+         (exhausted nil))
+    (labels ((fwd (emit-fn a b)
+               (let ((pos (rv-current-offset buf)))
+                 (funcall emit-fn buf a b 0) pos))
+             (here (pos) (rv-patch-branch-here buf pos))
+             (back (emit-fn a b target)
+               (funcall emit-fn buf a b (- target (rv-current-offset buf))))
+             (jmp-back (target)
+               (rv-emit-jal buf +rv-x0+ (- target (rv-current-offset buf))))
+             (jmp-fwd ()
+               (let ((pos (rv-current-offset buf)))
+                 (rv-emit-jal buf +rv-x0+ 0) pos))
+             (call-scan ()
+               (push (rv-current-offset buf) scan-calls)
+               (rv-emit-jal buf +rv-ra+ 0))
+             (scan-range (lo-reg hi-reg step)
+               ;; for (a0 = lo; a0 < hi; a0 += step) scan(a0), cursor in s7
+               (rv-emit-mv buf +rv-s7+ lo-reg)
+               (let* ((top (rv-current-offset buf))
+                      (out (fwd #'rv-emit-bgeu +rv-s7+ hi-reg)))
+                 (rv-emit-mv buf +rv-a0+ +rv-s7+)
+                 (call-scan)
+                 (rv-emit-addi buf +rv-s7+ +rv-s7+ step)
+                 (jmp-back top)
+                 (here out)))
+             (leaf-branches (subtag-reg target-list-cell)
+               ;; beq subtag, <leaf>, SKIP -- positions pushed for patching
+               (dolist (st '(#x10 #x11 #x12 #x14 #x16 #x60 #x64 #x65 #x66))
+                 (rv-emit-addi buf +rv-t3+ +rv-x0+ st)
+                 (push (fwd #'rv-emit-beq subtag-reg +rv-t3+)
+                       (car target-list-cell)))))
+      ;; ---- save x1..x31 (not sp) ----
+      (rv-emit-addi buf +rv-sp+ +rv-sp+ (- frame))
+      (loop for r from 1 to 31 unless (= r +rv-sp+)
+            do (rv-emit-store-word buf r +rv-sp+ (* r w)))
+      ;; ---- geometry ----
+      (rv-emit-li buf +rv-t0+ +rv-hosted-gc-meta+)
+      (rv-emit-load-word buf +rv-s1+ +rv-t0+ 0)            ; from_start
+      (rv-emit-load-word buf +rv-s3+ +rv-t0+ w)            ; to_start
+      (rv-emit-load-word buf +rv-t2+ +rv-t0+ (* 2 w))      ; space_size
+      (rv-emit-add buf +rv-s2+ +rv-s1+ +rv-t2+)            ; from_end
+      (rv-emit-add buf +rv-s4+ +rv-s3+ +rv-t2+)            ; to_end
+      (rv-emit-mv buf +rv-s5+ +rv-s3+)                     ; object free (up)
+      (rv-emit-mv buf +rv-s6+ +rv-s4+)                     ; cons low (down)
+      ;; ---- roots: stack (from the save frame) ----
+      (rv-emit-load-word buf +rv-s11+ +rv-t0+ (* 3 w))     ; stack_base
+      (rv-emit-mv buf +rv-t2+ +rv-sp+)
+      (scan-range +rv-t2+ +rv-s11+ w)
+      ;; ---- roots: the low convention block ----
+      (rv-emit-li buf +rv-t2+ +rv-hosted-convention-base+)
+      (rv-emit-li buf +rv-s11+ (rv-hosted-root-block-end))
+      (scan-range +rv-t2+ +rv-s11+ w)
+      ;; ---- Cheney: a5 = object scan (up), a6 = cons scan (down) ----
+      (rv-emit-mv buf +rv-a5+ +rv-s3+)
+      (rv-emit-mv buf +rv-a6+ +rv-s4+)
+      (let* ((ch (rv-current-offset buf))
+             (to-obj (fwd #'rv-emit-bltu +rv-a5+ +rv-s5+))
+             (to-cons (fwd #'rv-emit-bltu +rv-s6+ +rv-a6+))
+             (done (jmp-fwd)))
+        ;; -- one object at a5 --
+        (here to-obj)
+        (rv-emit-load-word buf +rv-t0+ +rv-a5+ 0)          ; header
+        (rv-emit-srli buf +rv-a7+ +rv-t0+ 8)               ; count
+        (rv-emit-andi buf +rv-a4+ +rv-t0+ #xFF)            ; subtag
+        ;; size -> t4 : byte vector = count + w, else (count+1)*w; align 16
+        (rv-emit-addi buf +rv-t3+ +rv-x0+ #x11)
+        (let ((words (fwd #'rv-emit-bne +rv-a4+ +rv-t3+)))
+          (rv-emit-addi buf +rv-t4+ +rv-a7+ w)
+          (let ((al (jmp-fwd)))
+            (here words)
+            (rv-emit-addi buf +rv-t4+ +rv-a7+ 1)
+            (rv-emit-slli buf +rv-t4+ +rv-t4+ wsh)
+            (rv-patch-jal-here buf al)))
+        (rv-emit-addi buf +rv-t4+ +rv-t4+ 15)
+        (rv-emit-andi buf +rv-t4+ +rv-t4+ -16)
+        ;; next object start kept in s7? no -- s7 is the slot cursor; use a3
+        (rv-emit-add buf +rv-a3+ +rv-a5+ +rv-t4+)
+        (let ((skips (list nil)))
+          (leaf-branches +rv-a4+ skips)
+          ;; slots a5+w .. a5+(count+1)*w ; end in a4 (subtag no longer needed)
+          (rv-emit-addi buf +rv-a4+ +rv-a7+ 1)
+          (rv-emit-slli buf +rv-a4+ +rv-a4+ wsh)
+          (rv-emit-add buf +rv-a4+ +rv-a4+ +rv-a5+)
+          (rv-emit-addi buf +rv-t2+ +rv-a5+ w)
+          ;; scan-range clobbers a0,s7 and scan clobbers t*,a1-a2 only: a3/a4
+          ;; survive, but scan-range compares against a register we pass.
+          (scan-range +rv-t2+ +rv-a4+ w)
+          (dolist (p (car skips)) (here p)))
+        (rv-emit-mv buf +rv-a5+ +rv-a3+)
+        (jmp-back ch)
+        ;; -- one cons below a6 --
+        (here to-cons)
+        (rv-emit-addi buf +rv-a6+ +rv-a6+ -16)
+        (rv-emit-mv buf +rv-a0+ +rv-a6+)
+        (call-scan)
+        (rv-emit-addi buf +rv-a0+ +rv-a6+ w)
+        (call-scan)
+        (jmp-back ch)
+        (rv-patch-jal-here buf done))
+      ;; ---- clear both bitmaps over the evacuated semispace [s1, s2) ----
+      ;; Byte-exact: every semispace boundary is a multiple of 128 bytes from
+      ;; the heap base, i.e. of 8 granules.  Without this the bits of dead
+      ;; objects survive and the validation decays over collections (the x64 /
+      ;; aarch64 bitmap-saturation lesson).
+      (multiple-value-bind (start cons base) (rv-hosted-bitmaps)
+        (dolist (bmp (list start cons))
+          (rv-emit-li buf +rv-t3+ base)
+          (rv-emit-sub buf +rv-t5+ +rv-s1+ +rv-t3+)
+          (rv-emit-srli buf +rv-t5+ +rv-t5+ 7)
+          (rv-emit-li buf +rv-t3+ bmp)
+          (rv-emit-add buf +rv-t5+ +rv-t5+ +rv-t3+)     ; first byte
+          (rv-emit-sub buf +rv-t6+ +rv-s2+ +rv-s1+)
+          (rv-emit-srli buf +rv-t6+ +rv-t6+ 7)
+          (rv-emit-add buf +rv-t6+ +rv-t6+ +rv-t5+)     ; one past the last
+          (let* ((top (rv-current-offset buf))
+                 (out (fwd #'rv-emit-bgeu +rv-t5+ +rv-t6+)))
+            (rv-emit-sb buf +rv-x0+ +rv-t5+ 0)
+            (rv-emit-addi buf +rv-t5+ +rv-t5+ 1)
+            (jmp-back top)
+            (here out))))
+      ;; ---- swap the semispaces, count the collection ----
+      (rv-emit-li buf +rv-t0+ +rv-hosted-gc-meta+)
+      (rv-emit-store-word buf +rv-s3+ +rv-t0+ 0)
+      (rv-emit-store-word buf +rv-s1+ +rv-t0+ w)
+      (rv-emit-load-word buf +rv-t2+ +rv-t0+ (* 4 w))
+      (rv-emit-addi buf +rv-t2+ +rv-t2+ 1)
+      (rv-emit-store-word buf +rv-t2+ +rv-t0+ (* 4 w))
+      ;; ---- new VA / VL, written into the save frame so the restore installs
+      ;;      them; refuse to return with less than the margin free ----
+      (rv-emit-li buf +rv-t2+ +rv-gc-overshoot-margin+)
+      (rv-emit-sub buf +rv-t2+ +rv-s6+ +rv-t2+)
+      (push (fwd #'rv-emit-bgeu +rv-s5+ +rv-t2+) exhausted)
+      (rv-emit-store-word buf +rv-s5+ +rv-sp+ (* +rv-s8+ w))
+      (rv-emit-store-word buf +rv-t2+ +rv-sp+ (* +rv-s9+ w))
+      ;; ---- restore and return through t1 ----
+      (loop for r from 1 to 31 unless (= r +rv-sp+)
+            do (rv-emit-load-word buf r +rv-sp+ (* r w)))
+      (rv-emit-addi buf +rv-sp+ +rv-sp+ frame)
+      (rv-emit-jalr buf +rv-x0+ +rv-t1+ 0)
+      ;; ---- heap exhausted after a full collection ----
+      (dolist (p exhausted) (here p))
+      (rv-emit-addi buf +rv-a7+ +rv-x0+ #x0F0)
+      (rv-emit-ebreak buf)
+      ;; ================= SCAN(a0 = slot address) =================
+      ;; Forward the word at a0 if it points into from-space.  Uses t0-t6,
+      ;; a1, a2 only.  State: s1/s2 from bounds, s5 object free, s6 cons low.
+      (dolist (c scan-calls) (rv-patch-jal-here buf c))
+      (let ((rets nil))
+        (rv-emit-load-word buf +rv-t0+ +rv-a0+ 0)
+        (rv-emit-andi buf +rv-t2+ +rv-t0+ 15)              ; tag
+        (rv-emit-addi buf +rv-t3+ +rv-x0+ 1)
+        (let ((is-ptr (fwd #'rv-emit-beq +rv-t2+ +rv-t3+)))
+          (rv-emit-addi buf +rv-t3+ +rv-x0+ 9)
+          (push (fwd #'rv-emit-bne +rv-t2+ +rv-t3+) rets)
+          (here is-ptr))
+        (rv-emit-andi buf +rv-t4+ +rv-t0+ -16)             ; address
+        (push (fwd #'rv-emit-bltu +rv-t4+ +rv-s1+) rets)
+        (push (fwd #'rv-emit-bgeu +rv-t4+ +rv-s2+) rets)
+        ;; A REAL START of the right KIND, or not a root at all (see the
+        ;; allocation-bitmaps header).  t3/t5/t6 are free here.
+        (rv-emit-addi buf +rv-t3+ +rv-x0+ 1)
+        (let ((cons-p (fwd #'rv-emit-beq +rv-t2+ +rv-t3+)))
+          (rv-emit-bitmap-bit buf +rv-t4+ :start :test +rv-t3+ +rv-t5+ +rv-t6+)
+          (let ((checked (jmp-fwd)))
+            (here cons-p)
+            (rv-emit-bitmap-bit buf +rv-t4+ :cons :test +rv-t3+ +rv-t5+ +rv-t6+)
+            (rv-patch-jal-here buf checked)))
+        (push (fwd #'rv-emit-beq +rv-t3+ +rv-x0+) rets)
+        (rv-emit-load-word buf +rv-t5+ +rv-t4+ 0)          ; first word
+        (rv-emit-andi buf +rv-t6+ +rv-t5+ 15)
+        (rv-emit-addi buf +rv-t3+ +rv-x0+ 15)
+        (let ((not-fwd (fwd #'rv-emit-bne +rv-t6+ +rv-t3+)))
+          ;; already forwarded: new pointer = (fwd & ~15) | tag
+          (rv-emit-andi buf +rv-t5+ +rv-t5+ -16)
+          (rv-emit-or buf +rv-t5+ +rv-t5+ +rv-t2+)
+          (rv-emit-store-word buf +rv-t5+ +rv-a0+ 0)
+          (rv-emit-jalr buf +rv-x0+ +rv-ra+ 0)
+          (here not-fwd))
+        (rv-emit-addi buf +rv-t3+ +rv-x0+ 1)
+        (let ((is-cons (fwd #'rv-emit-beq +rv-t2+ +rv-t3+)))
+          ;; -- object: header in t5 --
+          (rv-emit-srli buf +rv-a1+ +rv-t5+ 8)
+          (rv-emit-andi buf +rv-a2+ +rv-t5+ #xFF)
+          (rv-emit-addi buf +rv-t3+ +rv-x0+ #x11)
+          (let ((words (fwd #'rv-emit-bne +rv-a2+ +rv-t3+)))
+            (rv-emit-addi buf +rv-a1+ +rv-a1+ w)
+            (let ((al (jmp-fwd)))
+              (here words)
+              (rv-emit-addi buf +rv-a1+ +rv-a1+ 1)
+              (rv-emit-slli buf +rv-a1+ +rv-a1+ wsh)
+              (rv-patch-jal-here buf al)))
+          (rv-emit-addi buf +rv-a1+ +rv-a1+ 15)
+          (rv-emit-andi buf +rv-a1+ +rv-a1+ -16)           ; size
+          ;; gates: a "header" whose object cannot lie inside from-space is not
+          ;; an object (a false conservative root) -- leave the slot alone.
+          (rv-emit-add buf +rv-t3+ +rv-t4+ +rv-a1+)
+          (push (fwd #'rv-emit-bltu +rv-s2+ +rv-t3+) rets)
+          (push (fwd #'rv-emit-bltu +rv-t3+ +rv-t4+) rets)   ; wrapped
+          ;; room below the cons frontier, else to-space overflow: loud
+          (rv-emit-add buf +rv-t3+ +rv-s5+ +rv-a1+)
+          (let ((ovf (fwd #'rv-emit-bltu +rv-s6+ +rv-t3+)))
+            ;; copy a1 bytes t4 -> s5
+            (rv-emit-mv buf +rv-a2+ +rv-t4+)
+            (rv-emit-mv buf +rv-t6+ +rv-s5+)
+            (rv-emit-add buf +rv-t3+ +rv-t4+ +rv-a1+)
+            (let* ((cl (rv-current-offset buf))
+                   (cd (fwd #'rv-emit-bgeu +rv-a2+ +rv-t3+)))
+              (rv-emit-load-word buf +rv-t5+ +rv-a2+ 0)
+              (rv-emit-store-word buf +rv-t5+ +rv-t6+ 0)
+              (rv-emit-addi buf +rv-a2+ +rv-a2+ w)
+              (rv-emit-addi buf +rv-t6+ +rv-t6+ w)
+              (jmp-back cl)
+              (here cd))
+            (rv-emit-bitmap-bit buf +rv-s5+ :start :set +rv-t3+ +rv-t5+ +rv-t6+)
+            (rv-emit-ori buf +rv-t5+ +rv-s5+ 15)
+            (rv-emit-store-word buf +rv-t5+ +rv-t4+ 0)      ; forward
+            (rv-emit-ori buf +rv-t5+ +rv-s5+ 9)
+            (rv-emit-store-word buf +rv-t5+ +rv-a0+ 0)      ; update slot
+            (rv-emit-add buf +rv-s5+ +rv-s5+ +rv-a1+)
+            (rv-emit-jalr buf +rv-x0+ +rv-ra+ 0)
+            ;; -- cons --
+            (here is-cons)
+            (rv-emit-addi buf +rv-t3+ +rv-s6+ -16)
+            (let ((ovf2 (fwd #'rv-emit-bltu +rv-t3+ +rv-s5+)))
+              (rv-emit-mv buf +rv-s6+ +rv-t3+)
+              (rv-emit-load-word buf +rv-t5+ +rv-t4+ 0)
+              (rv-emit-store-word buf +rv-t5+ +rv-s6+ 0)
+              (rv-emit-load-word buf +rv-t5+ +rv-t4+ w)
+              (rv-emit-store-word buf +rv-t5+ +rv-s6+ w)
+              (rv-emit-bitmap-bit buf +rv-s6+ :cons :set +rv-t3+ +rv-t5+ +rv-t6+)
+              (rv-emit-ori buf +rv-t5+ +rv-s6+ 15)
+              (rv-emit-store-word buf +rv-t5+ +rv-t4+ 0)
+              (rv-emit-ori buf +rv-t5+ +rv-s6+ 1)
+              (rv-emit-store-word buf +rv-t5+ +rv-a0+ 0)
+              (rv-emit-jalr buf +rv-x0+ +rv-ra+ 0)
+              ;; -- to-space overflow: cannot happen if from-space fit --
+              (here ovf) (here ovf2)
+              (rv-emit-addi buf +rv-a7+ +rv-x0+ #x0F1)
+              (rv-emit-ebreak buf))))
+        (dolist (r rets) (here r))
+        (rv-emit-jalr buf +rv-x0+ +rv-ra+ 0)))))
+
 (defun translate-mvm-to-riscv (bytecode function-table)
   "Translate MVM bytecode to RISC-V native code.
    BYTECODE is a vector of (unsigned-byte 8) containing MVM instructions.
@@ -2901,6 +3307,9 @@
                                     :function-table native-fn-table)))
       ;; Record end position
       (setf (gethash mvm-len label-map) (rv-current-offset measure-buf)))
+    ;; Pass 1's end is where pass 2 will emit the hosted collector.
+    (setf *rv-gc-collector-offset*
+          (and *riscv-linux-mode* (gethash mvm-len label-map)))
 
     ;; Build native function table from MVM function table
     ;; Key by bytecode offset (which is what CALL operands use)
@@ -2943,6 +3352,12 @@
                                     :function-table native-fn-table
                                     :pass2 t)))
       (setf (gethash mvm-len label-map) (rv-current-offset final-buf))
+      (when *riscv-linux-mode*
+        (assert (eql (rv-current-offset final-buf) *rv-gc-collector-offset*) ()
+                "riscv: hosted collector expected at ~D, pass 2 ended at ~D"
+                *rv-gc-collector-offset* (rv-current-offset final-buf))
+        (rv-emit-gc-collector final-buf))
+      (setf *rv-gc-collector-offset* nil)
       ;; Re-derive the function map from PASS 2's positions and RETURN it.
       ;; This map was already being built (from pass 1) and then dropped on
       ;; the floor: the second value was never returned, so cross.lisp fell

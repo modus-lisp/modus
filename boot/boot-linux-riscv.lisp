@@ -123,7 +123,10 @@
   ;; --- mmap the heap: MAP_FIXED so save-image can rely on the address
   ;;     mmap(addr, len, PROT_READ|WRITE, MAP_PRIVATE|ANON|FIXED, -1, 0)
   (rv-emit-li buf +rv-a0+ +linux-riscv-heap-addr+)
-  (rv-emit-li buf +rv-a1+ (+ +linux-riscv-heap-size+ +linux-riscv-gc-guard+))
+  (rv-emit-li buf +rv-a1+ (+ +linux-riscv-heap-size+ +linux-riscv-gc-guard+
+                                ;; + the collector's START and CONS bitmaps
+                                ;; (translate-riscv's allocation-bitmaps header)
+                                (* 2 (rv-hosted-bitmap-bytes +linux-riscv-heap-size+))))
   (rv-emit-li buf +rv-a2+ 3)             ; PROT_READ|PROT_WRITE
   (rv-emit-li buf +rv-a3+ #x32)          ; MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED
   (rv-emit-li buf +rv-a4+ -1)            ; fd
@@ -140,7 +143,10 @@
   ;; --- MVM allocation registers: s8 = alloc pointer, s9 = limit, s10 = NIL
   (rv-emit-li buf +rv-t0+ +linux-riscv-heap-alloc-start+)
   (rv-emit-add buf +rv-s8+ +rv-s4+ +rv-t0+)
-  (rv-emit-li buf +rv-t0+ +linux-riscv-gc-midpoint+)
+  ;; VL stops +RV-GC-OVERSHOOT-MARGIN+ short of the semispace's end: :gc-check
+  ;; cannot see the size of the allocation that follows it (translate-riscv's
+  ;; collector header explains the margin).
+  (rv-emit-li buf +rv-t0+ (- +linux-riscv-gc-midpoint+ +rv-gc-overshoot-margin+))
   (rv-emit-add buf +rv-s9+ +rv-s4+ +rv-t0+)
   ;; VN = NIL.  #xDEAD0001 (+NIL-VALUE+), NOT zero.  The three hosted ports that
   ;; run the real CL image — x64, AArch64, i386 — all load this immediate, and the
@@ -188,7 +194,9 @@
   ;;     address<<1 convention gc.lisp once needed is gone).
   (rv-emit-li buf +rv-t1+ #x10000040)
   (rv-emit-sd buf +rv-s8+ +rv-t1+ 0)     ; [0x40] from_start
-  (rv-emit-sd buf +rv-s9+ +rv-t1+ 8)     ; [0x48] to_start
+  (rv-emit-li buf +rv-t0+ +linux-riscv-gc-midpoint+)   ; NOT VL: VL stops a
+  (rv-emit-add buf +rv-t0+ +rv-s4+ +rv-t0+)             ; margin short of it
+  (rv-emit-sd buf +rv-t0+ +rv-t1+ 8)     ; [0x48] to_start
   (rv-emit-li buf +rv-t0+ (- +linux-riscv-gc-midpoint+
                              +linux-riscv-heap-alloc-start+))
   (rv-emit-sd buf +rv-t0+ +rv-t1+ 16)    ; [0x50] space_size

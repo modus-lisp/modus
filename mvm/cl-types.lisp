@@ -2264,6 +2264,11 @@
     ((or (%ieee-float-p a) (%ieee-float-p b))
      (%as-result-float (%float-div (%any-to-float a) (%any-to-float b))
                        (%float-result-type a b)))
+    ;; A rational ZERO divisor signals DIVISION-BY-ZERO (CLHS /).  It used
+    ;; to reach (mod a 0) -- an integer divide trap, recovered as a bare
+    ;; SIMPLE-ERROR fault (/.error.2 and friends).  (A ratio is never 0.)
+    ((eql b 0)
+     (error 'division-by-zero :operation '/ :operands (list a b)))
     ((or (ratiop a) (ratiop b)) (%rational-divide a b))
     ((= (mod a b) 0) (%rat-exact-div a b))
     (t (%make-rat a b))))
@@ -3670,13 +3675,45 @@
            (aset v i (aref contents i))
            (setq i (+ i 1))))))))
 
-(defun bit (bv idx) (aref bv idx))
-(defun sbit (bv idx) (aref bv idx))
+(defun bit (bv &rest subscripts)
+  "CLHS BIT: any rank, including 0 -- (bit a) on a zero-rank bit array.
+   It took exactly one index, so (bit a) was an arity fault (bit.4)."
+  (if (and (consp subscripts) (null (cdr subscripts)))
+      (aref bv (car subscripts))
+      (row-major-aref bv (apply #'array-row-major-index bv subscripts))))
+(defun sbit (bit-array &rest subscripts)
+  "Access element of simple bit array, any rank."
+  (if (and (consp subscripts) (null (cdr subscripts)))
+      (aref bit-array (car subscripts))
+      (row-major-aref bit-array (apply #'array-row-major-index bit-array subscripts))))
 ;; SETF expansions for (bit bv idx) / (sbit bv idx).
 ;; SETF macro generic case emits (set-bit BV IDX VAL); our defun
 ;; mirrors that arg order.
-(defun set-bit  (bv idx val) (aset bv idx val) val)
-(defun set-sbit (bv idx val) (aset bv idx val) val)
+(defun %set-bit-any-rank (bit-array args)
+  "ARGS = subscripts... VALUE (the SETF SET-<name> convention, value LAST)."
+  (let ((subs nil) (cur args))
+    (loop
+      (when (null (cdr cur)) (return nil))
+      (setq subs (cons (car cur) subs))
+      (setq cur (cdr cur)))
+    (let ((new-value (car cur)))
+      (setq subs (nreverse subs))
+      (if (and (consp subs) (null (cdr subs)))
+          (aset bit-array (car subs) new-value)
+          (setf (row-major-aref bit-array
+                                (apply #'array-row-major-index bit-array subs))
+                new-value))
+      new-value)))
+
+(defun set-bit (bit-array &rest args)
+  "Setter for (SETF (BIT BV subscripts...) val): (BV subscripts... VAL).
+   It took exactly (BV IDX VAL), so a zero-rank (setf (bit a) 1) passed the
+   VALUE as the index."
+  (%set-bit-any-rank bit-array args))
+
+(defun set-sbit (bit-array &rest args)
+  "Setter for (SETF (SBIT BV subscripts...) val) — same convention."
+  (%set-bit-any-rank bit-array args))
 
 (defun %bit-result-array (bv1 result-arg)
   "Resolve the result-array argument of a bit-X function.

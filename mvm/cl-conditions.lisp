@@ -1430,15 +1430,30 @@
   "Argument LIST passed to the last INVOKE-RESTART (:BC-CASE)."
   *restart-case-result*)
 
-(defun %rc-exit (frame)
-  "Pop FRAME off *restart-stack* (normal restart-case exit) and drop its
-   condition association."
-  (setq *restart-stack* (cdr *restart-stack*))
+(defun %restart-frame-unwind (frame)
+  "Remove FRAME -- and anything pushed above it -- from *restart-stack* IF it
+   is still there, and drop its condition association.  Idempotent, so it is
+   safe both as the normal-exit pop and as an UNWIND-PROTECT cleanup.
+
+   A restart frame used to be popped only on normal return or by its own
+   handler; a body that exited NON-LOCALLY to an OUTER handler left it
+   installed.  A later (continue) / (muffle-warning) / (invoke-restart 'foo)
+   then found that dead restart and longjmp'd to a frame that no longer
+   existed -- an unhandled RESTART-INVOCATION (the upstream random-printer
+   tests)."
+  (let ((tail (member frame *restart-stack* :test #'eq)))
+    (when tail
+      (setq *restart-stack* (cdr tail))))
   (when *restart-frame-condition-map*
     (setq *restart-frame-condition-map*
           (remove frame *restart-frame-condition-map*
                   :test (lambda (f e) (eq (car e) f)))))
   nil)
+
+(defun %rc-exit (frame)
+  "Pop FRAME off *restart-stack* (normal restart-case exit) and drop its
+   condition association -- by identity, see %RESTART-FRAME-UNWIND."
+  (%restart-frame-unwind frame))
 
 (defun %rc-invoked-p ()
   "T iff a restart was just invoked (INVOKE-RESTART set the flag)."
@@ -1456,12 +1471,8 @@
 (defun %rc-catch-cleanup (frame)
   "Handler-side cleanup shared with %with-restarts: pop FRAME, reset the
    handler-bind skip that a longjmp short-circuited, drop the association."
-  (setq *restart-stack* (cdr *restart-stack*))
+  (%restart-frame-unwind frame)
   (setq *handler-bind-effective-skip* 0)
-  (when *restart-frame-condition-map*
-    (setq *restart-frame-condition-map*
-          (remove frame *restart-frame-condition-map*
-                  :test (lambda (f e) (eq (car e) f)))))
   nil)
 
 (defun %with-restarts (restarts-spec body-fn)
@@ -1500,6 +1511,7 @@
                     wrapped))))
     (let ((frame (nreverse wrapped)))
       (setq *restart-stack* (cons frame *restart-stack*))
+      (unwind-protect
       (handler-case
           (multiple-value-prog1 (funcall body-fn)
             (setq *restart-stack* (cdr *restart-stack*))
@@ -1537,7 +1549,10 @@
                   ;; Report before dying so the escape is diagnosable.
                   (progn
                     (%report-escaping-condition "with-restarts-no-armed-handler")
-                    (halt)))))))))
+                    (halt))))))
+        ;; Any exit -- including a non-local one to an OUTER handler --
+        ;; removes this frame (a no-op if a path above already did).
+        (%restart-frame-unwind frame)))))
 
 ;;; Override invoke-restart: dispatches on the restart cell's 5th
 ;;; element.  If :case (set by %with-restarts), the cell came from a

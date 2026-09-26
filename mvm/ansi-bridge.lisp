@@ -4154,20 +4154,7 @@
          (t (%mda-row-major-index dims subscripts)))))
     (t (if (null subscripts) 0 (car subscripts)))))
 
-(defun sbit (bit-array &rest subscripts)
-  "Access element of simple bit array."
-  (aref bit-array (if (null subscripts) 0 (car subscripts))))
-
-(defun set-bit (bit-array idx new-value)
-  "Setter for (SETF (BIT BV I) val) — modus's setf macro emits args
-   in (BV IDX VAL) order; not the older val-first convention."
-  (aset bit-array idx new-value)
-  new-value)
-
-(defun set-sbit (bit-array idx new-value)
-  "Setter for (SETF (SBIT BV I) val) — same arg order as set-bit."
-  (aset bit-array idx new-value)
-  new-value)
+;; SBIT / SET-BIT / SET-SBIT: canonical (any-rank) definitions live in cl-types.lisp.
 
 ;;; ============================================================
 ;;; Misc Symbol/Special Form Stubs

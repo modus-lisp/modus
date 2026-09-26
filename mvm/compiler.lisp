@@ -7737,9 +7737,11 @@
              (emit-ir :br *loop-exit-label*))
            (compile-nil dest)))
 
-      ;; BIT — like aref but for bit arrays: (bit array index)
+      ;; BIT — like AREF, with ALL the subscripts.  It took only the first
+      ;; one, so (bit a) on a zero-rank array read (aref a NIL) and
+      ;; (bit m 1 0) on a 2-D one read (aref m 1).  (bit.4)
       ((= op-name 496243224)  ; BIT
-       (compile-form `(aref ,(cadr form) ,(caddr form)) env dest))
+       (compile-form `(aref ,@(cdr form)) env dest))
 
       ;; ARRAY-IN-BOUNDS-P — (array-in-bounds-p array index...)
       ;; Returns T if all indices are valid.  Per CLHS this checks
@@ -8698,6 +8700,11 @@
         (setf dispatch-clauses (nreverse dispatch-clauses))
         (compile-form
          `(let ((,frame-var (%rc-enter (list ,@cell-forms))))
+           ;; UNWIND-PROTECT: a non-local exit through this RESTART-CASE to
+           ;; an OUTER handler must still remove its restarts (see
+           ;; %RESTART-FRAME-UNWIND); the normal paths already did, so the
+           ;; cleanup is then a no-op.
+           (unwind-protect
             (handler-case
                 ;; MULTIPLE-VALUE-PROG1: RESTART-CASE returns ALL the values
                 ;; of its form when no restart fires (binding it to one
@@ -8727,7 +8734,8 @@
                     ;; restart-case body silently (halt)ed the image (exit 1,
                     ;; zero output — the find-system death shape).  `error`
                     ;; itself handles the truly-unarmed case (report + halt).
-                    (error ,cnd-var)))))
+                    (error ,cnd-var))))
+            (%restart-frame-unwind ,frame-var)))
          env dest)))))
 
 ;;; ============================================================

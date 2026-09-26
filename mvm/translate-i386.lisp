@@ -4570,6 +4570,33 @@
            (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
            (i386-store-vreg buf vd +scratch1+)))
 
+        ((op= +op-fround32+)
+         ;; (fround32 Vd Vs) — payload -> CVTSD2SS -> CVTSS2SD -> fresh boxed
+         ;; SINGLE-float (header #x464, x64's).  %ROUND-TO-SINGLE became this
+         ;; native op for speed and i386 had no arm, so its INT3 default fired
+         ;; on EVERY single-float operation -- including the reader building a
+         ;; `1.5' literal.  That is why six of the 22 ladder libraries
+         ;; (alexandria, babel, bordeaux-threads, cl-annot, ieee-floats,
+         ;; parse-float) died at LOAD with SIGTRAP.
+         (let ((vd (first operands)) (vs (second operands)))
+           (i386-load-vreg buf +scratch0+ vs)
+           (i386-emit-float-bits-to-stack buf +scratch0+ +scratch1+)
+           (i386-emit-movsd-xmm-esp buf +i386-xmm0+)
+           (i386-emit-add-reg-imm buf +i386-esp+ 8)
+           ;; CVTSD2SS xmm0,xmm0 (F2 0F 5A) ; CVTSS2SD xmm0,xmm0 (F3 0F 5A)
+           (i386-emit-byte buf #xF2) (i386-emit-byte buf #x0F) (i386-emit-byte buf #x5A)
+           (i386-emit-byte buf (i386-modrm #b11 +i386-xmm0+ +i386-xmm0+))
+           (i386-emit-byte buf #xF3) (i386-emit-byte buf #x0F) (i386-emit-byte buf #x5A)
+           (i386-emit-byte buf (i386-modrm #b11 +i386-xmm0+ +i386-xmm0+))
+           (i386-emit-float-alloc buf +scratch1+ +scratch0+)
+           (i386-emit-mov-mem-imm buf +scratch1+ 0 #x464)     ; single-float header
+           (i386-emit-sub-reg-imm buf +i386-esp+ 8)
+           (i386-emit-movsd-esp-xmm buf +i386-xmm0+)
+           (i386-emit-float-bits-from-stack buf +scratch1+ +scratch0+)
+           (i386-emit-add-reg-imm buf +i386-esp+ 8)
+           (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
+           (i386-store-vreg buf vd +scratch1+)))
+
         ((op= +op-itof+)
          ;; (itof Vd Vs) — tagged integer -> freshly allocated float object.
          (let ((vd (first operands)) (vs (second operands)))

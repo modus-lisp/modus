@@ -5853,6 +5853,20 @@
       ((symbolp form)
        (compile-variable-ref form env dest))
 
+      ;; A cons whose CAR is an INTEGER is never a compound form -- it is
+      ;; one of the runtime's cons-represented OBJECTS spliced into code as
+      ;; a literal: a package (987654321 . #<array>), an adjustable/fill-
+      ;; pointer vector wrapper (8765432 ...), etc.  CLHS 3.1.2.1.3: such
+      ;; objects are SELF-EVALUATING.  Compiled as a call they returned
+      ;; garbage: every def-pprint-test binds (*package* #<PACKAGE CL-TEST>)
+      ;; with the package object itself, and the whole LET evaluated to 0.
+      ;; COMPILE-QUOTE keeps identity at runtime (the constant pool), so the
+      ;; package stays EQ.  (CL-symbol wrappers never get here: SYMBOLP is
+      ;; wrapper-aware and is tested above; the tag is excluded anyway.)
+      ((and (consp form) (integerp (car form))
+            (not (eql (car form) 123456789)))
+       (compile-quote form dest))
+
       ;; Compound forms (special forms, builtins, calls)
       ((consp form)
        (compile-compound form env dest))

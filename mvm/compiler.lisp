@@ -968,6 +968,15 @@
       (setq *runtime-special-names* (make-hash-table :test 'eql)))
     (setf (gethash name-hash *runtime-special-names*) t)))
 
+(defun %proclaim-special-name (sym)
+  "PROCLAIM (SPECIAL SYM) at runtime: record SYM in *RUNTIME-SPECIAL-NAMES*.
+   Unconditional -- PROCLAIM is a runtime call, not something the compiler
+   sees, so it cannot wait for *MVM-EVAL-RUNTIME-P*."
+  (unless *runtime-special-names*
+    (setq *runtime-special-names* (make-hash-table :test 'eql)))
+  (setf (gethash (normalize-name sym) *runtime-special-names*) t)
+  sym)
+
 (defun %runtime-special-p (var)
   "T when VAR was defvar'd/defparameter'd at runtime under mvm-eval."
   (and *mvm-eval-runtime-p*
@@ -2619,6 +2628,20 @@
   (cond ((stringp name) name)
         ((symbolp name) (%rt-fn-name name))
         (t nil)))
+
+(defun %declaim-note-special (form)
+  "Record (special v ...) specs of a DECLAIM/PROCLAIM form, so later LET /
+   LET* bindings of those names are DYNAMIC (CLHS 3.3.4).  The form itself
+   compiles to a no-op, so this compile-time note is the whole effect; it
+   used to be missing, and after (declaim (special *x*)) every
+   (let ((*x* v)) ...) bound *x* lexically."
+  (dolist (spec (cdr form))
+    (let ((s (if (and (consp spec) (name-eq (car spec) "QUOTE") (consp (cdr spec)))
+                 (cadr spec)
+                 spec)))
+      (when (and (consp s) (symbolp (car s)) (name-eq (car s) "SPECIAL"))
+        (dolist (v (cdr s))
+          (when (and v (symbolp v)) (%proclaim-special-name v)))))))
 
 (defun %declaim-note-inline (form)
   "Record (inline f …) / (notinline f …) specs of a DECLAIM/PROCLAIM form."
@@ -5511,6 +5534,7 @@
              (slot-names nil)
              (initarg-pairs nil)    ; (cons :kw 'slot) forms
              (initform-pairs nil)   ; (cons 'slot (lambda () form)) forms
+             (class-slots nil)      ; slots declared :ALLOCATION :CLASS
              (extra-defuns nil))
         (dolist (spec slot-specs)
           (let* ((sname (if (consp spec) (car spec) spec))
@@ -5595,6 +5619,14 @@
                                        `(defun ,set-name (obj nv)
                                           (%gf-dispatch '(setf ,val) (list nv obj))))
                                    extra-defuns))))
+                    ;; :ALLOCATION :CLASS -- one value shared by every
+                    ;; instance (CLHS 7.5.1).  The runtime has the per-class
+                    ;; storage (%CLASS-SLOT-GET/SET); only the ANSI gate
+                    ;; runner's DEFCLASS expander ever registered the slot,
+                    ;; so in the CLI each instance got its own copy.
+                    ((and (symbolp key) (string= (symbol-name key) "ALLOCATION"))
+                     (when (and (symbolp val) (string= (symbol-name val) "CLASS"))
+                       (setq class-slots (cons sname class-slots))))
                     ((and (symbolp key) (string= (symbol-name key) "INITARG"))
                      (setq initarg-pairs
                            (cons `(cons ',val ',sname) initarg-pairs)))
@@ -5643,6 +5675,8 @@
                                        (list ,@(nreverse initarg-pairs))
                                        (list ,@(nreverse initform-pairs)))
              (%register-clos-direct-slots ',class-name ',slot-names)
+             ;; Always emitted (even empty) so a redefinition clears it.
+             (%register-clos-class-slots ',class-name ',(reverse class-slots))
              (%register-clos-default-initargs ',class-name
                                               (list ,@(nreverse default-initarg-pairs)))
              ,@(nreverse extra-defuns)
@@ -7996,7 +8030,8 @@
        (%declaim-note-optimize form)
        (when *mvm-eval-runtime-p*
          (%declaim-note-inline form)
-         (%declaim-note-type form))
+         (%declaim-note-type form)
+         (%declaim-note-special form))
        (compile-nil dest))
 
       (t (compile-call op (cdr form) env dest)))))
@@ -23825,7 +23860,8 @@
      (%declaim-note-optimize form)
      (when *mvm-eval-runtime-p*
        (%declaim-note-inline form)
-       (%declaim-note-type form))
+       (%declaim-note-type form)
+       (%declaim-note-special form))
      nil)
 
     ;; (eval-when (situations...) body...) — compile body as top-level forms

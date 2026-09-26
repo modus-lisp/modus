@@ -1028,6 +1028,17 @@
     ;; %inline-expansion in compiler.lisp).  Other kinds stay no-ops.
     (%declaim-note-inline (list 'declaim decl))
     (%declaim-note-type (list 'declaim decl))
+    ;; SPECIAL: every later LET/LET* of these names must bind DYNAMICALLY
+    ;; (CLHS 3.3.4).  Record them in the same runtime registry DEFVAR feeds,
+    ;; which the LET dispatch consults.  It used to be a no-op, so after
+    ;; (declaim (special *x*)) a (let ((*x* 1)) ...) bound *x* lexically and
+    ;; every function reading *x* saw the global value instead.
+    (when (and (consp decl) (symbolp (car decl))
+               ;; by name via %MLL-NAME-EQ: SYMBOL-NAME answers "" for some
+               ;; native symbols in-image
+               (%mll-name-eq (car decl) "SPECIAL"))
+      (dolist (v (cdr decl))
+        (when (symbolp v) (%proclaim-special-name v))))
     nil))
 
 (defun declaim (&rest decls)

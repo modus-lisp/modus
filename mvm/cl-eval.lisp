@@ -4074,6 +4074,20 @@
     (t
      (values nil nil (list (gensym "GSE-V")) place place))))
 
+(defun %rmw-place (place newval-fn pre-bindings)
+  "Read-modify-write expansion for INCF/DECF/PUSH/POP/PUSHNEW (the runtime
+   macros): bind PRE-BINDINGS (e.g. PUSH's item, evaluated first), then the
+   place's temporaries from GET-SETF-EXPANSION -- so every subform of PLACE
+   is evaluated exactly once, left to right (CLHS 5.1.3) -- then the store
+   variable to (NEWVAL-FN reader), and run the writer."
+  (multiple-value-bind (vars vals stores writer reader)
+      (get-setf-expansion place)
+    (list 'let*
+          (append pre-bindings
+                  (mapcar (function list) vars vals)
+                  (list (list (car stores) (funcall newval-fn reader))))
+          writer)))
+
 ;;; SETF-SYMBOL-FUNCTION / SETF-MACRO-FUNCTION runtime entries —
 ;;; some tests do (setf (symbol-function …) …) via eval.
 

@@ -86,28 +86,35 @@
                      nil))))))
          (t nil)))"
 
+    ;; INCF / DECF / PUSH / POP / PUSHNEW: CLHS 5.1.3 -- each subform of the
+    ;; PLACE is evaluated ONCE, left to right (after PUSH's item).  These
+    ;; used to be textual (setf PLACE (op PLACE ...)), which evaluated the
+    ;; place's subforms twice: (push x (aref v (incf i))) bumped I twice and
+    ;; read and wrote DIFFERENT elements (push.order.2, then garbage).
+    ;; %RMW-PLACE builds the expansion from GET-SETF-EXPANSION.
     "(defmacro incf (place &rest delta)
-       (let ((d (if delta (car delta) 1)))
-         (list 'setf place (list '+ place d))))"
+       (%rmw-place place (lambda (acc) (list '+ acc (if delta (car delta) 1))) nil))"
 
     "(defmacro decf (place &rest delta)
-       (let ((d (if delta (car delta) 1)))
-         (list 'setf place (list '- place d))))"
+       (%rmw-place place (lambda (acc) (list '- acc (if delta (car delta) 1))) nil))"
 
     "(defmacro push (val place)
-       (list 'setf place (list 'cons val place)))"
+       (let ((g (gensym \"PSH\")))
+         (%rmw-place place (lambda (acc) (list 'cons g acc)) (list (list g val)))))"
 
     "(defmacro pop (place)
        (let ((tmp (gensym \"POP\")))
-         (list 'let (list (list tmp (list 'car place)))
-               (list 'setf place (list 'cdr place))
-               tmp)))"
+         (list 'let (list (list tmp nil))
+               (%rmw-place place
+                           (lambda (acc) (list 'cdr (list 'setq tmp acc)))
+                           nil)
+               (list 'car tmp))))"
 
-    "(defmacro pushnew (val place)
-       (let ((vtmp (gensym \"PN\")))
-         (list 'let (list (list vtmp val))
-               (list 'unless (list 'member vtmp place)
-                     (list 'setf place (list 'cons vtmp place))))))"
+    "(defmacro pushnew (val place &rest keys)
+       (let ((g (gensym \"PN\")))
+         (%rmw-place place
+                     (lambda (acc) (cons 'adjoin (cons g (cons acc keys))))
+                     (list (list g val)))))"
 
     ;; DO and DO* — sequential variable update (technically DO is
     ;; supposed to be parallel; we approximate as sequential, which

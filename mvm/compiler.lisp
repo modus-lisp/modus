@@ -4447,25 +4447,10 @@
         `(defmacro ,name (%dmm-place &rest %dmm-args)
            (%dmm-expand ',fn %dmm-place %dmm-args)))))
 
-  ;; GET-SETF-EXPANSION — stub returning a generic 5-value tuple.
-  ;; Used by tests that introspect setf machinery; the structure is correct
-  ;; even if the store-form would not actually update for unknown places.
-  (mvm-define-macro "GET-SETF-EXPANSION"
-    (lambda (form)
-      (let ((place (cadr form)))
-        ;; place is typically a quoted form like (quote (my-car x)).
-        ;; We return code that, at runtime, builds the 5-value tuple from `place'.
-        `(let* ((p ,place)
-                (g (%mvm-gensym "GSE-")))
-           (if (consp p)
-               (values nil
-                       (cdr p)
-                       (cons g nil)
-                       (cons 'setf (cons p (cons g nil)))
-                       p)
-               (values nil nil (cons g nil)
-                       (cons 'setq (cons p (cons g nil)))
-                       p))))))
+  ;; (GET-SETF-EXPANSION used to be a stub MACRO here, shadowing the real
+  ;; function in cl-eval.lisp: it returned NO temporaries and handed back the
+  ;; original subforms as both the reader and the writer, so every user of
+  ;; it evaluated them twice.  Removed; the function does CLHS 5.1.2.)
 
   ;; LDB — extract byte field from integer
   ;; (ldb (byte size position) integer) → (logand (ash integer (- position)) mask)
@@ -4568,32 +4553,12 @@
           `(%safe-car (%safe-cdr (%safe-cdr (%safe-cdr ,(cadr form)))))
           '(%signal-program-error))))
 
-  ;; PUSH — (push item place) → (setq place (cons item place))
-  ;; PUSH/POP/DECF — must expand via SETF, not SETQ: SETQ only assigns to a
-  ;; symbol, so on a non-symbol place (e.g. (mvm-stack state)) the old SETQ
-  ;; expansion silently no-op'd.  CLHS defines push/pop/incf/decf in terms of
-  ;; SETF.  (For a symbol place SETF lowers to SETQ — identical output.)
-  (mvm-define-macro "PUSH"
-    (lambda (form)
-      (let ((item (cadr form))
-            (place (caddr form)))
-        `(setf ,place (cons ,item ,place)))))
-
-  ;; POP — (pop place) → (let ((tmp (car place))) (setf place (cdr place)) tmp)
-  (mvm-define-macro "POP"
-    (lambda (form)
-      (let ((place (cadr form))
-            (tmp (%mvm-gensym "POP")))
-        `(let ((,tmp (car ,place)))
-           (setf ,place (cdr ,place))
-           ,tmp))))
-
-  ;; DECF — (decf place [delta]) → (setf place (- place delta))
-  (mvm-define-macro "DECF"
-    (lambda (form)
-      (let ((place (cadr form))
-            (delta (or (caddr form) 1)))
-        `(setf ,place (- ,place ,delta)))))
+  ;; (A second, naive PUSH / POP / DECF used to be defined HERE -- plain
+  ;; (setf place (cons item place)) -- and, defined later, it replaced the
+  ;; place-expansion versions above, so every subform of the place ran TWICE:
+  ;; (push x (aref v (incf i))) incremented I twice, read one element and
+  ;; wrote another.  PUSH.ORDER.2 then read out of bounds and the garbage it
+  ;; pushed crashed the escaping-closure walker.  Removed.)
 
   ;; PROG1 — evaluate forms, return first
   (mvm-define-macro "PROG1"

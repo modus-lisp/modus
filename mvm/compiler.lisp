@@ -12111,13 +12111,35 @@
     (declare (special *promote-loop-depth*))
     (%compile-loop-1 body env dest)))
 
+(defun %loop-nonil-marker-p (x)
+  "True for the (%LOOP-NONIL) marker GENERATE-LOOP-CODE puts at the head of
+   a NAMED loop's inner simple LOOP."
+  (and (consp x) (symbolp (car x)) (null (cdr x))
+       (string= (symbol-name (car x)) "%LOOP-NONIL")))
+
 (defun %compile-loop-1 (body env dest)
   "Compile (loop forms...) - either simple infinite loop or CL-style loop.
    Per CLHS, an unnamed LOOP establishes an implicit BLOCK NIL; we push
    a fresh (NIL exit dest) onto *block-labels* so compile-return finds
    the LOOP's block before any outer match.  Suppressed when the LOOP is
    NAMED — in that case the named block is the implicit block, RETURN
-   targets the outer nil if present."
+   targets the outer nil if present.
+
+   The suppression rides a (%LOOP-NONIL) MARKER at the head of the body,
+   not only *SUPPRESS-LOOP-BLOCK-NIL*: that special is LET-bound by the
+   %NAMED-LOOP dispatch, and a special LET inside the compiler is invisible
+   to its callees in the SELF-HOSTED compiler (the documented mvm-eval
+   limitation), so every runtime-compiled (loop named foo ... (return x))
+   returned from the LOOP instead of the enclosing BLOCK NIL.  The marker
+   also scopes the suppression to exactly this one loop -- a user loop
+   nested in the body still gets its own BLOCK NIL."
+  (let ((nonil (and (consp body) (%loop-nonil-marker-p (car body)))))
+    (when nonil (setq body (cdr body)))
+    (%compile-loop-2 body env dest (or nonil *suppress-loop-block-nil*))))
+
+(defun %compile-loop-2 (body env dest suppress-nil)
+  "Body of %COMPILE-LOOP-1; SUPPRESS-NIL says whether to skip the implicit
+   BLOCK NIL."
   (if (and (consp body) (cl-loop-keyword-p (car body)))
       ;; CL-style loop: expand to basic forms, then compile
       (compile-form (expand-cl-loop body) env dest)
@@ -12141,7 +12163,7 @@
       ;; LET — the documented mvm-eval limitation).
       (if (and (not (prog1 *in-loop-catch-wrap*
                       (setq *in-loop-catch-wrap* nil)))
-               (not *suppress-loop-block-nil*)
+               (not suppress-nil)
                (%return-from-escapes-block-p body 0 nil nil)
                (not (%block-runtime-catch-unsafe-p body)))
           (let* ((tag-val (progn
@@ -12177,10 +12199,20 @@
                  (*loop-exit-label* exit-label)
                  (*loop-exit-uwp-seq* (%uwp-current-seq))
                  (*block-labels*
-                   (if *suppress-loop-block-nil*
-                       *block-labels*
-                       (cons (list nil exit-label dest (%uwp-current-seq))
-                             *block-labels*))))
+                   ;; :%LOOP-EXIT is this loop's own exit for the
+                   ;; generator's (RETURN-FROM :%LOOP-EXIT v) forms -- present even when
+                   ;; the implicit BLOCK NIL is suppressed (NAMED loop).  It
+                   ;; lives in *BLOCK-LABELS* rather than being read from
+                   ;; *LOOP-EXIT-LABEL* because that special, bound in this
+                   ;; same LET*, is not visible to callees in the self-hosted
+                   ;; compiler; *BLOCK-LABELS* demonstrably is.
+                   (let ((own (cons (list :%loop-exit exit-label dest
+                                          (%uwp-current-seq))
+                                    *block-labels*)))
+                     (if suppress-nil
+                         own
+                         (cons (list nil exit-label dest (%uwp-current-seq))
+                               own)))))
             ;; Loop entry
             (emit-ir-label loop-label)
             ;; Compile loop body.  A simple LOOP never yields a body value, so
@@ -12285,10 +12317,17 @@
    etc.), return (typespec . new-rest).  Else NIL.  Only fires when
    the FOLLOWING token is itself a loop keyword so we don't eat a
    value expression."
-  (when (and rest (cdr rest) (symbolp (car rest))
+  (when (and rest (symbolp (car rest)) (car rest) (not (eq (car rest) t))
              (not (cl-loop-keyword-p (car rest)))
-             (symbolp (cadr rest))
-             (cl-loop-keyword-p (cadr rest)))
+             (or
+              ;; FIXNUM / FLOAT: CLHS simple-type-specs, legal BARE wherever
+              ;; a type-spec may appear -- including at the very END of the
+              ;; loop (`maximize x fixnum)'), where there is no following
+              ;; keyword for the heuristic below to see.
+              (%loop-simple-type-spec-p (car rest))
+              (and (cdr rest)
+                   (symbolp (cadr rest))
+                   (cl-loop-keyword-p (cadr rest)))))
     (cons (car rest) (cdr rest))))
 
 (defun %loop-iter-intro-kw-p (x)
@@ -12491,7 +12530,7 @@
     (:minimize `(let ((%v ,expr))
                   (setq ,into-var (if (null ,into-var) %v
                                       (if (%loop-lt %v ,into-var) %v ,into-var)))))
-    (:return  `(return ,expr))
+    (:return  `(return-from :%loop-exit ,expr))
     (:do      expr)
     (t (error "%loop-acc-stmt: bad kind ~A" kind))))
 
@@ -12579,7 +12618,7 @@
                          (cons 'progn do-forms))
                      stmts)))
             (:return
-             (push `(return ,(cadr rest)) stmts)
+             (push `(return-from :%loop-exit ,(cadr rest)) stmts)
              (setf rest (cddr rest)))
             ((:when :unless)
              ;; Nested WHEN/IF/UNLESS inside a conditional clause.  Recurse
@@ -12668,6 +12707,16 @@
                  (push (%loop-acc-stmt kind expr var) stmts))))))))
     (cons (nreverse stmts) rest)))
 
+(defun %loop-real-acc-count (state)
+  "Accumulators that get a chunk of ACC-BODY (i.e. not :ANON-COND markers)."
+  (let ((n 0))
+    (dolist (a (loop-state-accumulator state) n)
+      (unless (eq (car a) :anon-cond) (setq n (+ n 1))))))
+
+(defun %loop-acc-slot-p (x)
+  (and (consp x) (symbolp (car x)) (null (cdr x))
+       (string= (symbol-name (car x)) "%LOOP-ACC-SLOT")))
+
 (defun parse-cl-loop (body)
   "Parse loop clauses into a loop-state struct."
   (let ((state (make-loop-state))
@@ -12679,7 +12728,8 @@
       (setf (loop-state-block-name state) (cadr rest))
       (setf rest (cddr rest)))
     (loop while rest do
-      (let ((kw (normalize-name (car rest))))
+      (let ((%acc-n0 (%loop-real-acc-count state)))
+        (let ((kw (normalize-name (car rest))))
         (cond
           ;; END as a top-level token: defensive no-op (most ENDs are
           ;; consumed inside WHEN/IF/UNLESS, but a stray one shouldn't
@@ -12924,6 +12974,12 @@
                                (= (compute-name-hash (symbol-name (car rest)))
                                   517285148))  ; BY
                       (setf rest (cdr rest))
+                      ;; CLHS 6.1.1.4: the list form is evaluated BEFORE the
+                      ;; BY form.  BY is captured in a with-binding, so the
+                      ;; list form must be too, ahead of it, or BY runs first.
+                      (let ((lv (%mvm-gensym "LIV")))
+                        (push (list lv list-form) (loop-state-with-bindings state))
+                        (setf list-form lv))
                       (let ((g (%mvm-gensym "INBY")))
                         (push (list g (car rest)) (loop-state-with-bindings state))
                         (setf by-fn g))
@@ -12962,6 +13018,12 @@
                                (= (compute-name-hash (symbol-name (car rest)))
                                   517285148))  ; BY
                       (setf rest (cdr rest))
+                      ;; CLHS 6.1.1.4: the list form is evaluated BEFORE the
+                      ;; BY form.  BY is captured in a with-binding, so the
+                      ;; list form must be too, ahead of it, or BY runs first.
+                      (let ((lv (%mvm-gensym "LOV")))
+                        (push (list lv list-form) (loop-state-with-bindings state))
+                        (setf list-form lv))
                       (let ((g (%mvm-gensym "ONBY")))
                         (push (list g (car rest)) (loop-state-with-bindings state))
                         (setf by-fn g))
@@ -13093,22 +13155,20 @@
           ;; acc-body is appended AFTER body, so a WHILE that follows a
           ;; COLLECT cannot be expressed by an in-body position.
           ((= kw 208372112)  ; WHILE
-           (let ((test `(if (null ,(cadr rest)) (return nil))))
+           (let ((test `(if (null ,(cadr rest)) (return-from :%loop-exit nil))))
              (cond
-               ((loop-state-accumulator state)
-                (push test (loop-state-post-body-tests state)))
-               ((loop-state-body-forms state)
+               ((or (loop-state-body-forms state)
+                    (loop-state-accumulator state))
                 (push test (loop-state-body-forms state)))
                (t (push test (loop-state-pre-body-tests state)))))
            (setf rest (cddr rest)))
 
           ;; UNTIL condition — same source-order rule.
           ((= kw 301724213)  ; UNTIL
-           (let ((test `(if ,(cadr rest) (return nil))))
+           (let ((test `(if ,(cadr rest) (return-from :%loop-exit nil))))
              (cond
-               ((loop-state-accumulator state)
-                (push test (loop-state-post-body-tests state)))
-               ((loop-state-body-forms state)
+               ((or (loop-state-body-forms state)
+                    (loop-state-accumulator state))
                 (push test (loop-state-body-forms state)))
                (t (push test (loop-state-pre-body-tests state)))))
            (setf rest (cddr rest)))
@@ -13316,7 +13376,14 @@
           ((or (= kw 435414233) (= kw 348520500))   ; MAXIMIZE
            (let ((expr (cadr rest)))
              (setf rest (cddr rest))
+             ;; Optional type-spec (OF-TYPE x, or a bare simple-type-spec)
+             ;; before and after INTO, exactly as SUM / COUNT take it.
+             (let ((ot (or (%loop-try-of-type rest) (%loop-try-bare-type rest))))
+               (when ot (setf rest (cdr ot))))
              (let ((iv (%loop-try-into rest)))
+               (when iv
+                 (let ((ot2 (%loop-try-of-type (cddr iv))))
+                   (when ot2 (setf iv (list* (car iv) (cadr iv) (cdr ot2))))))
                (when iv (setf rest (cddr iv)))
                (push (if iv (list :maximize expr (car iv)) (list :maximize expr))
                      (loop-state-accumulator state)))))
@@ -13324,7 +13391,14 @@
           ((or (= kw 470771431) (= kw 18723802))  ; MINIMIZE
            (let ((expr (cadr rest)))
              (setf rest (cddr rest))
+             ;; Optional type-spec (OF-TYPE x, or a bare simple-type-spec)
+             ;; before and after INTO, exactly as SUM / COUNT take it.
+             (let ((ot (or (%loop-try-of-type rest) (%loop-try-bare-type rest))))
+               (when ot (setf rest (cdr ot))))
              (let ((iv (%loop-try-into rest)))
+               (when iv
+                 (let ((ot2 (%loop-try-of-type (cddr iv))))
+                   (when ot2 (setf iv (list* (car iv) (cadr iv) (cdr ot2))))))
                (when iv (setf rest (cddr iv)))
                (push (if iv (list :minimize expr (car iv)) (list :minimize expr))
                      (loop-state-accumulator state)))))
@@ -13454,13 +13528,19 @@
 
           ;; RETURN expr
           ((= kw 232767877)  ; RETURN
-           (push `(return ,(cadr rest)) (loop-state-body-forms state))
+           (push `(return-from :%loop-exit ,(cadr rest)) (loop-state-body-forms state))
            (setf rest (cddr rest)))
 
           ;; Unknown keyword — treat as body form
           (t
            (push (car rest) (loop-state-body-forms state))
-           (setf rest (cdr rest))))))
+           (setf rest (cdr rest)))))
+        ;; One (%LOOP-ACC-SLOT) marker per accumulator this clause added, at
+        ;; its SOURCE position among the body forms: GENERATE-LOOP-CODE splices
+        ;; each accumulator's code in there, so `collect x do (loop-finish)'
+        ;; collects before it finishes (CLHS 6.1.1.4 -- clauses run in order).
+        (dotimes (%k (- (%loop-real-acc-count state) %acc-n0))
+          (push (list '%loop-acc-slot) (loop-state-body-forms state)))))
 
     ;; Reverse accumulated lists
     (setf (loop-state-iterations state) (nreverse (loop-state-iterations state)))
@@ -13703,10 +13783,10 @@
                ;; raw `>` is fixnum-only and silently mis-compares with a
                ;; boxed-float pointer, hanging the loop.
                (push (ecase (loop-iter-end-test iter)
-                       (:to    `(if (%loop-gt ,var ,end-var) (progn ,back-out (return nil))))
-                       (:below `(if (%loop-ge ,var ,end-var) (progn ,back-out (return nil))))
-                       (:downto `(if (%loop-lt ,var ,end-var) (progn ,back-out (return nil))))
-                       (:above `(if (%loop-le ,var ,end-var) (progn ,back-out (return nil)))))
+                       (:to    `(if (%loop-gt ,var ,end-var) (progn ,back-out (return-from :%loop-exit nil))))
+                       (:below `(if (%loop-ge ,var ,end-var) (progn ,back-out (return-from :%loop-exit nil))))
+                       (:downto `(if (%loop-lt ,var ,end-var) (progn ,back-out (return-from :%loop-exit nil))))
+                       (:above `(if (%loop-le ,var ,end-var) (progn ,back-out (return-from :%loop-exit nil)))))
                      test-forms)))
            (if (and (loop-iter-end-test iter)
                     (member (loop-iter-end-test iter) '(:downto :above)))
@@ -13719,7 +13799,7 @@
                (by-fn (loop-iter-by-form iter)))
            (push (list tmp (loop-iter-init-form iter)) bindings)
            (push (list var nil) bindings)
-           (push `(if (null ,tmp) (return nil)) test-forms)
+           (push `(if (null ,tmp) (return-from :%loop-exit nil)) test-forms)
            (push `(setq ,var (car ,tmp)) init-stmts)
            (if by-fn
                (push `(setq ,tmp (funcall ,by-fn ,tmp)) step-stmts)
@@ -13729,7 +13809,7 @@
          (let ((var (loop-iter-var iter))
                (by-fn (loop-iter-by-form iter)))
            (push (list var (loop-iter-init-form iter)) bindings)
-           (push `(if (null ,var) (return nil)) test-forms)
+           (push `(if (null ,var) (return-from :%loop-exit nil)) test-forms)
            (if by-fn
                (push `(setq ,var (funcall ,by-fn ,var)) step-stmts)
                (push `(setq ,var (cdr ,var)) step-stmts))))
@@ -13747,7 +13827,7 @@
            ;; the fill-pointer, not the underlying size. Cache once at entry
            ;; so we don't pay the wrapper-peel cost per element.
            (push (list lim `(length ,arr)) bindings)
-           (push `(if (>= ,idx ,lim) (return nil)) test-forms)
+           (push `(if (>= ,idx ,lim) (return-from :%loop-exit nil)) test-forms)
            ;; Public AREF already returns a CHARACTER for strings (conformant
            ;; as of e159986) and the raw element for other arrays, so no
            ;; code-char wrap is needed.  Wrapping a value that is ALREADY a
@@ -13800,16 +13880,16 @@
                  (push `(setq ,var ,(loop-iter-step-form iter)) step-stmts)))))
 
         (:while
-         (push `(if (null ,(loop-iter-init-form iter)) (return nil)) test-forms))
+         (push `(if (null ,(loop-iter-init-form iter)) (return-from :%loop-exit nil)) test-forms))
 
         (:until
-         (push `(if ,(loop-iter-init-form iter) (return nil)) test-forms))
+         (push `(if ,(loop-iter-init-form iter) (return-from :%loop-exit nil)) test-forms))
 
         (:repeat
          (let ((var (loop-iter-var iter)))
            (push (list var (loop-iter-init-form iter)) bindings)
            ;; %loop-le handles float/ratio bounds without hanging.
-           (push `(if (%loop-le ,var 0) (return nil)) test-forms)
+           (push `(if (%loop-le ,var 0) (return-from :%loop-exit nil)) test-forms)
            (push `(setq ,var (- ,var 1)) step-stmts)))
 
         ;; FOR var BEING THE HASH-KEY[S] OF ht [USING (HASH-VALUE v)]
@@ -13825,7 +13905,7 @@
            (push (list var nil) bindings)
            (when using (push (list using nil) bindings))
            (push (list pair-var nil) bindings)
-           (push `(if (null ,alist) (return nil)) test-forms)
+           (push `(if (null ,alist) (return-from :%loop-exit nil)) test-forms)
            (push `(setq ,pair-var (car ,alist)) init-stmts)
            (push `(setq ,var (car ,pair-var)) init-stmts)
            (when using
@@ -13842,7 +13922,7 @@
            (push (list var nil) bindings)
            (when using (push (list using nil) bindings))
            (push (list pair-var nil) bindings)
-           (push `(if (null ,alist) (return nil)) test-forms)
+           (push `(if (null ,alist) (return-from :%loop-exit nil)) test-forms)
            (push `(setq ,pair-var (car ,alist)) init-stmts)
            (push `(setq ,var (cdr ,pair-var)) init-stmts)
            (when using
@@ -13858,7 +13938,7 @@
            (push (list lst `(%loop-collect-symbols ,(loop-iter-init-form iter)))
                  bindings)
            (push (list var nil) bindings)
-           (push `(if (null ,lst) (return nil)) test-forms)
+           (push `(if (null ,lst) (return-from :%loop-exit nil)) test-forms)
            (push `(setq ,var (car ,lst)) init-stmts)
            (push `(setq ,lst (cdr ,lst)) step-stmts)))
 
@@ -13870,7 +13950,7 @@
                              ,(loop-iter-init-form iter)))
                  bindings)
            (push (list var nil) bindings)
-           (push `(if (null ,lst) (return nil)) test-forms)
+           (push `(if (null ,lst) (return-from :%loop-exit nil)) test-forms)
            (push `(setq ,var (car ,lst)) init-stmts)
            (push `(setq ,lst (cdr ,lst)) step-stmts)))
 
@@ -13882,7 +13962,7 @@
                              ,(loop-iter-init-form iter)))
                  bindings)
            (push (list var nil) bindings)
-           (push `(if (null ,lst) (return nil)) test-forms)
+           (push `(if (null ,lst) (return-from :%loop-exit nil)) test-forms)
            (push `(setq ,var (car ,lst)) init-stmts)
            (push `(setq ,lst (cdr ,lst)) step-stmts)))))
 
@@ -13927,11 +14007,11 @@
                    acc-body))
             (:always
              (setf has-always t)
-             (push `(unless ,(cadr acc) (return nil)) acc-body))
+             (push `(unless ,(cadr acc) (return-from :%loop-exit nil)) acc-body))
             (:thereis
              (setf has-thereis t)
              (push `(let ((,av ,(cadr acc)))
-                      (when ,av (return ,av))) acc-body))
+                      (when ,av (return-from :%loop-exit ,av))) acc-body))
             (:anon-cond
              ;; No body emission — body-forms already contains the setq
              ;; via the conditional clause built in parse-cl-loop.  This
@@ -13959,12 +14039,24 @@
                                 ;; (post-init pre-body) so iter vars are
                                 ;; bound.
                                 pre-body-tests
-                                body
-                                acc-body
+                                ;; Each accumulator's chunk goes at its
+                                ;; (%LOOP-ACC-SLOT) marker, i.e. in source
+                                ;; order with the DO / WHILE / conditional
+                                ;; forms; any chunk without a marker trails.
+                                (let ((chunks acc-body) (out nil))
+                                  (dolist (f body)
+                                    (if (%loop-acc-slot-p f)
+                                        (when chunks
+                                          (push (car chunks) out)
+                                          (setq chunks (cdr chunks)))
+                                        (push f out)))
+                                  (append (nreverse out) chunks))
                                 ;; WHILE/UNTIL parsed AFTER body, here.
                                 post-body-tests
                                 (nreverse step-stmts)))
-             (inner `(loop ,@loop-body))
+             (inner (if block-name
+                        `(loop (%loop-nonil) ,@loop-body)
+                        `(loop ,@loop-body)))
              ;; For always: rewrite iteration-end returns
              ;; The test-forms have (return nil) for exhaustion — we need
              ;; (return t) for always (all passed).
@@ -13979,16 +14071,16 @@
                    (mapcar (lambda (tf)
                              (cond
                                ((and (consp tf) (eq (car tf) 'if)
-                                     (equal (caddr tf) '(return nil)))
-                                `(if ,(cadr tf) (return t)))
+                                     (equal (caddr tf) '(return-from :%loop-exit nil)))
+                                `(if ,(cadr tf) (return-from :%loop-exit t)))
                                ;; (if TEST (progn BACK-OUT (return nil)))
                                ((and (consp tf) (eq (car tf) 'if)
                                      (consp (caddr tf))
                                      (eq (car (caddr tf)) 'progn)
-                                     (equal (car (last (caddr tf))) '(return nil)))
+                                     (equal (car (last (caddr tf))) '(return-from :%loop-exit nil)))
                                 (let* ((then (caddr tf))
                                        (back-stmts (butlast (cdr then))))
-                                  `(if ,(cadr tf) (progn ,@back-stmts (return t)))))
+                                  `(if ,(cadr tf) (progn ,@back-stmts (return-from :%loop-exit t)))))
                                (t tf)))
                            loop-body)
                    loop-body))
@@ -14047,7 +14139,7 @@
                                     (string= (symbol-name (car x)) "LOOP-FINISH")
                                     (null (cdr x)))
                                `(progn (setq ,%nat-var t)
-                                       (return ,loop-finish-return-val)))
+                                       (return-from :%loop-exit ,loop-finish-return-val)))
                               ;; Manual car/cdr walk — mapcar fails on
                               ;; dotted pairs which appear inside quoted
                               ;; data and some setq-targets.  rec-cdr
@@ -14069,7 +14161,9 @@
                (mapcar loop-finish-expander test-forms-with-nat))
              (inner2 (if (eq effective-body loop-body)
                          inner
-                         `(loop ,@effective-body)))
+                         (if block-name
+                             `(loop (%loop-nonil) ,@effective-body)
+                             `(loop ,@effective-body))))
              ;; Pre-finally fixups for the list accumulators: there are none.
              ;; NONE.  The list accumulators are built forward onto a tail
              ;; pointer, so every one of them is already in iteration order —

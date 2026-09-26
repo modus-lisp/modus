@@ -866,9 +866,13 @@
    Uses multiple-value-prog1 so body-fn's full MV-state propagates
    — `(let ((result (funcall body-fn))) … result)` would have
    collapsed (values …) to a single value."
-  (setq *restart-stack* (cons restarts *restart-stack*))
-  (multiple-value-prog1 (funcall body-fn)
-    (setq *restart-stack* (cdr *restart-stack*))))
+  ;; Pop by RESTORING the saved stack in an UNWIND-PROTECT: a RETURN-FROM /
+  ;; THROW / GO out of BODY-FN (restart-bind.4 and friends) used to skip the
+  ;; pop and leave this frame installed for the rest of the process.
+  (let ((saved *restart-stack*))
+    (setq *restart-stack* (cons restarts saved))
+    (unwind-protect (funcall body-fn)
+      (setq *restart-stack* saved))))
 
 (defun %pop-restarts ()
   "Pop the top restart frame."

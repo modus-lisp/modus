@@ -349,6 +349,25 @@
        (list '%print-unreadable-object (car spec) (cadr spec)
              (getf (cddr spec) :type) (getf (cddr spec) :identity)
              (if body (list 'function (cons 'lambda (cons nil body))) nil)))"
+    ;; RESTART-BIND (CLHS 9.2) -- there was NO expander in the CLI (only the
+    ;; ANSI gate runner rewrote it), so every use was an UNDEFINED-FUNCTION.
+    ;; Cells are (NAME FN REPORT INTERACTIVE TEST), the shape %PUSH-RESTARTS
+    ;; and INVOKE-RESTART already consume; no :CASE marker, so invoking one
+    ;; just calls FN and returns its values.
+    "(defmacro restart-bind (bindings &rest body)
+       (list '%push-restarts
+             (cons 'list
+                   (mapcar (lambda (b)
+                             (list 'list (list 'quote (car b)) (cadr b)
+                                   (getf (cddr b) :report-function)
+                                   (getf (cddr b) :interactive-function)
+                                   (getf (cddr b) :test-function)))
+                           bindings))
+             (list 'function (cons 'lambda (cons nil body)))))"
+    ;; WITH-CONDITION-RESTARTS: both forms are evaluated (CLHS 9.2); the
+    ;; condition/restart association itself is not modelled yet.
+    "(defmacro with-condition-restarts (condition-form restarts-form &rest body)
+       (list 'progn condition-form restarts-form (cons 'progn body)))"
     "(defmacro ignore-errors (&rest body)
        (list 'handler-case (cons 'progn body) (list 'error (list 'c) (list 'values nil 'c))))"
     ;; NOT a PROGN: w-s-i-s must bind the whole printer/reader variable set

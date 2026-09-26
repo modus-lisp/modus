@@ -3855,6 +3855,22 @@
 
 ;;; Main format implementation
 ;;; Returns remaining args (for use by formatter)
+(defun %fmt-skip-params (control j len)
+  "Index of the directive character of the FORMAT directive whose parameters
+   start at J (just after the tilde): skips prefix parameters (digits, signs,
+   commas, V, #, 'c) and the : / @ modifiers."
+  (loop
+    (when (>= j len) (return j))
+    (let ((c (%prim-aref control j)))
+      (cond
+        ((= c 39) (setq j (+ j 2)))                     ; 'c -- a quoted char
+        ((or (and (>= c 48) (<= c 57))                  ; digit
+             (= c 44) (= c 43) (= c 45)                 ; , + -
+             (= c 86) (= c 118) (= c 35)                ; V v #
+             (= c 58) (= c 64))                         ; : @
+         (setq j (+ j 1)))
+        (t (return j))))))
+
 (defun %format-impl (stream control args)
   "Core format. Returns remaining unused args."
   ;; CLHS 22.3: a format control may be a FUNCTION (the result of FORMATTER)
@@ -4270,7 +4286,13 @@
                        (loop
                          (when (>= end-pos len) (return nil))
                          (when (= (%prim-aref control end-pos) 126)
-                           (let ((nc (if (< (+ end-pos 1) len) (%prim-aref control (+ end-pos 1)) 0)))
+                           ;; Skip the directive's PARAMETERS and MODIFIERS
+                           ;; before reading its character: an inner ~:( or
+                           ;; ~@( was not recognised as nested, so its ~)
+                           ;; closed THIS block and the rest of the outer
+                           ;; text went unconverted (format.paren.9-25).
+                           (let* ((dj (%fmt-skip-params control (+ end-pos 1) len))
+                                  (nc (if (< dj len) (%prim-aref control dj) 0)))
                              (cond
                                ((or (= nc 40) (= nc 41)) ; nested (  )
                                 (setq depth (if (= nc 40) (+ depth 1) (- depth 1)))
@@ -4317,7 +4339,7 @@
                                                (t
                                                 (string-downcase result)))))
                                         (%print-string-raw converted stream))))
-                                  (setq i (+ end-pos 2))
+                                  (setq i (+ dj 1))
                                   (return nil)))
                                (t nil))))
                          (setq end-pos (+ end-pos 1))))))

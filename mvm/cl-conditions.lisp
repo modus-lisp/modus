@@ -1015,11 +1015,15 @@
    (NAME FN REPORT INTERACTIVE TEST :CASE); TEST is the 5th element, but
    only when a :CASE marker follows it (older 5-element cells have :CASE
    in that 5th slot and no test)."
+  ;; Every cell layout keeps TEST in the 5th slot: (NAME FN REPORT
+  ;; INTERACTIVE TEST :CASE), the compiler's (NAME NIL REPORT INTERACTIVE
+  ;; TEST :BC-CASE IDX), and RESTART-BIND's (NAME FN REPORT INTERACTIVE
+  ;; TEST).  Requiring a following :CASE ignored every compiled
+  ;; RESTART-CASE :TEST (restart-case.19).  The legacy 5-element cells hold
+  ;; the :CASE keyword there, which is not a function.
   (and (consp r)
-       (let ((tail (cddddr r)))   ; (TEST :CASE) for case cells with a test
-         (and (consp tail) (consp (cdr tail))
-              (eq (cadr tail) :case)
-              (car tail)))))
+       (let ((tail (cddddr r)))
+         (and (consp tail) (functionp (car tail)) (car tail)))))
 
 (defun %restart-test-passes-p (r condition)
   "Apply restart R's :TEST predicate (if any) to CONDITION.  A restart
@@ -1124,6 +1128,16 @@
   (when *catch-active*
     (return-from %signal-condition nil))
   (let ((type-name (%condition-type-name cond-obj))
+        ;; A RESTART-CASE invocation in flight: %RC-INVOCATION /
+        ;; RESTART-INVOCATION are control transfers (INVOKE-RESTART's longjmp
+        ;; to its restart-case frame); %RC-INVOCATION is an ERROR subtype only
+        ;; so the interpreter's longjmp bridge catches it.  USER handler-bind
+        ;; handlers must not see it (an outer (handler-bind ((error ...)))
+        ;; used to receive it as an error -- restart-case.23-31 under the
+        ;; upstream harness), but HANDLER-CASE BARRIERS below still must, or
+        ;; the transfer never reaches the restart-case frame.
+        (internal (let ((tn (%condition-type-name cond-obj)))
+                    (or (eq tn '%rc-invocation) (eq tn 'restart-invocation))))
         (cur *handler-bind-stack*)
         (frame-idx 0)
         (skip *handler-bind-effective-skip*))
@@ -1150,7 +1164,7 @@
         (dolist (handler frame)
           (let ((htype (car handler))
                 (hfn (cadr handler)))
-            (when (%type-matches-condition-p htype cond-obj)
+            (when (and (not internal) (%type-matches-condition-p htype cond-obj))
               ;; Bump the skip count to (frame-idx + 1) so handlers in
               ;; THIS and inner frames are inhibited during the handler's
               ;; body, and bump *signal-walk-depth* so a fresh signal can
@@ -1566,7 +1580,13 @@
           ;; Mark this restart as in-progress so a recursive invoke-restart
           ;; in rfn's body finds the NEXT applicable restart instead of
           ;; looping on this one (restart-case.12).
-          (setq *restarts-being-invoked* (cons r *restarts-being-invoked*))
+          ;; ... but only for RESTART-CASE styles, whose frame is (being)
+          ;; unwound.  A RESTART-BIND restart stays ACTIVE while its function
+          ;; runs, so a recursive (invoke-restart 'foo) inside it must find
+          ;; it again (restart-bind.14); excluding it sent the lookup past it
+          ;; to an unrelated older FOO.
+          (when style
+            (setq *restarts-being-invoked* (cons r *restarts-being-invoked*)))
           (cond
             ((eq style :bc-case)
              ;; mvm-eval restart-case: stash the invoke ARGS + invoked cell; the
@@ -1600,9 +1620,7 @@
                (%hc-longjmp)))
             (t
              ;; restart-bind: run user fn, re-emit its values.
-             (let ((vals (multiple-value-list (apply rfn args))))
-               (setq *restarts-being-invoked* (cdr *restarts-being-invoked*))
-               (values-list vals)))))
+             (values-list (multiple-value-list (apply rfn args))))))
         (error "No restart named ~A" name-or-restart))))
 
 (defun abort (&optional condition)

@@ -794,6 +794,21 @@
       ;; Condition (CLHS 9.1.3): printed WITHOUT escaping, a condition runs
       ;; its report; escaped, it is unreadable.  Before this, PRINC / ~A of a
       ;; condition printed its raw two-slot representation.
+      ;; An ACTIVE RESTART (a cell on *restart-stack*): unescaped it prints
+      ;; its report (CLHS 9.1.4.2.1 -- a string, or a function of the
+      ;; stream), else its name; escaped, #<RESTART name>.  It used to print
+      ;; as the raw cell list (FOO NIL "A report" NIL NIL :BC-CASE 0).
+      ((and (not preadably) (consp obj) (symbolp (car obj)) (consp (cdr obj))
+            (%active-restart-p obj))
+       (let ((report (and (consp (cddr obj)) (caddr obj))))
+         (cond
+           (escape
+            (%print-string-raw "#<RESTART " stream)
+            (%write-obj-1 (car obj) stream level t)
+            (%print-char 62 stream))
+           ((stringp report) (%print-string-raw report stream))
+           ((functionp report) (funcall report stream))
+           (t (%write-obj-1 (car obj) stream level nil)))))
       ((and (not preadably) (%condition-p obj))
        (if escape
            (progn (%print-string-raw "#<" stream)

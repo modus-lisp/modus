@@ -3821,10 +3821,23 @@
                                                 (setf remaining (cdr remaining))))
                                      ;; Adjust for outer (cdr remaining) increment
                                      (setf remaining (cons nil remaining)))
+                                    ;; &AUX: every remaining spec is a LET*
+                                    ;; binding, var or (var init) -- NOT a
+                                    ;; positional pattern.  It used to be skipped
+                                    ;; and its specs destructured from the list
+                                    ;; (so (&aux (y 5)) bound Y to NIL).
                                     ((and (symbolp elt)
-                                          (or (string= (symbol-name elt) "&ALLOW-OTHER-KEYS")
-                                              (string= (symbol-name elt) "&AUX")))
-                                     nil) ; skip these for simplicity
+                                          (string= (symbol-name elt) "&AUX"))
+                                     (dolist (spec (cdr remaining))
+                                       (setf result
+                                             (append result
+                                                     (list (if (consp spec)
+                                                               (list (car spec) (cadr spec))
+                                                               (list spec nil))))))
+                                     (setf remaining (list nil)))
+                                    ((and (symbolp elt)
+                                          (string= (symbol-name elt) "&ALLOW-OTHER-KEYS"))
+                                     nil)
                                     (rest-mode
                                      ;; Bind rest of list to this variable/sub-pattern
                                      (setf result
@@ -8706,17 +8719,26 @@
             ;; Dispatch by positional INDEX (fixnum) not restart NAME: a user
             ;; restart symbol loses EQ crossing the native %rc-enter boundary,
             ;; but a fixnum index compares reliably.
+            ;; DESTRUCTURING-BIND, not (apply (lambda ARGLIST . BODY) ...): a
+            ;; lambda made the clause body a separate closure, and the
+            ;; enclosing LET's capture/mutation analysis never looks inside an
+            ;; unexpanded RESTART-CASE -- so the closure got the outer
+            ;; variables BY VALUE and (incf i 100) in a clause was lost
+            ;; (restart-case.13).  D-B takes the same lambda list and keeps
+            ;; the body in this function.
             (push (list `(eql ,idx-var ,idx)
-                        `(apply (lambda ,arglist ,@body-forms) ,args-var))
+                        `(destructuring-bind ,arglist ,args-var ,@body-forms))
                   dispatch-clauses)
             (setf idx (+ idx 1))))
         (setf dispatch-clauses (nreverse dispatch-clauses))
         (compile-form
          `(let ((,frame-var (%rc-enter (list ,@cell-forms))))
             (handler-case
-                (let ((,res-var ,protected-form))
-                  (%rc-exit ,frame-var)
-                  ,res-var)
+                ;; MULTIPLE-VALUE-PROG1: RESTART-CASE returns ALL the values
+                ;; of its form when no restart fires (binding it to one
+                ;; variable returned only the primary).
+                (multiple-value-prog1 ,protected-form
+                  (%rc-exit ,frame-var))
               ;; Machinery, not a handler: no barrier, or its T clause would
               ;; hide every outer HANDLER-BIND from conditions in the body.
               (:%no-barrier)

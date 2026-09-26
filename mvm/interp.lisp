@@ -590,8 +590,18 @@
                                  :lambda-offsets lam-offsets)
                bc ftab rt lam-offsets))
           (mv *mvm-last-mv*))
+      ;; The SECONDARY values escape to the native caller too, so they get
+      ;; the same wrap as the primary.  They were re-emitted raw, so a
+      ;; closure returned as a second or later value -- (values 1 (lambda
+      ;; ...)) -- reached native code as a bare module closure and any call
+      ;; of it jumped to a bytecode offset (the upstream REMOVE-RANDOM fault:
+      ;; its generator returns its :KEY lambda as the 9th of 11 values).
       (values-list (if (if mv (> (car mv) 1) nil)
-                       (cons r (cdr mv))
+                       (cons r (let ((acc nil))
+                                 (dolist (x (cdr mv) (nreverse acc))
+                                   (setq acc (cons (%mvm-wrap-escaping-result
+                                                    x bc ftab rt lam-offsets)
+                                                   acc)))))
                        (list r))))))
 
 ;;; NOTE (retired predicate): there used to be a `%mvm-lambda-offset-p' here,

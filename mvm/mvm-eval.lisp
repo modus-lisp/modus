@@ -2760,7 +2760,14 @@
     (if %mv
         (if (eql (car %mv) 0)
             (values)
-            (values-list (cons %prim (cdr %mv))))
+            ;; Secondaries escape to the native caller like the primary does,
+            ;; so they get the same wrap (see the interp.lisp trampoline).
+            (values-list (cons %prim
+                               (let ((%acc nil))
+                                 (dolist (%x (cdr %mv) (nreverse %acc))
+                                   (setq %acc (cons (%mvm-wrap-escaping-result
+                                                     %x %bc %fnt %rt %lam)
+                                                    %acc)))))))
         %prim)))
 
 (defun %mvm-eval-compile-tuple (forms)

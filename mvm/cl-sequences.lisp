@@ -2328,9 +2328,16 @@
   ;; nested-exception loop (we don't install an IDT entry for #DE).
   (if (= n 0)
       0
-      (let* ((seed (mem-ref #x100000A0 :u64))
+      ;; The seed lives at #x10000FD8 -- NOT #x100000A0, which is the SECOND
+      ;; extra slot of the multiple-value buffer (#x10000098..#x10000138): every
+      ;; function returning three or more values overwrote the seed with its
+      ;; third value, so the next RANDOM multiplied a string or a character
+      ;; (a TYPE-ERROR with no datum) or returned garbage (upstream
+      ;; REMOVE-RANDOM and friends, whose generator returns three values).
+      ;; :u32 so an uninitialised (bare-metal) word still reads as an integer.
+      (let* ((seed (mem-ref #x10000FD8 :u32))
              (next (logand (+ (* seed 1664525) 1013904223) #x3FFFFFFF)))
-        (setf (mem-ref #x100000A0 :u64) next)
+        (setf (mem-ref #x10000FD8 :u32) next)
         ;; CLHS: LIMIT is a positive INTEGER *or* a positive FLOAT, and the
         ;; result is of the same type as LIMIT and strictly within [0,LIMIT).
         ;; The integer path below ((- next (* (truncate next n) n))) is a

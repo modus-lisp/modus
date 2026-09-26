@@ -458,6 +458,9 @@
   ;; SOURCE STRING, so a double quote here ends the string literal.)
   (setq *x64-tls-window* t)
   (setq *tls-window* t)
+  ;; handler-case handler paths check for a freshly recovered hardware fault
+  ;; (see compile-handler-case / %HC-FAULT-FIXUP).
+  (setq *hc-fault-fixup* t)
   (setq *jit-xlate-err-info* nil)
   ;; WS5 #223 / #278: emit the THUNK's li-const as a load from the GC-updated
   ;; constant vector instead of a baked heap address, so a mid-flight

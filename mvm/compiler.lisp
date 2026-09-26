@@ -8391,6 +8391,10 @@
                 clauses))
          (%hc-barrier-pop ,prev)))))
 
+(defvar *hc-fault-fixup* nil
+  "When T, every HANDLER-CASE handler path first calls %HC-FAULT-FIXUP (see
+   compile-handler-case).  Set by the hosted x64 CLI build only.")
+
 (defun compile-handler-case (body-form clauses env dest catch-frame-p)
   "Compile (handler-case body (type (var) handler-forms...))
    Uses setjmp/longjmp: saves state, runs body, catches errors.
@@ -8564,7 +8568,16 @@
           (emit-ir :br end-label)
           ;; === Handler path: dispatch on condition type ===
           (emit-ir-label handler-label)
-          (compile-form cond-form env dest)
+          ;; A hardware FAULT recovered by the #x0520 stub longjmps here
+          ;; WITHOUT publishing a condition, so the dispatch used to test
+          ;; whatever stale object *CURRENT-CONDITION* held -- a leftover
+          ;; RESTART-INVOCATION re-signalled as an unhandled escape.
+          ;; %HC-FAULT-FIXUP turns a fault that happened since the last
+          ;; check into a TYPE-ERROR first (hosted x64 CLI only).
+          (compile-form (if *hc-fault-fixup*
+                            `(progn (%hc-fault-fixup) ,cond-form)
+                            cond-form)
+                        env dest)
           (emit-ir-label end-label)))))
 
 ;;; ============================================================

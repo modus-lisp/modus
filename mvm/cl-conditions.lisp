@@ -2620,6 +2620,21 @@
         (%sig-reentry-leave)
         (if (%error-handler-active-p) (%hc-longjmp) nil))))
 
+(defun %hc-fault-fixup ()
+  "Called first on a HANDLER-CASE handler path (hosted x64 CLI).  If the
+   #x0520 fault stub has recovered a hardware fault since the last check
+   (its count at #x10000FB0 moved past the last-seen count at #x10000FB8),
+   publish a fresh TYPE-ERROR as *CURRENT-CONDITION* -- the stub longjmps
+   without one, and the handler used to dispatch on a STALE condition."
+  (let ((n (mem-ref #x10000FB0 :u32)))
+    (unless (= n (mem-ref #x10000FB8 :u32))
+      (setf (mem-ref #x10000FB8 :u32) n)
+      (let ((c (make-array 2)))
+        (aset c 0 *%sig-type-error-sym*)
+        (aset c 1 nil)
+        (setq *current-condition* c))))
+  nil)
+
 (defun %signal-type-error ()
   "Runtime helper: signal a TYPE-ERROR condition for handler-case.
    Used when a CL primitive is called with an argument of the wrong

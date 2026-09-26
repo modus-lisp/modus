@@ -1612,6 +1612,14 @@
                 (emit-bytes buf #x48 #x89 #xD0)                     ; mov rax, rdx (ucontext ptr)
                 (emit-bytes buf #x48 #x89 #x04 #x25)
                 (emit-u32 buf #x10000C58)
+                ;; lock inc qword [0x10000FB0] -- the recovered-fault COUNT.
+                ;; The longjmp below publishes no condition; %HC-FAULT-FIXUP
+                ;; (cl-conditions) compares this against the last count it
+                ;; saw so a handler can tell a fresh fault from a stale
+                ;; *CURRENT-CONDITION*.  A counter, not the RIP: the same
+                ;; instruction can fault twice in a row.
+                (emit-bytes buf #xF0 #x48 #xFF #x04 #x25)
+                (emit-u32 buf #x10000FB0)
                 ;; mov rcx, 0x10000180  (saved-handler-state address)
                 ;; PER-THREAD WINDOW: the signal runs on the FAULTING thread
                 ;; with that thread's FS base, so "is a handler-case active?"

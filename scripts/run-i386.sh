@@ -28,7 +28,7 @@
 # never run on 32 bits at all.  The suite is recoverable from git history at
 # ba693fa (mvm/build-i386-cli.lisp).  Its replacement:
 #
-#   ./scripts/run-ladder-i386.sh <image> <tag>   # then lf/score.py on the logs
+#   ./scripts/run-ladder-i386.sh <image> <tag>   # then test/ladder/score.py on the logs
 #
 # and, for anything the ladder does not cover, a --load-able script — which this
 # image can now actually run.

@@ -627,6 +627,14 @@
 (defparameter +fixnum-half+      2305843009213693952)
 (defparameter +fixnum-neg-half+  -2305843009213693952)
 (defparameter +fixnum-half-max+  2305843009213693951)
+(defparameter +fixnum-signed-bits+ 63
+  "Signed width of the largest fixnum: +fixnum-bits+ magnitude bits plus the
+   sign.  A NAMED constant rather than (+ +fixnum-bits+ 1) at each use so the
+   width tests in compiler.lisp compare against a leaf, as they did against the
+   literal 63 they replace -- an arithmetic form there makes the compiler's
+   ANF pass mint temporaries and renumbers every later generated name.")
+(defparameter +fixnum-bits-1+    61
+  "+fixnum-bits+ - 1; see +fixnum-signed-bits+ for why it is named.")
 (defparameter +limb-bits+        62)
 (defparameter +limb-bits-1+      61)
 (defparameter +limb-split-bits+  30)
@@ -694,6 +702,8 @@
         +fixnum-half+          (ash 1 (- bits 1))
         +fixnum-neg-half+      (- (ash 1 (- bits 1)))
         +fixnum-half-max+      (- (ash 1 (- bits 1)) 1)
+        +fixnum-signed-bits+   (+ bits 1)
+        +fixnum-bits-1+        (- bits 1)
         +limb-bits+            bits
         +limb-bits-1+          (- bits 1)
         +limb-split-bits+      (- (floor bits 2) 1)
@@ -855,6 +865,7 @@
      (defconstant +fixnum-min+ ~D)~%(defconstant +fixnum-limit+ ~D)~%~
      (defconstant +fixnum-neg-limit+ ~D)~%(defconstant +fixnum-half+ ~D)~%~
      (defconstant +fixnum-neg-half+ ~D)~%(defconstant +fixnum-half-max+ ~D)~%~
+     (defconstant +fixnum-signed-bits+ ~D)~%(defconstant +fixnum-bits-1+ ~D)~%~
      (defconstant +limb-bits+ ~D)~%(defconstant +limb-bits-1+ ~D)~%~
      (defconstant +limb-split-bits+ ~D)~%(defconstant +neg-limb-bits+ ~D)~%~
      (defconstant +neg-limb-bits-1+ ~D)~%(defconstant +fixnum-read-guard+ ~D)~%~
@@ -869,7 +880,8 @@
      (defconstant +mv-count-addr+ ~D)~%~
      (defconstant +mv-values-addr+ ~D)~%"
     +fixnum-bits+ +fixnum-max+ +fixnum-min+ +fixnum-limit+ +fixnum-neg-limit+
-    +fixnum-half+ +fixnum-neg-half+ +fixnum-half-max+ +limb-bits+ +limb-bits-1+
+    +fixnum-half+ +fixnum-neg-half+ +fixnum-half-max+
+    +fixnum-signed-bits+ +fixnum-bits-1+ +limb-bits+ +limb-bits-1+
     +limb-split-bits+ +neg-limb-bits+ +neg-limb-bits-1+ +fixnum-read-guard+
     +small-bignum-bits+ +half-limb-bits+ +neg-half-limb-bits+
     +half-limb-mask+

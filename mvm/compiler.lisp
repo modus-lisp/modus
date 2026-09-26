@@ -20051,13 +20051,15 @@
   (cond ((null ty) nil)
         ((symbolp ty)
          (let ((n (symbol-name ty)))
-           (cond ((string= n "FIXNUM") 63)   ; 62 magnitude bits + sign
+           (cond ((string= n "FIXNUM") +fixnum-signed-bits+)   ; magnitude bits + sign
                  ((string= n "BIT") 1)
                  (t nil))))
         ((and (consp ty) (symbolp (car ty)) (consp (cdr ty)) (integerp (cadr ty)))
          (let ((n (symbol-name (car ty))) (w (cadr ty)))
-           (cond ((string= n "SIGNED-BYTE")   (and (<= w 62) w))
-                 ((string= n "UNSIGNED-BYTE") (and (<= w 61) (+ w 1)))
+           ;; Bounds are the TARGET's fixnum (62/61 on the 62-bit tower,
+           ;; 30/29 on the 30-bit one), like %expr-width's cap.
+           (cond ((string= n "SIGNED-BYTE")   (and (<= w +fixnum-bits+) w))
+                 ((string= n "UNSIGNED-BYTE") (and (<= w +fixnum-bits-1+) (+ w 1)))
                  ;; (integer LO HI) with both bounds literal (the dotimes
                  ;; counter declaration): width covers the larger magnitude.
                  ((and (string= n "INTEGER") (consp (cddr ty)) (integerp (caddr ty)))
@@ -20087,13 +20089,21 @@
                ;; (acc x) on a declared struct: the slot's declared type
                (and (consp form)
                     (let ((ty (%expr-dtype form env))) (and ty (%decl-int-width ty)))))))
-    (and w (<= w 63) w)))
+    ;; THE CAP IS THE TARGET'S SIGNED FIXNUM WIDTH (+fixnum-signed-bits+), which is
+    ;; the old literal 63 on the 62-bit tower and 31 on the 30-bit one.  The
+    ;; hard 63 made every width in 32..63 a "fixnum" on RV32/i386, so
+    ;; %IEEE-FLOAT-TO-RAT's `(+ (ash 1 52) mantissa)' skipped the tag test and
+    ;; ADDED TWO BIGNUM POINTERS -- (rational 2.5d0) was <heap address>/2^51 on
+    ;; RV32 and every float compare and print went wrong.  i386 dodged it only
+    ;; because its heap (#x30000000) lies above emit-arith-pair's 30-bit
+    ;; operand-range guard, which sent the pointers to the slow path by luck.
+    (and w (<= w +fixnum-signed-bits+) w)))
 
 (defun %expr-width-1 (form env)
   "The uncapped estimate behind %expr-width."
   (cond
     ((integerp form)
-     (let ((w (+ 1 (integer-length (abs form))))) (and (<= w 62) w)))
+     (let ((w (+ 1 (integer-length (abs form))))) (and (<= w +fixnum-bits+) w)))
     ((symbolp form)
      (and form (%decl-int-width (%var-dtype form env))))
     ((not (consp form)) nil)

@@ -2879,7 +2879,18 @@
    doesn't need expansion and falls through to a compile-time builtin)
    reports expanded-p=NIL — without this, macroexpand-mvm would loop
    forever on no-op expanders."
-  (if (and (consp form) (symbolp (car form)))
+  ;; A KEYWORD-HEADED FORM IS NEVER A MACRO CALL (CLHS 3.1.2.1.2: only a symbol
+  ;; naming a macro in the macro namespace; keywords name no operators).  The
+  ;; macro table is keyed by NAME HASH, so without this check (:METACLASS x)
+  ;; ran the user's macro named METACLASS.  cl-annot defines exactly that
+  ;; macro, whose expander produces (append ... (list (list :metaclass
+  ;; metaclass))) -- the list-building compiler rewrote that into a template
+  ;; headed by the keyword, the analysis walker expanded it as a METACLASS
+  ;; call, which produced the same template again: unbounded recursion, a
+  ;; stack overflow on x64 and i386 alike (the ladder's cl-annot SIGSEGV).
+  ;; Minimal: (defmacro metaclass (metaclass cdf)
+  ;;            (funcall (lambda (c) (append c (list (list :metaclass metaclass)))) cdf))
+  (if (and (consp form) (symbolp (car form)) (not (keywordp (car form))))
       (let* ((name (normalize-name (car form)))
              ;; CONFIRMED lookup — see %MACRO-NAME-CONFIRMED-P.  A hash
              ;; collision here runs the WRONG expander, silently.
@@ -6791,6 +6802,10 @@
       ;; to the block's runtime CATCH tag for a proper non-local exit that
       ;; runs intervening unwind-protect cleanups and propagates the value.
       ;; (3) compile-return fallback (BLOCK NIL / loop / function).
+      ;; (%%LX-REG vreg) -- internal to %COMPILE-LEXICAL-EXIT: the value
+      ;; currently in virtual register VREG.
+      ((= op-name #.(compute-name-hash "%%LX-REG"))
+       (unless (eql dest (cadr form)) (emit-ir :mov dest (cadr form))))
       ((= op-name 164933334)  ; RETURN-FROM
        (let* ((bname (cadr form))
               (entry (assoc bname *block-labels*
@@ -14157,13 +14172,38 @@
      3. :br to EXIT-LABEL.
    When no intervening u-p exists this is exactly the old fast path (no
    push/pop, no extra emission)."
-  (compile-form value-form env value-dest)
-  (when (%uwp-pending-above target-seq)
-    ;; Cross at least one u-p: preserve the result across cleanup forms
-    ;; (which run arbitrary code and clobber regs), then restore.
-    (emit-ir :push value-dest)
-    (%emit-uwp-unwind-to target-seq)
-    (emit-ir :pop value-dest))
+  (if (%uwp-pending-above target-seq)
+      ;; Crossing at least one unwind-protect -- including the one every LET
+      ;; of a SPECIAL variable compiles to.  The cleanups run arbitrary code
+      ;; (the special's restore is a function call), and any call resets the
+      ;; MULTIPLE-VALUE state, so preserving only the primary value in a
+      ;; register -- what this did -- truncated every such exit to one value:
+      ;;   (block b (let ((*s* 1)) (return-from b (values 1 10 20))))  => (1)
+      ;; cl-ppcre's scanner closures return (values start end reg-starts
+      ;; reg-ends) exactly like that, from inside a LET* of its specials, so
+      ;; ALL-MATCHES-AS-STRINGS lost the match end and returned "bbbc" for
+      ;; "b+" on "abbbc".  CLHS 5.2: RETURN-FROM passes ALL the values.
+      ;; Capture them as a list, run the cleanups, re-establish them with the
+      ;; INLINE values-list -- no runtime function, so a minimal image that
+      ;; lacks VALUES-LIST compiles this the same way.  THROW / %NLX-THROW
+      ;; use the same list capture.
+      ;;
+      ;; The list rides across the cleanups ON THE STACK (push / pop), exactly
+      ;; as the primary value always did -- NOT in a LET variable: the
+      ;; cleanups are compiled from the environment saved when their
+      ;; UNWIND-PROTECT was entered, which knows nothing of a binding made
+      ;; here, so they reused its register.  Measured: ANSI unwind-protect.2,
+      ;; (block foo (unwind-protect (progn (push 1 x) (return-from foo x))
+      ;; (incf (car x)))), returned the CLEANUP's value 2 instead of (2).
+      (progn
+        (compile-form `(multiple-value-list ,value-form) env value-dest)
+        (emit-ir :push value-dest)
+        (%emit-uwp-unwind-to target-seq)
+        (emit-ir :pop value-dest)
+        ;; %%LX-REG reads VALUE-DEST as the FIRST thing the expansion
+        ;; evaluates, so nothing in between can clobber it.
+        (compile-form `(values-list (%%lx-reg ,value-dest)) env value-dest))
+      (compile-form value-form env value-dest))
   (emit-ir :br exit-label))
 
 (defun %walker-macroexpand (form)
@@ -14842,8 +14882,17 @@
         ;; symbol-function.  CLHS agrees: #'F is the function F NAMES, and for a
         ;; GF that is the GF object.  Emitting the lookup is also the only
         ;; correct answer for a value that must stay EQ to symbol-function.
+        ;; ...BUT ONLY WHEN NO LEXICAL BINDING SHADOWS IT.  This used to run
+        ;; before the flet/labels check above was consulted, so `#'ENCODER'
+        ;; inside (labels ((encoder ...)) #'encoder) -- alexandria's
+        ;; NAMED-LAMBDA, which babel wraps every encoder in -- returned the
+        ;; GLOBAL generic function ENCODER (babel's mapping accessor), and
+        ;; babel's load died "no applicable method for generic function
+        ;; ENCODER", leaving *STRING-VECTOR-MAPPINGS* unbound.  CLHS 3.1.2.1.2.1:
+        ;; a local function binding shadows the global definition.
         (if (and *mvm-eval-runtime-p*
                  (symbolp name)
+                 (null unique-name)
                  (%e2-name-names-gf-p name))
             (compile-form (list 'symbol-function (list 'quote name)) env dest)
             (if (and *mvm-eval-runtime-p*
@@ -15037,10 +15086,6 @@
      `(let* ((,lst-tmp ,list-form)
              (,pri-tmp (if (null ,lst-tmp) nil (car ,lst-tmp)))
              (,cnt-tmp (length ,lst-tmp)))
-        ;; Store count (the visible MV count — handler-case dispatch
-        ;; reads this; oversized counts are OK, just the storage region
-        ;; is capped).
-        (setf (mem-ref ,+mv-count-addr+ :u64) ,cnt-tmp)
         ;; Store extra values (elements 1+) into MV-VALUES-ADDR with bound.
         (let ((,cur-tmp (if (null ,lst-tmp) nil (cdr ,lst-tmp)))
               (,idx-tmp 0))
@@ -15050,6 +15095,15 @@
             (setf (mem-ref (+ ,+mv-values-addr+ (* ,idx-tmp 8)) :u64) (car ,cur-tmp))
             (setq ,idx-tmp (+ ,idx-tmp 1))
             (setq ,cur-tmp (cdr ,cur-tmp))))
+        ;; Store the count LAST (the visible MV count -- handler-case dispatch
+        ;; reads this; oversized counts are OK, just the storage region is
+        ;; capped).  It used to be stored BEFORE the loop, and anything in
+        ;; the loop that CALLS -- on the 30-bit tower the slot address
+        ;; (+ #x10000098 ...) is past the add guard's 2^28 bound, so the add
+        ;; is an out-of-line GENERIC-ADD -- resets the count to 1 on return.
+        ;; Measured on i386: (multiple-value-list (values-list '(1 10 20)))
+        ;; => (1); cl-ppcre's scanner lost its match end.
+        (setf (mem-ref ,+mv-count-addr+ :u64) ,cnt-tmp)
         ,pri-tmp)
      env dest)))
 

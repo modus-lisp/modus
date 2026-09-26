@@ -153,6 +153,14 @@
     ;; most-specific "class" is their struct type-name.  Must precede the
     ;; vector/array cases (a struct instance is a #x32 array).
     ((%struct-instance-p obj) (%struct-type-name obj))
+    ;; FUNCTIONS -- lambdas, closures, #'CAR, user defuns.  There was no
+    ;; branch, so every function dispatched as STANDARD-OBJECT and a method
+    ;; specialized on FUNCTION was never applicable.  cl-ppcre's SCAN has a
+    ;; (regex function) method for the closure CREATE-SCANNER returns; the
+    ;; closure fell through to the (regex t) default, which PARSED it as a
+    ;; regex string: "Unknown token #<closure> in parse tree" -- every
+    ;; ALL-MATCHES / REGEX-REPLACE on the library ladder.
+    ((functionp obj)   'function)
     ;; vectors / arrays — without these every array dispatched as
     ;; STANDARD-OBJECT, so methods specialized on (y array) / (y vector)
     ;; were never applicable (defgeneric.33).  CLOS instances never

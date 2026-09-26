@@ -587,11 +587,19 @@
    the `X.ERROR.2` test across every macro (WHEN/UNLESS/CASE/
    TYPECASE/COND/PSETQ/NTH-VALUE/MULTIPLE-VALUE-SETQ/…)."
   (declare (ignore extra))
-  (let ((nargs (mem-ref #x10000150 :u32)))
+  ;; (%GET-NARGS), not (mem-ref #x10000150): i386 keeps nargs in its own
+  ;; global slot and never writes that literal, so (= nargs 2) was never true
+  ;; there and every MACROEXPAND signalled PROGRAM-ERROR (issue #260) --
+  ;; iterate's #L reader macroexpands a backquote and died, so iterate never
+  ;; loaded on i386.  Both convention slots are READ FIRST, into locals: on
+  ;; i386 nargs and cenv are call-clobbered globals (CLAUDE.md), and the
+  ;; SETQ below is a call.
+  (let* ((nargs (%get-nargs))
+         (expander (car (%get-cenv))))
     (setq *%mexp-trace* nargs)
     (cond
       ((= nargs 2)
-       (funcall (car (%get-cenv)) form))
+       (funcall expander form))
       (t (%signal-program-error)))))
 
 (defun %interp-macro-shim (form &rest extra)
@@ -610,14 +618,16 @@
    not the whole call form), so we strip the operator before calling
    %call-interp-closure."
   (declare (ignore extra))
-  (let ((nargs (mem-ref #x10000150 :u32)))
+  ;; (%GET-NARGS) and the cenv read first -- see %MACRO-EXPANDER-SHIM.
+  (let* ((nargs (%get-nargs))
+         (closure (car (%get-cenv))))
     (cond
       ;; Exactly 2 args (form env) per CLHS §3.1.2.1.2.2.  No internal
       ;; caller funcalls this wrapper with 1 arg (macroexpand-1 and
       ;; runtime-EVAL dispatch use %RAW-MACRO-EXPANDER), so rejecting
       ;; 1-arg as program-error makes the X.ERROR.2 tests pass.
       ((= nargs 2)
-       (%call-interp-closure (car (%get-cenv)) (cdr form)))
+       (%call-interp-closure closure (cdr form)))
       (t (%signal-program-error)))))
 
 (defun %compiler-macro-shim (&rest args)

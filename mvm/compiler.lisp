@@ -22575,7 +22575,16 @@
       ;; actually passed (nargs, written by caller via :set-nargs).
       ;; Sentinel 255 = "caller already packed" (compile-call's
       ;; static-rest path) — skip the build.
-      (when (and rest-slot (< rest-slot +max-reg-args+))
+      ;; NOT capped at +max-reg-args+.  It was, and a function with four or
+      ;; more required params therefore NEVER built its rest list unless the
+      ;; caller statically pre-packed it: FUNCALL / APPLY / runtime-compiled
+      ;; callers pass the true nargs, so (defun f (a b c d &rest r) r) gave
+      ;; (f 1 2 3 4) => 0 and (f 1 2 3 4 5) => 5 -- the stale slot, or the
+      ;; bare fifth argument.  CL:MERGE is exactly that shape and signalled
+      ;; TYPE-ERROR on every call from evaluated code.  The prologue already
+      ;; handles stack-resident args: its #x0530 trap copies the overflow
+      ;; args into frame slots 4.. before the ladder stack-loads them.
+      (when rest-slot
         (emit-rest-prologue rest-slot))
 
       ;; &optional prologue: NIL-init optional slots the caller didn't

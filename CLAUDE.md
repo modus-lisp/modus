@@ -368,7 +368,7 @@ tar/`install-tarball`, the hosted socket/storage/HTTP layer, the ASDF and
 ./scripts/run-i386.sh eval '(+ 1 2)'     # evaluate one form and exit
 ./scripts/run-i386.sh repl               # interactive REPL on stdin
 ./scripts/run-i386.sh exec ARGS...       # arbitrary invocation
-./scripts/run-ladder-i386.sh <img> <tag> # the 22-library ladder (the gate)
+./scripts/run-ladder-i386.sh <img> <tag> # the 22-library ladder (the gate; test/ladder/)
 ```
 
 **32-bit ELFs need `qemu-i386-static` — binfmt_misc is NOT registered here, so

@@ -22330,16 +22330,25 @@
                 ;; when no optional default/supplied-p references it —
                 ;; same guard as the fallback &optional path.
                 (touch (when nargs-var (list nargs-var)))
+                ;; nargs snapshot in its OWN outer LET (see the fallback
+                ;; &optional path): a SPECIAL optional/key name sends the
+                ;; LET* through the dynamic-binding path, whose calls would
+                ;; clobber the nargs slot before the snapshot is read.
+                (snap (and nargs-var (assoc nargs-var bindings)))
+                (inner-binds (if snap (remove snap bindings) bindings))
+                (core (if auxes
+                          `(let* (,@inner-binds)
+                             ,@touch
+                             ,@validation
+                             (let* ,auxes ,@body))
+                          `(let* (,@inner-binds)
+                             ,@touch
+                             ,@validation
+                             ,@body)))
                 (new-body
-                  (if auxes
-                      `((let* (,@bindings)
-                          ,@touch
-                          ,@validation
-                          (let* ,auxes ,@body)))
-                      `((let* (,@bindings)
-                          ,@touch
-                          ,@validation
-                          ,@body)))))
+                  (if snap
+                      `((let (,snap) ,core))
+                      (list core))))
            (list new-params new-body
                  (when optional req-count) (length optional)
                  rest-slot))))
@@ -22423,14 +22432,21 @@
                   (push `(when (null ,(car k)) (setq ,(car k) ,(cadr k))) key-defaults))
                 (when (caddr k)
                   (push `(when (null ,(caddr k)) (setq ,(caddr k) nil)) key-defaults)))
+              ;; The nargs SNAPSHOT gets its own outer LET: it must be the
+              ;; very first thing read, and if an &optional name is SPECIAL
+              ;; the LET* below goes through the dynamic-binding path, whose
+              ;; save-the-old-value calls ran before its first init and
+              ;; clobbered the nargs convention slot -- so
+              ;; (defun f (&optional (*x* 7)) ...) called as (f) took the
+              ;; "supplied" arm and bound *X* to the empty slot (NIL).
               (setf new-body
-                    `((let* ((,nargs-var (%get-nargs))
-                             ,@(nreverse opt-bindings))
-                        ;; touch nargs-var so it isn't dead-stripped when no
-                        ;; default/supplied references it.
-                        ,nargs-var
-                        ,@(nreverse key-defaults)
-                        ,@new-body)))))
+                    `((let ((,nargs-var (%get-nargs)))
+                        (let* (,@(nreverse opt-bindings))
+                          ;; touch nargs-var so it isn't dead-stripped when no
+                          ;; default/supplied references it.
+                          ,nargs-var
+                          ,@(nreverse key-defaults)
+                          ,@new-body))))))
            ;; --- no &optional: legacy null-check path for &key fallback ---
            (t
             (let ((defaults nil))
@@ -22644,7 +22660,44 @@
       (free-temp-reg)
       (free-temp-reg))))
 
+(defun %param-special-p (var body)
+  "True when parameter VAR must be bound DYNAMICALLY: it is proclaimed
+   special (DEFVAR / DECLAIM / a CLHS standard variable -- the same test the
+   LET dispatch uses) or declared special at the head of BODY."
+  (and (symbolp var) var (not (eq var t))
+       (not (let ((n (symbol-name var)))
+              (and (> (length n) 0) (char= (char n 0) #\&))))
+       (or (gethash (normalize-name var) (%ensure-clhs-specials-table))
+           (member (symbol-name var) *clhs-extra-specials* :test #'string=)
+           (%runtime-special-p var)
+           (member (symbol-name var) (extract-special-vars body)
+                   :key #'symbol-name :test #'string=))))
+
 (defun mvm-compile-function-internal (name params body &optional parent-env rest-slot opt-start opt-count)
+  "CLHS 3.1.2.1.1.2: a parameter named by a SPECIAL variable binds it
+   dynamically.  Rename each such parameter to a gensym and rebind the
+   special to it with a LET around the body -- the LET dispatch already
+   makes that binding dynamic.  (It used to be bound lexically: a
+   (defun f (x *print-case*) (princ x)) ignored its *PRINT-CASE*.)
+   An &optional default the preprocessor turned into a SETQ of the name
+   in BODY still lands on the right place: inside the LET it assigns the
+   dynamic binding."
+  (let ((renames nil) (new-params nil))
+    (dolist (p params)
+      (if (%param-special-p p body)
+          (let ((g (%mvm-gensym "SPARAM")))
+            (setq renames (cons (list p g) renames))
+            (setq new-params (cons g new-params)))
+          (setq new-params (cons p new-params))))
+    (if renames
+        (mvm-compile-function-internal-1
+         name (nreverse new-params)
+         (list (cons 'let (cons (nreverse renames) body)))
+         parent-env rest-slot opt-start opt-count)
+        (mvm-compile-function-internal-1
+         name params body parent-env rest-slot opt-start opt-count))))
+
+(defun mvm-compile-function-internal-1 (name params body &optional parent-env rest-slot opt-start opt-count)
   "Compile a single function into IR. Returns function-info.
    Does NOT produce bytecode; that happens in phase 3.
    PARENT-ENV, if provided, allows closure variable references.

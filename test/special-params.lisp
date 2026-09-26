@@ -1,0 +1,23 @@
+;;; A parameter named by a SPECIAL variable binds it dynamically (required,
+;;; &optional with default, &key, &rest, lambda); (setf (readtable-case ...))
+;;; works.
+(defvar *spv* 1)
+(defun spv-read () *spv*)
+(defun spv-req (*spv*) (spv-read))
+(defun spv-opt (&optional (*spv* 7)) (spv-read))
+(defun spv-key (&key (*spv* 8)) (spv-read))
+(defun spv-rest (a &rest *spv*) (list a (spv-read)))
+(defun spv-case (sym *print-case*) (princ-to-string sym))
+(defparameter *ok*
+  (and (eql (spv-req 5) 5)
+       (eql (spv-opt) 7) (eql (spv-opt 9) 9)
+       (eql (spv-key) 8) (eql (spv-key :*spv* 3) 3)
+       (equal (spv-rest 1 2 3) '(1 (2 3)))
+       (eql (funcall (lambda (*spv*) (spv-read)) 42) 42)
+       (eql *spv* 1)
+       (equal (spv-case 'abc :downcase) "abc")
+       (let ((r (copy-readtable nil)))
+         (setf (readtable-case r) :invert)
+         (eq (readtable-case r) :invert))))
+(format t "~&special-params: ~a~%" (if *ok* "PASS" "FAIL"))
+(sys-exit (if *ok* 0 1))

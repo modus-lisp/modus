@@ -129,6 +129,13 @@
 (defun %set-readtable-case (rt val)
   (aset (%rt-data rt) 0 val)
   val)
+;; (setf (readtable-case rt) v) compiles to (SET-READTABLE-CASE rt v) -- the
+;; SETF fallback's SET-<name>, value last -- and nothing defined it, so every
+;; such SETF was UNDEFINED-FUNCTION (all of the upstream PRINT.SYMBOL.*).
+(defun set-readtable-case (rt val)
+  (unless (member val '(:upcase :downcase :preserve :invert))
+    (error 'type-error :datum val :expected-type '(member :upcase :downcase :preserve :invert)))
+  (%set-readtable-case rt val))
 (defun %rt-macros (rt) (aref (%rt-data rt) 1))
 (defun %rt-dispatch (rt) (aref (%rt-data rt) 2))
 (defun %rt-syntax (rt) (aref (%rt-data rt) 3))

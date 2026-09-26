@@ -3859,10 +3859,21 @@
       (setq *modules* (cons name *modules*))))
   t)
 (defun require (module-name &optional pathnames)
-  "Stub: load a module if not already provided."
+  "CLHS REQUIRE: unless MODULE-NAME is already in *MODULES*, load PATHNAMES
+   (one designator or a list), in order.  With no pathnames, a module whose
+   PACKAGE already exists in this image (ASDF, UIOP, SB-POSIX, ...) counts as
+   present -- those are built in -- and any other name signals an error.
+   This used to be a silent no-op, so (require \"M\" #p\"m.lsp\") loaded
+   nothing and the caller went on to call functions that did not exist."
   (let ((name (string module-name)))
     (unless (member name *modules* :test #'string=)
-      nil)))  ; no-op stub
+      (cond
+        (pathnames
+         (dolist (p (if (listp pathnames) pathnames (list pathnames)))
+           (load p)))
+        ((find-package name) nil)
+        (t (error "REQUIRE: don't know how to load module ~A" name))))
+    nil))
 
 ;; replace: copy elements from one sequence to another
 (defun replace (seq1 seq2 &rest args)

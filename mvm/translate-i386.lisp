@@ -1954,6 +1954,20 @@
       (i386-emit-pop-reg buf +i386-eax+)
       (i386-emit-ret buf))))
 
+(defparameter *i386-gc-vl-margin* #x1000000
+  "Bytes VL stops short of the end of the ACTIVE semispace (16 MB, the same as
+   the upper semispace's +linux-i386-gc-guard+).  :gc-check tests VA < VL
+   BEFORE an allocation whose size it cannot see, so the allocation that
+   trips it runs past VL by up to its own size.  When VL was the semispace's
+   exact end, in the LOWER semispace that overshoot landed in to-space: the
+   collector then copied survivors OVER the tail of the straddling object
+   before copying the object itself.  Measured with a ring of live 400 KB
+   arrays (test/i386-gc-straddle.lisp): SIGSEGV on the default build, clean
+   on a stress build whose VL is far from the boundary -- and the same shape
+   as the nondeterministic named-readtables crash (MEM-WRITE to address 0
+   after 71 collections).  A single allocation larger than the margin is the
+   residual every port has; the cure is a size-aware :gc-check.")
+
 (defun i386-emit-gc-trampoline (buf tramp-label collect-label)
   "A complete Cheney copying collector in native i386, called by :gc-check.
 
@@ -2199,7 +2213,10 @@
     (i386-emit-mov-abs-reg buf *va-addr* +i386-esi+)
     (if *i386-gc-stress-limit*
         (i386-emit-add-reg-imm buf +i386-eax+ *i386-gc-stress-limit*)
-        (i386-emit-add-reg-abs buf +i386-eax+ *i386-gc-size-addr*))
+        (progn
+          (i386-emit-add-reg-abs buf +i386-eax+ *i386-gc-size-addr*)
+          ;; ...less the overshoot margin: see *I386-GC-VL-MARGIN*.
+          (i386-emit-sub-reg-imm buf +i386-eax+ *i386-gc-vl-margin*)))
     (i386-emit-mov-abs-reg buf *vl-addr* +i386-eax+)
 
     ;; --- MCGC point (c): byte-exact clear of the reclaimed range's bitmaps ---

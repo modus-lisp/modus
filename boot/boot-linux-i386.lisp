@@ -152,10 +152,12 @@
   "Offset from heap base to the first allocatable byte.  The low 512 bytes
    mirror argc/argv the way the 64-bit ports do.")
 
-(defparameter *linux-i386-vl-offset* #x10000000
+(defparameter *linux-i386-vl-offset* (- #x10000000 #x1000000)
   "Offset from heap base for VL (the alloc limit).  With GC OFF this is set
-   just short of the mapping end so :gc-check never fires; a GC-on build
-   would lower it to the semispace midpoint.
+   just short of the mapping end so :gc-check never fires.  A GC-on build
+   uses the semispace midpoint LESS 16 MB -- the collector's
+   *I386-GC-VL-MARGIN* (translate-i386.lisp), so the allocation that trips
+   the first :gc-check cannot straddle into to-space.
 
    HARD CEILING AT 2^31, measured.  The arena top must stay below 2^31:
    with the top at 0x9EFFD000 a 64 KiB SHA-256 COMPLETED but produced a WRONG

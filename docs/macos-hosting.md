@@ -394,10 +394,21 @@ host/macos/build-macos.sh /tmp/modus-darwin.elf ./modus
   TRAP.  `lldb` cannot attach to the ad-hoc-signed binary without
   `get-task-allow`.
 
-**Not yet (M2 proper):** signals (`rt_sigaction` is accepted and ignored, so
-a fault kills the process instead of unwinding into a handler-case),
-`getdents64`, fork/wait, sockets, threads, and the JIT (M3: `MAP_JIT` +
-`pthread_jit_write_protect_np`).
+- **Signals.**  `rt_sigaction` / `rt_sigprocmask` / `kill` translate Linux
+  signal numbers (SIGBUS 7 -> 10, …), flags and masks.  The image's handler
+  (trap `#x0520`) is a stub that ignores its arguments and branches into the
+  armed handler-case frame, so Darwin calls it directly: real SIGSEGVs unwind
+  into handler-case natively, repeated and nested.
+- **Directories.**  `getdents64` is emulated with a `DIR*` per fd.
+
+**The test scripts, native vs a Linux twin** (same layout, no x18, no JIT —
+only the OS differs): 68 of 72 byte-identical.  Three `region-gc*` tests
+differ only in heap checksums and live-byte counts (the process's own strings:
+macOS passes a far larger environment), with identical pass counts;
+`rfb-static` needs sockets.
+
+**Not yet:** sockets (M4), fork/wait, native threads (hosted aarch64 has none
+on Linux either), and the JIT (M3: `MAP_JIT` + `pthread_jit_write_protect_np`).
 
 ## Open questions
 

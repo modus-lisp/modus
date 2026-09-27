@@ -1066,8 +1066,10 @@
                      (modus.mvm::a64-buffer-position aarch64-unified-buf))
                (if modus.mvm::*aarch64-force-absolute-inmodule-calls*
                    (progn
-                     (modus.mvm::a64-movz aarch64-unified-buf modus.mvm::+a64-x16+ 0 0)
-                     (modus.mvm::a64-movk aarch64-unified-buf modus.mvm::+a64-x16+ 0 1)
+                     ;; 2 halfwords, or 3 when the code is linked above 4 GB
+                     ;; (docs/macos-hosting.md) — see ENTRY-JUMP-WORDS below.
+                     (modus.mvm::a64-emit-code-addr-placeholder aarch64-unified-buf
+                                                                modus.mvm::+a64-x16+)
                      (modus.mvm::a64-br   aarch64-unified-buf modus.mvm::+a64-x16+))
                    (modus.mvm::a64-emit aarch64-unified-buf 0))  ; placeholder B
                ;; Phase C: translate into the same buffer.
@@ -1118,8 +1120,11 @@
       (let* ((b-instr-idx aarch64-boot-end-instr)
              ;; Entry-jump placeholder is 3 words (MOVZ/MOVK/BR) under the gate
              ;; long-range flag, else 1 word (B).
+             (addr-halfwords (if modus.mvm::*a64-code-addr-wide* 3 2))
              (entry-jump-words
-              (if modus.mvm::*aarch64-force-absolute-inmodule-calls* 3 1))
+              (if modus.mvm::*aarch64-force-absolute-inmodule-calls*
+                  (+ addr-halfwords 1)
+                  1))
              ;; kernel-image-entry-point is kernel-main's offset in BYTES
              ;; within the translated region (Phase 2a kept it relative).
              (km-byte-offset (or (kernel-image-entry-point image) 0))
@@ -1133,12 +1138,16 @@
                    (wrap (wrap-header-size-for-boot boot-descriptor))
                    (km-va (+ declared wrap (* 4 km-instr-idx)))
                    (code (modus.mvm::a64-buffer-code aarch64-unified-buf)))
-              (setf (aref code b-instr-idx)
-                    (logior (aref code b-instr-idx)
-                            (ash (logand km-va #xFFFF) 5)))
-              (setf (aref code (+ b-instr-idx 1))
-                    (logior (aref code (+ b-instr-idx 1))
-                            (ash (logand (ash km-va -16) #xFFFF) 5))))
+              ;; A truncated entry VA jumps into the void at boot — the moved
+              ;; gate did exactly that (PC 0x1070A470) before this counted
+              ;; its halfwords.  Refuse at build time instead.
+              (unless (< km-va (ash 1 (* 16 addr-halfwords)))
+                (error "cross-link: kernel-main VA #x~X needs more than ~D halfwords"
+                       km-va addr-halfwords))
+              (dotimes (h addr-halfwords)
+                (setf (aref code (+ b-instr-idx h))
+                      (logior (aref code (+ b-instr-idx h))
+                              (ash (logand (ash km-va (* h -16)) #xFFFF) 5)))))
             ;; Short B: imm26 = target_pc - current_pc (instruction units).
             (let ((b-insn (logior #x14000000
                                   (logand (- km-instr-idx b-instr-idx) #x3FFFFFF))))

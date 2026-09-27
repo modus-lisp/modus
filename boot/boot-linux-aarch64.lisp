@@ -192,6 +192,21 @@
       (error "code #x~X..#x~X overlaps the runtime-data region at #x~X; raise MODUS_CONV_DELTA or lower MODUS_CODE_BASE"
              load-addr (+ load-addr header-total raw-len #x10000)
              (conv-real +conv-region-low+)))
+    ;; Code linked LOW must end below the runtime-data region.  The unmoved
+    ;; region starts at 0x10000000 (its scratch pages from 0x0F000000), which
+    ;; leaves 252 MB from 0x400000; the ANSI gate outgrew that (273 MB on
+    ;; origin/main, measured 2026-09-27): its own bytes land on the convention
+    ;; block and it dies at boot reading ASCII as a gate word.  Moved region:
+    ;; refuse.  Unmoved: say so loudly, since the historic gate build relies on
+    ;; not refusing — link it high (docs/macos-hosting.md) to fix it.
+    (when (< load-addr +conv-region-low+)
+      (let ((end (+ load-addr header-total raw-len)))
+        (when (> end +conv-region-low+)
+          (if (eql (conv-real +conv-region-base+) +conv-region-base+)
+              (format t "~&~%  *** WARNING: image #x~X..#x~X overlaps the runtime-data area at #x~X (scratch pages) / #x~X (convention block); it will corrupt itself at boot.  Link it high: MODUS_CODE_BASE (docs/macos-hosting.md). ***~%~%"
+                      load-addr end +conv-region-low+ +conv-region-base+)
+              (error "image #x~X..#x~X overlaps the moved region's old range at #x~X; link the code high (MODUS_CODE_BASE)"
+                     load-addr end +conv-region-low+)))))
     (mvm-emit-byte buf #x7F)
     (mvm-emit-byte buf (char-code #\E))
     (mvm-emit-byte buf (char-code #\L))

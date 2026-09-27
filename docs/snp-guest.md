@@ -52,7 +52,8 @@ under SBCL, CCL and ABCL, and identical run to run:**
 | `MODUS_UEFI_SNP` | image | md5 |
 |---|---|---|
 | 0 (plain UEFI) | 35,951,616 B | `8a04528c8c708244d6603c2198deb206` |
-| 1 (SNP: C-bit tables, #VC handler, GHCB page) | 35,951,616 B | `eda7f5222c0173e418125234f64484d7` |
+| 1 (SNP: C-bit tables, #VC handler, GHCB page, **attestation code**, 2c36c06) | 36,822,016 B | `f7c2f4df1cedb1b0fbbbf743e66bad6b` |
+| 1, before the attestation code (7520e23) | 35,951,616 B | `eda7f5222c0173e418125234f64484d7` |
 | test (fake-#VC self-test) | 35,951,616 B | `e511c6efa52fbec20db8e48c74d413a1` (SBCL host) |
 
 The SNP-mode hash is the one an attestation report's measurement should be

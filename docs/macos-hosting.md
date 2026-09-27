@@ -560,6 +560,7 @@ follow translate-x64's contract.
 **Status, thread suite (24 tests incl. ctx-switch and actors; x86-64
 baseline 19).**  Linux/aarch64 and native macOS agree check-for-check.
 - Pass:
+  - dynbind
   - many-threads
   - threads
   - mutex
@@ -577,8 +578,13 @@ baseline 19).**  Linux/aarch64 and native macOS agree check-for-check.
   - many-regions: 12 regions and scale 2
   - thread-lisp, thread-regions and actor-regions: region-0 collection counts
   - on macOS, literal unrelocated addresses
-- dynbind: passes when its worker body is wrapped, and every piece passes on
-  a worker.  The exact test file exits 2; open.
+- dynbind passes.  It had failed through a shared-code bug: `%ha-carve`
+  zeroed the band's control area in pieces, and the gaps held the lock-arena
+  words.  After enough allocation (a few flips of 432 MB semispaces) the arena
+  end read `0xDEAD0001`, `%rt-arena-carve` took that for "already carved", and
+  locked sections allocated from garbage: SIGSEGV in `%LL-SHAPE-MEMO-PUT`, then
+  a silent exit 2.  The carve now zeroes the whole control area,
+  `[band, band+0x12200)`.
 - Fail on x86-64 too: sb-thread, region0-frontier, term-xregion,
   worker-xregion, thread-lisp-unsync.  mv-handler-unsync is a race control:
   x86-64 collides in 2 of 6 runs, and AArch64's worker there now has its own

@@ -389,6 +389,17 @@
                           (+ from0 (+ new0 #xD000)))
                 (%ha-zero (+ from0 (+ new0 #x10000))
                           (+ from0 (+ new0 #x12200)))
+                ;; AND EVERYTHING BETWEEN THEM — the whole control area, not a
+                ;; list of the parts somebody has been bitten by so far.  The
+                ;; gaps held the thread-region reports (+0xB000), the per-CPU
+                ;; lock-arena slices (+0xB800) and the ARENA WORDS (+0xBC00),
+                ;; and %RT-ARENA-CARVE reads a non-zero arena end as "already
+                ;; carved".  MEASURED on the AArch64 CLI (432 MB semispaces, so
+                ;; a few flips reach the band): after 200000 conses the end
+                ;; word read 0xDEAD0001, the carve returned "ready", and the
+                ;; locked sections allocated from garbage — SIGSEGV in
+                ;; %LL-SHAPE-MEMO-PUT and a silent exit 2.  72 KB of stores.
+                (%ha-zero (+ from0 new0) (+ from0 (+ new0 #x12200)))
                 (setq *ha-band* (+ from0 new0))
                 ;; THE COLLECTOR'S PER-COLLECTION STATE BECOMES PER CPU.  Until
                 ;; this runs, mvm/gc.lisp's three working words are the historic

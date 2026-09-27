@@ -407,8 +407,19 @@ differ only in heap checksums and live-byte counts (the process's own strings:
 macOS passes a far larger environment), with identical pass counts;
 `rfb-static` needs sockets.
 
-**Not yet:** sockets (M4), fork/wait, native threads (hosted aarch64 has none
-on Linux either), and the JIT (M3: `MAP_JIT` + `pthread_jit_write_protect_np`).
+- **Sockets.**  socket/bind/listen/accept/connect/getsockname/sendto/recvfrom/
+  set-/getsockopt/shutdown, translating `sockaddr` (Darwin's length byte),
+  `SOL_SOCKET` and option numbers, and `SOCK_NONBLOCK`/`SOCK_CLOEXEC`;
+  sockets get `SO_NOSIGPIPE` so writes fail with EPIPE as Linux callers
+  expect.  `test/run-rfb-static.sh` — modus serving a framebuffer over RFB to
+  a real (Python) VNC client — PASSES natively.  Getting there found a hosted
+  aarch64 LINUX bug: the syscall remap table lacked getsockname/setsockopt/
+  sendto/recvfrom, so they ran as chroot/fchownat/fstatfs/truncate (the
+  Linux twin printed `PORT -1`); fixed in its own commit, and the same test
+  now passes on Linux too.
+
+**Not yet:** fork/wait, native threads (hosted aarch64 has none on Linux
+either), and the JIT (M3: `MAP_JIT` + `pthread_jit_write_protect_np`).
 
 ## Open questions
 

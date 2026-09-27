@@ -26,7 +26,10 @@
 #include <mach-o/ldsyms.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sched.h>
+#include <sys/socket.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -260,6 +263,50 @@ static void forget_dir(long fd) {
     if (fd >= 0 && fd < MAXDIRFD && dirs[fd]) { closedir(dirs[fd]); dirs[fd] = NULL; pending[fd] = NULL; }
 }
 
+// -------------------------------------------------------------- sockets ---
+// Linux sockaddr: u16 family then data; Darwin: u8 length, u8 family, data.
+// AF_INET is 2 on both; Linux AF_INET6 = 10, Darwin 30.
+static socklen_t dx_sockaddr(const uint8_t *lx, socklen_t len, struct sockaddr_storage *out) {
+    if (!lx || len < 2) return 0;
+    if (len > sizeof *out) len = sizeof *out;
+    memcpy(out, lx, len);
+    uint16_t fam = (uint16_t)(lx[0] | (lx[1] << 8));
+    ((uint8_t *)out)[0] = (uint8_t)len;
+    ((uint8_t *)out)[1] = (uint8_t)(fam == 10 ? AF_INET6 : fam);
+    return len;
+}
+static void lx_sockaddr(const struct sockaddr_storage *d, uint8_t *lx, uint32_t *lxlen, socklen_t dlen) {
+    if (!lx || !lxlen) return;
+    socklen_t n = dlen < *lxlen ? dlen : *lxlen;
+    memcpy(lx, d, n);
+    uint16_t fam = ((const uint8_t *)d)[1] == AF_INET6 ? 10 : ((const uint8_t *)d)[1];
+    if (n >= 2) { lx[0] = (uint8_t)fam; lx[1] = (uint8_t)(fam >> 8); }
+    *lxlen = dlen;
+}
+static int dx_sockopt(long level, long opt, int *dlevel) {
+    if (level == 1) {                              // SOL_SOCKET
+        *dlevel = SOL_SOCKET;
+        switch (opt) {
+        case 2: return SO_REUSEADDR;  case 4: return SO_ERROR;   case 6: return SO_BROADCAST;
+        case 7: return SO_SNDBUF;     case 8: return SO_RCVBUF;  case 9: return SO_KEEPALIVE;
+        case 13: return SO_LINGER;    case 15: return SO_REUSEPORT;
+        case 20: return SO_RCVTIMEO;  case 21: return SO_SNDTIMEO;
+        default: return -1;
+        }
+    }
+    *dlevel = (int)level;                          // IPPROTO_TCP = 6, TCP_NODELAY = 1 agree
+    return (int)opt;
+}
+static long dx_socket(long domain, long type, long proto) {
+    int d = domain == 10 ? AF_INET6 : (int)domain;
+    int fd = socket(d, (int)(type & 0xF), (int)proto);   // SOCK_STREAM/DGRAM agree
+    if (fd < 0) return -lx_errno(errno);
+    if (type & 0x800) fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);   // SOCK_NONBLOCK
+    if (type & 0x80000) fcntl(fd, F_SETFD, FD_CLOEXEC);                     // SOCK_CLOEXEC
+    int one = 1; setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one); // Linux callers expect EPIPE
+    return fd;
+}
+
 static unsigned char unknown_seen[512];
 
 long modus_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long nr) {
@@ -303,6 +350,42 @@ long modus_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long nr
     case 134: return dx_rt_sigaction(a0, (struct lx_sigaction *)a1, (struct lx_sigaction *)a2);
     case 135: return dx_rt_sigprocmask(a0, (const uint64_t *)a1, (uint64_t *)a2);
     case 129: RET(kill((pid_t)a0, dx_sig(a1)));
+    case 198: return dx_socket(a0, a1, a2);
+    case 200: case 203: {                          // bind, connect
+        struct sockaddr_storage ss; socklen_t n = dx_sockaddr((const uint8_t *)a1, (socklen_t)a2, &ss);
+        if (nr == 200) RET(bind((int)a0, (struct sockaddr *)&ss, n));
+        RET(connect((int)a0, (struct sockaddr *)&ss, n)); }
+    case 201: RET(listen((int)a0, (int)a1));
+    case 202: case 242: {                          // accept, accept4
+        struct sockaddr_storage ss; socklen_t n = sizeof ss;
+        int fd = accept((int)a0, (struct sockaddr *)&ss, &n);
+        if (fd < 0) return -lx_errno(errno);
+        lx_sockaddr(&ss, (uint8_t *)a1, (uint32_t *)a2, n);
+        int one = 1; setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+        return fd; }
+    case 204: case 205: {                          // getsockname, getpeername
+        struct sockaddr_storage ss; socklen_t n = sizeof ss;
+        if ((nr == 204 ? getsockname : getpeername)((int)a0, (struct sockaddr *)&ss, &n) < 0) return -lx_errno(errno);
+        lx_sockaddr(&ss, (uint8_t *)a1, (uint32_t *)a2, n); return 0; }
+    case 206: {                                    // sendto
+        struct sockaddr_storage ss; socklen_t n = a4 ? dx_sockaddr((const uint8_t *)a4, (socklen_t)a5, &ss) : 0;
+        RET(sendto((int)a0, (const void *)a1, (size_t)a2, (int)(a3 & 0x1), a4 ? (struct sockaddr *)&ss : NULL, n)); }
+    case 207: {                                    // recvfrom
+        struct sockaddr_storage ss; socklen_t n = sizeof ss;
+        long r = recvfrom((int)a0, (void *)a1, (size_t)a2, (int)(a3 & 0x2 ? MSG_PEEK : 0),
+                          a4 ? (struct sockaddr *)&ss : NULL, a4 ? &n : NULL);
+        if (r < 0) return -lx_errno(errno);
+        if (a4) lx_sockaddr(&ss, (uint8_t *)a4, (uint32_t *)a5, n);
+        return r; }
+    case 208: case 209: {                          // setsockopt, getsockopt
+        int lvl; int opt = dx_sockopt(a1, a2, &lvl);
+        if (opt < 0) return nr == 208 ? 0 : -92;   // unknown option: accept a set, ENOPROTOOPT a get
+        if (nr == 208) RET(setsockopt((int)a0, lvl, opt, (const void *)a3, (socklen_t)a4));
+        socklen_t n = a4 ? *(uint32_t *)a4 : 0;
+        if (getsockopt((int)a0, lvl, opt, (void *)a3, &n) < 0) return -lx_errno(errno);
+        if (a4) *(uint32_t *)a4 = n;
+        return 0; }
+    case 210: RET(shutdown((int)a0, (int)a1));      // SHUT_* agree
     case 103: return 0;                            // setitimer
     default:
         if (nr >= 0 && nr < 512 && !unknown_seen[nr]) {

@@ -33,7 +33,8 @@
 ;;;                 0x10000248              argv[2] string (64 bytes)
 ;;;                 0x10000400              per-fork handler stack
 ;;;                 0x10000A00              i386 global slot block  <-- i386 only
-;;;   0x30000000  heap (mmap2, MAP_ANON)
+;;;   0x18000000  our own stack (8 MB, MAP_FIXED)
+;;;   0x19000000  heap (mmap2, MAP_FIXED_NOREPLACE) -- ALL of it below 2^30
 ;;;
 ;;; The i386 global slot block is the one genuinely new thing.  x64 and
 ;;; aarch64 keep the alloc pointer, alloc limit, NIL constant, closure-env
@@ -52,7 +53,7 @@
    staging for path arguments) and *io-buf-addr* (the 4 KB read/write
    buffer) — and i386 has nowhere else to put them: the ELF ends around
    0x0A800000, the stack is a MAP_FIXED 8 MB at 0x18000000 and the heap a
-   512 MB arena at 0x30000000, all GC-owned.  Extending p_memsz by 124 KB
+   512 MB arena at 0x19000000, all GC-owned.  Extending p_memsz by 124 KB
    costs nothing (the pages are demand-zeroed and only two are touched) and,
    critically, RESERVES the range at exec time, so the later NULL-hinted
    bitmap mmaps cannot land in it.  Both scratch addresses stay below 2^30,
@@ -82,7 +83,18 @@
   "Staged string arena — every argv/envp string, NUL-terminated, packed.")
 (defconstant +linux-i386-argv-arena-end+ #x1001E000)
 
-(defconstant +linux-i386-heap-hint+   #x30000000)
+(defconstant +linux-i386-heap-hint+   #x19000000
+  "Heap base, just above our own stack (+linux-i386-stack-addr+ .. +8 MB).
+   THE WHOLE ARENA MUST LIE BELOW 2^30, and at #x30000000 it did not: the
+   second semispace was #x40000000..#x50000000.  The MVM's value<->word round
+   trip (%val->word = SHL 1, %word->val = SAR 1) turns a pointer at or above
+   2^30 into a different address -- #x4029D319 comes back as #xC029D319 -- so
+   the image ran fine in the FIRST semispace and died on the first eval after
+   its first collection moved everything up.  That was 'i386 --script dies at
+   its first GC' (~1300 toplevel forms), and 'any collection during boot is
+   fatal' with an early MODUS_I386_VL.  Mapped MAP_FIXED_NOREPLACE, so a busy
+   range fails loudly instead of the kernel quietly placing the heap
+   somewhere that breaks the rule again.")
 (defconstant +linux-i386-gc-guard+    #x1000000
   "16 MB of MAPPED-BUT-UNCOUNTED memory past the SECOND semispace's from_end.
    This is boot-linux-x64.lisp's +linux-x64-gc-guard+, which the i386 port
@@ -127,14 +139,25 @@
    object-start (conservative-root validation) and cons-kind (so %gc-scan-copied walks to-space by TYPE rather
    than forwarding every word — the latter mis-forwards bignum limbs, and
    SHA-256 on a 30-bit tower allocates almost nothing but bignums).")
+;;; THE ARENA INVARIANT, checked rather than asserted in prose: every heap
+;;; address below 2^30 (see +linux-i386-heap-hint+), and the arena clear of our
+;;; own stack beneath it.
+(assert (<= (+ +linux-i386-heap-hint+ +linux-i386-heap-size+) (ash 1 30)) ()
+        "i386 heap [#x~X, #x~X) must end at or below 2^30"
+        +linux-i386-heap-hint+ (+ +linux-i386-heap-hint+ +linux-i386-heap-size+))
+(assert (>= +linux-i386-heap-hint+ (+ +linux-i386-stack-addr+ +linux-i386-stack-size+)) ()
+        "i386 heap must start above the relocated stack")
+
 (defconstant +linux-i386-heap-alloc-start+ #x200
   "Offset from heap base to the first allocatable byte.  The low 512 bytes
    mirror argc/argv the way the 64-bit ports do.")
 
-(defparameter *linux-i386-vl-offset* #x10000000
+(defparameter *linux-i386-vl-offset* (- #x10000000 #x1000000)
   "Offset from heap base for VL (the alloc limit).  With GC OFF this is set
-   just short of the mapping end so :gc-check never fires; a GC-on build
-   would lower it to the semispace midpoint.
+   just short of the mapping end so :gc-check never fires.  A GC-on build
+   uses the semispace midpoint LESS 16 MB -- the collector's
+   *I386-GC-VL-MARGIN* (translate-i386.lisp), so the allocation that trips
+   the first :gc-check cannot straddle into to-space.
 
    HARD CEILING AT 2^31, measured.  The arena top must stay below 2^31:
    with the top at 0x9EFFD000 a 64 KiB SHA-256 COMPLETED but produced a WRONG
@@ -347,8 +370,8 @@
 ;;; ELF32 little-endian wrapper (EM_386)
 ;;; ============================================================
 
-(defun wrap-in-elf32-le-i386 (raw-bytes load-addr &key bss-end)
-  "Wrap RAW-BYTES in a minimal ELF32-LE i386 executable: one ELF header
+(defun wrap-in-elf32-le-i386 (raw-bytes load-addr &key bss-end (machine 3))
+  "Wrap RAW-BYTES in a minimal ELF32-LE executable: one ELF header
    (52 bytes) + one PT_LOAD program header (32 bytes) = 84 bytes, matching
    WRAP-HEADER-SIZE-FOR-BOOT's :linux-i386 arm.
 
@@ -359,7 +382,13 @@
    NOTE the ELF32 program-header field ORDER differs from ELF64:
      ELF32: type offset vaddr paddr filesz memsz flags align
      ELF64: type flags  offset vaddr paddr  filesz memsz align
-   Getting that wrong yields a segment the kernel silently refuses to map."
+   Getting that wrong yields a segment the kernel silently refuses to map.
+
+   MACHINE defaults to 3 (EM_386), which leaves i386 output byte-identical; 40
+   is EM_ARM.  Named for i386 because that is what it was written for, but the
+   only thing architecture-specific in an ELF32-LE header is e_machine — the
+   same reason WRAP-IN-ELF64-LE-AA64 now takes a :MACHINE.  A third copy of
+   this function would be a third place for the field order above to rot."
   (let* ((ehdr-size 52)
          (phdr-size 32)
          (header-total (+ ehdr-size phdr-size))
@@ -378,7 +407,7 @@
     (i386l-bytes buf 0)                 ; EI_OSABI  = SYSV
     (dotimes (i 8) (mvm-emit-byte buf 0))  ; EI_ABIVERSION + padding
     (i386l-le16 buf 2)                  ; e_type    = ET_EXEC
-    (i386l-le16 buf 3)                  ; e_machine = EM_386
+    (i386l-le16 buf machine)            ; EM_386 by default, 40 = EM_ARM
     (i386l-le32 buf 1)                  ; e_version
     (i386l-le32 buf entry-point)        ; e_entry
     (i386l-le32 buf ehdr-size)          ; e_phoff
@@ -500,7 +529,7 @@
   (i386l-mov-reg-imm buf 3 +linux-i386-heap-hint+)   ; mov ebx, hint
   (i386l-mov-reg-imm buf 1 +linux-i386-heap-size+)   ; mov ecx, length
   (i386l-mov-reg-imm buf 2 3)                        ; mov edx, PROT_READ|PROT_WRITE
-  (i386l-mov-reg-imm buf 6 #x22)                     ; mov esi, MAP_PRIVATE|MAP_ANONYMOUS
+  (i386l-mov-reg-imm buf 6 #x100022)                 ; mov esi, PRIVATE|ANON|FIXED_NOREPLACE
   (i386l-mov-reg-imm buf 7 #xFFFFFFFF)               ; mov edi, -1 (fd)
   (i386l-bytes buf #x55)                             ; push ebp
   (i386l-bytes buf #x31 #xED)                        ; xor ebp, ebp (pgoff = 0)

@@ -31,7 +31,19 @@
 (defconstant +aarch64-gic-cpu+       #x08010000)   ; GIC CPU Interface
 (defconstant +aarch64-gic-redist+    #x080A0000)   ; GICv3 Redistributor
 (defconstant +aarch64-dram-base+     #x40000000)   ; DRAM start
-(defconstant +aarch64-kernel-base+   #x40200000)   ; Kernel load address
+;; KERNEL BASE = QEMU virt's DRAM START, #x40000000 -- not #x40200000.
+;; cross.lisp adds the bare-AArch64 image_load_offset (#x80000) to this to get
+;; where the image actually runs, and qemu's virt machine loads a raw -kernel
+;; image (no arm64 Image header) at DRAM + #x80000 = #x40080000 -- the address
+;; this file's own fixpoint notes record ("Image loads at PA 0x40080000").
+;; With #x40200000 every ABSOLUTE reference the build patches -- li-const pool
+;; addresses, fn-addr targets -- pointed #x200000 too high: r17-li-const read a
+;; pooled string of length 0 (answering 2^32-258) and r16-funcall called into
+;; empty memory.  Position-independent code ran either way, which is why every
+;; other rung passed.  Only the bare ladder and build-aarch64-fbprobe use this
+;; descriptor; the ANSI and fixpoint images use :fixpoint, whose base was
+;; already #x40000000.
+(defconstant +aarch64-kernel-base+   #x40000000)   ; Kernel load address
 
 ;; Memory regions
 (defconstant +aarch64-stack-top+     #x40400000)   ; Stack top
@@ -128,6 +140,18 @@
     (emit-aarch64-movz buf x16 #x4040 16)   ; x16 = 0x40400000
     (emit-aarch64-mov-sp buf sp x16)         ; SP = x16
 
+    ;; 1b. Enable FP/SIMD: CPACR_EL1.FPEN (bits 21:20) = 0b11 -- the same four
+    ;; instructions as step 15 of the fixpoint entry below, whose comment says
+    ;; they apply "to every bare-metal AArch64 image".  This entry never had
+    ;; them: at EL1 reset FPEN=00 traps every FP/SIMD instruction, so every
+    ;; double-float rung on the bare aarch64 ladder died while hosted aarch64
+    ;; (where Linux enables FP) and bare ppc64/68k/arm32 passed.
+    (emit-aarch64-u32 buf #xD5381040)            ; MRS X0, CPACR_EL1
+    (emit-aarch64-load-imm64 buf x1 #x300000)    ; FPEN = 0b11 -> bits 21:20
+    (emit-aarch64-u32 buf #xAA010000)            ; ORR X0, X0, X1
+    (emit-aarch64-u32 buf #xD5181040)            ; MSR CPACR_EL1, X0
+    (emit-aarch64-u32 buf #xD5033FDF)            ; ISB
+
     ;; 2. Initialize PL011 UART at 0x09000000
     ;; Load UART base into x17
     (emit-aarch64-movz buf x17 #x0900 16)   ; x17 = 0x09000000
@@ -177,8 +201,17 @@
     (emit-aarch64-movz buf x25 #x4500 16)
     ;; x26 = NIL = 0 (already zero from QEMU reset, but be explicit)
     (emit-aarch64-movz buf x26 0 0)
-    ;; x18 = convention-block base #x10000000 (translate-aarch64 *a64-x18-base*)
-    (emit-aarch64-movz buf 18 #x1000 16)
+    ;; x18 = the convention-block base (translate-aarch64 *a64-x18-base*).
+    ;;
+    ;; IN RAM, NOT AT #x10000000.  Every convention-slot access goes through x18
+    ;; -- SET-NARGS stores [x18,#0x150], the &rest copy (#x0530) reads it back --
+    ;; so the block can sit anywhere the boot says.  #x10000000 is RAM on the
+    ;; Raspberry Pi, but on QEMU virt it is the PCIe MMIO window: the store
+    ;; vanished and #x0530 read garbage, so every &rest call with more than
+    ;; four arguments (r29-rest-many) built its list from junk, while
+    ;; fixed-count calls (r27), which never read nargs, passed.  #x41100000 sits
+    ;; between the gate's probe (#x41000000) and the per-CPU block (#x41200000).
+    (emit-aarch64-movz buf 18 #x4110 16)     ; x18 = 0x41100000
 
     ;; 4. Set TPIDR_EL1 = BSP per-CPU data base (0x41200000)
     (emit-aarch64-movz buf x16 #x4120 16)     ; x16 = 0x41200000

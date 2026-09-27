@@ -78,17 +78,23 @@
   number) ; 0-7
 
 (defparameter *68k-vreg-map*
-  (vector (make-m68k-reg :type :data :number +68k-d0+)     ; V0
-          (make-m68k-reg :type :data :number +68k-d1+)     ; V1
-          (make-m68k-reg :type :data :number +68k-d2+)     ; V2
-          (make-m68k-reg :type :data :number +68k-d3+)     ; V3
-          (make-m68k-reg :type :data :number +68k-d4+)     ; V4
-          (make-m68k-reg :type :data :number +68k-d5+)     ; V5
-          (make-m68k-reg :type :data :number +68k-d6+)     ; V6
-          (make-m68k-reg :type :data :number +68k-d7+)     ; V7
+  ;; D0 and D1 are the TRANSLATOR'S SCRATCH and must not also be allocatable.
+  ;; They used to be V0/V1, and ~200 emit sites load a vreg into D0 to work on
+  ;; it -- so any op touching a vreg clobbered V0 while it was live.  The
+  ;; visible symptom: `(setf (mem-ref addr :u8) v)` stored (addr >> 2) instead
+  ;; of v, because the address untag ran through D0 after the value had been
+  ;; placed there.  Sliding the window to D2..D7 makes every existing scratch
+  ;; use correct at once, at the cost of two inline vregs (V6/V7 now spill).
+  (vector (make-m68k-reg :type :data :number +68k-d2+)     ; V0
+          (make-m68k-reg :type :data :number +68k-d3+)     ; V1
+          (make-m68k-reg :type :data :number +68k-d4+)     ; V2
+          (make-m68k-reg :type :data :number +68k-d5+)     ; V3
+          (make-m68k-reg :type :data :number +68k-d6+)     ; V4
+          (make-m68k-reg :type :data :number +68k-d7+)     ; V5
+          nil nil           ; V6-V7 (spill -- D0/D1 are reserved scratch)
           nil nil nil nil   ; V8-V11 (spill)
           nil nil nil nil   ; V12-V15 (spill)
-          (make-m68k-reg :type :data :number +68k-d0+)     ; VR (aliases V0)
+          (make-m68k-reg :type :data :number +68k-d2+)     ; VR (aliases V0)
           (make-m68k-reg :type :address :number +68k-a2+)  ; VA
           (make-m68k-reg :type :address :number +68k-a3+)  ; VL
           (make-m68k-reg :type :address :number +68k-a4+)  ; VN
@@ -110,6 +116,12 @@
   (fixups nil)      ; list of (word-index label-id fixup-type)
   (position 0)      ; byte position
   (word-count 0))   ; word index (position / 2)
+
+(defvar *68k-li-const-patches* nil
+  "List of (NATIVE-BYTE-OFFSET . POOL-INDEX) recorded by +OP-LI-CONST+: at that
+   offset is a MOVE.L #imm32,D0 whose 32-bit immediate (bytes +2..+5, big-endian)
+   cross.lisp's apply-li-const-patches fills with the constant-pool slot's
+   tagged address.  Reset at the start of every translation.")
 
 (defun m68k-emit-word (buf word)
   "Emit a 16-bit instruction word."
@@ -548,6 +560,62 @@
 
 ;;; --- Shifts ---
 
+;;; ============================================================
+;;; Convention slots (nargs / cenv / mv-count)
+;;; ============================================================
+;;;
+;;; Same absolute-slot shape as i386: the caller writes, the callee reads.
+;;; The block sits at 6MB -- above the image (loaded at 64KB) and below the
+;;; downward stack (top 8MB), so it is clear of both stack and heap (cons at
+;;; 9MB, general at 10MB).  A1 carries the address; D0/D1 are the reserved
+;;; translator scratch (see *68k-vreg-map*).
+(defparameter *68k-globals-base* #x00600000
+  "Base of the 68k absolute-address convention slot block.")
+
+(defparameter *68k-linux-mode* nil
+  "T when building a HOSTED Linux/m68k image rather than a bare-metal one.
+   Bare and hosted are different memory maps: #x00600000 is ordinary RAM on
+   `virt' and is NOT MAPPED under Linux, and the Goldfish TTY at
+   +M68K-UART-BASE+ does not exist in our address space there.
+   M68K-SET-LINUX-MODE moves the slots and turns the console byte into write(2).")
+
+(defparameter *68k-hosted-globals-base* #x10000A00
+  "Convention slots for the HOSTED port, inside the mmap'd heap and above the
+   Cheney metadata at #x10000040 — the address every hosted port picks.")
+
+;;; Linux/m68k syscall numbers.  This is the ORIGINAL Linux table (the one i386
+;;; also uses) and not the asm-generic one: write is 4 here, 64 on RISC-V.
+;;; 192 is mmap2, whose sixth argument is an offset in PAGES; it is used in
+;;; preference to 90 (old_mmap) because old_mmap takes a POINTER to a block of
+;;; six arguments in d1 rather than the arguments themselves.
+;;;
+;;; THE ARGUMENT REGISTERS ARE d1,d2,d3,d4,d5,a0 — five data registers and then
+;;; an ADDRESS register, which is why a six-argument syscall needs a0 here and
+;;; nothing else in this file does.  The number goes in d0 and the result comes
+;;; back in d0.
+(defconstant +68k-linux-sys-exit+   1)
+(defconstant +68k-linux-sys-read+   3)
+(defconstant +68k-linux-sys-write+  4)
+(defconstant +68k-linux-sys-mmap2+ 192)
+(defun m68k-nargs-addr ()   (+ *68k-globals-base* #x00))
+(defun m68k-cenv-addr ()    (+ *68k-globals-base* #x08))
+;;; SHARED contract address, as on x64/aarch64/i386/ppc64: compiler-emitted
+;;; mem-refs and shared CL source read #x10000090 directly.  It is 256MB in,
+;;; so the 68k images must be run with at least that much RAM -- the harness
+;;; passes -m 512.  Unlike RISC-V (where it lands in UART MMIO) and ppc32
+;;; (outside the mapped TLBs), on m68k virt it is ordinary RAM.
+(defun m68k-mvcount-addr () modus.mvm::+mv-count-addr+)
+
+(defun m68k-emit-store-abs (buf dn addr)
+  "Store data register DN to absolute ADDR (address parked in A1)."
+  (m68k-emit-move-imm-an buf addr +68k-a1+)
+  (m68k-emit-move-dn-an-ind buf dn +68k-a1+))
+
+(defun m68k-emit-load-abs (buf dn addr)
+  "Load from absolute ADDR into data register DN (address parked in A1)."
+  (m68k-emit-move-imm-an buf addr +68k-a1+)
+  (m68k-emit-move-an-ind-dn buf +68k-a1+ dn))
+
 (defun m68k-emit-lsl-imm (buf dn count)
   "LSL.L #count, Dn (logical shift left)"
   ;; Format: 1110 count(3) 1 10 i/r=0 01 reg
@@ -868,10 +936,15 @@
    First slots are for saving callee-saved regs.")
 
 (defun m68k-spill-offset (vreg)
-  "Calculate the A6-relative offset for a spilled virtual register."
+  "Calculate the A6-relative offset for a spilled virtual register.
+
+   V6 and V7 spill now too: D0/D1 are reserved as the translator's scratch
+   (see *68k-vreg-map*), which cost two inline registers.  Slots are laid out
+   by vreg index from V6, so V8..V15 keep moving down as before, two slots
+   further along -- the frame reserves room for all of them."
   (cond
-    ((and (>= vreg 8) (<= vreg 15))
-     (+ +68k-spill-base-offset+ (* (- vreg 8) -4)))
+    ((and (>= vreg 6) (<= vreg 15))
+     (+ +68k-spill-base-offset+ (* (- vreg 6) -4)))
     (t (error "68k: unexpected spill for vreg ~D" vreg))))
 
 (defun m68k-vreg-phys (vreg)
@@ -938,30 +1011,58 @@
 ;;; Prologue / Epilogue
 ;;; ============================================================
 
-(defconstant +68k-frame-slot-base+ -64
+(defconstant +68k-frame-slot-base+ -72
   "A6-relative offset for frame slot 0 (local variables via obj-ref VFP).
    Frame slots grow downward: slot N is at A6 + frame-slot-base - N*4.
-   This is below all spill slots (which end at A6-60) to avoid overlap.")
 
-(defconstant +68k-frame-size+ 96
-  "Stack frame size: 60 bytes spill area + 32 bytes frame slots = 92,
-   rounded to 96 for alignment.")
+   This MUST stay below the last spill slot.  Reserving D0/D1 as the
+   translator's scratch pushed V6 and V7 out of registers and into the spill
+   area, which grew it by 8 bytes (it now ends at A6-68 rather than A6-60).
+   The old -64 base then overlapped the V14/V15 spill slots: a local and a
+   spilled vreg shared a word, and `(cons 40 2)` returned through a smashed
+   pointer -- the 68k ran off to an odd PC (0x006f4001) and took an address
+   error.  Move the base down by the same 8 bytes the spill area gained.")
 
-(defun m68k-emit-prologue (buf)
-  "Emit 68k function prologue. LINK + save callee-saved registers."
+(defconstant +68k-frame-size+ 592
+  "Stack frame size: 68 bytes spill area (V6-V15) + 512 bytes of frame slots
+   (128 slots from A6-72 down to A6-580) = 580, rounded to 592.
+
+   ONE HUNDRED TWENTY-EIGHT SLOTS, NOT FOURTEEN.  The MVM compiler picks the
+   `obj-ref VFP <idx>' index per function and tells the back end no bound,
+   which is why translate-x64 reserves 128; a local past the last reserved
+   slot is addressed BELOW the frame, in memory the next call's frame
+   occupies.  Measured on RISC-V: MAKE-HASH-TABLE's &rest prologue alone
+   reads frame slot 31.  -592 still fits LINK's 16-bit displacement.")
+
+(defun m68k-emit-prologue (buf &optional (nparams 0))
+  "Emit 68k function prologue. LINK, copy parameters 5.. into frame slots 4..,
+   save callee-saved registers.
+
+   NPARAMS is the frame-enter TRAP's code.  Only V0-V3 travel in registers;
+   the caller PUSHes the rest (arg 4 last, a longword each) and the body reads
+   parameter i as `obj-ref VFP i', so they must be copied into the frame --
+   translate-x64/i386/aarch64/arm32 all do it, and this back end did not, so
+   every fifth-and-later parameter was an uninitialised slot.  Found on RISC-V
+   in the real CL image (COPY-SEQ's fifth argument to %BULK-COPY).
+
+   JSR pushed the return address and LINK the old A6, so parameter i is at
+   A6 + 8 + (i-4)*4.  D0 is translator scratch and free here."
+  (when (> nparams 128)
+    (error "MVM 68k: ~D parameters exceed the 128-slot frame" nparams))
   ;; LINK A6, #-frame-size
   (m68k-emit-link buf +68k-a6+ (logand (- +68k-frame-size+) #xFFFF))
+  (loop for i from 4 below nparams
+        do (m68k-emit-move-disp-dn buf +68k-a6+ (+ 8 (* (- i 4) 4)) +68k-d0+)
+           (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a6+
+                                   (- +68k-frame-slot-base+ (* i 4))))
   ;; Save callee-saved data registers D4-D7 using MOVEM
   ;; Predecrement mask is reversed: bit 15=D0, bit 14=D1, ...
   ;; D4=bit 11, D5=bit 10, D6=bit 9, D7=bit 8
-  ;; Also save A2-A4 (VA, VL, VN): A2=bit 5, A3=bit 4, A4=bit 3
+  ;; A2-A4 (VA, VL, VN) ARE NOT SAVED -- see m68k-emit-epilogue.
   (let ((mask (logior (ash 1 11)   ; D4
                       (ash 1 10)   ; D5
                       (ash 1 9)    ; D6
-                      (ash 1 8)    ; D7
-                      (ash 1 5)    ; A2
-                      (ash 1 4)    ; A3
-                      (ash 1 3)))) ; A4
+                      (ash 1 8))))  ; D7
     (m68k-emit-movem-to-predec buf mask)))
 
 (defun m68k-emit-epilogue (buf)
@@ -969,14 +1070,18 @@
   ;; Restore callee-saved registers with MOVEM (postincrement)
   ;; Normal mask: bit 0=D0, ..., bit 7=D7, bit 8=A0, ...
   ;; D4=bit 4, D5=bit 5, D6=bit 6, D7=bit 7
-  ;; A2=bit 10, A3=bit 11, A4=bit 12
+  ;; A2 (VA), A3 (VL) AND A4 (VN) ARE GLOBAL STATE AND ARE NOT RESTORED.
+  ;; A2 is the ALLOCATION POINTER; restoring it on return rolls the heap
+  ;; pointer back over everything the callee allocated, so the caller's next
+  ;; CONS is handed live memory.  translate-aarch64 names the consequence
+  ;; ("allocations made by callees would be lost on return"); found on RISC-V,
+  ;; where it destroyed the first nine conses of the image.  A3 is the alloc
+  ;; LIMIT, which a collection legitimately moves, and A4 is a constant.  The
+  ;; two masks must stay symmetric, so both dropped the same three.
   (let ((mask (logior (ash 1 4)    ; D4
                       (ash 1 5)    ; D5
                       (ash 1 6)    ; D6
-                      (ash 1 7)    ; D7
-                      (ash 1 10)   ; A2
-                      (ash 1 11)   ; A3
-                      (ash 1 12)))) ; A4
+                      (ash 1 7))))  ; D7
     (m68k-emit-movem-from-postinc buf mask))
   ;; UNLK A6
   (m68k-emit-unlk buf +68k-a6+)
@@ -1013,15 +1118,133 @@
        (let ((code (first operands)))
          (cond
            ((< code #x0100)
-            ;; Frame-enter: emit function prologue
-            (m68k-emit-prologue buf))
+            ;; Frame-enter: CODE is the parameter count -- see m68k-emit-prologue.
+            (m68k-emit-prologue buf code))
            ((< code #x0300)
             ;; Frame-alloc/frame-free: NOP for now
             nil)
+           ((= code #x0510)
+            ;; SETJMP.  Stack the outer jmpbuf, then save A7 / A6 / resume
+            ;; address / D4..D7.  First return NIL; LONGJMP re-enters at RESUME
+            ;; with D2 = T.  A capped push arms nothing.  The resume address is
+            ;; LEA (bd.l,PC) with the same hand-referenced :disp32 fixup
+            ;; +op-fn-addr+ uses.
+            (let ((skip (mvm-make-label))
+                  (resume (mvm-make-label)))
+              (m68k-emit-handler-push buf)
+              (m68k-emit-tst buf +68k-d0+)
+              (m68k-emit-bne buf skip)
+              (m68k-emit-move-imm-an buf (m68k-jmpbuf-addr) +68k-a1+)
+              (m68k-emit-move-an-disp buf +68k-a7+ +68k-a1+ 0)
+              (m68k-emit-move-an-disp buf +68k-a6+ +68k-a1+ 4)
+              (m68k-emit-word buf #x41FB)                     ; LEA (bd.l,PC),A0
+              (let ((ext-pos (m68k-buffer-position buf)))
+                (m68k-emit-word buf #x0170)
+                (m68k-emit-word buf 0)
+                (push (list (1- (m68k-buffer-word-count buf)) resume :disp32
+                            (+ ext-pos 2))
+                      (m68k-buffer-fixups buf))
+                (m68k-emit-word buf 0))
+              (m68k-emit-move-an-disp buf +68k-a0+ +68k-a1+ 8)
+              (loop for d in (list +68k-d4+ +68k-d5+ +68k-d6+ +68k-d7+)
+                    for i from 3
+                    do (m68k-emit-move-dn-disp buf d +68k-a1+ (* 4 i)))
+              (m68k-emit-label buf skip)
+              (m68k-emit-move-an-dn buf +68k-a4+ +68k-d2+)      ; first return: NIL
+              (m68k-emit-label buf resume)))
+           ((= code #x0511)
+            ;; LONGJMP.  Copy the jmpbuf aside first, zero the live capped count,
+            ;; pop, then restore and JMP with D2 = T.  Nothing armed (word 0 = 0):
+            ;; ILLEGAL rather than a jump to address zero.
+            (let ((nohandler (mvm-make-label)))
+              (m68k-emit-move-imm-an buf (m68k-jmpbuf-addr) +68k-a1+)
+              (m68k-emit-move-disp-dn buf +68k-a1+ 0 +68k-d0+)
+              (m68k-emit-tst buf +68k-d0+)
+              (m68k-emit-beq buf nohandler)
+              (m68k-emit-move-imm-an buf (m68k-lj-scratch-addr) +68k-a0+)
+              (m68k-emit-copy-words buf +68k-a1+ +68k-a0+)
+              (m68k-emit-move-imm-an buf (m68k-hcapped-addr) +68k-a1+)
+              (m68k-emit-move-imm-dn buf 0 +68k-d0+)
+              (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ 0)
+              (m68k-emit-handler-pop buf)
+              (m68k-emit-move-imm-an buf (m68k-lj-scratch-addr) +68k-a1+)
+              (loop for d in (list +68k-d4+ +68k-d5+ +68k-d6+ +68k-d7+)
+                    for i from 3
+                    do (m68k-emit-move-disp-dn buf +68k-a1+ (* 4 i) d))
+              (m68k-emit-move-disp-an buf +68k-a1+ 8 +68k-a0+)  ; resume
+              (m68k-emit-move-disp-an buf +68k-a1+ 4 +68k-a6+)
+              (m68k-emit-move-disp-an buf +68k-a1+ 0 +68k-a7+)
+              (m68k-emit-move-imm-dn buf #xDEAD1009 +68k-d2+)  ; second return: T
+              (m68k-emit-jmp-an-ind buf +68k-a0+)
+              (m68k-emit-label buf nohandler)
+              (m68k-emit-illegal buf)))
+           ((= code #x0512)
+            ;; CLEAR-HANDLER: pop one frame; D2 (the result) untouched.
+            (m68k-emit-handler-pop buf))
+           ((= code #x0530)
+            ;; COPY-OVERFLOW-ARGS: the &rest/&key prologue's RUNTIME copy of
+            ;; arguments 4.. into frame slots 4.., as translate-x64/i386/riscv
+            ;; do.  Unrolled -- for i = 4..31: stop once nargs <= i, else copy
+            ;; one longword -- so it needs only D0 (the count) and D1.  JSR
+            ;; pushed the return address and LINK the old A6, so argument i is
+            ;; at A6 + 8 + (i-4)*4.  Capped at 32 like the other back ends.
+            (let ((done (mvm-make-label)))
+              (m68k-emit-load-abs buf +68k-d0+ (m68k-nargs-addr))
+              (loop for i from 4 below 32
+                    do (m68k-emit-cmpi buf +68k-d0+ i)
+                       (m68k-emit-ble buf done)
+                       (m68k-emit-move-disp-dn buf +68k-a6+ (+ 8 (* (- i 4) 4)) +68k-d1+)
+                       (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a6+
+                                               (- +68k-frame-slot-base+ (* i 4))))
+              (m68k-emit-label buf done)))
+           ((and (= code #x0300) *68k-linux-mode*)
+            ;; HOSTED: the serial write becomes write(1, &byte, 1).
+            ;;
+            ;; write(2) wants an ADDRESS, so the untagged byte is PUSHED and the
+            ;; buffer is 3(a7) — THREE, not zero: m68k is BIG-ENDIAN, so the low
+            ;; byte of a pushed longword is the LAST of its four bytes.  Passing
+            ;; a7 itself would print the high byte of the char, which for any
+            ;; ASCII character is 0.
+            (m68k-emit-move-dn-dn buf +68k-d2+ +68k-d1+)   ; V0 -> scratch
+            (m68k-emit-asr-imm buf +68k-d1+ 1)             ; untag
+            (m68k-emit-push-dn buf +68k-d1+)
+            (m68k-emit-lea-disp buf +68k-a7+ 3 +68k-a0+)   ; a0 = &low byte
+            (m68k-emit-move-imm-dn buf 1 +68k-d1+)         ; arg1: fd = stdout
+            (m68k-emit-move-an-dn buf +68k-a0+ +68k-d2+)   ; arg2: buf
+            (m68k-emit-move-imm-dn buf 1 +68k-d3+)         ; arg3: count
+            (m68k-emit-move-imm-dn buf +68k-linux-sys-write+ +68k-d0+)
+            (m68k-emit-trap buf 0)
+            (m68k-emit-addq-an buf +68k-a7+ 4))            ; pop the byte
+           ((and (= code #x0301) *68k-linux-mode*)
+            ;; HOSTED: read(0, &byte, 1); the byte comes back TAGGED in V0 (d2),
+            ;; matching the bare arm's contract.  Same 3(a7) big-endian offset.
+            (m68k-emit-move-imm-dn buf 0 +68k-d1+)         ; make room (value
+            (m68k-emit-push-dn buf +68k-d1+)               ; irrelevant)
+            (m68k-emit-lea-disp buf +68k-a7+ 3 +68k-a0+)
+            (m68k-emit-move-imm-dn buf 0 +68k-d1+)         ; arg1: fd = stdin
+            (m68k-emit-move-an-dn buf +68k-a0+ +68k-d2+)   ; arg2: buf
+            (m68k-emit-move-imm-dn buf 1 +68k-d3+)         ; arg3: count
+            (m68k-emit-move-imm-dn buf +68k-linux-sys-read+ +68k-d0+)
+            (m68k-emit-trap buf 0)
+            (m68k-emit-move-imm-dn buf 0 +68k-d2+)
+            (m68k-emit-lea-disp buf +68k-a7+ 3 +68k-a0+)
+            (m68k-emit-move-byte-an-ind-dn buf +68k-a0+ +68k-d2+)
+            (m68k-emit-addq-an buf +68k-a7+ 4)
+            (m68k-emit-lsl-imm buf +68k-d2+ 1))            ; tag as fixnum
+           ((and (= code #x0500) *68k-linux-mode*)
+            ;; HOSTED: exit(status), status arriving TAGGED in V0 (d2).
+            (m68k-emit-move-dn-dn buf +68k-d2+ +68k-d1+)
+            (m68k-emit-asr-imm buf +68k-d1+ 1)
+            (m68k-emit-move-imm-dn buf +68k-linux-sys-exit+ +68k-d0+)
+            (m68k-emit-trap buf 0))
            ((= code #x0300)
-            ;; Serial write: V0 (D0) contains tagged fixnum char code
-            ;; move.l d0, d1 (copy V0 to scratch)
-            (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d1+)
+            ;; BARE METAL: serial write.  V0 IS D2, NOT D0 — this arm read D0
+            ;; until 2026-09-24, left behind when *68K-VREG-MAP* slid the window
+            ;; to D2..D7 (D0/D1 became reserved scratch).  The arch ladder cannot
+            ;; see it: its oracle is guest MEMORY, not serial output, so the one
+            ;; path that would notice is the one no test on this target uses.
+            ;; move.l d2, d1 (copy V0 to scratch)
+            (m68k-emit-move-dn-dn buf +68k-d2+ +68k-d1+)
             ;; asr.l #1, d1 (untag fixnum)
             (m68k-emit-asr-imm buf +68k-d1+ 1)
             ;; movea.l #uart_base, a0
@@ -1078,10 +1301,17 @@
              ((and pd (not ps) (eq (m68k-reg-type pd) :address))
               (m68k-emit-move-disp-an buf +68k-a6+ (m68k-spill-offset vs)
                                       (m68k-reg-number pd)))
-             ;; Both spill: use D0 as scratch (careful if vd=VR=D0!)
+             ;; Everything else -- both spilled, OR an address-register source
+             ;; into a spilled destination -- through D0 with the general
+             ;; helpers, which handle every register kind.  The old fallback
+             ;; assumed BOTH spilled and asked for the source's spill slot, so
+             ;; `MOV V7 VN' (VN lives in A4, V7 spills) died at build time with
+             ;; "unexpected spill for vreg 19".  That is the first instruction
+             ;; of every &rest ladder with nothing in it, which is how
+             ;; r29-rest-many found it.
              (t
-              (m68k-emit-move-disp-dn buf +68k-a6+ (m68k-spill-offset vs) +68k-d0+)
-              (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a6+ (m68k-spill-offset vd)))))))
+              (m68k-load-vreg buf +68k-d0+ vs)
+              (m68k-store-vreg buf vd +68k-d0+))))))
 
       (#.+op-li+
        (let ((vd (first operands))
@@ -1134,7 +1364,26 @@
               (m68k-store-vreg buf vd +68k-d0+))))))
 
       ;;; --- Arithmetic ---
-      (#.+op-add+
+      ((#.+op-add+ #.+op-add-checked+ #.+op-adds+)
+       ;; :ADDS shares this clause.  :adds/:subs are "arithmetic that also sets
+       ;; the overflow flag", for a following :bvs to branch on.  The result
+       ;; they compute is identical to :add/:sub -- translate-i386 uses the
+       ;; very same code for both pairs -- so the value is right here too.
+       ;; What is NOT provided is :bvs, which still traps: these back ends do
+       ;; not promote on overflow (see the :add-checked note), so a :bvs that
+       ;; silently fell through would be a quiet wrong answer rather than a
+       ;; visible gap.  RISC-V has no condition flags at all, so a faithful
+       ;; :bvs there needs the operands, not a flag -- that is a real design
+       ;; question, and it should stay loud until someone answers it.
+       ;; :ADD-CHECKED shares this clause.  The checked opcodes mean "tagged
+       ;; arithmetic that promotes to a bignum on overflow"; implementing the
+       ;; promotion needs the generic-arith slow path, which these back ends do
+       ;; not have yet.  Falling back to plain WRAPPING arithmetic is exactly
+       ;; what translate-x64 and translate-i386 do when a module has no
+       ;; generic-arith entry (see *i386-checked-arith-slowpath*), so this is
+       ;; the documented degrade rather than a new invention -- and it is a
+       ;; large step up from the previous behaviour, which was to trap.
+
        (let ((vd (first operands))
              (va (second operands))
              (vb (third operands)))
@@ -1146,7 +1395,26 @@
            (m68k-emit-add-dn-dn buf db +68k-d0+)
            (m68k-store-vreg buf vd +68k-d0+))))
 
-      (#.+op-sub+
+      ((#.+op-sub+ #.+op-sub-checked+ #.+op-subs+)
+       ;; :SUBS shares this clause.  :adds/:subs are "arithmetic that also sets
+       ;; the overflow flag", for a following :bvs to branch on.  The result
+       ;; they compute is identical to :add/:sub -- translate-i386 uses the
+       ;; very same code for both pairs -- so the value is right here too.
+       ;; What is NOT provided is :bvs, which still traps: these back ends do
+       ;; not promote on overflow (see the :add-checked note), so a :bvs that
+       ;; silently fell through would be a quiet wrong answer rather than a
+       ;; visible gap.  RISC-V has no condition flags at all, so a faithful
+       ;; :bvs there needs the operands, not a flag -- that is a real design
+       ;; question, and it should stay loud until someone answers it.
+       ;; :SUB-CHECKED shares this clause.  The checked opcodes mean "tagged
+       ;; arithmetic that promotes to a bignum on overflow"; implementing the
+       ;; promotion needs the generic-arith slow path, which these back ends do
+       ;; not have yet.  Falling back to plain WRAPPING arithmetic is exactly
+       ;; what translate-x64 and translate-i386 do when a module has no
+       ;; generic-arith entry (see *i386-checked-arith-slowpath*), so this is
+       ;; the documented degrade rather than a new invention -- and it is a
+       ;; large step up from the previous behaviour, which was to trap.
+
        (let ((vd (first operands))
              (va (second operands))
              (vb (third operands)))
@@ -1157,7 +1425,16 @@
              (m68k-emit-sub-dn-dn buf db +68k-d0+)
              (m68k-store-vreg buf vd +68k-d0+)))))
 
-      (#.+op-mul+
+      ((#.+op-mul+ #.+op-mul-checked+)
+       ;; :MUL-CHECKED shares this clause.  The checked opcodes mean "tagged
+       ;; arithmetic that promotes to a bignum on overflow"; implementing the
+       ;; promotion needs the generic-arith slow path, which these back ends do
+       ;; not have yet.  Falling back to plain WRAPPING arithmetic is exactly
+       ;; what translate-x64 and translate-i386 do when a module has no
+       ;; generic-arith entry (see *i386-checked-arith-slowpath*), so this is
+       ;; the documented degrade rather than a new invention -- and it is a
+       ;; large step up from the previous behaviour, which was to trap.
+
        (let ((vd (first operands))
              (va (second operands))
              (vb (third operands)))
@@ -1503,8 +1780,13 @@
          ;; Tag pointer: result = A2 | +tag-cons+
          (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
          (m68k-emit-ori buf +68k-d0+ +tag-cons+)
-         ;; Bump A2 by 8
-         (m68k-emit-addq-an buf +68k-a2+ 8)
+         ;; Bump A2 by SIXTEEN, not 8.  Objects are rounded to 16 and pointer
+         ;; types are read from the low FOUR bits, so the heap pointer must
+         ;; never sit at 8 mod 16: an odd number of 8-byte conses left it there,
+         ;; and the next object's tag 9 read as nibble 1 (a cons) while the next
+         ;; cons's 1 read as 9.  r26-callee-alloc answered 1042 on 68k (and on
+         ;; riscv32 and ppc32).  ADDQ stops at 8, hence LEA.
+         (m68k-emit-lea-disp buf +68k-a2+ 16 +68k-a2+)
          (m68k-store-vreg buf vd +68k-d0+)))
 
       (#.+op-setcar+
@@ -1532,11 +1814,25 @@
          (m68k-load-vreg buf +68k-d0+ vs)
          (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d1+)
          (m68k-emit-andi buf +68k-d1+ #xF)
+         ;; AND NIL IS NOT A CONS.  NIL's low nibble IS +tag-cons+ by design --
+         ;; that is what lets car/cdr of NIL be a plain load into a NIL-filled
+         ;; page -- so the tag test alone answers T for NIL.  translate-i386's
+         ;; comment records the cost: `(loop while (consp cur) ... (setq cur
+         ;; (cdr cur)))' never terminates, because (car NIL) hands back NIL and
+         ;; the walk recurses on NIL forever.  r24-nil-atom measured 68k at 12:
+         ;; the four-bit mask was right, so (consp T) worked and (consp NIL) did
+         ;; not.  D0 still holds the untouched value here (D1 is the masked
+         ;; copy), so CMPA.L against A4 costs one instruction and no register.
          (m68k-emit-cmpi buf +68k-d1+ +tag-cons+)
          (let ((true-label (mvm-make-label))
+               (false-label (mvm-make-label))
                (done-label (mvm-make-label)))
-           (m68k-emit-beq buf true-label)
+           (m68k-emit-bne buf false-label)
+           (m68k-emit-cmpa buf +68k-a4+ +68k-d0+)   ; is the value NIL?
+           (m68k-emit-beq buf false-label)          ; NIL -> not a cons
+           (m68k-emit-bra buf true-label)
            ;; False: load NIL (from A4)
+           (m68k-emit-label buf false-label)
            (m68k-emit-move-an-dn buf +68k-a4+ +68k-d0+)
            (m68k-emit-bra buf done-label)
            ;; True: load T (tagged fixnum 1 = 2)
@@ -1551,10 +1847,13 @@
          (m68k-load-vreg buf +68k-d0+ vs)
          (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d1+)
          (m68k-emit-andi buf +68k-d1+ #xF)
+         ;; The inverse of +op-consp+'s NIL exclusion: (atom NIL) is T.
          (m68k-emit-cmpi buf +68k-d1+ +tag-cons+)
          (let ((true-label (mvm-make-label))
                (done-label (mvm-make-label)))
            (m68k-emit-bne buf true-label)
+           (m68k-emit-cmpa buf +68k-a4+ +68k-d0+)   ; is the value NIL?
+           (m68k-emit-beq buf true-label)           ; NIL is an atom
            ;; Is cons: return NIL
            (m68k-emit-move-an-dn buf +68k-a4+ +68k-d0+)
            (m68k-emit-bra buf done-label)
@@ -1697,10 +1996,106 @@
              ;; Unknown target: emit BSR with no fixup
              (m68k-emit-bsr buf nil))))
 
+      ((#.+op-fadd+ #.+op-fsub+ #.+op-fmul+ #.+op-fdiv+)
+       (let ((vd (first operands)))
+         (m68k-load-vreg buf +68k-d0+ (second operands))
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+         (m68k-float-unbox buf 0)
+         (m68k-load-vreg buf +68k-d0+ (third operands))
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+         (m68k-float-unbox buf 1)
+         (m68k-emit-fop buf (cond ((= opcode +op-fadd+) #x22)
+                                  ((= opcode +op-fsub+) #x28)
+                                  ((= opcode +op-fmul+) #x23)
+                                  (t                    #x20))
+                        1 0)                                  ; FP0 op= FP1
+         (m68k-float-box buf 0)
+         (m68k-store-vreg buf vd +68k-d0+)))
+
+      (#.+op-itof+
+       ;; Tagged fixnum -> double: untag, FMOVE.L Dn,FP0 (exact for 32 bits).
+       (let ((vd (first operands)))
+         (m68k-load-vreg buf +68k-d0+ (second operands))
+         (m68k-emit-asr-imm buf +68k-d0+ 1)
+         (m68k-emit-fmove-l-from-dn buf +68k-d0+ 0)
+         (m68k-float-box buf 0)
+         (m68k-store-vreg buf vd +68k-d0+)))
+
+      (#.+op-ftoi+
+       ;; Double -> tagged fixnum, TRUNCATING: FINTRZ first (round toward
+       ;; zero, whatever FPCR's mode), then FMOVE.L of an already-integral value.
+       (let ((vd (first operands)))
+         (m68k-load-vreg buf +68k-d0+ (second operands))
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+         (m68k-float-unbox buf 0)
+         (m68k-emit-fop buf #x03 0 0)                         ; FINTRZ FP0,FP0
+         (m68k-emit-fmove-l-to-dn buf 0 +68k-d0+)
+         (m68k-emit-lsl-imm buf +68k-d0+ 1)                   ; tag
+         (m68k-store-vreg buf vd +68k-d0+)))
+
+      (#.+op-fn-addr+
+       ;; (fn-addr Vd target) -- a function's native address TAGGED with
+       ;; +tag-function+ (3), as funcall dispatch and FUNCTIONP expect.
+       ;;
+       ;; LEA (bd.l,PC),A1 -- the 68020 full-extension-word form, because
+       ;; LEA d16(PC) reaches only +-32 KB and a real image is megabytes.  The
+       ;; extension word #x0170 says: base register PC, index suppressed, 32-bit
+       ;; base displacement, no memory indirection.  The PC it adds is the
+       ;; address of the EXTENSION WORD, so the fixup's reference position is
+       ;; set to that by hand (m68k-emit-fixup would measure from the
+       ;; displacement word itself).  The translator already emits 68020
+       ;; instructions (MULS.L/DIVS.L), so this raises no CPU floor.
+       ;; Entries are 4-aligned (translate-mvm-to-68k-1), so OR 3 is exact.
+       ;; THE OPERAND IS THE TARGET'S BYTECODE OFFSET, not a function index
+       ;; (compiler.lisp's :fn-addr lowering passes function-info-bytecode-
+       ;; offset), and #xFFFFFFF0 is the compiler's sentinel for an undefined
+       ;; name, which must load NIL so FUNCALL signals UNDEFINED-FUNCTION --
+       ;; translate-x64's contract.  An index lookup passed r16 and r29 only
+       ;; because each rung's target was the image's FIRST function, offset 0 =
+       ;; index 0; the whole prelude, pushed through arm32 as a census, found it
+       ;; ("no label for function index 37512").
+       (let* ((vd (first operands))
+              (target (second operands))
+              (label (gethash target label-map)))
+         (when (= target #xFFFFFFF0)                     ; undefined name: NIL
+           (m68k-emit-move-an-dn buf +68k-a4+ +68k-d0+)
+           (m68k-store-vreg buf vd +68k-d0+)
+           (return-from m68k-translate-insn nil))
+         (unless label
+           (error "68k fn-addr: no function at bytecode offset ~D" target))
+         (m68k-emit-word buf #x43FB)                     ; LEA (bd.l,PC),A1
+         (let ((ext-pos (m68k-buffer-position buf)))
+           (m68k-emit-word buf #x0170)                   ; full extension word
+           (m68k-emit-word buf 0)                        ; bd high (patched)
+           (push (list (1- (m68k-buffer-word-count buf)) label :disp32
+                       (+ ext-pos 2))
+                 (m68k-buffer-fixups buf))
+           (m68k-emit-word buf 0))                       ; bd low (patched)
+         (m68k-emit-move-an-dn buf +68k-a1+ +68k-d0+)
+         (m68k-emit-ori buf +68k-d0+ +tag-function+)
+         (m68k-store-vreg buf vd +68k-d0+)))
+
+      (#.+op-li-const+
+       ;; (li-const Vd idx) -- the TAGGED address of constant-pool slot IDX, not
+       ;; known until the image is laid out: MOVE.L #0,D0 recorded in
+       ;; *68k-li-const-patches* and filled in by cross.lisp.
+       (let ((vd (first operands))
+             (idx (second operands)))
+         (push (cons (m68k-buffer-position buf) idx) *68k-li-const-patches*)
+         (m68k-emit-word buf #x203C)                     ; MOVE.L #imm32,D0
+         (m68k-emit-long buf 0)
+         (m68k-store-vreg buf vd +68k-d0+)))
+
       (#.+op-call-ind+
        (let ((vs (first operands)))
-         ;; Load target address into A0, then JSR (A0)
-         (m68k-load-vreg-to-an buf +68k-a0+ vs)
+         ;; CLEAR THE FUNCTION TAG, then JSR (A0).  A function value carries tag
+         ;; 3 (+op-fn-addr+), and JSR to an odd address is an ADDRESS ERROR on
+         ;; 68k -- unlike PowerPC, whose BCCTR ignores the low two bits.  AND
+         ;; rather than SUBQ #3 so an untagged (4-aligned) target passes through
+         ;; unchanged too.
+         (m68k-load-vreg buf +68k-d0+ vs)
+         (m68k-emit-andi buf +68k-d0+ #xFFFFFFFC)
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
          (m68k-emit-jsr-an-ind buf +68k-a0+)))
 
       (#.+op-ret+
@@ -1725,16 +2120,33 @@
          ;; Tag A2 (VA) as cons pointer
          (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
          (m68k-emit-ori buf +68k-d0+ +tag-cons+)
-         ;; Bump A2 by 8
-         (m68k-emit-addq-an buf +68k-a2+ 8)
+         ;; Bump A2 by 16 -- the same reason as +op-cons+.
+         (m68k-emit-lea-disp buf +68k-a2+ 16 +68k-a2+)
          (m68k-store-vreg buf vd +68k-d0+)))
 
-      (#.+op-gc-check+
-       ;; Compare A2 (VA) against A3 (VL)
-       (m68k-emit-cmpa-an buf +68k-a2+ +68k-a3+)
+      ((#.+op-gc-check+ #.+op-gc-check-n+ #.+op-gc-check-r+)
+       ;; :GC-CHECK-N and :GC-CHECK-R share this clause.  They carry an
+       ;; allocation SIZE (a constant, or a runtime value) so a back end can
+       ;; check `VA + n < VL` rather than `VA < VL`.  None of x64, i386 or
+       ;; aarch64 uses the size either -- translate-i386 routes all three to
+       ;; the same plain VA-vs-VL comparison -- so doing the same here matches
+       ;; the reference back ends exactly.  What it replaces is worse than an
+       ;; imprecise check: RISC-V/PPC/68k TRAPPED on these opcodes, and
+       ;; make-array emits :gc-check-n, so no array could be allocated at all.
+       ;; Room remains while VA (A2, alloc pointer) is below VL (A3, limit).
+       ;;
+       ;; THE OPERAND ORDER WAS REVERSED AND THE TEST RAN BACKWARDS.
+       ;; m68k-emit-cmpa-an takes (src dst) and emits CMPA.L src,dst, which
+       ;; computes dst - src; carry is the BORROW, so it is set when dst <
+       ;; src.  Comparing (A2, A3) therefore computed A3 - A2 and set carry
+       ;; when VL < VA -- out of memory -- and the branch treated that as the
+       ;; OK case.  Every allocation with room available fell through to the
+       ;; ILLEGAL instead: `(cons 42 0)` trapped on the first cons, which is
+       ;; why 68k passed arithmetic and recursion but could not build a pair.
+       ;; Comparing (A3, A2) computes A2 - A3, so carry set means VA < VL.
+       (m68k-emit-cmpa-an buf +68k-a3+ +68k-a2+)
        (let ((ok-label (mvm-make-label)))
-         ;; If A2 < A3 (unsigned), still room
-         (m68k-emit-bcc-word buf +68k-cc-cs+ ok-label)  ; CS = carry set = A3 > A2
+         (m68k-emit-bcc-word buf +68k-cc-cs+ ok-label)  ; CS = VA < VL = room
          ;; GC needed: trap
          (m68k-emit-illegal buf)
          (m68k-emit-label buf ok-label)))
@@ -1848,6 +2260,208 @@
          (m68k-load-vreg buf +68k-d0+ vs)
          (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a0+)))
 
+      ;;; --- Arrays ---
+      ;; Object layout as obj-ref already uses it here: tag 9 (+tag-object+),
+      ;; header longword at obj-9, element k at obj-9 + (1+k)*4.  The index
+      ;; arrives TAGGED (2k), so k*4 == tagged*2 and the element sits at
+      ;; obj + tagged*2 - 5.  D0/D1 are the reserved scratch, A0 the address
+      ;; scratch, A2 the alloc pointer (VA).
+      (#.+op-alloc-array+
+       ;; (alloc-array Vd Vcount) — Vcount is UNTAGGED (the compiler SAR'd it).
+       (let ((vd (first operands))
+             (vcount (second operands)))
+         ;; D1 = count (kept); D0 = header, stored at (A2).
+         (m68k-load-vreg buf +68k-d1+ vcount)
+         (m68k-emit-move-dn-dn buf +68k-d1+ +68k-d0+)
+         (m68k-emit-lsl-imm buf +68k-d0+ 8)
+         (m68k-emit-ori buf +68k-d0+ #x32)             ; array subtag
+         (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a2+)
+         ;; D0 = VA | 9 — the RESULT, taken before the pointer is bumped.
+         (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
+         (m68k-emit-ori buf +68k-d0+ +tag-object+)
+         (m68k-store-vreg buf vd +68k-d0+)
+         ;; D1 = align16((count + 1) * 4), then A2 += D1.
+         (m68k-emit-addi buf +68k-d1+ 1)
+         (m68k-emit-lsl-imm buf +68k-d1+ 2)
+         (m68k-emit-addi buf +68k-d1+ 15)
+         (m68k-emit-andi buf +68k-d1+ (logand (lognot 15) #xFFFFFFFF))
+         (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
+         (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a2+)))
+
+      (#.+op-aref+
+       (let ((vd (first operands))
+             (vobj (second operands))
+             (vidx (third operands)))
+         (m68k-load-vreg buf +68k-d0+ vidx)
+         (m68k-emit-lsl-imm buf +68k-d0+ 1)            ; tagged*2 = k*4
+         (m68k-load-vreg buf +68k-d1+ vobj)
+         (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)   ; D0 += Vobj
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+         (m68k-emit-move-disp-dn buf +68k-a0+ (- 4 +tag-object+) +68k-d0+)
+         (m68k-store-vreg buf vd +68k-d0+)))
+
+      (#.+op-aset+
+       ;; (aset Vobj Vidx Vs).  The address is finished into A0 FIRST, so the
+       ;; value can then own D0 without either clobbering the other.
+       (let ((vobj (first operands))
+             (vidx (second operands))
+             (vs (third operands)))
+         (m68k-load-vreg buf +68k-d0+ vidx)
+         (m68k-emit-lsl-imm buf +68k-d0+ 1)
+         (m68k-load-vreg buf +68k-d1+ vobj)
+         (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+         (m68k-load-vreg buf +68k-d0+ vs)
+         (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a0+ (- 4 +tag-object+))))
+
+      (#.+op-array-len+
+       ;; count = (header >> 8) & 0xFFFFFF, returned TAGGED.
+       (let ((vd (first operands))
+             (vobj (second operands)))
+         (m68k-load-vreg buf +68k-d0+ vobj)
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+         (m68k-emit-move-disp-dn buf +68k-a0+ (- +tag-object+) +68k-d0+)
+         (m68k-emit-lsr-imm buf +68k-d0+ 8)
+         (m68k-emit-andi buf +68k-d0+ #xFFFFFF)
+         (m68k-emit-lsl-imm buf +68k-d0+ 1)            ; tag as fixnum
+         (m68k-store-vreg buf vd +68k-d0+)))
+
+      ;;; --- Byte vectors and strings ---
+      ;; Payload starts right after the header longword, at obj - 9 + 4, i.e.
+      ;; obj - 5.  The 68k has no byte move with a displacement here, so the
+      ;; -5 is folded into the address before it reaches A0.  Shapes mirror
+      ;; translate-i386, including which operands arrive TAGGED.
+      (#.+op-alloc-u8+
+       (let ((vd (first operands))
+             (vcount (second operands)))
+         (m68k-load-vreg buf +68k-d1+ vcount)
+         (m68k-emit-asr-imm buf +68k-d1+ 1)              ; N = count >> 1
+         (m68k-emit-move-dn-dn buf +68k-d1+ +68k-d0+)
+         (m68k-emit-lsl-imm buf +68k-d0+ 8)
+         (m68k-emit-ori buf +68k-d0+ #x11)               ; u8-vector subtag
+         (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a2+)
+         ;; result = VA | 9, taken BEFORE the pointer is bumped
+         (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
+         (m68k-emit-ori buf +68k-d0+ +tag-object+)
+         (m68k-store-vreg buf vd +68k-d0+)
+         ;; bytes = align16(N + 4)
+         (m68k-emit-addi buf +68k-d1+ 19)                ; N + 4 + 15
+         (m68k-emit-andi buf +68k-d1+ (logand (lognot 15) #xFFFFFFFF))
+         (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
+         (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a2+)))
+
+      (#.+op-alloc-string+
+       ;; One character CODE per WORD; count already UNTAGGED by the compiler.
+       (let ((vd (first operands))
+             (vcount (second operands)))
+         (m68k-load-vreg buf +68k-d1+ vcount)
+         (m68k-emit-move-dn-dn buf +68k-d1+ +68k-d0+)
+         (m68k-emit-lsl-imm buf +68k-d0+ 8)
+         (m68k-emit-ori buf +68k-d0+ #x31)               ; string subtag
+         (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a2+)
+         (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
+         (m68k-emit-ori buf +68k-d0+ +tag-object+)
+         (m68k-store-vreg buf vd +68k-d0+)
+         ;; bytes = align16((count + 1) * 4)
+         (m68k-emit-addi buf +68k-d1+ 1)
+         (m68k-emit-lsl-imm buf +68k-d1+ 2)
+         (m68k-emit-addi buf +68k-d1+ 15)
+         (m68k-emit-andi buf +68k-d1+ (logand (lognot 15) #xFFFFFFFF))
+         (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
+         (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a2+)))
+
+      (#.+op-u8-ref+
+       (let ((vd (first operands))
+             (varr (second operands))
+             (vidx (third operands)))
+         (m68k-load-vreg buf +68k-d0+ vidx)
+         (m68k-emit-asr-imm buf +68k-d0+ 1)
+         (m68k-load-vreg buf +68k-d1+ varr)
+         (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
+         (m68k-emit-subi buf +68k-d0+ 5)                 ; tag 9 - header 4
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+         (m68k-emit-move-byte-an-ind-dn buf +68k-a0+ +68k-d0+)
+         (m68k-emit-andi buf +68k-d0+ #xFF)              ; MOVE.B leaves the top
+         (m68k-emit-lsl-imm buf +68k-d0+ 1)              ; tag as fixnum
+         (m68k-store-vreg buf vd +68k-d0+)))
+
+      (#.+op-u8-set+
+       ;; (u8-set Varr Vidx Vval) — Vidx and Vval both TAGGED.  The address is
+       ;; finished into A0 first, so the value can then own D0.
+       (let ((varr (first operands))
+             (vidx (second operands))
+             (vval (third operands)))
+         (m68k-load-vreg buf +68k-d0+ vidx)
+         (m68k-emit-asr-imm buf +68k-d0+ 1)
+         (m68k-load-vreg buf +68k-d1+ varr)
+         (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
+         (m68k-emit-subi buf +68k-d0+ 5)
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+         (m68k-load-vreg buf +68k-d0+ vval)
+         (m68k-emit-asr-imm buf +68k-d0+ 1)
+         (m68k-emit-move-byte-dn-an-ind buf +68k-d0+ +68k-a0+)))
+
+      ;;; --- System area pointers ---
+      ;; One-slot object, subtag #x16: header (1<<8)|#x16 then the raw address.
+      (#.+op-sap-new+
+       (let ((vd (first operands))
+             (vaddr (second operands)))
+         ;; Payload first — the allocation sequence below owns D0.
+         (m68k-load-vreg buf +68k-d1+ vaddr)
+         (m68k-emit-move-imm-dn buf #x116 +68k-d0+)
+         (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a2+)
+         (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a2+ 4)
+         (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
+         (m68k-emit-ori buf +68k-d0+ +tag-object+)
+         (m68k-store-vreg buf vd +68k-d0+)
+         (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
+         (m68k-emit-addi buf +68k-d0+ 16)
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a2+)))
+
+      (#.+op-sap-addr+
+       ;; Raw address out, TAGGED as a fixnum (as on x64/i386).
+       (let ((vd (first operands))
+             (vsap (second operands)))
+         (m68k-load-vreg buf +68k-d0+ vsap)
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+         (m68k-emit-move-disp-dn buf +68k-a0+ (- 4 +tag-object+) +68k-d0+)
+         (m68k-emit-lsl-imm buf +68k-d0+ 1)
+         (m68k-store-vreg buf vd +68k-d0+)))
+
+      ;;; --- Calling-convention slots ---
+      ;; These fell into the OTHERWISE branch below, which emits ILLEGAL.
+      ;; :set-nargs precedes every call, so the first call in any image
+      ;; executed an illegal instruction.
+      ;; nargs is stored RAW; :get-nargs tags it (<<1) on the way out.
+      (#.+op-set-nargs+
+       (let ((n (logand (first operands) #xFF)))
+         (m68k-emit-move-imm-dn buf n +68k-d0+)
+         (m68k-emit-store-abs buf +68k-d0+ (m68k-nargs-addr))))
+
+      (#.+op-get-nargs+
+       (let ((vd (first operands)))
+         (m68k-emit-load-abs buf +68k-d0+ (m68k-nargs-addr))
+         (m68k-emit-lsl-imm buf +68k-d0+ 1)     ; tag as fixnum
+         (m68k-store-vreg buf vd +68k-d0+)))
+
+      (#.+op-set-cenv+
+       (let ((vs (first operands)))
+         (m68k-load-vreg buf +68k-d0+ vs)
+         (m68k-emit-store-abs buf +68k-d0+ (m68k-cenv-addr))))
+
+      (#.+op-get-cenv+
+       (let ((vd (first operands)))
+         (m68k-emit-load-abs buf +68k-d0+ (m68k-cenv-addr))
+         (m68k-store-vreg buf vd +68k-d0+)))
+
+      (#.+op-set-mv-count+
+       (let ((tagged (ash (first operands) 1)))
+         (m68k-emit-move-imm-dn buf tagged +68k-d0+)
+         (m68k-emit-store-abs buf +68k-d0+ (m68k-mvcount-addr))))
+
       (otherwise
        ;; Unknown opcode: ILLEGAL
        (m68k-emit-illegal buf)))))
@@ -1857,12 +2471,17 @@
 ;;; ============================================================
 
 (defun translate-mvm-to-68k (bytecode function-table)
+  (setf *68k-li-const-patches* nil)
+  (translate-mvm-to-68k-1 bytecode function-table))
+
+(defun translate-mvm-to-68k-1 (bytecode function-table)
   "Translate MVM bytecode to Motorola 68000 native code.
    BYTECODE is a (vector (unsigned-byte 8)).
    FUNCTION-TABLE maps function indices to bytecode offsets.
    Returns a byte vector of 68k big-endian machine code."
   (let* ((buf (make-m68k-buffer))
          (label-map (make-hash-table :test 'eql))
+         (fn-entries nil)
          (bc bytecode)
          (len (length bc))
          (pc 0))
@@ -1904,10 +2523,26 @@
     ;; Emit prologue
     (m68k-emit-prologue buf)
 
+    ;; Function-entry MVM offsets, for the alignment below.
+    (setf fn-entries (make-hash-table :test 'eql))
+    (when function-table
+      (maphash (lambda (idx mvm-offset)
+                 (declare (ignore idx))
+                 (setf (gethash mvm-offset fn-entries) t))
+               function-table))
+
     ;; Second pass: translate
     (setf pc 0)
     (loop while (< pc len)
           do (progn
+               ;; FUNCTION ENTRIES ARE 4-ALIGNED.  +op-fn-addr+ ORs the function
+               ;; tag 3 into an entry address, which needs its low two bits free;
+               ;; 68k instructions are 2-byte multiples, so an entry can land at
+               ;; 2 mod 4.  Pad with NOP -- harmless if the previous function
+               ;; could ever fall through, and it cannot (it ends in RTS/branch).
+               (when (and function-table (gethash pc fn-entries))
+                 (loop while (/= 0 (mod (m68k-buffer-position buf) 4))
+                       do (m68k-emit-nop buf)))
                ;; Emit label at current PC before translating
                (let ((label (gethash pc label-map)))
                  (when label
@@ -1922,8 +2557,19 @@
     ;; Resolve labels
     (m68k-fixup-labels buf)
 
-    ;; Convert to byte vector
-    (m68k-buffer-to-bytes buf)))
+    ;; Report where each function actually LANDED — see the same change in
+    ;; translate-ppc.lisp.  Without it cross.lisp guesses proportionally and
+    ;; the entry jump lands mid-prologue as soon as there are two functions.
+    (let ((fn-map (make-hash-table :test 'eql)))
+      (when function-table
+        (maphash (lambda (idx mvm-offset)
+                   (declare (ignore idx))
+                   (let* ((label (gethash mvm-offset label-map))
+                          (pos (and label (gethash label (m68k-buffer-labels buf)))))
+                     (when pos
+                       (setf (gethash mvm-offset fn-map) pos))))
+                 function-table))
+      (values (m68k-buffer-to-bytes buf) fn-map))))
 
 ;;; ============================================================
 ;;; Installer
@@ -1936,6 +2582,189 @@
          (limit (or end (m68k-buffer-word-count buf))))
     (loop for i from start below limit
           do (format t "  ~4,'0X: ~4,'0X~%" (* i 2) (aref words i)))))
+
+;;; ============================================================
+;;; Double floats through the 68881/68882 coprocessor (on-chip on the 68040)
+;;; ============================================================
+;;;
+;;; A boxed double is four TAGGED 16-bit chunks, slot k holding bits
+;;; (63-16k)..(48-16k).  68k is big-endian, so chunk k is the WORD at byte 2k of
+;;; the IEEE double: unbox writes the untagged chunks into a 16-byte stack
+;;; scratch with MOVE.W and loads it with one FMOVE.D; box is FMOVE.D out, then
+;;; each word back, tagged, into the new object -- the route PPC and RV32 take.
+;;; FPU words are emitted raw: opword #xF200 | <ea>, then the command word.
+;;; Only FP0/FP1 are used.
+
+(defun m68k-emit-move-w-dn-disp (buf dn an disp)
+  "MOVE.W Dd, d16(An)"
+  (m68k-emit-word buf (m68k-encode-move-word 3 +ea-mode-an-disp+ an +ea-mode-dn+ dn))
+  (m68k-emit-word buf (logand disp #xFFFF)))
+
+(defun m68k-emit-move-w-disp-dn (buf an disp dn)
+  "MOVE.W d16(An), Dd -- the upper word of Dd is unchanged."
+  (m68k-emit-word buf (m68k-encode-move-word 3 +ea-mode-dn+ dn +ea-mode-an-disp+ an))
+  (m68k-emit-word buf (logand disp #xFFFF)))
+
+(defun m68k-emit-fmove-d-from-sp (buf fpn)
+  "FMOVE.D (A7), FPn"
+  (m68k-emit-word buf #xF217)
+  (m68k-emit-word buf (logior #x5400 (ash fpn 7))))
+
+(defun m68k-emit-fmove-d-to-sp (buf fpn)
+  "FMOVE.D FPn, (A7)"
+  (m68k-emit-word buf #xF217)
+  (m68k-emit-word buf (logior #x7400 (ash fpn 7))))
+
+(defun m68k-emit-fop (buf opmode src dst)
+  "Register-to-register FPU op: FADD #x22, FSUB #x28, FMUL #x23, FDIV #x20,
+   FINTRZ #x03.  DST op= SRC."
+  (m68k-emit-word buf #xF200)
+  (m68k-emit-word buf (logior (ash src 10) (ash dst 7) opmode)))
+
+(defun m68k-emit-fmove-l-from-dn (buf dn fpn)
+  "FMOVE.L Dn, FPn -- signed 32-bit integer to extended/double."
+  (m68k-emit-word buf (logior #xF200 (logand dn 7)))
+  (m68k-emit-word buf (logior #x4000 (ash fpn 7))))
+
+(defun m68k-emit-fmove-l-to-dn (buf fpn dn)
+  "FMOVE.L FPn, Dn -- to a signed 32-bit integer in the current rounding mode;
+   callers FINTRZ first so the value is already integral and exact."
+  (m68k-emit-word buf (logior #xF200 (logand dn 7)))
+  (m68k-emit-word buf (logior #x6000 (ash fpn 7))))
+
+(defun m68k-float-unbox (buf fpn)
+  "Load the double whose TAGGED pointer is in A0 into FPn.  Clobbers D1."
+  (m68k-emit-lea-disp buf +68k-a7+ -16 +68k-a7+)
+  (loop for k from 0 to 3
+        do (m68k-emit-move-disp-dn buf +68k-a0+ (- (* 4 (1+ k)) +tag-object+) +68k-d1+)
+           (m68k-emit-lsr-imm buf +68k-d1+ 1)                 ; untag
+           (m68k-emit-move-w-dn-disp buf +68k-d1+ +68k-a7+ (* 2 k)))
+  (m68k-emit-fmove-d-from-sp buf fpn)
+  (m68k-emit-lea-disp buf +68k-a7+ 16 +68k-a7+))
+
+(defun m68k-float-box (buf fpn)
+  "Box FPn as a fresh four-chunk double; its TAGGED pointer lands in D0.
+   Header (4<<8)|#x60, five longwords rounded to 32 bytes (16-aligned heap).
+   Clobbers D1."
+  (m68k-emit-lea-disp buf +68k-a7+ -16 +68k-a7+)
+  (m68k-emit-fmove-d-to-sp buf fpn)
+  (m68k-emit-move-imm-dn buf (logior #x60 (ash 4 8)) +68k-d1+)
+  (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a2+ 0)            ; header at VA
+  (loop for k from 0 to 3
+        do (m68k-emit-move-imm-dn buf 0 +68k-d1+)
+           (m68k-emit-move-w-disp-dn buf +68k-a7+ (* 2 k) +68k-d1+)
+           (m68k-emit-lsl-imm buf +68k-d1+ 1)                 ; tag
+           (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a2+ (* 4 (1+ k))))
+  (m68k-emit-lea-disp buf +68k-a7+ 16 +68k-a7+)
+  (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
+  (m68k-emit-ori buf +68k-d0+ +tag-object+)
+  (m68k-emit-lea-disp buf +68k-a2+ 32 +68k-a2+))
+
+;;; ============================================================
+;;; handler-case: SETJMP (#x0510) / LONGJMP (#x0511) / CLEAR-HANDLER (#x0512)
+;;; ============================================================
+;;;
+;;; The protocol of translate-riscv / translate-ppc: one live jmpbuf, a stack of
+;;; saved outer jmpbufs so handler-cases NEST, a depth cap (21) past which a
+;;; push stores nothing and its matching pop is ABSORBED, and LONGJMP copying the
+;;; jmpbuf aside before the pop overwrites it.
+;;;
+;;; JMPBUF = 7 longwords: A7, A6 (VFP), resume address, D4..D7 -- V2..V5, the
+;;; callee-saved V-registers the prologue's MOVEM saves and whose epilogues a
+;;; LONGJMP skips.  VA/VL/VN (A2..A4) deliberately absent; V0/V1 (D2/D3) are
+;;; caller-saved.  Frames are 8 longwords (32 bytes, one spare) so a frame
+;;; address is a shift.  Temporaries: D0, D1, A0, A1.
+;;;
+;;; WHERE: hosted, the shared contract block at the heap base (jmpbuf
+;;; #x10000180 ... frames from #x10000408; 21 frames end at #x100006A8, clear of
+;;; the globals at #x10000A00); bare, the same offsets in *68k-globals-base*'s
+;;; block, which otherwise uses only #x00-#x0F.  Computed at translate time.
+
+(defconstant +68k-jmpbuf-words+ 7)
+(defparameter *68k-hstack-max-depth* 21)
+(defun m68k-hbase ()           (if *68k-linux-mode* #x10000000 *68k-globals-base*))
+(defun m68k-jmpbuf-addr ()     (+ (m68k-hbase) #x180))
+(defun m68k-lj-scratch-addr () (+ (m68k-hbase) #x300))
+(defun m68k-hcapped-addr ()    (+ (m68k-hbase) #x360))
+(defun m68k-hdepth-addr ()     (+ (m68k-hbase) #x400))
+(defun m68k-hframes-addr ()    (+ (m68k-hbase) #x408))
+
+(defun m68k-emit-copy-words (buf from-an to-an)
+  "Copy the 7 jmpbuf longwords from 0(FROM-AN) to 0(TO-AN) through D1."
+  (dotimes (i +68k-jmpbuf-words+)
+    (m68k-emit-move-disp-dn buf from-an (* 4 i) +68k-d1+)
+    (m68k-emit-move-dn-disp buf +68k-d1+ to-an (* 4 i))))
+
+(defun m68k-emit-frame-addr (buf dst-an depth-dn)
+  "DST-AN = frames-base + DEPTH-DN * 32.  Clobbers D1."
+  (m68k-emit-move-dn-dn buf depth-dn +68k-d1+)
+  (m68k-emit-lsl-imm buf +68k-d1+ 5)
+  (m68k-emit-addi buf +68k-d1+ (m68k-hframes-addr))
+  (m68k-emit-move-dn-an buf +68k-d1+ dst-an))
+
+(defun m68k-emit-handler-push (buf)
+  "Stack the CURRENT jmpbuf.  Leaves D0 = 0 if a frame was stored, 1 if the
+   push was CAPPED.  Clobbers D0, D1, A0, A1."
+  (let ((capped (mvm-make-label))
+        (done (mvm-make-label)))
+    (m68k-emit-move-imm-an buf (m68k-hdepth-addr) +68k-a1+)
+    (m68k-emit-move-disp-dn buf +68k-a1+ 0 +68k-d0+)        ; D0 = depth
+    (m68k-emit-cmpi buf +68k-d0+ *68k-hstack-max-depth*)
+    (m68k-emit-bge buf capped)
+    (m68k-emit-frame-addr buf +68k-a0+ +68k-d0+)
+    (m68k-emit-addi buf +68k-d0+ 1)
+    (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ 0)        ; depth++
+    (m68k-emit-move-imm-an buf (m68k-jmpbuf-addr) +68k-a1+)
+    (m68k-emit-copy-words buf +68k-a1+ +68k-a0+)
+    (m68k-emit-move-imm-dn buf 0 +68k-d0+)                  ; stored
+    (m68k-emit-bra buf done)
+    (m68k-emit-label buf capped)
+    (m68k-emit-move-imm-an buf (m68k-hcapped-addr) +68k-a1+)
+    (m68k-emit-move-disp-dn buf +68k-a1+ 0 +68k-d0+)
+    (m68k-emit-addi buf +68k-d0+ 1)
+    (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ 0)
+    (m68k-emit-move-imm-dn buf 1 +68k-d0+)                  ; capped
+    (m68k-emit-label buf done)))
+
+(defun m68k-emit-handler-pop (buf)
+  "Absorb a capped push, restore the top stacked frame into the jmpbuf, or ZERO
+   the jmpbuf when the stack is empty.  Never touches D2 (V0), which holds the
+   handler-case's result at a CLEAR-HANDLER.  Clobbers D0, D1, A0, A1."
+  (let ((not-capped (mvm-make-label))
+        (empty (mvm-make-label))
+        (done (mvm-make-label)))
+    (m68k-emit-move-imm-an buf (m68k-hcapped-addr) +68k-a1+)
+    (m68k-emit-move-disp-dn buf +68k-a1+ 0 +68k-d0+)
+    (m68k-emit-tst buf +68k-d0+)
+    (m68k-emit-beq buf not-capped)
+    (m68k-emit-subq buf +68k-d0+ 1)
+    (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ 0)
+    (m68k-emit-bra buf done)
+    (m68k-emit-label buf not-capped)
+    (m68k-emit-move-imm-an buf (m68k-hdepth-addr) +68k-a1+)
+    (m68k-emit-move-disp-dn buf +68k-a1+ 0 +68k-d0+)
+    (m68k-emit-tst buf +68k-d0+)
+    (m68k-emit-beq buf empty)
+    (m68k-emit-subq buf +68k-d0+ 1)
+    (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ 0)        ; depth--
+    (m68k-emit-frame-addr buf +68k-a0+ +68k-d0+)
+    (m68k-emit-move-imm-an buf (m68k-jmpbuf-addr) +68k-a1+)
+    (m68k-emit-copy-words buf +68k-a0+ +68k-a1+)
+    (m68k-emit-bra buf done)
+    (m68k-emit-label buf empty)                             ; zero the whole jmpbuf
+    (m68k-emit-move-imm-an buf (m68k-jmpbuf-addr) +68k-a1+)
+    (m68k-emit-move-imm-dn buf 0 +68k-d1+)
+    (dotimes (i +68k-jmpbuf-words+)
+      (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a1+ (* 4 i)))
+    (m68k-emit-label buf done)))
+
+(defun m68k-set-linux-mode (on)
+  "Turn hosted mode on or off, moving the convention slots with it.  One
+   function so the two cannot drift apart: an unmapped slot base is a SIGSEGV on
+   the first :set-nargs, which precedes EVERY call, so the first function call in
+   the image dies rather than something subtle later."
+  (setf *68k-linux-mode* (and on t))
+  (setf *68k-globals-base* (if on *68k-hosted-globals-base* #x00600000)))
 
 (defun install-68k-translator ()
   "Install the 68k translator into the target descriptor."

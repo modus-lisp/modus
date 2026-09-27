@@ -587,11 +587,19 @@
    the `X.ERROR.2` test across every macro (WHEN/UNLESS/CASE/
    TYPECASE/COND/PSETQ/NTH-VALUE/MULTIPLE-VALUE-SETQ/…)."
   (declare (ignore extra))
-  (let ((nargs (mem-ref #x10000150 :u32)))
+  ;; (%GET-NARGS), not (mem-ref #x10000150): i386 keeps nargs in its own
+  ;; global slot and never writes that literal, so (= nargs 2) was never true
+  ;; there and every MACROEXPAND signalled PROGRAM-ERROR (issue #260) --
+  ;; iterate's #L reader macroexpands a backquote and died, so iterate never
+  ;; loaded on i386.  Both convention slots are READ FIRST, into locals: on
+  ;; i386 nargs and cenv are call-clobbered globals (CLAUDE.md), and the
+  ;; SETQ below is a call.
+  (let* ((nargs (%get-nargs))
+         (expander (car (%get-cenv))))
     (setq *%mexp-trace* nargs)
     (cond
       ((= nargs 2)
-       (funcall (car (%get-cenv)) form))
+       (funcall expander form))
       (t (%signal-program-error)))))
 
 (defun %interp-macro-shim (form &rest extra)
@@ -610,14 +618,16 @@
    not the whole call form), so we strip the operator before calling
    %call-interp-closure."
   (declare (ignore extra))
-  (let ((nargs (mem-ref #x10000150 :u32)))
+  ;; (%GET-NARGS) and the cenv read first -- see %MACRO-EXPANDER-SHIM.
+  (let* ((nargs (%get-nargs))
+         (closure (car (%get-cenv))))
     (cond
       ;; Exactly 2 args (form env) per CLHS §3.1.2.1.2.2.  No internal
       ;; caller funcalls this wrapper with 1 arg (macroexpand-1 and
       ;; runtime-EVAL dispatch use %RAW-MACRO-EXPANDER), so rejecting
       ;; 1-arg as program-error makes the X.ERROR.2 tests pass.
       ((= nargs 2)
-       (%call-interp-closure (car (%get-cenv)) (cdr form)))
+       (%call-interp-closure closure (cdr form)))
       (t (%signal-program-error)))))
 
 (defun %compiler-macro-shim (&rest args)
@@ -2659,13 +2669,13 @@
   "Return elements of LIST as multiple values. Sets MV buffer directly.
    Cap idx at 16 — see compile-values-list for the rationale."
   (let ((n (length list)))
-    (setf (mem-ref #x10000090 :u64) n)
+    (setf (mem-ref +mv-count-addr+ :u64) n)
     (let ((cur (if (null list) nil (cdr list)))
           (idx 0))
       (loop
         (when (null cur) (return nil))
         (when (>= idx 16) (return nil))
-        (setf (mem-ref (+ #x10000098 (* idx 8)) :u64) (car cur))
+        (setf (mem-ref (+ +mv-values-addr+ (* idx 8)) :u64) (car cur))
         (setq idx (+ idx 1))
         (setq cur (cdr cur))))
     (if (null list) nil (car list))))
@@ -2822,14 +2832,14 @@
                      (m-hi+1 (%fixnum-+ m-hi (if (= m-lo +fixnum-limit+) 1 0)))
                      (m-lo-clamped (logand m-lo +fixnum-max+)))
                 (cons -1 (list m-lo-clamped m-hi+1))))))))
-    ;; A FIXNUM most-negative-fixnum: native checked arithmetic produces one
-    ;; ((- (1+ mnf) 1) does not overflow the tagged word), although the
-    ;; runtime otherwise keeps MNF a bignum.  Its raw negation wraps back to
-    ;; itself, and a negative "magnitude" limb crashed the process:
-    ;; (* (floor -9223372036854775807 2) 3), upstream ASH.3.  Its magnitude
-    ;; is exactly the limb base, i.e. limbs (0 1).
-    ((< n 0) (let ((m (%fixnum-- 0 n)))
-               (if (< m 0) (cons -1 (list 0 1)) (cons -1 (list m)))))
+    ((< n 0)
+     ;; A RAW -2^fixnum-bits (a machine word, but outside +fixnum-min+) comes
+     ;; out of raw ops like (logand x -2); negating it wraps back to itself, so
+     ;; its magnitude 2^limb-bits is spelled as limbs (0 1).  Without this the
+     ;; limb came out negative: on i386 `(- (logand x -2))' and `=' against the
+     ;; bignum -2^30 segfaulted for x = -(2^30-1).
+     (let ((m (%fixnum-- 0 n)))
+       (if (< m 0) (cons -1 (list 0 1)) (cons -1 (list m)))))
     ((= n 0) (cons 1 '(0)))
     (t (cons 1 (list n)))))
 
@@ -3486,7 +3496,7 @@
        (+ (* (- nl 1) +limb-bits+) (%fixnum-integer-length top))))
     (t
      (let ((hi (bignum-hi n)))
-       (if (> hi 0) (+ 62 (%fixnum-integer-length hi))
+       (if (> hi 0) (+ +limb-bits+ (%fixnum-integer-length hi))
            (%fixnum-integer-length (bignum-lo n)))))))
 
 (defun integer-length (n)

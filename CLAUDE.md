@@ -295,6 +295,193 @@ baselines in `mvm/build-checks.lisp` (`:unresolved-function . 40`, line ~1069)
 **with a comment naming what was absorbed and why**. Bumping a baseline without
 naming its contents just relocates the problem.
 
+## The architecture ladder — does every back end still run code?
+
+```bash
+scripts/arch-ladder-gate.sh                 # every arch, every rung
+scripts/arch-ladder-gate.sh riscv64 68k     # just these
+ARCH_LADDER_JOBS=16 scripts/arch-ladder-gate.sh
+```
+
+Boots a real image per (architecture, rung) in QEMU and reads the answer back
+out of guest memory over QMP `pmemsave` — the same extraction
+`run-fixpoint-i386.sh` uses. No UART driver, no interrupt controller, no boot
+work: just what QEMU needs to load the image and start it. **An architecture
+passes only when every rung returns the right VALUE**; "the image wrote
+something" is not a pass.
+
+Rungs live in `test/arch-rungs/`, each with a header saying what it isolates
+and, where one was found through it, which bug. Add a rung by dropping a file
+there that defines `probe`; the gate wraps it.
+
+Two properties worth preserving if you touch this:
+
+- **The gate proves it can fail, AND THAT THE CONTROL ANSWERED.** It first runs
+  one rung with a deliberately wrong expected value and requires
+  `arch-ladder.py` to exit **3** — meaning the image BUILT, it RAN, and the
+  comparison rejected the value. Any other non-zero exit makes it refuse the
+  ladder. Accepting "non-zero" was wrong and was **measured wrong**: a bad
+  `sb-posix:chmod` broke `check-source-parses` for every target, and the gate
+  printed *"positive control failed as required — the gate can fail"* above 14
+  BUILD-FAILs, certifying a harness in which nothing compiled. This whole area
+  exists because "all 9 architectures compile and produce correct output
+  (factorial 3628800) in QEMU" stood in the README for months while five of
+  those images had no serial output path to print with.
+- **A NEGATIVE CONTROL MUST BREAK SOMETHING THAT IS ACTUALLY LOAD-BEARING.**
+  The first attempt at testing the above appended a broken form to the END of
+  `test/arch-ladder-build.lisp` — and the gate reported a clean 14/14, because
+  `load-as-source` has already written the image by the time it reads that far.
+  Inject the break AFTER `(in-package :modus.mvm)`, i.e. before the work, or the
+  control is measuring nothing. Verified both ways: broken build -> `arch-ladder.py`
+  1 (not 3), gate 2 with the reason named, `hosted-ladder.py` 2; healthy tree ->
+  riscv64 14/14 with the control answering WRONG.
+- **The probe address must stay clear of the heap.** i386's was
+  `+i386-cons-base+` exactly, so any allocating rung wrote an object header
+  over the answer. See the table in `scripts/arch-ladder.py`.
+
+When a rung fails, `--keep` leaves the built image and payload behind, and
+`scripts/arch-ladder.py` documents the per-arch QEMU machine choices (ppc64
+needs `powernv`, not `pseries`; 68k needs `virt`, not `an5206`).
+
+### The HOSTED ladder — the same rungs, seconds per cell
+
+```bash
+scripts/hosted-ladder.py riscv32            # one port, all 15 rungs
+scripts/hosted-ladder.py --all
+HOSTED_LADDER_JOBS=12 scripts/hosted-ladder.py 68k
+```
+
+**CELLS RUN IN PARALLEL** (default: half the cores).  A cell was always
+independent — own temp dir, own output path, own emulator — so the only
+sequential thing was the loop.  Six ports x 15 rungs takes minutes.
+
+A hosted image has a console, so the oracle is four bytes on stdout rather than
+a QMP read of guest memory: ~35 s per cell against ~6 min, and no machine to
+boot. Same two rules — `--expect` is mandatory and a deliberately-wrong control
+runs first — because they are what makes either harness evidence.
+
+Six ports are in it: `riscv64`, `riscv32`, `arm32`, `ppc64`, `ppc32`, `68k` —
+every one whose build script takes a SOURCE FILE. The hosted x64/aarch64/i386 images come from the CLI
+lineage and bake a whole runtime, so grading them this way would measure
+something else; they have `./modus` and the ANSI gate.
+
+**`qemu-*-static` REJECTS A NON-EXECUTABLE FILE SILENTLY** — exit 1, nothing on
+stderr, indistinguishable from "file not found". `build-image` writes mode 644,
+so a freshly built hosted image does not run until it is chmod'd; the harness
+does it so no caller can hit it. Same class as the i386 `binfmt_misc` trap.
+
+**AND THE CHMOD THAT CLOSES IT CANNOT BE SPELLED `sb-posix:chmod`.**
+`check-source-parses` READS all 201 first-party files before any build, and that
+symbol does not exist until the sb-posix contrib is required — which a load-time
+`(require :sb-posix)` does too late. The qualified name therefore fails the parse
+sweep and kills builds *for unrelated targets*. Use
+`(funcall (find-symbol "CHMOD" "SB-POSIX") out #o755)`.
+
+### AN UNMAPPED ZERO PAGE IS AN ORACLE — three PowerPC r0-as-base bugs
+
+**R0 IS NOT A BASE REGISTER ON POWERPC.**  In a D-form load or store, `rA=0`
+means the LITERAL VALUE ZERO, not the contents of r0.  So
+
+    addi r0, obj, -9        ; r0 = obj - tag-object
+    lwz  r3, 0(r0)          ; reads ABSOLUTE ADDRESS 0
+
+Three sites in `translate-ppc.lisp` did exactly that, in every PowerPC image ever
+built:
+
+| site | effect |
+|---|---|
+| `:obj-subtag` | read address 0 instead of the object header, so EVERY subtag dispatch (including `%prim-aref`'s u8-vector check) branched on whatever was at 0 |
+| `:setcar` | STORED to absolute address 0 |
+| `:setcdr` | STORED to absolute address 4 (or 8 on ppc64) |
+
+**Bare ppc32 loads at address 0 with RAM from 0**, so the stray stores landed on
+the image's own first words and the stray load read them back.  Nothing faulted.
+The HOSTED port has nothing mapped at zero, so it is an immediate SIGSEGV —
+which is how this was found.  *That* is the argument for hosted ports as a
+correctness instrument and not merely a convenience: the unmapped zero page is an
+oracle bare metal cannot provide.
+
+**AND THE LADDER COULD NOT HAVE CAUGHT THE STORE HALF AT ALL.**  For fourteen
+rungs across eight architectures, NOTHING MUTATED A CONS — `r08-cons` is
+`(let ((l (cons 40 2))) (+ (car l) (cdr l)))`, which only reads.  `r15-cons-mutate`
+now exercises `:setcar`/`:setcdr`, and passes on all eight bare targets and all
+six hosted ones.  The generalisable lesson is **a rung per
+OPCODE PAIR, not per data type**: "cons" looked covered because allocation and
+reading were.
+
+The fix puts the address in a real scratch register, and which one is not
+arbitrary — `:setcar`/`:setcdr` use scratch1 because their VALUE operand comes
+from `vreg-or-scratch` with scratch2 as its fallback and so can never BE
+scratch1; `:obj-subtag` uses scratch2 because both its operands are
+scratch1-or-a-vreg, and the address is dead after the load, which is what lets
+the tag-shift reuse scratch2.
+
+### RV32: one RISC-V back end, two widths
+
+`*riscv-64-bit*` (PPC's model) selects the width and `install-riscv32-translator`
+clears it; every width-dependent value is DERIVED — `rv-word-size`, `rv-granule`
+(a word PAIR, so tags 1 and 2 stay exact), `rv-word-shift`, `rv-index-shift`,
+`rv-mask24-shift`, `rv-mask26-shift`, and `rv-shamt` as the backstop.
+
+**Three RV32 facts that are not "narrower", each of which was a bug first:**
+- **`SLLI`'s shamt field is FIVE bits.** A shamt of 40 sets bit 25, which is
+  funct7 — so it is not a wrong shift, it is a reserved instruction. This is why
+  the mask-to-24-bits idiom needs `rv-mask24-shift` and not a constant.
+- **`AMOSWAP.D` does not exist**; funct3 is the ACCESS WIDTH, so emitting 011 on
+  RV32 is illegal rather than merely wide.
+- **`#x80000000` is an ordinary RV32 value outside signed-32**, so `rv-emit-li`'s
+  64-bit shift-and-add chain would run and build what the register cannot hold.
+  It now re-reads every immediate as signed-32 when the width is 32.
+
+`mul26hi` is the one arm that needs an extra instruction rather than a different
+constant: two 26-bit operands make a 52-bit product, so RV32 brings the high
+half down with `MULHU`. (ppc32's equivalent uses `mullw` and silently truncates
+— a real defect there, out of scope here.)
+
+**Found while porting, and NOT an RV32 bug:** `+WIDTH-TLS-BIT+` was unmasked in
+RISC-V's `op-load`/`op-store`. Widths 4..7 are 0..3 plus "per-thread window
+slot", and an unmatched `CASE` emits NOTHING — so a window-marked store was a
+silent no-op. i386 and aarch64 mask it; RISC-V now does too.
+
+**RV64's alloc start is `#x2000` now** (it was `#x200`, on top of the argc
+slot); RV32's is `#x20000`, above the staged argv.  Both are clear of the fixed
+low block (metadata `#x40`, globals `#x80`, MV `#x90..#x138`, argc `#x200`,
+handler frames `#x400..#xC2F`, per-CPU mode `#xFF8`).
+
+### Hosted RISC-V has a collector (both widths)
+
+`rv-emit-gc-collector` in `translate-riscv.lisp`: a native Cheney collector,
+one routine for RV32 and RV64, emitted once after the translated code and
+called from every hosted `:gc-check` through `auipc`/`jalr t1`.  Before it, a
+hosted RISC-V image died (`EBREAK`, `a7=#xF0`) the moment its first semispace
+filled.  Four design points, each measured:
+
+- **Roots**: the saved register file (the stack scan starts AT the save frame),
+  the stack, and the WHOLE low convention block `[#x10000000, heap+alloc-start)`
+  -- globals, symbol tables, MV values, jmpbuf and every handler frame -- so a
+  slot added later is covered by construction.
+- **To-space is split by shape**: objects copied UP from `to_start`, conses DOWN
+  from `to_end`, so the Cheney scan always knows whether it is at a header or a
+  cell, and SKIPS leaf payloads (byte vectors, SAPs, floats).  i386 scans
+  to-space word by word and would rewrite a byte pattern that looks like a
+  pointer.
+- **START and CONS bitmaps** (1 bit / 16 bytes each, in the heap's own mapping
+  past the guard, so both bases are compile-time constants).  A tag-9 root is
+  accepted only on a START bit, a tag-1 root only on a CONS bit.  Without them a
+  stale word in one of RISC-V's 128 never-initialised frame slots pointed at
+  what had become a cons whose car is NIL; `#xDEAD0001` read as a header is a
+  14.5M-element vector, and the collector copied 58 MB of garbage.  A
+  frontier-only bound is NOT enough: surviving conses live ABOVE VA.
+- **VL = cons frontier - 1 MB margin**, because `:gc-check` does not know the
+  size of the allocation that follows it.  A larger single allocation is the
+  same residual every port has.
+
+`test/hosted-rungs/h01-gc-survive.lisp` (`scripts/hosted-ladder.py riscv32
+test/hosted-rungs/h01-gc-survive.lisp`) churns 1 GB past a live chain, array and
+16384-slot string; with the stack scan deleted it SIGSEGVs on both widths, and
+the first (frontier-only) cut failed it after 8 collections.  Hosted-only on
+purpose: bare targets have no collector, so it cannot be an arch-ladder rung.
+
 ## Build Commands
 
 All builds: `sbcl --script <build-script>`
@@ -368,7 +555,7 @@ tar/`install-tarball`, the hosted socket/storage/HTTP layer, the ASDF and
 ./scripts/run-i386.sh eval '(+ 1 2)'     # evaluate one form and exit
 ./scripts/run-i386.sh repl               # interactive REPL on stdin
 ./scripts/run-i386.sh exec ARGS...       # arbitrary invocation
-./scripts/run-ladder-i386.sh <img> <tag> # the 22-library ladder (the gate)
+./scripts/run-ladder-i386.sh <img> <tag> # the 22-library ladder (the gate; test/ladder/)
 ```
 
 **32-bit ELFs need `qemu-i386-static` — binfmt_misc is NOT registered here, so
@@ -414,10 +601,38 @@ the boot stub STAGED into the BSS at `0x10009000` rather than the live initial
 stack (4-byte slots, and the kernel stack at `0x40800390` is above the 2^30
 ceiling a tagged `mem-ref` address can express); and `*cstr-scratch*` /
 `*io-buf-addr*`, which must sit in the `0x10004000..0x10009000` BSS window
-because i386's heap is at `0x30000000` and every syscall address travels as a
-tagged fixnum. There is **no in-image JIT** on i386 (`*JIT-ON*` is forced NIL) —
+because every syscall address travels as a tagged fixnum. There is **no in-image JIT** on i386 (`*JIT-ON*` is forced NIL) —
 `translate-i386.lisp` builds the image but has no runtime arm; `mvm-eval` falls
 back to `mvm-interpret`, which is correct, just slower.
+
+**THE i386 CL IMAGE USED TO DIE AT ITS FIRST COLLECTION — three defects, all
+fixed (2026-09-26).**  Any `--script` of ~1300 toplevel forms (each allocates
+~135 KB in mvm-eval, so VA reaches VL at the midpoint), or any collection at all
+with an early `MODUS_I386_VL`.  Found with CORE DUMPS read by gdb-multiarch —
+ptrace is blocked here, but `ulimit -c unlimited` + `gdb -batch -ex core-file`
+needs none.
+1. **The arena crossed 2^30.**  It was mapped at `0x30000000`, so the second
+   semispace was `0x40000000+`; the MVM's value<->word round trip (SHL 1 / SAR 1)
+   turns a pointer at or above 2^30 into another address (`0x4029D319` ->
+   `0xC029D319`), and everything ran until the first flip moved live data up.
+   The arena is now `0x19000000..0x3A000000` (just above our own stack),
+   `MAP_FIXED_NOREPLACE`, with a build-time assert of the invariant.
+2. **`%GC-COUNT` is a :u64 read of a raw count** and hands back a TAGGED value:
+   count 9 read as "an object at address 0", and `%MEXP-MEMO-SYNC`'s EQL on it
+   faulted — every i386 image died at its ninth collection.  `%GC-EPOCH`
+   (gc.lisp, `:u32`) is the always-a-fixnum "did a GC happen" reader; use it.
+3. **The Cheney scan walked to-space WORD BY WORD**, forwarding bytes inside
+   byte vectors — MVM bytecode is one — whenever four of them spelled a tagged
+   from-space address with a start bit.  That was the long-open
+   `MVM: unknown opcode #xNN at PC N` class whose pair "moved with unrelated
+   code".  The walk is typed now: cons-kind bit -> two words; else header ->
+   leaf payloads skipped, exactly COUNT slots otherwise.
+Evidence: a collect-every-8-MB build (`MODUS_I386_VL=8388608
+MODUS_I386_GCSTRESS=8388608`) runs the probe file, `test/word-boundary.lisp`
+and a 3000-form script through 257 collections, and an interpreted
+cons/string/hash-table stress through 6986 with every value intact; the
+default build passes that stress 12 of 12 (6 with ASLR off) where the previous
+build failed 12 of 12.
 
 **RETIRED (2026-08 convergence):** `MODUS_I386_LAYER=1..5` and the ~1300-line
 baked probe suite (`run-i386.sh test/gc/bulk/chain/argv/probe N`, including the

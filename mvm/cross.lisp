@@ -93,7 +93,40 @@
                    (compiled-module-to-mvm-module compiled-mod source-text))))
     (when *static-build-p* (format t "  PHASE module-done~%"))
     (setf (mvm-module-name module) name)
+    (maybe-dump-mvm-function module)
     module))
+
+(defun maybe-dump-mvm-function (module)
+  "Print one function's MVM bytecode when MODUS_MVM_DUMP names it.  Inert
+   otherwise: an env knob, like MODUS_SYMMAP.
+
+   WHY THIS IS WORTH A PERMANENT INSTRUMENT.  Every back-end bug found in this
+   port was found by comparing WHAT THE MVM SAID to WHAT THE TARGET EMITTED —
+   and until now only one of those two was readable.  MODUS_SYMMAP plus gdb
+   gives the native side; this gives the side it has to agree with, so a
+   disagreement can be pointed at instead of inferred.  Name substrings match,
+   so MODUS_MVM_DUMP=%GV-CELL prints %GV-CELL and %GV-CELL-SLOW both."
+  (let ((want (sb-posix-getenv-safe "MODUS_MVM_DUMP")))
+    (when (and want (plusp (length want)))
+      (let ((bytes (mvm-module-bytecode module)))
+        (dolist (fi (mvm-module-function-table module))
+          (let ((nm (string (mvm-function-info-name fi))))
+            (when (search want nm)
+              (format t "~&=== MVM ~A  bytecode ~D..~D (~D bytes), params ~D~%"
+                      nm (mvm-function-info-bytecode-offset fi)
+                      (+ (mvm-function-info-bytecode-offset fi)
+                         (mvm-function-info-bytecode-length fi))
+                      (mvm-function-info-bytecode-length fi)
+                      (mvm-function-info-param-count fi))
+              (disassemble-mvm bytes
+                               :start (mvm-function-info-bytecode-offset fi)
+                               :end (+ (mvm-function-info-bytecode-offset fi)
+                                       (mvm-function-info-bytecode-length fi))))))))))
+
+(defun sb-posix-getenv-safe (var)
+  "Read an environment variable without assuming the host package is loaded."
+  (let ((f (find-symbol "POSIX-GETENV" "SB-EXT")))
+    (and f (funcall f var))))
 
 (defun translate-module-to-native (module target &key into-buf)
   "Phase 2: Translate MVM bytecode to native code for TARGET.
@@ -235,7 +268,7 @@
      (let ((name (target-name target)))
        (handler-case
            (ecase name
-             (:riscv64
+             ((:riscv64 :riscv32)
               ;; rv-buffer has bytes slot with position tracking fill
               (rv-buffer-to-bytes buf))
              (:aarch64  (a64-buffer-to-bytes buf))
@@ -275,7 +308,19 @@
          (word-size (target-word-size target))
          (constants (mvm-module-constant-table module))
          (n (length constants))
-         (addr-table (make-array n :initial-element 0)))
+         (addr-table (make-array n :initial-element 0))
+         (big (target-big-endian-p target)))
+    ;; POOL WORDS ARE WRITTEN IN THE TARGET'S BYTE ORDER.  mvm-emit-u32/u64 are
+    ;; little-endian, which is right for seven targets and byte-swaps every
+    ;; header and character of a pooled string on ppc and 68k -- found when
+    ;; li-const was first implemented for PowerPC.
+    (flet ((emit-word (val)
+             (let ((nbytes word-size))
+               (if big
+                   (loop for i from (1- nbytes) downto 0
+                         do (mvm-emit-byte buf (logand (ash val (* -8 i)) #xFF)))
+                   (loop for i from 0 below nbytes
+                         do (mvm-emit-byte buf (logand (ash val (* -8 i)) #xFF)))))))
     (loop for constant in constants
           for idx from 0
           do (typecase constant
@@ -283,35 +328,44 @@
                 ;; Each heap object is 16-byte aligned at its header.
                 (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
                       do (mvm-emit-byte buf 0))
-                (let ((obj-offset (mvm-buffer-position buf))
-                      (len (length constant)))
-                  (cond
-                    ((= word-size 8)
-                     ;; 64-bit layout: header (8B) | padding (8B) | N tagged char slots (8B each)
-                     ;; Header: (count << 8) | subtag-string (#x31).
-                     ;; Matches alloc-obj's runtime header format and the
-                     ;; (count + 2) * 8 align-16 alloc-size convention.
-                     (mvm-emit-u64 buf (logior #x31 (ash len 8)))
-                     (mvm-emit-u64 buf 0)
-                     (loop for c across constant
-                           do (mvm-emit-u64 buf (ash (char-code c) 1)))
-                     (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
-                           do (mvm-emit-byte buf 0))
-                     ;; Tagged offset: object tag (#x09) on the header address.
-                     (setf (aref addr-table idx) (logior obj-offset #x09)))
-                    (t
-                     ;; 32-bit: not yet supported; leave addr=0 and emit 0 word.
-                     (mvm-emit-u32 buf 0)))))
+                (let* ((obj-offset (mvm-buffer-position buf))
+                       (len (length constant))
+                       ;; THE LAYOUT AND THE TAG ARE TARGET FACTS, not x64's.
+                       ;; This function baked `header | padding | slots' with tag
+                       ;; #x09 for every target, which is right on x64 and
+                       ;; AArch64 and wrong on the other seven: i386/ppc/68k put
+                       ;; the first slot one word after the header (no padding),
+                       ;; and riscv/arm32 additionally tag objects with 2 rather
+                       ;; than 9, because tag 9 needs 16-byte alignment and a
+                       ;; 32-bit granule is 8.
+                       ;;
+                       ;; Measured before the fix: a pooled string read on RISC-V
+                       ;; reported length 0 — the header was looked for one word
+                       ;; before where it sat, through the wrong tag.
+                       (tag (target-object-tag target))
+                       (data-off (target-object-data-offset target))
+                       (pad-words (1- (/ data-off word-size))))
+                  ;; Header: (count << 8) | subtag-string (#x31), matching
+                  ;; alloc-obj's runtime header format, then however many
+                  ;; padding words this target's layout puts before the data.
+                  (emit-word (logior #x31 (ash len 8)))
+                  (dotimes (i pad-words)
+                    (emit-word 0))
+                  ;; One TAGGED character code per word, as every target's
+                  ;; :alloc-string does.
+                  (loop for c across constant
+                        do (emit-word (ash (char-code c) 1)))
+                  (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
+                        do (mvm-emit-byte buf 0))
+                  (setf (aref addr-table idx) (logior obj-offset tag))))
                (t
                 ;; Non-string constants in the table are unexpected for now —
                 ;; primitives are inlined by compile-quote, and other
                 ;; compound types haven't been routed through yet.  Emit a
                 ;; single zero so subsequent layout doesn't drift if such an
                 ;; entry creeps in; addr-table[idx] stays 0.
-                (if (= word-size 8)
-                    (mvm-emit-u64 buf 0)
-                    (mvm-emit-u32 buf 0)))))
-    (values (mvm-buffer-used-bytes buf) addr-table)))
+                (emit-word 0))))
+    (values (mvm-buffer-used-bytes buf) addr-table))))
 
 (defun build-nfn-table (module target)
   "Build the NFN (Name-to-Function-Number) table.
@@ -719,6 +773,19 @@
     (setf (aref raw-bytes (+ file-pos 2)) (logand (ash patched -16) #xFF))
     (setf (aref raw-bytes (+ file-pos 3)) (logand (ash patched -24) #xFF))))
 
+(defun patch-riscv-addi-imm12 (raw-bytes pos imm12)
+  "Write IMM12 into the I-type immediate field of the 4-byte little-endian
+   RISC-V instruction at POS.  The immediate is bits 31..20; everything below is
+   left alone, so this rewrites only the field."
+  (let ((w (logior (aref raw-bytes pos)
+                   (ash (aref raw-bytes (+ pos 1)) 8)
+                   (ash (aref raw-bytes (+ pos 2)) 16)
+                   (ash (aref raw-bytes (+ pos 3)) 24))))
+    (setf w (logior (logand w #x000FFFFF)
+                    (ash (logand imm12 #xFFF) 20)))
+    (dotimes (i 4)
+      (setf (aref raw-bytes (+ pos i)) (logand (ash w (* i -8)) #xFF)))))
+
 (defun apply-li-const-patches (raw-bytes image module boot-descriptor
                                 pool-addr-table native-code)
   "Walk the architecture-specific LI-CONST patch list and write tagged
@@ -745,6 +812,24 @@
                           (let ((s (find-symbol "*I386-LI-CONST-PATCHES*"
                                                 :modus.mvm.i386)))
                             (and s (boundp s) (symbol-value s)))))
+                    ;; RISC-V (both widths): a five-instruction shift-and-add
+                    ;; chain with three patchable ADDI immediates.
+                    ((member arch '(:riscv64 :riscv32))
+                     (and (boundp 'modus.mvm::*riscv-li-const-patches*)
+                          (symbol-value 'modus.mvm::*riscv-li-const-patches*)))
+                    ;; PowerPC (both widths): a LIS / ORI pair.
+                    ((member arch '(:ppc64 :ppc32))
+                     (and (boundp 'modus.mvm::*ppc-li-const-patches*)
+                          (symbol-value 'modus.mvm::*ppc-li-const-patches*)))
+                    ;; ARM32: an inline literal word (translate-arm32's
+                    ;; arm32-emit-literal-load).
+                    ((member arch '(:arm32 :armv7 :armv7-rpi))
+                     (and (boundp 'modus.mvm::*arm32-li-const-patches*)
+                          (symbol-value 'modus.mvm::*arm32-li-const-patches*)))
+                    ;; 68k: MOVE.L #imm32,D0.
+                    ((eq arch :68k)
+                     (and (boundp 'modus.mvm::*68k-li-const-patches*)
+                          (symbol-value 'modus.mvm::*68k-li-const-patches*)))
                     (t nil))))
     (when patches
       (let* ((native-image-offset (or (kernel-image-native-image-offset image) 0))
@@ -790,6 +875,62 @@
                (dotimes (i 4)
                  (setf (aref raw-bytes (+ file-pos i))
                        (logand (ash tagged-addr (* i -8)) #xFF))))
+              ((member arch '(:riscv64 :riscv32))
+               ;; RISC-V: three ADDI immediates at +0, +8 and +16, holding
+               ;; bits 31..21, 20..10 and 9..0 of the address.  Each chunk is
+               ;; NON-NEGATIVE and under 2048, so ADDI's sign-extension never
+               ;; fires -- which is the whole reason for this shape rather than
+               ;; LUI+ADDI (LUI sign-extends on RV64, and every bare-metal DRAM
+               ;; address has bit 31 set).
+               ;;
+               ;; FAIL LOUDLY rather than truncate: the chain carries exactly 32
+               ;; bits, and every RISC-V image in this tree loads well inside
+               ;; that.  A target that someday does not must change the chain,
+               ;; not discover a silently wrong constant.
+               (unless (< tagged-addr (ash 1 32))
+                 (error "riscv li-const: pool address #x~X exceeds the 32 bits ~
+                         the patch chain carries" tagged-addr))
+               (patch-riscv-addi-imm12 raw-bytes file-pos
+                                       (logand (ash tagged-addr -21) #x7FF))
+               (patch-riscv-addi-imm12 raw-bytes (+ file-pos 8)
+                                       (logand (ash tagged-addr -10) #x7FF))
+               (patch-riscv-addi-imm12 raw-bytes (+ file-pos 16)
+                                       (logand tagged-addr #x3FF)))
+              ((member arch '(:ppc64 :ppc32))
+               ;; PowerPC: LIS rT,hi16 at +0 and ORI rT,rT,lo16 at +4.  Both
+               ;; immediates are the LOW halfword of a BIG-ENDIAN instruction
+               ;; word, i.e. bytes +2 and +3.  ORI is a plain OR, so no @ha
+               ;; carry adjustment -- but LIS sign-extends on ppc64, so the
+               ;; address must stay below 2^31 or the constant comes out
+               ;; negative.  Fail loudly rather than load the wrong address.
+               (unless (< tagged-addr (ash 1 31))
+                 (error "ppc li-const: pool address #x~X is not below 2^31, ~
+                         which LIS would sign-extend" tagged-addr))
+               (let ((hi (logand (ash tagged-addr -16) #xFFFF))
+                     (lo (logand tagged-addr #xFFFF)))
+                 (setf (aref raw-bytes (+ file-pos 2)) (ash hi -8)
+                       (aref raw-bytes (+ file-pos 3)) (logand hi #xFF)
+                       (aref raw-bytes (+ file-pos 6)) (ash lo -8)
+                       (aref raw-bytes (+ file-pos 7)) (logand lo #xFF))))
+              ((member arch '(:arm32 :armv7 :armv7-rpi))
+               ;; ARM32: the literal holds a PC-RELATIVE distance, not an address
+               ;; (see translate-arm32's li-const: qemu's raspi2b and the real Pi
+               ;; firmware load the same image at different addresses).  The ADD
+               ;; after the literal reads PC = literal + 4 + 8, so the distance is
+               ;; slot - (literal + 12), and with both in raw-byte offsets the load
+               ;; address cancels.  A slot with no heap layout (offset 0) keeps 0.
+               (let ((delta (if (zerop offset)
+                                0
+                                (- (+ pool-offset-in-raw offset) (+ file-pos 12)))))
+                 (dotimes (i 4)
+                   (setf (aref raw-bytes (+ file-pos i))
+                         (logand (ash delta (* -8 i)) #xFF)))))
+              ((eq arch :68k)
+               ;; 68k: the 32-bit immediate of MOVE.L #imm32,D0, big-endian,
+               ;; at bytes +2..+5 after the opcode word.
+               (dotimes (i 4)
+                 (setf (aref raw-bytes (+ file-pos 2 i))
+                       (logand (ash tagged-addr (* -8 (- 3 i))) #xFF))))
               (t
                ;; x64: little-endian 8-byte MOVABS immediate write.
                (dotimes (i 8)
@@ -1053,7 +1194,74 @@
               ;; and patched after translation in the block above).
               ;; jmp-size stays 0 — native-image-offset = boot-code-length.
               ((and (member arch '(:aarch64 :rpi)) aarch64-unified-p)
-               nil))))
+               nil)
+              ;; RISC-V / PPC / 68k had NO entry jump at all.  The boot stub
+              ;; fell straight through into whichever function the module
+              ;; happened to emit FIRST, which is kernel-main only when
+              ;; kernel-main is the only function -- with a second defun ahead
+              ;; of it the image quietly ran the wrong code and then off the
+              ;; end.  (That is why a one-function probe reached its stores on
+              ;; ppc32 and a two-function one did not.)  Each arch gets the
+              ;; same single PC-relative branch x86 and ARM already had.
+              ((member arch '(:riscv64 :riscv32))
+               ;; AUIPC t0, hi20 ; JALR x0, lo12(t0) — a PC-relative jump that
+               ;; reaches +/-2 GB.
+               ;;
+               ;; THIS WAS A SINGLE `JAL x0, imm' AND THAT IS A 1 MB CLIFF.  JAL's
+               ;; J-type immediate is 21 bits signed, so it reaches +/-1 MB; the
+               ;; real CL image puts kernel-main about 1.5 MB into 31 MB of native
+               ;; code, the immediate WRAPPED, and the boot stub's last instruction
+               ;; jumped BACKWARD out of the image:
+               ;;
+               ;;     0x400108:  j  -571748   # 0x3747a4   <- unmapped, SIGSEGV
+               ;;
+               ;; Every ladder image is a few KB, so every one of them was inside
+               ;; the cliff and this was invisible until the first big image.  Note
+               ;; the shape of the failure: not a diagnostic, a wild branch — the
+               ;; whole boot stub traces perfectly and then leaves.
+               ;;
+               ;; The 0x800 in the split is the standard AUIPC+lo12 correction:
+               ;; JALR's offset is SIGN-extended, so a lo12 >= 0x800 must be
+               ;; borrowed from the high part.  t0 is free here — the stub has
+               ;; finished with it and translated code has not started.
+               (let* ((off (+ entry-native-offset 8))   ; two instructions now
+                      (hi20 (ash (+ off #x800) -12))
+                      (lo12 (- off (ash hi20 12)))
+                      (auipc (logior #x17 (ash 5 7)          ; rd = x5 = t0
+                                     (ash (logand hi20 #xFFFFF) 12)))
+                      (jalr (logior #x67 (ash 0 7)           ; rd = x0
+                                    (ash 0 12)               ; funct3 = 0
+                                    (ash 5 15)               ; rs1 = t0
+                                    (ash (logand lo12 #xFFF) 20))))
+                 (dolist (insn (list auipc jalr))
+                   (mvm-emit-byte final-buf (logand insn #xFF))
+                   (mvm-emit-byte final-buf (logand (ash insn -8) #xFF))
+                   (mvm-emit-byte final-buf (logand (ash insn -16) #xFF))
+                   (mvm-emit-byte final-buf (logand (ash insn -24) #xFF)))
+                 (setq jmp-size 8)))
+              ((member arch '(:ppc64 :ppc32))
+               ;; b target  (I-form, opcode 18, AA=0, LK=0): the 24-bit LI
+               ;; field is the word-aligned displacement from THIS
+               ;; instruction.  Big-endian, so the bytes go out high first.
+               (let* ((off (+ entry-native-offset 4))
+                      (insn (logior #x48000000 (logand off #x03FFFFFC))))
+                 (mvm-emit-byte final-buf (logand (ash insn -24) #xFF))
+                 (mvm-emit-byte final-buf (logand (ash insn -16) #xFF))
+                 (mvm-emit-byte final-buf (logand (ash insn -8) #xFF))
+                 (mvm-emit-byte final-buf (logand insn #xFF))
+                 (setq jmp-size 4)))
+              ((eq arch :68k)
+               ;; BRA.L (0x60FF + 32-bit displacement, 68020+/ColdFire).
+               ;; The displacement is measured from the EXTENSION WORD at
+               ;; +2, and native code starts at +6, so it is offset + 4.
+               (let ((disp (+ entry-native-offset 4)))
+                 (mvm-emit-byte final-buf #x60)
+                 (mvm-emit-byte final-buf #xFF)
+                 (mvm-emit-byte final-buf (logand (ash disp -24) #xFF))
+                 (mvm-emit-byte final-buf (logand (ash disp -16) #xFF))
+                 (mvm-emit-byte final-buf (logand (ash disp -8) #xFF))
+                 (mvm-emit-byte final-buf (logand disp #xFF))
+                 (setq jmp-size 6))))))
         ;; Native code
         (let ((code-offset (mvm-buffer-position final-buf)))
           (setf (kernel-image-native-image-offset image) code-offset)
@@ -1296,6 +1504,28 @@
                        raw-bytes
                        (or (getf boot-descriptor :load-addr) #x08048000)
                        :bss-end (getf boot-descriptor :bss-end)))
+                    ((eq (getf boot-descriptor :elf-format) :linux-arm32)
+                     (wrap-in-elf32-le-arm
+                       raw-bytes
+                       (or (getf boot-descriptor :load-addr) #x10000)
+                       :bss-end (getf boot-descriptor :bss-end)))
+                    ((eq (getf boot-descriptor :elf-format) :linux-riscv32)
+                     ;; RV32 is ELF32, so it goes through the ELF32 wrapper and
+                     ;; carries no symbol/function table -- the ELF64 writer is
+                     ;; what emits those, and nothing on this port reads them.
+                     (wrap-in-elf32-le-riscv
+                       raw-bytes
+                       (or (getf boot-descriptor :load-addr) #x10000)
+                       :bss-end (getf boot-descriptor :bss-end)))
+                    ((eq (getf boot-descriptor :elf-format) :linux-riscv)
+                     (wrap-in-elf64-le-riscv raw-bytes
+                                             (or (getf boot-descriptor :load-addr) #x400000)
+                                             :function-table
+                                             (mvm-module-function-table module)
+                                             :native-image-offset
+                                             (or (kernel-image-native-image-offset image) 0)
+                                             :native-code-length
+                                             (length (kernel-image-native-code image))))
                     ((eq (getf boot-descriptor :elf-format) :linux-aarch64)
                      (wrap-in-elf64-le-aa64 raw-bytes
                                             (or (getf boot-descriptor :load-addr) #x400000)
@@ -1332,15 +1562,15 @@
    Rows are sorted by virtual-addr ascending."
   (let* ((load-addr (or (and boot-descriptor (getf boot-descriptor :load-addr))
                         #x400000))
-         ;; ehdr+phdr for the ELF wrapper.  For non-ELF targets this is 0;
-         ;; the image-byte 0 already lives at the load address.
-         (elf-header (cond
-                       ((null boot-descriptor) 0)
-                       ((member (getf boot-descriptor :elf-format)
-                                '(:linux-x64 :linux-aarch64))
-                        120)
-                       ((eq (getf boot-descriptor :elf-format) :linux-i386) 84)
-                       (t 0)))
+         ;; ehdr+phdr for the ELF wrapper -- from WRAP-HEADER-SIZE-FOR-BOOT, the
+         ;; one rule the li-const and fn-addr patchers already use.  This used
+         ;; to be a private copy that knew only x64, aarch64 and i386, so every
+         ;; other ELF target (riscv32, ppc, 68k, arm32) got 0 and its symbol map
+         ;; was shifted by the header size -- 84 bytes on RV32, which put every
+         ;; name 84 bytes before its function and made gdb's frame names lie.
+         (elf-header (if boot-descriptor
+                         (wrap-header-size-for-boot boot-descriptor)
+                         0))
          (nio (or (kernel-image-native-image-offset image) 0))
          (ncl (length (kernel-image-native-code image)))
          (sorted (stable-sort (copy-list function-table)
@@ -1377,6 +1607,19 @@
     (:uefi-x64-cl :x86-64)
     (:linux-x64 :x86-64)
     (:linux-aarch64 :aarch64)
+    (:linux-riscv :riscv64)
+    (:linux-riscv32 :riscv32)
+    ;; The big-endian hosted ports.  No new ELF wrapper: their descriptors
+    ;; carry :elf-machine/:elf-class and fall through to the GENERIC arm of the
+    ;; wrapper dispatch, which is big-endian already.
+    (:linux-ppc64 :ppc64)
+    (:linux-ppc32 :ppc32)
+    (:linux-68k :68k)
+    ;; ARMv7, not the ARMv5 :arm32 descriptor: INSTALL-ARMV7-TRANSLATOR is what
+    ;; the hosted build installs (movw/movt make 32-bit immediates one pair of
+    ;; instructions instead of a literal pool), and it is what qemu-arm and any
+    ;; ARM Linux worth targeting emulate.
+    (:linux-arm32 :armv7)
     (:linux-i386 :i386)
     (:x64-console :x86-64)
     (:i386-console :i386)
@@ -1458,6 +1701,12 @@
     (:uefi-x64-cl (uefi-x64-cl-boot-descriptor))
     (:linux-x64 (linux-x64-boot-descriptor))
     (:linux-aarch64 (linux-aarch64-boot-descriptor))
+    (:linux-riscv (linux-riscv-boot-descriptor))
+    (:linux-riscv32 (linux-riscv32-boot-descriptor))
+    (:linux-ppc64 (linux-ppc64-boot-descriptor))
+    (:linux-ppc32 (linux-ppc32-boot-descriptor))
+    (:linux-68k (linux-68k-boot-descriptor))
+    (:linux-arm32 (linux-arm32-boot-descriptor))
     (:linux-i386 (linux-i386-boot-descriptor))
     (:x64-console (x64-console-boot-descriptor))
     (:i386-console (i386-console-boot-descriptor))

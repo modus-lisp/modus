@@ -1038,7 +1038,7 @@
 
 (defun %mv-to-list (primary)
   "Collect multiple values into a list. PRIMARY is the first value."
-  (let ((count (mem-ref #x10000090 :u64)))
+  (let ((count (mem-ref +mv-count-addr+ :u64)))
     (if (zerop count)
         nil
         (if (= count 1)
@@ -1047,7 +1047,7 @@
                   (i (- count 2)))
               (loop
                 (when (< i 0) (return (cons primary result)))
-                (setq result (cons (mem-ref (+ #x10000098 (* i 8)) :u64) result))
+                (setq result (cons (mem-ref (+ +mv-values-addr+ (* i 8)) :u64) result))
                 (setq i (- i 1))))))))
 
 ;;; ============================================================
@@ -1785,12 +1785,31 @@
   (cond
     ((stringp key)
      (if strcmp?
-         (let ((h 2166136261) (len (array-length key)) (i 0))
-           (loop
-             (when (>= i len) (return nil))
-             (setq h (logand (* (logxor h (%prim-aref key i)) 16777619) #xFFFFFFFF))
-             (setq i (+ i 1)))
-           (logand h mask))
+         ;; THE STRING HASH MUST STAY IN FIXNUMS AT THE TARGET'S WIDTH, like the
+         ;; fixnum branch below.  FNV-1a's offset basis 2166136261 and prime
+         ;; 16777619 are fixnums at 62 bits and BIGNUMS at 30: on a 32-bit port
+         ;; every EQUAL-table string key went through bignum arithmetic, and on
+         ;; RV32 the "bucket index" came back as a heap object -- the first
+         ;; hosted RV32 CL image faulted in %HT-BUCKET-FIND before printing a
+         ;; byte.  So at 30 bits it is h = (h*31 + c) mod 2^22, written as
+         ;; ((h << 5) - h + c) with NO multiply: a 30-bit build sends any `*'
+         ;; whose operands might overflow to GENERIC-MULTIPLY (see
+         ;; emit-arith-pair), and h*31 per character through the bignum path
+         ;; exhausted the heap.  Every intermediate here is below 2^28.  The
+         ;; 64-bit path is FNV-1a exactly as before.
+         (if (> +fixnum-bits+ 32)
+             (let ((h 2166136261) (len (array-length key)) (i 0))
+               (loop
+                 (when (>= i len) (return nil))
+                 (setq h (logand (* (logxor h (%prim-aref key i)) 16777619) #xFFFFFFFF))
+                 (setq i (+ i 1)))
+               (logand h mask))
+             (let ((h 1162397) (len (array-length key)) (i 0))   ; #x11BC9D
+               (loop
+                 (when (>= i len) (return nil))
+                 (setq h (logand (+ (- (ash h 5) h) (%prim-aref key i)) #x3FFFFF))
+                 (setq i (+ i 1)))
+               (logand h mask)))
          (%ht-nohash)))
     ;; MIX the fixnum, do not truncate it.  `(logand key 255)' keeps only the
     ;; low 8 bits, and the single biggest user of a fixnum-keyed EQL table is
@@ -2053,12 +2072,12 @@
 (defun values (&rest args)
   "Return multiple values. Sets MV buffer for count and extra values."
   (let ((n (length args)))
-    (setf (mem-ref #x10000090 :u64) n)
+    (setf (mem-ref +mv-count-addr+ :u64) n)
     (let ((cur (if (null args) nil (cdr args)))
           (idx 0))
       (loop
         (when (null cur) (return nil))
-        (setf (mem-ref (+ #x10000098 (* idx 8)) :u64) (car cur))
+        (setf (mem-ref (+ +mv-values-addr+ (* idx 8)) :u64) (car cur))
         (setq idx (+ idx 1))
         (setq cur (cdr cur))))
     (if (null args) nil (car args))))
@@ -2664,6 +2683,24 @@
     (%rt-leave)
     r))
 
+(defun %symbol-pkg-key (name-hash pkg-hash)
+  "The per-package symbol-table key for (NAME-HASH, PKG-HASH).  ONE definition,
+   called by %INTERN-SYMBOL-PKG-1 here and by cl-packages.lisp's INTERN path,
+   which must produce the SAME key (they used to be two copies of one formula).
+
+   The mask must be a FIXNUM at the target's width.  #x3FFFFFFFFFFFFFFF is one
+   at 62 bits and a BIGNUM at 30, where (logand <fixnum> <bignum>) makes every
+   package-qualified symbol's key a bignum -- so every GETHASH on the symbol
+   table hashed and compared through the limb machinery, and the hosted RV32 CL
+   image, with no collector yet, ran out of heap in BIGNUM-CMP while compiling
+   its first --eval form.  At 30 bits the mask is +fixnum-max+; the 64-bit
+   expression is unchanged."
+  (if (> +fixnum-bits+ 32)
+      (logand (%fixnum-+ name-hash (%fixnum-* pkg-hash +fixnum-half-max+))
+              #x3FFFFFFFFFFFFFFF)
+      (logand (%fixnum-+ name-hash (%fixnum-* pkg-hash +fixnum-half-max+))
+              +fixnum-max+)))
+
 (defun %intern-symbol-pkg-1 (name-hash pkg-hash)
   "Intern a symbol identified by (NAME-HASH, PKG-HASH).  Per CLHS
    11.1.2 — see SYMBOLS_PLAN.md — symbol identity is per-package: the
@@ -2698,8 +2735,7 @@
   ;; global <param>").  The mask makes the wraparound irrelevant.
   (let ((key (if (= pkg-hash 0)
                  name-hash
-                 (logand (%fixnum-+ name-hash (%fixnum-* pkg-hash +fixnum-half-max+))
-                         #x3FFFFFFFFFFFFFFF))))
+                 (%symbol-pkg-key name-hash pkg-hash))))
     (let ((table (mem-ref #x10000088 :u64)))
       (let ((existing (gethash key table)))
         (cond
@@ -2859,8 +2895,12 @@
         (when (and (>= c 97) (<= c 122))
           (setq c (- c 32)))
         (setq c (logand c 65535))
-        (setq h1 (logand (* (logxor h1 c) 403) 65535))
-        (setq h2 (logand (* (logxor h2 c) 89) 65535)))
+        ;; %FIXNUM-* (raw): every product here is below 2^25 (16-bit state
+        ;; times a 9-bit prime), so the raw op is exact.  Plain * cannot prove
+        ;; that -- h1/h2 are loop variables of unknown width -- and on a 30-bit
+        ;; build would route each character through GENERIC-MULTIPLY.
+        (setq h1 (logand (%fixnum-* (logxor h1 c) 403) 65535))
+        (setq h2 (logand (%fixnum-* (logxor h2 c) 89) 65535)))
       (setq i (+ i 1)))
     (let ((combined (logior (ash (logand h1 +name-hash-hi-mask+) +name-hash-shift+)
                             (logand h2 +name-hash-lo-mask+))))

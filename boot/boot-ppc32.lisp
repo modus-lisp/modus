@@ -65,6 +65,16 @@
   ;; --- Save DTB pointer (r3) into r30 (callee-saved, not in vreg map) ---
   (emit-ppc-insn buf (ppc-mr 30 3))         ; mr r30, r3
 
+  ;; --- Enable SPE: MSR[SPE] (#x02000000) ---
+  ;; e500v2 has no classic FPU; the translator does doubles with SPE's
+  ;; embedded double-precision unit (*ppc-float-isa* :spe), and every SPE
+  ;; instruction traps as SPE-unavailable until this bit is set.  Same class as
+  ;; bare ppc64's MSR[FP].
+  (emit-ppc-insn buf #x7C0000A6)            ; mfmsr r0
+  (emit-ppc-insn buf #x64000200)            ; oris  r0, r0, 0x0200  (SPE)
+  (emit-ppc-insn buf #x7C000124)            ; mtmsr r0
+  (emit-ppc-insn buf #x4C00012C)            ; isync
+
   ;; --- Set up TLB1 entry for CCSR MMIO space (UART at 0xE0004500) ---
   ;; E500 ppce500 maps CCSR at 36-bit physical address 0x0FE0000000.
   ;; TLB1 entry 15: 1MB at VA 0xE0000000 → PA 0x0FE0000000

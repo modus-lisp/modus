@@ -185,6 +185,17 @@
   (emit-ppc-insn buf (ppc-lis 1 #x2040))    ; lis r1, 0x2040
   (emit-ppc-insn buf (ppc-ori 1 1 #x0000))  ; ori r1, r1, 0x0000
 
+  ;; --- Enable the FPU: MSR[FP] (#x2000) ---
+  ;; Firmware hands over with FP off, and the first LFD/FADD then takes a
+  ;; floating-point-unavailable interrupt that nothing here handles.  Hosted
+  ;; Linux enables it for the process; a bare boot owns the MSR and must.  Found
+  ;; when PowerPC gained double floats: every float rung passed hosted and hung
+  ;; bare.  MTMSRD (L=0) writes the whole MSR back, SF included, from MFMSR.
+  (emit-ppc-insn buf #x7C0000A6)            ; mfmsr  r0
+  (emit-ppc-insn buf #x60002000)            ; ori    r0, r0, 0x2000  (FP)
+  (emit-ppc-insn buf #x7C000164)            ; mtmsrd r0
+  (emit-ppc-insn buf #x4C00012C)            ; isync
+
   ;; --- Set up TOC (r2 = 0, no shared library TOC in bare metal) ---
   (emit-ppc-insn buf (ppc-li 2 0))          ; li r2, 0
 

@@ -213,6 +213,18 @@
   ;; MCR p15, 0, r0, c12, c0, 0 (VBAR = r0 = 0)
   (emit-arm32-insn buf #xEE0C0F10)
 
+  ;; --- Enable the VFP: CPACR grants CP10/CP11, then FPEXC.EN ---
+  ;; Out of reset both are off, so the first VLDR/VADD is UNDEFINED.  Hosted
+  ;; Linux enables the VFP for the process; a bare boot owns these registers and
+  ;; must.  Found when arm32 gained double floats: every float rung passed
+  ;; hosted and died bare.  (Same class as bare ppc64's MSR[FP].)
+  (emit-arm32-insn buf #xEE110F50)   ; MRC p15,0,r0,c1,c0,2   (CPACR)
+  (emit-arm32-insn buf #xE380060F)   ; ORR r0,r0,#0x00F00000  (cp10+cp11 full)
+  (emit-arm32-insn buf #xEE010F50)   ; MCR p15,0,r0,c1,c0,2
+  (emit-arm32-insn buf #xF57FF06F)   ; ISB
+  (emit-arm32-insn buf #xE3A00101)   ; MOV r0,#0x40000000     (FPEXC.EN)
+  (emit-arm32-insn buf #xEEE80A10)   ; VMSR FPEXC, r0
+
   ;; --- Set up SVC mode registers ---
   (emit-arm32-load-imm buf 13 +armv7-rpi-stack-top+)
   (emit-arm32-load-imm buf 9 +armv7-rpi-cons-base+)

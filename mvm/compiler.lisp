@@ -109,7 +109,12 @@
 ;;; Multiple-value return storage (fixed addresses in BSS/globals area)
 ;;; MV-COUNT at 0x600010: number of values returned (tagged fixnum)
 ;;; MV-VALUES at 0x600020: array of up to 20 extra values (0x600020..0x6000C0)
-(defconstant +mv-count-addr+ #x10000090)
+;;; +MV-COUNT-ADDR+ / +MV-VALUES-ADDR+ now live in mvm/target.lisp, set PER
+;;; TARGET by SET-TARGET-FIXNUM-BITS-FOR and injected into every compilation by
+;;; WIDTH-CONSTANTS-SOURCE — the same dual-life shape as +FIXNUM-BITS+.  They
+;;; were DEFCONSTANTs here fixed at #x10000090/#x10000098, which is not memory
+;;; on riscv64 (UART MMIO) or ppc32 (outside the mapped TLBs).  See the comment
+;;; block above their definition for how that surfaced.
 
 ;;; ---- THE GC METADATA BLOCK IS A REGION CONTROL BLOCK ----------------------
 ;;;
@@ -321,7 +326,8 @@
 (defconstant +gc-saved-alloc-addr+ (+ +gc-region-0-base+ +gc-off-saved-alloc+))
 (defconstant +gc-saved-limit-addr+ (+ +gc-region-0-base+ +gc-off-saved-limit+))
 
-(defconstant +mv-values-addr+ #x10000098)
+;;; +MV-VALUES-ADDR+ is defined in mvm/target.lisp — see the note at the old
+;;; +MV-COUNT-ADDR+ site above.
 
 ;;; Closure environment storage (fixed address for passing env to closure functions)
 ;;; Place after MV-VALUES area: 0x10000098 + 20*8 = 0x10000138, align to 0x10000140
@@ -2604,12 +2610,12 @@
 ;;; A name declaimed INLINE whose later DEFUN has only required parameters is
 ;;; recorded (params + body, declarations included); a call with matching
 ;;; arity then compiles as
-;;;     (let ((p1' a1) (p2' a2) …) <declares> <body>)       [+ (block f …)
+;;;     (let ((p1 a1) (p2 a2) …) <declares> <body>)         [+ (block f …)
 ;;;                                                          when the body
 ;;;                                                          RETURN-FROMs f]
-;;; with the parameters renamed to fresh symbols throughout the body, so a
-;;; caller variable of the same name is never captured and the body's own
-;;; type declarations land on the LET (the typed fast paths read them).
+;;; -- a parallel LET, so a caller variable of the same name is never
+;;; captured, the body is not rewritten, and the body's own type declarations
+;;; land on the LET (the typed fast paths read them).
 ;;; Recursion is cut by *inline-active*; &optional/&rest/&key definitions are
 ;;; never inlined; a NOTINLINE declaim retracts.  Runtime only: the image
 ;;; build ignores it, so its output does not move.  Known limitation (SBCL
@@ -2628,6 +2634,15 @@
   "DIAGNOSTIC: when non-NIL, calls are expanded only inside the DEFUNs named
    here (strings, compared with *current-function-name*) — bisects which
    caller a bad expansion lives in.  NIL in production.")
+
+(defun %cxr-place-name-p (nm)
+  "True for CAAR .. CDDDDR: C, 2-4 of A/D, R."
+  (let ((n (length nm)))
+    (and (<= 4 n 6)
+         (char= (char nm 0) #\C)
+         (char= (char nm (- n 1)) #\R)
+         (every (lambda (c) (or (char= c #\A) (char= c #\D)))
+                (subseq nm 1 (- n 1))))))
 
 (defun %inline-name-key (name)
   (cond ((stringp name) name)
@@ -2684,12 +2699,6 @@
             (cons (cons k (cons params body))
                   (remove k *inline-fn-defs* :key (function car) :test (function string=)))))))
 
-(defun %subst-syms (alist tree)
-  "Replace every symbol in TREE that has an entry in ALIST (eq) by its value."
-  (cond ((symbolp tree) (let ((e (assoc tree alist :test (function eq)))) (if e (cdr e) tree)))
-        ((consp tree) (cons (%subst-syms alist (car tree)) (%subst-syms alist (cdr tree))))
-        (t tree)))
-
 (defun %tree-has-return-from (tree name)
   (and (consp tree)
        (or (and (symbolp (car tree)) (name-eq (car tree) "RETURN-FROM")
@@ -2708,14 +2717,18 @@
                (not (member k *inline-active* :test (function string=)))
                (< (length *inline-active*) 4)
                (= (length args) (length (cadr def))))
+      ;; The parameters are bound under their OWN names.  A parallel LET
+      ;; evaluates every argument in the caller's scope before any binding
+      ;; exists, so a caller variable of the same name cannot be captured --
+      ;; and the body is left untouched.  They used to be renamed by a blind
+      ;; tree substitution (%SUBST-SYMS), which cannot tell a variable from a
+      ;; LOOP keyword, quoted data or a shadowing inner binding: md5's
+      ;; COPY-TO-BUFFER has a parameter named FROM, so every inlined
+      ;; (loop for i from …) lost its FROM and BELOW became a variable
+      ;; (UNBOUND-VARIABLE BELOW from md5sum-string).
       (let* ((params (cadr def))
-             (body (cddr def))
-             ;; variables resolve by NAME hash, so the fresh names carry a
-             ;; prefix no source variable uses
-             (fresh (mapcar (lambda (p) (%mvm-gensym (concatenate 'string "%INL-" (symbol-name p))))
-                            params))
-             (nbody (%subst-syms (mapcar (function cons) params fresh) body))
-             (let-form (cons 'let (cons (mapcar (function list) fresh args) nbody))))
+             (nbody (cddr def))
+             (let-form (cons 'let (cons (mapcar (function list) params args) nbody))))
         (if (%tree-has-return-from nbody fn)
             (list 'block fn let-form)
             let-form)))))
@@ -2867,6 +2880,8 @@
 (defvar *mexp-memo-gc* -1
   "The %GC-COUNT at which *MEXP-MEMO* was last (re)keyed.")
 (defun %mexp-memo-epoch ()
+  ;; %GC-EPOCH, not %GC-COUNT: see its docstring in gc.lisp -- an odd raw count
+  ;; read as a tagged pointer killed every i386 image at its ninth collection.
   (if (fboundp (quote %gc-epoch)) (funcall (quote %gc-epoch)) 0))
 (defun %mexp-memo-rekey ()
   "Rebuild the address-keyed memo from its (form . expansion) entries — the
@@ -2910,7 +2925,18 @@
    doesn't need expansion and falls through to a compile-time builtin)
    reports expanded-p=NIL — without this, macroexpand-mvm would loop
    forever on no-op expanders."
-  (if (and (consp form) (symbolp (car form)))
+  ;; A KEYWORD-HEADED FORM IS NEVER A MACRO CALL (CLHS 3.1.2.1.2: only a symbol
+  ;; naming a macro in the macro namespace; keywords name no operators).  The
+  ;; macro table is keyed by NAME HASH, so without this check (:METACLASS x)
+  ;; ran the user's macro named METACLASS.  cl-annot defines exactly that
+  ;; macro, whose expander produces (append ... (list (list :metaclass
+  ;; metaclass))) -- the list-building compiler rewrote that into a template
+  ;; headed by the keyword, the analysis walker expanded it as a METACLASS
+  ;; call, which produced the same template again: unbounded recursion, a
+  ;; stack overflow on x64 and i386 alike (the ladder's cl-annot SIGSEGV).
+  ;; Minimal: (defmacro metaclass (metaclass cdf)
+  ;;            (funcall (lambda (c) (append c (list (list :metaclass metaclass)))) cdf))
+  (if (and (consp form) (symbolp (car form)) (not (keywordp (car form))))
       (let* ((name (normalize-name (car form)))
              ;; CONFIRMED lookup — see %MACRO-NAME-CONFIRMED-P.  A hash
              ;; collision here runs the WRONG expander, silently.
@@ -4270,18 +4296,41 @@
                            (,gval ,value))
                       (,setter ,gval ,@gargs)
                       ,gval)))
-                ;; A place whose operator is a MACRO -- a MACROLET local or a
-                ;; user DEFMACRO with no DEFSETF: CLHS 5.1.2.7, expand it and
-                ;; SETF the expansion.  (It fell to the SET-<name> fallback
-                ;; below, so (macrolet ((%m (x) `(car ,x))) (setf (%m y) 6))
-                ;; called an undefined SET-%M.)  Runtime compiles only, and
-                ;; after every known place, so built-in accessors that are
-                ;; also compiler macros (CADDR, ...) keep their own clauses.
-                ((and *mvm-eval-runtime-p* (consp place) (symbolp (car place))
-                      (%macro-expander (car place) (normalize-name (car place))))
-                 `(setf ,(funcall (%macro-expander (car place) (normalize-name (car place)))
-                                  place)
-                        ,value))
+                ;; (setf (cXYr x) v), 2-4 letters of A/D: set the CAR or CDR of
+                ;; (cYr x) -- the outermost letter is the last step taken.
+                ;; Only CAR/CDR had clauses; the rest reached SET-CAAAR &c.,
+                ;; which exist in a build-time image but not at runtime, so an
+                ;; evaluated (setf (cdddr x) v) was UNDEFINED-FUNCTION.
+                ((and (consp place)
+                      (symbolp (car place))
+                      (= (length place) 2)
+                      (eq (symbol-package (car place))
+                          (find-package "COMMON-LISP"))
+                      (%cxr-place-name-p (symbol-name (car place))))
+                 (let* ((nm (symbol-name (car place)))
+                        (inner (intern (concatenate 'string "C" (subseq nm 2))
+                                       (symbol-package (car place)))))
+                   `(,(if (char= (char nm 1) #\A) 'set-car 'set-cdr)
+                     (,inner ,(cadr place)) ,value)))
+                ;; CLHS 5.1.2.7: a place that is a MACRO FORM is expanded and
+                ;; the expansion is the place.  Without this every
+                ;; (setf (MACRO …) v) fell to the SET-<MACRO> fallback below,
+                ;; an UNDEFINED-FUNCTION nobody defines (md5's
+                ;; (setf (md5-regs-a regs) …) → SET-MD5-REGS-A).  Placed after
+                ;; the builtin places and setf functions so every expansion
+                ;; that used to resolve still resolves the same way.
+                ;;
+                ;; Never for a COMMON-LISP symbol: no standard function is a
+                ;; macro, but the compiler open-codes several as macros in
+                ;; its own table (CADDR -> (%safe-car …), REST, FIRST…), and
+                ;; expanding THOSE here produced (setf (%safe-car …) v) ->
+                ;; SET-%SAFE-CAR (ANSI caddr-set / cadddr-set / rest-set-1).
+                ((and (consp place)
+                      (symbolp (car place))
+                      (not (eq (symbol-package (car place))
+                               (find-package "COMMON-LISP")))
+                      (cdr (%macroexpand-1-mvm-raw place)))
+                 `(setf ,(car (%macroexpand-1-mvm-raw place)) ,value))
                 ;; Generic accessor: (setf (foo-bar a1 ... aN) v) → (set-foo-bar a1 ... aN v)
                 ;; Pass ALL place args plus the value (was only passing the
                 ;; first arg, which silently dropped the index in
@@ -6979,6 +7028,10 @@
       ;; to the block's runtime CATCH tag for a proper non-local exit that
       ;; runs intervening unwind-protect cleanups and propagates the value.
       ;; (3) compile-return fallback (BLOCK NIL / loop / function).
+      ;; (%%LX-REG vreg) -- internal to %COMPILE-LEXICAL-EXIT: the value
+      ;; currently in virtual register VREG.
+      ((= op-name #.(compute-name-hash "%%LX-REG"))
+       (unless (eql dest (cadr form)) (emit-ir :mov dest (cadr form))))
       ((= op-name 164933334)  ; RETURN-FROM
        (let* ((bname (cadr form))
               (entry (assoc bname *block-labels*
@@ -14676,13 +14729,38 @@
      3. :br to EXIT-LABEL.
    When no intervening u-p exists this is exactly the old fast path (no
    push/pop, no extra emission)."
-  (compile-form value-form env value-dest)
-  (when (%uwp-pending-above target-seq)
-    ;; Cross at least one u-p: preserve the result across cleanup forms
-    ;; (which run arbitrary code and clobber regs), then restore.
-    (emit-ir :push value-dest)
-    (%emit-uwp-unwind-to target-seq)
-    (emit-ir :pop value-dest))
+  (if (%uwp-pending-above target-seq)
+      ;; Crossing at least one unwind-protect -- including the one every LET
+      ;; of a SPECIAL variable compiles to.  The cleanups run arbitrary code
+      ;; (the special's restore is a function call), and any call resets the
+      ;; MULTIPLE-VALUE state, so preserving only the primary value in a
+      ;; register -- what this did -- truncated every such exit to one value:
+      ;;   (block b (let ((*s* 1)) (return-from b (values 1 10 20))))  => (1)
+      ;; cl-ppcre's scanner closures return (values start end reg-starts
+      ;; reg-ends) exactly like that, from inside a LET* of its specials, so
+      ;; ALL-MATCHES-AS-STRINGS lost the match end and returned "bbbc" for
+      ;; "b+" on "abbbc".  CLHS 5.2: RETURN-FROM passes ALL the values.
+      ;; Capture them as a list, run the cleanups, re-establish them with the
+      ;; INLINE values-list -- no runtime function, so a minimal image that
+      ;; lacks VALUES-LIST compiles this the same way.  THROW / %NLX-THROW
+      ;; use the same list capture.
+      ;;
+      ;; The list rides across the cleanups ON THE STACK (push / pop), exactly
+      ;; as the primary value always did -- NOT in a LET variable: the
+      ;; cleanups are compiled from the environment saved when their
+      ;; UNWIND-PROTECT was entered, which knows nothing of a binding made
+      ;; here, so they reused its register.  Measured: ANSI unwind-protect.2,
+      ;; (block foo (unwind-protect (progn (push 1 x) (return-from foo x))
+      ;; (incf (car x)))), returned the CLEANUP's value 2 instead of (2).
+      (progn
+        (compile-form `(multiple-value-list ,value-form) env value-dest)
+        (emit-ir :push value-dest)
+        (%emit-uwp-unwind-to target-seq)
+        (emit-ir :pop value-dest)
+        ;; %%LX-REG reads VALUE-DEST as the FIRST thing the expansion
+        ;; evaluates, so nothing in between can clobber it.
+        (compile-form `(values-list (%%lx-reg ,value-dest)) env value-dest))
+      (compile-form value-form env value-dest))
   (emit-ir :br exit-label))
 
 (defun %walker-macroexpand (form)
@@ -15361,8 +15439,17 @@
         ;; symbol-function.  CLHS agrees: #'F is the function F NAMES, and for a
         ;; GF that is the GF object.  Emitting the lookup is also the only
         ;; correct answer for a value that must stay EQ to symbol-function.
+        ;; ...BUT ONLY WHEN NO LEXICAL BINDING SHADOWS IT.  This used to run
+        ;; before the flet/labels check above was consulted, so `#'ENCODER'
+        ;; inside (labels ((encoder ...)) #'encoder) -- alexandria's
+        ;; NAMED-LAMBDA, which babel wraps every encoder in -- returned the
+        ;; GLOBAL generic function ENCODER (babel's mapping accessor), and
+        ;; babel's load died "no applicable method for generic function
+        ;; ENCODER", leaving *STRING-VECTOR-MAPPINGS* unbound.  CLHS 3.1.2.1.2.1:
+        ;; a local function binding shadows the global definition.
         (if (and *mvm-eval-runtime-p*
                  (symbolp name)
+                 (null unique-name)
                  (%e2-name-names-gf-p name))
             (compile-form (list 'symbol-function (list 'quote name)) env dest)
             (if (and *mvm-eval-runtime-p*
@@ -15556,10 +15643,6 @@
      `(let* ((,lst-tmp ,list-form)
              (,pri-tmp (if (null ,lst-tmp) nil (car ,lst-tmp)))
              (,cnt-tmp (length ,lst-tmp)))
-        ;; Store count (the visible MV count — handler-case dispatch
-        ;; reads this; oversized counts are OK, just the storage region
-        ;; is capped).
-        (setf (mem-ref ,+mv-count-addr+ :u64) ,cnt-tmp)
         ;; Store extra values (elements 1+) into MV-VALUES-ADDR with bound.
         (let ((,cur-tmp (if (null ,lst-tmp) nil (cdr ,lst-tmp)))
               (,idx-tmp 0))
@@ -15569,6 +15652,15 @@
             (setf (mem-ref (+ ,+mv-values-addr+ (* ,idx-tmp 8)) :u64) (car ,cur-tmp))
             (setq ,idx-tmp (+ ,idx-tmp 1))
             (setq ,cur-tmp (cdr ,cur-tmp))))
+        ;; Store the count LAST (the visible MV count -- handler-case dispatch
+        ;; reads this; oversized counts are OK, just the storage region is
+        ;; capped).  It used to be stored BEFORE the loop, and anything in
+        ;; the loop that CALLS -- on the 30-bit tower the slot address
+        ;; (+ #x10000098 ...) is past the add guard's 2^28 bound, so the add
+        ;; is an out-of-line GENERIC-ADD -- resets the count to 1 on return.
+        ;; Measured on i386: (multiple-value-list (values-list '(1 10 20)))
+        ;; => (1); cl-ppcre's scanner lost its match end.
+        (setf (mem-ref ,+mv-count-addr+ :u64) ,cnt-tmp)
         ,pri-tmp)
      env dest)))
 
@@ -16741,6 +16833,8 @@
   ;; operand (DEST when it was compiled there, as before; a promoted local's
   ;; own register when the caller passed it).  Every READ of the left operand
   ;; in this function goes through SRC1; DEST is only written.
+  ;; (%arith-trust-for's width limit follows +fixnum-bits+, so this proof is
+  ;; valid at 30 bits too.)
   (when (and *arith-trust* (cadr *arith-trust*))
     (emit-ir (cond ((eq fast-op :add-checked) :add)
                    ((eq fast-op :sub-checked) :sub)
@@ -16768,6 +16862,51 @@
       (emit-ir :li   one-temp 1)
       (emit-ir :test tag-temp one-temp)
       (emit-ir :bne  slow-label))
+    ;; OVERFLOW GUARD ON A 30-BIT TOWER.  Overflow promotion is disabled above
+    ;; (it regressed ANSI on x64, where a 62-bit fixnum rarely overflows).  At
+    ;; 30 bits overflow is ROUTINE -- a ten-digit literal, a hash multiplier --
+    ;; and a silent wrap there broke the reader and the hash tables of the
+    ;; hosted RV32 CL image.  So on a 30-bit target only, operands that COULD
+    ;; take the result out of fixnum range go to the generic function up front:
+    ;; for + and -, |operand| < 2^28 keeps the result inside 2^29; for *,
+    ;; |operand| < 2^14 keeps the product inside 2^28.  Conservative (some
+    ;; safe pairs take the slow path), never wrong, and needs no overflow flag,
+    ;; which RISC-V does not have.  64-bit images compile exactly as before.
+    (when (< +fixnum-bits+ 62)
+      (flet ((in-range-or (x bits miss)
+               ;; branch to MISS unless -2^BITS < x < 2^BITS (x a TAGGED word)
+               (let ((tb (ash (ash 1 bits) +fixnum-shift+)))
+                 (emit-ir :li one-temp tb)
+                 (emit-ir :cmp x one-temp)
+                 (emit-ir :bge miss)
+                 (emit-ir :li one-temp (- tb))
+                 (emit-ir :cmp x one-temp)
+                 (emit-ir :blt miss))))
+        (cond
+          ((member fast-op '(:add :sub :add-checked :sub-checked))
+           (in-range-or src1 (- +fixnum-bits+ 2) slow-label)
+           (in-range-or temp (- +fixnum-bits+ 2) slow-label))
+          ((member fast-op '(:mul :mul-checked))
+           ;; The product fits when the operands' bit lengths sum to at most
+           ;; fixnum-bits - 2.  One fixed split (14+14) sent `(* n (fact n-1))'
+           ;; to GENERIC-MULTIPLY -- correct, but a ladder image has no numeric
+           ;; tower to call, and a real image pays a call per multiply.  Three
+           ;; shapes cover small*small, tiny*medium and medium*tiny inline;
+           ;; only a genuinely large product takes the generic path.
+           (let* ((b (- +fixnum-bits+ 2))
+                  (h (floor b 2))
+                  (tiny (floor b 3))
+                  (shapes (list (list h (- b h)) (list tiny (- b tiny))
+                                (list (- b tiny) tiny)))
+                  (fast (make-compiler-label)))
+             (dolist (sh shapes)
+               (let ((next (make-compiler-label)))
+                 (in-range-or src1 (first sh) next)
+                 (in-range-or temp (second sh) next)
+                 (emit-ir :br fast)
+                 (emit-ir-label next)))
+             (emit-ir :br slow-label)
+             (emit-ir-label fast))))))
     ;; Fast path.
     (cond
       (checked-op
@@ -18734,7 +18873,10 @@
     ((and count (<= count 30) *mvm-eval-runtime-p*
           (%cg-on-p (quote *cg-typed-ash*))
           (let ((w (%expr-width value-form env)))
-            (and w (or (< count 0) (<= (+ w count) 62)))))
+            ;; +fixnum-bits+, not a literal 62: at 30 bits the literal
+            ;; trusted `(ash 16388 16)' (16 + 16 <= 62), emitted a bare SHL,
+            ;; and the product wrapped to -1073479680 in eval'd code.
+            (and w (or (< count 0) (<= (+ w count) +fixnum-bits+)))))
      (compile-form value-form env dest)
      (if (>= count 0)
          (when (> count 0) (emit-ir :shl dest dest count))
@@ -19360,13 +19502,25 @@
          (w0 (car wt0)))
     (when (and (%mem-width-promotes-p w0 (cdr wt0))
                (not *target-big-endian-p*))
-      (let ((asym (%mvm-gensym "MRA")))
+      ;; ONLY PROMOTE WHEN THE VALUE CAN ACTUALLY LEAVE FIXNUM RANGE.  With
+      ;; hi16 below 2^(fixnum-bits - 17) the result, hi16*2^16 + lo16, is an
+      ;; ordinary fixnum, and an inline constant ASH of that small hi16 is
+      ;; exact.  Always going through BIGNUM-ASH made every u32 read -- %RT-ENTER
+      ;; and %RT-LEAVE read one on EVERY hash-table operation, almost always 0 --
+      ;; run the full limb machinery (sixteen one-bit shifts, each allocating a
+      ;; limb list) to produce a small integer.  On the hosted RV32 CL image,
+      ;; which has no collector yet, that garbage alone exhausted the 64 MB
+      ;; semispace during boot.  Values that really are >= 2^29 still promote.
+      (let ((asym (%mvm-gensym "MRA"))
+            (hsym (%mvm-gensym "MRH")))
         (return-from compile-mem-ref
           (compile-form
             (list 'let (list (list asym addr-form))
-                  (list '+ (list 'bignum-ash
-                                 (list 'mem-ref (list '+ asym 2) :u16) 16)
-                           (list 'mem-ref asym :u16)))
+                  (list 'let (list (list hsym (list 'mem-ref (list '+ asym 2) :u16)))
+                        (list 'if (list '< hsym (ash 1 (- +fixnum-bits+ 17)))
+                              (list '+ (list 'ash hsym 16) (list 'mem-ref asym :u16))
+                              (list '+ (list 'bignum-ash hsym 16)
+                                       (list 'mem-ref asym :u16)))))
             env dest)))))
   (compile-form addr-form env dest)
   ;; Untag address: logical shift right by 1
@@ -20593,13 +20747,15 @@
   (cond ((null ty) nil)
         ((symbolp ty)
          (let ((n (symbol-name ty)))
-           (cond ((string= n "FIXNUM") 63)   ; 62 magnitude bits + sign
+           (cond ((string= n "FIXNUM") +fixnum-signed-bits+)   ; magnitude bits + sign
                  ((string= n "BIT") 1)
                  (t nil))))
         ((and (consp ty) (symbolp (car ty)) (consp (cdr ty)) (integerp (cadr ty)))
          (let ((n (symbol-name (car ty))) (w (cadr ty)))
-           (cond ((string= n "SIGNED-BYTE")   (and (<= w 62) w))
-                 ((string= n "UNSIGNED-BYTE") (and (<= w 61) (+ w 1)))
+           ;; Bounds are the TARGET's fixnum (62/61 on the 62-bit tower,
+           ;; 30/29 on the 30-bit one), like %expr-width's cap.
+           (cond ((string= n "SIGNED-BYTE")   (and (<= w +fixnum-bits+) w))
+                 ((string= n "UNSIGNED-BYTE") (and (<= w +fixnum-bits-1+) (+ w 1)))
                  ;; (integer LO HI) with both bounds literal (the dotimes
                  ;; counter declaration): width covers the larger magnitude.
                  ((and (string= n "INTEGER") (consp (cddr ty)) (integerp (caddr ty)))
@@ -20629,13 +20785,21 @@
                ;; (acc x) on a declared struct: the slot's declared type
                (and (consp form)
                     (let ((ty (%expr-dtype form env))) (and ty (%decl-int-width ty)))))))
-    (and w (<= w 63) w)))
+    ;; THE CAP IS THE TARGET'S SIGNED FIXNUM WIDTH (+fixnum-signed-bits+), which is
+    ;; the old literal 63 on the 62-bit tower and 31 on the 30-bit one.  The
+    ;; hard 63 made every width in 32..63 a "fixnum" on RV32/i386, so
+    ;; %IEEE-FLOAT-TO-RAT's `(+ (ash 1 52) mantissa)' skipped the tag test and
+    ;; ADDED TWO BIGNUM POINTERS -- (rational 2.5d0) was <heap address>/2^51 on
+    ;; RV32 and every float compare and print went wrong.  i386 dodged it only
+    ;; because its heap (#x30000000) lies above emit-arith-pair's 30-bit
+    ;; operand-range guard, which sent the pointers to the slow path by luck.
+    (and w (<= w +fixnum-signed-bits+) w)))
 
 (defun %expr-width-1 (form env)
   "The uncapped estimate behind %expr-width."
   (cond
     ((integerp form)
-     (let ((w (+ 1 (integer-length (abs form))))) (and (<= w 62) w)))
+     (let ((w (+ 1 (integer-length (abs form))))) (and (<= w +fixnum-bits+) w)))
     ((symbolp form)
      (and form (%decl-int-width (%var-dtype form env))))
     ((not (consp form)) nil)
@@ -20703,7 +20867,10 @@
    (:add :sub :mul), or NIL when either width is unknown."
   (and w1 w2
        (let ((rw (if (eq op :mul) (+ w1 w2) (+ 1 (max w1 w2)))))
-         (list t (<= rw 61) rw))))
+         ;; The result must fit THIS TARGET's fixnum: 61 bits of magnitude on
+         ;; the 62-bit tower (exactly the old constant), 29 on the 30-bit one.
+         ;; A hard 61 made a 30-bit build trust products that overflow.
+         (list t (<= rw (- +fixnum-bits+ 1)) rw))))
 
 (defun %leaf-operand-p (form env)
   "True when compiling FORM into a fresh temp register is a pure load that

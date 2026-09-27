@@ -31,6 +31,26 @@
 (defconstant +i386-kernel-load-addr+ #x100000)     ; 1MB - standard Multiboot load
 (defconstant +i386-stack-top+        #x400000)     ; 4MB - initial stack top
 
+;;; LAYOUT OVERRIDES — for images too large for the default map.
+;;;
+;;; The defaults above put the stack top at 4 MB and cons space at 8 MB, which
+;;; suits the small legacy images (the mini-Lisp REPL is 100 KB, the SSH image
+;;; 1.8 MB).  The bare-metal REAL CL image is 37 MB: loaded at 1 MB it covers
+;;; 1..38 MB, so BOTH the stack and the cons allocator would land inside the
+;;; image and overwrite the code that is running.  Measured: the image printed
+;;; its banner and then died before reaching the REPL.
+;;;
+;;; Same shape as boot-x64.lisp's *X64-STACK-TOP-OVERRIDE* — a build binds
+;;; these, the entry stub reads them through the accessors below, and NIL means
+;;; "use the default", so every existing i386 image is byte-identical.
+(defvar *i386-stack-top-override* nil)
+(defvar *i386-cons-base-override* nil)
+(defvar *i386-general-base-override* nil)
+
+(defun i386-stack-top ()   (or *i386-stack-top-override*   +i386-stack-top+))
+(defun i386-cons-base ()   (or *i386-cons-base-override*   +i386-cons-base+))
+(defun i386-general-base () (or *i386-general-base-override* +i386-general-base+))
+
 ;; Memory regions (32-bit addresses)
 (defconstant +i386-cons-base+        #x00800000)   ; 8MB - cons space
 (defconstant +i386-general-base+     #x07800000)   ; 120MB - general heap (cross-compile needs ~70MB for 32-bit arrays)
@@ -130,6 +150,24 @@
   ;; --- CLI (redundant but safe) ---
   (mvm-emit-byte buf #xFA)                         ; cli
 
+  ;; --- Enable SSE: CR0.EM=0, CR0.MP=1, CR4.OSFXSR|OSXMMEXCPT ---
+  ;; translate-i386 emits SSE2 for doubles (CVTSI2SD, ADDSD, ...).  Out of reset
+  ;; the OS-support bits are clear and the first SSE instruction is #UD; with no
+  ;; IDT yet that escalates to a triple fault, which qemu -no-reboot shows as a
+  ;; BIOS/iPXE banner rather than an error -- so every double-float rung "never
+  ;; reached Lisp" on bare i386.  Hosted Linux sets these for the process; a
+  ;; bare boot must.  Same class as bare ppc64 MSR[FP], the Pi's FPEXC and
+  ;; aarch64's CPACR_EL1.  EAX/EBX hold multiboot values: EBX is untouched here
+  ;; and the EAX magic is not read afterwards.
+  (dolist (b '(#x0F #x20 #xC0                      ; mov eax, cr0
+               #x25 #xFB #xFF #xFF #xFF            ; and eax, ~4      (EM=0)
+               #x83 #xC8 #x02                      ; or  eax, 2       (MP=1)
+               #x0F #x22 #xC0                      ; mov cr0, eax
+               #x0F #x20 #xE0                      ; mov eax, cr4
+               #x0D #x00 #x06 #x00 #x00            ; or  eax, 0x600   (OSFXSR|OSXMMEXCPT)
+               #x0F #x22 #xE0))                    ; mov cr4, eax
+    (mvm-emit-byte buf b))
+
   ;; --- Save multiboot info pointer (EBX) to scratch location ---
   ;; mov [0x500], ebx
   (mvm-emit-byte buf #x89)                         ; mov [disp32], ebx
@@ -139,7 +177,7 @@
   ;; --- Set up stack ---
   ;; mov esp, +i386-stack-top+
   (mvm-emit-byte buf #xBC)                         ; mov esp, imm32
-  (mvm-emit-u32 buf +i386-stack-top+)
+  (mvm-emit-u32 buf (i386-stack-top))
 
   ;; --- Set up frame pointer ---
   ;; push ebp; mov ebp, esp
@@ -156,12 +194,12 @@
   (mvm-emit-byte buf #xC7)                         ; mov [disp32], imm32
   (mvm-emit-byte buf #x05)                         ; ModR/M: mod=00 r/m=5 (disp32)
   (mvm-emit-u32 buf #x600)
-  (mvm-emit-u32 buf +i386-cons-base+)
+  (mvm-emit-u32 buf (i386-cons-base))
   ;; mov [0x604], +i386-general-base+  (VL = alloc limit)
   (mvm-emit-byte buf #xC7)
   (mvm-emit-byte buf #x05)
   (mvm-emit-u32 buf #x604)
-  (mvm-emit-u32 buf +i386-general-base+)
+  (mvm-emit-u32 buf (i386-general-base))
   ;; mov [0x608], 0x00  (VN = NIL = 0, matching AArch64/RISC-V convention)
   ;; NIL=0 ensures fixnum 0 is falsy, required by (when (logand ...)) idioms
   (mvm-emit-byte buf #xC7)
@@ -324,8 +362,11 @@
         :serial-init-fn #'i386-init-serial
         :percpu-layout-fn #'i386-percpu-layout
         :load-addr +i386-kernel-load-addr+
-        :stack-top +i386-stack-top+
-        :cons-base +i386-cons-base+
-        :general-base +i386-general-base+
+        ;; Through the accessors, not the raw constants: the descriptor is
+        ;; read by cross.lisp and must report the SAME addresses the entry stub
+        ;; above emits, or an overridden layout is described wrongly.
+        :stack-top (i386-stack-top)
+        :cons-base (i386-cons-base)
+        :general-base (i386-general-base)
         :percpu-base +i386-percpu-base+
         :percpu-stride +i386-percpu-stride+))

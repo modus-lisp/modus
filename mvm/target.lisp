@@ -93,8 +93,17 @@
    :name :riscv64
    :word-size 8
    :endianness :little
+   ;; V4 IS s11, NOT s0.  s0 IS THE FRAME POINTER on RISC-V (x8, fp and s0 are
+   ;; one register), so a V4 mapped to s0 would alias VFP and any function using
+   ;; both would read its frame pointer as a local.  translate-riscv.lisp's
+   ;; *RISCV-REG-MAP* has always said s11 and carries that comment; THIS table
+   ;; said s0 and disagreed with it.  Nothing broke, because only the TRANSLATOR
+   ;; emits code and the compiler reads this map only to decide whether a vreg is
+   ;; in a register at all (both answers are non-NIL) — but two maps that
+   ;; disagree is a trap for whoever next derives a fact from this one.
+   ;; THE TRANSLATOR IS THE AUTHORITY.
    :reg-map #(:a0 :a1 :a2 :a3        ; V0-V3 (args) = x10-x13
-              :s0 :s1 :s2 :s3        ; V4-V7 (callee-saved) = x8,x9,x18,x19
+              :s11 :s1 :s2 :s3       ; V4-V7 (callee-saved) = x27,x9,x18,x19
               :s4 :s5 :s6 :s7        ; V8-V11 (callee-saved) = x20-x23
               nil nil nil nil         ; V12-V15 (spill)
               :a0                     ; VR (aliases V0)
@@ -115,6 +124,52 @@
    :emit-epilogue nil
    :emit-boot nil
    :features '(:has-sbi t :has-plic t)))
+
+;;; ============================================================
+;;; RISC-V 32 Target (RV32I/M) — the EMBEDDED RISC-V
+;;; ============================================================
+;;;
+;;; Same register map, same translator, 4-byte words.  RV32 is not a smaller
+;;; RV64: SLLI's shift-amount field is 5 bits rather than 6, AMOSWAP.D and the
+;;; whole *W instruction family do not exist, and the object/cons granule is a
+;;; word pair (8 bytes, not 16).  TRANSLATE-RISCV.LISP derives all of that from
+;;; *RISCV-64-BIT*, which INSTALL-RISCV32-TRANSLATOR sets.
+(defparameter *target-riscv32*
+  (make-target
+   :name :riscv32
+   :word-size 4
+   :endianness :little
+   ;; V4 IS s11, NOT s0.  s0 IS THE FRAME POINTER on RISC-V (x8, fp and s0 are
+   ;; one register), so a V4 mapped to s0 would alias VFP and any function using
+   ;; both would read its frame pointer as a local.  translate-riscv.lisp's
+   ;; *RISCV-REG-MAP* has always said s11 and carries that comment; THIS table
+   ;; said s0 and disagreed with it.  Nothing broke, because only the TRANSLATOR
+   ;; emits code and the compiler reads this map only to decide whether a vreg is
+   ;; in a register at all (both answers are non-NIL) — but two maps that
+   ;; disagree is a trap for whoever next derives a fact from this one.
+   ;; THE TRANSLATOR IS THE AUTHORITY.
+   :reg-map #(:a0 :a1 :a2 :a3        ; V0-V3 (args) = x10-x13
+              :s11 :s1 :s2 :s3       ; V4-V7 (callee-saved) = x27,x9,x18,x19
+              :s4 :s5 :s6 :s7        ; V8-V11 (callee-saved) = x20-x23
+              nil nil nil nil         ; V12-V15 (spill)
+              :a0                     ; VR (aliases V0)
+              :s8                     ; VA = x24
+              :s9                     ; VL = x25
+              :s10                    ; VN = x26
+              :sp                     ; VSP = x2
+              :fp                     ; VFP = x8 (alias of s0)
+              nil)                    ; VPC
+   :n-phys-regs 32
+   :callee-saved '(4 5 6 7 8 9 10 11)
+   :arg-regs '(0 1 2 3)
+   :scratch-regs '(5 6 7 8)
+   :max-inline-regs 11
+   :page-size 4096
+   :translate-fn nil
+   :emit-prologue nil
+   :emit-epilogue nil
+   :emit-boot nil
+   :features '(:32-bit t :has-sbi t :has-plic t)))
 
 ;;; ============================================================
 ;;; AArch64 Target
@@ -307,11 +362,12 @@
    :name :68k
    :word-size 4
    :endianness :big
-   :reg-map #(:d0 :d1 :d2 :d3       ; V0-V3 (args, data regs)
-              :d4 :d5 :d6 :d7       ; V4-V7 (callee-saved)
+   ;; D0/D1 are reserved as the translator's scratch — see *68k-vreg-map*.
+   :reg-map #(:d2 :d3 :d4 :d5       ; V0-V3 (args, data regs)
+              :d6 :d7 nil nil       ; V4-V5 (callee-saved), V6-V7 spill
               nil nil nil nil         ; V8-V11 (spill)
               nil nil nil nil         ; V12-V15 (spill)
-              :d0                     ; VR (aliases V0)
+              :d2                     ; VR (aliases V0)
               :a2                     ; VA (address reg)
               :a3                     ; VL (address reg)
               :a4                     ; VN (address reg)
@@ -319,10 +375,10 @@
               :a6                     ; VFP (FP)
               nil)                    ; VPC
    :n-phys-regs 16  ; 8 data + 8 address
-   :callee-saved '(4 5 6 7)
+   :callee-saved '(4 5)
    :arg-regs '(0 1 2 3)
    :scratch-regs nil
-   :max-inline-regs 7
+   :max-inline-regs 6
    :page-size 4096
    :translate-fn nil
    :emit-prologue nil
@@ -449,6 +505,7 @@
 ;; Register all built-in targets
 (register-target *target-x86-64*)
 (register-target *target-riscv64*)
+(register-target *target-riscv32*)
 (register-target *target-aarch64*)
 (register-target *target-ppc64*)
 (register-target *target-ppc32*)
@@ -532,6 +589,36 @@
    Set by BUILD-IMAGE from the target's word size; 62 for 64-bit, 30 for
    32-bit.  Everything else derives from this one knob.")
 
+;;; MULTIPLE-VALUE TRANSFER SLOTS — PER TARGET, and they have to be.
+;;;
+;;; These were a pair of DEFCONSTANTs in compiler.lisp fixed at #x10000090 /
+;;; #x10000098, and three separate families of code baked that literal:
+;;; compiler.lisp's own MULTIPLE-VALUE-BIND / VALUES / NTH-VALUE expansions,
+;;; five hand-written sites in shared CL source (prelude, cl-eval, cl-clos,
+;;; gc), and each back end's :set-mv-count.
+;;;
+;;; #x10000090 IS NOT MEMORY ON EVERY TARGET.  On QEMU riscv virt it is inside
+;;; the NS16550 UART's MMIO window (+riscv-uart-base+ = #x10000000), and on
+;;; ppc32 it is outside the 64 MB the boot TLBs map (stack top #x03F00000).
+;;; The two back ends therefore pointed their :set-mv-count somewhere mapped,
+;;; which made the writer and the readers disagree — documented at the time as
+;;; "multiple values are not yet correct there".
+;;;
+;;; That latent divergence became a boot failure when the compiler started
+;;; clamping the MV count at every single-valued tail leaf: the emitted
+;;; `(setf (mem-ref #x10000090 :u64) 1)' now runs on the ordinary return path,
+;;; so `(defun down (n) (if (< n 1) 42 (down (1- n))))' stored into UART
+;;; registers on riscv64 and took a data-storage exception on ppc32, while the
+;;; six targets whose slot really is RAM carried on passing.
+;;;
+;;; One value per target, set by SET-TARGET-FIXNUM-BITS-FOR and injected into
+;;; every compilation by WIDTH-CONSTANTS-SOURCE, so all three families read the
+;;; same number by construction rather than by everyone remembering.
+(defparameter +mv-count-addr+  #x10000090
+  "Address of the multiple-values COUNT slot for the target being compiled.")
+(defparameter +mv-values-addr+ #x10000098
+  "Base of the multiple-values vector; the count slot's word plus one.")
+
 (defparameter +fixnum-bits+      62)
 (defparameter +fixnum-max+       4611686018427387903)
 (defparameter +fixnum-min+       -4611686018427387903)
@@ -540,6 +627,14 @@
 (defparameter +fixnum-half+      2305843009213693952)
 (defparameter +fixnum-neg-half+  -2305843009213693952)
 (defparameter +fixnum-half-max+  2305843009213693951)
+(defparameter +fixnum-signed-bits+ 63
+  "Signed width of the largest fixnum: +fixnum-bits+ magnitude bits plus the
+   sign.  A NAMED constant rather than (+ +fixnum-bits+ 1) at each use so the
+   width tests in compiler.lisp compare against a leaf, as they did against the
+   literal 63 they replace -- an arithmetic form there makes the compiler's
+   ANF pass mint temporaries and renumbers every later generated name.")
+(defparameter +fixnum-bits-1+    61
+  "+fixnum-bits+ - 1; see +fixnum-signed-bits+ for why it is named.")
 (defparameter +limb-bits+        62)
 (defparameter +limb-bits-1+      61)
 (defparameter +limb-split-bits+  30)
@@ -607,6 +702,8 @@
         +fixnum-half+          (ash 1 (- bits 1))
         +fixnum-neg-half+      (- (ash 1 (- bits 1)))
         +fixnum-half-max+      (- (ash 1 (- bits 1)) 1)
+        +fixnum-signed-bits+   (+ bits 1)
+        +fixnum-bits-1+        (- bits 1)
         +limb-bits+            bits
         +limb-bits-1+          (- bits 1)
         +limb-split-bits+      (- (floor bits 2) 1)
@@ -654,9 +751,103 @@
   bits)
 
 (defun set-target-fixnum-bits-for (target)
-  "Derive the numeric width (and endianness) from TARGET."
+  "Derive the numeric width, endianness and MV-slot addresses from TARGET."
   (setf *target-big-endian-p* (eq (target-endianness target) :big))
+  (multiple-value-bind (mvc mvv) (mv-slot-addrs-for target)
+    (setf +mv-count-addr+ mvc
+          +mv-values-addr+ mvv))
   (set-target-fixnum-bits (- (* 8 (target-word-size target)) 2)))
+
+(defun target-object-tag (target)
+  "The low-nibble TAG this target's translator puts on an object pointer.
+
+   THE AUTHORITY IS THE TRANSLATOR'S :ALLOC-OBJ / :OBJ-REF PAIR, not this table —
+   these values are transcribed from it and a translator that changes its tag
+   must change this too.  Measured from each file:
+
+     9  every port (+TAG-OBJECT+, the shared value)
+
+   RISC-V AND ARM32 ARE NOT BEING SLOPPY.  Tag 9 needs the low FOUR bits free,
+   i.e. 16-byte object alignment; RV32's allocation granule is a word PAIR, which
+   is EIGHT bytes, so 9 does not fit and 2 does.  The divergence is a
+   consequence of 32-bit word sizes, not a preference."
+  (case (target-name target)
+    ;; EVERY PORT IS 9 NOW.  RISC-V (both widths) and arm32 used 2 because
+    ;; 9 needs 16-byte objects; the shared compiler needs every pointer tag
+    ;; odd, so both moved to 9 with a 16-byte granule (rv-object-tag,
+    ;; +arm32-object-tag+).  Kept as a function so a port can diverge again
+    ;; only by saying so here.
+    (t 9)))
+
+(defun target-object-data-offset (target)
+  "Bytes from an object's RAW (untagged) base to the first data slot.
+
+   Two words on x64 and AArch64 — a header word and a PADDING word, so data
+   starts at raw+16 — and ONE word everywhere else, where the first slot follows
+   the header immediately.  Transcribed from each translator's :obj-ref slot
+   arithmetic, which is the authority:
+
+     x64      (* idx 8) + 7 from the TAGGED pointer, tag 9  ->  raw + 16 + idx*8
+     i386     (* (1+ idx) 4) after stripping the tag        ->  raw +  4 + idx*4
+     ppc      (* (1+ idx) ws) after stripping the tag       ->  raw + ws + idx*ws
+     riscv    (* (1+ idx) ws) - 2 from the tagged pointer   ->  raw + ws + idx*ws
+     arm32    2 + idx*4 from the tagged pointer, tag 2      ->  raw +  4 + idx*4
+
+   THIS MATTERED BECAUSE THE CONSTANT POOL BAKED x64's LAYOUT FOR EVERYONE.  A
+   pooled string read on RISC-V came back with length 0: the reader looked for the
+   header one word before where the pool had put it, and for the tag 9 the pool
+   had OR'd in rather than the 2 the target uses."
+  (let ((ws (target-word-size target)))
+    (case (target-name target)
+      ((:x86-64 :aarch64 :rpi) (* 2 ws))
+      (t ws))))
+
+(defun ppc-linux-mode-p ()
+  "T when the PPC back end is in hosted mode.  Looked up by name rather than
+   referenced directly because target.lisp is loaded BEFORE the translators, so
+   *PPC-LINUX-MODE* does not exist yet when this file is read."
+  (and (find-package "MODUS.MVM")
+       (let ((sym (find-symbol "*PPC-LINUX-MODE*" "MODUS.MVM")))
+         (and sym (boundp sym) (symbol-value sym) t))))
+
+(defun mv-slot-addrs-for (target)
+  "The (COUNT VALUES) multiple-value slot addresses for TARGET.
+
+   #x10000090 is the historical pair and is correct wherever that address is
+   ordinary RAM — x86-64, AArch64, i386, ARM32 (RAM from 0 on raspi2b), PPC64
+   and 68k.  The two exceptions are not preferences, they are memory maps:
+
+     riscv64  #x10000090 is inside the NS16550 UART MMIO window at
+              +riscv-uart-base+ #x10000000.  Moved into DRAM, alongside the
+              other convention slots the RISC-V back end keeps at #x80700000.
+     ppc32    #x10000090 is past the 64 MB boot-ppc32.lisp's TLBs map (its
+              stack top is #x03F00000).  Moved into the mapped low region,
+              alongside the PPC convention slots at #x00900000.
+
+   A target absent from this table gets the historical pair, which is the right
+   default: it is what every working image already used."
+  (case (target-name target)
+    ;; riscv64 BARE only.  #x80700010 is DRAM on virt; under hosted Linux it is
+    ;; not mapped, and the hosted port uses the shared pair inside its mmap'd
+    ;; heap.  *RISCV-LINUX-MODE* is the only thing that distinguishes them here:
+    ;; RESOLVE-TARGET-ARCH maps :linux-riscv to :riscv64, so (target-name ...)
+    ;; cannot tell bare from hosted.
+    (:riscv64 (if (and (find-package "MODUS.MVM")
+                       (let ((sym (find-symbol "*RISCV-LINUX-MODE*" "MODUS.MVM")))
+                         (and sym (boundp sym) (symbol-value sym))))
+                  (values #x10000090 #x10000098)
+                  (values #x80700010 #x80700018)))
+    ;; ppc32/ppc64 BARE vs HOSTED, the same split riscv64 has and for the same
+    ;; reason: RESOLVE-TARGET-ARCH maps :linux-ppc32 to :ppc32, so (target-name
+    ;; ...) cannot tell them apart, and the bare addresses are not mapped under
+    ;; Linux.  The hosted pair is the shared one, inside the mmap'd heap.
+    ((:ppc32 :ppc64)
+     (if (ppc-linux-mode-p)
+         (values #x10000090 #x10000098)
+         (if (eq (target-name target) :ppc32)
+             (values #x00900020 #x00900028)
+             (values #x10000090 #x10000098))))
+    (t        (values #x10000090 #x10000098))))
 
 (defun width-constants-source ()
   "The width DEFCONSTANT block, as source text, with the CURRENT target's
@@ -674,6 +865,7 @@
      (defconstant +fixnum-min+ ~D)~%(defconstant +fixnum-limit+ ~D)~%~
      (defconstant +fixnum-neg-limit+ ~D)~%(defconstant +fixnum-half+ ~D)~%~
      (defconstant +fixnum-neg-half+ ~D)~%(defconstant +fixnum-half-max+ ~D)~%~
+     (defconstant +fixnum-signed-bits+ ~D)~%(defconstant +fixnum-bits-1+ ~D)~%~
      (defconstant +limb-bits+ ~D)~%(defconstant +limb-bits-1+ ~D)~%~
      (defconstant +limb-split-bits+ ~D)~%(defconstant +neg-limb-bits+ ~D)~%~
      (defconstant +neg-limb-bits-1+ ~D)~%(defconstant +fixnum-read-guard+ ~D)~%~
@@ -684,10 +876,14 @@
      (defconstant +name-hash-bits+ ~D)~%~
      (defconstant +name-hash-shift+ ~D)~%~
      (defconstant +name-hash-hi-mask+ ~D)~%~
-     (defconstant +name-hash-lo-mask+ ~D)~%"
+     (defconstant +name-hash-lo-mask+ ~D)~%~
+     (defconstant +mv-count-addr+ ~D)~%~
+     (defconstant +mv-values-addr+ ~D)~%"
     +fixnum-bits+ +fixnum-max+ +fixnum-min+ +fixnum-limit+ +fixnum-neg-limit+
-    +fixnum-half+ +fixnum-neg-half+ +fixnum-half-max+ +limb-bits+ +limb-bits-1+
+    +fixnum-half+ +fixnum-neg-half+ +fixnum-half-max+
+    +fixnum-signed-bits+ +fixnum-bits-1+ +limb-bits+ +limb-bits-1+
     +limb-split-bits+ +neg-limb-bits+ +neg-limb-bits-1+ +fixnum-read-guard+
     +small-bignum-bits+ +half-limb-bits+ +neg-half-limb-bits+
     +half-limb-mask+
-    +name-hash-bits+ +name-hash-shift+ +name-hash-hi-mask+ +name-hash-lo-mask+))
+    +name-hash-bits+ +name-hash-shift+ +name-hash-hi-mask+ +name-hash-lo-mask+
+    +mv-count-addr+ +mv-values-addr+))

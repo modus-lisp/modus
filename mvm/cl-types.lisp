@@ -56,8 +56,12 @@
 ;;; ============================================================
 
 (defun %fl (n)
-  "Tagged integer N → IEEE double."
-  (%float-from-int n))
+  "Integer N → IEEE double.  Through %BIGNUM-TO-FLOAT, not the bare
+   %float-from-int primop: the constants below (3141592653589793 …) are
+   BIGNUMS on the 30-bit tower, and the primop converts a bignum's heap
+   pointer -- i386 had π = 0.99999990766, so every sin/cos/tan was wrong
+   (md5's T table, built from SIN at load time, gave wrong digests)."
+  (%bignum-to-float n))
 
 ;; Double-precision constants, built from full-precision decimal
 ;; rationals via %float-div (defvars don't auto-init at boot, so we
@@ -82,8 +86,8 @@
   "Round double A to the nearest integer (returns a tagged integer).
    Uses truncate(a + 0.5*sign)."
   (if (float-negative-p a)
-      (%float-to-int (%float-sub a (%f-half)))
-      (%float-to-int (%float-add a (%f-half)))))
+      (%float-to-integer (%float-sub a (%f-half)))
+      (%float-to-integer (%float-add a (%f-half)))))
 
 (defun %trig-reduce-f (x)
   "Reduce double angle X into approximately [-π, π] by subtracting an
@@ -1695,12 +1699,30 @@
 ;; 17 5) errored with %eval-escape.  Compiled callers still use the
 ;; inline opcodes; these defuns serve the SFT-routed runtime path.
 
+(defun %float-to-integer (x)
+  "IEEE double X → the integer toward zero, EXACT at every magnitude.
+   The %float-to-int primop (CVTTSD2SI) is only defined inside the fixnum
+   range; past it i386 answered (truncate 3.5d9) => 0 and (truncate 1.5d9)
+   => -647483648, and x64 fails the same way past 2^62.  Below 2^29 -- a
+   fixnum on every tower -- take the primop; above it, decode the IEEE bits
+   (every double that large is an integer, significand * 2^exponent).
+   Infinity and NaN have no integer value: signal, never guess."
+  (let* ((hi (%float-hi32 x))
+         (e  (logand (ash hi -20) 2047)))
+    (cond
+      ((< e (+ 1023 29)) (%float-to-int x))
+      ((= e 2047) (error "Cannot convert ~S to an integer" x))
+      (t (let ((m (ash (logior (ash (logior (logand hi 1048575) 1048576) 32)
+                               (%float-lo32 x))
+                       (- e 1075))))
+           (if (>= hi 2147483648) (- m) m))))))
+
 (defun %trunc1-generic (n)
   "1-arg truncate of an IEEE float N → (values q r) where q = trunc(n)
    toward zero (a tagged integer) and r = n - q (a FLOAT).  CLHS
    requires 2 values; the compiler's truncate intercept routes the
    float case here so (multiple-value-list (truncate 5.5)) → (5 0.5)."
-  (let ((q (%float-to-int n)))
+  (let ((q (%float-to-integer n)))
     (values q (generic-subtract n q))))
 
 (defun truncate (n &rest rest)
@@ -1728,9 +1750,9 @@
                          (values q (- n q))))
            ;; Float: q = ⌊n⌋ (toward -inf), r = n - q (a FLOAT in [0,1)).
            ((%ieee-float-p n)
-            (let* ((tz (%float-to-int n))          ; toward zero
+            (let* ((tz (%float-to-integer n))      ; toward zero
                    (q (if (and (float-negative-p n)
-                               (not (numeric-equal-p (%float-from-int tz) n)))
+                               (not (numeric-equal-p (%bignum-to-float tz) n)))
                           (- tz 1) tz)))
               (values q (generic-subtract n q))))
            (t (truncate n))))
@@ -1759,9 +1781,9 @@
                          (values q (- n q))))
            ;; Float: q = ⌈n⌉ (toward +inf), r = n - q (a FLOAT in (-1,0]).
            ((%ieee-float-p n)
-            (let* ((tz (%float-to-int n))
+            (let* ((tz (%float-to-integer n))
                    (q (if (and (not (float-negative-p n))
-                               (not (numeric-equal-p (%float-from-int tz) n)))
+                               (not (numeric-equal-p (%bignum-to-float tz) n)))
                           (+ tz 1) tz)))
               (values q (generic-subtract n q))))
            (t (truncate n))))
@@ -2589,7 +2611,12 @@
     ((and (integerp a) (ratiop b))
      (make-ratio-obj (bignum-add (bignum-mul a (aref b 1)) (aref b 0)) (aref b 1)))
     ;; Bignum operands route through bignum-add (overflow-safe).
-    ((or (bignump a) (bignump b)) (bignum-add a b))
+    ;; BOTH integers: a bignum beside a float or ratio belongs to the
+    ;; float / ratio arms below.  (- 3.5d9 3500000000) sent the float
+    ;; into bignum-add, killing the i386 image outright (x64: an error
+    ;; past 2^62) -- the remainder of every large float TRUNCATE.
+    ((and (integerp a) (integerp b) (or (bignump a) (bignump b)))
+     (bignum-add a b))
     ;; Fixnum + fixnum: detect potential overflow by operand magnitude
     ;; check (each fits in 61 bits → sum fits in 62-bit fixnum range).
     ;; Larger operands route through bignum-add, which correctly
@@ -2624,6 +2651,16 @@
     ;; fast path AND promotes to bignum on overflow.  The naked
     ;; %fixnum-* silently wrapped `(* 2^60 2^60) -> 0' for products
     ;; that exceed 63 bits.
+    ;; 30-BIT TOWER, FIXNUM x FIXNUM: decide EXACTLY whether the product fits
+    ;; before touching the bignum engine.  A 30-bit build sends any `*' it
+    ;; cannot prove small here (see emit-arith-pair), and bignum-mul builds
+    ;; limb lists even for a result that fits -- garbage the hosted RV32 image
+    ;; (no collector yet) could not afford.  |a| <= floor(fixnum-max / |b|)
+    ;; is the exact condition, and both it and the raw product are fixnum ops.
+    ((and (< +fixnum-bits+ 62) (fixnump a) (fixnump b)
+          (let ((aa (if (< a 0) (- 0 a) a)) (bb (if (< b 0) (- 0 b) b)))
+            (or (= bb 0) (<= aa (truncate +fixnum-max+ bb)))))
+     (%fixnum-* a b))
     ((and (or (bignump a) (integerp a)) (or (bignump b) (integerp b)))
      (bignum-mul a b))
     ;; Ratio branches: a ratio's numerator/denominator may itself be a
@@ -2654,7 +2691,12 @@
     ((and (integerp a) (ratiop b))
      (make-ratio-obj (bignum-sub (bignum-mul a (aref b 1)) (aref b 0)) (aref b 1)))
     ;; Bignum-aware: bignum-sub handles fixnum/bignum mix.
-    ((or (bignump a) (bignump b)) (bignum-sub a b))
+    ;; BOTH integers: a bignum beside a float or ratio belongs to the
+    ;; float / ratio arms below.  (- 3.5d9 3500000000) sent the float
+    ;; into bignum-sub, killing the i386 image outright (x64: an error
+    ;; past 2^62) -- the remainder of every large float TRUNCATE.
+    ((and (integerp a) (integerp b) (or (bignump a) (bignump b)))
+     (bignum-sub a b))
     ;; Fixnum - fixnum: mirror generic-add's magnitude guard.  Each operand
     ;; in [-2^61, 2^61-1] guarantees the difference fits the 62-bit fixnum
     ;; range, so %fixnum-- (raw) is exact.  Larger operands can overflow
@@ -2936,8 +2978,12 @@
          (na (if a-neg (bignum-negate a) a)))
     (let ((mag
             (cond
-              ;; Fast path: divisor magnitude fits in (2^31 - 1).
-              ((and (not (bignump b-mag)) (< b-mag 2147483648))
+              ;; Fast path: %bignum-divmod-fixnum's digit recurrence stays in
+              ;; fixnums for a divisor up to 2^(bits - half): 2^31 on the
+              ;; 62-bit tower (the old literal), 2^15 on the 30-bit one, where
+              ;; the literal 2147483648 is not even a fixnum.
+              ((and (not (bignump b-mag))
+                    (<= b-mag (ash 1 (- +fixnum-bits+ +half-limb-bits+))))
                (car (%bignum-divmod-fixnum na b-mag)))
               ;; General path: long division (Algorithm D).  The doubling-
               ;; subtract it replaced took 34 s for a 2048-bit dividend.

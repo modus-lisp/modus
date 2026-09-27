@@ -112,9 +112,25 @@
 
 (defun wrap-in-elf64-le-aa64 (raw-bytes load-addr &key function-table
                                                        native-image-offset
-                                                       native-code-length)
-  "Wrap raw image bytes in an ELF64-LE AArch64 executable.
-   Mirrors wrap-in-elf64-le (x64) but with EM_AARCH64."
+                                                       native-code-length
+                                                       (machine 183)
+                                                       (page-align #x10000)
+                                                       (bss-size nil))
+  "Wrap raw image bytes in an ELF64-LE executable.
+
+   Named for AArch64 because that is what it was written for, and the defaults
+   still produce byte-identical AArch64 output; MACHINE, PAGE-ALIGN and
+   BSS-SIZE make it serve any little-endian 64-bit target.  The only things
+   that differ between ELF64-LE ports are e_machine, p_align and how much BSS
+   the p_memsz reserves — everything else here, including the section headers
+   and the per-function symbol table that objdump and addr2line need, is
+   identical.  Copying 125 lines per architecture to change two numbers is how
+   three ports drift apart.
+
+   MACHINE   e_machine: 183 EM_AARCH64 (default), 243 EM_RISCV, 62 EM_X86_64.
+   PAGE-ALIGN p_align: 64K on AArch64, 4K elsewhere.
+   BSS-SIZE  extra p_memsz beyond p_filesz; defaults to the AArch64 heap size."
+  (declare (ignorable bss-size))
   (let* ((ehdr-size 64)
          (phdr-size 56)
          (shdr-size 64)
@@ -176,7 +192,7 @@
     (mvm-emit-byte buf 0)              ; ELFOSABI_NONE
     (dotimes (i 8) (mvm-emit-byte buf 0))
     (mvm-emit-u16 buf 2)               ; ET_EXEC
-    (mvm-emit-u16 buf 183)             ; EM_AARCH64
+    (mvm-emit-u16 buf machine)         ; EM_AARCH64 by default
     (mvm-emit-u32 buf 1)               ; e_version
     (mvm-emit-u64 buf entry-point)
     (mvm-emit-u64 buf ehdr-size)
@@ -195,8 +211,9 @@
     (mvm-emit-u64 buf load-addr)
     (mvm-emit-u64 buf load-addr)
     (mvm-emit-u64 buf (+ header-total raw-len))
-    (mvm-emit-u64 buf (+ header-total raw-len +linux-aarch64-heap-size+))
-    (mvm-emit-u64 buf #x10000)        ; 64K page
+    (mvm-emit-u64 buf (+ header-total raw-len
+                         (or bss-size +linux-aarch64-heap-size+)))
+    (mvm-emit-u64 buf page-align)     ; 64K on AArch64, 4K elsewhere
     (loop for b across raw-bytes do (mvm-emit-byte buf b))
     (loop for b across shstrtab-bytes do (mvm-emit-byte buf b))
     (dotimes (i sym-size) (mvm-emit-byte buf 0))

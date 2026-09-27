@@ -190,7 +190,11 @@
 ;;; multiple values read PHANTOM secondaries out of #x10000098.  Symptom:
 ;;; `(multiple-value-list (typep 1 'integer))` => ("T" T) on i386 vs (T) on x64.
 ;;; Keep this EQ to modus.mvm::+mv-count-addr+; it must not be relocated.
-(defparameter *mvcount-addr* modus.mvm::+mv-count-addr+)  ; SHARED, see above
+;;; Read modus.mvm::+MV-COUNT-ADDR+ at EMISSION time through this function, not
+;;; once at load time: it is now set PER TARGET (mvm/target.lisp), and a
+;;; DEFPARAMETER here would freeze whichever value happened to be current when
+;;; this file loaded.  i386's own value is the historical #x10000090.
+(defun mvcount-addr () modus.mvm::+mv-count-addr+)
 (defparameter *gc-page-base-addr* #x618)  ; raw from_start, for the bit-set
 (defparameter *gc-startbmp-addr*  #x61C)  ; raw object-start bitmap base
 (defparameter *gc-consbmp-addr*   #x620)  ; raw cons-kind bitmap base
@@ -205,7 +209,7 @@
         *vn-addr*      (+ base #x08)
         *nargs-addr*   (+ base #x0C)
         *cenv-addr*    (+ base #x10)
-        ;; base+#x14 stays RESERVED (do not reuse): *mvcount-addr* is a shared
+        ;; base+#x14 stays RESERVED (do not reuse): (mvcount-addr) is a shared
         ;; contract address, never relocated.  See its defparameter above.
         *gc-page-base-addr* (+ base #x18)
         *gc-startbmp-addr*  (+ base #x1C)
@@ -545,6 +549,21 @@
 ;;;
 ;;; Scratch at 0x100003C0..0x100003F8 sits in the unused gap between the
 ;;; saved initial ESP (0x10000290) and the handler stack.
+
+(defun i386-set-handler-block ()
+  "Place the handler-case block for the current mode.  Hosted: the shared
+   contract addresses at the heap base (#x10000180 jmp_buf ... #x10000408
+   frames), unchanged.  Bare: the SAME low offsets from #x5C0000, free RAM on
+   the Multiboot board -- above the per-CPU block (#x5B0000), below the cons
+   space (8 MB), clear of the stack (down from 4 MB).  #x10000180 is past the
+   end of RAM on a `qemu-system-i386 -m 256' board."
+  (let ((base (if *i386-linux-mode* #x10000000 #x5C0000)))
+    (setf *i386-jmpbuf-addr*          (+ base #x180)
+          *i386-longjmp-scratch-addr* (+ base #x3C0)
+          *i386-hstack-capcount-addr* (+ base #x3F0)
+          *i386-hstack-overflow-addr* (+ base #x3F8)
+          *i386-hstack-depth-addr*    (+ base #x400)
+          *i386-hstack-base-addr*     (+ base #x408))))
 
 (defparameter *i386-jmpbuf-addr* #x10000180
   "Base of the six-word jmp_buf (ESP/EBP/IP/EBX/ESI/EDI).")
@@ -1935,6 +1954,20 @@
       (i386-emit-pop-reg buf +i386-eax+)
       (i386-emit-ret buf))))
 
+(defparameter *i386-gc-vl-margin* #x1000000
+  "Bytes VL stops short of the end of the ACTIVE semispace (16 MB, the same as
+   the upper semispace's +linux-i386-gc-guard+).  :gc-check tests VA < VL
+   BEFORE an allocation whose size it cannot see, so the allocation that
+   trips it runs past VL by up to its own size.  When VL was the semispace's
+   exact end, in the LOWER semispace that overshoot landed in to-space: the
+   collector then copied survivors OVER the tail of the straddling object
+   before copying the object itself.  Measured with a ring of live 400 KB
+   arrays (test/i386-gc-straddle.lisp): SIGSEGV on the default build, clean
+   on a stress build whose VL is far from the boundary -- and the same shape
+   as the nondeterministic named-readtables crash (MEM-WRITE to address 0
+   after 71 collections).  A single allocation larger than the margin is the
+   residual every port has; the cure is a size-aware :gc-check.")
+
 (defun i386-emit-gc-trampoline (buf tramp-label collect-label)
   "A complete Cheney copying collector in native i386, called by :gc-check.
 
@@ -2056,7 +2089,7 @@
     ;; invisible-root class as CENV at globals+0x10, which sat unscanned until
     ;; this session.  ESP/EBP/IP are scanned too rather than skipped — the
     ;; stack (0x18000000) and the ELF image (0x08048000) are both BELOW the
-    ;; arena (0x30000000), so scan_word's from-space bounds test rejects them,
+    ;; arena (0x19000000), so scan_word's from-space bounds test rejects them,
     ;; and scanning the block whole keeps any slot added later covered.
     (let ((jl (i386-make-label)) (jd (i386-make-label)))
       (i386-emit-mov-reg-imm buf +i386-ebp+ *i386-jmpbuf-addr*)
@@ -2087,15 +2120,87 @@
       (i386-emit-jmp-rel32 buf hl)
       (i386-emit-label buf hd))
 
-    ;; --- Cheney scan of to-space: [to_start, free_ptr), free_ptr growing ---
-    (let ((cl (i386-make-label)) (cd (i386-make-label)))
+    ;; --- Cheney scan of to-space: [to_start, free_ptr), OBJECT BY OBJECT ---
+    ;; This walked to-space WORD BY WORD, handing every word to scan_word --
+    ;; including the PAYLOAD of byte vectors.  MVM bytecode is a byte vector:
+    ;; any four bytes of an instruction stream (an LI immediate, a branch
+    ;; offset) that happened to spell a tagged from-space address with a start
+    ;; bit were "forwarded", i.e. overwritten, and the interpreter later died
+    ;; on `MVM: unknown opcode #xNN at PC 869' -- the i386 class whose
+    ;; (opcode, PC) pair "moved with unrelated code" because it depended on
+    ;; which addresses the heap happened to hold.
+    ;;
+    ;; Now: the cons-kind bit says CONS (scan car and cdr, 16 bytes);
+    ;; otherwise the granule holds a header, whose size is computed exactly as
+    ;; copy_object computes it, and a LEAF subtag (byte vector, SAP, floats,
+    ;; the raw vectors) has its payload skipped.  Every other object has
+    ;; exactly COUNT slots scanned -- not its alignment padding either.
+    (let ((cl (i386-make-label)) (cd (i386-make-label)) (c-cons (i386-make-label))
+          (c-u8 (i386-make-label)) (c-al (i386-make-label))
+          (c-skip (i386-make-label)) (sl (i386-make-label)))
       (i386-emit-mov-reg-abs buf +i386-ebp+ *i386-gc-to-addr*)
       (i386-emit-label buf cl)
       (i386-emit-cmp-reg-reg buf +i386-ebp+ +i386-esi+)
       (i386-emit-jcc buf :ae cd)
+      ;; BT [consbmp], (ebp - page_base) >> 4   -> CF = cons-kind bit
+      (i386-emit-mov-reg-reg buf +scratch0+ +i386-ebp+)
+      (i386-emit-byte buf #x2B)                                ; SUB ecx, [page_base]
+      (i386-emit-byte buf (i386-modrm #b00 +scratch0+ 5))
+      (i386-emit-u32 buf *gc-page-base-addr*)
+      (i386-emit-shr-reg-imm buf +scratch0+ 4)
+      (i386-emit-mov-reg-abs buf +scratch1+ *gc-consbmp-addr*)
+      (i386-emit-byte buf #x0F) (i386-emit-byte buf #xA3)      ; BT [edx], ecx
+      (i386-emit-byte buf (i386-modrm #b00 +scratch0+ +scratch1+))
+      (i386-emit-jcc buf :b c-cons)
+      ;; -- object: EAX = header, ECX = subtag, EDX = count --
+      (i386-emit-mov-reg-mem buf +i386-eax+ +i386-ebp+ 0)
+      (i386-emit-mov-reg-reg buf +scratch0+ +i386-eax+)
+      (i386-emit-and-reg-imm buf +scratch0+ 255)
+      (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
+      (i386-emit-shr-reg-imm buf +scratch1+ 8)
+      ;; EAX = size (copy_object's rule), then EAX = next object
+      (i386-emit-cmp-reg-imm buf +scratch0+ #x11)
+      (i386-emit-jcc buf :e c-u8)
+      (i386-emit-mov-reg-reg buf +i386-eax+ +scratch1+)
+      (i386-emit-add-reg-imm buf +i386-eax+ 1)
+      (i386-emit-shl-reg-imm buf +i386-eax+ 2)
+      (i386-emit-jmp-rel32 buf c-al)
+      (i386-emit-label buf c-u8)
+      (i386-emit-mov-reg-reg buf +i386-eax+ +scratch1+)
+      (i386-emit-add-reg-imm buf +i386-eax+ 4)
+      (i386-emit-label buf c-al)
+      (i386-emit-add-reg-imm buf +i386-eax+ 15)
+      (i386-emit-and-reg-imm buf +i386-eax+ -16)
+      (i386-emit-add-reg-reg buf +i386-eax+ +i386-ebp+)
+      (i386-emit-push-reg buf +i386-eax+)                      ; [esp] = next
+      ;; leaf subtags: skip the payload
+      (dolist (st '(#x10 #x11 #x12 #x14 #x16 #x60 #x64 #x65 #x66))
+        (i386-emit-cmp-reg-imm buf +scratch0+ st)
+        (i386-emit-jcc buf :e c-skip))
+      ;; slots: [ebp+4, ebp+4+4*count)
+      (i386-emit-shl-reg-imm buf +scratch1+ 2)
+      (i386-emit-add-reg-reg buf +scratch1+ +i386-ebp+)
+      (i386-emit-add-reg-imm buf +scratch1+ 4)
+      (i386-emit-mov-abs-reg buf *i386-gcroot-bound-addr* +scratch1+)
+      (i386-emit-add-reg-imm buf +i386-ebp+ 4)
+      (i386-emit-label buf sl)
+      (i386-emit-cmp-reg-abs buf +i386-ebp+ *i386-gcroot-bound-addr*)
+      (i386-emit-jcc buf :ae c-skip)
       (i386-emit-mov-reg-reg buf +i386-eax+ +i386-ebp+)
       (i386-emit-call-rel32 buf scan-label)
       (i386-emit-add-reg-imm buf +i386-ebp+ 4)
+      (i386-emit-jmp-rel32 buf sl)
+      (i386-emit-label buf c-skip)
+      (i386-emit-pop-reg buf +i386-ebp+)                       ; ebp = next
+      (i386-emit-jmp-rel32 buf cl)
+      ;; -- cons: car at +0, cdr at +4, 16 bytes --
+      (i386-emit-label buf c-cons)
+      (i386-emit-mov-reg-reg buf +i386-eax+ +i386-ebp+)
+      (i386-emit-call-rel32 buf scan-label)
+      (i386-emit-mov-reg-reg buf +i386-eax+ +i386-ebp+)
+      (i386-emit-add-reg-imm buf +i386-eax+ 4)
+      (i386-emit-call-rel32 buf scan-label)
+      (i386-emit-add-reg-imm buf +i386-ebp+ 16)
       (i386-emit-jmp-rel32 buf cl)
       (i386-emit-label buf cd))
 
@@ -2108,7 +2213,10 @@
     (i386-emit-mov-abs-reg buf *va-addr* +i386-esi+)
     (if *i386-gc-stress-limit*
         (i386-emit-add-reg-imm buf +i386-eax+ *i386-gc-stress-limit*)
-        (i386-emit-add-reg-abs buf +i386-eax+ *i386-gc-size-addr*))
+        (progn
+          (i386-emit-add-reg-abs buf +i386-eax+ *i386-gc-size-addr*)
+          ;; ...less the overshoot margin: see *I386-GC-VL-MARGIN*.
+          (i386-emit-sub-reg-imm buf +i386-eax+ *i386-gc-vl-margin*)))
     (i386-emit-mov-abs-reg buf *vl-addr* +i386-eax+)
 
     ;; --- MCGC point (c): byte-exact clear of the reclaimed range's bitmaps ---
@@ -2780,13 +2888,9 @@
              ;; range.  The hazard would be a STALE saved ESP, which is why
              ;; __handler_pop zeroes the whole jmp_buf when the stack empties.
              ;;
-             ;; Bare metal keeps the unimplemented-trap reporter: these
-             ;; addresses are in the HOSTED Linux BSS (0x10000180 is past the
-             ;; end of RAM on a `qemu-system-i386 -m 256` board), and the
-             ;; bare-metal i386 images run mvm/repl-source.lisp, which has no
-             ;; handler-case.  Gating on *i386-linux-mode* also keeps those
-             ;; images byte-identical.
-             ((and (= code #x0510) *i386-linux-mode* *i386-handler-push-label*)
+             ;; Both modes: the block is placed per mode by
+             ;; i386-set-handler-block (bare: #x5C0000 + the same offsets).
+             ((and (= code #x0510) *i386-handler-push-label*)
               (let ((skiparm (i386-make-label))
                     (resume (i386-make-label)))
                 ;; Stack the OUTER frame first; EDX comes back 1 if capped.
@@ -2821,7 +2925,7 @@
                 (i386-emit-mov-reg-abs buf +i386-eax+ *vn-addr*)
                 ;; LONGJMP lands here with EAX already holding the T sentinel.
                 (i386-emit-label buf resume)))
-             ((and (= code #x0511) *i386-linux-mode* *i386-handler-pop-label*)
+             ((and (= code #x0511) *i386-handler-pop-label*)
               ;; LONGJMP.  Read OUR frame out to scratch BEFORE the pop
               ;; overwrites the jmp_buf, then restore and transfer.
               (let ((armed (i386-make-label))
@@ -2856,7 +2960,7 @@
                 ;; (:mov dest VR) takes the handler path.
                 (i386-emit-mov-reg-imm buf +i386-eax+ +i386-mvm-t+)
                 (i386-emit-jmp-reg buf +scratch1+)))
-             ((and (= code #x0512) *i386-linux-mode* *i386-handler-pop-label*)
+             ((and (= code #x0512) *i386-handler-pop-label*)
               ;; CLEAR-HANDLER: pop the outer frame back into the jmp_buf.
               ;; The dispatch's push/pop EAX bracket is what preserves the
               ;; handler-case body's result across this call (dest==VR==EAX);
@@ -4234,7 +4338,7 @@
          (let ((tagged (ash (first operands) 1)))
            (i386-emit-byte buf #xC7)
            (i386-emit-byte buf (i386-modrm #b00 0 5))
-           (i386-emit-u32 buf *mvcount-addr*)
+           (i386-emit-u32 buf (mvcount-addr))
            (i386-emit-u32 buf tagged)))
 
         ;; ---- ALLOC-STRING Vd, Vcount ----
@@ -4483,6 +4587,33 @@
            (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
            (i386-store-vreg buf vd +scratch1+)))
 
+        ((op= +op-fround32+)
+         ;; (fround32 Vd Vs) — payload -> CVTSD2SS -> CVTSS2SD -> fresh boxed
+         ;; SINGLE-float (header #x464, x64's).  %ROUND-TO-SINGLE became this
+         ;; native op for speed and i386 had no arm, so its INT3 default fired
+         ;; on EVERY single-float operation -- including the reader building a
+         ;; `1.5' literal.  That is why six of the 22 ladder libraries
+         ;; (alexandria, babel, bordeaux-threads, cl-annot, ieee-floats,
+         ;; parse-float) died at LOAD with SIGTRAP.
+         (let ((vd (first operands)) (vs (second operands)))
+           (i386-load-vreg buf +scratch0+ vs)
+           (i386-emit-float-bits-to-stack buf +scratch0+ +scratch1+)
+           (i386-emit-movsd-xmm-esp buf +i386-xmm0+)
+           (i386-emit-add-reg-imm buf +i386-esp+ 8)
+           ;; CVTSD2SS xmm0,xmm0 (F2 0F 5A) ; CVTSS2SD xmm0,xmm0 (F3 0F 5A)
+           (i386-emit-byte buf #xF2) (i386-emit-byte buf #x0F) (i386-emit-byte buf #x5A)
+           (i386-emit-byte buf (i386-modrm #b11 +i386-xmm0+ +i386-xmm0+))
+           (i386-emit-byte buf #xF3) (i386-emit-byte buf #x0F) (i386-emit-byte buf #x5A)
+           (i386-emit-byte buf (i386-modrm #b11 +i386-xmm0+ +i386-xmm0+))
+           (i386-emit-float-alloc buf +scratch1+ +scratch0+)
+           (i386-emit-mov-mem-imm buf +scratch1+ 0 #x464)     ; single-float header
+           (i386-emit-sub-reg-imm buf +i386-esp+ 8)
+           (i386-emit-movsd-esp-xmm buf +i386-xmm0+)
+           (i386-emit-float-bits-from-stack buf +scratch1+ +scratch0+)
+           (i386-emit-add-reg-imm buf +i386-esp+ 8)
+           (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
+           (i386-store-vreg buf vd +scratch1+)))
+
         ((op= +op-itof+)
          ;; (itof Vd Vs) — tagged integer -> freshly allocated float object.
          (let ((vd (first operands)) (vs (second operands)))
@@ -4676,15 +4807,15 @@
     ;; that starts with the boot-side init.
     (setf *i386-gc-collect-label*
           (and *i386-gc-enabled* *i386-linux-mode* (i386-make-label)))
-    ;; handler-case helper entry points (TRAP #x0510/#x0511/#x0512).  Hosted
-    ;; Linux only: the jmp_buf and handler stack live in the hosted BSS, which
-    ;; a bare-metal i386 board does not have.  With these NIL the traps fall
-    ;; through to the unimplemented reporter exactly as before, so every
-    ;; bare-metal i386 image stays byte-identical.
-    (setf *i386-handler-push-label*
-          (and *i386-linux-mode* (i386-make-label)))
-    (setf *i386-handler-pop-label*
-          (and *i386-linux-mode* (i386-make-label)))
+    ;; handler-case helper entry points (TRAP #x0510/#x0511/#x0512) -- in
+    ;; BOTH modes now.  They used to be hosted-only, to keep the bare images
+    ;; (REPL/SSH, which have no handler-case) byte-identical; those images are
+    ;; being retired in favour of load scripts on generic images, and the gate
+    ;; left bare i386 as the one port where r19-handler hit an int3.  The block
+    ;; they use moves with the mode (i386-set-handler-block).
+    (i386-set-handler-block)
+    (setf *i386-handler-push-label* (i386-make-label))
+    (setf *i386-handler-pop-label* (i386-make-label))
     ;; Translate each function
     (loop for i from 0 below n-functions
           for entry in function-table

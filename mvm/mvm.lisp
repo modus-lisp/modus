@@ -135,7 +135,7 @@
    #:target-page-size #:target-translate-fn #:target-emit-prologue
    #:target-emit-epilogue #:target-emit-boot #:target-features
    #:*target-x86-64* #:*target-riscv64* #:*target-aarch64*
-   #:*target-ppc64* #:*target-i386* #:*target-68k*
+   #:*target-ppc64* #:*target-i386* #:*target-68k* #:*target-riscv32*
    #:register-target #:find-target #:list-targets
    #:target-vreg-to-phys #:target-vreg-spills-p #:target-spill-offset
    ;; Compiler (from compiler.lisp)

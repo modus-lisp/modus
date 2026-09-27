@@ -192,7 +192,8 @@ DEPS = {
                       "trivial-garbage"],
  "iterate": [],
  "cl-ppcre": [],
- "md5": [],                             # declares flexi-streams on non-SBCL (MISSING)
+ "md5": ["flexi-streams"],              # md5.asd: flexi-streams on non-cmu/sbcl/lw/ccl/allegro
+ "flexi-streams": ["trivial-gray-streams"],
  "sha1": [],
  "cl-base64": [],
  "parse-float": ["alexandria"],

@@ -4589,13 +4589,21 @@
     (let ((actual-end (if end end (length seq)))
           (i start)
           (s (%resolve-output-stream stream)))
+      ;; Dispatch on the ELEMENT, not on STRINGP: a fill-pointer / adjustable
+      ;; string is a character vector but not STRINGP here, and it went down
+      ;; the byte path -- %FS-WRITE-BYTE on a string-output stream, a file
+      ;; primitive writing into a stream that is not a file.  Nothing reached
+      ;; the output (WRITE-SEQUENCE.FILL-VECTOR.7 read back "") and the stray
+      ;; write intermittently broke the NEXT test in the same process
+      ;; (WRITE-SEQUENCE.BV.1: "end of file" in some gate runs, not others).
       (loop
         (when (>= i actual-end) (return seq))
-        (if (stringp seq)
-            (%write-char-to-stream (%ensure-char-code (aref seq i)) s)
-            (if (streamp s)
-                (%fs-write-byte (aref seq i) s)
-                (write-char-serial (aref seq i))))
+        (let ((e (aref seq i)))
+          (if (or (stringp seq) (characterp e))
+              (%write-char-to-stream (%ensure-char-code e) s)
+              (if (streamp s)
+                  (%fs-write-byte e s)
+                  (write-char-serial e))))
         (setq i (+ i 1)))))
   seq)
 

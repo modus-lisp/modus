@@ -319,19 +319,26 @@
 ;;; that no reader-conditional can ever select a Genera branch whose
 ;;; support has not been installed yet.
 ;;;
-;;; :64-BIT is not a Genera claim — it is simply true of this runtime — but
-;;; it is included here because it only becomes load-bearing once :GENERA
+;;; :64-BIT / :32-BIT is not a Genera claim — it is the machine word size —
+;;; but it is installed here because it only becomes load-bearing once :GENERA
 ;;; is on: bordeaux-threads'
 ;;;     (deftype %atomic-integer-value () #+32-bit … #+64-bit …)
 ;;; is only ever reached down a recognised-implementation path, and with
 ;;; neither feature present the deftype body is empty, which makes the type
 ;;; NIL and every CHECK-TYPE against it fail.
+;;;
+;;; It used to push :64-BIT unconditionally ("simply true of this runtime"),
+;;; so the 30-bit tower (i386, RV32, ppc32, arm32, 68k) claimed :64-BIT and
+;;; bordeaux-threads chose its 64-bit atomic integer type there.  The word
+;;; size is read off MOST-POSITIVE-FIXNUM: 2^62-1 on the 64-bit ports,
+;;; 2^30-1 on the 32-bit ones.
 ;;; =====================================================================
 
 (defun %genera-install-features ()
   (when (boundp '*features*)
-    (unless (member :64-bit *features*)
-      (setq *features* (cons :64-bit *features*)))
+    (let ((word (if (> most-positive-fixnum #xFFFFFFFF) :64-bit :32-bit)))
+      (unless (or (member :64-bit *features*) (member :32-bit *features*))
+        (setq *features* (cons word *features*))))
     (unless (member :genera *features*)
       (setq *features* (cons :genera *features*)))))
 

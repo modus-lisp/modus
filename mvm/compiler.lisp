@@ -5891,6 +5891,23 @@
       (if (= (bq-comma-kind x) 2) 'comma-at 'comma)
       (car x)))
 
+(defun %defstruct-kw-ctor-defun (ctor-sym slot-names slot-defaults internal-ctor-sym)
+  "A DEFUN form for a KEYWORD constructor: (&key ((:slot g) default) …) calling
+   the internal positional constructor.  Keyword constructors are registered as
+   MACROS (fast direct calls), but a macro is not a function: #'%MAKE-URI,
+   (apply #'make-foo args) and (mapcar #'make-foo …) found nothing -- quri's
+   MAKE-BASIC-URI and every MAKE-URI-* died UNDEFINED-FUNCTION at definition.
+   Emitted for runtime compiles only, alongside the macro; direct calls still
+   expand.  Gensym variables, so a slot name can never collide with a special
+   or a constant."
+  (let ((vars (mapcar (lambda (s) (declare (ignore s)) (%mvm-gensym "SLOT")) slot-names)))
+    (list 'defun ctor-sym
+          (cons '&key
+                (mapcar (lambda (s v d)
+                          (list (list (intern (symbol-name s) :keyword) v) d))
+                        slot-names vars slot-defaults))
+          (cons internal-ctor-sym vars))))
+
 (defun expand-backquote (template &optional (level 1))
   "Expand a backquote template into explicit list-building code.
    Handles ,x (unquote) and ,@x (splice).  LEVEL counts the open
@@ -5941,6 +5958,27 @@
                       (push (cons :list (nreverse current)) segments)
                       (setf current nil))
                     (push (cons :splice (bq-comma-expr elt)) segments))
+                   ;; ,,@E / ,,.E at level 2 -- the outer comma is live THIS
+                   ;; pass: evaluate E now and splice each element wrapped in
+                   ;; its own COMMA marker, so the inner backquote unquotes each
+                   ;; one.  lib/runtime-backquote.lisp's %RBQ-SPLICE-COMMAS case,
+                   ;; which this lowering left out: alexandria's ONCE-ONLY is
+                   ;; `(let (,,@(mapcar …)) …), and without it the whole list
+                   ;; became ONE (COMMA (…)) binding -- ENSURE-GETHASH, and
+                   ;; everything built on it, died UNDEFINED-FUNCTION NIL.
+                   ((and (= level 2) (bq-comma-p elt)
+                         (let ((inner (bq-comma-expr elt)))
+                           (and (bq-comma-p inner) (= (bq-comma-kind inner) 2))))
+                    (when current
+                      (push (cons :list (nreverse current)) segments)
+                      (setf current nil))
+                    (push (cons :splice
+                                (list 'mapcar
+                                      (list 'function
+                                            (list 'lambda '(%bq-e)
+                                                  (list 'list (list 'quote 'comma) '%bq-e)))
+                                      (bq-comma-expr (bq-comma-expr elt))))
+                          segments))
                    ;; ,x — unquote at level 1, rebuilt as data deeper;
                    ;; nested backquote; nested list: all via EXPAND-BACKQUOTE.
                    ;; (An SBCL comma is a STRUCT, not a cons — test it first.)
@@ -9756,7 +9794,10 @@
          ((or (and (symbolp op) (string= (symbol-name op) "LET"))
               (and (integerp op) (= op 536263002))  ; LET
               (and (symbolp op) (string= (symbol-name op) "LET*"))
-              (and (integerp op) (= op 431241200)))  ; LET*
+              (and (integerp op) (= op 431241200))  ; LET*
+              ;; PROG / PROG* bind exactly like LET / LET* (special forms here)
+              (and (symbolp op) (string= (symbol-name op) "PROG"))
+              (and (symbolp op) (string= (symbol-name op) "PROG*")))
           (let* ((bindings (cadr form))
                  (body (cddr form))
                  ;; Variables bound by this let shadow outer boxed vars
@@ -9773,6 +9814,21 @@
                  (new-body (mapcar (lambda (f) (cell-rewrite-form f inner-boxed lambda-params))
                                    body)))
             `(,op ,new-bindings ,@new-body)))
+         ;; THE OTHER BINDING SPECIAL FORMS.  In Modus these are compiler
+         ;; special forms, not macros, so this pass (which runs before
+         ;; macroexpansion) sees them unexpanded -- and the general case below
+         ;; rewrote EVERY occurrence of a boxed name, including the ones these
+         ;; forms rebind.  quri's PARSE-URI-STRING boxes its &key END (a
+         ;; closure reads it) and rebinds END with MULTIPLE-VALUE-BIND; the
+         ;; inner reads became reads of the parameter's box (NIL), and every
+         ;; URL parse died TYPE-ERROR.  See %CELL-REWRITE-BINDING-FORM.
+         ((and (symbolp op)
+               (member (symbol-name op)
+                       '("MULTIPLE-VALUE-BIND" "HANDLER-CASE" "WITH-OPEN-FILE"
+                         "WITH-OUTPUT-TO-STRING" "WITH-INPUT-FROM-STRING"
+                         "SYMBOL-MACROLET" "LOOP")
+                       :test #'string=))
+          (%cell-rewrite-binding-form form boxed-vars lambda-params))
          ;; General case: rewrite all subforms.  IMPROPER-LIST SAFE: loop
          ;; destructuring patterns (`:for (o . a) :in …`), macro lambda
          ;; lists, etc. appear as DOTTED subforms of not-yet-expanded macro
@@ -9829,6 +9885,81 @@
             (let ((res cur))
               (dolist (x acc) (setq res (cons x res)))
               (cons head res)))))))))
+
+(defun %cr-minus (boxed names)
+  (remove-if (lambda (v) (member v names :test #'name-equal)) boxed))
+
+(defun %cr-list (forms boxed lp)
+  "CELL-REWRITE-FORM over a (possibly dotted) list of forms."
+  (let ((acc nil) (cur forms))
+    (loop (when (not (consp cur)) (return nil))
+      (setq acc (cons (cell-rewrite-form (car cur) boxed lp) acc))
+      (setq cur (cdr cur)))
+    (let ((res cur)) (dolist (x acc) (setq res (cons x res))) res)))
+
+(defun %cr-names (tree)
+  "Every variable symbol in a binding list / destructuring pattern / lambda
+   list (lambda-list keywords excluded)."
+  (cond ((null tree) nil)
+        ((symbolp tree)
+         (let ((n (symbol-name tree)))
+           (if (and (plusp (length n)) (char= (char n 0) #\&)) nil (list tree))))
+        ((consp tree) (append (%cr-names (car tree)) (%cr-names (cdr tree))))
+        (t nil)))
+
+(defun %cr-loop-names (clauses)
+  "Variables a LOOP binds: the pattern after FOR / AS / WITH, and INTO targets."
+  (let ((names nil) (cur clauses))
+    (loop (when (not (consp cur)) (return names))
+      (let ((x (car cur)))
+        (when (and (symbolp x) (consp (cdr cur))
+                   (member (symbol-name x) '("FOR" "AS" "WITH" "INTO") :test #'string=))
+          (setq names (append (%cr-names (cadr cur)) names))))
+      (setq cur (cdr cur)))))
+
+(defun %cell-rewrite-binding-form (form boxed lp)
+  "CELL-REWRITE-FORM for the binding special forms: the names a form binds
+   shadow the boxed set in the scope where they are bound, and only there."
+  (let ((n (symbol-name (car form))))
+    (cond
+      ;; (multiple-value-bind vars values-form . body)
+      ((string= n "MULTIPLE-VALUE-BIND")
+       (list* (car form) (cadr form)
+              (cell-rewrite-form (caddr form) boxed lp)
+              (%cr-list (cdddr form) (%cr-minus boxed (%cr-names (cadr form))) lp)))
+      ;; (with-… (var . args) . body)
+      ((or (string= n "WITH-OPEN-FILE") (string= n "WITH-OUTPUT-TO-STRING")
+           (string= n "WITH-INPUT-FROM-STRING"))
+       (let ((spec (cadr form)))
+         (if (and (consp spec) (symbolp (car spec)))
+             (list* (car form)
+                    (cons (car spec) (%cr-list (cdr spec) boxed lp))
+                    (%cr-list (cddr form) (%cr-minus boxed (list (car spec))) lp))
+             (cons (car form) (%cr-list (cdr form) boxed lp)))))
+      ;; (symbol-macrolet ((name expansion) …) . body)
+      ((string= n "SYMBOL-MACROLET")
+       (list* (car form)
+              (mapcar (lambda (b) (if (consp b) (list (car b) (cell-rewrite-form (cadr b) boxed lp)) b))
+                      (cadr form))
+              (%cr-list (cddr form)
+                        (%cr-minus boxed (mapcar (lambda (b) (if (consp b) (car b) b)) (cadr form)))
+                        lp)))
+      ;; (handler-case form (type (var) . body) …)
+      ((string= n "HANDLER-CASE")
+       (list* (car form)
+              (cell-rewrite-form (cadr form) boxed lp)
+              (mapcar (lambda (cl)
+                        (if (and (consp cl) (consp (cdr cl)) (listp (cadr cl)))
+                            (list* (car cl) (cadr cl)
+                                   (%cr-list (cddr cl) (%cr-minus boxed (%cr-names (cadr cl))) lp))
+                            cl))
+                      (cddr form))))
+      ;; LOOP: conservative -- a name the loop binds is shadowed across the
+      ;; whole loop (an init form reading an outer var of the same name is the
+      ;; one shape this gets wrong, and it is far rarer than the shape it fixes).
+      ((string= n "LOOP")
+       (cons (car form) (%cr-list (cdr form) (%cr-minus boxed (%cr-loop-names (cdr form))) lp)))
+      (t (cons (car form) (%cr-list (cdr form) boxed lp))))))
 
 (defun %tree-mentions-any-p (tree names)
   "True if any symbol in NAMES (by NAME-EQUAL) occurs anywhere in TREE."
@@ -24419,6 +24550,9 @@
             (conc-name-specified nil)
             (conc-name nil)  ; nil = no prefix, string = prefix
             (include-parent nil)
+            ;; The slot-descriptions after the parent in (:INCLUDE parent …):
+            ;; per-slot DEFAULT overrides for inherited slots (CLHS 3.4.6).
+            (include-overrides nil)
             ;; Named constructors from (:CONSTRUCTOR NAME [arg-spec]).
             ;; Each entry: (name . arg-spec) where arg-spec is
             ;; :default (use struct slot order), NIL (0-arg ctor), or
@@ -24474,7 +24608,8 @@
                                           (symbol-name cn)))
                                     nil)))  ; (:conc-name nil) → no prefix
                ((name-eq opt-name "INCLUDE")
-                (setf include-parent (cadr opt)))
+                (setf include-parent (cadr opt))
+                (setf include-overrides (cddr opt)))
                ((name-eq opt-name "CONSTRUCTOR")
                 (let ((ctor-sym (cadr opt))
                       (arg-spec (if (cddr opt) (caddr opt) :default)))
@@ -24528,7 +24663,23 @@
             (parent-slots (when include-parent
                             (%defstruct-eff-slots-get (%rt-fn-name include-parent))))
             (parent-slot-names (mapcar #'car parent-slots))
-            (parent-slot-defaults (mapcar #'cdr parent-slots))
+            ;; ...with the :INCLUDE option's own slot-descriptions applied: in
+            ;; (:include uri (scheme :urn)) the inherited SCHEME defaults to
+            ;; :URN, not to URI's default.  These were never read, so every
+            ;; quri subtype (urn, uri-http, uri-ftp …) got the parent's NIL
+            ;; scheme and port.  A bare slot name means no initform.
+            (parent-slot-defaults
+              (mapcar (lambda (ps)
+                        (let ((ov (find-if (lambda (o)
+                                             (let ((n (if (consp o) (car o) o)))
+                                               (and (symbolp n)
+                                                    (string= (symbol-name n)
+                                                             (symbol-name (car ps))))))
+                                           include-overrides)))
+                          (cond ((null ov) (cdr ps))
+                                ((consp ov) (cadr ov))
+                                (t nil))))
+                      parent-slots))
             ;; CLHS 3.4.6 slot option :READ-ONLY — parsed per OWN slot and
             ;; inherited for the parent's slots.  Previously accepted and
             ;; silently discarded, so a write SBCL refuses succeeded here.
@@ -24640,7 +24791,14 @@
              ;; Only when no (:CONSTRUCTOR …) option replaced it — see
              ;; DEFAULT-CTOR-SUPPRESSED above.
              (unless default-ctor-suppressed
-               (mvm-define-macro ctor-name %ctor-expander))
+               (mvm-define-macro ctor-name %ctor-expander)
+               ;; ...AND A FUNCTION (runtime compiles): see
+               ;; %DEFSTRUCT-KW-CTOR-DEFUN.
+               (when *mvm-eval-runtime-p*
+                 (push (%defstruct-kw-ctor-defun (%defstruct-intern ctor-name)
+                                                 slot-names slot-defaults
+                                                 internal-ctor-sym)
+                       forms-to-compile)))
              ;; mvm-eval (in-image runtime compile) PERSISTENCE: *macro-table* is
              ;; rebound PER mvm-eval CALL, so without a runtime registration a
              ;; LATER (eval '(make-NAME …)) compiled the ctor as an undefined
@@ -24704,6 +24862,12 @@
                                       (setf cargs (cddr cargs)))
                              `(,ics ,@positional)))))
                   (mvm-define-macro ctor-fn-name expander)
+                  ;; A callable function too (runtime compiles) -- quri's
+                  ;; (apply #'%make-uri args); see %DEFSTRUCT-KW-CTOR-DEFUN.
+                  (when *mvm-eval-runtime-p*
+                    (push (%defstruct-kw-ctor-defun ctor-sym slot-names
+                                                    slot-defaults ics)
+                          forms-to-compile))
                   ;; CTOR-SYM, not (%DEFSTRUCT-INTERN CTOR-FN-NAME): the
                   ;; user WROTE the constructor name as a symbol, so it must
                   ;; be defined in ITS package.  Re-interning the bare string

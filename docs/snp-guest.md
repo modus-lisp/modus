@@ -35,10 +35,12 @@ Hence two routes, both kept open:
 `mvm/build-fixpoint.lisp` (the multi-arch Gen0, task #252) **runs the whole
 chain again as of 2026-09-27**: `scripts/run-fixpoint.sh` takes SBCL → Gen0
 (x64) → Gen1 (aarch64, 60,067,696 bytes) → Gen2 (x64, 49,283,136 bytes) →
-Gen3 (aarch64) and `sha256(Gen1) == sha256(Gen3)` (fbd4e2f9…).  Gen1 and
+Gen3 (aarch64) and `sha256(Gen1) == sha256(Gen3)` (22e8f227… on 9d0790c; the
+first passing run, before the collector's leaf-skip fixes, hashed fbd4e2f9…).  Gen1 and
 Gen2 each run with a live native collector (Gen1: 50 collections over hop 2).
 The chain had been broken since April; the twelve defects and their fixes are
-in commit 5f0df2c's message.  What it proves is translator determinism on bare
+in commit 5f0df2c's message, plus the two collector defects 9d0790c fixes
+(found by `test/run-uefi-ddc.sh`, not by the ANSI gate).  What it proves is translator determinism on bare
 metal — the bytecode is compiled once by SBCL — which is the complement of the
 source-level DDC below, not a substitute for it.  It is a different artifact
 from the payload; the DDC'd payload is `--compile-uefi`'s output above.

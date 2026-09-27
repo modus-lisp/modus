@@ -2775,6 +2775,133 @@
         ;; ANSI suite the trig case keeps k ≤ 47.  Guard anyway.
         (setq q (bignum-add q (if (>= k +limb-bits+) (bignum-mul (ash 1 +limb-split-bits+) (ash 1 (- k +limb-split-bits+))) (ash 1 k))))))))
 
+;;; --- Long division on half-limb digits (Knuth, TAOCP vol. 2, 4.3.1, Algorithm D) ---
+;;;
+;;; %BIGNUM-TRUNC-DOUBLING is O(bits) full-width bignum operations per quotient
+;;; BIT, and every one of them allocates: (truncate (ash 1 2048) (expt 10 10))
+;;; took 34 s, and com.inuoe.jzon's load-time power-of-ten table (348 of those
+;;; divisions) would have taken hours.  This is the textbook algorithm instead:
+;;; one pass per quotient DIGIT, in the same 31-bit half-limb digits
+;;; %MUL-LIMBS-MAG multiplies in, so that every intermediate below fits a
+;;; fixnum.  With B = 2^+half-limb-bits+ and digits in [0, B):
+;;;
+;;;   U[j+n]*B + U[j+n-1]          <= B^2 - 1          (the 2-digit trial numerator)
+;;;   QHAT * V[i] + CARRY          <= (B-1)^2 + (B-1)  (multiply-subtract, QHAT < B)
+;;;   RHAT*B + U[j+n-2]            <= B^2 - 1          (only formed while RHAT < B)
+;;;
+;;; B^2 - 1 is +fixnum-max+ on the 62-bit tower, and the same bound holds on
+;;; any tower since the digits are half a limb.  Limb arithmetic uses the raw
+;;; %FIXNUM-+ / %FIXNUM-- and constant-count ASH only, for the reasons spelled
+;;; out at %SUB-LIMBS-MAG: plain + and - promote on overflow and would re-enter
+;;; generic arithmetic from inside it.
+;;;
+;;; Normalisation multiplies both operands by D = floor(B / (V[n-1] + 1)), as in
+;;; Knuth's original D1, rather than shifting: the quotient is unchanged, it
+;;; needs no variable-count shift, and only the quotient is returned (the
+;;; remainder is formed by %TRUNCATE2-GENERIC as a - q*b).
+
+(defun %trim-halves (digits)
+  "DIGITS (LSB-first) without its high-order zero digits; NIL for zero."
+  (let ((cur (reverse digits)))
+    (loop (when (or (null cur) (not (= (car cur) 0)))
+            (return (nreverse cur)))
+      (setq cur (cdr cur)))))
+
+(defun %scale-halves-into (digits d out)
+  "Store DIGITS * D into OUT[0 .. (length DIGITS) - 1], digit by digit, and
+   return the carry out of the top digit.  D is at most B/2."
+  (let ((carry 0) (i 0) (cur digits))
+    (loop (when (null cur) (return carry))
+      (let ((p (%fixnum-+ (* (car cur) d) carry)))
+        (aset out i (logand p +half-limb-mask+))
+        (setq carry (ash p +neg-half-limb-bits+)))
+      (setq i (+ i 1))
+      (setq cur (cdr cur)))))
+
+(defun %bignum-divide-knuth (na nb)
+  "Return floor(NA/NB) for non-negative integers NA and NB > 0 (fixnum or
+   bignum), by Algorithm D on half-limb digits."
+  (let* ((u0 (%trim-halves (%limbs-to-halves (cdr (%any-to-limbs na)))))
+         (v0 (%trim-halves (%limbs-to-halves (cdr (%any-to-limbs nb)))))
+         (n (length v0))
+         (m (- (length u0) n))
+         (base (%fixnum-+ +half-limb-mask+ 1)))
+    (cond
+      ((< m 0) 0)                               ; NA < NB
+      ((= n 1)
+       ;; One-digit divisor: short division, MSB first.  R*B + U[i] < V*B <= B^2.
+       (let* ((v (car v0)) (r 0) (acc nil) (cur (reverse u0)))
+         (loop (when (null cur) (return nil))
+           (let* ((num (%fixnum-+ (ash r +half-limb-bits+) (car cur)))
+                  (qd (truncate num v)))
+             (setq r (%fixnum-- num (* qd v)))
+             (setq acc (cons qd acc)))
+           (setq cur (cdr cur)))
+         ;; ACC was consed MSB first, so it is LSB-first now.
+         (%make-bb 1 (%halves-to-limbs acc))))
+      (t
+       (let* ((d (truncate base (%fixnum-+ (nth (- n 1) v0) 1)))
+              (u (make-array (+ m n 1)))
+              (v (make-array n))
+              (q (make-array (+ m 1))))
+         ;; D1: normalise.  V*D fits in n digits (its top digit is now >= B/2);
+         ;; U*D may need one more.
+         (aset u (+ m n) (%scale-halves-into u0 d u))
+         (%scale-halves-into v0 d v)
+         (let ((vtop (aref v (- n 1)))
+               (vnext (aref v (- n 2)))
+               (j m))
+           (loop (when (< j 0) (return nil))
+             ;; D3: estimate QHAT from the top two digits, then correct it
+             ;; (at most twice) against the third.
+             (let* ((num (%fixnum-+ (ash (aref u (+ j n)) +half-limb-bits+)
+                                    (aref u (+ j n -1))))
+                    (qhat (truncate num vtop))
+                    (rhat (%fixnum-- num (* qhat vtop))))
+               (loop
+                 (when (not (or (>= qhat base)
+                                (> (* qhat vnext)
+                                   (%fixnum-+ (ash rhat +half-limb-bits+)
+                                              (aref u (+ j n -2))))))
+                   (return nil))
+                 (setq qhat (%fixnum-- qhat 1))
+                 (setq rhat (%fixnum-+ rhat vtop))
+                 (when (>= rhat base) (return nil)))
+               ;; D4: U[j .. j+n] -= QHAT * V.
+               (let ((carry 0) (borrow 0) (i 0))
+                 (loop (when (>= i n) (return nil))
+                   (let* ((p (%fixnum-+ (* qhat (aref v i)) carry))
+                          (tt (%fixnum-- (%fixnum-- (aref u (+ i j))
+                                                    (logand p +half-limb-mask+))
+                                         borrow)))
+                     (setq carry (ash p +neg-half-limb-bits+))
+                     (if (< tt 0)
+                         (progn (aset u (+ i j) (%fixnum-+ tt base)) (setq borrow 1))
+                         (progn (aset u (+ i j) tt) (setq borrow 0))))
+                   (setq i (+ i 1)))
+                 (let ((tt (%fixnum-- (%fixnum-- (aref u (+ j n)) carry) borrow)))
+                   (if (>= tt 0)
+                       (aset u (+ j n) tt)
+                       ;; D6: QHAT was one too large (probability ~2/B): add V
+                       ;; back.  The digit above the window is dropped; it is
+                       ;; never read again.
+                       (let ((c 0) (k 0))
+                         (setq qhat (%fixnum-- qhat 1))
+                         (loop (when (>= k n) (return nil))
+                           (let ((s (%fixnum-+ (%fixnum-+ (aref u (+ k j)) (aref v k)) c)))
+                             (aset u (+ k j) (logand s +half-limb-mask+))
+                             (setq c (ash s +neg-half-limb-bits+)))
+                           (setq k (+ k 1)))
+                         (aset u (+ j n) 0)))))
+               (aset q j qhat))
+             (setq j (- j 1))))
+         ;; Q is LSB-first digits; pack pairs into limbs.
+         (let ((acc nil) (i m))
+           (loop (when (< i 0) (return nil))
+             (setq acc (cons (aref q i) acc))
+             (setq i (- i 1)))
+           (%make-bb 1 (%halves-to-limbs acc))))))))
+
 (defun %integer-truncate (a b)
   "Bignum-aware integer truncate.  Returns the quotient only;
    %truncate2-generic computes the remainder separately.
@@ -2784,7 +2911,7 @@
    3. bignum / pos-fixnum-≤-2^31 → %bignum-divmod-fixnum (fast).
    4. bignum / neg-fixnum-≤-2^31 → negate-then-divmod, flip sign.
    5. bignum / larger-fixnum or bignum / bignum →
-      %bignum-trunc-doubling (slow but correct).
+      %bignum-divide-knuth (long division on half-limb digits).
 
    Note: bignum-truncate in cl-eval.lisp relies on (logbitp i bignum),
    but compile-logand emits a raw IR :and that mishandles bignum
@@ -2793,8 +2920,8 @@
    bignum input.  %bignum-divmod-fixnum (originally written for base-N
    printer) uses only safe fixnum-on-fixnum limb-level arithmetic, so
    we route the fast bignum/small-fixnum case through it.  The general
-   bignum/anything case uses doubling-subtract, which only depends on
-   bignum-mul / bignum-add / bignum-sub / bignum-cmp."
+   case is %bignum-divide-knuth, which likewise works digit by digit in
+   fixnums and never touches a bignum's bits directly."
   (when (= b 0) (error "divide by zero"))
   (when (and (not (bignump a)) (not (bignump b)))
     (return-from %integer-truncate (truncate a b)))
@@ -2812,8 +2939,9 @@
               ;; Fast path: divisor magnitude fits in (2^31 - 1).
               ((and (not (bignump b-mag)) (< b-mag 2147483648))
                (car (%bignum-divmod-fixnum na b-mag)))
-              ;; General path: doubling-subtract.
-              (t (%bignum-trunc-doubling na b-mag)))))
+              ;; General path: long division (Algorithm D).  The doubling-
+              ;; subtract it replaced took 34 s for a 2048-bit dividend.
+              (t (%bignum-divide-knuth na b-mag)))))
       (if (eq a-neg b-neg) mag (bignum-negate mag)))))
 
 (defun %truncate2-generic (a b)

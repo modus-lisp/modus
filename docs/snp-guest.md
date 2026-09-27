@@ -45,6 +45,20 @@ metal — the bytecode is compiled once by SBCL — which is the complement of t
 source-level DDC below, not a substitute for it.  It is a different artifact
 from the payload; the DDC'd payload is `--compile-uefi`'s output above.
 
+**Result, 2026-09-27 (tree 460d22f, after the #252 collector fixes): all three
+image modes are DDC'd, each byte-identical from SBCL and from modus-sh built
+under SBCL, CCL and ABCL, and identical run to run:**
+
+| `MODUS_UEFI_SNP` | image | md5 |
+|---|---|---|
+| 0 (plain UEFI) | 35,951,616 B | `8a04528c8c708244d6603c2198deb206` |
+| 1 (SNP: C-bit tables, #VC handler, GHCB page) | 35,951,616 B | `eda7f5222c0173e418125234f64484d7` |
+| test (fake-#VC self-test) | 35,951,616 B | `e511c6efa52fbec20db8e48c74d413a1` (SBCL host) |
+
+The SNP-mode hash is the one an attestation report's measurement should be
+checked against.  (The earlier 76ec6cfb was the plain image before those
+collector fixes changed the emitted GC trampoline.)
+
 ## Making the bare image DDC'd: `modus-sh --compile-uefi`
 
 `mvm/build-modus-selfhost.lisp` now bakes `boot/boot-uefi-snp.lisp`,

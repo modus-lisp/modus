@@ -866,6 +866,14 @@
   ;; aarch64 back-end so production mvm-eval JITs native via the Stage-5 seam.
   ;; Inert no-op when JIT-off.  Wrapped so a JIT-init fault can never take down
   ;; a normal boot (belt-and-suspenders; the seam already guards translate).
+  ;; AND the defvar/defparameter init thunks must have run before the
+  ;; translator co-init reads its tables: without (init-all-globals) they are
+  ;; UNBOUND (Active Limitation #7), and the co-init's first read of one
+  ;; faulted at boot on Linux/aarch64 -- d64c140's reordering alone did not
+  ;; fix it; this call does (verified on OrbStack / Apple container).  Guarded
+  ;; exactly as the CLI's kernel-main guards it, since a thunk may reference
+  ;; something not yet available in this image.
+  (handler-case (init-all-globals) (t (c) nil))
   ;; MUST run BEFORE %init-clos-protocol: that is the image's first in-image
   ;; EVAL (%make-gf-stub DEFUNs each protocol GF), and with the JIT-on flip
   ;; source baked, the seam JITs it -- through a translator whose co-init

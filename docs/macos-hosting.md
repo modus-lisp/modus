@@ -341,8 +341,9 @@ before jumping in — the hosted `head.S` — plus M0's trap mode and the
 constant/struct differences.  Done when `modus --eval '(+ 1 2)'` and
 `modus --load script.lisp` run natively on this Mac.
 
-**M3 — JIT on macOS.**  `MAP_JIT` arena (unfixed) with
-`pthread_jit_write_protect_np` around writes; saved images relocate.
+**M3 — JIT on macOS: DONE (2026-09-27).**  Build the Darwin image WITHOUT
+`MODUS_NO_JIT`.  See *The JIT on macOS* below.  (Planned as "unfixed arena,
+saved images relocate"; neither turned out to be needed.)
 
 **M4 — sockets natively.**  The glass RFB server serving from a native
 macOS modus.
@@ -418,8 +419,41 @@ macOS passes a far larger environment), with identical pass counts;
   Linux twin printed `PORT -1`); fixed in its own commit, and the same test
   now passes on Linux too.
 
-**Not yet:** fork/wait, native threads (hosted aarch64 has none on Linux
-either), and the JIT (M3: `MAP_JIT` + `pthread_jit_write_protect_np`).
+**Not yet:** fork/wait, and native threads (hosted aarch64 has none on Linux
+either).
+
+## The JIT on macOS (M3)
+
+- **The arena stays fixed.**  `MAP_JIT` with `MAP_FIXED` is refused, but
+  macOS honours a `MAP_JIT` address *hint* (probed), so the boot stub's arena
+  request — any exec `mmap` — becomes `MAP_JIT` at the hint, and
+  `MAP_FIXED_NOREPLACE` is still emulated.  JIT pages keep their addresses,
+  so save-and-die carries them exactly as on Linux.
+- **Write/exec is flipped by faults.**  A thread sees `MAP_JIT` memory
+  writable OR executable (`pthread_jit_write_protect_np`).  The image writes
+  JIT code with ordinary stores and then calls it, as on Linux; the shim owns
+  SIGSEGV/SIGBUS and, for a fault inside a JIT region, flips the mode and
+  returns so the instruction retries — a fetch in write mode (pc == fault
+  address) flips to exec, a store in exec mode flips to write.  Probed with
+  1000 alternating rounds.  Other faults chain to the handler the image
+  registered (handler-case recovery), else the fault report.  JIT code that
+  writes JIT memory would ping-pong; the shim stops it loudly after 8 flips at
+  one pc.  The handler runs `SA_NODEFER` because a chained image handler
+  never returns.
+- **The GC bitmaps leave the arena on Darwin** (`gc.lisp`
+  `%gc-bitmap-map`, `(%layout :darwin 0)`): written on every allocation,
+  they would flip the mode twice per allocation.  They are plain RW `mmap`s
+  there; everywhere else they still come from the exec-page primitive.
+- **`read(2)` into the arena bounces through ordinary memory**: the kernel's
+  copy-out fails with EFAULT on `MAP_JIT` pages even in write mode, and no
+  fault reaches the handler.  Core restore reads JIT pages that way.
+
+Verified natively: `(jit-eager)` translates 121 runtime functions (37 fail —
+the same count as Linux), `(jit-eager '(fib 24))` runs native, 6.7 MB of JIT
+code in the arena; a core saved after `jit-eager` restores with its JIT pages
+and keeps running them; smoke/stress/GC/fault/RFB all pass on the JIT build.
+(Runtime DEFUNs start as interpreter trampolines and the JIT is hot-gated;
+`jit-eager` is how to exercise it — the same on Linux.)
 
 ## Open questions
 

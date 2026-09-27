@@ -43,7 +43,11 @@
   (let ((v (sb-ext:posix-getenv "MODUS_DARWIN")))
     (and v (plusp (length v)) (string/= v "0"))))
 
-(when *layout-darwin* (setq *layout-no-x18* t))   ; Darwin zeroes x18
+(when *layout-darwin*
+  (setq *layout-no-x18* t)                          ; Darwin zeroes x18
+  ;; runtime source asks (%layout :darwin 0) where Darwin needs a different
+  ;; shape (gc.lisp's bitmaps: RW data, not the MAP_JIT arena).
+  (setq *layout-plist* (list* :darwin 1 *layout-plist*)))
 
 (defun layout-darwin-syscall-slot ()
   "The fixed VA of the word holding the shim's syscall-stub address: one

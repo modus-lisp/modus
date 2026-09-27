@@ -630,8 +630,19 @@
    native alloc-site bit-set would write through a garbage base).  Non-allocating
    (mmap result + config addresses are fixnums)."
   (setf (mem-ref #x10000E00 :u64) (%gc-from-start))
-  (setf (mem-ref #x10000E18 :u64) (%mmap-exec-page #x800000))
-  (setf (mem-ref #x10000E40 :u64) (%mmap-exec-page #x800000)))
+  (setf (mem-ref #x10000E18 :u64) (%gc-bitmap-map #x800000))
+  (setf (mem-ref #x10000E40 :u64) (%gc-bitmap-map #x800000)))
+
+(defun %gc-bitmap-map (size)
+  "SIZE bytes of zeroed memory for a GC bitmap.  Data, written on every
+   allocation.  Everywhere but Darwin it comes from the exec-page primitive
+   (inside the JIT arena, as it always has).  On Darwin the arena is MAP_JIT:
+   a thread sees it writable OR executable, never both, and the host shim
+   flips the mode on each fault — so a bitmap there would flip twice per
+   allocation.  A plain RW mapping instead (mmap, x86-64 number 9)."
+  (if (= (%layout :darwin 0) 0)
+      (%mmap-exec-page size)
+      (syscall6 9 0 size 3 #x22 -1 0)))
 
 (defun %gc-bit-mask (bit)
   "1 << BIT for BIT in 0..7, as a CONSTANT-ONLY dispatch.

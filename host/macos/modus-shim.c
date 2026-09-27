@@ -28,6 +28,7 @@
 #include <mach/mach_vm.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <pthread.h>
 #include <sched.h>
 #include <sys/socket.h>
 #include <signal.h>
@@ -143,14 +144,34 @@ static void to_lx_stat(const struct stat *s, struct lx_stat *l) {
     l->ctime = s->st_ctimespec.tv_sec; l->ctime_ns = s->st_ctimespec.tv_nsec;
 }
 
+// JIT regions: MAP_JIT memory is writable OR executable per thread, never
+// both (pthread_jit_write_protect_np).  The image writes code and then runs
+// it exactly as on Linux; the fault handler below flips the mode.
+#define MAXJIT 64
+static struct { uint64_t lo, hi; } jit_regions[MAXJIT];
+static int n_jit;
+static int in_jit(uint64_t a) {
+    for (int i = 0; i < n_jit; i++) if (a >= jit_regions[i].lo && a < jit_regions[i].hi) return 1;
+    return 0;
+}
+
 static long dx_mmap(long addr, long len, long prot, long flags, long fd, long off) {
     int f = (int)(flags & 3);                      // SHARED/PRIVATE agree
     if (flags & 0x20) f |= MAP_ANON;
     int noreplace = (flags & 0x100000) != 0;       // MAP_FIXED_NOREPLACE
-    if ((flags & 0x10) && !noreplace) f |= MAP_FIXED;
-    // RWX without MAP_JIT is refused on macOS; so is MAP_JIT at a fixed
-    // address.  The image degrades exactly as when Linux refuses the arena.
+    int jit = (prot & PROT_EXEC) && (flags & 0x20);
+    // macOS refuses RWX anonymous memory without MAP_JIT, and MAP_JIT with
+    // MAP_FIXED; it does honour MAP_JIT's address HINT (probed), which keeps
+    // the JIT arena at its fixed address for save-and-die.
+    if (jit) f |= MAP_JIT;
+    else if ((flags & 0x10) && !noreplace) f |= MAP_FIXED;
     void *p = mmap((void *)addr, (size_t)len, (int)prot, f, (int)fd, (off_t)off);
+    if (p != MAP_FAILED && jit) {
+        if (noreplace && (long)p != addr) { munmap(p, (size_t)len); return -17; }
+        if (n_jit < MAXJIT) { jit_regions[n_jit].lo = (uint64_t)p; jit_regions[n_jit].hi = (uint64_t)p + (uint64_t)len; n_jit++; }
+        pthread_jit_write_protect_np(1);           // running mode: executable
+        return (long)p;
+    }
     if (p == MAP_FAILED && (prot & PROT_EXEC) && (prot & PROT_WRITE) && addr == 0) {
         // An unfixed RWX request is the runtime's exec-page primitive with no
         // JIT arena: on an M0 (JIT-off) image it only ever holds DATA (the GC
@@ -188,8 +209,19 @@ static uint64_t lx_sigset(sigset_t s) {
 // Linux aarch64 struct sigaction as rt_sigaction takes it.
 struct lx_sigaction { uint64_t handler, flags, restorer, mask; };
 
+// SIGSEGV and SIGBUS stay the shim's own (the JIT mode flip must see them
+// first); what the image registers for them is kept here and chained to.
+static struct lx_sigaction image_fault_handler[2];      // [0] SEGV, [1] BUS
+static int fault_slot(int sig) { return sig == SIGSEGV ? 0 : sig == SIGBUS ? 1 : -1; }
+
 static long dx_rt_sigaction(long lsig, struct lx_sigaction *nw, struct lx_sigaction *old) {
     int sig = dx_sig(lsig);
+    int slot = fault_slot(sig);
+    if (slot >= 0) {
+        if (old) *old = image_fault_handler[slot];
+        if (nw) image_fault_handler[slot] = *nw;
+        return 0;
+    }
     struct sigaction dn, dold; memset(&dn, 0, sizeof dn);
     if (nw) {
         // The image's handler (translate-aarch64 trap #x0520) is a stub that
@@ -307,12 +339,38 @@ static long dx_socket(long domain, long type, long proto) {
     return fd;
 }
 
+// A read(2) INTO the JIT arena fails with EFAULT: the kernel's copy-out does
+// not honour the thread's MAP_JIT write mode, and no fault reaches the flip
+// handler.  (Restoring a core reads its JIT pages straight into the arena.)
+// Read into ordinary memory and copy in with write mode open.
+static int jit_overlap(uint64_t p, uint64_t n) { return n && (in_jit(p) || in_jit(p + n - 1)); }
+static long jit_read(int fd, void *buf, size_t n) {
+    if (!jit_overlap((uint64_t)buf, n)) {
+        long r = read(fd, buf, n);
+        if (getenv("MODUS_SHIM_TRACE") && (r < 0 || (size_t)r < n))
+            fprintf(stderr, "modus-shim: read(fd=%d, buf=%p, n=%zu) = %ld\n", fd, buf, n, r);
+        return r;
+    }
+    void *tmp = malloc(n);
+    if (!tmp) { errno = ENOMEM; return -1; }
+    long r = read(fd, tmp, n);
+    int e = errno;
+    if (r > 0) {
+        pthread_jit_write_protect_np(0);
+        memcpy(buf, tmp, (size_t)r);
+        pthread_jit_write_protect_np(1);
+    }
+    free(tmp);
+    errno = e;
+    return r;
+}
+
 static unsigned char unknown_seen[512];
 
 long modus_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long nr) {
     struct stat st;
     switch (nr) {
-    case 63:  RET(read((int)a0, (void *)a1, (size_t)a2));
+    case 63:  RET(jit_read((int)a0, (void *)a1, (size_t)a2));
     case 64:  RET(write((int)a0, (const void *)a1, (size_t)a2));
     case 56:  RET(openat(dx_dirfd(a0), (const char *)a1, dx_open_flags(a2), (int)a3));
     case 57:  forget_dir(a0); RET(close((int)a0));
@@ -407,7 +465,38 @@ static void pr_reg(const char *n, uint64_t v) {
         fprintf(stderr, " %s=%#llx(+%#llx)", n, (unsigned long long)v, (unsigned long long)(v - g_code_lo));
     else fprintf(stderr, " %s=%#llx", n, (unsigned long long)v);
 }
+static void report_fault(int sig, siginfo_t *si, void *uc_);
+static uint64_t last_flip_pc; static int same_pc_flips;
+
 static void on_fault(int sig, siginfo_t *si, void *uc_) {
+    ucontext_t *uc = uc_;
+    uint64_t pc = __darwin_arm_thread_state64_get_pc(uc->uc_mcontext->__ss);
+    uint64_t a = (uint64_t)si->si_addr;
+    if ((sig == SIGBUS || sig == SIGSEGV) && in_jit(a)) {
+        // A fetch from the JIT arena in write mode (pc == fault address), or
+        // a write to it in exec mode.  Flip and retry.  JIT code WRITING the
+        // arena would ping-pong (each flip re-faults its own fetch): stop
+        // loudly rather than livelock.
+        if (pc == last_flip_pc && ++same_pc_flips > 8) {
+            fprintf(stderr, "\nmodus-shim: JIT code writes JIT memory at pc=%#llx (cannot run under MAP_JIT)\n",
+                    (unsigned long long)pc);
+            report_fault(sig, si, uc_);
+        }
+        if (pc != last_flip_pc) { last_flip_pc = pc; same_pc_flips = 0; }
+        pthread_jit_write_protect_np(a == pc ? 1 : 0);
+        return;
+    }
+    int slot = fault_slot(sig);
+    if (slot >= 0 && image_fault_handler[slot].handler > 1) {
+        // The image's handler: a stub that ignores its arguments and branches
+        // into the armed handler-case frame, never returning.
+        ((void (*)(int, siginfo_t *, void *))(uintptr_t)image_fault_handler[slot].handler)
+            (sig == SIGBUS ? 7 : 11, si, uc_);
+    }
+    report_fault(sig, si, uc_);
+}
+
+static void report_fault(int sig, siginfo_t *si, void *uc_) {
     ucontext_t *uc = uc_;
     __typeof__(uc->uc_mcontext->__ss) *ts = &uc->uc_mcontext->__ss;
     fprintf(stderr, "\nmodus-shim: signal %d at", sig);
@@ -425,7 +514,9 @@ static void install_fault_report(void) {
     stack_t ss = { .ss_sp = altstack, .ss_size = sizeof altstack, .ss_flags = 0 };
     sigaltstack(&ss, NULL);
     struct sigaction sa; memset(&sa, 0, sizeof sa);
-    sa.sa_sigaction = on_fault; sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    // SA_NODEFER: a chained image handler never returns (it branches into a
+    // handler-case frame), so the signal must not stay blocked afterwards.
+    sa.sa_sigaction = on_fault; sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
     int sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGFPE };
     for (unsigned i = 0; i < sizeof sigs / sizeof *sigs; i++) sigaction(sigs[i], &sa, NULL);
 }

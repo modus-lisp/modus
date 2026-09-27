@@ -466,8 +466,8 @@
                       ;; via the pkg-tag but does not splice the symbol into
                       ;; the package's internal slot.  Without it, every
                       ;; `'FOO` printed while `*package*` is the symbol's own
-                      ;; home package falls through to `%pkg-find-sym` (a
-                      ;; linear walk that misses lazily-stamped symbols) and
+                      ;; home package falls through to `%pkg-find-sym` (which
+                      ;; misses lazily-stamped symbols) and
                       ;; emits a bogus `PKG::FOO` qualifier.
                       (let ((accessible nil))
                         (cond
@@ -541,19 +541,28 @@
              t))
       nil))
 
-;;; Find symbol in package (non-closure version)
-(defvar *%find-sym-name* nil)
-(defvar *%find-sym-result* nil)
-(defun %find-sym-match (s)
-  (when (and (%cl-sym-p s) (string-equal (%cl-sym-name s) *%find-sym-name*))
-    (setq *%find-sym-result* s)))
+;;; The symbol named NAME accessible in PKG, or NIL: the hashed symtab index,
+;;; own tables then the use-list (FIND-SYMBOL's order).  This used to walk EVERY
+;;; accessible symbol with %do-symbols-fn -- all of COMMON-LISP through the
+;;; use-list -- comparing with STRING-EQUAL (case-INSENSITIVE, wrong for
+;;; symbol names) and without stopping at a match, once or twice per symbol
+;;; PRINTED: ~26 ms a symbol on x64, so printing a symbol-heavy form looked
+;;; like a hang.
+;;; The hashed lookup directly, not FIND-SYMBOL: this file is compiled before
+;;; cl-packages.lisp, so a direct call bound to prelude's one-argument
+;;; FIND-SYMBOL stub (PROGRAM-ERROR on every qualified symbol printed).
 (defun %pkg-find-sym (name pkg)
   (if (%pkg-p pkg)
-      (progn
-        (setq *%find-sym-name* name)
-        (setq *%find-sym-result* nil)
-        (%do-symbols-fn #'%find-sym-match pkg)
-        *%find-sym-result*)
+      (let ((e (or (%symtab-find-in pkg 3 name)       ; external
+                   (%symtab-find-in pkg 2 name))))    ; internal
+        (if e
+            (cdr e)
+            (let ((use (%pkg-use-list pkg)) (found nil))
+              (loop
+                (when (null use) (return found))
+                (let ((ue (%symtab-find-in (car use) 3 name)))
+                  (when ue (return (cdr ue))))
+                (setq use (cdr use))))))
       nil))
 
 ;;; Print a multi-dim array: emit "#NA" then a nested-list literal whose
@@ -775,6 +784,34 @@
                ((stringp report) (%print-string-raw report stream))
                ((functionp report) (funcall report stream))
                (t (%write-obj (car obj) stream level nil))))))
+      ;; PACKAGE and STREAM are marked conses -- (987654321 . data) and
+      ;; (7770001 type . data) -- so without these arms they reached the
+      ;; generic CONS arm and printed their INSIDES: (print *package*) walked
+      ;; every symbol alist of the package and of every package it uses, at
+      ;; printer speed, which looked like a hang.  CLHS 22.1.3.13 / 21.1.1:
+      ;; both print as #<...>, and are not readable.
+      ((or (%pkg-p obj) (streamp obj))
+       (when preadably
+         (error 'print-not-readable :object obj))
+       (%print-string-raw "#<" stream)
+       (if (%pkg-p obj)
+           (progn
+             (%print-string-raw "PACKAGE " stream)
+             (%write-obj (package-name obj) stream level t))
+           (%print-string-raw
+            (let ((ty (%stream-type obj)))
+              (cond ((eql ty 1) "STRING-INPUT-STREAM")
+                    ((eql ty 2) "STRING-OUTPUT-STREAM")
+                    ((eql ty 3) "ECHO-STREAM")
+                    ((eql ty 4) "TWO-WAY-STREAM")
+                    ((eql ty 5) "BROADCAST-STREAM")
+                    ((eql ty 6) "CONCATENATED-STREAM")
+                    ((eql ty 7) "SYNONYM-STREAM")
+                    ((eql ty 8) "FD-STREAM")
+                    ((eql ty 9) "FILE-STREAM")
+                    (t "STREAM")))
+            stream))
+       (%print-char 62 stream))
       ;; Adjustable wrapper: (cons 8765432 inner) — peel and recurse
       ((and (consp obj) (eql (car obj) 8765432) (consp (cdr obj)))
        (%write-obj (cdr obj) stream level escape))

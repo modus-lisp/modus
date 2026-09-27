@@ -152,9 +152,15 @@
 
 (defun %mvm-wrap-word (w)
   "W wrapped to a signed machine word: +fixnum-bits+ + 2 bits (32 / 64)."
-  (let* ((m (ash 1 (+ +fixnum-bits+ 2)))
-         (r (mod w m)))
-    (if (>= r (ash m -1)) (- r m) r)))
+  ;; A machine word is two bits wider than a fixnum, so EVERY fixnum W is
+  ;; already a signed machine word: return it.  Only a bignum W can wrap.
+  ;; Without this every SHL / INC / DEC built the bignum modulus 2^64 and
+  ;; took a bignum MOD -- ~40% of all time in an interpreted loop.
+  (if (typep w 'fixnum)
+      w
+      (let* ((m (ash 1 (+ +fixnum-bits+ 2)))
+             (r (mod w m)))
+        (if (>= r (ash m -1)) (- r m) r))))
 
 (defun %mvm-word->val (w)
   "The register object whose machine word is W (exact, machine-width)."
@@ -211,7 +217,11 @@
 (defstruct (mvm-state (:conc-name mvm-))
   (regs    (make-array +num-vregs+ :initial-element 0) :type simple-vector)
   (stack   nil :type list)
-  (flags   :eq :type keyword)
+  ;; Compare result: -1 / 0 / 1 (lt / eq / gt).  Were the keywords :LT :EQ
+  ;; :GT -- and in image code every keyword literal is a %INTERN-KEYWORD
+  ;; call (lock + GETHASH), so every CMP/TEST and every conditional branch
+  ;; paid one.
+  (flags   0 :type fixnum)
   (memory  (make-hash-table :test 'eql))
   ;; NO "HEAP" RETENTION LIST.  There used to be one: every op-cons /
   ;; op-alloc-cons / op-alloc-obj / -array / -string / -u8 pushed its fresh
@@ -286,6 +296,13 @@
   (nargs      0)
   (cenv       nil)
   (mv-count   1))
+
+(defun %mvm-ensure-memory (state)
+  (or (mvm-memory state) (setf (mvm-memory state) (make-hash-table :test 'eql))))
+(defun %mvm-ensure-percpu (state)
+  (or (mvm-percpu state) (setf (mvm-percpu state) (make-hash-table :test 'eql))))
+(defun %mvm-ensure-io-ports (state)
+  (or (mvm-io-ports state) (setf (mvm-io-ports state) (make-hash-table :test 'eql))))
 
 (declaim (inline vref vset))
 (defun vref (state reg) (svref (mvm-regs state) reg))
@@ -507,34 +524,41 @@
   (values (logior (aref bc pc) (ash (aref bc (+ pc 1)) 8))
           (+ pc 2)))
 
+;;; FETCH-S32 / -U32 / -U64 use Horner's rule from the MOST significant byte,
+;;; like FETCH-LI-VALUE: every partial result is the final value floored by a
+;;; power of 256, so no intermediate is larger in magnitude than the answer.
+;;; The shift-and-LOGIOR forms built (ash b3 24) and lo + hi*2^32, which leave
+;;; the fixnum range on the 30-bit tower for EVERY operand: 67% of an i386
+;;; interpreted loop was bignum arithmetic decoding small immediates.
+;;; Same values on every width; only the intermediates change.
 (defun fetch-s32 (bc pc)
-  (let ((val (logior (aref bc pc) (ash (aref bc (+ pc 1)) 8)
-                     (ash (aref bc (+ pc 2)) 16) (ash (aref bc (+ pc 3)) 24))))
-    (values (if (>= val #x80000000) (- val #x100000000) val) (+ pc 4))))
+  (let ((b3 (aref bc (+ pc 3))))
+    (values (+ (ash (+ (ash (+ (ash (if (>= b3 128) (- b3 256) b3) 8)
+                               (aref bc (+ pc 2)))
+                            8)
+                       (aref bc (+ pc 1)))
+                    8)
+               (aref bc pc))
+            (+ pc 4))))
 
 (defun fetch-u32 (bc pc)
-  (values (logior (aref bc pc) (ash (aref bc (+ pc 1)) 8)
-                  (ash (aref bc (+ pc 2)) 16) (ash (aref bc (+ pc 3)) 24))
+  (values (+ (ash (+ (ash (+ (ash (aref bc (+ pc 3)) 8) (aref bc (+ pc 2))) 8)
+                     (aref bc (+ pc 1)))
+                  8)
+             (aref bc pc))
           (+ pc 4)))
 
 (defun fetch-u64 (bc pc)
-  ;; Reconstruct the 8-byte little-endian immediate as a SIGNED 64-bit value
-  ;; held as a native (possibly negative) fixnum.  The old form
-  ;; `(logior lo (ash hi 32))` formed an UNSIGNED value: for any immediate with
-  ;; the high word's bit 31 set (every negative tagged literal — word's hi32 =
-  ;; #xFFFFFFFF — and large positives), `(ash hi 32)` lands >= 2^62 where
-  ;; Modus's bignum-range ASH is lossy, so the immediate read back as garbage
-  ;; (negative fixnum literals like -5 became 2^62-ish).  Interpreting hi as
-  ;; signed and combining with `+`/`*` keeps the common case (hi = 0 or
-  ;; #xFFFFFFFF, i.e. |value| < 2^31) entirely in fixnum range and yields the
-  ;; correct signed word, which `%word->val` (a single arithmetic SHR) then
-  ;; turns back into the right value.
-  (let* ((lo (logior (aref bc pc) (ash (aref bc (+ pc 1)) 8)
-                     (ash (aref bc (+ pc 2)) 16) (ash (aref bc (+ pc 3)) 24)))
-         (hi (logior (aref bc (+ pc 4)) (ash (aref bc (+ pc 5)) 8)
-                     (ash (aref bc (+ pc 6)) 16) (ash (aref bc (+ pc 7)) 24)))
-         (hi-signed (if (>= hi #x80000000) (- hi #x100000000) hi)))
-    (values (+ lo (* hi-signed 4294967296)) (+ pc 8))))
+  ;; The 8-byte little-endian immediate as a SIGNED 64-bit value (the top byte
+  ;; is read signed).  It was once formed UNSIGNED, (logior lo (ash hi 32)),
+  ;; and every negative tagged literal read back as garbage near 2^62.
+  (let* ((b7 (aref bc (+ pc 7)))
+         (acc (if (>= b7 128) (- b7 256) b7))
+         (i 6))
+    (loop
+      (when (< i 0) (return (values acc (+ pc 8))))
+      (setq acc (+ (ash acc 8) (aref bc (+ pc i))))
+      (setq i (- i 1)))))
 
 (defun fetch-li-value (bc pc)
   "Read an 8-byte little-endian LI immediate (a tagged WORD W = value<<1) and
@@ -638,11 +662,7 @@
     ;; list in tail position is exempt from the set-mv-count=1 epilogue
     ;; (tail-form-is-values-p descends LET).
     (let ((r (%mvm-wrap-escaping-result
-               (mvm-interpret bc :entry-point offset
-                                 :function-table ftab :runtime-table rt
-                                 :return-raw nil
-                                 :initial-args args :initial-cenv env
-                                 :lambda-offsets lam-offsets)
+               (%mvm-interpret-1 bc offset ftab rt nil args env lam-offsets)
                bc ftab rt lam-offsets))
           (mv *mvm-last-mv*))
       (values-list (if (if mv (> (car mv) 1) nil)
@@ -935,6 +955,15 @@
 (defun mvm-interpret (bytecode &key (entry-point 0) function-table runtime-table
                                     (return-raw t) initial-args initial-cenv
                                     lambda-offsets)
+  "Keyword front end of %MVM-INTERPRET-1 (see there)."
+  (%mvm-interpret-1 bytecode entry-point function-table runtime-table
+                    return-raw initial-args initial-cenv lambda-offsets))
+
+;;; Positional: the trampoline calls this once per interpreted CALL, and the
+;;; keyword entry's &KEY parse (seven keywords, each a runtime-interned literal)
+;;; was a measurable share of every cross-module call.
+(defun %mvm-interpret-1 (bytecode entry-point function-table runtime-table
+                         return-raw initial-args initial-cenv lambda-offsets)
   "Execute MVM bytecode starting at ENTRY-POINT.
    When RET or HALT is reached, return VR.  RETURN-RAW (default T, for callers
    that re-tag the result themselves via `(ash result -1)`) returns the RAW WORD
@@ -1583,8 +1612,16 @@
                  ;; Exact word, shifted, WRAPPED to the machine word like the
                  ;; hardware's SHL.  compile-ash detects left-shift overflow by
                  ;; shifting back and comparing, which only works if this wraps.
-                 (%mvm-put-word regs vd
-                                (%mvm-wrap-word (ash (%mvm-word (svref regs vs)) amt)))
+                 ;; Fast path: a fixnum whose shifted value stays below
+                 ;; 2^(fixnum-bits - 1) is (ash v amt) exactly -- the word
+                 ;; 2*(v << amt) cannot wrap -- with no bignum in sight.
+                 (let ((v (svref regs vs)))
+                   (if (and (typep v 'fixnum) (< amt (- +fixnum-bits+ 1))
+                            (let ((lim (ash 1 (- +fixnum-bits+ 1 amt))))
+                              (and (< v lim) (> v (- lim)))))
+                       (setf (svref regs vd) (ash v amt))
+                       (%mvm-put-word regs vd
+                                      (%mvm-wrap-word (ash (%mvm-word v) amt)))))
                  (setf pc npc3)))))
 
           ;; SHR / SAR ARE WORD-LEVEL, exactly as the native translators
@@ -1691,9 +1728,9 @@
                (let ((a (svref regs va)) (b (svref regs vb)))
                  (setf (mvm-flags state)
                        (cond ((and (integerp a) (integerp b))
-                              (cond ((= a b) :eq) ((< a b) :lt) (t :gt)))
-                             ((eql a b) :eq)
-                             (t :gt))))
+                              (cond ((= a b) 0) ((< a b) -1) (t 1)))
+                             ((eql a b) 0)
+                             (t 1))))
                (setf pc npc2))))
 
           (#.+op-test+
@@ -1703,7 +1740,7 @@
                ;; REG-GET of a large fixnum wrapped, so the test lied.
                (let ((r (logand (%mvm-word (svref regs va)) (%mvm-word (svref regs vb)))))
                  (setf (mvm-flags state)
-                       (cond ((zerop r) :eq) ((< r 0) :lt) (t :gt))))
+                       (cond ((zerop r) 0) ((< r 0) -1) (t 1))))
                (setf pc npc2))))
 
           ;; --- Branches (offsets relative to end of instruction) ---
@@ -1713,27 +1750,27 @@
 
           (#.+op-beq+
            (multiple-value-bind (off npc) (fetch-s32 bc pc)
-             (setf pc (if (eq (mvm-flags state) :eq) (+ npc off) npc))))
+             (setf pc (if (= (mvm-flags state) 0) (+ npc off) npc))))
 
           (#.+op-bne+
            (multiple-value-bind (off npc) (fetch-s32 bc pc)
-             (setf pc (if (not (eq (mvm-flags state) :eq)) (+ npc off) npc))))
+             (setf pc (if (/= (mvm-flags state) 0) (+ npc off) npc))))
 
           (#.+op-blt+
            (multiple-value-bind (off npc) (fetch-s32 bc pc)
-             (setf pc (if (eq (mvm-flags state) :lt) (+ npc off) npc))))
+             (setf pc (if (< (mvm-flags state) 0) (+ npc off) npc))))
 
           (#.+op-bge+
            (multiple-value-bind (off npc) (fetch-s32 bc pc)
-             (setf pc (if (member (mvm-flags state) '(:eq :gt)) (+ npc off) npc))))
+             (setf pc (if (>= (mvm-flags state) 0) (+ npc off) npc))))
 
           (#.+op-ble+
            (multiple-value-bind (off npc) (fetch-s32 bc pc)
-             (setf pc (if (member (mvm-flags state) '(:eq :lt)) (+ npc off) npc))))
+             (setf pc (if (<= (mvm-flags state) 0) (+ npc off) npc))))
 
           (#.+op-bgt+
            (multiple-value-bind (off npc) (fetch-s32 bc pc)
-             (setf pc (if (eq (mvm-flags state) :gt) (+ npc off) npc))))
+             (setf pc (if (> (mvm-flags state) 0) (+ npc off) npc))))
 
           (#.+op-bnull+
            (multiple-value-bind (vs npc) (fetch-reg bc pc)
@@ -2697,7 +2734,7 @@
                ;; record it and, on resume, land tagged-1 into THAT register
                ;; of the restored file (restore-ctx's own operand register is
                ;; a different vreg and must not be used for this).
-               (setf (gethash addr (mvm-memory state))
+               (setf (gethash addr (%mvm-ensure-memory state))
                      (list* npc vd (copy-seq regs)))
                ;; Initial-save result = tagged fixnum 0.
                (reg-set regs vd (tag-fixnum 0))
@@ -2706,7 +2743,7 @@
           (#.+op-restore-ctx+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (let* ((addr (reg-get regs vd))
-                    (saved (gethash addr (mvm-memory state))))
+                    (saved (let ((m (mvm-memory state))) (and m (gethash addr m)))))
                (if (and (consp saved) (typep (cddr saved) 'simple-vector))
                    (let ((resume-pc (car saved))
                          (result-reg (cadr saved))
@@ -2756,7 +2793,7 @@
              (multiple-value-bind (port npc2) (fetch-u16 bc npc)
                (multiple-value-bind (_w npc3) (fetch-byte bc npc2)
                  (declare (ignore _w))
-                 (reg-set regs vd (gethash port (mvm-io-ports state) 0))
+                 (reg-set regs vd (let ((h (mvm-io-ports state))) (if h (gethash port h 0) 0)))
                  (setf pc npc3)))))
 
           (#.+op-io-write+
@@ -2775,7 +2812,7 @@
                      (2 (if (integerp val)     ; print + newline
                             (format *standard-output* "~D~%" (untag-fixnum val))
                             (format *standard-output* "~S~%" val)))
-                     (otherwise (setf (gethash port (mvm-io-ports state)) val))))
+                     (otherwise (setf (gethash port (%mvm-ensure-io-ports state)) val))))
                  (setf pc npc3)))))
 
           (#.+op-halt+ (setf (mvm-halted state) t))
@@ -2785,13 +2822,13 @@
           (#.+op-percpu-ref+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (offset npc2) (fetch-u16 bc npc)
-               (reg-set regs vd (gethash offset (mvm-percpu state) 0))
+               (reg-set regs vd (let ((h (mvm-percpu state))) (if h (gethash offset h 0) 0)))
                (setf pc npc2))))
 
           (#.+op-percpu-set+
            (multiple-value-bind (offset npc) (fetch-u16 bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
-               (setf (gethash offset (mvm-percpu state)) (reg-get regs vs))
+               (setf (gethash offset (%mvm-ensure-percpu state)) (reg-get regs vs))
                (setf pc npc2))))
 
           (otherwise

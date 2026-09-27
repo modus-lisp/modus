@@ -3821,12 +3821,14 @@
 ;;; ============================================================
 
 (defun get-universal-time ()
-  "Return seconds since 1900-01-01.  On Linux, calls time(2) (syscall
-   201) to get Unix epoch seconds, then adds the 70-year offset
-   2208988800.  On bare metal where syscall isn't available, returns 0."
-  (let ((unix-sec (handler-case (syscall3 201 0 0 0) (t (c) 0))))
-    (if (and (integerp unix-sec) (> unix-sec 0))
-        (+ unix-sec 2208988800)
+  "Return seconds since 1900-01-01: CLOCK_REALTIME (Unix epoch) plus the
+   70-year offset 2208988800.  Through %CLOCK-GETTIME-NS, the one per-arch
+   clock seam, rather than time(2): 201 is time only on x86-64 -- on i386 it
+   is geteuid32, and every i386 image reported the uid (1001) as the Unix
+   time, i.e. 1970-01-01.  0 where there is no clock (bare metal)."
+  (let ((ns (%clock-gettime-ns 0)))           ; CLOCK_REALTIME
+    (if (and (integerp ns) (> ns 0))
+        (values (+ (floor ns 1000000000) 2208988800))
         0)))
 
 (defun %timer-universal-time ()

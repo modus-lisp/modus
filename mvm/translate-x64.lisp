@@ -6290,6 +6290,15 @@
         (let ((scan-it (make-label)) (leaf (make-label))
               (sz-u8 (make-label)) (sz-f32 (make-label)) (sz-adv (make-label))
               (sz-take (make-label)))
+          ;; Only at a 16-byte boundary: the start bit is per GRANULE, so the
+          ;; word at obj+8 (the +8 pad word, which alloc-string and copy_object
+          ;; leave as whatever it was) maps to the same set bit as the header
+          ;; and would be read as a header -- a pad word whose low byte happened
+          ;; to spell a leaf subtag skipped by a garbage size.  That made
+          ;; modus-sh --compile-uefi nondeterministic (9.9 MB output one run,
+          ;; TYPE-ERROR the next).  Objects are 16-aligned with the header first.
+          (emit-bytes buf #x41 #xF7 #xC2 #x0F #x00 #x00 #x00) ; test r10d, 15
+          (emit-jcc buf :ne scan-it)
           (emit-bytes buf #x4C #x89 #xD6)                ; mov rsi, r10
           (emit-bytes buf #x48 #x2B #x34 #x25)           ; sub rsi, [page_base]
           (emit-u32 buf +mcgc-cfg-page-base-addr+)
@@ -6305,7 +6314,12 @@
           (emit-mov-reg-mem buf 'rsi 'r10 0)             ; rsi = header
           (emit-mov-reg-reg buf 'r8 'rsi)
           (emit-and-reg-imm buf 'r8 #xFF)                ; r8 = subtag
-          (dolist (st '(#x10 #x11 #x12 #x14 #x16 #x30 #x31 #x60 #x64 #x65 #x66))
+          ;; NOT #x30: a BIG bignum is a 2-slot #x30 whose slot 1 is a POINTER to
+          ;; its limbs array (compile-integer's sentinel -1 shape); skipping it
+          ;; left that pointer un-forwarded, and modus-sh --compile-uefi then read
+          ;; a stale threshold and compiled 2^130 as a small bignum (the UEFI DDC
+          ;; caught it).  Only pointer-free layouts may be skipped.
+          (dolist (st '(#x10 #x11 #x12 #x14 #x16 #x60 #x64 #x65 #x66))
             (emit-cmp-reg-imm buf 'r8 st)
             (emit-jcc buf :e leaf))
           (emit-jmp buf scan-it)

@@ -65,25 +65,6 @@
 ;; stack top) -- everything below derives from it, so NIL is byte-identical
 ;; to the historic literals.
 (defvar *x64-heap-end-override* nil)
-(defun x64-heap-end () (or *x64-heap-end-override* #x1E000000))
-(defun x64-heap-geometry ()
-  "(values from-start to-start space-size): semispaces below a 16 MB guard
-   that ends at (x64-heap-end).  Default: 0x10001000 / 0x16800000 / 0x067FF000."
-  (let* ((from #x10001000)
-         (guard-lo (- (x64-heap-end) #x1000000))
-         (size (logand (truncate (- guard-lo from) 2) (lognot #xFFF))))
-    (values from (+ from size) size)))
-(defun x64-mcgc-data-end () (- (x64-heap-end) #x1000))
-(defun x64-mcgc-meta-base () (x64-heap-end))
-(defun x64-mcgc-page-count ()
-  (truncate (- (x64-mcgc-data-end) +x64-mcgc-data-base+) +x64-mcgc-page-size+))
-(defun x64-mcgc-descriptor-base () (x64-mcgc-meta-base))
-(defun x64-mcgc-bitmap-base ()
-  (logand (+ (x64-mcgc-descriptor-base) (x64-mcgc-page-count) 63) (lognot 63)))
-(defun x64-mcgc-freelist-base ()
-  (logand (+ (x64-mcgc-bitmap-base)
-             (truncate (- (x64-mcgc-data-end) +x64-mcgc-data-base+) (* 16 8)) 63)
-          (lognot 63)))
 (defun x64-effective-stack-top ()
   (or *x64-stack-top-override* +x64-stack-top+))
 
@@ -126,6 +107,32 @@
 (defconstant +x64-mcgc-freelist-base+
   (logand (+ +x64-mcgc-bitmap-base+
              (truncate (- +x64-mcgc-data-end+ +x64-mcgc-data-base+) (* 16 8)) 63)
+          (lognot 63)))
+
+;; The geometry FUNCTIONS live BELOW the constants they use.  The MVM compiler
+;; folds a defconstant only if it appeared EARLIER in the source stream; placed
+;; above them, +x64-mcgc-data-base+ / +x64-mcgc-page-size+ read as NIL in the
+;; self-hosted image and modus-sh emitted page_count = 0 (the UEFI DDC caught
+;; it: SBCL 0xDFFE vs modus-sh 0, then every address after it).  Divisions are
+;; ASH by a constant, never TRUNCATE, for the same host-vs-image reason.
+(defun x64-heap-end () (or *x64-heap-end-override* #x1E000000))
+(defun x64-heap-geometry ()
+  "(values from-start to-start space-size): semispaces below a 16 MB guard
+   that ends at (x64-heap-end).  Default: 0x10001000 / 0x16800000 / 0x067FF000."
+  (let* ((from #x10001000)
+         (guard-lo (- (x64-heap-end) #x1000000))
+         (size (logand (ash (- guard-lo from) -1) (lognot #xFFF))))
+    (values from (+ from size) size)))
+(defun x64-mcgc-data-end () (- (x64-heap-end) #x1000))
+(defun x64-mcgc-meta-base () (x64-heap-end))
+(defun x64-mcgc-page-count ()
+  (ash (- (x64-mcgc-data-end) +x64-mcgc-data-base+) -12))   ; / +x64-mcgc-page-size+ (4096)
+(defun x64-mcgc-descriptor-base () (x64-mcgc-meta-base))
+(defun x64-mcgc-bitmap-base ()
+  (logand (+ (x64-mcgc-descriptor-base) (x64-mcgc-page-count) 63) (lognot 63)))
+(defun x64-mcgc-freelist-base ()
+  (logand (+ (x64-mcgc-bitmap-base)
+             (ash (- (x64-mcgc-data-end) +x64-mcgc-data-base+) -7) 63)   ; / (* 16 8)
           (lognot 63)))
 
 ;; Per-CPU structures

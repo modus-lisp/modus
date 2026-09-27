@@ -27,6 +27,7 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -161,6 +162,104 @@ static long dx_mmap(long addr, long len, long prot, long flags, long fd, long of
     return (long)p;
 }
 
+// ------------------------------------------------------------- signals ---
+// Linux and Darwin agree on most signal numbers but not all.
+static int dx_sig(long l) {
+    switch (l) {
+    case 7:  return SIGBUS;   case 10: return SIGUSR1;  case 12: return SIGUSR2;
+    case 17: return SIGCHLD;  case 18: return SIGCONT;  case 19: return SIGSTOP;
+    case 20: return SIGTSTP;  case 23: return SIGURG;   case 29: return SIGIO;
+    case 31: return SIGSYS;   default: return (int)l;   // 1-6, 8, 9, 11, 13-16, 21-22, 24-28
+    }
+}
+static sigset_t dx_sigset(uint64_t lx) {
+    sigset_t s; sigemptyset(&s);
+    for (long l = 1; l < 32; l++) if (lx & (1ULL << (l - 1))) sigaddset(&s, dx_sig(l));
+    return s;
+}
+static uint64_t lx_sigset(sigset_t s) {
+    uint64_t m = 0;
+    for (long l = 1; l < 32; l++) if (sigismember(&s, dx_sig(l))) m |= 1ULL << (l - 1);
+    return m;
+}
+// Linux aarch64 struct sigaction as rt_sigaction takes it.
+struct lx_sigaction { uint64_t handler, flags, restorer, mask; };
+
+static long dx_rt_sigaction(long lsig, struct lx_sigaction *nw, struct lx_sigaction *old) {
+    int sig = dx_sig(lsig);
+    struct sigaction dn, dold; memset(&dn, 0, sizeof dn);
+    if (nw) {
+        // The image's handler (translate-aarch64 trap #x0520) is a stub that
+        // ignores its arguments and branches into the armed handler-case
+        // frame without returning, so Darwin can call it directly.
+        dn.sa_sigaction = (void (*)(int, siginfo_t *, void *))(uintptr_t)nw->handler;
+        int f = 0;
+        if (nw->flags & 0x4)        f |= SA_SIGINFO;
+        if (nw->flags & 0x08000000) f |= SA_ONSTACK;
+        if (nw->flags & 0x10000000) f |= SA_RESTART;
+        if (nw->flags & 0x40000000) f |= SA_NODEFER;
+        if (nw->flags & 0x80000000) f |= SA_RESETHAND;
+        dn.sa_flags = f;
+        dn.sa_mask = dx_sigset(nw->mask);
+    }
+    if (sigaction(sig, nw ? &dn : NULL, &dold) < 0) return -lx_errno(errno);
+    if (old) {
+        old->handler = (uint64_t)(uintptr_t)dold.sa_sigaction;
+        old->flags = ((dold.sa_flags & SA_SIGINFO) ? 0x4 : 0) | ((dold.sa_flags & SA_NODEFER) ? 0x40000000 : 0)
+                   | ((dold.sa_flags & SA_RESTART) ? 0x10000000 : 0) | ((dold.sa_flags & SA_ONSTACK) ? 0x08000000 : 0);
+        old->restorer = 0; old->mask = lx_sigset(dold.sa_mask);
+    }
+    return 0;
+}
+
+static long dx_rt_sigprocmask(long how, const uint64_t *set, uint64_t *old) {
+    int h = how == 0 ? SIG_BLOCK : how == 1 ? SIG_UNBLOCK : SIG_SETMASK;
+    sigset_t ns, os; if (set) ns = dx_sigset(*set);
+    if (sigprocmask(h, set ? &ns : NULL, &os) < 0) return -lx_errno(errno);
+    if (old) *old = lx_sigset(os);
+    return 0;
+}
+
+// ----------------------------------------------------------- directories ---
+// getdents64 reads packed linux_dirent64 records from an fd.  Darwin has no
+// public equivalent, so keep a DIR* per fd (fdopendir on a dup, so closedir
+// cannot close the image's fd) and refill from readdir; one record that did
+// not fit waits for the next call.
+struct lx_dirent64 { uint64_t ino; int64_t off; uint16_t reclen; uint8_t type; char name[]; };
+#define MAXDIRFD 1024
+static DIR *dirs[MAXDIRFD];
+static struct dirent *pending[MAXDIRFD];
+
+static long dx_getdents64(long fd, uint8_t *buf, long len) {
+    if (fd < 0 || fd >= MAXDIRFD) return -9;       // EBADF
+    if (!dirs[fd]) {
+        int d = dup((int)fd);
+        if (d < 0) return -lx_errno(errno);
+        if (!(dirs[fd] = fdopendir(d))) { close(d); return -lx_errno(errno); }
+    }
+    long used = 0;
+    for (;;) {
+        struct dirent *e = pending[fd] ? pending[fd] : readdir(dirs[fd]);
+        pending[fd] = NULL;
+        if (!e) break;
+        size_t nlen = strlen(e->d_name);
+        size_t rec = ROUND_UP(sizeof(struct lx_dirent64) + nlen + 1, 8);
+        if (used + (long)rec > len) {
+            if (used == 0) return -22;             // EINVAL: buffer too small
+            pending[fd] = e; break;
+        }
+        struct lx_dirent64 *d = (struct lx_dirent64 *)(buf + used);
+        d->ino = e->d_ino; d->off = used + (long)rec; d->reclen = (uint16_t)rec;
+        d->type = e->d_type;                       // DT_* values agree
+        memcpy(d->name, e->d_name, nlen + 1);
+        used += (long)rec;
+    }
+    return used;
+}
+static void forget_dir(long fd) {
+    if (fd >= 0 && fd < MAXDIRFD && dirs[fd]) { closedir(dirs[fd]); dirs[fd] = NULL; pending[fd] = NULL; }
+}
+
 static unsigned char unknown_seen[512];
 
 long modus_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long nr) {
@@ -169,7 +268,8 @@ long modus_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long nr
     case 63:  RET(read((int)a0, (void *)a1, (size_t)a2));
     case 64:  RET(write((int)a0, (const void *)a1, (size_t)a2));
     case 56:  RET(openat(dx_dirfd(a0), (const char *)a1, dx_open_flags(a2), (int)a3));
-    case 57:  RET(close((int)a0));
+    case 57:  forget_dir(a0); RET(close((int)a0));
+    case 61:  return dx_getdents64(a0, (uint8_t *)a1, a2);
     case 62:  RET(lseek((int)a0, (off_t)a1, (int)a2));
     case 79: {                                     // newfstatat
         if (fstatat(dx_dirfd(a0), (const char *)a1, &st, dx_at_flags(a3)) < 0) return -lx_errno(errno);
@@ -200,9 +300,9 @@ long modus_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long nr
     case 29:  return -25;                          // ioctl: ENOTTY (no terminal control yet)
     case 278: arc4random_buf((void *)a0, (size_t)a1); return a1;   // getrandom
     case 214: return -12;                          // brk: ENOMEM (the image mmaps)
-    // Signals: not yet (M2).  Pretend success so boot proceeds; a fault then
-    // kills the process instead of unwinding into a handler-case.
-    case 134: case 135: return 0;                  // rt_sigaction, rt_sigprocmask
+    case 134: return dx_rt_sigaction(a0, (struct lx_sigaction *)a1, (struct lx_sigaction *)a2);
+    case 135: return dx_rt_sigprocmask(a0, (const uint64_t *)a1, (uint64_t *)a2);
+    case 129: RET(kill((pid_t)a0, dx_sig(a1)));
     case 103: return 0;                            // setitimer
     default:
         if (nr >= 0 && nr < 512 && !unknown_seen[nr]) {
@@ -217,7 +317,6 @@ long modus_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long nr
 // Until the image installs its own handlers on Darwin (M2), a fault would
 // die silently.  Print where it happened: PC and the registers, as offsets
 // into the image where they point at it, so a symbol map can name them.
-#include <signal.h>
 #include <sys/ucontext.h>
 static uint64_t g_code_lo, g_code_hi;
 static void pr_reg(const char *n, uint64_t v) {

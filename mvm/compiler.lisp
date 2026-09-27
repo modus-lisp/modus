@@ -10304,7 +10304,11 @@
 (defparameter *promote-forbidden-ops*
   '("LAMBDA" "FLET" "LABELS" "MACROLET" "CATCH" "UNWIND-PROTECT" "HANDLER-CASE"
     "HANDLER-BIND" "RESTART-CASE" "RESTART-BIND" "IGNORE-ERRORS"
-    "WITH-SIMPLE-RESTART" "PROGV" "THE-ENVIRONMENT"))
+    "WITH-SIMPLE-RESTART" "PROGV" "THE-ENVIRONMENT"
+    ;; A coroutine switch keeps only SP, FP, x19 and x27 (translate-aarch64
+    ;; SAVE-CTX, hosted): a local promoted into a register would come back
+    ;; holding whatever the other fiber left in it.
+    "SAVE-CONTEXT"))
 
 (defparameter *promote-loop-ops* '("LOOP" "DOTIMES" "DOLIST" "DO" "DO*"))
 

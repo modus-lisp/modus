@@ -5589,6 +5589,44 @@
           ;; Extra callee-saved (x20-x23, x29, x30) are pushed to the stack
           ;; so they're recovered when SP is restored. Only essential state
           ;; (SP, x24, x25, x19, continuation, obj-alloc/limit) goes in save area.
+          ;; HOSTED: translate-x64's contract, which the hosted actor layer
+          ;; is written against.  Only SP, FP (x29), x19 (V4) and x27 (CENV)
+          ;; are live across a switch in AOT code — locals are FP-relative
+          ;; frame slots, and the in-image JIT never promotes a local in a
+          ;; function that contains SAVE-CONTEXT (*PROMOTE-FORBIDDEN-OPS*).
+          ;; So they go in the SAVE AREA and nothing goes on the stack.  The
+          ;; bare-metal arm below pushes a register block BELOW the saved SP
+          ;; and pops it at once on the save path; everything the save path
+          ;; then calls builds its frames over that block, and a resume pops
+          ;; the wreckage (measured: YIELD resumed with FP = 0x20).
+          ;; Save area: +0x00 SP  +0x08 x29  +0x10 x27  +0x18 x19  +0x28 PC.
+          ;; The allocation pointer and limit are not saved: they are shared
+          ;; by every fiber on the thread, and a region switch moves them
+          ;; explicitly (%GC-REGION-ENTER).
+          ((and *aarch64-linux-mode* (= op +op-save-ctx+))
+           (let* ((vd (vr 0))
+                  (pa (ensure-src vd +a64-x16+)))
+             (a64-add-imm buf +a64-x17+ +a64-sp+ 0)          ; mov x17, sp
+             (a64-str-unsigned buf +a64-x17+ pa #x00)
+             (a64-str-unsigned buf +a64-x29+ pa #x08)
+             (a64-str-unsigned buf +a64-x27+ pa #x10)
+             (a64-str-unsigned buf +a64-x19+ pa #x18)
+             (let ((adr-idx (a64-current-index buf))
+                   (done (incf *mvm-label-counter*)))
+               (a64-emit buf 0)                              ; ADR x17, cont
+               (a64-str-unsigned buf +a64-x17+ pa #x28)
+               (a64-movz buf +a64-x0+ 0 0)                   ; first return: 0
+               (let ((i (a64-current-index buf)))
+                 (a64-b buf 0) (a64-add-fixup buf i done :b))
+               (let* ((cont-idx (a64-current-index buf))
+                      (byte-off (* (- cont-idx adr-idx) 4)))
+                 (setf (aref (a64-buffer-code buf) adr-idx)
+                       (logior (ash (logand byte-off 3) 29) (ash #b10000 24)
+                               (ash (logand (ash byte-off -2) #x7FFFF) 5) +a64-x17+)))
+               (a64-movz buf +a64-x0+ 2 0)                   ; resumed: tagged 1
+               (a64-set-label buf done)
+               (store-dst +a64-x0+ vd))))
+
           ((= op +op-save-ctx+)
            (let* ((vd (vr 0))
                   (pa (ensure-src vd +a64-x0+)))
@@ -5603,20 +5641,31 @@
              ;; 2. Save SP (post-push) to save area [pa+0x00]
              (a64-add-imm buf +a64-x16+ +a64-sp+ 0)   ; MOV x16, SP
              (a64-str-unsigned buf +a64-x16+ pa 0)     ; [pa+0x00] = SP
-             ;; 3. Save key registers to save area
-             (a64-str-unsigned buf +a64-x24+ pa 8)     ; [pa+0x08] = x24 (alloc ptr)
-             (a64-str-unsigned buf +a64-x25+ pa 16)    ; [pa+0x10] = x25 (alloc limit)
+             ;; 3. Save key registers to save area.
+             ;; HOSTED (translate-x64's contract, which the hosted actor layer
+             ;; is written against): the allocation pointer and limit are
+             ;; GLOBAL state every fiber shares — saving them here and loading
+             ;; them in RESTORE-CTX rolls the allocator back and hands the same
+             ;; memory out twice.  A region switch moves them explicitly
+             ;; (%GC-REGION-ENTER).  Only SP, x19 (V4, x64's RBX) and the
+             ;; continuation move; the rest of the callee-saved set is on the
+             ;; fiber's own stack (step 1).
+             (unless *aarch64-linux-mode*
+               (a64-str-unsigned buf +a64-x24+ pa 8)   ; [pa+0x08] = x24 (alloc ptr)
+               (a64-str-unsigned buf +a64-x25+ pa 16)) ; [pa+0x10] = x25 (alloc limit)
              (a64-str-unsigned buf +a64-x19+ pa 24)    ; [pa+0x18] = x19 (V4)
              ;; 4. ADR x17 → continuation; store to [pa+0x28]
              (let ((adr-idx (a64-current-index buf)))
                (a64-emit buf 0)                         ; placeholder for ADR x17
                (a64-str-unsigned buf +a64-x17+ pa #x28) ; [pa+0x28] = continuation
-               ;; 5. Save per-CPU obj-alloc/obj-limit from TPIDR_EL1
-               (a64-load-percpu-base buf +a64-x16+ +a64-x17+)
-               (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ #x28)
-               (a64-str-unsigned buf +a64-x17+ pa #x68)  ; [pa+0x68] = obj-alloc
-               (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ #x30)
-               (a64-str-unsigned buf +a64-x17+ pa #x70)  ; [pa+0x70] = obj-limit
+               ;; 5. Save per-CPU obj-alloc/obj-limit from TPIDR_EL1 (bare
+               ;;    metal's per-CPU object heap; hosted has none — see 3).
+               (unless *aarch64-linux-mode*
+                 (a64-load-percpu-base buf +a64-x16+ +a64-x17+)
+                 (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ #x28)
+                 (a64-str-unsigned buf +a64-x17+ pa #x68)  ; [pa+0x68] = obj-alloc
+                 (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ #x30)
+                 (a64-str-unsigned buf +a64-x17+ pa #x70)) ; [pa+0x70] = obj-limit
                ;; 6. Initial save: return 0
                (a64-movz buf +a64-x0+ 0 0)
                ;; 7. B to pop (skip resume entry)
@@ -5662,16 +5711,22 @@
              (a64-mov-reg buf +a64-x16+ pa)
              ;; Load continuation address into x17
              (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ #x28)
-             ;; Restore per-CPU obj-alloc/obj-limit via TPIDR_EL1
-             (a64-load-percpu-base buf +a64-x0+ +a64-x1+)
-             (a64-ldr-unsigned buf +a64-x1+ +a64-x16+ #x68)
-             (a64-str-unsigned buf +a64-x1+ +a64-x0+ #x28)  ; TPIDR+0x28 = obj-alloc
-             (a64-ldr-unsigned buf +a64-x1+ +a64-x16+ #x70)
-             (a64-str-unsigned buf +a64-x1+ +a64-x0+ #x30)  ; TPIDR+0x30 = obj-limit
+             ;; Restore per-CPU obj-alloc/obj-limit via TPIDR_EL1 — bare
+             ;; metal only, like x24/x25 below (see SAVE-CTX step 3).
+             (unless *aarch64-linux-mode*
+               (a64-load-percpu-base buf +a64-x0+ +a64-x1+)
+               (a64-ldr-unsigned buf +a64-x1+ +a64-x16+ #x68)
+               (a64-str-unsigned buf +a64-x1+ +a64-x0+ #x28)  ; TPIDR+0x28 = obj-alloc
+               (a64-ldr-unsigned buf +a64-x1+ +a64-x16+ #x70)
+               (a64-str-unsigned buf +a64-x1+ +a64-x0+ #x30)) ; TPIDR+0x30 = obj-limit
              ;; Restore callee-saved from save area
              (a64-ldr-unsigned buf +a64-x19+ +a64-x16+ #x18)
-             (a64-ldr-unsigned buf +a64-x24+ +a64-x16+ #x08)
-             (a64-ldr-unsigned buf +a64-x25+ +a64-x16+ #x10)
+             (when *aarch64-linux-mode*                   ; hosted SAVE-CTX layout
+               (a64-ldr-unsigned buf +a64-x29+ +a64-x16+ #x08)
+               (a64-ldr-unsigned buf +a64-x27+ +a64-x16+ #x10))
+             (unless *aarch64-linux-mode*
+               (a64-ldr-unsigned buf +a64-x24+ +a64-x16+ #x08)
+               (a64-ldr-unsigned buf +a64-x25+ +a64-x16+ #x10))
              ;; Restore SP from save area (AFTER register loads, SP change is the
              ;; "point of no return" — we're now on the resumed actor's stack)
              (a64-ldr-unsigned buf +a64-x0+ +a64-x16+ 0)
@@ -6383,6 +6438,59 @@
     (a64-load-imm64-general buf rd (conv-real +gc-region-0-base+))
     (a64-set-label buf have)))
 
+;;; ---- THE COLLECTOR CONCURRENCY PROBE (translate-x64's, ported) ----------
+;;;
+;;; translate-x64 EMIT-GC-CONCURRENCY-ENTER says what this measures and why it
+;;; lives in the trampoline: ENTRY bumps [cur] and, if another collector was
+;;; already inside, [witness]; EXIT drops [cur]; a non-zero [barrier] is a spin
+;;; budget a lone collector burns waiting for a second (bumping [met] if one
+;;; comes).  Same four words, 0x10000EE0..EF8, read by net/hosted-actors-post
+;;; %HA-GC-CONC-*.  Only with threads; the atomics are exclusive-monitor loops
+;;; so the probe runs on cores without LSE too.  Scratch x9..x13.
+(defun a64-emit-atomic-add (buf addr delta)
+  "x11 = *ADDR += DELTA (DELTA is +1 or -1), atomically.  x10 = ADDR."
+  (a64-load-imm64-general buf +a64-x10+ (conv-real addr))
+  (let ((loop-idx (a64-current-index buf)))
+    (a64-emit buf (logior #xC85FFC00 (ash +a64-x10+ 5) +a64-x11+))    ; LDAXR x11,[x10]
+    (if (> delta 0)
+        (a64-add-imm buf +a64-x11+ +a64-x11+ delta)
+        (a64-sub-imm buf +a64-x11+ +a64-x11+ (- delta)))
+    (a64-emit buf (logior #xC800FC00 (ash +a64-x12+ 16) (ash +a64-x10+ 5) +a64-x11+)) ; STLXR w12,x11,[x10]
+    (let ((back (- loop-idx (a64-current-index buf))))
+      (a64-emit buf (logior #x35000000 (ash (logand back #x7FFFF) 5) +a64-x12+))))) ; CBNZ w12
+
+(defun emit-aarch64-gc-conc-enter (buf)
+  (when *a64-tls-window*
+    (let ((no-witness (incf *mvm-label-counter*))
+          (no-barrier (incf *mvm-label-counter*))
+          (spin (incf *mvm-label-counter*))
+          (met (incf *mvm-label-counter*)))
+      (a64-emit-atomic-add buf #x10000EE0 1)                     ; cur += 1
+      (a64-cmp-imm buf +a64-x11+ 2)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i no-witness :bcond))
+      (a64-emit-atomic-add buf #x10000EE8 1)                     ; witness += 1
+      (a64-set-label buf no-witness)
+      (a64-load-imm64-general buf +a64-x10+ (conv-real #x10000EF0))
+      (a64-ldr-unsigned buf +a64-x13+ +a64-x10+ 0)               ; x13 = spin budget
+      (a64-cmp-imm buf +a64-x13+ 0)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i no-barrier :bcond))
+      (a64-load-imm64-general buf +a64-x10+ (conv-real #x10000EE0))
+      (a64-set-label buf spin)
+      (a64-emit buf (logior #xC8DFFC00 (ash +a64-x10+ 5) +a64-x11+)) ; LDAR x11,[x10]
+      (a64-cmp-imm buf +a64-x11+ 2)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i met :bcond))
+      (a64-sub-imm buf +a64-x13+ +a64-x13+ 1)
+      (a64-cmp-imm buf +a64-x13+ 0)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i spin :bcond))
+      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i no-barrier :b))
+      (a64-set-label buf met)
+      (a64-emit-atomic-add buf #x10000EF8 1)                     ; met += 1
+      (a64-set-label buf no-barrier))))
+
+(defun emit-aarch64-gc-conc-exit (buf)
+  (when *a64-tls-window*
+    (a64-emit-atomic-add buf #x10000EE0 -1)))
+
 (defun emit-aarch64-native-gc-trampoline (buf)
   "Native Cheney copying collector.  Layout: label → B main → [scan_word] →
    [copy_object] → main.  GC registers (all mutator regs saved in a 240B frame):
@@ -6591,6 +6699,7 @@
     ;; object-start bitmap base below, so it MUST be restored before RET or the
     ;; next gc-check's BLR x28 would jump to the bitmap base.
     (a64-str-unsigned buf +a64-x28+ +a64-sp+ 224)
+    (emit-aarch64-gc-conc-enter buf)
     (a64-tramp-mark 31)
     ;; ---- #286 PAUSE TIMER: stamp collection ENTRY ----
     ;; Placed AFTER the register save (so x9/x16 are free scratch) and BEFORE
@@ -6943,6 +7052,7 @@
       (a64-add-reg buf +a64-x10+ +a64-x10+ +a64-x12+ 0 0)
       (a64-str-unsigned buf +a64-x10+ +a64-x16+ 0))
     (a64-tramp-mark 12)
+    (emit-aarch64-gc-conc-exit buf)
     ;; ---- restore mutator regs + RET ----
     (a64-ldr-unsigned buf +a64-x28+ +a64-sp+ 224)   ; restore trampoline VA into x28
     (a64-ldr-unsigned buf +a64-x30+ +a64-sp+ 216)

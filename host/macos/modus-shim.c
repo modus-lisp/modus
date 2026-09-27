@@ -649,6 +649,18 @@ static void on_fault(int sig, siginfo_t *si, void *uc_) {
         return;
     }
     int slot = fault_slot(sig);
+    // MODUS_SHIM_FAULTS=1: say where every fault the image recovers from was.
+    static int show = -1;
+    if (show < 0) show = getenv("MODUS_SHIM_FAULTS") != NULL;
+    if (show) {
+        __typeof__(uc->uc_mcontext->__ss) *ts = &uc->uc_mcontext->__ss;
+        fprintf(stderr, "modus-shim: [%ld] signal %d", my_tid(), sig);
+        pr_reg("pc", pc);
+        fprintf(stderr, " addr=%p", si->si_addr);
+        pr_reg("lr", __darwin_arm_thread_state64_get_lr(*ts));
+        pr_reg("sp", __darwin_arm_thread_state64_get_sp(*ts));
+        fprintf(stderr, "\n");
+    }
     if (slot >= 0 && image_fault_handler[slot].handler > 1) {
         // The image's handler: a stub that ignores its arguments and branches
         // into the armed handler-case frame, never returning.

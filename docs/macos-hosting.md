@@ -538,28 +538,51 @@ unchanged by them.
 - Each thread gets its own sigaltstack.
 - `MODUS_SHIM_STRACE=1` traces every translated call.
 
-**Status, thread suite (22 tests; x86-64 baseline 17 pass).**
-- Pass on Linux/aarch64 and natively on macOS:
-  - many-threads (8 threads from 8 closures)
+**Actors (green threads) on AArch64.**  Hosted SAVE-CTX/RESTORE-CTX now
+follow translate-x64's contract.
+- The save area holds SP, FP (x29), CENV (x27), x19 and the continuation, and
+  nothing goes on the stack.  The bare-metal arm pushed a register block below
+  the saved SP and popped it immediately on the save path, so every call that
+  path made (YIELD's queue work) built its frames over the block.  A resume
+  then popped the wreckage: YIELD came back with FP = 0x20.
+- The allocation pointer and limit are no longer saved or restored.  They are
+  shared by every fiber on the thread and are moved explicitly by a region
+  switch; restoring them rolled the allocator back.
+- RESTORE-CTX releases the hosted scheduler lock and does not execute
+  `MSR DAIFClr`, which is UNDEFINED at EL0.
+- The in-image JIT never register-promotes a local in a function containing
+  SAVE-CONTEXT.
+- The collector concurrency probe (EE0..EF8: inside / overlap witness /
+  barrier) is ported to the AArch64 trampoline with exclusive-monitor loops.
+- The bitmap alignment check uses AArch64's unit: bits are set a byte at a
+  time, so 128 heap bytes, not x86-64's 1024.
+
+**Status, thread suite (24 tests incl. ctx-switch and actors; x86-64
+baseline 19).**  Linux/aarch64 and native macOS agree check-for-check.
+- Pass:
+  - many-threads
   - threads
   - mutex
   - atomics
   - percpu
   - mv-handler
-  - thread-lisp: 28/29; the one miss is a region-0 GC count that depends on
-    heap size
-  - thread-regions: 35/36, same kind of miss
-  - many-regions: 103/106; x86-64 geometry: 12 regions not 16, metadata
-    scale 2
-- dynbind passes when its worker body is wrapped, and every piece passes on
-  a worker.  The exact test file still exits 2; open.
-- Not yet on AArch64: actor-regions, spinlock, thread-actors and
-  thread-gc{,-concurrent,-stress}.  All of them run **actors** (green threads
-  switched by SAVE-CTX/RESTORE-CTX) on top of the native threads.
-  RESTORE-CTX now releases the hosted scheduler lock and no longer executes
-  the EL1-only `MSR DAIFClr`; the coroutine layer is next.
+  - ctx-switch
+  - actors
+  - spinlock
+  - thread-actors
+  - thread-gc
+  - thread-gc-stress (675 checks)
+- Miss only x86-64 expectations:
+  - thread-gc-concurrent: asserts that +512 is misaligned (x86-64's unit)
+  - many-regions: 12 regions and scale 2
+  - thread-lisp, thread-regions and actor-regions: region-0 collection counts
+  - on macOS, literal unrelocated addresses
+- dynbind: passes when its worker body is wrapped, and every piece passes on
+  a worker.  The exact test file exits 2; open.
 - Fail on x86-64 too: sb-thread, region0-frontier, term-xregion,
-  worker-xregion, thread-lisp-unsync (a control).
+  worker-xregion, thread-lisp-unsync.  mv-handler-unsync is a race control:
+  x86-64 collides in 2 of 6 runs, and AArch64's worker there now has its own
+  window.
 
 ## Open questions
 
@@ -578,5 +601,5 @@ unchanged by them.
 - Save-and-die cores embed code pointers from the image that saved them —
   the same staleness `4a03744` hit on the Pi.  A core is only valid for the
   image, and the VAs, that wrote it.
-- Native threads run on hosted AArch64, Linux and macOS (see "Native
-  threads on AArch64"); the actor (green-thread) layer above them does not yet.
+- Native threads and the actor (green-thread) layer run on hosted AArch64,
+  Linux and macOS (see "Native threads on AArch64").

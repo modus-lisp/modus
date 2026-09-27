@@ -1439,13 +1439,18 @@
    read-modify-write word, nothing to align.  Congruence is tested against
    page_base's own low bits rather than by subtraction, so it is correct even
    for a region below page_base (which is itself a bug, but not this one's)."
+  ;; THE UNIT IS PER TARGET.  1024 heap bytes is x86-64's 64-bit BTS.  AArch64
+  ;; sets and clears these bits a BYTE at a time (translate-aarch64's LDRB/STRB
+  ;; in EMIT-AARCH64-GC-SET-BIT; the collector's clears are byte-exact at a
+  ;; region's edges), and one bitmap byte covers 128 heap bytes.
   (if (= (%gc-bitmap-base) 0)
       0
-      (let ((p (logand (%gc-bitmap-page-base-exact) 1023))
-            (v 0))
-        (if (= (logand from 1023) p) 0 (setq v (+ v 1)))
-        (if (= (logand to 1023) p)   0 (setq v (+ v 2)))
-        (if (= (logand size 1023) 0) 0 (setq v (+ v 4)))
+      (let* ((m (%layout-if :a64-threads 127 1023))
+             (p (logand (%gc-bitmap-page-base-exact) m))
+             (v 0))
+        (if (= (logand from m) p) 0 (setq v (+ v 1)))
+        (if (= (logand to m) p)   0 (setq v (+ v 2)))
+        (if (= (logand size m) 0) 0 (setq v (+ v 4)))
         v)))
 
 ;;; THE VIOLATION LEDGER.  %gc-region-init cannot REFUSE a misaligned carve —

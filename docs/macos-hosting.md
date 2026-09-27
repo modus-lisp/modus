@@ -583,8 +583,8 @@ The five failing tests fail on all three platforms: sb-thread, region0-frontier,
 term-xregion, worker-xregion and thread-lisp-unsync (a control).
 mv-handler-unsync is a race control; x86-64 collides in about 2 of 6 runs.
 
-**sb-thread.**  x86-64 passes it now (44 checks).  It had crashed on all
-three targets; AArch64 still fails it.  Three shared fixes:
+**sb-thread.**  It passes on all three targets now (44 checks).  It had
+crashed on all three.  Three shared fixes, then an AArch64 one:
 - **Per-thread condition and non-local-exit state.**  THROW, cross-unit
   RETURN-FROM and handler-case dispatch hand the in-flight exit from frame to
   frame in plain specials (`*catch-tag*`, `*catch-value(s)*`, `*catch-active*`,
@@ -605,20 +605,22 @@ three targets; AArch64 still fails it.  Three shared fixes:
   only and drops it before the code runs, because a run can block.  It is
   inert until threads are on.
 
-AArch64 still fails it, and now the cause is known.  The worker's
-interpreter reads its bytecode as `#<STALE-FORWARDED>`: the closure's module
-lives in REGION 0, where main compiled the toplevel form, and main COLLECTED
-region 0 while the worker was running it.  The copying collector moved the
-bytecode, and the worker's pointer is not a region-0 root.  That is the
-precondition CLAUDE.md states for the runtime lock ("region 0 must not collect
-while threads run Lisp — a stop-the-world handshake with per-thread root
-windows, not done").  Nothing AArch64-specific breaks it; AArch64 only breaks
-it sooner.  Its in-image JIT (compiling ahead at every spawn) produces far
-more region-0 garbage than x86-64's, so region 0 fills and collects during the
-test.  The two ways forward:
-- make the precondition hold, by producing less region-0 garbage on AArch64;
-- or remove it, with the stop-the-world handshake that makes region 0
-  collectable under threads.
+**AArch64 now passes it too, and on every target.**  The last failure was
+region 0 collecting under a running worker.  The worker's interpreter read its
+closure's bytecode, which main had compiled into region 0, as
+`#<STALE-FORWARDED>` after main collected region 0.  That is CLAUDE.md's
+unmet precondition ("region 0 must not collect while threads run Lisp").
+AArch64 broke it only because it filled region 0 so fast.
+- `%make-native-thread` calls JIT-EAGER on every spawn.
+- JIT-EAGER re-attempted the 19 modules the AArch64 JIT cannot translate,
+  every time, at about 7 MB of garbage each: 140 MB per spawn.
+- `%jit-eager-all` now remembers a failed module (its bytecode is immutable,
+  so it fails again).  A retry costs 175 KB.  Five fresh modules cost 6.6 MB
+  on AArch64 against 2.7 MB on x86-64.
+
+The precondition itself still stands on every target: a program that
+allocates enough in region 0 while threads run can still break it.  Removing
+it is the stop-the-world handshake.
 
 ## Open questions
 

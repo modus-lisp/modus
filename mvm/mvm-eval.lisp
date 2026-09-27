@@ -1588,6 +1588,11 @@
   (let ((f (%mvm-resolve-runtime-fn name)))
     (and f (eql (logand (%val->word f) 15) 3))))
 
+(defvar *jit-eager-failed* nil
+  "Module bytecode vectors (EQ) JIT-EAGER already failed to translate; see
+   %JIT-EAGER-ALL.  Boots NIL (a defvar init does not run in-image), which is
+   the right empty value.")
+
 (defun %jit-eager-all ()
   "Translate every registered runtime DEFUN that is still an interpreter
    trampoline to native code and publish it.  Returns (INSTALLED MODULES
@@ -1605,16 +1610,32 @@
         (dolist (m pending)
           (when (not (member (car m) done :test (function eq)))
             (setq done (cons (car m) done))
-            (let ((je (%jit-translate-page (car m) (cadr m) (reverse (caddr m))
-                                           (car (cddddr m)))))
-              (if (and je (cadr (cddddr je)))
-                  (progn
-                    (setq modules (+ modules 1))
-                    (setq installed
-                          (+ installed
-                             (%jit-install-native-fns (car je) (cadr (cddddr je))
-                                                      (car (cddr (cddddr m)))))))
-                  (setq failed (+ failed 1))))))
+            ;; A MODULE THAT FAILED ONCE IS NOT RETRIED.  Nothing about it has
+            ;; changed (its bytecode is immutable), so it fails again — and a
+            ;; failing translation is not cheap: MEASURED on the AArch64 CLI,
+            ;; re-attempting its 19 untranslatable modules cost 140 MB of
+            ;; region-0 garbage per JIT-EAGER, and %MAKE-NATIVE-THREAD calls
+            ;; JIT-EAGER on every spawn.  That garbage collected region 0 under
+            ;; running workers (docs/macos-hosting.md, sb-thread).  The count
+            ;; still reports them, so the answer is unchanged.
+            (if (member (car m) *jit-eager-failed* :test (function eq))
+                (setq failed (+ failed 1))
+                (let ((je (%jit-translate-page (car m) (cadr m) (reverse (caddr m))
+                                               (car (cddddr m)))))
+                  (if (and je (cadr (cddddr je)))
+                      (progn
+                        (setq modules (+ modules 1))
+                        (setq installed
+                              (+ installed
+                                 (%jit-install-native-fns (car je) (cadr (cddddr je))
+                                                          (car (cddr (cddddr m)))))))
+                      (progn
+                        (setq failed (+ failed 1))
+                        ;; OFF-MAIN, DO NOT RECORD: the cons would be a worker
+                        ;; object in a region-0 list (%MVM-ON-MAIN-THREAD-P).
+                        (when (%mvm-on-main-thread-p)
+                          (setq *jit-eager-failed*
+                                (cons (car m) *jit-eager-failed*)))))))))
         (when (> installed 0) (%jit-retry-drain))
         (list installed modules failed))))
 

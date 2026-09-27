@@ -1018,6 +1018,17 @@
                    (setq tail (cdr tail))
                    (setq count (+ count 1))))))
             (%print-char 41 stream))))))  ; )
+      ;; A PATHNAME is a %CLOS-INSTANCE vector underneath, so it fell into the
+      ;; array clause below and printed as #(%CLOS-INSTANCE PATHNAME ...) --
+      ;; under PRINC too, which is how the ASDF interface's PRINC-TO-STRING of a
+      ;; *CENTRAL-REGISTRY* pathname never named a directory.  CLHS 22.1.3.11:
+      ;; #P"..." with escaping, the namestring without.  Placed just before the
+      ;; array clause so no other object pays for the test.
+      ((%pathname-obj-p obj)
+       (if escape
+           (progn (%print-string-raw "#P" stream)
+                  (%write-obj (namestring obj) stream level t))
+           (%print-string-raw (namestring obj) stream)))
       ;; Array/string (non-cons)
       ((arrayp obj)
        (let ((plev *print-level*)

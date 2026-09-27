@@ -1206,9 +1206,40 @@
                     (setq s (cdr s))
                     (setq i (1+ i))))
                 (setf pc npc))
-               ((>= code #x100)
-                ;; FRAME-ALLOC / FRAME-FREE: no-op (frame is over-allocated).
+               ;; FRAME-ALLOC (#x100+n) / FRAME-FREE (#x200+n): no-op, the
+               ;; frame is over-allocated.  MEMORY-BARRIER (#x302): the
+               ;; interpreter has no reordering to fence.
+               ((or (and (>= code #x100) (< code #x300)) (= code #x0302))
                 (setf pc npc))
+               ;; SYSCALL3 / SYSCALL3-RAW / SYSCALL6: run the same primitive
+               ;; natively.  A register holds the OBJECT whose bits are the
+               ;; operand word, which is exactly what the native call passes,
+               ;; so tagged and raw operands both arrive intact, and the result
+               ;; object goes back into V0 as compile-syscall* expects.
+               ;; These were silently skipped like the frame traps above: a
+               ;; syscall in interpreted code did NOTHING and "returned" its
+               ;; own number (V0), on every architecture.
+               ((= code #x0502)
+                (setf (svref regs +vreg-v0+)
+                      (%native-syscall3 (svref regs +vreg-v0+) (svref regs +vreg-v1+)
+                                        (svref regs +vreg-v2+) (svref regs +vreg-v3+)))
+                (setf pc npc))
+               ((= code #x0503)
+                (setf (svref regs +vreg-v0+)
+                      (%native-syscall3-raw (svref regs +vreg-v0+) (svref regs +vreg-v1+)
+                                            (svref regs +vreg-v2+) (svref regs +vreg-v3+)))
+                (setf pc npc))
+               ((= code #x050B)
+                (setf (svref regs +vreg-v0+)
+                      (%native-syscall6 (svref regs +vreg-v0+) (svref regs +vreg-v1+)
+                                (svref regs +vreg-v2+) (svref regs +vreg-v3+)
+                                (svref regs (+ +vreg-v0+ 4)) (svref regs (+ +vreg-v0+ 5))
+                                (svref regs (+ +vreg-v0+ 6))))
+                (setf pc npc))
+               ;; Anything else (serial / MMIO / IRQ / exit / mmap / JIT /
+               ;; thread traps) is not implemented here: say so, loudly.
+               ((>= code #x100)
+                (error "MVM trap #x~X is not implemented in the interpreter" code))
                (t
                 ;; FRAME-ENTER: allocate a generously-sized frame so all locals
                 ;; that later FRAME-ALLOCs would add still fit.  The compiler

@@ -3820,6 +3820,15 @@
 ;;; Time Functions (stubs)
 ;;; ============================================================
 
+;;; The interpreter's SYSCALL traps (#x0502 / #x0503 / #x050B) call these: a
+;;; plain native function per primitive, so the syscall runs with the operands
+;;; the interpreted code computed.  (An inline SYSCALL3 inside MVM-INTERPRET's
+;;; body returned its own first operand -- every existing site passes a
+;;; literal number, and the operand shuffle for computed ones was not taken.)
+(defun %native-syscall3 (n a b c) (syscall3 n a b c))
+(defun %native-syscall3-raw (n a b c) (syscall3-raw n a b c))
+(defun %native-syscall6 (n a b c d e f) (syscall6 n a b c d e f))
+
 (defun get-universal-time ()
   "Return seconds since 1900-01-01: CLOCK_REALTIME (Unix epoch) plus the
    70-year offset 2208988800.  Through %CLOCK-GETTIME-NS, the one per-arch

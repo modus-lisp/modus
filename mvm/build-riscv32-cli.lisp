@@ -73,6 +73,14 @@
 ;;;     memory -- a word in the cstr page, past rename's two paths.
 ;;; The *at calls, AT_FDCWD = -100, and syscall6 are as on RV64.
 (defvar *cli-arch-override-source* "
+;; RV32 has no 32-bit-time clock_gettime: clock_gettime64 (403), whose
+;; struct __kernel_timespec is two 64-bit fields: tv_nsec at +8.
+(defun %clock-gettime-ns (clk)
+  (let ((buf *io-buf-addr*))
+    (if (eql (syscall3 403 clk buf 0) 0)
+        (+ (* (+ (mem-ref buf :u32) (* (mem-ref (+ buf 4) :u32) 4294967296)) 1000000000)
+           (mem-ref (+ buf 8) :u32))
+        0)))
 (defun %rv-openat (path-addr flags mode)
   (syscall6 56 -100 path-addr flags mode 0 0))
 (defun %sys-open-rdonly (path-str)

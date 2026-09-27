@@ -3145,6 +3145,12 @@
    through the full LSB-first limb list so values past 124 bits become
    proper big bignums.  Right shifts (COUNT < 0) implement floor toward
    negative infinity for negative N (CLHS ash semantics)."
+  ;; CLHS ASH: both arguments are INTEGERs.  Every variable-count ASH in
+  ;; compiled code arrives here, so this is the check for all of them: a
+  ;; float used to go into the limb machinery and SIGSEGV, (ash 1.5 2) killed
+  ;; the image instead of signalling.
+  (unless (and (integerp n) (integerp count))
+    (%signal-type-error))
   (cond
     ((= count 0) n)
     ;; Left shift of a FIXNUM that stays a fixnum: double it with the

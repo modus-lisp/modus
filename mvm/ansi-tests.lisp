@@ -4691,6 +4691,24 @@
            (eval '(block b (unwind-protect (return-from b 1) (setq *uwp-probe-8490* :ran))))
            *uwp-probe-8490*)
     :ran)
+  ;; 8492: ash.3's shape from a fixed seed -- values landing exactly on
+  ;; -2^62 come back as a BIGNUM from ASH and a FIXNUM from FLOOR; EQL must
+  ;; call them equal.  Returns the first mismatching (i s ash floor) tuples.
+  (rt-run-test 8492
+    (let ((bad nil) (k 0))
+      (setf (mem-ref #x10000FD8 :u32) 0)
+      (loop for i = (+ (random (1+ (- most-positive-fixnum most-negative-fixnum))) most-negative-fixnum)
+            for s = (+ (random 80) -40) repeat 1000 do (ash i s))
+      (let ((bound (expt 2 100)))
+        (loop for i = (+ (random (* 2 bound)) (- bound))
+              for s = (+ (random 240) -120)
+              repeat 1000
+              do (let ((a (ash i s)) (b (floor (* i (expt 2 s)))))
+                   (unless (eql a b)
+                     (setq k (+ k 1))
+                     (when (< (length bad) 3) (push (list i s a b) bad))))))
+      (if bad (list k bad) nil))
+    nil)
   (rt-run-test 8491
     (let ((n (length *handler-bind-stack*)))
       (eval '(block b (handler-case (return-from b 1) (error () 2))))

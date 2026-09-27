@@ -1638,6 +1638,14 @@
      ;; Bignums also box per value.  numeric-equal-p handles all
      ;; integer-typed combinations including bignum slot-compare.
      (numeric-equal-p a b))
+    ;; ONE integer has TWO representations: most-negative-fixnum (-2^62) is
+    ;; kept as a BIGNUM by the tower (demoting it crashed), but native
+    ;; checked fixnum arithmetic -- FLOOR's fast path, for one -- produces it
+    ;; as a FIXNUM.  They are the same integer, so they are EQL.  (The gate's
+    ;; ash.3 compares (ash i s) with (floor (* i (expt 2 s))) and hit exactly
+    ;; -2^62 once the RANDOM sequence changed.)
+    ((or (and (bignump a) (fixnump b)) (and (fixnump a) (bignump b)))
+     (numeric-equal-p a b))
     ((and (%complex-p a) (%complex-p b))
      ;; CLHS: (eql c1 c2) iff realparts are eql AND imagparts are eql.
      ;; Recurse through eql so each part's own type+value rule applies

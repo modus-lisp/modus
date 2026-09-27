@@ -2212,7 +2212,17 @@
 ;;;   blk+0xC50   address of the next free entry (0 = never used yet)
 ;;;   blk+0xC58   depth, as a TAGGED fixnum — the collector reads it and
 ;;;               untags with one SHR, exactly like the MV count
-;;;   blk+0xC60   entry 0: [key][value], 16 bytes, 58 of them to blk+0x1000
+;;;   blk+0xC60   base of this thread's EXTENSION stack (tagged), 0 = none
+;;;   blk+0xC70   fallback entry 0: [key][value], 16 bytes, 57 to blk+0x1000
+;;;
+;;; THE EXTENSION.  57 entries is not enough for real work: the in-image
+;;; compiler binds ~12 specials per function it compiles plus one per nested
+;;; statement, so a worker that JIT-compiled a closure inside a function died
+;;; "dynamic binding stack exhausted" (bordeaux-threads' WITH-LOCK-HELD
+;;; reached it).  %TLS-INSTALL (net/hosted-sync.lisp) points blk+0xC60 at a
+;;; 16 KB per-CPU area in the thread band -- 1024 entries -- and the stack
+;;; lives there; a thread whose base is 0 uses the 57 in-window entries, as
+;;; before.  The collector reads the same word (EMIT-DYNBIND-ROOT-SCAN).
 ;;;
 ;;; THE VALUE SLOTS ARE A GC ROOT OF THE OWNING THREAD'S REGION.  A raw
 ;;; per-thread word is NOT a root — the precise root set is the fixed list in
@@ -2250,10 +2260,20 @@
    the collector can untag it with one SHR, as it does the MV count."
   (mem-ref (+ blk #xC58) :u64))
 
+(defun %dynb-base (blk)
+  "Address of entry 0: the extension stack when %TLS-INSTALL gave this thread
+   one, else the in-window fallback."
+  (let ((x (mem-ref (+ blk #xC60) :u64)))
+    (if (eql x 0) (+ blk #xC70) x)))
+
+(defun %dynb-capacity (blk)
+  "How many entries this thread's stack holds (see THE EXTENSION)."
+  (if (eql (mem-ref (+ blk #xC60) :u64) 0) 57 1024))
+
 (defun %dynb-next (blk)
   "Address of the next free entry's KEY word."
   (let ((a (mem-ref (+ blk #xC50) :u64)))
-    (if (eql a 0) (+ blk #xC60) a)))
+    (if (eql a 0) (%dynb-base blk) a)))
 
 (defun %dynb-set-top (blk next depth)
   "Publish the stack top.  ORDER IS THE CONTRACT: a caller writes the entry
@@ -2293,11 +2313,12 @@
           (%dynb-unwind blk key (- a 16) (- i 1)))))
 
 (defun %dynb-overflow (key)
-  "58 nested special bindings on one thread.  An honest error rather than a
+  "This thread's binding stack is full (%DYNB-CAPACITY entries).  An honest error rather than a
    silent shallow bind: a shallow bind here is the region-0 publication this
    whole mechanism exists to prevent, and it would additionally desynchronise
    the stack so the matching %DYNUNBIND truncated somebody else's entry."
-  (error "dynamic binding stack exhausted (58 nested specials) for key ~S" key))
+  (error "dynamic binding stack exhausted (~D nested specials) for key ~S"
+         (%dynb-capacity (%dynb-block)) key))
 
 (defun %dynbind (key val)
   "Establish a dynamic binding of the global named by KEY (a name hash).
@@ -2330,7 +2351,16 @@
             (set-symbol-value key val)
             (let ((d (%dynb-depth blk))
                   (a (%dynb-next blk)))
-              (if (>= d 58)
+              ;; HEADROOM.  Signalling the overflow binds specials too
+              ;; (condition creation, the handler machinery), so an error
+              ;; raised with the stack FULL overflowed again inside its own
+              ;; signalling and took the process down silently.  With the
+              ;; 1024-entry extension the error is raised 64 entries short of
+              ;; full -- only on the way up, at exactly that depth -- and the
+              ;; handler runs in the reserve.  The hard stop stays at capacity.
+              (if (or (>= d (%dynb-capacity blk))
+                      (and (> (%dynb-capacity blk) 64)
+                           (= d (- (%dynb-capacity blk) 64))))
                   (%dynb-overflow key)
                   (progn
                     ;; Entry first, top second — see %DYNB-SET-TOP.

@@ -122,15 +122,17 @@
    byte-identical.
 
    Layout, from mvm/prelude.lisp: blk+0xC58 = depth as a TAGGED fixnum (one
-   SHR, exactly like the MV count), blk+0xC60 = entry 0, 16 bytes per entry,
-   [key][value].  Only the VALUE word is scanned; a key is a name hash, i.e.
+   SHR, exactly like the MV count), blk+0xC60 = the thread's extension stack
+   base, TAGGED the same way (0 = none, entries in-window from blk+0xC70),
+   16 bytes per entry, [key][value].  Only the VALUE word is scanned; a key is a name hash, i.e.
    a fixnum, which scan_word would reject anyway.
 
    RDI and R10 are the loop registers because scan_word/copy_object preserve
    them — the MV-extras loop above depends on the same property."
   (when *x64-tls-window*
     (let ((db-loop (make-label))
-          (db-done (make-label)))
+          (db-done (make-label))
+          (db-inwin (make-label)))
       (emit-tls-base buf 'rdi)                       ; rdi = this thread's base
       (emit-cmp-reg-imm buf 'rdi 0)
       (emit-jcc buf :e db-done)                      ; base 0 = main thread
@@ -138,7 +140,15 @@
       (emit-shr-reg-imm buf 'r10 1)                  ; untag
       (emit-cmp-reg-imm buf 'r10 0)
       (emit-jcc buf :le db-done)
-      (emit-add-reg-imm buf 'rdi #x10000C68)         ; rdi = &entry0.value
+      (emit-mov-reg-mem buf 'rax 'rdi #x10000C60)    ; rax = tagged stack base
+      (emit-shr-reg-imm buf 'rax 1)                  ; untag
+      (emit-cmp-reg-imm buf 'rax 0)
+      (emit-jcc buf :e db-inwin)                     ; 0 = in-window entries
+      (emit-mov-reg-reg buf 'rdi 'rax)
+      (emit-add-reg-imm buf 'rdi 8)                  ; rdi = &entry0.value
+      (emit-jmp buf db-loop)
+      (emit-label buf db-inwin)
+      (emit-add-reg-imm buf 'rdi #x10000C78)         ; rdi = &entry0.value
       (emit-label buf db-loop)
       (emit-mov-reg-reg buf 'rax 'rdi)               ; rax = slot addr
       (emit-call buf scan-word-label)
@@ -1592,9 +1602,26 @@
                 ;;
                 ;; Slots 0x10000C30/C38/C40/C48 — overwritten on each fault,
                 ;; so the FAIL-record path reads them after the longjmp settles.
-                (emit-bytes buf #x48 #x8B #x82 #xA8 #x00 #x00 #x00) ; mov rax, [rdx+0xA8] (saved RIP)
-                (emit-bytes buf #x48 #x89 #x04 #x25)
-                (emit-u32 buf #x10000C30)
+                ;;
+                ;; EXCEPT THE RIP SLOT ONCE THREADS ARE LIVE.  0x10000C30 is
+                ;; ALSO the per-thread window's self slot (+TLS-SELF-ADDR+),
+                ;; and this store is absolute -- no segment override -- so on
+                ;; ANY thread it lands in the MAIN thread's self slot.  With
+                ;; the threads gate (0x10000DB8) open, a non-zero self slot
+                ;; means "armed worker": main would take the RIP for its window
+                ;; base and bind specials into the image.  So the RIP store is
+                ;; skipped while the gate is open; %RT-THREADS-ON clears what
+                ;; an earlier fault left.  With the gate shut -- every gate
+                ;; runner, every single-threaded image -- nothing changes.
+                (let ((skip-rip (make-label)))
+                  (emit-bytes buf #x83 #x3C #x25)                   ; cmp dword [0x10000DB8], 0
+                  (emit-u32 buf #x10000DB8)
+                  (emit-bytes buf #x00)
+                  (emit-jcc buf :ne skip-rip)
+                  (emit-bytes buf #x48 #x8B #x82 #xA8 #x00 #x00 #x00) ; mov rax, [rdx+0xA8] (saved RIP)
+                  (emit-bytes buf #x48 #x89 #x04 #x25)
+                  (emit-u32 buf #x10000C30)
+                  (emit-label buf skip-rip))
                 (emit-bytes buf #x48 #x8B #x82 #xA0 #x00 #x00 #x00) ; mov rax, [rdx+0xA0] (saved RSP)
                 (emit-bytes buf #x48 #x89 #x04 #x25)
                 (emit-u32 buf #x10000C38)

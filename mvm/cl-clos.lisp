@@ -5713,6 +5713,10 @@
    contents, honor :initial-element / :initial-contents / :fill-pointer
    / :displaced-to.  Returns A (eq holds — MDAs are always adjustable
    in our impl since the header is mutable)."
+  ;; NEW-SIZE bounds every fill loop below: a non-integer here is an overrun
+  ;; of new-data, not a wrong answer, so refuse it outright.
+  (unless (and (integerp new-size) (>= new-size 0))
+    (%signal-type-error))
   (let ((displaced-to nil) (displaced-offset 0)
         (fp-arg :unset) (init-elem :unset) (init-contents :unset)
         (cur args))
@@ -5809,6 +5813,25 @@
              (>= (%mda-rank a) 2)
              (not (member :displaced-to args)))
     (return-from adjust-array (%adjust-mda-nd a new-size args)))
+  ;; RANK 0: the new dimensions are () -- NEW-SIZE is NIL.  It used to reach
+  ;; %adjust-mda-1d as the loop bound, which compared the index against NIL's
+  ;; raw word (#xDEAD0001) and wrote ~3.7e9 slots past a 1-element array:
+  ;; heap corruption that crashed or hung whichever later test the damage hit
+  ;; (the adjust-array string/bit-vector cluster, allocation-order dependent).
+  ;; A rank-0 array is a 1-element MDA with dims NIL: adjust it as one, with
+  ;; :INITIAL-CONTENTS being the element itself (#0Ay), and keep dims ().
+  (when (and (null new-size) (%mda-p a) (= (%mda-rank a) 0))
+    (let ((args1 nil) (cur args))
+      (loop (when (null cur) (return nil))
+        (setq args1 (cons (car cur)
+                          (cons (if (eq (car cur) :initial-contents)
+                                    (list (cadr cur))
+                                    (cadr cur))
+                                args1)))
+        (setq cur (cddr cur)))
+      (%adjust-mda-1d a 1 args1)   ; pair order is irrelevant: it scans every key
+      (%prim-aset a 1 nil)
+      (return-from adjust-array a)))
   (when (consp new-size) (setq new-size (car new-size)))
   (when (%mda-p a)
     (let ((rank (%mda-rank a)))

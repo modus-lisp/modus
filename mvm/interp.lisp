@@ -222,7 +222,13 @@
   ;; call (lock + GETHASH), so every CMP/TEST and every conditional branch
   ;; paid one.
   (flags   0 :type fixnum)
-  (memory  (make-hash-table :test 'eql))
+  ;; MEMORY / PERCPU / IO-PORTS are created on first WRITE (%mvm-ensure-*):
+  ;; every interpreter entry -- every call through a trampoline -- built all
+  ;; three hash tables, and only save-ctx / percpu / port ops ever touch them.
+  ;; (Held back once because it made the ANSI adjust-array cluster crash; the
+  ;; cause was a rank-0 ADJUST-ARRAY heap overrun that allocation order merely
+  ;; exposed -- fixed in cl-clos.lisp.)
+  (memory  nil)
   ;; NO "HEAP" RETENTION LIST.  There used to be one: every op-cons /
   ;; op-alloc-cons / op-alloc-obj / -array / -string / -u8 pushed its fresh
   ;; object onto a `heap' list slot, commented "keep alive (anti-collection)".
@@ -248,9 +254,9 @@
   ;; MV-VALS — do not bring back a retention list.
   (halted  nil :type boolean)
   (call-stack nil :type list)
-  (percpu  (make-hash-table :test 'eql))
+  (percpu  nil)
   (interrupts-enabled t :type boolean)
-  (io-ports (make-hash-table :test 'eql))
+  (io-ports nil)
   ;; Calling-convention registers (native: RAX=nargs, a closure-env reg, and
   ;; the MV-COUNT slot).  Modeled as state fields so set/get-nargs, set/get-cenv,
   ;; and set-mv-count have somewhere to live.

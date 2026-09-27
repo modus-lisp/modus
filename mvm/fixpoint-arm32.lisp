@@ -1443,6 +1443,17 @@
           (loop
             (when (>= j size) (return hash))
             (let ((b (aref bytes j)))
+              ;; #252 diag: every 2M bytes h<j>:<hash> g<gc>; first non-fixnum byte J<j> and its neighbours
+              (when (zerop (logand j 2097151))
+                (write-char-serial 104) (print-dec j) (write-char-serial 58) (print-dec hash) (write-char-serial 32) (td-gc-mark) (write-char-serial 10))
+              (unless (fixnump b)
+                (write-char-serial 74) (print-dec j) (write-char-serial 32)
+                (let ((k (if (> j 2) (- j 2) 0)))
+                  (loop (when (> k (+ j 2)) (return nil))
+                    (let ((v (aref bytes k)))
+                      (write-char-serial 91) (if (fixnump v) (print-dec v) (write-char-serial 63)) (write-char-serial 93))
+                    (setq k (+ k 1))))
+                (write-char-serial 10) (return hash))
               (setq hash (logand #xFFFFFFFF
                                  (* (logxor hash b) 16777619))))
             (setq j (+ j 1)))))))

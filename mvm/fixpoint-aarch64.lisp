@@ -2,7 +2,11 @@
 ;;; AArch64 translator overrides (bare-metal compatible)
 ;;; ============================================================
 
-;;; Override a64-resolve-fixups: no destructuring-bind or ecase
+;;; Override a64-resolve-fixups: no destructuring-bind or ecase.
+;;; Fixup TYPES are the KEYWORDS translate-aarch64's a64-add-fixup records
+;;; (:b :bl :bcond :adr); this used to compare them against name-hash
+;;; integers, so every fixup counted as a miss (fm507946) and Gen1 shipped with
+;;; every branch/BL/B.cond still holding its zero placeholder (#252).
 (defun a64-resolve-fixups (buf)
   (let ((code (a64-buffer-code buf))
         (rest-fixups (a64-buffer-fixups buf))
@@ -20,19 +24,19 @@
                   (cond
                     ;; :b (name-hash 518081061) and :bl (391831169)
                     ;; Both use imm26 encoding
-                    ((eql type 518081061)
+                    ((eq type :b)
                      (setq fix-b (+ fix-b 1))
                      (aset code index
                            (logior (logand word #xFC000000)
                                    (logand offset #x3FFFFFF))))
-                    ((eql type 391831169)
+                    ((eq type :bl)
                      (setq fix-bl (+ fix-bl 1))
                      (aset code index
                            (logior (logand word #xFC000000)
                                    (logand offset #x3FFFFFF))))
                     ;; :bcond (name-hash 248172622495451147)
                     ;; Reconstruct from scratch to avoid bit4 tagging issue
-                    ((eql type 248172622495451147)
+                    ((eq type :bcond)
                      (setq fix-bcond (+ fix-bcond 1))
                      (let ((cond-bits (logand word #xF)))
                        (let ((new-word (logior (ash #b01010100 24)
@@ -54,7 +58,7 @@
                                (print-dec new-word) (write-char-serial 10))))
                          (aset code index new-word))))
                     ;; :adr (name-hash 253724600)
-                    ((eql type 253724600)
+                    ((eq type :adr)
                      (setq fix-adr (+ fix-adr 1))
                      (let ((byte-off (* offset 4)))
                        (let ((immlo (logand byte-off 3)))
@@ -65,7 +69,12 @@
                                (let ((lo (logior (ash immhi 5) rd)))
                                  (aset code index
                                        (logior hi lo)))))))))
-                    (t (setq fix-miss (+ fix-miss 1))))))
+                    (t (setq fix-miss (+ fix-miss 1))
+                       ;; name the first few unknown fixup types instead of silently skipping
+                       (when (<= fix-miss 3)
+                         (write-char-serial 63) ;; ?
+                         (if (symbolp type) (write-string-serial (symbol-name type)) (print-dec (if (fixnump type) type -1)))
+                         (write-char-serial 10))))))
               (setq fix-skip (+ fix-skip 1))))))
       (setq rest-fixups (cdr rest-fixups)))
     ;; Print fixup stats
@@ -117,30 +126,14 @@
   (a64-emit buf (logior (ash 1 31) (ash #b00 29) (ash #b100101 23)
                         (ash (logand hw 3) 21) (ash (logand imm16 65535) 5) rd)))
 
-;;; --- ADD/SUB immediate (null-safe shift) ---
-(defun a64-add-imm (buf rd rn imm12 shift)
-  (when (null shift) (setq shift 0))
-  (let ((sh (if (= shift 12) 1 0)))
-    (a64-emit buf (logior (ash 1 31) (ash #b100010 23) (ash sh 22)
-                          (ash (logand imm12 4095) 10) (ash rn 5) rd))))
-
-(defun a64-adds-imm (buf rd rn imm12 shift)
-  (when (null shift) (setq shift 0))
-  (let ((sh (if (= shift 12) 1 0)))
-    (a64-emit buf (logior (ash 1 31) (ash 1 29) (ash #b100010 23) (ash sh 22)
-                          (ash (logand imm12 4095) 10) (ash rn 5) rd))))
-
-(defun a64-sub-imm (buf rd rn imm12 shift)
-  (when (null shift) (setq shift 0))
-  (let ((sh (if (= shift 12) 1 0)))
-    (a64-emit buf (logior (ash 1 31) (ash 1 30) (ash #b100010 23) (ash sh 22)
-                          (ash (logand imm12 4095) 10) (ash rn 5) rd))))
-
-(defun a64-subs-imm (buf rd rn imm12 shift)
-  (when (null shift) (setq shift 0))
-  (let ((sh (if (= shift 12) 1 0)))
-    (a64-emit buf (logior (ash 1 31) (ash 1 30) (ash 1 29) (ash #b100010 23)
-                          (ash sh 22) (ash (logand imm12 4095) 10) (ash rn 5) rd))))
+;;; The ADD/SUB-immediate "null-safe shift" overrides that used to live here
+;;; are GONE (#252): translate-aarch64's a64-add-imm / a64-adds-imm /
+;;; a64-sub-imm / a64-subs-imm take (buf rd rn imm12) and every caller passes
+;;; four arguments, so the five-parameter overrides that outlived their
+;;; &key era won last-defun-wins and turned every ADD/SUB-immediate into an
+;;; arity mismatch that emitted NOTHING -- Gen1's metadata-zeroing loop had
+;;; no increment and spun forever, and its translated code was missing every
+;;; such instruction.
 
 ;;; --- ADD/SUB register (null-safe shift/amount) ---
 (defun a64-add-reg (buf rd rn rm shift amount)
@@ -186,9 +179,15 @@
 ;;; --- a64-load-imm64: bare-metal compatible (no list/remove-if/lambda) ---
 (defun a64-load-imm64 (buf rd imm64)
   (let ((hw0 (logand imm64 65535))
-        (hw1 (logand (ash imm64 -16) 65535))
-        (hw2 (logand (ash imm64 -32) 65535))
-        (hw3 (logand (ash imm64 -48) 65535)))
+        ;; #252: IMM64 may be a bignum.  (ash bignum -16) is an INLINED :sar on
+        ;; the bignum's POINTER (CLAUDE.md limitation 8: address-dependent
+        ;; garbage, so Gen3 could never equal Gen1), and (ash bignum -32) is a
+        ;; runtime BIGNUM-ASH with a variable count (8b, runaway bignum).
+        (hw1 (logand (floor imm64 65536) 65535))
+        ;; (continued) -- FLOOR is bignum-safe and brings the high halves into
+        ;; fixnum range before the remaining constant shift.
+        (hw2 (logand (floor imm64 4294967296) 65535))
+        (hw3 (logand (ash (floor imm64 140737488355328) -1) 65535)))
     (let ((nz 0) (first-nz-idx 0))
       (when (> hw0 0) (setq nz (+ nz 1)) (setq first-nz-idx 0))
       (when (> hw1 0) (setq nz (+ nz 1)) (when (= nz 1) (setq first-nz-idx 1)))
@@ -218,47 +217,119 @@
              (if did-first (a64-movk buf rd hw3 3)
                  (progn (a64-movz buf rd hw3 3) (setq did-first t))))))))))
 
-;;; Override a64-emit-prologue for bare metal - direct instruction encoding
-(defun a64-emit-prologue (buf)
-  ;; STP x29, x30, [sp, #-80]!
-  (a64-stp-pre buf 29 30 31 -80)
-  ;; ADD x29, sp, #0 (no shift arg - avoid &key issue)
-  (a64-emit buf (logior (ash 1 31) (ash #b100010 23) (ash 31 5) 29))
-  ;; STP x19, x20, [sp, #16]
-  (a64-stp-offset buf 19 20 31 16)
-  ;; STP x21, x22, [sp, #32]
-  (a64-stp-offset buf 21 22 31 32)
-  ;; STP x23, xzr, [sp, #48]
-  (a64-stp-offset buf 23 31 31 48)
-  ;; SUB sp, sp, #1024 (no shift arg)
-  (a64-emit buf (logior (ash 1 31) (ash 1 30) (ash #b100010 23) (ash 1024 10) (ash 31 5) 31)))
-
-;;; Override a64-emit-epilogue for bare metal
-(defun a64-emit-epilogue (buf)
-  ;; ADD sp, sp, #1024 (no shift arg)
-  (a64-emit buf (logior (ash 1 31) (ash #b100010 23) (ash 1024 10) (ash 31 5) 31))
-  ;; LDP x23, xzr, [sp, #48]
-  (a64-ldp-offset buf 23 31 31 48)
-  ;; LDP x21, x22, [sp, #32]
-  (a64-ldp-offset buf 21 22 31 32)
-  ;; LDP x19, x20, [sp, #16]
-  (a64-ldp-offset buf 19 20 31 16)
-  ;; LDP x29, x30, [sp], #80
-  (a64-ldp-post buf 29 30 31 80)
-  ;; RET
-  (a64-ret buf))
+;;; The a64-emit-prologue / a64-emit-epilogue overrides that lived here are
+;;; GONE (#252).  They set x29 = sp BEFORE the `sub sp, #1024', while
+;;; translate-aarch64's frame model (and every [x29 + off] local it emits)
+;;; assumes x29 was set LAST, at the bottom of the locals region -- so every
+;;; local store in Gen1 landed 1 KB up, in the CALLER's frame, over its saved
+;;; x19..x23; a callee's epilogue then handed %BULK-COPY a stack address as
+;;; its index and the store went through the page tables.  They also never
+;;; saved x27 (CENV) or the V9-V13 local registers.  The modern pair takes
+;;; only 4-argument helpers, so nothing here needs to stand in for it.
 
 ;;; Override a64-buffer-to-bytes: dotimes on bare metal returns nil (ignores
 ;;; result form), so the original function returns nil instead of the byte array.
 ;;; Use explicit loop with return.
+(defun td-bc-xor (tag bc)
+  ;; #252 diag: X<tag>=<xor of the bytecode array> -- the array is being
+  ;; overwritten with cons pointers at 8-byte slots during translation.
+  (let ((x 0) (i 0) (n (array-length bc)))
+    (loop (when (>= i n) (return nil)) (setq x (logxor x (aref bc i))) (setq i (+ i 1)))
+    (write-char-serial 88) (write-char-serial tag) (write-char-serial 61) (print-dec x) (write-char-serial 10)))
+(defun td-a64-gc-bitmap-init (obj-base cons-base nbytes)
+  ;; The CL image's %rpi-gc-bitmap-init, for the fixpoint's AArch64 generation:
+  ;; zero the object-start and cons-kind bitmaps and publish page_base (from
+  ;; the %gc-init'd block), the object bitmap and the cons bitmap in the MCGC
+  ;; config words the native trampoline reads.  Must run BEFORE the first
+  ;; allocation: an object allocated earlier carries no start bit and the
+  ;; collector would refuse to forward references to it.
+  (let ((i 0))
+    (loop
+      (when (>= i nbytes) (return nil))
+      (setf (mem-ref (+ obj-base i) :u64) 0)
+      (setf (mem-ref (+ cons-base i) :u64) 0)
+      (setq i (+ i 8))))
+  (setf (mem-ref #x10000E00 :u64) (%gc-from-start))
+  (setf (mem-ref #x10000E18 :u64) obj-base)
+  (setf (mem-ref #x10000E40 :u64) cons-base)
+  nil)
+(defvar *td-bc-shadow* nil)
+(defun td-bc-diff (bc)
+  ;; #252 diag: first index where BC differs from the shadow copy taken at S1,
+  ;; the 8-byte word there (little-endian, from the 8-aligned slot), and the count.
+  (let ((n (array-length bc)) (i 0) (first -1) (cnt 0))
+    (loop (when (>= i n) (return nil))
+      (unless (= (aref bc i) (aref *td-bc-shadow* i))
+        (setq cnt (+ cnt 1)) (when (< first 0) (setq first i)))
+      (setq i (+ i 1)))
+    (write-char-serial 68) (write-char-serial 61) (print-dec first) (write-char-serial 47) (print-dec cnt)
+    (when (>= first 0)
+      (let ((b (logand first -8)) (w 0) (k 7))
+        (loop (when (< k 0) (return nil)) (setq w (logior (ash w 8) (aref bc (+ b k)))) (setq k (- k 1)))
+        (write-char-serial 32) (write-char-serial 87) (print-dec w)))
+    (write-char-serial 10)))
+(defvar *td-bad-word-index* -1)
+(defvar *td-bc-to-native* nil)
+(defun td-apply-fn-addr-patches (native-start code-base native-size)
+  ;; NATIVE-START = image offset of the native code; CODE-BASE = its VA;
+  ;; NATIVE-SIZE bounds the patch positions -- 40 entries once landed PAST
+  ;; the native code and rewrote the appended bytecode (#252); they are
+  ;; skipped, counted, and the first few named (position, target).
+  (let ((rest *aarch64-fn-addr-patches*) (applied 0) (missing 0) (oob 0))
+    (loop
+      (when (null rest) (return nil))
+      (let ((patch (car rest)))
+        (let ((movz-pos (car patch)) (target-bc (cdr patch)))
+          (let ((noff (if (and (fixnump movz-pos) (>= movz-pos 0) (< (+ movz-pos 8) native-size))
+                          (gethash target-bc *td-bc-to-native*)
+                          (progn
+                            (setq oob (+ oob 1))
+                            (when (<= oob 4)
+                              (write-char-serial 79) (write-char-serial 66) (write-char-serial 58) ;; OB:
+                              (if (fixnump movz-pos) (print-dec movz-pos) (write-char-serial 63)) (write-char-serial 32)
+                              (if (fixnump target-bc) (print-dec target-bc) (write-char-serial 63)) (write-char-serial 10))
+                            nil))))
+            (if noff
+                (let ((vaddr (logior (+ code-base noff) 3)))
+                  (td-patch-a64-imm16 (+ native-start movz-pos) (logand vaddr 65535))
+                  (td-patch-a64-imm16 (+ native-start movz-pos 4) (logand (ash vaddr -16) 65535))
+                  (setq applied (+ applied 1)))
+                (setq missing (+ missing 1))))))
+      (setq rest (cdr rest)))
+    (write-char-serial 70) (write-char-serial 80) (write-char-serial 58) ;; FP:<applied> <missing> <out-of-range>
+    (print-dec applied) (write-char-serial 32) (print-dec missing) (write-char-serial 32) (print-dec oob) (write-char-serial 10)))
 (defun a64-buffer-to-bytes (buf)
   (let ((code (a64-buffer-code buf)))
     (let ((n (a64-buffer-position buf)))
-      (let ((bytes (make-array (* n 4))))
+      ;; A BYTE array (4n bytes), not a general array (32n bytes): at 16.6 MB
+      ;; of AArch64 code the general array was 133 MB, and with the 134 MB
+      ;; code array and the bytecode live beside it the peak no longer fit a
+      ;; 360 MB semispace -- the pre-check collected, the allocation STILL
+      ;; overshot into to-space, and the next collection copied the bytecode
+      ;; array over this array's tail: Gen1's last 5 MB of native code were
+      ;; bytecode (#252).
+      (let ((bytes (make-array (* n 4) :element-type '(unsigned-byte 8))))
+        ;; #252 diag: NB:<position> <4n> <array-length bytes> <array-length code>
+        (write-char-serial 78) (write-char-serial 66) (write-char-serial 58)
+        (print-dec n) (write-char-serial 32) (print-dec (* n 4)) (write-char-serial 32)
+        (print-dec (array-length bytes)) (write-char-serial 32) (print-dec (array-length code)) (write-char-serial 10)
         (let ((i 0))
           (loop
             (when (>= i n) (return bytes))
             (let ((w (aref code i)))
+              ;; #252 diag: the first non-fixnum code word (the byte array inherits it)
+              (unless (fixnump w)
+                (when (< *td-bad-word-index* 0)
+                  (setq *td-bad-word-index* i)
+                  (write-char-serial 88) (write-char-serial 87) (write-char-serial 58) ;; XW:
+                  (print-dec i) (write-char-serial 32)
+                  (print-dec (cond ((null w) 1) ((consp w) 2) (t (obj-subtag w)))) (write-char-serial 32)
+                  (let ((k (- i 2)))
+                    (loop (when (> k (+ i 2)) (return nil))
+                      (let ((v (aref code k))) (write-char-serial 91) (if (fixnump v) (print-dec v) (write-char-serial 63)) (write-char-serial 93))
+                      (setq k (+ k 1))))
+                  (write-char-serial 10))
+                (setq w 0))
               (let ((base (* i 4)))
                 (aset bytes base (logand w 255))
                 (aset bytes (+ base 1) (logand (ash w -8) 255))
@@ -356,6 +427,20 @@
 (defun translate-mvm-to-aarch64 (bytecode function-table)
   (write-char-serial 97) (write-char-serial 54) (write-char-serial 52) ;; a64
   (write-char-serial 10)
+  ;; #'NAME loads are MOVZ/MOVK placeholders the translator records on
+  ;; *aarch64-fn-addr-patches* (native byte pos . target bytecode offset) for
+  ;; a post-link pass -- cross.lisp's apply-aarch64-fn-addr-patches on the
+  ;; host.  Nothing applied them here, so every #'f in Gen1 was 0 and the
+  ;; first FUNCALL of one (PUTHASH's comparator) trapped (#252).  Start the
+  ;; list fresh, keep a bytecode-offset -> native-offset map for the
+  ;; assembler, which applies them (td-apply-fn-addr-patches).
+  (setq *aarch64-fn-addr-patches* nil)
+  (setq *aarch64-translated-start-idx* 0)
+  (setq *td-bc-to-native* (make-hash-table))
+  ;; #252 diag: shadow copy of the bytecode for td-bc-diff
+  (let ((n (array-length bytecode)))
+    (setq *td-bc-shadow* (make-array n :element-type (quote (unsigned-byte 8))))
+    (let ((i 0)) (loop (when (>= i n) (return nil)) (aset *td-bc-shadow* i (aref bytecode i)) (setq i (+ i 1)))))
   (let ((buf (make-a64-buffer)))
     (let ((n-functions (length function-table)))
       (print-dec n-functions) (write-char-serial 10)
@@ -371,6 +456,7 @@
                   (puthash offset mvm-to-native-label lbl))))
             (setq rest-ft (cdr rest-ft))
             (setq i (+ i 1))))
+        (td-bc-xor 97 bytecode)  ;; Xa= after first pass (labels for entries)
         ;; Pre-scan ALL function bodies for branch targets
         (let ((rest-ft function-table)
               (i 0))
@@ -381,7 +467,35 @@
                     (len (car (cdr (cdr entry)))))
                 (td-a64-scan-branches bytecode offset len mvm-to-native-label)))
             (setq rest-ft (cdr rest-ft))
-            (setq i (+ i 1))))
+            (setq i (+ i 1))
+            (when (zerop (mod i 500))
+              (write-char-serial 115) (print-dec i) (write-char-serial 32)
+              (let ((h (%ht-bucket-holder mvm-to-native-label)))
+                (print-dec (if h (let ((v (%ht-h-vec h))) (cond ((null v) 0) ((arrayp v) 1) (t 2))) -1))
+                (write-char-serial 47) (print-dec (if h (%ht-h-count h) -1)))
+              ;; #252: g<collections> A<bytecode array word>/<its length> V<label bucket vector word>/<its length> then the checksum
+              (write-char-serial 32) (td-gc-mark) (write-char-serial 65) (print-dec (%gc-word-of bytecode #x3000070))
+              (write-char-serial 47) (print-dec (%prim-array-length bytecode)) (write-char-serial 32)
+              (let ((h (%ht-bucket-holder mvm-to-native-label)))
+                (let ((v (and h (%ht-h-vec h))))
+                  (write-char-serial 86)
+                  (if (arrayp v)
+                      (progn (print-dec (%gc-word-of v #x3000070)) (write-char-serial 47) (print-dec (%prim-array-length v)))
+                      (write-char-serial 45))
+                  (write-char-serial 32)))
+              (td-bc-xor 112 bytecode)
+              (td-bc-diff bytecode))))
+        (td-bc-xor 98 bytecode)  ;; Xb= after the branch pre-scan
+        ;; label-table state after the pre-scan: W<index kind: 1 = bucketed> N<count> (#252)
+        (let ((h (%ht-bucket-holder mvm-to-native-label)))
+          (write-char-serial 87) (print-dec (if h (let ((v (%ht-h-vec h))) (cond ((null v) 0) ((arrayp v) 1) (t 2))) -1))
+          (write-char-serial 32) (write-char-serial 78) (print-dec (if h (%ht-h-count h) -1)) (write-char-serial 10))
+        ;; The NATIVE collector (#252): bind the trampoline label now so every
+        ;; gc-check the second pass emits is a BL to it (bare metal never loads
+        ;; x28, so *aarch64-gc-trampoline-call-via-bl* must be T); the trampoline
+        ;; itself is emitted after the last function, and Gen1's kernel-main
+        ;; publishes the heap geometry and zeroes the bitmaps at boot.
+        (setq *aarch64-gc-trampoline-label* (gensym-label))
         ;; Second pass: translate each function
         (write-char-serial 84) (write-char-serial 10) ;; T
         (let ((fn-map (make-hash-table)))
@@ -394,13 +508,26 @@
                 (let ((name (car entry))
                       (offset (car (cdr entry)))
                       (len (car (cdr (cdr entry)))))
+                  ;; 16-byte-align the ENTRY VA, as translate-mvm-to-aarch64 proper
+                  ;; does: fn pointers are addr|3 and CALL-IND checks the low
+                  ;; nibble is exactly 3, so the raw address must end in 0.  The
+                  ;; native code starts at image offset 0x1004 (VA 0x81004), so the
+                  ;; entry VA is 16-aligned when (4*index + 4) mod 16 = 0.  Without
+                  ;; this every #'f in Gen1 was addr|3 with nibble B and the first
+                  ;; FUNCALL trapped (#252).
+                  (loop
+                    (when (zerop (mod (+ (* (a64-current-index buf) 4) 4) 16)) (return nil))
+                    (a64-emit buf #xD503201F))
                   ;; Set label at function entry
                   (let ((fn-label (gethash offset mvm-to-native-label)))
                     (when fn-label
                       (a64-set-label buf fn-label)))
                   ;; Record native byte offset for this function
                   (let ((native-off (* (a64-current-index buf) 4)))
-                    (puthash name fn-map native-off))
+                    (puthash name fn-map native-off)
+                    (puthash offset *td-bc-to-native* native-off)
+                    ;; per-function native map for mapping a Gen1 fault PC: F<hash>@<off>
+                    (write-char-serial 70) (print-dec name) (write-char-serial 64) (print-dec native-off) (write-char-serial 10))
                   ;; NOTE: No explicit prologue here — the TRAP instruction
                   ;; at function start triggers prologue via translate-mvm-insn
                   ;; Translate body
@@ -409,79 +536,45 @@
               (setq i (+ i 1))
               (when (zerop (mod i 50))
                 (write-char-serial 35)
-                (print-dec i)
+                (print-dec i) (write-char-serial 64) (print-dec (a64-buffer-position buf))
                 (write-char-serial 10))))
           ;; End-of-stream label
           (let ((end-label (gethash (array-length bytecode) mvm-to-native-label)))
             (when end-label
               (a64-set-label buf end-label)))
+          (td-bc-xor 99 bytecode)  ;; Xc= after the second pass (translation)
+          ;; The native Cheney collector, reached by BL from every gc-check.
+          (when (and *aarch64-gc-native-mcgc* *aarch64-gc-trampoline-label*)
+            (write-char-serial 84) (write-char-serial 82) (write-char-serial 58) ;; TR:
+            (print-dec (a64-buffer-position buf)) (write-char-serial 32)
+            (emit-aarch64-native-gc-trampoline buf)
+            (write-char-serial 47) (print-dec (a64-buffer-position buf)) (write-char-serial 10))
+          ;; #252 diag: which function owns the first bad code word (see a64-buffer-to-bytes)
+          (when (>= *td-bad-word-index* 0)
+            (let ((bad (* *td-bad-word-index* 4)) (best -1) (best-name 0) (rf function-table))
+              (loop (when (null rf) (return nil))
+                (let ((nm (car (car rf))))
+                  (let ((off (gethash nm fn-map)))
+                    (when (and off (<= off bad) (> off best)) (setq best off) (setq best-name nm))))
+                (setq rf (cdr rf)))
+              (write-char-serial 88) (write-char-serial 70) (write-char-serial 58) ;; XF:
+              (print-dec best-name) (write-char-serial 32) (print-dec best) (write-char-serial 32) (print-dec bad) (write-char-serial 10)))
+          ;; #252 diag: final position and the KERNEL-MAIN entry as recorded
+          (write-char-serial 81) (print-dec (a64-buffer-position buf)) (write-char-serial 32)
+          (print-dec (gethash (td-read-u32 #x3000028) fn-map)) (write-char-serial 10) ;; Q<pos> <km-off>
           ;; Resolve fixups
           (write-char-serial 82) (write-char-serial 10) ;; R
           (a64-resolve-fixups buf)
-          (write-char-serial 68) (write-char-serial 10) ;; D
+          (write-char-serial 68) (print-dec (a64-buffer-position buf)) (write-char-serial 10) ;; D<pos after fixups>
+          (td-bc-xor 100 bytecode)  ;; Xd= after fixup resolution
           ;; Return (cons buf fn-map)
           ;; Convert buffer to bytes for consistency
-          (let ((native-bytes (a64-buffer-to-bytes buf)))
-            ;; Diagnostic: scan byte array for B.cond (byte3=0x54)
-            (let ((nb-len (array-length native-bytes))
-                  (nb-good 0) (nb-bad 0) (nb-i 0))
-              (loop
-                (when (>= nb-i nb-len) (return nil))
-                (let ((b3 (aref native-bytes (+ nb-i 3))))
-                  (when (= b3 #x54)
-                    (let ((b0 (aref native-bytes nb-i)))
-                      (if (zerop (logand b0 #x10))
-                          (setq nb-good (+ nb-good 1))
-                          (let ((dummy (+ 0 0)))
-                            (setq nb-bad (+ nb-bad 1))
-                            (when (<= nb-bad 5)
-                              (write-char-serial 88) ;; X
-                              (print-dec nb-i) (write-char-serial 58)
-                              (print-dec b0) (write-char-serial 44)
-                              (print-dec b3) (write-char-serial 10)))))))
-                (setq nb-i (+ nb-i 4)))
-              (write-char-serial 71) ;; G
-              (print-dec nb-good) (write-char-serial 10)
-              (write-char-serial 66) ;; B
-              (print-dec nb-bad) (write-char-serial 10))
-            ;; Also check: scan code buffer (tagged words) for B.cond
-            ;; Use a different approach: check if (aref code i) >> 25 (untagged) = 0x54
-            ;; On tagged: ((tagged >> 1) >> 24) = hi byte. Check = 0x54.
-            ;; We can compute: (ash (ash word -1) -24) but this is tricky with tagged values.
-            ;; Instead, read the tagged word, write it to a scratch memory as u64,
-            ;; then read byte 3 via u8.
-            (let ((diag-code (a64-buffer-code buf))
-                  (diag-n (a64-buffer-position buf))
-                  (dg 0) (db 0) (di 0))
-              (loop
-                (when (>= di diag-n) (return nil))
-                (let ((w (aref diag-code di)))
-                  ;; Write tagged word to scratch address, read bytes
-                  (setf (mem-ref #x3000070 :u64) w)
-                  ;; :u64 writes raw tagged bits. Now read byte 3 (bits [31:24] of tagged)
-                  ;; Tagged = untagged << 1, so byte 3 of tagged is different from untagged.
-                  ;; For untagged 0x54000001, tagged 0xA8000002:
-                  ;; byte0=0x02, byte1=0x00, byte2=0x00, byte3=0xA8
-                  ;; We want to check untagged byte3 = 0x54. That's tagged byte3 = 0xA8.
-                  (let ((tb3 (mem-ref #x3000073 :u8)))
-                    (when (= tb3 #xA8)
-                      ;; Check bit 4 of untagged byte0 = bit 5 of tagged byte0
-                      (let ((tb0 (mem-ref #x3000070 :u8)))
-                        (if (zerop (logand tb0 #x20))
-                            (setq dg (+ dg 1))
-                            (let ((dummy2 (+ 0 0)))
-                              (setq db (+ db 1))
-                              (when (<= db 3)
-                                (write-char-serial 67) ;; C (code buffer bad)
-                                (print-dec di) (write-char-serial 58)
-                                (print-dec tb0) (write-char-serial 10))))))))
-                (setq di (+ di 1)))
-              (write-char-serial 99) ;; g (code buffer good)
-              (print-dec dg) (write-char-serial 10)
-              (write-char-serial 98) ;; b (code buffer bad)
-              (print-dec db) (write-char-serial 10))
-            (let ((native-size (* (a64-current-index buf) 4)))
-              (cons native-bytes (cons native-size fn-map)))))))))
+          ;; #252: hand back the WORD array itself.  The 4n byte copy was a
+          ;; ~46 MB single allocation, larger than the 16 MB guard band, so
+          ;; its gc-check fired after the allocation had already run 30 MB
+          ;; into to-space and the collection copied live data over it.
+          (let ((native-size (* (a64-current-index buf) 4)))
+            (cons (a64-buffer-code buf) (cons native-size fn-map))))))))
 
 ;;; ============================================================
 ;;; AArch64 image assembly
@@ -491,18 +584,48 @@
 ;;; Uses emit-aarch64-fixpoint-entry which writes into an mvm-buffer,
 ;;; then copies the bytes into the image.
 (defun td-generate-aarch64-boot ()
-  (let ((boot-buf (make-mvm-buffer)))
+  ;; emit-aarch64-u32 writes 32-bit WORDS into an a64-buffer's code array
+  ;; (task #34: boot preamble and translated code share one label/fixup
+  ;; space).  This used to hand it an mvm-buffer and read mvm-buffer-bytes
+  ;; back -- so every Gen1 began with garbage (first word 0x20001f10, an
+  ;; undefined instruction; #252).  Emit into an a64-buffer, resolve any
+  ;; fixups, and serialise the words little-endian.
+  (let ((boot-buf (make-a64-buffer)))
     (emit-aarch64-fixpoint-entry boot-buf)
-    ;; Copy boot bytes into image
-    (let ((boot-size (mvm-buffer-position boot-buf))
-          (i 0))
+    (a64-resolve-fixups boot-buf)
+    (let ((bytes (a64-buffer-to-bytes boot-buf)))
+      (let ((boot-size (* (a64-buffer-position boot-buf) 4))
+            (i 0))
+        (loop
+          (when (>= i boot-size) (return boot-size))
+          (img-emit (aref bytes i))
+          (setq i (+ i 1)))))))
+
+;;; #252: the metadata block sits at a FIXED image offset (VA 0x3000000 is what
+;;; every td-read-u32 #x30000xx in this file reads).  With the native GC
+;;; collector and bitmaps baked in, AArch64 native code alone is ~46 MB and
+;;; the 10 MB bytecode no longer fits below the block, so when it would not,
+;;; the bytecode (and the function table after it) go ABOVE the block instead.
+;;; Consumers only ever reach them through the metadata's offset fields.
+(defun td-bytecode-start (bc-len md-off)
+  (when (> (+ (img-pos) bc-len #x40000) md-off)
+    (let ((target (+ md-off #x1000)))
       (loop
-        (when (>= i boot-size) (return boot-size))
-        (img-emit (aref (mvm-buffer-bytes boot-buf) i))
-        (setq i (+ i 1))))))
+        (when (>= (img-pos) target) (return nil))
+        (img-emit 0))
+      (write-char-serial 94) (print-dec target) (write-char-serial 10))) ;; ^<bytecode moved above metadata>
+  (img-pos))
+
+(defun td-image-total-size (md-off)
+  (if (> (img-pos) (+ md-off 64)) (img-pos) (+ md-off 64)))
 
 ;;; Assemble Gen1 AArch64 image from translated native code
 ;;; Image layout: [boot preamble 4096B] [native code at offset 0x1000] [bytecodes] [fn-table] [pad] [metadata at 0x500000]
+(defun td-patch-a64-imm16 (byte-off imm16)
+  ;; Rewrite the imm16 field (bits 5..20) of the MOVZ/MOVK at image offset BYTE-OFF.
+  (let ((w (mem-ref (+ #x08000000 byte-off) :u32)))
+    (img-patch-u32 byte-off (logior (logand w #xFFE0001F) (ash (logand imm16 65535) 5)))))
+
 (defun td-assemble-gen1-aarch64 (result bc ft)
   ;; result = (cons native-bytes (cons native-size fn-map))
   (let ((native-bytes (car result))
@@ -553,18 +676,36 @@
       ;; 4. Copy native code (starts at 0x1004)
       (write-char-serial 78) ;; N
       (td-write-u32 #x3000050 (img-pos))
-      (let ((i 0))
+      ;; native-bytes is the a64-buffer's WORD array (see td-translate); a
+      ;; non-fixnum word (never observed since the flat-scan fix) writes 0.
+      (let ((i 0) (nwords (ash native-size -2)))
         (loop
-          (when (>= i native-size) (return nil))
-          (img-emit (aref native-bytes i))
+          (when (>= i nwords) (return nil))
+          (let ((w (aref native-bytes i)))
+            (img-emit-u32 (if (fixnump w) w 0)))
           (setq i (+ i 1))
-          (when (zerop (mod i 50000))
+          (when (zerop (mod i 12500))
             (write-char-serial 46))))
       (write-char-serial 10)
+      ;; Patch the code-bounds placeholders emit-aarch64-code-bounds-init left
+      ;; in the preamble (what cross.lisp's apply-aarch64-code-bounds-patches
+      ;; does for a host build): code_base = image VA 0x80000 + native start,
+      ;; code_end = code_base + native size.  Unpatched they read 0 and
+      ;; FUNCTIONP's code-range check misclassifies fn-addrs (#252).
+      (let ((code-base (+ #x80000 (td-read-u32 #x3000050))))
+        (let ((code-end (+ code-base native-size)))
+          (td-patch-a64-imm16 *aarch64-code-base-patch-offset* (logand code-base 65535))
+          (td-patch-a64-imm16 (+ *aarch64-code-base-patch-offset* 4) (logand (ash code-base -16) 65535))
+          (td-patch-a64-imm16 *aarch64-code-end-patch-offset* (logand code-end 65535))
+          (td-patch-a64-imm16 (+ *aarch64-code-end-patch-offset* 4) (logand (ash code-end -16) 65535))
+          (write-char-serial 67) (write-char-serial 66) (write-char-serial 58) ;; CB:
+          (print-dec code-base) (write-char-serial 45) (print-dec code-end) (write-char-serial 10)
+          (td-apply-fn-addr-patches (td-read-u32 #x3000050) code-base native-size)))
+      (td-bc-xor 101 bc)  ;; Xe= just before the bytecode is appended to the image
       ;; 4. Append MVM bytecode
       (write-char-serial 84) ;; T
       (let ((bc-len (array-length bc))
-            (bc-img-offset (img-pos)))
+            (bc-img-offset (td-bytecode-start (array-length bc) #x2F80000)))
         (let ((bi 0))
           (loop
             (when (>= bi bc-len) (return nil))
@@ -628,7 +769,7 @@
             ;; mode (default: 0=cross-compile, overridden by host script)
             (img-patch-u32 (+ md-img-off 56) 0))
           ;; Total size must cover metadata at 0x440000
-          (let ((total-size (+ #x2F80000 64)))
+          (let ((total-size (td-image-total-size #x2F80000)))
             (write-char-serial 65) (write-char-serial 49) ;; A1
             (write-char-serial 61) ;; =
             (print-dec total-size) (write-char-serial 10)
@@ -691,7 +832,7 @@
         ;; 5. Append bytecodes
         (write-char-serial 84) ;; T
         (let ((bc-len (array-length bc))
-              (bc-img-offset (img-pos)))
+              (bc-img-offset (td-bytecode-start (array-length bc) #x2F00000)))
           (let ((bi 0))
             (loop
               (when (>= bi bc-len) (return nil))
@@ -714,8 +855,10 @@
               (setq ft-count (+ ft-count 1)))
             (write-char-serial 10)
             (print-dec ft-count) (write-char-serial 10)
-            ;; 7. Write metadata at offset 0x400000 (= VA 0x500000 for x64)
-            (let ((md-img-off #x2F80000))
+            ;; 7. Write metadata at image offset 0x2F00000 = VA 0x3000000 for an x64
+            ;;    image loaded at 0x100000 (the aarch64 arm uses 0x2F80000 because
+            ;;    its image loads at VA 0x80000; both must read back at #x3000000).
+            (let ((md-img-off #x2F00000))
               ;; magic
               (img-patch-u32 md-img-off #x544D564D)
               (img-patch-u32 (+ md-img-off 4) 1)
@@ -743,7 +886,7 @@
               ;; mode (default: 0=cross-compile, overridden by host script)
               (img-patch-u32 (+ md-img-off 56) 0))
             ;; 8. Patch multiboot header
-            (let ((total-size (+ #x2F80000 64)))
+            (let ((total-size (td-image-total-size #x2F00000)))
               (let ((load-end (+ #x100000 total-size)))
                 (img-patch-u32 20 load-end)
                 (img-patch-u32 24 load-end))

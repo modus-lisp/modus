@@ -133,6 +133,13 @@
   "Label-id (integer) for the per-fork handler-stack pop helper.  See
    *aarch64-handler-push-label*.")
 
+(defvar *aarch64-tramp-trace* nil
+  "Diagnostic hook: when non-NIL, a function of one fixnum called at each
+   section of emit-aarch64-native-gc-trampoline.  NIL on the host and in every
+   image that does not set it; the fixpoint's Gen0 points it at a serial
+   printer to localise an in-image failure inside the emitter (#252).")
+(defun a64-tramp-mark (n)
+  (when *aarch64-tramp-trace* (funcall *aarch64-tramp-trace* n)))
 (defvar *aarch64-gc-trampoline-label* nil
   "Label-id (integer) for the GC trampoline.  Bound by
    assemble-kernel-image around the unified-buffer translate call so
@@ -6087,6 +6094,7 @@
     ;; entry: jump over the subroutines to main
     (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i main :b))
 
+    (a64-tramp-mark 1)
     ;; ============ SUBROUTINE scan_word (x9 = ADDRESS of word) ============
     (a64-set-label buf scan-word)
     (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0)       ; x10 = value
@@ -6153,6 +6161,7 @@
       (a64-set-label buf sret)
       (a64-ret buf))
 
+    (a64-tramp-mark 2)
     ;; ============ SUBROUTINE copy_object (x10 = tagged; → x10 = new; advances x21) ============
     (a64-set-label buf copy-obj)
     (a64-lsr-imm buf +a64-x11+ +a64-x10+ 4)
@@ -6250,6 +6259,7 @@
       (a64-set-label buf co-done)
       (a64-ret buf))
 
+    (a64-tramp-mark 3)
     ;; ============ MAIN BODY ============
     (a64-set-label buf main)
     ;; save mutator regs (same 240B frame as the Lisp trampoline)
@@ -6277,6 +6287,7 @@
     ;; object-start bitmap base below, so it MUST be restored before RET or the
     ;; next gc-check's BLR x28 would jump to the bitmap base.
     (a64-str-unsigned buf +a64-x28+ +a64-sp+ 224)
+    (a64-tramp-mark 31)
     ;; ---- #286 PAUSE TIMER: stamp collection ENTRY ----
     ;; Placed AFTER the register save (so x9/x16 are free scratch) and BEFORE
     ;; the metadata load, i.e. it brackets the whole collection including the
@@ -6298,7 +6309,9 @@
     ;; single-region image — which is every aarch64 image today — loads exactly
     ;; the addresses this code used to hard-code.  The two bitmap CONFIG words
     ;; are not region fields and keep their absolute addresses.
+    (a64-tramp-mark 32)
     (a64-load-gc-region buf +a64-x17+ +a64-x16+)
+    (a64-tramp-mark 33)
     (flet ((load-abs (rd addr) (a64-load-imm64-general buf +a64-x16+ addr)
                      (a64-ldr-unsigned buf rd +a64-x16+ 0) (a64-asr-imm buf rd rd 1))
            (load-fld (rd off) (a64-ldr-unsigned buf rd +a64-x17+ off)
@@ -6311,6 +6324,7 @@
       (load-fld +a64-x23+ +gc-off-stack-base+)          ; stack_base
       (load-abs +a64-x27+ #x10000E00)                   ; page_base
       (load-abs +a64-x28+ #x10000E18))                  ; obj-bitmap base
+    (a64-tramp-mark 4)
     ;; ---- scan THIS REGION'S ROOT WINDOW: [x26, stack_base) ----
     ;; STAGE 2, ported here by stage 3 — until now this collector started the
     ;; scan at the live SP unconditionally, i.e. it assumed every region it
@@ -6352,6 +6366,7 @@
       (a64-add-imm buf +a64-x26+ +a64-x26+ 8)
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i sloop :b))
       (a64-set-label buf sdone))
+    (a64-tramp-mark 5)
     ;; ---- fixed global roots ----
     (flet ((scan-fixed (addr) (a64-load-imm64-general buf +a64-x9+ addr)
                        (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))))
@@ -6368,6 +6383,7 @@
       ;; so scan_word returns immediately.  Keep in lock-step with the emit
       ;; site's *aarch64-jit-constvec-root*.
       (scan-fixed #x10000F10))
+    (a64-tramp-mark 6)
     ;; ---- MV region: count-1 extras from 0x98 (only when 2<=count<=16) ----
     ;; count = [0x90]>>1; extras = count-1.  Guards (both SIGNED, mirroring x64's
     ;; JLE — a b.eq-only guard let a zeroed/garbage count run extras=-1 as a
@@ -6393,6 +6409,7 @@
       (a64-sub-imm buf +a64-x26+ +a64-x26+ 1)
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i mvloop :b))
       (a64-set-label buf mvdone))
+    (a64-tramp-mark 7)
     ;; ---- Cheney scan: OBJECT-BY-OBJECT, TYPE-AWARE ----
     ;; #160 PIECE 1: walk to-space object-by-object (cursor x26; next-obj x24;
     ;; slot cursor x18 — all preserved across scan_word/copy_object).  The
@@ -6471,6 +6488,7 @@
       (a64-add-imm buf +a64-x26+ +a64-x26+ 16)
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i cloop :b))
       (a64-set-label buf cdone))
+    (a64-tramp-mark 8)
     ;; ---- clear reclaimed (old from_start = x19) object-start bitmap range ----
     ;; dest = obj_bitmap(x28) + (x19-page_base)>>7 ; count = space_size(x25)>>7 bytes.
     ;; #160 FIX: the per-semispace byte count is NOT 8-aligned — space_size =
@@ -6502,6 +6520,7 @@
       (a64-add-imm buf +a64-x9+ +a64-x9+ 1)
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i zbyte :b))
       (a64-set-label buf zdone))
+    (a64-tramp-mark 9)
     ;; ---- ALSO byte-exact clear the reclaimed CONS-KIND bitmap range ----
     ;; (else stale cons-kind bits in the reclaimed semispace would misclassify a
     ;; future object-start as a cons in the type-aware walk.)  Same range/method.
@@ -6528,6 +6547,7 @@
       (a64-add-imm buf +a64-x9+ +a64-x9+ 1)
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i zbyte2 :b))
       (a64-set-label buf zdone2b))
+    (a64-tramp-mark 10)
     ;; ---- swap metadata (store <<1), IN THE ACTIVE REGION'S BLOCK ----
     ;; x17 was the region base at entry but the scan subroutines use it as
     ;; scratch, so it is resolved again here rather than kept live across the
@@ -6562,6 +6582,7 @@
     (a64-ldr-unsigned buf +a64-x9+ +a64-x16+ +gc-off-count+)
     (a64-add-imm buf +a64-x9+ +a64-x9+ 2)
     (a64-str-unsigned buf +a64-x9+ +a64-x16+ +gc-off-count+)
+    (a64-tramp-mark 11)
     ;; ---- #286 PAUSE TIMER + SURVIVOR BYTES: close out this collection ----
     ;; MUST stay here, before the register restore: x21 (free_ptr) and x22
     ;; (to_start) are still live and their difference is exactly the number of
@@ -6609,6 +6630,7 @@
       (a64-ldr-unsigned buf +a64-x10+ +a64-x16+ 0)
       (a64-add-reg buf +a64-x10+ +a64-x10+ +a64-x12+ 0 0)
       (a64-str-unsigned buf +a64-x10+ +a64-x16+ 0))
+    (a64-tramp-mark 12)
     ;; ---- restore mutator regs + RET ----
     (a64-ldr-unsigned buf +a64-x28+ +a64-sp+ 224)   ; restore trampoline VA into x28
     (a64-ldr-unsigned buf +a64-x30+ +a64-sp+ 216)
@@ -6638,6 +6660,7 @@
    those labels at the entry points.  No-op otherwise — non-unified
    callers don't pay for this."
   (when (and *aarch64-handler-push-label* *aarch64-handler-pop-label*)
+    (a64-tramp-mark 13)
     ;; ---- PUSH helper ----
     (a64-set-label buf *aarch64-handler-push-label*)
     ;; x9 = 0x10010000 (depth slot)

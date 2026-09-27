@@ -84,8 +84,37 @@
     "boot/boot-i386.lisp"
     "boot/boot-arm32.lisp"))
 
+;;; #252: mvm/compiler.lisp is NOT in this image, but translate-x64/aarch64/i386,
+;;; cross, gc.lisp and the boot descriptors use its DEFCONSTANTs (+gc-off-*+,
+;;; +gc-region-addr+, +tag-function+, +nil-value+, ...).  The MVM compiler folds
+;;; a constant ONLY if its defconstant appeared EARLIER in the source stream;
+;;; otherwise the use becomes a read of an uninitialised global (NIL), and the
+;;; in-image aarch64 GC-trampoline emitter died at its first (ash NIL -3).  So
+;;; the host's values are emitted as literal defconstants at the head of the
+;;; stream.  Values come from the host (compiler.lisp is loaded there).
+(defvar *fixpoint-constant-names*
+  '("+GC-REGION-STRIDE+" "+GC-OFF-FROM-START+" "+GC-OFF-TO-START+"
+    "+GC-OFF-SPACE-SIZE+" "+GC-OFF-STACK-BASE+" "+GC-OFF-COUNT+"
+    "+GC-OFF-SAVED-SP+" "+GC-OFF-SAVED-ALLOC+" "+GC-OFF-SAVED-LIMIT+"
+    "+GC-MAX-PARKED-WINDOW+" "+GC-REGION-0-BASE+" "+GC-REGION-ADDR+"
+    "+GC-REGION-PERCPU-ADDR+" "+GC-PERCPU-CPU-ID-OFF+"
+    "+GC-FROM-START-ADDR+" "+GC-TO-START-ADDR+" "+GC-SPACE-SIZE-ADDR+"
+    "+GC-STACK-BASE-ADDR+" "+GC-COUNT-ADDR+" "+CLOSURE-ENV-ADDR+"
+    "+MAX-REG-ARGS+" "+MV-COUNT-ADDR+" "+FIXNUM-SHIFT+" "+FLOAT-SLOTS+"
+    "+SUBTAG-FLOAT+" "+NIL-VALUE+" "+T-VALUE+" "+TAG-FIXNUM+" "+TAG-FUNCTION+"
+    "+TAG-IMMEDIATE+" "+TAG-FORWARD+"))
+
+(defvar *fixpoint-constants-text*
+  (with-output-to-string (s)
+    (dolist (n *fixpoint-constant-names*)
+      (let ((sym (find-symbol n "MODUS.MVM")))
+        (unless (and sym (boundp sym))
+          (error "fixpoint constant ~A not defined on the host" n))
+        (format s "(defconstant ~A ~D)~%" n (symbol-value sym))))))
+
 (defvar *mvm-source-text*
   (with-output-to-string (s)
+    (write-string *fixpoint-constants-text* s)
     (dolist (file *mvm-source-files*)
       (let ((path (merge-pathnames file *modus-base*)))
         (format t "  ~A~%" file)
@@ -107,12 +136,26 @@
 ;; semispace and the alloc pointer runs off into the GC config page.  1 MB +
 ;; grow-on-demand is what build-modus-selfhost uses.
 (let ((needle "(bytes (make-array 100663296 :element-type '(unsigned-byte 8)))")
-      (repl   "(bytes (make-array 1048576 :element-type '(unsigned-byte 8)))"))
+      (repl   "(bytes (make-array 67108864 :element-type '(unsigned-byte 8)))"))
   (let ((p (search needle *mvm-source-text*)))
     (when p
       (setf *mvm-source-text*
             (concatenate 'string (subseq *mvm-source-text* 0 p) repl
                          (subseq *mvm-source-text* (+ p (length needle))))))))
+
+;; #252: mvm.lisp's MVM-BUFFER is a FIXED 128 MB byte array.  The fixpoint uses
+;; it only for the ~4 KB x64 boot preamble (td-generate-x64-boot), but Gen1
+;; allocated it into a heap already holding ~200 MB live and spent the rest
+;; of its life in the collector (h51/h52: GC count 50 -> 330+ after "X1:").
+;; 1 MB, grow-on-demand.
+(let ((needle "(bytes (make-array 134217728 :element-type '(unsigned-byte 8)))")
+      (repl   "(bytes (make-array 1048576 :element-type '(unsigned-byte 8)))"))
+  (let ((p (search needle *mvm-source-text*)))
+    (if p
+        (setf *mvm-source-text*
+              (concatenate 'string (subseq *mvm-source-text* 0 p) repl
+                           (subseq *mvm-source-text* (+ p (length needle)))))
+        (error "build-fixpoint: mvm-buffer 128 MB needle not found in mvm.lisp"))))
 
 ;;; ============================================================
 ;;; Source preprocessing (SBCL-side)
@@ -239,10 +282,18 @@
                       (if (null operands)
                           (format s "nil")
                           (progn
+                            ;; KEYWORD literals, not name hashes: decode-instruction-mv
+                            ;; (cd8fbaa) dispatches on (ecase op-type (:reg ..) (:off32 ..))
+                            ;; and the x64 branch scan does (member :off32 op-specs), so a
+                            ;; spec of hashes matched nothing -- every instruction decoded
+                            ;; with NO operands and a wrong length, the label table filled
+                            ;; with non-fixnum keys and fell to the linear path, and Gen0
+                            ;; never reached its second pass (#252).  Keywords are safe
+                            ;; here: kernel-main runs init-keyword-table before this.
                             (loop for op in operands
                                   for first = t then nil
                                   do (unless first (format s " "))
-                                     (format s "(cons ~D" (modus.mvm::normalize-name op)))
+                                     (format s "(cons :~A" (symbol-name op)))
                             (format s " nil")
                             (dotimes (j (length operands))
                               (format s ")"))))
@@ -280,7 +331,11 @@
 ;; R14 into garbage (ENSURE-LABEL-AT read a wild pointer mid-translation).  With
 ;; it on, each alloc gets a gc-check and %gc-collect (baked from gc.lisp) is
 ;; wired into the trampoline.  Host-build codegen flag → Gen0's native code.
-(setf modus.mvm.x64::*x64-gc-enabled* t)
+(setf modus.mvm.x64::*mcgc-kind-bitmap-enabled* t)   ; as build-generic-cli: cons starts are marked, so the scan can skip leaf objects (#252)
+(setf modus.mvm.x64::*x64-gc-enabled*
+      ;; MODUS_FIXPOINT_GC=0 builds Gen0 with the collector off -- the #252
+      ;; bisect: Gen0 died after its second collection (region block count=2).
+      (not (equal (sb-ext:posix-getenv "MODUS_FIXPOINT_GC") "0")))
 
 ;; init-opcode-entries source was generated above (before in-package switch)
 ;; to avoid maphash compiler-macro conflict in modus.mvm package.
@@ -298,12 +353,19 @@
                ;; Networking source (only when --ssh)
                (or cl-user::*net-source-text* "")
                (string #\Newline)
-               ;; CL runtime (generic arith, arrays, conditions, funcall) —
-               ;; see *fixpoint-runtime-source* note above.
-               cl-user::*fixpoint-runtime-source*
-               (string #\Newline)
-               ;; MVM system source
+               ;; MVM system source (prelude FIRST -- see below)
                cl-user::*mvm-source-text*
+               (string #\Newline)
+               ;; CL runtime (generic arith, arrays, conditions, packages) AFTER
+               ;; the MVM source, as build-cli-common orders it: prelude.lisp
+               ;; carries stubs -- (defun find-package (name) nil), find-symbol,
+               ;; ... -- that the cl-*.lisp files are meant to REPLACE by
+               ;; last-defun-wins.  With the runtime concatenated before
+               ;; prelude, every one of those stubs won instead: FIND-PACKAGE
+               ;; returned NIL for a package it had just made, %INIT-PACKAGES
+               ;; exported into a NIL package, and Gen0 only lived because x64
+               ;; reads identity-mapped garbage where AArch64 Gen1 faults (#252).
+               cl-user::*fixpoint-runtime-source*
                (string #\Newline)
                ;; Fixpoint cross-compilation functions
                cl-user::*fixpoint-extra-source*
@@ -319,6 +381,12 @@
   ;; Boot code also sets this up, but setup-irq ensures it works for all
   ;; generations regardless of boot path. Safe to call twice.
   (setup-irq)
+  ;; AArch64 generation (metadata arch = 1): publish the 756 MB heap
+  ;; [0x10A00000, 0x3FE00000) as two 378 MB semispaces and zero the two 8 MB
+  ;; bitmaps at 0x04000000 / 0x04800000 -- BEFORE the first allocation.
+  (when (= (td-read-u32 #x3000008) 1)
+    (%gc-init 278921216 792723456 134217728)
+    (td-a64-gc-bitmap-init 67108864 75497472 8388608))
   ;; ---- CL runtime bring-up (the shared boot init build-cli-common does).
   ;; The fixpoint now bakes the full CL runtime (generic arith, arrays,
   ;; conditions, hash tables), and that runtime reads the symbol/keyword/package
@@ -389,7 +457,48 @@
        ;; REPL-only mode (no networking)
        (repl (cons nil nil)))
       (t
-       ;; Cross-compile mode: read target from metadata
+       ;; Cross-compile mode: read target from metadata.  The x64 boot code
+       ;; this image may emit (Gen2) must carry the LARGE heap geometry the
+       ;; host gave Gen0 (see build-fixpoint.lisp, #252): 0x3E000000 heap
+       ;; end, stack at 0x40000000.
+       (setq *x64-stack-top-override* 1073741824)
+       (setq *x64-heap-end-override* 1040187392)
+       ;; ... and the AArch64 boot code it emits for Gen1 gets the 756 MB bump
+       ;; heap (see *aarch64-fixpoint-big-heap*; QEMU -m 1024).
+       (setq *aarch64-fixpoint-big-heap* t)
+       ;; ... and its NIL register: the compiler's +nil-value+ (#xDEAD0001),
+       ;; not the legacy 0 the defvar defaults to -- Gen0 itself runs with
+       ;; R15 = #xDEAD0001 and Gen1's translated literals are the same.
+       (setq *aarch64-fixpoint-nil-value* 3735879681)
+       ;; ... and the boot re-entry guard, so a wild jump to the image base
+       ;; records the jumper's LR at 0x10000C30 and parks, instead of
+       ;; re-running boot under the live MMU (observed: vectors zeroed,
+       ;; x16 = the L2 table PA).
+       (setq *aarch64-fixpoint-reentry-guard* t)
+       ;; ... and the x64 collector Gen1 emits for Gen2 marks cons starts, so its
+       ;; to-space scan can skip leaf objects instead of forwarding bytecode bytes.
+       (setq *mcgc-kind-bitmap-enabled* t)
+       ;; The AArch64 generation gets a NATIVE collector: allocation sites mark
+       ;; the bitmaps, gc-checks BL the trampoline (bare metal never loads x28).
+       (setq *aarch64-gc-native-mcgc* t)
+       (setq *aarch64-gc-trampoline-call-via-bl* t)
+       (setq *aarch64-gc-bitmap-enabled* t)
+       (setq *aarch64-gc-limit-guard* 16777216)
+       ;; #252 diag: trace the trampoline emitter's sections on serial (t<n>)
+       (setq *aarch64-tramp-trace* (lambda (n) (write-char-serial 116) (print-dec n) (write-char-serial 32)))
+       ;; #252 bisect knob (MODUS_FIXPOINT_SLOTCACHE=0 at build time): the
+       ;; AArch64 translator's block-local frame-slot cache off in-image.
+       " (if (equal (sb-ext:posix-getenv "MODUS_FIXPOINT_SLOTCACHE") "0")
+             "(setq *a64-slot-cache-on* nil)" "") "
+       ;; #252: the x64 image Gen1 emits (Gen2) gets the same collector Gen0
+       ;; has -- boot geometry from *x64-gc-enabled*, the native trampoline
+       ;; wired to %GC-COLLECT, generic-arithmetic slow paths by label.
+       (setq *x64-gc-enabled* t)
+       " (format nil "(setq *td-gc-collect-hash* ~D) (setq *td-genmul-hash* ~D) (setq *td-genadd-hash* ~D) (setq *td-gensub-hash* ~D)"
+                 (modus.mvm::compute-name-hash "%GC-COLLECT")
+                 (modus.mvm::compute-name-hash "GENERIC-MULTIPLY")
+                 (modus.mvm::compute-name-hash "GENERIC-ADD")
+                 (modus.mvm::compute-name-hash "GENERIC-SUBTRACT")) "
        (let ((target (td-read-u32 #x3000034)))
          (build-image-cross target)))))
   (write-char-serial 68) (write-char-serial 10)
@@ -556,7 +665,7 @@
 
   ;; AArch64 reference translation (SBCL side)
   (format t "~%AArch64 reference translation (SBCL side)...~%")
-  (let ((*aarch64-serial-base* #x20000000)
+  (let ((*aarch64-serial-base* #x0F000000)   ; #252: UART VA under the big-heap boot
         (*aarch64-serial-width* 0)
         (*aarch64-serial-tx-poll* nil)
         (*aarch64-sched-lock-addr* nil))
@@ -634,12 +743,12 @@
                         (:x64     "/tmp/fixpoint-gen0.elf")
                         (:aarch64 "/tmp/fixpoint-gen0-aarch64.bin")))
          (qemu-cmd (case gen0-arch
-                     (:x64 (format nil "qemu-system-x86_64 -kernel ~A -m 512 -nographic -no-reboot" output-path))
+                     (:x64 (format nil "qemu-system-x86_64 -kernel ~A -m 1024 -nographic -no-reboot" output-path))
                      (:aarch64 (format nil "qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 512 -kernel ~A -nographic -semihosting" output-path)))))
 
   ;; AArch64 translator config
   (when (eq gen0-arch :aarch64)
-    (setq *aarch64-serial-base* #x20000000)   ; VA-mapped UART (MMU: VA 0x20000000 → PA 0x09000000)
+    (setq *aarch64-serial-base* #x0F000000)   ; VA-mapped UART (MMU: VA 0x0F000000 → PA 0x09000000, #252)
     (setq *aarch64-serial-width* 0)
     (setq *aarch64-serial-tx-poll* nil)
     (setq *aarch64-sched-lock-addr* nil))
@@ -649,8 +758,20 @@
   ;; build uses (build-x64.lisp).  Above the image, the 32 MB metadata, the
   ;; 128 MB Gen1 build buffer, and the 256 MB heap.
   (when (eq gen0-arch :x64)
-    (setf modus.mvm::*x64-stack-top-override* #x20000000))
+    ;; #252: the in-image translator's peak live set (128 MB AArch64 code
+    ;; array + 81 MB label array + copies) needs semispaces far bigger than
+    ;; the default 104 MB.  Heap end 0x3E000000 -> ~360 MB per semispace,
+    ;; stack at the top of 1 GB (QEMU -m 1024).  Gen0's kernel-main sets the
+    ;; same two values in-image so the x64 boot code it emits for Gen2
+    ;; carries the same geometry.
+    (setf modus.mvm::*x64-stack-top-override* #x40000000)
+    (setf modus.mvm::*x64-heap-end-override* #x3E000000))
 
+  ;; MODUS_SYMMAP=path: tab-separated name/offset map of Gen0 (assemble-kernel-image
+  ;; writes it), for mapping a bare-metal RIP to a function under gdb.
+  (let ((sm (sb-ext:posix-getenv "MODUS_SYMMAP")))
+    (when (and sm (plusp (length sm)))
+      (setf modus.mvm::*write-symmap-path* sm)))
   (let ((boot-desc (get-boot-descriptor boot-target)))
     (let ((image (assemble-kernel-image module (find-target build-target)
                                         :boot-descriptor boot-desc)))

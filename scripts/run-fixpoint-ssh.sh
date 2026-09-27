@@ -137,8 +137,8 @@ image_extract_size() {
 qemu_cmd() {
   # Return the QEMU command line for an architecture (no kernel argument)
   case "$1" in
-    x64)     echo "qemu-system-x86_64 -m 512 -nographic -no-reboot" ;;
-    aarch64) echo "qemu-system-aarch64 -M virt -cpu cortex-a53 -m 512 -nographic" ;;
+    x64)     echo "qemu-system-x86_64 -m 1024 -nographic -no-reboot" ;;
+    aarch64) echo "qemu-system-aarch64 -M virt -cpu cortex-a53 -m 1024 -nographic" ;;
     i386)    echo "qemu-system-i386 -m 512 -nographic -no-reboot" ;;
     arm32)   echo "qemu-system-arm -M raspi2b -m 1G -nographic" ;;
   esac

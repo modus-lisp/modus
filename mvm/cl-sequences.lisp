@@ -3268,7 +3268,7 @@
 (defun conjugate (x)
   (cond
     ((%complex-p x)
-     (complex (aref x 1) (- 0 (aref x 2))))
+     (complex (aref x 1) (%negate-number (aref x 2))))
     (t x)))
 
 (defun complexp (x) (%complex-p x))

@@ -78,7 +78,10 @@
   (let ((d (%float-sub a b)))
     (and (float-negative-p d) (not (%float-zero-p d)))))
 
-(defun %float-neg (a) (%float-sub (%fl 0) a))
+(defun %float-neg (a)
+  "IEEE negation: flip the sign, so (- 0.0) is -0.0.  0.0 - a is +0.0 for a
+   zero, which is why this multiplies instead of subtracting."
+  (%float-mul (%fl -1) a))
 
 (defun %float-abs (a) (if (float-negative-p a) (%float-neg a) a))
 
@@ -1670,8 +1673,16 @@
         (loop (when (null rest) (return r))
               (setq r (+ r (car rest)))
               (setq rest (cdr rest))))))
+(defun %negate-number (x)
+  "Unary minus for any number.  A float keeps its width and flips its
+   sign bit ((- 0.0) => -0.0); everything else is 0 - x."
+  (if (%ieee-float-p x)
+      (%as-result-float (%float-mul (%fl -1) (%any-to-float x))
+                        (%float-result-type x x))
+      (- 0 x)))
+
 (defun - (a &rest rest)
-  (if (null rest) (- 0 a)
+  (if (null rest) (%negate-number a)
       (let ((r a) (cur rest))
         (loop (when (null cur) (return r))
               (setq r (- r (car cur)))

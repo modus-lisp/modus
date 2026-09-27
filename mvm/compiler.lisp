@@ -3624,10 +3624,15 @@
             ;; instead of 4.  GENERIC-NEGATE-INT routes MNF to
             ;; %SAFE-FIXNUM-NEGATE → (make-bignum 0 1) = +2^62, and negates
             ;; bignum operands correctly too.
+            ;; A FLOAT is tested on its SIGN BIT: (< -0.0 0) is false, so
+            ;; (abs -0.0) came back -0.0 once the reader produced real
+            ;; negative zeros.
             `(let ((,tmp ,(cadr form)))
                (if (%complex-p ,tmp)
                    (%complex-abs ,tmp)
-                   (if (< ,tmp 0) (generic-negate-int ,tmp) ,tmp))))
+                   (if (%ieee-float-p ,tmp)
+                       (if (float-negative-p ,tmp) (%negate-number ,tmp) ,tmp)
+                       (if (< ,tmp 0) (generic-negate-int ,tmp) ,tmp)))))
           '(%signal-program-error))))
 
   ;; PROG1 → LET + body + return first value
@@ -5880,21 +5885,39 @@
                   (let ((pk (symbol-package (car form))))
                     (and pk (string= (package-name pk) "SB-INT"))))))))
 
-(defun expand-backquote (template)
+(defun %bq-marker-sym (x)
+  "The marker symbol to rebuild when comma X is DATA (level > 1)."
+  (if (%sbcl-comma-p x)
+      (if (= (bq-comma-kind x) 2) 'comma-at 'comma)
+      (car x)))
+
+(defun expand-backquote (template &optional (level 1))
   "Expand a backquote template into explicit list-building code.
-   Handles ,x (unquote) and ,@x (splice)."
+   Handles ,x (unquote) and ,@x (splice).  LEVEL counts the open
+   backquotes whose commas are still pending (entry is 1): a comma at
+   level 1 unquotes; a comma at a deeper level is DATA that drops one
+   level (the classic `,',x / `,,x tunnelling), and a nested backquote
+   raises the level for its template and is rebuilt as a (BACKQUOTE ...)
+   marker the in-image compiler lowers when that data is later
+   evaluated.  Same semantics as build-generic.lisp's %RBQ; before this
+   a nested template's commas were unquoted at the OUTER level (upstream
+   DEFTYPE.10-13, MISC.323, STRUCT-TEST-*/5: `(deftype ,s (&optional (x 14))
+   `(integer 0 ,x)) evaluated X in the outer scope — UNBOUND-VARIABLE)."
   (cond
-    ;; Atom (no unquoting needed): quote it
     ((null template) nil)
     ((bq-comma-p template)
-     ;; Bare ,x at top level
-     (bq-comma-expr template))
-    ((atom template)
-     (list 'quote template))
+     (if (= level 1)
+         (bq-comma-expr template)
+         (list 'list (list 'quote (%bq-marker-sym template))
+               (expand-backquote (bq-comma-expr template) (- level 1)))))
+    ((atom template) (list 'quote template))
+    ((%bq-form-p template)
+     (list 'list (list 'quote 'backquote)
+           (expand-backquote (cadr template) (+ level 1))))
     ;; List — process element by element
-    (t (expand-backquote-list template))))
+    (t (expand-backquote-list template level))))
 
-(defun expand-backquote-list (lst)
+(defun expand-backquote-list (lst &optional (level 1))
   "Expand a backquote list template. Handles splice and nested backquote."
   (let ((segments nil)   ; list of (kind . form) — :list or :splice
         (current nil))   ; accumulator for consecutive non-splice elements
@@ -5903,22 +5926,18 @@
       (loop while (consp remaining)
             do (let ((elt (car remaining)))
                  (cond
-                   ;; ,@x — splice
-                   ((and (bq-comma-p elt) (= (bq-comma-kind elt) 2))
+                   ;; ,@x — splice (only at the level that owns the comma)
+                   ((and (bq-comma-p elt) (= level 1) (= (bq-comma-kind elt) 2))
                     ;; Flush current accumulator
                     (when current
                       (push (cons :list (nreverse current)) segments)
                       (setf current nil))
                     (push (cons :splice (bq-comma-expr elt)) segments))
-                   ;; ,x — unquote
-                   ((bq-comma-p elt)
-                    (push (bq-comma-expr elt) current))
-                   ;; Nested backquote
-                   ((%bq-form-p elt)
-                    (push (expand-backquote (cadr elt)) current))
-                   ;; Nested list
-                   ((consp elt)
-                    (push (expand-backquote elt) current))
+                   ;; ,x — unquote at level 1, rebuilt as data deeper;
+                   ;; nested backquote; nested list: all via EXPAND-BACKQUOTE.
+                   ;; (An SBCL comma is a STRUCT, not a cons — test it first.)
+                   ((or (bq-comma-p elt) (consp elt))
+                    (push (expand-backquote elt level) current))
                    ;; Literal atom
                    (t
                     (push (list 'quote elt) current))))
@@ -5930,7 +5949,7 @@
           (push (cons :list (nreverse current)) segments)
           (setf current nil))
         (if (bq-comma-p remaining)
-            (push (cons :tail (bq-comma-expr remaining)) segments)
+            (push (cons :tail (expand-backquote remaining level)) segments)
             (push (cons :tail (list 'quote remaining)) segments))))
     ;; Flush final accumulator
     (when current
@@ -17703,8 +17722,16 @@
      (compile-form `(error "- requires at least one argument") env dest))
     ((null (cdr args))
      ;; Rewrite to binary (- 0 x) so the tag-checked slow path handles
-     ;; bignum / ratio / IEEE-float arguments correctly.
-     (compile-sub (list 0 (car args)) env dest))
+     ;; bignum / ratio arguments correctly.  A FLOAT must not go that way:
+     ;; 0.0 - 0.0 is +0.0 where (- 0.0) is -0.0 (upstream CONJUGATE.3,
+     ;; READ-FLOAT.1), so an operand not provably a fixnum is tag-tested
+     ;; and a float negates through %NEGATE-NUMBER.
+     (if (%expr-width (car args) env)
+         (compile-sub (list 0 (car args)) env dest)
+         (let ((g (%mvm-gensym "NEG")))
+           (compile-form `(let ((,g ,(car args)))
+                            (if (fixnump ,g) (- 0 ,g) (%negate-number ,g)))
+                         env dest))))
     (t
      (let ((anf (anf-normalize-arith-args '- args env)))
        (if anf

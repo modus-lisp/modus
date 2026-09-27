@@ -3717,6 +3717,8 @@
         ;; MOST-NEGATIVE-FIXNUM (-2^62): plain (- 0 n) WRAPS it back to
         ;; itself (still negative), and the resulting bad "magnitude"
         ;; crashed gcd/lcm.4/.6/.7.  Also covers negative bignum inputs.
+        ;; floats by sign bit: (abs -0.0) is 0.0 though (< -0.0 0) is false
+        ((%ieee-float-p n) (if (float-negative-p n) (%negate-number n) n))
         ((< n 0) (generic-negate-int n))
         (t n))))
 

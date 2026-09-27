@@ -2356,6 +2356,32 @@
                          *ha-rsize* stack-top k)
         rcb)))
 
+(defun %escape-describe (c)
+  "A short description of an escaped condition: its type and, when it has
+   them, its format control and arguments."
+  (handler-case
+      (if (%condition-p c)
+          (let ((fc (handler-case (simple-condition-format-control c) (t (c2) nil))))
+            (if fc
+                (format nil "~A (~A ~S)" (%condition-type-name c) fc
+                        (handler-case (simple-condition-format-arguments c) (t (c3) nil)))
+                (format nil "~A" (%condition-type-name c))))
+          (format nil "~S" c))
+    (t (c4) "an unprintable condition")))
+
+(defun %thr-run-body (slot rec)
+  "Run SLOT's body, and let NOTHING escape the thread.  A condition, THROW or
+   cross-unit RETURN-FROM that no frame inside the body claims used to reach
+   the bottom of the stack and LONGJMP through an empty frame to PC 0, killing
+   the process with no word about what escaped.  Report it and end the thread;
+   the thread record counts escapes at +0x60."
+  (handler-case (funcall (aref (%thr-funs) slot))
+    (t (c)
+      (%gc-write64 (+ rec #x60) (+ (%gc-read64 (+ rec #x60)) 1))
+      (format t "~&modus: thread ~D: ~A escaped the thread body (catch tag ~S, active ~S)~%"
+              slot (%escape-describe c) *catch-tag* *catch-active*)
+      0)))
+
 (defun %thr-trampoline ()
   "EVERY thread starts here.  Zero arguments, because the clone stub enters it
    with a bare `call rbx' — see the handshake above for how it learns which
@@ -2393,7 +2419,60 @@
     ;; 4. tell the spawner the slot has been read; it may now start the next.
     (%gc-write64 (+ rec #x28) 1)
     (%gc-write64 (%thr-ack) 1)
-    (funcall (aref (%thr-funs) slot))
+    ;; 5. THE CONDITION AND NON-LOCAL-EXIT STATE IS THIS THREAD'S OWN.
+    ;;    THROW, a cross-unit RETURN-FROM and handler-case dispatch hand the
+    ;;    in-flight exit from frame to frame in plain specials: THROW sets
+    ;;    *CATCH-TAG* / *CATCH-VALUE(S)* / *CATCH-ACTIVE* and longjmps, and each
+    ;;    CATCH or UNWIND-PROTECT on the way READS them to decide whether the
+    ;;    exit is its own or must be re-thrown outward (compile-unwind-protect's
+    ;;    error path).  Shared between threads, one thread's CATCH read
+    ;;    another's tag, re-threw an exit that was its own, and a worker — with
+    ;;    nothing further out — longjmped through an empty frame to PC 0
+    ;;    (sb-thread's condition-broadcast and negative-control sections, on
+    ;;    every target).  So bind them here: a worker's SETQ then lands in its
+    ;;    binding (per-thread dynamic bindings, mvm/prelude.lisp), and the
+    ;;    main thread keeps the globals.  The eval-run state MVM-EVAL-FORMS
+    ;;    saves and restores with SETQ is per-thread for the same reason.
+    ;;    ONLY WITH THE GATE OPEN.  Before a program turns threads on
+    ;;    (%RT-THREADS-ON), bindings are SHALLOW — a LET writes the global and
+    ;;    restores it — so the same LET on eight threads at once would race
+    ;;    the very words it means to isolate.  Those threads run no shared
+    ;;    Lisp state anyway (the bare %MAKE-NATIVE-THREAD selftests).
+    (if (eql (mem-ref #x10000DB8 :u32) 0)
+        (%thr-run-body slot rec)
+        (let ((*current-condition* nil)
+              (*catch-active* nil)
+              (*catch-tag* nil)
+              (*catch-value* nil)
+              (*catch-values* nil)
+              (*handler-bind-stack* nil)
+              (*restart-stack* nil)
+              (*restart-frame-condition-map* nil)
+              (*restart-case-result* nil)
+              (*restart-invoking-p* nil)
+              (*signal-walk-depth* 0)
+              (*handler-bind-effective-skip* 0)
+              (*%escape-report-busy* nil)
+              (*mvm-last-mv* nil)
+              (*jit-native-ran* nil)
+              (*jit-infra-fallback* nil)
+              (*e2-active-defun-names* nil)
+              (*e2-persist-defuns* nil)
+              (*e2-module-defuns* nil)
+              (*mvm-eval-no-cache* nil)
+              (*jit-inhibit* nil))
+          ;; DECLARED, not inferred: this compiler binds a DEFVAR'd name
+          ;; lexically unless the LET says otherwise (build-checks #248).
+          (declare (special *current-condition* *catch-active* *catch-tag*
+                            *catch-value* *catch-values* *handler-bind-stack*
+                            *restart-stack* *restart-frame-condition-map*
+                            *restart-case-result* *restart-invoking-p*
+                            *signal-walk-depth* *handler-bind-effective-skip*
+                            *%escape-report-busy* *mvm-last-mv* *jit-native-ran*
+                            *jit-infra-fallback* *e2-active-defun-names*
+                            *e2-persist-defuns* *e2-module-defuns*
+                            *mvm-eval-no-cache* *jit-inhibit*))
+          (%thr-run-body slot rec)))
     ;; PARK THE ALLOCATION FRONTIER ON THE WAY OUT.  A region's +0x30 is where
     ;; its live heap ends as far as anything outside this thread is concerned;
     ;; until it is parked it still holds the from-space START, and every

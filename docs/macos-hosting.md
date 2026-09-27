@@ -583,25 +583,34 @@ The five failing tests fail on all three platforms: sb-thread, region0-frontier,
 term-xregion, worker-xregion and thread-lisp-unsync (a control).
 mv-handler-unsync is a race control; x86-64 collides in about 2 of 6 runs.
 
-**sb-thread (fails on all three targets; open).**  What is established:
-- The fault is a LONGJMP through an EMPTY handler frame on a worker: PC = SP =
-  0.  The return address is always the same JIT site inside
-  `sb-thread:make-thread`'s module, which is the worker body that binds
-  `*current-thread*`.  A non-local exit escapes the user's function, the
-  body's unwind-protect re-throws it outward, and a worker has no outer frame.
-  The shim's `MODUS_SHIM_FAULTS=1` now dumps the registers and the code before
-  LR when a thread jumps to 0.
-- The user functions are closures from INTERPRETED toplevel forms.  An
-  interpreted closure is compiled on its FIRST CALL (`%e2ic-compile`, through
-  `mvm-eval-forms`), and the in-image compiler is process-wide state with no
-  lock.  `%make-native-thread`'s JIT-EAGER mitigation covers DEFUNs only.
-- A recursive compile lock (compile phase only, dropped before the code runs)
-  was tried and reverted: it moved the crash from the condition-broadcast
-  section into the negative-control section, which passes without it, for a
-  reason not yet understood.
+**sb-thread.**  x86-64 passes it now (44 checks).  It had crashed on all
+three targets; AArch64 still fails it.  Three shared fixes:
+- **Per-thread condition and non-local-exit state.**  THROW, cross-unit
+  RETURN-FROM and handler-case dispatch hand the in-flight exit from frame to
+  frame in plain specials (`*catch-tag*`, `*catch-value(s)*`, `*catch-active*`,
+  `*current-condition*`, and the restart and handler bookkeeping).  Shared, one
+  thread's CATCH read another's tag, re-threw an exit that was its own, and a
+  worker longjmped through an empty frame to PC 0.  `%thr-trampoline` now binds
+  them per thread (with the gate open, where bindings are per-thread; with it
+  shut a LET is shallow and would race).  So is the eval-run state
+  `mvm-eval-forms` saves and restores with SETQ.  The compiler needs
+  `(declare (special ...))` for those LETs, or it binds them lexically.
+- **Nothing escapes a thread.**  `%thr-run-body` catches whatever reaches the
+  bottom of a thread, reports it ("thread N: ... escaped the thread body") and
+  counts it in the thread record at +0x60.  Before, that was a silent jump to
+  PC 0 that took the process down.
+- **The eval lock.**  The in-image compiler is process-wide state, and
+  interpreted closures are compiled on their first call, so workers compiled
+  concurrently.  `%mvm-eval-forms-1` holds a recursive lock for the compile
+  only and drops it before the code runs, because a run can block.  It is
+  inert until threads are on.
 
-The next step is to find which non-local exit escapes (tag or target, and
-from which thread), rather than to serialize by guesswork.
+AArch64 still fails it, and the thread root now shows how: a worker's
+interpreter hits `unknown opcode NIL` at a fixed PC, running offset 6817 of a
+bytecode vector too short to hold it.  The suspect is objects compiled or
+allocated on a WORKER (its own GC region) and published into process-wide
+tables, then reclaimed when that region collects or is re-initialised for the
+next thread in the slot.  Not yet confirmed.
 
 ## Open questions
 

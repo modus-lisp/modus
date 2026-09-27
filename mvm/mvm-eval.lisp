@@ -2955,7 +2955,79 @@
       (%mvm-eval-forms-nested-in-static-build forms)
       (%mvm-eval-forms-1 forms)))
 
+;;; ============================================================
+;;; THE EVAL LOCK — one compiler at a time
+;;; ============================================================
+;;;
+;;; The in-image compiler is process-wide state from end to end: the reused
+;;; *MVM-EVAL-BUFFER*, the opcode and constant tables, *UWP-SEQ-COUNTER*, the
+;;; E2 defun bookkeeping, the JIT's page and constant-vector globals.  Two
+;;; threads compiling at once corrupt each other, and they DO compile at once:
+;;; an interpreted closure is compiled on its FIRST CALL (%E2IC-COMPILE, through
+;;; here), so workers started on closures from one toplevel form compile
+;;; concurrently with each other and with main.  MEASURED (sb-thread's mutex
+;;; section, with the thread root reporting escapes): a worker's interpreter
+;;; hit `unknown opcode NIL' — bytecode copied out of the shared buffer while
+;;; another thread was writing it.
+;;;
+;;; So compilation holds a RECURSIVE lock, and only compilation: the lock is
+;;; dropped before the compiled code RUNS (%EVAL-LOCK-DROP-FOR-RUN at both run
+;;; sites), because a run can block — a closure parked in CONDITION-WAIT holding
+;;; the lock would stop the thread that must notify it from evaluating anything.
+;;; It is NOT the runtime-table lock: that one moves allocation into a 64 KB
+;;; slice of the lock arena, and a compile allocates far more than that.
+;;;
+;;; Inert until a program turns threads on (the gate at 0x10000DB8): one load
+;;; and a branch.  Words: 0x10000EB0 lock, 0x10000EB8 owner (this thread's
+;;; window self slot + 1, so main is 1), 0x10000EC0 depth.
+(defun %eval-lock-me () (+ (mem-ref #x10000C30 :u32) 1))
+
+(defun %eval-lock-acquire ()
+  "Take one level; returns the depth now held, or 0 with threads off."
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      0
+      (let ((me (%eval-lock-me)))
+        (if (eql (mem-ref #x10000EB8 :u32) me)
+            (progn (setf (mem-ref #x10000EC0 :u32) (+ (mem-ref #x10000EC0 :u32) 1))
+                   (mem-ref #x10000EC0 :u32))
+            (progn
+              (loop
+                (when (eql (xchg-mem (%conv-addr #x10000EB0) 1) 0) (return 0))
+                ;; Somebody is compiling, which takes milliseconds: give the
+                ;; core away rather than spin it.
+                (syscall3 24 0 0 0))
+              (setf (mem-ref #x10000EB8 :u32) me)
+              (setf (mem-ref #x10000EC0 :u32) 1)
+              1)))))
+
+(defun %eval-lock-release ()
+  (let ((d (- (mem-ref #x10000EC0 :u32) 1)))
+    (setf (mem-ref #x10000EC0 :u32) d)
+    (when (eql d 0)
+      (setf (mem-ref #x10000EB8 :u32) 0)
+      (mfence)
+      (setf (mem-ref #x10000EB0 :u64) 0))
+    d))
+
+(defun %eval-lock-drop-for-run ()
+  "Before running compiled code: give back the level this call took."
+  (if (and (not (eql (mem-ref #x10000DB8 :u32) 0))
+           (eql (mem-ref #x10000EB8 :u32) (%eval-lock-me)))
+      (%eval-lock-release)
+      0))
+
 (defun %mvm-eval-forms-1 (forms)
+  (let ((%depth (%eval-lock-acquire)))
+    (unwind-protect
+        (%mvm-eval-forms-2 forms)
+      ;; Still holding THIS call's level (the compile did not reach a run
+      ;; site: an error, or an early exit) — give it back.
+      (when (and (> %depth 0)
+                 (eql (mem-ref #x10000EB8 :u32) (%eval-lock-me))
+                 (>= (mem-ref #x10000EC0 :u32) %depth))
+        (%eval-lock-release)))))
+
+(defun %mvm-eval-forms-2 (forms)
   ;; In-image: emit integer literals as fixnum-safe :li-halves (set the GLOBAL,
   ;; not a let-binding — compiled LET of a special may not establish a dynamic
   ;; binding the compiler's compile-integer reads).  Native builds never call
@@ -2999,7 +3071,9 @@
       (unless *mvm-eval-cache*
         (setq *mvm-eval-cache* (make-hash-table :test (quote equal))))
       (let ((%hit (gethash forms *mvm-eval-cache*)))
-        (when %hit (return-from mvm-eval-forms (%mvm-eval-run-tuple %hit)))))
+        (when %hit
+          (%eval-lock-drop-for-run)
+          (return-from mvm-eval-forms (%mvm-eval-run-tuple %hit)))))
   (let ((*functions* (make-hash-table :test (quote equal)))
         (*function-table* nil)
         (*constant-table* nil)
@@ -3296,6 +3370,9 @@
             ;; run so fmakunbound honors source order vs the pre-run defun
             ;; installation (see the defvar).  Lexical-save + setq-restore
             ;; (nested mvm-eval during the run saves/restores its own).
+            ;; THE COMPILE IS OVER: drop the eval lock before running (see
+            ;; THE EVAL LOCK).
+            (%eval-lock-drop-for-run)
             (let* ((%adn-saved *e2-active-defun-names*)
                    ;; WS5 #203: the re-execution guard, same as in
                    ;; %mvm-eval-run-tuple.  THIS is the site the doubling was

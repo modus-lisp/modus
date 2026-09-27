@@ -4760,6 +4760,66 @@
         (eval '(handler-case (error "boom") (error (c) :handled)))
       (t (c) (declare (ignore c)) :crashed))
     :handled)
+;; format.f.38 fails in the GATE RUNNER (deterministically on aarch64 as a
+  ;; mis-tagged #<?48>, flakily on x64) while the same body is clean in the
+  ;; CLI: the runner AOT-compiles the corpus's (funcall (compile nil '(lambda
+  ;; () BODY))) as BODY, so these are the AOT shapes, from small to whole.
+  (rt-run-test 8505
+    (let ((*read-default-float-format* 'short-float))
+      (ignore-errors (floor (read-from-string " 487.00"))))
+    487)
+  (rt-run-test 8506
+    (ignore-errors (floor (read-from-string "-2946.00")))
+    -2946)
+  (rt-run-test 8507
+    (floor (read-from-string " 487.00"))
+    487)
+  (rt-run-test 8508
+    (ignore-errors (floor 487.0))
+    487)
+  (rt-run-test 8509
+    (let ((s (format nil "~7,2f" 487.0)))
+      (list s (ignore-errors (floor (read-from-string s)))))
+    '(" 487.00" 487))
+  (rt-run-test 8510
+    (with-standard-io-syntax
+      (let ((*read-default-float-format* 'short-float))
+        (loop for i from -3000 below 3000
+              unless (zerop i)
+              nconc (loop for sf = (coerce i 'short-float)
+                          for s = (format nil "~7,2f" sf)
+                          for i2 = (ignore-errors (floor (read-from-string s)))
+                          repeat 1
+                          unless (eql i i2) collect (list i s i2)))))
+    nil)
+  (rt-run-test 8511
+    (with-standard-io-syntax
+      (let ((*read-default-float-format* 'short-float) (total 0))
+        (loop for i from -3000 below 3000
+              unless (zerop i)
+              nconc (loop for sf = (coerce i 'short-float)
+                          for w = (random 8) for d = (random 4)
+                          for s = (format nil "~v,vf" w d sf)
+                          for i2 = (ignore-errors (floor (read-from-string s)))
+                          repeat 5
+                          unless (eql i i2) do (incf total) and collect (list i sf w d s i2))
+              when (> total 100) collect "count limit exceeded" and do (loop-finish))))
+    nil)
+  ;; 8512: format.f.38 as the RUNNER compiles it -- the rewriter's
+  ;; %WITH-STANDARD-IO-SYNTAX and the corpus's full +/-2^13 range.
+  (rt-run-test 8512
+    (%with-standard-io-syntax
+      (let ((*read-default-float-format* 'short-float) (total 0))
+        (loop for i from (- 1 (ash 1 13)) below (ash 1 13)
+              unless (zerop i)
+              nconc (loop for sf = (coerce i 'short-float)
+                          for w = (random 8) for d = (random 4)
+                          for s = (format nil "~v,vf" w d sf)
+                          for i2 = (ignore-errors (floor (read-from-string s)))
+                          repeat 5
+                          unless (eql i i2) do (incf total) and collect (list i sf w d s i2))
+              when (> total 100) collect "count limit exceeded" and do (loop-finish))))
+    nil)
   ;; Regression for the compile-symbolp immediate-T fix.  A GF with
   ;; SYMBOL / INTEGER / T methods, dispatched over args of each shape.
   ;; The universal (T) specializer + a symbol/integer arg exercises the

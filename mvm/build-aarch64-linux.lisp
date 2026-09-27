@@ -237,7 +237,7 @@
                      ~%  (handler-case (rt-run-test-mv id (funcall thunk) expecteds)~
                      ~%    (t (c) (%test-crash-fail-c id c))))~
                      ~%;; wait4 wstatus buffer — 8 bytes past handler-case slots.~
-                     ~%(defvar *wstatus-addr* #x100001A0)~
+                     ~%(defvar *wstatus-addr* (%conv-addr #x100001A0))~
                      ~%;; Per-FILE fork: parent forks, child runs the file's run-ansi-X~
                      ~%;; in-process (with run-test handling per-test crashes), then exits.~
                      ~%;; If the child exit status is nonzero, the parent re-forks~
@@ -890,8 +890,8 @@
   (setq *default-pathname-defaults* \"/home/claude/modus/tmp/ansi-test/sandbox/\")
 
   ;; Init file I/O scratch buffers (defvar defaults not applied without init-all-globals)
-  (setq *cstr-scratch* #x0FE00000)  ; moved below heap base
-  (setq *io-buf-addr*  #x0FF00000)  ; moved out of heap semispace 0; see memory note
+  (setq *cstr-scratch* (%conv-addr #x0FE00000))  ; moved below heap base
+  (setq *io-buf-addr*  (%conv-addr #x0FF00000))  ; moved out of heap semispace 0; see memory note
   (setq *scratch-mmapped* nil)
   (setq *filesystem* nil)
 
@@ -907,7 +907,7 @@
   (setq *fail-emitted* 0)
   (setq *fail-cap* 2000)
   (setq *file-alarm-secs* 45)
-  (setq *wstatus-addr* #x100001A0)
+  (setq *wstatus-addr* (%conv-addr #x100001A0))
   ;; gensym-counter/gentemp-counter defvars don't run init at boot.
   ;; Without these, gensym produces same-named symbols (format runs
   ;; with N=NIL).  Two gensyms hash-collide in symbol-function table.

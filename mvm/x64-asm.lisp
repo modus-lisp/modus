@@ -90,8 +90,28 @@
   ;; fixnum so the final `(ash … -1)` is a normal fixnum shift.  Byte-identical
   ;; to the old `ldb` form for every value the host/fixnum path handles, so the
   ;; image build stays byte-for-byte the same.
-  (emit-u32 buf (logand value #xFFFFFFFF))
-  (emit-u32 buf (logand (ash (floor value 2147483648) -1) #xFFFFFFFF)))
+  ;; FIXNUM FAST PATH (#252): in-image, `(floor V 2^31)' is the GENERIC integer
+  ;; truncate (%TRUNCATE2-GENERIC -> %BIGNUM-TRUNC-DOUBLING -> BIGNUM-MUL), which
+  ;; allocates on EVERY 64-bit immediate the translator emits; Gen1 of the
+  ;; fixpoint chain -- which has no collector -- burnt its 508 MB heap on it
+  ;; after 450 functions.  Two arithmetic shifts by 16 are inlined :sar and
+  ;; allocate nothing.  Same two halves for every value in fixnum range
+  ;; (negative included: the arithmetic shift keeps the sign bits, and the
+  ;; masked high half is bits 63..32 of the two's-complement word), so the
+  ;; emitted bytes are identical and every image build is unchanged.
+  ;; A negative word arrives from decode-u64 as an UNSIGNED bignum >= 2^63
+  ;; (every `LI Vd, -n' in the bytecode); fold it back to the negative value
+  ;; first -- the two halves are the same bits -- so it takes the fast path.
+  (let ((v (if (and (integerp value) (>= value 9223372036854775808))
+               (- value 18446744073709551616)
+               value)))
+    (if (and (integerp v) (<= -4611686018427387904 v 4611686018427387903))
+        (progn
+          (emit-u32 buf (logand v #xFFFFFFFF))
+          (emit-u32 buf (logand (ash (ash v -16) -16) #xFFFFFFFF)))
+        (progn
+          (emit-u32 buf (logand value #xFFFFFFFF))
+          (emit-u32 buf (logand (ash (floor value 2147483648) -1) #xFFFFFFFF))))))
 
 (defun emit-s32 (buf value)
   ;; Assert the value fits in signed 32-bit range before truncating.

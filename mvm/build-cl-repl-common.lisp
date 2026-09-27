@@ -113,6 +113,10 @@
 ;; Same thin-head contract as :VIRT; the x86 arms are marked at each
 ;; DIVERGENCE site below.  *CL-REPL-VIRT-P* keeps its aarch64-only meaning.
 (defvar *cl-repl-x64-p*  (eq *cl-repl-platform* :x64))
+;; :X64 + UEFI — the same image booted through OVMF (mvm/build-uefi-cl-repl.lisp):
+;; PE32+ wrapper, boot-uefi-x64's entry stub in front of boot-x64's kernel64
+;; entry, optional SEV-SNP hooks (boot/boot-uefi-snp.lisp).  Set by the head.
+(defvar *cl-repl-uefi-p* nil)
 (defvar *cl-repl-qemu-p* (or *cl-repl-virt-p* *cl-repl-x64-p*)
   "T for the two QEMU machines (virt, pc): E1000 over PCI, user-mode net.")
 
@@ -1915,14 +1919,20 @@
   ;; SET side is left as a dead no-op (its bits are never read).
   (setf modus.mvm.x64::*ws5-force-no-kindcheck* t)
   (setf modus.mvm.x64::*x64-native-code-offset*
-        (let ((buf (make-mvm-buffer))
-              (desc (x64-boot-descriptor)))
-          (funcall (getf desc :multiboot-header-fn) buf)
-          (funcall (getf desc :boot32-fn) buf)
-          (funcall (getf desc :kernel64-entry-fn) buf)
-          (let ((n (+ 5 (length (mvm-buffer-used-bytes buf)))))
-            (format t "~%Bare-metal boot preamble: ~D bytes (native code offset)~%" n)
-            n)))
+        (if cl-user::*cl-repl-uefi-p*
+            ;; UEFI: at 0x100000 sits the kernel64 entry alone (the stub is
+            ;; below it and is not part of the runtime image).
+            (let ((n (+ 5 (modus.mvm::uefi-cl-preamble-length))))
+              (format t "~%UEFI-CL boot preamble: ~D bytes (native code offset)~%" n)
+              n)
+            (let ((buf (make-mvm-buffer))
+                  (desc (x64-boot-descriptor)))
+              (funcall (getf desc :multiboot-header-fn) buf)
+              (funcall (getf desc :boot32-fn) buf)
+              (funcall (getf desc :kernel64-entry-fn) buf)
+              (let ((n (+ 5 (length (mvm-buffer-used-bytes buf)))))
+                (format t "~%Bare-metal boot preamble: ~D bytes (native code offset)~%" n)
+                n))))
   (format t "~&;; CONSOLE: COM1 via port I/O (x86-64 QEMU-pc)~%"))
 
 (defun %x64-memory-map-asserts (image)
@@ -2257,12 +2267,68 @@
 
 ;;; DIVERGENCE 8 — BUILD-IMAGE :TARGET and the default output path.
 ;;; MODUS_CL_REPL_OUT overrides either one.
+;; DDC: CONSTANTS FORWARD BLOCK.  The MVM compiler folds a +constant+ reference
+;; only if its DEFCONSTANT appeared EARLIER in the source stream; a use before
+;; the definition compiles as a global-variable read (NIL at runtime).  Under
+;; SBCL every constant is already known from the HOST image (lib/load-mvm), so
+;; the host build never sees the problem — but the in-image compiler
+;; (`modus-sh --compile-uefi`) does: 142 constants (+OP-*+ used in a table before
+;; mvm.lisp, +GC-REGION-0-BASE+ used in gc.lisp before compiler.lisp) came out
+;; as implicit globals and the two compilers disagreed.  So prepend every
+;; integer-literal DEFCONSTANT found in the text.  DEFCONSTANT emits no code, so
+;; the SBCL artifact must be byte-identical with this block (verified by
+;; test/run-uefi-ddc.sh's md5 of the SBCL image before/after).
+(defun %ddc-constants-forward-block (text)
+  (let ((out (make-string-output-stream)) (n 0) (pos 0))
+    (format out "(in-package :modus.mvm)~%;; DDC constants forward block (auto)~%")
+    ;; CL's own limits: the HOST folds these as SBCL constants (whose values
+    ;; happen to equal Modus's 62-bit fixnum range); in-image they read as
+    ;; implicit globals (NIL).  The toplevel DEFCONSTANT clause only records
+    ;; them in *constants* and never redefines a host constant.
+    (format out "(defconstant most-positive-fixnum 4611686018427387903)~%")
+    (format out "(defconstant most-negative-fixnum -4611686018427387904)~%")
+    (incf n 2)
+    (loop
+      (let ((p (search "(defconstant +" text :start2 pos)))
+        (unless p (return))
+        (let* ((close (position #\) text :start p))
+               (form (and close (subseq text p (1+ close)))))
+          ;; only the simple shape "(defconstant +NAME+ <integer>)" on one line
+          (when (and form (not (find #\Newline form)))
+            (let* ((sp1 (position #\Space form :start 13))
+                   (name (and sp1 (subseq form 13 sp1)))
+                   (rest (and sp1 (string-trim " " (subseq form (1+ sp1) (1- (length form)))))))
+              (when (and name rest (plusp (length rest))
+                         (every (lambda (c) (or (digit-char-p c) (find c "#xXabcdefABCDEF-"))) rest)
+                         (or (digit-char-p (char rest 0)) (char= (char rest 0) #\#) (char= (char rest 0) #\-)))
+                (format out "(defconstant ~A ~A)~%" name rest)
+                (incf n))))
+          (setq pos (if close (1+ close) (1+ p))))))
+    (format t "~&;; DDC: constants forward block: ~D defconstants~%" n)
+    (concatenate 'string (get-output-stream-string out) text)))
+(setq cl-user::*full-source*
+      (modus.mvm::%build-package-scoped-source (%ddc-constants-forward-block cl-user::*full-source*)))
+
+;; DDC: MODUS_DDC_DUMP_SOURCE=path writes the EXACT text build-image is about
+;; to compile AND still builds, so `modus-sh --compile-uefi path OUT` can
+;; reproduce this image from inside Modus (test/run-uefi-ddc.sh compares the
+;; bytes).  Not build-cli-common's MODUS_DUMP_FULL_SOURCE: that one exits
+;; before this file appends its own arms, so its text is not what we compile.
+#+sbcl
+(let ((p (sb-ext:posix-getenv "MODUS_DDC_DUMP_SOURCE")))
+  (when (and p (plusp (length p)))
+    (with-open-file (o p :direction :output :if-exists :supersede)
+      (write-string cl-user::*full-source* o))
+    (format t "~&;; DDC: full source text (~D chars) written to ~A~%"
+            (length cl-user::*full-source*) p)))
 (let ((image (build-image :target (cond (cl-user::*cl-repl-virt-p* :fixpoint)
+                                        (cl-user::*cl-repl-uefi-p* :uefi-x64-cl)
                                         (cl-user::*cl-repl-x64-p* :x86-64)
                                         (t :rpi))
                           :source-text cl-user::*full-source*)))
   (let ((path (or #+sbcl (sb-ext:posix-getenv "MODUS_CL_REPL_OUT")
                   (cond (cl-user::*cl-repl-virt-p* "/tmp/modus-aarch64-cl-repl.bin")
+                        (cl-user::*cl-repl-uefi-p* "/tmp/modus-uefi-cl.efi")
                         (cl-user::*cl-repl-x64-p* "/tmp/modus-x64-cl-repl.bin")
                         (t "/tmp/piboot/kernel8.img")))))
     (ensure-directories-exist path)

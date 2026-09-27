@@ -98,7 +98,9 @@
         (if (zerop bc-len)
             nil
             (let ((addr (+ img-base bc-off)))
-              (let ((bc (make-array bc-len))
+              ;; byte array: 10 MB, not an 81 MB general array (see
+              ;; a64-buffer-to-bytes in fixpoint-aarch64.lisp, #252)
+              (let ((bc (make-array bc-len :element-type '(unsigned-byte 8)))
                     (i 0))
                 (loop
                   (when (>= i bc-len) (return bc))
@@ -131,6 +133,17 @@
 ;;; compile-quote (causes triple fault from deep recursive cons nesting).
 ;;; These overrides compute register info directly via cond, no consing.
 
+;;; #252: everything from here to the end of the x64 driver is read in
+;;; MODUS.MVM.X64.  Register names are SYMBOLS and symbol identity is
+;;; per-package: read in MODUS.MVM, (quote r15) was a different object from
+;;; the MODUS.ASM:R15 the assembler's tables and translate-x64's vreg map use,
+;;; so every register the fixpoint's own intercepts emitted (CONSP/ATOM's
+;;; `mov d, r15', GC-CHECK's `cmp r12, r14', TAILCALL's rbx/rbp/rsp) encoded
+;;; as EAX: Gen2 booted, printed R1 and died on `mov rbx,[rbx+7]' with a
+;;; garbage rbx.  In this package the names are the inherited MODUS.ASM
+;;; symbols; helper calls into MODUS.MVM resolve through the bare-name
+;;; fallback and globals are keyed by name hash alone.
+(in-package :modus.mvm.x64)
 (defun reg-code-lookup (reg)
   (cond
     ((eql reg 'rax) 0) ((eql reg 'eax) 0) ((eql reg 'al) 0)
@@ -198,8 +211,34 @@
 ;;; CALL opcode looks up function labels by bytecode offset.
 ;;; Hash table gethash is unreliable on AArch64 bare metal.
 (defvar *td-fn-label-array* nil)
+;;; #252: the helper labels the HOST translate-mvm-to-x64 threads through every
+;;; translate-state and emits bodies for after the last function.  Left NIL,
+;;; every cons-alloc site, handler-case and gc-check emitted a CALL to a NIL
+;;; label (x64-asm's "label-p FALSE-NEGATIVE" lines), and the fixup pass then
+;;; recursed BIGNUM-ASH to death on (aref NIL 1).  Name hashes are baked by
+;;; build-fixpoint's kernel-main text (the fn table here carries hashes).
+(defvar *td-x64-gc-label* nil)
+(defvar *td-x64-hpush-label* nil)
+(defvar *td-x64-hpop-label* nil)
+(defvar *td-x64-yield-label* nil)
+(defvar *td-gc-collect-hash* 0)
+(defvar *td-genmul-hash* 0)
+(defvar *td-genadd-hash* 0)
+(defvar *td-gensub-hash* 0)
 
 ;;; Override ensure-label-at: use array instead of position-labels hash table
+;;; #252 / #211: since the compiler keys calls by PKG::NAME (falling back to
+;;; the bare name), an override of a MODUS.ASM or MODUS.MVM.X64 function that
+;;; is read in MODUS.MVM registers as MODUS.MVM::NAME and does NOT replace it
+;;; for callers inside those packages: translate-x64 kept using its own
+;;; hash-table ENSURE-LABEL-AT and x64-asm's EMIT-CALL/EMIT-LABEL while the
+;;; fixpoint driver emitted labels through its array-based ones -- two label
+;;; systems on one code buffer.  Gen1's hop 2 died in FIXUP-LABELS (h43) and
+;;; later ran away at a BR (h44-h46).  Each override below is therefore read
+;;; in the package of the function it replaces.  Helper references inside
+;;; them (write-char-serial, print-dec, td-*, set-code-buffer-fixups) still
+;;; resolve through the bare-name fallback.
+(in-package :modus.mvm.x64)
 (defun ensure-label-at (state mvm-pos)
   (let ((idx (- mvm-pos *td-label-base*)))
     (let ((existing (aref *td-label-array* idx)))
@@ -210,6 +249,7 @@
           existing))))
 
 ;;; Override emit-label: simpler version that just sets position (no hash table)
+(in-package :modus.asm)
 (defun emit-label (buf label)
   (let ((pos (code-buffer-position buf)))
     (aset label 1 pos)))
@@ -218,6 +258,7 @@
 ;;; (member :off16 op-specs) which fails on bare metal (equal broken for cons cells).
 ;;; Branch opcodes: BR(64)-BGT(70) have offset in operand 0,
 ;;;                 BNULL(71)/BNNULL(72) have offset in operand 1.
+(in-package :modus.mvm.x64)
 (defun scan-branch-targets (state)
   (let ((bytes (translate-state-mvm-bytes state))
         (offset (translate-state-mvm-offset state))
@@ -239,6 +280,7 @@
                   (ensure-label-at state target-pos))))
             (setq pos new-pos)))))))
 
+(in-package :modus.mvm.x64)
 (defun reg-code (reg)
   (logand 7 (reg-code-lookup reg)))
 
@@ -358,9 +400,18 @@
         (offset (translate-state-mvm-offset state))
         (len (translate-state-mvm-length state)))
     (let ((pos offset)
-          (limit (+ offset len)))
+          (limit (+ offset len))
+          (ninsn 0))
       (loop
         (when (>= pos limit) (return nil))
+        ;; #252 diag: a function body that decodes more than 2M instructions
+        ;; is looping (Gen1 hop 2 consed itself into GC thrash at fn ~5450);
+        ;; report the function and its position and abandon the body.
+        (setq ninsn (+ ninsn 1))
+        (when (> ninsn 2000000)
+          (write-char-serial 33) (write-char-serial 76) ;; !L<fn offset> <pos> <limit>
+          (print-dec offset) (write-char-serial 32) (print-dec pos) (write-char-serial 32) (print-dec limit) (write-char-serial 10)
+          (return nil))
         ;; Use array-based label lookup (bypasses hash table)
         (let ((lbl-idx (- pos *td-label-base*)))
           (let ((label (aref *td-label-array* lbl-idx)))
@@ -370,6 +421,11 @@
           (let ((opcode (car decoded))
                 (operands (car (cdr decoded)))
                 (new-pos (cdr (cdr decoded))))
+            ;; #252 diag: current opcode / bytecode position / first operand in
+            ;; the metadata scratch words, readable from gdb at a stall.
+            (td-write-u32 #x3000040 opcode)
+            (td-write-u32 #x3000044 pos)
+            (td-write-u32 #x3000048 (let ((o (car operands))) (if (integerp o) (logand o 4294967295) 4294967295)))
             ;; Intercept opcodes that need bare-metal fixes
             (cond
               ;; ALU rrr: direct call, no funcall/#'function
@@ -439,7 +495,7 @@
               ((= opcode 131) ;; TAILCALL (#x83)
                (let ((target-offset (car operands)))
                  (let ((buf2 (translate-state-buf state))
-                       (label (aref *td-fn-label-array* target-offset)))
+                       (label (or (gethash target-offset *td-fn-label-array*) 0)))
                    (emit-mov-reg-mem buf2 (quote rbx) (quote rbp) -8)
                    (emit-mov-reg-reg buf2 (quote rsp) (quote rbp))
                    (emit-pop buf2 (quote rbp))
@@ -449,7 +505,7 @@
               ;; CALL: use array-based fn label lookup (bypass hash table)
               ((= opcode 128) ;; CALL
                (let ((target-offset (car operands)))
-                 (let ((label (aref *td-fn-label-array* target-offset)))
+                 (let ((label (or (gethash target-offset *td-fn-label-array*) 0)))
                    (if (zerop label)
                        (emit-call (translate-state-buf state) (make-label))
                        (emit-call (translate-state-buf state) label)))))
@@ -457,7 +513,7 @@
               ((= opcode 167) ;; FN-ADDR
                (let ((vd (car operands))
                      (target-offset (car (cdr operands))))
-                 (let ((label (aref *td-fn-label-array* target-offset)))
+                 (let ((label (or (gethash target-offset *td-fn-label-array*) 0)))
                    (let ((d (dest-phys-or-scratch vd)))
                      (if (zerop label)
                          ;; Unknown target — load 0 (matches original)
@@ -480,6 +536,18 @@
       (set-translate-state-mvm-length state len)
       (set-translate-state-mvm-offset state offset)
       (set-translate-state-function-table state fn-offset-to-label)
+      (set-translate-state-gc-label state *td-x64-gc-label*)
+      (set-translate-state-handler-push-label state *td-x64-hpush-label*)
+      (set-translate-state-handler-pop-label state *td-x64-hpop-label*)
+      (set-translate-state-yield-longjmp-label state *td-x64-yield-label*)
+      ;; 16-align the entry, as translate-mvm-to-x64 proper does: fn pointers are
+      ;; addr|3 and funcall checks the low nibble, so the raw start must end in 0
+      ;; (the boot preamble NOP-pads itself so native code starts 16-aligned;
+      ;; *x64-native-code-offset* carries any residue).  Same gap as the AArch64
+      ;; arm's, found via Gen1's first FUNCALL (#252).
+      (loop
+        (let ((n (logand (+ *x64-native-code-offset* (code-buffer-position buf)) 15)))
+          (if (zerop n) (return nil) (emit-nop buf))))
       ;; Emit function label
       (let ((lpos (code-buffer-position buf)))
         (aset fn-label 1 lpos)
@@ -511,7 +579,16 @@
         (let ((fn-map (make-hash-table))
               (fn-offset-to-label (make-hash-table)))
           ;; Create global array for fn-offset-to-label (bypass hash table)
-          (setq *td-fn-label-array* (make-array (+ (array-length bytecode) 65536)))
+          ;; #252: allocated ONCE, at the top of build-image-cross while the
+          ;; heap is still nearly empty -- at 80 MB it is far larger than any
+          ;; guard band, so allocated here (after the bytecode, the fn table
+          ;; and everything else) its gc-check fires only after it has run
+          ;; that far past the limit into to-space.
+          ;; #252: a HASH TABLE keyed by function offset, not a bytecode-sized
+          ;; array -- the array was 80 MB of live heap for 6041 entries, and on
+          ;; Gen1 (254 MB semispaces) it left so little room between
+          ;; collections that hop 2 thrashed in the collector at fn ~2200.
+          (setq *td-fn-label-array* (make-hash-table))
           (let ((rest-ft function-table)
                 (i 0))
             (loop
@@ -523,10 +600,33 @@
                     (aset fn-labels i label)
                     (puthash name fn-map label)
                     (puthash offset fn-offset-to-label label)
-                    (let ((dummy (aset *td-fn-label-array* offset label)))
+                    (let ((dummy (puthash offset *td-fn-label-array* label)))
                       dummy))))
               (setq rest-ft (cdr rest-ft))
               (setq i (+ i 1))))
+          ;; #252: helper labels (see *td-x64-gc-label*).  The GC trampoline is
+          ;; wired only if %GC-COLLECT is in the table; the cons-kind-bit
+          ;; subroutine only if the kind bitmap is on (kernel-main sets it).
+          (let ((gcc (gethash *td-gc-collect-hash* fn-map)))
+            (setq *td-x64-gc-label* (if gcc (make-label) nil)))
+          (setq *td-x64-hpush-label* (make-label))
+          (setq *td-x64-hpop-label* (make-label))
+          ;; #252: NIL for now -- YIELD sites then stay NOPs in Gen2, as they were
+          ;; in every fixpoint generation before the helper labels were wired.
+          ;; With the stub label set, hop 2 ran away (150 MB of allocation per
+          ;; collection, forever) while translating a backward BR right after
+          ;; a loop's YIELD; isolating which of the two it is comes first.
+          (setq *td-x64-yield-label* nil)
+          (setq *mcgc-cons-bit-label* (if (mcgc-kind-bitmap-on-p) (make-label) nil))
+          (setq *x64-genmul-label* (gethash *td-genmul-hash* fn-map))
+          (setq *x64-genadd-label* (gethash *td-genadd-hash* fn-map))
+          (setq *x64-gensub-label* (gethash *td-gensub-hash* fn-map))
+          (write-char-serial 72) (write-char-serial 76) (write-char-serial 58) ;; HL:<gc> <consbit> <genmul> <genadd> <gensub>
+          (print-dec (if *td-x64-gc-label* 1 0)) (write-char-serial 32)
+          (print-dec (if *mcgc-cons-bit-label* 1 0)) (write-char-serial 32)
+          (print-dec (if *x64-genmul-label* 1 0)) (write-char-serial 32)
+          (print-dec (if *x64-genadd-label* 1 0)) (write-char-serial 32)
+          (print-dec (if *x64-gensub-label* 1 0)) (write-char-serial 10)
           ;; Translate each function
           (write-char-serial 84) (write-char-serial 10) ;; T
           (let ((ctx (cons buf (cons bytecode fn-offset-to-label))))
@@ -541,10 +641,30 @@
                       (td-translate-one-fn ctx fn-label offset len))))
                 (setq rest-ft (cdr rest-ft))
                 (setq i (+ i 1))
-                (when (zerop (mod i 50))
-                  (write-char-serial 35) ;; #
-                  (print-dec i)
+                (when (or (zerop (mod i 50)) (>= i 5400))
+                  (write-char-serial 35) ;; #<i>@<code position>
+                  (print-dec i) (write-char-serial 64)
+                  (print-dec (code-buffer-position buf))
                   (write-char-serial 10)))))
+          ;; #252: helper bodies, exactly the host's tail order (translate-x64
+          ;; translate-mvm-to-x64): GC trampoline, cons-kind-bit subroutine,
+          ;; handler push/pop, yield-longjmp stub.  HB:<n> traces each step.
+          (loop
+            (let ((n (logand (+ *x64-native-code-offset* (code-buffer-position buf)) 15)))
+              (if (zerop n) (return nil) (emit-nop buf))))
+          (write-char-serial 72) (write-char-serial 66) (write-char-serial 58) ;; HB:
+          (when *td-x64-gc-label*
+            (print-dec 1) (write-char-serial 32)
+            (emit-gc-trampoline buf *td-x64-gc-label* (gethash *td-gc-collect-hash* fn-map)))
+          (when *mcgc-cons-bit-label*
+            (print-dec 2) (write-char-serial 32)
+            (emit-mcgc-cons-bit-subroutine buf *mcgc-cons-bit-label*))
+          (print-dec 3) (write-char-serial 32)
+          (emit-handler-helpers buf *td-x64-hpush-label* *td-x64-hpop-label*)
+          (when *td-x64-yield-label*
+            (print-dec 4) (write-char-serial 32)
+            (emit-yield-longjmp-stub buf *td-x64-yield-label* *td-x64-hpop-label*))
+          (print-dec 5) (write-char-serial 10)
           ;; Apply fixups — print count for debug
           (let ((fc 0) (rf (code-buffer-fixups buf)))
             (loop (when (null rf) (return nil))
@@ -563,6 +683,22 @@
           (cons buf fn-map))))))
 
 ;;; Override emit-label-ref-rel32: bare-metal compatible version
+(in-package :modus.asm)
+;;; #252 diag: a code-buffer growth is a large late allocation; say so.
+(defun %code-buffer-ensure (buf pos)
+  (let ((bytes (code-buffer-bytes buf)))
+    (let ((cap (length bytes)))
+      (when (>= pos cap)
+        (write-char-serial 67) (write-char-serial 66) (write-char-serial 33) ;; CB!<pos> <cap>
+        (print-dec pos) (write-char-serial 32) (print-dec cap) (write-char-serial 10)
+        (let ((new-cap cap))
+          (loop (when (> new-cap pos) (return nil)) (setq new-cap (* new-cap 2)))
+          (let ((new-bytes (make-array new-cap :element-type (quote (unsigned-byte 8)))))
+            (let ((i 0))
+              (loop (when (>= i cap) (return nil))
+                (aset new-bytes i (aref bytes i))
+                (setq i (+ i 1))))
+            (set-code-buffer-bytes buf new-bytes)))))))
 (defun emit-label-ref-rel32 (buf label)
   (let ((pos (code-buffer-position buf)))
     (let ((inner (cons 4 nil)))
@@ -617,12 +753,12 @@
           (let ((pos (car fixup))
                 (label (car (cdr fixup)))
                 (size (car (cdr (cdr fixup)))))
-            (let ((target (aref label 1)))
+            (let ((target (if (null label) nil (aref label 1))))
               (when (null target)
                 (write-char-serial 78) (write-char-serial 85) ;; NU
                 (write-char-serial 76) (write-char-serial 64) ;; L@
                 (print-dec fi) (write-char-serial 10))
-              (when (eql size 4)
+              (when (and target (eql size 4))
                 (let ((sum (+ pos size)))
                   (let ((rel (- target sum)))
                     (fixup-patch-one bytes pos rel)))))))
@@ -632,3 +768,5 @@
         (setq rest-fixups (cdr rest-fixups)))))
   buf)
 
+
+(in-package :modus.mvm)

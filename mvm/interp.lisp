@@ -151,10 +151,24 @@
 (defconstant +mvm-runtime-call-base+ #x40000000)
 
 (defun %mvm-resolve-runtime-fn (name)
-  "Resolve a native function by NAME (string) via the symbol-function table."
+  "Resolve a native function by NAME (string) via the symbol-function table.
+   A package-qualified key (PKG::NAME — what the compiler emits for a symbol
+   whose home package folds, MODUS.MVM included) falls back to its BARE name,
+   the same strict-superset rule %FN-INFO-FOR-KEY applies at compile time.
+   Without it a self-hosting image's read-time #.(compute-name-hash ...) —
+   read in a runtime-created MODUS.MVM — resolved MODUS.MVM::COMPUTE-NAME-HASH,
+   found nothing, and the reader dropped 114 forms the host compiled."
   (and (boundp '*symbol-function-table*)
        *symbol-function-table*
-       (gethash name *symbol-function-table*)))
+       (or (gethash name *symbol-function-table*)
+           (let ((n (length name)) (i 0) (cut nil))
+             (loop
+               (when (>= (+ i 1) n) (return))
+               (when (and (char= (char name i) #\:) (char= (char name (+ i 1)) #\:))
+                 (setq cut (+ i 2)) (return))
+               (setq i (+ i 1)))
+             (and cut (< cut n)
+                  (gethash (subseq name cut) *symbol-function-table*))))))
 
 (defconstant +num-vregs+ 23)
 

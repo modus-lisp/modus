@@ -41,6 +41,7 @@
 (mvm-load "mvm/interp.lisp")
 
 ;; Boot descriptors (all architectures)
+(mvm-load "boot/boot-uefi-snp.lisp")
 (mvm-load "boot/boot-x64.lisp")
 (mvm-load "boot/boot-riscv.lisp")
 (mvm-load "boot/boot-aarch64.lisp")

@@ -14,7 +14,7 @@
 set -e
 cd "$(dirname "$0")/.."
 
-TIMEOUT=${FIXPOINT_TIMEOUT:-90}
+TIMEOUT=${FIXPOINT_TIMEOUT:-5400}   # Gen1 (aarch64 under TCG) takes ~45 min
 IMAGE_SIZE=4194368
 GEN0=/tmp/fixpoint-gen0.elf
 GEN1=/tmp/fixpoint-gen1.bin
@@ -63,6 +63,10 @@ extract_image() {
   fi
 
   # Extract image via QMP pmemsave
+  # The assembler prints A1=<image bytes>; size the memory save from it (the
+  # fixed 4 MB constants predate the CL-runtime fixpoint, whose images are ~49 MB).
+  local a1; a1=$(grep -ao "[AX]1=[0-9]*" "$logfile" | tail -1 | cut -d= -f2)   # A1= aarch64 image, X1= x64 image
+  local save_size=${a1:-$IMAGE_SIZE}
   python3 -c "
 import socket, json, time
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -77,7 +81,7 @@ recv()
 s.sendall(json.dumps({'execute': 'qmp_capabilities'}).encode() + b'\n')
 recv()
 s.sendall(json.dumps({'execute': 'pmemsave', 'arguments': {
-    'val': $pmemsave_addr, 'size': $IMAGE_SIZE, 'filename': '$output'
+    'val': $pmemsave_addr, 'size': $save_size, 'filename': '$output'
 }}).encode() + b'\n')
 recv()
 time.sleep(1)
@@ -100,14 +104,14 @@ echo ""
 
 # Step 0: Build Gen0 from SBCL (seed kernel)
 echo "Step 0: SBCL → Gen0(x64)"
-sbcl --script mvm/build-fixpoint.lisp 2>&1 | grep -E "bytecode:|Functions:|native code:|written"
+sbcl --dynamic-space-size 12288 --script mvm/build-fixpoint.lisp 2>&1 | grep -E "bytecode:|Functions:|native code:|written"
 echo ""
 
 # Step 1: Gen0(x64) → Gen1(aarch64)
 # Image buffer at VA 0x08000000 = PA 0x08000000 (x64 identity-mapped)
 echo "Step 1: Gen0(x64) → Gen1(aarch64)"
 extract_image "$GEN0" "$GEN1" "Gen1" \
-  "qemu-system-x86_64 -m 512 -no-reboot" \
+  "qemu-system-x86_64 -m 1024 -no-reboot" \
   134217728  # 0x08000000
 echo ""
 
@@ -115,7 +119,7 @@ echo ""
 # AArch64 MMU: VA = PA - 0x40000000, so VA 0x08000000 → PA 0x48000000
 echo "Step 2: Gen1(aarch64) → Gen2(x64)"
 extract_image "$GEN1" "$GEN2" "Gen2" \
-  "qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 512 -semihosting" \
+  "qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 1024 -semihosting" \
   1207959552  # 0x48000000
 echo ""
 
@@ -123,7 +127,7 @@ echo ""
 # Same as Step 1 but from Gen2 instead of Gen0
 echo "Step 3: Gen2(x64) → Gen3(aarch64)"
 extract_image "$GEN2" "$GEN3" "Gen3" \
-  "qemu-system-x86_64 -m 512 -no-reboot" \
+  "qemu-system-x86_64 -m 1024 -no-reboot" \
   134217728  # 0x08000000
 echo ""
 

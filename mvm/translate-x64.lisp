@@ -6277,6 +6277,100 @@
       ;; scan >= free_ptr? done
       (emit-cmp-reg-reg buf 'r10 'r13)
       (emit-jcc buf :ae cheney-done)
+      ;; LEAF SKIP (#252).  This scan used to be a FLAT walk: every word of
+      ;; to-space went through scan_word, including the RAW payload of byte
+      ;; vectors, strings, floats, bignums and saps.  A payload word that
+      ;; happens to equal a live object's tagged address (any 8 bytes of a
+      ;; 10 MB bytecode array will, ~40 times) passes the start-bit gate and
+      ;; is "forwarded": the collector rewrites the bytecode with a to-space
+      ;; pointer.  Gen0 of the fixpoint chain corrupted its own bytecode at
+      ;; every collection; two identical arrays were corrupted identically.
+      ;; So, at a recorded object start that is not a cons, read the header
+      ;; and, for the leaf subtags %GC-LEAF-SUBTAG-P names, step over the
+      ;; whole object with copy_object's own size rule.  Anything else --
+      ;; a pointer-bearing object, a cons, or a granule with no start bit --
+      ;; is scanned exactly as before.  RAX/RSI/R8/R9 are free here (scan_word
+      ;; and copy_object temps); RDX/RCX/RBX/R13/R10 are untouched.
+      ;; Needs the CONS-KIND bitmap too: a copied cons carries a start bit, and
+      ;; without the kind bit its CAR would be read as a header (a fixnum 48 is
+      ;; tagged #x60 -- a "float" -- and the skip would step over live data).
+      (when (and (mcgc-bitmap-on-p) (mcgc-kind-bitmap-on-p))
+        (let ((scan-it (make-label)) (leaf (make-label))
+              (sz-u8 (make-label)) (sz-f32 (make-label)) (sz-adv (make-label))
+              (sz-take (make-label)))
+          ;; Only at a 16-byte boundary: the start bit is per GRANULE, so the
+          ;; word at obj+8 (the +8 pad word, which alloc-string and copy_object
+          ;; leave as whatever it was) maps to the same set bit as the header
+          ;; and would be read as a header -- a pad word whose low byte happened
+          ;; to spell a leaf subtag skipped by a garbage size.  That made
+          ;; modus-sh --compile-uefi nondeterministic (9.9 MB output one run,
+          ;; TYPE-ERROR the next).  Objects are 16-aligned with the header first.
+          (emit-bytes buf #x41 #xF7 #xC2 #x0F #x00 #x00 #x00) ; test r10d, 15
+          (emit-jcc buf :ne scan-it)
+          (emit-bytes buf #x4C #x89 #xD6)                ; mov rsi, r10
+          (emit-bytes buf #x48 #x2B #x34 #x25)           ; sub rsi, [page_base]
+          (emit-u32 buf +mcgc-cfg-page-base-addr+)
+          (emit-shr-reg-imm buf 'rsi 4)                  ; rsi = granule
+          (emit-bytes buf #x4C #x8B #x04 #x25)           ; mov r8, [bitmap_base]
+          (emit-u32 buf +mcgc-cfg-bitmap-addr+)
+          (emit-bytes buf #x49 #x0F #xA3 #x30)           ; bt [r8], rsi  (CF = object-start bit)
+          (emit-jcc buf :nc scan-it)
+          (emit-bytes buf #x49 #x81 #xC0)                ; add r8, imm32 (cons-kind delta)
+          (emit-u32 buf +mcgc-kindbitmap-delta+)
+          (emit-bytes buf #x49 #x0F #xA3 #x30)           ; bt [r8], rsi  (CF = cons-kind bit)
+          (emit-jcc buf :c scan-it)                      ; a cons: scan its two words as before
+          (emit-mov-reg-mem buf 'rsi 'r10 0)             ; rsi = header
+          (emit-mov-reg-reg buf 'r8 'rsi)
+          (emit-and-reg-imm buf 'r8 #xFF)                ; r8 = subtag
+          ;; NOT #x30: a BIG bignum is a 2-slot #x30 whose slot 1 is a POINTER to
+          ;; its limbs array (compile-integer's sentinel -1 shape); skipping it
+          ;; left that pointer un-forwarded, and modus-sh --compile-uefi then read
+          ;; a stale threshold and compiled 2^130 as a small bignum (the UEFI DDC
+          ;; caught it).  Only pointer-free layouts may be skipped.
+          (dolist (st '(#x10 #x11 #x12 #x14 #x16 #x60 #x64 #x65 #x66))
+            (emit-cmp-reg-imm buf 'r8 st)
+            (emit-jcc buf :e leaf))
+          (emit-jmp buf scan-it)
+          (emit-label buf leaf)
+          (emit-mov-reg-reg buf 'r9 'rsi)
+          (emit-shr-reg-imm buf 'r9 8)                   ; r9 = element count
+          (emit-cmp-reg-imm buf 'r8 #x11)
+          (emit-jcc buf :e sz-u8)
+          (emit-cmp-reg-imm buf 'r8 #x12)
+          (emit-jcc buf :e sz-f32)
+          (emit-add-reg-imm buf 'r9 2)                   ; general: (count+2)*8, align 16
+          (emit-shl-reg-imm buf 'r9 3)
+          (emit-add-reg-imm buf 'r9 15)
+          (emit-and-reg-imm buf 'r9 -16)
+          (emit-jmp buf sz-adv)
+          (emit-label buf sz-f32)
+          (emit-shl-reg-imm buf 'r9 2)                   ; 4 bytes per lane, then the u8 rule
+          (emit-label buf sz-u8)
+          (emit-add-reg-imm buf 'r9 16)                  ; header + pad
+          (emit-add-reg-imm buf 'r9 15)
+          (emit-and-reg-imm buf 'r9 -16)
+          (emit-label buf sz-adv)
+          ;; CONSISTENCY GUARD: a start bit can be stale (an allocation that
+          ;; overshot into this space before the collection), so a "header"
+          ;; read here can be junk.  Take the skip only if it lands exactly on
+          ;; the free pointer or on another recorded object start -- every
+          ;; copied object has one -- and otherwise fall back to the flat scan.
+          (emit-bytes buf #x4C #x89 #xD6)                ; mov rsi, r10
+          (emit-add-reg-reg buf 'rsi 'r9)                ; rsi = r10 + size
+          (emit-cmp-reg-reg buf 'rsi 'r13)
+          (emit-jcc buf :e sz-take)
+          (emit-jcc buf :a scan-it)                      ; past the free pointer: junk
+          (emit-bytes buf #x48 #x2B #x34 #x25)           ; sub rsi, [page_base]
+          (emit-u32 buf +mcgc-cfg-page-base-addr+)
+          (emit-shr-reg-imm buf 'rsi 4)
+          (emit-bytes buf #x4C #x8B #x04 #x25)           ; mov r8, [bitmap_base]
+          (emit-u32 buf +mcgc-cfg-bitmap-addr+)
+          (emit-bytes buf #x49 #x0F #xA3 #x30)           ; bt [r8], rsi
+          (emit-jcc buf :nc scan-it)                     ; next granule is not a start: junk
+          (emit-label buf sz-take)
+          (emit-add-reg-reg buf 'r10 'r9)                ; step over the leaf object
+          (emit-jmp buf cheney-loop)
+          (emit-label buf scan-it)))
       ;; Scan the word at [r10]
       (emit-bytes buf #x4C #x89 #xD0)            ; mov rax, r10
       (emit-call buf scan-word-label)

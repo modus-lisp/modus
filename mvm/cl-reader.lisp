@@ -912,6 +912,43 @@
                    ;; nil / single-float / short-float / anything else → single
                    (t 'single-float))))))
 
+(defun %pow2-scale (x p)
+  "X * 2^P by repeated exact doubling/halving.  A power-of-two step is exact
+   at every magnitude down to 2^-1074, and there is no EXPT on a float base,
+   which overflows for the 1.79d308 boundary literal."
+  (loop (when (<= p 0) (return)) (setq x (* x 2.0d0)) (setq p (- p 1)))
+  (loop (when (>= p 0) (return)) (setq x (* x 0.5d0)) (setq p (+ p 1)))
+  x)
+
+(defun %exact-ratio-to-double (n d)
+  "The double nearest N/D (N >= 0, D > 0 integers), round-half-even, with
+   denormals.  Integer arithmetic only until the final exact scaling, so the
+   result is bit-identical to a host that reads the same literal (DDC needs
+   the reader's float thunks to match SBCL's bits)."
+  (if (zerop n) 0.0d0
+      (let* ((bl (- (integer-length n) (integer-length d)))
+             (k (- 54 bl)) (q 0) (r 0))
+        (loop
+          (let ((nn (if (>= k 0) (* n (expt 2 k)) n))
+                (dd (if (>= k 0) d (* d (expt 2 (- k))))))
+            (multiple-value-bind (qq rr) (floor nn dd) (setq q qq) (setq r rr)))
+          (cond ((< q (expt 2 54)) (setq k (+ k 1)))
+                ((>= q (expt 2 55)) (setq k (- k 1)))
+                (t (return))))
+        ;; q in [2^54, 2^55): value = q * 2^-k, leading-bit exponent e = 54-k.
+        (let* ((e (- 54 k))
+               (shift (if (< e -1022) (- -1022 e) 0))
+               (drop (+ 2 shift))
+               (pw (expt 2 drop))
+               (m (floor q pw))
+               (rem (- q (* m pw)))
+               (half (expt 2 (- drop 1))))
+          (when (or (> rem half) (and (= rem half) (or (not (zerop r)) (oddp m))))
+            (setq m (+ m 1)))
+          (if (> e 1023)
+              (error "float literal out of range")
+              (%pow2-scale (%bignum-to-float m) (- drop k)))))))
+
 (defun %build-float-from-parts (sign int-part frac-part frac-div exp-sign exp-part &rest type-arg)
   "Create a real IEEE-bit boxed float from parsed components.
    value = sign * (int-part + frac-part/frac-div) * 10^(exp-sign*exp-part)
@@ -934,20 +971,14 @@
         (setq divisor (* divisor 10))
         (setq i (+ i 1))))
     ;; Convert num/den → IEEE via SSE2 (a #x60 double payload).
-    (let* ((signed-mant (* sign mantissa))
-           ;; %float-from-int is raw SSE2 cvtsi2sd on a FIXNUM; the decimal
-           ;; exponent loops above push mantissa/divisor into BIGNUM range for
-           ;; large |exponent| literals (1.79d308, 5.9e-8, denormals), and
-           ;; cvtsi2sd of a bignum converts its tagged heap POINTER — the
-           ;; parsed value became a function of the allocation address:
-           ;; wrong AND different on every parse (broke bit-reproducible
-           ;; self-compiles; the 3-float-thunk md5 variance in task #187/#191).
-           ;; %bignum-to-float (cl-types) folds limbs MSB-first in float
-           ;; domain — deterministic, fixnum-transparent, bignum-correct.
-           (raw (if (= divisor 1)
-                    (%bignum-to-float signed-mant)
-                    (%float-div (%bignum-to-float signed-mant)
-                                (%bignum-to-float divisor))))
+    (let* (;; Correctly rounded from the exact integer ratio.  The former
+           ;; %bignum-to-float / %float-div tail rounded TWICE (each operand,
+           ;; then the quotient) and folded bignum limbs in float domain, so
+           ;; 1.7976931348623157d308 read as +inf and 0.1d0 could be one ulp
+           ;; off SBCL — 14 float-constant init thunks differed between the
+           ;; host build and the in-image self-compile (test/run-uefi-ddc.sh).
+           (mag (%exact-ratio-to-double mantissa divisor))
+           (raw (if (< sign 0) (* -1.0d0 mag) mag))
            (type (if type-arg (car type-arg) 'single-float)))
       ;; Single (the CLHS default) rounds to 24-bit + retags #x61; double
       ;; keeps the full #x60 payload.
@@ -1217,7 +1248,19 @@
                  ;; intern is find-or-create, which matches the previous
                  ;; intended fallback ("intern anyway for robustness");
                  ;; strict external-only enforcement is deferred.
-                 (intern sym-name pkg)))))))))
+                 ;;
+                 ;; COMMON-LISP:T / CL:NIL are the boolean constants, not a
+                 ;; symbol named "T" interned in COMMON-LISP: the unqualified
+                 ;; branch above answers T/NIL and this one must agree, or
+                 ;; `(eq type 'common-lisp:t)` compiles to an intern in the
+                 ;; image where the host bakes the constant (COERCE differed
+                 ;; between the SBCL build and the in-image self-compile).
+                 (cond
+                   ((and (eq pkg (find-package "COMMON-LISP"))
+                         (string= sym-name "T")) t)
+                   ((and (eq pkg (find-package "COMMON-LISP"))
+                         (string= sym-name "NIL")) nil)
+                   (t (intern sym-name pkg)))))))))))
 
 ;;; --- List reader ---
 
@@ -1627,7 +1670,16 @@
              (*read-suppress* nil)
              ((not *read-eval*)
               (%reader-error "#. read-time eval disabled by *read-eval*"))
-             (t (eval obj)))))
+             ;; EVAL here is mvm-eval, which SETQs *mvm-eval-runtime-p* and
+             ;; *mvm-emit-halves* to T for its own compile and leaves them so
+             ;; ("mvm-eval-leaked", WS5).  A #. met while READING a source text
+             ;; for a static build (modus-sh --compile-uefi: interp.lisp's
+             ;; #.+op-nop+ CASE keys) must not flip the enclosing compile into
+             ;; runtime-eval codegen for every form after it.  Restore both.
+             (t (let ((%rt *mvm-eval-runtime-p*) (%hv *mvm-emit-halves*))
+                  (unwind-protect (eval obj)
+                    (setq *mvm-eval-runtime-p* %rt)
+                    (setq *mvm-emit-halves* %hv)))))))
         ;; #S(struct-type slot1 val1 slot2 val2 ...) — structure literal.
         ;; CLHS 2.4.8.13.  Read the inner list, then call the structure's
         ;; constructor with keyword args.  If a slot symbol is unkeyworded

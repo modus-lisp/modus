@@ -1,18 +1,18 @@
 ;;; ============================================================
 ;;; Image buffer functions (for assembling Gen1 on bare metal)
 ;;; ============================================================
-;;; Image buffer at 0x08000000, position counter at 0x4FF040
+;;; Image buffer at 0x08000000, position counter at 0x3000F00 (metadata page + 0xF00; 0x4FF040 was inside the 46+ MB native code of both generations and img-init clobbered a function -- #252)
 
 (defun img-init ()
-  (setf (mem-ref #x4FF040 :u64) 0))
+  (setf (mem-ref #x3000F00 :u64) 0))
 
 (defun img-pos ()
-  (mem-ref #x4FF040 :u64))
+  (mem-ref #x3000F00 :u64))
 
 (defun img-emit (b)
-  (let ((pos (mem-ref #x4FF040 :u64)))
+  (let ((pos (mem-ref #x3000F00 :u64)))
     (setf (mem-ref (+ #x08000000 pos) :u8) b)
-    (setf (mem-ref #x4FF040 :u64) (+ pos 1))))
+    (setf (mem-ref #x3000F00 :u64) (+ pos 1))))
 
 (defun img-emit-u32 (v)
   (img-emit (logand v 255))
@@ -23,9 +23,9 @@
 (defun img-emit-u64-raw (v)
   ;; Write tagged fixnum v as 8 LE bytes via mem-ref :u64 (raw bits)
   ;; This preserves the tagged representation for next-generation reads
-  (let ((pos (mem-ref #x4FF040 :u64)))
+  (let ((pos (mem-ref #x3000F00 :u64)))
     (setf (mem-ref (+ #x08000000 pos) :u64) v)
-    (setf (mem-ref #x4FF040 :u64) (+ pos 8))))
+    (setf (mem-ref #x3000F00 :u64) (+ pos 8))))
 
 (defun img-patch-u32 (offset v)
   (let ((base #x08000000))
@@ -218,16 +218,24 @@
 
 ;;; Build AArch64 target from x64 host (cross-arch)
 (defun build-aarch64-from-x64 (bc ft)
-  ;; Set AArch64 serial config for fixpoint (UART at VA 0x20000000, PL011 byte-width)
-  (setq *aarch64-serial-base* #x20000000)
+  ;; Set AArch64 serial config for fixpoint (UART at VA 0x0F000000 = L2[120] under
+  ;; the big-heap boot; was 0x20000000 -- see boot-aarch64.lisp step 7c, #252)
+  (setq *aarch64-serial-base* #x0F000000)
   (setq *aarch64-serial-width* 0)
   (setq *aarch64-serial-tx-poll* nil)
   (setq *aarch64-sched-lock-addr* nil)
+  (td-gc-mark) (write-char-serial 76) (print-dec (length ft)) (write-char-serial 10) ;; L<len> just before the call
   (let ((result (translate-mvm-to-aarch64 bc ft)))
     ;; result is (cons native-bytes (cons native-size fn-map))
     (let ((native-bytes (car result))
           (native-size (car (cdr result))))
       (print-dec native-size) (write-char-serial 10)
+      ;; #252 diag: the byte array as handed over -- Y<array-length> Z<first 4 bytes> g<gc>
+      (write-char-serial 89) (print-dec (array-length native-bytes)) (write-char-serial 32)
+      (write-char-serial 90) (print-dec (aref native-bytes 0)) (write-char-serial 44)
+      (print-dec (aref native-bytes 1)) (write-char-serial 44)
+      (print-dec (aref native-bytes 2)) (write-char-serial 44)
+      (print-dec (aref native-bytes 3)) (write-char-serial 32) (td-gc-mark) (write-char-serial 10)
       ;; FNV-1a of AArch64 native code
       (let ((hash (td-fnv-native native-bytes native-size)))
         (write-char-serial 70) (write-char-serial 78) ;; FN
@@ -251,9 +259,14 @@
         (td-assemble-gen1-x64 result bc ft)
         pos))))
 
+(defun td-gc-mark ()
+  ;; "g<count>" -- region 0's collection count (+0x20 of the block at
+  ;; 0x10000040), read as a u32 so the tagged load is the plain number.
+  (write-char-serial 103) (print-dec (td-read-u32 #x10000060)) (write-char-serial 32))
 (defun build-image-cross (target)
   ;; target: 0=x64, 1=aarch64
   ;; Step 1: Read embedded bytecode
+  (td-gc-mark)
   (write-char-serial 83) (write-char-serial 49) (write-char-serial 58)
   (let ((bc (td-read-bytecode)))
     (print-dec (array-length bc))
@@ -268,11 +281,13 @@
       (print-dec xsum))
     (write-char-serial 10)
     ;; Step 2: Read function table
+    (td-gc-mark)
     (write-char-serial 83) (write-char-serial 50) (write-char-serial 58)
     (let ((ft (td-read-fn-table-list)))
       (print-dec (length ft))
       (write-char-serial 10)
       ;; Step 3: Translate and assemble based on target
+      (td-gc-mark)
       (write-char-serial 83) (write-char-serial 51) (write-char-serial 58)
       (write-char-serial 10)
       (let ((my-arch (td-read-u32 #x3000008)))

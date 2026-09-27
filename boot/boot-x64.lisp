@@ -52,6 +52,19 @@
 ;; the historical layout — all small-image bare-metal x64 builds emit
 ;; byte-identical boot code.
 (defvar *x64-stack-top-override* nil)
+
+;; Heap-end override for LARGE workloads.  The bare-metal x64 heap is two Cheney
+;; semispaces carved from [0x10001000, heap-end - 16 MB guard); the default
+;; heap end 0x1E000000 gives ~104 MB per semispace, and a Cheney collector
+;; cannot copy an object larger than a semispace -- the in-image fixpoint
+;; translator allocates a 128 MB AArch64 code array (make-a64-buffer: 16M
+;; entries x 8 bytes) and an 81 MB label array, so its first collection
+;; overflowed to-space and the immediate second one copied back over live
+;; data (#252: Gen0 died at marker b0 with the function table reading as
+;; empty).  A build that needs more sets this (and its QEMU -m, and the
+;; stack top) -- everything below derives from it, so NIL is byte-identical
+;; to the historic literals.
+(defvar *x64-heap-end-override* nil)
 (defun x64-effective-stack-top ()
   (or *x64-stack-top-override* +x64-stack-top+))
 
@@ -94,6 +107,32 @@
 (defconstant +x64-mcgc-freelist-base+
   (logand (+ +x64-mcgc-bitmap-base+
              (truncate (- +x64-mcgc-data-end+ +x64-mcgc-data-base+) (* 16 8)) 63)
+          (lognot 63)))
+
+;; The geometry FUNCTIONS live BELOW the constants they use.  The MVM compiler
+;; folds a defconstant only if it appeared EARLIER in the source stream; placed
+;; above them, +x64-mcgc-data-base+ / +x64-mcgc-page-size+ read as NIL in the
+;; self-hosted image and modus-sh emitted page_count = 0 (the UEFI DDC caught
+;; it: SBCL 0xDFFE vs modus-sh 0, then every address after it).  Divisions are
+;; ASH by a constant, never TRUNCATE, for the same host-vs-image reason.
+(defun x64-heap-end () (or *x64-heap-end-override* #x1E000000))
+(defun x64-heap-geometry ()
+  "(values from-start to-start space-size): semispaces below a 16 MB guard
+   that ends at (x64-heap-end).  Default: 0x10001000 / 0x16800000 / 0x067FF000."
+  (let* ((from #x10001000)
+         (guard-lo (- (x64-heap-end) #x1000000))
+         (size (logand (ash (- guard-lo from) -1) (lognot #xFFF))))
+    (values from (+ from size) size)))
+(defun x64-mcgc-data-end () (- (x64-heap-end) #x1000))
+(defun x64-mcgc-meta-base () (x64-heap-end))
+(defun x64-mcgc-page-count ()
+  (ash (- (x64-mcgc-data-end) +x64-mcgc-data-base+) -12))   ; / +x64-mcgc-page-size+ (4096)
+(defun x64-mcgc-descriptor-base () (x64-mcgc-meta-base))
+(defun x64-mcgc-bitmap-base ()
+  (logand (+ (x64-mcgc-descriptor-base) (x64-mcgc-page-count) 63) (lognot 63)))
+(defun x64-mcgc-freelist-base ()
+  (logand (+ (x64-mcgc-bitmap-base)
+             (ash (- (x64-mcgc-data-end) +x64-mcgc-data-base+) -7) 63)   ; / (* 16 8)
           (lognot 63)))
 
 ;; Per-CPU structures
@@ -456,11 +495,11 @@
     (mvm-emit-u32 buf #x10001000)
     (mvm-emit-u32 buf 0)
 
-    ;; R14 = from-space end (alloc limit).
-    ;; mov r14, 0x16800000
+    ;; R14 = from-space end (alloc limit) = to_start (see x64-heap-geometry).
+    ;; mov r14, 0x16800000 by default
     (mvm-emit-byte buf #x49)          ; REX.WB
     (mvm-emit-byte buf #xBE)          ; mov r14, imm64
-    (mvm-emit-u32 buf #x16800000)
+    (mvm-emit-u32 buf (nth-value 1 (x64-heap-geometry)))
     (mvm-emit-u32 buf 0)
 
     ;; Initialize GC metadata at 0x10000040..0x10000058.  The x64 GC
@@ -486,13 +525,13 @@
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
     (mvm-emit-u32 buf +gc-to-start-addr+) (mvm-emit-u32 buf 0)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xB8)
-    (mvm-emit-u32 buf #x16800000) (mvm-emit-u32 buf 0)
+    (mvm-emit-u32 buf (nth-value 1 (x64-heap-geometry))) (mvm-emit-u32 buf 0)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x07)
     ;; Slot 0x10000050 = space_size = 0x067FF000  (leaves the ~16MB guard)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
     (mvm-emit-u32 buf +gc-space-size-addr+) (mvm-emit-u32 buf 0)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xB8)
-    (mvm-emit-u32 buf #x067FF000) (mvm-emit-u32 buf 0)
+    (mvm-emit-u32 buf (nth-value 2 (x64-heap-geometry))) (mvm-emit-u32 buf 0)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x07)
     ;; Slot 0x10000058 = stack_base = top of stack (GC conservative-root
     ;; scan upper bound; must match the effective stack top).
@@ -514,13 +553,13 @@
              (mvm-emit-u32 buf (logand (ash val -32) #xFFFFFFFF))
              (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x07)))
       (mcgc-store #x10000E00 +x64-mcgc-data-base+)        ; page_base
-      (mcgc-store #x10000E08 +x64-mcgc-page-count+)       ; page_count
-      (mcgc-store #x10000E10 +x64-mcgc-descriptor-base+)  ; descriptor
-      (mcgc-store #x10000E18 +x64-mcgc-bitmap-base+)      ; bitmap
-      (mcgc-store #x10000E20 +x64-mcgc-freelist-base+)    ; freelist
+      (mcgc-store #x10000E08 (x64-mcgc-page-count))       ; page_count
+      (mcgc-store #x10000E10 (x64-mcgc-descriptor-base))  ; descriptor
+      (mcgc-store #x10000E18 (x64-mcgc-bitmap-base))      ; bitmap
+      (mcgc-store #x10000E20 (x64-mcgc-freelist-base))    ; freelist
       (mcgc-store #x10000E28 0)                           ; freelist_count
       (mcgc-store #x10000E30 0)                           ; alloc_page
-      (mcgc-store #x10000E38 +x64-mcgc-data-end+))        ; data_end
+      (mcgc-store #x10000E38 (x64-mcgc-data-end)))        ; data_end
 
     ;; RBP = frame pointer (same as RSP initially)
     ;; mov rbp, rsp
@@ -1086,6 +1125,11 @@
     ;; lidt [rsp]
     (mvm-emit-byte buf #x0F) (mvm-emit-byte buf #x01)
     (mvm-emit-byte buf #x1C) (mvm-emit-byte buf #x24)
+    ;; SEV-SNP (boot-uefi-snp.lisp): this LIDT just replaced the UEFI stub's
+    ;; IDT, whose vector 29 (#VC) made every port instruction work.  Put the
+    ;; gate back into THIS table before the next IN/OUT.  Emits nothing when
+    ;; *x64-snp-mode* is NIL.
+    (emit-snp-readd-vector29 buf idt-base #x10)
     ;; add rsp, 16  (restore stack)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x83)
     (mvm-emit-byte buf #xC4) (mvm-emit-byte buf #x10)

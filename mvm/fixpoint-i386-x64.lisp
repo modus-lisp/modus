@@ -29,20 +29,28 @@
 ;;; #xFFFFFFFF overflows 30-bit fixnum. With LI and CONSP/ATOM intercepted,
 ;;; all remaining emit-u64 calls on i386 have values that fit in 32 bits.
 ;;; On x64/AArch64, use standard ldb decomposition (safe for 63-bit fixnums).
+;;; #252 / #211: read in MODUS.ASM so this replaces x64-asm's EMIT-U64 for its own callers (see fixpoint-common.lisp).
+(in-package :modus.asm)
 (defun emit-u64 (buf value)
   (if (= (td-read-u32 #x3000008) 2)
       ;; i386 host: high32 always 0
       (progn (emit-u32 buf value)
              (emit-byte buf 0) (emit-byte buf 0)
              (emit-byte buf 0) (emit-byte buf 0))
-      ;; x64/AArch64 host
+      ;; x64/AArch64 host.  #252: VALUE may be a BIGNUM (64-bit immediates in
+      ;; the crypto code), and (ash bignum -32) is a runtime BIGNUM-ASH with a
+      ;; variable count -- the documented runaway-bignum bug (CLAUDE.md 8b):
+      ;; Gen1 hop 2 sat in EMIT-MOV-REG-IMM allocating 150 MB per collection
+      ;; forever at fn 5985.  FLOOR by 2^31 brings the high part into fixnum
+      ;; range, and the remaining shift is a constant 1 (inlined).
       (let ((lo (logand value 4294967295)))
-        (let ((hi (logand (ash value -32) 4294967295)))
+        (let ((hi (logand (ash (floor value 2147483648) -1) 4294967295)))
           (emit-u32 buf lo)
           (emit-u32 buf hi)))))
 
 ;;; i386-safe version of td-translate-fn-body: intercepts LI (opcode 17)
 ;;; before decode-instruction to avoid decode-u64 overflow.
+(in-package :modus.mvm)
 (defun td-translate-fn-body-li-safe (state)
   (let ((bytes (translate-state-mvm-bytes state))
         (offset (translate-state-mvm-offset state))

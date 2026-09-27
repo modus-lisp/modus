@@ -123,21 +123,21 @@ echo ""
 # Step 1: Gen0(x64) → Gen1(aarch64) [target=1, default]
 echo "Step 1: Gen0(x64) → Gen1(aarch64)"
 extract_image "$GEN0" "$GEN1" "Gen1" \
-  "qemu-system-x86_64 -m 512 -no-reboot" \
+  "qemu-system-x86_64 -m 1024 -no-reboot" \
   134217728 $A64_IMAGE_SIZE  # 0x08000000
 echo ""
 
 # Step 2: Gen1(aarch64) → Gen2(x64) [target=0, default]
 echo "Step 2: Gen1(aarch64) → Gen2(x64)"
 extract_image "$GEN1" "$GEN2" "Gen2" \
-  "qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 512 -semihosting" \
+  "qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 1024 -semihosting" \
   1207959552 $X64_IMAGE_SIZE  # 0x48000000
 echo ""
 
 # Step 3: Gen2(x64) → Gen3(aarch64) [target=1, default]
 echo "Step 3: Gen2(x64) → Gen3(aarch64)"
 extract_image "$GEN2" "$GEN3" "Gen3" \
-  "qemu-system-x86_64 -m 512 -no-reboot" \
+  "qemu-system-x86_64 -m 1024 -no-reboot" \
   134217728 $A64_IMAGE_SIZE
 echo ""
 
@@ -147,7 +147,7 @@ GEN0_I386=/tmp/fixpoint-gen0-i386.elf
 cp "$GEN0" "$GEN0_I386"
 patch_target "$GEN0_I386" $((0x380000)) 2
 extract_image "$GEN0_I386" "$I386_A" "i386-A" \
-  "qemu-system-x86_64 -m 512 -no-reboot" \
+  "qemu-system-x86_64 -m 1024 -no-reboot" \
   134217728 $I386_IMAGE_SIZE
 echo ""
 
@@ -157,7 +157,7 @@ GEN1_I386=/tmp/fixpoint-gen1-i386.bin
 cp "$GEN1" "$GEN1_I386"
 patch_target "$GEN1_I386" $((0x300000)) 2
 extract_image "$GEN1_I386" "$I386_B" "i386-B" \
-  "qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 512 -semihosting" \
+  "qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 1024 -semihosting" \
   1207959552 $I386_IMAGE_SIZE
 echo ""
 

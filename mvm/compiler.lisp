@@ -940,6 +940,9 @@
 (defvar *function-return-label* nil
   "Label for early return from function body (return outside loop)")
 
+(defvar *ddc-trace-nil-callee* nil
+  "DDC triage: when T, the :call assembler names each call site whose callee
+   name is NIL, and the unresolved-calls summary prints each key's type.")
 (defvar *unresolved-calls* (make-hash-table :test 'equal)
   "Tracks unresolved function calls: name-string -> count")
 
@@ -1912,6 +1915,8 @@
 
 (defun emit-ir (op &rest args)
   "Emit an IR instruction to the current buffer"
+  (when (and *ddc-trace-nil-callee* (eq op :call) (equal (car args) "NIL"))
+    (format t "~&  NIL-CALL built in ~A (nargs ~A)~%" *current-function-name* (cadr args)))
   (push (cons op args) *ir-buffer*))
 
 (defun emit-ir-label (label-id)
@@ -5768,17 +5773,63 @@
 ;;;   (SB-INT:QUASIQUOTE (a #S(COMMA :EXPR b :KIND 0) #S(COMMA :EXPR c :KIND 2)))
 ;;; We expand this to explicit list/cons/append calls before compiling.
 
+(defun %bq-list-comma-kind (x)
+  "Modus's OWN reader (cl-reader.lisp) represents backquote as
+   (BACKQUOTE form) with (COMMA x) / (COMMA-AT x) / (COMMA-DOT x) markers,
+   where SBCL's reader gives SB-INT:QUASIQUOTE + SB-IMPL::COMMA structs.  The
+   compiler must lower BOTH through the same EXPAND-BACKQUOTE, or a self-
+   hosting image compiles every backquoted macro body differently from the
+   host build (measured: the only differing probe function was the backquote
+   template).  Returns 0 (unquote), 2 (splice; ,. treated as splice) or NIL."
+  (and (consp x) (consp (cdr x)) (null (cddr x)) (symbolp (car x)) (car x)
+       (let ((n (symbol-name (car x))))
+         (cond ((string= n "COMMA") 0)
+               ((string= n "COMMA-AT") 2)
+               ((string= n "COMMA-DOT") 2)
+               (t nil)))))
+
+;;; SBCL's comma STRUCT and quasiquote SYMBOL are reached BY NAME, never
+;;; spelled as reader symbols: `sb-impl::comma' in this file would read as
+;;; one symbol under SBCL and another under Modus's reader (no SB-IMPL
+;;; package), and these four functions were the last to differ between the
+;;; host build and the self-compile for exactly that reason.  In-image the
+;;; packages do not exist and every helper answers NIL / falls through.
+(defun %sbcl-comma-type ()
+  (let ((p (find-package "SB-IMPL")))
+    (and p (find-symbol "COMMA" p))))
+(defun %sbcl-comma-p (x)
+  (let ((ty (%sbcl-comma-type)))
+    (and ty (not (symbolp x)) (not (consp x)) (typep x ty))))
+(defun %sbcl-comma-slot (x accessor-name)
+  (let* ((p (find-package "SB-IMPL"))
+         (f (and p (find-symbol accessor-name p))))
+    (and f (fboundp f) (funcall (symbol-function f) x))))
+
 (defun bq-comma-p (x)
-  "Check if X is an SBCL comma struct"
-  (typep x 'sb-impl::comma))
+  "Check if X is a comma: an SBCL comma struct or Modus's (COMMA…) marker"
+  (or (%sbcl-comma-p x)
+      (not (null (%bq-list-comma-kind x)))))
 
 (defun bq-comma-expr (x)
-  "Get the expression from an SBCL comma struct"
-  (sb-impl::comma-expr x))
+  "Get the expression from a comma (either representation)"
+  (if (%sbcl-comma-p x)
+      (%sbcl-comma-slot x "COMMA-EXPR")
+      (cadr x)))
 
 (defun bq-comma-kind (x)
-  "Get the kind from an SBCL comma struct (0=unquote, 2=splice)"
-  (sb-impl::comma-kind x))
+  "Get the kind from a comma (0=unquote, 2=splice), either representation"
+  (if (%sbcl-comma-p x)
+      (%sbcl-comma-slot x "COMMA-KIND")
+      (%bq-list-comma-kind x)))
+
+(defun %bq-form-p (form)
+  "A backquote template form in either reader's representation."
+  (and (consp form) (symbolp (car form)) (car form)
+       (let ((n (symbol-name (car form))))
+         (or (string= n "BACKQUOTE")
+             (and (string= n "QUASIQUOTE")
+                  (let ((pk (symbol-package (car form))))
+                    (and pk (string= (package-name pk) "SB-INT"))))))))
 
 (defun expand-backquote (template)
   "Expand a backquote template into explicit list-building code.
@@ -5814,7 +5865,7 @@
                    ((bq-comma-p elt)
                     (push (bq-comma-expr elt) current))
                    ;; Nested backquote
-                   ((and (consp elt) (eq (car elt) 'sb-int:quasiquote))
+                   ((%bq-form-p elt)
                     (push (expand-backquote (cadr elt)) current))
                    ;; Nested list
                    ((consp elt)
@@ -5861,7 +5912,7 @@
   "Compile FORM in environment ENV, placing result in register DEST.
    DEST is a virtual register number."
   ;; Expand backquote before macro expansion
-  (let ((form (if (and (consp form) (eq (car form) 'sb-int:quasiquote))
+  (let ((form (if (%bq-form-p form)
                   (expand-backquote (cadr form))
                   form)))
   ;; Macro expand.  If the INCOMING form is the discarded statement marked
@@ -8295,7 +8346,17 @@
                (emit-ir :push arr-slot)
                (compile-quote (aref value i) elem-slot)
                (emit-ir :pop arr-slot)
-               (emit-ir :obj-set arr-slot i elem-slot))
+               ;; :obj-set carries the slot index as imm8, so element 256
+               ;; landed on slot 0 and the tail of a long literal overwrote
+               ;; its head (boot-x64's 347-byte #VC/SIGSEGV stub blob, baked
+               ;; into modus-sh, came out as its own last 91 bytes).  Past
+               ;; 255, index from a register.
+               (if (< i 256)
+                   (emit-ir :obj-set arr-slot i elem-slot)
+                   (let ((idx-slot (alloc-temp-reg)))
+                     (emit-ir :li idx-slot (ash i +fixnum-shift+))
+                     (emit-ir :aset arr-slot idx-slot elem-slot)
+                     (free-temp-reg))))
              (free-temp-reg)))
          (unless (= dest arr-slot)
            (emit-ir :mov dest arr-slot))
@@ -9112,7 +9173,7 @@
                ;; is a real expression and `(foo ,(setq x 1))' really does mutate x,
                ;; so the boxing decision still needs to see it.  EXPAND-BACKQUOTE is
                ;; what COMPILE-FORM lowers anyway, so this scans what actually runs.
-               (when (and (consp form) (eq (car form) 'sb-int:quasiquote))
+               (when (%bq-form-p form)
                  (scan (expand-backquote (cadr form)) in-lambda)
                  (return-from scan))
                (let ((mx (%cfv-macroexpand form)))
@@ -11321,7 +11382,7 @@
          ;; before lowering anyway, so free-var collection over the
          ;; raw template is the wrong thing.  Reach into the expansion
          ;; via expand-backquote and collect from THAT.
-         ((eq head 'sb-int:quasiquote)
+         ((%bq-form-p form)
           (%collect-free-vars (expand-backquote (cadr form)) bound env acc))
          ;; IN-IMAGE reader backquote: `(setq ,v t) reads as
          ;; (BACKQUOTE (SETQ (COMMA V) T)).  The default element walk would
@@ -18301,6 +18362,8 @@
 ;;; PROGRAM-ERROR from AOT code while the identical runtime-compiled code
 ;;; worked.  The pre-pass records every name DEFUNed at top level with more
 ;;; than one lambda-list SHAPE; calls to those take the forward-reference path.
+(defvar *multi-shape-dump* nil "When T, mvm-compile-all prints the multi-shape defun table.")
+(defun %multi-shape-dump-entry (k v) (format t "~&;; MULTI-SHAPE ~A final=~S~%" k v))
 (defvar *multi-shape-defuns* nil
   "NIL or an EQUAL hash of symbol-name -> the FINAL definition's shape
    (REQUIRED OPTIONAL REST-P KEY-P), set per MVM-COMPILE-ALL.")
@@ -23627,7 +23690,12 @@
                                     0)))))
              (unless fn-info
                (when (boundp '*unresolved-calls*)
-                 (incf (gethash fn-name *unresolved-calls* 0))))
+                 (incf (gethash fn-name *unresolved-calls* 0)))
+               ;; DDC triage: an unresolved callee whose NAME is NIL is a call
+               ;; the assembler could not even name.  Off unless asked for.
+               (when (and *ddc-trace-nil-callee* (or (null fn-name) (equal fn-name "NIL")))
+                 (format t "~&  NIL-CALLEE in ~A at ~A insn ~S~%"
+                         *current-function-name* *current-source-location* insn)))
              (mvm-call buf target)))
 
           (:call-indirect
@@ -24003,7 +24071,21 @@
      (let ((name (cadr form))
            (value-form (caddr form)))
        (when value-form
-         (let ((value (eval value-form)))
+         ;; A self-evaluating literal is taken AS IS.  Identical on the host
+         ;; (EVAL of a literal is the literal); in-image it matters: the
+         ;; interpreter's value->word conversion overflows for |v| >= 2^61, so
+         ;; (eval 4611686018427387903) — +FIXNUM-MAX+ — came back as a wrong
+         ;; object whose heap word was then baked as an immediate, differently
+         ;; in every run (the 144-byte nondeterminism test/run-uefi-ddc.sh saw).
+         (let ((value (if (or (numberp value-form) (stringp value-form)
+                              (characterp value-form) (keywordp value-form)
+                              ;; T and NIL are constants too: in-image (eval 't)
+                              ;; answers the CL package's symbol object named T,
+                              ;; not the T constant, and the init thunk then
+                              ;; interned a symbol where the host baked T.
+                              (eq value-form t) (null value-form))
+                          value-form
+                          (eval value-form))))
            (setf (gethash (normalize-name name) *constants*) value)
            ;; Make available for subsequent eval calls (skip if already a constant)
            (when (and (symbolp name)
@@ -24773,10 +24855,12 @@
     ;; *MULTI-SHAPE-DEFUNS*).  SETQ, not LET, for the same in-image reason as
     ;; *MVM-GENSYM-COUNTER* above.
     (setq *multi-shape-defuns* (%collect-multi-shape-defuns forms))
-    #+sbcl
-    (when (sb-ext:posix-getenv "MODUS_MULTI_SHAPE_DUMP")
-      (maphash (lambda (k v) (format t "~&;; MULTI-SHAPE ~A final=~S~%" k v))
-               *multi-shape-defuns*))
+    ;; Diagnostic dump behind a plain special (set it by hand), not #+sbcl +
+    ;; posix-getenv + a LAMBDA: a feature conditional reads differently under
+    ;; SBCL's reader and Modus's own, and the closure it hid was the one
+    ;; function-count difference between the host build and the self-compile.
+    (when *multi-shape-dump*
+      (maphash #'%multi-shape-dump-entry *multi-shape-defuns*))
 
     ;; Phase 1 & 2: Compile all forms to IR
     (let ((form-index 0))
@@ -24876,10 +24960,16 @@
     ;; init-all-globals is a safe no-op.  (DIAG count exposes the empty case.)
     (let ((init-calls nil))
       (format t "  init-all-globals: ~D init thunks~%" (length *init-thunk-names*))
-      (dolist (thunk-name (nreverse *init-thunk-names*))
-        (push `(handler-case (,(intern thunk-name :modus.mvm))
-                 (t (c) nil))
-              init-calls))
+      ;; INTERN into MODUS.MVM by designator on the host; IN-IMAGE that
+      ;; designator does not resolve — (intern "X" :modus.mvm) returned NIL in
+      ;; modus-sh — so every thunk call became a call to NIL (936 of them, the
+      ;; self-compiled image died at boot in INIT-ALL-GLOBALS).  Fall back to
+      ;; the current package, which is MODUS.MVM at build time anyway.
+      (let ((pkg (or (find-package :modus.mvm) *package*)))
+        (dolist (thunk-name (nreverse *init-thunk-names*))
+          (push `(handler-case (,(intern thunk-name pkg))
+                   (t (c) nil))
+                init-calls)))
       (let* ((result (mvm-compile-toplevel
                        `(defun init-all-globals ()
                           ,@(nreverse init-calls))))
@@ -24976,7 +25066,10 @@
                 (format t "~%  === ~D unresolved calls to ~D functions (!! NO %%UNRESOLVED-FN STUB — targeting offset 0, this is garbage execution) ===~%"
                         total (length names))))
           (dolist (entry (subseq names 0 (min 200 (length names))))
-            (format t "    ~4D × ~A~%" (car entry) (cdr entry)))
+            (format t "    ~4D × ~A~%" (car entry) (cdr entry))
+            (when *ddc-trace-nil-callee*
+              (format t "           key type ~A~A~%" (type-of (cdr entry))
+                      (if (stringp (cdr entry)) (format nil " len ~D" (length (cdr entry))) ""))))
           (when (> (length names) 200)
             (format t "    ... and ~D more~%" (- (length names) 200)))
           (force-output)))

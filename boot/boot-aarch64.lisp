@@ -811,6 +811,17 @@
 ;; which calls %gc-collect (gc.lisp).  After collection the trampoline
 ;; reloads x24/x25 from updated metadata slots.  See mvm/gc.lisp for
 ;; the algorithm and 0x10000040–0x10000078 metadata layout.
+(defvar *aarch64-fixpoint-big-heap* nil
+  "When T the fixpoint entry maps VA 0x10200000-0x3FFFFFFF to DRAM (+0x40000000,
+   needs QEMU -m 1024) instead of PCI identity, and starts the bump allocator at
+   VA 0x10A00000 with its limit at 0x3FE00000 (756 MB; was 0x20200000 / 508 MB
+   until the UART moved to L2[120], #252) instead of the 112 MB
+   heap below.  The fixpoint's AArch64 translation has no collector wired --
+   its gc-check is `b.cc +2; brk #1' -- so Gen1 must fit its whole run in the
+   heap; translating the ~10 MB bytecode back to x64 allocates a 96 MB code
+   buffer and an 81 MB label array (#252).  NIL keeps every existing image
+   byte-identical.  The fixpoint kernel-main sets it in-image, so the Gen1
+   boot code Gen0 emits carries it too.")
 (defconstant +tdk-cons-base-va+   #x09000000)  ; Cons alloc base
 (defconstant +tdk-cons-half-va+   #x0C800000)  ; Mid-point of 112-MB heap
 (defconstant +tdk-cons-end-va+    #x10000000)  ; End of 112-MB heap
@@ -1051,7 +1062,9 @@
     ;;    entry = PA | 0x705 (device nGnRnE, AF, SH=inner, AttrIndx=1)
     ;;    L2[128] at L2_base + 128*8 = L2_base + 0x400
     (emit-aarch64-load-imm64 buf x0 (+ +tdk-l2-table-pa+ #x400))  ; x0 = &L2[128]
-    (emit-aarch64-load-imm64 buf x1 #x10000705)                     ; x1 = first entry (PA 0x10000000)
+    ;; Big-heap fixpoint: DRAM (VA+0x40000000, normal cacheable) instead of the
+    ;; PCI identity window; L2[128] metadata and L2[256] UART are restored below.
+    (emit-aarch64-load-imm64 buf x1 (if *aarch64-fixpoint-big-heap* #x50000701 #x10000705)) ; x1 = first entry
     (emit-aarch64-movz buf x2 384 0)                                 ; x2 = count (128..511 = 384 entries)
     ;; Reuse x3 = 0x200000 (2MB step, already loaded from step 6)
     (let ((pci-loop-pos (a64-buffer-position buf)))
@@ -1069,7 +1082,11 @@
 
     ;; 7c. Restore L2[256] = UART (was overwritten by PCI loop above)
     ;;    VA 0x20000000 → PA 0x09000000 (device)
-    (emit-aarch64-load-imm64 buf x0 (+ +tdk-l2-table-pa+ (* 256 8)))
+    ;;    #252 big-heap: the UART moves to L2[120] = VA 0x0F000000 so that
+    ;;    VA 0x10A00000-0x3FE00000 is one contiguous 756 MB heap (378 MB
+    ;;    semispaces; 254 MB thrashed at the end of Gen1's hop 2).  Must match
+    ;;    *aarch64-serial-base* in fixpoint-cross.lisp / build-fixpoint.lisp.
+    (emit-aarch64-load-imm64 buf x0 (+ +tdk-l2-table-pa+ (* (if *aarch64-fixpoint-big-heap* 120 256) 8)))
     (emit-aarch64-load-imm64 buf x1 #x09000705)
     (emit-aarch64-str-x buf x1 x0 0)
 
@@ -1101,9 +1118,14 @@
     ;; runtime's image-buffer at this VA stops working.  Acceptable
     ;; for the ANSI build (no runtime image-buffer use); other builds
     ;; that depend on this VA→DRAM mapping must skip this fixup.
-    (emit-aarch64-load-imm64 buf x0 (+ +tdk-l2-table-pa+ (* 64 8)))
-    (emit-aarch64-load-imm64 buf x1 #x08000705)
-    (emit-aarch64-str-x buf x1 x0 0)
+    ;; #252: the fixpoint big-heap boot IS such a build -- Gen1 assembles
+    ;; Gen2 into the image buffer at VA 0x08000000 (its first write, at
+    ;; 0x08001000, faulted into the GIC) and takes no interrupts -- so the
+    ;; override is skipped there and L2[64] stays DRAM.
+    (unless *aarch64-fixpoint-big-heap*
+      (emit-aarch64-load-imm64 buf x0 (+ +tdk-l2-table-pa+ (* 64 8)))
+      (emit-aarch64-load-imm64 buf x1 #x08000705)
+      (emit-aarch64-str-x buf x1 x0 0))
 
     ;; ================================================================
     ;; Phase C: Configure system registers and enable MMU
@@ -1269,12 +1291,26 @@
     ;; 0x10000070/78 (see translate-aarch64.lisp).  x26 = NIL is also
     ;; raw 0 — *not* a tagged immediate — and the AArch64 call-ind
     ;; check explicitly CBZ's on it to catch `(funcall NIL)`.
-    (emit-aarch64-load-imm64 buf x24 +tdk-cons-base-va+)   ; cons alloc
-    (emit-aarch64-load-imm64 buf x25 +tdk-cons-limit-va+)  ; cons limit
+    (emit-aarch64-load-imm64 buf x24 (if *aarch64-fixpoint-big-heap* #x10A00000 +tdk-cons-base-va+))   ; cons alloc
+    ;; #252: the big-heap limit sits 16 MB BELOW from-space's end (0x28400000 =
+    ;; 0x10A00000 + 378 MB) -- the same guard the fixpoint kernel-main sets in
+    ;; *aarch64-gc-limit-guard* for every later collection: gc-check tests
+    ;; AFTER an allocation of unknown size, so an allocation larger than the
+    ;; guard runs into to-space and the next collection copies over its tail.
+    ;; The fixpoint's big buffers are therefore allocated up front, from a
+    ;; nearly empty heap, so nothing larger than this is allocated late.
+    (emit-aarch64-load-imm64 buf x25 (if *aarch64-fixpoint-big-heap* #x27400000 +tdk-cons-limit-va+))  ; cons limit = from-end (0x10A00000 + 378 MB = 0x28400000) - 16 MB guard
     ;; NIL: 0 for legacy fixpoint builds, #xDEAD0001 for the ANSI runner
     ;; (see *aarch64-fixpoint-nil-value* defvar above).  With value 0 this
     ;; emits the single MOVZ the legacy sequence used (byte-identical).
     (emit-aarch64-load-imm64 buf x26 *aarch64-fixpoint-nil-value*)
+    ;; x18 = the CONVENTION BASE #x10000000 (translate-aarch64 *a64-x18-base*):
+    ;; every conv-slot access in translated code is `x18 + off', and so is
+    ;; emit-aarch64-code-bounds-init below.  Only the re-entry-guard block
+    ;; set it, so a legacy fixpoint image left x18 = 0 and the very first
+    ;; code-bounds store hit VA 0x160 in the read-only image mapping
+    ;; (ESR 0x9600004e; #252) -- the x18-unset class boot-rpi-cl.lisp records.
+    (emit-aarch64-movz buf 18 #x1000 16)
 
     ;; 17b. x28 = the native MCGC GC trampoline's absolute VA (same as
     ;; boot-rpi-cl.lisp and emit-linux-aarch64-entry).  BAKED code reaches the

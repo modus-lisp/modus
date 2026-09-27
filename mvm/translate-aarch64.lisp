@@ -2378,6 +2378,19 @@
                                   (41 . 198)   ; socket
                                   (42 . 203)   ; connect
                                   (43 . 202)   ; accept
+                                  ;; net/hosted-sockets.lisp issues these too.
+                                  ;; Unmapped, they passed through as the
+                                  ;; aarch64 syscall of the same NUMBER:
+                                  ;; getsockname 51 = chroot (every bind's
+                                  ;; port read back -1), setsockopt 54 =
+                                  ;; fchownat, sendto 44 = fstatfs, recvfrom
+                                  ;; 45 = truncate.
+                                  (44 . 206)   ; sendto
+                                  (45 . 207)   ; recvfrom
+                                  (48 . 210)   ; shutdown
+                                  (51 . 204)   ; getsockname
+                                  (54 . 208)   ; setsockopt
+                                  (55 . 209)   ; getsockopt
                                   (49 . 200)   ; bind
                                   (50 . 201)   ; listen
                                   (60 . 93)    ; exit

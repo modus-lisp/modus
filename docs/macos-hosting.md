@@ -306,7 +306,15 @@ limit leaves no room for a fixed VA.
 
 ## Milestones
 
-**M0 — Darwin trap spike (small).**  A `*aarch64-darwin-mode*` beside the
+**M0 — native on macOS: DONE (2026-09-27).**  `host/macos/`: the Linux
+aarch64 ELF, built with `MODUS_DARWIN=1`, embedded in a signed Mach-O that
+`mach_vm_remap`s it to its link address and calls it through a syscall stub.
+Natively on this Mac: `--eval`, `--load`, the smoke/stress/GC probes (200
+collections, file I/O, CLOS, conditions, restarts) and save-and-die /
+`--core` restore all give the same results as on Linux.  See *Running
+natively* below.
+
+*The plan as first written:* **M0 — Darwin trap spike (small).**  A `*aarch64-darwin-mode*` beside the
 Linux one: `svc #0x80`, x16, carry→negate, the remap table.  Compile a
 trivial MVM program (no runtime) that writes and exits, link it with Apple
 `ld`, run it on macOS.  Proves the toolchain path and the syscall ABI in
@@ -343,6 +351,53 @@ macOS modus.
 function pointers handed in by the shim (no raw `svc` on iOS), and a small
 Swift host that blits the glass framebuffer to a Metal texture and feeds
 touches back.
+
+## Running natively (M0)
+
+```
+MODUS_DARWIN=1 MODUS_NO_JIT=1 MODUS_CODE_BASE=7000010000 \
+MODUS_CONV_DELTA=7040000000 MODUS_HEAP_BASE=7080000000 \
+MODUS_JIT_ARENA_BASE=70C0000000 MODUS_CLI_OUT=/tmp/modus-darwin.elf \
+  sbcl --dynamic-space-size 16384 --script mvm/build-aarch64-cli.lisp
+host/macos/build-macos.sh /tmp/modus-darwin.elf ./modus
+./modus --eval '(+ 1 2)'
+```
+
+- **Syscalls.**  `MODUS_DARWIN=1` makes `a64-svc` emit, for SVC #0,
+  `str x30,[sp,#-16]!; x16 = slot; ldr x16,[x16]; blr x16; ldr x30,[sp],#16`
+  (other SVC immediates become BRK).  The slot is one 16 KB page below the
+  code base; the shim stores `modus_syscall_stub` there.  The stub
+  (`syscall-stub.S`) preserves every register but x0 — SVC semantics — and
+  `modus_syscall` (`modus-shim.c`) translates the LINUX aarch64 call the
+  image makes: numbers, open/at flags, `struct stat`, mmap flags
+  (`MAP_FIXED_NOREPLACE` emulated), clock ids, errno.  Unknown calls return
+  `-ENOSYS` and are logged once.  Translating in the host's C, not a second
+  trap ABI in the translator, is also the iOS shape (no raw syscalls there).
+- **Mappings.**  Only the code is the shim's job (remapped from `__TEXT`,
+  16 KB-aligned via `-sectalign`); the boot stub maps the region, heap and
+  arena itself, through the translator, exactly as on Linux.  An unfixed RWX
+  request (the exec-page primitive with no arena — GC bitmaps) is retried RW.
+- **macOS reserves `[0x1000000000, 0x7000000000)`** (64–448 GB, no access;
+  probed with `mach_vm_region`), which is why fixed maps at 64/128 GB fail and
+  why 448 GB is the floor.  Nothing can sit below `0x7000000000`, so the code
+  base is `0x7000010000` and the slot page `0x700000C000`.
+- **The JIT-off boot applies the layout too** (`%jit-boot-init` /
+  `%aa64-jit-boot-init`): the in-image compiler serves the interpreter, and
+  without it the first native run faulted on the MV-count slot's old
+  address.  (This also invalidates the earlier moved-layout JIT-OFF gate
+  spot-checks; the stock-`main` reproduction of the format-f failures stands.)
+- **argv strings are copied to 16-byte-aligned storage**: the restore path
+  reads `argv[2]` as `(* 2 (mem-ref … :u64))`, which drops bit 0 — the class
+  `455f7780` fixed for getenv; macOS put argv at odd addresses.
+- **Fault report.**  The image installs no signal handlers on Darwin yet, so
+  the shim prints the PC and registers (as image offsets) on SIGSEGV/BUS/ILL/
+  TRAP.  `lldb` cannot attach to the ad-hoc-signed binary without
+  `get-task-allow`.
+
+**Not yet (M2 proper):** signals (`rt_sigaction` is accepted and ignored, so
+a fault kills the process instead of unwinding into a handler-case),
+`getdents64`, fork/wait, sockets, threads, and the JIT (M3: `MAP_JIT` +
+`pthread_jit_write_protect_np`).
 
 ## Open questions
 

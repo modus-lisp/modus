@@ -8,6 +8,9 @@
 ;;;;   MODUS_HEAP_BASE       the fixed heap mapping              (0x2000000000)
 ;;;;   MODUS_JIT_ARENA_BASE  the fixed JIT arena                 (0x3000000000)
 ;;;;   MODUS_NO_X18=1        Darwin's register rule: no x18 base, boot poisons x18
+;;;;   MODUS_DARWIN=1        a Darwin image: every syscall calls the host shim's
+;;;;                         stub through a word one 16 KB page below the code
+;;;;                         base (implies MODUS_NO_X18; needs MODUS_CODE_BASE)
 ;;;;
 ;;;; Every value has TWO homes that must agree: the HOST build that compiles
 ;;;; and translates the image's fixed code, and the image's JIT co-init that
@@ -36,6 +39,21 @@
   (let ((v (sb-ext:posix-getenv "MODUS_NO_X18")))
     (and v (plusp (length v)) (string/= v "0"))))
 
+(defvar *layout-darwin*
+  (let ((v (sb-ext:posix-getenv "MODUS_DARWIN")))
+    (and v (plusp (length v)) (string/= v "0"))))
+
+(when *layout-darwin* (setq *layout-no-x18* t))   ; Darwin zeroes x18
+
+(defun layout-darwin-syscall-slot ()
+  "The fixed VA of the word holding the shim's syscall-stub address: one
+   16 KB page below the code base.  NIL for a non-Darwin image."
+  (when *layout-darwin*
+    (let ((code (getf *layout-plist* :code-base)))
+      (unless (and code (>= code (ash 1 32)))
+        (error "MODUS_DARWIN needs MODUS_CODE_BASE above 4 GB (macOS maps nothing lower)"))
+      (- code #x4000))))
+
 (defun layout-coinit-text ()
   "Source text for an image's JIT co-init: the runtime twin of
    APPLY-LAYOUT-HOST.  Spliced inside a DEFUN body, so no double quotes."
@@ -44,10 +62,12 @@
   (setq *conv-relative* t)
   (setq *conv-delta* ~D)
   (setq *hosted-layout* (quote ~S))
+  (setq *aarch64-darwin-syscall-slot* ~A)
 "
             (if *layout-no-x18* "nil" "t")
             *layout-conv-delta*
-            *layout-plist*)))
+            *layout-plist*
+            (let ((slot (layout-darwin-syscall-slot))) (if slot (format nil "~D" slot) "nil")))))
 
 (defun apply-layout-host ()
   "Set the host translator and compiler to this build's layout.  Call after
@@ -61,6 +81,7 @@
                          (symbol-value (find-symbol "+LINUX-AARCH64-LOAD-ADDR+" :modus.mvm)))))
       (put "*A64-CODE-ADDR-WIDE*" (>= code (ash 1 32))))
     (when *layout-no-x18* (put "*A64-X18-BASE*" nil))
+    (put "*AARCH64-DARWIN-SYSCALL-SLOT*" (layout-darwin-syscall-slot))
     (let ((real (funcall (find-symbol "CONV-REAL" :modus.mvm)
                          (symbol-value (find-symbol "+CONV-REGION-BASE+" :modus.mvm)))))
       (format t "~&  Hosted layout: code #x~X  region #x~X (delta #x~X)  heap #x~X  arena #x~X~A~%"
@@ -68,4 +89,7 @@
               real *layout-conv-delta*
               (or (getf *layout-plist* :heap-base) #x2000000000)
               (or (getf *layout-plist* :jit-arena-base) #x3000000000)
-              (if *layout-no-x18* "  x18: NOT used (poisoned)" "")))))
+              (if *layout-no-x18* "  x18: NOT used (poisoned)" ""))
+      (when *layout-darwin*
+        (format t "  DARWIN image: syscalls call the shim stub via slot #x~X~%"
+                (layout-darwin-syscall-slot))))))

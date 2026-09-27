@@ -473,9 +473,12 @@
   (setq *jit-target-arch* :aarch64)
   t)
 "
-      "
-(defun %aa64-jit-boot-init () nil)
-"))
+      ;; JIT off still applies the hosted layout: the in-image compiler serves
+      ;; the interpreter, and its bytecode must name the moved region.
+      (concatenate 'string "
+(defun %aa64-jit-boot-init ()
+" (cl-user::layout-coinit-text) "  nil)
+")))
 
 
 ;; The arch's translator source, assembled in image load order.  x64:

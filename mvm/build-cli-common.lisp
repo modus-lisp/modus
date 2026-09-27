@@ -624,6 +624,16 @@
 ;;; with nothing to patch.
 (defvar *jit-boot-source*
   (cond
+    ;; JIT off still needs the HOSTED LAYOUT (docs/macos-hosting.md): the
+    ;; in-image compiler serves the interpreter too, and bytecode it compiles
+    ;; must name the region where it really is.  Without this a moved-layout
+    ;; JIT-off image (the first native macOS build) faulted on the MV-count
+    ;; slot's old address the first time it evaluated a form.
+    ((and (not *jit-on*) (eq *cli-arch* :aarch64))
+     (concatenate 'string "
+(defun %jit-boot-init ()
+" (layout-coinit-text) "  nil)
+"))
     ((not *jit-on*)
      "
 (defun %jit-boot-init () nil)

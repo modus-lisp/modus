@@ -337,13 +337,18 @@
     (emit-aarch64-load-imm64 buf 4 #xFFFFFFFFFFFFFFFF)
     (emit-aarch64-load-imm64 buf 5 0)
     (emit-aarch64-load-imm64 buf 8 222)        ; mmap
-    (emit-aarch64-u32 buf #xD4000001)          ; SVC #0
+    (modus.mvm::a64-svc buf 0)          ; SVC #0
     (emit-aarch64-load-imm64 buf 16 (conv-real +conv-region-low+))
     (emit-aarch64-u32 buf #xEB10001F)          ; CMP x0, x16
-    (emit-aarch64-u32 buf (logior #x54000000 (ash 4 5)))   ; B.EQ +4
-    (emit-aarch64-load-imm64 buf 0 97)         ; exit(97): region not mappable
-    (emit-aarch64-load-imm64 buf 8 93)
-    (emit-aarch64-u32 buf #xD4000001))         ; SVC #0
+    ;; B.EQ past the exit, patched from where it really ends: a Darwin image's
+    ;; syscall is a five-instruction call, not one SVC.
+    (let ((beq-at (a64-buffer-position buf)))
+      (emit-aarch64-u32 buf 0)                 ; B.EQ <past exit>, patched
+      (emit-aarch64-load-imm64 buf 0 97)       ; exit(97): region not mappable
+      (emit-aarch64-load-imm64 buf 8 93)
+      (modus.mvm::a64-svc buf 0)
+      (setf (aref (a64-buffer-code buf) beq-at)
+            (logior #x54000000 (ash (- (a64-buffer-position buf) beq-at) 5)))))
 
   ;; Store argc as 32-bit at [0x10000200].
   (emit-aarch64-load-imm64 buf 16 (conv-real #x10000200))
@@ -405,7 +410,7 @@
   (emit-aarch64-load-imm64 buf 4 #xFFFFFFFFFFFFFFFF)
   (emit-aarch64-load-imm64 buf 5 0)
   (emit-aarch64-load-imm64 buf 8 222)
-  (emit-aarch64-u32 buf #xD4000001)   ; SVC #0
+  (modus.mvm::a64-svc buf 0)   ; SVC #0
   (emit-aarch64-load-imm64 buf 16 (hosted-layout :heap-base +linux-aarch64-fixed-heap-base+))
   (emit-aarch64-u32 buf #xEB10001F)   ; CMP x0, x16
   (let ((beq-at (a64-buffer-position buf)))
@@ -417,7 +422,7 @@
     (emit-aarch64-load-imm64 buf 4 #xFFFFFFFFFFFFFFFF)
     (emit-aarch64-load-imm64 buf 5 0)
     (emit-aarch64-load-imm64 buf 8 222)
-    (emit-aarch64-u32 buf #xD4000001)   ; SVC #0
+    (modus.mvm::a64-svc buf 0)   ; SVC #0
     (setf (aref (a64-buffer-code buf) beq-at)
           (logior #x54000000 (ash (- (a64-buffer-position buf) beq-at) 5))))
   ;; MOV x22, x0  (heap base → x22)
@@ -435,7 +440,7 @@
   (emit-aarch64-load-imm64 buf 4 #xFFFFFFFFFFFFFFFF)
   (emit-aarch64-load-imm64 buf 5 0)
   (emit-aarch64-load-imm64 buf 8 222)
-  (emit-aarch64-u32 buf #xD4000001)   ; SVC #0
+  (modus.mvm::a64-svc buf 0)   ; SVC #0
   (emit-aarch64-load-imm64 buf 16 (hosted-layout :jit-arena-base +linux-aarch64-jit-arena-base+))
   (emit-aarch64-u32 buf #xEB10001F)   ; CMP x0, x16
   (emit-aarch64-u32 buf #x9A9F0000)   ; CSEL x0, x0, xzr, EQ

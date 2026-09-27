@@ -1806,10 +1806,33 @@
   (a64-emit buf (logior #xD4400000
                         (ash (logand imm16 #xFFFF) 5))))
 
+(defvar *aarch64-darwin-syscall-slot* nil
+  "Darwin (docs/macos-hosting.md, M0): the fixed VA of a word holding the
+   address of the host shim's syscall stub, or NIL for a Linux image.  When
+   set, every syscall — SVC #0 with a LINUX aarch64 number in x8, exactly as
+   the hosted-Linux trap codegen leaves it — becomes a call to that stub,
+   which translates the call to libSystem and returns like SVC: only x0
+   changes.  iOS has no raw syscalls at all, and Darwin's differ from Linux's
+   in number, flags, structs and error convention; translating in the host's
+   C is far simpler than emitting a second trap ABI here.")
+
 (defun a64-svc (buf imm16)
-  "SVC #imm16  (supervisor call)"
-  (a64-emit buf (logior #xD4000001
-                        (ash (logand imm16 #xFFFF) 5))))
+  "SVC #imm16  (supervisor call).
+   Darwin (*AARCH64-DARWIN-SYSCALL-SLOT*): SVC #0 becomes
+     STR x30, [sp, #-16]! ; x16 = slot ; LDR x16, [x16] ; BLR x16 ; LDR x30, [sp], #16
+   — x30 saved because BLR writes it (a helper reached by BL may issue a
+   syscall), x16 is IP0 scratch.  Any other SVC immediate is a bare-metal
+   trap with no Darwin meaning: BRK, so it stops loudly."
+  (cond ((null *aarch64-darwin-syscall-slot*)
+         (a64-emit buf (logior #xD4000001
+                               (ash (logand imm16 #xFFFF) 5))))
+        ((zerop imm16)
+         (a64-str-pre buf +a64-x30+ +a64-sp+ -16)
+         (a64-load-imm64 buf +a64-x16+ *aarch64-darwin-syscall-slot*)
+         (a64-ldr-unsigned buf +a64-x16+ +a64-x16+ 0)
+         (a64-blr buf +a64-x16+)
+         (a64-ldr-post buf +a64-x30+ +a64-sp+ 16))
+        (t (a64-brk buf imm16))))
 
 ;;; --- Data Memory Barrier ---
 ;;; DMB: 11010101000000110011|CRm(4)|1|01|11111
@@ -2491,7 +2514,7 @@
                    (a64-mov-reg buf +a64-x1+ +a64-x17+)
                    (a64-load-imm64 buf +a64-x2+ 1)
                    (a64-load-imm64 buf +a64-x8+ 64)
-                   (a64-emit buf #xD4000001))     ; SVC #0
+                   (a64-svc buf 0))     ; SVC #0
                   (t
                    ;; Bare-metal: write to UART data register.
                    (a64-asr-imm buf +a64-x16+ +a64-x0+ 1)
@@ -2629,7 +2652,7 @@
                 ;; Linux sys-exit: V0 (x0) = exit status.  exit_group(2) = 94.
                 ;; mov x8, #94; svc #0.
                 (a64-load-imm64 buf +a64-x8+ 94)
-                (a64-emit buf #xD4000001))      ; SVC #0
+                (a64-svc buf 0))      ; SVC #0
                ((= code #x0502)
                 ;; Generic 3-arg Linux syscall — AArch64 ABI.
                 ;;   Inputs: V0=x0=syscall#(tagged), V1=x1=arg1(tagged),

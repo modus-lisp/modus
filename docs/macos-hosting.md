@@ -583,12 +583,25 @@ The five failing tests fail on all three platforms: sb-thread, region0-frontier,
 term-xregion, worker-xregion and thread-lisp-unsync (a control).
 mv-handler-unsync is a race control; x86-64 collides in about 2 of 6 runs.
 
-sb-thread's crash (the condition-broadcast section) is three workers running
-closures from an INTERPRETED toplevel form while main also interprets.
-`%make-native-thread` already names concurrent interpretation as unsafe and
-mitigates it only for DEFUNs (JIT-EAGER).  The eval path has process-wide
-state and no compile lock (`*mvm-eval-buffer*`, the compiler's tables), so this
-is the next thing to fix properly, not by rearranging the test.
+**sb-thread (fails on all three targets; open).**  What is established:
+- The fault is a LONGJMP through an EMPTY handler frame on a worker: PC = SP =
+  0.  The return address is always the same JIT site inside
+  `sb-thread:make-thread`'s module, which is the worker body that binds
+  `*current-thread*`.  A non-local exit escapes the user's function, the
+  body's unwind-protect re-throws it outward, and a worker has no outer frame.
+  The shim's `MODUS_SHIM_FAULTS=1` now dumps the registers and the code before
+  LR when a thread jumps to 0.
+- The user functions are closures from INTERPRETED toplevel forms.  An
+  interpreted closure is compiled on its FIRST CALL (`%e2ic-compile`, through
+  `mvm-eval-forms`), and the in-image compiler is process-wide state with no
+  lock.  `%make-native-thread`'s JIT-EAGER mitigation covers DEFUNs only.
+- A recursive compile lock (compile phase only, dropped before the code runs)
+  was tried and reverted: it moved the crash from the condition-broadcast
+  section into the negative-control section, which passes without it, for a
+  reason not yet understood.
+
+The next step is to find which non-local exit escapes (tag or target, and
+from which thread), rather than to serialize by guesswork.
 
 ## Open questions
 

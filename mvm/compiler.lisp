@@ -13547,14 +13547,24 @@
                  ((= iter-kw 190453506)  ; =
                   (setf rest (cdr rest))
                   (let ((init (car rest))
-                        (step nil))
+                        (step nil)
+                        (has-then nil))
                     (setf rest (cdr rest))
                     (when (and rest (symbolp (car rest))
                                (= (normalize-name (car rest)) 325947496))  ; THEN
-                      (setf step (cadr rest) rest (cddr rest)))
+                      (setf step (cadr rest) rest (cddr rest) has-then t))
+                    ;; PRESENCE of THEN, not the truth of its form: `for first
+                    ;; = t then nil` stored (or NIL T) = T as its step, which
+                    ;; the code generator reads as "no THEN" (step EQ init), so
+                    ;; FIRST stayed T forever.  cl-ppcre's COLLECT-CHAR-CLASS
+                    ;; loops exactly so and took every character for the first
+                    ;; one, never seeing the closing bracket.  A literal NIL
+                    ;; step is spelled (QUOTE NIL) so it is never EQ to INIT.
                     (push (make-loop-iter :kind :general :var var
                                           :init-form init
-                                          :step-form (or step init))
+                                          :step-form (cond ((not has-then) init)
+                                                           ((null step) (list 'quote nil))
+                                                           (t step)))
                           (loop-state-iterations state))))
 
                  ;; FOR var BEING [THE | EACH] kind {OF | IN} expr [USING (k v)]
@@ -14391,10 +14401,25 @@
                (let ((firstv (%mvm-gensym "FORTHEN-FIRST")))
                  (push (list var nil) bindings)
                  (push (list firstv t) bindings)
-                 (push `(if ,firstv
-                            (progn (setq ,var ,(loop-iter-init-form iter))
-                                   (setq ,firstv nil)))
-                       init-stmts)
+                 (if (loop-iter-and-p iter)
+                     (push `(if ,firstv
+                                (progn (setq ,var ,(loop-iter-init-form iter))
+                                       (setq ,firstv nil)))
+                           init-stmts)
+                     ;; SEQUENTIAL FOR (no AND): the STEP runs here too, in
+                     ;; clause order, on every iteration after the first -- not
+                     ;; at the end of the previous one.  A no-THEN sibling
+                     ;; before it (`for q = (quant lexer)`) is re-assigned in
+                     ;; INIT-STMTS, so a STEP-STMTS step read the OLD q: in
+                     ;; cl-ppcre's `for seq = quant then (cond … seq quant …)`
+                     ;; every regex parsed one token behind ("abc" -> "aab").
+                     ;; CLHS 6.1.2.1: sequential for-as clauses step in order,
+                     ;; each seeing the ones before it already stepped.
+                     (push `(if ,firstv
+                                (progn (setq ,var ,(loop-iter-init-form iter))
+                                       (setq ,firstv nil))
+                                (setq ,var ,(loop-iter-step-form iter)))
+                           init-stmts))
                  (if (loop-iter-and-p iter)
                      ;; FOR ... AND v = i THEN s: S sees the group's OLD
                      ;; values, so evaluate it into a temp BEFORE the group's
@@ -14408,7 +14433,8 @@
                                      (list `(setq ,tmp ,(loop-iter-step-form iter)))
                                      (nthcdr n step-stmts)))
                        (push `(setq ,var ,tmp) step-stmts))
-                     (push `(setq ,var ,(loop-iter-step-form iter)) step-stmts))))))
+                     ;; (sequential: stepped in INIT-STMTS above)
+                     nil)))))
 
         (:while
          (push `(if (null ,(loop-iter-init-form iter)) (return-from :%loop-exit nil)) test-forms))

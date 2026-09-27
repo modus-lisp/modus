@@ -453,10 +453,15 @@
 ;; %aa64-jit-boot-init runs the translator co-init (vreg map, stack-align-16,
 ;; linux-mode, label counter) and selects the aarch64 JIT back-end; the Stage-5
 ;; seam sets *aarch64-jit-mode* per translation itself.
+;; %jit-enabled-p is NOT a constant T: an EVAL that runs before
+;; %aa64-jit-boot-init (the runner's CLOS init is one) must interpret, or it
+;; is JIT'd through an un-initialised translator.  *jit-target-arch* is
+;; exactly the word boot-init writes, so the gate is true only after it.
 (defvar *aarch64-jit-flip-source*
   (if *aarch64-jit-on*
       "
-(defun %jit-enabled-p () t)
+(defun %jit-enabled-p ()
+  (and (boundp (quote *jit-target-arch*)) (eq *jit-target-arch* :aarch64)))
 (defun %aa64-jit-boot-init ()
   (%init-aarch64-translator)
   (setq *jit-target-arch* :aarch64)

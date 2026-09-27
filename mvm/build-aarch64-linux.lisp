@@ -861,14 +861,22 @@
   ;; slot-missing, print-object, describe-object — as real GFs with
   ;; default methods.  Without these, tests that do
   ;; (compute-applicable-methods #'initialize-instance ...) get NIL.
-  (%init-clos-protocol)
-
   ;; WS4-AA64 FLIP: initialize the aarch64 runtime JIT when built JIT-on
   ;; (MODUS_USE_JIT / default).  Runs the translator co-init + selects the
   ;; aarch64 back-end so production mvm-eval JITs native via the Stage-5 seam.
   ;; Inert no-op when JIT-off.  Wrapped so a JIT-init fault can never take down
   ;; a normal boot (belt-and-suspenders; the seam already guards translate).
+  ;; MUST run BEFORE %init-clos-protocol: that is the image's first in-image
+  ;; EVAL (%make-gf-stub DEFUNs each protocol GF), and with the JIT-on flip
+  ;; source baked, the seam JITs it -- through a translator whose co-init
+  ;; (vreg map, stack alignment) had not run.  Measured on Linux/aarch64
+  ;; (OrbStack + Apple container): GENERIC-ADD on #xDEAD0009 out of
+  ;; %INIT-CLOS-PROTOCOL -> %MAKE-GF-STUB -> EVAL, on every commit back to
+  ;; 455f778.  The x64 runner never hit it because its gate is *use-jit*,
+  ;; which it sets after its translator init.
   (handler-case (%aa64-jit-boot-init) (t (c) nil))
+
+  (%init-clos-protocol)
 
   ;; Set default pathname defaults to the ANSI test sandbox directory
   (setq *default-pathname-defaults* \"/home/claude/modus/tmp/ansi-test/sandbox/\")

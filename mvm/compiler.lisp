@@ -430,20 +430,97 @@
              (%tls-window-addr-form-p (caddr form))))
         (t nil)))
 
+;;; ---- THE CONVENTION REGION (docs/macos-hosting.md, M1) -------------------
+;;;
+;;; Hosted 64-bit images keep all runtime data — the convention block, the
+;;; handler-frame stack, the GC metadata, the file-I/O buffers — in the BSS
+;;; tail at 0x10000000 and up, and the runtime's own source names those words
+;;; by literal address: (mem-ref #x10000200 :u32) is argc.  macOS cannot map
+;;; anything below 4 GB (__PAGEZERO), so that region has to move, and every
+;;; access to it has to follow.
+;;;
+;;; It moves the way the per-thread window does: by a DELTA, not a new address.
+;;; The literals stay what they are — a VIRTUAL address in the region — and an
+;;; access the compiler can prove lands in the region carries +WIDTH-CONV-BIT+,
+;;; which tells a back-end that opts in to add the region's delta (new base -
+;;; +CONV-REGION-BASE+).  Where the region has not moved the delta is 0 and the
+;;; bit changes nothing.
+;;;
+;;; WHAT THIS DOES NOT COVER, because a compile-time rule cannot see it: an
+;;; address that reaches a MEM-REF as a VALUE — through a variable, a function
+;;; return, a table.  (defun %rt-gate-addr () #x1...) handed to
+;;; (mem-ref (%rt-gate-addr) :u32) is unmarked here.  Those literals are
+;;; rebased at their SOURCE instead, as values, which is a separate and manual
+;;; audit.  A marked access and a rebased value must never meet: the bit says
+;;; "this operand is VIRTUAL", so it is only set when the whole address is a
+;;; compile-time constant, or a constant plus an index.
+(defconstant +conv-region-base+ #x10000000
+  "First address of the runtime-data region; the delta is measured from here.")
+
+(defconstant +conv-region-end+ #x40000000
+  "End (exclusive) of the runtime-data region.  The hosted aarch64 CLI's BSS
+   tail runs to 0x3C219CF8 (measured from its program header, 2026-09-26), and
+   nothing but that BSS lives in [0x10000000, 0x40000000) on either 64-bit
+   port — the image is below it, the heap far above.  A MEM-REF operand in this
+   range is an address by construction; a bare literal elsewhere need not be
+   (A64 opcodes live at 0x1...), which is why this is decided here, from the
+   operand's ROLE, and never from the number alone.")
+
+(defparameter *conv-relative* nil
+  "Emit LOAD/STORE of provable runtime-data addresses with +WIDTH-CONV-BIT+.
+   NIL — every image that has not opted in — emits the historic width, so the
+   bytecode is unchanged.  Like *TLS-WINDOW* it has TWO homes: the host build
+   sets it for the image's fixed code, and the image's JIT co-init sets it for
+   code compiled at runtime.  With only one of them on, the two halves of the
+   program would disagree about where the region is.")
+
+(defvar *conv-audit* nil
+  "Host-build instrument.  When a cons, every MEM-REF access compiled while
+   *CONV-RELATIVE* is on adds (function-name address-form marked-p) to its
+   CDR, so a build can report exactly which accesses the rule proved and which
+   it left to the value audit.  NIL in every normal build.")
+
+(defun %conv-addr-form-p (form)
+  "T when FORM is an address the compiler can prove, AT COMPILE TIME, lands in
+   the runtime-data region: a bare constant, or (+ K x) / (+ x K) with K such
+   a constant.  The MV-extras loop is the (+ K x) case:
+   (+ #x10000098 (* i 8)).  NIL is safe in a DIFFERENT sense than for the
+   window — a missed access keeps reading the virtual address, which is wrong
+   once the region moves — so the NIL answers are what *CONV-AUDIT* reports."
+  (cond ((integerp form)
+         (and (>= form +conv-region-base+) (< form +conv-region-end+)))
+        ((and (consp form) (consp (cdr form)) (consp (cddr form))
+              (null (cdddr form))
+              (symbolp (car form)) (name-eq (car form) "+"))
+         (or (and (integerp (cadr form)) (%conv-addr-form-p (cadr form)))
+             (and (integerp (caddr form)) (%conv-addr-form-p (caddr form)))))
+        (t nil)))
+
 (defun %tls-width (width addr-form)
   "WIDTH, with the thread-local bit set when the window is on and ADDR-FORM is
-   provably a window slot."
-  (if (and *tls-window* (%tls-window-addr-form-p addr-form))
-      (logior width +width-tls-bit+)
-      width))
+   provably a window slot, and the convention-region bit set when the region
+   is relative and ADDR-FORM provably lands in it.  Every window slot is in the
+   region; the two bits are independent and a back-end may honour either."
+  (let ((conv (and *conv-relative* (%conv-addr-form-p addr-form))))
+    (when (and *conv-relative* (consp *conv-audit*))
+      (rplacd *conv-audit*
+              (cons (list *current-function-name* addr-form (if conv t nil))
+                    (cdr *conv-audit*))))
+    (logior width
+            (if (and *tls-window* (%tls-window-addr-form-p addr-form))
+                +width-tls-bit+
+                0)
+            (if conv +width-conv-bit+ 0))))
 
 (defun %mv-width ()
   "Width code for a direct-IR access to the multiple-value buffer.  The sites
    that emit :LI + :LOAD/:STORE by hand (UNWIND-PROTECT saving the MV block
    across its cleanup, TRUNCATE publishing its remainder) name the address as
-   an immediate rather than as a MEM-REF form, so they ask for the bit here
-   instead of going through %TLS-WIDTH."
-  (if *tls-window* +width-u64-tls+ +width-u64+))
+   an immediate rather than as a MEM-REF form, so they ask for the bits here
+   instead of going through %TLS-WIDTH.  The MV buffer is in the runtime-data
+   region, so it carries the convention bit too."
+  (logior (if *tls-window* +width-u64-tls+ +width-u64+)
+          (if *conv-relative* +width-conv-bit+ 0)))
 
 
 ;;; ============================================================
@@ -11086,7 +11163,8 @@
       ;; cell = [+GV-CACHE-ROOT+]  (the cache vector, or 0 before boot built it)
       (emit-li-tagged cell +gv-cache-root+)
       (emit-ir :shr cell cell +fixnum-shift+)
-      (emit-ir :load cell cell (car (memory-width-code :u64)))
+      (emit-ir :load cell cell (%tls-width (car (memory-width-code :u64))
+                                           +gv-cache-root+))
       ;; A raw 0 is a FIXNUM (low bit clear): no vector yet -> miss.
       (emit-ir :li dest 1)
       (emit-ir :test cell dest)
@@ -11222,7 +11300,8 @@
       ;; result lands in it.
       (emit-li-tagged dest #x10000DB8)
       (emit-ir :shr dest dest +fixnum-shift+)
-      (emit-ir :load w dest (car (memory-width-code :u32)))
+      (emit-ir :load w dest (%tls-width (car (memory-width-code :u32))
+                                        #x10000DB8))
       (emit-ir :li dest 0)
       (emit-ir :cmp w dest)
       (emit-ir :bne slow)
@@ -11292,7 +11371,8 @@
                (done (make-compiler-label)))
            (emit-li-tagged tmp #x10000DB8)
            (emit-ir :shr tmp tmp +fixnum-shift+)
-           (emit-ir :load tmp tmp (car (memory-width-code :u32)))
+           (emit-ir :load tmp tmp (%tls-width (car (memory-width-code :u32))
+                                              #x10000DB8))
            (emit-ir :li zed 0)
            (emit-ir :cmp tmp zed)
            (emit-ir :bne slow)

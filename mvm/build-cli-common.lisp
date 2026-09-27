@@ -574,6 +574,11 @@
   ;; TRAP codegen emits Linux syscalls.
   (setq *aarch64-stack-align-16* t)
   (setq *aarch64-linux-mode* t)
+  ;; The compiler half of the convention-region bit (docs/macos-hosting.md M1)
+  ;; must match the host build that compiled the fixed code: code compiled at
+  ;; runtime reaches the same region, and once it moves an unmarked access
+  ;; would read the old address.  The x64 TLS window learned this the hard way.
+  (setq *conv-relative* t)
   t)
 "))
 

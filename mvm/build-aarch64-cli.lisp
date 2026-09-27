@@ -1368,6 +1368,17 @@
 (setf *aarch64-gc-native-mcgc* t)
 (format t "~%  AArch64 GC: ON (NATIVE MCGC)  midpoint=#x~X  metadata-shl=t  bitmap=t~%"
         *linux-aarch64-gc-midpoint*)
+;; docs/macos-hosting.md M1: mark every provable runtime-data access with
+;; +WIDTH-CONV-BIT+ so the region can later move by a delta.  The AArch64
+;; translator masks the bit today (the delta is 0), so this changes the image's
+;; bytecode widths and nothing it executes.  Its twin is in the JIT co-init
+;; (build-cli-common.lisp); the two must agree.
+(setf *conv-relative* t)
+;; MODUS_CONV_AUDIT=<path>: write every MEM-REF access the rule saw — function,
+;; address form, and whether it was proved — for the value audit.
+(let ((ca (sb-ext:posix-getenv "MODUS_CONV_AUDIT")))
+  (when (and ca (plusp (length ca)))
+    (setf *conv-audit* (list :audit))))
 (setf *aarch64-handler-pop-label* nil)
 (setf *aarch64-handler-push-label* nil)
 (setf *aarch64-gc-trampoline-label* nil)
@@ -1396,5 +1407,14 @@
     #+sbcl (sb-ext:run-program "/bin/chmod" (list "+x" path) :wait t)
     (when (string= path "/home/claude/modus-aa64-cli")
       (format t "~%NOTE: wrote the SHARED default path.  Set MODUS_CLI_OUT for any~%      gate or comparison build — the default is outside the worktree, so~%      two agents building at once overwrite each other.~%"))
+    (when (consp *conv-audit*)
+      (let ((ca (sb-ext:posix-getenv "MODUS_CONV_AUDIT")))
+        (with-open-file (o ca :direction :output :if-exists :supersede)
+          (let ((*print-base* 16) (*print-radix* t) (*print-length* nil))
+            (dolist (e (reverse (cdr *conv-audit*)))
+              (format o "~A	~A	~S~%" (if (third e) "PROVED" "VALUE")
+                      (first e) (second e)))))
+        (format t "  conv audit: ~D accesses -> ~A~%"
+                (length (cdr *conv-audit*)) ca)))
     (format t "~%Wrote ~D bytes to ~A~%"
             (length (kernel-image-image-bytes image)) path)))

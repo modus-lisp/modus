@@ -2327,15 +2327,40 @@
    the lambda-list (string= over the LL keywords) -- ~4 us/call on the Pi Zero
    2 W, a big slice of the residual %gf-dispatch cost.")
 (defun %lambda-list-shape-cached (ll)
+  "LOCKED, like every shared runtime table (see %RT-ENTER, mvm/prelude.lisp).
+   The memo is filled lazily by WHICHEVER thread first calls a generic
+   function, and a worker's allocations live in its own GC region: a worker
+   that created the table (or an entry) left region 0 holding pointers into a
+   region reclaimed when the worker exited, and the next generic call on any
+   thread died TYPE-ERROR -- every sb-thread:grab-mutex included, since the
+   mutex's cell is a slot accessor.  Under the lock, allocation goes to the
+   immortal arena.  A load and a branch while one thread runs Lisp.
+   %LAMBDA-LIST-SHAPE runs before the lock: it walks a list and cannot longjmp
+   out of a held lock."
   (if (null ll) nil
       (progn
-        (when (null *ll-shape-memo*)
-          (setq *ll-shape-memo* (make-hash-table :test (function eq))))
-        (let ((hit (gethash ll *ll-shape-memo*)))
+        (%rt-enter)
+        (let ((hit (%ll-shape-memo-get ll)))
+          (%rt-leave)
           (if hit hit
               (let ((sh (%lambda-list-shape ll)))
-                (puthash ll *ll-shape-memo* sh)
-                sh))))))
+                (%rt-enter)
+                (let ((r (%ll-shape-memo-put ll sh)))
+                  (%rt-leave)
+                  r)))))))
+
+(defun %ll-shape-memo-get (ll)
+  (and *ll-shape-memo* (gethash ll *ll-shape-memo*)))
+
+(defun %ll-shape-memo-put (ll sh)
+  "Store SH for LL, copied (it was consed by the caller, possibly in a
+   worker's region); answers the stored value."
+  (when (null *ll-shape-memo*)
+    (setq *ll-shape-memo* (make-hash-table :test (function eq))))
+  (or (gethash ll *ll-shape-memo*)
+      (let ((copy (copy-list sh)))
+        (puthash ll *ll-shape-memo* copy)
+        copy)))
 
 (defun %lambda-list-shape (ll)
   "Return (req-count optional-count has-rest has-key has-allow-other-keys).

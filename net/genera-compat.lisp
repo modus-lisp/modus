@@ -70,21 +70,30 @@
 ;;; a symbol with no type, which is worse than not exporting it at all.
 (defpackage "SCL"
   (:use)
-  (:import-from "COMMON-LISP" "BOOLEAN")
-  (:export "LOCF" "LET-GLOBALLY" "MAKE-HASH-TABLE" "BOOLEAN"))
+  (:import-from "COMMON-LISP" "BOOLEAN" "SHIFTF")
+  (:export "LOCF" "LET-GLOBALLY" "MAKE-HASH-TABLE" "BOOLEAN"
+           "SHIFTF" "NCONS" "*CURRENT-PROCESS*" "PROCESS-ALLOW-SCHEDULE"))
 
 (defpackage "SYS"
   (:use)
-  (:export "STORE-CONDITIONAL" "GC-IMMEDIATELY"))
+  (:export "STORE-CONDITIONAL" "GC-IMMEDIATELY"
+           "VALUE-CELL-LOCATION" "LOCATION-CONTENTS"))
 
 (defpackage "SI"
   (:use)
   (:export "GC-REPORT-STREAM" "GC-REPORTS-ENABLE" "GC-EPHEMERAL-REPORTS-ENABLE"
-           "GC-WARNINGS-ENABLE" "EPHEMERAL-GC-FLIP"))
+           "GC-WARNINGS-ENABLE" "EPHEMERAL-GC-FLIP" "PROCESS-SPARE-SLOT-4"))
 
 (defpackage "PROCESS"
   (:use)
-  (:export "ATOMIC-INCF" "ATOMIC-DECF"))
+  (:export "ATOMIC-INCF" "ATOMIC-DECF"
+           ;; section 8: processes, locks, waits, over SB-THREAD
+           "PROCESS" "PROCESS-P" "PROCESS-RUN-FUNCTION" "PROCESS-NAME"
+           "PROCESS-ACTIVE-P" "PROCESS-WAIT" "PROCESS-INTERRUPT" "PROCESS-KILL"
+           "*ALL-PROCESSES*" "WAKEUP" "BLOCK-WITH-TIMEOUT" "WITH-TIMEOUT"
+           "MAKE-LOCK" "MAKE-LOCK-ARGUMENT" "LOCK" "UNLOCK" "LOCK-LOCKABLE-P"
+           "WITH-NO-OTHER-PROCESSES"
+           "ATOMIC-UPDATEF" "ATOMIC-POP" "ATOMIC-REPLACEF"))
 
 ;;; CLI is referenced only as `cli::basic-table-options' (double colon), so
 ;;; the name need not be external — but the PACKAGE must exist or the form
@@ -343,6 +352,284 @@
 (%init-genera-compat)
 
 ;;; =====================================================================
+;;; 8.  Processes and locks (bordeaux-threads' Genera backends)
+;;;
+;;; bordeaux-threads 0.9.4 selects impl-genera.lisp on :GENERA, in BOTH its
+;;; APIs -- and its v1 API (BT:MAKE-LOCK, what almost every library calls)
+;;; now sits on v2.  Until this section, PROCESS exported only the two
+;;; atomics, so every BT:MAKE-LOCK in the image died UNDEFINED-FUNCTION
+;;; PROCESS::MAKE-LOCK.  This is the surface those two files name, each
+;;; operator given its Genera meaning over Modus's real threads (the
+;;; SB-THREAD surface, net/sb-thread-shim.lisp).
+;;;
+;;; SB-THREAD IS LOOKED UP WHEN CALLED, never named in source: this file is
+;;; installed BEFORE the sb-thread shim, and on a target without threads the
+;;; package does not exist at all (a READ of `sb-thread:x' would drop the
+;;; rest of this file).  On such a target the operators below signal.
+;;;
+;;; THE DEGENERACIES, in one place (each repeated where it lives):
+;;;   WITH-NO-OTHER-PROCESSES  a PROGN.  Genera stopped the scheduler; real
+;;;       threads cannot be stopped, and a global lock would deadlock the
+;;;       way bordeaux uses it (it BLOCKS in PROCESS:LOCK inside one).  Each
+;;;       operator here is thread-safe on its own instead.
+;;;   LOCK-LOCKABLE-P  answers by TRYING the lock: on T the caller now holds
+;;;       it, and the PROCESS:LOCK bordeaux always issues next completes the
+;;;       claim.  A caller that asks and then does not lock leaks the lock.
+;;;   WITH-TIMEOUT     bounds only the waits made through this section (a
+;;;       PROCESS:LOCK, PROCESS-WAIT, BLOCK-WITH-TIMEOUT); a body that is
+;;;       computing, not waiting, runs to completion.  Modus cannot
+;;;       interrupt another thread (see INTERRUPT-THREAD in the shim).
+;;;   PROCESS-WAIT / BLOCK-WITH-TIMEOUT  poll their predicate every 1 ms;
+;;;       WAKEUP is therefore a no-op.  Latency 1 ms, no lost wakeups: the
+;;;       state a waiter watches is in the predicate, not in the wakeup.
+;;;   PROCESS-INTERRUPT / PROCESS-KILL  signal, as the shim's do.
+;;;
+;;; Written around the closure bug recorded in section 4: no DEFUN below
+;;; builds more than one closure.
+;;; =====================================================================
+
+(defun %genera-sbt (name)
+  "SB-THREAD's function NAME, found now; signals if this image has none."
+  (let ((s (and (find-package "SB-THREAD") (find-symbol name "SB-THREAD"))))
+    (if (and s (fboundp s))
+        (symbol-function s)
+        (error "PROCESS: this Modus image has no threads (SB-THREAD:~A)" name))))
+
+(defun %genera-current ()
+  "The current process: SB-THREAD:*CURRENT-THREAD*, or :MAIN without threads."
+  (let ((s (and (find-package "SB-THREAD")
+                (find-symbol "*CURRENT-THREAD*" "SB-THREAD"))))
+    (if (and s (boundp s)) (symbol-value s) :main)))
+
+(define-symbol-macro scl::*current-process* (%genera-current))
+
+;;; One global mutex serialises the short critical sections below (the
+;;; atomic place updates, the per-process table).  Nothing blocks while
+;;; holding it.  Made on first use -- the shim is not installed yet when
+;;; this file is.
+;;;
+;;; WORKER ALLOCATIONS DIE WITH THE WORKER.  Each thread allocates in its own
+;;; GC region, reclaimed when it exits, so an object a worker creates must not
+;;; be stored anywhere global -- the next thread to touch it finds garbage.
+;;; First use may be on a worker, so the mutex is made inside %RT-ENTER, whose
+;;; locked sections allocate in the immortal arena (mvm/prelude.lisp).
+(defvar %genera-atomic-mutex nil)
+
+(defun %genera-make-atomic-mutex ()
+  (unless %genera-atomic-mutex
+    (setq %genera-atomic-mutex
+          (funcall (%genera-sbt "MAKE-MUTEX") :name "genera atomic")))
+  %genera-atomic-mutex)
+
+(defun %genera-atomically (thunk)
+  (when (and (null %genera-atomic-mutex) (find-package "SB-THREAD"))
+    (%rt-enter)
+    (%genera-make-atomic-mutex)
+    (%rt-leave))
+  (if (null %genera-atomic-mutex)
+      (funcall thunk)
+      (progn
+        (funcall (%genera-sbt "GRAB-MUTEX") %genera-atomic-mutex)
+        (unwind-protect (funcall thunk)
+          (funcall (%genera-sbt "RELEASE-MUTEX") %genera-atomic-mutex)))))
+
+(defmacro process::atomic-updatef (place function)
+  `(%genera-atomically (lambda () (setf ,place (funcall ,function ,place)))))
+(defmacro process::atomic-pop (place)
+  `(%genera-atomically (lambda () (pop ,place))))
+(defmacro process::atomic-replacef (place new)
+  `(%genera-atomically (lambda () (shiftf ,place ,new))))
+
+(defun scl::ncons (x) (list x))
+
+;;; --- processes ---
+
+(deftype process::process ()
+  (let ((s (and (find-package "SB-THREAD") (find-symbol "THREAD" "SB-THREAD"))))
+    (or s t)))
+
+(define-symbol-macro process::*all-processes* (%genera-all-processes))
+(defun %genera-all-processes () (funcall (%genera-sbt "ALL-THREADS")))
+
+(defun process::process-p (x) (funcall (%genera-sbt "THREADP") x))
+(defun process::process-name (p) (funcall (%genera-sbt "THREAD-NAME") p))
+(defun process::process-active-p (p) (funcall (%genera-sbt "THREAD-ALIVE-P") p))
+(defun scl::process-allow-schedule () (funcall (%genera-sbt "THREAD-YIELD")))
+(defun process::wakeup (p) p)            ; waits poll; see the header
+
+(defun process::process-run-function (name-or-options function &rest args)
+  "Genera: NAME-OR-OPTIONS is a name or a keyword list with :NAME."
+  (let ((name (if (consp name-or-options)
+                  (or (getf name-or-options :name) "Anonymous")
+                  name-or-options)))
+    (funcall (%genera-sbt "MAKE-THREAD") function
+             :name (string name) :arguments args)))
+
+(defun process::process-interrupt (p function &rest args)
+  (funcall (%genera-sbt "INTERRUPT-THREAD") p
+           (lambda () (apply function args))))
+
+(defun process::process-kill (p &rest options)
+  (declare (ignore options))
+  (funcall (%genera-sbt "TERMINATE-THREAD") p))
+
+;;; SI:PROCESS-SPARE-SLOT-4 -- where bordeaux v1 parks a thread's return
+;;; values.  A table keyed by process, made at install (on main).  Stores go
+;;; through %RT-ENTER so the table's own entries land in the immortal arena
+;;; rather than the storing worker's region.  The VALUE is the worker's, and
+;;; is good for as long as the shim's JOIN-THREAD value is (see the shim).
+(defvar %genera-spare-slots (make-hash-table :test 'eq))
+(defun si::process-spare-slot-4 (p)
+  (%rt-enter)
+  (let ((v (gethash p %genera-spare-slots)))
+    (%rt-leave)
+    v))
+(defun (setf si::process-spare-slot-4) (value p)
+  (%rt-enter)
+  (puthash p %genera-spare-slots value)
+  (%rt-leave)
+  value)
+
+;;; --- timeouts and waiting ---
+;;;
+;;; The deadline of the innermost PROCESS:WITH-TIMEOUT is a special, bound
+;;; per thread (a worker's binding lives on its own binding stack, and a
+;;; THROW out of the binding unwinds it -- %DYNB-UNWIND, mvm/prelude.lisp).
+;;; A table keyed by thread would have had workers storing into a global.
+
+(defvar %genera-deadline-now nil)
+(defun %genera-deadline () %genera-deadline-now)
+
+(defun %genera-seconds-left (deadline)
+  (max 1/1000 (/ (- deadline (get-internal-real-time))
+                 internal-time-units-per-second)))
+
+(defun %genera-expired-p (deadline)
+  (and deadline (>= (get-internal-real-time) deadline)))
+
+;;; RATIOS, NOT FLOAT LITERALS, anywhere in this file.  It is evaluated at boot
+;;; in every image, the web (JS MVM) one included, and reading a float literal
+;;; calls %ROUND-TO-SINGLE, whose opcode the JS engine does not implement: one
+;;; 0.001 here stopped the web image booting at step 0.
+(defun %genera-pause () (sleep 1/1000))
+
+(defmacro process::with-timeout ((seconds &rest options) &body body)
+  "Genera: the value of BODY, or NIL if SECONDS pass first.  See the header:
+   only waits made through this section are bounded."
+  (declare (ignore options))
+  `(%genera-call-with-timeout ,seconds (lambda () ,@body)))
+
+(defun %genera-call-with-timeout (seconds thunk)
+  (if (null seconds)
+      (funcall thunk)
+      (let* ((outer (%genera-deadline))
+             (mine (+ (get-internal-real-time)
+                      (round (* seconds internal-time-units-per-second))))
+             (dl (if (and outer (< outer mine)) outer mine)))
+        (catch '%genera-timeout
+          (let ((%genera-deadline-now dl))
+            (funcall thunk))))))
+
+(defun process::process-wait (whostate predicate &rest args)
+  "Return when (apply PREDICATE ARGS) is true.  Polls; see the header."
+  (declare (ignore whostate))
+  (let ((dl (%genera-deadline)))
+    (loop
+      (when (apply predicate args) (return t))
+      (when (%genera-expired-p dl) (throw '%genera-timeout nil))
+      (%genera-pause))))
+
+(defun process::block-with-timeout (timeout whostate predicate &rest args)
+  "The predicate's value once true, or NIL after TIMEOUT seconds (NIL:
+   no limit)."
+  (declare (ignore whostate))
+  (let ((end (and timeout (+ (get-internal-real-time)
+                             (round (* timeout internal-time-units-per-second))))))
+    (loop
+      (let ((v (apply predicate args)))
+        (when v (return v)))
+      (when (%genera-expired-p end) (return nil))
+      (%genera-pause))))
+
+;;; SYS:VALUE-CELL-LOCATION of a (quoted) variable -- bordeaux passes a LEXICAL
+;;; one -- is a locative to it, which is exactly section 4's SCL:LOCF.
+(defmacro sys::value-cell-location (form)
+  (%genera-locf-var-form form))
+(defun %genera-locf-var-form (form)
+  (let ((var (if (and (consp form) (eq (car form) 'quote)) (cadr form) form)))
+    (list 'scl::locf var)))
+(defun sys::location-contents (loc) (%genera-locative-read loc))
+(defun (setf sys::location-contents) (value loc)
+  (%genera-locative-write loc value)
+  value)
+
+;;; --- locks ---
+;;;
+;;; A lock is a vector, not a struct, so this file needs nothing of DEFSTRUCT:
+;;;   0 tag   1 name   2 mutex   3 recursive-p   4 owner   5 depth   6 claimed
+;;; OWNER is only written by the thread holding MUTEX (set after taking it,
+;;; cleared before giving it back), so reading it to ask "is it mine?" is safe.
+
+(defun process::make-lock (name &rest options &key recursive &allow-other-keys)
+  (declare (ignore options))
+  (vector '%genera-lock name
+          (funcall (%genera-sbt "MAKE-MUTEX") :name (string name))
+          recursive nil 0 nil))
+
+(defun process::make-lock-argument (lock &rest options)
+  (declare (ignore lock options))
+  (list :lock-argument))
+
+(defun %genera-take (lock me)
+  (setf (svref lock 4) me (svref lock 5) 1 (svref lock 6) nil)
+  t)
+
+(defun process::lock (lock &optional lock-argument)
+  "Take LOCK, waiting as long as the enclosing PROCESS:WITH-TIMEOUT allows."
+  (declare (ignore lock-argument))
+  (let ((me (%genera-current)))
+    (cond
+      ((and (eq (svref lock 4) me) (svref lock 6))    ; LOCK-LOCKABLE-P took it
+       (setf (svref lock 6) nil)
+       t)
+      ((eq (svref lock 4) me)
+       (if (svref lock 3)
+           (progn (setf (svref lock 5) (+ 1 (svref lock 5))) t)
+           (error "PROCESS:LOCK: ~A is already held by this process" (svref lock 1))))
+      (t
+       (let ((dl (%genera-deadline)))
+         (if (null dl)
+             (funcall (%genera-sbt "GRAB-MUTEX") (svref lock 2))
+             (unless (funcall (%genera-sbt "GRAB-MUTEX") (svref lock 2)
+                              :timeout (%genera-seconds-left dl))
+               (throw '%genera-timeout nil)))
+         (%genera-take lock me))))))
+
+(defun process::lock-lockable-p (lock)
+  "Genera: could LOCK be taken now?  Here: TAKE it if possible (see the header)."
+  (let ((me (%genera-current)))
+    (cond
+      ((eq (svref lock 4) me) (and (svref lock 3) t))
+      ((funcall (%genera-sbt "GRAB-MUTEX") (svref lock 2) :waitp nil)
+       (%genera-take lock me)
+       (setf (svref lock 6) t)
+       t)
+      (t nil))))
+
+(defun process::unlock (lock &optional lock-argument)
+  (declare (ignore lock-argument))
+  (when (eq (svref lock 4) (%genera-current))
+    (setf (svref lock 5) (- (svref lock 5) 1))
+    (when (<= (svref lock 5) 0)
+      (setf (svref lock 4) nil (svref lock 5) 0 (svref lock 6) nil)
+      (funcall (%genera-sbt "RELEASE-MUTEX") (svref lock 2))))
+  t)
+
+(defmacro process::with-no-other-processes (&body body)
+  "A PROGN; see the header."
+  `(progn ,@body))
+
+;;; =====================================================================
 ;;; KNOWN DEGENERACIES  (what a Genera branch will and will not get)
 ;;;
 ;;;  * WEAK REFERENCES DO NOT EXIST.  SCL:MAKE-HASH-TABLE ignores
@@ -366,6 +653,11 @@
 ;;;    "Finalizers are not available in Genera." — which is TRUE of Modus
 ;;;    as well, and is a better outcome than the silent empty body the
 ;;;    unrecognised-implementation path produces.
+;;;
+;;;  * PROCESSES ARE SB-THREAD THREADS, LOCKS ARE ITS MUTEXES.  Section 8
+;;;    lists what that does not give a Genera program: no scheduler freeze
+;;;    (WITH-NO-OTHER-PROCESSES is a PROGN), timeouts that bound only waits,
+;;;    1 ms polling for PROCESS-WAIT, no interrupt or kill.
 ;;;
 ;;;  * GENERA PREDATES ANSI.  Some #+genera branches in the wild are
 ;;;    decades stale.  Anything that loads down a Genera path should be

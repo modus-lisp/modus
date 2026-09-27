@@ -77,6 +77,9 @@
 ;;;            spawn handshake words.  See MANY THREADS, FROM CLOSURES.
 ;;;   +0x14000 PER-CPU BLOCKS, 16 KB per CPU, 16 CPUs (ending at +0x54000).
 ;;;            The actor band only ever had room for two.
+;;;   +0x54000 DYNAMIC-BINDING STACKS, 16 KB per CPU, 16 CPUs (ending at
+;;;            +0x94000): 1024 [key][value] entries a thread, pointed to by
+;;;            its window block's +0xC60.  See THE EXTENSION in mvm/prelude.lisp.
 ;;;
 ;;; The mapping is 336 KB rather than 8 KB for those additions; NOTHING at a
 ;;; lower offset moved, so every earlier user reads the same bytes.
@@ -101,7 +104,7 @@
           (let ((q (%gc-read64 (%thr-page-slot))))
             (if (> q 0)
                 (progn (spin-unlock (%thr-page-lock)) q)
-                (let ((m (%mmap-shared-page 344064)))
+                (let ((m (%mmap-shared-page 606208)))
                   ;; A failed mmap comes back as a small negative (-errno).
                   (if (< m 4096)
                       (progn (spin-unlock (%thr-page-lock)) 0)
@@ -146,6 +149,11 @@
    counters live here.  0 if the page could not be mapped."
   (let ((p (%thr-page)))
     (if (zerop p) 0 (+ p #x1000))))
+
+(defun %thr-dynb-stack (cpu)
+  "CPU's 16 KB dynamic-binding stack in the thread band, or 0 if unmapped."
+  (let ((p (%thr-page)))
+    (if (zerop p) 0 (+ p (+ #x54000 (* cpu #x4000))))))
 
 (defun %thr-tls-block (cpu)
   "CPU's 4 KB PER-THREAD WINDOW block, or 0 if the page could not be mapped."
@@ -231,6 +239,7 @@
                 ;; DYNAMIC BINDINGS in mvm/prelude.lisp for the layout.
                 (setf (mem-ref (+ b #xC50) :u64) 0)   ; next-free entry
                 (setf (mem-ref (+ b #xC58) :u64) 0)   ; depth
+                (setf (mem-ref (+ b #xC60) :u64) (%thr-dynb-stack cpu)) ; stack
                 (%tls-set-self-base delta)
                 0)
               r)))))
@@ -1438,6 +1447,18 @@
         ;; not a failure — the slice path just never engages and every locked
         ;; section behaves exactly as before this change.
         (%rt-arena-carve)
+        ;; CLEAR THE MAIN THREAD'S SELF SLOT, on the first switch-on only (the
+        ;; gate is still shut, so this is the spawning thread: main).  The
+        ;; x64 fault stub records the faulting RIP at 0x10000C30 -- absolute,
+        ;; so into MAIN's self slot -- and until the gate opens it still does.
+        ;; A RIP left there by any earlier recovered fault would make main
+        ;; read itself as an armed worker whose window block is 0x10000000 +
+        ;; that RIP, and every special it bound afterwards would be written
+        ;; into the image (the "stack exhausted (57)" on main, and quickload
+        ;; failing TYPE-ERROR after a thread had run).  The stub stops
+        ;; writing that slot once the gate is open (translate-x64).
+        (when (= (mem-ref (%rt-gate-addr) :u32) 0)
+          (%tls-set-self-base 0))
         (setf (mem-ref (%rt-gate-addr) :u32) 1)
         ;; AND COMPILE THE COMPAT SURFACE, because from here on it is hot and
         ;; it is BYTECODE.  net/cooperative-atomics.lisp and the SB-* shims
@@ -2202,7 +2223,27 @@
    own — which matters, because a starting thread has no GC region and must not
    go anywhere near the shared runtime tables.")
 
-(defvar *thr-stack-bytes* 262144)
+;;; 16 MB, not 256 KB.  A worker's native frames measured ~870 bytes for a
+;;; one-argument recursive function (the main thread's are under 84 -- a
+;;; difference worth chasing separately), so 256 KB was ~300 levels: a
+;;; worker died SIGSEGV in (rn 400).  Anonymous pages are committed only as
+;;; touched, and a slot now REUSES its previous stack (%THR-SLOT-STACK), so
+;;; the size costs address space, not memory, and threads spawned in a loop
+;;; no longer leak one mapping each.
+(defvar *thr-stack-bytes* 16777216)
+
+(defun %thr-slot-stack (rec)
+  "A stack for the thread about to start in the slot whose record is REC: the
+   slot's previous stack when it is the current size, else a fresh mapping.
+   Reuse is safe because a slot is freed only by %JOIN-NATIVE-THREAD, after
+   the KERNEL has cleared the old thread's TID -- i.e. after it has left its
+   stack for good.  Stacks were never unmapped before; this bounds them at one
+   per slot."
+  (let ((old (%gc-read64 (+ rec #x10)))
+        (sz (%gc-read64 (+ rec #x18))))
+    (if (and (> old 4096) (= sz *thr-stack-bytes*))
+        old
+        (%mmap-shared-page *thr-stack-bytes*))))
 
 (defun %thr-funs ()
   (if (null *thr-funs*) (setq *thr-funs* (make-array 16)) 0)
@@ -2342,7 +2383,7 @@
             (if (< slot 0)
                 (progn (spin-unlock (%thr-spawn-lock)) -1)
                 (let* ((rec (%thr-rec slot))
-                       (stk (%mmap-shared-page *thr-stack-bytes*)))
+                       (stk (%thr-slot-stack rec)))
                   (if (< stk 4096)
                       (progn (spin-unlock (%thr-spawn-lock)) -3)
                       (progn

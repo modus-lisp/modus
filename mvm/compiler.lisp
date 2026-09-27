@@ -9255,6 +9255,20 @@
                  (return-from scan))
                (let ((mx (%cfv-macroexpand form)))
                  (when mx (setq form mx)))
+               ;; ...AND KEEP EXPANDING (runtime compiles): a macro whose
+               ;; expansion is another macro call hid the closure one level
+               ;; down -- (sys:value-cell-location 'x) -> (scl:locf x) ->
+               ;; (lambda …(setf x v)) -- so X was never boxed and the write
+               ;; was lost.  Bounded, like %COLLECT-FREE-VARS' loop; gated on
+               ;; *MVM-EVAL-RUNTIME-P* so host-built output is unchanged.
+               (when *mvm-eval-runtime-p*
+                 (let ((steps 0))
+                   (loop
+                     (when (>= steps 100) (return nil))
+                     (let ((mx (%cfv-macroexpand form)))
+                       (if mx
+                           (progn (setq form mx) (setq steps (+ steps 1)))
+                           (return nil))))))
                (unless (consp form) (return-from scan))
                (let ((op (car form)))
                  (cond
@@ -9445,6 +9459,15 @@
                (unless (consp form) (return-from scan))
                (let ((mx (%cfv-macroexpand form)))
                  (when mx (setq form mx)))
+               ;; Keep expanding, as the mutation scan does (runtime only).
+               (when *mvm-eval-runtime-p*
+                 (let ((steps 0))
+                   (loop
+                     (when (>= steps 100) (return nil))
+                     (let ((mx (%cfv-macroexpand form)))
+                       (if mx
+                           (progn (setq form mx) (setq steps (+ steps 1)))
+                           (return nil))))))
                (unless (consp form) (return-from scan))
                (let ((op (car form)))
                  (cond
@@ -9773,6 +9796,22 @@
          ;; (the fixnum interpreted as a code address).  Only a CONS head
          ;; is a real subform — ((lambda …) …) must still be rewritten so
          ;; the LAMBDA branch above sees it.
+         ;;
+         ;; A MACRO CALL THAT MENTIONS A BOXED VAR IS EXPANDED FIRST (runtime
+         ;; compiles only).  This pass runs before macroexpansion, so rewriting
+         ;; a macro's ARGUMENTS turned (setter x) -- whose expansion is
+         ;; (lambda (n) (setq x n)) -- into (setter (car %CELL-X)), and the
+         ;; closure's write went nowhere: the boxing analysis (which DOES
+         ;; expand, %CFV-MACROEXPAND) boxed X, and then no write reached the
+         ;; box.  bordeaux-threads' condition-wait is this shape (a locative
+         ;; made by a macro over a lexical).  INCF/DECF/PUSH/SETF are special-
+         ;; cased above for the same reason; this is the general form.  Gated
+         ;; on *MVM-EVAL-RUNTIME-P* like the union half of %BOXED-VARS-FOR-LET,
+         ;; so host-built output is byte-identical.
+         ((and *mvm-eval-runtime-p* (symbolp op)
+               (%tree-mentions-any-p (cdr form) boxed-vars)
+               (%cfv-macroexpand form))
+          (cell-rewrite-form (%cfv-macroexpand form) boxed-vars lambda-params))
          (t
           (let ((head (if (consp op)
                           (cell-rewrite-form op boxed-vars lambda-params)
@@ -9787,6 +9826,18 @@
             (let ((res cur))
               (dolist (x acc) (setq res (cons x res)))
               (cons head res)))))))))
+
+(defun %tree-mentions-any-p (tree names)
+  "True if any symbol in NAMES (by NAME-EQUAL) occurs anywhere in TREE."
+  (cond ((symbolp tree) (and tree (member tree names :test #'name-equal) t))
+        ((consp tree)
+         (let ((cur tree) (hit nil))
+           (loop
+             (when (or hit (not (consp cur)))
+               (return (or hit (and cur (%tree-mentions-any-p cur names)))))
+             (when (%tree-mentions-any-p (car cur) names) (setq hit t))
+             (setq cur (cdr cur)))))
+        (t nil)))
 
 ;;; ============================================================
 ;;; Let / Let*
@@ -11447,8 +11498,19 @@
     (t
      (let ((head (car form)))
        (cond
-         ;; Don't walk inside (quote …) or (function …).
-         ((or (eq head 'quote) (eq head 'function)) acc)
+         ;; Don't walk inside (quote …), nor (function NAME).  But
+         ;; (function (lambda …)) -- #'(lambda …) -- IS a closure, exactly
+         ;; like a bare (lambda …): skipping it left its free variables
+         ;; uncaptured, so inside another closure they read the inner
+         ;; lambda's own argument slots: (let ((w 1)) (call (lambda ()
+         ;; (funcall #'(lambda (a) (list a w)) 0)))) answered (0 0).
+         ;; bordeaux-threads' condition-wait is written exactly so.
+         ((eq head 'quote) acc)
+         ((eq head 'function)
+          (let ((f (cadr form)))
+            (if (and (consp f) (eq (car f) 'lambda))
+                (%collect-free-vars f bound env acc)
+                acc)))
          ;; Don't walk inside (sb-int:quasiquote …) — the template
          ;; contains SB-IMPL::COMMA structs in expression positions
          ;; (e.g. `(let ,bindings ,body)' has COMMA at the bindings

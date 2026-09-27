@@ -5891,6 +5891,23 @@
       (if (= (bq-comma-kind x) 2) 'comma-at 'comma)
       (car x)))
 
+(defun %bq-splice-through (elt level)
+  "ELT is a comma marker met at LEVEL.  Descending one level per comma, if it
+   bottoms out in a SPLICE owned by level 1 -- `(let (,,@forms)) in
+   alexandria's ONCE-ONLY -- return a form evaluating to the list to splice
+   HERE: the level-1 splice's elements, each re-wrapped in the outer commas
+   (CLHS 2.4.6: the leftmost comma belongs to the innermost backquote, so
+   ,,@X splices X's elements as ,X1 ,X2 ... into the inner template).
+   NIL when ELT is an ordinary comma."
+  (cond
+    ((not (bq-comma-p elt)) nil)
+    ((= level 1) (if (= (bq-comma-kind elt) 2) (bq-comma-expr elt) nil))
+    (t (let ((inner (%bq-splice-through (bq-comma-expr elt) (- level 1))))
+         (and inner
+              (let ((m (%bq-marker-sym elt)) (e (%mvm-gensym "BQE")))
+                (list 'mapcar (list 'lambda (list e) (list 'list (list 'quote m) e))
+                      inner)))))))
+
 (defun expand-backquote (template &optional (level 1))
   "Expand a backquote template into explicit list-building code.
    Handles ,x (unquote) and ,@x (splice).  LEVEL counts the open
@@ -5929,15 +5946,17 @@
     ;; which the tail branch below already handled.
     (let ((remaining lst))
       (loop while (and (consp remaining) (not (%bq-list-comma-kind remaining)))
-            do (let ((elt (car remaining)))
+            do (let* ((elt (car remaining))
+                      ;; ,@x at level 1, or ,,@x / ,,,@x reaching level 1
+                      (sp (and (bq-comma-p elt) (%bq-splice-through elt level))))
                  (cond
-                   ;; ,@x — splice (only at the level that owns the comma)
-                   ((and (bq-comma-p elt) (= level 1) (= (bq-comma-kind elt) 2))
+                   ;; splice
+                   (sp
                     ;; Flush current accumulator
                     (when current
                       (push (cons :list (nreverse current)) segments)
                       (setf current nil))
-                    (push (cons :splice (bq-comma-expr elt)) segments))
+                    (push (cons :splice sp) segments))
                    ;; ,x — unquote at level 1, rebuilt as data deeper;
                    ;; nested backquote; nested list: all via EXPAND-BACKQUOTE.
                    ;; (An SBCL comma is a STRUCT, not a cons — test it first.)

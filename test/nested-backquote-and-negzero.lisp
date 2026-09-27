@@ -39,6 +39,22 @@
        (eval form)
        (equal (eval `(zz-mk ,@inits)) '(1 2 9))))
 
+;; ,,@ : alexandria's ONCE-ONLY shape -- the splice belongs to the OUTER
+;; backquote and each spliced element keeps a comma for the inner one
+(defun zz-make-gensym-list (n &optional (x "G")) (loop repeat n collect (gensym x)))
+(defmacro zz-once-only (specs &body forms)
+  (let ((gensyms (zz-make-gensym-list (length specs) "ONCE-ONLY"))
+        (names-and-forms (mapcar (lambda (spec) (if (consp spec) spec (list spec spec))) specs)))
+    `(let ,(mapcar (lambda (g n) `(,g (gensym ,(string (car n))))) gensyms names-and-forms)
+       `(let (,,@(mapcar (lambda (g n) ``(,,g ,,(cadr n))) gensyms names-and-forms))
+          ,(let ,(mapcar (lambda (n g) (list (car n) g)) names-and-forms gensyms)
+             ,@forms)))))
+(defmacro zz-sq (x) (zz-once-only (x) `(* ,x ,x)))
+(defmacro zz-add (x y) (zz-once-only (x y) `(+ ,x ,y ,x)))
+(chk "once-only" (and (eql (zz-sq (+ 1 2)) 9) (eql (zz-add 2 3) 7)
+                      (let ((n 0)) (and (eql (zz-sq (incf n)) 1) (eql n 1)))))
+(chk "double-comma-splice" (let ((v '(1 2))) (equal (eval `(let ((q 5)) `(a ,,@v ,q))) '(a 1 2 5))))
+
 ;; dotted comma tail: `(a . ,b) reads as (A COMMA B) in the list representation
 (chk "dotted-tail"
      (let ((tail '(:from-end t)))

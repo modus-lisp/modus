@@ -214,6 +214,15 @@
 (defconstant +num-vregs+ 23)
 
 (defvar *nlx-state-serial* 0)
+;;; The interpreter runs at boot BEFORE INIT-ALL-GLOBALS (e.g. %DEFGENERIC ->
+;;; EVAL from %INIT-MAKE-LOAD-FORM), when *NLX-STATE-SERIAL* is still NIL
+;;; (CLAUDE.md limitation 7).  (INCF NIL) only "works" because generic + does
+;;; a raw word add on a non-number (unchecked -- test/numeric-type-checks.lisp
+;;; says why); don't depend on that, count from 0 here.
+(defun %nlx-next-serial ()
+  (setq *nlx-state-serial*
+        (if (integerp *nlx-state-serial*) (+ *nlx-state-serial* 1) 1)))
+
 (defstruct (mvm-state (:conc-name mvm-))
   (regs    (make-array +num-vregs+ :initial-element 0) :type simple-vector)
   (stack   nil :type list)
@@ -283,7 +292,7 @@
   ;; and VR to a non-NIL marker so the handler-case's `:bnnull` takes the
   ;; handler path (mirroring the native setjmp's non-zero return).
   (handlers nil :type list)
-  (serial (incf *nlx-state-serial*)))
+  (serial (%nlx-next-serial)))
 
 ;; A jmp-buf saved by SETJMP (TRAP #x0510): everything the interpreter needs to
 ;; resume the handler-case body's setjmp point after a LONGJMP.  pc is the

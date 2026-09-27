@@ -604,6 +604,10 @@
               (loop (when (null dims) (return total))
                 (setq total (* total (car dims)))
                 (setq dims (cdr dims))))))))
+    ;; Not a sequence: TYPE-ERROR (CLHS).  ARRAY-LENGTH of any other object
+    ;; read its header count -- (length :foo) answered 1.
+    ((or (symbolp seq) (characterp seq) (numberp seq) (functionp seq))
+     (%signal-type-error))
     (t (array-length seq))))
 
 ;;; ============================================================

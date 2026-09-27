@@ -358,6 +358,28 @@
                   (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
                         do (mvm-emit-byte buf 0))
                   (setf (aref addr-table idx) (logior obj-offset tag))))
+               (keyword
+                ;; STATIC KEYWORD (compile-keyword under *static-keywords-p*):
+                ;; the same object :ALLOC-OBJ 1 +SUBTAG-KEYWORD+ builds at
+                ;; runtime -- header (1 << 8) | #x53, the target's padding
+                ;; words, then slot 0 = the tagged name hash.  It holds no heap
+                ;; pointer, so it can live outside the heap: the collector never
+                ;; moves it and never needs to scan it (pooled strings rely on
+                ;; the same facts).  Boot seeds the keyword table with it
+                ;; (%seed-static-keywords), so runtime interning returns it.
+                (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
+                      do (mvm-emit-byte buf 0))
+                (let* ((obj-offset (mvm-buffer-position buf))
+                       (tag (target-object-tag target))
+                       (data-off (target-object-data-offset target))
+                       (pad-words (1- (/ data-off word-size))))
+                  (emit-word (logior #x53 (ash 1 8)))
+                  (dotimes (i pad-words)
+                    (emit-word 0))
+                  (emit-word (ash (normalize-name constant) 1))
+                  (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
+                        do (mvm-emit-byte buf 0))
+                  (setf (aref addr-table idx) (logior obj-offset tag))))
                (t
                 ;; Non-string constants in the table are unexpected for now —
                 ;; primitives are inlined by compile-quote, and other

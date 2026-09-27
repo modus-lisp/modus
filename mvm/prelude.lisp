@@ -2755,6 +2755,22 @@
 (defun %init-pkg-by-hash ()
   (setf (mem-ref #x10000170 :u64) (make-hash-table)))
 
+(defun %seed-static-keyword (kw)
+  "Register static keyword object KW (image constant pool) in the keyword
+   table, so %INTERN-KEYWORD -- the reader, INTERN, runtime-compiled code --
+   returns the same object the image's literals load.  Called only from the
+   generated %SEED-STATIC-KEYWORDS, right after INIT-KEYWORD-TABLE.  A heap
+   keyword already in the table under the same hash means something interned
+   it before seeding: EQ between it and the literal is lost, so say so."
+  (let* ((table (mem-ref #x10000148 :u64))
+         (h (aref kw 0))
+         (old (gethash h table)))
+    (cond ((null old) (puthash h table kw))
+          ((eq old kw) nil)
+          (t (write-string-serial "  !! static keyword seeded after a heap copy: hash ")
+             (write-object h)
+             (write-char-serial 10)))))
+
 (defun %intern-keyword (name-hash)
   "Intern a keyword by name hash, under the runtime-table lock.  Split into a
    wrapper and a body for the reason %INTERN-SYMBOL-PKG gives.

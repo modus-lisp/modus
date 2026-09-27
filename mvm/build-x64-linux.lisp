@@ -996,6 +996,7 @@
   ;; Initialize runtime
   (init-symbol-table)
   (init-keyword-table)
+  (%seed-static-keywords)
 
   ;; Initialize package system (creates CL, CL-USER, KEYWORD, test packages)
   ;; %init-packages's last step IS %export-standard-cl-symbols.
@@ -1806,6 +1807,8 @@
 (setf modus.mvm.x64::*mcgc-kind-bitmap-enabled* t)
 ;; Set R14 to midpoint so GC fires at half heap
 (setf modus.mvm::*linux-x64-r14-offset* modus.mvm::+linux-x64-gc-midpoint+)
+;; Static keyword literals (docs/static-literals.md, phase 1); boot seeds them.
+(setf modus.mvm::*static-keywords-p* t)
 ;; Set native code offset for funcall alignment:
 ;; ELF header (64+56=120) + linux-x64 boot code (192) + nil-page mmap (49) +
 ;; code-bounds init (34) + JMP rel32 (5) = 351 = 0x15F

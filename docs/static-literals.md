@@ -1,7 +1,25 @@
 # Proposal: static literals in image code
 
-Status: proposal (2026-09-27). Scope: every back end; the change is in the
+Status: phase 1 (static keywords) implemented 2026-09-27 for the CLI and
+ANSI builds; phases 2-3 proposed. Scope: every back end; the change is in the
 compiler and image assembler, not in any one translator.
+
+## Phase 1 results (measured)
+
+- Enabled by `*static-keywords-p*` (set in `build-cli-common.lisp` and
+  `build-x64-linux.lisp`); bare-metal and other images are unchanged.
+  Static keywords per image: x64 511, i386 480, aarch64 662, riscv64/32 480.
+- Identity holds on x64, i386, aarch64, riscv64 and riscv32 (qemu-user):
+  a literal is `eq` to `intern`, `read-from-string`, `find-symbol`, `eval`
+  and runtime-compiled `:foo`; boot reports no heap copies.
+- Runtime compilation (`eval` of a `defun`, 50x): x64 42 -> 17 ms, i386
+  161 -> 68 ms. The compiler is image code that dispatches on keyword IR
+  operations constantly, so this is where it pays.
+- `make-array` with `&key` arguments (100k calls): x64 1.70 -> 1.57 s (one
+  keyword), 2.30 -> 2.00 s (three); i386 8.46 -> 7.57 s (three). **Interning
+  turned out to be a minor part of `&key` cost**; the rest is elsewhere in
+  keyword-argument handling (below, the "measured cost" figures were the
+  motivation, not a measurement of interning alone).
 
 ## Problem
 
@@ -92,9 +110,8 @@ keyword points into the heap.
    object per distinct keyword in the constant pool (header with
    `+subtag-keyword+`, then the tagged name hash). The existing per-arch
    `*<arch>-li-const-patches*` pass bakes each site's address, just as it does
-   for strings today. Six back ends already have patch lists (x64, aarch64,
-   riscv, ppc, arm32, 68k); **i386 must be checked first**, since it has
-   `:li-const` but no patch list in `cross.lisp`.
+   for strings today. All seven back ends have patch lists (i386's lives in
+   `modus.mvm.i386` and `cross.lisp` finds it by name at run time).
 3. **Boot.** Before the first keyword can be interned at runtime, boot seeds
    the keyword table (`0x10000148`) with every static keyword, keyed by name
    hash. From then on `%intern-keyword` returns the static object for those
@@ -180,7 +197,7 @@ asks for it.
 
 ## Open questions
 
-1. How does i386 bake constants today (it has `:li-const` but no patch list)?
+1. ~~How does i386 bake constants?~~ Answered: its own patch list, found by name.
 2. Is the boot keyword-table seeding cheap enough on bare-metal images, or
    should the table be pre-built into the image as static data?
 3. Should phase 2 also take over the runtime quote pool's per-execution

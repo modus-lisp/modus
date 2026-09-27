@@ -1122,6 +1122,20 @@
             (%reg-pkg-alist-put (gethash key *global-symbol-macros-pkg*)
                                 p (cons expansion nil))))))
 
+(defvar *static-keywords-p* nil
+  "When T, an image build (not a runtime mvm-eval compile) bakes every keyword
+   literal as a STATIC keyword object in the image constant pool and loads it
+   with :LI-CONST -- one baked address, where the default path calls
+   %INTERN-KEYWORD (lock + GETHASH) on every evaluation.  The module then also
+   gets %SEED-STATIC-KEYWORDS, which boot must call right after
+   INIT-KEYWORD-TABLE so runtime interning returns the same objects.
+   docs/static-literals.md, phase 1.  Set by the builds that call the seeder.")
+
+(defvar *static-keyword-index* nil
+  "name-hash -> constant-table index of that keyword's static object, for the
+   module being compiled (one object per keyword, or EQ breaks).  Reset per
+   module by MVM-COMPILE-ALL with SETQ for the reason *INIT-THUNK-NAMES* is.")
+
 (defvar *init-thunk-names* nil
   "Names of auto-generated INIT-* thunks emitted by the DEFVAR /
    DEFPARAMETER handlers in mvm-compile-toplevel.  init-all-globals
@@ -6155,6 +6169,17 @@
   ;; comparing :CONC-NAME), and the ANSI gate lost 289 tests (structures,
   ;; defmethod, documentation ...).  The intern call is keyed by NAME HASH
   ;; and is pool-independent.
+  (when (and *static-keywords-p* (not *mvm-eval-runtime-p*))
+    (let* ((h (normalize-name kw))
+           (idx (and *static-keyword-index* (gethash h *static-keyword-index*))))
+      (unless idx
+        (unless *static-keyword-index*
+          (setq *static-keyword-index* (make-hash-table :test 'eql)))
+        (setq idx (length *constant-table*))
+        (push kw *constant-table*)
+        (setf (gethash h *static-keyword-index*) idx))
+      (emit-ir :li-const dest idx)
+      (return-from compile-keyword nil)))
   (if (and *mvm-eval-runtime-p* (not *static-build-p*) (fboundp (quote %intern-keyword)))
       ;; Runtime compile: the keyword object exists (or is created) NOW and is
       ;; interned for good, so bake it as a pool constant — a `:foo' literal
@@ -24291,6 +24316,7 @@
     ;; init-all-globals was never generated → funcall-of-0 at modus2 boot.
     ;; Using the plain global (reset per compile) makes push+read share one cell.
     (setq *init-thunk-names* nil)
+    (setq *static-keyword-index* nil)
 
     ;; Register standard macros (cond, and, or) for this compilation
     (register-mvm-bootstrap-macros)
@@ -24404,6 +24430,26 @@
              (ir (cdr result)))
         (when (and info ir)
           (setf all-ir (nconc all-ir (list (cons info ir)))))))
+
+    ;; Static keywords: %SEED-STATIC-KEYWORDS registers every static keyword
+    ;; object of this module in the keyword table.  Its own literals compile
+    ;; through the same deduplicated index, so it seeds exactly the objects
+    ;; the code loads.  Generated LAST, from the complete index.
+    (when *static-keywords-p*
+      (let ((kws nil))
+        (when *static-keyword-index*
+          (maphash (lambda (h idx) (declare (ignore h))
+                     (push (nth (- (length *constant-table*) 1 idx) *constant-table*) kws))
+                   *static-keyword-index*))
+        (format t "  static keywords: ~D~%" (length kws))
+        (let* ((result (mvm-compile-toplevel
+                         `(defun %seed-static-keywords ()
+                            ,@(mapcar (lambda (k) `(%seed-static-keyword ,k)) kws)
+                            nil)))
+               (info (car result))
+               (ir (cdr result)))
+          (when (and info ir)
+            (setf all-ir (nconc all-ir (list (cons info ir))))))))
 
     ;; Phase 2b: fuse size-aware gc-checks.  MUST be here — after the IR is
     ;; final, before Phase 3 computes label positions from ir-instruction-size

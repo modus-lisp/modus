@@ -1110,5 +1110,29 @@
   (let ((p (%sbs-path-cstr path)))
     (if (zerop p) -36 (syscall3 87 p 0 0))))
 
+;;; getcwd(2) / chdir(2), for UIOP:GETCWD and UIOP:CHDIR (net/asdf-interface.lisp).
+;;; The cwd lands in this CPU's struct scratch, 512 bytes; a longer path answers
+;;; NIL (ERANGE) rather than a truncated -- i.e. different -- directory.
+(defun %sbs-getcwd ()
+  (let ((buf (%struct-scratch)))
+    (if (zerop buf)
+        nil
+        (let ((r (syscall3 79 buf 512 0)))
+          (if (< r 0)
+              nil
+              (let ((len 0))
+                (loop
+                  (when (or (>= len 511) (= (mem-ref (+ buf len) :u8) 0)) (return nil))
+                  (setq len (+ len 1)))
+                (let ((s (%make-string-array len)) (i 0))
+                  (loop
+                    (when (>= i len) (return s))
+                    (%prim-aset s i (mem-ref (+ buf i) :u8))
+                    (setq i (+ i 1))))))))))
+
+(defun %sbs-chdir (path)
+  (let ((p (%sbs-path-cstr path)))
+    (if (zerop p) -36 (syscall3 80 p 0 0))))
+
 (defun %sbs-getuid () (syscall3 102 0 0 0))
 (defun %sbs-getpid () (syscall3 39 0 0 0))

@@ -39,8 +39,8 @@
    pincount_base = freelist_base + page_count*4 (the array lives just past the
    run-free-list in the MAP_ANON-zeroed metadata region).  Both operands come
    from constant config slots, so the result is a clean fixnum address."
-  (+ (%mcgc-cfg-uval +mcgc-pin-cfg-freelist+)
-     (* (%mcgc-cfg-uval +mcgc-pin-cfg-page-count+) 4)))
+  (+ (%mcgc-cfg-uval (%conv-addr +mcgc-pin-cfg-freelist+))
+     (* (%mcgc-cfg-uval (%conv-addr +mcgc-pin-cfg-page-count+)) 4)))
 
 (defun %mcgc-obj-raw-addr (obj)
   "Raw byte address of heap object OBJ (cons or object).  Proven tagged->raw
@@ -63,7 +63,7 @@
   "Add DELTA (+1 / -1) to the pin-count of every page OBJ covers.  Returns the
    object's raw byte address.  No-op (still returns the address) when the page
    metadata isn't initialised (page_base==0)."
-  (let ((page-base (%mcgc-cfg-uval +mcgc-pin-cfg-page-base+))
+  (let ((page-base (%mcgc-cfg-uval (%conv-addr +mcgc-pin-cfg-page-base+)))
         (raw (%mcgc-obj-raw-addr obj)))
     (when (> page-base 0)
       (let* ((size (%mcgc-obj-size obj))
@@ -97,7 +97,7 @@
 
 (defun %mcgc-page-pincount (obj)
   "Pin-count of the page containing OBJ's start (diagnostic)."
-  (let ((page-base (%mcgc-cfg-uval +mcgc-pin-cfg-page-base+))
+  (let ((page-base (%mcgc-cfg-uval (%conv-addr +mcgc-pin-cfg-page-base+)))
         (raw (%mcgc-obj-raw-addr obj)))
     (if (> page-base 0)
         (mem-ref (+ (%mcgc-pincount-base) (* (ash (- raw page-base) -12) 4)) :u32)

@@ -347,10 +347,10 @@
 (defun %mv-slot-index (addr width)
   "Vector index into mvm-mv-vals for a u64 access to the MV region, else NIL."
   (and (= width 3)
-       (>= addr #x10000090)
-       (< addr #x10000138)
+       (>= addr (%conv-addr #x10000090))
+       (< addr (%conv-addr #x10000138))
        (= 0 (logand addr 7))
-       (ash (- addr #x10000090) -3)))
+       (ash (- addr (%conv-addr #x10000090)) -3)))
 
 (defun mem-read (state addr width)
   (let ((mv (%mv-slot-index addr width)))
@@ -964,7 +964,7 @@
         (i (- mvc 2)))
     (loop
       (when (< i 0) (return secs))
-      (setq secs (cons (%word->val (mem-read state (+ #x10000098 (* i 8)) 3))
+      (setq secs (cons (%word->val (mem-read state (+ (%conv-addr #x10000098) (* i 8)) 3))
                        secs))
       (setq i (- i 1)))))
 
@@ -1046,7 +1046,7 @@
     ;; fresh per-state memory hash would otherwise read as 0 (= "zero
     ;; values"), corrupting single-value results.  Word encoding matches
     ;; op-store / the bridge mirror: the WORD of the fixnum count.
-    (mem-write state #x10000090 (%val->word 1) 3)
+    (mem-write state (%conv-addr #x10000090) (%val->word 1) 3)
 
     (loop
       ;; Re-load regs from the state each iteration: the compiled in-image
@@ -1067,7 +1067,7 @@
             ;; (matching native, where they are ONE real location), and the
             ;; entry above initialized it to 1.  Counts outside [0..64] are
             ;; treated as 1 (defensive: a raw store aliasing the slot).
-            (let ((%mvc (%word->val (mem-read state #x10000090 3))))
+            (let ((%mvc (%word->val (mem-read state (%conv-addr #x10000090) 3))))
               (if (and (integerp %mvc) (>= %mvc 0) (<= %mvc 64) (not (eql %mvc 1)))
                   (setq *mvm-last-mv* (cons %mvc (%mvm-collect-mv-secs state %mvc)))
                   (setq *mvm-last-mv* nil))
@@ -2492,14 +2492,14 @@
                            ;; count slot (#x10000090) holds the WORD of the fixnum
                            ;; count — match a normal (setf (mem-ref ... :u64) n),
                            ;; which stores (reg-get) = %val->word of the fixnum.
-                           (mem-write-value state #x10000090 nvals 3)
+                           (mem-write-value state (%conv-addr #x10000090) nvals 3)
                            ;; secondaries (value 1+) -> #x10000098 + i*8, stored
                            ;; as VALUES (op-store's path).  The old %val->word
                            ;; SHL overflowed for |v| >= 2^61, so (floor 1 mnf)'s
                            ;; remainder -4611686018427387903 came back as 1.
                            (let ((i 0))
                              (dolist (v (cdr vals))
-                               (mem-write-value state (+ #x10000098 (* i 8)) v 3)
+                               (mem-write-value state (+ (%conv-addr #x10000098) (* i 8)) v 3)
                                (incf i)))))
                        ;; Unresolved runtime name: signal UNDEFINED-FUNCTION
                        ;; (CL semantics — `(eval '(no-such-fn))` must signal).
@@ -2619,10 +2619,10 @@
                     (let* ((vals (multiple-value-list (apply target args)))
                            (nvals (length vals)))
                       (setf (svref regs +vreg-vr+) (car vals))
-                      (mem-write state #x10000090 (%val->word nvals) 3)
+                      (mem-write state (%conv-addr #x10000090) (%val->word nvals) 3)
                       (let ((i 0))
                         (dolist (v (cdr vals))
-                          (mem-write state (+ #x10000098 (* i 8))
+                          (mem-write state (+ (%conv-addr #x10000098) (* i 8))
                                      (%val->word v) 3)
                           (incf i))))
                     (setf pc npc)))
@@ -2719,7 +2719,7 @@
              ;; multiple-value-bind / the mvm-eval MV return path read — a stale
              ;; count from an inner (values …) leaked past a single-value
              ;; return.  Word encoding matches op-store / the bridge mirror.
-             (mem-write state #x10000090 (%val->word n) 3)
+             (mem-write state (%conv-addr #x10000090) (%val->word n) 3)
              (setf pc npc)))
 
           ;; --- Actor / Concurrency ---

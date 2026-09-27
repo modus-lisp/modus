@@ -748,13 +748,11 @@
                        (and *aarch64-jit-mode* *aarch64-jit-handler-va-slots-p*)))))
     (when probe
       ;; save caller x30 to 0x10000FF0
-      (a64-movz buf +a64-x16+ #xFFF0 0)
-      (a64-movk buf +a64-x16+ #x1000 1)
+      (a64-load-imm64 buf +a64-x16+ (conv-real #x1000FFF0))
       (a64-str-unsigned buf +a64-x30+ +a64-x16+ 0)
       (a64-emit-handler-helper-call buf which)
       ;; restore caller x30
-      (a64-movz buf +a64-x16+ #xFFF0 0)
-      (a64-movk buf +a64-x16+ #x1000 1)
+      (a64-load-imm64 buf +a64-x16+ (conv-real #x1000FFF0))
       (a64-ldr-unsigned buf +a64-x30+ +a64-x16+ 0)
       t)))
 
@@ -1541,12 +1539,19 @@
 
    So the fold is no longer inferred from the value.  A caller that knows it
    is naming a convention slot says so by calling THIS; everything else takes
-   the plain MOVZ/MOVK sequence, which is correct for any word.  Missing a
-   call site here costs two instructions, never correctness."
+   the plain MOVZ/MOVK sequence, which is correct for any word.
+
+   Since the runtime-data region can move (docs/macos-hosting.md, option B),
+   x18 holds its REAL base and the arm outside the window loads CONV-REAL of
+   ADDR.  So a convention address loaded any OTHER way is a correctness bug
+   once the region has moved, not just two wasted instructions."
   (if (and *a64-x18-base* (integerp addr)
            (>= addr +a64-conv-base+) (< addr (+ +a64-conv-base+ #x1000)))
       (a64-add-imm buf rd +a64-x18+ (- addr +a64-conv-base+))
-      (a64-load-imm64 buf rd addr)))
+      ;; Outside the fold window: the REAL address.  x18 holds the region's
+      ;; real base, so the fold above is already moved; this arm must be
+      ;; moved explicitly (docs/macos-hosting.md, option B).
+      (a64-load-imm64 buf rd (conv-real addr))))
 
 (defun a64-load-imm64-general (buf rd imm64)
   "General (bignum / negative two's-complement) case of A64-LOAD-IMM64."
@@ -3014,7 +3019,7 @@
                   (a64-mov-reg buf +a64-x0+ +a64-x26+)         ; first-time return = NIL
                   ;; AFTER this point execution falls through.  ADR target is here.
                   (let ((return-idx (a64-current-index buf)))
-                    (a64-movz buf +a64-x18+ #x1000 1)        ; x18 = convention base again
+                    (a64-load-imm64 buf +a64-x18+ (conv-real +a64-conv-base+)) ; x18 = convention base again
                     (a64-load-spill buf +a64-x6+ +vreg-v9+)
                     (a64-load-spill buf +a64-x7+ +vreg-v10+)
                     (a64-load-spill buf +a64-x4+ +vreg-v11+)
@@ -3285,7 +3290,7 @@
                   (let ((stub-start-idx (a64-current-index buf)))
 
                     ;; x9/x10/x11 = saved SP / FP / PC.
-                    (a64-load-imm64-general buf +a64-x16+ #x10000180)
+                    (a64-load-imm64-general buf +a64-x16+ (conv-real #x10000180))
                     (a64-ldur buf +a64-x9+  +a64-x16+ 0)
                     (a64-ldur buf +a64-x10+ +a64-x16+ 8)
                     (a64-ldur buf +a64-x11+ +a64-x16+ 16)
@@ -3299,9 +3304,9 @@
                       ;; depth at #x10010000 ; frames at #x10010008 + depth*24.
                       ;; Scratch: x12 = depth-addr, x13 = depth, x14 = frame
                       ;; ptr, x15 = slot ptr (#x10000180), x16 = temp.
-                      (a64-load-imm64-general buf +a64-x12+ #x10010000)
+                      (a64-load-imm64-general buf +a64-x12+ (conv-real #x10010000))
                       (a64-ldur buf +a64-x13+ +a64-x12+ 0)
-                      (a64-load-imm64-general buf +a64-x15+ #x10000180)
+                      (a64-load-imm64-general buf +a64-x15+ (conv-real #x10000180))
                       ;; If depth == 0, write zeros to slot then skip.
                       (let ((cbz-zero-idx (a64-current-index buf)))
                         (a64-emit buf (logior #xB4000000 13))  ; CBZ x13
@@ -3690,8 +3695,8 @@
                    ;; hard-codes.  Host-side the defvar IS initialised, so
                    ;; image builds are unaffected.
                    (a64-load-imm64 buf pd (if (integerp *aarch64-jit-constvec-root*)
-                                              *aarch64-jit-constvec-root*
-                                              #x10000F10))
+                                              (conv-real *aarch64-jit-constvec-root*)
+                                              (conv-real #x10000F10)))
                    (a64-ldr-unsigned buf pd pd 0)      ; pd = tagged vector
                    ;; Slot address = (vec - 9) + 16 + idx*8 = vec + idx*8 + 7,
                    ;; the formula obj-ref/aref use.  LDR needs an 8-aligned
@@ -6102,13 +6107,13 @@
   ;; trampoline both BEFORE and AFTER x18 is repurposed as the copy loop's
   ;; slot cursor, and from the handler helpers, so x18 cannot be assumed to
   ;; hold the convention base at any call site.
-  (a64-load-imm64-general buf rtmp +gc-region-addr+)
+  (a64-load-imm64-general buf rtmp (conv-real +gc-region-addr+))
   (a64-ldr-unsigned buf rd rtmp 0)
   (let ((have (incf *mvm-label-counter*)))
     (a64-cmp-imm buf rd 0)
     (let ((i (a64-current-index buf)))
       (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i have :bcond))
-    (a64-load-imm64-general buf rd +gc-region-0-base+)
+    (a64-load-imm64-general buf rd (conv-real +gc-region-0-base+))
     (a64-set-label buf have)))
 
 (defun emit-aarch64-native-gc-trampoline (buf)
@@ -6166,7 +6171,7 @@
       ;; read as a header → astronomical count → the copy loop runs off the mapped
       ;; heap → SIGSEGV (WS4-AA64 #160 root cause).  conskind base @0x10000E40 (<<1);
       ;; scratch x13..x17; preserves x9(word-addr)/x10(value)/x11(tag)/x12(raw).
-      (a64-load-imm64-general buf +a64-x14+ #x10000E40) (a64-ldr-unsigned buf +a64-x14+ +a64-x14+ 0) (a64-asr-imm buf +a64-x14+ +a64-x14+ 1)
+      (a64-load-imm64-general buf +a64-x14+ (conv-real #x10000E40)) (a64-ldr-unsigned buf +a64-x14+ +a64-x14+ 0) (a64-asr-imm buf +a64-x14+ +a64-x14+ 1)
       (a64-sub-reg buf +a64-x13+ +a64-x12+ +a64-x27+ 0 0)          ; raw - page_base
       (a64-lsr-imm buf +a64-x15+ +a64-x13+ 7) (a64-add-reg buf +a64-x15+ +a64-x14+ +a64-x15+ 0 0) ; x15 = conskind byte addr
       (a64-lsr-imm buf +a64-x13+ +a64-x13+ 4)                      ; granule
@@ -6274,7 +6279,7 @@
       ;; scan classifies this copy as a cons.  conskind base @0x10000E40 (<<1).
       ;; NB: x10 holds the RETURN value (dest|1) — must NOT clobber it; use x9
       ;; for the base and x13..x17 for the bit math.
-      (a64-load-imm64-general buf +a64-x9+ #x10000E40) (a64-ldr-unsigned buf +a64-x9+ +a64-x9+ 0) (a64-asr-imm buf +a64-x9+ +a64-x9+ 1)
+      (a64-load-imm64-general buf +a64-x9+ (conv-real #x10000E40)) (a64-ldr-unsigned buf +a64-x9+ +a64-x9+ 0) (a64-asr-imm buf +a64-x9+ +a64-x9+ 1)
       (a64-sub-reg buf +a64-x13+ +a64-x12+ +a64-x27+ 0 0)
       (a64-lsr-imm buf +a64-x14+ +a64-x13+ 7) (a64-add-reg buf +a64-x14+ +a64-x9+ +a64-x14+ 0 0)
       (a64-lsr-imm buf +a64-x13+ +a64-x13+ 4)
@@ -6331,7 +6336,7 @@
     (when *aarch64-gc-stats-enabled*
       (a64-mrs buf +a64-x9+ +sysreg-cntvct-el0+)
       (a64-lsl-imm buf +a64-x9+ +a64-x9+ 1)
-      (a64-load-imm64-general buf +a64-x16+ #x10000F20)
+      (a64-load-imm64-general buf +a64-x16+ (conv-real #x10000F20))
       (a64-str-unsigned buf +a64-x9+ +a64-x16+ 0))
     ;; load GC metadata (all stored <<1 → ASR #1 to raw)
     ;; STAGE 3: THE ACTIVE REGION, not region 0.  Every field below is an
@@ -6344,7 +6349,7 @@
     (a64-tramp-mark 32)
     (a64-load-gc-region buf +a64-x17+ +a64-x16+)
     (a64-tramp-mark 33)
-    (flet ((load-abs (rd addr) (a64-load-imm64-general buf +a64-x16+ addr)
+    (flet ((load-abs (rd addr) (a64-load-imm64-general buf +a64-x16+ (conv-real addr))
                      (a64-ldr-unsigned buf rd +a64-x16+ 0) (a64-asr-imm buf rd rd 1))
            (load-fld (rd off) (a64-ldr-unsigned buf rd +a64-x17+ off)
                      (a64-asr-imm buf rd rd 1)))
@@ -6400,7 +6405,7 @@
       (a64-set-label buf sdone))
     (a64-tramp-mark 5)
     ;; ---- fixed global roots ----
-    (flet ((scan-fixed (addr) (a64-load-imm64-general buf +a64-x9+ addr)
+    (flet ((scan-fixed (addr) (a64-load-imm64-general buf +a64-x9+ (conv-real addr))
                        (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))))
       (scan-fixed #x10000FA0)      ; global-cell cache vector (%GV-REF-FILL)
       (scan-fixed #x10000080)      ; globals hash-table
@@ -6422,7 +6427,7 @@
     ;; runaway scan): skip if extras<=0 (count 0/1) OR count>16 (garbage —
     ;; multiple-values-limit is 16), so a stale/uninit MV-count can't drive a
     ;; wild scan off into unmapped memory.
-    (a64-load-imm64-general buf +a64-x16+ #x10000090)
+    (a64-load-imm64-general buf +a64-x16+ (conv-real #x10000090))
     (a64-ldr-unsigned buf +a64-x26+ +a64-x16+ 0)        ; tagged count
     (a64-asr-imm buf +a64-x26+ +a64-x26+ 1)             ; raw count
     (a64-sub-imm buf +a64-x26+ +a64-x26+ 1)             ; extras = count-1
@@ -6432,7 +6437,7 @@
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-le+ 0) (a64-add-fixup buf i mvdone :bcond)) ; extras<=0
       (a64-cmp-imm buf +a64-x26+ 16)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-gt+ 0) (a64-add-fixup buf i mvdone :bcond)) ; extras>16 garbage
-      (a64-load-imm64-general buf +a64-x9+ #x10000098)
+      (a64-load-imm64-general buf +a64-x9+ (conv-real #x10000098))
       (a64-set-label buf mvloop)
       (a64-cmp-imm buf +a64-x26+ 0)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-le+ 0) (a64-add-fixup buf i mvdone :bcond))
@@ -6467,7 +6472,7 @@
       (a64-cmp-reg buf +a64-x26+ +a64-x21+)             ; cursor >= free_ptr → done
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i cdone :bcond))
       ;; cons-kind check for cursor: conskind base @0x10000E40 (<<1)
-      (a64-load-imm64-general buf +a64-x9+ #x10000E40) (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0) (a64-asr-imm buf +a64-x10+ +a64-x10+ 1)
+      (a64-load-imm64-general buf +a64-x9+ (conv-real #x10000E40)) (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0) (a64-asr-imm buf +a64-x10+ +a64-x10+ 1)
       (a64-sub-reg buf +a64-x11+ +a64-x26+ +a64-x27+ 0 0)  ; cursor - page_base
       (a64-lsr-imm buf +a64-x12+ +a64-x11+ 7) (a64-add-reg buf +a64-x12+ +a64-x10+ +a64-x12+ 0 0) ; byte addr
       (a64-lsr-imm buf +a64-x11+ +a64-x11+ 4)              ; granule
@@ -6556,7 +6561,7 @@
     ;; ---- ALSO byte-exact clear the reclaimed CONS-KIND bitmap range ----
     ;; (else stale cons-kind bits in the reclaimed semispace would misclassify a
     ;; future object-start as a cons in the type-aware walk.)  Same range/method.
-    (a64-load-imm64-general buf +a64-x12+ #x10000E40) (a64-ldr-unsigned buf +a64-x12+ +a64-x12+ 0) (a64-asr-imm buf +a64-x12+ +a64-x12+ 1) ; x12 = conskind base
+    (a64-load-imm64-general buf +a64-x12+ (conv-real #x10000E40)) (a64-ldr-unsigned buf +a64-x12+ +a64-x12+ 0) (a64-asr-imm buf +a64-x12+ +a64-x12+ 1) ; x12 = conskind base
     (a64-sub-reg buf +a64-x9+ +a64-x19+ +a64-x27+ 0 0)
     (a64-lsr-imm buf +a64-x9+ +a64-x9+ 7)
     (a64-add-reg buf +a64-x9+ +a64-x12+ +a64-x9+ 0 0)   ; x9 = dest (conskind)
@@ -6631,19 +6636,19 @@
     (when *aarch64-gc-stats-enabled*
       (a64-mrs buf +a64-x9+ +sysreg-cntvct-el0+)
       (a64-lsl-imm buf +a64-x9+ +a64-x9+ 1)               ; x9  = end<<1
-      (a64-load-imm64-general buf +a64-x16+ #x10000F20)
+      (a64-load-imm64-general buf +a64-x16+ (conv-real #x10000F20))
       (a64-ldr-unsigned buf +a64-x10+ +a64-x16+ 0)        ; x10 = start<<1
       (a64-sub-reg buf +a64-x11+ +a64-x9+ +a64-x10+ 0 0)  ; x11 = pause<<1
       ;; gc_stat_last = pause
-      (a64-load-imm64-general buf +a64-x16+ #x10000F38)
+      (a64-load-imm64-general buf +a64-x16+ (conv-real #x10000F38))
       (a64-str-unsigned buf +a64-x11+ +a64-x16+ 0)
       ;; gc_stat_total += pause
-      (a64-load-imm64-general buf +a64-x16+ #x10000F28)
+      (a64-load-imm64-general buf +a64-x16+ (conv-real #x10000F28))
       (a64-ldr-unsigned buf +a64-x10+ +a64-x16+ 0)
       (a64-add-reg buf +a64-x10+ +a64-x10+ +a64-x11+ 0 0)
       (a64-str-unsigned buf +a64-x10+ +a64-x16+ 0)
       ;; gc_stat_max = max(gc_stat_max, pause)   [unsigned; both operands <<1]
-      (a64-load-imm64-general buf +a64-x16+ #x10000F30)
+      (a64-load-imm64-general buf +a64-x16+ (conv-real #x10000F30))
       (a64-ldr-unsigned buf +a64-x10+ +a64-x16+ 0)
       (let ((nomax (incf *mvm-label-counter*)))
         (a64-cmp-reg buf +a64-x10+ +a64-x11+)
@@ -6655,10 +6660,10 @@
       (a64-sub-reg buf +a64-x12+ +a64-x21+ +a64-x22+ 0 0)
       (a64-lsl-imm buf +a64-x12+ +a64-x12+ 1)             ; x12 = bytes<<1
       ;; gc_stat_lastb = survivors
-      (a64-load-imm64-general buf +a64-x16+ #x10000F48)
+      (a64-load-imm64-general buf +a64-x16+ (conv-real #x10000F48))
       (a64-str-unsigned buf +a64-x12+ +a64-x16+ 0)
       ;; gc_stat_bytes += survivors
-      (a64-load-imm64-general buf +a64-x16+ #x10000F40)
+      (a64-load-imm64-general buf +a64-x16+ (conv-real #x10000F40))
       (a64-ldr-unsigned buf +a64-x10+ +a64-x16+ 0)
       (a64-add-reg buf +a64-x10+ +a64-x10+ +a64-x12+ 0 0)
       (a64-str-unsigned buf +a64-x10+ +a64-x16+ 0))
@@ -6696,8 +6701,7 @@
     ;; ---- PUSH helper ----
     (a64-set-label buf *aarch64-handler-push-label*)
     ;; x9 = 0x10010000 (depth slot)
-    (a64-movz buf +a64-x9+ #x0000 0)
-    (a64-movk buf +a64-x9+ #x1001 1)
+    (a64-load-imm64 buf +a64-x9+ (conv-real #x10010000))
     ;; x10 = depth
     (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0)
     ;; x11 = frame_base = 0x10010008 + depth*24
@@ -6707,8 +6711,7 @@
     (a64-lsl-imm buf +a64-x12+ +a64-x10+ 3)        ; depth*8
     (a64-add-reg buf +a64-x11+ +a64-x11+ +a64-x12+ 0 0)
     ;; x12 = 0x10000180 (current handler slot)
-    (a64-movz buf +a64-x12+ #x0180 0)
-    (a64-movk buf +a64-x12+ #x1000 1)
+    (a64-load-imm64 buf +a64-x12+ (conv-real #x10000180))
     ;; copy 3 doublewords: 180→frame+0, 188→frame+8, 190→frame+16
     (a64-ldr-unsigned buf +a64-x13+ +a64-x12+ 0)
     (a64-str-unsigned buf +a64-x13+ +a64-x11+ 0)
@@ -6722,8 +6725,7 @@
     (a64-ret buf)
     ;; ---- POP helper ----
     (a64-set-label buf *aarch64-handler-pop-label*)
-    (a64-movz buf +a64-x9+ #x0000 0)
-    (a64-movk buf +a64-x9+ #x1001 1)
+    (a64-load-imm64 buf +a64-x9+ (conv-real #x10010000))
     (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0)
     ;; if depth == 0 → zero slot 180/188/190 and return
     (a64-cmp-imm buf +a64-x10+ 0)
@@ -6732,8 +6734,7 @@
         (a64-bcond buf +cc-ne+ 0)
         (a64-add-fixup buf idx nz-label :bcond))
       ;; depth == 0 path: zero 0x180/188/190 and return
-      (a64-movz buf +a64-x12+ #x0180 0)
-      (a64-movk buf +a64-x12+ #x1000 1)
+      (a64-load-imm64 buf +a64-x12+ (conv-real #x10000180))
       (a64-str-unsigned buf +a64-xzr+ +a64-x12+ 0)
       (a64-str-unsigned buf +a64-xzr+ +a64-x12+ 8)
       (a64-str-unsigned buf +a64-xzr+ +a64-x12+ 16)
@@ -6749,8 +6750,7 @@
       (a64-lsl-imm buf +a64-x12+ +a64-x10+ 3)
       (a64-add-reg buf +a64-x11+ +a64-x11+ +a64-x12+ 0 0)
       ;; restore 0x180/188/190 from frame
-      (a64-movz buf +a64-x12+ #x0180 0)
-      (a64-movk buf +a64-x12+ #x1000 1)
+      (a64-load-imm64 buf +a64-x12+ (conv-real #x10000180))
       (a64-ldr-unsigned buf +a64-x13+ +a64-x11+ 0)
       (a64-str-unsigned buf +a64-x13+ +a64-x12+ 0)
       (a64-ldr-unsigned buf +a64-x13+ +a64-x11+ 8)

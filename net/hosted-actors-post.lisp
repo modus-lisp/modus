@@ -1341,10 +1341,10 @@
 ;;; The four words translate-x64's trampoline maintains.  They are BSS, zero in
 ;;; a fresh process, and nothing but the trampoline and these functions touch
 ;;; them.
-(defun %ha-gc-conc-cur ()     (%gc-read64 #x10000EE0))
-(defun %ha-gc-conc-witness () (%gc-read64 #x10000EE8))
-(defun %ha-gc-conc-met ()     (%gc-read64 #x10000EF8))
-(defun %ha-gc-conc-barrier () (%gc-read64 #x10000EF0))
+(defun %ha-gc-conc-cur ()     (%gc-read64 (%conv-addr #x10000EE0)))
+(defun %ha-gc-conc-witness () (%gc-read64 (%conv-addr #x10000EE8)))
+(defun %ha-gc-conc-met ()     (%gc-read64 (%conv-addr #x10000EF8)))
+(defun %ha-gc-conc-barrier () (%gc-read64 (%conv-addr #x10000EF0)))
 
 (defun %ha-set-gc-conc-barrier (n)
   "Arm (N > 0) or disarm (N = 0) the in-collection barrier with a SPIN BUDGET
@@ -1352,14 +1352,14 @@
    until a second collector arrives or the budget is spent.  It is BOUNDED on
    purpose: with collections serialized the second thread can never arrive, so
    a bounded barrier makes that case FAIL AN ASSERTION rather than hang."
-  (%gc-write64 #x10000EF0 n)
+  (%gc-write64 (%conv-addr #x10000EF0) n)
   n)
 
 (defun %ha-gc-conc-reset ()
-  (%gc-write64 #x10000EE0 0)
-  (%gc-write64 #x10000EE8 0)
-  (%gc-write64 #x10000EF0 0)
-  (%gc-write64 #x10000EF8 0)
+  (%gc-write64 (%conv-addr #x10000EE0) 0)
+  (%gc-write64 (%conv-addr #x10000EE8) 0)
+  (%gc-write64 (%conv-addr #x10000EF0) 0)
+  (%gc-write64 (%conv-addr #x10000EF8) 0)
   0)
 
 ;;; THE HAND-BACK.  A worker that has finished and been told to stop returns the

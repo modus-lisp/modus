@@ -89,8 +89,8 @@
 ;;; block at 0x10000E00.  A grep of every `#x10000xxx' literal in the tree
 ;;; finds nothing between 0x10000DA0 and 0x10000E00.
 
-(defun %thr-page-slot () #x10000DA8)
-(defun %thr-page-lock () #x10000DB0)
+(defun %thr-page-slot () (%conv-addr #x10000DA8))
+(defun %thr-page-lock () (%conv-addr #x10000DB0))
 
 (defun %thr-page ()
   "Raw byte address of the thread page, mapping it on first use.  0 if the
@@ -218,12 +218,12 @@
    ADDRESSES in the emitted code are unchanged: the segment moves, not the
    literal."
   (let ((b (%thr-tls-block cpu)))
-    (if (or (zerop b) (< b #x10000000))
+    (if (or (zerop b) (< b (%conv-addr #x10000000)))
         ;; A block BELOW the window base would make the segment base negative,
         ;; i.e. non-canonical, and arch_prctl would refuse it.  Refuse first so
         ;; the caller sees a decision rather than an errno.
         1
-        (let* ((delta (- b #x10000000))
+        (let* ((delta (- b (%conv-addr #x10000000)))
                (r (syscall3 158 #x1002 delta 0)))
           (if (zerop r)
               (progn
@@ -1212,11 +1212,11 @@
 ;;;   0x10000DD8 the owner's own region    0x10000DE0 acquisitions
 ;;;   0x10000DE8 acquisitions that had to wait
 
-(defun %rt-gate-addr ()  #x10000DB8)
-(defun %rt-mutex-addr () #x10000DC0)
-(defun %rt-owner-addr () #x10000DC8)
-(defun %rt-depth-addr () #x10000DD0)
-(defun %rt-saved-addr () #x10000DD8)
+(defun %rt-gate-addr ()  (%conv-addr #x10000DB8))
+(defun %rt-mutex-addr () (%conv-addr #x10000DC0))
+(defun %rt-owner-addr () (%conv-addr #x10000DC8))
+(defun %rt-depth-addr () (%conv-addr #x10000DD0))
+(defun %rt-saved-addr () (%conv-addr #x10000DD8))
 
 ;;; ============================================================
 ;;; B-LITE: PER-CPU ALLOCATION SLICES FOR LOCKED SECTIONS
@@ -1377,9 +1377,9 @@
           ;; A plain load cannot disturb anything.
           (if (zerop (%gc-read64 (%rt-mutex-addr)))
               0
-              (%gc-write64 #x10000DE8 (+ (%gc-read64 #x10000DE8) 1)))
+              (%gc-write64 (%conv-addr #x10000DE8) (+ (%gc-read64 (%conv-addr #x10000DE8)) 1)))
           (%mutex-lock (%rt-mutex-addr))
-          (%gc-write64 #x10000DE0 (+ (%gc-read64 #x10000DE0) 1))
+          (%gc-write64 (%conv-addr #x10000DE0) (+ (%gc-read64 (%conv-addr #x10000DE0)) 1))
           (%gc-write64 (%rt-owner-addr) me)
           (%gc-write64 (%rt-depth-addr) 1)
           ;; PARK MY REGION, TAKE MY SLICE — or, with no arena (small heap,
@@ -1439,8 +1439,8 @@
         (%gc-write64 (%rt-owner-addr) 0)
         (%gc-write64 (%rt-depth-addr) 0)
         (%mutex-init (%rt-mutex-addr))
-        (%gc-write64 #x10000DE0 0)
-        (%gc-write64 #x10000DE8 0)
+        (%gc-write64 (%conv-addr #x10000DE0) 0)
+        (%gc-write64 (%conv-addr #x10000DE8) 0)
         ;; B-LITE (see the block above %RT-SLICE-BASE): carve the lock arena
         ;; BEFORE the gate opens, so no locked section ever runs against a
         ;; half-carved arena.  A 0 here (small heap, frontier in the way) is
@@ -1491,8 +1491,8 @@
   (setf (mem-ref (%rt-gate-addr) :u32) 0)
   0)
 
-(defun %rt-acquisitions () (%gc-read64 #x10000DE0))
-(defun %rt-contended ()    (%gc-read64 #x10000DE8))
+(defun %rt-acquisitions () (%gc-read64 (%conv-addr #x10000DE0)))
+(defun %rt-contended ()    (%gc-read64 (%conv-addr #x10000DE8)))
 
 ;;; ============================================================
 ;;; ACCEPTANCE — TWO THREADS RUNNING REAL LISP AT THE SAME TIME
@@ -2812,7 +2812,7 @@
                   (let ((rp (%thr-region-report (+ i 1))))
                     (if (= (%gc-read64 (+ rp #x08)) (%ha-rcb (+ i 1)))
                         0 (setq badr (+ badr 1)))
-                    (if (= (%gc-read64 (+ rp #x10)) (+ #x10000F08 (* (+ i 1) 8)))
+                    (if (= (%gc-read64 (+ rp #x10)) (+ (%conv-addr #x10000F08) (* (+ i 1) 8)))
                         0 (setq badc (+ badc 1))))
                   (setq i (+ i 1)))
                 (%gc-write64 (+ res #x88) badr)

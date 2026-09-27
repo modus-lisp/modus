@@ -767,8 +767,8 @@
    *jit-target-arch* never got set falls back to the x64 slot, which is the
    historical value — i.e. this change is a no-op on x64 by construction."
   (if (and (boundp (quote *jit-target-arch*)) (eq *jit-target-arch* :aarch64))
-      #x10000F10
-      #x10000F00))
+      (%conv-addr #x10000F10)
+      (%conv-addr #x10000F00)))
 
 (defvar *jit-constvec-cap* nil
   "Allocated length of the JIT constant vector, or NIL before the first sync.")
@@ -1064,7 +1064,7 @@
   (%jit-write-movz-quad addr k (ash idx 1))
   (%jit-emit-word32 (+ addr k 16) (logior #x52800010 (ash (+ nargs 1) 5)))
   (%jit-emit-quad-placeholder (+ addr k 20) 17)
-  (%jit-write-movz-quad addr (+ k 20) #x10000150)
+  (%jit-write-movz-quad addr (+ k 20) (%conv-addr #x10000150))
   (%jit-emit-word32 (+ addr k 36) #xB9000230)
   (%jit-emit-quad-placeholder (+ addr k 40) 16)
   (%jit-write-movz-quad addr (+ k 40) (%jit-bridge-entry nargs))
@@ -1118,7 +1118,7 @@
 ;;;   str  w17, [x16]                    B9000211
 ;;;   movz/movk x16 <- bridge-any entry  4 words
 ;;;   br   x16                           D61F0200
-(defun %jit-fnaddr-idx-slot () #x10000178)
+(defun %jit-fnaddr-idx-slot () (%conv-addr #x10000178))
 (defvar *jit-fnaddr-thunks* nil "Alist NAME-string -> thunk address (one per name).")
 (defun %jit-bridge-any (&rest args)
   "Late-bound target of a #'NAME value thunk: resolve the name whose index the

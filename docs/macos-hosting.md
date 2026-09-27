@@ -1,6 +1,6 @@
 # Hosted macOS (and the road to iOS)
 
-Written 2026-09-26.  Status: **M1 started** — the compiler rule for runtime-data accesses is in (see the inventory); nothing moves yet.
+Written 2026-09-26.  Status: **M1 in progress** — the runtime-data region moves (option B, verified on aarch64 Linux); heap, JIT arena and code VA do not yet.
 
 ## Goal
 
@@ -93,41 +93,76 @@ while the base IS `0x10000000`.  **Once the base moves, a missed call site is a
 correctness bug.**  M1's invariant flips from "folding is an optimisation" to
 "every runtime-data address is base-relative".
 
-- **Translator-emitted addresses — largely ready.**  They go through
-  `a64-load-conv-addr` (~10 call sites).  Remaining: move it off x18, and
-  audit the `a64-load-imm64-general` paths (GC trampoline, signal stub).
-- **Runtime Lisp source, `mem-ref`/`mem-set` address operands — the
-  compiler rule is in.**  Shaped like the x64 per-thread window: the literal
-  stays a *virtual* address, and a provable access (a constant in
-  `[0x10000000, 0x40000000)`, or that constant plus an index) carries
-  `+width-conv-bit+` (8), telling a back-end to add the region's delta at that
-  access.  `*conv-relative*` turns it on, host-side in `build-aarch64-cli` and
-  in the aarch64 JIT co-init.  The three hand-emitted global-cache loads now go
-  through the same helper.  The AArch64 translator still masks the bit, so
-  today it changes widths, not execution.  Verified: flag-off and flag-on
-  aarch64 CLI, and the x64 CLI, are per-function identical except the edited
-  compiler functions (every other diff is a branch, `movabs` or RIP-relative
-  displacement); the JIT smoke test (MV, handler-case, unwind-protect, raw
-  argc read, GC) matches the baseline under OrbStack.
-  `MODUS_CONV_AUDIT=<path>` writes what the rule saw: **3968 accesses proved,
-  all in the first MB (`0x10000000`–`0x100FFFFF`); 199 not provable (100
-  distinct forms: 142 `(+ …)` over a variable base, 50 variables, 7 accessor
-  calls)**.  Those 199 are the value audit's entry list; not all of them reach the
-  region (many look like heap buffers — unverified).
-  Next: the translator side (a delta register, `ldr [xa, xdelta]` costs no
-  extra instruction), which is also the x18 decision.
-- **Runtime Lisp source, literals used as values — ~131 uses.**  Arithmetic,
-  tables, arguments like `(%gc-init … #x08000000)`.  One-by-one review: an
-  address needs an explicit base-relative form (an intrinsic such as
-  `%conv-addr`); a plain number stays.  The largest manual chunk, and where
-  the Pi bug lived.
-- **The image base, `0x400000` — 8 uses** (boot, cross, actors, hosted
-  files): becomes `:code-vaddr-base`.
-- **Out-of-window region addresses** — the handler-frame stack
-  (`0x10010000`), the JIT exec bounds (`%jit-exec-lo`/`-hi`, `0x14000000`/
-  `0x18000000`), file-I/O buffers in `cl-fileio` (`0x1DD00000`–`0x1DF00000`),
-  and a cluster at `0x1E2…`/`0x1E6…` in the translator: covered by the review
-  above, each checked for being an address.
+### Moving the data region: option B, a link-time delta (2026-09-26)
+
+Two ways were on the table: a runtime base register (A), or a link-time
+constant (B).  **B was chosen**: arm64 macOS has no spare register (x18 is
+Apple's; x19–x28 are all taken — vreg homes, alloc pointer/limit, NIL, closure
+env, GC trampoline VA), and the code already needs a fixed VA because it is not
+PIC, so fixing the data VA is the same bet.  A remains the route if iOS forces
+true PIC.
+
+The region `[0x10000000, 0x40000000)` has a **virtual** address (what the
+source says) and a **real** one: real = virtual + `*conv-delta*`, a build
+constant (`MODUS_CONV_DELTA`, hex; default 0 = unmoved).  `conv-real` maps one
+to the other.  Every kind of reference is rebased at compile or translate time:
+
+- **`mem-ref` operands the compiler can prove** — a constant (literal or
+  `defconstant`), or constant + index.  `compile-mem-ref` / `compile-setf`
+  compile the rebased form; the access also carries `+width-conv-bit+` and is
+  recorded by `MODUS_CONV_AUDIT`.  Gated by `*conv-relative*`.
+- **Addresses used as values** — `(%conv-addr K)` in runtime source: returned
+  from accessor defuns, passed to `%gc-read64` / `%core-slice` /
+  `%gc-forward-slot`, stored in defvars (the file-I/O buffers).  Substituted by
+  `%conv-subst` before a top-level form is compiled, so the compiler's
+  source-shape analyses see the literal (without that, `%gc-region-0` lost its
+  MV-count store).  About 70 sites across gc, save-image, mvm-eval, prelude,
+  cl-fileio, mcgc-pin, interp and the hosted net files — including files the
+  CLI bakes as SOURCE TEXT and evaluates at boot (`net/cooperative-atomics.lisp`
+  and the sb-* shims), which a scan of the compiled file list misses.  The
+  pre-pass runs on every form the image evaluates, so it hashes each list head
+  once against read-time constants: written with two `name-eq`s it cost 2.7 MB
+  of boot allocation, now 0.4 MB (0.8%).
+- **Compiler-emitted IR** — the MV buffer, the global-cell cache root, the
+  binding gate, the handler-active check: `conv-real` at the `:li`.
+- **Translator** — x18 holds the region's REAL base, so the fold window stays
+  one `add`; everything outside it (`a64-load-conv-addr`'s other arm,
+  `a64-load-imm64-general` sites, the GC trampoline's roots, seven hand-split
+  MOVZ/MOVK pairs, the constvec root, the x18 reload after longjmp) goes
+  through `conv-real`.
+- **Boot + ELF** — when moved, the ELF segment ends at `0x10000000` and the
+  boot stub maps the region at its real base (`MAP_FIXED_NOREPLACE`, exit 97
+  on refusal) before its first store.  The argv copy blocks now patch their
+  own skip branch, since a high address takes more than two words.
+- **Cross-emit** (`--compile`, `--compile-aarch64`) resets both variables:
+  the images it writes are ordinary, unmoved Linux ELFs.
+
+**Verified.**  Delta 0 is neutral: the aarch64 and x64 CLIs are per-function
+identical to the pre-change build for every runtime function — only the
+compiler, translator and boot functions that were edited differ, and every
+other difference is a branch, `movabs` or RIP-relative displacement.  With
+`MODUS_CONV_DELTA=7000000000` the region lives at `0x7010000000` with **nothing
+mapped at the old address**, so a missed site faults rather than passing by
+luck; the smoke, stress (17 collections, file I/O, CLOS, restarts, hash
+tables) and GC-count probes give identical output to the baseline.
+
+**Differential testing** is the gate for this: every `test/*.lisp` runs under
+the baseline image and the moved one, and the outputs are compared.  A
+difference is either a missed site or a test that prints an address.  The
+first run found the source-baked `%atomics-lock-addr` (via `hosted-atomics`).
+Final run: **67 of 72 byte-identical**; the other five differ only in printed
+addresses — `hosted-atomics` (the lock word) and the four `region-gc*` tests
+(control-block address, address-bearing checksums) — with identical `ok`
+counts, and `region-gc`'s one FAIL is on the baseline too.  (Run the tests
+with stdin from `/dev/null`: a REPL that inherits a pipe eats the rest of it.)  Cross-emit from the moved image writes
+x64 and aarch64 ELFs byte-identical to the baseline's.
+
+Not moved yet: the heap (`0x2000000000`) and the JIT arena (`0x3000000000`),
+both of which macOS may refuse (128 GB was EPERM in the probe), and the code
+itself (`:code-vaddr-base`).  x18 is still the base register, which Darwin
+forbids — on Darwin the fold arm becomes a plain immediate load.
+The interpreter honours the move for its simulated MV buffer; it still
+masks `+width-conv-bit+`, which is correct because addresses arrive real.
 
 True PIC remains the fallback if iOS forbids the remap or its address-space
 limit leaves no room for a fixed VA.
@@ -161,7 +196,8 @@ trivial MVM program (no runtime) that writes and exits, link it with Apple
 `ld`, run it on macOS.  Proves the toolchain path and the syscall ABI in
 isolation.
 
-**M1 — move modus above 4 GB, on aarch64 LINUX.**  The platform-neutral part
+**M1 — move modus above 4 GB, on aarch64 LINUX.**  *Data region: done
+(option B above).  Remaining: heap, JIT arena, code VA, x18.*  The platform-neutral part
 of the move, done where everything else works and the existing gates can
 prove nothing broke.  Linux loads an `ET_EXEC` at its link address, so no
 remap is needed there yet:

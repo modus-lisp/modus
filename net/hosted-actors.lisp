@@ -714,7 +714,7 @@
 ;;; mvm/build-generic-cli.lisp ratchets this literal against that constant, so
 ;;; the two cannot drift apart silently — a drift would deadlock on the first
 ;;; context switch.
-(defun sched-lock-addr ()    #x10000FC0)
+(defun sched-lock-addr ()    (%conv-addr #x10000FC0))
 (defun sched-state-base ()   (+ (%ha-base) #x140))
 (defun scratch-addr ()       (+ (%ha-base) #x180))
 (defun decode-ptr-addr ()    (+ (%ha-base) #x188))

@@ -16,8 +16,8 @@
 
 ;;; Fixed memory addresses for raw C-string scratch area
 ;;; (well above heap, in unmapped zone — we mmap it lazily via write)
-(defvar *cstr-scratch* #x1DF00000)  ; C-string scratch: up to 4096 bytes
-(defvar *io-buf-addr*  #x1DE00000)  ; Raw I/O buffer: 4096 bytes
+(defvar *cstr-scratch* (%conv-addr #x1DF00000))  ; C-string scratch: up to 4096 bytes
+(defvar *io-buf-addr*  (%conv-addr #x1DE00000))  ; Raw I/O buffer: 4096 bytes
 
 ;;; ============================================================
 ;;; THE STAGING PAGE IS A SEAM, because ONE PAGE IS NOT ENOUGH FOR TWO THREADS
@@ -71,7 +71,7 @@
   (when (null *scratch-mmapped*)
     (setq *scratch-mmapped* t)
     ;; mmap #x1DE00000 with 2 pages (8KB) for I/O buf + C-string
-    (syscall3 9 #x1DE00000 8192)  ;; hint addr (already tagged — syscall3 untags)
+    (syscall3 9 (%conv-addr #x1DE00000) 8192)  ;; hint addr (already tagged — syscall3 untags)
     ;; Actually use raw syscall for mmap with full args:
     ;; We can't call syscall3 with 6 args. Instead, use the fixed buffers
     ;; already mapped by the Linux ELF entry (heap is 896MB at 0x10000000).
@@ -1579,7 +1579,7 @@
 ;;; until eof, accumulating name strings.  Falls back to NIL on bare
 ;;; metal where the syscall isn't available.
 
-(defvar *%dirent-buf-addr* #x1DD00000)  ; 1MB scratch for getdents
+(defvar *%dirent-buf-addr* (%conv-addr #x1DD00000))  ; 1MB scratch for getdents
 (defvar *%dirent-buf-size* 4096)
 
 (defun %sys-getdents64 (fd buf-addr buf-size)

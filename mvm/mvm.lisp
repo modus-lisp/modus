@@ -764,10 +764,12 @@
 ;;; ---- CONVENTION-REGION BIT (bit 3 = "this address is a VIRTUAL address in
 ;;; the runtime-data region") ------------------------------------------------
 ;;;
-;;; The same trick as the thread-local bit, for the same reasons: the address
-;;; operand is a literal in [+CONV-REGION-BASE+, +CONV-REGION-END+) (see
-;;; compiler.lisp, THE CONVENTION REGION), and a back-end that has moved the
-;;; region adds the region's delta at this one access.  Unlike the TLS bit it
+;;; The address operand provably names a word of the runtime-data region
+;;; [+CONV-REGION-BASE+, +CONV-REGION-END+) (compiler.lisp, THE CONVENTION
+;;; REGION).  The compiler has already rebased it to the region's real place,
+;;; so no back-end needs to act on the bit today; it records intent, for the
+;;; audit and for a base-register back-end should one ever be needed.  Unlike
+;;; the TLS bit it
 ;;; is NOT masked by every back-end: 68k/arm32/ppc/riscv decode the width with
 ;;; a bare ECASE.  So the compiler only sets it when *CONV-RELATIVE* is on,
 ;;; and only builds whose back-end masks or implements it turn that on

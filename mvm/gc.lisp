@@ -155,8 +155,8 @@
    The :CPU-ID slot is read TAGGED (percpu-ref yields the machine word, and
    that slot holds a tagged fixnum), so the value IS the CPU number."
   (if (= (mem-ref #x10000FF8 :u32) 0)
-      #x10000F08
-      (+ #x10000F08 (* (percpu-ref 16) 8))))
+      (%conv-addr #x10000F08)
+      (+ (%conv-addr #x10000F08) (* (percpu-ref 16) 8))))
 
 (defun %gc-region ()
   "Raw byte address of the ACTIVE region's control block; 0 means region 0."
@@ -164,7 +164,7 @@
     (let ((lo (mem-ref cell :u32))
           (hi (mem-ref (+ cell 4) :u32)))
       (if (= hi 0)
-          (if (= lo 0) #x10000040 lo)
+          (if (= lo 0) (%conv-addr #x10000040) lo)
           (+ (* (* hi 65536) 65536) lo)))))
 
 (defun %gc-set-region (base)
@@ -176,7 +176,7 @@
       (setf (mem-ref cell :u32) lo)
       (setf (mem-ref (+ cell 4) :u32) hi))))
 
-(defun %gc-region-0 () #x10000040)
+(defun %gc-region-0 () (%conv-addr #x10000040))
 
 ;;; ============================================================
 ;;; GC Metadata Field Accessors
@@ -544,7 +544,7 @@
    per-CPU gate is on.  See the block comment above."
   (let ((b (mem-ref #x10000EC8 :u64)))
     (if (= b 0)
-        #x10000100
+        (%conv-addr #x10000100)
         (if (= (mem-ref #x10000FF8 :u32) 0)
             b
             (+ b (* (percpu-ref 16) 32))))))
@@ -1084,19 +1084,19 @@
    it does not cover and cannot."
   ;; The global-cell cache vector: compiled special reads load their cell
   ;; through it (prelude %GV-REF-FILL), so it is a root like any other.
-  (let ((fp (%gc-forward-slot #x10000FA0 from-start from-size free-ptr sc)))
+  (let ((fp (%gc-forward-slot (%conv-addr #x10000FA0) from-start from-size free-ptr sc)))
     ;; The globals alist head pointer itself
-    (setq fp (%gc-forward-slot #x10000080 from-start from-size fp sc))
+    (setq fp (%gc-forward-slot (%conv-addr #x10000080) from-start from-size fp sc))
     ;; The symbol intern table head pointer
-    (setq fp (%gc-forward-slot #x10000088 from-start from-size fp sc))
+    (setq fp (%gc-forward-slot (%conv-addr #x10000088) from-start from-size fp sc))
     ;; The keyword intern table (0x10000148) and package-by-hash table
     ;; (0x10000170) are ALSO heap roots — both are hash-tables interned
     ;; into during runtime EVAL.  Missing them stranded keywords/symbols
     ;; in dead from-space after a collection, faulting the next deref.
     ;; (This mirrors the x64 inline trampoline fix in translate-x64.lisp;
     ;; keep the two root sets in sync.)
-    (setq fp (%gc-forward-slot #x10000148 from-start from-size fp sc))
-    (setq fp (%gc-forward-slot #x10000170 from-start from-size fp sc))
+    (setq fp (%gc-forward-slot (%conv-addr #x10000148) from-start from-size fp sc))
+    (setq fp (%gc-forward-slot (%conv-addr #x10000170) from-start from-size fp sc))
     ;; NOTE: the pre-interned signal-condition symbols at 0xCA0/0xCA8/0xCB0
     ;; (%init-signal-symbols) are deliberately NOT scanned: they are
     ;; interned native MVM symbols already forwarded via the symbol intern
@@ -1114,12 +1114,12 @@
     ;; is exact for any plausible count.  Historically this read the halved
     ;; :u64 value and shifted again, yielding count/2 — the extras scan was
     ;; silently short by half.
-    (let ((count (ash (%gc-word-lo +mv-count-addr+) -1)))
+    (let ((count (ash (%gc-word-lo (%conv-addr +mv-count-addr+)) -1)))
       (when (>= count 2)
         (let ((i 0))
           (loop
             (when (>= i (- count 1)) (return))
-            (setq fp (%gc-forward-slot (+ +mv-values-addr+ (* i 8))
+            (setq fp (%gc-forward-slot (+ (%conv-addr +mv-values-addr+) (* i 8))
                                        from-start from-size fp sc))
             (setq i (+ i 1))))))
     fp))
@@ -1413,7 +1413,7 @@
    where boot ASSEMBLY stores it raw.  That is the same split the eight
    control-block fields have, and it has the same answer: the config word
    follows THIS TARGET's metadata convention, so read it in that scale."
-  (%gc-meta-read #x10000E00 (%gc-meta-scale)))
+  (%gc-meta-read (%conv-addr #x10000E00) (%gc-meta-scale)))
 
 (defun %gc-region-align-check (from to size)
   "0 if a region with semispaces at FROM and TO, each SIZE bytes, satisfies the
@@ -1440,11 +1440,11 @@
 ;;; violation, and the mask of the LAST one, at two BSS words that are zero in
 ;;; every image until something violates the rule.  A test asserts the count is
 ;;; zero; that is what makes this a checked invariant rather than a comment.
-(defun %gc-region-align-violations () (%gc-read64 #x10000ED0))
-(defun %gc-region-align-last ()       (%gc-read64 #x10000ED8))
+(defun %gc-region-align-violations () (%gc-read64 (%conv-addr #x10000ED0)))
+(defun %gc-region-align-last ()       (%gc-read64 (%conv-addr #x10000ED8)))
 (defun %gc-region-align-reset ()
-  (%gc-write64 #x10000ED0 0)
-  (%gc-write64 #x10000ED8 0)
+  (%gc-write64 (%conv-addr #x10000ED0) 0)
+  (%gc-write64 (%conv-addr #x10000ED8) 0)
   0)
 
 (defun %gc-region-init (rcb from to size stack-base k)
@@ -1461,8 +1461,8 @@
     (if (= v 0)
         0
         (progn
-          (%gc-write64 #x10000ED0 (+ (%gc-read64 #x10000ED0) 1))
-          (%gc-write64 #x10000ED8 v))))
+          (%gc-write64 (%conv-addr #x10000ED0) (+ (%gc-read64 (%conv-addr #x10000ED0)) 1))
+          (%gc-write64 (%conv-addr #x10000ED8) v))))
   (%gc-meta-write rcb from k)
   (%gc-meta-write (+ rcb #x08) to k)
   (%gc-meta-write (+ rcb #x10) size k)

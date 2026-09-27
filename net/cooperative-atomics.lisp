@@ -477,9 +477,9 @@
 ;;; typical / 260 s worst for ten sends, versus 0.1 s with the read-only wait).
 ;;; A `:u8' load is tagged on the way out, so the value IS the raw byte.
 
-(defun %atomics-lock-addr () #x10000FE0)
+(defun %atomics-lock-addr () (%conv-addr #x10000FE0))
 
-(defun %atomics-acquisitions-addr () #x10000FE8)
+(defun %atomics-acquisitions-addr () (%conv-addr #x10000FE8))
 
 (defun %atomics-acquisitions ()
   "How many times the ARMED path has taken the lock.  Zero on every unarmed

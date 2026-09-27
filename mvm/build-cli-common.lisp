@@ -547,8 +547,17 @@
 ;; AArch64 co-init.  Same role as %init-x64-translator: populate the tables the
 ;; translator's defvar init-thunks would have filled (limitation #7).  Verbatim
 ;; from build-ansi-common.lisp's *aarch64-translator-coinit-source*.
+;; docs/macos-hosting.md option B: where the runtime-data region really is,
+;; as an offset from its virtual base 0x10000000.  MODUS_CONV_DELTA (hex),
+;; default 0 = unmoved.  Read ONCE here so the host build (build-aarch64-cli)
+;; and the JIT co-init below bake the same number: fixed code and runtime-
+;; compiled code must agree on where the region is.
+(defvar *cli-conv-delta*
+  (let ((v (sb-ext:posix-getenv "MODUS_CONV_DELTA")))
+    (if (and v (plusp (length v))) (parse-integer v :radix 16) 0)))
+
 (defvar *aarch64-jit-coinit-source*
-  (when (and *jit-on* (eq *cli-arch* :aarch64)) "
+  (when (and *jit-on* (eq *cli-arch* :aarch64)) (concatenate 'string "
 (defun %init-aarch64-translator ()
   (let ((map (make-array 23)))
     (aset map 0 0) (aset map 1 1) (aset map 2 2) (aset map 3 3)
@@ -579,8 +588,9 @@
   ;; runtime reaches the same region, and once it moves an unmarked access
   ;; would read the old address.  The x64 TLS window learned this the hard way.
   (setq *conv-relative* t)
+  (setq *conv-delta* " (princ-to-string *cli-conv-delta*) ")
   t)
-"))
+")))
 
 ;;; The assembled translator slot, spliced into *all-runtime-source* and
 ;;; *full-source* as ONE unit.  Both arches: <encoder?> <translator> <co-init>,

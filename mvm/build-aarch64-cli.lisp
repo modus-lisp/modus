@@ -1172,6 +1172,12 @@
     (setq *setf-expanders* (make-hash-table :test (quote eql))))
   (%init-x64-translator)
   (%init-selfhost-targets)
+  ;; The ELFs --compile / --compile-aarch64 emit are ordinary Linux images
+  ;; with the runtime-data region at its historic place.  THIS image may have
+  ;; moved its own (docs/macos-hosting.md option B); the co-init set the
+  ;; compiler to match, and that must not leak into another image.
+  (setq *conv-relative* nil)
+  (setq *conv-delta* 0)
   t)
 (defun %ce-sys-close (fd) (syscall3 3 fd 0 0))
 (defun %ce-slurp-text (path)
@@ -1374,6 +1380,11 @@
 ;; bytecode widths and nothing it executes.  Its twin is in the JIT co-init
 ;; (build-cli-common.lisp); the two must agree.
 (setf *conv-relative* t)
+;; ...and move it, when MODUS_CONV_DELTA says so (read once, in
+;; build-cli-common, so the JIT co-init bakes the same value).
+(setf *conv-delta* cl-user::*cli-conv-delta*)
+(format t "~%  Runtime-data region: #x~X (delta #x~X)~%"
+        (conv-real +conv-region-base+) *conv-delta*)
 ;; MODUS_CONV_AUDIT=<path>: write every MEM-REF access the rule saw — function,
 ;; address form, and whether it was proved — for the value audit.
 (let ((ca (sb-ext:posix-getenv "MODUS_CONV_AUDIT")))

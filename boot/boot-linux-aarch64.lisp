@@ -211,8 +211,14 @@
     (mvm-emit-u64 buf load-addr)
     (mvm-emit-u64 buf load-addr)
     (mvm-emit-u64 buf (+ header-total raw-len))
-    (mvm-emit-u64 buf (+ header-total raw-len
-                         (or bss-size +linux-aarch64-heap-size+)))
+    ;; p_memsz: the image plus its BSS tail, which holds the runtime-data
+    ;; region at 0x10000000.  When that region has moved (docs/macos-hosting.md
+    ;; option B) the boot stub maps it at its real base, and the segment ends
+    ;; at 0x10000000 so any access still aimed at the OLD address faults.
+    (mvm-emit-u64 buf (if (eql (conv-real +conv-region-base+) +conv-region-base+)
+                          (+ header-total raw-len
+                             (or bss-size +linux-aarch64-heap-size+))
+                          (- +conv-region-base+ load-addr)))
     (mvm-emit-u64 buf page-align)     ; 64K on AArch64, 4K elsewhere
     (loop for b across raw-bytes do (mvm-emit-byte buf b))
     (loop for b across shstrtab-bytes do (mvm-emit-byte buf b))
@@ -279,13 +285,36 @@
   ;; LDR x21, [SP, #24]  — argv[2] → x21
   (emit-aarch64-u32 buf #xF9400FF5)
 
+  ;; THE RUNTIME-DATA REGION (docs/macos-hosting.md, option B).  Unmoved
+  ;; (*conv-delta* 0) it is the ELF's own BSS tail and nothing is emitted
+  ;; here.  Moved, the ELF stops at 0x10000000 (wrap-in-elf64-le-aa64) and the
+  ;; region is mapped at its real base FIRST, before any store into it:
+  ;; MAP_FIXED_NOREPLACE so a collision fails loudly instead of clobbering, and
+  ;; exit 97 when the kernel will not give us that address.  Anonymous memory
+  ;; is zeroed, which the ~900 MB BSS tail never reliably was.
+  (unless (eql (conv-real +conv-region-base+) +conv-region-base+)
+    (emit-aarch64-load-imm64 buf 0 (conv-real +conv-region-base+))
+    (emit-aarch64-load-imm64 buf 1 (- +conv-region-end+ +conv-region-base+))
+    (emit-aarch64-load-imm64 buf 2 3)          ; PROT_READ|WRITE
+    (emit-aarch64-load-imm64 buf 3 #x104022)   ; PRIV|ANON|NORESERVE|FIXED_NOREPLACE
+    (emit-aarch64-load-imm64 buf 4 #xFFFFFFFFFFFFFFFF)
+    (emit-aarch64-load-imm64 buf 5 0)
+    (emit-aarch64-load-imm64 buf 8 222)        ; mmap
+    (emit-aarch64-u32 buf #xD4000001)          ; SVC #0
+    (emit-aarch64-load-imm64 buf 16 (conv-real +conv-region-base+))
+    (emit-aarch64-u32 buf #xEB10001F)          ; CMP x0, x16
+    (emit-aarch64-u32 buf (logior #x54000000 (ash 4 5)))   ; B.EQ +4
+    (emit-aarch64-load-imm64 buf 0 97)         ; exit(97): region not mappable
+    (emit-aarch64-load-imm64 buf 8 93)
+    (emit-aarch64-u32 buf #xD4000001))         ; SVC #0
+
   ;; Store argc as 32-bit at [0x10000200].
-  (emit-aarch64-load-imm64 buf 16 #x10000200)
+  (emit-aarch64-load-imm64 buf 16 (conv-real #x10000200))
   ;; STR w19, [x16, #0]
   (emit-aarch64-u32 buf #xB9000213)
 
   ;; Zero-fill 128 bytes at 0x10000208.
-  (emit-aarch64-load-imm64 buf 16 #x10000208)
+  (emit-aarch64-load-imm64 buf 16 (conv-real #x10000208))
   (dotimes (i 16)
     ;; STR XZR, [x16, #(i*8)]
     (emit-aarch64-u32 buf (logior #xF9000000 (ash i 10) (ash 16 5) 31)))
@@ -297,38 +326,30 @@
   ;; copy, the fixed buffers stay zeroed and `(%parse-decimal-at-fixed-208)`
   ;; returns 0 — *skip-below* / *run-only-below* end up 0, every shard
   ;; runs the full suite, and the per-test range arguments are silently
-  ;; ignored.  Each block is 13 fixed-size instructions; we hand-encode
-  ;; the relative branches (offset19 in word units) below.
-
-  ;; argv[1] → 0x10000208 (max 63 bytes, source already null-terminated)
-  (emit-aarch64-u32 buf #xF100067F)   ; CMP x19, #1
-  (emit-aarch64-u32 buf #x5400018D)   ; B.LE +12 (skip 12 insns to next block)
-  (emit-aarch64-u32 buf #xAA1403E9)   ; MOV x9, x20      (src = argv[1])
-  (emit-aarch64-u32 buf #xD280410A)   ; MOVZ x10, #0x208
-  (emit-aarch64-u32 buf #xF2A2000A)   ; MOVK x10, #0x1000, LSL #16  (dst = 0x10000208)
-  (emit-aarch64-u32 buf #x528007EB)   ; MOVZ w11, #63    (max bytes)
-  (emit-aarch64-u32 buf #x3940012C)   ; LDRB w12, [x9]
-  (emit-aarch64-u32 buf #x340000CC)   ; CBZ w12, +6      (null term → exit loop)
-  (emit-aarch64-u32 buf #x3900014C)   ; STRB w12, [x10]
-  (emit-aarch64-u32 buf #x91000529)   ; ADD x9, x9, #1
-  (emit-aarch64-u32 buf #x9100054A)   ; ADD x10, x10, #1
-  (emit-aarch64-u32 buf #x5100016B)   ; SUB w11, w11, #1
-  (emit-aarch64-u32 buf #x35FFFF4B)   ; CBNZ w11, -6     (back to LDRB)
-
-  ;; argv[2] → 0x10000248 (same shape, different src/dst)
-  (emit-aarch64-u32 buf #xF1000A7F)   ; CMP x19, #2
-  (emit-aarch64-u32 buf #x5400018D)   ; B.LE +12
-  (emit-aarch64-u32 buf #xAA1503E9)   ; MOV x9, x21      (src = argv[2])
-  (emit-aarch64-u32 buf #xD280490A)   ; MOVZ x10, #0x248
-  (emit-aarch64-u32 buf #xF2A2000A)   ; MOVK x10, #0x1000, LSL #16  (dst = 0x10000248)
-  (emit-aarch64-u32 buf #x528007EB)   ; MOVZ w11, #63
-  (emit-aarch64-u32 buf #x3940012C)   ; LDRB w12, [x9]
-  (emit-aarch64-u32 buf #x340000CC)   ; CBZ w12, +6
-  (emit-aarch64-u32 buf #x3900014C)   ; STRB w12, [x10]
-  (emit-aarch64-u32 buf #x91000529)   ; ADD x9, x9, #1
-  (emit-aarch64-u32 buf #x9100054A)   ; ADD x10, x10, #1
-  (emit-aarch64-u32 buf #x5100016B)   ; SUB w11, w11, #1
-  (emit-aarch64-u32 buf #x35FFFF4B)   ; CBNZ w11, -6
+  ;; ignored.  The destination is the region's REAL address, which may take
+  ;; more than the two MOVZ/MOVK words these blocks once hand-encoded, so the
+  ;; B.LE that skips a block is patched from where the block actually ends.
+  (flet ((copy-argv (cmp-insn mov-src dst)
+           (emit-aarch64-u32 buf cmp-insn)
+           (let ((ble-at (a64-buffer-position buf)))
+             (emit-aarch64-u32 buf 0)                ; B.LE <next block>, patched
+             (emit-aarch64-u32 buf mov-src)          ; MOV x9, argv[n]
+             (emit-aarch64-load-imm64 buf 10 (conv-real dst))
+             (emit-aarch64-u32 buf #x528007EB)       ; MOVZ w11, #63    (max bytes)
+             (emit-aarch64-u32 buf #x3940012C)       ; LDRB w12, [x9]
+             (emit-aarch64-u32 buf #x340000CC)       ; CBZ w12, +6      (null term → exit loop)
+             (emit-aarch64-u32 buf #x3900014C)       ; STRB w12, [x10]
+             (emit-aarch64-u32 buf #x91000529)       ; ADD x9, x9, #1
+             (emit-aarch64-u32 buf #x9100054A)       ; ADD x10, x10, #1
+             (emit-aarch64-u32 buf #x5100016B)       ; SUB w11, w11, #1
+             (emit-aarch64-u32 buf #x35FFFF4B)       ; CBNZ w11, -6     (back to LDRB)
+             (setf (aref (a64-buffer-code buf) ble-at)
+                   (logior #x5400000D                ; B.LE
+                           (ash (- (a64-buffer-position buf) ble-at) 5))))))
+    ;; argv[1] → 0x10000208 (max 63 bytes, source already null-terminated)
+    (copy-argv #xF100067F #xAA1403E9 #x10000208)   ; CMP x19, #1 / MOV x9, x20
+    ;; argv[2] → 0x10000248 (same shape, different src/dst)
+    (copy-argv #xF1000A7F #xAA1503E9 #x10000248))  ; CMP x19, #2 / MOV x9, x21
 
   ;; mmap heap:
   ;;   x0=hint=0x10000000, x1=size, x2=PROT_RW(3), x3=MAP_PRIV|ANON(0x22),
@@ -381,7 +402,7 @@
   (emit-aarch64-load-imm64 buf 16 +linux-aarch64-jit-arena-base+)
   (emit-aarch64-u32 buf #xEB10001F)   ; CMP x0, x16
   (emit-aarch64-u32 buf #x9A9F0000)   ; CSEL x0, x0, xzr, EQ
-  (emit-aarch64-load-imm64 buf 17 #x10000F58)
+  (emit-aarch64-load-imm64 buf 17 (conv-real #x10000F58))
   (emit-aarch64-u32 buf #xF9000220)   ; STR x0, [x17]
 
   ;; Save argc/argv at heap base for Lisp reachability.
@@ -408,7 +429,7 @@
   ;; gc.lisp's (mem-ref :u64) reads back (see the defvar docstring).
   (flet ((maybe-shl () (when *linux-aarch64-gc-metadata-shl*
                          (emit-aarch64-u32 buf #x8B0A014A))))  ; ADD x10,x10,x10
-    (emit-aarch64-load-imm64 buf 17 +gc-from-start-addr+)
+    (emit-aarch64-load-imm64 buf 17 (conv-real +gc-from-start-addr+))
     ;; from_start = mmap+alloc_start
     (emit-aarch64-u32 buf #xAA1603EA)   ; MOV x10, x22
     (emit-aarch64-load-imm64 buf 16 +linux-aarch64-heap-alloc-start+)
@@ -449,7 +470,7 @@
   ;; case by case but kept needing fresh patches; this fixes the root.
   (emit-aarch64-load-imm64 buf 26 #xDEAD0001)
   ;; x18 = convention-block base #x10000000 (translate-aarch64 *a64-x18-base*)
-  (emit-aarch64-load-imm64 buf 18 #x10000000)
+  (emit-aarch64-load-imm64 buf 18 (conv-real #x10000000))
 
   ;; NATIVE MCGC: reserve x28 = the GC trampoline's absolute VA, loaded once
   ;; at boot, so every gc-check fire site is a single range-unlimited

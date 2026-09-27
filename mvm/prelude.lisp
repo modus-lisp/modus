@@ -2252,8 +2252,8 @@
   (let ((lo (mem-ref #x10000C30 :u32))
         (hi (mem-ref #x10000C34 :u32)))
     (if (eql hi 0)
-        (if (eql lo 0) 0 (+ #x10000000 lo))
-        (+ #x10000000 (+ (* (* hi 65536) 65536) lo)))))
+        (if (eql lo 0) 0 (+ (%conv-addr #x10000000) lo))
+        (+ (%conv-addr #x10000000) (+ (* (* hi 65536) 65536) lo)))))
 
 (defun %dynb-depth (blk)
   "Number of live dynamic bindings on this thread's stack.  Stored TAGGED so

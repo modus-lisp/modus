@@ -244,11 +244,11 @@
     ;; When the CODE is linked above the old region (the hosted layout's
     ;; :code-base) there is no BSS tail to keep at all: the segment is the file
     ;; plus a page of slack.
-    (mvm-emit-u64 buf (cond ((eql (conv-real +conv-region-base+) +conv-region-base+)
+    (mvm-emit-u64 buf (cond ((>= load-addr +conv-region-end+)
+                             (+ header-total raw-len #x10000))
+                            ((eql (conv-real +conv-region-base+) +conv-region-base+)
                              (+ header-total raw-len
                                 (or bss-size +linux-aarch64-heap-size+)))
-                            ((>= load-addr +conv-region-end+)
-                             (+ header-total raw-len #x10000))
                             (t (- +conv-region-low+ load-addr))))
     (mvm-emit-u64 buf page-align)     ; 64K on AArch64, 4K elsewhere
     (loop for b across raw-bytes do (mvm-emit-byte buf b))
@@ -323,7 +323,13 @@
   ;; MAP_FIXED_NOREPLACE so a collision fails loudly instead of clobbering, and
   ;; exit 97 when the kernel will not give us that address.  Anonymous memory
   ;; is zeroed, which the ~900 MB BSS tail never reliably was.
-  (unless (eql (conv-real +conv-region-base+) +conv-region-base+)
+  ;; Also when the CODE is linked high with the region unmoved (delta 0): then
+  ;; there is no ELF BSS tail to hold the region either, so map it at its own
+  ;; (virtual = real) address.  That layout is stock in every respect except
+  ;; code placement, which is what makes it the gate's baseline for a
+  ;; >252 MB image.
+  (when (or (not (eql (conv-real +conv-region-base+) +conv-region-base+))
+            (>= (linux-aarch64-code-base) +conv-region-end+))
     (emit-aarch64-load-imm64 buf 0 (conv-real +conv-region-low+))
     (emit-aarch64-load-imm64 buf 1 (- +conv-region-end+ +conv-region-low+))
     (emit-aarch64-load-imm64 buf 2 3)          ; PROT_READ|WRITE
@@ -540,13 +546,13 @@
    hosted layout moves it (MODUS_CODE_BASE; docs/macos-hosting.md).  Linux
    maps an ET_EXEC at its p_vaddr, so on Linux moving it is only a link-time
    change; macOS will remap the signed pages there.  A code base above the
-   old runtime-data region needs that region moved too — there is no BSS
-   tail at 0x10000000 any more — and code above 4 GB needs the translator's
+   old runtime-data region has no BSS tail to hold the region, so the boot
+   stub maps it (moved or not), and code above 4 GB needs the translator's
    wide code-address placeholders; both are checked here, at build time."
   (let ((base (hosted-layout :code-base +linux-aarch64-load-addr+)))
-    (when (and (>= base +conv-region-low+)
-               (eql (conv-real +conv-region-base+) +conv-region-base+))
-      (error "code base #x~X needs the runtime-data region moved (MODUS_CONV_DELTA)" base))
+    (when (and (>= base +conv-region-low+) (< base +conv-region-end+))
+      (error "code base #x~X lies inside the runtime-data region [#x~X, #x~X)"
+             base +conv-region-low+ +conv-region-end+))
     (when (and (>= base (ash 1 32)) (not *a64-code-addr-wide*))
       (error "code base #x~X is above 4 GB but *A64-CODE-ADDR-WIDE* is off" base))
     base))

@@ -476,8 +476,8 @@
 ;;; SI:PROCESS-SPARE-SLOT-4 -- where bordeaux v1 parks a thread's return
 ;;; values.  A table keyed by process, made at install (on main).  Stores go
 ;;; through %RT-ENTER so the table's own entries land in the immortal arena
-;;; rather than the storing worker's region.  The VALUE is the worker's, and
-;;; is good for as long as the shim's JOIN-THREAD value is (see the shim).
+;;; rather than the storing worker's region, and the value list is copied
+;;; there as well (its elements are still the worker's).
 (defvar %genera-spare-slots (make-hash-table :test 'eq))
 (defun si::process-spare-slot-4 (p)
   (%rt-enter)
@@ -485,8 +485,11 @@
     (%rt-leave)
     v))
 (defun (setf si::process-spare-slot-4) (value p)
+  ;; The VALUE is copied here, under the lock, so its spine lives in region 0
+  ;; too: bordeaux joins by waiting for the process to die and reading this
+  ;; slot afterwards, and by then the worker's region may be another thread's.
   (%rt-enter)
-  (puthash p %genera-spare-slots value)
+  (puthash p %genera-spare-slots (copy-tree value))
   (%rt-leave)
   value)
 

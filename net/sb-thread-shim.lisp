@@ -221,12 +221,20 @@
                      ;; around the body, which is what SBCL's is.
                      (let ((sb-thread:*current-thread* thread))
                        (setf (car box)
-                             (if arguments
-                                 (apply function arguments)
-                                 (funcall function)))
+                             (%sb-publish-value
+                              (if arguments
+                                  (apply function arguments)
+                                  (funcall function))))
                        (setf (cdr box) t))
                      0))
              (slot (%make-native-thread body)))
+        ;; A FULL TABLE MAY BE FULL OF THE DEAD.  SBCL does not require a
+        ;; thread to be joined, and bordeaux-threads' genera backend never
+        ;; joins natively (it waits for PROCESS-ACTIVE-P to go false), so
+        ;; every thread it started held its slot forever and the sixteenth
+        ;; MAKE-THREAD of a program failed.  Reclaim exited threads, retry once.
+        (when (and (= slot -1) (> (%sb-reap-exited-threads) 0))
+          (setq slot (%make-native-thread body)))
         (if (< slot 0)
             (error "sb-thread:make-thread: no thread could be started (code ~D). ~
                     -1 = all 15 thread slots are in use, -2 = the thread page ~
@@ -250,10 +258,39 @@
           ((%thread-joined thread) nil)
           (t (= (%native-thread-alive-p slot) 1)))))
 
-(defun %sb-forget-thread (thread)
-  (%mutex-lock (%sb-registry-lock))
-  (setq *sb-all-threads* (remove thread *sb-all-threads*))
-  (%mutex-unlock (%sb-registry-lock)))
+(defun %sb-publish-value (v)
+  "V, made safe to outlive the thread that computed it.  A worker allocates in
+   its own GC region and that region is reset when the slot is reused, so a
+   returned list or string would become garbage under JOIN-THREAD's caller.
+   Lists (COPY-TREE) and strings are copied into region 0 under %RT-ENTER;
+   immediates need nothing.  Other objects are returned as they are: their
+   lifetime is still the slot's (see JOIN-THREAD)."
+  (if (or (consp v) (stringp v))
+      (progn (%rt-enter)
+             (let ((c (if (consp v) (copy-tree v) (copy-seq v))))
+               (%rt-leave)
+               c))
+      v))
+
+(defun %sb-reap-exited-threads ()
+  "Free the slot of every thread this layer started that has EXITED without
+   being joined, and return how many.  The thread object keeps answering: it is
+   marked joined, so THREAD-ALIVE-P says NIL and JOIN-THREAD returns its value
+   from the box without looking at a slot that may now be someone else's."
+  (let ((n 0) (dead nil))
+    (%mutex-lock (%sb-registry-lock))
+    (dolist (th *sb-all-threads*)
+      (let ((slot (%thread-slot th)))
+        (when (and slot (not (%thread-joined th))
+                   (zerop (%native-thread-alive-p slot)))
+          (setq dead (cons th dead)))))
+    (dolist (th dead)
+      (setf (slot-value th 'joined) t)
+      (%join-native-thread (%thread-slot th) 1)
+      (setq *sb-all-threads* (remove th *sb-all-threads*))
+      (setq n (+ n 1)))
+    (%mutex-unlock (%sb-registry-lock))
+    n))
 
 (defun sb-thread::join-thread (thread &key (default :%sb-no-default) timeout)
   "Wait for THREAD and return what its function returned.
@@ -276,9 +313,14 @@
    the runtime lock on the way out, or a handshake that copies; neither is done
    here and pretending otherwise would be the worst of the three."
   (let ((slot (%thread-slot thread)))
-    (if (null slot)
+    (cond
+      ((null slot)
         (error 'simple-error :format-control
-               "sb-thread:join-thread: cannot join the main thread.")
+               "sb-thread:join-thread: cannot join the main thread."))
+      ;; Joined before, or reaped: the slot may belong to a newer thread now,
+      ;; so the answer is the box's and never the slot's.
+      ((%thread-joined thread) (car (%thread-box thread)))
+      (t
         (let* ((deadline (if timeout
                              (+ (%monotonic-ns)
                                 (truncate (* timeout 1000000000) 1))
@@ -299,16 +341,22 @@
               (let ((box (%thread-box thread)))
                 ;; The value FIRST, the slot afterwards: releasing the slot is
                 ;; what makes the region reusable.
+                ;; Freed under the registry lock and only if not yet joined:
+                ;; %SB-REAP-EXITED-THREADS may have freed it already, and a
+                ;; second free would release a slot a newer thread now holds.
                 (let ((value (car box)))
-                  (setf (slot-value thread 'joined) t)
-                  (%join-native-thread slot 1000)
-                  (%sb-forget-thread thread)
+                  (%mutex-lock (%sb-registry-lock))
+                  (unless (%thread-joined thread)
+                    (setf (slot-value thread 'joined) t)
+                    (%join-native-thread slot 1000)
+                    (setq *sb-all-threads* (remove thread *sb-all-threads*)))
+                  (%mutex-unlock (%sb-registry-lock))
                   value))
               (if (eq default :%sb-no-default)
                   (error 'simple-error :format-control
                          "sb-thread:join-thread: timed out.")
                   default
-))))))
+)))))))
 
 (defun sb-thread::terminate-thread (thread)
   "NOT IMPLEMENTED, deliberately.  Unwinding another thread means delivering a

@@ -1894,8 +1894,11 @@
                           ;; %RT-ENTER would load whatever %GC-REGION-INIT left
                           ;; in region 0's block.
                           (%gc-region-enter rcb2)
-                          (setq g0 (%gc-meta-read (+ r0 #x20) k))
+                          ;; The window opens AFTER bring-up: %RT-THREADS-ON
+                          ;; compiles ahead in region 0 before any second
+                          ;; thread exists, and may collect it doing so.
                           (if (zerop mode) (%rt-threads-on) 0)
+                          (setq g0 (%gc-meta-read (+ r0 #x20) k))
                           (setq tid (%ha-spawn-t2 (%tl-t2-entry)))
                           (%gc-write64 (+ ctl #x48) (%tl-barrier ctl budget))
                           (%tl-run 0)
@@ -2833,6 +2836,16 @@
             (%gc-write64 (+ res #x00) n)
             (%gc-write64 (+ res #x08) (%ha-nregions))
             (%gc-write64 (+ res #xC0) mode0)
+            ;; COLLECT REGION 0 NOW, while no worker exists.  The spawns below
+            ;; allocate in region 0 (the closures, the first call's compile),
+            ;; and a region-0 collection DURING them runs while the earlier
+            ;; workers are live — the residual race B-LITE documents.  From an
+            ;; empty from-space the spawns cannot fill it.  And COMPILE AHEAD
+            ;; first: %MAKE-NATIVE-THREAD JIT-EAGERs whatever was defined since
+            ;; the last spawn, and the AArch64 in-image translator's garbage
+            ;; alone collected region 0 during the first spawn (measured).
+            (handler-case (jit-eager) (t (c) c))
+            (%gc-collect-here)
             (%gc-write64 (+ res #x20) (%gc-meta-read (+ r0 #x20) (%gc-meta-scale)))
             ;; ---- THIS thread: a real per-CPU block, stamped CPU 0, and only
             ;;      then the mode word.  The order is the one %HA-REGIONS-PERCPU-

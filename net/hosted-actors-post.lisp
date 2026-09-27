@@ -1916,6 +1916,13 @@
 ;;;   +0x08 from-space +512  (must be 1)   +0x10 to-space +512 (must be 2)
 ;;;   +0x18 size +512        (must be 4)   +0x20 all three     (must be 7)
 ;;;   +0x28 violations counted (must be 4) +0x30 last mask     (must be 7)
+(defun %ha-align-probe ()
+  "An offset that breaks the bitmap alignment unit: half of it.  1024 bytes on
+   x86-64 (64-bit BTS); 128 on AArch64, which sets bits a byte at a time
+   (mvm/gc.lisp %GC-REGION-ALIGN-CHECK) — so 512 would be ALIGNED there and the
+   positive control could not answer non-zero."
+  (%layout-if :a64-threads 64 512))
+
 (defun %ha-align-control ()
   "Returns the block above, or 0 if the band could not be carved.  Leaves the
    violation ledger RESET, so a run of the real acceptance audit after this one
@@ -1931,19 +1938,19 @@
         (%ha-zero out (+ out #x40))
         (%gc-region-align-reset)
         (%gc-write64 (+ out #x00) (%gc-region-align-check f tt s))
-        (%gc-write64 (+ out #x08) (%gc-region-align-check (+ f 512) tt s))
-        (%gc-write64 (+ out #x10) (%gc-region-align-check f (+ tt 512) s))
-        (%gc-write64 (+ out #x18) (%gc-region-align-check f tt (+ s 512)))
+        (%gc-write64 (+ out #x08) (%gc-region-align-check (+ f (%ha-align-probe)) tt s))
+        (%gc-write64 (+ out #x10) (%gc-region-align-check f (+ tt (%ha-align-probe)) s))
+        (%gc-write64 (+ out #x18) (%gc-region-align-check f tt (+ s (%ha-align-probe))))
         (%gc-write64 (+ out #x20)
-                     (%gc-region-align-check (+ f 512) (+ tt 512) (+ s 512)))
+                     (%gc-region-align-check (+ f (%ha-align-probe)) (+ tt (%ha-align-probe)) (+ s (%ha-align-probe))))
         ;; ...and the LEDGER, through %GC-REGION-INIT itself, which is the path
         ;; the acceptance audit actually reads.  An aligned init first, so a
         ;; count of 4 also proves it does not count the good one.
         (%gc-region-init rcb f tt s 0 k)
-        (%gc-region-init rcb (+ f 512) tt s 0 k)
-        (%gc-region-init rcb f (+ tt 512) s 0 k)
-        (%gc-region-init rcb f tt (+ s 512) 0 k)
-        (%gc-region-init rcb (+ f 512) (+ tt 512) (+ s 512) 0 k)
+        (%gc-region-init rcb (+ f (%ha-align-probe)) tt s 0 k)
+        (%gc-region-init rcb f (+ tt (%ha-align-probe)) s 0 k)
+        (%gc-region-init rcb f tt (+ s (%ha-align-probe)) 0 k)
+        (%gc-region-init rcb (+ f (%ha-align-probe)) (+ tt (%ha-align-probe)) (+ s (%ha-align-probe)) 0 k)
         (%gc-write64 (+ out #x28) (%gc-region-align-violations))
         (%gc-write64 (+ out #x30) (%gc-region-align-last))
         (%gc-region-align-reset)

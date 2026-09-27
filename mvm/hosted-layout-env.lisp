@@ -67,7 +67,24 @@
     (unless (and v (plusp (length v)) (string/= v "0"))
       (setq *layout-threads* t)
       (unless (getf *layout-plist* :a64-threads)
-        (setq *layout-plist* (list* :a64-threads 1 *layout-plist*))))))
+        (setq *layout-plist* (list* :a64-threads 1 *layout-plist*)))
+      ;; x86-64's heap geometry: two 896 MB semispaces plus the 16 MB overshoot
+      ;; guard (boot-linux-aarch64 +LINUX-AARCH64-GC-GUARD+).  Every thread's
+      ;; region, the actor band and the lock arena are carved out of region
+      ;; 0's semispace; at 432 MB that affords 12 regions and leaves region 0
+      ;; small enough to collect inside the thread tests' measurement windows.
+      (unless (getf *layout-plist* :heap-size)
+        (setq *layout-plist* (list* :heap-size #x71000000 *layout-plist*))))))
+
+(defun check-layout-overlaps ()
+  "Refuse a layout whose heap mapping runs into the JIT arena."
+  (let ((heap (or (getf *layout-plist* :heap-base) #x2000000000))
+        (size (or (getf *layout-plist* :heap-size) #x38000000))
+        (arena (or (getf *layout-plist* :jit-arena-base) #x3000000000)))
+    (when (and (< heap arena) (> (+ heap size) arena))
+      (error "hosted layout: the heap [#x~X, #x~X) overlaps the JIT arena at #x~X ~
+              — move MODUS_JIT_ARENA_BASE to #x~X or above"
+             heap (+ heap size) arena (+ heap size)))))
 
 (defun layout-tsd-offset ()
   "Byte offset of the delta in the pthread TSD array (Darwin), or NIL (Linux:
@@ -109,6 +126,7 @@
 (defun apply-layout-host ()
   "Set the host translator and compiler to this build's layout.  Call after
    boot-linux-aarch64.lisp is loaded and the AArch64 translator installed."
+  (check-layout-overlaps)
   (flet ((put (name value)
            (setf (symbol-value (find-symbol name :modus.mvm)) value)))
     (put "*CONV-RELATIVE*" t)
@@ -130,10 +148,11 @@
            (symbol-value (find-symbol "+HOSTED-SCHED-LOCK-ADDR+" :modus.mvm))))
     (let ((real (funcall (find-symbol "CONV-REAL" :modus.mvm)
                          (symbol-value (find-symbol "+CONV-REGION-BASE+" :modus.mvm)))))
-      (format t "~&  Hosted layout: code #x~X  region #x~X (delta #x~X)  heap #x~X  arena #x~X~A~%"
+      (format t "~&  Hosted layout: code #x~X  region #x~X (delta #x~X)  heap #x~X (#x~X)  arena #x~X~A~%"
               (funcall (find-symbol "LINUX-AARCH64-CODE-BASE" :modus.mvm))
               real *layout-conv-delta*
               (or (getf *layout-plist* :heap-base) #x2000000000)
+              (or (getf *layout-plist* :heap-size) #x38000000)
               (or (getf *layout-plist* :jit-arena-base) #x3000000000)
               (if *layout-no-x18* "  x18: NOT used (poisoned)" ""))
       (when *layout-threads*

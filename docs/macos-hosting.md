@@ -201,9 +201,13 @@ image is 264 MB (301 MB without x18), and the layout below left the code only
 ```
 MODUS_CODE_BASE=7000000000       code          0x7000000000
 MODUS_CONV_DELTA=7040000000      region        0x704F000000 .. 0x7080000000
-MODUS_HEAP_BASE=7080000000       heap          0x7080000000 .. 0x70B8000000
-MODUS_JIT_ARENA_BASE=70C0000000  JIT arena     0x70C0000000 .. 0x70E0000000
+MODUS_HEAP_BASE=7080000000       heap          0x7080000000 .. 0x70F1000000
+MODUS_JIT_ARENA_BASE=7100000000  JIT arena     0x7100000000 .. 0x7120000000
 ```
+
+The heap is 896 MB without threads and 1808 MB with them (the CLI's
+default; see "Native threads on AArch64"), so the arena sits above the larger.
+`check-layout-overlaps` refuses a layout whose heap runs into the arena.
 
 All knobs live in `mvm/hosted-layout-env.lisp`, loaded by both the CLI and the
 ANSI gate builds (`build-cli-common`, `build-ansi-common`), which apply them
@@ -358,7 +362,7 @@ touches back.
 ```
 MODUS_DARWIN=1 MODUS_NO_JIT=1 MODUS_CODE_BASE=7000010000 \
 MODUS_CONV_DELTA=7040000000 MODUS_HEAP_BASE=7080000000 \
-MODUS_JIT_ARENA_BASE=70C0000000 MODUS_CLI_OUT=/tmp/modus-darwin.elf \
+MODUS_JIT_ARENA_BASE=7100000000 MODUS_CLI_OUT=/tmp/modus-darwin.elf \
   sbcl --dynamic-space-size 16384 --script mvm/build-aarch64-cli.lisp
 host/macos/build-macos.sh /tmp/modus-darwin.elf ./modus
 ./modus --eval '(+ 1 2)'
@@ -504,8 +508,10 @@ window-less thread colliding, now "comes back clean" on AArch64.
   `(43 . 202)`, or every accept becomes a futex.
 - The GC trampoline scans this thread's MV buffer and dynamic-binding stack,
   and reads this CPU's active-region cell.
-- The CLI's semispaces are 432 MB with threads, not 128 MB.  Thread regions are
-  carved from region 0's semispace, and 128 MB affords only two.
+- The CLI takes x86-64's heap geometry with threads: 896 MB semispaces in an
+  1808 MB mapping (layout key `:heap-size`), where it had 128 MB semispaces.
+  Thread regions, the actor band and the lock arena are carved from region
+  0's semispace, so 128 MB afforded two regions and 432 MB twelve.
 
 **Collisions on the per-CPU region table.**  `0x10000F08 + 8*cpu`, sixteen
 cells, overlapped two AArch64-only word sets:
@@ -557,38 +563,32 @@ follow translate-x64's contract.
 - The bitmap alignment check uses AArch64's unit: bits are set a byte at a
   time, so 128 heap bytes, not x86-64's 1024.
 
-**Status, thread suite (24 tests incl. ctx-switch and actors; x86-64
-baseline 19).**  Linux/aarch64 and native macOS agree check-for-check.
-- Pass:
-  - dynbind
-  - many-threads
-  - threads
-  - mutex
-  - atomics
-  - percpu
-  - mv-handler
-  - ctx-switch
-  - actors
-  - spinlock
-  - thread-actors
-  - thread-gc
-  - thread-gc-stress (675 checks)
-- Miss only x86-64 expectations:
-  - thread-gc-concurrent: asserts that +512 is misaligned (x86-64's unit)
-  - many-regions: 12 regions and scale 2
-  - thread-lisp, thread-regions and actor-regions: region-0 collection counts
-  - on macOS, literal unrelocated addresses
-- dynbind passes.  It had failed through a shared-code bug: `%ha-carve`
-  zeroed the band's control area in pieces, and the gaps held the lock-arena
-  words.  After enough allocation (a few flips of 432 MB semispaces) the arena
-  end read `0xDEAD0001`, `%rt-arena-carve` took that for "already carved", and
-  locked sections allocated from garbage: SIGSEGV in `%LL-SHAPE-MEMO-PUT`, then
-  a silent exit 2.  The carve now zeroes the whole control area,
-  `[band, band+0x12200)`.
-- Fail on x86-64 too: sb-thread, region0-frontier, term-xregion,
-  worker-xregion, thread-lisp-unsync.  mv-handler-unsync is a race control:
-  x86-64 collides in 2 of 6 runs, and AArch64's worker there now has its own
-  window.
+**Status, thread suite (24 tests).**  Linux/aarch64, native macOS and x86-64
+now give **identical** results: 19 pass on all three.  The 12 threads, 16
+regions and region-0 counts misses are gone, because threaded AArch64 now has
+x86-64's heap geometry:
+- 896 MB semispaces in an 1808 MB mapping, via the layout key `:heap-size`.
+- GC bitmaps sized to the heap, at 1/128 of it.  They were a fixed 8 MB, which
+  covers exactly 1 GB, and the collector read past them on a bigger heap.
+- The alignment control's offset follows each target's bitmap unit.
+- The two tests that compared against unrelocated literals use `%conv-addr`.
+- Two selftest windows were measured wrong:
+  - `%tl-selftest` opened its "no region-0 collection" window before
+    `%rt-threads-on`, whose compile-ahead runs before any second thread exists.
+  - The n-region selftest now compiles ahead and collects region 0 before it
+    spawns, so the spawns cannot collect region 0 while earlier workers are
+    live.  That was the residual race, not a test artifact.
+
+The five failing tests fail on all three platforms: sb-thread, region0-frontier,
+term-xregion, worker-xregion and thread-lisp-unsync (a control).
+mv-handler-unsync is a race control; x86-64 collides in about 2 of 6 runs.
+
+sb-thread's crash (the condition-broadcast section) is three workers running
+closures from an INTERPRETED toplevel form while main also interprets.
+`%make-native-thread` already names concurrent interpretation as unsafe and
+mitigates it only for DEFUNs (JIT-EAGER).  The eval path has process-wide
+state and no compile lock (`*mvm-eval-buffer*`, the compiler's tables), so this
+is the next thing to fix properly, not by rearranging the test.
 
 ## Open questions
 

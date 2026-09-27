@@ -1366,13 +1366,12 @@
 (setf *linux-aarch64-gc-midpoint*
       (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_GC_MIDPOINT")))
         (cond ((and v (> (length v) 0)) (parse-integer v :radix 16))
-              ;; WITH THREADS, 432 MB semispaces: every thread's GC
-              ;; region is carved out of region 0's (net/hosted-actors.lisp
-              ;; %HA-CARVE, 16 MB each, region 0 keeping at least half), and
-              ;; 128 MB affords only the minimum two — most threads would get
-              ;; no heap of their own.  432 MB affords twelve and keeps the 16 MB
-              ;; overshoot slack below the 896 MB mapping.
-              (cl-user::*layout-threads* #x1B000000)
+              ;; WITH THREADS, x86-64's 896 MB semispaces in a 1808 MB
+              ;; mapping (the :HEAP-SIZE hosted-layout-env gives a threaded
+              ;; build): every thread's GC region is carved out of region 0's
+              ;; (net/hosted-actors.lisp %HA-CARVE, 16 MB each, region 0 keeping
+              ;; at least half), so this is what affords all sixteen.
+              (cl-user::*layout-threads* #x38000000)
               (t #x08000000))))
 (setf *linux-aarch64-r25-offset* *linux-aarch64-gc-midpoint*)
 ;; WS4-AA64 #160 Stage B: emit the object-start-bit SET at every alloc site so

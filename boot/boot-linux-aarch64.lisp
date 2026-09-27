@@ -23,6 +23,13 @@
 (defconstant +linux-aarch64-jit-arena-size+ #x20000000)   ; 512 MB of VA
 (defconstant +linux-aarch64-heap-addr+ #x10000000)
 (defconstant +linux-aarch64-heap-size+ #x38000000)   ; 896 MB
+
+(defun linux-aarch64-heap-size ()
+  "The heap mapping's size for THIS build: +LINUX-AARCH64-HEAP-SIZE+, or the
+   hosted layout's :HEAP-SIZE.  A threaded CLI takes x86-64's geometry (two
+   896 MB semispaces plus the guard), because every thread's region is carved
+   out of region 0's semispace (mvm/hosted-layout-env.lisp)."
+  (hosted-layout :heap-size +linux-aarch64-heap-size+))
 (defconstant +linux-aarch64-heap-alloc-start+ #x200)
 (defconstant +linux-aarch64-gc-midpoint+ #x1C000000)
 
@@ -63,21 +70,21 @@
    geometry leaves less than +linux-aarch64-gc-guard+ of mapped slack above
    the top semispace.  GC-off builds (r25-offset = heap-size, so allocation is
    bounded by the mapping itself and never flips) are exempt."
-  (when (/= *linux-aarch64-r25-offset* +linux-aarch64-heap-size+)
+  (when (/= *linux-aarch64-r25-offset* (linux-aarch64-heap-size))
     (let* ((midpoint *linux-aarch64-gc-midpoint*)
            ;; to_start = base+midpoint, space_size = midpoint - alloc_start,
            ;; so the top semispace ends at base + 2*midpoint - alloc_start.
            (top-end (- (* 2 midpoint) +linux-aarch64-heap-alloc-start+))
-           (slack (- +linux-aarch64-heap-size+ top-end)))
+           (slack (- (linux-aarch64-heap-size) top-end)))
       (when (< slack +linux-aarch64-gc-guard+)
         (error "AArch64 GC arena has no overshoot guard: midpoint #x~X puts the ~
                 top semispace's end at heap+#x~X, only ~D bytes below the ~D MB ~
                 mapping — need at least #x~X (16 MB).  Either raise ~
-                +linux-aarch64-heap-size+ to #x~X or lower the midpoint.  ~
+                (linux-aarch64-heap-size) to #x~X or lower the midpoint.  ~
                 Shipping this is i386 bug B3 (18b223b): every allocation larger ~
                 than the slack that trips :gc-check runs off the mmap and ~
                 SIGSEGVs in its own initialising stores."
-               midpoint top-end slack (ash +linux-aarch64-heap-size+ -20)
+               midpoint top-end slack (ash (linux-aarch64-heap-size) -20)
                +linux-aarch64-gc-guard+
                (+ top-end +linux-aarch64-gc-guard+)))))
   t)
@@ -248,7 +255,7 @@
                              (+ header-total raw-len #x10000))
                             ((eql (conv-real +conv-region-base+) +conv-region-base+)
                              (+ header-total raw-len
-                                (or bss-size +linux-aarch64-heap-size+)))
+                                (or bss-size (linux-aarch64-heap-size))))
                             (t (- +conv-region-low+ load-addr))))
     (mvm-emit-u64 buf page-align)     ; 64K on AArch64, 4K elsewhere
     (loop for b across raw-bytes do (mvm-emit-byte buf b))
@@ -404,7 +411,7 @@
   ;; ignores the flag and picks its own), fall through to the historical hint
   ;; mmap.  Restore then refuses with `heap base differs' instead of guessing.
   (emit-aarch64-load-imm64 buf 0 (hosted-layout :heap-base +linux-aarch64-fixed-heap-base+))
-  (emit-aarch64-load-imm64 buf 1 +linux-aarch64-heap-size+)
+  (emit-aarch64-load-imm64 buf 1 (linux-aarch64-heap-size))
   (emit-aarch64-load-imm64 buf 2 3)
   (emit-aarch64-load-imm64 buf 3 #x100022)   ; MAP_PRIV|ANON|FIXED_NOREPLACE
   (emit-aarch64-load-imm64 buf 4 #xFFFFFFFFFFFFFFFF)
@@ -416,7 +423,7 @@
   (let ((beq-at (a64-buffer-position buf)))
     (emit-aarch64-u32 buf 0)          ; B.EQ <past the fallback>, patched below
     (emit-aarch64-load-imm64 buf 0 #x10000000)
-    (emit-aarch64-load-imm64 buf 1 +linux-aarch64-heap-size+)
+    (emit-aarch64-load-imm64 buf 1 (linux-aarch64-heap-size))
     (emit-aarch64-load-imm64 buf 2 3)
     (emit-aarch64-load-imm64 buf 3 #x22)
     (emit-aarch64-load-imm64 buf 4 #xFFFFFFFFFFFFFFFF)

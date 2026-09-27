@@ -5,7 +5,7 @@
 # Build the image first, e.g.:
 #   MODUS_DARWIN=1 MODUS_NO_JIT=1 MODUS_CODE_BASE=7000000000 \
 #   MODUS_CONV_DELTA=7040000000 MODUS_HEAP_BASE=7080000000 \
-#   MODUS_JIT_ARENA_BASE=70C0000000 MODUS_CLI_OUT=/tmp/modus-darwin.elf \
+#   MODUS_JIT_ARENA_BASE=7100000000 MODUS_CLI_OUT=/tmp/modus-darwin.elf \
 #   sbcl --dynamic-space-size 16384 --script mvm/build-aarch64-cli.lisp
 set -eu
 IMAGE=$1

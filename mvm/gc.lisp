@@ -634,8 +634,19 @@
    native alloc-site bit-set would write through a garbage base).  Non-allocating
    (mmap result + config addresses are fixnums)."
   (setf (mem-ref #x10000E00 :u64) (%gc-from-start))
-  (setf (mem-ref #x10000E18 :u64) (%gc-bitmap-map #x800000))
-  (setf (mem-ref #x10000E40 :u64) (%gc-bitmap-map #x800000)))
+  ;; One bit per 16-byte granule, so a bitmap covers 128x its size: 8 MB for
+  ;; 1 GB of heap — every image before threads came to AArch64.  A layout with
+  ;; a bigger heap (:HEAP-SIZE; the threaded AArch64 CLI maps 1808 MB) gets
+  ;; bitmaps to match: an 8 MB map there ran off its end at the first object
+  ;; past 1 GB and the collector read the neighbouring mapping as bits.
+  (setf (mem-ref #x10000E18 :u64) (%gc-bitmap-map (%gc-bitmap-bytes)))
+  (setf (mem-ref #x10000E40 :u64) (%gc-bitmap-map (%gc-bitmap-bytes))))
+
+(defun %gc-bitmap-bytes ()
+  "Bytes per GC bitmap: 1/128 of the heap mapping (1 GB unless the hosted
+   layout says otherwise), rounded up to 16 KB so it is whole pages anywhere."
+  (let ((heap (%layout :heap-size #x40000000)))
+    (* (ash (+ (ash heap -7) 16383) -14) 16384)))
 
 (defun %gc-bitmap-map (size)
   "SIZE bytes of zeroed memory for a GC bitmap.  Data, written on every

@@ -134,7 +134,7 @@
         (chk "thread 1 reads CPU id" cpu1 0)
         (chk "thread 2 reads CPU id" cpu2 1)
         (chk "thread 1's cell is +GC-REGION-ADDR+ (the historic word)"
-             cell1 #x10000F08)
+             cell1 (%conv-addr #x10000F08))
         (chk "thread 2's cell is the next table entry" cell2 (+ cell1 8))
         (chk "and the driver computed the same address for CPU 1's cell"
              cell2b cell2)

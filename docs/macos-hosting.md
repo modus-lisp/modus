@@ -209,13 +209,32 @@ All knobs live in `mvm/hosted-layout-env.lisp`, loaded by both the CLI and the
 ANSI gate builds (`build-cli-common`, `build-ansi-common`), which apply them
 host-side and splice the same values into their JIT co-init.
 
-**ANSI gate: wired, not yet run.**  The moved, no-x18 gate builds (301 MB).  It
-could not be run on this Mac: the corpus lives on the Linux gate machine
-(`tmp/ansi-test` is symlinks into `/home/claude/modus-ref`), and a gate built
-from untouched `main` against upstream ansi-test crashes at boot in
-`%INIT-CLOS-PROTOCOL` → `%MAKE-GF-STUB` → `EVAL` → `GENERIC-ADD` on an unbound
-marker, before any test runs — so there is no baseline to compare against
-here.
+**ANSI gate: run, 2026-09-27.**  aarch64 hosted runner (`build-aarch64-linux`,
+JIT on), upstream ansi-test `ca06bd9` in `get-ansi-corpus.sh`'s layout, run
+on Linux/aarch64 under Apple `container`, 12 shards.  The runner needed
+`(init-all-globals)` in its `kernel-main` to boot at all (a `main` bug,
+reported upstream); both images carry that one line.
+
+| layout (code 0x7000000000, region delta 0x7040000000) | pass | fail | lost |
+|---|---|---|---|
+| with x18 | 18,855 | 1,357 | 1,321 |
+| **without x18** (`MODUS_NO_X18`, x18 poisoned) | 18,854 | 1,358 | 1,321 |
+
+Of 21,533 ids.  One test differs, and it is not an x18 defect: 25396
+(`format.f.38`) belongs to a pre-existing, nondeterministic class of about 27
+tests in BOTH runs that return garbage objects (`#<?NN>`) where floats should
+be (25361 and 25362 fail in both, with different garbage each run; 25392
+passed in both full runs and failed under gdb).  With the JIT off, 25396 fails
+10/10 on the x18 image too.  Hybrid builds that move only the nargs slot back
+to x18 make it pass, which changes code size and timing, not semantics: the
+fallback's address is identical, no JIT page faults, and moving its scratch
+from x17 to x9 changes nothing.  Shard timings match between the two images.
+
+The gate also found two more missed sites, both fixed: its long-range entry
+jump to KERNEL-MAIN patched only 32 bits, and its `kernel-main` set its
+scratch buffers from literal addresses in the build script's source string.
+The low layout cannot hold this image (273 MB from 0x400000 overruns
+0x10000000; the build now warns), which is why both runs link high.
 
 The full macOS-shaped layout runs on Linux — `/proc/self/maps` of a live
 image, nothing of modus below 4 GB:

@@ -1298,6 +1298,13 @@
                           (setq opt-offset (+ opt-offset 2 opt-len))))))))))
       yiaddr)))
 
+(defun dhcp-wait-tries ()
+  "Polls per DHCP wait (OFFER, then ACK).  2500 is the historic value, sized by
+   the aarch64 boards' io-delay; the x86 CL adapter's io-delay is far shorter
+   and 2500 of them expire before QEMU's slirp has answered (measured: the
+   OFFERs were in the RX ring afterwards).  The QEMU builds override this."
+  2500)
+
 (defun dhcp-client ()
   (let ((state (e1000-state-base)))
     (dhcp-discover)
@@ -1311,7 +1318,7 @@
       ;; first offer so this is a no-op there.  Do NOT re-send DISCOVER inside
       ;; the loop: slirp defers its pending OFFER on each new DISCOVER, so a
       ;; retransmit keeps pushing the reply out and the window never catches it.
-      (dotimes (try 2500)
+      (dotimes (try (dhcp-wait-tries))
         (when (zerop got-offer)
           (io-delay)
           (let ((pkt-len (e1000-receive)))
@@ -1341,7 +1348,7 @@
             (%serial-byte 68) (%serial-byte 72) (%serial-byte 67) (%serial-byte 80) (%serial-byte 58)
             (%serial-byte 82) (%serial-byte 10)
             (let ((got-ack 0))
-              (dotimes (try 2500)
+              (dotimes (try (dhcp-wait-tries))
                 (when (zerop got-ack)
                   (io-delay)
                   (let ((pkt-len (e1000-receive)))

@@ -327,6 +327,13 @@
      ;; Wrap in handler-case so a missing eval feature degrades to NIL
      ;; rather than killing the whole make-condition fork.
      (handler-case (eval form) (t (c) (declare (ignore c)) nil)))
+    ;; A SYMBOL initform is a variable reference, and was returned as the
+    ;; symbol: cl-ppcre's PPCRE-SYNTAX-ERROR has :initform
+    ;; *SYNTAX-ERROR-STRING*, so every syntax error carried the symbol, and
+    ;; printing one (its :report subseqs the string) failed on top of it.
+    ;; Keywords, T and NIL are constants; any other symbol is read.
+    ((and (symbolp form) (not (keywordp form)) (not (eq form t)))
+     (if (boundp form) (symbol-value form) form))
     (t form)))
 
 ;;; --- print-object for conditions ---

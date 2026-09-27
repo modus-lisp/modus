@@ -81,7 +81,8 @@
    ;; re-exported from UIOP (same symbols)
    "PARSE-VERSION" "VERSION<" "VERSION<=" "VERSION="
    ;; version / identity
-   "ASDF-VERSION" "*CENTRAL-REGISTRY*"
+   "ASDF-VERSION" "VERSION-SATISFIES" "*CENTRAL-REGISTRY*"
+   "*SYSTEM-DEFINITION-SEARCH-FUNCTIONS*"
    ;; the component/operation class namespace
    "COMPONENT" "SOURCE-FILE" "CL-SOURCE-FILE" "STATIC-FILE" "MODULE" "SYSTEM"
    "OPERATION" "COMPILE-OP" "LOAD-OP" "TEST-OP" "PREPARE-OP"
@@ -120,6 +121,13 @@
 (defun uiop::version< (x y) (%it-version< x y))
 (defun uiop::version<= (x y) (%it-version<= x y))
 (defun uiop::version= (x y) (and (%it-version<= x y) (%it-version<= y x)))
+
+(defun asdf::version-satisfies (version required)
+  "ASDF:VERSION-SATISFIES — true when VERSION is at least REQUIRED.
+   Quicklisp's setup.lisp asks exactly this of (asdf-version) before it will
+   use an ASDF that is already present; without it the check fails and setup
+   tries to load an ASDF of its own."
+  (and (stringp version) (stringp required) (uiop::version<= required version)))
 
 (defun asdf::%string-of (x)
   "A string designator (string / symbol / character) as a STRING.  Written
@@ -252,6 +260,10 @@
 (defvar asdf::*registered-systems* nil)   ; alist (NAME . SYSTEM)
 (defvar asdf::*systems-loading* nil)      ; names currently being loaded
 (defvar asdf::*central-registry* nil)     ; list of directories holding .asd
+;; The ASDF-2-era search hook.  Quicklisp's setup PUSHes its dist searcher
+;; here, which needs the variable to exist first.  Not reset by
+;; %INIT-ASDF-INTERFACE: whatever a client installed must survive.
+(defvar asdf::*system-definition-search-functions* nil)
 
 (defun asdf::coerce-name (x)
   "ASDF:COERCE-NAME — a system designator to its canonical string name.
@@ -342,7 +354,9 @@
 (defun asdf::%registry-dir (d)
   "A *CENTRAL-REGISTRY* entry as a directory string ending in exactly one
    \"/\"."
-  (let ((s (if (stringp d) d (princ-to-string d))))
+  ;; NAMESTRING, not PRINC-TO-STRING: a pathname entry (what Quicklisp and
+  ;; most callers push) prints as its raw instance under PRINC.
+  (let ((s (if (stringp d) d (namestring d))))
     (cond ((= (length s) 0) "")
           ((char= (char s (- (length s) 1)) #\/) s)
           (t (concatenate 'string s "/")))))
@@ -399,7 +413,11 @@
               ;; Registry + central-registry missed: run the runtime
               ;; search functions (quicklisp integration — see
               ;; %search-fns-locate).  A hit is the .asd's pathname.
-              (let ((spath (asdf::%search-fns-locate n)))
+              ;; Search for the PRIMARY name, as for *CENTRAL-REGISTRY*:
+              ;; Quicklisp's searcher only answers a name that matches the
+              ;; .asd file's own, so "seal/http" is found as seal.asd.
+              (let ((spath (asdf::%search-fns-locate
+                            (asdf::primary-system-name n))))
                 (cond
                   (spath (asdf::%register-from-asd
                           n (handler-case (namestring spath)
@@ -431,16 +449,56 @@
    form), so nothing acts on this; it is reported, not honoured."
   (%it-plist-get (cddr (asdf::%system-form sys)) :defsystem-depends-on))
 
+(defun asdf::%featurep (x)
+  "A feature expression against *FEATURES*: a symbol (compared by name, as
+   the reader does for #+), or (:not E), (:and E...), (:or E...)."
+  (cond
+    ((and x (symbolp x))
+     (let ((hit nil))
+       (dolist (f *features* hit)
+         (when (and (symbolp f) (string= (symbol-name f) (symbol-name x)))
+           (setq hit t)))))
+    ((and (consp x) (symbolp (car x)))
+     (let ((op (symbol-name (car x))))
+       (cond
+         ((string= op "NOT") (not (asdf::%featurep (cadr x))))
+         ((string= op "AND") (let ((r t))
+                               (dolist (e (cdr x) r)
+                                 (unless (asdf::%featurep e) (setq r nil)))))
+         ((string= op "OR") (let ((r nil))
+                              (dolist (e (cdr x) r)
+                                (when (asdf::%featurep e) (setq r t)))))
+         (t nil))))
+    (t nil)))
+
+(defun asdf::%dep-name (d)
+  "The system a single :DEPENDS-ON entry D requires, or NIL.
+     name                    -> name
+     (:version name v)       -> name  (the version is not checked)
+     (:feature expr dep)     -> dep's name when EXPR holds, else NIL
+     (:require module)       -> NIL   (a host module; Modus has none)"
+  (cond
+    ((stringp d) (asdf::coerce-name d))
+    ((and d (symbolp d)) (asdf::coerce-name d))
+    ((and (consp d) (symbolp (car d)))
+     (let ((op (symbol-name (car d))))
+       (cond
+         ((string= op "VERSION") (asdf::%dep-name (cadr d)))
+         ((string= op "FEATURE") (when (asdf::%featurep (cadr d))
+                                   (asdf::%dep-name (caddr d))))
+         (t nil))))
+    (t nil)))
+
 (defun asdf::%dep-names (sys)
-  "The subset of SYS's :DEPENDS-ON that names a system by designator.
-   Dependency FORMS — (:feature …), (:require …), (:version …) — are
-   dropped: :require names a MODULE of the host implementation, which
-   Modus has no equivalent of, and a :feature clause whose feature is
-   absent is by definition not required."
+  "The systems SYS's :DEPENDS-ON requires, in order (see %DEP-NAME).
+   Dependency FORMS used to be dropped wholesale, which silently skipped a
+   PRESENT :feature -- com.inuoe.jzon's (:feature (:not :ecl) float-features)
+   left float-features unloaded, and every jzon file then failed to READ its
+   first float-features: symbol."
   (let ((acc nil))
     (dolist (d (asdf::system-depends-on sys))
-      (when (or (stringp d) (and d (symbolp d)))
-        (setq acc (cons (asdf::coerce-name d) acc))))
+      (let ((n (asdf::%dep-name d)))
+        (when n (setq acc (cons n acc)))))
     (nreverse acc)))
 
 (defun asdf::system-source-directory (sys)
@@ -585,6 +643,18 @@
   ;; ASDF:COMPONENT-LOADED-P tell the truth about archive installs and
   ;; mgl-pax's autoload stubs stop re-loading a system that is already in.
   (setq *it-register-hook* (function asdf::%register-installed))
+  ;; Real ASDF counts itself and UIOP as systems that are already loaded, and
+  ;; libraries depend on them by name (a :depends-on ("uiop") is common).
+  (dolist (n (list "asdf" "uiop"))
+    (asdf::%register n (list 'asdf::defsystem n) nil t))
+  ;; SBCL contrib modules whose packages this image provides natively.  On
+  ;; SBCL they are ASDF systems (seal's :depends-on ("sb-bsd-sockets")); here
+  ;; they are already in the image, so they are registered as loaded -- but
+  ;; only when the package really exists, as it does not on every target.
+  (dolist (pair (list (cons "sb-bsd-sockets" "SB-BSD-SOCKETS")
+                      (cons "sb-posix" "SB-POSIX")))
+    (when (find-package (cdr pair))
+      (asdf::%register (car pair) (list 'asdf::defsystem (car pair)) nil t)))
   (asdf::%install-features)
   t)
 
@@ -616,8 +686,8 @@
 ;;;    with dependencies read out of its defpackage — is not implemented.
 ;;;
 ;;;  * VERSIONS ARE NOT CHECKED.  :version in a defsystem is not read, and a
-;;;    dependency written (:version "foo" "1.2") is skipped like every other
-;;;    dependency FORM, not verified.  UIOP:VERSION< / VERSION<= themselves
+;;;    dependency written (:version "foo" "1.2") loads "foo" without checking
+;;;    the version.  UIOP:VERSION< / VERSION<= themselves
 ;;;    are real and correct; nothing calls them on your behalf.
 ;;;
 ;;;  * ASDF-VERSION IS AN INTERFACE-LEVEL CLAIM, bounded by this list — the

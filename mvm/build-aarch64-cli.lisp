@@ -1385,6 +1385,11 @@
 ;; build-cli-common, so the JIT co-init bakes the same value).
 (setf *conv-delta* cl-user::*cli-conv-delta*)
 (setf *hosted-layout* cl-user::*cli-hosted-layout*)
+;; MODUS_NO_X18 (build-cli-common): Darwin's register discipline — no x18 base,
+;; and the boot stub poisons x18.
+(when cl-user::*cli-no-x18*
+  (setf *a64-x18-base* nil)
+  (format t "  x18: NOT used (MODUS_NO_X18) — boot poisons it~%"))
 ;; Code linked above 4 GB: every code-address placeholder gets a third
 ;; halfword (translate-aarch64 A64-EMIT-CODE-ADDR-PLACEHOLDER).
 (setf *a64-code-addr-wide*

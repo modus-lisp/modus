@@ -519,7 +519,7 @@
 (defconstant +a64-x15+ 15)   ; AAPCS caller-saved temp
 (defconstant +a64-x16+ 16)   ; IP0 scratch
 (defconstant +a64-x17+ 17)   ; IP1 scratch
-(defconstant +a64-x18+ 18)   ; platform reg (free on bare-metal — used by handler-case copy traps)
+(defconstant +a64-x18+ 18)   ; platform reg: convention base where *a64-x18-base*; never on Darwin (its kernel zeroes it)
 (defconstant +a64-x19+ 19)
 (defconstant +a64-x20+ 20)
 (defconstant +a64-x21+ 21)
@@ -3033,7 +3033,8 @@
                   (a64-mov-reg buf +a64-x0+ +a64-x26+)         ; first-time return = NIL
                   ;; AFTER this point execution falls through.  ADR target is here.
                   (let ((return-idx (a64-current-index buf)))
-                    (a64-load-imm64 buf +a64-x18+ (conv-real +a64-conv-base+)) ; x18 = convention base again
+                    (when *a64-x18-base*           ; x18 = convention base again
+                      (a64-load-imm64 buf +a64-x18+ (conv-real +a64-conv-base+)))
                     (a64-load-spill buf +a64-x6+ +vreg-v9+)
                     (a64-load-spill buf +a64-x7+ +vreg-v10+)
                     (a64-load-spill buf +a64-x4+ +vreg-v11+)
@@ -6317,7 +6318,7 @@
     (a64-stp-offset buf +a64-x12+ +a64-x13+ +a64-sp+ 96)
     (a64-stp-offset buf +a64-x14+ +a64-x15+ +a64-sp+ 112)
     (a64-stp-offset buf +a64-x16+ +a64-x17+ +a64-sp+ 128)
-    (a64-str-unsigned buf +a64-x18+ +a64-sp+ 144)
+    ;; slot 144 (x18) is unused: the collector no longer touches x18.
     (a64-str-unsigned buf +a64-x19+ +a64-sp+ 152)
     (a64-str-unsigned buf +a64-x20+ +a64-sp+ 160)
     (a64-str-unsigned buf +a64-x21+ +a64-sp+ 168)
@@ -6457,7 +6458,10 @@
     (a64-tramp-mark 7)
     ;; ---- Cheney scan: OBJECT-BY-OBJECT, TYPE-AWARE ----
     ;; #160 PIECE 1: walk to-space object-by-object (cursor x26; next-obj x24;
-    ;; slot cursor x18 — all preserved across scan_word/copy_object).  The
+    ;; slot cursor x23 — all preserved across scan_word/copy_object).  x23 held
+    ;; stack_base, dead once the root window above is scanned.  It is NOT x18:
+    ;; Darwin's kernel zeroes x18 on preemption (docs/macos-hosting.md), and a
+    ;; cursor zeroed mid-object would scan from address 0.  The
     ;; cons-kind bitmap (@0x10000E40) says whether the granule at the cursor is a
     ;; cons (scan car+cdr) or a headered object (read subtag).  LEAF subtags
     ;; (string #x10/#x31, u8 #x11, u64 #x14, sap #x16, bignum #x30, floats
@@ -6494,7 +6498,7 @@
       (a64-lsl-imm buf +a64-x14+ +a64-x13+ 56) (a64-lsr-imm buf +a64-x14+ +a64-x14+ 56) ; x14 = subtag
       (a64-lsr-imm buf +a64-x15+ +a64-x13+ 8)              ; x15 = count
       (a64-lsl-imm buf +a64-x16+ +a64-x15+ 3)              ; x16 = count*8
-      (a64-add-imm buf +a64-x18+ +a64-x26+ 16)             ; x18 = slot cursor (obj+16)
+      (a64-add-imm buf +a64-x23+ +a64-x26+ 16)             ; x23 = slot cursor (obj+16)
       (a64-cmp-imm buf +a64-x14+ #x11)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i u8sz2 :bcond))
       (a64-cmp-imm buf +a64-x14+ #x12)                     ; f32-vector: 4 bytes/lane
@@ -6508,17 +6512,17 @@
       (a64-set-label buf haveslots)
       (a64-add-imm buf +a64-x9+ +a64-x9+ 15) (a64-lsr-imm buf +a64-x9+ +a64-x9+ 4) (a64-lsl-imm buf +a64-x9+ +a64-x9+ 4) ; align16
       (a64-add-reg buf +a64-x24+ +a64-x26+ +a64-x9+ 0 0)   ; x24 = next object pos (preserved)
-      (a64-add-reg buf +a64-x26+ +a64-x18+ +a64-x16+ 0 0)  ; x26 = slot_end = obj+16+count*8
+      (a64-add-reg buf +a64-x26+ +a64-x23+ +a64-x16+ 0 0)  ; x26 = slot_end = obj+16+count*8
       (dolist (st (list #x10 #x11 #x12 #x14 #x16 #x30 #x31 #x60 #x64 #x65 #x66))
         (a64-cmp-imm buf +a64-x14+ st)
         (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i leafskip :bcond)))
-      ;; pointer-bearing: scan slots [x18 .. slot_end=x26)
+      ;; pointer-bearing: scan slots [x23 .. slot_end=x26)
       (a64-set-label buf sloop)
-      (a64-cmp-reg buf +a64-x18+ +a64-x26+)
+      (a64-cmp-reg buf +a64-x23+ +a64-x26+)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i sdone2 :bcond))
-      (a64-mov-reg buf +a64-x9+ +a64-x18+)
+      (a64-mov-reg buf +a64-x9+ +a64-x23+)
       (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
-      (a64-add-imm buf +a64-x18+ +a64-x18+ 8)
+      (a64-add-imm buf +a64-x23+ +a64-x23+ 8)
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i sloop :b))
       (a64-set-label buf sdone2)
       (a64-set-label buf leafskip)
@@ -6687,7 +6691,6 @@
     (a64-ldr-unsigned buf +a64-x21+ +a64-sp+ 168)
     (a64-ldr-unsigned buf +a64-x20+ +a64-sp+ 160)
     (a64-ldr-unsigned buf +a64-x19+ +a64-sp+ 152)
-    (a64-ldr-unsigned buf +a64-x18+ +a64-sp+ 144)
     (a64-ldp-offset buf +a64-x16+ +a64-x17+ +a64-sp+ 128)
     (a64-ldp-offset buf +a64-x14+ +a64-x15+ +a64-sp+ 112)
     (a64-ldp-offset buf +a64-x12+ +a64-x13+ +a64-sp+ 96)

@@ -476,7 +476,12 @@
   ;; case by case but kept needing fresh patches; this fixes the root.
   (emit-aarch64-load-imm64 buf 26 #xDEAD0001)
   ;; x18 = convention-block base #x10000000 (translate-aarch64 *a64-x18-base*)
-  (emit-aarch64-load-imm64 buf 18 (conv-real #x10000000))
+  ;; ...unless x18 is off (Darwin, or MODUS_NO_X18 on Linux): then POISON it
+  ;; with a non-canonical address, so any code still treating x18 as the base
+  ;; faults on its first use instead of working by luck.
+  (emit-aarch64-load-imm64 buf 18 (if modus.mvm::*a64-x18-base*
+                                      (conv-real #x10000000)
+                                      #x0018DEAD0018DEAD))
 
   ;; NATIVE MCGC: reserve x28 = the GC trampoline's absolute VA, loaded once
   ;; at boot, so every gc-check fire site is a single range-unlimited

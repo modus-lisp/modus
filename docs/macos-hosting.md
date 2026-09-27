@@ -209,8 +209,9 @@ image, nothing of modus below 4 GB:
 MODUS_HEAP_BASE=7040000000 MODUS_JIT_ARENA_BASE=7080000000`.)  Smoke, stress,
 GC, save/restore, `functionp`, and cross-emit (byte-identical x64 and aarch64
 ELFs) all match; `test/*.lisp` 67/72 byte-identical, the other five differ
-only in printed addresses.  The default layout is per-function neutral.  x18 is still the base register, which Darwin
-forbids — on Darwin the fold arm becomes a plain immediate load.
+only in printed addresses.  The default layout is per-function neutral.
+x18 is still the base register on Linux; Darwin runs without it (see Darwin
+differences).
 The interpreter honours the move for its simulated MV buffer; it still
 masks `+width-conv-bit+`, which is correct because addresses arrive real.
 
@@ -219,8 +220,32 @@ limit leaves no room for a fixed VA.
 
 ## Darwin differences the port must absorb
 
-- **x18 is reserved** by Apple's arm64 ABI (the OS may clobber it).  The
-  convention-block base moves to another callee-saved register.
+- **x18 is zeroed by the kernel — on macOS too, not only iOS.**  Measured on
+  this Mac (a C probe parks 0xDEADBEEF in x18 and spins under 1 kHz signals
+  and 16 competing threads): 214 of 3000 rounds came back 0.  So a Darwin
+  image may not depend on x18 at all.  There is no other register to spare
+  (x19–x28 are all taken), so on Darwin the convention base is not a register:
+  `*a64-x18-base*` off, and every slot address is loaded as an immediate.
+
+  Measured cost of that (fully moved image, x18 vs none, on Linux): code
+  +13% (65.5 → 74.2 MB); `sort` / `intern` / hash tables +3–5%; reader and
+  printer within noise; call/MV/special/handler-case/allocation loops
+  +1–2.5%.  A cheaper Darwin option exists but is unbuilt: code and region sit
+  at fixed VAs within ±4 GB, so `ADRP`+`ADD`/`LDR` reaches a slot in two
+  instructions with no register (vs one with x18, four as an immediate).
+  Linux and bare metal keep x18: it is free there and fastest.
+
+  The native GC trampoline used x18 as its Cheney slot cursor — preserved
+  across calls, and the one use a zeroing kernel would actually break (a
+  cursor reset mid-object scans from address 0).  It now uses x23, whose
+  value (stack_base) is dead once the root window is scanned, and no longer
+  saves or restores x18.  The longjmp path reloads x18 only when it is the
+  base.
+
+  **`MODUS_NO_X18=1` runs the Darwin discipline on Linux**: no x18 base (host
+  and JIT co-init), and the boot stub poisons x18 with the non-canonical
+  `0x0018DEAD0018DEAD`, so anything still depending on it faults here
+  instead of intermittently on a Mac.
 - **Syscall convention**: `svc #0x80`, number in **x16** (Linux: `svc #0`,
   x8).  Errors set the **carry flag** and return a **positive** errno; Linux
   returns `-errno`.  The trap must `b.cc` past a `neg x0, x0` so the runtime

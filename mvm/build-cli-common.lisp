@@ -570,6 +570,15 @@
           (setq out (list* (cdr kv) (parse-integer v :radix 16) out)))))
     out))
 
+;; MODUS_NO_X18=1: the DARWIN register discipline on Linux.  macOS and iOS
+;; zero x18 on preemption (measured, docs/macos-hosting.md), so an image for
+;; them must never depend on it: no convention base in x18, and the boot stub
+;; POISONS x18 so anything that still reads it breaks here, where it can be
+;; debugged, instead of intermittently on a Mac.
+(defvar *cli-no-x18*
+  (let ((v (sb-ext:posix-getenv "MODUS_NO_X18")))
+    (and v (plusp (length v)) (string/= v "0"))))
+
 (defvar *aarch64-jit-coinit-source*
   (when (and *jit-on* (eq *cli-arch* :aarch64)) (concatenate 'string "
 (defun %init-aarch64-translator ()
@@ -581,7 +590,7 @@
     (aset map 16 0) (aset map 17 24) (aset map 18 25) (aset map 19 26)
     (aset map 20 31) (aset map 21 29) (aset map 22 nil)
     (setq *a64-vreg-to-phys* map)
-  (setq *a64-x18-base* t))   ; x18 = convention base (translate-aarch64), a defvar whose init never runs in-image
+  (setq *a64-x18-base* " (if *cli-no-x18* "nil" "t") "))   ; x18 = convention base (translate-aarch64) unless MODUS_NO_X18; a defvar whose init never runs in-image
   ;; Hosted Linux preempts: YIELD (every loop back-edge) as SEV+WFE cost 18 cycles
   ;; per iteration on the A76 (2026-09-18), so the runtime JIT emits NOP for it.
   (setq *aarch64-yield-nop* t)

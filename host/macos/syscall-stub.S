@@ -10,12 +10,16 @@
 // passes the number as the 7th argument, and restores them.  x16 was already
 // spent by the caller; x18 is never touched (Apple reserves it); x19..x29 are
 // callee-saved by the C code itself.
+//
+// x19..x28 are STORED as well (never reloaded — the C side preserves them),
+// and the frame's address is the 8th argument: clone has to start a thread
+// with the caller's whole register file, which only exists here.
 
     .text
     .globl _modus_syscall_stub
     .p2align 2
 _modus_syscall_stub:
-    sub  sp, sp, #528
+    sub  sp, sp, #608
     stp  x1,  x2,  [sp, #0]
     stp  x3,  x4,  [sp, #16]
     stp  x5,  x6,  [sp, #32]
@@ -37,8 +41,15 @@ _modus_syscall_stub:
     stp  q26, q27, [sp, #432]
     stp  q28, q29, [sp, #464]
     stp  q30, q31, [sp, #496]
+    add  x16, sp, #528             // STP reaches only 504: address the
+    stp  x19, x20, [x16, #0]       // tail through x16 (spent by the caller)
+    stp  x21, x22, [x16, #16]
+    stp  x23, x24, [x16, #32]
+    stp  x25, x26, [x16, #48]
+    stp  x27, x28, [x16, #64]
     add  x29, sp, #128             // a frame the C side can unwind through
     mov  x6, x8                    // 7th argument: the Linux syscall number
+    mov  x7, sp                    // 8th: this frame (see struct stub_frame)
     bl   _modus_syscall
     ldp  q30, q31, [sp, #496]
     ldp  q28, q29, [sp, #464]
@@ -61,7 +72,7 @@ _modus_syscall_stub:
     ldp  x5,  x6,  [sp, #32]
     ldp  x3,  x4,  [sp, #16]
     ldp  x1,  x2,  [sp, #0]
-    add  sp, sp, #528
+    add  sp, sp, #608
     ret
 
 // Enter the image: switch to its stack and jump to its entry point.
@@ -73,3 +84,30 @@ _modus_enter:
     mov  x29, #0
     mov  x30, #0
     br   x1
+
+// Start a cloned thread inside the image (docs/macos-hosting.md, threads).
+//   x0 = struct resume_ctx { x[31]; sp; pc; }: the parent's register file at
+//   its clone call, with x0 = 0.  x16/x17 carry SP and PC and x18 is left
+//   alone (Apple's).
+    .globl _modus_resume
+    .p2align 2
+_modus_resume:
+    ldr  x16, [x0, #248]
+    mov  sp, x16
+    ldr  x17, [x0, #256]
+    ldp  x1,  x2,  [x0, #8]
+    ldp  x3,  x4,  [x0, #24]
+    ldp  x5,  x6,  [x0, #40]
+    ldp  x7,  x8,  [x0, #56]
+    ldp  x9,  x10, [x0, #72]
+    ldp  x11, x12, [x0, #88]
+    ldp  x13, x14, [x0, #104]
+    ldr  x15,      [x0, #120]
+    ldp  x19, x20, [x0, #152]
+    ldp  x21, x22, [x0, #168]
+    ldp  x23, x24, [x0, #184]
+    ldp  x25, x26, [x0, #200]
+    ldp  x27, x28, [x0, #216]
+    ldp  x29, x30, [x0, #232]
+    ldr  x0,       [x0, #0]
+    br   x17

@@ -104,7 +104,9 @@
           (let ((q (%gc-read64 (%thr-page-slot))))
             (if (> q 0)
                 (progn (spin-unlock (%thr-page-lock)) q)
-                (let ((m (%mmap-shared-page 606208)))
+                ;; AArch64 appends sixteen 0x11000-byte window blocks at
+                ;; 0x94000 (see %THR-TLS-BLOCK).
+                (let ((m (%mmap-shared-page (%layout-if :a64-threads 1720320 606208))))
                   ;; A failed mmap comes back as a small negative (-errno).
                   (if (< m 4096)
                       (progn (spin-unlock (%thr-page-lock)) 0)
@@ -156,9 +158,17 @@
     (if (zerop p) 0 (+ p (+ #x54000 (* cpu #x4000))))))
 
 (defun %thr-tls-block (cpu)
-  "CPU's 4 KB PER-THREAD WINDOW block, or 0 if the page could not be mapped."
+  "CPU's 4 KB PER-THREAD WINDOW block, or 0 if the page could not be mapped.
+   On AArch64 the window reaches past the first page — the handler-frame stack
+   at +0x10000 and two words just below it (translate-aarch64.lisp, THE
+   PER-THREAD WINDOW, AARCH64) — so its blocks are 0x11000 bytes, laid after
+   everything x86-64 keeps in the thread page."
   (let ((p (%thr-page)))
-    (if (zerop p) 0 (+ p (+ #x2000 (* cpu #x1000))))))
+    (if (zerop p)
+        0
+        (%layout-if :a64-threads
+          (+ p (+ #x94000 (* cpu #x11000)))
+          (+ p (+ #x2000 (* cpu #x1000)))))))
 
 ;;; ============================================================
 ;;; THE PER-THREAD WINDOW, INSTALLED
@@ -191,7 +201,12 @@
    thread, where nothing ever wrote it."
   (let ((lo (mem-ref #x10000C30 :u32))
         (hi (mem-ref #x10000C34 :u32)))
-    (if (= hi 0) lo (+ (* (* hi 65536) 65536) lo))))
+    (if (= hi 0)
+        lo
+        ;; SIGNED: an AArch64 delta may be negative (see %TLS-INSTALL).
+        (if (>= hi #x80000000)
+            (+ (* (* (- hi 4294967296) 65536) 65536) lo)
+            (+ (* (* hi 65536) 65536) lo)))))
 
 (defun %tls-set-self-base (base)
   "Store BASE as the EXACT machine word in the self slot.  Two :u32 halves,
@@ -218,13 +233,16 @@
    ADDRESSES in the emitted code are unchanged: the segment moves, not the
    literal."
   (let ((b (%thr-tls-block cpu)))
-    (if (or (zerop b) (< b (%conv-addr #x10000000)))
+    (if (or (zerop b)
+            (and (< b (%conv-addr #x10000000)) (= (%layout-if :a64-threads 0 1) 1)))
         ;; A block BELOW the window base would make the segment base negative,
         ;; i.e. non-canonical, and arch_prctl would refuse it.  Refuse first so
-        ;; the caller sees a decision rather than an errno.
+        ;; the caller sees a decision rather than an errno.  AArch64 adds the
+        ;; delta in a register, where a negative one wraps correctly, and it
+        ;; needs to: macOS maps the thread page BELOW the relocated region.
         1
         (let* ((delta (- b (%conv-addr #x10000000)))
-               (r (syscall3 158 #x1002 delta 0)))
+               (r (%arch-set-thread-delta delta)))
           (if (zerop r)
               (progn
                 ;; EMPTY THIS THREAD'S DYNAMIC-BINDING STACK BEFORE ARMING IT.
@@ -249,6 +267,28 @@
    process-wide one.  Reads the self slot THROUGH the window, so a thread that
    has installed one sees its own non-zero base and the main thread sees 0."
   (if (zerop (%tls-self-base)) 0 1))
+
+;;; ON AARCH64 THE PER-CPU POINTER LIVES IN THE WINDOW, so a thread cannot have
+;;; its own per-CPU block without its own window.  On x86-64 the two are
+;;; independent segment bases, and threads started by the older two-thread
+;;; path (%HA-SPAWN-T2, net/hosted-actors-post.lisp) set GS and never FS.  The
+;;; same thread on AArch64 would write its per-CPU pointer into the SPAWNER's
+;;; window, and both would then read one CPU id and one active-region cell.
+;;; So a thread giving itself a non-zero CPU without a window gets one here
+;;; first.  The main thread (CPU 0) keeps the process window, and a thread from
+;;; %THR-TRAMPOLINE has already installed its own.  A last-defun-wins override
+;;; of net/hosted-actors-post.lisp's definition, here because %TLS-INSTALL is
+;;; defined in this file; the x86-64 arm is that definition verbatim.
+(defun %ha-percpu-init-cpu (base cpu)
+  (%layout-if :a64-threads
+    (if (and (> cpu 0) (zerop (%tls-self-base)) (not (zerop (%tls-install cpu))))
+        -1
+        (let ((r (%arch-set-percpu-base base)))
+          (if (zerop r) (percpu-set 16 cpu) 0)
+          r))
+    (let ((r (%arch-set-percpu-base base)))
+      (if (zerop r) (percpu-set 16 cpu) 0)
+      r)))
 
 ;;; ============================================================
 ;;; CLOCKS
@@ -1333,7 +1373,19 @@
    once, shrinking region 0's size — and, in the same breath, the live
    allocation limit if region 0 is active and the parked one if it is not —
    so main can never reach it.  1 = arena ready, 0 = heap too small or
-   frontier already past the carve point (both keep today's path)."
+   frontier already past the carve point (both keep today's path).
+
+   COLLECT FIRST, THEN RE-ASK, exactly as %HA-CARVE-ROOM does for the band: a
+   frontier past the carve point usually means only that nothing has collected
+   yet.  Measured on the AArch64 CLI with 432 MB semispaces: boot alone put
+   region 0's frontier past it, so every threaded run lost the arena."
+  (if (= (%rt-arena-carve-1) 1)
+      1
+      (if (= (%gc-region-0) (%gc-region))
+          (progn (%gc-collect-here) (%rt-arena-carve-1))
+          0)))
+
+(defun %rt-arena-carve-1 ()
   (if (> (%rt-arena-end) 0)
       1
       (let* ((k (%gc-meta-scale))
@@ -1343,9 +1395,13 @@
         (if (< size #x6000000)
             0
             (let ((newsize (- size #x2000000)))
-              (if (or (> (%gc-meta-read (+ r0 #x30) k) (+ from newsize))
-                      (and (= r0 (%gc-region))
-                           (> (get-alloc-ptr) (+ from newsize))))
+              ;; The frontier is the LIVE pointer while region 0 is active —
+              ;; its parked word is whatever was last parked, which a
+              ;; collection since then does not rewrite — and the parked one
+              ;; otherwise.
+              (if (if (= r0 (%gc-region))
+                      (> (get-alloc-ptr) (+ from newsize))
+                      (> (%gc-meta-read (+ r0 #x30) k) (+ from newsize)))
                   0
                   (let ((base (%ha-align-up-to-page-base (+ from newsize))))
                     (%gc-region-shrink r0 newsize k)
@@ -1459,8 +1515,18 @@
         ;; writing that slot once the gate is open (translate-x64).
         (when (= (mem-ref (%rt-gate-addr) :u32) 0)
           (%tls-set-self-base 0))
+        ;; COMPILE AHEAD BEFORE THE GATE OPENS (the block below says why it
+        ;; happens at all).  With the gate open, every locked section
+        ;; allocates from a per-CPU SLICE of the lock arena, and a section
+        ;; that outgrows its slice's 64 KB headroom collects THE SLICE — the
+        ;; B-lite landmine.  Installing a hundred native functions grows and
+        ;; rehashes the symbol-function table inside one such section:
+        ;; measured on the AArch64 CLI, the arena's words came back zeroed
+        ;; and the next toplevel form died TYPE-ERROR.  Nothing is running on
+        ;; a second thread yet, so compiling here loses nothing.
+        (%rt-eager-compile)
         (setf (mem-ref (%rt-gate-addr) :u32) 1)
-        ;; AND COMPILE THE COMPAT SURFACE, because from here on it is hot and
+        ;; (%RT-EAGER-COMPILE, above.)  COMPILE THE COMPAT SURFACE, because from here on it is hot and
         ;; it is BYTECODE.  net/cooperative-atomics.lisp and the SB-* shims
         ;; are baked as SOURCE and evaluated at boot -- they have to be, the
         ;; host owns those package names -- so every function in them is an
@@ -1481,11 +1547,23 @@
         ;; about to call this surface at rate, and it pays once.
         ;; MODUS_NO_EAGER_THREADS=1 is the rollback; a failure to compile is
         ;; not a failure to arm, so it is swallowed.
-        (let ((off (%cli-getenv "MODUS_NO_EAGER_THREADS")))
-          (if (and off (> (length off) 0) (not (string= off "0")))
-              0
-              (handler-case (progn (jit-eager) 0) (t (c) 0))))
         1)))
+
+(defun %rt-eager-compile ()
+  "JIT-EAGER for %RT-THREADS-ON, gate still shut, IN REGION 0.  The native
+   functions it publishes go into process-wide tables, so they must not be
+   allocated in whatever private region the caller is in (%TL-SELFTEST enters
+   one before switching threads on) — that is the cross-region reference the
+   lock otherwise prevents."
+  (let ((off (%cli-getenv "MODUS_NO_EAGER_THREADS")))
+    (if (and off (> (length off) 0) (not (string= off "0")))
+        0
+        (let ((prev (if (= (%gc-region) (%gc-region-0))
+                        0
+                        (%gc-region-enter (%gc-region-0)))))
+          (handler-case (progn (jit-eager) 0) (t (c) 0))
+          (if (zerop prev) 0 (%gc-region-enter prev))
+          0))))
 
 (defun %rt-threads-off ()
   (setf (mem-ref (%rt-gate-addr) :u32) 0)

@@ -726,7 +726,7 @@
 ;;; ============================================================
 ;;;
 ;;; x64's root is #x10000F00 (*x64-jit-constvec-root*, translate-x64.lisp:99).
-;;; aarch64's is #x10000F10 (*aarch64-jit-constvec-root*, translate-aarch64.lisp
+;;; aarch64's is #x10000FD0 (*aarch64-jit-constvec-root*, translate-aarch64.lisp
 ;;; :208) — deliberately NOT F00, because on bare-metal aarch64 F00 is
 ;;; +rpi-cl-dtb-ptr-slot+ (boot/boot-rpi-cl.lisp:153), the firmware device-tree
 ;;; pointer.  The emitted li-const load reads the per-target root
@@ -759,7 +759,7 @@
 (defun %jit-constvec-root ()
   "The BSS word holding the tagged JIT constant vector FOR THE ACTIVE BACK-END.
    Must equal the translator's own root — *x64-jit-constvec-root* (#x10000F00)
-   or *aarch64-jit-constvec-root* (#x10000F10) — because the emitted li-const
+   or *aarch64-jit-constvec-root* (#x10000FD0) — because the emitted li-const
    load and the collector's fixed-root scan both use that one.
 
    A DEFUN, not a defvar: a defvar initform does not run in-image (Limitation 7)
@@ -767,7 +767,7 @@
    *jit-target-arch* never got set falls back to the x64 slot, which is the
    historical value — i.e. this change is a no-op on x64 by construction."
   (if (and (boundp (quote *jit-target-arch*)) (eq *jit-target-arch* :aarch64))
-      (%conv-addr #x10000F10)
+      (%conv-addr #x10000FD0)
       (%conv-addr #x10000F00)))
 
 (defvar *jit-constvec-cap* nil

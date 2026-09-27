@@ -26,6 +26,8 @@
 #include <mach-o/ldsyms.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <os/os_sync_wait_on_address.h>
+#include <os/clock.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
@@ -365,9 +367,164 @@ static long jit_read(int fd, void *buf, size_t n) {
     return r;
 }
 
+// -------------------------------------------------------------- threads ---
+// The image's threads are Linux threads: clone(CLONE_VM|...|CLONE_THREAD|
+// PARENT_SETTID|CHILD_CLEARTID) with a stack of its own, a per-thread window
+// delta (translate-aarch64.lisp, THE PER-THREAD WINDOW, AARCH64), exit(93) for
+// the thread alone, and a join that polls the TID word the kernel clears.
+//
+// clone returns TWICE, in the parent and in the child, with every register
+// but x0 and SP the parent's.  A pthread cannot be born that way, so the
+// stub's frame (every register at the call) is copied into a resume context
+// and the new pthread jumps into the image with it: PC = the instruction after
+// the stub call, SP = the image's stack, x0 = 0.  The C pthread's own stack
+// is left behind after that; syscalls from the thread run on the image's
+// stack, as the main thread's do.
+//
+// The delta lives in a pthread key the image reads at TPIDRRO_EL0 + 8*key.
+// Keys are handed out lowest-free-first, so creating keys until we hold
+// MODUS_TSD_KEY reserves it; the image was linked against the same number
+// (hosted-layout-env.lisp +LAYOUT-DARWIN-TSD-KEY+).
+#define MODUS_TSD_KEY 300
+#define LX_SYS_SET_THREAD_DELTA 1000     // translate-aarch64 +A64-DARWIN-SYS-SET-THREAD-DELTA+
+
+struct stub_frame {                       // syscall-stub.S, 608 bytes
+    uint64_t x1_15[15];                   // x1..x15            @0
+    uint64_t x17, x29, x30;               //                    @120
+    uint64_t q[48];                       // q0-7, q16-31       @144
+    uint64_t x19_28[10];                  // x19..x28           @528
+};
+struct resume_ctx { uint64_t x[31]; uint64_t sp, pc; };
+extern void modus_resume(struct resume_ctx *) __attribute__((noreturn));
+
+static pthread_key_t delta_key;
+static __thread uint32_t *my_ctid;        // CLONE_CHILD_CLEARTID word, or NULL
+static __thread int is_clone;             // a thread this shim started
+
+static void reserve_delta_key(void) {
+    pthread_key_t k;
+    for (;;) {
+        if (pthread_key_create(&k, NULL) != 0) die("pthread_key_create failed", 0);
+        if (k == MODUS_TSD_KEY) break;
+        if (k > MODUS_TSD_KEY) die("the per-thread-window pthread key is already taken", (long)k);
+    }
+    delta_key = k;
+}
+
+// A Linux TID is a positive 32-bit number; Darwin's thread ids are 64-bit
+// and sequential.  Keep the low 31 bits (distinct for 2^31 consecutive
+// threads) and never answer 0, which the join reads as "exited".
+static long lx_tid(uint64_t id) {
+    long t = (long)(id & 0x7FFFFFFF);
+    return t ? t : 1;
+}
+static long my_tid(void) {
+    if (pthread_main_np()) return getpid();     // Linux: the group leader's TID is the PID
+    uint64_t id = 0;
+    pthread_threadid_np(NULL, &id);
+    return lx_tid(id);
+}
+
+struct clone_start { struct resume_ctx ctx; void *delta; uint32_t *ctid; };
+
+static void *clone_child(void *arg) {
+    struct clone_start cs = *(struct clone_start *)arg;
+    free(arg);
+    is_clone = 1;
+    my_ctid = cs.ctid;
+    pthread_setspecific(delta_key, cs.delta);   // the parent's window, as Linux inherits TPIDR_EL0
+    // sigaltstack is per thread: the fault handler needs one here too.
+    stack_t ss = { .ss_sp = malloc(1 << 16), .ss_size = 1 << 16, .ss_flags = 0 };
+    sigaltstack(&ss, NULL);
+    modus_resume(&cs.ctx);
+}
+
+static long dx_clone(long flags, long newsp, uint32_t *ptid, uint32_t *ctid,
+                     struct stub_frame *f) {
+    if ((flags & 0x10000) == 0) return -38;     // only CLONE_THREAD: fork is not a clone here
+    struct clone_start *cs = calloc(1, sizeof *cs);
+    for (int i = 1; i <= 15; i++) cs->ctx.x[i] = f->x1_15[i - 1];
+    cs->ctx.x[17] = f->x17;
+    for (int i = 19; i <= 28; i++) cs->ctx.x[i] = f->x19_28[i - 19];
+    cs->ctx.x[29] = f->x29;
+    cs->ctx.x[30] = f->x30;
+    cs->ctx.x[0] = 0;
+    // The stub returns to the instruction after its BLR, which pops the saved
+    // LR: start 16 below the new stack so that pop leaves SP where clone put it.
+    cs->ctx.sp = (uint64_t)newsp - 16;
+    cs->ctx.pc = f->x30;
+    cs->delta = pthread_getspecific(delta_key);
+    cs->ctid = (flags & 0x200000) ? ctid : NULL;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&at, 1 << 18);
+    pthread_t th;
+    int e = pthread_create(&th, &at, clone_child, cs);
+    pthread_attr_destroy(&at);
+    if (e) { free(cs); return -lx_errno(e); }
+    uint64_t id = 0;
+    pthread_threadid_np(th, &id);
+    long tid = lx_tid(id);
+    // PARENT_SETTID and CHILD_CLEARTID name the same word here; Linux writes it
+    // before clone returns in the parent, and so must we — the join polls it.
+    if (flags & 0x100000) __atomic_store_n(ptid, (uint32_t)tid, __ATOMIC_SEQ_CST);
+    return tid;
+}
+
+static void thread_exit(void) {
+    if (my_ctid) {
+        __atomic_store_n(my_ctid, 0, __ATOMIC_SEQ_CST);
+        os_sync_wake_by_address_all(my_ctid, 4, OS_SYNC_WAKE_BY_ADDRESS_NONE);
+    }
+    pthread_exit(NULL);
+}
+
+// futex(uaddr, op, val, timeout): WAIT and WAKE, private or not.
+static long dx_futex(uint32_t *ua, long op, long val, const struct timespec *to) {
+    switch (op & 0x7F) {
+    case 0: {                                   // FUTEX_WAIT
+        if (__atomic_load_n(ua, __ATOMIC_SEQ_CST) != (uint32_t)val) return -11;   // EAGAIN
+        int r;
+        if (to) {
+            uint64_t ns = (uint64_t)to->tv_sec * 1000000000ULL + (uint64_t)to->tv_nsec;
+            if (ns == 0) return -110;
+            r = os_sync_wait_on_address_with_timeout(ua, (uint64_t)(uint32_t)val, 4,
+                    OS_SYNC_WAIT_ON_ADDRESS_NONE, OS_CLOCK_MACH_ABSOLUTE_TIME, ns);
+        } else {
+            r = os_sync_wait_on_address(ua, (uint64_t)(uint32_t)val, 4, OS_SYNC_WAIT_ON_ADDRESS_NONE);
+        }
+        if (r >= 0) return 0;
+        return errno == ETIMEDOUT ? -110 : errno == EINTR ? -4 : 0;
+    }
+    case 1: {                                   // FUTEX_WAKE
+        if (val <= 0) return 0;
+        int r = val == 1 ? os_sync_wake_by_address_any(ua, 4, OS_SYNC_WAKE_BY_ADDRESS_NONE)
+                         : os_sync_wake_by_address_all(ua, 4, OS_SYNC_WAKE_BY_ADDRESS_NONE);
+        return r == 0 ? 1 : 0;                  // ENOENT: nobody was waiting
+    }
+    default: return -38;
+    }
+}
+
 static unsigned char unknown_seen[512];
 
-long modus_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long nr) {
+static long modus_syscall_1(long a0, long a1, long a2, long a3, long a4, long a5, long nr,
+                            struct stub_frame *frame);
+static int strace_on = -1;
+// MODUS_SHIM_STRACE=1: every translated call and its result, on stderr.
+long modus_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long nr,
+                   struct stub_frame *frame) {
+    if (strace_on < 0) strace_on = getenv("MODUS_SHIM_STRACE") != NULL;
+    long r = modus_syscall_1(a0, a1, a2, a3, a4, a5, nr, frame);
+    if (strace_on)
+        fprintf(stderr, "[%ld] sys %ld(%#lx, %#lx, %#lx, %#lx) = %ld\n",
+                my_tid(), nr, a0, a1, a2, a3, r);
+    return r;
+}
+
+static long modus_syscall_1(long a0, long a1, long a2, long a3, long a4, long a5, long nr,
+                            struct stub_frame *frame) {
     struct stat st;
     switch (nr) {
     case 63:  RET(jit_read((int)a0, (void *)a1, (size_t)a2));
@@ -385,12 +542,17 @@ long modus_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long nr
     case 222: return dx_mmap(a0, a1, a2, a3, a4, a5);
     case 215: RET(munmap((void *)a0, (size_t)a1));
     case 226: RET(mprotect((void *)a0, (size_t)a1, (int)a2));
-    case 93: case 94: _exit((int)a0);
+    case 93: if (is_clone) thread_exit(); _exit((int)a0);   // exit: the THREAD
+    case 94: _exit((int)a0);                                // exit_group
+    case 220: return dx_clone(a0, a1, (uint32_t *)a2, (uint32_t *)a4, frame);
+    case 98:  return dx_futex((uint32_t *)a0, a1, a2, (const struct timespec *)a3);
+    case LX_SYS_SET_THREAD_DELTA: pthread_setspecific(delta_key, (void *)a0); return 0;
     case 113: RET(clock_gettime(dx_clock(a0), (struct timespec *)a1));
     case 169: RET(gettimeofday((struct timeval *)a0, NULL));
     case 101: RET(nanosleep((const struct timespec *)a0, (struct timespec *)a1));
     case 124: RET(sched_yield());
-    case 172: case 178: return getpid();
+    case 172: return getpid();
+    case 178: return my_tid();                     // gettid
     case 17: {                                     // getcwd: Linux returns the length
         if (!getcwd((char *)a0, (size_t)a1)) return -lx_errno(errno);
         return (long)strlen((char *)a0) + 1; }
@@ -466,7 +628,7 @@ static void pr_reg(const char *n, uint64_t v) {
     else fprintf(stderr, " %s=%#llx", n, (unsigned long long)v);
 }
 static void report_fault(int sig, siginfo_t *si, void *uc_);
-static uint64_t last_flip_pc; static int same_pc_flips;
+static __thread uint64_t last_flip_pc; static __thread int same_pc_flips;   // per thread: W^X is
 
 static void on_fault(int sig, siginfo_t *si, void *uc_) {
     ucontext_t *uc = uc_;
@@ -589,6 +751,7 @@ int main(int argc, char **argv, char **envp) {
     sp[k++] = 0; sp[k++] = 0;                      // auxv: AT_NULL
 
     g_code_lo = ph->vaddr; g_code_hi = ph->vaddr + ph->memsz;
+    reserve_delta_key();
     install_fault_report();
     modus_enter((uint64_t)(uintptr_t)sp, eh->entry);
 }

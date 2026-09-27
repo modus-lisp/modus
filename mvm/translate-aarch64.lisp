@@ -250,7 +250,7 @@
             nil))
     (t (c) (let ((%ignore c)) %ignore) nil)))
 
-(defvar *aarch64-jit-constvec-root* #x10000F10
+(defvar *aarch64-jit-constvec-root* #x10000FD0
   "#282: fixed metadata word holding the tagged JIT constant VECTOR, the
    aarch64 sibling of *x64-jit-constvec-root*.  Emitted li-const loads read the
    pool object THROUGH this root, so a collection that moves the object — even
@@ -260,11 +260,16 @@
    NOT #x10000F00 (x64's slot).  On bare-metal RPi that address is
    +rpi-cl-dtb-ptr-slot+, the firmware device-tree pointer the boot preamble
    stores before kernel-main runs; the same translator serves both aarch64
-   targets, so the root has to be free on BOTH.  #x10000F10 is in the gap
-   boot/boot-rpi-cl.lisp documents as empty from #x10000EA8 to #x10001000
-   (aarch64 uses only E00/E18/E40 of the config block), 16 bytes clear of the
-   DTB slot and 240 clear of anything above.  Grep #x10000[EF].. before
-   claiming any other word in this range.")
+   targets, so the root has to be free on BOTH.
+
+   AND NOT #x10000F10, where it was until threads came to AArch64: that is
+   CPU 1's cell in the per-CPU active-region table (+GC-REGION-ADDR+ #x10000F08
+   + 8*cpu, sixteen cells to #x10000F88).  The first worker to adopt its region
+   wrote its control block's address over the JIT's constant vector, and the
+   next JIT-compiled QUOTE read garbage (measured: sb-thread:make-thread's
+   'SLOT came back as 0).  #x10000FD0 is clear of the table, the scheduler lock
+   at FC0 and the random seed at FD8.  Grep #x10000[EF].. before claiming any
+   other word in this range.")
 
 (defvar *aarch64-jit-constvec-p* nil
   "#282: enable the constant-VECTOR indirection for JIT-mode li-const.  NIL at
@@ -747,12 +752,14 @@
                    (or *aarch64-handler-pop-label*
                        (and *aarch64-jit-mode* *aarch64-jit-handler-va-slots-p*)))))
     (when probe
-      ;; save caller x30 to 0x10000FF0
-      (a64-load-imm64 buf +a64-x16+ (conv-real #x1000FFF0))
+      ;; save caller x30 to 0x1000FFF0 — THIS thread's copy: two threads
+      ;; arming handlers at once would otherwise return through each other's
+      ;; LR.  x9 is free: the helper clobbers x9..x13 anyway.
+      (a64-load-tls-addr buf +a64-x16+ #x1000FFF0 +a64-x9+)
       (a64-str-unsigned buf +a64-x30+ +a64-x16+ 0)
       (a64-emit-handler-helper-call buf which)
       ;; restore caller x30
-      (a64-load-imm64 buf +a64-x16+ (conv-real #x1000FFF0))
+      (a64-load-tls-addr buf +a64-x16+ #x1000FFF0 +a64-x9+)
       (a64-ldr-unsigned buf +a64-x30+ +a64-x16+ 0)
       t)))
 
@@ -1898,6 +1905,90 @@
 
 (defconstant +sysreg-tpidr-el1+ #xC684 "TPIDR_EL1: S3_0_C13_C0_4")
 (defconstant +sysreg-vbar-el1+  #xC600 "VBAR_EL1: S3_0_C12_C0_0")
+
+;;; ---- THE PER-THREAD WINDOW, AARCH64 -------------------------------------
+;;;
+;;; x86-64 makes the window per-thread with an FS segment override
+;;; (mvm/compiler.lisp, THE PER-THREAD WINDOW): an access keeps its literal
+;;; address and the segment base (0 on the main thread, block - window base on
+;;; a worker) is added by the hardware.  AArch64 has no segments, so the same
+;;; DELTA lives somewhere the kernel keeps per thread and every window access
+;;; adds it explicitly:
+;;;
+;;;   Linux    TPIDR_EL0 — user-writable, saved and restored per thread.  A
+;;;            static image's main thread starts with 0, which IS the main
+;;;            thread's delta, so (as on x86-64) nothing has to be initialised
+;;;            before the first MULTIPLE-VALUE-BIND.
+;;;   Darwin   TPIDR_EL0 is the KERNEL's: it rewrites it with the CPU number on
+;;;            context switches (measured: ~50 lost writes per thread in 3M
+;;;            reads; docs/macos-hosting.md).  TPIDRRO_EL0 points at the
+;;;            thread's pthread TSD array, so the delta lives in a pthread key
+;;;            the host shim reserves, at a byte offset fixed at link time.  An
+;;;            unset key reads 0: again nothing to initialise on the main thread.
+;;;
+;;; The window is x86-64's slot set PLUS what only AArch64 keeps in the low
+;;; BSS: the handler-frame stack at 0x10010000 (x86-64's is at 0x10000400,
+;;; inside the first page), the helper-call LR save at 0x1000FFF0, and the
+;;; per-CPU block pointer at 0x1000FFE8 (x86-64 has GS for that).  So an
+;;; AArch64 worker's block spans 0x11000 bytes, not 4 KB.
+;;;
+;;; Both specials default to NIL, which emits exactly the historic code; the
+;;; in-image JIT gets them from the co-init (a defvar initform does not run
+;;; there — see below).
+(defvar *a64-tls-window* nil
+  "Add the per-thread delta to every per-thread-window access (hosted threads).")
+
+(defvar *a64-tls-tsd-offset* nil
+  "NIL: the per-thread delta is TPIDR_EL0 (Linux).  An integer: it is the word
+   at that byte offset in the pthread TSD array TPIDRRO_EL0 points at (Darwin).")
+
+(defconstant +sysreg-tpidr-el0+   #xDE82 "TPIDR_EL0: S3_3_C13_C0_2")
+(defconstant +sysreg-tpidrro-el0+ #xDE83 "TPIDRRO_EL0: S3_3_C13_C0_3")
+
+(defun a64-load-thread-delta (buf rd)
+  "Xd = this thread's per-thread-window delta (0 on the main thread)."
+  (if *a64-tls-tsd-offset*
+      (progn (a64-mrs buf rd +sysreg-tpidrro-el0+)
+             (a64-ldr-unsigned buf rd rd *a64-tls-tsd-offset*))
+      (a64-mrs buf rd +sysreg-tpidr-el0+)))
+
+(defun a64-add-thread-delta (buf rd scratch)
+  "Xd += this thread's delta, when the window is per-thread.  SCRATCH /= RD."
+  (when *a64-tls-window*
+    (a64-load-thread-delta buf scratch)
+    (a64-add-reg buf rd rd scratch 0 0)))
+
+(defun a64-load-tls-addr (buf rd addr scratch)
+  "Per-thread-window address ADDR, for THIS thread, into Xd: A64-LOAD-CONV-ADDR
+   plus the delta when threads are on (SCRATCH /= RD is clobbered then)."
+  (a64-load-conv-addr buf rd addr)
+  (a64-add-thread-delta buf rd scratch))
+
+(defconstant +a64-darwin-sys-set-thread-delta+ 1000
+  "Pseudo-syscall number the Darwin host shim answers by storing x0 in the
+   reserved pthread key (host/macos/modus-shim.c).  Past every Linux number.")
+
+(defconstant +a64-percpu-ptr-addr+ #x1000FFE8
+  "Per-thread window slot holding the per-CPU block's address: AArch64's GS
+   base.  0 until %HA-PERCPU-INIT-CPU stores one, like a fresh GS.")
+
+(defun a64-gc-stat-addr (addr)
+  "Where one of the aarch64-only words at 0x10000F20..0x10000F58 (the GC pause
+   statistics and the JIT arena bump) lives in THIS image.  With threads they
+   move to 0x1000FF00..0x1000FF38: 0x10000F08 + 8*cpu is the per-CPU
+   active-region table (sixteen cells to 0x10000F88), and these words are CPU
+   3..10's cells.  mvm/gc.lisp and lib/save-image.lisp follow the same switch
+   through (%LAYOUT-IF :A64-THREADS ...)."
+  (if *a64-tls-window* (+ #x1000FF00 (- addr #x10000F20)) addr))
+
+(defun a64-load-percpu-base (buf rd scratch)
+  "Xd = the per-CPU block.  Bare metal: TPIDR_EL1.  Hosted with threads: the
+   window slot +A64-PERCPU-PTR-ADDR+ (EL0 cannot read TPIDR_EL1)."
+  (if *a64-tls-window*
+      (progn (a64-load-tls-addr buf rd +a64-percpu-ptr-addr+ scratch)
+             (a64-ldr-unsigned buf rd rd 0))
+      (a64-mrs buf rd +sysreg-tpidr-el1+)))
+
 ;;; JIT exec-page region for BARE METAL (#x0531 %MMAP-EXEC-PAGE bump allocator).
 ;;;
 ;;; DEFUNS, not defvars, and that is load-bearing: this file is BAKED INTO the
@@ -2175,7 +2266,7 @@
   (a64-ldr-unsigned buf +a64-x8+ +a64-sp+ 96))
 (defparameter *a64-local-scratch-traps*
   '(#x0300 #x0301 #x0500 #x0502 #x050B #x0503 #x0504 #x0505 #x0506 #x0507
-    #x0508 #x0509 #x050A #x0531 #x0534 #x0520)
+    #x0508 #x0509 #x050A #x0531 #x0534 #x0520 #x0540 #x0541)
   "Trap codes whose expansion clobbers x4/x5/x8 (syscall arguments and the
    syscall number).  Those are local registers V11-V13 now, so the trap op
    saves them around these arms.  SETJMP/LONGJMP and the overflow-arg copy
@@ -2321,7 +2412,7 @@
   (a64-mov-reg buf +a64-x0+ +a64-x9+)
   (a64-mov-reg buf +a64-x1+ +a64-x10+)
   ;; NARGS = 2 at the fixed convention slot (32-bit store).
-  (a64-load-conv-addr buf +a64-x17+ #x10000150)
+  (a64-load-tls-addr buf +a64-x17+ #x10000150 +a64-x16+)
   (a64-movz buf +a64-x16+ 2 0)
   (a64-str-width buf +a64-x16+ +a64-x17+ 0 2)
   ;; Call via fn-addr-patched MOVZ+MOVK+BLR.
@@ -2355,7 +2446,7 @@
   (a64-emit-load-vreg buf +a64-x10+ vb)
   (a64-mov-reg buf +a64-x0+ +a64-x9+)
   (a64-mov-reg buf +a64-x1+ +a64-x10+)
-  (a64-load-conv-addr buf +a64-x17+ #x10000150)
+  (a64-load-tls-addr buf +a64-x17+ #x10000150 +a64-x16+)
   (a64-movz buf +a64-x16+ 2 0)
   (a64-str-width buf +a64-x16+ +a64-x17+ 0 2)
   (a64-load-imm64 buf +a64-x16+ entry)
@@ -2368,7 +2459,20 @@
   ;; x86-64 syscall number -> AArch64 generic-ABI number, for the generic
   ;; 3-arg (0x0502) and 6-arg (0x050B) syscall traps.  A MISSING ENTRY IS A
   ;; WRONG SYSCALL (see the comment at the 0x0502 arm).
-  '(( 0 . 63)    ; read
+  ;;
+  ;; THE CHAIN IS SEQUENTIAL CMP/CSEL, so an entry whose FROM equals an
+  ;; earlier entry's TO re-maps that result: x64 202 (futex) must come BEFORE
+  ;; (43 . 202), or every accept becomes a futex.  Keep new entries first
+  ;; and check both columns.
+  '(;; Threads (net/hosted-sync.lisp, net/sb-thread-shim.lisp).  Unmapped,
+    ;; futex 202 was aarch64 accept and gettid 186 msgsnd.
+    (186 . 178)  ; gettid
+    (202 . 98)   ; futex
+    (35 . 101)   ; nanosleep
+    (24 . 124)   ; sched_yield
+    (72 . 25)    ; fcntl
+    (102 . 174)  ; getuid
+    ( 0 . 63)    ; read
                                   ( 1 . 64)    ; write
                                   ( 3 . 57)    ; close
                                   ( 5 . 80)    ; fstat
@@ -2658,7 +2762,7 @@
                 (a64-emit buf #xD50343FF))
                ((= code #x0400)
                 ;; switch-idle-stack: set SP to per-CPU idle-stack-top
-                (a64-mrs buf +a64-x16+ +sysreg-tpidr-el1+)
+                (a64-load-percpu-base buf +a64-x16+ +a64-x17+)
                 (a64-ldr-unsigned buf +a64-x16+ +a64-x16+ #x38)
                 (a64-add-imm buf +a64-sp+ +a64-x16+ 0))
                ((and *aarch64-linux-mode* (= code #x0500))
@@ -2768,6 +2872,72 @@
                 (a64-mov-reg buf +a64-x1+ +a64-x2+)    ; x1 = arg2 raw
                 (a64-mov-reg buf +a64-x2+ +a64-x3+)    ; x2 = arg3 raw
                 (a64-svc buf 0))
+               ((and *aarch64-linux-mode* (= code #x0540))
+                ;; %SPAWN-THREAD — clone(2) a NATIVE OS THREAD.  The AArch64
+                ;; twin of translate-x64's #x0540, whose comment says why this
+                ;; is a stub and not a syscall6: clone returns TWICE, the child
+                ;; with the parent's FP and every other register, so it must
+                ;; branch off here, before any compiled Lisp touches a frame.
+                ;;   x0 = entry (tagged raw address of a 0-arg native function)
+                ;;   x1 = stack top (tagged, 16-aligned)   x2 = tid word (tagged)
+                ;; Parent: x0 = child TID (or -errno), tagged; x1..x3 kept.
+                ;; Child: FP = LR = 0, BLR entry on its own stack, then exit(93)
+                ;; — the THREAD, never exit_group.
+                ;;
+                ;; clone(flags, newsp, parent_tid, tls, child_tid) — the
+                ;; generic-ABI argument order, not x86-64's.  Same flags,
+                ;; 0x3D0F00: VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|PARENT_SETTID|
+                ;; CHILD_CLEARTID (the join is the kernel zeroing the tid word).
+                ;; No CLONE_SETTLS: the child is born with the parent's
+                ;; TPIDR_EL0, i.e. the parent's window, until %TLS-INSTALL —
+                ;; exactly x86-64's FS arrangement.
+                ;;
+                ;; x9 carries the entry into the child: every register but x0
+                ;; and SP is copied.  x4/x5/x8 are saved around this arm
+                ;; (*A64-LOCAL-SCRATCH-TRAPS*).
+                (a64-stp-pre buf +a64-x1+ +a64-x2+ +a64-sp+ -32)
+                (a64-stp-offset buf +a64-x3+ +a64-x9+ +a64-sp+ 16)
+                (a64-asr-imm buf +a64-x9+ +a64-x0+ 1)          ; entry
+                (a64-asr-imm buf +a64-x1+ +a64-x1+ 1)          ; newsp
+                (a64-asr-imm buf +a64-x2+ +a64-x2+ 1)          ; parent_tid
+                (a64-mov-reg buf +a64-x4+ +a64-x2+)            ; child_tid
+                (a64-movz buf +a64-x3+ 0 0)                    ; tls: unused
+                (a64-movz buf +a64-x0+ #x0F00 0)
+                (a64-movk buf +a64-x0+ #x003D 1)               ; flags
+                (a64-movz buf +a64-x8+ 220 0)                  ; SYS_clone
+                (a64-svc buf 0)
+                (let ((child (incf *mvm-label-counter*))
+                      (done (incf *mvm-label-counter*)))
+                  (a64-cmp-imm buf +a64-x0+ 0)
+                  (let ((i (a64-current-index buf)))
+                    (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i child :bcond))
+                  ;; ---- PARENT ----
+                  (a64-lsl-imm buf +a64-x0+ +a64-x0+ 1)
+                  (a64-ldp-offset buf +a64-x3+ +a64-x9+ +a64-sp+ 16)
+                  (a64-ldp-post buf +a64-x1+ +a64-x2+ +a64-sp+ 32)
+                  (let ((i (a64-current-index buf)))
+                    (a64-b buf 0) (a64-add-fixup buf i done :b))
+                  ;; ---- CHILD: SP = its own stack top ----
+                  (a64-set-label buf child)
+                  (a64-movz buf +a64-x29+ 0 0)
+                  (a64-movz buf +a64-x30+ 0 0)
+                  (a64-blr buf +a64-x9+)
+                  (a64-movz buf +a64-x0+ 0 0)
+                  (a64-movz buf +a64-x8+ 93 0)                 ; SYS_exit (thread)
+                  (a64-svc buf 0)
+                  (a64-brk buf 0)                              ; unreachable
+                  (a64-set-label buf done)))
+               ((and *aarch64-linux-mode* (= code #x0541))
+                ;; %SET-THREAD-DELTA — THIS thread's per-thread-window delta
+                ;; (x0, tagged).  Linux: TPIDR_EL0 directly.  Darwin: the host
+                ;; shim stores it in the reserved pthread key
+                ;; (+A64-DARWIN-SYS-SET-THREAD-DELTA+).  Returns 0.
+                (a64-asr-imm buf +a64-x0+ +a64-x0+ 1)
+                (if *a64-tls-tsd-offset*
+                    (progn (a64-movz buf +a64-x8+ +a64-darwin-sys-set-thread-delta+ 0)
+                           (a64-svc buf 0))
+                    (a64-msr-sysreg buf +sysreg-tpidr-el0+ +a64-x0+))
+                (a64-movz buf +a64-x0+ 0 0))
                ((and *aarch64-linux-mode* (= code #x0505))
                 ;; LINUX-ALARM: AArch64 setitimer(ITIMER_REAL, &new, NULL).
                 ;; V0 = duration in seconds (tagged; 0 = clear).
@@ -2896,7 +3066,7 @@
                 (a64-add-imm buf +a64-x1+ +a64-x1+ 15)
                 (a64-lsr-imm buf +a64-x1+ +a64-x1+ 4)
                 (a64-lsl-imm buf +a64-x1+ +a64-x1+ 4)        ; 16-align size
-                (a64-load-conv-addr buf +a64-x9+ #x10000F58)     ; x9  = &bump
+                (a64-load-conv-addr buf +a64-x9+ (a64-gc-stat-addr #x10000F58)) ; x9 = &bump
                 (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0)  ; x10 = cur
                 (let ((cbz-at (a64-current-index buf)))
                   (a64-emit buf 0)                           ; CBZ x10 -> fallback
@@ -3058,7 +3228,7 @@
                 (a64-store-spill buf +a64-x4+ +vreg-v11+)
                 (a64-store-spill buf +a64-x5+ +vreg-v12+)
                 (a64-store-spill buf +a64-x8+ +vreg-v13+)
-                (a64-load-conv-addr buf +a64-x16+ #x10000180)
+                (a64-load-tls-addr buf +a64-x16+ #x10000180 +a64-x17+)
                 (a64-add-imm buf +a64-x17+ +a64-sp+ 0)        ; mov x17, sp
                 (a64-str-unsigned buf +a64-x17+ +a64-x16+ 0)
                 (a64-str-unsigned buf +a64-x29+ +a64-x16+ 8)
@@ -3113,8 +3283,8 @@
                   ((or *aarch64-handler-pop-label*
                        (and *aarch64-jit-mode* *aarch64-jit-handler-va-slots-p*))
                    ;; Read current 180/188/190 → scratch 0xC10/C18/C20.
-                   (a64-load-conv-addr buf +a64-x16+ #x10000180)
-                   (a64-load-conv-addr buf +a64-x17+ #x10000C10)
+                   (a64-load-tls-addr buf +a64-x16+ #x10000180 +a64-x17+)
+                   (a64-load-tls-addr buf +a64-x17+ #x10000C10 +a64-x15+)
                    (a64-ldr-unsigned buf +a64-x15+ +a64-x16+ 0)
                    (a64-str-unsigned buf +a64-x15+ +a64-x17+ 0)
                    (a64-ldr-unsigned buf +a64-x15+ +a64-x16+ 8)
@@ -3129,7 +3299,7 @@
                    ;; the VA slot from a runtime-JIT page — #307).
                    (a64-emit-handler-helper-call buf :pop)
                    ;; Restore inner SP/FP/IP from scratch.
-                   (a64-load-conv-addr buf +a64-x17+ #x10000C10)
+                   (a64-load-tls-addr buf +a64-x17+ #x10000C10 +a64-x16+)
                    (a64-ldr-unsigned buf +a64-x16+ +a64-x17+ 0)
                    (a64-add-imm buf +a64-sp+ +a64-x16+ 0)
                    (a64-ldr-unsigned buf +a64-x29+ +a64-x17+ 8)
@@ -3137,7 +3307,7 @@
                    (a64-load-imm64 buf +a64-x0+ #xDEAD1009)
                    (a64-br buf +a64-x16+))
                   (t
-                   (a64-load-conv-addr buf +a64-x16+ #x10000180)
+                   (a64-load-tls-addr buf +a64-x16+ #x10000180 +a64-x17+)
                    (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ 0)  ; saved SP
                    (a64-add-imm buf +a64-sp+ +a64-x17+ 0)
                    (a64-ldr-unsigned buf +a64-x29+ +a64-x16+ 8)  ; FP
@@ -3163,15 +3333,15 @@
                   ;; from a runtime-JIT page — through the VA slot (#307).
                   ((a64-emit-handler-helper-call-framed buf :pop))
                   (t
-                   (a64-load-conv-addr buf +a64-x16+ #x10000180)
+                   (a64-load-tls-addr buf +a64-x16+ #x10000180 +a64-x17+)
                    (a64-str-unsigned buf +a64-xzr+ +a64-x16+ 0))))
                ((= code #x0513)
                 ;; SAVE-OUTER: copy slot 0x10000180/188/190 → 0x100001A0/1A8/1B0.
                 ;; Used by fork-file to establish a "fallback" handler that
                 ;; the IRQ deadline can longjmp to even when slot 180 has
                 ;; been zeroed by a per-test CLEAR-HANDLER.
-                (a64-load-conv-addr buf +a64-x16+ #x10000180)
-                (a64-load-conv-addr buf +a64-x17+ #x100001C0)
+                (a64-load-tls-addr buf +a64-x16+ #x10000180 +a64-x17+)
+                (a64-load-tls-addr buf +a64-x17+ #x100001C0 +a64-x15+)
                 (a64-ldr-unsigned buf +a64-x15+ +a64-x16+ 0)
                 (a64-str-unsigned buf +a64-x15+ +a64-x17+ 0)
                 (a64-ldr-unsigned buf +a64-x15+ +a64-x16+ 8)
@@ -3181,7 +3351,7 @@
                ((= code #x0514)
                 ;; CLEAR-OUTER: zero slot 0x100001C0 so the IRQ handler
                 ;; falls through to "no handler".
-                (a64-load-conv-addr buf +a64-x16+ #x100001C0)
+                (a64-load-tls-addr buf +a64-x16+ #x100001C0 +a64-x17+)
                 (a64-str-unsigned buf +a64-xzr+ +a64-x16+ 0))
                ((= code #x0515)
                 ;; RESTORE-OUTER: copy slot 0x100001C0/1C8/1D0 → 0x10000180/188/190.
@@ -3191,8 +3361,8 @@
                 ;; SAVE-OUTER (#x0513).  Use case: between per-test
                 ;; handler-cases inside fork-file's thunk, where the
                 ;; previous test's CLEAR-HANDLER zeroed slot 180.
-                (a64-load-conv-addr buf +a64-x16+ #x100001C0)
-                (a64-load-conv-addr buf +a64-x17+ #x10000180)
+                (a64-load-tls-addr buf +a64-x16+ #x100001C0 +a64-x17+)
+                (a64-load-tls-addr buf +a64-x17+ #x10000180 +a64-x15+)
                 (a64-ldr-unsigned buf +a64-x15+ +a64-x16+ 0)
                 (a64-str-unsigned buf +a64-x15+ +a64-x17+ 0)
                 (a64-ldr-unsigned buf +a64-x15+ +a64-x16+ 8)
@@ -3230,7 +3400,7 @@
                 ;;   add x10, x10, #8; sub x11, x11, #8; sub w9, w9, #1
                 ;;   b loop
                 ;; done:
-                (a64-load-conv-addr buf +a64-x17+ #x10000150)
+                (a64-load-tls-addr buf +a64-x17+ #x10000150 +a64-x9+)
                 ;; ldr w9, [x17] — read 32-bit nargs (zero-extends to x9)
                 (a64-ldr-width buf 9 +a64-x17+ 0 2)
                 ;; cmp w9, #5  (32-bit subs-imm form: SF=0)
@@ -3341,7 +3511,10 @@
                   (let ((stub-start-idx (a64-current-index buf)))
 
                     ;; x9/x10/x11 = saved SP / FP / PC.
+                    ;; THIS thread's slots (the fault is delivered on the
+                    ;; faulting thread; its delta register is intact).
                     (a64-load-imm64-general buf +a64-x16+ (conv-real #x10000180))
+                    (a64-add-thread-delta buf +a64-x16+ +a64-x9+)
                     (a64-ldur buf +a64-x9+  +a64-x16+ 0)
                     (a64-ldur buf +a64-x10+ +a64-x16+ 8)
                     (a64-ldur buf +a64-x11+ +a64-x16+ 16)
@@ -3356,8 +3529,10 @@
                       ;; Scratch: x12 = depth-addr, x13 = depth, x14 = frame
                       ;; ptr, x15 = slot ptr (#x10000180), x16 = temp.
                       (a64-load-imm64-general buf +a64-x12+ (conv-real #x10010000))
+                      (a64-add-thread-delta buf +a64-x12+ +a64-x13+)
                       (a64-ldur buf +a64-x13+ +a64-x12+ 0)
                       (a64-load-imm64-general buf +a64-x15+ (conv-real #x10000180))
+                      (a64-add-thread-delta buf +a64-x15+ +a64-x14+)
                       ;; If depth == 0, write zeros to slot then skip.
                       (let ((cbz-zero-idx (a64-current-index buf)))
                         (a64-emit buf (logior #xB4000000 13))  ; CBZ x13
@@ -3747,7 +3922,7 @@
                    ;; image builds are unaffected.
                    (a64-load-imm64 buf pd (if (integerp *aarch64-jit-constvec-root*)
                                               (conv-real *aarch64-jit-constvec-root*)
-                                              (conv-real #x10000F10)))
+                                              (conv-real #x10000FD0)))
                    (a64-ldr-unsigned buf pd pd 0)      ; pd = tagged vector
                    ;; Slot address = (vec - 9) + 16 + idx*8 = vec + idx*8 + 7,
                    ;; the formula obj-ref/aref use.  LDR needs an 8-aligned
@@ -5052,11 +5227,16 @@
           ((= op +op-load+)
            (let* ((vd (vr 0))
                   (pa (ensure-src (vr 1) +a64-x16+))
-                  ;; Mask +WIDTH-TLS-BIT+: AArch64 has no per-thread window
-                  ;; yet, so a thread-local width is the plain width.  See
-                  ;; mvm/mvm.lisp.
+                  ;; +WIDTH-TLS-BIT+ (mvm/mvm.lisp): a per-thread-window
+                  ;; slot.  Add this thread's delta into x9 — the address
+                  ;; register may be a live vreg — or, with threads off,
+                  ;; the plain width.
                   (width (logand (vr 2) 3))
                   (pd (or (a64-phys-reg vd) +a64-x17+)))
+             (when (and *a64-tls-window* (logtest (vr 2) +width-tls-bit+))
+               (a64-load-thread-delta buf +a64-x9+)
+               (a64-add-reg buf +a64-x9+ +a64-x9+ pa 0 0)
+               (setq pa +a64-x9+))
              (a64-ldr-width buf pd pa 0 width)
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
@@ -5066,6 +5246,10 @@
            (let ((pa (ensure-src (vr 0) +a64-x16+))
                  (ps (ensure-src (vr 1) +a64-x17+))
                  (width (logand (vr 2) 3)))   ; +WIDTH-TLS-BIT+: see op-load
+             (when (and *a64-tls-window* (logtest (vr 2) +width-tls-bit+))
+               (a64-load-thread-delta buf +a64-x9+)
+               (a64-add-reg buf +a64-x9+ +a64-x9+ pa 0 0)
+               (setq pa +a64-x9+))
              (a64-str-width buf ps pa 0 width)))
 
           ;; ---- FENCE ----
@@ -5428,7 +5612,7 @@
                (a64-emit buf 0)                         ; placeholder for ADR x17
                (a64-str-unsigned buf +a64-x17+ pa #x28) ; [pa+0x28] = continuation
                ;; 5. Save per-CPU obj-alloc/obj-limit from TPIDR_EL1
-               (a64-mrs buf +a64-x16+ +sysreg-tpidr-el1+)
+               (a64-load-percpu-base buf +a64-x16+ +a64-x17+)
                (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ #x28)
                (a64-str-unsigned buf +a64-x17+ pa #x68)  ; [pa+0x68] = obj-alloc
                (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ #x30)
@@ -5479,7 +5663,7 @@
              ;; Load continuation address into x17
              (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ #x28)
              ;; Restore per-CPU obj-alloc/obj-limit via TPIDR_EL1
-             (a64-mrs buf +a64-x0+ +sysreg-tpidr-el1+)
+             (a64-load-percpu-base buf +a64-x0+ +a64-x1+)
              (a64-ldr-unsigned buf +a64-x1+ +a64-x16+ #x68)
              (a64-str-unsigned buf +a64-x1+ +a64-x0+ #x28)  ; TPIDR+0x28 = obj-alloc
              (a64-ldr-unsigned buf +a64-x1+ +a64-x16+ #x70)
@@ -5495,12 +5679,17 @@
              ;; Release scheduler lock (MUST be after SP switch to prevent
              ;; another CPU from dequeuing this actor while on its stack)
              (when *aarch64-sched-lock-addr*
-               (a64-load-imm64 buf +a64-x0+ *aarch64-sched-lock-addr*)
+               ;; Barrier FIRST: the actor's writes must be visible before
+               ;; the lock reads free (x86-64's plain store is TSO-ordered).
+               (a64-dmb buf #xB)
+               (a64-load-imm64 buf +a64-x0+ (conv-real *aarch64-sched-lock-addr*))
                (a64-str-unsigned buf +a64-xzr+ +a64-x0+ 0) ; store 0 → unlock
                ;; Memory barrier — ensure lock release visible to other CPUs
                (a64-dmb buf #xB)
-               ;; Enable interrupts
-               (a64-msr-daifclr buf #x3))
+               ;; Enable interrupts — bare metal only: MSR DAIFClr is
+               ;; UNDEFINED at EL0 (a hosted image would SIGILL here).
+               (unless *aarch64-linux-mode*
+                 (a64-msr-daifclr buf #x3)))
              ;; Jump to continuation (save-ctx's resume entry point)
              (a64-br buf +a64-x17+)))
 
@@ -5541,15 +5730,21 @@
                   (pd (or (a64-phys-reg vd) +a64-x16+))
                   (status +a64-x10+)
                   (loop-idx (a64-current-index buf)))
-             ;; loop: LDXR x9, [Vaddr]
-             (a64-ldxr buf +a64-x9+ pa)
-             ;; STXR W10, Vs, [Vaddr]
-             (a64-stxr buf status ps pa)
+             ;; ORDERING.  x86-64's XCHG is a full barrier and the callers
+             ;; (SPIN-LOCK, the futex mutex) were written against that, so
+             ;; with real threads a plain LDXR/STXR is not enough: nothing
+             ;; would keep the critical section's accesses inside the lock.
+             ;; Acquire-exclusive + release-exclusive, then DMB ISH.
+             ;; loop: LDAXR x9, [Vaddr]
+             (a64-emit buf (logior #xC85FFC00 (ash pa 5) +a64-x9+))
+             ;; STLXR W10, Vs, [Vaddr]
+             (a64-emit buf (logior #xC800FC00 (ash status 16) (ash pa 5) ps))
              ;; CBNZ W10, loop (32-bit variant, sf=0)
              (let ((back-offset (- loop-idx (a64-current-index buf))))
                (a64-emit buf (logior #x35000000
                                      (ash (logand back-offset #x7FFFF) 5)
                                      status)))
+             (a64-dmb buf #xB)                                 ; DMB ISH
              ;; Old value -> Vd, after the loop is done with the address.
              (a64-mov-reg buf pd +a64-x9+)
              (unless (a64-phys-reg vd)
@@ -5598,7 +5793,7 @@
            (let* ((vd (vr 0))
                   (offset (vr 1))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
-             (a64-mrs buf +a64-x17+ +sysreg-tpidr-el1+)  ; system reg encoding for TPIDR_EL1
+             (a64-load-percpu-base buf +a64-x17+ +a64-x9+)  ; TPIDR_EL1, or the window slot
              ;; LDR Xd, [x17, #offset]
              (if (and (zerop (mod offset 8)) (<= offset (* #xFFF 8)))
                  (a64-ldr-unsigned buf pd +a64-x17+ offset)
@@ -5628,7 +5823,7 @@
           ((= op +op-percpu-set+)
            (let ((offset (vr 0))
                  (ps (ensure-src (vr 1) +a64-x17+)))
-             (a64-mrs buf +a64-x16+ +sysreg-tpidr-el1+)
+             (a64-load-percpu-base buf +a64-x16+ +a64-x9+)
              (if (and (zerop (mod offset 8)) (<= offset (* #xFFF 8)))
                  (a64-str-unsigned buf ps +a64-x16+ offset)
                  (progn
@@ -5735,9 +5930,10 @@
            (let ((n (vr 0)))
              (setq *aarch64-last-set-nargs* n)
              (a64-movz buf +a64-x16+ (logand n #xFFFF) 0)
-             (if *a64-x18-base*
+             ;; Per-thread with threads on: x18 is the PROCESS's page.
+             (if (and *a64-x18-base* (not *a64-tls-window*))
                  (a64-str32-unsigned buf +a64-x16+ +a64-x18+ #x150)
-                 (progn (a64-load-conv-addr buf +a64-x17+ #x10000150)
+                 (progn (a64-load-tls-addr buf +a64-x17+ #x10000150 +a64-x9+)
                         (a64-str-width buf +a64-x16+ +a64-x17+ 0 2)))))  ; size=2 = 32-bit STR
 
           ;; ---- GET-NARGS Vd ----
@@ -5745,9 +5941,9 @@
           ((= op +op-get-nargs+)
            (let* ((vd (vr 0))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
-             (if *a64-x18-base*
+             (if (and *a64-x18-base* (not *a64-tls-window*))
                  (a64-ldr32-unsigned buf pd +a64-x18+ #x150)
-                 (progn (a64-load-conv-addr buf +a64-x17+ #x10000150)
+                 (progn (a64-load-tls-addr buf +a64-x17+ #x10000150 +a64-x9+)
                         (a64-ldr-width buf pd +a64-x17+ 0 2)))  ; size=2 = 32-bit LDR (zero-extends)
              (a64-lsl-imm buf pd pd 1)              ; tag as fixnum (shl 1)
              (unless (a64-phys-reg vd)
@@ -5805,9 +6001,9 @@
            (let* ((count (vr 0))
                   (tagged (ash count 1)))
              (a64-load-imm64 buf +a64-x16+ tagged)
-             (if *a64-x18-base*
+             (if (and *a64-x18-base* (not *a64-tls-window*))
                  (a64-str-unsigned buf +a64-x16+ +a64-x18+ #x90)
-                 (progn (a64-load-conv-addr buf +a64-x17+ #x10000090)
+                 (progn (a64-load-tls-addr buf +a64-x17+ #x10000090 +a64-x9+)
                         (a64-str-unsigned buf +a64-x16+ +a64-x17+ 0)))))
 
           ;; ---- SET-CENV Vs ----
@@ -6065,7 +6261,7 @@
 ;;; The native aarch64 collector timestamps itself with CNTVCT_EL0 and
 ;;; accumulates six words in the runtime-metadata window.  THESE ADDRESSES ARE
 ;;; THE ONLY COPY the emitter uses (bare literals at the two emit sites below,
-;;; exactly as #x10000E00/E18/E40 and #x10000F10 already are); the LISP-side
+;;; exactly as #x10000E00/E18/E40 and #x10000FD0 already are); the LISP-side
 ;;; readers live in mvm/gc.lisp as %GC-STAT-* DEFUNs.  Deliberately NOT defined
 ;;; as defuns here as well: this file is baked into the image for the in-image
 ;;; JIT and so is gc.lisp, and a duplicate defun name in shared image source is
@@ -6095,7 +6291,7 @@
 ;;; 0x10001000 as the one free gap in the metadata window.  Taken within it:
 ;;; 0x10000F00 (+rpi-cl-dtb-ptr-slot+, firmware device-tree pointer, written by
 ;;; the RPi preamble BEFORE Lisp runs and deliberately not zeroed) and
-;;; 0x10000F10 (*aarch64-jit-constvec-root*, #282) and 0x10000FF0 (the caller-x30
+;;; 0x10000FD0 (*aarch64-jit-constvec-root*, #282) and 0x1000FFF0 (the caller-x30
 ;;; save slot used by the out-of-module call thunks).  0x10000F20..0x10000F57 is
 ;;; 16 bytes clear of the constvec root below and 152 clear of the x30 slot
 ;;; above.  Grep #x10000[EF].. before claiming any other word in this range.
@@ -6152,7 +6348,33 @@
   ;; trampoline both BEFORE and AFTER x18 is repurposed as the copy loop's
   ;; slot cursor, and from the handler helpers, so x18 cannot be assumed to
   ;; hold the convention base at any call site.
-  (a64-load-imm64-general buf rtmp (conv-real +gc-region-addr+))
+  ;;
+  ;; WITH THREADS, the word is per CPU (translate-x64's :RUNTIME form of
+  ;; EMIT-LOAD-GC-REGION): once the mode word +GC-REGION-PERCPU-ADDR+ is set,
+  ;; the cell is +GC-REGION-ADDR+ + 8*cpu, cpu being per-CPU slot 16 (stored
+  ;; tagged, so <<2 is *8).  The mode word is set only after every thread's
+  ;; per-CPU pointer is, as on x86-64.
+  (if *a64-tls-window*
+      (let ((single (incf *mvm-label-counter*))
+            (loaded (incf *mvm-label-counter*)))
+        (a64-load-imm64-general buf rtmp (conv-real +gc-region-percpu-addr+))
+        (a64-ldr-width buf rd rtmp 0 2)                       ; u32 mode word
+        (a64-cmp-imm buf rd 0)
+        (let ((i (a64-current-index buf)))
+          (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i single :bcond))
+        (a64-load-imm64-general buf rd (conv-real +a64-percpu-ptr-addr+))
+        (a64-add-thread-delta buf rd rtmp)
+        (a64-ldr-unsigned buf rd rd 0)                        ; per-CPU block
+        (a64-ldr-unsigned buf rd rd +gc-percpu-cpu-id-off+)   ; cpu, tagged
+        (a64-lsl-imm buf rd rd 2)
+        (a64-load-imm64-general buf rtmp (conv-real +gc-region-addr+))
+        (a64-add-reg buf rtmp rtmp rd 0 0)
+        (let ((i (a64-current-index buf)))
+          (a64-b buf 0) (a64-add-fixup buf i loaded :b))
+        (a64-set-label buf single)
+        (a64-load-imm64-general buf rtmp (conv-real +gc-region-addr+))
+        (a64-set-label buf loaded))
+      (a64-load-imm64-general buf rtmp (conv-real +gc-region-addr+)))
   (a64-ldr-unsigned buf rd rtmp 0)
   (let ((have (incf *mvm-label-counter*)))
     (a64-cmp-imm buf rd 0)
@@ -6381,7 +6603,7 @@
     (when *aarch64-gc-stats-enabled*
       (a64-mrs buf +a64-x9+ +sysreg-cntvct-el0+)
       (a64-lsl-imm buf +a64-x9+ +a64-x9+ 1)
-      (a64-load-imm64-general buf +a64-x16+ (conv-real #x10000F20))
+      (a64-load-imm64-general buf +a64-x16+ (conv-real (a64-gc-stat-addr #x10000F20)))
       (a64-str-unsigned buf +a64-x9+ +a64-x16+ 0))
     ;; load GC metadata (all stored <<1 → ASR #1 to raw)
     ;; STAGE 3: THE ACTIVE REGION, not region 0.  Every field below is an
@@ -6464,7 +6686,7 @@
       ;; unconditionally: an unset root reads 0, whose tag is neither 1 nor 9,
       ;; so scan_word returns immediately.  Keep in lock-step with the emit
       ;; site's *aarch64-jit-constvec-root*.
-      (scan-fixed #x10000F10))
+      (scan-fixed #x10000FD0))
     (a64-tramp-mark 6)
     ;; ---- MV region: count-1 extras from 0x98 (only when 2<=count<=16) ----
     ;; count = [0x90]>>1; extras = count-1.  Guards (both SIGNED, mirroring x64's
@@ -6472,7 +6694,10 @@
     ;; runaway scan): skip if extras<=0 (count 0/1) OR count>16 (garbage —
     ;; multiple-values-limit is 16), so a stale/uninit MV-count can't drive a
     ;; wild scan off into unmapped memory.
+    ;; THIS thread's MV buffer: the collector runs on the thread that hit its
+    ;; own limit, so the delta register names the right window.
     (a64-load-imm64-general buf +a64-x16+ (conv-real #x10000090))
+    (a64-add-thread-delta buf +a64-x16+ +a64-x9+)
     (a64-ldr-unsigned buf +a64-x26+ +a64-x16+ 0)        ; tagged count
     (a64-asr-imm buf +a64-x26+ +a64-x26+ 1)             ; raw count
     (a64-sub-imm buf +a64-x26+ +a64-x26+ 1)             ; extras = count-1
@@ -6483,6 +6708,7 @@
       (a64-cmp-imm buf +a64-x26+ 16)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-gt+ 0) (a64-add-fixup buf i mvdone :bcond)) ; extras>16 garbage
       (a64-load-imm64-general buf +a64-x9+ (conv-real #x10000098))
+      (a64-add-thread-delta buf +a64-x9+ +a64-x16+)
       (a64-set-label buf mvloop)
       (a64-cmp-imm buf +a64-x26+ 0)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-le+ 0) (a64-add-fixup buf i mvdone :bcond))
@@ -6491,6 +6717,7 @@
       (a64-sub-imm buf +a64-x26+ +a64-x26+ 1)
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i mvloop :b))
       (a64-set-label buf mvdone))
+    (emit-aarch64-dynbind-root-scan buf scan-word)
     (a64-tramp-mark 7)
     ;; ---- Cheney scan: OBJECT-BY-OBJECT, TYPE-AWARE ----
     ;; #160 PIECE 1: walk to-space object-by-object (cursor x26; next-obj x24;
@@ -6684,19 +6911,19 @@
     (when *aarch64-gc-stats-enabled*
       (a64-mrs buf +a64-x9+ +sysreg-cntvct-el0+)
       (a64-lsl-imm buf +a64-x9+ +a64-x9+ 1)               ; x9  = end<<1
-      (a64-load-imm64-general buf +a64-x16+ (conv-real #x10000F20))
+      (a64-load-imm64-general buf +a64-x16+ (conv-real (a64-gc-stat-addr #x10000F20)))
       (a64-ldr-unsigned buf +a64-x10+ +a64-x16+ 0)        ; x10 = start<<1
       (a64-sub-reg buf +a64-x11+ +a64-x9+ +a64-x10+ 0 0)  ; x11 = pause<<1
       ;; gc_stat_last = pause
-      (a64-load-imm64-general buf +a64-x16+ (conv-real #x10000F38))
+      (a64-load-imm64-general buf +a64-x16+ (conv-real (a64-gc-stat-addr #x10000F38)))
       (a64-str-unsigned buf +a64-x11+ +a64-x16+ 0)
       ;; gc_stat_total += pause
-      (a64-load-imm64-general buf +a64-x16+ (conv-real #x10000F28))
+      (a64-load-imm64-general buf +a64-x16+ (conv-real (a64-gc-stat-addr #x10000F28)))
       (a64-ldr-unsigned buf +a64-x10+ +a64-x16+ 0)
       (a64-add-reg buf +a64-x10+ +a64-x10+ +a64-x11+ 0 0)
       (a64-str-unsigned buf +a64-x10+ +a64-x16+ 0)
       ;; gc_stat_max = max(gc_stat_max, pause)   [unsigned; both operands <<1]
-      (a64-load-imm64-general buf +a64-x16+ (conv-real #x10000F30))
+      (a64-load-imm64-general buf +a64-x16+ (conv-real (a64-gc-stat-addr #x10000F30)))
       (a64-ldr-unsigned buf +a64-x10+ +a64-x16+ 0)
       (let ((nomax (incf *mvm-label-counter*)))
         (a64-cmp-reg buf +a64-x10+ +a64-x11+)
@@ -6708,10 +6935,10 @@
       (a64-sub-reg buf +a64-x12+ +a64-x21+ +a64-x22+ 0 0)
       (a64-lsl-imm buf +a64-x12+ +a64-x12+ 1)             ; x12 = bytes<<1
       ;; gc_stat_lastb = survivors
-      (a64-load-imm64-general buf +a64-x16+ (conv-real #x10000F48))
+      (a64-load-imm64-general buf +a64-x16+ (conv-real (a64-gc-stat-addr #x10000F48)))
       (a64-str-unsigned buf +a64-x12+ +a64-x16+ 0)
       ;; gc_stat_bytes += survivors
-      (a64-load-imm64-general buf +a64-x16+ (conv-real #x10000F40))
+      (a64-load-imm64-general buf +a64-x16+ (conv-real (a64-gc-stat-addr #x10000F40)))
       (a64-ldr-unsigned buf +a64-x10+ +a64-x16+ 0)
       (a64-add-reg buf +a64-x10+ +a64-x10+ +a64-x12+ 0 0)
       (a64-str-unsigned buf +a64-x10+ +a64-x16+ 0))
@@ -6738,6 +6965,45 @@
     (a64-ldp-post buf +a64-x0+ +a64-x1+ +a64-sp+ 240)
     (a64-ret buf)))
 
+;;; THIS THREAD's dynamic-binding stack as a precise root set — the AArch64
+;;; twin of translate-x64's EMIT-DYNBIND-ROOT-SCAN, which says why a binding
+;;; made on a worker lives in the thread's own block and why that makes its
+;;; value words roots the collector must forward.  Same layout (mvm/prelude.lisp,
+;;; PER-THREAD DYNAMIC BINDINGS): blk+0xC58 tagged depth, blk+0xC60 tagged
+;;; extension-stack base (0 = in-window entries from blk+0xC70), 16-byte
+;;; [key][value] entries.  The main thread's delta is 0 and it never binds
+;;; here, so it skips everything; with threads off nothing is emitted.
+;;; x9 (slot address) and x26 (count) survive scan_word, as the MV loop needs.
+(defun emit-aarch64-dynbind-root-scan (buf scan-word)
+  (when *a64-tls-window*
+    (let ((db-loop (incf *mvm-label-counter*))
+          (db-done (incf *mvm-label-counter*))
+          (db-inwin (incf *mvm-label-counter*)))
+      (a64-load-thread-delta buf +a64-x10+)
+      (a64-cmp-imm buf +a64-x10+ 0)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i db-done :bcond))
+      (a64-load-imm64-general buf +a64-x9+ (conv-real #x10000000))
+      (a64-add-reg buf +a64-x9+ +a64-x9+ +a64-x10+ 0 0)      ; x9 = this thread's block
+      (a64-ldr-unsigned buf +a64-x26+ +a64-x9+ #xC58)
+      (a64-asr-imm buf +a64-x26+ +a64-x26+ 1)                ; depth
+      (a64-cmp-imm buf +a64-x26+ 0)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-le+ 0) (a64-add-fixup buf i db-done :bcond))
+      (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ #xC60)
+      (a64-asr-imm buf +a64-x10+ +a64-x10+ 1)                ; extension stack
+      (a64-cmp-imm buf +a64-x10+ 0)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i db-inwin :bcond))
+      (a64-add-imm buf +a64-x9+ +a64-x10+ 8)                 ; &entry0.value
+      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i db-loop :b))
+      (a64-set-label buf db-inwin)
+      (a64-add-imm buf +a64-x9+ +a64-x9+ #xC78)              ; &entry0.value
+      (a64-set-label buf db-loop)
+      (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
+      (a64-add-imm buf +a64-x9+ +a64-x9+ 16)
+      (a64-sub-imm buf +a64-x26+ +a64-x26+ 1)
+      (a64-cmp-imm buf +a64-x26+ 0)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-gt+ 0) (a64-add-fixup buf i db-loop :bcond))
+      (a64-set-label buf db-done))))
+
 (defun emit-aarch64-handler-helpers (buf)
   "If *aarch64-handler-push-label* / *aarch64-handler-pop-label* are
    bound (non-nil), emit the push and pop helpers into BUF and set
@@ -6749,6 +7015,7 @@
     (a64-set-label buf *aarch64-handler-push-label*)
     ;; x9 = 0x10010000 (depth slot)
     (a64-load-imm64 buf +a64-x9+ (conv-real #x10010000))
+    (a64-add-thread-delta buf +a64-x9+ +a64-x10+)   ; THIS thread's stack
     ;; x10 = depth
     (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0)
     ;; x11 = frame_base = 0x10010008 + depth*24
@@ -6759,6 +7026,7 @@
     (a64-add-reg buf +a64-x11+ +a64-x11+ +a64-x12+ 0 0)
     ;; x12 = 0x10000180 (current handler slot)
     (a64-load-imm64 buf +a64-x12+ (conv-real #x10000180))
+    (a64-add-thread-delta buf +a64-x12+ +a64-x13+)
     ;; copy 3 doublewords: 180→frame+0, 188→frame+8, 190→frame+16
     (a64-ldr-unsigned buf +a64-x13+ +a64-x12+ 0)
     (a64-str-unsigned buf +a64-x13+ +a64-x11+ 0)
@@ -6773,6 +7041,7 @@
     ;; ---- POP helper ----
     (a64-set-label buf *aarch64-handler-pop-label*)
     (a64-load-imm64 buf +a64-x9+ (conv-real #x10010000))
+    (a64-add-thread-delta buf +a64-x9+ +a64-x10+)   ; THIS thread's stack
     (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0)
     ;; if depth == 0 → zero slot 180/188/190 and return
     (a64-cmp-imm buf +a64-x10+ 0)
@@ -6782,6 +7051,7 @@
         (a64-add-fixup buf idx nz-label :bcond))
       ;; depth == 0 path: zero 0x180/188/190 and return
       (a64-load-imm64 buf +a64-x12+ (conv-real #x10000180))
+      (a64-add-thread-delta buf +a64-x12+ +a64-x13+)
       (a64-str-unsigned buf +a64-xzr+ +a64-x12+ 0)
       (a64-str-unsigned buf +a64-xzr+ +a64-x12+ 8)
       (a64-str-unsigned buf +a64-xzr+ +a64-x12+ 16)
@@ -6798,6 +7068,7 @@
       (a64-add-reg buf +a64-x11+ +a64-x11+ +a64-x12+ 0 0)
       ;; restore 0x180/188/190 from frame
       (a64-load-imm64 buf +a64-x12+ (conv-real #x10000180))
+      (a64-add-thread-delta buf +a64-x12+ +a64-x13+)
       (a64-ldr-unsigned buf +a64-x13+ +a64-x11+ 0)
       (a64-str-unsigned buf +a64-x13+ +a64-x12+ 0)
       (a64-ldr-unsigned buf +a64-x13+ +a64-x11+ 8)
@@ -6974,7 +7245,7 @@
     ;; raw u32 slot 0x10000150; only matters if the callee has an
     ;; arity check, but emit it for parity with the standard call
     ;; sequence).
-    (a64-load-conv-addr buf +a64-x17+ #x10000150)
+    (a64-load-tls-addr buf +a64-x17+ #x10000150 +a64-x16+)
     (a64-movz buf +a64-x16+ 0 0)
     ;; STUR w16, [x17] — 32-bit store; reuse a64-emit raw.
     (a64-emit buf (logior #xB8000010                ; STUR Wt, [Xn, #imm9]

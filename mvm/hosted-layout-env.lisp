@@ -11,6 +11,7 @@
 ;;;;   MODUS_DARWIN=1        a Darwin image: every syscall calls the host shim's
 ;;;;                         stub through a word one 16 KB page below the code
 ;;;;                         base (implies MODUS_NO_X18; needs MODUS_CODE_BASE)
+;;;;   MODUS_NO_THREADS=1    a CLI without native threads (see ENABLE-LAYOUT-THREADS)
 ;;;;
 ;;;; Every value has TWO homes that must agree: the HOST build that compiles
 ;;;; and translates the image's fixed code, and the image's JIT co-init that
@@ -49,6 +50,30 @@
   ;; shape (gc.lisp's bitmaps: RW data, not the MAP_JIT arena).
   (setq *layout-plist* (list* :darwin 1 *layout-plist*)))
 
+(defvar *layout-threads* nil
+  "Native threads (translate-aarch64.lisp, THE PER-THREAD WINDOW, AARCH64).  Set
+   by ENABLE-LAYOUT-THREADS, which only the CLI calls: the ANSI gate bakes no
+   thread support and keeps its historic code.")
+
+(defconstant +layout-darwin-tsd-key+ 300
+  "The pthread key a Darwin image keeps its per-thread-window delta in.  The
+   host shim creates keys until it holds this one (host/macos/modus-shim.c
+   MODUS_TSD_KEY); the image reads it at TPIDRRO_EL0 + 8*key.")
+
+(defun enable-layout-threads ()
+  "Turn native threads on for this build unless MODUS_NO_THREADS is set.  The
+   layout key :A64-THREADS is what runtime source tests, with %LAYOUT-IF."
+  (let ((v (sb-ext:posix-getenv "MODUS_NO_THREADS")))
+    (unless (and v (plusp (length v)) (string/= v "0"))
+      (setq *layout-threads* t)
+      (unless (getf *layout-plist* :a64-threads)
+        (setq *layout-plist* (list* :a64-threads 1 *layout-plist*))))))
+
+(defun layout-tsd-offset ()
+  "Byte offset of the delta in the pthread TSD array (Darwin), or NIL (Linux:
+   TPIDR_EL0)."
+  (and *layout-darwin* (* 8 +layout-darwin-tsd-key+)))
+
 (defun layout-darwin-syscall-slot ()
   "The fixed VA of the word holding the shim's syscall-stub address: one
    16 KB page below the code base.  NIL for a non-Darwin image."
@@ -67,11 +92,19 @@
   (setq *conv-delta* ~D)
   (setq *hosted-layout* (quote ~S))
   (setq *aarch64-darwin-syscall-slot* ~A)
+  (setq *a64-tls-window* ~A)
+  (setq *tls-window* ~:*~A)
+  (setq *tls-window-a64* ~:*~A)
+  (setq *a64-tls-tsd-offset* ~A)
+  (setq *aarch64-sched-lock-addr* ~A)
 "
             (if *layout-no-x18* "nil" "t")
             *layout-conv-delta*
             *layout-plist*
-            (let ((slot (layout-darwin-syscall-slot))) (if slot (format nil "~D" slot) "nil")))))
+            (let ((slot (layout-darwin-syscall-slot))) (if slot (format nil "~D" slot) "nil"))
+            (if *layout-threads* "t" "nil")
+            (let ((o (and *layout-threads* (layout-tsd-offset)))) (if o (format nil "~D" o) "nil"))
+            (if *layout-threads* "268439488" "nil"))))   ; +HOSTED-SCHED-LOCK-ADDR+ #x10000FC0
 
 (defun apply-layout-host ()
   "Set the host translator and compiler to this build's layout.  Call after
@@ -86,6 +119,15 @@
       (put "*A64-CODE-ADDR-WIDE*" (>= code (ash 1 32))))
     (when *layout-no-x18* (put "*A64-X18-BASE*" nil))
     (put "*AARCH64-DARWIN-SYSCALL-SLOT*" (layout-darwin-syscall-slot))
+    (put "*A64-TLS-WINDOW*" *layout-threads*)
+    (put "*TLS-WINDOW*" *layout-threads*)
+    (put "*TLS-WINDOW-A64*" *layout-threads*)
+    (put "*A64-TLS-TSD-OFFSET*" (and *layout-threads* (layout-tsd-offset)))
+    ;; RESTORE-CTX releases the hosted scheduler lock, as x86-64's does
+    ;; (build-generic-cli.lisp *X64-SCHED-LOCK-ADDR*).
+    (when *layout-threads*
+      (put "*AARCH64-SCHED-LOCK-ADDR*"
+           (symbol-value (find-symbol "+HOSTED-SCHED-LOCK-ADDR+" :modus.mvm))))
     (let ((real (funcall (find-symbol "CONV-REAL" :modus.mvm)
                          (symbol-value (find-symbol "+CONV-REGION-BASE+" :modus.mvm)))))
       (format t "~&  Hosted layout: code #x~X  region #x~X (delta #x~X)  heap #x~X  arena #x~X~A~%"
@@ -94,6 +136,11 @@
               (or (getf *layout-plist* :heap-base) #x2000000000)
               (or (getf *layout-plist* :jit-arena-base) #x3000000000)
               (if *layout-no-x18* "  x18: NOT used (poisoned)" ""))
+      (when *layout-threads*
+        (format t "  Native threads: per-thread window via ~A~%"
+                (if (layout-tsd-offset)
+                    (format nil "pthread key ~D (TPIDRRO_EL0+~D)" +layout-darwin-tsd-key+ (layout-tsd-offset))
+                    "TPIDR_EL0")))
       (when *layout-darwin*
         (format t "  DARWIN image: syscalls call the shim stub via slot #x~X~%"
                 (layout-darwin-syscall-slot))))))

@@ -231,7 +231,7 @@
 ;;; SLOT MAP — keep in lock-step with the emitter's copy, which uses bare
 ;;; literals at the emit sites.  All six live in the 0x10000EA8..0x10001000 gap
 ;;; boot/boot-rpi-cl.lisp documents, clear of 0x10000F00 (RPi DTB pointer),
-;;; 0x10000F10 (JIT constvec root) and 0x10000FF0 (call-thunk x30 save):
+;;; 0x10000FD0 (JIT constvec root) and 0x1000FFF0 (call-thunk x30 save):
 ;;;
 ;;;   0x10000F20  start   CNTVCT at collection entry (collector scratch)
 ;;;   0x10000F28  total   sum of pause ticks
@@ -261,13 +261,17 @@
 ;;; readable (the metadata window is mapped well past 0x10001000 on both) and
 ;;; read 0, meaning "not instrumented on this target" — NOT "no collections".
 ;;; %GC-COUNT is the portable one.
+;;;
+;;; WITH THREADS (the :A64-THREADS layout) the words move to 0x1000FF00..FF30:
+;;; 0x10000F20..F58 are CPU 3..10's cells in the per-CPU active-region table.
+;;; See translate-aarch64.lisp A64-GC-STAT-ADDR, which the emitter uses.
 
-(defun %gc-stat-total-ticks () (mem-ref #x10000F28 :u64))
-(defun %gc-stat-max-ticks   () (mem-ref #x10000F30 :u64))
-(defun %gc-stat-last-ticks  () (mem-ref #x10000F38 :u64))
-(defun %gc-stat-total-bytes () (mem-ref #x10000F40 :u64))
-(defun %gc-stat-last-bytes  () (mem-ref #x10000F48 :u64))
-(defun %gc-stat-base-count  () (mem-ref #x10000F50 :u64))
+(defun %gc-stat-total-ticks () (mem-ref (%layout-if :a64-threads #x1000FF08 #x10000F28) :u64))
+(defun %gc-stat-max-ticks   () (mem-ref (%layout-if :a64-threads #x1000FF10 #x10000F30) :u64))
+(defun %gc-stat-last-ticks  () (mem-ref (%layout-if :a64-threads #x1000FF18 #x10000F38) :u64))
+(defun %gc-stat-total-bytes () (mem-ref (%layout-if :a64-threads #x1000FF20 #x10000F40) :u64))
+(defun %gc-stat-last-bytes  () (mem-ref (%layout-if :a64-threads #x1000FF28 #x10000F48) :u64))
+(defun %gc-stat-base-count  () (mem-ref (%layout-if :a64-threads #x1000FF30 #x10000F50) :u64))
 
 (defun %gc-stat-count ()
   "Collections COVERED by the current tick/byte totals, i.e. since the last
@@ -284,13 +288,13 @@
    %GC-COUNT itself is deliberately NOT zeroed — it is the shared cross-target
    counter and mvm-eval keys its JIT re-bake on it.  0x10000F50 records where
    it stood instead, which is what makes %GC-STAT-COUNT honest."
-  (setf (mem-ref #x10000F50 :u64) (%gc-count))
-  (setf (mem-ref #x10000F20 :u64) 0)
-  (setf (mem-ref #x10000F28 :u64) 0)
-  (setf (mem-ref #x10000F30 :u64) 0)
-  (setf (mem-ref #x10000F38 :u64) 0)
-  (setf (mem-ref #x10000F40 :u64) 0)
-  (setf (mem-ref #x10000F48 :u64) 0)
+  (setf (mem-ref (%layout-if :a64-threads #x1000FF30 #x10000F50) :u64) (%gc-count))
+  (setf (mem-ref (%layout-if :a64-threads #x1000FF00 #x10000F20) :u64) 0)
+  (setf (mem-ref (%layout-if :a64-threads #x1000FF08 #x10000F28) :u64) 0)
+  (setf (mem-ref (%layout-if :a64-threads #x1000FF10 #x10000F30) :u64) 0)
+  (setf (mem-ref (%layout-if :a64-threads #x1000FF18 #x10000F38) :u64) 0)
+  (setf (mem-ref (%layout-if :a64-threads #x1000FF20 #x10000F40) :u64) 0)
+  (setf (mem-ref (%layout-if :a64-threads #x1000FF28 #x10000F48) :u64) 0)
   t)
 
 (defun %gc-stats ()

@@ -412,6 +412,18 @@
       (and (>= off #x400) (<= off #xC0F))    ; handler-stack depth + 64 frames
       (and (>= off #xC10) (<= off #xC37))))  ; longjmp scratch + the self slot
 
+(defparameter *tls-window-a64* nil
+  "The AArch64 window's extra slots (translate-aarch64.lisp, THE PER-THREAD
+   WINDOW, AARCH64) are per-thread too.  Only an AArch64 threaded build sets
+   it: on every other target those addresses are ordinary process memory.")
+
+(defun %tls-window-a64-offset-p (off)
+  "The slots only AArch64 keeps outside the first page: the per-CPU pointer
+   (0xFFE8) and the helper-call LR save (0xFFF0) just below the handler-frame
+   stack, and the stack itself (depth at 0x10000, 24-byte frames above)."
+  (or (and (>= off #xFFE8) (<= off #xFFF7))
+      (and (>= off #x10000) (<= off #x10FFF))))
+
 (defun %tls-window-addr-form-p (form)
   "T when FORM is an address the compiler can prove, AT COMPILE TIME, lands in
    the per-thread window.  A bare constant, or (+ K x) / (+ x K) with K such a
@@ -422,7 +434,9 @@
    one would give a thread a private copy of a shared table."
   (cond ((integerp form)
          (let ((off (- form +tls-window-base+)))
-           (and (>= off 0) (< off #x1000) (%tls-window-offset-p off))))
+           (and (>= off 0)
+                (or (and (< off #x1000) (%tls-window-offset-p off))
+                    (and *tls-window-a64* (%tls-window-a64-offset-p off))))))
         ((and (consp form) (consp (cdr form)) (consp (cddr form))
               (null (cdddr form))
               (symbolp (car form)) (name-eq (car form) "+"))
@@ -6668,7 +6682,8 @@
 ;;; *SYM-NAME-TABLE* coverage tightens it further.
 
 (defparameter *hash-dispatch-names*
-  '("WITH-OPEN-STREAM" "%CONV-ADDR" "%LAYOUT" 
+  '("WITH-OPEN-STREAM" "%CONV-ADDR" "%LAYOUT" "%SET-THREAD-DELTA"
+    
     "STI" "MUL26HI" "ON" "COMMON-LISP-USER"
     "BEING" "DO" "MAKE-PACKAGE" "MACROLET"
     "PRESENT-SYMBOL" "%MAKE-SYMBOL" "CCASE" "TAGBODY"
@@ -7831,6 +7846,9 @@
       ;; (%spawn-thread entry stack-top tidptr) — clone(2) a NATIVE OS THREAD.
       ((= op-name (compute-name-hash "%SPAWN-THREAD"))
        (compile-spawn-thread (cdr form) env dest))
+      ;; (%set-thread-delta d) — AArch64's ARCH_SET_FS.
+      ((= op-name #.(compute-name-hash "%SET-THREAD-DELTA"))
+       (compile-set-thread-delta (cdr form) env dest))
       ;; (%mmap-exec-page size) — PROT_RWX page for the WS4 runtime JIT.
       ((= op-name #.(compute-name-hash "%MMAP-EXEC-PAGE"))
        (compile-mmap-exec (cdr form) env dest))
@@ -20346,6 +20364,17 @@
   (emit-ir :trap #x0540)
   (emit-ir :mov dest +vreg-v0+))
 
+(defun compile-set-thread-delta (args env dest)
+  "Compile (%set-thread-delta delta) — install DELTA as THIS thread's
+   per-thread-window delta.  TRAP #x0541.  AArch64 only: it is what x86-64's
+   arch_prctl(ARCH_SET_FS) is to that target (translate-aarch64.lisp, THE
+   PER-THREAD WINDOW, AARCH64), so runtime source reaches it through
+   (%layout-if :a64-threads ...) and no other back-end ever sees the trap.
+   Returns 0."
+  (compile-form (car args) env +vreg-v0+)
+  (emit-ir :trap #x0541)
+  (emit-ir :mov dest +vreg-v0+))
+
 (defun compile-mmap-shared (args env dest)
   "Compile (%mmap-shared-page size) — allocate a shared anonymous mmap
    region of SIZE bytes (page-multiple).  The result is the tagged
@@ -24346,6 +24375,15 @@
               (consp (cdr form)) (symbolp (cadr form))
               (consp (cddr form)) (integerp (caddr form)) (null (cdddr form)))
          (hosted-layout (cadr form) (caddr form)))
+        ;; (%LAYOUT-IF :KEY THEN [ELSE]): THEN when the layout gives KEY a
+        ;; non-zero value, else ELSE — chosen HERE, so the arm not taken is
+        ;; never compiled.  That is the point: it lets one runtime source hold
+        ;; an arm another back-end cannot translate (an AArch64-only trap).
+        ((and (symbolp (car form)) (name-eq (car form) "%LAYOUT-IF")
+              (consp (cdr form)) (symbolp (cadr form)) (consp (cddr form)))
+         (%conv-subst (if (eql (hosted-layout (cadr form) 0) 0)
+                          (car (cdddr form))
+                          (caddr form))))
         (t
          ;; Walk the spine ITERATIVELY (recursing only into elements): a long
          ;; unquoted list would otherwise recurse once per element, and an
@@ -24381,7 +24419,8 @@
           (let ((h (normalize-name x)))
             (when (= h #.(compute-name-hash "QUOTE")) (return nil))
             (when (= h #.(compute-name-hash "%CONV-ADDR")) (return t))
-            (when (= h #.(compute-name-hash "%LAYOUT")) (return t))))
+            (when (= h #.(compute-name-hash "%LAYOUT")) (return t))
+            (when (= h #.(compute-name-hash "%LAYOUT-IF")) (return t))))
         (when (and (consp x) (%conv-form-present-p x)) (return t)))
       (setq tail (cdr tail)))))
 

@@ -444,7 +444,7 @@
   (emit-aarch64-load-imm64 buf 16 (hosted-layout :jit-arena-base +linux-aarch64-jit-arena-base+))
   (emit-aarch64-u32 buf #xEB10001F)   ; CMP x0, x16
   (emit-aarch64-u32 buf #x9A9F0000)   ; CSEL x0, x0, xzr, EQ
-  (emit-aarch64-load-imm64 buf 17 (conv-real #x10000F58))
+  (emit-aarch64-load-imm64 buf 17 (conv-real (a64-gc-stat-addr #x10000F58)))
   (emit-aarch64-u32 buf #xF9000220)   ; STR x0, [x17]
 
   ;; Save argc/argv at heap base for Lisp reachability.

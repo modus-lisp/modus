@@ -64,8 +64,9 @@
 
 (defun %core-jit-bump-slot ()
   "Address of the arena's RAW bump word (the trap reads it).  Hosted aarch64:
-   0x10000F58; the Pi overrides to its own (%jit-exec-bump)."
-  (%conv-addr #x10000F58))
+   0x10000F58 (0x1000FF38 with threads: translate-aarch64 A64-GC-STAT-ADDR);
+   the Pi overrides to its own (%jit-exec-bump)."
+  (%layout-if :a64-threads (%conv-addr #x1000FF38) (%conv-addr #x10000F58)))
 
 (defun %core-jit-arena-bump ()
   "Current bump pointer of the arena, or 0 when this process has none.  The
@@ -243,15 +244,16 @@
       (%core-slice fd (%conv-addr #x10000148) 8)       ; keyword intern table
       (%core-slice fd stage #x20)         ; 0x150..0x170: nargs, handler frames
       (%core-slice fd (%conv-addr #x10000170) 8)       ; package-by-hash table
-      (%core-slice fd stage #xD98)        ; 0x178..0xF10: argv, bitmap cfg, stats
-      (%core-slice fd (%conv-addr #x10000F10) 8)       ; JIT constant-vector root
-      (%core-slice fd stage #x88)         ; 0xF18..0xFA0
+      (%core-slice fd stage #xE28)        ; 0x178..0xFA0: argv, bitmap cfg, stats,
+                                          ; the per-CPU region cells
       ;; The global-cell cache vector + its init guard.  In place, not staged:
       ;; the cells it points at live in the heap slice that follows and are
       ;; restored at the same addresses, so a restored image that dropped this
       ;; word would read every special through the SAVING process's pairs.
       (%core-slice fd (%conv-addr #x10000FA0) 16)      ; global-cell cache root + guard
-      (%core-slice fd stage #x50)         ; 0xFB0..0x1000
+      (%core-slice fd stage #x20)         ; 0xFB0..0xFD0
+      (%core-slice fd (%conv-addr #x10000FD0) 8)       ; JIT constant-vector root (aarch64)
+      (%core-slice fd stage #x28)         ; 0xFD8..0x1000
       (%core-slice fd from (- free from))
       (%core-slice fd (+ (%gc-bitmap-base) boff) blen)
       (%core-slice fd (+ (%gc-cons-bitmap-base) boff) blen)

@@ -551,6 +551,11 @@
 ;; _JIT_ARENA_BASE / MODUS_NO_X18), shared with the ANSI gate.
 (load (merge-pathnames "hosted-layout-env.lisp"
                        (directory-namestring (truename *load-truename*))))
+;; Native threads on the hosted AArch64 CLI (MODUS_NO_THREADS=1 opts out).
+;; Before anything reads *LAYOUT-PLIST*: the co-init text below, the thread
+;; group (*CLI-HOSTED-ACTORS-SOURCE*) and every %LAYOUT-IF :A64-THREADS.
+(when (and (eq *cli-arch* :aarch64) (not *cli-bare-metal*))
+  (cl-user::enable-layout-threads))
 
 (defvar *aarch64-jit-coinit-source*
   (when (and *jit-on* (eq *cli-arch* :aarch64)) (concatenate 'string "
@@ -709,11 +714,11 @@
     ;; (any long loop) left the rest of that run reading stale from-space.
     ;; Gated on the same published-bitmap check as the flags above: the
     ;; indirection is only correct when the collector is actually forwarding
-    ;; the root at #x10000F10, which only the native trampoline does.
+    ;; the root at #x10000FD0, which only the native trampoline does.
     ;; Zero the root before enabling: %jit-constvec treats 0 as
     ;; no-vector-installed, the safe state.  On Linux the BSS already reads 0;
     ;; this costs one store and keeps the hosted and bare-metal init identical.
-    (setf (mem-ref #x10000F10 :u64) 0)
+    (setf (mem-ref #x10000FD0 :u64) 0)
     (setq *aarch64-jit-constvec-p* t))
   ;; #307: a runtime-JIT page may arm a REAL handler frame only if this image's
   ;; boot stub recorded the push/pop helpers' VAs.  Gate on the slot itself
@@ -1129,18 +1134,28 @@
 ;;; addresses by SHRINKING REGION 0 and using the top of the semispaces that
 ;;; frees — the same carve mvm/gc.lisp's stage-1/2/3 selftests already use.
 ;;;
-;;; x64 ONLY, and hosted only.  aarch64's per-CPU storage is TPIDR_EL1 (a
-;;; system register the kernel does not let userspace write) rather than a GS
-;;; base an ordinary arch_prctl can set, so the aarch64 CLI gets "" here and
-;;; its blob is byte-identical to before.  Bare-metal targets already have a
-;;; board file and do not want this one.
+;;; HOSTED ONLY, x64 and AArch64.  Bare-metal targets already have a board file
+;;; and do not want this one.  AArch64 has no GS base for the per-CPU block and
+;;; EL0 cannot write TPIDR_EL1, so its per-CPU pointer lives in the per-thread
+;;; window instead (translate-aarch64.lisp, THE PER-THREAD WINDOW, AARCH64;
+;;; net/hosted-actors.lisp %ARCH-SET-PERCPU-BASE), and it gets the four core
+;;; files only: hosted-sockets-post and hosted-intern-probe issue syscalls the
+;;; AArch64 remap does not carry yet (poll, stat, unlink, chmod), so that image
+;;; keeps the single-buffer socket layer.  MODUS_NO_THREADS=1 gives the old "".
 ;;; THE ORDER IS LOAD-BEARING.  net/hosted-actors.lisp supplies the twelve
 ;;; address hooks and must precede net/actors.lisp (a forward reference across
 ;;; the blob does not resolve).  net/hosted-actors-post.lisp must FOLLOW it,
 ;;; because its SPIN-LOCK / SPIN-UNLOCK / AP-SCHEDULER are last-defun-wins
 ;;; overrides of definitions net/actors.lisp itself makes.
 (defvar *cli-hosted-actors-source*
-  (if (and (eq *cli-arch* :x64) (not *cli-bare-metal*))
+  (cond
+   ((and (eq *cli-arch* :aarch64) (not *cli-bare-metal*) cl-user::*layout-threads*)
+    (concatenate 'string (string #\Newline)
+                 (mvm-text "net/hosted-actors.lisp") (string #\Newline)
+                 (mvm-text "net/actors.lisp") (string #\Newline)
+                 (mvm-text "net/hosted-actors-post.lisp") (string #\Newline)
+                 (mvm-text "net/hosted-sync.lisp") (string #\Newline)))
+   ((and (eq *cli-arch* :x64) (not *cli-bare-metal*))
       (concatenate 'string (string #\Newline)
                    (mvm-text "net/hosted-actors.lisp")
                    (string #\Newline)
@@ -1182,8 +1197,8 @@
                    ;; forward references across the blob.  "" on aarch64 and on
                    ;; bare metal with the rest of the group.
                    (mvm-text "net/hosted-intern-probe.lisp")
-                   (string #\Newline))
-      ""))
+                   (string #\Newline)))
+   (t "")))
 
 (format t "  prelude: ~D chars~%" (length *prelude-source*))
 (format t "  gc:      ~D chars~%" (length *gc-source*))

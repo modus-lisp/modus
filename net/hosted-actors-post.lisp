@@ -438,7 +438,7 @@
    and stamp CPU into the :CPU-ID slot at +GC-PERCPU-CPU-ID-OFF+ = 16.  The
    order matters: PERCPU-SET is a GS-relative store, so it can only be issued
    after the base is set.  Returns the kernel's return value (0 = success)."
-  (let ((r (syscall3 158 #x1001 base 0)))
+  (let ((r (%arch-set-percpu-base base)))
     (if (zerop r) (percpu-set 16 cpu) 0)
     r))
 

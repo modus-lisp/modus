@@ -419,8 +419,7 @@ macOS passes a far larger environment), with identical pass counts;
   Linux twin printed `PORT -1`); fixed in its own commit, and the same test
   now passes on Linux too.
 
-**Not yet:** fork/wait, and native threads (hosted aarch64 has none on Linux
-either).
+**Not yet:** fork/wait.  Native threads: see below.
 
 ## The JIT on macOS (M3)
 
@@ -455,6 +454,113 @@ and keeps running them; smoke/stress/GC/fault/RFB all pass on the JIT build.
 (Runtime DEFUNs start as interpreter trampolines and the JIT is hot-gated;
 `jit-eager` is how to exercise it — the same on Linux.)
 
+## Native threads on AArch64 (Linux and macOS)
+
+Hosted x86-64 has had up to 16 OS threads for a while: a per-thread *window*
+(the MV buffer, nargs, handler frames, the dynamic-binding stack) addressed
+through the FS segment, and a per-CPU block (CPU id, active GC region) through
+GS.  AArch64 has no segments, so the port keeps the same design and changes how
+the two bases are reached.
+
+**The per-thread window.**  Every window access adds a per-thread DELTA to its
+literal address (translate-aarch64.lisp, THE PER-THREAD WINDOW, AARCH64).  The
+delta is 0 on the main thread, so the main thread needs no set-up, exactly as
+FS = 0 did.
+- Linux: TPIDR_EL0, which the kernel saves per thread and a static image
+  starts with 0.
+- macOS: TPIDR_EL0 is **not** usable.  The kernel rewrites it with the CPU
+  number on context switches: a probe that wrote it and read it back 3M times
+  lost the value ~50 times per thread, and read values 0..13 on a 14-core
+  machine.  TPIDRRO_EL0 points at the thread's pthread TSD array, so the
+  delta lives in a pthread key (300).  The shim reserves the key at start-up
+  and the image reads `[TPIDRRO_EL0 + 2400]`: one extra load per window access.
+  A probe of 16 threads x 20M reads saw no mismatch.
+- The AArch64 window is bigger than x86-64's.  The handler-frame stack is at
+  0x10010000, not in the first page, and there are two more words: the
+  helper-call LR save at 0x1000FFF0 and the per-CPU pointer at 0x1000FFE8.  A
+  worker's block is therefore 0x11000 bytes.
+- On macOS the thread page is mapped *below* the relocated region, so deltas
+  can be negative.  The register add wraps correctly; the Lisp readers of the
+  self slot sign-extend.
+
+**The per-CPU block.**  EL0 cannot touch TPIDR_EL1, so the block's address is
+a word in the window (0x1000FFE8) that PERCPU-REF/-SET load through.  One
+consequence: a thread cannot have its own per-CPU block without its own
+window.  The older two-thread path (`%ha-spawn-t2`) never gave threads a
+window, so on AArch64 `%ha-percpu-init-cpu` now installs one first.  That is
+also why `hosted-mv-handler-unsync`, a negative control that relies on a
+window-less thread colliding, now "comes back clean" on AArch64.
+
+**Spawn and the rest.**
+- TRAP #x0540 is clone(220) with x64's flags, in generic-ABI argument order.
+  The child branches off in the stub, before any compiled Lisp runs.
+- TRAP #x0541 (`%set-thread-delta`) sets the delta.  Runtime source reaches it
+  through `(%layout-if :a64-threads ...)`, a compile-time choice made in the
+  %CONV-SUBST pre-pass, so x86-64 never sees an AArch64-only trap.
+- ATOMIC-XCHG is now LDAXR/STLXR + DMB ISH.  x86-64's XCHG is a full barrier,
+  and the spin locks were written against that.
+- futex, gettid, nanosleep, sched_yield, fcntl and getuid are remapped.  The
+  remap is a sequential cmp/csel chain, so x64 futex (202) must come before
+  `(43 . 202)`, or every accept becomes a futex.
+- The GC trampoline scans this thread's MV buffer and dynamic-binding stack,
+  and reads this CPU's active-region cell.
+- The CLI's semispaces are 432 MB with threads, not 128 MB.  Thread regions are
+  carved from region 0's semispace, and 128 MB affords only two.
+
+**Collisions on the per-CPU region table.**  `0x10000F08 + 8*cpu`, sixteen
+cells, overlapped two AArch64-only word sets:
+- The JIT constant-vector root at 0x10000F10, which is CPU 1's cell.  The
+  first worker's region adoption overwrote the JIT's constants, and
+  sb-thread:make-thread's `'SLOT` read back as 0.  The root is now at
+  0x10000FD0; save-image slices the new place.
+- The GC pause statistics and the JIT arena bump at 0x10000F20..F58, which are
+  CPU 3..10's cells.  With threads these move to 0x1000FF00..FF38.
+
+**Two fixes in shared code.**  Both apply to x86-64 as well, and its suite is
+unchanged by them.
+- `%rt-threads-on` ran JIT-EAGER *after* opening the gate.  Installing ~140
+  native functions grows the symbol-function table inside one locked section,
+  which outgrows the 64 KB slice and collects the slice (the B-lite landmine).
+  It now compiles before the gate opens, in region 0, since the caller may be
+  in a private region.
+- `%rt-arena-carve` collects once and retries when the frontier is in the way,
+  as `%ha-carve-room` does.
+
+**macOS shim.**
+- `clone` copies the syscall stub's frame, which now also stores x19..x28,
+  into a resume context.  A detached pthread jumps into the image with it:
+  PC after the stub call, SP 16 below the new stack so the stub's LR pop
+  lands on it, x0 = 0.
+- `exit(93)` on such a thread clears the CHILD_CLEARTID word, wakes waiters,
+  and calls pthread_exit.
+- `futex` maps to os_sync_wait_on_address / os_sync_wake_by_address_*.
+- `gettid` returns the pid on the main thread, as on Linux.
+- Each thread gets its own sigaltstack.
+- `MODUS_SHIM_STRACE=1` traces every translated call.
+
+**Status, thread suite (22 tests; x86-64 baseline 17 pass).**
+- Pass on Linux/aarch64 and natively on macOS:
+  - many-threads (8 threads from 8 closures)
+  - threads
+  - mutex
+  - atomics
+  - percpu
+  - mv-handler
+  - thread-lisp: 28/29; the one miss is a region-0 GC count that depends on
+    heap size
+  - thread-regions: 35/36, same kind of miss
+  - many-regions: 103/106; x86-64 geometry: 12 regions not 16, metadata
+    scale 2
+- dynbind passes when its worker body is wrapped, and every piece passes on
+  a worker.  The exact test file still exits 2; open.
+- Not yet on AArch64: actor-regions, spinlock, thread-actors and
+  thread-gc{,-concurrent,-stress}.  All of them run **actors** (green threads
+  switched by SAVE-CTX/RESTORE-CTX) on top of the native threads.
+  RESTORE-CTX now releases the hosted scheduler lock and no longer executes
+  the EL1-only `MSR DAIFClr`; the coroutine layer is next.
+- Fail on x86-64 too: sb-thread, region0-frontier, term-xregion,
+  worker-xregion, thread-lisp-unsync (a control).
+
 ## Open questions
 
 - Does the image ever write into its own loaded code bytes?  (Decides how
@@ -472,5 +578,5 @@ and keeps running them; smoke/stress/GC/fault/RFB all pass on the JIT build.
 - Save-and-die cores embed code pointers from the image that saved them —
   the same staleness `4a03744` hit on the Pi.  A core is only valid for the
   image, and the VAs, that wrote it.
-- Hosted AArch64 has no native threads yet (hosted x64 does); threads on
-  macOS come after M2.
+- Native threads run on hosted AArch64, Linux and macOS (see "Native
+  threads on AArch64"); the actor (green-thread) layer above them does not yet.

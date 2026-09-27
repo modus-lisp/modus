@@ -408,6 +408,34 @@
 
 (defvar *ha-gs-base* 0)   ; the address arch_prctl was last given; 0 = never set
 
+;;; THE TWO THREAD REGISTERS, PER TARGET.  x86-64 has two segment bases, set
+;;; with arch_prctl: GS for the per-CPU block and FS for the per-thread window.
+;;; AArch64 (an image built with the :A64-THREADS layout key) has neither, and
+;;; EL0 cannot touch TPIDR_EL1, so (translate-aarch64.lisp, THE PER-THREAD
+;;; WINDOW, AARCH64): the window delta is TPIDR_EL0 on Linux or a pthread key on
+;;; Darwin, set by %SET-THREAD-DELTA, and the per-CPU block's address is a word
+;;; IN the window, which PERCPU-REF / -SET read.  %LAYOUT-IF picks the arm at
+;;; compile time, so neither back-end ever sees the other's.  Both return 0 on
+;;; success like the syscall.
+
+(defun %arch-set-percpu-base (base)
+  "Make BASE this thread's per-CPU block (x86-64: ARCH_SET_GS)."
+  (%layout-if :a64-threads
+    ;; The exact machine word, as two :u32 halves (a :u64 store deposits
+    ;; val*2), at a LITERAL address so the store is per-thread.
+    (let* ((hi (ash (ash base -16) -16))
+           (lo (- base (* (* hi 65536) 65536))))
+      (setf (mem-ref #x1000FFE8 :u32) lo)
+      (setf (mem-ref #x1000FFEC :u32) hi)
+      0)
+    (syscall3 158 #x1001 base 0)))
+
+(defun %arch-set-thread-delta (delta)
+  "Make DELTA this thread's per-thread-window delta (x86-64: ARCH_SET_FS)."
+  (%layout-if :a64-threads
+    (%set-thread-delta delta)
+    (syscall3 158 #x1002 delta 0)))
+
 ;; CARVE-ON-DEMAND.  Every address hook below goes through this rather than
 ;; reading *HA-BAND* directly, so that a call into net/actors.lisp before
 ;; anything set the system up computes a REAL address instead of dereferencing
@@ -436,7 +464,7 @@
    to carry a non-zero GS base."
   (if (zerop (%ha-carve))
       -1
-      (let ((r (syscall3 158 #x1001 (%ha-percpu-base) 0)))
+      (let ((r (%arch-set-percpu-base (%ha-percpu-base))))
         (if (zerop r) (setq *ha-gs-base* (%ha-percpu-base)) 0)
         r)))
 

@@ -159,7 +159,7 @@
 ;; SINCE WRITTEN, three further tenants have moved into that gap.  Anyone
 ;; claiming a word here must grep #x10000[EF].. first; the list as of #286 is:
 ;;   0x10000F00       this slot (DTB pointer)
-;;   0x10000F10       *aarch64-jit-constvec-root* (#282, translate-aarch64.lisp)
+;;   0x10000FD0       *aarch64-jit-constvec-root* (#282, translate-aarch64.lisp)
 ;;   0x10000F20..F50  GC pause statistics (#286, seven words — see mvm/gc.lisp)
 ;;   0x10000FF0       caller-x30 save slot for the out-of-module call thunks
 ;; Still free: 0x10000EA8..0x10000EFF, 0x10000F18, 0x10000F58..0x10000FE8.

@@ -605,12 +605,20 @@ three targets; AArch64 still fails it.  Three shared fixes:
   only and drops it before the code runs, because a run can block.  It is
   inert until threads are on.
 
-AArch64 still fails it, and the thread root now shows how: a worker's
-interpreter hits `unknown opcode NIL` at a fixed PC, running offset 6817 of a
-bytecode vector too short to hold it.  The suspect is objects compiled or
-allocated on a WORKER (its own GC region) and published into process-wide
-tables, then reclaimed when that region collects or is re-initialised for the
-next thread in the slot.  Not yet confirmed.
+AArch64 still fails it, and now the cause is known.  The worker's
+interpreter reads its bytecode as `#<STALE-FORWARDED>`: the closure's module
+lives in REGION 0, where main compiled the toplevel form, and main COLLECTED
+region 0 while the worker was running it.  The copying collector moved the
+bytecode, and the worker's pointer is not a region-0 root.  That is the
+precondition CLAUDE.md states for the runtime lock ("region 0 must not collect
+while threads run Lisp — a stop-the-world handshake with per-thread root
+windows, not done").  Nothing AArch64-specific breaks it; AArch64 only breaks
+it sooner.  Its in-image JIT (compiling ahead at every spawn) produces far
+more region-0 garbage than x86-64's, so region 0 fills and collects during the
+test.  The two ways forward:
+- make the precondition hold, by producing less region-0 garbage on AArch64;
+- or remove it, with the stop-the-world handshake that makes region 0
+  collectable under threads.
 
 ## Open questions
 

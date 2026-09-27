@@ -1375,31 +1375,10 @@
 (setf *aarch64-gc-native-mcgc* t)
 (format t "~%  AArch64 GC: ON (NATIVE MCGC)  midpoint=#x~X  metadata-shl=t  bitmap=t~%"
         *linux-aarch64-gc-midpoint*)
-;; docs/macos-hosting.md M1: mark every provable runtime-data access with
-;; +WIDTH-CONV-BIT+ so the region can later move by a delta.  The AArch64
-;; translator masks the bit today (the delta is 0), so this changes the image's
-;; bytecode widths and nothing it executes.  Its twin is in the JIT co-init
-;; (build-cli-common.lisp); the two must agree.
-(setf *conv-relative* t)
-;; ...and move it, when MODUS_CONV_DELTA says so (read once, in
-;; build-cli-common, so the JIT co-init bakes the same value).
-(setf *conv-delta* cl-user::*cli-conv-delta*)
-(setf *hosted-layout* cl-user::*cli-hosted-layout*)
-;; MODUS_NO_X18 (build-cli-common): Darwin's register discipline — no x18 base,
-;; and the boot stub poisons x18.
-(when cl-user::*cli-no-x18*
-  (setf *a64-x18-base* nil)
-  (format t "  x18: NOT used (MODUS_NO_X18) — boot poisons it~%"))
-;; Code linked above 4 GB: every code-address placeholder gets a third
-;; halfword (translate-aarch64 A64-EMIT-CODE-ADDR-PLACEHOLDER).
-(setf *a64-code-addr-wide*
-      (>= (hosted-layout :code-base +linux-aarch64-load-addr+) (ash 1 32)))
-(format t "  Code linked at #x~X~%" (linux-aarch64-code-base))
-(format t "  Heap #x~X, JIT arena #x~X~%"
-        (hosted-layout :heap-base +linux-aarch64-fixed-heap-base+)
-        (hosted-layout :jit-arena-base +linux-aarch64-jit-arena-base+))
-(format t "~%  Runtime-data region: #x~X (delta #x~X)~%"
-        (conv-real +conv-region-base+) *conv-delta*)
+;; docs/macos-hosting.md: the hosted layout (region delta, code / heap / JIT
+;; arena bases, x18) from MODUS_* env vars — mvm/hosted-layout-env.lisp, read
+;; once and shared with the JIT co-init and the ANSI gate.
+(cl-user::apply-layout-host)
 ;; MODUS_CONV_AUDIT=<path>: write every MEM-REF access the rule saw — function,
 ;; address form, and whether it was proved — for the value audit.
 (let ((ca (sb-ext:posix-getenv "MODUS_CONV_AUDIT")))

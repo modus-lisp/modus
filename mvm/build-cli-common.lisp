@@ -547,37 +547,10 @@
 ;; AArch64 co-init.  Same role as %init-x64-translator: populate the tables the
 ;; translator's defvar init-thunks would have filled (limitation #7).  Verbatim
 ;; from build-ansi-common.lisp's *aarch64-translator-coinit-source*.
-;; docs/macos-hosting.md option B: where the runtime-data region really is,
-;; as an offset from its virtual base 0x10000000.  MODUS_CONV_DELTA (hex),
-;; default 0 = unmoved.  Read ONCE here so the host build (build-aarch64-cli)
-;; and the JIT co-init below bake the same number: fixed code and runtime-
-;; compiled code must agree on where the region is.
-(defvar *cli-conv-delta*
-  (let ((v (sb-ext:posix-getenv "MODUS_CONV_DELTA")))
-    (if (and v (plusp (length v))) (parse-integer v :radix 16) 0)))
-
-;; The hosted layout's other fixed mappings (docs/macos-hosting.md): the heap
-;; and the JIT arena.  MODUS_HEAP_BASE / MODUS_JIT_ARENA_BASE (hex); unset
-;; keeps the historic 0x2000000000 / 0x3000000000.  Same two homes as the
-;; delta above.
-(defvar *cli-hosted-layout*
-  (let ((out nil))
-    (dolist (kv '(("MODUS_CODE_BASE" . :code-base)
-                  ("MODUS_HEAP_BASE" . :heap-base)
-                  ("MODUS_JIT_ARENA_BASE" . :jit-arena-base)))
-      (let ((v (sb-ext:posix-getenv (car kv))))
-        (when (and v (plusp (length v)))
-          (setq out (list* (cdr kv) (parse-integer v :radix 16) out)))))
-    out))
-
-;; MODUS_NO_X18=1: the DARWIN register discipline on Linux.  macOS and iOS
-;; zero x18 on preemption (measured, docs/macos-hosting.md), so an image for
-;; them must never depend on it: no convention base in x18, and the boot stub
-;; POISONS x18 so anything that still reads it breaks here, where it can be
-;; debugged, instead of intermittently on a Mac.
-(defvar *cli-no-x18*
-  (let ((v (sb-ext:posix-getenv "MODUS_NO_X18")))
-    (and v (plusp (length v)) (string/= v "0"))))
+;; The hosted layout knobs (MODUS_CONV_DELTA / _CODE_BASE / _HEAP_BASE /
+;; _JIT_ARENA_BASE / MODUS_NO_X18), shared with the ANSI gate.
+(load (merge-pathnames "hosted-layout-env.lisp"
+                       (directory-namestring (truename *load-truename*))))
 
 (defvar *aarch64-jit-coinit-source*
   (when (and *jit-on* (eq *cli-arch* :aarch64)) (concatenate 'string "
@@ -590,7 +563,7 @@
     (aset map 16 0) (aset map 17 24) (aset map 18 25) (aset map 19 26)
     (aset map 20 31) (aset map 21 29) (aset map 22 nil)
     (setq *a64-vreg-to-phys* map)
-  (setq *a64-x18-base* " (if *cli-no-x18* "nil" "t") "))   ; x18 = convention base (translate-aarch64) unless MODUS_NO_X18; a defvar whose init never runs in-image
+  (setq *a64-x18-base* t))   ; x18 = convention base (translate-aarch64), a defvar whose init never runs in-image; the layout text below may turn it off
   ;; Hosted Linux preempts: YIELD (every loop back-edge) as SEV+WFE cost 18 cycles
   ;; per iteration on the A76 (2026-09-18), so the runtime JIT emits NOP for it.
   (setq *aarch64-yield-nop* t)
@@ -606,14 +579,10 @@
   ;; TRAP codegen emits Linux syscalls.
   (setq *aarch64-stack-align-16* t)
   (setq *aarch64-linux-mode* t)
-  ;; The compiler half of the convention-region bit (docs/macos-hosting.md M1)
-  ;; must match the host build that compiled the fixed code: code compiled at
-  ;; runtime reaches the same region, and once it moves an unmarked access
-  ;; would read the old address.  The x64 TLS window learned this the hard way.
-  (setq *conv-relative* t)
-  (setq *conv-delta* " (princ-to-string *cli-conv-delta*) ")
-  (setq *hosted-layout* (quote " (let ((*print-base* 10) (*print-radix* nil))
-                                    (prin1-to-string *cli-hosted-layout*)) "))
+  ;; The hosted layout (docs/macos-hosting.md) — the runtime twin of
+  ;; APPLY-LAYOUT-HOST: code compiled at runtime must agree with the fixed code
+  ;; on where the region is, which heap and arena, and whether x18 is the base.
+" (layout-coinit-text) "
   t)
 ")))
 

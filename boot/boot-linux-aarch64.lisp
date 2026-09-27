@@ -182,6 +182,16 @@
          (shdrs-offset (+ strtab-offset strtab-len))
          (entry-point (+ load-addr header-total))
          (buf (make-mvm-buffer)))
+    ;; Code linked high must END below where the moved region begins: the
+    ;; ANSI gate's image is ~200 MB, and code at 0x7000000000 overlapping a
+    ;; region at 0x700F000000 would be two MAP_FIXED mappings on one range.
+    (when (and (>= load-addr +conv-region-end+)
+               (> (+ load-addr header-total raw-len #x10000)
+                  (conv-real +conv-region-low+))
+               (< load-addr (conv-real +conv-region-low+)))
+      (error "code #x~X..#x~X overlaps the runtime-data region at #x~X; raise MODUS_CONV_DELTA or lower MODUS_CODE_BASE"
+             load-addr (+ load-addr header-total raw-len #x10000)
+             (conv-real +conv-region-low+)))
     (mvm-emit-byte buf #x7F)
     (mvm-emit-byte buf (char-code #\E))
     (mvm-emit-byte buf (char-code #\L))

@@ -1480,6 +1480,9 @@
 ;; instead of `BL label`.  Gate-only; OFF everywhere else → CLI/bare-metal/x64
 ;; byte-identical.  Removes the branch horizon with no veneer islands / fixpoint.
 (setf *aarch64-force-absolute-inmodule-calls* t)
+;; docs/macos-hosting.md: the hosted layout from MODUS_* env vars (shared with
+;; the CLI; unset = the historic layout, byte-identical).
+(cl-user::apply-layout-host)
 (format t "~%  AArch64 GATE GC: ON (NATIVE MCGC)  midpoint=#x~X  metadata-shl=t  bitmap=t  abs-calls=t~%"
         *linux-aarch64-gc-midpoint*)
 

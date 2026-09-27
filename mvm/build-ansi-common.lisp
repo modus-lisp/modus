@@ -398,7 +398,11 @@
 ;; (V0-V3→x0-x3, V4-V8→x19-x23, VR→x0, VA→x24, VL→x25, VN→x26, VSP→sp, VFP→x29;
 ;; V9-V15 + V22 spill = nil).  Raw numbers (defconstants don't fold in-image);
 ;; spill slots set to nil explicitly (aarch64 alloc-array does NOT zero-init).
-(defvar *aarch64-translator-coinit-source* "
+;; The hosted layout knobs (docs/macos-hosting.md), shared with the CLI.
+(load (merge-pathnames "hosted-layout-env.lisp"
+                       (directory-namestring (truename *load-truename*))))
+
+(defvar *aarch64-translator-coinit-source* (concatenate 'string "
 (defun %init-aarch64-translator ()
   (let ((map (make-array 23)))
     (aset map 0 0) (aset map 1 1) (aset map 2 2) (aset map 3 3)
@@ -422,8 +426,10 @@
   ;; any TRAP codegen emits Linux syscalls.
   (setq *aarch64-stack-align-16* t)
   (setq *aarch64-linux-mode* t)
+  ;; The hosted layout: the runtime twin of APPLY-LAYOUT-HOST.
+" (cl-user::layout-coinit-text) "
   t)
-")
+"))
 
 ;;; ============================================================
 ;;; WS4-AA64 FLIP knob: default runtime-JIT on/off for the aarch64 image

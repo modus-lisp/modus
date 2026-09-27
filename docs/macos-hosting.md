@@ -193,7 +193,29 @@ to follow it:
   addresses (restore failed with `core: short read` until they did).
 
 A code base above the old region requires the region moved, and above 4 GB
-requires the wide placeholders; both are build-time errors.
+requires the wide placeholders; both are build-time errors, as is code that
+would overlap the moved region.  That last check fired on the ANSI gate: its
+image is 264 MB (301 MB without x18), and the layout below left the code only
+240 MB.  **The recommended layout gives the code 1.2 GB:**
+
+```
+MODUS_CODE_BASE=7000000000       code          0x7000000000
+MODUS_CONV_DELTA=7040000000      region        0x704F000000 .. 0x7080000000
+MODUS_HEAP_BASE=7080000000       heap          0x7080000000 .. 0x70B8000000
+MODUS_JIT_ARENA_BASE=70C0000000  JIT arena     0x70C0000000 .. 0x70E0000000
+```
+
+All knobs live in `mvm/hosted-layout-env.lisp`, loaded by both the CLI and the
+ANSI gate builds (`build-cli-common`, `build-ansi-common`), which apply them
+host-side and splice the same values into their JIT co-init.
+
+**ANSI gate: wired, not yet run.**  The moved, no-x18 gate builds (301 MB).  It
+could not be run on this Mac: the corpus lives on the Linux gate machine
+(`tmp/ansi-test` is symlinks into `/home/claude/modus-ref`), and a gate built
+from untouched `main` against upstream ansi-test crashes at boot in
+`%INIT-CLOS-PROTOCOL` → `%MAKE-GF-STUB` → `EVAL` → `GENERIC-ADD` on an unbound
+marker, before any test runs — so there is no baseline to compare against
+here.
 
 The full macOS-shaped layout runs on Linux — `/proc/self/maps` of a live
 image, nothing of modus below 4 GB:

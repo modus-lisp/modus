@@ -515,7 +515,7 @@
 (defun asdf::%register-from-asd (name path)
   "Read the .asd at PATH, find NAME's DEFSYSTEM in it, register it as NOT
    loaded, and return the SYSTEM."
-  (let* ((forms (%it-read-asd-forms (%it-slurp-text path)))
+  (let* ((forms (%it-read-asd-forms (%it-slurp-text path) path))
          (ds (%it-find-defsystem forms (asdf::coerce-name name))))
     (when (null ds)
       (error 'asdf::missing-component :requires (asdf::coerce-name name)))

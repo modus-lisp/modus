@@ -3766,10 +3766,21 @@
                                                      (opt-supplied (if (and (consp opt-elt) (cddr opt-elt))
                                                                        (caddr opt-elt) nil))
                                                      (next-cur (%mvm-gensym "DC")))
-                                                (setf result
-                                                      (append result
-                                                              (list (list opt-var
-                                                                          `(if ,cur (car ,cur) ,opt-default)))))
+                                                ;; OPT-VAR may itself be a destructuring
+                                                ;; PATTERN, (&optional ((y z) '(2 3))):
+                                                ;; bind the value to a temp and destructure
+                                                ;; it (it used to be bound as a variable
+                                                ;; named by the list, so Y / Z were unbound).
+                                                (if (consp opt-var)
+                                                    (let ((ot (%mvm-gensym "DO")))
+                                                      (setf result
+                                                            (append result
+                                                                    (list (list ot `(if ,cur (car ,cur) ,opt-default)))
+                                                                    (gen-bindings opt-var ot))))
+                                                    (setf result
+                                                          (append result
+                                                                  (list (list opt-var
+                                                                              `(if ,cur (car ,cur) ,opt-default))))))
                                                 (when opt-supplied
                                                   (setf result
                                                         (append result
@@ -3796,23 +3807,37 @@
                                                                     (string= (symbol-name (car remaining)) "&AUX")
                                                                     (string= (symbol-name (car remaining)) "&ALLOW-OTHER-KEYS")))))
                                            do (let* ((key-elt (car remaining))
-                                                     (key-var (if (consp key-elt) (car key-elt) key-elt))
+                                                     (key-spec (if (consp key-elt) (car key-elt) key-elt))
+                                                     ;; ((:keyword var-or-pattern) ...) names the
+                                                     ;; keyword explicitly (CLHS 3.4.1.4).
+                                                     (explicit-kw (consp key-spec))
+                                                     (key-var (if explicit-kw (cadr key-spec) key-spec))
                                                      (key-default (if (and (consp key-elt) (cdr key-elt))
                                                                       (cadr key-elt) nil))
                                                      (key-supplied (if (and (consp key-elt) (cddr key-elt))
                                                                        (caddr key-elt) nil))
-                                                     ;; Make :var keyword from var name
-                                                     (kw (intern (symbol-name key-var) :keyword))
+                                                     ;; Make :var keyword from var name, unless
+                                                     ;; the spec named one.
+                                                     (kw (if explicit-kw
+                                                             (car key-spec)
+                                                             (intern (symbol-name key-var) :keyword)))
                                                      (probe-tmp (%mvm-gensym "KP")))
                                                 (setf result
                                                       (append result
                                                               (list (list probe-tmp
                                                                           `(let ((c ,cur)) (loop (when (null c) (return nil)) (when (eq (car c) ',kw) (return c)) (setq c (cdr c)))))))
                                                       )
-                                                (setf result
-                                                      (append result
-                                                              (list (list key-var
-                                                                          `(if ,probe-tmp (cadr ,probe-tmp) ,key-default)))))
+                                                (if (consp key-var)
+                                                    ;; Destructuring pattern as the key's variable.
+                                                    (let ((kt (%mvm-gensym "DK")))
+                                                      (setf result
+                                                            (append result
+                                                                    (list (list kt `(if ,probe-tmp (cadr ,probe-tmp) ,key-default)))
+                                                                    (gen-bindings key-var kt))))
+                                                    (setf result
+                                                          (append result
+                                                                  (list (list key-var
+                                                                              `(if ,probe-tmp (cadr ,probe-tmp) ,key-default))))))
                                                 (when key-supplied
                                                   (setf result
                                                         (append result
@@ -4240,6 +4265,18 @@
                            (,gval ,value))
                       (,setter ,gval ,@gargs)
                       ,gval)))
+                ;; A place whose operator is a MACRO -- a MACROLET local or a
+                ;; user DEFMACRO with no DEFSETF: CLHS 5.1.2.7, expand it and
+                ;; SETF the expansion.  (It fell to the SET-<name> fallback
+                ;; below, so (macrolet ((%m (x) `(car ,x))) (setf (%m y) 6))
+                ;; called an undefined SET-%M.)  Runtime compiles only, and
+                ;; after every known place, so built-in accessors that are
+                ;; also compiler macros (CADDR, ...) keep their own clauses.
+                ((and *mvm-eval-runtime-p* (consp place) (symbolp (car place))
+                      (%macro-expander (car place) (normalize-name (car place))))
+                 `(setf ,(funcall (%macro-expander (car place) (normalize-name (car place)))
+                                  place)
+                        ,value))
                 ;; Generic accessor: (setf (foo-bar a1 ... aN) v) → (set-foo-bar a1 ... aN v)
                 ;; Pass ALL place args plus the value (was only passing the
                 ;; first arg, which silently dropped the index in

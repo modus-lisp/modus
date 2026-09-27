@@ -1300,8 +1300,8 @@
   (%init-sym-name-auto)
   (setq *macro-table* (make-hash-table))
   (%init-runtime-macros)
-  (setq *cstr-scratch* #x0FE00000)  ; moved below heap base
-  (setq *io-buf-addr*  #x0FF00000)  ; moved out of heap semispace 0; see memory note
+  (setq *cstr-scratch* (%conv-addr #x0FE00000))  ; moved below heap base
+  (setq *io-buf-addr*  (%conv-addr #x0FF00000))  ; moved out of heap semispace 0; see memory note
 "
   ;; BARE-METAL SEAM.  %init-signal-handling -> %install-signal-handlers ->
   ;; TRAP #x0520, which BOTH translators emit as unconditional rt_sigaction

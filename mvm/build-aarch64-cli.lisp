@@ -76,8 +76,8 @@
             (when (>= i len) (return s))
             (aset s i (mem-ref (+ addr i) :u8))
             (setq i (+ i 1)))))))
-(defun %argv1 () (%argv-string-at #x10000208))
-(defun %argv2 () (%argv-string-at #x10000248))
+(defun %argv1 () (%argv-string-at (%conv-addr #x10000208)))
+(defun %argv2 () (%argv-string-at (%conv-addr #x10000248)))
 (defun %argc  () (mem-ref #x10000200 :u32))
 ;; AArch64 handler-stack geometry differs from x64 and these observers were
 ;; COPIED FROM THE x64 BUILD UNCHANGED, so they read the wrong memory:

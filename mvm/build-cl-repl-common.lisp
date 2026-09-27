@@ -922,10 +922,17 @@
     ;; the 2 MB region 0x0C000000.. that the SNP boot maps SHARED (C=0): the
     ;; per-connection block holds the host private key (+0x110) and the session
     ;; keys, and shared memory is the hypervisor's to read.  They live above it.
+    ;; e1000-state-base moves too: it is CPU-only state (the NIC DMAs only into
+    ;; the ring/buffer areas), and +0x710 is the HOST PRIVATE KEY, +0x62C the
+    ;; PRNG -- the last SSH secrets that were still in host-readable memory.
+    ;; fe-scratch-base keeps its +0x900 relation to it.  ssh-ipc ends at
+    ;; 0x0C280000 + 76800*8 = 0x0C316000.
     (*cl-repl-x64-p*
      "
 (defun ssh-conn-base ()      #x0C200000)
 (defun ssh-ipc-base ()       #x0C280000)
+(defun e1000-state-base ()   #x0C320000)
+(defun fe-scratch-base ()    #x0C320900)
 ")
     (t
       "
@@ -1018,19 +1025,29 @@
         ;; repl-source reader) — neither exists in this image, so exec produced
         ;; no output.  Route the command through the REAL CL stack instead:
         ;; read-from-string -> eval (eval2) -> prin1-to-string -> channel data.
+        ;; What the form PRINTS goes to the channel too: *standard-output* is
+        ;; bound to a string stream around the eval and its contents precede the
+        ;; `= VALUE' line, so a client can read lines a function writes (the
+        ;; attestation report from SNP-ATTEST-SSH is 19 of them) and not only
+        ;; the value.  Serial no longer sees that output; it is the session's.
         "(defun ssh-eval-line (ssh cmd cmd-len)
-  (let ((s (make-string cmd-len)))
+  (let ((s (make-string cmd-len)) (out nil))
     (dotimes (i cmd-len) (aset s i (code-char (aref cmd i))))
-    (let ((result (handler-case (eval (read-from-string s))
+    (let ((result (handler-case
+                      (let ((so (make-string-output-stream)))
+                        (let ((r (let ((*standard-output* so)) (eval (read-from-string s)))))
+                          (setq out (get-output-stream-string so))
+                          r))
                     (t (c) (list (quote error) c)))))
       (let ((rs (handler-case (prin1-to-string result)
                   (t (c) (prin1-to-string (quote unprintable))))))
-        (let ((rl (length rs)))
-          (let ((arr (make-array (+ rl 3))))
-            (aset arr 0 61) (aset arr 1 32)
-            (dotimes (i rl) (aset arr (+ 2 i) (char-code (aref rs i))))
-            (aset arr (+ 2 rl) 10)
-            (ssh-send-string ssh arr (+ rl 3))))))))"
+        (let ((rl (length rs)) (ol (if out (length out) 0)))
+          (let ((arr (make-array (+ ol rl 3))))
+            (dotimes (i ol) (aset arr i (char-code (aref out i))))
+            (aset arr ol 61) (aset arr (+ ol 1) 32)
+            (dotimes (i rl) (aset arr (+ ol 2 i) (char-code (aref rs i))))
+            (aset arr (+ ol 2 rl) 10)
+            (ssh-send-string ssh arr (+ ol rl 3))))))))"
         (string #\Newline)
         ;; SHELL-path fix (completes the interactive SSH loop): the active
         ;; ssh-do-eval-expr (net/aarch64-overrides.lisp) used eval-sexp (the
@@ -1087,8 +1104,11 @@
         (if *cl-repl-x64-p*
             ;; :X64 -- the NIC is already up from run-net-pipeline (PCI, E1000,
             ;; DHCP into e1000-state-base +24/+28), so only the SSH state is
-            ;; zeroed and seeded.  No USB probe, no static address, no actors.
+            ;; zeroed and seeded (state +0x600..+0x900 is the SSH-side part of
+            ;; e1000-state: key-set flag, PRNG, host key; the NIC/DHCP words below
+            ;; it stay).  No USB probe, no static address, no actors.
             "(defun ssh-boot ()
+  (let ((s (+ (e1000-state-base) #x600))) (dotimes (i 96) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
   (let ((s (ssh-ipc-base))) (dotimes (i 76800) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
   (let ((s (ssh-conn-base))) (dotimes (i 8192) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
   (setf (mem-ref (+ (ssh-ipc-base) #x60438) :u32) 22)
@@ -1812,7 +1832,11 @@
         (%rpi-mvm-text "crypto/aes.lisp")       (string #\Newline)
         (%rpi-mvm-text "crypto/gcm.lisp")       (string #\Newline)
         (%rpi-mvm-text "crypto/snp-guest.lisp") (string #\Newline)
-        (%rpi-mvm-text "net/snp-attest.lisp")   (string #\Newline))
+        (%rpi-mvm-text "net/snp-attest.lisp")   (string #\Newline)
+        ;; The SSH-host-key binding needs both the SNP half and the SSH server
+        ;; (SHA512, the host key slots), so only an SNP+SSH image carries it.
+        (if *ssh-build-p* (%rpi-mvm-text "net/snp-ssh-attest.lisp") "")
+        (string #\Newline))
       ""))
 
 (defvar *cli-bare-metal-net-source*

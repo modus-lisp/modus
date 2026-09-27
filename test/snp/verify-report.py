@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Verify an SEV-SNP ATTESTATION_REPORT for attested SSH.
 
-  verify-report.py <report.bin> [--hostkey FILE | --report-data HEX] [--measurement HEX] [--vcek CERT.pem]
+  verify-report.py <report.bin> [--hostkey FILE | --hostkey-hex HEX | --hostkey-b64 BLOB | --report-data HEX]
+                   [--measurement HEX] [--vcek CERT.pem]
 
 Checks, each printed and any failure fatal:
-  * report_data == SHA-512 of --hostkey's bytes (or == --report-data)
+  * report_data == SHA-512 of the 32 raw Ed25519 host public key bytes, given as
+    a file of raw bytes, hex (what the server prints as SNP-HOSTKEY), or the
+    base64 blob from `ssh-keyscan` / known_hosts / ssh -v ("ssh-ed25519 AAAA...")
+    (or == --report-data)
   * measurement == --measurement (the DDC'd image's launch digest)
   * ECDSA P-384 signature over bytes 0..0x2A0 with the VCEK (if given);
     r and s are 72-byte little-endian fields at 0x2A0 / 0x2E8.
@@ -24,8 +28,18 @@ def main():
     rd=rep[0x50:0x90]; meas=rep[0x90:0xC0]
     print("report_data", rd.hex()); print("measurement", meas.hex())
     ok=True
-    if '--hostkey' in opts:
-        want=hashlib.sha512(open(opts['--hostkey'],'rb').read()).digest()
+    hk=None
+    if '--hostkey' in opts: hk=open(opts['--hostkey'],'rb').read()
+    if '--hostkey-hex' in opts: hk=bytes.fromhex(opts['--hostkey-hex'])
+    if '--hostkey-b64' in opts:
+        import base64
+        blob=base64.b64decode(opts['--hostkey-b64'].split()[-1] if ' ' in opts['--hostkey-b64'] else opts['--hostkey-b64'])
+        n=struct.unpack_from('>I',blob,0)[0]; assert blob[4:4+n]==b'ssh-ed25519', blob[4:4+n]
+        m=struct.unpack_from('>I',blob,4+n)[0]; hk=blob[8+n:8+n+m]
+    if hk is not None:
+        assert len(hk)==32, f"host key is {len(hk)} bytes, expected 32 raw Ed25519 bytes"
+        print("hostkey", hk.hex())
+        want=hashlib.sha512(hk).digest()
         print("report_data == SHA-512(hostkey):", rd==want); ok&=rd==want
     if '--report-data' in opts:
         want=bytes.fromhex(opts['--report-data']); print("report_data matches:", rd==want); ok&=rd==want

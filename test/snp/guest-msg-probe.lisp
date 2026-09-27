@@ -9,6 +9,7 @@
   (when (probe-file "tmp/snp/resp.bin")
     (multiple-value-bind (report status why) (snp-report-open (%rd-bin "tmp/snp/resp.bin") seqno vmpck)
       (cond ((null report) (format t "OPEN-FAILED status=~A why=~A~%" status why))
-            (t (format t "REPORT ok: version ~D vmpl ~D~%report_data ~A~%measurement ~A~%RD-MATCH ~A~%"
+            (t (%wr-bin "tmp/snp/report.bin" report)
+               (format t "REPORT ok: version ~D vmpl ~D~%report_data ~A~%measurement ~A~%RD-MATCH ~A~%"
                        (snp-report-version report) (snp-report-vmpl report) (snp-hex (snp-report-report-data report))
                        (snp-hex (snp-report-measurement report)) (if (equalp (snp-report-report-data report) rd) "YES" "NO")))))))

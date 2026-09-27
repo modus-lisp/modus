@@ -1,7 +1,7 @@
 #!/bin/bash
 # run-uefi-ssh.sh — boot an x64 UEFI CL image built with MODUS_NET_BUILD=1
 # MODUS_SSH_BUILD=1 under OVMF with QEMU user networking, start its SSH server
-# from the serial REPL, and evaluate forms over SSH from the host (paramiko).
+# from the serial REPL, and evaluate forms over SSH from the host (OpenSSH).
 #
 #   test/run-uefi-ssh.sh IMAGE.efi [PORT] [FORM ...]    default port 2222, form (+ 1 2)
 set -u
@@ -38,6 +38,9 @@ for f in "$@"; do
                -o PreferredAuthentications=none,password -o NumberOfPasswordPrompts=1 test@127.0.0.1 2>&1 | tr -d '\r')
   reply=$(printf '%s' "$raw" | grep -ao '= .*' | head -1 | sed 's/modus>.*//')
   echo "$f -> ${reply:-NO REPLY: $(printf '%s' "$raw" | tail -c 120)}"; [ -n "$reply" ] || RC=1
+  # RAWDIR=dir keeps each form's whole channel transcript (reply-1.txt, ...) for
+  # callers that read printed lines rather than the `= VALUE` answer.
+  N=$(( ${N:-0} + 1 )); [ -n "${RAWDIR:-}" ] && printf '%s\n' "$raw" > "$RAWDIR/reply-$N.txt"
 done
 if [ -n "${KEEP:-}" ]; then echo "KEEP: QEMU pid $QP still serving on port $PORT; serial $OUT; work $W"; else exec 3>&-; kill $QP 2>/dev/null; wait $QP 2>/dev/null; fi
 echo "serial tail:"; tr -d '\r' < $OUT | tail -4 | cut -c1-120

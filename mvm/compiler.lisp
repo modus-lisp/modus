@@ -2585,12 +2585,12 @@
 ;;; A name declaimed INLINE whose later DEFUN has only required parameters is
 ;;; recorded (params + body, declarations included); a call with matching
 ;;; arity then compiles as
-;;;     (let ((p1' a1) (p2' a2) …) <declares> <body>)       [+ (block f …)
+;;;     (let ((p1 a1) (p2 a2) …) <declares> <body>)         [+ (block f …)
 ;;;                                                          when the body
 ;;;                                                          RETURN-FROMs f]
-;;; with the parameters renamed to fresh symbols throughout the body, so a
-;;; caller variable of the same name is never captured and the body's own
-;;; type declarations land on the LET (the typed fast paths read them).
+;;; -- a parallel LET, so a caller variable of the same name is never
+;;; captured, the body is not rewritten, and the body's own type declarations
+;;; land on the LET (the typed fast paths read them).
 ;;; Recursion is cut by *inline-active*; &optional/&rest/&key definitions are
 ;;; never inlined; a NOTINLINE declaim retracts.  Runtime only: the image
 ;;; build ignores it, so its output does not move.  Known limitation (SBCL
@@ -2609,6 +2609,15 @@
   "DIAGNOSTIC: when non-NIL, calls are expanded only inside the DEFUNs named
    here (strings, compared with *current-function-name*) — bisects which
    caller a bad expansion lives in.  NIL in production.")
+
+(defun %cxr-place-name-p (nm)
+  "True for CAAR .. CDDDDR: C, 2-4 of A/D, R."
+  (let ((n (length nm)))
+    (and (<= 4 n 6)
+         (char= (char nm 0) #\C)
+         (char= (char nm (- n 1)) #\R)
+         (every (lambda (c) (or (char= c #\A) (char= c #\D)))
+                (subseq nm 1 (- n 1))))))
 
 (defun %inline-name-key (name)
   (cond ((stringp name) name)
@@ -2651,12 +2660,6 @@
             (cons (cons k (cons params body))
                   (remove k *inline-fn-defs* :key (function car) :test (function string=)))))))
 
-(defun %subst-syms (alist tree)
-  "Replace every symbol in TREE that has an entry in ALIST (eq) by its value."
-  (cond ((symbolp tree) (let ((e (assoc tree alist :test (function eq)))) (if e (cdr e) tree)))
-        ((consp tree) (cons (%subst-syms alist (car tree)) (%subst-syms alist (cdr tree))))
-        (t tree)))
-
 (defun %tree-has-return-from (tree name)
   (and (consp tree)
        (or (and (symbolp (car tree)) (name-eq (car tree) "RETURN-FROM")
@@ -2675,14 +2678,18 @@
                (not (member k *inline-active* :test (function string=)))
                (< (length *inline-active*) 4)
                (= (length args) (length (cadr def))))
+      ;; The parameters are bound under their OWN names.  A parallel LET
+      ;; evaluates every argument in the caller's scope before any binding
+      ;; exists, so a caller variable of the same name cannot be captured --
+      ;; and the body is left untouched.  They used to be renamed by a blind
+      ;; tree substitution (%SUBST-SYMS), which cannot tell a variable from a
+      ;; LOOP keyword, quoted data or a shadowing inner binding: md5's
+      ;; COPY-TO-BUFFER has a parameter named FROM, so every inlined
+      ;; (loop for i from …) lost its FROM and BELOW became a variable
+      ;; (UNBOUND-VARIABLE BELOW from md5sum-string).
       (let* ((params (cadr def))
-             (body (cddr def))
-             ;; variables resolve by NAME hash, so the fresh names carry a
-             ;; prefix no source variable uses
-             (fresh (mapcar (lambda (p) (%mvm-gensym (concatenate 'string "%INL-" (symbol-name p))))
-                            params))
-             (nbody (%subst-syms (mapcar (function cons) params fresh) body))
-             (let-form (cons 'let (cons (mapcar (function list) fresh args) nbody))))
+             (nbody (cddr def))
+             (let-form (cons 'let (cons (mapcar (function list) params args) nbody))))
         (if (%tree-has-return-from nbody fn)
             (list 'block fn let-form)
             let-form)))))
@@ -4179,6 +4186,41 @@
                            (,gval ,value))
                       (,setter ,gval ,@gargs)
                       ,gval)))
+                ;; (setf (cXYr x) v), 2-4 letters of A/D: set the CAR or CDR of
+                ;; (cYr x) -- the outermost letter is the last step taken.
+                ;; Only CAR/CDR had clauses; the rest reached SET-CAAAR &c.,
+                ;; which exist in a build-time image but not at runtime, so an
+                ;; evaluated (setf (cdddr x) v) was UNDEFINED-FUNCTION.
+                ((and (consp place)
+                      (symbolp (car place))
+                      (= (length place) 2)
+                      (eq (symbol-package (car place))
+                          (find-package "COMMON-LISP"))
+                      (%cxr-place-name-p (symbol-name (car place))))
+                 (let* ((nm (symbol-name (car place)))
+                        (inner (intern (concatenate 'string "C" (subseq nm 2))
+                                       (symbol-package (car place)))))
+                   `(,(if (char= (char nm 1) #\A) 'set-car 'set-cdr)
+                     (,inner ,(cadr place)) ,value)))
+                ;; CLHS 5.1.2.7: a place that is a MACRO FORM is expanded and
+                ;; the expansion is the place.  Without this every
+                ;; (setf (MACRO …) v) fell to the SET-<MACRO> fallback below,
+                ;; an UNDEFINED-FUNCTION nobody defines (md5's
+                ;; (setf (md5-regs-a regs) …) → SET-MD5-REGS-A).  Placed after
+                ;; the builtin places and setf functions so every expansion
+                ;; that used to resolve still resolves the same way.
+                ;;
+                ;; Never for a COMMON-LISP symbol: no standard function is a
+                ;; macro, but the compiler open-codes several as macros in
+                ;; its own table (CADDR -> (%safe-car …), REST, FIRST…), and
+                ;; expanding THOSE here produced (setf (%safe-car …) v) ->
+                ;; SET-%SAFE-CAR (ANSI caddr-set / cadddr-set / rest-set-1).
+                ((and (consp place)
+                      (symbolp (car place))
+                      (not (eq (symbol-package (car place))
+                               (find-package "COMMON-LISP")))
+                      (cdr (%macroexpand-1-mvm-raw place)))
+                 `(setf ,(car (%macroexpand-1-mvm-raw place)) ,value))
                 ;; Generic accessor: (setf (foo-bar a1 ... aN) v) → (set-foo-bar a1 ... aN v)
                 ;; Pass ALL place args plus the value (was only passing the
                 ;; first arg, which silently dropped the index in

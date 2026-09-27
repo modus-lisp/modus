@@ -32,13 +32,15 @@ Hence two routes, both kept open:
 | **Linux intermediate** | bzImage + initramfs containing the fixpoint `modus` ELF | DDC'd now (the ELF); kernel/initrd reproducible by the usual means | `/dev/sev-guest` ioctl from hosted modus |
 | **Bare metal (the goal)** | `modus-uefi-cl.efi` via `-kernel` | needs `--compile` to grow a `:uefi-x64-cl` target and match the SBCL build byte-for-byte | GHCB guest request from the #VC-capable image |
 
-`mvm/build-fixpoint.lisp` (the multi-arch SSH Gen0, task #252) **builds again
-on this tree** — a 49 MB Gen0 at metadata VA 0x3000000 — so the build-time
-wall my earlier note recorded is gone.  `run-fixpoint-ssh.sh x64 x64` was
-re-run: the plain Gen0 boots under QEMU, prints its bring-up markers through
-`b0`, and never emits Gen1 (timeout at 400 s); the SSH-mode Gen0 build dies
-host-side in SBCL (the runner keeps only a backtrace tail).  So #252 has
-moved from a build-time wall to a runtime one.  It is a different artifact
+`mvm/build-fixpoint.lisp` (the multi-arch Gen0, task #252) **runs the whole
+chain again as of 2026-09-27**: `scripts/run-fixpoint.sh` takes SBCL → Gen0
+(x64) → Gen1 (aarch64, 60,067,696 bytes) → Gen2 (x64, 49,283,136 bytes) →
+Gen3 (aarch64) and `sha256(Gen1) == sha256(Gen3)` (fbd4e2f9…).  Gen1 and
+Gen2 each run with a live native collector (Gen1: 50 collections over hop 2).
+The chain had been broken since April; the twelve defects and their fixes are
+in commit 5f0df2c's message.  What it proves is translator determinism on bare
+metal — the bytecode is compiled once by SBCL — which is the complement of the
+source-level DDC below, not a substitute for it.  It is a different artifact
 from the payload; the DDC'd payload is `--compile-uefi`'s output above.
 
 ## Making the bare image DDC'd: `modus-sh --compile-uefi`

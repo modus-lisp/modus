@@ -5921,9 +5921,14 @@
   "Expand a backquote list template. Handles splice and nested backquote."
   (let ((segments nil)   ; list of (kind . form) — :list or :splice
         (current nil))   ; accumulator for consecutive non-splice elements
-    ;; Process each element
+    ;; Process each element.  A cons that IS a comma marker in the list
+    ;; representation -- `(a . ,b) reads as (A COMMA B), indistinguishable
+    ;; from two elements -- is the dotted TAIL, as build-generic's %RBQ
+    ;; always took it (upstream MISC.323 `(f (g . ,tail))', STRUCT-TEST-*/5
+    ;; `(make-foo . ,inits)').  SBCL's reader gives a comma STRUCT there,
+    ;; which the tail branch below already handled.
     (let ((remaining lst))
-      (loop while (consp remaining)
+      (loop while (and (consp remaining) (not (%bq-list-comma-kind remaining)))
             do (let ((elt (car remaining)))
                  (cond
                    ;; ,@x — splice (only at the level that owns the comma)

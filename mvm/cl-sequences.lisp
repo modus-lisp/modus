@@ -3262,7 +3262,9 @@
   ;; a same-format float ZERO for floats (e.g. (imagpart 1.0) => 0.0).
   (cond
     ((%complex-p x) (aref x 2))
-    ((%ieee-float-p x) (%irr-result (%float-sub x x) x))
+    ;; 0.0 * x, not x - x: the sign of (* 0 x) follows x, so
+    ;; (imagpart -79916.61) is -0.0 (upstream MISC.598).
+    ((%ieee-float-p x) (%irr-result (%float-mul (%fl 0) x) x))
     (t 0)))
 
 (defun conjugate (x)

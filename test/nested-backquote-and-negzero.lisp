@@ -39,6 +39,17 @@
        (eval form)
        (equal (eval `(zz-mk ,@inits)) '(1 2 9))))
 
+;; dotted comma tail: `(a . ,b) reads as (A COMMA B) in the list representation
+(chk "dotted-tail"
+     (let ((tail '(:from-end t)))
+       (and (equal (eval (read-from-string "(let ((tail '(3 4))) `(1 2 . ,tail))")) '(1 2 3 4))
+            (eql (funcall (compile nil `(lambda () (eval '(reduce #'logior (vector (reduce #'logand (vector 0 0) . ,tail) 0) . ,tail))))) 0))))
+(chk "dotted-tail-nested"
+     (equal (eval (read-from-string "(let ((inits '(1 2))) (defmacro zz-mk4 (&rest r) `(list . ,r)) (eval `(zz-mk4 . ,inits)))")) '(1 2)))
+
+;; imagpart of a negative float is -0.0 (CLHS: (* 0 x))
+(chk "imagpart-negzero" (and (eql (imagpart -79916.61) -0.0) (eql (imagpart 2.5d0) 0.0d0) (eql (imagpart 3) 0)))
+
 ;; negative zero
 (chk "neg-single" (and (eql (- 0.0) -0.0) (not (eql (- 0.0) 0.0)) (eql (- 1.5) -1.5)))
 (chk "neg-double" (and (eql (- 0.0d0) -0.0d0) (eql (- 2.5d0) -2.5d0)))

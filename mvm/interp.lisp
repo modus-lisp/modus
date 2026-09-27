@@ -409,7 +409,12 @@
    -string opcodes route here).  Fixed-size numeric boxes use their typed
    allocators; arrays/strings take the runtime size."
   (cond ((= subtag #x31) (make-string size :initial-element #\Space)) ; string
-        ((= subtag #x32) (make-array size :initial-element nil))      ; simple-vector
+        ;; ZERO-filled like the native :alloc-obj (GC allocators zero-init).
+        ;; NIL here made an interpreted (make-array n) -- and the (signed-byte
+        ;; 32) / fixnum spellings that inline to this op -- read NIL where the
+        ;; same bytecode JIT'd read 0: reel's DEC coefficient blocks, wrong
+        ;; picture whenever one decoder defun ran interpreted.
+        ((= subtag #x32) (make-array size :initial-element 0))        ; simple-vector
         ((= subtag #x60) (%make-float2))   ; 2-slot boxed double-float
         ;; N1 typed floats: the float-literal compiler emits #x64 for a SINGLE
         ;; (which is what `1.5' is under *read-default-float-format*=single),
@@ -432,7 +437,7 @@
         ;; overwritten by the following obj-sets; %prim-aset is uniform across
         ;; object types.
         ((= subtag #x52) (%make-closure 0 nil))
-        (t (make-array size :initial-element nil))))
+        (t (make-array size :initial-element 0))))
 ;; Slot ref/set/len via the NATIVE primitives.  %prim-aref returns the raw slot
 ;; (char CODE for a string), %prim-aset stores it; uniform across object types.
 (defun %obj-elt-ref (obj idx) (%prim-aref obj idx))
@@ -1911,9 +1916,18 @@
           (#.+op-alloc-array+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vcount npc2) (fetch-reg bc npc)
+               ;; ZERO-filled, exactly like the native arm (the GC allocators
+               ;; zero-init every :alloc-array).  This used to fill with NIL,
+               ;; so an interpreted (make-array n) -- or (make-array n
+               ;; :element-type '(signed-byte 32)), which lowers to this op --
+               ;; read NIL where the same bytecode JIT'd read 0.  reel's DEC
+               ;; constructor builds its coefficient blocks and IDCT scratch
+               ;; that way: every decode that ran even one of those defuns
+               ;; interpreted (a core whose translation of it FAILED, MODUS_NO_JIT)
+               ;; produced a wrong picture while jit-eager matched SBCL exactly.
                (reg-set regs vd (%val->word
                                  (make-array (reg-get regs vcount)
-                                             :initial-element nil)))
+                                             :initial-element 0)))
                (setf pc npc2))))
 
           (#.+op-alloc-string+

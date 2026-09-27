@@ -570,9 +570,20 @@
   "The address form to COMPILE for a MEM-REF whose written address is FORM:
    rebased when the region is relative and FORM is provably in it, FORM
    otherwise.  The WIDTH is still decided from the written FORM."
-  (if (and *conv-relative* (%conv-addr-form-p form))
+  (if (and *conv-relative* (%conv-addr-form-p form) (%conv-moves-p form))
       (%conv-rebase-form form)
       form))
+
+(defun %conv-moves-p (form)
+  "T when rebasing FORM's region constant would change its value — i.e. the
+   region has moved.  Unmoved, the source form is compiled AS WRITTEN: a
+   constant SYMBOL such as +MV-COUNT-ADDR+ does not compile to the same code
+   as its integer, and an unmoved image must stay byte-identical."
+  (let ((k (if (atom form)
+               (%conv-const-int form)
+               (or (and (%conv-in-region-p (cadr form)) (%conv-const-int (cadr form)))
+                   (%conv-const-int (caddr form))))))
+    (and k (not (eql (conv-real k) k)))))
 
 (defun compile-conv-addr (form env dest)
   "(%CONV-ADDR K) — K must be a literal integer: the REAL address of the
@@ -582,7 +593,8 @@
   (let ((k (and (null (cddr form)) (%conv-const-int (cadr form)))))
     (unless k
       (error "MVM compiler: %CONV-ADDR needs one compile-time integer, got ~S" form))
-    (compile-form (conv-real k) env dest)))
+    ;; Unmoved: compile the argument as written (see %CONV-MOVES-P).
+    (compile-form (if (eql (conv-real k) k) (cadr form) (conv-real k)) env dest)))
 
 (defun %conv-addr (k)
   "Function twin of the %CONV-ADDR special form, for any caller that reaches
@@ -24327,7 +24339,9 @@
         ((and (symbolp (car form)) (name-eq (car form) "%CONV-ADDR")
               (consp (cdr form)) (null (cddr form))
               (%conv-const-int (cadr form)))
-         (conv-real (%conv-const-int (cadr form))))
+         ;; Unmoved: the argument as written (see %CONV-MOVES-P).
+         (let ((k (%conv-const-int (cadr form))))
+           (if (eql (conv-real k) k) (cadr form) (conv-real k))))
         ((and (symbolp (car form)) (name-eq (car form) "%LAYOUT")
               (consp (cdr form)) (symbolp (cadr form))
               (consp (cddr form)) (integerp (caddr form)) (null (cdddr form)))

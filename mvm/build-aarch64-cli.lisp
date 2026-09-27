@@ -1383,6 +1383,10 @@
 ;; ...and move it, when MODUS_CONV_DELTA says so (read once, in
 ;; build-cli-common, so the JIT co-init bakes the same value).
 (setf *conv-delta* cl-user::*cli-conv-delta*)
+(setf *hosted-layout* cl-user::*cli-hosted-layout*)
+(format t "  Heap #x~X, JIT arena #x~X~%"
+        (hosted-layout :heap-base +linux-aarch64-fixed-heap-base+)
+        (hosted-layout :jit-arena-base +linux-aarch64-jit-arena-base+))
 (format t "~%  Runtime-data region: #x~X (delta #x~X)~%"
         (conv-real +conv-region-base+) *conv-delta*)
 ;; MODUS_CONV_AUDIT=<path>: write every MEM-REF access the rule saw — function,

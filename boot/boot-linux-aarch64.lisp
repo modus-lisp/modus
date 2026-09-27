@@ -361,7 +361,7 @@
   ;; kernel returns anything else (address taken, or a pre-4.17 kernel that
   ;; ignores the flag and picks its own), fall through to the historical hint
   ;; mmap.  Restore then refuses with `heap base differs' instead of guessing.
-  (emit-aarch64-load-imm64 buf 0 +linux-aarch64-fixed-heap-base+)
+  (emit-aarch64-load-imm64 buf 0 (hosted-layout :heap-base +linux-aarch64-fixed-heap-base+))
   (emit-aarch64-load-imm64 buf 1 +linux-aarch64-heap-size+)
   (emit-aarch64-load-imm64 buf 2 3)
   (emit-aarch64-load-imm64 buf 3 #x100022)   ; MAP_PRIV|ANON|FIXED_NOREPLACE
@@ -369,7 +369,7 @@
   (emit-aarch64-load-imm64 buf 5 0)
   (emit-aarch64-load-imm64 buf 8 222)
   (emit-aarch64-u32 buf #xD4000001)   ; SVC #0
-  (emit-aarch64-load-imm64 buf 16 +linux-aarch64-fixed-heap-base+)
+  (emit-aarch64-load-imm64 buf 16 (hosted-layout :heap-base +linux-aarch64-fixed-heap-base+))
   (emit-aarch64-u32 buf #xEB10001F)   ; CMP x0, x16
   (let ((beq-at (a64-buffer-position buf)))
     (emit-aarch64-u32 buf 0)          ; B.EQ <past the fallback>, patched below
@@ -391,7 +391,7 @@
   ;; sit at the same addresses in every process.  Bump word at 0x10000F58 =
   ;; arena base on success, 0 if the kernel refused (the trap then falls back
   ;; to mmap(NULL)).  MAP_NORESERVE: it is address space, not memory.
-  (emit-aarch64-load-imm64 buf 0 +linux-aarch64-jit-arena-base+)
+  (emit-aarch64-load-imm64 buf 0 (hosted-layout :jit-arena-base +linux-aarch64-jit-arena-base+))
   (emit-aarch64-load-imm64 buf 1 +linux-aarch64-jit-arena-size+)
   (emit-aarch64-load-imm64 buf 2 7)          ; PROT_READ|WRITE|EXEC
   (emit-aarch64-load-imm64 buf 3 #x104022)   ; PRIV|ANON|NORESERVE|FIXED_NOREPLACE
@@ -399,7 +399,7 @@
   (emit-aarch64-load-imm64 buf 5 0)
   (emit-aarch64-load-imm64 buf 8 222)
   (emit-aarch64-u32 buf #xD4000001)   ; SVC #0
-  (emit-aarch64-load-imm64 buf 16 +linux-aarch64-jit-arena-base+)
+  (emit-aarch64-load-imm64 buf 16 (hosted-layout :jit-arena-base +linux-aarch64-jit-arena-base+))
   (emit-aarch64-u32 buf #xEB10001F)   ; CMP x0, x16
   (emit-aarch64-u32 buf #x9A9F0000)   ; CSEL x0, x0, xzr, EQ
   (emit-aarch64-load-imm64 buf 17 (conv-real #x10000F58))

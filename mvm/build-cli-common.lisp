@@ -556,6 +556,19 @@
   (let ((v (sb-ext:posix-getenv "MODUS_CONV_DELTA")))
     (if (and v (plusp (length v))) (parse-integer v :radix 16) 0)))
 
+;; The hosted layout's other fixed mappings (docs/macos-hosting.md): the heap
+;; and the JIT arena.  MODUS_HEAP_BASE / MODUS_JIT_ARENA_BASE (hex); unset
+;; keeps the historic 0x2000000000 / 0x3000000000.  Same two homes as the
+;; delta above.
+(defvar *cli-hosted-layout*
+  (let ((out nil))
+    (dolist (kv '(("MODUS_HEAP_BASE" . :heap-base)
+                  ("MODUS_JIT_ARENA_BASE" . :jit-arena-base)))
+      (let ((v (sb-ext:posix-getenv (car kv))))
+        (when (and v (plusp (length v)))
+          (setq out (list* (cdr kv) (parse-integer v :radix 16) out)))))
+    out))
+
 (defvar *aarch64-jit-coinit-source*
   (when (and *jit-on* (eq *cli-arch* :aarch64)) (concatenate 'string "
 (defun %init-aarch64-translator ()
@@ -589,6 +602,8 @@
   ;; would read the old address.  The x64 TLS window learned this the hard way.
   (setq *conv-relative* t)
   (setq *conv-delta* " (princ-to-string *cli-conv-delta*) ")
+  (setq *hosted-layout* (quote " (let ((*print-base* 10) (*print-radix* nil))
+                                    (prin1-to-string *cli-hosted-layout*)) "))
   t)
 ")))
 

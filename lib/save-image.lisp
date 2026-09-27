@@ -58,8 +58,9 @@
 
 (defun %core-jit-arena-lo ()
   "Base of the fixed JIT exec arena (boot-linux-aarch64.lisp
-   +linux-aarch64-jit-arena-base+).  Arch builds without one override to 0."
-  #x3000000000)
+   +linux-aarch64-jit-arena-base+, overridable per build as the hosted
+   layout's :JIT-ARENA-BASE).  Arch builds without one override to 0."
+  (%layout :jit-arena-base #x3000000000))
 
 (defun %core-jit-bump-slot ()
   "Address of the arena's RAW bump word (the trap reads it).  Hosted aarch64:
@@ -220,7 +221,7 @@
     (when (/= (mem-ref hdr :u64) (%core-magic))
       (%core-die "core: not a Modus core file"))
     (when (/= (mem-ref (+ hdr 8) :u64) from)
-      (%core-die "core: heap base differs from this process (stub did not get its fixed mapping)"))
+      (%core-die "core: heap base differs from this process (the core was saved by an image with a different layout, or the stub did not get its fixed mapping)"))
     (when (/= (mem-ref (+ hdr 24) :u64) (%gc-space-size))
       (%core-die "core: heap geometry differs from this image"))
     (let ((free (mem-ref (+ hdr 32) :u64))

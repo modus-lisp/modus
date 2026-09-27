@@ -517,6 +517,37 @@
   (let ((v (%conv-const-int x)))
     (and v (>= v +conv-region-base+) (< v +conv-region-end+))))
 
+(defparameter *hosted-layout* nil
+  "The fixed virtual addresses of a hosted image's OTHER mappings — the heap
+   and the JIT arena — as a plist (:heap-base N :jit-arena-base N).  NIL, or a
+   missing key, means the historic default the caller names.  Like the region
+   delta it is a LINK-TIME layout (docs/macos-hosting.md, option B): the boot
+   stub maps there, and runtime source that must know the number writes
+   (%layout :key default), substituted at compile time.  Two homes: the host
+   build and the JIT co-init.")
+
+(defun hosted-layout (key default)
+  "*HOSTED-LAYOUT*'s value for KEY, else DEFAULT.  Keys compare by name hash so
+   the in-image compiler agrees with the host whatever package read them."
+  (let ((p *hosted-layout*) (h (normalize-name key)) (v default))
+    (loop
+      (when (or (atom p) (atom (cdr p))) (return v))
+      (when (and (symbolp (car p)) (= (normalize-name (car p)) h)
+                 (integerp (cadr p)))
+        (return (cadr p)))
+      (setq p (cddr p)))))
+
+(defun %layout (key default)
+  "Function twin of the %LAYOUT form."
+  (hosted-layout key default))
+
+(defun compile-layout (form env dest)
+  "(%LAYOUT :KEY DEFAULT) — a hosted layout address as a compile-time constant."
+  (unless (and (consp (cdr form)) (symbolp (cadr form))
+               (consp (cddr form)) (integerp (caddr form)) (null (cdddr form)))
+    (error "MVM compiler: %LAYOUT needs a keyword and a literal default, got ~S" form))
+  (compile-form (hosted-layout (cadr form) (caddr form)) env dest))
+
 (defun %conv-rebase-form (form)
   "FORM with its provable region constant replaced by the real address — the
    compile-time half of option B.  Called only on forms %CONV-ADDR-FORM-P
@@ -6616,7 +6647,7 @@
 ;;; *SYM-NAME-TABLE* coverage tightens it further.
 
 (defparameter *hash-dispatch-names*
-  '("WITH-OPEN-STREAM" "%CONV-ADDR" 
+  '("WITH-OPEN-STREAM" "%CONV-ADDR" "%LAYOUT" 
     "STI" "MUL26HI" "ON" "COMMON-LISP-USER"
     "BEING" "DO" "MAKE-PACKAGE" "MACROLET"
     "PRESENT-SYMBOL" "%MAKE-SYMBOL" "CCASE" "TAGBODY"
@@ -6762,6 +6793,8 @@
       ;; compile time.  See CONV-REAL and docs/macos-hosting.md.
       ((= op-name #.(compute-name-hash "%CONV-ADDR"))
        (compile-conv-addr form env dest))
+      ((= op-name #.(compute-name-hash "%LAYOUT"))
+       (compile-layout form env dest))
       ;; PERF: (typep X 'SIMPLE-TYPE) with a literal standard type name folds
       ;; to the inline predicate at compile time (the runtime TYPEP walks a
       ;; 45-clause chain; standard type names cannot be redefined, CLHS 11.1.2.1.2).
@@ -24286,6 +24319,10 @@
               (consp (cdr form)) (null (cddr form))
               (%conv-const-int (cadr form)))
          (conv-real (%conv-const-int (cadr form))))
+        ((and (symbolp (car form)) (name-eq (car form) "%LAYOUT")
+              (consp (cdr form)) (symbolp (cadr form))
+              (consp (cddr form)) (integerp (caddr form)) (null (cdddr form)))
+         (hosted-layout (cadr form) (caddr form)))
         (t
          ;; Walk the spine ITERATIVELY (recursing only into elements): a long
          ;; unquoted list would otherwise recurse once per element, and an
@@ -24306,7 +24343,7 @@
                    (setq acc (cdr acc)))))))))
 
 (defun %conv-form-present-p (form)
-  "T when FORM contains a (%CONV-ADDR ...) outside quoted data.  Allocates
+  "T when FORM contains a (%CONV-ADDR ...) or (%LAYOUT ...) outside quoted data.  Allocates
    nothing, so the common case — no such form — costs one walk and no
    garbage."
   (let ((tail form))
@@ -24320,7 +24357,8 @@
         (when (and (eq tail form) (symbolp x))
           (let ((h (normalize-name x)))
             (when (= h #.(compute-name-hash "QUOTE")) (return nil))
-            (when (= h #.(compute-name-hash "%CONV-ADDR")) (return t))))
+            (when (= h #.(compute-name-hash "%CONV-ADDR")) (return t))
+            (when (= h #.(compute-name-hash "%LAYOUT")) (return t))))
         (when (and (consp x) (%conv-form-present-p x)) (return t)))
       (setq tail (cdr tail)))))
 

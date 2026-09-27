@@ -1,6 +1,6 @@
 # Hosted macOS (and the road to iOS)
 
-Written 2026-09-26.  Status: **M1 in progress** — the runtime-data region moves (option B, verified on aarch64 Linux); heap, JIT arena and code VA do not yet.
+Written 2026-09-26.  Status: **M1 in progress** — the runtime-data region, heap and JIT arena move (option B, verified on aarch64 Linux); the code VA does not yet.
 
 ## Goal
 
@@ -157,9 +157,23 @@ counts, and `region-gc`'s one FAIL is on the baseline too.  (Run the tests
 with stdin from `/dev/null`: a REPL that inherits a pipe eats the rest of it.)  Cross-emit from the moved image writes
 x64 and aarch64 ELFs byte-identical to the baseline's.
 
-Not moved yet: the heap (`0x2000000000`) and the JIT arena (`0x3000000000`),
-both of which macOS may refuse (128 GB was EPERM in the probe), and the code
-itself (`:code-vaddr-base`).  x18 is still the base register, which Darwin
+**The heap and the JIT arena** are the layout's other two fixed mappings
+(save-and-die restores both in place).  They are build-time layout constants
+too: `MODUS_HEAP_BASE` / `MODUS_JIT_ARENA_BASE` (hex; defaults `0x2000000000`
+/ `0x3000000000`, which macOS may refuse — 128 GB was EPERM in the probe) set
+`*hosted-layout*`, read by the boot stub's two `MAP_FIXED_NOREPLACE` calls and,
+through `(%layout :jit-arena-base …)`, by save-image.  The runtime otherwise
+reads both dynamically (`%gc-from-start`, the bump word).
+
+A macOS-shaped layout, all inside the 448 GB band the probe allowed, runs on
+Linux: region `0x7010000000`, heap `0x7040000000`, arena `0x7080000000`
+(`MODUS_CONV_DELTA=7000000000 MODUS_HEAP_BASE=7040000000
+MODUS_JIT_ARENA_BASE=7080000000`).  Smoke/stress/GC probes match the baseline;
+a core saved and restored in a fresh process carries a JIT'd function, a
+closure, an `equal` table and a CLOS method, and keeps collecting; a core from
+a different layout is refused.  The default layout is per-function neutral.
+
+Not moved yet: the code itself (`:code-vaddr-base`).  x18 is still the base register, which Darwin
 forbids — on Darwin the fold arm becomes a plain immediate load.
 The interpreter honours the move for its simulated MV buffer; it still
 masks `+width-conv-bit+`, which is correct because addresses arrive real.
@@ -196,8 +210,8 @@ trivial MVM program (no runtime) that writes and exits, link it with Apple
 `ld`, run it on macOS.  Proves the toolchain path and the syscall ABI in
 isolation.
 
-**M1 — move modus above 4 GB, on aarch64 LINUX.**  *Data region: done
-(option B above).  Remaining: heap, JIT arena, code VA, x18.*  The platform-neutral part
+**M1 — move modus above 4 GB, on aarch64 LINUX.**  *Data region, heap
+and JIT arena: done (option B above).  Remaining: code VA, x18.*  The platform-neutral part
 of the move, done where everything else works and the existing gates can
 prove nothing broke.  Linux loads an `ET_EXEC` at its link address, so no
 remap is needed there yet:

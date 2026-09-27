@@ -404,15 +404,28 @@
 (define-symbol-macro scl::*current-process* (%genera-current))
 
 ;;; One global mutex serialises the short critical sections below (the
-;;; atomic place updates, the per-process tables).  Nothing blocks while
+;;; atomic place updates, the per-process table).  Nothing blocks while
 ;;; holding it.  Made on first use -- the shim is not installed yet when
-;;; this file is -- and first use is on the loading thread.
+;;; this file is.
+;;;
+;;; WORKER ALLOCATIONS DIE WITH THE WORKER.  Each thread allocates in its own
+;;; GC region, reclaimed when it exits, so an object a worker creates must not
+;;; be stored anywhere global -- the next thread to touch it finds garbage.
+;;; First use may be on a worker, so the mutex is made inside %RT-ENTER, whose
+;;; locked sections allocate in the immortal arena (mvm/prelude.lisp).
 (defvar %genera-atomic-mutex nil)
+
+(defun %genera-make-atomic-mutex ()
+  (unless %genera-atomic-mutex
+    (setq %genera-atomic-mutex
+          (funcall (%genera-sbt "MAKE-MUTEX") :name "genera atomic")))
+  %genera-atomic-mutex)
 
 (defun %genera-atomically (thunk)
   (when (and (null %genera-atomic-mutex) (find-package "SB-THREAD"))
-    (setq %genera-atomic-mutex
-          (funcall (%genera-sbt "MAKE-MUTEX") :name "genera atomic")))
+    (%rt-enter)
+    (%genera-make-atomic-mutex)
+    (%rt-leave))
   (if (null %genera-atomic-mutex)
       (funcall thunk)
       (progn
@@ -461,32 +474,31 @@
   (funcall (%genera-sbt "TERMINATE-THREAD") p))
 
 ;;; SI:PROCESS-SPARE-SLOT-4 -- where bordeaux v1 parks a thread's return
-;;; values.  A table keyed by process.
+;;; values.  A table keyed by process, made at install (on main).  Stores go
+;;; through %RT-ENTER so the table's own entries land in the immortal arena
+;;; rather than the storing worker's region.  The VALUE is the worker's, and
+;;; is good for as long as the shim's JOIN-THREAD value is (see the shim).
 (defvar %genera-spare-slots (make-hash-table :test 'eq))
 (defun si::process-spare-slot-4 (p)
-  (%genera-atomically (lambda () (gethash p %genera-spare-slots))))
+  (%rt-enter)
+  (let ((v (gethash p %genera-spare-slots)))
+    (%rt-leave)
+    v))
 (defun (setf si::process-spare-slot-4) (value p)
-  (%genera-atomically (lambda () (setf (gethash p %genera-spare-slots) value))))
+  (%rt-enter)
+  (puthash p %genera-spare-slots value)
+  (%rt-leave)
+  value)
 
 ;;; --- timeouts and waiting ---
 ;;;
-;;; The deadline of the innermost PROCESS:WITH-TIMEOUT is kept per process
-;;; in a table, not in a special: a special's global value is shared by
-;;; every thread, and (see %IT-EVAL-SOURCE) a LET of a special is not
-;;; restored by a THROW on this image.
+;;; The deadline of the innermost PROCESS:WITH-TIMEOUT is a special, bound
+;;; per thread (a worker's binding lives on its own binding stack, and a
+;;; THROW out of the binding unwinds it -- %DYNB-UNWIND, mvm/prelude.lisp).
+;;; A table keyed by thread would have had workers storing into a global.
 
-(defvar %genera-deadlines (make-hash-table :test 'eq))
-
-(defun %genera-deadline ()
-  (let ((me (%genera-current)))
-    (%genera-atomically (lambda () (gethash me %genera-deadlines)))))
-
-(defun %genera-set-deadline (value)
-  (let ((me (%genera-current)))
-    (%genera-atomically
-     (lambda () (if value
-                    (setf (gethash me %genera-deadlines) value)
-                    (remhash me %genera-deadlines))))))
+(defvar %genera-deadline-now nil)
+(defun %genera-deadline () %genera-deadline-now)
 
 (defun %genera-seconds-left (deadline)
   (max 0.001 (/ (- deadline (get-internal-real-time))
@@ -510,10 +522,9 @@
              (mine (+ (get-internal-real-time)
                       (round (* seconds internal-time-units-per-second))))
              (dl (if (and outer (< outer mine)) outer mine)))
-        (unwind-protect
-             (progn (%genera-set-deadline dl)
-                    (catch '%genera-timeout (funcall thunk)))
-          (%genera-set-deadline outer)))))
+        (catch '%genera-timeout
+          (let ((%genera-deadline-now dl))
+            (funcall thunk))))))
 
 (defun process::process-wait (whostate predicate &rest args)
   "Return when (apply PREDICATE ARGS) is true.  Polls; see the header."

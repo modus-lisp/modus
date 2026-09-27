@@ -6536,7 +6536,7 @@
     "%RESTORE-OUTER-HANDLER" "SYMBOLP" "SETUP-NIC-IDT" "="
     "LIDT" "NCONCING" "SYMBOLS" "STRINGP"
     "ACROSS" "<" "DEFPACKAGE" "%FLOAT-TO-INT"
-    "NULL" "ROTATEF" "MUL26LO" "PERCPU-REF"
+    "NULL" "ROTATEF" "MUL26LO" "PERCPU-REF" "%APPLY-SPREAD"
     "GET-ALLOC-LIMIT" "BLOCK" ">" "COLLECTING"
     "USE-PACKAGE" "DOTIMES" "MEMORY-BARRIER" "%MAKE-FLOAT"
     "FIXNUMP" "EVAL-WHEN" "BIGNUMP" "ALWAYS"
@@ -7471,6 +7471,8 @@
        (when (arity-ok-p form 1 1 env dest)
          (compile-form (cadr form) env dest)
          (emit-ir :ftoi dest dest)))
+      ((= op-name 73083122)   ; %APPLY-SPREAD
+       (when (arity-ok-p form 3 3 env dest) (compile-apply-spread (cdr form) env dest)))
       ((= op-name 325386564) (compile-mul26lo (cdr form) env dest))  ; MUL26LO
       ((= op-name 421051478) (compile-mul26hi (cdr form) env dest))  ; MUL26HI
       ((= op-name 13026604224746835194) (compile-mul64lo (cdr form) env dest))
@@ -17889,6 +17891,109 @@
                            (emit-arith-pair :mul-checked "GENERIC-MULTIPLY" dest temp))
                          (free-temp-reg)))
                    (setq lw (and trust (caddr trust))))))))))))
+
+(defconstant +apply-spread-max+ 120
+  "CALL-ARGUMENTS-LIMIT as every call shape honours it.  %APPLY-SPREAD's
+   SET-NARGS ladder runs to this, the #x0530 overflow-copy trap copies this
+   many caller-stack args into frame slots (interp, x64, aarch64, web), and
+   the frame has 128 slots.  CLHS requires >= 50.")
+
+(defun compile-apply-spread (args env dest)
+  "(%APPLY-SPREAD FN RLIST N): call FN with the N arguments held in RLIST,
+   which is the argument list REVERSED.  The runtime fallthrough of APPLY
+   (cl-printer.lisp) -- and through it the interpreter's native bridge --
+   used to spread with an unrolled FUNCALL ladder capped at 48 (32 before
+   cbe4e92), silently dropping every argument past the cap: reel's
+   90-argument MAKE-DEC read its trailing slots as a stray BIT and painted
+   the chroma planes cyan.  A ladder cannot grow: it is a LET* of 2N+2
+   bindings against *LET-BINDING-LIMIT*.  This emits a LOOP instead: push
+   four NIL pads, push each element of RLIST (so arg0 ends on top), pop
+   args 0..3 into V0..V3, leave args 4.. on the stack exactly where the
+   calling convention wants them, pick SET-NARGS with a constant ladder
+   over N (SET-NARGS is imm8; no new opcode), CALL-INDIRECT, then pop N
+   words.  FN, RLIST and N must be VARIABLES: N is re-read after the call
+   for the pop count (temps are caller-saved).  Closures are dispatched as
+   COMPILE-FUNCALL does; symbols and interp-closures are resolved by APPLY
+   before it gets here."
+  (let* ((fn-form (first args)) (r-form (second args)) (n-form (third args))
+         (save-count (min *temp-reg-counter* 12)))
+    ;; Save caller-saved temp registers (as compile-funcall does).
+    (when (> save-count 1)
+      (loop for r from (+ +vreg-v4+ 1) below (+ +vreg-v4+ save-count)
+            do (unless (= r dest) (emit-ir :push r))))
+    (let ((f-reg (alloc-temp-reg)) (r-reg (alloc-temp-reg)) (n-reg (alloc-temp-reg))
+          (c-reg (alloc-temp-reg)) (t-reg (alloc-temp-reg)))
+      (compile-form fn-form env f-reg)
+      (compile-form r-form env r-reg)
+      (compile-form n-form env n-reg)
+      ;; Four NIL pads under the arguments: with fewer than four args the
+      ;; register pops below still find NILs (compile-funcall's NIL-fill).
+      (dotimes (i 4) (emit-ir :push +vreg-vn+))
+      ;; Push every element of the reversed list; arg0 ends on top.
+      (let ((top (make-compiler-label)) (body (make-compiler-label)) (done (make-compiler-label)))
+        (emit-ir-label top)
+        (emit-ir :bnnull r-reg body)
+        (emit-ir :br done)
+        (emit-ir-label body)
+        (emit-ir :car t-reg r-reg)
+        (emit-ir :push t-reg)
+        (emit-ir :cdr r-reg r-reg)
+        (emit-ir :br top)
+        (emit-ir-label done))
+      (emit-ir :pop +vreg-v0+) (emit-ir :pop +vreg-v1+)
+      (emit-ir :pop +vreg-v2+) (emit-ir :pop +vreg-v3+)
+      ;; NIL fn: signal UNDEFINED-FUNCTION exactly as compile-funcall does.
+      (let ((good (make-compiler-label)))
+        (emit-ir :bnnull f-reg good)
+        (when *mvm-emit-halves* (emit-ir :set-nargs 0))
+        (emit-ir :call "%SIGNAL-UNDEFINED-FUNCTION" 0)
+        (emit-ir-label good))
+      ;; Closure object (tag object, subtag closure): env via set-cenv, fn = slot 0.
+      (let ((direct (make-compiler-label)))
+        (emit-ir :obj-tag c-reg f-reg)
+        (emit-ir :li t-reg (ash +tag-object+ +fixnum-shift+))
+        (emit-ir :cmp c-reg t-reg)
+        (emit-ir :bne direct)
+        (emit-ir :obj-subtag c-reg f-reg)
+        (emit-ir :li t-reg (ash +subtag-closure+ +fixnum-shift+))
+        (emit-ir :cmp c-reg t-reg)
+        (emit-ir :bne direct)
+        (emit-ir :obj-ref t-reg f-reg 1)
+        (emit-ir :obj-ref f-reg f-reg 0)
+        (emit-ir :set-cenv t-reg)
+        (emit-ir-label direct))
+      ;; SET-NARGS takes an immediate: select it with a ladder over N.
+      (let ((setdone (make-compiler-label)))
+        (loop for k from 0 to +apply-spread-max+
+              do (let ((next (make-compiler-label)))
+                   (emit-ir :li c-reg (ash k +fixnum-shift+))
+                   (emit-ir :cmp n-reg c-reg)
+                   (emit-ir :bne next)
+                   (emit-ir :set-nargs k)
+                   (emit-ir :br setdone)
+                   (emit-ir-label next)))
+        (emit-ir :set-nargs +apply-spread-max+)   ; unreachable: APPLY refuses larger N
+        (emit-ir-label setdone))
+      (emit-ir :call-indirect f-reg 0)
+      (unless (= dest +vreg-vr+) (emit-ir :mov dest +vreg-vr+))
+      ;; Pop the N words still on the stack (N args past the pads, or the
+      ;; pads themselves when N < 4): re-read N, temps are caller-saved.
+      (compile-form n-form env n-reg)
+      (let ((top (make-compiler-label)) (done (make-compiler-label)))
+        (emit-ir :li c-reg 0)
+        (emit-ir :li t-reg (ash 1 +fixnum-shift+))
+        (emit-ir-label top)
+        (emit-ir :cmp n-reg c-reg)
+        (emit-ir :beq done)
+        (emit-ir :pop f-reg)
+        (emit-ir :sub n-reg n-reg t-reg)
+        (emit-ir :br top)
+        (emit-ir-label done))
+      (free-temp-reg) (free-temp-reg) (free-temp-reg) (free-temp-reg) (free-temp-reg))
+    ;; Restore caller-saved temps (reverse order, skip dest).
+    (when (> save-count 1)
+      (loop for r from (+ +vreg-v4+ save-count -1) downto (+ +vreg-v4+ 1)
+            do (unless (= r dest) (emit-ir :pop r))))))
 
 (defun compile-mul26lo (args env dest)
   "Compile (mul26lo a b) — low 26 bits of untag(a)*untag(b), tagged.

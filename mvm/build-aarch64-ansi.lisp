@@ -1444,7 +1444,7 @@
   ;; (random NIL), etc. — and the fork hangs or crashes inside the
   ;; aux helper before reaching the per-test handler.
   (setq char-code-limit       #x110000)   ; full Unicode codespace (21-bit char immediate)
-  (setq call-arguments-limit  256)
+  (setq call-arguments-limit  120)
   ;; Array-related limits (CLHS): bounds on array size/rank/dim.
   ;; Modus arrays are 49-bit element-count in header; pick conservative
   ;; values that are well within fixnum range and well above 1024.

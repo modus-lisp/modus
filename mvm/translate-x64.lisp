@@ -1522,13 +1522,13 @@
                     (loop-label (make-label))
                     (nocap-label (make-label)))
                 (emit-jcc buf :l done-label)
-                ;; cmp eax, 64   (CALL-ARGUMENTS-LIMIT; was 32 — see
+                ;; cmp eax, 120  (CALL-ARGUMENTS-LIMIT; was 64, 32 — see
                 ;; emit-rest-prologue's variable-index loop for 33..64)
-                (emit-bytes buf #x83 #xF8 #x40)
+                (emit-bytes buf #x83 #xF8 #x78)   ; 120 = +apply-spread-max+
                 ;; jle nocap
                 (emit-jcc buf :le nocap-label)
-                ;; mov eax, 64
-                (emit-bytes buf #xB8 #x40 #x00 #x00 #x00)
+                ;; mov eax, 120
+                (emit-bytes buf #xB8 #x78 #x00 #x00 #x00)
                 (emit-label buf nocap-label)
                 ;; sub eax, 4
                 (emit-bytes buf #x83 #xE8 #x04)

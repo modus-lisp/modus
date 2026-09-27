@@ -561,7 +561,7 @@
   (setq array-total-size-limit  (ash 1 24))
   (setq array-dimension-limit   (ash 1 24))
   (setq array-rank-limit        256)
-  (setq call-arguments-limit    256)
+  (setq call-arguments-limit    120)
   (setq lambda-parameters-limit 256)
   ;; Full Unicode codespace — Modus chars are a 21-bit code field and
   ;; CODE-CHAR/CHAR-CODE round-trip across the whole range.  DEFCONSTANT

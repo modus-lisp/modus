@@ -938,7 +938,7 @@
 (defvar *standard-output* nil)
 (defvar most-positive-fixnum +fixnum-max+)
 (defvar most-negative-fixnum +fixnum-neg-limit+)
-(defvar call-arguments-limit 50)
+(defvar call-arguments-limit 120)
 (defvar lambda-parameters-limit 50)
 (defvar multiple-values-limit 20)
 (defvar *universe*

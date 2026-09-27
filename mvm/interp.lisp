@@ -1198,12 +1198,12 @@
                ((= code #x0530)
                 (let* ((nargs (mvm-nargs state))
                        (vfp (svref regs +vreg-vfp+))
-                       ;; Cap at 64 total args (CALL-ARGUMENTS-LIMIT) — matches
+                       ;; Cap at 120 total args (CALL-ARGUMENTS-LIMIT; was 64) — matches
                        ;; emit-rest-prologue's overflow-copy bound and the native
                        ;; traps.  The ≤32 case is handled by the unrolled ladder;
                        ;; 33..64 by emit-rest-prologue's variable-index :aref loop,
                        ;; which reads exactly the frame slots this copy populates.
-                       (top (if (> nargs 64) 64 nargs))
+                       (top (if (> nargs 120) 120 nargs))
                        (s (mvm-stack state))
                        (i 4))
                   (loop

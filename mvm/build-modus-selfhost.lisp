@@ -1745,7 +1745,7 @@
   (setq array-total-size-limit  (ash 1 24))
   (setq array-dimension-limit   (ash 1 24))
   (setq array-rank-limit        256)
-  (setq call-arguments-limit    256)
+  (setq call-arguments-limit    120)
   (setq lambda-parameters-limit 256)
   (setq pi 3.141592653589793d0)
   ;; AFTER init-all-globals — overrides defvar's init.  *write-object-

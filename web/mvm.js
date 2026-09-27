@@ -775,7 +775,7 @@ class MVM {
       case 0x0530: {
         let n = this.ld32(A_NARGS);
         if (n < 5) return;
-        if (n > 32) n = 32;
+        if (n > 120) n = 120;              // CALL-ARGUMENTS-LIMIT (+apply-spread-max+)
         for (let i = 4; i < n; i++) {
           const s = this.ebp + 16 + 8 * (i - 4), d = this.ebp + SLOT_BASE - 8 * i;
           this.st64(d, this.ldlo(s), this.ldhi(s));

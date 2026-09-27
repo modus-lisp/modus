@@ -288,7 +288,20 @@
 (defstruct it-file
   path        ; module-prefixed base name, e.g. "alexandria-1/package"
   name        ; local base name, e.g. "package"
-  deps)       ; list of local dependency base names
+  deps        ; list of local dependency base names
+  abs-deps)   ; dependencies inherited from enclosing MODULES' :depends-on,
+              ; as keys already resolved in the module's parent scope
+
+;;; MODULES AS DEPENDENCY TARGETS.  A :depends-on may name a sibling MODULE, not
+;;; just a file -- quri's (:file "quri" :depends-on ("uri-classes" …)) -- and a
+;;; module may carry its own :depends-on, which ASDF applies to everything in it.
+;;; Both were ignored: the collector flattened modules to files and the sort only
+;;; resolved file names, so quri.lisp loaded BEFORE uri/*.lisp, its DEFPACKAGE
+;;; :USE silently dropped the four packages that did not exist yet, and every
+;;; (quri:uri "http://…") died calling NIL.  *IT-MODULES* maps a module's key
+;;; (its parent's path prefix + its NAME -- the same shape a sibling's dep name
+;;; resolves to) to the paths of every file inside it.
+(defvar *it-modules* nil)
 
 (defun %it-plist-get (plist key)
   "Fetch KEY from a component plist (the cddr of a component form)."
@@ -391,8 +404,26 @@
                   (pn (%it-plist-get plist :pathname))
                   (dir (if pn (%it-dir-prefix pn)
                            (concatenate 'string name "/")))
-                  (new-prefix (concatenate 'string prefix dir)))
-             (setq acc (%it-collect-components sub new-prefix acc))))
+                  (new-prefix (concatenate 'string prefix dir))
+                  (before (length acc)))
+             (setq acc (%it-collect-components sub new-prefix acc))
+             ;; The files this module contributed are the first (length acc) -
+             ;; BEFORE entries of the reversed accumulator.
+             (let ((mine nil) (cur acc) (k (- (length acc) before))
+                   (mdeps (mapcar (lambda (d) (concatenate 'string prefix
+                                                           (%it-string-designator d)))
+                                  (%it-plist-get plist :depends-on))))
+               (loop (when (<= k 0) (return nil))
+                 (setq mine (cons (car cur) mine))
+                 (when mdeps
+                   (setf (it-file-abs-deps (car cur))
+                         (append mdeps (it-file-abs-deps (car cur)))))
+                 (setq cur (cdr cur))
+                 (setq k (- k 1)))
+               (setq *it-modules*
+                     (cons (cons (concatenate 'string prefix name)
+                                 (mapcar #'it-file-path mine))
+                           *it-modules*)))))
           ;; :static-file and anything else: ignore.
           (t nil)))))
   acc)
@@ -424,6 +455,17 @@
    \"/\"), or \"\" for a top-level file."
   (let ((slash (%it-last-slash path)))
     (if slash (subseq path 0 (+ slash 1)) "")))
+
+(defun %it-dep-targets (files key)
+  "The files a dependency KEY (already prefixed) names: the file at that path,
+   else every file of the module with that key, else nothing."
+  (let ((f (%it-file-by-dep files "" key)))
+    (if f
+        (list f)
+        (let ((m (assoc key *it-modules* :test #'string=)) (acc nil))
+          (dolist (p (cdr m) (nreverse acc))
+            (let ((mf (%it-file-by-dep files "" p)))
+              (when mf (setq acc (cons mf acc)))))))))
 
 (defun %it-file-by-dep (files prefix name)
   "Resolve dependency NAME (module-local) to the it-file at PREFIX+NAME."
@@ -460,8 +502,11 @@
       (setq *it-visiting* (cons path *it-visiting*))
       (let ((prefix (%it-module-prefix path)))
         (dolist (dname (it-file-deps f))
-          (let ((df (%it-file-by-dep files prefix dname)))
-            (when df (%it-visit df files)))))
+          (dolist (df (%it-dep-targets files (concatenate 'string prefix dname)))
+            (%it-visit df files)))
+        (dolist (key (it-file-abs-deps f))
+          (dolist (df (%it-dep-targets files key))
+            (%it-visit df files))))
       (setq *it-visiting* (%it-remove-str path *it-visiting*))
       (setq *it-emitted* (cons f *it-emitted*))
       (setq *it-emitted-paths* (cons path *it-emitted-paths*)))))
@@ -474,6 +519,7 @@
    (ASDF:LOAD-SYSTEM, net/asdf-interface.lisp) walk components through exactly
    ONE implementation.  A second component walker is precisely the \"second
    system loader in the image\" this work exists to avoid."
+  (setq *it-modules* nil)
   (let* ((comps (%it-plist-get (cddr ds) :components))
          (files (nreverse (%it-collect-components comps "" nil)))
          (acc nil))

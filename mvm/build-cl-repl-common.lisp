@@ -1757,12 +1757,25 @@
   (setq *aarch64-serial-rx-poll* (list #x18 4 :tbnz))"))))
       ""))
 
+;; SEV-SNP attestation (docs/snp-guest.md): the guest-message framing over the
+;; in-tree AES-GCM plus the GHCB/secrets-page platform half.  "" unless the head
+;; set an SNP mode, so every other image is byte-identical.
+(defvar *snp-attest-source*
+  (if (and (boundp 'modus.mvm::*x64-snp-mode*) modus.mvm::*x64-snp-mode*)
+      (concatenate 'string
+        (%rpi-mvm-text "crypto/aes.lisp")       (string #\Newline)
+        (%rpi-mvm-text "crypto/gcm.lisp")       (string #\Newline)
+        (%rpi-mvm-text "crypto/snp-guest.lisp") (string #\Newline)
+        (%rpi-mvm-text "net/snp-attest.lisp")   (string #\Newline))
+      ""))
+
 (defvar *cli-bare-metal-net-source*
   ;; *cl-repl-jit-region-source* LAST: its %jit-exec-* defuns must come after
   ;; translate-aarch64.lisp's defaults so last-defun-wins picks the :virt DRAM
   ;; window.  Empty string on :rpi, which keeps the translator's own values.
   (concatenate 'string *net-source* *net-url-source* *net-driver-source*
-               *rpi-jit-coinit-override* *cl-repl-jit-region-source*))
+               *rpi-jit-coinit-override* *cl-repl-jit-region-source*
+               *snp-attest-source*))
 
 ;;; ARCH SLOT: the toplevel entry / probe program.  The hosted CLIs hand off to
 ;;; cli-toplevel here; this image runs the same E2SMOKE self-check the bare ANSI

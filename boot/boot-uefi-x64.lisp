@@ -893,6 +893,9 @@
   ;; ---- Diagnostic: print "2" via ConOut (GOP query survived) ----
   (emit-uefi-conout-char buf (char-code #\2))
 
+  ;; ---- SEV-SNP: locate the secrets page while the system table is live ----
+  (when *x64-snp-mode* (emit-snp-find-secrets buf))
+
   ;; ---- Allocate stack frame ----
   ;; 16384 bytes for memory map + 32 bytes for vars + 48 bytes shadow/5th-arg = 16464
   ;; Round up to 16-byte alignment: 16464 -> 16464 (already aligned: 64+16464 = 16528 = 1033*16)

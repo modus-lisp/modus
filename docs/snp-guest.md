@@ -248,9 +248,22 @@ keeps emitting IN/OUT inline and the handler makes them work.
    sev-snp-guest,id=sev0,cbitpos=51,reduced-phys-bits=1`.
 2. UEFI build of the SSH image; E1000 under SNP (rings are already in the
    shared page; the NIC's BAR MMIO needs a shared mapping or MMIO #VC support).
-3. Attestation: locate the secrets page and CPUID page (EFI config table
-   `SEV-SNP secrets` GUID), MSG_REPORT_REQ over the GHCB guest-request NAE
-   (0x80000011) encrypted with VMPCK0 via `crypto/gcm.lisp` (needs the MVM
-   adaptation), `report_data` = SHA-512 of the Ed25519 host public key.
-   Verifier side: `seal` has P-384 ECDSA verify (SBCL-hosted); VCEK chain
-   from AMD KDS.
+3. Attestation — BUILT 2026-09-27, awaiting a host to exercise the PSP path:
+   `crypto/snp-guest.lisp` (guest-message framing, AES-256-GCM under VMPCK0,
+   MSG_REPORT_REQ/RSP, report accessors; the in-tree AES-GCM compiles in-image
+   unmodified and matches python-cryptography), `net/snp-attest.lisp` (secrets
+   page, shared request/response pages below the GHCB, SNP_GUEST_REQUEST over
+   the GHCB, `SNP-ATTESTATION-REPORT`), and in the stub: the EFI CC-blob table
+   scan (`emit-snp-find-secrets`, before ExitBootServices) and a callable
+   VMGEXIT routine at 0x19E80.  `test/run-snp-guest-msg.sh` round-trips the
+   framing against a fake PSP on host and in-image (6/6, tamper-rejecting);
+   `test/snp/verify-report.py` is the verifier (report_data vs SHA-512 of the
+   host key, measurement vs the DDC'd hash, ECDSA P-384 vs a VCEK).  Under
+   plain OVMF the image's `(snp-attest-selftest)` reports active 0, a callable
+   routine and status `(:NO-SNP)`.  Still to do: bind the SSH host key hash
+   into `report_data` and expose the report over SSH; VCEK fetch from AMD KDS.
+
+   The SNP status block moved from 0x600180 to 0x1A000: 0x600180.. lies inside
+   the 42 MB CL image's native code (%RESOLVE-OUTPUT-STREAM) and the stub was
+   overwriting live code; the UEFI framebuffer words at 0x600100..0x600150 have
+   the same exposure and are still there (the CL image is serial-only).

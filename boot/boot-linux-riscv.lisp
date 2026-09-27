@@ -36,7 +36,7 @@
    under Linux that window is not mapped into our address space at all.")
 
 (defconstant +linux-riscv-heap-size+ #x38000000)   ; 896 MB
-(defconstant +linux-riscv-heap-alloc-start+ #x2000
+(defconstant +linux-riscv-heap-alloc-start+ #x3000
   "Where the bump allocator starts, as an offset into the heap.
 
    #x200 WAS WRONG AND IT COST A DAY.  That is exactly where this stub writes
@@ -55,8 +55,12 @@
    Found with gdb-multiarch over qemu's gdbstub: the cursor register held
    #xDEAD1009 and the table pointer was #x10000281.
 
-   #x2000 matches what boot-linux-riscv32.lisp already does, and leaves
-   #x1000..#x2000 for the CLI's cstr/io scratch.")
+   #x3000 leaves #x1000..#x3000 for the CLI's scratch: cstr at #x1000 and a
+   FULL 4 KiB I/O page at #x2000.  It was #x2000 with the I/O page at #x1800,
+   which is only 2 KiB -- and cl-fileio reads and writes 4096 bytes at a time
+   through that page, so every file read longer than 2048 bytes overwrote the
+   first heap objects at heap+#x2000.  Any riscv64 --script over 2 KB died with
+   a TYPE-ERROR escaping LOAD (a 2010-byte script ran, a 2090-byte one did not).")
 (defconstant +linux-riscv-gc-midpoint+ #x1C000000)
 (defconstant +linux-riscv-gc-guard+ #x1000000
   "16 MB past the second semispace, same as the other hosted ports: :gc-check

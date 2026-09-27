@@ -102,20 +102,21 @@
 ;;; port asks for NO bss: every byte it owns comes from the mmap at #x10000000, so
 ;;; #x1DF00000 is simply unmapped and the first %string-to-cstr would fault.
 ;;;
-;;; The window used instead is #x10001000..#x10002000, which exists because
-;;; +LINUX-RISCV-HEAP-ALLOC-START+ starts the bump allocator at heap+0x2000 rather
+;;; The window used instead is #x10001000..#x10003000, which exists because
+;;; +LINUX-RISCV-HEAP-ALLOC-START+ starts the bump allocator at heap+0x3000 rather
 ;;; than heap+0x200: below it sit the fixed runtime slots (metadata #x40, globals
 ;;; #x80, MV #x90..#x138, argc #x200, handler frames #x400..#xC0F, the convention
-;;; slots at #xA00) and then this 4 KB of scratch.  cstr gets the low half and the
-;;; I/O page the high half — one 4 KiB page is exactly what cl-fileio reads and
-;;; writes in.
+;;; slots at #xA00) and then 8 KB of scratch: cstr at #x1000, and a FULL 4 KiB I/O
+;;; page at #x2000, because cl-fileio reads and writes 4096 bytes at a time.  The
+;;; page was the 2 KiB at #x1800, so every file read past 2048 bytes overran into
+;;; the first heap objects.
 ;;;
 ;;; *SCRATCH-MMAPPED* is forced T because the region is ALREADY mapped, and for a
 ;;; second reason worth naming: %ensure-scratch-mmapped issues `(syscall3 9 ...)',
 ;;; which is mmap on x86-64 and IOCTL on the asm-generic table.  A bogus ioctl on
 ;;; two garbage pointers is harmless today and is not something to leave armed.
 (defvar *cli-arch-io-scratch-source* "  (setq *cstr-scratch* #x10001000)
-  (setq *io-buf-addr*  #x10001800)
+  (setq *io-buf-addr*  #x10002000)
   (setq *scratch-mmapped* t)
 ")
 

@@ -1,7 +1,10 @@
 ;;;; modus.asd - ASDF system definition for Modus
 ;;;;
-;;;; This loads only the MVM core (compiler, translators) and the
-;;;; shared assembler. The full build system is invoked via:
+;;;; Loads the MVM system (compiler, translators, cross-compiler) into the host Lisp.
+;;;; The file list lives in ONE place, lib/load-mvm.lisp, and this defers to it: the
+;;;; sources must be LOADed form by form (compiler.lisp uses #.(compute-name-hash ...)
+;;;; after defining it earlier in the same file), which COMPILE-FILE cannot do.
+;;;; The full build system is invoked via:
 ;;;;   sbcl --script mvm/build-fixpoint.lisp
 ;;;;   sbcl --script mvm/build-{x64,i386,aarch64,arm32}-{repl,ssh}.lisp
 
@@ -11,27 +14,6 @@
   :author "Modus Project"
   :license "MIT"
   :depends-on ()
-  :serial t
-  :components
-  ((:module "cross-base"
-    :serial t
-    :pathname "cross"
-    :components
-    ((:file "packages")
-     (:file "x64-asm")))
-   (:module "mvm"
-    :serial t
-    :depends-on ("cross-base")
-    :components
-    ((:file "mvm")
-     (:file "target")
-     (:file "compiler")
-     (:file "interp")))
-   (:module "mvm-translators"
-    :depends-on ("cross-base" "mvm")
-    :pathname "mvm"
-    :components
-    ((:file "translate-x64")
-     (:file "translate-aarch64")
-     (:file "translate-i386")
-     (:file "translate-arm32")))))
+  :components ((:static-file "lib/load-mvm.lisp"))
+  :perform (asdf:load-op (o c)
+             (load (asdf:system-relative-pathname c "lib/load-mvm.lisp"))))

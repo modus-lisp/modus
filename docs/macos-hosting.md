@@ -130,7 +130,7 @@ to the other.  Every kind of reference is rebased at compile or translate time:
   `a64-load-imm64-general` sites, the GC trampoline's roots, seven hand-split
   MOVZ/MOVK pairs, the constvec root, the x18 reload after longjmp) goes
   through `conv-real`.
-- **Boot + ELF** — when moved, the ELF segment ends at `0x10000000` and the
+- **Boot + ELF** — when moved, the ELF segment ends at `0x0F000000` and the
   boot stub maps the region at its real base (`MAP_FIXED_NOREPLACE`, exit 97
   on refusal) before its first store.  The argv copy blocks now patch their
   own skip branch, since a high address takes more than two words.
@@ -173,7 +173,43 @@ a core saved and restored in a fresh process carries a JIT'd function, a
 closure, an `equal` table and a CLOS method, and keeps collecting; a core from
 a different layout is refused.  The default layout is per-function neutral.
 
-Not moved yet: the code itself (`:code-vaddr-base`).  x18 is still the base register, which Darwin
+**The code** is the last fixed mapping: `MODUS_CODE_BASE` (hex, layout key
+`:code-base`; default `0x400000`).  Linux maps an `ET_EXEC` at its `p_vaddr`,
+so on Linux this is only a link-time change — no remap stub.  Two things had
+to follow it:
+
+- **Code addresses above 4 GB.**  Every placeholder the cross-linker patches
+  with a code address (function addresses, code bounds, the x28 trampoline VA,
+  the handler-helper VAs) was a MOVZ+MOVK pair — 32 bits.  They now come from
+  one helper that adds a third MOVK when the code base is high
+  (`*a64-code-addr-wide*`), and one patcher that fills however many halfwords
+  follow and **fails the build** when an address does not fit — the link-time
+  counterpart of leaving the old region unmapped.
+- **The BSS tail below the region.**  Restore staged the metadata window at
+  `0x0FF00000` and hosted-storage parks `*block-scratch*` at `0x0FC00000`: both
+  in the ELF's BSS tail, which exists only because the image is linked at
+  `0x400000`.  The moving range now starts at `0x0F000000`
+  (`+conv-region-low+`) so they move with the region at their old virtual
+  addresses (restore failed with `core: short read` until they did).
+
+A code base above the old region requires the region moved, and above 4 GB
+requires the wide placeholders; both are build-time errors.
+
+The full macOS-shaped layout runs on Linux — `/proc/self/maps` of a live
+image, nothing of modus below 4 GB:
+
+```
+7000000000-7003e46000 rwxp  code (the ELF)
+700f000000-7040000000 rw-p  runtime-data region (virtual 0x0F000000–0x40000000)
+7040000000-7078000000 rw-p  heap
+7080000000-70a0000000 rwxp  JIT arena
+```
+
+(`MODUS_CODE_BASE=7000000000 MODUS_CONV_DELTA=7000000000
+MODUS_HEAP_BASE=7040000000 MODUS_JIT_ARENA_BASE=7080000000`.)  Smoke, stress,
+GC, save/restore, `functionp`, and cross-emit (byte-identical x64 and aarch64
+ELFs) all match; `test/*.lisp` 67/72 byte-identical, the other five differ
+only in printed addresses.  The default layout is per-function neutral.  x18 is still the base register, which Darwin
 forbids — on Darwin the fold arm becomes a plain immediate load.
 The interpreter honours the move for its simulated MV buffer; it still
 masks `+width-conv-bit+`, which is correct because addresses arrive real.

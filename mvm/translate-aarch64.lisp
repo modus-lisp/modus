@@ -1456,6 +1456,21 @@
                         (ash (logand imm16 #xFFFF) 5)
                         rd)))
 
+(defvar *a64-code-addr-wide* nil
+  "T when the image's CODE is linked at or above 4 GB (docs/macos-hosting.md:
+   the hosted layout's :CODE-BASE, e.g. 0x7000000000).  Every placeholder the
+   cross-linker patches with a code address then carries a third halfword.
+   NIL — every image linked low, and every in-image cross-emit — keeps the
+   historic MOVZ+MOVK pair, byte-identical.")
+
+(defun a64-emit-code-addr-placeholder (buf rd)
+  "MOVZ Xd,#0 ; MOVK Xd,#0,LSL 16 [; MOVK Xd,#0,LSL 32] — a code address the
+   cross-linker fills in (cross.lisp PATCH-AARCH64-MOV-ADDRESS, which reads how
+   many halfwords follow and refuses an address that does not fit them)."
+  (a64-movz buf rd 0 0)
+  (a64-movk buf rd 0 1)
+  (when *a64-code-addr-wide* (a64-movk buf rd 0 2)))
+
 (defun a64-adrp (buf rd imm21)
   "ADRP Xd, #imm21  — Xd := (PC & ~0xFFF) + (imm21 << 12).
 
@@ -2292,8 +2307,7 @@
                (or *aarch64-translated-start-idx* 0))
             4)))
     (push (cons movz-byte-pos bc-offset) *aarch64-fn-addr-patches*))
-  (a64-movz buf +a64-x16+ 0 0)              ; placeholder low 16
-  (a64-movk buf +a64-x16+ 0 1)              ; placeholder high 16
+  (a64-emit-code-addr-placeholder buf +a64-x16+)   ; placeholder: patched with a code address
   (a64-sub-imm buf +a64-x16+ +a64-x16+ 3)   ; strip +tag-function+
   (a64-blr buf +a64-x16+)
   ;; Result -> x16, then restore the arg regs.
@@ -5646,10 +5660,8 @@
                           4)))
                   (push (cons movz-byte-pos target-offset)
                         *aarch64-fn-addr-patches*))
-                ;; MOVZ Xd, #0 (placeholder for low 16 bits)
-                (a64-movz buf pd 0 0)
-                ;; MOVK Xd, #0, lsl 16 (placeholder for high 16 bits)
-                (a64-movk buf pd 0 1))
+                ;; MOVZ/MOVK placeholder for the function's address
+                (a64-emit-code-addr-placeholder buf pd))
                ;; WS4 aarch64 Stage 4: a JIT out-of-module #'NAME value-load
                ;; (synthetic runtime offset).  Emit a FULL MOVZ/MOVK quad so the
                ;; complete 64-bit TAGGED fn word fits, and record the site in
@@ -5940,14 +5952,12 @@
   ;; so the cross.lisp patcher (which works in bytes) finds the right MOVZ.
   ;; ---- code_base ----
   (setf *aarch64-code-base-patch-offset* (* (a64-buffer-position buf) 4))
-  (a64-movz buf +a64-x16+ 0 0)              ; placeholder (lo16)
-  (a64-movk buf +a64-x16+ 0 1)              ; placeholder (hi16 lsl 16)
+  (a64-emit-code-addr-placeholder buf +a64-x16+)   ; placeholder: patched with a code address
   (a64-load-conv-addr buf +a64-x17+ #x10000160)
   (a64-str-unsigned buf +a64-x16+ +a64-x17+ 0)
   ;; ---- code_end ----
   (setf *aarch64-code-end-patch-offset* (* (a64-buffer-position buf) 4))
-  (a64-movz buf +a64-x16+ 0 0)              ; placeholder (lo16)
-  (a64-movk buf +a64-x16+ 0 1)              ; placeholder (hi16 lsl 16)
+  (a64-emit-code-addr-placeholder buf +a64-x16+)   ; placeholder: patched with a code address
   (a64-load-conv-addr buf +a64-x17+ #x10000168)
   (a64-str-unsigned buf +a64-x16+ +a64-x17+ 0))
 
@@ -5969,13 +5979,11 @@
    zero, which is exactly the `do not JIT a handler frame' state."
   (when (and *aarch64-handler-push-label* *aarch64-handler-pop-label*)
     (setf *aarch64-handler-push-va-patch-offset* (* (a64-buffer-position buf) 4))
-    (a64-movz buf +a64-x16+ 0 0)              ; placeholder (lo16)
-    (a64-movk buf +a64-x16+ 0 1)              ; placeholder (hi16 lsl 16)
+    (a64-emit-code-addr-placeholder buf +a64-x16+)   ; placeholder: patched with a code address
     (a64-load-conv-addr buf +a64-x17+ +a64-handler-push-va-slot+)
     (a64-str-unsigned buf +a64-x16+ +a64-x17+ 0)
     (setf *aarch64-handler-pop-va-patch-offset* (* (a64-buffer-position buf) 4))
-    (a64-movz buf +a64-x16+ 0 0)
-    (a64-movk buf +a64-x16+ 0 1)
+    (a64-emit-code-addr-placeholder buf +a64-x16+)   ; placeholder: patched with a code address
     (a64-load-conv-addr buf +a64-x17+ +a64-handler-pop-va-slot+)
     (a64-str-unsigned buf +a64-x16+ +a64-x17+ 0)))
 
@@ -6953,8 +6961,7 @@
               4)))
       (push (cons movz-byte-pos *aarch64-gc-collect-bytecode-offset*)
             *aarch64-fn-addr-patches*))
-    (a64-movz buf +a64-x16+ 0 0)              ; placeholder for low 16
-    (a64-movk buf +a64-x16+ 0 1)              ; placeholder for high 16
+    (a64-emit-code-addr-placeholder buf +a64-x16+)   ; placeholder: patched with a code address
     (a64-sub-imm buf +a64-x16+ +a64-x16+ 3)   ; strip +tag-function+
     (a64-blr buf +a64-x16+)
     ;; Reload x24, x25 from (now-updated) metadata OF THE ACTIVE REGION.

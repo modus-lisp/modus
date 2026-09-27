@@ -1178,6 +1178,7 @@
   ;; compiler to match, and that must not leak into another image.
   (setq *conv-relative* nil)
   (setq *conv-delta* 0)
+  (setq *hosted-layout* nil)
   t)
 (defun %ce-sys-close (fd) (syscall3 3 fd 0 0))
 (defun %ce-slurp-text (path)
@@ -1384,6 +1385,11 @@
 ;; build-cli-common, so the JIT co-init bakes the same value).
 (setf *conv-delta* cl-user::*cli-conv-delta*)
 (setf *hosted-layout* cl-user::*cli-hosted-layout*)
+;; Code linked above 4 GB: every code-address placeholder gets a third
+;; halfword (translate-aarch64 A64-EMIT-CODE-ADDR-PLACEHOLDER).
+(setf *a64-code-addr-wide*
+      (>= (hosted-layout :code-base +linux-aarch64-load-addr+) (ash 1 32)))
+(format t "  Code linked at #x~X~%" (linux-aarch64-code-base))
 (format t "  Heap #x~X, JIT arena #x~X~%"
         (hosted-layout :heap-base +linux-aarch64-fixed-heap-base+)
         (hosted-layout :jit-arena-base +linux-aarch64-jit-arena-base+))

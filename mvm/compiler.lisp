@@ -459,6 +459,15 @@
 (defconstant +conv-region-base+ #x10000000
   "First address of the runtime-data region; the delta is measured from here.")
 
+(defconstant +conv-region-low+ #x0F000000
+  "Lowest address that moves WITH the region.  The 16 MB below
+   +CONV-REGION-BASE+ is the tail of the ELF's BSS, and runtime code parks
+   scratch pages there (save-image's restore staging page at 0x0FF00000,
+   hosted-storage's block scratch at 0x0FC00000).  Linked at 0x400000 the ELF
+   maps that tail; linked high (the hosted layout's :code-base) nothing does,
+   so it moves by the same delta instead of every scratch page finding a new
+   home.  The delta is still measured from +CONV-REGION-BASE+.")
+
 (defconstant +conv-region-end+ #x40000000
   "End (exclusive) of the runtime-data region.  The hosted aarch64 CLI's BSS
    tail runs to 0x3C219CF8 (measured from its program header, 2026-09-26), and
@@ -499,7 +508,7 @@
    defparameter init thunks do not run) as 0."
   (let ((d *conv-delta*))
     (if (and (integerp d) (integerp addr)
-             (>= addr +conv-region-base+) (< addr +conv-region-end+))
+             (>= addr +conv-region-low+) (< addr +conv-region-end+))
         (+ addr d)
         addr)))
 
@@ -515,7 +524,7 @@
 
 (defun %conv-in-region-p (x)
   (let ((v (%conv-const-int x)))
-    (and v (>= v +conv-region-base+) (< v +conv-region-end+))))
+    (and v (>= v +conv-region-low+) (< v +conv-region-end+))))
 
 (defparameter *hosted-layout* nil
   "The fixed virtual addresses of a hosted image's OTHER mappings — the heap

@@ -705,8 +705,9 @@
                                            3))
                      (lo16 (logand target-vaddr #xFFFF))
                      (hi16 (logand (ash target-vaddr -16) #xFFFF)))
-                (patch-aarch64-mov-imm16 raw-bytes movz-file-pos lo16)
-                (patch-aarch64-mov-imm16 raw-bytes movk-file-pos hi16)))))))))
+                (declare (ignore lo16 hi16))
+                (patch-aarch64-mov-address raw-bytes movz-file-pos target-vaddr
+                                           "function address")))))))))
 
 (defun apply-aarch64-code-bounds-patches (raw-bytes image boot-descriptor)
   "Patch the MOVZ+MOVK pairs that emit-aarch64-code-bounds-init left
@@ -743,17 +744,48 @@
         ;; Each patch site is a MOVZ at offset N (lo16) and a MOVK at
         ;; offset N+4 (hi16 lsl 16) — same convention the fn-addr
         ;; patcher uses.
-        (patch-aarch64-mov-imm16 raw-bytes cb-off
-                                 (logand code-base #xFFFF))
-        (patch-aarch64-mov-imm16 raw-bytes (+ cb-off 4)
-                                 (logand (ash code-base -16) #xFFFF))
-        (patch-aarch64-mov-imm16 raw-bytes ce-off
-                                 (logand code-end #xFFFF))
-        (patch-aarch64-mov-imm16 raw-bytes (+ ce-off 4)
-                                 (logand (ash code-end -16) #xFFFF))
+        (patch-aarch64-mov-address raw-bytes cb-off code-base "code_base")
+        (patch-aarch64-mov-address raw-bytes ce-off code-end "code_end")
         ;; Reset for next build.
         (setf modus.mvm::*aarch64-code-base-patch-offset* nil)
         (setf modus.mvm::*aarch64-code-end-patch-offset*  nil)))))
+
+(defun %aarch64-word-at (raw-bytes file-pos)
+  (logior (aref raw-bytes file-pos) (ash (aref raw-bytes (+ file-pos 1)) 8)
+          (ash (aref raw-bytes (+ file-pos 2)) 16) (ash (aref raw-bytes (+ file-pos 3)) 24)))
+
+(defun patch-aarch64-mov-address (raw-bytes file-pos value what)
+  "Fill the MOVZ (lsl 0) at FILE-POS and the MOVKs (lsl 16, 32, 48) that
+   directly follow it FOR THE SAME REGISTER with successive halfwords of
+   VALUE — two for an image linked below 4 GB, three when the translator was
+   told the code lives higher (*A64-CODE-ADDR-WIDE*, docs/macos-hosting.md),
+   four for a full quad.  An address that does not fit the placeholder is a
+   BUILD error naming WHAT: silently truncating it would branch into the
+   void at run time, which is how a missed site would otherwise show up."
+  (let* ((w0 (%aarch64-word-at raw-bytes file-pos))
+         (rd (logand w0 #x1F))
+         (n 1))
+    (unless (= (logand w0 #xFFE00000) #xD2800000)
+      (error "cross-link: ~A: no MOVZ Xd,#imm,LSL 0 at file offset #x~X" what file-pos))
+    (loop
+      (unless (and (< n 4)
+                   (<= (+ file-pos (* 4 n) 4) (length raw-bytes))
+                   (let ((w (%aarch64-word-at raw-bytes (+ file-pos (* 4 n)))))
+                     (and (= (logand w #xFF800000) #xF2800000)         ; MOVK X
+                          (= (logand (ash w -21) 3) n)                 ; LSL 16*n
+                          (= (logand w #x1F) rd))))
+        (return))
+      (setq n (+ n 1)))
+    (when (< n 2)
+      (error "cross-link: ~A: MOVZ at #x~X has no MOVK after it" what file-pos))
+    (unless (< value (ash 1 (* 16 n)))
+      (error "cross-link: ~A: address #x~X needs more than the ~D halfwords the ~
+              placeholder at #x~X has (link the code low, or build with the wide ~
+              placeholders the hosted layout's :code-base turns on)"
+             what value n file-pos))
+    (dotimes (i n)
+      (patch-aarch64-mov-imm16 raw-bytes (+ file-pos (* 4 i))
+                               (logand (ash value (* i -16)) #xFFFF)))))
 
 (defun patch-aarch64-mov-imm16 (raw-bytes file-pos imm16)
   "Patch the imm16 field of an AArch64 MOVZ or MOVK instruction at
@@ -1382,10 +1414,8 @@
                                        wrap-header))
                                 (* label-word 4)))
                    (off *aarch64-x28-load-patch-offset*))
-              (patch-aarch64-mov-imm16 raw-bytes off
-                                       (logand tramp-va #xFFFF))
-              (patch-aarch64-mov-imm16 raw-bytes (+ off 4)
-                                       (logand (ash tramp-va -16) #xFFFF))
+              (patch-aarch64-mov-address raw-bytes off tramp-va
+                                         "x28 GC-trampoline VA")
               ;; Reset for next build.
               (setf *aarch64-x28-load-patch-offset* nil))))
         ;; #307 AArch64 handler-helper VA patches: the boot stub
@@ -1429,14 +1459,10 @@
                    (pop-va  (+ base-va (* pop-word 4)))
                    (p-off modus.mvm::*aarch64-handler-push-va-patch-offset*)
                    (q-off modus.mvm::*aarch64-handler-pop-va-patch-offset*))
-              (patch-aarch64-mov-imm16 raw-bytes p-off
-                                       (logand push-va #xFFFF))
-              (patch-aarch64-mov-imm16 raw-bytes (+ p-off 4)
-                                       (logand (ash push-va -16) #xFFFF))
-              (patch-aarch64-mov-imm16 raw-bytes q-off
-                                       (logand pop-va #xFFFF))
-              (patch-aarch64-mov-imm16 raw-bytes (+ q-off 4)
-                                       (logand (ash pop-va -16) #xFFFF))
+              (patch-aarch64-mov-address raw-bytes p-off push-va
+                                         "handler PUSH helper VA")
+              (patch-aarch64-mov-address raw-bytes q-off pop-va
+                                         "handler POP helper VA")
               ;; Reset for next build.
               (setf modus.mvm::*aarch64-handler-push-va-patch-offset* nil)
               (setf modus.mvm::*aarch64-handler-pop-va-patch-offset* nil))))

@@ -214,11 +214,17 @@
     ;; p_memsz: the image plus its BSS tail, which holds the runtime-data
     ;; region at 0x10000000.  When that region has moved (docs/macos-hosting.md
     ;; option B) the boot stub maps it at its real base, and the segment ends
-    ;; at 0x10000000 so any access still aimed at the OLD address faults.
-    (mvm-emit-u64 buf (if (eql (conv-real +conv-region-base+) +conv-region-base+)
-                          (+ header-total raw-len
-                             (or bss-size +linux-aarch64-heap-size+))
-                          (- +conv-region-base+ load-addr)))
+    ;; at +CONV-REGION-LOW+ (0x0F000000) so any access still aimed at the OLD
+    ;; address faults.
+    ;; When the CODE is linked above the old region (the hosted layout's
+    ;; :code-base) there is no BSS tail to keep at all: the segment is the file
+    ;; plus a page of slack.
+    (mvm-emit-u64 buf (cond ((eql (conv-real +conv-region-base+) +conv-region-base+)
+                             (+ header-total raw-len
+                                (or bss-size +linux-aarch64-heap-size+)))
+                            ((>= load-addr +conv-region-end+)
+                             (+ header-total raw-len #x10000))
+                            (t (- +conv-region-low+ load-addr))))
     (mvm-emit-u64 buf page-align)     ; 64K on AArch64, 4K elsewhere
     (loop for b across raw-bytes do (mvm-emit-byte buf b))
     (loop for b across shstrtab-bytes do (mvm-emit-byte buf b))
@@ -293,15 +299,15 @@
   ;; exit 97 when the kernel will not give us that address.  Anonymous memory
   ;; is zeroed, which the ~900 MB BSS tail never reliably was.
   (unless (eql (conv-real +conv-region-base+) +conv-region-base+)
-    (emit-aarch64-load-imm64 buf 0 (conv-real +conv-region-base+))
-    (emit-aarch64-load-imm64 buf 1 (- +conv-region-end+ +conv-region-base+))
+    (emit-aarch64-load-imm64 buf 0 (conv-real +conv-region-low+))
+    (emit-aarch64-load-imm64 buf 1 (- +conv-region-end+ +conv-region-low+))
     (emit-aarch64-load-imm64 buf 2 3)          ; PROT_READ|WRITE
     (emit-aarch64-load-imm64 buf 3 #x104022)   ; PRIV|ANON|NORESERVE|FIXED_NOREPLACE
     (emit-aarch64-load-imm64 buf 4 #xFFFFFFFFFFFFFFFF)
     (emit-aarch64-load-imm64 buf 5 0)
     (emit-aarch64-load-imm64 buf 8 222)        ; mmap
     (emit-aarch64-u32 buf #xD4000001)          ; SVC #0
-    (emit-aarch64-load-imm64 buf 16 (conv-real +conv-region-base+))
+    (emit-aarch64-load-imm64 buf 16 (conv-real +conv-region-low+))
     (emit-aarch64-u32 buf #xEB10001F)          ; CMP x0, x16
     (emit-aarch64-u32 buf (logior #x54000000 (ash 4 5)))   ; B.EQ +4
     (emit-aarch64-load-imm64 buf 0 97)         ; exit(97): region not mappable
@@ -485,8 +491,8 @@
   (when modus.mvm::*aarch64-gc-native-mcgc*
     (setf modus.mvm::*aarch64-x28-load-patch-offset*
           (* (modus.mvm::a64-buffer-position buf) 4))
-    (modus.mvm::a64-movz buf modus.mvm::+a64-x28+ 0 0)   ; placeholder (lo16)
-    (modus.mvm::a64-movk buf modus.mvm::+a64-x28+ 0 1))  ; placeholder (hi16 lsl 16)
+    ;; lo16 / hi16 [/ bits 32-47 when the code is linked above 4 GB]
+    (modus.mvm::a64-emit-code-addr-placeholder buf modus.mvm::+a64-x28+))
 
   ;; #307: record the handler-stack PUSH/POP helpers' absolute VAs into
   ;; 0x10000F90/F98.  A runtime-JIT page has no labels and so cannot BL these
@@ -499,8 +505,24 @@
   ;; x29 (FP) = SP
   (emit-aarch64-u32 buf #x910003FD))
 
+(defun linux-aarch64-code-base ()
+  "Where the image's code is linked: +LINUX-AARCH64-LOAD-ADDR+ unless the
+   hosted layout moves it (MODUS_CODE_BASE; docs/macos-hosting.md).  Linux
+   maps an ET_EXEC at its p_vaddr, so on Linux moving it is only a link-time
+   change; macOS will remap the signed pages there.  A code base above the
+   old runtime-data region needs that region moved too — there is no BSS
+   tail at 0x10000000 any more — and code above 4 GB needs the translator's
+   wide code-address placeholders; both are checked here, at build time."
+  (let ((base (hosted-layout :code-base +linux-aarch64-load-addr+)))
+    (when (and (>= base +conv-region-low+)
+               (eql (conv-real +conv-region-base+) +conv-region-base+))
+      (error "code base #x~X needs the runtime-data region moved (MODUS_CONV_DELTA)" base))
+    (when (and (>= base (ash 1 32)) (not *a64-code-addr-wide*))
+      (error "code base #x~X is above 4 GB but *A64-CODE-ADDR-WIDE* is off" base))
+    base))
+
 (defun linux-aarch64-boot-descriptor ()
   (list :arch :aarch64
         :entry-fn #'emit-linux-aarch64-entry
-        :load-addr +linux-aarch64-load-addr+
+        :load-addr (linux-aarch64-code-base)
         :elf-format :linux-aarch64))

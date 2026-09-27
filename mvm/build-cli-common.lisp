@@ -562,7 +562,8 @@
 ;; delta above.
 (defvar *cli-hosted-layout*
   (let ((out nil))
-    (dolist (kv '(("MODUS_HEAP_BASE" . :heap-base)
+    (dolist (kv '(("MODUS_CODE_BASE" . :code-base)
+                  ("MODUS_HEAP_BASE" . :heap-base)
                   ("MODUS_JIT_ARENA_BASE" . :jit-arena-base)))
       (let ((v (sb-ext:posix-getenv (car kv))))
         (when (and v (plusp (length v)))

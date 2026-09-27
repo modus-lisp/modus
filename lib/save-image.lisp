@@ -215,7 +215,7 @@
          (base (- from 512))                          ; heap-alloc-start
          (fd (%core-open-in))
          (hdr (+ base 256))                           ; below from_start: never live
-         (stage #x0FF00000))                          ; the io-buf BSS page
+         (stage (%conv-addr #x0FF00000)))             ; the io-buf BSS page
     (when (< fd 0) (%core-die "core: cannot open the core file"))
     (%core-slice fd hdr 128)
     (when (/= (mem-ref hdr :u64) (%core-magic))

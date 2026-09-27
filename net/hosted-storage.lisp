@@ -18,7 +18,7 @@
 ;;; Dedicated block-transfer scratch: a mapped page range below the heap,
 ;;; clear of *cstr-scratch* (#x0FE0…) / *io-buf-addr* (#x0FF0…) / the socket
 ;;; buffers.  Verified mapped for MiBs (0x0FB..0x0FF).
-(defvar *block-scratch* #x0FC00000)
+(defvar *block-scratch* (%conv-addr #x0FC00000))
 (defvar *block-scratch-max* 65536)      ; 64 KiB copied per syscall; larger chunks loop
 
 ;;; ---- raw syscall wrappers not already in cl-fileio ----

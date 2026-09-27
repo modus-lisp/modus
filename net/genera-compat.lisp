@@ -501,13 +501,17 @@
 (defun %genera-deadline () %genera-deadline-now)
 
 (defun %genera-seconds-left (deadline)
-  (max 0.001 (/ (- deadline (get-internal-real-time))
-                internal-time-units-per-second)))
+  (max 1/1000 (/ (- deadline (get-internal-real-time))
+                 internal-time-units-per-second)))
 
 (defun %genera-expired-p (deadline)
   (and deadline (>= (get-internal-real-time) deadline)))
 
-(defun %genera-pause () (sleep 0.001))
+;;; RATIOS, NOT FLOAT LITERALS, anywhere in this file.  It is evaluated at boot
+;;; in every image, the web (JS MVM) one included, and reading a float literal
+;;; calls %ROUND-TO-SINGLE, whose opcode the JS engine does not implement: one
+;;; 0.001 here stopped the web image booting at step 0.
+(defun %genera-pause () (sleep 1/1000))
 
 (defmacro process::with-timeout ((seconds &rest options) &body body)
   "Genera: the value of BODY, or NIL if SECONDS pass first.  See the header:

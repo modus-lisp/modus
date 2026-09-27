@@ -1343,7 +1343,7 @@
   (setq array-dimension-limit   (ash 1 24))
   (setq array-rank-limit        256)
   (setq call-arguments-limit    120)
-  (setq lambda-parameters-limit 256)
+  (setq lambda-parameters-limit 120)
   ;; CHAR-CODE-LIMIT.  Modus characters are a 21-bit code field in the
   ;; character immediate (runtime/tags.lisp), and CODE-CHAR/CHAR-CODE
   ;; round-trip exactly across the whole Unicode range (65, 255, 256,

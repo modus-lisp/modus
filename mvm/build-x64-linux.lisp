@@ -1182,7 +1182,7 @@
   (setq pi 3.141592653589793d0)
   (setq lambda-list-keywords    '(&allow-other-keys &aux &body &environment &key
                                    &optional &rest &whole))
-  (setq lambda-parameters-limit 256)
+  (setq lambda-parameters-limit 120)
   (setq multiple-values-limit   16)
   (setq internal-time-units-per-second 1000000)
   ;; MVM fixnums are 63-bit signed (tag bit + 1-bit shift).

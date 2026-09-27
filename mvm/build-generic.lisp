@@ -562,7 +562,7 @@
   (setq array-dimension-limit   (ash 1 24))
   (setq array-rank-limit        256)
   (setq call-arguments-limit    120)
-  (setq lambda-parameters-limit 256)
+  (setq lambda-parameters-limit 120)
   ;; Full Unicode codespace — Modus chars are a 21-bit code field and
   ;; CODE-CHAR/CHAR-CODE round-trip across the whole range.  DEFCONSTANT
   ;; init thunks do not run at boot (limitation #7), so set it explicitly.

@@ -29,7 +29,7 @@ MODUS_STATIC_BUILD=1 MODUS_UEFI_SNP=$MODE MODUS_CL_REPL_OUT=$W/sbcl.efi MODUS_DD
 say "   $(stat -c %s $W/sbcl.efi) bytes, source $(stat -c %s $W/full-source.lisp) chars"
 
 if [ -n "${MODUS_SH:-}" ] && [ -x "$MODUS_SH" ]; then
-  SH=$MODUS_SH; say "2. reusing modus-sh at $SH"
+  SH=$(readlink -f "$MODUS_SH"); say "2. reusing modus-sh at $SH"   # absolute: step 3 runs inside $W
 else
   SH=$W/modus-sh; say "2. SBCL build of modus-sh"
   MODUS_CLI_OUT=$SH sbcl --dynamic-space-size $DSS --script mvm/build-modus-selfhost.lisp > $W/build-sh.log 2>&1 \

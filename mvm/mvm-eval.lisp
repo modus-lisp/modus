@@ -995,14 +995,22 @@
     k))
 
 (defun %jit-thunk-emit-tail (addr k idx nargs)
-  "movabs rsi,<tagged idx>; mov dword [0x10000150],nargs+1; movabs rax,bridge; jmp rax"
+  "movabs rsi,<tagged idx>; mov dword fs:[0x10000150],nargs+1; movabs rax,bridge; jmp rax
+
+   THE FS PREFIX (#x64) IS THE PER-THREAD WINDOW.  The nargs slot is state of
+   the call in flight (mvm/compiler.lisp, THE PER-THREAD WINDOW) and every
+   compiled access to it carries the override; this hand-assembled store did
+   not, so a worker calling through a bridge thunk wrote the MAIN thread's
+   nargs -- and main, between storing its own and a &KEY/&REST callee reading
+   it, got \"odd-length keyword argument list\" or a bare PROGRAM-ERROR.  On
+   the main thread FS base is 0 and the prefix changes nothing."
   (%jit-emit-bytes (+ addr k) (list #x48 #xBE))
   (%jit-write-imm64 addr (+ k 2) (ash idx 1))
-  (%jit-emit-bytes (+ addr k 10) (list #xC7 #x04 #x25 #x50 #x01 #x00 #x10 (+ nargs 1) 0 0 0))
-  (%jit-emit-bytes (+ addr k 21) (list #x48 #xB8))
-  (%jit-write-imm64 addr (+ k 23) (%jit-bridge-entry nargs))
-  (%jit-emit-bytes (+ addr k 31) (list #xFF #xE0))
-  (+ k 33))
+  (%jit-emit-bytes (+ addr k 10) (list #x64 #xC7 #x04 #x25 #x50 #x01 #x00 #x10 (+ nargs 1) 0 0 0))
+  (%jit-emit-bytes (+ addr k 22) (list #x48 #xB8))
+  (%jit-write-imm64 addr (+ k 24) (%jit-bridge-entry nargs))
+  (%jit-emit-bytes (+ addr k 32) (list #xFF #xE0))
+  (+ k 34))
 
 (defun %jit-thunk-fill (addr name nargs)
   (let ((idx *jit-bridge-count*))

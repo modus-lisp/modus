@@ -89,8 +89,19 @@
 
 (defun %core-open-in ()
   "Open the core source for restore: argv[2], read through the raw pointer
-   the stub stored at heap-base+32 (STR x21,[x22,#32]) -- no string exists yet."
-  (%core-open-path-at (* 2 (mem-ref (+ (- (%gc-from-start) 512) 32) :u64))))
+   the stub stored at heap-base+32 (STR x21,[x22,#32]) -- no string exists yet.
+   Read as two :u32 halves, which load exactly.  It was (* 2 <:u64 load>), and
+   a :u64 load yields the word shifted right by one, so doubling it dropped bit
+   0: whenever argv[2] began at an ODD address the open got the byte before it
+   -- the NUL ending \"--core\" -- i.e. an empty path, and the restore died
+   with \"cannot open the core file\".  The address's parity follows the
+   lengths of the other arguments, so it looked flaky and path-dependent."
+  (let* ((slot (+ (- (%gc-from-start) 512) 32))
+         (lo (mem-ref slot :u32))
+         (hi (mem-ref (+ slot 4) :u32)))
+    ;; HI is 0 on a 32-bit image, where 2^32 would be a bignum -- and nothing
+    ;; may allocate yet.
+    (%core-open-path-at (if (= hi 0) lo (+ lo (* 4294967296 hi))))))
 
 (defun %core-close (fd)
   (syscall3 3 fd 0 0))

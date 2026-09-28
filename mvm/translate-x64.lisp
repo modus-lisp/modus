@@ -2884,7 +2884,10 @@
                 (count (third operands))
                 (d (dest-phys-or-scratch vd)))
            (emit-load-vreg buf vs d)
-           (emit-shr-reg-imm buf d count)
+           ;; x86 masks the count to 6 bits; a logical shift of 64 or more is 0.
+           (if (>= count 64)
+               (emit-mov-reg-imm buf d 0)
+               (emit-shr-reg-imm buf d count))
            (maybe-store-scratch buf vd)))
 
         ((op= +op-sar+)
@@ -2894,7 +2897,9 @@
                 (count (third operands))
                 (d (dest-phys-or-scratch vd)))
            (emit-load-vreg buf vs d)
-           (emit-sar-reg-imm buf d count)
+           ;; x86 masks the count to 6 bits; 63 IS every larger arithmetic
+           ;; right shift (the sign fill).
+           (emit-sar-reg-imm buf d (min count 63))
            (maybe-store-scratch buf vd)))
 
         ((op= +op-shlv+)

@@ -17239,9 +17239,17 @@
         ;; shortcut is taken only for a leaf landing in a physical temp
         ;; (V4..V8); otherwise DEST is a callee-saved / spilled vreg and the
         ;; scratch traffic is harmless.
+        ;; A HEAP CONSTANT IS NOT SUCH A LEAF: in runtime-compiled code a
+        ;; bignum literal or a quoted object loads from the constant vector
+        ;; THROUGH rax, so with DEST = VR it overwrote the left operand --
+        ;; (logxor a #xe100000000000000) returned the constant, and every
+        ;; AES-GCM tag seal computed was wrong.  Only a variable or a small
+        ;; integer immediate is safe with DEST = VR.
         (and (or leaf (%pure-simple-expr-p arg env))
              (or (/= dest +vreg-vr+)
-                 (and leaf (< *temp-reg-counter* 5)))))
+                 (and leaf (< *temp-reg-counter* 5)
+                      (or (symbolp arg)
+                          (and (integerp arg) (<= (integer-length arg) 60)))))))
       ;; Leaf / pure right operand: no push/mov/pop round trip is needed.
       (let ((temp (alloc-temp-reg)))
         (compile-form arg env temp)
@@ -19079,6 +19087,18 @@
                         (t nil))))
            (and n (symbolp n) (%unsigned-small-max n env) (cons :right n))))
         (t nil)))))
+(defun %ash-inline-sar-count (count)
+  "The immediate for an INLINE right shift by -COUNT on a tagged fixnum word.
+   A right shift of 63 or more is the sign fill and must be emitted as exactly
+   63: x86 SAR (and the aarch64 immediate) take the count mod 64, so the inline
+   paths turned (ash n -78) into (ash n -14).  natrium's Poly1305 takes
+   (ash n -78) of a short final block's small N -- 5 instead of 0 -- and every
+   JIT-compiled MAC came out wrong (TLS: \"handshake record decryption
+   failed\").  63 on the tagged word leaves 0 or -1, which the tag-clearing AND
+   after it makes fixnum 0 or -1.  Only the INLINE shift is clamped: the bignum
+   cold path gets the real count."
+  (min 63 (- count)))
+
 (defun compile-ash (value-form count-form env dest)
   "Compile (ash value count) - arithmetic shift.
    Positive count = left shift, negative = right shift.
@@ -19135,7 +19155,7 @@
      (if (>= count 0)
          (when (> count 0) (emit-ir :shl dest dest count))
          (progn
-           (emit-ir :sar dest dest (- count))
+           (emit-ir :sar dest dest (%ash-inline-sar-count count))
            (let ((temp (alloc-temp-reg)))
              (emit-ir :li temp 2)
              (emit-ir :neg temp temp)
@@ -19199,7 +19219,7 @@
            (emit-ir-label ok)
            (free-temp-reg))
          (progn
-           (emit-ir :sar dest dest (- count))
+           (emit-ir :sar dest dest (%ash-inline-sar-count count))
            (let ((temp (alloc-temp-reg)))
              ;; Mask off the low tag bit.  The mask is -2 (0xFFFF...FFFE),
              ;; but a NEGATIVE :li operand is materialised via emit-u64,

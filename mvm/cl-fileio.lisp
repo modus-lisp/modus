@@ -2245,7 +2245,7 @@
      (write-char-serial (logior #x80 (logand (ash code -6) #x3F)))
      (write-char-serial (logior #x80 (logand code #x3F))))))
 
-;;; Gray streams (net/sb-sys-shim.lisp) set these at boot: a CLOS instance of
+;;; Gray streams (net/sb-gray-shim.lisp) set these when installed: a CLOS instance of
 ;;; *GRAY-ROOT-CLASS* receives character output through *GRAY-WRITE-CHAR-FN*.
 (defvar *gray-root-class* nil)
 (defvar *gray-write-char-fn* nil)
@@ -2253,7 +2253,7 @@
 (defun %write-char-to-stream (code stream)
   "Write a char code (integer) to a resolved stream. Caller must convert characters first."
   (if (not (streamp stream))
-      (if (and *gray-root-class* stream (not (eq stream t)) (typep stream *gray-root-class*))
+      (if (and *gray-root-class* (%clos-instance-p stream) (typep stream *gray-root-class*))
           (funcall *gray-write-char-fn* stream code)
           (%write-code-serial code))
       (let ((ty (%stream-type stream)))

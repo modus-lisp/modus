@@ -773,6 +773,9 @@
    KEYS (:force, :verbose, …) are accepted for signature compatibility and
    ignored; see KNOWN DEGENERACIES."
   (declare (ignore keys))
+  ;; Gray streams are installed on first use (net/sb-gray-shim.lisp): a
+  ;; library that subclasses FUNDAMENTAL-* arrives through here.
+  (when (fboundp '%ensure-gray-streams) (%ensure-gray-streams))
   (let* ((sys (asdf::find-system name t))
          (n (asdf::component-name sys)))
     (cond

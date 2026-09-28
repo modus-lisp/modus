@@ -1355,3 +1355,16 @@ only swaps pointers afterwards; before, it inherited whatever list was
 running (the 512-wide `rh-pattern` list after `rh-init`), which showed as
 the frame repeated four times across.  Frame 0 of `cam.ivf` really is a noise
 strip over pink — `cam0-frame0-hosted.png` is the reference; do not chase it.
+
+**The board image MUST be built with `MODUS_NET_BUFSZ` when clips come over HTTP
+(2026-09-28, walked into again):** `%net-resp-cap` defaults to 32 KB and
+`tcp-rx-copy` silently drops everything past it while `net-fetch-bytes` still
+reports the Content-Length.  A 37 KB `bars.ivf` fetched by `rh-load` decoded
+frame 0 and then VP8-ERROR'd; summing the "vector" natively took a data abort at
+an address above 4 GB (garbage elements past the cap).  Build with
+`MODUS_NET_BUFSZ=1048576` (the chainload recipe is now
+`MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1 MODUS_NET_NOAUTO=1 MODUS_RPI_CHAINLOAD=1
+MODUS_NET_BUFSZ=1048576 sbcl --dynamic-space-size 8192 --script
+mvm/build-rpi-cl-repl.lisp`), and `rh-load` now signals an error instead of
+returning a truncated clip.  A saved core carries the image's cap, so rebuild
+the core too.

@@ -377,6 +377,14 @@
   "FMV.X.D rd, fs1 -- move 64 raw bits from an FP register into an integer one."
   (rv-emit-fp-r buf #x71 0 fs1 0 rd))
 
+(defun rv-emit-fcvt-s-d (buf fd fs1)
+  "FCVT.S.D fd, fs1, rne -- double to single, round to nearest even."
+  (rv-emit-fp-r buf #x20 1 fs1 0 fd))
+
+(defun rv-emit-fcvt-d-s (buf fd fs1)
+  "FCVT.D.S fd, fs1 -- single to double (exact)."
+  (rv-emit-fp-r buf #x21 0 fs1 0 fd))
+
 (defun rv-emit-fcvt-d-l (buf fd rs1)
   "FCVT.D.L fd, rs1 -- signed 64-bit integer to double."
   (rv-emit-fp-r buf #x69 2 rs1 0 fd))
@@ -1038,6 +1046,57 @@
 (defvar *rv-last-cmp-rs2* +rv-t4+
   "Physical register holding the second operand of the most recent MVM-CMP.")
 
+;;; ============================================================
+;;; Checked arithmetic: overflow promotes to a bignum
+;;; ============================================================
+
+(defvar *riscv-genarith-offsets* nil
+  "Alist (NAME . bytecode-offset) of GENERIC-ADD / GENERIC-SUBTRACT /
+   GENERIC-MULTIPLY in the module being translated, bound by cross.lisp's
+   TRANSLATE-MODULE-TO-NATIVE.  The :ADD-CHECKED family calls them when the
+   fixnum result overflows.  NIL, or a name missing, means the module has no
+   generic arithmetic (the small ladder images): those ops then wrap, as on
+   aarch64 without its offsets.")
+
+(defun rv-genarith-offset (name)
+  (cdr (assoc name *riscv-genarith-offsets* :test #'string=)))
+
+(defun rv-emit-genarith-call (buf ra rb bc-offset function-table)
+  "The overflow slow path: GENERIC-xxx(RA, RB), result in t2.  An arithmetic
+   op is not a call to the compiler, so everything it may consider live
+   survives: a0-a3 (V0-V3) are saved here, s1-s7/s11 (V4-V11) and fp by the
+   callee's own prologue; VA/VL/VN are global and must NOT be restored.  RA
+   and RB may be any of a0-a3/t0/t1, so both are staged in t3/t4 before a0/a1
+   (or t1, which STORE-ABS uses) are written.  Fixed size in both passes: the
+   call is always AUIPC+JALR, and the target is only known in pass 2."
+  (let ((w (rv-word-size)))
+    (rv-emit-mv buf +rv-t3+ ra)
+    (rv-emit-mv buf +rv-t4+ rb)
+    (rv-emit-addi buf +rv-sp+ +rv-sp+ (logand (- (* 4 w)) #xFFF))
+    (rv-emit-store-word buf +rv-a0+ +rv-sp+ 0)
+    (rv-emit-store-word buf +rv-a1+ +rv-sp+ w)
+    (rv-emit-store-word buf +rv-a2+ +rv-sp+ (* 2 w))
+    (rv-emit-store-word buf +rv-a3+ +rv-sp+ (* 3 w))
+    (rv-emit-mv buf +rv-a0+ +rv-t3+)
+    (rv-emit-mv buf +rv-a1+ +rv-t4+)
+    (rv-emit-li buf +rv-t2+ 2)
+    (rv-emit-store-abs buf +rv-t2+ (rv-nargs-addr))
+    (let* ((target (and function-table (gethash bc-offset function-table)))
+           (rel (if target (- target (rv-current-offset buf)) 0)))
+      (rv-emit-call buf rel))
+    (rv-emit-mv buf +rv-t2+ +rv-a0+)
+    (rv-emit-load-word buf +rv-a0+ +rv-sp+ 0)
+    (rv-emit-load-word buf +rv-a1+ +rv-sp+ w)
+    (rv-emit-load-word buf +rv-a2+ +rv-sp+ (* 2 w))
+    (rv-emit-load-word buf +rv-a3+ +rv-sp+ (* 3 w))
+    (rv-emit-addi buf +rv-sp+ +rv-sp+ (* 4 w))))
+
+(defun rv-genarith-call-size (ra rb)
+  "Byte size of RV-EMIT-GENARITH-CALL, measured by emitting it."
+  (let ((tmp (make-rv-buffer)))
+    (rv-emit-genarith-call tmp ra rb 0 nil)
+    (rv-current-offset tmp)))
+
 (defun translate-mvm-insn-riscv (buf opcode operands mvm-pc
                                   &key (pass2 nil) label-map function-table)
   "Translate a single MVM instruction to RISC-V native code.
@@ -1407,11 +1466,29 @@
        ;; the documented degrade rather than a new invention -- and it is a
        ;; large step up from the previous behaviour, which was to trap.
 
+       ;;
+       ;; UPDATE: :ADD-CHECKED now promotes, below, whenever the module carries
+       ;; GENERIC-ADD (every CL image).  The wrap was not a harmless degrade:
+       ;; the reader builds a float's mantissa with (* m 10), so 5d18 read as
+       ;; -4.2d18 and (truncate -1d20) came out positive.
        (let* ((vd (vreg 0))
               (ra (resolve (vreg 1)))
-              (rb (resolve2 (vreg 2))))
-         (rv-emit-add buf +rv-t0+ ra rb)
-         (store-result vd +rv-t0+)))
+              (rb (resolve2 (vreg 2)))
+              (gen (and (= opcode +op-add-checked+) (rv-genarith-offset "GENERIC-ADD"))))
+         (if gen
+             ;; Tags cancel: tag(a)+tag(b) = tag(a+b).  Signed overflow iff the
+             ;; result's sign differs from BOTH operands': ((a^r) & (b^r)) < 0.
+             (progn
+               (rv-emit-add buf +rv-t2+ ra rb)
+               (rv-emit-xor buf +rv-t3+ ra +rv-t2+)
+               (rv-emit-xor buf +rv-t4+ rb +rv-t2+)
+               (rv-emit-and buf +rv-t3+ +rv-t3+ +rv-t4+)
+               (rv-emit-bge buf +rv-t3+ +rv-x0+ (+ 4 (rv-genarith-call-size ra rb)))
+               (rv-emit-genarith-call buf ra rb gen function-table)
+               (store-result vd +rv-t2+))
+             (progn
+               (rv-emit-add buf +rv-t0+ ra rb)
+               (store-result vd +rv-t0+)))))
 
       ((#.+op-sub+ #.+op-sub-checked+ #.+op-subs+)
        ;; :SUBS shares this clause.  :adds/:subs are "arithmetic that also sets
@@ -1435,9 +1512,22 @@
 
        (let* ((vd (vreg 0))
               (ra (resolve (vreg 1)))
-              (rb (resolve2 (vreg 2))))
-         (rv-emit-sub buf +rv-t0+ ra rb)
-         (store-result vd +rv-t0+)))
+              (rb (resolve2 (vreg 2)))
+              (gen (and (= opcode +op-sub-checked+) (rv-genarith-offset "GENERIC-SUBTRACT"))))
+         (if gen
+             ;; Overflow iff the operands' signs differ AND the result's sign
+             ;; differs from a's: ((a^b) & (a^r)) < 0.  See :ADD-CHECKED.
+             (progn
+               (rv-emit-sub buf +rv-t2+ ra rb)
+               (rv-emit-xor buf +rv-t3+ ra rb)
+               (rv-emit-xor buf +rv-t4+ ra +rv-t2+)
+               (rv-emit-and buf +rv-t3+ +rv-t3+ +rv-t4+)
+               (rv-emit-bge buf +rv-t3+ +rv-x0+ (+ 4 (rv-genarith-call-size ra rb)))
+               (rv-emit-genarith-call buf ra rb gen function-table)
+               (store-result vd +rv-t2+))
+             (progn
+               (rv-emit-sub buf +rv-t0+ ra rb)
+               (store-result vd +rv-t0+)))))
 
       ((#.+op-mul+ #.+op-mul-checked+)
        ;; :MUL-CHECKED shares this clause.  The checked opcodes mean "tagged
@@ -1453,10 +1543,24 @@
        ;; (a<<1) * (b>>1) = a*b << 1 (preserves single tag bit)
        (let* ((vd (vreg 0))
               (ra (resolve (vreg 1)))
-              (rb (resolve2 (vreg 2))))
-         (rv-emit-srai buf +rv-t0+ ra 1)       ; untag first operand
-         (rv-emit-mul buf +rv-t0+ +rv-t0+ rb)  ; multiply (result has one tag bit)
-         (store-result vd +rv-t0+)))
+              (rb (resolve2 (vreg 2)))
+              (gen (and (= opcode +op-mul-checked+) (rv-genarith-offset "GENERIC-MULTIPLY"))))
+         (if gen
+             ;; untag(a) * tag(b) = tag(a*b).  The XLEN x XLEN product fits iff
+             ;; MULH (the high word) is the sign-extension of the low word.
+             ;; t5 holds untag(a) so RA itself stays intact for the slow path.
+             (progn
+               (rv-emit-srai buf +rv-t5+ ra 1)
+               (rv-emit-mul buf +rv-t2+ +rv-t5+ rb)
+               (rv-emit-mulh buf +rv-t3+ +rv-t5+ rb)
+               (rv-emit-srai buf +rv-t4+ +rv-t2+ (1- (* 8 (rv-word-size))))
+               (rv-emit-beq buf +rv-t3+ +rv-t4+ (+ 4 (rv-genarith-call-size ra rb)))
+               (rv-emit-genarith-call buf ra rb gen function-table)
+               (store-result vd +rv-t2+))
+             (progn
+               (rv-emit-srai buf +rv-t0+ ra 1)       ; untag first operand
+               (rv-emit-mul buf +rv-t0+ +rv-t0+ rb)  ; multiply (result has one tag bit)
+               (store-result vd +rv-t0+)))))
 
       (#.+op-mul26lo+
        ;; Low 26 bits of untag(Va)*untag(Vb), tagged
@@ -2044,6 +2148,29 @@
              (rv-emit-fmv-x-d buf +rv-t0+ 0)
              (rv-float-box buf +rv-t0+ +rv-t1+ +rv-t2+)
              (store-result vd +rv-t2+))))
+
+      (#.+op-fround32+
+       ;; (fround32 Vd Vs): the double payload rounded to single precision and
+       ;; boxed as a SINGLE-FLOAT (#x64) -- %ROUND-TO-SINGLE's native op.  It
+       ;; had no arm here, so the default trap fired on EVERY single-float
+       ;; operation, the reader's `1.5' included (i386 had the same gap until
+       ;; 51b0c83).  FCVT.S.D then FCVT.D.S, like x64's CVTSD2SS/CVTSS2SD.
+       (let* ((vd (vreg 0))
+              (rs (resolve (vreg 1))))
+         (if (not *riscv-64-bit*)
+             (progn
+               (rv32-float-unbox buf rs 0 +rv-t3+)
+               (rv-emit-fcvt-s-d buf 0 0)
+               (rv-emit-fcvt-d-s buf 0 0)
+               (rv32-float-box buf 0 +rv-t3+ +rv-t2+ #x64))
+             (progn
+               (rv-float-load-bits buf rs +rv-t0+ +rv-t1+)
+               (rv-emit-fmv-d-x buf 0 +rv-t0+)
+               (rv-emit-fcvt-s-d buf 0 0)
+               (rv-emit-fcvt-d-s buf 0 0)
+               (rv-emit-fmv-x-d buf +rv-t0+ 0)
+               (rv-float-box buf +rv-t0+ +rv-t1+ +rv-t2+ #x64)))
+         (store-result vd +rv-t2+)))
 
       (#.+op-itof+
        ;; Tagged integer -> a fresh double.  The value arrives TAGGED, so it is
@@ -2751,7 +2878,7 @@
              (rv-emit-srli buf tmp tmp (* 16 k))
              (rv-emit-or buf acc acc tmp))))
 
-(defun rv-float-box (buf bits tmp out)
+(defun rv-float-box (buf bits tmp out &optional (subtag #x60))
   "Allocate a fresh double object holding the 64 IEEE bits in BITS, leaving its
    TAGGED pointer in OUT.  TMP is clobbered; BITS is preserved.
 
@@ -2762,7 +2889,7 @@
          (g (rv-granule))
          (bytes (logand (+ (* 5 ws) (1- g)) (lognot (1- g)))))
     (rv-emit-alloc-mark buf :start)
-    (rv-emit-li buf tmp (logior #x60 (ash 4 8)))
+    (rv-emit-li buf tmp (logior subtag (ash 4 8)))   ; #x60 double, #x64 single
     (rv-emit-store-word buf tmp +rv-s8+ 0)
     ;; chunk k = bits (63-16k)..(48-16k), stored TAGGED.
     (loop for k from 0 to 3
@@ -2795,7 +2922,7 @@
     (rv-emit-fld buf fd +rv-sp+ 0)
     (rv-emit-addi buf +rv-sp+ +rv-sp+ 16)))
 
-(defun rv32-float-box (buf fs tmp out)
+(defun rv32-float-box (buf fs tmp out &optional (subtag #x60))
   "RV32: box the double in FP register FS as a fresh four-chunk object, leaving
    its TAGGED pointer in OUT.  The inverse of rv32-float-unbox: FSD to a stack
    scratch, then LHU each 16-bit chunk back out, tag it, and store it in its
@@ -2806,7 +2933,7 @@
     (rv-emit-addi buf +rv-sp+ +rv-sp+ -16)
     (rv-emit-fsd buf fs +rv-sp+ 0)
     (rv-emit-alloc-mark buf :start)
-    (rv-emit-li buf tmp (logior #x60 (ash 4 8)))
+    (rv-emit-li buf tmp (logior subtag (ash 4 8)))   ; #x60 double, #x64 single
     (rv-emit-store-word buf tmp +rv-s8+ 0)
     (loop for k from 0 to 3
           do (rv-emit-lhu buf tmp +rv-sp+ (- 6 (* 2 k)))

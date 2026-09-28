@@ -151,7 +151,17 @@
       ;; or bytecode-offset → native-byte-offset (aarch64/riscv/ppc/68k)
       (multiple-value-bind (buf fn-map)
           (let ((table fn-table)
-                (max-retries 1))
+                (max-retries 1)
+                ;; The checked-arith slow paths' targets (riscv; aarch64 binds
+                ;; its own three offsets in the unified path below).
+                (modus.mvm::*riscv-genarith-offsets*
+                  (let ((acc nil))
+                    (dolist (fi fn-list acc)
+                      (let ((nm (string (mvm-function-info-name fi))))
+                        (when (member nm '("GENERIC-ADD" "GENERIC-SUBTRACT" "GENERIC-MULTIPLY")
+                                      :test #'string-equal)
+                          (push (cons (string-upcase nm) (mvm-function-info-bytecode-offset fi))
+                                acc)))))))
             (loop for attempt from 1
                   do (handler-case (return (funcall translator bytecode table))
                        (error (e)

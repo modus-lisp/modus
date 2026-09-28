@@ -973,6 +973,15 @@
                        secs))
       (setq i (- i 1)))))
 
+;;; AOT wrappers for the three WS4 JIT trap primitives, so the interpreter's
+;;; #x0531/#x0532/#x0533 arms can reach the NATIVE trap of whatever target this
+;;; image is built for (the compiler inlines the primitives at every call
+;;; site, so there is no other defun to call).  Never call these from compiled
+;;; code — write the primitive itself.
+(defun %mmap-exec-page-1 (n) (%mmap-exec-page n))
+(defun %jit-call-1 (entry) (%jit-call entry))
+(defun %jit-icache-flush-1 (addr len) (%jit-icache-flush addr len))
+
 (defun mvm-interpret (bytecode &key (entry-point 0) function-table runtime-table
                                     (return-raw t) initial-args initial-cenv
                                     lambda-offsets)
@@ -1223,6 +1232,29 @@
                ;; (sys-exit N) in evaluated code -- every --script test's
                ;; verdict line -- did nothing and the process exited 0 at EOF.
                ;; Here it is compiled native code, so this call really exits.
+               ;; WS4 JIT primitives — %MMAP-EXEC-PAGE (#x0531), %JIT-CALL
+               ;; (#x0532), %JIT-ICACHE-FLUSH (#x0533).  The compiler inlines
+               ;; these as TRAPs, so an INTERPRETED call site has no defun to
+               ;; reach; without these arms the code fell through to the
+               ;; FRAME-ENTER arm below (params = code & #xFF = 49), which
+               ;; allocated a frame and left V0 UNTOUCHED — the primitive
+               ;; echoed its argument.  Measured 2026-09-28: hosted x64
+               ;; (%mmap-exec-page 4096) => 4096 under MODUS_NO_JIT=1, and on
+               ;; the Zero 2 W an interpreted rh-init "mapped" 6291456 (its
+               ;; byte count) and filled 2 MB of the kernel image.  Each arm
+               ;; calls an AOT wrapper whose body IS the native trap for this
+               ;; target, so the interpreter gets exactly the native answer.
+               ;; Registers hold VALUES; the wrappers take and return values.
+               ((= code #x0531)
+                (setf (svref regs +vreg-v0+) (%mmap-exec-page-1 (svref regs +vreg-v0+)))
+                (setf pc npc))
+               ((= code #x0532)
+                (setf (svref regs +vreg-vr+) (%jit-call-1 (svref regs +vreg-v0+)))
+                (setf pc npc))
+               ((= code #x0533)
+                (setf (svref regs +vreg-v0+)
+                      (%jit-icache-flush-1 (svref regs +vreg-v0+) (svref regs +vreg-v1+)))
+                (setf pc npc))
                ((= code #x0500)
                 (sys-exit (svref regs +vreg-v0+)))
                ((>= code #x100)

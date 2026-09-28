@@ -533,6 +533,29 @@
 (defun sb-bsd-sockets:socket-name (socket) (%sock-getname socket 51))
 (defun sb-bsd-sockets:socket-peername (socket) (%sock-getname socket 52))
 
+(defun sb-bsd-sockets:socket-send (socket buffer length &key address external-format)
+  "Write LENGTH bytes (all of BUFFER when NIL) of the (unsigned-byte 8) vector
+   BUFFER; returns the count written.  PARTIAL: ADDRESS (datagram sends) and
+   EXTERNAL-FORMAT are not supported and must be NIL."
+  external-format
+  (when address (error "sb-bsd-sockets:socket-send: :ADDRESS is not supported on modus."))
+  (let ((n (socket-send (%socket-fd socket) buffer (or length (length buffer)))))
+    (if (< n 0)
+        (error 'sb-bsd-sockets:socket-error :errno (- n))
+        n)))
+
+(defun sb-bsd-sockets:socket-receive (socket buffer length &key oob peek waitall element-type)
+  "One read(2) of up to LENGTH bytes (BUFFER's length when NIL) into BUFFER,
+   or into a fresh (unsigned-byte 8) vector of LENGTH when BUFFER is NIL.
+   Returns (values buffer count nil); count 0 = the peer closed.  PARTIAL: OOB,
+   PEEK, WAITALL and ELEMENT-TYPE are accepted and ignored."
+  oob peek waitall element-type
+  (let* ((buf (or buffer (make-array length :element-type '(unsigned-byte 8))))
+         (n (socket-recv (%socket-fd socket) buf (or length (length buf)))))
+    (if (< n 0)
+        (error 'sb-bsd-sockets:socket-error :errno (- n))
+        (values buf n nil))))
+
 (defun sb-bsd-sockets:socket-make-stream (socket &key input output
                                                       (element-type 'character)
                                                       buffering timeout
@@ -598,22 +621,97 @@
 (defun sb-bsd-sockets:host-ent-address (host-ent)
   (car (sb-bsd-sockets:host-ent-addresses host-ent)))
 
-(defun sb-bsd-sockets:get-host-by-name (name)
-  "Resolve NAME.
+(defun %shim-split-ws (line)
+  "LINE's whitespace-separated fields, up to a # comment."
+  (let ((fields nil) (cur nil) (i 0) (n (length line)))
+    (loop
+      (when (>= i n) (return nil))
+      (let ((c (char line i)))
+        (cond ((char= c #\#) (return nil))
+              ((or (char= c #\Space) (char= c #\Tab) (char= c #\Return))
+               (when cur (push (coerce (nreverse cur) 'string) fields) (setq cur nil)))
+              (t (push c cur))))
+      (setq i (+ i 1)))
+    (when cur (push (coerce (nreverse cur) 'string) fields))
+    (nreverse fields)))
 
-   PARTIAL, AND THE PARTIAL PART IS THE WHOLE OF IT: a DOTTED QUAD is recognised
-   without asking anybody; anything else SIGNALS.  modus does have a resolver
-   (DNS-LOOKUP in net/hosted-sockets.lisp) but it takes a nameserver address as
-   an argument and this shim has no configured one to pass — there is no
-   /etc/resolv.conf reader in the image — so `resolve a name' would mean picking
-   a public resolver on the caller\'s behalf, which is not a decision a
-   compatibility shim gets to make.  glass\'s only call site
-   (src/socket.lisp:520) passes a host that is a dotted quad in every
-   configuration the RFB server is used in."
-  (if (and (> (length name) 0) (digit-char-p (char name 0)))
-      (make-instance 'sb-bsd-sockets:host-ent :name name
-                     :addresses (list (sb-bsd-sockets:make-inet-address name)))
-      (error 'sb-bsd-sockets:socket-error :errno 2)))
+(defun %shim-dotted-quad-int (s)
+  "The host-order integer of a dotted-quad STRING, or NIL if it is not one."
+  (let ((parts nil) (acc 0) (digits 0) (i 0) (n (length s)) (ok t))
+    (loop
+      (when (>= i n) (return nil))
+      (let ((c (char s i)))
+        (cond ((digit-char-p c)
+               (setq acc (+ (* acc 10) (digit-char-p c)) digits (+ digits 1)))
+              ((and (char= c #\.) (> digits 0))
+               (push acc parts) (setq acc 0 digits 0))
+              (t (setq ok nil) (return nil))))
+      (setq i (+ i 1)))
+    (when (and ok (> digits 0)) (push acc parts))
+    (setq parts (nreverse parts))
+    (if (and ok (= (length parts) 4) (every (lambda (x) (<= x 255)) parts))
+        (+ (* (first parts) 16777216) (* (second parts) 65536)
+           (* (third parts) 256) (fourth parts))
+        nil)))
+
+(defun %shim-file-lines (path)
+  "The lines of the file at PATH, or NIL if it cannot be read."
+  (handler-case
+      (with-open-file (in path)
+        (let ((acc nil))
+          (loop
+            (let ((l (read-line in nil nil)))
+              (when (null l) (return nil))
+              (push l acc)))
+          (nreverse acc)))
+    (error () nil)))
+
+(defun %shim-hosts-lookup (name)
+  "NAME's IPv4 address string from /etc/hosts, or NIL."
+  (dolist (line (%shim-file-lines "/etc/hosts") nil)
+    (let ((f (%shim-split-ws line)))
+      (when (and f (%shim-dotted-quad-int (car f))
+                 (member name (cdr f) :test #'string-equal))
+        (return (car f))))))
+
+(defun %shim-nameservers ()
+  "The IPv4 nameservers /etc/resolv.conf names, as host-order integers, in its
+   order; 8.8.8.8 last, as the fallback when it names none that answer."
+  (let ((acc nil))
+    (dolist (line (%shim-file-lines "/etc/resolv.conf"))
+      (let ((f (%shim-split-ws line)))
+        (when (and (= (length f) 2) (string= (car f) "nameserver"))
+          (let ((ip (%shim-dotted-quad-int (cadr f))))
+            (when ip (push ip acc))))))
+    (nreverse (cons 134744072 acc))))
+
+(defun sb-bsd-sockets:get-host-by-name (name)
+  "Resolve NAME to its IPv4 address.
+
+   A dotted quad answers itself; then /etc/hosts; then each IPv4 nameserver in
+   /etc/resolv.conf in order (UDP, then TCP), with 8.8.8.8 last.  This shim
+   used to refuse every non-numeric name because the image had no resolv.conf
+   reader and it would not pick a public resolver on the caller's behalf --
+   the configured resolver is the one to ask, and now it is asked.  IPv4 only
+   (DNS-LOOKUP asks for A records).  Signals SOCKET-ERROR when nothing answers."
+  (let ((quad (cond ((%shim-dotted-quad-int name) name)
+                    ((%shim-hosts-lookup name))
+                    (t (let* ((n (length name))
+                              (codes (make-array n))
+                              (found nil))
+                         (dotimes (i n) (aset codes i (char-code (char name i))))
+                         (dolist (ns (%shim-nameservers))
+                           (unless found
+                             (let ((ip (handler-case (dns-lookup codes n ns nil) (error () 0))))
+                               (when (eql ip 0)
+                                 (setq ip (handler-case (dns-lookup codes n ns t) (error () 0))))
+                               (when (and (integerp ip) (> ip 0))
+                                 (setq found (%format-dotted-ip ip))))))
+                         found)))))
+    (if quad
+        (make-instance 'sb-bsd-sockets:host-ent :name name
+                       :addresses (list (sb-bsd-sockets:make-inet-address quad)))
+        (error 'sb-bsd-sockets:socket-error :errno 2))))
 
 ;;; ============================================================
 ;;; SB-EXT additions
@@ -669,3 +767,231 @@
 ;;; THE FEATURES
 ;;; ============================================================
 (pushnew :sb-bsd-sockets *features*)
+
+;;; ============================================================
+;;; GRAY STREAMS
+;;; ============================================================
+;;;
+;;; The GRAY-STREAMS package (net/genera-compat.lisp) used to hold symbols
+;;; only: no classes, and no CL stream function dispatched to a user stream,
+;;; so a library stream class (seal's TLS-STREAM, flexi-streams, chunga) was
+;;; a CLOS object READ-BYTE rejected as "not a stream".  This is the Gray
+;;; proposal: the FUNDAMENTAL-* classes, the generic functions with the
+;;; proposal's default methods, and the CL entry points wrapped so an
+;;; instance of FUNDAMENTAL-STREAM goes to its generic and anything else to
+;;; the original function.  The wrappers are installed through the function
+;;; cell, which is what runtime-compiled callers (interpreted and JIT) reach.
+;;; Character OUTPUT from FORMAT/PRINC/etc. reaches a Gray stream through
+;;; *GRAY-ROOT-CLASS* / *GRAY-WRITE-CHAR-FN*, which mvm/cl-fileio.lisp's
+;;; %WRITE-CHAR-TO-STREAM consults.
+
+(defclass gray-streams:fundamental-stream ()
+  ((%gray-open :initform t :accessor %gray-open-p)))
+(defclass gray-streams:fundamental-input-stream (gray-streams:fundamental-stream) ())
+(defclass gray-streams:fundamental-output-stream (gray-streams:fundamental-stream) ())
+(defclass gray-streams:fundamental-character-stream (gray-streams:fundamental-stream) ())
+(defclass gray-streams:fundamental-binary-stream (gray-streams:fundamental-stream) ())
+(defclass gray-streams:fundamental-character-input-stream
+    (gray-streams:fundamental-input-stream gray-streams:fundamental-character-stream) ())
+(defclass gray-streams:fundamental-character-output-stream
+    (gray-streams:fundamental-output-stream gray-streams:fundamental-character-stream) ())
+(defclass gray-streams:fundamental-binary-input-stream
+    (gray-streams:fundamental-input-stream gray-streams:fundamental-binary-stream) ())
+(defclass gray-streams:fundamental-binary-output-stream
+    (gray-streams:fundamental-output-stream gray-streams:fundamental-binary-stream) ())
+
+(defun %gray-p (x)
+  (and x (not (eq x t)) (typep x 'gray-streams:fundamental-stream)))
+
+;;; --- generics, with the proposal's defaults ---
+(defgeneric gray-streams:stream-read-byte (stream))
+(defgeneric gray-streams:stream-write-byte (stream integer))
+(defgeneric gray-streams:stream-read-char (stream))
+(defgeneric gray-streams:stream-unread-char (stream character))
+(defgeneric gray-streams:stream-read-char-no-hang (stream))
+(defmethod gray-streams:stream-read-char-no-hang ((s gray-streams:fundamental-stream))
+  (gray-streams:stream-read-char s))
+(defgeneric gray-streams:stream-peek-char (stream))
+(defmethod gray-streams:stream-peek-char ((s gray-streams:fundamental-stream))
+  (let ((c (gray-streams:stream-read-char s)))
+    (unless (eq c :eof) (gray-streams:stream-unread-char s c))
+    c))
+(defgeneric gray-streams:stream-listen (stream))
+(defmethod gray-streams:stream-listen ((s gray-streams:fundamental-stream)) t)
+(defgeneric gray-streams:stream-read-line (stream))
+(defmethod gray-streams:stream-read-line ((s gray-streams:fundamental-stream))
+  (let ((acc nil))
+    (loop
+      (let ((c (gray-streams:stream-read-char s)))
+        (cond ((eq c :eof)
+               (return (values (coerce (nreverse acc) 'string) t)))
+              ((char= c #\Newline)
+               (return (values (coerce (nreverse acc) 'string) nil)))
+              (t (push c acc)))))))
+(defgeneric gray-streams:stream-clear-input (stream))
+(defmethod gray-streams:stream-clear-input ((s gray-streams:fundamental-stream)) nil)
+(defgeneric gray-streams:stream-write-char (stream character))
+(defgeneric gray-streams:stream-line-column (stream))
+(defmethod gray-streams:stream-line-column ((s gray-streams:fundamental-stream)) nil)
+(defgeneric gray-streams:stream-start-line-p (stream))
+(defmethod gray-streams:stream-start-line-p ((s gray-streams:fundamental-stream))
+  (eql (gray-streams:stream-line-column s) 0))
+(defgeneric gray-streams:stream-write-string (stream string &optional start end))
+(defmethod gray-streams:stream-write-string ((s gray-streams:fundamental-stream) string
+                                             &optional (start 0) end)
+  (let ((end (or end (length string))))
+    (do ((i start (+ i 1))) ((>= i end) string)
+      (gray-streams:stream-write-char s (char string i)))))
+(defgeneric gray-streams:stream-terpri (stream))
+(defmethod gray-streams:stream-terpri ((s gray-streams:fundamental-stream))
+  (gray-streams:stream-write-char s #\Newline) nil)
+(defgeneric gray-streams:stream-fresh-line (stream))
+(defmethod gray-streams:stream-fresh-line ((s gray-streams:fundamental-stream))
+  (unless (gray-streams:stream-start-line-p s)
+    (gray-streams:stream-terpri s) t))
+(defgeneric gray-streams:stream-finish-output (stream))
+(defmethod gray-streams:stream-finish-output ((s gray-streams:fundamental-stream))
+  (gray-streams:stream-force-output s))
+(defgeneric gray-streams:stream-force-output (stream))
+(defmethod gray-streams:stream-force-output ((s gray-streams:fundamental-stream)) nil)
+(defgeneric gray-streams:stream-clear-output (stream))
+(defmethod gray-streams:stream-clear-output ((s gray-streams:fundamental-stream)) nil)
+(defgeneric gray-streams:stream-advance-to-column (stream column))
+(defmethod gray-streams:stream-advance-to-column ((s gray-streams:fundamental-stream) column)
+  (let ((c (gray-streams:stream-line-column s)))
+    (when c
+      (dotimes (i (- column c)) (gray-streams:stream-write-char s #\Space))
+      t)))
+(defgeneric gray-streams:stream-read-sequence (stream seq &optional start end))
+(defmethod gray-streams:stream-read-sequence ((s gray-streams:fundamental-stream) seq
+                                              &optional (start 0) end)
+  (let ((end (or end (length seq)))
+        (binp (typep s 'gray-streams:fundamental-binary-stream)))
+    (do ((i start (+ i 1))) ((>= i end) end)
+      (let ((x (if binp (gray-streams:stream-read-byte s) (gray-streams:stream-read-char s))))
+        (when (eq x :eof) (return i))
+        (setf (elt seq i) x)))))
+(defgeneric gray-streams:stream-write-sequence (stream seq &optional start end))
+(defmethod gray-streams:stream-write-sequence ((s gray-streams:fundamental-stream) seq
+                                               &optional (start 0) end)
+  (let ((end (or end (length seq)))
+        (binp (typep s 'gray-streams:fundamental-binary-stream)))
+    (do ((i start (+ i 1))) ((>= i end) seq)
+      (if binp
+          (gray-streams:stream-write-byte s (elt seq i))
+          (gray-streams:stream-write-char s (elt seq i))))))
+(defgeneric gray-streams:stream-file-position (stream))
+(defmethod gray-streams:stream-file-position ((s gray-streams:fundamental-stream)) nil)
+
+;;; --- the CL entry points ---
+(defmacro %gray-wrap (name lambda-list gray-form)
+  "Install NAME := a function that runs GRAY-FORM when its stream argument
+   (bound to STREAM in LAMBDA-LIST's sense by GRAY-FORM itself) is a Gray
+   stream, and otherwise applies the ORIGINAL definition to its arguments."
+  `(let ((orig (symbol-function ',name)))
+     (setf (symbol-function ',name)
+           (lambda (&rest args)
+             (destructuring-bind ,lambda-list args
+               (declare (ignorable ,@(remove-if (lambda (x) (member x '(&optional &rest &key)))
+                                                (mapcar (lambda (x) (if (consp x) (car x) x)) lambda-list))))
+               (if (%gray-p stream) ,gray-form (apply orig args)))))))
+
+(defun %gray-eof (stream eof-error-p eof-value)
+  (if eof-error-p (error 'end-of-file :stream stream) eof-value))
+
+(%gray-wrap read-byte (stream &optional (eof-error-p t) eof-value)
+  (let ((b (gray-streams:stream-read-byte stream)))
+    (if (eq b :eof) (%gray-eof stream eof-error-p eof-value) b)))
+(%gray-wrap write-byte (byte stream)
+  (progn (gray-streams:stream-write-byte stream byte) byte))
+(%gray-wrap read-char (&optional stream (eof-error-p t) eof-value recursive-p)
+  (let ((c (gray-streams:stream-read-char stream)))
+    (if (eq c :eof) (%gray-eof stream eof-error-p eof-value) c)))
+(%gray-wrap read-char-no-hang (&optional stream (eof-error-p t) eof-value recursive-p)
+  (let ((c (gray-streams:stream-read-char-no-hang stream)))
+    (if (eq c :eof) (%gray-eof stream eof-error-p eof-value) c)))
+(%gray-wrap unread-char (character &optional stream)
+  (progn (gray-streams:stream-unread-char stream character) nil))
+(%gray-wrap peek-char (&optional peek-type stream (eof-error-p t) eof-value recursive-p)
+  (let ((c (if (null peek-type)
+               (gray-streams:stream-peek-char stream)
+               (loop
+                 (let ((c (gray-streams:stream-read-char stream)))
+                   (when (or (eq c :eof)
+                             (if (eq peek-type t)
+                                 (not (member c '(#\Space #\Tab #\Newline #\Return #\Page)))
+                                 (char= c peek-type)))
+                     (unless (eq c :eof) (gray-streams:stream-unread-char stream c))
+                     (return c)))))))
+    (if (eq c :eof) (%gray-eof stream eof-error-p eof-value) c)))
+(%gray-wrap read-line (&optional stream (eof-error-p t) eof-value recursive-p)
+  (multiple-value-bind (line missing) (gray-streams:stream-read-line stream)
+    (if (and missing (= (length line) 0))
+        (%gray-eof stream eof-error-p eof-value)
+        (values line missing))))
+(%gray-wrap listen (&optional stream) (gray-streams:stream-listen stream))
+(%gray-wrap clear-input (&optional stream) (gray-streams:stream-clear-input stream))
+(%gray-wrap write-char (character &optional stream)
+  (progn (gray-streams:stream-write-char stream character) character))
+(%gray-wrap write-string (string &optional stream &key (start 0) end)
+  (progn (gray-streams:stream-write-string stream string start end) string))
+(%gray-wrap write-line (string &optional stream &key (start 0) end)
+  (progn (gray-streams:stream-write-string stream string start end)
+         (gray-streams:stream-terpri stream) string))
+(%gray-wrap terpri (&optional stream) (progn (gray-streams:stream-terpri stream) nil))
+(%gray-wrap fresh-line (&optional stream) (gray-streams:stream-fresh-line stream))
+(%gray-wrap finish-output (&optional stream) (progn (gray-streams:stream-finish-output stream) nil))
+(%gray-wrap force-output (&optional stream) (progn (gray-streams:stream-force-output stream) nil))
+(%gray-wrap clear-output (&optional stream) (progn (gray-streams:stream-clear-output stream) nil))
+(%gray-wrap read-sequence (seq stream &key (start 0) end)
+  (gray-streams:stream-read-sequence stream seq start end))
+(%gray-wrap write-sequence (seq stream &key (start 0) end)
+  (progn (gray-streams:stream-write-sequence stream seq start end) seq))
+(%gray-wrap close (stream &key abort)
+  (progn (setf (%gray-open-p stream) nil) t))
+(%gray-wrap open-stream-p (stream) (%gray-open-p stream))
+(%gray-wrap streamp (stream) t)
+(%gray-wrap input-stream-p (stream) (typep stream 'gray-streams:fundamental-input-stream))
+(%gray-wrap output-stream-p (stream) (typep stream 'gray-streams:fundamental-output-stream))
+(%gray-wrap stream-element-type (stream)
+  (if (typep stream 'gray-streams:fundamental-binary-stream) '(unsigned-byte 8) 'character))
+
+;;; The printers resolve their destination inside the image, before any
+;;; character is written, and reject what they do not recognise; for a Gray
+;;; destination they render to a string with the original and hand it over.
+(let ((orig (symbol-function 'format)))
+  (setf (symbol-function 'format)
+        (lambda (destination control &rest args)
+          (if (%gray-p destination)
+              (progn (gray-streams:stream-write-string
+                      destination (apply orig nil control args))
+                     nil)
+              (apply orig destination control args)))))
+(%gray-wrap princ (object &optional stream)
+  (progn (gray-streams:stream-write-string stream (princ-to-string object)) object))
+(%gray-wrap prin1 (object &optional stream)
+  (progn (gray-streams:stream-write-string stream (prin1-to-string object)) object))
+(%gray-wrap print (object &optional stream)
+  (progn (gray-streams:stream-terpri stream)
+         (gray-streams:stream-write-string stream (prin1-to-string object))
+         (gray-streams:stream-write-char stream #\Space) object))
+(%gray-wrap pprint (object &optional stream)
+  (progn (gray-streams:stream-terpri stream)
+         (gray-streams:stream-write-string stream (prin1-to-string object)) (values)))
+(let ((orig (symbol-function 'write)))
+  (setf (symbol-function 'write)
+        (lambda (object &rest keys)
+          (let ((stream (getf keys :stream)))
+            (if (%gray-p stream)
+                (let ((k (copy-list keys)))
+                  (remf k :stream)
+                  (gray-streams:stream-write-string
+                   stream (apply (function write-to-string) object k))
+                  object)
+                (apply orig object keys))))))
+
+;;; FORMAT / PRINC / WRITE-TO-STREAM reach character output through
+;;; %WRITE-CHAR-TO-STREAM, compiled into the image; it consults these.
+(setq *gray-root-class* 'gray-streams:fundamental-stream)
+(setq *gray-write-char-fn* (lambda (stream code)
+                             (gray-streams:stream-write-char stream (code-char code))))

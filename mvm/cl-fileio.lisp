@@ -1536,7 +1536,15 @@
    designator argument.  Per CLHS: must return a pathname (or NIL)."
   ;; CLHS error.1: (user-homedir-pathname :unspecific nil) → program-error.
   (when (and args (cdr args)) (%signal-program-error))
-  (%coerce-to-pathname "/root/"))
+  ;; $HOME when the image can see an environment (hosted: %CLI-GETENV is
+  ;; real), with a trailing slash so MERGE-PATHNAMES treats it as a directory;
+  ;; /root/ where it cannot (bare metal's %CLI-GETENV answers NIL).  A fixed
+  ;; /root/ sent every `~/.foo' lookup of a hosted program to the wrong user.
+  (let ((h (%cli-getenv "HOME")))
+    (%coerce-to-pathname
+     (if (and (stringp h) (> (length h) 0))
+         (if (char= (char h (- (length h) 1)) #\/) h (concatenate 'string h "/"))
+         "/root/"))))
 
 ;;; --- probe-file ---
 (defun probe-file (x)
@@ -2237,10 +2245,17 @@
      (write-char-serial (logior #x80 (logand (ash code -6) #x3F)))
      (write-char-serial (logior #x80 (logand code #x3F))))))
 
+;;; Gray streams (net/sb-sys-shim.lisp) set these at boot: a CLOS instance of
+;;; *GRAY-ROOT-CLASS* receives character output through *GRAY-WRITE-CHAR-FN*.
+(defvar *gray-root-class* nil)
+(defvar *gray-write-char-fn* nil)
+
 (defun %write-char-to-stream (code stream)
   "Write a char code (integer) to a resolved stream. Caller must convert characters first."
   (if (not (streamp stream))
-      (%write-code-serial code)
+      (if (and *gray-root-class* stream (not (eq stream t)) (typep stream *gray-root-class*))
+          (funcall *gray-write-char-fn* stream code)
+          (%write-code-serial code))
       (let ((ty (%stream-type stream)))
         (cond
           ;; String-output: collect char codes

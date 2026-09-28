@@ -1420,6 +1420,40 @@
                     (%gc-write64 #x10000D98 (%rt-arena-words))
                     1)))))))
 
+(defun %fatal-stop (msg)
+  "Write MSG to fd 2 and end the process (exit_group, status 134).  For states
+   where continuing would be a deadlock or a corrupt heap.  Allocates nothing
+   and takes no lock -- it is called exactly when the lock cannot be had --
+   so each byte goes out through a raw write(2) from a scratch word."
+  (let ((w (%thr-scratch-word)))
+    (dotimes (i (length msg))
+      (%gc-write64 w (char-code (char msg i)))
+      (syscall3 1 2 w 1))
+    (sys-exit 134)))
+
+(defun %rt-mutex-lock-bounded ()
+  "Take the runtime mutex like %MUTEX-LOCK, but give up after 60 s.  Locked
+   sections are microseconds long, so a minute of waiting means the lock was
+   LEAKED -- its owner faulted, unwound through an error, or exited inside a
+   section -- and every thread that needs the runtime would wait forever.  A
+   deadlock is a correctness failure; stop loudly instead."
+  (let ((addr (%rt-mutex-addr)))
+    (if (zerop (xchg-mem addr 1))
+        0
+        (let ((ts (%futex-timeout-ts)) (n 0))
+          (loop
+            (if (zerop (xchg-mem addr 2))
+                (return 0)
+                (if (= (%futex-wait-to addr 2 ts) -110)
+                    (progn
+                      (%futex-timeout-bump)
+                      (setq n (+ n 1))
+                      (when (> n 3000)            ; 3000 x 20 ms
+                        (%fatal-stop "
+modus: waited 60 s for the runtime lock; its owner leaked it (faulted, unwound or exited inside a locked section). Stopping instead of deadlocking.
+")))
+                    0)))))))
+
 (defun %rt-enter-locked ()
   (let ((me (+ (%thr-cpu) 1)))
     (if (= (%gc-read64 (%rt-owner-addr)) me)
@@ -1435,7 +1469,7 @@
           (if (zerop (%gc-read64 (%rt-mutex-addr)))
               0
               (%gc-write64 #x10000DE8 (+ (%gc-read64 #x10000DE8) 1)))
-          (%mutex-lock (%rt-mutex-addr))
+          (%rt-mutex-lock-bounded)
           (%gc-write64 #x10000DE0 (+ (%gc-read64 #x10000DE0) 1))
           (%gc-write64 (%rt-owner-addr) me)
           (%gc-write64 (%rt-depth-addr) 1)

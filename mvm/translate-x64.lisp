@@ -1362,7 +1362,15 @@
               ;; SYS_exit: V0 (RSI) = tagged exit code
               (emit-bytes buf #x48 #x89 #xF7)  ; mov rdi, rsi (exit code)
               (emit-bytes buf #x48 #xD1 #xFF)   ; sar rdi, 1 (untag)
-              (emit-bytes buf #x48 #xC7 #xC0 #x3C #x00 #x00 #x00) ; mov rax, 60 (SYS_exit)
+              ;; exit_group (231), not exit (60), in the image whose threads run
+              ;; Lisp: (SYS-EXIT n) means the PROCESS.  With 60, main ending
+              ;; with a worker alive left the process up, a zombie leader and a
+              ;; worker parked forever -- and if main was inside a locked
+              ;; section, holding the runtime lock the worker then waited on.
+              ;; Threads end through the clone stub's own SYS_exit, never here.
+              (if (x64-stw-p)
+                  (emit-bytes buf #x48 #xC7 #xC0 #xE7 #x00 #x00 #x00) ; mov rax, 231
+                  (emit-bytes buf #x48 #xC7 #xC0 #x3C #x00 #x00 #x00)) ; mov rax, 60 (SYS_exit)
               (emit-bytes buf #x0F #x05))       ; syscall
              ((= code #x0502)
               ;; Generic 3-arg Linux syscall

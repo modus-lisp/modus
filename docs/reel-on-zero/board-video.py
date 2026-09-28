@@ -8,7 +8,8 @@ and the webcam).  One session:
      re-link before its first decode (BOARD-RUNBOOK 2026-09-28) — then (ssh-boot);
   3. over SSH (test@10.0.0.2): push reel-hvs-forms.txt (the core's copy is stale), (rh-init), then per clip (rh-load "http://10.0.0.1:8099/CLIP")
      from `python3 -m http.server 8099` in /home/modus, and (rh-play t) LOOPS times
-     while ffmpeg records /dev/video0 to OUT-CLIP.mkv.
+     while ffmpeg records /dev/video0 to OUT-CLIP.mkv, then trims the ssh
+     handshake lead-in (~12 s per connection) into OUT-CLIP.mp4.
 
   python3 board-video.py --img board-z.img.gz --core reel-z.core \
       --clip bars.ivf --clip testsrc2.ivf --loops 3
@@ -86,6 +87,20 @@ for clip in a.clip:
     rec = subprocess.Popen(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "v4l2", "-input_format", "mjpeg",
                             "-video_size", "1280x720", "-framerate", "30", "-i", "/dev/video0", "-t", "120", "-c:v", "copy", "-y", out])
     time.sleep(2)
-    run("(let ((r nil)) (dotimes (i %d) (setq r (rh-play t))) r)" % a.loops, 600)
+    t0 = time.time()
+    res = run("(let ((r nil)) (dotimes (i %d) (setq r (rh-play t))) r)" % a.loops, 600) or ""
+    t1 = time.time()
     time.sleep(1); rec.terminate(); rec.wait(); log("  recorded", out)
+    # Each ssh connection costs the board's key exchange (~12 s) before the
+    # form even starts, so the recording opens on the previous screen.  The
+    # play's own TOTAL-MS x loops says how long it ran; it ended when run()
+    # returned, so trim to [end - play - 1 s, end] and encode to h264.
+    m = re.search(r"TOTAL-MS (\d+)", res)
+    if m:
+        play = int(m.group(1)) * a.loops / 1000.0
+        start = max(0.0, (t1 - t0 - 2) - play - 1.0)   # rec started 2 s before t0
+        mp4 = out[:-4] + ".mp4"
+        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", "%.2f" % start, "-i", out,
+                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-y", mp4])
+        log("  trimmed %.1fs of ssh lead-in -> %s" % (start, mp4))
 log("=== BOARD-VIDEO DONE")

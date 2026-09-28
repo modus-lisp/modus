@@ -280,6 +280,19 @@
           (%gc-write64 (+ b #x400) 0)
           (%gc-write64 (+ b #x5000) 0)
           (%gc-write64 (+ b #x5008) 0)
+          ;; THE SHARED-STORE GUARD'S WORDS (translate-x64, SHARED-STORE
+          ;; GUARD): this thread's region pair and size, so a store of one of
+          ;; its objects into memory outside that pair traps instead of
+          ;; leaving a pointer no collector will keep.  Size 0 = no region of
+          ;; its own = nothing to guard.
+          (if (and (< cpu (%ha-nregions)) (not (zerop (%thr-threads-can-cons-p))))
+              (progn (%gc-write64 (+ b #x5040) (%ha-region-from cpu))
+                     (%gc-write64 (+ b #x5048) (%ha-region-to cpu))
+                     (%gc-write64 (+ b #x5050) *ha-rsize*))
+              (progn (%gc-write64 (+ b #x5040) 0)
+                     (%gc-write64 (+ b #x5048) 0)
+                     (%gc-write64 (+ b #x5050) 0)))
+          (%gc-write64 (+ b #x5058) 0)
           (%gc-write64 (+ b #xC30) delta)
           delta))))
 
@@ -2363,9 +2376,51 @@
     ;; and a list in this thread's region that dangled once the slot's region
     ;; was reset.  The serial starts in a range of its own per slot so no two
     ;; threads can mint the same one.
+    ;;
+    ;; AND THE RUNTIME'S OTHER PER-COMPUTATION STATE: the condition system's
+    ;; current condition, handler and restart stacks, the printer's scratch,
+    ;; the loader's depth.  Threads share no state; left global, a worker's
+    ;; (setq *current-condition* <its condition>) put an object of its own
+    ;; region into the process-wide cell -- the shared-store guard
+    ;; (translate-x64) now refuses exactly that, which is how these were
+    ;; found.  Each starts EMPTY, not as a copy of the spawner's: a thread
+    ;; started inside main's HANDLER-BIND must not run main's handlers.
     (let ((*mvm-last-mv* nil)
-          (*nlx-state-serial* (* slot 1099511627776)))
-      (declare (special *mvm-last-mv* *nlx-state-serial*))
+          (*nlx-state-serial* (* slot 1099511627776))
+          (*current-condition* nil)
+          (*catch-active* nil)
+          (*restart-stack* nil)
+          (*handler-bind-stack* nil)
+          (*handler-bind-effective-skip* 0)
+          (*restart-frame-condition-map* nil)
+          (*signal-walk-depth* 0)
+          (*restarts-being-invoked* nil)
+          (*restart-invoking-p* nil)
+          (*restart-case-result* nil)
+          (*rc-invoked-restart* nil)
+          (*format-iter-escape* nil)
+          (*write-object-budget* 0)
+          (*%circ-next* 0)
+          (*%ppx-stack* nil)
+          (*%pp-ctx* nil)
+          (*load-error-condition* nil)
+          (*%load-depth* 0)
+          ;; CLOS: the generic function being dispatched and its arguments
+          ;; and next methods live in globals for the length of a call.
+          (*%next-methods* nil)
+          (*%current-gf-args* nil)
+          (*%current-gf* nil)
+          (*%dmc-call-args* nil))
+      (declare (special *mvm-last-mv* *nlx-state-serial* *current-condition*
+                        *catch-active* *restart-stack* *handler-bind-stack*
+                        *handler-bind-effective-skip* *restart-frame-condition-map*
+                        *signal-walk-depth* *restarts-being-invoked*
+                        *restart-invoking-p* *restart-case-result*
+                        *rc-invoked-restart* *format-iter-escape*
+                        *write-object-budget* *%circ-next* *%ppx-stack* *%pp-ctx*
+                        *load-error-condition* *%load-depth*
+                        *%next-methods* *%current-gf-args* *%current-gf*
+                        *%dmc-call-args*))
       (funcall (aref (%thr-funs) slot)))
     ;; PARK THE ALLOCATION FRONTIER ON THE WAY OUT.  A region's +0x30 is where
     ;; its live heap ends as far as anything outside this thread is concerned;

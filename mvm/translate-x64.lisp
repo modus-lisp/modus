@@ -200,6 +200,100 @@
     (dolist (r (reverse *stw-park-regs*)) (emit-pop buf r))
     (emit-bytes buf #xC3)))
 
+;;; ------------------------------------------------------------
+;;; SHARED-STORE GUARD (hosted threaded image only)
+;;; ------------------------------------------------------------
+;;; Modus threads share NO state: they pass messages.  A worker's heap is its
+;;; own region, which no other collector scans, so a pointer from anywhere
+;;; else into it goes stale at that worker's next collection or exit -- silent
+;;; corruption, found later somewhere unrelated.  This turns that into a
+;;; LOUD, IMMEDIATE error at the store that would create such a pointer:
+;;; storing a heap pointer into the worker's own region pair into an object
+;;; OUTSIDE that pair traps before the store happens.
+;;;
+;;; The per-thread words (window offsets, seeded by %TLS-PREPARE-BLOCK):
+;;;   FS:[0x10005040] semispace A   FS:[0x10005048] semispace B
+;;;   FS:[0x10005050] semispace size (0 = no region: nothing to guard)
+;;;   FS:[0x10005058] set to 1 just before the trap, read by %HC-FAULT-FIXUP
+;;;   FS:[0x10005060] the store site (return address) of the last trap
+;;; The main thread (self slot 0) and every non-pointer are waved through; a
+;;; single-threaded process pays one compare per store (the threads gate).
+
+(defconstant +ssg-a-addr+ #x10005040)
+(defconstant +ssg-b-addr+ #x10005048)
+(defconstant +ssg-size-addr+ #x10005050)
+(defconstant +ssg-marker-addr+ #x10005058)
+(defconstant +ssg-site-addr+ #x10005060)
+
+(defun %ssg-fs-rcx-op (buf opcode addr)
+  ;; OPCODE rcx, fs:[addr]   (64 48 op 0C 25 disp32)
+  (emit-bytes buf #x64 #x48 opcode #x0C #x25) (emit-u32 buf addr))
+
+(defun %ssg-emit-in-region (buf inside)
+  "Jump to INSIDE when RAX (an untagged address) lies in this thread's region
+   pair.  Clobbers RCX."
+  (dolist (base (list +ssg-a-addr+ +ssg-b-addr+))
+    (emit-bytes buf #x48 #x89 #xC1)                  ; mov rcx, rax
+    (%ssg-fs-rcx-op buf #x2B base)                   ; sub rcx, fs:[base]
+    (%ssg-fs-rcx-op buf #x3B +ssg-size-addr+)        ; cmp rcx, fs:[size]
+    (emit-jcc buf :b inside)))
+
+(defun emit-shared-store-guard-sub (buf label)
+  "The guard subroutine.  Stack on entry: [rsp]=ret, [rsp+8]=value,
+   [rsp+16]=target.  Preserves every register."
+  (let ((ok (make-label)) (vmine (make-label)))
+    (emit-label buf label)
+    (emit-push buf 'rax)
+    (emit-push buf 'rcx)
+    (emit-bytes buf #x48 #x8B #x44 #x24 #x18)        ; mov rax, [rsp+24]  value
+    (emit-bytes buf #x89 #xC1)                       ; mov ecx, eax
+    (emit-bytes buf #x83 #xE1 #x05)                  ; and ecx, 5
+    (emit-bytes buf #x83 #xF9 #x01)                  ; cmp ecx, 1  (cons/function/object)
+    (emit-jcc buf :ne ok)
+    (%ssg-fs-rcx-op buf #x8B #x10000C30)             ; mov rcx, fs:[self]
+    (emit-bytes buf #x48 #x85 #xC9)                  ; test rcx, rcx
+    (emit-jcc buf :e ok)                             ; main thread
+    (emit-bytes buf #x48 #x83 #xE0 #xF0)             ; and rax, -16
+    (%ssg-emit-in-region buf vmine)
+    (emit-jmp buf ok)
+    (emit-label buf vmine)
+    (emit-bytes buf #x48 #x8B #x44 #x24 #x20)        ; mov rax, [rsp+32]  target
+    (emit-bytes buf #x48 #x83 #xE0 #xF0)             ; and rax, -16
+    (%ssg-emit-in-region buf ok)                     ; target is ours too: fine
+    ;; A thread-local object is about to be stored into shared memory.
+    (emit-bytes buf #x48 #x8B #x4C #x24 #x10)        ; mov rcx, [rsp+16]  store site
+    (emit-bytes buf #x64 #x48 #x89 #x0C #x25) (emit-u32 buf +ssg-site-addr+)
+    (emit-bytes buf #x64 #x48 #xC7 #x04 #x25) (emit-u32 buf +ssg-marker-addr+) (emit-u32 buf 1)
+    (emit-bytes buf #x0F #x0B)                       ; ud2 -- before the store
+    (emit-label buf ok)
+    (emit-pop buf 'rcx)
+    (emit-pop buf 'rax)
+    (emit-bytes buf #xC3)))
+
+(defun %ssg-load-rax (buf vreg saved-rax-disp)
+  "RAX := VREG, where the caller's RAX was saved at [rsp+SAVED-RAX-DISP]."
+  (if (eq (vreg-phys vreg) 'rax)
+      (emit-bytes buf #x48 #x8B #x44 #x24 saved-rax-disp) ; mov rax, [rsp+disp]
+      (emit-load-vreg buf vreg 'rax)))
+
+(defun emit-shared-store-guard (buf state vtarget vvalue)
+  "At a pointer store of VVALUE into the object VTARGET: call this unit's
+   guard subroutine when threads are live."
+  (let ((g (translate-state-ssg-label state)))
+    (when g
+      (let ((skip (make-label)))
+        (emit-bytes buf #x83 #x3C #x25) (emit-u32 buf #x10000DB8) (emit-bytes buf #x00)
+        (emit-jcc buf :e skip)                       ; threads not live
+        (emit-push buf 'rax)
+        (%ssg-load-rax buf vtarget 0)
+        (emit-push buf 'rax)
+        (%ssg-load-rax buf vvalue 8)
+        (emit-push buf 'rax)
+        (emit-call buf g)
+        (emit-bytes buf #x48 #x83 #xC4 #x10)         ; add rsp, 16
+        (emit-pop buf 'rax)
+        (emit-label buf skip)))))
+
 (defun emit-syscall-gc-safe (buf park-label)
   "A `syscall' that a stop-the-world collection can see past.  Without
    PARK-LABEL (every image but the hosted threaded one) it is the bare
@@ -1088,7 +1182,9 @@
   ;; HOSTED THREADED IMAGE: this unit's copy of the stop-the-world PARK stub
   ;; (emit-park-stub).  YIELD polls and blocking syscalls call it while a
   ;; region-0 collection has the world stopped.  NIL everywhere else.
-  (park-label nil))
+  (park-label nil)
+  ;; HOSTED THREADED IMAGE: this unit's SHARED-STORE GUARD subroutine.
+  (ssg-label nil))
 
 (defun ensure-label-at (state mvm-pos)
   "Ensure a label exists for MVM bytecode position MVM-POS.
@@ -3205,6 +3301,7 @@
                 (vs (second operands))
                 (pd (vreg-phys vd))
                 (ps (vreg-phys vs)))
+           (emit-shared-store-guard buf state vd vs)
            (cond
              ((and pd ps)
               (emit-mov-mem-reg buf pd ps -1))
@@ -3233,6 +3330,7 @@
                 (vs (second operands))
                 (pd (vreg-phys vd))
                 (ps (vreg-phys vs)))
+           (emit-shared-store-guard buf state vd vs)
            (cond
              ((and pd ps)
               (emit-mov-mem-reg buf pd ps 7))
@@ -4157,6 +4255,8 @@
          (let* ((vobj (first operands))
                 (idx (second operands))
                 (vs (third operands)))
+           (unless (= vobj +vreg-vfp+)
+             (emit-shared-store-guard buf state vobj vs))
            (if (= vobj +vreg-vfp+)
                ;; Frame slot store: use safe RBP-relative offset below spill area
                (let ((ps (vreg-phys vs)))
@@ -4314,6 +4414,7 @@
          (let* ((vobj (first operands))
                 (vidx (second operands))
                 (vs (third operands)))
+           (emit-shared-store-guard buf state vobj vs)
            ;; Compute address in scratch: Vidx*4
            (let ((pidx (vreg-phys vidx)))
              (if pidx
@@ -8476,6 +8577,7 @@
          ;; stays a NOP and the Linux image is byte-identical.
          (yield-longjmp-lbl (unless *x64-linux-mode* (make-label)))
          (park-lbl (when (x64-stw-p) (make-label)))
+         (ssg-lbl (when (x64-stw-p) (make-label)))
          ;; Find %GC-COLLECT function in the table (if present)
          (gc-collect-entry (when *x64-gc-enabled*
                              (find "%GC-COLLECT" function-table
@@ -8530,7 +8632,8 @@
                               :handler-push-label handler-push-lbl
                               :handler-pop-label handler-pop-lbl
                               :yield-longjmp-label yield-longjmp-lbl
-                              :park-label park-lbl)))
+                              :park-label park-lbl
+                              :ssg-label ssg-lbl)))
                  ;; Align THIS function's entry.  The tail alignment below only
                  ;; aligns SUBSEQUENT functions; without a head alignment the
                  ;; FIRST emitted function starts at whatever code-position the
@@ -8637,7 +8740,9 @@
         (emit-yield-longjmp-stub buf yield-longjmp-lbl handler-pop-lbl))
       ;; HOSTED THREADED: the stop-the-world park stub (see emit-park-stub).
       (when park-lbl
-        (emit-park-stub buf park-lbl)))
+        (emit-park-stub buf park-lbl))
+      (when ssg-lbl
+        (emit-shared-store-guard-sub buf ssg-lbl)))
 
     ;; Resolve all label fixups
     (fixup-labels buf)

@@ -2636,10 +2636,25 @@
   (let ((n (mem-ref #x10000FB0 :u32)))
     (unless (= n (mem-ref #x10000FB8 :u32))
       (setf (mem-ref #x10000FB8 :u32) n)
-      (let ((c (make-array 2)))
-        (aset c 0 *%sig-type-error-sym*)
-        (aset c 1 nil)
-        (setq *current-condition* c))))
+      ;; THE SHARED-STORE GUARD (translate-x64) marks its trap in this
+      ;; thread's window word +0x5058 before faulting; the word is outside
+      ;; the range the compiler can prove per-thread, so address it through
+      ;; the self slot (0 on main, where the absolute word is unused).
+      (let* ((lo (mem-ref #x10000C30 :u32))
+             (hi (mem-ref #x10000C34 :u32))
+             (self (if (= hi 0) lo (+ (* (* hi 65536) 65536) lo)))
+             (m (+ self #x10005058)))
+        (if (and (> self 0) (= (%gc-read64 m) 1))
+            (progn
+              (%gc-write64 m 0)
+              (setq *current-condition*
+                    (make-condition 'simple-error
+                                    :format-control "modus: a thread stored one of its own objects into shared memory. Threads share no state -- pass the value as a message (or allocate shared data under the runtime lock); the store was refused."
+                                    :format-arguments nil)))
+            (let ((c (make-array 2)))
+              (aset c 0 *%sig-type-error-sym*)
+              (aset c 1 nil)
+              (setq *current-condition* c))))))
   nil)
 
 (defun %signal-type-error ()

@@ -45,9 +45,8 @@
   (setq *list* acc))
 (setq *vec* (make-array 200))
 (dotimes (i 200) (setf (aref *vec* i) (make-string (+ 1 (mod i 17)) :initial-element #\x)))
-;; Made by a DEFUN, not a toplevel LET: a closure that escapes a toplevel form
-;; is uncallable once the form returns (x64 and aarch64 alike, before any
-;; thread exists) — a separate JIT bug this test must not trip over.
+;; Main's closure, run by the MVM interpreter on every worker: the case that
+;; found stop-the-world must not park at loop back-edges.
 (defun make-adder (k) (lambda (x) (+ x k)))
 (setq *fn* (make-adder 7))
 

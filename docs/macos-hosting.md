@@ -662,10 +662,16 @@ is the shape.
 interpreted closure while main collects region 0.  It requires at least three
 such collections during the run and no bad traversal.
 
-**A separate bug it tripped:** a closure that escapes a top-level `LET`
-(`(setq *fn* (let ((k 7)) (lambda (x) (+ x k))))`) cannot be called once the
-form has returned.  This happens on x86-64 and AArch64 alike, single-threaded.
-The test makes its closure with a DEFUN instead.
+**A separate bug it tripped, now fixed:** a lambda SETQ'd into a global
+(`(setq *fn* (let ((k 7)) (lambda (x) (+ x k))))`) could not be called from a
+later form, on x86-64 and AArch64 alike.
+- A SETQ of a global whose cell is known stores in place, with no bridge call.
+- Only the bridge call wraps an in-module lambda in a native trampoline.
+- So the raw closure, whose slot 0 is its module's bytecode offset, outlived
+  its module.
+
+Now only a fixnum or NIL is stored in place, and anything else takes the
+`%GV-SET` call (`test/setq-closure-escape.lisp`).
 
 ## Open questions
 

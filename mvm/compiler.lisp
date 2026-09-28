@@ -11530,6 +11530,21 @@
            (emit-ir :li zed 0)
            (emit-ir :cmp tmp zed)
            (emit-ir :bne slow)
+           ;; ONLY A FIXNUM OR NIL IS STORED IN PLACE.  Anything else may be,
+           ;; or hold, an in-module lambda (a #x52 closure whose slot 0 is
+           ;; THIS module's bytecode offset), and only the %GV-SET bridge call
+           ;; wraps that in a native trampoline.  Stored raw, it outlived the
+           ;; module: `(setq *fn* (let ((k 7)) (lambda (x) (+ x k))))' and a
+           ;; later form's (funcall *fn* 1) jumped to the offset (x64 and
+           ;; aarch64 alike).  Counters and flags keep the fast path.
+           (let ((fast (make-compiler-label)))
+             (emit-ir :li zed 1)
+             (emit-ir :test dest zed)
+             (emit-ir :beq fast)
+             (emit-ir :mov zed +vreg-vn+)
+             (emit-ir :cmp dest zed)
+             (emit-ir :bne slow)
+             (emit-ir-label fast))
            (emit-ir :li-const tmp (%e2-const-register cell))
            (emit-ir :setcdr tmp dest)
            (emit-ir :br done)

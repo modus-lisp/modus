@@ -267,7 +267,12 @@ $SSH '(reel-demo-pass 4)'   # -> (FRAMES n TOTAL-MS t DECODE-MS d FPS f)
      trampolines), push `demo-forms.txt`, `hvs-all-forms.txt`,
      `reel-hvs-forms.txt`, `(init)`, and fetch the clip(s) into memory with
      `reel-demo-load` / `rh-load`. Everything that needs the network happens
-     here.
+     here.  `(rh-init)` now ends by painting `rh-pattern` — eight luma bars
+     (16..235) with a checker strip along the top, U=V=128, full screen — so
+     the monitor shows something the moment the plane is up instead of
+     looking hung; a tint on the bars is the chroma bug, not the pattern.
+     `rh-plane-words` / `rh-show-plane` are the factored plane builder
+     `rh-yuv-plane` and `rh-pattern` share.
   2. **Then over serial** (nothing needs the network any more):
      `(setq *jit-hot-only* nil)`, `(jit-eager)` — natively compiles every
      registered reel DEFUN (the trampoline registry), the ~16 min the install

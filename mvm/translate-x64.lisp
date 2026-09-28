@@ -102,6 +102,426 @@
              (emit-mov-reg-abs buf reg #x10000C30))
       (emit-mov-reg-imm buf reg 0)))
 
+;;; ============================================================
+;;; STOP THE WORLD FOR REGION 0 (hosted threaded image)
+;;; ============================================================
+;;;
+;;; Region 0 is the heap every thread READS: symbols, the globals table, the
+;;; closures and lock objects main made and handed to workers.  Its Cheney
+;;; collector moved those objects while workers were running with pointers to
+;;; them in their registers and on their stacks, which nothing scanned -- the
+;;; precondition net/hosted-sync.lisp stated and left open ("REGION 0 MUST NOT
+;;; COLLECT WHILE THIS IS IN USE").  Measured: three readers walking a shared
+;;; list while main forced region-0 collections SIGSEGV'd 4 runs of 4.
+;;;
+;;; THE PROTOCOL.  One global STOP word.  A region-0 collector XCHGs it to 1
+;;; (or, finding it already 1, parks and retries: another collector owns the
+;;; world), then waits until every other live thread is either PARKED or in a
+;;; SYSCALL, scans each one's published stack window [its RSP, its stack top),
+;;; its dynamic bindings and the saved RBX of its handler frames as extra roots,
+;;; collects, and clears STOP with a futex wake.  Each thread's STATE and RSP
+;;; are per-thread words in the FS window (0 running, 1 in a syscall, 2 parked):
+;;; a worker's live in its 32 KB window block (+0x5000/+0x5008), main's at the
+;;; same literal addresses in BSS.  Threads stop only at SAFE POINTS:
+;;;   - YIELD, at every loop back-edge: `cmp [STOP],0 / call park'.
+;;;   - the generic syscall traps: registers pushed and RSP published before
+;;;     the kernel is entered, so a thread blocked in a futex, a sleep or a read
+;;;     is already stopped; on the way out it checks STOP before popping.
+;;; Both XCHG their STATE (a full fence) and the collector XCHGs STOP, so the
+;;; store-then-load on each side is ordered (Dekker).
+(defconstant +stw-state-addr+ #x10005000
+  "FS-relative per-thread word: 0 running, 1 in a syscall, 2 parked.")
+(defconstant +stw-rsp-addr+ #x10005008
+  "FS-relative per-thread word: the RSP a parked / in-syscall thread published.")
+(defconstant +stw-clone-tls-addr+ #x10005020
+  "ABSOLUTE global word: the FS base the next cloned thread is born with (the
+   spawner writes it under the spawn lock), 0 = none.")
+(defconstant +stw-stop-addr+ #x10005018
+  "ABSOLUTE global word: 1 while a region-0 collection has the world stopped.")
+
+(defun x64-stw-p ()
+  "True in the image whose threads can run Lisp: hosted Linux with the
+   per-thread window.  Everything else stays byte-identical."
+  (and *x64-linux-mode* *x64-tls-window*))
+
+(defun emit-abs32 (buf addr) (emit-u32 buf addr))
+
+(defun emit-cmp-abs64-zero (buf addr)
+  "cmp qword [ADDR], 0   (absolute, no segment)"
+  (emit-bytes buf #x48 #x83 #x3C #x25) (emit-abs32 buf addr) (emit-bytes buf #x00))
+
+(defun emit-fs-xchg-abs-r11 (buf addr)
+  "xchg fs:[ADDR], r11"
+  (emit-bytes buf #x64 #x4C #x87 #x1C #x25) (emit-abs32 buf addr))
+
+(defun emit-fs-xchg-abs-rcx (buf addr)
+  "xchg fs:[ADDR], rcx"
+  (emit-bytes buf #x64 #x48 #x87 #x0C #x25) (emit-abs32 buf addr))
+
+(defun emit-fs-store-rsp (buf addr)
+  "mov fs:[ADDR], rsp"
+  (emit-bytes buf #x64 #x48 #x89 #x24 #x25) (emit-abs32 buf addr))
+
+(defun emit-futex-stop (buf op val)
+  "futex(&STOP, OP, VAL, NULL) -- clobbers rax rcx rdx rsi rdi r10 r11."
+  (emit-bytes buf #xBF) (emit-abs32 buf +stw-stop-addr+)   ; mov edi, STOP
+  (emit-bytes buf #xBE) (emit-u32 buf op)                  ; mov esi, op
+  (emit-bytes buf #xBA) (emit-u32 buf val)                 ; mov edx, val
+  (emit-bytes buf #x45 #x31 #xD2)                          ; xor r10d, r10d
+  (emit-bytes buf #xB8 #xCA #x00 #x00 #x00)                ; mov eax, 202
+  (emit-bytes buf #x0F #x05))                              ; syscall
+
+(defparameter *stw-park-regs*
+  '(rax rcx rdx rbx rbp rsi rdi r8 r9 r10 r11 r12 r13 r14 r15))
+
+(defun emit-park-stub (buf label)
+  "The PARK stub: push every register (so all of them sit inside the window
+   the collector scans, and come back FORWARDED), publish RSP, mark this
+   thread parked, futex-wait on STOP until it clears, mark running, and
+   re-check STOP before popping (a collector may have started between the
+   check and the mark)."
+  (let ((again (make-label)) (wait (make-label)) (leave (make-label)))
+    (emit-label buf label)
+    (dolist (r *stw-park-regs*) (emit-push buf r))
+    (emit-fs-store-rsp buf +stw-rsp-addr+)
+    (emit-label buf again)
+    (emit-bytes buf #xB9 #x02 #x00 #x00 #x00)       ; mov ecx, 2
+    (emit-fs-xchg-abs-rcx buf +stw-state-addr+)
+    (emit-label buf wait)
+    (emit-cmp-abs64-zero buf +stw-stop-addr+)
+    (emit-jcc buf :e leave)
+    (emit-futex-stop buf 128 1)                      ; FUTEX_WAIT_PRIVATE, 1
+    (emit-jmp buf wait)
+    (emit-label buf leave)
+    (emit-bytes buf #x31 #xC9)                       ; xor ecx, ecx
+    (emit-fs-xchg-abs-rcx buf +stw-state-addr+)
+    (emit-cmp-abs64-zero buf +stw-stop-addr+)
+    (emit-jcc buf :ne again)
+    (dolist (r (reverse *stw-park-regs*)) (emit-pop buf r))
+    (emit-bytes buf #xC3)))
+
+(defun emit-syscall-gc-safe (buf park-label)
+  "A `syscall' that a stop-the-world collection can see past.  Without
+   PARK-LABEL (every image but the hosted threaded one) it is the bare
+   instruction.  With it: push the registers the trap did not already save,
+   publish RSP, STATE := in-syscall, syscall, STATE := running, and if a
+   collection is in progress park (keeping the result and the argument
+   registers) before popping -- the collector may be rewriting the pushed words.
+   RCX and R11 are free: SYSCALL itself destroys them."
+  (if (null park-label)
+      (emit-bytes buf #x0F #x05)
+      (let ((done (make-label)))
+        (dolist (r '(rbx rbp r12 r13 r14 r15)) (emit-push buf r))
+        (emit-fs-store-rsp buf +stw-rsp-addr+)
+        (emit-bytes buf #x41 #xBB #x01 #x00 #x00 #x00)  ; mov r11d, 1
+        (emit-fs-xchg-abs-r11 buf +stw-state-addr+)
+        (emit-bytes buf #x0F #x05)                        ; syscall
+        (emit-bytes buf #x45 #x31 #xDB)                   ; xor r11d, r11d
+        (emit-fs-xchg-abs-r11 buf +stw-state-addr+)
+        (emit-cmp-abs64-zero buf +stw-stop-addr+)
+        (emit-jcc buf :e done)
+        (dolist (r '(rax rdi rsi rdx r8 r9 r10)) (emit-push buf r))
+        (emit-call buf park-label)
+        (dolist (r (reverse '(rax rdi rsi rdx r8 r9 r10))) (emit-pop buf r))
+        (emit-label buf done)
+        (dolist (r (reverse '(rbx rbp r12 r13 r14 r15))) (emit-pop buf r)))))
+
+;;; The thread table (net/hosted-sync.lisp): its page's RAW address in BSS
+;;; 0x10000DA8, the table at +0x13000, 16 records of 0x80 from +0x100:
+;;;   +0x00 state (1 live)  +0x08 tid (u32, 0 = gone)  +0x10 stack base
+;;;   +0x18 stack size      +0x38 FS segment base (0 until the window is set)
+(defconstant +stw-thr-page-slot+ #x10000DA8)
+(defconstant +stw-max-slots+ 16)
+
+(defun emit-stw-load-table (buf reg skip-label)
+  "REG := the thread table's address, or jump to SKIP-LABEL if there is none."
+  (emit-mov-reg-imm buf reg +stw-thr-page-slot+)
+  (emit-mov-reg-mem buf reg reg 0)
+  (emit-cmp-reg-imm buf reg 0)
+  (emit-jcc buf :e skip-label)
+  (emit-add-reg-imm buf reg #x13000))
+
+(defun emit-stw-stop-subroutine (buf label park-label)
+  "Take the world for a region-0 collection.  Called on the collector's entry
+   with only RBP (the scan start) and R15 live; clobbers RAX RSI R8 R11 R12 R14
+   (R12/R14 are rebuilt from the metadata at the end of every collection).
+   A no-op unless threads are live and region 0 is the active region."
+  (let ((ret (make-label)) (try (make-label)) (acquired (make-label))
+        (skip-main (make-label)) (wm (make-label)) (lp (make-label))
+        (next (make-label)) (haveseg (make-label)) (done (make-label)))
+    (emit-label buf label)
+    ;; threads live?
+    (emit-bytes buf #x83 #x3C #x25) (emit-abs32 buf #x10000DB8) (emit-bytes buf #x00)
+    (emit-jcc buf :e ret)
+    ;; region 0 collecting?
+    (emit-load-gc-region buf 'rax)
+    (emit-cmp-reg-imm buf 'rax modus.mvm::+gc-region-0-base+)
+    (emit-jcc buf :ne ret)
+    (emit-label buf try)
+    (emit-bytes buf #xB8 #x01 #x00 #x00 #x00)        ; mov eax, 1
+    (emit-bytes buf #x48 #x87 #x04 #x25) (emit-abs32 buf +stw-stop-addr+) ; xchg [STOP], rax
+    (emit-bytes buf #x48 #x85 #xC0)                  ; test rax, rax
+    (emit-jcc buf :e acquired)
+    (emit-call buf park-label)                       ; another collector owns it
+    (emit-jmp buf try)
+    (emit-label buf acquired)
+    (emit-stw-load-table buf 'r11 done)
+    ;; r14 = my segment base (0 on main)
+    (emit-bytes buf #x64 #x4C #x8B #x34 #x25) (emit-abs32 buf #x10000C30)
+    (emit-cmp-reg-imm buf 'r14 0)
+    (emit-jcc buf :e skip-main)
+    (emit-label buf wm)                              ; a worker collecting: stop main
+    (emit-cmp-abs64-zero buf +stw-state-addr+)
+    (emit-jcc buf :ne skip-main)
+    (emit-bytes buf #xF3 #x90)                       ; pause
+    (emit-jmp buf wm)
+    (emit-label buf skip-main)
+    (emit-mov-reg-reg buf 'r12 'r11)
+    (emit-add-reg-imm buf 'r12 #x180)                ; record 1
+    (emit-bytes buf #x41 #xB8) (emit-u32 buf (- +stw-max-slots+ 1)) ; mov r8d, 15
+    (emit-label buf lp)
+    (emit-mov-reg-mem buf 'rax 'r12 0)
+    (emit-cmp-reg-imm buf 'rax 1)
+    (emit-jcc buf :ne next)                          ; not live
+    (emit-bytes buf #x41 #x8B #x44 #x24 #x08)        ; mov eax, [r12+8]  (tid)
+    (emit-bytes buf #x85 #xC0)                       ; test eax, eax
+    (emit-jcc buf :e next)                           ; exited
+    (emit-mov-reg-mem buf 'rsi 'r12 #x38)
+    (emit-cmp-reg-reg buf 'rsi 'r14)
+    (emit-jcc buf :e next)                           ; that is me
+    (emit-cmp-reg-imm buf 'rsi 0)
+    (emit-jcc buf :ne haveseg)
+    (emit-bytes buf #xF3 #x90)                       ; not started yet: re-check
+    (emit-jmp buf lp)
+    (emit-label buf haveseg)
+    (emit-mov-reg-mem buf 'rax 'rsi +stw-state-addr+)
+    (emit-cmp-reg-imm buf 'rax 0)
+    (emit-jcc buf :ne next)                          ; parked / in a syscall
+    (emit-bytes buf #xF3 #x90)
+    (emit-jmp buf lp)
+    (emit-label buf next)
+    (emit-add-reg-imm buf 'r12 #x80)
+    (emit-sub-reg-imm buf 'r8 1)
+    (emit-cmp-reg-imm buf 'r8 0)
+    (emit-jcc buf :g lp)
+    (emit-label buf done)
+    (emit-label buf ret)
+    (emit-bytes buf #xC3)))
+
+(defun emit-stw-scan-range (buf scan-word-label)
+  "Scan [RDI, R10) word by word.  RDI/R10 survive scan_word."
+  (let ((l (make-label)) (d (make-label)))
+    (emit-label buf l)
+    (emit-cmp-reg-reg buf 'rdi 'r10)
+    (emit-jcc buf :ae d)
+    (emit-mov-reg-reg buf 'rax 'rdi)
+    (emit-call buf scan-word-label)
+    (emit-add-reg-imm buf 'rdi 8)
+    (emit-jmp buf l)
+    (emit-label buf d)))
+
+(defun emit-stw-scan-handler-rbx (buf seg-reg scan-word-label)
+  "Scan the saved RBX of every handler frame of the thread whose segment base
+   is SEG-REG (a longjmp restores it), plus the armed frame's.  Frames are at
+   seg+0x10001000 + i*32, RBX at +24, depth (raw) at seg+0x10000400."
+  ;; SEG-REG may be one scan_word clobbers (RSI): read everything derived from
+  ;; it BEFORE the first call, and keep the base on the stack for the armed
+  ;; frame's slot, scanned last.
+  (let ((l (make-label)) (d (make-label)))
+    (emit-push buf seg-reg)
+    (emit-mov-reg-mem buf 'r10 seg-reg #x10000400)   ; depth
+    (emit-mov-reg-reg buf 'rdi seg-reg)
+    (emit-add-reg-imm buf 'rdi (+ #x10001000 24))
+    (emit-label buf l)
+    (emit-cmp-reg-imm buf 'r10 0)
+    (emit-jcc buf :le d)
+    (emit-mov-reg-reg buf 'rax 'rdi)
+    (emit-call buf scan-word-label)
+    (emit-add-reg-imm buf 'rdi 32)
+    (emit-sub-reg-imm buf 'r10 1)
+    (emit-jmp buf l)
+    (emit-label buf d)
+    (emit-pop buf 'rax)
+    (emit-add-reg-imm buf 'rax #x10000198)
+    (emit-call buf scan-word-label)))
+
+(defun emit-stw-scan-subroutine (buf label scan-word-label)
+  "Scan every STOPPED thread's roots.  Called after the collector's own roots
+   and before the Cheney loop, with RBX/RCX/R13/RBP live; clobbers RAX RSI R8
+   R9 RDI R10 R11 R12 R14.  A no-op unless this collection took the world."
+  (let ((ret (make-label)) (skip-main (make-label)) (lp (make-label))
+        (next (make-label)) (dbl (make-label)) (dbd (make-label))
+        (dbin (make-label)) (dbgo (make-label)))
+    (emit-label buf label)
+    (emit-cmp-abs64-zero buf +stw-stop-addr+)
+    (emit-jcc buf :e ret)
+    (emit-stw-load-table buf 'r11 ret)
+    (emit-bytes buf #x64 #x4C #x8B #x34 #x25) (emit-abs32 buf #x10000C30) ; r14 = my seg
+    (emit-cmp-reg-imm buf 'r14 0)
+    (emit-jcc buf :e skip-main)
+    ;; MAIN, stopped by a worker: its stack up to region 0's stack_base.
+    (emit-mov-reg-imm buf 'rdi +stw-rsp-addr+)
+    (emit-mov-reg-mem buf 'rdi 'rdi 0)
+    (emit-mov-reg-imm buf 'r10 modus.mvm::+gc-region-0-base+)
+    (emit-mov-reg-mem buf 'r10 'r10 modus.mvm::+gc-off-stack-base+)
+    (emit-stw-scan-range buf scan-word-label)
+    (emit-bytes buf #x45 #x31 #xE4)                  ; xor r12d, r12d (seg 0)
+    (emit-stw-scan-handler-rbx buf 'r12 scan-word-label)
+    (emit-label buf skip-main)
+    (emit-mov-reg-reg buf 'r12 'r11)
+    (emit-add-reg-imm buf 'r12 #x180)                ; record 1
+    (emit-label buf lp)
+    ;; stop after record 15: r12 - r11 > 0x100 + 15*0x80
+    (emit-mov-reg-reg buf 'rax 'r12)
+    (emit-sub-reg-reg buf 'rax 'r11)
+    (emit-cmp-reg-imm buf 'rax (+ #x100 (* (- +stw-max-slots+ 1) #x80)))
+    (emit-jcc buf :g ret)
+    (emit-mov-reg-mem buf 'rax 'r12 0)
+    (emit-cmp-reg-imm buf 'rax 1)
+    (emit-jcc buf :ne next)
+    (emit-bytes buf #x41 #x8B #x44 #x24 #x08)        ; mov eax, [r12+8]
+    (emit-bytes buf #x85 #xC0)
+    (emit-jcc buf :e next)
+    (emit-mov-reg-mem buf 'rsi 'r12 #x38)
+    (emit-cmp-reg-imm buf 'rsi 0)
+    (emit-jcc buf :e next)
+    (emit-cmp-reg-reg buf 'rsi 'r14)
+    (emit-jcc buf :e next)
+    ;; its stack: [published RSP, stack base + size)
+    (emit-mov-reg-mem buf 'rdi 'rsi +stw-rsp-addr+)
+    (emit-mov-reg-mem buf 'r10 'r12 #x10)
+    (emit-mov-reg-mem buf 'rax 'r12 #x18)
+    (emit-add-reg-reg buf 'r10 'rax)
+    (emit-stw-scan-range buf scan-word-label)
+    ;; its HEAP: the live part of its own region.  A worker's objects point
+    ;; into region 0 all the time (a list of symbols, a closure over a lock),
+    ;; and nothing else would update them.  Live = [from_start, alloc_ptr);
+    ;; the alloc pointer is the R12 the park stub / syscall wrapper pushed, at
+    ;; [published RSP + 24] in both.  If that is not inside the region (the
+    ;; thread was in a locked section, allocating in its arena slice) the
+    ;; region's own PARKED pointer (+0x30) is current instead; failing both,
+    ;; the whole semispace.
+    (let ((have (make-label)) (try30 (make-label)) (whole (make-label))
+          (lgo (make-label)) (none (make-label)))
+      (emit-mov-reg-mem buf 'rsi 'r12 #x40)            ; rsi = its RCB
+      (emit-cmp-reg-imm buf 'rsi 0)
+      (emit-jcc buf :e none)
+      (emit-mov-reg-mem buf 'rdi 'rsi modus.mvm::+gc-off-from-start+)
+      (emit-mov-reg-mem buf 'r9 'rsi modus.mvm::+gc-off-space-size+)
+      (emit-add-reg-reg buf 'r9 'rdi)                  ; r9 = from_end
+      (emit-mov-reg-mem buf 'rax 'r12 #x38)            ; its segment base
+      (emit-mov-reg-mem buf 'rax 'rax +stw-rsp-addr+)  ; its published RSP
+      (emit-mov-reg-mem buf 'r10 'rax 24)              ; its pushed R12
+      (emit-cmp-reg-reg buf 'r10 'rdi)
+      (emit-jcc buf :b try30)
+      (emit-cmp-reg-reg buf 'r10 'r9)
+      (emit-jcc buf :be lgo)
+      (emit-label buf try30)
+      (emit-mov-reg-mem buf 'r10 'rsi #x30)            ; parked alloc ptr
+      (emit-cmp-reg-reg buf 'r10 'rdi)
+      (emit-jcc buf :b whole)
+      (emit-cmp-reg-reg buf 'r10 'r9)
+      (emit-jcc buf :be lgo)
+      (emit-label buf whole)
+      (emit-mov-reg-reg buf 'r10 'r9)
+      (emit-label buf lgo)
+      (emit-stw-scan-range buf scan-word-label)
+      (emit-label buf none))
+    ;; its handler frames' saved RBX
+    (emit-mov-reg-mem buf 'rsi 'r12 #x38)
+    (emit-stw-scan-handler-rbx buf 'rsi scan-word-label)
+    ;; its dynamic bindings (layout: emit-dynbind-root-scan)
+    (emit-mov-reg-mem buf 'rsi 'r12 #x38)
+    (emit-mov-reg-mem buf 'r10 'rsi #x10000C58)       ; tagged depth
+    (emit-shr-reg-imm buf 'r10 1)
+    (emit-cmp-reg-imm buf 'r10 0)
+    (emit-jcc buf :le dbd)
+    (emit-mov-reg-mem buf 'rax 'rsi #x10000C60)       ; tagged stack base
+    (emit-shr-reg-imm buf 'rax 1)
+    (emit-cmp-reg-imm buf 'rax 0)
+    (emit-jcc buf :e dbin)
+    (emit-mov-reg-reg buf 'rdi 'rax)
+    (emit-add-reg-imm buf 'rdi 8)
+    (emit-jmp buf dbgo)
+    (emit-label buf dbin)
+    (emit-mov-reg-reg buf 'rdi 'rsi)
+    (emit-add-reg-imm buf 'rdi #x10000C78)
+    (emit-label buf dbgo)
+    (emit-label buf dbl)
+    (emit-mov-reg-reg buf 'rax 'rdi)
+    (emit-call buf scan-word-label)
+    (emit-add-reg-imm buf 'rdi 16)
+    (emit-sub-reg-imm buf 'r10 1)
+    (emit-cmp-reg-imm buf 'r10 0)
+    (emit-jcc buf :g dbl)
+    (emit-label buf dbd)
+    (emit-label buf next)
+    (emit-add-reg-imm buf 'r12 #x80)
+    (emit-jmp buf lp)
+    (emit-label buf ret)
+    (emit-bytes buf #xC3)))
+
+(defun emit-stw-resume-subroutine (buf label)
+  "Give the world back: STOP := 0 and wake every parked thread.  Preserves
+   every register (the collector's epilogue follows)."
+  (let ((ret (make-label)))
+    (emit-label buf label)
+    (emit-cmp-abs64-zero buf +stw-stop-addr+)
+    (emit-jcc buf :e ret)
+    (dolist (r '(rax rcx rdx rsi rdi r10 r11)) (emit-push buf r))
+    (emit-bytes buf #x31 #xC0)                       ; xor eax, eax
+    (emit-bytes buf #x48 #x87 #x04 #x25) (emit-abs32 buf +stw-stop-addr+) ; xchg [STOP], rax
+    (emit-futex-stop buf 129 #x7FFFFFFF)             ; FUTEX_WAKE_PRIVATE, all
+    (dolist (r (reverse '(rax rcx rdx rsi rdi r10 r11))) (emit-pop buf r))
+    (emit-label buf ret)
+    (emit-bytes buf #xC3)))
+
+(defconstant +x64-lock-arena-words-slot+ #x10000D98
+  "BSS word holding the RAW address of the lock arena's bound words (base at
+   +0, frontier at +8 -- net/hosted-sync.lisp %RT-ARENA-WORDS), or 0 before
+   %RT-ARENA-CARVE has run.  Nothing else in the tree uses this word.")
+
+(defun emit-lock-arena-root-scan (buf scan-word-label)
+  "Scan the LOCK ARENA as a root range when the collection is region 0's.
+
+   The arena (net/hosted-sync.lisp, B-LITE) is region-0 address space carved
+   off the top of the semispace, never collected and never moved: everything a
+   thread allocates under %RT-ENTER lands there -- symbols a worker interned,
+   globals-table entries created while threads are live, package indexes.
+   Those objects point INTO region 0, and region 0's collector did not know the
+   arena existed, so a region-0 flip left every such pointer at the OLD
+   from-space (measured: 74 of 74 arena words stale after one flip; two flips
+   and the loader's own READ died).  Here each word of [base, frontier) goes
+   through scan_word, which forwards exactly the words that point into THIS
+   collection's from-space and passes over everything else -- conservative in
+   the same way the stack scan is.  Gated on region 0 (RBX, the from-space
+   being evacuated, equals region 0's from_start): a worker region's arena
+   references are forbidden anyway and its collections should not pay for the
+   walk.  RDI/R10 are the loop registers because scan_word/copy_object
+   preserve them.  Emitted only in the hosted threaded image; everything else
+   stays byte-identical."
+  (when (and *x64-linux-mode* *x64-tls-window*)
+    (let ((ar-loop (make-label))
+          (ar-done (make-label)))
+      (emit-mov-reg-imm buf 'rax +x64-lock-arena-words-slot+)
+      (emit-mov-reg-mem buf 'rax 'rax 0)             ; rax = arena words addr
+      (emit-cmp-reg-imm buf 'rax 0)
+      (emit-jcc buf :e ar-done)                      ; no arena yet
+      (emit-mov-reg-imm buf 'rsi modus.mvm::+gc-region-0-base+)
+      (emit-mov-reg-mem buf 'rsi 'rsi modus.mvm::+gc-off-from-start+)
+      (emit-cmp-reg-reg buf 'rsi 'rbx)
+      (emit-jcc buf :ne ar-done)                     ; not region 0
+      (emit-mov-reg-mem buf 'rdi 'rax 0)             ; rdi = arena base
+      (emit-mov-reg-mem buf 'r10 'rax 8)             ; r10 = arena frontier
+      (emit-label buf ar-loop)
+      (emit-cmp-reg-reg buf 'rdi 'r10)
+      (emit-jcc buf :ae ar-done)
+      (emit-mov-reg-reg buf 'rax 'rdi)
+      (emit-call buf scan-word-label)
+      (emit-add-reg-imm buf 'rdi 8)
+      (emit-jmp buf ar-loop)
+      (emit-label buf ar-done))))
+
 (defun emit-dynbind-root-scan (buf scan-word-label)
   "Scan THIS THREAD's dynamic-binding stack as a precise root set.
 
@@ -664,7 +1084,11 @@
   ;; stub clears the flag and performs the standard longjmp through the
   ;; innermost armed handler-case — at a SAFE POINT (loop back-edge), never
   ;; mid-intern/mid-alloc/mid-GC the way the old ISR-side longjmp did.
-  (yield-longjmp-label nil))
+  (yield-longjmp-label nil)
+  ;; HOSTED THREADED IMAGE: this unit's copy of the stop-the-world PARK stub
+  ;; (emit-park-stub).  YIELD polls and blocking syscalls call it while a
+  ;; region-0 collection has the world stopped.  NIL everywhere else.
+  (park-label nil))
 
 (defun ensure-label-at (state mvm-pos)
   "Ensure a label exists for MVM bytecode position MVM-POS.
@@ -962,7 +1386,7 @@
               (emit-bytes buf #x4C #x89 #xCA)   ; mov rdx, r9
               (emit-bytes buf #x48 #xD1 #xFA)   ; sar rdx, 1
               ;; syscall
-              (emit-bytes buf #x0F #x05)         ; syscall
+              (emit-syscall-gc-safe buf (translate-state-park-label state))         ; syscall
               ;; Tag result → V0 (RSI)
               (emit-bytes buf #x48 #x01 #xC0)   ; add rax, rax
               (emit-bytes buf #x48 #x89 #xC6)   ; mov rsi, rax
@@ -991,7 +1415,7 @@
               ;; rdx = V3 (arg3, raw)
               (emit-bytes buf #x4C #x89 #xCA)   ; mov rdx, r9
               ;; syscall
-              (emit-bytes buf #x0F #x05)         ; syscall
+              (emit-syscall-gc-safe buf (translate-state-park-label state))         ; syscall
               ;; Result → V0 (RSI), raw
               (emit-bytes buf #x48 #x89 #xC6)   ; mov rsi, rax
               ;; Restore
@@ -1028,7 +1452,7 @@
               (emit-bytes buf #x49 #xD1 #xFA)       ; sar r10, 1
               (emit-bytes buf #x49 #xD1 #xF8)       ; sar r8, 1
               (emit-bytes buf #x49 #xD1 #xF9)       ; sar r9, 1
-              (emit-bytes buf #x0F #x05)            ; syscall
+              (emit-syscall-gc-safe buf (translate-state-park-label state))            ; syscall
               (emit-bytes buf #x48 #x01 #xC0)       ; add rax, rax   (tag result)
               (emit-bytes buf #x48 #x89 #xC6)       ; mov rsi, rax   (result → V0)
               (emit-bytes buf #x41 #x5A)            ; pop r10
@@ -1179,7 +1603,18 @@
               (emit-bytes buf #x49 #x89 #xD2)       ; mov r10, rdx (child_tidptr)
               (emit-bytes buf #xBF)                 ; mov edi, imm32 (flags)
               (emit-u32 buf #x003D0F00)
-              (emit-bytes buf #x45 #x31 #xC0)       ; xor r8d, r8d  (tls: unused)
+              (if (x64-stw-p)
+                  ;; HOSTED THREADED: the child is born with ITS OWN window.
+                  ;; The spawner leaves the child's FS base in +STW-CLONE-TLS+
+                  ;; (net/hosted-sync.lisp); non-zero => CLONE_SETTLS with it,
+                  ;; so no instruction of the child ever runs on the spawner's
+                  ;; multiple values, nargs, handler frames or safepoint words.
+                  (progn
+                    (emit-bytes buf #x4C #x8B #x04 #x25) (emit-abs32 buf +stw-clone-tls-addr+) ; mov r8, [tls]
+                    (emit-bytes buf #x4D #x85 #xC0)       ; test r8, r8
+                    (emit-bytes buf #x74 #x06)            ; jz +6
+                    (emit-bytes buf #x81 #xCF #x00 #x00 #x08 #x00)) ; or edi, CLONE_SETTLS
+                  (emit-bytes buf #x45 #x31 #xC0))      ; xor r8d, r8d  (tls: unused)
               (emit-bytes buf #xB8 #x38 #x00 #x00 #x00) ; mov eax, 56 (SYS_clone)
               (emit-bytes buf #x0F #x05)            ; syscall
               (emit-bytes buf #x48 #x85 #xC0)       ; test rax, rax
@@ -4484,7 +4919,18 @@
          ;; abandon half-written global state (see emit-yield-longjmp-stub).
          (if (or *x64-linux-mode*
                  (null (translate-state-yield-longjmp-label state)))
-             (emit-nop buf)
+             (if (translate-state-park-label state)
+                 ;; HOSTED THREADED: the stop-the-world SAFEPOINT.  A loop
+                 ;; back-edge is a point where the registers hold what the
+                 ;; collector already accepts at an allocation site, so a
+                 ;; thread parked here is scannable.  One compare per
+                 ;; iteration when no collection is waiting.
+                 (let ((skip (make-label)))
+                   (emit-cmp-abs64-zero buf +stw-stop-addr+)
+                   (emit-jcc buf :e skip)
+                   (emit-call buf (translate-state-park-label state))
+                   (emit-label buf skip))
+                 (emit-nop buf))
              (let ((skip (make-label)))
                ;; cmp qword [0x10000D30], 0
                (emit-bytes buf #x48 #x83 #x3C #x25)
@@ -6084,7 +6530,12 @@
   ;; Labels for GC subroutines
   (let ((copy-label (make-label))      ; copy_object(RAX) -> RAX=new ptr, R13 advanced
         (scan-word-label (make-label))  ; scan_word(RAX=addr of word) -> update word, R13
-        (restore-label (make-label)))
+        (restore-label (make-label))
+        ;; STOP THE WORLD (hosted threaded image only; see emit-park-stub)
+        (stw-stop-label (when (x64-stw-p) (make-label)))
+        (stw-scan-label (when (x64-stw-p) (make-label)))
+        (stw-resume-label (when (x64-stw-p) (make-label)))
+        (stw-park-label (when (x64-stw-p) (make-label))))
 
     (emit-label buf gc-trampoline-label)
     (unless *x64-linux-mode*
@@ -6118,6 +6569,11 @@
     (emit-push buf 'rbp)
     ;; Save RSP for stack root scanning (after all pushes)
     (emit-bytes buf #x48 #x89 #xE5)              ; mov rbp, rsp  (save scan start)
+
+    ;; ---- STOP THE WORLD if this is region 0 with threads live, BEFORE any
+    ;; metadata is read: a collector that has to wait for another one reads
+    ;; the region's fields afresh afterwards.
+    (when stw-stop-label (emit-call buf stw-stop-label))
 
     ;; ---- THIS COLLECTION HAS BEGUN.  Say so, where two CPUs can both see it.
     (emit-gc-concurrency-enter buf)
@@ -6290,6 +6746,10 @@
       (emit-label buf mv-done))
     ;; THIS THREAD'S DYNAMIC BINDINGS — the other per-thread root set.
     (emit-dynbind-root-scan buf scan-word-label)
+    ;; THE LOCK ARENA, when region 0 is the region collecting.
+    (emit-lock-arena-root-scan buf scan-word-label)
+    ;; EVERY STOPPED THREAD'S ROOTS, when this collection took the world.
+    (when stw-scan-label (emit-call buf stw-scan-label))
     (emit-gc-dbg-char buf #x72)          ; 'r' — roots scan done (globals+kw+pkg+mv+dynbind)
 
     ;; ---- Cheney scan loop ----
@@ -6491,8 +6951,17 @@
     (emit-bytes buf #x48 #xFF #x46)               ; inc qword [rsi+disp8]
     (emit-byte buf modus.mvm::+gc-off-count+)
 
+    ;; ---- Give the world back (no-op unless this collection took it) ----
+    (when stw-resume-label (emit-call buf stw-resume-label))
     ;; ---- Restore registers ----
     (emit-jmp buf restore-label)
+
+    ;; STOP-THE-WORLD subroutines (hosted threaded image only)
+    (when stw-stop-label
+      (emit-stw-stop-subroutine buf stw-stop-label stw-park-label)
+      (emit-stw-scan-subroutine buf stw-scan-label scan-word-label)
+      (emit-stw-resume-subroutine buf stw-resume-label)
+      (emit-park-stub buf stw-park-label))
 
     ;; ===========================================================
     ;; SUBROUTINE: scan_word
@@ -7993,6 +8462,7 @@
          ;; PIT ISR only sets the pending flag).  NIL on Linux → YIELD
          ;; stays a NOP and the Linux image is byte-identical.
          (yield-longjmp-lbl (unless *x64-linux-mode* (make-label)))
+         (park-lbl (when (x64-stw-p) (make-label)))
          ;; Find %GC-COLLECT function in the table (if present)
          (gc-collect-entry (when *x64-gc-enabled*
                              (find "%GC-COLLECT" function-table
@@ -8046,7 +8516,8 @@
                               :gc-label gc-trampoline-label
                               :handler-push-label handler-push-lbl
                               :handler-pop-label handler-pop-lbl
-                              :yield-longjmp-label yield-longjmp-lbl)))
+                              :yield-longjmp-label yield-longjmp-lbl
+                              :park-label park-lbl)))
                  ;; Align THIS function's entry.  The tail alignment below only
                  ;; aligns SUBSEQUENT functions; without a head alignment the
                  ;; FIRST emitted function starts at whatever code-position the
@@ -8150,7 +8621,10 @@
       (emit-handler-helpers buf handler-push-lbl handler-pop-lbl)
       ;; BARE-METAL: safepoint-deadline stub (see emit-yield-longjmp-stub).
       (when yield-longjmp-lbl
-        (emit-yield-longjmp-stub buf yield-longjmp-lbl handler-pop-lbl)))
+        (emit-yield-longjmp-stub buf yield-longjmp-lbl handler-pop-lbl))
+      ;; HOSTED THREADED: the stop-the-world park stub (see emit-park-stub).
+      (when park-lbl
+        (emit-park-stub buf park-lbl)))
 
     ;; Resolve all label fixups
     (fixup-labels buf)

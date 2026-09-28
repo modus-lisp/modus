@@ -69,9 +69,8 @@
 ;;;           +0x08 total wakes issued   +0x10 STOP flag for every scheduler
 ;;;           +0x18 legacy AP-SCHEDULER returns (the pre-blocking behaviour)
 ;;;   +0x1000 free scratch for tests (mutex words, condvars, counters)
-;;;   +0x2000 PER-THREAD WINDOW BLOCKS, 4 KB per CPU, 16 CPUs (+0x2000 +
-;;;           0x1000*cpu, ending at +0x12000).  See THE PER-THREAD WINDOW
-;;;           below.
+;;;   +0x2000 formerly the PER-THREAD WINDOW BLOCKS (4 KB per CPU, which was
+;;;           too small -- see %THR-TLS-BLOCK); now unused.
 ;;;   +0x12000 the MV/handler-case two-thread selftest's control block, 4 KB.
 ;;;   +0x13000 THE THREAD TABLE, 4 KB — one record per thread, plus the
 ;;;            spawn handshake words.  See MANY THREADS, FROM CLOSURES.
@@ -80,9 +79,13 @@
 ;;;   +0x54000 DYNAMIC-BINDING STACKS, 16 KB per CPU, 16 CPUs (ending at
 ;;;            +0x94000): 1024 [key][value] entries a thread, pointed to by
 ;;;            its window block's +0xC60.  See THE EXTENSION in mvm/prelude.lisp.
+;;;   +0x94000 PER-THREAD WINDOW BLOCKS, 32 KB per CPU, 16 CPUs (ending at
+;;;            +0x114000): the window proper at +0x000, the handler-frame stack
+;;;            at +0x1000..+0x4FFF.  See THE PER-THREAD WINDOW below.
 ;;;
-;;; The mapping is 336 KB rather than 8 KB for those additions; NOTHING at a
-;;; lower offset moved, so every earlier user reads the same bytes.
+;;; The mapping is 1104 KB for those additions (anonymous pages, committed only
+;;; as touched); only the window blocks moved, and every user reaches them
+;;; through %THR-TLS-BLOCK.
 ;;;
 ;;; The two BSS words are 0x10000DA8 and 0x10000DB0 — the first two free words
 ;;; above the safepoint-boundary slot at 0x10000DA0 and below the MCGC config
@@ -104,7 +107,7 @@
           (let ((q (%gc-read64 (%thr-page-slot))))
             (if (> q 0)
                 (progn (spin-unlock (%thr-page-lock)) q)
-                (let ((m (%mmap-shared-page 606208)))
+                (let ((m (%mmap-shared-page 1130496)))
                   ;; A failed mmap comes back as a small negative (-errno).
                   (if (< m 4096)
                       (progn (spin-unlock (%thr-page-lock)) 0)
@@ -156,9 +159,19 @@
     (if (zerop p) 0 (+ p (+ #x54000 (* cpu #x4000))))))
 
 (defun %thr-tls-block (cpu)
-  "CPU's 4 KB PER-THREAD WINDOW block, or 0 if the page could not be mapped."
+  "CPU's 32 KB PER-THREAD WINDOW block, or 0 if the page could not be mapped.
+
+   32 KB AND NOT 4, BECAUSE THE WINDOW IS NOT 4 KB LONG.  On hosted Linux the
+   handler-frame stack is FS:[0x10001000 + depth*32], 512 frames (translate-x64,
+   __handler_push: the BALANCED-CAP enlargement), i.e. window offsets 0x1000 to
+   0x4FFF.  With 4 KB blocks a worker's saved handler frames were the NEXT
+   CPU's window: its neighbour's multiple-value count and extras (offset 0x090+)
+   overwrote frames 4-5, its nargs and armed frame the ones after, and an
+   unwind then restored the neighbour's values as RSP/RBP/IP -- the TYPE-ERRORs,
+   wrong argument counts and jumps to 0 that multi-threaded programs died of.
+   Each block now holds the whole window, frames included."
   (let ((p (%thr-page)))
-    (if (zerop p) 0 (+ p (+ #x2000 (* cpu #x1000))))))
+    (if (zerop p) 0 (+ p (+ #x94000 (* cpu #x8000))))))
 
 ;;; ============================================================
 ;;; THE PER-THREAD WINDOW, INSTALLED
@@ -243,6 +256,32 @@
                 (%tls-set-self-base delta)
                 0)
               r)))))
+
+(defun %tls-prepare-block (cpu)
+  "Make CPU's window block a clean start for the thread about to be cloned into
+   it, FROM THE SPAWNER, before the clone: the block is reused when a slot is,
+   and the child is born with its FS base already pointing here (CLONE_SETTLS,
+   translate-x64 +STW-CLONE-TLS-ADDR+), so every word it can read before its
+   own %TLS-INSTALL must already be right -- the dynamic-binding stack empty,
+   no handler frames or armed frame left by the previous occupant, the
+   stop-the-world STATE running and no stale published RSP, and the self slot
+   holding its own segment base.  Returns that base, or 0 if there is no block."
+  (let ((b (%thr-tls-block cpu)))
+    (if (or (zerop b) (< b #x10000000))
+        0
+        (let ((delta (- b #x10000000)))
+          (setf (mem-ref (+ b #xC50) :u64) 0)
+          (setf (mem-ref (+ b #xC58) :u64) 0)
+          (setf (mem-ref (+ b #xC60) :u64) (%thr-dynb-stack cpu))
+          (%gc-write64 (+ b #x180) 0)
+          (%gc-write64 (+ b #x188) 0)
+          (%gc-write64 (+ b #x190) 0)
+          (%gc-write64 (+ b #x198) 0)
+          (%gc-write64 (+ b #x400) 0)
+          (%gc-write64 (+ b #x5000) 0)
+          (%gc-write64 (+ b #x5008) 0)
+          (%gc-write64 (+ b #xC30) delta)
+          delta))))
 
 (defun %tls-installed-p ()
   "1 when this thread has its own window, 0 when it is still using the
@@ -1361,6 +1400,11 @@
                     (%gc-write64 (+ (%rt-arena-words) #x08) base)
                     (%gc-write64 (+ (%rt-arena-words) #x10) (+ from size))
                     (%gc-write64 (+ (%rt-arena-words) #x18) 0)
+                    ;; Tell region 0's collector where the arena is: it scans
+                    ;; [base, frontier) as roots (translate-x64,
+                    ;; EMIT-LOCK-ARENA-ROOT-SCAN).  Raw address, last, so the
+                    ;; collector never sees a half-initialised arena.
+                    (%gc-write64 #x10000D98 (%rt-arena-words))
                     1)))))))
 
 (defun %rt-enter-locked ()
@@ -2312,7 +2356,17 @@
     ;; 4. tell the spawner the slot has been read; it may now start the next.
     (%gc-write64 (+ rec #x28) 1)
     (%gc-write64 (%thr-ack) 1)
-    (funcall (aref (%thr-funs) slot))
+    ;; THE INTERPRETER'S TWO GLOBALS, BOUND PER THREAD.  MVM-INTERPRET parks a
+    ;; run's secondary values in *MVM-LAST-MV* and numbers non-local-exit
+    ;; states from *NLX-STATE-SERIAL*; unbound here, every interpreted return
+    ;; on a worker wrote the ONE process-wide cell -- another thread's values,
+    ;; and a list in this thread's region that dangled once the slot's region
+    ;; was reset.  The serial starts in a range of its own per slot so no two
+    ;; threads can mint the same one.
+    (let ((*mvm-last-mv* nil)
+          (*nlx-state-serial* (* slot 1099511627776)))
+      (declare (special *mvm-last-mv* *nlx-state-serial*))
+      (funcall (aref (%thr-funs) slot)))
     ;; PARK THE ALLOCATION FRONTIER ON THE WAY OUT.  A region's +0x30 is where
     ;; its live heap ends as far as anything outside this thread is concerned;
     ;; until it is parked it still holds the from-space START, and every
@@ -2411,6 +2465,9 @@
                                             slot (+ stk *thr-stack-bytes*) k))))
                         (%gc-write64 (%thr-pending-slot) slot)
                         (%gc-write64 (%thr-ack) 0)
+                        ;; The child's own window, ready BEFORE it exists; the
+                        ;; clone stub reads the base from 0x10005020.
+                        (%gc-write64 #x10005020 (%tls-prepare-block slot))
                         (let ((tid (%spawn-thread (%thr-trampoline-entry)
                                                   (+ stk *thr-stack-bytes*)
                                                   (+ rec #x08))))
@@ -2427,6 +2484,7 @@
                                     (progn (setq ok 1) (return 0)))
                                   (when (>= i 2000000000) (return 0))
                                   (setq i (+ i 1)))
+                                (%gc-write64 #x10005020 0)
                                 (%gc-write64 (%thr-started)
                                              (+ (%gc-read64 (%thr-started)) 1))
                                 (spin-unlock (%thr-spawn-lock))

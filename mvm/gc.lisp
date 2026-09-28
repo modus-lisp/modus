@@ -1511,13 +1511,23 @@
    difference is that the region those registers point into now carries its own
    collector state.  Returns the region left, so (%gc-region-enter that) undoes
    it."
+  ;; A LIMIT OF 0 IS A STOP-THE-WORLD CLAMP, NOT A LIMIT (translate-aarch64 /
+  ;; translate-x64, STOP-THE-WORLD FOR REGION 0): a back-edge poll set it so
+  ;; the next allocation parks, after keeping the real limit in the region's
+  ;; +0x38.  Parking the 0 there instead lost the real one, and the next
+  ;; thread into that region — a lock slice, typically — started with no room
+  ;; and COLLECTED the slice, whose objects region-0 tables point at and no
+  ;; slice collection updates (measured on x86-64: an interpreter reading its
+  ;; bytecode as unknown opcodes).  So leave the real limit where it is, and
+  ;; carry the clamp into the region entered.
   (let ((prev (%gc-region))
-        (k (%gc-meta-scale)))
+        (k (%gc-meta-scale))
+        (clamped (zerop (get-alloc-limit))))
     (%gc-meta-write (+ prev #x30) (get-alloc-ptr) k)
-    (%gc-meta-write (+ prev #x38) (get-alloc-limit) k)
+    (unless clamped (%gc-meta-write (+ prev #x38) (get-alloc-limit) k))
     (%gc-set-region rcb)
     (set-alloc-ptr (%gc-meta-read (+ rcb #x30) k))
-    (set-alloc-limit (%gc-meta-read (+ rcb #x38) k))
+    (set-alloc-limit (if clamped 0 (%gc-meta-read (+ rcb #x38) k)))
     prev))
 
 ;;; ------------------------------------------------------------

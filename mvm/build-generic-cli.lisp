@@ -190,6 +190,12 @@
 ;; its own FS base as its first act.
 (setf modus.mvm::*tls-window* t)
 (setf modus.mvm.x64::*x64-tls-window* t)
+;; STOP-THE-WORLD FOR REGION 0 (translate-x64): the trampoline's handshake,
+;; the back-edge poll and the safe-region traps; and layout key :STW, which
+;; turns on the runtime half (net/hosted-sync.lisp %GC-STW-ARM, the safe
+;; regions).  x86-64 has no other hosted layout keys, so this is the list.
+(setf modus.mvm.x64::*x64-stw* t)
+(setf modus.mvm::*hosted-layout* (list* :stw 1 modus.mvm::*hosted-layout*))
 (let ((txt (with-open-file (s (merge-pathnames "net/hosted-actors.lisp"
                                                cl-user::*modus-base*))
              (let ((b (make-string (file-length s))))

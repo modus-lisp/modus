@@ -68,6 +68,9 @@
       (setq *layout-threads* t)
       (unless (getf *layout-plist* :a64-threads)
         (setq *layout-plist* (list* :a64-threads 1 *layout-plist*)))
+      ;; Stop-the-world region-0 collection (translate-aarch64).
+      (unless (getf *layout-plist* :stw)
+        (setq *layout-plist* (list* :stw 1 *layout-plist*)))
       ;; x86-64's heap geometry: two 896 MB semispaces plus the 16 MB overshoot
       ;; guard (boot-linux-aarch64 +LINUX-AARCH64-GC-GUARD+).  Every thread's
       ;; region, the actor band and the lock arena are carved out of region

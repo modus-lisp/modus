@@ -465,6 +465,7 @@
   ;; (No quotation marks in this comment on purpose: it is INSIDE the co-init
   ;; SOURCE STRING, so a double quote here ends the string literal.)
   (setq *x64-tls-window* t)
+  (setq *x64-stw* t)
   (setq *tls-window* t)
   ;; handler-case handler paths check for a freshly recovered hardware fault
   ;; (see compile-handler-case / %HC-FAULT-FIXUP).

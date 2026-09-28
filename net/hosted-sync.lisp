@@ -361,17 +361,17 @@
 ;;; parks if a collection is under way (%GC-SAFE-LEAVE).  Everything it passes
 ;;; the kernel is a raw word — a futex word or a timespec in the thread page,
 ;;; never a heap object — so nothing the collector moves is in use while it
-;;; sleeps.  AArch64 only for now (the traps are translate-aarch64's).
+;;; sleeps.  Layout key :STW: the hosted AArch64 and x86-64 CLIs.
 (defun %gc-safe-block-3 (n a b c)
-  (%layout-if :a64-threads (%gc-safe-enter) nil)
+  (%layout-if :stw (%gc-safe-enter) nil)
   (let ((r (syscall3 n a b c)))
-    (%layout-if :a64-threads (%gc-safe-leave) nil)
+    (%layout-if :stw (%gc-safe-leave) nil)
     r))
 
 (defun %gc-safe-block-6 (n a b c d)
-  (%layout-if :a64-threads (%gc-safe-enter) nil)
+  (%layout-if :stw (%gc-safe-enter) nil)
   (let ((r (syscall6 n a b c d 0 0)))
-    (%layout-if :a64-threads (%gc-safe-leave) nil)
+    (%layout-if :stw (%gc-safe-leave) nil)
     r))
 
 (defun %nanosleep-at (ts sec nsec)
@@ -1426,12 +1426,13 @@
                     ;; ZEROED, and its bitmap bits cleared: a stop-the-world
                     ;; collection walks [base, frontier) object by object, and
                     ;; the unused tail of every slice must read as nothing, not
-                    ;; as region 0's old objects.  (AArch64: x86-64 has no
-                    ;; stop-the-world walk yet.)
-                    (%layout-if :a64-threads
-                      (progn (%ha-zero base (+ from size))
-                             (%ha-bitmap-clear base (+ from size)))
-                      0)
+                    ;; as region 0's old objects.  Both walks need the zero:
+                    ;; x86-64's flat walk took a stale word for a pointer and
+                    ;; copied a dead "object" of garbage size (an interpreter
+                    ;; then read its bytecode as unknown opcodes).  The bitmap
+                    ;; clear is AArch64's object walk only.
+                    (%layout-if :stw (%ha-zero base (+ from size)) 0)
+                    (%layout-if :a64-threads (%ha-bitmap-clear base (+ from size)) 0)
                     (%gc-region-shrink r0 newsize k)
                     ;; If main is NOT in region 0 right now (%TL-SELFTEST's
                     ;; shape), the shrink moved no live register; clamp the
@@ -1512,9 +1513,10 @@
   "Arm STOP-THE-WORLD for region-0 collections (translate-aarch64, STOP-THE-
    WORLD FOR REGION 0): publish the band and the region count in the thread
    table, enrol the main thread as slot 0 (running, its stack top = region 0's
-   stack base, window delta 0), then set the armed word LAST.  AArch64 only
-   for now; a no-op elsewhere."
-  (%layout-if :a64-threads
+   stack base, window delta 0), then set the armed word LAST.  A no-op where
+   the layout has no :STW (translate-aarch64 / translate-x64, STOP-THE-WORLD
+   FOR REGION 0)."
+  (%layout-if :stw
     (let ((tt (%thr-table)))
       (if (zerop tt)
           0
@@ -2450,7 +2452,7 @@
     ;; (its collector token is its CPU id): its stack top, then RUNNING and a
     ;; check of the stop flag — the same handshake as leaving a safe region.
     (%gc-write64 (+ rec #x78) (+ (%gc-read64 (+ rec #x10)) (%gc-read64 (+ rec #x18))))
-    (%layout-if :a64-threads (%gc-safe-leave) nil)
+    (%layout-if :stw (%gc-safe-leave) nil)
     (set-current-actor 0)
     (set-idle-flag 0)
     (%gc-write64 (+ rec #x20) slot)

@@ -618,15 +618,16 @@ AArch64 broke it only because it filled region 0 so fast.
   so it fails again).  A retry costs 175 KB.  Five fresh modules cost 6.6 MB
   on AArch64 against 2.7 MB on x86-64.
 
-The precondition itself still stands on x86-64: a program that allocates
-enough in region 0 while threads run can still break it.  On AArch64 the
-stop-the-world handshake below removes it.
+The stop-the-world handshake below removes that precondition, on AArch64 and
+x86-64 alike.
 
-## Stop the world (AArch64)
+## Stop the world
 
 A region-0 collection with threads armed stops every other thread first.
-`translate-aarch64.lisp`, "STOP-THE-WORLD FOR REGION 0", has the layout; this
-is the shape.
+`translate-aarch64.lisp` and `translate-x64.lisp`, "STOP-THE-WORLD FOR REGION
+0", have the layout; this is the shape.  The runtime half
+(`net/hosted-sync.lisp`) is under layout key `:stw`, which both hosted CLIs
+set.
 - **The handshake.**  The collector takes a stop flag (`0x10000FC8`, its token
   `2*cpu+2`, by LDAXR/STLXR) and waits until every other live thread's record
   says PARKED or SAFE.  It then adds to its roots:
@@ -649,18 +650,45 @@ is the shape.
   - The next allocation enters the trampoline, which parks, takes the real
     limit back and, when the allocation fits under it, returns without
     collecting.
-  - The gc-check leaves the requested end in x16 (the no-size form now puts
-    x24 there), which is how the trampoline knows.
+  - AArch64: the gc-check leaves the requested end in x16 (the no-size form
+    now puts x24 there), which is how the trampoline knows.
+  - x86-64 has nowhere to put it: the no-size check runs before a CONS, with
+    the car live in RAX.  So the trampoline RETURNS TO THE CHECK instead.
+    Every gc-check ends `cmp <r>, r14 ; jl ; call`, 14 bytes before the
+    return address, and re-running the compare against the real limit is the
+    caller asking again.  It checks those bytes first, and otherwise collects.
+  - Either way, a limit that comes back as 0 means collect.  A region switch
+    between the clamp and the allocation (every locked runtime section makes
+    one) saves the clamped 0 as the region's limit.  x86-64 first returned to
+    the check anyway, and the thread looped between the check and the
+    trampoline forever.
 - **Safe regions.**  `%GC-SAFE-ENTER` / `%GC-SAFE-LEAVE` bracket the nanosleep
   and futex waits.  A thread blocked there counts as stopped, since its
   published stack is all it holds.  Leaving while a collection runs, it goes
   back to SAFE and waits for the flag to clear.
 - **The cost.**  A loop that never allocates and never blocks holds up a
   region-0 collection until it does one or the other.
+- **x86-64 differences.**  Region metadata is raw, not `<<1`.  The other
+  threads' regions and the lock arena are walked with the Cheney scan's own
+  flat walk (`EMIT-X64-FLAT-WALK`), not object by object, so they need no
+  bitmap clearing at the carve.
 
 `test/hosted-stw.lisp` has four workers traverse main's list, vector and
 interpreted closure while main collects region 0.  It requires at least three
-such collections during the run and no bad traversal.
+such collections during the run and no bad traversal.  It passes on AArch64.
+On x86-64 it fails, for a reason that has nothing to do with collection.
+- Several workers FUNCALLing one interpreted closure at once corrupt each
+  other's interpreter: "unknown opcode", "stack underflow".
+- It happens with main asleep and zero collections, and on the build from
+  before stop-the-world existed.
+- One worker alone is fine.
+
+The x86-64 handshake itself was checked separately:
+- Four workers traversing main's data, the interpreted closure included,
+  through three forced region-0 collections: no bad traversal, main's data
+  intact.
+- A diagnostic build (`MODUS_STW_VERIFY=1`) re-walks every extra root after
+  each collection.  It found no word still pointing into the evacuated space.
 
 **A separate bug it tripped, now fixed:** a lambda SETQ'd into a global
 (`(setq *fn* (let ((k 7)) (lambda (x) (+ x k))))`) could not be called from a

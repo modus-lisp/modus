@@ -1207,6 +1207,16 @@
                 (emit-bytes buf #x0F #x05)          ; syscall
                 (emit-bytes buf #x0F #x0B)          ; ud2 — unreachable
                 (emit-label buf done)))
+             ((= code #x0542)
+              ;; %GC-SAFE-ENTER — stop-the-world safe region (EMIT-X64-GC-SAFE-TRAP).
+              (if *x64-stw*
+                  (emit-x64-gc-safe-trap buf t)
+                  (emit-mov-reg-reg buf 'rsi 'r15)))
+             ((= code #x0543)
+              ;; %GC-SAFE-LEAVE.
+              (if *x64-stw*
+                  (emit-x64-gc-safe-trap buf nil)
+                  (emit-mov-reg-reg buf 'rsi 'r15)))
              ((= code #x0533)
               ;; %JIT-ICACHE-FLUSH: no-op on x86-64 (coherent I-cache — writes
               ;; to an exec page are visible to fetch without maintenance).
@@ -4482,9 +4492,14 @@
          ;; recovered at an instruction boundary where no intern/alloc/GC
          ;; critical section is mid-flight — the ISR-side longjmp used to
          ;; abandon half-written global state (see emit-yield-longjmp-stub).
+         ;; HOSTED WITH THREADS: the stop-the-world poll — a back-edge clamps
+         ;; the allocation limit so the next allocation parks (see
+         ;; STOP-THE-WORLD FOR REGION 0 (x86-64)).
          (if (or *x64-linux-mode*
                  (null (translate-state-yield-longjmp-label state)))
-             (emit-nop buf)
+             (if (and *x64-linux-mode* *x64-stw*)
+                 (emit-x64-stw-clamp buf)
+                 (emit-nop buf))
              (let ((skip (make-label)))
                ;; cmp qword [0x10000D30], 0
                (emit-bytes buf #x48 #x83 #x3C #x25)
@@ -6064,6 +6079,584 @@
     (emit-mov-reg-imm buf reg modus.mvm::+gc-region-0-base+)
     (emit-label buf have-region)))
 
+;;; ============================================================
+;;; STOP-THE-WORLD FOR REGION 0 (x86-64)
+;;; ============================================================
+;;;
+;;; The x86-64 half of translate-aarch64's STOP-THE-WORLD FOR REGION 0, which
+;;; has the design and the reasons; docs/macos-hosting.md, "Stop the world".
+;;; Same table, records, token and stop flag.  The differences are x86-64's:
+;;;   - region metadata is RAW here (aarch64 stores it <<1);
+;;;   - the other threads' regions and the lock arena are walked with the
+;;;     Cheney scan's own flat walk (EMIT-X64-FLAT-WALK), not object by object;
+;;;   - a clamped thread cannot say how much it wanted (the no-size gc-check
+;;;     runs before a CONS with the car live in RAX, so nothing can be put
+;;;     there).  So after parking, the trampoline puts the real limit back and
+;;;     RETURNS TO THE CHECK: every gc-check form ends `cmp <r>, r14 ; jl ;
+;;;     call', 14 bytes, and re-running the compare against the real limit is
+;;;     the caller asking again.  The bytes are checked first; anything else
+;;;     simply collects.
+;;; The collector keeps its state in a frame below RBP (the register save):
+;;;   [rbp-8] table  [rbp-16] token  [rbp-24] 1 = a STW collection
+;;;   [rbp-32] loop index  [rbp-40] window base  [rbp-48] this thread's record
+
+(defvar *x64-stw* nil
+  "Emit stop-the-world for region-0 collections: the trampoline's handshake
+   and extra roots, the loop back-edge poll, and the safe-region traps.
+   Hosted threaded images only (build-generic-cli.lisp and the CLI JIT's
+   co-init set it).")
+
+(defconstant +x64-stw-flag-addr+ #x10000FC8)
+(defconstant +x64-stw-frame+ 64)
+
+(defun x64-stw-rm (buf opcodes regfield base off &key (imm8 nil) (imm32 nil))
+  "REX.W <OPCODES> with ModRM reg=REGFIELD (0-15), r/m = [BASE + OFF]."
+  (let* ((bc (reg-code base)) (bx (reg-extended-p base))
+         (rx (>= regfield 8)))
+    (emit-byte buf (logior #x48 (if rx #x04 0) (if bx #x01 0)))
+    (dolist (o opcodes) (emit-byte buf o))
+    (let ((mod (cond ((and (zerop off) (/= bc 5)) 0)
+                     ((<= -128 off 127) 1)
+                     (t 2))))
+      (emit-byte buf (logior (ash mod 6) (ash (logand regfield 7) 3) bc))
+      (when (= bc 4) (emit-byte buf #x24))
+      (case mod (1 (emit-byte buf (logand off #xFF))) (2 (emit-s32 buf off))))
+    (when imm8 (emit-byte buf (logand imm8 #xFF)))
+    (when imm32 (emit-s32 buf imm32))))
+
+(defun x64-stw-store-imm (buf base off imm)
+  "mov qword [BASE+OFF], imm32"
+  (x64-stw-rm buf '(#xC7) 0 base off :imm32 imm))
+
+(defun x64-stw-cmp-imm (buf base off imm)
+  "cmp qword [BASE+OFF], imm8"
+  (x64-stw-rm buf '(#x83) 7 base off :imm8 imm))
+
+(defun x64-stw-flag-test (buf)
+  "cmp qword [flag], 0"
+  (emit-bytes buf #x48 #x83 #x3C #x25)
+  (emit-u32 buf +x64-stw-flag-addr+)
+  (emit-byte buf 0))
+
+(defun x64-stw-mfence (buf) (emit-bytes buf #x0F #xAE #xF0))
+
+(defun x64-stw-sched-yield (buf)
+  "sched_yield(2).  Clobbers RAX, RCX, R11."
+  (emit-bytes buf #xB8 24 0 0 0)
+  (emit-bytes buf #x0F #x05))
+
+(defun x64-stw-table (buf reg skip)
+  "REG = the thread table if stop-the-world is ARMED, else jump to SKIP."
+  (emit-mov-reg-abs buf reg #x10000DA8)
+  (emit-cmp-reg-imm buf reg 0)
+  (emit-jcc buf :e skip)
+  (emit-add-reg-imm buf reg #x13000)
+  (x64-stw-cmp-imm buf reg #x50 0)
+  (emit-jcc buf :e skip))
+
+(defun x64-stw-token-and-rec (buf table token rec)
+  "TOKEN = 2*cpu+2, REC = this thread's record.  The CPU id is per-CPU slot
+   GS:[cpu-id], tagged (2*cpu), as EMIT-LOAD-GC-REGION reads it."
+  (emit-byte buf #x65)
+  (emit-byte buf (logior #x48 (if (reg-extended-p token) #x04 0)))
+  (emit-byte buf #x8B)
+  (emit-byte buf (logior #x04 (ash (reg-code token) 3)))
+  (emit-byte buf #x25)
+  (emit-u32 buf modus.mvm::+gc-percpu-cpu-id-off+)
+  (emit-mov-reg-reg buf rec token)
+  (emit-shl-reg-imm buf rec 6)                    ; 2*cpu*64 = cpu*0x80
+  (emit-add-reg-reg buf rec table)
+  (emit-add-reg-imm buf rec #x100)
+  (emit-add-reg-imm buf token 2))
+
+(defun emit-x64-stw-park (buf park)
+  "The PARK subroutine: R9 = this thread's record.  Publish SP and the active
+   region's frontier (R12), then PARKED; wait for the flag to clear; RUNNING.
+   Clobbers RAX, RCX, R8, R11."
+  (let ((spin (make-label)) (out (make-label)))
+    (emit-label buf park)
+    (emit-mov-mem-reg buf 'r9 'rsp #x70)
+    (emit-load-gc-region buf 'r8)
+    (emit-mov-mem-reg buf 'r8 'r12 modus.mvm::+gc-off-saved-alloc+)
+    (x64-stw-store-imm buf 'r9 #x68 1)            ; x86 stores are ordered
+    (emit-label buf spin)
+    (x64-stw-flag-test buf)
+    (emit-jcc buf :e out)
+    (x64-stw-sched-yield buf)
+    (emit-jmp buf spin)
+    (emit-label buf out)
+    (x64-stw-store-imm buf 'r9 #x68 3)
+    (x64-stw-mfence buf)
+    (emit-ret buf)))
+
+(defun emit-x64-stw-entry (buf park)
+  "Trampoline ENTRY, after the register save and `mov rbp, rsp'.  Parks for
+   another thread's collection; then, if a back-edge poll CLAMPED R14 (0; a
+   real limit never is), takes the real limit back from the region's
+   saved-limit and returns to the caller's gc-check compare (see the block
+   comment).  Every register it uses is on the stack."
+  (when *x64-stw*
+    (let ((skip (make-label)) (no-park (make-label)) (collect (make-label)))
+      (x64-stw-table buf 'rax skip)
+      (x64-stw-token-and-rec buf 'rax 'r8 'r9)
+      (emit-mov-reg-abs buf 'rcx +x64-stw-flag-addr+)
+      (emit-cmp-reg-imm buf 'rcx 0)
+      (emit-jcc buf :e no-park)
+      (emit-cmp-reg-reg buf 'rcx 'r8)
+      (emit-jcc buf :e no-park)
+      (emit-call buf park)
+      (emit-label buf no-park)
+      (emit-cmp-reg-imm buf 'r14 0)
+      (emit-jcc buf :ne skip)
+      (emit-load-gc-region buf 'rax)
+      (emit-mov-reg-mem buf 'r14 'rax modus.mvm::+gc-off-saved-limit+)
+      ;; No room under it — or no real limit at all: a region switch between
+      ;; the clamp and here saved the clamped 0 as the region's limit, and
+      ;; returning to the check would only call back here, forever.  Collect;
+      ;; the collection sets the limit afresh.
+      (emit-cmp-reg-reg buf 'r12 'r14)
+      (emit-jcc buf :ae collect)
+      ;; The call site: `cmp r12,r14' (4D 39 F4) or `cmp rax,r14' (4C 39 F0),
+      ;; then `jl rel32' (0F 8C), then this call — 14 bytes back.
+      (emit-mov-reg-mem buf 'rdx 'rbp 96)          ; return address
+      (emit-mov-reg-mem buf 'rax 'rdx -14)
+      (emit-shl-reg-imm buf 'rax 24)
+      (emit-shr-reg-imm buf 'rax 24)               ; the five bytes
+      (emit-mov-reg-imm buf 'rcx #x8C0FF4394D)
+      (let ((rewind (make-label)))
+        (emit-cmp-reg-reg buf 'rax 'rcx)
+        (emit-jcc buf :e rewind)
+        (emit-mov-reg-imm buf 'rcx #x8C0FF0394C)
+        (emit-cmp-reg-reg buf 'rax 'rcx)
+        (emit-jcc buf :ne collect)
+        (emit-label buf rewind))
+      (emit-sub-reg-imm buf 'rdx 14)
+      (emit-mov-mem-reg buf 'rbp 'rdx 96)
+      (emit-mov-reg-reg buf 'rsp 'rbp)
+      (dolist (r '(rbp r13 r11 r10 rdx rcx rbx r9 r8 rdi rsi rax))
+        (emit-pop buf r))
+      (emit-ret buf)
+      (emit-label buf collect)
+      (emit-label buf skip))))
+
+(defun emit-x64-stw-collector-begin (buf park)
+  "Before the metadata loads: allocate the STW frame, and if the active region
+   is REGION 0 with threads armed, take the stop flag and wait until every
+   other live thread is parked or safe."
+  (when *x64-stw*
+    (let ((normal (make-label)) (acquire (make-label)) (acquired (make-label))
+          (next (make-label)) (wait (make-label)))
+      (emit-sub-reg-imm buf 'rsp +x64-stw-frame+)
+      (x64-stw-store-imm buf 'rbp -24 0)
+      (x64-stw-table buf 'rax normal)
+      (emit-load-gc-region buf 'rcx)
+      (emit-cmp-reg-imm buf 'rcx modus.mvm::+gc-region-0-base+)
+      (emit-jcc buf :ne normal)
+      (emit-mov-mem-reg buf 'rbp 'rax -8)
+      (x64-stw-token-and-rec buf 'rax 'r8 'r9)
+      (emit-mov-mem-reg buf 'rbp 'r8 -16)
+      (emit-mov-mem-reg buf 'rbp 'r9 -48)
+      ;; take the flag: 0 -> token
+      (emit-label buf acquire)
+      (emit-mov-reg-imm buf 'rax 0)
+      (emit-mov-reg-mem buf 'rcx 'rbp -16)
+      (emit-bytes buf #xF0 #x48 #x0F #xB1 #x0C #x25)  ; lock cmpxchg [flag], rcx
+      (emit-u32 buf +x64-stw-flag-addr+)
+      (emit-jcc buf :e acquired)
+      (emit-mov-reg-mem buf 'r9 'rbp -48)
+      (emit-call buf park)                          ; another collector's turn
+      (emit-jmp buf acquire)
+      (emit-label buf acquired)
+      (x64-stw-store-imm buf 'rbp -24 1)
+      ;; wait for every other live thread
+      (emit-mov-reg-imm buf 'rdi 0)
+      (emit-label buf next)
+      (emit-cmp-reg-imm buf 'rdi 16)
+      (emit-jcc buf :ae normal)
+      (emit-mov-reg-reg buf 'rsi 'rdi)
+      (emit-shl-reg-imm buf 'rsi 7)
+      (emit-add-reg-imm buf 'rsi #x100)
+      (emit-mov-reg-mem buf 'rax 'rbp -8)
+      (emit-add-reg-reg buf 'rsi 'rax)               ; rsi = rec i
+      (emit-add-reg-imm buf 'rdi 1)
+      (emit-mov-reg-reg buf 'rax 'rdi)
+      (emit-shl-reg-imm buf 'rax 1)                  ; (i+1)*2 = token of i
+      (emit-mov-reg-mem buf 'rcx 'rbp -16)
+      (emit-cmp-reg-reg buf 'rax 'rcx)
+      (emit-jcc buf :e next)                         ; me
+      (emit-label buf wait)
+      (x64-stw-cmp-imm buf 'rsi #x68 3)
+      (emit-jcc buf :ne next)                        ; parked, safe or absent
+      (x64-stw-sched-yield buf)
+      (emit-jmp buf wait)
+      (emit-label buf normal))))
+
+(defun emit-x64-stw-own-window-top (buf)
+  "A STW collector's own stack window ends at ITS stack top (record +0x78).
+   RDX is stack_base here."
+  (when *x64-stw*
+    (let ((skip (make-label)))
+      (x64-stw-cmp-imm buf 'rbp -24 0)
+      (emit-jcc buf :e skip)
+      (emit-mov-reg-mem buf 'rsi 'rbp -48)
+      (emit-mov-reg-mem buf 'rdx 'rsi #x78)
+      (emit-label buf skip))))
+
+(defun emit-x64-window-root-scan (buf scan-word-label)
+  "Scan the per-thread window whose BASE is at [rbp-40]: its MV extras and,
+   when the base is not 0 (main never binds there), its dynamic bindings.
+   Same layout as the collector's own loops (EMIT-DYNBIND-ROOT-SCAN)."
+  (let ((mv-loop (make-label)) (mv-done (make-label))
+        (db-loop (make-label)) (db-done (make-label)) (db-inwin (make-label)))
+    (emit-mov-reg-mem buf 'rdi 'rbp -40)
+    (emit-mov-reg-mem buf 'r10 'rdi #x10000090)
+    (emit-shr-reg-imm buf 'r10 1)
+    (emit-sub-reg-imm buf 'r10 1)
+    (emit-cmp-reg-imm buf 'r10 0)
+    (emit-jcc buf :le mv-done)
+    (emit-cmp-reg-imm buf 'r10 16)
+    (emit-jcc buf :g mv-done)
+    (emit-add-reg-imm buf 'rdi #x10000098)
+    (emit-label buf mv-loop)
+    (emit-mov-reg-reg buf 'rax 'rdi)
+    (emit-call buf scan-word-label)
+    (emit-add-reg-imm buf 'rdi 8)
+    (emit-sub-reg-imm buf 'r10 1)
+    (emit-cmp-reg-imm buf 'r10 0)
+    (emit-jcc buf :g mv-loop)
+    (emit-label buf mv-done)
+    (emit-mov-reg-mem buf 'rdi 'rbp -40)
+    (emit-cmp-reg-imm buf 'rdi 0)
+    (emit-jcc buf :e db-done)
+    (emit-mov-reg-mem buf 'r10 'rdi #x10000C58)
+    (emit-shr-reg-imm buf 'r10 1)
+    (emit-cmp-reg-imm buf 'r10 0)
+    (emit-jcc buf :le db-done)
+    (emit-mov-reg-mem buf 'rax 'rdi #x10000C60)
+    (emit-shr-reg-imm buf 'rax 1)
+    (emit-cmp-reg-imm buf 'rax 0)
+    (emit-jcc buf :e db-inwin)
+    (emit-mov-reg-reg buf 'rdi 'rax)
+    (emit-add-reg-imm buf 'rdi 8)
+    (emit-jmp buf db-loop)
+    (emit-label buf db-inwin)
+    (emit-add-reg-imm buf 'rdi #x10000C78)
+    (emit-label buf db-loop)
+    (emit-mov-reg-reg buf 'rax 'rdi)
+    (emit-call buf scan-word-label)
+    (emit-add-reg-imm buf 'rdi 16)
+    (emit-sub-reg-imm buf 'r10 1)
+    (emit-cmp-reg-imm buf 'r10 0)
+    (emit-jcc buf :g db-loop)
+    (emit-label buf db-done)))
+
+(defun emit-x64-stw-extra-roots (buf scan-word-label)
+  "A STW collection's extra roots, before the Cheney scan: every other
+   parked or safe thread's stack window and per-thread window, then every
+   carved thread region up to its published frontier, then the lock arena."
+  (when *x64-stw*
+    (let ((skip (make-label)) (tloop (make-label)) (sloop (make-label))
+          (sdone (make-label)) (rloop (make-label)) (rnext (make-label))
+          (rdone (make-label)) (adone (make-label)))
+      (x64-stw-cmp-imm buf 'rbp -24 0)
+      (emit-jcc buf :e skip)
+      ;; ---- threads ----
+      (x64-stw-store-imm buf 'rbp -32 0)
+      (emit-label buf tloop)
+      (emit-mov-reg-mem buf 'rdi 'rbp -32)
+      (emit-cmp-reg-imm buf 'rdi 16)
+      (emit-jcc buf :ae rloop)
+      (emit-mov-reg-reg buf 'rsi 'rdi)
+      (emit-shl-reg-imm buf 'rsi 7)
+      (emit-add-reg-imm buf 'rsi #x100)
+      (emit-mov-reg-mem buf 'rax 'rbp -8)
+      (emit-add-reg-reg buf 'rsi 'rax)               ; rsi = rec
+      (emit-add-reg-imm buf 'rdi 1)
+      (emit-mov-mem-reg buf 'rbp 'rdi -32)
+      (emit-shl-reg-imm buf 'rdi 1)
+      (emit-mov-reg-mem buf 'rax 'rbp -16)
+      (emit-cmp-reg-reg buf 'rdi 'rax)
+      (emit-jcc buf :e tloop)                        ; me
+      (x64-stw-cmp-imm buf 'rsi #x68 0)
+      (emit-jcc buf :e tloop)                        ; not participating
+      (x64-stw-cmp-imm buf 'rsi #x68 3)
+      (emit-jcc buf :e tloop)                        ; (cannot be: waited)
+      (emit-mov-reg-mem buf 'rax 'rsi #x38)
+      (emit-mov-mem-reg buf 'rbp 'rax -40)           ; window base
+      (emit-mov-reg-mem buf 'rdi 'rsi #x70)          ; [SP, top)
+      (emit-mov-reg-mem buf 'r11 'rsi #x78)
+      (emit-label buf sloop)
+      (emit-cmp-reg-reg buf 'rdi 'r11)
+      (emit-jcc buf :ae sdone)
+      (emit-mov-reg-reg buf 'rax 'rdi)
+      (emit-call buf scan-word-label)
+      (emit-add-reg-imm buf 'rdi 8)
+      (emit-jmp buf sloop)
+      (emit-label buf sdone)
+      (emit-x64-window-root-scan buf scan-word-label)
+      (emit-jmp buf tloop)
+      ;; ---- carved thread regions [from, frontier) ----
+      (emit-label buf rloop)
+      (x64-stw-store-imm buf 'rbp -32 0)
+      (emit-label buf rnext)
+      (emit-mov-reg-mem buf 'rdi 'rbp -32)
+      (emit-mov-reg-mem buf 'rax 'rbp -8)
+      (emit-mov-reg-mem buf 'rsi 'rax #x60)          ; region count
+      (emit-cmp-reg-reg buf 'rdi 'rsi)
+      (emit-jcc buf :ae rdone)
+      (emit-mov-reg-mem buf 'rsi 'rax #x58)          ; band
+      (emit-add-reg-imm buf 'rsi #xA000)
+      (emit-mov-reg-reg buf 'rax 'rdi)
+      (emit-shl-reg-imm buf 'rax 6)
+      (emit-add-reg-reg buf 'rsi 'rax)               ; rsi = rcb
+      (emit-add-reg-imm buf 'rdi 1)
+      (emit-mov-mem-reg buf 'rbp 'rdi -32)
+      (emit-mov-reg-mem buf 'r10 'rsi modus.mvm::+gc-off-from-start+)
+      (emit-cmp-reg-imm buf 'r10 0)
+      (emit-jcc buf :e rnext)
+      (emit-mov-reg-mem buf 'r11 'rsi modus.mvm::+gc-off-saved-alloc+)
+      ;; A frontier outside [from, from+size] is stale (another semispace, a
+      ;; region never entered): skip rather than walk it.
+      (emit-cmp-reg-reg buf 'r11 'r10)
+      (emit-jcc buf :b rnext)
+      (emit-mov-reg-mem buf 'rax 'rsi modus.mvm::+gc-off-space-size+)
+      (emit-add-reg-reg buf 'rax 'r10)
+      (emit-cmp-reg-reg buf 'r11 'rax)
+      (emit-jcc buf :a rnext)
+      (emit-x64-flat-walk buf scan-word-label 'r11)
+      (emit-jmp buf rnext)
+      (emit-label buf rdone)
+      ;; ---- the lock arena [base, frontier): band + 0xBC00 / 0xBC08 ----
+      (emit-mov-reg-mem buf 'rax 'rbp -8)
+      (emit-mov-reg-mem buf 'rsi 'rax #x58)
+      (emit-add-reg-imm buf 'rsi #xBC00)
+      (emit-mov-reg-mem buf 'r10 'rsi 0)
+      (emit-cmp-reg-imm buf 'r10 0)
+      (emit-jcc buf :e adone)
+      (emit-mov-reg-mem buf 'r11 'rsi 8)
+      (emit-x64-flat-walk buf scan-word-label 'r11)
+      (emit-label buf adone)
+      (emit-label buf skip))))
+
+(defvar *x64-stw-verify*
+  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_STW_VERIFY") #-sbcl nil)) (if v t nil))
+  "DIAGNOSTIC, off unless MODUS_STW_VERIFY is set at build time: after a
+   stop-the-world collection, walk the extra roots again and count every word
+   still pointing into the old from-space (table +0x68 count, +0x70 first
+   address, +0x78 its value).")
+
+(defun emit-x64-stw-verify-word (buf label)
+  "Subroutine: RAX = address of a word.  If the word is a cons/object pointer
+   into [RBX, RCX) — the from-space just evacuated — count it.  Preserves
+   everything but flags."
+  (let ((done (make-label)))
+    (emit-label buf label)
+    (emit-push buf 'rsi) (emit-push buf 'rdx)
+    (emit-mov-reg-mem buf 'rsi 'rax 0)
+    (emit-mov-reg-reg buf 'rdx 'rsi)
+    (emit-and-reg-imm buf 'rdx 7)
+    (emit-cmp-reg-imm buf 'rdx 1)
+    (emit-jcc buf :ne done)                      ; tags 1 and 9 both end in 001
+    (emit-mov-reg-reg buf 'rdx 'rsi)
+    (emit-and-reg-imm buf 'rdx -16)
+    (emit-cmp-reg-reg buf 'rdx 'rbx)
+    (emit-jcc buf :b done)
+    (emit-cmp-reg-reg buf 'rdx 'rcx)
+    (emit-jcc buf :ae done)
+    (emit-mov-reg-mem buf 'rdx 'rbp -8)          ; table
+    (x64-stw-cmp-imm buf 'rdx #x68 0)
+    (let ((not-first (make-label)))
+      (emit-jcc buf :ne not-first)
+      (emit-mov-mem-reg buf 'rdx 'rax #x70)
+      (emit-mov-mem-reg buf 'rdx 'rsi #x78)
+      (emit-label buf not-first))
+    (emit-mov-reg-mem buf 'rsi 'rdx #x68)
+    (emit-add-reg-imm buf 'rsi 1)
+    (emit-mov-mem-reg buf 'rdx 'rsi #x68)
+    (emit-label buf done)
+    (emit-pop buf 'rdx) (emit-pop buf 'rsi)
+    (emit-ret buf)))
+
+(defun emit-x64-stw-release (buf &optional verify-label)
+  "End of a collection: a STW collector clears the stop flag (first, with
+   *X64-STW-VERIFY*, re-walking the extra roots through VERIFY-LABEL)."
+  (when *x64-stw*
+    (let ((skip (make-label)))
+      (x64-stw-cmp-imm buf 'rbp -24 0)
+      (emit-jcc buf :e skip)
+      (when verify-label
+        ;; RBX is still the old from_start; RCX went to the bitmap clears.
+        (emit-load-gc-region buf 'rcx)
+        (emit-mov-reg-mem buf 'rcx 'rcx modus.mvm::+gc-off-space-size+)
+        (emit-add-reg-reg buf 'rcx 'rbx)
+        (emit-x64-stw-extra-roots buf verify-label))
+      (emit-mov-abs-imm32 buf +x64-stw-flag-addr+ 0)
+      (emit-label buf skip))))
+
+(defun emit-x64-stw-clamp (buf)
+  "A loop back-edge's poll: with the stop flag held, keep the real limit in
+   the active region's saved-limit (unless already clamped) and clamp R14 to
+   0, so the next allocation enters the trampoline and parks.  Only RAX is
+   used, and it is saved."
+  (let ((skip (make-label)))
+    (x64-stw-flag-test buf)
+    (emit-jcc buf :e skip)
+    (emit-cmp-reg-imm buf 'r14 0)
+    (emit-jcc buf :e skip)
+    (emit-push buf 'rax)
+    (emit-load-gc-region buf 'rax)
+    (emit-mov-mem-reg buf 'rax 'r14 modus.mvm::+gc-off-saved-limit+)
+    (emit-pop buf 'rax)
+    (emit-mov-reg-imm buf 'r14 0)
+    (emit-label buf skip)))
+
+(defun emit-x64-gc-safe-trap (buf enter)
+  "%GC-SAFE-ENTER (ENTER true) / %GC-SAFE-LEAVE.  Enter publishes SP and the
+   frontier, then SAFE.  Leave marks RUNNING and, with the flag held, goes back
+   to SAFE and waits for it to clear.  Result NIL in V0 (RSI).
+   Every value register is pushed: the published stack is ALL a collector
+   sees of a safe thread, so a live pointer in one (a caller's RBX, say) must
+   be on it, and comes back forwarded."
+  (let ((skip (make-label)))
+    (dolist (r '(rax rbx rcx rdx rsi rdi r8 r9 r10 r11)) (emit-push buf r))
+    (x64-stw-table buf 'rax skip)
+    (x64-stw-token-and-rec buf 'rax 'r8 'r9)
+    (if enter
+        (progn
+          (emit-mov-mem-reg buf 'r9 'rsp #x70)
+          (emit-load-gc-region buf 'rdx)
+          (emit-mov-mem-reg buf 'rdx 'r12 modus.mvm::+gc-off-saved-alloc+)
+          (x64-stw-store-imm buf 'r9 #x68 2))
+        (let ((again (make-label)) (spin (make-label)))
+          (emit-label buf again)
+          (x64-stw-store-imm buf 'r9 #x68 3)
+          (x64-stw-mfence buf)
+          (x64-stw-flag-test buf)
+          (emit-jcc buf :e skip)
+          (x64-stw-store-imm buf 'r9 #x68 2)
+          (emit-label buf spin)
+          (x64-stw-sched-yield buf)
+          (x64-stw-flag-test buf)
+          (emit-jcc buf :ne spin)
+          (emit-jmp buf again)))
+    (emit-label buf skip)
+    (dolist (r '(r11 r10 r9 r8 rdi rsi rdx rcx rbx rax)) (emit-pop buf r))
+    (emit-mov-reg-reg buf 'rsi 'r15)))
+
+(defun emit-x64-flat-walk (buf scan-word-label bound)
+  "Walk heap words from the cursor R10 up to the register BOUND, calling
+   scan_word on each and stepping over LEAF objects whole when the bitmaps say
+   where they start.  This is the Cheney scan (EMIT-GC-TRAMPOLINE, with BOUND
+   = R13, the growing free pointer); stop-the-world also walks the thread
+   regions and the lock arena with it, BOUND = R11 (fixed).  scan_word and
+   copy_object preserve R10 and R11; RAX/RSI/R8/R9 are its temps."
+  (let ((cheney-loop (make-label))
+        (cheney-done (make-label)))
+    (emit-label buf cheney-loop)
+    ;; scan >= free_ptr? done
+    (emit-cmp-reg-reg buf 'r10 bound)
+    (emit-jcc buf :ae cheney-done)
+    ;; LEAF SKIP (#252).  This scan used to be a FLAT walk: every word of
+    ;; to-space went through scan_word, including the RAW payload of byte
+    ;; vectors, strings, floats, bignums and saps.  A payload word that
+    ;; happens to equal a live object's tagged address (any 8 bytes of a
+    ;; 10 MB bytecode array will, ~40 times) passes the start-bit gate and
+    ;; is "forwarded": the collector rewrites the bytecode with a to-space
+    ;; pointer.  Gen0 of the fixpoint chain corrupted its own bytecode at
+    ;; every collection; two identical arrays were corrupted identically.
+    ;; So, at a recorded object start that is not a cons, read the header
+    ;; and, for the leaf subtags %GC-LEAF-SUBTAG-P names, step over the
+    ;; whole object with copy_object's own size rule.  Anything else --
+    ;; a pointer-bearing object, a cons, or a granule with no start bit --
+    ;; is scanned exactly as before.  RAX/RSI/R8/R9 are free here (scan_word
+    ;; and copy_object temps); RDX/RCX/RBX/R13/R10 are untouched.
+    ;; Needs the CONS-KIND bitmap too: a copied cons carries a start bit, and
+    ;; without the kind bit its CAR would be read as a header (a fixnum 48 is
+    ;; tagged #x60 -- a "float" -- and the skip would step over live data).
+    (when (and (mcgc-bitmap-on-p) (mcgc-kind-bitmap-on-p))
+      (let ((scan-it (make-label)) (leaf (make-label))
+            (sz-u8 (make-label)) (sz-f32 (make-label)) (sz-adv (make-label))
+            (sz-take (make-label)))
+        ;; Only at a 16-byte boundary: the start bit is per GRANULE, so the
+        ;; word at obj+8 (the +8 pad word, which alloc-string and copy_object
+        ;; leave as whatever it was) maps to the same set bit as the header
+        ;; and would be read as a header -- a pad word whose low byte happened
+        ;; to spell a leaf subtag skipped by a garbage size.  That made
+        ;; modus-sh --compile-uefi nondeterministic (9.9 MB output one run,
+        ;; TYPE-ERROR the next).  Objects are 16-aligned with the header first.
+        (emit-bytes buf #x41 #xF7 #xC2 #x0F #x00 #x00 #x00) ; test r10d, 15
+        (emit-jcc buf :ne scan-it)
+        (emit-bytes buf #x4C #x89 #xD6)                ; mov rsi, r10
+        (emit-bytes buf #x48 #x2B #x34 #x25)           ; sub rsi, [page_base]
+        (emit-u32 buf +mcgc-cfg-page-base-addr+)
+        (emit-shr-reg-imm buf 'rsi 4)                  ; rsi = granule
+        (emit-bytes buf #x4C #x8B #x04 #x25)           ; mov r8, [bitmap_base]
+        (emit-u32 buf +mcgc-cfg-bitmap-addr+)
+        (emit-bytes buf #x49 #x0F #xA3 #x30)           ; bt [r8], rsi  (CF = object-start bit)
+        (emit-jcc buf :nc scan-it)
+        (emit-bytes buf #x49 #x81 #xC0)                ; add r8, imm32 (cons-kind delta)
+        (emit-u32 buf +mcgc-kindbitmap-delta+)
+        (emit-bytes buf #x49 #x0F #xA3 #x30)           ; bt [r8], rsi  (CF = cons-kind bit)
+        (emit-jcc buf :c scan-it)                      ; a cons: scan its two words as before
+        (emit-mov-reg-mem buf 'rsi 'r10 0)             ; rsi = header
+        (emit-mov-reg-reg buf 'r8 'rsi)
+        (emit-and-reg-imm buf 'r8 #xFF)                ; r8 = subtag
+        ;; NOT #x30: a BIG bignum is a 2-slot #x30 whose slot 1 is a POINTER to
+        ;; its limbs array (compile-integer's sentinel -1 shape); skipping it
+        ;; left that pointer un-forwarded, and modus-sh --compile-uefi then read
+        ;; a stale threshold and compiled 2^130 as a small bignum (the UEFI DDC
+        ;; caught it).  Only pointer-free layouts may be skipped.
+        (dolist (st '(#x10 #x11 #x12 #x14 #x16 #x60 #x64 #x65 #x66))
+          (emit-cmp-reg-imm buf 'r8 st)
+          (emit-jcc buf :e leaf))
+        (emit-jmp buf scan-it)
+        (emit-label buf leaf)
+        (emit-mov-reg-reg buf 'r9 'rsi)
+        (emit-shr-reg-imm buf 'r9 8)                   ; r9 = element count
+        (emit-cmp-reg-imm buf 'r8 #x11)
+        (emit-jcc buf :e sz-u8)
+        (emit-cmp-reg-imm buf 'r8 #x12)
+        (emit-jcc buf :e sz-f32)
+        (emit-add-reg-imm buf 'r9 2)                   ; general: (count+2)*8, align 16
+        (emit-shl-reg-imm buf 'r9 3)
+        (emit-add-reg-imm buf 'r9 15)
+        (emit-and-reg-imm buf 'r9 -16)
+        (emit-jmp buf sz-adv)
+        (emit-label buf sz-f32)
+        (emit-shl-reg-imm buf 'r9 2)                   ; 4 bytes per lane, then the u8 rule
+        (emit-label buf sz-u8)
+        (emit-add-reg-imm buf 'r9 16)                  ; header + pad
+        (emit-add-reg-imm buf 'r9 15)
+        (emit-and-reg-imm buf 'r9 -16)
+        (emit-label buf sz-adv)
+        ;; CONSISTENCY GUARD: a start bit can be stale (an allocation that
+        ;; overshot into this space before the collection), so a "header"
+        ;; read here can be junk.  Take the skip only if it lands exactly on
+        ;; the free pointer or on another recorded object start -- every
+        ;; copied object has one -- and otherwise fall back to the flat scan.
+        (emit-bytes buf #x4C #x89 #xD6)                ; mov rsi, r10
+        (emit-add-reg-reg buf 'rsi 'r9)                ; rsi = r10 + size
+        (emit-cmp-reg-reg buf 'rsi bound)
+        (emit-jcc buf :e sz-take)
+        (emit-jcc buf :a scan-it)                      ; past the free pointer: junk
+        (emit-bytes buf #x48 #x2B #x34 #x25)           ; sub rsi, [page_base]
+        (emit-u32 buf +mcgc-cfg-page-base-addr+)
+        (emit-shr-reg-imm buf 'rsi 4)
+        (emit-bytes buf #x4C #x8B #x04 #x25)           ; mov r8, [bitmap_base]
+        (emit-u32 buf +mcgc-cfg-bitmap-addr+)
+        (emit-bytes buf #x49 #x0F #xA3 #x30)           ; bt [r8], rsi
+        (emit-jcc buf :nc scan-it)                     ; next granule is not a start: junk
+        (emit-label buf sz-take)
+        (emit-add-reg-reg buf 'r10 'r9)                ; step over the leaf object
+        (emit-jmp buf cheney-loop)
+        (emit-label buf scan-it)))
+    ;; Scan the word at [r10]
+    (emit-bytes buf #x4C #x89 #xD0)            ; mov rax, r10
+    (emit-call buf scan-word-label)
+    (emit-add-reg-imm buf 'r10 8)
+    (emit-jmp buf cheney-loop)
+    (emit-label buf cheney-done)))
+
 (defun emit-gc-trampoline (buf gc-trampoline-label gc-collect-label)
   "Emit a complete Cheney copying GC in native x64 assembly.
 
@@ -6084,7 +6677,9 @@
   ;; Labels for GC subroutines
   (let ((copy-label (make-label))      ; copy_object(RAX) -> RAX=new ptr, R13 advanced
         (scan-word-label (make-label))  ; scan_word(RAX=addr of word) -> update word, R13
-        (restore-label (make-label)))
+        (restore-label (make-label))
+        (park-label (make-label))       ; stop-the-world: park this thread
+        (verify-label (make-label)))    ; stop-the-world diagnostic
 
     (emit-label buf gc-trampoline-label)
     (unless *x64-linux-mode*
@@ -6118,9 +6713,14 @@
     (emit-push buf 'rbp)
     ;; Save RSP for stack root scanning (after all pushes)
     (emit-bytes buf #x48 #x89 #xE5)              ; mov rbp, rsp  (save scan start)
+    ;; STOP-THE-WORLD: park for another thread's region-0 collection; a
+    ;; clamped back-edge poll with room to spare returns from here.
+    (emit-x64-stw-entry buf park-label)
 
     ;; ---- THIS COLLECTION HAS BEGUN.  Say so, where two CPUs can both see it.
     (emit-gc-concurrency-enter buf)
+    ;; STOP-THE-WORLD: a region-0 collection with threads armed stops them.
+    (emit-x64-stw-collector-begin buf park-label)
 
     ;; ---- Load GC metadata FROM THE ACTIVE REGION'S CONTROL BLOCK ----
     ;; RAX = region base (see emit-load-gc-region: 0 in the pointer word means
@@ -6139,6 +6739,7 @@
     ;; share this one load of the region base; scan_word pushes/pops RDX, so it
     ;; survives the whole scan exactly as before.
     (emit-mov-reg-mem buf 'rdx 'rax modus.mvm::+gc-off-stack-base+)
+    (emit-x64-stw-own-window-top buf)
 
     (emit-gc-dbg-char buf #x70)          ; 'p' — pushed regs + metadata loaded, about to scan stack
     ;; ---- Scan THIS REGION'S ROOT WINDOW ----
@@ -6290,6 +6891,10 @@
       (emit-label buf mv-done))
     ;; THIS THREAD'S DYNAMIC BINDINGS — the other per-thread root set.
     (emit-dynbind-root-scan buf scan-word-label)
+    ;; STOP-THE-WORLD: the other threads' stacks and windows, and every heap
+    ;; that can point into region 0 — before the scan, which walks whatever
+    ;; they forward.
+    (emit-x64-stw-extra-roots buf scan-word-label)
     (emit-gc-dbg-char buf #x72)          ; 'r' — roots scan done (globals+kw+pkg+mv+dynbind)
 
     ;; ---- Cheney scan loop ----
@@ -6298,112 +6903,7 @@
     (emit-load-gc-region buf 'rax)
     (emit-mov-reg-mem buf 'r10 'rax modus.mvm::+gc-off-to-start+)   ; r10 = to_start
 
-    (let ((cheney-loop (make-label))
-          (cheney-done (make-label)))
-      (emit-label buf cheney-loop)
-      ;; scan >= free_ptr? done
-      (emit-cmp-reg-reg buf 'r10 'r13)
-      (emit-jcc buf :ae cheney-done)
-      ;; LEAF SKIP (#252).  This scan used to be a FLAT walk: every word of
-      ;; to-space went through scan_word, including the RAW payload of byte
-      ;; vectors, strings, floats, bignums and saps.  A payload word that
-      ;; happens to equal a live object's tagged address (any 8 bytes of a
-      ;; 10 MB bytecode array will, ~40 times) passes the start-bit gate and
-      ;; is "forwarded": the collector rewrites the bytecode with a to-space
-      ;; pointer.  Gen0 of the fixpoint chain corrupted its own bytecode at
-      ;; every collection; two identical arrays were corrupted identically.
-      ;; So, at a recorded object start that is not a cons, read the header
-      ;; and, for the leaf subtags %GC-LEAF-SUBTAG-P names, step over the
-      ;; whole object with copy_object's own size rule.  Anything else --
-      ;; a pointer-bearing object, a cons, or a granule with no start bit --
-      ;; is scanned exactly as before.  RAX/RSI/R8/R9 are free here (scan_word
-      ;; and copy_object temps); RDX/RCX/RBX/R13/R10 are untouched.
-      ;; Needs the CONS-KIND bitmap too: a copied cons carries a start bit, and
-      ;; without the kind bit its CAR would be read as a header (a fixnum 48 is
-      ;; tagged #x60 -- a "float" -- and the skip would step over live data).
-      (when (and (mcgc-bitmap-on-p) (mcgc-kind-bitmap-on-p))
-        (let ((scan-it (make-label)) (leaf (make-label))
-              (sz-u8 (make-label)) (sz-f32 (make-label)) (sz-adv (make-label))
-              (sz-take (make-label)))
-          ;; Only at a 16-byte boundary: the start bit is per GRANULE, so the
-          ;; word at obj+8 (the +8 pad word, which alloc-string and copy_object
-          ;; leave as whatever it was) maps to the same set bit as the header
-          ;; and would be read as a header -- a pad word whose low byte happened
-          ;; to spell a leaf subtag skipped by a garbage size.  That made
-          ;; modus-sh --compile-uefi nondeterministic (9.9 MB output one run,
-          ;; TYPE-ERROR the next).  Objects are 16-aligned with the header first.
-          (emit-bytes buf #x41 #xF7 #xC2 #x0F #x00 #x00 #x00) ; test r10d, 15
-          (emit-jcc buf :ne scan-it)
-          (emit-bytes buf #x4C #x89 #xD6)                ; mov rsi, r10
-          (emit-bytes buf #x48 #x2B #x34 #x25)           ; sub rsi, [page_base]
-          (emit-u32 buf +mcgc-cfg-page-base-addr+)
-          (emit-shr-reg-imm buf 'rsi 4)                  ; rsi = granule
-          (emit-bytes buf #x4C #x8B #x04 #x25)           ; mov r8, [bitmap_base]
-          (emit-u32 buf +mcgc-cfg-bitmap-addr+)
-          (emit-bytes buf #x49 #x0F #xA3 #x30)           ; bt [r8], rsi  (CF = object-start bit)
-          (emit-jcc buf :nc scan-it)
-          (emit-bytes buf #x49 #x81 #xC0)                ; add r8, imm32 (cons-kind delta)
-          (emit-u32 buf +mcgc-kindbitmap-delta+)
-          (emit-bytes buf #x49 #x0F #xA3 #x30)           ; bt [r8], rsi  (CF = cons-kind bit)
-          (emit-jcc buf :c scan-it)                      ; a cons: scan its two words as before
-          (emit-mov-reg-mem buf 'rsi 'r10 0)             ; rsi = header
-          (emit-mov-reg-reg buf 'r8 'rsi)
-          (emit-and-reg-imm buf 'r8 #xFF)                ; r8 = subtag
-          ;; NOT #x30: a BIG bignum is a 2-slot #x30 whose slot 1 is a POINTER to
-          ;; its limbs array (compile-integer's sentinel -1 shape); skipping it
-          ;; left that pointer un-forwarded, and modus-sh --compile-uefi then read
-          ;; a stale threshold and compiled 2^130 as a small bignum (the UEFI DDC
-          ;; caught it).  Only pointer-free layouts may be skipped.
-          (dolist (st '(#x10 #x11 #x12 #x14 #x16 #x60 #x64 #x65 #x66))
-            (emit-cmp-reg-imm buf 'r8 st)
-            (emit-jcc buf :e leaf))
-          (emit-jmp buf scan-it)
-          (emit-label buf leaf)
-          (emit-mov-reg-reg buf 'r9 'rsi)
-          (emit-shr-reg-imm buf 'r9 8)                   ; r9 = element count
-          (emit-cmp-reg-imm buf 'r8 #x11)
-          (emit-jcc buf :e sz-u8)
-          (emit-cmp-reg-imm buf 'r8 #x12)
-          (emit-jcc buf :e sz-f32)
-          (emit-add-reg-imm buf 'r9 2)                   ; general: (count+2)*8, align 16
-          (emit-shl-reg-imm buf 'r9 3)
-          (emit-add-reg-imm buf 'r9 15)
-          (emit-and-reg-imm buf 'r9 -16)
-          (emit-jmp buf sz-adv)
-          (emit-label buf sz-f32)
-          (emit-shl-reg-imm buf 'r9 2)                   ; 4 bytes per lane, then the u8 rule
-          (emit-label buf sz-u8)
-          (emit-add-reg-imm buf 'r9 16)                  ; header + pad
-          (emit-add-reg-imm buf 'r9 15)
-          (emit-and-reg-imm buf 'r9 -16)
-          (emit-label buf sz-adv)
-          ;; CONSISTENCY GUARD: a start bit can be stale (an allocation that
-          ;; overshot into this space before the collection), so a "header"
-          ;; read here can be junk.  Take the skip only if it lands exactly on
-          ;; the free pointer or on another recorded object start -- every
-          ;; copied object has one -- and otherwise fall back to the flat scan.
-          (emit-bytes buf #x4C #x89 #xD6)                ; mov rsi, r10
-          (emit-add-reg-reg buf 'rsi 'r9)                ; rsi = r10 + size
-          (emit-cmp-reg-reg buf 'rsi 'r13)
-          (emit-jcc buf :e sz-take)
-          (emit-jcc buf :a scan-it)                      ; past the free pointer: junk
-          (emit-bytes buf #x48 #x2B #x34 #x25)           ; sub rsi, [page_base]
-          (emit-u32 buf +mcgc-cfg-page-base-addr+)
-          (emit-shr-reg-imm buf 'rsi 4)
-          (emit-bytes buf #x4C #x8B #x04 #x25)           ; mov r8, [bitmap_base]
-          (emit-u32 buf +mcgc-cfg-bitmap-addr+)
-          (emit-bytes buf #x49 #x0F #xA3 #x30)           ; bt [r8], rsi
-          (emit-jcc buf :nc scan-it)                     ; next granule is not a start: junk
-          (emit-label buf sz-take)
-          (emit-add-reg-reg buf 'r10 'r9)                ; step over the leaf object
-          (emit-jmp buf cheney-loop)
-          (emit-label buf scan-it)))
-      ;; Scan the word at [r10]
-      (emit-bytes buf #x4C #x89 #xD0)            ; mov rax, r10
-      (emit-call buf scan-word-label)
-      (emit-add-reg-imm buf 'r10 8)
-      (emit-jmp buf cheney-loop)
-      (emit-label buf cheney-done))
+    (emit-x64-flat-walk buf scan-word-label 'r13)
     (emit-gc-dbg-char buf #x63)          ; 'c' — cheney scan done
 
     ;; ---- Swap THIS REGION's semispaces ----
@@ -6491,8 +6991,11 @@
     (emit-bytes buf #x48 #xFF #x46)               ; inc qword [rsi+disp8]
     (emit-byte buf modus.mvm::+gc-off-count+)
 
+    (emit-x64-stw-release buf (and *x64-stw-verify* verify-label))
     ;; ---- Restore registers ----
     (emit-jmp buf restore-label)
+    (when *x64-stw* (emit-x64-stw-park buf park-label))
+    (when (and *x64-stw* *x64-stw-verify*) (emit-x64-stw-verify-word buf verify-label))
 
     ;; ===========================================================
     ;; SUBROUTINE: scan_word

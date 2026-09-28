@@ -455,7 +455,8 @@
    checksum over an empty range is a check that can only ever answer 0.
    Measured: without this the step-5 heap checksum was 0 -> 0."
   (%gc-meta-write (+ rcb #x30) (get-alloc-ptr) k)
-  (%gc-meta-write (+ rcb #x38) (get-alloc-limit) k)
+  ;; 0 is a stop-the-world clamp, not a limit (see %GC-REGION-ENTER).
+  (unless (zerop (get-alloc-limit)) (%gc-meta-write (+ rcb #x38) (get-alloc-limit) k))
   0)
 
 (defun %ha-thread-adopt-region (rcb k)

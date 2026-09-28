@@ -5813,6 +5813,14 @@
                    ((= op +op-fsub+) (a64-fsub-d buf 0 0 1))
                    ((= op +op-fmul+) (a64-fmul-d buf 0 0 1))
                    (t                (a64-fdiv-d buf 0 0 1)))
+             ;; Object-start bit for the box at x24, like every other alloc
+             ;; site.  Missing, the collector's scan_word rejected every
+             ;; pointer to an FP result as "not an object start" and left it
+             ;; pointing into from-space: every double reached the heap this
+             ;; way (the reader's 1.5d0 too) and read back as whatever was
+             ;; copied over it later.  Here: after the operands are in D0/D1,
+             ;; before the result goes to x9 -- gc-set-bit clobbers x9..x13.
+             (emit-aarch64-gc-mark-start buf)
              ;; D0 bits → x9
              (a64-fmov-x-d buf +a64-x9+ 0)
              ;; Allocate fresh 4-slot float at x24 (alloc ptr).
@@ -5837,6 +5845,7 @@
              (a64-asr-imm buf +a64-x9+ ps 1)
              ;; SCVTF D0, x9
              (a64-scvtf-d-x buf 0 +a64-x9+)
+             (emit-aarch64-gc-mark-start buf)   ; see FADD: clobbers x9..x13
              ;; D0 bits → x9
              (a64-fmov-x-d buf +a64-x9+ 0)
              ;; Allocate 4-slot float (same tail as fadd)

@@ -1211,6 +1211,12 @@
               ;; ppc32 and a two-function one did not.)  Each arch gets the
               ;; same single PC-relative branch x86 and ARM already had.
               ((member arch '(:riscv64 :riscv32))
+               ;; (Native code must START on a 16-byte boundary: the translator
+               ;; aligns every function entry to 16 relative to it, so that a
+               ;; tagged function pointer never ends in the collector's forward
+               ;; tag F.  PAD NOPs go between this jump and the code, and the
+               ;; jump skips them; the payload's load address is the ELF
+               ;; header size past a page boundary.)
                ;; AUIPC t0, hi20 ; JALR x0, lo12(t0) — a PC-relative jump that
                ;; reaches +/-2 GB.
                ;;
@@ -1231,7 +1237,10 @@
                ;; JALR's offset is SIGN-extended, so a lo12 >= 0x800 must be
                ;; borrowed from the high part.  t0 is free here — the stub has
                ;; finished with it and translated code has not started.
-               (let* ((off (+ entry-native-offset 8))   ; two instructions now
+               (let* ((hdr (case (getf boot-descriptor :elf-format)
+                             (:linux-riscv 120) (:linux-riscv32 84) (t 0)))
+                      (pad (mod (- 16 (mod (+ hdr (mvm-buffer-position final-buf) 8) 16)) 16))
+                      (off (+ entry-native-offset 8 pad))   ; two instructions + pad
                       (hi20 (ash (+ off #x800) -12))
                       (lo12 (- off (ash hi20 12)))
                       (auipc (logior #x17 (ash 5 7)          ; rd = x5 = t0
@@ -1240,12 +1249,13 @@
                                     (ash 0 12)               ; funct3 = 0
                                     (ash 5 15)               ; rs1 = t0
                                     (ash (logand lo12 #xFFF) 20))))
-                 (dolist (insn (list auipc jalr))
+                 (dolist (insn (append (list auipc jalr)
+                                       (make-list (floor pad 4) :initial-element #x00000013)))
                    (mvm-emit-byte final-buf (logand insn #xFF))
                    (mvm-emit-byte final-buf (logand (ash insn -8) #xFF))
                    (mvm-emit-byte final-buf (logand (ash insn -16) #xFF))
                    (mvm-emit-byte final-buf (logand (ash insn -24) #xFF)))
-                 (setq jmp-size 8)))
+                 (setq jmp-size (+ 8 pad))))
               ((member arch '(:ppc64 :ppc32))
                ;; b target  (I-form, opcode 18, AA=0, LK=0): the 24-bit LI
                ;; field is the word-aligned displacement from THIS

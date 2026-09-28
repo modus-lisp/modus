@@ -44,8 +44,9 @@
 (defun %hc-armed-p () (if (eql (mem-ref #x10000180 :u32) 0) nil t))
 ")
 
-;;; No pre-init setup: the whole low block is a zero-filled MAP_ANONYMOUS mmap,
-;;; and there is no native collector, so no %gc-bitmap-init (as on RV64).
+;;; No pre-init setup: the whole low block is a zero-filled MAP_ANONYMOUS mmap.
+;;; The native collector (translate-riscv's RV-EMIT-GC-COLLECTOR, shared with
+;;; RV64) keeps its bitmaps in the boot mapping, so no %gc-bitmap-init either.
 (defvar *cli-arch-kernel-prologue* "")
 
 ;;; Scratch pages below the allocator (which starts at heap+#x20000 here):

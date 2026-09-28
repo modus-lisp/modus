@@ -407,6 +407,14 @@
   "LHU rd, imm12(rs1) (load halfword unsigned)"
   (rv-emit-u32 buf (rv-encode-i-type imm12 rs1 #x5 rd #x03)))
 
+(defun rv-emit-flw (buf fd rs1 imm12)
+  "FLW fd, imm12(rs1) -- load a single into an FP register."
+  (rv-emit-u32 buf (rv-encode-i-type imm12 rs1 #x2 fd #x07)))
+
+(defun rv-emit-fsw (buf fs2 rs1 imm12)
+  "FSW fs2, imm12(rs1) -- store a single from an FP register."
+  (rv-emit-u32 buf (rv-encode-s-type imm12 fs2 rs1 #x2 #x27)))
+
 (defun rv-emit-fld (buf fd rs1 imm12)
   "FLD fd, imm12(rs1) -- load a double into an FP register (D extension)."
   (rv-emit-u32 buf (rv-encode-i-type imm12 rs1 #x3 fd #x07)))
@@ -681,6 +689,10 @@
   (rv-emit-u32 buf (rv-encode-i-type imm12 rs1 #x0 rd #x67)))
 
 ;; --- System instructions ---
+
+(defun rv-emit-fence-i (buf)
+  "FENCE.I -- order this hart's instruction fetch after its own stores."
+  (rv-emit-u32 buf #x0000100F))
 
 (defun rv-emit-ecall (buf)
   "ECALL (environment call)"
@@ -1392,6 +1404,110 @@
             (rv-emit-mv buf +rv-a7+ +rv-t0+)
             (rv-emit-ecall buf)
             (rv-emit-slli buf +rv-a0+ +rv-a0+ 1))       ; tag the result
+           ((and (= code #x0503) *riscv-linux-mode*)
+            ;; RAW 3-ARG SYSCALL: number TAGGED in V0, args V1..V3 passed as
+            ;; they are, result RAW in V0 -- translate-x64/aarch64/i386's
+            ;; contract.  Same register shuffle as #x0502, minus the shifts.
+            (rv-emit-srai buf +rv-t0+ +rv-a0+ 1)
+            (rv-emit-mv buf +rv-a0+ +rv-a1+)
+            (rv-emit-mv buf +rv-a1+ +rv-a2+)
+            (rv-emit-mv buf +rv-a2+ +rv-a3+)
+            (rv-emit-mv buf +rv-a7+ +rv-t0+)
+            (rv-emit-ecall buf))
+           ((and (= code #x0310) *riscv-linux-mode*)
+            ;; RDTSC: a monotonic counter, TAGGED, in VR; (cntfrq) is its rate.
+            ;; The CPU counters are no good here -- Linux may deny rdcycle to
+            ;; user mode and rdtime's rate is a device-tree fact -- so it is
+            ;; clock_gettime(CLOCK_MONOTONIC).  a1 is saved: this is not a call.
+            ;;   RV64: nanoseconds, rate 10^9 (62 bits: centuries).
+            ;;   RV32: MILLISECONDS SINCE THE FIRST READ, rate 1000.  A 30-bit
+            ;;         fixnum holds 12.4 days of that and no absolute counter at
+            ;;         all; the first read's seconds are kept, tagged (so the
+            ;;         collector's low-block scan sees a fixnum), +1 so that 0
+            ;;         still means unset, at #x10000FB8 (free; save-image stages
+            ;;         it, so a restored process starts its own epoch).
+            (progn
+              (rv-emit-addi buf +rv-sp+ +rv-sp+ -32)
+              (rv-emit-store-word buf +rv-a1+ +rv-sp+ 16)
+              (rv-emit-addi buf +rv-a0+ +rv-x0+ 1)             ; CLOCK_MONOTONIC
+              (rv-emit-mv buf +rv-a1+ +rv-sp+)
+              (rv-emit-addi buf +rv-a7+ +rv-x0+ (if *riscv-64-bit* 113 403))
+              (rv-emit-ecall buf)
+              (rv-emit-load-word buf +rv-t0+ +rv-sp+ 0)         ; tv_sec (low word)
+              (rv-emit-load-word buf +rv-t1+ +rv-sp+ 8)         ; tv_nsec
+              (if *riscv-64-bit*
+                  (progn
+                    (rv-emit-li buf +rv-t2+ 1000000000)
+                    (rv-emit-mul buf +rv-t0+ +rv-t0+ +rv-t2+)
+                    (rv-emit-add buf +rv-t0+ +rv-t0+ +rv-t1+))
+                  (progn
+                    (rv-emit-li buf +rv-t2+ #x10000FB8)
+                    (rv-emit-lw buf +rv-t3+ +rv-t2+ 0)
+                    (rv-emit-bne buf +rv-t3+ +rv-x0+ 16)          ; epoch set?
+                    (rv-emit-addi buf +rv-t3+ +rv-t0+ 1)
+                    (rv-emit-slli buf +rv-t3+ +rv-t3+ 1)
+                    (rv-emit-sw buf +rv-t3+ +rv-t2+ 0)
+                    (rv-emit-srai buf +rv-t3+ +rv-t3+ 1)
+                    (rv-emit-addi buf +rv-t3+ +rv-t3+ -1)         ; epoch seconds
+                    (rv-emit-sub buf +rv-t0+ +rv-t0+ +rv-t3+)
+                    (rv-emit-li buf +rv-t2+ 1000)
+                    (rv-emit-mul buf +rv-t0+ +rv-t0+ +rv-t2+)
+                    (rv-emit-li buf +rv-t2+ 1000000)
+                    (rv-emit-div buf +rv-t1+ +rv-t1+ +rv-t2+)
+                    (rv-emit-add buf +rv-t0+ +rv-t0+ +rv-t1+)))
+              (rv-emit-slli buf +rv-a0+ +rv-t0+ 1)
+              (rv-emit-load-word buf +rv-a1+ +rv-sp+ 16)
+              (rv-emit-addi buf +rv-sp+ +rv-sp+ 32)))
+           ((and (= code #x0311) *riscv-linux-mode*)
+            ;; CNTFRQ: the rate of #x0310's counter, TAGGED.  See #x0310.
+            (rv-emit-li buf +rv-a0+ (ash (if *riscv-64-bit* 1000000000 1000) 1)))
+           ((and (= code #x0531) *riscv-linux-mode*)
+            ;; %MMAP-EXEC-PAGE size: mmap(NULL, size, RWX, PRIVATE|ANON, -1, 0),
+            ;; address TAGGED in V0 (negative errno on failure).  RV32: an
+            ;; address at or above 2^30 has no fixnum, so the mapping is given
+            ;; back and -ENOMEM returned rather than a wrapped address.
+            (rv-emit-srai buf +rv-a1+ +rv-a0+ 1)
+            (rv-emit-mv buf +rv-t2+ +rv-a1+)
+            (rv-emit-mv buf +rv-a0+ +rv-x0+)
+            (rv-emit-addi buf +rv-a2+ +rv-x0+ 7)
+            (rv-emit-addi buf +rv-a3+ +rv-x0+ #x22)
+            (rv-emit-addi buf +rv-a4+ +rv-x0+ -1)
+            (rv-emit-mv buf +rv-a5+ +rv-x0+)
+            (rv-emit-addi buf +rv-a7+ +rv-x0+ 222)
+            (rv-emit-ecall buf)
+            (rv-emit-slli buf +rv-t0+ +rv-a0+ 1)
+            (unless *riscv-64-bit*
+              (rv-emit-srai buf +rv-t1+ +rv-t0+ 1)
+              (rv-emit-beq buf +rv-t1+ +rv-a0+ 24)             ; fits: done
+              (rv-emit-mv buf +rv-a1+ +rv-t2+)
+              (rv-emit-addi buf +rv-a7+ +rv-x0+ 215)          ; munmap
+              (rv-emit-ecall buf)
+              (rv-emit-addi buf +rv-t0+ +rv-x0+ -24)          ; tagged -ENOMEM
+              (rv-emit-nop buf))
+            (rv-emit-mv buf +rv-a0+ +rv-t0+))
+           ((and (= code #x0532) *riscv-linux-mode*)
+            ;; %JIT-CALL entry: untag and call; the callee's value is in a0 = VR.
+            ;; ra is the enclosing function's, saved by its prologue.
+            (rv-emit-srai buf +rv-t0+ +rv-a0+ 1)
+            (rv-emit-jalr buf +rv-ra+ +rv-t0+ 0))
+           ((and (= code #x0533) *riscv-linux-mode*)
+            ;; %JIT-ICACHE-FLUSH base len: FENCE.I for this hart, then
+            ;; riscv_flush_icache(base, base+len, 0) (syscall 259) for the others.
+            (rv-emit-fence-i buf)
+            (rv-emit-srai buf +rv-a0+ +rv-a0+ 1)
+            (rv-emit-srai buf +rv-a1+ +rv-a1+ 1)
+            (rv-emit-add buf +rv-a1+ +rv-a1+ +rv-a0+)
+            (rv-emit-mv buf +rv-a2+ +rv-x0+)
+            (rv-emit-addi buf +rv-a7+ +rv-x0+ 259)
+            (rv-emit-ecall buf)
+            (rv-emit-slli buf +rv-a0+ +rv-a0+ 1))
+           ((and (= code #x0534) *riscv-linux-mode*)
+            ;; %JIT-FREE-PAGE base len: munmap, result tagged.
+            (rv-emit-srai buf +rv-a0+ +rv-a0+ 1)
+            (rv-emit-srai buf +rv-a1+ +rv-a1+ 1)
+            (rv-emit-addi buf +rv-a7+ +rv-x0+ 215)
+            (rv-emit-ecall buf)
+            (rv-emit-slli buf +rv-a0+ +rv-a0+ 1))
            ((and (= code #x0500) *riscv-linux-mode*)
             ;; HOSTED: exit(status), status arriving TAGGED in V0.
             (rv-emit-srai buf +rv-a0+ +rv-a0+ 1)
@@ -2316,9 +2432,10 @@
          (rv-emit-load-word buf +rv-s5+  +rv-sp+ (- total-frame 56))
          (rv-emit-load-word buf +rv-s6+  +rv-sp+ (- total-frame 64))
          (rv-emit-load-word buf +rv-s7+  +rv-sp+ (- total-frame 72))
-         (rv-emit-load-word buf +rv-s8+  +rv-sp+ (- total-frame 80))
-         (rv-emit-load-word buf +rv-s9+  +rv-sp+ (- total-frame 88))
-         (rv-emit-load-word buf +rv-s10+ +rv-sp+ (- total-frame 96))
+         ;; NOT s8/s9/s10 (VA, VL, NIL): global state, never saved by the
+         ;; prologue -- see rv-emit-epilogue.  This arm reloaded all three from
+         ;; those never-written slots, i.e. rolled the allocation pointer back
+         ;; to whatever stale word sat there.
          (rv-emit-load-word buf +rv-s11+ +rv-sp+ (- total-frame 104))
          ;; Deallocate frame
          (rv-emit-addi buf +rv-sp+ +rv-sp+ total-frame)
@@ -2597,6 +2714,110 @@
          (rv-emit-addi buf +rv-t0+ +rv-s8+ (rv-object-tag))
          (rv-emit-add buf +rv-s8+ +rv-s8+ +rv-t1+)
          (store-result vd +rv-t0+)))
+
+      ;; ---- Packed single-float vectors (subtag #x12) ----
+      ;; Header (N << 8) | #x12 with N in LANES, then N 4-byte IEEE32 lanes
+      ;; right after the header word (no padding word on this target, as for
+      ;; u8 vectors): lane i at tagged + w - tag + 4i.  Size = align(w + 4N),
+      ;; the collector's #x12 rule.  #x12 is a leaf: lanes are never scanned.
+      (#.+op-alloc-f32+
+       (let* ((vd (vreg 0))
+              (rc (resolve (vreg 1) +rv-t2+))
+              (w (rv-word-size)))
+         (rv-emit-alloc-mark buf :start)
+         (rv-emit-srai buf +rv-t2+ rc 1)              ; N
+         (rv-emit-slli buf +rv-t0+ +rv-t2+ 8)
+         (rv-emit-addi buf +rv-t0+ +rv-t0+ #x12)
+         (rv-emit-store-word buf +rv-t0+ +rv-s8+ 0)
+         (rv-emit-slli buf +rv-t1+ +rv-t2+ 2)
+         (rv-emit-addi buf +rv-t1+ +rv-t1+ w)
+         (rv-emit-addi buf +rv-t1+ +rv-t1+ (1- (rv-granule)))
+         (rv-emit-andi buf +rv-t1+ +rv-t1+ (- (rv-granule)))
+         ;; ZERO the lanes: a new vector reads 0.0f0 (%MAKE-F32-VECTOR's
+         ;; contract), and the bump region may hold a dead object's bytes.
+         (rv-emit-addi buf +rv-t0+ +rv-s8+ w)
+         (rv-emit-add buf +rv-t3+ +rv-s8+ +rv-t1+)
+         (rv-emit-bgeu buf +rv-t0+ +rv-t3+ 16)          ; loop: done?
+         (rv-emit-sw buf +rv-x0+ +rv-t0+ 0)
+         (rv-emit-addi buf +rv-t0+ +rv-t0+ 4)
+         (rv-emit-jal buf +rv-x0+ -12)
+         (rv-emit-addi buf +rv-t0+ +rv-s8+ (rv-object-tag))
+         (rv-emit-add buf +rv-s8+ +rv-s8+ +rv-t1+)
+         (store-result vd +rv-t0+)))
+
+      (#.+op-f32-ref+
+       ;; (f32-ref Vd Varr Vidx) -- the lane's raw 32 bits as a TAGGED fixnum.
+       ;; RV64 only: 32 bits do not fit RV32's 31-bit fixnum, so on 30-bit
+       ;; towers COMPILE-F32-REF expands %F32-BITS-REF into byte reads and
+       ;; generic arithmetic instead, and this opcode never reaches RV32.
+       (if (not *riscv-64-bit*)
+           (progn (rv-note-unimpl opcode)
+                  (rv-emit-addi buf +rv-a7+ +rv-x0+ opcode)
+                  (rv-emit-ebreak buf))
+           (let* ((vd (vreg 0))
+                  (rarr (resolve (vreg 1)))
+                  (ridx (resolve2 (vreg 2))))
+             (rv-emit-srai buf +rv-t2+ ridx 1)
+             (rv-emit-slli buf +rv-t2+ +rv-t2+ 2)
+             (rv-emit-add buf +rv-t2+ +rv-t2+ rarr)
+             (rv-emit-lwu buf +rv-t2+ +rv-t2+ (- (rv-word-size) (rv-object-tag)))
+             (rv-emit-slli buf +rv-t2+ +rv-t2+ 1)
+             (store-result vd +rv-t2+))))
+
+      (#.+op-f32-set+
+       ;; (f32-set Varr Vidx Vval) -- store the low 32 bits of the untagged
+       ;; value.  RV64 only, for the reason at :F32-REF.
+       (if (not *riscv-64-bit*)
+           (progn (rv-note-unimpl opcode)
+                  (rv-emit-addi buf +rv-a7+ +rv-x0+ opcode)
+                  (rv-emit-ebreak buf))
+           (let* ((rarr (resolve (vreg 0)))
+                  (ridx (rv-vreg-or-load buf (vreg 1) +rv-t1+))
+                  (rval (rv-vreg-or-load buf (vreg 2) +rv-t2+)))
+             (rv-emit-srai buf +rv-t1+ ridx 1)
+             (rv-emit-slli buf +rv-t1+ +rv-t1+ 2)
+             (rv-emit-add buf +rv-t1+ +rv-t1+ rarr)
+             (rv-emit-srai buf +rv-t2+ rval 1)
+             (rv-emit-sw buf +rv-t2+ +rv-t1+ (- (rv-word-size) (rv-object-tag))))))
+
+      (#.+op-f32-load+
+       ;; (f32-load Vd Varr Vidx) -- lane -> FCVT.D.S -> fresh boxed single.
+       (let* ((vd (vreg 0))
+              (rarr (resolve (vreg 1)))
+              (ridx (resolve2 (vreg 2))))
+         (rv-emit-srai buf +rv-t3+ ridx 1)
+         (rv-emit-slli buf +rv-t3+ +rv-t3+ 2)
+         (rv-emit-add buf +rv-t3+ +rv-t3+ rarr)
+         (rv-emit-flw buf 0 +rv-t3+ (- (rv-word-size) (rv-object-tag)))
+         (rv-emit-fcvt-d-s buf 0 0)
+         (if (not *riscv-64-bit*)
+             (rv32-float-box buf 0 +rv-t3+ +rv-t2+ #x64)
+             (progn
+               (rv-emit-fmv-x-d buf +rv-t0+ 0)
+               (rv-float-box buf +rv-t0+ +rv-t1+ +rv-t2+ #x64)))
+         (store-result vd +rv-t2+)))
+
+      (#.+op-f32-store+
+       ;; (f32-store Varr Vidx Vval) -- boxed float payload -> FCVT.S.D (RNE)
+       ;; -> lane.  The lane address is formed FIRST, in t3, because unboxing
+       ;; the value uses t0/t1, which may be the array's and index's scratch.
+       (let* ((rarr (resolve (vreg 0)))
+              (ridx (resolve2 (vreg 1))))
+         (rv-emit-srai buf +rv-t3+ ridx 1)
+         (rv-emit-slli buf +rv-t3+ +rv-t3+ 2)
+         (rv-emit-add buf +rv-t3+ +rv-t3+ rarr)
+         (let ((rval (rv-vreg-or-load buf (vreg 2) +rv-t2+)))
+           (if (not *riscv-64-bit*)
+               (progn
+                 ;; rv32-float-unbox's temporary must not be the address.
+                 (rv-emit-mv buf +rv-t5+ +rv-t3+)
+                 (rv32-float-unbox buf rval 0 +rv-t4+)
+                 (rv-emit-mv buf +rv-t3+ +rv-t5+))
+               (progn
+                 (rv-float-load-bits buf rval +rv-t0+ +rv-t1+)
+                 (rv-emit-fmv-d-x buf 0 +rv-t0+))))
+         (rv-emit-fcvt-s-d buf 0 0)
+         (rv-emit-fsw buf 0 +rv-t3+ (- (rv-word-size) (rv-object-tag)))))
 
       (#.+op-alloc-string+
        ;; One character CODE per WORD, as on every other target.
@@ -3131,7 +3352,8 @@
 
 (defconstant +rv-hosted-convention-base+ #x10000000)
 (defconstant +rv-hosted-gc-meta+ #x10000040
-  "from_start, to_start, space_size, stack_base, gc_count -- one WORD each.")
+  "from_start, to_start, space_size, stack_base, gc_count -- 8 bytes apart on
+   both widths (a WORD in each, zero high half on RV32), gc.lisp's layout.")
 
 (defun rv-hosted-root-block-end ()
   "End of the low convention block = heap + the allocator's start offset, read
@@ -3187,15 +3409,17 @@
             do (rv-emit-store-word buf r +rv-sp+ (* r w)))
       ;; ---- geometry ----
       (rv-emit-li buf +rv-t0+ +rv-hosted-gc-meta+)
+      ;; Fields are 8 bytes apart on BOTH widths (gc.lisp's layout; see
+      ;; boot-linux-riscv32.lisp), so these offsets are not multiples of W.
       (rv-emit-load-word buf +rv-s1+ +rv-t0+ 0)            ; from_start
-      (rv-emit-load-word buf +rv-s3+ +rv-t0+ w)            ; to_start
-      (rv-emit-load-word buf +rv-t2+ +rv-t0+ (* 2 w))      ; space_size
+      (rv-emit-load-word buf +rv-s3+ +rv-t0+ 8)            ; to_start
+      (rv-emit-load-word buf +rv-t2+ +rv-t0+ 16)           ; space_size
       (rv-emit-add buf +rv-s2+ +rv-s1+ +rv-t2+)            ; from_end
       (rv-emit-add buf +rv-s4+ +rv-s3+ +rv-t2+)            ; to_end
       (rv-emit-mv buf +rv-s5+ +rv-s3+)                     ; object free (up)
       (rv-emit-mv buf +rv-s6+ +rv-s4+)                     ; cons low (down)
       ;; ---- roots: stack (from the save frame) ----
-      (rv-emit-load-word buf +rv-s11+ +rv-t0+ (* 3 w))     ; stack_base
+      (rv-emit-load-word buf +rv-s11+ +rv-t0+ 24)          ; stack_base
       (rv-emit-mv buf +rv-t2+ +rv-sp+)
       (scan-range +rv-t2+ +rv-s11+ w)
       ;; ---- roots: the low convention block ----
@@ -3214,15 +3438,24 @@
         (rv-emit-load-word buf +rv-t0+ +rv-a5+ 0)          ; header
         (rv-emit-srli buf +rv-a7+ +rv-t0+ 8)               ; count
         (rv-emit-andi buf +rv-a4+ +rv-t0+ #xFF)            ; subtag
-        ;; size -> t4 : byte vector = count + w, else (count+1)*w; align 16
-        (rv-emit-addi buf +rv-t3+ +rv-x0+ #x11)
-        (let ((words (fwd #'rv-emit-bne +rv-a4+ +rv-t3+)))
-          (rv-emit-addi buf +rv-t4+ +rv-a7+ w)
-          (let ((al (jmp-fwd)))
-            (here words)
-            (rv-emit-addi buf +rv-t4+ +rv-a7+ 1)
-            (rv-emit-slli buf +rv-t4+ +rv-t4+ wsh)
-            (rv-patch-jal-here buf al)))
+        ;; size -> t4 : byte vector = count + w, f32 vector = 4*count + w,
+        ;; else (count+1)*w; align 16.  (#x12 used to take the WORD rule:
+        ;; exact on RV32, double on RV64 -- and alloc-f32 must agree with it.)
+        (rv-emit-addi buf +rv-t3+ +rv-x0+ #x12)
+        (let ((not-f32 (fwd #'rv-emit-bne +rv-a4+ +rv-t3+)))
+          (rv-emit-slli buf +rv-t4+ +rv-a7+ 2)
+          (rv-emit-addi buf +rv-t4+ +rv-t4+ w)
+          (let ((al-f32 (jmp-fwd)))
+            (here not-f32)
+            (rv-emit-addi buf +rv-t3+ +rv-x0+ #x11)
+            (let ((words (fwd #'rv-emit-bne +rv-a4+ +rv-t3+)))
+              (rv-emit-addi buf +rv-t4+ +rv-a7+ w)
+              (let ((al (jmp-fwd)))
+                (here words)
+                (rv-emit-addi buf +rv-t4+ +rv-a7+ 1)
+                (rv-emit-slli buf +rv-t4+ +rv-t4+ wsh)
+                (rv-patch-jal-here buf al)))
+            (rv-patch-jal-here buf al-f32)))
         (rv-emit-addi buf +rv-t4+ +rv-t4+ 15)
         (rv-emit-andi buf +rv-t4+ +rv-t4+ -16)
         ;; next object start kept in s7? no -- s7 is the slot cursor; use a3
@@ -3273,10 +3506,10 @@
       ;; ---- swap the semispaces, count the collection ----
       (rv-emit-li buf +rv-t0+ +rv-hosted-gc-meta+)
       (rv-emit-store-word buf +rv-s3+ +rv-t0+ 0)
-      (rv-emit-store-word buf +rv-s1+ +rv-t0+ w)
-      (rv-emit-load-word buf +rv-t2+ +rv-t0+ (* 4 w))
+      (rv-emit-store-word buf +rv-s1+ +rv-t0+ 8)
+      (rv-emit-load-word buf +rv-t2+ +rv-t0+ 32)           ; gc_count
       (rv-emit-addi buf +rv-t2+ +rv-t2+ 1)
-      (rv-emit-store-word buf +rv-t2+ +rv-t0+ (* 4 w))
+      (rv-emit-store-word buf +rv-t2+ +rv-t0+ 32)
       ;; ---- new VA / VL, written into the save frame so the restore installs
       ;;      them; refuse to return with less than the margin free ----
       (rv-emit-li buf +rv-t2+ +rv-gc-overshoot-margin+)
@@ -3333,14 +3566,22 @@
           ;; -- object: header in t5 --
           (rv-emit-srli buf +rv-a1+ +rv-t5+ 8)
           (rv-emit-andi buf +rv-a2+ +rv-t5+ #xFF)
-          (rv-emit-addi buf +rv-t3+ +rv-x0+ #x11)
-          (let ((words (fwd #'rv-emit-bne +rv-a2+ +rv-t3+)))
+          ;; size rule: see the scan's -- #x12 is 4*count + w
+          (rv-emit-addi buf +rv-t3+ +rv-x0+ #x12)
+          (let ((not-f32 (fwd #'rv-emit-bne +rv-a2+ +rv-t3+)))
+            (rv-emit-slli buf +rv-a1+ +rv-a1+ 2)
             (rv-emit-addi buf +rv-a1+ +rv-a1+ w)
-            (let ((al (jmp-fwd)))
-              (here words)
-              (rv-emit-addi buf +rv-a1+ +rv-a1+ 1)
-              (rv-emit-slli buf +rv-a1+ +rv-a1+ wsh)
-              (rv-patch-jal-here buf al)))
+            (let ((al-f32 (jmp-fwd)))
+              (here not-f32)
+              (rv-emit-addi buf +rv-t3+ +rv-x0+ #x11)
+              (let ((words (fwd #'rv-emit-bne +rv-a2+ +rv-t3+)))
+                (rv-emit-addi buf +rv-a1+ +rv-a1+ w)
+                (let ((al (jmp-fwd)))
+                  (here words)
+                  (rv-emit-addi buf +rv-a1+ +rv-a1+ 1)
+                  (rv-emit-slli buf +rv-a1+ +rv-a1+ wsh)
+                  (rv-patch-jal-here buf al)))
+              (rv-patch-jal-here buf al-f32)))
           (rv-emit-addi buf +rv-a1+ +rv-a1+ 15)
           (rv-emit-andi buf +rv-a1+ +rv-a1+ -16)           ; size
           ;; gates: a "header" whose object cannot lie inside from-space is not
@@ -3392,6 +3633,17 @@
         (dolist (r rets) (here r))
         (rv-emit-jalr buf +rv-x0+ +rv-ra+ 0)))))
 
+(defvar *rv-fn-starts* nil
+  "Set of bytecode offsets that begin a function, for the translation in
+   progress; see the alignment note in TRANSLATE-MVM-TO-RISCV.")
+
+(defun rv-align-function-start (buf mvm-pc)
+  "Pad BUF with NOPs to a 16-byte boundary if MVM-PC begins a function.
+   Depends only on the buffer offset, so both passes pad identically."
+  (when (and *rv-fn-starts* (gethash mvm-pc *rv-fn-starts*))
+    (loop until (zerop (mod (rv-current-offset buf) 16))
+          do (rv-emit-nop buf))))
+
 (defun translate-mvm-to-riscv (bytecode function-table)
   "Translate MVM bytecode to RISC-V native code.
    BYTECODE is a vector of (unsigned-byte 8) containing MVM instructions.
@@ -3422,11 +3674,28 @@
                  (setf pos new-pos))))
     (setf insns (nreverse insns))
 
+    ;; FUNCTION ENTRIES ARE 16-ALIGNED.  :fn-addr ORs +tag-function+ (3) into
+    ;; the entry address, and with 4-byte alignment only, an entry at 12 mod 16
+    ;; made a function pointer whose low nibble is F -- the collector's
+    ;; FORWARDING tag.  A cons whose CAR was such a pointer looked already
+    ;; forwarded, so the collector rewrote the reference to (car & ~15) | 1, a
+    ;; pointer into CODE, and never copied the cell: RV32 lost the last cell of
+    ;; *GF-STUB-CLOSURES* at its first collection, and from then on every
+    ;; FUNCTIONP (so every list print, every new toplevel form) died in MEMBER.
+    ;; x64 and i386 align entries to 16 for exactly this reason.  (Paired with
+    ;; cross.lisp, which starts the native code itself on a 16-byte boundary.)
+    (let ((fn-starts (make-hash-table :test 'eql)))
+      (when function-table
+        (maphash (lambda (idx off) (declare (ignore idx)) (setf (gethash off fn-starts) t))
+                 function-table))
+      (setf *rv-fn-starts* fn-starts))
+
     ;; ---- Pass 1: Measure native code sizes ----
     ;; Emit into a temporary buffer to measure sizes, build label-map
     (let ((measure-buf (make-rv-buffer)))
       (dolist (insn insns)
         (destructuring-bind (mvm-pc opcode operands next-pc) insn
+          (rv-align-function-start measure-buf mvm-pc)
           (setf (gethash mvm-pc label-map) (rv-current-offset measure-buf))
           ;; Pass next-pc for branch offset computation (MVM offsets are from end of insn)
           (translate-mvm-insn-riscv measure-buf opcode operands next-pc
@@ -3452,6 +3721,7 @@
     (let ((final-buf (make-rv-buffer)))
       (dolist (insn insns)
         (destructuring-bind (mvm-pc opcode operands next-pc) insn
+          (rv-align-function-start final-buf mvm-pc)
           ;; PASS 1'S MAP IS THE AUTHORITY.  This used to REWRITE the entry with
           ;; pass 2's position, which quietly mixes the two passes: a BACKWARD
           ;; branch then resolves against a pass-2 offset while a FORWARD branch

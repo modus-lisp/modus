@@ -1063,6 +1063,21 @@
   "Allocate a packed single-float vector of N lanes, zero-filled (= 0.0f0)."
   (%alloc-f32 n))
 
+;; 30-bit towers: a lane's IEEE32 bits are 0..2^32-1, which is not always a
+;; fixnum, so %F32-BITS-REF/-SET compile to these (COMPILE-F32-REF).  The lanes
+;; are plain little-endian bytes after the header, exactly where %U8-REF looks.
+(defun %f32-bits-ref-narrow (a i)
+  (let ((b (* 4 i)))
+    (logior (%u8-ref a b) (ash (%u8-ref a (+ b 1)) 8)
+            (ash (%u8-ref a (+ b 2)) 16) (ash (%u8-ref a (+ b 3)) 24))))
+(defun %f32-bits-set-narrow (a i bits)
+  (let ((b (* 4 i)))
+    (%u8-set a b (logand bits 255))
+    (%u8-set a (+ b 1) (logand (ash bits -8) 255))
+    (%u8-set a (+ b 2) (logand (ash bits -16) 255))
+    (%u8-set a (+ b 3) (logand (ash bits -24) 255))
+    bits))
+
 (defun %f32-bits-ref-rt (a i) (%f32-bits-ref a i))
 (defun %f32-bits-set-rt (a i bits) (%f32-bits-set a i bits))
 

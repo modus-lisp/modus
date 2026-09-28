@@ -20702,7 +20702,14 @@
     (free-temp-reg)))
 
 (defun compile-f32-ref (arr-form idx-form env dest)
-  "Compile (%f32-bits-ref arr idx) — the lane's raw IEEE32 bits as a fixnum."
+  "Compile (%f32-bits-ref arr idx) — the lane's raw IEEE32 bits as a fixnum.
+   On a tower narrower than 32 bits (RV32, i386) the bits need not BE a
+   fixnum -- every negative single is >= 2^31 -- so the :F32-REF opcode, which
+   tags them in a register, cannot be right there; it is a call to
+   %F32-BITS-REF-NARROW instead (byte reads + generic arithmetic)."
+  (when (< +fixnum-bits+ 32)
+    (return-from compile-f32-ref
+      (compile-form `(%f32-bits-ref-narrow ,arr-form ,idx-form) env dest)))
   (let ((arr-reg (alloc-temp-reg))
         (idx-reg (alloc-temp-reg)))
     (compile-form arr-form env arr-reg)
@@ -20713,7 +20720,11 @@
 
 (defun compile-f32-set (arr-form idx-form val-form env dest)
   "Compile (%f32-bits-set arr idx bits) — store the low 32 bits of BITS into
-   the lane.  Returns BITS."
+   the lane.  Returns BITS.  Narrow towers: %F32-BITS-SET-NARROW, see
+   COMPILE-F32-REF (BITS may be a bignum there)."
+  (when (< +fixnum-bits+ 32)
+    (return-from compile-f32-set
+      (compile-form `(%f32-bits-set-narrow ,arr-form ,idx-form ,val-form) env dest)))
   (let ((val-reg (alloc-temp-reg)))
     (compile-form val-form env val-reg)
     (let ((arr-reg (alloc-temp-reg))

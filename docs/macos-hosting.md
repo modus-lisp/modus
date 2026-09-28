@@ -675,20 +675,27 @@ set.
 
 `test/hosted-stw.lisp` has four workers traverse main's list, vector and
 interpreted closure while main collects region 0.  It requires at least three
-such collections during the run and no bad traversal.  It passes on AArch64.
-On x86-64 it fails, for a reason that has nothing to do with collection.
-- Several workers FUNCALLing one interpreted closure at once corrupt each
-  other's interpreter: "unknown opcode", "stack underflow".
-- It happens with main asleep and zero collections, and on the build from
-  before stop-the-world existed.
-- One worker alone is fine.
+such collections during the run and no bad traversal.  It passes on AArch64
+and on x86-64.
 
-The x86-64 handshake itself was checked separately:
-- Four workers traversing main's data, the interpreted closure included,
-  through three forced region-0 collections: no bad traversal, main's data
-  intact.
-- A diagnostic build (`MODUS_STW_VERIFY=1`) re-walks every extra root after
-  each collection.  It found no word still pointing into the evacuated space.
+On x86-64 it used to fail for reasons that had nothing to do with collection.
+Several workers calling one interpreted closure at once corrupted each other
+("unknown opcode", "stack underflow"), even with main asleep and zero
+collections.  It was three bugs, each a thread writing another thread's state
+(`test/hosted-handler-depth.lisp`):
+- **Window blocks too small.**  Linux keeps 512 handler frames at window
+  +0x1000..+0x5000, but the per-thread window blocks were 4 KB apart.  A
+  worker's frames landed on the next worker's multiple-value slots and nargs;
+  the victim was always the even-numbered thread.  The blocks are now 0x5000
+  bytes (`%THR-TLS-BLOCK`).
+- **Bridge thunks wrote main's nargs.**  The JIT's bridge thunks stored nargs
+  to the absolute slot with no FS override; the AArch64 ones added no thread
+  delta.  The AArch64 `#'NAME` thunk's index slot was shared the same way; it
+  is now a per-thread window offset.
+- **The JIT's co-init missed the per-CPU region mode.**  A JIT page carries
+  its own GC trampoline and allocation paths, compiled in-image.  Without
+  `*X64-GC-REGION-PERCPU*` they used CPU 0's region cell, so a worker's JIT'd
+  collection collected main's heap.
 
 ### The lock arena is collected
 

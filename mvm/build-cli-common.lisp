@@ -466,6 +466,17 @@
   ;; SOURCE STRING, so a double quote here ends the string literal.)
   (setq *x64-tls-window* t)
   (setq *x64-stw* t)
+  ;; THE ACTIVE REGION IS PER CPU, and a JIT page's own GC trampoline and
+  ;; allocation paths must read it the way the image's do (build-generic-cli
+  ;; sets :RUNTIME for the AOT half).  Left at the defvar's NIL they read the
+  ;; single cell -- CPU 0's, region 0 -- so a worker's JIT'd collection
+  ;; collected MAIN's heap from the worker, and its allocations went there:
+  ;; measured as a worker's &rest lists and argument counts corrupting under
+  ;; nested HANDLER-CASE (test/hosted-handler-depth.lisp), JIT only.
+  (setq *x64-gc-region-percpu* :runtime)
+  ;; RESTORE-CTX releases the hosted scheduler lock (+HOSTED-SCHED-LOCK-ADDR+),
+  ;; as the image's does.
+  (setq *x64-sched-lock-addr* 268439488)
   (setq *tls-window* t)
   ;; handler-case handler paths check for a freshly recovered hardware fault
   ;; (see compile-handler-case / %HC-FAULT-FIXUP).
@@ -508,6 +519,9 @@
    (if *cli-bare-metal*
        "  (setq *x64-linux-mode* nil)
   (setq *ws5-force-no-kindcheck* t)
+  (setq *x64-gc-region-percpu* nil)
+  (setq *x64-sched-lock-addr* nil)
+  (setq *x64-stw* nil)
 "
        "")
    "  t)

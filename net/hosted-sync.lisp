@@ -104,9 +104,10 @@
           (let ((q (%gc-read64 (%thr-page-slot))))
             (if (> q 0)
                 (progn (spin-unlock (%thr-page-lock)) q)
-                ;; AArch64 appends sixteen 0x11000-byte window blocks at
-                ;; 0x94000 (see %THR-TLS-BLOCK).
-                (let ((m (%mmap-shared-page (%layout-if :a64-threads 1720320 606208))))
+                ;; Both append sixteen window blocks at 0x94000 (see
+                ;; %THR-TLS-BLOCK): 0x11000 bytes each on AArch64, 0x5000 on
+                ;; x86-64.
+                (let ((m (%mmap-shared-page (%layout-if :a64-threads 1720320 933888))))
                   ;; A failed mmap comes back as a small negative (-errno).
                   (if (< m 4096)
                       (progn (spin-unlock (%thr-page-lock)) 0)
@@ -158,17 +159,27 @@
     (if (zerop p) 0 (+ p (+ #x54000 (* cpu #x4000))))))
 
 (defun %thr-tls-block (cpu)
-  "CPU's 4 KB PER-THREAD WINDOW block, or 0 if the page could not be mapped.
-   On AArch64 the window reaches past the first page — the handler-frame stack
-   at +0x10000 and two words just below it (translate-aarch64.lisp, THE
-   PER-THREAD WINDOW, AARCH64) — so its blocks are 0x11000 bytes, laid after
-   everything x86-64 keeps in the thread page."
+  "CPU's PER-THREAD WINDOW block, or 0 if the page could not be mapped.
+
+   THE WINDOW REACHES PAST ITS FIRST PAGE ON BOTH TARGETS, and each block has
+   to cover all of it:
+   - AArch64: the handler-frame stack at +0x10000 and two words just below it
+     (translate-aarch64.lisp, THE PER-THREAD WINDOW, AARCH64) — 0x11000 bytes.
+   - x86-64 Linux: the handler-frame stack is 512 frames at +0x1000..+0x5000
+     (translate-x64's handler helpers; the 64 in-window frames at +0x408 are
+     bare metal's) — 0x5000 bytes.  These blocks used to be 4 KB apart, so a
+     worker's handler frames landed in the NEXT worker's block, on its
+     multiple-value slots (+0x90) and nargs (+0x150) — measured: every
+     interpreted capturing closure called from two workers at once went wrong
+     within ~20 000 calls (unknown opcodes, stack underflows, wrong results),
+     and the victim was always the even-numbered thread.
+   Both lay their blocks after everything else in the thread page (0x94000)."
   (let ((p (%thr-page)))
     (if (zerop p)
         0
         (%layout-if :a64-threads
           (+ p (+ #x94000 (* cpu #x11000)))
-          (+ p (+ #x2000 (* cpu #x1000)))))))
+          (+ p (+ #x94000 (* cpu #x5000)))))))
 
 ;;; ============================================================
 ;;; THE PER-THREAD WINDOW, INSTALLED

@@ -995,14 +995,21 @@
     k))
 
 (defun %jit-thunk-emit-tail (addr k idx nargs)
-  "movabs rsi,<tagged idx>; mov dword [0x10000150],nargs+1; movabs rax,bridge; jmp rax"
+  "movabs rsi,<tagged idx>; mov dword fs:[0x10000150],nargs+1; movabs rax,bridge;
+   jmp rax.  THE NARGS SLOT IS PER-THREAD (a window slot, compiler.lisp THE
+   PER-THREAD WINDOW), so the store carries the FS override like every compiled
+   one; FS base 0 — the main thread, an image without threads — is the absolute
+   slot.  Without it a worker's thunk wrote MAIN's nargs and the bridge read
+   the worker's stale one: measured as &rest lists of the wrong length (and a
+   thread returning the tail of an earlier call's argument list) whenever two
+   threads called through bridges."
   (%jit-emit-bytes (+ addr k) (list #x48 #xBE))
   (%jit-write-imm64 addr (+ k 2) (ash idx 1))
-  (%jit-emit-bytes (+ addr k 10) (list #xC7 #x04 #x25 #x50 #x01 #x00 #x10 (+ nargs 1) 0 0 0))
-  (%jit-emit-bytes (+ addr k 21) (list #x48 #xB8))
-  (%jit-write-imm64 addr (+ k 23) (%jit-bridge-entry nargs))
-  (%jit-emit-bytes (+ addr k 31) (list #xFF #xE0))
-  (+ k 33))
+  (%jit-emit-bytes (+ addr k 10) (list #x64 #xC7 #x04 #x25 #x50 #x01 #x00 #x10 (+ nargs 1) 0 0 0))
+  (%jit-emit-bytes (+ addr k 22) (list #x48 #xB8))
+  (%jit-write-imm64 addr (+ k 24) (%jit-bridge-entry nargs))
+  (%jit-emit-bytes (+ addr k 32) (list #xFF #xE0))
+  (+ k 34))
 
 (defun %jit-thunk-fill (addr name nargs)
   (let ((idx *jit-bridge-count*))
@@ -1059,17 +1066,44 @@
     (when (>= nargs 1) (setq k (+ k (%jit-emit-word32 (+ addr k) #xAA0003E1))))  ; mov x1,x0
     k))
 
+(defun %jit-emit-thread-delta-aarch64 (addr k rd scratch)
+  "Emit `Xrd += this thread's window delta' (translate-aarch64's
+   A64-ADD-THREAD-DELTA, as bytes), using SCRATCH; nothing when the image's
+   window is not per-thread.  Returns bytes written.  A thunk that stores to a
+   window slot (nargs, the #'NAME index) must address THIS thread's copy — an
+   absolute store hits the main thread's."
+  (if (not (and (boundp (quote *a64-tls-window*)) *a64-tls-window*))
+      0
+      (let ((n 0)
+            (tsd (and (boundp (quote *a64-tls-tsd-offset*)) *a64-tls-tsd-offset*)))
+        (if tsd
+            (progn
+              (%jit-emit-word32 (+ addr k) (logior #xD53BD060 scratch))       ; mrs x, TPIDRRO_EL0
+              (%jit-emit-word32 (+ addr k 4)                                  ; ldr x, [x, #tsd]
+                                (logior #xF9400000 (ash (ash tsd -3) 10) (ash scratch 5) scratch))
+              (setq n 8))
+            (progn
+              (%jit-emit-word32 (+ addr k) (logior #xD53BD040 scratch))       ; mrs x, TPIDR_EL0
+              (setq n 4)))
+        (%jit-emit-word32 (+ addr k n)                                        ; add rd, rd, x
+                          (logior #x8B000000 (ash scratch 16) (ash rd 5) rd))
+        (+ n 4))))
+
 (defun %jit-thunk-emit-tail-aarch64 (addr k idx nargs)
+  ;; nargs is a PER-THREAD window slot: add this thread's delta to its address
+  ;; (see %JIT-EMIT-THREAD-DELTA-AARCH64 and x64's %JIT-THUNK-EMIT-TAIL).
   (%jit-emit-quad-placeholder (+ addr k) 0)
   (%jit-write-movz-quad addr k (ash idx 1))
-  (%jit-emit-word32 (+ addr k 16) (logior #x52800010 (ash (+ nargs 1) 5)))
-  (%jit-emit-quad-placeholder (+ addr k 20) 17)
-  (%jit-write-movz-quad addr (+ k 20) (%conv-addr #x10000150))
-  (%jit-emit-word32 (+ addr k 36) #xB9000230)
-  (%jit-emit-quad-placeholder (+ addr k 40) 16)
-  (%jit-write-movz-quad addr (+ k 40) (%jit-bridge-entry nargs))
-  (%jit-emit-word32 (+ addr k 56) #xD61F0200)
-  (+ k 60))
+  (%jit-emit-quad-placeholder (+ addr k 16) 17)
+  (%jit-write-movz-quad addr (+ k 16) (%conv-addr #x10000150))
+  (let ((j (+ k 32)))
+    (setq j (+ j (%jit-emit-thread-delta-aarch64 addr j 17 16)))
+    (%jit-emit-word32 (+ addr j) (logior #x52800010 (ash (+ nargs 1) 5)))   ; movz w16, #nargs+1
+    (%jit-emit-word32 (+ addr j 4) #xB9000230)                              ; str w16, [x17]
+    (%jit-emit-quad-placeholder (+ addr j 8) 16)
+    (%jit-write-movz-quad addr (+ j 8) (%jit-bridge-entry nargs))
+    (%jit-emit-word32 (+ addr j 24) #xD61F0200)                             ; br x16
+    (+ j 28)))
 
 (defun %jit-thunk-fill-aarch64 (addr name nargs)
   (let ((idx *jit-bridge-count*))
@@ -1109,7 +1143,9 @@
 ;;;
 ;;; Reentrancy: the slot is written by the thunk immediately before the branch
 ;;; and read by the bridge's body before it makes any call; nothing intervenes
-;;; (cooperative, single-threaded).  Slot #x10000178 is the free 8 bytes in the
+;;; on one thread, and the slot is PER-THREAD (an AArch64 window offset,
+;;; compiler.lisp %TLS-WINDOW-A64-OFFSET-P; the thunk adds its thread's delta)
+;;; so two threads cannot trade indices.  Slot #x10000178 is the free 8 bytes in the
 ;;; convention block (#x150 nargs … #x1D0 all taken; #x1F0 is the write-char
 ;;; scratch).  One thunk per NAME, cached, so `#'foo` from many pages shares an
 ;;; address.  Layout (14 words, in a 96-byte slot):
@@ -1147,9 +1183,10 @@
   (- (%val->word (symbol-function (quote %jit-bridge-any))) 3))
 (defun %jit-fnaddr-thunk-cache-slot (addr)
   "Byte offset of the cached native target inside a #'NAME thunk (the 96-byte
-   slot is 16-aligned, so +72 is an 8-aligned data word after the 68 bytes
-   of code).  0 = not cached: take the slow path."
-  (+ addr 72))
+   slot is 16-aligned, so +88 is an 8-aligned data word after the code, which
+   is up to 80 bytes with the per-thread delta).  0 = not cached: take the
+   slow path."
+  (+ addr 88))
 
 (defun %jit-fnaddr-thunk-invalidate (name)
   "A DEFUN / (setf symbol-function) of NAME: drop the cached native target of
@@ -1160,18 +1197,22 @@
     (when h (setf (mem-ref (%jit-fnaddr-thunk-cache-slot (cdr h)) :u64) 0))))
 
 (defun %jit-fnaddr-thunk-fill-aarch64 (addr name)
-  ;; Layout:   0: ldr x16, [pc+72]   cached native target (raw code address)
+  ;; Layout:   0: ldr x16, [pc+88]   cached native target (raw code address)
   ;;           4: cbz x16, +8        not cached -> slow path
   ;;           8: br  x16            direct: args / nargs / LR untouched
   ;;          12: slow: movz/movk x17 <- idx; movz/movk x16 <- slot;
   ;;              str w17,[x16]; movz/movk x16 <- %jit-bridge-any; br x16
-  ;;          72: cache word (8 bytes), 0 until %jit-bridge-any fills it.
+  ;;          88: cache word (8 bytes), 0 until %jit-bridge-any fills it.
+  ;; The index slot is PER-THREAD (%JIT-FNADDR-IDX-SLOT): two threads in two
+  ;; #'NAME thunks at once each pass their own index — the slow path adds this
+  ;; thread's window delta to the slot address, and %JIT-BRIDGE-ANY reads it
+  ;; through the window.
   ;; The cached call costs 3 instructions instead of an &rest cons + APPLY
   ;; per call — (every #'zerop blk) ran the slow path once PER ELEMENT.
   (let ((idx *jit-bridge-count*) (k 0))
     (setf (aref *jit-bridge-names* idx) name)
     (setq *jit-bridge-count* (+ idx 1))
-    (%jit-emit-word32 (+ addr k) #x58000250)          ; ldr x16, [pc, #72]
+    (%jit-emit-word32 (+ addr k) #x580002D0)          ; ldr x16, [pc, #88]
     (setq k (+ k 4))
     (%jit-emit-word32 (+ addr k) #xB4000050)          ; cbz x16, +8
     (setq k (+ k 4))
@@ -1184,6 +1225,7 @@
     (%jit-emit-quad-placeholder (+ addr k) 16)
     (%jit-write-movz-quad addr k (%jit-fnaddr-idx-slot))
     (setq k (+ k 16))
+    (setq k (+ k (%jit-emit-thread-delta-aarch64 addr k 16 9)))   ; x16 += delta (x9 scratch)
     (%jit-emit-word32 (+ addr k) #xB9000211)          ; str w17, [x16]
     (setq k (+ k 4))
     (%jit-emit-quad-placeholder (+ addr k) 16)

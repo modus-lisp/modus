@@ -410,6 +410,11 @@
       (and (>= off #x150) (<= off #x157))    ; dynamic nargs (u32)
       (and (>= off #x180) (<= off #x19F))    ; armed handler frame RSP/RBP/IP/RBX
       (and (>= off #x400) (<= off #xC0F))    ; handler-stack depth + 64 frames
+                                             ; (hosted x86-64: 512 frames at
+                                             ; +0x1000..+0x5000, FS-relative in
+                                             ; translate-x64 itself; the thread
+                                             ; blocks are sized for them —
+                                             ; net/hosted-sync.lisp %THR-TLS-BLOCK)
       (and (>= off #xC10) (<= off #xC37))))  ; longjmp scratch + the self slot
 
 (defparameter *tls-window-a64* nil
@@ -422,7 +427,10 @@
    (0xFFE8) and the helper-call LR save (0xFFF0) just below the handler-frame
    stack, and the stack itself (depth at 0x10000, 24-byte frames above)."
   (or (and (>= off #xFFE8) (<= off #xFFF7))
-      (and (>= off #x10000) (<= off #x10FFF))))
+      (and (>= off #x10000) (<= off #x10FFF))
+      ;; the #'NAME thunk's index slot (mvm-eval.lisp %JIT-FNADDR-IDX-SLOT):
+      ;; each thread's thunk writes its own, %JIT-BRIDGE-ANY reads its own.
+      (and (>= off #x178) (<= off #x17F))))
 
 (defun %tls-window-addr-form-p (form)
   "T when FORM is an address the compiler can prove, AT COMPILE TIME, lands in

@@ -162,6 +162,39 @@
   "mov fs:[ADDR], rsp"
   (emit-bytes buf #x64 #x48 #x89 #x24 #x25) (emit-abs32 buf addr))
 
+(defconstant +stw-owner-addr+ #x10005028
+  "ABSOLUTE: the self base + 1 of the thread holding STOP (0 = none).  Lets a
+   fault or a watchdog say WHO holds the world, and lets the fault stub refuse
+   to carry on when the faulting thread is the collector.")
+
+(defun emit-fatal-message (buf text &optional (code 134))
+  "write(2, TEXT) then exit_group(CODE).  For states where continuing would be
+   a hang or a corrupt heap: a loud stop is the correct outcome."
+  (let ((after (make-label)) (bytes (map 'list #'char-code text)))
+    (emit-call buf after)                          ; pushes the string's address
+    (dolist (b bytes) (emit-byte buf b))
+    (emit-label buf after)
+    (emit-bytes buf #x5E)                          ; pop rsi
+    (emit-bytes buf #xBA) (emit-u32 buf (length bytes)) ; mov edx, len
+    (emit-bytes buf #xBF #x02 #x00 #x00 #x00)      ; mov edi, 2
+    (emit-bytes buf #xB8 #x01 #x00 #x00 #x00)      ; mov eax, 1 (write)
+    (emit-bytes buf #x0F #x05)
+    (emit-bytes buf #xBF) (emit-u32 buf code)      ; mov edi, code
+    (emit-bytes buf #xB8 #xE7 #x00 #x00 #x00)      ; mov eax, 231 (exit_group)
+    (emit-bytes buf #x0F #x05)))
+
+(defun emit-futex-stop-timed (buf op val)
+  "futex(&STOP, OP, VAL, {1 s}) -- clobbers rax rcx rdx rsi rdi r10 r11."
+  (emit-bytes buf #x6A #x00)                               ; push 0  (tv_nsec)
+  (emit-bytes buf #x6A #x01)                               ; push 1  (tv_sec)
+  (emit-bytes buf #xBF) (emit-abs32 buf +stw-stop-addr+)   ; mov edi, STOP
+  (emit-bytes buf #xBE) (emit-u32 buf op)                  ; mov esi, op
+  (emit-bytes buf #xBA) (emit-u32 buf val)                 ; mov edx, val
+  (emit-bytes buf #x49 #x89 #xE2)                          ; mov r10, rsp
+  (emit-bytes buf #xB8 #xCA #x00 #x00 #x00)                ; mov eax, 202
+  (emit-bytes buf #x0F #x05)                               ; syscall
+  (emit-bytes buf #x48 #x83 #xC4 #x10))                    ; add rsp, 16
+
 (defun emit-futex-stop (buf op val)
   "futex(&STOP, OP, VAL, NULL) -- clobbers rax rcx rdx rsi rdi r10 r11."
   (emit-bytes buf #xBF) (emit-abs32 buf +stw-stop-addr+)   ; mov edi, STOP
@@ -187,10 +220,20 @@
     (emit-label buf again)
     (emit-bytes buf #xB9 #x02 #x00 #x00 #x00)       ; mov ecx, 2
     (emit-fs-xchg-abs-rcx buf +stw-state-addr+)
+    (emit-bytes buf #x45 #x31 #xC0)                 ; xor r8d, r8d  (seconds waited)
     (emit-label buf wait)
     (emit-cmp-abs64-zero buf +stw-stop-addr+)
     (emit-jcc buf :e leave)
-    (emit-futex-stop buf 128 1)                      ; FUTEX_WAIT_PRIVATE, 1
+    ;; WATCHDOG: a collection that has not finished in a minute will not.
+    ;; Its collector died or is stuck; waiting forever is a deadlock, so say so
+    ;; and stop the process.  One-second timed waits count the minute.
+    (emit-bytes buf #x49 #xFF #xC0)                 ; inc r8
+    (let ((ok (make-label)))
+      (emit-bytes buf #x49 #x83 #xF8 60)            ; cmp r8, 60
+      (emit-jcc buf :l ok)
+      (emit-fatal-message buf (format nil "~%modus: a thread waited 60 s for a garbage collection that never finished (the collecting thread is stuck or died); stopping instead of deadlocking.~%"))
+      (emit-label buf ok))
+    (emit-futex-stop-timed buf 128 1)               ; FUTEX_WAIT_PRIVATE, 1, 1 s
     (emit-jmp buf wait)
     (emit-label buf leave)
     (emit-bytes buf #x31 #xC9)                       ; xor ecx, ecx
@@ -342,8 +385,10 @@
    A no-op unless threads are live and region 0 is the active region."
   (let ((ret (make-label)) (try (make-label)) (acquired (make-label))
         (skip-main (make-label)) (wm (make-label)) (lp (make-label))
-        (next (make-label)) (haveseg (make-label)) (done (make-label)))
+        (next (make-label)) (haveseg (make-label)) (done (make-label))
+        (spin-dead (make-label)))
     (emit-label buf label)
+    (emit-push buf 'rcx)                             ; the spin budget below
     ;; threads live?
     (emit-bytes buf #x83 #x3C #x25) (emit-abs32 buf #x10000DB8) (emit-bytes buf #x00)
     (emit-jcc buf :e ret)
@@ -359,6 +404,14 @@
     (emit-call buf park-label)                       ; another collector owns it
     (emit-jmp buf try)
     (emit-label buf acquired)
+    ;; OWNER := my self base + 1, so a fault or a watchdog knows who holds it.
+    (emit-bytes buf #x64 #x48 #x8B #x04 #x25) (emit-abs32 buf #x10000C30) ; mov rax, fs:[self]
+    (emit-bytes buf #x48 #xFF #xC0)                  ; inc rax
+    (emit-bytes buf #x48 #x89 #x04 #x25) (emit-abs32 buf +stw-owner-addr+)
+    ;; SPIN BUDGET: waiting for the other threads to reach a safe point.  A
+    ;; thread that never does (a loop with no poll, a blocking call outside
+    ;; the gc-safe syscall sites) would otherwise hold every thread forever.
+    (emit-bytes buf #xB9 #xFF #xFF #xFF #x7F)        ; mov ecx, 0x7FFFFFFF
     (emit-stw-load-table buf 'r11 done)
     ;; r14 = my segment base (0 on main)
     (emit-bytes buf #x64 #x4C #x8B #x34 #x25) (emit-abs32 buf #x10000C30)
@@ -368,6 +421,8 @@
     (emit-cmp-abs64-zero buf +stw-state-addr+)
     (emit-jcc buf :ne skip-main)
     (emit-bytes buf #xF3 #x90)                       ; pause
+    (emit-bytes buf #x48 #xFF #xC9)                 ; dec rcx
+    (emit-jcc buf :e spin-dead)
     (emit-jmp buf wm)
     (emit-label buf skip-main)
     (emit-mov-reg-reg buf 'r12 'r11)
@@ -386,12 +441,16 @@
     (emit-cmp-reg-imm buf 'rsi 0)
     (emit-jcc buf :ne haveseg)
     (emit-bytes buf #xF3 #x90)                       ; not started yet: re-check
+    (emit-bytes buf #x48 #xFF #xC9)                 ; dec rcx
+    (emit-jcc buf :e spin-dead)
     (emit-jmp buf lp)
     (emit-label buf haveseg)
     (emit-mov-reg-mem buf 'rax 'rsi +stw-state-addr+)
     (emit-cmp-reg-imm buf 'rax 0)
     (emit-jcc buf :ne next)                          ; parked / in a syscall
     (emit-bytes buf #xF3 #x90)
+    (emit-bytes buf #x48 #xFF #xC9)                 ; dec rcx
+    (emit-jcc buf :e spin-dead)
     (emit-jmp buf lp)
     (emit-label buf next)
     (emit-add-reg-imm buf 'r12 #x80)
@@ -400,7 +459,10 @@
     (emit-jcc buf :g lp)
     (emit-label buf done)
     (emit-label buf ret)
-    (emit-bytes buf #xC3)))
+    (emit-pop buf 'rcx)
+    (emit-bytes buf #xC3)
+    (emit-label buf spin-dead)
+    (emit-fatal-message buf (format nil "~%modus: a garbage collection waited too long for another thread to reach a safe point; stopping instead of deadlocking.~%"))))
 
 (defun emit-stw-scan-range (buf scan-word-label)
   "Scan [RDI, R10) word by word.  RDI/R10 survive scan_word."
@@ -564,6 +626,7 @@
     (emit-jcc buf :e ret)
     (dolist (r '(rax rcx rdx rsi rdi r10 r11)) (emit-push buf r))
     (emit-bytes buf #x31 #xC0)                       ; xor eax, eax
+    (emit-bytes buf #x48 #x89 #x04 #x25) (emit-abs32 buf +stw-owner-addr+) ; owner := 0
     (emit-bytes buf #x48 #x87 #x04 #x25) (emit-abs32 buf +stw-stop-addr+) ; xchg [STOP], rax
     (emit-futex-stop buf 129 #x7FFFFFFF)             ; FUTEX_WAKE_PRIVATE, all
     (dolist (r (reverse '(rax rcx rdx rsi rdi r10 r11))) (emit-pop buf r))
@@ -2191,6 +2254,21 @@
                 ;; with that thread's FS base, so "is a handler-case active?"
                 ;; is answered about the thread that actually faulted — and the
                 ;; longjmp lands on ITS stack, not on some other thread's.
+                ;; A FAULT IN THE COLLECTOR.  If this thread holds STOP it
+                ;; was mid-collection: the heap is half-copied and every other
+                ;; thread is parked on it.  Recovering into a handler would run
+                ;; Lisp on that heap; returning never would deadlock the rest.
+                ;; Stop the process and say why.
+                (when (x64-stw-p)
+                  (let ((not-gc (make-label)))
+                    (emit-cmp-abs64-zero buf +stw-stop-addr+)
+                    (emit-jcc buf :e not-gc)
+                    (emit-bytes buf #x64 #x48 #x8B #x04 #x25) (emit-u32 buf #x10000C30) ; mov rax, fs:[self]
+                    (emit-bytes buf #x48 #xFF #xC0)          ; inc rax
+                    (emit-bytes buf #x48 #x3B #x04 #x25) (emit-u32 buf +stw-owner-addr+) ; cmp rax, [owner]
+                    (emit-jcc buf :ne not-gc)
+                    (emit-fatal-message buf (format nil "~%modus: a hardware fault inside a garbage collection; the heap cannot be trusted, stopping.~%"))
+                    (emit-label buf not-gc)))
                 (emit-bytes buf #x48 #xB9)
                 (emit-u32 buf #x10000180) (emit-u32 buf 0)
                 ;; rdx = [rcx]  (saved RSP — zero means no handler-case active)

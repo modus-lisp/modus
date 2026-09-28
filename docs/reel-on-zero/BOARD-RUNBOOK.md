@@ -1339,3 +1339,19 @@ Rule: **never write HVS registers or list SRAM through a Normal mapping;
 `hvs-window-nc` is not for stores.**  A test that "reads back what it wrote"
 must write the WHOLE list several times and count mismatches, not three words
 once.
+
+**Playback with the JIT re-linked (2026-09-28, both pairs, `serial-jitplay.py`):**
+a restored core MUST run `(setq *jit-hot-only* nil)` + `(jit-eager)` before
+the first decode — decoding first faults (ESR 0x2000000 in the code window;
+that was the whole of "bug B") or runs interpreted at 2.5 s/frame.
+
+| pair | `(rh-play nil)` | `(rh-play t)` (vsync) |
+|---|---|---|
+| f270aea + reel 110ac55 | 35 ms/frame, 28 fps | 22 fps |
+| main 14502ad + reel HEAD (`board-z`/`reel-z`) | **20 ms/frame, 47-49 fps** | **35-36 fps** |
+
+`rh-play` writes the picture's own plane words on frame 0 (`rh-yuv-plane`) and
+only swaps pointers afterwards; before, it inherited whatever list was
+running (the 512-wide `rh-pattern` list after `rh-init`), which showed as
+the frame repeated four times across.  Frame 0 of `cam.ivf` really is a noise
+strip over pink — `cam0-frame0-hosted.png` is the reference; do not chase it.

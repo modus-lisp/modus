@@ -466,6 +466,16 @@
   ;; SOURCE STRING, so a double quote here ends the string literal.)
   (setq *x64-tls-window* t)
   (setq *tls-window* t)
+  ;; THE ACTIVE REGION IS PER-THREAD (build-generic-cli.lisp, NATIVE THREADS
+  ;; STEP 3), and a JIT page carries its own copy of the collector.  Left at
+  ;; its NIL default here, that copy read the single region word -- region 0's
+  ;; -- so a worker whose own region filled inside JIT-compiled code collected
+  ;; REGION 0 with its registers: it took the stop-the-world flag, faulted
+  ;; mid-collection and never gave it back, and the next poll parked every
+  ;; thread.  Boxed-vector churn and TLS on a worker, measured.  Allocation
+  ;; inside AOT functions (MAKE-LIST, conses) used the image's own collector
+  ;; and was fine, which is why this hid.
+  (setq *x64-gc-region-percpu* :runtime)
   ;; handler-case handler paths check for a freshly recovered hardware fault
   ;; (see compile-handler-case / %HC-FAULT-FIXUP).
   (setq *hc-fault-fixup* t)

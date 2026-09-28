@@ -695,6 +695,72 @@
     (dolist (x list) (unless (string= x n) (setq acc (cons x acc))))
     (nreverse acc)))
 
+(defun asdf::%fset-in (pkg name fn)
+  "Install FN as PKG::NAME's function, if that symbol exists."
+  (let ((s (and (find-package pkg) (find-symbol name pkg))))
+    (when s (setf (fdefinition s) fn))
+    s))
+
+(defun asdf::%quirk-float-features ()
+  "float-features has a branch per implementation and none for modus, so its
+   float<->bits functions signal \"Implementation not supported.\" -- and jzon
+   prints and reads every JSON number through them.  modus stores a double as
+   hi/lo 32-bit halves (%FLOAT-HI32 / %FLOAT-LO32, %MAKE-TYPED-FLOAT) and has
+   IEEE32 conversions (%SINGLE->BITS / %BITS->SINGLE).  They are redefined by
+   EVALUATING DEFUNs, not by setting function cells: float-features DECLAIMs
+   them INLINE, so callers expand the stored source, which only a new DEFUN
+   replaces."
+  (let ((p (find-package "ORG.SHIRAKUMO.FLOAT-FEATURES")))
+    (when p
+      (flet ((def (name lambda-list body)
+               (let ((s (find-symbol name p)))
+                 (when s (eval (list 'defun s lambda-list body))))))
+        (def "DOUBLE-FLOAT-BITS" '(f)
+          '(let ((d (float f 1d0)))
+             (logior (ash (logand (%float-hi32 d) 4294967295) 32)
+                     (logand (%float-lo32 d) 4294967295))))
+        (def "LONG-FLOAT-BITS" '(f)
+          '(let ((d (float f 1d0)))
+             (logior (ash (logand (%float-hi32 d) 4294967295) 32)
+                     (logand (%float-lo32 d) 4294967295))))
+        (def "BITS-DOUBLE-FLOAT" '(bits)
+          '(%make-typed-float (ash bits -32) (logand bits 4294967295) 'double-float))
+        (def "BITS-LONG-FLOAT" '(bits)
+          '(%make-typed-float (ash bits -32) (logand bits 4294967295) 'double-float))
+        (def "SINGLE-FLOAT-BITS" '(f) '(%single->bits f))
+        (def "BITS-SINGLE-FLOAT" '(b) '(%bits->single b)))
+      (let ((s (find-symbol "WITH-FLOAT-TRAPS-MASKED" p)))
+        (when s
+          (eval (list 'defmacro s '(traps &body body)
+                      '(declare (ignore traps))
+                      '(cons 'progn body))))))))
+
+(defvar asdf::*system-quirks*
+  '(("float-features" . asdf::%quirk-float-features))
+  "System name -> a function run right after that system loads: the fix-ups
+   for libraries that have a branch per implementation and none for modus.")
+
+(defun asdf::%apply-system-quirks (name)
+  (let ((q (assoc name asdf::*system-quirks* :test #'string-equal)))
+    (when q (handler-case (funcall (cdr q)) (serious-condition (c) nil)))))
+
+(defun asdf::%jit-loaded-system ()
+  "Translate what the system just loaded to native code.  Loaded source is
+   installed as INTERPRETER TRAMPOLINES and nothing made it native until a
+   program happened to start a thread (%MAKE-NATIVE-THREAD runs JIT-EAGER):
+   natrium's X25519 took 11 s interpreted and 0.4 s native, SHA-256 100x, and
+   TLS could not finish a ClientHello before the server hung up.  After each
+   system rather than once at the end, so a later system's load-time calls
+   into an earlier one run native too.  JIT-EAGER translates only what is new.
+   MODUS_NO_LOAD_JIT=1 turns it off; a JIT failure never fails the load."
+  ;; RAISED, not run: the outermost LOAD runs it between two toplevel forms
+  ;; (mvm/ansi-bridge.lisp, DEFERRED JIT) -- running it here replaced the
+  ;; still-executing Quicklisp functions under their own frames.
+  (let ((off (%cli-getenv "MODUS_NO_LOAD_JIT")))
+    (unless (and off (> (length off) 0) (not (string= off "0")))
+      (setq *%jit-pending* t)))
+  nil)
+
 (defun asdf::load-system (name &rest keys)
   "ASDF:LOAD-SYSTEM — load NAME and everything it depends on, and return T.
 
@@ -722,7 +788,9 @@
             (progn
               (dolist (d (asdf::%dep-names sys)) (asdf::load-system d))
               (asdf::%load-system-files sys)
-              (asdf::%set-loaded sys t))
+              (asdf::%set-loaded sys t)
+              (asdf::%apply-system-quirks n)
+              (asdf::%jit-loaded-system))
          (setq asdf::*systems-loading*
                (asdf::%remove-name n asdf::*systems-loading*)))
        t))))

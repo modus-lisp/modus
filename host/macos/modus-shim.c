@@ -22,10 +22,27 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
+#include <libgen.h>
 #include <mach-o/ldsyms.h>
 #include <mach/mach.h>
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+// iOS: mach_vm.h is unsupported, but the vm_* calls take the same arguments and
+// their addresses are 64-bit on arm64.  No JIT there (no MAP_JIT without the
+// entitlement; pthread_jit_write_protect_np unavailable): the iOS image is
+// built with MODUS_NO_JIT, so the JIT paths below never run.
+#include <mach/vm_map.h>
+typedef vm_address_t modus_vaddr_t;
+typedef vm_size_t modus_vsize_t;
+#define mach_vm_remap vm_remap
+#define mach_vm_allocate vm_allocate
+#else
 #include <mach/mach_vm.h>
+typedef mach_vm_address_t modus_vaddr_t;
+typedef mach_vm_size_t modus_vsize_t;
+#endif
 #include <os/os_sync_wait_on_address.h>
 #include <os/clock.h>
 #include <netinet/in.h>
@@ -44,6 +61,16 @@
 #include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
+
+// MAP_JIT's per-thread write/execute switch — macOS only (see the iOS note at
+// the mach includes).
+static inline void modus_jit_wp(int executable) {
+#if TARGET_OS_IPHONE
+    (void)executable;
+#else
+    pthread_jit_write_protect_np(executable);
+#endif
+}
 
 extern void modus_syscall_stub(void);
 extern void modus_enter(uint64_t sp, uint64_t entry) __attribute__((noreturn));
@@ -171,7 +198,7 @@ static long dx_mmap(long addr, long len, long prot, long flags, long fd, long of
     if (p != MAP_FAILED && jit) {
         if (noreplace && (long)p != addr) { munmap(p, (size_t)len); return -17; }
         if (n_jit < MAXJIT) { jit_regions[n_jit].lo = (uint64_t)p; jit_regions[n_jit].hi = (uint64_t)p + (uint64_t)len; n_jit++; }
-        pthread_jit_write_protect_np(1);           // running mode: executable
+        modus_jit_wp(1);           // running mode: executable
         return (long)p;
     }
     if (p == MAP_FAILED && (prot & PROT_EXEC) && (prot & PROT_WRITE) && addr == 0) {
@@ -358,9 +385,9 @@ static long jit_read(int fd, void *buf, size_t n) {
     long r = read(fd, tmp, n);
     int e = errno;
     if (r > 0) {
-        pthread_jit_write_protect_np(0);
+        modus_jit_wp(0);
         memcpy(buf, tmp, (size_t)r);
-        pthread_jit_write_protect_np(1);
+        modus_jit_wp(1);
     }
     free(tmp);
     errno = e;
@@ -645,7 +672,7 @@ static void on_fault(int sig, siginfo_t *si, void *uc_) {
             report_fault(sig, si, uc_);
         }
         if (pc != last_flip_pc) { last_flip_pc = pc; same_pc_flips = 0; }
-        pthread_jit_write_protect_np(a == pc ? 1 : 0);
+        modus_jit_wp(a == pc ? 1 : 0);
         return;
     }
     int slot = fault_slot(sig);
@@ -729,23 +756,36 @@ int main(int argc, char **argv, char **envp) {
     if (ph->type != 1 || ph->offset != 0) die("unexpected program header", ph->type);
 
     // 1. the code: remap our own signed pages to the link address.
-    mach_vm_address_t code = ph->vaddr;
-    mach_vm_size_t file_span = ROUND_UP(ph->filesz, PAGE16K);
+    modus_vaddr_t code = ph->vaddr;
+    modus_vsize_t file_span = ROUND_UP(ph->filesz, PAGE16K);
     vm_prot_t cur = 0, max = 0;
     kern_return_t kr = mach_vm_remap(mach_task_self(), &code, file_span, 0,
                                      VM_FLAGS_FIXED, mach_task_self(),
-                                     (mach_vm_address_t)(uintptr_t)img, FALSE,
+                                     (modus_vaddr_t)(uintptr_t)img, FALSE,
                                      &cur, &max, VM_INHERIT_NONE);
-    if (kr != KERN_SUCCESS || code != ph->vaddr) die("mach_vm_remap of the image code failed", kr);
+    if (kr != KERN_SUCCESS || code != ph->vaddr) {
+        // Say what is in the way: the fixed layout collides with whatever the
+        // loader or the allocator put there this launch.
+        vm_address_t ra = (vm_address_t)ph->vaddr; vm_size_t rs = 0;
+        vm_region_basic_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        if (vm_region_64(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
+                         (vm_region_info_t)&info, &cnt, &obj) == KERN_SUCCESS)
+            fprintf(stderr, "modus-shim: in the way at %#llx: region [%#lx, %#lx) prot %d\n",
+                    (unsigned long long)ph->vaddr, (unsigned long)ra, (unsigned long)(ra + rs), info.protection);
+        fprintf(stderr, "modus-shim: this executable is at %p (image section %p, %#lx bytes)\n",
+                (void *)&_mh_execute_header, (void *)img, size);
+        die("mach_vm_remap of the image code failed", kr);
+    }
     // p_memsz slack past the file (a page of BSS on a high-linked image).
     if (ph->memsz > file_span) {
-        mach_vm_address_t tail = ph->vaddr + file_span;
+        modus_vaddr_t tail = ph->vaddr + file_span;
         kr = mach_vm_allocate(mach_task_self(), &tail, ROUND_UP(ph->memsz - file_span, PAGE16K), VM_FLAGS_FIXED);
         if (kr != KERN_SUCCESS) die("could not map the image's BSS tail", kr);
     }
 
     // 2. the syscall slot, one 16 KB page below the code base.
-    mach_vm_address_t slot = ph->vaddr - PAGE16K;
+    modus_vaddr_t slot = ph->vaddr - PAGE16K;
     kr = mach_vm_allocate(mach_task_self(), &slot, PAGE16K, VM_FLAGS_FIXED);
     if (kr != KERN_SUCCESS) die("could not map the syscall slot page", kr);
     *(void **)(uintptr_t)slot = (void *)modus_syscall_stub;
@@ -763,9 +803,19 @@ int main(int argc, char **argv, char **envp) {
     // ... :u64)), which drops bit 0 — the restore path reads argv[2] that way
     // (the same class 455f7780 fixed for getenv).  Linux happened to hand us
     // even addresses; macOS does not.
+    // An argument "@NAME" names a file beside the executable — in an iOS app
+    // bundle nothing else knows where that is (the working directory is /).
+    char exedir[4096] = "";
+    { char exe[4096]; uint32_t n = sizeof exe;
+      if (_NSGetExecutablePath(exe, &n) == 0) { strncpy(exedir, dirname(exe), sizeof exedir - 1); } }
     char **args = calloc((size_t)argc + (size_t)envc + 1, sizeof *args);
     for (int i = 0; i < argc + envc; i++) {
         const char *src = i < argc ? argv[i] : envp[i - argc];
+        char resolved[4096];
+        if (i > 0 && i < argc && src[0] == '@' && exedir[0]) {
+            snprintf(resolved, sizeof resolved, "%s/%s", exedir, src + 1);
+            src = resolved;
+        }
         size_t n = strlen(src) + 1;
         char *dst = aligned_alloc(16, ROUND_UP(n, 16));
         memcpy(dst, src, n);

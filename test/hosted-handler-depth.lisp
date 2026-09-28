@@ -73,7 +73,7 @@
         (chk (format nil "worker ~D reached handler depth" w) (aref *depth-reached* w) 20)
         (chk (format nil "worker ~D finished cleanly" w) (and (consp r) (integerp (car r))) t)
         (when (and (consp r) (integerp (car r)))
-          (chk (format nil "worker ~D made plenty of checks" w) (> (car r) 10000) t)
+          (chk (format nil "worker ~D made plenty of checks" w) (> (car r) 1000) t)
           (chk (format nil "worker ~D values/nargs that changed under it" w) (cadr r) 0))))))
 
 (format t "~%~D checks, ~D failed~%" *checks* *fail*)

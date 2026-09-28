@@ -357,6 +357,45 @@ function pointers handed in by the shim (no raw `svc` on iOS), and a small
 Swift host that blits the glass framebuffer to a Metal texture and feeds
 touches back.
 
+## iOS spike (M5, 2026-09-28)
+
+`host/ios/build-ios.sh IMAGE OUT.app [sim|device] [IDENTITY] [PROFILE]` wraps a
+JIT-off Darwin image in a minimal app bundle, using the macOS shim built with
+the iOS SDK.
+- **Shim changes for iOS.** iOS has no `mach_vm.h`, so it uses the `vm_*`
+  calls, which take the same arguments.  The JIT's write-protect toggle
+  compiles to nothing.
+- **Bundled files.** An argument `@NAME` names a file beside the executable,
+  since an app's working directory is `/`.
+- **Simulator results (iOS 18.1).**  The bundle installs, launches with console
+  output, and passes `hosted-threads`, `hosted-thread-gc` and
+  `hosted-handler-depth`.
+
+**The address space is the constraint.**  Without the (paid-account)
+extended-virtual-addressing entitlement, an iOS app on a device with more
+than 3 GB of RAM gets about 15.375 GB, of which only about 7.4 GB is usable.
+Page-zero takes the first 4 GB, and the shared region takes 4 GB from
+`0x180000000`.  The macOS layout at 448 GB cannot work there.
+- **What the layout needs** (measured): 77 MB of code, a 2.6 GB block (the
+  784 MB data region, then the heap), and a 512 MB JIT arena.
+- **The iOS layout** sits where iOS allows it AND macOS leaves room, so the Mac
+  and the Simulator can test it: `MODUS_CODE_BASE=300010000
+  MODUS_CONV_DELTA=2F6000000 MODUS_HEAP_BASE=336000000
+  MODUS_JIT_ARENA_BASE=3A8000000`.  Its top is `0x3C8000000`, 15.1 GB.  It
+  started cleanly in 40 of 40 launches on macOS.
+- **The 24 GB layout collided.**  The macOS allocator reserves about 24 GB at
+  a random base between 16 and 39 GB; a 24 GB layout collided in about 20%
+  of launches.  `ld` caps `-pagezero_size` at 4 GB on arm64, so the range
+  cannot be claimed at link time.
+
+**Relocating at startup is impossible on iOS.**  The iOS-layout image
+materialises about 1.08 million data-region addresses and 11,600 code
+addresses as `MOVZ`/`MOVK` immediates, all in signed code, and iOS never lets
+a process modify signed code.  The robust answer is PC-relative addressing:
+`ADRP`+`ADD` for every address inside the layout.  The image is then correct
+wherever it is mapped, provided code and data keep their distance, so the
+shim can place the whole layout wherever the kernel has room.
+
 ## Running natively (M0)
 
 ```

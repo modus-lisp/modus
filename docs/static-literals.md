@@ -1,7 +1,8 @@
 # Proposal: static literals in image code
 
-Status: phase 1 (static keywords) implemented 2026-09-27 for the CLI and
-ANSI builds; phases 2-3 proposed. Scope: every back end; the change is in the
+Status: phase 1 (static keywords) and phase 2 for quoted SYMBOLS implemented
+2026-09-27 for the CLI and ANSI builds; quoted lists (rest of phase 2) and
+phase 3 proposed. Scope: every back end; the change is in the
 compiler and image assembler, not in any one translator.
 
 ## Phase 1 results (measured)
@@ -20,6 +21,45 @@ compiler and image assembler, not in any one translator.
   turned out to be a minor part of `&key` cost**; the rest is elsewhere in
   keyword-argument handling (below, the "measured cost" figures were the
   motivation, not a measurement of interning alone).
+
+## Phase 2 results (measured, symbols only)
+
+- Enabled by `*static-symbols-p*`, set next to `*static-keywords-p*`.
+  Distinct cached symbols: x64 993, i386 914, aarch64 1050, ANSI 2224.
+- As built, each site is ONE hand-emitted call, `%STATIC-SYMBOL-REF idx h ph`
+  (the same shape as the `%INTERN-SYMBOL-PKG` call it replaces, plus one
+  argument register), not the three inline loads designed below. An inline
+  version compiled through `compile-form` grew the i386 native code from 43.1
+  to 65.8 MB (`COMPILE-FORM` 5.4 to 23.9 KB), because generic `SVREF`/`EQL`
+  are large, and made runtime compilation slower. The call version adds 0.2%.
+- Runtime compilation (eval of a `defun`, 50x, under identical load): x64
+  64 -> 42 ms, i386 268 -> 115 ms. `make-array` with `&key` arguments is
+  unchanged: that path is keyword-bound, and phase 1 already covered it.
+- **Boot-order landmine, hit and fixed.** Literals evaluated before
+  `*sym-name-table*` is filled intern a NAME-LESS symbol, and cl-packages'
+  `INTERN` deliberately replaces such an occupant of the symbol table with a
+  named one; the uncached path then converges on the new object. Caching the
+  placeholder split `CL:LIST` into two objects: `(subtypep 'null 'list)` =>
+  NIL, and named-readtables' `DEFREADTABLE` failed a `CHECK-TYPE`. The fill
+  therefore caches only a symbol whose name resolves (slot 2 non-empty, or
+  its hash in `*sym-name-table*`), which is exactly the set cl-packages never
+  replaces.
+- **Multiple-value landmine, hit and fixed.** A quoted symbol is one value,
+  and the old call said so by accident: `%INTERN-SYMBOL-PKG`'s epilogue
+  reset MV-COUNT. A `RETURN-FROM` in the fill right after a `GETHASH` left it
+  at 2, and the ANSI image's `(multiple-value-list (defsetf ...))` returned
+  `(NAME NIL)` (defsetf.1-3 lost). Both helpers end in `(VALUES sym)`.
+- Roots: #x10000FB0 was added to the x64 trampoline and page collector,
+  i386, aarch64 and `gc.lisp` (riscv scans the low block). It is zeroed at
+  boot wherever FA0 is, and `save-image` restores it in place, so a restored
+  core keeps its filled cache (verified on hosted aarch64: save, `--core`,
+  then `test/static-symbols.lisp` passes through 58 collections).
+- `test/static-symbols.lisp` forces real collections (3 on x64, 63 on i386,
+  60 on aarch64, 7 on riscv64) and checks every filled slot against
+  `FIND-SYMBOL`; it passes on all four.
+- Quoted LISTS still cons per evaluation. Returning one object is CL-correct,
+  but code that destructively modifies a "fresh" quoted list would change
+  behaviour, so that needs an audit first.
 
 ## Problem
 

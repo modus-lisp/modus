@@ -250,7 +250,12 @@
       ;; restored at the same addresses, so a restored image that dropped this
       ;; word would read every special through the SAVING process's pairs.
       (%core-slice fd #x10000FA0 16)      ; global-cell cache root + guard
-      (%core-slice fd stage #x50)         ; 0xFB0..0x1000
+      ;; The static-literal vector (docs/static-literals.md phase 2), in place:
+      ;; it points into the heap slice.  This process's own word is 0 here
+      ;; (restore runs before any quoted symbol is loaded) or, if not, points
+      ;; at a vector the heap slice has just overwritten.
+      (%core-slice fd #x10000FB0 8)       ; static-literal vector root
+      (%core-slice fd stage #x48)         ; 0xFB8..0x1000
       (%core-slice fd from (- free from))
       (%core-slice fd (+ (%gc-bitmap-base) boff) blen)
       (%core-slice fd (+ (%gc-cons-bitmap-base) boff) blen)

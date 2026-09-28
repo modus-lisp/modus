@@ -724,6 +724,17 @@ for #x53 objects.  How a `:foo` LITERAL is compiled depends on the build:
 - **Every other build:** `(li v0 hash; call %INTERN-KEYWORD)` per evaluation,
   resolving to the same heap object via the keyword table.
 
+A quoted INTERNED symbol (`'foo`) in CLI and ANSI builds
+(`*static-symbols-p*`, phase 2) compiles to one call,
+`%STATIC-SYMBOL-REF idx name-hash pkg-hash`, which loads slot `idx` of the
+vector rooted at **#x10000FB0** (a root in EVERY collector, restored in place
+by save-image) and fills it once through `%INTERN-SYMBOL-PKG`.  The fill
+caches only a symbol whose NAME resolves: cl-packages' INTERN replaces an
+early-boot name-less occupant of the symbol table, and a cached placeholder
+split CL:LIST in two (`(subtypep 'null 'list)` => NIL).  Hand-emit calls like
+this one; `compile-form` on a template bloated the image 50%.
+`test/static-symbols.lisp` audits the whole vector.
+
 Reader's `(intern name (find-package "KEYWORD"))` is unified with
 compile-keyword: it also routes through %INTERN-KEYWORD and returns the
 **same** #x53 object the literal `:foo` in source resolved to.  Round-trip

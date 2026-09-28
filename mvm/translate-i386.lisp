@@ -2053,6 +2053,7 @@
 
     ;; --- fixed global roots (same set the x64 trampoline scans) ---
     (dolist (a (list #x10000FA0     ; global-cell cache vector (%GV-REF-FILL)
+                     #x10000FB0     ; static-literal vector (compile-quote)
                      #x10000080     ; global special-variable alist
                      #x10000088     ; symbol intern table
                      #x10000148     ; keyword intern table

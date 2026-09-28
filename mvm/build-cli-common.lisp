@@ -204,6 +204,7 @@
 ;; literal in the image is a static constant-pool object, and boot seeds the
 ;; keyword table with them right after INIT-KEYWORD-TABLE (above).
 (setf modus.mvm::*static-keywords-p* t)
+(setf modus.mvm::*static-symbols-p* t)
 (defvar *interp-source*   (mvm-text "mvm/interp.lisp"))
 ;; STAGE 2: the MVM compiler itself, so (mvm-compile-all forms) runs in-image.
 (defvar *compiler-source* (mvm-text "mvm/compiler.lisp"))

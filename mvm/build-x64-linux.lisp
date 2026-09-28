@@ -1809,6 +1809,7 @@
 (setf modus.mvm::*linux-x64-r14-offset* modus.mvm::+linux-x64-gc-midpoint+)
 ;; Static keyword literals (docs/static-literals.md, phase 1); boot seeds them.
 (setf modus.mvm::*static-keywords-p* t)
+(setf modus.mvm::*static-symbols-p* t)
 ;; Set native code offset for funcall alignment:
 ;; ELF header (64+56=120) + linux-x64 boot code (192) + nil-page mmap (49) +
 ;; code-bounds init (34) + JMP rel32 (5) = 351 = 0x15F

@@ -3707,6 +3707,8 @@
    length compound spec doesn't match the produced length.  Per CLHS
    15.5: at least one sequence argument is required — zero seqs
    signals program-error."
+  (when (%seq-type-u8-p result-type)
+    (return-from map (%seq-u8-copy (apply (function map) 'vector fn seqs))))
   (when (null seqs) (%signal-program-error))
   ;; Type-error on known non-sequence head + on pinned-length mismatch.
   (when result-type

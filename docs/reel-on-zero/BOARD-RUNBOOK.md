@@ -1307,3 +1307,35 @@ suspect: reel functions left interpreted after the QEMU `jit-eager`, which
 reported 7 failed modules; `serial-native.py` lists them).  A native stub
 that reads system registers via `%jit-call` faults the REPL — read the
 mailbox clock BEFORE any such probe.
+
+## 2026-09-28 — THE "NOISE + PINK" / GREEN-SCREEN REGRESSION WAS LOSSY DLIST WRITES THROUGH THE NC WINDOW
+
+**Display-list stores issued while `(hvs-window-nc t)` maps the HVS block as
+Normal non-cacheable DO NOT ALL LAND.**  Measured on the Zero 2 W with the
+f270aea image (modus a034ac3 + its UART fix, reel 110ac55): the 29-word
+`rh-plane-words` list written to a parked slot (2400) and read back under the
+Device mapping is wrong in **13 / 8 / 7 words** on three consecutive writes;
+the identical list written with the window OFF is wrong in **0 / 0 / 0**.
+Reads through the window are lossy too (each 16-byte group reads as its first
+word ×4).  Normal-memory stores may be merged and reordered by the write
+buffer; the HVS list SRAM is a 32-bit peripheral and wants Device accesses.
+
+Why it looked like a codegen regression: a034ac3's faster native
+`hvs-slot-wr32` loop turned an occasional lost word (lr9's running list read
+back with two odd words) into a certain one, so every image from a034ac3 on
+showed a uniform colour (a wrecked pointer/format word: green, cyan, dark
+blue depending on which words were lost) while lr9 (a898bfa) still rendered.
+Everything the CPU can check was identical on both images and was checked:
+descriptors, MAIR/TTBR0/SCTLR/TCR/HCR at EL2, buffer contents, kernel slots,
+`:u32` store width (neighbour-word test), a forced `dc civac` over the buffer
+(changed nothing).  The 2026-09-17 "stores are correct" entry above tested
+THREE words — a sample too small to see a 7-to-13-of-29 loss.
+
+Fix (`reel-hvs-forms.txt`): `rh-show-plane` and `rh-play` no longer toggle
+the window; list words, kernel and DISPLIST1 are written through the Device
+mapping.  Verified on f270aea: grey → neutral, red → RED, `rh-pattern`
+bars visible, `(rh-play nil)` 90 frames ending on a correct camera frame.
+Rule: **never write HVS registers or list SRAM through a Normal mapping;
+`hvs-window-nc` is not for stores.**  A test that "reads back what it wrote"
+must write the WHOLE list several times and count mismatches, not three words
+once.

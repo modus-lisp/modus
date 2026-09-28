@@ -1968,6 +1968,10 @@
   "Pseudo-syscall number the Darwin host shim answers by storing x0 in the
    reserved pthread key (host/macos/modus-shim.c).  Past every Linux number.")
 
+(defconstant +a64-stw-flag-addr+ #x10000FC8
+  "The region-0 stop-the-world flag: 0, or the collecting thread's token.
+   See STOP-THE-WORLD FOR REGION 0.")
+
 (defconstant +a64-percpu-ptr-addr+ #x1000FFE8
   "Per-thread window slot holding the per-CPU block's address: AArch64's GS
    base.  0 until %HA-PERCPU-INIT-CPU stores one, like a fresh GS.")
@@ -2927,6 +2931,57 @@
                   (a64-svc buf 0)
                   (a64-brk buf 0)                              ; unreachable
                   (a64-set-label buf done)))
+               ((and *aarch64-linux-mode* (= code #x0542))
+                ;; %GC-SAFE-ENTER — this thread is about to BLOCK (a futex wait,
+                ;; a sleep) holding no heap pointer in a register: publish its
+                ;; SP and frontier and mark it SAFE, so a region-0 collector
+                ;; scans its stack instead of waiting for it.  A no-op until
+                ;; stop-the-world is armed.  Returns NIL.
+                (when *a64-tls-window*
+                  (let ((skip (incf *mvm-label-counter*)))
+                    (a64-stw-table buf +a64-x9+ skip)
+                    (a64-stw-token-and-rec buf +a64-x9+ +a64-x13+ +a64-x14+)
+                    (a64-stw-publish buf +a64-x14+ 2)
+                    (a64-set-label buf skip)))
+                (a64-mov-reg buf +a64-x0+ +a64-x26+))
+               ((and *aarch64-linux-mode* (= code #x0543))
+                ;; %GC-SAFE-LEAVE — running again: mark RUNNING, then (after a
+                ;; full barrier, so a collector that has not seen us running
+                ;; has set its flag where we can see it) check the flag.  Held:
+                ;; go back to SAFE — the collector may be scanning this stack,
+                ;; which has not changed since %GC-SAFE-ENTER published it —
+                ;; wait for the flag to clear, and try again.  Returns NIL.
+                (when *a64-tls-window*
+                  (let ((skip (incf *mvm-label-counter*))
+                        (again (incf *mvm-label-counter*))
+                        (spin (incf *mvm-label-counter*)))
+                    (a64-stw-table buf +a64-x9+ skip)
+                    (a64-stw-token-and-rec buf +a64-x9+ +a64-x13+ +a64-x14+)
+                    (a64-load-imm64-general buf +a64-x11+ (conv-real +a64-stw-flag-addr+))
+                    (a64-set-label buf again)
+                    (a64-movz buf +a64-x10+ 3 0)                    ; running
+                    (a64-str-unsigned buf +a64-x10+ +a64-x14+ #x68)
+                    (a64-dmb buf #xB)
+                    (a64-ldar buf +a64-x12+ +a64-x11+)
+                    (a64-cmp-imm buf +a64-x12+ 0)
+                    (let ((i (a64-current-index buf)))
+                      (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+                    (a64-movz buf +a64-x10+ 2 0)                    ; safe again
+                    (a64-dmb buf #xB)
+                    (a64-str-unsigned buf +a64-x10+ +a64-x14+ #x68)
+                    ;; sched_yield clobbers x0/x8, and x8 is a local register.
+                    (a64-stp-pre buf +a64-x0+ +a64-x8+ +a64-sp+ -16)
+                    (a64-set-label buf spin)
+                    (a64-sched-yield buf)
+                    (a64-ldar buf +a64-x12+ +a64-x11+)
+                    (a64-cmp-imm buf +a64-x12+ 0)
+                    (let ((i (a64-current-index buf)))
+                      (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i spin :bcond))
+                    (a64-ldp-post buf +a64-x0+ +a64-x8+ +a64-sp+ 16)
+                    (let ((i (a64-current-index buf)))
+                      (a64-b buf 0) (a64-add-fixup buf i again :b))
+                    (a64-set-label buf skip)))
+                (a64-mov-reg buf +a64-x0+ +a64-x26+))
                ((and *aarch64-linux-mode* (= code #x0541))
                 ;; %SET-THREAD-DELTA — THIS thread's per-thread-window delta
                 ;; (x0, tagged).  Linux: TPIDR_EL0 directly.  Darwin: the host
@@ -5527,7 +5582,12 @@
                        (a64-load-imm64 buf +a64-x16+ nbytes)
                        (a64-add-reg buf +a64-x16+ +a64-x24+ +a64-x16+ 0 0)))
                  (a64-cmp-reg buf +a64-x16+ +a64-x25+))
-               (a64-cmp-reg buf +a64-x24+ +a64-x25+)))
+               (progn
+                 ;; With threads the trampoline reads the requested end in
+                 ;; x16 (STOP-THE-WORLD: a clamped limit), so the no-size
+                 ;; form puts x24 there — "fits" is x24 < limit either way.
+                 (when *a64-tls-window* (a64-mov-reg buf +a64-x16+ +a64-x24+))
+                 (a64-cmp-reg buf +a64-x24+ +a64-x25+))))
            (let ((cc (if *aarch64-linux-mode* +cc-cc+ +cc-lt+)))
              (cond
                ;; Only emit the BL-to-trampoline when BOTH the label is
@@ -5753,6 +5813,16 @@
           ;; QEMU virt: SEV+WFE (SEV sets event register, WFE sees it and
           ;; returns immediately — lets QEMU process events).
           ;; QEMU raspi3b: NOP (WFE halts CPU with no wake source).
+          ;; WITH THREADS: a loop back-edge POLLS the stop flag, so a thread
+          ;; in a long loop still reaches a safepoint.  It does NOT park here:
+          ;; a back-edge is not a point where the runtime expects a
+          ;; collection, and code written against "only an allocation can
+          ;; move an object" (the interpreter's raw register words, above
+          ;; all) holds raw object words across one.  It CLAMPS the limit
+          ;; instead (EMIT-AARCH64-STW-CLAMP), so the loop's next allocation
+          ;; enters the trampoline, which parks there.  See STOP-THE-WORLD.
+          ((and (= op +op-yield+) *a64-tls-window* *aarch64-gc-native-mcgc*)
+           (emit-aarch64-stw-clamp buf))
           ((= op +op-yield+)
            (if *aarch64-yield-nop*
                (a64-nop buf)
@@ -6491,6 +6561,504 @@
   (when *a64-tls-window*
     (a64-emit-atomic-add buf #x10000EE0 -1)))
 
+;;; ============================================================
+;;; STOP-THE-WORLD FOR REGION 0 (docs/macos-hosting.md, "Stop the world")
+;;; ============================================================
+;;;
+;;; Every thread holds pointers into region 0 — its code, the symbols, the
+;;; closures main made for it — and region 0's collector is a MOVING one.  A
+;;; collection that forwards those objects without fixing every other thread's
+;;; references leaves the threads reading from-space (measured: a worker's
+;;; interpreter read its bytecode as STALE-FORWARDED).  So when threads are
+;;; armed (%GC-STW-ARM, net/hosted-sync.lisp) a region-0 collection:
+;;;   1. takes the STOP FLAG (a word only a collector writes: its token);
+;;;   2. waits until every other live thread is PARKED (it entered its GC
+;;;      trampoline, i.e. an ALLOCATION, and saved its registers on its stack)
+;;;      or SAFE (blocked in a wait wrapped by %GC-SAFE-ENTER/-LEAVE, holding
+;;;      no heap pointer in a register);
+;;;   3. adds to its roots each such thread's stack window [published SP, stack
+;;;      top) and per-thread window (MV buffer, dynamic bindings), and walks
+;;;      every other heap that can point into region 0 — the carved thread
+;;;      regions up to their parked frontiers, and the lock arena;
+;;;   4. collects as usual, then clears the flag.
+;;; Threads stop only at ALLOCATIONS, never asynchronously and never at a
+;;; loop back-edge.  The single-threaded runtime already assumes an object can
+;;; move only where something allocates, and code relies on it: the MVM
+;;; interpreter keeps raw object words as fixnums between allocations (mvm/
+;;; interp.lisp, REG-GET), invisible to any root scan.  Parking a worker
+;;; running interpreted code at a back-edge left those words naming from-space
+;;; (measured: a TYPE-ERROR, or a SIGSEGV, in a worker FUNCALLing main's
+;;; interpreted closure).  So a back-edge only POLLS: it clamps the thread's
+;;; allocation limit to 0 (keeping the real one in the region's saved-limit),
+;;; the next allocation enters the trampoline, which parks, restores the limit
+;;; and — when the allocation fits — returns without collecting.  A loop that
+;;; never allocates therefore holds a region-0 collection up until it does,
+;;; or until it blocks in a safe region.
+;;;
+;;; WHERE THINGS ARE.  Stop flag: the word at 0x10000FC8 (0 = none, else the
+;;; collector's token, 2*cpu+2).  The thread table (thread page + 0x13000,
+;;; page address in 0x10000DA8):
+;;;   +0x50 armed   +0x58 the actor band   +0x60 carved region count
+;;;   record i at +0x100+0x80*i: +0x00 state (1 = live), +0x38 window delta,
+;;;   +0x68 GC state (0 not participating, 1 parked, 2 safe, 3 running),
+;;;   +0x70 published SP,
+;;;   +0x78 stack top.  Slot 0 is the main thread.
+
+(defun a64-add-imm-lsl12 (buf rd rn imm12)
+  "ADD Xd, Xn, #imm12, LSL #12"
+  (a64-emit buf (logior #x91400000 (ash (logand imm12 #xFFF) 10) (ash rn 5) rd)))
+
+(defun a64-ldar (buf rt rn)
+  "LDAR Xt, [Xn]"
+  (a64-emit buf (logior #xC8DFFC00 (ash rn 5) rt)))
+
+(defun a64-sched-yield (buf)
+  "sched_yield(2): x8 = 124, SVC.  Clobbers x0 and x8."
+  (a64-movz buf +a64-x8+ 124 0)
+  (a64-svc buf 0))
+
+(defun a64-stw-table (buf rd skip)
+  "Xd = the thread table if stop-the-world is ARMED, else branch to SKIP.
+   Uses x16."
+  (a64-load-imm64-general buf +a64-x16+ (conv-real #x10000DA8))
+  (a64-ldr-unsigned buf rd +a64-x16+ 0)
+  (a64-cmp-imm buf rd 0)
+  (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+  (a64-add-imm-lsl12 buf rd rd #x13)
+  (a64-ldr-unsigned buf +a64-x16+ rd #x50)
+  (a64-cmp-imm buf +a64-x16+ 0)
+  (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond)))
+
+(defun a64-stw-token-and-rec (buf table token rec)
+  "TOKEN = 2*cpu+2 (this thread's collector token), REC = its thread record.
+   Uses x16/x17."
+  (a64-load-percpu-base buf token +a64-x16+)
+  (a64-ldr-unsigned buf token token +gc-percpu-cpu-id-off+)  ; cpu, tagged = 2*cpu
+  (a64-lsl-imm buf rec token 6)                               ; cpu*0x80
+  (a64-add-reg buf rec rec table 0 0)
+  (a64-add-imm buf rec rec #x100)
+  (a64-add-imm buf token token 2))
+
+(defun a64-stw-publish (buf rec state)
+  "Publish this thread as STATE (1 parked, 2 safe): its SP, its active
+   region's allocation frontier (so a collector can walk that region), then
+   the state, released.  Uses x15/x16/x17."
+  (a64-add-imm buf +a64-x16+ +a64-sp+ 0)
+  (a64-str-unsigned buf +a64-x16+ rec #x70)
+  (a64-load-gc-region buf +a64-x15+ +a64-x16+)
+  (a64-lsl-imm buf +a64-x16+ +a64-x24+ 1)
+  (a64-str-unsigned buf +a64-x16+ +a64-x15+ +gc-off-saved-alloc+)
+  (a64-movz buf +a64-x16+ state 0)
+  (a64-dmb buf #xB)
+  (a64-str-unsigned buf +a64-x16+ rec #x68))
+
+(defun emit-aarch64-stw-park (buf park)
+  "The PARK subroutine (label PARK): x14 = this thread's record.  Publishes
+   the thread as parked and waits for the stop flag to clear.  Registers
+   are the caller's to have saved (the trampoline's frame); it clobbers
+   x0/x8/x11/x12/x15/x16/x17 and returns with the thread running."
+  (let ((spin (incf *mvm-label-counter*))
+        (out (incf *mvm-label-counter*)))
+    (a64-set-label buf park)
+    (a64-stw-publish buf +a64-x14+ 1)
+    (a64-set-label buf spin)
+    (a64-load-imm64-general buf +a64-x11+ (conv-real +a64-stw-flag-addr+))
+    (a64-ldar buf +a64-x12+ +a64-x11+)
+    (a64-cmp-imm buf +a64-x12+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i out :bcond))
+    (a64-sched-yield buf)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i spin :b))
+    (a64-set-label buf out)
+    (a64-movz buf +a64-x16+ 3 0)                                     ; running
+    (a64-str-unsigned buf +a64-x16+ +a64-x14+ #x68)
+    (a64-dmb buf #xB)
+    (a64-ret buf)))
+
+(defun emit-aarch64-stw-clamp (buf)
+  "A loop back-edge's stop-the-world poll.  When a collection wants the world
+   stopped: CLAMP the allocation limit to 0, first keeping the real one in
+   the active region's saved-limit field (unless already clamped), so this
+   thread's next allocation enters the trampoline and parks there.  Uses
+   x15-x17 and x9 (scratch everywhere a YIELD is emitted)."
+  (let ((skip (incf *mvm-label-counter*)))
+    (a64-load-conv-addr buf +a64-x16+ +a64-stw-flag-addr+)
+    (a64-ldr-width buf +a64-x16+ +a64-x16+ 0 2)
+    (a64-cmp-imm buf +a64-x16+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+    (a64-cmp-imm buf +a64-x25+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+    (a64-load-gc-region buf +a64-x15+ +a64-x16+)
+    (a64-lsl-imm buf +a64-x16+ +a64-x25+ 1)
+    (a64-str-unsigned buf +a64-x16+ +a64-x15+ +gc-off-saved-limit+)
+    (a64-movz buf +a64-x25+ 0 0)
+    (a64-set-label buf skip)))
+
+(defun emit-aarch64-stw-entry (buf park early-return)
+  "Trampoline ENTRY, right after the register save.  With threads armed: a
+   thread that finds the stop flag held by another collector parks here.
+   Then, if it came only because a back-edge poll CLAMPED its limit (x25 =
+   0; a real limit is never 0), it takes the real limit back and, when the
+   allocation that brought it here fits under it, returns without a
+   collection of its own.  The requested end is the gc-check's x16, saved
+   at [sp+128]."
+  (when *a64-tls-window*
+    (let ((skip (incf *mvm-label-counter*))
+          (no-park (incf *mvm-label-counter*)))
+      (a64-stw-table buf +a64-x9+ skip)
+      (a64-stw-token-and-rec buf +a64-x9+ +a64-x13+ +a64-x14+)
+      (a64-load-imm64-general buf +a64-x11+ (conv-real +a64-stw-flag-addr+))
+      (a64-ldar buf +a64-x12+ +a64-x11+)
+      (a64-cmp-imm buf +a64-x12+ 0)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i no-park :bcond))
+      (a64-cmp-reg buf +a64-x12+ +a64-x13+)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i no-park :bcond))
+      (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i park :bl))
+      (a64-set-label buf no-park)
+      (a64-cmp-imm buf +a64-x25+ 0)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i skip :bcond))
+      (a64-load-gc-region buf +a64-x15+ +a64-x16+)
+      (a64-ldr-unsigned buf +a64-x25+ +a64-x15+ +gc-off-saved-limit+)
+      (a64-asr-imm buf +a64-x25+ +a64-x25+ 1)
+      (a64-ldr-unsigned buf +a64-x16+ +a64-sp+ 128)                  ; requested end
+      (a64-cmp-reg buf +a64-x16+ +a64-x25+)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i early-return :bcond))
+      (a64-set-label buf skip))))
+
+;;; The collector keeps its state in a 64-byte frame below the register save
+;;; (so its own root window, which starts at SP, includes it harmlessly):
+;;;   [sp+0] thread table   [sp+8] token   [sp+16] 1 = this is a STW collection
+;;;   [sp+24] loop index    [sp+32] walk bound
+(defconstant +a64-stw-frame+ 64)
+
+(defun emit-aarch64-stw-collector-begin (buf park)
+  "After the active region is known (x17): if it is REGION 0 and threads are
+   armed, take the stop flag and wait until every other live thread is parked
+   or safe.  Always allocates the 64-byte STW frame (with threads compiled
+   in), marking it active or not."
+  (when *a64-tls-window*
+    (let ((normal (incf *mvm-label-counter*))
+          (acquire (incf *mvm-label-counter*))
+          (busy (incf *mvm-label-counter*))
+          (acquired (incf *mvm-label-counter*))
+          (next (incf *mvm-label-counter*))
+          (wait (incf *mvm-label-counter*))
+          (ready (incf *mvm-label-counter*))
+          (done (incf *mvm-label-counter*)))
+      (a64-sub-imm buf +a64-sp+ +a64-sp+ +a64-stw-frame+)
+      (a64-str-unsigned buf +a64-xzr+ +a64-sp+ 16)
+      (a64-stw-table buf +a64-x9+ normal)
+      (a64-load-imm64-general buf +a64-x10+ (conv-real #x10000040))   ; region 0
+      (a64-cmp-reg buf +a64-x17+ +a64-x10+)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i normal :bcond))
+      (a64-stw-token-and-rec buf +a64-x9+ +a64-x13+ +a64-x14+)
+      (a64-str-unsigned buf +a64-x9+ +a64-sp+ 0)
+      (a64-str-unsigned buf +a64-x13+ +a64-sp+ 8)
+      ;; ---- take the flag: 0 -> token ----
+      (a64-set-label buf acquire)
+      (a64-load-imm64-general buf +a64-x11+ (conv-real +a64-stw-flag-addr+))
+      (a64-emit buf (logior #xC85FFC00 (ash +a64-x11+ 5) +a64-x12+))  ; LDAXR x12,[x11]
+      (a64-cmp-imm buf +a64-x12+ 0)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i busy :bcond))
+      (a64-emit buf (logior #xC800FC00 (ash +a64-x10+ 16) (ash +a64-x11+ 5) +a64-x13+)) ; STLXR w10,x13,[x11]
+      (a64-cmp-imm buf +a64-x10+ 0)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i acquire :bcond))
+      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i acquired :b))
+      ;; Another collector holds it: be parked for its collection, then try
+      ;; again (x9/x13/x14 survive the park).
+      (a64-set-label buf busy)
+      (a64-emit buf #xD5033F5F)                                      ; CLREX
+      (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i park :bl))
+      (a64-ldr-unsigned buf +a64-x9+ +a64-sp+ 0)
+      (a64-ldr-unsigned buf +a64-x13+ +a64-sp+ 8)
+      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i acquire :b))
+      (a64-set-label buf acquired)
+      (a64-dmb buf #xB)
+      (a64-movz buf +a64-x10+ 1 0)
+      (a64-str-unsigned buf +a64-x10+ +a64-sp+ 16)
+      ;; ---- wait for every other live thread ----
+      (a64-str-unsigned buf +a64-xzr+ +a64-sp+ 24)                   ; i = 0
+      (a64-set-label buf next)
+      (a64-ldr-unsigned buf +a64-x10+ +a64-sp+ 24)
+      (a64-cmp-imm buf +a64-x10+ 16)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i done :bcond))
+      (a64-lsl-imm buf +a64-x14+ +a64-x10+ 7)
+      (a64-ldr-unsigned buf +a64-x9+ +a64-sp+ 0)
+      (a64-add-reg buf +a64-x14+ +a64-x14+ +a64-x9+ 0 0)
+      (a64-add-imm buf +a64-x14+ +a64-x14+ #x100)                    ; x14 = rec i
+      (a64-add-imm buf +a64-x10+ +a64-x10+ 1)
+      (a64-str-unsigned buf +a64-x10+ +a64-sp+ 24)                   ; i++ (early)
+      (a64-lsl-imm buf +a64-x10+ +a64-x10+ 1)                        ; (i+1)*2 = token of i
+      (a64-ldr-unsigned buf +a64-x13+ +a64-sp+ 8)
+      (a64-cmp-reg buf +a64-x10+ +a64-x13+)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i next :bcond)) ; me
+      (a64-set-label buf wait)
+      (a64-add-imm buf +a64-x11+ +a64-x14+ #x68)
+      (a64-ldar buf +a64-x10+ +a64-x11+)
+      (a64-cmp-imm buf +a64-x10+ 3)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i next :bcond)) ; not running
+      (a64-sched-yield buf)
+      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i wait :b))
+      (a64-set-label buf normal)
+      (a64-set-label buf done)
+      (a64-set-label buf ready))))
+
+(defun emit-aarch64-stw-own-window-top (buf)
+  "A STW collector's own root window ends at ITS stack top (record +0x78),
+   which for the main thread is region 0's stack base anyway, and for a
+   worker collecting region 0 is not.  Rewrites x23 (stack_base)."
+  (when *a64-tls-window*
+    (let ((skip (incf *mvm-label-counter*)))
+      (a64-ldr-unsigned buf +a64-x10+ +a64-sp+ 16)
+      (a64-cmp-imm buf +a64-x10+ 0)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+      (a64-ldr-unsigned buf +a64-x9+ +a64-sp+ 0)
+      (a64-ldr-unsigned buf +a64-x10+ +a64-sp+ 8)
+      (a64-sub-imm buf +a64-x10+ +a64-x10+ 2)
+      (a64-lsl-imm buf +a64-x10+ +a64-x10+ 6)
+      (a64-add-reg buf +a64-x10+ +a64-x10+ +a64-x9+ 0 0)
+      (a64-ldr-unsigned buf +a64-x23+ +a64-x10+ #x178)               ; rec+0x100+0x78
+      (a64-set-label buf skip))))
+
+(defun emit-aarch64-window-root-scan (buf scan-word)
+  "Scan the per-thread WINDOW whose block address is in x9: its MV extras
+   (count at +0x90, tagged; extras from +0x98) and its dynamic-binding stack
+   (see EMIT-AARCH64-DYNBIND-ROOT-SCAN for the layout).  x26/x9 are the loop
+   registers (they survive scan_word); uses x10/x11."
+  (let ((mvdone (incf *mvm-label-counter*))
+        (mvloop (incf *mvm-label-counter*))
+        (db-loop (incf *mvm-label-counter*))
+        (db-done (incf *mvm-label-counter*))
+        (db-inwin (incf *mvm-label-counter*)))
+    (a64-str-unsigned buf +a64-x9+ +a64-sp+ 40)                      ; keep the block
+    ;; MV extras
+    (a64-ldr-unsigned buf +a64-x26+ +a64-x9+ #x90)
+    (a64-asr-imm buf +a64-x26+ +a64-x26+ 1)
+    (a64-sub-imm buf +a64-x26+ +a64-x26+ 1)
+    (a64-cmp-imm buf +a64-x26+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-le+ 0) (a64-add-fixup buf i mvdone :bcond))
+    (a64-cmp-imm buf +a64-x26+ 16)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-gt+ 0) (a64-add-fixup buf i mvdone :bcond))
+    (a64-add-imm buf +a64-x9+ +a64-x9+ #x98)
+    (a64-set-label buf mvloop)
+    (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
+    (a64-add-imm buf +a64-x9+ +a64-x9+ 8)
+    (a64-sub-imm buf +a64-x26+ +a64-x26+ 1)
+    (a64-cmp-imm buf +a64-x26+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-gt+ 0) (a64-add-fixup buf i mvloop :bcond))
+    (a64-set-label buf mvdone)
+    ;; dynamic bindings
+    (a64-ldr-unsigned buf +a64-x9+ +a64-sp+ 40)
+    (a64-ldr-unsigned buf +a64-x26+ +a64-x9+ #xC58)
+    (a64-asr-imm buf +a64-x26+ +a64-x26+ 1)
+    (a64-cmp-imm buf +a64-x26+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-le+ 0) (a64-add-fixup buf i db-done :bcond))
+    (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ #xC60)
+    (a64-asr-imm buf +a64-x10+ +a64-x10+ 1)
+    (a64-cmp-imm buf +a64-x10+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i db-inwin :bcond))
+    (a64-add-imm buf +a64-x9+ +a64-x10+ 8)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i db-loop :b))
+    (a64-set-label buf db-inwin)
+    (a64-add-imm buf +a64-x9+ +a64-x9+ #xC78)
+    (a64-set-label buf db-loop)
+    (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
+    (a64-add-imm buf +a64-x9+ +a64-x9+ 16)
+    (a64-sub-imm buf +a64-x26+ +a64-x26+ 1)
+    (a64-cmp-imm buf +a64-x26+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-gt+ 0) (a64-add-fixup buf i db-loop :bcond))
+    (a64-set-label buf db-done)))
+
+(defun emit-aarch64-stw-extra-roots (buf scan-word)
+  "A STW collection's extra roots, after the collector's own: every other
+   live thread's stack window and per-thread window, then every carved
+   thread region up to its parked frontier, then the lock arena.  Runs before
+   the Cheney walk, so whatever it forwards into to-space is then scanned."
+  (when *a64-tls-window*
+    (let ((skip (incf *mvm-label-counter*))
+          (tloop (incf *mvm-label-counter*))
+          (tnext (incf *mvm-label-counter*))
+          (sloop (incf *mvm-label-counter*))
+          (sdone (incf *mvm-label-counter*))
+          (rloop (incf *mvm-label-counter*))
+          (rnext (incf *mvm-label-counter*))
+          (rdone (incf *mvm-label-counter*))
+          (adone (incf *mvm-label-counter*)))
+      (a64-ldr-unsigned buf +a64-x10+ +a64-sp+ 16)
+      (a64-cmp-imm buf +a64-x10+ 0)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+      ;; ---- threads ----
+      (a64-str-unsigned buf +a64-xzr+ +a64-sp+ 24)
+      (a64-set-label buf tloop)
+      (a64-ldr-unsigned buf +a64-x10+ +a64-sp+ 24)
+      (a64-cmp-imm buf +a64-x10+ 16)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i rloop :bcond))
+      (a64-lsl-imm buf +a64-x14+ +a64-x10+ 7)
+      (a64-ldr-unsigned buf +a64-x9+ +a64-sp+ 0)
+      (a64-add-reg buf +a64-x14+ +a64-x14+ +a64-x9+ 0 0)
+      (a64-add-imm buf +a64-x14+ +a64-x14+ #x100)                    ; x14 = rec
+      (a64-add-imm buf +a64-x10+ +a64-x10+ 1)
+      (a64-str-unsigned buf +a64-x10+ +a64-sp+ 24)
+      (a64-lsl-imm buf +a64-x10+ +a64-x10+ 1)
+      (a64-ldr-unsigned buf +a64-x13+ +a64-sp+ 8)
+      (a64-cmp-reg buf +a64-x10+ +a64-x13+)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i tloop :bcond)) ; me
+      (a64-ldr-unsigned buf +a64-x10+ +a64-x14+ #x68)
+      (a64-cmp-imm buf +a64-x10+ 0)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i tloop :bcond)) ; not participating
+      (a64-cmp-imm buf +a64-x10+ 3)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i tloop :bcond)) ; (cannot be: waited)
+      ;; its stack window [SP, top)
+      (a64-ldr-unsigned buf +a64-x26+ +a64-x14+ #x70)
+      (a64-ldr-unsigned buf +a64-x10+ +a64-x14+ #x78)
+      (a64-str-unsigned buf +a64-x10+ +a64-sp+ 32)
+      (a64-ldr-unsigned buf +a64-x10+ +a64-x14+ #x38)                ; window delta
+      (a64-str-unsigned buf +a64-x10+ +a64-sp+ 48)
+      (a64-set-label buf sloop)
+      (a64-ldr-unsigned buf +a64-x9+ +a64-sp+ 32)
+      (a64-cmp-reg buf +a64-x26+ +a64-x9+)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i sdone :bcond))
+      (a64-mov-reg buf +a64-x9+ +a64-x26+)
+      (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
+      (a64-add-imm buf +a64-x26+ +a64-x26+ 8)
+      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i sloop :b))
+      (a64-set-label buf sdone)
+      ;; its per-thread window
+      (a64-load-imm64-general buf +a64-x9+ (conv-real #x10000000))
+      (a64-ldr-unsigned buf +a64-x10+ +a64-sp+ 48)
+      (a64-add-reg buf +a64-x9+ +a64-x9+ +a64-x10+ 0 0)
+      (emit-aarch64-window-root-scan buf scan-word)
+      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i tloop :b))
+      ;; ---- carved thread regions [from, parked frontier) ----
+      (a64-set-label buf rloop)
+      (a64-str-unsigned buf +a64-xzr+ +a64-sp+ 24)
+      (a64-set-label buf rnext)
+      (a64-ldr-unsigned buf +a64-x10+ +a64-sp+ 24)
+      (a64-ldr-unsigned buf +a64-x9+ +a64-sp+ 0)
+      (a64-ldr-unsigned buf +a64-x11+ +a64-x9+ #x60)                 ; region count
+      (a64-cmp-reg buf +a64-x10+ +a64-x11+)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i rdone :bcond))
+      (a64-ldr-unsigned buf +a64-x11+ +a64-x9+ #x58)                 ; band
+      (a64-add-imm-lsl12 buf +a64-x11+ +a64-x11+ #xA)                ; + 0xA000
+      (a64-lsl-imm buf +a64-x12+ +a64-x10+ 6)
+      (a64-add-reg buf +a64-x11+ +a64-x11+ +a64-x12+ 0 0)            ; rcb
+      (a64-add-imm buf +a64-x10+ +a64-x10+ 1)
+      (a64-str-unsigned buf +a64-x10+ +a64-sp+ 24)
+      (a64-ldr-unsigned buf +a64-x26+ +a64-x11+ +gc-off-from-start+)
+      (a64-asr-imm buf +a64-x26+ +a64-x26+ 1)
+      (a64-cmp-imm buf +a64-x26+ 0)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i rnext :bcond))
+      (a64-ldr-unsigned buf +a64-x12+ +a64-x11+ +gc-off-saved-alloc+)
+      (a64-asr-imm buf +a64-x12+ +a64-x12+ 1)
+      (a64-str-unsigned buf +a64-x12+ +a64-sp+ 32)
+      (emit-aarch64-object-walk buf scan-word (list :sp 32))
+      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i rnext :b))
+      (a64-set-label buf rdone)
+      ;; ---- the lock arena [base, frontier) — band + 0xBC00 / 0xBC08 ----
+      (a64-ldr-unsigned buf +a64-x9+ +a64-sp+ 0)
+      (a64-ldr-unsigned buf +a64-x11+ +a64-x9+ #x58)
+      (a64-add-imm-lsl12 buf +a64-x11+ +a64-x11+ #xB)
+      (a64-add-imm buf +a64-x11+ +a64-x11+ #xC00)
+      (a64-ldr-unsigned buf +a64-x26+ +a64-x11+ 0)
+      (a64-cmp-imm buf +a64-x26+ 0)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i adone :bcond))
+      (a64-ldr-unsigned buf +a64-x12+ +a64-x11+ 8)
+      (a64-str-unsigned buf +a64-x12+ +a64-sp+ 32)
+      (emit-aarch64-object-walk buf scan-word (list :sp 32))
+      (a64-set-label buf adone)
+      (a64-set-label buf skip))))
+
+(defun emit-aarch64-stw-release (buf)
+  "End of a collection: a STW collector clears the stop flag (released);
+   the frame goes either way."
+  (when *a64-tls-window*
+    (let ((skip (incf *mvm-label-counter*)))
+      (a64-ldr-unsigned buf +a64-x10+ +a64-sp+ 16)
+      (a64-cmp-imm buf +a64-x10+ 0)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+      (a64-load-imm64-general buf +a64-x11+ (conv-real +a64-stw-flag-addr+))
+      (a64-dmb buf #xB)
+      (a64-str-unsigned buf +a64-xzr+ +a64-x11+ 0)
+      (a64-set-label buf skip)
+      (a64-add-imm buf +a64-sp+ +a64-sp+ +a64-stw-frame+))))
+
+(defun emit-aarch64-object-walk (buf scan-word bound)
+  "Walk objects from the cursor x26 up to the register BOUND, type-aware,
+   calling SCAN-WORD on every pointer-bearing slot (see the Cheney scan in
+   EMIT-AARCH64-NATIVE-GC-TRAMPOLINE, which is this with BOUND = x21, the
+   growing free pointer).  x23/x24/x26 are the loop state.  BOUND is x21, or
+   (:SP OFF) for a fixed end kept in the frame — every scratch register is
+   scan_word's or copy_object's."
+  (let ((cloop (incf *mvm-label-counter*))
+        (cdone (incf *mvm-label-counter*))
+        (is-cons (incf *mvm-label-counter*))
+        (leafskip (incf *mvm-label-counter*))
+        (u8sz2 (incf *mvm-label-counter*))
+        (f32sz2 (incf *mvm-label-counter*))
+        (haveslots (incf *mvm-label-counter*))
+        (sloop (incf *mvm-label-counter*))
+        (sdone2 (incf *mvm-label-counter*)))
+    (a64-set-label buf cloop)
+    (if (integerp bound)
+        (a64-cmp-reg buf +a64-x26+ bound)             ; cursor >= bound → done
+        (progn                                        ; (:sp OFF): a fixed end
+          (a64-ldr-unsigned buf +a64-x9+ +a64-sp+ (cadr bound))
+          (a64-cmp-reg buf +a64-x26+ +a64-x9+)))
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i cdone :bcond))
+    ;; cons-kind check for cursor: conskind base @0x10000E40 (<<1)
+    (a64-load-imm64-general buf +a64-x9+ (conv-real #x10000E40)) (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0) (a64-asr-imm buf +a64-x10+ +a64-x10+ 1)
+    (a64-sub-reg buf +a64-x11+ +a64-x26+ +a64-x27+ 0 0)  ; cursor - page_base
+    (a64-lsr-imm buf +a64-x12+ +a64-x11+ 7) (a64-add-reg buf +a64-x12+ +a64-x10+ +a64-x12+ 0 0) ; byte addr
+    (a64-lsr-imm buf +a64-x11+ +a64-x11+ 4)              ; granule
+    (a64-movz buf +a64-x13+ 7 0) (a64-and-reg buf +a64-x11+ +a64-x11+ +a64-x13+) ; bit idx
+    (a64-ldrb buf +a64-x14+ +a64-x12+)
+    (a64-movz buf +a64-x15+ 1 0) (a64-lslv buf +a64-x15+ +a64-x15+ +a64-x11+)  ; mask
+    (a64-ands-reg buf +a64-xzr+ +a64-x14+ +a64-x15+)     ; TST
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i is-cons :bcond)) ; set → cons
+    ;; headered object
+    (a64-ldr-unsigned buf +a64-x13+ +a64-x26+ 0)         ; x13 = header
+    (a64-lsl-imm buf +a64-x14+ +a64-x13+ 56) (a64-lsr-imm buf +a64-x14+ +a64-x14+ 56) ; x14 = subtag
+    (a64-lsr-imm buf +a64-x15+ +a64-x13+ 8)              ; x15 = count
+    (a64-lsl-imm buf +a64-x16+ +a64-x15+ 3)              ; x16 = count*8
+    (a64-add-imm buf +a64-x23+ +a64-x26+ 16)             ; x23 = slot cursor (obj+16)
+    (a64-cmp-imm buf +a64-x14+ #x11)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i u8sz2 :bcond))
+    (a64-cmp-imm buf +a64-x14+ #x12)                     ; f32-vector: 4 bytes/lane
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i f32sz2 :bcond))
+    (a64-add-imm buf +a64-x9+ +a64-x16+ 16)              ; general: count*8+16
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i haveslots :b))
+    (a64-set-label buf f32sz2)
+    (a64-lsl-imm buf +a64-x15+ +a64-x15+ 2)              ; count*4
+    (a64-set-label buf u8sz2)
+    (a64-add-imm buf +a64-x9+ +a64-x15+ 16)              ; u8: 16+count(bytes)
+    (a64-set-label buf haveslots)
+    (a64-add-imm buf +a64-x9+ +a64-x9+ 15) (a64-lsr-imm buf +a64-x9+ +a64-x9+ 4) (a64-lsl-imm buf +a64-x9+ +a64-x9+ 4) ; align16
+    (a64-add-reg buf +a64-x24+ +a64-x26+ +a64-x9+ 0 0)   ; x24 = next object pos (preserved)
+    (a64-add-reg buf +a64-x26+ +a64-x23+ +a64-x16+ 0 0)  ; x26 = slot_end = obj+16+count*8
+    (dolist (st (list #x10 #x11 #x12 #x14 #x16 #x30 #x31 #x60 #x64 #x65 #x66))
+      (a64-cmp-imm buf +a64-x14+ st)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i leafskip :bcond)))
+    ;; pointer-bearing: scan slots [x23 .. slot_end=x26)
+    (a64-set-label buf sloop)
+    (a64-cmp-reg buf +a64-x23+ +a64-x26+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i sdone2 :bcond))
+    (a64-mov-reg buf +a64-x9+ +a64-x23+)
+    (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
+    (a64-add-imm buf +a64-x23+ +a64-x23+ 8)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i sloop :b))
+    (a64-set-label buf sdone2)
+    (a64-set-label buf leafskip)
+    (a64-mov-reg buf +a64-x26+ +a64-x24+)                ; advance to next object
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i cloop :b))
+    ;; cons: scan car @cursor, cdr @cursor+8
+    (a64-set-label buf is-cons)
+    (a64-mov-reg buf +a64-x9+ +a64-x26+)
+    (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
+    (a64-add-imm buf +a64-x9+ +a64-x26+ 8)
+    (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
+    (a64-add-imm buf +a64-x26+ +a64-x26+ 16)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i cloop :b))
+    (a64-set-label buf cdone)))
+
 (defun emit-aarch64-native-gc-trampoline (buf)
   "Native Cheney copying collector.  Layout: label → B main → [scan_word] →
    [copy_object] → main.  GC registers (all mutator regs saved in a 240B frame):
@@ -6502,7 +7070,9 @@
   (a64-set-label buf *aarch64-gc-trampoline-label*)
   (let ((scan-word (incf *mvm-label-counter*))
         (copy-obj  (incf *mvm-label-counter*))
-        (main      (incf *mvm-label-counter*)))
+        (main      (incf *mvm-label-counter*))
+        (park      (incf *mvm-label-counter*))
+        (early-return (incf *mvm-label-counter*)))
     ;; entry: jump over the subroutines to main
     (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i main :b))
 
@@ -6672,6 +7242,8 @@
       (a64-ret buf))
 
     (a64-tramp-mark 3)
+    ;; ============ SUBROUTINE park (stop-the-world; x14 = this thread's record) ============
+    (when *a64-tls-window* (emit-aarch64-stw-park buf park))
     ;; ============ MAIN BODY ============
     (a64-set-label buf main)
     ;; save mutator regs (same 240B frame as the Lisp trampoline)
@@ -6699,6 +7271,9 @@
     ;; object-start bitmap base below, so it MUST be restored before RET or the
     ;; next gc-check's BLR x28 would jump to the bitmap base.
     (a64-str-unsigned buf +a64-x28+ +a64-sp+ 224)
+    ;; STOP-THE-WORLD: park for another thread's region-0 collection, and a
+    ;; safepoint poll that found nothing to do returns here.
+    (emit-aarch64-stw-entry buf park early-return)
     (emit-aarch64-gc-conc-enter buf)
     (a64-tramp-mark 31)
     ;; ---- #286 PAUSE TIMER: stamp collection ENTRY ----
@@ -6724,6 +7299,8 @@
     ;; are not region fields and keep their absolute addresses.
     (a64-tramp-mark 32)
     (a64-load-gc-region buf +a64-x17+ +a64-x16+)
+    ;; STOP-THE-WORLD: a region-0 collection with threads armed stops them.
+    (emit-aarch64-stw-collector-begin buf park)
     (a64-tramp-mark 33)
     (flet ((load-abs (rd addr) (a64-load-imm64-general buf +a64-x16+ (conv-real addr))
                      (a64-ldr-unsigned buf rd +a64-x16+ 0) (a64-asr-imm buf rd rd 1))
@@ -6737,6 +7314,7 @@
       (load-fld +a64-x23+ +gc-off-stack-base+)          ; stack_base
       (load-abs +a64-x27+ #x10000E00)                   ; page_base
       (load-abs +a64-x28+ #x10000E18))                  ; obj-bitmap base
+    (emit-aarch64-stw-own-window-top buf)
     (a64-tramp-mark 4)
     ;; ---- scan THIS REGION'S ROOT WINDOW: [x26, stack_base) ----
     ;; STAGE 2, ported here by stage 3 — until now this collector started the
@@ -6842,73 +7420,12 @@
     ;; rewritten — the residual gap the word-by-word scan had).  #x61 = mvm-module
     ;; is NOT a leaf (pointer slots) so it is scanned.  Object size mirrors
     ;; copy_object: u8 = align16(16+count[bytes]); else align16((count+2)*8).
+    ;; STOP-THE-WORLD: the other threads' stacks and windows, and every other
+    ;; heap that can point into region 0 — before the walk, which scans
+    ;; whatever they forward.
+    (emit-aarch64-stw-extra-roots buf scan-word)
     (a64-mov-reg buf +a64-x26+ +a64-x22+)               ; walk cursor = to_start
-    (let ((cloop (incf *mvm-label-counter*))
-          (cdone (incf *mvm-label-counter*))
-          (is-cons (incf *mvm-label-counter*))
-          (leafskip (incf *mvm-label-counter*))
-          (u8sz2 (incf *mvm-label-counter*))
-          (f32sz2 (incf *mvm-label-counter*))
-          (haveslots (incf *mvm-label-counter*))
-          (sloop (incf *mvm-label-counter*))
-          (sdone2 (incf *mvm-label-counter*)))
-      (a64-set-label buf cloop)
-      (a64-cmp-reg buf +a64-x26+ +a64-x21+)             ; cursor >= free_ptr → done
-      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i cdone :bcond))
-      ;; cons-kind check for cursor: conskind base @0x10000E40 (<<1)
-      (a64-load-imm64-general buf +a64-x9+ (conv-real #x10000E40)) (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0) (a64-asr-imm buf +a64-x10+ +a64-x10+ 1)
-      (a64-sub-reg buf +a64-x11+ +a64-x26+ +a64-x27+ 0 0)  ; cursor - page_base
-      (a64-lsr-imm buf +a64-x12+ +a64-x11+ 7) (a64-add-reg buf +a64-x12+ +a64-x10+ +a64-x12+ 0 0) ; byte addr
-      (a64-lsr-imm buf +a64-x11+ +a64-x11+ 4)              ; granule
-      (a64-movz buf +a64-x13+ 7 0) (a64-and-reg buf +a64-x11+ +a64-x11+ +a64-x13+) ; bit idx
-      (a64-ldrb buf +a64-x14+ +a64-x12+)
-      (a64-movz buf +a64-x15+ 1 0) (a64-lslv buf +a64-x15+ +a64-x15+ +a64-x11+)  ; mask
-      (a64-ands-reg buf +a64-xzr+ +a64-x14+ +a64-x15+)     ; TST
-      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i is-cons :bcond)) ; set → cons
-      ;; headered object
-      (a64-ldr-unsigned buf +a64-x13+ +a64-x26+ 0)         ; x13 = header
-      (a64-lsl-imm buf +a64-x14+ +a64-x13+ 56) (a64-lsr-imm buf +a64-x14+ +a64-x14+ 56) ; x14 = subtag
-      (a64-lsr-imm buf +a64-x15+ +a64-x13+ 8)              ; x15 = count
-      (a64-lsl-imm buf +a64-x16+ +a64-x15+ 3)              ; x16 = count*8
-      (a64-add-imm buf +a64-x23+ +a64-x26+ 16)             ; x23 = slot cursor (obj+16)
-      (a64-cmp-imm buf +a64-x14+ #x11)
-      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i u8sz2 :bcond))
-      (a64-cmp-imm buf +a64-x14+ #x12)                     ; f32-vector: 4 bytes/lane
-      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i f32sz2 :bcond))
-      (a64-add-imm buf +a64-x9+ +a64-x16+ 16)              ; general: count*8+16
-      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i haveslots :b))
-      (a64-set-label buf f32sz2)
-      (a64-lsl-imm buf +a64-x15+ +a64-x15+ 2)              ; count*4
-      (a64-set-label buf u8sz2)
-      (a64-add-imm buf +a64-x9+ +a64-x15+ 16)              ; u8: 16+count(bytes)
-      (a64-set-label buf haveslots)
-      (a64-add-imm buf +a64-x9+ +a64-x9+ 15) (a64-lsr-imm buf +a64-x9+ +a64-x9+ 4) (a64-lsl-imm buf +a64-x9+ +a64-x9+ 4) ; align16
-      (a64-add-reg buf +a64-x24+ +a64-x26+ +a64-x9+ 0 0)   ; x24 = next object pos (preserved)
-      (a64-add-reg buf +a64-x26+ +a64-x23+ +a64-x16+ 0 0)  ; x26 = slot_end = obj+16+count*8
-      (dolist (st (list #x10 #x11 #x12 #x14 #x16 #x30 #x31 #x60 #x64 #x65 #x66))
-        (a64-cmp-imm buf +a64-x14+ st)
-        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i leafskip :bcond)))
-      ;; pointer-bearing: scan slots [x23 .. slot_end=x26)
-      (a64-set-label buf sloop)
-      (a64-cmp-reg buf +a64-x23+ +a64-x26+)
-      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i sdone2 :bcond))
-      (a64-mov-reg buf +a64-x9+ +a64-x23+)
-      (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
-      (a64-add-imm buf +a64-x23+ +a64-x23+ 8)
-      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i sloop :b))
-      (a64-set-label buf sdone2)
-      (a64-set-label buf leafskip)
-      (a64-mov-reg buf +a64-x26+ +a64-x24+)                ; advance to next object
-      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i cloop :b))
-      ;; cons: scan car @cursor, cdr @cursor+8
-      (a64-set-label buf is-cons)
-      (a64-mov-reg buf +a64-x9+ +a64-x26+)
-      (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
-      (a64-add-imm buf +a64-x9+ +a64-x26+ 8)
-      (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
-      (a64-add-imm buf +a64-x26+ +a64-x26+ 16)
-      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i cloop :b))
-      (a64-set-label buf cdone))
+    (emit-aarch64-object-walk buf scan-word +a64-x21+)
     (a64-tramp-mark 8)
     ;; ---- clear reclaimed (old from_start = x19) object-start bitmap range ----
     ;; dest = obj_bitmap(x28) + (x19-page_base)>>7 ; count = space_size(x25)>>7 bytes.
@@ -7052,7 +7569,9 @@
       (a64-add-reg buf +a64-x10+ +a64-x10+ +a64-x12+ 0 0)
       (a64-str-unsigned buf +a64-x10+ +a64-x16+ 0))
     (a64-tramp-mark 12)
+    (emit-aarch64-stw-release buf)
     (emit-aarch64-gc-conc-exit buf)
+    (a64-set-label buf early-return)                    ; (entered no probe)
     ;; ---- restore mutator regs + RET ----
     (a64-ldr-unsigned buf +a64-x28+ +a64-sp+ 224)   ; restore trampoline VA into x28
     (a64-ldr-unsigned buf +a64-x30+ +a64-sp+ 216)

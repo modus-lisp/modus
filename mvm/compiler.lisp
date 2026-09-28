@@ -6683,6 +6683,7 @@
 
 (defparameter *hash-dispatch-names*
   '("WITH-OPEN-STREAM" "%CONV-ADDR" "%LAYOUT" "%SET-THREAD-DELTA"
+    "%GC-SAFE-ENTER" "%GC-SAFE-LEAVE"
     
     "STI" "MUL26HI" "ON" "COMMON-LISP-USER"
     "BEING" "DO" "MAKE-PACKAGE" "MACROLET"
@@ -7849,6 +7850,11 @@
       ;; (%set-thread-delta d) — AArch64's ARCH_SET_FS.
       ((= op-name #.(compute-name-hash "%SET-THREAD-DELTA"))
        (compile-set-thread-delta (cdr form) env dest))
+      ;; (%gc-safe-enter) / (%gc-safe-leave) — stop-the-world safe regions.
+      ((= op-name #.(compute-name-hash "%GC-SAFE-ENTER"))
+       (emit-ir :trap #x0542) (emit-ir :mov dest +vreg-v0+))
+      ((= op-name #.(compute-name-hash "%GC-SAFE-LEAVE"))
+       (emit-ir :trap #x0543) (emit-ir :mov dest +vreg-v0+))
       ;; (%mmap-exec-page size) — PROT_RWX page for the WS4 runtime JIT.
       ((= op-name #.(compute-name-hash "%MMAP-EXEC-PAGE"))
        (compile-mmap-exec (cdr form) env dest))

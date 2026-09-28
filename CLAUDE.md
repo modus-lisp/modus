@@ -1310,7 +1310,10 @@ where thread 2's roots are.  It is ~840 MB after the carve and the interned
 universe is small; `test/hosted-thread-lisp.lisp` requires region 0's collection
 count **unchanged**, so a workload that outgrew this FAILS rather than corrupts.
 Making region 0 collectable under threads needs a stop-the-world handshake with
-per-thread root windows — **not done**.
+per-thread root windows.  **Done on AArch64** (docs/macos-hosting.md, "Stop the
+world"; `test/hosted-stw.lisp`), **not on x86-64**.  Threads park only at an
+allocation, never at a loop back-edge: the interpreter holds raw object words
+between allocations.
 
 **ORDERING TRAP:** `%RT-LEAVE-LOCKED` must not decrement the depth to zero until
 **after** the region is restored.  `%GC-REGION-ENTER` is ordinary compiled Lisp;

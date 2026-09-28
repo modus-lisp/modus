@@ -618,9 +618,54 @@ AArch64 broke it only because it filled region 0 so fast.
   so it fails again).  A retry costs 175 KB.  Five fresh modules cost 6.6 MB
   on AArch64 against 2.7 MB on x86-64.
 
-The precondition itself still stands on every target: a program that
-allocates enough in region 0 while threads run can still break it.  Removing
-it is the stop-the-world handshake.
+The precondition itself still stands on x86-64: a program that allocates
+enough in region 0 while threads run can still break it.  On AArch64 the
+stop-the-world handshake below removes it.
+
+## Stop the world (AArch64)
+
+A region-0 collection with threads armed stops every other thread first.
+`translate-aarch64.lisp`, "STOP-THE-WORLD FOR REGION 0", has the layout; this
+is the shape.
+- **The handshake.**  The collector takes a stop flag (`0x10000FC8`, its token
+  `2*cpu+2`, by LDAXR/STLXR) and waits until every other live thread's record
+  says PARKED or SAFE.  It then adds to its roots:
+  - each such thread's stack, from its published SP to its stack top;
+  - its per-thread window (MV buffer and dynamic bindings);
+  - every carved thread region, up to the frontier the thread published;
+  - the lock arena.
+
+  Then it collects as usual and clears the flag.
+- **A thread parks only at an allocation.**  The single-threaded runtime
+  already assumes an object moves only where something allocates, and code
+  relies on it.  The MVM interpreter keeps raw object words as fixnums between
+  allocations (`REG-GET`), where no root scan can see them.
+  - The first cut parked at loop back-edges too.  A worker FUNCALLing main's
+    interpreted closure then died with a TYPE-ERROR or a SIGSEGV: the
+    interpreter's raw words still named from-space.
+  - Now a back-edge only polls.  With the flag held, it clamps the thread's
+    allocation limit (x25) to 0, keeping the real one in the region's
+    saved-limit field.
+  - The next allocation enters the trampoline, which parks, takes the real
+    limit back and, when the allocation fits under it, returns without
+    collecting.
+  - The gc-check leaves the requested end in x16 (the no-size form now puts
+    x24 there), which is how the trampoline knows.
+- **Safe regions.**  `%GC-SAFE-ENTER` / `%GC-SAFE-LEAVE` bracket the nanosleep
+  and futex waits.  A thread blocked there counts as stopped, since its
+  published stack is all it holds.  Leaving while a collection runs, it goes
+  back to SAFE and waits for the flag to clear.
+- **The cost.**  A loop that never allocates and never blocks holds up a
+  region-0 collection until it does one or the other.
+
+`test/hosted-stw.lisp` has four workers traverse main's list, vector and
+interpreted closure while main collects region 0.  It requires at least three
+such collections during the run and no bad traversal.
+
+**A separate bug it tripped:** a closure that escapes a top-level `LET`
+(`(setq *fn* (let ((k 7)) (lambda (x) (+ x k))))`) cannot be called once the
+form has returned.  This happens on x86-64 and AArch64 alike, single-threaded.
+The test makes its closure with a DEFUN instead.
 
 ## Open questions
 

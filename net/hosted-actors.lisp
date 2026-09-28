@@ -158,6 +158,39 @@
       (setf (mem-ref a :u64) 0)
       (setq a (+ a 8)))))
 
+(defun %ha-zero-bytes (start end)
+  "Zero [START,END) exactly: bytes at the unaligned ends, words between."
+  (let ((a start))
+    (loop
+      (when (or (>= a end) (zerop (logand a 7))) (return 0))
+      (setf (mem-ref a :u8) 0)
+      (setq a (+ a 1)))
+    (let ((w (logand end -8)))
+      (when (> w a) (%ha-zero a w) (setq a w)))
+    (loop
+      (when (>= a end) (return 0))
+      (setf (mem-ref a :u8) 0)
+      (setq a (+ a 1)))))
+
+(defun %ha-bitmap-clear (lo hi)
+  "Clear both GC bitmaps (object-start, cons-kind) for heap range [LO,HI).
+   Memory handed to a new owner — a carved region, the lock arena — was region
+   0's heap, and its bits describe region 0's old objects.  A collector that
+   walks the range object by object (stop-the-world, translate-aarch64) takes a
+   stale cons-kind bit at face value and walks into the middle of an object.
+   AArch64 only: nothing else walks that way, and x86-64's bitmaps are laid
+   out differently (its cons-kind base reads 0)."
+  (%layout-if :a64-threads
+    (let ((pb (%gc-bitmap-page-base-exact)))
+      (when (and (> (%gc-bitmap-base) 0) (> (%gc-cons-bitmap-base) 0)
+                 (>= lo pb) (> hi lo))
+        (let ((b0 (ash (- lo pb) -7))
+              (b1 (ash (+ (- hi pb) 127) -7)))
+          (%ha-zero-bytes (+ (%gc-bitmap-base) b0) (+ (%gc-bitmap-base) b1))
+          (%ha-zero-bytes (+ (%gc-cons-bitmap-base) b0) (+ (%gc-cons-bitmap-base) b1))))
+      0)
+    0))
+
 (defun %ha-align-up-to-page-base (a)
   "A rounded UP to the next address congruent to the bitmap page_base modulo
    mvm/gc.lisp's region alignment (1024).  That congruence — not plain
@@ -400,6 +433,15 @@
                 ;; locked sections allocated from garbage — SIGSEGV in
                 ;; %LL-SHAPE-MEMO-PUT and a silent exit 2.  72 KB of stores.
                 (%ha-zero (+ from0 new0) (+ from0 (+ new0 #x12200)))
+                ;; AND THEIR BITMAP BITS, both semispaces: everything above
+                ;; NEW0 now belongs to the band and the thread regions.
+                ;; Gated at the CALL, not only inside: on x86-64 the call
+                ;; alone (returning 0) made test/hosted-mutex.lisp hang in
+                ;; about half its runs, so x86-64's %HA-CARVE stays as it was.
+                (%layout-if :a64-threads
+                  (progn (%ha-bitmap-clear (+ from0 new0) (+ from0 size0))
+                         (%ha-bitmap-clear (+ to0 new0) (+ to0 size0)))
+                  0)
                 (setq *ha-band* (+ from0 new0))
                 ;; THE COLLECTOR'S PER-COLLECTION STATE BECOMES PER CPU.  Until
                 ;; this runs, mvm/gc.lisp's three working words are the historic

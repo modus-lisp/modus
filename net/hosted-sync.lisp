@@ -355,6 +355,25 @@
 ;;; SLEEP
 ;;; ============================================================
 
+;;; A BLOCKING SYSCALL IS A STOP-THE-WORLD SAFE REGION.  A thread asleep in
+;;; the kernel cannot reach a safepoint, and a region-0 collector must not
+;;; wait for it; so it publishes its stack first (%GC-SAFE-ENTER) and, awake,
+;;; parks if a collection is under way (%GC-SAFE-LEAVE).  Everything it passes
+;;; the kernel is a raw word — a futex word or a timespec in the thread page,
+;;; never a heap object — so nothing the collector moves is in use while it
+;;; sleeps.  AArch64 only for now (the traps are translate-aarch64's).
+(defun %gc-safe-block-3 (n a b c)
+  (%layout-if :a64-threads (%gc-safe-enter) nil)
+  (let ((r (syscall3 n a b c)))
+    (%layout-if :a64-threads (%gc-safe-leave) nil)
+    r))
+
+(defun %gc-safe-block-6 (n a b c d)
+  (%layout-if :a64-threads (%gc-safe-enter) nil)
+  (let ((r (syscall6 n a b c d 0 0)))
+    (%layout-if :a64-threads (%gc-safe-leave) nil)
+    r))
+
 (defun %nanosleep-at (ts sec nsec)
   "nanosleep(2) for SEC seconds + NSEC nanoseconds, restarting on EINTR with
    the kernel's own remainder, using the caller-supplied 32-byte scratch at TS
@@ -377,7 +396,7 @@
             (%gc-write64 rem 0)
             (%gc-write64 (+ rem 8) 0)
             ;; 35 = SYS_nanosleep on x86-64.
-            (setq r (syscall3 35 req rem 0))
+            (setq r (%gc-safe-block-3 35 req rem 0))
             (when (>= r 0) (return 0))
             ;; -4 = -EINTR.  Anything else is a real error; do not spin on it.
             (when (not (= r -4)) (return 0))
@@ -437,7 +456,7 @@
   "Park this thread on ADDR while the word there still reads VAL.  Returns 0
    if it slept and was woken, -11 (-EAGAIN) if the value had already changed —
    which is not an error but the whole point of the compare-and-park."
-  (syscall6 202 addr 128 val 0 0 0))
+  (%gc-safe-block-6 202 addr 128 val 0))
 
 (defun %futex-wake (addr n)
   "Wake at most N threads parked on ADDR.  Returns the number woken."
@@ -449,7 +468,7 @@
   "FUTEX_WAIT with a RELATIVE TIMEOUT at the 16-byte timespec TS.  Returns 0 if
    it slept and was woken, -110 (-ETIMEDOUT) if the timeout expired, -11
    (-EAGAIN) if the value had already changed.  TS = 0 means no timeout."
-  (syscall6 202 addr 128 val ts 0 0))
+  (%gc-safe-block-6 202 addr 128 val ts))
 
 (defun %futex-timeout-ts ()
   "This CPU's futex-timeout timespec, armed at 20 ms.  0 if the thread page
@@ -1404,6 +1423,15 @@
                       (> (%gc-meta-read (+ r0 #x30) k) (+ from newsize)))
                   0
                   (let ((base (%ha-align-up-to-page-base (+ from newsize))))
+                    ;; ZEROED, and its bitmap bits cleared: a stop-the-world
+                    ;; collection walks [base, frontier) object by object, and
+                    ;; the unused tail of every slice must read as nothing, not
+                    ;; as region 0's old objects.  (AArch64: x86-64 has no
+                    ;; stop-the-world walk yet.)
+                    (%layout-if :a64-threads
+                      (progn (%ha-zero base (+ from size))
+                             (%ha-bitmap-clear base (+ from size)))
+                      0)
                     (%gc-region-shrink r0 newsize k)
                     ;; If main is NOT in region 0 right now (%TL-SELFTEST's
                     ;; shape), the shrink moved no live register; clamp the
@@ -1480,6 +1508,27 @@
                 0)))
         0)))
 
+(defun %gc-stw-arm ()
+  "Arm STOP-THE-WORLD for region-0 collections (translate-aarch64, STOP-THE-
+   WORLD FOR REGION 0): publish the band and the region count in the thread
+   table, enrol the main thread as slot 0 (running, its stack top = region 0's
+   stack base, window delta 0), then set the armed word LAST.  AArch64 only
+   for now; a no-op elsewhere."
+  (%layout-if :a64-threads
+    (let ((tt (%thr-table)))
+      (if (zerop tt)
+          0
+          (let ((r0 (%thr-rec 0)) (k (%gc-meta-scale)))
+            (%gc-write64 (+ tt #x58) (%ha-base))
+            (%gc-write64 (+ tt #x60) (%ha-nregions))
+            (%gc-write64 (+ r0 #x38) 0)
+            (%gc-write64 (+ r0 #x78) (%gc-meta-read (+ (%gc-region-0) #x18) k))
+            (%gc-write64 (+ r0 #x68) 3)
+            (mfence)
+            (%gc-write64 (+ tt #x50) 1)
+            1)))
+    0))
+
 (defun %rt-threads-on ()
   "Declare that more than one thread is about to run Lisp through the shared
    runtime tables.  Returns 1 on success, 0 if the precondition is not met.
@@ -1503,6 +1552,7 @@
         ;; not a failure — the slice path just never engages and every locked
         ;; section behaves exactly as before this change.
         (%rt-arena-carve)
+        (%gc-stw-arm)
         ;; CLEAR THE MAIN THREAD'S SELF SLOT, on the first switch-on only (the
         ;; gate is still shut, so this is the spawning thread: main).  The
         ;; x64 fault stub records the faulting RIP at 0x10000C30 -- absolute,
@@ -2396,6 +2446,11 @@
     (%gc-write64 (+ rec #x38) (%tls-self-base))
     ;; 2. its own per-CPU block and CPU id.
     (%ha-percpu-init-cpu (%thr-percpu-base slot) slot)
+    ;; JOIN STOP-THE-WORLD, now that this thread has its own per-CPU block
+    ;; (its collector token is its CPU id): its stack top, then RUNNING and a
+    ;; check of the stop flag — the same handshake as leaving a safe region.
+    (%gc-write64 (+ rec #x78) (+ (%gc-read64 (+ rec #x10)) (%gc-read64 (+ rec #x18))))
+    (%layout-if :a64-threads (%gc-safe-leave) nil)
     (set-current-actor 0)
     (set-idle-flag 0)
     (%gc-write64 (+ rec #x20) slot)
@@ -2481,6 +2536,8 @@
     (let ((rcb (%gc-read64 (+ rec #x40))))
       (if (zerop rcb) 0 (%ha-thread-park-region rcb (%gc-read64 (+ rec #x48)))))
     (%gc-write64 (+ rec #x30) 1)
+    ;; LEAVE STOP-THE-WORLD: from here on this thread touches no heap object.
+    (%gc-write64 (+ rec #x68) 0)
     (%gc-write64 (+ rec #x00) 2)
     0))
 
@@ -2556,6 +2613,9 @@
                         (%gc-write64 (+ rec #x30) 0)
                         (%gc-write64 (+ rec #x50) 0)
                         (%gc-write64 (+ rec #x58) 0)
+                        (%gc-write64 (+ rec #x60) 0)
+                        (%gc-write64 (+ rec #x68) 0)      ; not in STW yet
+                        (%gc-write64 (+ rec #x70) 0)
                         ;; ITS HEAP, PREPARED BY THE SPAWNER, BEFORE THE CLONE.
                         ;; The root window's top is the top of the stack just
                         ;; mapped, which only this side knows; and the metadata

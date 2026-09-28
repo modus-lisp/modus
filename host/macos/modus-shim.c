@@ -662,6 +662,12 @@ static void on_fault(int sig, siginfo_t *si, void *uc_) {
         fprintf(stderr, "\n");
         // A jump to nowhere: show where it came from — every register, and
         // the code before the return address, for an offline disassembly.
+        if (sig == SIGTRAP) {
+            fprintf(stderr, "modus-shim: code at pc %#llx:", (unsigned long long)pc);
+            const uint32_t *w = (const uint32_t *)(uintptr_t)((pc & ~3ULL) - 0x200);
+            for (int i = 0; i < 0x90; i++) fprintf(stderr, "%s%08x", i % 8 ? " " : "\n  ", w[i]);
+            fprintf(stderr, "\n");
+        }
         if (pc < 0x10000) {
             for (int i = 0; i < 29; i++) { char n[8]; snprintf(n, sizeof n, "x%d", i); pr_reg(n, ts->__x[i]); if (i % 4 == 3) fprintf(stderr, "\n"); }
             pr_reg("fp", __darwin_arm_thread_state64_get_fp(*ts));

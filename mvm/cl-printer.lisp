@@ -738,6 +738,14 @@
     ;; *print-readably* overrides *print-escape*
     (when preadably (setq escape t))
     (cond
+      ;; A HASH TABLE IS A CONS in this image (alist . (%ht-tag . meta)), so it
+      ;; must be recognised before any cons arm, or it prints as its innards.
+      ((hash-table-p obj)
+       (%print-string-raw "#<HASH-TABLE :TEST " stream)
+       (%print-string-raw (symbol-name (hash-table-test obj)) stream)
+       (%print-string-raw " :COUNT " stream)
+       (%print-string-raw (princ-to-string (hash-table-count obj)) stream)
+       (%print-string-raw ">" stream))
       ;; NIL — honor *print-case*. NIL is a symbol whose name is "NIL";
       ;; under :downcase / :capitalize the printed form must follow.
       ;; (:capitalize on "NIL" → "Nil", which needs per-word handling.)

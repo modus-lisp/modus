@@ -4843,6 +4843,8 @@
     ((%condition-p obj) (%condition-type-name obj))
     ;; A CLOS class object is itself an instance of STANDARD-CLASS.
     ((%clos-class-p obj) 'standard-class)
+    ;; A hash table is a tagged cons underneath; its type is HASH-TABLE.
+    ((hash-table-p obj) 'hash-table)
     ;; Integers: CLHS says an (integer low high) spec is fine, but a bare
     ;; recognisable supertype name also satisfies req 1.a + the subtypep
     ;; checks.  Use FIXNUM / BIGNUM (TYPEP accepts both as INTEGER here).

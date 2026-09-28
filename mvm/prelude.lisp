@@ -1694,6 +1694,15 @@
        (let ((c (cdr ht)))
          (and (consp c) (eql (car c) (%ht-tag))))))
 
+;;; CL's view of CONSP / LISTP / ATOM, for code compiled at RUNTIME (library and
+;;; user code; see COMPILE-CONSP).  A hash table is a cons underneath, which
+;;; the image's own code relies on; CLHS makes HASH-TABLE and LIST disjoint,
+;;; and portable code dispatches on it -- jzon's object parser took a table for
+;;; a list and every JSON object failed with a TYPE-ERROR.
+(defun %rt-consp (x) (and (consp x) (not (hash-table-p x))))
+(defun %rt-listp (x) (or (null x) (%rt-consp x)))
+(defun %rt-atom (x) (not (%rt-consp x)))
+
 (defun hash-table-test (ht)
   "Return the test designator for HT — one of EQ EQL EQUAL EQUALP.
    0-arg tables carry a NIL test slot (see MAKE-HASH-TABLE) and report

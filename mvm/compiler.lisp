@@ -19303,9 +19303,14 @@
 (defun compile-consp (arg env dest)
   "Compile (consp x) - true if x has cons tag.
    The MVM consp instruction produces a tagged boolean (T or NIL) in dest."
-  (compile-form arg env dest)
-  ;; MVM consp: dest = (consp? src) -> T or NIL
-  (emit-ir :consp dest dest))
+  ;; RUNTIME-COMPILED CODE sees CL's CONSP, which excludes hash tables (see
+  ;; %RT-CONSP); the image's own code keeps the raw tag test it relies on.
+  (if *mvm-eval-runtime-p*
+      (compile-form (list '%rt-consp arg) env dest)
+      (progn
+        (compile-form arg env dest)
+        ;; MVM consp: dest = (consp? src) -> T or NIL
+        (emit-ir :consp dest dest))))
 
 (defun compile-fixnump (arg env dest)
   "Compile (fixnump x) - true if low bit is 0"
@@ -19324,12 +19329,18 @@
 (defun compile-atom-p (arg env dest)
   "Compile (atom x) - true if x is not a cons.
    The MVM atom instruction produces a tagged boolean (T or NIL) in dest."
-  (compile-form arg env dest)
-  ;; MVM atom: dest = (atom? src) -> T or NIL
-  (emit-ir :atom dest dest))
+  (if *mvm-eval-runtime-p*
+      (compile-form (list '%rt-atom arg) env dest)
+      (progn
+        (compile-form arg env dest)
+        ;; MVM atom: dest = (atom? src) -> T or NIL
+        (emit-ir :atom dest dest))))
 
 (defun compile-listp (arg env dest)
   "Compile (listp x) - true if x is NIL or a cons"
+  (when *mvm-eval-runtime-p*
+    (compile-form (list '%rt-listp arg) env dest)
+    (return-from compile-listp nil))
   (let ((true-label (make-compiler-label))
         (check-cons-label (make-compiler-label))
         (end-label (make-compiler-label)))

@@ -2944,6 +2944,14 @@
                     (a64-stw-publish buf +a64-x14+ 2)
                     (a64-set-label buf skip)))
                 (a64-mov-reg buf +a64-x0+ +a64-x26+))
+               ((and *aarch64-linux-mode* (= code #x0544))
+                ;; %GC-COLLECT-NOW — enter the collector with no allocation to
+                ;; follow: the caller has set the limit to the pointer, so the
+                ;; trampoline collects the ACTIVE region (for the lock arena's
+                ;; refill, region 0 — net/hosted-sync.lisp).  Returns NIL.
+                (a64-mov-reg buf +a64-x16+ +a64-x24+)
+                (a64-blr buf +a64-x28+)
+                (a64-mov-reg buf +a64-x0+ +a64-x26+))
                ((and *aarch64-linux-mode* (= code #x0543))
                 ;; %GC-SAFE-LEAVE — running again: mark RUNNING, then (after a
                 ;; full barrier, so a collector that has not seen us running
@@ -2957,8 +2965,8 @@
                         (spin (incf *mvm-label-counter*)))
                     (a64-stw-table buf +a64-x9+ skip)
                     (a64-stw-token-and-rec buf +a64-x9+ +a64-x13+ +a64-x14+)
-                    (a64-load-imm64-general buf +a64-x11+ (conv-real +a64-stw-flag-addr+))
                     (a64-set-label buf again)
+                    (a64-load-imm64-general buf +a64-x11+ (conv-real +a64-stw-flag-addr+))
                     (a64-movz buf +a64-x10+ 3 0)                    ; running
                     (a64-str-unsigned buf +a64-x10+ +a64-x14+ #x68)
                     (a64-dmb buf #xB)
@@ -2978,6 +2986,10 @@
                     (let ((i (a64-current-index buf)))
                       (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i spin :bcond))
                     (a64-ldp-post buf +a64-x0+ +a64-x8+ +a64-sp+ 16)
+                    ;; Another thread may have collected region 0 meanwhile.
+                    (let ((back (incf *mvm-label-counter*)))
+                      (emit-aarch64-stw-refresh buf back)
+                      (a64-set-label buf back))
                     (let ((i (a64-current-index buf)))
                       (a64-b buf 0) (a64-add-fixup buf i again :b))
                     (a64-set-label buf skip)))
@@ -6693,6 +6705,37 @@
     (a64-movz buf +a64-x25+ 0 0)
     (a64-set-label buf skip)))
 
+(defun emit-aarch64-stw-refresh (buf changed)
+  "REGION 0 CAN BE COLLECTED BY ANOTHER THREAD (a worker refilling the lock
+   arena, EVACUATING THE LOCK ARENA), which leaves this thread's x24/x25 —
+   if region 0 is its active region — in the evacuated semispace.  That
+   collector left the new frontier and limit in region 0's block (+0x30/
+   +0x38).  So: region 0 active and x24 outside [from, from+size]?  Reload
+   both and branch to CHANGED.  Uses x10-x12, x15, x16."
+  (let ((same (incf *mvm-label-counter*)))
+    (a64-load-gc-region buf +a64-x15+ +a64-x16+)
+    (a64-load-imm64-general buf +a64-x10+ (conv-real #x10000040))
+    (a64-cmp-reg buf +a64-x15+ +a64-x10+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i same :bcond))
+    (a64-ldr-unsigned buf +a64-x11+ +a64-x15+ +gc-off-from-start+)
+    (a64-asr-imm buf +a64-x11+ +a64-x11+ 1)
+    (a64-ldr-unsigned buf +a64-x12+ +a64-x15+ +gc-off-space-size+)
+    (a64-asr-imm buf +a64-x12+ +a64-x12+ 1)
+    (a64-add-reg buf +a64-x12+ +a64-x12+ +a64-x11+ 0 0)
+    (let ((stale (incf *mvm-label-counter*)))
+      (a64-cmp-reg buf +a64-x24+ +a64-x11+)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i stale :bcond))
+      (a64-cmp-reg buf +a64-x24+ +a64-x12+)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i same :bcond))
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i same :bcond))
+      (a64-set-label buf stale))
+    (a64-ldr-unsigned buf +a64-x24+ +a64-x15+ +gc-off-saved-alloc+)
+    (a64-asr-imm buf +a64-x24+ +a64-x24+ 1)
+    (a64-ldr-unsigned buf +a64-x25+ +a64-x15+ +gc-off-saved-limit+)
+    (a64-asr-imm buf +a64-x25+ +a64-x25+ 1)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i changed :b))
+    (a64-set-label buf same)))
+
 (defun emit-aarch64-stw-entry (buf park early-return)
   "Trampoline ENTRY, right after the register save.  With threads armed: a
    thread that finds the stop flag held by another collector parks here.
@@ -6703,7 +6746,9 @@
    at [sp+128]."
   (when *a64-tls-window*
     (let ((skip (incf *mvm-label-counter*))
-          (no-park (incf *mvm-label-counter*)))
+          (no-park (incf *mvm-label-counter*))
+          (reloaded (incf *mvm-label-counter*))
+          (fits (incf *mvm-label-counter*)))
       (a64-stw-table buf +a64-x9+ skip)
       (a64-stw-token-and-rec buf +a64-x9+ +a64-x13+ +a64-x14+)
       (a64-load-imm64-general buf +a64-x11+ (conv-real +a64-stw-flag-addr+))
@@ -6712,13 +6757,23 @@
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i no-park :bcond))
       (a64-cmp-reg buf +a64-x12+ +a64-x13+)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i no-park :bcond))
+      (a64-mov-reg buf +a64-x13+ +a64-x24+)                           ; x24 before the park
       (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i park :bl))
+      (emit-aarch64-stw-refresh buf reloaded)
       (a64-set-label buf no-park)
       (a64-cmp-imm buf +a64-x25+ 0)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i skip :bcond))
       (a64-load-gc-region buf +a64-x15+ +a64-x16+)
       (a64-ldr-unsigned buf +a64-x25+ +a64-x15+ +gc-off-saved-limit+)
       (a64-asr-imm buf +a64-x25+ +a64-x25+ 1)
+      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i fits :b))
+      ;; Region 0 moved under us: the gc-check's requested end moves with x24.
+      (a64-set-label buf reloaded)
+      (a64-ldr-unsigned buf +a64-x16+ +a64-sp+ 128)
+      (a64-sub-reg buf +a64-x16+ +a64-x16+ +a64-x13+ 0 0)
+      (a64-add-reg buf +a64-x16+ +a64-x16+ +a64-x24+ 0 0)
+      (a64-str-unsigned buf +a64-x16+ +a64-sp+ 128)
+      (a64-set-label buf fits)
       (a64-ldr-unsigned buf +a64-x16+ +a64-sp+ 128)                  ; requested end
       (a64-cmp-reg buf +a64-x16+ +a64-x25+)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i early-return :bcond))
@@ -6798,9 +6853,103 @@
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i next :bcond)) ; not running
       (a64-sched-yield buf)
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i wait :b))
-      (a64-set-label buf normal)
       (a64-set-label buf done)
+      (emit-aarch64-stw-evac-begin buf)
+      (a64-set-label buf normal)
       (a64-set-label buf ready))))
+
+;;; EVACUATING THE LOCK ARENA.  Locked sections allocate in per-CPU slices of
+;;; an arena carved off region 0 (net/hosted-sync.lisp, B-LITE), which nothing
+;;; used to collect: the arena was immortal and filled up (measured: ~31-95
+;;; bytes of garbage per locked INTERN).  A stop-the-world region-0 collection
+;;; sees every root, so it can treat the arena's used span as more from-space:
+;;; scan_word forwards arena objects into region 0's to-space like any other,
+;;; and afterwards the arena is zeroed, its bitmaps cleared, its frontier put
+;;; back to its base and every CPU's slice emptied (the next locked section
+;;; refills from the base).  NOT while any thread holds the runtime lock: its
+;;; allocation pointer is in its slice.  Thread table +0x80 = arena lo, +0x88
+;;; = arena hi (0: not evacuating this collection).
+
+(defun emit-aarch64-stw-evac-begin (buf)
+  "After the world stops (x9 free, table at [sp+0]): arm arena evacuation
+   unless the runtime lock is held or there is no arena in use."
+  (let ((skip (incf *mvm-label-counter*)))
+    (a64-ldr-unsigned buf +a64-x9+ +a64-sp+ 0)
+    (a64-str-unsigned buf +a64-xzr+ +a64-x9+ #x88)
+    (a64-load-imm64-general buf +a64-x10+ (conv-real #x10000DC0))    ; runtime mutex
+    (a64-ldr-width buf +a64-x10+ +a64-x10+ 0 2)
+    (a64-cmp-imm buf +a64-x10+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i skip :bcond))
+    (a64-ldr-unsigned buf +a64-x11+ +a64-x9+ #x58)                     ; band
+    (a64-cmp-imm buf +a64-x11+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+    (a64-add-imm-lsl12 buf +a64-x11+ +a64-x11+ #xB)
+    (a64-add-imm buf +a64-x11+ +a64-x11+ #xC00)                        ; arena words
+    (a64-ldr-unsigned buf +a64-x12+ +a64-x11+ 0)                       ; lo
+    (a64-ldr-unsigned buf +a64-x13+ +a64-x11+ 8)                       ; hi (frontier)
+    (a64-cmp-imm buf +a64-x12+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+    (a64-cmp-reg buf +a64-x13+ +a64-x12+)                               ; hi <= lo: nothing
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i skip :bcond))
+    (a64-str-unsigned buf +a64-x12+ +a64-x9+ #x80)
+    (a64-str-unsigned buf +a64-x13+ +a64-x9+ #x88)
+    (a64-set-label buf skip)))
+
+(defun a64-zero-range (buf lo hi)
+  "Zero [LO, HI) (8-aligned registers, LO advanced).  No other register."
+  (let ((loop (incf *mvm-label-counter*)) (done (incf *mvm-label-counter*)))
+    (a64-set-label buf loop)
+    (a64-cmp-reg buf lo hi)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i done :bcond))
+    (a64-str-unsigned buf +a64-xzr+ lo 0)
+    (a64-add-imm buf lo lo 8)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i loop :b))
+    (a64-set-label buf done)))
+
+(defun emit-aarch64-stw-evac-finish (buf)
+  "After the collection, before the flag clears: with the arena evacuated,
+   zero it and its two bitmaps' range, rewind its frontier, empty every
+   slice.  x9-x17 are free (restored from the register save)."
+  (let ((skip (incf *mvm-label-counter*)) (sl (incf *mvm-label-counter*)))
+    (a64-ldr-unsigned buf +a64-x9+ +a64-sp+ 0)                         ; table
+    (a64-ldr-unsigned buf +a64-x13+ +a64-x9+ #x88)
+    (a64-cmp-imm buf +a64-x13+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+    (a64-ldr-unsigned buf +a64-x12+ +a64-x9+ #x80)
+    ;; the bitmaps: byte range [(lo-pb)>>7, (hi-pb)>>7) in each
+    (dolist (cfg (list #x10000E18 #x10000E40))
+      (a64-ldr-unsigned buf +a64-x12+ +a64-x9+ #x80)
+      (a64-ldr-unsigned buf +a64-x13+ +a64-x9+ #x88)
+      (a64-load-imm64-general buf +a64-x14+ (conv-real #x10000E00))
+      (a64-ldr-unsigned buf +a64-x14+ +a64-x14+ 0) (a64-asr-imm buf +a64-x14+ +a64-x14+ 1)
+      (a64-load-imm64-general buf +a64-x15+ (conv-real cfg))
+      (a64-ldr-unsigned buf +a64-x15+ +a64-x15+ 0) (a64-asr-imm buf +a64-x15+ +a64-x15+ 1)
+      (a64-sub-reg buf +a64-x12+ +a64-x12+ +a64-x14+ 0 0) (a64-lsr-imm buf +a64-x12+ +a64-x12+ 7)
+      (a64-sub-reg buf +a64-x13+ +a64-x13+ +a64-x14+ 0 0) (a64-lsr-imm buf +a64-x13+ +a64-x13+ 7)
+      (a64-add-reg buf +a64-x12+ +a64-x12+ +a64-x15+ 0 0)
+      (a64-add-reg buf +a64-x13+ +a64-x13+ +a64-x15+ 0 0)
+      (a64-zero-range buf +a64-x12+ +a64-x13+))
+    ;; the arena itself
+    (a64-ldr-unsigned buf +a64-x12+ +a64-x9+ #x80)
+    (a64-ldr-unsigned buf +a64-x13+ +a64-x9+ #x88)
+    (a64-zero-range buf +a64-x12+ +a64-x13+)
+    ;; frontier back to the base; every slice empty
+    (a64-ldr-unsigned buf +a64-x11+ +a64-x9+ #x58)
+    (a64-add-imm-lsl12 buf +a64-x11+ +a64-x11+ #xB)
+    (a64-add-imm buf +a64-x11+ +a64-x11+ #x800)                        ; slice blocks
+    (a64-ldr-unsigned buf +a64-x12+ +a64-x9+ #x80)
+    (a64-str-unsigned buf +a64-x12+ +a64-x11+ #x408)                   ; +0xBC08 frontier
+    (a64-movz buf +a64-x10+ 16 0)
+    (a64-set-label buf sl)
+    (a64-str-unsigned buf +a64-xzr+ +a64-x11+ #x30)
+    (a64-str-unsigned buf +a64-xzr+ +a64-x11+ #x38)
+    (a64-add-imm buf +a64-x11+ +a64-x11+ #x40)
+    (a64-sub-imm buf +a64-x10+ +a64-x10+ 1)
+    (a64-cmp-imm buf +a64-x10+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i sl :bcond))
+    (a64-str-unsigned buf +a64-xzr+ +a64-x9+ #x88)
+    (a64-set-label buf skip)))
 
 (defun emit-aarch64-stw-own-window-top (buf)
   "A STW collector's own root window ends at ITS stack top (record +0x78),
@@ -6954,7 +7103,11 @@
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i rnext :b))
       (a64-set-label buf rdone)
       ;; ---- the lock arena [base, frontier) — band + 0xBC00 / 0xBC08 ----
+      ;; (a root set only when this collection is NOT evacuating it)
       (a64-ldr-unsigned buf +a64-x9+ +a64-sp+ 0)
+      (a64-ldr-unsigned buf +a64-x11+ +a64-x9+ #x88)
+      (a64-cmp-imm buf +a64-x11+ 0)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i adone :bcond))
       (a64-ldr-unsigned buf +a64-x11+ +a64-x9+ #x58)
       (a64-add-imm-lsl12 buf +a64-x11+ +a64-x11+ #xB)
       (a64-add-imm buf +a64-x11+ +a64-x11+ #xC00)
@@ -6975,6 +7128,14 @@
       (a64-ldr-unsigned buf +a64-x10+ +a64-sp+ 16)
       (a64-cmp-imm buf +a64-x10+ 0)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+      (emit-aarch64-stw-evac-finish buf)
+      ;; Region 0's new frontier and limit, for a thread whose x24/x25 were in
+      ;; it while another thread collected (EMIT-AARCH64-STW-REFRESH).
+      (a64-load-imm64-general buf +a64-x11+ (conv-real #x10000040))
+      (a64-lsl-imm buf +a64-x12+ +a64-x24+ 1)
+      (a64-str-unsigned buf +a64-x12+ +a64-x11+ +gc-off-saved-alloc+)
+      (a64-lsl-imm buf +a64-x12+ +a64-x25+ 1)
+      (a64-str-unsigned buf +a64-x12+ +a64-x11+ +gc-off-saved-limit+)
       (a64-load-imm64-general buf +a64-x11+ (conv-real +a64-stw-flag-addr+))
       (a64-dmb buf #xB)
       (a64-str-unsigned buf +a64-xzr+ +a64-x11+ 0)
@@ -7091,11 +7252,33 @@
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i maybe :bcond))
       (a64-ret buf)                                    ; not a pointer
       (a64-set-label buf maybe)
-      ;; in from-space?  from_start(x19) <= raw(x12) < from_end(x20)
-      (a64-cmp-reg buf +a64-x12+ +a64-x19+)
-      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i sret :bcond)) ; raw<from_start
-      (a64-cmp-reg buf +a64-x12+ +a64-x20+)
-      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i sret :bcond)) ; raw>=from_end
+      ;; in from-space?  from_start(x19) <= raw(x12) < from_end(x20) — or,
+      ;; during a stop-the-world collection that EVACUATES THE LOCK ARENA, in
+      ;; [arena lo, arena hi) (thread table +0x80/+0x88; see
+      ;; EMIT-AARCH64-STW-EVAC-BEGIN).
+      (let ((arena (incf *mvm-label-counter*))
+            (validate (incf *mvm-label-counter*)))
+        (a64-cmp-reg buf +a64-x12+ +a64-x19+)
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i (if *a64-tls-window* arena sret) :bcond)) ; raw<from_start
+        (a64-cmp-reg buf +a64-x12+ +a64-x20+)
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i (if *a64-tls-window* arena sret) :bcond)) ; raw>=from_end
+        (when *a64-tls-window*
+          (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i validate :b))
+          (a64-set-label buf arena)
+          (a64-load-imm64-general buf +a64-x13+ (conv-real +a64-stw-flag-addr+))
+          (a64-ldr-unsigned buf +a64-x13+ +a64-x13+ 0)
+          (a64-cmp-imm buf +a64-x13+ 0)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i sret :bcond))
+          (a64-load-imm64-general buf +a64-x13+ (conv-real #x10000DA8))
+          (a64-ldr-unsigned buf +a64-x13+ +a64-x13+ 0)
+          (a64-add-imm-lsl12 buf +a64-x13+ +a64-x13+ #x13)
+          (a64-ldr-unsigned buf +a64-x14+ +a64-x13+ #x80)
+          (a64-ldr-unsigned buf +a64-x15+ +a64-x13+ #x88)
+          (a64-cmp-reg buf +a64-x12+ +a64-x14+)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i sret :bcond))
+          (a64-cmp-reg buf +a64-x12+ +a64-x15+)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i sret :bcond)))
+        (a64-set-label buf validate))
       ;; object-start bitmap validate: gran=(raw-page)>>4 ; byte=objbmp+gran>>3 ; bit=gran&7
       (a64-sub-reg buf +a64-x13+ +a64-x12+ +a64-x27+ 0 0)
       (a64-lsr-imm buf +a64-x14+ +a64-x13+ 7)

@@ -690,6 +690,51 @@ The x86-64 handshake itself was checked separately:
 - A diagnostic build (`MODUS_STW_VERIFY=1`) re-walks every extra root after
   each collection.  It found no word still pointing into the evacuated space.
 
+### The lock arena is collected
+
+Locked runtime sections (INTERN, the symbol tables) allocate in per-CPU slices
+of a lock arena carved off region 0 (`net/hosted-sync.lisp`, B-LITE).  It used
+to be immortal.
+- **The leak:** about 31 bytes (x86-64) or 95 bytes (AArch64) of it went per
+  locked INTERN.
+- **The failure:** a worker interning in a loop filled the 31 MB arena, and
+  the fallback path then corrupted memory.
+
+Now a stop-the-world region-0 collection **evacuates** it:
+- **Evacuation:** `scan_word` counts `[arena base, frontier)` as from-space,
+  so live arena objects move into region 0 with every reference updated.  The
+  range is kept at thread table `+0x80`/`+0x88` for the length of the
+  collection.
+- **Reset:** the arena is then zeroed, its bitmaps cleared, its frontier
+  rewound, and every CPU's slice emptied.
+- **Not while the runtime lock is held:** its holder's allocation pointer is in
+  its slice.  That collection walks the arena as roots instead, as before.
+
+**The trigger.**  An outermost lock entry that finds under a quarter of the
+arena left collects region 0 first (`%RT-ARENA-REFILL-CHECK`,
+`%GC-COLLECT-REGION-0`).  Usually that's a worker, so a worker has to be able
+to collect **region 0**, main's heap, without allocating in it:
+- **Collecting from a worker:** it points its region cell at region 0, keeps
+  its own allocation registers, sets its limit to its pointer and enters the
+  collector through a new trap, `%GC-COLLECT-NOW`.  Then it puts the cell and
+  its registers back.
+- **Hand-off:** every stop-the-world region-0 collection leaves region 0's new
+  frontier and limit in region 0's control block.
+- **Refresh:** a thread that wakes from a park or a safe region with region 0
+  active and an allocation pointer outside region 0's current space reloads
+  both from the block.  On AArch64 the gc-check's requested end moves with
+  it; on x86-64 so does the saved RAX of a `cmp rax, r14` check.
+
+`test/hosted-arena-evac.lisp` passes on all three targets:
+- A worker interns 3000 fresh symbols and collects region 0 three times.  Each
+  collection rewinds the arena, every symbol still interns to itself, and
+  main's heap is intact.
+- A worker interning in a long loop never falls back.
+
+Measured on AArch64 under two interning workers: the arena climbs to about
+23 MB, is evacuated to about 3 MB, and repeats, with no fallback.  Before, the
+same run filled it and hung.
+
 **A separate bug it tripped, now fixed:** a lambda SETQ'd into a global
 (`(setq *fn* (let ((k 7)) (lambda (x) (+ x k))))`) could not be called from a
 later form, on x86-64 and AArch64 alike.

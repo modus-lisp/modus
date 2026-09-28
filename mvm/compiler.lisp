@@ -6683,7 +6683,7 @@
 
 (defparameter *hash-dispatch-names*
   '("WITH-OPEN-STREAM" "%CONV-ADDR" "%LAYOUT" "%SET-THREAD-DELTA"
-    "%GC-SAFE-ENTER" "%GC-SAFE-LEAVE"
+    "%GC-SAFE-ENTER" "%GC-SAFE-LEAVE" "%GC-COLLECT-NOW"
     
     "STI" "MUL26HI" "ON" "COMMON-LISP-USER"
     "BEING" "DO" "MAKE-PACKAGE" "MACROLET"
@@ -7855,6 +7855,9 @@
        (emit-ir :trap #x0542) (emit-ir :mov dest +vreg-v0+))
       ((= op-name #.(compute-name-hash "%GC-SAFE-LEAVE"))
        (emit-ir :trap #x0543) (emit-ir :mov dest +vreg-v0+))
+      ;; (%gc-collect-now) — enter the collector, no allocation to follow.
+      ((= op-name #.(compute-name-hash "%GC-COLLECT-NOW"))
+       (emit-ir :trap #x0544) (emit-ir :mov dest +vreg-v0+))
       ;; (%mmap-exec-page size) — PROT_RWX page for the WS4 runtime JIT.
       ((= op-name #.(compute-name-hash "%MMAP-EXEC-PAGE"))
        (compile-mmap-exec (cdr form) env dest))

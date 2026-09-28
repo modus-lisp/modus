@@ -1333,6 +1333,16 @@
 ;;; a region-0 structure mid-evacuation still races the collector, exactly as
 ;;; it always has.
 ;;;
+;;; NO LONGER IMMORTAL (stop-the-world, :STW layouts): a stop-the-world
+;;; region-0 collection EVACUATES the arena — its live objects move into
+;;; region 0 with every reference updated, and the arena is zeroed and rewound
+;;; (translate-aarch64, EVACUATING THE LOCK ARENA).  An outermost %RT-ENTER
+;;; that finds under a quarter of the arena left starts one
+;;; (%RT-ARENA-REFILL-CHECK); otherwise any region-0 collection does it.
+;;; Measured before: ~31 bytes (x86-64) / ~95 (AArch64) of arena per locked
+;;; INTERN, and a worker interning in a loop filled the 31 MB arena and then
+;;; corrupted memory on the fallback path.
+;;;
 ;;; SLICE EXHAUSTION: an outermost %RT-ENTER refills this CPU's slice from the
 ;;; arena whenever headroom is below 64 KB, so a single locked section has at
 ;;; least that; a section allocating MORE than 64 KB in one hold would run the
@@ -1386,6 +1396,55 @@
                       (%gc-region-init blk af af #x100000 0 k)
                       (%gc-write64 (+ (%rt-arena-words) #x08) (+ af #x100000))
                       blk))))))))
+
+(defun %gc-collect-region-0 ()
+  "Collect REGION 0 now, from any thread, with no allocation in it: point
+   this CPU's region cell at region 0 but keep this thread's own allocation
+   registers, set the limit to the pointer, and enter the collector
+   (%GC-COLLECT-NOW).  With threads armed that is a stop-the-world collection
+   that also EVACUATES THE LOCK ARENA (translate-aarch64 / translate-x64);
+   it leaves region 0's new frontier in region 0's block, where main — or
+   whichever thread has region 0 active — takes it on waking.  Then put the
+   cell and the registers back.  Our own frontier is published first: the
+   collection walks every carved region up to it."
+  (%layout-if :stw
+    (let ((k (%gc-meta-scale))
+          (r0 (%gc-region-0))
+          (own (%gc-region)))
+      (if (= own r0)
+          (progn (set-alloc-limit (get-alloc-ptr)) (%gc-collect-now) 0)
+          (let ((a (get-alloc-ptr))
+                (l (get-alloc-limit)))
+            (%gc-meta-write (+ own #x30) a k)
+            (%gc-set-region r0)
+            (set-alloc-limit a)
+            (%gc-collect-now)
+            (%gc-set-region own)
+            (set-alloc-ptr a)
+            (set-alloc-limit l)
+            0)))
+    0))
+
+(defun %rt-arena-refill-check ()
+  "Before an OUTERMOST lock: with under a quarter of the lock arena left,
+   collect region 0 (%GC-COLLECT-REGION-0), which evacuates the arena and
+   rewinds it.  An evacuation can be skipped (the lock was held at the
+   collection); if the arena is still low afterwards, wait 256 lock entries
+   before trying again rather than collect on every one.  Arena words +0x20
+   is that countdown."
+  (let ((ae (%rt-arena-end)))
+    (when (> ae 0)
+      (let* ((base (%rt-arena-base))
+             (quarter (ash (- ae base) -2)))
+        (when (< (- ae (%rt-arena-alloc)) quarter)
+          (let ((cool (%gc-read64 (+ (%rt-arena-words) #x20))))
+            (if (> cool 0)
+                (%gc-write64 (+ (%rt-arena-words) #x20) (- cool 1))
+                (progn
+                  (%gc-collect-region-0)
+                  (when (< (- ae (%rt-arena-alloc)) quarter)
+                    (%gc-write64 (+ (%rt-arena-words) #x20) 256)))))))))
+  0)
 
 (defun %rt-arena-carve ()
   "Carve the immortal lock arena off the top of region 0's CURRENT from-space,
@@ -1463,6 +1522,9 @@
           (if (zerop (%gc-read64 (%rt-mutex-addr)))
               0
               (%gc-write64 (%conv-addr #x10000DE8) (+ (%gc-read64 (%conv-addr #x10000DE8)) 1)))
+          ;; The lock arena running low: refill it BEFORE taking the lock —
+          ;; a collection cannot evacuate it while anyone holds the lock.
+          (%layout-if :stw (%rt-arena-refill-check) 0)
           (%mutex-lock (%rt-mutex-addr))
           (%gc-write64 (%conv-addr #x10000DE0) (+ (%gc-read64 (%conv-addr #x10000DE0)) 1))
           (%gc-write64 (%rt-owner-addr) me)

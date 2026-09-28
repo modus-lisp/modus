@@ -1207,6 +1207,13 @@
                 (emit-bytes buf #x0F #x05)          ; syscall
                 (emit-bytes buf #x0F #x0B)          ; ud2 — unreachable
                 (emit-label buf done)))
+             ((= code #x0544)
+              ;; %GC-COLLECT-NOW — enter the collector with no allocation to
+              ;; follow (the caller set the limit to the pointer), so the
+              ;; trampoline collects the ACTIVE region.  NIL in V0.
+              (let ((gc-lbl (translate-state-gc-label state)))
+                (when gc-lbl (emit-call buf gc-lbl)))
+              (emit-mov-reg-reg buf 'rsi 'r15))
              ((= code #x0542)
               ;; %GC-SAFE-ENTER — stop-the-world safe region (EMIT-X64-GC-SAFE-TRAP).
               (if *x64-stw*
@@ -6189,6 +6196,28 @@
     (x64-stw-mfence buf)
     (emit-ret buf)))
 
+(defun emit-x64-stw-refresh (buf changed)
+  "Region 0 active and R12 outside [from, from+size]?  Another thread
+   collected region 0 (the lock-arena refill); reload R12/R14 from region 0's
+   block and jump to CHANGED.  RAX, RCX, RDX scratch (see translate-aarch64's
+   EMIT-AARCH64-STW-REFRESH)."
+  (let ((same (make-label)) (stale (make-label)))
+    (emit-load-gc-region buf 'rax)
+    (emit-cmp-reg-imm buf 'rax modus.mvm::+gc-region-0-base+)
+    (emit-jcc buf :ne same)
+    (emit-mov-reg-mem buf 'rcx 'rax modus.mvm::+gc-off-from-start+)
+    (emit-cmp-reg-reg buf 'r12 'rcx)
+    (emit-jcc buf :b stale)
+    (emit-mov-reg-mem buf 'rdx 'rax modus.mvm::+gc-off-space-size+)
+    (emit-add-reg-reg buf 'rdx 'rcx)
+    (emit-cmp-reg-reg buf 'r12 'rdx)
+    (emit-jcc buf :be same)
+    (emit-label buf stale)
+    (emit-mov-reg-mem buf 'r12 'rax modus.mvm::+gc-off-saved-alloc+)
+    (emit-mov-reg-mem buf 'r14 'rax modus.mvm::+gc-off-saved-limit+)
+    (emit-jmp buf changed)
+    (emit-label buf same)))
+
 (defun emit-x64-stw-entry (buf park)
   "Trampoline ENTRY, after the register save and `mov rbp, rsp'.  Parks for
    another thread's collection; then, if a back-edge poll CLAMPED R14 (0; a
@@ -6196,7 +6225,8 @@
    saved-limit and returns to the caller's gc-check compare (see the block
    comment).  Every register it uses is on the stack."
   (when *x64-stw*
-    (let ((skip (make-label)) (no-park (make-label)) (collect (make-label)))
+    (let ((skip (make-label)) (no-park (make-label)) (collect (make-label))
+          (reloaded (make-label)) (check (make-label)))
       (x64-stw-table buf 'rax skip)
       (x64-stw-token-and-rec buf 'rax 'r8 'r9)
       (emit-mov-reg-abs buf 'rcx +x64-stw-flag-addr+)
@@ -6204,12 +6234,19 @@
       (emit-jcc buf :e no-park)
       (emit-cmp-reg-reg buf 'rcx 'r8)
       (emit-jcc buf :e no-park)
+      (emit-mov-reg-reg buf 'r10 'r12)            ; R12 before the park
       (emit-call buf park)
+      (emit-x64-stw-refresh buf reloaded)
       (emit-label buf no-park)
+      (emit-mov-reg-imm buf 'r10 0)                ; no reload
       (emit-cmp-reg-imm buf 'r14 0)
       (emit-jcc buf :ne skip)
       (emit-load-gc-region buf 'rax)
       (emit-mov-reg-mem buf 'r14 'rax modus.mvm::+gc-off-saved-limit+)
+      (emit-jmp buf check)
+      ;; Region 0 moved under us: R10 = the old R12, for the saved RAX below.
+      (emit-label buf reloaded)
+      (emit-label buf check)
       ;; No room under it — or no real limit at all: a region switch between
       ;; the clamp and here saved the clamped 0 as the region's limit, and
       ;; returning to the check would only call back here, forever.  Collect;
@@ -6229,6 +6266,13 @@
         (emit-mov-reg-imm buf 'rcx #x8C0FF0394C)
         (emit-cmp-reg-reg buf 'rax 'rcx)
         (emit-jcc buf :ne collect)
+        ;; `cmp rax, r14': RAX is R12 + size — move it with a reloaded R12.
+        (emit-cmp-reg-imm buf 'r10 0)
+        (emit-jcc buf :e rewind)
+        (emit-mov-reg-mem buf 'rax 'rbp 88)          ; saved RAX
+        (emit-sub-reg-reg buf 'rax 'r10)
+        (emit-add-reg-reg buf 'rax 'r12)
+        (emit-mov-mem-reg buf 'rbp 'rax 88)
         (emit-label buf rewind))
       (emit-sub-reg-imm buf 'rdx 14)
       (emit-mov-mem-reg buf 'rbp 'rdx 96)
@@ -6245,7 +6289,7 @@
    other live thread is parked or safe."
   (when *x64-stw*
     (let ((normal (make-label)) (acquire (make-label)) (acquired (make-label))
-          (next (make-label)) (wait (make-label)))
+          (next (make-label)) (wait (make-label)) (evac (make-label)))
       (emit-sub-reg-imm buf 'rsp +x64-stw-frame+)
       (x64-stw-store-imm buf 'rbp -24 0)
       (x64-stw-table buf 'rax normal)
@@ -6272,7 +6316,7 @@
       (emit-mov-reg-imm buf 'rdi 0)
       (emit-label buf next)
       (emit-cmp-reg-imm buf 'rdi 16)
-      (emit-jcc buf :ae normal)
+      (emit-jcc buf :ae evac)
       (emit-mov-reg-reg buf 'rsi 'rdi)
       (emit-shl-reg-imm buf 'rsi 7)
       (emit-add-reg-imm buf 'rsi #x100)
@@ -6289,6 +6333,8 @@
       (emit-jcc buf :ne next)                        ; parked, safe or absent
       (x64-stw-sched-yield buf)
       (emit-jmp buf wait)
+      (emit-label buf evac)
+      (emit-x64-stw-evac-begin buf)
       (emit-label buf normal))))
 
 (defun emit-x64-stw-own-window-top (buf)
@@ -6427,7 +6473,10 @@
       (emit-jmp buf rnext)
       (emit-label buf rdone)
       ;; ---- the lock arena [base, frontier): band + 0xBC00 / 0xBC08 ----
+      ;; (a root set only when this collection is NOT evacuating it)
       (emit-mov-reg-mem buf 'rax 'rbp -8)
+      (x64-stw-cmp-imm buf 'rax #x88 0)
+      (emit-jcc buf :ne adone)
       (emit-mov-reg-mem buf 'rsi 'rax #x58)
       (emit-add-reg-imm buf 'rsi #xBC00)
       (emit-mov-reg-mem buf 'r10 'rsi 0)
@@ -6477,6 +6526,107 @@
     (emit-pop buf 'rdx) (emit-pop buf 'rsi)
     (emit-ret buf)))
 
+(defun x64-stw-from-space-check (buf not-label)
+  "RAX = a candidate's raw address.  Fall through if it is in from-space
+   [RBX, RCX) — or, during a stop-the-world collection that EVACUATES THE LOCK
+   ARENA, in [arena lo, arena hi) (thread table +0x80/+0x88; translate-aarch64
+   has the design, EVACUATING THE LOCK ARENA).  Else jump to NOT-LABEL.  RDX is
+   scratch (scan_word saved it)."
+  (let ((ok (make-label)) (arena (make-label)))
+    (emit-cmp-reg-reg buf 'rax 'rbx)
+    (emit-jcc buf :b (if *x64-stw* arena not-label))
+    (emit-cmp-reg-reg buf 'rax 'rcx)
+    (if *x64-stw*
+        (progn
+          (emit-jcc buf :b ok)
+          (emit-label buf arena)
+          (x64-stw-flag-test buf)
+          (emit-jcc buf :e not-label)
+          (emit-mov-reg-abs buf 'rdx #x10000DA8)
+          (emit-add-reg-imm buf 'rdx #x13000)
+          (x64-stw-rm buf '(#x3B) 0 'rdx #x80)       ; cmp rax, [rdx+0x80]
+          (emit-jcc buf :b not-label)
+          (x64-stw-rm buf '(#x3B) 0 'rdx #x88)       ; cmp rax, [rdx+0x88]
+          (emit-jcc buf :ae not-label)
+          (emit-label buf ok))
+        (emit-jcc buf :ae not-label))))
+
+(defun emit-x64-stw-evac-begin (buf)
+  "After the world stops: arm arena evacuation (table +0x80/+0x88) unless the
+   runtime lock is held or no arena is in use."
+  (let ((skip (make-label)))
+    (emit-mov-reg-mem buf 'rax 'rbp -8)                 ; table
+    (x64-stw-store-imm buf 'rax #x88 0)
+    (emit-bytes buf #x8B #x0C #x25)                     ; mov ecx, [runtime mutex]
+    (emit-u32 buf #x10000DC0)
+    (emit-cmp-reg-imm buf 'rcx 0)
+    (emit-jcc buf :ne skip)
+    (emit-mov-reg-mem buf 'rsi 'rax #x58)               ; band
+    (emit-cmp-reg-imm buf 'rsi 0)
+    (emit-jcc buf :e skip)
+    (emit-add-reg-imm buf 'rsi #xBC00)
+    (emit-mov-reg-mem buf 'rdi 'rsi 0)                  ; lo
+    (emit-mov-reg-mem buf 'r8 'rsi 8)                   ; hi (frontier)
+    (emit-cmp-reg-imm buf 'rdi 0)
+    (emit-jcc buf :e skip)
+    (emit-cmp-reg-reg buf 'r8 'rdi)
+    (emit-jcc buf :be skip)
+    (emit-mov-mem-reg buf 'rax 'rdi #x80)
+    (emit-mov-mem-reg buf 'rax 'r8 #x88)
+    (emit-label buf skip)))
+
+(defun x64-stw-zero-bytes (buf)
+  "REP STOSB: zero RCX bytes at RDI.  Clobbers RAX (AL = 0), RCX, RDI."
+  (emit-bytes buf #xFC)
+  (emit-bytes buf #x31 #xC0)
+  (emit-bytes buf #xF3 #xAA))
+
+(defun emit-x64-stw-evac-finish (buf)
+  "After the collection, before the flag clears: with the arena evacuated,
+   zero it and its bitmap ranges, rewind its frontier, empty every slice.
+   Everything but RBP/RSP/R12-R15 is scratch here (restored by the pops)."
+  (let ((skip (make-label)) (sl (make-label)))
+    (emit-mov-reg-mem buf 'rsi 'rbp -8)                 ; table
+    (x64-stw-cmp-imm buf 'rsi #x88 0)
+    (emit-jcc buf :e skip)
+    (emit-mov-reg-mem buf 'r8 'rsi #x80)                ; lo
+    (emit-mov-reg-mem buf 'r9 'rsi #x88)                ; hi
+    (when (mcgc-collector-on-p)
+      ;; object-start bitmap: [(lo-pb)>>7, (hi-pb)>>7)
+      (emit-mov-reg-reg buf 'rdi 'r8)
+      (emit-bytes buf #x48 #x2B #x3C #x25) (emit-u32 buf +mcgc-cfg-page-base-addr+) ; sub rdi,[pb]
+      (emit-shr-reg-imm buf 'rdi 7)
+      (emit-bytes buf #x48 #x03 #x3C #x25) (emit-u32 buf +mcgc-cfg-bitmap-addr+)   ; add rdi,[bm]
+      (emit-mov-reg-reg buf 'rcx 'r9)
+      (emit-sub-reg-reg buf 'rcx 'r8)
+      (emit-shr-reg-imm buf 'rcx 7)
+      (emit-mov-reg-reg buf 'r10 'rdi)
+      (emit-mov-reg-reg buf 'r11 'rcx)
+      (x64-stw-zero-bytes buf)
+      (when (mcgc-kind-bitmap-on-p)
+        (emit-mov-reg-reg buf 'rdi 'r10)
+        (emit-bytes buf #x48 #x81 #xC7) (emit-u32 buf +mcgc-kindbitmap-delta+)       ; add rdi, delta
+        (emit-mov-reg-reg buf 'rcx 'r11)
+        (x64-stw-zero-bytes buf)))
+    ;; the arena itself
+    (emit-mov-reg-reg buf 'rdi 'r8)
+    (emit-mov-reg-reg buf 'rcx 'r9)
+    (emit-sub-reg-reg buf 'rcx 'r8)
+    (x64-stw-zero-bytes buf)
+    ;; frontier back to the base; every slice empty
+    (emit-mov-reg-mem buf 'rax 'rsi #x58)               ; band
+    (emit-add-reg-imm buf 'rax #xB800)                  ; slice blocks
+    (emit-mov-mem-reg buf 'rax 'r8 #x408)               ; +0xBC08 = lo
+    (emit-mov-reg-imm buf 'rcx 16)
+    (emit-label buf sl)
+    (x64-stw-store-imm buf 'rax #x30 0)
+    (x64-stw-store-imm buf 'rax #x38 0)
+    (emit-add-reg-imm buf 'rax #x40)
+    (emit-sub-reg-imm buf 'rcx 1)
+    (emit-jcc buf :ne sl)
+    (x64-stw-store-imm buf 'rsi #x88 0)
+    (emit-label buf skip)))
+
 (defun emit-x64-stw-release (buf &optional verify-label)
   "End of a collection: a STW collector clears the stop flag (first, with
    *X64-STW-VERIFY*, re-walking the extra roots through VERIFY-LABEL)."
@@ -6490,6 +6640,12 @@
         (emit-mov-reg-mem buf 'rcx 'rcx modus.mvm::+gc-off-space-size+)
         (emit-add-reg-reg buf 'rcx 'rbx)
         (emit-x64-stw-extra-roots buf verify-label))
+      (emit-x64-stw-evac-finish buf)
+      ;; Region 0's new frontier and limit, for a thread whose R12/R14 were in
+      ;; it while another thread collected (EMIT-X64-STW-REFRESH).
+      (emit-mov-reg-imm buf 'rax modus.mvm::+gc-region-0-base+)
+      (emit-mov-mem-reg buf 'rax 'r12 modus.mvm::+gc-off-saved-alloc+)
+      (emit-mov-mem-reg buf 'rax 'r14 modus.mvm::+gc-off-saved-limit+)
       (emit-mov-abs-imm32 buf +x64-stw-flag-addr+ 0)
       (emit-label buf skip))))
 
@@ -6538,6 +6694,10 @@
           (x64-stw-sched-yield buf)
           (x64-stw-flag-test buf)
           (emit-jcc buf :ne spin)
+          ;; Another thread may have collected region 0 meanwhile.
+          (let ((back (make-label)))
+            (emit-x64-stw-refresh buf back)
+            (emit-label buf back))
           (emit-jmp buf again)))
     (emit-label buf skip)
     (dolist (r '(r11 r10 r9 r8 rdi rsi rdx rcx rbx rax)) (emit-pop buf r))
@@ -7030,10 +7190,7 @@
       ;; Check if in from-space: from_start <= (rsi & ~0xF) < from_end
       (emit-mov-reg-reg buf 'rax 'rsi)
       (emit-and-reg-imm buf 'rax -16)            ; strip tag bits
-      (emit-cmp-reg-reg buf 'rax 'rbx)           ; < from_start?
-      (emit-jcc buf :b sw-not-ptr)
-      (emit-cmp-reg-reg buf 'rax 'rcx)           ; >= from_end?
-      (emit-jcc buf :ae sw-not-ptr)
+      (x64-stw-from-space-check buf sw-not-ptr)  ; from_start <= rax < from_end (or the arena)
       ;; MCGC: reject unless RAX is a recorded object start.
       (when (mcgc-collector-on-p)
         (emit-mcgc-validate-or-jump buf 'rax sw-not-ptr)
@@ -7057,10 +7214,7 @@
       ;; Check if in from-space
       (emit-mov-reg-reg buf 'rax 'rsi)
       (emit-and-reg-imm buf 'rax -16)            ; strip tag bits
-      (emit-cmp-reg-reg buf 'rax 'rbx)           ; < from_start?
-      (emit-jcc buf :b sw-not-ptr)
-      (emit-cmp-reg-reg buf 'rax 'rcx)           ; >= from_end?
-      (emit-jcc buf :ae sw-not-ptr)
+      (x64-stw-from-space-check buf sw-not-ptr)  ; from_start <= rax < from_end (or the arena)
       ;; MCGC: reject unless RAX is a recorded object start (same gate as the
       ;; cons path).  The Cheney scan walks copied objects' payload FLATLY and
       ;; calls scan_word on every word; a payload word that coincidentally
@@ -7239,10 +7393,19 @@
       ;; original tagged ptr unchanged (scan_word rewrites the dead slot to
       ;; itself — a no-op; the from-space bytes are untouched).
       ;; RAX is free here (header already consumed into R8), so no spill:
-      (emit-mov-reg-reg buf 'rax 'rsi)           ; rax = raw addr
-      (emit-add-reg-reg buf 'rax 'r8)            ; rax = raw addr + size
-      (emit-cmp-reg-reg buf 'rax 'rcx)           ; raw_addr+size vs from_end
-      (emit-jcc buf :a copy-bogus)               ; > from_end? not a real object — bail
+      (let ((sized (make-label)))
+        ;; (An object outside [from_start, from_end) is an evacuated lock-arena
+        ;; object: its bound is not from_end, and scan_word already vetted it.)
+        (when *x64-stw*
+          (emit-cmp-reg-reg buf 'rsi 'rbx)
+          (emit-jcc buf :b sized)
+          (emit-cmp-reg-reg buf 'rsi 'rcx)
+          (emit-jcc buf :ae sized))
+        (emit-mov-reg-reg buf 'rax 'rsi)           ; rax = raw addr
+        (emit-add-reg-reg buf 'rax 'r8)            ; rax = raw addr + size
+        (emit-cmp-reg-reg buf 'rax 'rcx)           ; raw_addr+size vs from_end
+        (emit-jcc buf :a copy-bogus)               ; > from_end? not a real object — bail
+        (emit-label buf sized))
       ;; Copy R8 bytes from RSI to R13 using REP MOVSQ
       ;; Save RDI and RCX (used by caller for stack scan / from_end)
       (emit-push buf 'rdi)

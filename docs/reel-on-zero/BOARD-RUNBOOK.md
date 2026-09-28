@@ -272,7 +272,12 @@ $SSH '(reel-demo-pass 4)'   # -> (FRAMES n TOTAL-MS t DECODE-MS d FPS f)
      the monitor shows something the moment the plane is up instead of
      looking hung; a tint on the bars is the chroma bug, not the pattern.
      `rh-plane-words` / `rh-show-plane` are the factored plane builder
-     `rh-yuv-plane` and `rh-pattern` share.
+     `rh-yuv-plane` and `rh-pattern` share.  **`hvs-nfill-nc` / `hvs-ncopy-nc`
+     take a byte count that MUST be a multiple of 64**: the native loop is
+     `subs x1,x1,#64; b.ne` with no remainder arm, so 48 bytes never reaches
+     zero and the fill runs off the end of RAM — the board goes silent with
+     no fault (measured 2026-09-28 with 48-byte bars; 64-byte bars are why
+     the pattern is 512x288).
   2. **Then over serial** (nothing needs the network any more):
      `(setq *jit-hot-only* nil)`, `(jit-eager)` — natively compiles every
      registered reel DEFUN (the trampoline registry), the ~16 min the install

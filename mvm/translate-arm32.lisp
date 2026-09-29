@@ -1255,6 +1255,55 @@
               (arm32-add-imm buf +arm-sp+ +arm-sp+ 0 8)
               (arm32-ldr-post buf +arm-r7+ +arm-sp+ 8)     ; restore V7
               (arm32-lsl-imm buf +arm-r0+ +arm-r0+ 1))     ; tag as fixnum
+             ((and (= code #x0502) *arm32-linux-mode*)
+              ;; GENERIC 3-ARG SYSCALL: V0 = number, V1..V3 = args, all TAGGED;
+              ;; result TAGGED in V0.  EABI: number in r7, args r0..r2, svc #0.
+              ;; r7 is V7, so it is saved (8-byte slot: EABI stack alignment).
+              ;; No number remapping: the arch slot overrides the %sys-*
+              ;; functions with ARM's own numbers, as i386's does.
+              (arm32-str-pre buf +arm-r7+ +arm-sp+ -8)
+              (arm32-asr-imm buf +arm-r7+ +arm-r0+ 1)
+              (arm32-asr-imm buf +arm-r0+ +arm-r1+ 1)
+              (arm32-asr-imm buf +arm-r1+ +arm-r2+ 1)
+              (arm32-asr-imm buf +arm-r2+ +arm-r3+ 1)
+              (arm32-svc buf)
+              (arm32-ldr-post buf +arm-r7+ +arm-sp+ 8)
+              (arm32-lsl-imm buf +arm-r0+ +arm-r0+ 1))
+             ((and (= code #x0503) *arm32-linux-mode*)
+              ;; RAW 3-ARG SYSCALL: number TAGGED, args and result RAW.
+              (arm32-str-pre buf +arm-r7+ +arm-sp+ -8)
+              (arm32-asr-imm buf +arm-r7+ +arm-r0+ 1)
+              (arm32-mov buf +arm-r0+ +arm-r1+)
+              (arm32-mov buf +arm-r1+ +arm-r2+)
+              (arm32-mov buf +arm-r2+ +arm-r3+)
+              (arm32-svc buf)
+              (arm32-ldr-post buf +arm-r7+ +arm-sp+ 8))
+             ((and (= code #x050B) *arm32-linux-mode*)
+              ;; GENERIC 6-ARG SYSCALL: V0 = number, V1..V6 = args, TAGGED.
+              ;; V4..V6 are r4..r6 and args 4..6 go in r3..r5, so every move
+              ;; reads a register the previous one has finished with.  r4, r5
+              ;; (V4, V5) and r7 (V7) are saved; r6 is only read.
+              (arm32-str-pre buf +arm-r7+ +arm-sp+ -8)
+              (arm32-str-pre buf +arm-r5+ +arm-sp+ -4)
+              (arm32-str-pre buf +arm-r4+ +arm-sp+ -4)
+              (arm32-asr-imm buf +arm-r7+ +arm-r0+ 1)
+              (arm32-asr-imm buf +arm-r0+ +arm-r1+ 1)
+              (arm32-asr-imm buf +arm-r1+ +arm-r2+ 1)
+              (arm32-asr-imm buf +arm-r2+ +arm-r3+ 1)
+              (arm32-asr-imm buf +arm-r3+ +arm-r4+ 1)
+              (arm32-asr-imm buf +arm-r4+ +arm-r5+ 1)
+              (arm32-asr-imm buf +arm-r5+ +arm-r6+ 1)
+              (arm32-svc buf)
+              (arm32-ldr-post buf +arm-r4+ +arm-sp+ 4)
+              (arm32-ldr-post buf +arm-r5+ +arm-sp+ 4)
+              (arm32-ldr-post buf +arm-r7+ +arm-sp+ 8)
+              (arm32-lsl-imm buf +arm-r0+ +arm-r0+ 1))
+             ((and (= code #x0520) *arm32-linux-mode*)
+              ;; INSTALL-SIGNAL-HANDLERS: a named NOP for now, as i386 and riscv
+              ;; had it -- a fault is a clean SIGSEGV instead of a condition.
+              ;; Pure side effect, no result: skipping it cannot make a wrong
+              ;; value.  TODO: the handler stub (x64/i386/riscv have one).
+              nil)
              ((and (= code #x0500) *arm32-linux-mode*)
               ;; HOSTED: exit(status), status arriving TAGGED in r0.
               (arm32-asr-imm buf +arm-r0+ +arm-r0+ 1)
@@ -1305,8 +1354,18 @@
               (when *arm32-v7*
                 (arm32-movw buf +arm-r0+ #xF424)      ; r0 = 62500
                 (arm32-emit buf #xEE0E0F13)))
+             (*arm32-linux-mode*
+              ;; HOSTED, UNIMPLEMENTED TRAP: UDF #code, loud and named, and
+              ;; recorded for the build's census (as #x10000+code).  It was
+              ;; `SWI code', which on Linux is a REAL system call numbered by
+              ;; whatever r7 held -- the silent-garbage class that made RISC-V's
+              ;; ENOSYS land in a live register.
+              (pushnew (+ #x10000 code) *arm32-unimpl-opcodes*)
+              (arm32-emit buf (logior #xE7F000F0
+                                      (ash (ldb (byte 12 4) code) 8)
+                                      (ldb (byte 4 0) code))))
              (t
-              ;; Real trap: SWI
+              ;; Bare metal: SWI, for the machine-mode handler.
               (arm32-swi buf code)))))
 
         ;;; --- Data Movement ---
@@ -2390,7 +2449,7 @@
 (defun arm32-unimplemented-report ()
   "Print, and return, the opcodes the last arm32 translation had no arm for."
   (when *arm32-unimpl-opcodes*
-    (format t "~&  *** arm32 translator gaps (UDF emitted): ~{#x~2,'0X~^ ~} ***~%"
+    (format t "~&  *** arm32 translator gaps (UDF emitted; #x1xxxx = trap xxxx): ~{#x~2,'0X~^ ~} ***~%"
             (sort (copy-list *arm32-unimpl-opcodes*) #'<)))
   *arm32-unimpl-opcodes*)
 
@@ -2449,19 +2508,30 @@
             (setf (gethash mvm-offset label-map) (mvm-make-label))))))
 
     ;; Second pass: translate instructions
-    (setf pc 0)
-    (loop while (< pc len)
-          do (progn
-               ;; Emit label at current PC before translating
-               (let ((label (gethash pc label-map)))
-                 (when label
-                   (arm32-emit-label buf label)))
-               (let* ((decoded (decode-instruction bc pc))
-                      (opcode (car decoded))
-                      (operands (cadr decoded))
-                      (new-pc (cddr decoded)))
-                 (arm32-translate-insn buf opcode operands new-pc label-map function-table)
-                 (setf pc new-pc))))
+    ;; FUNCTION ENTRIES ARE 16-ALIGNED (NOP-padded).  :fn-addr ORs
+    ;; +tag-function+ (3) into the entry, and with 4-byte alignment alone an
+    ;; entry at 4/8/12 mod 16 tags as 7/B/F -- not a function to anything that
+    ;; reads the low nibble, and F is the collector's forwarding tag (the RV32
+    ;; lost-cons bug).  x64/i386/riscv align for the same reason; cross.lisp
+    ;; starts the native code itself on a 16-byte boundary.
+    (let ((fn-starts (make-hash-table :test 'eql)))
+      (dolist (entry function-table) (setf (gethash (second entry) fn-starts) t))
+      (setf pc 0)
+      (loop while (< pc len)
+            do (progn
+                 (when (gethash pc fn-starts)
+                   (loop until (zerop (mod (arm32-current-index buf) 4))
+                         do (arm32-emit buf #xE1A00000)))        ; MOV r0, r0
+                 ;; Emit label at current PC before translating
+                 (let ((label (gethash pc label-map)))
+                   (when label
+                     (arm32-emit-label buf label)))
+                 (let* ((decoded (decode-instruction bc pc))
+                        (opcode (car decoded))
+                        (operands (cadr decoded))
+                        (new-pc (cddr decoded)))
+                   (arm32-translate-insn buf opcode operands new-pc label-map function-table)
+                   (setf pc new-pc)))))
 
     ;; Emit software divide routine at end (only needed for ARMv5)
     (unless *arm32-v7*

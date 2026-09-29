@@ -35,6 +35,7 @@
 ;;;;   +0x080 scheduler thread slots (16 x 8)
 ;;;;   +0x200 + id*64  actor ID's region control block
 ;;;   +0x1400 + id*48 actor ID's parked-actor scan entry (%AR-MARK-PARKED)
+;;;   +0x2400 + id*8  actor ID's receive deadline   +0x2800 + id*8 timed out
 
 (defvar *ar-ctl* 0)
 (defvar *ar-fns* nil
@@ -147,6 +148,43 @@
 (defun %ar-thread-rcb ()
   (%gc-read64 (+ (%thr-rec (%thr-cpu)) #x40)))
 
+;;; TIMEOUTS.  An actor blocking with a deadline records it at +0x2400+8*id
+;;; (monotonic ns, 0 = none).  Every scheduler pass expires deadlines under
+;;; the lock -- a BLOCKED actor (status 4) past its deadline becomes READY with
+;;; its timed-out flag (+0x2800+8*id) set -- and an idle scheduler sleeps no
+;;; longer than the earliest one.  Only status-4 actors are touched, so an
+;;; expiry can never re-queue an actor that a message already woke.
+
+(defun %ar-deadline-addr (id) (+ *ar-ctl* (+ #x2400 (* 8 id))))
+(defun %ar-timedout-addr (id) (+ *ar-ctl* (+ #x2800 (* 8 id))))
+
+(defun %ar-expire ()
+  "Under the scheduler lock: wake every blocked actor past its deadline.
+   Returns the earliest deadline still pending, or 0."
+  (let ((now (%monotonic-ns)) (soonest 0) (n (+ (%ar-get #x08) 2)) (i 2))
+    (loop
+      (when (>= i n) (return 0))
+      (let ((d (%gc-read64 (%ar-deadline-addr i))))
+        (when (> d 0)
+          (if (and (<= d now) (= (actor-get i #x00) 4))
+              (progn (%gc-write64 (%ar-deadline-addr i) 0)
+                     (%gc-write64 (%ar-timedout-addr i) 1)
+                     (actor-set i #x00 2)
+                     (actor-enqueue i))
+              (when (or (zerop soonest) (< d soonest)) (setq soonest d)))))
+      (setq i (+ i 1)))
+    soonest))
+
+(defun %ar-idle-wait (b g soonest)
+  "%SCHED-IDLE-WAIT, but no longer than until SOONEST (0 = no limit)."
+  (%gc-write64 (+ b #x40) (+ (%gc-read64 (+ b #x40)) 1))
+  (if (zerop (%gc-read64 g))
+      (if (zerop soonest)
+          (%futex-wait g 0)
+          (let ((ms (max 1 (ceiling (- soonest (%monotonic-ns)) 1000000))))
+            (%futex-wait-to g 0 (%cond-ts ms))))
+      0))
+
 (defun %ar-sched-run ()
   "A scheduler thread's loop: %SCHED-RUN's protocol (declare the intent to
    sleep, then look at the queue, then FUTEX_WAIT), plus the two halves of an
@@ -168,12 +206,13 @@
             (when (%sched-stop-p) (return 0))
             (xchg-mem g 0)
             (spin-lock (sched-lock-addr))
-            (let ((id (actor-dequeue)))
+            (let* ((soonest (%ar-expire))
+                   (id (actor-dequeue)))
               (if (zerop id)
                   (progn
                     (spin-unlock (sched-lock-addr))
                     (set-idle-flag 1)
-                    (%sched-idle-wait b g)
+                    (%ar-idle-wait b g soonest)
                     (set-idle-flag 0))
                   (progn
                     (set-idle-flag 0)
@@ -205,8 +244,11 @@
   (let ((id (get-current-actor)))
     (%ar-mark-running id)
     (%with-computation-state ((* (+ id 16) 1099511627776))
-      (handler-case (funcall (svref *ar-fns* id))
-        (serious-condition (e) (%ar-report id e))))
+      (let ((*ar-deferred* nil))
+        (declare (special *ar-deferred*))
+        (%gc-write64 (%ar-deadline-addr id) 0)
+        (handler-case (funcall (svref *ar-fns* id))
+          (serious-condition (e) (%ar-report id e)))))
     (%ar-exit id)))
 
 (defun %ar-entry-addr ()
@@ -520,28 +562,81 @@
     (spin-unlock (sched-lock-addr))
     m))
 
-(defun actors-receive ()
-  "The next message for this actor, blocking until one arrives.  From an actor
-   the thread goes back to its scheduler while it waits; from the main thread
-   (actor 1) it sleeps on the main wake word."
-  (let ((id (get-current-actor)))
+(defvar *ar-deferred* nil
+  "Messages ACTORS-RECEIVE-IF set aside, oldest first.  Bound per actor (in
+   its entry), so it lives in the actor's own heap; main's is the global.")
+
+(defun %ar-raw-receive (timeout-ms)
+  "The next mailbox message: (values message t), or (values nil nil) when
+   TIMEOUT-MS (NIL = wait forever) passes first."
+  (let* ((id (get-current-actor))
+         (deadline (if timeout-ms (+ (%monotonic-ns) (* timeout-ms 1000000)) 0)))
     (if (= id 1)
         (loop
           (xchg-mem (+ *ar-ctl* #x48) 0)
           (spin-lock (sched-lock-addr))
           (let ((o (%ar-dequeue 1)))
             (spin-unlock (sched-lock-addr))
-            (unless (zerop o) (return (%ar-take 1 o))))
-          (%futex-wait (+ *ar-ctl* #x48) 0))
-        (loop
-          (%ar-mark-running id)
-          (spin-lock (sched-lock-addr))
-          (let ((o (%ar-dequeue id)))
-            (if (not (zerop o))
-                (progn (spin-unlock (sched-lock-addr)) (return (%ar-take id o)))
-                (when (zerop (save-context (+ (actor-struct-addr id) #x08)))
-                  (actor-set id #x00 4)
-                  (%ar-hand-back id))))))))
+            (unless (zerop o) (return (values (%ar-take 1 o) t))))
+          (if (zerop deadline)
+              (%futex-wait (+ *ar-ctl* #x48) 0)
+              (let ((left (- deadline (%monotonic-ns))))
+                (when (<= left 0) (return (values nil nil)))
+                (%futex-wait-to (+ *ar-ctl* #x48) 0
+                                (%cond-ts (max 1 (ceiling left 1000000)))))))
+        (progn
+          (%gc-write64 (%ar-timedout-addr id) 0)
+          (loop
+            (%ar-mark-running id)
+            (spin-lock (sched-lock-addr))
+            (let ((o (%ar-dequeue id)))
+              (cond
+                ((not (zerop o))
+                 (%gc-write64 (%ar-deadline-addr id) 0)
+                 (spin-unlock (sched-lock-addr))
+                 (return (values (%ar-take id o) t)))
+                ((and (> deadline 0)
+                      (or (= (%gc-read64 (%ar-timedout-addr id)) 1)
+                          (>= (%monotonic-ns) deadline)))
+                 (%gc-write64 (%ar-deadline-addr id) 0)
+                 (%gc-write64 (%ar-timedout-addr id) 0)
+                 (spin-unlock (sched-lock-addr))
+                 (return (values nil nil)))
+                (t
+                 (when (zerop (save-context (+ (actor-struct-addr id) #x08)))
+                   (%gc-write64 (%ar-deadline-addr id) deadline)
+                   (actor-set id #x00 4)
+                   (%ar-hand-back id))))))))))
+
+(defun actors-receive (&optional timeout-ms)
+  "The next message for this actor: (values message t), or (values nil nil)
+   if TIMEOUT-MS milliseconds pass first (NIL, the default, waits forever).
+   Messages set aside by ACTORS-RECEIVE-IF come first, in order.  From an
+   actor the thread goes back to its scheduler while it waits; from the main
+   thread (actor 1) it sleeps on the main wake word."
+  (if *ar-deferred*
+      (values (pop *ar-deferred*) t)
+      (%ar-raw-receive timeout-ms)))
+
+(defun actors-receive-if (predicate &optional timeout-ms)
+  "The first message satisfying PREDICATE (selective receive): (values message
+   t), or (values nil nil) on timeout.  Messages that do not match are kept,
+   in order, for later receives."
+  (let ((prev nil) (q *ar-deferred*))
+    (loop
+      (unless q (return 0))
+      (when (funcall predicate (car q))
+        (if prev (setf (cdr prev) (cdr q)) (setq *ar-deferred* (cdr q)))
+        (return-from actors-receive-if (values (car q) t)))
+      (setq prev q q (cdr q))))
+  (let ((deadline (if timeout-ms (+ (%monotonic-ns) (* timeout-ms 1000000)) 0)))
+    (loop
+      (let ((left (if (zerop deadline) nil (max 0 (ceiling (- deadline (%monotonic-ns)) 1000000)))))
+        (multiple-value-bind (m got) (%ar-raw-receive left)
+          (unless got (return (values nil nil)))
+          (if (funcall predicate m)
+              (return (values m t))
+              (setq *ar-deferred* (append *ar-deferred* (list m)))))))))
 
 (defun actors-yield ()
   (let ((id (get-current-actor)))

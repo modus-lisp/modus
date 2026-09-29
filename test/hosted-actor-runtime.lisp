@@ -70,6 +70,21 @@
       (when (>= iters 40000) (return 0)))
     (actors-send 1 bad)))
 
+(defun waiter ()
+  ;; (:wait ms): report whether a receive with that timeout got a message, and how long it took
+  (loop (let ((m (actors-receive)))
+          (when (eq m :stop) (return 0))
+          (let ((t0 (get-internal-real-time)))
+            (multiple-value-bind (msg got) (actors-receive (second m))
+              (actors-send 1 (list :waited got msg
+                                   (round (* 1000 (- (get-internal-real-time) t0))
+                                          internal-time-units-per-second))))))))
+
+(defun selector ()
+  (actors-receive)
+  (let ((r (actors-receive-if (lambda (m) (and (consp m) (eq (first m) :reply))) 2000)))
+    (actors-send 1 (list :selected r (actors-receive 500) (actors-receive 500)))))
+
 (defun churn-main (n)
   (let ((keep nil)) (dotimes (i n) (setq keep (make-list 1000 :initial-element i))) (length keep)))
 
@@ -148,6 +163,34 @@
         (ncoll (- (%gc-meta-read (+ (%gc-region-0) #x20) (%gc-meta-scale)) c0)))
     (chk "running actors' region-0 references survive region-0 collections"
          (and (zerop bad) (> ncoll 0)) (list :bad bad :collections ncoll))))
+
+;; TIMEOUTS and SELECTIVE RECEIVE.
+(let ((w (actors-spawn 'waiter)))
+  (actors-send w (list :wait 150))
+  (let ((r (actors-receive)))
+    (chk "an actor's receive times out" (and (null (second r)) (>= (fourth r) 140) (< (fourth r) 1500)) r))
+  (actors-send w (list :wait 3000))
+  (sleep 0.05)
+  (actors-send w :hello)
+  (let ((r (actors-receive)))
+    (chk "a message before the timeout wins" (and (second r) (eq (third r) :hello) (< (fourth r) 2000)) r))
+  (actors-send w :stop))
+(let ((t0 (get-internal-real-time)))
+  (multiple-value-bind (m got) (actors-receive 120)
+    (let ((ms (round (* 1000 (- (get-internal-real-time) t0)) internal-time-units-per-second)))
+      (chk "main's receive times out" (and (null got) (null m) (>= ms 110) (< ms 1500)) ms))))
+(let ((s (actors-spawn 'selector)))
+  (actors-send s :go)
+  (actors-send s (list :other 1)) (actors-send s (list :reply 7)) (actors-send s (list :other 2))
+  (let ((r (actors-receive)))
+    (chk "selective receive takes the reply and keeps the rest in order"
+         (equal r (list :selected (list :reply 7) (list :other 1) (list :other 2))) r)))
+(let ((ws (loop repeat 3 collect (actors-spawn 'waiter))) (t0 (get-internal-real-time)))
+  (dolist (w ws) (actors-send w (list :wait 300)))
+  (dotimes (i 3) (actors-receive))
+  (let ((ms (round (* 1000 (- (get-internal-real-time) t0)) internal-time-units-per-second)))
+    (chk "waiting actors do not hold a thread (3 x 300 ms on 3 threads < 900 ms)" (< ms 850) ms))
+  (dolist (w ws) (actors-send w :stop)))
 
 (chk "stop" (actors-stop))
 

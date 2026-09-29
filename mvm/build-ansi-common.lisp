@@ -2303,7 +2303,11 @@
             (ind-form (rewrite-reader-forms (caddr place)))
             (val-form (rewrite-reader-forms (caddr form))))
        ;; RETURN the value (CLHS) and store a non-symbol place back.
-       (let ((vt (gensym "GETFV")))
+       ;; An INTERNED temp: this rewrite runs on the build host and its
+       ;; output is read again, so a gensym's two occurrences would come
+       ;; back as two different symbols.  VALUE is evaluated before the
+       ;; binding exists, so a fixed name cannot capture it.
+       (let ((vt '%setf-getf-value))
          `(let ((,vt ,val-form))
             ,(if (symbolp (cadr place))
                  `(setq ,(cadr place) (set-getf ,plist-form ,ind-form ,vt))

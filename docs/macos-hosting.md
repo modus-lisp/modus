@@ -495,10 +495,33 @@ Results:
   the open question.  If it does not, link the shim's own segments high as
   well, since only the distances matter now.
 
-Still open for iOS:
-- Reserving the region, heap and arena robustly before anything else lands
-  there, perhaps as zero-fill segments that the shim's `mmap` emulation
-  accepts as already mapped.
+**The data layout is reserved too (2026-09-29).**  A PC-relative image names
+its runtime-data region, heap and JIT arena in its ELF symbol table, as
+absolute `MODUS-LAYOUT-{REGION,HEAP,ARENA}-{LO,HI}` symbols
+(`LINUX-AARCH64-LAYOUT-SYMS`; other images emit none and are byte-identical).
+`image-segments.sh` turns each into a zero-fill segment at its link address:
+- `__MODUSR` covers the region, `__MODUSH` the heap and `__MODUSA` the arena.
+- They cost no file bytes (2.6 GB reserved in a 33 KB test binary) and slide
+  with the code, so nothing else can take that address space first.
+- Every segment is generated from one assembly file, with the image bytes via
+  `.incbin`, in ascending address order.  `ld` refuses out-of-order segments
+  and places `-sectcreate` ones after an object's.
+
+The shim records the reservations.  A fixed request inside one (the boot
+stub's `MAP_FIXED_NOREPLACE` mappings) maps over it in place:
+- The JIT arena is released and taken back as `MAP_JIT` at the same address,
+  because Darwin refuses `MAP_JIT` with `MAP_FIXED`.
+- Where there is no JIT (iOS without the entitlement), the arena becomes
+  plain RW.
+
+Results:
+- **Placement and speed:** on macOS the boot mappings land at exactly their
+  slid addresses, and the arena is `rwx` under the JIT.
+- **Launches:** 40 of 40 per image, with and without the JIT.
+- **Memory:** peak footprint is unchanged (about 277 MB for `hello`).
+- **Tests:** the thread suite passes in place on macOS and in the iOS
+  Simulator.
+- **Device:** the device build links, but has not run yet.
 
 ### Interning without the runtime lock (2026-09-29)
 
@@ -545,6 +568,31 @@ Results:
   fresh keywords and symbols at once, through repeated index rebuilds.  It
   passes, and it fails (5 duplicate keywords) with the miss path's lock
   removed.
+
+**CL `INTERN` and `FIND-SYMBOL` of strings, too.**  A package's symbol tables
+are alists with a derived hash index that `%SYMTAB-INDEX-SYNC` brings up to
+date lazily, and that sync is a write.  `FIND-SYMBOL` and the printer used to
+run it with no lock at all:
+- Two threads could rebuild one index at once.
+- A worker's sync allocated the index in its own region and stored it into
+  the package, in region 0.
+
+Now:
+- An index already in sync with its alist is probed without the lock.
+- A stale one is synced under the (recursive) runtime lock.
+- A rebuilt index is filled privately and installed with one store, and its
+  HEAD moves last, after the fence.
+- `INTERN` looks up external, internal and inherited symbols this way and
+  takes the lock only to create.
+
+Results:
+- `(intern "FOO")` takes the lock 0 times per call, down from 0.25.
+- The race test adds four threads interning the same 5,000 names in one
+  package, alongside `FIND-SYMBOL`, and it passes.
+- `test/hosted-worker-intern.lisp` ("a worker thread that interns fresh
+  symbols dies") timed out on HEAD and now reports `ARM intern-fresh: CLEAN`
+  on AArch64.  On x86-64 its `intern-fresh` arm still dies with a
+  `TYPE-ERROR`, exactly as it did on HEAD, so a second cause remains there.
 
 ## Running natively (M0)
 

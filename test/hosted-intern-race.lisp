@@ -10,8 +10,12 @@
 ;;;; make them, and both tables rebuild their bucket index (it doubles past two
 ;;;; entries a bucket) several times under readers that hold no lock.
 ;;;;
-;;;; WHAT MUST HOLD: every thread got the SAME object for a hash (one keyword,
-;;;; not two), and a lookup afterwards gets that object too.
+;;;; Then the same for CL:INTERN of STRINGS into one package, with FIND-SYMBOL
+;;;; alongside: the package symtab index (mvm/cl-packages.lisp
+;;;; %SYMTAB-FIND-IN) is probed without the lock and re-synced under it.
+;;;;
+;;;; WHAT MUST HOLD: every thread got the SAME object for a hash or name (one
+;;;; keyword, not two), and a lookup afterwards gets that object too.
 ;;;;
 ;;;; WHAT WOULD MAKE A PASS MEANINGLESS: the hashes already existing (each is
 ;;;; checked absent first, through the same lock-free probe), or the threads
@@ -101,6 +105,52 @@
   (chk "results that are not keywords" knotkw 0)
   (chk "keywords a later intern does not return" kafter 0)
   (chk "symbols a later intern does not return" safter 0))
+
+;;; CL:INTERN of STRINGS: the package symtabs (mvm/cl-packages.lisp).  An
+;;; existing symbol is found through %SYMTAB-FIND-IN's lock-free probe; a
+;;; miss interns under the lock.  FIND-SYMBOL runs alongside, and the
+;;; package's index is re-synced under the readers as names arrive.
+(defvar *nstr* 5000)
+(defvar *spk* (make-package "INTERN-RACE-PKG" :use nil))
+(defvar *names* (let ((v (make-array *nstr*)))
+                  (dotimes (i *nstr*) (setf (aref v i) (format nil "IRACE-~D" i)))
+                  v))
+(defvar *cres* (let ((v (make-array *nthreads*))) (dotimes (i *nthreads*) (setf (aref v i) (make-array *nstr*))) v))
+(defvar *found-wrong* (make-array *nthreads* :initial-element 0))
+
+(defun string-racer (id)
+  (let ((cv (aref *cres* id)) (stride (aref #(1 7919 104729 1299709) id))
+        (j (* id 1237)) (wrong 0))
+    (dotimes (k *nstr*)
+      (setq j (mod (+ j stride) *nstr*))
+      (let ((sym (intern (aref *names* j) *spk*)))
+        (setf (aref cv j) sym)
+        ;; FIND-SYMBOL of the name just interned must now find that symbol.
+        (unless (eq (find-symbol (aref *names* j) *spk*) sym) (setq wrong (+ wrong 1)))))
+    (setf (aref *found-wrong* id) wrong)
+    0))
+
+(format t "~%=== ~D THREADS INTERN THE SAME ~D NAMES IN ONE PACKAGE ===~%" *nthreads* *nstr*)
+(let ((ths nil))
+  (dotimes (w *nthreads*)
+    (let ((id w))
+      (setq ths (cons (sb-thread:make-thread
+                       (lambda () (handler-case (string-racer id) (error (e) (list :err (%escape-describe e))))))
+                      ths))))
+  (chk "every string thread finished" (mapcar (function sb-thread:join-thread) (reverse ths))
+       (make-list *nthreads* :initial-element 0)))
+(let ((diff 0) (badname 0) (after 0))
+  (dotimes (i *nstr*)
+    (let ((s0 (aref (aref *cres* 0) i)))
+      (dotimes (w *nthreads*)
+        (unless (eq (aref (aref *cres* w) i) s0) (setq diff (+ diff 1))))
+      (unless (and (symbolp s0) (string= (symbol-name s0) (aref *names* i))) (setq badname (+ badname 1)))
+      (unless (eq (find-symbol (aref *names* i) *spk*) s0) (setq after (+ after 1)))))
+  (chk "symbols that differ between threads" diff 0)
+  (chk "symbols with the wrong name" badname 0)
+  (chk "FIND-SYMBOL misses right after a thread's own INTERN"
+       (let ((n 0)) (dotimes (w *nthreads*) (setq n (+ n (aref *found-wrong* w)))) n) 0)
+  (chk "symbols FIND-SYMBOL does not return afterwards" after 0))
 
 (format t "~%~D checks, ~D failed~%" *checks* *fail*)
 (format t "~A~%" (if (zerop *fail*) "LOCK-FREE INTERN RACE: PASS" "LOCK-FREE INTERN RACE: FAIL"))

@@ -1620,7 +1620,9 @@
                                             :native-image-offset
                                             (or (kernel-image-native-image-offset image) 0)
                                             :native-code-length
-                                            (length (kernel-image-native-code image))))
+                                            (length (kernel-image-native-code image))
+                                            :layout-syms
+                                            (linux-aarch64-layout-syms)))
                     (t (let ((elf-machine (getf boot-descriptor :elf-machine))
                              (load-addr (or (getf boot-descriptor :load-addr) 0))
                              (elf-class (getf boot-descriptor :elf-class 32))

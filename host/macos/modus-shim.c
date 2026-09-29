@@ -184,11 +184,53 @@ static int in_jit(uint64_t a) {
     return 0;
 }
 
+// RESERVED RANGES: the runtime-data region, heap and JIT arena of an image
+// running in place, which the executable reserves as zero-fill segments
+// (host/macos/image-segments.sh) so nothing else can take the address space
+// before the image's boot stub maps them.  A fixed request that lies inside
+// one maps OVER it in place.
+#define MAXRES 4
+static struct { uint64_t lo, hi; } reserved[MAXRES];
+static int n_reserved;
+static int in_reserved(uint64_t a, uint64_t len) {
+    for (int i = 0; i < n_reserved; i++)
+        if (a >= reserved[i].lo && a + len <= reserved[i].hi) return 1;
+    return 0;
+}
+static void note_reservation(const char *seg) {
+    unsigned long n = 0;
+    uint8_t *p = getsectiondata(&_mh_execute_header, seg, "__reserve", &n);
+    if (p && n && n_reserved < MAXRES) {
+        reserved[n_reserved].lo = (uint64_t)(uintptr_t)p;
+        reserved[n_reserved].hi = (uint64_t)(uintptr_t)p + n;
+        n_reserved++;
+    }
+}
+
 static long dx_mmap(long addr, long len, long prot, long flags, long fd, long off) {
     int f = (int)(flags & 3);                      // SHARED/PRIVATE agree
     if (flags & 0x20) f |= MAP_ANON;
     int noreplace = (flags & 0x100000) != 0;       // MAP_FIXED_NOREPLACE
     int jit = (prot & PROT_EXEC) && (flags & 0x20);
+    if (((flags & 0x10) || noreplace) && addr && in_reserved((uint64_t)addr, (uint64_t)len)) {
+        // Ours already: map over the reservation at exactly that address.
+        // JIT memory cannot be MAP_FIXED on Darwin, so release the range and
+        // take it back as MAP_JIT at the (now free) address; where there is
+        // no JIT (iOS without the entitlement) it becomes plain RW data.
+        if (jit) {
+            munmap((void *)addr, (size_t)len);
+            void *p = mmap((void *)addr, (size_t)len, (int)prot, f | MAP_JIT, (int)fd, (off_t)off);
+            if (p == (void *)addr) {
+                if (n_jit < MAXJIT) { jit_regions[n_jit].lo = (uint64_t)p; jit_regions[n_jit].hi = (uint64_t)p + (uint64_t)len; n_jit++; }
+                modus_jit_wp(1);
+                return (long)p;
+            }
+            if (p != MAP_FAILED) munmap(p, (size_t)len);
+            prot &= ~PROT_EXEC;
+        }
+        void *p = mmap((void *)addr, (size_t)len, (int)prot, f | MAP_FIXED, (int)fd, (off_t)off);
+        return p == MAP_FAILED ? -lx_errno(errno) : (long)p;
+    }
     // macOS refuses RWX anonymous memory without MAP_JIT, and MAP_JIT with
     // MAP_FIXED; it does honour MAP_JIT's address HINT (probed), which keeps
     // the JIT arena at its fixed address for save-and-die.
@@ -864,6 +906,11 @@ int main(int argc, char **argv, char **envp) {
     sp[k++] = 0; sp[k++] = 0;                      // auxv: AT_NULL
 
     g_code_lo = link; g_code_hi = link + ph->memsz;
+    if (in_place) {
+        note_reservation("__MODUSR");
+        note_reservation("__MODUSH");
+        note_reservation("__MODUSA");
+    }
     reserve_delta_key();
     install_fault_report();
     modus_enter((uint64_t)(uintptr_t)sp, eh->entry + (uint64_t)slide);

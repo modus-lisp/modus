@@ -122,7 +122,8 @@
                                                        native-code-length
                                                        (machine 183)
                                                        (page-align #x10000)
-                                                       (bss-size nil))
+                                                       (bss-size nil)
+                                                       (layout-syms nil))
   "Wrap raw image bytes in an ELF64-LE executable.
 
    Named for AArch64 because that is what it was written for, and the defaults
@@ -136,7 +137,11 @@
 
    MACHINE   e_machine: 183 EM_AARCH64 (default), 243 EM_RISCV, 62 EM_X86_64.
    PAGE-ALIGN p_align: 64K on AArch64, 4K elsewhere.
-   BSS-SIZE  extra p_memsz beyond p_filesz; defaults to the AArch64 heap size."
+   BSS-SIZE  extra p_memsz beyond p_filesz; defaults to the AArch64 heap size.
+   LAYOUT-SYMS  ((name . address) ...) emitted as ABSOLUTE symbols after the
+             function symbols — how a PC-relative image tells the host tools
+             where the rest of its layout lies (LINUX-AARCH64-LAYOUT-SYMS).
+             NIL, the default, emits nothing extra."
   (declare (ignorable bss-size))
   (let* ((ehdr-size 64)
          (phdr-size 56)
@@ -167,10 +172,11 @@
                                 ".strtab" (string #\Null)))
          (shstrtab-bytes (map 'vector #'char-code shstrtab))
          (shstrtab-len (length shstrtab-bytes))
-         (sym-names (cons "" (mapcar (lambda (fi)
-                                       (%sanitize-symbol-name
-                                         (mvm-function-info-name fi)))
-                                     sorted-fns)))
+         (sym-names (append (cons "" (mapcar (lambda (fi)
+                                               (%sanitize-symbol-name
+                                                 (mvm-function-info-name fi)))
+                                             sorted-fns))
+                            (mapcar #'car layout-syms)))
          (sym-name-offsets (let ((acc 0) (offs nil))
                              (dolist (n sym-names (nreverse offs))
                                (push acc offs)
@@ -181,7 +187,7 @@
                            (write-char #\Null out))))
          (strtab-byte-vec (map 'vector #'char-code strtab-bytes))
          (strtab-len (length strtab-byte-vec))
-         (n-syms (1+ (length function-table)))
+         (n-syms (+ 1 (length function-table) (length layout-syms)))
          (symtab-len (* n-syms sym-size))
          (shstrtab-offset (+ header-total raw-len))
          (symtab-offset (+ shstrtab-offset shstrtab-len))
@@ -272,6 +278,15 @@
                (mvm-emit-u16 buf 1)
                (mvm-emit-u64 buf sym-addr)
                (mvm-emit-u64 buf fn-size)))
+    ;; Layout symbols: GLOBAL OBJECT, SHN_ABS (#xFFF1), size 0.
+    (loop for (nil . value) in layout-syms
+          for name-offset in (nthcdr (1+ (length sorted-fns)) sym-name-offsets)
+          do (mvm-emit-u32 buf name-offset)
+             (mvm-emit-byte buf #x11)
+             (mvm-emit-byte buf 0)
+             (mvm-emit-u16 buf #xFFF1)
+             (mvm-emit-u64 buf value)
+             (mvm-emit-u64 buf 0))
     (loop for b across strtab-byte-vec do (mvm-emit-byte buf b))
     (dotimes (i shdr-size) (mvm-emit-byte buf 0))
     (mvm-emit-u32 buf 1) (mvm-emit-u32 buf 1)
@@ -311,6 +326,23 @@
 ;;; Generic AArch64 syscalls: write=64 exit=93 mmap=222 clone=220 wait4=260.
 ;;;
 ;;; MVM registers (translate-aarch64.lisp): x24=VA x25=VL x26=NIL x29=FP.
+
+(defun linux-aarch64-layout-syms ()
+  "For a PC-relative image (MODUS_PCREL): absolute ELF symbols naming its
+   data layout — the runtime-data region, the heap and the JIT arena, each as
+   [LO, HI) at the LINK address.  host/macos/image-segments.sh reads them to
+   RESERVE those ranges as zero-fill segments of the executable, which the
+   loader slides with the code.  NIL for any other image (byte-identical)."
+  (when (modus.mvm::a64-pcrel-p)
+    (let* ((rlo (conv-real +conv-region-low+))
+           (hlo (hosted-layout :heap-base +linux-aarch64-fixed-heap-base+))
+           (alo (hosted-layout :jit-arena-base +linux-aarch64-jit-arena-base+)))
+      (list (cons "MODUS-LAYOUT-REGION-LO" rlo)
+            (cons "MODUS-LAYOUT-REGION-HI" (+ rlo (- +conv-region-end+ +conv-region-low+)))
+            (cons "MODUS-LAYOUT-HEAP-LO" hlo)
+            (cons "MODUS-LAYOUT-HEAP-HI" (+ hlo (linux-aarch64-heap-size)))
+            (cons "MODUS-LAYOUT-ARENA-LO" alo)
+            (cons "MODUS-LAYOUT-ARENA-HI" (+ alo +linux-aarch64-jit-arena-size+))))))
 
 (defun emit-aarch64-layout-addr (buf rd addr)
   "Xd := ADDR, an address in the image's layout: PC-relative under

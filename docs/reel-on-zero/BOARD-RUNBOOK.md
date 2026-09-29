@@ -1393,7 +1393,7 @@ so performance should not depend on the loader.  Verified two ways:
   | handover | testsrc2 decode / fps | bars decode / fps |
   |---|---|---|
   | `go` (MMU+dcache ON) | 2452-2454 ms, 29 | 1385-1387 ms, 57 |
-  | `booti` (MMU+caches OFF) | 2463 ms, 29 | 1459 ms, 54 |
+  | `booti` (MMU+caches OFF) | 2463 ms, 29 (x2) | 1386-1387 ms, 57 (first play after the re-link once read 1459) |
 
   The image's own MMU/cache setup and clock request are what the numbers
   depend on, not the loader's state.  The SD card is a stock Raspberry Pi OS

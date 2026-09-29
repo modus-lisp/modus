@@ -1208,8 +1208,75 @@
            ((< code #x0300)
             ;; Frame-alloc/frame-free: NOP for now
             nil)
+           ((and (= code #x0520) *riscv-linux-mode*)
+            ;; INSTALL-SIGNAL-HANDLERS, hosted: SIGSEGV/SIGBUS/SIGFPE/SIGILL
+            ;; longjmp into the innermost handler-case (TRAP #x0511's body), as
+            ;; on x64, aarch64 and now i386; nothing armed -> exit_group(139).
+            ;; rt_sigaction (134) with the asm-generic struct { handler; flags;
+            ;; mask } -- RISC-V has no sa_restorer, the kernel returns through
+            ;; the vDSO -- and SA_SIGINFO|SA_NODEFER: the handler never
+            ;; returns, so without NODEFER the signal would stay blocked and a
+            ;; second fault would kill.  a0-a3 are saved: this is not a call.
+            (let ((w (rv-word-size))
+                  (skip (rv-current-offset buf)))
+              (rv-emit-jal buf +rv-x0+ 0)                      ; over the stub
+              (let ((stub (rv-current-offset buf)))
+                ;; Unblock SEGV/BUS/FPE/ILL (mask #x4C8) before leaving: the
+                ;; handler never returns through sigreturn, and qemu-riscv64
+                ;; left SIGSEGV blocked despite SA_NODEFER -- the SECOND fault
+                ;; then killed the process.  rt_sigprocmask(SIG_UNBLOCK) is
+                ;; right whatever the kernel does with NODEFER.
+                (rv-emit-addi buf +rv-sp+ +rv-sp+ -16)
+                (rv-emit-li buf +rv-t0+ #x4C8)
+                (rv-emit-sw buf +rv-t0+ +rv-sp+ 0)
+                (rv-emit-sw buf +rv-x0+ +rv-sp+ 4)
+                (rv-emit-addi buf +rv-a0+ +rv-x0+ 1)           ; SIG_UNBLOCK
+                (rv-emit-mv buf +rv-a1+ +rv-sp+)
+                (rv-emit-mv buf +rv-a2+ +rv-x0+)
+                (rv-emit-addi buf +rv-a3+ +rv-x0+ 8)
+                (rv-emit-addi buf +rv-a7+ +rv-x0+ 135)         ; rt_sigprocmask
+                (rv-emit-ecall buf)
+                (rv-emit-addi buf +rv-sp+ +rv-sp+ 16)
+                (rv-emit-longjmp-to-armed
+                 buf (lambda ()
+                       (rv-emit-addi buf +rv-a0+ +rv-x0+ 139)
+                       (rv-emit-addi buf +rv-a7+ +rv-x0+ 94)   ; exit_group
+                       (rv-emit-ecall buf)))
+                (rv-patch-jal-here buf skip)
+                (rv-emit-addi buf +rv-sp+ +rv-sp+ -64)
+                (rv-emit-store-word buf +rv-a0+ +rv-sp+ 32)
+                (rv-emit-store-word buf +rv-a1+ +rv-sp+ 40)
+                (rv-emit-store-word buf +rv-a2+ +rv-sp+ 48)
+                (rv-emit-store-word buf +rv-a3+ +rv-sp+ 56)
+                ;; act at sp: handler, flags, 8-byte mask (0)
+                ;; Full AUIPC hi20/lo12 split: on RV64 the stub (64-bit LIs,
+                ;; the handler pop) is more than ADDI's +/-2 KB back.
+                (let* ((here (rv-current-offset buf))
+                       (off (- stub here))
+                       (lo12 (logand off #xFFF))
+                       (lo12-sext (if (>= lo12 #x800) (- lo12 #x1000) lo12))
+                       (hi20 (logand (ash (- off lo12-sext) -12) #xFFFFF)))
+                  (rv-emit-auipc buf +rv-t1+ hi20)
+                  (rv-emit-addi buf +rv-t1+ +rv-t1+ (logand lo12-sext #xFFF)))
+                (rv-emit-store-word buf +rv-t1+ +rv-sp+ 0)
+                (rv-emit-li buf +rv-t1+ #x40000004)
+                (rv-emit-store-word buf +rv-t1+ +rv-sp+ w)
+                (rv-emit-sw buf +rv-x0+ +rv-sp+ (* 2 w))
+                (rv-emit-sw buf +rv-x0+ +rv-sp+ (+ (* 2 w) 4))
+                (dolist (sig '(11 7 8 4))
+                  (rv-emit-addi buf +rv-a0+ +rv-x0+ sig)
+                  (rv-emit-mv buf +rv-a1+ +rv-sp+)
+                  (rv-emit-mv buf +rv-a2+ +rv-x0+)
+                  (rv-emit-addi buf +rv-a3+ +rv-x0+ 8)
+                  (rv-emit-addi buf +rv-a7+ +rv-x0+ 134)
+                  (rv-emit-ecall buf))
+                (rv-emit-load-word buf +rv-a0+ +rv-sp+ 32)
+                (rv-emit-load-word buf +rv-a1+ +rv-sp+ 40)
+                (rv-emit-load-word buf +rv-a2+ +rv-sp+ 48)
+                (rv-emit-load-word buf +rv-a3+ +rv-sp+ 56)
+                (rv-emit-addi buf +rv-sp+ +rv-sp+ 64))))
            ((= code #x0520)
-            ;; INSTALL-SIGNAL-HANDLERS -- a deliberate, named NOP, exactly as on
+            ;; BARE: INSTALL-SIGNAL-HANDLERS -- a deliberate, named NOP, exactly as on
             ;; i386 (*i386-safe-nop-traps*): a pure side effect with no result
             ;; and no control transfer, so skipping it makes a hardware fault
             ;; fatal instead of recovered into a handler-case -- worse
@@ -1327,37 +1394,14 @@
             ;; armed this falls through to a TRAP rather than jumping to address
             ;; zero, so an unhandled condition is an honest crash at a named
             ;; instruction instead of a wild branch.
-            (rv-emit-li buf +rv-t0+ *rv-jmpbuf-addr*)
-            (rv-emit-load-word buf +rv-t1+ +rv-t0+ 0)
-            (let ((to-nohandler (rv-current-offset buf)))
-              (rv-emit-beq buf +rv-t1+ +rv-x0+ 0)              ; patched
-              (rv-emit-li buf +rv-t2+ *rv-longjmp-scratch-addr*)
-              (dotimes (i +rv-jmpbuf-words+)
-                (rv-emit-load-word buf +rv-t3+ +rv-t0+ (* 8 i))
-                (rv-emit-store-word buf +rv-t3+ +rv-t2+ (* 8 i)))
-              ;; Zero the LIVE capped count: this unwind passes every capped
-              ;; (strictly inner) frame at once, so their pending absorbs must
-              ;; not fire against an outer pop afterwards.
-              (rv-emit-li buf +rv-t1+ *rv-hstack-capped-addr*)
-              (rv-emit-store-word buf +rv-x0+ +rv-t1+ 0)
-              (rv-emit-handler-pop buf)
-              ;; Restore from the scratch copy.  V0 is loaded LAST but one so
-              ;; nothing below clobbers it, and t2 holds the jump target.
-              (rv-emit-li buf +rv-t0+ *rv-longjmp-scratch-addr*)
-              (dotimes (i 8)
-                (rv-emit-load-word buf (rv-resolve-vreg (+ 4 i))
-                                   +rv-t0+ (* 8 (+ 3 i))))
-              (rv-emit-load-word buf +rv-t2+ +rv-t0+ 16)       ; resume ip
-              (rv-emit-load-word buf +rv-fp+ +rv-t0+ 8)
-              (rv-emit-load-word buf +rv-sp+ +rv-t0+ 0)
-              (rv-emit-li buf +rv-a0+ +t-value+)               ; second return: T
-              (rv-emit-jalr buf +rv-x0+ +rv-t2+ 0)
-              (rv-patch-branch-here buf to-nohandler)
-              ;; No handler armed: trap with the code in a7, so the failure names
-              ;; itself.  mvm-eval prints "LONGJMP with no active handler-case"
-              ;; on the arches that can; this one at least stops HERE.
-              (rv-emit-addi buf +rv-a7+ +rv-x0+ #x0511)
-              (rv-emit-ebreak buf)))
+            (rv-emit-longjmp-to-armed
+             buf (lambda ()
+                   ;; No handler armed: trap with the code in a7, so the failure
+                   ;; names itself.  mvm-eval prints "LONGJMP with no active
+                   ;; handler-case" on the arches that can; this one at least
+                   ;; stops HERE.
+                   (rv-emit-addi buf +rv-a7+ +rv-x0+ #x0511)
+                   (rv-emit-ebreak buf))))
 
            ((= code #x0512)
             ;; CLEAR-HANDLER: pop one frame.  V0 carries the handler-case's
@@ -3632,6 +3676,38 @@
               (rv-emit-ebreak buf))))
         (dolist (r rets) (here r))
         (rv-emit-jalr buf +rv-x0+ +rv-ra+ 0)))))
+
+(defun rv-emit-longjmp-to-armed (buf no-handler-fn)
+  "Unwind to the innermost armed handler-case with V0 = T: TRAP #x0511's body,
+   shared with the signal handler #x0520 installs.  Word 0 of the jmpbuf == 0
+   is the \"nothing armed\" sentinel; NO-HANDLER-FN emits what happens then."
+  (rv-emit-li buf +rv-t0+ *rv-jmpbuf-addr*)
+  (rv-emit-load-word buf +rv-t1+ +rv-t0+ 0)
+  (let ((to-nohandler (rv-current-offset buf)))
+    (rv-emit-beq buf +rv-t1+ +rv-x0+ 0)              ; patched
+    (rv-emit-li buf +rv-t2+ *rv-longjmp-scratch-addr*)
+    (dotimes (i +rv-jmpbuf-words+)
+      (rv-emit-load-word buf +rv-t3+ +rv-t0+ (* 8 i))
+      (rv-emit-store-word buf +rv-t3+ +rv-t2+ (* 8 i)))
+    ;; Zero the LIVE capped count: this unwind passes every capped
+    ;; (strictly inner) frame at once, so their pending absorbs must
+    ;; not fire against an outer pop afterwards.
+    (rv-emit-li buf +rv-t1+ *rv-hstack-capped-addr*)
+    (rv-emit-store-word buf +rv-x0+ +rv-t1+ 0)
+    (rv-emit-handler-pop buf)
+    ;; Restore from the scratch copy.  V0 is loaded LAST but one so
+    ;; nothing below clobbers it, and t2 holds the jump target.
+    (rv-emit-li buf +rv-t0+ *rv-longjmp-scratch-addr*)
+    (dotimes (i 8)
+      (rv-emit-load-word buf (rv-resolve-vreg (+ 4 i))
+                         +rv-t0+ (* 8 (+ 3 i))))
+    (rv-emit-load-word buf +rv-t2+ +rv-t0+ 16)       ; resume ip
+    (rv-emit-load-word buf +rv-fp+ +rv-t0+ 8)
+    (rv-emit-load-word buf +rv-sp+ +rv-t0+ 0)
+    (rv-emit-li buf +rv-a0+ +t-value+)               ; second return: T
+    (rv-emit-jalr buf +rv-x0+ +rv-t2+ 0)
+    (rv-patch-branch-here buf to-nohandler)
+    (funcall no-handler-fn)))
 
 (defvar *rv-fn-starts* nil
   "Set of bytecode offsets that begin a function, for the translation in

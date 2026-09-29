@@ -1117,14 +1117,16 @@
            (multiple-value-bind (code npc) (fetch-u16 bc pc)
              (cond
                ((= code #x0310)
-                ;; RDTSC: fake value in interpreter
-                (reg-set regs +vreg-vr+ 0)
+                ;; RDTSC: THE MACHINE'S counter -- this interpreter is itself
+                ;; native image code, so (rdtsc) here is the port's own trap.  It
+                ;; used to return a fake 0, so runtime-evaluated timing (TIME,
+                ;; trace, GC pause stats) silently measured nothing.
+                (setf (svref regs +vreg-vr+) (rdtsc))   ; a VALUE, not a word: no reg-set
                 (setf pc npc))
                ((= code #x0311)
-                ;; CNTFRQ: no counter under the interpreter, so report
-                ;; frequency-unknown — the same answer a platform without the
-                ;; register gives, which callers already have to handle.
-                (reg-set regs +vreg-vr+ 0)
+                ;; CNTFRQ: the same counter's rate, from the port (0 where the
+                ;; platform cannot say -- x64's TSC -- which callers handle).
+                (setf (svref regs +vreg-vr+) (cntfrq))
                 (setf pc npc))
                ;; --- handler-case / catch / throw setjmp-longjmp ---
                ;; SETJMP (#x0510): push a jmp-buf recording the resume-PC (npc,

@@ -1316,20 +1316,24 @@
              ((= code #x0310)
               ;; RDTSC: Read timestamp counter, return 64-bit result in RAX
               ;; Combine EDX:EAX into full 64-bit value
-              ;; rdtsc
+              ;;
+              ;; RCX AND RDX ARE SAVED: RDTSCP writes ECX (TSC_AUX) and EDX, and
+              ;; RCX/RDX are the homes of V5/V6.  The arm used to clobber both,
+              ;; unnoticed while only straight-line timing code called it; once
+              ;; the interpreter's own #x0310 became this native read, a
+              ;; runtime (rdtsc) wrecked the interpreter's live registers.
+              (emit-bytes buf #x51)            ; push rcx
+              (emit-bytes buf #x52)            ; push rdx
               (emit-bytes buf #x0F #x01 #xF9)  ; RDTSCP (waits for instructions)
-              ;; mov ecx, eax (save low 32)
-              (emit-bytes buf #x89 #xC1)
-              ;; mov eax, edx
-              (emit-bytes buf #x89 #xD0)
-              ;; shl rax, 32
-              (emit-bytes buf #x48 #xC1 #xE0 #x20)
-              ;; or rax, rcx
-              (emit-bytes buf #x48 #x09 #xC8)
+              ;; rax = edx:eax  (both 32-bit writes zero-extend)
+              (emit-bytes buf #x48 #xC1 #xE2 #x20)   ; shl rdx, 32
+              (emit-bytes buf #x48 #x09 #xD0)        ; or rax, rdx
               ;; shl rax, 1 — tag as a fixnum.  A value register holds a TAGGED
               ;; word; a raw counter with its low bit set carries the cons tag
               ;; (0x1), i.e. a wild pointer, on half of all reads.
-              (emit-bytes buf #x48 #xD1 #xE0))
+              (emit-bytes buf #x48 #xD1 #xE0)
+              (emit-bytes buf #x5A)            ; pop rdx
+              (emit-bytes buf #x59))           ; pop rcx
              ((= code #x0311)
               ;; CNTFRQ equivalent: x86 has no architectural "counter Hz"
               ;; register (the TSC rate is discoverable only via CPUID leaf 0x15

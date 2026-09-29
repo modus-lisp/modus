@@ -314,7 +314,7 @@
    (materialises arguments 5+ — a no-op hands the callee stack garbage),
    #x0531 %MMAP-EXEC-PAGE (returns a page address).")
 
-(defparameter *i386-eax-live-traps* (list #x0510 #x0511 #x0532)
+(defparameter *i386-eax-live-traps* (list #x0510 #x0511 #x0532 #x0310 #x0311)
   "Trap codes whose ARM OWNS EAX, so the :trap dispatch must NOT bracket them
    with push/pop EAX.  On i386 VR is EAX, and these are the only traps that
    traffic in VR:
@@ -352,6 +352,17 @@
   (i386-emit-abort-msg buf
                        (format nil "MODUS i386: unimplemented trap #x~4,'0X~%" code)
                        70))
+
+(defun i386-emit-label-address (buf reg label)
+  "REG = the absolute address of LABEL, position-independently: `call +0'
+   pushes the next instruction's address, and a buffer-relative diff32 turns
+   it into LABEL's (the idiom SETJMP's resume address uses)."
+  (i386-emit-byte buf #xE8) (i386-emit-u32 buf 0)
+  (let ((anchor (i386-current-pos buf)))
+    (i386-emit-pop-reg buf reg)
+    (i386-emit-byte buf #x81)                            ; add reg, imm32
+    (i386-emit-byte buf (i386-modrm #b11 0 reg))
+    (i386-emit-fixup-diff32 buf label anchor)))
 
 (defun i386-emit-abort-msg (buf msg status)
   "Emit code that writes MSG to stderr and _exit(STATUS).  Hosted Linux only;
@@ -2430,6 +2441,147 @@
               (i386-emit-byte buf #x01) (i386-emit-byte buf #xC0) ; add eax, eax (tag)
               (i386-emit-byte buf #x89) (i386-emit-byte buf #xC6) ; mov esi, eax
               (i386-emit-byte buf #x5B))                          ; pop ebx
+
+             ((and (= code #x0310) *i386-linux-mode*)
+              ;; RDTSC: a monotonic counter in VR (EAX), TAGGED; (cntfrq) is its
+              ;; rate.  MILLISECONDS SINCE THE FIRST READ at 1000 Hz, from
+              ;; clock_gettime(CLOCK_MONOTONIC): a 30-bit fixnum holds 12.4 days
+              ;; of that and no absolute counter at all (RV32 does the same).
+              ;; The first read's seconds are kept tagged, +1 so that 0 means
+              ;; unset, at #x10000FB8.  EBX (V4) is stacked; ECX/EDX are scratch.
+              (let ((have (i386-make-label)))
+                (i386-emit-byte buf #x53)                           ; push ebx
+                (i386-emit-sub-reg-imm buf +i386-esp+ 8)
+                (i386-emit-byte buf #xB8) (i386-emit-u32 buf 265)    ; eax = clock_gettime
+                (i386-emit-byte buf #xBB) (i386-emit-u32 buf 1)      ; ebx = MONOTONIC
+                (i386-emit-byte buf #x89) (i386-emit-byte buf #xE1)  ; mov ecx, esp
+                (i386-emit-byte buf #xCD) (i386-emit-byte buf #x80)  ; int 0x80
+                (i386-emit-byte buf #x8B) (i386-emit-byte buf #x0C) (i386-emit-byte buf #x24) ; ecx=[esp] sec
+                (i386-emit-byte buf #x8B) (i386-emit-byte buf #x54) (i386-emit-byte buf #x24)
+                (i386-emit-byte buf #x04)                            ; edx=[esp+4] nsec
+                (i386-emit-add-reg-imm buf +i386-esp+ 8)
+                (i386-emit-byte buf #xA1) (i386-emit-u32 buf #x10000FB8) ; eax=[epoch]
+                (i386-emit-byte buf #x85) (i386-emit-byte buf #xC0)  ; test eax, eax
+                (i386-emit-jcc buf :ne have)
+                (i386-emit-byte buf #x8D) (i386-emit-byte buf #x41) (i386-emit-byte buf #x01) ; lea eax,[ecx+1]
+                (i386-emit-byte buf #xD1) (i386-emit-byte buf #xE0)  ; shl eax,1
+                (i386-emit-byte buf #xA3) (i386-emit-u32 buf #x10000FB8) ; [epoch]=eax
+                (i386-emit-label buf have)
+                (i386-emit-byte buf #xD1) (i386-emit-byte buf #xF8)  ; sar eax,1
+                (i386-emit-byte buf #x48)                            ; dec eax
+                (i386-emit-byte buf #x29) (i386-emit-byte buf #xC1)  ; sub ecx, eax
+                (i386-emit-byte buf #x69) (i386-emit-byte buf #xC9) (i386-emit-u32 buf 1000) ; imul ecx,ecx,1000
+                (i386-emit-byte buf #x89) (i386-emit-byte buf #xD0)  ; mov eax, edx
+                (i386-emit-byte buf #x31) (i386-emit-byte buf #xD2)  ; xor edx, edx
+                (i386-emit-byte buf #xBB) (i386-emit-u32 buf 1000000) ; ebx = 10^6
+                (i386-emit-byte buf #xF7) (i386-emit-byte buf #xF3)  ; div ebx
+                (i386-emit-byte buf #x01) (i386-emit-byte buf #xC8)  ; add eax, ecx
+                (i386-emit-byte buf #xD1) (i386-emit-byte buf #xE0)  ; shl eax,1 (tag)
+                (i386-emit-byte buf #x5B)))                          ; pop ebx
+
+             ((and (= code #x0311) *i386-linux-mode*)
+              ;; CNTFRQ: #x0310's rate, TAGGED, in VR.  mov eax, 2000.
+              (i386-emit-byte buf #xB8) (i386-emit-u32 buf 2000))
+
+             ((and (= code #x050B) *i386-linux-mode*)
+              ;; GENERIC 6-ARG SYSCALL: V0 = number, V1..V6 = args, all TAGGED;
+              ;; result TAGGED in V0 (ESI).  int 0x80 takes ebx ecx edx esi edi
+              ;; EBP -- the frame register the spilled vregs are read through --
+              ;; so every argument is loaded (EBP still intact) and PUSHED
+              ;; untagged first, then popped into place.  EBX/EDI/EBP are saved;
+              ;; ESI is V0 and receives the result.
+              (i386-emit-byte buf #x53)                               ; push ebx
+              (i386-emit-byte buf #x55)                               ; push ebp
+              (i386-emit-byte buf #x57)                               ; push edi
+              (loop for v from 6 downto 1
+                    do (i386-load-vreg buf +scratch0+ (+ modus.mvm::+vreg-v0+ v))
+                       (i386-emit-sar-reg-imm buf +scratch0+ 1)
+                       (i386-emit-push-reg buf +scratch0+))
+              (i386-load-vreg buf +scratch0+ modus.mvm::+vreg-v0+)
+              (i386-emit-sar-reg-imm buf +scratch0+ 1)
+              (i386-emit-byte buf #x89) (i386-emit-byte buf #xC8)     ; mov eax, ecx
+              (i386-emit-byte buf #x5B)                               ; pop ebx  a1
+              (i386-emit-byte buf #x59)                               ; pop ecx  a2
+              (i386-emit-byte buf #x5A)                               ; pop edx  a3
+              (i386-emit-byte buf #x5E)                               ; pop esi  a4
+              (i386-emit-byte buf #x5F)                               ; pop edi  a5
+              (i386-emit-byte buf #x5D)                               ; pop ebp  a6
+              (i386-emit-byte buf #xCD) (i386-emit-byte buf #x80)     ; int 0x80
+              (i386-emit-byte buf #x01) (i386-emit-byte buf #xC0)     ; add eax, eax (tag)
+              (i386-emit-byte buf #x89) (i386-emit-byte buf #xC6)     ; mov esi, eax  (V0)
+              (i386-emit-byte buf #x5F)                               ; pop edi
+              (i386-emit-byte buf #x5D)                               ; pop ebp
+              (i386-emit-byte buf #x5B))                              ; pop ebx
+
+             ((and (= code #x0520) *i386-linux-mode* *i386-handler-pop-label*)
+              ;; INSTALL-SIGNAL-HANDLERS: SIGSEGV/SIGBUS/SIGFPE/SIGILL become a
+              ;; longjmp into the innermost handler-case, exactly as on x64 and
+              ;; aarch64 -- it was a named NOP here, so a (car 5) that the other
+              ;; ports turn into a condition killed the i386 process.  The stub
+              ;; is TRAP #x0511's sequence; with nothing armed it exit_groups
+              ;; 139 (the whole process: a lone thread's exit would hang any
+              ;; sibling).  Like x64 it does not set *CURRENT-CONDITION*.
+              ;; rt_sigaction(174) with SA_SIGINFO|SA_RESTORER|SA_NODEFER --
+              ;; NODEFER because the handler never returns, so the signal
+              ;; would otherwise stay blocked and the next fault would kill.
+              (let ((stub (i386-make-label)) (exitl (i386-make-label))
+                    (restorer (i386-make-label)) (past (i386-make-label))
+                    (ljs *i386-longjmp-scratch-addr*))
+                (i386-emit-jmp-rel32 buf past)
+                ;; ---- the handler (entered by the kernel, never returns) ----
+                (i386-emit-label buf stub)
+                (i386-emit-mov-reg-imm buf +scratch0+ *i386-jmpbuf-addr*)
+                (i386-emit-mov-reg-mem buf +scratch1+ +scratch0+ 0)
+                (i386-emit-test-reg-reg buf +scratch1+ +scratch1+)
+                (i386-emit-jcc buf :e exitl)
+                (i386-emit-mov-abs-imm buf *i386-hstack-overflow-addr* 0)
+                (dotimes (i +i386-jmpbuf-words+)
+                  (i386-emit-mov-reg-mem buf +scratch1+ +scratch0+ (* 4 i))
+                  (i386-emit-mov-abs-reg buf (+ ljs (* 4 i)) +scratch1+))
+                (i386-emit-call-rel32 buf *i386-handler-pop-label*)
+                (i386-emit-mov-reg-abs buf +i386-ebx+ (+ ljs 12))
+                (i386-emit-mov-reg-abs buf +i386-esi+ (+ ljs 16))
+                (i386-emit-mov-reg-abs buf +i386-edi+ (+ ljs 20))
+                (i386-emit-mov-reg-abs buf +i386-ebp+ (+ ljs 4))
+                (i386-emit-mov-reg-abs buf +scratch1+ (+ ljs 8))
+                (i386-emit-mov-reg-abs buf +i386-esp+ ljs)
+                (i386-emit-byte buf #xB8) (i386-emit-u32 buf +i386-mvm-t+) ; eax = T
+                (i386-emit-jmp-reg buf +scratch1+)
+                ;; ---- nothing armed: exit_group(139) ----
+                (i386-emit-label buf exitl)
+                (i386-emit-byte buf #xBB) (i386-emit-u32 buf 139)
+                (i386-emit-byte buf #xB8) (i386-emit-u32 buf 252)
+                (i386-emit-byte buf #xCD) (i386-emit-byte buf #x80)
+                ;; ---- sa_restorer (reached only if a handler returned) ----
+                (i386-emit-label buf restorer)
+                (i386-emit-byte buf #xB8) (i386-emit-u32 buf 173)      ; rt_sigreturn
+                (i386-emit-byte buf #xCD) (i386-emit-byte buf #x80)
+                ;; ---- install ----
+                (i386-emit-label buf past)
+                (i386-emit-byte buf #x53)                              ; push ebx
+                (i386-emit-byte buf #x51)                              ; push ecx
+                (i386-emit-byte buf #x52)                              ; push edx
+                (i386-emit-byte buf #x56)                              ; push esi
+                (i386-emit-sub-reg-imm buf +i386-esp+ 20)
+                (i386-emit-byte buf #x89) (i386-emit-byte buf #xE1)    ; mov ecx, esp
+                (i386-emit-label-address buf +scratch1+ stub)
+                (i386-emit-mov-mem-reg buf +scratch0+ 0 +scratch1+)    ; sa_handler
+                (i386-emit-mov-mem-imm buf +scratch0+ 4 #x44000004)    ; sa_flags
+                (i386-emit-label-address buf +scratch1+ restorer)
+                (i386-emit-mov-mem-reg buf +scratch0+ 8 +scratch1+)    ; sa_restorer
+                (i386-emit-mov-mem-imm buf +scratch0+ 12 0)            ; sa_mask
+                (i386-emit-mov-mem-imm buf +scratch0+ 16 0)
+                (dolist (sig '(11 7 8 4))
+                  (i386-emit-byte buf #xB8) (i386-emit-u32 buf 174)    ; rt_sigaction
+                  (i386-emit-byte buf #xBB) (i386-emit-u32 buf sig)
+                  (i386-emit-byte buf #x31) (i386-emit-byte buf #xD2)  ; oldact = 0
+                  (i386-emit-byte buf #xBE) (i386-emit-u32 buf 8)      ; sigsetsize
+                  (i386-emit-byte buf #xCD) (i386-emit-byte buf #x80))
+                (i386-emit-add-reg-imm buf +i386-esp+ 20)
+                (i386-emit-byte buf #x5E)                              ; pop esi
+                (i386-emit-byte buf #x5A)                              ; pop edx
+                (i386-emit-byte buf #x59)                              ; pop ecx
+                (i386-emit-byte buf #x5B)))                            ; pop ebx
 
              ((and (= code #x0503) *i386-linux-mode*)
               ;; Raw 3-arg syscall: number is TAGGED, args 1-3 are RAW, and the
@@ -4587,6 +4739,91 @@
            (i386-emit-add-reg-imm buf +i386-esp+ 8)
            (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
            (i386-store-vreg buf vd +scratch1+)))
+
+        ;; ---- Packed single-float vectors (subtag #x12) ----
+        ;; Header (N << 8) | #x12 with N in LANES, then N 4-byte IEEE32 lanes
+        ;; at +4 -- the u8-vector layout with 4-byte elements.  A lane is one
+        ;; i386 word, so the collector's WORD size rule, align16((N+1)*4), is
+        ;; already this object's size, and #x12 is already a leaf there.
+        ;; :f32-ref/:f32-set never reach this port: on a 30-bit tower
+        ;; COMPILE-F32-REF expands %F32-BITS-REF/-SET into byte reads and
+        ;; generic arithmetic, because an IEEE32 pattern need not be a fixnum.
+        ((op= +op-alloc-f32+)
+         (let ((vd (first operands)) (vcount (second operands))
+               (zl (i386-make-label)) (zd (i386-make-label)))
+           (i386-load-vreg buf +scratch0+ vcount)
+           (i386-emit-sar-reg-imm buf +scratch0+ 1)         ; N
+           (i386-emit-push-reg buf +scratch0+)
+           (i386-emit-shl-reg-imm buf +scratch0+ 8)
+           (i386-emit-or-reg-imm buf +scratch0+ #x12)       ; f32-vector subtag
+           (i386-emit-mov-reg-abs buf +scratch1+ *va-addr*)  ; EDX = base
+           (i386-emit-mov-mem-reg buf +scratch1+ 0 +scratch0+)
+           (i386-emit-pop-reg buf +scratch0+)               ; N
+           (i386-emit-shl-reg-imm buf +scratch0+ 2)         ; 4N
+           (i386-emit-add-reg-imm buf +scratch0+ 4)         ; + header
+           (i386-emit-add-reg-imm buf +scratch0+ 15)
+           (i386-emit-and-reg-imm buf +scratch0+ -16)
+           (i386-emit-add-reg-reg buf +scratch0+ +scratch1+) ; ECX = new VA
+           (i386-emit-mov-abs-reg buf *va-addr* +scratch0+)
+           ;; ZERO every lane, walking down to the header: a new vector reads
+           ;; 0.0f0 (%MAKE-F32-VECTOR's contract), so the fill word must be 0,
+           ;; not whatever I386-EMIT-FILL-RANGE's diagnostic poison would be.
+           (i386-emit-label buf zl)
+           (i386-emit-sub-reg-imm buf +scratch0+ 4)
+           (i386-emit-cmp-reg-reg buf +scratch0+ +scratch1+)
+           (i386-emit-jcc buf :be zd)
+           (i386-emit-mov-mem-imm buf +scratch0+ 0 0)
+           (i386-emit-jmp-rel32 buf zl)
+           (i386-emit-label buf zd)
+           (i386-emit-gc-mark-start buf +scratch1+)
+           (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
+           (i386-store-vreg buf vd +scratch1+)))
+
+        ((op= +op-f32-load+)
+         ;; (f32-load Vd Varr Vidx) -- lane -> CVTSS2SD -> fresh boxed single.
+         ;; Lane address = Varr - 9 + 4 + 4*idx = Varr + 4*idx - 5.
+         (let ((vd (first operands)) (varr (second operands)) (vidx (third operands)))
+           (i386-load-vreg buf +scratch0+ vidx)
+           (i386-load-vreg buf +scratch1+ varr)
+           (i386-emit-sar-reg-imm buf +scratch0+ 1)
+           (i386-emit-shl-reg-imm buf +scratch0+ 2)
+           (i386-emit-add-reg-reg buf +scratch0+ +scratch1+)
+           ;; MOVSS xmm0, [ecx-5]  (F3 0F 10 /r, mod=01 disp8)
+           (i386-emit-byte buf #xF3) (i386-emit-byte buf #x0F) (i386-emit-byte buf #x10)
+           (i386-emit-byte buf (i386-modrm #b01 +i386-xmm0+ +scratch0+))
+           (i386-emit-byte buf #xFB)
+           ;; CVTSS2SD xmm0, xmm0 (F3 0F 5A)
+           (i386-emit-byte buf #xF3) (i386-emit-byte buf #x0F) (i386-emit-byte buf #x5A)
+           (i386-emit-byte buf (i386-modrm #b11 +i386-xmm0+ +i386-xmm0+))
+           (i386-emit-float-alloc buf +scratch1+ +scratch0+)
+           (i386-emit-mov-mem-imm buf +scratch1+ 0 #x464)     ; single-float header
+           (i386-emit-sub-reg-imm buf +i386-esp+ 8)
+           (i386-emit-movsd-esp-xmm buf +i386-xmm0+)
+           (i386-emit-float-bits-from-stack buf +scratch1+ +scratch0+)
+           (i386-emit-add-reg-imm buf +i386-esp+ 8)
+           (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
+           (i386-store-vreg buf vd +scratch1+)))
+
+        ((op= +op-f32-store+)
+         ;; (f32-store Varr Vidx Vval) -- boxed payload -> CVTSD2SS (round to
+         ;; nearest even, MXCSR default) -> lane.
+         (let ((varr (first operands)) (vidx (second operands)) (vval (third operands)))
+           (i386-load-vreg buf +scratch0+ vval)
+           (i386-emit-float-bits-to-stack buf +scratch0+ +scratch1+)
+           (i386-emit-movsd-xmm-esp buf +i386-xmm0+)
+           (i386-emit-add-reg-imm buf +i386-esp+ 8)
+           ;; CVTSD2SS xmm0, xmm0 (F2 0F 5A)
+           (i386-emit-byte buf #xF2) (i386-emit-byte buf #x0F) (i386-emit-byte buf #x5A)
+           (i386-emit-byte buf (i386-modrm #b11 +i386-xmm0+ +i386-xmm0+))
+           (i386-load-vreg buf +scratch0+ vidx)
+           (i386-load-vreg buf +scratch1+ varr)
+           (i386-emit-sar-reg-imm buf +scratch0+ 1)
+           (i386-emit-shl-reg-imm buf +scratch0+ 2)
+           (i386-emit-add-reg-reg buf +scratch0+ +scratch1+)
+           ;; MOVSS [ecx-5], xmm0  (F3 0F 11 /r, mod=01 disp8)
+           (i386-emit-byte buf #xF3) (i386-emit-byte buf #x0F) (i386-emit-byte buf #x11)
+           (i386-emit-byte buf (i386-modrm #b01 +i386-xmm0+ +scratch0+))
+           (i386-emit-byte buf #xFB)))
 
         ((op= +op-fround32+)
          ;; (fround32 Vd Vs) — payload -> CVTSD2SS -> CVTSS2SD -> fresh boxed

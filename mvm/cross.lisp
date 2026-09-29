@@ -707,7 +707,8 @@
                      (hi16 (logand (ash target-vaddr -16) #xFFFF)))
                 (declare (ignore lo16 hi16))
                 (patch-aarch64-mov-address raw-bytes movz-file-pos target-vaddr
-                                           "function address")))))))))
+                                           "function address"
+                                           (+ load-addr movz-file-pos))))))))))
 
 (defun apply-aarch64-code-bounds-patches (raw-bytes image boot-descriptor)
   "Patch the MOVZ+MOVK pairs that emit-aarch64-code-bounds-init left
@@ -744,8 +745,10 @@
         ;; Each patch site is a MOVZ at offset N (lo16) and a MOVK at
         ;; offset N+4 (hi16 lsl 16) — same convention the fn-addr
         ;; patcher uses.
-        (patch-aarch64-mov-address raw-bytes cb-off code-base "code_base")
-        (patch-aarch64-mov-address raw-bytes ce-off code-end "code_end")
+        (patch-aarch64-mov-address raw-bytes cb-off code-base "code_base"
+                                   (+ load-addr cb-off))
+        (patch-aarch64-mov-address raw-bytes ce-off code-end "code_end"
+                                   (+ load-addr ce-off))
         ;; Reset for next build.
         (setf modus.mvm::*aarch64-code-base-patch-offset* nil)
         (setf modus.mvm::*aarch64-code-end-patch-offset*  nil)))))
@@ -754,14 +757,51 @@
   (logior (aref raw-bytes file-pos) (ash (aref raw-bytes (+ file-pos 1)) 8)
           (ash (aref raw-bytes (+ file-pos 2)) 16) (ash (aref raw-bytes (+ file-pos 3)) 24)))
 
-(defun patch-aarch64-mov-address (raw-bytes file-pos value what)
+(defun %aarch64-set-word-at (raw-bytes file-pos w)
+  (dotimes (i 4)
+    (setf (aref raw-bytes (+ file-pos i)) (logand (ash w (* i -8)) #xFF))))
+
+(defun patch-aarch64-pcrel-address (raw-bytes file-pos site-va value what)
+  "Fill the ADRP Xd ; ADD Xd,Xd,#lo12 pair at FILE-POS (whose VA is SITE-VA)
+   so it forms VALUE (translate-aarch64 *A64-PCREL*).  VALUE 0 — a pool entry
+   that does not exist — cannot be PC-relative, so the pair becomes
+   MOVZ Xd,#0 ; NOP."
+  (let* ((w0 (%aarch64-word-at raw-bytes file-pos))
+         (w1 (%aarch64-word-at raw-bytes (+ file-pos 4)))
+         (rd (logand w0 #x1F)))
+    (unless (and (= (logand w0 #x9F000000) #x90000000)
+                 (= (logand w1 #xFFC00000) #x91000000)
+                 (= (logand w1 #x1F) rd) (= (logand (ash w1 -5) #x1F) rd))
+      (error "cross-link: ~A: no ADRP/ADD pair at file offset #x~X" what file-pos))
+    (unless site-va
+      (error "cross-link: ~A: a PC-relative site at #x~X needs its VA" what file-pos))
+    (if (zerop value)
+        (progn (%aarch64-set-word-at raw-bytes file-pos (logior #xD2800000 rd))
+               (%aarch64-set-word-at raw-bytes (+ file-pos 4) #xD503201F))
+        (let ((pages (- (ash value -12) (ash site-va -12))))
+          (unless (and (>= pages (- (ash 1 20))) (< pages (ash 1 20)))
+            (error "cross-link: ~A: #x~X is out of ADRP reach of #x~X" what value site-va))
+          (%aarch64-set-word-at raw-bytes file-pos
+                                (logior (logand w0 #x9F00001F)
+                                        (ash (logand pages 3) 29)
+                                        (ash (logand (ash pages -2) #x7FFFF) 5)))
+          (%aarch64-set-word-at raw-bytes (+ file-pos 4)
+                                (logior (logand w1 #xFFC003FF)
+                                        (ash (logand value #xFFF) 10)))))))
+
+(defun patch-aarch64-mov-address (raw-bytes file-pos value what &optional site-va)
   "Fill the MOVZ (lsl 0) at FILE-POS and the MOVKs (lsl 16, 32, 48) that
    directly follow it FOR THE SAME REGISTER with successive halfwords of
    VALUE — two for an image linked below 4 GB, three when the translator was
    told the code lives higher (*A64-CODE-ADDR-WIDE*, docs/macos-hosting.md),
    four for a full quad.  An address that does not fit the placeholder is a
    BUILD error naming WHAT: silently truncating it would branch into the
-   void at run time, which is how a missed site would otherwise show up."
+   void at run time, which is how a missed site would otherwise show up.
+   An ADRP at FILE-POS is the *A64-PCREL* placeholder: filled relative to
+   SITE-VA, the VA of FILE-POS, instead (PATCH-AARCH64-PCREL-ADDRESS)."
+  (when (= (logand (%aarch64-word-at raw-bytes file-pos) #x9F000000) #x90000000)
+    (return-from patch-aarch64-mov-address
+      (patch-aarch64-pcrel-address raw-bytes file-pos site-va value what)))
   (let* ((w0 (%aarch64-word-at raw-bytes file-pos))
          (rd (logand w0 #x1F))
          (n 1))
@@ -895,6 +935,14 @@
                              0))
                  (tagged-addr (if (zerop offset) 0 (+ pool-vaddr offset))))
             (cond
+              ((and aarch64-p
+                    (= (logand (%aarch64-word-at raw-bytes file-pos) #x9F000000)
+                       #x90000000))
+               ;; *A64-PCREL*: an ADRP/ADD pair, relative to its own VA.
+               (patch-aarch64-pcrel-address
+                raw-bytes file-pos
+                (+ (- pool-vaddr pool-offset-in-raw) file-pos)
+                tagged-addr "constant-pool address"))
               (aarch64-p
                ;; AArch64: MOVZ+MOVKx3 quad — patch the four imm16
                ;; fields with successive 16-bit slices of tagged-addr.
@@ -1424,7 +1472,8 @@
                                 (* label-word 4)))
                    (off *aarch64-x28-load-patch-offset*))
               (patch-aarch64-mov-address raw-bytes off tramp-va
-                                         "x28 GC-trampoline VA")
+                                         "x28 GC-trampoline VA"
+                                         (+ (- tramp-va (* label-word 4)) off))
               ;; Reset for next build.
               (setf *aarch64-x28-load-patch-offset* nil))))
         ;; #307 AArch64 handler-helper VA patches: the boot stub
@@ -1469,9 +1518,11 @@
                    (p-off modus.mvm::*aarch64-handler-push-va-patch-offset*)
                    (q-off modus.mvm::*aarch64-handler-pop-va-patch-offset*))
               (patch-aarch64-mov-address raw-bytes p-off push-va
-                                         "handler PUSH helper VA")
+                                         "handler PUSH helper VA"
+                                         (+ base-va p-off))
               (patch-aarch64-mov-address raw-bytes q-off pop-va
-                                         "handler POP helper VA")
+                                         "handler POP helper VA"
+                                         (+ base-va q-off))
               ;; Reset for next build.
               (setf modus.mvm::*aarch64-handler-push-va-patch-offset* nil)
               (setf modus.mvm::*aarch64-handler-pop-va-patch-offset* nil))))

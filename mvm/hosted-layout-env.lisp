@@ -12,6 +12,9 @@
 ;;;;                         stub through a word one 16 KB page below the code
 ;;;;                         base (implies MODUS_NO_X18; needs MODUS_CODE_BASE)
 ;;;;   MODUS_NO_THREADS=1    a CLI without native threads (see ENABLE-LAYOUT-THREADS)
+;;;;   MODUS_PCREL=1         every layout address PC-relative (ADRP+ADD), so the
+;;;;                         whole layout can be mapped at a uniform slide
+;;;;                         (translate-aarch64 *A64-PCREL*)
 ;;;;
 ;;;; Every value has TWO homes that must agree: the HOST build that compiles
 ;;;; and translates the image's fixed code, and the image's JIT co-init that
@@ -49,6 +52,10 @@
   ;; runtime source asks (%layout :darwin 0) where Darwin needs a different
   ;; shape (gc.lisp's bitmaps: RW data, not the MAP_JIT arena).
   (setq *layout-plist* (list* :darwin 1 *layout-plist*)))
+
+(defvar *layout-pcrel*
+  (let ((v (sb-ext:posix-getenv "MODUS_PCREL")))
+    (and v (plusp (length v)) (string/= v "0") t)))
 
 (defvar *layout-threads* nil
   "Native threads (translate-aarch64.lisp, THE PER-THREAD WINDOW, AARCH64).  Set
@@ -103,33 +110,89 @@
         (error "MODUS_DARWIN needs MODUS_CODE_BASE above 4 GB (macOS maps nothing lower)"))
       (- code #x4000))))
 
+(defparameter +layout-slid-keys+ '(:code-base :heap-base :jit-arena-base)
+  "The layout keys that are ADDRESSES, and so move with a PC-relative image.")
+
+(defun layout-slid-text (slide-var)
+  "Under MODUS_PCREL: source text for *CONV-DELTA*, *HOSTED-LAYOUT* and the
+   syscall slot as they are NOW, SLIDE-VAR bytes from where they were linked.
+   Every address the image's own code forms is PC-relative, so it moved with
+   the layout; these three are the values code compiled at RUNTIME is built
+   from, which must move the same way."
+  (let ((slot (layout-darwin-syscall-slot)))
+    ;; Every integer is (%LINK-INT K): a PC-relative build would otherwise
+    ;; take a K that equals a layout address for one, and slide it too.
+    (format nil "  (setq *conv-delta* (+ (%link-int ~D) ~A))
+  (setq *hosted-layout* (list~{ ~A~}))
+  (setq *aarch64-darwin-syscall-slot* ~A)
+"
+            *layout-conv-delta* slide-var
+            (loop for (k v) on *layout-plist* by #'cddr
+                  collect (format nil ":~A" (symbol-name k))
+                  collect (if (member k +layout-slid-keys+)
+                              (format nil "(+ (%link-int ~D) ~A)" v slide-var)
+                              (format nil "(%link-int ~D)" v)))
+            (if slot (format nil "(+ (%link-int ~D) ~A)" slot slide-var) "nil"))))
+
 (defun layout-coinit-text ()
   "Source text for an image's JIT co-init: the runtime twin of
-   APPLY-LAYOUT-HOST.  Spliced inside a DEFUN body, so no double quotes."
+   APPLY-LAYOUT-HOST.  Spliced inside a DEFUN body, so no double quotes.
+   A PC-relative image measures its slide first: (%CONV-ADDR #x10000000)
+   compiles PC-relative (compiler.lisp PCREL-LAYOUT-ADDR-P), so it is the
+   region's base where it is mapped THIS run."
   (let ((*print-base* 10) (*print-radix* nil))
     (format nil "  (setq *a64-x18-base* ~A)
   (setq *conv-relative* t)
-  (setq *conv-delta* ~D)
+~A~A"
+            (if *layout-no-x18* "nil" "t")
+            (if *layout-pcrel*
+                (format nil "  (let ((%slide (- (%conv-addr #x10000000) (%link-int ~D))))
+~A  )
+"
+                        (+ #x10000000 *layout-conv-delta*)
+                        (layout-slid-text "%slide"))
+                (format nil "  (setq *conv-delta* ~D)
   (setq *hosted-layout* (quote ~S))
   (setq *aarch64-darwin-syscall-slot* ~A)
-  (setq *a64-tls-window* ~A)
+"
+                        *layout-conv-delta*
+                        *layout-plist*
+                        (let ((slot (layout-darwin-syscall-slot)))
+                          (if slot (format nil "~D" slot) "nil"))))
+            (layout-coinit-rest-text))))
+
+(defun layout-coinit-rest-text ()
+  (let ((*print-base* 10) (*print-radix* nil))
+    (format nil "  (setq *a64-tls-window* ~A)
   (setq *tls-window* ~:*~A)
   (setq *tls-window-a64* ~:*~A)
   (setq *a64-tls-tsd-offset* ~A)
   (setq *aarch64-sched-lock-addr* ~A)
 "
-            (if *layout-no-x18* "nil" "t")
-            *layout-conv-delta*
-            *layout-plist*
-            (let ((slot (layout-darwin-syscall-slot))) (if slot (format nil "~D" slot) "nil"))
             (if *layout-threads* "t" "nil")
             (let ((o (and *layout-threads* (layout-tsd-offset)))) (if o (format nil "~D" o) "nil"))
             (if *layout-threads* "268439488" "nil"))))   ; +HOSTED-SCHED-LOCK-ADDR+ #x10000FC0
+
+(defun check-layout-pcrel ()
+  "A PC-relative build recognises layout addresses BY VALUE (compiler.lisp
+   PCREL-LAYOUT-ADDR-P), which is only sound where the runtime source writes no
+   ordinary numbers: refuse a layout that is not wholly above 4 GB.  The stock
+   Linux layout's region (0x0F000000..0x40000000) would claim masks like
+   #x3FFFFFFF as addresses and slide them."
+  (when *layout-pcrel*
+    (let ((low (+ #x0F000000 *layout-conv-delta*))
+          (code (getf *layout-plist* :code-base)))
+      (unless (and (>= low (ash 1 32)) code (>= code (ash 1 32))
+                   (getf *layout-plist* :heap-base) (getf *layout-plist* :jit-arena-base))
+        (error "MODUS_PCREL needs the whole layout above 4 GB: set MODUS_CONV_DELTA, ~
+                MODUS_CODE_BASE, MODUS_HEAP_BASE and MODUS_JIT_ARENA_BASE ~
+                (region low now #x~X)" low)))))
 
 (defun apply-layout-host ()
   "Set the host translator and compiler to this build's layout.  Call after
    boot-linux-aarch64.lisp is loaded and the AArch64 translator installed."
   (check-layout-overlaps)
+  (check-layout-pcrel)
   (flet ((put (name value)
            (setf (symbol-value (find-symbol name :modus.mvm)) value)))
     (put "*CONV-RELATIVE*" t)
@@ -139,6 +202,8 @@
                          (symbol-value (find-symbol "+LINUX-AARCH64-LOAD-ADDR+" :modus.mvm)))))
       (put "*A64-CODE-ADDR-WIDE*" (>= code (ash 1 32))))
     (when *layout-no-x18* (put "*A64-X18-BASE*" nil))
+    (put "*A64-PCREL*" *layout-pcrel*)
+    (put "*PCREL-LAYOUT*" *layout-pcrel*)
     (put "*AARCH64-DARWIN-SYSCALL-SLOT*" (layout-darwin-syscall-slot))
     (put "*A64-TLS-WINDOW*" *layout-threads*)
     (put "*TLS-WINDOW*" *layout-threads*)
@@ -158,6 +223,8 @@
               (or (getf *layout-plist* :heap-size) #x38000000)
               (or (getf *layout-plist* :jit-arena-base) #x3000000000)
               (if *layout-no-x18* "  x18: NOT used (poisoned)" ""))
+      (when *layout-pcrel*
+        (format t "  PC-relative layout addresses (ADRP+ADD): the layout may slide~%"))
       (when *layout-threads*
         (format t "  Native threads: per-thread window via ~A~%"
                 (if (layout-tsd-offset)

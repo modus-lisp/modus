@@ -747,47 +747,81 @@ struct elf64_phdr { uint32_t type, flags; uint64_t offset, vaddr, paddr, filesz,
 
 int main(int argc, char **argv, char **envp) {
     unsigned long size = 0;
-    uint8_t *img = getsectiondata(&_mh_execute_header, "__TEXT", "__modus", &size);
-    if (!img || size < 64) die("no embedded image (__TEXT,__modus)", 0);
+    // IN PLACE (docs/macos-hosting.md, "Running in place"): a PC-relative
+    // image linked into its own segments (host/macos/image-segments.sh) runs
+    // where the loader put it — code in __MODUS, the syscall slot page in
+    // __MODUSS just below, the BSS tail in __MODUSB just above.  Otherwise
+    // the image sits in __TEXT,__modus and is remapped to its link address.
+    uint8_t *img = getsectiondata(&_mh_execute_header, "__MODUS", "__image", &size);
+    int in_place = img != NULL;
+    if (!in_place) img = getsectiondata(&_mh_execute_header, "__TEXT", "__modus", &size);
+    if (!img || size < 64) die("no embedded image (__MODUS,__image or __TEXT,__modus)", 0);
     if ((uintptr_t)img & (PAGE16K - 1)) die("embedded image is not 16 KB aligned", (long)(uintptr_t)img);
     const struct elf64_ehdr *eh = (const void *)img;
     if (memcmp(eh->ident, "\177ELF", 4) || eh->machine != 183) die("not an aarch64 ELF", 0);
     const struct elf64_phdr *ph = (const void *)(img + eh->phoff);
     if (ph->type != 1 || ph->offset != 0) die("unexpected program header", ph->type);
 
-    // 1. the code: remap our own signed pages to the link address.
-    modus_vaddr_t code = ph->vaddr;
+    // MODUS_SLIDE (hex, 16 KB multiple, "-" for down): map the whole layout
+    // that far from where it was linked.  Only a PC-relative image (built with
+    // MODUS_PCREL=1, docs/macos-hosting.md) runs slid; its boot stub then maps
+    // the region, heap and arena at the same slide by itself.
+    int64_t slide = 0;
+    if (in_place) slide = (int64_t)((uint64_t)(uintptr_t)img - ph->vaddr);
+    else { const char *e = getenv("MODUS_SLIDE");
+      if (e && *e) {
+          slide = (int64_t)strtoull(e[0] == '-' ? e + 1 : e, NULL, 16);
+          if (e[0] == '-') slide = -slide;
+          if (slide & (int64_t)(PAGE16K - 1)) die("MODUS_SLIDE is not a 16 KB multiple", (long)slide);
+      } }
+    uint64_t link = ph->vaddr + (uint64_t)slide;
+
     modus_vsize_t file_span = ROUND_UP(ph->filesz, PAGE16K);
+    modus_vaddr_t slot = link - PAGE16K;
+    if (in_place) {
+        // The loader already placed all three segments, slid together; check
+        // they are where the image's PC-relative sites expect them.
+        unsigned long n = 0;
+        uint8_t *s = getsectiondata(&_mh_execute_header, "__MODUSS", "__slot", &n);
+        if ((uint64_t)(uintptr_t)s != slot || n < 8) die("__MODUSS is not one page below the image", (long)(uintptr_t)s);
+        if (ph->memsz > file_span) {
+            uint8_t *b = getsectiondata(&_mh_execute_header, "__MODUSB", "__bss", &n);
+            if ((uint64_t)(uintptr_t)b != link + file_span || n < ph->memsz - file_span)
+                die("__MODUSB is not the image's BSS tail", (long)(uintptr_t)b);
+        }
+    } else {
+    // 1. the code: remap our own signed pages to the link address.
+    modus_vaddr_t code = link;
     vm_prot_t cur = 0, max = 0;
     kern_return_t kr = mach_vm_remap(mach_task_self(), &code, file_span, 0,
                                      VM_FLAGS_FIXED, mach_task_self(),
                                      (modus_vaddr_t)(uintptr_t)img, FALSE,
                                      &cur, &max, VM_INHERIT_NONE);
-    if (kr != KERN_SUCCESS || code != ph->vaddr) {
+    if (kr != KERN_SUCCESS || code != link) {
         // Say what is in the way: the fixed layout collides with whatever the
         // loader or the allocator put there this launch.
-        vm_address_t ra = (vm_address_t)ph->vaddr; vm_size_t rs = 0;
+        vm_address_t ra = (vm_address_t)link; vm_size_t rs = 0;
         vm_region_basic_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
         mach_port_t obj = MACH_PORT_NULL;
         if (vm_region_64(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
                          (vm_region_info_t)&info, &cnt, &obj) == KERN_SUCCESS)
             fprintf(stderr, "modus-shim: in the way at %#llx: region [%#lx, %#lx) prot %d\n",
-                    (unsigned long long)ph->vaddr, (unsigned long)ra, (unsigned long)(ra + rs), info.protection);
+                    (unsigned long long)link, (unsigned long)ra, (unsigned long)(ra + rs), info.protection);
         fprintf(stderr, "modus-shim: this executable is at %p (image section %p, %#lx bytes)\n",
                 (void *)&_mh_execute_header, (void *)img, size);
         die("mach_vm_remap of the image code failed", kr);
     }
     // p_memsz slack past the file (a page of BSS on a high-linked image).
     if (ph->memsz > file_span) {
-        modus_vaddr_t tail = ph->vaddr + file_span;
+        modus_vaddr_t tail = link + file_span;
         kr = mach_vm_allocate(mach_task_self(), &tail, ROUND_UP(ph->memsz - file_span, PAGE16K), VM_FLAGS_FIXED);
         if (kr != KERN_SUCCESS) die("could not map the image's BSS tail", kr);
     }
 
     // 2. the syscall slot, one 16 KB page below the code base.
-    modus_vaddr_t slot = ph->vaddr - PAGE16K;
     kr = mach_vm_allocate(mach_task_self(), &slot, PAGE16K, VM_FLAGS_FIXED);
     if (kr != KERN_SUCCESS) die("could not map the syscall slot page", kr);
+    }
     *(void **)(uintptr_t)slot = (void *)modus_syscall_stub;
 
     // 3. a Linux initial stack: argc, argv..., NULL, envp..., NULL, AT_NULL.
@@ -829,8 +863,8 @@ int main(int argc, char **argv, char **envp) {
     sp[k++] = 0;
     sp[k++] = 0; sp[k++] = 0;                      // auxv: AT_NULL
 
-    g_code_lo = ph->vaddr; g_code_hi = ph->vaddr + ph->memsz;
+    g_code_lo = link; g_code_hi = link + ph->memsz;
     reserve_delta_key();
     install_fault_report();
-    modus_enter((uint64_t)(uintptr_t)sp, eh->entry);
+    modus_enter((uint64_t)(uintptr_t)sp, eh->entry + (uint64_t)slide);
 }

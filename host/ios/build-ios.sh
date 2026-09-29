@@ -22,9 +22,16 @@ case $KIND in
 esac
 SDK=$(xcrun --sdk $SDKN --show-sdk-path)
 rm -rf "$OUT"; mkdir -p "$OUT"
+# MODUS_IN_PLACE=1: run a PC-relative image from its own signed segments
+# (host/macos/image-segments.sh) — the only way a device can run it.
+if [ "${MODUS_IN_PLACE:-0}" != 0 ]; then
+  WHERE=$("$MAC/image-segments.sh" "$IMAGE" "$OUT.segs")
+else
+  WHERE="-Wl,-sectcreate,__TEXT,__modus,$IMAGE -Wl,-sectalign,__TEXT,__modus,0x4000"
+fi
+# shellcheck disable=SC2086  # WHERE is a flag list
 xcrun --sdk $SDKN clang -target $TARGET -isysroot "$SDK" -O2 -Wall \
-  -o "$OUT/modus" "$MAC/modus-shim.c" "$MAC/syscall-stub.S" \
-  -Wl,-sectcreate,__TEXT,__modus,"$IMAGE" -Wl,-sectalign,__TEXT,__modus,0x4000
+  -o "$OUT/modus" "$MAC/modus-shim.c" "$MAC/syscall-stub.S" $WHERE
 cat > "$OUT/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

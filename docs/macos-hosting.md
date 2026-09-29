@@ -396,6 +396,156 @@ a process modify signed code.  The robust answer is PC-relative addressing:
 wherever it is mapped, provided code and data keep their distance, so the
 shim can place the whole layout wherever the kernel has room.
 
+## PC-relative layout addresses (`MODUS_PCREL=1`, 2026-09-28)
+
+`MODUS_PCREL=1` builds an AArch64 image in which every address inside its own
+layout (code, runtime-data region, heap, JIT arena, and the Darwin syscall
+slot) is formed from the PC as `ADRP Xd` + `ADD Xd,Xd,#lo12`.  The whole layout
+can then be mapped at any 4 KB-aligned slide, and nothing in the code is
+patched.  The flag is off by default, and an image built without it is
+unchanged: per-function sizes match HEAD, apart from the edited functions and
+gensym renumbering.
+
+**Where addresses come from, and what each became:**
+- **Translator.**  `A64-LOAD-REAL-ADDR` records an `:adrp-abs` fixup, which
+  `a64-resolve-fixups` resolves against the image base VA.  This covers
+  `a64-load-conv-addr`, every `conv-real` load, the syscall slot and the boot
+  stub's region, heap and arena mappings.  These were about 1.08 million
+  three-instruction loads, so the image shrinks 4.3 MB.
+- **Cross-linker placeholders.**  The `fn-addr`, code-bounds, x28-trampoline,
+  handler-helper and constant-pool sites emit `ADRP`/`ADD` instead of
+  `MOVZ`/`MOVK`.  `patch-aarch64-mov-address` sees the `ADRP` and fills the pair
+  relative to the site's own VA (`patch-aarch64-pcrel-address`).
+- **Compiler.**  Runtime source names region words by value, and after
+  `%conv-subst` they are plain literals.  Under the flag, an integer the
+  compiler loads that lies in the layout becomes the new opcode `LI-ADDR`
+  (raw) or `LI-TADDR` (fixnum, `addr<<1`).  Both have the same wire format as
+  `LI`, and only the AArch64 translator implements them.
+  `PCREL-LAYOUT-ADDR-P` recognises layout addresses **by value**, which is only
+  sound where the source contains no ordinary numbers in that range.  So the
+  build refuses a PC-relative layout that is not wholly above 4 GB: the stock
+  region's range, 0x0F000000..0x40000000, would claim masks such as
+  `#x3FFFFFFF`.
+- **`(%LINK-INT K)`** is a literal that is never PC-relative.  The co-init
+  needs it: it measures the slide as `(- (%conv-addr #x10000000) (%link-int
+  REAL))`, and a bare `REAL` would itself be a layout address, so it would
+  slide too and the difference would always be 0.  That actually happened
+  before `%LINK-INT` existed.
+- **Runtime state.**  The co-init (`LAYOUT-COINIT-TEXT`) builds `*conv-delta*`,
+  `*hosted-layout*`'s address keys and the syscall slot from the measured
+  slide.  Code compiled at runtime (the in-image compiler, and the JIT) stays
+  absolute and uses these slid values.
+
+**Checking a build.**  Scan the image for `MOVZ`/`MOVK` sequences whose value
+lands in the layout, both raw and `<<1`.  The iOS-layout image has 0 raw
+sequences, and the 5 tagged hits are exactly the co-init's `%LINK-INT`
+constants.  Beforehand it had 1,088,046 raw and 4,147 tagged.
+
+**Testing a slide.**  The macOS shim's `MODUS_SLIDE` (hex, a multiple of
+16 KB, with `-` for downward) maps the code and syscall slot that far from
+their link address and enters the image there.  The image's own boot stub
+then maps the region, heap and arena at the same slide.  Results on this Mac:
+- The iOS-layout image ran at slides of −16 KB, +16 MB, +256 MB and +4 GB.
+- At 0 and +256 MB, with JIT off and on: `hosted-threads`, `hosted-thread-gc`,
+  `hosted-handler-depth`, `hosted-stw` (JIT off) and `setq-closure-escape`
+  pass.  `hosted-arena-evac` passes with the JIT.
+- Two failures also occurred in the absolute build of the same layout, and
+  both are explained:
+  - `hosted-arena-evac` with JIT off was a reused thread slot's stale GC
+    bitmaps.  It is fixed; see the slot-reuse item under "Stop the world".
+  - `hosted-stw` with JIT on is not a hang: it takes about 4 minutes on
+    macOS, against 67 s on Linux.  The cause is the runtime-lock contention
+    described under "Running in place".
+- A large slide can land on the macOS allocator's randomly placed
+  reservation.  The boot stub's `MAP_FIXED_NOREPLACE` then refuses, and the
+  process exits 97.
+- On Linux (OrbStack alpine), the same layout built PC-relative (with x18
+  loaded PC-relative in the boot stub) passes all six tests, unslid.  A Linux
+  `ET_EXEC` cannot slide.
+
+## Running in place (`MODUS_IN_PLACE=1`, 2026-09-29)
+
+A PC-relative image need not be copied or remapped anywhere, and on an iOS
+device it could not be.  `MODUS_IN_PLACE=1 host/macos/build-macos.sh` (and
+`host/ios/build-ios.sh`) links the image into three Mach-O segments of its own
+(`host/macos/image-segments.sh`), each at its ELF link address:
+
+| segment | prot | contents |
+|---|---|---|
+| `__MODUSS` | rw- | the 16 KB syscall-slot page, just below the code |
+| `__MODUS` | r-x | the loaded bytes of the ELF (`p_filesz`; the symbol table after it is dropped) |
+| `__MODUSB` | rw- | the BSS tail (`p_memsz` past the file) |
+
+The loader slides the whole executable by one amount, so the distances the
+image's `ADRP`+`ADD` sites encode hold.  The shim finds `__MODUS`, checks the
+other two sit where the image expects them, writes the syscall stub's address
+into the slot, and enters the image at its slid entry.  No `mach_vm_remap`
+happens and no page is ever writable and executable.  It keeps the remap path
+for an image in `__TEXT,__modus`.  The runtime-data region, heap and arena are
+still mapped by the image's boot stub, at the same slide.
+
+Results:
+- **macOS:** ASLR gives a different slide every launch (e.g. `0x42B0000`,
+  `0xBE4000`).  40 of 40 launches ran, and the thread suite passes in place,
+  with the JIT and without.
+- **iOS Simulator (18.1):** the in-place bundle passes `hosted-threads`,
+  `hosted-thread-gc`, `hosted-handler-depth` and `hosted-stw`.
+- **Device:** not yet tried.  Whether the kernel accepts a main executable
+  whose segments sit 8 GB above its `__TEXT`, across the shared region, is
+  the open question.  If it does not, link the shim's own segments high as
+  well, since only the distances matter now.
+
+Still open for iOS:
+- Reserving the region, heap and arena robustly before anything else lands
+  there, perhaps as zero-fill segments that the shim's `mmap` emulation
+  accepts as already mapped.
+
+### Interning without the runtime lock (2026-09-29)
+
+In a threaded image the shared runtime tables sit behind one global mutex
+(`%RT-ENTER`).  Interpreted code took it constantly: about 33–37 times per
+function call, and about 0.5 times per iteration of an empty loop.
+- A JIT-off image, which is what iOS runs, therefore serialised its threads
+  on that lock.
+- `hosted-stw`'s main thread ran ~1 ms per cons under four workers on macOS,
+  where waking a waiter is slower than on Linux.
+- Spinning before parking made it worse: the workers barged the lock and
+  starved main.
+
+Counting per call site found that the entries were nearly all two wrappers:
+`%INTERN-KEYWORD` (~116 entries per call, one for every keyword literal
+evaluated) and `%INTERN-SYMBOL-PKG` (~31).  Nearly every one was a hit on an
+entry that already exists.
+
+**Hits are now lock-free.**  `%HT-GET-RO` probes a table for a fixnum key
+without the lock.  It never writes (unlike `GETHASH`, which builds the bucket
+index lazily) and never allocates, so no collection can move the table under
+it.  A miss takes the lock, and the locked body looks again before it
+inserts.  It is sound because every change a writer makes publishes a
+finished object with one store:
+- a new pair onto the alist (`SET-CAR`);
+- a new chain head into a bucket (one vector store);
+- a whole rebuilt index into the holder (one store);
+- an update (`SET-CDR`).
+
+A racing reader sees the old state or the new, never half of one.  Each
+writer calls `%PUBLISH-FENCE` just before that store.  It is a no-op in the
+prelude, and the hosted runtime overrides it with a barrier once threads are
+armed, so a reader on another core sees the new object's fields.  Writers
+already hold the lock, so readers pay nothing.  `%GV-CELL`, the compiled
+special-variable read, already probed the globals table this way; the
+fences make that safe too.
+
+Results:
+- **Lock use:** acquisitions per call and per loop iteration are now 0.  Only
+  CL `INTERN` of a string still locks.
+- **`hosted-stw` speed:** 243 s → 4.4 s with the JIT, and 32 s → 4.1 s
+  without it.
+- **`test/hosted-intern-race.lisp`:** four threads intern the same 20,000
+  fresh keywords and symbols at once, through repeated index rebuilds.  It
+  passes, and it fails (5 duplicate keywords) with the miss path's lock
+  removed.
+
 ## Running natively (M0)
 
 ```
@@ -792,6 +942,23 @@ later form, on x86-64 and AArch64 alike.
 Now only a fixnum or NIL is stored in place, and anything else takes the
 `%GV-SET` call (`test/setq-closure-escape.lisp`).
 
+**A reused thread slot starts with clean GC bitmaps (2026-09-29).**  Each
+thread slot owns one region, which `%THR-PREPARE-REGION` re-initialises for
+the slot's next thread.  Before this fix, it left that region's object-start
+and cons-kind bitmap bits from the previous thread set, in both semispaces.
+- The collector trusts a set bit, so the new thread's first collections walked
+  into the middle of objects that no longer existed.
+- JIT code in a simple loop allocates too little to leave many bits.  The
+  interpreter allocates as it runs, so a JIT-off image hit this at once.
+- With an even number of collections by the previous thread, the next thread
+  died with a `TYPE-ERROR` that its own `HANDLER-CASE` never saw.
+- With an odd number, the collector read past the heap's end.
+- The same bug failed `hosted-arena-evac` without the JIT.
+
+The region's bits are now cleared before it is re-initialised
+(`test/hosted-slot-reuse.lisp`).  `%ESCAPE-DESCRIBE` also names a
+`TYPE-ERROR`'s datum and expected type now.
+
 ## Open questions
 
 - Does the image ever write into its own loaded code bytes?  (Decides how
@@ -805,7 +972,8 @@ Now only a fixnum or NIL is stored in place, and anything else takes the
   at startup and fail with a clear message rather than a stray fault.
 - iOS: an app's address space is far smaller than macOS's (and extended
   addressing needs an entitlement), and it is unverified whether iOS allows
-  `mach_vm_remap` of executable pages.  If either fails, iOS needs true PIC.
+  `mach_vm_remap` of executable pages.  If either fails, iOS needs true PIC
+  — which the image now has for its own layout (`MODUS_PCREL`, above).
 - Save-and-die cores embed code pointers from the image that saved them —
   the same staleness `4a03744` hit on the Pi.  A core is only valid for the
   image, and the VAs, that wrote it.

@@ -312,6 +312,14 @@
 ;;;
 ;;; MVM registers (translate-aarch64.lisp): x24=VA x25=VL x26=NIL x29=FP.
 
+(defun emit-aarch64-layout-addr (buf rd addr)
+  "Xd := ADDR, an address in the image's layout: PC-relative under
+   *A64-PCREL* (translate-aarch64 A64-LOAD-REAL-ADDR), else the stub's
+   historic MOVZ/MOVK sequence, byte-identical."
+  (if (modus.mvm::a64-pcrel-p)
+      (modus.mvm::a64-load-real-addr buf rd addr)
+      (emit-aarch64-load-imm64 buf rd addr)))
+
 (defun emit-linux-aarch64-entry (buf)
   "Emit AArch64 Linux userspace entry stub into BUF (an a64-buffer).
    Sets up argc/argv globals, mmap heap, MVM regs.  Falls through to
@@ -337,7 +345,7 @@
   ;; >252 MB image.
   (when (or (not (eql (conv-real +conv-region-base+) +conv-region-base+))
             (>= (linux-aarch64-code-base) +conv-region-end+))
-    (emit-aarch64-load-imm64 buf 0 (conv-real +conv-region-low+))
+    (emit-aarch64-layout-addr buf 0 (conv-real +conv-region-low+))
     (emit-aarch64-load-imm64 buf 1 (- +conv-region-end+ +conv-region-low+))
     (emit-aarch64-load-imm64 buf 2 3)          ; PROT_READ|WRITE
     (emit-aarch64-load-imm64 buf 3 #x104022)   ; PRIV|ANON|NORESERVE|FIXED_NOREPLACE
@@ -345,7 +353,7 @@
     (emit-aarch64-load-imm64 buf 5 0)
     (emit-aarch64-load-imm64 buf 8 222)        ; mmap
     (modus.mvm::a64-svc buf 0)          ; SVC #0
-    (emit-aarch64-load-imm64 buf 16 (conv-real +conv-region-low+))
+    (emit-aarch64-layout-addr buf 16 (conv-real +conv-region-low+))
     (emit-aarch64-u32 buf #xEB10001F)          ; CMP x0, x16
     ;; B.EQ past the exit, patched from where it really ends: a Darwin image's
     ;; syscall is a five-instruction call, not one SVC.
@@ -358,12 +366,12 @@
             (logior #x54000000 (ash (- (a64-buffer-position buf) beq-at) 5)))))
 
   ;; Store argc as 32-bit at [0x10000200].
-  (emit-aarch64-load-imm64 buf 16 (conv-real #x10000200))
+  (emit-aarch64-layout-addr buf 16 (conv-real #x10000200))
   ;; STR w19, [x16, #0]
   (emit-aarch64-u32 buf #xB9000213)
 
   ;; Zero-fill 128 bytes at 0x10000208.
-  (emit-aarch64-load-imm64 buf 16 (conv-real #x10000208))
+  (emit-aarch64-layout-addr buf 16 (conv-real #x10000208))
   (dotimes (i 16)
     ;; STR XZR, [x16, #(i*8)]
     (emit-aarch64-u32 buf (logior #xF9000000 (ash i 10) (ash 16 5) 31)))
@@ -383,7 +391,7 @@
            (let ((ble-at (a64-buffer-position buf)))
              (emit-aarch64-u32 buf 0)                ; B.LE <next block>, patched
              (emit-aarch64-u32 buf mov-src)          ; MOV x9, argv[n]
-             (emit-aarch64-load-imm64 buf 10 (conv-real dst))
+             (emit-aarch64-layout-addr buf 10 (conv-real dst))
              (emit-aarch64-u32 buf #x528007EB)       ; MOVZ w11, #63    (max bytes)
              (emit-aarch64-u32 buf #x3940012C)       ; LDRB w12, [x9]
              (emit-aarch64-u32 buf #x340000CC)       ; CBZ w12, +6      (null term → exit loop)
@@ -410,7 +418,7 @@
   ;; kernel returns anything else (address taken, or a pre-4.17 kernel that
   ;; ignores the flag and picks its own), fall through to the historical hint
   ;; mmap.  Restore then refuses with `heap base differs' instead of guessing.
-  (emit-aarch64-load-imm64 buf 0 (hosted-layout :heap-base +linux-aarch64-fixed-heap-base+))
+  (emit-aarch64-layout-addr buf 0 (hosted-layout :heap-base +linux-aarch64-fixed-heap-base+))
   (emit-aarch64-load-imm64 buf 1 (linux-aarch64-heap-size))
   (emit-aarch64-load-imm64 buf 2 3)
   (emit-aarch64-load-imm64 buf 3 #x100022)   ; MAP_PRIV|ANON|FIXED_NOREPLACE
@@ -418,7 +426,7 @@
   (emit-aarch64-load-imm64 buf 5 0)
   (emit-aarch64-load-imm64 buf 8 222)
   (modus.mvm::a64-svc buf 0)   ; SVC #0
-  (emit-aarch64-load-imm64 buf 16 (hosted-layout :heap-base +linux-aarch64-fixed-heap-base+))
+  (emit-aarch64-layout-addr buf 16 (hosted-layout :heap-base +linux-aarch64-fixed-heap-base+))
   (emit-aarch64-u32 buf #xEB10001F)   ; CMP x0, x16
   (let ((beq-at (a64-buffer-position buf)))
     (emit-aarch64-u32 buf 0)          ; B.EQ <past the fallback>, patched below
@@ -440,7 +448,7 @@
   ;; sit at the same addresses in every process.  Bump word at 0x10000F58 =
   ;; arena base on success, 0 if the kernel refused (the trap then falls back
   ;; to mmap(NULL)).  MAP_NORESERVE: it is address space, not memory.
-  (emit-aarch64-load-imm64 buf 0 (hosted-layout :jit-arena-base +linux-aarch64-jit-arena-base+))
+  (emit-aarch64-layout-addr buf 0 (hosted-layout :jit-arena-base +linux-aarch64-jit-arena-base+))
   (emit-aarch64-load-imm64 buf 1 +linux-aarch64-jit-arena-size+)
   (emit-aarch64-load-imm64 buf 2 7)          ; PROT_READ|WRITE|EXEC
   (emit-aarch64-load-imm64 buf 3 #x104022)   ; PRIV|ANON|NORESERVE|FIXED_NOREPLACE
@@ -448,10 +456,10 @@
   (emit-aarch64-load-imm64 buf 5 0)
   (emit-aarch64-load-imm64 buf 8 222)
   (modus.mvm::a64-svc buf 0)   ; SVC #0
-  (emit-aarch64-load-imm64 buf 16 (hosted-layout :jit-arena-base +linux-aarch64-jit-arena-base+))
+  (emit-aarch64-layout-addr buf 16 (hosted-layout :jit-arena-base +linux-aarch64-jit-arena-base+))
   (emit-aarch64-u32 buf #xEB10001F)   ; CMP x0, x16
   (emit-aarch64-u32 buf #x9A9F0000)   ; CSEL x0, x0, xzr, EQ
-  (emit-aarch64-load-imm64 buf 17 (conv-real (a64-gc-stat-addr #x10000F58)))
+  (emit-aarch64-layout-addr buf 17 (conv-real (a64-gc-stat-addr #x10000F58)))
   (emit-aarch64-u32 buf #xF9000220)   ; STR x0, [x17]
 
   ;; Save argc/argv at heap base for Lisp reachability.
@@ -478,7 +486,7 @@
   ;; gc.lisp's (mem-ref :u64) reads back (see the defvar docstring).
   (flet ((maybe-shl () (when *linux-aarch64-gc-metadata-shl*
                          (emit-aarch64-u32 buf #x8B0A014A))))  ; ADD x10,x10,x10
-    (emit-aarch64-load-imm64 buf 17 (conv-real +gc-from-start-addr+))
+    (emit-aarch64-layout-addr buf 17 (conv-real +gc-from-start-addr+))
     ;; from_start = mmap+alloc_start
     (emit-aarch64-u32 buf #xAA1603EA)   ; MOV x10, x22
     (emit-aarch64-load-imm64 buf 16 +linux-aarch64-heap-alloc-start+)
@@ -522,9 +530,9 @@
   ;; ...unless x18 is off (Darwin, or MODUS_NO_X18 on Linux): then POISON it
   ;; with a non-canonical address, so any code still treating x18 as the base
   ;; faults on its first use instead of working by luck.
-  (emit-aarch64-load-imm64 buf 18 (if modus.mvm::*a64-x18-base*
-                                      (conv-real #x10000000)
-                                      #x0018DEAD0018DEAD))
+  (if modus.mvm::*a64-x18-base*
+      (emit-aarch64-layout-addr buf 18 (conv-real #x10000000))
+      (emit-aarch64-load-imm64 buf 18 #x0018DEAD0018DEAD))
 
   ;; NATIVE MCGC: reserve x28 = the GC trampoline's absolute VA, loaded once
   ;; at boot, so every gc-check fire site is a single range-unlimited

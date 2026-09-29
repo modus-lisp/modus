@@ -1512,6 +1512,58 @@
             ((eq tn 'equalp)  (function equalp))
             (t                (function %equal-fn))))))
 
+(defun %publish-fence ()
+  "Order this thread's earlier stores before the next one.  A no-op here; the
+   hosted threaded runtime (net/hosted-sync.lisp) redefines it to a barrier
+   once threads are armed.  Called by the table writers just before the store
+   that PUBLISHES new structure — a pair on the alist, a bucket chain, a
+   rebuilt index — so a reader on another core that follows the new pointer
+   (%HT-GET-RO, %GV-CELL, which take no lock) sees the object's fields filled
+   in.  AArch64 may otherwise make the pointer visible first."
+  0)
+
+(defun %ht-get-ro (key ht)
+  "The value stored under the FIXNUM KEY in hash table HT, or NIL — WITHOUT the
+   runtime lock and WITHOUT writing anything.
+
+   WHY A READER NEEDS NO LOCK.  Every change a writer (under the lock) makes
+   to a table is one store that publishes a finished object: PUTHASH pushes a
+   new pair onto the alist with one SET-CAR and a new chain head into a bucket
+   with one vector store; %HT-REBUILD-INDEX builds the whole new index and
+   installs it with one store to the holder; an update is one SET-CDR.  A
+   reader racing any of them sees the old state or the new, never a half-built
+   one, and each writer calls %PUBLISH-FENCE first so the new object's fields
+   are visible before the pointer to it.  Losing a race just misses an entry
+   inserted at the same instant, which is what the lock would have ordered
+   anyway; callers that act on a miss retry under the lock.
+
+   WHAT IT DOES NOT DO: build the bucket index (GETHASH does, lazily — a
+   write), allocate (so no collection can move the table under it: threads
+   park only at allocations), or compare anything but fixnums by EQ (exact for
+   immediates, whatever the table's test).  Values must be non-NIL to be seen
+   as present — true of the symbol and keyword tables it serves."
+  (if (not (consp ht))
+      nil
+      (let* ((c (cdr ht))
+             (holder (if (and (consp c) (eq (car c) (%ht-tag)))
+                         (car (cdr (cdr (cdr (cdr (cdr c))))))
+                         nil))
+             (vec (if holder (car holder) nil))
+             (r nil))
+        (if (and vec (not (eq vec -424242001)))
+            (let ((cur (%word-aref vec (%ht-hash key nil (- (%prim-array-length vec) 1)))))
+              (loop
+                (when (null cur) (return r))
+                (let ((e (car cur)))
+                  (when (eq (car e) key) (setq r (cdr (cdr e))) (return r)))
+                (setq cur (cdr cur))))
+            (let ((cur (car ht)))
+              (loop
+                (when (null cur) (return r))
+                (let ((pair (car cur)))
+                  (when (eq (car pair) key) (setq r (cdr pair)) (return r)))
+                (setq cur (cdr cur))))))))
+
 (defun gethash (key ht &optional default)
   "Look up KEY in hash table HT.  Returns (values value present-p);
    if not present, value is DEFAULT (nil if not supplied) and
@@ -1598,12 +1650,15 @@
     (cond
       ;; ---- Bucket path: key IS bucketable and already present → update. ----
       ((and vec existing (not (eq existing (%ht-nohash))))
+       (%publish-fence)
        (set-cdr existing value)               ; update shared pair in place
        value)
       ;; ---- Bucket path: key IS bucketable and absent → add + index. ----
       ((and vec (null existing))
-       (let ((new-pair (cons key value)))
-         (set-car ht (cons new-pair (car ht)))
+       (let* ((new-pair (cons key value))
+              (new-head (cons new-pair (car ht))))
+         (%publish-fence)
+         (set-car ht new-head)
          (%ht-h-set-count holder (+ (%ht-h-count holder) 1))
          ;; Keep chains short: once the table holds more than 2 entries per
          ;; bucket, rebuild the index at the next power of two (the rebuild
@@ -1620,12 +1675,15 @@
        (let ((cmp (%ht-keytest ht)) (cur (car ht)))
          (loop
            (when (null cur)
-             (let ((new-pair (cons key value)))
-               (set-car ht (cons new-pair (car ht)))
+             (let* ((new-pair (cons key value))
+                    (new-head (cons new-pair (car ht))))
+               (%publish-fence)
+               (set-car ht new-head)
                (when holder (%ht-h-set-count holder (+ (%ht-h-count holder) 1))))
              (return value))
            (let ((pair (car cur)))
              (when (funcall cmp (car pair) key)
+               (%publish-fence)
                (set-cdr pair value)
                (return value)))
            (setq cur (cdr cur))))))))
@@ -1882,8 +1940,10 @@
    already present (gethash/puthash check first).  No-op for :NOHASH keys."
   (let ((h (%ht-hash key strcmp? (- (%prim-array-length vec) 1))))
     (unless (eq h (%ht-nohash))
-      (let ((old (%word-aref vec h)))
-        (%ht-vec-set vec h (cons (cons key pair) old)))))
+      (let* ((old (%word-aref vec h))
+             (new-head (cons (cons key pair) old)))
+        (%publish-fence)
+        (%ht-vec-set vec h new-head))))
   pair)
 
 (defun %ht-bucket-rem (vec key strcmp?)
@@ -1920,7 +1980,7 @@
           (%ht-bucket-put vec k pair strcmp?))
         (setq cur (cdr cur)))
       (if ok
-          (progn (%ht-h-set-vec holder vec) vec)
+          (progn (%publish-fence) (%ht-h-set-vec holder vec) vec)
           (progn (%ht-h-set-vec holder (%ht-nohash)) (%ht-nohash))))))
 
 (defun %ht-active-vec-h (ht holder)
@@ -2711,11 +2771,24 @@
    THE WRAPPER IS A SEPARATE FUNCTION because this compiler resolves every call
    to the LAST defun of a name, so a hosted image cannot wrap a function by
    redefining it and calling the old one.  Splitting the body out is the only
-   shape that lets the lock be added in ONE place and still be overridable."
-  (%rt-enter)
-  (let ((r (%intern-symbol-pkg-1 name-hash pkg-hash)))
-    (%rt-leave)
-    r))
+   shape that lets the lock be added in ONE place and still be overridable.
+
+   A SYMBOL THAT ALREADY EXISTS IS FOUND WITHOUT THE LOCK (%HT-GET-RO): that
+   is nearly every call, and taking the lock for each one serialised every
+   thread running interpreted code on it (~31 interns per interpreted call).
+   Only a miss takes the lock, and the locked body looks again before it
+   inserts, so two threads that both miss still make one symbol."
+  (let ((hit (%ht-get-ro (if (= pkg-hash 0)
+                             name-hash
+                             (%symbol-pkg-key name-hash pkg-hash))
+                         (mem-ref #x10000088 :u64))))
+    (if hit
+        hit
+        (progn
+          (%rt-enter)
+          (let ((r (%intern-symbol-pkg-1 name-hash pkg-hash)))
+            (%rt-leave)
+            r)))))
 
 (defun %symbol-pkg-key (name-hash pkg-hash)
   "The per-package symbol-table key for (NAME-HASH, PKG-HASH).  ONE definition,
@@ -2832,11 +2905,21 @@
    THIS ONE IS HOT: compile-keyword emits a call to it for EVERY `:foo' literal
    in compiled code, so it runs on every evaluation of every keyword, FORMAT's
    included.  That is exactly why it must be locked once a second thread exists,
-   and exactly why the lock has to cost nothing until then."
-  (%rt-enter)
-  (let ((r (%intern-keyword-1 name-hash)))
-    (%rt-leave)
-    r))
+   and exactly why the lock has to cost nothing until then.
+
+   So a keyword that exists — every one after its first use — is found
+   WITHOUT the lock (%HT-GET-RO).  Measured before that: ~116 keyword interns
+   per interpreted function call, each a lock acquisition, which put every
+   thread running interpreted code in one queue.  A miss takes the lock and
+   the locked body looks again before it inserts."
+  (let ((hit (%ht-get-ro name-hash (mem-ref #x10000148 :u64))))
+    (if hit
+        hit
+        (progn
+          (%rt-enter)
+          (let ((r (%intern-keyword-1 name-hash)))
+            (%rt-leave)
+            r)))))
 
 (defun %intern-keyword-1 (name-hash)
   "Intern a keyword by name hash.  Same shape as %INTERN-SYMBOL but uses

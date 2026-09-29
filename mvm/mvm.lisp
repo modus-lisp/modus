@@ -30,7 +30,7 @@
    #:+vreg-vsp+ #:+vreg-vfp+ #:+vreg-vpc+
    ;; Opcodes
    #:+op-nop+ #:+op-break+
-   #:+op-mov+ #:+op-li+ #:+op-li-const+ #:+op-push+ #:+op-pop+
+   #:+op-mov+ #:+op-li+ #:+op-li-const+ #:+op-li-addr+ #:+op-li-taddr+ #:+op-push+ #:+op-pop+
    #:+op-add+ #:+op-sub+ #:+op-mul+ #:+op-mul-checked+ #:+op-add-checked+ #:+op-sub-checked+ #:+op-div+ #:+op-mod+
    #:+op-neg+ #:+op-inc+ #:+op-dec+
    #:+op-and+ #:+op-or+ #:+op-xor+
@@ -265,6 +265,14 @@
                                  ; Wire-compatible with LI in encoded size (10 B),
                                  ; differs only in semantics: translator emits a
                                  ; placeholder absolute load and records a patch.
+(defconstant +op-li-addr+ #x15)  ; (li-addr Vd addr:imm64) - LI of an address in
+                                 ; the image's own layout (raw word).  Wire- and
+                                 ; value-identical to LI; the mark lets the AArch64
+                                 ; translator form it PC-relative (*a64-pcrel*).
+(defconstant +op-li-taddr+ #x16) ; (li-taddr Vd addr:imm64) - the same address as
+                                 ; a FIXNUM: loads addr<<1.  Emitted only by a
+                                 ; PC-relative AArch64 build (compiler.lisp
+                                 ; PCREL-LAYOUT-ADDR-P); no other back-end has it.
 
 ;; Arithmetic (tagged fixnum fast path)
 (defconstant +op-add+    #x20)  ; (add Vd Va Vb) - 3 reg
@@ -557,6 +565,8 @@
 (defopcode :push   #x12 (:reg)                "Push register to stack")
 (defopcode :pop    #x13 (:reg)                "Pop from stack to register")
 (defopcode :li-const #x14 (:reg :imm64)       "Load tagged addr of constant-pool[idx]")
+(defopcode :li-addr #x15 (:reg :imm64)        "Load a layout address (raw)")
+(defopcode :li-taddr #x16 (:reg :imm64)       "Load a layout address as a fixnum")
 
 ;; Arithmetic
 (defopcode :add    #x20 (:reg :reg :reg)      "Add tagged fixnums")
@@ -1021,6 +1031,12 @@
    placeholder absolute-address load and records a fixup that the
    image-assembly stage patches with the real tagged pool address."
   (encode-instruction buf +op-li-const+ vd idx))
+
+(defun mvm-li-addr (buf vd addr)
+  (encode-instruction buf +op-li-addr+ vd addr))
+
+(defun mvm-li-taddr (buf vd addr)
+  (encode-instruction buf +op-li-taddr+ vd addr))
 
 (defun mvm-push (buf vs)
   (encode-instruction buf +op-push+ vs))

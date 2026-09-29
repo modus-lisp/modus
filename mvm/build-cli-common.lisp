@@ -1159,6 +1159,12 @@
                    ;; layer and their blobs are unaffected.
                    (mvm-text "net/hosted-sockets-post.lisp")
                    (string #\Newline)
+                   ;; THE ACTOR RUNTIME (docs/hosted-actor-runtime.md).  After
+                   ;; hosted-sync (its scheduler, %MAKE-NATIVE-THREAD, the
+                   ;; %WITH-COMPUTATION-STATE macro) and net/actors.lisp,
+                   ;; neither of which resolves as a forward reference.
+                   (mvm-text "net/hosted-actor-runtime.lisp")
+                   (string #\Newline)
                    ;; THE AOT HALF OF AN A/B.  test/hosted-intern-layers.lisp's
                    ;; `low' arm — a worker interning fresh symbols through
                    ;; %INTERN-SYMBOL-PKG — dies about half the time while its

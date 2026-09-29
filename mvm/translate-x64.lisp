@@ -543,11 +543,27 @@
     (emit-jcc buf :e next)
     (emit-cmp-reg-reg buf 'rsi 'r14)
     (emit-jcc buf :e next)
-    ;; its stack: [published RSP, stack base + size)
-    (emit-mov-reg-mem buf 'rdi 'rsi +stw-rsp-addr+)
-    (emit-mov-reg-mem buf 'r10 'r12 #x10)
-    (emit-mov-reg-mem buf 'rax 'r12 #x18)
-    (emit-add-reg-reg buf 'r10 'rax)
+    ;; its stack: [published RSP, top).  TOP is the thread's own stack top
+    ;; unless the RSP lies inside the CONTEXT stack its current window names
+    ;; ([+0x50C8, +0x50C0): an actor's stack, net/hosted-actor-runtime) --
+    ;; decided by where the RSP IS, so a thread stopped mid-switch (window
+    ;; already the actor's, still on its own stack, or the reverse) is scanned
+    ;; over the stack it is actually standing on.
+    (let ((tgo (make-label)))
+      (emit-mov-reg-mem buf 'rdi 'rsi +stw-rsp-addr+)
+      (emit-mov-reg-mem buf 'r10 'r12 #x10)
+      (emit-mov-reg-mem buf 'rax 'r12 #x18)
+      (emit-add-reg-reg buf 'r10 'rax)
+      (emit-mov-reg-mem buf 'rax 'rsi #x100050C0)      ; context top
+      (emit-cmp-reg-imm buf 'rax 0)
+      (emit-jcc buf :e tgo)
+      (emit-cmp-reg-reg buf 'rdi 'rax)
+      (emit-jcc buf :ae tgo)
+      (emit-mov-reg-mem buf 'r8 'rsi #x100050C8)       ; context bottom
+      (emit-cmp-reg-reg buf 'rdi 'r8)
+      (emit-jcc buf :b tgo)
+      (emit-mov-reg-reg buf 'r10 'rax)
+      (emit-label buf tgo))
     (emit-stw-scan-range buf scan-word-label)
     ;; its HEAP: the live part of its own region.  A worker's objects point
     ;; into region 0 all the time (a list of symbols, a closure over a lock),
@@ -574,6 +590,43 @@
       (emit-jcc buf :be lgo)
       (emit-label buf try30)
       (emit-mov-reg-mem buf 'r10 'rsi #x30)            ; parked alloc ptr
+      (emit-cmp-reg-reg buf 'r10 'rdi)
+      (emit-jcc buf :b whole)
+      (emit-cmp-reg-reg buf 'r10 'r9)
+      (emit-jcc buf :be lgo)
+      (emit-label buf whole)
+      (emit-mov-reg-reg buf 'r10 'r9)
+      (emit-label buf lgo)
+      (emit-stw-scan-range buf scan-word-label)
+      (emit-label buf none))
+    ;; AND ITS ACTIVE REGION, when that is not its own: a thread running an
+    ;; actor allocates in the ACTOR's region.  The authoritative answer is the
+    ;; thread's per-CPU active-region cell (+GC-REGION-ADDR+ + 8*cpu, the cpu
+    ;; id being the record's +0x20).  Live = [from, pushed R12 if inside,
+    ;; else the parked +0x30, else the whole semispace] as above.
+    (let ((have (make-label)) (try30 (make-label)) (whole (make-label))
+          (lgo (make-label)) (none (make-label)))
+      (emit-mov-reg-mem buf 'rsi 'r12 #x20)
+      (emit-shl-reg-imm buf 'rsi 3)
+      (emit-add-reg-imm buf 'rsi modus.mvm::+gc-region-addr+)
+      (emit-mov-reg-mem buf 'rsi 'rsi 0)               ; its active RCB
+      (emit-cmp-reg-imm buf 'rsi 0)
+      (emit-jcc buf :e none)
+      (emit-mov-reg-mem buf 'rax 'r12 #x40)
+      (emit-cmp-reg-reg buf 'rsi 'rax)
+      (emit-jcc buf :e none)                           ; its own: done above
+      (emit-mov-reg-mem buf 'rdi 'rsi modus.mvm::+gc-off-from-start+)
+      (emit-mov-reg-mem buf 'r9 'rsi modus.mvm::+gc-off-space-size+)
+      (emit-add-reg-reg buf 'r9 'rdi)
+      (emit-mov-reg-mem buf 'rax 'r12 #x38)
+      (emit-mov-reg-mem buf 'rax 'rax +stw-rsp-addr+)
+      (emit-mov-reg-mem buf 'r10 'rax 24)
+      (emit-cmp-reg-reg buf 'r10 'rdi)
+      (emit-jcc buf :b try30)
+      (emit-cmp-reg-reg buf 'r10 'r9)
+      (emit-jcc buf :be lgo)
+      (emit-label buf try30)
+      (emit-mov-reg-mem buf 'r10 'rsi #x30)
       (emit-cmp-reg-reg buf 'r10 'rdi)
       (emit-jcc buf :b whole)
       (emit-cmp-reg-reg buf 'r10 'r9)
@@ -615,7 +668,90 @@
     (emit-add-reg-imm buf 'r12 #x80)
     (emit-jmp buf lp)
     (emit-label buf ret)
+    (emit-stw-scan-parked-actors buf scan-word-label)
     (emit-bytes buf #xC3)))
+
+(defconstant +stw-actor-table-addr+ #x100050D0
+  "ABSOLUTE: net/hosted-actor-runtime's parked-actor scan table, or 0.  64
+   entries of 48 bytes: +0 flag (1 = off-CPU: scan it here), +8 saved SP,
+   +16 stack top, +24 window segment base, +32 region control block.")
+
+(defun emit-stw-scan-parked-actors (buf scan-word-label)
+  "Scan every PARKED actor: an actor that is ready or blocked is on no
+   thread, so no thread's scan reaches its stack, its window's handler frames
+   and bindings, or its region -- and each can hold region-0 objects.  Runs at
+   the end of the STW scan (so only when this collection took the world);
+   R12/R14 are free by then and survive scan_word."
+  (let ((lp (make-label)) (next (make-label)) (done (make-label))
+        (noreg (make-label)) (rok (make-label)) (dbl (make-label))
+        (dbd (make-label)) (dbin (make-label)) (dbgo (make-label)))
+    (emit-cmp-abs64-zero buf +stw-stop-addr+)
+    (emit-jcc buf :e done)
+    (emit-mov-reg-imm buf 'r12 +stw-actor-table-addr+)
+    (emit-mov-reg-mem buf 'r12 'r12 0)
+    (emit-cmp-reg-imm buf 'r12 0)
+    (emit-jcc buf :e done)
+    (emit-mov-reg-reg buf 'r14 'r12)
+    (emit-add-reg-imm buf 'r14 (* 64 48))
+    (emit-label buf lp)
+    (emit-cmp-reg-reg buf 'r12 'r14)
+    (emit-jcc buf :ae done)
+    (emit-mov-reg-mem buf 'rax 'r12 0)
+    (emit-cmp-reg-imm buf 'rax 0)
+    (emit-jcc buf :e next)
+    ;; its stack [saved SP, stack top)
+    (emit-mov-reg-mem buf 'rdi 'r12 8)
+    (emit-mov-reg-mem buf 'r10 'r12 16)
+    (emit-stw-scan-range buf scan-word-label)
+    ;; its region's live part [from, parked alloc), clamped to the semispace
+    (emit-mov-reg-mem buf 'rsi 'r12 32)
+    (emit-cmp-reg-imm buf 'rsi 0)
+    (emit-jcc buf :e noreg)
+    (emit-mov-reg-mem buf 'rdi 'rsi modus.mvm::+gc-off-from-start+)
+    (emit-mov-reg-mem buf 'r9 'rsi modus.mvm::+gc-off-space-size+)
+    (emit-add-reg-reg buf 'r9 'rdi)
+    (emit-mov-reg-mem buf 'r10 'rsi #x30)
+    (emit-cmp-reg-reg buf 'r10 'rdi)
+    (emit-jcc buf :b rok)
+    (emit-cmp-reg-reg buf 'r10 'r9)
+    (let ((inr (make-label)))
+      (emit-jcc buf :be inr)
+      (emit-label buf rok)
+      (emit-mov-reg-reg buf 'r10 'r9)
+      (emit-label buf inr))
+    (emit-stw-scan-range buf scan-word-label)
+    (emit-label buf noreg)
+    ;; its window's handler frames' saved RBX, and its dynamic bindings
+    (emit-mov-reg-mem buf 'rsi 'r12 24)
+    (emit-stw-scan-handler-rbx buf 'rsi scan-word-label)
+    (emit-mov-reg-mem buf 'rsi 'r12 24)
+    (emit-mov-reg-mem buf 'r10 'rsi #x10000C58)
+    (emit-shr-reg-imm buf 'r10 1)
+    (emit-cmp-reg-imm buf 'r10 0)
+    (emit-jcc buf :le dbd)
+    (emit-mov-reg-mem buf 'rax 'rsi #x10000C60)
+    (emit-shr-reg-imm buf 'rax 1)
+    (emit-cmp-reg-imm buf 'rax 0)
+    (emit-jcc buf :e dbin)
+    (emit-mov-reg-reg buf 'rdi 'rax)
+    (emit-add-reg-imm buf 'rdi 8)
+    (emit-jmp buf dbgo)
+    (emit-label buf dbin)
+    (emit-mov-reg-reg buf 'rdi 'rsi)
+    (emit-add-reg-imm buf 'rdi #x10000C78)
+    (emit-label buf dbgo)
+    (emit-label buf dbl)
+    (emit-mov-reg-reg buf 'rax 'rdi)
+    (emit-call buf scan-word-label)
+    (emit-add-reg-imm buf 'rdi 16)
+    (emit-sub-reg-imm buf 'r10 1)
+    (emit-cmp-reg-imm buf 'r10 0)
+    (emit-jcc buf :g dbl)
+    (emit-label buf dbd)
+    (emit-label buf next)
+    (emit-add-reg-imm buf 'r12 48)
+    (emit-jmp buf lp)
+    (emit-label buf done)))
 
 (defun emit-stw-resume-subroutine (buf label)
   "Give the world back: STOP := 0 and wake every parked thread.  Preserves

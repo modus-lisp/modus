@@ -2397,6 +2397,44 @@ modus: a thread needed the runtime lock but the lock arena is exhausted or missi
                          *ha-rsize* stack-top k)
         rcb)))
 
+(defmacro %with-computation-state ((serial) &body body)
+  "Bind, EMPTY, the runtime's per-computation state: the interpreter's MV and
+   NLX serial, the condition system, handler/restart stacks, printer scratch,
+   loader depth, CLOS dispatch state and CATCH/THROW's values in flight.  A
+   thread (%THR-TRAMPOLINE) and an actor (%AR-ACTOR-ENTRY, in its own window)
+   each run their whole computation inside one.  SERIAL seeds the NLX state
+   serial so no two computations mint the same one."
+  `(let ((*mvm-last-mv* nil)
+         (*nlx-state-serial* ,serial)
+         (*current-condition* nil)
+         (*catch-active* nil)
+         (*restart-stack* nil)
+         (*handler-bind-stack* nil)
+         (*handler-bind-effective-skip* 0)
+         (*restart-frame-condition-map* nil)
+         (*signal-walk-depth* 0)
+         (*restarts-being-invoked* nil)
+         (*restart-invoking-p* nil)
+         (*restart-case-result* nil)
+         (*rc-invoked-restart* nil)
+         (*format-iter-escape* nil)
+         (*write-object-budget* 0)
+         (*%circ-next* 0)
+         (*%ppx-stack* nil)
+         (*%pp-ctx* nil)
+         (*load-error-condition* nil)
+         (*%load-depth* 0)
+         (*%next-methods* nil)
+         (*%current-gf-args* nil)
+         (*%current-gf* nil)
+         (*%dmc-call-args* nil)
+         (*catch-tag* nil)
+         (*catch-value* nil)
+         (*catch-values* nil)
+         (*catch-tags* nil))
+     (declare (special *mvm-last-mv* *nlx-state-serial* *current-condition* *catch-active* *restart-stack* *handler-bind-stack* *handler-bind-effective-skip* *restart-frame-condition-map* *signal-walk-depth* *restarts-being-invoked* *restart-invoking-p* *restart-case-result* *rc-invoked-restart* *format-iter-escape* *write-object-budget* *%circ-next* *%ppx-stack* *%pp-ctx* *load-error-condition* *%load-depth* *%next-methods* *%current-gf-args* *%current-gf* *%dmc-call-args* *catch-tag* *catch-value* *catch-values* *catch-tags*))
+     ,@body))
+
 (defun %thr-trampoline ()
   "EVERY thread starts here.  Zero arguments, because the clone stub enters it
    with a bare `call rbx' — see the handshake above for how it learns which
@@ -2450,48 +2488,7 @@ modus: a thread needed the runtime lock but the lock arena is exhausted or missi
     ;; (translate-x64) now refuses exactly that, which is how these were
     ;; found.  Each starts EMPTY, not as a copy of the spawner's: a thread
     ;; started inside main's HANDLER-BIND must not run main's handlers.
-    (let ((*mvm-last-mv* nil)
-          (*nlx-state-serial* (* slot 1099511627776))
-          (*current-condition* nil)
-          (*catch-active* nil)
-          (*restart-stack* nil)
-          (*handler-bind-stack* nil)
-          (*handler-bind-effective-skip* 0)
-          (*restart-frame-condition-map* nil)
-          (*signal-walk-depth* 0)
-          (*restarts-being-invoked* nil)
-          (*restart-invoking-p* nil)
-          (*restart-case-result* nil)
-          (*rc-invoked-restart* nil)
-          (*format-iter-escape* nil)
-          (*write-object-budget* 0)
-          (*%circ-next* 0)
-          (*%ppx-stack* nil)
-          (*%pp-ctx* nil)
-          (*load-error-condition* nil)
-          (*%load-depth* 0)
-          ;; CLOS: the generic function being dispatched and its arguments
-          ;; and next methods live in globals for the length of a call.
-          (*%next-methods* nil)
-          (*%current-gf-args* nil)
-          (*%current-gf* nil)
-          (*%dmc-call-args* nil)
-          ;; CATCH/THROW: the tag and values in flight.
-          (*catch-tag* nil)
-          (*catch-value* nil)
-          (*catch-values* nil)
-          (*catch-tags* nil))
-      (declare (special *mvm-last-mv* *nlx-state-serial* *current-condition*
-                        *catch-active* *restart-stack* *handler-bind-stack*
-                        *handler-bind-effective-skip* *restart-frame-condition-map*
-                        *signal-walk-depth* *restarts-being-invoked*
-                        *restart-invoking-p* *restart-case-result*
-                        *rc-invoked-restart* *format-iter-escape*
-                        *write-object-budget* *%circ-next* *%ppx-stack* *%pp-ctx*
-                        *load-error-condition* *%load-depth*
-                        *%next-methods* *%current-gf-args* *%current-gf*
-                        *%dmc-call-args* *catch-tag* *catch-value*
-                        *catch-values* *catch-tags*))
+    (%with-computation-state ((* slot 1099511627776))
       (funcall (aref (%thr-funs) slot)))
     ;; PARK THE ALLOCATION FRONTIER ON THE WAY OUT.  A region's +0x30 is where
     ;; its live heap ends as far as anything outside this thread is concerned;

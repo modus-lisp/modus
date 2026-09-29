@@ -927,9 +927,9 @@
 (defvar *ssh-build-p*
   (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_SSH_BUILD")))
     (and v (string= v "1"))))
-(when (and *ssh-build-p* *cl-repl-qemu-p*)
-  (error "MODUS_SSH_BUILD=1 is :RPI-only — the actor/SSH address map is Pi ~
-          DRAM.  See the DIVERGENCE 5 comment in build-cl-repl-common.lisp."))
+(when (and *ssh-build-p* *cl-repl-virt-p*)
+  (error "MODUS_SSH_BUILD=1 is :RPI or :X64 — the :VIRT actor/SSH address map ~
+          is not laid out.  See the DIVERGENCE 5 comment in build-cl-repl-common.lisp."))
 
 ;; Crypto source, spliced into *net-source* after ip.lisp.  "" unless SSH build.
 (defvar *crypto-source*
@@ -947,7 +947,27 @@
 ;; window 0x11000000-0x111FFFFF is Device — actor code must NOT run there).
 ;; arch-rpi-cl does NOT define these, so there is no last-defun-wins conflict.
 (defvar *ssh-addr-map-source*
-  (if *ssh-build-p*
+  (cond
+    ((not *ssh-build-p*) "")
+    ;; :X64 (QEMU pc / UEFI): no actors -- the CL server is the synchronous poll
+    ;; loop (ssh-server -> net-actor-main, connections served inline), so only
+    ;; the SSH state needs a home.  arch-x86-cl.lisp puts ssh-conn/ssh-ipc INSIDE
+    ;; the 2 MB region 0x0C000000.. that the SNP boot maps SHARED (C=0): the
+    ;; per-connection block holds the host private key (+0x110) and the session
+    ;; keys, and shared memory is the hypervisor's to read.  They live above it.
+    ;; e1000-state-base moves too: it is CPU-only state (the NIC DMAs only into
+    ;; the ring/buffer areas), and +0x710 is the HOST PRIVATE KEY, +0x62C the
+    ;; PRNG -- the last SSH secrets that were still in host-readable memory.
+    ;; fe-scratch-base keeps its +0x900 relation to it.  ssh-ipc ends at
+    ;; 0x0C280000 + 76800*8 = 0x0C316000.
+    (*cl-repl-x64-p*
+     "
+(defun ssh-conn-base ()      #x0C200000)
+(defun ssh-ipc-base ()       #x0C280000)
+(defun e1000-state-base ()   #x0C320000)
+(defun fe-scratch-base ()    #x0C320900)
+")
+    (t
       "
 (defun percpu-data-base ()   #x12000000)
 (defun sched-lock-addr ()    #x12000200)
@@ -971,8 +991,7 @@
 (defun e1000-state-base ()   #x13000000)
 (defun ssh-conn-base ()      #x13010000)
 (defun ssh-ipc-base ()       #x13100000)
-"
-      ""))
+")))
 
 ;; SSH transport: address map + actor scheduler + net-actor + SSH server.
 ;; actors-net-overrides.lisp comes AFTER ip.lisp (which also defines
@@ -993,11 +1012,22 @@
 ;; uninitialised, so calling it directly IS the single-threaded server.
 ;; Its native-eval = (eval-sexp ...) is the DELETED tree-walker; override it with
 ;; the CL image's production eval so the SSH shell evaluates via mvm-eval.
+(defvar *ssh-x64-actor-stubs*
+  ";; :X64 has no actor scheduler in this image: ip.lisp's net-actor-main polls
+;; (arch-x86-cl's YIELD is an io-delay) and every connection is served inline.
+(defun actor-spawn (fn) 0)
+(defun actor-exit () 0)
+(defun try-receive () 0)
+(defun send (target message) 0)
+(defun smp-init () 0)
+(defun actor-init () 0)
+")
+
 (defvar *ssh-transport-source*
   (if *ssh-build-p*
       (concatenate 'string
         *ssh-addr-map-source*                     (string #\Newline)
-        (%rpi-net-text "actors.lisp")             (string #\Newline)
+        (if *cl-repl-x64-p* *ssh-x64-actor-stubs* (%rpi-net-text "actors.lisp")) (string #\Newline)
         (%rpi-net-text "ssh.lisp")                (string #\Newline)
         (%rpi-net-text "aarch64-overrides.lisp")  (string #\Newline)
         "(defun native-eval (form) (eval form))"  (string #\Newline)
@@ -1028,19 +1058,29 @@
         ;; repl-source reader) — neither exists in this image, so exec produced
         ;; no output.  Route the command through the REAL CL stack instead:
         ;; read-from-string -> eval (eval2) -> prin1-to-string -> channel data.
+        ;; What the form PRINTS goes to the channel too: *standard-output* is
+        ;; bound to a string stream around the eval and its contents precede the
+        ;; `= VALUE' line, so a client can read lines a function writes (the
+        ;; attestation report from SNP-ATTEST-SSH is 19 of them) and not only
+        ;; the value.  Serial no longer sees that output; it is the session's.
         "(defun ssh-eval-line (ssh cmd cmd-len)
-  (let ((s (make-string cmd-len)))
+  (let ((s (make-string cmd-len)) (out nil))
     (dotimes (i cmd-len) (aset s i (code-char (aref cmd i))))
-    (let ((result (handler-case (eval (read-from-string s))
+    (let ((result (handler-case
+                      (let ((so (make-string-output-stream)))
+                        (let ((r (let ((*standard-output* so)) (eval (read-from-string s)))))
+                          (setq out (get-output-stream-string so))
+                          r))
                     (t (c) (list (quote error) c)))))
       (let ((rs (handler-case (prin1-to-string result)
                   (t (c) (prin1-to-string (quote unprintable))))))
-        (let ((rl (length rs)))
-          (let ((arr (make-array (+ rl 3))))
-            (aset arr 0 61) (aset arr 1 32)
-            (dotimes (i rl) (aset arr (+ 2 i) (char-code (aref rs i))))
-            (aset arr (+ 2 rl) 10)
-            (ssh-send-string ssh arr (+ rl 3))))))))"
+        (let ((rl (length rs)) (ol (if out (length out) 0)))
+          (let ((arr (make-array (+ ol rl 3))))
+            (dotimes (i ol) (aset arr i (char-code (aref out i))))
+            (aset arr ol 61) (aset arr (+ ol 1) 32)
+            (dotimes (i rl) (aset arr (+ ol 2 i) (char-code (aref rs i))))
+            (aset arr (+ ol 2 rl) 10)
+            (ssh-send-string ssh arr (+ ol rl 3))))))))"
         (string #\Newline)
         ;; SHELL-path fix (completes the interactive SSH loop): the active
         ;; ssh-do-eval-expr (net/aarch64-overrides.lisp) used eval-sexp (the
@@ -1094,6 +1134,24 @@
         ;; register listen port 22, crypto pre-compute, actor/mailbox init, then
         ;; the synchronous poll loop.  Called from the REPL; net-actor-main
         ;; blocks, serving inline (net-accept-connection -> ssh-handle-connection).
+        (if *cl-repl-x64-p*
+            ;; :X64 -- the NIC is already up from run-net-pipeline (PCI, E1000,
+            ;; DHCP into e1000-state-base +24/+28), so only the SSH state is
+            ;; zeroed and seeded (state +0x600..+0x900 is the SSH-side part of
+            ;; e1000-state: key-set flag, PRNG, host key; the NIC/DHCP words below
+            ;; it stay).  No USB probe, no static address, no actors.
+            "(defun ssh-boot ()
+  (let ((s (+ (e1000-state-base) #x600))) (dotimes (i 96) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
+  (let ((s (ssh-ipc-base))) (dotimes (i 76800) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
+  (let ((s (ssh-conn-base))) (dotimes (i 8192) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
+  (setf (mem-ref (+ (ssh-ipc-base) #x60438) :u32) 22)
+  (ssh-seed-random)
+  (ssh-init-strings)
+  (ssh-use-default-key)
+  (pre-compute-host-sign)
+  (pre-compute-server-eph (conn-ssh 0))
+  (write-string-serial \"NETUP\") (write-char-serial 10)
+  (net-actor-main))"
         "(defun ssh-boot ()
   (let ((s (e1000-state-base))) (dotimes (i 1024) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
   (let ((s (ssh-ipc-base))) (dotimes (i 76800) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
@@ -1110,7 +1168,7 @@
   (smp-init)
   (actor-init)
   (write-string-serial \"NETUP\") (write-char-serial 10)
-  (net-actor-main))"
+  (net-actor-main))")
         (string #\Newline)
         ;; usb-netdev.lisp LAST: runtime USB NIC binding + hot-plug.  Its
         ;; e1000-send/receive/rx-buf DISPATCHERS win over r8152's forwarders
@@ -1118,7 +1176,10 @@
         ;; driver at runtime (RTL8153 -> r8152, else CDC-ECM) and latches it, and
         ;; the real usb-netdev-hotplug-poll overrides ip.lisp's no-op stub so the
         ;; net-actor-main loop re-binds on a USB connect/disconnect edge.
-        (%rpi-net-text "usb-netdev.lisp")         (string #\Newline))
+        ;; :X64 has no USB NIC and no hot-plug: usb-netdev.lisp overrides E1000-RECEIVE,
+        ;; E1000-SEND, E1000-RX-BUF and E1000-PROBE with USB-backed versions that probe
+        ;; for a USB NIC on every poll (the "ND:0" stream) -- the E1000 never gets polled.
+        (if *cl-repl-x64-p* "" (%rpi-net-text "usb-netdev.lisp"))         (string #\Newline))
       ""))
 
 ;;; DIVERGENCE 3 — the arch adapter + the NIC driver.  Everything downstream of
@@ -1545,7 +1606,12 @@
 
 (defvar *net-pipeline-defun-source*
   (if *cl-repl-qemu-p*
-      "(defun run-net-pipeline ()
+      ";; QEMU user-mode net: slirp answers a DISCOVER in tens of ms, which is more
+;; than 2500 of the x86 adapter's io-delays (DHCP:F five times, then the OFFERs
+;; found queued in the RX ring).  Wait longer per attempt; the count only
+;; matters when no answer comes.
+(defun dhcp-wait-tries () 250000)
+(defun run-net-pipeline ()
   (write-string-serial \"NET-PIPELINE-START\") (write-char-serial 10)
   ;; 1. PCI bring-up: assign BARs (no firmware did it), then probe the E1000.
   ;;    e1000-probe prints its own MAC / link diagnostics.
@@ -1790,12 +1856,29 @@
   (setq *aarch64-serial-rx-poll* (list #x18 4 :tbnz))"))))
       ""))
 
+;; SEV-SNP attestation (docs/snp-guest.md): the guest-message framing over the
+;; in-tree AES-GCM plus the GHCB/secrets-page platform half.  "" unless the head
+;; set an SNP mode, so every other image is byte-identical.
+(defvar *snp-attest-source*
+  (if (and (boundp 'modus.mvm::*x64-snp-mode*) modus.mvm::*x64-snp-mode*)
+      (concatenate 'string
+        (%rpi-mvm-text "crypto/aes.lisp")       (string #\Newline)
+        (%rpi-mvm-text "crypto/gcm.lisp")       (string #\Newline)
+        (%rpi-mvm-text "crypto/snp-guest.lisp") (string #\Newline)
+        (%rpi-mvm-text "net/snp-attest.lisp")   (string #\Newline)
+        ;; The SSH-host-key binding needs both the SNP half and the SSH server
+        ;; (SHA512, the host key slots), so only an SNP+SSH image carries it.
+        (if *ssh-build-p* (%rpi-mvm-text "net/snp-ssh-attest.lisp") "")
+        (string #\Newline))
+      ""))
+
 (defvar *cli-bare-metal-net-source*
   ;; *cl-repl-jit-region-source* LAST: its %jit-exec-* defuns must come after
   ;; translate-aarch64.lisp's defaults so last-defun-wins picks the :virt DRAM
   ;; window.  Empty string on :rpi, which keeps the translator's own values.
   (concatenate 'string *net-source* *net-url-source* *net-driver-source*
-               *rpi-jit-coinit-override* *cl-repl-jit-region-source*))
+               *rpi-jit-coinit-override* *cl-repl-jit-region-source*
+               *snp-attest-source*))
 
 ;;; ARCH SLOT: the toplevel entry / probe program.  The hosted CLIs hand off to
 ;;; cli-toplevel here; this image runs the same E2SMOKE self-check the bare ANSI

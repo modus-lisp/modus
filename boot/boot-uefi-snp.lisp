@@ -54,12 +54,31 @@
 (defconstant +snp-vc-addr+      #x19000  "#VC handler code, copied here from the stub.")
 (defconstant +snp-vc-thunk-addr+ #x19F00 ":TEST vector-29 thunk (push 0x7B; jmp handler).")
 
-;;; Scratch words (0x600180.. is unused by the UEFI stub and the console)
-(defconstant +snp-active-addr+  #x600180 "u32: 1 if SNP detected and the shared region is live")
-(defconstant +snp-cbit-mask-addr+ #x600188 "u64: 1 << C-bit, or 0")
-(defconstant +snp-cbit-pos-addr+  #x600190 "u32: C-bit position")
-(defconstant +snp-vc-count-addr+  #x600198 "u64: number of #VC entries taken")
-(defconstant +snp-vc-last-addr+   #x6001A0 "u64: last exit code seen")
+;;; Scratch words (the SNP status block; see +snp-status-base+ below)
+;; The SNP status block.  ONE page below the #VC handler's, safe for every x64
+;; image: it used to be 0x600180.., which is inside the 42 MB CL image's own
+;; native code (%RESOLVE-OUTPUT-STREAM) -- the toy image is small enough not to
+;; reach it, the CL image is not, and the stub was overwriting live code.
+(defconstant +snp-status-base+    #x1A000)
+(defconstant +snp-active-addr+    (+ +snp-status-base+ #x00) "u32: 1 if SNP detected and the shared region + GHCB are set up")
+(defconstant +snp-cbit-mask-addr+ (+ +snp-status-base+ #x08) "u64: 1 << C-bit, or 0")
+(defconstant +snp-cbit-pos-addr+  (+ +snp-status-base+ #x10) "u32: C-bit position")
+(defconstant +snp-vc-count-addr+  (+ +snp-status-base+ #x18) "u64: number of #VC entries taken")
+(defconstant +snp-vc-last-addr+   (+ +snp-status-base+ #x20) "u64: last exit code seen")
+;; Published for net/snp-attest.lisp (Lisp reads them with mem-ref):
+(defconstant +snp-secrets-addr+   (+ +snp-status-base+ #x28) "u64: GPA of the SNP secrets page from the EFI CC-blob table, or 0")
+(defconstant +snp-vmgexit-fn-addr+ (+ +snp-status-base+ #x30) "u64: TAGGED (|3) pointer to the VMGEXIT routine at +snp-vmgexit-addr+")
+(defconstant +snp-ghcb-word-addr+ (+ +snp-status-base+ #x38) "u64: GPA of the GHCB")
+(defconstant +snp-shared-word-addr+ (+ +snp-status-base+ #x40) "u64: base of the shared (C=0) region")
+(defconstant +snp-vmgexit-addr+  #x19E80 "the VMGEXIT routine: `rep vmmcall; mov eax,NIL; ret' (:snp) or `mov eax,NIL; ret' (:test)")
+;; EFI_CC_BLOB_GUID 067b1f5f-cf26-44c5-8554-93d777912d42 as the two little-endian
+;; u64 of its in-memory encoding; the vendor table is `struct cc_blob_sev_info'
+;; (magic "AMDE" 0x45444D41 at +0, secrets_phys u64 at +8).
+(defconstant +efi-cc-blob-guid-lo+ #x44C5CF26067B1F5F)
+(defconstant +efi-cc-blob-guid-hi+ #x422D9177D7935485)
+(defconstant +cc-blob-magic+ #x45444D41)
+(defconstant +efi-st-nr-tables+ #x68)
+(defconstant +efi-st-config-table+ #x70)
 
 ;;; GHCB layout (struct ghcb)
 (defconstant +ghcb-rax+        #x1F8)
@@ -390,6 +409,33 @@
       (let ((bytes (sa-finish a)))
         (loop for b across bytes do (mvm-emit-byte buf b))))))
 
+(defun emit-snp-find-secrets (buf)
+  "Before ExitBootServices, with R13 = EFI SystemTable: walk the configuration
+   table for the SEV-SNP CC blob and store its secrets_phys at
+   +snp-secrets-addr+ (0 if absent -- a plain machine, or :TEST mode).
+   Clobbers RAX RCX RDX RSI only."
+  (let ((a (make-snp-asm)))
+    (sa a #x48 #xC7 #x04 #x25) (sa-u32 a +snp-secrets-addr+) (sa-u32 a 0)   ; mov qword [secrets],0
+    (sa a #x49 #x8B #x4D +efi-st-nr-tables+)                                 ; mov rcx,[r13+0x68]
+    (sa a #x49 #x8B #x75 +efi-st-config-table+)                              ; mov rsi,[r13+0x70]
+    (sa-label a :loop)
+    (sa a #x48 #x85 #xC9) (sa-jcc a :e :end)                                 ; test rcx,rcx ; jz end
+    (sa a #x48 #x8B #x06) (sa a #x48 #xBA) (sa-u64 a +efi-cc-blob-guid-lo+)  ; mov rax,[rsi] ; mov rdx,lo
+    (sa a #x48 #x39 #xD0) (sa-jcc a :ne :next)                               ; cmp rax,rdx
+    (sa a #x48 #x8B #x46 #x08) (sa a #x48 #xBA) (sa-u64 a +efi-cc-blob-guid-hi+) ; mov rax,[rsi+8]
+    (sa a #x48 #x39 #xD0) (sa-jcc a :ne :next)
+    (sa a #x48 #x8B #x46 #x10)                                               ; mov rax,[rsi+16] (VendorTable)
+    (sa a #x8B #x10) (sa a #x81 #xFA) (sa-u32 a +cc-blob-magic+)             ; mov edx,[rax] ; cmp edx,"AMDE"
+    (sa-jcc a :ne :end)
+    (sa a #x48 #x8B #x40 #x08)                                               ; mov rax,[rax+8] secrets_phys
+    (sa a #x48 #x89 #x04 #x25) (sa-u32 a +snp-secrets-addr+)                 ; mov [secrets],rax
+    (sa-jmp a :end)
+    (sa-label a :next)
+    (sa a #x48 #x83 #xC6 24) (sa a #x48 #xFF #xC9) (sa-jmp a :loop)          ; add rsi,24 ; dec rcx
+    (sa-label a :end)
+    (let ((bytes (sa-finish a)))
+      (loop for b across bytes do (mvm-emit-byte buf b)))))
+
 (defun emit-snp-load-cbit-rbx (buf)
   "mov rbx, [+snp-cbit-mask-addr+] — the page-table build ORs RBX into every
    table pointer and every 2 MB entry.  Zero when SNP is not active."
@@ -446,7 +492,7 @@
    CODE-SELECTOR: the live GDT's 64-bit code segment, for the IDT entry."
   (let ((a (make-snp-asm))
         (handler (assemble-vc-handler *x64-snp-mode*)))
-    (when (> (length handler) (- +snp-vc-thunk-addr+ +snp-vc-addr+))
+    (when (> (length handler) (- +snp-vmgexit-addr+ +snp-vc-addr+))
       (error "#VC handler too large: ~D bytes" (length handler)))
     ;; -- (a) SNP-active only: PSC + GHCB registration
     (sa a #x8B #x04 #x25) (sa-u32 a +snp-active-addr+)         ; mov eax,[active]
@@ -512,6 +558,18 @@
     (sa a #xC7 #x04 #x25) (sa-u32 a (+ +snp-idtr-addr+ 2)) (sa-u32 a +snp-idt-addr+)
     (sa a #xC7 #x04 #x25) (sa-u32 a (+ +snp-idtr-addr+ 6)) (sa-u32 a 0)
     (sa a #x0F #x01 #x1C #x25) (sa-u32 a +snp-idtr-addr+)                       ; lidt [idtr]
+    ;; ---- the VMGEXIT routine Lisp calls (net/snp-attest.lisp), and the words it reads
+    ;;      :snp  F3 0F 01 D9  rep vmmcall ; B8 01 00 AD DE mov eax,NIL ; C3 ret
+    ;;      :test              B8 01 00 AD DE mov eax,NIL ; C3 ret   (no SVM on a plain machine)
+    (let ((code (if (eq *x64-snp-mode* :snp)
+                    '(#xF3 #x0F #x01 #xD9 #xB8 #x01 #x00 #xAD #xDE #xC3 #x90 #x90)
+                    '(#xB8 #x01 #x00 #xAD #xDE #xC3 #x90 #x90))))
+      (loop for i from 0 below (length code) by 4
+            do (sa a #xC7 #x04 #x25) (sa-u32 a (+ +snp-vmgexit-addr+ i))
+               (dolist (k '(0 1 2 3)) (sa a (nth (+ i k) code)))))      ; mov dword [addr+i], 4 bytes
+    (sa a #x48 #xC7 #x04 #x25) (sa-u32 a +snp-vmgexit-fn-addr+) (sa-u32 a (logior +snp-vmgexit-addr+ 3))
+    (sa a #x48 #xC7 #x04 #x25) (sa-u32 a +snp-ghcb-word-addr+) (sa-u32 a (snp-ghcb-addr))
+    (sa a #x48 #xC7 #x04 #x25) (sa-u32 a +snp-shared-word-addr+) (sa-u32 a *snp-shared-base*)
     (sa-jmp a :end)
     (sa-label a :fatal)
     (sa a #xF4) (sa-jmp a :fatal)

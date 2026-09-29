@@ -5,6 +5,7 @@
 #   scripts/run-uefi-cl.sh IMAGE.efi                 interactive (Ctrl-A X quits)
 #   scripts/run-uefi-cl.sh IMAGE.efi '(+ 1 2)' ...   eval each form, print results
 #   OUT=file  keep the raw serial capture       NET=1  add an E1000 (user net)
+#   HOSTFWD=port  with NET=1, forward host tcp:port to the guest's 22 (SSH)
 #   TIMEOUT=s (default 120)                     MEM=m  (default 512)
 #
 # THE PAYLOAD IS DELIVERED BY A FAT DISK HERE, WHICH AN SEV-SNP LAUNCH DOES NOT
@@ -22,7 +23,7 @@ SZ=$(( ( $(stat -c %s "$EFI") / 1048576 ) + 8 ))
 dd if=/dev/zero of=$IMG bs=1M count=$SZ status=none
 mformat -i $IMG -F :: && mmd -i $IMG ::/EFI && mmd -i $IMG ::/EFI/BOOT && mcopy -i $IMG "$EFI" ::/EFI/BOOT/BOOTX64.EFI || exit 1
 cp /usr/share/OVMF/OVMF_VARS_4M.fd $VARS
-NETARGS=""; [ "${NET:-0}" = 1 ] && NETARGS="-device e1000,netdev=net0,romfile=,rombar=0 -netdev user,id=net0"
+NETARGS=""; [ "${NET:-0}" = 1 ] && NETARGS="-device e1000,netdev=net0,romfile=,rombar=0 -netdev user,id=net0${HOSTFWD:+,hostfwd=tcp::${HOSTFWD}-:22}"
 QEMU="qemu-system-x86_64 -drive if=pflash,format=raw,readonly=on,file=$OVMF -drive if=pflash,format=raw,file=$VARS -drive format=raw,file=$IMG -m ${MEM:-512} -nographic -no-reboot $NETARGS"
 if [ $# = 0 ]; then echo "Booting $EFI (Ctrl-A X to quit)" >&2; exec $QEMU; fi
 FIFO=$W/fifo; mkfifo $FIFO

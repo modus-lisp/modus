@@ -45,6 +45,22 @@ metal — the bytecode is compiled once by SBCL — which is the complement of t
 source-level DDC below, not a substitute for it.  It is a different artifact
 from the payload; the DDC'd payload is `--compile-uefi`'s output above.
 
+**Result, 2026-09-27 (tree 460d22f, after the #252 collector fixes): all three
+image modes are DDC'd, each byte-identical from SBCL and from modus-sh built
+under SBCL, CCL and ABCL, and identical run to run:**
+
+| `MODUS_UEFI_SNP` | image | md5 |
+|---|---|---|
+| 0 (plain UEFI) | 35,951,616 B | `8a04528c8c708244d6603c2198deb206` |
+| 1 (SNP: C-bit tables, #VC handler, GHCB page, **attestation code**, 2c36c06) | 36,822,016 B | `f7c2f4df1cedb1b0fbbbf743e66bad6b` |
+| 1, before the attestation code (7520e23) | 35,951,616 B | `eda7f5222c0173e418125234f64484d7` |
+| **SNP mode + E1000 + SSH server + host-key binding** (`MODUS_UEFI_SNP=test MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1`, 2026-09-27) | 40,268,288 B | `94062cf68337cc6840ef1d2a36bb322f` |
+| test (fake-#VC self-test) | 35,951,616 B | `e511c6efa52fbec20db8e48c74d413a1` (SBCL host) |
+
+The SNP-mode hash is the one an attestation report's measurement should be
+checked against.  (The earlier 76ec6cfb was the plain image before those
+collector fixes changed the emitted GC trampoline.)
+
 ## Making the bare image DDC'd: `modus-sh --compile-uefi`
 
 `mvm/build-modus-selfhost.lisp` now bakes `boot/boot-uefi-snp.lisp`,
@@ -232,11 +248,59 @@ keeps emitting IN/OUT inline and the handler makes them work.
 1. A host: kernel ≥ 6.11 with SNP, QEMU ≥ 9.1, `OVMF.amdsev.fd`; then
    `MODUS_UEFI_SNP=1` and `-machine confidential-guest-support=sev0 -object
    sev-snp-guest,id=sev0,cbitpos=51,reduced-phys-bits=1`.
-2. UEFI build of the SSH image; E1000 under SNP (rings are already in the
-   shared page; the NIC's BAR MMIO needs a shared mapping or MMIO #VC support).
-3. Attestation: locate the secrets page and CPUID page (EFI config table
-   `SEV-SNP secrets` GUID), MSG_REPORT_REQ over the GHCB guest-request NAE
-   (0x80000011) encrypted with VMPCK0 via `crypto/gcm.lisp` (needs the MVM
-   adaptation), `report_data` = SHA-512 of the Ed25519 host public key.
-   Verifier side: `seal` has P-384 ECDSA verify (SBCL-hosted); VCEK chain
-   from AMD KDS.
+2. E1000 under SNP: the rings are in the shared page and the SSH image builds
+   and serves under plain OVMF (`test/run-uefi-ssh.sh`, `MODUS_NET_BUILD=1
+   MODUS_SSH_BUILD=1`); the NIC's BAR MMIO still needs a shared mapping or MMIO
+   #VC support on a real SNP host.
+3. Attestation — BUILT 2026-09-27, awaiting a host to exercise the PSP path:
+   `crypto/snp-guest.lisp` (guest-message framing, AES-256-GCM under VMPCK0,
+   MSG_REPORT_REQ/RSP, report accessors; the in-tree AES-GCM compiles in-image
+   unmodified and matches python-cryptography), `net/snp-attest.lisp` (secrets
+   page, shared request/response pages below the GHCB, SNP_GUEST_REQUEST over
+   the GHCB, `SNP-ATTESTATION-REPORT`), and in the stub: the EFI CC-blob table
+   scan (`emit-snp-find-secrets`, before ExitBootServices) and a callable
+   VMGEXIT routine at 0x19E80.  `test/run-snp-guest-msg.sh` round-trips the
+   framing against a fake PSP on host and in-image (6/6, tamper-rejecting);
+   `test/snp/verify-report.py` is the verifier (report_data vs SHA-512 of the
+   host key, measurement vs the DDC'd hash, ECDSA P-384 vs a VCEK).  Under
+   plain OVMF the image's `(snp-attest-selftest)` reports active 0, a callable
+   routine and status `(:NO-SNP)`.
+
+   **The SSH binding and the remote verifier are built (2026-09-27), and the
+   whole chain except the root of trust runs here.**  `net/snp-ssh-attest.lisp`
+   (SNP + SSH images only): `report_data = SHA-512(the 32 raw bytes of the
+   Ed25519 host public key)`; `(snp-attest-ssh)` prints `SNP-HOSTKEY`,
+   `SNP-REPORT-DATA` and either the report as 19 `SNP-REPORT` hex lines or
+   `SNP-STATUS`.  The CL image's SSH `ssh-eval-line` now sends what a form
+   PRINTS ahead of its `= VALUE` line, so those lines reach the client.
+   `test/snp/attested-ssh-client.sh HOST PORT [--vcek C] [--measurement H]` is
+   the verifier's side: it takes the host key from OpenSSH's own known_hosts
+   record of the handshake (never from anything the server prints), asks the
+   session for the report, requires printed key == handshake key and printed
+   report_data == SHA-512 of it, then runs `verify-report.py` with that key
+   (which also accepts `--hostkey-hex` and the `ssh-keyscan` base64 blob).
+   Exit 0 attested, 2 bound-but-no-report, 1 mismatch.  Measured against the
+   SNP-test SSH image under plain OVMF: both equalities `yes`, then
+   `no report: SNP-STATUS (NO-SNP)`, exit 2 — the correct answer without a PSP.
+
+   The root of trust is stood in for by OUR OWN KEY so the rest can be
+   exercised: `fake-psp.py keygen` makes a P-384 key + self-signed cert (the
+   VCEK stand-in) and `respond ... vcek-key.pem` signs the report exactly as
+   the PSP does (ECDSA P-384 / SHA-384 over bytes 0..0x2A0, r and s as 72-byte
+   little-endian fields, sig_algo 1).  `test/run-snp-guest-msg.sh` grew an
+   attested arm on host and in a hosted modus image: a fresh Ed25519 host key,
+   request -> signed report -> `verify-report.py` PASS with the key file and
+   with its ssh-keyscan form; a different host key, a different measurement, a
+   flipped signature byte and another signer's certificate each REJECTED
+   (12 of 12).  What a real host adds is only the VCEK from AMD KDS in place
+   of `vcek.pem`, and `(:NO-SNP)` becoming a report.
+
+   Also this round: e1000-state-base (host PRIVATE key at +0x710, PRNG at
+   +0x62C) and ssh-conn/ssh-ipc moved OUT of the 2 MB shared region on x64
+   (0x0C200000 / 0x0C280000 / 0x0C320000) — the last SSH secrets that were in
+   host-readable memory; the plain SSH image still passes `test/run-uefi-ssh.sh`.
+
+   The SNP status block moved from 0x600180 to 0x1A000: 0x600180.. lies inside
+   the 42 MB CL image's native code (%RESOLVE-OUTPUT-STREAM) and the stub was
+   overwriting live code; the UEFI framebuffer words at 0x600100..0x600150 have
+   the same exposure and are still there (the CL image is serial-only).

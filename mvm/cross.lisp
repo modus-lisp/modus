@@ -1240,14 +1240,21 @@
                ;; offset in instruction words: (entry_native_offset - 4) / 4
                ;; -4 because ARM reads PC as current+8, and native code starts
                ;; 4 bytes after this instruction (1 instruction unit)
-               (let* ((byte-offset entry-native-offset)  ; bytes from native code start
+               ;; ...plus PAD bytes of NOPs so the native code starts on a
+               ;; 16-byte boundary (the translator 16-aligns every function
+               ;; entry relative to it; see translate-mvm-to-arm32).  The
+               ;; payload loads at the ELF32 header size past a page boundary.
+               (let* ((hdr (if (eq (getf boot-descriptor :elf-format) :linux-arm32) 84 0))
+                      (pad (mod (- 16 (mod (+ hdr (mvm-buffer-position final-buf) 4) 16)) 16))
+                      (byte-offset (+ entry-native-offset pad))
                       (arm-offset (ash (- byte-offset 4) -2))  ; instruction units, adjusted for PC+8
                       (insn (logior #xEA000000 (logand arm-offset #xFFFFFF))))
-                 (mvm-emit-byte final-buf (logand insn #xFF))
-                 (mvm-emit-byte final-buf (logand (ash insn -8) #xFF))
-                 (mvm-emit-byte final-buf (logand (ash insn -16) #xFF))
-                 (mvm-emit-byte final-buf (logand (ash insn -24) #xFF))
-                 (setq jmp-size 4)))
+                 (dolist (w (cons insn (make-list (floor pad 4) :initial-element #xE1A00000)))
+                   (mvm-emit-byte final-buf (logand w #xFF))
+                   (mvm-emit-byte final-buf (logand (ash w -8) #xFF))
+                   (mvm-emit-byte final-buf (logand (ash w -16) #xFF))
+                   (mvm-emit-byte final-buf (logand (ash w -24) #xFF)))
+                 (setq jmp-size (+ 4 pad))))
               ((and (member arch '(:aarch64 :rpi))
                     (not aarch64-unified-p))
                ;; AArch64 B (unconditional branch, 4 bytes)

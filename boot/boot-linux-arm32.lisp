@@ -28,12 +28,30 @@
   "Heap base, the same #x10000000 every hosted port uses — the shared CL runtime
    and gc.lisp hold the Cheney metadata at fixed absolute slots just below it.")
 
-(defconstant +linux-arm32-heap-size+ #x18000000)   ; 384 MB
-(defconstant +linux-arm32-heap-alloc-start+ #x200)
-(defconstant +linux-arm32-gc-midpoint+ #x0C000000)
-(defconstant +linux-arm32-gc-guard+ #x1000000
-  "16 MB past the second semispace: :gc-check tests the alloc pointer AFTER the
-   bump, so a large allocation can overshoot before anyone looks.")
+(defconstant +linux-arm32-heap-size+ #xF800000
+  "248 MB, ending (with the guard) at #x1FC00000 -- RV32's geometry, for RV32's
+   reason: a MEM-REF address travels as a TAGGED 30-bit fixnum, so nothing the
+   Lisp side addresses may sit at or above #x20000000.  It was 384 MB, ending
+   at #x29000000.")
+(defconstant +linux-arm32-heap-alloc-start+ #x20000
+  "Past the fixed runtime block (#x0000-#x0FFF), the CLI scratch pages
+   (#x1000-#x8FFF) and the staged argv (#x9000-#x1DFFF), as on RV32.")
+(defconstant +linux-arm32-gc-midpoint+ #x7C00000)
+(defconstant +linux-arm32-gc-guard+ #x400000
+  "4 MB past the heap: :gc-check tests the alloc pointer before an allocation
+   whose size it does not know, so a large one can overshoot the limit.")
+(defconstant +linux-arm32-vl-margin+ #x100000
+  "NO COLLECTOR YET: VL is the whole heap less this margin, and :gc-check's
+   BKPT is heap exhaustion.  Remove when the collector lands (VL then stops at
+   the first semispace).")
+
+;;; Staged argv/envp, below 2^29 -- RV32's layout (see boot-linux-riscv32.lisp).
+;;; qemu-arm puts the initial stack near #x40800000, which a tagged MEM-REF
+;;; address cannot express, so the stub copies the vectors down.
+(defconstant +linux-arm32-argv-ptrs+       #x10009000)
+(defconstant +linux-arm32-argv-ptrs-end+   #x1000A000)
+(defconstant +linux-arm32-argv-arena+      #x1000A000)
+(defconstant +linux-arm32-argv-arena-end+  #x1001E000)
 
 ;;; ============================================================
 ;;; ELF wrapper
@@ -63,8 +81,11 @@
    fault is a clean SIGSEGV rather than a longjmp into handler-case."
   (let ((buf (make-arm32-buffer)))
     ;; On entry SP points at argc, then argv[0..].
-    ;; LDR r4, [sp, #0]  — argc into a callee-saved register
-    (arm32-ldr buf +arm-r4+ +arm-sp+ 0)
+    ;; LDR r11, [sp, #0] — argc, in a register NO syscall below uses.  It was
+    ;; r4 -- which mmap2 takes as its fd (-1) -- so the "argc" stored after the
+    ;; mapping was always -1.  Harmless while only ladder images ran (none reads
+    ;; argc); fatal to a CLI.
+    (arm32-ldr buf +arm-r11+ +arm-sp+ 0)
     ;; MMAP FIRST.  The argc slot at #x10000200 is INSIDE the heap mapping, so
     ;; writing it before the mapping exists is a SIGSEGV — measured exactly
     ;; that, si_addr=0x10000200.  (The RISC-V port had the same ordering and
@@ -87,11 +108,77 @@
     (arm32-mov buf +arm-r6+ +arm-r0+)
     ;; NOW the argc slot, inside the mapping that exists as of the line above.
     (arm32-load-imm32 buf +arm-r5+ #x10000200)
-    (arm32-str buf +arm-r4+ +arm-r5+ 0)
+    (arm32-str buf +arm-r11+ +arm-r5+ 0)
+    ;; THE NIL PAGE: (car nil) / (cdr nil) are plain loads from #xDEAD0000, so it
+    ;; must be mapped and NIL-filled, as on RV32/RV64.
+    (arm32-load-imm32 buf +arm-r0+ #xDEAD0000)
+    (arm32-load-imm32 buf +arm-r1+ 4096)
+    (arm32-mov-imm buf +arm-r2+ 0 3)
+    (arm32-load-imm32 buf +arm-r3+ #x32)
+    (arm32-load-imm32 buf +arm-r4+ #xFFFFFFFF)
+    (arm32-mov-imm buf +arm-r5+ 0 0)
+    (arm32-load-imm32 buf +arm-r7+ +arm-linux-sys-mmap2+)
+    (arm32-svc buf)
+    (arm32-load-imm32 buf +arm-r12+ +nil-value+)
+    (arm32-load-imm32 buf +arm-r1+ 1024)
+    (let ((fill (incf *mvm-label-counter*)))
+      (arm32-emit-label buf fill)
+      (arm32-str buf +arm-r12+ +arm-r0+ 0)
+      (arm32-add-imm buf +arm-r0+ +arm-r0+ 0 4)
+      (arm32-sub-imm buf +arm-r1+ +arm-r1+ 0 1)
+      (arm32-cmp-imm buf +arm-r1+ 0 0)
+      (arm32-b-cond buf +arm-cc-ne+ fill))
+    ;; STAGE argv/envp at +linux-arm32-argv-ptrs+ / -arena+.  r0 = source slot
+    ;; (sp+4 = argv[0]), r1 = destination slot, r2 = arena cursor, r3 = NULLs
+    ;; still to copy (argv's then envp's), r5/r12 = the two regions' limits,
+    ;; r7 = the string being copied, lr = byte.  Stops early, leaving both
+    ;; vectors terminated, rather than overrun either region.
+    (let ((top (incf *mvm-label-counter*)) (copy (incf *mvm-label-counter*))
+          (cloop (incf *mvm-label-counter*)) (full (incf *mvm-label-counter*))
+          (done (incf *mvm-label-counter*)))
+      (arm32-add-imm buf +arm-r0+ +arm-sp+ 0 4)
+      (arm32-load-imm32 buf +arm-r1+ +linux-arm32-argv-ptrs+)
+      (arm32-load-imm32 buf +arm-r2+ +linux-arm32-argv-arena+)
+      (arm32-mov-imm buf +arm-r3+ 0 2)
+      (arm32-load-imm32 buf +arm-r5+ (- +linux-arm32-argv-ptrs-end+ 8))
+      (arm32-load-imm32 buf +arm-r12+ (- +linux-arm32-argv-arena-end+ 4096))
+      (arm32-emit-label buf top)
+      (arm32-ldr buf +arm-r7+ +arm-r0+ 0)
+      (arm32-add-imm buf +arm-r0+ +arm-r0+ 0 4)
+      (arm32-cmp-imm buf +arm-r7+ 0 0)
+      (arm32-b-cond buf +arm-cc-ne+ copy)
+      ;; a NULL: copy it; stop after the second
+      (arm32-mov-imm buf +arm-lr+ 0 0)
+      (arm32-str buf +arm-lr+ +arm-r1+ 0)
+      (arm32-add-imm buf +arm-r1+ +arm-r1+ 0 4)
+      (arm32-sub-imm buf +arm-r3+ +arm-r3+ 0 1)
+      (arm32-cmp-imm buf +arm-r3+ 0 0)
+      (arm32-b-cond buf +arm-cc-ne+ top)
+      (arm32-b buf done)
+      (arm32-emit-label buf copy)
+      (arm32-cmp buf +arm-r1+ +arm-r5+)
+      (arm32-b-cond buf +arm-cc-cs+ full)
+      (arm32-cmp buf +arm-r2+ +arm-r12+)
+      (arm32-b-cond buf +arm-cc-cs+ full)
+      (arm32-str buf +arm-r2+ +arm-r1+ 0)            ; ptr[k] = arena
+      (arm32-add-imm buf +arm-r1+ +arm-r1+ 0 4)
+      (arm32-emit-label buf cloop)
+      (arm32-ldrb buf +arm-lr+ +arm-r7+ 0)
+      (arm32-strb buf +arm-lr+ +arm-r2+ 0)
+      (arm32-add-imm buf +arm-r7+ +arm-r7+ 0 1)
+      (arm32-add-imm buf +arm-r2+ +arm-r2+ 0 1)
+      (arm32-cmp-imm buf +arm-lr+ 0 0)
+      (arm32-b-cond buf +arm-cc-ne+ cloop)
+      (arm32-b buf top)
+      (arm32-emit-label buf full)
+      (arm32-mov-imm buf +arm-lr+ 0 0)
+      (arm32-str buf +arm-lr+ +arm-r1+ 0)
+      (arm32-str buf +arm-lr+ +arm-r1+ 4)
+      (arm32-emit-label buf done))
     ;; MVM registers: r9 = alloc pointer (VA), r10 = limit (VL), r8 = NIL
     (arm32-load-imm32 buf +arm-r12+ +linux-arm32-heap-alloc-start+)
     (arm32-add buf +arm-r9+ +arm-r6+ +arm-r12+)
-    (arm32-load-imm32 buf +arm-r12+ +linux-arm32-gc-midpoint+)
+    (arm32-load-imm32 buf +arm-r12+ (- +linux-arm32-heap-size+ +linux-arm32-vl-margin+))
     (arm32-add buf +arm-r10+ +arm-r6+ +arm-r12+)
     ;; VN = NIL = +NIL-VALUE+ (#xDEAD0001), not zero — see boot-linux-riscv.lisp.
     ;; ARM32 cannot load it as a rotated immediate, so it goes through the same
@@ -109,6 +196,7 @@
     (arm32-mov-imm buf +arm-r12+ 0 0)
     (arm32-str buf +arm-r12+ +arm-lr+ 32)         ; [0x60] gc_count
     ;; fall through to translated native code
+    (arm32-resolve-fixups buf)
     (loop for b across (arm32-buffer-to-bytes buf)
           do (mvm-emit-byte mbuf b))))
 

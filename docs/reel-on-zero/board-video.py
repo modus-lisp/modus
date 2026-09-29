@@ -23,6 +23,9 @@ ap.add_argument("--clip", action="append", required=True)
 ap.add_argument("--loops", type=int, default=3)
 ap.add_argument("--http", default="http://10.0.0.1:8099")
 ap.add_argument("--out", default="zero")
+ap.add_argument("--pre-go", action="append", default=[], help="U-Boot command(s) to run before `go`, e.g. \"dcache off\" \"icache off\" to hand over MMU/caches OFF like the firmware does")
+ap.add_argument("--unzip-addr", default=None, help="netboot: where to unzip the image (default 0x300000)")
+ap.add_argument("--boot-cmd", default=None, help="netboot: U-Boot command that starts the image instead of `go 0x300000`, e.g. a booti of an ARM64-Image-wrapped copy")
 ap.add_argument("--no-boot", action="store_true", help="board already up with the network; skip netboot/serial")
 ap.add_argument("--forms", default="/home/modus/reel-hvs-forms.txt")
 a = ap.parse_args()
@@ -33,9 +36,13 @@ def log(*x): print(*x, flush=True)
 if a.no_boot: log("=== no-boot: using the live board")
 else:
   log("=== netboot", a.img, a.core)
-  r = subprocess.run(["python3", "netboot-core-gz.py", "--img", a.img, "--core", a.core, "--tftp-tries", "6"],
+  r = subprocess.run(["python3", "netboot-core-gz.py", "--img", a.img, "--core", a.core, "--tftp-tries", "6"] + sum([["--pre-go", c] for c in a.pre_go], []) + (["--unzip-addr", a.unzip_addr] if a.unzip_addr else []) + (["--boot-cmd", a.boot_cmd] if a.boot_cmd else []),
                      capture_output=True, text=True, cwd="/home/modus")
+  open("/home/modus/%s-netboot.log" % a.out, "w").write(r.stdout)   # U-Boot transcript: pre-go echoes, ARMCLK line
   if "CORE-RESTORED" not in r.stdout: log(r.stdout[-800:]); sys.exit("netboot failed")
+  for key in ("pre-go", "ARMCLK"):
+    for l in r.stdout.split("\n"):
+      if key in l: log("  netboot:", l.strip()[:100])
   time.sleep(15)
 
   # 2. serial: re-link, then network

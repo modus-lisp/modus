@@ -1368,3 +1368,37 @@ MODUS_NET_BUFSZ=1048576 sbcl --dynamic-space-size 8192 --script
 mvm/build-rpi-cl-repl.lisp`), and `rh-load` now signals an error instead of
 returning a truncated clip.  A saved core carries the image's cap, so rebuild
 the core too.
+
+## Does the loader matter?  Booting with MMU and caches handed over OFF (2026-09-29)
+
+Nothing Linux boots the Zero: the chain is GPU firmware → U-Boot on the SD →
+`tftpboot` → `go`.  What U-Boot's `go` does hand over is a LIVE MMU and data
+cache (see 07c2aa3 / 7fc3568), which the image tears down and rebuilds itself,
+so performance should not depend on the loader.  Verified two ways:
+
+* This U-Boot (2025.01, RPi) has **no `dcache`/`icache` commands** — a run with
+  `--pre-go "dcache off"` answered `Unknown command` and measured nothing.
+  Read the netboot transcript (`OUT-netboot.log`, kept by board-video.py now)
+  before trusting a "same numbers" result.
+* `booti` is U-Boot's cache-teardown path (`cleanup_before_linux`: flush +
+  disable D/I caches and MMU, then `Starting kernel ...` at EL2).  Wrapping
+  the chainload image in a 64-byte ARM64 `Image` header (code0 = `b +0x1000`,
+  text_offset 0xFF000, flags 0xA, payload at +0x1000 so the image lands at
+  0x300000 exactly as `go` puts it) and booting it with
+  `netboot-core-gz.py --img booti-XXX.img.gz --unzip-addr 0x2FF000
+  --pre-go "fatload mmc 0:1 0x0F000000 bcm2710-rpi-zero-2-w.dtb"
+  --boot-cmd "booti 0x2FF000 - 0x0F000000"` boots, restores the core, prints
+  `ARMCLK=600000000->1000000000`, and plays:
+
+  | handover | testsrc2 decode / fps | bars decode / fps |
+  |---|---|---|
+  | `go` (MMU+dcache ON) | 2452-2454 ms, 29 | 1385-1387 ms, 57 |
+  | `booti` (MMU+caches OFF) | 2463 ms, 29 | 1459 ms, 54 |
+
+  The image's own MMU/cache setup and clock request are what the numbers
+  depend on, not the loader's state.  The SD card is a stock Raspberry Pi OS
+  card (its `kernel8.img` is Linux, 16 MB) with U-Boot selected by config.txt;
+  a firmware-direct Modus boot (`kernel8.img` = the GPU-load layout,
+  MODUS_RPI_CHAINLOAD unset, via scripts/build-pizero2w.sh) needs the card
+  rewritten by hand — U-Boot's `fatwrite` could do it from here but would take
+  the netboot rig with it, so it was not done.

@@ -55,11 +55,14 @@
               ;; the value spliced in; set-getf returns the new list.  When
               ;; the place is a bare symbol we (setq sym (set-getf ...)),
               ;; otherwise leave the set-getf call as the expansion.
+              ;; Returns VALUE (CLHS) and stores a non-symbol place back.
               ((eq acc 'getf)
-               (if (symbolp (car args))
-                   (list 'setq (car args)
-                         (list 'set-getf (car args) (cadr args) value))
-                   (list 'set-getf (car args) (cadr args) value)))
+               (let ((vt (gensym \"GETFV\")))
+                 (list 'let (list (list vt value))
+                       (list (if (symbolp (car args)) 'setq 'setf)
+                             (car args)
+                             (list 'set-getf (car args) (cadr args) vt))
+                       vt)))
               ;; (setf (ldb spec n) v) → store (dpb v spec n) back into the
               ;; integer place n, but RETURN v (CLHS: setf yields the newly
               ;; stored value, not the updated place).  Bind v to a temp so

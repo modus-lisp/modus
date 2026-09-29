@@ -4180,11 +4180,20 @@
                 ;; Mirrors the build-time rewriter so PSETF/SHIFTF/ROTATEF
                 ;; expansions that emit (setf (getf …) …) at COMPILE time —
                 ;; after the read-time rewriter has run — still work.
+                ;; RETURN the value and STORE BACK a non-symbol place: the
+                ;; old arm returned the new PLIST and, for an accessor place
+                ;; like (getf (db-state c) :k), never wrote it back at all --
+                ;; sqlite-pure's (or (getf …) (setf (getf …) (list 0))) got
+                ;; (:K (0)) and a slot still NIL.
                 ((and (consp place) (name-eq (car place) "GETF"))
-                 (if (symbolp (cadr place))
-                     `(setq ,(cadr place)
-                            (set-getf ,(cadr place) ,(caddr place) ,value))
-                     `(set-getf ,(cadr place) ,(caddr place) ,value)))
+                 (let ((vt (%mvm-gensym "GETFV")))
+                   `(let ((,vt ,value))
+                      ,(if (symbolp (cadr place))
+                           `(setq ,(cadr place)
+                                  (set-getf ,(cadr place) ,(caddr place) ,vt))
+                           `(setf ,(cadr place)
+                                  (set-getf ,(cadr place) ,(caddr place) ,vt)))
+                      ,vt)))
                 ;; (setf (ldb spec n) val) → store (dpb val spec n) back
                 ;; into the integer place, but RETURN val (CLHS: setf
                 ;; yields the newly-stored value, NOT the updated place).

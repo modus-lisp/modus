@@ -8517,7 +8517,14 @@
           (emit-ir :br end-label)
           ;; === Handler path: dispatch on condition type ===
           (emit-ir-label handler-label)
-          (compile-form cond-form env dest)
+          ;; A HARDWARE FAULT arrives here with no condition object: the
+          ;; signal stub cannot allocate, so it only records the signal
+          ;; number.  %TAKE-PENDING-FAULT turns that into *CURRENT-CONDITION*
+          ;; before any clause looks -- otherwise the clauses matched whatever
+          ;; was signalled LAST (a fault after an unrelated (error "x") was
+          ;; caught by a SIMPLE-ERROR clause).  One word load when nothing is
+          ;; pending.
+          (compile-form `(progn (%take-pending-fault) ,cond-form) env dest)
           (emit-ir-label end-label)))))
 
 ;;; ============================================================

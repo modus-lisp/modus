@@ -506,6 +506,14 @@
     nil nil)
   ;; storage-condition
   (%define-condition 'storage-condition '(serious-condition) nil nil nil)
+  ;; memory-fault-error -- SIGSEGV/SIGBUS caught by a handler-case (see
+  ;; %TAKE-PENDING-FAULT).  A TYPE-ERROR because in compiled code a fault is
+  ;; how a type check fails: (car 5) faults, and ANSI says it signals
+  ;; TYPE-ERROR.  The name still says what actually happened.
+  (%define-condition 'memory-fault-error '(type-error) nil nil nil)
+  ;; illegal-instruction-error -- SIGILL (an unimplemented-opcode trap, or a
+  ;; jump into data).
+  (%define-condition 'illegal-instruction-error '(error) nil nil nil)
   ;; restart-invocation — internal type used by restart-case mechanism
   (%define-condition 'restart-invocation '(condition) nil nil nil)
   ;; mvm-type-error — raised by the MVM interpreter's opcode guards
@@ -648,6 +656,24 @@
             (t (c2) (write-string-serial "<report-print-error>"))))
         (write-char-serial 10)
         (setq *%escape-report-busy* nil))))
+
+(defun %take-pending-fault ()
+  "Called by every handler-case dispatch.  A signal stub (TRAP #x0520 on
+   every port) longjmps into the handler-case with the raw signal number in
+   the word at #x10000EB8 and no condition, since it cannot allocate; build
+   the condition here.  SIGFPE (8) is DIVISION-BY-ZERO (integer division
+   is what traps), SIGILL (4) ILLEGAL-INSTRUCTION-ERROR, SIGSEGV/SIGBUS
+   MEMORY-FAULT-ERROR."
+  (let ((sig (mem-ref #x10000EB8 :u32)))
+    (unless (eql sig 0)
+      (setf (mem-ref #x10000EB8 :u32) 0)
+      (setq *current-condition*
+            (cond ((eql sig 8) (make-condition 'division-by-zero
+                                               :operation nil :operands nil))
+                  ((eql sig 4) (make-condition 'illegal-instruction-error))
+                  (t (make-condition 'memory-fault-error
+                                     :datum nil :expected-type t)))))
+    nil))
 
 (defun %maybe-report-unhandled-hc ()
   "Called by compiled handler-case dispatch tails just before the

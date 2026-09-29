@@ -1334,11 +1334,70 @@
               (emit-bytes buf #x48 #xD1 #xE0)
               (emit-bytes buf #x5A)            ; pop rdx
               (emit-bytes buf #x59))           ; pop rcx
+             ((and (= code #x0311) *x64-linux-mode*)
+              ;; CNTFRQ, hosted: x86 has no architectural "counter Hz" register
+              ;; (CPUID leaf 0x15 is often 0, and always so under qemu), so the
+              ;; TSC's rate is MEASURED, once, and cached TAGGED at #x10000F18:
+              ;; TSC read, clock_gettime(MONOTONIC), a 10 ms nanosleep, both
+              ;; read again; Hz = ticks * 1e9 / elapsed-ns.  The elapsed time
+              ;; is measured, so an interrupted sleep still calibrates (just
+              ;; less precisely).  It used to answer 0 -- "unknown" -- so no x64
+              ;; tick count (GC pause stats, trace timing) could become time.
+              ;; Every register it touches but RAX (the result, VR) is saved.
+              (let ((done (make-label)))
+                (emit-bytes buf #x48 #x8B #x04 #x25) (emit-u32 buf #x10000F18) ; mov rax,[F18]
+                (emit-bytes buf #x48 #x85 #xC0)                    ; test rax, rax
+                (emit-jcc buf :ne done)
+                (emit-bytes buf #x51 #x52 #x56 #x57)               ; push rcx rdx rsi rdi
+                (emit-bytes buf #x41 #x50 #x41 #x51 #x41 #x52 #x41 #x53) ; push r8-r11
+                (emit-bytes buf #x48 #x83 #xEC #x20)               ; sub rsp, 32
+                ;; t0 -> r8
+                (emit-bytes buf #x0F #x01 #xF9)                    ; rdtscp
+                (emit-bytes buf #x48 #xC1 #xE2 #x20 #x48 #x09 #xD0) ; rax = edx:eax
+                (emit-bytes buf #x49 #x89 #xC0)                    ; mov r8, rax
+                ;; ts0 at [rsp]
+                (emit-bytes buf #xB8 #xE4 #x00 #x00 #x00)          ; eax = clock_gettime
+                (emit-bytes buf #xBF #x01 #x00 #x00 #x00)          ; edi = MONOTONIC
+                (emit-bytes buf #x48 #x89 #xE6)                    ; rsi = rsp
+                (emit-bytes buf #x0F #x05)                         ; syscall
+                ;; nanosleep({0, 10 ms}) with the request at [rsp+16]
+                (emit-bytes buf #x48 #xC7 #x44 #x24 #x10) (emit-u32 buf 0)
+                (emit-bytes buf #x48 #xC7 #x44 #x24 #x18) (emit-u32 buf 10000000)
+                (emit-bytes buf #xB8 #x23 #x00 #x00 #x00)          ; eax = nanosleep
+                (emit-bytes buf #x48 #x8D #x7C #x24 #x10)          ; rdi = rsp+16
+                (emit-bytes buf #x31 #xF6)                         ; rsi = NULL
+                (emit-bytes buf #x0F #x05)
+                ;; ts1 at [rsp+16]
+                (emit-bytes buf #xB8 #xE4 #x00 #x00 #x00)
+                (emit-bytes buf #xBF #x01 #x00 #x00 #x00)
+                (emit-bytes buf #x48 #x8D #x74 #x24 #x10)          ; rsi = rsp+16
+                (emit-bytes buf #x0F #x05)
+                ;; ticks -> r9
+                (emit-bytes buf #x0F #x01 #xF9)
+                (emit-bytes buf #x48 #xC1 #xE2 #x20 #x48 #x09 #xD0)
+                (emit-bytes buf #x4C #x29 #xC0)                    ; sub rax, r8
+                (emit-bytes buf #x49 #x89 #xC1)                    ; mov r9, rax
+                ;; ns -> r10 = (s1-s0)*1e9 + n1 - n0
+                (emit-bytes buf #x48 #x8B #x44 #x24 #x10)          ; rax = s1
+                (emit-bytes buf #x48 #x2B #x04 #x24)               ; - s0
+                (emit-bytes buf #x48 #x69 #xC0) (emit-u32 buf 1000000000) ; * 1e9
+                (emit-bytes buf #x48 #x03 #x44 #x24 #x18)          ; + n1
+                (emit-bytes buf #x48 #x2B #x44 #x24 #x08)          ; - n0
+                (emit-bytes buf #x49 #x89 #xC2)                    ; mov r10, rax
+                ;; Hz = ticks * 1e9 / ns  (128-bit product, so no overflow)
+                (emit-bytes buf #x4C #x89 #xC8)                    ; rax = r9
+                (emit-bytes buf #xB9) (emit-u32 buf 1000000000)    ; ecx = 1e9
+                (emit-bytes buf #x48 #xF7 #xE1)                    ; mul rcx
+                (emit-bytes buf #x49 #xF7 #xF2)                    ; div r10
+                (emit-bytes buf #x48 #xD1 #xE0)                    ; tag
+                (emit-bytes buf #x48 #x89 #x04 #x25) (emit-u32 buf #x10000F18) ; cache
+                (emit-bytes buf #x48 #x83 #xC4 #x20)               ; add rsp, 32
+                (emit-bytes buf #x41 #x5B #x41 #x5A #x41 #x59 #x41 #x58) ; pop r11-r8
+                (emit-bytes buf #x5F #x5E #x5A #x59)               ; pop rdi rsi rdx rcx
+                (emit-label buf done)))
              ((= code #x0311)
-              ;; CNTFRQ equivalent: x86 has no architectural "counter Hz"
-              ;; register (the TSC rate is discoverable only via CPUID leaf 0x15
-              ;; or calibration), so report frequency-unknown rather than invent
-              ;; a number.  Tagged 0.
+              ;; CNTFRQ, bare metal: no clock to calibrate against yet, so
+              ;; frequency-unknown (tagged 0), which callers handle.
               ;; xor eax, eax
               (emit-bytes buf #x31 #xC0))
              ((= code #x0510)
@@ -1645,6 +1704,13 @@
                 (emit-bytes buf #x48 #x85 #xD2)
                 ;; jz exit_path
                 (emit-jcc buf :e exit-label)
+                ;; Record the signal (EDI = signum) for %TAKE-PENDING-FAULT,
+                ;; which builds the condition in the handler-case dispatch --
+                ;; this stub cannot allocate one.  A process-global word (no
+                ;; TLS prefix): a worker's window at that offset is its
+                ;; dynamic-binding area.
+                (emit-bytes buf #x89 #x3C #x25)           ; mov [disp32], edi
+                (emit-u32 buf #x10000EB8)
                 ;; --- Active handler-case: do the longjmp ---
                 ;; Save OUR state to scratch (#x10000C10..) before the pop
                 ;; helper overwrites [180].

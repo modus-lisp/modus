@@ -1352,6 +1352,26 @@
 (defun %rt-arena-fallbacks ()
   (if (zerop (%ha-base)) 0 (%gc-read64 (+ (%rt-arena-words) #x18))))
 
+(defun %rt-slice-need ()
+  "Headroom the next locked section needs in its slice: 64 KB, or the size a
+   caller announced in this thread's window word +0x50A8 (%RT-ENTER-SIZED)
+   for one large allocation.  Allocation inside a locked section must never
+   run past the slice -- the collector would then collect the slice block,
+   which is meaningless and corrupts."
+  (let ((self (%tls-self-base)))
+    (if (zerop self)
+        #x10000
+        (let ((n (%gc-read64 (+ self #x100050A8))))
+          (if (> n #x10000) n #x10000)))))
+
+(defun %rt-enter-sized (bytes)
+  "%RT-ENTER, with room for one allocation of BYTES in the locked section."
+  (let ((self (%tls-self-base)))
+    (unless (zerop self) (%gc-write64 (+ self #x100050A8) (+ bytes 64))))
+  (%rt-enter)
+  (let ((self (%tls-self-base)))
+    (unless (zerop self) (%gc-write64 (+ self #x100050A8) 0))))
+
 (defun %rt-slice-ensure ()
   "This CPU's slice block with at least 64 KB of headroom, refilled from the
    arena if not — the caller holds the runtime mutex, which is what makes the
@@ -1364,10 +1384,13 @@
                (blk (%rt-slice-block (%thr-cpu)))
                (alloc (%gc-meta-read (+ blk #x30) k))
                (limit (%gc-meta-read (+ blk #x38) k)))
-          (if (>= (- limit alloc) #x10000)
+          (if (>= (- limit alloc) (%rt-slice-need))
               blk
-              (let ((af (%rt-arena-alloc)))
-                (if (> (+ af #x100000) ae)
+              (let* ((af (%rt-arena-alloc))
+                     (chunk (if (> (+ (%rt-slice-need) #x10000) #x100000)
+                                (logand (+ (%rt-slice-need) #x10000 #xFFFF) (- 0 #x10000))
+                                #x100000)))
+                (if (> (+ af chunk) ae)
                     (progn
                       (%gc-write64 (+ (%rt-arena-words) #x18)
                                    (+ (%rt-arena-fallbacks) 1))
@@ -1376,8 +1399,8 @@
                       ;; A slice IS a region block as far as %GC-REGION-ENTER
                       ;; is concerned: init writes +0x30 = AF, +0x38 = AF+1MB.
                       ;; It is never collected, so from/to/stack are inert.
-                      (%gc-region-init blk af af #x100000 0 k)
-                      (%gc-write64 (+ (%rt-arena-words) #x08) (+ af #x100000))
+                      (%gc-region-init blk af af chunk 0 k)
+                      (%gc-write64 (+ (%rt-arena-words) #x08) (+ af chunk))
                       blk))))))))
 
 (defun %rt-arena-carve ()
@@ -1484,6 +1507,14 @@ modus: waited 60 s for the runtime lock; its owner leaked it (faulted, unwound o
           ;; it parks the SLICE block, which is what persists the slice
           ;; frontier for this CPU's next acquisition.
           (let ((blk (%rt-slice-ensure)))
+            ;; A WORKER WITH NO SLICE would take region 0's parked frontier
+            ;; while main allocates from its live one: two mutators, one
+            ;; frontier, silent corruption.  That is the pre-arena path and it
+            ;; is only sound for the main thread.  Stop instead.
+            (when (and (zerop blk) (> (%thr-cpu) 0))
+              (%fatal-stop "
+modus: a thread needed the runtime lock but the lock arena is exhausted or missing; continuing would corrupt the heap. Stopping.
+"))
             (%gc-write64 (%rt-saved-addr)
                          (%gc-region-enter (if (zerop blk) (%gc-region-0) blk))))
           0))))
@@ -2444,7 +2475,12 @@ modus: waited 60 s for the runtime lock; its owner leaked it (faulted, unwound o
           (*%next-methods* nil)
           (*%current-gf-args* nil)
           (*%current-gf* nil)
-          (*%dmc-call-args* nil))
+          (*%dmc-call-args* nil)
+          ;; CATCH/THROW: the tag and values in flight.
+          (*catch-tag* nil)
+          (*catch-value* nil)
+          (*catch-values* nil)
+          (*catch-tags* nil))
       (declare (special *mvm-last-mv* *nlx-state-serial* *current-condition*
                         *catch-active* *restart-stack* *handler-bind-stack*
                         *handler-bind-effective-skip* *restart-frame-condition-map*
@@ -2454,7 +2490,8 @@ modus: waited 60 s for the runtime lock; its owner leaked it (faulted, unwound o
                         *write-object-budget* *%circ-next* *%ppx-stack* *%pp-ctx*
                         *load-error-condition* *%load-depth*
                         *%next-methods* *%current-gf-args* *%current-gf*
-                        *%dmc-call-args*))
+                        *%dmc-call-args* *catch-tag* *catch-value*
+                        *catch-values* *catch-tags*))
       (funcall (aref (%thr-funs) slot)))
     ;; PARK THE ALLOCATION FRONTIER ON THE WAY OUT.  A region's +0x30 is where
     ;; its live heap ends as far as anything outside this thread is concerned;

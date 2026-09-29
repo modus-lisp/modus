@@ -2350,6 +2350,21 @@
                   (emit-bytes buf #xBA #x30 #x00 #x00 #x00)   ; mov edx, 48
                   (emit-bytes buf #xB8 #x01 #x00 #x00 #x00)   ; mov eax, 1 (write)
                   (emit-bytes buf #x0F #x05))                 ; syscall
+                ;; SAY WHY, when threads are live.  A worker's refused shared
+                ;; store (the shared-store guard's marker is set) or any other
+                ;; fault on a thread with no handler-case armed -- bordeaux-
+                ;; threads' own wrapper uses HANDLER-BIND, which arms nothing --
+                ;; used to end the process with a bare 139.
+                (when (x64-stw-p)
+                  (let ((quiet (make-label)) (not-guard (make-label)))
+                    (emit-bytes buf #x83 #x3C #x25) (emit-u32 buf #x10000DB8) (emit-bytes buf #x00)
+                    (emit-jcc buf :e quiet)
+                    (emit-bytes buf #x64 #x48 #x83 #x3C #x25) (emit-u32 buf +ssg-marker-addr+) (emit-bytes buf #x01)
+                    (emit-jcc buf :ne not-guard)
+                    (emit-fatal-message buf (format nil "~%modus: a thread stored one of its own objects into shared memory, and nothing on that thread handles errors. Threads share no state -- pass the value as a message. The store was refused; stopping.~%") 139)
+                    (emit-label buf not-guard)
+                    (emit-fatal-message buf (format nil "~%modus: unhandled hardware fault while threads are running (no handler-case active on the faulting thread); stopping.~%") 139)
+                    (emit-label buf quiet)))
                 ;; mov edi, 139
                 (emit-bytes buf #xBF #x8B #x00 #x00 #x00)
                 ;; mov eax, 231 (sys_exit_group)

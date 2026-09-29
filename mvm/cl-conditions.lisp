@@ -519,6 +519,14 @@
     nil nil)
   ;; storage-condition
   (%define-condition 'storage-condition '(serious-condition) nil nil nil)
+  ;; memory-fault-error -- SIGSEGV/SIGBUS caught by a handler-case (see
+  ;; %TAKE-PENDING-FAULT).  A TYPE-ERROR because in compiled code a fault is
+  ;; how a type check fails: (car 5) faults, and ANSI says it signals
+  ;; TYPE-ERROR.  The name still says what actually happened.
+  (%define-condition 'memory-fault-error '(type-error) nil nil nil)
+  ;; illegal-instruction-error -- SIGILL (an unimplemented-opcode trap, or a
+  ;; jump into data).
+  (%define-condition 'illegal-instruction-error '(error) nil nil nil)
   ;; restart-invocation — internal type used by restart-case mechanism
   (%define-condition 'restart-invocation '(condition) nil nil nil)
   ;; mvm-type-error — raised by the MVM interpreter's opcode guards
@@ -661,6 +669,24 @@
             (t (c2) (write-string-serial "<report-print-error>"))))
         (write-char-serial 10)
         (setq *%escape-report-busy* nil))))
+
+(defun %take-pending-fault ()
+  "Called by every handler-case dispatch.  A signal stub (TRAP #x0520 on
+   every port) longjmps into the handler-case with the raw signal number in
+   the word at #x10000CB0 and no condition, since it cannot allocate; build
+   the condition here.  SIGFPE (8) is DIVISION-BY-ZERO (integer division
+   is what traps), SIGILL (4) ILLEGAL-INSTRUCTION-ERROR, SIGSEGV/SIGBUS
+   MEMORY-FAULT-ERROR."
+  (let ((sig (mem-ref #x10000CB0 :u32)))
+    (unless (eql sig 0)
+      (setf (mem-ref #x10000CB0 :u32) 0)
+      (setq *current-condition*
+            (cond ((eql sig 8) (make-condition 'division-by-zero
+                                               :operation nil :operands nil))
+                  ((eql sig 4) (make-condition 'illegal-instruction-error))
+                  (t (make-condition 'memory-fault-error
+                                     :datum nil :expected-type t)))))
+    nil))
 
 (defun %maybe-report-unhandled-hc ()
   "Called by compiled handler-case dispatch tails just before the
@@ -2628,11 +2654,12 @@
         (if (%error-handler-active-p) (%hc-longjmp) nil))))
 
 (defun %hc-fault-fixup ()
-  "Called first on a HANDLER-CASE handler path (hosted x64 CLI).  If the
-   #x0520 fault stub has recovered a hardware fault since the last check
-   (its count at #x10000CA0 moved past the last-seen count at #x10000CA8),
-   publish a fresh TYPE-ERROR as *CURRENT-CONDITION* -- the stub longjmps
-   without one, and the handler used to dispatch on a STALE condition."
+  "Called first on a HANDLER-CASE handler path (hosted x64 CLI), before
+   %TAKE-PENDING-FAULT.  If the #x0520 fault stub has recovered a hardware
+   fault since the last check (its count at #x10000CA0 moved past the
+   last-seen count at #x10000CA8) and it was THE SHARED-STORE GUARD's trap,
+   publish that guard's error and clear the pending signal; any other fault
+   is left for %TAKE-PENDING-FAULT to type."
   (let ((n (mem-ref #x10000CA0 :u32)))
     (unless (= n (mem-ref #x10000CA8 :u32))
       (setf (mem-ref #x10000CA8 :u32) n)
@@ -2647,14 +2674,16 @@
         (if (and (> self 0) (= (%gc-read64 m) 1))
             (progn
               (%gc-write64 m 0)
+              ;; This condition says more than the signal would: claim it.
+              (setf (mem-ref #x10000CB0 :u32) 0)
               (setq *current-condition*
                     (make-condition 'simple-error
                                     :format-control "modus: a thread stored one of its own objects into shared memory. Threads share no state -- pass the value as a message (or allocate shared data under the runtime lock); the store was refused."
                                     :format-arguments nil)))
-            (let ((c (make-array 2)))
-              (aset c 0 *%sig-type-error-sym*)
-              (aset c 1 nil)
-              (setq *current-condition* c))))))
+            ;; Any other fault: %TAKE-PENDING-FAULT, which the dispatch
+            ;; calls next, builds the condition from the recorded signal
+            ;; (SIGSEGV -> MEMORY-FAULT-ERROR, a TYPE-ERROR).
+            nil))))
   nil)
 
 (defun %signal-type-error ()

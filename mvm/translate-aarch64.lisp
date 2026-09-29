@@ -3590,6 +3590,10 @@
                     ;; CBZ x9, #0 — patched to jump to exit-label.
                     (let ((cbz-exit-idx (a64-current-index buf)))
                       (a64-emit buf (logior #xB4000000 9))    ; CBZ x9
+                      ;; Record the signal (x0) for %TAKE-PENDING-FAULT: the
+                      ;; handler-case dispatch builds the condition from it.
+                      (a64-load-imm64-general buf +a64-x16+ #x10000CB0)
+                      (a64-str-width buf +a64-x0+ +a64-x16+ 0 2) ; STR w0
 
                       ;; ---- Inline handler-stack pop ----
                       ;; depth at #x10010000 ; frames at #x10010008 + depth*24.

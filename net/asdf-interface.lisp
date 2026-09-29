@@ -761,6 +761,21 @@
       (setq *%jit-pending* t)))
   nil)
 
+(defvar asdf::*system-aliases*
+  '(("sqlite" . "sqlite-pure/cl-sqlite"))
+  "System name -> the pure-Lisp system that provides the same package and API
+   on modus.  Modus has no FFI, so a library that binds a C library (cl-sqlite
+   over CFFI/libsqlite3) cannot load; its drop-in replacement can.  An alias
+   applies only when the replacement can actually be found, so an image
+   without it still reports the original system.")
+
+(defun asdf::%system-alias (name)
+  (let* ((n (if (stringp name) name (string-downcase (string name))))
+         (a (assoc n asdf::*system-aliases* :test #'string-equal)))
+    (if (and a (handler-case (asdf::find-system (cdr a) nil) (error (c) nil)))
+        (cdr a)
+        name)))
+
 (defun asdf::load-system (name &rest keys)
   "ASDF:LOAD-SYSTEM — load NAME and everything it depends on, and return T.
 
@@ -776,6 +791,7 @@
   ;; Gray streams are installed on first use (net/sb-gray-shim.lisp): a
   ;; library that subclasses FUNDAMENTAL-* arrives through here.
   (when (fboundp '%ensure-gray-streams) (%ensure-gray-streams))
+  (setq name (asdf::%system-alias name))
   (let* ((sys (asdf::find-system name t))
          (n (asdf::component-name sys)))
     (cond

@@ -190,11 +190,20 @@
 ;; its own FS base as its first act.
 (setf modus.mvm::*tls-window* t)
 (setf modus.mvm.x64::*x64-tls-window* t)
+;; STOP-THE-WORLD FOR REGION 0 (translate-x64): the trampoline's handshake,
+;; the back-edge poll and the safe-region traps; and layout key :STW, which
+;; turns on the runtime half (net/hosted-sync.lisp %GC-STW-ARM, the safe
+;; regions).  x86-64 has no other hosted layout keys, so this is the list.
+(setf modus.mvm.x64::*x64-stw* t)
+(setf modus.mvm::*hosted-layout* (list* :stw 1 modus.mvm::*hosted-layout*))
 (let ((txt (with-open-file (s (merge-pathnames "net/hosted-actors.lisp"
                                                cl-user::*modus-base*))
              (let ((b (make-string (file-length s))))
                (subseq b 0 (read-sequence b s)))))
-      (want (format nil "(defun sched-lock-addr ()    #x~8,'0X)"
+      ;; (%conv-addr K): the runtime names the lock by its VIRTUAL address and
+      ;; the compiler rebases it (docs/macos-hosting.md); the translator's
+      ;; RESTORE-CTX must name the same virtual word.
+      (want (format nil "(defun sched-lock-addr ()    (%conv-addr #x~8,'0X))"
                     modus.mvm::+hosted-sched-lock-addr+)))
   (unless (search want txt)
     (error "build-generic-cli: net/hosted-actors.lisp's SCHED-LOCK-ADDR does ~

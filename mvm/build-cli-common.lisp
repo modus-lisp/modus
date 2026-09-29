@@ -465,6 +465,18 @@
   ;; (No quotation marks in this comment on purpose: it is INSIDE the co-init
   ;; SOURCE STRING, so a double quote here ends the string literal.)
   (setq *x64-tls-window* t)
+  (setq *x64-stw* t)
+  ;; THE ACTIVE REGION IS PER CPU, and a JIT page's own GC trampoline and
+  ;; allocation paths must read it the way the image's do (build-generic-cli
+  ;; sets :RUNTIME for the AOT half).  Left at the defvar's NIL they read the
+  ;; single cell -- CPU 0's, region 0 -- so a worker's JIT'd collection
+  ;; collected MAIN's heap from the worker, and its allocations went there:
+  ;; measured as a worker's &rest lists and argument counts corrupting under
+  ;; nested HANDLER-CASE (test/hosted-handler-depth.lisp), JIT only.
+  (setq *x64-gc-region-percpu* :runtime)
+  ;; RESTORE-CTX releases the hosted scheduler lock (+HOSTED-SCHED-LOCK-ADDR+),
+  ;; as the image's does.
+  (setq *x64-sched-lock-addr* 268439488)
   (setq *tls-window* t)
   ;; handler-case handler paths check for a freshly recovered hardware fault
   ;; (see compile-handler-case / %HC-FAULT-FIXUP).
@@ -507,6 +519,9 @@
    (if *cli-bare-metal*
        "  (setq *x64-linux-mode* nil)
   (setq *ws5-force-no-kindcheck* t)
+  (setq *x64-gc-region-percpu* nil)
+  (setq *x64-sched-lock-addr* nil)
+  (setq *x64-stw* nil)
 "
        "")
    "  t)
@@ -547,8 +562,18 @@
 ;; AArch64 co-init.  Same role as %init-x64-translator: populate the tables the
 ;; translator's defvar init-thunks would have filled (limitation #7).  Verbatim
 ;; from build-ansi-common.lisp's *aarch64-translator-coinit-source*.
+;; The hosted layout knobs (MODUS_CONV_DELTA / _CODE_BASE / _HEAP_BASE /
+;; _JIT_ARENA_BASE / MODUS_NO_X18), shared with the ANSI gate.
+(load (merge-pathnames "hosted-layout-env.lisp"
+                       (directory-namestring (truename *load-truename*))))
+;; Native threads on the hosted AArch64 CLI (MODUS_NO_THREADS=1 opts out).
+;; Before anything reads *LAYOUT-PLIST*: the co-init text below, the thread
+;; group (*CLI-HOSTED-ACTORS-SOURCE*) and every %LAYOUT-IF :A64-THREADS.
+(when (and (eq *cli-arch* :aarch64) (not *cli-bare-metal*))
+  (cl-user::enable-layout-threads))
+
 (defvar *aarch64-jit-coinit-source*
-  (when (and *jit-on* (eq *cli-arch* :aarch64)) "
+  (when (and *jit-on* (eq *cli-arch* :aarch64)) (concatenate 'string "
 (defun %init-aarch64-translator ()
   (let ((map (make-array 23)))
     (aset map 0 0) (aset map 1 1) (aset map 2 2) (aset map 3 3)
@@ -558,7 +583,7 @@
     (aset map 16 0) (aset map 17 24) (aset map 18 25) (aset map 19 26)
     (aset map 20 31) (aset map 21 29) (aset map 22 nil)
     (setq *a64-vreg-to-phys* map)
-  (setq *a64-x18-base* t))   ; x18 = convention base (translate-aarch64), a defvar whose init never runs in-image
+  (setq *a64-x18-base* t))   ; x18 = convention base (translate-aarch64), a defvar whose init never runs in-image; the layout text below may turn it off
   ;; Hosted Linux preempts: YIELD (every loop back-edge) as SEV+WFE cost 18 cycles
   ;; per iteration on the A76 (2026-09-18), so the runtime JIT emits NOP for it.
   (setq *aarch64-yield-nop* t)
@@ -574,8 +599,12 @@
   ;; TRAP codegen emits Linux syscalls.
   (setq *aarch64-stack-align-16* t)
   (setq *aarch64-linux-mode* t)
+  ;; The hosted layout (docs/macos-hosting.md) — the runtime twin of
+  ;; APPLY-LAYOUT-HOST: code compiled at runtime must agree with the fixed code
+  ;; on where the region is, which heap and arena, and whether x18 is the base.
+" (layout-coinit-text) "
   t)
-"))
+")))
 
 ;;; The assembled translator slot, spliced into *all-runtime-source* and
 ;;; *full-source* as ONE unit.  Both arches: <encoder?> <translator> <co-init>,
@@ -615,6 +644,16 @@
 ;;; with nothing to patch.
 (defvar *jit-boot-source*
   (cond
+    ;; JIT off still needs the HOSTED LAYOUT (docs/macos-hosting.md): the
+    ;; in-image compiler serves the interpreter too, and bytecode it compiles
+    ;; must name the region where it really is.  Without this a moved-layout
+    ;; JIT-off image (the first native macOS build) faulted on the MV-count
+    ;; slot's old address the first time it evaluated a form.
+    ((and (not *jit-on*) (eq *cli-arch* :aarch64))
+     (concatenate 'string "
+(defun %jit-boot-init ()
+" (layout-coinit-text) "  nil)
+"))
     ((not *jit-on*)
      "
 (defun %jit-boot-init () nil)
@@ -690,11 +729,11 @@
     ;; (any long loop) left the rest of that run reading stale from-space.
     ;; Gated on the same published-bitmap check as the flags above: the
     ;; indirection is only correct when the collector is actually forwarding
-    ;; the root at #x10000F10, which only the native trampoline does.
+    ;; the root at #x10000FD0, which only the native trampoline does.
     ;; Zero the root before enabling: %jit-constvec treats 0 as
     ;; no-vector-installed, the safe state.  On Linux the BSS already reads 0;
     ;; this costs one store and keeps the hosted and bare-metal init identical.
-    (setf (mem-ref #x10000F10 :u64) 0)
+    (setf (mem-ref #x10000FD0 :u64) 0)
     (setq *aarch64-jit-constvec-p* t))
   ;; #307: a runtime-JIT page may arm a REAL handler frame only if this image's
   ;; boot stub recorded the push/pop helpers' VAs.  Gate on the slot itself
@@ -1110,18 +1149,28 @@
 ;;; addresses by SHRINKING REGION 0 and using the top of the semispaces that
 ;;; frees — the same carve mvm/gc.lisp's stage-1/2/3 selftests already use.
 ;;;
-;;; x64 ONLY, and hosted only.  aarch64's per-CPU storage is TPIDR_EL1 (a
-;;; system register the kernel does not let userspace write) rather than a GS
-;;; base an ordinary arch_prctl can set, so the aarch64 CLI gets "" here and
-;;; its blob is byte-identical to before.  Bare-metal targets already have a
-;;; board file and do not want this one.
+;;; HOSTED ONLY, x64 and AArch64.  Bare-metal targets already have a board file
+;;; and do not want this one.  AArch64 has no GS base for the per-CPU block and
+;;; EL0 cannot write TPIDR_EL1, so its per-CPU pointer lives in the per-thread
+;;; window instead (translate-aarch64.lisp, THE PER-THREAD WINDOW, AARCH64;
+;;; net/hosted-actors.lisp %ARCH-SET-PERCPU-BASE), and it gets the four core
+;;; files only: hosted-sockets-post and hosted-intern-probe issue syscalls the
+;;; AArch64 remap does not carry yet (poll, stat, unlink, chmod), so that image
+;;; keeps the single-buffer socket layer.  MODUS_NO_THREADS=1 gives the old "".
 ;;; THE ORDER IS LOAD-BEARING.  net/hosted-actors.lisp supplies the twelve
 ;;; address hooks and must precede net/actors.lisp (a forward reference across
 ;;; the blob does not resolve).  net/hosted-actors-post.lisp must FOLLOW it,
 ;;; because its SPIN-LOCK / SPIN-UNLOCK / AP-SCHEDULER are last-defun-wins
 ;;; overrides of definitions net/actors.lisp itself makes.
 (defvar *cli-hosted-actors-source*
-  (if (and (eq *cli-arch* :x64) (not *cli-bare-metal*))
+  (cond
+   ((and (eq *cli-arch* :aarch64) (not *cli-bare-metal*) cl-user::*layout-threads*)
+    (concatenate 'string (string #\Newline)
+                 (mvm-text "net/hosted-actors.lisp") (string #\Newline)
+                 (mvm-text "net/actors.lisp") (string #\Newline)
+                 (mvm-text "net/hosted-actors-post.lisp") (string #\Newline)
+                 (mvm-text "net/hosted-sync.lisp") (string #\Newline)))
+   ((and (eq *cli-arch* :x64) (not *cli-bare-metal*))
       (concatenate 'string (string #\Newline)
                    (mvm-text "net/hosted-actors.lisp")
                    (string #\Newline)
@@ -1163,8 +1212,8 @@
                    ;; forward references across the blob.  "" on aarch64 and on
                    ;; bare metal with the rest of the group.
                    (mvm-text "net/hosted-intern-probe.lisp")
-                   (string #\Newline))
-      ""))
+                   (string #\Newline)))
+   (t "")))
 
 (format t "  prelude: ~D chars~%" (length *prelude-source*))
 (format t "  gc:      ~D chars~%" (length *gc-source*))
@@ -1281,8 +1330,8 @@
   (%init-sym-name-auto)
   (setq *macro-table* (make-hash-table))
   (%init-runtime-macros)
-  (setq *cstr-scratch* #x0FE00000)  ; moved below heap base
-  (setq *io-buf-addr*  #x0FF00000)  ; moved out of heap semispace 0; see memory note
+  (setq *cstr-scratch* (%conv-addr #x0FE00000))  ; moved below heap base
+  (setq *io-buf-addr*  (%conv-addr #x0FF00000))  ; moved out of heap semispace 0; see memory note
 "
   ;; BARE-METAL SEAM.  %init-signal-handling -> %install-signal-handlers ->
   ;; TRAP #x0520, which BOTH translators emit as unconditional rt_sigaction

@@ -410,7 +410,27 @@
       (and (>= off #x150) (<= off #x157))    ; dynamic nargs (u32)
       (and (>= off #x180) (<= off #x19F))    ; armed handler frame RSP/RBP/IP/RBX
       (and (>= off #x400) (<= off #xC0F))    ; handler-stack depth + 64 frames
+                                             ; (hosted x86-64: 512 frames at
+                                             ; +0x1000..+0x5000, FS-relative in
+                                             ; translate-x64 itself; the thread
+                                             ; blocks are sized for them —
+                                             ; net/hosted-sync.lisp %THR-TLS-BLOCK)
       (and (>= off #xC10) (<= off #xC37))))  ; longjmp scratch + the self slot
+
+(defparameter *tls-window-a64* nil
+  "The AArch64 window's extra slots (translate-aarch64.lisp, THE PER-THREAD
+   WINDOW, AARCH64) are per-thread too.  Only an AArch64 threaded build sets
+   it: on every other target those addresses are ordinary process memory.")
+
+(defun %tls-window-a64-offset-p (off)
+  "The slots only AArch64 keeps outside the first page: the per-CPU pointer
+   (0xFFE8) and the helper-call LR save (0xFFF0) just below the handler-frame
+   stack, and the stack itself (depth at 0x10000, 24-byte frames above)."
+  (or (and (>= off #xFFE8) (<= off #xFFF7))
+      (and (>= off #x10000) (<= off #x10FFF))
+      ;; the #'NAME thunk's index slot (mvm-eval.lisp %JIT-FNADDR-IDX-SLOT):
+      ;; each thread's thunk writes its own, %JIT-BRIDGE-ANY reads its own.
+      (and (>= off #x178) (<= off #x17F))))
 
 (defun %tls-window-addr-form-p (form)
   "T when FORM is an address the compiler can prove, AT COMPILE TIME, lands in
@@ -422,7 +442,9 @@
    one would give a thread a private copy of a shared table."
   (cond ((integerp form)
          (let ((off (- form +tls-window-base+)))
-           (and (>= off 0) (< off #x1000) (%tls-window-offset-p off))))
+           (and (>= off 0)
+                (or (and (< off #x1000) (%tls-window-offset-p off))
+                    (and *tls-window-a64* (%tls-window-a64-offset-p off))))))
         ((and (consp form) (consp (cdr form)) (consp (cddr form))
               (null (cdddr form))
               (symbolp (car form)) (name-eq (car form) "+"))
@@ -430,20 +452,217 @@
              (%tls-window-addr-form-p (caddr form))))
         (t nil)))
 
+;;; ---- THE CONVENTION REGION (docs/macos-hosting.md, M1) -------------------
+;;;
+;;; Hosted 64-bit images keep all runtime data — the convention block, the
+;;; handler-frame stack, the GC metadata, the file-I/O buffers — in the BSS
+;;; tail at 0x10000000 and up, and the runtime's own source names those words
+;;; by literal address: (mem-ref #x10000200 :u32) is argc.  macOS cannot map
+;;; anything below 4 GB (__PAGEZERO), so that region has to move, and every
+;;; access to it has to follow.
+;;;
+;;; The source keeps naming VIRTUAL addresses; the region's REAL place is
+;;; virtual + *CONV-DELTA*, a link-time constant (option B in the doc — a fixed
+;;; VA, like the code's, rather than a base register nobody can spare on arm64
+;;; macOS).  Everything is rebased before it reaches a register:
+;;;
+;;;   - a MEM-REF operand the compiler can prove is in the region (a constant,
+;;;     or constant + index) compiles as the real address (%CONV-ADDR-FORM);
+;;;   - an address used as a VALUE — returned, stored, passed to %gc-read64 —
+;;;     is written (%conv-addr K) in the source and substituted by %CONV-SUBST
+;;;     before the form is compiled, because a compile-time rule cannot see an
+;;;     address that reaches a MEM-REF through a variable or a call;
+;;;   - hand-emitted IR, the translator and the boot stub call CONV-REAL.
+;;;
+;;; Proven accesses also carry +WIDTH-CONV-BIT+.  Under option B nothing has
+;;; to act on it — the address is already real — so every back-end masks it;
+;;; it records intent for a future base-register back-end (option A, the route
+;;; if iOS forces true PIC) and for the MODUS_CONV_AUDIT report.
+(defconstant +conv-region-base+ #x10000000
+  "First address of the runtime-data region; the delta is measured from here.")
+
+(defconstant +conv-region-low+ #x0F000000
+  "Lowest address that moves WITH the region.  The 16 MB below
+   +CONV-REGION-BASE+ is the tail of the ELF's BSS, and runtime code parks
+   scratch pages there (save-image's restore staging page at 0x0FF00000,
+   hosted-storage's block scratch at 0x0FC00000).  Linked at 0x400000 the ELF
+   maps that tail; linked high (the hosted layout's :code-base) nothing does,
+   so it moves by the same delta instead of every scratch page finding a new
+   home.  The delta is still measured from +CONV-REGION-BASE+.")
+
+(defconstant +conv-region-end+ #x40000000
+  "End (exclusive) of the runtime-data region.  The hosted aarch64 CLI's BSS
+   tail runs to 0x3C219CF8 (measured from its program header, 2026-09-26), and
+   nothing but that BSS lives in [0x10000000, 0x40000000) on either 64-bit
+   port — the image is below it, the heap far above.  A MEM-REF operand in this
+   range is an address by construction; a bare literal elsewhere need not be
+   (A64 opcodes live at 0x1...), which is why this is decided here, from the
+   operand's ROLE, and never from the number alone.")
+
+(defparameter *conv-relative* nil
+  "Rebase provable runtime-data MEM-REF operands by *CONV-DELTA* and mark them
+   with +WIDTH-CONV-BIT+.  NIL — every image that has not opted in — compiles
+   the historic address and width, so the bytecode is unchanged.  Like *TLS-WINDOW* it has TWO homes: the host build
+   sets it for the image's fixed code, and the image's JIT co-init sets it for
+   code compiled at runtime.  With only one of them on, the two halves of the
+   program would disagree about where the region is.")
+
+(defvar *conv-audit* nil
+  "Host-build instrument.  When a cons, every MEM-REF access compiled while
+   *CONV-RELATIVE* is on adds (function-name address-form marked-p) to its
+   CDR, so a build can report exactly which accesses the rule proved and which
+   it left to the value audit.  NIL in every normal build.")
+
+(defparameter *conv-delta* 0
+  "Where the runtime-data region really is: real = virtual + this.  0 — every
+   image that has not moved it — changes nothing.  A LINK-TIME constant, not a
+   register (docs/macos-hosting.md, option B): the region sits at a fixed VA
+   exactly as the code does, so the compiler rewrites every address it can
+   prove (CONV-REAL), and the boot stub, the translator and the runtime's value
+   literals name the same real addresses.  Two homes, like *CONV-RELATIVE*:
+   the host build and the JIT co-init.  Anything that emits code for ANOTHER
+   image (cross-emit) must bind it to that image's delta, not inherit this
+   one's.")
+
+(defun conv-real (addr)
+  "ADDR moved by the region's delta when it is a virtual runtime-data address;
+   anything else unchanged.  Tolerates an unset *CONV-DELTA* (in-image, where
+   defparameter init thunks do not run) as 0."
+  (let ((d *conv-delta*))
+    (if (and (integerp d) (integerp addr)
+             (>= addr +conv-region-low+) (< addr +conv-region-end+))
+        (+ addr d)
+        addr)))
+
+(defun %conv-const-int (x)
+  "X's value when it is a compile-time integer — a literal, or a DEFCONSTANT
+   symbol the compiler has recorded — else NIL.  Runtime source names region
+   words through constants as well as literals: (mem-ref +mcgc-pin-cfg-...+ ..)."
+  (cond ((integerp x) x)
+        ((and (symbolp x) x (hash-table-p *constants*))
+         (let ((v (gethash (normalize-name x) *constants* :not-found)))
+           (if (integerp v) v nil)))
+        (t nil)))
+
+(defun %conv-in-region-p (x)
+  (let ((v (%conv-const-int x)))
+    (and v (>= v +conv-region-low+) (< v +conv-region-end+))))
+
+(defparameter *hosted-layout* nil
+  "The fixed virtual addresses of a hosted image's OTHER mappings — the heap
+   and the JIT arena — as a plist (:heap-base N :jit-arena-base N).  NIL, or a
+   missing key, means the historic default the caller names.  Like the region
+   delta it is a LINK-TIME layout (docs/macos-hosting.md, option B): the boot
+   stub maps there, and runtime source that must know the number writes
+   (%layout :key default), substituted at compile time.  Two homes: the host
+   build and the JIT co-init.")
+
+(defun hosted-layout (key default)
+  "*HOSTED-LAYOUT*'s value for KEY, else DEFAULT.  Keys compare by name hash so
+   the in-image compiler agrees with the host whatever package read them."
+  (let ((p *hosted-layout*) (h (normalize-name key)) (v default))
+    (loop
+      (when (or (atom p) (atom (cdr p))) (return v))
+      (when (and (symbolp (car p)) (= (normalize-name (car p)) h)
+                 (integerp (cadr p)))
+        (return (cadr p)))
+      (setq p (cddr p)))))
+
+(defun %layout (key default)
+  "Function twin of the %LAYOUT form."
+  (hosted-layout key default))
+
+(defun compile-layout (form env dest)
+  "(%LAYOUT :KEY DEFAULT) — a hosted layout address as a compile-time constant."
+  (unless (and (consp (cdr form)) (symbolp (cadr form))
+               (consp (cddr form)) (integerp (caddr form)) (null (cdddr form)))
+    (error "MVM compiler: %LAYOUT needs a keyword and a literal default, got ~S" form))
+  (compile-form (hosted-layout (cadr form) (caddr form)) env dest))
+
+(defun %conv-rebase-form (form)
+  "FORM with its provable region constant replaced by the real address — the
+   compile-time half of option B.  Called only on forms %CONV-ADDR-FORM-P
+   accepts, so the shapes are a bare constant or (+ K x) / (+ x K)."
+  (cond ((atom form) (conv-real (%conv-const-int form)))
+        ((%conv-in-region-p (cadr form))
+         (list (car form) (conv-real (%conv-const-int (cadr form))) (caddr form)))
+        (t (list (car form) (cadr form) (conv-real (%conv-const-int (caddr form)))))))
+
+(defun %conv-addr-form (form)
+  "The address form to COMPILE for a MEM-REF whose written address is FORM:
+   rebased when the region is relative and FORM is provably in it, FORM
+   otherwise.  The WIDTH is still decided from the written FORM."
+  (if (and *conv-relative* (%conv-addr-form-p form) (%conv-moves-p form))
+      (%conv-rebase-form form)
+      form))
+
+(defun %conv-moves-p (form)
+  "T when rebasing FORM's region constant would change its value — i.e. the
+   region has moved.  Unmoved, the source form is compiled AS WRITTEN: a
+   constant SYMBOL such as +MV-COUNT-ADDR+ does not compile to the same code
+   as its integer, and an unmoved image must stay byte-identical."
+  (let ((k (if (atom form)
+               (%conv-const-int form)
+               (or (and (%conv-in-region-p (cadr form)) (%conv-const-int (cadr form)))
+                   (%conv-const-int (caddr form))))))
+    (and k (not (eql (conv-real k) k)))))
+
+(defun compile-conv-addr (form env dest)
+  "(%CONV-ADDR K) — K must be a literal integer: the REAL address of the
+   runtime-data word whose virtual address is K, as a compile-time constant.
+   This is how runtime source names a region address it uses as a VALUE —
+   returns it, stores it, adds to it — which the MEM-REF rule cannot see."
+  (let ((k (and (null (cddr form)) (%conv-const-int (cadr form)))))
+    (unless k
+      (error "MVM compiler: %CONV-ADDR needs one compile-time integer, got ~S" form))
+    ;; Unmoved: compile the argument as written (see %CONV-MOVES-P).
+    (compile-form (if (eql (conv-real k) k) (cadr form) (conv-real k)) env dest)))
+
+(defun %conv-addr (k)
+  "Function twin of the %CONV-ADDR special form, for any caller that reaches
+   it as a function (the host, APPLY)."
+  (conv-real k))
+
+(defun %conv-addr-form-p (form)
+  "T when FORM is an address the compiler can prove, AT COMPILE TIME, lands in
+   the runtime-data region: a bare constant, or (+ K x) / (+ x K) with K such
+   a constant.  The MV-extras loop is the (+ K x) case:
+   (+ #x10000098 (* i 8)).  NIL is safe in a DIFFERENT sense than for the
+   window — a missed access keeps reading the virtual address, which is wrong
+   once the region moves — so the NIL answers are what *CONV-AUDIT* reports."
+  (cond ((atom form) (%conv-in-region-p form))
+        ((and (consp form) (consp (cdr form)) (consp (cddr form))
+              (null (cdddr form))
+              (symbolp (car form)) (name-eq (car form) "+"))
+         (or (%conv-in-region-p (cadr form))
+             (%conv-in-region-p (caddr form))))
+        (t nil)))
+
 (defun %tls-width (width addr-form)
   "WIDTH, with the thread-local bit set when the window is on and ADDR-FORM is
-   provably a window slot."
-  (if (and *tls-window* (%tls-window-addr-form-p addr-form))
-      (logior width +width-tls-bit+)
-      width))
+   provably a window slot, and the convention-region bit set when the region
+   is relative and ADDR-FORM provably lands in it.  Every window slot is in the
+   region; the two bits are independent and a back-end may honour either."
+  (let ((conv (and *conv-relative* (%conv-addr-form-p addr-form))))
+    (when (and *conv-relative* (consp *conv-audit*))
+      (rplacd *conv-audit*
+              (cons (list *current-function-name* addr-form (if conv t nil))
+                    (cdr *conv-audit*))))
+    (logior width
+            (if (and *tls-window* (%tls-window-addr-form-p addr-form))
+                +width-tls-bit+
+                0)
+            (if conv +width-conv-bit+ 0))))
 
 (defun %mv-width ()
   "Width code for a direct-IR access to the multiple-value buffer.  The sites
    that emit :LI + :LOAD/:STORE by hand (UNWIND-PROTECT saving the MV block
    across its cleanup, TRUNCATE publishing its remainder) name the address as
-   an immediate rather than as a MEM-REF form, so they ask for the bit here
-   instead of going through %TLS-WIDTH."
-  (if *tls-window* +width-u64-tls+ +width-u64+))
+   an immediate rather than as a MEM-REF form, so they ask for the bits here
+   instead of going through %TLS-WIDTH.  The MV buffer is in the runtime-data
+   region, so it carries the convention bit too."
+  (logior (if *tls-window* +width-u64-tls+ +width-u64+)
+          (if *conv-relative* +width-conv-bit+ 0)))
 
 
 ;;; ============================================================
@@ -6471,7 +6690,9 @@
 ;;; *SYM-NAME-TABLE* coverage tightens it further.
 
 (defparameter *hash-dispatch-names*
-  '("WITH-OPEN-STREAM" 
+  '("WITH-OPEN-STREAM" "%CONV-ADDR" "%LAYOUT" "%SET-THREAD-DELTA"
+    "%GC-SAFE-ENTER" "%GC-SAFE-LEAVE" "%GC-COLLECT-NOW"
+    
     "STI" "MUL26HI" "ON" "COMMON-LISP-USER"
     "BEING" "DO" "MAKE-PACKAGE" "MACROLET"
     "PRESENT-SYMBOL" "%MAKE-SYMBOL" "CCASE" "TAGBODY"
@@ -6613,6 +6834,12 @@
        (compile-funcall form env dest))
       ;; --- Special Forms ---
       ((= op-name 338547669)    (compile-quote (cadr form) dest))  ; QUOTE
+      ;; (%CONV-ADDR K): a runtime-data address used as a VALUE — rebased at
+      ;; compile time.  See CONV-REAL and docs/macos-hosting.md.
+      ((= op-name #.(compute-name-hash "%CONV-ADDR"))
+       (compile-conv-addr form env dest))
+      ((= op-name #.(compute-name-hash "%LAYOUT"))
+       (compile-layout form env dest))
       ;; PERF: (typep X 'SIMPLE-TYPE) with a literal standard type name folds
       ;; to the inline predicate at compile time (the runtime TYPEP walks a
       ;; 45-clause chain; standard type names cannot be redefined, CLHS 11.1.2.1.2).
@@ -7630,6 +7857,17 @@
       ;; (%spawn-thread entry stack-top tidptr) — clone(2) a NATIVE OS THREAD.
       ((= op-name (compute-name-hash "%SPAWN-THREAD"))
        (compile-spawn-thread (cdr form) env dest))
+      ;; (%set-thread-delta d) — AArch64's ARCH_SET_FS.
+      ((= op-name #.(compute-name-hash "%SET-THREAD-DELTA"))
+       (compile-set-thread-delta (cdr form) env dest))
+      ;; (%gc-safe-enter) / (%gc-safe-leave) — stop-the-world safe regions.
+      ((= op-name #.(compute-name-hash "%GC-SAFE-ENTER"))
+       (emit-ir :trap #x0542) (emit-ir :mov dest +vreg-v0+))
+      ((= op-name #.(compute-name-hash "%GC-SAFE-LEAVE"))
+       (emit-ir :trap #x0543) (emit-ir :mov dest +vreg-v0+))
+      ;; (%gc-collect-now) — enter the collector, no allocation to follow.
+      ((= op-name #.(compute-name-hash "%GC-COLLECT-NOW"))
+       (emit-ir :trap #x0544) (emit-ir :mov dest +vreg-v0+))
       ;; (%mmap-exec-page size) — PROT_RWX page for the WS4 runtime JIT.
       ((= op-name #.(compute-name-hash "%MMAP-EXEC-PAGE"))
        (compile-mmap-exec (cdr form) env dest))
@@ -10085,7 +10323,11 @@
 (defparameter *promote-forbidden-ops*
   '("LAMBDA" "FLET" "LABELS" "MACROLET" "CATCH" "UNWIND-PROTECT" "HANDLER-CASE"
     "HANDLER-BIND" "RESTART-CASE" "RESTART-BIND" "IGNORE-ERRORS"
-    "WITH-SIMPLE-RESTART" "PROGV" "THE-ENVIRONMENT"))
+    "WITH-SIMPLE-RESTART" "PROGV" "THE-ENVIRONMENT"
+    ;; A coroutine switch keeps only SP, FP, x19 and x27 (translate-aarch64
+    ;; SAVE-CTX, hosted): a local promoted into a register would come back
+    ;; holding whatever the other fiber left in it.
+    "SAVE-CONTEXT"))
 
 (defparameter *promote-loop-ops* '("LOOP" "DOTIMES" "DOLIST" "DO" "DO*"))
 
@@ -11086,9 +11328,10 @@
     (let ((cell (alloc-temp-reg))
           (want (alloc-temp-reg)))
       ;; cell = [+GV-CACHE-ROOT+]  (the cache vector, or 0 before boot built it)
-      (emit-li-tagged cell +gv-cache-root+)
+      (emit-li-tagged cell (conv-real +gv-cache-root+))
       (emit-ir :shr cell cell +fixnum-shift+)
-      (emit-ir :load cell cell (car (memory-width-code :u64)))
+      (emit-ir :load cell cell (%tls-width (car (memory-width-code :u64))
+                                           +gv-cache-root+))
       ;; A raw 0 is a FIXNUM (low bit clear): no vector yet -> miss.
       (emit-ir :li dest 1)
       (emit-ir :test cell dest)
@@ -11222,9 +11465,10 @@
     (let ((w (alloc-temp-reg)))
       ;; w = (mem-ref #x10000DB8 :u32); DEST is the second scratch until the
       ;; result lands in it.
-      (emit-li-tagged dest #x10000DB8)
+      (emit-li-tagged dest (conv-real #x10000DB8))
       (emit-ir :shr dest dest +fixnum-shift+)
-      (emit-ir :load w dest (car (memory-width-code :u32)))
+      (emit-ir :load w dest (%tls-width (car (memory-width-code :u32))
+                                        #x10000DB8))
       (emit-ir :li dest 0)
       (emit-ir :cmp w dest)
       (emit-ir :bne slow)
@@ -11292,12 +11536,28 @@
                (zed (alloc-temp-reg))
                (slow (make-compiler-label))
                (done (make-compiler-label)))
-           (emit-li-tagged tmp #x10000DB8)
+           (emit-li-tagged tmp (conv-real #x10000DB8))
            (emit-ir :shr tmp tmp +fixnum-shift+)
-           (emit-ir :load tmp tmp (car (memory-width-code :u32)))
+           (emit-ir :load tmp tmp (%tls-width (car (memory-width-code :u32))
+                                              #x10000DB8))
            (emit-ir :li zed 0)
            (emit-ir :cmp tmp zed)
            (emit-ir :bne slow)
+           ;; ONLY A FIXNUM OR NIL IS STORED IN PLACE.  Anything else may be,
+           ;; or hold, an in-module lambda (a #x52 closure whose slot 0 is
+           ;; THIS module's bytecode offset), and only the %GV-SET bridge call
+           ;; wraps that in a native trampoline.  Stored raw, it outlived the
+           ;; module: `(setq *fn* (let ((k 7)) (lambda (x) (+ x k))))' and a
+           ;; later form's (funcall *fn* 1) jumped to the offset (x64 and
+           ;; aarch64 alike).  Counters and flags keep the fast path.
+           (let ((fast (make-compiler-label)))
+             (emit-ir :li zed 1)
+             (emit-ir :test dest zed)
+             (emit-ir :beq fast)
+             (emit-ir :mov zed +vreg-vn+)
+             (emit-ir :cmp dest zed)
+             (emit-ir :bne slow)
+             (emit-ir-label fast))
            (emit-ir :li-const tmp (%e2-const-register cell))
            (emit-ir :setcdr tmp dest)
            (emit-ir :br done)
@@ -16289,11 +16549,11 @@
     ;; Save MV count and up to n-mv-slots extra values on the stack.
     ;; These are raw u64 (tagged CL objects), loaded without fixnum shift.
     (let ((mv-temp (alloc-temp-reg)))
-      (emit-ir :li mv-temp +mv-count-addr+)
+      (emit-ir :li mv-temp (conv-real +mv-count-addr+))
       (emit-ir :load mv-temp mv-temp (%mv-width))
       (emit-ir :push mv-temp)
       (dotimes (i n-mv-slots)
-        (emit-ir :li mv-temp (+ +mv-values-addr+ (* i 8)))
+        (emit-ir :li mv-temp (conv-real (+ +mv-values-addr+ (* i 8))))
         (emit-ir :load mv-temp mv-temp (%mv-width))
         (emit-ir :push mv-temp))
       (free-temp-reg))
@@ -16318,11 +16578,11 @@
           (addr-temp (alloc-temp-reg)))
       (loop for i from (1- n-mv-slots) downto 0 do
         (emit-ir :pop mv-temp)
-        (emit-ir :li addr-temp (+ +mv-values-addr+ (* i 8)))
+        (emit-ir :li addr-temp (conv-real (+ +mv-values-addr+ (* i 8))))
         (emit-ir :store addr-temp mv-temp (%mv-width)))
       ;; Restore MV count
       (emit-ir :pop mv-temp)
-      (emit-ir :li addr-temp +mv-count-addr+)
+      (emit-ir :li addr-temp (conv-real +mv-count-addr+))
       (emit-ir :store addr-temp mv-temp (%mv-width))
       (free-temp-reg)
       (free-temp-reg))
@@ -18301,9 +18561,9 @@
             (emit-ir :mod r-temp n-temp dest)
             (emit-ir :pop q-temp)
             ;; MV[0] = remainder, MV-COUNT = 2 (n-temp reused as addr)
-            (emit-ir :li n-temp +mv-values-addr+)
+            (emit-ir :li n-temp (conv-real +mv-values-addr+))
             (emit-ir :store n-temp r-temp (%mv-width))
-            (emit-ir :li n-temp +mv-count-addr+)
+            (emit-ir :li n-temp (conv-real +mv-count-addr+))
             (emit-ir :li r-temp (ash 2 +fixnum-shift+))
             (emit-ir :store n-temp r-temp (%mv-width))
             (emit-ir :mov dest q-temp)
@@ -18352,9 +18612,9 @@
           (emit-ir :mod r-temp n-temp d-temp)
           (emit-ir :pop q-temp)
           ;; MV[0] = remainder, MV-COUNT = 2
-          (emit-ir :li addr-temp +mv-values-addr+)
+          (emit-ir :li addr-temp (conv-real +mv-values-addr+))
           (emit-ir :store addr-temp r-temp (%mv-width))
-          (emit-ir :li addr-temp +mv-count-addr+)
+          (emit-ir :li addr-temp (conv-real +mv-count-addr+))
           (emit-ir :li r-temp (ash 2 +fixnum-shift+))
           (emit-ir :store addr-temp r-temp (%mv-width))
           (emit-ir :mov dest q-temp)
@@ -19740,7 +20000,7 @@
                               (list '+ (list 'bignum-ash hsym 16)
                                        (list 'mem-ref asym :u16)))))
             env dest)))))
-  (compile-form addr-form env dest)
+  (compile-form (%conv-addr-form addr-form) env dest)
   ;; Untag address: logical shift right by 1
   ;; Must use SHR (not SAR) because on 32-bit targets, addresses >= 0x40000000
   ;; have the sign bit set in their tagged representation, and SAR would
@@ -19797,8 +20057,8 @@
            ;; Save value across address evaluation (may involve function calls
            ;; that clobber caller-saved regs including dest)
            (emit-ir :push dest)
-           ;; Compile address
-           (compile-form addr-form env addr-reg)
+           ;; Compile address (rebased when it provably names runtime data)
+           (compile-form (%conv-addr-form addr-form) env addr-reg)
            ;; Restore value
            (emit-ir :pop dest)
            ;; Untag address (logical shift right, not arithmetic — see compile-mem-ref)
@@ -20072,7 +20332,7 @@
   "Compile (%error-handler-active-p) — returns T if handler-case active, NIL otherwise.
    Reads saved RSP at fixed address 0x10000180. Non-zero means active."
   ;; Load the saved RSP from fixed address
-  (emit-ir :li dest #x10000180)
+  (emit-ir :li dest (conv-real #x10000180))
   ;; THIS THREAD's armed frame — see THE PER-THREAD WINDOW.  A thread asking
   ;; "is a handler-case active?" must not be answered about another one.
   (emit-ir :load dest dest (%mv-width))
@@ -20243,6 +20503,17 @@
   (emit-ir :pop +vreg-v1+)
   (emit-ir :pop +vreg-v0+)
   (emit-ir :trap #x0540)
+  (emit-ir :mov dest +vreg-v0+))
+
+(defun compile-set-thread-delta (args env dest)
+  "Compile (%set-thread-delta delta) — install DELTA as THIS thread's
+   per-thread-window delta.  TRAP #x0541.  AArch64 only: it is what x86-64's
+   arch_prctl(ARCH_SET_FS) is to that target (translate-aarch64.lisp, THE
+   PER-THREAD WINDOW, AARCH64), so runtime source reaches it through
+   (%layout-if :a64-threads ...) and no other back-end ever sees the trap.
+   Returns 0."
+  (compile-form (car args) env +vreg-v0+)
+  (emit-ir :trap #x0541)
   (emit-ir :mov dest +vreg-v0+))
 
 (defun compile-mmap-shared (args env dest)
@@ -24222,10 +24493,83 @@
       ;; Return the info and IR for later bytecode emission
       (cons info ir))))
 
+(defun %conv-subst (form)
+  "FORM with every (%CONV-ADDR K) replaced by its integer, sharing structure —
+   the SAME object back when there is none, which is nearly always.
+
+   Why a pre-pass and not only the special form: the compiler reads SOURCE
+   SHAPE before it compiles — the epilogue's MV-count clamp
+   (TAIL-FORM-IS-VALUES-P), MV consumers (%MV-TAIL-CANNOT-SET-COUNT-P), the
+   fixnum-arithmetic inference — and each of those sees an unknown call where
+   a literal was.  Measured: (defun %gc-region-0 () (%conv-addr #x10000040))
+   lost its MV-count store and %GC-SCAN-GLOBALS grew 24% at delta 0.
+   Substituting first makes (%conv-addr K) exactly the literal it stands for."
+  (cond ((atom form) form)
+        ((and (symbolp (car form)) (name-eq (car form) "QUOTE")) form)
+        ((and (symbolp (car form)) (name-eq (car form) "%CONV-ADDR")
+              (consp (cdr form)) (null (cddr form))
+              (%conv-const-int (cadr form)))
+         ;; Unmoved: the argument as written (see %CONV-MOVES-P).
+         (let ((k (%conv-const-int (cadr form))))
+           (if (eql (conv-real k) k) (cadr form) (conv-real k))))
+        ((and (symbolp (car form)) (name-eq (car form) "%LAYOUT")
+              (consp (cdr form)) (symbolp (cadr form))
+              (consp (cddr form)) (integerp (caddr form)) (null (cdddr form)))
+         (hosted-layout (cadr form) (caddr form)))
+        ;; (%LAYOUT-IF :KEY THEN [ELSE]): THEN when the layout gives KEY a
+        ;; non-zero value, else ELSE — chosen HERE, so the arm not taken is
+        ;; never compiled.  That is the point: it lets one runtime source hold
+        ;; an arm another back-end cannot translate (an AArch64-only trap).
+        ((and (symbolp (car form)) (name-eq (car form) "%LAYOUT-IF")
+              (consp (cdr form)) (symbolp (cadr form)) (consp (cddr form)))
+         (%conv-subst (if (eql (hosted-layout (cadr form) 0) 0)
+                          (car (cdddr form))
+                          (caddr form))))
+        (t
+         ;; Walk the spine ITERATIVELY (recursing only into elements): a long
+         ;; unquoted list would otherwise recurse once per element, and an
+         ;; in-image frame is over a kilobyte.
+         (let ((changed nil) (acc nil) (tail form))
+           (loop
+             (when (atom tail) (return))
+             (let ((x (%conv-subst (car tail))))
+               (unless (eq x (car tail)) (setq changed t))
+               (setq acc (cons x acc)))
+             (setq tail (cdr tail)))
+           (if (not changed)
+               form
+               (let ((out tail))
+                 (loop
+                   (when (null acc) (return out))
+                   (setq out (cons (car acc) out))
+                   (setq acc (cdr acc)))))))))
+
+(defun %conv-form-present-p (form)
+  "T when FORM contains a (%CONV-ADDR ...) or (%LAYOUT ...) outside quoted data.  Allocates
+   nothing, so the common case — no such form — costs one walk and no
+   garbage."
+  (let ((tail form))
+    (loop
+      (when (atom tail) (return nil))
+      (let ((x (car tail)))
+        ;; ONE hash of the head, compared against read-time constants.
+        ;; NAME-EQ re-hashes its string argument on every call; this runs on
+        ;; every form the image evaluates, and two NAME-EQs per list head cost
+        ;; 2.7 MB of boot-time allocation (measured with test/region-gc.lisp).
+        (when (and (eq tail form) (symbolp x))
+          (let ((h (normalize-name x)))
+            (when (= h #.(compute-name-hash "QUOTE")) (return nil))
+            (when (= h #.(compute-name-hash "%CONV-ADDR")) (return t))
+            (when (= h #.(compute-name-hash "%LAYOUT")) (return t))
+            (when (= h #.(compute-name-hash "%LAYOUT-IF")) (return t))))
+        (when (and (consp x) (%conv-form-present-p x)) (return t)))
+      (setq tail (cdr tail)))))
+
 (defun mvm-compile-toplevel (form)
   "Compile a top-level form.  Register promotion (see %let-promotion-plan)
    is opportunistic: if a form runs out of temporaries with it on, the form
    is compiled again with promotion inhibited."
+  (when (%conv-form-present-p form) (setq form (%conv-subst form)))
   (if (and (%promote-locals-p) (not *promote-inhibit*))
       (handler-case (%mvm-compile-toplevel-1 form)
         (error (e)

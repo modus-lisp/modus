@@ -80,7 +80,7 @@
         (format t "~%=== THE LOCK IS A FIXED BSS WORD =========================~%")
         (format t "  scheduler lock address ~X~%" addr)
         (chk "and it is +HOSTED-SCHED-LOCK-ADDR+, the word translate-x64 bakes in"
-             addr #x10000FC0)
+             addr (%conv-addr #x10000FC0))
         (chk "BSS zero-fill left it UNLOCKED" w0 0)
 
         (format t "~%=== ACQUIRE AND RELEASE ==================================~%")

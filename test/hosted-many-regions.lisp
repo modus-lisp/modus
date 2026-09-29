@@ -85,7 +85,9 @@
         (format t "~%-- the carve --------------------------------------------~%")
         (chk "threads asked for" (w res #x00) *nthreads*)
         (chk "regions carved" (w res #x08) 16)
-        (chk "metadata scale" (w res #xA0) 1)
+        ;; AArch64 stores the collector's metadata fields <<1 (boot-linux-aarch64
+        ;; *LINUX-AARCH64-GC-METADATA-SHL*), x86-64 raw: the scale says which.
+        (chk "metadata scale" (w res #xA0) (%layout-if :a64-threads 2 1))
         (chk "region-alignment violations" (w res #x30) 0)
         (chk "last violation mask" (w res #x38) 0)
         (format t "  ... region i's from-space = 0x~X + i * 0x~X~%"

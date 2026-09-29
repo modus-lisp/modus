@@ -126,8 +126,8 @@
 ;;; MAP_ANONYMOUS is zero-filled and demand-faulted, so the 1 MB of staging
 ;;; costs one page per CPU that actually moves bytes, not 1 MB of RAM.
 
-(defun %sk-page-slot () #x10000DF0)
-(defun %sk-page-lock () #x10000DF8)
+(defun %sk-page-slot () (%conv-addr #x10000DF0))
+(defun %sk-page-lock () (%conv-addr #x10000DF8))
 
 (defun %sk-cpus ()      16)
 (defun %sk-buf-bytes () 65536)

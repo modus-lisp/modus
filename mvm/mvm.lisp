@@ -761,6 +761,21 @@
 (defconstant +width-u32-tls+ 6)
 (defconstant +width-u64-tls+ 7)
 
+;;; ---- CONVENTION-REGION BIT (bit 3 = "this address is a VIRTUAL address in
+;;; the runtime-data region") ------------------------------------------------
+;;;
+;;; The address operand provably names a word of the runtime-data region
+;;; [+CONV-REGION-BASE+, +CONV-REGION-END+) (compiler.lisp, THE CONVENTION
+;;; REGION).  The compiler has already rebased it to the region's real place,
+;;; so no back-end needs to act on the bit today; it records intent, for the
+;;; audit and for a base-register back-end should one ever be needed.  Unlike
+;;; the TLS bit it
+;;; is NOT masked by every back-end: 68k/arm32/ppc/riscv decode the width with
+;;; a bare ECASE.  So the compiler only sets it when *CONV-RELATIVE* is on,
+;;; and only builds whose back-end masks or implements it turn that on
+;;; (hosted AArch64).  Bits 2 and 3 compose: 8..15 are 0..7 plus this bit.
+(defconstant +width-conv-bit+ 8)
+
 ;;; ============================================================
 ;;; Bytecode Buffer
 ;;; ============================================================

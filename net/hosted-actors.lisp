@@ -158,6 +158,39 @@
       (setf (mem-ref a :u64) 0)
       (setq a (+ a 8)))))
 
+(defun %ha-zero-bytes (start end)
+  "Zero [START,END) exactly: bytes at the unaligned ends, words between."
+  (let ((a start))
+    (loop
+      (when (or (>= a end) (zerop (logand a 7))) (return 0))
+      (setf (mem-ref a :u8) 0)
+      (setq a (+ a 1)))
+    (let ((w (logand end -8)))
+      (when (> w a) (%ha-zero a w) (setq a w)))
+    (loop
+      (when (>= a end) (return 0))
+      (setf (mem-ref a :u8) 0)
+      (setq a (+ a 1)))))
+
+(defun %ha-bitmap-clear (lo hi)
+  "Clear both GC bitmaps (object-start, cons-kind) for heap range [LO,HI).
+   Memory handed to a new owner — a carved region, the lock arena — was region
+   0's heap, and its bits describe region 0's old objects.  A collector that
+   walks the range object by object (stop-the-world, translate-aarch64) takes a
+   stale cons-kind bit at face value and walks into the middle of an object.
+   AArch64 only: nothing else walks that way, and x86-64's bitmaps are laid
+   out differently (its cons-kind base reads 0)."
+  (%layout-if :a64-threads
+    (let ((pb (%gc-bitmap-page-base-exact)))
+      (when (and (> (%gc-bitmap-base) 0) (> (%gc-cons-bitmap-base) 0)
+                 (>= lo pb) (> hi lo))
+        (let ((b0 (ash (- lo pb) -7))
+              (b1 (ash (+ (- hi pb) 127) -7)))
+          (%ha-zero-bytes (+ (%gc-bitmap-base) b0) (+ (%gc-bitmap-base) b1))
+          (%ha-zero-bytes (+ (%gc-cons-bitmap-base) b0) (+ (%gc-cons-bitmap-base) b1))))
+      0)
+    0))
+
 (defun %ha-align-up-to-page-base (a)
   "A rounded UP to the next address congruent to the bitmap page_base modulo
    mvm/gc.lisp's region alignment (1024).  That congruence — not plain
@@ -389,6 +422,26 @@
                           (+ from0 (+ new0 #xD000)))
                 (%ha-zero (+ from0 (+ new0 #x10000))
                           (+ from0 (+ new0 #x12200)))
+                ;; AND EVERYTHING BETWEEN THEM — the whole control area, not a
+                ;; list of the parts somebody has been bitten by so far.  The
+                ;; gaps held the thread-region reports (+0xB000), the per-CPU
+                ;; lock-arena slices (+0xB800) and the ARENA WORDS (+0xBC00),
+                ;; and %RT-ARENA-CARVE reads a non-zero arena end as "already
+                ;; carved".  MEASURED on the AArch64 CLI (432 MB semispaces, so
+                ;; a few flips reach the band): after 200000 conses the end
+                ;; word read 0xDEAD0001, the carve returned "ready", and the
+                ;; locked sections allocated from garbage — SIGSEGV in
+                ;; %LL-SHAPE-MEMO-PUT and a silent exit 2.  72 KB of stores.
+                (%ha-zero (+ from0 new0) (+ from0 (+ new0 #x12200)))
+                ;; AND THEIR BITMAP BITS, both semispaces: everything above
+                ;; NEW0 now belongs to the band and the thread regions.
+                ;; Gated at the CALL, not only inside: on x86-64 the call
+                ;; alone (returning 0) made test/hosted-mutex.lisp hang in
+                ;; about half its runs, so x86-64's %HA-CARVE stays as it was.
+                (%layout-if :a64-threads
+                  (progn (%ha-bitmap-clear (+ from0 new0) (+ from0 size0))
+                         (%ha-bitmap-clear (+ to0 new0) (+ to0 size0)))
+                  0)
                 (setq *ha-band* (+ from0 new0))
                 ;; THE COLLECTOR'S PER-COLLECTION STATE BECOMES PER CPU.  Until
                 ;; this runs, mvm/gc.lisp's three working words are the historic
@@ -407,6 +460,34 @@
 ;;; ============================================================
 
 (defvar *ha-gs-base* 0)   ; the address arch_prctl was last given; 0 = never set
+
+;;; THE TWO THREAD REGISTERS, PER TARGET.  x86-64 has two segment bases, set
+;;; with arch_prctl: GS for the per-CPU block and FS for the per-thread window.
+;;; AArch64 (an image built with the :A64-THREADS layout key) has neither, and
+;;; EL0 cannot touch TPIDR_EL1, so (translate-aarch64.lisp, THE PER-THREAD
+;;; WINDOW, AARCH64): the window delta is TPIDR_EL0 on Linux or a pthread key on
+;;; Darwin, set by %SET-THREAD-DELTA, and the per-CPU block's address is a word
+;;; IN the window, which PERCPU-REF / -SET read.  %LAYOUT-IF picks the arm at
+;;; compile time, so neither back-end ever sees the other's.  Both return 0 on
+;;; success like the syscall.
+
+(defun %arch-set-percpu-base (base)
+  "Make BASE this thread's per-CPU block (x86-64: ARCH_SET_GS)."
+  (%layout-if :a64-threads
+    ;; The exact machine word, as two :u32 halves (a :u64 store deposits
+    ;; val*2), at a LITERAL address so the store is per-thread.
+    (let* ((hi (ash (ash base -16) -16))
+           (lo (- base (* (* hi 65536) 65536))))
+      (setf (mem-ref #x1000FFE8 :u32) lo)
+      (setf (mem-ref #x1000FFEC :u32) hi)
+      0)
+    (syscall3 158 #x1001 base 0)))
+
+(defun %arch-set-thread-delta (delta)
+  "Make DELTA this thread's per-thread-window delta (x86-64: ARCH_SET_FS)."
+  (%layout-if :a64-threads
+    (%set-thread-delta delta)
+    (syscall3 158 #x1002 delta 0)))
 
 ;; CARVE-ON-DEMAND.  Every address hook below goes through this rather than
 ;; reading *HA-BAND* directly, so that a call into net/actors.lisp before
@@ -436,7 +517,7 @@
    to carry a non-zero GS base."
   (if (zerop (%ha-carve))
       -1
-      (let ((r (syscall3 158 #x1001 (%ha-percpu-base) 0)))
+      (let ((r (%arch-set-percpu-base (%ha-percpu-base))))
         (if (zerop r) (setq *ha-gs-base* (%ha-percpu-base)) 0)
         r)))
 
@@ -714,7 +795,7 @@
 ;;; mvm/build-generic-cli.lisp ratchets this literal against that constant, so
 ;;; the two cannot drift apart silently — a drift would deadlock on the first
 ;;; context switch.
-(defun sched-lock-addr ()    #x10000FC0)
+(defun sched-lock-addr ()    (%conv-addr #x10000FC0))
 (defun sched-state-base ()   (+ (%ha-base) #x140))
 (defun scratch-addr ()       (+ (%ha-base) #x180))
 (defun decode-ptr-addr ()    (+ (%ha-base) #x188))

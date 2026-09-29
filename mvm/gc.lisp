@@ -155,8 +155,8 @@
    The :CPU-ID slot is read TAGGED (percpu-ref yields the machine word, and
    that slot holds a tagged fixnum), so the value IS the CPU number."
   (if (= (mem-ref #x10000FF8 :u32) 0)
-      #x10000F08
-      (+ #x10000F08 (* (percpu-ref 16) 8))))
+      (%conv-addr #x10000F08)
+      (+ (%conv-addr #x10000F08) (* (percpu-ref 16) 8))))
 
 (defun %gc-region ()
   "Raw byte address of the ACTIVE region's control block; 0 means region 0."
@@ -164,7 +164,7 @@
     (let ((lo (mem-ref cell :u32))
           (hi (mem-ref (+ cell 4) :u32)))
       (if (= hi 0)
-          (if (= lo 0) #x10000040 lo)
+          (if (= lo 0) (%conv-addr #x10000040) lo)
           (+ (* (* hi 65536) 65536) lo)))))
 
 (defun %gc-set-region (base)
@@ -176,7 +176,7 @@
       (setf (mem-ref cell :u32) lo)
       (setf (mem-ref (+ cell 4) :u32) hi))))
 
-(defun %gc-region-0 () #x10000040)
+(defun %gc-region-0 () (%conv-addr #x10000040))
 
 ;;; ============================================================
 ;;; GC Metadata Field Accessors
@@ -231,7 +231,7 @@
 ;;; SLOT MAP — keep in lock-step with the emitter's copy, which uses bare
 ;;; literals at the emit sites.  All six live in the 0x10000EA8..0x10001000 gap
 ;;; boot/boot-rpi-cl.lisp documents, clear of 0x10000F00 (RPi DTB pointer),
-;;; 0x10000F10 (JIT constvec root) and 0x10000FF0 (call-thunk x30 save):
+;;; 0x10000FD0 (JIT constvec root) and 0x1000FFF0 (call-thunk x30 save):
 ;;;
 ;;;   0x10000F20  start   CNTVCT at collection entry (collector scratch)
 ;;;   0x10000F28  total   sum of pause ticks
@@ -261,13 +261,17 @@
 ;;; readable (the metadata window is mapped well past 0x10001000 on both) and
 ;;; read 0, meaning "not instrumented on this target" — NOT "no collections".
 ;;; %GC-COUNT is the portable one.
+;;;
+;;; WITH THREADS (the :A64-THREADS layout) the words move to 0x1000FF00..FF30:
+;;; 0x10000F20..F58 are CPU 3..10's cells in the per-CPU active-region table.
+;;; See translate-aarch64.lisp A64-GC-STAT-ADDR, which the emitter uses.
 
-(defun %gc-stat-total-ticks () (mem-ref #x10000F28 :u64))
-(defun %gc-stat-max-ticks   () (mem-ref #x10000F30 :u64))
-(defun %gc-stat-last-ticks  () (mem-ref #x10000F38 :u64))
-(defun %gc-stat-total-bytes () (mem-ref #x10000F40 :u64))
-(defun %gc-stat-last-bytes  () (mem-ref #x10000F48 :u64))
-(defun %gc-stat-base-count  () (mem-ref #x10000F50 :u64))
+(defun %gc-stat-total-ticks () (mem-ref (%layout-if :a64-threads #x1000FF08 #x10000F28) :u64))
+(defun %gc-stat-max-ticks   () (mem-ref (%layout-if :a64-threads #x1000FF10 #x10000F30) :u64))
+(defun %gc-stat-last-ticks  () (mem-ref (%layout-if :a64-threads #x1000FF18 #x10000F38) :u64))
+(defun %gc-stat-total-bytes () (mem-ref (%layout-if :a64-threads #x1000FF20 #x10000F40) :u64))
+(defun %gc-stat-last-bytes  () (mem-ref (%layout-if :a64-threads #x1000FF28 #x10000F48) :u64))
+(defun %gc-stat-base-count  () (mem-ref (%layout-if :a64-threads #x1000FF30 #x10000F50) :u64))
 
 (defun %gc-stat-count ()
   "Collections COVERED by the current tick/byte totals, i.e. since the last
@@ -284,13 +288,13 @@
    %GC-COUNT itself is deliberately NOT zeroed — it is the shared cross-target
    counter and mvm-eval keys its JIT re-bake on it.  0x10000F50 records where
    it stood instead, which is what makes %GC-STAT-COUNT honest."
-  (setf (mem-ref #x10000F50 :u64) (%gc-count))
-  (setf (mem-ref #x10000F20 :u64) 0)
-  (setf (mem-ref #x10000F28 :u64) 0)
-  (setf (mem-ref #x10000F30 :u64) 0)
-  (setf (mem-ref #x10000F38 :u64) 0)
-  (setf (mem-ref #x10000F40 :u64) 0)
-  (setf (mem-ref #x10000F48 :u64) 0)
+  (setf (mem-ref (%layout-if :a64-threads #x1000FF30 #x10000F50) :u64) (%gc-count))
+  (setf (mem-ref (%layout-if :a64-threads #x1000FF00 #x10000F20) :u64) 0)
+  (setf (mem-ref (%layout-if :a64-threads #x1000FF08 #x10000F28) :u64) 0)
+  (setf (mem-ref (%layout-if :a64-threads #x1000FF10 #x10000F30) :u64) 0)
+  (setf (mem-ref (%layout-if :a64-threads #x1000FF18 #x10000F38) :u64) 0)
+  (setf (mem-ref (%layout-if :a64-threads #x1000FF20 #x10000F40) :u64) 0)
+  (setf (mem-ref (%layout-if :a64-threads #x1000FF28 #x10000F48) :u64) 0)
   t)
 
 (defun %gc-stats ()
@@ -544,7 +548,7 @@
    per-CPU gate is on.  See the block comment above."
   (let ((b (mem-ref #x10000EC8 :u64)))
     (if (= b 0)
-        #x10000100
+        (%conv-addr #x10000100)
         (if (= (mem-ref #x10000FF8 :u32) 0)
             b
             (+ b (* (percpu-ref 16) 32))))))
@@ -630,8 +634,30 @@
    native alloc-site bit-set would write through a garbage base).  Non-allocating
    (mmap result + config addresses are fixnums)."
   (setf (mem-ref #x10000E00 :u64) (%gc-from-start))
-  (setf (mem-ref #x10000E18 :u64) (%mmap-exec-page #x800000))
-  (setf (mem-ref #x10000E40 :u64) (%mmap-exec-page #x800000)))
+  ;; One bit per 16-byte granule, so a bitmap covers 128x its size: 8 MB for
+  ;; 1 GB of heap — every image before threads came to AArch64.  A layout with
+  ;; a bigger heap (:HEAP-SIZE; the threaded AArch64 CLI maps 1808 MB) gets
+  ;; bitmaps to match: an 8 MB map there ran off its end at the first object
+  ;; past 1 GB and the collector read the neighbouring mapping as bits.
+  (setf (mem-ref #x10000E18 :u64) (%gc-bitmap-map (%gc-bitmap-bytes)))
+  (setf (mem-ref #x10000E40 :u64) (%gc-bitmap-map (%gc-bitmap-bytes))))
+
+(defun %gc-bitmap-bytes ()
+  "Bytes per GC bitmap: 1/128 of the heap mapping (1 GB unless the hosted
+   layout says otherwise), rounded up to 16 KB so it is whole pages anywhere."
+  (let ((heap (%layout :heap-size #x40000000)))
+    (* (ash (+ (ash heap -7) 16383) -14) 16384)))
+
+(defun %gc-bitmap-map (size)
+  "SIZE bytes of zeroed memory for a GC bitmap.  Data, written on every
+   allocation.  Everywhere but Darwin it comes from the exec-page primitive
+   (inside the JIT arena, as it always has).  On Darwin the arena is MAP_JIT:
+   a thread sees it writable OR executable, never both, and the host shim
+   flips the mode on each fault — so a bitmap there would flip twice per
+   allocation.  A plain RW mapping instead (mmap, x86-64 number 9)."
+  (if (= (%layout :darwin 0) 0)
+      (%mmap-exec-page size)
+      (syscall6 9 0 size 3 #x22 -1 0)))
 
 (defun %gc-bit-mask (bit)
   "1 << BIT for BIT in 0..7, as a CONSTANT-ONLY dispatch.
@@ -1084,19 +1110,19 @@
    it does not cover and cannot."
   ;; The global-cell cache vector: compiled special reads load their cell
   ;; through it (prelude %GV-REF-FILL), so it is a root like any other.
-  (let ((fp (%gc-forward-slot #x10000FA0 from-start from-size free-ptr sc)))
+  (let ((fp (%gc-forward-slot (%conv-addr #x10000FA0) from-start from-size free-ptr sc)))
     ;; The globals alist head pointer itself
-    (setq fp (%gc-forward-slot #x10000080 from-start from-size fp sc))
+    (setq fp (%gc-forward-slot (%conv-addr #x10000080) from-start from-size fp sc))
     ;; The symbol intern table head pointer
-    (setq fp (%gc-forward-slot #x10000088 from-start from-size fp sc))
+    (setq fp (%gc-forward-slot (%conv-addr #x10000088) from-start from-size fp sc))
     ;; The keyword intern table (0x10000148) and package-by-hash table
     ;; (0x10000170) are ALSO heap roots — both are hash-tables interned
     ;; into during runtime EVAL.  Missing them stranded keywords/symbols
     ;; in dead from-space after a collection, faulting the next deref.
     ;; (This mirrors the x64 inline trampoline fix in translate-x64.lisp;
     ;; keep the two root sets in sync.)
-    (setq fp (%gc-forward-slot #x10000148 from-start from-size fp sc))
-    (setq fp (%gc-forward-slot #x10000170 from-start from-size fp sc))
+    (setq fp (%gc-forward-slot (%conv-addr #x10000148) from-start from-size fp sc))
+    (setq fp (%gc-forward-slot (%conv-addr #x10000170) from-start from-size fp sc))
     ;; NOTE: the pre-interned signal-condition symbols at 0xCA0/0xCA8/0xCB0
     ;; (%init-signal-symbols) are deliberately NOT scanned: they are
     ;; interned native MVM symbols already forwarded via the symbol intern
@@ -1114,12 +1140,12 @@
     ;; is exact for any plausible count.  Historically this read the halved
     ;; :u64 value and shifted again, yielding count/2 — the extras scan was
     ;; silently short by half.
-    (let ((count (ash (%gc-word-lo +mv-count-addr+) -1)))
+    (let ((count (ash (%gc-word-lo (%conv-addr +mv-count-addr+)) -1)))
       (when (>= count 2)
         (let ((i 0))
           (loop
             (when (>= i (- count 1)) (return))
-            (setq fp (%gc-forward-slot (+ +mv-values-addr+ (* i 8))
+            (setq fp (%gc-forward-slot (+ (%conv-addr +mv-values-addr+) (* i 8))
                                        from-start from-size fp sc))
             (setq i (+ i 1))))))
     fp))
@@ -1413,7 +1439,7 @@
    where boot ASSEMBLY stores it raw.  That is the same split the eight
    control-block fields have, and it has the same answer: the config word
    follows THIS TARGET's metadata convention, so read it in that scale."
-  (%gc-meta-read #x10000E00 (%gc-meta-scale)))
+  (%gc-meta-read (%conv-addr #x10000E00) (%gc-meta-scale)))
 
 (defun %gc-region-align-check (from to size)
   "0 if a region with semispaces at FROM and TO, each SIZE bytes, satisfies the
@@ -1424,13 +1450,18 @@
    read-modify-write word, nothing to align.  Congruence is tested against
    page_base's own low bits rather than by subtraction, so it is correct even
    for a region below page_base (which is itself a bug, but not this one's)."
+  ;; THE UNIT IS PER TARGET.  1024 heap bytes is x86-64's 64-bit BTS.  AArch64
+  ;; sets and clears these bits a BYTE at a time (translate-aarch64's LDRB/STRB
+  ;; in EMIT-AARCH64-GC-SET-BIT; the collector's clears are byte-exact at a
+  ;; region's edges), and one bitmap byte covers 128 heap bytes.
   (if (= (%gc-bitmap-base) 0)
       0
-      (let ((p (logand (%gc-bitmap-page-base-exact) 1023))
-            (v 0))
-        (if (= (logand from 1023) p) 0 (setq v (+ v 1)))
-        (if (= (logand to 1023) p)   0 (setq v (+ v 2)))
-        (if (= (logand size 1023) 0) 0 (setq v (+ v 4)))
+      (let* ((m (%layout-if :a64-threads 127 1023))
+             (p (logand (%gc-bitmap-page-base-exact) m))
+             (v 0))
+        (if (= (logand from m) p) 0 (setq v (+ v 1)))
+        (if (= (logand to m) p)   0 (setq v (+ v 2)))
+        (if (= (logand size m) 0) 0 (setq v (+ v 4)))
         v)))
 
 ;;; THE VIOLATION LEDGER.  %gc-region-init cannot REFUSE a misaligned carve —
@@ -1440,11 +1471,11 @@
 ;;; violation, and the mask of the LAST one, at two BSS words that are zero in
 ;;; every image until something violates the rule.  A test asserts the count is
 ;;; zero; that is what makes this a checked invariant rather than a comment.
-(defun %gc-region-align-violations () (%gc-read64 #x10000ED0))
-(defun %gc-region-align-last ()       (%gc-read64 #x10000ED8))
+(defun %gc-region-align-violations () (%gc-read64 (%conv-addr #x10000ED0)))
+(defun %gc-region-align-last ()       (%gc-read64 (%conv-addr #x10000ED8)))
 (defun %gc-region-align-reset ()
-  (%gc-write64 #x10000ED0 0)
-  (%gc-write64 #x10000ED8 0)
+  (%gc-write64 (%conv-addr #x10000ED0) 0)
+  (%gc-write64 (%conv-addr #x10000ED8) 0)
   0)
 
 (defun %gc-region-init (rcb from to size stack-base k)
@@ -1461,8 +1492,8 @@
     (if (= v 0)
         0
         (progn
-          (%gc-write64 #x10000ED0 (+ (%gc-read64 #x10000ED0) 1))
-          (%gc-write64 #x10000ED8 v))))
+          (%gc-write64 (%conv-addr #x10000ED0) (+ (%gc-read64 (%conv-addr #x10000ED0)) 1))
+          (%gc-write64 (%conv-addr #x10000ED8) v))))
   (%gc-meta-write rcb from k)
   (%gc-meta-write (+ rcb #x08) to k)
   (%gc-meta-write (+ rcb #x10) size k)
@@ -1480,13 +1511,23 @@
    difference is that the region those registers point into now carries its own
    collector state.  Returns the region left, so (%gc-region-enter that) undoes
    it."
+  ;; A LIMIT OF 0 IS A STOP-THE-WORLD CLAMP, NOT A LIMIT (translate-aarch64 /
+  ;; translate-x64, STOP-THE-WORLD FOR REGION 0): a back-edge poll set it so
+  ;; the next allocation parks, after keeping the real limit in the region's
+  ;; +0x38.  Parking the 0 there instead lost the real one, and the next
+  ;; thread into that region — a lock slice, typically — started with no room
+  ;; and COLLECTED the slice, whose objects region-0 tables point at and no
+  ;; slice collection updates (measured on x86-64: an interpreter reading its
+  ;; bytecode as unknown opcodes).  So leave the real limit where it is, and
+  ;; carry the clamp into the region entered.
   (let ((prev (%gc-region))
-        (k (%gc-meta-scale)))
+        (k (%gc-meta-scale))
+        (clamped (zerop (get-alloc-limit))))
     (%gc-meta-write (+ prev #x30) (get-alloc-ptr) k)
-    (%gc-meta-write (+ prev #x38) (get-alloc-limit) k)
+    (unless clamped (%gc-meta-write (+ prev #x38) (get-alloc-limit) k))
     (%gc-set-region rcb)
     (set-alloc-ptr (%gc-meta-read (+ rcb #x30) k))
-    (set-alloc-limit (%gc-meta-read (+ rcb #x38) k))
+    (set-alloc-limit (if clamped 0 (%gc-meta-read (+ rcb #x38) k)))
     prev))
 
 ;;; ------------------------------------------------------------

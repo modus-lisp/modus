@@ -76,8 +76,8 @@
             (when (>= i len) (return s))
             (aset s i (mem-ref (+ addr i) :u8))
             (setq i (+ i 1)))))))
-(defun %argv1 () (%argv-string-at #x10000208))
-(defun %argv2 () (%argv-string-at #x10000248))
+(defun %argv1 () (%argv-string-at (%conv-addr #x10000208)))
+(defun %argv2 () (%argv-string-at (%conv-addr #x10000248)))
 (defun %argc  () (mem-ref #x10000200 :u32))
 ;; AArch64 handler-stack geometry differs from x64 and these observers were
 ;; COPIED FROM THE x64 BUILD UNCHANGED, so they read the wrong memory:
@@ -1172,6 +1172,13 @@
     (setq *setf-expanders* (make-hash-table :test (quote eql))))
   (%init-x64-translator)
   (%init-selfhost-targets)
+  ;; The ELFs --compile / --compile-aarch64 emit are ordinary Linux images
+  ;; with the runtime-data region at its historic place.  THIS image may have
+  ;; moved its own (docs/macos-hosting.md option B); the co-init set the
+  ;; compiler to match, and that must not leak into another image.
+  (setq *conv-relative* nil)
+  (setq *conv-delta* 0)
+  (setq *hosted-layout* nil)
   t)
 (defun %ce-sys-close (fd) (syscall3 3 fd 0 0))
 (defun %ce-slurp-text (path)
@@ -1358,7 +1365,14 @@
 (setf *linux-aarch64-gc-metadata-shl* t)
 (setf *linux-aarch64-gc-midpoint*
       (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_GC_MIDPOINT")))
-        (if (and v (> (length v) 0)) (parse-integer v :radix 16) #x08000000)))
+        (cond ((and v (> (length v) 0)) (parse-integer v :radix 16))
+              ;; WITH THREADS, x86-64's 896 MB semispaces in a 1808 MB
+              ;; mapping (the :HEAP-SIZE hosted-layout-env gives a threaded
+              ;; build): every thread's GC region is carved out of region 0's
+              ;; (net/hosted-actors.lisp %HA-CARVE, 16 MB each, region 0 keeping
+              ;; at least half), so this is what affords all sixteen.
+              (cl-user::*layout-threads* #x38000000)
+              (t #x08000000))))
 (setf *linux-aarch64-r25-offset* *linux-aarch64-gc-midpoint*)
 ;; WS4-AA64 #160 Stage B: emit the object-start-bit SET at every alloc site so
 ;; gc.lisp's %gc-forward-slot / %gc-scan-copied can reject false roots.
@@ -1368,6 +1382,15 @@
 (setf *aarch64-gc-native-mcgc* t)
 (format t "~%  AArch64 GC: ON (NATIVE MCGC)  midpoint=#x~X  metadata-shl=t  bitmap=t~%"
         *linux-aarch64-gc-midpoint*)
+;; docs/macos-hosting.md: the hosted layout (region delta, code / heap / JIT
+;; arena bases, x18) from MODUS_* env vars — mvm/hosted-layout-env.lisp, read
+;; once and shared with the JIT co-init and the ANSI gate.
+(cl-user::apply-layout-host)
+;; MODUS_CONV_AUDIT=<path>: write every MEM-REF access the rule saw — function,
+;; address form, and whether it was proved — for the value audit.
+(let ((ca (sb-ext:posix-getenv "MODUS_CONV_AUDIT")))
+  (when (and ca (plusp (length ca)))
+    (setf *conv-audit* (list :audit))))
 (setf *aarch64-handler-pop-label* nil)
 (setf *aarch64-handler-push-label* nil)
 (setf *aarch64-gc-trampoline-label* nil)
@@ -1396,5 +1419,14 @@
     #+sbcl (sb-ext:run-program "/bin/chmod" (list "+x" path) :wait t)
     (when (string= path "/home/claude/modus-aa64-cli")
       (format t "~%NOTE: wrote the SHARED default path.  Set MODUS_CLI_OUT for any~%      gate or comparison build — the default is outside the worktree, so~%      two agents building at once overwrite each other.~%"))
+    (when (consp *conv-audit*)
+      (let ((ca (sb-ext:posix-getenv "MODUS_CONV_AUDIT")))
+        (with-open-file (o ca :direction :output :if-exists :supersede)
+          (let ((*print-base* 16) (*print-radix* t) (*print-length* nil))
+            (dolist (e (reverse (cdr *conv-audit*)))
+              (format o "~A	~A	~S~%" (if (third e) "PROVED" "VALUE")
+                      (first e) (second e)))))
+        (format t "  conv audit: ~D accesses -> ~A~%"
+                (length (cdr *conv-audit*)) ca)))
     (format t "~%Wrote ~D bytes to ~A~%"
             (length (kernel-image-image-bytes image)) path)))

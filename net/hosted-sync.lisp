@@ -89,8 +89,8 @@
 ;;; block at 0x10000E00.  A grep of every `#x10000xxx' literal in the tree
 ;;; finds nothing between 0x10000DA0 and 0x10000E00.
 
-(defun %thr-page-slot () #x10000DA8)
-(defun %thr-page-lock () #x10000DB0)
+(defun %thr-page-slot () (%conv-addr #x10000DA8))
+(defun %thr-page-lock () (%conv-addr #x10000DB0))
 
 (defun %thr-page ()
   "Raw byte address of the thread page, mapping it on first use.  0 if the
@@ -104,7 +104,10 @@
           (let ((q (%gc-read64 (%thr-page-slot))))
             (if (> q 0)
                 (progn (spin-unlock (%thr-page-lock)) q)
-                (let ((m (%mmap-shared-page 606208)))
+                ;; Both append sixteen window blocks at 0x94000 (see
+                ;; %THR-TLS-BLOCK): 0x11000 bytes each on AArch64, 0x5000 on
+                ;; x86-64.
+                (let ((m (%mmap-shared-page (%layout-if :a64-threads 1720320 933888))))
                   ;; A failed mmap comes back as a small negative (-errno).
                   (if (< m 4096)
                       (progn (spin-unlock (%thr-page-lock)) 0)
@@ -156,9 +159,27 @@
     (if (zerop p) 0 (+ p (+ #x54000 (* cpu #x4000))))))
 
 (defun %thr-tls-block (cpu)
-  "CPU's 4 KB PER-THREAD WINDOW block, or 0 if the page could not be mapped."
+  "CPU's PER-THREAD WINDOW block, or 0 if the page could not be mapped.
+
+   THE WINDOW REACHES PAST ITS FIRST PAGE ON BOTH TARGETS, and each block has
+   to cover all of it:
+   - AArch64: the handler-frame stack at +0x10000 and two words just below it
+     (translate-aarch64.lisp, THE PER-THREAD WINDOW, AARCH64) — 0x11000 bytes.
+   - x86-64 Linux: the handler-frame stack is 512 frames at +0x1000..+0x5000
+     (translate-x64's handler helpers; the 64 in-window frames at +0x408 are
+     bare metal's) — 0x5000 bytes.  These blocks used to be 4 KB apart, so a
+     worker's handler frames landed in the NEXT worker's block, on its
+     multiple-value slots (+0x90) and nargs (+0x150) — measured: every
+     interpreted capturing closure called from two workers at once went wrong
+     within ~20 000 calls (unknown opcodes, stack underflows, wrong results),
+     and the victim was always the even-numbered thread.
+   Both lay their blocks after everything else in the thread page (0x94000)."
   (let ((p (%thr-page)))
-    (if (zerop p) 0 (+ p (+ #x2000 (* cpu #x1000))))))
+    (if (zerop p)
+        0
+        (%layout-if :a64-threads
+          (+ p (+ #x94000 (* cpu #x11000)))
+          (+ p (+ #x94000 (* cpu #x5000)))))))
 
 ;;; ============================================================
 ;;; THE PER-THREAD WINDOW, INSTALLED
@@ -191,7 +212,12 @@
    thread, where nothing ever wrote it."
   (let ((lo (mem-ref #x10000C30 :u32))
         (hi (mem-ref #x10000C34 :u32)))
-    (if (= hi 0) lo (+ (* (* hi 65536) 65536) lo))))
+    (if (= hi 0)
+        lo
+        ;; SIGNED: an AArch64 delta may be negative (see %TLS-INSTALL).
+        (if (>= hi #x80000000)
+            (+ (* (* (- hi 4294967296) 65536) 65536) lo)
+            (+ (* (* hi 65536) 65536) lo)))))
 
 (defun %tls-set-self-base (base)
   "Store BASE as the EXACT machine word in the self slot.  Two :u32 halves,
@@ -218,13 +244,16 @@
    ADDRESSES in the emitted code are unchanged: the segment moves, not the
    literal."
   (let ((b (%thr-tls-block cpu)))
-    (if (or (zerop b) (< b #x10000000))
+    (if (or (zerop b)
+            (and (< b (%conv-addr #x10000000)) (= (%layout-if :a64-threads 0 1) 1)))
         ;; A block BELOW the window base would make the segment base negative,
         ;; i.e. non-canonical, and arch_prctl would refuse it.  Refuse first so
-        ;; the caller sees a decision rather than an errno.
+        ;; the caller sees a decision rather than an errno.  AArch64 adds the
+        ;; delta in a register, where a negative one wraps correctly, and it
+        ;; needs to: macOS maps the thread page BELOW the relocated region.
         1
-        (let* ((delta (- b #x10000000))
-               (r (syscall3 158 #x1002 delta 0)))
+        (let* ((delta (- b (%conv-addr #x10000000)))
+               (r (%arch-set-thread-delta delta)))
           (if (zerop r)
               (progn
                 ;; EMPTY THIS THREAD'S DYNAMIC-BINDING STACK BEFORE ARMING IT.
@@ -249,6 +278,28 @@
    process-wide one.  Reads the self slot THROUGH the window, so a thread that
    has installed one sees its own non-zero base and the main thread sees 0."
   (if (zerop (%tls-self-base)) 0 1))
+
+;;; ON AARCH64 THE PER-CPU POINTER LIVES IN THE WINDOW, so a thread cannot have
+;;; its own per-CPU block without its own window.  On x86-64 the two are
+;;; independent segment bases, and threads started by the older two-thread
+;;; path (%HA-SPAWN-T2, net/hosted-actors-post.lisp) set GS and never FS.  The
+;;; same thread on AArch64 would write its per-CPU pointer into the SPAWNER's
+;;; window, and both would then read one CPU id and one active-region cell.
+;;; So a thread giving itself a non-zero CPU without a window gets one here
+;;; first.  The main thread (CPU 0) keeps the process window, and a thread from
+;;; %THR-TRAMPOLINE has already installed its own.  A last-defun-wins override
+;;; of net/hosted-actors-post.lisp's definition, here because %TLS-INSTALL is
+;;; defined in this file; the x86-64 arm is that definition verbatim.
+(defun %ha-percpu-init-cpu (base cpu)
+  (%layout-if :a64-threads
+    (if (and (> cpu 0) (zerop (%tls-self-base)) (not (zerop (%tls-install cpu))))
+        -1
+        (let ((r (%arch-set-percpu-base base)))
+          (if (zerop r) (percpu-set 16 cpu) 0)
+          r))
+    (let ((r (%arch-set-percpu-base base)))
+      (if (zerop r) (percpu-set 16 cpu) 0)
+      r)))
 
 ;;; ============================================================
 ;;; CLOCKS
@@ -315,6 +366,25 @@
 ;;; SLEEP
 ;;; ============================================================
 
+;;; A BLOCKING SYSCALL IS A STOP-THE-WORLD SAFE REGION.  A thread asleep in
+;;; the kernel cannot reach a safepoint, and a region-0 collector must not
+;;; wait for it; so it publishes its stack first (%GC-SAFE-ENTER) and, awake,
+;;; parks if a collection is under way (%GC-SAFE-LEAVE).  Everything it passes
+;;; the kernel is a raw word — a futex word or a timespec in the thread page,
+;;; never a heap object — so nothing the collector moves is in use while it
+;;; sleeps.  Layout key :STW: the hosted AArch64 and x86-64 CLIs.
+(defun %gc-safe-block-3 (n a b c)
+  (%layout-if :stw (%gc-safe-enter) nil)
+  (let ((r (syscall3 n a b c)))
+    (%layout-if :stw (%gc-safe-leave) nil)
+    r))
+
+(defun %gc-safe-block-6 (n a b c d)
+  (%layout-if :stw (%gc-safe-enter) nil)
+  (let ((r (syscall6 n a b c d 0 0)))
+    (%layout-if :stw (%gc-safe-leave) nil)
+    r))
+
 (defun %nanosleep-at (ts sec nsec)
   "nanosleep(2) for SEC seconds + NSEC nanoseconds, restarting on EINTR with
    the kernel's own remainder, using the caller-supplied 32-byte scratch at TS
@@ -337,7 +407,7 @@
             (%gc-write64 rem 0)
             (%gc-write64 (+ rem 8) 0)
             ;; 35 = SYS_nanosleep on x86-64.
-            (setq r (syscall3 35 req rem 0))
+            (setq r (%gc-safe-block-3 35 req rem 0))
             (when (>= r 0) (return 0))
             ;; -4 = -EINTR.  Anything else is a real error; do not spin on it.
             (when (not (= r -4)) (return 0))
@@ -397,7 +467,7 @@
   "Park this thread on ADDR while the word there still reads VAL.  Returns 0
    if it slept and was woken, -11 (-EAGAIN) if the value had already changed —
    which is not an error but the whole point of the compare-and-park."
-  (syscall6 202 addr 128 val 0 0 0))
+  (%gc-safe-block-6 202 addr 128 val 0))
 
 (defun %futex-wake (addr n)
   "Wake at most N threads parked on ADDR.  Returns the number woken."
@@ -409,7 +479,7 @@
   "FUTEX_WAIT with a RELATIVE TIMEOUT at the 16-byte timespec TS.  Returns 0 if
    it slept and was woken, -110 (-ETIMEDOUT) if the timeout expired, -11
    (-EAGAIN) if the value had already changed.  TS = 0 means no timeout."
-  (syscall6 202 addr 128 val ts 0 0))
+  (%gc-safe-block-6 202 addr 128 val ts))
 
 (defun %futex-timeout-ts ()
   "This CPU's futex-timeout timespec, armed at 20 ms.  0 if the thread page
@@ -1212,11 +1282,11 @@
 ;;;   0x10000DD8 the owner's own region    0x10000DE0 acquisitions
 ;;;   0x10000DE8 acquisitions that had to wait
 
-(defun %rt-gate-addr ()  #x10000DB8)
-(defun %rt-mutex-addr () #x10000DC0)
-(defun %rt-owner-addr () #x10000DC8)
-(defun %rt-depth-addr () #x10000DD0)
-(defun %rt-saved-addr () #x10000DD8)
+(defun %rt-gate-addr ()  (%conv-addr #x10000DB8))
+(defun %rt-mutex-addr () (%conv-addr #x10000DC0))
+(defun %rt-owner-addr () (%conv-addr #x10000DC8))
+(defun %rt-depth-addr () (%conv-addr #x10000DD0))
+(defun %rt-saved-addr () (%conv-addr #x10000DD8))
 
 ;;; ============================================================
 ;;; B-LITE: PER-CPU ALLOCATION SLICES FOR LOCKED SECTIONS
@@ -1274,6 +1344,16 @@
 ;;; a region-0 structure mid-evacuation still races the collector, exactly as
 ;;; it always has.
 ;;;
+;;; NO LONGER IMMORTAL (stop-the-world, :STW layouts): a stop-the-world
+;;; region-0 collection EVACUATES the arena — its live objects move into
+;;; region 0 with every reference updated, and the arena is zeroed and rewound
+;;; (translate-aarch64, EVACUATING THE LOCK ARENA).  An outermost %RT-ENTER
+;;; that finds under a quarter of the arena left starts one
+;;; (%RT-ARENA-REFILL-CHECK); otherwise any region-0 collection does it.
+;;; Measured before: ~31 bytes (x86-64) / ~95 (AArch64) of arena per locked
+;;; INTERN, and a worker interning in a loop filled the 31 MB arena and then
+;;; corrupted memory on the fallback path.
+;;;
 ;;; SLICE EXHAUSTION: an outermost %RT-ENTER refills this CPU's slice from the
 ;;; arena whenever headroom is below 64 KB, so a single locked section has at
 ;;; least that; a section allocating MORE than 64 KB in one hold would run the
@@ -1328,12 +1408,73 @@
                       (%gc-write64 (+ (%rt-arena-words) #x08) (+ af #x100000))
                       blk))))))))
 
+(defun %gc-collect-region-0 ()
+  "Collect REGION 0 now, from any thread, with no allocation in it: point
+   this CPU's region cell at region 0 but keep this thread's own allocation
+   registers, set the limit to the pointer, and enter the collector
+   (%GC-COLLECT-NOW).  With threads armed that is a stop-the-world collection
+   that also EVACUATES THE LOCK ARENA (translate-aarch64 / translate-x64);
+   it leaves region 0's new frontier in region 0's block, where main — or
+   whichever thread has region 0 active — takes it on waking.  Then put the
+   cell and the registers back.  Our own frontier is published first: the
+   collection walks every carved region up to it."
+  (%layout-if :stw
+    (let ((k (%gc-meta-scale))
+          (r0 (%gc-region-0))
+          (own (%gc-region)))
+      (if (= own r0)
+          (progn (set-alloc-limit (get-alloc-ptr)) (%gc-collect-now) 0)
+          (let ((a (get-alloc-ptr))
+                (l (get-alloc-limit)))
+            (%gc-meta-write (+ own #x30) a k)
+            (%gc-set-region r0)
+            (set-alloc-limit a)
+            (%gc-collect-now)
+            (%gc-set-region own)
+            (set-alloc-ptr a)
+            (set-alloc-limit l)
+            0)))
+    0))
+
+(defun %rt-arena-refill-check ()
+  "Before an OUTERMOST lock: with under a quarter of the lock arena left,
+   collect region 0 (%GC-COLLECT-REGION-0), which evacuates the arena and
+   rewinds it.  An evacuation can be skipped (the lock was held at the
+   collection); if the arena is still low afterwards, wait 256 lock entries
+   before trying again rather than collect on every one.  Arena words +0x20
+   is that countdown."
+  (let ((ae (%rt-arena-end)))
+    (when (> ae 0)
+      (let* ((base (%rt-arena-base))
+             (quarter (ash (- ae base) -2)))
+        (when (< (- ae (%rt-arena-alloc)) quarter)
+          (let ((cool (%gc-read64 (+ (%rt-arena-words) #x20))))
+            (if (> cool 0)
+                (%gc-write64 (+ (%rt-arena-words) #x20) (- cool 1))
+                (progn
+                  (%gc-collect-region-0)
+                  (when (< (- ae (%rt-arena-alloc)) quarter)
+                    (%gc-write64 (+ (%rt-arena-words) #x20) 256)))))))))
+  0)
+
 (defun %rt-arena-carve ()
   "Carve the immortal lock arena off the top of region 0's CURRENT from-space,
    once, shrinking region 0's size — and, in the same breath, the live
    allocation limit if region 0 is active and the parked one if it is not —
    so main can never reach it.  1 = arena ready, 0 = heap too small or
-   frontier already past the carve point (both keep today's path)."
+   frontier already past the carve point (both keep today's path).
+
+   COLLECT FIRST, THEN RE-ASK, exactly as %HA-CARVE-ROOM does for the band: a
+   frontier past the carve point usually means only that nothing has collected
+   yet.  Measured on the AArch64 CLI with 432 MB semispaces: boot alone put
+   region 0's frontier past it, so every threaded run lost the arena."
+  (if (= (%rt-arena-carve-1) 1)
+      1
+      (if (= (%gc-region-0) (%gc-region))
+          (progn (%gc-collect-here) (%rt-arena-carve-1))
+          0)))
+
+(defun %rt-arena-carve-1 ()
   (if (> (%rt-arena-end) 0)
       1
       (let* ((k (%gc-meta-scale))
@@ -1343,11 +1484,25 @@
         (if (< size #x6000000)
             0
             (let ((newsize (- size #x2000000)))
-              (if (or (> (%gc-meta-read (+ r0 #x30) k) (+ from newsize))
-                      (and (= r0 (%gc-region))
-                           (> (get-alloc-ptr) (+ from newsize))))
+              ;; The frontier is the LIVE pointer while region 0 is active —
+              ;; its parked word is whatever was last parked, which a
+              ;; collection since then does not rewrite — and the parked one
+              ;; otherwise.
+              (if (if (= r0 (%gc-region))
+                      (> (get-alloc-ptr) (+ from newsize))
+                      (> (%gc-meta-read (+ r0 #x30) k) (+ from newsize)))
                   0
                   (let ((base (%ha-align-up-to-page-base (+ from newsize))))
+                    ;; ZEROED, and its bitmap bits cleared: a stop-the-world
+                    ;; collection walks [base, frontier) object by object, and
+                    ;; the unused tail of every slice must read as nothing, not
+                    ;; as region 0's old objects.  Both walks need the zero:
+                    ;; x86-64's flat walk took a stale word for a pointer and
+                    ;; copied a dead "object" of garbage size (an interpreter
+                    ;; then read its bytecode as unknown opcodes).  The bitmap
+                    ;; clear is AArch64's object walk only.
+                    (%layout-if :stw (%ha-zero base (+ from size)) 0)
+                    (%layout-if :a64-threads (%ha-bitmap-clear base (+ from size)) 0)
                     (%gc-region-shrink r0 newsize k)
                     ;; If main is NOT in region 0 right now (%TL-SELFTEST's
                     ;; shape), the shrink moved no live register; clamp the
@@ -1377,9 +1532,12 @@
           ;; A plain load cannot disturb anything.
           (if (zerop (%gc-read64 (%rt-mutex-addr)))
               0
-              (%gc-write64 #x10000DE8 (+ (%gc-read64 #x10000DE8) 1)))
+              (%gc-write64 (%conv-addr #x10000DE8) (+ (%gc-read64 (%conv-addr #x10000DE8)) 1)))
+          ;; The lock arena running low: refill it BEFORE taking the lock —
+          ;; a collection cannot evacuate it while anyone holds the lock.
+          (%layout-if :stw (%rt-arena-refill-check) 0)
           (%mutex-lock (%rt-mutex-addr))
-          (%gc-write64 #x10000DE0 (+ (%gc-read64 #x10000DE0) 1))
+          (%gc-write64 (%conv-addr #x10000DE0) (+ (%gc-read64 (%conv-addr #x10000DE0)) 1))
           (%gc-write64 (%rt-owner-addr) me)
           (%gc-write64 (%rt-depth-addr) 1)
           ;; PARK MY REGION, TAKE MY SLICE — or, with no arena (small heap,
@@ -1424,6 +1582,28 @@
                 0)))
         0)))
 
+(defun %gc-stw-arm ()
+  "Arm STOP-THE-WORLD for region-0 collections (translate-aarch64, STOP-THE-
+   WORLD FOR REGION 0): publish the band and the region count in the thread
+   table, enrol the main thread as slot 0 (running, its stack top = region 0's
+   stack base, window delta 0), then set the armed word LAST.  A no-op where
+   the layout has no :STW (translate-aarch64 / translate-x64, STOP-THE-WORLD
+   FOR REGION 0)."
+  (%layout-if :stw
+    (let ((tt (%thr-table)))
+      (if (zerop tt)
+          0
+          (let ((r0 (%thr-rec 0)) (k (%gc-meta-scale)))
+            (%gc-write64 (+ tt #x58) (%ha-base))
+            (%gc-write64 (+ tt #x60) (%ha-nregions))
+            (%gc-write64 (+ r0 #x38) 0)
+            (%gc-write64 (+ r0 #x78) (%gc-meta-read (+ (%gc-region-0) #x18) k))
+            (%gc-write64 (+ r0 #x68) 3)
+            (mfence)
+            (%gc-write64 (+ tt #x50) 1)
+            1)))
+    0))
+
 (defun %rt-threads-on ()
   "Declare that more than one thread is about to run Lisp through the shared
    runtime tables.  Returns 1 on success, 0 if the precondition is not met.
@@ -1439,14 +1619,15 @@
         (%gc-write64 (%rt-owner-addr) 0)
         (%gc-write64 (%rt-depth-addr) 0)
         (%mutex-init (%rt-mutex-addr))
-        (%gc-write64 #x10000DE0 0)
-        (%gc-write64 #x10000DE8 0)
+        (%gc-write64 (%conv-addr #x10000DE0) 0)
+        (%gc-write64 (%conv-addr #x10000DE8) 0)
         ;; B-LITE (see the block above %RT-SLICE-BASE): carve the lock arena
         ;; BEFORE the gate opens, so no locked section ever runs against a
         ;; half-carved arena.  A 0 here (small heap, frontier in the way) is
         ;; not a failure — the slice path just never engages and every locked
         ;; section behaves exactly as before this change.
         (%rt-arena-carve)
+        (%gc-stw-arm)
         ;; CLEAR THE MAIN THREAD'S SELF SLOT, on the first switch-on only (the
         ;; gate is still shut, so this is the spawning thread: main).  The
         ;; x64 fault stub records the faulting RIP at 0x10000C30 -- absolute,
@@ -1459,8 +1640,18 @@
         ;; writing that slot once the gate is open (translate-x64).
         (when (= (mem-ref (%rt-gate-addr) :u32) 0)
           (%tls-set-self-base 0))
+        ;; COMPILE AHEAD BEFORE THE GATE OPENS (the block below says why it
+        ;; happens at all).  With the gate open, every locked section
+        ;; allocates from a per-CPU SLICE of the lock arena, and a section
+        ;; that outgrows its slice's 64 KB headroom collects THE SLICE — the
+        ;; B-lite landmine.  Installing a hundred native functions grows and
+        ;; rehashes the symbol-function table inside one such section:
+        ;; measured on the AArch64 CLI, the arena's words came back zeroed
+        ;; and the next toplevel form died TYPE-ERROR.  Nothing is running on
+        ;; a second thread yet, so compiling here loses nothing.
+        (%rt-eager-compile)
         (setf (mem-ref (%rt-gate-addr) :u32) 1)
-        ;; AND COMPILE THE COMPAT SURFACE, because from here on it is hot and
+        ;; (%RT-EAGER-COMPILE, above.)  COMPILE THE COMPAT SURFACE, because from here on it is hot and
         ;; it is BYTECODE.  net/cooperative-atomics.lisp and the SB-* shims
         ;; are baked as SOURCE and evaluated at boot -- they have to be, the
         ;; host owns those package names -- so every function in them is an
@@ -1481,18 +1672,30 @@
         ;; about to call this surface at rate, and it pays once.
         ;; MODUS_NO_EAGER_THREADS=1 is the rollback; a failure to compile is
         ;; not a failure to arm, so it is swallowed.
-        (let ((off (%cli-getenv "MODUS_NO_EAGER_THREADS")))
-          (if (and off (> (length off) 0) (not (string= off "0")))
-              0
-              (handler-case (progn (jit-eager) 0) (t (c) 0))))
         1)))
+
+(defun %rt-eager-compile ()
+  "JIT-EAGER for %RT-THREADS-ON, gate still shut, IN REGION 0.  The native
+   functions it publishes go into process-wide tables, so they must not be
+   allocated in whatever private region the caller is in (%TL-SELFTEST enters
+   one before switching threads on) — that is the cross-region reference the
+   lock otherwise prevents."
+  (let ((off (%cli-getenv "MODUS_NO_EAGER_THREADS")))
+    (if (and off (> (length off) 0) (not (string= off "0")))
+        0
+        (let ((prev (if (= (%gc-region) (%gc-region-0))
+                        0
+                        (%gc-region-enter (%gc-region-0)))))
+          (handler-case (progn (jit-eager) 0) (t (c) 0))
+          (if (zerop prev) 0 (%gc-region-enter prev))
+          0))))
 
 (defun %rt-threads-off ()
   (setf (mem-ref (%rt-gate-addr) :u32) 0)
   0)
 
-(defun %rt-acquisitions () (%gc-read64 #x10000DE0))
-(defun %rt-contended ()    (%gc-read64 #x10000DE8))
+(defun %rt-acquisitions () (%gc-read64 (%conv-addr #x10000DE0)))
+(defun %rt-contended ()    (%gc-read64 (%conv-addr #x10000DE8)))
 
 ;;; ============================================================
 ;;; ACCEPTANCE — TWO THREADS RUNNING REAL LISP AT THE SAME TIME
@@ -1816,8 +2019,11 @@
                           ;; %RT-ENTER would load whatever %GC-REGION-INIT left
                           ;; in region 0's block.
                           (%gc-region-enter rcb2)
-                          (setq g0 (%gc-meta-read (+ r0 #x20) k))
+                          ;; The window opens AFTER bring-up: %RT-THREADS-ON
+                          ;; compiles ahead in region 0 before any second
+                          ;; thread exists, and may collect it doing so.
                           (if (zerop mode) (%rt-threads-on) 0)
+                          (setq g0 (%gc-meta-read (+ r0 #x20) k))
                           (setq tid (%ha-spawn-t2 (%tl-t2-entry)))
                           (%gc-write64 (+ ctl #x48) (%tl-barrier ctl budget))
                           (%tl-run 0)
@@ -2275,6 +2481,32 @@
                          *ha-rsize* stack-top k)
         rcb)))
 
+(defun %escape-describe (c)
+  "A short description of an escaped condition: its type and, when it has
+   them, its format control and arguments."
+  (handler-case
+      (if (%condition-p c)
+          (let ((fc (handler-case (simple-condition-format-control c) (t (c2) nil))))
+            (if fc
+                (format nil "~A (~A ~S)" (%condition-type-name c) fc
+                        (handler-case (simple-condition-format-arguments c) (t (c3) nil)))
+                (format nil "~A" (%condition-type-name c))))
+          (format nil "~S" c))
+    (t (c4) "an unprintable condition")))
+
+(defun %thr-run-body (slot rec)
+  "Run SLOT's body, and let NOTHING escape the thread.  A condition, THROW or
+   cross-unit RETURN-FROM that no frame inside the body claims used to reach
+   the bottom of the stack and LONGJMP through an empty frame to PC 0, killing
+   the process with no word about what escaped.  Report it and end the thread;
+   the thread record counts escapes at +0x60."
+  (handler-case (funcall (aref (%thr-funs) slot))
+    (t (c)
+      (%gc-write64 (+ rec #x60) (+ (%gc-read64 (+ rec #x60)) 1))
+      (format t "~&modus: thread ~D: ~A escaped the thread body (catch tag ~S, active ~S)~%"
+              slot (%escape-describe c) *catch-tag* *catch-active*)
+      0)))
+
 (defun %thr-trampoline ()
   "EVERY thread starts here.  Zero arguments, because the clone stub enters it
    with a bare `call rbx' — see the handshake above for how it learns which
@@ -2289,6 +2521,11 @@
     (%gc-write64 (+ rec #x38) (%tls-self-base))
     ;; 2. its own per-CPU block and CPU id.
     (%ha-percpu-init-cpu (%thr-percpu-base slot) slot)
+    ;; JOIN STOP-THE-WORLD, now that this thread has its own per-CPU block
+    ;; (its collector token is its CPU id): its stack top, then RUNNING and a
+    ;; check of the stop flag — the same handshake as leaving a safe region.
+    (%gc-write64 (+ rec #x78) (+ (%gc-read64 (+ rec #x10)) (%gc-read64 (+ rec #x18))))
+    (%layout-if :stw (%gc-safe-leave) nil)
     (set-current-actor 0)
     (set-idle-flag 0)
     (%gc-write64 (+ rec #x20) slot)
@@ -2312,7 +2549,60 @@
     ;; 4. tell the spawner the slot has been read; it may now start the next.
     (%gc-write64 (+ rec #x28) 1)
     (%gc-write64 (%thr-ack) 1)
-    (funcall (aref (%thr-funs) slot))
+    ;; 5. THE CONDITION AND NON-LOCAL-EXIT STATE IS THIS THREAD'S OWN.
+    ;;    THROW, a cross-unit RETURN-FROM and handler-case dispatch hand the
+    ;;    in-flight exit from frame to frame in plain specials: THROW sets
+    ;;    *CATCH-TAG* / *CATCH-VALUE(S)* / *CATCH-ACTIVE* and longjmps, and each
+    ;;    CATCH or UNWIND-PROTECT on the way READS them to decide whether the
+    ;;    exit is its own or must be re-thrown outward (compile-unwind-protect's
+    ;;    error path).  Shared between threads, one thread's CATCH read
+    ;;    another's tag, re-threw an exit that was its own, and a worker — with
+    ;;    nothing further out — longjmped through an empty frame to PC 0
+    ;;    (sb-thread's condition-broadcast and negative-control sections, on
+    ;;    every target).  So bind them here: a worker's SETQ then lands in its
+    ;;    binding (per-thread dynamic bindings, mvm/prelude.lisp), and the
+    ;;    main thread keeps the globals.  The eval-run state MVM-EVAL-FORMS
+    ;;    saves and restores with SETQ is per-thread for the same reason.
+    ;;    ONLY WITH THE GATE OPEN.  Before a program turns threads on
+    ;;    (%RT-THREADS-ON), bindings are SHALLOW — a LET writes the global and
+    ;;    restores it — so the same LET on eight threads at once would race
+    ;;    the very words it means to isolate.  Those threads run no shared
+    ;;    Lisp state anyway (the bare %MAKE-NATIVE-THREAD selftests).
+    (if (eql (mem-ref #x10000DB8 :u32) 0)
+        (%thr-run-body slot rec)
+        (let ((*current-condition* nil)
+              (*catch-active* nil)
+              (*catch-tag* nil)
+              (*catch-value* nil)
+              (*catch-values* nil)
+              (*handler-bind-stack* nil)
+              (*restart-stack* nil)
+              (*restart-frame-condition-map* nil)
+              (*restart-case-result* nil)
+              (*restart-invoking-p* nil)
+              (*signal-walk-depth* 0)
+              (*handler-bind-effective-skip* 0)
+              (*%escape-report-busy* nil)
+              (*mvm-last-mv* nil)
+              (*jit-native-ran* nil)
+              (*jit-infra-fallback* nil)
+              (*e2-active-defun-names* nil)
+              (*e2-persist-defuns* nil)
+              (*e2-module-defuns* nil)
+              (*mvm-eval-no-cache* nil)
+              (*jit-inhibit* nil))
+          ;; DECLARED, not inferred: this compiler binds a DEFVAR'd name
+          ;; lexically unless the LET says otherwise (build-checks #248).
+          (declare (special *current-condition* *catch-active* *catch-tag*
+                            *catch-value* *catch-values* *handler-bind-stack*
+                            *restart-stack* *restart-frame-condition-map*
+                            *restart-case-result* *restart-invoking-p*
+                            *signal-walk-depth* *handler-bind-effective-skip*
+                            *%escape-report-busy* *mvm-last-mv* *jit-native-ran*
+                            *jit-infra-fallback* *e2-active-defun-names*
+                            *e2-persist-defuns* *e2-module-defuns*
+                            *mvm-eval-no-cache* *jit-inhibit*))
+          (%thr-run-body slot rec)))
     ;; PARK THE ALLOCATION FRONTIER ON THE WAY OUT.  A region's +0x30 is where
     ;; its live heap ends as far as anything outside this thread is concerned;
     ;; until it is parked it still holds the from-space START, and every
@@ -2321,6 +2611,8 @@
     (let ((rcb (%gc-read64 (+ rec #x40))))
       (if (zerop rcb) 0 (%ha-thread-park-region rcb (%gc-read64 (+ rec #x48)))))
     (%gc-write64 (+ rec #x30) 1)
+    ;; LEAVE STOP-THE-WORLD: from here on this thread touches no heap object.
+    (%gc-write64 (+ rec #x68) 0)
     (%gc-write64 (+ rec #x00) 2)
     0))
 
@@ -2396,6 +2688,9 @@
                         (%gc-write64 (+ rec #x30) 0)
                         (%gc-write64 (+ rec #x50) 0)
                         (%gc-write64 (+ rec #x58) 0)
+                        (%gc-write64 (+ rec #x60) 0)
+                        (%gc-write64 (+ rec #x68) 0)      ; not in STW yet
+                        (%gc-write64 (+ rec #x70) 0)
                         ;; ITS HEAP, PREPARED BY THE SPAWNER, BEFORE THE CLONE.
                         ;; The root window's top is the top of the stack just
                         ;; mapped, which only this side knows; and the metadata
@@ -2755,6 +3050,16 @@
             (%gc-write64 (+ res #x00) n)
             (%gc-write64 (+ res #x08) (%ha-nregions))
             (%gc-write64 (+ res #xC0) mode0)
+            ;; COLLECT REGION 0 NOW, while no worker exists.  The spawns below
+            ;; allocate in region 0 (the closures, the first call's compile),
+            ;; and a region-0 collection DURING them runs while the earlier
+            ;; workers are live — the residual race B-LITE documents.  From an
+            ;; empty from-space the spawns cannot fill it.  And COMPILE AHEAD
+            ;; first: %MAKE-NATIVE-THREAD JIT-EAGERs whatever was defined since
+            ;; the last spawn, and the AArch64 in-image translator's garbage
+            ;; alone collected region 0 during the first spawn (measured).
+            (handler-case (jit-eager) (t (c) c))
+            (%gc-collect-here)
             (%gc-write64 (+ res #x20) (%gc-meta-read (+ r0 #x20) (%gc-meta-scale)))
             ;; ---- THIS thread: a real per-CPU block, stamped CPU 0, and only
             ;;      then the mode word.  The order is the one %HA-REGIONS-PERCPU-
@@ -2812,7 +3117,7 @@
                   (let ((rp (%thr-region-report (+ i 1))))
                     (if (= (%gc-read64 (+ rp #x08)) (%ha-rcb (+ i 1)))
                         0 (setq badr (+ badr 1)))
-                    (if (= (%gc-read64 (+ rp #x10)) (+ #x10000F08 (* (+ i 1) 8)))
+                    (if (= (%gc-read64 (+ rp #x10)) (+ (%conv-addr #x10000F08) (* (+ i 1) 8)))
                         0 (setq badc (+ badc 1))))
                   (setq i (+ i 1)))
                 (%gc-write64 (+ res #x88) badr)

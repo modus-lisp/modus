@@ -238,7 +238,7 @@
 ;;; counter 0.  The 263 were all *jit-cv-reject* = 261 (+2 non-const forms):
 ;;; %JIT-CONSTVEC-COVERS-P rejecting every page, because mvm-eval.lisp published
 ;;; the JIT constant vector at x64's root #x10000F00 while the aarch64 back-end
-;;; reads and roots #x10000F10.  Unrooted, the word went stale at the first
+;;; reads and roots #x10000FD0.  Unrooted, the word went stale at the first
 ;;; collection — and %JIT-SYNC-CONSTVEC kept ASETting into that recycled
 ;;; address, which is exactly the "READER-ERROR and TYPE-ERROR spread across six
 ;;; unrelated files" above: wild heap writes from a JIT that never ran a single
@@ -634,7 +634,7 @@
   (setf (mem-ref #x10000D58 :u64) 0)
   (setf (mem-ref #x10000DA0 :u64) 0)
   (setf (mem-ref #x10000F00 :u64) 0)
-  (setf (mem-ref #x10000F10 :u64) 0)
+  (setf (mem-ref #x10000FD0 :u64) 0)
   ;; #286 GC pause-statistics block (start/total/max/last/bytes/lastb).  The
   ;; native collector ACCUMULATES into F28/F30/F40, so garbage here is not a
   ;; wrong first reading, it is a permanently wrong reading.  The Pi gets these
@@ -1786,14 +1786,14 @@
   ;; MODUS_RPI_JIT_BITMAP=0 builds it out for triage.
   ~A
   ;; #282 layer 2: JIT-mode li-const reads the pool object THROUGH the
-  ;; GC-updated constant vector at #x10000F10 instead of baking its heap
+  ;; GC-updated constant vector at #x10000FD0 instead of baking its heap
   ;; address into the instruction stream.  A baked address is only re-baked
   ;; when the seam re-enters the thunk, so a collection that fired WHILE a
   ;; thunk was running left the rest of that run reading stale from-space --
   ;; on the hosted CLI that was a crash after about 5500 loop iterations.
   ;; (NO TILDE IN THIS BLOCK: it is a host FORMAT template, so a tilde is a
   ;; directive -- same class of trap as the no-double-quotes rule.)  The
-  ;; native trampoline scans #x10000F10 as a fixed root (translate-aarch64),
+  ;; native trampoline scans #x10000FD0 as a fixed root (translate-aarch64),
   ;; and this image always uses that trampoline.
   ;;
   ;; ZERO THE ROOT FIRST, and note this is NOT ceremony on bare metal: DRAM
@@ -1801,7 +1801,7 @@
   ;; see the zeroed-DRAM dependency found on the real Pi Zero 2 W).  A garbage
   ;; word here would be read back as a tagged vector and its length taken.
   ;; %jit-constvec treats 0 as no-vector-installed, which is the safe state.
-  (setf (mem-ref #x10000F10 :u64) 0)
+  (setf (mem-ref #x10000FD0 :u64) 0)
   (setq *aarch64-jit-constvec-p* t)
   ;; LINKAGE CELLS: proper CL late binding for out-of-module native CALLs, so a
   ;; callee (re)definition (e.g. reel's -neon.lisp kernels replacing the scalar

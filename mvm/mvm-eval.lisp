@@ -726,7 +726,7 @@
 ;;; ============================================================
 ;;;
 ;;; x64's root is #x10000F00 (*x64-jit-constvec-root*, translate-x64.lisp:99).
-;;; aarch64's is #x10000F10 (*aarch64-jit-constvec-root*, translate-aarch64.lisp
+;;; aarch64's is #x10000FD0 (*aarch64-jit-constvec-root*, translate-aarch64.lisp
 ;;; :208) — deliberately NOT F00, because on bare-metal aarch64 F00 is
 ;;; +rpi-cl-dtb-ptr-slot+ (boot/boot-rpi-cl.lisp:153), the firmware device-tree
 ;;; pointer.  The emitted li-const load reads the per-target root
@@ -759,7 +759,7 @@
 (defun %jit-constvec-root ()
   "The BSS word holding the tagged JIT constant vector FOR THE ACTIVE BACK-END.
    Must equal the translator's own root — *x64-jit-constvec-root* (#x10000F00)
-   or *aarch64-jit-constvec-root* (#x10000F10) — because the emitted li-const
+   or *aarch64-jit-constvec-root* (#x10000FD0) — because the emitted li-const
    load and the collector's fixed-root scan both use that one.
 
    A DEFUN, not a defvar: a defvar initform does not run in-image (Limitation 7)
@@ -767,8 +767,8 @@
    *jit-target-arch* never got set falls back to the x64 slot, which is the
    historical value — i.e. this change is a no-op on x64 by construction."
   (if (and (boundp (quote *jit-target-arch*)) (eq *jit-target-arch* :aarch64))
-      #x10000F10
-      #x10000F00))
+      (%conv-addr #x10000FD0)
+      (%conv-addr #x10000F00)))
 
 (defvar *jit-constvec-cap* nil
   "Allocated length of the JIT constant vector, or NIL before the first sync.")
@@ -995,14 +995,21 @@
     k))
 
 (defun %jit-thunk-emit-tail (addr k idx nargs)
-  "movabs rsi,<tagged idx>; mov dword [0x10000150],nargs+1; movabs rax,bridge; jmp rax"
+  "movabs rsi,<tagged idx>; mov dword fs:[0x10000150],nargs+1; movabs rax,bridge;
+   jmp rax.  THE NARGS SLOT IS PER-THREAD (a window slot, compiler.lisp THE
+   PER-THREAD WINDOW), so the store carries the FS override like every compiled
+   one; FS base 0 — the main thread, an image without threads — is the absolute
+   slot.  Without it a worker's thunk wrote MAIN's nargs and the bridge read
+   the worker's stale one: measured as &rest lists of the wrong length (and a
+   thread returning the tail of an earlier call's argument list) whenever two
+   threads called through bridges."
   (%jit-emit-bytes (+ addr k) (list #x48 #xBE))
   (%jit-write-imm64 addr (+ k 2) (ash idx 1))
-  (%jit-emit-bytes (+ addr k 10) (list #xC7 #x04 #x25 #x50 #x01 #x00 #x10 (+ nargs 1) 0 0 0))
-  (%jit-emit-bytes (+ addr k 21) (list #x48 #xB8))
-  (%jit-write-imm64 addr (+ k 23) (%jit-bridge-entry nargs))
-  (%jit-emit-bytes (+ addr k 31) (list #xFF #xE0))
-  (+ k 33))
+  (%jit-emit-bytes (+ addr k 10) (list #x64 #xC7 #x04 #x25 #x50 #x01 #x00 #x10 (+ nargs 1) 0 0 0))
+  (%jit-emit-bytes (+ addr k 22) (list #x48 #xB8))
+  (%jit-write-imm64 addr (+ k 24) (%jit-bridge-entry nargs))
+  (%jit-emit-bytes (+ addr k 32) (list #xFF #xE0))
+  (+ k 34))
 
 (defun %jit-thunk-fill (addr name nargs)
   (let ((idx *jit-bridge-count*))
@@ -1059,17 +1066,44 @@
     (when (>= nargs 1) (setq k (+ k (%jit-emit-word32 (+ addr k) #xAA0003E1))))  ; mov x1,x0
     k))
 
+(defun %jit-emit-thread-delta-aarch64 (addr k rd scratch)
+  "Emit `Xrd += this thread's window delta' (translate-aarch64's
+   A64-ADD-THREAD-DELTA, as bytes), using SCRATCH; nothing when the image's
+   window is not per-thread.  Returns bytes written.  A thunk that stores to a
+   window slot (nargs, the #'NAME index) must address THIS thread's copy — an
+   absolute store hits the main thread's."
+  (if (not (and (boundp (quote *a64-tls-window*)) *a64-tls-window*))
+      0
+      (let ((n 0)
+            (tsd (and (boundp (quote *a64-tls-tsd-offset*)) *a64-tls-tsd-offset*)))
+        (if tsd
+            (progn
+              (%jit-emit-word32 (+ addr k) (logior #xD53BD060 scratch))       ; mrs x, TPIDRRO_EL0
+              (%jit-emit-word32 (+ addr k 4)                                  ; ldr x, [x, #tsd]
+                                (logior #xF9400000 (ash (ash tsd -3) 10) (ash scratch 5) scratch))
+              (setq n 8))
+            (progn
+              (%jit-emit-word32 (+ addr k) (logior #xD53BD040 scratch))       ; mrs x, TPIDR_EL0
+              (setq n 4)))
+        (%jit-emit-word32 (+ addr k n)                                        ; add rd, rd, x
+                          (logior #x8B000000 (ash scratch 16) (ash rd 5) rd))
+        (+ n 4))))
+
 (defun %jit-thunk-emit-tail-aarch64 (addr k idx nargs)
+  ;; nargs is a PER-THREAD window slot: add this thread's delta to its address
+  ;; (see %JIT-EMIT-THREAD-DELTA-AARCH64 and x64's %JIT-THUNK-EMIT-TAIL).
   (%jit-emit-quad-placeholder (+ addr k) 0)
   (%jit-write-movz-quad addr k (ash idx 1))
-  (%jit-emit-word32 (+ addr k 16) (logior #x52800010 (ash (+ nargs 1) 5)))
-  (%jit-emit-quad-placeholder (+ addr k 20) 17)
-  (%jit-write-movz-quad addr (+ k 20) #x10000150)
-  (%jit-emit-word32 (+ addr k 36) #xB9000230)
-  (%jit-emit-quad-placeholder (+ addr k 40) 16)
-  (%jit-write-movz-quad addr (+ k 40) (%jit-bridge-entry nargs))
-  (%jit-emit-word32 (+ addr k 56) #xD61F0200)
-  (+ k 60))
+  (%jit-emit-quad-placeholder (+ addr k 16) 17)
+  (%jit-write-movz-quad addr (+ k 16) (%conv-addr #x10000150))
+  (let ((j (+ k 32)))
+    (setq j (+ j (%jit-emit-thread-delta-aarch64 addr j 17 16)))
+    (%jit-emit-word32 (+ addr j) (logior #x52800010 (ash (+ nargs 1) 5)))   ; movz w16, #nargs+1
+    (%jit-emit-word32 (+ addr j 4) #xB9000230)                              ; str w16, [x17]
+    (%jit-emit-quad-placeholder (+ addr j 8) 16)
+    (%jit-write-movz-quad addr (+ j 8) (%jit-bridge-entry nargs))
+    (%jit-emit-word32 (+ addr j 24) #xD61F0200)                             ; br x16
+    (+ j 28)))
 
 (defun %jit-thunk-fill-aarch64 (addr name nargs)
   (let ((idx *jit-bridge-count*))
@@ -1109,7 +1143,9 @@
 ;;;
 ;;; Reentrancy: the slot is written by the thunk immediately before the branch
 ;;; and read by the bridge's body before it makes any call; nothing intervenes
-;;; (cooperative, single-threaded).  Slot #x10000178 is the free 8 bytes in the
+;;; on one thread, and the slot is PER-THREAD (an AArch64 window offset,
+;;; compiler.lisp %TLS-WINDOW-A64-OFFSET-P; the thunk adds its thread's delta)
+;;; so two threads cannot trade indices.  Slot #x10000178 is the free 8 bytes in the
 ;;; convention block (#x150 nargs … #x1D0 all taken; #x1F0 is the write-char
 ;;; scratch).  One thunk per NAME, cached, so `#'foo` from many pages shares an
 ;;; address.  Layout (14 words, in a 96-byte slot):
@@ -1118,7 +1154,7 @@
 ;;;   str  w17, [x16]                    B9000211
 ;;;   movz/movk x16 <- bridge-any entry  4 words
 ;;;   br   x16                           D61F0200
-(defun %jit-fnaddr-idx-slot () #x10000178)
+(defun %jit-fnaddr-idx-slot () (%conv-addr #x10000178))
 (defvar *jit-fnaddr-thunks* nil "Alist NAME-string -> thunk address (one per name).")
 (defun %jit-bridge-any (&rest args)
   "Late-bound target of a #'NAME value thunk: resolve the name whose index the
@@ -1147,9 +1183,10 @@
   (- (%val->word (symbol-function (quote %jit-bridge-any))) 3))
 (defun %jit-fnaddr-thunk-cache-slot (addr)
   "Byte offset of the cached native target inside a #'NAME thunk (the 96-byte
-   slot is 16-aligned, so +72 is an 8-aligned data word after the 68 bytes
-   of code).  0 = not cached: take the slow path."
-  (+ addr 72))
+   slot is 16-aligned, so +88 is an 8-aligned data word after the code, which
+   is up to 80 bytes with the per-thread delta).  0 = not cached: take the
+   slow path."
+  (+ addr 88))
 
 (defun %jit-fnaddr-thunk-invalidate (name)
   "A DEFUN / (setf symbol-function) of NAME: drop the cached native target of
@@ -1160,18 +1197,22 @@
     (when h (setf (mem-ref (%jit-fnaddr-thunk-cache-slot (cdr h)) :u64) 0))))
 
 (defun %jit-fnaddr-thunk-fill-aarch64 (addr name)
-  ;; Layout:   0: ldr x16, [pc+72]   cached native target (raw code address)
+  ;; Layout:   0: ldr x16, [pc+88]   cached native target (raw code address)
   ;;           4: cbz x16, +8        not cached -> slow path
   ;;           8: br  x16            direct: args / nargs / LR untouched
   ;;          12: slow: movz/movk x17 <- idx; movz/movk x16 <- slot;
   ;;              str w17,[x16]; movz/movk x16 <- %jit-bridge-any; br x16
-  ;;          72: cache word (8 bytes), 0 until %jit-bridge-any fills it.
+  ;;          88: cache word (8 bytes), 0 until %jit-bridge-any fills it.
+  ;; The index slot is PER-THREAD (%JIT-FNADDR-IDX-SLOT): two threads in two
+  ;; #'NAME thunks at once each pass their own index — the slow path adds this
+  ;; thread's window delta to the slot address, and %JIT-BRIDGE-ANY reads it
+  ;; through the window.
   ;; The cached call costs 3 instructions instead of an &rest cons + APPLY
   ;; per call — (every #'zerop blk) ran the slow path once PER ELEMENT.
   (let ((idx *jit-bridge-count*) (k 0))
     (setf (aref *jit-bridge-names* idx) name)
     (setq *jit-bridge-count* (+ idx 1))
-    (%jit-emit-word32 (+ addr k) #x58000250)          ; ldr x16, [pc, #72]
+    (%jit-emit-word32 (+ addr k) #x580002D0)          ; ldr x16, [pc, #88]
     (setq k (+ k 4))
     (%jit-emit-word32 (+ addr k) #xB4000050)          ; cbz x16, +8
     (setq k (+ k 4))
@@ -1184,6 +1225,7 @@
     (%jit-emit-quad-placeholder (+ addr k) 16)
     (%jit-write-movz-quad addr k (%jit-fnaddr-idx-slot))
     (setq k (+ k 16))
+    (setq k (+ k (%jit-emit-thread-delta-aarch64 addr k 16 9)))   ; x16 += delta (x9 scratch)
     (%jit-emit-word32 (+ addr k) #xB9000211)          ; str w17, [x16]
     (setq k (+ k 4))
     (%jit-emit-quad-placeholder (+ addr k) 16)
@@ -1588,6 +1630,11 @@
   (let ((f (%mvm-resolve-runtime-fn name)))
     (and f (eql (logand (%val->word f) 15) 3))))
 
+(defvar *jit-eager-failed* nil
+  "Module bytecode vectors (EQ) JIT-EAGER already failed to translate; see
+   %JIT-EAGER-ALL.  Boots NIL (a defvar init does not run in-image), which is
+   the right empty value.")
+
 (defun %jit-eager-all ()
   "Translate every registered runtime DEFUN that is still an interpreter
    trampoline to native code and publish it.  Returns (INSTALLED MODULES
@@ -1605,16 +1652,32 @@
         (dolist (m pending)
           (when (not (member (car m) done :test (function eq)))
             (setq done (cons (car m) done))
-            (let ((je (%jit-translate-page (car m) (cadr m) (reverse (caddr m))
-                                           (car (cddddr m)))))
-              (if (and je (cadr (cddddr je)))
-                  (progn
-                    (setq modules (+ modules 1))
-                    (setq installed
-                          (+ installed
-                             (%jit-install-native-fns (car je) (cadr (cddddr je))
-                                                      (car (cddr (cddddr m)))))))
-                  (setq failed (+ failed 1))))))
+            ;; A MODULE THAT FAILED ONCE IS NOT RETRIED.  Nothing about it has
+            ;; changed (its bytecode is immutable), so it fails again — and a
+            ;; failing translation is not cheap: MEASURED on the AArch64 CLI,
+            ;; re-attempting its 19 untranslatable modules cost 140 MB of
+            ;; region-0 garbage per JIT-EAGER, and %MAKE-NATIVE-THREAD calls
+            ;; JIT-EAGER on every spawn.  That garbage collected region 0 under
+            ;; running workers (docs/macos-hosting.md, sb-thread).  The count
+            ;; still reports them, so the answer is unchanged.
+            (if (member (car m) *jit-eager-failed* :test (function eq))
+                (setq failed (+ failed 1))
+                (let ((je (%jit-translate-page (car m) (cadr m) (reverse (caddr m))
+                                               (car (cddddr m)))))
+                  (if (and je (cadr (cddddr je)))
+                      (progn
+                        (setq modules (+ modules 1))
+                        (setq installed
+                              (+ installed
+                                 (%jit-install-native-fns (car je) (cadr (cddddr je))
+                                                          (car (cddr (cddddr m)))))))
+                      (progn
+                        (setq failed (+ failed 1))
+                        ;; OFF-MAIN, DO NOT RECORD: the cons would be a worker
+                        ;; object in a region-0 list (%MVM-ON-MAIN-THREAD-P).
+                        (when (%mvm-on-main-thread-p)
+                          (setq *jit-eager-failed*
+                                (cons (car m) *jit-eager-failed*)))))))))
         (when (> installed 0) (%jit-retry-drain))
         (list installed modules failed))))
 
@@ -2955,7 +3018,79 @@
       (%mvm-eval-forms-nested-in-static-build forms)
       (%mvm-eval-forms-1 forms)))
 
+;;; ============================================================
+;;; THE EVAL LOCK — one compiler at a time
+;;; ============================================================
+;;;
+;;; The in-image compiler is process-wide state from end to end: the reused
+;;; *MVM-EVAL-BUFFER*, the opcode and constant tables, *UWP-SEQ-COUNTER*, the
+;;; E2 defun bookkeeping, the JIT's page and constant-vector globals.  Two
+;;; threads compiling at once corrupt each other, and they DO compile at once:
+;;; an interpreted closure is compiled on its FIRST CALL (%E2IC-COMPILE, through
+;;; here), so workers started on closures from one toplevel form compile
+;;; concurrently with each other and with main.  MEASURED (sb-thread's mutex
+;;; section, with the thread root reporting escapes): a worker's interpreter
+;;; hit `unknown opcode NIL' — bytecode copied out of the shared buffer while
+;;; another thread was writing it.
+;;;
+;;; So compilation holds a RECURSIVE lock, and only compilation: the lock is
+;;; dropped before the compiled code RUNS (%EVAL-LOCK-DROP-FOR-RUN at both run
+;;; sites), because a run can block — a closure parked in CONDITION-WAIT holding
+;;; the lock would stop the thread that must notify it from evaluating anything.
+;;; It is NOT the runtime-table lock: that one moves allocation into a 64 KB
+;;; slice of the lock arena, and a compile allocates far more than that.
+;;;
+;;; Inert until a program turns threads on (the gate at 0x10000DB8): one load
+;;; and a branch.  Words: 0x10000EB0 lock, 0x10000EB8 owner (this thread's
+;;; window self slot + 1, so main is 1), 0x10000EC0 depth.
+(defun %eval-lock-me () (+ (mem-ref #x10000C30 :u32) 1))
+
+(defun %eval-lock-acquire ()
+  "Take one level; returns the depth now held, or 0 with threads off."
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      0
+      (let ((me (%eval-lock-me)))
+        (if (eql (mem-ref #x10000EB8 :u32) me)
+            (progn (setf (mem-ref #x10000EC0 :u32) (+ (mem-ref #x10000EC0 :u32) 1))
+                   (mem-ref #x10000EC0 :u32))
+            (progn
+              (loop
+                (when (eql (xchg-mem (%conv-addr #x10000EB0) 1) 0) (return 0))
+                ;; Somebody is compiling, which takes milliseconds: give the
+                ;; core away rather than spin it.
+                (syscall3 24 0 0 0))
+              (setf (mem-ref #x10000EB8 :u32) me)
+              (setf (mem-ref #x10000EC0 :u32) 1)
+              1)))))
+
+(defun %eval-lock-release ()
+  (let ((d (- (mem-ref #x10000EC0 :u32) 1)))
+    (setf (mem-ref #x10000EC0 :u32) d)
+    (when (eql d 0)
+      (setf (mem-ref #x10000EB8 :u32) 0)
+      (mfence)
+      (setf (mem-ref #x10000EB0 :u64) 0))
+    d))
+
+(defun %eval-lock-drop-for-run ()
+  "Before running compiled code: give back the level this call took."
+  (if (and (not (eql (mem-ref #x10000DB8 :u32) 0))
+           (eql (mem-ref #x10000EB8 :u32) (%eval-lock-me)))
+      (%eval-lock-release)
+      0))
+
 (defun %mvm-eval-forms-1 (forms)
+  (let ((%depth (%eval-lock-acquire)))
+    (unwind-protect
+        (%mvm-eval-forms-2 forms)
+      ;; Still holding THIS call's level (the compile did not reach a run
+      ;; site: an error, or an early exit) — give it back.
+      (when (and (> %depth 0)
+                 (eql (mem-ref #x10000EB8 :u32) (%eval-lock-me))
+                 (>= (mem-ref #x10000EC0 :u32) %depth))
+        (%eval-lock-release)))))
+
+(defun %mvm-eval-forms-2 (forms)
   ;; In-image: emit integer literals as fixnum-safe :li-halves (set the GLOBAL,
   ;; not a let-binding — compiled LET of a special may not establish a dynamic
   ;; binding the compiler's compile-integer reads).  Native builds never call
@@ -2999,7 +3134,9 @@
       (unless *mvm-eval-cache*
         (setq *mvm-eval-cache* (make-hash-table :test (quote equal))))
       (let ((%hit (gethash forms *mvm-eval-cache*)))
-        (when %hit (return-from mvm-eval-forms (%mvm-eval-run-tuple %hit)))))
+        (when %hit
+          (%eval-lock-drop-for-run)
+          (return-from mvm-eval-forms (%mvm-eval-run-tuple %hit)))))
   (let ((*functions* (make-hash-table :test (quote equal)))
         (*function-table* nil)
         (*constant-table* nil)
@@ -3296,6 +3433,9 @@
             ;; run so fmakunbound honors source order vs the pre-run defun
             ;; installation (see the defvar).  Lexical-save + setq-restore
             ;; (nested mvm-eval during the run saves/restores its own).
+            ;; THE COMPILE IS OVER: drop the eval lock before running (see
+            ;; THE EVAL LOCK).
+            (%eval-lock-drop-for-run)
             (let* ((%adn-saved *e2-active-defun-names*)
                    ;; WS5 #203: the re-execution guard, same as in
                    ;; %mvm-eval-run-tuple.  THIS is the site the doubling was

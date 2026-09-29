@@ -58,13 +58,15 @@
 
 (defun %core-jit-arena-lo ()
   "Base of the fixed JIT exec arena (boot-linux-aarch64.lisp
-   +linux-aarch64-jit-arena-base+).  Arch builds without one override to 0."
-  #x3000000000)
+   +linux-aarch64-jit-arena-base+, overridable per build as the hosted
+   layout's :JIT-ARENA-BASE).  Arch builds without one override to 0."
+  (%layout :jit-arena-base #x3000000000))
 
 (defun %core-jit-bump-slot ()
   "Address of the arena's RAW bump word (the trap reads it).  Hosted aarch64:
-   0x10000F58; the Pi overrides to its own (%jit-exec-bump)."
-  #x10000F58)
+   0x10000F58 (0x1000FF38 with threads: translate-aarch64 A64-GC-STAT-ADDR);
+   the Pi overrides to its own (%jit-exec-bump)."
+  (%layout-if :a64-threads (%conv-addr #x1000FF38) (%conv-addr #x10000F58)))
 
 (defun %core-jit-arena-bump ()
   "Current bump pointer of the arena, or 0 when this process has none.  The
@@ -169,7 +171,7 @@
     (setf (mem-ref (+ hdr 64) :u64) alo)
     (setf (mem-ref (+ hdr 72) :u64) abump)
     (%core-write-all fd hdr 128)
-    (%core-write-all fd #x10000000 4096)
+    (%core-write-all fd (%conv-addr #x10000000) 4096)
     (%core-write-all fd from (- free from))
     (%core-write-all fd (+ (%gc-bitmap-base) boff) blen)
     (%core-write-all fd (+ (%gc-cons-bitmap-base) boff) blen)
@@ -214,13 +216,13 @@
          (base (- from 512))                          ; heap-alloc-start
          (fd (%core-open-in))
          (hdr (+ base 256))                           ; below from_start: never live
-         (stage #x0FF00000))                          ; the io-buf BSS page
+         (stage (%conv-addr #x0FF00000)))             ; the io-buf BSS page
     (when (< fd 0) (%core-die "core: cannot open the core file"))
     (%core-slice fd hdr 128)
     (when (/= (mem-ref hdr :u64) (%core-magic))
       (%core-die "core: not a Modus core file"))
     (when (/= (mem-ref (+ hdr 8) :u64) from)
-      (%core-die "core: heap base differs from this process (stub did not get its fixed mapping)"))
+      (%core-die "core: heap base differs from this process (the core was saved by an image with a different layout, or the stub did not get its fixed mapping)"))
     (when (/= (mem-ref (+ hdr 24) :u64) (%gc-space-size))
       (%core-die "core: heap geometry differs from this image"))
     (let ((free (mem-ref (+ hdr 32) :u64))
@@ -235,22 +237,23 @@
       ;; gc_count land in place; every other word is per-process and is read
       ;; to the staging page instead.  Offsets sum to 0x1000.
       (%core-slice fd stage #x60)
-      (%core-slice fd #x10000060 8)       ; gc_count
+      (%core-slice fd (%conv-addr #x10000060) 8)       ; gc_count
       (%core-slice fd stage #x18)         ; 0x68..0x80: saved sp / regs
-      (%core-slice fd #x10000080 16)      ; globals alist, symbol intern table
+      (%core-slice fd (%conv-addr #x10000080) 16)      ; globals alist, symbol intern table
       (%core-slice fd stage #xB8)         ; 0x90..0x148: mv area, gc temps
-      (%core-slice fd #x10000148 8)       ; keyword intern table
+      (%core-slice fd (%conv-addr #x10000148) 8)       ; keyword intern table
       (%core-slice fd stage #x20)         ; 0x150..0x170: nargs, handler frames
-      (%core-slice fd #x10000170 8)       ; package-by-hash table
-      (%core-slice fd stage #xD98)        ; 0x178..0xF10: argv, bitmap cfg, stats
-      (%core-slice fd #x10000F10 8)       ; JIT constant-vector root
-      (%core-slice fd stage #x88)         ; 0xF18..0xFA0
+      (%core-slice fd (%conv-addr #x10000170) 8)       ; package-by-hash table
+      (%core-slice fd stage #xE28)        ; 0x178..0xFA0: argv, bitmap cfg, stats,
+                                          ; the per-CPU region cells
       ;; The global-cell cache vector + its init guard.  In place, not staged:
       ;; the cells it points at live in the heap slice that follows and are
       ;; restored at the same addresses, so a restored image that dropped this
       ;; word would read every special through the SAVING process's pairs.
-      (%core-slice fd #x10000FA0 16)      ; global-cell cache root + guard
-      (%core-slice fd stage #x50)         ; 0xFB0..0x1000
+      (%core-slice fd (%conv-addr #x10000FA0) 16)      ; global-cell cache root + guard
+      (%core-slice fd stage #x20)         ; 0xFB0..0xFD0
+      (%core-slice fd (%conv-addr #x10000FD0) 8)       ; JIT constant-vector root (aarch64)
+      (%core-slice fd stage #x28)         ; 0xFD8..0x1000
       (%core-slice fd from (- free from))
       (%core-slice fd (+ (%gc-bitmap-base) boff) blen)
       (%core-slice fd (+ (%gc-cons-bitmap-base) boff) blen)

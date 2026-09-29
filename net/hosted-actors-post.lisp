@@ -438,7 +438,7 @@
    and stamp CPU into the :CPU-ID slot at +GC-PERCPU-CPU-ID-OFF+ = 16.  The
    order matters: PERCPU-SET is a GS-relative store, so it can only be issued
    after the base is set.  Returns the kernel's return value (0 = success)."
-  (let ((r (syscall3 158 #x1001 base 0)))
+  (let ((r (%arch-set-percpu-base base)))
     (if (zerop r) (percpu-set 16 cpu) 0)
     r))
 
@@ -455,7 +455,8 @@
    checksum over an empty range is a check that can only ever answer 0.
    Measured: without this the step-5 heap checksum was 0 -> 0."
   (%gc-meta-write (+ rcb #x30) (get-alloc-ptr) k)
-  (%gc-meta-write (+ rcb #x38) (get-alloc-limit) k)
+  ;; 0 is a stop-the-world clamp, not a limit (see %GC-REGION-ENTER).
+  (unless (zerop (get-alloc-limit)) (%gc-meta-write (+ rcb #x38) (get-alloc-limit) k))
   0)
 
 (defun %ha-thread-adopt-region (rcb k)
@@ -1341,10 +1342,10 @@
 ;;; The four words translate-x64's trampoline maintains.  They are BSS, zero in
 ;;; a fresh process, and nothing but the trampoline and these functions touch
 ;;; them.
-(defun %ha-gc-conc-cur ()     (%gc-read64 #x10000EE0))
-(defun %ha-gc-conc-witness () (%gc-read64 #x10000EE8))
-(defun %ha-gc-conc-met ()     (%gc-read64 #x10000EF8))
-(defun %ha-gc-conc-barrier () (%gc-read64 #x10000EF0))
+(defun %ha-gc-conc-cur ()     (%gc-read64 (%conv-addr #x10000EE0)))
+(defun %ha-gc-conc-witness () (%gc-read64 (%conv-addr #x10000EE8)))
+(defun %ha-gc-conc-met ()     (%gc-read64 (%conv-addr #x10000EF8)))
+(defun %ha-gc-conc-barrier () (%gc-read64 (%conv-addr #x10000EF0)))
 
 (defun %ha-set-gc-conc-barrier (n)
   "Arm (N > 0) or disarm (N = 0) the in-collection barrier with a SPIN BUDGET
@@ -1352,14 +1353,14 @@
    until a second collector arrives or the budget is spent.  It is BOUNDED on
    purpose: with collections serialized the second thread can never arrive, so
    a bounded barrier makes that case FAIL AN ASSERTION rather than hang."
-  (%gc-write64 #x10000EF0 n)
+  (%gc-write64 (%conv-addr #x10000EF0) n)
   n)
 
 (defun %ha-gc-conc-reset ()
-  (%gc-write64 #x10000EE0 0)
-  (%gc-write64 #x10000EE8 0)
-  (%gc-write64 #x10000EF0 0)
-  (%gc-write64 #x10000EF8 0)
+  (%gc-write64 (%conv-addr #x10000EE0) 0)
+  (%gc-write64 (%conv-addr #x10000EE8) 0)
+  (%gc-write64 (%conv-addr #x10000EF0) 0)
+  (%gc-write64 (%conv-addr #x10000EF8) 0)
   0)
 
 ;;; THE HAND-BACK.  A worker that has finished and been told to stop returns the
@@ -1916,6 +1917,13 @@
 ;;;   +0x08 from-space +512  (must be 1)   +0x10 to-space +512 (must be 2)
 ;;;   +0x18 size +512        (must be 4)   +0x20 all three     (must be 7)
 ;;;   +0x28 violations counted (must be 4) +0x30 last mask     (must be 7)
+(defun %ha-align-probe ()
+  "An offset that breaks the bitmap alignment unit: half of it.  1024 bytes on
+   x86-64 (64-bit BTS); 128 on AArch64, which sets bits a byte at a time
+   (mvm/gc.lisp %GC-REGION-ALIGN-CHECK) — so 512 would be ALIGNED there and the
+   positive control could not answer non-zero."
+  (%layout-if :a64-threads 64 512))
+
 (defun %ha-align-control ()
   "Returns the block above, or 0 if the band could not be carved.  Leaves the
    violation ledger RESET, so a run of the real acceptance audit after this one
@@ -1931,19 +1939,19 @@
         (%ha-zero out (+ out #x40))
         (%gc-region-align-reset)
         (%gc-write64 (+ out #x00) (%gc-region-align-check f tt s))
-        (%gc-write64 (+ out #x08) (%gc-region-align-check (+ f 512) tt s))
-        (%gc-write64 (+ out #x10) (%gc-region-align-check f (+ tt 512) s))
-        (%gc-write64 (+ out #x18) (%gc-region-align-check f tt (+ s 512)))
+        (%gc-write64 (+ out #x08) (%gc-region-align-check (+ f (%ha-align-probe)) tt s))
+        (%gc-write64 (+ out #x10) (%gc-region-align-check f (+ tt (%ha-align-probe)) s))
+        (%gc-write64 (+ out #x18) (%gc-region-align-check f tt (+ s (%ha-align-probe))))
         (%gc-write64 (+ out #x20)
-                     (%gc-region-align-check (+ f 512) (+ tt 512) (+ s 512)))
+                     (%gc-region-align-check (+ f (%ha-align-probe)) (+ tt (%ha-align-probe)) (+ s (%ha-align-probe))))
         ;; ...and the LEDGER, through %GC-REGION-INIT itself, which is the path
         ;; the acceptance audit actually reads.  An aligned init first, so a
         ;; count of 4 also proves it does not count the good one.
         (%gc-region-init rcb f tt s 0 k)
-        (%gc-region-init rcb (+ f 512) tt s 0 k)
-        (%gc-region-init rcb f (+ tt 512) s 0 k)
-        (%gc-region-init rcb f tt (+ s 512) 0 k)
-        (%gc-region-init rcb (+ f 512) (+ tt 512) (+ s 512) 0 k)
+        (%gc-region-init rcb (+ f (%ha-align-probe)) tt s 0 k)
+        (%gc-region-init rcb f (+ tt (%ha-align-probe)) s 0 k)
+        (%gc-region-init rcb f tt (+ s (%ha-align-probe)) 0 k)
+        (%gc-region-init rcb (+ f (%ha-align-probe)) (+ tt (%ha-align-probe)) (+ s (%ha-align-probe)) 0 k)
         (%gc-write64 (+ out #x28) (%gc-region-align-violations))
         (%gc-write64 (+ out #x30) (%gc-region-align-last))
         (%gc-region-align-reset)

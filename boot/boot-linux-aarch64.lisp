@@ -23,6 +23,13 @@
 (defconstant +linux-aarch64-jit-arena-size+ #x20000000)   ; 512 MB of VA
 (defconstant +linux-aarch64-heap-addr+ #x10000000)
 (defconstant +linux-aarch64-heap-size+ #x38000000)   ; 896 MB
+
+(defun linux-aarch64-heap-size ()
+  "The heap mapping's size for THIS build: +LINUX-AARCH64-HEAP-SIZE+, or the
+   hosted layout's :HEAP-SIZE.  A threaded CLI takes x86-64's geometry (two
+   896 MB semispaces plus the guard), because every thread's region is carved
+   out of region 0's semispace (mvm/hosted-layout-env.lisp)."
+  (hosted-layout :heap-size +linux-aarch64-heap-size+))
 (defconstant +linux-aarch64-heap-alloc-start+ #x200)
 (defconstant +linux-aarch64-gc-midpoint+ #x1C000000)
 
@@ -63,21 +70,21 @@
    geometry leaves less than +linux-aarch64-gc-guard+ of mapped slack above
    the top semispace.  GC-off builds (r25-offset = heap-size, so allocation is
    bounded by the mapping itself and never flips) are exempt."
-  (when (/= *linux-aarch64-r25-offset* +linux-aarch64-heap-size+)
+  (when (/= *linux-aarch64-r25-offset* (linux-aarch64-heap-size))
     (let* ((midpoint *linux-aarch64-gc-midpoint*)
            ;; to_start = base+midpoint, space_size = midpoint - alloc_start,
            ;; so the top semispace ends at base + 2*midpoint - alloc_start.
            (top-end (- (* 2 midpoint) +linux-aarch64-heap-alloc-start+))
-           (slack (- +linux-aarch64-heap-size+ top-end)))
+           (slack (- (linux-aarch64-heap-size) top-end)))
       (when (< slack +linux-aarch64-gc-guard+)
         (error "AArch64 GC arena has no overshoot guard: midpoint #x~X puts the ~
                 top semispace's end at heap+#x~X, only ~D bytes below the ~D MB ~
                 mapping — need at least #x~X (16 MB).  Either raise ~
-                +linux-aarch64-heap-size+ to #x~X or lower the midpoint.  ~
+                (linux-aarch64-heap-size) to #x~X or lower the midpoint.  ~
                 Shipping this is i386 bug B3 (18b223b): every allocation larger ~
                 than the slack that trips :gc-check runs off the mmap and ~
                 SIGSEGVs in its own initialising stores."
-               midpoint top-end slack (ash +linux-aarch64-heap-size+ -20)
+               midpoint top-end slack (ash (linux-aarch64-heap-size) -20)
                +linux-aarch64-gc-guard+
                (+ top-end +linux-aarch64-gc-guard+)))))
   t)
@@ -182,6 +189,31 @@
          (shdrs-offset (+ strtab-offset strtab-len))
          (entry-point (+ load-addr header-total))
          (buf (make-mvm-buffer)))
+    ;; Code linked high must END below where the moved region begins: the
+    ;; ANSI gate's image is ~200 MB, and code at 0x7000000000 overlapping a
+    ;; region at 0x700F000000 would be two MAP_FIXED mappings on one range.
+    (when (and (>= load-addr +conv-region-end+)
+               (> (+ load-addr header-total raw-len #x10000)
+                  (conv-real +conv-region-low+))
+               (< load-addr (conv-real +conv-region-low+)))
+      (error "code #x~X..#x~X overlaps the runtime-data region at #x~X; raise MODUS_CONV_DELTA or lower MODUS_CODE_BASE"
+             load-addr (+ load-addr header-total raw-len #x10000)
+             (conv-real +conv-region-low+)))
+    ;; Code linked LOW must end below the runtime-data region.  The unmoved
+    ;; region starts at 0x10000000 (its scratch pages from 0x0F000000), which
+    ;; leaves 252 MB from 0x400000; the ANSI gate outgrew that (273 MB on
+    ;; origin/main, measured 2026-09-27): its own bytes land on the convention
+    ;; block and it dies at boot reading ASCII as a gate word.  Moved region:
+    ;; refuse.  Unmoved: say so loudly, since the historic gate build relies on
+    ;; not refusing — link it high (docs/macos-hosting.md) to fix it.
+    (when (< load-addr +conv-region-low+)
+      (let ((end (+ load-addr header-total raw-len)))
+        (when (> end +conv-region-low+)
+          (if (eql (conv-real +conv-region-base+) +conv-region-base+)
+              (format t "~&~%  *** WARNING: image #x~X..#x~X overlaps the runtime-data area at #x~X (scratch pages) / #x~X (convention block); it will corrupt itself at boot.  Link it high: MODUS_CODE_BASE (docs/macos-hosting.md). ***~%~%"
+                      load-addr end +conv-region-low+ +conv-region-base+)
+              (error "image #x~X..#x~X overlaps the moved region's old range at #x~X; link the code high (MODUS_CODE_BASE)"
+                     load-addr end +conv-region-low+)))))
     (mvm-emit-byte buf #x7F)
     (mvm-emit-byte buf (char-code #\E))
     (mvm-emit-byte buf (char-code #\L))
@@ -211,8 +243,20 @@
     (mvm-emit-u64 buf load-addr)
     (mvm-emit-u64 buf load-addr)
     (mvm-emit-u64 buf (+ header-total raw-len))
-    (mvm-emit-u64 buf (+ header-total raw-len
-                         (or bss-size +linux-aarch64-heap-size+)))
+    ;; p_memsz: the image plus its BSS tail, which holds the runtime-data
+    ;; region at 0x10000000.  When that region has moved (docs/macos-hosting.md
+    ;; option B) the boot stub maps it at its real base, and the segment ends
+    ;; at +CONV-REGION-LOW+ (0x0F000000) so any access still aimed at the OLD
+    ;; address faults.
+    ;; When the CODE is linked above the old region (the hosted layout's
+    ;; :code-base) there is no BSS tail to keep at all: the segment is the file
+    ;; plus a page of slack.
+    (mvm-emit-u64 buf (cond ((>= load-addr +conv-region-end+)
+                             (+ header-total raw-len #x10000))
+                            ((eql (conv-real +conv-region-base+) +conv-region-base+)
+                             (+ header-total raw-len
+                                (or bss-size (linux-aarch64-heap-size))))
+                            (t (- +conv-region-low+ load-addr))))
     (mvm-emit-u64 buf page-align)     ; 64K on AArch64, 4K elsewhere
     (loop for b across raw-bytes do (mvm-emit-byte buf b))
     (loop for b across shstrtab-bytes do (mvm-emit-byte buf b))
@@ -279,13 +323,47 @@
   ;; LDR x21, [SP, #24]  — argv[2] → x21
   (emit-aarch64-u32 buf #xF9400FF5)
 
+  ;; THE RUNTIME-DATA REGION (docs/macos-hosting.md, option B).  Unmoved
+  ;; (*conv-delta* 0) it is the ELF's own BSS tail and nothing is emitted
+  ;; here.  Moved, the ELF stops at 0x10000000 (wrap-in-elf64-le-aa64) and the
+  ;; region is mapped at its real base FIRST, before any store into it:
+  ;; MAP_FIXED_NOREPLACE so a collision fails loudly instead of clobbering, and
+  ;; exit 97 when the kernel will not give us that address.  Anonymous memory
+  ;; is zeroed, which the ~900 MB BSS tail never reliably was.
+  ;; Also when the CODE is linked high with the region unmoved (delta 0): then
+  ;; there is no ELF BSS tail to hold the region either, so map it at its own
+  ;; (virtual = real) address.  That layout is stock in every respect except
+  ;; code placement, which is what makes it the gate's baseline for a
+  ;; >252 MB image.
+  (when (or (not (eql (conv-real +conv-region-base+) +conv-region-base+))
+            (>= (linux-aarch64-code-base) +conv-region-end+))
+    (emit-aarch64-load-imm64 buf 0 (conv-real +conv-region-low+))
+    (emit-aarch64-load-imm64 buf 1 (- +conv-region-end+ +conv-region-low+))
+    (emit-aarch64-load-imm64 buf 2 3)          ; PROT_READ|WRITE
+    (emit-aarch64-load-imm64 buf 3 #x104022)   ; PRIV|ANON|NORESERVE|FIXED_NOREPLACE
+    (emit-aarch64-load-imm64 buf 4 #xFFFFFFFFFFFFFFFF)
+    (emit-aarch64-load-imm64 buf 5 0)
+    (emit-aarch64-load-imm64 buf 8 222)        ; mmap
+    (modus.mvm::a64-svc buf 0)          ; SVC #0
+    (emit-aarch64-load-imm64 buf 16 (conv-real +conv-region-low+))
+    (emit-aarch64-u32 buf #xEB10001F)          ; CMP x0, x16
+    ;; B.EQ past the exit, patched from where it really ends: a Darwin image's
+    ;; syscall is a five-instruction call, not one SVC.
+    (let ((beq-at (a64-buffer-position buf)))
+      (emit-aarch64-u32 buf 0)                 ; B.EQ <past exit>, patched
+      (emit-aarch64-load-imm64 buf 0 97)       ; exit(97): region not mappable
+      (emit-aarch64-load-imm64 buf 8 93)
+      (modus.mvm::a64-svc buf 0)
+      (setf (aref (a64-buffer-code buf) beq-at)
+            (logior #x54000000 (ash (- (a64-buffer-position buf) beq-at) 5)))))
+
   ;; Store argc as 32-bit at [0x10000200].
-  (emit-aarch64-load-imm64 buf 16 #x10000200)
+  (emit-aarch64-load-imm64 buf 16 (conv-real #x10000200))
   ;; STR w19, [x16, #0]
   (emit-aarch64-u32 buf #xB9000213)
 
   ;; Zero-fill 128 bytes at 0x10000208.
-  (emit-aarch64-load-imm64 buf 16 #x10000208)
+  (emit-aarch64-load-imm64 buf 16 (conv-real #x10000208))
   (dotimes (i 16)
     ;; STR XZR, [x16, #(i*8)]
     (emit-aarch64-u32 buf (logior #xF9000000 (ash i 10) (ash 16 5) 31)))
@@ -297,38 +375,30 @@
   ;; copy, the fixed buffers stay zeroed and `(%parse-decimal-at-fixed-208)`
   ;; returns 0 — *skip-below* / *run-only-below* end up 0, every shard
   ;; runs the full suite, and the per-test range arguments are silently
-  ;; ignored.  Each block is 13 fixed-size instructions; we hand-encode
-  ;; the relative branches (offset19 in word units) below.
-
-  ;; argv[1] → 0x10000208 (max 63 bytes, source already null-terminated)
-  (emit-aarch64-u32 buf #xF100067F)   ; CMP x19, #1
-  (emit-aarch64-u32 buf #x5400018D)   ; B.LE +12 (skip 12 insns to next block)
-  (emit-aarch64-u32 buf #xAA1403E9)   ; MOV x9, x20      (src = argv[1])
-  (emit-aarch64-u32 buf #xD280410A)   ; MOVZ x10, #0x208
-  (emit-aarch64-u32 buf #xF2A2000A)   ; MOVK x10, #0x1000, LSL #16  (dst = 0x10000208)
-  (emit-aarch64-u32 buf #x528007EB)   ; MOVZ w11, #63    (max bytes)
-  (emit-aarch64-u32 buf #x3940012C)   ; LDRB w12, [x9]
-  (emit-aarch64-u32 buf #x340000CC)   ; CBZ w12, +6      (null term → exit loop)
-  (emit-aarch64-u32 buf #x3900014C)   ; STRB w12, [x10]
-  (emit-aarch64-u32 buf #x91000529)   ; ADD x9, x9, #1
-  (emit-aarch64-u32 buf #x9100054A)   ; ADD x10, x10, #1
-  (emit-aarch64-u32 buf #x5100016B)   ; SUB w11, w11, #1
-  (emit-aarch64-u32 buf #x35FFFF4B)   ; CBNZ w11, -6     (back to LDRB)
-
-  ;; argv[2] → 0x10000248 (same shape, different src/dst)
-  (emit-aarch64-u32 buf #xF1000A7F)   ; CMP x19, #2
-  (emit-aarch64-u32 buf #x5400018D)   ; B.LE +12
-  (emit-aarch64-u32 buf #xAA1503E9)   ; MOV x9, x21      (src = argv[2])
-  (emit-aarch64-u32 buf #xD280490A)   ; MOVZ x10, #0x248
-  (emit-aarch64-u32 buf #xF2A2000A)   ; MOVK x10, #0x1000, LSL #16  (dst = 0x10000248)
-  (emit-aarch64-u32 buf #x528007EB)   ; MOVZ w11, #63
-  (emit-aarch64-u32 buf #x3940012C)   ; LDRB w12, [x9]
-  (emit-aarch64-u32 buf #x340000CC)   ; CBZ w12, +6
-  (emit-aarch64-u32 buf #x3900014C)   ; STRB w12, [x10]
-  (emit-aarch64-u32 buf #x91000529)   ; ADD x9, x9, #1
-  (emit-aarch64-u32 buf #x9100054A)   ; ADD x10, x10, #1
-  (emit-aarch64-u32 buf #x5100016B)   ; SUB w11, w11, #1
-  (emit-aarch64-u32 buf #x35FFFF4B)   ; CBNZ w11, -6
+  ;; ignored.  The destination is the region's REAL address, which may take
+  ;; more than the two MOVZ/MOVK words these blocks once hand-encoded, so the
+  ;; B.LE that skips a block is patched from where the block actually ends.
+  (flet ((copy-argv (cmp-insn mov-src dst)
+           (emit-aarch64-u32 buf cmp-insn)
+           (let ((ble-at (a64-buffer-position buf)))
+             (emit-aarch64-u32 buf 0)                ; B.LE <next block>, patched
+             (emit-aarch64-u32 buf mov-src)          ; MOV x9, argv[n]
+             (emit-aarch64-load-imm64 buf 10 (conv-real dst))
+             (emit-aarch64-u32 buf #x528007EB)       ; MOVZ w11, #63    (max bytes)
+             (emit-aarch64-u32 buf #x3940012C)       ; LDRB w12, [x9]
+             (emit-aarch64-u32 buf #x340000CC)       ; CBZ w12, +6      (null term → exit loop)
+             (emit-aarch64-u32 buf #x3900014C)       ; STRB w12, [x10]
+             (emit-aarch64-u32 buf #x91000529)       ; ADD x9, x9, #1
+             (emit-aarch64-u32 buf #x9100054A)       ; ADD x10, x10, #1
+             (emit-aarch64-u32 buf #x5100016B)       ; SUB w11, w11, #1
+             (emit-aarch64-u32 buf #x35FFFF4B)       ; CBNZ w11, -6     (back to LDRB)
+             (setf (aref (a64-buffer-code buf) ble-at)
+                   (logior #x5400000D                ; B.LE
+                           (ash (- (a64-buffer-position buf) ble-at) 5))))))
+    ;; argv[1] → 0x10000208 (max 63 bytes, source already null-terminated)
+    (copy-argv #xF100067F #xAA1403E9 #x10000208)   ; CMP x19, #1 / MOV x9, x20
+    ;; argv[2] → 0x10000248 (same shape, different src/dst)
+    (copy-argv #xF1000A7F #xAA1503E9 #x10000248))  ; CMP x19, #2 / MOV x9, x21
 
   ;; mmap heap:
   ;;   x0=hint=0x10000000, x1=size, x2=PROT_RW(3), x3=MAP_PRIV|ANON(0x22),
@@ -340,26 +410,26 @@
   ;; kernel returns anything else (address taken, or a pre-4.17 kernel that
   ;; ignores the flag and picks its own), fall through to the historical hint
   ;; mmap.  Restore then refuses with `heap base differs' instead of guessing.
-  (emit-aarch64-load-imm64 buf 0 +linux-aarch64-fixed-heap-base+)
-  (emit-aarch64-load-imm64 buf 1 +linux-aarch64-heap-size+)
+  (emit-aarch64-load-imm64 buf 0 (hosted-layout :heap-base +linux-aarch64-fixed-heap-base+))
+  (emit-aarch64-load-imm64 buf 1 (linux-aarch64-heap-size))
   (emit-aarch64-load-imm64 buf 2 3)
   (emit-aarch64-load-imm64 buf 3 #x100022)   ; MAP_PRIV|ANON|FIXED_NOREPLACE
   (emit-aarch64-load-imm64 buf 4 #xFFFFFFFFFFFFFFFF)
   (emit-aarch64-load-imm64 buf 5 0)
   (emit-aarch64-load-imm64 buf 8 222)
-  (emit-aarch64-u32 buf #xD4000001)   ; SVC #0
-  (emit-aarch64-load-imm64 buf 16 +linux-aarch64-fixed-heap-base+)
+  (modus.mvm::a64-svc buf 0)   ; SVC #0
+  (emit-aarch64-load-imm64 buf 16 (hosted-layout :heap-base +linux-aarch64-fixed-heap-base+))
   (emit-aarch64-u32 buf #xEB10001F)   ; CMP x0, x16
   (let ((beq-at (a64-buffer-position buf)))
     (emit-aarch64-u32 buf 0)          ; B.EQ <past the fallback>, patched below
     (emit-aarch64-load-imm64 buf 0 #x10000000)
-    (emit-aarch64-load-imm64 buf 1 +linux-aarch64-heap-size+)
+    (emit-aarch64-load-imm64 buf 1 (linux-aarch64-heap-size))
     (emit-aarch64-load-imm64 buf 2 3)
     (emit-aarch64-load-imm64 buf 3 #x22)
     (emit-aarch64-load-imm64 buf 4 #xFFFFFFFFFFFFFFFF)
     (emit-aarch64-load-imm64 buf 5 0)
     (emit-aarch64-load-imm64 buf 8 222)
-    (emit-aarch64-u32 buf #xD4000001)   ; SVC #0
+    (modus.mvm::a64-svc buf 0)   ; SVC #0
     (setf (aref (a64-buffer-code buf) beq-at)
           (logior #x54000000 (ash (- (a64-buffer-position buf) beq-at) 5))))
   ;; MOV x22, x0  (heap base → x22)
@@ -370,18 +440,18 @@
   ;; sit at the same addresses in every process.  Bump word at 0x10000F58 =
   ;; arena base on success, 0 if the kernel refused (the trap then falls back
   ;; to mmap(NULL)).  MAP_NORESERVE: it is address space, not memory.
-  (emit-aarch64-load-imm64 buf 0 +linux-aarch64-jit-arena-base+)
+  (emit-aarch64-load-imm64 buf 0 (hosted-layout :jit-arena-base +linux-aarch64-jit-arena-base+))
   (emit-aarch64-load-imm64 buf 1 +linux-aarch64-jit-arena-size+)
   (emit-aarch64-load-imm64 buf 2 7)          ; PROT_READ|WRITE|EXEC
   (emit-aarch64-load-imm64 buf 3 #x104022)   ; PRIV|ANON|NORESERVE|FIXED_NOREPLACE
   (emit-aarch64-load-imm64 buf 4 #xFFFFFFFFFFFFFFFF)
   (emit-aarch64-load-imm64 buf 5 0)
   (emit-aarch64-load-imm64 buf 8 222)
-  (emit-aarch64-u32 buf #xD4000001)   ; SVC #0
-  (emit-aarch64-load-imm64 buf 16 +linux-aarch64-jit-arena-base+)
+  (modus.mvm::a64-svc buf 0)   ; SVC #0
+  (emit-aarch64-load-imm64 buf 16 (hosted-layout :jit-arena-base +linux-aarch64-jit-arena-base+))
   (emit-aarch64-u32 buf #xEB10001F)   ; CMP x0, x16
   (emit-aarch64-u32 buf #x9A9F0000)   ; CSEL x0, x0, xzr, EQ
-  (emit-aarch64-load-imm64 buf 17 #x10000F58)
+  (emit-aarch64-load-imm64 buf 17 (conv-real (a64-gc-stat-addr #x10000F58)))
   (emit-aarch64-u32 buf #xF9000220)   ; STR x0, [x17]
 
   ;; Save argc/argv at heap base for Lisp reachability.
@@ -408,7 +478,7 @@
   ;; gc.lisp's (mem-ref :u64) reads back (see the defvar docstring).
   (flet ((maybe-shl () (when *linux-aarch64-gc-metadata-shl*
                          (emit-aarch64-u32 buf #x8B0A014A))))  ; ADD x10,x10,x10
-    (emit-aarch64-load-imm64 buf 17 +gc-from-start-addr+)
+    (emit-aarch64-load-imm64 buf 17 (conv-real +gc-from-start-addr+))
     ;; from_start = mmap+alloc_start
     (emit-aarch64-u32 buf #xAA1603EA)   ; MOV x10, x22
     (emit-aarch64-load-imm64 buf 16 +linux-aarch64-heap-alloc-start+)
@@ -449,7 +519,12 @@
   ;; case by case but kept needing fresh patches; this fixes the root.
   (emit-aarch64-load-imm64 buf 26 #xDEAD0001)
   ;; x18 = convention-block base #x10000000 (translate-aarch64 *a64-x18-base*)
-  (emit-aarch64-load-imm64 buf 18 #x10000000)
+  ;; ...unless x18 is off (Darwin, or MODUS_NO_X18 on Linux): then POISON it
+  ;; with a non-canonical address, so any code still treating x18 as the base
+  ;; faults on its first use instead of working by luck.
+  (emit-aarch64-load-imm64 buf 18 (if modus.mvm::*a64-x18-base*
+                                      (conv-real #x10000000)
+                                      #x0018DEAD0018DEAD))
 
   ;; NATIVE MCGC: reserve x28 = the GC trampoline's absolute VA, loaded once
   ;; at boot, so every gc-check fire site is a single range-unlimited
@@ -464,8 +539,8 @@
   (when modus.mvm::*aarch64-gc-native-mcgc*
     (setf modus.mvm::*aarch64-x28-load-patch-offset*
           (* (modus.mvm::a64-buffer-position buf) 4))
-    (modus.mvm::a64-movz buf modus.mvm::+a64-x28+ 0 0)   ; placeholder (lo16)
-    (modus.mvm::a64-movk buf modus.mvm::+a64-x28+ 0 1))  ; placeholder (hi16 lsl 16)
+    ;; lo16 / hi16 [/ bits 32-47 when the code is linked above 4 GB]
+    (modus.mvm::a64-emit-code-addr-placeholder buf modus.mvm::+a64-x28+))
 
   ;; #307: record the handler-stack PUSH/POP helpers' absolute VAs into
   ;; 0x10000F90/F98.  A runtime-JIT page has no labels and so cannot BL these
@@ -478,8 +553,24 @@
   ;; x29 (FP) = SP
   (emit-aarch64-u32 buf #x910003FD))
 
+(defun linux-aarch64-code-base ()
+  "Where the image's code is linked: +LINUX-AARCH64-LOAD-ADDR+ unless the
+   hosted layout moves it (MODUS_CODE_BASE; docs/macos-hosting.md).  Linux
+   maps an ET_EXEC at its p_vaddr, so on Linux moving it is only a link-time
+   change; macOS will remap the signed pages there.  A code base above the
+   old runtime-data region has no BSS tail to hold the region, so the boot
+   stub maps it (moved or not), and code above 4 GB needs the translator's
+   wide code-address placeholders; both are checked here, at build time."
+  (let ((base (hosted-layout :code-base +linux-aarch64-load-addr+)))
+    (when (and (>= base +conv-region-low+) (< base +conv-region-end+))
+      (error "code base #x~X lies inside the runtime-data region [#x~X, #x~X)"
+             base +conv-region-low+ +conv-region-end+))
+    (when (and (>= base (ash 1 32)) (not *a64-code-addr-wide*))
+      (error "code base #x~X is above 4 GB but *A64-CODE-ADDR-WIDE* is off" base))
+    base))
+
 (defun linux-aarch64-boot-descriptor ()
   (list :arch :aarch64
         :entry-fn #'emit-linux-aarch64-entry
-        :load-addr +linux-aarch64-load-addr+
+        :load-addr (linux-aarch64-code-base)
         :elf-format :linux-aarch64))

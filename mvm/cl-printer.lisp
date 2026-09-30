@@ -677,7 +677,37 @@
            (setq i (+ i 1))))
        (return nil)))))
 
+(defvar *%write-depth* 0
+  "Printer nesting depth of the current WRITE: how many %WRITE-OBJ frames are
+   live.  Bound, never assigned, so a non-local exit restores it for free.")
+
+(defconstant +%write-depth-limit+ 1000
+  "Deeper than this and the printer signals instead of recursing on.  Measured
+   2026-09-30 on the x64 CLI: a list nested 3000 deep printed before this guard
+   and 6000 deep took the process down with SIGSEGV; with the per-level binding
+   the frames are larger and 3000 died too, so the limit is 1000 -- the 8 MB stack is gone and the fault stub
+   has no stack left to recover on.  Structure that deep is either a mistake or
+   a circular graph printed with *PRINT-CIRCLE* NIL (the upstream ansi-test
+   harness reports a failing test's value that way, inside a HANDLER-CASE that
+   can catch an ERROR but not a dead process: PRINT.CONS.RANDOM.2 took shard 26
+   with it).")
+
 (defun %write-obj (obj stream level escape)
+  "Recursion guard around %WRITE-OBJ-0: an ERROR at +%WRITE-DEPTH-LIMIT+ levels
+   instead of a stack overflow.  Every nested element print comes through here."
+  ;; DECLARE SPECIAL is load-bearing: this compiler only treats CLHS-standard
+  ;; names (and per-file DECLAIMs) as implicitly special in a LET, so without
+  ;; it the binding below is LEXICAL, every frame reads the global 0 and the
+  ;; guard never fires (measured: a 1500-deep list printed straight through).
+  (declare (special *%write-depth*))
+  (let ((d *%write-depth*))
+    (when (> d +%write-depth-limit+)
+      (error "printer: structure nested deeper than ~D levels -- a circular object printed with *PRINT-CIRCLE* NIL?" +%write-depth-limit+))
+    (let ((*%write-depth* (+ d 1)))
+      (declare (special *%write-depth*))
+      (%write-obj-0 obj stream level escape))))
+
+(defun %write-obj-0 (obj stream level escape)
   "*PRINT-CIRCLE* (CLHS 22.1.3) around %WRITE-OBJ-1.  It was only ever BOUND:
    a circular list hung the printer forever (upstream PRINT.CONS.7 stalled
    the whole ansi-test), and shared structure never printed as #n= / #n#.

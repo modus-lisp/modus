@@ -2670,7 +2670,7 @@
       (let* ((lo (mem-ref #x10000C30 :u32))
              (hi (mem-ref #x10000C34 :u32))
              (self (if (= hi 0) lo (+ (* (* hi 65536) 65536) lo)))
-             (m (+ self #x10005058)))
+             (m (+ self (%conv-addr #x10005058))))
         (if (and (> self 0) (= (%gc-read64 m) 1))
             (progn
               (%gc-write64 m 0)

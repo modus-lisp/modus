@@ -53,8 +53,10 @@
           (setq log (cons (list before (arena-used)) log)))
         (dolist (s mine)
           (unless (eq (intern (symbol-name s) :cl-user) s) (setq bad (+ bad 1))))))
-    (setq *worker-syms* mine)
-    (list bad (reverse log))))
+    ;; RETURNED, not SETQ'd into a global: a worker storing its own objects
+    ;; into shared memory is refused on x86-64 (the shared-store guard);
+    ;; JOIN-THREAD carries the result back as a message.
+    (list bad (reverse log) mine)))
 
 (format t "~%=== A WORKER COLLECTS REGION 0, EVACUATING THE ARENA ====~%")
 (let ((keep (let ((l nil)) (dotimes (i 500) (setq l (cons i l))) l))
@@ -66,7 +68,8 @@
     (when (not (sb-thread:thread-alive-p th)) (return nil))
     (let ((junk nil)) (dotimes (j 200) (setq junk (cons j junk)))))
   (let ((r (sb-thread:join-thread th)))
-    (format t "  worker: ~S~%" r)
+    (when (and (consp r) (integerp (car r))) (setq *worker-syms* (caddr r)))
+    (format t "  worker: ~S~%" (if (consp r) (list (car r) (cadr r)) r))
     (chk-true "the worker finished without an error" (and (consp r) (integerp (car r))))
     (when (and (consp r) (integerp (car r)))
       (chk "symbols that no longer intern to themselves" (car r) 0)

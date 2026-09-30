@@ -7272,6 +7272,19 @@
     (emit-jcc buf :g db-loop)
     (emit-label buf db-done)))
 
+(defvar *x64-stw-scan-mode*
+  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_STW_SCANMODE") #-sbcl nil))
+    (if (and v (plusp (length v))) (parse-integer v) 1))
+  "Which of the pieces ported from operandi's own STW thread scan
+   EMIT-X64-STW-EXTRA-ROOTS emits: bit 1 = a thread running an actor is
+   scanned over the ACTOR's stack (window +0x50C0/+0x50C8), bit 2 = its
+   rec+0x40 region [from, parked +0x30), bit 4 = its per-CPU ACTIVE region.
+   DEFAULT 1, MEASURED: test/hosted-actor-runtime.lisp passes 35/35 with bit 1
+   alone, and HANGS (the initiator waits forever on a record still RUNNING,
+   every worker in futex_wait) with bit 2 or bits 2+4 added -- the region
+   scans are wrong on this collector, not merely redundant.  Kept as a
+   build-time knob so the next person can re-measure instead of re-deriving.")
+
 (defun emit-x64-stw-extra-roots (buf scan-word-label)
   "A STW collection's extra roots, before the Cheney scan: every other
    parked or safe thread's stack window and per-thread window, then every
@@ -7312,6 +7325,7 @@
       ;; +0x50C8/+0x50C0; when the parked SP lies inside them, that top is
       ;; the scan's top (operandi's rule, ported here from its own STW scan).
       (let ((tgo (make-label)))
+        (when (logtest *x64-stw-scan-mode* 1)
         (emit-mov-reg-mem buf 'rax 'rsi #x38)          ; window delta
         (emit-mov-reg-mem buf 'r8 'rax #x100050C0)     ; context top
         (emit-cmp-reg-imm buf 'r8 0)
@@ -7321,7 +7335,7 @@
         (emit-mov-reg-mem buf 'rax 'rax #x100050C8)    ; context bottom
         (emit-cmp-reg-reg buf 'rdi 'rax)
         (emit-jcc buf :b tgo)
-        (emit-mov-reg-reg buf 'r11 'r8)
+        (emit-mov-reg-reg buf 'r11 'r8))
         (emit-label buf tgo))
       (emit-label buf sloop)
       (emit-cmp-reg-reg buf 'rdi 'r11)
@@ -7337,6 +7351,7 @@
       ;; below never visits.  Live part [from, parked alloc), clamped to the
       ;; semispace; a thread region seen here and below is scanned twice,
       ;; which is harmless.
+      (when (logtest *x64-stw-scan-mode* 2)
       (let ((rnone (make-label)) (rin (make-label)))
         (emit-push buf 'rsi)
         (emit-mov-reg-mem buf 'rsi 'rsi #x40)          ; rsi = its RCB
@@ -7365,7 +7380,44 @@
           (emit-label buf ok2))
         (emit-stw-scan-range buf scan-word-label)
         (emit-label buf rnone)
-        (emit-pop buf 'rsi))
+        (emit-pop buf 'rsi)))
+      ;; AND ITS ACTIVE REGION when that is not rec+0x40: a thread running an
+      ;; actor allocates in the ACTOR's region, whose block is neither its own
+      ;; nor in the carved list below.  The park stub published R12 into the
+      ;; active block's +0x30, so [from, +0x30) is exact.  The active block
+      ;; is this thread's per-CPU cell (+GC-REGION-ADDR+ + 8*cpu, cpu at
+      ;; rec+0x20) -- operandi's rule, ported from its own STW scan.
+      (when (logtest *x64-stw-scan-mode* 4)
+      (let ((anone (make-label)))
+        (emit-push buf 'rsi)
+        (emit-mov-reg-mem buf 'rax 'rsi #x40)          ; its own RCB
+        (emit-mov-reg-mem buf 'rsi 'rsi #x20)          ; cpu id
+        (emit-shl-reg-imm buf 'rsi 3)
+        (emit-add-reg-imm buf 'rsi modus.mvm::+gc-region-addr+)
+        (emit-mov-reg-mem buf 'rsi 'rsi 0)             ; active RCB
+        (emit-cmp-reg-imm buf 'rsi 0)
+        (emit-jcc buf :e anone)
+        (emit-cmp-reg-reg buf 'rsi 'rax)
+        (emit-jcc buf :e anone)                        ; its own: done above
+        (emit-mov-reg-mem buf 'rdi 'rsi modus.mvm::+gc-off-from-start+)
+        (emit-cmp-reg-imm buf 'rdi 0)
+        (emit-jcc buf :e anone)
+        (emit-mov-reg-mem buf 'r8 'rsi modus.mvm::+gc-off-space-size+)
+        (emit-add-reg-reg buf 'r8 'rdi)                ; from_end
+        (emit-mov-reg-mem buf 'r10 'rsi #x30)          ; published frontier
+        (emit-cmp-reg-reg buf 'r10 'rdi)
+        (let ((ok (make-label)))
+          (emit-jcc buf :ae ok)
+          (emit-mov-reg-reg buf 'r10 'r8)
+          (emit-label buf ok))
+        (emit-cmp-reg-reg buf 'r10 'r8)
+        (let ((ok2 (make-label)))
+          (emit-jcc buf :be ok2)
+          (emit-mov-reg-reg buf 'r10 'r8)
+          (emit-label buf ok2))
+        (emit-stw-scan-range buf scan-word-label)
+        (emit-label buf anone)
+        (emit-pop buf 'rsi)))
       (emit-jmp buf tloop)
       ;; ---- carved thread regions [from, frontier) ----
       (emit-label buf rloop)

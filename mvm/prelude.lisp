@@ -2716,11 +2716,52 @@
    THE WRAPPER IS A SEPARATE FUNCTION because this compiler resolves every call
    to the LAST defun of a name, so a hosted image cannot wrap a function by
    redefining it and calling the old one.  Splitting the body out is the only
-   shape that lets the lock be added in ONE place and still be overridable."
-  (%rt-enter)
-  (let ((r (%intern-symbol-pkg-1 name-hash pkg-hash)))
-    (%rt-leave)
-    r))
+   shape that lets the lock be added in ONE place and still be overridable.
+
+   A SYMBOL THAT ALREADY EXISTS IS FOUND WITHOUT THE LOCK.  Every quoted symbol
+   literal in image code is a call here per evaluation, so once threads were on
+   each one was a mutex plus two region switches: TYPEP of a struct name took
+   66 of them, a generic-function call 141, and TLS certificate parsing ran
+   3-6x slower than before the first thread (and slower still on the thread).
+   The probe only reads, and every writer of this table publishes safely: an
+   insert prepends a fully built cons, a rebuild fills a new bucket vector
+   before swapping it in, and a removal builds a fresh chain.  So a reader sees
+   the old state or the new one, never a torn one.  A miss (the symbol is new,
+   or is being made right now by another thread) takes the lock and asks again."
+  (let ((hit (%symtab-probe (mem-ref #x10000088 :u64)
+                            (if (= pkg-hash 0)
+                                name-hash
+                                (%symbol-pkg-key name-hash pkg-hash)))))
+    (if hit
+        hit
+        (progn
+          (%rt-enter)
+          (let ((r (%intern-symbol-pkg-1 name-hash pkg-hash)))
+            (%rt-leave)
+            r)))))
+
+(defun %symtab-probe (ht key)
+  "The symbol for fixnum KEY in HT -- the intern table at #x10000088 or the
+   keyword table at #x10000148 -- or NIL.  Reads only: it never builds the
+   bucket index (GETHASH may) and never allocates, so it is safe without the
+   runtime lock -- see %INTERN-SYMBOL-PKG."
+  (if (or (eq ht 0) (not (consp ht)))
+      nil
+      (let* ((c (cdr ht))
+             (holder (and (consp c) (eq (car c) (%ht-tag))
+                          (car (cdr (cdr (cdr (cdr (cdr c))))))))
+             (vec (and holder (car holder))))
+        (if (or (null vec) (fixnump vec))
+            nil
+            (let ((h (%ht-hash key nil (- (%prim-array-length vec) 1))))
+              (if (fixnump h)
+                  (let ((cur (%word-aref vec h)))
+                    (loop
+                      (when (null cur) (return nil))
+                      (let ((e (car cur)))
+                        (when (eq (car e) key) (return (cdr (cdr e)))))
+                      (setq cur (cdr cur))))
+                  nil))))))
 
 (defun %symbol-pkg-key (name-hash pkg-hash)
   "The per-package symbol-table key for (NAME-HASH, PKG-HASH).  ONE definition,
@@ -2837,11 +2878,18 @@
    THIS ONE IS HOT: compile-keyword emits a call to it for EVERY `:foo' literal
    in compiled code, so it runs on every evaluation of every keyword, FORMAT's
    included.  That is exactly why it must be locked once a second thread exists,
-   and exactly why the lock has to cost nothing until then."
-  (%rt-enter)
-  (let ((r (%intern-keyword-1 name-hash)))
-    (%rt-leave)
-    r))
+   and exactly why the lock has to cost nothing until then.  It costs nothing
+   after then either for a keyword that exists, which is nearly every call:
+   found without the lock, as %INTERN-SYMBOL-PKG explains (a generic-function
+   call evaluated ~97 keywords, each a mutex and two region switches)."
+  (let ((hit (%symtab-probe (mem-ref #x10000148 :u64) name-hash)))
+    (if hit
+        hit
+        (progn
+          (%rt-enter)
+          (let ((r (%intern-keyword-1 name-hash)))
+            (%rt-leave)
+            r)))))
 
 (defun %intern-keyword-1 (name-hash)
   "Intern a keyword by name hash.  Same shape as %INTERN-SYMBOL but uses

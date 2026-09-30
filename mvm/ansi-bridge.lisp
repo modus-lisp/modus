@@ -666,7 +666,9 @@
 ;; complete version wins.
 
 (defun copy-tree (tree)
-  (if (consp tree)
+  ;; %RT-CONSP: a hash table is a tagged cons and must be a LEAF here, as the
+  ;; runtime CONSP now says (upstream COPY-TREE.2).
+  (if (%rt-consp tree)
     (cons (copy-tree (car tree))
           (copy-tree (cdr tree)))
     tree))
@@ -1305,7 +1307,10 @@
    space, a tab to the next TABSIZE column (tabular only) and a KIND
    conditional newline.  A non-list OBJECT is printed as if by WRITE."
   (let ((s (%resolve-output-stream stream)))
-    (if (not (listp object))
+    ;; %RT-LISTP, not LISTP: image code's LISTP is the raw tag test, which calls a
+    ;; hash table (a tagged cons) a list and printed its cells (upstream
+    ;; PPRINT-FILL/LINEAR/TABULAR.1-2 once runtime LISTP said HASH-TABLE).
+    (if (not (%rt-listp object))
         (write-to-stream object s)
         (let ((cap (%pp-begin s object (if colon-p "(" "") nil)))
           (catch :%pp-tag

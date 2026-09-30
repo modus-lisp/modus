@@ -6152,6 +6152,28 @@
               (let ((m (%bq-marker-sym elt)) (e (%mvm-gensym "BQE")))
                 (list 'mapcar (list 'lambda (list e) (list 'list (list 'quote m) e))
                       inner)))))))
+(defun %defstruct-kw-ctor-defun-rest (ctor-sym slot-names slot-defaults internal-ctor-sym)
+  "The &REST shape of %DEFSTRUCT-KW-CTOR-DEFUN, for structs with more than 60
+   slots: an &KEY lambda list costs two frame slots per key and the frame limit
+   is 120, so the &KEY DEFUN for the upstream ansi-test's 61-slot
+   STRUCT-TEST-65 was refused and MAKE-STRUCT-TEST-65 came back UNDEFINED
+   (upstream STRUCT-TEST-65/2..9, 2026-09-30).  GETF with an absent marker keeps
+   the default expression unevaluated when the key is supplied."
+  (let ((args (%mvm-gensym "ARGS")))
+    (list 'defun ctor-sym (list '&rest args)
+          (cons internal-ctor-sym
+                (mapcar (lambda (s d)
+                          (let ((v (%mvm-gensym "KV")))
+                            (list 'let (list (list v (list 'getf args (intern (symbol-name s) :keyword) :%absent-kw)))
+                                  (list 'if (list 'eq v :%absent-kw) d v))))
+                        slot-names slot-defaults)))))
+
+(defun %defstruct-kw-ctor-form (ctor-sym slot-names slot-defaults internal-ctor-sym)
+  "The callable keyword constructor: &KEY up to 60 slots, &REST beyond."
+  (if (> (length slot-names) 60)
+      (%defstruct-kw-ctor-defun-rest ctor-sym slot-names slot-defaults internal-ctor-sym)
+      (%defstruct-kw-ctor-defun ctor-sym slot-names slot-defaults internal-ctor-sym)))
+
 (defun %defstruct-kw-ctor-defun (ctor-sym slot-names slot-defaults internal-ctor-sym)
   "A DEFUN form for a KEYWORD constructor: (&key ((:slot g) default) …) calling
    the internal positional constructor.  Keyword constructors are registered as
@@ -25372,7 +25394,7 @@
                ;; ...AND A FUNCTION (runtime compiles): see
                ;; %DEFSTRUCT-KW-CTOR-DEFUN.
                (when *mvm-eval-runtime-p*
-                 (push (%defstruct-kw-ctor-defun (%defstruct-intern ctor-name)
+                 (push (%defstruct-kw-ctor-form (%defstruct-intern ctor-name)
                                                  slot-names slot-defaults
                                                  internal-ctor-sym)
                        forms-to-compile)))
@@ -25442,7 +25464,7 @@
                   ;; A callable function too (runtime compiles) -- quri's
                   ;; (apply #'%make-uri args); see %DEFSTRUCT-KW-CTOR-DEFUN.
                   (when *mvm-eval-runtime-p*
-                    (push (%defstruct-kw-ctor-defun ctor-sym slot-names
+                    (push (%defstruct-kw-ctor-form ctor-sym slot-names
                                                     slot-defaults ics)
                           forms-to-compile))
                   ;; CTOR-SYM, not (%DEFSTRUCT-INTERN CTOR-FN-NAME): the

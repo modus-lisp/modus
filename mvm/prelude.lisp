@@ -536,8 +536,9 @@
 (defun 1- (x) (- x 1))
 
 (defun copy-tree (tree)
-  "Return a fresh copy of TREE (all conses copied recursively)."
-  (if (consp tree)
+  "Return a fresh copy of TREE (all conses copied recursively).  A hash table
+   is a tagged cons but a LEAF here, as the runtime CONSP says (%RT-CONSP)."
+  (if (%rt-consp tree)
       (cons (copy-tree (car tree)) (copy-tree (cdr tree)))
       tree))
 

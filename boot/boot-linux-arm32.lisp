@@ -40,10 +40,6 @@
 (defconstant +linux-arm32-gc-guard+ #x400000
   "4 MB past the heap: :gc-check tests the alloc pointer before an allocation
    whose size it does not know, so a large one can overshoot the limit.")
-(defconstant +linux-arm32-vl-margin+ #x100000
-  "NO COLLECTOR YET: VL is the whole heap less this margin, and :gc-check's
-   BKPT is heap exhaustion.  Remove when the collector lands (VL then stops at
-   the first semispace).")
 
 ;;; Staged argv/envp, below 2^29 -- RV32's layout (see boot-linux-riscv32.lisp).
 ;;; qemu-arm puts the initial stack near #x40800000, which a tagged MEM-REF
@@ -94,8 +90,11 @@
     ;; depends on that accident.)
     ;; mmap2(addr, len, PROT_READ|WRITE, MAP_PRIVATE|ANON|FIXED, -1, 0)
     (arm32-load-imm32 buf +arm-r0+ +linux-arm32-heap-addr+)
+    ;; heap + guard + the collector's KIND map (a byte per 16-byte granule;
+    ;; translate-arm32's hosted-collector header)
     (arm32-load-imm32 buf +arm-r1+ (+ +linux-arm32-heap-size+
-                                      +linux-arm32-gc-guard+))
+                                      +linux-arm32-gc-guard+
+                                      (floor +linux-arm32-heap-size+ 16)))
     (arm32-mov-imm buf +arm-r2+ 0 3)              ; PROT_READ|PROT_WRITE
     (arm32-load-imm32 buf +arm-r3+ #x32)          ; PRIVATE|ANONYMOUS|FIXED
     (arm32-load-imm32 buf +arm-r4+ #xFFFFFFFF)    ; fd = -1
@@ -178,7 +177,8 @@
     ;; MVM registers: r9 = alloc pointer (VA), r10 = limit (VL), r8 = NIL
     (arm32-load-imm32 buf +arm-r12+ +linux-arm32-heap-alloc-start+)
     (arm32-add buf +arm-r9+ +arm-r6+ +arm-r12+)
-    (arm32-load-imm32 buf +arm-r12+ (- +linux-arm32-heap-size+ +linux-arm32-vl-margin+))
+    ;; VL: the first semispace's end less the collector's overshoot margin.
+    (arm32-load-imm32 buf +arm-r12+ (- +linux-arm32-gc-midpoint+ +arm32-gc-overshoot-margin+))
     (arm32-add buf +arm-r10+ +arm-r6+ +arm-r12+)
     ;; VN = NIL = +NIL-VALUE+ (#xDEAD0001), not zero — see boot-linux-riscv.lisp.
     ;; ARM32 cannot load it as a rotated immediate, so it goes through the same
@@ -187,7 +187,12 @@
     ;; Cheney metadata at the shared absolute slots, RAW addresses.
     (arm32-load-imm32 buf +arm-lr+ #x10000040)
     (arm32-str buf +arm-r9+ +arm-lr+ 0)           ; [0x40] from_start
-    (arm32-str buf +arm-r10+ +arm-lr+ 8)          ; [0x48] to_start
+    ;; to_start = heap + midpoint, computed here: NOT r10, which is VL and
+    ;; stops the collector's margin short of it (storing r10 put to-space 1 MB
+    ;; inside from-space, and the second collection corrupted the heap).
+    (arm32-load-imm32 buf +arm-r12+ +linux-arm32-gc-midpoint+)
+    (arm32-add buf +arm-r12+ +arm-r6+ +arm-r12+)
+    (arm32-str buf +arm-r12+ +arm-lr+ 8)          ; [0x48] to_start
     (arm32-load-imm32 buf +arm-r12+ (- +linux-arm32-gc-midpoint+
                                        +linux-arm32-heap-alloc-start+))
     (arm32-str buf +arm-r12+ +arm-lr+ 16)         ; [0x50] space_size

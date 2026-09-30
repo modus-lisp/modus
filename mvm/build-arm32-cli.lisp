@@ -6,10 +6,11 @@
 ;;;;   sbcl --dynamic-space-size 12288 --script mvm/build-arm32-cli.lisp
 ;;;;   -> /tmp/modus-arm32-cli   (override with MODUS_CLI_OUT)
 ;;;;
-;;;; SPIKE STATUS: boots the real CL image; NO COLLECTOR yet (VL is the whole
-;;;; 248 MB heap and exhaustion is a BKPT), #x0520 is a named NOP (faults are
-;;;; SIGSEGV, not conditions), and :add-checked still wraps.  See the census the
-;;;; build prints for the remaining translator gaps.
+;;;; STATUS: the full CL image with a native copying collector (kind-byte
+;;;; allocation marks; translate-arm32's hosted-collector header), faults as
+;;;; conditions, overflow promotion to bignums, single floats and f32 vectors,
+;;;; the clock (ms since first read, 1000 Hz) and the JIT traps.  The build
+;;;; prints the translator's census; it is empty.
 ;;;;
 ;;;; A thin tail over build-cli-common.lisp.  The ARM EABI syscall table is
 ;;;; i386's legacy table for almost everything this slot touches, so the

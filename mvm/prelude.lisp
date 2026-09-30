@@ -2292,17 +2292,25 @@
   (setf (mem-ref (+ blk #xC58) :u64) depth)
   depth)
 
-(defun %dynb-find (key a i)
+(defun %dynb-find (key a i base)
   "Address of the VALUE word of the innermost binding of KEY, or 0.  A is the
-   KEY word of entry I; walk DOWN so an inner binding shadows an outer one.
+   KEY word of entry I; walk DOWN so an inner binding shadows an outer one, and
+   never below BASE (entry 0).
 
    NO MULTIPLICATION AND NO GLOBAL READ ANYWHERE ON THIS PATH — it is called
-   from SYMBOL-VALUE, so anything that itself read a global would recurse."
-  (if (< i 0)
-      0
-      (if (eql (mem-ref a :u64) key)
-          (+ a 8)
-          (%dynb-find key (- a 16) (- i 1)))))
+   from SYMBOL-VALUE, so anything that itself read a global would recurse.
+
+   A LOOP, NOT A RECURSION.  The recursive form took one native frame (about
+   1.1 KB) per entry it passed, and this compiler does not eliminate the tail
+   call: on an actor's 256 KB stack a miss past ~230 live bindings ran off the
+   stack, and the fault came back through an unarmed handler frame to address 0
+   (operandi's ACP session actor, second turn).  BASE bounds the walk too, so a
+   depth word that disagreed with the entries could never read below them."
+  (loop
+    (when (or (< i 0) (< a base)) (return 0))
+    (when (eql (mem-ref a :u64) key) (return (+ a 8)))
+    (setq a (- a 16))
+    (setq i (- i 1))))
 
 (defun %dynb-filter (blk)
   "Address of this thread's BOUND-KEY FILTER, or 0 when it has none.
@@ -2348,7 +2356,7 @@
     (if (and (not (eql f 0))
              (eql (mem-ref (%dynb-filter-slot f key) :u16) 0))
         0
-        (%dynb-find key (- (%dynb-next blk) 16) (- (%dynb-depth blk) 1)))))
+        (%dynb-find key (- (%dynb-next blk) 16) (- (%dynb-depth blk) 1) (%dynb-base blk)))))
 
 (defun %dynb-unwind (blk key a i)
   "Pop the innermost binding of KEY, and everything above it, by truncating
@@ -2361,14 +2369,16 @@
    not reverse.  Truncation is right in both cases — by the time this
    cleanup runs every INNER binding has already been popped by its own
    cleanup, so nothing above I is live."
-  (if (< i 0)
-      0
-      (if (eql (mem-ref a :u64) key)
-          (let ((f (%dynb-filter blk)))
-            (unless (eql f 0) (%dynb-filter-drop f a (%dynb-next blk)))
-            (%dynb-set-top blk a i)
-            1)
-          (%dynb-unwind blk key (- a 16) (- i 1)))))
+  (let ((base (%dynb-base blk)))
+    (loop                                   ; a loop for the reason %DYNB-FIND gives
+      (when (or (< i 0) (< a base)) (return 0))
+      (when (eql (mem-ref a :u64) key)
+        (let ((f (%dynb-filter blk)))
+          (unless (eql f 0) (%dynb-filter-drop f a (%dynb-next blk)))
+          (%dynb-set-top blk a i)
+          (return 1)))
+      (setq a (- a 16))
+      (setq i (- i 1)))))
 
 (defun %dynb-overflow (key)
   "This thread's binding stack is full (%DYNB-CAPACITY entries).  An honest error rather than a

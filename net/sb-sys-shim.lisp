@@ -739,13 +739,20 @@
 (defun sb-ext:exit (&key (code 0) abort timeout)
   "exit_group(2).  :ABORT and :TIMEOUT are accepted and ignored — modus has no
    other threads to unwind or wait for at exit, and never runs *EXIT-HOOKS*
-   (see below), so the two spellings do the same thing."
-  abort timeout
+   (see below), so the two spellings do the same thing.  The standard streams
+   are flushed first, as SBCL's unwind does (not on :ABORT): output still
+   buffered at exit_group(2) is lost."
+  timeout
+  (unless abort
+    (ignore-errors (finish-output *standard-output*))
+    (ignore-errors (finish-output *error-output*)))
   (sys-exit code))
 
 (defun sb-ext:quit (&key (unix-status 0) recklessly-p)
   "The pre-1.0.57 spelling of EXIT."
-  recklessly-p
+  (unless recklessly-p
+    (ignore-errors (finish-output *standard-output*))
+    (ignore-errors (finish-output *error-output*)))
   (sys-exit unix-status))
 
 (defun sb-ext:gc (&rest options)

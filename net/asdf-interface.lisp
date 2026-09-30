@@ -81,7 +81,7 @@
            "FIRST-CHAR" "LAST-CHAR" "NATIVE-NAMESTRING" "PARSE-NATIVE-NAMESTRING"
            "MERGE-PATHNAMES*" "ENSURE-DIRECTORY-PATHNAME"
            "RUN-PROGRAM" "LAUNCH-PROGRAM" "WAIT-PROCESS" "TERMINATE-PROCESS"
-           "PROCESS-ALIVE-P" "DELETE-DIRECTORY-TREE"))
+           "PROCESS-ALIVE-P" "DELETE-DIRECTORY-TREE" "QUIT"))
 
 (defpackage "ASDF"
   (:use "COMMON-LISP" "UIOP")
@@ -155,6 +155,14 @@
 (defun uiop::getenv (name)
   "The value of environment variable NAME, or NIL."
   (%cli-getenv (asdf::%string-of name)))
+
+(defun uiop::quit (&optional (code 0) (finish-output t))
+  "Exit with CODE, flushing the standard streams first unless FINISH-OUTPUT
+   is NIL -- output still buffered at exit_group(2) is lost."
+  (when finish-output
+    (ignore-errors (finish-output *standard-output*))
+    (ignore-errors (finish-output *error-output*)))
+  (sys-exit code))
 
 (defun uiop::getenvp (name)
   (let ((v (uiop::getenv name))) (and v (plusp (length v)))))

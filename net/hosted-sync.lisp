@@ -253,6 +253,7 @@
                 (setf (mem-ref (+ b #xC50) :u64) 0)   ; next-free entry
                 (setf (mem-ref (+ b #xC58) :u64) 0)   ; depth
                 (setf (mem-ref (+ b #xC60) :u64) (%thr-dynb-stack cpu)) ; stack
+                (%dynb-filter-clear b)
                 (%tls-set-self-base delta)
                 0)
               r)))))
@@ -273,6 +274,7 @@
           (setf (mem-ref (+ b #xC50) :u64) 0)
           (setf (mem-ref (+ b #xC58) :u64) 0)
           (setf (mem-ref (+ b #xC60) :u64) (%thr-dynb-stack cpu))
+          (%dynb-filter-clear b)
           (%gc-write64 (+ b #x180) 0)
           (%gc-write64 (+ b #x188) 0)
           (%gc-write64 (+ b #x190) 0)

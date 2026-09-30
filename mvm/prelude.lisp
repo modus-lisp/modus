@@ -2304,6 +2304,52 @@
           (+ a 8)
           (%dynb-find key (- a 16) (- i 1)))))
 
+(defun %dynb-filter (blk)
+  "Address of this thread's BOUND-KEY FILTER, or 0 when it has none.
+
+   A read of a special this thread has NOT bound -- almost every read, since a
+   worker starts with its per-computation bindings and nothing else -- used to
+   walk the whole binding stack before falling through to the global: 0.76 us
+   against main's 3 ns, which made elliptic-curve code 6x slower on a thread.
+   The filter is 256 16-bit counters, one per (KEY mod 256): %DYNBIND counts a
+   key in, %DYNB-UNWIND counts every truncated entry out, and a zero counter
+   answers \"not bound here\" without the walk.  Anything that desynchronises
+   it can only leave a counter too HIGH (a thread that died with bindings live,
+   a wrap), which costs a walk and never a wrong answer.
+
+   It lives in the in-window fallback area, blk+0xC80..0xE7F, which is unused
+   exactly when the thread has an extension stack (blk+0xC60 non-zero).  A
+   thread without one keeps its entries there and has no filter."
+  (if (eql (mem-ref (+ blk #xC60) :u64) 0) 0 (+ blk #xC80)))
+
+(defun %dynb-filter-slot (f key)
+  (+ f (ash (logand key 255) 1)))
+
+(defun %dynb-filter-clear (blk)
+  "Zero BLK's filter.  Called wherever the stack is emptied."
+  (let ((a (+ blk #xC80)))
+    (loop
+      (when (>= a (+ blk #xE80)) (return 0))
+      (setf (mem-ref a :u32) 0)
+      (setq a (+ a 4)))))
+
+(defun %dynb-filter-drop (f a top)
+  "Count out every entry from the KEY word at A up to TOP."
+  (loop
+    (when (>= a top) (return 0))
+    (let ((slot (%dynb-filter-slot f (mem-ref a :u64))))
+      (setf (mem-ref slot :u16) (logand (- (mem-ref slot :u16) 1) #xFFFF)))
+    (setq a (+ a 16))))
+
+(defun %dynb-lookup (blk key)
+  "Address of the VALUE word of this thread's innermost binding of KEY, or 0:
+   %DYNB-FIND behind the filter.  Same no-global-read rule as %DYNB-FIND."
+  (let ((f (%dynb-filter blk)))
+    (if (and (not (eql f 0))
+             (eql (mem-ref (%dynb-filter-slot f key) :u16) 0))
+        0
+        (%dynb-find key (- (%dynb-next blk) 16) (- (%dynb-depth blk) 1)))))
+
 (defun %dynb-unwind (blk key a i)
   "Pop the innermost binding of KEY, and everything above it, by truncating
    the stack to entry I.  Answers 1 when it found one, 0 when it did not.
@@ -2318,7 +2364,10 @@
   (if (< i 0)
       0
       (if (eql (mem-ref a :u64) key)
-          (progn (%dynb-set-top blk a i) 1)
+          (let ((f (%dynb-filter blk)))
+            (unless (eql f 0) (%dynb-filter-drop f a (%dynb-next blk)))
+            (%dynb-set-top blk a i)
+            1)
           (%dynb-unwind blk key (- a 16) (- i 1)))))
 
 (defun %dynb-overflow (key)
@@ -2376,6 +2425,11 @@
                     (setf (mem-ref a :u64) key)
                     (setf (mem-ref (+ a 8) :u64) val)
                     (%dynb-set-top blk (+ a 16) (+ d 1))
+                    (let ((f (%dynb-filter blk)))
+                      (unless (eql f 0)
+                        (let ((slot (%dynb-filter-slot f key)))
+                          (setf (mem-ref slot :u16)
+                                (logand (+ (mem-ref slot :u16) 1) #xFFFF)))))
                     val)))))))
 
 (defun %dynunbind (key saved)
@@ -2413,8 +2467,7 @@
     (unless (eql (mem-ref #x10000DB8 :u32) 0)
       (let ((blk (%dynb-block)))
         (unless (eql blk 0)
-          (let ((a (%dynb-find key (- (%dynb-next blk) 16)
-                               (- (%dynb-depth blk) 1))))
+          (let ((a (%dynb-lookup blk key)))
             (unless (eql a 0)
               (return-from symbol-value (values (mem-ref a :u64))))))))
     ;; THE READ IS LOCKED TOO, and not out of caution: PUTHASH grows and
@@ -2448,8 +2501,7 @@
   (unless (eql (mem-ref #x10000DB8 :u32) 0)
     (let ((blk (%dynb-block)))
       (unless (eql blk 0)
-        (let ((a (%dynb-find name-hash (- (%dynb-next blk) 16)
-                             (- (%dynb-depth blk) 1))))
+        (let ((a (%dynb-lookup blk name-hash)))
           (unless (eql a 0)
             (setf (mem-ref a :u64) value)
             (return-from set-symbol-value value))))))
@@ -2535,7 +2587,7 @@
       (let ((blk (%dynb-block)))
         (if (eql blk 0)
             0
-            (%dynb-find key (- (%dynb-next blk) 16) (- (%dynb-depth blk) 1))))))
+            (%dynb-lookup blk key)))))
 
 (defun %gv-ref (%gv-key)
   "Compiled special-variable READ: value of global KEY, NIL if absent

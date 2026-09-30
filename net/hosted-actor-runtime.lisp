@@ -291,7 +291,7 @@
    are 1024-byte aligned, so each region's bits fill whole bitmap words and
    clearing them cannot touch a neighbour's."
   (let ((pb (%gc-bitmap-page-base-exact))
-        (bb (%gc-read64 #x10000E18))
+        (bb (%gc-read64 (%conv-addr #x10000E18)))
         (n (ceiling (%ar-get #x10) 128)))
     (unless (zerop bb)
       (dolist (space (list (%ar-region-from id) (%ar-region-to id)))

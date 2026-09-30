@@ -1170,6 +1170,16 @@ up three problems.  The first two were already on `main`.
   `%HT-REBUILD-INDEX` reserves its worst case first, and `%RT-SLICE-ENSURE`
   takes the needed headroom as an argument.  `hosted-worker-intern` is
   `CLEAN` again.
+- **A reused thread slot on x86-64 kept its collector bits.**  The
+  slot-reuse fix above cleared a slot's bitmaps with `%HA-BITMAP-CLEAR`,
+  which is AArch64's layout: x86-64 keeps its object-start bitmap at the word
+  in `0x10000E18` and cons-kind bits `#xFE4000` above it.
+  - So on x86-64 the fifth thread through one slot died with a `TYPE-ERROR`
+    in `test/hosted-slot-reuse.lisp`, on `main` as well.
+  - `%THR-PREPARE-REGION` now uses x86-64's own clear
+    (`%THR-CLEAR-REGION-BITS-X64`), the arithmetic the actor runtime already
+    uses for a reused actor slot (`%AR-CLEAR-REGION-BITS`).
+  - That runtime's raw `#x10000E18` is now `(%CONV-ADDR #x10000E18)`.
 - **`hosted-stw`'s positive control.**  Its churn of 20,000 conses a round
   never filled region 0, which is ~600 MB after the carve.  The collections it
   counted used to come from lock-arena refills, which lock-free interning

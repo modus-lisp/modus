@@ -2655,10 +2655,34 @@ modus: a thread needed the runtime lock but the lock arena is exhausted or missi
         ;; thread had collected its region an even number of times died with a
         ;; TYPE-ERROR its own HANDLER-CASE never saw, and with an odd number
         ;; the collector read past the heap's end (test/hosted-slot-reuse.lisp).
-        (%ha-bitmap-clear from (+ from *ha-rsize*))
-        (%ha-bitmap-clear to (+ to *ha-rsize*))
+        ;; x86-64 lays its bitmaps out differently (%HA-BITMAP-CLEAR is
+        ;; AArch64's): same hazard, same fix, the actor runtime's arithmetic
+        ;; (%THR-CLEAR-REGION-BITS-X64).  Measured on x86-64: the 5th thread
+        ;; through one slot died TYPE-ERROR in test/hosted-slot-reuse.lisp.
+        (%layout-if :a64-threads
+          (progn (%ha-bitmap-clear from (+ from *ha-rsize*))
+                 (%ha-bitmap-clear to (+ to *ha-rsize*)))
+          (%thr-clear-region-bits-x64 from to *ha-rsize*))
         (%gc-region-init rcb from to *ha-rsize* stack-top k)
         rcb)))
+
+(defun %thr-clear-region-bits-x64 (from to size)
+  "Clear the collector's object-start and cons-kind bits over both semispaces
+   [FROM, FROM+SIZE) and [TO, TO+SIZE) of a thread slot's region, laid out as
+   x86-64 keeps them: the object-start bitmap at the word in 0x10000E18 and the
+   cons-kind bitmap #xFE4000 above it -- the arithmetic net/hosted-actor-
+   runtime.lisp %AR-CLEAR-REGION-BITS uses for a reused actor slot.  Regions
+   are 1024-byte aligned, so each one's bits fill whole bitmap words and
+   clearing them cannot touch a neighbour's."
+  (let ((pb (%gc-bitmap-page-base-exact))
+        (bb (%gc-read64 (%conv-addr #x10000E18)))
+        (n (ceiling size 128)))
+    (unless (zerop bb)
+      (dolist (space (list from to))
+        (let ((b (+ bb (floor (- space pb) 128))))
+          (%ha-zero b (+ b n))
+          (%ha-zero (+ b #xFE4000) (+ b #xFE4000 n)))))
+    0))
 
 (defun %escape-describe (c)
   "A short description of an escaped condition: its type and, when it has

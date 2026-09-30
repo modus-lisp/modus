@@ -163,6 +163,9 @@
 ;;   0x10000F20..F50  GC pause statistics (#286, seven words — see mvm/gc.lisp)
 ;;   0x10000FF0       caller-x30 save slot for the out-of-module call thunks
 ;; Still free: 0x10000EA8..0x10000EFF, 0x10000F18, 0x10000F58..0x10000FE8.
+;; (STALE -- verify with a repo-wide grep before claiming any.  Since taken:
+;;  EA8/EC8/ED0/ED8/EE0-EF0 (gc), EB8 pending-fault signal, F18 x64 TSC Hz,
+;;  F58/F60 (jit bump, core cursor), FA0-FB8, FC0-FD0 (scheduler locks).)
 ;;
 ;; DO NOT ADD IT TO THE BSS-ZEROING LIST.  build-rpi-cl-repl.lisp's kernel-main
 ;; prologue zeroes the metadata words that stand in for BSS.  This slot is

@@ -1221,6 +1221,11 @@
                   (skip (rv-current-offset buf)))
               (rv-emit-jal buf +rv-x0+ 0)                      ; over the stub
               (let ((stub (rv-current-offset buf)))
+                ;; Record the signal (a0) for %TAKE-PENDING-FAULT, which
+                ;; builds the condition in the handler-case dispatch.  Stored
+                ;; even if nothing is armed: the process then exits anyway.
+                (rv-emit-li buf +rv-t0+ #x10000CB0)
+                (rv-emit-sw buf +rv-a0+ +rv-t0+ 0)
                 ;; Unblock SEGV/BUS/FPE/ILL (mask #x4C8) before leaving: the
                 ;; handler never returns through sigreturn, and qemu-riscv64
                 ;; left SIGSEGV blocked despite SA_NODEFER -- the SECOND fault

@@ -519,6 +519,14 @@
     nil nil)
   ;; storage-condition
   (%define-condition 'storage-condition '(serious-condition) nil nil nil)
+  ;; memory-fault-error -- SIGSEGV/SIGBUS caught by a handler-case (see
+  ;; %TAKE-PENDING-FAULT).  A TYPE-ERROR because in compiled code a fault is
+  ;; how a type check fails: (car 5) faults, and ANSI says it signals
+  ;; TYPE-ERROR.  The name still says what actually happened.
+  (%define-condition 'memory-fault-error '(type-error) nil nil nil)
+  ;; illegal-instruction-error -- SIGILL (an unimplemented-opcode trap, or a
+  ;; jump into data).
+  (%define-condition 'illegal-instruction-error '(error) nil nil nil)
   ;; restart-invocation — internal type used by restart-case mechanism
   (%define-condition 'restart-invocation '(condition) nil nil nil)
   ;; mvm-type-error — raised by the MVM interpreter's opcode guards
@@ -661,6 +669,24 @@
             (t (c2) (write-string-serial "<report-print-error>"))))
         (write-char-serial 10)
         (setq *%escape-report-busy* nil))))
+
+(defun %take-pending-fault ()
+  "Called by every handler-case dispatch.  A signal stub (TRAP #x0520 on
+   every port) longjmps into the handler-case with the raw signal number in
+   the word at #x10000CB0 and no condition, since it cannot allocate; build
+   the condition here.  SIGFPE (8) is DIVISION-BY-ZERO (integer division
+   is what traps), SIGILL (4) ILLEGAL-INSTRUCTION-ERROR, SIGSEGV/SIGBUS
+   MEMORY-FAULT-ERROR."
+  (let ((sig (mem-ref #x10000CB0 :u32)))
+    (unless (eql sig 0)
+      (setf (mem-ref #x10000CB0 :u32) 0)
+      (setq *current-condition*
+            (cond ((eql sig 8) (make-condition 'division-by-zero
+                                               :operation nil :operands nil))
+                  ((eql sig 4) (make-condition 'illegal-instruction-error))
+                  (t (make-condition 'memory-fault-error
+                                     :datum nil :expected-type t)))))
+    nil))
 
 (defun %maybe-report-unhandled-hc ()
   "Called by compiled handler-case dispatch tails just before the
@@ -2631,8 +2657,9 @@
   "Called first on a HANDLER-CASE handler path (hosted x64 CLI).  If the
    #x0520 fault stub has recovered a hardware fault since the last check
    (its count at #x10000CA0 moved past the last-seen count at #x10000CA8),
-   publish a fresh TYPE-ERROR as *CURRENT-CONDITION* -- the stub longjmps
-   without one, and the handler used to dispatch on a STALE condition."
+   and the SHARED-STORE GUARD armed it, publish that diagnosis as
+   *CURRENT-CONDITION*; any other fault's condition was already built by
+   %TAKE-PENDING-FAULT from the stub's signal number."
   (let ((n (mem-ref #x10000CA0 :u32)))
     (unless (= n (mem-ref #x10000CA8 :u32))
       (setf (mem-ref #x10000CA8 :u32) n)
@@ -2651,10 +2678,10 @@
                     (make-condition 'simple-error
                                     :format-control "modus: a thread stored one of its own objects into shared memory. Threads share no state -- pass the value as a message (or allocate shared data under the runtime lock); the store was refused."
                                     :format-arguments nil)))
-            (let ((c (make-array 2)))
-              (aset c 0 *%sig-type-error-sym*)
-              (aset c 1 nil)
-              (setq *current-condition* c))))))
+            ;; Not the guard: %TAKE-PENDING-FAULT already built the condition
+            ;; (MEMORY-FAULT-ERROR / DIVISION-BY-ZERO / ILLEGAL-INSTRUCTION-
+            ;; ERROR) from the stub's signal number; leave it.
+            nil))))
   nil)
 
 (defun %signal-type-error ()

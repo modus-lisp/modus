@@ -9106,15 +9106,16 @@
           (emit-ir :br end-label)
           ;; === Handler path: dispatch on condition type ===
           (emit-ir-label handler-label)
-          ;; A hardware FAULT recovered by the #x0520 stub longjmps here
-          ;; WITHOUT publishing a condition, so the dispatch used to test
-          ;; whatever stale object *CURRENT-CONDITION* held -- a leftover
-          ;; RESTART-INVOCATION re-signalled as an unhandled escape.
-          ;; %HC-FAULT-FIXUP turns a fault that happened since the last
-          ;; check into a TYPE-ERROR first (hosted x64 CLI only).
+          ;; A HARDWARE FAULT arrives here with no condition object: the
+          ;; signal stub cannot allocate, so it only records the signal
+          ;; number.  %TAKE-PENDING-FAULT (multi-arch, every port) turns that
+          ;; into *CURRENT-CONDITION* before any clause looks; %HC-FAULT-FIXUP
+          ;; (hosted x64 only) then adds the shared-store-guard diagnosis when
+          ;; that guard armed the fault, and otherwise leaves the condition
+          ;; alone.  One word load each when nothing is pending.
           (compile-form (if *hc-fault-fixup*
-                            `(progn (%hc-fault-fixup) ,cond-form)
-                            cond-form)
+                            `(progn (%take-pending-fault) (%hc-fault-fixup) ,cond-form)
+                            `(progn (%take-pending-fault) ,cond-form))
                         env dest)
           (emit-ir-label end-label)))))
 

@@ -1570,7 +1570,15 @@ modus: a thread needed the runtime lock but the lock arena is exhausted or missi
         ;; half-carved arena.  A 0 here (small heap, frontier in the way) is
         ;; not a failure — the slice path just never engages and every locked
         ;; section behaves exactly as before this change.
-        (%rt-arena-carve)
+        ;;
+        ;; A FRONTIER IN THE WAY IS NOT "NO ARENA", though: after a large load
+        ;; (operandi's quickload) region 0's live frontier sits above the carve
+        ;; point, the carve answers 0, and the first worker that needs the lock
+        ;; then has no slice and must stop.  Collect once to compact, as
+        ;; %AR-CARVE does, and carve again.
+        (when (and (zerop (%rt-arena-carve)) (= (%gc-region-0) (%gc-region)))
+          (%gc-collect-here)
+          (%rt-arena-carve))
         ;; CLEAR THE MAIN THREAD'S SELF SLOT, on the first switch-on only (the
         ;; gate is still shut, so this is the spawning thread: main).  The
         ;; x64 fault stub records the faulting RIP at 0x10000C30 -- absolute,

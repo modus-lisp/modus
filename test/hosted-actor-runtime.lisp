@@ -85,6 +85,15 @@
   (let ((r (actors-receive-if (lambda (m) (and (consp m) (eq (first m) :reply))) 2000)))
     (actors-send 1 (list :selected r (actors-receive 500) (actors-receive 500)))))
 
+(defun canary-ok (c)
+  (and (= (length c) 2000)
+       (loop for x in c for i from 0 always (and (consp x) (eql (car x) i) (equal (cdr x) "v")))))
+(defun canary-churner ()
+  ;; a live list held across many collections of this actor's own region
+  (let ((canary (loop for i below 2000 collect (cons i (copy-seq "v")))))
+    (dotimes (j 5) (let ((k nil)) (dotimes (i 20000) (setq k (make-list 50))) k))
+    (actors-send 1 (if (canary-ok canary) :intact :corrupt))))
+
 (defun churn-main (n)
   (let ((keep nil)) (dotimes (i n) (setq keep (make-list 1000 :initial-element i))) (length keep)))
 
@@ -146,6 +155,16 @@
 ;; SLOT REUSE (gap 1).
 (chk "40 spawns through 12 slots"
      (= 40 (let ((n 0)) (dotimes (i 40) (actors-spawn 'quick) (actors-receive) (incf n)) n)))
+
+;; A REUSED SLOT STARTS CLEAN: the previous occupant's object-start bits made
+;; stale stack words look like roots, and the collector wrote forwarding
+;; pointers into live objects (the canary came back corrupt from the 3rd reuse).
+(chk "actors reusing one slot keep their heaps intact across collections"
+     (let ((all t))
+       (dotimes (i 5)
+         (actors-spawn 'canary-churner)            ; one at a time: each reuses the slot
+         (unless (eq (actors-receive 60) :intact) (setq all nil)))
+       all))
 
 ;; STOP-THE-WORLD REACHES ACTORS (gap 2): parked, then running.
 (setq *shared* (loop for i below 2000 collect (* i 3)))

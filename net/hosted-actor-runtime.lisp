@@ -279,6 +279,27 @@
   (%gc-region-enter (%ar-thread-rcb))
   (restore-context (%sched-block)))
 
+(defun %ar-clear-region-bits (id)
+  "Clear the collector's object-start and cons-kind bits over both of actor
+   ID's semispaces.  A REUSED SLOT MUST START WITH NO BITS SET.  The stack scan
+   is conservative: a word counts as a root when the object-start bitmap says an
+   object begins where it points.  The previous occupant's bits outlive it, and
+   the new actor's live frames can hold uninitialised words left on the stack
+   by the old one -- a stale word at a stale bit was taken for a root, and
+   evacuating it wrote a forwarding pointer into the middle of a live object
+   (a fresh slot's stack and bits are zero, so only reuse corrupted).  Regions
+   are 1024-byte aligned, so each region's bits fill whole bitmap words and
+   clearing them cannot touch a neighbour's."
+  (let ((pb (%gc-bitmap-page-base-exact))
+        (bb (%gc-read64 #x10000E18))
+        (n (ceiling (%ar-get #x10) 128)))
+    (unless (zerop bb)
+      (dolist (space (list (%ar-region-from id) (%ar-region-to id)))
+        (let ((b (+ bb (floor (- space pb) 128))))
+          (%ha-zero b (+ b n))
+          (%ha-zero (+ b #xFE4000) (+ b #xFE4000 n)))))
+    0))
+
 (defun actors-spawn (fn)
   "Start an actor running FN (a function of no arguments; from inside an actor
    pass a SYMBOL naming one).  Returns its id, or signals when every slot is in
@@ -303,6 +324,7 @@
           (actor-set id #x30 (untag (%ar-entry-addr)))
           (%gc-region-init (%ar-rcb id) (%ar-region-from id) (%ar-region-to id)
                            (%ar-get #x10) (%ar-stack-top id) (%gc-meta-scale))
+          (%ar-clear-region-bits id)
           (actor-set id #x68 (untag (%ar-rcb id)))
           (%ar-prepare-window id)
           (%ar-mark-parked id (%ar-stack-top id))

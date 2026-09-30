@@ -1104,3 +1104,34 @@ The region's bits are now cleared before it is re-initialised
   image, and the VAs, that wrote it.
 - Native threads and the actor (green-thread) layer run on hosted AArch64,
   Linux and macOS (see "Native threads on AArch64").
+
+## On the watch — Simulator (2026-09-30)
+
+`host/watch/build-watch.sh IMAGE OUT.app` builds a standalone watchOS app
+(`WKWatchOnly`) for the Simulator from the same JIT-off, PC-relative image.
+The image runs in place, with its data layout reserved, exactly as on the
+phone.  The shim needs three watchOS changes:
+- **The UI is SwiftUI** (`host/watch/modus-watch.swift`).  watchOS has no
+  public UIKit, so the main thread runs a SwiftUI app instead of
+  `UIApplicationMain`.  It exports the same C entry points as the iOS bridge,
+  so pseudo-syscalls 1001–1004 (info, fill, present, next event) mean the
+  same thing on the wrist.  The buffer is shown as an `Image`, and a
+  zero-distance drag gesture reports down, move and up.
+- **No `sigaltstack`.**  It is prohibited on watchOS, so the fault handler
+  runs on the faulting thread's own stack (`modus_altstack`).
+- **Linking.**  The Swift bridge is linked with the shim by clang, with the
+  Swift runtime's library paths.
+
+On an Apple Watch Series 11 (46 mm) Simulator, watchOS 26.4, `hello` runs and
+`test/ios-draw.lisp` draws its tile grid, 3×4 on a small screen.
+
+**A real watch is a different project.**  Watches up to at least the S5
+(this Watch5,10) run `arm64_32`: AArch64 instructions with a 4 GB address
+space.  Reaching one needs:
+- a layout below 4 GB with a far smaller heap;
+- explicit address marking in the compiler, since the by-value
+  PC-relative rule needs a layout above 4 GB;
+- an ILP32 port of the shim;
+- a footprint that fits a watch app's memory limit.
+
+The Simulator runs watch apps as 64-bit Mac processes and shows none of this.

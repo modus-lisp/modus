@@ -75,6 +75,15 @@ static inline void modus_jit_wp(int executable) {
 extern void modus_syscall_stub(void);
 
 extern void modus_enter(uint64_t sp, uint64_t entry) __attribute__((noreturn));
+// sigaltstack is prohibited on watchOS: there the fault handler runs on the
+// faulting thread's own stack.
+static inline void modus_altstack(stack_t *ss) {
+#if TARGET_OS_WATCH
+    (void)ss;
+#else
+    sigaltstack(ss, NULL);
+#endif
+}
 // The thread the image STARTED on: Linux's thread-group leader, whose TID is
 // the PID.  The process's main thread on macOS; on iOS a thread of its own,
 // because the main thread belongs to UIKit (below).
@@ -90,11 +99,17 @@ static __thread int image_leader;
 #include <objc/runtime.h>
 #include <objc/message.h>
 #include <CoreFoundation/CoreFoundation.h>
-extern int UIApplicationMain(int argc, char **argv, CFStringRef principal, CFStringRef delegate);
-// host/ios/modus-ui.m: a framebuffer and touch events for the image.
+// host/ios/modus-ui.m (host/watch/modus-watch.swift on watchOS): a framebuffer
+// and touch events for the image.
 extern void modus_ui_init(void);
 extern void modus_ui_start(void);
 extern long modus_ui_call(long nr, long a0, long a1, long a2, long a3);
+#if TARGET_OS_WATCH
+// watchOS has no public UIKit: the SwiftUI app in host/watch/modus-watch.swift
+// owns the main thread instead.
+extern void modus_watch_main(void) __attribute__((noreturn));
+#else
+extern int UIApplicationMain(int argc, char **argv, CFStringRef principal, CFStringRef delegate);
 static signed char modus_did_finish(void *self, SEL cmd, void *app, void *opts) {
     (void)self; (void)cmd; (void)opts;
     // Keep the screen from AUTO-LOCKING while modus is in front: a locked
@@ -104,12 +119,13 @@ static signed char modus_did_finish(void *self, SEL cmd, void *app, void *opts) 
     modus_ui_start();
     return 1;
 }
+#endif
 struct image_start { uint64_t sp, entry; };
 static void *image_thread(void *arg) {
     struct image_start st = *(struct image_start *)arg;
     // sigaltstack is per thread: the fault handler needs one here too.
     stack_t ss = { .ss_sp = malloc(1 << 16), .ss_size = 1 << 16, .ss_flags = 0 };
-    sigaltstack(&ss, NULL);
+    modus_altstack(&ss);
     image_leader = 1;
     modus_enter(st.sp, st.entry);
 }
@@ -126,12 +142,17 @@ static void run_image_beside_uikit(int argc, char **argv, uint64_t sp, uint64_t 
         fprintf(stderr, "modus-shim: could not start the image thread\n");
         _exit(1);
     }
+#if TARGET_OS_WATCH
+    (void)argc; (void)argv;
+    modus_watch_main();
+#else
     Class c = objc_allocateClassPair(objc_getClass("UIResponder"), "ModusAppDelegate", 0);
     class_addMethod(c, sel_registerName("application:didFinishLaunchingWithOptions:"),
                     (IMP)modus_did_finish, "c@:@@");
     objc_registerClassPair(c);
     UIApplicationMain(argc, argv, NULL, CFSTR("ModusAppDelegate"));
     _exit(0);   // UIApplicationMain does not return; the image's exit() ends the app
+#endif
 }
 #endif
 
@@ -564,7 +585,7 @@ static void *clone_child(void *arg) {
     pthread_setspecific(delta_key, cs.delta);   // the parent's window, as Linux inherits TPIDR_EL0
     // sigaltstack is per thread: the fault handler needs one here too.
     stack_t ss = { .ss_sp = malloc(1 << 16), .ss_size = 1 << 16, .ss_flags = 0 };
-    sigaltstack(&ss, NULL);
+    modus_altstack(&ss);
     modus_resume(&cs.ctx);
 }
 
@@ -836,7 +857,7 @@ static void report_fault(int sig, siginfo_t *si, void *uc_) {
 static void install_fault_report(void) {
     static uint8_t altstack[1 << 16];
     stack_t ss = { .ss_sp = altstack, .ss_size = sizeof altstack, .ss_flags = 0 };
-    sigaltstack(&ss, NULL);
+    modus_altstack(&ss);
     struct sigaction sa; memset(&sa, 0, sizeof sa);
     // SA_NODEFER: a chained image handler never returns (it branches into a
     // handler-case frame), so the signal must not stay blocked afterwards.

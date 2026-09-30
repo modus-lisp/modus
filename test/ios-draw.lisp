@@ -1,4 +1,4 @@
-;;;; ios-draw.lisp — TAP TO CHANGE COLOURS: modus drawing on an iPhone.
+;;;; ios-draw.lisp — TAP TO CHANGE COLOURS: modus drawing on an iPhone or a watch.
 ;;;;
 ;;;;   host/ios/build-ios.sh … (MODUS_IOS_FILES=test/ios-draw.lisp)
 ;;;;   xcrun devicectl device process launch --device D org.modus-lisp.modus --script @ios-draw.lisp
@@ -21,9 +21,11 @@
 (defun next-event () (sys 1004 0 0 0))
 
 (defvar *palette* (vector #xE63946 #xF4A261 #xE9C46A #x2A9D8F #x457B9D #x8338EC #xFF006E #x06D6A0))
-(defvar *cols* 4)
-(defvar *rows* 8)
-(defvar *gap* 12)
+;; A watch-sized screen (host/watch/modus-watch.swift) gets fewer, bigger tiles.
+(defvar *small* (< *w* 600))
+(defvar *cols* (if *small* 3 4))
+(defvar *rows* (if *small* 4 8))
+(defvar *gap* (if *small* 8 12))
 (defvar *tile-w* (floor (- *w* (* *gap* (+ *cols* 1))) *cols*))
 (defvar *tile-h* (floor (- *h* (* *gap* (+ *rows* 1))) *rows*))
 (defvar *tiles* (make-array (* *cols* *rows*)))

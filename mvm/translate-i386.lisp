@@ -2538,7 +2538,7 @@
                 ;; %TAKE-PENDING-FAULT, which builds the condition.
                 (i386-emit-byte buf #x8B) (i386-emit-byte buf #x44)
                 (i386-emit-byte buf #x24) (i386-emit-byte buf #x04)  ; mov eax,[esp+4]
-                (i386-emit-byte buf #xA3) (i386-emit-u32 buf #x10000CB0) ; [CB0]=eax (pending signal)
+                (i386-emit-byte buf #xA3) (i386-emit-u32 buf #x10000CB0) ; [CB0]=eax
                 (i386-emit-mov-abs-imm buf *i386-hstack-overflow-addr* 0)
                 (dotimes (i +i386-jmpbuf-words+)
                   (i386-emit-mov-reg-mem buf +scratch1+ +scratch0+ (* 4 i))

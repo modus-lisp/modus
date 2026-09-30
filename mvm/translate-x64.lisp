@@ -2112,7 +2112,7 @@
              ((and (= code #x0311) *x64-linux-mode*)
               ;; CNTFRQ, hosted: x86 has no architectural "counter Hz" register
               ;; (CPUID leaf 0x15 is often 0, and always so under qemu), so the
-              ;; TSC's rate is MEASURED, once, and cached TAGGED at #x10000F18:
+              ;; TSC's rate is MEASURED, once, and cached TAGGED at #x10000CB8:
               ;; TSC read, clock_gettime(MONOTONIC), a 10 ms nanosleep, both
               ;; read again; Hz = ticks * 1e9 / elapsed-ns.  The elapsed time
               ;; is measured, so an interrupted sleep still calibrates (just
@@ -2120,7 +2120,7 @@
               ;; tick count (GC pause stats, trace timing) could become time.
               ;; Every register it touches but RAX (the result, VR) is saved.
               (let ((done (make-label)))
-                (emit-bytes buf #x48 #x8B #x04 #x25) (emit-u32 buf #x10000F18) ; mov rax,[F18]
+                (emit-bytes buf #x48 #x8B #x04 #x25) (emit-u32 buf #x10000CB8) ; mov rax,[CB8]
                 (emit-bytes buf #x48 #x85 #xC0)                    ; test rax, rax
                 (emit-jcc buf :ne done)
                 (emit-bytes buf #x51 #x52 #x56 #x57)               ; push rcx rdx rsi rdi
@@ -2165,7 +2165,7 @@
                 (emit-bytes buf #x48 #xF7 #xE1)                    ; mul rcx
                 (emit-bytes buf #x49 #xF7 #xF2)                    ; div r10
                 (emit-bytes buf #x48 #xD1 #xE0)                    ; tag
-                (emit-bytes buf #x48 #x89 #x04 #x25) (emit-u32 buf #x10000F18) ; cache
+                (emit-bytes buf #x48 #x89 #x04 #x25) (emit-u32 buf #x10000CB8) ; cache
                 (emit-bytes buf #x48 #x83 #xC4 #x20)               ; add rsp, 32
                 (emit-bytes buf #x41 #x5B #x41 #x5A #x41 #x59 #x41 #x58) ; pop r11-r8
                 (emit-bytes buf #x5F #x5E #x5A #x59)               ; pop rdi rsi rdx rcx

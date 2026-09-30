@@ -9167,13 +9167,15 @@
           (emit-ir-label handler-label)
           ;; A HARDWARE FAULT arrives here with no condition object: the
           ;; signal stub cannot allocate, so it only records the signal
-          ;; number.  %TAKE-PENDING-FAULT (multi-arch, every port) turns that
-          ;; into *CURRENT-CONDITION* before any clause looks; %HC-FAULT-FIXUP
-          ;; (hosted x64 only) then adds the shared-store-guard diagnosis when
-          ;; that guard armed the fault, and otherwise leaves the condition
-          ;; alone.  One word load each when nothing is pending.
+          ;; number.  %TAKE-PENDING-FAULT turns that into *CURRENT-CONDITION*
+          ;; before any clause looks -- otherwise the clauses matched whatever
+          ;; was signalled LAST (a leftover RESTART-INVOCATION re-signalled as
+          ;; an unhandled escape; a fault after an unrelated (error "x") caught
+          ;; by a SIMPLE-ERROR clause).  One word load when nothing is pending.
+          ;; Hosted x64 first runs %HC-FAULT-FIXUP, which owns the fault COUNT
+          ;; and the shared-store guard's own condition.
           (compile-form (if *hc-fault-fixup*
-                            `(progn (%take-pending-fault) (%hc-fault-fixup) ,cond-form)
+                            `(progn (%hc-fault-fixup) (%take-pending-fault) ,cond-form)
                             `(progn (%take-pending-fault) ,cond-form))
                         env dest)
           (emit-ir-label end-label)))))

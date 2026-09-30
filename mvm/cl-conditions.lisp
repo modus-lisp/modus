@@ -2654,12 +2654,12 @@
         (if (%error-handler-active-p) (%hc-longjmp) nil))))
 
 (defun %hc-fault-fixup ()
-  "Called first on a HANDLER-CASE handler path (hosted x64 CLI).  If the
-   #x0520 fault stub has recovered a hardware fault since the last check
-   (its count at #x10000CA0 moved past the last-seen count at #x10000CA8),
-   and the SHARED-STORE GUARD armed it, publish that diagnosis as
-   *CURRENT-CONDITION*; any other fault's condition was already built by
-   %TAKE-PENDING-FAULT from the stub's signal number."
+  "Called first on a HANDLER-CASE handler path (hosted x64 CLI), before
+   %TAKE-PENDING-FAULT.  If the #x0520 fault stub has recovered a hardware
+   fault since the last check (its count at #x10000CA0 moved past the
+   last-seen count at #x10000CA8) and it was THE SHARED-STORE GUARD's trap,
+   publish that guard's error and clear the pending signal; any other fault
+   is left for %TAKE-PENDING-FAULT to type."
   (let ((n (mem-ref #x10000CA0 :u32)))
     (unless (= n (mem-ref #x10000CA8 :u32))
       (setf (mem-ref #x10000CA8 :u32) n)
@@ -2674,13 +2674,15 @@
         (if (and (> self 0) (= (%gc-read64 m) 1))
             (progn
               (%gc-write64 m 0)
+              ;; This condition says more than the signal would: claim it.
+              (setf (mem-ref #x10000CB0 :u32) 0)
               (setq *current-condition*
                     (make-condition 'simple-error
                                     :format-control "modus: a thread stored one of its own objects into shared memory. Threads share no state -- pass the value as a message (or allocate shared data under the runtime lock); the store was refused."
                                     :format-arguments nil)))
-            ;; Not the guard: %TAKE-PENDING-FAULT already built the condition
-            ;; (MEMORY-FAULT-ERROR / DIVISION-BY-ZERO / ILLEGAL-INSTRUCTION-
-            ;; ERROR) from the stub's signal number; leave it.
+            ;; Any other fault: %TAKE-PENDING-FAULT, which the dispatch
+            ;; calls next, builds the condition from the recorded signal
+            ;; (SIGSEGV -> MEMORY-FAULT-ERROR, a TYPE-ERROR).
             nil))))
   nil)
 

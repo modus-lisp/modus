@@ -694,8 +694,9 @@
   (let ((lp (make-label)) (next (make-label)) (done (make-label))
         (noreg (make-label)) (rok (make-label)) (dbl (make-label))
         (dbd (make-label)) (dbin (make-label)) (dbgo (make-label)))
-    (emit-cmp-abs64-zero buf +stw-stop-addr+)
-    (emit-jcc buf :e done)
+    ;; No +STW-STOP-ADDR+ gate: the caller (emit-x64-stw-extra-roots, the
+    ;; live protocol) has already established that this collection took the
+    ;; world; operandi's STOP word is never set in this tree.
     (emit-mov-reg-imm buf 'r12 +stw-actor-table-addr+)
     (emit-mov-reg-mem buf 'r12 'r12 0)
     (emit-cmp-reg-imm buf 'r12 0)
@@ -7360,6 +7361,16 @@
       (emit-mov-reg-mem buf 'r11 'rsi 8)
       (emit-x64-flat-walk buf scan-word-label 'r11)
       (emit-label buf adone)
+      ;; ---- operandi's PARKED ACTORS (net/hosted-actor-runtime): an actor
+      ;; that is ready or blocked is on no thread, so no thread window or
+      ;; region above reaches its stack, its window segment or its region.
+      ;; Its scan lived in operandi's own STW scan subroutine, which this
+      ;; tree does not emit (X64-STW-P is NIL); it runs here, inside this
+      ;; collection's took-the-world gate.  R12/R14 (and R9/R10) are its
+      ;; scratch and are still live at this point of the trampoline.
+      (emit-push buf 'r9) (emit-push buf 'r10) (emit-push buf 'r12) (emit-push buf 'r14)
+      (emit-stw-scan-parked-actors buf scan-word-label)
+      (emit-pop buf 'r14) (emit-pop buf 'r12) (emit-pop buf 'r10) (emit-pop buf 'r9)
       (emit-label buf skip))))
 
 (defvar *x64-stw-verify*

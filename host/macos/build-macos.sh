@@ -14,8 +14,14 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 # The image goes into __TEXT (r-x, covered by the code signature) on a 16 KB
 # boundary, so the shim can mach_vm_remap it page for page.  ld signs arm64
 # executables ad hoc.
-cc -O2 -Wall -o "$OUT" "$HERE/modus-shim.c" "$HERE/syscall-stub.S" \
-   -Wl,-sectcreate,__TEXT,__modus,"$IMAGE" \
-   -Wl,-sectalign,__TEXT,__modus,0x4000
+# MODUS_IN_PLACE=1: a PC-relative image (MODUS_PCREL=1) instead gets its own
+# segments and runs where the loader put it (image-segments.sh).
+if [ "${MODUS_IN_PLACE:-0}" != 0 ]; then
+  WHERE=$("$HERE/image-segments.sh" "$IMAGE" "$OUT.segs")
+else
+  WHERE="-Wl,-sectcreate,__TEXT,__modus,$IMAGE -Wl,-sectalign,__TEXT,__modus,0x4000"
+fi
+# shellcheck disable=SC2086  # WHERE is a flag list
+cc -O2 -Wall -o "$OUT" "$HERE/modus-shim.c" "$HERE/syscall-stub.S" $WHERE
 codesign --force --sign - "$OUT" >/dev/null 2>&1 || true
 echo "wrote $OUT ($(wc -c < "$OUT" | tr -d ' ') bytes)"

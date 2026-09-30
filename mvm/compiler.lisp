@@ -524,6 +524,31 @@
    image (cross-emit) must bind it to that image's delta, not inherit this
    one's.")
 
+(defparameter *pcrel-layout* nil
+  "T in a PC-relative AArch64 image build (MODUS_PCREL, translate-aarch64
+   *A64-PCREL*): an integer the compiler loads that lies in the image's own
+   layout — the runtime-data region, heap, JIT arena or code — is emitted as
+   :LI-ADDR / :LI-TADDR, so the translator forms it from the PC and the layout
+   can slide.  Recognised BY VALUE (PCREL-LAYOUT-ADDR-P): after %CONV-SUBST an
+   address is just a literal.  The ranges are far above anything the runtime
+   source writes as a number (the layout sits at 12 GB and up), and a PC-relative
+   image built from such a literal would compute it as slid, not fail — so the
+   build's census (docs/macos-hosting.md) is the check.  NIL in-image: code the
+   image compiles at runtime is absolute, with the slid values.")
+
+(defun pcrel-layout-addr-p (v)
+  (and (eq *pcrel-layout* t) (integerp v)
+       ;; (CONV-REAL of the END would not move: it is outside the region.)
+       (or (let ((lo (conv-real +conv-region-low+)))
+             (and (>= v lo) (< v (+ lo (- +conv-region-end+ +conv-region-low+)))))
+           (let ((h (hosted-layout :heap-base 0)))
+             (and (> h 0) (>= v h) (< v (+ h (hosted-layout :heap-size #x38000000)))))
+           (let ((a (hosted-layout :jit-arena-base 0)))
+             (and (> a 0) (>= v a) (< v (+ a #x20000000))))
+           ;; code, and the Darwin syscall slot one 16 KB page below it
+           (let ((c (hosted-layout :code-base 0)))
+             (and (> c 0) (>= v (- c #x4000)) (< v (+ c #x10000000)))))))
+
 (defun conv-real (addr)
   "ADDR moved by the region's delta when it is a virtual runtime-data address;
    anything else unchanged.  Tolerates an unset *CONV-DELTA* (in-image, where
@@ -578,6 +603,19 @@
                (consp (cddr form)) (integerp (caddr form)) (null (cdddr form)))
     (error "MVM compiler: %LAYOUT needs a keyword and a literal default, got ~S" form))
   (compile-form (hosted-layout (cadr form) (caddr form)) env dest))
+
+(defun compile-link-int (form env dest)
+  "(%LINK-INT K) — the integer K exactly as written, never an :LI-ADDR: a
+   link-time NUMBER that may equal a layout address without being one (the
+   co-init's slide arithmetic, hosted-layout-env LAYOUT-COINIT-TEXT)."
+  (unless (and (consp (cdr form)) (integerp (cadr form)) (null (cddr form)))
+    (error "MVM compiler: %LINK-INT needs one literal integer, got ~S" form))
+  (if (and (eq *pcrel-layout* t) (typep (cadr form) 'fixnum))
+      ;; The plain tagged :LI EMIT-LI-TAGGED would emit without the rule.
+      ;; (Not a rebinding of *PCREL-LAYOUT*: the in-image compiler shares this
+      ;; source, and a LET there binds only lexically.)
+      (emit-ir :li dest (ash (cadr form) +fixnum-shift+))
+      (compile-form (cadr form) env dest)))
 
 (defun %conv-rebase-form (form)
   "FORM with its provable region constant replaced by the real address — the
@@ -6515,9 +6553,19 @@
      (emit-ir :li-halves dest
               (* (logand value #x7FFFFFFF) 2)
               (logand (ash value -31) #xFFFFFFFF)))
+    ((pcrel-layout-addr-p value)
+     ;; A layout address used as a fixnum: PC-relative (see the predicate).
+     (emit-ir :li-taddr dest value))
     (t
      (let ((tagged (ash value +fixnum-shift+)))
        (if (zerop tagged) (emit-ir :li dest 0) (emit-ir :li dest tagged))))))
+
+(defun emit-li-addr (dest addr)
+  "Load ADDR, a raw machine address, into DEST: :LI-ADDR when it lies in a
+   PC-relative build's layout, else the plain :LI."
+  (if (pcrel-layout-addr-p addr)
+      (emit-ir :li-addr dest addr)
+      (emit-ir :li dest addr)))
 
 (defun compile-integer (value dest)
   "Load an integer literal into DEST.
@@ -6915,6 +6963,8 @@
        (compile-conv-addr form env dest))
       ((= op-name #.(compute-name-hash "%LAYOUT"))
        (compile-layout form env dest))
+      ((= op-name #.(compute-name-hash "%LINK-INT"))
+       (compile-link-int form env dest))
       ;; PERF: (typep X 'SIMPLE-TYPE) with a literal standard type name folds
       ;; to the inline predicate at compile time (the runtime TYPEP walks a
       ;; 45-clause chain; standard type names cannot be redefined, CLHS 11.1.2.1.2).
@@ -16773,11 +16823,11 @@
     ;; Save MV count and up to n-mv-slots extra values on the stack.
     ;; These are raw u64 (tagged CL objects), loaded without fixnum shift.
     (let ((mv-temp (alloc-temp-reg)))
-      (emit-ir :li mv-temp (conv-real +mv-count-addr+))
+      (emit-li-addr mv-temp (conv-real +mv-count-addr+))
       (emit-ir :load mv-temp mv-temp (%mv-width))
       (emit-ir :push mv-temp)
       (dotimes (i n-mv-slots)
-        (emit-ir :li mv-temp (conv-real (+ +mv-values-addr+ (* i 8))))
+        (emit-li-addr mv-temp (conv-real (+ +mv-values-addr+ (* i 8))))
         (emit-ir :load mv-temp mv-temp (%mv-width))
         (emit-ir :push mv-temp))
       (free-temp-reg))
@@ -16802,11 +16852,11 @@
           (addr-temp (alloc-temp-reg)))
       (loop for i from (1- n-mv-slots) downto 0 do
         (emit-ir :pop mv-temp)
-        (emit-ir :li addr-temp (conv-real (+ +mv-values-addr+ (* i 8))))
+        (emit-li-addr addr-temp (conv-real (+ +mv-values-addr+ (* i 8))))
         (emit-ir :store addr-temp mv-temp (%mv-width)))
       ;; Restore MV count
       (emit-ir :pop mv-temp)
-      (emit-ir :li addr-temp (conv-real +mv-count-addr+))
+      (emit-li-addr addr-temp (conv-real +mv-count-addr+))
       (emit-ir :store addr-temp mv-temp (%mv-width))
       (free-temp-reg)
       (free-temp-reg))
@@ -18793,9 +18843,9 @@
             (emit-ir :mod r-temp n-temp dest)
             (emit-ir :pop q-temp)
             ;; MV[0] = remainder, MV-COUNT = 2 (n-temp reused as addr)
-            (emit-ir :li n-temp (conv-real +mv-values-addr+))
+            (emit-li-addr n-temp (conv-real +mv-values-addr+))
             (emit-ir :store n-temp r-temp (%mv-width))
-            (emit-ir :li n-temp (conv-real +mv-count-addr+))
+            (emit-li-addr n-temp (conv-real +mv-count-addr+))
             (emit-ir :li r-temp (ash 2 +fixnum-shift+))
             (emit-ir :store n-temp r-temp (%mv-width))
             (emit-ir :mov dest q-temp)
@@ -18844,9 +18894,9 @@
           (emit-ir :mod r-temp n-temp d-temp)
           (emit-ir :pop q-temp)
           ;; MV[0] = remainder, MV-COUNT = 2
-          (emit-ir :li addr-temp (conv-real +mv-values-addr+))
+          (emit-li-addr addr-temp (conv-real +mv-values-addr+))
           (emit-ir :store addr-temp r-temp (%mv-width))
-          (emit-ir :li addr-temp (conv-real +mv-count-addr+))
+          (emit-li-addr addr-temp (conv-real +mv-count-addr+))
           (emit-ir :li r-temp (ash 2 +fixnum-shift+))
           (emit-ir :store addr-temp r-temp (%mv-width))
           (emit-ir :mov dest q-temp)
@@ -20587,7 +20637,7 @@
   "Compile (%error-handler-active-p) — returns T if handler-case active, NIL otherwise.
    Reads saved RSP at fixed address 0x10000180. Non-zero means active."
   ;; Load the saved RSP from fixed address
-  (emit-ir :li dest (conv-real #x10000180))
+  (emit-li-addr dest (conv-real #x10000180))
   ;; THIS THREAD's armed frame — see THE PER-THREAD WINDOW.  A thread asking
   ;; "is a handler-case active?" must not be answered about another one.
   (emit-ir :load dest dest (%mv-width))
@@ -24147,6 +24197,8 @@
       (:li    10)
       (:li-halves 10)
       (:li-const 10)
+      (:li-addr 10)
+      (:li-taddr 10)
       ;; li-func now emits FN-ADDR (1 opcode + 1 reg + 4 imm32 = 6 bytes)
       (:li-func 6)
 
@@ -24478,6 +24530,8 @@
            ;; Same wire bytes as :li for the combined word; used by the integer/
            ;; bignum literal path to avoid forming value<<1 as one in-image int.
            (mvm-li-halves buf (second insn) (third insn) (fourth insn)))
+          (:li-addr (mvm-li-addr buf (second insn) (third insn)))
+          (:li-taddr (mvm-li-taddr buf (second insn) (third insn)))
           (:li-const
            ;; Load tagged address of constant-pool[idx].  The translator
            ;; emits a placeholder absolute load; image-assembly patches it

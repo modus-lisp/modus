@@ -73,7 +73,88 @@ static inline void modus_jit_wp(int executable) {
 }
 
 extern void modus_syscall_stub(void);
+
 extern void modus_enter(uint64_t sp, uint64_t entry) __attribute__((noreturn));
+// sigaltstack is prohibited on watchOS: there the fault handler runs on the
+// faulting thread's own stack.
+static inline void modus_altstack(stack_t *ss) {
+#if TARGET_OS_WATCH
+    (void)ss;
+#else
+    sigaltstack(ss, NULL);
+#endif
+}
+// The thread the image STARTED on: Linux's thread-group leader, whose TID is
+// the PID.  The process's main thread on macOS; on iOS a thread of its own,
+// because the main thread belongs to UIKit (below).
+static __thread int image_leader;
+
+#if TARGET_OS_IPHONE
+// AN iOS APP MUST FINISH LAUNCHING WITHIN 20 SECONDS, or FrontBoard's launch
+// watchdog kills it (0x8BADF00D, "process-launch watchdog transgression":
+// measured on an iPhone 15 Pro, every run over 20 s).  Launching finishes
+// when UIApplicationMain has called the delegate's didFinishLaunching, so the
+// main thread runs UIKit and the image runs on a thread of its own.  The
+// delegate class is built at run time so the shim stays C.
+#include <objc/runtime.h>
+#include <objc/message.h>
+#include <CoreFoundation/CoreFoundation.h>
+// host/ios/modus-ui.m (host/watch/modus-watch.swift on watchOS): a framebuffer
+// and touch events for the image.
+extern void modus_ui_init(void);
+extern void modus_ui_start(void);
+extern long modus_ui_call(long nr, long a0, long a1, long a2, long a3);
+#if TARGET_OS_WATCH
+// watchOS has no public UIKit: the SwiftUI app in host/watch/modus-watch.swift
+// owns the main thread instead.
+extern void modus_watch_main(void) __attribute__((noreturn));
+#else
+extern int UIApplicationMain(int argc, char **argv, CFStringRef principal, CFStringRef delegate);
+static signed char modus_did_finish(void *self, SEL cmd, void *app, void *opts) {
+    (void)self; (void)cmd; (void)opts;
+    // Keep the screen from AUTO-LOCKING while modus is in front: a locked
+    // device backgrounds the app and iOS suspends it within seconds, which
+    // froze long runs mid-way.  (A lock by the user still suspends it.)
+    ((void (*)(void *, SEL, signed char))objc_msgSend)(app, sel_registerName("setIdleTimerDisabled:"), 1);
+    modus_ui_start();
+    return 1;
+}
+#endif
+struct image_start { uint64_t sp, entry; };
+static void *image_thread(void *arg) {
+    struct image_start st = *(struct image_start *)arg;
+    // sigaltstack is per thread: the fault handler needs one here too.
+    stack_t ss = { .ss_sp = malloc(1 << 16), .ss_size = 1 << 16, .ss_flags = 0 };
+    modus_altstack(&ss);
+    image_leader = 1;
+    modus_enter(st.sp, st.entry);
+}
+static void run_image_beside_uikit(int argc, char **argv, uint64_t sp, uint64_t entry)
+    __attribute__((noreturn));
+static void run_image_beside_uikit(int argc, char **argv, uint64_t sp, uint64_t entry) {
+    static struct image_start st;
+    st.sp = sp; st.entry = entry;
+    modus_ui_init();
+    pthread_attr_t at; pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    pthread_t th;
+    if (pthread_create(&th, &at, image_thread, &st) != 0) {
+        fprintf(stderr, "modus-shim: could not start the image thread\n");
+        _exit(1);
+    }
+#if TARGET_OS_WATCH
+    (void)argc; (void)argv;
+    modus_watch_main();
+#else
+    Class c = objc_allocateClassPair(objc_getClass("UIResponder"), "ModusAppDelegate", 0);
+    class_addMethod(c, sel_registerName("application:didFinishLaunchingWithOptions:"),
+                    (IMP)modus_did_finish, "c@:@@");
+    objc_registerClassPair(c);
+    UIApplicationMain(argc, argv, NULL, CFSTR("ModusAppDelegate"));
+    _exit(0);   // UIApplicationMain does not return; the image's exit() ends the app
+#endif
+}
+#endif
 
 #define PAGE16K 0x4000ULL
 #define ROUND_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
@@ -184,11 +265,53 @@ static int in_jit(uint64_t a) {
     return 0;
 }
 
+// RESERVED RANGES: the runtime-data region, heap and JIT arena of an image
+// running in place, which the executable reserves as zero-fill segments
+// (host/macos/image-segments.sh) so nothing else can take the address space
+// before the image's boot stub maps them.  A fixed request that lies inside
+// one maps OVER it in place.
+#define MAXRES 4
+static struct { uint64_t lo, hi; } reserved[MAXRES];
+static int n_reserved;
+static int in_reserved(uint64_t a, uint64_t len) {
+    for (int i = 0; i < n_reserved; i++)
+        if (a >= reserved[i].lo && a + len <= reserved[i].hi) return 1;
+    return 0;
+}
+static void note_reservation(const char *seg) {
+    unsigned long n = 0;
+    uint8_t *p = getsectiondata(&_mh_execute_header, seg, "__reserve", &n);
+    if (p && n && n_reserved < MAXRES) {
+        reserved[n_reserved].lo = (uint64_t)(uintptr_t)p;
+        reserved[n_reserved].hi = (uint64_t)(uintptr_t)p + n;
+        n_reserved++;
+    }
+}
+
 static long dx_mmap(long addr, long len, long prot, long flags, long fd, long off) {
     int f = (int)(flags & 3);                      // SHARED/PRIVATE agree
     if (flags & 0x20) f |= MAP_ANON;
     int noreplace = (flags & 0x100000) != 0;       // MAP_FIXED_NOREPLACE
     int jit = (prot & PROT_EXEC) && (flags & 0x20);
+    if (((flags & 0x10) || noreplace) && addr && in_reserved((uint64_t)addr, (uint64_t)len)) {
+        // Ours already: map over the reservation at exactly that address.
+        // JIT memory cannot be MAP_FIXED on Darwin, so release the range and
+        // take it back as MAP_JIT at the (now free) address; where there is
+        // no JIT (iOS without the entitlement) it becomes plain RW data.
+        if (jit) {
+            munmap((void *)addr, (size_t)len);
+            void *p = mmap((void *)addr, (size_t)len, (int)prot, f | MAP_JIT, (int)fd, (off_t)off);
+            if (p == (void *)addr) {
+                if (n_jit < MAXJIT) { jit_regions[n_jit].lo = (uint64_t)p; jit_regions[n_jit].hi = (uint64_t)p + (uint64_t)len; n_jit++; }
+                modus_jit_wp(1);
+                return (long)p;
+            }
+            if (p != MAP_FAILED) munmap(p, (size_t)len);
+            prot &= ~PROT_EXEC;
+        }
+        void *p = mmap((void *)addr, (size_t)len, (int)prot, f | MAP_FIXED, (int)fd, (off_t)off);
+        return p == MAP_FAILED ? -lx_errno(errno) : (long)p;
+    }
     // macOS refuses RWX anonymous memory without MAP_JIT, and MAP_JIT with
     // MAP_FIXED; it does honour MAP_JIT's address HINT (probed), which keeps
     // the JIT arena at its fixed address for save-and-die.
@@ -446,7 +569,7 @@ static long lx_tid(uint64_t id) {
     return t ? t : 1;
 }
 static long my_tid(void) {
-    if (pthread_main_np()) return getpid();     // Linux: the group leader's TID is the PID
+    if (image_leader) return getpid();          // Linux: the group leader's TID is the PID
     uint64_t id = 0;
     pthread_threadid_np(NULL, &id);
     return lx_tid(id);
@@ -462,7 +585,7 @@ static void *clone_child(void *arg) {
     pthread_setspecific(delta_key, cs.delta);   // the parent's window, as Linux inherits TPIDR_EL0
     // sigaltstack is per thread: the fault handler needs one here too.
     stack_t ss = { .ss_sp = malloc(1 << 16), .ss_size = 1 << 16, .ss_flags = 0 };
-    sigaltstack(&ss, NULL);
+    modus_altstack(&ss);
     modus_resume(&cs.ctx);
 }
 
@@ -634,6 +757,10 @@ static long modus_syscall_1(long a0, long a1, long a2, long a3, long a4, long a5
         return 0; }
     case 210: RET(shutdown((int)a0, (int)a1));      // SHUT_* agree
     case 103: return 0;                            // setitimer
+#if TARGET_OS_IPHONE
+    case 1001: case 1002: case 1003: case 1004:    // the framebuffer (host/ios/modus-ui.m)
+        return modus_ui_call(nr, a0, a1, a2, a3);
+#endif
     default:
         if (nr >= 0 && nr < 512 && !unknown_seen[nr]) {
             unknown_seen[nr] = 1;
@@ -730,7 +857,7 @@ static void report_fault(int sig, siginfo_t *si, void *uc_) {
 static void install_fault_report(void) {
     static uint8_t altstack[1 << 16];
     stack_t ss = { .ss_sp = altstack, .ss_size = sizeof altstack, .ss_flags = 0 };
-    sigaltstack(&ss, NULL);
+    modus_altstack(&ss);
     struct sigaction sa; memset(&sa, 0, sizeof sa);
     // SA_NODEFER: a chained image handler never returns (it branches into a
     // handler-case frame), so the signal must not stay blocked afterwards.
@@ -747,47 +874,81 @@ struct elf64_phdr { uint32_t type, flags; uint64_t offset, vaddr, paddr, filesz,
 
 int main(int argc, char **argv, char **envp) {
     unsigned long size = 0;
-    uint8_t *img = getsectiondata(&_mh_execute_header, "__TEXT", "__modus", &size);
-    if (!img || size < 64) die("no embedded image (__TEXT,__modus)", 0);
+    // IN PLACE (docs/macos-hosting.md, "Running in place"): a PC-relative
+    // image linked into its own segments (host/macos/image-segments.sh) runs
+    // where the loader put it — code in __MODUS, the syscall slot page in
+    // __MODUSS just below, the BSS tail in __MODUSB just above.  Otherwise
+    // the image sits in __TEXT,__modus and is remapped to its link address.
+    uint8_t *img = getsectiondata(&_mh_execute_header, "__MODUS", "__image", &size);
+    int in_place = img != NULL;
+    if (!in_place) img = getsectiondata(&_mh_execute_header, "__TEXT", "__modus", &size);
+    if (!img || size < 64) die("no embedded image (__MODUS,__image or __TEXT,__modus)", 0);
     if ((uintptr_t)img & (PAGE16K - 1)) die("embedded image is not 16 KB aligned", (long)(uintptr_t)img);
     const struct elf64_ehdr *eh = (const void *)img;
     if (memcmp(eh->ident, "\177ELF", 4) || eh->machine != 183) die("not an aarch64 ELF", 0);
     const struct elf64_phdr *ph = (const void *)(img + eh->phoff);
     if (ph->type != 1 || ph->offset != 0) die("unexpected program header", ph->type);
 
-    // 1. the code: remap our own signed pages to the link address.
-    modus_vaddr_t code = ph->vaddr;
+    // MODUS_SLIDE (hex, 16 KB multiple, "-" for down): map the whole layout
+    // that far from where it was linked.  Only a PC-relative image (built with
+    // MODUS_PCREL=1, docs/macos-hosting.md) runs slid; its boot stub then maps
+    // the region, heap and arena at the same slide by itself.
+    int64_t slide = 0;
+    if (in_place) slide = (int64_t)((uint64_t)(uintptr_t)img - ph->vaddr);
+    else { const char *e = getenv("MODUS_SLIDE");
+      if (e && *e) {
+          slide = (int64_t)strtoull(e[0] == '-' ? e + 1 : e, NULL, 16);
+          if (e[0] == '-') slide = -slide;
+          if (slide & (int64_t)(PAGE16K - 1)) die("MODUS_SLIDE is not a 16 KB multiple", (long)slide);
+      } }
+    uint64_t link = ph->vaddr + (uint64_t)slide;
+
     modus_vsize_t file_span = ROUND_UP(ph->filesz, PAGE16K);
+    modus_vaddr_t slot = link - PAGE16K;
+    if (in_place) {
+        // The loader already placed all three segments, slid together; check
+        // they are where the image's PC-relative sites expect them.
+        unsigned long n = 0;
+        uint8_t *s = getsectiondata(&_mh_execute_header, "__MODUSS", "__slot", &n);
+        if ((uint64_t)(uintptr_t)s != slot || n < 8) die("__MODUSS is not one page below the image", (long)(uintptr_t)s);
+        if (ph->memsz > file_span) {
+            uint8_t *b = getsectiondata(&_mh_execute_header, "__MODUSB", "__bss", &n);
+            if ((uint64_t)(uintptr_t)b != link + file_span || n < ph->memsz - file_span)
+                die("__MODUSB is not the image's BSS tail", (long)(uintptr_t)b);
+        }
+    } else {
+    // 1. the code: remap our own signed pages to the link address.
+    modus_vaddr_t code = link;
     vm_prot_t cur = 0, max = 0;
     kern_return_t kr = mach_vm_remap(mach_task_self(), &code, file_span, 0,
                                      VM_FLAGS_FIXED, mach_task_self(),
                                      (modus_vaddr_t)(uintptr_t)img, FALSE,
                                      &cur, &max, VM_INHERIT_NONE);
-    if (kr != KERN_SUCCESS || code != ph->vaddr) {
+    if (kr != KERN_SUCCESS || code != link) {
         // Say what is in the way: the fixed layout collides with whatever the
         // loader or the allocator put there this launch.
-        vm_address_t ra = (vm_address_t)ph->vaddr; vm_size_t rs = 0;
+        vm_address_t ra = (vm_address_t)link; vm_size_t rs = 0;
         vm_region_basic_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
         mach_port_t obj = MACH_PORT_NULL;
         if (vm_region_64(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
                          (vm_region_info_t)&info, &cnt, &obj) == KERN_SUCCESS)
             fprintf(stderr, "modus-shim: in the way at %#llx: region [%#lx, %#lx) prot %d\n",
-                    (unsigned long long)ph->vaddr, (unsigned long)ra, (unsigned long)(ra + rs), info.protection);
+                    (unsigned long long)link, (unsigned long)ra, (unsigned long)(ra + rs), info.protection);
         fprintf(stderr, "modus-shim: this executable is at %p (image section %p, %#lx bytes)\n",
                 (void *)&_mh_execute_header, (void *)img, size);
         die("mach_vm_remap of the image code failed", kr);
     }
     // p_memsz slack past the file (a page of BSS on a high-linked image).
     if (ph->memsz > file_span) {
-        modus_vaddr_t tail = ph->vaddr + file_span;
+        modus_vaddr_t tail = link + file_span;
         kr = mach_vm_allocate(mach_task_self(), &tail, ROUND_UP(ph->memsz - file_span, PAGE16K), VM_FLAGS_FIXED);
         if (kr != KERN_SUCCESS) die("could not map the image's BSS tail", kr);
     }
 
     // 2. the syscall slot, one 16 KB page below the code base.
-    modus_vaddr_t slot = ph->vaddr - PAGE16K;
     kr = mach_vm_allocate(mach_task_self(), &slot, PAGE16K, VM_FLAGS_FIXED);
     if (kr != KERN_SUCCESS) die("could not map the syscall slot page", kr);
+    }
     *(void **)(uintptr_t)slot = (void *)modus_syscall_stub;
 
     // 3. a Linux initial stack: argc, argv..., NULL, envp..., NULL, AT_NULL.
@@ -829,8 +990,18 @@ int main(int argc, char **argv, char **envp) {
     sp[k++] = 0;
     sp[k++] = 0; sp[k++] = 0;                      // auxv: AT_NULL
 
-    g_code_lo = ph->vaddr; g_code_hi = ph->vaddr + ph->memsz;
+    g_code_lo = link; g_code_hi = link + ph->memsz;
+    if (in_place) {
+        note_reservation("__MODUSR");
+        note_reservation("__MODUSH");
+        note_reservation("__MODUSA");
+    }
     reserve_delta_key();
     install_fault_report();
-    modus_enter((uint64_t)(uintptr_t)sp, eh->entry);
+#if TARGET_OS_IPHONE
+    run_image_beside_uikit(argc, argv, (uint64_t)(uintptr_t)sp, eh->entry + (uint64_t)slide);
+#else
+    image_leader = 1;
+    modus_enter((uint64_t)(uintptr_t)sp, eh->entry + (uint64_t)slide);
+#endif
 }

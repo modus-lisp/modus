@@ -343,7 +343,16 @@
 
 (defun %symtab-index-sync (pkg slot)
   "Return PKG's hash index for the alist in data SLOT (2=internal,
-   3=external), synced to that alist's current head."
+   3=external), synced to that alist's current head.  A WRITE: call it under
+   the runtime lock (%SYMTAB-FIND-IN does), so two threads cannot sync one
+   index at once and what it allocates lands beside the package in region 0.
+
+   READERS TAKE NO LOCK (%SYMTAB-FIND-IN on an index already in sync), so
+   every store here that a reader can follow publishes a finished object: a
+   rebuilt index is filled while still private and installed by one store,
+   an incremental sync only PUTHASHes (which publishes safely), and HEAD moves
+   last, after %PUBLISH-FENCE, so a reader that sees HEAD match sees every
+   entry it covers."
   (let ((data (%pkg-data pkg)))
     (let ((table (aref data slot))
           (islot (+ slot 5))
@@ -356,6 +365,7 @@
         ;; intern table exists at boot.
         (aset idx 0 0)
         (aset idx 1 (make-hash-table))
+        (%publish-fence)
         (aset data islot idx))
       (let ((head (aref idx 0)))
         (unless (eq head table)
@@ -365,55 +375,64 @@
               (when (null cur) (return nil))
               (setq new (cons (car cur) new))
               (setq cur (cdr cur)))
-            (unless found
-              (aset idx 1 (make-hash-table))
-              (setq new nil)
-              (let ((c table))
+            (let ((ht (if found (aref idx 1) (make-hash-table))))
+              (unless found
+                (setq new nil)
+                (let ((c table))
+                  (loop
+                    (when (null c) (return nil))
+                    (setq new (cons (car c) new))
+                    (setq c (cdr c)))))
+              ;; NEW is oldest-first, so pushing in order leaves the
+              ;; frontmost (newest) entry at the head of its bucket.
+              (let ((n new))
                 (loop
-                  (when (null c) (return nil))
-                  (setq new (cons (car c) new))
-                  (setq c (cdr c)))))
-            ;; NEW is oldest-first, so pushing in order leaves the
-            ;; frontmost (newest) entry at the head of its bucket.
-            (let ((ht (aref idx 1))
-                  (n new))
-              (loop
-                (when (null n) (return nil))
-                (let ((entry (car n)))
-                  (let ((k (compute-name-hash (car entry))))
-                    (puthash k ht (cons entry (gethash k ht)))))
-                (setq n (cdr n)))))
+                  (when (null n) (return nil))
+                  (let ((entry (car n)))
+                    (let ((k (compute-name-hash (car entry))))
+                      (puthash k ht (cons entry (gethash k ht)))))
+                  (setq n (cdr n))))
+              (unless found
+                (%publish-fence)
+                (aset idx 1 ht))))
+          (%publish-fence)
           (aset idx 0 table)))
       (aref idx 1))))
 
+(defun %symtab-probe (ht name-string)
+  "The entry for NAME-STRING in symtab index HT, or NIL.  No lock, no write."
+  (let ((cur (%ht-get-ro (compute-name-hash name-string) ht))
+        (res nil))
+    (loop
+      (when (null cur) (return res))
+      (let ((entry (car cur)))
+        (when (string= (car entry) name-string)
+          (return entry)))
+      (setq cur (cdr cur)))))
+
 (defun %symtab-find-in (pkg slot name-string)
-  "O(1) equivalent of (%symtab-find (aref (%pkg-data pkg) SLOT) NAME-STRING)."
-  (let ((table (aref (%pkg-data pkg) slot)))
-    ;; UNDER THE RUNTIME-TABLE LOCK, because a lookup WRITES: the index is
-    ;; built and synced lazily, here.  On a worker that put the index's hash
-    ;; table and bucket conses in the worker's own region and stored them into
-    ;; the package -- region 0 -- so they dangled once the worker was gone, and
-    ;; FIND-SYMBOL on the main thread then missed symbols that were plainly
-    ;; there (bordeaux-threads: "no threads (SB-THREAD:THREAD-ALIVE-P)").  Two
-    ;; threads syncing at once also raced each other's PUTHASH.  Under the lock
-    ;; the index lives in the arena with the tables that point at it.  The lock
-    ;; is recursive (INTERN calls in here holding it) and, with threads off, a
-    ;; load and a branch.  Nothing below signals.
+  "O(1) equivalent of (%symtab-find (aref (%pkg-data pkg) SLOT) NAME-STRING).
+
+   AN INDEX ALREADY IN SYNC IS READ WITHOUT THE LOCK — the common case, and
+   what lets INTERN and FIND-SYMBOL of an existing symbol run on several
+   threads at once.  A stale one is synced UNDER the lock (recursive, so this
+   is also safe inside INTERN's locked body).  Before, FIND-SYMBOL and the
+   printer synced it with no lock at all: two threads could rebuild one
+   index at once, and a worker's sync allocated the index in its own region
+   and stored it into the package, in region 0.  Nothing in the locked arm
+   can signal."
+  (let* ((data (%pkg-data pkg))
+         (table (aref data slot)))
     (if (null table)
         nil
-        (progn
-          (%rt-enter)
-          (let ((r (let ((ht (%symtab-index-sync pkg slot)))
-                     (let ((cur (gethash (compute-name-hash name-string) ht))
-                           (res nil))
-                       (loop
-                         (when (null cur) (return res))
-                         (let ((entry (car cur)))
-                           (when (string= (car entry) name-string)
-                             (return entry)))
-                         (setq cur (cdr cur)))))))
-            (%rt-leave)
-            r)))))
+        (let ((idx (aref data (+ slot 5))))
+          (if (and idx (eq (aref idx 0) table))
+              (%symtab-probe (aref idx 1) name-string)
+              (progn
+                (%rt-enter)
+                (let ((r (%symtab-probe (%symtab-index-sync pkg slot) name-string)))
+                  (%rt-leave)
+                  r)))))))
 
 (defun %symtab-add (table name-string symbol)
   "Add SYMBOL to alist TABLE under NAME-STRING. Returns new table."
@@ -1151,18 +1170,41 @@
    LOCKED, like %INTERN-SYMBOL-PKG and for the same reason — see
    %CL-INTERN-IN above.  Everything that can SIGNAL (the arg-count check,
    package resolution, the string designator) runs HERE, before the lock, so
-   no longjmp can escape a held lock."
+   no longjmp can escape a held lock.
+
+   A SYMBOL THAT ALREADY EXISTS IS FOUND WITHOUT THE LOCK — external, then
+   internal, then inherited, the order %CL-INTERN-IN checks, through
+   %SYMTAB-FIND-IN's lock-free probe.  Only a miss takes the lock, and
+   %CL-INTERN-IN looks again before it creates anything."
   (when (and pkg-arg (cdr pkg-arg))
     (%signal-program-error))
   (let ((pkg (%resolve-package (if pkg-arg (car pkg-arg) *package*)))
         (name-str (%pkg-string-designator name)))
     (if (null pkg)
         (values nil nil)
-        (progn
-          (%rt-enter)
-          (let ((r (%cl-intern-in pkg name-str)))
-            (%rt-leave)
-            (values (car r) (car (cdr r))))))))
+        (let ((ext (%symtab-find-in pkg 3 name-str)))
+          (if ext
+              (values (cdr ext) :external)
+              (let ((int (%symtab-find-in pkg 2 name-str)))
+                (if int
+                    (values (cdr int) :internal)
+                    (let ((inh (%cl-intern-inherited pkg name-str)))
+                      (if inh
+                          (values (cdr inh) :inherited)
+                          (progn
+                            (%rt-enter)
+                            (let ((r (%cl-intern-in pkg name-str)))
+                              (%rt-leave)
+                              (values (car r) (car (cdr r))))))))))))))
+
+(defun %cl-intern-inherited (pkg name-str)
+  "The external entry for NAME-STR in the first package PKG uses that has
+   one, or NIL — %CL-INTERN-IN's inherited check, without the lock."
+  (let ((use (%pkg-use-list pkg)) (found nil))
+    (loop
+      (when (or found (null use)) (return found))
+      (setq found (%symtab-find-in (car use) 3 name-str))
+      (setq use (cdr use)))))
 
 ;;; --- export / unexport ---
 

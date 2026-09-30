@@ -1622,6 +1622,16 @@ modus: waited 60 s for the runtime lock; its owner leaked it (faulted, unwound o
 ")))
                     0)))))))
 
+(defun %publish-fence ()
+  "The hosted twin of mvm/prelude.lisp's no-op: once threads are armed, a
+   barrier, so the table writers' new objects are complete before the store
+   that publishes them reaches a lock-free reader (%HT-GET-RO, %GV-CELL) on
+   another core.  Writers only — every one of them already holds the lock —
+   so readers pay nothing."
+  (if (= (mem-ref #x10000DB8 :u32) 0)
+      0
+      (progn (memory-barrier) 0)))
+
 (defun %rt-enter-locked ()
   (let ((me (+ (%thr-cpu) 1)))
     (if (= (%gc-read64 (%rt-owner-addr)) me)
@@ -2588,9 +2598,20 @@ modus: a thread needed the runtime lock but the lock arena is exhausted or missi
    meaningful question on a thread whose cell and R12 belong together."
   (if (>= slot (%ha-nregions))
       0
-      (let ((rcb (%ha-rcb slot)))
-        (%gc-region-init rcb (%ha-region-from slot) (%ha-region-to slot)
-                         *ha-rsize* stack-top k)
+      (let ((rcb (%ha-rcb slot))
+            (from (%ha-region-from slot))
+            (to (%ha-region-to slot)))
+        ;; A REUSED SLOT'S REGION STILL CARRIES THE LAST THREAD'S BITMAP BITS,
+        ;; in both semispaces.  The collector trusts a set object-start or
+        ;; cons-kind bit, so the new thread's first collections walked into the
+        ;; middle of objects that no longer existed: an interpreted loop (which
+        ;; allocates as it runs, unlike JIT code) in a slot whose previous
+        ;; thread had collected its region an even number of times died with a
+        ;; TYPE-ERROR its own HANDLER-CASE never saw, and with an odd number
+        ;; the collector read past the heap's end (test/hosted-slot-reuse.lisp).
+        (%ha-bitmap-clear from (+ from *ha-rsize*))
+        (%ha-bitmap-clear to (+ to *ha-rsize*))
+        (%gc-region-init rcb from to *ha-rsize* stack-top k)
         rcb)))
 
 (defun %escape-describe (c)
@@ -2602,7 +2623,14 @@ modus: a thread needed the runtime lock but the lock arena is exhausted or missi
             (if fc
                 (format nil "~A (~A ~S)" (%condition-type-name c) fc
                         (handler-case (simple-condition-format-arguments c) (t (c3) nil)))
-                (format nil "~A" (%condition-type-name c))))
+                ;; A TYPE-ERROR names its datum and the type it failed, which
+                ;; is most of what anyone needs to find it.
+                (let ((ty (handler-case (type-error-expected-type c) (t (c5) :none))))
+                  (if (eq ty :none)
+                      (format nil "~A" (%condition-type-name c))
+                      (format nil "~A (datum ~S, expected ~S)" (%condition-type-name c)
+                              (handler-case (type-error-datum c) (t (c6) :unprintable))
+                              ty)))))
           (format nil "~S" c))
     (t (c4) "an unprintable condition")))
 

@@ -735,7 +735,52 @@
   (let ((ty (if (streamp stream) (%stream-type stream) 9)))
     (if (or (= ty 3) (= ty 4) (= ty 6) (= ty 7))
         (read-byte stream eof-error-p eof-value)
-        (%fs-read-byte-raw stream eof-error-p eof-value))))
+        (%fs-read-element stream eof-error-p eof-value))))
+
+;;; --- Multi-byte elements ---
+;;; A file stream of element type (UNSIGNED-BYTE N) or (SIGNED-BYTE N) with
+;;; N > 8 stores each element in CEIL(N/8) bytes, little-endian (signed:
+;;; two's complement at that width).  READ-BYTE / WRITE-BYTE move that many
+;;; bytes; FILE-POSITION and FILE-LENGTH count ELEMENTS.  %FS-POS stays a BYTE
+;;; offset, so the buffered read path and lseek are unchanged, and every
+;;; 1-byte stream (text included) takes exactly the old path.  This used to
+;;; write and read ONE byte per element whatever N was: every value >= 256
+;;; came back truncated (FILE-POSITION.7/.8, FILE-LENGTH.3/.4).
+(defun %fs-elt-spec (stream)
+  "(BYTES . SIGNEDP) for STREAM's element type."
+  (let ((et (%fs-element-type stream)))
+    ;; UNSIGNED-BYTE <= 8 bits is the historic 1-byte path (CONS 1 NIL);
+    ;; SIGNED-BYTE of ANY width needs sign extension on read, so it always
+    ;; takes the element path, 1 byte when N <= 8.
+    (if (and (consp et) (symbolp (car et)) (consp (cdr et)) (integerp (cadr et))
+             (> (cadr et) 0))
+        (let ((nm (symbol-name (car et))) (k (floor (+ (cadr et) 7) 8)))
+          (cond ((and (string= nm "UNSIGNED-BYTE") (> k 1)) (cons k nil))
+                ((string= nm "SIGNED-BYTE") (cons k t))
+                (t (cons 1 nil))))
+        (cons 1 nil))))
+
+(defun %fs-elt-bytes (stream) (car (%fs-elt-spec stream)))
+
+(defun %fs-read-element (stream eof-error-p eof-value)
+  "Read one ELEMENT (1 or more bytes) from a type-9 file stream."
+  (let* ((spec (%fs-elt-spec stream)) (k (car spec)))
+    (if (and (= k 1) (not (cdr spec)))
+        (%fs-read-byte-raw stream eof-error-p eof-value)
+        (let ((v 0) (i 0) (sh 0))
+          (loop
+            (when (>= i k) (return nil))
+            (let ((b (%fs-read-byte-raw stream nil :eof)))
+              (when (eq b :eof)
+                ;; A partial trailing element is end of file too.
+                (return-from %fs-read-element
+                  (if eof-error-p (error "end of file") eof-value)))
+              (setq v (+ v (ash b sh)))
+              (setq sh (+ sh 8))
+              (setq i (+ i 1))))
+          (if (and (cdr spec) (>= v (ash 1 (- sh 1))))
+              (- v (ash 1 sh))
+              v)))))
 
 (defun %fs-read-byte-raw (stream eof-error-p eof-value)
   "Read one byte directly from a type-9 file stream's buffer."
@@ -761,11 +806,24 @@
 
 ;;; --- File stream write-byte ---
 (defun %fs-write-byte (byte stream)
-  "Write one byte to a file stream."
+  "Write one ELEMENT to a file stream: 1 byte, or CEIL(N/8) little-endian
+   bytes for an (UNSIGNED-BYTE N) / (SIGNED-BYTE N) stream with N > 8."
   (let ((fd (%fs-fd stream)))
     (when (>= fd 0)
-      (%sys-write-byte-1 fd byte)
-      (%fs-set-pos stream (+ (%fs-pos stream) 1)))))
+      (let* ((spec (%fs-elt-spec stream)) (k (car spec)))
+        (if (and (= k 1) (not (cdr spec)))
+            (progn
+              (%sys-write-byte-1 fd byte)
+              (%fs-set-pos stream (+ (%fs-pos stream) 1)))
+            (let ((v byte) (i 0))
+              ;; ASH is arithmetic, so a negative SIGNED-BYTE value yields
+              ;; its two's complement bytes.
+              (loop
+                (when (>= i k) (return nil))
+                (%sys-write-byte-1 fd (logand v 255))
+                (setq v (ash v -8))
+                (setq i (+ i 1)))
+              (%fs-set-pos stream (+ (%fs-pos stream) k))))))))
 
 ;;; --- file-length ---
 (defun file-length (stream)
@@ -778,7 +836,8 @@
            (let ((fd (%fs-fd stream)))
              (if (< fd 0)
                  (error "file-length: stream is closed")
-                 (%sys-fstat-size fd))))
+                 ;; In ELEMENTS (CLHS), not bytes.
+                 (values (floor (%sys-fstat-size fd) (%fs-elt-bytes stream))))))
           ((= ty 5) ;; broadcast: use first file stream
            (let ((streams (%stream-data stream)))
              (if streams
@@ -805,10 +864,11 @@
              (if (< fd 0)
                  nil
                  (if (null args)
-                     ;; %fs-pos counts CONSUMED chars (read or written),
+                     ;; %fs-pos counts CONSUMED bytes (read or written),
                      ;; not the underlying lseek offset, so it already
-                     ;; reflects the logical position.
-                     (%fs-pos stream)
+                     ;; reflects the logical position -- in ELEMENTS once
+                     ;; divided by the element size.
+                     (values (floor (%fs-pos stream) (%fs-elt-bytes stream)))
                      ;; Set position
                      (let ((newpos (car args)))
                        (cond
@@ -825,6 +885,7 @@
                             (%fs-set-blen stream 0)
                             t))
                          ((integerp newpos)
+                          (setq newpos (* newpos (%fs-elt-bytes stream)))
                           (%sys-lseek fd newpos 0)
                           (%fs-set-pos stream newpos)
                           (%fs-set-bpos stream 0)

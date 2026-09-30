@@ -151,7 +151,17 @@
       ;; or bytecode-offset → native-byte-offset (aarch64/riscv/ppc/68k)
       (multiple-value-bind (buf fn-map)
           (let ((table fn-table)
-                (max-retries 1))
+                (max-retries 1)
+                ;; The checked-arith slow paths' targets (riscv; aarch64 binds
+                ;; its own three offsets in the unified path below).
+                (modus.mvm::*riscv-genarith-offsets*
+                  (let ((acc nil))
+                    (dolist (fi fn-list acc)
+                      (let ((nm (string (mvm-function-info-name fi))))
+                        (when (member nm '("GENERIC-ADD" "GENERIC-SUBTRACT" "GENERIC-MULTIPLY")
+                                      :test #'string-equal)
+                          (push (cons (string-upcase nm) (mvm-function-info-bytecode-offset fi))
+                                acc)))))))
             (loop for attempt from 1
                   do (handler-case (return (funcall translator bytecode table))
                        (error (e)
@@ -355,6 +365,28 @@
                   ;; :alloc-string does.
                   (loop for c across constant
                         do (emit-word (ash (char-code c) 1)))
+                  (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
+                        do (mvm-emit-byte buf 0))
+                  (setf (aref addr-table idx) (logior obj-offset tag))))
+               (keyword
+                ;; STATIC KEYWORD (compile-keyword under *static-keywords-p*):
+                ;; the same object :ALLOC-OBJ 1 +SUBTAG-KEYWORD+ builds at
+                ;; runtime -- header (1 << 8) | #x53, the target's padding
+                ;; words, then slot 0 = the tagged name hash.  It holds no heap
+                ;; pointer, so it can live outside the heap: the collector never
+                ;; moves it and never needs to scan it (pooled strings rely on
+                ;; the same facts).  Boot seeds the keyword table with it
+                ;; (%seed-static-keywords), so runtime interning returns it.
+                (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
+                      do (mvm-emit-byte buf 0))
+                (let* ((obj-offset (mvm-buffer-position buf))
+                       (tag (target-object-tag target))
+                       (data-off (target-object-data-offset target))
+                       (pad-words (1- (/ data-off word-size))))
+                  (emit-word (logior #x53 (ash 1 8)))
+                  (dotimes (i pad-words)
+                    (emit-word 0))
+                  (emit-word (ash (normalize-name constant) 1))
                   (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
                         do (mvm-emit-byte buf 0))
                   (setf (aref addr-table idx) (logior obj-offset tag))))
@@ -1245,6 +1277,12 @@
               ;; ppc32 and a two-function one did not.)  Each arch gets the
               ;; same single PC-relative branch x86 and ARM already had.
               ((member arch '(:riscv64 :riscv32))
+               ;; (Native code must START on a 16-byte boundary: the translator
+               ;; aligns every function entry to 16 relative to it, so that a
+               ;; tagged function pointer never ends in the collector's forward
+               ;; tag F.  PAD NOPs go between this jump and the code, and the
+               ;; jump skips them; the payload's load address is the ELF
+               ;; header size past a page boundary.)
                ;; AUIPC t0, hi20 ; JALR x0, lo12(t0) — a PC-relative jump that
                ;; reaches +/-2 GB.
                ;;
@@ -1265,7 +1303,10 @@
                ;; JALR's offset is SIGN-extended, so a lo12 >= 0x800 must be
                ;; borrowed from the high part.  t0 is free here — the stub has
                ;; finished with it and translated code has not started.
-               (let* ((off (+ entry-native-offset 8))   ; two instructions now
+               (let* ((hdr (case (getf boot-descriptor :elf-format)
+                             (:linux-riscv 120) (:linux-riscv32 84) (t 0)))
+                      (pad (mod (- 16 (mod (+ hdr (mvm-buffer-position final-buf) 8) 16)) 16))
+                      (off (+ entry-native-offset 8 pad))   ; two instructions + pad
                       (hi20 (ash (+ off #x800) -12))
                       (lo12 (- off (ash hi20 12)))
                       (auipc (logior #x17 (ash 5 7)          ; rd = x5 = t0
@@ -1274,12 +1315,13 @@
                                     (ash 0 12)               ; funct3 = 0
                                     (ash 5 15)               ; rs1 = t0
                                     (ash (logand lo12 #xFFF) 20))))
-                 (dolist (insn (list auipc jalr))
+                 (dolist (insn (append (list auipc jalr)
+                                       (make-list (floor pad 4) :initial-element #x00000013)))
                    (mvm-emit-byte final-buf (logand insn #xFF))
                    (mvm-emit-byte final-buf (logand (ash insn -8) #xFF))
                    (mvm-emit-byte final-buf (logand (ash insn -16) #xFF))
                    (mvm-emit-byte final-buf (logand (ash insn -24) #xFF)))
-                 (setq jmp-size 8)))
+                 (setq jmp-size (+ 8 pad))))
               ((member arch '(:ppc64 :ppc32))
                ;; b target  (I-form, opcode 18, AA=0, LK=0): the 24-bit LI
                ;; field is the word-aligned displacement from THIS

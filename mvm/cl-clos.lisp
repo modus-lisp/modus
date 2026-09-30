@@ -5842,6 +5842,10 @@
    contents, honor :initial-element / :initial-contents / :fill-pointer
    / :displaced-to.  Returns A (eq holds — MDAs are always adjustable
    in our impl since the header is mutable)."
+  ;; NEW-SIZE bounds every fill loop below: a non-integer here is an overrun
+  ;; of new-data, not a wrong answer, so refuse it outright.
+  (unless (and (integerp new-size) (>= new-size 0))
+    (%signal-type-error))
   (let ((displaced-to nil) (displaced-offset 0)
         (fp-arg :unset) (init-elem :unset) (init-contents :unset)
         (cur args))

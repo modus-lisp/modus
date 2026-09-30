@@ -708,12 +708,32 @@ Object header: `[subtag:8][unused:7][element-count:49]`
 Key subtags: string=#x10, symbol=#x50, keyword=#x53, closure=#x52, array=#x32, hash-table=#x41
 
 Keywords (`:foo`) are subtag #x53 — distinct from #x50 symbols so KEYWORDP
-can identify them without a per-symbol package slot.  compile-keyword in
-mvm/compiler.lisp emits `(li v0 hash; call %INTERN-KEYWORD)` so all `:foo`
-literals at any call site resolve to the same heap object via the keyword
-intern table at #x10000148 (init by `init-keyword-table` early in
-kernel-main).  SYMBOLP accepts both #x50 and #x53; KEYWORDP only #x53;
-SYMBOL-PACKAGE returns the KEYWORD package for #x53 objects.
+can identify them without a per-symbol package slot.  SYMBOLP accepts both
+#x50 and #x53; KEYWORDP only #x53; SYMBOL-PACKAGE returns the KEYWORD package
+for #x53 objects.  How a `:foo` LITERAL is compiled depends on the build:
+
+- **CLI and ANSI builds (`*static-keywords-p*`, docs/static-literals.md phase
+  1):** each distinct keyword is a STATIC object in the image constant pool
+  (header `#x153`, slot 0 = tagged name hash — no heap pointer, so the
+  collector never moves or scans it) loaded with one `:li-const`.  The
+  compiler also generates `%SEED-STATIC-KEYWORDS`, which boot calls right
+  after `init-keyword-table`; it registers every static keyword in the
+  keyword table at #x10000148 so `%INTERN-KEYWORD` (reader, INTERN, runtime
+  compile) returns the same object.  A heap copy already in the table when
+  seeding runs is reported loudly — it would break EQ.
+- **Every other build:** `(li v0 hash; call %INTERN-KEYWORD)` per evaluation,
+  resolving to the same heap object via the keyword table.
+
+A quoted INTERNED symbol (`'foo`) in CLI and ANSI builds
+(`*static-symbols-p*`, phase 2) compiles to one call,
+`%STATIC-SYMBOL-REF idx name-hash pkg-hash`, which loads slot `idx` of the
+vector rooted at **#x10000FB0** (a root in EVERY collector, restored in place
+by save-image) and fills it once through `%INTERN-SYMBOL-PKG`.  The fill
+caches only a symbol whose NAME resolves: cl-packages' INTERN replaces an
+early-boot name-less occupant of the symbol table, and a cached placeholder
+split CL:LIST in two (`(subtypep 'null 'list)` => NIL).  Hand-emit calls like
+this one; `compile-form` on a template bloated the image 50%.
+`test/static-symbols.lisp` audits the whole vector.
 
 Reader's `(intern name (find-package "KEYWORD"))` is unified with
 compile-keyword: it also routes through %INTERN-KEYWORD and returns the
@@ -1692,7 +1712,11 @@ read is in the same function.  Measured, no shim involved:
 The syscall IS issued; the RESULT is wrong, and a non-negative wrong result is
 indistinguishable from success to a caller checking for `-errno`.  That is how a
 `socket-bind` that appeared to succeed left a socket bound to nothing.
-**NOT FIXED.**  Routed around: the shim issues no syscalls at all, and
+**NOT FIXED.**  *(2026-09-27: these four shapes return the right pid on
+multi-arch both before and after 6045283, the fix for SYSCALL clobbering
+RCX/R11 — the same symptom in MVM-INTERPRET.  So this record no longer
+reproduces as written; the RCX/R11 clobber is a plausible cause for whatever
+shape it was, not a demonstrated one.)*  Routed around: the shim issues no syscalls at all, and
 `net/hosted-sockets-post.lisp` gained an AOT `%SBS-*` floor it calls instead.
 
 **`(LISTEN stream)` ON A DRAINED SOCKET ANSWERED T** — fixed, via a

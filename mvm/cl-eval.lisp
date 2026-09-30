@@ -3163,13 +3163,38 @@
         (when (not (= (logand (car cur) mask) 0)) (setq found t))))
     found))
 
+(defun %fixnum-shl-or-nil (n k)
+  "Fixnum N shifted left K bits, or NIL if that leaves the fixnum range."
+  (loop
+    (when (= k 0) (return n))
+    (when (or (> n +fixnum-half-max+) (< n +fixnum-neg-half+))
+      (return nil))
+    (setq n (ash n 1))
+    (setq k (- k 1))))
+
 (defun bignum-ash (n count)
   "Arithmetic shift N by COUNT bits.  Left shifts (COUNT > 0) promote
    through the full LSB-first limb list so values past 124 bits become
    proper big bignums.  Right shifts (COUNT < 0) implement floor toward
    negative infinity for negative N (CLHS ash semantics)."
+  ;; CLHS ASH: both arguments are INTEGERs.  Every variable-count ASH in
+  ;; compiled code arrives here, so this is the check for all of them: a
+  ;; float used to go into the limb machinery and SIGSEGV, (ash 1.5 2) killed
+  ;; the image instead of signalling.
+  (unless (and (integerp n) (integerp count))
+    (%signal-type-error))
   (cond
     ((= count 0) n)
+    ;; Left shift of a FIXNUM that stays a fixnum: double it with the
+    ;; constant-count ASH (an inline SHL) while |r| <= +fixnum-half-max+,
+    ;; which is exactly when doubling cannot leave the fixnum range.  Every
+    ;; variable-count ASH in compiled code is a call to this function, the
+    ;; interpreter's shift arms included, and the limb path below built and
+    ;; reversed a limb list for (ash 3 1) -- ~40% of an interpreted loop.
+    ;; (A test-only clause: its value -- the shifted fixnum, never NIL -- is
+    ;; the result; NIL means it would overflow and falls through.)
+    ((and (> count 0) (not (bignump n)) (< count +fixnum-bits+)
+          (%fixnum-shl-or-nil n count)))
     ((> count 0)
      ;; Left shift: route the full sign+limbs through the limb machinery so
      ;; the result promotes to fixnum / small / big bignum correctly via

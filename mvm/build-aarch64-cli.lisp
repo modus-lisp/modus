@@ -251,6 +251,7 @@
   ;; compiled special read.
   (setf (mem-ref #x10000FA0 :u64) 0)
   (setf (mem-ref #x10000FA8 :u64) 0)
+  (setf (mem-ref #x10000FB0 :u64) 0)   ; static-literal vector root
   (setf (mem-ref #x10000088 :u64) 0)
   (setf (mem-ref #x10000090 :u64) 0)
   (setf (mem-ref #x10000098 :u64) 0)
@@ -749,6 +750,14 @@
 ;;; definition applies BEFORE the syscall must be reproduced verbatim.  When
 ;;; adding a %sys-* override, diff it against mvm/cl-fileio.lisp first.
 (defvar *cli-arch-override-source* "
+;; clock_gettime is 113 in the generic Linux ABI (x86-64's 228 is mlock here),
+;; and struct timespec is two 64-bit longs: tv_nsec at +8, low words read :u32.
+(defun %clock-gettime-ns (clk)
+  (let ((buf *io-buf-addr*))
+    (if (eql (syscall3 113 clk buf 0) 0)
+        (+ (* (+ (mem-ref buf :u32) (* (mem-ref (+ buf 4) :u32) 4294967296)) 1000000000)
+           (mem-ref (+ buf 8) :u32))
+        0)))
 (defun %sys-open-rdonly (path-str)
   (if (%cab-on)
       (if (%cab :exists path-str) (%cab-fd-open path-str 0) -2)

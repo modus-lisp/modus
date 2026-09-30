@@ -44,8 +44,9 @@
 (defun %hc-armed-p () (if (eql (mem-ref #x10000180 :u32) 0) nil t))
 ")
 
-;;; No pre-init setup: the whole low block is a zero-filled MAP_ANONYMOUS mmap,
-;;; and there is no native collector, so no %gc-bitmap-init (as on RV64).
+;;; No pre-init setup: the whole low block is a zero-filled MAP_ANONYMOUS mmap.
+;;; The native collector (translate-riscv's RV-EMIT-GC-COLLECTOR, shared with
+;;; RV64) keeps its bitmaps in the boot mapping, so no %gc-bitmap-init either.
 (defvar *cli-arch-kernel-prologue* "")
 
 ;;; Scratch pages below the allocator (which starts at heap+#x20000 here):
@@ -73,6 +74,14 @@
 ;;;     memory -- a word in the cstr page, past rename's two paths.
 ;;; The *at calls, AT_FDCWD = -100, and syscall6 are as on RV64.
 (defvar *cli-arch-override-source* "
+;; RV32 has no 32-bit-time clock_gettime: clock_gettime64 (403), whose
+;; struct __kernel_timespec is two 64-bit fields: tv_nsec at +8.
+(defun %clock-gettime-ns (clk)
+  (let ((buf *io-buf-addr*))
+    (if (eql (syscall3 403 clk buf 0) 0)
+        (+ (* (+ (mem-ref buf :u32) (* (mem-ref (+ buf 4) :u32) 4294967296)) 1000000000)
+           (mem-ref (+ buf 8) :u32))
+        0)))
 (defun %rv-openat (path-addr flags mode)
   (syscall6 56 -100 path-addr flags mode 0 0))
 (defun %sys-open-rdonly (path-str)

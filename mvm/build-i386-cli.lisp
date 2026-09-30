@@ -147,7 +147,8 @@
 ;;;
 ;;; 1. SYSCALL NUMBERS.  mvm/cl-fileio.lisp hardcodes the x86-64 table
 ;;;    (open=2 close=3 read=0 write=1 lseek=8 stat=4 fstat=5 unlink=87
-;;;    rename=82 mkdir=83 getpid=39 getdents64=217).  i386 shares almost none
+;;;    rename=82 mkdir=83 getpid=39 getdents64=217; ansi-bridge's clock uses
+;;;    clock_gettime=228).  i386 shares almost none
 ;;;    of them.  Same class build-aarch64-cli.lisp fixed for the *at-only
 ;;;    AArch64 ABI (be1aef1): without these, LOAD, OPEN and every path
 ;;;    predicate are silently dead.
@@ -230,6 +231,15 @@
     (let ((ret (syscall3 197 fd buf-addr 0)))
       (if (< ret 0) -1 (mem-ref (+ buf-addr 44) :u32)))))
 (defun %sys-getdents64 (fd buf-addr buf-size) (syscall3 220 fd buf-addr buf-size))
+;; clock_gettime is 265 here (228 is x86-64's), and i386's struct timespec is
+;; two 32-bit longs, so tv_nsec is at +4, not +8.  Without this override
+;; GET-INTERNAL-REAL-TIME fell back to its call counter and every timing on
+;; i386 read 1 tick.  (32-bit time_t: good until 2038.)
+(defun %clock-gettime-ns (clk)
+  (let ((buf *io-buf-addr*))
+    (if (eql (syscall3 265 clk buf 0) 0)
+        (+ (* (mem-ref buf :u32) 1000000000) (mem-ref (+ buf 4) :u32))
+        0)))
 
 (defun %cli-argv-base () 268472320)   ; #x10009000 — the staged pointer array
 

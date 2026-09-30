@@ -1207,6 +1207,7 @@
   ;; compiled special read.
   (setf (mem-ref #x10000FA0 :u64) 0)
   (setf (mem-ref #x10000FA8 :u64) 0)
+  (setf (mem-ref #x10000FB0 :u64) 0)   ; static-literal vector root
   (setf (mem-ref #x10000088 :u64) 0)
   (setf (mem-ref #x10000090 :u64) 0)
   (setf (mem-ref #x10000098 :u64) 0)

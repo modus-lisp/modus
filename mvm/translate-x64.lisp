@@ -392,6 +392,22 @@
 ;;;   VR  → RAX   VA  → R12   VL  → R14   VN  → R15
 ;;;   VSP → RSP   VFP → RBP
 
+;;; The SYSCALL instruction overwrites RCX (return RIP) and R11 (RFLAGS).
+;;; Both are ordinary allocatable V-registers here (V5 = RCX, V8 = R11), and
+;;; the compiler DOES keep values live in them across a syscall trap: in
+;;; MVM-INTERPRET, (setf (svref regs 0) (syscall3 ...)) had the store's index
+;;; in RCX, so the result was written to regs + <return RIP>*4 -- a wild store,
+;;; and the syscall "returned" its own number.  Every trap that performs a
+;;; syscall and RETURNS to the caller emits it through here.  (Not exit, which
+;;; never returns, and not the clone in spawn-thread, whose child resumes on a
+;;; different stack.)
+(defun emit-syscall-saving-rcx-r11 (buf)
+  (emit-bytes buf #x51)              ; push rcx
+  (emit-bytes buf #x41 #x53)         ; push r11
+  (emit-bytes buf #x0F #x05)         ; syscall
+  (emit-bytes buf #x41 #x5B)         ; pop r11
+  (emit-bytes buf #x59))             ; pop rcx
+
 (defparameter *vreg-to-x64*
   (vector 'rsi  ; V0   0
           'rdi  ; V1   1
@@ -883,7 +899,7 @@
                     (emit-bytes buf #x48 #x8D #x74 #x24 #x10) ; lea rsi, [rsp+16]
                     (emit-bytes buf #x48 #xC7 #xC2 #x01 #x00 #x00 #x00) ; mov rdx, 1
                     (emit-bytes buf #x48 #xC7 #xC0 #x01 #x00 #x00 #x00) ; mov rax, 1 (SYS_write)
-                    (emit-bytes buf #x0F #x05)             ; syscall
+                    (emit-syscall-saving-rcx-r11 buf)     ; syscall (RCX/R11 preserved)
                     ;; Restore regs
                     (emit-bytes buf #x5A)                  ; pop rdx
                     (emit-bytes buf #x5F)                  ; pop rdi
@@ -904,7 +920,7 @@
                     (emit-bytes buf #x48 #x8D #x74 #x24 #x10) ; lea rsi, [rsp+16] (temp on stack)
                     (emit-bytes buf #x48 #xC7 #xC2 #x01 #x00 #x00 #x00) ; mov rdx, 1
                     (emit-bytes buf #x48 #xC7 #xC0 #x00 #x00 #x00 #x00) ; mov rax, 0 (SYS_read)
-                    (emit-bytes buf #x0F #x05)             ; syscall
+                    (emit-syscall-saving-rcx-r11 buf)     ; syscall (RCX/R11 preserved)
                     (emit-bytes buf #x5A)                  ; pop rdx
                     (emit-bytes buf #x5F)                  ; pop rdi
                     ;; Result byte at [rsp-16] (where we read into, adjusted for pops)
@@ -962,7 +978,7 @@
               (emit-bytes buf #x4C #x89 #xCA)   ; mov rdx, r9
               (emit-bytes buf #x48 #xD1 #xFA)   ; sar rdx, 1
               ;; syscall
-              (emit-bytes buf #x0F #x05)         ; syscall
+              (emit-syscall-saving-rcx-r11 buf)     ; syscall (RCX/R11 preserved)
               ;; Tag result → V0 (RSI)
               (emit-bytes buf #x48 #x01 #xC0)   ; add rax, rax
               (emit-bytes buf #x48 #x89 #xC6)   ; mov rsi, rax
@@ -991,7 +1007,7 @@
               ;; rdx = V3 (arg3, raw)
               (emit-bytes buf #x4C #x89 #xCA)   ; mov rdx, r9
               ;; syscall
-              (emit-bytes buf #x0F #x05)         ; syscall
+              (emit-syscall-saving-rcx-r11 buf)     ; syscall (RCX/R11 preserved)
               ;; Result → V0 (RSI), raw
               (emit-bytes buf #x48 #x89 #xC6)   ; mov rsi, rax
               ;; Restore
@@ -1008,8 +1024,8 @@
               ;; assembler-verified (gas .intel_syntax).  The a3<->a6 register
               ;; overlap (both need a swap between rdx and r9) is the XCHG.
               ;; Save/restore the V-reg carriers this clobbers (rsi,rdi,r8,r9,
-              ;; rdx,r10); rcx(V5)/r11(V8) are caller-save temps (syscall3
-              ;; already assumes so), rbx(V4) is only read.
+              ;; rdx,r10); rcx(V5)/r11(V8), which SYSCALL itself clobbers,
+              ;; are saved by EMIT-SYSCALL-SAVING-RCX-R11; rbx(V4) is only read.
               (emit-bytes buf #x56)                 ; push rsi
               (emit-bytes buf #x57)                 ; push rdi
               (emit-bytes buf #x41 #x50)            ; push r8
@@ -1028,7 +1044,7 @@
               (emit-bytes buf #x49 #xD1 #xFA)       ; sar r10, 1
               (emit-bytes buf #x49 #xD1 #xF8)       ; sar r8, 1
               (emit-bytes buf #x49 #xD1 #xF9)       ; sar r9, 1
-              (emit-bytes buf #x0F #x05)            ; syscall
+              (emit-syscall-saving-rcx-r11 buf)     ; syscall (RCX/R11 preserved)
               (emit-bytes buf #x48 #x01 #xC0)       ; add rax, rax   (tag result)
               (emit-bytes buf #x48 #x89 #xC6)       ; mov rsi, rax   (result → V0)
               (emit-bytes buf #x41 #x5A)            ; pop r10
@@ -1069,7 +1085,7 @@
               ;; r9 = 0 (offset)
               (emit-bytes buf #x4D #x31 #xC9)
               ;; syscall
-              (emit-bytes buf #x0F #x05)
+              (emit-syscall-saving-rcx-r11 buf)     ; syscall (RCX/R11 preserved)
               ;; Tag result → V0 (RSI)
               (emit-bytes buf #x48 #x01 #xC0)   ; add rax, rax
               (emit-bytes buf #x48 #x89 #xC6)   ; mov rsi, rax
@@ -1103,7 +1119,7 @@
               (emit-bytes buf #x41 #xBA #x22 #x00 #x00 #x00) ; mov r10d, 0x22 (PRIV|ANON)
               (emit-bytes buf #x49 #xC7 #xC0 #xFF #xFF #xFF #xFF) ; mov r8, -1 (fd)
               (emit-bytes buf #x4D #x31 #xC9)    ; xor r9, r9 (offset)
-              (emit-bytes buf #x0F #x05)         ; syscall
+              (emit-syscall-saving-rcx-r11 buf)     ; syscall (RCX/R11 preserved)
               (emit-bytes buf #x48 #x01 #xC0)    ; add rax, rax (tag result)
               (emit-bytes buf #x48 #x89 #xC6)    ; mov rsi, rax → V0
               (emit-bytes buf #x41 #x5B)         ; pop r11
@@ -1327,20 +1343,24 @@
              ((= code #x0310)
               ;; RDTSC: Read timestamp counter, return 64-bit result in RAX
               ;; Combine EDX:EAX into full 64-bit value
-              ;; rdtsc
+              ;;
+              ;; RCX AND RDX ARE SAVED: RDTSCP writes ECX (TSC_AUX) and EDX, and
+              ;; RCX/RDX are the homes of V5/V6.  The arm used to clobber both,
+              ;; unnoticed while only straight-line timing code called it; once
+              ;; the interpreter's own #x0310 became this native read, a
+              ;; runtime (rdtsc) wrecked the interpreter's live registers.
+              (emit-bytes buf #x51)            ; push rcx
+              (emit-bytes buf #x52)            ; push rdx
               (emit-bytes buf #x0F #x01 #xF9)  ; RDTSCP (waits for instructions)
-              ;; mov ecx, eax (save low 32)
-              (emit-bytes buf #x89 #xC1)
-              ;; mov eax, edx
-              (emit-bytes buf #x89 #xD0)
-              ;; shl rax, 32
-              (emit-bytes buf #x48 #xC1 #xE0 #x20)
-              ;; or rax, rcx
-              (emit-bytes buf #x48 #x09 #xC8)
+              ;; rax = edx:eax  (both 32-bit writes zero-extend)
+              (emit-bytes buf #x48 #xC1 #xE2 #x20)   ; shl rdx, 32
+              (emit-bytes buf #x48 #x09 #xD0)        ; or rax, rdx
               ;; shl rax, 1 — tag as a fixnum.  A value register holds a TAGGED
               ;; word; a raw counter with its low bit set carries the cons tag
               ;; (0x1), i.e. a wild pointer, on half of all reads.
-              (emit-bytes buf #x48 #xD1 #xE0))
+              (emit-bytes buf #x48 #xD1 #xE0)
+              (emit-bytes buf #x5A)            ; pop rdx
+              (emit-bytes buf #x59))           ; pop rcx
              ((= code #x0311)
               ;; CNTFRQ equivalent: x86 has no architectural "counter Hz"
               ;; register (the TSC rate is discoverable only via CPUID leaf 0x15
@@ -1656,14 +1676,14 @@
                 (emit-bytes buf #x48 #x89 #xD0)                     ; mov rax, rdx (ucontext ptr)
                 (emit-bytes buf #x48 #x89 #x04 #x25)
                 (emit-u32 buf #x10000C58)
-                ;; lock inc qword [0x10000FB0] -- the recovered-fault COUNT.
+                ;; lock inc qword [0x10000CA0] -- the recovered-fault COUNT.
                 ;; The longjmp below publishes no condition; %HC-FAULT-FIXUP
                 ;; (cl-conditions) compares this against the last count it
                 ;; saw so a handler can tell a fresh fault from a stale
                 ;; *CURRENT-CONDITION*.  A counter, not the RIP: the same
                 ;; instruction can fault twice in a row.
                 (emit-bytes buf #xF0 #x48 #xFF #x04 #x25)
-                (emit-u32 buf #x10000FB0)
+                (emit-u32 buf #x10000CA0)
                 ;; mov rcx, 0x10000180  (saved-handler-state address)
                 ;; PER-THREAD WINDOW: the signal runs on the FAULTING thread
                 ;; with that thread's FS base, so "is a handler-case active?"
@@ -1809,7 +1829,7 @@
                   (emit-bytes buf #x48 #x31 #xD2)        ; xor rdx, rdx
                   (emit-bytes buf #x49 #xC7 #xC2 #x08 #x00 #x00 #x00) ; mov r10, 8
                   (emit-bytes buf #x48 #xC7 #xC0 #x0D #x00 #x00 #x00) ; mov rax, 13 (rt_sigaction)
-                  (emit-bytes buf #x0F #x05))            ; syscall
+                  (emit-syscall-saving-rcx-r11 buf))     ; syscall (RCX/R11 preserved)
 
                 ;; Free struct
                 (emit-bytes buf #x48 #x83 #xC4 #x20)  ; add rsp, 32
@@ -6967,6 +6987,11 @@
     ;; THROUGH this word, so it is forwarded exactly like the constvec root.
     (emit-mov-reg-imm buf 'rax #x10000FA0)
     (emit-call buf scan-word-label)
+    ;; The static-literal vector (compile-quote under *static-symbols-p*,
+    ;; docs/static-literals.md phase 2): image code loads cached quoted
+    ;; symbols THROUGH this word.  0 until the first such load allocates it.
+    (emit-mov-reg-imm buf 'rax #x10000FB0)
+    (emit-call buf scan-word-label)
     ;; Globals alist at 0x10000080
     (emit-mov-reg-imm buf 'rax #x10000080)
     (emit-call buf scan-word-label)
@@ -7932,6 +7957,7 @@
 
     ;; ================= P2a: forward PRECISE roots into the to-run ===========
     (emit-mov-reg-imm buf 'rax #x10000FA0) (emit-call buf scan-word-label)  ; global-cell cache
+    (emit-mov-reg-imm buf 'rax #x10000FB0) (emit-call buf scan-word-label)  ; static-literal vector
     (emit-mov-reg-imm buf 'rax #x10000080) (emit-call buf scan-word-label)
     (emit-mov-reg-imm buf 'rax #x10000088) (emit-call buf scan-word-label)
     (emit-mov-reg-imm buf 'rax #x10000148) (emit-call buf scan-word-label)

@@ -3910,12 +3910,14 @@
 ;;; ============================================================
 
 (defun get-universal-time ()
-  "Return seconds since 1900-01-01.  On Linux, calls time(2) (syscall
-   201) to get Unix epoch seconds, then adds the 70-year offset
-   2208988800.  On bare metal where syscall isn't available, returns 0."
-  (let ((unix-sec (handler-case (syscall3 201 0 0 0) (t (c) 0))))
-    (if (and (integerp unix-sec) (> unix-sec 0))
-        (+ unix-sec 2208988800)
+  "Return seconds since 1900-01-01: CLOCK_REALTIME (Unix epoch) plus the
+   70-year offset 2208988800.  Through %CLOCK-GETTIME-NS, the one per-arch
+   clock seam, rather than time(2): 201 is time only on x86-64 -- on i386 it
+   is geteuid32, and every i386 image reported the uid (1001) as the Unix
+   time, i.e. 1970-01-01.  0 where there is no clock (bare metal)."
+  (let ((ns (%clock-gettime-ns 0)))           ; CLOCK_REALTIME
+    (if (and (integerp ns) (> ns 0))
+        (values (+ (floor ns 1000000000) 2208988800))
         0)))
 
 (defun %timer-universal-time ()
@@ -5063,6 +5065,18 @@
                          ((consp dim) dim)
                          (t (list dim))))
          (rank 0) (cur dim-list) (total 1))
+    ;; CLHS MAKE-ARRAY: every dimension is a valid array dimension, a
+    ;; non-negative fixnum.  Nothing checked it: a non-number's raw bits
+    ;; became the element count.  With a keyword on the heap that was a huge
+    ;; address and the allocation failed, which LOOKED like an error; with the
+    ;; keyword a static constant-pool object it is a small address and
+    ;; (make-array :fill-pointer) quietly built a vector of millions of zeros
+    ;; (ADJUST-ARRAY.ERROR.6 then hung filling it).
+    (let ((d dim-list))
+      (loop (when (null d) (return nil))
+        (unless (and (fixnump (car d)) (>= (car d) 0))
+          (%signal-type-error))
+        (setq d (cdr d))))
     (loop (when (null cur) (return nil))
       (setq total (* total (car cur)))
       (setq rank (+ rank 1))

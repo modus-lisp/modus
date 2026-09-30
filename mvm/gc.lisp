@@ -1111,6 +1111,9 @@
   ;; The global-cell cache vector: compiled special reads load their cell
   ;; through it (prelude %GV-REF-FILL), so it is a root like any other.
   (let ((fp (%gc-forward-slot (%conv-addr #x10000FA0) from-start from-size free-ptr sc)))
+    ;; The static-literal vector (compile-quote, docs/static-literals.md
+    ;; phase 2): cached quoted symbols are loaded through it.
+    (setq fp (%gc-forward-slot (%conv-addr #x10000FB0) from-start from-size fp sc))
     ;; The globals alist head pointer itself
     (setq fp (%gc-forward-slot (%conv-addr #x10000080) from-start from-size fp sc))
     ;; The symbol intern table head pointer

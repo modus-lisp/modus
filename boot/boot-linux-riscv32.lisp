@@ -218,19 +218,25 @@
     ;; VN = NIL = +NIL-VALUE+, not zero — see boot-linux-riscv.lisp.
     (rv-emit-li buf +rv-s10+ +nil-value+)
     ;; --- Cheney metadata, at the heap-relative block this port uses.  RAW
-    ;;     addresses, matching what the collector expects.
+    ;;     addresses, matching what the collector expects.  EIGHT-BYTE FIELDS
+    ;;     even here, where a word is four: gc.lisp's accessors (%GC-EPOCH,
+    ;;     %GC-FROM-START, ...) address the block at a fixed 8-byte stride on
+    ;;     every port, i386 included.  With 4-byte fields %GC-EPOCH read
+    ;;     [+0x20] -- never written -- so it was 0 forever, and RV32 looked like
+    ;;     it had no collector while collecting 187 times.  High halves stay 0
+    ;;     (the mapping is zero-filled).
     (rv-emit-li buf +rv-t1+ (+ +linux-riscv32-heap-addr+ #x40))
     (rv-emit-store-word buf +rv-s8+ +rv-t1+ 0)   ; [+0x00] from_start
     (rv-emit-li buf +rv-t0+ +linux-riscv32-gc-midpoint+)  ; NOT VL: VL is the
     (rv-emit-add buf +rv-t0+ +rv-s4+ +rv-t0+)             ; whole heap until a
-    (rv-emit-store-word buf +rv-t0+ +rv-t1+ 4)   ; [+0x04] to_start  (collector lands)
+    (rv-emit-store-word buf +rv-t0+ +rv-t1+ 8)   ; [+0x08] to_start  (collector lands)
     (rv-emit-li buf +rv-t0+ (- +linux-riscv32-gc-midpoint+
                                +linux-riscv32-heap-alloc-start+))
-    (rv-emit-store-word buf +rv-t0+ +rv-t1+ 8)   ; [+0x08] space_size
+    (rv-emit-store-word buf +rv-t0+ +rv-t1+ 16)  ; [+0x10] space_size
     (rv-emit-mv buf +rv-t0+ +rv-sp+)
-    (rv-emit-store-word buf +rv-t0+ +rv-t1+ 12)  ; [+0x0C] stack_base
+    (rv-emit-store-word buf +rv-t0+ +rv-t1+ 24)  ; [+0x18] stack_base
     (rv-emit-li buf +rv-t0+ 0)
-    (rv-emit-store-word buf +rv-t0+ +rv-t1+ 16)  ; [+0x10] gc_count
+    (rv-emit-store-word buf +rv-t0+ +rv-t1+ 32)  ; [+0x20] gc_count
     ;; --- fall through to translated native code
     (loop for b across (rv-buffer-to-bytes buf)
           do (mvm-emit-byte mbuf b))))

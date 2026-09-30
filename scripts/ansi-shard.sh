@@ -23,6 +23,8 @@ set -u
 
 SHARDS=${SHARDS:-32}
 BINARY=${BINARY:-/home/claude/modus/tmp/modus-ansi-test}
+# Absolute: each shard runs in its own directory (below).
+BINARY=$(readlink -f "$BINARY")
 FIRST=10001
 # Last corpus id comes from the build's own ranges file (next to the binary);
 # 27708 is only the historical fallback -- the corpus grew to ~29531 when the
@@ -57,13 +59,22 @@ SHARD_TIMEOUT=${SHARD_TIMEOUT:-600}
 # Launch all shards in parallel. Shard 0 also runs the pre-fork custom tests
 # (it uses start=0 to not skip them). `timeout` lets the shard binary write
 # its output normally but kills it if it runs over.
+#
+# EACH SHARD RUNS IN ITS OWN EMPTY WORKING DIRECTORY ($OUTDIR/wd-N).  The
+# file / stream tests create scratch files relative to the cwd (tmp.dat,
+# foo.txt, file-position.txt, scratch/ ...).  With every shard in the caller's
+# cwd, 64 processes raced on the same names: OPEN.IO.*, FILE-POSITION.7/.8,
+# FILE-LENGTH.*, WRITE-SEQUENCE.BV.* failed in batches in some runs and not
+# others, and every gate comparison needed a manual rerun to tell a flake
+# from a regression.
 for i in $(seq 0 $(( SHARDS - 1 ))); do
   lo=$(( FIRST + i * STEP ))
   hi=$(( lo + STEP ))
   if [ $hi -gt $LAST ]; then hi=$LAST; fi
   if [ $i -eq 0 ]; then lo=0; fi     # shard 0 gets pre-fork custom tests too
-  timeout --kill-after=5s "$SHARD_TIMEOUT" \
-    "$BINARY" "$lo" "$hi" > "$OUTDIR/shard-$i.out" 2>&1 &
+  mkdir -p "$OUTDIR/wd-$i"
+  ( cd "$OUTDIR/wd-$i" && exec timeout --kill-after=5s "$SHARD_TIMEOUT" \
+      "$BINARY" "$lo" "$hi" ) > "$OUTDIR/shard-$i.out" 2>&1 &
 done
 
 # Wait for all.

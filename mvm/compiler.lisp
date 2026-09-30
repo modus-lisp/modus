@@ -1364,6 +1364,32 @@
             (%reg-pkg-alist-put (gethash key *global-symbol-macros-pkg*)
                                 p (cons expansion nil))))))
 
+(defvar *static-keywords-p* nil
+  "When T, an image build (not a runtime mvm-eval compile) bakes every keyword
+   literal as a STATIC keyword object in the image constant pool and loads it
+   with :LI-CONST -- one baked address, where the default path calls
+   %INTERN-KEYWORD (lock + GETHASH) on every evaluation.  The module then also
+   gets %SEED-STATIC-KEYWORDS, which boot must call right after
+   INIT-KEYWORD-TABLE so runtime interning returns the same objects.
+   docs/static-literals.md, phase 1.  Set by the builds that call the seeder.")
+
+(defvar *static-symbols-p* nil
+  "When T, an image build caches every quoted INTERNED symbol in the static-
+   literal vector rooted at #x10000FB0 (docs/static-literals.md phase 2): the
+   first evaluation interns it exactly as before (%STATIC-SYMBOL-FILL), later
+   ones load it with a few instructions instead of %INTERN-SYMBOL-PKG's lock +
+   GETHASH.  The vector is a GC root in every collector.  Quoted LISTS are not
+   cached: returning the same object per evaluation is CL-correct but changes
+   what destructive code sees, and needs its own audit.")
+
+(defvar *static-literal-index* nil
+  "(name-hash . pkg-hash) -> slot in the static-literal vector, per module.")
+
+(defvar *static-keyword-index* nil
+  "name-hash -> constant-table index of that keyword's static object, for the
+   module being compiled (one object per keyword, or EQ breaks).  Reset per
+   module by MVM-COMPILE-ALL with SETQ for the reason *INIT-THUNK-NAMES* is.")
+
 (defvar *init-thunk-names* nil
   "Names of auto-generated INIT-* thunks emitted by the DEFVAR /
    DEFPARAMETER handlers in mvm-compile-toplevel.  init-all-globals
@@ -6563,6 +6589,17 @@
   ;; comparing :CONC-NAME), and the ANSI gate lost 289 tests (structures,
   ;; defmethod, documentation ...).  The intern call is keyed by NAME HASH
   ;; and is pool-independent.
+  (when (and *static-keywords-p* (not *mvm-eval-runtime-p*))
+    (let* ((h (normalize-name kw))
+           (idx (and *static-keyword-index* (gethash h *static-keyword-index*))))
+      (unless idx
+        (unless *static-keyword-index*
+          (setq *static-keyword-index* (make-hash-table :test 'eql)))
+        (setq idx (length *constant-table*))
+        (push kw *constant-table*)
+        (setf (gethash h *static-keyword-index*) idx))
+      (emit-ir :li-const dest idx)
+      (return-from compile-keyword nil)))
   (if (and *mvm-eval-runtime-p* (not *static-build-p*) (fboundp (quote %intern-keyword)))
       ;; Runtime compile: the keyword object exists (or is created) NOW and is
       ;; interned for good, so bake it as a pool constant — a `:foo' literal
@@ -8465,7 +8502,7 @@
 ;;; ============================================================
 
 (defun compile-quote (value dest)
-  "Compile (quote VALUE)"
+  "Compile (quote VALUE)."
   (cond
     ((null value)
      (compile-nil dest))
@@ -8504,6 +8541,35 @@
     ;; slot 1.
     ;;
     ;; Emits: LI V0, name-hash; LI V1, pkg-hash; CALL %INTERN-SYMBOL-PKG; MOV dest, VR
+    ;; Static-literal cache (phase 2): an interned symbol loads from its slot
+    ;; in the vector at #x10000FB0; slot 0 means "not yet", and the fill
+    ;; interns it exactly as the path below does.  Uninterned symbols keep
+    ;; the old path (their identity semantics are not this change's to touch).
+    ((and (symbolp value) *static-symbols-p* (not *mvm-eval-runtime-p*)
+          (symbol-package value))
+     (let* ((h (normalize-name value))
+            (ph (compute-name-hash (package-name (symbol-package value))))
+            (key (cons h ph))
+            (idx (progn
+                   (unless *static-literal-index*
+                     (setq *static-literal-index* (make-hash-table :test 'equal)))
+                   (or (gethash key *static-literal-index*)
+                       (setf (gethash key *static-literal-index*)
+                             (hash-table-count *static-literal-index*))))))
+       ;; ONE CALL per site, the same shape as the %INTERN-SYMBOL-PKG call it
+       ;; replaces (one more argument register): the check-and-fill lives
+       ;; once, in the generated %STATIC-SYMBOL-REF.  Hand-emitted, like that
+       ;; call and %COMPILE-GLOBAL-READ-CACHED, NOT COMPILE-FORM on a template.
+       ;; An inline template (root load, SVREFs, EQLs) was measured first:
+       ;; it grew the i386 image's native code 43 -> 66 MB and made runtime
+       ;; compilation slower.
+       (emit-li-tagged +vreg-v0+ idx)
+       (emit-li-tagged +vreg-v1+ h)
+       (emit-li-tagged +vreg-v2+ ph)
+       (when *mvm-emit-halves* (emit-ir :set-nargs 3))
+       (emit-ir :call "%STATIC-SYMBOL-REF" 3)
+       (unless (= dest +vreg-vr+)
+         (emit-ir :mov dest +vreg-vr+))))
     ((symbolp value)
      (let* ((pkg (symbol-package value))
             (pkg-name (and pkg (package-name pkg)))
@@ -21720,7 +21786,14 @@
     (free-temp-reg)))
 
 (defun compile-f32-ref (arr-form idx-form env dest)
-  "Compile (%f32-bits-ref arr idx) — the lane's raw IEEE32 bits as a fixnum."
+  "Compile (%f32-bits-ref arr idx) — the lane's raw IEEE32 bits as a fixnum.
+   On a tower narrower than 32 bits (RV32, i386) the bits need not BE a
+   fixnum -- every negative single is >= 2^31 -- so the :F32-REF opcode, which
+   tags them in a register, cannot be right there; it is a call to
+   %F32-BITS-REF-NARROW instead (byte reads + generic arithmetic)."
+  (when (< +fixnum-bits+ 32)
+    (return-from compile-f32-ref
+      (compile-form `(%f32-bits-ref-narrow ,arr-form ,idx-form) env dest)))
   (let ((arr-reg (alloc-temp-reg))
         (idx-reg (alloc-temp-reg)))
     (compile-form arr-form env arr-reg)
@@ -21731,7 +21804,11 @@
 
 (defun compile-f32-set (arr-form idx-form val-form env dest)
   "Compile (%f32-bits-set arr idx bits) — store the low 32 bits of BITS into
-   the lane.  Returns BITS."
+   the lane.  Returns BITS.  Narrow towers: %F32-BITS-SET-NARROW, see
+   COMPILE-F32-REF (BITS may be a bignum there)."
+  (when (< +fixnum-bits+ 32)
+    (return-from compile-f32-set
+      (compile-form `(%f32-bits-set-narrow ,arr-form ,idx-form ,val-form) env dest)))
   (let ((val-reg (alloc-temp-reg)))
     (compile-form val-form env val-reg)
     (let ((arr-reg (alloc-temp-reg))
@@ -25577,6 +25654,8 @@
     ;; init-all-globals was never generated → funcall-of-0 at modus2 boot.
     ;; Using the plain global (reset per compile) makes push+read share one cell.
     (setq *init-thunk-names* nil)
+    (setq *static-keyword-index* nil)
+    (setq *static-literal-index* nil)
 
     ;; Register standard macros (cond, and, or) for this compilation
     (register-mvm-bootstrap-macros)
@@ -25706,6 +25785,89 @@
              (ir (cdr result)))
         (when (and info ir)
           (setf all-ir (nconc all-ir (list (cons info ir)))))))
+
+    ;; Static keywords: %SEED-STATIC-KEYWORDS registers every static keyword
+    ;; object of this module in the keyword table.  Its own literals compile
+    ;; through the same deduplicated index, so it seeds exactly the objects
+    ;; the code loads.  Generated LAST, from the complete index.
+    (when *static-keywords-p*
+      (let ((kws nil))
+        (when *static-keyword-index*
+          (maphash (lambda (h idx) (declare (ignore h))
+                     (push (nth (- (length *constant-table*) 1 idx) *constant-table*) kws))
+                   *static-keyword-index*))
+        (format t "  static keywords: ~D~%" (length kws))
+        (let* ((result (mvm-compile-toplevel
+                         `(defun %seed-static-keywords ()
+                            ,@(mapcar (lambda (k) `(%seed-static-keyword ,k)) kws)
+                            nil)))
+               (info (car result))
+               (ir (cdr result)))
+          (when (and info ir)
+            (setf all-ir (nconc all-ir (list (cons info ir))))))))
+
+    ;; %STATIC-SYMBOL-FILL (phase 2): the slow path of a cached quoted symbol.
+    ;; Interns it exactly as the uncached path does, allocates the vector on
+    ;; first use (%MAKE-ARRAY-RAW with the slot count baked in, NOT MAKE-ARRAY,
+    ;; which evaluates quoted symbols itself and would re-enter this before the
+    ;; root is set), and stores it.  Generated here -- after everything else,
+    ;; from the complete index -- so an image built without the flag carries
+    ;; neither it nor an unresolved call to it.
+    (when *static-symbols-p*
+      (let ((n (if *static-literal-index* (hash-table-count *static-literal-index*) 0)))
+        (format t "  static literal slots: ~D~%" n)
+        (let* ((result (mvm-compile-toplevel
+                         `(defun %static-symbol-fill (idx h ph)
+                            (let ((sym (%intern-symbol-pkg h ph))
+                                  (vec (mem-ref #x10000FB0 :u64)))
+                              ;; Cache only a symbol whose NAME resolves.  An
+                              ;; early-boot literal (before *SYM-NAME-TABLE*
+                              ;; is filled) is a name-less placeholder, and
+                              ;; cl-packages' INTERN deliberately REPLACES
+                              ;; such an occupant with a named symbol; the
+                              ;; uncached path then converges on that one.
+                              ;; Caching the placeholder made CL:LIST two
+                              ;; objects: (subtypep 'null 'list) => NIL.
+                              ;; This is SYMBOL-NAME's own test, inlined --
+                              ;; calling it would recurse (it quotes
+                              ;; *SYM-NAME-TABLE*).  A named occupant is
+                              ;; never replaced.
+                              ;; ONE value on every path, (VALUES SYM) below:
+                              ;; a quoted symbol is one value, and the
+                              ;; GETHASH here left MV-COUNT at 2 -- an early
+                              ;; RETURN-FROM leaked it, so the ANSI image's
+                              ;; (multiple-value-list (defsetf ...)) got
+                              ;; (NAME NIL).
+                              (when (let ((nm (aref sym 2)))
+                                      (if (and (stringp nm) (> (length nm) 0))
+                                          t
+                                          (let ((tab *sym-name-table*))
+                                            (if tab (if (gethash h tab) t nil) nil))))
+                                (when (eql vec 0)
+                                  (let ((v (%make-array-raw ,n)) (i 0))
+                                    (loop (when (>= i ,n) (return nil))
+                                      (setf (svref v i) 0)
+                                      (setq i (+ i 1)))
+                                    (setf (mem-ref #x10000FB0 :u64) v)
+                                    (setq vec v)))
+                                (setf (svref vec idx) sym))
+                              (values sym)))))
+               (info (car result))
+               (ir (cdr result)))
+          (when (and info ir)
+            (setf all-ir (nconc all-ir (list (cons info ir))))))
+        ;; The per-site entry: load the slot, fill it the first time.
+        (let* ((result (mvm-compile-toplevel
+                         `(defun %static-symbol-ref (idx h ph)
+                            (let ((vec (mem-ref #x10000FB0 :u64)))
+                              (if (eql vec 0)
+                                  (%static-symbol-fill idx h ph)
+                                  (let ((e (svref vec idx)))
+                                    (if (eql e 0) (%static-symbol-fill idx h ph) (values e))))))))
+               (info (car result))
+               (ir (cdr result)))
+          (when (and info ir)
+            (setf all-ir (nconc all-ir (list (cons info ir))))))))
 
     ;; Phase 2b: fuse size-aware gc-checks.  MUST be here — after the IR is
     ;; final, before Phase 3 computes label positions from ir-instruction-size

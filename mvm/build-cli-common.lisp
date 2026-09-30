@@ -200,6 +200,11 @@
 ;; read-time eval, resolved by the readers binding *package* to :modus.mvm
 ;; (cross.lisp check-parses / read-all-forms-with-locations).
 (defvar *isa-source*      (mvm-text "mvm/mvm.lisp"))
+;; Static keyword literals (docs/static-literals.md, phase 1): every keyword
+;; literal in the image is a static constant-pool object, and boot seeds the
+;; keyword table with them right after INIT-KEYWORD-TABLE (above).
+(setf modus.mvm::*static-keywords-p* t)
+(setf modus.mvm::*static-symbols-p* t)
 (defvar *interp-source*   (mvm-text "mvm/interp.lisp"))
 ;; STAGE 2: the MVM compiler itself, so (mvm-compile-all forms) runs in-image.
 (defvar *compiler-source* (mvm-text "mvm/compiler.lisp"))
@@ -1305,6 +1310,7 @@
   ;; ---- file exists: task #245 (the missing (init-all-globals)) lived here.
   "  (init-symbol-table)
   (init-keyword-table)
+  (%seed-static-keywords)
   (%init-packages)
   (%init-streams)
 "

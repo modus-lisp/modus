@@ -939,12 +939,14 @@
   (arm32-emit buf (logior #xED900B00 (ash +arm-sp+ 16) (ash dd 12)))   ; VLDR Dd,[sp]
   (arm32-add-imm buf +arm-sp+ +arm-sp+ 0 16))
 
-(defun arm32-float-box (buf dd)
+(defun arm32-float-box (buf dd &optional (header (logior #x60 (ash 4 8))))
   "Box Dd as a fresh four-chunk double; its TAGGED pointer lands in r12.
-   Header (4<<8)|#x60, five words rounded to 32 bytes (16-aligned heap)."
+   Header (4<<8)|#x60 (or HEADER: #x464 boxes a SINGLE-FLOAT), five words
+   rounded to 32 bytes (16-aligned heap)."
+  (arm32-emit-alloc-mark buf 1)
   (arm32-sub-imm buf +arm-sp+ +arm-sp+ 0 16)
   (arm32-emit buf (logior #xED800B00 (ash +arm-sp+ 16) (ash dd 12)))   ; VSTR Dd,[sp]
-  (arm32-load-imm32 buf +arm-r12+ (logior #x60 (ash 4 8)))
+  (arm32-load-imm32 buf +arm-r12+ header)
   (arm32-str buf +arm-r12+ +arm-r9+ 0)                                ; header at VA
   (loop for k from 0 to 3
         do (arm32-ldrh buf +arm-r12+ +arm-sp+ (- 6 (* 2 k)))
@@ -1184,28 +1186,8 @@
              ((= code #x0511)
               ;; LONGJMP: copy the jmpbuf aside, zero the capped count, pop,
               ;; restore, jump with r0 = T.  Nothing armed: UDF, not a jump to 0.
-              (let ((nohandler (mvm-make-label)))
-                (arm32-load-imm32 buf +arm-r12+ (arm32-jmpbuf-addr))
-                (arm32-ldr buf +arm-lr+ +arm-r12+ 0)
-                (arm32-cmp-imm buf +arm-lr+ 0 0)
-                (arm32-b-cond buf +arm-cc-eq+ nohandler)
-                (arm32-load-imm32 buf +arm-r1+ (arm32-lj-scratch-addr))
-                (arm32-emit-copy-words buf +arm-r12+ +arm-r1+)
-                (arm32-load-imm32 buf +arm-r2+ (arm32-hcapped-addr))
-                (arm32-mov-imm buf +arm-lr+ 0 0)
-                (arm32-str buf +arm-lr+ +arm-r2+ 0)
-                (arm32-emit-handler-pop buf)
-                (arm32-load-imm32 buf +arm-r12+ (arm32-lj-scratch-addr))
-                (loop for r in (list +arm-r4+ +arm-r5+ +arm-r6+ +arm-r7+)
-                      for i from 3
-                      do (arm32-ldr buf r +arm-r12+ (* 4 i)))
-                (arm32-ldr buf +arm-lr+ +arm-r12+ 8)
-                (arm32-ldr buf +arm-r11+ +arm-r12+ 4)
-                (arm32-ldr buf +arm-sp+ +arm-r12+ 0)
-                (arm32-load-imm32 buf +arm-r0+ #xDEAD1009)     ; second return: T
-                (arm32-bx buf +arm-lr+)
-                (arm32-emit-label buf nohandler)
-                (arm32-emit buf #xE7F000F0)))                  ; UDF
+              (arm32-emit-longjmp-to-armed
+               buf (lambda () (arm32-emit buf #xE7F000F0))))    ; UDF
              ((= code #x0512)
               ;; CLEAR-HANDLER: pop one frame; r0 (the result) untouched.
               (arm32-emit-handler-pop buf))
@@ -1299,11 +1281,41 @@
               (arm32-ldr-post buf +arm-r7+ +arm-sp+ 8)
               (arm32-lsl-imm buf +arm-r0+ +arm-r0+ 1))
              ((and (= code #x0520) *arm32-linux-mode*)
-              ;; INSTALL-SIGNAL-HANDLERS: a named NOP for now, as i386 and riscv
-              ;; had it -- a fault is a clean SIGSEGV instead of a condition.
-              ;; Pure side effect, no result: skipping it cannot make a wrong
-              ;; value.  TODO: the handler stub (x64/i386/riscv have one).
-              nil)
+              (arm32-emit-install-signal-handlers buf))
+             ((and (= code #x0310) *arm32-linux-mode*)
+              (arm32-emit-rdtsc buf))
+             ((and (= code #x0311) *arm32-linux-mode*)
+              ;; CNTFRQ: #x0310's rate, TAGGED (1000 Hz: milliseconds).
+              (arm32-load-imm32 buf +arm-r0+ 2000))
+             ((and (= code #x0531) *arm32-linux-mode*)
+              (arm32-emit-mmap-exec buf))
+             ((and (= code #x0532) *arm32-linux-mode*)
+              ;; %JIT-CALL entry: untag, BLX; the callee's value is in r0 = VR.
+              ;; LR is the enclosing function's (saved by its prologue).
+              (arm32-asr-imm buf +arm-r12+ +arm-r0+ 1)
+              (arm32-emit buf (logior #xE12FFF30 +arm-r12+)))       ; BLX r12
+             ((and (= code #x0533) *arm32-linux-mode*)
+              ;; %JIT-ICACHE-FLUSH base len: ARM's cacheflush (#xF0002).
+              (arm32-push buf (logior (ash 1 +arm-r1+) (ash 1 +arm-r2+)
+                                      (ash 1 +arm-r7+) (ash 1 +arm-lr+)))
+              (arm32-asr-imm buf +arm-r0+ +arm-r0+ 1)
+              (arm32-asr-imm buf +arm-r1+ +arm-r1+ 1)
+              (arm32-add buf +arm-r1+ +arm-r0+ +arm-r1+)
+              (arm32-mov-imm buf +arm-r2+ 0 0)
+              (arm32-load-imm32 buf +arm-r7+ #xF0002)
+              (arm32-svc buf)
+              (arm32-lsl-imm buf +arm-r0+ +arm-r0+ 1)
+              (arm32-pop buf (logior (ash 1 +arm-r1+) (ash 1 +arm-r2+)
+                                     (ash 1 +arm-r7+) (ash 1 +arm-lr+))))
+             ((and (= code #x0534) *arm32-linux-mode*)
+              ;; %JIT-FREE-PAGE base len: munmap (91), result tagged.
+              (arm32-push buf (logior (ash 1 +arm-r1+) (ash 1 +arm-r7+)))
+              (arm32-asr-imm buf +arm-r0+ +arm-r0+ 1)
+              (arm32-asr-imm buf +arm-r1+ +arm-r1+ 1)
+              (arm32-load-imm32 buf +arm-r7+ 91)
+              (arm32-svc buf)
+              (arm32-lsl-imm buf +arm-r0+ +arm-r0+ 1)
+              (arm32-pop buf (logior (ash 1 +arm-r1+) (ash 1 +arm-r7+))))
              ((and (= code #x0500) *arm32-linux-mode*)
               ;; HOSTED: exit(status), status arriving TAGGED in r0.
               (arm32-asr-imm buf +arm-r0+ +arm-r0+ 1)
@@ -1418,6 +1430,19 @@
         ;;; --- Arithmetic ---
 
         ((#.+op-add+ #.+op-add-checked+ #.+op-adds+)
+         ;; :ADD-CHECKED PROMOTES when the module has GENERIC-ADD (every CL
+         ;; image): ADDS, and on V set call it.  It used to wrap silently.
+         (let ((gen (and (= opcode +op-add-checked+)
+                         (arm32-genarith-offset "GENERIC-ADD" function-table))))
+           (when gen
+             (let ((vd (vreg 0)) (ok (mvm-make-label)))
+               (with-src2 (pa (vreg 1) +arm-r12+) (pb (vreg 2) +arm-lr+)
+                 (arm32-dp-reg buf +arm-dp-add+ +arm-r12+ pa pb :s 1))
+               (arm32-b-cond buf 7 ok)                          ; VC
+               (arm32-emit-genarith-call buf (vreg 1) (vreg 2) (ensure-label gen))
+               (arm32-emit-label buf ok)
+               (arm32-store-vreg buf +arm-r12+ vd)
+               (return-from arm32-translate-insn nil))))
          ;; :ADDS shares this clause.  :adds/:subs are "arithmetic that also sets
          ;; the overflow flag", for a following :bvs to branch on.  The result
          ;; they compute is identical to :add/:sub -- translate-i386 uses the
@@ -1443,6 +1468,18 @@
              (arm32-store-vreg buf +arm-r12+ vd))))
 
         ((#.+op-sub+ #.+op-sub-checked+ #.+op-subs+)
+         ;; :SUB-CHECKED promotes like :ADD-CHECKED (SUBS, V set).
+         (let ((gen (and (= opcode +op-sub-checked+)
+                         (arm32-genarith-offset "GENERIC-SUBTRACT" function-table))))
+           (when gen
+             (let ((vd (vreg 0)) (ok (mvm-make-label)))
+               (with-src2 (pa (vreg 1) +arm-r12+) (pb (vreg 2) +arm-lr+)
+                 (arm32-dp-reg buf +arm-dp-sub+ +arm-r12+ pa pb :s 1))
+               (arm32-b-cond buf 7 ok)                          ; VC
+               (arm32-emit-genarith-call buf (vreg 1) (vreg 2) (ensure-label gen))
+               (arm32-emit-label buf ok)
+               (arm32-store-vreg buf +arm-r12+ vd)
+               (return-from arm32-translate-insn nil))))
          ;; :SUBS shares this clause.  :adds/:subs are "arithmetic that also sets
          ;; the overflow flag", for a following :bvs to branch on.  The result
          ;; they compute is identical to :add/:sub -- translate-i386 uses the
@@ -1468,6 +1505,25 @@
              (arm32-store-vreg buf +arm-r12+ vd))))
 
         ((#.+op-mul+ #.+op-mul-checked+)
+         ;; :MUL-CHECKED promotes: untag(a) * tag(b) by SMULL; the 32x32
+         ;; product fits iff the high word is the low word's sign
+         ;; (CMP hi, lo, ASR #31).  ARMv7 permits RdLo == Rm (hosted is v7).
+         (let ((gen (and (= opcode +op-mul-checked+)
+                         (arm32-genarith-offset "GENERIC-MULTIPLY" function-table))))
+           (when gen
+             (let ((vd (vreg 0)) (ok (mvm-make-label)))
+               (with-src2 (pa (vreg 1) +arm-r12+) (pb (vreg 2) +arm-lr+)
+                 (arm32-asr-imm buf +arm-r12+ pa 1)
+                 ;; SMULL r12(lo), lr(hi), r12, pb
+                 (arm32-emit buf (logior #xE0C00090 (ash +arm-lr+ 16) (ash +arm-r12+ 12)
+                                         (ash pb 8) +arm-r12+)))
+               (arm32-dp-reg buf +arm-dp-cmp+ 0 +arm-lr+ +arm-r12+ :s 1
+                             :shift-type +arm-shift-asr+ :shift-amt 31)
+               (arm32-b-cond buf +arm-cc-eq+ ok)
+               (arm32-emit-genarith-call buf (vreg 1) (vreg 2) (ensure-label gen))
+               (arm32-emit-label buf ok)
+               (arm32-store-vreg buf +arm-r12+ vd)
+               (return-from arm32-translate-insn nil))))
          ;; :MUL-CHECKED shares this clause.  The checked opcodes mean "tagged
          ;; arithmetic that promotes to a bignum on overflow"; implementing the
          ;; promotion needs the generic-arith slow path, which these back ends do
@@ -1733,6 +1789,7 @@
              (arm32-store-vreg buf +arm-r12+ vd))))
 
         (#.+op-cons+
+         (arm32-emit-alloc-mark buf 2)   ; FIRST: clobbers r12/LR
          ;; Allocate cons cell from alloc pointer (r9=VA)
          ;; STR car, [r9, #0]; STR cdr, [r9, #4]; ORR Rd, r9, #1; ADD r9, r9, #8
          (let ((vd (vreg 0)))
@@ -1807,6 +1864,7 @@
         ;;; --- Object Operations ---
 
         (#.+op-alloc-obj+
+         (arm32-emit-alloc-mark buf 1)   ; FIRST: clobbers r12/LR
          ;; (alloc-obj Vd size subtag)
          ;; Header word: (size << 8) | subtag, stored at VA
          ;; Object pointer: VA + 4 (skip header), tagged with object tag
@@ -1834,6 +1892,7 @@
                      (arm32-add buf +arm-r9+ +arm-r9+ +arm-lr+)))))))
 
         (#.+op-alloc-array+
+         (arm32-emit-alloc-mark buf 1)   ; FIRST: clobbers r12/LR
          ;; (alloc-array Vd Vcount) — dynamic array allocation
          ;; Vcount: UNTAGGED element count (compiler SAR'd it already)
          ;; 32-bit: header = (count << 8) | 0x32, 4 bytes
@@ -2111,6 +2170,7 @@
         ;;; --- GC / Allocation ---
 
         (#.+op-alloc-cons+
+         (arm32-emit-alloc-mark buf 2)   ; FIRST: clobbers r12/LR
          ;; (alloc-cons Vd) — allocate cons cell without filling
          ;; 16-byte alignment for 4-bit tag (same as CONS)
          (let ((vd (vreg 0)))
@@ -2133,10 +2193,17 @@
          (arm32-cmp buf +arm-r9+ +arm-r10+)
          ;; BKPTCS #1  (if unsigned >=)
          ;; Actually ARM BKPTcc doesn't exist; use: BLO .ok; BKPT #1; .ok:
-         (let ((ok-label (mvm-make-label)))
-           (arm32-b-cond buf +arm-cc-cc+ ok-label)  ; branch if VA < VL (unsigned)
-           (arm32-emit buf #xE1200071)               ; BKPT #1
-           (arm32-emit-label buf ok-label)))
+         (if *arm32-gc-label*
+             ;; HOSTED: BLCS to the collector (it preserves every register but
+             ;; installs the new VA/VL).  LR is per-op scratch after the
+             ;; prologue, so the BL's link costs nothing live.
+             (progn
+               (arm32-emit buf (logior (ash +arm-cc-cs+ 28) #x0B000000))
+               (arm32-emit-fixup buf *arm32-gc-label* :bl))
+             (let ((ok-label (mvm-make-label)))
+               (arm32-b-cond buf +arm-cc-cc+ ok-label)  ; branch if VA < VL (unsigned)
+               (arm32-emit buf #xE1200071)               ; BKPT #1
+               (arm32-emit-label buf ok-label))))
 
         (#.+op-write-barrier+
          ;; Simplified: NOP on bare-metal
@@ -2304,7 +2371,80 @@
         ;; obj + 2 -- the same +2 the existing :aref uses.  R12 and LR are the
         ;; translator scratch (LR is saved by the prologue, which is why the
         ;; existing :alloc-array already uses it here).
+        (#.+op-fround32+
+         ;; (fround32 Vd Vs): the double payload rounded to single precision,
+         ;; boxed as a SINGLE-FLOAT (#x464).  VCVT.F32.F64 S2, D0 then
+         ;; VCVT.F64.F32 D0, S2 -- x64's CVTSD2SS/CVTSS2SD.
+         (let ((vd (vreg 0)))
+           (arm32-load-vreg buf +arm-lr+ (vreg 1))
+           (arm32-float-unbox buf +arm-lr+ 0)
+           (arm32-emit buf #xEEB71BC0)                ; VCVT.F32.F64 S2, D0
+           (arm32-emit buf #xEEB70AC1)                ; VCVT.F64.F32 D0, S2
+           (arm32-float-box buf 0 #x464)
+           (arm32-store-vreg buf +arm-r12+ vd)))
+
+        ;; ---- Packed single-float vectors (subtag #x12) ----
+        ;; Header (N << 8) | #x12, N 4-byte lanes at +4: lane i at
+        ;; tagged + 4i - 5.  The collector's #x12 rule sizes it (4N + 4).
+        ;; :f32-ref/:f32-set never reach a 30-bit tower (COMPILE-F32-REF
+        ;; expands them into byte reads and generic arithmetic).
+        (#.+op-alloc-f32+
+         (arm32-emit-alloc-mark buf 1)   ; FIRST: clobbers r12/LR
+         (let ((vd (vreg 0)) (zl (mvm-make-label)) (zd (mvm-make-label)))
+           (arm32-load-vreg buf +arm-r12+ (vreg 1))
+           (arm32-asr-imm buf +arm-r12+ +arm-r12+ 1)     ; N
+           (arm32-mov buf +arm-lr+ +arm-r12+)
+           (arm32-lsl-imm buf +arm-r12+ +arm-r12+ 8)
+           (arm32-orr-imm buf +arm-r12+ +arm-r12+ 0 #x12)
+           (arm32-str buf +arm-r12+ +arm-r9+ 0)
+           (arm32-orr-imm buf +arm-r12+ +arm-r9+ 0 +arm32-object-tag+)
+           (arm32-store-vreg buf +arm-r12+ vd)
+           ;; end = VA + align16(4N + 4); ZERO the lanes (a new vector reads
+           ;; 0.0f0), walking VA itself up to the end, which is the new VA.
+           (arm32-lsl-imm buf +arm-lr+ +arm-lr+ 2)
+           (arm32-add-imm buf +arm-lr+ +arm-lr+ 0 19)
+           (arm32-bic-imm buf +arm-lr+ +arm-lr+ 0 15)
+           (arm32-add buf +arm-lr+ +arm-r9+ +arm-lr+)
+           (arm32-add-imm buf +arm-r9+ +arm-r9+ 0 4)
+           (arm32-mov-imm buf +arm-r12+ 0 0)
+           (arm32-emit-label buf zl)
+           (arm32-cmp buf +arm-r9+ +arm-lr+)
+           (arm32-b-cond buf +arm-cc-cs+ zd)
+           (arm32-str buf +arm-r12+ +arm-r9+ 0)
+           (arm32-add-imm buf +arm-r9+ +arm-r9+ 0 4)
+           (arm32-b buf zl)
+           (arm32-emit-label buf zd)
+           (arm32-mov buf +arm-r9+ +arm-lr+)))
+
+        (#.+op-f32-load+
+         ;; (f32-load Vd Varr Vidx): lane -> VCVT.F64.F32 -> fresh boxed single.
+         (let ((vd (vreg 0)))
+           (arm32-load-vreg buf +arm-r12+ (vreg 2))            ; tagged idx = 2i
+           (arm32-load-vreg buf +arm-lr+ (vreg 1))
+           (arm32-dp-reg buf +arm-dp-add+ +arm-r12+ +arm-lr+ +arm-r12+
+                         :shift-type +arm-shift-lsl+ :shift-amt 1)   ; arr + 4i
+           (arm32-sub-imm buf +arm-r12+ +arm-r12+ 0 5)
+           (arm32-emit buf (logior #xED901A00 (ash +arm-r12+ 16)))  ; VLDR S2,[r12]
+           (arm32-emit buf #xEEB70AC1)                         ; VCVT.F64.F32 D0, S2
+           (arm32-float-box buf 0 #x464)
+           (arm32-store-vreg buf +arm-r12+ vd)))
+
+        (#.+op-f32-store+
+         ;; (f32-store Varr Vidx Vval): payload -> VCVT.F32.F64 (RNE) -> lane.
+         ;; Unbox FIRST (it uses r12), then form the lane address in r12.
+         (progn
+           (arm32-load-vreg buf +arm-lr+ (vreg 2))
+           (arm32-float-unbox buf +arm-lr+ 0)
+           (arm32-emit buf #xEEB71BC0)                         ; VCVT.F32.F64 S2, D0
+           (arm32-load-vreg buf +arm-r12+ (vreg 1))
+           (arm32-load-vreg buf +arm-lr+ (vreg 0))
+           (arm32-dp-reg buf +arm-dp-add+ +arm-r12+ +arm-lr+ +arm-r12+
+                         :shift-type +arm-shift-lsl+ :shift-amt 1)
+           (arm32-sub-imm buf +arm-r12+ +arm-r12+ 0 5)
+           (arm32-emit buf (logior #xED801A00 (ash +arm-r12+ 16)))))  ; VSTR S2,[r12]
+
         (#.+op-alloc-u8+
+         (arm32-emit-alloc-mark buf 1)   ; FIRST: clobbers r12/LR
          (let ((vd (vreg 0))
                (vcount (vreg 1)))
            (arm32-load-vreg buf +arm-r12+ vcount)
@@ -2321,6 +2461,7 @@
            (arm32-add buf +arm-r9+ +arm-r9+ +arm-lr+)))
 
         (#.+op-alloc-string+
+         (arm32-emit-alloc-mark buf 1)   ; FIRST: clobbers r12/LR
          ;; One character CODE per WORD; count already UNTAGGED.
          (let ((vd (vreg 0))
                (vcount (vreg 1)))
@@ -2367,6 +2508,7 @@
         ;; One-slot object, subtag #x16: header (1<<8)|#x16 then the raw
         ;; address.  Tag 2 and a 4-byte header, so the slot reads at obj + 2.
         (#.+op-sap-new+
+         (arm32-emit-alloc-mark buf 1)   ; FIRST: clobbers r12/LR
          (let ((vd (vreg 0)))
            (arm32-load-vreg buf +arm-lr+ (vreg 1))       ; payload first
            (arm32-load-imm32 buf +arm-r12+ #x116)
@@ -2453,6 +2595,509 @@
             (sort (copy-list *arm32-unimpl-opcodes*) #'<)))
   *arm32-unimpl-opcodes*)
 
+;;; ============================================================
+;;; Hosted traps: longjmp body, signal handlers, clock, exec pages
+;;; ============================================================
+
+(defun arm32-emit-longjmp-to-armed (buf no-handler-fn)
+  "Unwind to the innermost armed handler-case with r0 = T: TRAP #x0511's body,
+   shared with the signal handler #x0520 installs.  Word 0 of the jmpbuf == 0
+   is the \"nothing armed\" sentinel; NO-HANDLER-FN emits what happens then.
+   Copies the jmpbuf aside, zeroes the capped count, pops the handler stack,
+   restores sp/fp/r4-r7 and jumps to the resume IP."
+  (let ((nohandler (mvm-make-label)))
+    (arm32-load-imm32 buf +arm-r12+ (arm32-jmpbuf-addr))
+    (arm32-ldr buf +arm-lr+ +arm-r12+ 0)
+    (arm32-cmp-imm buf +arm-lr+ 0 0)
+    (arm32-b-cond buf +arm-cc-eq+ nohandler)
+    (arm32-load-imm32 buf +arm-r1+ (arm32-lj-scratch-addr))
+    (arm32-emit-copy-words buf +arm-r12+ +arm-r1+)
+    (arm32-load-imm32 buf +arm-r2+ (arm32-hcapped-addr))
+    (arm32-mov-imm buf +arm-lr+ 0 0)
+    (arm32-str buf +arm-lr+ +arm-r2+ 0)
+    (arm32-emit-handler-pop buf)
+    (arm32-load-imm32 buf +arm-r12+ (arm32-lj-scratch-addr))
+    (loop for r in (list +arm-r4+ +arm-r5+ +arm-r6+ +arm-r7+)
+          for i from 3
+          do (arm32-ldr buf r +arm-r12+ (* 4 i)))
+    (arm32-ldr buf +arm-lr+ +arm-r12+ 8)
+    (arm32-ldr buf +arm-r11+ +arm-r12+ 4)
+    (arm32-ldr buf +arm-sp+ +arm-r12+ 0)
+    (arm32-load-imm32 buf +arm-r0+ #xDEAD1009)     ; second return: T
+    (arm32-bx buf +arm-lr+)
+    (arm32-emit-label buf nohandler)
+    (funcall no-handler-fn)))
+
+(defun arm32-emit-install-signal-handlers (buf)
+  "TRAP #x0520, hosted: SIGSEGV/SIGBUS/SIGFPE/SIGILL longjmp into the innermost
+   handler-case, as on x64, aarch64, i386 and riscv; nothing armed ->
+   exit_group(139).  The stub records the signal at #x10000EB8 for
+   %TAKE-PENDING-FAULT (the handler-case dispatch builds the condition), and
+   unblocks the four signals with rt_sigprocmask before leaving -- the handler
+   never returns through sigreturn, and qemu-riscv64 was measured keeping the
+   signal blocked despite SA_NODEFER.  rt_sigaction (174) takes ARM's old-style
+   struct { handler; flags; restorer; mask[8] } with SA_SIGINFO|SA_NODEFER|
+   SA_RESTORER; the restorer is rt_sigreturn (173), reached only if a handler
+   ever returned."
+  (let ((stub (mvm-make-label)) (restorer (mvm-make-label)) (past (mvm-make-label))
+        (saved (logior (ash 1 +arm-r0+) (ash 1 +arm-r1+) (ash 1 +arm-r2+)
+                       (ash 1 +arm-r3+) (ash 1 +arm-r7+) (ash 1 +arm-lr+))))
+    (arm32-b buf past)
+    ;; ---- the handler: r0 = signum (never returns) ----
+    (arm32-emit-label buf stub)
+    (arm32-load-imm32 buf +arm-r12+ #x10000EB8)
+    (arm32-str buf +arm-r0+ +arm-r12+ 0)
+    (arm32-sub-imm buf +arm-sp+ +arm-sp+ 0 8)
+    (arm32-load-imm32 buf +arm-r12+ #x4C8)             ; SEGV|BUS|FPE|ILL bits
+    (arm32-str buf +arm-r12+ +arm-sp+ 0)
+    (arm32-mov-imm buf +arm-r12+ 0 0)
+    (arm32-str buf +arm-r12+ +arm-sp+ 4)
+    (arm32-mov-imm buf +arm-r0+ 0 1)                   ; SIG_UNBLOCK
+    (arm32-mov buf +arm-r1+ +arm-sp+)
+    (arm32-mov-imm buf +arm-r2+ 0 0)
+    (arm32-mov-imm buf +arm-r3+ 0 8)
+    (arm32-load-imm32 buf +arm-r7+ 175)                ; rt_sigprocmask
+    (arm32-svc buf)
+    (arm32-add-imm buf +arm-sp+ +arm-sp+ 0 8)
+    (arm32-emit-longjmp-to-armed
+     buf (lambda ()
+           (arm32-mov-imm buf +arm-r0+ 0 139)
+           (arm32-load-imm32 buf +arm-r7+ 248)         ; exit_group
+           (arm32-svc buf)))
+    ;; ---- sa_restorer ----
+    (arm32-emit-label buf restorer)
+    (arm32-load-imm32 buf +arm-r7+ 173)                ; rt_sigreturn
+    (arm32-svc buf)
+    ;; ---- install ----
+    (arm32-emit-label buf past)
+    (arm32-push buf saved)
+    (arm32-sub-imm buf +arm-sp+ +arm-sp+ 0 24)
+    (arm32-emit-pcrel-addr buf +arm-r12+ stub)
+    (arm32-str buf +arm-r12+ +arm-sp+ 0)               ; sa_handler
+    (arm32-load-imm32 buf +arm-r12+ #x44000004)
+    (arm32-str buf +arm-r12+ +arm-sp+ 4)               ; sa_flags
+    (arm32-emit-pcrel-addr buf +arm-r12+ restorer)
+    (arm32-str buf +arm-r12+ +arm-sp+ 8)               ; sa_restorer
+    (arm32-mov-imm buf +arm-r12+ 0 0)
+    (arm32-str buf +arm-r12+ +arm-sp+ 12)              ; sa_mask
+    (arm32-str buf +arm-r12+ +arm-sp+ 16)
+    (dolist (sig '(11 7 8 4))
+      (arm32-mov-imm buf +arm-r0+ 0 sig)
+      (arm32-mov buf +arm-r1+ +arm-sp+)
+      (arm32-mov-imm buf +arm-r2+ 0 0)
+      (arm32-mov-imm buf +arm-r3+ 0 8)
+      (arm32-load-imm32 buf +arm-r7+ 174)              ; rt_sigaction
+      (arm32-svc buf))
+    (arm32-add-imm buf +arm-sp+ +arm-sp+ 0 24)
+    (arm32-pop buf saved)))
+
+(defun arm32-emit-rdtsc (buf)
+  "TRAP #x0310, hosted: MILLISECONDS SINCE THE FIRST READ, TAGGED, in r0; rate
+   1000 Hz (#x0311).  clock_gettime(CLOCK_MONOTONIC) (263, 32-bit timespec).  A
+   30-bit fixnum holds 12.4 days of this and no absolute counter at all -- the
+   RV32 and i386 answer.  The first read's seconds are kept tagged, +1 so 0
+   means unset, at #x10000FB8.  r1-r3 and r7 are saved: this is not a call."
+  (let ((have (mvm-make-label))
+        (saved (logior (ash 1 +arm-r1+) (ash 1 +arm-r2+) (ash 1 +arm-r3+) (ash 1 +arm-r7+))))
+    (arm32-push buf saved)
+    (arm32-sub-imm buf +arm-sp+ +arm-sp+ 0 8)
+    (arm32-mov-imm buf +arm-r0+ 0 1)                   ; CLOCK_MONOTONIC
+    (arm32-mov buf +arm-r1+ +arm-sp+)
+    (arm32-load-imm32 buf +arm-r7+ 263)
+    (arm32-svc buf)
+    (arm32-ldr buf +arm-r1+ +arm-sp+ 0)                ; tv_sec
+    (arm32-ldr buf +arm-r2+ +arm-sp+ 4)                ; tv_nsec
+    (arm32-add-imm buf +arm-sp+ +arm-sp+ 0 8)
+    (arm32-load-imm32 buf +arm-r12+ #x10000FB8)
+    (arm32-ldr buf +arm-r3+ +arm-r12+ 0)
+    (arm32-cmp-imm buf +arm-r3+ 0 0)
+    (arm32-b-cond buf +arm-cc-ne+ have)
+    (arm32-add-imm buf +arm-r3+ +arm-r1+ 0 1)
+    (arm32-lsl-imm buf +arm-r3+ +arm-r3+ 1)
+    (arm32-str buf +arm-r3+ +arm-r12+ 0)
+    (arm32-emit-label buf have)
+    (arm32-asr-imm buf +arm-r3+ +arm-r3+ 1)
+    (arm32-sub-imm buf +arm-r3+ +arm-r3+ 0 1)          ; epoch seconds
+    (arm32-sub buf +arm-r1+ +arm-r1+ +arm-r3+)         ; elapsed seconds
+    (arm32-load-imm32 buf +arm-lr+ 1000)
+    (arm32-mul buf +arm-r3+ +arm-r1+ +arm-lr+)         ; * 1000
+    (arm32-load-imm32 buf +arm-lr+ 1000000)
+    (arm32-udiv buf +arm-r2+ +arm-r2+ +arm-lr+)        ; ns -> ms
+    (arm32-add buf +arm-r0+ +arm-r3+ +arm-r2+)
+    (arm32-lsl-imm buf +arm-r0+ +arm-r0+ 1)
+    (arm32-pop buf saved)))
+
+(defun arm32-emit-mmap-exec (buf)
+  "TRAP #x0531, hosted: %MMAP-EXEC-PAGE size -> mmap2(NULL, size, RWX,
+   PRIVATE|ANON, -1, 0), address TAGGED in r0 (negative errno on failure).  An
+   address at or above 2^30 has no fixnum here, so that mapping is given back
+   (munmap 91) and -ENOMEM returned rather than a wrapped address."
+  (let ((ok (mvm-make-label))
+        (saved (logior (ash 1 +arm-r1+) (ash 1 +arm-r2+) (ash 1 +arm-r3+)
+                       (ash 1 +arm-r4+) (ash 1 +arm-r5+) (ash 1 +arm-r7+))))
+    (arm32-push buf saved)
+    (arm32-asr-imm buf +arm-r1+ +arm-r0+ 1)            ; size
+    (arm32-mov-imm buf +arm-r0+ 0 0)
+    (arm32-mov-imm buf +arm-r2+ 0 7)                   ; RWX
+    (arm32-mov-imm buf +arm-r3+ 0 #x22)                ; PRIVATE|ANONYMOUS
+    (arm32-load-imm32 buf +arm-r4+ #xFFFFFFFF)         ; fd -1
+    (arm32-mov-imm buf +arm-r5+ 0 0)
+    (arm32-load-imm32 buf +arm-r7+ +arm-linux-sys-mmap2+)
+    (arm32-svc buf)
+    (arm32-lsl-imm buf +arm-r12+ +arm-r0+ 1)
+    (arm32-dp-reg buf +arm-dp-cmp+ 0 +arm-r0+ +arm-r12+ :s 1
+                  :shift-type +arm-shift-asr+ :shift-amt 1)
+    (arm32-b-cond buf +arm-cc-eq+ ok)
+    (arm32-load-imm32 buf +arm-r7+ 91)                 ; munmap(r0, r1)
+    (arm32-svc buf)
+    (arm32-load-imm32 buf +arm-r12+ #xFFFFFFE8)        ; tagged -ENOMEM
+    (arm32-emit-label buf ok)
+    (arm32-mov buf +arm-r0+ +arm-r12+)
+    (arm32-pop buf saved)))
+
+;;; ============================================================
+;;; Checked arithmetic: overflow promotes to a bignum
+;;; ============================================================
+
+(defun arm32-genarith-offset (name function-table)
+  "Bytecode offset of NAME (GENERIC-ADD / -SUBTRACT / -MULTIPLY) in the module
+   being translated, or NIL -- the small ladder images have no generic
+   arithmetic, and their checked ops keep wrapping as before."
+  (second (find name function-table :key #'first :test #'string-equal)))
+
+(defun arm32-emit-genarith-call (buf va vb label)
+  "The overflow slow path: GENERIC-xxx(VA, VB) with the result in r12.  An
+   arithmetic op is not a call to the compiler, so r0-r3 (V0-V3) are saved
+   here; r4-r8/r11 are the callee's to save, r9/r10 are global.  The operands
+   are staged in r12/LR first because VA/VB may themselves be r0-r3."
+  (arm32-load-vreg buf +arm-r12+ va)
+  (arm32-load-vreg buf +arm-lr+ vb)
+  (arm32-push buf #x000F)                       ; r0-r3 (keeps 8-alignment)
+  (arm32-mov buf +arm-r0+ +arm-r12+)
+  (arm32-mov buf +arm-r1+ +arm-lr+)
+  (arm32-mov-imm buf +arm-r12+ 0 2)
+  (arm32-emit-store-abs buf +arm-r12+ (arm32-nargs-addr))
+  (arm32-bl buf label)
+  (arm32-mov buf +arm-r12+ +arm-r0+)
+  (arm32-pop buf #x000F))
+
+;;; ============================================================
+;;; Hosted collector
+;;; ============================================================
+;;;
+;;; A Cheney copying collector in native ARM, the port of translate-riscv's
+;;; RV-EMIT-GC-COLLECTOR with ONE layout change: allocation marks are a KIND
+;;; BYTE per 16-byte granule (1 = object start, 2 = cons) rather than two bit
+;;; maps.  An ARM allocation site has only r12 and LR free, and a bit set is a
+;;; read-modify-write that needs three; a byte store needs two:
+;;;     lr = K ; ADD lr, lr, r9, LSR #4 ; MOV r12, #kind ; STRB r12, [lr]
+;;; where K = KIND-MAP - (HEAP-BASE >> 4).  The map is SIZE/16 bytes past the
+;;; heap guard; only native code touches it, so it may sit above 2^29.
+;;;
+;;; ROOTS: every register (the entry pushes r0-r12 and LR and the stack scan
+;;; starts there, so a register holding a pointer is updated in place and
+;;; restored updated), the stack up to stack_base, and the whole low block
+;;; [#x10000000, heap + alloc-start) -- as on RISC-V.  A conservative root must
+;;; name an address in from-space whose kind byte matches its tag (cons tag 1
+;;; <-> 2, object tag 9 <-> 1), or it is left alone.
+;;;
+;;; TO-SPACE IS SPLIT BY SHAPE: objects copied UP from to_start, conses DOWN
+;;; from to_end, so the Cheney scan always knows what it is looking at and can
+;;; skip leaf payloads.  The mutator then allocates in the gap: VL = the cons
+;;; frontier minus +arm32-gc-overshoot-margin+.  Failure is loud: BKPT #xF0
+;;; (heap still full after a collection) / #xF1 (to-space overflow).
+;;;
+;;; Register plan inside the collector:  r4 from_start  r5 from_end
+;;; r6 to_start  r7 to_end  r8 object free (up)  r9 cons low (down)
+;;; r10/r11 loop cursors.  SCAN (r0 = slot address) uses r1-r3 and r12 only,
+;;; preserves r4-r11, and returns with BX LR.
+
+(defconstant +arm32-gc-overshoot-margin+ #x100000
+  "Bytes kept free below VL: :gc-check tests VA < VL before an allocation whose
+   size it does not know.  1 MB, as on RISC-V.")
+
+(defvar *arm32-gc-label* nil
+  "Label of the hosted collector while translating a hosted module, else NIL
+   (then :gc-check is the old BKPT and no allocation marks are emitted).")
+
+(defun arm32-hosted-geometry ()
+  "(values heap-base heap-size guard kind-map alloc-start midpoint), read from
+   boot-linux-arm32.lisp so the translator and the boot stub cannot drift."
+  (flet ((c (name)
+           (let ((sym (find-symbol name :modus.mvm)))
+             (unless (and sym (boundp sym))
+               (error "hosted ARM32: ~A is not defined -- boot file not loaded" name))
+             (symbol-value sym))))
+    (let ((base (c "+LINUX-ARM32-HEAP-ADDR+")) (size (c "+LINUX-ARM32-HEAP-SIZE+"))
+          (guard (c "+LINUX-ARM32-GC-GUARD+")))
+      (values base size guard (+ base size guard)
+              (c "+LINUX-ARM32-HEAP-ALLOC-START+") (c "+LINUX-ARM32-GC-MIDPOINT+")))))
+
+(defun arm32-kind-bias ()
+  "K such that the kind byte of address A is at K + (A >> 4)."
+  (multiple-value-bind (base size guard kind) (arm32-hosted-geometry)
+    (declare (ignore size guard))
+    (- kind (ash base -4))))
+
+(defun arm32-emit-kind-addr (buf dst addr-reg)
+  "DST = the kind-byte address of the granule at ADDR-REG (DST /= ADDR-REG)."
+  (arm32-load-imm32 buf dst (arm32-kind-bias))
+  (arm32-dp-reg buf +arm-dp-add+ dst dst addr-reg
+                :shift-type +arm-shift-lsr+ :shift-amt 4))
+
+(defun arm32-emit-alloc-mark (buf kind)
+  "Mark the allocation about to start at VA (r9): KIND 1 = object, 2 = cons.
+   Hosted with a collector only.  Clobbers r12 and LR, so it is emitted FIRST
+   in every allocation arm, before either holds an operand."
+  (when *arm32-gc-label*
+    (arm32-emit-kind-addr buf +arm-lr+ +arm-r9+)
+    (arm32-mov-imm buf +arm-r12+ 0 kind)
+    (arm32-strb buf +arm-r12+ +arm-lr+ 0)))
+
+(defun arm32-emit-bkpt (buf imm)
+  (arm32-emit buf (logior #xE1200070 (ash (ldb (byte 12 4) imm) 8) (ldb (byte 4 0) imm))))
+
+(defun arm32-emit-ldr-reg (buf rd rn rm)
+  "LDR Rd, [Rn, Rm]"
+  (arm32-emit buf (logior #xE7900000 (ash rn 16) (ash rd 12) rm)))
+
+(defun arm32-emit-str-reg (buf rd rn rm)
+  "STR Rd, [Rn, Rm]"
+  (arm32-emit buf (logior #xE7800000 (ash rn 16) (ash rd 12) rm)))
+
+(defun arm32-emit-object-size (buf dst header sub)
+  "DST = the byte size of the object whose HEADER word is in HEADER, aligned to
+   16.  SUB is clobbered with the subtag.  u8 vectors (#x11) count bytes, f32
+   vectors (#x12) 4-byte lanes, everything else words; all have the 4-byte
+   header.  Mirrors every arm32 allocation site."
+  (let ((n1 (mvm-make-label)) (n2 (mvm-make-label)) (al (mvm-make-label)))
+    (arm32-lsr-imm buf dst header 8)
+    (arm32-and-imm buf sub header 0 #xFF)
+    (arm32-cmp-imm buf sub 0 #x12)
+    (arm32-b-cond buf +arm-cc-ne+ n1)
+    (arm32-lsl-imm buf dst dst 2)
+    (arm32-add-imm buf dst dst 0 4)
+    (arm32-b buf al)
+    (arm32-emit-label buf n1)
+    (arm32-cmp-imm buf sub 0 #x11)
+    (arm32-b-cond buf +arm-cc-ne+ n2)
+    (arm32-add-imm buf dst dst 0 4)
+    (arm32-b buf al)
+    (arm32-emit-label buf n2)
+    (arm32-add-imm buf dst dst 0 1)
+    (arm32-lsl-imm buf dst dst 2)
+    (arm32-emit-label buf al)
+    (arm32-add-imm buf dst dst 0 15)
+    (arm32-bic-imm buf dst dst 0 15)))
+
+(defun arm32-emit-gc-collector (buf)
+  "Emit the hosted collector at *ARM32-GC-LABEL*.  Entered by BLCS from
+   :gc-check (LR = return address); every register is preserved except the
+   new VA/VL it installs."
+  (multiple-value-bind (base size guard kind alloc-start) (arm32-hosted-geometry)
+    (declare (ignore size guard kind))
+    (let ((scan (mvm-make-label)) (meta #x10000040))
+      (flet ((lbl () (mvm-make-label))
+             (here (l) (arm32-emit-label buf l))
+             (root-range (lo-reg hi-reg)
+               ;; for (r10 = lo; r10 < hi; r10 += 4) scan(r10)
+               (let ((top (mvm-make-label)) (out (mvm-make-label)))
+                 (unless (= lo-reg +arm-r10+) (arm32-mov buf +arm-r10+ lo-reg))
+                 (arm32-emit-label buf top)
+                 (arm32-cmp buf +arm-r10+ hi-reg)
+                 (arm32-b-cond buf +arm-cc-cs+ out)
+                 (arm32-mov buf +arm-r0+ +arm-r10+)
+                 (arm32-bl buf scan)
+                 (arm32-add-imm buf +arm-r10+ +arm-r10+ 0 4)
+                 (arm32-b buf top)
+                 (arm32-emit-label buf out))))
+        (here *arm32-gc-label*)
+        (arm32-push buf #x5FFF)                       ; r0-r12, lr
+        ;; ---- geometry ----
+        (arm32-load-imm32 buf +arm-r12+ meta)
+        (arm32-ldr buf +arm-r4+ +arm-r12+ 0)           ; from_start
+        (arm32-ldr buf +arm-r6+ +arm-r12+ 8)           ; to_start
+        (arm32-ldr buf +arm-r1+ +arm-r12+ 16)          ; space_size
+        (arm32-add buf +arm-r5+ +arm-r4+ +arm-r1+)     ; from_end
+        (arm32-add buf +arm-r7+ +arm-r6+ +arm-r1+)     ; to_end
+        (arm32-mov buf +arm-r8+ +arm-r6+)              ; object free
+        (arm32-mov buf +arm-r9+ +arm-r7+)              ; cons low
+        ;; ---- roots: the stack from the save frame, then the low block ----
+        (arm32-ldr buf +arm-r11+ +arm-r12+ 24)         ; stack_base
+        (root-range +arm-sp+ +arm-r11+)
+        (arm32-load-imm32 buf +arm-r10+ #x10000000)
+        (arm32-load-imm32 buf +arm-r11+ (+ base alloc-start))
+        (root-range +arm-r10+ +arm-r11+)
+        ;; ---- Cheney: r10 = object scan (up), r11 = cons scan (down) ----
+        (arm32-mov buf +arm-r10+ +arm-r6+)
+        (arm32-mov buf +arm-r11+ +arm-r7+)
+        (let ((ch (lbl)) (obj (lbl)) (cons (lbl)) (cdone (lbl))
+              (leaf (lbl)) (sl (lbl)) (sd (lbl)))
+          (here ch)
+          (arm32-cmp buf +arm-r10+ +arm-r8+)
+          (arm32-b-cond buf +arm-cc-cc+ obj)
+          (arm32-cmp buf +arm-r9+ +arm-r11+)
+          (arm32-b-cond buf +arm-cc-cc+ cons)
+          (arm32-b buf cdone)
+          ;; -- one object at r10 --
+          (here obj)
+          (arm32-ldr buf +arm-r12+ +arm-r10+ 0)                  ; header
+          (arm32-emit-object-size buf +arm-r1+ +arm-r12+ +arm-r2+)
+          (arm32-add buf +arm-r3+ +arm-r10+ +arm-r1+)
+          (arm32-push buf (ash 1 +arm-r3+))                      ; [sp] = next
+          (dolist (st '(#x10 #x11 #x12 #x14 #x16 #x60 #x64 #x65 #x66))
+            (arm32-cmp-imm buf +arm-r2+ 0 st)
+            (arm32-b-cond buf +arm-cc-eq+ leaf))
+          (arm32-lsr-imm buf +arm-r3+ +arm-r12+ 8)               ; count
+          (arm32-lsl-imm buf +arm-r3+ +arm-r3+ 2)
+          (arm32-add buf +arm-r3+ +arm-r3+ +arm-r10+)
+          (arm32-add-imm buf +arm-r3+ +arm-r3+ 0 4)              ; slot end
+          (arm32-push buf (ash 1 +arm-r3+))
+          (arm32-add-imm buf +arm-r10+ +arm-r10+ 0 4)
+          (here sl)
+          (arm32-ldr buf +arm-r3+ +arm-sp+ 0)
+          (arm32-cmp buf +arm-r10+ +arm-r3+)
+          (arm32-b-cond buf +arm-cc-cs+ sd)
+          (arm32-mov buf +arm-r0+ +arm-r10+)
+          (arm32-bl buf scan)
+          (arm32-add-imm buf +arm-r10+ +arm-r10+ 0 4)
+          (arm32-b buf sl)
+          (here sd)
+          (arm32-add-imm buf +arm-sp+ +arm-sp+ 0 4)              ; drop slot end
+          (here leaf)
+          (arm32-pop buf (ash 1 +arm-r10+))                      ; r10 = next
+          (arm32-b buf ch)
+          ;; -- one cons below r11 --
+          (here cons)
+          (arm32-sub-imm buf +arm-r11+ +arm-r11+ 0 16)
+          (arm32-mov buf +arm-r0+ +arm-r11+)
+          (arm32-bl buf scan)
+          (arm32-add-imm buf +arm-r0+ +arm-r11+ 0 4)
+          (arm32-bl buf scan)
+          (arm32-b buf ch)
+          (here cdone))
+        ;; ---- clear the kind bytes of the evacuated semispace [r4, r5) ----
+        (let ((zl (lbl)) (zd (lbl)))
+          (arm32-emit-kind-addr buf +arm-r0+ +arm-r4+)
+          (arm32-emit-kind-addr buf +arm-r1+ +arm-r5+)
+          (arm32-mov-imm buf +arm-r2+ 0 0)
+          (here zl)
+          (arm32-cmp buf +arm-r0+ +arm-r1+)
+          (arm32-b-cond buf +arm-cc-cs+ zd)
+          (arm32-str buf +arm-r2+ +arm-r0+ 0)
+          (arm32-add-imm buf +arm-r0+ +arm-r0+ 0 4)
+          (arm32-b buf zl)
+          (here zd))
+        ;; ---- swap the semispaces, count the collection ----
+        (arm32-load-imm32 buf +arm-r12+ meta)
+        (arm32-str buf +arm-r6+ +arm-r12+ 0)
+        (arm32-str buf +arm-r4+ +arm-r12+ 8)
+        (arm32-ldr buf +arm-r0+ +arm-r12+ 32)
+        (arm32-add-imm buf +arm-r0+ +arm-r0+ 0 1)
+        (arm32-str buf +arm-r0+ +arm-r12+ 32)
+        ;; ---- new VA = object free, VL = cons low - margin, into the frame ----
+        (let ((exhausted (lbl)))
+          (arm32-load-imm32 buf +arm-r0+ +arm32-gc-overshoot-margin+)
+          (arm32-sub buf +arm-r1+ +arm-r9+ +arm-r0+)
+          (arm32-cmp buf +arm-r8+ +arm-r1+)
+          (arm32-b-cond buf +arm-cc-cs+ exhausted)
+          (arm32-str buf +arm-r8+ +arm-sp+ 36)                   ; saved r9 (VA)
+          (arm32-str buf +arm-r1+ +arm-sp+ 40)                   ; saved r10 (VL)
+          (arm32-pop buf #x5FFF)
+          (arm32-bx buf +arm-lr+)
+          (here exhausted)
+          (arm32-emit-bkpt buf #xF0))
+        ;; ================= SCAN (r0 = slot address) =================
+        (let ((ret (lbl)) (isptr (lbl)) (kobj (lbl)) (kok (lbl)) (notfwd (lbl))
+              (obj (lbl)) (ovf (lbl)) (cl (lbl)))
+          (here scan)
+          (arm32-ldr buf +arm-r1+ +arm-r0+ 0)
+          (arm32-and-imm buf +arm-r2+ +arm-r1+ 0 15)             ; tag
+          (arm32-cmp-imm buf +arm-r2+ 0 1)
+          (arm32-b-cond buf +arm-cc-eq+ isptr)
+          (arm32-cmp-imm buf +arm-r2+ 0 9)
+          (arm32-b-cond buf +arm-cc-ne+ ret)
+          (here isptr)
+          (arm32-bic-imm buf +arm-r3+ +arm-r1+ 0 15)             ; address
+          (arm32-cmp buf +arm-r3+ +arm-r4+)
+          (arm32-b-cond buf +arm-cc-cc+ ret)
+          (arm32-cmp buf +arm-r3+ +arm-r5+)
+          (arm32-b-cond buf +arm-cc-cs+ ret)
+          ;; a real start of the right kind, or not a root at all
+          (arm32-emit-kind-addr buf +arm-r12+ +arm-r3+)
+          (arm32-ldrb buf +arm-r12+ +arm-r12+ 0)
+          (arm32-cmp-imm buf +arm-r2+ 0 1)
+          (arm32-b-cond buf +arm-cc-ne+ kobj)
+          (arm32-cmp-imm buf +arm-r12+ 0 2)
+          (arm32-b-cond buf +arm-cc-ne+ ret)
+          (arm32-b buf kok)
+          (here kobj)
+          (arm32-cmp-imm buf +arm-r12+ 0 1)
+          (arm32-b-cond buf +arm-cc-ne+ ret)
+          (here kok)
+          (arm32-ldr buf +arm-r12+ +arm-r3+ 0)                   ; first word
+          (arm32-and-imm buf +arm-r1+ +arm-r12+ 0 15)
+          (arm32-cmp-imm buf +arm-r1+ 0 15)
+          (arm32-b-cond buf +arm-cc-ne+ notfwd)
+          ;; already forwarded: (fwd & ~15) | tag
+          (arm32-bic-imm buf +arm-r12+ +arm-r12+ 0 15)
+          (arm32-orr buf +arm-r12+ +arm-r12+ +arm-r2+)
+          (arm32-str buf +arm-r12+ +arm-r0+ 0)
+          (arm32-bx buf +arm-lr+)
+          (here notfwd)
+          (arm32-cmp-imm buf +arm-r2+ 0 1)
+          (arm32-b-cond buf +arm-cc-ne+ obj)
+          ;; -- cons: 16 bytes down from r9 --
+          (arm32-sub-imm buf +arm-r1+ +arm-r9+ 0 16)
+          (arm32-cmp buf +arm-r1+ +arm-r8+)
+          (arm32-b-cond buf +arm-cc-cc+ ovf)
+          (arm32-mov buf +arm-r9+ +arm-r1+)
+          (arm32-ldr buf +arm-r1+ +arm-r3+ 0)
+          (arm32-str buf +arm-r1+ +arm-r9+ 0)
+          (arm32-ldr buf +arm-r1+ +arm-r3+ 4)
+          (arm32-str buf +arm-r1+ +arm-r9+ 4)
+          (arm32-emit-kind-addr buf +arm-r12+ +arm-r9+)
+          (arm32-mov-imm buf +arm-r1+ 0 2)
+          (arm32-strb buf +arm-r1+ +arm-r12+ 0)
+          (arm32-orr-imm buf +arm-r1+ +arm-r9+ 0 15)
+          (arm32-str buf +arm-r1+ +arm-r3+ 0)                    ; forward
+          (arm32-orr-imm buf +arm-r1+ +arm-r9+ 0 1)
+          (arm32-str buf +arm-r1+ +arm-r0+ 0)                    ; update slot
+          (arm32-bx buf +arm-lr+)
+          ;; -- object: header in r12 --
+          (here obj)
+          (arm32-emit-object-size buf +arm-r1+ +arm-r12+ +arm-r2+)
+          ;; a header whose object cannot lie inside from-space is a false root
+          (arm32-add buf +arm-r2+ +arm-r3+ +arm-r1+)
+          (arm32-cmp buf +arm-r2+ +arm-r5+)
+          (arm32-b-cond buf +arm-cc-hi+ ret)
+          (arm32-cmp buf +arm-r2+ +arm-r3+)
+          (arm32-b-cond buf +arm-cc-cc+ ret)                     ; wrapped
+          ;; room below the cons frontier, else to-space overflow
+          (arm32-add buf +arm-r2+ +arm-r8+ +arm-r1+)
+          (arm32-cmp buf +arm-r2+ +arm-r9+)
+          (arm32-b-cond buf +arm-cc-hi+ ovf)
+          (arm32-mov-imm buf +arm-r2+ 0 0)
+          (here cl)
+          (arm32-emit-ldr-reg buf +arm-r12+ +arm-r3+ +arm-r2+)
+          (arm32-emit-str-reg buf +arm-r12+ +arm-r8+ +arm-r2+)
+          (arm32-add-imm buf +arm-r2+ +arm-r2+ 0 4)
+          (arm32-cmp buf +arm-r2+ +arm-r1+)
+          (arm32-b-cond buf +arm-cc-cc+ cl)
+          (arm32-emit-kind-addr buf +arm-r12+ +arm-r8+)
+          (arm32-mov-imm buf +arm-r2+ 0 1)
+          (arm32-strb buf +arm-r2+ +arm-r12+ 0)
+          (arm32-orr-imm buf +arm-r2+ +arm-r8+ 0 15)
+          (arm32-str buf +arm-r2+ +arm-r3+ 0)                    ; forward
+          (arm32-orr-imm buf +arm-r2+ +arm-r8+ 0 9)
+          (arm32-str buf +arm-r2+ +arm-r0+ 0)                    ; update slot
+          (arm32-add buf +arm-r8+ +arm-r8+ +arm-r1+)
+          (arm32-bx buf +arm-lr+)
+          (here ret)
+          (arm32-bx buf +arm-lr+)
+          (here ovf)
+          (arm32-emit-bkpt buf #xF1))))))
+
 (defun translate-mvm-to-arm32 (bytecode function-table &key (v7 nil))
   "Translate MVM bytecode to ARM32 native code.
    When V7 is T, emit ARMv7-A instructions (SDIV, MOVW/MOVT, DMB, LDREX/STREX).
@@ -2460,6 +3105,7 @@
   (setf *arm32-li-const-patches* nil
         *arm32-unimpl-opcodes* nil)
   (let* ((*arm32-v7* v7)
+         (*arm32-gc-label* (and *arm32-linux-mode* (mvm-make-label)))
          (buf (make-arm32-buffer))
          (label-map (make-hash-table :test 'eql))
          (bc bytecode)
@@ -2536,6 +3182,8 @@
     ;; Emit software divide routine at end (only needed for ARMv5)
     (unless *arm32-v7*
       (arm32-emit-divmod buf))
+    (when *arm32-gc-label*
+      (arm32-emit-gc-collector buf))
 
     ;; Resolve branch fixups
     (arm32-resolve-fixups buf)

@@ -15,7 +15,8 @@
 # anywhere, aarch64 on a non-aarch64 host) runs under qemu-user through a
 # generated wrapper -- binfmt_misc is NOT registered on the dev box, and a bare
 # ./binary of a 32-bit ELF silently fails to exec instead of reporting an
-# error.  Override the emulator with QEMU_I386 / QEMU_AARCH64.
+# error.  Override the emulator with QEMU_I386 / QEMU_AARCH64 / QEMU_ARM /
+# QEMU_RISCV64 / QEMU_RISCV32.
 #
 # Compare against a run of the SAME tree on another arch -- never a stale binary.
 set -u
@@ -37,6 +38,12 @@ case "$(file -b "$BIN")" in
     if [ "$HOSTARCH" = aarch64 ]; then EMU=""; else EMU="${QEMU_AARCH64:-qemu-aarch64-static}"; fi ;;
   *"x86-64"*)
     if [ "$HOSTARCH" = x86_64 ]; then EMU=""; else EMU="${QEMU_X86_64:-qemu-x86_64-static}"; fi ;;
+  *"32-bit"*", ARM,"*)
+    EMU="${QEMU_ARM:-qemu-arm-static}" ;;
+  *"64-bit"*"RISC-V"*)
+    EMU="${QEMU_RISCV64:-qemu-riscv64-static}" ;;
+  *"32-bit"*"RISC-V"*)
+    EMU="${QEMU_RISCV32:-qemu-riscv32-static}" ;;
   *) echo "unrecognised binary: $(file -b "$BIN")" >&2; exit 1 ;;
 esac
 if [ -n "$EMU" ]; then

@@ -7307,6 +7307,22 @@
       (emit-mov-mem-reg buf 'rbp 'rax -40)           ; window base
       (emit-mov-reg-mem buf 'rdi 'rsi #x70)          ; [SP, top)
       (emit-mov-reg-mem buf 'r11 'rsi #x78)
+      ;; A thread RUNNING AN ACTOR (net/hosted-actor-runtime) stands on the
+      ;; actor's stack, whose bounds its current window publishes at
+      ;; +0x50C8/+0x50C0; when the parked SP lies inside them, that top is
+      ;; the scan's top (operandi's rule, ported here from its own STW scan).
+      (let ((tgo (make-label)))
+        (emit-mov-reg-mem buf 'rax 'rsi #x38)          ; window delta
+        (emit-mov-reg-mem buf 'r8 'rax #x100050C0)     ; context top
+        (emit-cmp-reg-imm buf 'r8 0)
+        (emit-jcc buf :e tgo)
+        (emit-cmp-reg-reg buf 'rdi 'r8)
+        (emit-jcc buf :ae tgo)
+        (emit-mov-reg-mem buf 'rax 'rax #x100050C8)    ; context bottom
+        (emit-cmp-reg-reg buf 'rdi 'rax)
+        (emit-jcc buf :b tgo)
+        (emit-mov-reg-reg buf 'r11 'r8)
+        (emit-label buf tgo))
       (emit-label buf sloop)
       (emit-cmp-reg-reg buf 'rdi 'r11)
       (emit-jcc buf :ae sdone)
@@ -7316,6 +7332,40 @@
       (emit-jmp buf sloop)
       (emit-label buf sdone)
       (emit-x64-window-root-scan buf scan-word-label)
+      ;; The region this thread ALLOCATES IN (rec+0x40): for a thread running
+      ;; an actor that is the actor's region, which the thread-region loop
+      ;; below never visits.  Live part [from, parked alloc), clamped to the
+      ;; semispace; a thread region seen here and below is scanned twice,
+      ;; which is harmless.
+      (let ((rnone (make-label)) (rin (make-label)))
+        (emit-push buf 'rsi)
+        (emit-mov-reg-mem buf 'rsi 'rsi #x40)          ; rsi = its RCB
+        (emit-cmp-reg-imm buf 'rsi 0)
+        (emit-jcc buf :e rnone)
+        (emit-mov-reg-mem buf 'rdi 'rsi modus.mvm::+gc-off-from-start+)
+        (emit-cmp-reg-imm buf 'rdi 0)
+        (emit-jcc buf :e rnone)
+        (emit-mov-reg-mem buf 'r8 'rsi modus.mvm::+gc-off-space-size+)
+        (emit-add-reg-reg buf 'r8 'rdi)                ; r8 = from_end
+        (emit-mov-reg-mem buf 'r10 'rsi #x30)          ; parked alloc
+        (emit-cmp-reg-reg buf 'r10 'rdi)
+        (emit-jcc buf :b rin)
+        (emit-cmp-reg-reg buf 'r10 'r8)
+        (emit-jcc buf :be rin)
+        (emit-label buf rin)
+        (emit-cmp-reg-reg buf 'r10 'rdi)
+        (let ((ok (make-label)))
+          (emit-jcc buf :ae ok)
+          (emit-mov-reg-reg buf 'r10 'r8)
+          (emit-label buf ok))
+        (emit-cmp-reg-reg buf 'r10 'r8)
+        (let ((ok2 (make-label)))
+          (emit-jcc buf :be ok2)
+          (emit-mov-reg-reg buf 'r10 'r8)
+          (emit-label buf ok2))
+        (emit-stw-scan-range buf scan-word-label)
+        (emit-label buf rnone)
+        (emit-pop buf 'rsi))
       (emit-jmp buf tloop)
       ;; ---- carved thread regions [from, frontier) ----
       (emit-label buf rloop)

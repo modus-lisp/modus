@@ -77,11 +77,15 @@
       (setq ths (cons (sb-thread:make-thread (lambda () (worker id))) ths))))
   (%sleep-ms 50)
   (setq g0 (region0-gcs))
-  ;; Churn region 0 until it has collected *MIN-GCS* times (bounded).
+  ;; Churn region 0 until it has collected *MIN-GCS* times (bounded).  In
+  ;; ARRAYS, about 8 MB a round: region 0 is ~600 MB once the lock arena is
+  ;; carved, and a round of 20 000 conses (320 KB) never filled it -- the
+  ;; collections this counted used to come from the lock arena's refills,
+  ;; which lock-free interning (mvm/prelude.lisp %HT-GET-RO) made rare.
   (loop
-    (when (or (>= (- (region0-gcs) g0) *min-gcs*) (> i 400)) (return nil))
+    (when (or (>= (- (region0-gcs) g0) *min-gcs*) (> i 2000)) (return nil))
     (let ((junk nil) (j 0))
-      (loop (when (>= j 20000) (return nil)) (setq junk (cons j junk)) (setq j (+ j 1))))
+      (loop (when (>= j 50) (return nil)) (setq junk (make-array 20000)) (setq j (+ j 1))))
     (setq i (+ i 1)))
   (setq g1 (region0-gcs))
   (setq *stop* t)

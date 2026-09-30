@@ -269,13 +269,13 @@
   (let ((self (%tls-self-base)))
     (if (zerop self)
         nil
-        (let ((w (%gc-word-of x (+ self #x100050A0))))
+        (let ((w (%gc-word-of x (+ self (%conv-addr #x100050A0)))))
           (if (/= (logand w 5) 1)
               nil
               (let ((a (logand w -16))
-                    (ba (%gc-read64 (+ self #x10005040)))
-                    (bb (%gc-read64 (+ self #x10005048)))
-                    (sz (%gc-read64 (+ self #x10005050))))
+                    (ba (%gc-read64 (+ self (%conv-addr #x10005040))))
+                    (bb (%gc-read64 (+ self (%conv-addr #x10005048))))
+                    (sz (%gc-read64 (+ self (%conv-addr #x10005050)))))
                 (and (> sz 0)
                      (or (and (>= a ba) (< a (+ ba sz)))
                          (and (>= a bb) (< a (+ bb sz)))))))))))

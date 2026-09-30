@@ -1990,6 +1990,13 @@
           (setq cur (cdr cur)))
         (%ht-vec-set vec h (nreverse result))))))
 
+(defun %rt-reserve (bytes)
+  "Room for BYTES of allocation in the current locked section.  A no-op here;
+   the hosted threaded runtime (net/hosted-sync.lisp) redefines it to refill
+   the lock-arena slice a locked section allocates from."
+  bytes
+  0)
+
 (defun %ht-rebuild-index (ht holder strcmp?)
   "Build (or RE-build, larger) the bucket index from HT's current alist and
    store it in HOLDER's car.  The bucket count is a power of two sized so the
@@ -2001,6 +2008,10 @@
     (loop
       (when (or (>= n (* 2 cnt)) (>= n 65536)) (return nil))
       (setq n (* n 2)))
+    ;; The rebuild is one allocation burst: the bucket vector and two conses
+    ;; an entry.  Under the runtime lock that must fit the lock-arena slice
+    ;; (%RT-RESERVE, net/hosted-sync.lisp).
+    (%rt-reserve (+ (* n 8) (* cnt 32) 256))
     (let ((vec (%ht-new-bucket-vec n)) (cur (car ht)) (ok t))
       (loop
         (when (null cur) (return nil))

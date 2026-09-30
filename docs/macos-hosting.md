@@ -1135,3 +1135,47 @@ space.  Reaching one needs:
 - a footprint that fits a watch app's memory limit.
 
 The Simulator runs watch apps as 64-bit Mac processes and shows none of this.
+
+## After rebasing onto main (2026-09-30)
+
+Rebasing the iPhone/watch work onto `main` (after the operandi merge) turned
+up three problems.  The first two were already on `main`.
+
+- **Region literals that do not move.**  New runtime code addressed runtime-
+  region words as raw literals passed to `%GC-WRITE64` or added to a thread's
+  self base, which the compiler cannot rebase:
+  - the lock arena root, `#x10000D98`;
+  - the clone's window word, `#x10005020`;
+  - the window words `+0x5040`–`+0x50A8`.
+
+  They are right wherever the region sits at `0x10000000` (x86-64, default
+  Linux) and wrong wherever it moves.  On macOS and iOS, `%SB-THREADS-UP`
+  faulted, so every `sb-thread` test failed.  They are now `(%CONV-ADDR K)`,
+  which is the literal where nothing moves.
+- **A locked section can outgrow its lock-arena slice.**  Headroom is topped
+  up to 64 KB only when the outermost section begins.  Re-indexing a big
+  table inside one section needs more: `COMMON-LISP-USER` at ~2,000 symbols
+  takes a 32 KB bucket vector plus two conses an entry.
+  - A slice that overflows is collected, and its objects come back as
+    garbage.
+  - A worker interning fresh symbols died with a `TYPE-ERROR` in
+    `%HT-REBUILD-INDEX` while holding the lock.  The lock leaked, and `main`'s
+    60-second guard stopped the process.
+  - On `main` this is `test/hosted-worker-intern.lisp`'s failing arm.  The
+    lock-free lookups only changed which run hit it.
+
+  The fix is `%RT-RESERVE BYTES`: a no-op in the prelude, redefined in the
+  hosted runtime.  If the caller holds the lock, is allocating from its slice
+  and has too little room, it refills the slice from the arena mid-section.
+  `%HT-REBUILD-INDEX` reserves its worst case first, and `%RT-SLICE-ENSURE`
+  takes the needed headroom as an argument.  `hosted-worker-intern` is
+  `CLEAN` again.
+- **`hosted-stw`'s positive control.**  Its churn of 20,000 conses a round
+  never filled region 0, which is ~600 MB after the carve.  The collections it
+  counted used to come from lock-arena refills, which lock-free interning
+  made rare.  It now churns arrays (~8 MB a round).
+
+How it was found: breakpoints set after launch on the in-place macOS image
+(lldb disables ASLR, so its addresses are the symbol map's), and a Python
+callback that logs each hit on `%SIGNAL-TYPE-ERROR` / `MAKE-CONDITION` with a
+stack scan for return addresses.

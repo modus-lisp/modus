@@ -287,9 +287,9 @@
    stop-the-world STATE running and no stale published RSP, and the self slot
    holding its own segment base.  Returns that base, or 0 if there is no block."
   (let ((b (%thr-tls-block cpu)))
-    (if (or (zerop b) (< b #x10000000))
+    (if (or (zerop b) (< b (%conv-addr #x10000000)))
         0
-        (let ((delta (- b #x10000000)))
+        (let ((delta (- b (%conv-addr #x10000000))))
           (setf (mem-ref (+ b #xC50) :u64) 0)
           (setf (mem-ref (+ b #xC58) :u64) 0)
           (setf (mem-ref (+ b #xC60) :u64) (%thr-dynb-stack cpu))
@@ -1433,19 +1433,20 @@
   (let ((self (%tls-self-base)))
     (if (zerop self)
         #x10000
-        (let ((n (%gc-read64 (+ self #x100050A8))))
+        (let ((n (%gc-read64 (+ self (%conv-addr #x100050A8)))))
           (if (> n #x10000) n #x10000)))))
 
 (defun %rt-enter-sized (bytes)
   "%RT-ENTER, with room for one allocation of BYTES in the locked section."
   (let ((self (%tls-self-base)))
-    (unless (zerop self) (%gc-write64 (+ self #x100050A8) (+ bytes 64))))
+    (unless (zerop self) (%gc-write64 (+ self (%conv-addr #x100050A8)) (+ bytes 64))))
   (%rt-enter)
   (let ((self (%tls-self-base)))
-    (unless (zerop self) (%gc-write64 (+ self #x100050A8) 0))))
+    (unless (zerop self) (%gc-write64 (+ self (%conv-addr #x100050A8)) 0))))
 
-(defun %rt-slice-ensure ()
-  "This CPU's slice block with at least 64 KB of headroom, refilled from the
+(defun %rt-slice-ensure (need)
+  "This CPU's slice block with at least NEED bytes of headroom (the entry
+   path passes %RT-SLICE-NEED, 64 KB unless announced), refilled from the
    arena if not — the caller holds the runtime mutex, which is what makes the
    arena frontier single-writer.  0 when there is no arena or it is exhausted
    (counted), in which case the caller uses the pre-B-lite path."
@@ -1456,11 +1457,11 @@
                (blk (%rt-slice-block (%thr-cpu)))
                (alloc (%gc-meta-read (+ blk #x30) k))
                (limit (%gc-meta-read (+ blk #x38) k)))
-          (if (>= (- limit alloc) (%rt-slice-need))
+          (if (>= (- limit alloc) need)
               blk
               (let* ((af (%rt-arena-alloc))
-                     (chunk (if (> (+ (%rt-slice-need) #x10000) #x100000)
-                                (logand (+ (%rt-slice-need) #x10000 #xFFFF) (- 0 #x10000))
+                     (chunk (if (> (+ need #x10000) #x100000)
+                                (logand (+ need #x10000 #xFFFF) (- 0 #x10000))
                                 #x100000)))
                 (if (> (+ af chunk) ae)
                     (progn
@@ -1474,6 +1475,41 @@
                       (%gc-region-init blk af af chunk 0 k)
                       (%gc-write64 (+ (%rt-arena-words) #x08) (+ af chunk))
                       blk))))))))
+
+(defun %rt-reserve (bytes)
+  "Make sure the locked section this thread is in can allocate BYTES without
+   running past its slice.  The hosted twin of mvm/prelude.lisp's no-op.
+
+   A SLICE THAT OVERFLOWS IS COLLECTED, and a slice is not something a
+   collection understands: its objects are what region-0 tables point at, so
+   they come back as garbage (the B-LITE landmine, %RT-EAGER-COMPILE).
+   Headroom is only topped up to 64 KB when the OUTERMOST section begins, and
+   one table rebuild outgrows that: re-indexing COMMON-LISP-USER at ~2 000
+   symbols allocates a 32 KB bucket vector and two conses an entry.  A worker
+   interning its 1 703rd fresh symbol died TYPE-ERROR in %HT-REBUILD-INDEX
+   with the lock held, and the lock leaked (test/hosted-intern-race.lisp).
+
+   So a known large allocator calls this first (%HT-REBUILD-INDEX).  If this
+   thread holds the lock and is allocating from its slice with too little
+   room: park the slice, refill it from the arena with a chunk that fits, and
+   re-enter it.  Anything else — no threads, not the owner, not in a slice,
+   enough room — is a no-op."
+  (if (or (= (mem-ref #x10000DB8 :u32) 0)
+          (/= (%gc-read64 (%rt-owner-addr)) (+ (%thr-cpu) 1))
+          (zerop (%rt-arena-end)))
+      0
+      (let ((blk (%rt-slice-block (%thr-cpu))))
+        (if (or (/= (%gc-region) blk)
+                (>= (- (get-alloc-limit) (get-alloc-ptr)) bytes))
+            0
+            (progn
+              ;; Park the slice (its frontier into its block), refill the
+              ;; block, take it back.  Region 0 is active for no allocation
+              ;; in between.
+              (%gc-region-enter (%gc-region-0))
+              (let ((b (%rt-slice-ensure (+ bytes #x10000))))
+                (%gc-region-enter (if (zerop b) blk b)))
+              0)))))
 
 (defun %gc-collect-region-0 ()
   "Collect REGION 0 now, from any thread, with no allocation in it: point
@@ -1587,7 +1623,7 @@
                     ;; [base, frontier) as roots (translate-x64,
                     ;; EMIT-LOCK-ARENA-ROOT-SCAN).  Raw address, last, so the
                     ;; collector never sees a half-initialised arena.
-                    (%gc-write64 #x10000D98 (%rt-arena-words))
+                    (%gc-write64 (%conv-addr #x10000D98) (%rt-arena-words))
                     1)))))))
 
 (defun %fatal-stop (msg)
@@ -1666,7 +1702,7 @@ modus: waited 60 s for the runtime lock; its owner leaked it (faulted, unwound o
           ;; which is exactly what %RT-LEAVE needs to undo it; on the way out
           ;; it parks the SLICE block, which is what persists the slice
           ;; frontier for this CPU's next acquisition.
-          (let ((blk (%rt-slice-ensure)))
+          (let ((blk (%rt-slice-ensure (%rt-slice-need))))
             ;; A WORKER WITH NO SLICE would take region 0's parked frontier
             ;; while main allocates from its live one: two mutators, one
             ;; frontier, silent corruption.  That is the pre-arena path and it
@@ -2897,7 +2933,7 @@ modus: a thread needed the runtime lock but the lock arena is exhausted or missi
                         (%gc-write64 (%thr-ack) 0)
                         ;; The child's own window, ready BEFORE it exists; the
                         ;; clone stub reads the base from 0x10005020.
-                        (%gc-write64 #x10005020 (%tls-prepare-block slot))
+                        (%gc-write64 (%conv-addr #x10005020) (%tls-prepare-block slot))
                         (let ((tid (%spawn-thread (%thr-trampoline-entry)
                                                   (+ stk *thr-stack-bytes*)
                                                   (+ rec #x08))))
@@ -2914,7 +2950,7 @@ modus: a thread needed the runtime lock but the lock arena is exhausted or missi
                                     (progn (setq ok 1) (return 0)))
                                   (when (>= i 2000000000) (return 0))
                                   (setq i (+ i 1)))
-                                (%gc-write64 #x10005020 0)
+                                (%gc-write64 (%conv-addr #x10005020) 0)
                                 (%gc-write64 (%thr-started)
                                              (+ (%gc-read64 (%thr-started)) 1))
                                 (spin-unlock (%thr-spawn-lock))

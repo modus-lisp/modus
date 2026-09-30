@@ -767,7 +767,7 @@ class MVM {
                                toNum(this.rlo(3), this.rhi(3)), 0, 0, 0);
         fromNum(r); this.setReg(0, RL, RH); return;
       }
-      case 0x0507: {
+      case 0x0507: case 0x050B: {             // generic 6-arg syscall (compile-syscall6 emits 0x050B)
         const r = this.syscall(this.arg(0), this.arg(1), this.arg(2), this.arg(3), this.arg(4), this.arg(5), this.arg(6));
         fromNum(r * 2); this.setReg(0, RL, RH); return;
       }
@@ -851,6 +851,7 @@ class MVM {
     const sk = (nr === 0 || nr === 1 || nr === 3 || nr === 42) ? this.socks.get(a1) : undefined;
     switch (nr) {
       case 60: case 231: throw new MvmExit(a1);
+      case 13: return 0;                         // rt_sigaction: no signals here (boot ignores SIGPIPE)
       case 0: if (!inMem(a2, a3)) return -14;
               return sk ? this.sockRead(sk, this.m8, a2 - VBASE, a3) : h.read(a1, this.m8, a2 - VBASE, a3);
       case 1: if (!inMem(a2, a3)) return -14;

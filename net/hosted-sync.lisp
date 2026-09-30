@@ -272,6 +272,7 @@
                 (setf (mem-ref (+ b #xC50) :u64) 0)   ; next-free entry
                 (setf (mem-ref (+ b #xC58) :u64) 0)   ; depth
                 (setf (mem-ref (+ b #xC60) :u64) (%thr-dynb-stack cpu)) ; stack
+                (%dynb-filter-clear b)
                 (%tls-set-self-base delta)
                 0)
               r)))))
@@ -292,6 +293,7 @@
           (setf (mem-ref (+ b #xC50) :u64) 0)
           (setf (mem-ref (+ b #xC58) :u64) 0)
           (setf (mem-ref (+ b #xC60) :u64) (%thr-dynb-stack cpu))
+          (%dynb-filter-clear b)
           (%gc-write64 (+ b #x180) 0)
           (%gc-write64 (+ b #x188) 0)
           (%gc-write64 (+ b #x190) 0)
@@ -1748,7 +1750,15 @@ modus: a thread needed the runtime lock but the lock arena is exhausted or missi
         ;; half-carved arena.  A 0 here (small heap, frontier in the way) is
         ;; not a failure — the slice path just never engages and every locked
         ;; section behaves exactly as before this change.
-        (%rt-arena-carve)
+        ;;
+        ;; A FRONTIER IN THE WAY IS NOT "NO ARENA", though: after a large load
+        ;; (operandi's quickload) region 0's live frontier sits above the carve
+        ;; point, the carve answers 0, and the first worker that needs the lock
+        ;; then has no slice and must stop.  Collect once to compact, as
+        ;; %AR-CARVE does, and carve again.
+        (when (and (zerop (%rt-arena-carve)) (= (%gc-region-0) (%gc-region)))
+          (%gc-collect-here)
+          (%rt-arena-carve))
         (%gc-stw-arm)
         ;; CLEAR THE MAIN THREAD'S SELF SLOT, on the first switch-on only (the
         ;; gate is still shut, so this is the spawning thread: main).  The
@@ -2647,6 +2657,77 @@ modus: a thread needed the runtime lock but the lock arena is exhausted or missi
               slot (%escape-describe c) *catch-tag* *catch-active*)
       0)))
 
+(defvar *per-computation-specials* nil
+  "Globals whose value is PER-COMPUTATION state -- a library's random
+   generator, a lazily built cache -- registered by the library with
+   REGISTER-PER-COMPUTATION-SPECIAL.  Every thread and actor starts with its
+   own NIL binding of each, so the library's (or *x* (setf *x* ...)) fills
+   that computation's copy.  Threads share no state: without this, the first
+   worker to fill such a global would be storing one of its own objects into
+   shared memory, which the shared-store guard refuses.")
+
+(defun register-per-computation-special (symbol)
+  "Declare SYMBOL's global value per-computation state (see
+   *PER-COMPUTATION-SPECIALS*).  Call it when the library loads, on the main
+   thread; computations started afterwards get their own binding."
+  (unless (zerop (%tls-self-base))
+    (error "register-per-computation-special: call it from the main thread (at load time)."))
+  (unless (member symbol *per-computation-specials*)
+    (setq *per-computation-specials* (cons symbol *per-computation-specials*)))
+  symbol)
+
+(defmacro %with-computation-state ((serial) &body body)
+  "Bind, EMPTY, the runtime's per-computation state: the interpreter's MV and
+   NLX serial, the condition system, handler/restart stacks, printer scratch,
+   loader depth, CLOS dispatch state and CATCH/THROW's values in flight.  A
+   thread (%THR-TRAMPOLINE) and an actor (%AR-ACTOR-ENTRY, in its own window)
+   each run their whole computation inside one.  SERIAL seeds the NLX state
+   serial so no two computations mint the same one."
+  `(let ((*mvm-last-mv* nil)
+         (*nlx-state-serial* ,serial)
+         (*current-condition* nil)
+         (*catch-active* nil)
+         (*restart-stack* nil)
+         (*handler-bind-stack* nil)
+         (*handler-bind-effective-skip* 0)
+         (*restart-frame-condition-map* nil)
+         (*signal-walk-depth* 0)
+         (*restarts-being-invoked* nil)
+         (*restart-invoking-p* nil)
+         (*restart-case-result* nil)
+         (*rc-invoked-restart* nil)
+         (*format-iter-escape* nil)
+         (*write-object-budget* 0)
+         (*%circ-next* 0)
+         (*%ppx-stack* nil)
+         (*%pp-ctx* nil)
+         (*load-error-condition* nil)
+         (*%load-depth* 0)
+         (*%next-methods* nil)
+         (*%current-gf-args* nil)
+         (*%current-gf* nil)
+         (*%dmc-call-args* nil)
+         (*catch-tag* nil)
+         (*catch-value* nil)
+         (*catch-values* nil)
+         (*catch-tags* nil)
+         ;; macos-hosting's per-thread eval/JIT state, so a worker's runtime
+         ;; compile never writes main's flags (2026-09-30 reconciliation).
+         (*%escape-report-busy* nil)
+         (*jit-native-ran* nil)
+         (*jit-infra-fallback* nil)
+         (*e2-active-defun-names* nil)
+         (*e2-persist-defuns* nil)
+         (*e2-module-defuns* nil)
+         (*mvm-eval-no-cache* nil)
+         (*jit-inhibit* nil)
+         )
+     (declare (special *%escape-report-busy* *jit-native-ran* *jit-infra-fallback* *e2-active-defun-names* *e2-persist-defuns* *e2-module-defuns* *mvm-eval-no-cache* *jit-inhibit*
+                       *mvm-last-mv* *nlx-state-serial* *current-condition* *catch-active* *restart-stack* *handler-bind-stack* *handler-bind-effective-skip* *restart-frame-condition-map* *signal-walk-depth* *restarts-being-invoked* *restart-invoking-p* *restart-case-result* *rc-invoked-restart* *format-iter-escape* *write-object-budget* *%circ-next* *%ppx-stack* *%pp-ctx* *load-error-condition* *%load-depth* *%next-methods* *%current-gf-args* *%current-gf* *%dmc-call-args* *catch-tag* *catch-value* *catch-values* *catch-tags*))
+     (progv *per-computation-specials*
+         (make-list (length *per-computation-specials*))
+       ,@body)))
+
 (defun %thr-trampoline ()
   "EVERY thread starts here.  Zero arguments, because the clone stub enters it
    with a bare `call rbx' — see the handshake above for how it learns which
@@ -2689,82 +2770,27 @@ modus: a thread needed the runtime lock but the lock arena is exhausted or missi
     ;; 4. tell the spawner the slot has been read; it may now start the next.
     (%gc-write64 (+ rec #x28) 1)
     (%gc-write64 (%thr-ack) 1)
-    ;; 5. THE CONDITION AND NON-LOCAL-EXIT STATE IS THIS THREAD'S OWN.
-    ;;    THROW, a cross-unit RETURN-FROM and handler-case dispatch hand the
-    ;;    in-flight exit from frame to frame in plain specials: THROW sets
-    ;;    *CATCH-TAG* / *CATCH-VALUE(S)* / *CATCH-ACTIVE* and longjmps, and each
-    ;;    CATCH or UNWIND-PROTECT on the way READS them to decide whether the
-    ;;    exit is its own or must be re-thrown outward (compile-unwind-protect's
-    ;;    error path).  Shared between threads, one thread's CATCH read
-    ;;    another's tag, re-threw an exit that was its own, and a worker — with
-    ;;    nothing further out — longjmped through an empty frame to PC 0
-    ;;    (sb-thread's condition-broadcast and negative-control sections, on
-    ;;    every target).  So bind them here: a worker's SETQ then lands in its
-    ;;    binding (per-thread dynamic bindings, mvm/prelude.lisp), and the
-    ;;    main thread keeps the globals.  The eval-run state MVM-EVAL-FORMS
-    ;;    saves and restores with SETQ is per-thread for the same reason.
-    ;;    ONLY WITH THE GATE OPEN.  Before a program turns threads on
-    ;;    (%RT-THREADS-ON), bindings are SHALLOW — a LET writes the global and
-    ;;    restores it — so the same LET on eight threads at once would race
-    ;;    the very words it means to isolate.  Those threads run no shared
-    ;;    Lisp state anyway (the bare %MAKE-NATIVE-THREAD selftests).
+    ;; THE INTERPRETER'S TWO GLOBALS, BOUND PER THREAD.  MVM-INTERPRET parks a
+    ;; run's secondary values in *MVM-LAST-MV* and numbers non-local-exit
+    ;; states from *NLX-STATE-SERIAL*; unbound here, every interpreted return
+    ;; on a worker wrote the ONE process-wide cell -- another thread's values,
+    ;; and a list in this thread's region that dangled once the slot's region
+    ;; was reset.  The serial starts in a range of its own per slot so no two
+    ;; threads can mint the same one.
+    ;;
+    ;; AND THE RUNTIME'S OTHER PER-COMPUTATION STATE: the condition system's
+    ;; current condition, handler and restart stacks, the printer's scratch,
+    ;; the loader's depth.  Threads share no state; left global, a worker's
+    ;; (setq *current-condition* <its condition>) put an object of its own
+    ;; region into the process-wide cell -- the shared-store guard
+    ;; (translate-x64) now refuses exactly that, which is how these were
+    ;; found.  Each starts EMPTY, not as a copy of the spawner's: a thread
+    ;; started inside main's HANDLER-BIND must not run main's handlers.
+    ;; ONLY WITH THE GATE OPEN (macos-hosting): before %RT-THREADS-ON bindings
+    ;; are shallow, and %THR-RUN-BODY lets nothing escape the thread either way.
     (if (eql (mem-ref #x10000DB8 :u32) 0)
         (%thr-run-body slot rec)
-        (let ((*current-condition* nil)
-              (*catch-active* nil)
-              (*catch-tag* nil)
-              (*catch-value* nil)
-              (*catch-values* nil)
-              (*handler-bind-stack* nil)
-              (*restart-stack* nil)
-              (*restart-frame-condition-map* nil)
-              (*restart-case-result* nil)
-              (*restart-invoking-p* nil)
-              (*signal-walk-depth* 0)
-              (*handler-bind-effective-skip* 0)
-              (*%escape-report-busy* nil)
-              (*mvm-last-mv* nil)
-              (*jit-native-ran* nil)
-              (*jit-infra-fallback* nil)
-              (*e2-active-defun-names* nil)
-              (*e2-persist-defuns* nil)
-              (*e2-module-defuns* nil)
-              (*mvm-eval-no-cache* nil)
-              (*jit-inhibit* nil)
-              ;; operandi's additions: the interpreter's NLX serial, the
-              ;; restart/format/printer/loader scratch and the CLOS dispatch
-              ;; state -- each starts EMPTY, never as a copy of the spawner's.
-              (*nlx-state-serial* (* slot 1099511627776))
-              (*restarts-being-invoked* nil)
-              (*rc-invoked-restart* nil)
-              (*format-iter-escape* nil)
-              (*write-object-budget* 0)
-              (*%circ-next* 0)
-              (*%ppx-stack* nil)
-              (*%pp-ctx* nil)
-              (*load-error-condition* nil)
-              (*%load-depth* 0)
-              (*%next-methods* nil)
-              (*%current-gf-args* nil)
-              (*%current-gf* nil)
-              (*%dmc-call-args* nil)
-              (*catch-tags* nil)
-              )
-          ;; DECLARED, not inferred: this compiler binds a DEFVAR'd name
-          ;; lexically unless the LET says otherwise (build-checks #248).
-          (declare (special *current-condition* *catch-active* *catch-tag*
-                            *catch-value* *catch-values* *handler-bind-stack*
-                            *restart-stack* *restart-frame-condition-map*
-                            *restart-case-result* *restart-invoking-p*
-                            *signal-walk-depth* *handler-bind-effective-skip*
-                            *%escape-report-busy* *mvm-last-mv* *jit-native-ran*
-                            *jit-infra-fallback* *e2-active-defun-names*
-                            *e2-persist-defuns* *e2-module-defuns*
-                            *mvm-eval-no-cache* *jit-inhibit*
-                            *nlx-state-serial* *restarts-being-invoked* *rc-invoked-restart*
-                            *format-iter-escape* *write-object-budget* *%circ-next* *%ppx-stack*
-                            *%pp-ctx* *load-error-condition* *%load-depth* *%next-methods*
-                            *%current-gf-args* *%current-gf* *%dmc-call-args* *catch-tags*))
+        (%with-computation-state ((* slot 1099511627776))
           (%thr-run-body slot rec)))
     ;; PARK THE ALLOCATION FRONTIER ON THE WAY OUT.  A region's +0x30 is where
     ;; its live heap ends as far as anything outside this thread is concerned;

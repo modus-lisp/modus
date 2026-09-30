@@ -2311,10 +2311,17 @@
             (plist-form (rewrite-reader-forms (cadr place)))
             (ind-form (rewrite-reader-forms (caddr place)))
             (val-form (rewrite-reader-forms (caddr form))))
-       ;; getf plist may be a variable - update it
-       (if (symbolp (cadr place))
-           `(setq ,(cadr place) (set-getf ,plist-form ,ind-form ,val-form))
-           `(set-getf ,plist-form ,ind-form ,val-form))))
+       ;; RETURN the value (CLHS) and store a non-symbol place back.
+       ;; An INTERNED temp: this rewrite runs on the build host and its
+       ;; output is read again, so a gensym's two occurrences would come
+       ;; back as two different symbols.  VALUE is evaluated before the
+       ;; binding exists, so a fixed name cannot capture it.
+       (let ((vt '%setf-getf-value))
+         `(let ((,vt ,val-form))
+            ,(if (symbolp (cadr place))
+                 `(setq ,(cadr place) (set-getf ,plist-form ,ind-form ,vt))
+                 `(setf ,plist-form (set-getf ,plist-form ,ind-form ,vt)))
+            ,vt))))
     ;; NOTE: (setf (ldb spec n) val) is NO LONGER rewritten here.  The old
     ;; rewriter expanded to `(setq n (dpb val spec n))`, which RETURNS the
     ;; updated place (n) rather than VAL — violating CLHS (setf yields the

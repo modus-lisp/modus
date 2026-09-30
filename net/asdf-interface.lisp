@@ -81,7 +81,7 @@
            "FIRST-CHAR" "LAST-CHAR" "NATIVE-NAMESTRING" "PARSE-NATIVE-NAMESTRING"
            "MERGE-PATHNAMES*" "ENSURE-DIRECTORY-PATHNAME"
            "RUN-PROGRAM" "LAUNCH-PROGRAM" "WAIT-PROCESS" "TERMINATE-PROCESS"
-           "PROCESS-ALIVE-P" "DELETE-DIRECTORY-TREE"))
+           "PROCESS-ALIVE-P" "DELETE-DIRECTORY-TREE" "QUIT"))
 
 (defpackage "ASDF"
   (:use "COMMON-LISP" "UIOP")
@@ -155,6 +155,14 @@
 (defun uiop::getenv (name)
   "The value of environment variable NAME, or NIL."
   (%cli-getenv (asdf::%string-of name)))
+
+(defun uiop::quit (&optional (code 0) (finish-output t))
+  "Exit with CODE, flushing the standard streams first unless FINISH-OUTPUT
+   is NIL -- output still buffered at exit_group(2) is lost."
+  (when finish-output
+    (ignore-errors (finish-output *standard-output*))
+    (ignore-errors (finish-output *error-output*)))
+  (sys-exit code))
 
 (defun uiop::getenvp (name)
   (let ((v (uiop::getenv name))) (and v (plusp (length v)))))
@@ -761,6 +769,21 @@
       (setq *%jit-pending* t)))
   nil)
 
+(defvar asdf::*system-aliases*
+  '(("sqlite" . "sqlite-pure/cl-sqlite"))
+  "System name -> the pure-Lisp system that provides the same package and API
+   on modus.  Modus has no FFI, so a library that binds a C library (cl-sqlite
+   over CFFI/libsqlite3) cannot load; its drop-in replacement can.  An alias
+   applies only when the replacement can actually be found, so an image
+   without it still reports the original system.")
+
+(defun asdf::%system-alias (name)
+  (let* ((n (if (stringp name) name (string-downcase (string name))))
+         (a (assoc n asdf::*system-aliases* :test #'string-equal)))
+    (if (and a (handler-case (asdf::find-system (cdr a) nil) (error (c) nil)))
+        (cdr a)
+        name)))
+
 (defun asdf::load-system (name &rest keys)
   "ASDF:LOAD-SYSTEM — load NAME and everything it depends on, and return T.
 
@@ -776,6 +799,7 @@
   ;; Gray streams are installed on first use (net/sb-gray-shim.lisp): a
   ;; library that subclasses FUNDAMENTAL-* arrives through here.
   (when (fboundp '%ensure-gray-streams) (%ensure-gray-streams))
+  (setq name (asdf::%system-alias name))
   (let* ((sys (asdf::find-system name t))
          (n (asdf::component-name sys)))
     (cond

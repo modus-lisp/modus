@@ -1213,6 +1213,12 @@
                    ;; layer and their blobs are unaffected.
                    (mvm-text "net/hosted-sockets-post.lisp")
                    (string #\Newline)
+                   ;; THE ACTOR RUNTIME (docs/hosted-actor-runtime.md).  After
+                   ;; hosted-sync (its scheduler, %MAKE-NATIVE-THREAD, the
+                   ;; %WITH-COMPUTATION-STATE macro) and net/actors.lisp,
+                   ;; neither of which resolves as a forward reference.
+                   (mvm-text "net/hosted-actor-runtime.lisp")
+                   (string #\Newline)
                    ;; THE AOT HALF OF AN A/B.  test/hosted-intern-layers.lisp's
                    ;; `low' arm — a worker interning fresh symbols through
                    ;; %INTERN-SYMBOL-PKG — dies about half the time while its
@@ -1631,6 +1637,8 @@
         nil
         (progn (%it-eval-source (%sb-shim-source) \"sb-shims\")
                (%publish-ensure-gray-streams)
+               (%publish-runtime-api)
+               (%ignore-sigpipe)
                t))))
 "))
 
@@ -1655,6 +1663,39 @@
           (if (and off (> (length off) 0) (not (string= off \"0\")))
               nil
               (progn (%it-eval-source (%sb-gray-source) \"sb-gray\") t))))))
+
+;; THE PUBLIC RUNTIME API (net/hosted-actor-runtime.lisp, net/hosted-sync.lisp).
+;; Runtime-compiled code reaches these by direct calls resolved at compile
+;; time, but they are not in the symbol-function table, so FBOUNDP, FUNCALL
+;; and APPLY of the SYMBOL did not see them -- a library probing
+;; (fboundp 'register-per-computation-special) before calling it found NIL.
+;; SIGPIPE IS IGNORED, as SBCL does: a write to a socket or pipe the other
+;; end closed must come back as EPIPE, not end the process (an actor's TLS
+;; write to a server that had hung up killed everything with exit 141).
+;; rt_sigaction(SIGPIPE=13, {SIG_IGN, 0, 0, 0}, NULL, 8) = syscall 13.
+(defun %ignore-sigpipe ()
+  (let ((sa (%mmap-shared-page 4096)))
+    (if (< sa 4096)
+        0
+        (progn (%gc-write64 sa 1)
+               (syscall6 13 13 sa 0 8 0 0)))))
+
+(defun %publish-runtime-api ()
+  (let ((pk (find-package \"COMMON-LISP-USER\")))
+    (dolist (e (list (cons \"REGISTER-PER-COMPUTATION-SPECIAL\" (function register-per-computation-special))
+                     (cons \"ACTORS-START\" (function actors-start))
+                     (cons \"ACTORS-STOP\" (function actors-stop))
+                     (cons \"ACTORS-SPAWN\" (function actors-spawn))
+                     (cons \"ACTORS-SEND\" (function actors-send))
+                     (cons \"ACTORS-RECEIVE\" (function actors-receive))
+                     (cons \"ACTORS-RECEIVE-IF\" (function actors-receive-if))
+                     (cons \"ACTORS-YIELD\" (function actors-yield))
+                     (cons \"ACTORS-SELF\" (function actors-self))
+                     (cons \"ACTORS-LINK\" (function actors-link))))
+      (set-symbol-function (intern (car e) pk) (cdr e))
+      (when (boundp (quote *symbol-function-table*))
+        (puthash (car e) *symbol-function-table* (cdr e))))
+    t))
 
 ;; Baked functions are not in runtime EVAL's function table (this blob is kept
 ;; out of *all-runtime-source* on purpose), so publish the installer under

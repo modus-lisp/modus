@@ -2376,17 +2376,71 @@
   (setf (mem-ref (+ blk #xC58) :u64) depth)
   depth)
 
-(defun %dynb-find (key a i)
+(defun %dynb-find (key a i base)
   "Address of the VALUE word of the innermost binding of KEY, or 0.  A is the
-   KEY word of entry I; walk DOWN so an inner binding shadows an outer one.
+   KEY word of entry I; walk DOWN so an inner binding shadows an outer one, and
+   never below BASE (entry 0).
 
    NO MULTIPLICATION AND NO GLOBAL READ ANYWHERE ON THIS PATH — it is called
-   from SYMBOL-VALUE, so anything that itself read a global would recurse."
-  (if (< i 0)
-      0
-      (if (eql (mem-ref a :u64) key)
-          (+ a 8)
-          (%dynb-find key (- a 16) (- i 1)))))
+   from SYMBOL-VALUE, so anything that itself read a global would recurse.
+
+   A LOOP, NOT A RECURSION.  The recursive form took one native frame (about
+   1.1 KB) per entry it passed, and this compiler does not eliminate the tail
+   call: on an actor's 256 KB stack a miss past ~230 live bindings ran off the
+   stack, and the fault came back through an unarmed handler frame to address 0
+   (operandi's ACP session actor, second turn).  BASE bounds the walk too, so a
+   depth word that disagreed with the entries could never read below them."
+  (loop
+    (when (or (< i 0) (< a base)) (return 0))
+    (when (eql (mem-ref a :u64) key) (return (+ a 8)))
+    (setq a (- a 16))
+    (setq i (- i 1))))
+
+(defun %dynb-filter (blk)
+  "Address of this thread's BOUND-KEY FILTER, or 0 when it has none.
+
+   A read of a special this thread has NOT bound -- almost every read, since a
+   worker starts with its per-computation bindings and nothing else -- used to
+   walk the whole binding stack before falling through to the global: 0.76 us
+   against main's 3 ns, which made elliptic-curve code 6x slower on a thread.
+   The filter is 256 16-bit counters, one per (KEY mod 256): %DYNBIND counts a
+   key in, %DYNB-UNWIND counts every truncated entry out, and a zero counter
+   answers \"not bound here\" without the walk.  Anything that desynchronises
+   it can only leave a counter too HIGH (a thread that died with bindings live,
+   a wrap), which costs a walk and never a wrong answer.
+
+   It lives in the in-window fallback area, blk+0xC80..0xE7F, which is unused
+   exactly when the thread has an extension stack (blk+0xC60 non-zero).  A
+   thread without one keeps its entries there and has no filter."
+  (if (eql (mem-ref (+ blk #xC60) :u64) 0) 0 (+ blk #xC80)))
+
+(defun %dynb-filter-slot (f key)
+  (+ f (ash (logand key 255) 1)))
+
+(defun %dynb-filter-clear (blk)
+  "Zero BLK's filter.  Called wherever the stack is emptied."
+  (let ((a (+ blk #xC80)))
+    (loop
+      (when (>= a (+ blk #xE80)) (return 0))
+      (setf (mem-ref a :u32) 0)
+      (setq a (+ a 4)))))
+
+(defun %dynb-filter-drop (f a top)
+  "Count out every entry from the KEY word at A up to TOP."
+  (loop
+    (when (>= a top) (return 0))
+    (let ((slot (%dynb-filter-slot f (mem-ref a :u64))))
+      (setf (mem-ref slot :u16) (logand (- (mem-ref slot :u16) 1) #xFFFF)))
+    (setq a (+ a 16))))
+
+(defun %dynb-lookup (blk key)
+  "Address of the VALUE word of this thread's innermost binding of KEY, or 0:
+   %DYNB-FIND behind the filter.  Same no-global-read rule as %DYNB-FIND."
+  (let ((f (%dynb-filter blk)))
+    (if (and (not (eql f 0))
+             (eql (mem-ref (%dynb-filter-slot f key) :u16) 0))
+        0
+        (%dynb-find key (- (%dynb-next blk) 16) (- (%dynb-depth blk) 1) (%dynb-base blk)))))
 
 (defun %dynb-unwind (blk key a i)
   "Pop the innermost binding of KEY, and everything above it, by truncating
@@ -2399,11 +2453,16 @@
    not reverse.  Truncation is right in both cases — by the time this
    cleanup runs every INNER binding has already been popped by its own
    cleanup, so nothing above I is live."
-  (if (< i 0)
-      0
-      (if (eql (mem-ref a :u64) key)
-          (progn (%dynb-set-top blk a i) 1)
-          (%dynb-unwind blk key (- a 16) (- i 1)))))
+  (let ((base (%dynb-base blk)))
+    (loop                                   ; a loop for the reason %DYNB-FIND gives
+      (when (or (< i 0) (< a base)) (return 0))
+      (when (eql (mem-ref a :u64) key)
+        (let ((f (%dynb-filter blk)))
+          (unless (eql f 0) (%dynb-filter-drop f a (%dynb-next blk)))
+          (%dynb-set-top blk a i)
+          (return 1)))
+      (setq a (- a 16))
+      (setq i (- i 1)))))
 
 (defun %dynb-overflow (key)
   "This thread's binding stack is full (%DYNB-CAPACITY entries).  An honest error rather than a
@@ -2460,6 +2519,11 @@
                     (setf (mem-ref a :u64) key)
                     (setf (mem-ref (+ a 8) :u64) val)
                     (%dynb-set-top blk (+ a 16) (+ d 1))
+                    (let ((f (%dynb-filter blk)))
+                      (unless (eql f 0)
+                        (let ((slot (%dynb-filter-slot f key)))
+                          (setf (mem-ref slot :u16)
+                                (logand (+ (mem-ref slot :u16) 1) #xFFFF)))))
                     val)))))))
 
 (defun %dynunbind (key saved)
@@ -2497,8 +2561,7 @@
     (unless (eql (mem-ref #x10000DB8 :u32) 0)
       (let ((blk (%dynb-block)))
         (unless (eql blk 0)
-          (let ((a (%dynb-find key (- (%dynb-next blk) 16)
-                               (- (%dynb-depth blk) 1))))
+          (let ((a (%dynb-lookup blk key)))
             (unless (eql a 0)
               (return-from symbol-value (values (mem-ref a :u64))))))))
     ;; THE READ IS LOCKED TOO, and not out of caution: PUTHASH grows and
@@ -2532,8 +2595,7 @@
   (unless (eql (mem-ref #x10000DB8 :u32) 0)
     (let ((blk (%dynb-block)))
       (unless (eql blk 0)
-        (let ((a (%dynb-find name-hash (- (%dynb-next blk) 16)
-                             (- (%dynb-depth blk) 1))))
+        (let ((a (%dynb-lookup blk name-hash)))
           (unless (eql a 0)
             (setf (mem-ref a :u64) value)
             (return-from set-symbol-value value))))))
@@ -2619,7 +2681,7 @@
       (let ((blk (%dynb-block)))
         (if (eql blk 0)
             0
-            (%dynb-find key (- (%dynb-next blk) 16) (- (%dynb-depth blk) 1))))))
+            (%dynb-lookup blk key)))))
 
 (defun %gv-ref (%gv-key)
   "Compiled special-variable READ: value of global KEY, NIL if absent

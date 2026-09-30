@@ -2397,6 +2397,25 @@ modus: a thread needed the runtime lock but the lock arena is exhausted or missi
                          *ha-rsize* stack-top k)
         rcb)))
 
+(defvar *per-computation-specials* nil
+  "Globals whose value is PER-COMPUTATION state -- a library's random
+   generator, a lazily built cache -- registered by the library with
+   REGISTER-PER-COMPUTATION-SPECIAL.  Every thread and actor starts with its
+   own NIL binding of each, so the library's (or *x* (setf *x* ...)) fills
+   that computation's copy.  Threads share no state: without this, the first
+   worker to fill such a global would be storing one of its own objects into
+   shared memory, which the shared-store guard refuses.")
+
+(defun register-per-computation-special (symbol)
+  "Declare SYMBOL's global value per-computation state (see
+   *PER-COMPUTATION-SPECIALS*).  Call it when the library loads, on the main
+   thread; computations started afterwards get their own binding."
+  (unless (zerop (%tls-self-base))
+    (error "register-per-computation-special: call it from the main thread (at load time)."))
+  (unless (member symbol *per-computation-specials*)
+    (setq *per-computation-specials* (cons symbol *per-computation-specials*)))
+  symbol)
+
 (defmacro %with-computation-state ((serial) &body body)
   "Bind, EMPTY, the runtime's per-computation state: the interpreter's MV and
    NLX serial, the condition system, handler/restart stacks, printer scratch,
@@ -2433,7 +2452,9 @@ modus: a thread needed the runtime lock but the lock arena is exhausted or missi
          (*catch-values* nil)
          (*catch-tags* nil))
      (declare (special *mvm-last-mv* *nlx-state-serial* *current-condition* *catch-active* *restart-stack* *handler-bind-stack* *handler-bind-effective-skip* *restart-frame-condition-map* *signal-walk-depth* *restarts-being-invoked* *restart-invoking-p* *restart-case-result* *rc-invoked-restart* *format-iter-escape* *write-object-budget* *%circ-next* *%ppx-stack* *%pp-ctx* *load-error-condition* *%load-depth* *%next-methods* *%current-gf-args* *%current-gf* *%dmc-call-args* *catch-tag* *catch-value* *catch-values* *catch-tags*))
-     ,@body))
+     (progv *per-computation-specials*
+         (make-list (length *per-computation-specials*))
+       ,@body)))
 
 (defun %thr-trampoline ()
   "EVERY thread starts here.  Zero arguments, because the clone stub enters it

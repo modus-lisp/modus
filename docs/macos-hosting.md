@@ -521,7 +521,84 @@ Results:
 - **Memory:** peak footprint is unchanged (about 277 MB for `hello`).
 - **Tests:** the thread suite passes in place on macOS and in the iOS
   Simulator.
-- **Device:** the device build links, but has not run yet.
+- **Device:** see the next section.
+
+## On an iPhone (2026-09-30)
+
+The layout above runs natively on an **iPhone 15 Pro (iOS 26.6.2)**: signed
+code, in place, PC-relative, with the data layout reserved.  The kernel
+accepted an executable whose segments span ~4 GB to ~15 GB without the
+extended-virtual-addressing entitlement.  All 11 tests pass:
+
+| Test | Time |
+|---|---|
+| hello | 2 s |
+| `hosted-threads` | 2 s |
+| `hosted-thread-gc` | 2 s |
+| `hosted-handler-depth` | 17 s |
+| `hosted-stw` | 7 s |
+| `hosted-arena-evac` | 66 s |
+| `hosted-slot-reuse` | 11 s |
+| `hosted-intern-race` | 41 s |
+| `hosted-thread-lisp` | 2 s |
+| `hosted-dynbind` | 13 s |
+| `setq-closure-escape` | 2 s |
+
+**Signing, with a free Personal Team.**
+- Xcode made the provisioning profile.  A throwaway project with automatic
+  signing and the same bundle id (`org.modus-lisp.modus`), built with
+  `xcodebuild -allowProvisioningUpdates`, puts it in
+  `~/Library/Developer/Xcode/UserData/Provisioning Profiles/`.
+- `build-ios.sh IMAGE OUT.app device "Apple Development: …" PROFILE` signs
+  with the profile's entitlements.
+- `xcrun devicectl device install app` installs the app.  The phone must be
+  unlocked the first time, to mount its developer disk image.
+- `xcrun devicectl device process launch --console … --script @TEST.lisp`
+  runs it with console output.
+- A free team's device list cannot be edited, and this one is full, so only
+  the devices already registered can run it.
+
+**Three iOS-only changes to the shim:**
+- **The launch watchdog.**  An app must finish launching within 20 s, or
+  FrontBoard kills it (`0x8BADF00D`, "process-launch watchdog
+  transgression").  The first device runs lost every test over 20 s this way:
+  not a crash, and not memory.  The main thread now runs `UIApplicationMain`
+  with a delegate class built through the Objective-C runtime (the shim stays
+  C), and the image runs on a thread of its own (`RUN-IMAGE-BESIDE-UIKIT`).
+  `build-ios.sh` links UIKit and adds `UILaunchScreen`.
+- **The thread-group leader.**  Linux gives the first thread TID = PID.  The
+  shim used to answer that with `pthread_main_np`, which is now UIKit's
+  thread, so the image's starting thread is marked explicitly
+  (`image_leader`).
+- **Auto-lock.**  A locked device backgrounds the app, and iOS suspends it
+  within seconds.  The delegate sets `idleTimerDisabled`, so the phone does
+  not auto-lock while modus is in front.  A lock by hand still suspends it.
+
+## Drawing on the phone (2026-09-30)
+
+The image speaks Linux syscalls and cannot reach UIKit, so the iOS shim offers
+a framebuffer through four pseudo-syscalls past every Linux number
+(`host/ios/modus-ui.m`, dispatched from `modus_syscall_1`):
+
+| call | arguments | result |
+|---|---|---|
+| 1001 `UI-INFO` | `k` | width (`k=0`), height (`k=1`), scale (`k=2`) |
+| 1002 `FILL` | `x \| y<<16`, `w \| h<<16`, `0xRRGGBB` | fills the rectangle, clipped |
+| 1003 `PRESENT` | — | shows the buffer (coalesced on the main thread) |
+| 1004 `NEXT-EVENT` | — | `type<<40 \| y<<20 \| x`; type 1 down, 2 move, 3 up; 0 = none |
+
+- **The view:** a full-screen view whose layer shows the buffer, at 2 pixels
+  per point, nearest-neighbour.  The shim's app delegate puts it up.
+- **Before UIKit is ready:** the image thread starts first, so every call
+  waits for the view.
+- **Speed:** filling is native, so interpreted Lisp only decides what to
+  draw.
+- **Access:** a script reaches the calls through `%GC-SAFE-BLOCK-6`, a
+  compiled image function; the in-image compiler's `SYSCALL6` does not issue
+  the call.  So drawing needed no image rebuild.
+- **The demo:** `test/ios-draw.lisp` draws a grid of coloured tiles.  Tapping
+  a tile cycles its colour, and dragging paints.  It ran on the iPhone
+  15 Pro, driven by touch.
 
 ### Interning without the runtime lock (2026-09-29)
 

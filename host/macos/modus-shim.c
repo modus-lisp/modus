@@ -73,7 +73,67 @@ static inline void modus_jit_wp(int executable) {
 }
 
 extern void modus_syscall_stub(void);
+
 extern void modus_enter(uint64_t sp, uint64_t entry) __attribute__((noreturn));
+// The thread the image STARTED on: Linux's thread-group leader, whose TID is
+// the PID.  The process's main thread on macOS; on iOS a thread of its own,
+// because the main thread belongs to UIKit (below).
+static __thread int image_leader;
+
+#if TARGET_OS_IPHONE
+// AN iOS APP MUST FINISH LAUNCHING WITHIN 20 SECONDS, or FrontBoard's launch
+// watchdog kills it (0x8BADF00D, "process-launch watchdog transgression":
+// measured on an iPhone 15 Pro, every run over 20 s).  Launching finishes
+// when UIApplicationMain has called the delegate's didFinishLaunching, so the
+// main thread runs UIKit and the image runs on a thread of its own.  The
+// delegate class is built at run time so the shim stays C.
+#include <objc/runtime.h>
+#include <objc/message.h>
+#include <CoreFoundation/CoreFoundation.h>
+extern int UIApplicationMain(int argc, char **argv, CFStringRef principal, CFStringRef delegate);
+// host/ios/modus-ui.m: a framebuffer and touch events for the image.
+extern void modus_ui_init(void);
+extern void modus_ui_start(void);
+extern long modus_ui_call(long nr, long a0, long a1, long a2, long a3);
+static signed char modus_did_finish(void *self, SEL cmd, void *app, void *opts) {
+    (void)self; (void)cmd; (void)opts;
+    // Keep the screen from AUTO-LOCKING while modus is in front: a locked
+    // device backgrounds the app and iOS suspends it within seconds, which
+    // froze long runs mid-way.  (A lock by the user still suspends it.)
+    ((void (*)(void *, SEL, signed char))objc_msgSend)(app, sel_registerName("setIdleTimerDisabled:"), 1);
+    modus_ui_start();
+    return 1;
+}
+struct image_start { uint64_t sp, entry; };
+static void *image_thread(void *arg) {
+    struct image_start st = *(struct image_start *)arg;
+    // sigaltstack is per thread: the fault handler needs one here too.
+    stack_t ss = { .ss_sp = malloc(1 << 16), .ss_size = 1 << 16, .ss_flags = 0 };
+    sigaltstack(&ss, NULL);
+    image_leader = 1;
+    modus_enter(st.sp, st.entry);
+}
+static void run_image_beside_uikit(int argc, char **argv, uint64_t sp, uint64_t entry)
+    __attribute__((noreturn));
+static void run_image_beside_uikit(int argc, char **argv, uint64_t sp, uint64_t entry) {
+    static struct image_start st;
+    st.sp = sp; st.entry = entry;
+    modus_ui_init();
+    pthread_attr_t at; pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    pthread_t th;
+    if (pthread_create(&th, &at, image_thread, &st) != 0) {
+        fprintf(stderr, "modus-shim: could not start the image thread\n");
+        _exit(1);
+    }
+    Class c = objc_allocateClassPair(objc_getClass("UIResponder"), "ModusAppDelegate", 0);
+    class_addMethod(c, sel_registerName("application:didFinishLaunchingWithOptions:"),
+                    (IMP)modus_did_finish, "c@:@@");
+    objc_registerClassPair(c);
+    UIApplicationMain(argc, argv, NULL, CFSTR("ModusAppDelegate"));
+    _exit(0);   // UIApplicationMain does not return; the image's exit() ends the app
+}
+#endif
 
 #define PAGE16K 0x4000ULL
 #define ROUND_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
@@ -488,7 +548,7 @@ static long lx_tid(uint64_t id) {
     return t ? t : 1;
 }
 static long my_tid(void) {
-    if (pthread_main_np()) return getpid();     // Linux: the group leader's TID is the PID
+    if (image_leader) return getpid();          // Linux: the group leader's TID is the PID
     uint64_t id = 0;
     pthread_threadid_np(NULL, &id);
     return lx_tid(id);
@@ -676,6 +736,10 @@ static long modus_syscall_1(long a0, long a1, long a2, long a3, long a4, long a5
         return 0; }
     case 210: RET(shutdown((int)a0, (int)a1));      // SHUT_* agree
     case 103: return 0;                            // setitimer
+#if TARGET_OS_IPHONE
+    case 1001: case 1002: case 1003: case 1004:    // the framebuffer (host/ios/modus-ui.m)
+        return modus_ui_call(nr, a0, a1, a2, a3);
+#endif
     default:
         if (nr >= 0 && nr < 512 && !unknown_seen[nr]) {
             unknown_seen[nr] = 1;
@@ -913,5 +977,10 @@ int main(int argc, char **argv, char **envp) {
     }
     reserve_delta_key();
     install_fault_report();
+#if TARGET_OS_IPHONE
+    run_image_beside_uikit(argc, argv, (uint64_t)(uintptr_t)sp, eh->entry + (uint64_t)slide);
+#else
+    image_leader = 1;
     modus_enter((uint64_t)(uintptr_t)sp, eh->entry + (uint64_t)slide);
+#endif
 }

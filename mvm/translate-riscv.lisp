@@ -1510,7 +1510,9 @@
            ((and (= code #x0311) *riscv-linux-mode*)
             ;; CNTFRQ: the rate of #x0310's counter, TAGGED.  See #x0310.
             (rv-emit-li buf +rv-a0+ (ash (if *riscv-64-bit* 1000000000 1000) 1)))
-           ((and (= code #x0531) *riscv-linux-mode*)
+           ((and (member code '(#x0531 #x0504)) *riscv-linux-mode*)
+            ;; #x0504 %MMAP-SHARED-PAGE is this with PROT_RW (3) and
+            ;; MAP_SHARED|MAP_ANONYMOUS (#x21).
             ;; %MMAP-EXEC-PAGE size: mmap(NULL, size, RWX, PRIVATE|ANON, -1, 0),
             ;; address TAGGED in V0 (negative errno on failure).  RV32: an
             ;; address at or above 2^30 has no fixnum, so the mapping is given
@@ -1518,8 +1520,8 @@
             (rv-emit-srai buf +rv-a1+ +rv-a0+ 1)
             (rv-emit-mv buf +rv-t2+ +rv-a1+)
             (rv-emit-mv buf +rv-a0+ +rv-x0+)
-            (rv-emit-addi buf +rv-a2+ +rv-x0+ 7)
-            (rv-emit-addi buf +rv-a3+ +rv-x0+ #x22)
+            (rv-emit-addi buf +rv-a2+ +rv-x0+ (if (= code #x0504) 3 7))
+            (rv-emit-addi buf +rv-a3+ +rv-x0+ (if (= code #x0504) #x21 #x22))
             (rv-emit-addi buf +rv-a4+ +rv-x0+ -1)
             (rv-emit-mv buf +rv-a5+ +rv-x0+)
             (rv-emit-addi buf +rv-a7+ +rv-x0+ 222)

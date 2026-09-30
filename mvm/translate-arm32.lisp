@@ -1289,6 +1289,9 @@
               (arm32-load-imm32 buf +arm-r0+ 2000))
              ((and (= code #x0531) *arm32-linux-mode*)
               (arm32-emit-mmap-exec buf))
+             ((and (= code #x0504) *arm32-linux-mode*)
+              ;; %MMAP-SHARED-PAGE: #x0531 with PROT_RW, MAP_SHARED|ANONYMOUS.
+              (arm32-emit-mmap-exec buf 3 #x21))
              ((and (= code #x0532) *arm32-linux-mode*)
               ;; %JIT-CALL entry: untag, BLX; the callee's value is in r0 = VR.
               ;; LR is the enclosing function's (saved by its prologue).
@@ -2727,7 +2730,7 @@
     (arm32-lsl-imm buf +arm-r0+ +arm-r0+ 1)
     (arm32-pop buf saved)))
 
-(defun arm32-emit-mmap-exec (buf)
+(defun arm32-emit-mmap-exec (buf &optional (prot 7) (flags #x22))
   "TRAP #x0531, hosted: %MMAP-EXEC-PAGE size -> mmap2(NULL, size, RWX,
    PRIVATE|ANON, -1, 0), address TAGGED in r0 (negative errno on failure).  An
    address at or above 2^30 has no fixnum here, so that mapping is given back
@@ -2738,8 +2741,8 @@
     (arm32-push buf saved)
     (arm32-asr-imm buf +arm-r1+ +arm-r0+ 1)            ; size
     (arm32-mov-imm buf +arm-r0+ 0 0)
-    (arm32-mov-imm buf +arm-r2+ 0 7)                   ; RWX
-    (arm32-mov-imm buf +arm-r3+ 0 #x22)                ; PRIVATE|ANONYMOUS
+    (arm32-mov-imm buf +arm-r2+ 0 prot)                ; RWX (#x0504: RW)
+    (arm32-mov-imm buf +arm-r3+ 0 flags)               ; PRIVATE|ANON (#x0504: SHARED)
     (arm32-load-imm32 buf +arm-r4+ #xFFFFFFFF)         ; fd -1
     (arm32-mov-imm buf +arm-r5+ 0 0)
     (arm32-load-imm32 buf +arm-r7+ +arm-linux-sys-mmap2+)

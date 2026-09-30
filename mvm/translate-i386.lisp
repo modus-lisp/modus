@@ -3184,7 +3184,10 @@
                 (i386-emit-pop-reg buf +i386-esi+)
                 (i386-emit-pop-reg buf +scratch1+)
                 (i386-emit-pop-reg buf +scratch0+)))
-             ((and (= code #x0531) *i386-linux-mode*)
+             ((and (member code '(#x0531 #x0504)) *i386-linux-mode*)
+              ;; #x0504 %MMAP-SHARED-PAGE is this with PROT_RW (3) and
+              ;; MAP_SHARED|MAP_ANONYMOUS (#x21): the actor runtime's windows
+              ;; and stacks, and the CLI's boot-time SIGPIPE struct on x64.
               ;; %MMAP-EXEC-PAGE — the ONE new primitive the WS4 JIT needs: a
               ;; page you can WRITE native bytes into AND then EXECUTE.
               ;; V0 (ESI) = size, tagged, a page multiple; result = the mmap
@@ -3205,14 +3208,30 @@
               ;; Build the arg block; pushes descend, so push in reverse.
               (i386-emit-push-imm32 buf 0)                        ; offset = 0
               (i386-emit-push-imm32 buf #xFFFFFFFF)               ; fd = -1
-              (i386-emit-push-imm32 buf #x22)                     ; PRIVATE|ANON
-              (i386-emit-push-imm32 buf 7)                        ; PROT_RWX
+              (i386-emit-push-imm32 buf (if (= code #x0504) #x21 #x22)) ; SHARED|ANON / PRIVATE|ANON
+              (i386-emit-push-imm32 buf (if (= code #x0504) 3 7)) ; PROT_RW / PROT_RWX
               (i386-emit-push-reg buf +i386-esi+)                 ; len
               (i386-emit-push-imm32 buf 0)                        ; addr = NULL
               (i386-emit-mov-reg-reg buf +i386-ebx+ +i386-esp+)   ; ebx = &args
               (i386-emit-byte buf #xB8) (i386-emit-u32 buf 90)    ; eax = old_mmap
               (i386-emit-byte buf #xCD) (i386-emit-byte buf #x80) ; int 0x80
               (i386-emit-add-reg-imm buf +i386-esp+ 24)           ; drop the block
+              ;; An address at or above 2^30 has no fixnum here (native i386
+              ;; maps near #xF7000000): give the mapping back (munmap 91) and
+              ;; answer -ENOMEM rather than a wrapped address, as RV32 and
+              ;; ARM32 do.  ECX may hold a live vreg, so it is stacked.
+              (i386-emit-byte buf #x51)                           ; push ecx
+              (i386-emit-byte buf #x89) (i386-emit-byte buf #xC1) ; mov ecx, eax
+              (i386-emit-byte buf #x01) (i386-emit-byte buf #xC9) ; add ecx, ecx
+              (i386-emit-byte buf #xD1) (i386-emit-byte buf #xF9) ; sar ecx, 1
+              (i386-emit-byte buf #x39) (i386-emit-byte buf #xC1) ; cmp ecx, eax
+              (i386-emit-byte buf #x74) (i386-emit-byte buf 16)   ; je fits
+              (i386-emit-byte buf #x89) (i386-emit-byte buf #xC3) ; mov ebx, eax
+              (i386-emit-byte buf #x89) (i386-emit-byte buf #xF1) ; mov ecx, esi
+              (i386-emit-byte buf #xB8) (i386-emit-u32 buf 91)    ; eax = munmap
+              (i386-emit-byte buf #xCD) (i386-emit-byte buf #x80) ; int 0x80
+              (i386-emit-byte buf #xB8) (i386-emit-u32 buf #xFFFFFFF4) ; eax = -ENOMEM
+              (i386-emit-byte buf #x59)                           ; fits: pop ecx
               (i386-emit-byte buf #x01) (i386-emit-byte buf #xC0) ; add eax, eax
               (i386-emit-byte buf #x89) (i386-emit-byte buf #xC6) ; mov esi, eax
               (i386-emit-pop-reg buf +i386-ebx+))

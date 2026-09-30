@@ -687,41 +687,104 @@
           nil)))))
 
 ;;; --- File stream read-char ---
+;;; UTF-8 ON CHARACTER FILE STREAMS.  :EXTERNAL-FORMAT was accepted and ignored
+;;; and every byte was a character (Latin-1): "é北" in a file read as five
+;;; characters, #\é in source was a reader error, and a string written out came
+;;; back as bytes.  Character file streams -- and stdin/stdout/stderr, which are
+;;; fd streams too -- are now UTF-8: READ-CHAR decodes, WRITE-CHAR encodes.
+;;; Decoding is LENIENT the way a loader must be: a malformed sequence yields
+;;; its first byte as a Latin-1 character and resynchronises, so a Latin-1 file
+;;; still reads rather than failing.  FILE-POSITION counts bytes, as SBCL's does.
+(defun %utf8-len-of-code (code)
+  (cond ((< code #x80) 1) ((< code #x800) 2) ((< code #x10000) 3) (t 4)))
+
 (defun %fs-read-char (stream eof-error-p eof-value)
-  "Read one character from a file stream using buffered I/O."
+  "Read one character from a file stream: one UTF-8 sequence."
+  (let ((b0 (%fs-read-byte-code stream)))
+    (cond
+      ((< b0 0) (if eof-error-p (error "end of file") eof-value))
+      ((< b0 #x80) (code-char b0))
+      (t
+       (let ((n (cond ((= (logand b0 #xE0) #xC0) 1)
+                      ((= (logand b0 #xF0) #xE0) 2)
+                      ((= (logand b0 #xF8) #xF0) 3)
+                      (t 0)))
+             (code 0))
+         (setq code (cond ((= n 1) (logand b0 #x1F))
+                          ((= n 2) (logand b0 #x0F))
+                          ((= n 3) (logand b0 #x07))
+                          (t b0)))
+         (if (= n 0)
+             (code-char b0)                 ; stray continuation / invalid lead
+             (let ((i 0) (ok t))
+               (loop
+                 (when (or (>= i n) (not ok)) (return nil))
+                 (let ((b (%fs-peek-byte-code stream)))
+                   (if (and (>= b 0) (= (logand b #xC0) #x80))
+                       (progn (%fs-read-byte-code stream)
+                              (setq code (logior (ash code 6) (logand b #x3F))))
+                       (setq ok nil)))
+                 (setq i (+ i 1)))
+               (if (and ok (< code #x110000) (not (and (>= code #xD800) (<= code #xDFFF))))
+                   (code-char code)
+                   (code-char b0)))))))))
+
+(defun %fs-peek-byte-code (stream)
+  "The next byte of a file stream without consuming it, or -1 at EOF."
+  (let ((b (%fs-read-byte-code stream)))
+    (when (>= b 0)
+      (%fs-set-bpos stream (- (%fs-bpos stream) 1))
+      (%fs-set-pos stream (- (%fs-pos stream) 1)))
+    b))
+
+(defun %fs-read-byte-code (stream)
+  "The next byte of a character file stream as an integer, or -1 at EOF.
+   (The buffer refill just before a peek never discards: bpos is 0 after it.)"
   (let ((fd (%fs-fd stream)))
     (if (< fd 0)
-        (if eof-error-p (error "end of file") eof-value)
+        -1
         (let ((bpos (%fs-bpos stream))
               (blen (%fs-blen stream)))
           (if (< bpos blen)
               ;; Buffer has data.  %prim-aref: the buffer is a STRING, and
               ;; public AREF now lifts string elements to CHARACTERs (e159986);
-              ;; we need the raw char-CODE here so code-char encodes it once.
-              (let ((ch (code-char (%prim-aref (%fs-buf stream) bpos))))
+              ;; we need the raw byte CODE here.
+              (let ((b (%prim-aref (%fs-buf stream) bpos)))
                 (%fs-set-bpos stream (+ bpos 1))
                 (%fs-set-pos stream (+ (%fs-pos stream) 1))
-                ch)
+                b)
               ;; Need to refill buffer
               ;; %SYS-READ-INTO-BUF fills the stream's own Lisp buffer, from
               ;; the syscall via *IO-BUF-ADDR* or straight from cabinet bytes.
               (let ((n (%sys-read-into-buf fd (%fs-buf stream) 4096)))
                 (if (<= n 0)
-                    ;; EOF
-                    (if eof-error-p (error "end of file") eof-value)
+                    -1                                  ; EOF
                     (progn
                       (%fs-set-bpos stream 0)
                       (%fs-set-blen stream n)
-                      ;; Recurse to read first char
-                      (%fs-read-char stream eof-error-p eof-value)))))))))
+                      (%fs-read-byte-code stream)))))))))
 
 ;;; --- File stream write-char ---
 (defun %fs-write-char (code stream)
-  "Write a char code to a file stream."
+  "Write a char code to a file stream, UTF-8 encoded."
   (let ((fd (%fs-fd stream)))
     (when (>= fd 0)
-      (%sys-write-byte-1 fd code)
-      (%fs-set-pos stream (+ (%fs-pos stream) 1)))))
+      (cond
+        ((< code #x80)
+         (%sys-write-byte-1 fd code))
+        ((< code #x800)
+         (%sys-write-byte-1 fd (logior #xC0 (ash code -6)))
+         (%sys-write-byte-1 fd (logior #x80 (logand code #x3F))))
+        ((< code #x10000)
+         (%sys-write-byte-1 fd (logior #xE0 (ash code -12)))
+         (%sys-write-byte-1 fd (logior #x80 (logand (ash code -6) #x3F)))
+         (%sys-write-byte-1 fd (logior #x80 (logand code #x3F))))
+        (t
+         (%sys-write-byte-1 fd (logior #xF0 (ash code -18)))
+         (%sys-write-byte-1 fd (logior #x80 (logand (ash code -12) #x3F)))
+         (%sys-write-byte-1 fd (logior #x80 (logand (ash code -6) #x3F)))
+         (%sys-write-byte-1 fd (logior #x80 (logand code #x3F)))))
+      (%fs-set-pos stream (+ (%fs-pos stream) (%utf8-len-of-code code))))))
 
 ;;; --- File stream read-byte ---
 (defun %fs-read-byte (stream eof-error-p eof-value)
@@ -1534,7 +1597,15 @@
    designator argument.  Per CLHS: must return a pathname (or NIL)."
   ;; CLHS error.1: (user-homedir-pathname :unspecific nil) → program-error.
   (when (and args (cdr args)) (%signal-program-error))
-  (%coerce-to-pathname "/root/"))
+  ;; $HOME when the image can see an environment (hosted: %CLI-GETENV is
+  ;; real), with a trailing slash so MERGE-PATHNAMES treats it as a directory;
+  ;; /root/ where it cannot (bare metal's %CLI-GETENV answers NIL).  A fixed
+  ;; /root/ sent every `~/.foo' lookup of a hosted program to the wrong user.
+  (let ((h (%cli-getenv "HOME")))
+    (%coerce-to-pathname
+     (if (and (stringp h) (> (length h) 0))
+         (if (char= (char h (- (length h) 1)) #\/) h (concatenate 'string h "/"))
+         "/root/"))))
 
 ;;; --- probe-file ---
 (defun probe-file (x)
@@ -2095,10 +2166,13 @@
                  (when (streamp target-stream)
                    (unread-char ch target-stream)))))
             ((= ty 9)
-             ;; File stream: push back by decrementing bpos
-             (let ((bpos (%fs-bpos s)))
+             ;; File stream: push back by decrementing bpos -- by the
+             ;; character's UTF-8 length, since that is what READ-CHAR consumed.
+             (let ((bpos (%fs-bpos s))
+                   (n (%utf8-len-of-code (%ensure-char-code ch))))
                (when (> bpos 0)
-                 (%fs-set-bpos s (- bpos 1)))))))
+                 (%fs-set-bpos s (- bpos (min n bpos)))
+                 (%fs-set-pos s (- (%fs-pos s) (min n bpos))))))))
       nil))))
 
 ;;; --- peek-char ---
@@ -2214,10 +2288,35 @@
 
 ;;; --- Core write-char ---
 
+;;; The terminal (stdout, the UART, the web page's TextDecoder) is UTF-8 too:
+;;; WRITE-CHAR-SERIAL emits one byte, so a code past ASCII is encoded here.
+(defun %write-code-serial (code)
+  (cond
+    ((< code #x80) (write-char-serial code))
+    ((< code #x800)
+     (write-char-serial (logior #xC0 (ash code -6)))
+     (write-char-serial (logior #x80 (logand code #x3F))))
+    ((< code #x10000)
+     (write-char-serial (logior #xE0 (ash code -12)))
+     (write-char-serial (logior #x80 (logand (ash code -6) #x3F)))
+     (write-char-serial (logior #x80 (logand code #x3F))))
+    (t
+     (write-char-serial (logior #xF0 (ash code -18)))
+     (write-char-serial (logior #x80 (logand (ash code -12) #x3F)))
+     (write-char-serial (logior #x80 (logand (ash code -6) #x3F)))
+     (write-char-serial (logior #x80 (logand code #x3F))))))
+
+;;; Gray streams (net/sb-gray-shim.lisp) set these when installed: a CLOS instance of
+;;; *GRAY-ROOT-CLASS* receives character output through *GRAY-WRITE-CHAR-FN*.
+(defvar *gray-root-class* nil)
+(defvar *gray-write-char-fn* nil)
+
 (defun %write-char-to-stream (code stream)
   "Write a char code (integer) to a resolved stream. Caller must convert characters first."
   (if (not (streamp stream))
-      (write-char-serial code)
+      (if (and *gray-root-class* (%clos-instance-p stream) (typep stream *gray-root-class*))
+          (funcall *gray-write-char-fn* stream code)
+          (%write-code-serial code))
       (let ((ty (%stream-type stream)))
         (cond
           ;; String-output: collect char codes
@@ -2238,7 +2337,7 @@
           ((= ty 9)
            (%fs-write-char code stream))
           ;; Serial-io
-          ((= ty 8) (write-char-serial code))
+          ((= ty 8) (%write-code-serial code))
           ;; Synonym: resolve target symbol's value and delegate.
           ((= ty 7)
            (let ((target (%stream-data stream)))
@@ -2247,14 +2346,14 @@
                                         (t target))))
                (if (streamp target-stream)
                    (%write-char-to-stream code target-stream)
-                   (write-char-serial code)))))
-          (t (write-char-serial code))))))
+                   (%write-code-serial code)))))
+          (t (%write-code-serial code))))))
 
 ;; Backward-compatible wrapper used by write-to-stream, princ-to-stream etc.
 (defun write-char-to-stream (ch stream)
   (let ((code (%ensure-char-code ch)))
     (if (null stream)
-        (write-char-serial code)
+        (%write-code-serial code)
         (if (streamp stream)
             (%write-char-to-stream code stream)
             ;; Legacy: old-style cons output stream (char-list . nil)

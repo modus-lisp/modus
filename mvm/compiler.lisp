@@ -6152,6 +6152,22 @@
               (let ((m (%bq-marker-sym elt)) (e (%mvm-gensym "BQE")))
                 (list 'mapcar (list 'lambda (list e) (list 'list (list 'quote m) e))
                       inner)))))))
+(defun %defstruct-kw-ctor-defun (ctor-sym slot-names slot-defaults internal-ctor-sym)
+  "A DEFUN form for a KEYWORD constructor: (&key ((:slot g) default) …) calling
+   the internal positional constructor.  Keyword constructors are registered as
+   MACROS (fast direct calls), but a macro is not a function: #'%MAKE-URI,
+   (apply #'make-foo args) and (mapcar #'make-foo …) found nothing -- quri's
+   MAKE-BASIC-URI and every MAKE-URI-* died UNDEFINED-FUNCTION at definition.
+   Emitted for runtime compiles only, alongside the macro; direct calls still
+   expand.  Gensym variables, so a slot name can never collide with a special
+   or a constant."
+  (let ((vars (mapcar (lambda (s) (declare (ignore s)) (%mvm-gensym "SLOT")) slot-names)))
+    (list 'defun ctor-sym
+          (cons '&key
+                (mapcar (lambda (s v d)
+                          (list (list (intern (symbol-name s) :keyword) v) d))
+                        slot-names vars slot-defaults))
+          (cons internal-ctor-sym vars))))
 
 (defun expand-backquote (template &optional (level 1))
   "Expand a backquote template into explicit list-building code.
@@ -10078,7 +10094,10 @@
          ((or (and (symbolp op) (string= (symbol-name op) "LET"))
               (and (integerp op) (= op 536263002))  ; LET
               (and (symbolp op) (string= (symbol-name op) "LET*"))
-              (and (integerp op) (= op 431241200)))  ; LET*
+              (and (integerp op) (= op 431241200))  ; LET*
+              ;; PROG / PROG* bind exactly like LET / LET* (special forms here)
+              (and (symbolp op) (string= (symbol-name op) "PROG"))
+              (and (symbolp op) (string= (symbol-name op) "PROG*")))
           (let* ((bindings (cadr form))
                  (body (cddr form))
                  ;; Variables bound by this let shadow outer boxed vars
@@ -10095,6 +10114,21 @@
                  (new-body (mapcar (lambda (f) (cell-rewrite-form f inner-boxed lambda-params))
                                    body)))
             `(,op ,new-bindings ,@new-body)))
+         ;; THE OTHER BINDING SPECIAL FORMS.  In Modus these are compiler
+         ;; special forms, not macros, so this pass (which runs before
+         ;; macroexpansion) sees them unexpanded -- and the general case below
+         ;; rewrote EVERY occurrence of a boxed name, including the ones these
+         ;; forms rebind.  quri's PARSE-URI-STRING boxes its &key END (a
+         ;; closure reads it) and rebinds END with MULTIPLE-VALUE-BIND; the
+         ;; inner reads became reads of the parameter's box (NIL), and every
+         ;; URL parse died TYPE-ERROR.  See %CELL-REWRITE-BINDING-FORM.
+         ((and (symbolp op)
+               (member (symbol-name op)
+                       '("MULTIPLE-VALUE-BIND" "HANDLER-CASE" "WITH-OPEN-FILE"
+                         "WITH-OUTPUT-TO-STRING" "WITH-INPUT-FROM-STRING"
+                         "SYMBOL-MACROLET" "LOOP")
+                       :test #'string=))
+          (%cell-rewrite-binding-form form boxed-vars lambda-params))
          ;; General case: rewrite all subforms.  IMPROPER-LIST SAFE: loop
          ;; destructuring patterns (`:for (o . a) :in …`), macro lambda
          ;; lists, etc. appear as DOTTED subforms of not-yet-expanded macro
@@ -10151,6 +10185,81 @@
             (let ((res cur))
               (dolist (x acc) (setq res (cons x res)))
               (cons head res)))))))))
+
+(defun %cr-minus (boxed names)
+  (remove-if (lambda (v) (member v names :test #'name-equal)) boxed))
+
+(defun %cr-list (forms boxed lp)
+  "CELL-REWRITE-FORM over a (possibly dotted) list of forms."
+  (let ((acc nil) (cur forms))
+    (loop (when (not (consp cur)) (return nil))
+      (setq acc (cons (cell-rewrite-form (car cur) boxed lp) acc))
+      (setq cur (cdr cur)))
+    (let ((res cur)) (dolist (x acc) (setq res (cons x res))) res)))
+
+(defun %cr-names (tree)
+  "Every variable symbol in a binding list / destructuring pattern / lambda
+   list (lambda-list keywords excluded)."
+  (cond ((null tree) nil)
+        ((symbolp tree)
+         (let ((n (symbol-name tree)))
+           (if (and (plusp (length n)) (char= (char n 0) #\&)) nil (list tree))))
+        ((consp tree) (append (%cr-names (car tree)) (%cr-names (cdr tree))))
+        (t nil)))
+
+(defun %cr-loop-names (clauses)
+  "Variables a LOOP binds: the pattern after FOR / AS / WITH, and INTO targets."
+  (let ((names nil) (cur clauses))
+    (loop (when (not (consp cur)) (return names))
+      (let ((x (car cur)))
+        (when (and (symbolp x) (consp (cdr cur))
+                   (member (symbol-name x) '("FOR" "AS" "WITH" "INTO") :test #'string=))
+          (setq names (append (%cr-names (cadr cur)) names))))
+      (setq cur (cdr cur)))))
+
+(defun %cell-rewrite-binding-form (form boxed lp)
+  "CELL-REWRITE-FORM for the binding special forms: the names a form binds
+   shadow the boxed set in the scope where they are bound, and only there."
+  (let ((n (symbol-name (car form))))
+    (cond
+      ;; (multiple-value-bind vars values-form . body)
+      ((string= n "MULTIPLE-VALUE-BIND")
+       (list* (car form) (cadr form)
+              (cell-rewrite-form (caddr form) boxed lp)
+              (%cr-list (cdddr form) (%cr-minus boxed (%cr-names (cadr form))) lp)))
+      ;; (with-… (var . args) . body)
+      ((or (string= n "WITH-OPEN-FILE") (string= n "WITH-OUTPUT-TO-STRING")
+           (string= n "WITH-INPUT-FROM-STRING"))
+       (let ((spec (cadr form)))
+         (if (and (consp spec) (symbolp (car spec)))
+             (list* (car form)
+                    (cons (car spec) (%cr-list (cdr spec) boxed lp))
+                    (%cr-list (cddr form) (%cr-minus boxed (list (car spec))) lp))
+             (cons (car form) (%cr-list (cdr form) boxed lp)))))
+      ;; (symbol-macrolet ((name expansion) …) . body)
+      ((string= n "SYMBOL-MACROLET")
+       (list* (car form)
+              (mapcar (lambda (b) (if (consp b) (list (car b) (cell-rewrite-form (cadr b) boxed lp)) b))
+                      (cadr form))
+              (%cr-list (cddr form)
+                        (%cr-minus boxed (mapcar (lambda (b) (if (consp b) (car b) b)) (cadr form)))
+                        lp)))
+      ;; (handler-case form (type (var) . body) …)
+      ((string= n "HANDLER-CASE")
+       (list* (car form)
+              (cell-rewrite-form (cadr form) boxed lp)
+              (mapcar (lambda (cl)
+                        (if (and (consp cl) (consp (cdr cl)) (listp (cadr cl)))
+                            (list* (car cl) (cadr cl)
+                                   (%cr-list (cddr cl) (%cr-minus boxed (%cr-names (cadr cl))) lp))
+                            cl))
+                      (cddr form))))
+      ;; LOOP: conservative -- a name the loop binds is shadowed across the
+      ;; whole loop (an init form reading an outer var of the same name is the
+      ;; one shape this gets wrong, and it is far rarer than the shape it fixes).
+      ((string= n "LOOP")
+       (cons (car form) (%cr-list (cdr form) (%cr-minus boxed (%cr-loop-names (cdr form))) lp)))
+      (t (cons (car form) (%cr-list (cdr form) boxed lp))))))
 
 (defun %tree-mentions-any-p (tree names)
   "True if any symbol in NAMES (by NAME-EQUAL) occurs anywhere in TREE."
@@ -13760,14 +13869,24 @@
                  ((= iter-kw 190453506)  ; =
                   (setf rest (cdr rest))
                   (let ((init (car rest))
-                        (step nil))
+                        (step nil)
+                        (has-then nil))
                     (setf rest (cdr rest))
                     (when (and rest (symbolp (car rest))
                                (= (normalize-name (car rest)) 325947496))  ; THEN
-                      (setf step (cadr rest) rest (cddr rest)))
+                      (setf step (cadr rest) rest (cddr rest) has-then t))
+                    ;; PRESENCE of THEN, not the truth of its form: `for first
+                    ;; = t then nil` stored (or NIL T) = T as its step, which
+                    ;; the code generator reads as "no THEN" (step EQ init), so
+                    ;; FIRST stayed T forever.  cl-ppcre's COLLECT-CHAR-CLASS
+                    ;; loops exactly so and took every character for the first
+                    ;; one, never seeing the closing bracket.  A literal NIL
+                    ;; step is spelled (QUOTE NIL) so it is never EQ to INIT.
                     (push (make-loop-iter :kind :general :var var
                                           :init-form init
-                                          :step-form (or step init))
+                                          :step-form (cond ((not has-then) init)
+                                                           ((null step) (list 'quote nil))
+                                                           (t step)))
                           (loop-state-iterations state))))
 
                  ;; FOR var BEING [THE | EACH] kind {OF | IN} expr [USING (k v)]
@@ -14604,10 +14723,25 @@
                (let ((firstv (%mvm-gensym "FORTHEN-FIRST")))
                  (push (list var nil) bindings)
                  (push (list firstv t) bindings)
-                 (push `(if ,firstv
-                            (progn (setq ,var ,(loop-iter-init-form iter))
-                                   (setq ,firstv nil)))
-                       init-stmts)
+                 (if (loop-iter-and-p iter)
+                     (push `(if ,firstv
+                                (progn (setq ,var ,(loop-iter-init-form iter))
+                                       (setq ,firstv nil)))
+                           init-stmts)
+                     ;; SEQUENTIAL FOR (no AND): the STEP runs here too, in
+                     ;; clause order, on every iteration after the first -- not
+                     ;; at the end of the previous one.  A no-THEN sibling
+                     ;; before it (`for q = (quant lexer)`) is re-assigned in
+                     ;; INIT-STMTS, so a STEP-STMTS step read the OLD q: in
+                     ;; cl-ppcre's `for seq = quant then (cond … seq quant …)`
+                     ;; every regex parsed one token behind ("abc" -> "aab").
+                     ;; CLHS 6.1.2.1: sequential for-as clauses step in order,
+                     ;; each seeing the ones before it already stepped.
+                     (push `(if ,firstv
+                                (progn (setq ,var ,(loop-iter-init-form iter))
+                                       (setq ,firstv nil))
+                                (setq ,var ,(loop-iter-step-form iter)))
+                           init-stmts))
                  (if (loop-iter-and-p iter)
                      ;; FOR ... AND v = i THEN s: S sees the group's OLD
                      ;; values, so evaluate it into a temp BEFORE the group's
@@ -14621,7 +14755,8 @@
                                      (list `(setq ,tmp ,(loop-iter-step-form iter)))
                                      (nthcdr n step-stmts)))
                        (push `(setq ,var ,tmp) step-stmts))
-                     (push `(setq ,var ,(loop-iter-step-form iter)) step-stmts))))))
+                     ;; (sequential: stepped in INIT-STMTS above)
+                     nil)))))
 
         (:while
          (push `(if (null ,(loop-iter-init-form iter)) (return-from :%loop-exit nil)) test-forms))
@@ -17426,9 +17561,17 @@
         ;; shortcut is taken only for a leaf landing in a physical temp
         ;; (V4..V8); otherwise DEST is a callee-saved / spilled vreg and the
         ;; scratch traffic is harmless.
+        ;; A HEAP CONSTANT IS NOT SUCH A LEAF: in runtime-compiled code a
+        ;; bignum literal or a quoted object loads from the constant vector
+        ;; THROUGH rax, so with DEST = VR it overwrote the left operand --
+        ;; (logxor a #xe100000000000000) returned the constant, and every
+        ;; AES-GCM tag seal computed was wrong.  Only a variable or a small
+        ;; integer immediate is safe with DEST = VR.
         (and (or leaf (%pure-simple-expr-p arg env))
              (or (/= dest +vreg-vr+)
-                 (and leaf (< *temp-reg-counter* 5)))))
+                 (and leaf (< *temp-reg-counter* 5)
+                      (or (symbolp arg)
+                          (and (integerp arg) (<= (integer-length arg) 60)))))))
       ;; Leaf / pure right operand: no push/mov/pop round trip is needed.
       (let ((temp (alloc-temp-reg)))
         (compile-form arg env temp)
@@ -19369,6 +19512,18 @@
                         (t nil))))
            (and n (symbolp n) (%unsigned-small-max n env) (cons :right n))))
         (t nil)))))
+(defun %ash-inline-sar-count (count)
+  "The immediate for an INLINE right shift by -COUNT on a tagged fixnum word.
+   A right shift of 63 or more is the sign fill and must be emitted as exactly
+   63: x86 SAR (and the aarch64 immediate) take the count mod 64, so the inline
+   paths turned (ash n -78) into (ash n -14).  natrium's Poly1305 takes
+   (ash n -78) of a short final block's small N -- 5 instead of 0 -- and every
+   JIT-compiled MAC came out wrong (TLS: \"handshake record decryption
+   failed\").  63 on the tagged word leaves 0 or -1, which the tag-clearing AND
+   after it makes fixnum 0 or -1.  Only the INLINE shift is clamped: the bignum
+   cold path gets the real count."
+  (min 63 (- count)))
+
 (defun compile-ash (value-form count-form env dest)
   "Compile (ash value count) - arithmetic shift.
    Positive count = left shift, negative = right shift.
@@ -19425,7 +19580,7 @@
      (if (>= count 0)
          (when (> count 0) (emit-ir :shl dest dest count))
          (progn
-           (emit-ir :sar dest dest (- count))
+           (emit-ir :sar dest dest (%ash-inline-sar-count count))
            (let ((temp (alloc-temp-reg)))
              (emit-ir :li temp 2)
              (emit-ir :neg temp temp)
@@ -19489,7 +19644,7 @@
            (emit-ir-label ok)
            (free-temp-reg))
          (progn
-           (emit-ir :sar dest dest (- count))
+           (emit-ir :sar dest dest (%ash-inline-sar-count count))
            (let ((temp (alloc-temp-reg)))
              ;; Mask off the low tag bit.  The mask is -2 (0xFFFF...FFFE),
              ;; but a NEGATIVE :li operand is materialised via emit-u64,
@@ -19573,9 +19728,14 @@
 (defun compile-consp (arg env dest)
   "Compile (consp x) - true if x has cons tag.
    The MVM consp instruction produces a tagged boolean (T or NIL) in dest."
-  (compile-form arg env dest)
-  ;; MVM consp: dest = (consp? src) -> T or NIL
-  (emit-ir :consp dest dest))
+  ;; RUNTIME-COMPILED CODE sees CL's CONSP, which excludes hash tables (see
+  ;; %RT-CONSP); the image's own code keeps the raw tag test it relies on.
+  (if *mvm-eval-runtime-p*
+      (compile-form (list '%rt-consp arg) env dest)
+      (progn
+        (compile-form arg env dest)
+        ;; MVM consp: dest = (consp? src) -> T or NIL
+        (emit-ir :consp dest dest))))
 
 (defun compile-fixnump (arg env dest)
   "Compile (fixnump x) - true if low bit is 0"
@@ -19594,12 +19754,18 @@
 (defun compile-atom-p (arg env dest)
   "Compile (atom x) - true if x is not a cons.
    The MVM atom instruction produces a tagged boolean (T or NIL) in dest."
-  (compile-form arg env dest)
-  ;; MVM atom: dest = (atom? src) -> T or NIL
-  (emit-ir :atom dest dest))
+  (if *mvm-eval-runtime-p*
+      (compile-form (list '%rt-atom arg) env dest)
+      (progn
+        (compile-form arg env dest)
+        ;; MVM atom: dest = (atom? src) -> T or NIL
+        (emit-ir :atom dest dest))))
 
 (defun compile-listp (arg env dest)
   "Compile (listp x) - true if x is NIL or a cons"
+  (when *mvm-eval-runtime-p*
+    (compile-form (list '%rt-listp arg) env dest)
+    (return-from compile-listp nil))
   (let ((true-label (make-compiler-label))
         (check-cons-label (make-compiler-label))
         (end-label (make-compiler-label)))
@@ -24961,6 +25127,9 @@
             (conc-name-specified nil)
             (conc-name nil)  ; nil = no prefix, string = prefix
             (include-parent nil)
+            ;; The slot-descriptions after the parent in (:INCLUDE parent …):
+            ;; per-slot DEFAULT overrides for inherited slots (CLHS 3.4.6).
+            (include-overrides nil)
             ;; Named constructors from (:CONSTRUCTOR NAME [arg-spec]).
             ;; Each entry: (name . arg-spec) where arg-spec is
             ;; :default (use struct slot order), NIL (0-arg ctor), or
@@ -25016,7 +25185,8 @@
                                           (symbol-name cn)))
                                     nil)))  ; (:conc-name nil) → no prefix
                ((name-eq opt-name "INCLUDE")
-                (setf include-parent (cadr opt)))
+                (setf include-parent (cadr opt))
+                (setf include-overrides (cddr opt)))
                ((name-eq opt-name "CONSTRUCTOR")
                 (let ((ctor-sym (cadr opt))
                       (arg-spec (if (cddr opt) (caddr opt) :default)))
@@ -25070,7 +25240,23 @@
             (parent-slots (when include-parent
                             (%defstruct-eff-slots-get (%rt-fn-name include-parent))))
             (parent-slot-names (mapcar #'car parent-slots))
-            (parent-slot-defaults (mapcar #'cdr parent-slots))
+            ;; ...with the :INCLUDE option's own slot-descriptions applied: in
+            ;; (:include uri (scheme :urn)) the inherited SCHEME defaults to
+            ;; :URN, not to URI's default.  These were never read, so every
+            ;; quri subtype (urn, uri-http, uri-ftp …) got the parent's NIL
+            ;; scheme and port.  A bare slot name means no initform.
+            (parent-slot-defaults
+              (mapcar (lambda (ps)
+                        (let ((ov (find-if (lambda (o)
+                                             (let ((n (if (consp o) (car o) o)))
+                                               (and (symbolp n)
+                                                    (string= (symbol-name n)
+                                                             (symbol-name (car ps))))))
+                                           include-overrides)))
+                          (cond ((null ov) (cdr ps))
+                                ((consp ov) (cadr ov))
+                                (t nil))))
+                      parent-slots))
             ;; CLHS 3.4.6 slot option :READ-ONLY — parsed per OWN slot and
             ;; inherited for the parent's slots.  Previously accepted and
             ;; silently discarded, so a write SBCL refuses succeeded here.
@@ -25182,7 +25368,14 @@
              ;; Only when no (:CONSTRUCTOR …) option replaced it — see
              ;; DEFAULT-CTOR-SUPPRESSED above.
              (unless default-ctor-suppressed
-               (mvm-define-macro ctor-name %ctor-expander))
+               (mvm-define-macro ctor-name %ctor-expander)
+               ;; ...AND A FUNCTION (runtime compiles): see
+               ;; %DEFSTRUCT-KW-CTOR-DEFUN.
+               (when *mvm-eval-runtime-p*
+                 (push (%defstruct-kw-ctor-defun (%defstruct-intern ctor-name)
+                                                 slot-names slot-defaults
+                                                 internal-ctor-sym)
+                       forms-to-compile)))
              ;; mvm-eval (in-image runtime compile) PERSISTENCE: *macro-table* is
              ;; rebound PER mvm-eval CALL, so without a runtime registration a
              ;; LATER (eval '(make-NAME …)) compiled the ctor as an undefined
@@ -25246,6 +25439,12 @@
                                       (setf cargs (cddr cargs)))
                              `(,ics ,@positional)))))
                   (mvm-define-macro ctor-fn-name expander)
+                  ;; A callable function too (runtime compiles) -- quri's
+                  ;; (apply #'%make-uri args); see %DEFSTRUCT-KW-CTOR-DEFUN.
+                  (when *mvm-eval-runtime-p*
+                    (push (%defstruct-kw-ctor-defun ctor-sym slot-names
+                                                    slot-defaults ics)
+                          forms-to-compile))
                   ;; CTOR-SYM, not (%DEFSTRUCT-INTERN CTOR-FN-NAME): the
                   ;; user WROTE the constructor name as a symbol, so it must
                   ;; be defined in ITS package.  Re-interning the bare string

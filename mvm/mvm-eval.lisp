@@ -1634,6 +1634,26 @@
   "Module bytecode vectors (EQ) JIT-EAGER already failed to translate; see
    %JIT-EAGER-ALL.  Boots NIL (a defvar init does not run in-image), which is
    the right empty value.")
+(defvar *jit-skip-prefixes* nil
+  "Registered DEFUN names (\"PKG::NAME\") that JIT-EAGER leaves as
+   interpreter trampolines, by prefix.  NIL = the default list (%JIT-SKIP-LIST);
+   set to (list) to JIT everything.")
+
+(defun %jit-skip-list ()
+  (let ((v (handler-case *jit-skip-prefixes* (error (c) nil))))
+    (if v v
+        ;; THE LOADER'S OWN CODE STAYS INTERPRETED.  JIT-compiling the
+        ;; Quicklisp client and then quickloading with it lost the load
+        ;; (bordeaux-threads loaded, then the process exited silently): some
+        ;; client function miscompiles.  Library code is where the time goes;
+        ;; the client runs once per system.
+        (list "QL-" "QUICKLISP"))))
+
+(defun %jit-skip-name-p (nm skips)
+  (and (stringp nm)
+       (dolist (p skips nil)
+         (when (and (>= (length nm) (length p)) (string= p nm :end2 (length p)))
+           (return t)))))
 
 (defun %jit-eager-all ()
   "Translate every registered runtime DEFUN that is still an interpreter
@@ -1644,11 +1664,13 @@
       (list 0 0 0)
       (let ((pending nil) (installed 0) (modules 0) (failed 0) (done nil))
         ;; collect first: publishing mutates the tables we would otherwise walk
-        (maphash (lambda (nm m)
-                   (when (not (%jit-fn-native-p nm))
-                     (when (not (member m pending :test (function eq)))
-                       (setq pending (cons m pending)))))
-                 *jit-module-registry*)
+        (let ((skips (%jit-skip-list)))
+          (maphash (lambda (nm m)
+                     (when (and (not (%jit-skip-name-p nm skips))
+                                (not (%jit-fn-native-p nm)))
+                       (when (not (member m pending :test (function eq)))
+                         (setq pending (cons m pending)))))
+                   *jit-module-registry*))
         (dolist (m pending)
           (when (not (member (car m) done :test (function eq)))
             (setq done (cons (car m) done))

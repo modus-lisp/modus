@@ -533,6 +533,29 @@
 (defun sb-bsd-sockets:socket-name (socket) (%sock-getname socket 51))
 (defun sb-bsd-sockets:socket-peername (socket) (%sock-getname socket 52))
 
+(defun sb-bsd-sockets:socket-send (socket buffer length &key address external-format)
+  "Write LENGTH bytes (all of BUFFER when NIL) of the (unsigned-byte 8) vector
+   BUFFER; returns the count written.  PARTIAL: ADDRESS (datagram sends) and
+   EXTERNAL-FORMAT are not supported and must be NIL."
+  external-format
+  (when address (error "sb-bsd-sockets:socket-send: :ADDRESS is not supported on modus."))
+  (let ((n (socket-send (%socket-fd socket) buffer (or length (length buffer)))))
+    (if (< n 0)
+        (error 'sb-bsd-sockets:socket-error :errno (- n))
+        n)))
+
+(defun sb-bsd-sockets:socket-receive (socket buffer length &key oob peek waitall element-type)
+  "One read(2) of up to LENGTH bytes (BUFFER's length when NIL) into BUFFER,
+   or into a fresh (unsigned-byte 8) vector of LENGTH when BUFFER is NIL.
+   Returns (values buffer count nil); count 0 = the peer closed.  PARTIAL: OOB,
+   PEEK, WAITALL and ELEMENT-TYPE are accepted and ignored."
+  oob peek waitall element-type
+  (let* ((buf (or buffer (make-array length :element-type '(unsigned-byte 8))))
+         (n (socket-recv (%socket-fd socket) buf (or length (length buf)))))
+    (if (< n 0)
+        (error 'sb-bsd-sockets:socket-error :errno (- n))
+        (values buf n nil))))
+
 (defun sb-bsd-sockets:socket-make-stream (socket &key input output
                                                       (element-type 'character)
                                                       buffering timeout
@@ -598,22 +621,97 @@
 (defun sb-bsd-sockets:host-ent-address (host-ent)
   (car (sb-bsd-sockets:host-ent-addresses host-ent)))
 
-(defun sb-bsd-sockets:get-host-by-name (name)
-  "Resolve NAME.
+(defun %shim-split-ws (line)
+  "LINE's whitespace-separated fields, up to a # comment."
+  (let ((fields nil) (cur nil) (i 0) (n (length line)))
+    (loop
+      (when (>= i n) (return nil))
+      (let ((c (char line i)))
+        (cond ((char= c #\#) (return nil))
+              ((or (char= c #\Space) (char= c #\Tab) (char= c #\Return))
+               (when cur (push (coerce (nreverse cur) 'string) fields) (setq cur nil)))
+              (t (push c cur))))
+      (setq i (+ i 1)))
+    (when cur (push (coerce (nreverse cur) 'string) fields))
+    (nreverse fields)))
 
-   PARTIAL, AND THE PARTIAL PART IS THE WHOLE OF IT: a DOTTED QUAD is recognised
-   without asking anybody; anything else SIGNALS.  modus does have a resolver
-   (DNS-LOOKUP in net/hosted-sockets.lisp) but it takes a nameserver address as
-   an argument and this shim has no configured one to pass — there is no
-   /etc/resolv.conf reader in the image — so `resolve a name' would mean picking
-   a public resolver on the caller\'s behalf, which is not a decision a
-   compatibility shim gets to make.  glass\'s only call site
-   (src/socket.lisp:520) passes a host that is a dotted quad in every
-   configuration the RFB server is used in."
-  (if (and (> (length name) 0) (digit-char-p (char name 0)))
-      (make-instance 'sb-bsd-sockets:host-ent :name name
-                     :addresses (list (sb-bsd-sockets:make-inet-address name)))
-      (error 'sb-bsd-sockets:socket-error :errno 2)))
+(defun %shim-dotted-quad-int (s)
+  "The host-order integer of a dotted-quad STRING, or NIL if it is not one."
+  (let ((parts nil) (acc 0) (digits 0) (i 0) (n (length s)) (ok t))
+    (loop
+      (when (>= i n) (return nil))
+      (let ((c (char s i)))
+        (cond ((digit-char-p c)
+               (setq acc (+ (* acc 10) (digit-char-p c)) digits (+ digits 1)))
+              ((and (char= c #\.) (> digits 0))
+               (push acc parts) (setq acc 0 digits 0))
+              (t (setq ok nil) (return nil))))
+      (setq i (+ i 1)))
+    (when (and ok (> digits 0)) (push acc parts))
+    (setq parts (nreverse parts))
+    (if (and ok (= (length parts) 4) (every (lambda (x) (<= x 255)) parts))
+        (+ (* (first parts) 16777216) (* (second parts) 65536)
+           (* (third parts) 256) (fourth parts))
+        nil)))
+
+(defun %shim-file-lines (path)
+  "The lines of the file at PATH, or NIL if it cannot be read."
+  (handler-case
+      (with-open-file (in path)
+        (let ((acc nil))
+          (loop
+            (let ((l (read-line in nil nil)))
+              (when (null l) (return nil))
+              (push l acc)))
+          (nreverse acc)))
+    (error () nil)))
+
+(defun %shim-hosts-lookup (name)
+  "NAME's IPv4 address string from /etc/hosts, or NIL."
+  (dolist (line (%shim-file-lines "/etc/hosts") nil)
+    (let ((f (%shim-split-ws line)))
+      (when (and f (%shim-dotted-quad-int (car f))
+                 (member name (cdr f) :test #'string-equal))
+        (return (car f))))))
+
+(defun %shim-nameservers ()
+  "The IPv4 nameservers /etc/resolv.conf names, as host-order integers, in its
+   order; 8.8.8.8 last, as the fallback when it names none that answer."
+  (let ((acc nil))
+    (dolist (line (%shim-file-lines "/etc/resolv.conf"))
+      (let ((f (%shim-split-ws line)))
+        (when (and (= (length f) 2) (string= (car f) "nameserver"))
+          (let ((ip (%shim-dotted-quad-int (cadr f))))
+            (when ip (push ip acc))))))
+    (nreverse (cons 134744072 acc))))
+
+(defun sb-bsd-sockets:get-host-by-name (name)
+  "Resolve NAME to its IPv4 address.
+
+   A dotted quad answers itself; then /etc/hosts; then each IPv4 nameserver in
+   /etc/resolv.conf in order (UDP, then TCP), with 8.8.8.8 last.  This shim
+   used to refuse every non-numeric name because the image had no resolv.conf
+   reader and it would not pick a public resolver on the caller's behalf --
+   the configured resolver is the one to ask, and now it is asked.  IPv4 only
+   (DNS-LOOKUP asks for A records).  Signals SOCKET-ERROR when nothing answers."
+  (let ((quad (cond ((%shim-dotted-quad-int name) name)
+                    ((%shim-hosts-lookup name))
+                    (t (let* ((n (length name))
+                              (codes (make-array n))
+                              (found nil))
+                         (dotimes (i n) (aset codes i (char-code (char name i))))
+                         (dolist (ns (%shim-nameservers))
+                           (unless found
+                             (let ((ip (handler-case (dns-lookup codes n ns nil) (error () 0))))
+                               (when (eql ip 0)
+                                 (setq ip (handler-case (dns-lookup codes n ns t) (error () 0))))
+                               (when (and (integerp ip) (> ip 0))
+                                 (setq found (%format-dotted-ip ip))))))
+                         found)))))
+    (if quad
+        (make-instance 'sb-bsd-sockets:host-ent :name name
+                       :addresses (list (sb-bsd-sockets:make-inet-address quad)))
+        (error 'sb-bsd-sockets:socket-error :errno 2))))
 
 ;;; ============================================================
 ;;; SB-EXT additions

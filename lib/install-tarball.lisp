@@ -29,12 +29,50 @@
            (if (= n len) buf (%tar-slice buf 0 n)))
       (close s))))
 
+(defun %it-utf8-bytes-to-string (bytes)
+  "BYTES decoded as UTF-8 into a string, LENIENTLY: a malformed sequence yields
+   its first byte as a Latin-1 character and decoding resynchronises, so a
+   Latin-1 source still loads.  Library sources are UTF-8, and decoding them
+   one char per byte turned every non-ASCII literal into mojibake and every
+   #\<non-ASCII> into a reader error (quill's own test file could not load)."
+  (let* ((n (length bytes))
+         (out (make-string n))
+         (i 0) (j 0))
+    (loop
+      (when (>= i n) (return nil))
+      (let* ((b0 (aref bytes i))
+             (k (cond ((< b0 #x80) 0)
+                      ((= (logand b0 #xE0) #xC0) 1)
+                      ((= (logand b0 #xF0) #xE0) 2)
+                      ((= (logand b0 #xF8) #xF0) 3)
+                      (t -1)))
+             (code b0))
+        (if (<= k 0)
+            (setq i (+ i 1))
+            (let ((c (cond ((= k 1) (logand b0 #x1F)) ((= k 2) (logand b0 #x0F))
+                           (t (logand b0 #x07))))
+                  (ok (<= (+ i k) (- n 1)))
+                  (m 1))
+              (loop
+                (when (or (not ok) (> m k)) (return nil))
+                (let ((b (aref bytes (+ i m))))
+                  (if (= (logand b #xC0) #x80)
+                      (setq c (logior (ash c 6) (logand b #x3F)))
+                      (setq ok nil)))
+                (setq m (+ m 1)))
+              (if (and ok (< c #x110000) (not (and (>= c #xD800) (<= c #xDFFF))))
+                  (progn (setq code c) (setq i (+ i k 1)))
+                  (setq i (+ i 1)))))
+        (%prim-aset out j code)
+        (setq j (+ j 1))))
+    (subseq out 0 j)))
+
 (defun %it-slurp-text (path)
   "Whole contents of PATH as a STRING.  The on-disk twin of the
    TAR-BYTES-TO-STRING call the archive path makes on a tar entry, so the
    directory-backed loader (ASDF:LOAD-SYSTEM) and the archive-backed loader
    (INSTALL-TARBALL) hand IDENTICAL text to %IT-EVAL-SOURCE."
-  (tar-bytes-to-string (%it-slurp-bytes path)))
+  (%it-utf8-bytes-to-string (%it-slurp-bytes path)))
 
 (defun %it-file-exists-p (path)
   "True when PATH can be opened for input.  OPEN-and-CLOSE rather than
@@ -141,7 +179,7 @@
 
 ;;; --- reading forms from an in-memory source string --------------------------
 
-(defun %it-read-asd-forms (source-string)
+(defun %it-read-asd-forms (source-string &optional path)
   "%IT-READ-FORMS for a SYSTEM DEFINITION, with the reader's lenient
    missing-package mode ON (*READER-MISSING-PACKAGE-LENIENT*, cl-reader.lisp:25).
 
@@ -177,9 +215,66 @@
     (unwind-protect
          (progn (setq *reader-missing-package-lenient* t)
                 (when asdf-user (setq *package* asdf-user))
-                (%it-read-forms source-string))
+                (%it-read-asd-forms-evaluating source-string path))
       (setq *reader-missing-package-lenient* saved)
       (setq *package* saved-package))))
+
+(defun %it-asd-form-evaluable-p (form)
+  "Whether a top-level .asd form is evaluated as it is read: the forms that set
+   up the READING of what follows -- packages, variables, features, helper
+   functions and macros -- and nothing that drives ASDF itself.  DEFSYSTEM
+   stays data (the caller registers it), and DEFMETHOD / DEFCLASS / operation
+   calls are skipped: this facade never runs PERFORM, and global-vars.asd's
+   `(defmethod perform ... (eql (find-system :global-vars)))' re-entered
+   FIND-SYSTEM for the very system being registered."
+  (and (consp form) (symbolp (car form))
+       (member (symbol-name (car form))
+               '("DEFPACKAGE" "IN-PACKAGE" "DEFVAR" "DEFPARAMETER" "DEFCONSTANT"
+                 "EVAL-WHEN" "PROGN" "DEFUN" "DEFMACRO" "PUSHNEW" "PUSH"
+                 "SETF" "SETQ" "WHEN" "UNLESS" "LET" "LET*")
+               :test #'string=)))
+
+(defun %it-read-asd-forms-evaluating (source-string &optional path)
+  "Read the forms of a .asd the way LOAD does -- READ one, EVALUATE it, read
+   the next -- and return them all.  A system definition is a program, not a
+   data file: quicklisp.asd DEFVARs ql-info:*version* and then reads
+   `#.ql-info:*version*' inside its defsystem, and a common idiom is
+   `(defpackage :foo-asd ...) (in-package :foo-asd)' ahead of the defsystem.
+   Read all-then-pick saw neither.  Which forms run: %IT-ASD-FORM-EVALUABLE-P.
+   They run with the lenient reader flag OFF,
+   so a load it triggers reads library source strictly.  A form that errors
+   is skipped: one DEFMETHOD on an ASDF class the facade lacks must not cost
+   the whole system definition.
+
+   PATH, when known, is bound as *LOAD-PATHNAME* and *LOAD-TRUENAME* for the
+   duration, as LOAD would: quicklisp.asd finds its version.txt by merging
+   against *LOAD-TRUENAME*."
+  (let ((s (make-string-input-stream source-string))
+        (eof (list 'eof))
+        (acc nil)
+        (saved-lp *load-pathname*)
+        (saved-lt *load-truename*))
+    (when path
+      (setq *load-pathname* (pathname path))
+      (setq *load-truename* (pathname path)))
+    (unwind-protect
+         (%it-read-asd-forms-loop s eof acc)
+      (setq *load-pathname* saved-lp)
+      (setq *load-truename* saved-lt))))
+
+(defun %it-read-asd-forms-loop (s eof acc)
+  (loop
+    (let ((form (read s nil eof)))
+      (when (eq form eof) (return))
+      (setq acc (cons form acc))
+      (when (%it-asd-form-evaluable-p form)
+        (let ((lenient *reader-missing-package-lenient*))
+          (unwind-protect
+               (progn (setq *reader-missing-package-lenient* nil)
+                      (handler-case (eval form)
+                        (serious-condition (c) nil)))
+            (setq *reader-missing-package-lenient* lenient))))))
+  (nreverse acc))
 
 (defun %it-read-forms (source-string)
   "Read every top-level form from SOURCE-STRING; return them in a list.
@@ -288,7 +383,20 @@
 (defstruct it-file
   path        ; module-prefixed base name, e.g. "alexandria-1/package"
   name        ; local base name, e.g. "package"
-  deps)       ; list of local dependency base names
+  deps        ; list of local dependency base names
+  abs-deps)   ; dependencies inherited from enclosing MODULES' :depends-on,
+              ; as keys already resolved in the module's parent scope
+
+;;; MODULES AS DEPENDENCY TARGETS.  A :depends-on may name a sibling MODULE, not
+;;; just a file -- quri's (:file "quri" :depends-on ("uri-classes" …)) -- and a
+;;; module may carry its own :depends-on, which ASDF applies to everything in it.
+;;; Both were ignored: the collector flattened modules to files and the sort only
+;;; resolved file names, so quri.lisp loaded BEFORE uri/*.lisp, its DEFPACKAGE
+;;; :USE silently dropped the four packages that did not exist yet, and every
+;;; (quri:uri "http://…") died calling NIL.  *IT-MODULES* maps a module's key
+;;; (its parent's path prefix + its NAME -- the same shape a sibling's dep name
+;;; resolves to) to the paths of every file inside it.
+(defvar *it-modules* nil)
 
 (defun %it-plist-get (plist key)
   "Fetch KEY from a component plist (the cddr of a component form)."
@@ -391,8 +499,26 @@
                   (pn (%it-plist-get plist :pathname))
                   (dir (if pn (%it-dir-prefix pn)
                            (concatenate 'string name "/")))
-                  (new-prefix (concatenate 'string prefix dir)))
-             (setq acc (%it-collect-components sub new-prefix acc))))
+                  (new-prefix (concatenate 'string prefix dir))
+                  (before (length acc)))
+             (setq acc (%it-collect-components sub new-prefix acc))
+             ;; The files this module contributed are the first (length acc) -
+             ;; BEFORE entries of the reversed accumulator.
+             (let ((mine nil) (cur acc) (k (- (length acc) before))
+                   (mdeps (mapcar (lambda (d) (concatenate 'string prefix
+                                                           (%it-string-designator d)))
+                                  (%it-plist-get plist :depends-on))))
+               (loop (when (<= k 0) (return nil))
+                 (setq mine (cons (car cur) mine))
+                 (when mdeps
+                   (setf (it-file-abs-deps (car cur))
+                         (append mdeps (it-file-abs-deps (car cur)))))
+                 (setq cur (cdr cur))
+                 (setq k (- k 1)))
+               (setq *it-modules*
+                     (cons (cons (concatenate 'string prefix name)
+                                 (mapcar #'it-file-path mine))
+                           *it-modules*)))))
           ;; :static-file and anything else: ignore.
           (t nil)))))
   acc)
@@ -424,6 +550,17 @@
    \"/\"), or \"\" for a top-level file."
   (let ((slash (%it-last-slash path)))
     (if slash (subseq path 0 (+ slash 1)) "")))
+
+(defun %it-dep-targets (files key)
+  "The files a dependency KEY (already prefixed) names: the file at that path,
+   else every file of the module with that key, else nothing."
+  (let ((f (%it-file-by-dep files "" key)))
+    (if f
+        (list f)
+        (let ((m (assoc key *it-modules* :test #'string=)) (acc nil))
+          (dolist (p (cdr m) (nreverse acc))
+            (let ((mf (%it-file-by-dep files "" p)))
+              (when mf (setq acc (cons mf acc)))))))))
 
 (defun %it-file-by-dep (files prefix name)
   "Resolve dependency NAME (module-local) to the it-file at PREFIX+NAME."
@@ -460,8 +597,11 @@
       (setq *it-visiting* (cons path *it-visiting*))
       (let ((prefix (%it-module-prefix path)))
         (dolist (dname (it-file-deps f))
-          (let ((df (%it-file-by-dep files prefix dname)))
-            (when df (%it-visit df files)))))
+          (dolist (df (%it-dep-targets files (concatenate 'string prefix dname)))
+            (%it-visit df files)))
+        (dolist (key (it-file-abs-deps f))
+          (dolist (df (%it-dep-targets files key))
+            (%it-visit df files))))
       (setq *it-visiting* (%it-remove-str path *it-visiting*))
       (setq *it-emitted* (cons f *it-emitted*))
       (setq *it-emitted-paths* (cons path *it-emitted-paths*)))))
@@ -474,6 +614,7 @@
    (ASDF:LOAD-SYSTEM, net/asdf-interface.lisp) walk components through exactly
    ONE implementation.  A second component walker is precisely the \"second
    system loader in the image\" this work exists to avoid."
+  (setq *it-modules* nil)
   (let* ((comps (%it-plist-get (cddr ds) :components))
          (files (nreverse (%it-collect-components comps "" nil)))
          (acc nil))
@@ -565,7 +706,7 @@
         (let* ((asd-path (car asd-entry))
                (asd-dir (let ((slash (%it-last-slash asd-path)))
                           (if slash (subseq asd-path 0 (+ slash 1)) "")))
-               (asd-src (tar-bytes-to-string (cdr asd-entry)))
+               (asd-src (%it-utf8-bytes-to-string (cdr asd-entry)))
                (asd-forms (%it-read-asd-forms asd-src))
                (ds (%it-find-defsystem asd-forms sysname)))
           (when (null ds)
@@ -592,7 +733,7 @@
                    (write-string-serial rel) (write-string-serial ")") (write-char-serial 10))
                   (t
                    (write-string-serial "    ") (write-string-serial rel) (write-char-serial 10)
-                   (%it-eval-source (tar-bytes-to-string (cdr ent)) p)))))
+                   (%it-eval-source (%it-utf8-bytes-to-string (cdr ent)) p)))))
             ;; 5. announce the system to whoever is keeping the registry.
             ;;    ASDF's LOAD-SYSTEM leaves the system REGISTERED and marked
             ;;    loaded, and mgl-pax's autoload stubs call ASDF:LOAD-SYSTEM

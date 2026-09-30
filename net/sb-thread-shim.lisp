@@ -215,18 +215,20 @@
               this image cannot start a thread.")
       (let* ((box (cons nil nil))
              (thread (make-instance 'sb-thread::thread :name name :box box))
-             (body (lambda ()
-                     ;; THE THREAD'S OWN *CURRENT-THREAD*.  A plain SETQ would
-                     ;; write the process-wide global; this is a DYNAMIC binding
-                     ;; around the body, which is what SBCL's is.
-                     (let ((sb-thread:*current-thread* thread))
-                       (setf (car box)
-                             (if arguments
-                                 (apply function arguments)
-                                 (funcall function)))
-                       (setf (cdr box) t))
-                     0))
+             ;; The body is a NAMED function (%SB-THREAD-BODY), not the
+             ;; closure's own code: this defun does not compile to native code
+             ;; (the JIT refuses it), so a closure written here would run
+             ;; INTERPRETED, and an error unwinding into interpreter frames on
+             ;; a worker crashed.  The closure only makes the call.
+             (body (lambda () (%sb-thread-body thread box function arguments)))
              (slot (%make-native-thread body)))
+        ;; A FULL TABLE MAY BE FULL OF THE DEAD.  SBCL does not require a
+        ;; thread to be joined, and bordeaux-threads' genera backend never
+        ;; joins natively (it waits for PROCESS-ACTIVE-P to go false), so
+        ;; every thread it started held its slot forever and the sixteenth
+        ;; MAKE-THREAD of a program failed.  Reclaim exited threads, retry once.
+        (when (and (= slot -1) (> (%sb-reap-exited-threads) 0))
+          (setq slot (%make-native-thread body)))
         (if (< slot 0)
             (error "sb-thread:make-thread: no thread could be started (code ~D). ~
                     -1 = all 15 thread slots are in use, -2 = the thread page ~
@@ -250,10 +252,164 @@
           ((%thread-joined thread) nil)
           (t (= (%native-thread-alive-p slot) 1)))))
 
-(defun %sb-forget-thread (thread)
-  (%mutex-lock (%sb-registry-lock))
-  (setq *sb-all-threads* (remove thread *sb-all-threads*))
-  (%mutex-unlock (%sb-registry-lock)))
+;;; A THREAD'S RESULT IS A MESSAGE.  Modus threads share no state: a worker's
+;;; objects live in its own region, which is reset when the slot is reused and
+;;; which no other collector scans.  So what JOIN-THREAD hands back must be a
+;;; COPY made outside that region -- in the immortal lock arena, allocated one
+;;; short locked section at a time (%RT-ENTER-SIZED gives a section room for
+;;; one large object).  Objects that are not the worker's own (symbols,
+;;; classes, anything made on main) are passed as they are: they are already
+;;; shared-safe.  What cannot be copied -- a closure, a circular or absurdly
+;;; deep structure -- comes back as a marker and JOIN-THREAD signals, in the
+;;; JOINING thread, instead of the worker's store being refused where nothing
+;;; can catch it (the shared-store guard, translate-x64).
+
+(defun %sb-worker-object-p (x)
+  "T when X is a heap object inside THIS thread's own region pair."
+  (let ((self (%tls-self-base)))
+    (if (zerop self)
+        nil
+        (let ((w (%gc-word-of x (+ self #x100050A0))))
+          (if (/= (logand w 5) 1)
+              nil
+              (let ((a (logand w -16))
+                    (ba (%gc-read64 (+ self #x10005040)))
+                    (bb (%gc-read64 (+ self #x10005048)))
+                    (sz (%gc-read64 (+ self #x10005050))))
+                (and (> sz 0)
+                     (or (and (>= a ba) (< a (+ ba sz)))
+                         (and (>= a bb) (< a (+ bb sz)))))))))))
+
+(defmacro %sb-locked ((bytes) &body body)
+  `(progn (%rt-enter-sized ,bytes)
+          (unwind-protect (progn ,@body) (%rt-leave))))
+
+(defun %sb-unpassable (why)
+  (throw '%sb-unpassable why))
+
+(defun %sb-copy (x depth)
+  (cond
+    ((not (%sb-worker-object-p x)) x)
+    ((> depth 4000) (%sb-unpassable "a structure nested more than 4000 deep (or circular)"))
+    ((hash-table-p x)
+     (let ((h (%sb-locked (256) (make-hash-table :test (hash-table-test x)))))
+       (maphash (lambda (k v)
+                  (let ((k2 (%sb-copy k (+ depth 1)))
+                        (v2 (%sb-copy v (+ depth 1))))
+                    (%sb-locked (256) (setf (gethash k2 h) v2))))
+                x)
+       h))
+    ((consp x)
+     ;; Iterative along the CDR, so a long list is not a deep recursion; a
+     ;; tortoise on the source detects a circular spine.
+     (let* ((head (%sb-locked (16) (cons nil nil)))
+            (tail head) (p x) (slow x) (n 0))
+       (loop
+         (let ((a (%sb-copy (car p) (+ depth 1))))
+           (setf (car tail) a))
+         (let ((d (cdr p)))
+           (if (consp d)
+               (let ((c (%sb-locked (16) (cons nil nil))))
+                 (setf (cdr tail) c)
+                 (setq tail c p d n (+ n 1))
+                 (when (evenp n) (setq slow (cdr slow)))
+                 (when (eq p slow) (%sb-unpassable "a circular list")))
+               (progn (setf (cdr tail) (%sb-copy d (+ depth 1)))
+                      (return head)))))))
+    ((stringp x)
+     (%sb-locked ((* 4 (length x))) (copy-seq x)))
+    ((numberp x)
+     ;; bignum / ratio / float / complex: fresh boxes, made in the arena.
+     (%sb-locked (256) (- (- x))))
+    ((functionp x) (%sb-unpassable "a function (a closure cannot be copied between threads)"))
+    ((= (obj-subtag x) 17)                  ; (unsigned-byte 8) vector
+     (let* ((n (length x))
+            (y (%sb-locked ((+ n 16)) (make-array n :element-type '(unsigned-byte 8)))))
+       (dotimes (i n) (setf (aref y i) (aref x i)))
+       y))
+    ((= (obj-subtag x) 50)                  ; general vector, struct, CLOS instance
+     (let* ((n (array-length x))
+            (y (%sb-locked ((* 8 (+ n 2))) (make-array n))))
+       (dotimes (i n) (setf (aref y i) (%sb-copy (aref x i) (+ depth 1))))
+       y))
+    (t (%sb-unpassable (format nil "an object of type ~S" (type-of x))))))
+
+(defun %sb-condition-text (e)
+  (let ((m (ignore-errors (princ-to-string e))))
+    (if (stringp m) m (let ((n (ignore-errors (symbol-name (type-of e))))) (if (stringp n) n "an error")))))
+
+(defun %sb-raw-report (msg)
+  "MSG to fd 2 with raw write(2) calls from this thread's scratch word."
+  (let ((w (+ (%tls-self-base) #x100050B0))
+        (pre "
+modus: unhandled error in a thread: "))
+    (dolist (str (list pre msg (string #\Newline)))
+      (dotimes (i (length str))
+        (%gc-write64 w (logand (char-code (char str i)) 255))
+        (syscall3 1 2 w 1)))))
+
+(defun %sb-publish-value (v)
+  "V as a message: a copy JOIN-THREAD can hand to another thread, or the
+   marker (:%SB-UNPASSABLE why) when it cannot be copied."
+  (let* ((done nil)
+         (c (catch '%sb-unpassable
+              (prog1 (%sb-copy v 0) (setq done t)))))
+    (if done
+        c
+        (%sb-locked (256) (list :%sb-unpassable (copy-seq c))))))
+
+(defun %sb-thread-body (thread box function arguments)
+  "What every thread MAKE-THREAD starts runs: bind *CURRENT-THREAD*, call
+   FUNCTION, and leave its result in BOX as a MESSAGE (%SB-PUBLISH-VALUE).  An
+   error nothing on the thread handles ends the THREAD, not the process: it is
+   reported on fd 2 (raw writes -- printing through a shared stream from here
+   would itself be a shared-state write) and JOIN-THREAD signals it in the
+   joiner."
+  (let ((sb-thread:*current-thread* thread))
+    (setf (car box)
+          (handler-case
+              (%sb-publish-value
+               (if arguments
+                   (apply function arguments)
+                   (funcall function)))
+            (serious-condition (e)
+              (let ((m (%sb-condition-text e)))
+                (%sb-raw-report m)
+                (%sb-locked (256)
+                  (list :%sb-thread-error (copy-seq m)))))))
+    (setf (cdr box) t))
+  0)
+
+(defun %sb-reap-exited-threads ()
+  "Free the slot of every thread this layer started that has EXITED without
+   being joined, and return how many.  The thread object keeps answering: it is
+   marked joined, so THREAD-ALIVE-P says NIL and JOIN-THREAD returns its value
+   from the box without looking at a slot that may now be someone else's."
+  (let ((n 0) (dead nil))
+    (%mutex-lock (%sb-registry-lock))
+    (dolist (th *sb-all-threads*)
+      (let ((slot (%thread-slot th)))
+        (when (and slot (not (%thread-joined th))
+                   (zerop (%native-thread-alive-p slot)))
+          (setq dead (cons th dead)))))
+    (dolist (th dead)
+      (setf (slot-value th 'joined) t)
+      (%join-native-thread (%thread-slot th) 1)
+      (setq *sb-all-threads* (remove th *sb-all-threads*))
+      (setq n (+ n 1)))
+    (%mutex-unlock (%sb-registry-lock))
+    n))
+
+(defun %sb-check-passable (value)
+  (when (and (consp value) (eq (car value) :%sb-thread-error))
+    (error "sb-thread:join-thread: the thread ended with an unhandled error: ~A"
+           (cadr value)))
+  (if (and (consp value) (eq (car value) :%sb-unpassable))
+      (error "sb-thread:join-thread: the thread returned ~A, which cannot be passed ~
+              between threads -- modus threads share no state; return data ~
+              (lists, strings, numbers, vectors, structs, hash tables)."
+             (cadr value))
+      value))
 
 (defun sb-thread::join-thread (thread &key (default :%sb-no-default) timeout)
   "Wait for THREAD and return what its function returned.
@@ -276,9 +432,14 @@
    the runtime lock on the way out, or a handshake that copies; neither is done
    here and pretending otherwise would be the worst of the three."
   (let ((slot (%thread-slot thread)))
-    (if (null slot)
+    (cond
+      ((null slot)
         (error 'simple-error :format-control
-               "sb-thread:join-thread: cannot join the main thread.")
+               "sb-thread:join-thread: cannot join the main thread."))
+      ;; Joined before, or reaped: the slot may belong to a newer thread now,
+      ;; so the answer is the box's and never the slot's.
+      ((%thread-joined thread) (%sb-check-passable (car (%thread-box thread))))
+      (t
         (let* ((deadline (if timeout
                              (+ (%monotonic-ns)
                                 (truncate (* timeout 1000000000) 1))
@@ -299,16 +460,22 @@
               (let ((box (%thread-box thread)))
                 ;; The value FIRST, the slot afterwards: releasing the slot is
                 ;; what makes the region reusable.
+                ;; Freed under the registry lock and only if not yet joined:
+                ;; %SB-REAP-EXITED-THREADS may have freed it already, and a
+                ;; second free would release a slot a newer thread now holds.
                 (let ((value (car box)))
-                  (setf (slot-value thread 'joined) t)
-                  (%join-native-thread slot 1000)
-                  (%sb-forget-thread thread)
-                  value))
+                  (%mutex-lock (%sb-registry-lock))
+                  (unless (%thread-joined thread)
+                    (setf (slot-value thread 'joined) t)
+                    (%join-native-thread slot 1000)
+                    (setq *sb-all-threads* (remove thread *sb-all-threads*)))
+                  (%mutex-unlock (%sb-registry-lock))
+                  (%sb-check-passable value)))
               (if (eq default :%sb-no-default)
                   (error 'simple-error :format-control
                          "sb-thread:join-thread: timed out.")
                   default
-))))))
+)))))))
 
 (defun sb-thread::terminate-thread (thread)
   "NOT IMPLEMENTED, deliberately.  Unwinding another thread means delivering a

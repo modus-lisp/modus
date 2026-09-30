@@ -73,7 +73,15 @@
 (defpackage "UIOP"
   (:use "COMMON-LISP")
   (:export "PARSE-VERSION" "VERSION<" "VERSION<=" "VERSION="
-           "SYMBOL-CALL" "FIND-SYMBOL*"))
+           "SYMBOL-CALL" "FIND-SYMBOL*"
+           ;; section 2b: the portability surface real programs call
+           "GETENV" "GETENVP" "GETCWD" "CHDIR" "TEMPORARY-DIRECTORY"
+           "TMPIZE-PATHNAME" "READ-FILE-STRING" "READ-FILE-LINES"
+           "SPLIT-STRING" "STRING-PREFIX-P" "STRING-SUFFIX-P" "EMPTYP"
+           "FIRST-CHAR" "LAST-CHAR" "NATIVE-NAMESTRING" "PARSE-NATIVE-NAMESTRING"
+           "MERGE-PATHNAMES*" "ENSURE-DIRECTORY-PATHNAME"
+           "RUN-PROGRAM" "LAUNCH-PROGRAM" "WAIT-PROCESS" "TERMINATE-PROCESS"
+           "PROCESS-ALIVE-P" "DELETE-DIRECTORY-TREE"))
 
 (defpackage "ASDF"
   (:use "COMMON-LISP" "UIOP")
@@ -128,6 +136,138 @@
    use an ASDF that is already present; without it the check fails and setup
    tries to load an ASDF of its own."
   (and (stringp version) (stringp required) (uiop::version<= required version)))
+
+;;; =====================================================================
+;;; 2b.  UIOP's portability surface -- the part programs actually call
+;;;
+;;; Measured over operandi's 27-system closure: getenv, read-file-string,
+;;; split-string, string-prefix-p, getcwd, chdir, temporary-directory,
+;;; tmpize-pathname, native-namestring, emptyp, first-/last-char ... and
+;;; run-program.  The same honesty rule as the rest of this file: each one
+;;; does the real thing or SIGNALS.  getcwd/chdir are syscalls in the hosted
+;;; floor (net/hosted-sockets-post.lisp), looked up when called.
+;;;
+;;; RUN-PROGRAM AND FRIENDS SIGNAL.  Modus has no fork and no exec, by design
+;;; (see SB-EXT:RUN-PROGRAM in net/sb-sys-shim.lisp); whether a hosted image
+;;; should grow a process spawner is a decision, not a gap to paper over.
+;;; =====================================================================
+
+(defun uiop::getenv (name)
+  "The value of environment variable NAME, or NIL."
+  (%cli-getenv (asdf::%string-of name)))
+
+(defun uiop::getenvp (name)
+  (let ((v (uiop::getenv name))) (and v (plusp (length v)))))
+
+(defun uiop::ensure-directory-pathname (x)
+  "X as a directory pathname (a namestring gains its trailing slash)."
+  (let ((s (if (stringp x) x (namestring x))))
+    (pathname (if (and (plusp (length s)) (char= (char s (- (length s) 1)) #\/))
+                  s
+                  (concatenate 'string s "/")))))
+
+(defun uiop::getcwd ()
+  "The process's current directory, as a directory pathname."
+  ;; %SBS-GETCWD is AOT code in the hosted floor, reached by NAME (it is not a
+  ;; symbol in any package, so FIND-SYMBOL cannot see it); an image without
+  ;; the floor answers UNDEFINED-FUNCTION, turned into a plain statement here.
+  (let ((s (handler-case (%sbs-getcwd) (undefined-function (c) c nil))))
+    (if s
+        (uiop::ensure-directory-pathname s)
+        (error "UIOP:GETCWD: this image cannot ask the OS for its directory"))))
+
+(defun uiop::chdir (x)
+  "Change the process's current directory to X."
+  (let ((r (handler-case (%sbs-chdir (if (stringp x) x (namestring x)))
+             (undefined-function (c) c
+               (error "UIOP:CHDIR: this image cannot change the OS directory")))))
+    (if (< r 0)
+        (error "UIOP:CHDIR: cannot change to ~A (errno ~D)" x (- 0 r))
+        t)))
+
+(defun uiop::temporary-directory ()
+  "$TMPDIR as a directory pathname, else /tmp/."
+  (let ((d (uiop::getenv "TMPDIR")))
+    (uiop::ensure-directory-pathname (if (and d (plusp (length d))) d "/tmp/"))))
+
+(defun uiop::tmpize-pathname (x)
+  "A sibling of X whose name is unique enough for a temporary file."
+  (let ((p (pathname x)))
+    (make-pathname :name (format nil "~A-tmp~36R~36R" (or (pathname-name p) "tmp")
+                                 (random 1000000000) (get-universal-time))
+                   :defaults p)))
+
+(defun uiop::read-file-string (file &rest keys)
+  "The contents of FILE as a string.  KEYS (:external-format …) are accepted;
+   Modus's file streams have one external format."
+  (declare (ignore keys))
+  (with-open-file (in file)
+    (let ((out (make-string-output-stream)))
+      (loop (let ((c (read-char in nil nil)))
+              (if c (write-char c out) (return nil))))
+      (get-output-stream-string out))))
+
+(defun uiop::read-file-lines (file &rest keys)
+  (declare (ignore keys))
+  (with-open-file (in file)
+    (let ((acc nil))
+      (loop (let ((l (read-line in nil nil)))
+              (if l (setq acc (cons l acc)) (return (nreverse acc))))))))
+
+(defun uiop::split-string (string &key max (separator '(#\Space #\Tab)))
+  "UIOP's: split STRING at any character in SEPARATOR (a sequence of
+   characters, or one character).  Empty pieces are kept.  With MAX, at most
+   MAX pieces, split from the END, the FIRST piece keeping the rest -- UIOP's
+   documented behaviour, not the one people guess."
+  (let ((seps (if (characterp separator) (list separator) (coerce separator 'list)))
+        (end (length string))
+        (acc nil)
+        (count 1))
+    (let ((i (- end 1)))
+      (loop
+        (when (< i 0) (return nil))
+        (when (and max (>= count max)) (return nil))
+        (when (member (char string i) seps)
+          (setq acc (cons (subseq string (+ i 1) end) acc))
+          (setq end i)
+          (setq count (+ count 1)))
+        (setq i (- i 1))))
+    (cons (subseq string 0 end) acc)))
+
+(defun uiop::string-prefix-p (prefix string)
+  (let ((p (string prefix)) (s (string string)))
+    (and (<= (length p) (length s)) (string= p s :end2 (length p)))))
+
+(defun uiop::string-suffix-p (string suffix)
+  (let ((s (string string)) (x (string suffix)))
+    (and (<= (length x) (length s)) (string= x s :start2 (- (length s) (length x))))))
+
+(defun uiop::emptyp (x)
+  (or (null x) (and (typep x 'sequence) (zerop (length x)))))
+
+(defun uiop::first-char (s) (and (stringp s) (plusp (length s)) (char s 0)))
+(defun uiop::last-char (s) (and (stringp s) (plusp (length s)) (char s (- (length s) 1))))
+
+(defun uiop::native-namestring (x) (and x (namestring x)))
+(defun uiop::parse-native-namestring (s &rest keys)
+  (declare (ignore keys))
+  (and s (pathname s)))
+(defun uiop::merge-pathnames* (specified &optional (defaults *default-pathname-defaults*))
+  (merge-pathnames specified defaults))
+
+(defun %uiop-no-processes (name)
+  (error "UIOP:~A: Modus has no processes to run (no fork, no exec)." name))
+(defun uiop::run-program (command &rest keys)
+  (declare (ignore command keys)) (%uiop-no-processes "RUN-PROGRAM"))
+(defun uiop::launch-program (command &rest keys)
+  (declare (ignore command keys)) (%uiop-no-processes "LAUNCH-PROGRAM"))
+(defun uiop::wait-process (p) (declare (ignore p)) (%uiop-no-processes "WAIT-PROCESS"))
+(defun uiop::terminate-process (p &rest keys)
+  (declare (ignore p keys)) (%uiop-no-processes "TERMINATE-PROCESS"))
+(defun uiop::process-alive-p (p) (declare (ignore p)) nil)
+(defun uiop::delete-directory-tree (dir &rest keys)
+  (declare (ignore keys))
+  (error "UIOP:DELETE-DIRECTORY-TREE is not implemented on Modus (~A)" dir))
 
 (defun asdf::%string-of (x)
   "A string designator (string / symbol / character) as a STRING.  Written
@@ -194,7 +334,7 @@
 
 (defclass asdf::system (asdf::module)
   ((name        :initarg :name        :reader asdf::component-name)
-   (source-file :initarg :source-file :reader asdf::system-source-file)
+   (source-file :initarg :source-file :reader asdf::%system-source-file)
    (form        :initarg :form        :reader asdf::%system-form)
    (state       :initarg :state       :reader asdf::%system-state)))
 
@@ -375,7 +515,7 @@
 (defun asdf::%register-from-asd (name path)
   "Read the .asd at PATH, find NAME's DEFSYSTEM in it, register it as NOT
    loaded, and return the SYSTEM."
-  (let* ((forms (%it-read-asd-forms (%it-slurp-text path)))
+  (let* ((forms (%it-read-asd-forms (%it-slurp-text path) path))
          (ds (%it-find-defsystem forms (asdf::coerce-name name))))
     (when (null ds)
       (error 'asdf::missing-component :requires (asdf::coerce-name name)))
@@ -501,6 +641,17 @@
         (when n (setq acc (cons n acc)))))
     (nreverse acc)))
 
+(defun asdf::%as-system (x)
+  "X if it is a SYSTEM, else the system it names (FIND-SYSTEM, which signals)."
+  (if (typep x 'asdf::system) x (asdf::find-system x)))
+
+(defun asdf::system-source-file (sys)
+  "ASDF:SYSTEM-SOURCE-FILE -- the .asd a system was read from.  SYS may be a
+   system or its NAME, as in ASDF: quri's etld.lisp asks by keyword at READ
+   time (#.), and a reader-only accessor answered NO-APPLICABLE-METHOD and
+   discarded the rest of the file."
+  (asdf::%system-source-file (asdf::%as-system sys)))
+
 (defun asdf::system-source-directory (sys)
   "ASDF:SYSTEM-SOURCE-DIRECTORY — the directory of SYS's .asd, with a
    trailing \"/\".  NIL for an archive install, which has no on-disk .asd."
@@ -514,7 +665,10 @@
     (when (null d)
       (error "ASDF:SYSTEM-RELATIVE-PATHNAME: system ~A has no source directory (it was installed from an archive)."
              (asdf::component-name sys)))
-    (concatenate 'string d (if (stringp name) name (princ-to-string name)))))
+    ;; A pathname NAME is common (#p"data/x.dat") and must go through NAMESTRING.
+    (pathname (concatenate 'string d (cond ((stringp name) name)
+                                           ((pathnamep name) (namestring name))
+                                           (t (princ-to-string name)))))))
 
 (defun asdf::%load-system-files (sys)
   "Load SYS's components, in dependency order, from its source directory."
@@ -541,6 +695,72 @@
     (dolist (x list) (unless (string= x n) (setq acc (cons x acc))))
     (nreverse acc)))
 
+(defun asdf::%fset-in (pkg name fn)
+  "Install FN as PKG::NAME's function, if that symbol exists."
+  (let ((s (and (find-package pkg) (find-symbol name pkg))))
+    (when s (setf (fdefinition s) fn))
+    s))
+
+(defun asdf::%quirk-float-features ()
+  "float-features has a branch per implementation and none for modus, so its
+   float<->bits functions signal \"Implementation not supported.\" -- and jzon
+   prints and reads every JSON number through them.  modus stores a double as
+   hi/lo 32-bit halves (%FLOAT-HI32 / %FLOAT-LO32, %MAKE-TYPED-FLOAT) and has
+   IEEE32 conversions (%SINGLE->BITS / %BITS->SINGLE).  They are redefined by
+   EVALUATING DEFUNs, not by setting function cells: float-features DECLAIMs
+   them INLINE, so callers expand the stored source, which only a new DEFUN
+   replaces."
+  (let ((p (find-package "ORG.SHIRAKUMO.FLOAT-FEATURES")))
+    (when p
+      (flet ((def (name lambda-list body)
+               (let ((s (find-symbol name p)))
+                 (when s (eval (list 'defun s lambda-list body))))))
+        (def "DOUBLE-FLOAT-BITS" '(f)
+          '(let ((d (float f 1d0)))
+             (logior (ash (logand (%float-hi32 d) 4294967295) 32)
+                     (logand (%float-lo32 d) 4294967295))))
+        (def "LONG-FLOAT-BITS" '(f)
+          '(let ((d (float f 1d0)))
+             (logior (ash (logand (%float-hi32 d) 4294967295) 32)
+                     (logand (%float-lo32 d) 4294967295))))
+        (def "BITS-DOUBLE-FLOAT" '(bits)
+          '(%make-typed-float (ash bits -32) (logand bits 4294967295) 'double-float))
+        (def "BITS-LONG-FLOAT" '(bits)
+          '(%make-typed-float (ash bits -32) (logand bits 4294967295) 'double-float))
+        (def "SINGLE-FLOAT-BITS" '(f) '(%single->bits f))
+        (def "BITS-SINGLE-FLOAT" '(b) '(%bits->single b)))
+      (let ((s (find-symbol "WITH-FLOAT-TRAPS-MASKED" p)))
+        (when s
+          (eval (list 'defmacro s '(traps &body body)
+                      '(declare (ignore traps))
+                      '(cons 'progn body))))))))
+
+(defvar asdf::*system-quirks*
+  '(("float-features" . asdf::%quirk-float-features))
+  "System name -> a function run right after that system loads: the fix-ups
+   for libraries that have a branch per implementation and none for modus.")
+
+(defun asdf::%apply-system-quirks (name)
+  (let ((q (assoc name asdf::*system-quirks* :test #'string-equal)))
+    (when q (handler-case (funcall (cdr q)) (serious-condition (c) nil)))))
+
+(defun asdf::%jit-loaded-system ()
+  "Translate what the system just loaded to native code.  Loaded source is
+   installed as INTERPRETER TRAMPOLINES and nothing made it native until a
+   program happened to start a thread (%MAKE-NATIVE-THREAD runs JIT-EAGER):
+   natrium's X25519 took 11 s interpreted and 0.4 s native, SHA-256 100x, and
+   TLS could not finish a ClientHello before the server hung up.  After each
+   system rather than once at the end, so a later system's load-time calls
+   into an earlier one run native too.  JIT-EAGER translates only what is new.
+   MODUS_NO_LOAD_JIT=1 turns it off; a JIT failure never fails the load."
+  ;; RAISED, not run: the outermost LOAD runs it between two toplevel forms
+  ;; (mvm/ansi-bridge.lisp, DEFERRED JIT) -- running it here replaced the
+  ;; still-executing Quicklisp functions under their own frames.
+  (let ((off (%cli-getenv "MODUS_NO_LOAD_JIT")))
+    (unless (and off (> (length off) 0) (not (string= off "0")))
+      (setq *%jit-pending* t)))
+  nil)
+
 (defun asdf::load-system (name &rest keys)
   "ASDF:LOAD-SYSTEM — load NAME and everything it depends on, and return T.
 
@@ -553,6 +773,9 @@
    KEYS (:force, :verbose, …) are accepted for signature compatibility and
    ignored; see KNOWN DEGENERACIES."
   (declare (ignore keys))
+  ;; Gray streams are installed on first use (net/sb-gray-shim.lisp): a
+  ;; library that subclasses FUNDAMENTAL-* arrives through here.
+  (when (fboundp '%ensure-gray-streams) (%ensure-gray-streams))
   (let* ((sys (asdf::find-system name t))
          (n (asdf::component-name sys)))
     (cond
@@ -568,7 +791,9 @@
             (progn
               (dolist (d (asdf::%dep-names sys)) (asdf::load-system d))
               (asdf::%load-system-files sys)
-              (asdf::%set-loaded sys t))
+              (asdf::%set-loaded sys t)
+              (asdf::%apply-system-quirks n)
+              (asdf::%jit-loaded-system))
          (setq asdf::*systems-loading*
                (asdf::%remove-name n asdf::*systems-loading*)))
        t))))

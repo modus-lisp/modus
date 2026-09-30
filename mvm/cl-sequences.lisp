@@ -1960,6 +1960,33 @@
             (when (= i size) (return arr))
             (aset arr i (aref contents i))
             (setq i (+ i 1)))))))
+;;; (UNSIGNED-BYTE 8) RESULT TYPES.  MAKE-ARRAY :ELEMENT-TYPE '(UNSIGNED-BYTE 8)
+;;; makes a PACKED byte vector (subtag #x11), but COERCE, MAP, CONCATENATE and
+;;; MAKE-SEQUENCE to the same type made a GENERAL vector (element type T).  Code
+;;; that declares (simple-array (unsigned-byte 8) (*)) and compiles at
+;;; (safety 0) reads the packed layout -- seal's GHASH table read tagged words
+;;; as bytes and every AES-GCM tag came out wrong (TLS 1.3 could not decrypt a
+;;; single handshake record).  These make the four agree with MAKE-ARRAY.
+(defun %seq-type-u8-p (type)
+  "True when TYPE is an array/vector type specifier whose element type is
+   (UNSIGNED-BYTE 8)."
+  (and (consp type) (symbolp (car type))
+       (member (symbol-name (car type)) '("SIMPLE-ARRAY" "ARRAY" "VECTOR") :test #'string=)
+       (consp (cdr type))
+       (let ((et (cadr type)))
+         (and (consp et) (symbolp (car et))
+              (string= (symbol-name (car et)) "UNSIGNED-BYTE")
+              (consp (cdr et)) (eql (cadr et) 8)))))
+
+(defun %seq-u8-copy (seq)
+  "A fresh packed (unsigned-byte 8) vector holding SEQ's elements."
+  (let* ((n (length seq))
+         (v (make-array n :element-type '(unsigned-byte 8))))
+    (if (listp seq)
+        (let ((i 0)) (dolist (e seq) (setf (aref v i) e) (setq i (+ i 1))))
+        (dotimes (i n) (setf (aref v i) (aref seq i))))
+    v))
+
 (defun make-sequence (type size &rest args)
   "Make a sequence of TYPE and SIZE.  Supports :initial-element.
    Accepts compound type forms like (VECTOR), (VECTOR *), (VECTOR T 5)
@@ -1969,6 +1996,10 @@
    pins a length (e.g. (VECTOR T 4)) and SIZE disagrees, the call
    must signal type-error.  Unrecognised non-sequence type names
    (SYMBOL, INTEGER, ...) likewise signal type-error."
+  (when (%seq-type-u8-p type)
+    (return-from make-sequence
+      (make-array size :element-type '(unsigned-byte 8)
+                       :initial-element (let ((p (member :initial-element args))) (if p (cadr p) 0)))))
   ;; Resolve a class designator (class object or class-proxy) to its name
   ;; so the dispatch below can match symbols uniformly.  Keeps callers
   ;; using `(find-class 'list)' / `(class-of '(a b c))' working.
@@ -2125,6 +2156,7 @@
   "Convert OBJ to TYPE per CLHS 4.7.  Handles list/vector/string/
    character/symbol/bit-vector and their compound forms like
    (vector *) / (vector * 2) / (simple-string)."
+  (when (%seq-type-u8-p type) (return-from coerce (%seq-u8-copy obj)))
   (let ((head (%coerce-canon-head (if (consp type) (car type) type))))
     (cond
       ((or (eq type t) (eq type 'common-lisp:t)) obj)
@@ -2451,6 +2483,8 @@
    non-sequence designator (FIXNUM, SYMBOL, etc.), when a
    pinned-length compound spec doesn't match the produced length, or
    when any input is not a sequence."
+  (when (%seq-type-u8-p result-type)
+    (return-from concatenate (%seq-u8-copy (apply (function concatenate) 'vector seqs))))
   (%concat-check-seqs seqs)
   ;; Reject known non-sequence head types + check pinned-length match.
   (let* ((head (if (consp result-type) (car result-type) result-type)))

@@ -69,9 +69,8 @@
 ;;;           +0x08 total wakes issued   +0x10 STOP flag for every scheduler
 ;;;           +0x18 legacy AP-SCHEDULER returns (the pre-blocking behaviour)
 ;;;   +0x1000 free scratch for tests (mutex words, condvars, counters)
-;;;   +0x2000 PER-THREAD WINDOW BLOCKS, 4 KB per CPU, 16 CPUs (+0x2000 +
-;;;           0x1000*cpu, ending at +0x12000).  See THE PER-THREAD WINDOW
-;;;           below.
+;;;   +0x2000 formerly the PER-THREAD WINDOW BLOCKS (4 KB per CPU, which was
+;;;           too small -- see %THR-TLS-BLOCK); now unused.
 ;;;   +0x12000 the MV/handler-case two-thread selftest's control block, 4 KB.
 ;;;   +0x13000 THE THREAD TABLE, 4 KB — one record per thread, plus the
 ;;;            spawn handshake words.  See MANY THREADS, FROM CLOSURES.
@@ -80,9 +79,13 @@
 ;;;   +0x54000 DYNAMIC-BINDING STACKS, 16 KB per CPU, 16 CPUs (ending at
 ;;;            +0x94000): 1024 [key][value] entries a thread, pointed to by
 ;;;            its window block's +0xC60.  See THE EXTENSION in mvm/prelude.lisp.
+;;;   +0x94000 PER-THREAD WINDOW BLOCKS, 32 KB per CPU, 16 CPUs (ending at
+;;;            +0x114000): the window proper at +0x000, the handler-frame stack
+;;;            at +0x1000..+0x4FFF.  See THE PER-THREAD WINDOW below.
 ;;;
-;;; The mapping is 336 KB rather than 8 KB for those additions; NOTHING at a
-;;; lower offset moved, so every earlier user reads the same bytes.
+;;; The mapping is 1104 KB for those additions (anonymous pages, committed only
+;;; as touched); only the window blocks moved, and every user reaches them
+;;; through %THR-TLS-BLOCK.
 ;;;
 ;;; The two BSS words are 0x10000DA8 and 0x10000DB0 — the first two free words
 ;;; above the safepoint-boundary slot at 0x10000DA0 and below the MCGC config
@@ -105,9 +108,9 @@
             (if (> q 0)
                 (progn (spin-unlock (%thr-page-lock)) q)
                 ;; Both append sixteen window blocks at 0x94000 (see
-                ;; %THR-TLS-BLOCK): 0x11000 bytes each on AArch64, 0x5000 on
-                ;; x86-64.
-                (let ((m (%mmap-shared-page (%layout-if :a64-threads 1720320 933888))))
+                ;; %THR-TLS-BLOCK): 0x11000 bytes each on AArch64, 0x8000 on
+                ;; x86-64 (the frames to +0x4FFF plus the shared-store guard word at +0x5058).
+                (let ((m (%mmap-shared-page (%layout-if :a64-threads 1720320 1130496))))
                   ;; A failed mmap comes back as a small negative (-errno).
                   (if (< m 4096)
                       (progn (spin-unlock (%thr-page-lock)) 0)
@@ -167,7 +170,7 @@
      (translate-aarch64.lisp, THE PER-THREAD WINDOW, AARCH64) — 0x11000 bytes.
    - x86-64 Linux: the handler-frame stack is 512 frames at +0x1000..+0x5000
      (translate-x64's handler helpers; the 64 in-window frames at +0x408 are
-     bare metal's) — 0x5000 bytes.  These blocks used to be 4 KB apart, so a
+     bare metal's) plus operandi's shared-store guard word at +0x5058 — 0x8000 bytes.  These blocks used to be 4 KB apart, so a
      worker's handler frames landed in the NEXT worker's block, on its
      multiple-value slots (+0x90) and nargs (+0x150) — measured: every
      interpreted capturing closure called from two workers at once went wrong
@@ -179,7 +182,7 @@
         0
         (%layout-if :a64-threads
           (+ p (+ #x94000 (* cpu #x11000)))
-          (+ p (+ #x94000 (* cpu #x5000)))))))
+          (+ p (+ #x94000 (* cpu #x8000)))))))
 
 ;;; ============================================================
 ;;; THE PER-THREAD WINDOW, INSTALLED
@@ -272,6 +275,45 @@
                 (%tls-set-self-base delta)
                 0)
               r)))))
+
+(defun %tls-prepare-block (cpu)
+  "Make CPU's window block a clean start for the thread about to be cloned into
+   it, FROM THE SPAWNER, before the clone: the block is reused when a slot is,
+   and the child is born with its FS base already pointing here (CLONE_SETTLS,
+   translate-x64 +STW-CLONE-TLS-ADDR+), so every word it can read before its
+   own %TLS-INSTALL must already be right -- the dynamic-binding stack empty,
+   no handler frames or armed frame left by the previous occupant, the
+   stop-the-world STATE running and no stale published RSP, and the self slot
+   holding its own segment base.  Returns that base, or 0 if there is no block."
+  (let ((b (%thr-tls-block cpu)))
+    (if (or (zerop b) (< b #x10000000))
+        0
+        (let ((delta (- b #x10000000)))
+          (setf (mem-ref (+ b #xC50) :u64) 0)
+          (setf (mem-ref (+ b #xC58) :u64) 0)
+          (setf (mem-ref (+ b #xC60) :u64) (%thr-dynb-stack cpu))
+          (%gc-write64 (+ b #x180) 0)
+          (%gc-write64 (+ b #x188) 0)
+          (%gc-write64 (+ b #x190) 0)
+          (%gc-write64 (+ b #x198) 0)
+          (%gc-write64 (+ b #x400) 0)
+          (%gc-write64 (+ b #x5000) 0)
+          (%gc-write64 (+ b #x5008) 0)
+          ;; THE SHARED-STORE GUARD'S WORDS (translate-x64, SHARED-STORE
+          ;; GUARD): this thread's region pair and size, so a store of one of
+          ;; its objects into memory outside that pair traps instead of
+          ;; leaving a pointer no collector will keep.  Size 0 = no region of
+          ;; its own = nothing to guard.
+          (if (and (< cpu (%ha-nregions)) (not (zerop (%thr-threads-can-cons-p))))
+              (progn (%gc-write64 (+ b #x5040) (%ha-region-from cpu))
+                     (%gc-write64 (+ b #x5048) (%ha-region-to cpu))
+                     (%gc-write64 (+ b #x5050) *ha-rsize*))
+              (progn (%gc-write64 (+ b #x5040) 0)
+                     (%gc-write64 (+ b #x5048) 0)
+                     (%gc-write64 (+ b #x5050) 0)))
+          (%gc-write64 (+ b #x5058) 0)
+          (%gc-write64 (+ b #xC30) delta)
+          delta))))
 
 (defun %tls-installed-p ()
   "1 when this thread has its own window, 0 when it is still using the
@@ -1380,6 +1422,26 @@
 (defun %rt-arena-fallbacks ()
   (if (zerop (%ha-base)) 0 (%gc-read64 (+ (%rt-arena-words) #x18))))
 
+(defun %rt-slice-need ()
+  "Headroom the next locked section needs in its slice: 64 KB, or the size a
+   caller announced in this thread's window word +0x50A8 (%RT-ENTER-SIZED)
+   for one large allocation.  Allocation inside a locked section must never
+   run past the slice -- the collector would then collect the slice block,
+   which is meaningless and corrupts."
+  (let ((self (%tls-self-base)))
+    (if (zerop self)
+        #x10000
+        (let ((n (%gc-read64 (+ self #x100050A8))))
+          (if (> n #x10000) n #x10000)))))
+
+(defun %rt-enter-sized (bytes)
+  "%RT-ENTER, with room for one allocation of BYTES in the locked section."
+  (let ((self (%tls-self-base)))
+    (unless (zerop self) (%gc-write64 (+ self #x100050A8) (+ bytes 64))))
+  (%rt-enter)
+  (let ((self (%tls-self-base)))
+    (unless (zerop self) (%gc-write64 (+ self #x100050A8) 0))))
+
 (defun %rt-slice-ensure ()
   "This CPU's slice block with at least 64 KB of headroom, refilled from the
    arena if not — the caller holds the runtime mutex, which is what makes the
@@ -1392,10 +1454,13 @@
                (blk (%rt-slice-block (%thr-cpu)))
                (alloc (%gc-meta-read (+ blk #x30) k))
                (limit (%gc-meta-read (+ blk #x38) k)))
-          (if (>= (- limit alloc) #x10000)
+          (if (>= (- limit alloc) (%rt-slice-need))
               blk
-              (let ((af (%rt-arena-alloc)))
-                (if (> (+ af #x100000) ae)
+              (let* ((af (%rt-arena-alloc))
+                     (chunk (if (> (+ (%rt-slice-need) #x10000) #x100000)
+                                (logand (+ (%rt-slice-need) #x10000 #xFFFF) (- 0 #x10000))
+                                #x100000)))
+                (if (> (+ af chunk) ae)
                     (progn
                       (%gc-write64 (+ (%rt-arena-words) #x18)
                                    (+ (%rt-arena-fallbacks) 1))
@@ -1404,8 +1469,8 @@
                       ;; A slice IS a region block as far as %GC-REGION-ENTER
                       ;; is concerned: init writes +0x30 = AF, +0x38 = AF+1MB.
                       ;; It is never collected, so from/to/stack are inert.
-                      (%gc-region-init blk af af #x100000 0 k)
-                      (%gc-write64 (+ (%rt-arena-words) #x08) (+ af #x100000))
+                      (%gc-region-init blk af af chunk 0 k)
+                      (%gc-write64 (+ (%rt-arena-words) #x08) (+ af chunk))
                       blk))))))))
 
 (defun %gc-collect-region-0 ()
@@ -1516,7 +1581,46 @@
                     (%gc-write64 (+ (%rt-arena-words) #x08) base)
                     (%gc-write64 (+ (%rt-arena-words) #x10) (+ from size))
                     (%gc-write64 (+ (%rt-arena-words) #x18) 0)
+                    ;; Tell region 0's collector where the arena is: it scans
+                    ;; [base, frontier) as roots (translate-x64,
+                    ;; EMIT-LOCK-ARENA-ROOT-SCAN).  Raw address, last, so the
+                    ;; collector never sees a half-initialised arena.
+                    (%gc-write64 #x10000D98 (%rt-arena-words))
                     1)))))))
+
+(defun %fatal-stop (msg)
+  "Write MSG to fd 2 and end the process (exit_group, status 134).  For states
+   where continuing would be a deadlock or a corrupt heap.  Allocates nothing
+   and takes no lock -- it is called exactly when the lock cannot be had --
+   so each byte goes out through a raw write(2) from a scratch word."
+  (let ((w (%thr-scratch-word)))
+    (dotimes (i (length msg))
+      (%gc-write64 w (char-code (char msg i)))
+      (syscall3 1 2 w 1))
+    (sys-exit 134)))
+
+(defun %rt-mutex-lock-bounded ()
+  "Take the runtime mutex like %MUTEX-LOCK, but give up after 60 s.  Locked
+   sections are microseconds long, so a minute of waiting means the lock was
+   LEAKED -- its owner faulted, unwound through an error, or exited inside a
+   section -- and every thread that needs the runtime would wait forever.  A
+   deadlock is a correctness failure; stop loudly instead."
+  (let ((addr (%rt-mutex-addr)))
+    (if (zerop (xchg-mem addr 1))
+        0
+        (let ((ts (%futex-timeout-ts)) (n 0))
+          (loop
+            (if (zerop (xchg-mem addr 2))
+                (return 0)
+                (if (= (%futex-wait-to addr 2 ts) -110)
+                    (progn
+                      (%futex-timeout-bump)
+                      (setq n (+ n 1))
+                      (when (> n 3000)            ; 3000 x 20 ms
+                        (%fatal-stop "
+modus: waited 60 s for the runtime lock; its owner leaked it (faulted, unwound or exited inside a locked section). Stopping instead of deadlocking.
+")))
+                    0)))))))
 
 (defun %rt-enter-locked ()
   (let ((me (+ (%thr-cpu) 1)))
@@ -1536,7 +1640,7 @@
           ;; The lock arena running low: refill it BEFORE taking the lock —
           ;; a collection cannot evacuate it while anyone holds the lock.
           (%layout-if :stw (%rt-arena-refill-check) 0)
-          (%mutex-lock (%rt-mutex-addr))
+          (%rt-mutex-lock-bounded)   ; a leaked lock stops the process instead of hanging it (operandi)
           (%gc-write64 (%conv-addr #x10000DE0) (+ (%gc-read64 (%conv-addr #x10000DE0)) 1))
           (%gc-write64 (%rt-owner-addr) me)
           (%gc-write64 (%rt-depth-addr) 1)
@@ -1551,6 +1655,14 @@
           ;; it parks the SLICE block, which is what persists the slice
           ;; frontier for this CPU's next acquisition.
           (let ((blk (%rt-slice-ensure)))
+            ;; A WORKER WITH NO SLICE would take region 0's parked frontier
+            ;; while main allocates from its live one: two mutators, one
+            ;; frontier, silent corruption.  That is the pre-arena path and it
+            ;; is only sound for the main thread.  Stop instead.
+            (when (and (zerop blk) (> (%thr-cpu) 0))
+              (%fatal-stop "
+modus: a thread needed the runtime lock but the lock arena is exhausted or missing; continuing would corrupt the heap. Stopping.
+"))
             (%gc-write64 (%rt-saved-addr)
                          (%gc-region-enter (if (zerop blk) (%gc-region-0) blk))))
           0))))
@@ -2590,7 +2702,26 @@
               (*e2-persist-defuns* nil)
               (*e2-module-defuns* nil)
               (*mvm-eval-no-cache* nil)
-              (*jit-inhibit* nil))
+              (*jit-inhibit* nil)
+              ;; operandi's additions: the interpreter's NLX serial, the
+              ;; restart/format/printer/loader scratch and the CLOS dispatch
+              ;; state -- each starts EMPTY, never as a copy of the spawner's.
+              (*nlx-state-serial* (* slot 1099511627776))
+              (*restarts-being-invoked* nil)
+              (*rc-invoked-restart* nil)
+              (*format-iter-escape* nil)
+              (*write-object-budget* 0)
+              (*%circ-next* 0)
+              (*%ppx-stack* nil)
+              (*%pp-ctx* nil)
+              (*load-error-condition* nil)
+              (*%load-depth* 0)
+              (*%next-methods* nil)
+              (*%current-gf-args* nil)
+              (*%current-gf* nil)
+              (*%dmc-call-args* nil)
+              (*catch-tags* nil)
+              )
           ;; DECLARED, not inferred: this compiler binds a DEFVAR'd name
           ;; lexically unless the LET says otherwise (build-checks #248).
           (declare (special *current-condition* *catch-active* *catch-tag*
@@ -2601,7 +2732,11 @@
                             *%escape-report-busy* *mvm-last-mv* *jit-native-ran*
                             *jit-infra-fallback* *e2-active-defun-names*
                             *e2-persist-defuns* *e2-module-defuns*
-                            *mvm-eval-no-cache* *jit-inhibit*))
+                            *mvm-eval-no-cache* *jit-inhibit*
+                            *nlx-state-serial* *restarts-being-invoked* *rc-invoked-restart*
+                            *format-iter-escape* *write-object-budget* *%circ-next* *%ppx-stack*
+                            *%pp-ctx* *load-error-condition* *%load-depth* *%next-methods*
+                            *%current-gf-args* *%current-gf* *%dmc-call-args* *catch-tags*))
           (%thr-run-body slot rec)))
     ;; PARK THE ALLOCATION FRONTIER ON THE WAY OUT.  A region's +0x30 is where
     ;; its live heap ends as far as anything outside this thread is concerned;
@@ -2706,6 +2841,9 @@
                                             slot (+ stk *thr-stack-bytes*) k))))
                         (%gc-write64 (%thr-pending-slot) slot)
                         (%gc-write64 (%thr-ack) 0)
+                        ;; The child's own window, ready BEFORE it exists; the
+                        ;; clone stub reads the base from 0x10005020.
+                        (%gc-write64 #x10005020 (%tls-prepare-block slot))
                         (let ((tid (%spawn-thread (%thr-trampoline-entry)
                                                   (+ stk *thr-stack-bytes*)
                                                   (+ rec #x08))))
@@ -2722,6 +2860,7 @@
                                     (progn (setq ok 1) (return 0)))
                                   (when (>= i 2000000000) (return 0))
                                   (setq i (+ i 1)))
+                                (%gc-write64 #x10005020 0)
                                 (%gc-write64 (%thr-started)
                                              (+ (%gc-read64 (%thr-started)) 1))
                                 (spin-unlock (%thr-spawn-lock))

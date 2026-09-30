@@ -108,6 +108,8 @@
     ;; (readtable cons list sequence t): it is not a list, even though its
     ;; Modus representation is a tagged cons.
     ((eq type-name 'readtable) '(readtable t))
+    ;; HASH-TABLE likewise: a tagged cons underneath, a distinct class above.
+    ((eq type-name 'hash-table) '(hash-table t))
     ((eq type-name 'list)      '(list sequence t))
     ((eq type-name 'null)      '(null symbol list sequence t))
     ((eq type-name 'symbol)    '(symbol t))
@@ -144,6 +146,10 @@
     ;; which failed with "no applicable method for (SETF DOCUMENTATION)".
     ;; Must precede the CONSP branch, like the RATIO / COMPLEX cases above.
     ((readtablep obj)  'readtable)
+    ;; HASH-TABLE: a tagged cons (alist . (%ht-tag . meta)), so it too must
+    ;; precede CONSP -- jzon's (defmethod write-value (w (v hash-table))) was
+    ;; never applicable and every JSON object was written as a list.
+    ((hash-table-p obj) 'hash-table)
     ((consp obj)       'cons)
     ;; conditions — detectable via the condition-type registry; their
     ;; CPL keeps STANDARD-OBJECT so methods that matched under the old

@@ -483,6 +483,16 @@
   ;; as the image's does.
   (setq *x64-sched-lock-addr* 268439488)
   (setq *tls-window* t)
+  ;; THE ACTIVE REGION IS PER-THREAD (build-generic-cli.lisp, NATIVE THREADS
+  ;; STEP 3), and a JIT page carries its own copy of the collector.  Left at
+  ;; its NIL default here, that copy read the single region word -- region 0's
+  ;; -- so a worker whose own region filled inside JIT-compiled code collected
+  ;; REGION 0 with its registers: it took the stop-the-world flag, faulted
+  ;; mid-collection and never gave it back, and the next poll parked every
+  ;; thread.  Boxed-vector churn and TLS on a worker, measured.  Allocation
+  ;; inside AOT functions (MAKE-LIST, conses) used the image's own collector
+  ;; and was fine, which is why this hid.
+  (setq *x64-gc-region-percpu* :runtime)
   ;; handler-case handler paths check for a freshly recovered hardware fault
   ;; (see compile-handler-case / %HC-FAULT-FIXUP).
   (setq *hc-fault-fixup* t)
@@ -1619,11 +1629,45 @@
   (let ((off (%cli-getenv \"MODUS_NO_SB\")))
     (if (and off (> (length off) 0) (not (string= off \"0\")))
         nil
-        (progn (%it-eval-source (%sb-shim-source) \"sb-shims\") t))))
+        (progn (%it-eval-source (%sb-shim-source) \"sb-shims\")
+               (%publish-ensure-gray-streams)
+               t))))
 "))
 
 (format t "  sb-shim: ~D chars (sb-thread/sb-bsd-sockets source baked for boot-time eval)~%"
         (length *sb-shim-text*))
+
+;;; GRAY STREAMS: baked like the shims above but evaluated ON DEMAND, not at
+;;; boot (net/sb-gray-shim.lisp's header has the measurement).
+(defvar *sb-gray-text*
+  (read-file-text (merge-pathnames "net/sb-gray-shim.lisp" *modus-base*)))
+
+(defvar *sb-gray-source*
+  (concatenate 'string "
+(defun %sb-gray-source ()
+  \"" (%escape-lisp-string *sb-gray-text*) "\")
+
+(defun %ensure-gray-streams-aot ()
+  (let ((p (find-package \"GRAY-STREAMS\")))
+    (if (and p (find-class (intern \"FUNDAMENTAL-STREAM\" p) nil))
+        t
+        (let ((off (%cli-getenv \"MODUS_NO_SB\")))
+          (if (and off (> (length off) 0) (not (string= off \"0\")))
+              nil
+              (progn (%it-eval-source (%sb-gray-source) \"sb-gray\") t))))))
+
+;; Baked functions are not in runtime EVAL's function table (this blob is kept
+;; out of *all-runtime-source* on purpose), so publish the installer under
+;; CL-USER::%ENSURE-GRAY-STREAMS the way %INIT-MODUS-PACKAGE publishes
+;; JIT-EAGER: the symbol's cell and the SFT key both.
+(defun %publish-ensure-gray-streams ()
+  (let ((f (function %ensure-gray-streams-aot))
+        (dst (intern \"%ENSURE-GRAY-STREAMS\" (find-package \"COMMON-LISP-USER\"))))
+    (set-symbol-function dst f)
+    (when (boundp (quote *symbol-function-table*))
+      (puthash \"%ENSURE-GRAY-STREAMS\" *symbol-function-table* f))
+    t))
+"))
 
 ;;; ============================================================
 ;;; ASDF INTERFACE over Modus's own loader
@@ -1998,6 +2042,11 @@
     ;; that the TEXTUAL scan-defuns scanner would mine for names like
     ;; `sb-thread::make-thread' and then emit `#'sb-thread::make-thread'
     ;; into a chunk that cannot compile.
+    ;; Gray streams, on demand.  BEFORE *sb-shim-source*: %INSTALL-SB-SHIMS
+    ;; calls %PUBLISH-ENSURE-GRAY-STREAMS, and a forward reference across the
+    ;; blob would emit a NIL sentinel.
+    *sb-gray-source*
+    (string #\Newline)
     *sb-shim-source*
     (string #\Newline)
     ;; ASDF interface (net/asdf-interface.lisp).  Same placement rule as

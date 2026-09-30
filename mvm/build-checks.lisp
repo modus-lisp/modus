@@ -1322,7 +1322,7 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
 (defvar *gck-parse-sweep-dirs* '("boot" "lib" "mvm" "net" "runtime"))
 
 (defvar *gck-parse-sweep-exclusions*
-  '("install-tarball" "sb-thread-shim" "sb-sys-shim")
+  '("install-tarball" "sb-thread-shim" "sb-sys-shim" "sb-gray-shim")
   "Pathname-names (no directory, no type) excluded from CHECK E.  See the
    FALSE POSITIVES note above; each entry needs a reason there.")
 

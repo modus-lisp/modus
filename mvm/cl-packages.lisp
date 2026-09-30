@@ -389,17 +389,31 @@
 (defun %symtab-find-in (pkg slot name-string)
   "O(1) equivalent of (%symtab-find (aref (%pkg-data pkg) SLOT) NAME-STRING)."
   (let ((table (aref (%pkg-data pkg) slot)))
+    ;; UNDER THE RUNTIME-TABLE LOCK, because a lookup WRITES: the index is
+    ;; built and synced lazily, here.  On a worker that put the index's hash
+    ;; table and bucket conses in the worker's own region and stored them into
+    ;; the package -- region 0 -- so they dangled once the worker was gone, and
+    ;; FIND-SYMBOL on the main thread then missed symbols that were plainly
+    ;; there (bordeaux-threads: "no threads (SB-THREAD:THREAD-ALIVE-P)").  Two
+    ;; threads syncing at once also raced each other's PUTHASH.  Under the lock
+    ;; the index lives in the arena with the tables that point at it.  The lock
+    ;; is recursive (INTERN calls in here holding it) and, with threads off, a
+    ;; load and a branch.  Nothing below signals.
     (if (null table)
         nil
-        (let ((ht (%symtab-index-sync pkg slot)))
-          (let ((cur (gethash (compute-name-hash name-string) ht))
-                (res nil))
-            (loop
-              (when (null cur) (return res))
-              (let ((entry (car cur)))
-                (when (string= (car entry) name-string)
-                  (return entry)))
-              (setq cur (cdr cur))))))))
+        (progn
+          (%rt-enter)
+          (let ((r (let ((ht (%symtab-index-sync pkg slot)))
+                     (let ((cur (gethash (compute-name-hash name-string) ht))
+                           (res nil))
+                       (loop
+                         (when (null cur) (return res))
+                         (let ((entry (car cur)))
+                           (when (string= (car entry) name-string)
+                             (return entry)))
+                         (setq cur (cdr cur)))))))
+            (%rt-leave)
+            r)))))
 
 (defun %symtab-add (table name-string symbol)
   "Add SYMBOL to alist TABLE under NAME-STRING. Returns new table."

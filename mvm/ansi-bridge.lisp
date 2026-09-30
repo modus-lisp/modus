@@ -2387,6 +2387,7 @@
    (vector *), (vector * 2), (simple-string 5) — uses the head symbol
    for dispatch (per CLHS, compound array/string subtypes are still
    the same family of result-type)."
+  (when (%seq-type-u8-p result-type) (return-from coerce (%seq-u8-copy object)))
   (let* ((orig-type result-type)
          ;; Explicit length from a compound array/vector/string spec like
          ;; (vector * 4) / (simple-string 5) — third element (or second for
@@ -4845,6 +4846,8 @@
     ((%condition-p obj) (%condition-type-name obj))
     ;; A CLOS class object is itself an instance of STANDARD-CLASS.
     ((%clos-class-p obj) 'standard-class)
+    ;; A hash table is a tagged cons underneath; its type is HASH-TABLE.
+    ((hash-table-p obj) 'hash-table)
     ;; Integers: CLHS says an (integer low high) spec is fine, but a bare
     ;; recognisable supertype name also satisfies req 1.a + the subtypep
     ;; checks.  Use FIXNUM / BIGNUM (TYPEP accepts both as INTEGER here).
@@ -5762,8 +5765,37 @@
    signals, instead of reporting and continuing.  The hosted CLI sets it so
    --load/--script abort like SBCL's; the ANSI harness leaves it NIL.")
 
+;;; DEFERRED JIT.  Code loaded at runtime runs as interpreter trampolines until
+;;; JIT-EAGER makes it native, and the system loader asks for that after each
+;;; system (net/asdf-interface.lisp %JIT-LOADED-SYSTEM).  It cannot do it THEN:
+;;; the loader's callers -- Quicklisp's own functions, loaded by LOAD, i.e.
+;;; trampolines -- are active on the stack, and JIT-EAGER replaces them under
+;;; their own frames (measured: the process died silently in the JIT after
+;;; bordeaux-threads loaded; the same JIT-EAGER at top level compiled 981
+;;; functions cleanly).  So the loader only RAISES *%JIT-PENDING*, and the
+;;; outermost LOAD -- the script, whose forms are not trampolines -- runs the
+;;; JIT between two of its toplevel forms, when nothing loaded is executing.
+(defvar *%jit-pending* nil)
+(defvar *%load-depth* 0)
+(defun %load-depth ()
+  (handler-case (if (integerp *%load-depth*) *%load-depth* 0) (t (c) 0)))
+(defun %maybe-run-pending-jit ()
+  (when (and (= (%load-depth) 1)
+             (handler-case *%jit-pending* (t (c) nil)))
+    (setq *%jit-pending* nil)
+    ;; Through EVAL, exactly as a `(jit-eager)' toplevel form of the script
+    ;; would run it: called directly from here the same JIT left
+    ;; bordeaux-threads' JOIN-THREAD returning a TYPE-ERROR, while the
+    ;; evaluated form works.
+    (handler-case (eval (list 'jit-eager)) (serious-condition (c) nil))))
+
 (defun %load-from-stream (stream verbose print)
   "Read+eval all forms from STREAM.  Returns T."
+  (setq *%load-depth* (+ (%load-depth) 1))
+  (unwind-protect (%load-from-stream-1 stream verbose print)
+    (setq *%load-depth* (- (%load-depth) 1))))
+
+(defun %load-from-stream-1 (stream verbose print)
   (when verbose
     (write-string "; loading from stream" *standard-output*)
     (write-char #\Newline *standard-output*))
@@ -5802,6 +5834,7 @@
           ;; per-file runners depend on continuing past a failed form.
           (when (and *load-abort-on-error* *load-error-condition*)
             (return nil))
+          (%maybe-run-pending-jit)
           (when print
             (handler-case
                 (progn (write val :stream *standard-output*)

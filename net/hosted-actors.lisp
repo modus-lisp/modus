@@ -403,6 +403,16 @@
                 ;; ago and can still hold anything.
                 (%ha-zero (+ from0 (+ new0 #xA000))
                           (+ from0 (+ new0 #xA400)))
+                ;; THE REPORT BLOCKS, THE LOCK-ARENA SLICES AND THE ARENA
+                ;; WORDS, +0xB000..+0xC000 (net/hosted-sync.lisp, B-LITE).
+                ;; %RT-ARENA-CARVE reads a non-zero arena END as "already
+                ;; carved": once a quickload had run the frontier through
+                ;; here, the words held (138 0 2609 0), the arena was never
+                ;; carved, and every worker's locked allocation took region
+                ;; 0's stale parked frontier -- bordeaux-threads' JOIN-THREAD
+                ;; came back with (0), (:TEST #<?0>) and TYPE-ERRORs.
+                (%ha-zero (+ from0 (+ new0 #xB000))
+                          (+ from0 (+ new0 #xC000)))
                 ;; AND THE BAND'S UPPER SCRATCH, +0xC000..+0xD000.  It holds
                 ;; the N-region selftest's result block and — the reason this
                 ;; line exists — %SYNC-CELL-CTL at +0xC800, whose FIRST WORD IS

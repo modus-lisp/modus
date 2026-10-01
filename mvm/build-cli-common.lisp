@@ -1650,6 +1650,29 @@
 (defvar *sb-gray-text*
   (read-file-text (merge-pathnames "net/sb-gray-shim.lisp" *modus-base*)))
 
+;;; %IGNORE-SIGPIPE's source, per port: the rt_sigaction number is the
+;;; ARCH's (x86-64 13, AArch64/RISC-V 134, i386/ARM EABI 174), and the struct
+;;; is the same shape everywhere this needs it -- the handler is the first word
+;;; of every Linux ABI's struct, SIG_IGN is 1, the rest zero.  x86-64/AArch64
+;;; take a fresh zero page; the 30-bit ports and RISC-V write the struct into
+;;; the C-string scratch page instead, since a 32-bit guest's mmap can land
+;;; above the fixnum range (and it is boot, so nothing else is using it).
+(defun %ignore-sigpipe-source ()
+  (let ((nr (ecase *cli-arch*
+              (:x64 13) ((:aarch64 :riscv64 :riscv32) 134) ((:i386 :arm32) 174))))
+    (if (member *cli-arch* '(:x64 :aarch64))
+        (format nil "(defun %ignore-sigpipe ()
+  (let ((sa (%mmap-shared-page 4096)))
+    (if (< sa 4096)
+        0
+        (progn (%gc-write64 sa 1)
+               (syscall6 ~D 13 sa 0 8 0 0)))))" nr)
+        (format nil "(defun %ignore-sigpipe ()
+  (let ((sa *cstr-scratch*))
+    (dotimes (i 8) (setf (mem-ref (+ sa (* 4 i)) :u32) 0))
+    (setf (mem-ref sa :u32) 1)
+    (syscall6 ~D 13 sa 0 8 0 0)))" nr))))
+
 (defvar *sb-gray-source*
   (concatenate 'string "
 (defun %sb-gray-source ()
@@ -1673,12 +1696,7 @@
 ;; end closed must come back as EPIPE, not end the process (an actor's TLS
 ;; write to a server that had hung up killed everything with exit 141).
 ;; rt_sigaction(SIGPIPE=13, {SIG_IGN, 0, 0, 0}, NULL, 8) = syscall 13.
-(defun %ignore-sigpipe ()
-  (let ((sa (%mmap-shared-page 4096)))
-    (if (< sa 4096)
-        0
-        (progn (%gc-write64 sa 1)
-               (syscall6 13 13 sa 0 8 0 0)))))
+" (%ignore-sigpipe-source) "
 
 (defun %publish-runtime-api ()
   (let ((pk (find-package \"COMMON-LISP-USER\")))

@@ -1665,6 +1665,11 @@
 ;;; the C-string scratch page instead, since a 32-bit guest's mmap can land
 ;;; above the fixnum range (and it is boot, so nothing else is using it).
 (defun %ignore-sigpipe-source ()
+  ;; BARE METAL: no OS, no signals -- and a syscall there is an SVC with
+  ;; nothing behind it, the `!!FAULT E..56000504' that stopped every Pi image
+  ;; at boot from c5d864e (this call joined the shared boot path) on.
+  (if *cli-bare-metal*
+      (return-from %ignore-sigpipe-source "(defun %ignore-sigpipe () 0)"))
   (let ((nr (ecase *cli-arch*
               (:x64 13) ((:aarch64 :riscv64 :riscv32) 134) ((:i386 :arm32) 174))))
     (if (member *cli-arch* '(:x64 :aarch64))
@@ -1704,8 +1709,13 @@
 ;; write to a server that had hung up killed everything with exit 141).
 ;; rt_sigaction(SIGPIPE=13, {SIG_IGN, 0, 0, 0}, NULL, 8) = syscall 13.
 " (%ignore-sigpipe-source) "
+" (if *cli-bare-metal*
+      ;; The actor runtime and the per-computation registry are hosted-only
+      ;; (*cli-hosted-actors-source*); a bare image has nothing to publish.
+      "(defun %publish-runtime-api () nil)"
+      "(defun %publish-runtime-api () (%publish-runtime-api-hosted))") "
 
-(defun %publish-runtime-api ()
+(defun %publish-runtime-api-hosted ()
   (let ((pk (find-package \"COMMON-LISP-USER\")))
     (dolist (e (list (cons \"REGISTER-PER-COMPUTATION-SPECIAL\" (function register-per-computation-special))
                      (cons \"ACTORS-START\" (function actors-start))

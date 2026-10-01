@@ -3,7 +3,8 @@
 Written 2026-09-06.  Status: **landed for the hosted Linux/AArch64 CLI**
 (a6085d2) **and for the bare-metal Pi image, validated under QEMU raspi3b**
 (fa9fa1e).  The remaining loose ends are the real board (the RAM-core
-round-trip) and x64 stub parity, at the bottom.
+round-trip), at the bottom.  **Hosted x86-64 landed 2026-10-01**, see
+[x86-64](#x86-64).
 
 ## Why
 
@@ -332,9 +333,36 @@ differences:
   constant-vector root is `0x10000F00`, inside the run the shared sequence
   stages, and must land in place.
 
+The core magic moved to 20261001 with the two new header words, so cores
+written before (aarch64 hosted, the Pi) must be re-made; the restore refuses
+them as "not a Modus core file" rather than misreading them.
+
 Measured on the 128-core x64 host (no emulation):
 
 | step | time |
 |---|---|
 | toy core (2 JIT'd fns), restore + run | 0.03 s, 10 MB core |
+| Quicklisp + alexandria core: restore + `ql:quickload :split-sequence` + use | 1.1 s, 25 MB core |
+| operandi: `ql:quickload :operandi` + `jit-eager` (7004 modules) + save | 310 s, once; 291 MB core |
+| operandi ACP server from the core: startup + `initialize` | **4.2 s** (whole ACP drive 55 s, was 410 s) |
+
+What else a core has to carry on x64, found by building that operandi core:
+
+- **The actor band.**  Loading bordeaux-threads makes a lock, which carves the
+  hosted actor band (`%ha-carve`) off region 0's top: region 0 shrinks from
+  0x37FFFC00 to 0x26FFE000 and the band holds the sync-cell control words.  The
+  band is the core's extra range (header words 10/11); restore checks it lies
+  in the semispaces, reads it in, and shrinks region 0 to the saved size
+  (`%core-adopt-geometry`).  The per-thread regions the carve also reserves are
+  NOT saved: a core is taken from a single-threaded image, so they hold nothing.
+- **Sync cells.**  A mutex object holds its cell's raw address, and the cell
+  arena was a random `mmap`; it now comes from the exec arena (`%sync-cell`),
+  which is fixed and saved.
+- **Not carried, and fine:** the thread page (slot 0x10000DA8) and the lock
+  arena root (0x10000D98) are window words, staged, so a restored process maps
+  fresh ones on first use; GS base is set when actors start, after restore.
+
+Known unrelated: sqlite-pure's cl-sqlite compat returns `:BUSY` for
+`PRAGMA journal_mode = WAL` on a brand-new database on modus (fresh process
+too, no core involved); an existing WAL database is fine.
 

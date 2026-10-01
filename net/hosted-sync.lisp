@@ -287,7 +287,11 @@
    stop-the-world STATE running and no stale published RSP, and the self slot
    holding its own segment base.  Returns that base, or 0 if there is no block."
   (let ((b (%thr-tls-block cpu)))
-    (if (or (zerop b) (< b (%conv-addr #x10000000)))
+    ;; Below the window base is refused on x86-64 only (see %TLS-INSTALL):
+    ;; macOS maps AArch64 thread pages there, and a block left unprepared
+    ;; kept its previous occupant's handler frames and had no guard words.
+    (if (or (zerop b)
+            (and (< b (%conv-addr #x10000000)) (= (%layout-if :a64-threads 0 1) 1)))
         0
         (let ((delta (- b (%conv-addr #x10000000))))
           (setf (mem-ref (+ b #xC50) :u64) 0)
@@ -1511,6 +1515,31 @@
                 (%gc-region-enter (if (zerop b) blk b)))
               0)))))
 
+(defun %rt-own-alloc-begin ()
+  "Switch a WORKER that holds the runtime lock back to its own region for an
+   allocation that must not go to the lock arena; returns the slice block to
+   go back to, or 0 when nothing was switched.  The hosted twin of
+   mvm/prelude.lisp's no-op.
+
+   A locked section allocates from the shared lock arena because what it
+   makes is meant for the shared tables.  The bytecode interpreter's own
+   bookkeeping is not: its SETJMP record (mvm/interp.lisp, #x0510) holds the
+   interpreter's stack and environment, which are this worker's objects, and
+   nothing shared ever points to it.  Made in the arena it was a shared object
+   pointing into a worker's region -- the shape the shared-store guard
+   refuses, and one that goes stale if that region is collected inside the
+   section.  On a JIT build the runtime shim is native and never makes one;
+   without a JIT (iOS devices) every %SB-LOCKED made one."
+  (if (or (= (mem-ref #x10000DB8 :u32) 0)
+          (= (%thr-cpu) 0)
+          (/= (%gc-read64 (%rt-owner-addr)) (+ (%thr-cpu) 1)))
+      0
+      (let ((own (%gc-read64 (%rt-saved-addr))))
+        (if (zerop own) 0 (%gc-region-enter own)))))
+
+(defun %rt-own-alloc-end (token)
+  "Back to the locked section's slice after %RT-OWN-ALLOC-BEGIN."
+  (if (zerop token) 0 (progn (%gc-region-enter token) 0)))
 (defun %gc-collect-region-0 ()
   "Collect REGION 0 now, from any thread, with no allocation in it: point
    this CPU's region cell at region 0 but keep this thread's own allocation

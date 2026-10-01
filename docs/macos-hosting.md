@@ -1189,3 +1189,59 @@ How it was found: breakpoints set after launch on the in-place macOS image
 (lldb disables ASLR, so its addresses are the symbol map's), and a Python
 callback that logs each hit on `%SIGNAL-TYPE-ERROR` / `MAKE-CONDITION` with a
 stack scan for return addresses.
+
+## The shared-store guard on AArch64 (2026-09-30)
+
+x86-64 refuses a store that would leave a pointer into a worker's own region
+from memory outside it (translate-x64, SHARED-STORE GUARD).  AArch64 now does
+the same, so `test/thread-fault-conditions.lisp` runs there instead of
+failing.
+
+- **Where.** Every `SETCAR`, `SETCDR`, `OBJ-SET` (object slots, not frame
+  slots) and `ASET` in a hosted threaded image, AOT and runtime JIT alike
+  (`*A64-TLS-WINDOW*`).
+- **How a store calls it.** Four instructions: value to x10, target to x11,
+  `ADR x9` for the return, `B` to one guard subroutine per translation unit.
+  The guard returns with `BR x9`, so x30 is untouched in leaves that never
+  saved it.  Inlining it instead grew the image from 77 MB to 129 MB; the
+  subroutine costs about 6 MB.
+- **What it checks.** The same window words as x86-64 (`+0x5040` A, `+0x5048`
+  B, `+0x5050` size), reached through the thread delta.  The threads gate
+  (`0x10000DB8`), a non-pointer or the main thread (delta 0) return at once.
+  A refusal writes the site (`+0x5060`) and the marker (`+0x5058`), then
+  executes `UDF`.
+- **How the error comes out.** The `#x0520` fault stub now counts recovered
+  faults at `0x10000CA0` (LDXR/STXR), as x86-64's does.  `%TAKE-PENDING-FAULT`,
+  which every handler-case calls, runs `%HC-FAULT-FIXUP` when the pending
+  signal is SIGILL.  So the guard's `SIMPLE-ERROR`, not an
+  `ILLEGAL-INSTRUCTION-ERROR`, reaches every handler, including those compiled
+  without `*HC-FAULT-FIXUP*`, which an image with no JIT never sets.  The
+  stub's signal word at `0x10000CB0` was an absolute address and now moves
+  with the region.
+- **macOS.** Thread pages sit below the moved region there, and
+  `%TLS-PREPARE-BLOCK` refused such blocks, so no guard words were ever
+  seeded (and a reused block kept its last occupant's handler frames).  The
+  refusal is now x86-64-only, like `%TLS-INSTALL`'s.  The same negative
+  delta made `%HC-FAULT-FIXUP` read the marker at the wrong address, since it
+  built the self base unsigned.  It now reads it signed, as `%TLS-SELF-BASE`
+  does.
+- **The interpreter's own bookkeeping stays out of the lock arena.** A
+  locked section allocates from the shared lock arena, because what it makes
+  is meant for the shared tables.  The bytecode interpreter's `SETJMP` (one
+  per interpreted `HANDLER-CASE` or `UNWIND-PROTECT`) also allocates a
+  record holding its stack and environment.  Made inside `%SB-LOCKED`, that
+  record was a shared object pointing into the worker's region.  The guard
+  refused it, and it would go stale if that region were collected mid-
+  section.  Compiled code makes no such record, but an image with no JIT
+  (iOS devices) interprets the whole SB-THREAD shim, so every thread died at
+  its first locked section.  `SETJMP` now brackets the record with
+  `%RT-OWN-ALLOC-BEGIN` / `-END`.  For a worker that holds the lock, these
+  switch back to its own region; everywhere else they are prelude no-ops.
+- **A first version broke the runtime JIT.** Built from FLET closures and a
+  MACROLET expanding into another, it translated fine on the host but raised
+  `TYPE-ERROR` in the in-image translator.  That left 32 more runtime modules
+  interpreted, the SB-THREAD shim among them.  The interpreter's `SETJMP`
+  allocates its jmpbuf, and under `%SB-LOCKED` that lands in the shared
+  arena pointing at worker objects, so the guard refused `JOIN-THREAD`'s
+  own result copy.  Plain functions fixed it: `%JIT-EAGER-ALL` reports the
+  same 22 untranslatable modules as before the guard.

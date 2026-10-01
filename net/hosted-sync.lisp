@@ -3553,7 +3553,12 @@ modus: a thread needed the runtime lock but the lock arena is exhausted or missi
     (spin-lock ctl)
     (let ((base (%gc-read64 (+ ctl #x08))))
       (if (zerop base)
-          (let ((m (%mmap-shared-page (%sync-arena-bytes))))
+          ;; From the JIT exec arena, not a fresh mmap: the cells' raw
+          ;; addresses live in mutex objects in the heap, so a core
+          ;; (lib/save-image.lisp) must find the cells where they were.  The
+          ;; arena is at a fixed address and travels in the core; with no
+          ;; arena this is the trap's own mmap(NULL).
+          (let ((m (%mmap-exec-page (%sync-arena-bytes))))
             (if (< m 4096)
                 (progn (spin-unlock ctl) 0)
                 (progn (%gc-write64 (+ ctl #x08) m)

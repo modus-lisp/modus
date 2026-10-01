@@ -218,9 +218,8 @@ value-domain op under the interpreter.  The original notes follow.
    walks the file and names the failing form.  Bare metal runs the
    interpreter for everything the JIT declines, so this one matters for the
    board.
-3. **x64 `./modus` has no fixed heap yet.**  The shared code builds and
-   `--core` refuses honestly (`heap base differs`); the stub needs the same
-   two mappings and the x64 `#x0531` arm the same bump fallback.  Small.
+3. ~~x64 `./modus` has no fixed heap yet.~~  Done (2026-10-01), see
+   [x86-64](#x86-64) below.
 4. The core path is read from the live `argv[2]`, so it has no 63-byte limit,
    but `--core` must be first.
 
@@ -307,3 +306,35 @@ Plan, in order:
 
 Order of work: (2) via QEMU `raspi3b` first — it validates the bare-metal
 restore path with a gdbstub on hand — then (1) on the board.
+
+## x86-64
+
+Landed 2026-10-01 for the hosted x64 CLI (`./modus`).  Same model, three
+differences:
+
+- **Stub** (`boot/boot-linux-x64.lisp`): the JIT arena (1 GB of VA,
+  `MAP_NORESERVE`) at `0x3000000000`, bump word `0x10000F58` set only when the
+  kernel returned exactly that base; then the heap at `0x2000000000` with
+  `MAP_FIXED_NOREPLACE`, falling back to the historical hinted mapping on an
+  error return.  The block is padded to 144 bytes = 9×16 so the fn-entry
+  alignment (`*x64-native-code-offset*` mod 16) is unchanged; the offsets were
+  bumped by 144 anyway (397 → 541, 351 → 495).
+- **Trap** (`translate-x64.lisp`, `#x0531`): `lock xadd` on the bump word
+  (workers JIT too), RCX (V5) preserved; bump word 0 keeps `mmap(NULL)`.
+- **Geometry**: x64's stub stores the GC control block and the MCGC config
+  words RAW, so the shared `mem-ref :u64` reads halve them.  `save-image.lisp`
+  reads geometry through `%core-from-start` / `%core-page-base` /
+  `%core-bitmap-base` / `%core-cons-bitmap-base` / `%core-heap-base` seams
+  (defaults = the old reads); `build-generic-cli.lisp`'s
+  `*cli-arch-override-source*` replaces them with `%gc-read64`.  The GC bitmaps
+  are inside the heap mapping here, not the arena, so the explicit bitmap
+  slices carry them.  `%core-restore-window` is a seam too: x64's JIT
+  constant-vector root is `0x10000F00`, inside the run the shared sequence
+  stages, and must land in place.
+
+Measured on the 128-core x64 host (no emulation):
+
+| step | time |
+|---|---|
+| toy core (2 JIT'd fns), restore + run | 0.03 s, 10 MB core |
+

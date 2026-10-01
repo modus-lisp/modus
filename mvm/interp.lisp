@@ -1188,15 +1188,21 @@
                ((= code #x0510)
                 (when *nlx-trace*
                   (format t "~%[NLX setjmp st=~D depth->~D pc=~D]" (mvm-serial state) (+ 1 (length (mvm-handlers state))) npc))
-                (push (make-mvm-jmpbuf
-                       :pc npc
-                       :stack (mvm-stack state)
-                       :call-stack (mvm-call-stack state)
-                       :vfp (svref regs +vreg-vfp+)
-                       :nargs (mvm-nargs state)
-                       :cenv (mvm-cenv state)
-                       :mv-count (mvm-mv-count state))
-                      (mvm-handlers state))
+                ;; The record and its cons are the interpreter's own, never
+                ;; shared: inside a locked section, make them in this thread's
+                ;; region, not the lock arena (net/hosted-sync.lisp
+                ;; %RT-OWN-ALLOC-BEGIN; a no-op elsewhere).
+                (let ((own (%rt-own-alloc-begin)))
+                  (push (make-mvm-jmpbuf
+                         :pc npc
+                         :stack (mvm-stack state)
+                         :call-stack (mvm-call-stack state)
+                         :vfp (svref regs +vreg-vfp+)
+                         :nargs (mvm-nargs state)
+                         :cenv (mvm-cenv state)
+                         :mv-count (mvm-mv-count state))
+                        (mvm-handlers state))
+                  (%rt-own-alloc-end own))
                 (reg-set-nil regs +vreg-vr+)
                 (setf pc npc))
                ;; LONGJMP (#x0511): pop the nearest jmp-buf, restore its dynamic

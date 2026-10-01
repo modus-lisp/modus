@@ -676,7 +676,14 @@
    the word at #x10000CB0 and no condition, since it cannot allocate; build
    the condition here.  SIGFPE (8) is DIVISION-BY-ZERO (integer division
    is what traps), SIGILL (4) ILLEGAL-INSTRUCTION-ERROR, SIGSEGV/SIGBUS
-   MEMORY-FAULT-ERROR."
+   MEMORY-FAULT-ERROR.
+
+   A SIGILL may be THE SHARED-STORE GUARD's refusal, which says more than the
+   signal does: %HC-FAULT-FIXUP claims it (and clears the signal) when it is.
+   Asked here, every handler-case gets that answer -- not only the ones
+   compiled with *HC-FAULT-FIXUP*, which an image without a JIT (iOS devices)
+   never sets."
+  (when (eql (mem-ref #x10000CB0 :u32) 4) (%hc-fault-fixup))
   (let ((sig (mem-ref #x10000CB0 :u32)))
     (unless (eql sig 0)
       (setf (mem-ref #x10000CB0 :u32) 0)
@@ -2654,7 +2661,7 @@
         (if (%error-handler-active-p) (%hc-longjmp) nil))))
 
 (defun %hc-fault-fixup ()
-  "Called first on a HANDLER-CASE handler path (hosted x64 CLI), before
+  "Called first on a HANDLER-CASE handler path (hosted CLI, both 64-bit arches), before
    %TAKE-PENDING-FAULT.  If the #x0520 fault stub has recovered a hardware
    fault since the last check (its count at #x10000CA0 moved past the
    last-seen count at #x10000CA8) and it was THE SHARED-STORE GUARD's trap,
@@ -2663,15 +2670,21 @@
   (let ((n (mem-ref #x10000CA0 :u32)))
     (unless (= n (mem-ref #x10000CA8 :u32))
       (setf (mem-ref #x10000CA8 :u32) n)
-      ;; THE SHARED-STORE GUARD (translate-x64) marks its trap in this
+      ;; THE SHARED-STORE GUARD (translate-x64, translate-aarch64) marks its trap in this
       ;; thread's window word +0x5058 before faulting; the word is outside
       ;; the range the compiler can prove per-thread, so address it through
       ;; the self slot (0 on main, where the absolute word is unused).
       (let* ((lo (mem-ref #x10000C30 :u32))
              (hi (mem-ref #x10000C34 :u32))
-             (self (if (= hi 0) lo (+ (* (* hi 65536) 65536) lo)))
+             ;; SIGNED, as %TLS-SELF-BASE: a macOS AArch64 worker's window
+             ;; lies below the region, so its delta is negative.
+             (self (if (= hi 0)
+                       lo
+                       (+ (* (* (if (>= hi #x80000000) (- hi 4294967296) hi)
+                                65536) 65536)
+                          lo)))
              (m (+ self (%conv-addr #x10005058))))
-        (if (and (> self 0) (= (%gc-read64 m) 1))
+        (if (and (/= self 0) (= (%gc-read64 m) 1))
             (progn
               (%gc-write64 m 0)
               ;; This condition says more than the signal would: claim it.

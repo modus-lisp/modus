@@ -2017,6 +2017,127 @@
   (a64-load-conv-addr buf rd addr)
   (a64-add-thread-delta buf rd scratch))
 
+;;; SHARED-STORE GUARD — the AArch64 twin of translate-x64's (read that one
+;;; first).  A worker's heap is its own region pair, which no other collector
+;;; scans, so storing one of its objects into memory outside that pair leaves
+;;; a pointer that goes stale at the worker's next collection.  The guard
+;;; traps before such a store: it sets the window's marker word and executes
+;;; UDF, a SIGILL, which the #x0520 stub recovers and %HC-FAULT-FIXUP turns
+;;; into the guard's own error.  Same window words as x64 (seeded by
+;;; %TLS-PREPARE-BLOCK): +0x5040 semispace A, +0x5048 B, +0x5050 size (0 = no
+;;; region), +0x5058 marker, +0x5060 site.
+;;;
+;;; One subroutine per translation unit, emitted at its end; each store site
+;;; is four instructions: value to x10, target to x11, return address to x9,
+;;; B.  It returns with BR x9, so x30 is untouched and a leaf that never
+;;; saved it stays correct.  It uses only x10-x15 besides x9 (no vreg lives
+;;; there, see *A64-VREG-TO-PHYS*), so the store's own x16/x17 survive.  The
+;;; main thread (delta 0), non-pointers and a closed threads gate
+;;; (0x10000DB8) return at once.
+
+(defconstant +a64-ssg-window-addr+ #x10005040)
+
+(defvar *a64-ssg-label* nil
+  "The current unit's guard subroutine label, made by its first guarded store
+   and emitted at the unit's end.  SETQ'd, never bound: see
+   *AARCH64-TRANSLATED-START-IDX* on in-image LET of specials.")
+
+(defun a64-ssg-p ()
+  "Whether stores get the shared-store guard: hosted with per-thread windows."
+  (and *a64-tls-window* t))
+
+(defun a64-emit-shared-store-guard (buf value target)
+  "Call the guard with VALUE (a register) about to be stored into TARGET (the
+   tagged object).  Clobbers x9-x15."
+  (unless *a64-ssg-label* (setq *a64-ssg-label* (incf *mvm-label-counter*)))
+  (a64-mov-reg buf +a64-x10+ value)
+  (a64-mov-reg buf +a64-x11+ target)
+  (let ((adr (a64-current-index buf)))
+    (a64-emit buf (logior #x10000000 +a64-x9+))       ; ADR x9, <return>
+    (a64-emit-call-label buf *a64-ssg-label* t)       ; B guard (any length)
+    (setf (aref (a64-buffer-code buf) adr)
+          (logior #x10000000 (ash (logand (- (a64-current-index buf) adr) #x7FFFF) 5)
+                  +a64-x9+))))
+
+;;; Plain top-level functions and explicit calls, on purpose: this file is
+;;; also compiled IN-IMAGE for the runtime JIT, and a first version built from
+;;; FLET closures (one pushing onto its parent's variable) and a MACROLET that
+;;; expanded into another made guarded pages fail to translate there --
+;;; TYPE-ERROR, and 32 more runtime modules left to the interpreter, among
+;;; them the SB-THREAD shim, whose interpreted SETJMPs under the runtime lock
+;;; then tripped the guard itself.
+
+(defun a64-ssg-untag (buf reg)
+  "Clear the tag nibble of REG in place."
+  (a64-lsr-imm buf reg reg 4)
+  (a64-lsl-imm buf reg reg 4))
+
+(defun a64-ssg-in-base (buf reg base)
+  "Flags for: unsigned (REG - BASE) < the size in x15.  Clobbers x12."
+  (a64-sub-reg buf +a64-x12+ reg base 0 0)
+  (a64-cmp-reg buf +a64-x12+ +a64-x15+))
+
+(defun a64-ssg-window (buf rd scratch)
+  "Xd = this thread's guard words (+0x5040)."
+  (a64-load-thread-delta buf scratch)
+  (a64-load-conv-addr buf rd +a64-ssg-window-addr+)
+  (a64-add-reg buf rd rd scratch 0 0))
+
+(defun a64-ssg-branch-here (buf idx)
+  "Point the CBZ / B.cond at IDX (imm19 still 0) at the current position."
+  (setf (aref (a64-buffer-code buf) idx)
+        (logior (aref (a64-buffer-code buf) idx)
+                (ash (logand (- (a64-current-index buf) idx) #x7FFFF) 5))))
+
+(defun a64-emit-shared-store-guard-sub (buf label)
+  "The guard: x10 = value, x11 = target, x9 = return address.  Traps if the
+   value is a heap object in this thread's region pair and the target is not."
+  (let ((rets nil) (vmine 0))
+    (a64-set-label buf label)
+    ;; The threads gate: closed in every single-threaded process.
+    (a64-load-conv-addr buf +a64-x12+ #x10000DB8)
+    (a64-ldr32-unsigned buf +a64-x12+ +a64-x12+ 0)
+    (setq rets (cons (a64-current-index buf) rets))
+    (a64-emit buf (logior #xB4000000 +a64-x12+))        ; CBZ x12, ret
+    ;; A heap object: (logand value 5) = 1.
+    (a64-movz buf +a64-x12+ 5 0)
+    (a64-and-reg buf +a64-x12+ +a64-x10+ +a64-x12+)
+    (a64-cmp-imm buf +a64-x12+ 1)
+    (setq rets (cons (a64-current-index buf) rets))
+    (a64-emit buf (logior #x54000000 #b0001))           ; B.NE ret
+    ;; A worker: its delta is its self slot, 0 on main.
+    (a64-load-thread-delta buf +a64-x12+)
+    (setq rets (cons (a64-current-index buf) rets))
+    (a64-emit buf (logior #xB4000000 +a64-x12+))        ; CBZ x12, ret
+    (a64-ssg-window buf +a64-x12+ +a64-x13+)
+    (a64-ldp-offset buf +a64-x13+ +a64-x14+ +a64-x12+ 0)    ; A, B
+    (a64-ldr-unsigned buf +a64-x15+ +a64-x12+ 16)           ; size
+    ;; The value in A or B, else nothing to guard.
+    (a64-ssg-untag buf +a64-x10+)
+    (a64-ssg-in-base buf +a64-x10+ +a64-x13+)
+    (setq vmine (a64-current-index buf))
+    (a64-emit buf (logior #x54000000 #b0011))           ; B.LO vmine
+    (a64-ssg-in-base buf +a64-x10+ +a64-x14+)
+    (setq rets (cons (a64-current-index buf) rets))
+    (a64-emit buf (logior #x54000000 #b0010))           ; B.HS ret
+    (a64-ssg-branch-here buf vmine)
+    ;; The target in A or B: a local store, fine.
+    (a64-ssg-untag buf +a64-x11+)
+    (a64-ssg-in-base buf +a64-x11+ +a64-x13+)
+    (setq rets (cons (a64-current-index buf) rets))
+    (a64-emit buf (logior #x54000000 #b0011))           ; B.LO ret
+    (a64-ssg-in-base buf +a64-x11+ +a64-x14+)
+    (setq rets (cons (a64-current-index buf) rets))
+    (a64-emit buf (logior #x54000000 #b0011))           ; B.LO ret
+    ;; Refused: the site (the return address), the marker, then trap.
+    (a64-ssg-window buf +a64-x12+ +a64-x13+)
+    (a64-str-unsigned buf +a64-x9+ +a64-x12+ 32)        ; +0x5060
+    (a64-movz buf +a64-x13+ 1 0)
+    (a64-str-unsigned buf +a64-x13+ +a64-x12+ 24)       ; +0x5058
+    (a64-emit buf #x00000000)                           ; UDF #0
+    (dolist (idx rets) (a64-ssg-branch-here buf idx))
+    (a64-br buf +a64-x9+)))
+
 (defconstant +a64-darwin-sys-set-thread-delta+ 1000
   "Pseudo-syscall number the Darwin host shim answers by storing x0 in the
    reserved pthread key (host/macos/modus-shim.c).  Past every Linux number.")
@@ -3645,8 +3766,19 @@
                       (a64-emit buf (logior #xB4000000 9))    ; CBZ x9
                       ;; Record the signal (x0) for %TAKE-PENDING-FAULT: the
                       ;; handler-case dispatch builds the condition from it.
-                      (a64-load-imm64-general buf +a64-x16+ #x10000CB0)
+                      ;; A process-global word, moved with the region.
+                      (a64-load-real-addr buf +a64-x16+ (conv-real #x10000CB0))
                       (a64-str-width buf +a64-x0+ +a64-x16+ 0 2) ; STR w0
+                      ;; The recovered-fault COUNT at 0x10000CA0, as on x64:
+                      ;; %HC-FAULT-FIXUP compares it with the last count it
+                      ;; saw to tell a fresh fault (the shared-store guard's
+                      ;; UDF among them) from a stale condition.  Atomic: two
+                      ;; threads can fault at once.
+                      (a64-load-real-addr buf +a64-x16+ (conv-real #x10000CA0))
+                      (a64-ldxr buf +a64-x17+ +a64-x16+)
+                      (a64-add-imm buf +a64-x17+ +a64-x17+ 1)
+                      (a64-stxr buf +a64-x13+ +a64-x17+ +a64-x16+)
+                      (a64-emit buf (logior #xB5000000 (ash (logand -3 #x7FFFF) 5) 13)) ; CBNZ x13, ldxr
 
                       ;; ---- Inline handler-stack pop ----
                       ;; depth at #x10010000 ; frames at #x10010008 + depth*24.
@@ -4531,6 +4663,9 @@
           ;; ---- SETCAR Vd, Vs ----
           ;; STUR Vs, [Vd, #-1]  (untag and store to car)
           ((= op +op-setcar+)
+           (when (a64-ssg-p)               ; first: the call may clobber x16
+             (a64-emit-shared-store-guard buf (ensure-src (vr 1) +a64-x17+)
+                                          (ensure-src (vr 0) +a64-x16+)))
            (let ((pd (ensure-src (vr 0) +a64-x16+))
                  (ps (ensure-src (vr 1) +a64-x17+)))
              (a64-stur buf ps pd -1)))
@@ -4538,6 +4673,9 @@
           ;; ---- SETCDR Vd, Vs ----
           ;; STUR Vs, [Vd, #7]  (untag + skip car)
           ((= op +op-setcdr+)
+           (when (a64-ssg-p)               ; first: the call may clobber x16
+             (a64-emit-shared-store-guard buf (ensure-src (vr 1) +a64-x17+)
+                                          (ensure-src (vr 0) +a64-x16+)))
            (let ((pd (ensure-src (vr 0) +a64-x16+))
                  (ps (ensure-src (vr 1) +a64-x17+)))
              (a64-stur buf ps pd 7)))
@@ -4795,7 +4933,12 @@
                  ;; operands spilled the collision is guaranteed (ps=x17,
                  ;; pobj=x16).  x9 is not a vreg and is not an `ensure-src`
                  ;; scratch in THIS opcode.  Same class as #220's :mod.
-                 (let* ((pobj (ensure-src vobj +a64-x16+))
+                 (let* ((pobj (progn
+                                (when (a64-ssg-p)   ; first: may clobber x16
+                                  (a64-emit-shared-store-guard
+                                   buf (ensure-src (vr 2) +a64-x17+)
+                                   (ensure-src vobj +a64-x16+)))
+                                (ensure-src vobj +a64-x16+)))
                         (offset (+ (* idx 8) 7)))
                    (if (and (>= offset -256) (<= offset 255))
                        (a64-stur buf ps pobj offset)
@@ -4895,6 +5038,9 @@
           ;; ---- ASET Vobj, Vidx, Vs ----
           ;; Variable-index array store — tag=9 layout, slot 0 at tagged+7.
           ((= op +op-aset+)
+           (when (a64-ssg-p)               ; first: the call may clobber x16
+             (a64-emit-shared-store-guard buf (ensure-src (vr 2) +a64-x17+)
+                                          (ensure-src (vr 0) +a64-x16+)))
            (let* ((pobj (ensure-src (vr 0) +a64-x16+))
                   (pidx (ensure-src (vr 1) +a64-x17+)))
              (a64-add-imm buf +a64-x16+ pobj 7)
@@ -8242,6 +8388,7 @@
   (setf *aarch64-fn-addr-relocs* nil)
   (setf *aarch64-fn-addr-local-relocs* nil)
   (a64-slot-cache-flush)   ; never inherit a previous translation's state
+  (setq *a64-ssg-label* nil)
   (let* ((buf (or *aarch64-translate-into-buf* (make-a64-buffer)))
          ;; Index (instruction units) where translated code starts within
          ;; buf.  Zero when buf is a fresh one; non-zero when we're
@@ -8361,6 +8508,11 @@
     ;; Phase 3(a) these are dead code — no trap BLs to them yet.
     (when *aarch64-translate-into-buf*
       (emit-aarch64-handler-helpers buf))
+
+    ;; The shared-store guard, when a store in this unit called it.
+    (when *a64-ssg-label*
+      (a64-emit-shared-store-guard-sub buf *a64-ssg-label*)
+      (setq *a64-ssg-label* nil))
 
     ;; Pass 2: Resolve all branch fixups.  Skip if we're appending into
     ;; a shared buffer — the caller will resolve once after appending

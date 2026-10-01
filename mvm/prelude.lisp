@@ -1997,6 +1997,17 @@
   bytes
   0)
 
+(defun %rt-own-alloc-begin ()
+  "Allocate from this thread's OWN region until %RT-OWN-ALLOC-END, even inside
+   a locked section.  Returns the token %RT-OWN-ALLOC-END takes.  A no-op
+   here; the hosted threaded runtime (net/hosted-sync.lisp) redefines it."
+  0)
+
+(defun %rt-own-alloc-end (token)
+  "Undo %RT-OWN-ALLOC-BEGIN.  A no-op here, like it."
+  token
+  0)
+
 (defun %ht-rebuild-index (ht holder strcmp?)
   "Build (or RE-build, larger) the bucket index from HT's current alist and
    store it in HOLDER's car.  The bucket count is a power of two sized so the

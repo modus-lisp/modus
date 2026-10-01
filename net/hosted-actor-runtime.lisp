@@ -43,7 +43,16 @@
    so it is a region-0 object; an actor storing its OWN closure here would be a
    shared-store violation and is refused (spawn from an actor with a symbol).")
 
-(defun %ar-stack-bytes () #x40000)          ; 256 KB per actor
+;;; ACTOR STACKS are adjacent slots of one mapping: actor ID's stack is
+;;; [base + ID*size, base + (ID+1)*size), growing down.  256 KB was too small for
+;;; real work (operandi's tool turn: interpreted frames are large), and an
+;;; overflow ran straight into the slot BELOW -- the actor spawned just before,
+;;; whose outermost frames it overwrote with NIL-initialised slots while that
+;;; actor sat blocked in read(2).  It returned through them to 0xDEAD0001.  So:
+;;; 2 MB each (pages are only committed when touched), and the lowest page of
+;;; every slot is a PROT_NONE guard, so an overflow faults in the actor that
+;;; overflowed instead of corrupting its neighbour.
+(defun %ar-stack-bytes () #x200000)         ; 2 MB per actor, guard page at the bottom
 (defun %ar-max-slots () 60)
 
 (defun %ar-get (off) (%gc-read64 (+ *ar-ctl* off)))
@@ -703,6 +712,8 @@
         (d (%mmap-shared-page (* 64 #x4000)))
         (s (%mmap-shared-page (* 64 (%ar-stack-bytes)))))
     (when (or (< w 4096) (< d 4096) (< s 4096)) (error "actors-start: could not map windows/stacks."))
+    ;; mprotect(slot bottom, 4096, PROT_NONE) for every slot: see %AR-STACK-BYTES.
+    (dotimes (i 64) (syscall3 10 (+ s (* i (%ar-stack-bytes))) 4096 0))
     (%ar-set #x30 w) (%ar-set #x38 d) (%ar-set #x40 s))
   (let ((st (%mmap-shared-page (* 64 (%ar-staging-bytes)))))
     (when (< st 4096) (error "actors-start: could not map staging."))

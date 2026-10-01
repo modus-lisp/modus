@@ -128,14 +128,33 @@
 (defmacro %gray-wrap (name lambda-list gray-form)
   "Install NAME := a function that runs GRAY-FORM when its stream argument
    (bound to STREAM in LAMBDA-LIST's sense by GRAY-FORM itself) is a Gray
-   stream, and otherwise applies the ORIGINAL definition to its arguments."
-  `(let ((orig (symbol-function ',name)))
-     (setf (symbol-function ',name)
-           (lambda (&rest args)
-             (destructuring-bind ,lambda-list args
-               (declare (ignorable ,@(remove-if (lambda (x) (member x '(&optional &rest &key)))
-                                                (mapcar (lambda (x) (if (consp x) (car x) x)) lambda-list))))
-               (if (%gray-p stream) ,gray-form (apply orig args)))))))
+   stream, and otherwise applies the ORIGINAL definition to its arguments.
+
+   A DEFUN, NOT A CLOSURE IN THE FUNCTION CELL.  A closure is no registered
+   module, so JIT-EAGER never made it native, and a JIT'd caller can only reach
+   a non-native callee through a bridge thunk, which takes at most 3 arguments:
+   every module with a 4-argument FORMAT (or a keyword WRITE-STRING) failed to
+   relocate and stayed interpreted -- 398 of operandi's, including the frames
+   every actor runs inside.  As a DEFUN it is translated like any library code
+   and callers link to it directly.  The original lives in a special that is
+   set only once, so evaluating this file twice cannot capture the wrapper as
+   the original."
+  (let ((orig (intern (concatenate 'string "*%GRAY-ORIG-" (symbol-name name) "*"))))
+    `(progn
+       (defvar ,orig nil)
+       ;; A DEFVAR's init does not run on this path (the image's limitation 7),
+       ;; so set it here -- once, so a second evaluation keeps the original.
+       (unless (and (boundp ',orig) (symbol-value ',orig))
+         (setf (symbol-value ',orig) (symbol-function ',name)))
+       ;; The DEFUN goes through EVAL so it is installed AFTER the line above
+       ;; ran: a unit's DEFUNs are installed before its body executes, and a
+       ;; DEFUN in this same PROGN replaced NAME first, so the original
+       ;; captured was the wrapper itself and every call recursed.
+       (eval '(defun ,name (&rest args)
+                (destructuring-bind ,lambda-list args
+                  (declare (ignorable ,@(remove-if (lambda (x) (member x '(&optional &rest &key)))
+                                                   (mapcar (lambda (x) (if (consp x) (car x) x)) lambda-list))))
+                  (if (%gray-p stream) ,gray-form (apply ,orig args))))))))
 
 (defun %gray-eof (stream eof-error-p eof-value)
   (if eof-error-p (error 'end-of-file :stream stream) eof-value))
@@ -200,14 +219,16 @@
 ;;; The printers resolve their destination inside the image, before any
 ;;; character is written, and reject what they do not recognise; for a Gray
 ;;; destination they render to a string with the original and hand it over.
-(let ((orig (symbol-function 'format)))
-  (setf (symbol-function 'format)
-        (lambda (destination control &rest args)
-          (if (%gray-p destination)
-              (progn (gray-streams:stream-write-string
-                      destination (apply orig nil control args))
-                     nil)
-              (apply orig destination control args)))))
+;;; DEFUNs for the reason %GRAY-WRAP gives.
+(defvar *%gray-orig-format* nil)
+(unless (and (boundp '*%gray-orig-format*) *%gray-orig-format*)
+  (setq *%gray-orig-format* (symbol-function 'format)))
+(defun format (destination control &rest args)
+  (if (%gray-p destination)
+      (progn (gray-streams:stream-write-string
+              destination (apply *%gray-orig-format* nil control args))
+             nil)
+      (apply *%gray-orig-format* destination control args)))
 (%gray-wrap princ (object &optional stream)
   (progn (gray-streams:stream-write-string stream (princ-to-string object)) object))
 (%gray-wrap prin1 (object &optional stream)
@@ -219,17 +240,18 @@
 (%gray-wrap pprint (object &optional stream)
   (progn (gray-streams:stream-terpri stream)
          (gray-streams:stream-write-string stream (prin1-to-string object)) (values)))
-(let ((orig (symbol-function 'write)))
-  (setf (symbol-function 'write)
-        (lambda (object &rest keys)
-          (let ((stream (getf keys :stream)))
-            (if (%gray-p stream)
-                (let ((k (copy-list keys)))
-                  (remf k :stream)
-                  (gray-streams:stream-write-string
-                   stream (apply (function write-to-string) object k))
-                  object)
-                (apply orig object keys))))))
+(defvar *%gray-orig-write* nil)
+(unless (and (boundp '*%gray-orig-write*) *%gray-orig-write*)
+  (setq *%gray-orig-write* (symbol-function 'write)))
+(defun write (object &rest keys)
+  (let ((stream (getf keys :stream)))
+    (if (%gray-p stream)
+        (let ((k (copy-list keys)))
+          (remf k :stream)
+          (gray-streams:stream-write-string
+           stream (apply (function write-to-string) object k))
+          object)
+        (apply *%gray-orig-write* object keys))))
 
 ;;; FORMAT / PRINC / WRITE-TO-STREAM reach character output through
 ;;; %WRITE-CHAR-TO-STREAM, compiled into the image; it consults these.

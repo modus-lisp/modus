@@ -1689,9 +1689,12 @@
               ;; worker parked forever -- and if main was inside a locked
               ;; section, holding the runtime lock the worker then waited on.
               ;; Threads end through the clone stub's own SYS_exit, never here.
-              (if (x64-stw-p)
-                  (emit-bytes buf #x48 #xC7 #xC0 #xE7 #x00 #x00 #x00) ; mov rax, 231
-                  (emit-bytes buf #x48 #xC7 #xC0 #x3C #x00 #x00 #x00)) ; mov rax, 60 (SYS_exit)
+              ;; UNCONDITIONAL: it was gated on (X64-STW-P), which the 2026-09-30
+              ;; merge made a constant NIL (that protocol went dormant), so every
+              ;; image emitted 60 again and an actor program's (uiop:quit) left a
+              ;; zombie leader beside its parked scheduler threads, forever.
+              ;; exit_group is the right call with or without threads.
+              (emit-bytes buf #x48 #xC7 #xC0 #xE7 #x00 #x00 #x00) ; mov rax, 231 (exit_group)
               (emit-bytes buf #x0F #x05))       ; syscall
              ((= code #x0502)
               ;; Generic 3-arg Linux syscall

@@ -5080,6 +5080,15 @@
   (cond
     ((%gf-p x) t)
     ((null x) nil)
+    ;; AN ARRAY IS NEVER A REGISTERED STUB (those are closures, conses and raw
+    ;; fn-addrs; a real gf-object is an array but %GF-P took it above), so it
+    ;; does not walk the registry -- one entry per generic function ever made.
+    ;; FUNCTIONP asks this of every array it sees, and LENGTH asks FUNCTIONP of
+    ;; every vector since it refuses non-sequences: each LENGTH cost a walk as
+    ;; long as the number of GFs, and a library defining many GFs loaded in
+    ;; quadratic time (80 DEFGENERICs: 10.7 s, 19.6 s, 28.9 s against a flat
+    ;; 0.5 s; quicklisp's setup 17 s -> 60 s).
+    ((arrayp x) nil)
     ((member x *gf-stub-closures*) t)
     (t nil)))
 

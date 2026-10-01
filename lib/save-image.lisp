@@ -54,7 +54,12 @@
 ;;;; pair, so they round-trip; the window and heap bytes are moved by read(2)
 ;;;; and write(2) directly and never pass through a Lisp word.
 
-(defun %core-magic () 20261001)   ; 2026-10-01: header words 10/11 (extra range)
+(defun %core-magic () 20261001)   ; 2026-10-01: header words 10/11 (extra range), 12 (build id)
+
+(defun %core-build-id ()
+  "Identity of the binary that writes or restores a core.  The build splices a
+   fresh value after this file (build-cli-common.lisp); 0 = unchecked."
+  0)
 
 (defun %core-jit-arena-lo ()
   "Base of the fixed JIT exec arena (boot-linux-aarch64.lisp
@@ -226,6 +231,7 @@
     (setf (mem-ref (+ hdr 72) :u64) abump)
     (setf (mem-ref (+ hdr 80) :u64) (%core-extra-addr))
     (setf (mem-ref (+ hdr 88) :u64) (%core-extra-len))
+    (setf (mem-ref (+ hdr 96) :u64) (%core-build-id))
     (%core-write-all fd hdr 128)
     (%core-write-all fd (%conv-addr #x10000000) 4096)
     (%core-write-all fd from (- free from))
@@ -311,6 +317,8 @@
     (%core-slice fd hdr 128)
     (when (/= (mem-ref hdr :u64) (%core-magic))
       (%core-die "core: not a Modus core file"))
+    (when (/= (mem-ref (+ hdr 96) :u64) (%core-build-id))
+      (%core-die "core: written by a different modus binary (a core holds addresses into the binary that saved it; re-make it)"))
     (when (/= (mem-ref (+ hdr 8) :u64) from)
       (%core-die "core: heap base differs from this process (the core was saved by an image with a different layout, or the stub did not get its fixed mapping)"))
     (unless (%core-geometry-ok-p (mem-ref (+ hdr 24) :u64))

@@ -1066,7 +1066,14 @@
     ;; kernel-main runs before boot init.  Lives here, not in the hosted layer,
     ;; because the bare-metal Pi image is its whole point (docs/save-and-die.md);
     ;; the arch slots supply the I/O seams (a file on Linux, a RAM range there).
-    (mvm-text "lib/save-image.lisp"))
+    (mvm-text "lib/save-image.lisp")
+    ;; A core holds raw addresses into THIS binary's text (function entries,
+    ;; JIT call targets), so it may only restore under the binary that wrote
+    ;; it.  A fresh id per build, checked by %RESTORE-IMAGE.
+    (format nil "~%(defun %core-build-id () ~D)~%"
+            ;; 28 bits: a fixnum on every target, the 32-bit ones included,
+            ;; because the restore compares it before anything may allocate.
+            (+ 1 (random (- (expt 2 28) 1) (make-random-state t)))))
       ""))
 
 ;;; THE HOSTED PLATFORM LAYER — Linux syscalls, hosted targets only.

@@ -333,7 +333,8 @@ differences:
   constant-vector root is `0x10000F00`, inside the run the shared sequence
   stages, and must land in place.
 
-The core magic moved to 20261001 with the two new header words, so cores
+The core magic moved to 20261001 with the new header words (10/11 extra
+range, 12 build id), so cores
 written before (aarch64 hosted, the Pi) must be re-made; the restore refuses
 them as "not a Modus core file" rather than misreading them.
 
@@ -358,6 +359,17 @@ What else a core has to carry on x64, found by building that operandi core:
 - **Sync cells.**  A mutex object holds its cell's raw address, and the cell
   arena was a random `mmap`; it now comes from the exec arena (`%sync-cell`),
   which is fixed and saved.
+- **Both hosted arches.**  Hosted aarch64 bakes the same band code and carves
+  the same way (0x37FFFE00 → 0x26FFE000 on the first mutex), so the band,
+  geometry and extra-range overrides live in `net/hosted-sync.lisp`, written
+  against the scale-aware `%gc-meta-*` accessors, and serve both.  Validated
+  on a real Pi 5 (hosted aarch64 CLI): `test/run-save-and-die.sh` PASS, restore
+  in 0.06 s.
+- **The binary.**  A core holds raw addresses into the text of the binary that
+  wrote it, so header word 12 carries a per-build id (`%core-build-id`,
+  spliced by `build-cli-common.lisp`); a different binary refuses the core
+  ("written by a different modus binary") instead of jumping into the wrong
+  code.
 - **Not carried, and fine:** the thread page (slot 0x10000DA8) and the lock
   arena root (0x10000D98) are window words, staged, so a restored process maps
   fresh ones on first use; GS base is set when actors start, after restore.

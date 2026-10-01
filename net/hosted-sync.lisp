@@ -3664,3 +3664,47 @@ modus: a thread needed the runtime lock but the lock arena is exhausted or missi
         (let ((a (+ b #x3E00)))
           (%string-to-cstr str a)
           a))))
+
+;;; ============================================================
+;;; SAVE-AND-DIE: the band travels in the core (lib/save-image.lisp)
+;;; ============================================================
+;;;
+;;; The first lock (bordeaux-threads makes one at load) carves the hosted actor
+;;; band off region 0's top (%HA-CARVE): region 0 shrinks, and the band holds
+;;; the sync-cell control words that every mutex's cell is reached through.  It
+;;; lies inside the heap mapping but above region 0's shrunk size, so the live
+;;; range a core carries does not cover it.  These override save-image's
+;;; defaults on both hosted arches (last-defun-wins: this file is spliced after
+;;; the library payload that holds save-image).  The per-thread regions the
+;;; carve also reserves are not saved: a core is taken single-threaded, so they
+;;; hold nothing.  The cells themselves come from the exec arena (%SYNC-CELL),
+;;; which a core carries whole.
+
+(defun %core-extra-addr () (if (> *ha-band* 0) *ha-band* 0))
+(defun %core-extra-len () (if (> *ha-band* 0) *ha-bandsize* 0))
+
+(defun %core-extra-ok-p (addr len)
+  "Inside this process's two semispaces: a fresh boot's region 0, which spans
+   both before any carve."
+  (and (>= addr (%core-from-start))
+       (<= (+ addr len) (+ (%core-to-start) (%core-space-size)))))
+
+(defun %core-geometry-ok-p (saved-size)
+  "A carve only shrinks region 0, so a core saved after one restores into a
+   fresh boot's larger region; %CORE-ADOPT-GEOMETRY then shrinks it."
+  (and (> saved-size #x4000000) (<= saved-size (%core-space-size))))
+
+(defun %core-adopt-geometry (saved-size)
+  "Shrink region 0 to the size it was saved with, moving the live allocation
+   limit with it, and clamp the parked limit as %HA-CARVE does."
+  (if (< saved-size (%core-space-size))
+      (let ((k (%gc-meta-scale))
+            (r0 (%gc-region-0))
+            (end (+ (%core-from-start) saved-size)))
+        (%gc-region-shrink r0 saved-size k)
+        (if (> (%gc-meta-read (+ r0 #x38) k) end)
+            (%gc-meta-write (+ r0 #x38) end k)
+            0))
+      0)
+  saved-size)
+

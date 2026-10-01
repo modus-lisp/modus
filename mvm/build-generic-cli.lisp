@@ -144,27 +144,6 @@
 (defun %core-cons-bitmap-base () (+ (%gc-read64 #x10000E18) #xFE4000))
 ;; +linux-x64-heap-alloc-start+.
 (defun %core-heap-base (from) (- from #x400))
-;; The hosted actor band (net/hosted-actors.lisp): the first bordeaux-threads
-;; lock carves it off region 0's top, and the mutexes' sync-cell control words
-;; live in it.  It is inside the heap mapping, above region 0's shrunk size, so
-;; the live range does not cover it: save it as the extra range, and have the
-;; restore shrink region 0 to the size it was saved with.
-(defun %core-extra-addr () (if (> *ha-band* 0) *ha-band* 0))
-(defun %core-extra-len () (if (> *ha-band* 0) *ha-bandsize* 0))
-(defun %core-extra-ok-p (addr len)
-  (let ((base (%core-heap-base (%core-from-start))))
-    ;; Inside the two semispaces (+linux-x64-gc-midpoint+ * 2), past the
-    ;; padding the stub keeps argc/argv in.
-    (and (>= addr (+ base #x400))
-         (<= (+ addr len) (+ base #x70000000)))))
-(defun %core-geometry-ok-p (saved-size)
-  (and (> saved-size #x4000000) (<= saved-size (%core-space-size))))
-(defun %core-adopt-geometry (saved-size)
-  (when (< saved-size (%core-space-size))
-    (%gc-region-shrink (%gc-region-0) saved-size 1)
-    (when (> (%gc-read64 #x10000078) (+ (%core-from-start) saved-size))
-      (%gc-write64 #x10000078 (+ (%core-from-start) saved-size))))
-  saved-size)
 ;; The shared sequence, with x64's JIT constant-vector root (0x10000F00,
 ;; translate-x64 *x64-jit-constvec-root*) restored IN PLACE: JIT code in the
 ;; arena loads its constants through it, and they live in the heap slice.

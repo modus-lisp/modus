@@ -267,6 +267,21 @@ What stood in the way, in the order found, all fixed:
   happened to be even.  `%gc-epoch` is the fixnum reader; same trap as
   `%gc-count`.
 
+## The Pi rig, scripted (2026-10-01)
+
+`test/run-rpi-core.sh kernel8.img OUT.core [--load=NAME ...] [--probe=FORM
+--expect=TEXT]` is runbook 6c as one command: QEMU raspi3b with the mini-UART
+on the SECOND `-serial` (a unix socket), each `TARS/<name>.tar` placed in RAM by
+`-device loader` at `0x30000000 + 16 MB * k` (QEMU has 1 GB; the board never
+sees these), `test/rpi-core-driver.py` waits for the banner sending nothing,
+installs each tarball with `install-tarball-from-bytes` over `ramv`, runs the
+probe, `save-and-die`s and reads `CORE-END=` with a terminator (an END ADDRESS
+or a BYTE COUNT -- both have been seen -- normalised to an address); the core
+is dumped over the gdbstub, must be over 1 MB, and the same kernel is booted
+again with `-device loader,file=OUT.core,addr=0x18000000` and must print
+`CORE-RESTORED` before its banner and answer the probe.  `kiln image zero2w`
+wraps it (modus-lisp/kiln).
+
 ## The board
 
 **★ VALIDATED ON REAL SILICON (Pi Zero 2 W, 2026-09-06):** produced a core

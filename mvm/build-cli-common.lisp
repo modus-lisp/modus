@@ -1658,6 +1658,14 @@
 ;;; the C-string scratch page instead, since a 32-bit guest's mmap can land
 ;;; above the fixnum range (and it is boot, so nothing else is using it).
 (defun %ignore-sigpipe-source ()
+  ;; BARE METAL HAS NO SIGNALS AND NO mmap: %MMAP-SHARED-PAGE is trap #x0504,
+  ;; which on a bare AArch64 image is an SVC with nothing behind it -- the Pi
+  ;; kernel8.img built from e7ef4e9 died at boot with
+  ;; `!!FAULT E0000000056000504' (EC 0x15 SVC, ISS = the trap number) before
+  ;; its banner, under QEMU raspi3b and the same on the board.  Nothing to
+  ;; ignore there; the shim install still runs.
+  (when (and (boundp '*cli-bare-metal*) *cli-bare-metal*)
+    (return-from %ignore-sigpipe-source "(defun %ignore-sigpipe () 0)"))
   (let ((nr (ecase *cli-arch*
               (:x64 13) ((:aarch64 :riscv64 :riscv32) 134) ((:i386 :arm32) 174))))
     (if (member *cli-arch* '(:x64 :aarch64))

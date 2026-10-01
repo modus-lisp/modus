@@ -1043,26 +1043,37 @@
 (defvar *is-eql-p-item* nil)
 (defun is-eql-p (x) (%make-closure #'closure-eql-fn (cons x nil)))
 (defun is-not-eql-p (x) (%make-closure #'closure-not-eql-fn (cons x nil)))
+;;; SORT IS A MERGE SORT (stable, O(n log n)).  It was an insertion sort for
+;;; lists and vectors alike -- O(n^2): flexi-streams sorts two ~24k-entry
+;;; encoding tables at load time (enc-cn-tbl.lisp), ~300M comparisons, ~40 s of
+;;; a 133 s load.  Merging takes the left run's element unless the right one is
+;;; strictly less, so equal keys keep their order and STABLE-SORT is the same
+;;; code.  Destructive on the list spine, as CLHS SORT allows.
+(defun %merge-lists (a b pred key)
+  (let* ((head (list nil)) (tail head))
+    (loop
+      (cond ((null a) (set-cdr tail b) (return nil))
+            ((null b) (set-cdr tail a) (return nil))
+            ((funcall pred (if key (funcall key (car b)) (car b))
+                           (if key (funcall key (car a)) (car a)))
+             (set-cdr tail b) (setq tail b) (setq b (cdr b)))
+            (t (set-cdr tail a) (setq tail a) (setq a (cdr a)))))
+    (cdr head)))
+
+(defun %merge-sort-list (lst n pred key)
+  "Sort the first N conses of LST (N = its length), returning the new head."
+  (if (< n 2)
+      (progn (when lst (set-cdr lst nil)) lst)
+      (let* ((half (floor n 2))
+             (mid (nthcdr half lst)))
+        (%merge-lists (%merge-sort-list lst half pred key)
+                      (%merge-sort-list mid (- n half) pred key)
+                      pred key))))
+
 (defun %sort-list (seq pred key)
-  ;; Insertion sort over a list — destructive on the spine of result.
   (if (or (null seq) (null (cdr seq)))
       seq
-      (let ((result (list (car seq))))
-        (dolist (item (cdr seq))
-          (let ((iv (if key (funcall key item) item))
-                (rv (if key (funcall key (car result)) (car result))))
-            (if (funcall pred iv rv)
-                (setq result (cons item result))
-                (let ((prev result))
-                  (loop
-                    (when (null (cdr prev))
-                      (set-cdr prev (list item)) (return nil))
-                    (let ((nv (if key (funcall key (cadr prev)) (cadr prev))))
-                      (when (funcall pred iv nv)
-                        (set-cdr prev (cons item (cdr prev)))
-                        (return nil)))
-                    (setq prev (cdr prev)))))))
-        result)))
+      (%merge-sort-list seq (length seq) pred key)))
 
 (defun %sort-vector (seq pred key)
   ;; Insertion sort over a vector, in-place.  Walk i from 1 to len-1;
@@ -1074,6 +1085,16 @@
   ;; fill pointer sorts only its active prefix, not the whole backing store.
   (let ((len (length seq))
         (str-p (stringp seq)))
+    ;; Past a few elements: merge-sort a list of the elements (AREF already
+    ;; presents a string's codes as characters) and store them back -- the
+    ;; insertion sort below is O(n^2); see %SORT-LIST.
+    (when (> len 8)
+      (let ((l nil) (i (- len 1)))
+        (loop (when (< i 0) (return nil)) (setq l (cons (aref seq i) l)) (setq i (- i 1)))
+        (let ((sorted (%sort-list l pred key)) (k 0))
+          (loop (when (null sorted) (return nil))
+            (aset seq k (car sorted)) (setq sorted (cdr sorted)) (setq k (+ k 1))))
+        (return-from %sort-vector seq)))
     (let ((i 1))
       (loop
         (when (>= i len) (return seq))
@@ -1105,7 +1126,7 @@
       (t (%sort-vector seq pred key)))))
 
 (defun stable-sort (seq pred &rest options)
-  ;; Insertion sort is naturally stable; same impl.
+  ;; The merge sort is stable; same impl.
   (%seq-subst-check-kwargs options)
   (let ((key nil) (a options))
     (loop (when (null a) (return))

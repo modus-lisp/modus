@@ -8,17 +8,17 @@
 ;;; GOP framebuffer provides higher quality graphics when UEFI GOP is present.
 ;;;
 ;;; Memory layout (set up by UEFI boot stub):
-;;;   0x600100: fb_base     (u64, pre-tagged = raw_addr << 1)
-;;;   0x600108: ppsl        (u32, raw pixels-per-scan-line)
-;;;   0x60010C: pixel_fmt   (u32, raw 0=RGBX, 1=BGRX)
-;;;   0x600110: cursor_x    (u32, raw text column — framebuffer)
-;;;   0x600114: cursor_y    (u32, raw text row — framebuffer)
-;;;   0x600118: text_cols   (u32, raw)
-;;;   0x60011C: text_rows   (u32, raw)
-;;;   0x600120: fb_valid    (u32, 1 if GOP found)
-;;;   0x600130: vga_cursor_x (u32, raw text column — VGA text mode)
-;;;   0x600134: vga_cursor_y (u32, raw text row — VGA text mode)
-;;;   0x601000: font data   (95 chars × 8 bytes)
+;;;   0x1B000: fb_base     (u64, pre-tagged = raw_addr << 1)
+;;;   0x1B008: ppsl        (u32, raw pixels-per-scan-line)
+;;;   0x1B00C: pixel_fmt   (u32, raw 0=RGBX, 1=BGRX)
+;;;   0x1B010: cursor_x    (u32, raw text column — framebuffer)
+;;;   0x1B014: cursor_y    (u32, raw text row — framebuffer)
+;;;   0x1B018: text_cols   (u32, raw)
+;;;   0x1B01C: text_rows   (u32, raw)
+;;;   0x1B020: fb_valid    (u32, 1 if GOP found)
+;;;   0x1B030: vga_cursor_x (u32, raw text column — VGA text mode)
+;;;   0x1B034: vga_cursor_y (u32, raw text row — VGA text mode)
+;;;   0x1B100: font data   (95 chars × 8 bytes)
 ;;;   0x601800: scancode normal  (128 bytes)
 ;;;   0x601880: scancode shifted (128 bytes)
 ;;;   0x601900: shift_state (u32, 0 or 1)
@@ -29,10 +29,10 @@
 ;;; Each cell: 2 bytes = char + attribute.
 ;;; Attribute 0x0F = bright white on black.
 
-(defun vga-cursor-x ()  (mem-ref #x600130 :u32))
-(defun vga-cursor-y ()  (mem-ref #x600134 :u32))
-(defun vga-set-cursor-x (v) (setf (mem-ref #x600130 :u32) v))
-(defun vga-set-cursor-y (v) (setf (mem-ref #x600134 :u32) v))
+(defun vga-cursor-x ()  (mem-ref #x1B030 :u32))
+(defun vga-cursor-y ()  (mem-ref #x1B034 :u32))
+(defun vga-set-cursor-x (v) (setf (mem-ref #x1B030 :u32) v))
+(defun vga-set-cursor-y (v) (setf (mem-ref #x1B034 :u32) v))
 
 (defun vga-cell-addr (col row)
   (let ((c col) (r row))
@@ -111,16 +111,16 @@
 ;;; :u32 loads auto-tag (SHL 1), :u32 stores auto-untag (SHR 1).
 ;;; fb_base stored pre-tagged, loaded with :u64 (raw bits = tagged addr).
 
-(defun fb-base ()      (mem-ref #x600100 :u64))
-(defun fb-ppsl ()      (mem-ref #x600108 :u32))
-(defun fb-cursor-x ()  (mem-ref #x600110 :u32))
-(defun fb-cursor-y ()  (mem-ref #x600114 :u32))
-(defun fb-text-cols () (mem-ref #x600118 :u32))
-(defun fb-text-rows () (mem-ref #x60011C :u32))
-(defun fb-valid ()     (mem-ref #x600120 :u32))
+(defun fb-base ()      (mem-ref #x1B000 :u64))
+(defun fb-ppsl ()      (mem-ref #x1B008 :u32))
+(defun fb-cursor-x ()  (mem-ref #x1B010 :u32))
+(defun fb-cursor-y ()  (mem-ref #x1B014 :u32))
+(defun fb-text-cols () (mem-ref #x1B018 :u32))
+(defun fb-text-rows () (mem-ref #x1B01C :u32))
+(defun fb-valid ()     (mem-ref #x1B020 :u32))
 
-(defun fb-set-cursor-x (v) (setf (mem-ref #x600110 :u32) v))
-(defun fb-set-cursor-y (v) (setf (mem-ref #x600114 :u32) v))
+(defun fb-set-cursor-x (v) (setf (mem-ref #x1B010 :u32) v))
+(defun fb-set-cursor-y (v) (setf (mem-ref #x1B014 :u32) v))
 
 ;;; ============================================================
 ;;; Pixel writing
@@ -176,10 +176,10 @@
 (defun fb-font-addr (ch)
   (let ((c ch))
     (if (< c 32)
-        #x601000
+        #x1B100
       (if (> c 126)
-          #x601000
-        (+ #x601000 (* (- c 32) 8))))))
+          #x1B100
+        (+ #x1B100 (* (- c 32) 8))))))
 
 (defun fb-text-addr (col row)
   ;; byte_offset = (row * ppsl + col) * 32

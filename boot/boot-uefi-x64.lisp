@@ -29,15 +29,20 @@
 (defconstant +gop-guid-qw1+ #x6A5180D0DE7AFB96)
 
 ;; Framebuffer info memory layout
-(defconstant +fb-info-base+   #x600100)  ; fb_base (u64, pre-tagged)
-(defconstant +fb-ppsl-addr+   #x600108)  ; ppsl (u32, raw)
-(defconstant +fb-pixfmt-addr+ #x60010C)  ; pixel_format (u32)
-(defconstant +fb-cx-addr+     #x600110)  ; cursor_x (u32)
-(defconstant +fb-cy-addr+     #x600114)  ; cursor_y (u32)
-(defconstant +fb-tcols-addr+  #x600118)  ; text_cols (u32)
-(defconstant +fb-trows-addr+  #x60011C)  ; text_rows (u32)
-(defconstant +fb-valid-addr+  #x600120)  ; fb_valid (u32)
-(defconstant +font-base+      #x601000)  ; 95 chars × 8 bytes
+;; THE FRAMEBUFFER WORDS AND THE FONT LIVE BELOW THE IMAGE, NOT AT 0x600100 /
+;; 0x601000: those addresses are INSIDE a 47 MB CL image's native code (they
+;; landed on USER-HOMEDIR-PATHNAME), so every UEFI boot overwrote live code.
+;; 0x1B000.. is free low RAM: page tables 0x10000, IDT 0x18000, SNP status
+;; 0x1A000 (one page) all end below it.
+(defconstant +fb-info-base+   #x1B000)  ; fb_base (u64, pre-tagged)
+(defconstant +fb-ppsl-addr+   #x1B008)  ; ppsl (u32, raw)
+(defconstant +fb-pixfmt-addr+ #x1B00C)  ; pixel_format (u32)
+(defconstant +fb-cx-addr+     #x1B010)  ; cursor_x (u32)
+(defconstant +fb-cy-addr+     #x1B014)  ; cursor_y (u32)
+(defconstant +fb-tcols-addr+  #x1B018)  ; text_cols (u32)
+(defconstant +fb-trows-addr+  #x1B01C)  ; text_rows (u32)
+(defconstant +fb-valid-addr+  #x1B020)  ; fb_valid (u32)
+(defconstant +font-base+      #x1B100)  ; 95 chars × 8 bytes
 (defconstant +scan-normal+    #x601800)  ; 128 bytes
 (defconstant +scan-shifted+   #x601880)  ; 128 bytes
 (defconstant +shift-state+    #x601900)  ; u32
@@ -859,8 +864,8 @@
   (emit-x64-out buf #x3D5 #x20)   ; bit 5 = cursor disable
 
   ;; Zero VGA cursor position
-  (uefi-emit-store-imm32-abs32 buf #x600130 0)
-  (uefi-emit-store-imm32-abs32 buf #x600134 0))
+  (uefi-emit-store-imm32-abs32 buf #x1B030 0)
+  (uefi-emit-store-imm32-abs32 buf #x1B034 0))
 
 ;;; ============================================================
 ;;; The actual UEFI entry stub (rewritten cleanly)
@@ -1361,7 +1366,7 @@
     ;; mov [0x600100], rdi
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89)
     (mvm-emit-byte buf #x3C) (mvm-emit-byte buf #x25)
-    (mvm-emit-u32 buf #x600100)
+    (mvm-emit-u32 buf #x1B000)
 
     ;; ppsl = framebuffer_pitch / 4  (bytes → pixels)
     ;; mov esi, [rax+96]
@@ -1370,7 +1375,7 @@
     (mvm-emit-byte buf #xC1) (mvm-emit-byte buf #xEE) (mvm-emit-byte buf 2)
     ;; mov [0x600108], esi
     (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x34) (mvm-emit-byte buf #x25)
-    (mvm-emit-u32 buf #x600108)
+    (mvm-emit-u32 buf #x1B008)
 
     ;; text_cols = width / 8
     ;; mov edx, [rax+100]
@@ -1379,7 +1384,7 @@
     (mvm-emit-byte buf #xC1) (mvm-emit-byte buf #xEA) (mvm-emit-byte buf 3)
     ;; mov [0x600118], edx
     (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x14) (mvm-emit-byte buf #x25)
-    (mvm-emit-u32 buf #x600118)
+    (mvm-emit-u32 buf #x1B018)
 
     ;; text_rows = height / 8
     ;; mov ecx, [rax+104]
@@ -1388,11 +1393,11 @@
     (mvm-emit-byte buf #xC1) (mvm-emit-byte buf #xE9) (mvm-emit-byte buf 3)
     ;; mov [0x60011C], ecx
     (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x0C) (mvm-emit-byte buf #x25)
-    (mvm-emit-u32 buf #x60011C)
+    (mvm-emit-u32 buf #x1B01C)
 
     ;; cursor_x = 0, cursor_y = 0
-    (uefi-emit-store-imm32-abs32 buf #x600110 0)
-    (uefi-emit-store-imm32-abs32 buf #x600114 0)
+    (uefi-emit-store-imm32-abs32 buf #x1B010 0)
+    (uefi-emit-store-imm32-abs32 buf #x1B014 0)
     ;; fb_valid = 1
     (uefi-emit-store-imm32-abs32 buf +fb-valid-addr+ 1)
 
@@ -1449,30 +1454,30 @@
    Diagnostic: step beeps at 1000Hz, DSPASURF[31:28]+1 beeps at 2000Hz."
   (let (skip-jumps)
     ;; Init step counter = 0
-    (uefi-emit-store-imm32-abs32 buf #x600150 0)
+    (uefi-emit-store-imm32-abs32 buf #x1B050 0)
 
     ;; Skip if framebuffer already detected (from multiboot info)
-    (uefi-emit-load-eax-abs32 buf #x600120)
+    (uefi-emit-load-eax-abs32 buf #x1B020)
     (mvm-emit-byte buf #x85) (mvm-emit-byte buf #xC0)    ; test eax, eax
     (let ((p (mvm-buffer-position buf)))
       (mvm-emit-byte buf #x0F) (mvm-emit-byte buf #x85) (mvm-emit-u32 buf 0)
       (push (cons p 6) skip-jumps))                        ; jnz skip
     ;; Step 1: fb_valid was 0 (good, proceeding)
-    (uefi-emit-store-imm32-abs32 buf #x600150 1)
+    (uefi-emit-store-imm32-abs32 buf #x1B050 1)
 
     ;; Check Intel GPU exists at bus 0, dev 2, fn 0
     (emit-pci-config-read32 buf #x80001000)
-    (uefi-emit-store-eax-abs32 buf #x600154)               ; save vendor/device
+    (uefi-emit-store-eax-abs32 buf #x1B054)               ; save vendor/device
     (mvm-emit-byte buf #x66) (mvm-emit-byte buf #x3D) (mvm-emit-u16 buf #x8086)
     (let ((p (mvm-buffer-position buf)))
       (mvm-emit-byte buf #x0F) (mvm-emit-byte buf #x85) (mvm-emit-u32 buf 0)
       (push (cons p 6) skip-jumps))
     ;; Step 2: vendor is Intel
-    (uefi-emit-store-imm32-abs32 buf #x600150 2)
+    (uefi-emit-store-imm32-abs32 buf #x1B050 2)
 
     ;; Read BAR0 (MMIO) at GPU bus 0/dev 2/fn 0/offset 0x10
     (emit-pci-config-read32 buf #x80001010)
-    (uefi-emit-store-eax-abs32 buf #x600158)
+    (uefi-emit-store-eax-abs32 buf #x1B058)
     (mvm-emit-byte buf #x25) (mvm-emit-u32 buf #xFFFFFFF0)
     (mvm-emit-byte buf #x85) (mvm-emit-byte buf #xC0)
     (let ((p (mvm-buffer-position buf)))
@@ -1481,18 +1486,18 @@
     ;; r10 = MMIO base
     (mvm-emit-byte buf #x41) (mvm-emit-byte buf #x89) (mvm-emit-byte buf #xC2)
     ;; Step 3: BAR0 non-zero
-    (uefi-emit-store-imm32-abs32 buf #x600150 3)
+    (uefi-emit-store-imm32-abs32 buf #x1B050 3)
 
     ;; Read BAR2 (GTT aperture) at offset 0x18
     (emit-pci-config-read32 buf #x80001018)
-    (uefi-emit-store-eax-abs32 buf #x60015C)               ; save raw BAR2
+    (uefi-emit-store-eax-abs32 buf #x1B05C)               ; save raw BAR2
     (mvm-emit-byte buf #x25) (mvm-emit-u32 buf #xFFFFFFF0)
     ;; r11 = aperture base (may be 0 if not assigned)
     (mvm-emit-byte buf #x41) (mvm-emit-byte buf #x89) (mvm-emit-byte buf #xC3)
 
     ;; Read BDSM from MCH (bus 0/dev 0/fn 0/offset 0xB0) — FIXED! was 0xB8 (TSEGMB)
     (emit-pci-config-read32 buf #x800000B0)
-    (uefi-emit-store-eax-abs32 buf #x600160)               ; save raw BDSM
+    (uefi-emit-store-eax-abs32 buf #x1B060)               ; save raw BDSM
     (mvm-emit-byte buf #x25) (mvm-emit-u32 buf #xFFF00000)
     (mvm-emit-byte buf #x85) (mvm-emit-byte buf #xC0)
     (let ((p (mvm-buffer-position buf)))
@@ -1501,40 +1506,40 @@
     ;; r13 = BDSM (physical stolen memory base)
     (mvm-emit-byte buf #x41) (mvm-emit-byte buf #x89) (mvm-emit-byte buf #xC5)
     ;; Step 4: BDSM non-zero (now reading correct register!)
-    (uefi-emit-store-imm32-abs32 buf #x600150 4)
+    (uefi-emit-store-imm32-abs32 buf #x1B050 4)
 
     ;; Save current display registers for diagnostics
     ;; DSPASURF at MMIO + 0x7019C
     (mvm-emit-byte buf #x41) (mvm-emit-byte buf #x8B) (mvm-emit-byte buf #x82)
     (mvm-emit-u32 buf #x7019C)
-    (uefi-emit-store-eax-abs32 buf #x600164)               ; save DSPASURF
+    (uefi-emit-store-eax-abs32 buf #x1B064)               ; save DSPASURF
     ;; DSPACNTR at MMIO + 0x70180
     (mvm-emit-byte buf #x41) (mvm-emit-byte buf #x8B) (mvm-emit-byte buf #x82)
     (mvm-emit-u32 buf #x70180)
-    (uefi-emit-store-eax-abs32 buf #x600168)               ; save DSPACNTR
+    (uefi-emit-store-eax-abs32 buf #x1B068)               ; save DSPACNTR
     ;; DSPALINOFF at MMIO + 0x70184
     (mvm-emit-byte buf #x41) (mvm-emit-byte buf #x8B) (mvm-emit-byte buf #x82)
     (mvm-emit-u32 buf #x70184)
-    (uefi-emit-store-eax-abs32 buf #x60016C)               ; save DSPALINOFF
+    (uefi-emit-store-eax-abs32 buf #x1B06C)               ; save DSPALINOFF
     ;; DSPASTRIDE at MMIO + 0x70188
     (mvm-emit-byte buf #x41) (mvm-emit-byte buf #x8B) (mvm-emit-byte buf #x82)
     (mvm-emit-u32 buf #x70188)
-    (uefi-emit-store-eax-abs32 buf #x600170)               ; save DSPASTRIDE
+    (uefi-emit-store-eax-abs32 buf #x1B070)               ; save DSPASTRIDE
     ;; PIPEASRC at MMIO + 0x6001C
     (mvm-emit-byte buf #x41) (mvm-emit-byte buf #x8B) (mvm-emit-byte buf #x82)
     (mvm-emit-u32 buf #x6001C)
-    (uefi-emit-store-eax-abs32 buf #x600174)               ; save PIPEASRC
+    (uefi-emit-store-eax-abs32 buf #x1B074)               ; save PIPEASRC
     ;; DSPASURFLIVE at MMIO + 0x701AC (actual surface address GPU is reading NOW)
     (mvm-emit-byte buf #x41) (mvm-emit-byte buf #x8B) (mvm-emit-byte buf #x82)
     (mvm-emit-u32 buf #x701AC)
-    (uefi-emit-store-eax-abs32 buf #x600178)               ; save DSPASURFLIVE
+    (uefi-emit-store-eax-abs32 buf #x1B078)               ; save DSPASURFLIVE
     ;; Step 5: registers saved
-    (uefi-emit-store-imm32-abs32 buf #x600150 5)
+    (uefi-emit-store-imm32-abs32 buf #x1B050 5)
 
     ;; === PHASE 1: Fill 8MB white at BDSM + DSPASURF ===
     ;; DSPASURF is a GGTT offset. With identity mapping in stolen memory,
     ;; the physical address is BDSM + DSPASURF.
-    (uefi-emit-load-eax-abs32 buf #x600164)                ; eax = DSPASURF
+    (uefi-emit-load-eax-abs32 buf #x1B064)                ; eax = DSPASURF
     ;; mov edi, eax  (DSPASURF)
     (mvm-emit-byte buf #x89) (mvm-emit-byte buf #xC7)
     ;; add rdi, r13  (BDSM + DSPASURF)
@@ -1545,14 +1550,14 @@
     (mvm-emit-byte buf #xF3)
     (mvm-emit-byte buf #xAB)                                 ; rep stosd
     ;; Step 6: BDSM+DSPASURF fill done
-    (uefi-emit-store-imm32-abs32 buf #x600150 6)
+    (uefi-emit-store-imm32-abs32 buf #x1B050 6)
 
     ;; === PHASE 2: Fill 8MB white at BAR2 + DSPASURF (through GTT aperture) ===
     (mvm-emit-byte buf #x41) (mvm-emit-byte buf #x85)
     (mvm-emit-byte buf #xDB)                                 ; test r11d, r11d
     (let ((skip-bar2a-pos (mvm-buffer-position buf)))
       (mvm-emit-byte buf #x74) (mvm-emit-byte buf 0)        ; jz skip_bar2a
-      (uefi-emit-load-eax-abs32 buf #x600164)               ; eax = DSPASURF
+      (uefi-emit-load-eax-abs32 buf #x1B064)               ; eax = DSPASURF
       ;; mov edi, eax
       (mvm-emit-byte buf #x89) (mvm-emit-byte buf #xC7)
       ;; add rdi, r11  (BAR2 + DSPASURF)
@@ -1567,7 +1572,7 @@
         (setf (aref bytes (1+ skip-bar2a-pos))
               (logand #xFF (- (mvm-buffer-position buf) skip-bar2a-pos 2)))))
     ;; Step 7: BAR2+DSPASURF fill done
-    (uefi-emit-store-imm32-abs32 buf #x600150 7)
+    (uefi-emit-store-imm32-abs32 buf #x1B050 7)
 
     ;; === PHASE 3: Fill 4MB white at BDSM+0 (start of stolen memory) ===
     ;; In case DSPASURF=0 (this overlaps with phase 1, that's fine)
@@ -1599,12 +1604,12 @@
     ;; WBINVD: flush all caches so GPU sees our writes
     (mvm-emit-byte buf #x0F) (mvm-emit-byte buf #x09)
     ;; Step 8: all fills + flush done
-    (uefi-emit-store-imm32-abs32 buf #x600150 8)
+    (uefi-emit-store-imm32-abs32 buf #x1B050 8)
 
     ;; === Set up fb_info for kernel ===
     ;; fb_base = (BDSM + DSPASURF) << 1 (pre-tagged for MVM)
     ;; Kernel will write characters to where the display pipeline reads from
-    (uefi-emit-load-eax-abs32 buf #x600164)                ; eax = DSPASURF
+    (uefi-emit-load-eax-abs32 buf #x1B064)                ; eax = DSPASURF
     ;; mov edi, eax
     (mvm-emit-byte buf #x89) (mvm-emit-byte buf #xC7)
     ;; add rdi, r13  (rdi = BDSM + DSPASURF)
@@ -1614,13 +1619,13 @@
     ;; mov [0x600100], rdi
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89)
     (mvm-emit-byte buf #x3C) (mvm-emit-byte buf #x25)
-    (mvm-emit-u32 buf #x600100)
+    (mvm-emit-u32 buf #x1B000)
     ;; Read stride from DSPASTRIDE at MMIO + 0x70188
     (mvm-emit-byte buf #x41) (mvm-emit-byte buf #x8B) (mvm-emit-byte buf #x82)
     (mvm-emit-u32 buf #x70188)
     ;; ppsl = stride / 4
     (uefi-emit-shr-eax-imm buf 2)
-    (uefi-emit-store-eax-abs32 buf #x600108)
+    (uefi-emit-store-eax-abs32 buf #x1B008)
     ;; Read resolution from PIPEASRC at MMIO + 0x6001C
     (mvm-emit-byte buf #x41) (mvm-emit-byte buf #x8B) (mvm-emit-byte buf #x82)
     (mvm-emit-u32 buf #x6001C)
@@ -1629,15 +1634,15 @@
     (mvm-emit-byte buf #x25) (mvm-emit-u32 buf #xFFFF)     ; and eax, 0xFFFF
     (mvm-emit-byte buf #xFF) (mvm-emit-byte buf #xC0)      ; inc eax (height)
     (uefi-emit-shr-eax-imm buf 3)                           ; / 8 = text_rows
-    (uefi-emit-store-eax-abs32 buf #x60011C)
+    (uefi-emit-store-eax-abs32 buf #x1B01C)
     (mvm-emit-byte buf #xC1) (mvm-emit-byte buf #xE9) (mvm-emit-byte buf 16) ; shr ecx, 16
     (mvm-emit-byte buf #xFF) (mvm-emit-byte buf #xC1)      ; inc ecx (width)
     (mvm-emit-byte buf #x89) (mvm-emit-byte buf #xC8)      ; mov eax, ecx
     (uefi-emit-shr-eax-imm buf 3)                           ; / 8 = text_cols
-    (uefi-emit-store-eax-abs32 buf #x600118)
+    (uefi-emit-store-eax-abs32 buf #x1B018)
     ;; cursor = 0, fb_valid = 1
-    (uefi-emit-store-imm32-abs32 buf #x600110 0)
-    (uefi-emit-store-imm32-abs32 buf #x600114 0)
+    (uefi-emit-store-imm32-abs32 buf #x1B010 0)
+    (uefi-emit-store-imm32-abs32 buf #x1B014 0)
     (uefi-emit-store-imm32-abs32 buf +fb-valid-addr+ 1)
 
     ;; All skip jumps land here
@@ -1654,7 +1659,7 @@
   (mvm-emit-byte buf #x04) (mvm-emit-byte buf #x25)
   (mvm-emit-u32 buf #x600000) (mvm-emit-u32 buf 0)
   ;; Zero the entire fb info region 0x600100-0x600140 (64 bytes = 8 qwords)
-  (uefi-emit-mov-reg-imm64 buf +rdi+ #x600100)
+  (uefi-emit-mov-reg-imm64 buf +rdi+ #x1B000)
   ;; xor rax, rax
   (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x31) (mvm-emit-byte buf #xC0)
   ;; mov ecx, 8
@@ -1772,7 +1777,7 @@
   (emit-uefi-scancode-tables buf)
   ;; === Diagnostic beep group 1: step count at 1000Hz ===
   ;; [0x600150]+1 beeps: tells user how far PCI detection got (1-9)
-  (uefi-emit-load-eax-abs32 buf #x600150)              ; eax = step counter
+  (uefi-emit-load-eax-abs32 buf #x1B050)              ; eax = step counter
   (mvm-emit-byte buf #xFF) (mvm-emit-byte buf #xC0)    ; inc eax
   (mvm-emit-byte buf #x89) (mvm-emit-byte buf #xC3)    ; mov ebx, eax (loop counter)
   (let ((loop-top (mvm-buffer-position buf)))
@@ -1789,7 +1794,7 @@
   ;; Beeps = (DSPASURF >> 28) + 1.  Tells user the address range:
   ;; 1 beep = 0x0_______, 2 = 0x1_______, ..., 16 = 0xF_______
   ;; Helps diagnose whether DSPASURF is a small GTT offset or large physical addr
-  (uefi-emit-load-eax-abs32 buf #x600164)              ; eax = DSPASURF
+  (uefi-emit-load-eax-abs32 buf #x1B064)              ; eax = DSPASURF
   (uefi-emit-shr-eax-imm buf 28)                        ; eax = top nibble (0-15)
   (mvm-emit-byte buf #xFF) (mvm-emit-byte buf #xC0)    ; inc eax (1-16)
   (mvm-emit-byte buf #x89) (mvm-emit-byte buf #xC3)    ; mov ebx, eax

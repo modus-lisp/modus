@@ -561,6 +561,25 @@
       (mcgc-store #x10000E30 0)                           ; alloc_page
       (mcgc-store #x10000E38 (x64-mcgc-data-end)))        ; data_end
 
+    ;; ZERO THE COLLECTOR'S METADATA: descriptors, the object-start bitmap, the
+    ;; free list and the CONS-KIND bitmap (at bitmap_base + the translator's
+    ;; delta).  QEMU hands us zero RAM so this changed nothing there; real DRAM
+    ;; does not, and a stale bit is a wrongly accepted or rejected root.  The
+    ;; range is computed from the same geometry the config words above store.
+    (let* ((bm-bytes (ash (- (x64-mcgc-data-end) +x64-mcgc-data-base+) -7))
+           (delta (let ((s (find-symbol "*MCGC-KINDBITMAP-DELTA*" "MODUS.MVM.X64")))
+                    (if (and s (boundp s)) (symbol-value s) #xFE4000)))
+           (lo (x64-mcgc-meta-base))
+           (hi (logand (+ (x64-mcgc-bitmap-base) delta bm-bytes #xFFF) (lognot #xFFF)))
+           (stack-top (x64-effective-stack-top)))
+      (when (and (> stack-top lo) (> (+ hi #x800000) stack-top))
+        (error "x64 GC metadata/kind bitmap end ~X is within 8 MB of the stack top ~X" hi stack-top))
+      ;; mov rdi, lo ; mov rcx, qwords ; xor eax, eax ; rep stosq
+      (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF) (mvm-emit-u32 buf lo) (mvm-emit-u32 buf 0)
+      (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xB9) (mvm-emit-u32 buf (ash (- hi lo) -3)) (mvm-emit-u32 buf 0)
+      (mvm-emit-byte buf #x31) (mvm-emit-byte buf #xC0)
+      (mvm-emit-byte buf #xF3) (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xAB))
+
     ;; RBP = frame pointer (same as RSP initially)
     ;; mov rbp, rsp
     (mvm-emit-byte buf #x48)          ; REX.W
@@ -1179,7 +1198,11 @@
     ;; can fire and longjmp out of infinite-loop tests.  In the original
     ;; boot, IRQs stayed disabled and Lisp used (sti-hlt) at idle points
     ;; only.  For ANSI testing the timer must fire throughout each test.
-    (mvm-emit-byte buf #xFB))   ; sti
+    ;; MODUS_X64_NO_STI=1 (A/B knob): leave IRQs masked for the whole run --
+    ;; no PIT tick ever lands on a Lisp stack.  io-delay on the CL image is a
+    ;; RAM-read loop and halt is HLT, so nothing needs the timer.
+    (unless (let ((v (sb-ext:posix-getenv "MODUS_X64_NO_STI"))) (and v (string= v "1")))
+      (mvm-emit-byte buf #xFB)))   ; sti
   )
 
 (defun emit-x64-ap-trampoline (buf)

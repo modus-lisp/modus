@@ -243,6 +243,53 @@ keeps emitting IN/OUT inline and the handler makes them work.
 * The UEFI image is the toy Lisp, not the CL stack with SSH.  "Attested SSH"
   needs a UEFI build of the SSH image (`build-x64-ssh` is multiboot today).
 
+## Attestable image generation: `kiln image` (2026-10-01)
+
+The recipe moved into kiln (`kiln image`, `boot/image.sh`, `boot/image-deps.py`
+in modus-lisp/kiln): build the generic UEFI CL image (net + SSH, SNP mode by
+`--snp`), resolve the requested systems and their dependency closure to tarballs
+(modus-lisp repos by `git archive` at `repos.lock`'s pins, Quicklisp releases
+from `~/quicklisp`, unresolved names LISTED), boot under QEMU, `ql:quickload`
+them in dependency order, `save-and-die`, pull the core out over QMP, boot the
+same image with the core back in RAM and run a probe; write `generic.efi`,
+`modus.core`, `packages.json` and `manifest.json` with every hash and pin.  The
+measured artifact today is `generic.efi` (via `-kernel` under the AmdSev OVMF);
+the core is attested by its sha256 in the manifest -- and it is NOT reproducible:
+two runs of the same recipe on the same image gave cores of 149,572,592 and
+149,641,312 bytes differing in 3.9 MB (network timing, hash-table order, the
+PRNG seed all reach the heap).  A verifier therefore pins a core it produced or
+audited itself; the DDC property belongs to `generic.efi` alone.  Folding the core into the
+measured image (a PE section the stub copies to 0x20000000, or the measured
+initrd) is the next step.  docs/save-and-die.md has the x64 rig.
+
+**Two defects in the UEFI image found on the way, both fixed:**
+
+* **The stub wrote inside the image's own code.**  The framebuffer words
+  (0x600100..), the VGA/PCI diagnostic words (0x600150..0x600178) and the
+  760-byte font (0x601000) all lie inside the 47 MB CL image -- on
+  `USER-HOMEDIR-PATHNAME` -- so every UEFI boot overwrote live native code.
+  They live at 0x1B000.. now (page tables 0x10000, IDT 0x18000, SNP status
+  0x1A000 all end below it); net/uefi-console.lisp reads the same addresses.
+* **The bare x64 collector copied objects as the wrong type.**  Every
+  multi-collection library load (alexandria over the network, or from a
+  tarball placed in RAM, under UEFI or multiboot alike) failed about three
+  times in four with `TYPE-ERROR NIL` / `READER-ERROR` mid-file or `REPL-DIED`
+  with an unprintable condition, moving between identical runs; cl-base64
+  (two collections) passed; hosted x64 passed 8 of 8 but collects ONCE during
+  that load, measured (its 896 MB semispace was sized to avoid collecting).
+  The cons-kind scan_word reject -- the check that stops a conservative stack
+  word aliasing a live object's base with a cons tag from being copied as a
+  16-byte cons with a forwarding word stamped over the object's header -- was
+  forced OFF on bare x64 on the argument that its bitmap address was a Linux
+  layout constant.  A/B on identical source, four instances each: reject OFF
+  1 of 4; interrupts masked with reject OFF 1 of 4; reject ON 4 of 4, then 8
+  of 8, each through five collections.  It is ON on bare x64 now
+  (`MODUS_X64_KINDCHECK=0` for the A/B), boot-x64 zeroes the metadata and both
+  bitmaps (real DRAM is not zero), and the kind-bitmap delta is a defvar set
+  from the Linux layout instead of a constant asserted against it.  The RED
+  arms each carry the symptom in the serial log now: the x64 kernel epilogue
+  prints `REPL-DIED: <condition>` instead of halting silently.
+
 ## Next
 
 1. A host: kernel ≥ 6.11 with SNP, QEMU ≥ 9.1, `OVMF.amdsev.fd`; then

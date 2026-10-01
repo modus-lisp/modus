@@ -135,12 +135,19 @@
 (defun %gc-force ()
   "Run the collector NOW: lower the allocation limit to the allocation pointer
    so the next allocation trips its gc-check, then allocate.  Loops until the
-   collection counter at 0x10000060 moves."
-  (let ((before (mem-ref #x10000060 :u64)))
+   active region's collection count moves.
+
+   %GC-EPOCH, NOT A :u64 READ OF THE COUNT WORD: x64 stores the count RAW, and
+   a :u64 load hands the raw word back as a tagged VALUE -- an ODD count is an
+   immediate, not a fixnum, so (> after before) was never true and this looped
+   forcing collections forever (17 a second, measured on the UEFI image after
+   five natural collections; it had worked by luck whenever the count was
+   even).  The same trap mvm/gc.lisp documents for %GC-COUNT."
+  (let ((before (%gc-epoch)))
     (loop
       (set-alloc-limit (get-alloc-ptr))
       (let ((probe (cons 1 2)))
-        (when (> (mem-ref #x10000060 :u64) before)
+        (when (> (%gc-epoch) before)
           (return (car probe)))))))
 
 (defun %gc-force-to-space-0 ()

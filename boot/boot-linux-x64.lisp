@@ -24,8 +24,14 @@
 ;; heap_end+0 on the overshoot of the second collection.  16 MB of guard past the
 ;; second from_end is far more than any plausible inter-check overshoot.
 (defconstant +linux-x64-gc-guard+ #x1000000)    ; 16MB guard past the 2nd semispace
-(defconstant +linux-x64-gc-midpoint+ #x38000000)  ; 896MB semispace (2x orig): self-compile ~580MB total alloc fits WITHOUT a collection (avoids the large-working-set-collection corruption). Total mmap 2x896MB+guard ~1.8GB < 2GB imm32 cap.
-(defconstant +linux-x64-heap-data-size+ (+ #x70000000 +linux-x64-gc-guard+))  ; 1792MB + 16MB guard
+(defconstant +linux-x64-gc-midpoint+
+  ;; MODUS_X64_MIDPOINT=<bytes> (A/B knob, host build time): a SMALL semispace
+  ;; makes a hosted library load collect several times with a large live set,
+  ;; the way the 104 MB bare-x64 heap does -- the shape the default below was
+  ;; chosen to avoid.  Must be a multiple of 1024 (see +linux-x64-heap-alloc-start+).
+  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_X64_MIDPOINT")))
+    (if (and v (plusp (length v))) (parse-integer v) #x38000000)))  ; 896MB semispace (2x orig): self-compile ~580MB total alloc fits WITHOUT a collection (avoids the large-working-set-collection corruption). Total mmap 2x896MB+guard ~1.8GB < 2GB imm32 cap.
+(defconstant +linux-x64-heap-data-size+ (+ (* 2 +linux-x64-gc-midpoint+) +linux-x64-gc-guard+))  ; 2 semispaces + 16MB guard
 ;; #x400 AND NOT #x200, WHICH IS A GC CONCURRENCY FIX, NOT A COSMETIC ONE.
 ;; page_base is heap_base + this offset, from_start is the same address, and
 ;; space_size is (midpoint - this offset).  The object-start and cons-kind
@@ -76,17 +82,17 @@
 ;; cross-checks a candidate's TAG against it so a conservative scratch word
 ;; aliasing a live object's BASE with the wrong tag can't be copied as the
 ;; wrong type.  Its runtime base is derived as [+mcgc-cfg-bitmap-addr+] +
-;; modus.mvm.x64::+mcgc-kindbitmap-delta+ (no extra boot config word, so no
+;; modus.mvm.x64::*mcgc-kindbitmap-delta* (no extra boot config word, so no
 ;; boot-preamble growth / *x64-native-code-offset* bump).  The two asserts
 ;; below pin that delta to the real layout.
 (defconstant +mcgc-kindbitmap-offset+
   (logand (+ +mcgc-freelist-offset+ +mcgc-freelist-size+ 63) (lognot 63)))
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (assert (= (- +mcgc-kindbitmap-offset+ +mcgc-bitmap-offset+)
-             modus.mvm.x64::+mcgc-kindbitmap-delta+)
-          () "cons-kind bitmap delta ~X != translate-x64 +mcgc-kindbitmap-delta+ ~X"
-          (- +mcgc-kindbitmap-offset+ +mcgc-bitmap-offset+)
-          modus.mvm.x64::+mcgc-kindbitmap-delta+)
+  ;; The translator reads the delta from this layout (it was a constant that
+  ;; this form ASSERTED equal; now the layout is the one source of truth, and
+  ;; the default layout still yields #xFE4000 byte-for-byte).
+  (setf modus.mvm.x64::*mcgc-kindbitmap-delta*
+        (- +mcgc-kindbitmap-offset+ +mcgc-bitmap-offset+))
   (assert (<= (+ +mcgc-kindbitmap-offset+ +mcgc-bitmap-size+)
               (+ +mcgc-meta-offset+ +mcgc-meta-size+))
           () "cons-kind bitmap overruns the metadata region"))

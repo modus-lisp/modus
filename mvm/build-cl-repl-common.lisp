@@ -431,7 +431,9 @@
 ;;; The parse is LAZY — first call, then cached (see lib/fdt.lisp's header for
 ;;; why boot time would be the wrong place, and for the full guard list).  This
 ;;; slot therefore contributes exactly one line of its own.
-;;; SAVE-AND-DIE on the Pi (lib/save-image.lisp, docs/save-and-die.md).  There
+;;; SAVE-AND-DIE on the Pi -- and, since 2026-10, the bare x64/UEFI image, which
+;;; splices this same source with %core-addr overridden to 0x20000000 (see
+;;; *cli-arch-override-source*) -- (lib/save-image.lisp, docs/save-and-die.md).  There
 ;;; is no file: the core is the RAM range at +core-addr+ = 0x18000000 (free
 ;;; DRAM above the JIT region, below the 448 MiB the board has), placed there
 ;;; by the boot loader (U-Boot `tftpboot 0x18000000 ql.core', QEMU
@@ -523,14 +525,29 @@
 (defun %core-die (msg)
   (write-string-serial msg) (write-char-serial 10) (halt))
 (defun %core-post-restore () nil)
+;; The shared SAVE-AND-DIE ends in (sys-exit 0), and on bare metal SYS-EXIT is a
+;; compiler intrinsic whose defun is dead (see *cli-arch-syscall-source*), so
+;; the machine fell back into the REPL after CORE-END.  Halt outright: the
+;; harness reads CORE-END, dumps the range, and is done with this boot.
+(defun save-and-die (path)
+  (%save-image path)
+  (halt))
 ")
 
 (defvar *cli-arch-override-source*
   (if *cl-repl-x64-p*
       ;; x86 QEMU-pc: no device tree; nothing to read MODUS_* knobs from yet.
-      "
+      ;; SAVE-AND-DIE rides along: the same RAM-range core as the Pi, at
+      ;; 0x20000000 -- ABOVE the bare x64 heap (0x10000000..0x1E000000) and its
+      ;; MCGC metadata (0x1E000000..), inside the stub's 4 GB identity map, so
+      ;; the machine needs more than 512 MB (QEMU -m 1024).  The x64 bare JIT is
+      ;; off by default and %jit-exec-* are unresolved here, so the integerp
+      ;; guards in the shared core source report "no arena".
+      (concatenate 'string "
 (defun %cli-getenv (name) nil)
-"
+" *cl-repl-rpi-core-source* "
+(defun %core-addr () #x20000000)
+")
       (concatenate 'string
         (string #\Newline)
         (%rpi-mvm-text "lib/fdt.lisp")
@@ -1283,7 +1300,7 @@
               (when (>= i data-len) (return data-len))
               (let ((dst-idx (+ dest-off i)))
                 (when (< dst-idx (%net-resp-cap))
-                  (aset dest dst-idx (mem-ref (+ data-base i) :u8))))
+                  (setf (aref dest dst-idx) (mem-ref (+ data-base i) :u8))))
               (setq i (+ i 1))))
           data-len)))))
 (defun http-fetch-impl (url url-len)
@@ -1326,7 +1343,11 @@
             ;; time and is speed-independent.  tcp-state going to 0 remains the
             ;; PRIMARY termination; this is only the safety net for a peer that
             ;; never closes.
-            (let ((resp (make-array (%net-resp-cap)))
+            ;; A BYTE vector, not a generic array: at the 4 MB cap a generic
+            ;; array is 32 MB, twice the 16 MB alloc-overshoot guard band, and
+            ;; the first big fetch ran the heap off its semispace (every later
+            ;; form then met wrecked objects -- TYPE-ERROR NIL, #(#\\O NIL)).
+            (let ((resp (make-array (%net-resp-cap) :element-type (quote (unsigned-byte 8))))
                   (resp-len 0)
                   (done 0)
                   (last-rx (%timer-universal-time)))
@@ -1419,12 +1440,14 @@
         (let* ((resp (car result))
                (resp-len (cdr result))
                (body-off (http-find-body resp resp-len)))
+          ;; byte vector, same reason as RESP above: a generic copy of a 5 MB
+          ;; tarball is 40 MB, past the alloc guard band.
           (let* ((blen (- resp-len body-off))
-                 (out (make-array blen)))
+                 (out (make-array blen :element-type (quote (unsigned-byte 8)))))
             (let ((i 0))
               (loop
                 (when (>= i blen) (return nil))
-                (aset out i (aref resp (+ body-off i)))
+                (setf (aref out i) (aref resp (+ body-off i)))
                 (setq i (+ i 1))))
             (cons out blen))))))
 
@@ -1889,7 +1912,7 @@
 ;;; toplevel the epilogue would have reached (no E2SMOKE; the net pipeline
 ;;; only when the build auto-starts it).
 (defvar *cli-arch-core-resume*
-  (if *cl-repl-rpi-p*
+  (if (or *cl-repl-rpi-p* *cl-repl-x64-p*)
       (concatenate 'string
         "    (write-string-serial \"CORE-RESTORED\") (write-char-serial 10)
     ;; A restored core skips boot init, so raise the ARM clock here too (the
@@ -1916,7 +1939,10 @@
 "
             "    (setq *use-jit* nil)
 ")
-        "    (handler-case (cl-serial-repl) (t (c) nil))
+        "    (handler-case (cl-serial-repl)
+      (t (c) (write-string-serial \"REPL-DIED: \")
+             (handler-case (write-object c) (t (c2) (write-string-serial \"<unprintable>\")))
+             (write-char-serial 10)))
     (halt)
 ")
       ""))
@@ -1965,7 +1991,13 @@
   ;; REPL evaluates (OFF through boot; see *jit-bridge-on* in mvm-eval.lisp).
   (setq *jit-bridge-on* t)
   ;; --- the REPL (lib/serial-repl.lisp) ------------------------------------
-  (handler-case (cl-serial-repl) (t (c) nil))
+  ;; A condition that unwinds PAST the REPL's own handlers ends the machine;
+  ;; say which one, or the serial log just stops (that silence cost an
+  ;; afternoon on an intermittent alexandria install, 2026-10-01).
+  (handler-case (cl-serial-repl)
+    (t (c) (write-string-serial \"REPL-DIED: \")
+           (handler-case (write-object c) (t (c2) (write-string-serial \"<unprintable>\")))
+           (write-char-serial 10)))
   (halt))
 "))
 
@@ -2081,18 +2113,23 @@
   (funcall (intern "INSTALL-X64-TRANSLATOR" "MODUS.MVM.X64"))
   (setf modus.mvm.x64::*x64-linux-mode* nil)
   (setf modus.mvm.x64::*x64-gc-enabled* t)
-  ;; Disable the CONS-KIND bitmap scan_word reject on bare x64.  The kind bitmap
-  ;; base is [bitmap_base] + +mcgc-kindbitmap-delta+, and that delta (#xFE4000)
-  ;; is a LINUX-x64 layout constant — boot-x64.lisp lays the GC metadata out
-  ;; differently, so on bare the check reads a wrong, uninitialised region and
-  ;; falsely rejects valid conservative roots, dropping live objects across a
-  ;; collection (symbols came back with empty name strings; the alexandria
-  ;; install then died with read/eval errors, sooner the more GCs ran).  The
-  ;; object-start bitmap (correctly based on the config word) still validates
-  ;; roots, which is sufficient.  Enable the kind check here only once the delta
-  ;; is made layout-agnostic for bare (a config word filled by boot-x64).  The
-  ;; SET side is left as a dead no-op (its bits are never read).
-  (setf modus.mvm.x64::*ws5-force-no-kindcheck* t)
+  ;; THE CONS-KIND scan_word REJECT IS ON, ON BARE x64 TOO (MODUS_X64_KINDCHECK=0
+  ;; turns it off for an A/B).  It used to be forced OFF here on the argument
+  ;; that the kind bitmap's address, [bitmap_base]+delta, is a Linux layout
+  ;; constant; on this layout that address (0x1EFEB800.., 14 MB under the 512 MB
+  ;; stack top) is free RAM, the SET side was writing it all along, and boot-x64
+  ;; now zeroes it.  MEASURED 2026-10-01, alexandria over the network on the
+  ;; UEFI image, four instances per arm, identical source otherwise: reject OFF
+  ;; 1 of 4 (TYPE-ERROR NIL / READER-ERROR mid-file, or REPL-DIED, moving
+  ;; between runs); interrupts masked with reject OFF 1 of 4; reject ON 4 of 4
+  ;; through 5 collections each.  Without the check a conservative stack word
+  ;; aliasing a live object's base with a cons tag is COPIED AS A CONS -- 16
+  ;; bytes and a forwarding word over the object's header -- which is the
+  ;; wrecked-symbol / wrecked-string signature every failing run showed.
+  ;; Hosted x64 never saw it because its 896 MB semispace does not collect
+  ;; during a library load at all (one collection, measured).
+  (setf modus.mvm.x64::*ws5-force-no-kindcheck*
+        (let ((v (sb-ext:posix-getenv "MODUS_X64_KINDCHECK"))) (and v (string= v "0"))))
   (setf modus.mvm.x64::*x64-native-code-offset*
         (if cl-user::*cl-repl-uefi-p*
             ;; UEFI: at 0x100000 sits the kernel64 entry alone (the stub is

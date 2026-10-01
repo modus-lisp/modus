@@ -3436,6 +3436,38 @@ pair merely MOVES).  Measured facts, so nobody re-derives them:
   stream.  Next step is to instrument that branch with the target value and the
   module identity rather than to keep bisecting source shapes.
 
+### BARE x64 COLLECTED OBJECTS AS THE WRONG TYPE — the cons-kind reject was OFF (2026-10-01)
+
+Every multi-collection library load on the bare x64 CL image (alexandria, over
+the network or from a tarball placed in RAM, under UEFI or multiboot alike)
+failed about 3 in 4 — `TYPE-ERROR NIL` / `READER-ERROR` mid-file or
+`REPL-DIED: <unprintable>` — moving between identical runs; cl-base64 (two
+collections) passed; hosted x64 passed 8/8 **but collects ONCE in that load**
+(its 896 MB semispace was sized to avoid collecting).  The cause was
+`*ws5-force-no-kindcheck*` T on bare x64 (build-cl-repl-common): the scan_word
+cons-kind cross-check that stops a conservative word aliasing a live object's
+base with a cons tag from being copied as a cons (forwarding word over the
+header) was disabled on the argument that its bitmap address is a Linux layout
+constant — but the SET side still wrote that address, which on this layout is
+free RAM.  A/B, identical source, 4 instances per arm: reject OFF 1/4;
+interrupts masked + reject OFF 1/4; reject ON 4/4 then 8/8, five collections
+each.  Now ON (`MODUS_X64_KINDCHECK=0` for the A/B); boot-x64 zeroes the GC
+metadata + both bitmaps (real DRAM is not zero); `*mcgc-kindbitmap-delta*` is
+a defvar SET from boot-linux-x64's layout (the `MODUS_X64_MIDPOINT` knob
+scales it) instead of a constant asserted against it; the x64 kernel epilogue
+prints `REPL-DIED: <cond>` instead of halting silently.  Also found: the UEFI
+stub wrote its framebuffer words and font at 0x600100/0x601000 — inside the CL
+image's native code (USER-HOMEDIR-PATHNAME) — now 0x1B000..; and the net fetch
+buffer/body copy were GENERIC arrays (8 bytes per byte: a 4 MB cap = 32 MB,
+past the 16 MB alloc guard) — now `(unsigned-byte 8)` vectors.
+**`%GC-FORCE` (lib/save-image.lisp) HAD THE SAME `:u64`-COUNT TRAP**: after an odd
+number of collections its `before` was an immediate and the save forced
+collections forever (17/s) — `%gc-epoch` now.  Any `(mem-ref <count-word> :u64)`
+on x64 is this bug.  **SAVE-AND-DIE works on bare x64** (core at 0x20000000, `-m 1024`;
+`test/run-uefi-core.sh`, docs/save-and-die.md) and `kiln image` builds the
+attestable image + core (modus-lisp/kiln).  Lesson re-learned: a hosted
+"pass" says nothing about a collector path the hosted heap never takes.
+
 ### Crash triage: it's almost never the GC — default elsewhere
 
 The collector is hardened (fuzz-closed layout-dependence, conservative-root

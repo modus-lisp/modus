@@ -224,6 +224,49 @@ value-domain op under the interpreter.  The original notes follow.
 4. The core path is read from the live `argv[2]`, so it has no 63-byte limit,
    but `--core` must be first.
 
+## Bare x86-64 (UEFI and multiboot), 2026-10-01
+
+The same core source now rides the x64 CL image (`*cli-arch-override-source*`
+in build-cl-repl-common splices `*cl-repl-rpi-core-source*` for `:x64` too),
+with the RAM slot at **0x20000000** -- above the heap (0x10000000..0x1E000000)
+and the MCGC metadata, inside the stub's 4 GB identity map, so the guest needs
+`-m 1024` or more.  The x64 bare JIT is off, so there is no code arena to carry.
+`SAVE-AND-DIE` on bare ends in `(halt)`: the shared version's `(sys-exit 0)` is
+a compiler intrinsic whose defun is dead, and the machine used to fall back into
+the REPL after `CORE-END`.
+
+The rig is `test/run-uefi-core.sh IMAGE.efi OUT.core [--load=NAME ...]
+[--probe=FORM --expect=TEXT]`: boot with a QMP socket, `ql:quickload` each NAME
+from a tarball directory served to the guest (`TARS=`, default `tmp/tars`),
+`save-and-die`, read `CORE-END=` off serial, `pmemsave` the range, then boot the
+same image with `-device loader,file=OUT.core,addr=0x20000000` and require
+`CORE-RESTORED` (and no `E2SMOKE`, which would mean boot init ran) before the
+probe answers.  `scripts/run-uefi-cl.sh` grew `QMP=`, `LOADER=file@addr`,
+`GDB=port`, `KERNEL=1` (multiboot image via `-kernel`), `FORM_WAIT=` and
+`KEEP=1` for it.  A 143 MB core (alexandria live) restores and
+`(alexandria:iota 3)` answers `(0 1 2)` from the restored image with no reload.
+
+What stood in the way, in the order found, all fixed:
+
+* **the HTTP response buffer was 32 KB** (`%net-resp-cap`, baked); the fetch
+  reported the full length and zero-filled the rest -- the documented
+  truncation trap, met again.  The CL image builds take `MODUS_NET_BUFSZ`
+  (kiln uses 4 MB).
+* **the response and the body copy were GENERIC arrays** -- 8 bytes per byte,
+  so a 4 MB cap is a 32 MB allocation, twice the 16 MB alloc-overshoot guard
+  band, and the first big fetch ran the heap off its semispace (every later
+  form met wrecked objects).  Both are `(unsigned-byte 8)` vectors now.
+* **the collector's cons-kind reject was OFF on bare x64**, and that is what
+  made every multi-collection library load intermittently fatal; see
+  docs/snp-guest.md and the note in build-cl-repl-common.
+* **`%gc-force` read the collection count with a `:u64` load**, which on x64
+  hands the raw word back as a tagged value; after an ODD number of natural
+  collections `before` is an immediate, `(> after before)` is never true, and
+  the save forced collections forever (17 a second, measured by sampling the
+  collector's registers over a gdbstub).  It had worked whenever the count
+  happened to be even.  `%gc-epoch` is the fixnum reader; same trap as
+  `%gc-count`.
+
 ## The board
 
 **★ VALIDATED ON REAL SILICON (Pi Zero 2 W, 2026-09-06):** produced a core

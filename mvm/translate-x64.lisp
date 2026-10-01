@@ -1322,15 +1322,18 @@
 (defconstant +mcgc-cfg-page-base-addr+ #x10000E00)
 (defconstant +mcgc-cfg-bitmap-addr+    #x10000E18)
 
-(defconstant +mcgc-kindbitmap-delta+   #xFE4000
+(defvar *mcgc-kindbitmap-delta*   #xFE4000
   "Byte offset from the object-start bitmap base to the CONS-KIND bitmap
    base.  Both bitmaps are +mcgc-bitmap-size+ bytes (1 bit / 16-byte
    granule); the kind bitmap lives in the metadata region just past the
    run-free-list.  Its base = [+mcgc-cfg-bitmap-addr+] + this delta, so no
    extra boot config word (and hence no boot-preamble growth / no
-   *x64-native-code-offset* bump) is needed.  The exact value is ASSERTED
-   against the real metadata layout in boot-linux-x64.lisp; if the heap
-   sizing ever changes the build fails loudly there.
+   *x64-native-code-offset* bump) is needed.  A DEFVAR, not a constant:
+   boot-linux-x64.lisp SETS it from the real metadata layout (kind-bitmap
+   offset minus start-bitmap offset), which is #xFE4000 for the default
+   896 MB semispaces and scales with MODUS_X64_MIDPOINT.  Bare x64 keeps the
+   default (boot-x64.lisp lays its metadata out differently; see the
+   *ws5-force-no-kindcheck* note in build-cl-repl-common).
 
    KIND BIT semantics: SET = the start at this granule is a CONS; CLEAR =
    it is an OBJECT (or not a start — gated by the object-start bitmap).
@@ -6017,7 +6020,7 @@
   "MASTER gate for the CONS-KIND bitmap feature (the fix for the symbol-
    truncation-via-cons-tagged-scratch corruption).  DEFAULT NIL.
 
-   The kind bitmap lives at [+mcgc-cfg-bitmap-addr+] + +mcgc-kindbitmap-delta+
+   The kind bitmap lives at [+mcgc-cfg-bitmap-addr+] + *mcgc-kindbitmap-delta*
    (#xFE4000) — a LINUX-x64 layout constant (boot-linux-x64.lisp asserts it).
    Bare-metal x64 (boot-x64.lisp, e.g. build-x64) lays the
    metadata out DIFFERENTLY, so that delta is wrong there.  Until the base is
@@ -6794,7 +6797,7 @@
   (emit-bytes buf #x48 #x8B #x0C #x25)          ; mov rcx, [bitmap_base]
   (emit-u32 buf +mcgc-cfg-bitmap-addr+)
   (emit-bytes buf #x48 #x81 #xC1)               ; add rcx, imm32 (kind delta)
-  (emit-u32 buf +mcgc-kindbitmap-delta+)
+  (emit-u32 buf *mcgc-kindbitmap-delta*)
   (emit-bytes buf #x48 #x0F #xAB #x01)          ; bts [rcx], rax
   (emit-pop buf 'rdx)
   (emit-pop buf 'rcx)
@@ -6828,7 +6831,7 @@
     (emit-bytes buf #x4C #x8B #x04 #x25)          ; mov r8, [bitmap_base]
     (emit-u32 buf +mcgc-cfg-bitmap-addr+)
     (emit-bytes buf #x49 #x81 #xC0)               ; add r8, imm32 (kind delta)
-    (emit-u32 buf +mcgc-kindbitmap-delta+)
+    (emit-u32 buf *mcgc-kindbitmap-delta*)
     (emit-bytes buf #x49 #x0F #xAB #x10)          ; bts [r8], rdx
     (emit-pop buf 'r8)
     (emit-pop buf 'rdx)
@@ -6846,7 +6849,7 @@
                       bit is SET — the start is a CONS, so the object tag is
                       a false positive (the symmetric case).
    Uses RDX and R8 as temps (saved/restored); preserves RAX/RBX/RCX/RSI/R13.
-   Kind bitmap base = [bitmap_base] + +mcgc-kindbitmap-delta+."
+   Kind bitmap base = [bitmap_base] + *mcgc-kindbitmap-delta*."
   (unless (eq addr-reg 'rax)
     (error "emit-mcgc-cons-kind-or-jump: ADDR-REG must be RAX"))
   (emit-push buf 'rdx)
@@ -6858,7 +6861,7 @@
   (emit-bytes buf #x4C #x8B #x04 #x25)              ; mov r8, [bitmap_base]
   (emit-u32 buf +mcgc-cfg-bitmap-addr+)
   (emit-bytes buf #x49 #x81 #xC0)                   ; add r8, imm32 (kind delta)
-  (emit-u32 buf +mcgc-kindbitmap-delta+)
+  (emit-u32 buf *mcgc-kindbitmap-delta*)
   (emit-bytes buf #x49 #x0F #xA3 #x10)              ; bt [r8], rdx  (CF = cons-kind bit)
   (emit-pop buf 'r8)
   (emit-pop buf 'rdx)
@@ -7596,7 +7599,7 @@
       (x64-stw-zero-bytes buf)
       (when (mcgc-kind-bitmap-on-p)
         (emit-mov-reg-reg buf 'rdi 'r10)
-        (emit-bytes buf #x48 #x81 #xC7) (emit-u32 buf +mcgc-kindbitmap-delta+)       ; add rdi, delta
+        (emit-bytes buf #x48 #x81 #xC7) (emit-u32 buf *mcgc-kindbitmap-delta*)       ; add rdi, delta
         (emit-mov-reg-reg buf 'rcx 'r11)
         (x64-stw-zero-bytes buf)))
     ;; the arena itself
@@ -7746,7 +7749,7 @@
         (emit-bytes buf #x49 #x0F #xA3 #x30)           ; bt [r8], rsi  (CF = object-start bit)
         (emit-jcc buf :nc scan-it)
         (emit-bytes buf #x49 #x81 #xC0)                ; add r8, imm32 (cons-kind delta)
-        (emit-u32 buf +mcgc-kindbitmap-delta+)
+        (emit-u32 buf *mcgc-kindbitmap-delta*)
         (emit-bytes buf #x49 #x0F #xA3 #x30)           ; bt [r8], rsi  (CF = cons-kind bit)
         (emit-jcc buf :c scan-it)                      ; a cons: scan its two words as before
         (emit-mov-reg-mem buf 'rsi 'r10 0)             ; rsi = header
@@ -8136,7 +8139,7 @@
       (emit-bytes buf #x48 #x8B #x3C #x25)           ; mov rdi, [bitmap_base]
       (emit-u32 buf +mcgc-cfg-bitmap-addr+)
       (emit-bytes buf #x48 #x81 #xC7)                ; add rdi, imm32 (kind delta)
-      (emit-u32 buf +mcgc-kindbitmap-delta+)
+      (emit-u32 buf *mcgc-kindbitmap-delta*)
       (emit-bytes buf #x48 #x01 #xC7)                ; add rdi, rax  (rdi = dest)
       ;; RSI = this region's control block (loaded at the swap above)
       (emit-mov-reg-mem buf 'rcx 'rsi modus.mvm::+gc-off-space-size+)

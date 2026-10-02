@@ -1588,7 +1588,12 @@
              (quarter (ash (- ae base) -2)))
         (when (< (- ae (%rt-arena-alloc)) quarter)
           (let ((cool (%gc-read64 (+ (%rt-arena-words) #x20))))
-            (if (> cool 0)
+            ;; NO COOLDOWN UNDER AN EIGHTH.  The 256-entry wait is for an arena
+            ;; that stays a little low; one that is running OUT must be tried
+            ;; on every entry, or a fast publisher fills it during the wait
+            ;; and the next worker to need a slice has to stop the process
+            ;; (seen: 1 run in 30 of warp's player started by a tap, no JIT).
+            (if (and (> cool 0) (>= (- ae (%rt-arena-alloc)) (ash quarter -1)))
                 (%gc-write64 (+ (%rt-arena-words) #x20) (- cool 1))
                 (progn
                   (%gc-collect-region-0)
@@ -1622,7 +1627,12 @@
              (size (%gc-meta-read (+ r0 #x10) k)))
         (if (< size #x6000000)
             0
-            (let ((newsize (- size #x2000000)))
+            ;; 64 MB on a big heap, 32 MB otherwise.  A worker that publishes
+            ;; frames (warp's media decoder: 0.7 MB a picture, 30 a second)
+            ;; turns the arena over every second, and the evacuation that
+            ;; rewinds it can be skipped while another thread holds the lock;
+            ;; 32 MB was too little slack to wait that out.
+            (let ((newsize (- size (if (>= size #x10000000) #x4000000 #x2000000))))
               ;; The frontier is the LIVE pointer while region 0 is active —
               ;; its parked word is whatever was last parked, which a
               ;; collection since then does not rewrite — and the parked one
@@ -1661,6 +1671,23 @@
                     ;; collector never sees a half-initialised arena.
                     (%gc-write64 (%conv-addr #x10000D98) (%rt-arena-words))
                     1)))))))
+
+(defun %fatal-say (msg)
+  "%FATAL-STOP's output without the stop: raw write(2)s, no allocation."
+  (let ((w (%thr-scratch-word)))
+    (dotimes (i (length msg))
+      (%gc-write64 w (char-code (char msg i)))
+      (syscall3 1 2 w 1))))
+
+(defun %fatal-hex (n)
+  "N as 16 hex digits to fd 2, allocating nothing (for %FATAL-STOP's callers)."
+  (let ((w (%thr-scratch-word)) (sh 60))
+    (loop
+      (when (< sh 0) (return nil))
+      (let ((d (logand (ash n (- 0 sh)) 15)))
+        (%gc-write64 w (if (< d 10) (+ 48 d) (+ 87 d)))
+        (syscall3 1 2 w 1))
+      (setq sh (- sh 4)))))
 
 (defun %fatal-stop (msg)
   "Write MSG to fd 2 and end the process (exit_group, status 134).  For states
@@ -1744,8 +1771,19 @@ modus: waited 60 s for the runtime lock; its owner leaked it (faulted, unwound o
             ;; frontier, silent corruption.  That is the pre-arena path and it
             ;; is only sound for the main thread.  Stop instead.
             (when (and (zerop blk) (> (%thr-cpu) 0))
+              ;; Say WHICH: no arena (end 0) and an exhausted one (fallbacks > 0)
+              ;; are different bugs, and the numbers are all that survives.
+              (%fatal-say "
+modus: a thread needed the runtime lock but the lock arena is exhausted or missing; continuing would corrupt the heap.
+  cpu ")
+              (%fatal-hex (%thr-cpu))
+              (%fatal-say " arena base ") (%fatal-hex (%rt-arena-base))
+              (%fatal-say " frontier ") (%fatal-hex (%rt-arena-alloc))
+              (%fatal-say " end ") (%fatal-hex (%rt-arena-end))
+              (%fatal-say " fallbacks ") (%fatal-hex (%rt-arena-fallbacks))
+              (%fatal-say " band ") (%fatal-hex *ha-band*)
               (%fatal-stop "
-modus: a thread needed the runtime lock but the lock arena is exhausted or missing; continuing would corrupt the heap. Stopping.
+Stopping.
 "))
             (%gc-write64 (%rt-saved-addr)
                          (%gc-region-enter (if (zerop blk) (%gc-region-0) blk))))

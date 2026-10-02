@@ -6558,13 +6558,16 @@
         (emit-ir :li dest (- value))               ; positive magnitude
         (emit-ir :shl dest dest +fixnum-shift+)
         (emit-ir :neg dest dest))))
+    ;; A layout address used as a fixnum: PC-relative (see the predicate).
+    ;; Ahead of the in-image :LI-HALVES arm, so code compiled at RUNTIME is
+    ;; position-independent too: a snapshot's JIT pages then run at any slide
+    ;; (lib/save-image.lisp), and the interpreter loads LI-TADDR as the integer.
+    ((pcrel-layout-addr-p value)
+     (emit-ir :li-taddr dest value))
     (*mvm-emit-halves*
      (emit-ir :li-halves dest
               (* (logand value #x7FFFFFFF) 2)
               (logand (ash value -31) #xFFFFFFFF)))
-    ((pcrel-layout-addr-p value)
-     ;; A layout address used as a fixnum: PC-relative (see the predicate).
-     (emit-ir :li-taddr dest value))
     (t
      (let ((tagged (ash value +fixnum-shift+)))
        (if (zerop tagged) (emit-ir :li dest 0) (emit-ir :li dest tagged))))))

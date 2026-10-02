@@ -461,6 +461,27 @@
 (defvar *jit-lcell-next* 0 "bump pointer into the current cell arena page.")
 (defvar *jit-lcell-end* 0 "end of the current cell arena page.")
 
+(defvar *jit-data-next* nil
+  "Low end of the JIT arena's DATA pages, which grow DOWN from its top while
+   code pages grow up from its base.  NIL until the first is taken.")
+
+(defun %jit-data-page ()
+  "A 16 KB page of DATA in the JIT arena, taken from the top down: the
+   linkage cells.  Kept apart from code so a snapshot's arena splits into a
+   code part, which an iOS app carries as signed read-only pages, and a data
+   part, which must stay writable (a restore at another slide rewrites the
+   cells; lib/save-image.lisp).  16 KB, iOS's page size, so the two parts
+   never share one.  0 when there is no arena (the caller falls back to an
+   ordinary exec page)."
+  (let ((alo (%core-jit-arena-lo)) (bump (%core-jit-arena-bump)))
+    (if (or (= bump 0) (= alo 0))
+        0
+        (let* ((top (or *jit-data-next* (+ alo #x20000000)))
+               (p (- top 16384)))
+          (if (<= p (+ bump 16384))
+              0
+              (progn (setq *jit-data-next* p) p))))))
+
 (defun %jit-linkage-cell (name)
   "Return the stable u64 cell address holding NAME's current native code
    address, creating it (zero-initialised) on first request.  NIL only if the
@@ -472,10 +493,12 @@
         c
         (progn
           (when (>= *jit-lcell-next* *jit-lcell-end*)
-            (let ((p (%mmap-exec-page 4096)))
+            (let* ((d (%jit-data-page))
+                   (p (if (> d 0) d (%mmap-exec-page 4096)))
+                   (len (if (> d 0) 16384 4096)))
               (if (< p 4096)
                   (return-from %jit-linkage-cell nil)
-                  (setq *jit-lcell-next* p *jit-lcell-end* (+ p 4096)))))
+                  (setq *jit-lcell-next* p *jit-lcell-end* (+ p len)))))
           (let ((cell *jit-lcell-next*))
             (setq *jit-lcell-next* (+ cell 8))
             (setf (mem-ref cell :u64) 0)
@@ -524,6 +547,27 @@
         (setf (mem-ref (+ base (+ wo 2)) :u8) (logand (ash nw -16) 255))
         (setf (mem-ref (+ base (+ wo 3)) :u8) (logand (ash nw -24) 255)))
       (setq k (+ k 1)))))
+
+(defun %jit-write-pcrel-quad (base off target)
+  "Rewrite the MOVZ/MOVK placeholder quad at BASE+OFF (16 bytes, register taken
+   from its first word) to form TARGET from the PC: ADRP + ADD #lo12, then two
+   NOPs.  For a TARGET in the image's own layout -- image code, a JIT page or
+   thunk, a region word -- under a PC-relative layout (*A64-PCREL*), so the
+   page is correct at any slide: a snapshot's JIT pages run unpatched after a
+   restore elsewhere (lib/save-image.lisp), which iOS, where they are signed
+   code, requires.  A tagged code word (entry|3) works too: entries are 16-
+   aligned, so the tag never crosses a page.  Elsewhere the absolute quad."
+  (if (not (and (boundp (quote *a64-pcrel*)) *a64-pcrel*))
+      (%jit-write-movz-quad base off target)
+      (let* ((pc (+ base off))
+             (rd (logand (logior (mem-ref pc :u8) (ash (mem-ref (+ pc 1) :u8) 8)) 31))
+             (pages (- (ash target -12) (ash pc -12))))
+        (%jit-write-word32 base off (logior #x90000000 (ash (logand pages 3) 29)
+                                            (ash (logand (ash pages -2) #x7FFFF) 5) rd))
+        (%jit-write-word32 base (+ off 4) (logior #x91000000 (ash (logand target 4095) 10)
+                                                  (ash rd 5) rd))
+        (%jit-write-word32 base (+ off 8) #xD503201F)
+        (%jit-write-word32 base (+ off 12) #xD503201F))))
 
 (defun %jit-write-word32 (base off w)
   "Store the 32-bit instruction W at BASE+OFF, little-endian."
@@ -1095,13 +1139,13 @@
   (%jit-emit-quad-placeholder (+ addr k) 0)
   (%jit-write-movz-quad addr k (ash idx 1))
   (%jit-emit-quad-placeholder (+ addr k 16) 17)
-  (%jit-write-movz-quad addr (+ k 16) (%conv-addr #x10000150))
+  (%jit-write-pcrel-quad addr (+ k 16) (%conv-addr #x10000150))
   (let ((j (+ k 32)))
     (setq j (+ j (%jit-emit-thread-delta-aarch64 addr j 17 16)))
     (%jit-emit-word32 (+ addr j) (logior #x52800010 (ash (+ nargs 1) 5)))   ; movz w16, #nargs+1
     (%jit-emit-word32 (+ addr j 4) #xB9000230)                              ; str w16, [x17]
     (%jit-emit-quad-placeholder (+ addr j 8) 16)
-    (%jit-write-movz-quad addr (+ j 8) (%jit-bridge-entry nargs))
+    (%jit-write-pcrel-quad addr (+ j 8) (%jit-bridge-entry nargs))
     (%jit-emit-word32 (+ addr j 24) #xD61F0200)                             ; br x16
     (+ j 28)))
 
@@ -1176,9 +1220,42 @@
           ;; address — its raw bits are then exactly the entry address.
           ;; Storing the address itself branched to twice it (a recovered
           ;; fault, surfacing as #(SIMPLE-ERROR NIL)).
-          (when h (setf (mem-ref (%jit-fnaddr-thunk-cache-slot (cdr h)) :u64)
-                        (ash (- word 3) -1))))))
+          ;; Only while this process can write code: a restored snapshot's
+          ;; thunks are signed, read-only pages on iOS (lib/save-image.lisp),
+          ;; and there every call takes this slow path instead.
+          (when (and h (%jit-enabled-p))
+            (setf (mem-ref (%jit-fnaddr-thunk-cache-slot (cdr h)) :u64)
+                  (ash (- word 3) -1))))))
     (apply f args)))
+
+(defun %jit-before-save ()
+  "Before a snapshot (lib/save-image.lisp): empty every #'NAME thunk's cached
+   target.  It is an absolute address in a code page, which a restore at
+   another slide could not correct where the pages are read-only (iOS)."
+  (dolist (h *jit-fnaddr-thunks*)
+    (setf (mem-ref (%jit-fnaddr-thunk-cache-slot (cdr h)) :u64) 0))
+  nil)
+
+(defun %jit-after-relocate (l0 l1 d)
+  "After a restore at another slide: move by D what the arena's DATA pages
+   hold as raw addresses -- each linkage cell's native entry address, and the
+   mutex-cell allocator's base, next and limit (net/hosted-sync.lisp
+   %SYNC-CELL-CTL, when it lives in a data page).  The pages' own addresses,
+   held in Lisp variables, were moved with the rest of the heap."
+  (let ((ctl (and (boundp (quote *sync-ctl*)) *sync-ctl*)))
+    (when (and (integerp ctl) (> ctl 0))
+      (dolist (off (list #x08 #x10 #x18))
+        (let ((a (%gc-read64 (+ ctl off))))
+          (when (and (>= a l0) (< a l1))
+            (%gc-write64 (+ ctl off) (+ a d)))))))
+  (when *jit-lcell-table*
+    (maphash (lambda (name cell)
+               (declare (ignore name))
+               (let ((a (%gc-read64 cell)))
+                 (when (and (>= a l0) (< a l1))
+                   (%gc-write64 cell (+ a d)))))
+             *jit-lcell-table*))
+  nil)
 (defun %jit-bridge-any-entry ()
   (- (%val->word (symbol-function (quote %jit-bridge-any))) 3))
 (defun %jit-fnaddr-thunk-cache-slot (addr)
@@ -1223,13 +1300,13 @@
     (%jit-write-movz-quad addr k idx)
     (setq k (+ k 16))
     (%jit-emit-quad-placeholder (+ addr k) 16)
-    (%jit-write-movz-quad addr k (%jit-fnaddr-idx-slot))
+    (%jit-write-pcrel-quad addr k (%jit-fnaddr-idx-slot))
     (setq k (+ k 16))
     (setq k (+ k (%jit-emit-thread-delta-aarch64 addr k 16 9)))   ; x16 += delta (x9 scratch)
     (%jit-emit-word32 (+ addr k) #xB9000211)          ; str w17, [x16]
     (setq k (+ k 4))
     (%jit-emit-quad-placeholder (+ addr k) 16)
-    (%jit-write-movz-quad addr k (%jit-bridge-any-entry))
+    (%jit-write-pcrel-quad addr k (%jit-bridge-any-entry))
     (setq k (+ k 16))
     (%jit-emit-word32 (+ addr k) #xD61F0200)          ; br x16
     (%jit-icache-flush addr 96)
@@ -1580,6 +1657,16 @@
             (when (eql (logand addr 15) 0)
               (let ((fn (%word->val (logior addr 3))))
                 (when (boundp (quote *symbol-function-table*))
+                  ;; A GENERIC FUNCTION'S DISPATCHER: CLOS finds the GF from
+                  ;; the function object (cl-clos.lisp %FN-TO-GF, an ASSOC on
+                  ;; *GF-FN-TO-NAME*), which still names the trampoline this
+                  ;; replaces -- so natively COMPUTE-APPLICABLE-METHODS of
+                  ;; #'NAME found nothing, and every warp consumer refused to
+                  ;; initialise.  Register the native function as well.
+                  (let* ((old (gethash nm *symbol-function-table*))
+                         (gf (and old (boundp (quote *gf-fn-to-name*))
+                                  (assoc old *gf-fn-to-name*))))
+                    (when gf (%register-gf-fn fn (cdr gf))))
                   (%jit-fnaddr-thunk-invalidate nm)
                   (puthash nm *symbol-function-table* fn))
                 (when (boundp (quote *native-sym-function-table*))
@@ -1935,6 +2022,24 @@
                   *e2-const-pool*))
           nil))))
 
+(defun %jit-resolve-adrp-fixups (base)
+  "Fill in the ADRP of every PC-relative layout address in the page just
+   copied to BASE (translate-aarch64.lisp *AARCH64-JIT-ADRP-FIXUPS*): the page
+   delta from the ADRP's own address to its target.  The ADD after it already
+   holds the target's low 12 bits."
+  (dolist (f *aarch64-jit-adrp-fixups*)
+    (let* ((at (+ base (* 4 (car f))))
+           (pages (- (ash (cdr f) -12) (ash at -12)))
+           (word (logior (mem-ref at :u8) (ash (mem-ref (+ at 1) :u8) 8)
+                         (ash (mem-ref (+ at 2) :u8) 16) (ash (mem-ref (+ at 3) :u8) 24)))
+           (new (logior (logand word #x9F00001F)
+                        (ash (logand pages 3) 29)
+                        (ash (logand (ash pages -2) #x7FFFF) 5))))
+      (setf (mem-ref at :u8) (logand new 255))
+      (setf (mem-ref (+ at 1) :u8) (logand (ash new -8) 255))
+      (setf (mem-ref (+ at 2) :u8) (logand (ash new -16) 255))
+      (setf (mem-ref (+ at 3) :u8) (logand (ash new -24) 255)))))
+
 (defun %jit-translate-page-1-aarch64 (bc mvm-entry ft-list rt-table)
   "WS4-S5 (aarch64) sibling of %jit-translate-page-1.  translate-mvm-to-aarch64
    wants an eql-keyed func-idx→MVM-offset HASH (not x64's (name offset length)
@@ -2070,6 +2175,8 @@
             (setf (mem-ref (+ base (+ o 2)) :u8) (logand (ash w -16) 255))
             (setf (mem-ref (+ base (+ o 3)) :u8) (logand (ash w -24) 255)))
           (setq k (+ k 1)))
+        ;; PC-RELATIVE LAYOUT ADDRESSES (the deferred :ADRP-ABS fixups).
+        (%jit-resolve-adrp-fixups base)
         ;; Out-of-module CALL relocations (untagged callee addr = word-3).
         ;; WS5 #206: the callee must carry the FN tag — see %jit-reloc-calls for
         ;; the full account.  A RUNTIME-defined function (a defun evaluated by an
@@ -2168,7 +2275,7 @@
                  (th (and name (%jit-bridge-on-p)
                           (%jit-make-fnaddr-thunk-aarch64 name))))
             (if th
-                (%jit-write-movz-quad base (car r) (logior th 3))
+                (%jit-write-pcrel-quad base (car r) (logior th 3))
                 (progn
                   (setq *jit-r-reloc-fnaddr-fail*
                         (if *jit-r-reloc-fnaddr-fail*
@@ -2194,7 +2301,7 @@
           (let* ((noff (gethash (cdr r) fn-map))
                  (addr (if noff (+ base noff) 0)))
             (if (and noff (eql (logand addr 15) 0))
-                (%jit-write-movz-quad base (car r) (logior addr 3))
+                (%jit-write-pcrel-quad base (car r) (logior addr 3))
                 (progn
                   (setq *jit-r-lrel-fail*
                         (if *jit-r-lrel-fail* (+ 1 *jit-r-lrel-fail*) 1))

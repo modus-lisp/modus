@@ -288,7 +288,15 @@ static void note_reservation(const char *seg) {
     }
 }
 
+// PRELOADED JIT CODE: an app built from a snapshot (host/macos/image-
+// segments.sh, MODUS_CORE) carries the arena's code pages as the signed,
+// read-only segment __MODUSC at the arena base, and reserves the rest of the
+// arena as __MODUSA.  The boot stub still asks for the whole arena there: it
+// is already in place, so answer with its address and map nothing.
+static uint64_t preloaded_lo;
+
 static long dx_mmap(long addr, long len, long prot, long flags, long fd, long off) {
+    if (preloaded_lo && (uint64_t)addr == preloaded_lo) return addr;
     int f = (int)(flags & 3);                      // SHARED/PRIVATE agree
     if (flags & 0x20) f |= MAP_ANON;
     int noreplace = (flags & 0x100000) != 0;       // MAP_FIXED_NOREPLACE
@@ -758,7 +766,7 @@ static long modus_syscall_1(long a0, long a1, long a2, long a3, long a4, long a5
     case 210: RET(shutdown((int)a0, (int)a1));      // SHUT_* agree
     case 103: return 0;                            // setitimer
 #if TARGET_OS_IPHONE
-    case 1001: case 1002: case 1003: case 1004:    // the framebuffer (host/ios/modus-ui.m)
+    case 1001: case 1002: case 1003: case 1004: case 1005:   // the framebuffer (host/ios/modus-ui.m)
         return modus_ui_call(nr, a0, a1, a2, a3);
 #endif
     default:
@@ -950,6 +958,41 @@ int main(int argc, char **argv, char **envp) {
     if (kr != KERN_SUCCESS) die("could not map the syscall slot page", kr);
     }
     *(void **)(uintptr_t)slot = (void *)modus_syscall_stub;
+
+    { unsigned long n = 0;
+      uint8_t *c = getsectiondata(&_mh_execute_header, "__MODUSC", "__code", &n);
+      if (c && n) preloaded_lo = (uint64_t)(uintptr_t)c; }
+
+    // NO ARGUMENTS: take them from modus.args beside the executable, one per
+    // line -- an app is launched with none, so this is how it says what to run
+    // (`kiln ios' writes `--core', `@kiln.core', `--eval', `(main)').
+    char exedir0[4096] = "";
+    { char exe[4096]; uint32_t n = sizeof exe;
+      if (_NSGetExecutablePath(exe, &n) == 0) strncpy(exedir0, dirname(exe), sizeof exedir0 - 1); }
+    if (argc == 1 && exedir0[0]) {
+        char path[4200]; snprintf(path, sizeof path, "%s/modus.args", exedir0);
+        FILE *af = fopen(path, "r");
+        if (af) {
+            char **nv = calloc(64, sizeof *nv); int nc = 0; char line[4096];
+            nv[nc++] = argv[0];
+            while (nc < 63 && fgets(line, sizeof line, af)) {
+                size_t l = strlen(line);
+                while (l && (line[l - 1] == '\n' || line[l - 1] == '\r')) line[--l] = 0;
+                if (l) nv[nc++] = strdup(line);
+            }
+            fclose(af);
+            argc = nc; argv = nv;
+        }
+    }
+    // Preloaded code cannot be written, so the image must not compile any:
+    // MODUS_NO_RUNTIME_JIT (lib/save-image.lisp %CORE-POST-RESTORE).
+    if (preloaded_lo) {
+        int n = 0; while (envp[n]) n++;
+        char **ne = calloc((size_t)n + 2, sizeof *ne);
+        for (int i = 0; i < n; i++) ne[i] = envp[i];
+        ne[n] = "MODUS_NO_RUNTIME_JIT=1";
+        envp = ne;
+    }
 
     // 3. a Linux initial stack: argc, argv..., NULL, envp..., NULL, AT_NULL.
     size_t stack_size = 64ULL << 20;

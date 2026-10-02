@@ -1419,14 +1419,21 @@
 (defun %rt-slice-base ()   (+ (%ha-base) #xB800))
 (defun %rt-slice-block (cpu) (+ (%rt-slice-base) (* cpu #x40)))
 (defun %rt-arena-words ()  (+ (%ha-base) #xBC00))
+;;; READING THE ARENA DOES NOT CARVE IT.  These answer 0 -- no arena -- until
+;;; something has carved the band (%SB-THREADS-UP, when a thread is wanted).
+;;; They used to ask %HA-BASE, which carves on first use, so the first locked
+;;; section of a SINGLE-threaded process (%RT-ENTER-LOCKED's refill check)
+;;; carved the band: region 0 lost ~270 MB for nothing, and a heap snapshot
+;;; taken then could not be restored into a fresh process, whose region 0 is
+;;; whole (lib/save-image.lisp, "heap geometry differs").
 (defun %rt-arena-base ()
-  (if (zerop (%ha-base)) 0 (%gc-read64 (%rt-arena-words))))
+  (if (zerop *ha-band*) 0 (%gc-read64 (%rt-arena-words))))
 (defun %rt-arena-alloc ()
-  (if (zerop (%ha-base)) 0 (%gc-read64 (+ (%rt-arena-words) #x08))))
+  (if (zerop *ha-band*) 0 (%gc-read64 (+ (%rt-arena-words) #x08))))
 (defun %rt-arena-end ()
-  (if (zerop (%ha-base)) 0 (%gc-read64 (+ (%rt-arena-words) #x10))))
+  (if (zerop *ha-band*) 0 (%gc-read64 (+ (%rt-arena-words) #x10))))
 (defun %rt-arena-fallbacks ()
-  (if (zerop (%ha-base)) 0 (%gc-read64 (+ (%rt-arena-words) #x18))))
+  (if (zerop *ha-band*) 0 (%gc-read64 (+ (%rt-arena-words) #x18))))
 
 (defun %rt-slice-need ()
   "Headroom the next locked section needs in its slice: 64 KB, or the size a
@@ -3535,7 +3542,29 @@ modus: a thread needed the runtime lock but the lock arena is exhausted or missi
 ;;; the N-regions selftest's result block; +0xC800..+0xD000 is otherwise unused):
 ;;;   +0x00 the bump lock   +0x08 arena base   +0x10 next free
 ;;;   +0x18 arena limit     +0x20 cells handed out   +0x28 refusals
-(defun %sync-cell-ctl () (+ (%ha-base) #xC800))
+;;;
+;;; IN THE JIT ARENA'S DATA PAGES WHEN THERE IS ONE (mvm-eval.lisp
+;;; %JIT-DATA-PAGE): the control words in the first such page, and cells handed
+;;; out of further 16 KB pages.  Those pages sit at fixed layout addresses and
+;;; travel in a heap snapshot, so a mutex made while a library loads still
+;;; works after a restore (lib/save-image.lisp).  The band, by contrast, is
+;;; carved out of region 0 on first use -- a lock made in a single-threaded
+;;; process cost it ~270 MB, and a snapshot of that process would not restore.
+;;; With no arena (the hosted x86-64 image), the band and one 4 MB mapping as
+;;; before.
+(defvar *sync-ctl* nil "The arena-page control block, once made; NIL before.")
+
+(defun %sync-cell-ctl ()
+  (let ((c *sync-ctl*))
+    (if (and (integerp c) (> c 0))
+        c
+        (let ((p (%jit-data-page)))
+          (if (> p 0)
+              (progn (setq *sync-ctl* p) p)
+              (+ (%ha-base) #xC800))))))
+
+(defun %sync-in-arena-p (ctl)
+  (let ((c *sync-ctl*)) (and (integerp c) (= ctl c))))
 (defun %sync-cell-size () 64)
 (defun %sync-arena-bytes () 4194304)
 
@@ -3552,6 +3581,15 @@ modus: a thread needed the runtime lock but the lock arena is exhausted or missi
   (let ((ctl (%sync-cell-ctl)))
     (spin-lock ctl)
     (let ((base (%gc-read64 (+ ctl #x08))))
+      ;; Arena mode: another 16 KB data page whenever the current one is full.
+      (when (and (%sync-in-arena-p ctl)
+                 (> (+ (%gc-read64 (+ ctl #x10)) (%sync-cell-size)) (%gc-read64 (+ ctl #x18))))
+        (let ((pg (%jit-data-page)))
+          (when (> pg 0)
+            (%gc-write64 (+ ctl #x08) pg)
+            (%gc-write64 (+ ctl #x10) pg)
+            (%gc-write64 (+ ctl #x18) (+ pg 16384))
+            (setq base pg))))
       (if (zerop base)
           (let ((m (%mmap-shared-page (%sync-arena-bytes))))
             (if (< m 4096)

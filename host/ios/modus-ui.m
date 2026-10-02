@@ -11,6 +11,11 @@
 //   1003 PRESENT            show the buffer (coalesced on the main thread)
 //   1004 NEXT-EVENT         the oldest touch: type<<40 | y<<20 | x, type
 //                           1 down / 2 move / 3 up; 0 when there is none
+//   1005 BLIT src wh xy     copy a w×h block of Lisp pixels to (x,y), clipped:
+//                           SRC is the address of element 0 of a SIMPLE-VECTOR
+//                           of 0xRRGGBB fixnums, w per row -- glass's frame-
+//                           buffer as modus stores it, one 8-byte word each
+//                           (value<<1).  wh = w | h<<16, xy = x | y<<16.
 //
 // The buffer is the screen at SCALE (2) pixels per point, XRGB 32-bit, drawn
 // with nearest-neighbour filtering.  Filling is native, so interpreted Lisp
@@ -22,7 +27,11 @@
 #include <stdint.h>
 #include <string.h>
 
-#define UI_SCALE 2
+// The screen's own pixel density (3 on a current iPhone), so one buffer pixel
+// is one device pixel; making things large enough to read is the drawing
+// side's job (glass's FB-BLIT-SCALED).
+static long ui_scale = 2;
+#define UI_SCALE ui_scale
 #define NEV 512
 
 static uint32_t *fb;
@@ -62,6 +71,8 @@ static UIWindow *window;
 // Called by the shim's app delegate, on the main thread, once launching is done.
 void modus_ui_start(void) {
     CGRect b = [[UIScreen mainScreen] bounds];
+    ui_scale = (long)[[UIScreen mainScreen] scale];
+    if (ui_scale < 1) ui_scale = 1;
     fb_w = (long)b.size.width * UI_SCALE;
     fb_h = (long)b.size.height * UI_SCALE;
     fb = calloc((size_t)(fb_w * fb_h), 4);
@@ -112,6 +123,19 @@ static long fill(long xy, long wh, long rgb) {
     return 0;
 }
 
+static long blit(long src, long wh, long xy) {
+    long w = wh & 0xFFFF, h = (wh >> 16) & 0xFFFF, x = xy & 0xFFFF, y = (xy >> 16) & 0xFFFF;
+    if (x >= fb_w || y >= fb_h) return 0;
+    long cw = x + w > fb_w ? fb_w - x : w, ch = y + h > fb_h ? fb_h - y : h;
+    const uint64_t *s = (const uint64_t *)(uintptr_t)src;
+    for (long j = 0; j < ch; j++) {
+        uint32_t *row = fb + (y + j) * fb_w + x;
+        const uint64_t *in = s + j * w;
+        for (long i = 0; i < cw; i++) row[i] = (uint32_t)(in[i] >> 1) & 0xFFFFFF;
+    }
+    return 0;
+}
+
 long modus_ui_call(long nr, long a0, long a1, long a2, long a3) {
     (void)a3;
     if (!ui_ready) return -38;
@@ -120,6 +144,7 @@ long modus_ui_call(long nr, long a0, long a1, long a2, long a3) {
     case 1001: return a0 == 0 ? fb_w : a0 == 1 ? fb_h : UI_SCALE;
     case 1002: return fill(a0, a1, a2);
     case 1003: present(); return 0;
+    case 1005: return blit(a0, a1, a2);
     case 1004: {
         uint64_t e = 0;
         os_unfair_lock_lock(&ev_lock);

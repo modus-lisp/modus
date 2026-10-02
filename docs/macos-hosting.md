@@ -380,9 +380,10 @@ Page-zero takes the first 4 GB, and the shared region takes 4 GB from
   784 MB data region, then the heap), and a 512 MB JIT arena.
 - **The iOS layout** sits where iOS allows it AND macOS leaves room, so the Mac
   and the Simulator can test it: `MODUS_CODE_BASE=300010000
-  MODUS_CONV_DELTA=2F6000000 MODUS_HEAP_BASE=336000000
-  MODUS_JIT_ARENA_BASE=3A8000000`.  Its top is `0x3C8000000`, 15.1 GB.  It
-  started cleanly in 40 of 40 launches on macOS.
+  MODUS_CONV_DELTA=2FA000000 MODUS_HEAP_BASE=33A000000
+  MODUS_JIT_ARENA_BASE=3AC000000`.  Its top is `0x3CC000000`, 15.2 GB.  The
+  first version, 64 MB lower (region delta `2F6000000`), started cleanly in 40
+  of 40 launches on macOS; it moved up when the code outgrew its 80 MB gap.
 - **The 24 GB layout collided.**  The macOS allocator reserves about 24 GB at
   a random base between 16 and 39 GB; a 24 GB layout collided in about 20%
   of launches.  `ld` caps `-pagezero_size` at 4 GB on arm64, so the range
@@ -1245,3 +1246,65 @@ failing.
   arena pointing at worker objects, so the guard refused `JOIN-THREAD`'s
   own result copy.  Plain functions fixed it: `%JIT-EAGER-ALL` reports the
   same 22 untranslatable modules as before the guard.
+
+## Snapshots that run on iOS (2026-10-01)
+
+An iOS app cannot load and compile a library world at startup: there is no
+JIT on the device, and loading glass, warp and the media player from source
+takes about 3.5 minutes on a Mac.  So the world is loaded and compiled ON THE
+MAC, saved with `save-and-die`, and the app carries the snapshot.  kiln's
+`kiln ios` does all of it (kiln `boot/ios-world.lisp`, `boot/ios.lisp`).
+
+**The snapshot is restored at another slide.**  iOS slides the whole app on
+every launch, so a restore relocates (`lib/save-image.lisp`, RELOCATION):
+- **Heap.** Every pointer-bearing word is moved by the slide difference,
+  walked object by object as the native collector walks to-space (byte
+  vectors count bytes, single-float vectors 4-byte lanes).  The rule is by
+  value: a tagged pointer into the old layout, or a fixnum whose value is an
+  old layout address.  Nothing hashes on addresses, so moved objects stay
+  found.
+- **Roots and globals.** The metadata window's restored roots,
+  `*conv-delta*` and `*layout-slide*`.
+- **The arena's data pages.** The JIT's linkage cells and the mutex-cell
+  allocator.
+
+**JIT code needs no relocation, because it is PC-relative now.**  The runtime
+JIT forms every layout address as `ADRP`+`ADD`, resolving the `ADRP`s when
+the page is placed (`%jit-resolve-adrp-fixups`).  This covers region words,
+image entry points, thunks and closures (`%jit-write-pcrel-quad`) and the
+constant-vector root.  Bytecode carries layout addresses at their LINK-time
+value (`mvm.lisp`, LAYOUT ADDRESSES IN BYTECODE), and the interpreter and the
+translator add the running process's slide.  A scan of a 7.6 MB arena found
+133,645 absolute layout addresses before and 0 after.
+
+**The app carries the code as signed pages.**  `MODUS_CORE=` makes
+`host/macos/image-segments.sh` put the snapshot's code pages in `__MODUSC`
+(r-x) at the arena base.  The restore compares rather than writes, so nothing
+touches them.  `MODUS_NO_RUNTIME_JIT` keeps the JIT off afterwards: new code
+is interpreted.  The arena's DATA (linkage cells, mutex cells) lives in pages
+taken from its top (`%jit-data-page`), so code and data never share a 16 KB
+page.  A macOS runner built the same way behaves as the phone does, and is
+the quickest test.
+
+**Making a world snapshot-safe turned up:**
+- **The lock arena carved region 0 in a single-threaded process.**  The
+  first runtime lock (any `bt:make-lock`) took about 270 MB, and the snapshot
+  then would not restore into a fresh process.  The arena readers no longer
+  carve, and mutex cells come from the arena's data pages.
+- **The constant vector reached only 4,096 entries.**  A big world passes
+  that early, after which every module with a constant was refused and
+  interpreted.  Up to 2^21 now.
+- **A native generic function lost its methods.**  CLOS maps a dispatcher
+  back to its GF by object (`%fn-to-gf`), which still named the interpreter
+  trampoline.  The native install registers the new function too.
+- **The compile pass must reach a fixpoint.**  A function compiles only once
+  its callees are native, and failures are not retried (the retry queue,
+  `*jit-retry-on*`, is off on hosted AArch64).  reel's VP8 loop filter, NEON
+  kernels included, stayed interpreted until the world build repeated the pass.
+
+**The layout moved up 64 MB** when the code outgrew its 80 MB gap (see "The
+address space is the constraint").
+
+On the Simulator and an iPhone 15 Pro, the app restores and draws warp's
+media player through glass.  On the Mac, with the same snapshot, a VP8 film
+decodes at about 28 frames per second.

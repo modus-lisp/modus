@@ -4,8 +4,8 @@
 #
 # IMAGE is a PC-relative, JIT-off Darwin image (the iOS layout):
 #   MODUS_PCREL=1 MODUS_DARWIN=1 MODUS_NO_JIT=1 MODUS_CODE_BASE=300010000 \
-#   MODUS_CONV_DELTA=2F6000000 MODUS_HEAP_BASE=336000000 \
-#   MODUS_JIT_ARENA_BASE=3A8000000 MODUS_CLI_OUT=… sbcl … mvm/build-aarch64-cli.lisp
+#   MODUS_CONV_DELTA=2FA000000 MODUS_HEAP_BASE=33A000000 \
+#   MODUS_JIT_ARENA_BASE=3AC000000 MODUS_CLI_OUT=… sbcl … mvm/build-aarch64-cli.lisp
 #
 # The Simulator runs watch apps as 64-bit processes on the Mac, so the iOS
 # layout works there.  A real watch is arm64_32 (a 4 GB address space) and

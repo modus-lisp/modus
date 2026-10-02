@@ -538,11 +538,19 @@ modus: unhandled error in a thread: "))
 ;;; MUTEXES
 ;;; ============================================================
 
-(defclass sb-thread::mutex ()
-  ((name :initarg :name :initform nil :accessor sb-thread::mutex-name)
-   ;; The raw arena cell.  +0x00 is the futex word, +0x10 the owner, +0x18 the
-   ;; recursion depth.  A number and not a Lisp object: the collector copies.
-   (cell :initarg :cell :accessor %mutex-cell)))
+;;; STRUCTS, NOT CLASSES -- the mutex, the waitqueue and the semaphore alike.
+;;; Each is a name and a cell address, and every lock and unlock reads the
+;;; cell.  As DEFCLASS accessors those reads were generic calls, two per
+;;; WITH-MUTEX, and they were most of what a lock cost; a struct accessor is a
+;;; plain function.
+(defstruct (sb-thread::mutex (:constructor %make-sb-mutex) (:conc-name %mutex-)
+                             (:copier nil) (:predicate nil))
+  (name nil)
+  ;; The raw arena cell.  +0x00 is the futex word, +0x10 the owner, +0x18 the
+  ;; recursion depth.  A number and not a Lisp object: the collector copies.
+  (cell 0))
+
+(defun sb-thread::mutex-name (mutex) (%mutex-name mutex))
 
 (defun sb-thread::mutexp (x) (typep x 'sb-thread::mutex))
 
@@ -553,7 +561,7 @@ modus: unhandled error in a thread: "))
                 (~D cells handed out, ~D refusals).  Cells are never reclaimed; ~
                 see %SYNC-CELL in net/hosted-sync.lisp."
                (%sync-cells-handed-out) (%sync-cells-exhausted))
-        (make-instance 'sb-thread::mutex :name name :cell cell))))
+        (%make-sb-mutex :name name :cell cell))))
 
 (defun sb-thread::mutex-owner (mutex)
   "PARTIAL.  SBCL returns the owning THREAD OBJECT; this returns the owning
@@ -661,15 +669,18 @@ modus: unhandled error in a thread: "))
 ;;; CONDITION VARIABLES
 ;;; ============================================================
 
-(defclass sb-thread::waitqueue ()
-  ((name :initarg :name :initform nil :accessor sb-thread::waitqueue-name)
-   (cell :initarg :cell :accessor %waitqueue-cell)))
+(defstruct (sb-thread::waitqueue (:constructor %make-sb-waitqueue) (:conc-name %waitqueue-)
+                                 (:copier nil) (:predicate nil))
+  (name nil)
+  (cell 0))
+
+(defun sb-thread::waitqueue-name (queue) (%waitqueue-name queue))
 
 (defun sb-thread::make-waitqueue (&key name)
   (let ((cell (%sync-cell)))
     (if (zerop cell)
         (error "sb-thread:make-waitqueue: the synchronisation arena is exhausted.")
-        (make-instance 'sb-thread::waitqueue :name name :cell cell))))
+        (%make-sb-waitqueue :name name :cell cell))))
 
 (defun sb-thread::condition-wait (queue mutex &key timeout)
   "Atomically release MUTEX and wait on QUEUE; re-acquire MUTEX before
@@ -719,16 +730,19 @@ modus: unhandled error in a thread: "))
 ;;; cell, which is why it is a dozen lines and not a new primitive: +0x00 is the
 ;;; mutex, +0x08 the condvar, +0x20 the count.
 
-(defclass sb-thread::semaphore ()
-  ((name :initarg :name :initform nil :accessor sb-thread::semaphore-name)
-   (cell :initarg :cell :accessor %semaphore-cell)))
+(defstruct (sb-thread::semaphore (:constructor %make-sb-semaphore) (:conc-name %semaphore-)
+                                 (:copier nil) (:predicate nil))
+  (name nil)
+  (cell 0))
+
+(defun sb-thread::semaphore-name (semaphore) (%semaphore-name semaphore))
 
 (defun sb-thread::make-semaphore (&key name (count 0))
   (let ((cell (%sync-cell)))
     (if (zerop cell)
         (error "sb-thread:make-semaphore: the synchronisation arena is exhausted.")
         (progn (%gc-write64 (+ cell #x20) count)
-               (make-instance 'sb-thread::semaphore :name name :cell cell)))))
+               (%make-sb-semaphore :name name :cell cell)))))
 
 (defun sb-thread::semaphore-count (semaphore)
   (%gc-read64 (+ (%semaphore-cell semaphore) #x20)))

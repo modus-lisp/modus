@@ -2222,6 +2222,20 @@
                   (setq addr th)
                   (setq *jit-bridged-sites*
                         (if *jit-bridged-sites* (+ 1 *jit-bridged-sites*) 1)))))
+            ;; ANY ARITY: the #'NAME thunk takes the arguments as they are (the
+            ;; callee's index rides in a window slot, and the call site has set
+            ;; nargs), so a callee that is not native yet is no reason to refuse
+            ;; the page.  Through the linkage cell, which %JIT-INSTALL-NATIVE-FNS
+            ;; repoints at the callee's native code the moment it has some -- so
+            ;; MUTUAL RECURSION across modules compiles too (scribe's
+            ;; GLYPH-OUTLINE and %COMPOSITE-GLYPH each waited for the other, and
+            ;; every glyph, so every line of text glass draws, ran interpreted).
+            (when (and (= addr 0) fn (%jit-bridge-on-p))
+              (let ((th (%jit-make-fnaddr-thunk-aarch64 name)))
+                (when th
+                  (setq addr th)
+                  (setq *jit-bridged-sites*
+                        (if *jit-bridged-sites* (+ 1 *jit-bridged-sites*) 1)))))
             (if (> addr 0)
                 ;; LINKAGE CELL: point the caller's ADRP/LDR pair at NAME's
                 ;; stable cell (the LDR dereferences it at call time) and make

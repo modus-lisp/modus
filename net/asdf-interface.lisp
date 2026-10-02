@@ -256,6 +256,25 @@
 (defun uiop::first-char (s) (and (stringp s) (plusp (length s)) (char s 0)))
 (defun uiop::last-char (s) (and (stringp s) (plusp (length s)) (char s (- (length s) 1))))
 
+(defun uiop::pathname-parent-directory-pathname (x)
+  "The directory containing directory X (X itself at the root)."
+  (let* ((s (string-right-trim "/" (namestring (uiop::ensure-directory-pathname x))))
+         (cut (position #\/ s :from-end t)))
+    (pathname (if cut (subseq s 0 (+ cut 1)) "/"))))
+
+(defun uiop::subdirectories (dir)
+  "The directories directly inside DIR, as namestrings ending in /."
+  (directory (concatenate 'string (namestring (uiop::ensure-directory-pathname dir)) "*/")))
+
+(defun uiop::directory-files (dir &optional (pattern "*.*"))
+  "The FILES directly inside DIR matching PATTERN -- not its subdirectories,
+   which modus's DIRECTORY lists among *.* without their trailing /."
+  (let* ((d (namestring (uiop::ensure-directory-pathname dir)))
+         (subs (mapcar (lambda (s) (string-right-trim "/" (namestring s)))
+                       (uiop::subdirectories d))))
+    (remove-if (lambda (f) (member (namestring f) subs :test (function string=)))
+               (directory (concatenate 'string d pattern)))))
+
 (defun uiop::native-namestring (x) (and x (namestring x)))
 (defun uiop::parse-native-namestring (s &rest keys)
   (declare (ignore keys))

@@ -9989,8 +9989,17 @@
    slot-fill `(aset obj i NIL-param)` always stored NIL — every struct came
    back with NIL user slots (accessors NIL, predicate NIL, kwargs lost).  Fall
    back to *package* (which IS MODUS.MVM during a normal compile), mirroring
-   cell-var-name."
-  (intern name (or (find-package "MODUS.MVM") *package*)))
+   cell-var-name.
+
+   AT RUNTIME, *PACKAGE*: the package the DEFSTRUCT is read in, as CLHS has it.
+   MODUS.MVM exists in-image too, so this used to put every runtime struct's
+   MAKE-<name>, accessors and predicate THERE -- one MAKE-DECODER for every
+   library that defines a DECODER struct.  reel defines eight; the last one
+   loaded (FFV1's) answered every package's MAKE-DECODER call, and the VP8
+   decoder got an FFV1 struct."
+  (intern name (if *mvm-eval-runtime-p*
+                   *package*
+                   (or (find-package "MODUS.MVM") *package*))))
 
 (defun cell-rewrite-form (form boxed-vars &optional (lambda-params nil))
   "Rewrite FORM to use cell indirection for BOXED-VARS.
@@ -25459,7 +25468,15 @@
              ;; Only when no (:CONSTRUCTOR …) option replaced it — see
              ;; DEFAULT-CTOR-SUPPRESSED above.
              (unless default-ctor-suppressed
-               (mvm-define-macro ctor-name %ctor-expander)
+               ;; NOT A MACRO AT RUNTIME.  The compiler's macro table is keyed
+               ;; by the BARE name, so a runtime struct's MAKE-<name> macro
+               ;; expanded every call to that name in EVERY package: reel
+               ;; defines eight DECODER structs, and REEL.DECODE:MAKE-DECODER
+               ;; (an ordinary defun) was rewritten into FFV1's constructor.
+               ;; At runtime the constructor is the FUNCTION below, defined
+               ;; under the struct's own symbol.
+               (unless *mvm-eval-runtime-p*
+                 (mvm-define-macro ctor-name %ctor-expander))
                ;; ...AND A FUNCTION (runtime compiles): see
                ;; %DEFSTRUCT-KW-CTOR-DEFUN.
                (when *mvm-eval-runtime-p*
@@ -25482,9 +25499,7 @@
              ;; Build-time (*mvm-eval-runtime-p* NIL) never takes this branch, so
              ;; host/native builds are unchanged.
              (when *mvm-eval-runtime-p*
-               (unless default-ctor-suppressed
-                 (set-macro-function (%defstruct-intern ctor-name)
-                                     %ctor-expander))
+               ;; (No runtime constructor MACRO: see NOT A MACRO AT RUNTIME.)
                ;; Also register the struct type so cross-call TYPEP /
                ;; :include ancestry / #S printing see it — mirrors the
                ;; walker's runtime-DEFSTRUCT registration (cl-eval.lisp).

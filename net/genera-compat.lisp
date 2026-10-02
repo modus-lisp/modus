@@ -587,8 +587,14 @@
           recursive nil 0 nil))
 
 (defun process::make-lock-argument (lock &rest options)
+  "A constant, not a fresh list: PROCESS:LOCK ignores it, and a caller keeps it
+   in the lock object (bordeaux-threads' Genera backend stores it on every
+   acquire).  A list made on a worker thread is that thread's object, and
+   storing it into a lock other threads share is the store modus's shared-store
+   guard refuses -- every bordeaux-threads lock taken off the main thread
+   failed."
   (declare (ignore lock options))
-  (list :lock-argument))
+  :lock-argument)
 
 (defun %genera-take (lock me)
   (setf (svref lock 4) me (svref lock 5) 1 (svref lock 6) nil)

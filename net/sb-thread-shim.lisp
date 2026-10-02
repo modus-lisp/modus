@@ -340,7 +340,7 @@
 
 (defun %sb-raw-report (msg)
   "MSG to fd 2 with raw write(2) calls from this thread's scratch word."
-  (let ((w (+ (%tls-self-base) #x100050B0))
+  (let ((w (+ (%tls-self-base) (%conv-addr #x100050B0)))
         (pre "
 modus: unhandled error in a thread: "))
     (dolist (str (list pre msg (string #\Newline)))
@@ -357,6 +357,49 @@ modus: unhandled error in a thread: "))
     (if done
         c
         (%sb-locked (256) (list :%sb-unpassable (copy-seq c))))))
+
+;;; ---- SHARING A VALUE WITH OTHER THREADS: MODUS:SHARE --------------------------
+;;;
+;;; Modus threads share no state.  A thread's objects live in its own region,
+;;; which only its own collector scans, so a pointer to one from anywhere
+;;; another thread can reach goes stale -- and the shared-store guard refuses
+;;; the store that would make it (translate-x64 / translate-aarch64, SHARED-
+;;; STORE GUARD).  A value meant for another thread is therefore SENT: copied
+;;; into shared memory first, exactly as JOIN-THREAD's result is.  These two
+;;; are that, for library code that hands data between threads itself (a decoder
+;;; thread filling a player's queues, say):
+;;;
+;;;   (modus:share X)       X, or a copy of it in shared memory -- X itself on
+;;;                         the main thread and for anything already shared,
+;;;                         so it is cheap to apply at every boundary.  Conses,
+;;;                         strings, numbers, vectors, structs, CLOS instances,
+;;;                         hash tables; a closure cannot be copied (an error).
+;;;   (modus:make-shared-array N &rest MAKE-ARRAY-ARGS)
+;;;                         an array allocated in shared memory to begin with:
+;;;                         a big buffer a thread fills in place and then
+;;;                         publishes, with nothing to copy.
+;;;
+;;; Portable code reaches them as #+modus (modus:share x) and is unchanged
+;;; elsewhere.
+
+(defun modus::share (x)
+  (if (zerop (%tls-self-base))
+      x
+      (let* ((done nil)
+             (c (catch '%sb-unpassable
+                  (prog1 (%sb-copy x 0) (setq done t)))))
+        (if done
+            c
+            (error "modus:share: ~A cannot be passed between threads" c)))))
+
+(defun modus::make-shared-array (n &rest args)
+  (if (zerop (%tls-self-base))
+      (apply (function make-array) n args)
+      ;; Room for the largest element type, header and padding included.
+      (%sb-locked ((+ (* 8 (if (integerp n) n (reduce (function *) n))) 64))
+        (apply (function make-array) n args))))
+
+(export (list (intern "SHARE" "MODUS") (intern "MAKE-SHARED-ARRAY" "MODUS")) "MODUS")
 
 (defun %sb-thread-body (thread box function arguments)
   "What every thread MAKE-THREAD starts runs: bind *CURRENT-THREAD*, call

@@ -1297,10 +1297,21 @@ the quickest test.
 - **A native generic function lost its methods.**  CLOS maps a dispatcher
   back to its GF by object (`%fn-to-gf`), which still named the interpreter
   trampoline.  The native install registers the new function too.
-- **The compile pass must reach a fixpoint.**  A function compiles only once
-  its callees are native, and failures are not retried (the retry queue,
-  `*jit-retry-on*`, is off on hosted AArch64).  reel's VP8 loop filter, NEON
-  kernels included, stayed interpreted until the world build repeated the pass.
+- **The eager compile now reaches a fixpoint.**  A function compiles only once
+  its callees are native, and a module JIT-EAGER failed on was never tried
+  again.  So reel's VP8 loop filter, NEON kernels included, stayed
+  interpreted: its kernel is defined twice, and the second (NEON) definition
+  came after its callers had already failed.  The #306 retry queue does not
+  help here: it only sees definition-time failures, and it is off on hosted
+  AArch64 anyway.  `%JIT-EAGER-ALL` now:
+  - repeats its pass while the previous pass installed something (at most
+    eight);
+  - retries a failed module once more functions have gone native since it
+    failed;
+  - never rebuilds a module that built.
+
+  The world went from 49 interpreted reel/cassette functions to 4, and
+  playback from 0.3 s to 9.6 s of film per 10 s.
 
 **The layout moved up 64 MB** when the code outgrew its 80 MB gap (see "The
 address space is the constraint").

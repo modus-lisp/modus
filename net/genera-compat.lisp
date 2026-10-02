@@ -395,18 +395,42 @@
 ;;; builds more than one closure.
 ;;; =====================================================================
 
+;;; FOUND ONCE.  Both of these looked SB-THREAD up by name on every call --
+;;; FIND-PACKAGE, FIND-SYMBOL, a BOUNDP -- and a bordeaux-threads lock goes
+;;; through them three or four times a lock and unlock: 50 us a
+;;; BT:WITH-LOCK-HELD, which a media player takes a few dozen times a frame.
+;;; The shim is loaded after this file, so the first call that finds it keeps
+;;; it.  Cached on the main thread only (a worker's cons in a global is the
+;;; store the shared-store guard refuses); a worker that misses looks up as
+;;; before.
+(defvar *genera-sbt-cache* nil "Alist SB-THREAD function NAME -> the function.")
+(defvar *genera-current-sym* nil "SB-THREAD:*CURRENT-THREAD*, once it exists.")
+
 (defun %genera-sbt (name)
-  "SB-THREAD's function NAME, found now; signals if this image has none."
-  (let ((s (and (find-package "SB-THREAD") (find-symbol name "SB-THREAD"))))
-    (if (and s (fboundp s))
-        (symbol-function s)
-        (error "PROCESS: this Modus image has no threads (SB-THREAD:~A)" name))))
+  "SB-THREAD's function NAME; signals if this image has none."
+  (let ((hit (assoc name *genera-sbt-cache* :test (function string=))))
+    (if hit
+        (cdr hit)
+        (let ((s (and (find-package "SB-THREAD") (find-symbol name "SB-THREAD"))))
+          (if (and s (fboundp s))
+              (let ((f (symbol-function s)))
+                (when (%gf-cache-writable-p)
+                  (setq *genera-sbt-cache* (cons (cons name f) *genera-sbt-cache*)))
+                f)
+              (error "PROCESS: this Modus image has no threads (SB-THREAD:~A)" name))))))
 
 (defun %genera-current ()
   "The current process: SB-THREAD:*CURRENT-THREAD*, or :MAIN without threads."
-  (let ((s (and (find-package "SB-THREAD")
-                (find-symbol "*CURRENT-THREAD*" "SB-THREAD"))))
-    (if (and s (boundp s)) (symbol-value s) :main)))
+  (let ((s *genera-current-sym*))
+    (if s
+        (symbol-value s)
+        (let ((s (and (find-package "SB-THREAD")
+                      (find-symbol "*CURRENT-THREAD*" "SB-THREAD"))))
+          (if (and s (boundp s))
+              (progn
+                (when (%gf-cache-writable-p) (setq *genera-current-sym* s))
+                (symbol-value s))
+              :main)))))
 
 (define-symbol-macro scl::*current-process* (%genera-current))
 

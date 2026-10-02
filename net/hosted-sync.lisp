@@ -2030,6 +2030,9 @@ modus: a thread needed the runtime lock but the lock arena is exhausted or missi
   (%rt-enter)
   (puthash name *symbol-function-table* fn)
   (%rt-leave)
+  ;; A reused slot reuses NAME: a bridge must not keep the old FN.
+  (when (fboundp (quote %jit-fnaddr-thunk-invalidate))
+    (%jit-fnaddr-thunk-invalidate name))
   0)
 
 (defun %tl-fn (name)

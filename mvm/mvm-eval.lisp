@@ -967,7 +967,13 @@
 ;; DEFUNs, not defconstants: a defconstant in this file read UNBOUND at
 ;; runtime (the positional-folding class), which faulted the builder.
 (defun %jit-thunk-size () 48)
-(defun %jit-bridge-cap () 4096)
+(defun %jit-bridge-cap ()
+  ;; One index per #'NAME thunk and per call-site bridge.  4096 ran out while
+  ;; kiln loaded its world (3876 call-site bridges alone), and from then on any
+  ;; function calling a not-yet-native callee -- every runtime DEFCLASS
+  ;; accessor is a closure -- failed its page and stayed INTERPRETED.  The
+  ;; thunks carry the index as a 32- or 64-bit immediate; only this table bounds it.
+  65536)
 
 (defun %jit-bridge-resolve (idx)
   (let ((nm (if (and *jit-bridge-names* (< idx (length *jit-bridge-names*)))
@@ -1007,8 +1013,13 @@
 (defun %jit-bridge-ensure ()
   "First-use init of the bridge tables; T when usable."
   (when (null *jit-bridge-names*)
-    (setq *jit-bridge-names* (make-array 4096))
+    (setq *jit-bridge-names* (make-array (%jit-bridge-cap)))
     (setq *jit-bridge-count* 0))
+  ;; A snapshot from before the cap rose: carry its names into a bigger table.
+  (when (< (length *jit-bridge-names*) (%jit-bridge-cap))
+    (let ((nv (make-array (%jit-bridge-cap))) (old *jit-bridge-names*))
+      (dotimes (i (length old)) (aset nv i (aref old i)))
+      (setq *jit-bridge-names* nv)))
   (when (null *jit-thunk-page*)
     (%jit-thunk-new-page))
   (if *jit-thunk-page* t nil))
@@ -1065,7 +1076,7 @@
 (defun %jit-make-bridge-thunk (name nargs)
   "Build the x64 bridge thunk for a NARGS-arg call to NAME; its address or NIL."
   (if (or (null nargs) (> nargs 3) (null (%jit-bridge-ensure))
-          (>= *jit-bridge-count* 4096))
+          (>= *jit-bridge-count* (%jit-bridge-cap)))
       nil
       (let ((addr (%jit-thunk-alloc)))
         (if (null addr) nil (%jit-thunk-fill addr name nargs)))))
@@ -1159,7 +1170,7 @@
 
 (defun %jit-make-bridge-thunk-aarch64 (name nargs)
   (if (or (null nargs) (> nargs 3) (null (%jit-bridge-ensure))
-          (>= *jit-bridge-count* 4096))
+          (>= *jit-bridge-count* (%jit-bridge-cap)))
       nil
       (let ((addr (%jit-thunk-alloc-aarch64)))
         (if (null addr) nil (%jit-thunk-fill-aarch64 addr name nargs)))))
@@ -1200,11 +1211,27 @@
 ;;;   br   x16                           D61F0200
 (defun %jit-fnaddr-idx-slot () (%conv-addr #x10000178))
 (defvar *jit-fnaddr-thunks* nil "Alist NAME-string -> thunk address (one per name).")
+(defvar *jit-fnaddr-thunk-index* nil
+  "EQUAL hash NAME-string -> its *JIT-FNADDR-THUNKS* entry.  The alist is
+   searched at every call-site relocation and every redefinition, and with one
+   thunk per not-yet-native callee it runs to thousands of names: a STRING=
+   scan per lookup.  Built from the alist on first use, so an older snapshot
+   (alist only) gets one too.")
+
+(defun %jit-fnaddr-thunk-entry (name)
+  "NAME's (NAME . thunk-address) entry, or NIL."
+  (when (and (stringp name) *jit-fnaddr-thunks*)
+    (when (null *jit-fnaddr-thunk-index*)
+      (let ((h (make-hash-table :test (function equal))))
+        (dolist (e *jit-fnaddr-thunks*)
+          (unless (gethash (car e) h) (setf (gethash (car e) h) e)))
+        (setq *jit-fnaddr-thunk-index* h)))
+    (gethash name *jit-fnaddr-thunk-index*)))
 (defun %jit-bridge-any (&rest args)
   "Late-bound target of a #'NAME value thunk: resolve the name whose index the
    thunk stored in the fn-addr slot, then apply it to the caller's arguments."
   (let* ((idx (mem-ref #x10000178 :u32))
-         (f (%jit-bridge-resolve idx)))
+         (f (%jit-bridge-lookup idx)))
     ;; Cache a NATIVE target (tag-3 code word) in the thunk so the next call
     ;; branches straight to it; a heap function (interpreted closure, tag 9)
     ;; keeps taking this path.  Cleared by %jit-fnaddr-thunk-invalidate on
@@ -1212,8 +1239,7 @@
     (let ((word (%val->word f)))
       (when (eql (logand word 15) 3)
         (let* ((nm (aref *jit-bridge-names* idx))
-               (h (and (stringp nm) *jit-fnaddr-thunks*
-                       (assoc nm *jit-fnaddr-thunks* :test (function string=)))))
+               (h (%jit-fnaddr-thunk-entry nm)))
           ;; RAW-ADDR-AUDIT: the thunk's LDR reads the slot's RAW bits, and a
           ;; Lisp (setf (mem-ref … :u64)) stores the value's tagged form
           ;; (fixnum n is stored as n<<1), so store HALF the (4-aligned)
@@ -1265,12 +1291,46 @@
    slow path."
   (+ addr 88))
 
+(defvar *jit-bridge-fns* nil
+  "THE BRIDGE'S FUNCTION CACHE: IDX -> the function the #'NAME thunk IDX last
+   resolved to, valid while *JIT-BRIDGE-FN-GENS*[IDX] is *JIT-BRIDGE-GEN*.  A
+   NATIVE target is cached in the thunk itself and never gets here; this is for
+   the rest -- a closure, which is every runtime DEFCLASS accessor and GF stub --
+   whose every call re-hashed its name string in *SYMBOL-FUNCTION-TABLE*: ~5 us
+   of a 7.8 us slot accessor.  Filled on the main thread only (a worker's lookup
+   result may be its own region's object; see %MVM-ON-MAIN-THREAD-P).")
+(defvar *jit-bridge-fn-gens* nil)
+(defvar *jit-bridge-gen* 0
+  "Bumped by every %JIT-FNADDR-THUNK-INVALIDATE -- any redefinition -- which
+   empties the whole bridge function cache at once.")
+
+(defun %jit-bridge-lookup (idx)
+  "%JIT-BRIDGE-RESOLVE through *JIT-BRIDGE-FNS*."
+  (let ((v *jit-bridge-fns*) (g *jit-bridge-fn-gens*) (gen *jit-bridge-gen*))
+    (if (and v (< idx (length v)) (eql (aref g idx) gen))
+        (aref v idx)
+        (let ((f (%jit-bridge-resolve idx)))
+          (when (%mvm-on-main-thread-p)
+            (when (or (null v) (>= idx (length v)))
+              (let* ((n (max 1024 (* 2 (+ idx 1))))
+                     (nv (make-array n :initial-element nil))
+                     (ng (make-array n :initial-element nil)))
+                (when v
+                  (dotimes (i (length v))
+                    (aset nv i (aref v i))
+                    (aset ng i (aref g i))))
+                (setq *jit-bridge-fns* nv *jit-bridge-fn-gens* ng v nv g ng)))
+            (aset v idx f)
+            (aset g idx gen))
+          f))))
+
 (defun %jit-fnaddr-thunk-invalidate (name)
   "A DEFUN / (setf symbol-function) of NAME: drop the cached native target of
    its #'NAME thunk so the next call re-resolves — late binding is what the
-   thunk exists for.  No-op when NAME has no thunk (and on x64, which bakes)."
-  (let ((h (and (stringp name) *jit-fnaddr-thunks*
-                (assoc name *jit-fnaddr-thunks* :test (function string=)))))
+   thunk exists for.  No-op when NAME has no thunk (and on x64, which bakes).
+   Every call also empties the bridge function cache (*JIT-BRIDGE-GEN*)."
+  (setq *jit-bridge-gen* (if (integerp *jit-bridge-gen*) (+ *jit-bridge-gen* 1) 1))
+  (let ((h (%jit-fnaddr-thunk-entry name)))
     (when h (setf (mem-ref (%jit-fnaddr-thunk-cache-slot (cdr h)) :u64) 0))))
 
 (defun %jit-fnaddr-thunk-fill-aarch64 (addr name)
@@ -1313,16 +1373,19 @@
     addr))
 (defun %jit-make-fnaddr-thunk-aarch64 (name)
   "Thunk address (16-aligned, so |3 is a valid tag-3 word) for #'NAME, or NIL."
-  (let ((hit (and (stringp name) (assoc name *jit-fnaddr-thunks* :test (function string=)))))
+  (let ((hit (%jit-fnaddr-thunk-entry name)))
     (if hit
         (cdr hit)
-        (if (or (null name) (null (%jit-bridge-ensure)) (>= *jit-bridge-count* 4096))
+        (if (or (null name) (null (%jit-bridge-ensure)) (>= *jit-bridge-count* (%jit-bridge-cap)))
             nil
             (let ((addr (%jit-thunk-alloc-aarch64)))
               (if (null addr)
                   nil
                   (let ((a (%jit-fnaddr-thunk-fill-aarch64 addr name)))
-                    (setq *jit-fnaddr-thunks* (cons (cons name a) *jit-fnaddr-thunks*))
+                    (let ((e (cons name a)))
+                      (setq *jit-fnaddr-thunks* (cons e *jit-fnaddr-thunks*))
+                      (when *jit-fnaddr-thunk-index*
+                        (setf (gethash name *jit-fnaddr-thunk-index*) e)))
                     a)))))))
 
 (defun %jit-reloc-calls (base relocs rt-table)
@@ -2214,14 +2277,6 @@
                  (fn (and name (%mvm-resolve-runtime-fn name)))
                  (word (if fn (%val->word fn) 0))
                  (addr (if (eql (logand word 15) 3) (- word 3) 0)))
-            ;; #306 BRIDGE (aarch64 arm): non-native callee -> per-site thunk.
-            (when (and (= addr 0) fn (%jit-bridge-on-p))
-              (let* ((na (assoc (car r) *aarch64-call-reloc-nargs*))
-                     (th (and na (%jit-make-bridge-thunk-aarch64 name (cdr na)))))
-                (when th
-                  (setq addr th)
-                  (setq *jit-bridged-sites*
-                        (if *jit-bridged-sites* (+ 1 *jit-bridged-sites*) 1)))))
             ;; ANY ARITY: the #'NAME thunk takes the arguments as they are (the
             ;; callee's index rides in a window slot, and the call site has set
             ;; nargs), so a callee that is not native yet is no reason to refuse
@@ -2230,8 +2285,18 @@
             ;; MUTUAL RECURSION across modules compiles too (scribe's
             ;; GLYPH-OUTLINE and %COMPOSITE-GLYPH each waited for the other, and
             ;; every glyph, so every line of text glass draws, ran interpreted).
+            ;; FIRST, because it is ONE thunk per NAME, shared by every caller:
+            ;; the per-site bridge below spends a table index per call site.
             (when (and (= addr 0) fn (%jit-bridge-on-p))
               (let ((th (%jit-make-fnaddr-thunk-aarch64 name)))
+                (when th
+                  (setq addr th)
+                  (setq *jit-bridged-sites*
+                        (if *jit-bridged-sites* (+ 1 *jit-bridged-sites*) 1)))))
+            ;; #306 BRIDGE (aarch64 arm): non-native callee -> per-site thunk.
+            (when (and (= addr 0) fn (%jit-bridge-on-p))
+              (let* ((na (assoc (car r) *aarch64-call-reloc-nargs*))
+                     (th (and na (%jit-make-bridge-thunk-aarch64 name (cdr na)))))
                 (when th
                   (setq addr th)
                   (setq *jit-bridged-sites*
@@ -2850,6 +2915,14 @@
           ;; more callees have gone native (see *jit-retry-queue*).
           (when (and persist-names (%jit-native-defuns-p))
             (%jit-retry-enqueue bc entry ft-list rt-table persist-names))
+          ;; THE FORM RUNS FROM HERE, so a condition it signals is the user's:
+          ;; say so, exactly as the native path does before its call.  Without
+          ;; it the caller's handler took this interpreted run's own error for
+          ;; a setup failure and interpreted the form AGAIN -- measured:
+          ;; (eval '(progn (incf *runs*) (mapcar (lambda (x) x) '(1)) (undef)))
+          ;; left *runs* at 2.  A page fails to build exactly when a callee is
+          ;; unresolved, which is when the run is likeliest to signal.
+          (setq *jit-native-ran* t)
           (%mvm-wrap-escaping-result
             (mvm-interpret bc :entry-point entry
                            :function-table fn-table :runtime-table rt-table
@@ -3476,6 +3549,9 @@
                 ;; / the fn at offset 0), so an ordinary fixnum DATA argument — a loop
                 ;; counter 0/1/2, an index — is never mistaken for a callable.
                 (lam-offsets (make-hash-table))
+                ;; T when the module compiled a LAMBDA / CLOSURE body -- see
+                ;; LAMBDA-BEARING FORMS SKIP RETRY-ON-HOT below.
+                (%lam-bearing nil)
                 ;; WS4-S5b: (name offset length) list for translate-mvm-to-x64
                 ;; (the JIT adapter — same function-info structs as fn-table).
                 (ft-list nil))
@@ -3501,7 +3577,7 @@
                 ;; %MVM-WRAP-ESCAPING in interp.lisp (alexandria EXTREMUM.1).
                 (if (and (or (search "$$LAMBDA" nm) (search "$$CLOSURE" nm))
                          (not (eql off 0)))
-                    (puthash off lam-offsets t)
+                    (progn (puthash off lam-offsets t) (setq %lam-bearing t))
                     ;; NON-lambda module fns (defuns, flet bodies, the thunk)
                     ;; record under the distinct :DEFUN marker: the #x52
                     ;; branches (module-closure vs native-closure
@@ -3629,7 +3705,22 @@
                             ;; forms (never re-eval'd; DEFUNs aren't even cacheable)
                             ;; thus never pay JIT translation — fast loading — while
                             ;; repeated forms go native on the second run.
-                            (if (and (%jit-active-p) (not (%jit-hot-only-p)))
+                            ;;
+                            ;; LAMBDA-BEARING FORMS SKIP RETRY-ON-HOT.  A one-shot
+                            ;; form is not one-shot CODE when it builds a closure
+                            ;; that outlives it: a DEFMETHOD's method function, a
+                            ;; DEFPARAMETER of a lambda, a hook pushed onto a list.
+                            ;; Interpreted, each of those is a trampoline that
+                            ;; re-enters mvm-interpret on EVERY call -- 3 us, against
+                            ;; 0.005 us native -- and no later pass revisits it:
+                            ;; %JIT-EAGER-ALL rebuilds DEFUN modules, and the form
+                            ;; that made the closure never runs again.  Measured on
+                            ;; warp's media player: every method body in the app
+                            ;; interpreted, a generic call 4.5 us, and a 40-row
+                            ;; layout 24 ms a frame.  So a module that compiled a
+                            ;; lambda body is JIT'd on its first run; if the page
+                            ;; cannot be built it interprets exactly as before.
+                            (if (and (%jit-active-p) (or (not (%jit-hot-only-p)) %lam-bearing))
                                 (handler-case
                                     (%mvm-eval-jit-run bc entry (reverse ft-list)
                                                     fn-table rt-table lam-offsets nil

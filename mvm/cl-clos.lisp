@@ -326,6 +326,8 @@
    is the definition point and SLOT-NAMES is already in hand, so the record
    belongs here; the macro's own call is now redundant but harmless."
   (%register-clos-direct-slots name slot-names)
+  ;; Any CPL may change: every GF dispatch cache is stale (THE DISPATCH CACHE).
+  (setq *gf-cache-epoch* (+ (%gf-cache-epoch) 1))
   (let* ((cpl (%compute-cpl name (if (null supers) '(standard-object) supers)))
          ;; Effective slots: this class's slots + each ancestor's slots
          ;; (de-duplicated, in CPL order).  Walk cpl skipping the leading
@@ -373,10 +375,32 @@
                 (when (not (eq (car (car cur)) name))
                   (setq new-registry (cons (car cur) new-registry)))
                 (setq cur (cdr cur)))
-              (setq *clos-classes* (cons (cons name cls) new-registry)))))
+              (setq *clos-classes* (cons (cons name cls) new-registry))
+              (setq *clos-find-memo* nil))))
       name)))
 
+(defvar *clos-find-memo* nil
+  "EQ hash: symbol class NAME -> what %FIND-CLOS-CLASS-SCAN answered.  %OBJ-CPL
+   asks on every SLOT-VALUE and every class TYPEP, and the scan walks every
+   class in the image.  Dropped wherever *CLOS-CLASSES* is set; main thread
+   only, as *GF-FIND-MEMO*.")
+
 (defun %find-clos-class (name)
+  "Return class descriptor for NAME, or nil -- through *CLOS-FIND-MEMO*."
+  (if (and (symbolp name) name (%gf-cache-writable-p))
+      (let ((memo *clos-find-memo*))
+        (when (null memo)
+          (setq memo (make-hash-table :test (quote eq)))
+          (setq *clos-find-memo* memo))
+        (let ((hit (gethash name memo)))
+          (if hit
+              hit
+              (let ((c (%find-clos-class-scan name)))
+                (when c (puthash name memo c))
+                c))))
+      (%find-clos-class-scan name)))
+
+(defun %find-clos-class-scan (name)
   "Return class descriptor for NAME, or nil.
 
    TWO PASSES.  Pass 1 is the historical EXACT-EQ scan: for the native /
@@ -394,13 +418,13 @@
     (loop
       (when (null cur) (return nil))
       (when (eq (car (car cur)) name)
-        (return-from %find-clos-class (cdr (car cur))))
+        (return-from %find-clos-class-scan (cdr (car cur))))
       (setq cur (cdr cur))))
   (let ((cur *clos-classes*))
     (loop
       (when (null cur) (return nil))
       (when (%clos-class-name-eq (car (car cur)) name)
-        (return-from %find-clos-class (cdr (car cur))))
+        (return-from %find-clos-class-scan (cdr (car cur))))
       (setq cur (cdr cur))))
   nil)
 
@@ -2216,7 +2240,7 @@
    %defgeneric) so %defmethod / find-method can validate method
    congruence (CLHS 7.6.4).  NIL means unknown — auto-created GFs
    from a leading %defmethod skip the check."
-  (let ((gf (make-array 9)))
+  (let ((gf (make-array 10)))
     (aset gf 0 '%generic-function)
     (aset gf 1 name)
     (aset gf 2 nil)  ; methods-alist
@@ -2233,6 +2257,8 @@
     ;; *gf-fn-to-name* by %make-gf-stub so %generic-function-p / find-method
     ;; can reverse-map it.
     (aset gf 8 (%make-gf-stub name))
+    ;; Slot 9: the dispatch cache -- see THE DISPATCH CACHE.
+    (aset gf 9 nil)
     gf))
 
 (defun %gf-p (x)
@@ -2251,10 +2277,91 @@
 ;; lack slot 4.  Guard via array-length.
 (defun %gf-lambda-list (gf)
   (if (>= (array-length gf) 5) (aref gf 4) nil))
-(defun %gf-set-methods (gf m) (aset gf 2 m))
-(defun %gf-set-combination (gf c) (aset gf 3 c))
+(defun %gf-set-methods (gf m) (aset gf 2 m) (%gf-cache-clear gf))
+(defun %gf-set-combination (gf c) (aset gf 3 c) (%gf-cache-clear gf))
 (defun %gf-set-lambda-list (gf ll)
-  (when (>= (array-length gf) 5) (aset gf 4 ll)))
+  (when (>= (array-length gf) 5) (aset gf 4 ll))
+  (%gf-cache-clear gf))
+
+;;; ---- THE DISPATCH CACHE --------------------------------------------------
+;;; %GF-DISPATCH used to collect and sort the applicable methods on every
+;;; call: with the arity check, ~2.4 us of a slot accessor, which an app's
+;;; layout and paint make thousands of times a frame.  Slot 9 remembers the
+;;; sorted applicable list per (class of the first argument, argument count).
+;;;
+;;; ONLY where that pair decides it: every method's specializers are a class
+;;; name (or T) for the first argument and T for the rest -- every DEFCLASS
+;;; accessor and most single-dispatch protocols.  An EQL specializer anywhere,
+;;; or a class specializer past the first argument, and the GF is not cached.
+;;; Only a CLOS INSTANCE as first argument is cached, keyed by the class name
+;;; it carries (its slot 1), which is what %OBJ-CPL looks its CPL up by.
+;;;
+;;; INVALIDATION.  The method list, combination or lambda list changing
+;;; clears the GF's cache (the setters above).  A class (re)definition can
+;;; change any instance's CPL, so %DEFCLASS bumps *GF-CACHE-EPOCH* and every
+;;; cache stamped with an older epoch reads as empty.  CHANGE-CLASS changes
+;;; the instance's slot 1, so its key, so it misses on its own.
+;;;
+;;; THREADS.  Only the main thread fills a cache: a worker's conses would be
+;;; worker-region objects stored into a shared GF (the forbidden direction,
+;;; see %MVM-ON-MAIN-THREAD-P).  Workers read it like anyone else.
+(defvar *gf-cache-epoch* 0)
+
+(defun %gf-cache-epoch ()
+  ;; CLOS runs at boot, before every defvar initform has: an absent global
+  ;; reads as NIL (%GV-REF), hence INTEGERP -- and not BOUNDP, which costs a
+  ;; microsecond on a path that is all about the microsecond.
+  (if (integerp *gf-cache-epoch*) *gf-cache-epoch* 0))
+
+(defun %gf-cache-clear (gf)
+  (when (>= (array-length gf) 10) (aset gf 9 nil)))
+
+(defun %gf-cache-writable-p ()
+  ;; %MVM-ON-MAIN-THREAD-P's test, here because not every image has mvm-eval.
+  (if (= (mem-ref #x10000FF8 :u32) 0) t (if (= (percpu-ref 16) 0) t nil)))
+
+(defun %gf-cache-get (gf args)
+  "The cached applicable-method list for ARGS, or NIL."
+  (when (and (>= (array-length gf) 10) (consp args))
+    (let ((c (aref gf 9)) (a (car args)))
+      (when (and (consp c) (eql (car c) (%gf-cache-epoch)) (%clos-instance-p a))
+        (let ((k (aref a 1)) (n (length args)) (e (cdr c)))
+          (loop
+            (when (null e) (return nil))
+            (let ((x (car e)))
+              (when (and (eq (car x) k) (eql (car (cdr x)) n))
+                (return (cdr (cdr x)))))
+            (setq e (cdr e))))))))
+
+(defun %gf-cacheable-p (gf)
+  "True iff every method of GF dispatches on the first argument's class alone."
+  (let ((ms (%gf-methods gf)) (ok t))
+    (loop
+      (when (or (null ms) (not ok)) (return ok))
+      (let ((specs (%method-specializers (car ms))))
+        (when (and (consp specs) (consp (car specs))) (setq ok nil))
+        (when ok
+          (let ((r (cdr specs)))
+            (loop
+              (when (null r) (return nil))
+              (unless (eq (car r) 't) (setq ok nil) (return nil))
+              (setq r (cdr r))))))
+      (setq ms (cdr ms)))))
+
+(defun %gf-cache-put (gf args applicable)
+  (when (and applicable (>= (array-length gf) 10) (consp args)
+             (%clos-instance-p (car args))
+             (%gf-cache-writable-p)
+             (%gf-cacheable-p gf))
+    (let ((c (aref gf 9)) (ep (%gf-cache-epoch)))
+      (unless (and (consp c) (eql (car c) ep))
+        (setq c (cons ep nil))
+        (aset gf 9 c))
+      ;; A handful of classes per GF; past that, stop growing rather than
+      ;; turn the lookup into the scan it replaced.
+      (when (< (length (cdr c)) 12)
+        (setf (cdr c) (cons (cons (aref (car args) 1) (cons (length args) applicable))
+                        (cdr c)))))))
 
 ;; Slot 5: methods added by a DEFGENERIC form for NAME.  CLHS DEFGENERIC:
 ;; redefining a GF removes the methods the PREVIOUS defgeneric form added
@@ -2782,7 +2889,32 @@
         (let ((pn (%gf-sym-pkg-name name)))
           (if (null pn) t (string= pk pn))))))
 
+(defvar *gf-find-memo* nil
+  "EQ hash: symbol GF NAME -> what %FIND-GF-SCAN answered for it.  The scan is
+   a walk of every GF in the image -- twice when the EQ pass misses -- and it
+   ran on every generic call: 10-17% of a media-player frame.  Entries are
+   only ever PUSHED onto *GENERIC-FUNCTIONS*, so an answer stays right until
+   the next push, which drops the memo (%DEFGENERIC).  Main thread only, for
+   reads as well as writes: an EQ table may rehash itself during a lookup, and
+   a worker must not write a shared table.")
+
 (defun %find-gf (name)
+  "Find generic function by name -- through *GF-FIND-MEMO* for a symbol."
+  (if (and (symbolp name) name (%gf-cache-writable-p))
+      ;; No BOUNDP (1 us here): an absent global reads as NIL (%GV-REF).
+      (let ((memo *gf-find-memo*))
+        (when (null memo)
+          (setq memo (make-hash-table :test (quote eq)))
+          (setq *gf-find-memo* memo))
+        (let ((hit (gethash name memo)))
+          (if hit
+              hit
+              (let ((gf (%find-gf-scan name)))
+                (when gf (puthash name memo gf))
+                gf))))
+      (%find-gf-scan name)))
+
+(defun %find-gf-scan (name)
   "Find generic function by name.  (setf X) function names are LISTS —
    each quoted occurrence is a distinct cons, so EQ never matches across
    call sites; compare those structurally by their inner symbol.
@@ -2808,7 +2940,7 @@
                        (not (%cl-sym-p k)) (not (%cl-sym-p name))
                        (consp (cdr k)) (consp (cdr name))
                        (eq (car (cdr k)) (car (cdr name)))))
-          (return-from %find-gf (cdr (car cur)))))
+          (return-from %find-gf-scan (cdr (car cur)))))
       (setq cur (cdr cur))))
   (when (not (consp name))
     (let ((cur *generic-functions*))
@@ -2823,7 +2955,7 @@
                      ;; GF (spurious congruence PROGRAM-ERROR one way,
                      ;; silent mis-dispatch the other).
                      (%gf-pkg-compatible k name))
-            (return-from %find-gf (cdr (car cur)))))
+            (return-from %find-gf-scan (cdr (car cur)))))
         (setq cur (cdr cur)))))
   nil)
 
@@ -2881,6 +3013,8 @@
          (when lambda-list
            (%gf-set-lambda-list gf lambda-list))
          (setq *generic-functions* (cons (cons name gf) *generic-functions*))
+         ;; A new entry can answer a name an older one answered by NAME-HASH.
+         (setq *gf-find-memo* nil)
          ;; A new named GF changes the answer %e2-name-names-gf-p memoized --
          ;; but only for THIS name.  Nuking the whole table made the memo
          ;; useless during a CLOS-heavy load (genera-shim registers constantly,
@@ -3578,11 +3712,32 @@
           (string= (symbol-name gf-name) target-name-str)) t)
     (t nil)))
 
+(defun %default-primary-shape-p (n)
+  "True iff the string N has the length and first letter of one of the names
+   %HAS-DEFAULT-PRIMARY-P knows."
+  (let ((len (length n)))
+    (and (> len 0)
+         (let ((c (char n 0)))
+           (cond ((= len 12) (or (char= c #\C) (char= c #\P)))   ; CHANGE-CLASS PRINT-OBJECT
+                 ((= len 17) (char= c #\S))                       ; SHARED-INITIALIZE
+                 ((= len 19) (char= c #\I))                       ; INITIALIZE-INSTANCE
+                 ((= len 21) (char= c #\R))                       ; REINITIALIZE-INSTANCE
+                 ((= len 35) (char= c #\U))                       ; UPDATE-INSTANCE-FOR-...
+                 (t nil))))))
+
 (defun %has-default-primary-p (gf-name)
   "True iff GF-NAME has a registered default-primary fallback.  Driven
    by a small symbol set rather than the *gf-default-primaries* alist
-   so the test is cheap and the supported set is visible at one spot."
+   so the test is cheap and the supported set is visible at one spot.
+
+   LENGTH AND FIRST LETTER FIRST.  This runs on EVERY generic call (the
+   single-method fast path asks it), and seven STRING= compares were 0.7 us of
+   a 1.3 us call.  A name that does not share a length AND an initial with one
+   of the seven cannot be it -- nearly every GF -- and that takes no STRING=.
+   (Length alone let CONSUMER-SCROLL-Y through: 17, like SHARED-INITIALIZE.)"
   (cond
+    ((not (symbolp gf-name)) nil)
+    ((not (%default-primary-shape-p (symbol-name gf-name))) nil)
     ((%gf-name-is-p gf-name 'shared-initialize "SHARED-INITIALIZE")    t)
     ((%gf-name-is-p gf-name 'change-class "CHANGE-CLASS")              t)
     ((%gf-name-is-p gf-name 'initialize-instance "INITIALIZE-INSTANCE") t)
@@ -4506,8 +4661,13 @@
     ;; CLHS 7.6.4: validate the supplied arg count against the GF's
     ;; required-parameter count BEFORE method selection — too few/many
     ;; required args is a program-error, not a no-applicable-method.
-    (%gf-check-arity gf args)
-    (let ((applicable (%collect-applicable-methods gf args)))
+    ;; A cache hit was filled by a call with the same argument count, which
+    ;; passed this same arity check (THE DISPATCH CACHE).
+    (let ((applicable (%gf-cache-get gf args)))
+      (unless applicable
+        (%gf-check-arity gf args)
+        (setq applicable (%collect-applicable-methods gf args))
+        (%gf-cache-put gf args applicable))
       ;; No USER method applies, but the GF has a system primary (the
       ;; standard-object method of SHARED-INITIALIZE, CHANGE-CLASS, ...):
       ;; that method is always applicable, so run it.  The default-primary

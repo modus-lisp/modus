@@ -1816,7 +1816,8 @@
            (unless (eq (car (car cur)) name)
              (setq new-reg (cons (car cur) new-reg)))
            (setq cur (cdr cur)))
-         (setq *clos-classes* new-reg)))
+         (setq *clos-classes* new-reg)
+         (setq *clos-find-memo* nil)))
       (t
        (let ((new-reg nil) (cur *clos-classes*))
          (loop
@@ -1824,7 +1825,8 @@
            (unless (eq (car (car cur)) name)
              (setq new-reg (cons (car cur) new-reg)))
            (setq cur (cdr cur)))
-         (setq *clos-classes* (cons (cons name value) new-reg)))))
+         (setq *clos-classes* (cons (cons name value) new-reg))
+         (setq *clos-find-memo* nil))))
     value))
 
 (defun %class-proxy-p (obj)

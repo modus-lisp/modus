@@ -295,6 +295,34 @@ static void note_reservation(const char *seg) {
 // is already in place, so answer with its address and map nothing.
 static uint64_t preloaded_lo;
 
+// THE ARENA'S DATA END IS NOT MAP_JIT.  Data pages (linkage cells, mutex
+// cells: mvm-eval.lisp %JIT-DATA-PAGE) grow down from the arena's top, and
+// image code writes them on every lock.  Inside MAP_JIT each such write
+// faulted the thread into write mode and its return to JIT code faulted it
+// back -- two signals, ~4 us, per lock and per unlock (measured: bt:with-lock-
+// held 80 us).  So a JIT region big enough to be the arena keeps its top
+// JIT_DATA_SLICE as ordinary RW memory.  Code grows up from the bottom and
+// uses a quarter of the arena; should it ever reach the slice, the exec fault
+// there is reported by name (on_fault) rather than flipped.
+#define JIT_DATA_SLICE (16ull << 20)
+static uint64_t data_slice_lo, data_slice_hi;
+static uint64_t jit_split(void *p, uint64_t len) {
+    if (len < (64ull << 20)) return len;
+    uint64_t lo = (uint64_t)(uintptr_t)p + len - JIT_DATA_SLICE;
+    munmap((void *)(uintptr_t)lo, JIT_DATA_SLICE);
+    void *d = mmap((void *)(uintptr_t)lo, JIT_DATA_SLICE, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+    if (d == MAP_FAILED) {
+        // Put it back as it was: slower, still correct.
+        fprintf(stderr, "modus-shim: could not map the arena's data end RW (%s); keeping MAP_JIT\n", strerror(errno));
+        mmap((void *)(uintptr_t)lo, JIT_DATA_SLICE, PROT_READ | PROT_WRITE | PROT_EXEC,
+             MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+        return len;
+    }
+    data_slice_lo = lo; data_slice_hi = lo + JIT_DATA_SLICE;
+    return len - JIT_DATA_SLICE;
+}
+
 static long dx_mmap(long addr, long len, long prot, long flags, long fd, long off) {
     if (preloaded_lo && (uint64_t)addr == preloaded_lo) return addr;
     int f = (int)(flags & 3);                      // SHARED/PRIVATE agree
@@ -310,7 +338,8 @@ static long dx_mmap(long addr, long len, long prot, long flags, long fd, long of
             munmap((void *)addr, (size_t)len);
             void *p = mmap((void *)addr, (size_t)len, (int)prot, f | MAP_JIT, (int)fd, (off_t)off);
             if (p == (void *)addr) {
-                if (n_jit < MAXJIT) { jit_regions[n_jit].lo = (uint64_t)p; jit_regions[n_jit].hi = (uint64_t)p + (uint64_t)len; n_jit++; }
+                uint64_t jl = jit_split(p, (uint64_t)len);
+                if (n_jit < MAXJIT) { jit_regions[n_jit].lo = (uint64_t)p; jit_regions[n_jit].hi = (uint64_t)p + jl; n_jit++; }
                 modus_jit_wp(1);
                 return (long)p;
             }
@@ -328,7 +357,8 @@ static long dx_mmap(long addr, long len, long prot, long flags, long fd, long of
     void *p = mmap((void *)addr, (size_t)len, (int)prot, f, (int)fd, (off_t)off);
     if (p != MAP_FAILED && jit) {
         if (noreplace && (long)p != addr) { munmap(p, (size_t)len); return -17; }
-        if (n_jit < MAXJIT) { jit_regions[n_jit].lo = (uint64_t)p; jit_regions[n_jit].hi = (uint64_t)p + (uint64_t)len; n_jit++; }
+        uint64_t jl = jit_split(p, (uint64_t)len);
+        if (n_jit < MAXJIT) { jit_regions[n_jit].lo = (uint64_t)p; jit_regions[n_jit].hi = (uint64_t)p + jl; n_jit++; }
         modus_jit_wp(1);           // running mode: executable
         return (long)p;
     }
@@ -810,6 +840,9 @@ static void on_fault(int sig, siginfo_t *si, void *uc_) {
         modus_jit_wp(a == pc ? 1 : 0);
         return;
     }
+    if (a == pc && a >= data_slice_lo && a < data_slice_hi)
+        fprintf(stderr, "\nmodus-shim: code ran at %#llx, in the JIT arena's RW data end: the arena's code has "
+                "grown into it (see JIT_DATA_SLICE)\n", (unsigned long long)pc);
     int slot = fault_slot(sig);
     // MODUS_SHIM_FAULTS=1: say where every fault the image recovers from was.
     static int show = -1;

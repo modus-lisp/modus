@@ -2368,14 +2368,29 @@
         ;; (%jit-make-bridge-thunk-aarch64 is nargs-specific today) is the follow-on.
         (dolist (r frel)
           (let* ((name (gethash (cdr r) rt-table))
+                 ;; AN IMAGE FUNCTION IS ITSELF.  #'EQUAL in JIT'd code used to be
+                 ;; the thunk below -- a DIFFERENT object from (symbol-function
+                 ;; 'equal) -- so anything that recognises a function by identity
+                 ;; failed: MAKE-HASH-TABLE took :TEST #'EQUAL for an unknown test
+                 ;; and made an EQL table, every list key missed, and reed's Vorbis
+                 ;; window cache (one per packet, never found) grew until decoding
+                 ;; stopped.  The image's own code is part of the binary, never
+                 ;; moved and not what the late binding below protects (CLOS
+                 ;; generic functions, forward references), so a native word below
+                 ;; the JIT arena is written as it is.
+                 (img (let* ((fn (and name (%mvm-resolve-runtime-fn name)))
+                             (w (if fn (%val->word fn) 0))
+                             (alo (%core-jit-arena-lo)))
+                        (if (and (eql (logand w 15) 3) (> alo 0) (< w alo)) w nil)))
                  ;; NARGS-GENERIC LATE-BINDING THUNK (see %jit-make-fnaddr-thunk-
                  ;; aarch64): the #'NAME value becomes a stable tag-3 word in the
                  ;; exec thunk page that re-resolves NAME on every call — never a
                  ;; baked object, so no staleness, and the form stays NATIVE.
                  ;; Was: fail the page unconditionally (118/121 of reel's fn-addr
                  ;; rejects were `#'MAKE-ARRAY` from the keyword expansion).
-                 (th (and name (%jit-bridge-on-p)
+                 (th (and (null img) name (%jit-bridge-on-p)
                           (%jit-make-fnaddr-thunk-aarch64 name))))
+            (when img (setq th (- img 3)))
             (if th
                 (%jit-write-pcrel-quad base (car r) (logior th 3))
                 (progn

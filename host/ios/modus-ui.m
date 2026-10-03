@@ -11,11 +11,14 @@
 //   1003 PRESENT            show the buffer (coalesced on the main thread)
 //   1004 NEXT-EVENT         the oldest touch: type<<40 | y<<20 | x, type
 //                           1 down / 2 move / 3 up; 0 when there is none
-//   1005 BLIT src wh xy     copy a w×h block of Lisp pixels to (x,y), clipped:
+//   1005 BLIT src wh xy [stride]  copy a w×h block of Lisp pixels to (x,y), clipped:
 //                           SRC is the address of element 0 of a SIMPLE-VECTOR
 //                           of 0xRRGGBB fixnums, w per row -- glass's frame-
 //                           buffer as modus stores it, one 8-byte word each
 //                           (value<<1).  wh = w | h<<16, xy = x | y<<16.
+//                           STRIDE, when given, is the source's row length in
+//                           elements -- a block cut from a wider framebuffer
+//                           (the part of the screen that changed); 0 means w.
 //
 // The buffer is the screen at SCALE (2) pixels per point, XRGB 32-bit, drawn
 // with nearest-neighbour filtering.  Filling is native, so interpreted Lisp
@@ -124,28 +127,27 @@ static long fill(long xy, long wh, long rgb) {
     return 0;
 }
 
-static long blit(long src, long wh, long xy) {
+static long blit(long src, long wh, long xy, long stride) {
     long w = wh & 0xFFFF, h = (wh >> 16) & 0xFFFF, x = xy & 0xFFFF, y = (xy >> 16) & 0xFFFF;
     if (x >= fb_w || y >= fb_h) return 0;
     long cw = x + w > fb_w ? fb_w - x : w, ch = y + h > fb_h ? fb_h - y : h;
     const uint64_t *s = (const uint64_t *)(uintptr_t)src;
     for (long j = 0; j < ch; j++) {
         uint32_t *row = fb + (y + j) * fb_w + x;
-        const uint64_t *in = s + j * w;
+        const uint64_t *in = s + j * (stride > 0 ? stride : w);
         for (long i = 0; i < cw; i++) row[i] = (uint32_t)(in[i] >> 1) & 0xFFFFFF;
     }
     return 0;
 }
 
 long modus_ui_call(long nr, long a0, long a1, long a2, long a3) {
-    (void)a3;
     if (!ui_ready) return -38;
     wait_ui();
     switch (nr) {
     case 1001: return a0 == 0 ? fb_w : a0 == 1 ? fb_h : UI_SCALE;
     case 1002: return fill(a0, a1, a2);
     case 1003: present(); return 0;
-    case 1005: return blit(a0, a1, a2);
+    case 1005: return blit(a0, a1, a2, a3);
     case 1004: {
         uint64_t e = 0;
         os_unfair_lock_lock(&ev_lock);

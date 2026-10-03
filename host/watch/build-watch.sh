@@ -26,6 +26,8 @@ xcrun --sdk watchsimulator swiftc -target $TARGET -parse-as-library -O \
   -module-name ModusWatch -c "$HERE/modus-watch.swift" -o "$OBJ/modus-watch.o"
 xcrun --sdk watchsimulator clang -target $TARGET -isysroot "$SDK" -O2 -Wall \
   -c "$MAC/modus-shim.c" -o "$OBJ/modus-shim.o"
+xcrun --sdk watchsimulator clang -target $TARGET -isysroot "$SDK" -O2 -Wall \
+  -c "$MAC/modus-audio.c" -o "$OBJ/modus-audio.o"
 xcrun --sdk watchsimulator clang -target $TARGET -isysroot "$SDK" \
   -c "$MAC/syscall-stub.S" -o "$OBJ/syscall-stub.o"
 
@@ -34,9 +36,9 @@ WHERE=$("$MAC/image-segments.sh" "$IMAGE" "$OUT.segs")
 TOOLCHAIN=$(dirname "$(dirname "$(xcrun --sdk watchsimulator --find swiftc)")")
 # shellcheck disable=SC2086  # WHERE is a flag list
 xcrun --sdk watchsimulator clang -target $TARGET -isysroot "$SDK" \
-  -o "$OUT/modus" "$OBJ/modus-watch.o" "$OBJ/modus-shim.o" "$OBJ/syscall-stub.o" \
+  -o "$OUT/modus" "$OBJ/modus-watch.o" "$OBJ/modus-shim.o" "$OBJ/modus-audio.o" "$OBJ/syscall-stub.o" \
   -L"$SDK/usr/lib/swift" -L"$TOOLCHAIN/lib/swift/watchsimulator" \
-  -framework SwiftUI -framework CoreGraphics -framework CoreFoundation $WHERE
+  -framework SwiftUI -framework AudioToolbox -framework CoreGraphics -framework CoreFoundation $WHERE
 
 cat > "$OUT/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

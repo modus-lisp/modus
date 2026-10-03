@@ -33,7 +33,7 @@ else
 fi
 # shellcheck disable=SC2086  # WHERE is a flag list
 xcrun --sdk $SDKN clang -target $TARGET -isysroot "$SDK" -O2 -Wall \
-  -o "$OUT/modus" "$MAC/modus-shim.c" "$MAC/syscall-stub.S" "$HERE/modus-ui.m" -fobjc-arc -framework UIKit -framework QuartzCore -framework CoreGraphics -framework CoreFoundation $WHERE
+  -o "$OUT/modus" "$MAC/modus-shim.c" "$MAC/modus-audio.c" "$MAC/syscall-stub.S" "$HERE/modus-ui.m" -fobjc-arc -framework AudioToolbox -framework AVFoundation -framework UIKit -framework QuartzCore -framework CoreGraphics -framework CoreFoundation $WHERE
 cat > "$OUT/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

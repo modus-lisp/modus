@@ -23,6 +23,7 @@
 // up, because the image thread starts before UIApplicationMain.
 
 #import <UIKit/UIKit.h>
+#import <AVFoundation/AVFoundation.h>
 #include <os/lock.h>
 #include <stdint.h>
 #include <string.h>
@@ -158,3 +159,13 @@ long modus_ui_call(long nr, long a0, long a1, long a2, long a3) {
 
 // Before the image thread starts: from then on a UI call waits for the view.
 void modus_ui_init(void) { ui_ready = dispatch_semaphore_create(0); }
+
+// The speaker's half that needs UIKit's world (host/macos/modus-audio.c calls it
+// when the image opens the output): PLAYBACK, so a media player is heard with
+// the ring/silent switch off -- the default category treats an app's sound as
+// incidental and mutes it.
+void modus_audio_session(void) {
+    AVAudioSession *s = [AVAudioSession sharedInstance];
+    [s setCategory:AVAudioSessionCategoryPlayback error:nil];
+    [s setActive:YES error:nil];
+}

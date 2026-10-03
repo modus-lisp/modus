@@ -20,6 +20,8 @@
 // below, exactly as it does on Linux.
 
 #include <errno.h>
+// host/macos/modus-audio.c: the speaker, pseudo-syscalls 1010-1012, every Apple target.
+extern long modus_audio_call(long nr, long a0, long a1);
 #include <fcntl.h>
 #include <dirent.h>
 #include <mach-o/dyld.h>
@@ -799,6 +801,8 @@ static long modus_syscall_1(long a0, long a1, long a2, long a3, long a4, long a5
     case 1001: case 1002: case 1003: case 1004: case 1005:   // the framebuffer (host/ios/modus-ui.m)
         return modus_ui_call(nr, a0, a1, a2, a3);
 #endif
+    case 1010: case 1011: case 1012:                          // the speaker (host/macos/modus-audio.c)
+        return modus_audio_call(nr, a0, a1);
     default:
         if (nr >= 0 && nr < 512 && !unknown_seen[nr]) {
             unknown_seen[nr] = 1;

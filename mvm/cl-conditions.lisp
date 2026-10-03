@@ -2693,8 +2693,12 @@
               (setf (mem-ref #x10000CB0 :u32) 0)
               (setq *current-condition*
                     (make-condition 'simple-error
-                                    :format-control "modus: a thread stored one of its own objects into shared memory. Threads share no state -- pass the value as a message (or allocate shared data under the runtime lock); the store was refused."
-                                    :format-arguments nil)))
+                                    :format-control "modus: a thread stored one of its own objects into shared memory. Threads share no state -- pass the value as a message (or allocate shared data under the runtime lock); the store was refused (at #x~x)."
+                                    ;; THE SITE: the guard leaves the storing code's
+                                    ;; return address at +0x5060, which names the
+                                    ;; function against a symbol map -- the one thing
+                                    ;; that makes this error actionable.
+                                    :format-arguments (list (%gc-read64 (+ m 8))))))
             ;; Any other fault: %TAKE-PENDING-FAULT, which the dispatch
             ;; calls next, builds the condition from the recorded signal
             ;; (SIGSEGV -> MEMORY-FAULT-ERROR, a TYPE-ERROR).

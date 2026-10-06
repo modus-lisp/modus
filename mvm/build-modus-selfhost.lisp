@@ -1704,6 +1704,7 @@
   (%init-signal-symbols)
   (%init-make-load-form)
   (%install-runtime-backquote)
+  (%seat-backquote-markers)
   ;; Init RT counters + registry (defvar init thunks don't run on bare metal)
   (setq *rt-test-count* 0)
   (setq *rt-pass-count* 0)

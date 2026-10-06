@@ -1689,8 +1689,17 @@
                      (setq sub-ch (read-char stream t nil t)))
               (return nil)))))
     ;; Dispatch on sub-char
-    (let ((code (if (characterp sub-ch) (char-code sub-ch) 0)))
+    (let* ((code (if (characterp sub-ch) (char-code sub-ch) 0))
+           ;; A function the PROGRAM installed for this sub-char comes first.  The built-ins
+           ;; below are the standard syntax, and the standard readtable's dispatch table is
+           ;; empty, so an entry there was put there by SET-DISPATCH-MACRO-CHARACTER -- and
+           ;; CLHS says it is what #<sub-char> means in RT.  Consulted only after the built-ins,
+           ;; a program's own #. #\ #+ #R ... was silently ignored.
+           (user-fn (let ((sub-table (%get-dispatch-table #\# rt))
+                          (upper-code (if (and (>= code 97) (<= code 122)) (- code 32) code)))
+                      (and sub-table (< upper-code 128) (aref sub-table upper-code)))))
       (cond
+        (user-fn (funcall user-fn stream sub-ch arg))
         ;; #' — function
         ((= code 39)  ; '
          (let ((obj (%read-internal stream t nil t)))

@@ -26078,15 +26078,31 @@
     ;; through the same deduplicated index, so it seeds exactly the objects
     ;; the code loads.  Generated LAST, from the complete index.
     (when *static-keywords-p*
-      (let ((kws nil))
+      ;; STATIC-KWS, not KWS: with the short name, SBCL compiled this closure's
+      ;; reference as a GLOBAL read (%GV-REF) while the in-image compiler kept it
+      ;; a frame slot -- the one divergence left in the UEFI DDC after the
+      ;; static-literal flags were mirrored (14,336 bytes, 2026-10-06).  The
+      ;; distinct name sidesteps whatever the host knows about KWS.
+      (let ((static-kws nil))
         (when *static-keyword-index*
-          (maphash (lambda (h idx) (declare (ignore h))
-                     (push (nth (- (length *constant-table*) 1 idx) *constant-table*) kws))
+          ;; #'(LAMBDA ...), NOT A BARE (LAMBDA ...): the MAPHASH expander
+          ;; open-codes only the FUNCTION form.  In the image LAMBDA is a macro
+          ;; that produces that form, so the in-image compiler inlined this loop
+          ;; and read STATIC-KWS from its frame; the host saw the bare list,
+          ;; compiled a real closure, and read the captured, mutated local as a
+          ;; GLOBAL (%GV-REF) -- the last UEFI DDC divergence (2026-10-06).
+          (maphash #'(lambda (h idx) (declare (ignore h))
+                       (push (cons idx (nth (- (length *constant-table*) 1 idx) *constant-table*)) static-kws))
                    *static-keyword-index*))
-        (format t "  static keywords: ~D~%" (length kws))
+        ;; IN CONSTANT-TABLE ORDER, never hash-table order: SBCL's EQUAL table and
+        ;; the in-image one iterate differently, and the seed function's literal
+        ;; order reached the emitted constant pool -- the UEFI DDC's last 659,487
+        ;; differences were every constant reference shifted by that (2026-10-06).
+        (setq static-kws (mapcar #'cdr (sort static-kws #'< :key #'car)))
+        (format t "  static keywords: ~D~%" (length static-kws))
         (let* ((result (mvm-compile-toplevel
                          `(defun %seed-static-keywords ()
-                            ,@(mapcar (lambda (k) `(%seed-static-keyword ,k)) kws)
+                            ,@(mapcar (lambda (k) `(%seed-static-keyword ,k)) static-kws)
                             nil)))
                (info (car result))
                (ir (cdr result)))
@@ -26228,7 +26244,7 @@
                  (boundp '*unresolved-calls*)
                  (> (hash-table-count *unresolved-calls*) 0))
         (let ((total 0) (names nil))
-          (maphash (lambda (k v) (incf total v) (push (cons v k) names))
+          (maphash #'(lambda (k v) (incf total v) (push (cons v k) names))
                    *unresolved-calls*)
           (setf names (sort names #'> :key #'car))
           ;; #215: say WHERE they resolved to, so a broken stub lookup is
@@ -26304,7 +26320,7 @@
                       (/ (* size 100.0) total-bytes)))
              ;; Top 4 IR ops by count for this function
              (op-list nil))
-        (maphash (lambda (k v) (push (cons v k) op-list)) counts)
+        (maphash #'(lambda (k v) (push (cons v k) op-list)) counts)
         (setf op-list (sort op-list #'> :key #'car))
         (format t "  ~6D  ~5,1F%   ~A   {"
                 size pct (function-info-name info))

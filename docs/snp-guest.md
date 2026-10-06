@@ -322,14 +322,14 @@ OVMF and as a multiboot kernel; the AmdSev firmware's loader is the same
 the `sevsecret` module (AMD's patched GRUB only; disk boot with secret
 injection, a path this image never takes).
 
-**OPEN: the SNP-mode DDC diverges again.**  `kiln image x64-uefi --snp=1 --ddc`
-FAILS: SBCL 42,398,720 bytes vs modus-sh 42,337,280, differing from byte 94 on
-(34 M bytes).  One cause was found and fixed -- modus-sh's `--compile-uefi`
-forced the cons-kind reject OFF while SBCL now emits it -- but the divergence
-remains, so it is something else that landed since 94062cf6 (the collector fix,
-the boot-x64 metadata zeroing, the fixed-address relocation, the merges).  The
-rental can proceed on the measurement of the image we ship; the DDC property
-has to be restored before that measurement means "reproducible by anyone".
+**DDC RESTORED (2026-10-06): SNP-mode image md5 `8ec40648075a0d269da2ec85479bfe1e`, SBCL and modus-sh identical.**
+Four causes, each a configuration or input the self-host saw differently from
+SBCL rather than a compiler bug: the static-literal flags set host-side only;
+the cons-kind reject forced off in `--compile-uefi`; three `maphash` sites
+written with a bare lambda that only the image's LAMBDA macro turned into the
+open-coded form; and the source slurp re-decoding UTF-8 that the image's
+character streams now decode themselves.  Rule and triage recipe: CLAUDE.md,
+"DDC RULE".
 
 ## Next
 

@@ -3468,6 +3468,22 @@ on x64 is this bug.  **SAVE-AND-DIE works on bare x64** (core at 0x20000000, `-m
 attestable image + core (modus-lisp/kiln).  Lesson re-learned: a hosted
 "pass" says nothing about a collector path the hosted heap never takes.
 
+### DDC RULE: a host-set compiler flag is OFF in the self-host unless its compile config sets it (2026-10-06)
+
+The UEFI DDC failed at every commit since the 2026-10-01 merges (SBCL image
+61,440 bytes longer than modus-sh's; first body diff at a symbol literal: SBCL
+`%STATIC-SYMBOL-REF` slot load, modus-sh `LI hash / CALL %INTERN-SYMBOL-PKG`).
+`*static-symbols-p*` / `*static-keywords-p*` are set by a host-side `setf` in
+build-cli-common that every SBCL build runs and no in-image compile sees
+(defvar defaults never run — limitation 7).  Third instance of the pattern after
+`*mcgc-kind-bitmap-enabled*` and `*ws5-force-no-kindcheck*`.  **Every
+emission-affecting flag the host sets must ALSO be set in build-modus-selfhost's
+`--compile` and `--compile-uefi` configuration blocks**; when adding one, add it
+there, and run `kiln image x64-uefi --ddc` before merging.  Triage recipe that
+found it in 20 minutes: run the DDC at three commits concurrently in worktrees;
+`cmp` the pair; the first diff past the preamble JMP is a call displacement, so
+scan for the first difference WIDER than 8 bytes and disassemble both sides there.
+
 ### AWS NITRO ENCLAVES — the hosted route (2026-10-06, docs/nitro-enclaves.md)
 
 `kiln image nitro --with=…` builds `modus.eif` from AWS's boot blobs + the hosted

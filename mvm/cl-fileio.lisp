@@ -1235,18 +1235,25 @@
                           (%fs-set-blen stream 0)
                           t)
                          (t nil)))))))
-          ;; String-input: track position cell
+          ;; String-input: track position cell.  The cell is (POS . UNREAD):
+          ;; UNREAD-CHAR parks the character in the cdr and leaves POS where READ-CHAR
+          ;; put it, one past that character.  So while one is parked the position is
+          ;; POS - 1 -- PEEK-CHAR is a READ-CHAR plus an UNREAD-CHAR, and a peek must not
+          ;; move the position -- and setting the position drops it, or the next
+          ;; READ-CHAR after a rewind would hand back the parked character first.
           ((= ty 1)
            (let ((data (%stream-data stream)))
              (let ((pos-cell (cdr data)))
                (if (null args)
-                   (car pos-cell)
+                   (if (cdr pos-cell) (- (car pos-cell) 1) (car pos-cell))
                    (let ((newpos (car args)))
                      (cond
-                       ((eq newpos :start) (set-car pos-cell 0) t)
+                       ((eq newpos :start) (set-cdr pos-cell nil) (set-car pos-cell 0) t)
                        ((eq newpos :end)
+                        (set-cdr pos-cell nil)
                         (set-car pos-cell (length (car data))) t)
                        ((integerp newpos)
+                        (set-cdr pos-cell nil)
                         (set-car pos-cell newpos) t)
                        (t nil)))))))
           ;; String-output: position == count of chars written so far.

@@ -1212,6 +1212,11 @@
                    ;; group, so those images keep the single-buffer socket
                    ;; layer and their blobs are unaffected.
                    (mvm-text "net/hosted-sockets-post.lisp")
+                   ;; AWS Nitro Enclaves: CBOR + the /dev/nsm attestation request
+                   ;; (lib/cbor.lisp, net/nsm-attest.lisp).  Hosted x64 only: the
+                   ;; NSM is a Linux device.  Inert without one (:NO-NSM).
+                   (mvm-text "lib/cbor.lisp")
+                   (mvm-text "net/nsm-attest.lisp")
                    (string #\Newline)
                    ;; THE ACTOR RUNTIME (docs/hosted-actor-runtime.md).  After
                    ;; hosted-sync (its scheduler, %MAKE-NATIVE-THREAD, the

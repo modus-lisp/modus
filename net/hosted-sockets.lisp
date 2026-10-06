@@ -66,6 +66,44 @@
     (setf (mem-ref (+ a 12) :u32) 0)
     a))
 
+;;; ---- AF_VSOCK (40): the only network a Nitro enclave has ---------------
+;;; sockaddr_vm is 16 bytes: svm_family u16, svm_reserved1 u16, svm_port u32,
+;;; svm_cid u32, svm_zero[4].  Ports are host order (no htons), unlike AF_INET.
+;;; CID 3 is the first enclave, 2 (VMADDR_CID_HOST) the parent instance, 1 the
+;;; loopback, -1 (#xFFFFFFFF, VMADDR_CID_ANY) binds every CID.  These are the
+;;; same connect/bind/listen/accept syscalls as the AF_INET path with a
+;;; different family and address shape; read/write/close are shared.
+(defun %vsock-build-addr (cid port)
+  (let ((a (%sock-addr-buf)))
+    (setf (mem-ref a :u16) 40)                         ; svm_family = AF_VSOCK
+    (setf (mem-ref (+ a 2) :u16) 0)                    ; svm_reserved1
+    (setf (mem-ref (+ a 4) :u32) (logand port #xFFFFFFFF))
+    (setf (mem-ref (+ a 8) :u32) (logand cid #xFFFFFFFF))
+    (setf (mem-ref (+ a 12) :u32) 0)
+    a))
+(defun vsock-connect (cid port)
+  "connect(AF_VSOCK, SOCK_STREAM) to CID:PORT -> fd, or -1."
+  (let ((fd (syscall3 41 40 1 0)))
+    (if (< fd 0)
+        -1
+        (progn (%vsock-build-addr cid port)
+               (if (< (syscall3 42 fd (%sock-addr-buf) 16) 0)
+                   (progn (socket-close fd) -1)
+                   fd)))))
+(defun vsock-listen (port backlog)
+  "Listen on PORT for any CID (an enclave's parent connects as CID 3 from its
+   side; the enclave sees the parent as CID 2) -> listening fd, or -1.
+   SOCKET-ACCEPT works on it unchanged."
+  (let ((fd (syscall3 41 40 1 0)))
+    (if (< fd 0)
+        -1
+        (progn (%vsock-build-addr #xFFFFFFFF port)
+               (if (< (syscall3 49 fd (%sock-addr-buf) 16) 0)
+                   (progn (socket-close fd) -1)
+                   (if (< (syscall3 50 fd backlog 0) 0)
+                       (progn (socket-close fd) -1)
+                       fd))))))
+
 ;;; ---- raw socket primitives (fd < 0 = error / -errno) ----
 (defun %sock-open (type)       (syscall3 41 2 type 0))   ; socket(AF_INET, type, 0)
 (defun %sock-connect-fd (fd)   (syscall3 42 fd (%sock-addr-buf) 16))

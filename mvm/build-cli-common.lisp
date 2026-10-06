@@ -1697,7 +1697,20 @@
         (let ((off (%cli-getenv \"MODUS_NO_SB\")))
           (if (and off (> (length off) 0) (not (string= off \"0\")))
               nil
-              (progn (%it-eval-source (%sb-gray-source) \"sb-gray\") t))))))
+              ;; IN A FIXED PACKAGE.  This runs at the first ASDF load,
+              ;; which is usually inside quicklisp's setup.lisp, with
+              ;; *PACKAGE* = QL-SETUP -- so the shim's helpers became
+              ;; QL-SETUP::%GRAY-P etc., which JIT-EAGER skips (the QL-
+              ;; prefix keeps the loader interpreted).  Every WRITE-CHAR /
+              ;; WRITE-STRING / FORMAT asks %GRAY-P, so each one paid an
+              ;; interpreter entry: ~25 us a character to a string stream.
+              ;; SETQ + restore, not a LET of the special (unreliable in
+              ;; image code).
+              (let ((%pkg *package*))
+                (setq *package* (find-package \"COMMON-LISP-USER\"))
+                (unwind-protect (%it-eval-source (%sb-gray-source) \"sb-gray\")
+                  (setq *package* %pkg))
+                t))))))
 
 ;; THE PUBLIC RUNTIME API (net/hosted-actor-runtime.lisp, net/hosted-sync.lisp).
 ;; Runtime-compiled code reaches these by direct calls resolved at compile

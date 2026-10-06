@@ -948,7 +948,10 @@
             (if (and (consp p) (cdr p))
                 (progn (setf (aref pairs idx) p) (cdr p))
                 (let ((f (and nm (%mvm-resolve-runtime-fn nm))))
-                  (if f f (error "jit-bridge: ~A is undefined at call time" nm)))))))))
+                  ;; UNDEFINED-FUNCTION, as the interpreter signals for the
+                  ;; same call: a site whose callee did not exist when its
+                  ;; page was built is bridged too (%JIT-RELOC-CALLS).
+                  (if f f (error (quote undefined-function) :name nm)))))))))
 (defun %jit-bridge-0 (idx) (funcall (%jit-bridge-resolve idx)))
 (defun %jit-bridge-1 (idx a) (funcall (%jit-bridge-resolve idx) a))
 (defun %jit-bridge-2 (idx a b) (funcall (%jit-bridge-resolve idx) a b))
@@ -1038,6 +1041,30 @@
     (setq *jit-bridge-count* (+ idx 1))
     (%jit-thunk-emit-tail addr (%jit-thunk-emit-shift addr nargs) idx nargs)
     addr))
+
+(defun %jit-make-bridge-any-thunk (name)
+  "x86-64 ANY-ARITY bridge thunk for a call to NAME: its address or NIL.  The
+   nargs-specific thunk shifts V0..V3 up to make room for the name index, which
+   cannot reach a 5th+ argument on the stack, so a site with more than 3
+   arguments failed its page -- and FORMAT, a heap closure, is called with 4+
+   all over jzon and flexi-streams.  This one passes the index out of band in
+   the per-thread slot fs:[0x10000178] and jumps to %JIT-BRIDGE-ANY with every
+   argument register, stack argument and the nargs slot untouched:
+     mov dword fs:[0x10000178], idx ; movabs rax, bridge-any ; jmp rax"
+  (if (or (null (%jit-bridge-ensure)) (>= *jit-bridge-count* 4096))
+      nil
+      (let ((addr (%jit-thunk-alloc)))
+        (if (null addr)
+            nil
+            (let ((idx *jit-bridge-count*))
+              (setf (aref *jit-bridge-names* idx) name)
+              (setq *jit-bridge-count* (+ idx 1))
+              (%jit-emit-bytes addr (list #x64 #xC7 #x04 #x25 #x78 #x01 #x00 #x10
+                                          (logand idx 255) (logand (ash idx -8) 255) 0 0))
+              (%jit-emit-bytes (+ addr 12) (list #x48 #xB8))
+              (%jit-write-imm64 addr 14 (%jit-bridge-any-entry))
+              (%jit-emit-bytes (+ addr 22) (list #xFF #xE0))
+              addr)))))
 
 (defun %jit-make-bridge-thunk (name nargs)
   "Build the x64 bridge thunk for a NARGS-arg call to NAME; its address or NIL."
@@ -1315,9 +1342,15 @@
         ;; #306 BRIDGE: a resolved-but-non-native callee gets a thunk instead
         ;; of failing the page (x64 only; nargs from the translator's parallel
         ;; alist, NIL on aarch64 → falls through to the old reject).
-        (when (and (= raw 0) fn (%jit-bridge-on-p) (not (eq *jit-target-arch* :aarch64)))
+        ;; Also for a callee that does not exist YET (unresolved): the
+        ;; bridge resolves at call time, and a DEFGENERIC whose methods call
+        ;; the GF it is defining (jzon's WRITE-VALUE) is the common case.
+        ;; More than 3 arguments (or an unknown count): the any-arity thunk.
+        (when (and (= raw 0) name (%jit-bridge-on-p) (not (eq *jit-target-arch* :aarch64)))
           (let* ((na (assoc (car r) *x64-call-reloc-nargs*))
-                 (th (and na (%jit-make-bridge-thunk name (cdr na)))))
+                 (th (if (and na (cdr na) (<= (cdr na) 3))
+                         (%jit-make-bridge-thunk name (cdr na))
+                         (%jit-make-bridge-any-thunk name))))
             (when th
               (setq raw th)
               (setq *jit-bridged-sites*
@@ -3150,6 +3183,20 @@
                  (>= (mem-ref #x10000EC0 :u32) %depth))
         (%eval-lock-release)))))
 
+(defun %mvm-forms-define-methods-p (forms)
+  "True when FORMS is a DEFMETHOD or DEFGENERIC top-level form.  Such a form
+   runs ONCE, so RETRY-ON-HOT would interpret it -- but the method function it
+   makes is a lambda of this module, and an interpreted module's lambda stays
+   an interpreter trampoline for every later call of the method.  JIT-EAGER
+   never reaches it (it translates DEFUN modules only).  Measured on an
+   operandi ACP server: jzon's WRITE-VALUE methods, interpreted, were most of
+   every turn.  So these forms are translated on their first eval."
+  (let ((f (if (and (consp forms) (null (cdr forms))) (car forms) forms)))
+    (and (consp f)
+         (symbolp (car f))
+         (let ((n (symbol-name (car f))))
+           (or (string= n "DEFMETHOD") (string= n "DEFGENERIC"))))))
+
 (defun %mvm-eval-forms-2 (forms)
   ;; In-image: emit integer literals as fixnum-safe :li-halves (set the GLOBAL,
   ;; not a let-binding — compiled LET of a special may not establish a dynamic
@@ -3526,7 +3573,9 @@
                             ;; forms (never re-eval'd; DEFUNs aren't even cacheable)
                             ;; thus never pay JIT translation — fast loading — while
                             ;; repeated forms go native on the second run.
-                            (if (and (%jit-active-p) (not (%jit-hot-only-p)))
+                            (if (and (%jit-active-p)
+                                     (or (not (%jit-hot-only-p))
+                                         (%mvm-forms-define-methods-p forms)))
                                 (handler-case
                                     (%mvm-eval-jit-run bc entry (reverse ft-list)
                                                     fn-table rt-table lam-offsets nil

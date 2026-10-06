@@ -1539,7 +1539,11 @@
         (setq *x64-nx-data-enable* t)
         (setq *x64-linux-mode* nil)
         (setq *x64-gc-enabled* t)
-        (setq *ws5-force-no-kindcheck* t)
+        ;; The cons-kind reject is ON for bare x64 (build-cl-repl-common,
+        ;; 2026-10-01: off, 3 of 4 library loads died); this must say the same
+        ;; or the DDC diverges -- it did, by 61,440 bytes, when SBCL emitted the
+        ;; reject and this still forced it off.
+        (setq *ws5-force-no-kindcheck* nil)
         (setq *x64-native-code-offset* (+ 5 (uefi-cl-preamble-length)))
         (write-string-serial \"modus --compile-uefi: snp-mode \")
         (write-object *x64-snp-mode*)

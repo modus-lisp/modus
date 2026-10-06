@@ -290,6 +290,47 @@ initrd) is the next step.  docs/save-and-die.md has the x64 rig.
   arms each carry the symptom in the serial log now: the x64 kernel epilogue
   prints `REPL-DIED: <condition>` instead of halting silently.
 
+## The rental kit (2026-10-06): everything for the SNP host hour, built and measured off the box
+
+`scripts/snp-kit.sh IMAGEDIR OVMF.fd OUT.tar.gz` bundles the SNP-mode image
+(`kiln image x64-uefi --snp=1 …`), the **AmdSev OVMF** (built here from
+edk2-stable202505 with nasm, iasl, bison, flex, libuuid and dosfstools all in the
+user prefix -- no root), the expected launch measurement per plausible vCPU
+model (`sev-snp-measure --mode snp --vmm-type QEMU --ovmf … --kernel …`), the
+attested client, the verifier, and `scripts/snp-host-bringup.sh`, which on the
+box does `preflight` (sev_snp flag, kvm_amd sev_snp, /dev/sev, /dev/kvm; cancel
+the rental on FAIL), `install` (QEMU >= 9.1 from the distro or v9.2.0 source),
+`launch` (`-kernel generic.efi` under the AmdSev OVMF with `kernel-hashes=on`,
+E1000 user net, `(ssh-boot)`), and `attest` (the attested client, then
+`test/snp/kds-fetch.py` pulls the VCEK for the report's chip_id and reported
+TCB from AMD KDS plus the ASK/ARK chain, then `verify-report.py --vcek --chain
+--measurement --hostkey-hex`).  The chain step was proven against AMD's live
+Milan chain (`test/snp/amd-milan-chain.pem`): ARK self-signed RSA-PSS, ASK by
+ARK.
+
+**Measured here:** the AmdSev OVMF built (sha256 `4d9746612e58e8fd…`), the
+expected launch measurements for EPYC-v4 / Milan / Milan-v2 / Genoa / Turin /
+Rome are in the kit's `expected-measurement.json` (Milan and Milan-v2 agree),
+and `tmp/snp-kit.tar.gz` is 7.5 MB.  **`-kernel` under the AmdSev OVMF on a
+machine WITHOUT SEV falls through to the firmware's embedded GRUB** ("starting
+Boot0002 Grub Bootloader", nothing from our stub): that firmware's blob
+verifier refuses a kernel that arrives without launch hashes, which is exactly
+its job, so the first real `-kernel` load of our EFI happens on the SNP box.
+What is verified off-box is the image booting from the FAT path under plain
+OVMF and as a multiboot kernel; the AmdSev firmware's loader is the same
+`LoadImage` once the hash check passes.  The embedded GRUB was built without
+the `sevsecret` module (AMD's patched GRUB only; disk boot with secret
+injection, a path this image never takes).
+
+**OPEN: the SNP-mode DDC diverges again.**  `kiln image x64-uefi --snp=1 --ddc`
+FAILS: SBCL 42,398,720 bytes vs modus-sh 42,337,280, differing from byte 94 on
+(34 M bytes).  One cause was found and fixed -- modus-sh's `--compile-uefi`
+forced the cons-kind reject OFF while SBCL now emits it -- but the divergence
+remains, so it is something else that landed since 94062cf6 (the collector fix,
+the boot-x64 metadata zeroing, the fixed-address relocation, the merges).  The
+rental can proceed on the measurement of the image we ship; the DDC property
+has to be restored before that measurement means "reproducible by anyone".
+
 ## Next
 
 1. A host: kernel ≥ 6.11 with SNP, QEMU ≥ 9.1, `OVMF.amdsev.fd`; then

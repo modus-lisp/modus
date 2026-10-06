@@ -1642,6 +1642,57 @@
         (values (cdr found-pair) t)
         (values default nil))))
 
+(defun %gethash-pair (key ht)
+  "The (KEY . VALUE) cons that holds KEY in HT, or NIL.  PUTHASH on a present
+   key updates that cons IN PLACE and the bucket index shares it, so a holder
+   of the cons sees every later PUTHASH of KEY (not a REMHASH).  The search is
+   GETHASH's, copied rather than shared so GETHASH keeps its zero-call hot
+   path -- keep the two in step."
+  (let ((found-pair nil)
+        (use-linear t)
+        (holder (let ((c (cdr ht)))          ; %ht-bucket-holder, inlined
+                  (if (and (consp c) (eq (car c) (%ht-tag)))
+                      (car (cdr (cdr (cdr (cdr (cdr c))))))
+                      nil))))
+    (when holder
+      (let ((vec (car holder)))
+        (when (null vec)
+          ;; still small: build the index once the table crosses the threshold
+          (when (>= (car (cdr holder)) 32)
+            (setq vec (%ht-rebuild-index ht holder (cdr (cdr holder))))))
+        (when (and vec (not (eq vec -424242001)))
+          (if (fixnump key)
+              ;; FIXNUM FAST PATH, fully inline (same mix as %ht-hash): this is
+              ;; every SYMBOL-VALUE / SET-SYMBOL-VALUE of a special, every
+              ;; keyword literal and every name-hash keyed compiler table.
+              (let* ((k (if (< key 0) (- key) key))
+                     (h (logand (logxor k (logxor (ash k -8) (ash k -16)))
+                                (- (%prim-array-length vec) 1)))
+                     (cur (%word-aref vec h)))
+                (setq use-linear nil)
+                (loop
+                  (when (null cur) (return nil))
+                  (let ((e (car cur)))
+                    (when (eq (car e) key) (setq found-pair (cdr e)) (return nil)))
+                  (setq cur (cdr cur))))
+              ;; O(1) bucket path.  :NOHASH key (e.g. a string in an EQ/EQL
+              ;; table) falls through to the linear path.
+              (let ((r (%ht-bucket-find vec key (cdr (cdr holder)))))
+                (unless (eq r -424242001)
+                  (setq use-linear nil)
+                  (setq found-pair r)))))))
+    (when use-linear
+      ;; Linear alist path (legacy / small / nohash table / :nohash key).
+      (let ((cmp (%ht-keytest ht)) (cur (car ht)))
+        (loop
+          (when (null cur) (return nil))
+          (let ((pair (car cur)))
+            (when (funcall cmp (car pair) key)
+              (setq found-pair pair)
+              (return nil)))
+          (setq cur (cdr cur)))))
+    found-pair))
+
 (defun puthash (key ht value)
   "Set KEY to VALUE in hash table HT. Returns VALUE.
    Maintains both the authoritative CAR alist and (for large explicit-:TEST

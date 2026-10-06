@@ -3164,13 +3164,22 @@
     found))
 
 (defun %fixnum-shl-or-nil (n k)
-  "Fixnum N shifted left K bits, or NIL if that leaves the fixnum range."
+  "Fixnum N shifted left K bits, or NIL if that leaves the fixnum range.
+   Eight bits per step while |N| leaves room for them (constant-count ASH is
+   an inline SHL), one bit at a time near the edge: bit-at-a-time made the
+   interpreter's (ash 1 60)-style bounds ~60 iterations each."
   (loop
-    (when (= k 0) (return n))
-    (when (or (> n +fixnum-half-max+) (< n +fixnum-neg-half+))
-      (return nil))
-    (setq n (ash n 1))
-    (setq k (- k 1))))
+    (when (or (= k 0) (= n 0)) (return n))
+    (if (and (>= k 8)
+             (<= n (ash +fixnum-half-max+ -7))
+             (>= n (ash +fixnum-neg-half+ -7)))
+        (progn (setq n (ash n 8))
+               (setq k (- k 8)))
+        (progn
+          (when (or (> n +fixnum-half-max+) (< n +fixnum-neg-half+))
+            (return nil))
+          (setq n (ash n 1))
+          (setq k (- k 1))))))
 
 (defun bignum-ash (n count)
   "Arithmetic shift N by COUNT bits.  Left shifts (COUNT > 0) promote
@@ -3211,11 +3220,15 @@
          ((not (bignump n))
           ;; Fixnum: native arithmetic right shift via literal -1 SAR loop
           ;; (compile-ash constant fast path, no recursion).
+          ;; Eight bits per step, and done as soon as only the sign is left.
           (let ((result n))
             (when (> k 63) (setq k 63))
-            (loop (when (= k 0) (return result))
-              (setq result (ash result -1))
-              (setq k (- k 1)))))
+            (loop (when (or (= k 0) (= result 0) (= result -1)) (return result))
+              (if (>= k 8)
+                  (progn (setq result (ash result -8))
+                         (setq k (- k 8)))
+                  (progn (setq result (ash result -1))
+                         (setq k (- k 1)))))))
          (t
           ;; Bignum: operate on sign+limbs.
           (let* ((sm (%any-to-limbs n))

@@ -304,7 +304,7 @@
       (loop (when (>= k nlen) (return nil))
             (setf (mem-ref (+ base k) :u8) (aref bc k))
             (setq k (+ k 1))))
-    (let* ((n (hash-table-count rt-table))
+    (let* ((n (%rt-stub-count rt-table))
            (tab (make-array (if (< n 1) 1 n)))
            (ok t) (k 0))
       (loop (when (>= k n) (return nil))

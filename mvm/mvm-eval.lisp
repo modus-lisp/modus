@@ -2947,6 +2947,9 @@
                                               :bytecode-length 0)))
                 (setf (gethash name *functions*) info)
                 (setf (gethash rt-next rt-table) name)
+                ;; The interpreter's per-stub cache cell (%mvm-rt-cell-fn), made HERE
+                ;; on the compiling thread: an actor running this module only RPLACAs it.
+                (setf (gethash (- rt-next) rt-table) (cons nil 0))
                 (setq rt-next (+ rt-next 1)))))))
       ;; Pass 2: emit bytecode.
       (dolist (e all-ir)
@@ -3312,6 +3315,9 @@
                                             :bytecode-length 0)))
               (setf (gethash name *functions*) info)
               (setf (gethash rt-next rt-table) name)
+              ;; The interpreter's per-stub cache cell (%mvm-rt-cell-fn), made HERE
+              ;; on the compiling thread: an actor running this module only RPLACAs it.
+              (setf (gethash (- rt-next) rt-table) (cons nil 0))
               (setq rt-next (+ rt-next 1)))))))
     ;; Pass 2: emit (CALLs resolve to in-module OR synthetic offsets via *functions*).
     (dolist (e all-ir)

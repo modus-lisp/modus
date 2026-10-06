@@ -743,7 +743,7 @@
              (fn-table (cadddr tuple))
              (rt-table (car (cddddr tuple)))
              (lam-offsets (cadr (cddddr tuple)))
-             (rt-n (hash-table-count rt-table)))
+             (rt-n (%rt-stub-count rt-table)))
         ;; *x64-jit-mode* enables the synthetic-offset indirect-call path;
         ;; translate populates *x64-call-relocs* (fresh per call).
         (setq *x64-jit-mode* t)
@@ -1397,7 +1397,7 @@
                    (fn-table (cadddr tuple))
                    (rt-table (car (cddddr tuple)))
                    (lam-offsets (cadr (cddddr tuple)))
-                   (rt-n (hash-table-count rt-table)))
+                   (rt-n (%rt-stub-count rt-table)))
               (write-string-serial \"WS4-S2 \") (write-string-serial label)
               (write-string-serial \" rt=\") (print-dec rt-n) (write-char-serial 10)
               ;; Always confirm the translator produces bytes for this form.

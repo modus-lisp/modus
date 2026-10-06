@@ -865,6 +865,11 @@
 (defun %try-parse-integer (codes base)
   "Try to parse char codes as an integer in BASE. Returns (value . t) or nil."
   (if (null codes) nil
+      ;; A token ending in "." is decimal whatever BASE is (CLHS 2.3.1.1), so it is
+      ;; decided before the digits are checked against BASE -- checked after, "8." in
+      ;; base 8 stopped at the 8, never reached the dot, and fell through to a float.
+      (if (and (/= base 10) (= (car (last codes)) 46))
+          (%try-parse-integer (%codes-drop-last codes) 10)
       (let ((sign 1) (cur codes) (n 0) (got-digit nil))
         ;; Check sign
         (when (= (car cur) 43) (setq cur (cdr cur)))    ; +
@@ -910,7 +915,7 @@
                   (if (and (= code 46) (null (cdr cur)) got-digit)
                       (return-from %try-parse-integer
                         (%try-parse-integer (%codes-drop-last codes) 10))
-                      (return-from %try-parse-integer nil)))))))))
+                      (return-from %try-parse-integer nil))))))))))
 
 (defun %codes-drop-last (codes)
   "Return a fresh list of CODES with its final element removed.

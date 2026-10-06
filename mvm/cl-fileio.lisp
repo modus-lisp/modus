@@ -2444,6 +2444,14 @@
          ;; trailing "" (pattern ended in /): base must be a directory
          ((and (string= comp "") (null rest))
           (if (%path-openable-p base) (list base) nil))
+         ;; "**" matches zero or more directory levels (CL's :WILD-INFERIORS):
+         ;; the rest of the pattern here, and again under every subdirectory.
+         ((string= comp "**")
+          (let ((out (%glob-expand base rest)))
+            (dolist (name (%dir-entries-raw (if (string= base "") "./" base)) out)
+              (let ((sub (concatenate 'string base name "/")))
+                (when (%directory-path-p sub)
+                  (setq out (append out (%glob-expand sub comps))))))))
          ((not (position #\* comp))
           (if (null rest)
               (let ((cand (concatenate 'string base comp)))
@@ -2460,14 +2468,39 @@
                                 (concatenate 'string base name "/") rest)))
                       (dolist (r sub) (push r out)))))))))))))
 
+(defun %directory-path-p (path)
+  "T when PATH names a directory.  GETDENTS64 answers >= 0 on a directory --
+   0 for an empty one -- and a negative errno (ENOTDIR) on anything else, so an
+   empty directory is not mistaken for a file the way an empty listing would be."
+  (let* ((n (length path))
+         (p (if (and (> n 1) (char= (char path (- n 1)) #\/)) (subseq path 0 (- n 1)) path)))
+    (if (%cab-on)
+        (handler-case (progn (%cab :readdir p) t) (t (c) nil))
+        (let ((fd (handler-case (%sys-open-rdonly p) (t (c) -1))))
+          (when (and fd (>= fd 0))
+            (let ((r (handler-case (%sys-getdents64 fd *%dirent-buf-addr* *%dirent-buf-size*)
+                       (t (c) -1))))
+              (handler-case (%sys-close fd) (t (c) nil))
+              (and r (>= r 0))))))))
+
+(defun %glob-result-pathname (s)
+  "One wild DIRECTORY match as a pathname, CLHS-fashion: a subdirectory in
+   directory form (name NIL, the directory appended), as SBCL returns it, so a
+   walker can tell (NULL (PATHNAME-NAME P)) and descend."
+  (let ((n (length s)))
+    (if (and (> n 0) (char/= (char s (- n 1)) #\/) (%directory-path-p s))
+        (pathname (concatenate 'string s "/"))
+        (pathname s))))
+
 (defun directory (x &rest args)
   "Return the entries of directory X.  Linux-only (getdents64).
    Non-wild X: bare entry-name strings (the long-standing in-tree
    contract; shims post-process these).  WILD X — any component
    containing `*` (e.g. quicklisp's \"dists/*/distinfo.txt\") — returns
-   FULL pathname strings of every match, expanding each wild component
-   against the real filesystem.  Directory-only matches are requested by
-   a trailing slash."
+   PATHNAMES of every match, expanding each wild component against the
+   real filesystem -- "**" across any depth of subdirectories -- with a
+   subdirectory in directory form.  Directory-only matches are requested
+   by a trailing slash."
   (declare (ignore args))
   (when (and (%lp-hosts-p) (not (streamp x)) (%lp-designator x))
     (setq x (translate-logical-pathname x)))
@@ -2491,7 +2524,7 @@
         ;; once that became the truename (upstream DIRECTORY.7).  In-tree
         ;; callers take NAMESTRING of them, which a pathname answers too.
         (let ((comps (%split-slash path)))
-          (mapcar (function truename)
+          (mapcar (lambda (s) (truename (%glob-result-pathname s)))
                   (if (and comps (string= (car comps) ""))
                       (%glob-expand "/" (cdr comps))
                       (%glob-expand "" comps)))))))

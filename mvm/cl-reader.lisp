@@ -487,20 +487,15 @@
         (t (return ch))))))
 
 (defun %invalid-constituent-p (ch)
-  "Per CLHS 2.4.4.4: #\\Backspace, #\\Tab (when not whitespace),
-   #\\Linefeed, #\\Page, #\\Return, #\\Rubout have constituent trait
-   :invalid in standard syntax — using them in a token is a reader
-   error.  Modus's whitespace set already includes Tab/Newline/Page/CR,
-   so the only chars left here are Backspace (8) and Rubout (127).
-   Plus all OTHER control chars below 32 that aren't in the whitespace
-   set — they're also :invalid by analogy."
+  "Per CLHS 2.1.4 (Figure 2-7): in standard syntax only #\\Backspace and
+   #\\Rubout have the constituent trait :invalid -- using one in a token is a
+   reader error.  Tab, Linefeed, Page and Return are whitespace here.  Every
+   OTHER control character is an ordinary constituent, as in SBCL: a Lisp
+   Machine's font had a glyph for every code, and TI's sources write them in
+   symbol names (the ^Z of kernel/initial-zlc-symbols.lisp; 163 of them across
+   118 files).  Refusing them \"by analogy\" made those files unreadable."
   (let ((code (char-code ch)))
-    (and (or (= code 8) (= code 127)
-             (and (< code 32)
-                  (not (= code 9))   ; tab
-                  (not (= code 10))  ; newline
-                  (not (= code 12))  ; page
-                  (not (= code 13))))  ; return
+    (and (or (= code 8) (= code 127))
          t)))
 
 (defun %read-as-token (ch stream rt)

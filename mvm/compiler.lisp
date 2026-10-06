@@ -3886,11 +3886,38 @@
       (t (let ((n (symbol-name op)))
            (or (null n) (zerop (length n)) (string-equal n registered)))))))
 
+;;; Macros whose names shadow a CL external, keyed by the symbol.  See
+;;; %DEFINE-COMPILE-TIME-MACRO.
+(defvar *shadowing-macro-table* nil)
+
 (defun %macro-expander (op hash)
   "The expander for OP, or NIL — the confirmed replacement for a bare
-   (gethash hash *macro-table*)."
-  (and (%macro-name-confirmed-p op hash)
-       (gethash hash *macro-table*)))
+   (gethash hash *macro-table*).  A macro whose name shadows a CL external is
+   found by the SYMBOL first (see %DEFINE-COMPILE-TIME-MACRO): its bare-name
+   entry, if any, is CL's, and using it compiled P::WHEN as CL:WHEN."
+  (or (and *shadowing-macro-table* (symbolp op)
+           (gethash op *shadowing-macro-table*))
+      (and (%macro-name-confirmed-p op hash)
+           (gethash hash *macro-table*))))
+
+;;; A DEFMACRO's compile-time registration.  A name that SHADOWS a CL external -- P::IF,
+;;; P::MULTIPLE-VALUE-BIND -- must not take the bare-name entry in *MACRO-TABLE*: that is the
+;;; entry every CL:IF lands on, so P::IF's expander became CL:IF's, its own (CL:IF ...)
+;;; expansion expanded through it again, and the stack overflowed (SIGSEGV, or a hang).
+;;; SET-MACRO-FUNCTION files such a name per package only, under the same test,
+;;; %SHADOWS-CL-NAME-P.  The compiler then finds it by the symbol, in *SHADOWING-MACRO-TABLE*,
+;;; ahead of the bare entry -- otherwise (P::WHEN ...) compiled as CL's WHEN and the user's
+;;; macro never ran.  FBOUNDP because the compiler also runs in the build host, where the
+;;; runtime's function does not exist and no source shadows CL.
+(defun %define-compile-time-macro (name expander)
+  (if (and (fboundp '%shadows-cl-name-p) (funcall '%shadows-cl-name-p name))
+      (progn
+        (unless *shadowing-macro-table*
+          (setq *shadowing-macro-table* (make-hash-table :test 'eq)))
+        (setf (gethash name *shadowing-macro-table*) expander)
+        (%mexp-memo-invalidate)
+        (set-macro-function name expander))
+      (mvm-define-macro (normalize-name name) expander)))
 
 (defun mvm-define-macro (name expander)
   "Register a macro with NAME (string or hash) and EXPANDER function.
@@ -8357,7 +8384,7 @@
                                             ,@(when env-var (list env-var))))
                         (destructuring-bind (,@d-params) (cdr form)
                           ,@body))))))
-             (mvm-define-macro (normalize-name name) expander)
+             (%define-compile-time-macro name expander)
              ;; (1b) …and, under runtime EVAL, make that registration
              ;; TRUTHFUL to the running program.  *MACRO-TABLE* is rebound
              ;; per mvm-eval call, but FBOUNDP / MACRO-FUNCTION consult it
@@ -29315,7 +29342,7 @@
                         `(lambda (form)
                            (destructuring-bind (,@params) (cdr form)
                              ,@body)))))
-         (mvm-define-macro (normalize-name name) expander))
+         (%define-compile-time-macro name expander))
        nil))
 
     ;; (defstruct name slot1 slot2 ...)

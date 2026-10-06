@@ -909,6 +909,11 @@
 ;;; binding — redefinition-safe, GC-safe: the thunk holds no heap pointer) and
 ;;; FUNCALLs.  Sites with >3 args still fail the page (rare; register window).
 (defvar *jit-bridge-names* nil "Vector of callee NAME strings, indexed by thunk.")
+(defvar *jit-bridge-pairs* nil
+  "Parallel to *JIT-BRIDGE-NAMES*: each callee's *SYMBOL-FUNCTION-TABLE* entry
+   CONS once a call has resolved it (see %JIT-BRIDGE-RESOLVE).  Made on the
+   main thread with the names vector, so a worker only stores an existing
+   region-0 cons into it.")
 (defvar *jit-bridge-count* nil "Fill index into *jit-bridge-names*.  NIL = 0.")
 (defvar *jit-thunk-page* nil "Current thunk pool page base (exec).")
 (defvar *jit-thunk-bump* nil "Byte offset of the next free thunk in the page.")
@@ -926,10 +931,24 @@
 (defun %jit-bridge-cap () 4096)
 
 (defun %jit-bridge-resolve (idx)
-  (let ((nm (if (and *jit-bridge-names* (< idx (length *jit-bridge-names*)))
-                (aref *jit-bridge-names* idx) nil)))
-    (let ((f (and nm (%mvm-resolve-runtime-fn nm))))
-      (if f f (error "jit-bridge: ~A is undefined at call time" nm)))))
+  "The callee of bridge thunk IDX, resolved at CALL time (late binding).  The
+   symbol-function-table entry CONS is cached per thunk: PUTHASH updates it in
+   place, so a redefinition is still seen, and a call no longer pays an EQUAL
+   hash of the callee's name (~10% of an operandi ACP turn).  Only a direct key
+   hit is cached; the bare-name fallback resolves every time."
+  (let* ((pairs *jit-bridge-pairs*)
+         (pair (and pairs (< idx (length pairs)) (aref pairs idx))))
+    (if (and (consp pair) (cdr pair))
+        (cdr pair)
+        (let ((nm (if (and *jit-bridge-names* (< idx (length *jit-bridge-names*)))
+                      (aref *jit-bridge-names* idx) nil)))
+          (let ((p (and nm pairs (< idx (length pairs))
+                        (boundp '*symbol-function-table*) *symbol-function-table*
+                        (%gethash-pair nm *symbol-function-table*))))
+            (if (and (consp p) (cdr p))
+                (progn (setf (aref pairs idx) p) (cdr p))
+                (let ((f (and nm (%mvm-resolve-runtime-fn nm))))
+                  (if f f (error "jit-bridge: ~A is undefined at call time" nm)))))))))
 (defun %jit-bridge-0 (idx) (funcall (%jit-bridge-resolve idx)))
 (defun %jit-bridge-1 (idx a) (funcall (%jit-bridge-resolve idx) a))
 (defun %jit-bridge-2 (idx a b) (funcall (%jit-bridge-resolve idx) a b))
@@ -965,6 +984,8 @@
   (when (null *jit-bridge-names*)
     (setq *jit-bridge-names* (make-array 4096))
     (setq *jit-bridge-count* 0))
+  (when (null *jit-bridge-pairs*)
+    (setq *jit-bridge-pairs* (make-array 4096 :initial-element nil)))
   (when (null *jit-thunk-page*)
     (%jit-thunk-new-page))
   (if *jit-thunk-page* t nil))
@@ -1668,10 +1689,11 @@
           (maphash (lambda (nm m)
                      (when (and (not (%jit-skip-name-p nm skips))
                                 (not (%jit-fn-native-p nm)))
-                       (when (not (member m pending :test (function eq)))
-                         (setq pending (cons m pending)))))
+                       (when (not (assoc m pending :test (function eq)))
+                         (setq pending (cons (cons m nm) pending)))))
                    *jit-module-registry*))
-        (dolist (m pending)
+        (dolist (pm pending)
+          (let ((m (car pm)) (nm (cdr pm)))
           (when (not (member (car m) done :test (function eq)))
             (setq done (cons (car m) done))
             ;; A MODULE THAT FAILED ONCE IS NOT RETRIED.  Nothing about it has
@@ -1692,14 +1714,27 @@
                         (setq installed
                               (+ installed
                                  (%jit-install-native-fns (car je) (cadr (cddddr je))
-                                                          (car (cddr (cddddr m)))))))
+                                                          (car (cddr (cddddr m))))))
+                        ;; INSTALLED BUT STILL NOT NATIVE UNDER ITS REGISTRY
+                        ;; NAME: the translator published the module's
+                        ;; functions under another spelling (iterate's
+                        ;; generated CLAUSE-FOR-ON-4 & co. have no
+                        ;; symbol-function-table entry under their registry
+                        ;; key).  Without this every JIT-EAGER -- one per
+                        ;; actor-thread spawn -- translated and installed the
+                        ;; same 17 modules again: ~0.55 s each time, most of an
+                        ;; operandi ACP server's startup.
+                        (when (and (not (%jit-fn-native-p nm))
+                                   (%mvm-on-main-thread-p))
+                          (setq *jit-eager-failed*
+                                (cons (car m) *jit-eager-failed*))))
                       (progn
                         (setq failed (+ failed 1))
                         ;; OFF-MAIN, DO NOT RECORD: the cons would be a worker
                         ;; object in a region-0 list (%MVM-ON-MAIN-THREAD-P).
                         (when (%mvm-on-main-thread-p)
                           (setq *jit-eager-failed*
-                                (cons (car m) *jit-eager-failed*)))))))))
+                                (cons (car m) *jit-eager-failed*))))))))))
         (when (> installed 0) (%jit-retry-drain))
         (list installed modules failed))))
 

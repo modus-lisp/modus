@@ -6414,9 +6414,7 @@
              ;; %bignum-to-float (cl-types): cvtsi2sd on a bignum POINTER
              ;; yields garbage magnitude — broke (float 2^70 1d0) round-trip.
              ((integerp n) (%bignum-to-float n))
-             ((ratiop n)
-              (%float-div (%bignum-to-float (aref n 0))
-                          (%bignum-to-float (aref n 1))))
+             ((ratiop n) (%ratio-to-double n))
              (t n))))
     (cond
       ((not (%ieee-float-p f)) f)

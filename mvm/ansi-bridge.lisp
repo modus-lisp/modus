@@ -1474,9 +1474,13 @@
         (k integer))
     (loop while (> k 60) do
       (setq r (* r (float (expt 2 60) one)) k (- k 60)))
+    ;; Negative steps DIVIDE by the integer power: FLOAT of a ratio goes
+    ;; through %RATIO-TO-DOUBLE, which calls SCALE-FLOAT.
     (loop while (< k -60) do
-      (setq r (* r (float (/ 1 (expt 2 60)) one)) k (+ k 60)))
-    (* r (float (expt 2 k) one))))
+      (setq r (/ r (float (expt 2 60) one)) k (+ k 60)))
+    (if (>= k 0)
+        (* r (float (expt 2 k) one))
+        (/ r (float (expt 2 (- k)) one)))))
 
 (defun decode-float (float)
   "Decode float into (significand exponent sign).

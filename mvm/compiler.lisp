@@ -12775,7 +12775,14 @@
                           (t nil)))
              (forms (cddr def))
              (head '()))
-        (if (null bname)
+        ;; ONLY WHEN THE BODY NAMES IT.  Wrapping every local function moved the
+        ;; gate runner's (return-from OUTER v) out of a local function off the
+        ;; outer block's catch frame and onto a function return (upstream
+        ;; MISC.14/36/176: (block b6 (flet ((f () (return-from b6 c))) ...))
+        ;; came back with F's value instead of leaving B6).  A body with no
+        ;; RETURN-FROM to its own name cannot observe the block, so it is left
+        ;; exactly as it compiled before.
+        (if (or (null bname) (not (%tree-has-return-from forms bname)))
             def
             (progn
               ;; leading declarations, and a docstring that is not the only form, stay outside

@@ -151,7 +151,7 @@
 ;; misaligned call returns immediately, leaving the caller's RAX
 ;; intact (silently looks like the fn returned T or whatever else
 ;; was in RAX).  See reference_append_funcall_bug.md.
-(setf modus.mvm.x64::*x64-native-code-offset* 397)
+(setf modus.mvm.x64::*x64-native-code-offset* (modus.mvm::linux-x64-native-code-offset))  ; computed from the stub, see boot-linux-x64.lisp
 
 ;; NATIVE THREADS, STEP 1: the hosted actor scheduler gets a REAL spinlock.
 ;; net/actors.lisp hands the lock's RELEASE to RESTORE-CONTEXT; with this set,

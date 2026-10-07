@@ -994,7 +994,7 @@
     (aset v 18 (quote r14)) (aset v 19 (quote r15))
     (aset v 20 (quote rsp)) (aset v 21 (quote rbp))
     (setq *vreg-to-x64* v))
-  (setq *x64-native-code-offset* 397)
+  (setq *x64-native-code-offset* (linux-x64-native-code-offset))
   (setq *x64-linux-mode* t)
   (setq *x64-gc-enabled* t)
   (setq *mcgc-kind-bitmap-enabled* t)

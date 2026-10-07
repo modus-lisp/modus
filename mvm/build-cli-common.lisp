@@ -1218,6 +1218,11 @@
                    (mvm-text "lib/cbor.lisp")
                    (mvm-text "net/nsm-attest.lisp")
                    (string #\Newline)
+                   ;; SAVE-AND-DIE on hosted x64: the arena bump word's address
+                   ;; (lib/save-image-x64.lisp; the stub and the trap arm agree).
+                   (format nil "(defun %core-kindbitmap-delta () ~D)~%" modus.mvm.x64::*mcgc-kindbitmap-delta*)
+                   (mvm-text "lib/save-image-x64.lisp")
+                   (string #\Newline)
                    ;; THE SSH-2 SERVER OVER A LINUX STREAM (docs/nitro-enclaves.md,
                    ;; "SSH").  net/ssh.lisp + the crypto it needs, exactly the
                    ;; files the bare x64 CL image bakes, then net/hosted-ssh.lisp

@@ -270,6 +270,20 @@
   (let ((l (vsock-listen port 4)))
     (if (< l 0) -1 (progn (format t "SSH: listening vsock:~D~%" port) (finish-output) (ssh-serve-fd l)))))
 
+;;; ---- after a SAVE-AND-DIE restore (lib/save-image.lisp): the per-process
+;;; mappings this file and net/nsm-attest.lisp cache in globals belong to the
+;;; process that saved; forget them so the next use maps afresh.  A saving run
+;;; should not have served SSH anyway (its host key would be baked into the
+;;; core, i.e. the same key in every enclave started from it); the guard makes
+;;; the state honest even if it did.  Signal handlers are per process too.
+(defun %core-post-restore ()
+  (%init-signal-handling)
+  (setq *hssh-base* 0)
+  (setq *nsm-page* 0)
+  (when (> (mem-ref (+ (%hssh-base) #x10000 #x624) :u32) 0)   ; a host key WAS baked: drop it
+    (setf (mem-ref (+ (%hssh-base) #x10000 #x624) :u32) 0))
+  0)
+
 ;;; ---- the Nitro binding: attest THIS host key over the session ----
 (defun nitro-ssh-host-pubkey ()
   "The 32-byte Ed25519 host public key as a u8 vector, or NIL before SSH-BOOT-HOSTED."

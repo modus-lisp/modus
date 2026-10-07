@@ -881,7 +881,7 @@
 ;; misaligned call returns immediately, leaving the caller's RAX
 ;; intact (silently looks like the fn returned T or whatever else
 ;; was in RAX).  See reference_append_funcall_bug.md.
-(setf modus.mvm.x64::*x64-native-code-offset* 397)
+(setf modus.mvm.x64::*x64-native-code-offset* (modus.mvm::linux-x64-native-code-offset))  ; computed from the stub, see boot-linux-x64.lisp
 
 ;; Enable the GC trampoline: without this, every :alloc-obj advances R12
 ;; unchecked and the heap walks past the mapped region in long-running

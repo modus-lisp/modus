@@ -1816,7 +1816,8 @@
 ;; code-bounds init (34) + JMP rel32 (5) = 351 = 0x15F
 ;; Functions at code-buffer positions P where (0x15F+P) & 0xF in {1,9} would be
 ;; misidentified as cons/object pointers by compile-funcall.
-(setf modus.mvm.x64::*x64-native-code-offset* 351)
+(setf modus.mvm.x64::*x64-native-code-offset*
+      (modus.mvm::linux-x64-native-code-offset-for #'modus.mvm::mvm-linux-x64-test-entry))  ; computed from THIS runner's stub (was pinned 351)
 
 ;; WS5 #223: when this gate runner is built JIT-ON, its collector must scan the
 ;; JIT constant-vector BSS root, or every const the JIT installs into the vector

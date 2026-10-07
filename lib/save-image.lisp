@@ -56,6 +56,27 @@
 
 (defun %core-magic () 20260905)
 
+;;; THE METADATA SCALE.  The GC control block and the bitmap config words are
+;;; stored SHL'd on aarch64/i386 and RAW on x64 (gc.lisp, %GC-META-SCALE), and
+;;; a (mem-ref … :u64) load halves what it reads -- so gc.lisp's plain readers
+;;; (%GC-FROM-START and friends) hand back the right address on aarch64 and
+;;; HALF of it on x64.  This file read them plainly and so, on x64, took
+;;; from_start = 0x1000000200 against a real 0x2000000400: live bytes came out
+;;; at 68 GB and the core was 4 KB.  Every address this file needs goes through
+;;; the scale now; the header round-trips regardless (same setf/mem-ref pair).
+(defun %core-k () (%gc-meta-scale))
+(defun %core-heap-alloc-start ()
+  "Bytes from the heap mapping's base to from_start: the boot stub's
+   +linux-*-heap-alloc-start+.  512 on aarch64; x64 moved to 0x400 for the
+   bitmap alignment (B-LITE) and overrides this in lib/save-image-x64.lisp."
+  512)
+(defun %core-from-start () (%gc-meta-read (+ (%gc-region) #x00) (%core-k)))
+(defun %core-to-start ()   (%gc-meta-read (+ (%gc-region) #x08) (%core-k)))
+(defun %core-space-size () (%gc-meta-read (+ (%gc-region) #x10) (%core-k)))
+(defun %core-bitmap-page-base () (%gc-meta-read (%conv-addr #x10000E00) (%core-k)))
+(defun %core-bitmap-base ()      (%gc-meta-read (%conv-addr #x10000E18) (%core-k)))
+(defun %core-cons-bitmap-base () (%gc-meta-read (%conv-addr #x10000E40) (%core-k)))
+
 (defun %core-jit-arena-lo ()
   "Base of the fixed JIT exec arena (boot-linux-aarch64.lisp
    +linux-aarch64-jit-arena-base+, overridable per build as the hosted
@@ -98,7 +119,7 @@
    -- the NUL ending \"--core\" -- i.e. an empty path, and the restore died
    with \"cannot open the core file\".  The address's parity follows the
    lengths of the other arguments, so it looked flaky and path-dependent."
-  (let* ((slot (+ (- (%gc-from-start) 512) 32))
+  (let* ((slot (+ (- (%core-from-start) (%core-heap-alloc-start)) 32))
          (lo (mem-ref slot :u32))
          (hi (mem-ref (+ slot 4) :u32)))
     ;; HI is 0 on a 32-bit image, where 2^32 would be a bignum -- and nothing
@@ -156,9 +177,9 @@
    for -- so a restored process needs no relocation and no limit change.
    Returns from_start."
   (%gc-force)
-  (when (/= (%gc-from-start) (%gc-bitmap-page-base))
+  (when (/= (%core-from-start) (%core-bitmap-page-base))
     (%gc-force))
-  (%gc-from-start))
+  (%core-from-start))
 
 (defun %save-image (path)
   "Write a heap snapshot of this process to PATH.  Full GC first; then header,
@@ -170,7 +191,7 @@
   (finish-output)
   (let* ((from (%gc-force-to-space-0))
          (free (get-alloc-ptr))
-         (boff (floor (- from (%gc-bitmap-page-base)) 128))
+         (boff (floor (- from (%core-bitmap-page-base)) 128))
          (blen (+ 1 (floor (- free from) 128)))
          (alo (%core-jit-arena-lo))
          (abump (%core-jit-arena-bump))
@@ -180,8 +201,8 @@
       (error "save-image: cannot create ~A" path))
     (setf (mem-ref hdr :u64) (%core-magic))
     (setf (mem-ref (+ hdr 8) :u64) from)
-    (setf (mem-ref (+ hdr 16) :u64) (%gc-to-start))
-    (setf (mem-ref (+ hdr 24) :u64) (%gc-space-size))
+    (setf (mem-ref (+ hdr 16) :u64) (%core-to-start))
+    (setf (mem-ref (+ hdr 24) :u64) (%core-space-size))
     (setf (mem-ref (+ hdr 32) :u64) free)
     (setf (mem-ref (+ hdr 40) :u64) 4096)
     (setf (mem-ref (+ hdr 48) :u64) blen)
@@ -191,8 +212,8 @@
     (%core-write-all fd hdr 128)
     (%core-write-all fd (%conv-addr #x10000000) 4096)
     (%core-write-all fd from (- free from))
-    (%core-write-all fd (+ (%gc-bitmap-base) boff) blen)
-    (%core-write-all fd (+ (%gc-cons-bitmap-base) boff) blen)
+    (%core-write-all fd (+ (%core-bitmap-base) boff) blen)
+    (%core-write-all fd (+ (%core-cons-bitmap-base) boff) blen)
     (when (> abump 0)
       (%core-write-all fd alo (- abump alo)))
     (%core-close fd)
@@ -230,8 +251,8 @@
 (defun %restore-image ()
   "Read the snapshot named by argv[2] into this process.  See the file header
    for what is and is not restored.  Returns the restored allocation pointer."
-  (let* ((from (%gc-from-start))
-         (base (- from 512))                          ; heap-alloc-start
+  (let* ((from (%core-from-start))
+         (base (- from (%core-heap-alloc-start)))     ; the mapping's base
          (fd (%core-open-in))
          (hdr (+ base 256))                           ; below from_start: never live
          (stage (%conv-addr #x0FF00000)))             ; the io-buf BSS page
@@ -241,7 +262,7 @@
       (%core-die "core: not a Modus core file"))
     (when (/= (mem-ref (+ hdr 8) :u64) from)
       (%core-die "core: heap base differs from this process (the core was saved by an image with a different layout, or the stub did not get its fixed mapping)"))
-    (when (/= (mem-ref (+ hdr 24) :u64) (%gc-space-size))
+    (when (/= (mem-ref (+ hdr 24) :u64) (%core-space-size))
       (%core-die "core: heap geometry differs from this image"))
     (let ((free (mem-ref (+ hdr 32) :u64))
           (blen (mem-ref (+ hdr 48) :u64))
@@ -278,8 +299,8 @@
       (%core-slice fd (%conv-addr #x10000FD0) 8)       ; JIT constant-vector root (aarch64)
       (%core-slice fd stage #x28)         ; 0xFD8..0x1000
       (%core-slice fd from (- free from))
-      (%core-slice fd (+ (%gc-bitmap-base) boff) blen)
-      (%core-slice fd (+ (%gc-cons-bitmap-base) boff) blen)
+      (%core-slice fd (+ (%core-bitmap-base) boff) blen)
+      (%core-slice fd (+ (%core-cons-bitmap-base) boff) blen)
       (when (> abump 0)
         ;; The arena: bitmaps + JIT pages, then the bump word (RAW: store the
         ;; halved value so the machine word is the address) and an I-cache

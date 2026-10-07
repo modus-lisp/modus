@@ -263,7 +263,7 @@
     (aset v 18 (quote r14)) (aset v 19 (quote r15))
     (aset v 20 (quote rsp)) (aset v 21 (quote rbp))
     (setq *vreg-to-x64* v))
-  (setq *x64-native-code-offset* 397)  ; WS5 modus3 FIX: linux-x64 boot preamble
+  (setq *x64-native-code-offset* (linux-x64-native-code-offset))  ; WS5 modus3 FIX: linux-x64 boot preamble
   ;; is 397 bytes; install-x64-translator runs IN-IMAGE and is the authoritative
   ;; runtime setter (the host-only (setf … 397) at file tail doesn't persist —
   ;; limitation #7).  With 0 here, in-image --compile aligned fn file-offsets to
@@ -1762,7 +1762,7 @@
   ;; so in-image --compile aligns entries to nibble 0, matching the seed's own
   ;; build.  Proof: nm seed = all fns nibble 0; nm modus2-v2 = all nibble d.
   ;; See reference_modus3_optional_lambda_miscompile.
-  (setq *x64-native-code-offset* 397)
+  (setq *x64-native-code-offset* (linux-x64-native-code-offset))
   (%install-deftest-macro)
   ;; Run all built-in defvar init thunks.  Each is wrapped in
   ;; handler-case at compile time so a thunk that references a not-yet-
@@ -2255,7 +2255,7 @@
 ;; misaligned call returns immediately, leaving the caller's RAX
 ;; intact (silently looks like the fn returned T or whatever else
 ;; was in RAX).  See reference_append_funcall_bug.md.
-(setf modus.mvm.x64::*x64-native-code-offset* 397)
+(setf modus.mvm.x64::*x64-native-code-offset* (modus.mvm::linux-x64-native-code-offset))  ; computed from the stub, see boot-linux-x64.lisp
 
 ;; Enable the GC trampoline: without this, every :alloc-obj advances R12
 ;; unchecked and the heap walks past the mapped region in long-running

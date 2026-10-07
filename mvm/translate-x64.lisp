@@ -1855,16 +1855,40 @@
               (emit-bytes buf #x41 #x51)         ; push r9
               (emit-bytes buf #x41 #x52)         ; push r10
               (emit-bytes buf #x41 #x53)         ; push r11
-              (emit-bytes buf #xB8 #x09 #x00 #x00 #x00) ; mov eax, 9 (SYS_mmap)
-              (emit-bytes buf #x48 #x31 #xFF)    ; xor rdi, rdi (addr = NULL)
-              (emit-bytes buf #x48 #xD1 #xFE)    ; sar rsi, 1 (untag size)
-              (emit-bytes buf #xBA #x07 #x00 #x00 #x00) ; mov edx, 7 (PROT_RWX)
-              (emit-bytes buf #x41 #xBA #x22 #x00 #x00 #x00) ; mov r10d, 0x22 (PRIV|ANON)
-              (emit-bytes buf #x49 #xC7 #xC0 #xFF #xFF #xFF #xFF) ; mov r8, -1 (fd)
-              (emit-bytes buf #x4D #x31 #xC9)    ; xor r9, r9 (offset)
-              (emit-syscall-saving-rcx-r11 buf)     ; syscall (RCX/R11 preserved)
-              (emit-bytes buf #x48 #x01 #xC0)    ; add rax, rax (tag result)
-              (emit-bytes buf #x48 #x89 #xC6)    ; mov rsi, rax → V0
+              ;; SAVE-AND-DIE (lib/save-image.lisp): when the boot stub mapped the
+              ;; fixed RWX JIT arena, the bump word at 0x10000FB8 holds its base
+              ;; (raw) and pages are bump-allocated from it, 16-aligned, so every
+              ;; process puts its JIT pages at the same addresses and a snapshot
+              ;; carries [arena, bump) verbatim -- the aarch64 arm's shape.  Bump
+              ;; word 0 (no arena, or a bare image) is the mmap(NULL) path below.
+              (let ((fallback (make-label)) (done (make-label)))
+                (when (and *x64-linux-mode*
+                           (not (equal (sb-ext:posix-getenv "MODUS_X64_ARENA_TRAP") "0")))  ; A/B knob
+                  (emit-mov-reg-imm buf 'rax #x10000FB8)
+                  (emit-mov-reg-mem buf 'rax 'rax 0)             ; rax = bump (raw)
+                  (emit-cmp-reg-imm buf 'rax 0)
+                  (emit-jcc buf :e fallback)
+                  (emit-mov-reg-reg buf 'rdx 'rsi)               ; rdx = tagged size
+                  (emit-bytes buf #x48 #xD1 #xFA)                ; sar rdx, 1
+                  (emit-bytes buf #x48 #x83 #xC2 #x0F)           ; add rdx, 15
+                  (emit-bytes buf #x48 #x83 #xE2 #xF0)           ; and rdx, -16
+                  (emit-bytes buf #x48 #x8D #x3C #x10)           ; lea rdi, [rax+rdx] = new bump
+                  (emit-bytes buf #x48 #x89 #x3C #x25)           ; mov [abs32], rdi
+                  (emit-u32 buf #x10000FB8)
+                  (emit-bytes buf #x48 #x8D #x34 #x00)           ; lea rsi, [rax+rax]  (tagged page)
+                  (emit-jmp buf done))
+                (emit-label buf fallback)
+                (emit-bytes buf #xB8 #x09 #x00 #x00 #x00) ; mov eax, 9 (SYS_mmap)
+                (emit-bytes buf #x48 #x31 #xFF)    ; xor rdi, rdi (addr = NULL)
+                (emit-bytes buf #x48 #xD1 #xFE)    ; sar rsi, 1 (untag size)
+                (emit-bytes buf #xBA #x07 #x00 #x00 #x00) ; mov edx, 7 (PROT_RWX)
+                (emit-bytes buf #x41 #xBA #x22 #x00 #x00 #x00) ; mov r10d, 0x22 (PRIV|ANON)
+                (emit-bytes buf #x49 #xC7 #xC0 #xFF #xFF #xFF #xFF) ; mov r8, -1 (fd)
+                (emit-bytes buf #x4D #x31 #xC9)    ; xor r9, r9 (offset)
+                (emit-syscall-saving-rcx-r11 buf)     ; syscall (RCX/R11 preserved)
+                (emit-bytes buf #x48 #x01 #xC0)    ; add rax, rax (tag result)
+                (emit-bytes buf #x48 #x89 #xC6)    ; mov rsi, rax → V0
+                (emit-label buf done))
               (emit-bytes buf #x41 #x5B)         ; pop r11
               (emit-bytes buf #x41 #x5A)         ; pop r10
               (emit-bytes buf #x41 #x59)         ; pop r9

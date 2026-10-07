@@ -69,7 +69,7 @@ for TYPE in $TYPES; do
     say "trying $TYPE in $AZ ${ON_DEMAND:+(on-demand)}"
     if ID=$(aws ec2 run-instances \
       --image-id "$AMI" --instance-type "$TYPE" --key-name "$KEY" --security-group-ids "$SGID" --subnet-id "$SUBNET" --associate-public-ip-address \
-      --enclave-options Enabled=true "${MARKET[@]}" \
+      --enclave-options Enabled=true ${MARKET[@]+"${MARKET[@]}"} \
       --block-device-mappings 'DeviceName=/dev/xvda,Ebs={VolumeSize=16,VolumeType=gp3}' \
       --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=modus-nitro}]' \
       --query 'Instances[0].InstanceId' --output text 2>"$TMPERR"); then break 2; fi

@@ -12759,6 +12759,22 @@
             (setq any-captures t)))))
     any-captures))
 
+(defun %flet-body-returns-from-p (tree name)
+  "True when TREE contains (RETURN-FROM NAME ...) -- NAME compared with EQ, as
+   CLHS block names are.  Not by name: in the ANSI gate runner a local
+   function's name can be a symbol whose name reads back EMPTY (it prints as
+   ||), so a name or name-hash comparison matched EVERY RETURN-FROM -- the
+   (return-from b6 c) of upstream MISC.14 too -- and the block was added where
+   nothing needed it.  If EQ ever misses, the function compiles as it did
+   before the implicit block existed."
+  (and (consp tree)
+       (or (and (symbolp (car tree)) (car tree)
+                (= (normalize-name (car tree)) 164933334)   ; RETURN-FROM
+                (consp (cdr tree))
+                (eq (cadr tree) name))
+           (%flet-body-returns-from-p (car tree) name)
+           (%flet-body-returns-from-p (cdr tree) name))))
+
 (defun %flet-with-block (def)
   "DEF, a local function definition (NAME PARAMS . BODY), with BODY in the implicit BLOCK
    CLHS 5.3 gives it -- named NAME, or X for a (SETF X) -- after its declarations and docstring.
@@ -12782,7 +12798,7 @@
         ;; came back with F's value instead of leaving B6).  A body with no
         ;; RETURN-FROM to its own name cannot observe the block, so it is left
         ;; exactly as it compiled before.
-        (if (or (null bname) (not (%tree-has-return-from forms bname)))
+        (if (or (null bname) (not (%flet-body-returns-from-p forms bname)))
             def
             (progn
               ;; leading declarations, and a docstring that is not the only form, stay outside
@@ -12810,7 +12826,11 @@
    (not raw let slots) carry the lambda values so mutual recursion in LABELS
    still works: each lambda body reads its target via (CAR CELL) at call
    time, after every cell's car has been populated."
-  (setq defs (mapcar (function %flet-with-block) defs))
+  ;; Replace DEFS only when a definition actually gained a block: the rest of
+  ;; COMPILE-FLET (and the walkers that ran on the enclosing BLOCK) see the
+  ;; SOURCE conses, and a fresh copy of an unchanged list is not EQ to them.
+  (let ((nd (mapcar (function %flet-with-block) defs)))
+    (unless (every (function eq) nd defs) (setq defs nd)))
   ;; Capture-aware transform: when any function body captures an outer
   ;; binding, replace the FLET/LABELS with a LET that allocates one
   ;; heap cell per local function name, then sets each cell's car to a

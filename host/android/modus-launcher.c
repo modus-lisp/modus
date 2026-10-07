@@ -14,12 +14,14 @@
 //                           xy = x | y<<16, wh = w | h<<16.  No reply.
 //   1003 PRESENT            show the buffer.  No reply.
 //   1004 NEXT-EVENT         reply u64: the oldest touch, type<<40 | y<<20 | x,
-//                           type 1 down / 2 move / 3 up; 0 when there is none
+//                           type 1 down / 2 move / 3 up; 0 when there is none;
+//                           type 4 is a key: 4<<40 | its X11 keysym
 // and the three more kiln's app uses (kiln boot/ios.lisp), whose data follows
 // the record on the socket — modus sends it with one write(2) straight from
 // the Lisp vector, since this process cannot read the child's memory:
 //   1005 BLIT  wh xy nbytes      a glass framebuffer's pixels, w*h of them,
 //                                drawn at (x, y), clipped
+//   1006 KEYBOARD on             show (1) or hide (0) the soft keyboard
 //   1010 AUDIO-OPEN rate         reply 0 when a speaker is open (mono s16)
 //   1011 AUDIO-WRITE n           n samples follow; queued for the speaker
 // Both payloads are the Lisp vector's storage as it is: one TAGGED 64-bit word
@@ -83,6 +85,8 @@ static int16_t aring[ARING];
 static uint64_t a_in, a_out;        // a_in - a_out = queued
 static AAudioStream *astream;
 
+static ANativeActivity *the_act;    // for the soft keyboard (1006)
+static int ime_pipe[2] = {-1, -1};  // serve thread -> main thread: '1' show, '0' hide
 static pid_t child = -1;
 static int sock = -1;               // our end of the socketpair
 
@@ -187,6 +191,12 @@ static void *serve(void *arg) {
             if (!px || read_full(sock, px, rec[3])) { free(px); goto done; }
             if ((uint64_t)(rec[1] & 0xFFFF) * (rec[1] >> 16) * 8 <= rec[3]) blit(rec[1], rec[2], px);
             free(px);
+            break;
+        }
+        case 1006: {
+            char c = rec[1] ? '1' : '0';
+            LOGI("keyboard %s", rec[1] ? "on" : "off");
+            if (ime_pipe[1] >= 0) write(ime_pipe[1], &c, 1);
             break;
         }
         case 1010:
@@ -331,6 +341,56 @@ static void start_modus(ANativeActivity *act) {
     pthread_create(&t, NULL, pump, (void *)(intptr_t)out[0]); pthread_detach(t);
 }
 
+// ---- the soft keyboard (1006), on the MAIN thread ------------------------------
+// ANativeActivity_showSoftInput asks the input-method manager to show for the
+// activity's content view, which has no input connection; recent Android
+// declines that without a word.  So the request goes through JNI to
+// InputMethodManager.showSoftInput on the window's DECOR view, from the main
+// thread (whose looper this pipe is on): what an app's own Java would do.
+
+static jobject decor_view(JNIEnv *env, jobject act) {
+    jclass ac = (*env)->GetObjectClass(env, act);
+    jobject win = (*env)->CallObjectMethod(env, act,
+        (*env)->GetMethodID(env, ac, "getWindow", "()Landroid/view/Window;"));
+    jclass wc = (*env)->GetObjectClass(env, win);
+    return (*env)->CallObjectMethod(env, win,
+        (*env)->GetMethodID(env, wc, "getDecorView", "()Landroid/view/View;"));
+}
+
+static void ime(int show) {
+    JNIEnv *env = the_act->env;                    // the main thread's
+    jobject act = the_act->clazz;
+    jclass ac = (*env)->GetObjectClass(env, act);
+    jstring name = (*env)->NewStringUTF(env, "input_method");
+    jobject imm = (*env)->CallObjectMethod(env, act,
+        (*env)->GetMethodID(env, ac, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;"), name);
+    jclass ic = (*env)->GetObjectClass(env, imm);
+    jobject view = decor_view(env, act);
+    jboolean ok;
+    if (show) {
+        jclass vc = (*env)->GetObjectClass(env, view);
+        (*env)->CallVoidMethod(env, view, (*env)->GetMethodID(env, vc, "setFocusableInTouchMode", "(Z)V"), JNI_TRUE);
+        (*env)->CallBooleanMethod(env, view, (*env)->GetMethodID(env, vc, "requestFocus", "()Z"));
+        ok = (*env)->CallBooleanMethod(env, imm,
+            (*env)->GetMethodID(env, ic, "showSoftInput", "(Landroid/view/View;I)Z"), view, 0);
+    } else {
+        jclass vc = (*env)->GetObjectClass(env, view);
+        jobject tok = (*env)->CallObjectMethod(env, view,
+            (*env)->GetMethodID(env, vc, "getWindowToken", "()Landroid/os/IBinder;"));
+        ok = (*env)->CallBooleanMethod(env, imm,
+            (*env)->GetMethodID(env, ic, "hideSoftInputFromWindow", "(Landroid/os/IBinder;I)Z"), tok, 0);
+    }
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); }
+    LOGI("ime %s -> %d", show ? "show" : "hide", ok);
+}
+
+static int on_ime(int fd, int evs, void *data) {
+    (void)evs; (void)data;
+    char c;
+    while (read(fd, &c, 1) == 1) ime(c == '1');
+    return 1;
+}
+
 // ---- touch input -------------------------------------------------------------
 
 static void push_event(int type, float x, float y) {
@@ -338,6 +398,50 @@ static void push_event(int type, float x, float y) {
     uint64_t e = ((uint64_t)type << 40) | ((yi & 0xFFFFF) << 20) | (xi & 0xFFFFF);
     pthread_mutex_lock(&lk);
     if (ev_tail - ev_head < NEV) events[ev_tail++ % NEV] = e;
+    pthread_mutex_unlock(&lk);
+}
+
+// A key's X11 keysym (what glass's desk reads), US layout; 0 = not ours.
+// NativeActivity's soft keyboard arrives as key events: the system turns typed
+// text into them with the key character map, so a keycode + shift is enough.
+static uint64_t keysym_of(int code, int meta) {
+    int shift = (meta & (AMETA_SHIFT_ON | AMETA_CAPS_LOCK_ON)) != 0;
+    if (code >= AKEYCODE_A && code <= AKEYCODE_Z) return (shift ? 'A' : 'a') + (code - AKEYCODE_A);
+    if (code >= AKEYCODE_0 && code <= AKEYCODE_9)
+        return shift ? (uint64_t)")!@#$%^&*("[code - AKEYCODE_0] : (uint64_t)('0' + code - AKEYCODE_0);
+    switch (code) {
+    case AKEYCODE_SPACE: return ' ';
+    case AKEYCODE_ENTER: case AKEYCODE_NUMPAD_ENTER: return 0xff0d;
+    case AKEYCODE_DEL: return 0xff08;               // backspace
+    case AKEYCODE_FORWARD_DEL: return 0xffff;
+    case AKEYCODE_TAB: return 0xff09;
+    case AKEYCODE_ESCAPE: return 0xff1b;
+    case AKEYCODE_DPAD_LEFT: return 0xff51;
+    case AKEYCODE_DPAD_UP: return 0xff52;
+    case AKEYCODE_DPAD_RIGHT: return 0xff53;
+    case AKEYCODE_DPAD_DOWN: return 0xff54;
+    case AKEYCODE_COMMA: return shift ? '<' : ',';
+    case AKEYCODE_PERIOD: return shift ? '>' : '.';
+    case AKEYCODE_GRAVE: return shift ? '~' : '`';
+    case AKEYCODE_MINUS: return shift ? '_' : '-';
+    case AKEYCODE_EQUALS: return shift ? '+' : '=';
+    case AKEYCODE_LEFT_BRACKET: return shift ? '{' : '[';
+    case AKEYCODE_RIGHT_BRACKET: return shift ? '}' : ']';
+    case AKEYCODE_BACKSLASH: return shift ? '|' : '\\';
+    case AKEYCODE_SEMICOLON: return shift ? ':' : ';';
+    case AKEYCODE_APOSTROPHE: return shift ? '"' : '\'';
+    case AKEYCODE_SLASH: return shift ? '?' : '/';
+    case AKEYCODE_AT: return '@';
+    case AKEYCODE_PLUS: return '+';
+    case AKEYCODE_STAR: return '*';
+    case AKEYCODE_POUND: return '#';
+    }
+    return 0;
+}
+
+static void push_key(uint64_t ks) {
+    pthread_mutex_lock(&lk);
+    if (ev_tail - ev_head < NEV) events[ev_tail++ % NEV] = (4ULL << 40) | (ks & 0xFFFFFFFFFFULL);
     pthread_mutex_unlock(&lk);
 }
 
@@ -353,6 +457,11 @@ static int on_input(int fd, int evs, void *data) {
             int type = a == AMOTION_EVENT_ACTION_DOWN ? 1 : a == AMOTION_EVENT_ACTION_MOVE ? 2
                      : a == AMOTION_EVENT_ACTION_UP ? 3 : 0;
             if (type) { push_event(type, AMotionEvent_getX(ev, 0), AMotionEvent_getY(ev, 0)); handled = 1; }
+        } else if (AInputEvent_getType(ev) == AINPUT_EVENT_TYPE_KEY
+                   && AKeyEvent_getAction(ev) == AKEY_EVENT_ACTION_DOWN) {
+            // one event per press: the desk makes its own press + release
+            uint64_t ks = keysym_of(AKeyEvent_getKeyCode(ev), AKeyEvent_getMetaState(ev));
+            if (ks) { push_key(ks); handled = 1; }
         }
         AInputQueue_finishEvent(q, ev, handled);
     }
@@ -399,6 +508,9 @@ static void onDestroy(ANativeActivity *a) {
 
 JNIEXPORT void ANativeActivity_onCreate(ANativeActivity *act, void *saved, size_t saved_size) {
     (void)saved; (void)saved_size;
+    the_act = act;
+    if (ime_pipe[0] < 0 && pipe2(ime_pipe, O_CLOEXEC | O_NONBLOCK) == 0)
+        ALooper_addFd(ALooper_forThread(), ime_pipe[0], 2, ALOOPER_EVENT_INPUT, on_ime, NULL);
     act->callbacks->onNativeWindowCreated = onNativeWindowCreated;
     act->callbacks->onNativeWindowRedrawNeeded = onNativeWindowRedrawNeeded;
     act->callbacks->onNativeWindowDestroyed = onNativeWindowDestroyed;

@@ -446,12 +446,13 @@
     ((= opcode 2)
      (let ((code (nth 0 operands)))
        (cond
-         ((< code 256)
+         ((or (< code 256) (>= code 32768))
           ;; Prologue already emitted by main translation loop — do NOT emit again
-          (if (> code 4)
+          ;; (a sized frame-enter, #x8000|units<<8|nparams, keeps this fixed frame)
+          (if (> (logand code 255) 4)
               (let ((param-idx 4))
                 (loop
-                  (when (>= param-idx code) (return nil))
+                  (when (>= param-idx (logand code 255)) (return nil))
                   (let ((k (- param-idx 4)))
                     (let ((src-off (+ 220 (* k 4))))
                       (let ((dst-off (* param-idx 4)))

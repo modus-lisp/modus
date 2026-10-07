@@ -142,14 +142,15 @@
       ((= opcode 2)
        (let ((code (first operands)))
          (cond
-           ((< code 256)
-            ;; Frame-enter: code = nparams.
+           ((or (< code 256) (>= code 32768))
+            ;; Frame-enter: nparams in the low byte (a sized frame-enter,
+            ;; #x8000|units<<8|nparams, keeps this fixed frame).
             ;; If nparams > 4, copy overflow args from caller's stack to local frame slots.
             ;; Overflow args at [EBP+16+k*4], frame slot N at [EBP + (-68) + N*(-4)].
-            (when (> code 4)
+            (when (> (logand code 255) 4)
               (let ((param-idx 4))
                 (loop
-                  (when (>= param-idx code) (return nil))
+                  (when (>= param-idx (logand code 255)) (return nil))
                   (let ((k (- param-idx 4)))
                     (let ((src-off (+ 16 (* k 4))))
                       (let ((dst-off (+ -68 (* param-idx -4))))

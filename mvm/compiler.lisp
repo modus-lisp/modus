@@ -2101,10 +2101,10 @@
              *current-function-name* op *arith-push-depth* inner-depth
              (+ *arith-push-depth* inner-depth) operand))))
 
-(defparameter *let-binding-limit* 120
-  "Maximum number of bindings in a single let/let* form.
-   The x64 frame has 128 slots; leave headroom for nested scopes.
-   Beyond this, stack slots overflow the frame causing corruption.")
+(defparameter *let-binding-limit* 248
+  "Maximum frame depth a let/let* may reach.  Frames are sized per function
+   (see %IR-FRAME-ENTER-CODES); the ceiling is the imm8 slot operand of
+   OBJ-REF/OBJ-SET on VFP, 256 slots, less headroom for temp spills.")
 
 (defun check-frame-overflow (n-bindings form-type env)
   "Error if total stack depth would exceed the frame slot limit."
@@ -24410,10 +24410,45 @@
 
 ;;; ------ Pass 2: Emit Bytecode ------
 
+(defun %ir-frame-enter-finish (codes fe top floor)
+  (when fe
+    (let ((nparams (second fe)))
+      (when (> top +frame-max-slots+)
+        (error "MVM compiler: function ~A addresses ~D frame slots (limit ~D)."
+               *current-function-name* top +frame-max-slots+))
+      (setf (gethash fe codes)
+            (if (< nparams #x100)
+                (encode-frame-enter nparams (max top floor nparams))
+                nparams)))))
+
+(defun %ir-frame-enter-codes (ir-list)
+  "Map each :FRAME-ENTER insn in IR-LIST (by EQ) to its sized trap code: the
+   function's highest addressed frame slot + 1, never below its parameter
+   count.  A function that copies overflow arguments into its frame (the
+   #x0530 &rest copy) or indexes the frame at run time keeps the full legacy
+   128 slots as a floor, since what it touches depends on the caller.
+   No FLET over the loop variables: written that way, the copy baked into the
+   image returned an EMPTY table (measured 2026-10-07; the same shape compiled
+   at run time is fine), so every in-image compile went unsized."
+  (let ((codes (make-hash-table :test 'eq))
+        (fe nil) (top 0) (floor 0))
+    (dolist (insn ir-list)
+      (case (car insn)
+        (:frame-enter (%ir-frame-enter-finish codes fe top floor)
+                      (setq fe insn top 0 floor 0))
+        ((:stack-load :stack-store) (setq top (max top (1+ (third insn)))))
+        (:aref (when (eql (third insn) +vreg-vfp+)
+                 (setq floor +frame-legacy-slots+)))
+        (:trap (when (eql (second insn) #x0530)
+                 (setq floor +frame-legacy-slots+)))))
+    (%ir-frame-enter-finish codes fe top floor)
+    codes))
+
 (defun emit-bytecode-for-ir (buf ir-list label-positions)
   "Emit MVM bytecode for a list of IR instructions.
    BUF is an mvm-buffer. LABEL-POSITIONS maps label-id -> byte offset."
-  (let ((current-offset 0))
+  (let ((current-offset 0)
+        (frame-codes (%ir-frame-enter-codes ir-list)))
     (dolist (insn ir-list)
       (unless (eq (car insn) :label)
       (let ((op (car insn)))
@@ -24860,9 +24895,7 @@
 
           ;; ---- Frame management ----
           (:frame-enter
-           ;; Emit as: push VFP; mov VFP, VSP; sub VSP, N*8
-           ;; Encoded as trap with frame size
-           (mvm-trap buf (second insn)))
+           (mvm-trap buf (gethash insn frame-codes (second insn))))
           (:frame-alloc
            ;; sub VSP, N*8
            (mvm-trap buf (+ #x100 (second insn))))

@@ -1034,7 +1034,14 @@
    occupies.  Measured on RISC-V: MAKE-HASH-TABLE's &rest prologue alone
    reads frame slot 31.  -592 still fits LINK's 16-bit displacement.")
 
-(defun m68k-emit-prologue (buf &optional (nparams 0))
+(defun m68k-frame-bytes (slots)
+  "LINK size for SLOTS slots: slot N is at A6-72-4N, so 68+4*SLOTS, rounded
+   to 16.  The unsized frame keeps 592."
+  (if (= slots +frame-legacy-slots+)
+      +68k-frame-size+
+      (logand (+ 68 (* 4 slots) 15) (lognot 15))))
+
+(defun m68k-emit-prologue (buf &optional (nparams 0) (slots +frame-legacy-slots+))
   "Emit 68k function prologue. LINK, copy parameters 5.. into frame slots 4..,
    save callee-saved registers.
 
@@ -1047,10 +1054,10 @@
 
    JSR pushed the return address and LINK the old A6, so parameter i is at
    A6 + 8 + (i-4)*4.  D0 is translator scratch and free here."
-  (when (> nparams 128)
-    (error "MVM 68k: ~D parameters exceed the 128-slot frame" nparams))
+  (when (> nparams (max slots 128))
+    (error "MVM 68k: ~D parameters exceed the ~D-slot frame" nparams slots))
   ;; LINK A6, #-frame-size
-  (m68k-emit-link buf +68k-a6+ (logand (- +68k-frame-size+) #xFFFF))
+  (m68k-emit-link buf +68k-a6+ (logand (- (m68k-frame-bytes slots)) #xFFFF))
   (loop for i from 4 below nparams
         do (m68k-emit-move-disp-dn buf +68k-a6+ (+ 8 (* (- i 4) 4)) +68k-d0+)
            (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a6+
@@ -1117,9 +1124,9 @@
       (#.+op-trap+
        (let ((code (first operands)))
          (cond
-           ((< code #x0100)
-            ;; Frame-enter: CODE is the parameter count -- see m68k-emit-prologue.
-            (m68k-emit-prologue buf code))
+           ((frame-enter-code-p code)
+            ;; Frame-enter: CODE carries the parameter count -- see m68k-emit-prologue.
+            (m68k-emit-prologue buf (frame-enter-nparams code) (frame-enter-slots code)))
            ((< code #x0300)
             ;; Frame-alloc/frame-free: NOP for now
             nil)

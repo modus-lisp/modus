@@ -938,11 +938,12 @@
 (defun a64i-translate-trap (buf code)
   (cond
     ;; Frame-enter (code < 256)
-    ((< code 256)
+    ((or (< code 256) (>= code 32768))
      (a64i-emit-prologue buf)
-     ;; Copy overflow args (>4 params) from caller's stack
-     (when (> code 4)
-       (a64i-translate-trap-overflow buf code 4)))
+     ;; Copy overflow args (>4 params) from caller's stack.  A sized
+     ;; frame-enter (#x8000|units<<8|nparams) keeps this fixed frame.
+     (when (> (logand code 255) 4)
+       (a64i-translate-trap-overflow buf (logand code 255) 4)))
     ;; Frame-alloc/frame-free (code < 768)
     ((< code 768) nil)
     ;; Serial write (code = 768 = 0x0300)

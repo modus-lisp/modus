@@ -1197,12 +1197,6 @@
    Frame slots grow downward: slot N is at RBP + frame-slot-base - N*8.
    Above this: callee-saved saves (32 bytes) + spill slots (56 bytes) = 88.")
 
-(defconstant +frame-total-size+ 1120
-  "Total frame reservation in bytes. Callee-saved saves (32) + spill slots (56)
-   + 128 frame slots for local variables (1024) = 1112, rounded to 1120.
-   Note: fe-mul (crypto.lisp) has ~74 nested let/let* bindings but works because
-   many are within inner lambdas (each gets their own frame).")
-
 ;;; ============================================================
 ;;; Scratch Register for Spill Mediation
 ;;; ============================================================
@@ -1580,14 +1574,15 @@
         ((op= +op-trap+)
          (let ((code (first operands)))
            (cond
-             ((< code #x100)
-              ;; Frame-enter: code = param count.
+             ((frame-enter-code-p code)
+              ;; Frame-enter: the param count (and frame size, which the
+              ;; prologue already reserved -- see FUNCTION-FRAME-SLOTS).
               ;; Prologue is emitted at function boundaries.
               ;; If > 4 params, copy overflow args from caller's stack
               ;; to local frame slots so stack-load can find them.
               ;;
-              ;; JIT FLIP-SAFETY (Class 1): the NATIVE frame reserves a FIXED
-              ;; 128 slots (+frame-total-size+ 1120 = 88 overhead + 128*8),
+              ;; JIT FLIP-SAFETY (Class 1): an UNSIZED frame-enter (code < #x100)
+              ;; reserves a fixed 128 slots (X64-FRAME-BYTES),
               ;; whereas the interpreter's frame is sized (params+160) per call.
               ;; A function with a large param count (or params + deep locals)
               ;; overruns the fixed native frame: params/locals past slot ~128
@@ -1601,10 +1596,10 @@
               ;; interpreter — matching the interpret baseline exactly, with no
               ;; wrong value and no overrun.  Image-build codegen (*x64-jit-mode*
               ;; nil) is unaffected → shipped image stays byte-identical.
-              (when (and *x64-jit-mode* (>= code 120))
+              (when (and *x64-jit-mode* (< code #x100) (>= code 120))
                 (error "jit-frame-param-overflow"))
-              (when (> code 4)
-                (loop for i from 4 below code
+              (when (> (frame-enter-nparams code) 4)
+                (loop for i from 4 below (frame-enter-nparams code)
                       for src-offset = (+ 16 (* (- i 4) 8))  ; [RBP + 16 + k*8]
                       for dst-offset = (+ +frame-slot-base+ (* i -8))  ; frame slot i
                       do (emit-mov-reg-mem buf 'rax 'rbp src-offset)
@@ -5904,7 +5899,12 @@
                                  (+ (code-buffer-position buf) 4))))
         (emit-label-ref-rel32 buf label))))
 
-(defun emit-function-prologue (buf)
+(defun x64-frame-bytes (slots)
+  "Frame size below RBP: 96 bytes of callee-save + spill area, then SLOTS
+   frame slots.  SLOTS is a multiple of 8, so RSP stays 16-byte aligned."
+  (+ (- +frame-slot-base+) (* slots 8)))
+
+(defun emit-function-prologue (buf &optional (slots +frame-legacy-slots+))
   "Emit the standard function prologue.
    push rbp / mov rbp,rsp / sub rsp,frame_size / save RBX
    In kernel mode, R12 (alloc ptr), R14 (alloc limit), R15 (nil) are global
@@ -5912,7 +5912,7 @@
   (emit-push buf 'rbp)
   (emit-mov-reg-reg buf 'rbp 'rsp)
   ;; Reserve space for callee-save + spill slots + frame slots
-  (emit-sub-reg-imm buf 'rsp +frame-total-size+)
+  (emit-sub-reg-imm buf 'rsp (x64-frame-bytes slots))
   ;; Save RBX (V4) as callee-saved register at [RBP-8]
   (emit-mov-mem-reg buf 'rbp 'rbx -8))
 
@@ -5939,7 +5939,7 @@
                  :mvm-length length
                  :mvm-offset offset)))
     ;; Emit prologue
-    (emit-function-prologue buf)
+    (emit-function-prologue buf (function-frame-slots bytecode offset))
     ;; First pass: scan for branch targets and create labels
     (scan-branch-targets state)
     ;; Second pass: translate instructions
@@ -9779,7 +9779,10 @@
                  (handler-case (emit-label buf fn-label)
                    (error (c) (error "SETUP-emit-label fn ~D '~A' pos ~D: ~A" i name (code-buffer-position buf) c)))
                  ;; Emit prologue
-                 (handler-case (emit-function-prologue buf)
+                 (handler-case (emit-function-prologue
+                                buf (if (zerop length)
+                                        +frame-legacy-slots+
+                                        (function-frame-slots bytecode offset)))
                    (error (c) (error "SETUP-prologue fn ~D '~A' pos ~D: ~A" i name (code-buffer-position buf) c)))
                  ;; If length=0 (orphaned stub with no bytecode), emit an immediate
                  ;; epilogue+ret so we don't fall through into the next function.

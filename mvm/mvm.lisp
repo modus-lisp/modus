@@ -52,6 +52,9 @@
    #:+op-io-read+ #:+op-io-write+ #:+op-halt+
    #:+op-cli+ #:+op-sti+ #:+op-percpu-ref+ #:+op-percpu-set+
    #:+op-fn-addr+
+   #:+frame-enter-sized+ #:+frame-legacy-slots+ #:+frame-max-slots+
+   #:frame-enter-code-p #:frame-enter-nparams #:frame-enter-slots
+   #:encode-frame-enter #:function-frame-slots
    #:+op-mul26lo+ #:+op-mul26hi+
    #:+op-mul64lo+ #:+op-mul64hi+ #:+op-acc128+
    #:+op-sap-new+ #:+op-sap-ref8+ #:+op-sap-ref32+ #:+op-sap-ref64+
@@ -985,6 +988,45 @@
    x64 hot path uses decode-instruction-mv to skip the wrapper cons."
   (multiple-value-bind (opcode operands new-pos) (decode-instruction-mv bytes pos)
     (cons opcode (cons operands new-pos))))
+
+;;; ============================================================
+;;; Frame-enter: parameter count and frame size
+;;; ============================================================
+;;; FRAME-ENTER is TRAP code N < #x100 (N = parameter count), which leaves
+;;; the frame size to the back end: every port reserved a fixed 128 slots.
+;;; A SIZED frame-enter is TRAP #x8000 | units<<8 | N, where the function
+;;; addresses frame slots [0, units*8).  The slot index is an imm8 operand
+;;; of OBJ-REF/OBJ-SET on VFP, so no function can address past slot 255 and
+;;; 32 units (256 slots) covers every encodable frame.
+
+(defconstant +frame-enter-sized+ #x8000)
+(defconstant +frame-legacy-slots+ 128)
+(defconstant +frame-max-slots+ 256)
+
+(defun frame-enter-code-p (code)
+  (or (< code #x100) (>= code +frame-enter-sized+)))
+
+(defun frame-enter-nparams (code)
+  (if (>= code +frame-enter-sized+) (logand code #xFF) code))
+
+(defun frame-enter-slots (code)
+  "Frame slots a FRAME-ENTER trap CODE reserves: 128 for the unsized form."
+  (if (>= code +frame-enter-sized+)
+      (* 8 (logand (ash code -8) #x3F))
+      +frame-legacy-slots+))
+
+(defun encode-frame-enter (nparams slots)
+  "The FRAME-ENTER trap code for NPARAMS parameters and SLOTS frame slots."
+  (logior +frame-enter-sized+ (ash (ash (+ slots 7) -3) 8) nparams))
+
+(defun function-frame-slots (bytes offset)
+  "Frame slots of the function whose bytecode starts at OFFSET: read from its
+   leading FRAME-ENTER, or 128 when it has none or an unsized one."
+  (if (and (< (+ offset 2) (length bytes))
+           (= (aref bytes offset) +op-trap+))
+      (let ((code (decode-u16 bytes (1+ offset))))
+        (if (frame-enter-code-p code) (frame-enter-slots code) +frame-legacy-slots+))
+      +frame-legacy-slots+))
 
 ;;; ============================================================
 ;;; Convenience Instruction Constructors

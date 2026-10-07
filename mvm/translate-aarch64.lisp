@@ -2290,14 +2290,22 @@
 ;;; changed.  That is deliberate — the GC's conservative stack scan, the
 ;;; SETJMP jmpbuf, SAVE-CTX/RESTORE-CTX and the overflow-argument area all
 ;;; describe the same words they always did.
-(defconstant +a64-fp-bias+ 1024
-  "Bytes x29 sits BELOW the old frame top (= +a64-locals-frame-size+).
-   A64-FP-OFF converts a legacy frame-top-relative offset to an x29-relative
-   one.  Kept as its own constant so every conversion site names the bias.")
+(defvar *a64-locals-bytes* +a64-locals-frame-size+
+  "Locals region (spills + frame slots) of the function being translated, set
+   by its FRAME-ENTER.  x29 sits this many bytes below the frame top, so it is
+   the bias every frame offset is converted with.")
+
+(defun a64-locals-bytes (slots)
+  "Locals region for SLOTS frame slots: slot N is at top-64-8N.  The unsized
+   frame keeps its 1024 bytes (slots 0..120).  64+8*SLOTS is 16-aligned since
+   SLOTS is a multiple of 8."
+  (if (= slots +frame-legacy-slots+)
+      +a64-locals-frame-size+
+      (+ 64 (* 8 slots))))
 
 (defun a64-fp-off (top-relative-offset)
   "Convert a (negative) frame-top-relative offset to an x29-relative one."
-  (+ top-relative-offset +a64-fp-bias+))
+  (+ top-relative-offset *a64-locals-bytes*))
 
 (defun a64-fp-scaled-p (off)
   "Can OFF be encoded directly in LDR/STR Xt, [x29, #imm12]?"
@@ -2501,7 +2509,7 @@
   ;; x6/x7/x4/x5/x8 = V9-V13, callee-saved by Modus convention (see *a64-vreg-to-phys*)
   (a64-emit-local-regs-save buf)
   ;; Allocate space for spill slots and frame locals below the save area
-  (a64-sub-imm buf +a64-sp+ +a64-sp+ +a64-locals-frame-size+)
+  (a64-sub-imm buf +a64-sp+ +a64-sp+ *a64-locals-bytes*)
   ;; Set up frame pointer LAST, at the BOTTOM of the locals region, so every
   ;; local is at a positive (scaled-imm12-encodable) offset from it.
   ;; (Cannot use a64-mov-reg because ORR encodes reg 31 as XZR, not SP)
@@ -2519,7 +2527,7 @@
    restored — see prologue docstring."
   (a64-slot-cache-flush)
   ;; Deallocate spill/frame-slot area
-  (a64-add-imm buf +a64-sp+ +a64-sp+ +a64-locals-frame-size+)
+  (a64-add-imm buf +a64-sp+ +a64-sp+ *a64-locals-bytes*)
   ;; Restore callee-saved registers (x19-x23, x27, and x6/x7 = V9/V10)
   ;; x24/x25/x26 are global alloc/limit/nil — do NOT restore
   (a64-emit-local-regs-restore buf)
@@ -2748,8 +2756,9 @@
            (let ((code (vr 0)))
              (when (a64-local-scratch-trap-p code) (a64-save-local-scratch buf))
              (cond
-               ((< code #x0100)
-                ;; Frame-enter: emit function prologue
+               ((frame-enter-code-p code)
+                ;; Frame-enter: emit function prologue, sized for this function
+                (setq *a64-locals-bytes* (a64-locals-bytes (frame-enter-slots code)))
                 (a64-emit-prologue buf)
                 ;; If > 4 params, copy overflow args from caller's stack
                 ;; to local frame slots so stack-load can find them.
@@ -2769,9 +2778,9 @@
                 ;; (slot 5's etype value) instead of the underlying
                 ;; array — triggering SIGSEGV at every subsequent aref
                 ;; on fill-pointer arrays.  See feedback_aa64_stride.
-                (when (> code 4)
+                (when (> (frame-enter-nparams code) 4)
                   (let ((arg-stride (if *aarch64-stack-align-16* 16 8)))
-                    (loop for i from 4 below code
+                    (loop for i from 4 below (frame-enter-nparams code)
                           ;; x29 is the frame BOTTOM, so BOTH the incoming
                           ;; overflow area (above the save area) and the frame
                           ;; slots are at positive offsets from it.
@@ -5721,7 +5730,7 @@
              (when label
                ;; Deallocate spill/frame-slot area and restore callee-saved regs
                ;; x24/x25/x26 are global state — NOT restored
-               (a64-add-imm buf +a64-sp+ +a64-sp+ +a64-locals-frame-size+)
+               (a64-add-imm buf +a64-sp+ +a64-sp+ *a64-locals-bytes*)
                ;; the local registers too: the tail target's prologue would
                ;; otherwise save OUR values and hand them back to our caller
                (a64-emit-local-regs-restore buf)

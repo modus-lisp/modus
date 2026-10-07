@@ -1019,6 +1019,32 @@
    deepest slot at fp-1168 both fit; a larger frame would need the offsets
    materialised into a register first, so raising this count is not free.")
 
+(defvar *rv-locals-bytes* +rv-local-frame-size+
+  "Locals region of the function being translated, set by its FRAME-ENTER.")
+
+(defun rv-locals-bytes (slots)
+  "Locals region for SLOTS frame slots: slot N is at fp-152-N*word, the save
+   area takes the 112 above, so 40+SLOTS*word covers them; rounded to 16.  The
+   unsized frame keeps its 1056 bytes."
+  (if (= slots +frame-legacy-slots+)
+      +rv-local-frame-size+
+      (logand (+ 40 (* slots (rv-word-size)) 15) (lognot 15))))
+
+(defun rv-emit-frame-slot-access (buf load-p reg idx)
+  "Load (LOAD-P) or store REG at frame slot IDX.  Slots past the 12-bit reach
+   of fp go through t0 (load) or t6 (store) as the address."
+  (let ((off (+ +rv-frame-slot-base+ (* idx (- (rv-word-size))))))
+    (if (>= off -2048)
+        (if load-p
+            (rv-emit-load-word buf reg +rv-fp+ off)
+            (rv-emit-store-word buf reg +rv-fp+ off))
+        (let ((addr (if load-p +rv-t0+ +rv-t6+)))
+          (rv-emit-li buf addr off)
+          (rv-emit-add buf addr +rv-fp+ addr)
+          (if load-p
+              (rv-emit-load-word buf reg addr 0)
+              (rv-emit-store-word buf reg addr 0))))))
+
 (defun rv-spill-offset (vreg)
   "Compute the FP-relative offset for a spilled vreg (V12-V15)."
   (+ +rv-spill-base-offset+ (* (- vreg 12) -8)))
@@ -1182,8 +1208,8 @@
       (#.+op-trap+
        (let ((code (vreg 0)))
          (cond
-           ((< code #x0100)
-            ;; Frame-enter: CODE is the function's parameter count.  Emit the
+           ((frame-enter-code-p code)
+            ;; Frame-enter: CODE carries the function's parameter count.  Emit the
             ;; prologue, then COPY PARAMETERS 5.. INTO FRAME SLOTS 4.. .
             ;;
             ;; Only V0-V3 travel in registers.  The caller PUSHes the rest before
@@ -1207,14 +1233,14 @@
             ;; the stack.  The prologue sets fp to the caller's sp at the call, so
             ;; arg i lives at fp + (i-4)*8.  x64's version reads rbp+16+(i-4)*8;
             ;; its 16 is the return address and saved rbp that RISC-V does not push.
-            (rv-emit-prologue buf +rv-local-frame-size+)
-            (when (> code 128)
-              (error "MVM RISC-V: ~D parameters exceed the 128-slot frame" code))
-            (loop for i from 4 below code
+            (setq *rv-locals-bytes* (rv-locals-bytes (frame-enter-slots code)))
+            (rv-emit-prologue buf *rv-locals-bytes*)
+            (when (> (frame-enter-nparams code) (frame-enter-slots code))
+              (error "MVM RISC-V: ~D parameters exceed the ~D-slot frame"
+                     (frame-enter-nparams code) (frame-enter-slots code)))
+            (loop for i from 4 below (frame-enter-nparams code)
                   do (rv-emit-load-word buf +rv-t0+ +rv-fp+ (* (- i 4) 8))
-                     (rv-emit-store-word buf +rv-t0+ +rv-fp+
-                                         (+ +rv-frame-slot-base+
-                                            (* i (- (rv-word-size)))))))
+                     (rv-emit-frame-slot-access buf nil +rv-t0+ i)))
            ((< code #x0300)
             ;; Frame-alloc/frame-free: NOP for now
             nil)
@@ -2126,8 +2152,7 @@
               (idx (vreg 2)))
          (if (= vobj +vreg-vfp+)
              ;; Frame slot access: use safe FP-relative offset below spill area
-             (let ((off (+ +rv-frame-slot-base+ (* idx (- (rv-word-size))))))
-               (rv-emit-load-word buf +rv-t0+ +rv-fp+ off))
+             (rv-emit-frame-slot-access buf t +rv-t0+ idx)
              ;; Normal object slot access
              (let* ((robj (resolve vobj))
                     (offset (- (* (1+ idx) (rv-word-size)) (rv-object-tag))))  ; (1+idx)*word - tag
@@ -2146,8 +2171,7 @@
               (rs (resolve2 (vreg 2))))
          (if (= vobj +vreg-vfp+)
              ;; Frame slot store: use safe FP-relative offset below spill area
-             (let ((off (+ +rv-frame-slot-base+ (* idx (- (rv-word-size))))))
-               (rv-emit-store-word buf rs +rv-fp+ off))
+             (rv-emit-frame-slot-access buf nil rs idx)
              ;; Normal object slot store
              (let* ((robj (resolve vobj))
                     (offset (- (* (1+ idx) (rv-word-size)) (rv-object-tag))))
@@ -2474,7 +2498,7 @@
          (rv-emit-jalr buf +rv-ra+ +rv-t1+ 0)))
 
       (#.+op-ret+
-       (rv-emit-epilogue buf +rv-local-frame-size+))
+       (rv-emit-epilogue buf *rv-locals-bytes*))
 
       (#.+op-tailcall+
        ;; Tail call: restore frame, then jump (not jal)
@@ -2482,7 +2506,9 @@
               (target-offset (if function-table
                                  (gethash target-idx function-table)
                                  0))
-              (total-frame (+ +rv-local-frame-size+ 112)))
+              (total-frame (+ *rv-locals-bytes* 112)))
+         (when (> total-frame 2048)
+           (error "MVM RISC-V: TAILCALL from a ~D-byte frame is not implemented" total-frame))
          ;; Restore callee-saved registers
          (rv-emit-load-word buf +rv-ra+  +rv-sp+ (- total-frame 8))
          (rv-emit-load-word buf +rv-fp+  +rv-sp+ (- total-frame 16))
@@ -3236,8 +3262,15 @@
 (defun rv-emit-prologue (buf frame-size)
   "Emit a RISC-V function prologue.
    FRAME-SIZE is the number of bytes needed for locals/spills.
-   Saves ra, fp, and callee-saved registers used by MVM."
+   Saves ra, fp, and callee-saved registers used by MVM.
+
+   A frame whose total reaches past the signed 12-bit immediate (a sized frame
+   of more than ~240 slots) cannot be carved with one ADDI or saved with
+   sp-relative offsets from its far end.  It saves the 112-byte area first,
+   sets fp, then lowers sp through t6.  Same layout either way: fp = the
+   caller's sp, registers at fp-8.., slot N at fp+frame-slot-base-N*word."
   (let ((total-frame (+ frame-size 112)))  ; 14 callee-saved regs * 8 = 112
+    (when (> total-frame 2048) (setq total-frame 112))
     ;; Allocate stack frame
     (rv-emit-addi buf +rv-sp+ +rv-sp+ (- total-frame))
     ;; Save return address and frame pointer
@@ -3255,11 +3288,19 @@
     ;; slots at total-frame-80/-88/-96 stay unused; see rv-emit-epilogue.
     (rv-emit-store-word buf +rv-s11+ +rv-sp+ (- total-frame 104))
     ;; Set up frame pointer
-    (rv-emit-addi buf +rv-fp+ +rv-sp+ total-frame)))
+    (rv-emit-addi buf +rv-fp+ +rv-sp+ total-frame)
+    (when (> (+ frame-size 112) 2048)
+      (rv-emit-li buf +rv-t6+ frame-size)
+      (rv-emit-sub buf +rv-sp+ +rv-sp+ +rv-t6+))))
 
 (defun rv-emit-epilogue (buf frame-size)
-  "Emit a RISC-V function epilogue. Restores callee-saved registers and returns."
+  "Emit a RISC-V function epilogue. Restores callee-saved registers and returns.
+   A frame too big for 12-bit sp offsets (see rv-emit-prologue) first points
+   sp at its 112-byte save area, which sits at fp-112."
   (let ((total-frame (+ frame-size 112)))
+    (when (> total-frame 2048)
+      (setq total-frame 112)
+      (rv-emit-addi buf +rv-sp+ +rv-fp+ -112))
     ;; Restore callee-saved registers
     (rv-emit-load-word buf +rv-ra+  +rv-sp+ (- total-frame 8))
     (rv-emit-load-word buf +rv-fp+  +rv-sp+ (- total-frame 16))

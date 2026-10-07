@@ -609,7 +609,7 @@
     (loop
       (when (not (zerop got-version)) (return 1))
       (when (> tries 50) (return 0))
-      (let ((msg (receive)))
+      (let ((msg (ssh-wait-data ssh)))
         (when (zerop msg) (return 0)))
       (let ((blen (mem-ref (+ ssh #x6D4) :u32)))
         (when (> blen 8)
@@ -659,9 +659,9 @@
                               (setf (mem-ref (+ ssh #x04) :u32)
                                     (+ (mem-ref (+ ssh #x04) :u32) 1))
                               (setq result parsed)))
-                          (let ((msg (receive)))
+                          (let ((msg (ssh-wait-data ssh)))
                             (when (zerop msg) (return 0))))))
-                  (let ((msg (receive)))
+                  (let ((msg (ssh-wait-data ssh)))
                     (when (zerop msg) (return 0)))))
             (setq tries (+ tries 1))))
         (let ((tries 0) (result ()))
@@ -677,9 +677,9 @@
                             (ssh-buf-consume ssh
                              (- blen (mem-ref (+ cb #x16F8) :u32)))
                             (setq result dec))
-                          (let ((msg (receive)))
+                          (let ((msg (ssh-wait-data ssh)))
                             (when (zerop msg) (return 0))))))
-                  (let ((msg (receive)))
+                  (let ((msg (ssh-wait-data ssh)))
                     (when (zerop msg) (return 0)))))
             (setq tries (+ tries 1)))))))
 

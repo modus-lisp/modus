@@ -1849,48 +1849,53 @@
               ;; native bytes into AND then EXECUTE.  Identical shape to
               ;; %MMAP-SHARED-PAGE (#x0504) except rdx=7 (RWX) and
               ;; r10=0x22 (MAP_PRIVATE|MAP_ANONYMOUS).
-              (let ((%arena-fallback (make-label)) (%arena-done (make-label)))
-              ;; SAVE-AND-DIE: with the boot stub's fixed RWX arena mapped, its
-              ;; RAW bump word at 0x10000F58 is non-zero and the page comes from
-              ;; there -- the same address in every process, so a core carries
-              ;; JIT code verbatim (lib/save-image.lisp).  LOCK XADD: workers JIT
-              ;; too.  Bump word 0 (no arena) keeps the mmap(NULL) path below.
-              (emit-bytes buf #x48 #x8B #x04 #x25) (emit-u32 buf #x10000F58) ; mov rax, [bump]
-              (emit-bytes buf #x48 #x85 #xC0)          ; test rax, rax
-              (emit-jcc buf :e %arena-fallback)
-              (emit-bytes buf #x51)                    ; push rcx (V5)
-              (emit-bytes buf #x48 #x89 #xF1)          ; mov rcx, rsi
-              (emit-bytes buf #x48 #xD1 #xF9)          ; sar rcx, 1 (untag size)
-              (emit-bytes buf #x48 #x81 #xC1) (emit-u32 buf #xFFF)      ; add rcx, 4095
-              (emit-bytes buf #x48 #x81 #xE1) (emit-u32 buf #xFFFFF000) ; and rcx, -4096
-              (emit-bytes buf #xF0 #x48 #x0F #xC1 #x0C #x25) (emit-u32 buf #x10000F58) ; lock xadd [bump], rcx
-              (emit-bytes buf #x48 #x8D #x34 #x09)     ; lea rsi, [rcx+rcx] (tagged old bump)
-              (emit-bytes buf #x59)                    ; pop rcx
-              (emit-jmp buf %arena-done)
-              (emit-label buf %arena-fallback)
               (emit-bytes buf #x57)              ; push rdi
               (emit-bytes buf #x52)              ; push rdx
               (emit-bytes buf #x41 #x50)         ; push r8
               (emit-bytes buf #x41 #x51)         ; push r9
               (emit-bytes buf #x41 #x52)         ; push r10
               (emit-bytes buf #x41 #x53)         ; push r11
-              (emit-bytes buf #xB8 #x09 #x00 #x00 #x00) ; mov eax, 9 (SYS_mmap)
-              (emit-bytes buf #x48 #x31 #xFF)    ; xor rdi, rdi (addr = NULL)
-              (emit-bytes buf #x48 #xD1 #xFE)    ; sar rsi, 1 (untag size)
-              (emit-bytes buf #xBA #x07 #x00 #x00 #x00) ; mov edx, 7 (PROT_RWX)
-              (emit-bytes buf #x41 #xBA #x22 #x00 #x00 #x00) ; mov r10d, 0x22 (PRIV|ANON)
-              (emit-bytes buf #x49 #xC7 #xC0 #xFF #xFF #xFF #xFF) ; mov r8, -1 (fd)
-              (emit-bytes buf #x4D #x31 #xC9)    ; xor r9, r9 (offset)
-              (emit-syscall-saving-rcx-r11 buf)     ; syscall (RCX/R11 preserved)
-              (emit-bytes buf #x48 #x01 #xC0)    ; add rax, rax (tag result)
-              (emit-bytes buf #x48 #x89 #xC6)    ; mov rsi, rax → V0
+              ;; SAVE-AND-DIE (lib/save-image.lisp): when the boot stub mapped the
+              ;; fixed RWX JIT arena, the bump word at 0x10000FB8 holds its base
+              ;; (raw) and pages are bump-allocated from it, 16-aligned, so every
+              ;; process puts its JIT pages at the same addresses and a snapshot
+              ;; carries [arena, bump) verbatim -- the aarch64 arm's shape.  Bump
+              ;; word 0 (no arena, or a bare image) is the mmap(NULL) path below.
+              (let ((fallback (make-label)) (done (make-label)))
+                (when (and *x64-linux-mode*
+                           (not (equal (sb-ext:posix-getenv "MODUS_X64_ARENA_TRAP") "0")))  ; A/B knob
+                  (emit-mov-reg-imm buf 'rax #x10000FB8)
+                  (emit-mov-reg-mem buf 'rax 'rax 0)             ; rax = bump (raw)
+                  (emit-cmp-reg-imm buf 'rax 0)
+                  (emit-jcc buf :e fallback)
+                  ;; LOCK XADD, not load+store: worker threads JIT too, and two
+                  ;; of them bumping at once must not be handed the same page.
+                  (emit-mov-reg-reg buf 'rdx 'rsi)               ; rdx = tagged size
+                  (emit-bytes buf #x48 #xD1 #xFA)                ; sar rdx, 1
+                  (emit-bytes buf #x48 #x83 #xC2 #x0F)           ; add rdx, 15
+                  (emit-bytes buf #x48 #x83 #xE2 #xF0)           ; and rdx, -16
+                  (emit-bytes buf #xF0 #x48 #x0F #xC1 #x14 #x25) ; lock xadd [abs32], rdx
+                  (emit-u32 buf #x10000FB8)                      ;   rdx = old bump
+                  (emit-bytes buf #x48 #x8D #x34 #x12)           ; lea rsi, [rdx+rdx]  (tagged page)
+                  (emit-jmp buf done))
+                (emit-label buf fallback)
+                (emit-bytes buf #xB8 #x09 #x00 #x00 #x00) ; mov eax, 9 (SYS_mmap)
+                (emit-bytes buf #x48 #x31 #xFF)    ; xor rdi, rdi (addr = NULL)
+                (emit-bytes buf #x48 #xD1 #xFE)    ; sar rsi, 1 (untag size)
+                (emit-bytes buf #xBA #x07 #x00 #x00 #x00) ; mov edx, 7 (PROT_RWX)
+                (emit-bytes buf #x41 #xBA #x22 #x00 #x00 #x00) ; mov r10d, 0x22 (PRIV|ANON)
+                (emit-bytes buf #x49 #xC7 #xC0 #xFF #xFF #xFF #xFF) ; mov r8, -1 (fd)
+                (emit-bytes buf #x4D #x31 #xC9)    ; xor r9, r9 (offset)
+                (emit-syscall-saving-rcx-r11 buf)     ; syscall (RCX/R11 preserved)
+                (emit-bytes buf #x48 #x01 #xC0)    ; add rax, rax (tag result)
+                (emit-bytes buf #x48 #x89 #xC6)    ; mov rsi, rax → V0
+                (emit-label buf done))
               (emit-bytes buf #x41 #x5B)         ; pop r11
               (emit-bytes buf #x41 #x5A)         ; pop r10
               (emit-bytes buf #x41 #x59)         ; pop r9
               (emit-bytes buf #x41 #x58)         ; pop r8
               (emit-bytes buf #x5A)              ; pop rdx
-              (emit-bytes buf #x5F)              ; pop rdi
-              (emit-label buf %arena-done)))
+              (emit-bytes buf #x5F))             ; pop rdi
              ((= code #x0540)
               ;; %SPAWN-THREAD — clone(2) A NATIVE OS THREAD.
               ;;   V0(RSI) = entry address (tagged fixnum, raw byte address of a

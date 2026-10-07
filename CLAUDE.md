@@ -3486,6 +3486,30 @@ scan for the first difference WIDER than 8 bytes and disassemble both sides ther
 
 ### AWS NITRO ENCLAVES — the hosted route (2026-10-06, docs/nitro-enclaves.md)
 
+**RAN FOR REAL 2026-10-07 — VERDICT PASS** on an m5.xlarge in us-east-2, non-debug
+enclave: alexandria from the measured ramdisk, `(alexandria:iota 3)` over vsock,
+and an NSM attestation document that `verify-attestation.py` passes on chain,
+signature, **PCR0/1/2 = the EIF's offline PCRs**, nonce and user_data
+(`test/nitro/records/`).  Four enclave-only lessons, in docs/nitro-enclaves.md
+"The first real run": the app ramdisk needs `rootfs/` (+dev proc sys run tmp)
+with `cmd`/`env` at its root; `/cmd` is one argv entry per line; the NSM
+response iovec must offer 0x3000 or the device answers with length 0; the
+document payload is an indefinite-length CBOR map.  `test/nitro/aws-launch.sh`
+launches the host (`ON_DEMAND=1`; spot was reclaimed mid-install).
+**AND SSH INTO IT IS ATTESTED (same day):** `net/hosted-ssh.lisp` runs
+net/ssh.lisp over a Linux stream (TCP or vsock; fresh getrandom host key),
+the EIF serves `(ssh-serve-vsock 22)`, `test/nitro/vsock-proxy.py` bridges the
+parent, and `test/nitro/attested-ssh-client.sh` PASSES against the real
+enclave: handshake key == attested key, PCR0/1/2 == the EIF's.  Bare builds
+unchanged except ssh.lisp's wait is the `SSH-WAIT-DATA` seam (UEFI SSH PASS).
+**AND THE ENCLAVE BOOTS FROM A SAVED CORE IN 2.7 s** (same day): save-and-die
+ported to hosted x64 (fixed heap `0x2000000000`, JIT arena `0x3000000000`, bump
+word `0x10000FB8`; four arch slots in lib/save-image-x64.lisp — metadata
+scale, alloc-start 0x400, cons-bitmap delta).  **`*X64-NATIVE-CODE-OFFSET*`
+IS COMPUTED FROM THE STUB NOW** (`linux-x64-native-code-offset`, 695): it was
+pinned at 397 in six scripts and a grown stub under the pin SIGSEGVs at boot
+with RIP = RSP = 0.  Never pin it again.
+
 `kiln image nitro --with=…` builds `modus.eif` from AWS's boot blobs + the hosted
 static ELF + deterministic cpio ramdisks (no Docker, no nitro-cli; PCRs identical
 across builds).  In the image: `lib/cbor.lisp` (RFC 8949 subset, byte-identical

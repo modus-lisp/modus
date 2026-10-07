@@ -139,9 +139,10 @@
 (defun %core-space-size () (%gc-read64 #x10000050))
 (defun %core-page-base () (%gc-read64 #x10000E00))
 (defun %core-bitmap-base () (%gc-read64 #x10000E18))
-;; No config word for the cons-kind bitmap on x64: translate-x64 derives it as
-;; the object-start bitmap + +mcgc-kindbitmap-delta+.
-(defun %core-cons-bitmap-base () (+ (%gc-read64 #x10000E18) #xFE4000))
+;; %CORE-CONS-BITMAP-BASE is lib/save-image-x64.lisp's: it uses the HOST's
+;; *mcgc-kindbitmap-delta* (baked as %CORE-KINDBITMAP-DELTA), which follows the
+;; MODUS_X64_MIDPOINT layout knob; a hard-coded #xFE4000 here would win by
+;; last-defun-wins (this source is baked after it) and be wrong on a moved layout.
 ;; +linux-x64-heap-alloc-start+.
 (defun %core-heap-base (from) (- from #x400))
 ;; The shared sequence, with x64's JIT constant-vector root (0x10000F00,
@@ -188,7 +189,7 @@
 ;; misaligned call returns immediately, leaving the caller's RAX
 ;; intact (silently looks like the fn returned T or whatever else
 ;; was in RAX).  See reference_append_funcall_bug.md.
-(setf modus.mvm.x64::*x64-native-code-offset* 541)
+(setf modus.mvm.x64::*x64-native-code-offset* (modus.mvm::linux-x64-native-code-offset))  ; computed from the stub, see boot-linux-x64.lisp
 
 ;; NATIVE THREADS, STEP 1: the hosted actor scheduler gets a REAL spinlock.
 ;; net/actors.lisp hands the lock's RELEASE to RESTORE-CONTEXT; with this set,

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """verify-attestation.py -- check a Nitro attestation document (COSE_Sign1) off-box.
 
-  verify-attestation.py DOC.cose [--root ROOT.pem] [--pcr0 HEX] [--pcr1 HEX] [--pcr2 HEX]
+  verify-attestation.py DOC.cose [--root ROOT.pem] [--pcr0 HEX] [--pcr1 HEX] [--pcr2 HEX] [--pcr8 HEX | --signing-cert PEM]
                         [--nonce HEX] [--user-data HEX | --hostkey-b64 BLOB | --hostkey-hex HEX]
 
 Checks, each printed, any failure fatal:
@@ -48,7 +48,17 @@ def main():
     r, s = int.from_bytes(sig[:48], "big"), int.from_bytes(sig[48:], "big")
     try: leaf.public_key().verify(encode_dss_signature(r, s), sig_structure, ec.ECDSA(hashes.SHA384())); print("signature: valid")
     except Exception as e: print("signature: INVALID", e); ok = False
-    for i in (0, 1, 2):
+    # PCR8 = the signing certificate: SHA-384(48 zero bytes || SHA-384(cert DER))
+    # (aws-nitro-enclaves-image-format, EifHasher's TPM-style extend).  Given the
+    # CERTIFICATE the verifier computes it itself -- no number to copy and get
+    # wrong -- and an unsigned or differently-signed image fails here.
+    if "--signing-cert" in opts:
+        from cryptography import x509 as _x
+        sc = _x.load_pem_x509_certificate(open(opts["--signing-cert"], "rb").read())
+        der = sc.public_bytes(Encoding.DER)
+        opts["--pcr8"] = hashlib.sha384(b"\0" * 48 + hashlib.sha384(der).digest()).hexdigest()
+        print("signing cert:", sc.subject.rfc4514_string(), "-> PCR8", opts["--pcr8"][:16] + "..")
+    for i in (0, 1, 2, 8):
         if f"--pcr{i}" in opts:
             want = bytes.fromhex(opts[f"--pcr{i}"]); print(f"PCR{i} matches:", p["pcrs"][i] == want); ok &= p["pcrs"][i] == want
     if "--nonce" in opts:

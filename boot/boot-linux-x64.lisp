@@ -12,15 +12,20 @@
 
 (defconstant +linux-x64-load-addr+ #x400000)    ; Traditional Linux x64 load address
 (defconstant +linux-x64-heap-addr+ #x10000000)  ; Heap start (same as bare-metal)
-;; SAVE-AND-DIE (lib/save-image.lisp, docs/save-and-die.md): a core is restored
-;; into the SAME addresses it was saved from, so the heap and the JIT's code
-;; pages must land at fixed addresses in every process.  The stub asks for both
-;; with MAP_FIXED_NOREPLACE (same bases as hosted aarch64); a refusal falls back
-;; to the old placement, and --core then refuses honestly ("heap base differs").
+;;; SAVE-AND-DIE (lib/save-image.lisp, docs/save-and-die.md): the heap and the
+;;; JIT exec arena are asked for at FIXED addresses with MAP_FIXED_NOREPLACE,
+;;; so a snapshot restores with no relocation -- the same two mappings the
+;;; hosted AArch64 CLI has (boot-linux-aarch64.lisp).  If the kernel refuses
+;;; the heap address the stub falls back to the historical hint mmap and a
+;;; later --core refuses with "heap base differs"; if it refuses the arena the
+;;; bump word stays 0 and the %mmap-exec-page trap falls back to mmap(NULL).
+;;; The bump word is 0x10000FB8: in the window span save-image stages (it is
+;;; per-process and set explicitly on restore), claimed by nothing on x64
+;;; (the aarch64 word, 0x10000F58, is inside x64's per-region cell table).
 (defconstant +linux-x64-fixed-heap-base+ #x2000000000)
-(defconstant +linux-x64-jit-arena-base+ #x3000000000)
-(defconstant +linux-x64-jit-arena-size+ #x40000000)   ; 1 GB of VA, MAP_NORESERVE
-(defconstant +linux-x64-jit-bump-word+ #x10000F58)    ; RAW bump pointer; 0 = no arena
+(defconstant +linux-x64-jit-arena-base+  #x3000000000)
+(defconstant +linux-x64-jit-arena-size+  #x20000000)    ; 512 MB of VA, MAP_NORESERVE
+(defconstant +linux-x64-jit-bump-slot+   #x10000FB8)
 ;; The two Cheney semispaces are [0x200, midpoint) and [midpoint, midpoint+space_size).
 ;; The SECOND semispace's from_end = midpoint + space_size ≈ 2*midpoint ≈ 0x37FFFE00.
 ;; The mmap'd region MUST extend past that by a guard band, because the gc-check
@@ -395,64 +400,52 @@
   (emit-bytes buf #xB9 #x3F #x00 #x00 #x00)      ; mov ecx, 63
   (emit-bytes buf #xF3 #xA4)                     ; rep movsb  — 20 bytes
 
-  ;; JIT EXEC ARENA (save-and-die): one fixed RWX mapping the #x0531 trap
-  ;; bump-allocates JIT pages from, so they sit at the same addresses in every
-  ;; process and a core can carry them.  Only if the kernel put it exactly at
-  ;; the base does the bump word get set; otherwise it stays 0 and the trap
-  ;; keeps its old mmap(NULL) path.  Before the heap mmap: RAX is the heap base
-  ;; from there on.
-  (emit-bytes buf #x48 #xBF)                     ; movabs rdi, arena base
-  (emit-le64 buf +linux-x64-jit-arena-base+)
-  (emit-bytes buf #x48 #xC7 #xC6)                ; mov rsi, imm32 (size)
-  (emit-le32 buf +linux-x64-jit-arena-size+)
-  (emit-bytes buf #x48 #xC7 #xC2 #x07 #x00 #x00 #x00) ; mov rdx, 7 (PROT_RWX)
-  (emit-bytes buf #x49 #xC7 #xC2)                ; mov r10, PRIV|ANON|NORESERVE|FIXED_NOREPLACE
-  (emit-le32 buf #x104022)
-  (emit-bytes buf #x49 #xC7 #xC0 #xFF #xFF #xFF #xFF)   ; mov r8, -1
-  (emit-bytes buf #x49 #xC7 #xC1 #x00 #x00 #x00 #x00) ; mov r9, 0
-  (emit-bytes buf #x48 #xC7 #xC0 #x09 #x00 #x00 #x00) ; mov rax, 9 (SYS_mmap)
-  (emit-bytes buf #x0F #x05)                      ; syscall
-  (emit-bytes buf #x48 #xB9)                     ; movabs rcx, arena base
-  (emit-le64 buf +linux-x64-jit-arena-base+)
-  (emit-bytes buf #x48 #x39 #xC8)                ; cmp rax, rcx
-  (emit-bytes buf #x75 #x08)                     ; jne +8 (not ours: no arena)
-  (emit-bytes buf #x48 #x89 #x04 #x25)           ; mov [abs32], rax  (bump = base)
-  (emit-le32 buf +linux-x64-jit-bump-word+)
-  ;; PAD: the arena block (77 bytes) and the fixed-heap block below (62) grow
-  ;; the preamble by 139; five NOPs make it 144 = 9*16, so the fn-entry
-  ;; alignment, which only looks at *x64-native-code-offset* mod 16, is
-  ;; unchanged.  The offsets in build-generic-cli / build-x64-linux are bumped
-  ;; by 144 to stay exact.
-  (emit-bytes buf #x90 #x90 #x90 #x90 #x90)
-
-  ;; mmap heap AT THE FIXED BASE (MAP_FIXED_NOREPLACE): rax=9, rdi=addr,
-  ;; rsi=size, rdx=prot, r10=flags, r8=fd, r9=off.  On an error return (a
-  ;; collision, or a kernel without the flag) fall through to the historical
-  ;; hinted mapping below; a kernel that IGNORES the flag returns some other
-  ;; address, which is a valid heap that merely cannot restore a core.
-  (emit-bytes buf #x48 #xBF)                     ; movabs rdi, fixed heap base
-  (emit-le64 buf +linux-x64-fixed-heap-base+)
-  (emit-bytes buf #x48 #xC7 #xC6)                ; mov rsi, imm32
-  (emit-le32 buf +linux-x64-heap-size+)
-  (emit-bytes buf #x48 #xC7 #xC2 #x03 #x00 #x00 #x00) ; mov rdx, 3 (PROT_RW)
-  (emit-bytes buf #x49 #xC7 #xC2)                ; mov r10, PRIV|ANON|FIXED_NOREPLACE
-  (emit-le32 buf #x100022)
-  (emit-bytes buf #x49 #xC7 #xC0 #xFF #xFF #xFF #xFF)   ; mov r8, -1
-  (emit-bytes buf #x49 #xC7 #xC1 #x00 #x00 #x00 #x00) ; mov r9, 0
-  (emit-bytes buf #x48 #xC7 #xC0 #x09 #x00 #x00 #x00) ; mov rax, 9 (SYS_mmap)
-  (emit-bytes buf #x0F #x05)                      ; syscall
-  (emit-bytes buf #x48 #x3D #x00 #xF0 #xFF #xFF) ; cmp rax, -4096
-  (emit-bytes buf #x72 #x33)                     ; jb +51 (success: skip the fallback)
-  ;; fallback: the historical hinted mapping (51 bytes)
-  (emit-bytes buf #x48 #xC7 #xC7 #x00 #x00 #x00 #x10) ; mov rdi, 0x10000000
-  (emit-bytes buf #x48 #xC7 #xC6)                ; mov rsi, imm32
-  (emit-le32 buf +linux-x64-heap-size+)
-  (emit-bytes buf #x48 #xC7 #xC2 #x03 #x00 #x00 #x00) ; mov rdx, 3 (PROT_RW)
-  (emit-bytes buf #x49 #xC7 #xC2 #x22 #x00 #x00 #x00) ; mov r10, 0x22 (MAP_PRIV|MAP_ANON)
-  (emit-bytes buf #x49 #xC7 #xC0 #xFF #xFF #xFF #xFF)   ; mov r8, -1
-  (emit-bytes buf #x49 #xC7 #xC1 #x00 #x00 #x00 #x00) ; mov r9, 0
-  (emit-bytes buf #x48 #xC7 #xC0 #x09 #x00 #x00 #x00) ; mov rax, 9 (SYS_mmap)
-  (emit-bytes buf #x0F #x05)                      ; syscall
+  ;; mmap heap, FIRST at the fixed base with MAP_FIXED_NOREPLACE (0x100000):
+  ;; rax=9, rdi=addr, rsi=size, rdx=prot, r10=flags, r8=fd, r9=off.
+  (let ((hbase (modus.mvm::hosted-layout :heap-base +linux-x64-fixed-heap-base+))
+        (abase (modus.mvm::hosted-layout :jit-arena-base +linux-x64-jit-arena-base+)))
+    (emit-bytes buf #x48 #xBF) (emit-le64 buf hbase)      ; movabs rdi, fixed heap base
+    (emit-bytes buf #x48 #xC7 #xC6)                ; mov rsi, imm32
+    (emit-le32 buf +linux-x64-heap-size+)
+    (emit-bytes buf #x48 #xC7 #xC2 #x03 #x00 #x00 #x00) ; mov rdx, 3 (PROT_RW)
+    (emit-bytes buf #x49 #xC7 #xC2 #x22 #x00 #x10 #x00) ; mov r10, 0x100022 (PRIV|ANON|FIXED_NOREPLACE)
+    (emit-bytes buf #x49 #xC7 #xC0 #xFF #xFF #xFF #xFF)   ; mov r8, -1
+    (emit-bytes buf #x49 #xC7 #xC1 #x00 #x00 #x00 #x00) ; mov r9, 0
+    (emit-bytes buf #x48 #xC7 #xC0 #x09 #x00 #x00 #x00) ; mov rax, 9 (SYS_mmap)
+    (emit-bytes buf #x0F #x05)                      ; syscall
+    (emit-bytes buf #x48 #xB9) (emit-le64 buf hbase)      ; movabs rcx, fixed heap base
+    (emit-bytes buf #x48 #x39 #xC8)                ; cmp rax, rcx
+    (emit-bytes buf #x74 #x33)                     ; je +51: got it, skip the fallback
+    ;; Fallback: the historical hint mmap (kernel picks the address; --core will refuse).
+    (emit-bytes buf #x48 #xC7 #xC7 #x00 #x00 #x00 #x10) ; mov rdi, 0x10000000
+    (emit-bytes buf #x48 #xC7 #xC6)                ; mov rsi, imm32
+    (emit-le32 buf +linux-x64-heap-size+)
+    (emit-bytes buf #x48 #xC7 #xC2 #x03 #x00 #x00 #x00) ; mov rdx, 3 (PROT_RW)
+    (emit-bytes buf #x49 #xC7 #xC2 #x22 #x00 #x00 #x00) ; mov r10, 0x22 (MAP_PRIV|MAP_ANON)
+    (emit-bytes buf #x49 #xC7 #xC0 #xFF #xFF #xFF #xFF)   ; mov r8, -1
+    (emit-bytes buf #x49 #xC7 #xC1 #x00 #x00 #x00 #x00) ; mov r9, 0
+    (emit-bytes buf #x48 #xC7 #xC0 #x09 #x00 #x00 #x00) ; mov rax, 9 (SYS_mmap)
+    (emit-bytes buf #x0F #x05)                      ; syscall  (51 bytes from the je)
+    ;; The JIT exec arena: one fixed RWX MAP_NORESERVE mapping; bump word =
+    ;; its base, or 0 if the kernel refused.  RAX (heap base) is parked in RBP,
+    ;; which nothing has used yet (kernel-main sets its own frame pointer).
+    (emit-bytes buf #x48 #x89 #xC5)                ; mov rbp, rax
+    (emit-bytes buf #x48 #xBF) (emit-le64 buf abase)      ; movabs rdi, arena base
+    (emit-bytes buf #x48 #xC7 #xC6)                ; mov rsi, imm32
+    (emit-le32 buf +linux-x64-jit-arena-size+)
+    (emit-bytes buf #x48 #xC7 #xC2 #x07 #x00 #x00 #x00) ; mov rdx, 7 (PROT_RWX)
+    (emit-bytes buf #x49 #xC7 #xC2 #x22 #x40 #x10 #x00) ; mov r10, 0x104022 (PRIV|ANON|NORESERVE|FIXED_NOREPLACE)
+    (emit-bytes buf #x49 #xC7 #xC0 #xFF #xFF #xFF #xFF)   ; mov r8, -1
+    (emit-bytes buf #x49 #xC7 #xC1 #x00 #x00 #x00 #x00) ; mov r9, 0
+    (emit-bytes buf #x48 #xC7 #xC0 #x09 #x00 #x00 #x00) ; mov rax, 9 (SYS_mmap)
+    (emit-bytes buf #x0F #x05)                      ; syscall
+    (emit-bytes buf #x48 #xB9) (emit-le64 buf abase)      ; movabs rcx, arena base
+    (emit-bytes buf #x48 #x39 #xC8)                ; cmp rax, rcx
+    (emit-bytes buf #x74 #x02)                     ; je +2
+    (emit-bytes buf #x31 #xC0)                     ; xor eax, eax   (refused -> 0)
+    (emit-bytes buf #x48 #x89 #x04 #x25)           ; mov [abs32], rax
+    (emit-le32 buf +linux-x64-jit-bump-slot+)
+    (emit-bytes buf #x48 #x89 #xE8))               ; mov rax, rbp  (heap base back)
 
   ;; Store argc/argv to globals area at heap base (mmap result in RAX)
   ;; argc at [rax+0], argv[0] at [rax+0x10], argv[1] at [rax+0x18], argv[2] at [rax+0x20]
@@ -559,6 +552,24 @@
 
 (defun emit-bytes (buf &rest bytes)
   (dolist (b bytes) (mvm-emit-byte buf b)))
+
+;;; WHERE NATIVE CODE STARTS in a linux-x64 image: ELF header + program header
+;;; (64 + 56), the entry stub above, and the 5-byte JMP cross.lisp emits after
+;;; it.  COMPUTED FROM THE STUB, never pinned: translate-x64 keeps every
+;;; function's address clear of nibble 1 (the closure tag CALL-IND tests) using
+;;; this number, so a stub that grows under a pinned value moves every function
+;;; to the wrong nibble -- measured 2026-10-07: the fixed-heap + JIT-arena stub
+;;; (570 bytes) under the old pinned 397 (a 272-byte stub) was a SIGSEGV at boot
+;;; in every variant, with RIP = RSP = 0 after an unwind onto an empty handler
+;;; frame.  Six build scripts set *X64-NATIVE-CODE-OFFSET* from this.
+(defun linux-x64-native-code-offset-for (entry-fn)
+  "The offset for an image whose boot descriptor uses ENTRY-FN as its stub
+   (the ANSI runner wraps the stub with a NIL page and the code-bounds init)."
+  (let ((buf (make-mvm-buffer)))
+    (funcall entry-fn buf)
+    (+ 64 56 (length (mvm-buffer-used-bytes buf)) 5)))
+(defun linux-x64-native-code-offset ()
+  (linux-x64-native-code-offset-for #'emit-linux-x64-entry))
 
 (defun emit-le32 (buf val)
   (mvm-emit-byte buf (logand val #xFF))

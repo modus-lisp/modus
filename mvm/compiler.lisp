@@ -18349,7 +18349,7 @@
                      (declare (special *arith-trust*))
                      (emit-arith-pair :add-checked "GENERIC-ADD" dest temp))
                    (free-temp-reg)))
-             (setq lw (and trust (caddr trust)))))))))))
+             (setq lw (%arith-chain-width trust))))))))))
 
 (defun %first-operand-reg (form env dest)
   "The register of a promoted local FORM when the pairwise emitter may read
@@ -18412,7 +18412,7 @@
                            (declare (special *arith-trust*))
                            (emit-arith-pair :sub-checked "GENERIC-SUBTRACT" dest temp))
                          (free-temp-reg)))
-                   (setq lw (and trust (caddr trust))))))))))))
+                   (setq lw (%arith-chain-width trust)))))))))))
 
 (defun compile-mul (args env dest)
   "Compile (* args...).  Uses emit-arith-pair so non-fixnum operands
@@ -18458,7 +18458,7 @@
                            (declare (special *arith-trust*))
                            (emit-arith-pair :mul-checked "GENERIC-MULTIPLY" dest temp))
                          (free-temp-reg)))
-                   (setq lw (and trust (caddr trust))))))))))))
+                   (setq lw (%arith-chain-width trust)))))))))))
 
 (defconstant +apply-spread-max+ 120
   "CALL-ARGUMENTS-LIMIT as every call shape honours it.  %APPLY-SPREAD's
@@ -21681,6 +21681,16 @@
          ((string= op "THE")
           (and (consp args) (consp (cdr args)) (%decl-int-width (car args))))
          (t nil))))))
+
+(defun %arith-chain-width (trust)
+  "The width an n-ary + - * chain carries into its NEXT step: the result width
+   of the step just compiled, but ONLY when that result is known to fit a
+   fixnum.  A product or sum that can overflow may be a BIGNUM at run time, so
+   the next step must not be told its left operand is a fixnum -- doing so let
+   (* d d c) on fixnum-declared D and C skip the tag test and multiply d*d's
+   bignum POINTER (MISC.89A; the interpreter is generic and hid it, the x64
+   JIT did not)."
+  (and trust (cadr trust) (caddr trust)))
 
 (defun %arith-trust-for (w1 w2 op)
   "*arith-trust* value for a pair with operand widths W1 W2 under OP

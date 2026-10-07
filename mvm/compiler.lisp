@@ -10848,7 +10848,7 @@
           (t nil))))
 
 (defparameter *fp-scope-transparent-ops*
-  '("PROGN" "IF" "WHEN" "UNLESS" "AND" "OR" "BLOCK" "RETURN-FROM" "RETURN"
+  '("PROGN" "IF" "WHEN" "UNLESS" "AND" "OR" "BLOCK" "%%FLET-SELF" "RETURN-FROM" "RETURN"
     "TAGBODY" "GO" "THE" "LOCALLY" "DECLARE" "NOT" "NULL"))
 (defparameter *fp-scope-fixnum-ops*
   '("+" "-" "*" "1+" "1-" "<" ">" "<=" ">=" "=" "/=" "LOGAND" "LOGIOR" "ASH"
@@ -16614,6 +16614,16 @@
           ;; dynamic path, which the heuristic already accepts.
           ((= hash #.(compute-name-hash "BLOCK"))
            (tail-form-is-values-p (cddr form)))
+          ;; (%%FLET-SELF name . body) -- a local function's implicit block
+          ;; marker, (op name . body) like BLOCK.  Opaque, it read as an
+          ;; unknown operator and the epilogue declined to clamp, so a
+          ;; ROUND in an &optional default leaked its count of 2 past a
+          ;; literal tail: (flet ((g (&optional (x (round a))) -284)) (g))
+          ;; => -284, 0 (upstream MISC.190).  Its body's tail decides, and a
+          ;; self RETURN-FROM carrying values counts too.
+          ((= hash #.(compute-name-hash "%%FLET-SELF"))
+           (or (tail-form-is-values-p (cddr form))
+               (loop-body-has-mv-return-p (cdr form))))
           ;; if — check both branches
           ((= hash 463569520)     ; IF
            (or (and (caddr form) (tail-form-is-values-p (list (caddr form))))
@@ -16775,7 +16785,8 @@
               form))
          ((string= op "PROGN")
           (if (cdr form) (cons (car form) (%mv-clamp-body (cdr form))) form))
-         ((or (string= op "LET") (string= op "LET*") (string= op "BLOCK"))
+         ((or (string= op "LET") (string= op "LET*") (string= op "BLOCK")
+              (string= op "%%FLET-SELF"))
           (if (cddr form)
               (cons (car form) (cons (cadr form) (%mv-clamp-body (cddr form))))
               form))

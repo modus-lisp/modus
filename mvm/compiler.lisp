@@ -12813,7 +12813,30 @@
                       (t (return))))
               (list* name (cadr def)
                      (append (nreverse head)
-                             (list (list* '%%flet-self bname body)))))))))
+                             (list (list* (if (%flet-self-return-crosses-p body bname nil)
+                                              'block
+                                              '%%flet-self)
+                                          bname body)))))))))
+
+(defun %flet-self-return-crosses-p (tree name inside)
+  "True when TREE has (RETURN-FROM NAME ...) -- NAME by EQ -- inside a nested
+   LAMBDA, FLET or LABELS (INSIDE true), i.e. in another compilation unit.
+   %%FLET-SELF resolves a self-return only in the function's OWN unit; from a
+   nested unit (MISC.280: (return-from %f12 5) in an inner function's
+   &optional default) it needs a real BLOCK, whose cross-unit catch frame the
+   escape walker installs.  EQ, not the name: in the ANSI gate runner a local
+   function's name can read back empty, and a name match wrapped bodies that
+   only return to an OUTER block (MISC.14/36/176)."
+  (and (consp tree)
+       (let ((op (car tree)))
+         (cond ((and inside (symbolp op) op (= (normalize-name op) 164933334)   ; RETURN-FROM
+                     (consp (cdr tree)) (eq (cadr tree) name))
+                t)
+               ((and (symbolp op) op
+                     (member (normalize-name op) (list 80380232 445617652 417505106))) ; LAMBDA FLET LABELS
+                (%flet-self-return-crosses-p (cdr tree) name t))
+               (t (or (%flet-self-return-crosses-p op name inside)
+                      (%flet-self-return-crosses-p (cdr tree) name inside)))))))
 
 (defun compile-flet (defs body env dest &optional labels-p)
   "Compile (flet ((name (params) body) ...) body).

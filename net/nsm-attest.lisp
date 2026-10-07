@@ -16,9 +16,16 @@
 ;;;; SHA-512 of the thing being bound (a host key), nonce comes from the verifier.
 
 (defconstant +nsm-ioctl+ #xC0200A00)
-(defconstant +nsm-page-bytes+ 16384)       ; request + response: documents are ~4-5 KB
+(defconstant +nsm-page-bytes+ 24576)       ; request + message + a FULL-capacity response
+(defconstant +nsm-response-max+ #x3000)    ; NSM_RESPONSE_MAX_SIZE, the driver's own response buffer
 
-(defvar *nsm-page* 0 "One mapping: request CBOR at +0, NsmMessage at +4096, response at +8192.")
+;;; THE RESPONSE IOVEC MUST OFFER THE DRIVER'S WHOLE CAPACITY.  Measured on a
+;;; real enclave (i-0a9ec385a1bab53c4, 2026-10-07): with response.len 100, 1024,
+;;; 4096 or 8192 the ioctl returns 0, writes nothing, and hands back len 0 --
+;;; indistinguishable from an empty reply; with 0x3000 the same DescribeNSM is
+;;; answered in 164 bytes.  So the page is 24 KB and the response gets 12 KB.
+
+(defvar *nsm-page* 0 "One mapping: request CBOR at +0, NsmMessage at +4096, response at +8192 (12 KB).")
 (defvar *nsm-last-status* nil)
 
 (defun %nsm-page ()
@@ -53,7 +60,7 @@
         (let* ((pg (%nsm-page)) (bytes (cbor-encode req)) (msg (+ pg 4096)) (resp (+ pg 8192)))
           (%nsm-bytes-in pg bytes)
           (%gc-write64 msg pg)              (%gc-write64 (+ msg 8) (length bytes))
-          (%gc-write64 (+ msg 16) resp)     (%gc-write64 (+ msg 24) (- +nsm-page-bytes+ 8192))
+          (%gc-write64 (+ msg 16) resp)     (%gc-write64 (+ msg 24) +nsm-response-max+)
           (let ((r (%nsm-ioctl fd msg)))
             (%nsm-close fd)
             (if (< r 0)

@@ -15,15 +15,31 @@
 //   1003 PRESENT            show the buffer.  No reply.
 //   1004 NEXT-EVENT         reply u64: the oldest touch, type<<40 | y<<20 | x,
 //                           type 1 down / 2 move / 3 up; 0 when there is none
+// and the three more kiln's app uses (kiln boot/ios.lisp), whose data follows
+// the record on the socket — modus sends it with one write(2) straight from
+// the Lisp vector, since this process cannot read the child's memory:
+//   1005 BLIT  wh xy nbytes      a glass framebuffer's pixels, w*h of them,
+//                                drawn at (x, y), clipped
+//   1010 AUDIO-OPEN rate         reply 0 when a speaker is open (mono s16)
+//   1011 AUDIO-WRITE n           n samples follow; queued for the speaker
+// Both payloads are the Lisp vector's storage as it is: one TAGGED 64-bit word
+// per element (value << 1), even for an (unsigned-byte 32) or (signed-byte 16)
+// vector, so a pixel is word >> 1 (0xRRGGBB) and a sample is (int64)word >> 1.
+//   1012 AUDIO-QUEUED            reply: samples queued and not yet played
 // A socket rather than a shared-memory ring: every record is a syscall, which
 // orders memory on a weakly-ordered CPU without a barrier primitive in Lisp.
 // Filling is native, so the (interpreted) Lisp only decides WHAT to draw.
 //
-// The child's stdout and stderr go to logcat (tag "modus").  The script it runs
-// is named by the build (MODUS_SCRIPT) and written into the app's data dir on
-// first start, from the bytes embedded below.
+// WHAT RUNS.  An asset modus.args (one argument per line; "@NAME" is NAME in
+// the app's data dir), else the script embedded at build time (MODUS_SCRIPT).
+// Every other asset is extracted into the data dir on the first start of each
+// build (asset build.id), so a --core snapshot and a media folder are files.
+// The child's stdout and stderr go to logcat (tag "modus").
 
 #define _GNU_SOURCE
+#include <aaudio/AAudio.h>
+#include <android/asset_manager.h>
+#include <android/configuration.h>
 #include <android/log.h>
 #include <android/looper.h>
 #include <android/native_activity.h>
@@ -38,6 +54,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -57,6 +74,14 @@ static int dirty;                   // a PRESENT is pending
 #define NEV 1024
 static uint64_t events[NEV];
 static unsigned ev_head, ev_tail;   // ev_tail - ev_head = queued
+
+static int ui_scale = 1;            // density / 160
+
+// THE SPEAKER: a ring of s16 samples the AAudio callback drains.
+#define ARING (48000 * 4)
+static int16_t aring[ARING];
+static uint64_t a_in, a_out;        // a_in - a_out = queued
+static AAudioStream *astream;
 
 static pid_t child = -1;
 static int sock = -1;               // our end of the socketpair
@@ -87,6 +112,42 @@ static void present_locked(void) {
     ANativeWindow_unlockAndPost(win);
 }
 
+static void blit(uint32_t wh, uint32_t xy, const uint64_t *src) {
+    int w = wh & 0xFFFF, h = wh >> 16, x = xy & 0xFFFF, y = xy >> 16;
+    pthread_mutex_lock(&lk);
+    if (fb)
+        for (int r = 0; r < h && y + r < fb_h; r++)
+            for (int c = 0; c < w && x + c < fb_w; c++)
+                fb[(y + r) * fb_w + x + c] = to_px((uint32_t)(src[r * w + c] >> 1));
+    pthread_mutex_unlock(&lk);
+}
+
+static aaudio_data_callback_result_t audio_cb(AAudioStream *st, void *u, void *data, int32_t n) {
+    (void)st; (void)u;
+    int16_t *out = data;
+    pthread_mutex_lock(&lk);
+    for (int32_t i = 0; i < n; i++)
+        out[i] = a_out < a_in ? aring[a_out++ % ARING] : 0;   // late: silence
+    pthread_mutex_unlock(&lk);
+    return AAUDIO_CALLBACK_RESULT_CONTINUE;
+}
+
+static int audio_open(int rate) {
+    if (astream) return 0;
+    AAudioStreamBuilder *b;
+    if (AAudio_createStreamBuilder(&b) != AAUDIO_OK) return -1;
+    AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_I16);
+    AAudioStreamBuilder_setChannelCount(b, 1);
+    AAudioStreamBuilder_setSampleRate(b, rate);
+    AAudioStreamBuilder_setDataCallback(b, audio_cb, NULL);
+    aaudio_result_t r = AAudioStreamBuilder_openStream(b, &astream);
+    AAudioStreamBuilder_delete(b);
+    if (r != AAUDIO_OK) { LOGE("AAudio open: %s", AAudio_convertResultToText(r)); astream = NULL; return -1; }
+    AAudioStream_requestStart(astream);
+    LOGI("speaker at %d Hz", AAudioStream_getSampleRate(astream));
+    return 0;
+}
+
 static int read_full(int fd, void *p, size_t n) {
     for (size_t got = 0; got < n;) {
         ssize_t k = read(fd, (char *)p + got, n - got);
@@ -107,7 +168,7 @@ static void *serve(void *arg) {
         case 1001:
             pthread_mutex_lock(&lk);
             while (!fb) pthread_cond_wait(&ready_cv, &lk);   // like iOS: wait for the view
-            reply = rec[1] == 0 ? (uint64_t)fb_w : rec[1] == 1 ? (uint64_t)fb_h : 1;
+            reply = rec[1] == 0 ? (uint64_t)fb_w : rec[1] == 1 ? (uint64_t)fb_h : (uint64_t)ui_scale;
             pthread_mutex_unlock(&lk);
             write(sock, &reply, 8);
             break;
@@ -121,12 +182,38 @@ static void *serve(void *arg) {
             pthread_mutex_unlock(&lk);
             write(sock, &reply, 8);
             break;
+        case 1005: {
+            uint64_t *px = malloc(rec[3] ? rec[3] : 1);
+            if (!px || read_full(sock, px, rec[3])) { free(px); goto done; }
+            if ((uint64_t)(rec[1] & 0xFFFF) * (rec[1] >> 16) * 8 <= rec[3]) blit(rec[1], rec[2], px);
+            free(px);
+            break;
+        }
+        case 1010:
+            reply = (uint64_t)(int64_t)audio_open((int)rec[1]);
+            write(sock, &reply, 8);
+            break;
+        case 1011: {
+            size_t n = rec[1];
+            int64_t *w = malloc(n * 8 + 8);
+            if (!w || read_full(sock, w, n * 8)) { free(w); goto done; }
+            pthread_mutex_lock(&lk);
+            for (size_t i = 0; i < n && a_in - a_out < ARING; i++) aring[a_in++ % ARING] = (int16_t)(w[i] >> 1);
+            pthread_mutex_unlock(&lk);
+            free(w);
+            break;
+        }
+        case 1012:
+            pthread_mutex_lock(&lk); reply = a_in - a_out; pthread_mutex_unlock(&lk);
+            write(sock, &reply, 8);
+            break;
         default:
             LOGE("unknown request %u", rec[0]);
             reply = (uint64_t)-38;
             write(sock, &reply, 8);
         }
     }
+done:
     LOGI("modus closed the UI socket");
     return NULL;
 }
@@ -148,6 +235,48 @@ static void *pump(void *arg) {
     return NULL;
 }
 
+static char *asset_text(AAssetManager *am, const char *name) {
+    AAsset *a = AAssetManager_open(am, name, AASSET_MODE_BUFFER);
+    if (!a) return NULL;
+    off_t n = AAsset_getLength(a);
+    char *t = malloc(n + 1);
+    memcpy(t, AAsset_getBuffer(a), n); t[n] = 0;
+    AAsset_close(a);
+    return t;
+}
+
+static void mkdirs_for(char *path) {
+    for (char *p = strchr(path + 1, '/'); p; p = strchr(p + 1, '/')) {
+        *p = 0; mkdir(path, 0700); *p = '/';
+    }
+}
+
+// Copy every asset named in files.list into DATA, once per build (build.id).
+static void extract_assets(AAssetManager *am, const char *data) {
+    char *id = asset_text(am, "build.id"), *list = asset_text(am, "files.list");
+    if (!id || !list) { free(id); free(list); return; }
+    char stamp[600], *old = NULL;
+    snprintf(stamp, sizeof stamp, "%s/.build.id", data);
+    FILE *f = fopen(stamp, "rb");
+    if (f) { old = calloc(1, 256); fread(old, 1, 255, f); fclose(f); }
+    if (old && strcmp(old, id) == 0) { free(old); free(id); free(list); return; }
+    for (char *name = strtok(list, "\n"); name; name = strtok(NULL, "\n")) {
+        AAsset *a = AAssetManager_open(am, name, AASSET_MODE_STREAMING);
+        if (!a) { LOGE("asset %s missing", name); continue; }
+        char dst[800];
+        snprintf(dst, sizeof dst, "%s/%s", data, name);
+        mkdirs_for(dst);
+        FILE *o = fopen(dst, "wb");
+        char buf[65536]; int k;
+        while (o && (k = AAsset_read(a, buf, sizeof buf)) > 0) fwrite(buf, 1, k, o);
+        if (o) fclose(o);
+        AAsset_close(a);
+    }
+    if ((f = fopen(stamp, "wb"))) { fputs(id, f); fclose(f); }
+    LOGI("assets extracted for build %s", id);
+    free(old); free(id); free(list);
+}
+
 static void start_modus(ANativeActivity *act) {
     // The native-library directory is wherever this library was loaded from.
     Dl_info di;
@@ -162,6 +291,23 @@ static void start_modus(ANativeActivity *act) {
     FILE *f = fopen(script, "wb");
     if (!f) { LOGE("cannot write %s: %s", script, strerror(errno)); return; }
     fwrite(modus_script, 1, modus_script_len, f); fclose(f);
+    extract_assets(act->assetManager, act->internalDataPath);
+
+    // argv: modus.args if the build has one, else --script <embedded script>.
+    static char *argv[64];
+    int argc = 0;
+    argv[argc++] = "modus";
+    char *args = asset_text(act->assetManager, "modus.args");
+    if (args) {
+        for (char *a = strtok(args, "\n"); a && argc < 63; a = strtok(NULL, "\n")) {
+            if (*a == '@') {
+                char *p = malloc(strlen(act->internalDataPath) + strlen(a) + 2);
+                sprintf(p, "%s/%s", act->internalDataPath, a + 1);
+                argv[argc++] = p;
+            } else argv[argc++] = a;
+        }
+    } else { argv[argc++] = "--script"; argv[argc++] = script; }
+    argv[argc] = NULL;
 
     int sp[2], out[2];
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sp) || pipe2(out, O_CLOEXEC)) {
@@ -172,14 +318,14 @@ static void start_modus(ANativeActivity *act) {
         dup2(sp[1], 3); dup2(out[1], 1); dup2(out[1], 2);
         setenv("HOME", act->internalDataPath, 1);
         chdir(act->internalDataPath);
-        execl(image, "modus", "--script", script, (char *)NULL);
+        execv(image, argv);
         dprintf(2, "exec %s: %s\n", image, strerror(errno));
         _exit(127);
     }
     close(sp[1]); close(out[1]);
     if (child < 0) { LOGE("fork: %s", strerror(errno)); close(sp[0]); close(out[0]); return; }
     sock = sp[0];
-    LOGI("started modus pid %d: %s --script %s", child, image, script);
+    LOGI("started modus pid %d: %s (%d args)", child, image, argc);
     pthread_t t;
     pthread_create(&t, NULL, serve, NULL); pthread_detach(t);
     pthread_create(&t, NULL, pump, (void *)(intptr_t)out[0]); pthread_detach(t);
@@ -260,5 +406,10 @@ JNIEXPORT void ANativeActivity_onCreate(ANativeActivity *act, void *saved, size_
     act->callbacks->onInputQueueDestroyed = onInputQueueDestroyed;
     act->callbacks->onDestroy = onDestroy;
     signal(SIGPIPE, SIG_IGN);
+    AConfiguration *cfg = AConfiguration_new();
+    AConfiguration_fromAssetManager(cfg, act->assetManager);
+    int dpi = AConfiguration_getDensity(cfg);
+    AConfiguration_delete(cfg);
+    ui_scale = dpi >= 160 ? (dpi + 80) / 160 : 1;
     if (child < 0) start_modus(act);
 }

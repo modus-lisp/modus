@@ -7,6 +7,11 @@
 # protocol).  SCRIPT (default host/android/draw.lisp) is embedded and run with
 # --script.  Debug-signed with a key kept in $MODUS_ANDROID_KEYSTORE.
 #
+# MODUS_ANDROID_ASSETS=DIR packs DIR's files as assets, which the app extracts
+# into its data dir on the first start of each build.  A modus.args there (one
+# argument per line, "@NAME" for NAME in the data dir) replaces --script SCRIPT,
+# e.g. "--core / @kiln.core / --eval / (kiln-android-main)" (kiln android).
+#
 # Needs, all from Google's SDK repository, x86-64 Linux only:
 #   ANDROID_BUILD_TOOLS  a build-tools dir (aapt2, zipalign, apksigner)
 #   ANDROID_JAR          platforms/android-NN/android.jar (NN >= 30)
@@ -43,13 +48,22 @@ mkdir -p "$W/apk/lib/arm64-v8a"
 "$CLANG" --target=aarch64-linux-android$API --sysroot="$NDK_SYSROOT" -fuse-ld=lld \
   -O2 -fPIC -shared -nostdlib -Wall -I"$W" \
   -o "$W/apk/lib/arm64-v8a/libmodusapp.so" \
-  "$L/crtbegin_so.o" "$HERE/modus-launcher.c" -L"$L" -landroid -llog -ldl -lc "$L/crtend_so.o" \
+  "$L/crtbegin_so.o" "$HERE/modus-launcher.c" -L"$L" -landroid -laaudio -llog -ldl -lc "$L/crtend_so.o" \
   -Wl,-soname,libmodusapp.so -Wl,-z,max-page-size=16384
 cp "$IMAGE" "$W/apk/lib/arm64-v8a/libmodus.so"
 
-# Manifest -> binary XML, then the native libraries alongside it.
+# Assets: the caller's files, the list of them, and a build id (the stamp the
+# launcher compares before extracting them again).
+mkdir -p "$W/assets"
+if [ -n "${MODUS_ANDROID_ASSETS:-}" ]; then
+  cp -R "$MODUS_ANDROID_ASSETS"/. "$W/assets/"
+  (cd "$W/assets" && find . -type f ! -name modus.args ! -name files.list | sed 's|^\./||' | sort > files.list)
+  date -u +%Y%m%dT%H%M%SZ-$$ > "$W/assets/build.id"
+fi
+
+# Manifest -> binary XML (and the assets), then the native libraries alongside.
 "$ANDROID_BUILD_TOOLS/aapt2" link -o "$W/base.apk" --manifest "$HERE/AndroidManifest.xml" \
-  -I "$ANDROID_JAR" --min-sdk-version $API --target-sdk-version 36
+  -I "$ANDROID_JAR" --min-sdk-version $API --target-sdk-version 36 -A "$W/assets"
 python3 - "$W/base.apk" "$W/apk" <<'PY'
 import sys, os, zipfile
 z = zipfile.ZipFile(sys.argv[1], 'a', zipfile.ZIP_DEFLATED)

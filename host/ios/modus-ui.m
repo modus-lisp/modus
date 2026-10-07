@@ -9,8 +9,15 @@
 //   1002 FILL  xy wh rgb    fill [x,x+w)×[y,y+h) with 0xRRGGBB, clipped;
 //                           xy = x | y<<16, wh = w | h<<16
 //   1003 PRESENT            show the buffer (coalesced on the main thread)
-//   1004 NEXT-EVENT         the oldest touch: type<<40 | y<<20 | x, type
-//                           1 down / 2 move / 3 up; 0 when there is none
+//   1004 NEXT-EVENT         the oldest event: type<<40 | y<<20 | x for a touch,
+//                           type 1 down / 2 move / 3 up; type<<40 | keysym for
+//                           a key, type 4 (an X11 keysym: Latin-1 as itself,
+//                           other Unicode 0x01000000+cp, Return 0xff0d,
+//                           BackSpace 0xff08, arrows 0xff51-54, Escape 0xff1b);
+//                           0 when there is none
+//   1006 KEYBOARD on        1 shows the on-screen keyboard, 0 hides it.  Keys
+//                           typed on it -- or on a hardware keyboard while it
+//                           is up -- arrive through NEXT-EVENT.
 //   1005 BLIT src wh xy [stride]  copy a w×h block of Lisp pixels to (x,y), clipped:
 //                           SRC is the address of element 0 of a SIMPLE-VECTOR
 //                           of 0xRRGGBB fixnums, w per row -- glass's frame-
@@ -58,9 +65,61 @@ static void push_event(long type, CGPoint p) {
     os_unfair_lock_unlock(&ev_lock);
 }
 
-@interface ModusView : UIView
+static void push_key(uint32_t keysym) {
+    os_unfair_lock_lock(&ev_lock);
+    if (ev_tail - ev_head < NEV)
+        events[ev_tail++ % NEV] = ((uint64_t)4 << 40) | (uint64_t)keysym;
+    os_unfair_lock_unlock(&ev_lock);
+}
+
+static uint32_t keysym_for(uint32_t cp) {
+    if (cp == '\n' || cp == '\r') return 0xff0d;
+    if (cp == '\t') return 0xff09;
+    if (cp >= 0x20 && cp <= 0xff) return cp;          // Latin-1: the keysym is the character
+    return 0x01000000 | cp;                            // the X11 Unicode keysym range
+}
+
+// THE KEYBOARD.  The view is a UIKeyInput, so it can be first responder: the on-screen keyboard
+// types into it, and so does a hardware one while the view holds focus.  Text is the image's to
+// interpret -- no autocorrection, no auto-capitals, the keys as typed.
+@interface ModusView : UIView <UIKeyInput>
+@property(nonatomic) UITextAutocorrectionType autocorrectionType;
+@property(nonatomic) UITextAutocapitalizationType autocapitalizationType;
+@property(nonatomic) UITextSpellCheckingType spellCheckingType;
+@property(nonatomic) UITextSmartQuotesType smartQuotesType;
+@property(nonatomic) UITextSmartDashesType smartDashesType;
 @end
 @implementation ModusView
+- (BOOL)canBecomeFirstResponder { return YES; }
+- (BOOL)hasText { return YES; }                        // so Backspace is always offered
+- (void)insertText:(NSString *)text {
+    [text enumerateSubstringsInRange:NSMakeRange(0, text.length)
+                             options:NSStringEnumerationByComposedCharacterSequences
+                          usingBlock:^(NSString *ch, NSRange r, NSRange er, BOOL *stop) {
+        uint32_t cp = 0;
+        [ch getBytes:&cp maxLength:4 usedLength:NULL encoding:NSUTF32LittleEndianStringEncoding
+             options:0 range:NSMakeRange(0, ch.length) remainingRange:NULL];
+        push_key(keysym_for(cp));
+    }];
+}
+- (void)deleteBackward { push_key(0xff08); }
+// A hardware keyboard's arrows and Escape never reach insertText.
+- (void)pressesBegan:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)e {
+    BOOL rest = NO;
+    for (UIPress *p in presses) {
+        uint32_t ks = 0;
+        switch (p.key.keyCode) {
+        case UIKeyboardHIDUsageKeyboardLeftArrow:  ks = 0xff51; break;
+        case UIKeyboardHIDUsageKeyboardUpArrow:    ks = 0xff52; break;
+        case UIKeyboardHIDUsageKeyboardRightArrow: ks = 0xff53; break;
+        case UIKeyboardHIDUsageKeyboardDownArrow:  ks = 0xff54; break;
+        case UIKeyboardHIDUsageKeyboardEscape:     ks = 0xff1b; break;
+        default: rest = YES;
+        }
+        if (ks) push_key(ks);
+    }
+    if (rest) [super pressesBegan:presses withEvent:e];
+}
 - (void)touches:(NSSet<UITouch *> *)ts type:(long)type {
     for (UITouch *t in ts) push_event(type, [t locationInView:self]);
 }
@@ -148,6 +207,11 @@ long modus_ui_call(long nr, long a0, long a1, long a2, long a3) {
     case 1002: return fill(a0, a1, a2);
     case 1003: present(); return 0;
     case 1005: return blit(a0, a1, a2, a3);
+    case 1006:
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (a0) [fb_view becomeFirstResponder]; else [fb_view resignFirstResponder];
+        });
+        return 0;
     case 1004: {
         uint64_t e = 0;
         os_unfair_lock_lock(&ev_lock);

@@ -798,7 +798,7 @@ static long modus_syscall_1(long a0, long a1, long a2, long a3, long a4, long a5
     case 210: RET(shutdown((int)a0, (int)a1));      // SHUT_* agree
     case 103: return 0;                            // setitimer
 #if TARGET_OS_IPHONE
-    case 1001: case 1002: case 1003: case 1004: case 1005:   // the framebuffer (host/ios/modus-ui.m)
+    case 1001: case 1002: case 1003: case 1004: case 1005: case 1006:   // screen, input (host/ios/modus-ui.m)
         return modus_ui_call(nr, a0, a1, a2, a3);
 #endif
     case 1010: case 1011: case 1012:                          // the speaker (host/macos/modus-audio.c)

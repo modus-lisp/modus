@@ -168,6 +168,7 @@
   (when (%core-jit-lossy-p)
     (error "save-image: the JIT produced code pages this process cannot snapshot (no fixed exec arena); (setq *use-jit* nil) before loading what you want baked"))
   (finish-output)
+  (%jit-before-save)
   (let* ((from (%gc-force-to-space-0))
          (free (get-alloc-ptr))
          (boff (floor (- from (%gc-bitmap-page-base)) 128))
@@ -188,13 +189,23 @@
     (setf (mem-ref (+ hdr 56) :u64) boff)
     (setf (mem-ref (+ hdr 64) :u64) alo)
     (setf (mem-ref (+ hdr 72) :u64) abump)
+    ;; WHERE THE LAYOUT WAS: a restore at another slide relocates by the
+    ;; difference (see RELOCATION below).  0 in a core from before this.
+    (setf (mem-ref (+ hdr 80) :u64) (%conv-addr #x10000000))
+    (setf (mem-ref (+ hdr 88) :u64) (%core-layout-lo))
+    (setf (mem-ref (+ hdr 96) :u64) (%core-layout-hi))
+    ;; THE ARENA'S DATA PAGES (mvm-eval.lisp %JIT-DATA-PAGE): [dlo, top), or 0.
+    (setf (mem-ref (+ hdr 104) :u64) (%core-jit-data-lo))
     (%core-write-all fd hdr 128)
     (%core-write-all fd (%conv-addr #x10000000) 4096)
     (%core-write-all fd from (- free from))
     (%core-write-all fd (+ (%gc-bitmap-base) boff) blen)
     (%core-write-all fd (+ (%gc-cons-bitmap-base) boff) blen)
     (when (> abump 0)
-      (%core-write-all fd alo (- abump alo)))
+      (%core-write-all fd alo (- abump alo))
+      (let ((dlo (%core-jit-data-lo)))
+        (when (> dlo 0)
+          (%core-write-all fd dlo (- (%core-layout-hi) dlo)))))
     (%core-close fd)
     (- free from)))
 
@@ -239,7 +250,13 @@
     (%core-slice fd hdr 128)
     (when (/= (mem-ref hdr :u64) (%core-magic))
       (%core-die "core: not a Modus core file"))
-    (when (/= (mem-ref (+ hdr 8) :u64) from)
+    (let* ((was (mem-ref (+ hdr 80) :u64))
+           ;; THE SLIDE between the saving process and this one: every address
+           ;; in the layout moved by D (they are one mapping on Darwin, ASLR-
+           ;; slid as a whole).  0 for a core saved without the field.
+           (d (if (= was 0) 0 (- (%conv-addr #x10000000) was)))
+           (sfrom (mem-ref (+ hdr 8) :u64)))
+    (when (/= (+ sfrom d) from)
       (%core-die "core: heap base differs from this process (the core was saved by an image with a different layout, or the stub did not get its fixed mapping)"))
     (when (/= (mem-ref (+ hdr 24) :u64) (%gc-space-size))
       (%core-die "core: heap geometry differs from this image"))
@@ -247,9 +264,12 @@
           (blen (mem-ref (+ hdr 48) :u64))
           (boff (mem-ref (+ hdr 56) :u64))
           (alo (mem-ref (+ hdr 64) :u64))
-          (abump (mem-ref (+ hdr 72) :u64)))
+          (abump (mem-ref (+ hdr 72) :u64))
+          (l0 (mem-ref (+ hdr 88) :u64))
+          (l1 (mem-ref (+ hdr 96) :u64))
+          (dlo (mem-ref (+ hdr 104) :u64)))
       (when (and (> abump 0)
-                 (or (= (%core-jit-arena-bump) 0) (/= alo (%core-jit-arena-lo))))
+                 (or (= (%core-jit-arena-bump) 0) (/= (+ alo d) (%core-jit-arena-lo))))
         (%core-die "core: snapshot has JIT pages but this process has no matching exec arena"))
       ;; The metadata window, sequentially: the collector's fixed roots and
       ;; gc_count land in place; every other word is per-process and is read
@@ -277,24 +297,167 @@
       (%core-slice fd stage #x18)         ; 0xFB8..0xFD0
       (%core-slice fd (%conv-addr #x10000FD0) 8)       ; JIT constant-vector root (aarch64)
       (%core-slice fd stage #x28)         ; 0xFD8..0x1000
-      (%core-slice fd from (- free from))
+      (%core-slice fd from (- free sfrom))
       (%core-slice fd (+ (%gc-bitmap-base) boff) blen)
       (%core-slice fd (+ (%gc-cons-bitmap-base) boff) blen)
       (when (> abump 0)
         ;; The arena: bitmaps + JIT pages, then the bump word (RAW: store the
         ;; halved value so the machine word is the address) and an I-cache
-        ;; invalidate over the code we just read in.
-        (%core-slice fd alo (- abump alo))
-        (setf (mem-ref (%core-jit-bump-slot) :u64) (ash abump -1))
-        (%jit-icache-flush alo (- abump alo)))
+        ;; invalidate over the code we just read in.  JIT code is PC-relative
+        ;; for the layout, so it needs no relocation.
+        (%core-load-code fd (+ alo d) (- abump alo) stage)
+        (setf (mem-ref (%core-jit-bump-slot) :u64) (ash (+ abump d) -1))
+        (%jit-icache-flush (+ alo d) (- abump alo))
+        ;; Its data pages (the linkage cells): ordinary writable memory.
+        (when (> dlo 0)
+          (%core-slice fd (+ dlo d) (- l1 dlo))))
       ;; Publish the alloc pointer BEFORE anything that allocates -- %core-close
       ;; prints CORE-END via print-dec, which conses; until this runs, the
       ;; pointer is still the fresh boot's (heap base), so that string would
       ;; land ON TOP of the just-restored data at the low heap and corrupt it.
-      (set-alloc-ptr free)
+      (set-alloc-ptr (+ free d))
+      (unless (= d 0)
+        (%core-relocate from (+ free d) l0 l1 d))
       (%core-close fd)
-      free)))
+      (+ free d)))))
+
+;;; ---- RELOCATION: restoring at another slide ---------------------------------
+;;;
+;;; iOS slides an app's whole image on every launch (and arm64 apps must be
+;;; position-independent), so a core saved on one launch is restored at a
+;;; different address on the next.  The image's own code and a PC-relative
+;;; image's JIT pages are position-independent; what holds absolute addresses
+;;; is DATA, and it all moved by the same D:
+;;;   - every pointer-bearing heap word, walked object by object exactly as the
+;;;     collector scans to-space (%GC-SCAN-COPIED: conses by the cons-kind
+;;;     bitmap, headed objects by count, leaf payloads skipped);
+;;;   - the metadata window's restored roots;
+;;;   - the JIT's linkage cells, which hold native entry addresses;
+;;;   - *CONV-DELTA*, which is a difference, not an address.
+;;; A word is relocated when it is a TAGGED POINTER into the old layout, or a
+;;; FIXNUM whose value is an old layout address -- the same by-value rule the
+;;; compiler applies to literals (compiler.lisp PCREL-LAYOUT-ADDR-P), sound
+;;; for the same reason: a PC-relative layout lies wholly above 4 GB, where
+;;; ordinary numbers do not reach.  Nothing here allocates: the words are read
+;;; as 32-bit halves and only those below 2^40 are formed, as fixnums.
+;;; Address-keyed hashing does not exist (%HT-HASH buckets only strings,
+;;; fixnums, characters and symbols), so moved objects stay found.
+
+(defun %core-jit-data-lo ()
+  "Low end of the JIT arena's data pages (mvm-eval.lisp %JIT-DATA-PAGE), or 0."
+  (let ((d *jit-data-next*)) (if (integerp d) d 0)))
+
+(defun %core-load-code (fd dst len stage)
+  "Read LEN bytes of JIT code from the core to DST, a chunk at a time through
+   STAGE, writing a chunk only where it differs from what DST already holds.
+   An iOS app carries a snapshot's code as SIGNED, READ-ONLY pages at exactly
+   this address (host/macos/image-segments.sh), and they hold these bytes
+   already, so nothing is written; anywhere else the arena is fresh and every
+   chunk is copied in.  STAGE is a 4 KB page."
+  (let ((off 0))
+    (loop
+      (when (>= off len) (return nil))
+      (let ((n (if (> (- len off) 4096) 4096 (- len off))))
+        (%core-slice fd stage n)
+        (unless (%core-same-p stage (+ dst off) n)
+          (%core-copy stage (+ dst off) n))
+        (setq off (+ off n))))))
+
+(defun %core-same-p (a b n)
+  (let ((i 0))
+    (loop
+      (when (>= i n) (return t))
+      (unless (and (= (mem-ref (+ a i) :u32) (mem-ref (+ b i) :u32))
+                   (= (mem-ref (+ a (+ i 4)) :u32) (mem-ref (+ b (+ i 4)) :u32)))
+        (return nil))
+      (setq i (+ i 8)))))
+
+(defun %core-copy (src dst n)
+  (let ((i 0))
+    (loop
+      (when (>= i n) (return nil))
+      (setf (mem-ref (+ dst i) :u32) (mem-ref (+ src i) :u32))
+      (setq i (+ i 4)))))
+
+(defun %core-layout-lo ()
+  "Low end of this process's layout: the code base, less the Darwin syscall
+   slot's page below it."
+  (- (%layout :code-base 0) #x4000))
+
+(defun %core-layout-hi ()
+  "High end of this process's layout: the end of the JIT arena."
+  (+ (%core-jit-arena-lo) #x20000000))
+
+(defun %core-set-word (at w)
+  (setf (mem-ref at :u32) (logand w #xFFFFFFFF))
+  (setf (mem-ref (+ at 4) :u32) (ash w -32)))
+
+(defun %core-reloc-word (at l0 l1 d)
+  "Relocate the machine word at AT by D when it addresses the old layout."
+  (let ((lo (mem-ref at :u32)) (hi (mem-ref (+ at 4) :u32)))
+    (when (< hi 256)
+      (let ((w (+ (* hi 4294967296) lo)))
+        (if (= (logand lo 5) 1)
+            (let ((a (- w (logand lo 15))))
+              (when (and (>= a l0) (< a l1)) (%core-set-word at (+ w d))))
+            (when (= (logand lo 1) 0)
+              (let ((v (ash w -1)))
+                (when (and (>= v l0) (< v l1)) (%core-set-word at (+ w (* 2 d))))))))))
+  nil)
+
+(defun %core-object-bytes (subtag count)
+  "An object's size, as the native collector's walk computes it (translate-
+   aarch64 EMIT-AARCH64-OBJECT-WALK): a byte vector counts bytes, a single-
+   float vector 4-byte lanes, everything else words; header and padding word
+   first, rounded to 16."
+  (logand (+ 15 (+ 16 (cond ((= subtag #x11) count)
+                            ((= subtag #x12) (* count 4))
+                            (t (* count 8)))))
+          (lognot 15)))
+
+(defun %core-leaf-p (subtag)
+  "A raw payload, as the native walk's leaf set: never relocated."
+  (or (= subtag #x10) (= subtag #x11) (= subtag #x12) (= subtag #x14)
+      (= subtag #x16) (= subtag #x30) (= subtag #x31) (= subtag #x60)
+      (= subtag #x64) (= subtag #x65) (= subtag #x66)))
+
+(defun %core-reloc-heap (from free l0 l1 d)
+  "Relocate every pointer-bearing word of the heap [FROM, FREE), walked object
+   by object exactly as the native collector walks to-space."
+  (let ((scan from))
+    (loop
+      (when (>= scan free) (return nil))
+      (if (%gc-is-cons-granule scan)
+          (progn (%core-reloc-word scan l0 l1 d)
+                 (%core-reloc-word (+ scan 8) l0 l1 d)
+                 (setq scan (+ scan 16)))
+          (let* ((hdr-lo (%gc-word-lo scan))
+                 (count (%gc-header-count hdr-lo (%gc-word-hi scan)))
+                 (subtag (logand hdr-lo #xFF)))
+            (unless (%core-leaf-p subtag)
+              (let ((i 0))
+                (loop
+                  (when (>= i count) (return nil))
+                  (%core-reloc-word (+ scan (+ 16 (* i 8))) l0 l1 d)
+                  (setq i (+ i 1)))))
+            (setq scan (+ scan (%core-object-bytes subtag count))))))))
+
+(defun %core-relocate (from free l0 l1 d)
+  "Relocate a just-restored snapshot by D (see RELOCATION above)."
+  (%core-reloc-heap from free l0 l1 d)
+  (dolist (off (list #x80 #x88 #x148 #x170 #xFA0 #xFB0 #xFD0))
+    (%core-reloc-word (+ (%conv-addr #x10000000) off) l0 l1 d))
+  (setq *conv-delta* (+ *conv-delta* d))
+  (setq *layout-slide* (+ (%layout-slide) d))
+  (%jit-after-relocate l0 l1 d))
 
 (defun %core-post-restore ()
-  "Per-process state a snapshot cannot carry: signal handlers."
-  (%init-signal-handling))
+  "Per-process state a snapshot cannot carry: signal handlers, and whether
+   this process may compile to native code.  An iOS app cannot write code at
+   all -- its snapshot's JIT pages are signed and read-only -- and says so
+   with MODUS_NO_RUNTIME_JIT (host/macos/modus-shim.c); code compiled there
+   after the restore is interpreted."
+  (%init-signal-handling)
+  (let ((v (%cli-getenv "MODUS_NO_RUNTIME_JIT")))
+    (when (and v (> (length v) 0) (not (string= v "0")))
+      (setq *use-jit* nil))))

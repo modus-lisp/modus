@@ -1032,11 +1032,30 @@
    image-assembly stage patches with the real tagged pool address."
   (encode-instruction buf +op-li-const+ vd idx))
 
+;;; LAYOUT ADDRESSES IN BYTECODE ARE LINK-TIME ADDRESSES.  A PC-relative
+;;; layout is mapped at a different SLIDE in every process (iOS slides the
+;;; whole image on every launch), and bytecode outlives the process that
+;;; compiled it: a snapshot carries it to another launch (lib/save-image.lisp).
+;;; So LI-ADDR / LI-TADDR encode the address with this process's slide taken
+;;; off, and every consumer adds the slide of the process that runs it: the
+;;; interpreter when it executes one, the AArch64 translator when it forms it.
+;;; *LAYOUT-SLIDE* is that slide -- 0 at image build, measured by the layout
+;;; co-init at boot, moved by a relocating restore.
+
+(defvar *layout-slide* 0
+  "This process's layout slide: where the PC-relative layout is mapped, less
+   where it was linked.  See LAYOUT ADDRESSES IN BYTECODE above.")
+
+(defun %layout-slide ()
+  "*LAYOUT-SLIDE*, or 0 where nothing set it (a defvar initform does not run
+   in-image)."
+  (let ((s *layout-slide*)) (if (integerp s) s 0)))
+
 (defun mvm-li-addr (buf vd addr)
-  (encode-instruction buf +op-li-addr+ vd addr))
+  (encode-instruction buf +op-li-addr+ vd (- addr (%layout-slide))))
 
 (defun mvm-li-taddr (buf vd addr)
-  (encode-instruction buf +op-li-taddr+ vd addr))
+  (encode-instruction buf +op-li-taddr+ vd (- addr (%layout-slide))))
 
 (defun mvm-push (buf vs)
   (encode-instruction buf +op-push+ vs))

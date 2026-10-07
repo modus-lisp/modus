@@ -9,8 +9,10 @@
 #   MODUS_CONV_DELTA=640000000 MODUS_HEAP_BASE=680000000 \
 #   MODUS_JIT_ARENA_BASE=700000000 MODUS_CLI_OUT=/tmp/modus-ios.elf \
 #   sbcl --dynamic-space-size 16384 --script mvm/build-aarch64-cli.lisp
-# Any extra files in $MODUS_IOS_FILES (space-separated) are copied into the
-# bundle; pass "@NAME" on the command line to name one.
+# Any extra files or directories in $MODUS_IOS_FILES (space-separated) are
+# copied into the bundle, before it is signed; pass "@NAME" on the command line
+# to name one, or list the arguments one per line in a bundled modus.args.
+# MODUS_CORE=FILE puts a snapshot's compiled code in the app (image-segments.sh).
 set -eu
 IMAGE=$1; OUT=$2; KIND=${3:-sim}; IDENT=${4:-}; PROFILE=${5:-}
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -31,7 +33,7 @@ else
 fi
 # shellcheck disable=SC2086  # WHERE is a flag list
 xcrun --sdk $SDKN clang -target $TARGET -isysroot "$SDK" -O2 -Wall \
-  -o "$OUT/modus" "$MAC/modus-shim.c" "$MAC/syscall-stub.S" "$HERE/modus-ui.m" -fobjc-arc -framework UIKit -framework QuartzCore -framework CoreGraphics -framework CoreFoundation $WHERE
+  -o "$OUT/modus" "$MAC/modus-shim.c" "$MAC/modus-audio.c" "$MAC/syscall-stub.S" "$HERE/modus-ui.m" -fobjc-arc -framework AudioToolbox -framework AVFoundation -framework UIKit -framework QuartzCore -framework CoreGraphics -framework CoreFoundation $WHERE
 cat > "$OUT/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -49,7 +51,7 @@ cat > "$OUT/Info.plist" <<PLIST
   <key>CFBundleSupportedPlatforms</key><array><string>$( [ $KIND = sim ] && echo iPhoneSimulator || echo iPhoneOS )</string></array>
 </dict></plist>
 PLIST
-for f in ${MODUS_IOS_FILES:-}; do cp "$f" "$OUT/"; done
+for f in ${MODUS_IOS_FILES:-}; do cp -R "$f" "$OUT/"; done
 if [ -n "$PROFILE" ]; then cp "$PROFILE" "$OUT/embedded.mobileprovision"; fi
 if [ -n "$IDENT" ]; then
   ENT=$(mktemp); security cms -D -i "$PROFILE" > "$ENT.plist" 2>/dev/null && \

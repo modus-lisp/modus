@@ -1419,14 +1419,21 @@
 (defun %rt-slice-base ()   (+ (%ha-base) #xB800))
 (defun %rt-slice-block (cpu) (+ (%rt-slice-base) (* cpu #x40)))
 (defun %rt-arena-words ()  (+ (%ha-base) #xBC00))
+;;; READING THE ARENA DOES NOT CARVE IT.  These answer 0 -- no arena -- until
+;;; something has carved the band (%SB-THREADS-UP, when a thread is wanted).
+;;; They used to ask %HA-BASE, which carves on first use, so the first locked
+;;; section of a SINGLE-threaded process (%RT-ENTER-LOCKED's refill check)
+;;; carved the band: region 0 lost ~270 MB for nothing, and a heap snapshot
+;;; taken then could not be restored into a fresh process, whose region 0 is
+;;; whole (lib/save-image.lisp, "heap geometry differs").
 (defun %rt-arena-base ()
-  (if (zerop (%ha-base)) 0 (%gc-read64 (%rt-arena-words))))
+  (if (zerop *ha-band*) 0 (%gc-read64 (%rt-arena-words))))
 (defun %rt-arena-alloc ()
-  (if (zerop (%ha-base)) 0 (%gc-read64 (+ (%rt-arena-words) #x08))))
+  (if (zerop *ha-band*) 0 (%gc-read64 (+ (%rt-arena-words) #x08))))
 (defun %rt-arena-end ()
-  (if (zerop (%ha-base)) 0 (%gc-read64 (+ (%rt-arena-words) #x10))))
+  (if (zerop *ha-band*) 0 (%gc-read64 (+ (%rt-arena-words) #x10))))
 (defun %rt-arena-fallbacks ()
-  (if (zerop (%ha-base)) 0 (%gc-read64 (+ (%rt-arena-words) #x18))))
+  (if (zerop *ha-band*) 0 (%gc-read64 (+ (%rt-arena-words) #x18))))
 
 (defun %rt-slice-need ()
   "Headroom the next locked section needs in its slice: 64 KB, or the size a
@@ -1581,7 +1588,12 @@
              (quarter (ash (- ae base) -2)))
         (when (< (- ae (%rt-arena-alloc)) quarter)
           (let ((cool (%gc-read64 (+ (%rt-arena-words) #x20))))
-            (if (> cool 0)
+            ;; NO COOLDOWN UNDER AN EIGHTH.  The 256-entry wait is for an arena
+            ;; that stays a little low; one that is running OUT must be tried
+            ;; on every entry, or a fast publisher fills it during the wait
+            ;; and the next worker to need a slice has to stop the process
+            ;; (seen: 1 run in 30 of warp's player started by a tap, no JIT).
+            (if (and (> cool 0) (>= (- ae (%rt-arena-alloc)) (ash quarter -1)))
                 (%gc-write64 (+ (%rt-arena-words) #x20) (- cool 1))
                 (progn
                   (%gc-collect-region-0)
@@ -1615,7 +1627,12 @@
              (size (%gc-meta-read (+ r0 #x10) k)))
         (if (< size #x6000000)
             0
-            (let ((newsize (- size #x2000000)))
+            ;; 64 MB on a big heap, 32 MB otherwise.  A worker that publishes
+            ;; frames (warp's media decoder: 0.7 MB a picture, 30 a second)
+            ;; turns the arena over every second, and the evacuation that
+            ;; rewinds it can be skipped while another thread holds the lock;
+            ;; 32 MB was too little slack to wait that out.
+            (let ((newsize (- size (if (>= size #x10000000) #x4000000 #x2000000))))
               ;; The frontier is the LIVE pointer while region 0 is active —
               ;; its parked word is whatever was last parked, which a
               ;; collection since then does not rewrite — and the parked one
@@ -1654,6 +1671,23 @@
                     ;; collector never sees a half-initialised arena.
                     (%gc-write64 (%conv-addr #x10000D98) (%rt-arena-words))
                     1)))))))
+
+(defun %fatal-say (msg)
+  "%FATAL-STOP's output without the stop: raw write(2)s, no allocation."
+  (let ((w (%thr-scratch-word)))
+    (dotimes (i (length msg))
+      (%gc-write64 w (char-code (char msg i)))
+      (syscall3 1 2 w 1))))
+
+(defun %fatal-hex (n)
+  "N as 16 hex digits to fd 2, allocating nothing (for %FATAL-STOP's callers)."
+  (let ((w (%thr-scratch-word)) (sh 60))
+    (loop
+      (when (< sh 0) (return nil))
+      (let ((d (logand (ash n (- 0 sh)) 15)))
+        (%gc-write64 w (if (< d 10) (+ 48 d) (+ 87 d)))
+        (syscall3 1 2 w 1))
+      (setq sh (- sh 4)))))
 
 (defun %fatal-stop (msg)
   "Write MSG to fd 2 and end the process (exit_group, status 134).  For states
@@ -1737,8 +1771,19 @@ modus: waited 60 s for the runtime lock; its owner leaked it (faulted, unwound o
             ;; frontier, silent corruption.  That is the pre-arena path and it
             ;; is only sound for the main thread.  Stop instead.
             (when (and (zerop blk) (> (%thr-cpu) 0))
+              ;; Say WHICH: no arena (end 0) and an exhausted one (fallbacks > 0)
+              ;; are different bugs, and the numbers are all that survives.
+              (%fatal-say "
+modus: a thread needed the runtime lock but the lock arena is exhausted or missing; continuing would corrupt the heap.
+  cpu ")
+              (%fatal-hex (%thr-cpu))
+              (%fatal-say " arena base ") (%fatal-hex (%rt-arena-base))
+              (%fatal-say " frontier ") (%fatal-hex (%rt-arena-alloc))
+              (%fatal-say " end ") (%fatal-hex (%rt-arena-end))
+              (%fatal-say " fallbacks ") (%fatal-hex (%rt-arena-fallbacks))
+              (%fatal-say " band ") (%fatal-hex *ha-band*)
               (%fatal-stop "
-modus: a thread needed the runtime lock but the lock arena is exhausted or missing; continuing would corrupt the heap. Stopping.
+Stopping.
 "))
             (%gc-write64 (%rt-saved-addr)
                          (%gc-region-enter (if (zerop blk) (%gc-region-0) blk))))
@@ -2023,6 +2068,9 @@ modus: a thread needed the runtime lock but the lock arena is exhausted or missi
   (%rt-enter)
   (puthash name *symbol-function-table* fn)
   (%rt-leave)
+  ;; A reused slot reuses NAME: a bridge must not keep the old FN.
+  (when (fboundp (quote %jit-fnaddr-thunk-invalidate))
+    (%jit-fnaddr-thunk-invalidate name))
   0)
 
 (defun %tl-fn (name)
@@ -3535,7 +3583,29 @@ modus: a thread needed the runtime lock but the lock arena is exhausted or missi
 ;;; the N-regions selftest's result block; +0xC800..+0xD000 is otherwise unused):
 ;;;   +0x00 the bump lock   +0x08 arena base   +0x10 next free
 ;;;   +0x18 arena limit     +0x20 cells handed out   +0x28 refusals
-(defun %sync-cell-ctl () (+ (%ha-base) #xC800))
+;;;
+;;; IN THE JIT ARENA'S DATA PAGES WHEN THERE IS ONE (mvm-eval.lisp
+;;; %JIT-DATA-PAGE): the control words in the first such page, and cells handed
+;;; out of further 16 KB pages.  Those pages sit at fixed layout addresses and
+;;; travel in a heap snapshot, so a mutex made while a library loads still
+;;; works after a restore (lib/save-image.lisp).  The band, by contrast, is
+;;; carved out of region 0 on first use -- a lock made in a single-threaded
+;;; process cost it ~270 MB, and a snapshot of that process would not restore.
+;;; With no arena (the hosted x86-64 image), the band and one 4 MB mapping as
+;;; before.
+(defvar *sync-ctl* nil "The arena-page control block, once made; NIL before.")
+
+(defun %sync-cell-ctl ()
+  (let ((c *sync-ctl*))
+    (if (and (integerp c) (> c 0))
+        c
+        (let ((p (%jit-data-page)))
+          (if (> p 0)
+              (progn (setq *sync-ctl* p) p)
+              (+ (%ha-base) #xC800))))))
+
+(defun %sync-in-arena-p (ctl)
+  (let ((c *sync-ctl*)) (and (integerp c) (= ctl c))))
 (defun %sync-cell-size () 64)
 (defun %sync-arena-bytes () 4194304)
 
@@ -3552,6 +3622,15 @@ modus: a thread needed the runtime lock but the lock arena is exhausted or missi
   (let ((ctl (%sync-cell-ctl)))
     (spin-lock ctl)
     (let ((base (%gc-read64 (+ ctl #x08))))
+      ;; Arena mode: another 16 KB data page whenever the current one is full.
+      (when (and (%sync-in-arena-p ctl)
+                 (> (+ (%gc-read64 (+ ctl #x10)) (%sync-cell-size)) (%gc-read64 (+ ctl #x18))))
+        (let ((pg (%jit-data-page)))
+          (when (> pg 0)
+            (%gc-write64 (+ ctl #x08) pg)
+            (%gc-write64 (+ ctl #x10) pg)
+            (%gc-write64 (+ ctl #x18) (+ pg 16384))
+            (setq base pg))))
       (if (zerop base)
           (let ((m (%mmap-shared-page (%sync-arena-bytes))))
             (if (< m 4096)

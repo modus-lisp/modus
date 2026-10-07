@@ -20,6 +20,8 @@
 // below, exactly as it does on Linux.
 
 #include <errno.h>
+// host/macos/modus-audio.c: the speaker, pseudo-syscalls 1010-1012, every Apple target.
+extern long modus_audio_call(long nr, long a0, long a1);
 #include <fcntl.h>
 #include <dirent.h>
 #include <mach-o/dyld.h>
@@ -288,7 +290,43 @@ static void note_reservation(const char *seg) {
     }
 }
 
+// PRELOADED JIT CODE: an app built from a snapshot (host/macos/image-
+// segments.sh, MODUS_CORE) carries the arena's code pages as the signed,
+// read-only segment __MODUSC at the arena base, and reserves the rest of the
+// arena as __MODUSA.  The boot stub still asks for the whole arena there: it
+// is already in place, so answer with its address and map nothing.
+static uint64_t preloaded_lo;
+
+// THE ARENA'S DATA END IS NOT MAP_JIT.  Data pages (linkage cells, mutex
+// cells: mvm-eval.lisp %JIT-DATA-PAGE) grow down from the arena's top, and
+// image code writes them on every lock.  Inside MAP_JIT each such write
+// faulted the thread into write mode and its return to JIT code faulted it
+// back -- two signals, ~4 us, per lock and per unlock (measured: bt:with-lock-
+// held 80 us).  So a JIT region big enough to be the arena keeps its top
+// JIT_DATA_SLICE as ordinary RW memory.  Code grows up from the bottom and
+// uses a quarter of the arena; should it ever reach the slice, the exec fault
+// there is reported by name (on_fault) rather than flipped.
+#define JIT_DATA_SLICE (16ull << 20)
+static uint64_t data_slice_lo, data_slice_hi;
+static uint64_t jit_split(void *p, uint64_t len) {
+    if (len < (64ull << 20)) return len;
+    uint64_t lo = (uint64_t)(uintptr_t)p + len - JIT_DATA_SLICE;
+    munmap((void *)(uintptr_t)lo, JIT_DATA_SLICE);
+    void *d = mmap((void *)(uintptr_t)lo, JIT_DATA_SLICE, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+    if (d == MAP_FAILED) {
+        // Put it back as it was: slower, still correct.
+        fprintf(stderr, "modus-shim: could not map the arena's data end RW (%s); keeping MAP_JIT\n", strerror(errno));
+        mmap((void *)(uintptr_t)lo, JIT_DATA_SLICE, PROT_READ | PROT_WRITE | PROT_EXEC,
+             MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+        return len;
+    }
+    data_slice_lo = lo; data_slice_hi = lo + JIT_DATA_SLICE;
+    return len - JIT_DATA_SLICE;
+}
+
 static long dx_mmap(long addr, long len, long prot, long flags, long fd, long off) {
+    if (preloaded_lo && (uint64_t)addr == preloaded_lo) return addr;
     int f = (int)(flags & 3);                      // SHARED/PRIVATE agree
     if (flags & 0x20) f |= MAP_ANON;
     int noreplace = (flags & 0x100000) != 0;       // MAP_FIXED_NOREPLACE
@@ -302,7 +340,8 @@ static long dx_mmap(long addr, long len, long prot, long flags, long fd, long of
             munmap((void *)addr, (size_t)len);
             void *p = mmap((void *)addr, (size_t)len, (int)prot, f | MAP_JIT, (int)fd, (off_t)off);
             if (p == (void *)addr) {
-                if (n_jit < MAXJIT) { jit_regions[n_jit].lo = (uint64_t)p; jit_regions[n_jit].hi = (uint64_t)p + (uint64_t)len; n_jit++; }
+                uint64_t jl = jit_split(p, (uint64_t)len);
+                if (n_jit < MAXJIT) { jit_regions[n_jit].lo = (uint64_t)p; jit_regions[n_jit].hi = (uint64_t)p + jl; n_jit++; }
                 modus_jit_wp(1);
                 return (long)p;
             }
@@ -320,7 +359,8 @@ static long dx_mmap(long addr, long len, long prot, long flags, long fd, long of
     void *p = mmap((void *)addr, (size_t)len, (int)prot, f, (int)fd, (off_t)off);
     if (p != MAP_FAILED && jit) {
         if (noreplace && (long)p != addr) { munmap(p, (size_t)len); return -17; }
-        if (n_jit < MAXJIT) { jit_regions[n_jit].lo = (uint64_t)p; jit_regions[n_jit].hi = (uint64_t)p + (uint64_t)len; n_jit++; }
+        uint64_t jl = jit_split(p, (uint64_t)len);
+        if (n_jit < MAXJIT) { jit_regions[n_jit].lo = (uint64_t)p; jit_regions[n_jit].hi = (uint64_t)p + jl; n_jit++; }
         modus_jit_wp(1);           // running mode: executable
         return (long)p;
     }
@@ -758,9 +798,11 @@ static long modus_syscall_1(long a0, long a1, long a2, long a3, long a4, long a5
     case 210: RET(shutdown((int)a0, (int)a1));      // SHUT_* agree
     case 103: return 0;                            // setitimer
 #if TARGET_OS_IPHONE
-    case 1001: case 1002: case 1003: case 1004:    // the framebuffer (host/ios/modus-ui.m)
+    case 1001: case 1002: case 1003: case 1004: case 1005:   // the framebuffer (host/ios/modus-ui.m)
         return modus_ui_call(nr, a0, a1, a2, a3);
 #endif
+    case 1010: case 1011: case 1012:                          // the speaker (host/macos/modus-audio.c)
+        return modus_audio_call(nr, a0, a1);
     default:
         if (nr >= 0 && nr < 512 && !unknown_seen[nr]) {
             unknown_seen[nr] = 1;
@@ -802,6 +844,9 @@ static void on_fault(int sig, siginfo_t *si, void *uc_) {
         modus_jit_wp(a == pc ? 1 : 0);
         return;
     }
+    if (a == pc && a >= data_slice_lo && a < data_slice_hi)
+        fprintf(stderr, "\nmodus-shim: code ran at %#llx, in the JIT arena's RW data end: the arena's code has "
+                "grown into it (see JIT_DATA_SLICE)\n", (unsigned long long)pc);
     int slot = fault_slot(sig);
     // MODUS_SHIM_FAULTS=1: say where every fault the image recovers from was.
     static int show = -1;
@@ -950,6 +995,41 @@ int main(int argc, char **argv, char **envp) {
     if (kr != KERN_SUCCESS) die("could not map the syscall slot page", kr);
     }
     *(void **)(uintptr_t)slot = (void *)modus_syscall_stub;
+
+    { unsigned long n = 0;
+      uint8_t *c = getsectiondata(&_mh_execute_header, "__MODUSC", "__code", &n);
+      if (c && n) preloaded_lo = (uint64_t)(uintptr_t)c; }
+
+    // NO ARGUMENTS: take them from modus.args beside the executable, one per
+    // line -- an app is launched with none, so this is how it says what to run
+    // (`kiln ios' writes `--core', `@kiln.core', `--eval', `(main)').
+    char exedir0[4096] = "";
+    { char exe[4096]; uint32_t n = sizeof exe;
+      if (_NSGetExecutablePath(exe, &n) == 0) strncpy(exedir0, dirname(exe), sizeof exedir0 - 1); }
+    if (argc == 1 && exedir0[0]) {
+        char path[4200]; snprintf(path, sizeof path, "%s/modus.args", exedir0);
+        FILE *af = fopen(path, "r");
+        if (af) {
+            char **nv = calloc(64, sizeof *nv); int nc = 0; char line[4096];
+            nv[nc++] = argv[0];
+            while (nc < 63 && fgets(line, sizeof line, af)) {
+                size_t l = strlen(line);
+                while (l && (line[l - 1] == '\n' || line[l - 1] == '\r')) line[--l] = 0;
+                if (l) nv[nc++] = strdup(line);
+            }
+            fclose(af);
+            argc = nc; argv = nv;
+        }
+    }
+    // Preloaded code cannot be written, so the image must not compile any:
+    // MODUS_NO_RUNTIME_JIT (lib/save-image.lisp %CORE-POST-RESTORE).
+    if (preloaded_lo) {
+        int n = 0; while (envp[n]) n++;
+        char **ne = calloc((size_t)n + 2, sizeof *ne);
+        for (int i = 0; i < n; i++) ne[i] = envp[i];
+        ne[n] = "MODUS_NO_RUNTIME_JIT=1";
+        envp = ne;
+    }
 
     // 3. a Linux initial stack: argc, argv..., NULL, envp..., NULL, AT_NULL.
     size_t stack_size = 64ULL << 20;

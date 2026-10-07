@@ -79,7 +79,38 @@
   (:export "POSIX-GETENV" "*EXIT-HOOKS*" "EXIT" "QUIT" "GC"
            "*INVOKE-DEBUGGER-HOOK*" "RUN-PROGRAM"
            "PROCESS-PTY" "PROCESS-KILL" "PROCESS-ALIVE-P" "PROCESS-EXIT-CODE"
-           "PROCESS-WAIT" "PROCESS-INPUT" "PROCESS-OUTPUT"))
+           "PROCESS-WAIT" "PROCESS-INPUT" "PROCESS-OUTPUT"
+           "OCTETS-TO-STRING" "STRING-TO-OCTETS"))
+
+;;; OCTETS-TO-STRING / STRING-TO-OCTETS — SBCL's byte<->text conversions, for
+;;; UTF-8 (the default) and Latin-1.  cassette reads WebM tag strings with the
+;;; first.  UTF-8 decoding is lenient, as for library sources (lib/install-
+;;; tarball.lisp %IT-UTF8-BYTES-TO-STRING): a malformed byte reads as Latin-1.
+(defun sb-ext::octets-to-string (octets &key (external-format :utf-8) (start 0) end)
+  (let* ((end (or end (length octets)))
+         (bytes (subseq octets start end)))
+    (if (member external-format '(:latin-1 :latin1 :iso-8859-1 :ascii))
+        (map 'string (function code-char) bytes)
+        (%it-utf8-bytes-to-string bytes))))
+
+(defun sb-ext::string-to-octets (string &key (external-format :utf-8) (start 0) end null-terminate)
+  (let* ((end (or end (length string)))
+         (latin (member external-format '(:latin-1 :latin1 :iso-8859-1 :ascii)))
+         (out nil))
+    (loop for i from start below end
+          do (let ((c (char-code (char string i))))
+               (cond ((or latin (< c #x80)) (push (logand c 255) out))
+                     ((< c #x800) (push (logior #xC0 (ash c -6)) out)
+                                  (push (logior #x80 (logand c #x3F)) out))
+                     ((< c #x10000) (push (logior #xE0 (ash c -12)) out)
+                                    (push (logior #x80 (logand (ash c -6) #x3F)) out)
+                                    (push (logior #x80 (logand c #x3F)) out))
+                     (t (push (logior #xF0 (ash c -18)) out)
+                        (push (logior #x80 (logand (ash c -12) #x3F)) out)
+                        (push (logior #x80 (logand (ash c -6) #x3F)) out)
+                        (push (logior #x80 (logand c #x3F)) out)))))
+    (when null-terminate (push 0 out))
+    (coerce (nreverse out) '(vector (unsigned-byte 8)))))
 
 ;;; ============================================================
 ;;; SB-ALIEN — two libc calls, emulated as syscalls

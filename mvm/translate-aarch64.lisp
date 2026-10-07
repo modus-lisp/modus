@@ -858,9 +858,13 @@
         ;; LABEL-ID is an ABSOLUTE target address, not a label: see
         ;; A64-LOAD-REAL-ADDR.  Page delta from this ADRP's own VA.
         (progn
-          (unless veneer-base-va
+          (unless (or veneer-base-va *aarch64-jit-mode*)
             (error "AArch64: PC-relative address fixup at index ~D, but no image ~
                     base VA was given to resolve it" index))
+          (if (not veneer-base-va)
+              ;; A JIT page: its address is not known yet.
+              (setq *aarch64-jit-adrp-fixups*
+                    (cons (cons index label-id) *aarch64-jit-adrp-fixups*))
           (let ((pages (- (ash label-id -12)
                           (ash (+ veneer-base-va (* 4 index)) -12)))
                 (word (aref code index)))
@@ -870,7 +874,7 @@
             (setf (aref code index)
                   (logior (logand word #x9F00001F)
                           (ash (logand pages 3) 29)
-                          (ash (logand (ash pages -2) #x7FFFF) 5)))))
+                          (ash (logand (ash pages -2) #x7FFFF) 5))))))
         (let* ((raw-target (gethash label-id (a64-buffer-labels buf))))
           (unless raw-target
             (error "AArch64: undefined label ~D (fixup at index ~D, type ~A)" label-id index type))
@@ -1499,7 +1503,18 @@
    to before.")
 
 (defun a64-pcrel-p ()
-  (and *a64-pcrel* (not *aarch64-jit-mode*)))
+  "PC-relative layout addresses: the image build, and since the snapshot work
+   the runtime JIT too.  A JIT page's address is not known while it is
+   translated, so its :ADRP-ABS fixups are deferred to *AARCH64-JIT-ADRP-
+   FIXUPS* and the page builder resolves them (mvm-eval.lisp
+   %JIT-RESOLVE-ADRP-FIXUPS).  A page that is position-independent for the
+   layout can be saved in a snapshot and run at another slide unpatched --
+   which iOS, where the saved pages are signed code, requires."
+  (and *a64-pcrel* t))
+
+(defvar *aarch64-jit-adrp-fixups* nil
+  "JIT mode: (INDEX . TARGET) for each :ADRP-ABS fixup of the page being
+   translated, resolved by the page builder once the page's address is known.")
 
 (defun a64-emit-pcrel-pair (buf rd lo12)
   "ADRP Xd,#0 ; ADD Xd,Xd,#LO12 — the page delta is filled in once the site's
@@ -2627,7 +2642,7 @@
   (a64-load-tls-addr buf +a64-x17+ #x10000150 +a64-x16+)
   (a64-movz buf +a64-x16+ 2 0)
   (a64-str-width buf +a64-x16+ +a64-x17+ 0 2)
-  (a64-load-imm64 buf +a64-x16+ entry)
+  (a64-load-real-addr buf +a64-x16+ entry)   ; image code: PC-relative where the layout is
   (a64-blr buf +a64-x16+)
   (a64-mov-reg buf +a64-x16+ +a64-x0+)
   (a64-ldp-offset buf +a64-x2+ +a64-x3+ +a64-sp+ 16)
@@ -3953,7 +3968,9 @@
           ((or (= op +op-li-addr+) (= op +op-li-taddr+))
            (let* ((vd (vr 0))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
-             (a64-load-real-addr buf pd (vr 1))
+             ;; The operand is the link-time address (mvm.lisp, LAYOUT
+             ;; ADDRESSES IN BYTECODE): where it is in THIS process.
+             (a64-load-real-addr buf pd (+ (vr 1) (%layout-slide)))
              (when (= op +op-li-taddr+) (a64-lsl-imm buf pd pd 1))
              (unless (a64-phys-reg vd) (store-dst pd vd))))
 
@@ -4161,12 +4178,14 @@
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
              (if (and *aarch64-jit-mode* *aarch64-jit-constvec-p*
                       ;; The slot load below is an LDR with a 12-bit SCALED
-                      ;; unsigned offset: byte offsets up to 32760, i.e. idx
-                      ;; <= 4095.  A larger index falls through to the baked
-                      ;; quad, which the R-CONST-BAKED gate then rejects, so
-                      ;; that form interprets (correct, just not native)
-                      ;; rather than silently loading from a truncated offset.
-                      (<= idx 4095))
+                      ;; unsigned offset (idx <= 4095), with an ADD #imm, LSL 12
+                      ;; in front for the rest: idx < 2^21.  The pool is one
+                      ;; growing table for the whole process, so a big world
+                      ;; (kiln's iOS snapshot) passes 4095 early -- and every
+                      ;; later module with a constant fell to the baked quad,
+                      ;; which the R-CONST-BAKED gate rejects: all of it ran
+                      ;; interpreted.
+                      (< idx 2097152))
                  ;; #282 CONSTVEC PATH (aarch64 port of WS5 #223 / #226).
                  ;; Load the pool object THROUGH the GC-updated vector, so
                  ;; nothing is baked and nothing needs re-baking after a
@@ -4186,15 +4205,19 @@
                    ;; garbage.  Fall back to the same literal %jit-constvec
                    ;; hard-codes.  Host-side the defvar IS initialised, so
                    ;; image builds are unaffected.
-                   (a64-load-imm64 buf pd (if (integerp *aarch64-jit-constvec-root*)
-                                              (conv-real *aarch64-jit-constvec-root*)
-                                              (conv-real #x10000FD0)))
+                   ;; A region address: PC-relative where the layout is.
+                   (a64-load-real-addr buf pd (if (integerp *aarch64-jit-constvec-root*)
+                                                  (conv-real *aarch64-jit-constvec-root*)
+                                                  (conv-real #x10000FD0)))
                    (a64-ldr-unsigned buf pd pd 0)      ; pd = tagged vector
                    ;; Slot address = (vec - 9) + 16 + idx*8 = vec + idx*8 + 7,
                    ;; the formula obj-ref/aref use.  LDR needs an 8-aligned
                    ;; scaled offset, so fold the +7 into the base first.
                    (a64-add-imm buf pd pd 7)
-                   (a64-ldr-unsigned buf pd pd (* idx 8)))
+                   (when (> idx 4095)                  ; ADD pd, pd, #hi, LSL #12
+                     (a64-emit buf (logior #x91400000 (ash (* (ash idx -12) 8) 10)
+                                           (ash pd 5) pd)))
+                   (a64-ldr-unsigned buf pd pd (* (logand idx 4095) 8)))
                  ;; Image-build path (unchanged): MOVZ/MOVK placeholder quad,
                  ;; patched with the tagged pool address once layout is final.
                  (let ((movz-byte-pos
@@ -8383,6 +8406,7 @@
   ;; (only populated under *aarch64-jit-mode*; nil otherwise so image-build
   ;; codegen is unchanged).
   (setf *aarch64-call-relocs* nil)
+  (setf *aarch64-jit-adrp-fixups* nil)
   (setf *aarch64-call-reloc-nargs* nil)
   (setf *aarch64-last-set-nargs* nil)
   (setf *aarch64-fn-addr-relocs* nil)

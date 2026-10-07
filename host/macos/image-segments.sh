@@ -15,6 +15,14 @@
 # The loader slides all three with the rest of the executable, by the same
 # amount, so the distances the image's ADRP+ADD sites encode hold.  Writes the
 # two zero-filled section files into SCRATCH-DIR.
+#
+# MODUS_CORE=FILE (a save-and-die snapshot of this image, lib/save-image.lisp):
+# the snapshot's JIT CODE becomes the first part of the arena, as
+#   __MODUSC  r-x  the arena's code pages, byte for byte, at the arena base
+# and __MODUSA reserves only the rest.  That code is position-independent for
+# the layout, so signed and read-only it runs wherever the loader slides it --
+# which is how an iOS app, which can never write code, carries native code
+# compiled on the Mac.  The restore finds those bytes already in place.
 set -eu
 IMAGE=$1
 DIR=$2
@@ -56,6 +64,27 @@ if [ -n "$(sym MODUS-LAYOUT-REGION-LO)" ]; then
     lo=$((0x$(sym MODUS-LAYOUT-$name-LO))); hi=$((0x$(sym MODUS-LAYOUT-$name-HI)))
     [ $((lo % P)) -eq 0 ] && [ $((hi % P)) -eq 0 ] ||
       { echo "image-segments: $name is not 16 KB aligned" >&2; exit 1; }
+    if [ "$name" = ARENA ] && [ -n "${MODUS_CORE:-}" ]; then
+      # The core's header words are stored as fixnums (value << 1).
+      cw() { echo $(( $(od -An -t u8 -j "$1" -N 8 "$MODUS_CORE" | tr -d ' ') / 2 )); }
+      FROM=$(cw 8); FREE=$(cw 32); BLEN=$(cw 48); ALO=$(cw 64); ABUMP=$(cw 72); CONV=$(cw 80)
+      # The saving process ran at some slide: its region base (0x10000000 in
+      # the image's terms) was CONV, and the region's link base is 16 MB
+      # above REGION-LO.  The code itself is position-independent.
+      SLIDE=$((CONV - 0x$(sym MODUS-LAYOUT-REGION-LO) - 0x1000000))
+      [ "$ALO" -eq $((lo + SLIDE)) ] || { echo "image-segments: the core's arena is not this image's" >&2; exit 1; }
+      CODE=$((ABUMP - ALO))
+      if [ "$CODE" -gt 0 ]; then
+        OFF=$((128 + 4096 + FREE - FROM + 2 * BLEN))
+        tail -c +$((OFF + 1)) "$MODUS_CORE" | head -c "$CODE" > "$DIR/arena-code.bin"
+        CSPAN=$(round "$CODE")
+        echo ".section __MODUSC,__code" >> "$S"
+        echo ".incbin \"$DIR/arena-code.bin\"" >> "$S"
+        [ "$CSPAN" -gt "$CODE" ] && echo ".space $((CSPAN - CODE))" >> "$S"
+        FLAGS="$FLAGS -Wl,-segprot,__MODUSC,rx,rx -Wl,-segaddr,__MODUSC,$(printf '%#x' "$lo")"
+        lo=$((lo + CSPAN))
+      fi
+    fi
     echo ".zerofill $seg,__reserve,_modus_reserve_$name,$((hi - lo)),14" >> "$S"
     FLAGS="$FLAGS -Wl,-segprot,$seg,rw,rw -Wl,-segaddr,$seg,$(printf '%#x' "$lo")"
   done

@@ -6061,6 +6061,14 @@
 ;; NOT add a stub defun: a third same-name copy re-triggers the
 ;; duplicate-defun by-name ambiguity (CHUNK-CRASH regression class).
 
+(defun %clos-cpl-has-p (obj name)
+  "True iff NAME is EQ to a class name in the CPL of the CLOS instance OBJ."
+  (let ((c (%obj-cpl obj)))
+    (loop
+      (when (null c) (return nil))
+      (when (eq (car c) name) (return t))
+      (setq c (cdr c)))))
+
 (defun typep (obj type)
   (when (or (eq type 'values)
             (and (consp type)
@@ -6072,6 +6080,13 @@
      (typep obj (aref type 1)))
     ((%class-proxy-p type)
      (typep obj (aref type 1)))
+    ;; AN INSTANCE OF A NAMED CLASS, first.  Otherwise a (typep x 'my-class) --
+    ;; what every ETYPECASE over an app's own classes asks -- walked ~90 built-in
+    ;; names, the struct and condition registries, and only then the CPL: 3 us
+    ;; native.  This answers only YES (TYPE is EQ to a class in OBJ's CPL, which
+    ;; is the answer the CPL walk at the bottom gives); anything else falls
+    ;; through to the full test unchanged.
+    ((and (symbolp type) (%clos-instance-p obj) (%clos-cpl-has-p obj type)) t)
     ((not (consp type))
      (let ((tn type))
        (cond

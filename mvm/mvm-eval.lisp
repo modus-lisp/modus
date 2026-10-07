@@ -461,6 +461,27 @@
 (defvar *jit-lcell-next* 0 "bump pointer into the current cell arena page.")
 (defvar *jit-lcell-end* 0 "end of the current cell arena page.")
 
+(defvar *jit-data-next* nil
+  "Low end of the JIT arena's DATA pages, which grow DOWN from its top while
+   code pages grow up from its base.  NIL until the first is taken.")
+
+(defun %jit-data-page ()
+  "A 16 KB page of DATA in the JIT arena, taken from the top down: the
+   linkage cells.  Kept apart from code so a snapshot's arena splits into a
+   code part, which an iOS app carries as signed read-only pages, and a data
+   part, which must stay writable (a restore at another slide rewrites the
+   cells; lib/save-image.lisp).  16 KB, iOS's page size, so the two parts
+   never share one.  0 when there is no arena (the caller falls back to an
+   ordinary exec page)."
+  (let ((alo (%core-jit-arena-lo)) (bump (%core-jit-arena-bump)))
+    (if (or (= bump 0) (= alo 0))
+        0
+        (let* ((top (or *jit-data-next* (+ alo #x20000000)))
+               (p (- top 16384)))
+          (if (<= p (+ bump 16384))
+              0
+              (progn (setq *jit-data-next* p) p))))))
+
 (defun %jit-linkage-cell (name)
   "Return the stable u64 cell address holding NAME's current native code
    address, creating it (zero-initialised) on first request.  NIL only if the
@@ -472,10 +493,12 @@
         c
         (progn
           (when (>= *jit-lcell-next* *jit-lcell-end*)
-            (let ((p (%mmap-exec-page 4096)))
+            (let* ((d (%jit-data-page))
+                   (p (if (> d 0) d (%mmap-exec-page 4096)))
+                   (len (if (> d 0) 16384 4096)))
               (if (< p 4096)
                   (return-from %jit-linkage-cell nil)
-                  (setq *jit-lcell-next* p *jit-lcell-end* (+ p 4096)))))
+                  (setq *jit-lcell-next* p *jit-lcell-end* (+ p len)))))
           (let ((cell *jit-lcell-next*))
             (setq *jit-lcell-next* (+ cell 8))
             (setf (mem-ref cell :u64) 0)
@@ -524,6 +547,27 @@
         (setf (mem-ref (+ base (+ wo 2)) :u8) (logand (ash nw -16) 255))
         (setf (mem-ref (+ base (+ wo 3)) :u8) (logand (ash nw -24) 255)))
       (setq k (+ k 1)))))
+
+(defun %jit-write-pcrel-quad (base off target)
+  "Rewrite the MOVZ/MOVK placeholder quad at BASE+OFF (16 bytes, register taken
+   from its first word) to form TARGET from the PC: ADRP + ADD #lo12, then two
+   NOPs.  For a TARGET in the image's own layout -- image code, a JIT page or
+   thunk, a region word -- under a PC-relative layout (*A64-PCREL*), so the
+   page is correct at any slide: a snapshot's JIT pages run unpatched after a
+   restore elsewhere (lib/save-image.lisp), which iOS, where they are signed
+   code, requires.  A tagged code word (entry|3) works too: entries are 16-
+   aligned, so the tag never crosses a page.  Elsewhere the absolute quad."
+  (if (not (and (boundp (quote *a64-pcrel*)) *a64-pcrel*))
+      (%jit-write-movz-quad base off target)
+      (let* ((pc (+ base off))
+             (rd (logand (logior (mem-ref pc :u8) (ash (mem-ref (+ pc 1) :u8) 8)) 31))
+             (pages (- (ash target -12) (ash pc -12))))
+        (%jit-write-word32 base off (logior #x90000000 (ash (logand pages 3) 29)
+                                            (ash (logand (ash pages -2) #x7FFFF) 5) rd))
+        (%jit-write-word32 base (+ off 4) (logior #x91000000 (ash (logand target 4095) 10)
+                                                  (ash rd 5) rd))
+        (%jit-write-word32 base (+ off 8) #xD503201F)
+        (%jit-write-word32 base (+ off 12) #xD503201F))))
 
 (defun %jit-write-word32 (base off w)
   "Store the 32-bit instruction W at BASE+OFF, little-endian."
@@ -923,7 +967,13 @@
 ;; DEFUNs, not defconstants: a defconstant in this file read UNBOUND at
 ;; runtime (the positional-folding class), which faulted the builder.
 (defun %jit-thunk-size () 48)
-(defun %jit-bridge-cap () 4096)
+(defun %jit-bridge-cap ()
+  ;; One index per #'NAME thunk and per call-site bridge.  4096 ran out while
+  ;; kiln loaded its world (3876 call-site bridges alone), and from then on any
+  ;; function calling a not-yet-native callee -- every runtime DEFCLASS
+  ;; accessor is a closure -- failed its page and stayed INTERPRETED.  The
+  ;; thunks carry the index as a 32- or 64-bit immediate; only this table bounds it.
+  65536)
 
 (defun %jit-bridge-resolve (idx)
   (let ((nm (if (and *jit-bridge-names* (< idx (length *jit-bridge-names*)))
@@ -963,8 +1013,13 @@
 (defun %jit-bridge-ensure ()
   "First-use init of the bridge tables; T when usable."
   (when (null *jit-bridge-names*)
-    (setq *jit-bridge-names* (make-array 4096))
+    (setq *jit-bridge-names* (make-array (%jit-bridge-cap)))
     (setq *jit-bridge-count* 0))
+  ;; A snapshot from before the cap rose: carry its names into a bigger table.
+  (when (< (length *jit-bridge-names*) (%jit-bridge-cap))
+    (let ((nv (make-array (%jit-bridge-cap))) (old *jit-bridge-names*))
+      (dotimes (i (length old)) (aset nv i (aref old i)))
+      (setq *jit-bridge-names* nv)))
   (when (null *jit-thunk-page*)
     (%jit-thunk-new-page))
   (if *jit-thunk-page* t nil))
@@ -1021,7 +1076,7 @@
 (defun %jit-make-bridge-thunk (name nargs)
   "Build the x64 bridge thunk for a NARGS-arg call to NAME; its address or NIL."
   (if (or (null nargs) (> nargs 3) (null (%jit-bridge-ensure))
-          (>= *jit-bridge-count* 4096))
+          (>= *jit-bridge-count* (%jit-bridge-cap)))
       nil
       (let ((addr (%jit-thunk-alloc)))
         (if (null addr) nil (%jit-thunk-fill addr name nargs)))))
@@ -1095,13 +1150,13 @@
   (%jit-emit-quad-placeholder (+ addr k) 0)
   (%jit-write-movz-quad addr k (ash idx 1))
   (%jit-emit-quad-placeholder (+ addr k 16) 17)
-  (%jit-write-movz-quad addr (+ k 16) (%conv-addr #x10000150))
+  (%jit-write-pcrel-quad addr (+ k 16) (%conv-addr #x10000150))
   (let ((j (+ k 32)))
     (setq j (+ j (%jit-emit-thread-delta-aarch64 addr j 17 16)))
     (%jit-emit-word32 (+ addr j) (logior #x52800010 (ash (+ nargs 1) 5)))   ; movz w16, #nargs+1
     (%jit-emit-word32 (+ addr j 4) #xB9000230)                              ; str w16, [x17]
     (%jit-emit-quad-placeholder (+ addr j 8) 16)
-    (%jit-write-movz-quad addr (+ j 8) (%jit-bridge-entry nargs))
+    (%jit-write-pcrel-quad addr (+ j 8) (%jit-bridge-entry nargs))
     (%jit-emit-word32 (+ addr j 24) #xD61F0200)                             ; br x16
     (+ j 28)))
 
@@ -1115,7 +1170,7 @@
 
 (defun %jit-make-bridge-thunk-aarch64 (name nargs)
   (if (or (null nargs) (> nargs 3) (null (%jit-bridge-ensure))
-          (>= *jit-bridge-count* 4096))
+          (>= *jit-bridge-count* (%jit-bridge-cap)))
       nil
       (let ((addr (%jit-thunk-alloc-aarch64)))
         (if (null addr) nil (%jit-thunk-fill-aarch64 addr name nargs)))))
@@ -1156,11 +1211,27 @@
 ;;;   br   x16                           D61F0200
 (defun %jit-fnaddr-idx-slot () (%conv-addr #x10000178))
 (defvar *jit-fnaddr-thunks* nil "Alist NAME-string -> thunk address (one per name).")
+(defvar *jit-fnaddr-thunk-index* nil
+  "EQUAL hash NAME-string -> its *JIT-FNADDR-THUNKS* entry.  The alist is
+   searched at every call-site relocation and every redefinition, and with one
+   thunk per not-yet-native callee it runs to thousands of names: a STRING=
+   scan per lookup.  Built from the alist on first use, so an older snapshot
+   (alist only) gets one too.")
+
+(defun %jit-fnaddr-thunk-entry (name)
+  "NAME's (NAME . thunk-address) entry, or NIL."
+  (when (and (stringp name) *jit-fnaddr-thunks*)
+    (when (null *jit-fnaddr-thunk-index*)
+      (let ((h (make-hash-table :test (function equal))))
+        (dolist (e *jit-fnaddr-thunks*)
+          (unless (gethash (car e) h) (setf (gethash (car e) h) e)))
+        (setq *jit-fnaddr-thunk-index* h)))
+    (gethash name *jit-fnaddr-thunk-index*)))
 (defun %jit-bridge-any (&rest args)
   "Late-bound target of a #'NAME value thunk: resolve the name whose index the
    thunk stored in the fn-addr slot, then apply it to the caller's arguments."
   (let* ((idx (mem-ref #x10000178 :u32))
-         (f (%jit-bridge-resolve idx)))
+         (f (%jit-bridge-lookup idx)))
     ;; Cache a NATIVE target (tag-3 code word) in the thunk so the next call
     ;; branches straight to it; a heap function (interpreted closure, tag 9)
     ;; keeps taking this path.  Cleared by %jit-fnaddr-thunk-invalidate on
@@ -1168,17 +1239,49 @@
     (let ((word (%val->word f)))
       (when (eql (logand word 15) 3)
         (let* ((nm (aref *jit-bridge-names* idx))
-               (h (and (stringp nm) *jit-fnaddr-thunks*
-                       (assoc nm *jit-fnaddr-thunks* :test (function string=)))))
+               (h (%jit-fnaddr-thunk-entry nm)))
           ;; RAW-ADDR-AUDIT: the thunk's LDR reads the slot's RAW bits, and a
           ;; Lisp (setf (mem-ref … :u64)) stores the value's tagged form
           ;; (fixnum n is stored as n<<1), so store HALF the (4-aligned)
           ;; address — its raw bits are then exactly the entry address.
           ;; Storing the address itself branched to twice it (a recovered
           ;; fault, surfacing as #(SIMPLE-ERROR NIL)).
-          (when h (setf (mem-ref (%jit-fnaddr-thunk-cache-slot (cdr h)) :u64)
-                        (ash (- word 3) -1))))))
+          ;; Only while this process can write code: a restored snapshot's
+          ;; thunks are signed, read-only pages on iOS (lib/save-image.lisp),
+          ;; and there every call takes this slow path instead.
+          (when (and h (%jit-enabled-p))
+            (setf (mem-ref (%jit-fnaddr-thunk-cache-slot (cdr h)) :u64)
+                  (ash (- word 3) -1))))))
     (apply f args)))
+
+(defun %jit-before-save ()
+  "Before a snapshot (lib/save-image.lisp): empty every #'NAME thunk's cached
+   target.  It is an absolute address in a code page, which a restore at
+   another slide could not correct where the pages are read-only (iOS)."
+  (dolist (h *jit-fnaddr-thunks*)
+    (setf (mem-ref (%jit-fnaddr-thunk-cache-slot (cdr h)) :u64) 0))
+  nil)
+
+(defun %jit-after-relocate (l0 l1 d)
+  "After a restore at another slide: move by D what the arena's DATA pages
+   hold as raw addresses -- each linkage cell's native entry address, and the
+   mutex-cell allocator's base, next and limit (net/hosted-sync.lisp
+   %SYNC-CELL-CTL, when it lives in a data page).  The pages' own addresses,
+   held in Lisp variables, were moved with the rest of the heap."
+  (let ((ctl (and (boundp (quote *sync-ctl*)) *sync-ctl*)))
+    (when (and (integerp ctl) (> ctl 0))
+      (dolist (off (list #x08 #x10 #x18))
+        (let ((a (%gc-read64 (+ ctl off))))
+          (when (and (>= a l0) (< a l1))
+            (%gc-write64 (+ ctl off) (+ a d)))))))
+  (when *jit-lcell-table*
+    (maphash (lambda (name cell)
+               (declare (ignore name))
+               (let ((a (%gc-read64 cell)))
+                 (when (and (>= a l0) (< a l1))
+                   (%gc-write64 cell (+ a d)))))
+             *jit-lcell-table*))
+  nil)
 (defun %jit-bridge-any-entry ()
   (- (%val->word (symbol-function (quote %jit-bridge-any))) 3))
 (defun %jit-fnaddr-thunk-cache-slot (addr)
@@ -1188,12 +1291,46 @@
    slow path."
   (+ addr 88))
 
+(defvar *jit-bridge-fns* nil
+  "THE BRIDGE'S FUNCTION CACHE: IDX -> the function the #'NAME thunk IDX last
+   resolved to, valid while *JIT-BRIDGE-FN-GENS*[IDX] is *JIT-BRIDGE-GEN*.  A
+   NATIVE target is cached in the thunk itself and never gets here; this is for
+   the rest -- a closure, which is every runtime DEFCLASS accessor and GF stub --
+   whose every call re-hashed its name string in *SYMBOL-FUNCTION-TABLE*: ~5 us
+   of a 7.8 us slot accessor.  Filled on the main thread only (a worker's lookup
+   result may be its own region's object; see %MVM-ON-MAIN-THREAD-P).")
+(defvar *jit-bridge-fn-gens* nil)
+(defvar *jit-bridge-gen* 0
+  "Bumped by every %JIT-FNADDR-THUNK-INVALIDATE -- any redefinition -- which
+   empties the whole bridge function cache at once.")
+
+(defun %jit-bridge-lookup (idx)
+  "%JIT-BRIDGE-RESOLVE through *JIT-BRIDGE-FNS*."
+  (let ((v *jit-bridge-fns*) (g *jit-bridge-fn-gens*) (gen *jit-bridge-gen*))
+    (if (and v (< idx (length v)) (eql (aref g idx) gen))
+        (aref v idx)
+        (let ((f (%jit-bridge-resolve idx)))
+          (when (%mvm-on-main-thread-p)
+            (when (or (null v) (>= idx (length v)))
+              (let* ((n (max 1024 (* 2 (+ idx 1))))
+                     (nv (make-array n :initial-element nil))
+                     (ng (make-array n :initial-element nil)))
+                (when v
+                  (dotimes (i (length v))
+                    (aset nv i (aref v i))
+                    (aset ng i (aref g i))))
+                (setq *jit-bridge-fns* nv *jit-bridge-fn-gens* ng v nv g ng)))
+            (aset v idx f)
+            (aset g idx gen))
+          f))))
+
 (defun %jit-fnaddr-thunk-invalidate (name)
   "A DEFUN / (setf symbol-function) of NAME: drop the cached native target of
    its #'NAME thunk so the next call re-resolves — late binding is what the
-   thunk exists for.  No-op when NAME has no thunk (and on x64, which bakes)."
-  (let ((h (and (stringp name) *jit-fnaddr-thunks*
-                (assoc name *jit-fnaddr-thunks* :test (function string=)))))
+   thunk exists for.  No-op when NAME has no thunk (and on x64, which bakes).
+   Every call also empties the bridge function cache (*JIT-BRIDGE-GEN*)."
+  (setq *jit-bridge-gen* (if (integerp *jit-bridge-gen*) (+ *jit-bridge-gen* 1) 1))
+  (let ((h (%jit-fnaddr-thunk-entry name)))
     (when h (setf (mem-ref (%jit-fnaddr-thunk-cache-slot (cdr h)) :u64) 0))))
 
 (defun %jit-fnaddr-thunk-fill-aarch64 (addr name)
@@ -1223,29 +1360,32 @@
     (%jit-write-movz-quad addr k idx)
     (setq k (+ k 16))
     (%jit-emit-quad-placeholder (+ addr k) 16)
-    (%jit-write-movz-quad addr k (%jit-fnaddr-idx-slot))
+    (%jit-write-pcrel-quad addr k (%jit-fnaddr-idx-slot))
     (setq k (+ k 16))
     (setq k (+ k (%jit-emit-thread-delta-aarch64 addr k 16 9)))   ; x16 += delta (x9 scratch)
     (%jit-emit-word32 (+ addr k) #xB9000211)          ; str w17, [x16]
     (setq k (+ k 4))
     (%jit-emit-quad-placeholder (+ addr k) 16)
-    (%jit-write-movz-quad addr k (%jit-bridge-any-entry))
+    (%jit-write-pcrel-quad addr k (%jit-bridge-any-entry))
     (setq k (+ k 16))
     (%jit-emit-word32 (+ addr k) #xD61F0200)          ; br x16
     (%jit-icache-flush addr 96)
     addr))
 (defun %jit-make-fnaddr-thunk-aarch64 (name)
   "Thunk address (16-aligned, so |3 is a valid tag-3 word) for #'NAME, or NIL."
-  (let ((hit (and (stringp name) (assoc name *jit-fnaddr-thunks* :test (function string=)))))
+  (let ((hit (%jit-fnaddr-thunk-entry name)))
     (if hit
         (cdr hit)
-        (if (or (null name) (null (%jit-bridge-ensure)) (>= *jit-bridge-count* 4096))
+        (if (or (null name) (null (%jit-bridge-ensure)) (>= *jit-bridge-count* (%jit-bridge-cap)))
             nil
             (let ((addr (%jit-thunk-alloc-aarch64)))
               (if (null addr)
                   nil
                   (let ((a (%jit-fnaddr-thunk-fill-aarch64 addr name)))
-                    (setq *jit-fnaddr-thunks* (cons (cons name a) *jit-fnaddr-thunks*))
+                    (let ((e (cons name a)))
+                      (setq *jit-fnaddr-thunks* (cons e *jit-fnaddr-thunks*))
+                      (when *jit-fnaddr-thunk-index*
+                        (setf (gethash name *jit-fnaddr-thunk-index*) e)))
                     a)))))))
 
 (defun %jit-reloc-calls (base relocs rt-table)
@@ -1580,6 +1720,16 @@
             (when (eql (logand addr 15) 0)
               (let ((fn (%word->val (logior addr 3))))
                 (when (boundp (quote *symbol-function-table*))
+                  ;; A GENERIC FUNCTION'S DISPATCHER: CLOS finds the GF from
+                  ;; the function object (cl-clos.lisp %FN-TO-GF, an ASSOC on
+                  ;; *GF-FN-TO-NAME*), which still names the trampoline this
+                  ;; replaces -- so natively COMPUTE-APPLICABLE-METHODS of
+                  ;; #'NAME found nothing, and every warp consumer refused to
+                  ;; initialise.  Register the native function as well.
+                  (let* ((old (gethash nm *symbol-function-table*))
+                         (gf (and old (boundp (quote *gf-fn-to-name*))
+                                  (assoc old *gf-fn-to-name*))))
+                    (when gf (%register-gf-fn fn (cdr gf))))
                   (%jit-fnaddr-thunk-invalidate nm)
                   (puthash nm *symbol-function-table* fn))
                 (when (boundp (quote *native-sym-function-table*))
@@ -1631,9 +1781,12 @@
     (and f (eql (logand (%val->word f) 15) 3))))
 
 (defvar *jit-eager-failed* nil
-  "Module bytecode vectors (EQ) JIT-EAGER already failed to translate; see
-   %JIT-EAGER-ALL.  Boots NIL (a defvar init does not run in-image), which is
-   the right empty value.")
+  "(BYTECODE . NATIVE-COUNT) for each module JIT-EAGER failed to translate,
+   with *JIT-NATIVE-DEFUN-COUNT* as it was then; see %JIT-EAGER-ALL.  Boots
+   NIL (a defvar init does not run in-image), which is the right empty value.")
+(defvar *jit-eager-built* nil
+  "Module bytecode vectors JIT-EAGER has translated: never translated again,
+   even when one of their names is not native (redefined by a later module).")
 (defvar *jit-skip-prefixes* nil
   "Registered DEFUN names (\"PKG::NAME\") that JIT-EAGER leaves as
    interpreter trampolines, by prefix.  NIL = the default list (%JIT-SKIP-LIST);
@@ -1658,48 +1811,68 @@
 (defun %jit-eager-all ()
   "Translate every registered runtime DEFUN that is still an interpreter
    trampoline to native code and publish it.  Returns (INSTALLED MODULES
-   FAILED).  Needs the JIT active."
+   FAILED).  Needs the JIT active.
+
+   TO A FIXPOINT.  A module is only translated once every function it calls
+   is native, so one pass leaves a caller behind whenever its callee comes
+   later in the pass -- or is REDEFINED by a later module (reel's NEON loop
+   filter replaces the scalar one; its callers stayed interpreted, the whole
+   VP8 loop filter, every pixel of every frame).  So passes repeat while the
+   previous one installed something, at most eight.
+
+   A FAILED MODULE IS RETRIED ONLY WHEN IT CAN NOW SUCCEED: when more functions
+   have gone native since it failed.  Otherwise nothing about it has changed
+   (its bytecode is immutable) and it would fail again -- not cheaply:
+   MEASURED on the AArch64 CLI, re-attempting its 19 untranslatable modules
+   cost 140 MB of region-0 garbage per JIT-EAGER, and %MAKE-NATIVE-THREAD calls
+   JIT-EAGER on every spawn.  That garbage collected region 0 under running
+   workers (docs/macos-hosting.md, sb-thread).  A module that built is never
+   built again (*JIT-EAGER-BUILT*)."
   (if (not (and (%jit-active-p) (boundp (quote *jit-module-registry*))
                 *jit-module-registry*))
       (list 0 0 0)
-      (let ((pending nil) (installed 0) (modules 0) (failed 0) (done nil))
-        ;; collect first: publishing mutates the tables we would otherwise walk
-        (let ((skips (%jit-skip-list)))
-          (maphash (lambda (nm m)
-                     (when (and (not (%jit-skip-name-p nm skips))
-                                (not (%jit-fn-native-p nm)))
-                       (when (not (member m pending :test (function eq)))
-                         (setq pending (cons m pending)))))
-                   *jit-module-registry*))
-        (dolist (m pending)
-          (when (not (member (car m) done :test (function eq)))
-            (setq done (cons (car m) done))
-            ;; A MODULE THAT FAILED ONCE IS NOT RETRIED.  Nothing about it has
-            ;; changed (its bytecode is immutable), so it fails again — and a
-            ;; failing translation is not cheap: MEASURED on the AArch64 CLI,
-            ;; re-attempting its 19 untranslatable modules cost 140 MB of
-            ;; region-0 garbage per JIT-EAGER, and %MAKE-NATIVE-THREAD calls
-            ;; JIT-EAGER on every spawn.  That garbage collected region 0 under
-            ;; running workers (docs/macos-hosting.md, sb-thread).  The count
-            ;; still reports them, so the answer is unchanged.
-            (if (member (car m) *jit-eager-failed* :test (function eq))
-                (setq failed (+ failed 1))
-                (let ((je (%jit-translate-page (car m) (cadr m) (reverse (caddr m))
-                                               (car (cddddr m)))))
-                  (if (and je (cadr (cddddr je)))
-                      (progn
-                        (setq modules (+ modules 1))
-                        (setq installed
-                              (+ installed
-                                 (%jit-install-native-fns (car je) (cadr (cddddr je))
-                                                          (car (cddr (cddddr m)))))))
-                      (progn
-                        (setq failed (+ failed 1))
-                        ;; OFF-MAIN, DO NOT RECORD: the cons would be a worker
-                        ;; object in a region-0 list (%MVM-ON-MAIN-THREAD-P).
-                        (when (%mvm-on-main-thread-p)
-                          (setq *jit-eager-failed*
-                                (cons (car m) *jit-eager-failed*)))))))))
+      (let ((installed 0) (modules 0) (failed 0) (pass 0))
+        (loop
+          (let ((pending nil) (done nil) (this-pass 0) (fails 0)
+                (now (or *jit-native-defun-count* 0)))
+            ;; collect first: publishing mutates the tables we would otherwise walk
+            (let ((skips (%jit-skip-list)))
+              (maphash (lambda (nm m)
+                         (when (and (not (%jit-skip-name-p nm skips))
+                                    (not (%jit-fn-native-p nm))
+                                    (not (member (car m) *jit-eager-built* :test (function eq))))
+                           (when (not (member m pending :test (function eq)))
+                             (setq pending (cons m pending)))))
+                       *jit-module-registry*))
+            (dolist (m pending)
+              (when (not (member (car m) done :test (function eq)))
+                (setq done (cons (car m) done))
+                (let ((f (assoc (car m) *jit-eager-failed* :test (function eq))))
+                  (if (and f (eql (cdr f) now))
+                      (setq fails (+ fails 1))
+                      (let ((je (%jit-translate-page (car m) (cadr m) (reverse (caddr m))
+                                                     (car (cddddr m)))))
+                        (if (and je (cadr (cddddr je)))
+                            (let ((n (%jit-install-native-fns (car je) (cadr (cddddr je))
+                                                              (car (cddr (cddddr m))))))
+                              (setq modules (+ modules 1))
+                              (setq this-pass (+ this-pass n))
+                              ;; OFF-MAIN, DO NOT RECORD: the cons would be a
+                              ;; worker object in a region-0 list.
+                              (when (%mvm-on-main-thread-p)
+                                (setq *jit-eager-built* (cons (car m) *jit-eager-built*))
+                                (when f (setq *jit-eager-failed*
+                                              (remove f *jit-eager-failed*)))))
+                            (progn
+                              (setq fails (+ fails 1))
+                              (when (%mvm-on-main-thread-p)
+                                (if f
+                                    (setf (cdr f) (or *jit-native-defun-count* 0))
+                                    (setq *jit-eager-failed*
+                                          (cons (cons (car m) (or *jit-native-defun-count* 0))
+                                                *jit-eager-failed*)))))))))))
+            (setq installed (+ installed this-pass) failed fails pass (+ pass 1))
+            (when (or (= this-pass 0) (>= pass 8)) (return nil))))
         (when (> installed 0) (%jit-retry-drain))
         (list installed modules failed))))
 
@@ -1935,6 +2108,24 @@
                   *e2-const-pool*))
           nil))))
 
+(defun %jit-resolve-adrp-fixups (base)
+  "Fill in the ADRP of every PC-relative layout address in the page just
+   copied to BASE (translate-aarch64.lisp *AARCH64-JIT-ADRP-FIXUPS*): the page
+   delta from the ADRP's own address to its target.  The ADD after it already
+   holds the target's low 12 bits."
+  (dolist (f *aarch64-jit-adrp-fixups*)
+    (let* ((at (+ base (* 4 (car f))))
+           (pages (- (ash (cdr f) -12) (ash at -12)))
+           (word (logior (mem-ref at :u8) (ash (mem-ref (+ at 1) :u8) 8)
+                         (ash (mem-ref (+ at 2) :u8) 16) (ash (mem-ref (+ at 3) :u8) 24)))
+           (new (logior (logand word #x9F00001F)
+                        (ash (logand pages 3) 29)
+                        (ash (logand (ash pages -2) #x7FFFF) 5))))
+      (setf (mem-ref at :u8) (logand new 255))
+      (setf (mem-ref (+ at 1) :u8) (logand (ash new -8) 255))
+      (setf (mem-ref (+ at 2) :u8) (logand (ash new -16) 255))
+      (setf (mem-ref (+ at 3) :u8) (logand (ash new -24) 255)))))
+
 (defun %jit-translate-page-1-aarch64 (bc mvm-entry ft-list rt-table)
   "WS4-S5 (aarch64) sibling of %jit-translate-page-1.  translate-mvm-to-aarch64
    wants an eql-keyed func-idx→MVM-offset HASH (not x64's (name offset length)
@@ -2070,6 +2261,8 @@
             (setf (mem-ref (+ base (+ o 2)) :u8) (logand (ash w -16) 255))
             (setf (mem-ref (+ base (+ o 3)) :u8) (logand (ash w -24) 255)))
           (setq k (+ k 1)))
+        ;; PC-RELATIVE LAYOUT ADDRESSES (the deferred :ADRP-ABS fixups).
+        (%jit-resolve-adrp-fixups base)
         ;; Out-of-module CALL relocations (untagged callee addr = word-3).
         ;; WS5 #206: the callee must carry the FN tag — see %jit-reloc-calls for
         ;; the full account.  A RUNTIME-defined function (a defun evaluated by an
@@ -2084,6 +2277,22 @@
                  (fn (and name (%mvm-resolve-runtime-fn name)))
                  (word (if fn (%val->word fn) 0))
                  (addr (if (eql (logand word 15) 3) (- word 3) 0)))
+            ;; ANY ARITY: the #'NAME thunk takes the arguments as they are (the
+            ;; callee's index rides in a window slot, and the call site has set
+            ;; nargs), so a callee that is not native yet is no reason to refuse
+            ;; the page.  Through the linkage cell, which %JIT-INSTALL-NATIVE-FNS
+            ;; repoints at the callee's native code the moment it has some -- so
+            ;; MUTUAL RECURSION across modules compiles too (scribe's
+            ;; GLYPH-OUTLINE and %COMPOSITE-GLYPH each waited for the other, and
+            ;; every glyph, so every line of text glass draws, ran interpreted).
+            ;; FIRST, because it is ONE thunk per NAME, shared by every caller:
+            ;; the per-site bridge below spends a table index per call site.
+            (when (and (= addr 0) fn (%jit-bridge-on-p))
+              (let ((th (%jit-make-fnaddr-thunk-aarch64 name)))
+                (when th
+                  (setq addr th)
+                  (setq *jit-bridged-sites*
+                        (if *jit-bridged-sites* (+ 1 *jit-bridged-sites*) 1)))))
             ;; #306 BRIDGE (aarch64 arm): non-native callee -> per-site thunk.
             (when (and (= addr 0) fn (%jit-bridge-on-p))
               (let* ((na (assoc (car r) *aarch64-call-reloc-nargs*))
@@ -2159,16 +2368,31 @@
         ;; (%jit-make-bridge-thunk-aarch64 is nargs-specific today) is the follow-on.
         (dolist (r frel)
           (let* ((name (gethash (cdr r) rt-table))
+                 ;; AN IMAGE FUNCTION IS ITSELF.  #'EQUAL in JIT'd code used to be
+                 ;; the thunk below -- a DIFFERENT object from (symbol-function
+                 ;; 'equal) -- so anything that recognises a function by identity
+                 ;; failed: MAKE-HASH-TABLE took :TEST #'EQUAL for an unknown test
+                 ;; and made an EQL table, every list key missed, and reed's Vorbis
+                 ;; window cache (one per packet, never found) grew until decoding
+                 ;; stopped.  The image's own code is part of the binary, never
+                 ;; moved and not what the late binding below protects (CLOS
+                 ;; generic functions, forward references), so a native word below
+                 ;; the JIT arena is written as it is.
+                 (img (let* ((fn (and name (%mvm-resolve-runtime-fn name)))
+                             (w (if fn (%val->word fn) 0))
+                             (alo (%core-jit-arena-lo)))
+                        (if (and (eql (logand w 15) 3) (> alo 0) (< w alo)) w nil)))
                  ;; NARGS-GENERIC LATE-BINDING THUNK (see %jit-make-fnaddr-thunk-
                  ;; aarch64): the #'NAME value becomes a stable tag-3 word in the
                  ;; exec thunk page that re-resolves NAME on every call — never a
                  ;; baked object, so no staleness, and the form stays NATIVE.
                  ;; Was: fail the page unconditionally (118/121 of reel's fn-addr
                  ;; rejects were `#'MAKE-ARRAY` from the keyword expansion).
-                 (th (and name (%jit-bridge-on-p)
+                 (th (and (null img) name (%jit-bridge-on-p)
                           (%jit-make-fnaddr-thunk-aarch64 name))))
+            (when img (setq th (- img 3)))
             (if th
-                (%jit-write-movz-quad base (car r) (logior th 3))
+                (%jit-write-pcrel-quad base (car r) (logior th 3))
                 (progn
                   (setq *jit-r-reloc-fnaddr-fail*
                         (if *jit-r-reloc-fnaddr-fail*
@@ -2194,7 +2418,7 @@
           (let* ((noff (gethash (cdr r) fn-map))
                  (addr (if noff (+ base noff) 0)))
             (if (and noff (eql (logand addr 15) 0))
-                (%jit-write-movz-quad base (car r) (logior addr 3))
+                (%jit-write-pcrel-quad base (car r) (logior addr 3))
                 (progn
                   (setq *jit-r-lrel-fail*
                         (if *jit-r-lrel-fail* (+ 1 *jit-r-lrel-fail*) 1))
@@ -2706,6 +2930,14 @@
           ;; more callees have gone native (see *jit-retry-queue*).
           (when (and persist-names (%jit-native-defuns-p))
             (%jit-retry-enqueue bc entry ft-list rt-table persist-names))
+          ;; THE FORM RUNS FROM HERE, so a condition it signals is the user's:
+          ;; say so, exactly as the native path does before its call.  Without
+          ;; it the caller's handler took this interpreted run's own error for
+          ;; a setup failure and interpreted the form AGAIN -- measured:
+          ;; (eval '(progn (incf *runs*) (mapcar (lambda (x) x) '(1)) (undef)))
+          ;; left *runs* at 2.  A page fails to build exactly when a callee is
+          ;; unresolved, which is when the run is likeliest to signal.
+          (setq *jit-native-ran* t)
           (%mvm-wrap-escaping-result
             (mvm-interpret bc :entry-point entry
                            :function-table fn-table :runtime-table rt-table
@@ -3332,6 +3564,9 @@
                 ;; / the fn at offset 0), so an ordinary fixnum DATA argument — a loop
                 ;; counter 0/1/2, an index — is never mistaken for a callable.
                 (lam-offsets (make-hash-table))
+                ;; T when the module compiled a LAMBDA / CLOSURE body -- see
+                ;; LAMBDA-BEARING FORMS SKIP RETRY-ON-HOT below.
+                (%lam-bearing nil)
                 ;; WS4-S5b: (name offset length) list for translate-mvm-to-x64
                 ;; (the JIT adapter — same function-info structs as fn-table).
                 (ft-list nil))
@@ -3357,7 +3592,7 @@
                 ;; %MVM-WRAP-ESCAPING in interp.lisp (alexandria EXTREMUM.1).
                 (if (and (or (search "$$LAMBDA" nm) (search "$$CLOSURE" nm))
                          (not (eql off 0)))
-                    (puthash off lam-offsets t)
+                    (progn (puthash off lam-offsets t) (setq %lam-bearing t))
                     ;; NON-lambda module fns (defuns, flet bodies, the thunk)
                     ;; record under the distinct :DEFUN marker: the #x52
                     ;; branches (module-closure vs native-closure
@@ -3485,7 +3720,22 @@
                             ;; forms (never re-eval'd; DEFUNs aren't even cacheable)
                             ;; thus never pay JIT translation — fast loading — while
                             ;; repeated forms go native on the second run.
-                            (if (and (%jit-active-p) (not (%jit-hot-only-p)))
+                            ;;
+                            ;; LAMBDA-BEARING FORMS SKIP RETRY-ON-HOT.  A one-shot
+                            ;; form is not one-shot CODE when it builds a closure
+                            ;; that outlives it: a DEFMETHOD's method function, a
+                            ;; DEFPARAMETER of a lambda, a hook pushed onto a list.
+                            ;; Interpreted, each of those is a trampoline that
+                            ;; re-enters mvm-interpret on EVERY call -- 3 us, against
+                            ;; 0.005 us native -- and no later pass revisits it:
+                            ;; %JIT-EAGER-ALL rebuilds DEFUN modules, and the form
+                            ;; that made the closure never runs again.  Measured on
+                            ;; warp's media player: every method body in the app
+                            ;; interpreted, a generic call 4.5 us, and a 40-row
+                            ;; layout 24 ms a frame.  So a module that compiled a
+                            ;; lambda body is JIT'd on its first run; if the page
+                            ;; cannot be built it interprets exactly as before.
+                            (if (and (%jit-active-p) (or (not (%jit-hot-only-p)) %lam-bearing))
                                 (handler-case
                                     (%mvm-eval-jit-run bc entry (reverse ft-list)
                                                     fn-table rt-table lam-offsets nil

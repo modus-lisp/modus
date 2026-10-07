@@ -3864,8 +3864,15 @@
     ((characterp x) nil)
     ((stringp x) nil)
     ((symbolp x) nil)
+    ;; AN ARRAY BEFORE THE GF REGISTRY.  %GENERIC-FUNCTION-P ends in a MEMBER
+    ;; over *GF-STUB-CLOSURES* -- every generic function's dispatcher, thousands
+    ;; once a library world is loaded -- so (functionp #(…)) walked all of it,
+    ;; and LENGTH asks FUNCTIONP of every vector: 20 us a call, which made
+    ;; glass's FB-RECT (a FILL per row) 13 ms.  The only array that is a
+    ;; generic function is the GF object itself; dispatch closures are not
+    ;; arrays.
+    ((arrayp x) (if (%gf-p x) t nil))
     ((%generic-function-p x) t)
-    ((arrayp x) nil)
     ;; A BIGNUM is a tagged object (tag 9), so it slips past the tagged-fn
     ;; (nibble 3) and code-range checks and used to hit the `(t t)' fallback →
     ;; (functionp <bignum>) = T.  Under mvm-eval that made op-obj-subtag report

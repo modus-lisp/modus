@@ -340,7 +340,7 @@
 
 (defun %sb-raw-report (msg)
   "MSG to fd 2 with raw write(2) calls from this thread's scratch word."
-  (let ((w (+ (%tls-self-base) #x100050B0))
+  (let ((w (+ (%tls-self-base) (%conv-addr #x100050B0)))
         (pre "
 modus: unhandled error in a thread: "))
     (dolist (str (list pre msg (string #\Newline)))
@@ -357,6 +357,49 @@ modus: unhandled error in a thread: "))
     (if done
         c
         (%sb-locked (256) (list :%sb-unpassable (copy-seq c))))))
+
+;;; ---- SHARING A VALUE WITH OTHER THREADS: MODUS:SHARE --------------------------
+;;;
+;;; Modus threads share no state.  A thread's objects live in its own region,
+;;; which only its own collector scans, so a pointer to one from anywhere
+;;; another thread can reach goes stale -- and the shared-store guard refuses
+;;; the store that would make it (translate-x64 / translate-aarch64, SHARED-
+;;; STORE GUARD).  A value meant for another thread is therefore SENT: copied
+;;; into shared memory first, exactly as JOIN-THREAD's result is.  These two
+;;; are that, for library code that hands data between threads itself (a decoder
+;;; thread filling a player's queues, say):
+;;;
+;;;   (modus:share X)       X, or a copy of it in shared memory -- X itself on
+;;;                         the main thread and for anything already shared,
+;;;                         so it is cheap to apply at every boundary.  Conses,
+;;;                         strings, numbers, vectors, structs, CLOS instances,
+;;;                         hash tables; a closure cannot be copied (an error).
+;;;   (modus:make-shared-array N &rest MAKE-ARRAY-ARGS)
+;;;                         an array allocated in shared memory to begin with:
+;;;                         a big buffer a thread fills in place and then
+;;;                         publishes, with nothing to copy.
+;;;
+;;; Portable code reaches them as #+modus (modus:share x) and is unchanged
+;;; elsewhere.
+
+(defun modus::share (x)
+  (if (zerop (%tls-self-base))
+      x
+      (let* ((done nil)
+             (c (catch '%sb-unpassable
+                  (prog1 (%sb-copy x 0) (setq done t)))))
+        (if done
+            c
+            (error "modus:share: ~A cannot be passed between threads" c)))))
+
+(defun modus::make-shared-array (n &rest args)
+  (if (zerop (%tls-self-base))
+      (apply (function make-array) n args)
+      ;; Room for the largest element type, header and padding included.
+      (%sb-locked ((+ (* 8 (if (integerp n) n (reduce (function *) n))) 64))
+        (apply (function make-array) n args))))
+
+(export (list (intern "SHARE" "MODUS") (intern "MAKE-SHARED-ARRAY" "MODUS")) "MODUS")
 
 (defun %sb-thread-body (thread box function arguments)
   "What every thread MAKE-THREAD starts runs: bind *CURRENT-THREAD*, call
@@ -495,11 +538,19 @@ modus: unhandled error in a thread: "))
 ;;; MUTEXES
 ;;; ============================================================
 
-(defclass sb-thread::mutex ()
-  ((name :initarg :name :initform nil :accessor sb-thread::mutex-name)
-   ;; The raw arena cell.  +0x00 is the futex word, +0x10 the owner, +0x18 the
-   ;; recursion depth.  A number and not a Lisp object: the collector copies.
-   (cell :initarg :cell :accessor %mutex-cell)))
+;;; STRUCTS, NOT CLASSES -- the mutex, the waitqueue and the semaphore alike.
+;;; Each is a name and a cell address, and every lock and unlock reads the
+;;; cell.  As DEFCLASS accessors those reads were generic calls, two per
+;;; WITH-MUTEX, and they were most of what a lock cost; a struct accessor is a
+;;; plain function.
+(defstruct (sb-thread::mutex (:constructor %make-sb-mutex) (:conc-name %mutex-)
+                             (:copier nil) (:predicate nil))
+  (name nil)
+  ;; The raw arena cell.  +0x00 is the futex word, +0x10 the owner, +0x18 the
+  ;; recursion depth.  A number and not a Lisp object: the collector copies.
+  (cell 0))
+
+(defun sb-thread::mutex-name (mutex) (%mutex-name mutex))
 
 (defun sb-thread::mutexp (x) (typep x 'sb-thread::mutex))
 
@@ -510,7 +561,7 @@ modus: unhandled error in a thread: "))
                 (~D cells handed out, ~D refusals).  Cells are never reclaimed; ~
                 see %SYNC-CELL in net/hosted-sync.lisp."
                (%sync-cells-handed-out) (%sync-cells-exhausted))
-        (make-instance 'sb-thread::mutex :name name :cell cell))))
+        (%make-sb-mutex :name name :cell cell))))
 
 (defun sb-thread::mutex-owner (mutex)
   "PARTIAL.  SBCL returns the owning THREAD OBJECT; this returns the owning
@@ -618,15 +669,18 @@ modus: unhandled error in a thread: "))
 ;;; CONDITION VARIABLES
 ;;; ============================================================
 
-(defclass sb-thread::waitqueue ()
-  ((name :initarg :name :initform nil :accessor sb-thread::waitqueue-name)
-   (cell :initarg :cell :accessor %waitqueue-cell)))
+(defstruct (sb-thread::waitqueue (:constructor %make-sb-waitqueue) (:conc-name %waitqueue-)
+                                 (:copier nil) (:predicate nil))
+  (name nil)
+  (cell 0))
+
+(defun sb-thread::waitqueue-name (queue) (%waitqueue-name queue))
 
 (defun sb-thread::make-waitqueue (&key name)
   (let ((cell (%sync-cell)))
     (if (zerop cell)
         (error "sb-thread:make-waitqueue: the synchronisation arena is exhausted.")
-        (make-instance 'sb-thread::waitqueue :name name :cell cell))))
+        (%make-sb-waitqueue :name name :cell cell))))
 
 (defun sb-thread::condition-wait (queue mutex &key timeout)
   "Atomically release MUTEX and wait on QUEUE; re-acquire MUTEX before
@@ -676,16 +730,19 @@ modus: unhandled error in a thread: "))
 ;;; cell, which is why it is a dozen lines and not a new primitive: +0x00 is the
 ;;; mutex, +0x08 the condvar, +0x20 the count.
 
-(defclass sb-thread::semaphore ()
-  ((name :initarg :name :initform nil :accessor sb-thread::semaphore-name)
-   (cell :initarg :cell :accessor %semaphore-cell)))
+(defstruct (sb-thread::semaphore (:constructor %make-sb-semaphore) (:conc-name %semaphore-)
+                                 (:copier nil) (:predicate nil))
+  (name nil)
+  (cell 0))
+
+(defun sb-thread::semaphore-name (semaphore) (%semaphore-name semaphore))
 
 (defun sb-thread::make-semaphore (&key name (count 0))
   (let ((cell (%sync-cell)))
     (if (zerop cell)
         (error "sb-thread:make-semaphore: the synchronisation arena is exhausted.")
         (progn (%gc-write64 (+ cell #x20) count)
-               (make-instance 'sb-thread::semaphore :name name :cell cell)))))
+               (%make-sb-semaphore :name name :cell cell)))))
 
 (defun sb-thread::semaphore-count (semaphore)
   (%gc-read64 (+ (%semaphore-cell semaphore) #x20)))

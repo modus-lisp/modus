@@ -1401,6 +1401,22 @@
                ;; reinterpretation — the slots already hold real VALUES.
                (setf (svref regs vd) (svref regs vs)) (setf pc npc2))))
 
+          ;; LI-TADDR: an address in the image's own layout, loaded as a
+          ;; FIXNUM -- i.e. the integer ADDR.  (The runtime compiler emits it
+          ;; and LI-ADDR under a PC-relative layout; compiler.lisp
+          ;; PCREL-LAYOUT-ADDR-P.)
+          ;; Both carry the LINK-TIME address (mvm.lisp, LAYOUT ADDRESSES IN
+          ;; BYTECODE): add this process's slide.  LI-ADDR is the raw word, so
+          ;; its value is what LI makes of an even word: half of it.
+          (#.+op-li-taddr+
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (addr npc2) (fetch-u64 bc npc)
+               (setf (svref regs vd) (+ addr (%layout-slide))) (setf pc npc2))))
+          (#.+op-li-addr+
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (addr npc2) (fetch-u64 bc npc)
+               (setf (svref regs vd) (ash (+ addr (%layout-slide)) -1)) (setf pc npc2))))
+
           (#.+op-li+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              ;; Peek the high 32 bits to choose the load path WITHOUT forming the

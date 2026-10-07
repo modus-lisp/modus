@@ -147,7 +147,9 @@
             (if *layout-no-x18* "nil" "t")
             (if *layout-pcrel*
                 (format nil "  (let ((%slide (- (%conv-addr #x10000000) (%link-int ~D))))
-~A  )
+~A    (setq *layout-slide* %slide))
+  (setq *a64-pcrel* t)
+  (setq *pcrel-layout* t)
 "
                         (+ #x10000000 *layout-conv-delta*)
                         (layout-slid-text "%slide"))

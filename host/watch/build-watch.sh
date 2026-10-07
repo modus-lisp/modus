@@ -4,8 +4,8 @@
 #
 # IMAGE is a PC-relative, JIT-off Darwin image (the iOS layout):
 #   MODUS_PCREL=1 MODUS_DARWIN=1 MODUS_NO_JIT=1 MODUS_CODE_BASE=300010000 \
-#   MODUS_CONV_DELTA=2F6000000 MODUS_HEAP_BASE=336000000 \
-#   MODUS_JIT_ARENA_BASE=3A8000000 MODUS_CLI_OUT=… sbcl … mvm/build-aarch64-cli.lisp
+#   MODUS_CONV_DELTA=2FA000000 MODUS_HEAP_BASE=33A000000 \
+#   MODUS_JIT_ARENA_BASE=3AC000000 MODUS_CLI_OUT=… sbcl … mvm/build-aarch64-cli.lisp
 #
 # The Simulator runs watch apps as 64-bit processes on the Mac, so the iOS
 # layout works there.  A real watch is arm64_32 (a 4 GB address space) and
@@ -26,6 +26,8 @@ xcrun --sdk watchsimulator swiftc -target $TARGET -parse-as-library -O \
   -module-name ModusWatch -c "$HERE/modus-watch.swift" -o "$OBJ/modus-watch.o"
 xcrun --sdk watchsimulator clang -target $TARGET -isysroot "$SDK" -O2 -Wall \
   -c "$MAC/modus-shim.c" -o "$OBJ/modus-shim.o"
+xcrun --sdk watchsimulator clang -target $TARGET -isysroot "$SDK" -O2 -Wall \
+  -c "$MAC/modus-audio.c" -o "$OBJ/modus-audio.o"
 xcrun --sdk watchsimulator clang -target $TARGET -isysroot "$SDK" \
   -c "$MAC/syscall-stub.S" -o "$OBJ/syscall-stub.o"
 
@@ -34,9 +36,9 @@ WHERE=$("$MAC/image-segments.sh" "$IMAGE" "$OUT.segs")
 TOOLCHAIN=$(dirname "$(dirname "$(xcrun --sdk watchsimulator --find swiftc)")")
 # shellcheck disable=SC2086  # WHERE is a flag list
 xcrun --sdk watchsimulator clang -target $TARGET -isysroot "$SDK" \
-  -o "$OUT/modus" "$OBJ/modus-watch.o" "$OBJ/modus-shim.o" "$OBJ/syscall-stub.o" \
+  -o "$OUT/modus" "$OBJ/modus-watch.o" "$OBJ/modus-shim.o" "$OBJ/modus-audio.o" "$OBJ/syscall-stub.o" \
   -L"$SDK/usr/lib/swift" -L"$TOOLCHAIN/lib/swift/watchsimulator" \
-  -framework SwiftUI -framework CoreGraphics -framework CoreFoundation $WHERE
+  -framework SwiftUI -framework AudioToolbox -framework CoreGraphics -framework CoreFoundation $WHERE
 
 cat > "$OUT/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

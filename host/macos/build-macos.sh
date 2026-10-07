@@ -22,6 +22,6 @@ else
   WHERE="-Wl,-sectcreate,__TEXT,__modus,$IMAGE -Wl,-sectalign,__TEXT,__modus,0x4000"
 fi
 # shellcheck disable=SC2086  # WHERE is a flag list
-cc -O2 -Wall -o "$OUT" "$HERE/modus-shim.c" "$HERE/syscall-stub.S" $WHERE
+cc -O2 -Wall -o "$OUT" "$HERE/modus-shim.c" "$HERE/modus-audio.c" "$HERE/syscall-stub.S" -framework AudioToolbox $WHERE
 codesign --force --sign - "$OUT" >/dev/null 2>&1 || true
 echo "wrote $OUT ($(wc -c < "$OUT" | tr -d ' ') bytes)"

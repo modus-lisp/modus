@@ -1288,11 +1288,18 @@
   ;; reads it -- a docstring with two em dashes was 4 chars longer in the
   ;; image's constant pool and shifted every LI-CONST address after it.
   ;; A malformed lead byte is kept as its Latin-1 char.
+  ;; IDEMPOTENT: the image's character file streams decode UTF-8 THEMSELVES
+  ;; now (2026-10 merges), so this sees pi (U+03C0) as ONE char -- and
+  ;; #x3C0 masked by #xE0 is #xC0, a two-byte lead, which swallowed the next
+  ;; character and emitted a control char.  Only a value below #x100 is a raw
+  ;; byte; anything wider is already a character and is kept as it is.  (The
+  ;; em dash, #x2014, matched no lead mask and survived, which is why only
+  ;; two-byte characters -- Greek, Latin-1 -- showed in the UEFI DDC.)
   (let ((n (length bytes)) (i 0) (out (%make-string-array (length bytes))) (j 0))
     (loop
       (when (>= i n) (return nil))
       (let ((b (char-code (aref bytes i))))
-        (cond ((< b #x80) (setf (aref out j) (code-char b)) (setq i (+ i 1)))
+        (cond ((or (< b #x80) (>= b #x100)) (setf (aref out j) (code-char b)) (setq i (+ i 1)))
               ((and (= (logand b #xE0) #xC0) (< (+ i 1) n))
                (setf (aref out j) (code-char (logior (ash (logand b #x1F) 6)
                                                      (logand (char-code (aref bytes (+ i 1))) #x3F))))
@@ -1321,7 +1328,16 @@
           (let ((buf (%make-string-array n)))
             (let ((got (read-sequence buf s)))
               (close s)
-              (%selfhost-utf8-decode (if (< got n) (subseq buf 0 got) buf))))))))
+              ;; FILE-LENGTH is BYTES and READ-SEQUENCE returns CHARACTERS: fewer
+              ;; characters than bytes proves the stream decoded UTF-8 itself
+              ;; (the image's character streams do, since the 2026-10 merges),
+              ;; and then the text is final -- a decoded U+00D7 looks exactly
+              ;; like a two-byte lead byte, so no second pass can be right.
+              ;; Equal counts mean raw bytes (or pure ASCII), and the decode
+              ;; below is what the SBCL host reader does with the same file.
+              (if (< got n)
+                  (subseq buf 0 got)
+                  (%selfhost-utf8-decode buf))))))))
 (defun %selfhost-open-exec (path)
   ;; open(path, O_WRONLY|O_CREAT|O_TRUNC, 0755) -> fd
   (%string-to-cstr path *cstr-scratch*)
@@ -1372,6 +1388,12 @@
         ;; identical-across-inputs early wild-jump crash (0x1816bad, RBP=0) can
         ;; be mapped to a function name in sb's OWN layout.
         (setq *static-build-p* t)
+        ;; Static literals, as every SBCL build has them (build-cli-common sets
+        ;; both at host build time; in-image the defvar defaults stay NIL):
+        ;; without these a --compile'd ELF differs from SBCL's at every symbol
+        ;; literal.  Same fix as %selfhost-compile-file-uefi.
+        (setq *static-keywords-p* t)
+        (setq *static-symbols-p* t)
         (setq *mvm-emit-halves* nil)
         ;; WS5 DECISIVE: force mvm-eval-runtime-p NIL for the OUTPUT codegen — the
         ;; EXACT config modus2-hoststatic uses (which BOOTS + --version works
@@ -1539,7 +1561,19 @@
         (setq *x64-nx-data-enable* t)
         (setq *x64-linux-mode* nil)
         (setq *x64-gc-enabled* t)
-        (setq *ws5-force-no-kindcheck* t)
+        ;; STATIC LITERALS, as every SBCL build has them (build-cli-common sets
+        ;; both at HOST build time, which an in-image compile never sees -- the
+        ;; defvar defaults are NIL and limitation #7 says they stay so).  Without
+        ;; these the in-image compiler emitted LI hash / CALL %INTERN-SYMBOL-PKG
+        ;; where SBCL emitted the %STATIC-SYMBOL-REF slot load: the UEFI DDC
+        ;; diverged at the first symbol literal, 61,440 bytes shorter overall.
+        (setq *static-keywords-p* t)
+        (setq *static-symbols-p* t)
+        ;; The cons-kind reject is ON for bare x64 (build-cl-repl-common,
+        ;; 2026-10-01: off, 3 of 4 library loads died); this must say the same
+        ;; or the DDC diverges -- it did, by 61,440 bytes, when SBCL emitted the
+        ;; reject and this still forced it off.
+        (setq *ws5-force-no-kindcheck* nil)
         (setq *x64-native-code-offset* (+ 5 (uefi-cl-preamble-length)))
         (write-string-serial \"modus --compile-uefi: snp-mode \")
         (write-object *x64-snp-mode*)

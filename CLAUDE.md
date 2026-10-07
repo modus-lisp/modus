@@ -3468,6 +3468,37 @@ on x64 is this bug.  **SAVE-AND-DIE works on bare x64** (core at 0x20000000, `-m
 attestable image + core (modus-lisp/kiln).  Lesson re-learned: a hosted
 "pass" says nothing about a collector path the hosted heap never takes.
 
+### DDC RULE: a host-set compiler flag is OFF in the self-host unless its compile config sets it (2026-10-06)
+
+The UEFI DDC failed at every commit since the 2026-10-01 merges (SBCL image
+61,440 bytes longer than modus-sh's; first body diff at a symbol literal: SBCL
+`%STATIC-SYMBOL-REF` slot load, modus-sh `LI hash / CALL %INTERN-SYMBOL-PKG`).
+`*static-symbols-p*` / `*static-keywords-p*` are set by a host-side `setf` in
+build-cli-common that every SBCL build runs and no in-image compile sees
+(defvar defaults never run — limitation 7).  Third instance of the pattern after
+`*mcgc-kind-bitmap-enabled*` and `*ws5-force-no-kindcheck*`.  **Every
+emission-affecting flag the host sets must ALSO be set in build-modus-selfhost's
+`--compile` and `--compile-uefi` configuration blocks**; when adding one, add it
+there, and run `kiln image x64-uefi --ddc` before merging.  Triage recipe that
+found it in 20 minutes: run the DDC at three commits concurrently in worktrees;
+`cmp` the pair; the first diff past the preamble JMP is a call displacement, so
+scan for the first difference WIDER than 8 bytes and disassemble both sides there.
+
+### AWS NITRO ENCLAVES — the hosted route (2026-10-06, docs/nitro-enclaves.md)
+
+`kiln image nitro --with=…` builds `modus.eif` from AWS's boot blobs + the hosted
+static ELF + deterministic cpio ramdisks (no Docker, no nitro-cli; PCRs identical
+across builds).  In the image: `lib/cbor.lisp` (RFC 8949 subset, byte-identical
+to cbor2), `net/nsm-attest.lisp` (`/dev/nsm` ioctl `#xC0200A00`,
+`nsm-attestation-document`, `(:NO-NSM -2)` here), AF_VSOCK in hosted sockets,
+and `vsock-repl` (one form per line) — measured over vsock loopback, 4/4 forms.
+`test/nitro/verify-attestation.py` chains to AWS's root (`aws-nitro-root.pem`)
+and binds a host key like the SNP verifier; `fake-nsm.py` is the stand-in NSM.
+**Nothing has run inside an enclave yet.**  Two runtime-code traps hit while
+writing it: a `syscall3` in evaluated code returned its syscall NUMBER, and
+`%mmap-shared-page` echoed its argument — both vanish in the baked image, so
+test hosted syscall modules on a rebuilt CLI, not via `--load`.
+
 ### Crash triage: it's almost never the GC — default elsewhere
 
 The collector is hardened (fuzz-closed layout-dependence, conservative-root

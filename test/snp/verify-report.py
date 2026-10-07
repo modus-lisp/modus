@@ -2,7 +2,7 @@
 """Verify an SEV-SNP ATTESTATION_REPORT for attested SSH.
 
   verify-report.py <report.bin> [--hostkey FILE | --hostkey-hex HEX | --hostkey-b64 BLOB | --report-data HEX]
-                   [--measurement HEX] [--vcek CERT.pem]
+                   [--measurement HEX] [--vcek CERT.pem|DER] [--chain CHAIN.pem]
 
 Checks, each printed and any failure fatal:
   * report_data == SHA-512 of the 32 raw Ed25519 host public key bytes, given as
@@ -47,10 +47,23 @@ def main():
         want=bytes.fromhex(opts['--measurement']); print("measurement matches:", meas==want); ok&=meas==want
     if '--vcek' in opts:
         from cryptography import x509
-        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives.asymmetric import ec, rsa, padding
         from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
         from cryptography.hazmat.primitives import hashes
-        cert=x509.load_pem_x509_certificate(open(opts['--vcek'],'rb').read())
+        raw=open(opts['--vcek'],'rb').read()
+        cert=x509.load_pem_x509_certificate(raw) if raw.startswith(b'-----') else x509.load_der_x509_certificate(raw)
+        if '--chain' in opts:
+            # ASK then ARK, as AMD KDS serves cert_chain; the ARK is self-signed RSA-PSS 4096.
+            pems=[b'-----BEGIN'+c for c in open(opts['--chain'],'rb').read().split(b'-----BEGIN')[1:]]
+            ask,ark=[x509.load_pem_x509_certificate(c) for c in pems[:2]]
+            def rsa_pss_ok(issuer, c):
+                try:
+                    issuer.public_key().verify(c.signature, c.tbs_certificate_bytes,
+                        padding.PSS(mgf=padding.MGF1(c.signature_hash_algorithm), salt_length=c.signature_hash_algorithm.digest_size), c.signature_hash_algorithm)
+                    return True
+                except Exception as e: return False
+            cok = rsa_pss_ok(ark, ark) and rsa_pss_ok(ark, ask) and rsa_pss_ok(ask, cert) and cert.issuer==ask.subject and ask.issuer==ark.subject
+            print("VCEK <- ASK <- ARK chain:", cok, "| ARK", ark.subject.rfc4514_string()); ok&=cok
         r=int.from_bytes(rep[0x2A0:0x2A0+72],'little'); s=int.from_bytes(rep[0x2E8:0x2E8+72],'little')
         try:
             cert.public_key().verify(encode_dss_signature(r,s), rep[:0x2A0], ec.ECDSA(hashes.SHA384())); print("VCEK signature: valid")

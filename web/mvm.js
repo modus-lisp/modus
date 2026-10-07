@@ -71,6 +71,16 @@ const A_MCGC_PAGEBASE = 0x10000E00;
 // V0-V3 and V5-V8 (physical registers on native) get their own per-frame
 // slots too: the reserved callee-save words and a 48-byte extension.
 const FRAME_SIZE = 1168;
+// A sized frame-enter (trap #x8000 | units<<8 | nparams, mvm.lisp) may name
+// more than the 128 slots FRAME_SIZE holds; grow the frame for those only.
+function frameEnterParams(c) { return c >= 0x8000 ? c & 0xFF : c; }
+function frameBytes(code, target) {
+  if (code[target] !== 0x02) return FRAME_SIZE;
+  const c = code[target + 1] | (code[target + 2] << 8);
+  if (c < 0x8000) return FRAME_SIZE;
+  const slots = ((c >> 8) & 0x3F) * 8;
+  return slots > 128 ? FRAME_SIZE + 8 * (slots - 128) : FRAME_SIZE;
+}
 const SLOT_BASE  = -96;
 const ROFF = new Int32Array(16);
 ROFF[4] = -8; ROFF[0] = -16; ROFF[1] = -24; ROFF[2] = -32;
@@ -640,7 +650,7 @@ class MVM {
     const a4l = m32[cb + IX4], a4h = m32[cb + IX4 + 1];
     this.push(this.ebp, 0);
     this.ebp = this.esp;
-    this.esp -= FRAME_SIZE;
+    this.esp -= frameBytes(this.code, target);
     if (this.esp < STACK_ADDR + 4096) { this.esp = this.ebp; this.ebp = this.pop(); this.pop(); this.memFault('stack overflow'); }
     const b = (this.ebp - VBASE) >> 2;
     m32[b + IX0] = a0l; m32[b + IX0 + 1] = a0h; m32[b + IX1] = a1l; m32[b + IX1 + 1] = a1h;
@@ -663,7 +673,7 @@ class MVM {
     this.push(ret, 0);
     this.push(oldEbp, 0);
     this.ebp = this.esp;
-    this.esp -= FRAME_SIZE;
+    this.esp -= frameBytes(this.code, target);
     const nb = (this.ebp - VBASE) >> 2;
     m32[nb + IX0] = r[0]; m32[nb + IX0 + 1] = r[1]; m32[nb + IX1] = r[2]; m32[nb + IX1 + 1] = r[3];
     m32[nb + IX2] = r[4]; m32[nb + IX2 + 1] = r[5]; m32[nb + IX3] = r[6]; m32[nb + IX3 + 1] = r[7];
@@ -744,8 +754,9 @@ class MVM {
   // -- traps (translate-x64 hosted arms) -------------------------------------
   trap(codeNum, nextPc) {
     const h = this.host;
-    if (codeNum < 0x100) {
-      for (let i = 4; i < codeNum; i++) {
+    if (codeNum < 0x100 || codeNum >= 0x8000) {
+      const n = frameEnterParams(codeNum);
+      for (let i = 4; i < n; i++) {
         const s = this.ebp + 16 + 8 * (i - 4), d = this.ebp + SLOT_BASE - 8 * i;
         this.st64(d, this.ldlo(s), this.ldhi(s));
       }
@@ -1491,7 +1502,7 @@ class MVM {
         case 0x00: break;
         case 0x02: {
           const c = b1 | (b2 << 8);
-          if (c < 0x100 && c <= 4) break;                                   // frame-enter, nothing to copy
+          if ((c < 0x100 || c >= 0x8000) && frameEnterParams(c) <= 4) break;   // frame-enter, nothing to copy
           if (c >= 0x100 && c < 0x300) break;
           out += `${P}${STORE}vm.trap(${c},${pc + len});fb=(vm.ebp-${VBASE})>>2;${LOAD}`;
           break;

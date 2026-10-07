@@ -115,10 +115,31 @@
   "Spill slots start at VFP+482 = SP+480, safely past max frame slot 119 at SP+476.
    Spills V8-V15 use SP+480..SP+508 (8 slots * 4 bytes).")
 
+(defvar *arm32-frame-bytes* +arm32-frame-size+
+  "Frame of the function being translated, set by its FRAME-ENTER.  Slots sit
+   at SP+4N, the eight spill words in the top 32 bytes, and the caller's
+   overflow arguments 28 bytes (the pushed registers) above the frame.")
+
+(defun arm32-frame-bytes (slots)
+  "Frame for SLOTS slots plus the 32-byte spill area, in 64-byte steps so
+   SUB/ADD sp can encode it as imm8 ROR 26.  The unsized frame keeps 512."
+  (if (= slots +frame-legacy-slots+)
+      +arm32-frame-size+
+      (* 64 (ash (+ (* 4 slots) 32 63) -6))))
+
+(defun arm32-emit-frame-adjust (buf add-p)
+  "ADD or SUB sp, sp, #*arm32-frame-bytes*."
+  (if (= *arm32-frame-bytes* +arm32-frame-size+)
+      (if add-p (arm32-add-imm buf +arm-sp+ +arm-sp+ 12 2)
+          (arm32-sub-imm buf +arm-sp+ +arm-sp+ 12 2))
+      (let ((n (ash *arm32-frame-bytes* -6)))
+        (if add-p (arm32-add-imm buf +arm-sp+ +arm-sp+ 13 n)
+            (arm32-sub-imm buf +arm-sp+ +arm-sp+ 13 n)))))
+
 (defun arm32-spill-offset (vreg)
   "Compute the frame offset for a spilled virtual register."
   (let ((slot (- vreg +arm32-max-inline+)))
-    (+ +arm32-spill-base+ (* slot 4))))
+    (+ (- +arm32-spill-base+ (- +arm32-frame-size+ *arm32-frame-bytes*)) (* slot 4))))
 
 ;;; ============================================================
 ;;; ARM32 Condition Codes
@@ -1089,18 +1110,16 @@
                          (ash 1 8) (ash 1 11)
                          (ash 1 14))))
     (arm32-push buf reglist))
-  ;; SUB sp, sp, #512  (allocate frame)
-  ;; 512 = 0x200 = 2 ROR 24 → rotate=12, imm8=2
-  (arm32-sub-imm buf +arm-sp+ +arm-sp+ 12 2)
+  ;; SUB sp, sp, #frame (512 = 2 ROR 24 when unsized)
+  (arm32-emit-frame-adjust buf nil)
   ;; SUB r11, sp, #2  (VFP = SP - 2, tagged with object tag 2)
   ;; This ensures obj-ref slots access the frame area, not saved registers.
   (arm32-sub-imm buf +arm-r11+ +arm-sp+ 0 2))
 
 (defun arm32-emit-epilogue (buf)
   "Emit function epilogue: restore and return."
-  ;; ADD sp, sp, #512  (deallocate frame)
-  ;; 512 = 0x200 = 2 ROR 24 → rotate=12, imm8=2
-  (arm32-add-imm buf +arm-sp+ +arm-sp+ 12 2)
+  ;; ADD sp, sp, #frame  (deallocate frame)
+  (arm32-emit-frame-adjust buf t)
   ;; POP {r4-r8, r11, pc}  (restore callee-saved, return via PC)
   ;; r9/r10 not restored — they are global alloc ptr/limit
   (let ((reglist (logior (ash 1 4) (ash 1 5) (ash 1 6) (ash 1 7)
@@ -1149,17 +1168,18 @@
         (#.+op-trap+
          (let ((code (first operands)))
            (cond
-             ((< code #x0100)
+             ((frame-enter-code-p code)
               ;; Frame-enter: emit function prologue (push regs, allocate frame)
+              (setq *arm32-frame-bytes* (arm32-frame-bytes (frame-enter-slots code)))
               (arm32-emit-prologue buf)
               ;; Copy overflow args (params 5+) from caller's stack to frame slots.
               ;; After prologue: PUSH 7 regs (28 bytes) + SUB SP 512.
               ;; Overflow arg k is at [SP + 540 + k*4].
               ;; Compiler accesses param N (N>=4) via obj-ref VFP N → [SP + N*4].
-              (when (> code 4)
-                (loop for param-idx from 4 below code
+              (when (> (frame-enter-nparams code) 4)
+                (loop for param-idx from 4 below (frame-enter-nparams code)
                       for k from 0
-                      do (let ((src-off (+ 540 (* k 4)))
+                      do (let ((src-off (+ *arm32-frame-bytes* 28 (* k 4)))
                                (dst-off (* param-idx 4)))
                            (arm32-ldr buf +arm-r12+ +arm-sp+ src-off)
                            (arm32-str buf +arm-r12+ +arm-sp+ dst-off)))))
@@ -1203,7 +1223,8 @@
                 (loop for i from 4 below 32
                       do (arm32-cmp-imm buf +arm-r12+ 0 i)
                          (arm32-b-cond buf +arm-cc-le+ done)
-                         (arm32-ldr buf +arm-lr+ +arm-r11+ (+ 542 (* 4 (- i 4))))
+                         (arm32-ldr buf +arm-lr+ +arm-r11+
+                                    (+ *arm32-frame-bytes* 30 (* 4 (- i 4))))
                          (arm32-str buf +arm-lr+ +arm-r11+ (+ 2 (* 4 i))))
                 (arm32-emit-label buf done)))
              ((and (= code #x0300) *arm32-linux-mode*)

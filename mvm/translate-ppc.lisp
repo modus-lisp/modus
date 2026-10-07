@@ -157,9 +157,22 @@
    here BEFORE popping the frame."
   (- (ppc-frame-size) (ppc-word-size)))
 
+(defvar *ppc-frame-bytes* nil
+  "Frame of the function being translated, set by a SIZED frame-enter; NIL
+   means the fixed 128-slot frame.")
+
+(defun ppc-sized-frame-bytes (slots)
+  "Frame for SLOTS slots: save area + spills (frame-slot-base), the slots, and
+   the LR word on top, 16-aligned.  NIL (fixed frame) for the unsized form."
+  (if (= slots +frame-legacy-slots+)
+      nil
+      (logand (+ (ppc-frame-slot-base) (* slots (ppc-word-size)) (ppc-word-size) 15)
+              (lognot 15))))
+
 (defun ppc-frame-size ()
   "Return the current frame size."
-  (if *ppc-64-bit* +ppc-frame-size+ +ppc32-frame-size+))
+  (or *ppc-frame-bytes*
+      (if *ppc-64-bit* +ppc-frame-size+ +ppc32-frame-size+)))
 
 ;;; ============================================================
 ;;; PPC Code Buffer
@@ -1304,9 +1317,10 @@
       (#.+op-trap+
        (let ((code (first operands)))
          (cond
-           ((< code #x0100)
-            ;; Frame-enter: CODE is the parameter count -- see ppc-emit-prologue.
-            (ppc-emit-prologue buf code))
+           ((frame-enter-code-p code)
+            ;; Frame-enter: CODE carries the parameter count -- see ppc-emit-prologue.
+            (setq *ppc-frame-bytes* (ppc-sized-frame-bytes (frame-enter-slots code)))
+            (ppc-emit-prologue buf (frame-enter-nparams code)))
            ((< code #x0300)
             ;; Frame-alloc/frame-free: NOP for now
             nil)

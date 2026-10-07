@@ -2267,14 +2267,23 @@
     (i386-emit-gcnative-scan-word buf scan-label copy-label)
     (i386-emit-gcnative-copy buf copy-label)))
 
-(defun i386-emit-prologue (buf)
+(defun i386-frame-bytes (slots)
+  "Frame size below EBP for SLOTS frame slots.  The unsized frame keeps its
+   historical 296 bytes (room for 57 slots, not 128).  A sized frame is
+   72 + 4*SLOTS: slot N sits at EBP-68-4N, and 72+32k stays 8 mod 16 like 296,
+   so ESP alignment after CALL+PUSH EBP is unchanged."
+  (if (= slots +frame-legacy-slots+)
+      +frame-size+
+      (+ 72 (* 4 slots))))
+
+(defun i386-emit-prologue (buf &optional (slots +frame-legacy-slots+))
   "Emit i386 function prologue.
    PUSH EBP; MOV EBP, ESP; SUB ESP, frame_size;
    save callee-saved EBX, ESI, EDI;
    copy incoming V2/V3 args from [EBP+8/12] to local spill slots."
   (i386-emit-push-reg buf +i386-ebp+)
   (i386-emit-mov-reg-reg buf +i386-ebp+ +i386-esp+)
-  (i386-emit-sub-reg-imm buf +i386-esp+ +frame-size+)
+  (i386-emit-sub-reg-imm buf +i386-esp+ (i386-frame-bytes slots))
   ;; Save callee-saved registers
   (i386-emit-mov-mem-reg buf +i386-ebp+ +save-ebx-off+ +i386-ebx+)
   (i386-emit-mov-mem-reg buf +i386-ebp+ +save-esi-off+ +i386-esi+)
@@ -2378,15 +2387,15 @@
            (unless eax-is-result
              (i386-emit-push-reg buf +i386-eax+))
            (cond
-             ((< code #x0100)
-              ;; Frame-enter: code = nparams.
+             ((frame-enter-code-p code)
+              ;; Frame-enter: nparams (the prologue reserved the frame).
               ;; If nparams > 4, copy excess args from caller's stack
               ;; to frame slot locations where the compiler expects them.
               ;; Caller pushes V2, V3 at [EBP+8/12], then overflow args at [EBP+16+k*4].
               ;; Compiler binds param N (N>=4) to stack-slot N, accessed via
               ;; obj-ref VFP N → [EBP + frame-slot-base + N * -4].
-              (when (> code 4)
-                (loop for param-idx from 4 below code
+              (when (> (frame-enter-nparams code) 4)
+                (loop for param-idx from 4 below (frame-enter-nparams code)
                       for k from 0  ;; k-th overflow arg
                       do (let ((src-off (+ 16 (* k 4)))
                                (dst-off (+ +frame-slot-base+ (* param-idx -4))))
@@ -3141,7 +3150,7 @@
               ;;
               ;; Cap at 32 total args, as x64 does: the ladder is unrolled per
               ;; defun, and raising x64's cap to 50 cost +30MB and regressed
-              ;; ANSI via layout shift.  i386's frame has 128 slots, so 32 fits.
+              ;; ANSI via layout shift.  A function with this copy gets >= 128 slots.
               ;;
               ;; Registers: the whole :trap dispatch is already bracketed with
               ;; push/pop EAX, and this arm additionally saves ECX/EDX/ESI, so
@@ -4991,7 +5000,7 @@
                  :mvm-length length
                  :mvm-offset offset)))
     ;; Emit prologue
-    (i386-emit-prologue buf)
+    (i386-emit-prologue buf (function-frame-slots bytecode offset))
     ;; Pass 1: scan for branch targets
     (i386-scan-branch-targets state)
     ;; Pass 2: translate instructions
@@ -5105,7 +5114,9 @@
                ;; Emit function label
                (i386-emit-label buf fn-label)
                ;; Emit prologue
-               (i386-emit-prologue buf)
+               (i386-emit-prologue buf (if (zerop fn-length)
+                                           +frame-legacy-slots+
+                                           (function-frame-slots bytecode fn-offset)))
                ;; Pass 1: scan branch targets
                (i386-scan-branch-targets state)
                ;; Pass 2: translate

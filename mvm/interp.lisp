@@ -1359,7 +1359,7 @@
                 (setf pc npc))
                ((= code #x0500)
                 (sys-exit (svref regs +vreg-v0+)))
-               ((>= code #x100)
+               ((and (>= code #x100) (< code +frame-enter-sized+))
                 ;; FRAME-ALLOC / FRAME-FREE: no-op (frame is over-allocated).
                 (setf pc npc))
                ;; SYSCALL3 / SYSCALL3-RAW / SYSCALL6: run the same primitive
@@ -1389,7 +1389,7 @@
                 (setf pc npc))
                ;; Anything else (serial / MMIO / IRQ / exit / mmap / JIT /
                ;; thread traps) is not implemented here: say so, loudly.
-               ((>= code #x100)
+               ((not (frame-enter-code-p code))
                 (error "MVM trap #x~X is not implemented in the interpreter" code))
                (t
                 ;; FRAME-ENTER: allocate a generously-sized frame so all locals
@@ -1400,8 +1400,10 @@
                 ;; 100-binding LET (ANSI let.14 / let*.14) stack-stored past
                 ;; the 64-slot array and errored.  +160 covers the compiler's
                 ;; own limit with headroom.
-                (let* ((params (logand code #xFF))
-                       (frame-size (+ params 160))
+                (let* ((params (frame-enter-nparams code))
+                       ;; A sized frame-enter may name more than params+160;
+                       ;; in-image stores are unchecked, so never go below it.
+                       (frame-size (max (+ params 160) (frame-enter-slots code)))
                        (frame (make-array frame-size :initial-element 0)))
                   ;; OVERFLOW-ARG COPY for FIXED-ARITY functions with >4
                   ;; params: mirror of the native x64 frame-enter trap, which

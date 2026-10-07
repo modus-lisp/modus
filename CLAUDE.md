@@ -3605,6 +3605,18 @@ at the end of the image must not overlap the globals or stack. Build scripts ass
      it as definitively core (this session mis-attributed several bugs; verify
      first).
 
+
+**Frame size is per function (2026-10-07).**  FRAME-ENTER is TRAP
+`#x8000 | units<<8 | nparams`: the function's highest addressed frame slot + 1
+(never below its parameter count; >= 128 for a function with the `#x0530`
+&rest copy or a run-time frame index), in units of 8 slots.  Every back end,
+the interpreter and `web/mvm.js` size the frame from it; the unsized form
+(code < `#x100`) keeps each port's old fixed frame.  The ceiling is **256
+slots**: frame slots are the imm8 operand of OBJ-REF/OBJ-SET on VFP, and
+`%IR-FRAME-ENTER-CODES` errors past it (`*let-binding-limit*` is 248).  The
+old fixed frames were smaller than the 120-binding guard suggested on two
+ports: i386's 296 bytes held 57 slots, aarch64's 1024 held 121.
+
 ## Known Bugs
 
 ### Mutable Closures — Global Cell Limitation (RESOLVED)

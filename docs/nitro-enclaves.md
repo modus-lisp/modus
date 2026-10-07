@@ -89,3 +89,50 @@ the hosted SSH transport, which is the long pole on this route.
 * no hosted SSH transport (the SSH-2 server is bound to the bare-metal E1000
   stack), so the first milestone is attested Modus with a vsock REPL;
 * no save-and-die core in the EIF (packages install at start instead).
+
+
+## The first real run (2026-10-07, m5.xlarge us-east-2) — PASS
+
+`kiln image nitro --with=alexandria` → `modus.eif`; `nitro-cli describe-eif`
+on the parent computed the SAME PCR0/1/2 as eif_build had offline.  Then, in a
+**non-debug** enclave (2 vCPU, 3072 MB): alexandria installed from the
+measured ramdisk, `(alexandria:iota 3)` answered `(0 1 2)` over the vsock
+console, and `nsm-attestation-document` with a nonce and user data returned a
+4469-byte COSE_Sign1 that `test/nitro/verify-attestation.py` passes on every
+check: chain to the AWS root, ES384 signature, **PCR0/1/2 equal to the EIF's
+offline values**, nonce echoed, user_data matched.  The document and the PCRs
+are in `test/nitro/records/`.  Debug mode first (`--debug-mode`, console
+visible): same document shape with PCR0..3 all zero, as AWS documents.
+
+Four things the enclave taught that no off-box test could, in the order hit:
+
+1. **The application ramdisk needs `rootfs/`.**  AWS's `init` does
+   `mount --bind /rootfs /rootfs`, moves it to `/`, chroots, then mounts
+   proc/sys/dev/run/tmp INSIDE it (its `ops[]` table) and execs `/cmd`'s argv.
+   `cmd` and `env` stay at the ramdisk root; everything the program sees
+   goes under `rootfs/`, with those five directories present.  Missing
+   `rootfs`: init dies at 0.23 s and the kernel panics ("Attempted to kill
+   init", exit 2); missing `run`: the same one mount later.
+2. **`/cmd` is one argv entry PER LINE.**  Splitting the command on spaces
+   cut `(install-tarball "/tars/x.tar")` in two → `READER-ERROR` on the
+   first `--eval`.
+3. **The NSM ioctl's response iovec must offer `NSM_RESPONSE_MAX_SIZE`
+   (0x3000).**  Offering 100, 163, 164, 200, 1024, 4096 or 8192 bytes: the
+   ioctl returns 0 and writes back length 0 — indistinguishable from an
+   empty reply, and `cbor-decode` then says "truncated at 0".  Offering
+   0x3000 or more: DescribeNSM answers 164 bytes, GetRandom 278, an
+   attestation 4463.  (The driver source says `min(user len, resp len)`; the
+   device behind it evidently does not.)  `+nsm-response-max+` now.
+4. **The document's payload is an indefinite-length CBOR map** (`bf …`), and
+   `lib/cbor.lisp` refused indefinite lengths; it decodes them now (strings,
+   arrays, maps, RFC 8949 3.2).
+
+Two instrument notes.  `syscall3` from RUNTIME-compiled code (a `--eval` or a
+vsock form) returns the syscall NUMBER — `(syscall3 16 …)` → 16, `(syscall3 4
+…)` → 4 — so probe the device only through the AOT helpers (`%nsm-ioctl`,
+`%nsm-open-at`), which are faithful (-9 for a bad fd, -14 for a null pointer,
+-90 for an oversize request).  And a spot instance was reclaimed mid-install
+(`Server.SpotInstanceTermination`); `ON_DEMAND=1 test/nitro/aws-launch.sh` is
+the ~$0.20/hour alternative.  `test/nitro/aws-launch.sh` builds the VPC when
+the account has no default one and sweeps every AZ and nine Nitro-capable
+types for capacity.

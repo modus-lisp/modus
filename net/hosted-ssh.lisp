@@ -65,6 +65,13 @@
 (defun native-eval (form) nil)
 (defun print-obj (x) nil)
 (defun rt-compile-defun (form) nil)
+(defun edit-cursor-pos () 0)
+(defun emit-prompt () 0)
+(defun read-list () nil)
+(defun eval-line-expr () nil)
+;; The handshake calls this between its expensive steps to keep a USB NIC's host
+;; from declaring the link dead (Pi Zero 2 W); here there is nothing to keep alive.
+(defun usb-keepalive () 0)
 
 ;;; ---- byte-buffer helpers crypto.lisp takes from net/ip.lisp (not baked
 ;;; hosted: it is the IP stack), and the hex printer its self-test uses ----

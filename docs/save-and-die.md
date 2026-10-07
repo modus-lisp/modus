@@ -1,6 +1,6 @@
 # save-and-die: heap snapshots for Modus
 
-Written 2026-09-06.  Status: **landed for the hosted Linux/AArch64 CLI**
+Written 2026-09-06.  Status: **landed for the hosted Linux/AArch64 CLI**; **hosted x86-64 since 2026-10-07** (docs/nitro-enclaves.md "The core rides in the EIF" has the four x64 arch slots and the pinned-offset trap)
 (a6085d2) **and for the bare-metal Pi image, validated under QEMU raspi3b**
 (fa9fa1e).  The remaining loose ends are the real board (the RAM-core
 round-trip) and x64 stub parity, at the bottom.

@@ -175,3 +175,51 @@ half-close and DRAIN before close(2) — closing with the client's final
 CLOSE/DISCONNECT unread makes Linux RST, which discards the exec reply the
 client had not yet received ("Broken pipe" on every exec, while the
 interactive path worked).  The bare TCP stack never RSTs there.
+
+
+## The core rides in the EIF (2026-10-07) — boot to SSH in 2.7 s
+
+`kiln image nitro` now installs the packages ONCE on the build host, snapshots
+the process (`save-and-die`, lib/save-image.lisp — 8.8 MB with alexandria),
+puts `modus.core` in the application ramdisk beside `modus`, and the enclave
+boots `/modus --core /modus.core --eval (ssh-serve-vsock 22)`.  Measured:
+`nitro-cli run-enclave` returns after 2.5 s and the SSH banner is on vsock 22
+0.2 s later; install-at-boot took over a minute.  PCR2 covers the core, so the
+attestation names the exact heap that serves, not only the code that would
+have produced it.  The host key is NOT in the core (it is generated when SSH
+starts; `%core-post-restore` also drops one if a saving run had made it).
+`--nocore` keeps the install-at-boot shape.  Fixture:
+`test/nitro/records/2026-10-07-core-*`.
+
+**SAVE-AND-DIE on hosted x86-64 did not exist; it does now** (docs/save-and-die.md
+was aarch64 + bare metal).  The port is the aarch64 design moved over —
+`boot/boot-linux-x64.lisp` maps the heap at `0x2000000000` and a 512 MB RWX
+JIT arena at `0x3000000000` with MAP_FIXED_NOREPLACE, falling back to the
+historical hint mmap (then `--core` refuses with "heap base differs"); the
+`#x0531` trap bump-allocates JIT pages from the arena, bump word `0x10000FB8`
+(the aarch64 word, `0x10000F58`, is inside x64's per-region cell table).  Four
+x64 facts the shared code had never met, each an arch slot now
+(`lib/save-image-x64.lisp`):
+
+1. **The GC metadata is stored RAW on x64 and SHL'd on aarch64**, and
+   `(mem-ref … :u64)` halves what it loads, so gc.lisp's plain readers return
+   the right address on aarch64 and HALF of it on x64.  The first core was 4 KB
+   with a "live range" of 68 GB.  Every address save-image needs now goes
+   through `%GC-META-SCALE`.
+2. The heap mapping's base is from_start − **0x400** on x64 (512 on aarch64).
+3. x64 has **no config word for the cons-kind bitmap**: its base is the start
+   bitmap's + a build-time delta.  The shared reader of `0x10000E40` returned 0
+   and the core came out exactly one bitmap slice short.
+4. **`*X64-NATIVE-CODE-OFFSET*` was PINNED at 397 in six build scripts** — the
+   byte at which native code starts, from which translate-x64 keeps every
+   function clear of address nibble 1 (the closure tag CALL-IND tests).  The
+   new stub is 570 bytes, not 272; under the pin every function sat at the
+   wrong nibble and the image SIGSEGV'd at boot in EVERY variant (RIP = RSP = 0
+   after an unwind onto an empty handler frame), which sent the bisect through
+   the heap base, the arena and the trap arm before the pin was found.  It is
+   `(linux-x64-native-code-offset)` now — computed from the stub, 695 — in all
+   six, including the ANSI runner's wrapped stub (which was pinned at 351).
+
+`test/run-hosted-core.sh` is the local acceptance: snapshot with alexandria,
+restore (0.02 s, answers `(0 1 2)`, no inherited host key), then
+`run-hosted-ssh.sh` against `modus --core`.

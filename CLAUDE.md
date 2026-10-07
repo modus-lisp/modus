@@ -3502,6 +3502,13 @@ the EIF serves `(ssh-serve-vsock 22)`, `test/nitro/vsock-proxy.py` bridges the
 parent, and `test/nitro/attested-ssh-client.sh` PASSES against the real
 enclave: handshake key == attested key, PCR0/1/2 == the EIF's.  Bare builds
 unchanged except ssh.lisp's wait is the `SSH-WAIT-DATA` seam (UEFI SSH PASS).
+**AND THE ENCLAVE BOOTS FROM A SAVED CORE IN 2.7 s** (same day): save-and-die
+ported to hosted x64 (fixed heap `0x2000000000`, JIT arena `0x3000000000`, bump
+word `0x10000FB8`; four arch slots in lib/save-image-x64.lisp — metadata
+scale, alloc-start 0x400, cons-bitmap delta).  **`*X64-NATIVE-CODE-OFFSET*`
+IS COMPUTED FROM THE STUB NOW** (`linux-x64-native-code-offset`, 695): it was
+pinned at 397 in six scripts and a grown stub under the pin SIGSEGVs at boot
+with RIP = RSP = 0.  Never pin it again.
 
 `kiln image nitro --with=…` builds `modus.eif` from AWS's boot blobs + the hosted
 static ELF + deterministic cpio ramdisks (no Docker, no nitro-cli; PCRs identical

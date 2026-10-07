@@ -1299,6 +1299,17 @@
 ;; *driver-source* here, at exactly the position it used to occupy, so every
 ;; existing driver scanner (defun names -> SFT, symbol names -> *SYM-NAME-TABLE*)
 ;; still sees these defuns unchanged.
+;;; MACHINE-TYPE / MACHINE-VERSION per port.  mvm/ansi-bridge.lisp's are the
+;;; constant "x86_64" every image shares, so the aarch64 image on an Android
+;;; phone answered "x86_64".  Like SBCL's, the answer is fixed when the image is
+;;; built; the names are uname's.  Spliced into *DRIVER-SOURCE*, which comes
+;;; after ansi-bridge, so these definitions win.
+(defun %machine-type-source ()
+  (let ((m (ecase *cli-arch*
+             (:x64 "x86_64") (:aarch64 "aarch64") (:i386 "i386")
+             (:riscv64 "riscv64") (:riscv32 "riscv32") (:arm32 "armv7l"))))
+    (format nil "~%(defun machine-type () ~S)~%(defun machine-version () ~S)~%" m m)))
+
 (defvar *driver-source*
  (concatenate 'string
   ;; ARCH SLOT: sys-exit / halt.  exit_group — the one that ends the PROCESS
@@ -1306,6 +1317,7 @@
   ;; AArch64 generic ABI and 252 on i386.  Using plain `exit' (60/93/1) is a
   ;; hang the moment a second thread is alive; see the arch files.
   *cli-arch-syscall-source*
+  (%machine-type-source)
   (mvm-text "lib/runtime-backquote.lisp")
   ;; ARCH SLOT: arch-address diagnostic probes, baked ahead of kernel-main.
   *cli-arch-probe-source*

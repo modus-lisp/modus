@@ -8053,6 +8053,15 @@
       ;; %OP-NAME-CONFIRMED-P.
       ((and op-name (symbolp op) (not (%op-name-confirmed-p op op-name)))
        (compile-call op (cdr form) env dest))
+      ;; SHADOWING GUARD -- the same reasoning, by package rather than by hash.
+      ;; Every dispatch below matches the operator's NAME, so P::MAKE-ARRAY (P
+      ;; shadowing CL's) compiled as CL's MAKE-ARRAY and P::AREF / P::CAR as CL's
+      ;; primops: the program's own function never ran, or a primop ran on its
+      ;; arguments and faulted.  A head that shadows a CL external and was not
+      ;; macroexpanded above is a call to that package's function, as in SBCL.
+      ;; FBOUNDP: the build host has no %SHADOWS-CL-NAME-P and no source shadows CL.
+      ((and (symbolp op) (fboundp '%shadows-cl-name-p) (funcall '%shadows-cl-name-p op))
+       (compile-call op (cdr form) env dest))
       ;; Non-symbol operator (immediately-applied lambda, etc.).  Route
       ;; through compile-funcall, NOT compile-call: compile-call's
       ;; indirect path emits a bare :call-indirect with no closure

@@ -1218,6 +1218,24 @@
                    (mvm-text "lib/cbor.lisp")
                    (mvm-text "net/nsm-attest.lisp")
                    (string #\Newline)
+                   ;; THE SSH-2 SERVER OVER A LINUX STREAM (docs/nitro-enclaves.md,
+                   ;; "SSH").  net/ssh.lisp + the crypto it needs, exactly the
+                   ;; files the bare x64 CL image bakes, then net/hosted-ssh.lisp
+                   ;; as their arch adapter (address map in one mmap, the two
+                   ;; transport touch points on a socket fd, getrandom entropy,
+                   ;; the CL shell, TCP and vsock listeners, the NSM binding).
+                   ;; Nothing listens unless a program calls SSH-SERVE-TCP /
+                   ;; -TCP-ON / -VSOCK.  Checked: of their 180 defuns only
+                   ;; RECEIVE collides (aarch64-overrides, which is NOT baked);
+                   ;; ssh.lisp's own wait is the SSH-WAIT-DATA seam.
+                   (mvm-text "net/crypto.lisp")
+                   (string #\Newline)
+                   (mvm-text "net/crypto-fast.lisp")
+                   (string #\Newline)
+                   (mvm-text "net/ssh.lisp")
+                   (string #\Newline)
+                   (mvm-text "net/hosted-ssh.lisp")
+                   (string #\Newline)
                    ;; THE ACTOR RUNTIME (docs/hosted-actor-runtime.md).  After
                    ;; hosted-sync (its scheduler, %MAKE-NATIVE-THREAD, the
                    ;; %WITH-COMPUTATION-STATE macro) and net/actors.lisp,

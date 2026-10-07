@@ -421,9 +421,17 @@
     arr))
 
 ;; Receive SSH packet. Returns cons(payload . payload-len) or NIL
-;; Handler actor blocks on (receive) to wait for data from net-actor.
+;; Handler actor blocks on (ssh-wait-data ssh) to wait for data from net-actor.
 ;; Net-actor sends data-len (>0) or 0 (close signal) as message.
 ;; ssh = per-connection SSH state base
+;; THE TRANSPORT'S WAIT SEAM.  Block until more bytes have been appended to
+;; this connection's recv buffer (ssh+0x6D4 length, ssh+0x6D8 data) and return
+;; non-zero; return 0 when the connection is gone.  Bare metal: the net actor
+;; (or the inline poll loop that stands in for it) fills the buffer and this is
+;; the actor RECEIVE it always was.  A hosted image overrides it with a read(2)
+;; on the connection's socket (net/hosted-ssh.lisp).
+(defun ssh-wait-data (ssh) (receive))
+
 (defun ssh-receive-packet (ssh timeout)
   (let ((encrypted (mem-ref (+ ssh #x0C) :u32))
         (cb (- ssh #x20)))
@@ -450,7 +458,7 @@
                             (setq i (+ i 1)))
                           (if (not (zerop nl))
                               (ssh-buf-consume ssh (+ nl 1))
-                              (let ((msg (receive)))
+                              (let ((msg (ssh-wait-data ssh)))
                                 (when (zerop msg) (return ())))))
                         (let ((pkt-len (ssh-get-u32 arr 0)))
                           ;; DEFENSE: max unencrypted SSH packet is 35000 bytes.
@@ -466,9 +474,9 @@
                                       (setf (mem-ref (+ ssh #x04) :u32)
                                             (+ (mem-ref (+ ssh #x04) :u32) 1))
                                       (setq result parsed)))
-                                  (let ((msg (receive)))
+                                  (let ((msg (ssh-wait-data ssh)))
                                     (when (zerop msg) (return ()))))))))
-                  (let ((msg (receive)))
+                  (let ((msg (ssh-wait-data ssh)))
                     (when (zerop msg) (return ())))))
             (setq tries (+ tries 1))))
         ;; Encrypted: decrypt
@@ -485,9 +493,9 @@
                             (ssh-buf-consume ssh
                              (- blen (mem-ref (+ cb #x16F8) :u32)))
                             (setq result dec))
-                          (let ((msg (receive)))
+                          (let ((msg (ssh-wait-data ssh)))
                             (when (zerop msg) (return ()))))))
-                  (let ((msg (receive)))
+                  (let ((msg (ssh-wait-data ssh)))
                     (when (zerop msg) (return ())))))
             (setq tries (+ tries 1)))))))
 
@@ -517,7 +525,7 @@
       (when (not (zerop got-version)) (return 1))
       (when (> tries 50) (return 0))
       ;; Wait for data from net-actor
-      (let ((msg (receive)))
+      (let ((msg (ssh-wait-data ssh)))
         (when (zerop msg) (return 0)))
       (let ((blen (mem-ref (+ ssh #x6D4) :u32)))
         (when (> blen 8)

@@ -1453,15 +1453,30 @@
       (if (%single-typed-p float) 24 53)))
 
 (defun float-sign (float &rest float2-arg)
-  "Return a float with magnitude of float2 and sign of float."
-  (let ((float2 (if float2-arg (car float2-arg) 1.0d0)))
-    (if (< float 0.0d0)
-        (if (< float2 0.0d0) float2 (- 0.0d0 float2))
-        (if (< float2 0.0d0) (- 0.0d0 float2) float2))))
+  "Return a float with the magnitude of FLOAT2 (default (FLOAT 1 FLOAT)) and the
+   sign of FLOAT.  The sign comes from INTEGER-DECODE-FLOAT, not (< FLOAT 0):
+   that is false for -0.0, so (float-sign -0.0d0) answered 1.0d0 and a JSON
+   writer printed -0.0 as 0.0."
+  (let* ((float2 (if float2-arg (car float2-arg) (float 1 float)))
+         (mag (abs float2)))
+    (if (minusp (nth-value 2 (integer-decode-float float)))
+        (- mag)
+        mag)))
 
 (defun scale-float (float integer)
-  "Return float * 2^integer."
-  (* float (expt 2.0d0 integer)))
+  "FLOAT * 2^INTEGER, in FLOAT's own format.  Multiplies by powers of two of at
+   most 2^60 at a time, each exact in that format: the old
+   (* float (expt 2.0d0 integer)) built 2^|INTEGER| as a double, so any
+   INTEGER below about -1023 signalled FLOATING-POINT-OVERFLOW instead of
+   producing a subnormal, and a single-float argument came back a double."
+  (let ((one (float 1 float))
+        (r float)
+        (k integer))
+    (loop while (> k 60) do
+      (setq r (* r (float (expt 2 60) one)) k (- k 60)))
+    (loop while (< k -60) do
+      (setq r (* r (float (/ 1 (expt 2 60)) one)) k (+ k 60)))
+    (* r (float (expt 2 k) one))))
 
 (defun decode-float (float)
   "Decode float into (significand exponent sign).

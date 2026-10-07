@@ -136,3 +136,42 @@ vsock form) returns the syscall NUMBER — `(syscall3 16 …)` → 16, `(syscall
 the ~$0.20/hour alternative.  `test/nitro/aws-launch.sh` builds the VPC when
 the account has no default one and sweeps every AZ and nine Nitro-capable
 types for capacity.
+
+
+## SSH into the enclave, attested (2026-10-07) — PASS
+
+The third step of the agreed order.  `net/hosted-ssh.lisp` puts the SSH-2
+server (`net/ssh.lisp`, the same code the bare images run) on a Linux stream:
+`(ssh-serve-tcp PORT)` on 127.0.0.1, `(ssh-serve-tcp-on IP PORT)`, and
+`(ssh-serve-vsock PORT)` — an enclave's only network.  `kiln image nitro` now
+runs `(ssh-serve-vsock 22)` as the enclave's service (`--console=repl` for the
+old form-per-line console).  On the parent, `test/nitro/vsock-proxy.py 2222 16 22`
+turns TCP 127.0.0.1:2222 into vsock 16:22, so a plain `ssh -p 2222 test@127.0.0.1`
+(or through an `ssh -L` tunnel from anywhere) reaches the enclave's REPL:
+
+    ssh -p 2222 test@127.0.0.1 '(list (lisp-implementation-type) (alexandria:iota 3))'
+    = ("Modus" (0 1 2))
+
+**The binding.**  The host key is 32 bytes of getrandom(2) per process (the
+bare images use an all-zero default key and a 32-bit PRNG — fine for a demo,
+unacceptable for anything attested: a known private key is a man in the middle
+for free), and `(nitro-attest-ssh "NONCE-HEX")` prints `NITRO-HOSTKEY`,
+`NITRO-USER-DATA` (= SHA-512 of the key) and `NITRO-DOC` (the attestation
+document with that user_data and the caller's nonce).
+`test/nitro/attested-ssh-client.sh HOST PORT --pcr0 … --pcr1 … --pcr2 …` is the
+verifier: it completes a handshake, takes the host key OpenSSH itself
+recorded, asks the session for the document with a fresh nonce, and requires
+printed key == handshake key, user_data == SHA-512 of it, and
+`verify-attestation.py` to pass on chain, signature, PCRs, nonce and
+user_data.  Measured on the real enclave: **VERDICT PASS**, record in
+`test/nitro/records/2026-10-07-ssh-*`.  Locally, `test/run-hosted-ssh.sh`
+runs the same against `./modus` (no NSM: the client exits 2 after the
+host-key binding checks, which is the PASS there).
+
+Two things the hosted path needed that the bare one never did: ssh.lisp's
+"wait for bytes" is now the `SSH-WAIT-DATA` seam (bare: the actor `RECEIVE` it
+always was; hosted: read(2) into the recv buffer); and the server must
+half-close and DRAIN before close(2) — closing with the client's final
+CLOSE/DISCONNECT unread makes Linux RST, which discards the exec reply the
+client had not yet received ("Broken pipe" on every exec, while the
+interactive path worked).  The bare TCP stack never RSTs there.

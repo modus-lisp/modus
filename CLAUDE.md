@@ -3496,6 +3496,12 @@ with `cmd`/`env` at its root; `/cmd` is one argv entry per line; the NSM
 response iovec must offer 0x3000 or the device answers with length 0; the
 document payload is an indefinite-length CBOR map.  `test/nitro/aws-launch.sh`
 launches the host (`ON_DEMAND=1`; spot was reclaimed mid-install).
+**AND SSH INTO IT IS ATTESTED (same day):** `net/hosted-ssh.lisp` runs
+net/ssh.lisp over a Linux stream (TCP or vsock; fresh getrandom host key),
+the EIF serves `(ssh-serve-vsock 22)`, `test/nitro/vsock-proxy.py` bridges the
+parent, and `test/nitro/attested-ssh-client.sh` PASSES against the real
+enclave: handshake key == attested key, PCR0/1/2 == the EIF's.  Bare builds
+unchanged except ssh.lisp's wait is the `SSH-WAIT-DATA` seam (UEFI SSH PASS).
 
 `kiln image nitro --with=…` builds `modus.eif` from AWS's boot blobs + the hosted
 static ELF + deterministic cpio ramdisks (no Docker, no nitro-cli; PCRs identical

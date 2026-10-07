@@ -1986,8 +1986,11 @@
         (setq cur (cdr cur))))
     ;; Call best match: specific > general > runtime-GF method > default error
     (let ((fn (if best-specific best-specific best-fn)))
+      ;; (VALUES …): CLHS 7.7.x SLOT-UNBOUND -- "if slot-unbound returns, its
+      ;; PRIMARY value will be used by the caller".  A method returning
+      ;; (values) made SLOT-VALUE return no values (SLOT-UNBOUND.3/5).
       (if fn
-        (funcall fn cls obj slot-name)
+        (values (funcall fn cls obj slot-name))
         ;; A RUNTIME (defmethod slot-unbound ((c t) (o CLASS) (s (eql 'X))) …)
         ;; — e.g. quicklisp's lazily-computed BASE-DIRECTORY (ql-dist
         ;; dist.lisp:508) — registers as a plain GF method on SLOT-UNBOUND,
@@ -2000,8 +2003,8 @@
               (let ((applicable (%collect-applicable-methods
                                  gf (list cls obj slot-name))))
                 (if applicable
-                    (%gf-dispatch-standard gf (list cls obj slot-name)
-                                           applicable)
+                    (values (%gf-dispatch-standard gf (list cls obj slot-name)
+                                                   applicable))
                     (error 'unbound-slot :name slot-name :instance obj)))
               (error 'unbound-slot :name slot-name :instance obj)))))))
 
@@ -2256,10 +2259,26 @@
     ;; per-arity register shuffle in the compiler.  The stub is EQ-recorded in
     ;; *gf-fn-to-name* by %make-gf-stub so %generic-function-p / find-method
     ;; can reverse-map it.
-    (aset gf 8 (%make-gf-stub name))
+    ;;
+    ;; SLOT 8 MUST BE A CLOSURE OBJECT, not whatever %MAKE-GF-STUB returns.
+    ;; That call site reads slot 1 as the env and slot 0 as the code address
+    ;; (the CLOSURE convention), and since c992425 the stub is a NATIVE DEFUN
+    ;; -- or, on the DEFCLASS-accessor path, a reused fixed-arity dispatcher --
+    ;; neither of which has those slots.  (funcall (defgeneric ...) 1 :a 2 :b 3)
+    ;; then jumped through garbage: 0, or a hang (DEFGENERIC.14/22/28/29).
+    ;; %MAKE-GF-STUB still runs for its side effect, installing NAME's fast
+    ;; native dispatcher; this closure is only the >4-arg FUNCALL entry.
+    (%make-gf-stub name)
+    (aset gf 8 (%make-gf-rest-closure name))
     ;; Slot 9: the dispatch cache -- see THE DISPATCH CACHE.
     (aset gf 9 nil)
     gf))
+
+(defun %make-gf-rest-closure (gf-name)
+  "A `(lambda (&rest args) (%gf-dispatch GF-NAME args))' CLOSURE OBJECT for
+   GF slot 8.  Captures the PARAMETER directly -- the shape %MAKE-GF-STUB's
+   SETF branch uses; a LET-bound capture beside &rest came back NIL."
+  (lambda (&rest args) (%gf-dispatch gf-name args)))
 
 (defun %gf-p (x)
   "True if X is a generic function object."

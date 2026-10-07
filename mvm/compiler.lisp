@@ -17005,6 +17005,7 @@
           (direct-call-label (make-compiler-label))
           (after-call-label (make-compiler-label))
           (after-sym-label (make-compiler-label))
+          (closure-check-label (make-compiler-label))
           (good-fn-label (make-compiler-label)))
       (emit-ir :pop fn-call-reg)
       ;; Layout-flip fuzzer hook — defaults to 0.  Used by
@@ -17082,6 +17083,8 @@
       (emit-ir :pop +vreg-v1+)
       (emit-ir :pop +vreg-v0+)
       (emit-ir-label after-sym-label)
+      ;; The >4-arg GF-struct path below re-enters HERE with slot 8's closure.
+      (emit-ir-label closure-check-label)
       ;; Detect closure object: must have object-tag AND subtag-closure.
       (let ((check-reg (alloc-temp-reg))
             (cmp-reg   (alloc-temp-reg)))
@@ -17270,7 +17273,6 @@
       (when (> nargs 4)
         (let ((check-reg (alloc-temp-reg))
               (cmp-reg   (alloc-temp-reg))
-              (env-reg   (alloc-temp-reg))
               (not-gf-label (make-compiler-label)))
           (emit-ir :obj-tag check-reg fn-call-reg)
           (emit-ir :li cmp-reg (ash +tag-object+ +fixnum-shift+))
@@ -17280,18 +17282,14 @@
           (emit-ir :li cmp-reg (ash +subtag-array+ +fixnum-shift+))
           (emit-ir :cmp check-reg cmp-reg)
           (emit-ir :bne not-gf-label)
-          ;; fn-call-reg = GF struct; load slot 8 = &rest stub closure.
+          ;; fn-call-reg = GF struct; load slot 8 = &rest stub closure and go
+          ;; back through the ONE closure-call sequence above, rather than a
+          ;; second hand-rolled copy of it here (that copy took a third temp
+          ;; while the five-plus argument registers were live, and the stub
+          ;; ran with a wrong env: DEFGENERIC.14/22/28/29).
           (emit-ir :obj-ref fn-call-reg fn-call-reg 8)
-          ;; Invoke via the closure convention: slot 1 = env-list (→ R13),
-          ;; slot 0 = fn-addr.  Mirrors the === Closure path === above.
-          (emit-ir :obj-ref env-reg fn-call-reg 1)
-          (emit-ir :obj-ref fn-call-reg fn-call-reg 0)
-          (emit-ir :set-cenv env-reg)
-          (emit-ir :set-nargs nargs)
-          (emit-ir :call-indirect fn-call-reg nargs)
-          (emit-ir :br after-call-label)
+          (emit-ir :br closure-check-label)
           (emit-ir-label not-gf-label)
-          (free-temp-reg)
           (free-temp-reg)
           (free-temp-reg)))
       (emit-ir :set-nargs nargs)

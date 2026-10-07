@@ -3194,6 +3194,13 @@
    compile-quote (no defvar init-thunks run at boot)."
   (let ((pkg (find-package "COMMON-LISP")))
     (when pkg
+      ;; T and NIL FIRST, and as themselves.  The reader turns the tokens into the
+      ;; runtime's own T and NIL, but INTERN below would have minted a fresh symbol
+      ;; under each name, so (FIND-SYMBOL "T" "CL") and (INTERN "T" ...) answered a
+      ;; T that is not EQ to T -- a type specifier SUBTYPEP then faulted on.  Seated
+      ;; here, INTERN finds them.  (EXPORT of NIL is the empty list: already external.)
+      (%pkg-set-external pkg (%symtab-add (%pkg-external pkg) "NIL" nil))
+      (%pkg-set-external pkg (%symtab-add (%pkg-external pkg) "T" t))
       (dolist (n (%standard-cl-symbol-names))
         (let ((sym (intern n pkg)))
           (export sym pkg)))

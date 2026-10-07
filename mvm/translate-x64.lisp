@@ -5080,13 +5080,22 @@
          ;; begins by staging its COUNT through RAX (`mov rax, pc` /
          ;; emit-load-vreg into +scratch-reg+).  The count VREG itself is NOT
          ;; clobbered — only RAX — so the allocator still reads it intact.
+         ;;
+         ;; UNLESS THE COUNT VREG *IS* RAX.  Then the check above overwrote the
+         ;; count with R12+size, and the allocator's `mov rax, rax` built the
+         ;; header from an ADDRESS, advanced R12 by ~8x that, and its zero-fill
+         ;; ran off the heap (MEMORY-FAULT-ERROR in %JIT-BRIDGE-ENSURE's
+         ;; (make-array (%jit-bridge-cap)) once the size stopped being a
+         ;; constant).  So when pc is RAX, the count is saved across the check.
          (let* ((vcount (first operands))
                 (kind (second operands))
                 (pc (vreg-phys vcount))
+                (keep (eq pc +scratch-reg+))
                 (page-lbl (and (mcgc-pinning-on-p) (mcgc-page-gc-label)))
                 (gc-lbl (or page-lbl (translate-state-gc-label state))))
            (when gc-lbl
              (let ((skip-label (make-label)))
+               (when keep (emit-push buf +scratch-reg+))
                (if pc
                    (emit-mov-reg-reg buf +scratch-reg+ pc)
                    (emit-load-vreg buf vcount +scratch-reg+))
@@ -5098,7 +5107,8 @@
                (emit-cmp-reg-reg buf +scratch-reg+ 'r14)
                (emit-jcc buf :l skip-label)
                (emit-call buf gc-lbl)
-               (emit-label buf skip-label)))))
+               (emit-label buf skip-label)
+               (when keep (emit-pop buf +scratch-reg+))))))
 
         ((op= +op-mcgc-collect+)
          ;; (%mcgc-collect) — force a full page collection UNCONDITIONALLY when

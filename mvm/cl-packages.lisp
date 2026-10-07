@@ -238,6 +238,12 @@
        (aset s 0 (char-code x))
        s))
     ((%cl-sym-p x) (%cl-sym-name x))
+    ;; T and NIL are symbols, and as string designators they name themselves.  They
+    ;; fell to "" below, which was harmless only while the CL package held separate
+    ;; symbols under those names; with the real T and NIL there, (FIND-ALL-SYMBOLS T)
+    ;; asked for "" (find-all-symbols.1).
+    ((null x) "NIL")
+    ((eq x t) "T")
     ;; Native MVM sym (#x50) or keyword (#x53), 1-slot hash-only.
     ;; Defer to SYMBOL-NAME which knows how to reverse-lookup the hash
     ;; through *sym-name-table* and the package symtabs.

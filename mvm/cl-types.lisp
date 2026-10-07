@@ -161,21 +161,35 @@
               (cs (%cos-poly-f r)))
          (%float-div sn cs)))))
 
+(defun %float-infinite-p (x)
+  "X (a boxed float) is +inf or -inf, by its IEEE bits.  Not by comparison:
+   (= (/ inf 2) inf) and (> inf 1) both answer NIL here."
+  (and (= (logand (%float-hi32 x) #x7FFFFFFF) #x7FF00000)
+       (= (%float-lo32 x) 0)))
+
 (defun %exp-f (x)
   "exp of double X via range-reduction + Taylor.  exp(x)=exp(x/2)^2
    keeps the Taylor argument in [-~1,1] for fast convergence; recursion
-   depth ~log2|x| (≤ ~11 for |x| ≤ ~700, beyond which exp overflows
-   IEEE double anyway)."
-  (if (%float-lt-p (%f-one) (%float-abs x))
-      (let ((half (%exp-f (%float-div x (%fl 2)))))
-        (%float-mul half half))
-      ;; |x| ≤ 1: 1 + x + x^2/2! + ...
-      (let ((term (%f-one)) (acc (%f-one)) (n 1))
-        (loop
-          (when (> n 18) (return acc))
-          (setq term (%float-div (%float-mul term x) (%fl n)))
-          (setq acc (%float-add acc term))
-          (setq n (+ n 1))))))
+   depth ~log2|x| (<= ~1024 for any finite double).
+
+   AN INFINITE X halves to itself and recursed until the stack ran out:
+   %LOG-F's Newton step can produce one, and LOG/ATANH/ACOSH on random floats
+   died with SIGSEGV in upstream shard 14 (7336 %EXP-F frames in the core).
+   exp(+inf) = +inf, exp(-inf) = 0."
+  (cond
+    ((%float-infinite-p x)
+     (if (= (logand (%float-hi32 x) #x80000000) 0) x (%fl 0)))
+    ((%float-lt-p (%f-one) (%float-abs x))
+     (let ((half (%exp-f (%float-div x (%fl 2)))))
+       (%float-mul half half)))
+    (t
+     ;; |x| <= 1: 1 + x + x^2/2! + ...
+     (let ((term (%f-one)) (acc (%f-one)) (n 1))
+       (loop
+         (when (> n 18) (return acc))
+         (setq term (%float-div (%float-mul term x) (%fl n)))
+         (setq acc (%float-add acc term))
+         (setq n (+ n 1)))))))
 
 (defun exp (x)
   "e^x.  Exact integer 1 for integer 0; IEEE float result otherwise."

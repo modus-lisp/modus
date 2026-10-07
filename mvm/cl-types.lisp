@@ -2561,6 +2561,33 @@
           (setq cur (cdr cur)))
         (if (= sign -1) (%float-sub (%float-from-int 0) acc) acc))))
 
+(defun %ratio-to-double (r)
+  "The double nearest the ratio R, ties to even.  It used to divide the two
+   halves as doubles: that rounds twice, and once the denominator passed the
+   double range (any |R| below about 1e-292 -- 1d-300 as a rational has a
+   2^1049 denominator) the quotient was 0.  Now: round R to a 53-bit integer
+   mantissa (to the subnormal grid 2^-1074 at the bottom) in exact integer
+   arithmetic, then SCALE-FLOAT it, which is exact."
+  ;; R is a ratio, or modus's 2-slot rational-form float: [numerator denominator].
+  (let* ((neg (minusp (aref r 0)))
+         (num (abs (aref r 0)))
+         (den (aref r 1))
+         (e2 (- (integer-length num) (integer-length den))))
+    ;; E2 is floor(log2 |R|) or one more.
+    (when (< (* num (if (< e2 0) (expt 2 (- e2)) 1))
+             (* den (if (> e2 0) (expt 2 e2) 1)))
+      (setq e2 (- e2 1)))
+    (when (> e2 1023) (error 'floating-point-overflow))
+    (let* ((shift (max (- e2 52) -1074))
+           (m (if (>= shift 0)
+                  (round num (* den (expt 2 shift)))
+                  (round (* num (expt 2 (- shift))) den))))
+      (when (= m (expt 2 53))
+        (setq m (expt 2 52) shift (+ shift 1)))
+      (when (> (+ shift 52) 1023) (error 'floating-point-overflow))
+      (let ((d (scale-float (%bignum-to-float m) shift)))
+        (if neg (- d) d)))))
+
 (defun %any-to-float (n)
   "Coerce any numeric N to an IEEE float object via the SSE2-backed
    %float-from-int / %float-div primops.  Handles:
@@ -2581,9 +2608,7 @@
   (cond
     ((%ieee-float-p n) n)
     ((integerp n) (%bignum-to-float n))         ; bignum-safe, NOT raw cvtsi2sd
-    ((ratiop n)
-     (%float-div (%bignum-to-float (aref n 0))
-                 (%bignum-to-float (aref n 1))))
+    ((ratiop n) (%ratio-to-double n))
     ;; Complex array: [%complex-marker r i] (3 slots, subtag #x32).
     ((and (not (fixnump n)) (not (consp n)) (not (null n))
           (not (characterp n))
@@ -2598,7 +2623,8 @@
        (cond
          ((= den 0) (%float-from-int 0))
          ((= den 1) (%bignum-to-float num))
-         (t (%float-div (%bignum-to-float num) (%bignum-to-float den))))))
+         ;; Same [num den] layout as a ratio.
+         (t (%ratio-to-double n)))))
     (t n)))
 
 ;; When T, arithmetic on NIL signals TYPE-ERROR (CLHS) instead of doing raw

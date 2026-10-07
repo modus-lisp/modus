@@ -1141,6 +1141,15 @@
 ;; cross-unit RETURN-FROM that finds its target here emits a THROW to
 ;; that tag, which unwinds (running unwind-protect cleanups) to the
 ;; BLOCK's catch frame.
+(defvar *flet-self-exits* nil
+  "Alist (NAME-HASH . FUNCTION-RETURN-LABEL), one entry per FLET/LABELS function
+   whose body is being compiled (pushed by its %%FLET-SELF marker).  CLHS gives a
+   local function an implicit BLOCK named after it; RETURN-FROM NAME that finds
+   no BLOCK consults this, and when the entry's label is the CURRENT
+   *function-return-label* (same compilation unit, not a nested lambda) returns
+   from the function.  Before, it fell back to the nearest BLOCK NIL -- inside a
+   LOOP that exited only the loop and the function ran on past its RETURN-FROM.")
+
 (defvar *nonlocal-blocks* nil
   "Alist of (name-hash tag-value) for cross-unit block/return-from")
 
@@ -7442,6 +7451,15 @@
       ;; (3) compile-return fallback (BLOCK NIL / loop / function).
       ;; (%%LX-REG vreg) -- internal to %COMPILE-LEXICAL-EXIT: the value
       ;; currently in virtual register VREG.
+      ;; (%%FLET-SELF name . body) -- see %FLET-DEF-MARK-SELF / *FLET-SELF-EXITS*.
+      ;; SETQ + restore, not a LET of the special (unreliable in image code).
+      ((= op-name #.(compute-name-hash "%%FLET-SELF"))
+       (let ((%fse-saved *flet-self-exits*))
+         (setq *flet-self-exits*
+               (cons (cons (normalize-name (cadr form)) *function-return-label*)
+                     %fse-saved))
+         (unwind-protect (compile-progn (cddr form) env dest)
+           (setq *flet-self-exits* %fse-saved))))
       ((= op-name #.(compute-name-hash "%%LX-REG"))
        (unless (eql dest (cadr form)) (emit-ir :mov dest (cadr form))))
       ((= op-name 164933334)  ; RETURN-FROM
@@ -7472,6 +7490,16 @@
               ;; restart-case internals.
               (compile-form (cons '%nlx-throw (cons tag-val (cddr form)))
                             env dest)))
+           ;; RETURN-FROM a local function's own name, in its own unit: return
+           ;; from the function (its implicit BLOCK), not the nearest BLOCK NIL.
+           ((let ((self (assoc (normalize-name bname) *flet-self-exits* :test #'=)))
+              (and self *function-return-label* (eq (cdr self) *function-return-label*)))
+            (compile-form (caddr form) env +vreg-vr+)
+            (when (%uwp-pending-above 0)
+              (emit-ir :push +vreg-vr+)
+              (%emit-uwp-unwind-to 0)
+              (emit-ir :pop +vreg-vr+))
+            (emit-ir :br *function-return-label*))
            (t (compile-return (caddr form) env dest)))))
       ;; VALUES — return multiple values
       ((= op-name 18794783)  ; VALUES
@@ -12759,57 +12787,33 @@
             (setq any-captures t)))))
     any-captures))
 
-(defun %flet-body-returns-from-p (tree name)
-  "True when TREE contains (RETURN-FROM NAME ...) -- NAME compared with EQ, as
-   CLHS block names are.  Not by name: in the ANSI gate runner a local
-   function's name can be a symbol whose name reads back EMPTY (it prints as
-   ||), so a name or name-hash comparison matched EVERY RETURN-FROM -- the
-   (return-from b6 c) of upstream MISC.14 too -- and the block was added where
-   nothing needed it.  If EQ ever misses, the function compiles as it did
-   before the implicit block existed."
-  (and (consp tree)
-       (or (and (symbolp (car tree)) (car tree)
-                (= (normalize-name (car tree)) 164933334)   ; RETURN-FROM
-                (consp (cdr tree))
-                (eq (cadr tree) name))
-           (%flet-body-returns-from-p (car tree) name)
-           (%flet-body-returns-from-p (cdr tree) name))))
-
-(defun %flet-with-block (def)
-  "DEF, a local function definition (NAME PARAMS . BODY), with BODY in the implicit BLOCK
-   CLHS 5.3 gives it -- named NAME, or X for a (SETF X) -- after its declarations and docstring.
-
-   WITHOUT IT, (return-from f v) inside a local F found no block named F (the body is compiled
-   as a function with a generated name, which is why MVM-COMPILE-FUNCTION-INTERNAL-1 registers
-   none) and fell back to COMPILE-RETURN, which exits the innermost BLOCK NIL: from inside a
-   LOOP or DOTIMES it left the LOOP and the function carried on.  A labels helper that searched
-   a list and returned the match always answered its fall-through value instead."
-  (if (and (consp def) (consp (cdr def)))
+(defun %flet-def-mark-self (def)
+  "DEF (name params . body) with BODY wrapped in (%%FLET-SELF name ...), after
+   any leading declarations and docstring.  The marker compiles exactly as
+   PROGN; it only tells RETURN-FROM which function NAME's implicit block is.
+   (Unlike wrapping the body in a real BLOCK, it adds no block for an outer
+   RETURN-FROM to pass through.)"
+  (if (not (and (consp def) (consp (cdr def))))
+      def
       (let* ((name (car def))
              (bname (cond ((symbolp name) name)
                           ((and (consp name) (consp (cdr name))) (cadr name))
                           (t nil)))
-             (forms (cddr def))
-             (head '()))
-        ;; ONLY WHEN THE BODY NAMES IT.  Wrapping every local function moved the
-        ;; gate runner's (return-from OUTER v) out of a local function off the
-        ;; outer block's catch frame and onto a function return (upstream
-        ;; MISC.14/36/176: (block b6 (flet ((f () (return-from b6 c))) ...))
-        ;; came back with F's value instead of leaving B6).  A body with no
-        ;; RETURN-FROM to its own name cannot observe the block, so it is left
-        ;; exactly as it compiled before.
-        (if (or (null bname) (not (%flet-body-returns-from-p forms bname)))
+             (body (cddr def))
+             (head nil))
+        (if (null bname)
             def
             (progn
-              ;; leading declarations, and a docstring that is not the only form, stay outside
-              (loop while (and (consp forms)
-                               (or (and (consp (car forms)) (symbolp (caar forms))
-                                        (string= (symbol-name (caar forms)) "DECLARE"))
-                                   (and (stringp (car forms)) (consp (cdr forms)))))
-                    do (push (car forms) head) (setq forms (cdr forms)))
+              (loop
+                (cond ((and (consp (car body))
+                            (%form-op-is (car body) #.(compute-name-hash "DECLARE") "DECLARE"))
+                       (push (pop body) head))
+                      ((and (stringp (car body)) (cdr body))
+                       (push (pop body) head))
+                      (t (return))))
               (list* name (cadr def)
-                     (append (nreverse head) (list (list* 'block bname forms)))))))
-      def))
+                     (append (nreverse head)
+                             (list (list* '%%flet-self bname body)))))))))
 
 (defun compile-flet (defs body env dest &optional labels-p)
   "Compile (flet ((name (params) body) ...) body).
@@ -12826,11 +12830,6 @@
    (not raw let slots) carry the lambda values so mutual recursion in LABELS
    still works: each lambda body reads its target via (CAR CELL) at call
    time, after every cell's car has been populated."
-  ;; Replace DEFS only when a definition actually gained a block: the rest of
-  ;; COMPILE-FLET (and the walkers that ran on the enclosing BLOCK) see the
-  ;; SOURCE conses, and a fresh copy of an unchanged list is not EQ to them.
-  (let ((nd (mapcar (function %flet-with-block) defs)))
-    (unless (every (function eq) nd defs) (setq defs nd)))
   ;; Capture-aware transform: when any function body captures an outer
   ;; binding, replace the FLET/LABELS with a LET that allocates one
   ;; heap cell per local function name, then sets each cell's car to a
@@ -12840,6 +12839,8 @@
   ;; vars) via the normal compile-lambda closure path; intra-FLET
   ;; mutual recursion still works because the cell pointer is constant
   ;; while its car is mutated.
+  (when (consp defs)
+    (setq defs (mapcar #'%flet-def-mark-self defs)))
   (when (and (consp defs) (%flet-functions-capture-vars-p defs env))
     (let* ((local-names nil)
            (cell-names  nil)

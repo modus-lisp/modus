@@ -126,9 +126,45 @@
   (handler-case (cli-toplevel) (t (c) (sys-exit 1))))
 ")
 
-;; No late arch overrides on x86-64: cl-fileio.lisp's syscall numbers and
-;; lib/cli-toplevel.lisp's %cli-argv-base are already the x86-64 forms.
-(defvar *cli-arch-override-source* "")
+;; Late arch overrides.  cl-fileio.lisp's syscall numbers and
+;; lib/cli-toplevel.lisp's %cli-argv-base are already the x86-64 forms; what is
+;; left is SAVE-AND-DIE's geometry (lib/save-image.lisp).  boot-linux-x64's stub
+;; stores the GC control block and the MCGC config words RAW, so the shared
+;; mem-ref :u64 reads halve them: read exact words instead.  The heap sits at
+;; the fixed +linux-x64-fixed-heap-base+ and JIT pages come from the fixed
+;; arena, so a core restores at the addresses it was saved from.
+(defvar *cli-arch-override-source*
+"(defun %core-from-start () (%gc-read64 #x10000040))
+(defun %core-to-start () (%gc-read64 #x10000048))
+(defun %core-space-size () (%gc-read64 #x10000050))
+(defun %core-page-base () (%gc-read64 #x10000E00))
+(defun %core-bitmap-base () (%gc-read64 #x10000E18))
+;; No config word for the cons-kind bitmap on x64: translate-x64 derives it as
+;; the object-start bitmap + +mcgc-kindbitmap-delta+.
+(defun %core-cons-bitmap-base () (+ (%gc-read64 #x10000E18) #xFE4000))
+;; +linux-x64-heap-alloc-start+.
+(defun %core-heap-base (from) (- from #x400))
+;; The shared sequence, with x64's JIT constant-vector root (0x10000F00,
+;; translate-x64 *x64-jit-constvec-root*) restored IN PLACE: JIT code in the
+;; arena loads its constants through it, and they live in the heap slice.
+(defun %core-restore-window (fd stage)
+  (%core-slice fd stage #x60)
+  (%core-slice fd #x10000060 8)
+  (%core-slice fd stage #x18)
+  (%core-slice fd #x10000080 16)
+  (%core-slice fd stage #xB8)
+  (%core-slice fd #x10000148 8)
+  (%core-slice fd stage #x20)
+  (%core-slice fd #x10000170 8)
+  (%core-slice fd stage #xD88)        ; 0x178..0xF00
+  (%core-slice fd #x10000F00 8)       ; JIT constant-vector root
+  (%core-slice fd stage #x98)         ; 0xF08..0xFA0: per-CPU region cells, GC stats, arena bump
+  (%core-slice fd #x10000FA0 16)
+  (%core-slice fd #x10000FB0 8)
+  (%core-slice fd stage #x18)
+  (%core-slice fd #x10000FD0 8)
+  (%core-slice fd stage #x28))
+")
 
 (load (merge-pathnames "build-cli-common.lisp"
                        (directory-namestring (truename *load-truename*))))
@@ -143,7 +179,8 @@
 
 (funcall (intern "INSTALL-X64-TRANSLATOR" "MODUS.MVM.X64"))
 (setf modus.mvm.x64::*x64-linux-mode* t)
-;; Boot preamble for linux-x64 ends 397 bytes into the file (ELF header
+;; Boot preamble for linux-x64 ends 541 bytes into the file (397 before the
+;; save-and-die fixed-mapping block, which is padded to 144 = 9*16) (ELF header
 ;; + entry stub).  Native code starts there, so the fn-entry alignment
 ;; loop must account for this offset — otherwise `:li-func` + OR-3 +
 ;; CALL-IND's sub-3 lands one byte before the prologue.  When the
@@ -151,7 +188,7 @@
 ;; misaligned call returns immediately, leaving the caller's RAX
 ;; intact (silently looks like the fn returned T or whatever else
 ;; was in RAX).  See reference_append_funcall_bug.md.
-(setf modus.mvm.x64::*x64-native-code-offset* 397)
+(setf modus.mvm.x64::*x64-native-code-offset* 541)
 
 ;; NATIVE THREADS, STEP 1: the hosted actor scheduler gets a REAL spinlock.
 ;; net/actors.lisp hands the lock's RELEASE to RESTORE-CONTEXT; with this set,

@@ -953,6 +953,11 @@
 ;;; binding — redefinition-safe, GC-safe: the thunk holds no heap pointer) and
 ;;; FUNCALLs.  Sites with >3 args still fail the page (rare; register window).
 (defvar *jit-bridge-names* nil "Vector of callee NAME strings, indexed by thunk.")
+(defvar *jit-bridge-pairs* nil
+  "Parallel to *JIT-BRIDGE-NAMES*: each callee's *SYMBOL-FUNCTION-TABLE* entry
+   CONS once a call has resolved it (see %JIT-BRIDGE-RESOLVE).  Made on the
+   main thread with the names vector, so a worker only stores an existing
+   region-0 cons into it.")
 (defvar *jit-bridge-count* nil "Fill index into *jit-bridge-names*.  NIL = 0.")
 (defvar *jit-thunk-page* nil "Current thunk pool page base (exec).")
 (defvar *jit-thunk-bump* nil "Byte offset of the next free thunk in the page.")
@@ -976,10 +981,27 @@
   65536)
 
 (defun %jit-bridge-resolve (idx)
-  (let ((nm (if (and *jit-bridge-names* (< idx (length *jit-bridge-names*)))
-                (aref *jit-bridge-names* idx) nil)))
-    (let ((f (and nm (%mvm-resolve-runtime-fn nm))))
-      (if f f (error "jit-bridge: ~A is undefined at call time" nm)))))
+  "The callee of bridge thunk IDX, resolved at CALL time (late binding).  The
+   symbol-function-table entry CONS is cached per thunk: PUTHASH updates it in
+   place, so a redefinition is still seen, and a call no longer pays an EQUAL
+   hash of the callee's name (~10% of an operandi ACP turn).  Only a direct key
+   hit is cached; the bare-name fallback resolves every time."
+  (let* ((pairs *jit-bridge-pairs*)
+         (pair (and pairs (< idx (length pairs)) (aref pairs idx))))
+    (if (and (consp pair) (cdr pair))
+        (cdr pair)
+        (let ((nm (if (and *jit-bridge-names* (< idx (length *jit-bridge-names*)))
+                      (aref *jit-bridge-names* idx) nil)))
+          (let ((p (and nm pairs (< idx (length pairs))
+                        (boundp '*symbol-function-table*) *symbol-function-table*
+                        (%gethash-pair nm *symbol-function-table*))))
+            (if (and (consp p) (cdr p))
+                (progn (setf (aref pairs idx) p) (cdr p))
+                (let ((f (and nm (%mvm-resolve-runtime-fn nm))))
+                  ;; UNDEFINED-FUNCTION, as the interpreter signals for the
+                  ;; same call: a site whose callee did not exist when its
+                  ;; page was built is bridged too (%JIT-RELOC-CALLS).
+                  (if f f (error (quote undefined-function) :name nm)))))))))
 (defun %jit-bridge-0 (idx) (funcall (%jit-bridge-resolve idx)))
 (defun %jit-bridge-1 (idx a) (funcall (%jit-bridge-resolve idx) a))
 (defun %jit-bridge-2 (idx a b) (funcall (%jit-bridge-resolve idx) a b))
@@ -1020,6 +1042,10 @@
     (let ((nv (make-array (%jit-bridge-cap))) (old *jit-bridge-names*))
       (dotimes (i (length old)) (aset nv i (aref old i)))
       (setq *jit-bridge-names* nv)))
+  ;; Per-thunk cache of the callee's symbol-function-table pair, same size.
+  (when (or (null *jit-bridge-pairs*)
+            (< (length *jit-bridge-pairs*) (%jit-bridge-cap)))
+    (setq *jit-bridge-pairs* (make-array (%jit-bridge-cap) :initial-element nil)))
   (when (null *jit-thunk-page*)
     (%jit-thunk-new-page))
   (if *jit-thunk-page* t nil))
@@ -1072,6 +1098,30 @@
     (setq *jit-bridge-count* (+ idx 1))
     (%jit-thunk-emit-tail addr (%jit-thunk-emit-shift addr nargs) idx nargs)
     addr))
+
+(defun %jit-make-bridge-any-thunk (name)
+  "x86-64 ANY-ARITY bridge thunk for a call to NAME: its address or NIL.  The
+   nargs-specific thunk shifts V0..V3 up to make room for the name index, which
+   cannot reach a 5th+ argument on the stack, so a site with more than 3
+   arguments failed its page -- and FORMAT, a heap closure, is called with 4+
+   all over jzon and flexi-streams.  This one passes the index out of band in
+   the per-thread slot fs:[0x10000178] and jumps to %JIT-BRIDGE-ANY with every
+   argument register, stack argument and the nargs slot untouched:
+     mov dword fs:[0x10000178], idx ; movabs rax, bridge-any ; jmp rax"
+  (if (or (null (%jit-bridge-ensure)) (>= *jit-bridge-count* 4096))
+      nil
+      (let ((addr (%jit-thunk-alloc)))
+        (if (null addr)
+            nil
+            (let ((idx *jit-bridge-count*))
+              (setf (aref *jit-bridge-names* idx) name)
+              (setq *jit-bridge-count* (+ idx 1))
+              (%jit-emit-bytes addr (list #x64 #xC7 #x04 #x25 #x78 #x01 #x00 #x10
+                                          (logand idx 255) (logand (ash idx -8) 255) 0 0))
+              (%jit-emit-bytes (+ addr 12) (list #x48 #xB8))
+              (%jit-write-imm64 addr 14 (%jit-bridge-any-entry))
+              (%jit-emit-bytes (+ addr 22) (list #xFF #xE0))
+              addr)))))
 
 (defun %jit-make-bridge-thunk (name nargs)
   "Build the x64 bridge thunk for a NARGS-arg call to NAME; its address or NIL."
@@ -1434,9 +1484,15 @@
         ;; #306 BRIDGE: a resolved-but-non-native callee gets a thunk instead
         ;; of failing the page (x64 only; nargs from the translator's parallel
         ;; alist, NIL on aarch64 → falls through to the old reject).
-        (when (and (= raw 0) fn (%jit-bridge-on-p) (not (eq *jit-target-arch* :aarch64)))
+        ;; Also for a callee that does not exist YET (unresolved): the
+        ;; bridge resolves at call time, and a DEFGENERIC whose methods call
+        ;; the GF it is defining (jzon's WRITE-VALUE) is the common case.
+        ;; More than 3 arguments (or an unknown count): the any-arity thunk.
+        (when (and (= raw 0) name (%jit-bridge-on-p) (not (eq *jit-target-arch* :aarch64)))
           (let* ((na (assoc (car r) *x64-call-reloc-nargs*))
-                 (th (and na (%jit-make-bridge-thunk name (cdr na)))))
+                 (th (if (and na (cdr na) (<= (cdr na) 3))
+                         (%jit-make-bridge-thunk name (cdr na))
+                         (%jit-make-bridge-any-thunk name))))
             (when th
               (setq raw th)
               (setq *jit-bridged-sites*
@@ -3179,6 +3235,9 @@
                                               :bytecode-length 0)))
                 (setf (gethash name *functions*) info)
                 (setf (gethash rt-next rt-table) name)
+                ;; The interpreter's per-stub cache cell (%mvm-rt-cell-fn), made HERE
+                ;; on the compiling thread: an actor running this module only RPLACAs it.
+                (setf (gethash (- rt-next) rt-table) (cons nil 0))
                 (setq rt-next (+ rt-next 1)))))))
       ;; Pass 2: emit bytecode.
       (dolist (e all-ir)
@@ -3343,6 +3402,20 @@
                  (eql (mem-ref #x10000EB8 :u32) (%eval-lock-me))
                  (>= (mem-ref #x10000EC0 :u32) %depth))
         (%eval-lock-release)))))
+
+(defun %mvm-forms-define-methods-p (forms)
+  "True when FORMS is a DEFMETHOD or DEFGENERIC top-level form.  Such a form
+   runs ONCE, so RETRY-ON-HOT would interpret it -- but the method function it
+   makes is a lambda of this module, and an interpreted module's lambda stays
+   an interpreter trampoline for every later call of the method.  JIT-EAGER
+   never reaches it (it translates DEFUN modules only).  Measured on an
+   operandi ACP server: jzon's WRITE-VALUE methods, interpreted, were most of
+   every turn.  So these forms are translated on their first eval."
+  (let ((f (if (and (consp forms) (null (cdr forms))) (car forms) forms)))
+    (and (consp f)
+         (symbolp (car f))
+         (let ((n (symbol-name (car f))))
+           (or (string= n "DEFMETHOD") (string= n "DEFGENERIC"))))))
 
 (defun %mvm-eval-forms-2 (forms)
   ;; In-image: emit integer literals as fixnum-safe :li-halves (set the GLOBAL,
@@ -3544,6 +3617,9 @@
                                             :bytecode-length 0)))
               (setf (gethash name *functions*) info)
               (setf (gethash rt-next rt-table) name)
+              ;; The interpreter's per-stub cache cell (%mvm-rt-cell-fn), made HERE
+              ;; on the compiling thread: an actor running this module only RPLACAs it.
+              (setf (gethash (- rt-next) rt-table) (cons nil 0))
               (setq rt-next (+ rt-next 1)))))))
     ;; Pass 2: emit (CALLs resolve to in-module OR synthetic offsets via *functions*).
     (dolist (e all-ir)
@@ -3735,7 +3811,10 @@
                             ;; layout 24 ms a frame.  So a module that compiled a
                             ;; lambda body is JIT'd on its first run; if the page
                             ;; cannot be built it interprets exactly as before.
-                            (if (and (%jit-active-p) (or (not (%jit-hot-only-p)) %lam-bearing))
+                            (if (and (%jit-active-p)
+                                     (or (not (%jit-hot-only-p))
+                                         %lam-bearing
+                                         (%mvm-forms-define-methods-p forms)))
                                 (handler-case
                                     (%mvm-eval-jit-run bc entry (reverse ft-list)
                                                     fn-table rt-table lam-offsets nil

@@ -75,7 +75,7 @@ if [ -n "$(sym MODUS-LAYOUT-REGION-LO)" ]; then
       [ "$ALO" -eq $((lo + SLIDE)) ] || { echo "image-segments: the core's arena is not this image's" >&2; exit 1; }
       CODE=$((ABUMP - ALO))
       if [ "$CODE" -gt 0 ]; then
-        OFF=$((128 + 4096 + FREE - FROM + 2 * BLEN))
+        OFF=$((192 + 4096 + FREE - FROM + 2 * BLEN))   # 192 = %CORE-HEADER-BYTES
         tail -c +$((OFF + 1)) "$MODUS_CORE" | head -c "$CODE" > "$DIR/arena-code.bin"
         CSPAN=$(round "$CODE")
         echo ".section __MODUSC,__code" >> "$S"

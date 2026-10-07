@@ -225,6 +225,51 @@
              (and cut (< cut n)
                   (gethash (subseq name cut) *symbol-function-table*))))))
 
+(defun %rt-stub-count (runtime-table)
+  "Number of runtime stubs in RUNTIME-TABLE: keys #x40000000, +1, ... are
+   contiguous.  Not HASH-TABLE-COUNT, which also counts the stubs' cache cells
+   (negative keys, see %MVM-RT-CELL-FN)."
+  (let ((n 0))
+    (loop
+      (unless (gethash (+ +mvm-runtime-call-base+ n) runtime-table) (return n))
+      (setq n (+ n 1)))))
+
+(defun %mvm-rt-cell-fn (runtime-table target name)
+  "The native function a runtime stub TARGET calls, through the stub's cache
+   cell: the (pair . store-p) cons mvm-eval made under key (- TARGET) when it
+   built RUNTIME-TABLE.  The cell caches the *SYMBOL-FUNCTION-TABLE* entry
+   CONS, which PUTHASH updates in place, so a redefinition is seen with no
+   invalidation; only the first call per stub pays the string-keyed lookup
+   (an EQUAL hash of the whole name, ~10% of a Quicklisp load when every
+   interpreted call paid it).  Only a direct key hit is cached; the bare-name
+   fallback, and tables built without cells, resolve every time."
+  (let ((cell (gethash (- target) runtime-table)))
+    (if (consp cell)
+        (let ((pair (car cell)))
+          (if (and (consp pair) (cdr pair))
+              (cdr pair)
+              (let ((p (and (boundp '*symbol-function-table*)
+                            *symbol-function-table*
+                            (stringp name)
+                            (%gethash-pair name *symbol-function-table*))))
+                (if (and (consp p) (cdr p))
+                    (progn (rplaca cell p) (cdr p))
+                    (%mvm-resolve-runtime-fn name)))))
+        (%mvm-resolve-runtime-fn name))))
+
+(defun %mvm-rt-cell-store-p (runtime-table target name)
+  "%MVM-STORE-FN-NAME-P of the stub's NAME, memoized in its cache cell's CDR
+   (0 = not yet asked; the answer depends on NAME alone)."
+  (let ((cell (gethash (- target) runtime-table)))
+    (if (consp cell)
+        (let ((v (cdr cell)))
+          (if (eql v 0)
+              (let ((r (if (%mvm-store-fn-name-p name) t nil)))
+                (rplacd cell r)
+                r)
+              v))
+        (%mvm-store-fn-name-p name))))
+
 (defconstant +num-vregs+ 23)
 
 (defvar *nlx-state-serial* 0)
@@ -1052,6 +1097,11 @@
    in-module call convention (op-call's bridge reads args via svref too)."
   (let* ((state (make-mvm-state))
          (bc bytecode) (pc entry-point) (len (length bc))
+         ;; Read ONCE per entry, not per instruction: a special read in image
+         ;; code is a globals-table probe (%GV-REF), and the per-opcode
+         ;; (when *mvm-trace* ...) made it ~10% of a Quicklisp load.  Setting
+         ;; *MVM-TRACE* takes effect at the next interpreter entry.
+         (%trace-on *mvm-trace*)
          (ftab (or function-table (vector)))
          (regs (mvm-regs state))
          ;; Unboxed single-float FP register file (F0..F5) for the interpreter
@@ -1130,7 +1180,7 @@
                   (setq *mvm-last-mv* (cons %mvc (%mvm-collect-mv-secs state %mvc)))
                   (setq *mvm-last-mv* nil))
               (return (svref regs +vreg-vr+)))))    ; value directly (boundary-safe)
-      (when *mvm-trace*
+      (when %trace-on
         ;; pc, opcode, flags, then V0..V7 as MACHINE WORDS (hex) -- the words
         ;; are what the word-level ops see, and a value<->word round trip that
         ;; goes wrong (the 30-bit tower's failure mode) shows up here directly.
@@ -1763,11 +1813,13 @@
                  ;; Fast path: a fixnum whose shifted value stays below
                  ;; 2^(fixnum-bits - 1) is (ash v amt) exactly -- the word
                  ;; 2*(v << amt) cannot wrap -- with no bignum in sight.
-                 (let ((v (svref regs vs)))
-                   (if (and (typep v 'fixnum) (< amt (- +fixnum-bits+ 1))
-                            (let ((lim (ash 1 (- +fixnum-bits+ 1 amt))))
-                              (and (< v lim) (> v (- lim)))))
-                       (setf (svref regs vd) (ash v amt))
+                 ;; %FIXNUM-SHL-OR-NIL is that test and the shift in one call
+                 ;; (the bound used to be its own (ash 1 ..) call per opcode).
+                 (let* ((v (svref regs vs))
+                        (r (and (typep v 'fixnum) (< amt (- +fixnum-bits+ 1))
+                                (%fixnum-shl-or-nil v amt))))
+                   (if r
+                       (setf (svref regs vd) r)
                        (%mvm-put-word regs vd
                                       (%mvm-wrap-word (ash (%mvm-word v) amt)))))
                  (setf pc npc3)))))
@@ -2603,7 +2655,7 @@
                  ;; %word->val'd args (raw words -> real values, no marshalling),
                  ;; store %val->word of the result in VR, continue after the CALL.
                  (let* ((name (gethash target runtime-table))
-                        (fn (%mvm-resolve-runtime-fn name))
+                        (fn (%mvm-rt-cell-fn runtime-table target name))
                         (nargs (mvm-nargs state)))
                    (if fn
                        (let ((args
@@ -2621,7 +2673,7 @@
                               (%mvm-collect-call-args state regs nargs
                                                       bc ftab runtime-table
                                                       lambda-offsets
-                                                      (%mvm-store-fn-name-p name))))
+                                                      (%mvm-rt-cell-store-p runtime-table target name))))
                          ;; PROPAGATE SECONDARY VALUES across the bridge.  Native
                          ;; multi-valued fns (floor/truncate/round/rem returning a
                          ;; quotient AND remainder) write their secondaries to the
@@ -2701,7 +2753,7 @@
              (multiple-value-bind (target npc2) (fetch-u32 bc npc)
                (if (and runtime-table (>= target +mvm-runtime-call-base+))
                    (let* ((name (gethash target runtime-table))
-                          (fn (and name (%mvm-resolve-runtime-fn name))))
+                          (fn (and name (%mvm-rt-cell-fn runtime-table target name))))
                      (if (functionp fn)
                          (reg-set regs vd (%val->word fn))
                          (reg-set-nil regs vd)))

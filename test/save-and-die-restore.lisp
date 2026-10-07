@@ -1,0 +1,17 @@
+;;;; save-and-die-restore.lisp — phase 2: runs under `modus --core'.  The
+;;;; restored image keeps its functions (native), data, and can JIT anew.
+(defun sad-new (y) (+ y 1))
+(sad-new 1)
+(jit-eager)
+(let ((ok (and (= (sad-mul 6) 42)
+               (= (sad-loop 1000) 3496500)
+               (%jit-fn-native-p "COMMON-LISP-USER::SAD-LOOP")
+               (equal (subseq *sad-kept* 0 3) '(1 "two" :three))
+               (= (gethash :k (fourth *sad-kept*)) 42)
+               (= (sad-new 41) 42)
+               (%jit-fn-native-p "COMMON-LISP-USER::SAD-NEW")
+               (eq (sb-thread:with-mutex (*sad-mutex*) :held) :held)
+               (eq (sb-thread:with-mutex ((sb-thread:make-mutex :name "new")) :held) :held))))
+  (format t "~&SAD-RESTORE ~a~%" (if ok "OK" "BAD"))
+  (finish-output)
+  (sys-exit (if ok 0 4)))

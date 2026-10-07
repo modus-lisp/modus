@@ -4681,11 +4681,14 @@
 (defun integer-length (n &rest extra)
   (if extra
       (%program-error "integer-length requires exactly 1 argument")
+      ;; Negative: the length of (lognot N) = |N| - 1 (CLHS), small and big
+      ;; bignums alike.  BIGNUM-HI of a big (sign-magnitude) bignum is not
+      ;; its sign, so a negative big bignum took the magnitude path and
+      ;; (integer-length (- (ash 1 124))) was 125.
       (if (bignump n)
-          (let ((hi (bignum-hi n)))
-            (if (< hi 0)
-                (%bignum-integer-length-pos (bignum-1- (bignum-negate n)))
-                (%bignum-integer-length-pos n)))
+          (if (< n 0)
+              (%bignum-integer-length-pos (bignum-1- (bignum-negate n)))
+              (%bignum-integer-length-pos n))
           (%fixnum-integer-length n))))
 
 ;;; INTEGERP — strict 1-arg arity (last-defun-wins)

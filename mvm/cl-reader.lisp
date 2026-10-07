@@ -1926,7 +1926,25 @@
    `*features* = (:a :x :b)` while the source uses `#+X` (the symbol X
    reads in package CL-TEST but should still match `:X`)."
   (and (symbolp a) (symbolp b)
-       (string= (symbol-name a) (symbol-name b))))
+       (or (eq a b)
+           ;; Every symbol flavour (native #x50, keyword #x53, CL-sym) keeps
+           ;; the compute-name-hash of its name in slot 0, so different
+           ;; hashes mean different names.  SYMBOL-NAME on a hash-only
+           ;; symbol is a table lookup that hashes again, and a #+X miss used
+           ;; to pay it against every element of *FEATURES*: ~6% of a
+           ;; Quicklisp load.  Only a hash match (or NIL/T, gensyms) compares
+           ;; names.
+           (let ((ha (%feature-sym-hash a)) (hb (%feature-sym-hash b)))
+             (if (and ha hb (not (eql ha hb)))
+                 nil
+                 (string= (symbol-name a) (symbol-name b)))))))
+
+(defun %feature-sym-hash (s)
+  "Slot-0 name hash of symbol S, or NIL for NIL/T/gensyms (no slot 0)."
+  (cond ((or (null s) (eq s t)) nil)
+        ((or (fixnump s) (characterp s) (stringp s) (consp s)) nil)
+        (t (let ((st (obj-subtag s)))
+             (if (or (= st 80) (= st 83)) (aref s 0) nil)))))
 
 (defun %feature-present-p (expr)
   "Check if a feature expression EXPR matches *features*.

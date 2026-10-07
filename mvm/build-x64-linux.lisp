@@ -743,7 +743,7 @@
              (fn-table (cadddr tuple))
              (rt-table (car (cddddr tuple)))
              (lam-offsets (cadr (cddddr tuple)))
-             (rt-n (hash-table-count rt-table)))
+             (rt-n (%rt-stub-count rt-table)))
         ;; *x64-jit-mode* enables the synthetic-offset indirect-call path;
         ;; translate populates *x64-call-relocs* (fresh per call).
         (setq *x64-jit-mode* t)
@@ -1397,7 +1397,7 @@
                    (fn-table (cadddr tuple))
                    (rt-table (car (cddddr tuple)))
                    (lam-offsets (cadr (cddddr tuple)))
-                   (rt-n (hash-table-count rt-table)))
+                   (rt-n (%rt-stub-count rt-table)))
               (write-string-serial \"WS4-S2 \") (write-string-serial label)
               (write-string-serial \" rt=\") (print-dec rt-n) (write-char-serial 10)
               ;; Always confirm the translator produces bytes for this form.
@@ -1813,10 +1813,11 @@
 (setf modus.mvm::*static-symbols-p* t)
 ;; Set native code offset for funcall alignment:
 ;; ELF header (64+56=120) + linux-x64 boot code (192) + nil-page mmap (49) +
-;; code-bounds init (34) + JMP rel32 (5) = 351 = 0x15F
+;; code-bounds init (34) + JMP rel32 (5) = 351 = 0x15F, + the save-and-die
+;; fixed-mapping block (144, padded to 9*16) = 495
 ;; Functions at code-buffer positions P where (0x15F+P) & 0xF in {1,9} would be
 ;; misidentified as cons/object pointers by compile-funcall.
-(setf modus.mvm.x64::*x64-native-code-offset* 351)
+(setf modus.mvm.x64::*x64-native-code-offset* 495)
 
 ;; WS5 #223: when this gate runner is built JIT-ON, its collector must scan the
 ;; JIT constant-vector BSS root, or every const the JIT installs into the vector

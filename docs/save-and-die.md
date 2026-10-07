@@ -3,7 +3,8 @@
 Written 2026-09-06.  Status: **landed for the hosted Linux/AArch64 CLI**
 (a6085d2) **and for the bare-metal Pi image, validated under QEMU raspi3b**
 (fa9fa1e).  The remaining loose ends are the real board (the RAM-core
-round-trip) and x64 stub parity, at the bottom.
+round-trip), at the bottom.  **Hosted x86-64 landed 2026-10-01**, see
+[x86-64](#x86-64).
 
 ## Why
 
@@ -64,7 +65,7 @@ through a Lisp word (a tagged pointer would lose its low bit).
 
 | offset | word |
 |---|---|
-| 0 | magic `20260905` |
+| 0 | magic `20261007` |
 | 8 | `from_start` (must equal this process's) |
 | 16 | `to_start` |
 | 24 | `space_size` (must equal) |
@@ -74,7 +75,12 @@ through a Lisp word (a tagged pointer would lose its low bit).
 | 56 | bitmap slice byte offset |
 | 64 | arena base (0 = none) |
 | 72 | arena bump |
-| 128 | metadata window `0x10000000..0x10001000` |
+| 80 | the saving process's `0x10000000` (its slide; `image-segments.sh` reads it) |
+| 88 / 96 | old layout `[lo, hi)` — what a slid restore relocates |
+| 104 | JIT arena data pages low end (0 = none) |
+| 112 / 120 | extra range address / length (x86-64 actor band; 0 / 0 = none) |
+| 128 | build id of the writing binary (0 = unchecked) |
+| 192 | metadata window `0x10000000..0x10001000` (`%core-header-bytes`) |
 | +4096 | heap `[from_start, free)` |
 | … | bitmap slices (arena-less saves only) |
 | … | arena `[base, bump)` |
@@ -218,9 +224,8 @@ value-domain op under the interpreter.  The original notes follow.
    walks the file and names the failing form.  Bare metal runs the
    interpreter for everything the JIT declines, so this one matters for the
    board.
-3. **x64 `./modus` has no fixed heap yet.**  The shared code builds and
-   `--core` refuses honestly (`heap base differs`); the stub needs the same
-   two mappings and the x64 `#x0531` arm the same bump fallback.  Small.
+3. ~~x64 `./modus` has no fixed heap yet.~~  Done (2026-10-01), see
+   [x86-64](#x86-64) below.
 4. The core path is read from the live `argv[2]`, so it has no 63-byte limit,
    but `--core` must be first.
 
@@ -365,3 +370,76 @@ Plan, in order:
 
 Order of work: (2) via QEMU `raspi3b` first — it validates the bare-metal
 restore path with a gdbstub on hand — then (1) on the board.
+
+## x86-64
+
+Landed 2026-10-01 for the hosted x64 CLI (`./modus`).  Same model, three
+differences:
+
+- **Stub** (`boot/boot-linux-x64.lisp`): the JIT arena (1 GB of VA,
+  `MAP_NORESERVE`) at `0x3000000000`, bump word `0x10000F58` set only when the
+  kernel returned exactly that base; then the heap at `0x2000000000` with
+  `MAP_FIXED_NOREPLACE`, falling back to the historical hinted mapping on an
+  error return.  The block is padded to 144 bytes = 9×16 so the fn-entry
+  alignment (`*x64-native-code-offset*` mod 16) is unchanged; the offsets were
+  bumped by 144 anyway (397 → 541, 351 → 495).
+- **Trap** (`translate-x64.lisp`, `#x0531`): `lock xadd` on the bump word
+  (workers JIT too), RCX (V5) preserved; bump word 0 keeps `mmap(NULL)`.
+- **Geometry**: x64's stub stores the GC control block and the MCGC config
+  words RAW, so the shared `mem-ref :u64` reads halve them.  `save-image.lisp`
+  reads geometry through `%core-from-start` / `%core-page-base` /
+  `%core-bitmap-base` / `%core-cons-bitmap-base` / `%core-heap-base` seams
+  (defaults = the old reads); `build-generic-cli.lisp`'s
+  `*cli-arch-override-source*` replaces them with `%gc-read64`.  The GC bitmaps
+  are inside the heap mapping here, not the arena, so the explicit bitmap
+  slices carry them.  `%core-restore-window` is a seam too: x64's JIT
+  constant-vector root is `0x10000F00`, inside the run the shared sequence
+  stages, and must land in place.
+
+The core magic moved to 20261001 with the new header words (extra range,
+build id), and again to 20261007 when that merged with the macOS/iOS slide
+words (the header grew to 192 bytes; extra range at 112/120, build id at 128;
+a core carrying an extra range is refused at a non-zero slide), so cores
+written before (aarch64 hosted, the Pi) must be re-made; the restore refuses
+them as "not a Modus core file" rather than misreading them.
+
+Measured on the 128-core x64 host (no emulation):
+
+| step | time |
+|---|---|
+| toy core (2 JIT'd fns), restore + run | 0.03 s, 10 MB core |
+| Quicklisp + alexandria core: restore + `ql:quickload :split-sequence` + use | 1.1 s, 25 MB core |
+| operandi: `ql:quickload :operandi` + `jit-eager` (7004 modules) + save | 310 s, once; 291 MB core |
+| operandi ACP server from the core: startup + `initialize` | **4.2 s** (whole ACP drive 55 s, was 410 s) |
+
+What else a core has to carry on x64, found by building that operandi core:
+
+- **The actor band.**  Loading bordeaux-threads makes a lock, which carves the
+  hosted actor band (`%ha-carve`) off region 0's top: region 0 shrinks from
+  0x37FFFC00 to 0x26FFE000 and the band holds the sync-cell control words.  The
+  band is the core's extra range (header words 10/11); restore checks it lies
+  in the semispaces, reads it in, and shrinks region 0 to the saved size
+  (`%core-adopt-geometry`).  The per-thread regions the carve also reserves are
+  NOT saved: a core is taken from a single-threaded image, so they hold nothing.
+- **Sync cells.**  A mutex object holds its cell's raw address, and the cell
+  arena was a random `mmap`; it now comes from the exec arena (`%sync-cell`),
+  which is fixed and saved.
+- **Both hosted arches.**  Hosted aarch64 bakes the same band code and carves
+  the same way (0x37FFFE00 → 0x26FFE000 on the first mutex), so the band,
+  geometry and extra-range overrides live in `net/hosted-sync.lisp`, written
+  against the scale-aware `%gc-meta-*` accessors, and serve both.  Validated
+  on a real Pi 5 (hosted aarch64 CLI): `test/run-save-and-die.sh` PASS, restore
+  in 0.06 s.
+- **The binary.**  A core holds raw addresses into the text of the binary that
+  wrote it, so header word 12 carries a per-build id (`%core-build-id`,
+  spliced by `build-cli-common.lisp`); a different binary refuses the core
+  ("written by a different modus binary") instead of jumping into the wrong
+  code.
+- **Not carried, and fine:** the thread page (slot 0x10000DA8) and the lock
+  arena root (0x10000D98) are window words, staged, so a restored process maps
+  fresh ones on first use; GS base is set when actors start, after restore.
+
+Known unrelated: sqlite-pure's cl-sqlite compat returns `:BUSY` for
+`PRAGMA journal_mode = WAL` on a brand-new database on modus (fresh process
+too, no core involved); an existing WAL database is fine.
+

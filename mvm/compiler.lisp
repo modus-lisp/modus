@@ -415,7 +415,12 @@
                                              ; translate-x64 itself; the thread
                                              ; blocks are sized for them —
                                              ; net/hosted-sync.lisp %THR-TLS-BLOCK)
-      (and (>= off #xC10) (<= off #xC37))))  ; longjmp scratch + the self slot
+      (and (>= off #xC10) (<= off #xC37))    ; longjmp scratch + the self slot
+      ;; the late-bound bridge's callee-index slot (mvm-eval.lisp
+      ;; %JIT-FNADDR-IDX-SLOT): x86-64's any-arity call thunk stores to
+      ;; fs:[it] and %JIT-BRIDGE-ANY reads it here, so each thread passes its
+      ;; own index.
+      (and (>= off #x178) (<= off #x17F))))
 
 (defparameter *tls-window-a64* nil
   "The AArch64 window's extra slots (translate-aarch64.lisp, THE PER-THREAD

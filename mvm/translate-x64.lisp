@@ -1849,6 +1849,25 @@
               ;; native bytes into AND then EXECUTE.  Identical shape to
               ;; %MMAP-SHARED-PAGE (#x0504) except rdx=7 (RWX) and
               ;; r10=0x22 (MAP_PRIVATE|MAP_ANONYMOUS).
+              (let ((%arena-fallback (make-label)) (%arena-done (make-label)))
+              ;; SAVE-AND-DIE: with the boot stub's fixed RWX arena mapped, its
+              ;; RAW bump word at 0x10000F58 is non-zero and the page comes from
+              ;; there -- the same address in every process, so a core carries
+              ;; JIT code verbatim (lib/save-image.lisp).  LOCK XADD: workers JIT
+              ;; too.  Bump word 0 (no arena) keeps the mmap(NULL) path below.
+              (emit-bytes buf #x48 #x8B #x04 #x25) (emit-u32 buf #x10000F58) ; mov rax, [bump]
+              (emit-bytes buf #x48 #x85 #xC0)          ; test rax, rax
+              (emit-jcc buf :e %arena-fallback)
+              (emit-bytes buf #x51)                    ; push rcx (V5)
+              (emit-bytes buf #x48 #x89 #xF1)          ; mov rcx, rsi
+              (emit-bytes buf #x48 #xD1 #xF9)          ; sar rcx, 1 (untag size)
+              (emit-bytes buf #x48 #x81 #xC1) (emit-u32 buf #xFFF)      ; add rcx, 4095
+              (emit-bytes buf #x48 #x81 #xE1) (emit-u32 buf #xFFFFF000) ; and rcx, -4096
+              (emit-bytes buf #xF0 #x48 #x0F #xC1 #x0C #x25) (emit-u32 buf #x10000F58) ; lock xadd [bump], rcx
+              (emit-bytes buf #x48 #x8D #x34 #x09)     ; lea rsi, [rcx+rcx] (tagged old bump)
+              (emit-bytes buf #x59)                    ; pop rcx
+              (emit-jmp buf %arena-done)
+              (emit-label buf %arena-fallback)
               (emit-bytes buf #x57)              ; push rdi
               (emit-bytes buf #x52)              ; push rdx
               (emit-bytes buf #x41 #x50)         ; push r8
@@ -1870,7 +1889,8 @@
               (emit-bytes buf #x41 #x59)         ; pop r9
               (emit-bytes buf #x41 #x58)         ; pop r8
               (emit-bytes buf #x5A)              ; pop rdx
-              (emit-bytes buf #x5F))             ; pop rdi
+              (emit-bytes buf #x5F)              ; pop rdi
+              (emit-label buf %arena-done)))
              ((= code #x0540)
               ;; %SPAWN-THREAD — clone(2) A NATIVE OS THREAD.
               ;;   V0(RSI) = entry address (tagged fixnum, raw byte address of a

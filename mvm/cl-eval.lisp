@@ -3164,13 +3164,22 @@
     found))
 
 (defun %fixnum-shl-or-nil (n k)
-  "Fixnum N shifted left K bits, or NIL if that leaves the fixnum range."
+  "Fixnum N shifted left K bits, or NIL if that leaves the fixnum range.
+   Eight bits per step while |N| leaves room for them (constant-count ASH is
+   an inline SHL), one bit at a time near the edge: bit-at-a-time made the
+   interpreter's (ash 1 60)-style bounds ~60 iterations each."
   (loop
-    (when (= k 0) (return n))
-    (when (or (> n +fixnum-half-max+) (< n +fixnum-neg-half+))
-      (return nil))
-    (setq n (ash n 1))
-    (setq k (- k 1))))
+    (when (or (= k 0) (= n 0)) (return n))
+    (if (and (>= k 8)
+             (<= n (ash +fixnum-half-max+ -7))
+             (>= n (ash +fixnum-neg-half+ -7)))
+        (progn (setq n (ash n 8))
+               (setq k (- k 8)))
+        (progn
+          (when (or (> n +fixnum-half-max+) (< n +fixnum-neg-half+))
+            (return nil))
+          (setq n (ash n 1))
+          (setq k (- k 1))))))
 
 (defun bignum-ash (n count)
   "Arithmetic shift N by COUNT bits.  Left shifts (COUNT > 0) promote
@@ -3211,11 +3220,15 @@
          ((not (bignump n))
           ;; Fixnum: native arithmetic right shift via literal -1 SAR loop
           ;; (compile-ash constant fast path, no recursion).
+          ;; Eight bits per step, and done as soon as only the sign is left.
           (let ((result n))
             (when (> k 63) (setq k 63))
-            (loop (when (= k 0) (return result))
-              (setq result (ash result -1))
-              (setq k (- k 1)))))
+            (loop (when (or (= k 0) (= result 0) (= result -1)) (return result))
+              (if (>= k 8)
+                  (progn (setq result (ash result -8))
+                         (setq k (- k 8)))
+                  (progn (setq result (ash result -1))
+                         (setq k (- k 1)))))))
          (t
           ;; Bignum: operate on sign+limbs.
           (let* ((sm (%any-to-limbs n))
@@ -3499,12 +3512,17 @@
   ;; lo>0 so (lo-1)>=0; the hi-1 borrow path is a limb value).  The fixnum
   ;; tail routes through generic-subtract so mnf promotes: (1- mnf) =
   ;; -(2^62+1), a bignum — a plain %fixnum-- would wrap it.
+  (if (and (bignump n) (big-bignum-p n))
+      ;; A BIG bignum is sign-magnitude limbs, not the (lo . hi) pair below:
+      ;; reading it as one returned garbage ((bignum-1- 2^124) came back
+      ;; ~2^98, so (integer-length (- (ash 1 124))) was 125, not 124).
+      (bignum-add n -1)
   (if (bignump n)
       (let ((lo (bignum-lo n)) (hi (bignum-hi n)))
         (if (> lo 0)
             (bignum-to-fixnum-if-possible (make-bignum (%fixnum-- lo 1) hi))
             (bignum-to-fixnum-if-possible (make-bignum +fixnum-max+ (%fixnum-- hi 1)))))
-      (generic-subtract n 1)))
+      (generic-subtract n 1))))
 (defun %fixnum-integer-length (n)
   (let ((x (if (< n 0) (logxor n -1) n)) (len 0))
     (loop (when (zerop x) (return len))
@@ -3527,20 +3545,11 @@
 (defun integer-length (n)
   (cond
     ((not (bignump n)) (%fixnum-integer-length n))
-    ((big-bignum-p n)
-     ;; Big bignum is sign-magnitude — negative magnitude length is the
-     ;; same as positive, EXCEPT for negative: CLHS says it's the length
-     ;; of (lognot n) = (- n 1) for negative n, which has the same MSB
-     ;; pattern minus 1 unless n is exactly a power of 2.  Conservative:
-     ;; just use the magnitude length — matches positive case behaviour
-     ;; for tests like print-integers where we never go negative for the
-     ;; integer-length call itself.
-     (%bignum-integer-length-pos n))
-    (t
-     (let ((hi (bignum-hi n)))
-       (if (< hi 0)
-           (%bignum-integer-length-pos (bignum-1- (bignum-negate n)))
-           (%bignum-integer-length-pos n))))))
+    ;; CLHS: a negative N's length is that of (lognot N) = |N| - 1, for every
+    ;; bignum size.  Big bignums used the bare magnitude ("conservative"),
+    ;; one too many for exactly -2^k.
+    ((< n 0) (%bignum-integer-length-pos (bignum-1- (bignum-negate n))))
+    (t (%bignum-integer-length-pos n))))
 
 (defun bignum-eql (a b)
   "EQL that handles bignums (small or big)."

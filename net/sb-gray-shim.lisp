@@ -42,7 +42,11 @@
     (gray-streams:fundamental-output-stream gray-streams:fundamental-binary-stream) ())
 
 (defun %gray-p (x)
-  (and x (not (eq x t)) (typep x 'gray-streams:fundamental-stream)))
+  ;; %CLOS-INSTANCE-P first: every wrapped CL stream function asks this on
+  ;; every call, and the class TYPEP (a lookup by name) cost microseconds even
+  ;; for a built-in string stream, which is never a Gray stream.
+  (and x (not (eq x t)) (%clos-instance-p x)
+       (typep x 'gray-streams:fundamental-stream)))
 
 ;;; --- generics, with the proposal's defaults ---
 (defgeneric gray-streams:stream-read-byte (stream))
@@ -139,7 +143,17 @@
    and callers link to it directly.  The original lives in a special that is
    set only once, so evaluating this file twice cannot capture the wrapper as
    the original."
-  (let ((orig (intern (concatenate 'string "*%GRAY-ORIG-" (symbol-name name) "*"))))
+  (let ((orig (intern (concatenate 'string "*%GRAY-ORIG-" (symbol-name name) "*")))
+        ;; Position of STREAM among the positional parameters: every wrapped
+        ;; function takes it before any &key/&rest, so the wrapper can test it
+        ;; without parsing the lambda list.
+        (pos (let ((i 0))
+               (dolist (p lambda-list nil)
+                 (let ((v (if (consp p) (car p) p)))
+                   (cond ((member v '(&key &rest &aux)) (return nil))
+                         ((eq v '&optional))
+                         ((string= (symbol-name v) "STREAM") (return i))
+                         (t (setq i (+ i 1)))))))))
     `(progn
        (defvar ,orig nil)
        ;; A DEFVAR's init does not run on this path (the image's limitation 7),
@@ -150,11 +164,18 @@
        ;; ran: a unit's DEFUNs are installed before its body executes, and a
        ;; DEFUN in this same PROGN replaced NAME first, so the original
        ;; captured was the wrapper itself and every call recursed.
+       ;; Ordinary streams take the fast path: look at the stream argument
+       ;; and APPLY the original.  The DESTRUCTURING-BIND (optional and keyword
+       ;; parsing on every call) runs only for a Gray stream: done
+       ;; unconditionally it made WRITE-CHAR to a string stream ~27 us once
+       ;; Gray streams were installed, 200x the unwrapped call.
        (eval '(defun ,name (&rest args)
-                (destructuring-bind ,lambda-list args
-                  (declare (ignorable ,@(remove-if (lambda (x) (member x '(&optional &rest &key)))
-                                                   (mapcar (lambda (x) (if (consp x) (car x) x)) lambda-list))))
-                  (if (%gray-p stream) ,gray-form (apply ,orig args))))))))
+                (if (%gray-p ,(if pos `(nth ,pos args) 'nil))
+                    (destructuring-bind ,lambda-list args
+                      (declare (ignorable ,@(remove-if (lambda (x) (member x '(&optional &rest &key)))
+                                                       (mapcar (lambda (x) (if (consp x) (car x) x)) lambda-list))))
+                      ,gray-form)
+                    (apply ,orig args)))))))
 
 (defun %gray-eof (stream eof-error-p eof-value)
   (if eof-error-p (error 'end-of-file :stream stream) eof-value))

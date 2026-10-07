@@ -54,7 +54,18 @@
 ;;;; pair, so they round-trip; the window and heap bytes are moved by read(2)
 ;;;; and write(2) directly and never pass through a Lisp word.
 
-(defun %core-magic () 20260905)
+(defun %core-magic () 20261007)   ; 2026-10-07: 192-byte header -- words 10-13 slide/layout/JIT
+                                  ; data (macos), 14/15 extra range, 16 build id (operandi)
+
+(defun %core-header-bytes ()
+  "The header's length in the file; the metadata window follows it.
+   host/macos/image-segments.sh hard-codes the same number."
+  192)
+
+(defun %core-build-id ()
+  "Identity of the binary that writes or restores a core.  The build splices a
+   fresh value after this file (build-cli-common.lisp); 0 = unchecked."
+  0)
 
 (defun %core-jit-arena-lo ()
   "Base of the fixed JIT exec arena (boot-linux-aarch64.lisp
@@ -81,6 +92,46 @@
    translates nothing) override this to NIL."
   (and (%jit-enabled-p) (= (%core-jit-arena-bump) 0)))
 
+;;; ---- the geometry seams ---------------------------------------------------
+;;; Where the heap, its bitmaps and the argv words are, as EXACT byte addresses.
+;;; The defaults read through mem-ref :u64, exact on the targets whose fields
+;;; are stored doubled (aarch64).  x86-64's boot assembly stores the GC control
+;;; block and the MCGC config words RAW, so a :u64 load halves them; its build
+;;; overrides these with %gc-read64 (build-generic-cli.lisp).
+
+(defun %core-from-start () (%gc-from-start))
+(defun %core-to-start () (%gc-to-start))
+(defun %core-space-size () (%gc-space-size))
+(defun %core-page-base () (%gc-bitmap-page-base))
+(defun %core-bitmap-base () (%gc-bitmap-base))
+(defun %core-cons-bitmap-base () (%gc-cons-bitmap-base))
+(defun %core-heap-base (from)
+  "The heap mapping's base: from_start less the heap-alloc-start padding, where
+   the stub left argc/argv."
+  (- from 512))
+
+;;; One EXTRA range of the heap mapping outside [from, free) that the image
+;;; still needs, saved and restored at its own address: x86-64's hosted actor
+;;; band, which the first bordeaux-threads lock carves off region 0's top and
+;;; which holds the sync-cell control words, region control blocks and actor
+;;; table.  0 / 0 = none (the default).
+(defun %core-extra-addr () 0)
+(defun %core-extra-len () 0)
+(defun %core-extra-ok-p (addr len)
+  "True when [ADDR, ADDR+LEN) is memory THIS process has mapped and that the
+   restore may overwrite."
+  nil)
+
+(defun %core-geometry-ok-p (saved-size)
+  "True when a core whose region 0 had SAVED-SIZE semispaces can restore here.
+   A carve (above) shrinks region 0, so the saved size may be smaller than a
+   fresh boot's; the arch that carves overrides this and %CORE-ADOPT-GEOMETRY."
+  (= saved-size (%core-space-size)))
+(defun %core-adopt-geometry (saved-size)
+  "Make region 0 the size it had when saved.  Runs after the heap is in and
+   the allocation pointer is published.  Default: nothing (sizes are equal)."
+  saved-size)
+
 ;;; ---- the I/O seams: a core is a FILE on Linux, a RAM range on bare metal --
 ;;; `fd' is opaque to the shared code: a Linux descriptor here, the address of
 ;;; a cursor word in the bare-metal overrides (build-cl-repl-common.lisp).
@@ -98,7 +149,7 @@
    -- the NUL ending \"--core\" -- i.e. an empty path, and the restore died
    with \"cannot open the core file\".  The address's parity follows the
    lengths of the other arguments, so it looked flaky and path-dependent."
-  (let* ((slot (+ (- (%gc-from-start) 512) 32))
+  (let* ((slot (+ (%core-heap-base (%core-from-start)) 32))
          (lo (mem-ref slot :u32))
          (hi (mem-ref (+ slot 4) :u32)))
     ;; HI is 0 on a 32-bit image, where 2^32 would be a bignum -- and nothing
@@ -141,13 +192,14 @@
    a :u64 load hands the raw word back as a tagged VALUE -- an ODD count is an
    immediate, not a fixnum, so (> after before) was never true and this looped
    forcing collections forever (17 a second, measured on the UEFI image after
-   five natural collections; it had worked by luck whenever the count was
-   even).  The same trap mvm/gc.lisp documents for %GC-COUNT."
+   five natural collections), or the comparison faulted (an operandi image
+   died in save-and-die on its 57th collection).  The same trap mvm/gc.lisp
+   documents for %GC-COUNT.  Compared with /=, not >: any movement counts."
   (let ((before (%gc-epoch)))
     (loop
       (set-alloc-limit (get-alloc-ptr))
       (let ((probe (cons 1 2)))
-        (when (> (%gc-epoch) before)
+        (when (/= (%gc-epoch) before)
           (return (car probe)))))))
 
 (defun %gc-force-to-space-0 ()
@@ -156,9 +208,9 @@
    for -- so a restored process needs no relocation and no limit change.
    Returns from_start."
   (%gc-force)
-  (when (/= (%gc-from-start) (%gc-bitmap-page-base))
+  (when (/= (%core-from-start) (%core-page-base))
     (%gc-force))
-  (%gc-from-start))
+  (%core-from-start))
 
 (defun %save-image (path)
   "Write a heap snapshot of this process to PATH.  Full GC first; then header,
@@ -171,7 +223,7 @@
   (%jit-before-save)
   (let* ((from (%gc-force-to-space-0))
          (free (get-alloc-ptr))
-         (boff (floor (- from (%gc-bitmap-page-base)) 128))
+         (boff (floor (- from (%core-page-base)) 128))
          (blen (+ 1 (floor (- free from) 128)))
          (alo (%core-jit-arena-lo))
          (abump (%core-jit-arena-bump))
@@ -181,8 +233,8 @@
       (error "save-image: cannot create ~A" path))
     (setf (mem-ref hdr :u64) (%core-magic))
     (setf (mem-ref (+ hdr 8) :u64) from)
-    (setf (mem-ref (+ hdr 16) :u64) (%gc-to-start))
-    (setf (mem-ref (+ hdr 24) :u64) (%gc-space-size))
+    (setf (mem-ref (+ hdr 16) :u64) (%core-to-start))
+    (setf (mem-ref (+ hdr 24) :u64) (%core-space-size))
     (setf (mem-ref (+ hdr 32) :u64) free)
     (setf (mem-ref (+ hdr 40) :u64) 4096)
     (setf (mem-ref (+ hdr 48) :u64) blen)
@@ -191,21 +243,28 @@
     (setf (mem-ref (+ hdr 72) :u64) abump)
     ;; WHERE THE LAYOUT WAS: a restore at another slide relocates by the
     ;; difference (see RELOCATION below).  0 in a core from before this.
+    ;; host/macos/image-segments.sh reads word 80 -- do not move it.
     (setf (mem-ref (+ hdr 80) :u64) (%conv-addr #x10000000))
     (setf (mem-ref (+ hdr 88) :u64) (%core-layout-lo))
     (setf (mem-ref (+ hdr 96) :u64) (%core-layout-hi))
     ;; THE ARENA'S DATA PAGES (mvm-eval.lisp %JIT-DATA-PAGE): [dlo, top), or 0.
     (setf (mem-ref (+ hdr 104) :u64) (%core-jit-data-lo))
-    (%core-write-all fd hdr 128)
+    ;; The EXTRA range (x86-64's actor band) and the writing binary's identity.
+    (setf (mem-ref (+ hdr 112) :u64) (%core-extra-addr))
+    (setf (mem-ref (+ hdr 120) :u64) (%core-extra-len))
+    (setf (mem-ref (+ hdr 128) :u64) (%core-build-id))
+    (%core-write-all fd hdr (%core-header-bytes))
     (%core-write-all fd (%conv-addr #x10000000) 4096)
     (%core-write-all fd from (- free from))
-    (%core-write-all fd (+ (%gc-bitmap-base) boff) blen)
-    (%core-write-all fd (+ (%gc-cons-bitmap-base) boff) blen)
+    (%core-write-all fd (+ (%core-bitmap-base) boff) blen)
+    (%core-write-all fd (+ (%core-cons-bitmap-base) boff) blen)
     (when (> abump 0)
       (%core-write-all fd alo (- abump alo))
       (let ((dlo (%core-jit-data-lo)))
         (when (> dlo 0)
           (%core-write-all fd dlo (- (%core-layout-hi) dlo)))))
+    (when (> (%core-extra-len) 0)
+      (%core-write-all fd (%core-extra-addr) (%core-extra-len)))
     (%core-close fd)
     (- free from)))
 
@@ -238,18 +297,52 @@
   (when (< (%core-read-all fd dst len) len)
     (%core-die "core: short read")))
 
+(defun %core-restore-window (fd stage)
+  "Read the snapshot's 4 KB metadata window.  The collector's fixed roots land
+   in place; every other word is per-process and goes to STAGE.  x86-64
+   overrides this: its JIT constant-vector root is 0x10000F00, inside the
+   0x178..0xFA0 run staged here."
+  ;; The metadata window, sequentially: the collector's fixed roots and
+  ;; gc_count land in place; every other word is per-process and is read
+  ;; to the staging page instead.  Offsets sum to 0x1000.
+  (%core-slice fd stage #x60)
+  (%core-slice fd (%conv-addr #x10000060) 8)       ; gc_count
+  (%core-slice fd stage #x18)         ; 0x68..0x80: saved sp / regs
+  (%core-slice fd (%conv-addr #x10000080) 16)      ; globals alist, symbol intern table
+  (%core-slice fd stage #xB8)         ; 0x90..0x148: mv area, gc temps
+  (%core-slice fd (%conv-addr #x10000148) 8)       ; keyword intern table
+  (%core-slice fd stage #x20)         ; 0x150..0x170: nargs, handler frames
+  (%core-slice fd (%conv-addr #x10000170) 8)       ; package-by-hash table
+  (%core-slice fd stage #xE28)        ; 0x178..0xFA0: argv, bitmap cfg, stats,
+                                      ; the per-CPU region cells
+  ;; The global-cell cache vector + its init guard.  In place, not staged:
+  ;; the cells it points at live in the heap slice that follows and are
+  ;; restored at the same addresses, so a restored image that dropped this
+  ;; word would read every special through the SAVING process's pairs.
+  (%core-slice fd (%conv-addr #x10000FA0) 16)      ; global-cell cache root + guard
+  ;; The static-literal vector (docs/static-literals.md phase 2), in place:
+  ;; it points into the heap slice.  This process's own word is 0 here
+  ;; (restore runs before any quoted symbol is loaded) or, if not, points
+  ;; at a vector the heap slice has just overwritten.
+  (%core-slice fd (%conv-addr #x10000FB0) 8)       ; static-literal vector root
+  (%core-slice fd stage #x18)         ; 0xFB8..0xFD0
+  (%core-slice fd (%conv-addr #x10000FD0) 8)       ; JIT constant-vector root (aarch64)
+  (%core-slice fd stage #x28))       ; 0xFD8..0x1000
+
 (defun %restore-image ()
   "Read the snapshot named by argv[2] into this process.  See the file header
    for what is and is not restored.  Returns the restored allocation pointer."
-  (let* ((from (%gc-from-start))
-         (base (- from 512))                          ; heap-alloc-start
+  (let* ((from (%core-from-start))
+         (base (%core-heap-base from))
          (fd (%core-open-in))
          (hdr (+ base 256))                           ; below from_start: never live
          (stage (%conv-addr #x0FF00000)))             ; the io-buf BSS page
     (when (< fd 0) (%core-die "core: cannot open the core file"))
-    (%core-slice fd hdr 128)
+    (%core-slice fd hdr (%core-header-bytes))
     (when (/= (mem-ref hdr :u64) (%core-magic))
       (%core-die "core: not a Modus core file"))
+    (when (/= (mem-ref (+ hdr 128) :u64) (%core-build-id))
+      (%core-die "core: written by a different modus binary (a core holds addresses into the binary that saved it; re-make it)"))
     (let* ((was (mem-ref (+ hdr 80) :u64))
            ;; THE SLIDE between the saving process and this one: every address
            ;; in the layout moved by D (they are one mapping on Darwin, ASLR-
@@ -258,7 +351,7 @@
            (sfrom (mem-ref (+ hdr 8) :u64)))
     (when (/= (+ sfrom d) from)
       (%core-die "core: heap base differs from this process (the core was saved by an image with a different layout, or the stub did not get its fixed mapping)"))
-    (when (/= (mem-ref (+ hdr 24) :u64) (%gc-space-size))
+    (unless (%core-geometry-ok-p (mem-ref (+ hdr 24) :u64))
       (%core-die "core: heap geometry differs from this image"))
     (let ((free (mem-ref (+ hdr 32) :u64))
           (blen (mem-ref (+ hdr 48) :u64))
@@ -267,39 +360,23 @@
           (abump (mem-ref (+ hdr 72) :u64))
           (l0 (mem-ref (+ hdr 88) :u64))
           (l1 (mem-ref (+ hdr 96) :u64))
-          (dlo (mem-ref (+ hdr 104) :u64)))
+          (dlo (mem-ref (+ hdr 104) :u64))
+          (xaddr (mem-ref (+ hdr 112) :u64))
+          (xlen (mem-ref (+ hdr 120) :u64)))
       (when (and (> abump 0)
                  (or (= (%core-jit-arena-bump) 0) (/= (+ alo d) (%core-jit-arena-lo))))
         (%core-die "core: snapshot has JIT pages but this process has no matching exec arena"))
-      ;; The metadata window, sequentially: the collector's fixed roots and
-      ;; gc_count land in place; every other word is per-process and is read
-      ;; to the staging page instead.  Offsets sum to 0x1000.
-      (%core-slice fd stage #x60)
-      (%core-slice fd (%conv-addr #x10000060) 8)       ; gc_count
-      (%core-slice fd stage #x18)         ; 0x68..0x80: saved sp / regs
-      (%core-slice fd (%conv-addr #x10000080) 16)      ; globals alist, symbol intern table
-      (%core-slice fd stage #xB8)         ; 0x90..0x148: mv area, gc temps
-      (%core-slice fd (%conv-addr #x10000148) 8)       ; keyword intern table
-      (%core-slice fd stage #x20)         ; 0x150..0x170: nargs, handler frames
-      (%core-slice fd (%conv-addr #x10000170) 8)       ; package-by-hash table
-      (%core-slice fd stage #xE28)        ; 0x178..0xFA0: argv, bitmap cfg, stats,
-                                          ; the per-CPU region cells
-      ;; The global-cell cache vector + its init guard.  In place, not staged:
-      ;; the cells it points at live in the heap slice that follows and are
-      ;; restored at the same addresses, so a restored image that dropped this
-      ;; word would read every special through the SAVING process's pairs.
-      (%core-slice fd (%conv-addr #x10000FA0) 16)      ; global-cell cache root + guard
-      ;; The static-literal vector (docs/static-literals.md phase 2), in place:
-      ;; it points into the heap slice.  This process's own word is 0 here
-      ;; (restore runs before any quoted symbol is loaded) or, if not, points
-      ;; at a vector the heap slice has just overwritten.
-      (%core-slice fd (%conv-addr #x10000FB0) 8)       ; static-literal vector root
-      (%core-slice fd stage #x18)         ; 0xFB8..0xFD0
-      (%core-slice fd (%conv-addr #x10000FD0) 8)       ; JIT constant-vector root (aarch64)
-      (%core-slice fd stage #x28)         ; 0xFD8..0x1000
+      ;; The extra range holds RAW addresses (sync-cell control words, region
+      ;; control blocks) that %CORE-RELOCATE does not walk, so a slid restore
+      ;; of one would be silently wrong.  Refuse it instead.
+      (when (and (> xlen 0) (/= d 0))
+        (%core-die "core: snapshot carries a heap range that cannot be relocated to another slide"))
+      (when (and (> xlen 0) (not (%core-extra-ok-p xaddr xlen)))
+        (%core-die "core: snapshot carries a heap range this process cannot hold"))
+      (%core-restore-window fd stage)
       (%core-slice fd from (- free sfrom))
-      (%core-slice fd (+ (%gc-bitmap-base) boff) blen)
-      (%core-slice fd (+ (%gc-cons-bitmap-base) boff) blen)
+      (%core-slice fd (+ (%core-bitmap-base) boff) blen)
+      (%core-slice fd (+ (%core-cons-bitmap-base) boff) blen)
       (when (> abump 0)
         ;; The arena: bitmaps + JIT pages, then the bump word (RAW: store the
         ;; halved value so the machine word is the address) and an I-cache
@@ -311,6 +388,8 @@
         ;; Its data pages (the linkage cells): ordinary writable memory.
         (when (> dlo 0)
           (%core-slice fd (+ dlo d) (- l1 dlo))))
+      (when (> xlen 0)
+        (%core-slice fd xaddr xlen))
       ;; Publish the alloc pointer BEFORE anything that allocates -- %core-close
       ;; prints CORE-END via print-dec, which conses; until this runs, the
       ;; pointer is still the fresh boot's (heap base), so that string would
@@ -318,6 +397,7 @@
       (set-alloc-ptr (+ free d))
       (unless (= d 0)
         (%core-relocate from (+ free d) l0 l1 d))
+      (%core-adopt-geometry (mem-ref (+ hdr 24) :u64))
       (%core-close fd)
       (+ free d)))))
 

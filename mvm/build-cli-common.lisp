@@ -1066,7 +1066,14 @@
     ;; kernel-main runs before boot init.  Lives here, not in the hosted layer,
     ;; because the bare-metal Pi image is its whole point (docs/save-and-die.md);
     ;; the arch slots supply the I/O seams (a file on Linux, a RAM range there).
-    (mvm-text "lib/save-image.lisp"))
+    (mvm-text "lib/save-image.lisp")
+    ;; A core holds raw addresses into THIS binary's text (function entries,
+    ;; JIT call targets), so it may only restore under the binary that wrote
+    ;; it.  A fresh id per build, checked by %RESTORE-IMAGE.
+    (format nil "~%(defun %core-build-id () ~D)~%"
+            ;; 28 bits: a fixnum on every target, the 32-bit ones included,
+            ;; because the restore compares it before anything may allocate.
+            (+ 1 (random (- (expt 2 28) 1) (make-random-state t)))))
       ""))
 
 ;;; THE HOSTED PLATFORM LAYER — Linux syscalls, hosted targets only.
@@ -1698,7 +1705,20 @@
         (let ((off (%cli-getenv \"MODUS_NO_SB\")))
           (if (and off (> (length off) 0) (not (string= off \"0\")))
               nil
-              (progn (%it-eval-source (%sb-gray-source) \"sb-gray\") t))))))
+              ;; IN A FIXED PACKAGE.  This runs at the first ASDF load,
+              ;; which is usually inside quicklisp's setup.lisp, with
+              ;; *PACKAGE* = QL-SETUP -- so the shim's helpers became
+              ;; QL-SETUP::%GRAY-P etc., which JIT-EAGER skips (the QL-
+              ;; prefix keeps the loader interpreted).  Every WRITE-CHAR /
+              ;; WRITE-STRING / FORMAT asks %GRAY-P, so each one paid an
+              ;; interpreter entry: ~25 us a character to a string stream.
+              ;; SETQ + restore, not a LET of the special (unreliable in
+              ;; image code).
+              (let ((%pkg *package*))
+                (setq *package* (find-package \"COMMON-LISP-USER\"))
+                (unwind-protect (%it-eval-source (%sb-gray-source) \"sb-gray\")
+                  (setq *package* %pkg))
+                t))))))
 
 ;; THE PUBLIC RUNTIME API (net/hosted-actor-runtime.lisp, net/hosted-sync.lisp).
 ;; Runtime-compiled code reaches these by direct calls resolved at compile
@@ -1710,8 +1730,13 @@
 ;; write to a server that had hung up killed everything with exit 141).
 ;; rt_sigaction(SIGPIPE=13, {SIG_IGN, 0, 0, 0}, NULL, 8) = syscall 13.
 " (%ignore-sigpipe-source) "
+" (if *cli-bare-metal*
+      ;; The actor runtime and the per-computation registry are hosted-only
+      ;; (*cli-hosted-actors-source*); a bare image has nothing to publish.
+      "(defun %publish-runtime-api () nil)"
+      "(defun %publish-runtime-api () (%publish-runtime-api-hosted))") "
 
-(defun %publish-runtime-api ()
+(defun %publish-runtime-api-hosted ()
   (let ((pk (find-package \"COMMON-LISP-USER\")))
     (dolist (e (list (cons \"REGISTER-PER-COMPUTATION-SPECIAL\" (function register-per-computation-special))
                      (cons \"ACTORS-START\" (function actors-start))

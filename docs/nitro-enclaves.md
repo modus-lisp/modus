@@ -223,3 +223,23 @@ x64 facts the shared code had never met, each an arch slot now
 `test/run-hosted-core.sh` is the local acceptance: snapshot with alexandria,
 restore (0.02 s, answers `(0 1 2)`, no inherited host key), then
 `run-hosted-ssh.sh` against `modus --core`.
+
+
+## Signed EIFs: PCR8 (2026-10-07)
+
+`kiln image nitro` signs the EIF (eif_build `--signing-certificate` /
+`--private-key`, P-384).  PCR8 = SHA-384(48 zero bytes || SHA-384(cert DER)) —
+read from aws-nitro-enclaves-image-format's EifHasher — so the verifier needs
+only the CERTIFICATE: `verify-attestation.py … --signing-cert cert.pem`
+computes PCR8 itself and requires it (`--pcr8 HEX` also accepted).  What it
+buys: PCR0-2 say WHAT was built and anyone can rebuild them; PCR8 says WHO
+released it — an image from the same sources signed by anyone else, or
+unsigned, fails.  Measured on the real enclave: our cert PASS; the same
+document against a different cert FAIL; the earlier unsigned record FAIL.
+
+Keys: with no `--sign-key=/--sign-cert=`, kiln creates a per-machine
+DEVELOPMENT key in its state dir (`nitro-signing/dev-key.pem`, mode 600) on
+first use and says so; a release passes its own (eif_build also accepts a KMS
+key ARN for `--private-key`).  `--nosign` builds without PCR8.  The key never
+enters the repository; the certificate is published beside the image
+(`signing-cert.pem`) and in `test/nitro/records/`.

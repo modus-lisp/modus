@@ -1,6 +1,7 @@
 #!/bin/bash
 # attested-ssh-client.sh -- the REMOTE VERIFIER's side of attested SSH, Nitro.
-#   test/nitro/attested-ssh-client.sh HOST PORT [verify-attestation.py args: --pcr0 HEX --pcr1 HEX --pcr2 HEX --root PEM]
+#   test/nitro/attested-ssh-client.sh HOST PORT [verify-attestation.py args: --pcr0 HEX --pcr1 HEX --pcr2 HEX
+#                                                 --signing-cert PEM (requires PCR8) --root PEM]
 # 1. Complete an SSH handshake with the modus server and record the host key it
 #    proved possession of (from OpenSSH's own known_hosts line, not anything the
 #    server prints).

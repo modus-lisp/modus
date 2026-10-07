@@ -839,10 +839,20 @@
 
    RISCV64 is not one target.  Bare and hosted are different memory maps,
    and every absolute address this back end bakes has to follow that.")
-(defparameter *rv-hosted-globals-base* #x10000A00
+(defparameter *rv-hosted-globals-base* #x10000380
   "Convention slots for the HOSTED port, inside the mmap'd heap and above the
-   Cheney metadata at #x10000040.  Same choice boot-linux-i386.lisp makes for
-   the same reason (its comment names 0x10000A00 the i386 global slot block).")
+   Cheney metadata at #x10000040: in the free span below the handler stack,
+   past the longjmp scratch (#x300) and the capped count (#x360).
+
+   NOT #x10000A00, where it was (i386's choice).  i386 and ARM32 stack 4-byte
+   words, so their 21 handler frames end at #x100006A8; this port's frames are
+   96 bytes, and frame N is at #x10000408 + 96*N, so frames 15..20 covered
+   #x10000A00.  The closure-env slot (+8) was FRAME 16's saved SP: every
+   closure call overwrote it, and a longjmp to that frame restored a tagged
+   closure-env pointer as the stack pointer.  Measured: a HANDLER-BIND handler
+   invoking a RESTART-CASE restart inside a DEFUN, nested under one more
+   HANDLER-BIND, runs at depth 16-18 and jumped to e9..1bfcfc with sp
+   = #x1bfcfd91 (restart-case-semantics, both widths).")
 (defun rv-nargs-addr ()
   "THE NARGS SLOT IS THE SHARED CONTRACT ADDRESS #x10000150 IN HOSTED MODE, not
    globals_base+0, and that is a correctness requirement rather than tidiness.
@@ -3041,6 +3051,14 @@
    somebody else's.  LONGJMP zeroes it: it unwinds past every capped (strictly
    inner) frame at once, so their pending absorbs must not fire against outer
    pops afterwards.")
+
+;;; The hosted convention slots must lie OUTSIDE the handler stack: a frame
+;;; push writes over them silently, and they write over a live frame.
+(assert (let ((stack-lo #x10000400)
+              (stack-hi (+ #x10000408 (* +rv-jmpbuf-size+ *rv-hstack-max-depth*)))
+              (g *rv-hosted-globals-base*))
+          (or (>= g stack-hi) (<= (+ g 16) stack-lo)))
+        () "riscv: hosted globals #x~X overlap the handler stack" *rv-hosted-globals-base*)
 
 (defun rv-emit-handler-push (buf)
   "Stack the CURRENT jmpbuf so a nested handler-case does not overwrite it.

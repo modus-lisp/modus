@@ -12759,6 +12759,35 @@
             (setq any-captures t)))))
     any-captures))
 
+(defun %flet-with-block (def)
+  "DEF, a local function definition (NAME PARAMS . BODY), with BODY in the implicit BLOCK
+   CLHS 5.3 gives it -- named NAME, or X for a (SETF X) -- after its declarations and docstring.
+
+   WITHOUT IT, (return-from f v) inside a local F found no block named F (the body is compiled
+   as a function with a generated name, which is why MVM-COMPILE-FUNCTION-INTERNAL-1 registers
+   none) and fell back to COMPILE-RETURN, which exits the innermost BLOCK NIL: from inside a
+   LOOP or DOTIMES it left the LOOP and the function carried on.  A labels helper that searched
+   a list and returned the match always answered its fall-through value instead."
+  (if (and (consp def) (consp (cdr def)))
+      (let* ((name (car def))
+             (bname (cond ((symbolp name) name)
+                          ((and (consp name) (consp (cdr name))) (cadr name))
+                          (t nil)))
+             (forms (cddr def))
+             (head '()))
+        (if (null bname)
+            def
+            (progn
+              ;; leading declarations, and a docstring that is not the only form, stay outside
+              (loop while (and (consp forms)
+                               (or (and (consp (car forms)) (symbolp (caar forms))
+                                        (string= (symbol-name (caar forms)) "DECLARE"))
+                                   (and (stringp (car forms)) (consp (cdr forms)))))
+                    do (push (car forms) head) (setq forms (cdr forms)))
+              (list* name (cadr def)
+                     (append (nreverse head) (list (list* 'block bname forms)))))))
+      def))
+
 (defun compile-flet (defs body env dest &optional labels-p)
   "Compile (flet ((name (params) body) ...) body).
    Each local function is compiled as a named global function with a UNIQUE
@@ -12774,6 +12803,7 @@
    (not raw let slots) carry the lambda values so mutual recursion in LABELS
    still works: each lambda body reads its target via (CAR CELL) at call
    time, after every cell's car has been populated."
+  (setq defs (mapcar (function %flet-with-block) defs))
   ;; Capture-aware transform: when any function body captures an outer
   ;; binding, replace the FLET/LABELS with a LET that allocates one
   ;; heap cell per local function name, then sets each cell's car to a

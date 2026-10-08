@@ -317,7 +317,18 @@
       (let ((folded2 (+ (logand folded #xFFFF) (ash folded -16))))
         (logand (logxor folded2 #xFFFF) #xFFFF)))))
 
+;; Seams a board may override (net/r8152-post.lisp): a bare ACK built without
+;; the general path's allocations (NIL = not available here), and the
+;; advertised receive window.
+(defun tcp-send-ack-fast () nil)
+(defun tcp-rx-window () 8192)
+
 (defun tcp-send-segment (flags data data-len)
+  (if (and (eql flags 16) (zerop data-len) (tcp-send-ack-fast))
+      (setf (mem-ref (+ (e1000-state-base) #x4C) :u32) 0)
+      (tcp-send-segment-1 flags data data-len)))
+
+(defun tcp-send-segment-1 (flags data data-len)
   ;; A SYN carries an MSS option (kind 2, length 4, 1460).  Without one the
   ;; peer must assume RFC 9293's default of 536 bytes, and did: every segment
   ;; of an HTTP fetch was 536 bytes, ~2.7x the packets (and per-packet costs)
@@ -332,7 +343,7 @@
     (buf-write-u32 seg 4 (mem-ref (+ state #x3C) :u32))
     (buf-write-u32 seg 8 (mem-ref (+ state #x40) :u32))
     (aset seg 12 (if syn #x60 #x50)) (aset seg 13 flags)
-    (buf-write-u16 seg 14 8192)
+    (buf-write-u16 seg 14 (tcp-rx-window))
     (aset seg 16 0) (aset seg 17 0)
     (aset seg 18 0) (aset seg 19 0)
     (when syn

@@ -1357,16 +1357,9 @@
         (if (and *ssh-build-p* *cl-repl-rpi-p*)
             (format nil "~%(defun usb-keepalive () 0)~%")
             "")
-        ;; Pi USB NICs (RTL8153 or CDC) receive on DWC2 bulk-IN channel 1.
-        ;; R8152-RECEIVE re-arms that channel at the START of its next call,
-        ;; so the poll right after every frame is empty by construction -- and
-        ;; then sat out a whole IO-DELAY (1.5 ms): the 1.71 ms per segment a
-        ;; capture showed, against a 79 us ACK.  Instead spin on the channel's
-        ;; HCINT (a read, consumes nothing) for at most the same 5000 reads,
-        ;; leaving as soon as the transfer halts (CHHLTD bit 1) or completes.
-        (if *cl-repl-rpi-p*
-            (format nil "~%(defun net-rx-idle () (let ((i 0)) (loop (when (>= i 5000) (return nil)) (when (not (zerop (logand (dwc2-read (dwc2-hcint 1)) 3))) (return t)) (setq i (+ i 1)))))~%")
-            "")
+        ;; The Pi's TCP fast paths over the RTL8153 (net/r8152-post.lisp):
+        ;; overrides of ip.lisp's seams, so spliced after it.
+        (if *cl-repl-rpi-p* (concatenate 'string (%rpi-net-text "r8152-post.lisp") (string #\Newline)) "")
         (%rpi-net-text "http-client.lisp")   (string #\Newline)
         ;; Bigger HTTP response buffer.  The stock http-fetch-impl caps a
         ;; response at 4096 bytes and tcp-rx-copy bounds its copy to 4096 — too
@@ -1401,7 +1394,9 @@
         (let* ((data-base (+ (+ buf 34) tcp-hdr-len))
                (n (max 0 (min data-len (- (length dest) dest-off))))
                (da (+ (%val->word dest) 7 dest-off))
-               (i 0))
+               ;; The RTL8153's RX buffer is ordinary cacheable RAM: copy its
+               ;; whole 64-byte chunks natively (net/r8152.lisp R8152-NCOPY).
+               (i (if (eq (usb-netdev-get) 2) (r8152-ncopy da data-base n) 0)))
           (loop
             (when (or (>= i n) (zerop (logand (+ data-base i) 3))) (return nil))
             (setf (aref dest (+ dest-off i)) (mem-ref (+ data-base i) :u8))

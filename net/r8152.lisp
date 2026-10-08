@@ -171,9 +171,33 @@
                      #xF9400060 #xF9400461 #xD50B7E20 #x91010000 #xF1010021
                      #x54FFFFA1 #xD5033F9F #xD65F03C0))
       (setf (mem-ref p :u32) w) (setq p (+ p 4)))
-    (%jit-icache-flush code 64)
+    ;; +256: copy [scratch2+8] -> [scratch2+0], [scratch2+16] bytes, 64 at a
+    ;; time with NEON pairs; scratch2 at +1600.  ldr x0/x1/x2; L: ldp q0,q1,[x1];
+    ;; stp q0,q1,[x0]; ldp q0,q1,[x1,#32]; stp q0,q1,[x0,#32]; add x0,#64;
+    ;; add x1,#64; subs x2,#64; b.ne L; dsb sy; ret.  (net/hdmi-console's.)
+    (let* ((scr2 (+ code 1600)) (q (+ code 256)))
+      (dolist (w (list (logior #xD2800003 (ash (logand scr2 #xFFFF) 5))
+                       (logior #xF2A00003 (ash (logand (ash scr2 -16) #xFFFF) 5))
+                       #xF9400060 #xF9400461 #xF9400862
+                       #xAD400420 #xAD000400 #xAD410420 #xAD010400
+                       #x91010000 #x91010021 #xF1010042 #x54FFFF21
+                       #xD5033F9F #xD65F03C0))
+        (setf (mem-ref q :u32) w) (setq q (+ q 4))))
+    (%jit-icache-flush code 512)
     (r8152-u64 (r8152-meta) code)
+    (r8152-u64 (+ (r8152-meta) 8) 0)          ; tcp-rx-window override: none
+    (setf (mem-ref (+ (r8152-meta) 12) :u32) 0) ; no async TX in flight
     code))
+
+(defun r8152-ncopy (dst src n)
+  "Copy the whole 64-byte chunks of N bytes SRC -> DST natively (both ordinary
+   memory; unaligned is fine).  Returns the bytes copied, a multiple of 64."
+  (let ((m (logand n (lognot 63))))
+    (when (> m 0)
+      (let* ((code (mem-ref (r8152-meta) :u32)) (scr2 (+ code 1600)))
+        (r8152-u64 scr2 dst) (r8152-u64 (+ scr2 8) src) (r8152-u64 (+ scr2 16) m)
+        (%jit-call (+ code 256))))
+    m))
 
 (defun r8152-dcache-civac (addr bytes)
   ;; ADDR 64-aligned; BYTES rounded up to whole lines.
@@ -245,8 +269,33 @@
 ;; NIC interface — vendor descriptor framing
 ;; ============================================================
 
+;; ASYNC TX (bare ACKs, net/r8152-post.lisp).  A blocking bulk-OUT waits for
+;; the bus -- most of an ACK's ~50 us -- so an ACK is started on its OWN
+;; channel (3; 0 = control, 1 = bulk-IN, 2 = bulk-OUT and HID splits) from
+;; its OWN buffer, and only waited for before the next OUT transfer, which
+;; also needs the data toggle it leaves.  r8152-meta+12 = 1 while in flight.
+;; A NAK drops that ACK, as the synchronous path already does; the next ACK
+;; covers it.
+(defun r8152-ack-buf () (+ (e1000-tx-buf-base) #x800))
+
+(defun r8152-tx-async-wait ()
+  (when (not (zerop (mem-ref (+ (r8152-meta) 12) :u32)))
+    (setf (mem-ref (+ (r8152-meta) 12) :u32) 0)
+    (dwc2-poll-channel 3)
+    (usb-set-bulk-out-toggle (logand (ash (dwc2-read (dwc2-hctsiz 3)) -29) 3))))
+
+(defun r8152-tx-async-start (buf len)
+  (r8152-tx-async-wait)
+  (dwc2-setup-channel 3 (dwc2-build-hcchar (usb-bulk-out-mps) (usb-bulk-out-ep)
+                                           0 2 (usb-dev-addr)))
+  (dwc2-start-transfer 3 (dwc2-build-hctsiz len (ceiling len (usb-bulk-out-mps))
+                                            (ash (logand (usb-bulk-out-toggle) 3) 29))
+                       buf)
+  (setf (mem-ref (+ (r8152-meta) 12) :u32) 1))
+
 (defun r8152-send (buf len)
   ;; 8-byte tx_desc {len | TX_FS(1<<31) | TX_LS(1<<30), 0} then the frame.
+  (r8152-tx-async-wait)
   (let ((tx (e1000-tx-buf-base)))
     (setf (mem-ref tx :u32) (logior len #xC0000000))
     (setf (mem-ref (+ tx 4) :u32) 0)

@@ -79,6 +79,11 @@
 ;;; 2))`) without the reader ever seeing a partial form.  Returns the number of
 ;;; characters buffered; the text is *SERIAL-REPL-BUF*[0 .. n).
 
+;; Console seams.  A board with another input device (net/usb-hid-split.lisp)
+;; overrides these by last-defun-wins; everywhere else input is the serial port.
+(defun %console-init () nil)
+(defun %console-read-char () (read-char-serial))
+
 (defun %srepl-read-form-text ()
   (setq *serial-repl-len* 0)
   (let ((depth 0)          ; open parens
@@ -87,7 +92,7 @@
         (incom nil)        ; inside a ; comment
         (any nil))         ; saw real content
     (loop
-      (let ((c (read-char-serial)))
+      (let ((c (%console-read-char)))
         ;; Terminals send CR for Return; normalize to LF.
         (when (= c 13) (setq c 10))
         (cond
@@ -143,6 +148,8 @@
 (defun cl-serial-repl ()
   "Interactive CL read-eval-print loop over the serial port.  Never returns."
   (%srepl-init-buf)
+  ;; Before the banner: serial drivers send nothing until they see it.
+  (handler-case (%console-init) (t (c) nil))
   (write-string-serial "Modus CL REPL (bare metal).  EVAL = MVM-EVAL.")
   (write-char-serial 10)
   (loop

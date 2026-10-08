@@ -380,6 +380,30 @@
     ;; UART.  This is the bare-metal counterpart of lib/cli-toplevel.lisp, which
     ;; the hosted payload supplies and *CLI-BARE-METAL* omits.
     (%rpi-mvm-text "lib/serial-repl.lisp")
+    ;; A board net build carries net/usb-hid-split.lisp, which is spliced
+    ;; BEFORE this text: its console must be bound HERE, after serial-repl's
+    ;; seam defaults, or the defaults win (last-defun-wins).  Read off the
+    ;; environment because *NET-BUILD-P* is defined further down.
+    (if (and *cl-repl-rpi-p*
+             (equal #+sbcl (sb-ext:posix-getenv "MODUS_NET_BUILD") "1"))
+        (concatenate 'string "
+(defun %console-init () (hid-console-init))
+(defun %console-read-char () (hid-console-read-char))
+"
+          ;; The non-blocking serial check must poll the UART READ-CHAR-SERIAL
+          ;; reads -- the same choice as the translator's serial co-init below
+          ;; (mini UART for a chainloaded board, MODUS_RPI_MINIUART overrides).
+          (if (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_RPI_MINIUART"))
+                    (c #+sbcl (sb-ext:posix-getenv "MODUS_RPI_CHAINLOAD")))
+                (if (and v (plusp (length v)))
+                    (not (string= v "0"))
+                    (equal c "1")))
+              ";; mini UART AUX_MU_LSR (0x3F215054): bit 0 = data ready.
+(defun hid-serial-ready-p ()
+  (not (zerop (logand (mem-ref #x3F215054 :u32) 1))))
+"
+              ""))
+        "")
     "
 ;; #160 bitmaps, bare-metal flavour — see the call in kernel-main for why.
 ;; gc.lisp's %gc-bitmap-init uses %mmap-exec-page, which does not exist here.
@@ -1258,7 +1282,13 @@
             ;; the glass blit seam.  Independent of the NIC (self-contained
             ;; hdmi-* defuns over mem-ref + the property mailbox at 0x3F00B880);
             ;; spliced here because board builds are always net builds.
-            (%rpi-net-text "hdmi-fb.lisp")       (string #\Newline))))))
+            (%rpi-net-text "hdmi-fb.lisp")       (string #\Newline)
+            ;; USB keyboard + mouse behind the board's hub: split transactions
+            ;; (dwc2-split) and the HID driver, which overrides lib/serial-repl's
+            ;; %console-init / %console-read-char seams (this text is spliced
+            ;; after it), so the REPL reads serial OR the keyboard.
+            (%rpi-net-text "dwc2-split.lisp")    (string #\Newline)
+            (%rpi-net-text "usb-hid-split.lisp") (string #\Newline))))))
 
 (defvar *net-source*
   (if *net-build-p*

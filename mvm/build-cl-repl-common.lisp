@@ -1345,6 +1345,18 @@
         ;; ip.lisp's); both "" otherwise.
         *crypto-source*
         *ssh-transport-source*
+        ;; The Pi's SSH key exchange spent ~9 of its ~9.5 s in USB-KEEPALIVE
+        ;; (aarch64-overrides.lisp): 100 x IO-DELAY (1.5 ms each: 5000 UART
+        ;; reads) per call, called every 16 squarings of every field inversion,
+        ;; every 32 ladder steps of X25519, every 4 bytes of ED-BASE-MULT and 3x
+        ;; in SSH-HANDLE-KEX -- ~60 calls, 155 ms each.  The arithmetic is ~20
+        ;; ms.  It kept a USB GADGET's host from declaring the link dead during
+        ;; crypto; here modus is the USB HOST and the RTL8153 queues what
+        ;; arrives, so waiting buys nothing -- and the polls it made DROPPED
+        ;; any TCP segment they read.  Spliced after the transport so it wins.
+        (if (and *ssh-build-p* *cl-repl-rpi-p*)
+            (format nil "~%(defun usb-keepalive () 0)~%")
+            "")
         (%rpi-net-text "http-client.lisp")   (string #\Newline)
         ;; Bigger HTTP response buffer.  The stock http-fetch-impl caps a
         ;; response at 4096 bytes and tcp-rx-copy bounds its copy to 4096 — too

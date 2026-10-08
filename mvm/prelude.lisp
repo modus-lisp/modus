@@ -1973,7 +1973,46 @@
     ((eq key t) 19)
     ((%cl-sym-p key) (logand (%cl-sym-hash key) mask))
     ((%native-mvm-sym-p key) (logand (%native-mvm-sym-hash key) mask))
+    ;; A LIST key in an EQUAL table hashes by structure.  Without this every
+    ;; cons key was :NOHASH, and one of them sent the whole table down the
+    ;; linear path for good: 4000 (list i j) inserts took 0.9 s (SBCL 1 ms).
+    ;; EQ/EQL tables keep identity semantics, so conses stay :NOHASH there.
+    ((and strcmp? (consp key)) (logand (%ht-cons-hash key 0) mask))
     (t (%ht-nohash))))
+
+;;; Structural hash for cons keys of EQUAL tables.  It must give EQUAL keys
+;;; equal hashes and terminate on anything: at most 8 elements of a list and 3
+;;; levels of nesting are read, the rest is a constant.  All arithmetic stays
+;;; below 2^27 (fixnums on a 30-bit port too, as the string hash).  Conses that
+;;; are OTHER objects underneath -- hash tables and array wrappers -- hash to a
+;;; constant: EQUAL treats them by identity in CL and their contents change
+;;; while they are keys, so a hash of their structure would go stale.
+(defun %ht-mix (h v) (logand (+ (- (ash h 5) h) v) #x3FFFFF))
+
+(defun %ht-opaque-cons-p (x)
+  "True for a cons that is a hash table or an array wrapper underneath:
+   (alist %HT-TAG . meta), (8765432 . wrapper) adjustable, (fill-pointer .
+   array) / ((dims . offset) . array).  A dotted pair with such a tail is
+   indistinguishable and is treated the same, which only costs spread."
+  (let ((d (cdr x)))
+    (or (eql (car x) 8765432)
+        (and (consp d) (eql (car d) (%ht-tag)))
+        (stringp d)
+        (and d (not (consp d)) (eq (%ht-hash d t #x3FFFFF) (%ht-nohash))))))
+
+(defun %ht-cons-hash (x depth)
+  (let ((h 7) (n 0))
+    (loop
+      (cond ((not (consp x)) (return (%ht-mix h (%ht-elt-hash x depth))))
+            ((or (>= n 8) (%ht-opaque-cons-p x)) (return (%ht-mix h 23))))
+      (setq h (%ht-mix h (%ht-elt-hash (car x) depth)))
+      (setq x (cdr x) n (+ n 1)))))
+
+(defun %ht-elt-hash (e depth)
+  (if (and (consp e) (not (stringp e)))
+      (if (< depth 3) (%ht-cons-hash e (+ depth 1)) 31)
+      (let ((v (%ht-hash e t #x3FFFFF)))
+        (if (eq v (%ht-nohash)) 11 v))))
 
 (defun %ht-vec-set (vec i val)
   "Var-index ASET forced to dest=frame-slot (CLAUDE.md var-index ASET bug)."
@@ -2000,20 +2039,29 @@
     (if (eq h (%ht-nohash))
         (%ht-nohash)
         (let ((cur (%word-aref vec h)))
-          (if (and strcmp? (stringp key))
-              ;; string-content path
-              (loop
-                (when (null cur) (return nil))
-                (let ((e (car cur)))
-                  (when (let ((ek (car e))) (and (stringp ek) (string= ek key)))
-                    (return (cdr e))))
-                (setq cur (cdr cur)))
-              ;; identity path
-              (loop
-                (when (null cur) (return nil))
-                (let ((e (car cur)))
-                  (when (eq (car e) key) (return (cdr e))))
-                (setq cur (cdr cur))))))))
+          (cond
+            ((and strcmp? (stringp key))
+             ;; string-content path
+             (loop
+               (when (null cur) (return nil))
+               (let ((e (car cur)))
+                 (when (let ((ek (car e))) (and (stringp ek) (string= ek key)))
+                   (return (cdr e))))
+               (setq cur (cdr cur))))
+            ((consp key)
+             ;; a list key (EQUAL tables only reach here, see %HT-HASH)
+             (loop
+               (when (null cur) (return nil))
+               (let ((e (car cur)))
+                 (when (equal (car e) key) (return (cdr e))))
+               (setq cur (cdr cur))))
+            (t
+             ;; identity path
+             (loop
+               (when (null cur) (return nil))
+               (let ((e (car cur)))
+                 (when (eq (car e) key) (return (cdr e))))
+               (setq cur (cdr cur)))))))))
 
 (defun %ht-bucket-put (vec key pair strcmp?)
   "Index PAIR (the alist cons) under KEY in VEC.  Caller guarantees KEY isn't
@@ -2034,9 +2082,10 @@
         (loop
           (when (null cur) (return nil))
           (let ((ek (car (car cur))))
-            (unless (if (and strcmp? (stringp key))
-                        (and (stringp ek) (string= ek key))
-                        (eql ek key))
+            (unless (cond ((and strcmp? (stringp key))
+                           (and (stringp ek) (string= ek key)))
+                          ((consp key) (equal ek key))
+                          (t (eql ek key)))
               (setq result (cons (car cur) result))))
           (setq cur (cdr cur)))
         (%ht-vec-set vec h (nreverse result))))))

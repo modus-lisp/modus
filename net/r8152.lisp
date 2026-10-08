@@ -117,6 +117,35 @@
                                          (r8152-reg-scratch) 4)))
             (if (> r 0) 1 0))))))
 
+;; Whole-dword vendor write; TYPE is #x0100 (PLA) or #x0000 (USB).
+(defun r8152-write-dword (addr type v)
+  (setf (mem-ref (r8152-reg-scratch) :u32) v)
+  (let ((r (usb-control-transfer (usb-dev-addr) #x40 5 addr (logior type #xFF)
+                                 (r8152-reg-scratch) 4)))
+    (if (> r 0) 1 0)))
+
+(defun r8152-read-dword-type (addr type)
+  (let ((r (usb-control-transfer (usb-dev-addr) #xC0 5 addr type
+                                 (r8152-reg-scratch) 4)))
+    (if (<= r 0) -1 (mem-ref (r8152-reg-scratch) :u32))))
+
+;; This driver reads ONE frame per 2048-byte bulk-IN transfer (r8152-receive).
+;; U-Boot leaves the chip AGGREGATING frames into a transfer, so once a
+;; second frame queued behind the first, frames over ~800 bytes never came up
+;; at all (the channel sat NAKing) -- every full-size TCP segment was lost,
+;; which is why fetches only worked at the 536-byte default MSS.  So:
+;;   USB_USB_CTRL (0xd406, upper half of dword 0xd404) |= RX_AGG_DISABLE 0x10
+;;   PLA_RMS      (0xc016, upper half of dword 0xc014)  = 1522
+;; 1522 is Linux's mtu + VLAN_ETH_HLEN + FCS; U-Boot's 1518 still dropped a
+;; full 1514-byte frame (measured: a 1472-byte ping arrived only after it).
+(defun r8152-rx-one-frame-per-transfer ()
+  (let ((ctrl (r8152-read-dword-type #xd404 0))
+        (rms (r8152-read-dword #xc014)))
+    (when (>= ctrl 0)
+      (r8152-write-dword #xd404 0 (logior ctrl (ash #x10 16))))
+    (when (>= rms 0)
+      (r8152-write-dword #xc014 #x100 (logior (logand rms #xFFFF) (ash 1522 16))))))
+
 ;; ============================================================
 ;; Probe: adopt U-Boot's running device (no init, no enumerate)
 ;; ============================================================
@@ -153,6 +182,7 @@
           ;; No PLA_CR / CRWECR (RE|TE already set; touching it wedges).
           (r8152-set-rcr)
           (r8152-ungate-rxdy)
+          (r8152-rx-one-frame-per-transfer)
           ;; Print MAC + addr for diagnostics.
           (write-string-serial "R8152:A") (print-dec addr)
           (write-string-serial " MAC:")

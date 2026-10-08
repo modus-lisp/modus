@@ -318,20 +318,28 @@
         (logand (logxor folded2 #xFFFF) #xFFFF)))))
 
 (defun tcp-send-segment (flags data data-len)
-  (let ((state (e1000-state-base))
-        (tcp-len (+ 20 data-len))
-        (seg (make-array 1480)))
+  ;; A SYN carries an MSS option (kind 2, length 4, 1460).  Without one the
+  ;; peer must assume RFC 9293's default of 536 bytes, and did: every segment
+  ;; of an HTTP fetch was 536 bytes, ~2.7x the packets (and per-packet costs)
+  ;; of a 1460-byte MSS.  Only SYNs carry it; the header is then 24 bytes.
+  (let* ((state (e1000-state-base))
+         (syn (not (zerop (logand flags 2))))
+         (hdr (if syn 24 20))
+         (tcp-len (+ hdr data-len))
+         (seg (make-array 1480)))
     (buf-write-u16 seg 0 (mem-ref (+ state #x34) :u16))
     (buf-write-u16 seg 2 (mem-ref (+ state #x36) :u16))
     (buf-write-u32 seg 4 (mem-ref (+ state #x3C) :u32))
     (buf-write-u32 seg 8 (mem-ref (+ state #x40) :u32))
-    (aset seg 12 #x50) (aset seg 13 flags)
+    (aset seg 12 (if syn #x60 #x50)) (aset seg 13 flags)
     (buf-write-u16 seg 14 8192)
     (aset seg 16 0) (aset seg 17 0)
     (aset seg 18 0) (aset seg 19 0)
+    (when syn
+      (aset seg 20 2) (aset seg 21 4) (aset seg 22 #x05) (aset seg 23 #xB4))
     (when (not (zerop data-len))
       (dotimes (i data-len)
-        (aset seg (+ 20 i) (aref data i))))
+        (aset seg (+ hdr i) (aref data i))))
     (let ((csum (tcp-checksum seg tcp-len)))
       (aset seg 16 (logand (ash csum -8) #xFF))
       (aset seg 17 (logand csum #xFF)))
@@ -402,10 +410,14 @@
 (defun tcp-receive (timeout)
   (let ((state (e1000-state-base))
         (received 0))
+    ;; Poll FIRST and wait only after an EMPTY poll.  It used to IO-DELAY
+    ;; before every poll, so a queue of segments drained at one per delay:
+    ;; 1.5 ms each on the Pi, 3.4 ms per segment end to end (tcpdump), which
+    ;; capped an HTTP fetch at ~115 KB/s however fast the peer sent.
     (dotimes (try timeout)
       (when (zerop received)
-        (io-delay)
         (let ((pkt-len (e1000-receive)))
+          (when (zerop pkt-len) (io-delay))
           (when (not (zerop pkt-len))
             (let ((buf (e1000-rx-buf)))
               (when (eq (mem-ref (+ buf 12) :u8) #x08)

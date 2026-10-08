@@ -1380,14 +1380,30 @@
     (let ((ip-total (buf-read-u16-mem buf 16))
           (tcp-hdr-len (ash (logand (mem-ref (+ buf 46) :u8) #xF0) -2)))
       (let ((data-len (- ip-total (+ 20 tcp-hdr-len))))
-        (let ((data-base (+ (+ buf 34) tcp-hdr-len)))
-          (let ((i 0))
-            (loop
-              (when (>= i data-len) (return data-len))
-              (let ((dst-idx (+ dest-off i)))
-                (when (< dst-idx (%net-resp-cap))
-                  (setf (aref dest dst-idx) (mem-ref (+ data-base i) :u8))))
-              (setq i (+ i 1))))
+        ;; Four bytes per load straight into DEST's packed data (byte K of a u8
+        ;; vector is at word+7+K), not a byte at a time through AREF with a
+        ;; %NET-RESP-CAP call per byte.  Clipped to the cap once.  The LOADS
+        ;; must be ALIGNED: the RX buffer is DMA memory mapped DEVICE, where an
+        ;; unaligned access is an alignment fault (ESR 0x96000021 at
+        ;; rx+0x4E: desc 24 + headers 54 put the payload on a 2-byte
+        ;; boundary).  So bytes up to a 4-byte source boundary, then aligned
+        ;; words; DEST is ordinary memory and takes unaligned stores.
+        (let* ((data-base (+ (+ buf 34) tcp-hdr-len))
+               (n (max 0 (min data-len (- (%net-resp-cap) dest-off))))
+               (da (+ (%val->word dest) 7 dest-off))
+               (i 0))
+          (loop
+            (when (or (>= i n) (zerop (logand (+ data-base i) 3))) (return nil))
+            (setf (aref dest (+ dest-off i)) (mem-ref (+ data-base i) :u8))
+            (setq i (+ i 1)))
+          (loop
+            (when (> (+ i 4) n) (return nil))
+            (setf (mem-ref (+ da i) :u32) (mem-ref (+ data-base i) :u32))
+            (setq i (+ i 4)))
+          (loop
+            (when (>= i n) (return nil))
+            (setf (aref dest (+ dest-off i)) (mem-ref (+ data-base i) :u8))
+            (setq i (+ i 1)))
           data-len)))))
 (defun http-fetch-impl (url url-len)
   (let ((scheme-end (url-skip-http url url-len)))
@@ -1530,11 +1546,7 @@
           ;; tarball is 40 MB, past the alloc guard band.
           (let* ((blen (- resp-len body-off))
                  (out (make-array blen :element-type (quote (unsigned-byte 8)))))
-            (let ((i 0))
-              (loop
-                (when (>= i blen) (return nil))
-                (setf (aref out i) (aref resp (+ body-off i)))
-                (setq i (+ i 1))))
+            (replace out resp :start2 body-off)     ; both packed: word copy
             (cons out blen))))))
 
 ;; Fetch URL-STRING and REPORT it: body length, the first four bytes (a .tar.gz

@@ -1357,6 +1357,16 @@
         (if (and *ssh-build-p* *cl-repl-rpi-p*)
             (format nil "~%(defun usb-keepalive () 0)~%")
             "")
+        ;; Pi USB NICs (RTL8153 or CDC) receive on DWC2 bulk-IN channel 1.
+        ;; R8152-RECEIVE re-arms that channel at the START of its next call,
+        ;; so the poll right after every frame is empty by construction -- and
+        ;; then sat out a whole IO-DELAY (1.5 ms): the 1.71 ms per segment a
+        ;; capture showed, against a 79 us ACK.  Instead spin on the channel's
+        ;; HCINT (a read, consumes nothing) for at most the same 5000 reads,
+        ;; leaving as soon as the transfer halts (CHHLTD bit 1) or completes.
+        (if *cl-repl-rpi-p*
+            (format nil "~%(defun net-rx-idle () (let ((i 0)) (loop (when (>= i 5000) (return nil)) (when (not (zerop (logand (dwc2-read (dwc2-hcint 1)) 3))) (return t)) (setq i (+ i 1)))))~%")
+            "")
         (%rpi-net-text "http-client.lisp")   (string #\Newline)
         ;; Bigger HTTP response buffer.  The stock http-fetch-impl caps a
         ;; response at 4096 bytes and tcp-rx-copy bounds its copy to 4096 — too
@@ -1389,7 +1399,7 @@
         ;; boundary).  So bytes up to a 4-byte source boundary, then aligned
         ;; words; DEST is ordinary memory and takes unaligned stores.
         (let* ((data-base (+ (+ buf 34) tcp-hdr-len))
-               (n (max 0 (min data-len (- (%net-resp-cap) dest-off))))
+               (n (max 0 (min data-len (- (length dest) dest-off))))
                (da (+ (%val->word dest) 7 dest-off))
                (i 0))
           (loop
@@ -1405,6 +1415,30 @@
             (setf (aref dest (+ dest-off i)) (mem-ref (+ data-base i) :u8))
             (setq i (+ i 1)))
           data-len)))))
+(defun %http-ci-match (buf at word)
+  (let ((i 0) (n (length word)))
+    (loop
+      (when (>= i n) (return t))
+      (let ((c (aref buf (+ at i))))
+        (when (and (>= c 65) (<= c 90)) (setq c (+ c 32)))
+        (when (not (eql c (char-code (char word i)))) (return nil)))
+      (setq i (+ i 1)))))
+(defun %http-full-length (buf len)
+  \"Header bytes + Content-Length, once the whole header is in BUF[0,LEN); else 0.\"
+  (let ((i 0) (cl -1) (hdr-end -1))
+    (loop
+      (when (or (>= (+ i 3) len) (>= hdr-end 0)) (return nil))
+      (when (and (eql (aref buf i) 13) (eql (aref buf (+ i 1)) 10)
+                 (eql (aref buf (+ i 2)) 13) (eql (aref buf (+ i 3)) 10))
+        (setq hdr-end (+ i 4)))
+      (when (and (< cl 0) (< (+ i 16) len) (%http-ci-match buf i \"content-length:\"))
+        (let ((j (+ i 15)) (v 0))
+          (loop (when (or (>= j len) (not (eql (aref buf j) 32))) (return nil)) (setq j (+ j 1)))
+          (loop (when (or (>= j len) (< (aref buf j) 48) (> (aref buf j) 57)) (return nil))
+                (setq v (+ (* v 10) (- (aref buf j) 48))) (setq j (+ j 1)))
+          (setq cl v)))
+      (setq i (+ i 1)))
+    (if (and (>= hdr-end 0) (>= cl 0)) (+ hdr-end cl) 0)))
 (defun http-fetch-impl (url url-len)
   (let ((scheme-end (url-skip-http url url-len)))
     (let ((host-end (url-host-end url scheme-end url-len)))
@@ -1458,6 +1492,18 @@
                 (let ((n (tcp-receive 300)))
                   (if (> n 0)
                       (progn
+                        ;; GROW rather than drop: %NET-RESP-CAP is now the
+                        ;; starting size.  Past a fixed cap tcp-rx-copy used to
+                        ;; discard bytes while resp-len still counted them.
+                        ;; Sized ONCE from Content-Length when the header has
+                        ;; arrived (doubling cost 5/10/20/50 ms stalls on a 4 MB
+                        ;; body); doubling only when the server sent none.
+                        (when (> (+ resp-len n) (length resp))
+                          (let ((bigger (make-array (max (* 2 (+ (length resp) n))
+                                                         (%http-full-length resp resp-len))
+                                                    :element-type (quote (unsigned-byte 8)))))
+                            (replace bigger resp :end2 resp-len)
+                            (setq resp bigger)))
                         (let ((copied (tcp-rx-copy resp resp-len)))
                           (setq resp-len (+ resp-len copied)))
                         (setq last-rx (%timer-universal-time)))

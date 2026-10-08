@@ -129,20 +129,66 @@
                                  (r8152-reg-scratch) 4)))
     (if (<= r 0) -1 (mem-ref (r8152-reg-scratch) :u32))))
 
-;; This driver reads ONE frame per 2048-byte bulk-IN transfer (r8152-receive).
-;; U-Boot leaves the chip AGGREGATING frames into a transfer, so once a
-;; second frame queued behind the first, frames over ~800 bytes never came up
-;; at all (the channel sat NAKing) -- every full-size TCP segment was lost,
-;; which is why fetches only worked at the 536-byte default MSS.  So:
-;;   USB_USB_CTRL (0xd406, upper half of dword 0xd404) |= RX_AGG_DISABLE 0x10
-;;   PLA_RMS      (0xc016, upper half of dword 0xc014)  = 1522
-;; 1522 is Linux's mtu + VLAN_ETH_HLEN + FCS; U-Boot's 1518 still dropped a
-;; full 1514-byte frame (measured: a 1472-byte ping arrived only after it).
-(defun r8152-rx-one-frame-per-transfer ()
+;; RX AGGREGATION.  The RTL8153 packs frames into one bulk-IN transfer as
+;; [rx_desc 24 B][frame + CRC], each record starting on an 8-byte boundary,
+;; filling up to the buffer size it is told the host has (USB_RX_EARLY_SIZE)
+;; or until USB_RX_EARLY_TIMEOUT passes.  U-Boot programs it for a 2 KB
+;; buffer, and a driver that read ONE frame per transfer lost everything
+;; queued behind the first frame: full-size TCP segments simply never arrived.
+;; So: a 16 KB buffer, programmed as Linux programs an RTL8153 at USB 2.0
+;; (r8153_set_rx_early_size / _timeout), and R8152-RECEIVE walks every frame
+;; of a transfer before re-arming.
+;;   USB_USB_CTRL   (0xd406, upper half of 0xd404): RX_AGG_DISABLE 0x10 clear
+;;   USB_RX_EARLY_TIMEOUT (0xd42c) = 250000 ns / 8 (COALESCE_HIGH)
+;;   USB_RX_EARLY_SIZE    (0xd42e) = (16384 - rx_reserved 1554) / 4
+;;   PLA_RMS        (0xc016, upper half of 0xc014): 1522 (mtu + VLAN hdr + FCS;
+;;     U-Boot's 1518 drops a full 1514-byte frame -- measured).
+(defun r8152-agg-size () 16384)
+
+;; The aggregate buffer is CACHEABLE RAM, not the Device-mapped USB DMA window
+;; at 0x11000000: every load from Device memory is its own uncached bus read,
+;; and copying a 1460-byte payload out of it cost ~85 us per segment -- 42% of
+;; a 4 MB fetch (instrumented).  0x11400000 is ordinary identity-mapped
+;; Normal-WB DRAM nothing else uses (the window is one 2 MB block; the SSH map
+;; starts at 0x12000000).  The DWC2's DMA is NOT cache-coherent, so after each
+;; transfer completes, the bytes it delivered are cleaned+invalidated (DC CIVAC)
+;; before the CPU reads them; the CPU never writes the buffer, so no dirty line
+;; can be evicted over incoming DMA.
+(defun r8152-agg-buf () #x11400000)
+(defun r8152-meta () (+ (r8152-agg-buf) (r8152-agg-size)))   ; +0 code page
+
+(defun r8152-u64 (a v)
+  (setf (mem-ref a :u32) (logand v #xFFFFFFFF))
+  (setf (mem-ref (+ a 4) :u32) (logand (ash v -32) #xFFFFFFFF)))
+
+(defun r8152-cache-init ()
+  ;; One exec page: DC CIVAC over [scratch+0] for [scratch+8] bytes; scratch
+  ;; at +1536.  ldr x0,[x3]; ldr x1,[x3,#8]; L: dc civac,x0; add x0,x0,#64;
+  ;; subs x1,x1,#64; b.ne L; dsb sy; ret.  (net/hdmi-console's encoding.)
+  (let* ((code (%mmap-exec-page 4096)) (scr (+ code 1536)) (p code))
+    (dolist (w (list (logior #xD2800003 (ash (logand scr #xFFFF) 5))
+                     (logior #xF2A00003 (ash (logand (ash scr -16) #xFFFF) 5))
+                     #xF9400060 #xF9400461 #xD50B7E20 #x91010000 #xF1010021
+                     #x54FFFFA1 #xD5033F9F #xD65F03C0))
+      (setf (mem-ref p :u32) w) (setq p (+ p 4)))
+    (%jit-icache-flush code 64)
+    (r8152-u64 (r8152-meta) code)
+    code))
+
+(defun r8152-dcache-civac (addr bytes)
+  ;; ADDR 64-aligned; BYTES rounded up to whole lines.
+  (let* ((code (mem-ref (r8152-meta) :u32)) (scr (+ code 1536)))
+    (r8152-u64 scr addr)
+    (r8152-u64 (+ scr 8) (logand (+ (max bytes 64) 63) (lognot 63)))
+    (%jit-call code)))
+
+(defun r8152-rx-config ()
   (let ((ctrl (r8152-read-dword-type #xd404 0))
         (rms (r8152-read-dword #xc014)))
     (when (>= ctrl 0)
-      (r8152-write-dword #xd404 0 (logior ctrl (ash #x10 16))))
+      (r8152-write-dword #xd404 0 (logand ctrl (logxor (ash #x10 16) #xFFFFFFFF))))
+    (r8152-write-dword #xd42c 0 (logior (ash (floor (- (r8152-agg-size) 1554) 4) 16)
+                                        (floor 250000 8)))
     (when (>= rms 0)
       (r8152-write-dword #xc014 #x100 (logior (logand rms #xFFFF) (ash 1522 16))))))
 
@@ -182,14 +228,17 @@
           ;; No PLA_CR / CRWECR (RE|TE already set; touching it wedges).
           (r8152-set-rcr)
           (r8152-ungate-rxdy)
-          (r8152-rx-one-frame-per-transfer)
+          (r8152-rx-config)
           ;; Print MAC + addr for diagnostics.
           (write-string-serial "R8152:A") (print-dec addr)
           (write-string-serial " MAC:")
           (print-hex-byte (mem-ref (+ state #x08) :u8)) (write-char-serial 58)
           (print-hex-byte (mem-ref (+ state #x0D) :u8)) (write-char-serial 10)
           ;; Arm the persistent bulk-IN (vendor RX: rx_desc + frame + CRC).
-          (dwc2-start-bulk-in 1 addr 1 (cdc-rx-buf-addr) 2048 512)
+          (setf (mem-ref (+ state #x48) :u32) 0)
+          (r8152-cache-init)
+          (r8152-dcache-civac (r8152-agg-buf) (r8152-agg-size))
+          (dwc2-start-bulk-in 1 addr 1 (r8152-agg-buf) (r8152-agg-size) 512)
           1))))
 
 ;; ============================================================
@@ -209,29 +258,61 @@
                                  0 tx (+ len 8) (usb-bulk-out-mps))))
       (if (eq r 1) 1 0))))
 
-(defun r8152-rx-buf () (+ (cdc-rx-buf-addr) 24))   ; skip the 24-byte rx_desc
+(defun r8152-rx-buf ()
+  ;; The CURRENT frame: past its 24-byte rx_desc, at offset state+0x54 of the
+  ;; aggregate.
+  (+ (r8152-agg-buf) (mem-ref (+ (e1000-state-base) #x54) :u32) 24))
+
+;; Aggregate state in the NIC block: +0x48 = 1 while a completed transfer is
+;; being walked (the channel is NOT armed, so the buffer cannot change under
+;; the caller's copy -- the old deferred re-arm, now per transfer), +0x54 =
+;; offset of the frame last returned, +0x78 = bytes the transfer delivered.
+(defun r8152-frame-len (off)
+  "Frame length (CRC excluded) of the record at OFF, or 0 if none is valid."
+  (let ((plen (- (logand (mem-ref (+ (r8152-agg-buf) off) :u32) #x7FFF) 4)))
+    (if (and (> plen 0) (< plen 1600)
+             (<= (+ off 24 plen) (mem-ref (+ (e1000-state-base) #x78) :u32)))
+        plen 0)))
+
+(defun r8152-rearm ()
+  (setf (mem-ref (+ (e1000-state-base) #x48) :u32) 0)
+  (dwc2-start-bulk-in 1 (usb-dev-addr) (usb-bulk-in-ep)
+                      (r8152-agg-buf) (r8152-agg-size) (usb-bulk-in-mps)))
+
+;; Next frame of the aggregate being walked, or 0 (re-arming the channel
+;; when the walk is over).
+(defun r8152-next-in-aggregate (st)
+  (if (zerop (mem-ref (+ st #x48) :u32))
+      0
+      (let* ((cur (mem-ref (+ st #x54) :u32))
+             (clen (r8152-frame-len cur))
+             (next (logand (+ cur 24 clen 4 7) (lognot 7)))
+             (nlen (if (and (> clen 0) (< (+ next 24) (mem-ref (+ st #x78) :u32)))
+                       (r8152-frame-len next) 0)))
+        (if (> nlen 0)
+            (progn (setf (mem-ref (+ st #x54) :u32) next)
+                   (setf (mem-ref (+ st #x44) :u32) nlen)
+                   nlen)
+            (progn (r8152-rearm) 0)))))
+
+;; A newly completed transfer: its first frame, or 0.
+(defun r8152-poll-new (st)
+  (let ((result (dwc2-poll-bulk-in 1)))
+    (cond
+      ((zerop result) 0)
+      ((not (eq result 1)) (r8152-rearm) 0)
+      (t
+       (setf (mem-ref (+ st #x78) :u32)
+             (- (r8152-agg-size) (logand (dwc2-read (dwc2-hctsiz 1)) #x7FFFF)))
+       (r8152-dcache-civac (r8152-agg-buf) (mem-ref (+ st #x78) :u32))
+       (setf (mem-ref (+ st #x54) :u32) 0)
+       (setf (mem-ref (+ st #x48) :u32) 1)
+       (let ((plen (r8152-frame-len 0)))
+         (setf (mem-ref (+ st #x44) :u32) plen)
+         (when (zerop plen) (r8152-rearm))
+         plen)))))
 
 (defun r8152-receive ()
-  ;; DEFERRED RE-ARM (state+0x48 = rearm-pending): the old code re-armed the
-  ;; next bulk-IN into the SAME single rx buffer immediately on completion —
-  ;; before the caller copied the frame out.  Back-to-back TCP segments then
-  ;; DMA-overwrote the buffer MID-COPY (client KEXINIT cookie bytes replaced
-  ;; by later payload text -> wrong I_C -> wrong exchange hash -> OpenSSH
-  ;; "incorrect signature").  Re-arming at the START of the NEXT call keeps
-  ;; the buffer stable across the caller's whole copy window; USB flow
-  ;; control makes it loss-free (un-armed endpoint NAKs, the RTL8153 holds
-  ;; frames in its internal FIFO).
-  (when (not (zerop (mem-ref (+ (e1000-state-base) #x48) :u32)))
-    (setf (mem-ref (+ (e1000-state-base) #x48) :u32) 0)
-    (dwc2-start-bulk-in 1 (usb-dev-addr) (usb-bulk-in-ep)
-                        (cdc-rx-buf-addr) 2048 (usb-bulk-in-mps)))
-  (let ((result (dwc2-poll-bulk-in 1)))
-    (if (zerop result)
-        0
-        (let ((plen (if (eq result 1)
-                        (- (logand (mem-ref (cdc-rx-buf-addr) :u32) #x7FFF) 4)
-                        0)))
-          (setf (mem-ref (+ (e1000-state-base) #x48) :u32) 1)
-          (if (and (> plen 0) (< plen 1600))
-              (progn (setf (mem-ref (+ (e1000-state-base) #x44) :u32) plen) plen)
-              0)))))
+  (let* ((st (e1000-state-base))
+         (n (r8152-next-in-aggregate st)))
+    (if (> n 0) n (r8152-poll-new st))))

@@ -191,7 +191,7 @@
 (defun ip-send (dst-ip proto payload-buf payload-len)
   (let ((state (e1000-state-base))
         (total-len (+ 20 payload-len))
-        (pkt (make-array 1514)))
+        (pkt (make-array (+ 34 payload-len))))   ; was 1514 slots for every ACK
     ;; Ethernet header: gateway MAC as destination
     (dotimes (i 6) (aset pkt i (mem-ref (+ state #x28 i) :u8)))
     (dotimes (i 6) (aset pkt (+ 6 i) (mem-ref (+ state #x08 i) :u8)))
@@ -326,7 +326,7 @@
          (syn (not (zerop (logand flags 2))))
          (hdr (if syn 24 20))
          (tcp-len (+ hdr data-len))
-         (seg (make-array 1480)))
+         (seg (make-array tcp-len)))
     (buf-write-u16 seg 0 (mem-ref (+ state #x34) :u16))
     (buf-write-u16 seg 2 (mem-ref (+ state #x36) :u16))
     (buf-write-u32 seg 4 (mem-ref (+ state #x3C) :u32))
@@ -349,6 +349,7 @@
                 (+ (mem-ref (+ state #x3C) :u32) 1)))
         (setf (mem-ref (+ state #x3C) :u32)
               (+ (mem-ref (+ state #x3C) :u32) data-len)))
+    (setf (mem-ref (+ state #x4C) :u32) 0)
     (let ((dst-ip (mem-ref (+ state #x38) :u32)))
       (ip-send dst-ip 6 seg tcp-len))))
 
@@ -407,6 +408,19 @@
 (defun tcp-send (data len)
   (tcp-send-segment 24 data len))
 
+(defun tcp-flush-ack ()
+  "Send the ACK a delayed in-order segment is owed (state+0x4C = 1)."
+  (when (not (zerop (mem-ref (+ (e1000-state-base) #x4C) :u32)))
+    (tcp-send-segment 16 (make-array 0) 0)))
+
+;; One unit of waiting after an EMPTY receive poll: at most an IO-DELAY.  A
+;; board whose NIC can say "a frame is ready" without consuming it overrides
+;; this to return as soon as one is, so timeouts keep their length (TIMEOUT
+;; units) while a busy stream is never made to sit out a whole delay.
+;; Returns true when it knows a frame is ready; NIL when it timed out (or,
+;; here, cannot tell).
+(defun net-rx-idle () (io-delay) nil)
+
 (defun tcp-receive (timeout)
   (let ((state (e1000-state-base))
         (received 0))
@@ -417,7 +431,11 @@
     (dotimes (try timeout)
       (when (zerop received)
         (let ((pkt-len (e1000-receive)))
-          (when (zerop pkt-len) (io-delay))
+          ;; Flush a delayed ACK only when the wait ends with NOTHING ready:
+          ;; with one frame per USB transfer the poll right after a frame is
+          ;; always empty, so flushing there ACKed every segment again.
+          (when (zerop pkt-len)
+            (when (not (net-rx-idle)) (tcp-flush-ack)))
           (when (not (zerop pkt-len))
             (let ((buf (e1000-rx-buf)))
               (when (eq (mem-ref (+ buf 12) :u8) #x08)
@@ -443,7 +461,13 @@
                             (if (eq their-seq expected)
                                 (progn
                                   (setf (mem-ref (+ state #x40) :u32) (+ their-seq data-len))
-                                  (tcp-send-segment 16 (make-array 0) 0)
+                                  ;; DELAYED ACK (RFC 9293 3.8.6.3): every
+                                  ;; second in-order segment, or as soon as a
+                                  ;; poll finds nothing queued (TCP-FLUSH-ACK
+                                  ;; below).  An ACK costs ~80 us here.
+                                  (if (>= (mem-ref (+ state #x4C) :u32) 1)
+                                      (tcp-send-segment 16 (make-array 0) 0)
+                                      (setf (mem-ref (+ state #x4C) :u32) 1))
                                   (setq received data-len))
                                 (tcp-send-segment 16 (make-array 0) 0))))
                         ;; FIN.  A FIN consumes ONE sequence number, and it

@@ -27,7 +27,7 @@ say() { echo "[aws-launch] $*" >&2; }
 TMPERR=$(mktemp); trap 'rm -f "$TMPERR"' EXIT
 
 # Amazon Linux 2023 x86_64, resolved through SSM so no AMI id is pinned here.
-AMI=$(aws ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query Parameter.Value --output text)
+AMI=${AMI:-$(aws ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query Parameter.Value --output text)}   # AMI=… to launch a specific image
 say "AMI $AMI"
 
 if ! aws ec2 describe-key-pairs --key-names "$KEY" >/dev/null 2>&1; then

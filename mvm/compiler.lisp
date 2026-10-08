@@ -9591,7 +9591,7 @@
   ;; Also handle pre-hashed integer ops
   )
 
-(defun collect-setq-vars-in-body (form bound-vars)
+(defun collect-setq-vars-in-body (form bound-vars &optional (mx 0))
   "Return list of variables (from BOUND-VARS) that are mutated anywhere in FORM
    (via setq/incf/decf), including inside lambdas. BOUND-VARS is a list of variable
    names to watch for."
@@ -9708,15 +9708,64 @@
          (dolist (v (collect-setq-vars-in-body f bound-vars))
            (setq results (adjoin v results :test #'name-equal))))
        results))
+    ;; A BACKQUOTE TEMPLATE is data with code only in its commas: scan the
+    ;; expansion, never the template (whose COND / LET heads with comma
+    ;; structs for operands the macro branch below would try to expand).
+    ((%bq-form-p form)
+     (collect-setq-vars-in-body (expand-backquote (cadr form)) bound-vars mx))
+    ;; MACROLET: walk the body with the local macros installed, exactly as
+    ;; compile-form will compile it, so a local macro that assigns a variable
+    ;; is seen through its expansion (quri's URL-DECODE: a closure over CHAR,
+    ;; which only a MACROLET'd GOTO assigns, decoded "a%20b" to "aaaaa").
+    ((and (symbolp (car form)) (string= (symbol-name (car form)) "MACROLET")
+          (consp (cdr form)))
+     (let ((saved nil))
+       (unwind-protect
+            (progn
+              (dolist (mdef (cadr form))
+                (when (and (consp mdef) (consp (cdr mdef)))
+                  (let ((mname (normalize-name (car mdef))))
+                    (push (cons mname (gethash mname *macro-table*)) saved)
+                    (mvm-define-macro mname (build-macrolet-expander
+                                             (cadr mdef) (cddr mdef) nil)))))
+              (%mexp-memo-invalidate)
+              (collect-setq-vars-in-body (cons 'progn (cddr form)) bound-vars mx))
+         (%mexp-memo-invalidate)
+         (dolist (sv saved)
+           (if (cdr sv)
+               (setf (gethash (car sv) *macro-table*) (cdr sv))
+               (remhash (car sv) *macro-table*))))))
+    ;; SYMBOL-MACROLET: an assignment to a symbol macro whose expansion is a
+    ;; watched variable assigns that variable.
+    ((and (symbolp (car form)) (string= (symbol-name (car form)) "SYMBOL-MACROLET")
+          (consp (cdr form)))
+     (let ((results (collect-setq-vars-in-body (cons 'progn (cddr form)) bound-vars mx)))
+       (dolist (sm (cadr form))
+         (when (and (consp sm) (consp (cdr sm)) (symbolp (cadr sm))
+                    (member (cadr sm) bound-vars :test #'name-equal)
+                    (collect-setq-vars-in-body (cons 'progn (cddr form)) (list (car sm)) mx))
+           (setq results (adjoin (cadr sm) results :test #'name-equal))))
+       results))
     (t
-     ;; Recurse into all subforms (guard against dotted pairs)
-     (let ((results nil)
-           (rest form))
-       (loop while (consp rest) do
-         (dolist (v (collect-setq-vars-in-body (car rest) bound-vars))
-           (setq results (adjoin v results :test #'name-equal)))
-         (setf rest (cdr rest)))
-       results))))
+     ;; A MACRO CALL: scan its expansion.  A macro that assigns a variable --
+     ;; (defmacro set-c (v) `(setq c ,v)) -- leaves no SETQ in the source,
+     ;; so the variable was not boxed and every closure over it kept the
+     ;; value it had when the closure was made.  %MACROEXPAND-1-MVM-RAW
+     ;; returns the CONS (expansion . expanded-p).  MX bounds the expansions
+     ;; along one path: some expanders return a fresh copy of their own form
+     ;; (a builtin the compiler lowers itself), which would expand forever.
+     (let ((x (and (< mx 16) (symbolp (car form)) (car form)
+                   (%macroexpand-1-mvm-raw form))))
+       (if (and (consp x) (cdr x) (not (eq (car x) form)))
+           (collect-setq-vars-in-body (car x) bound-vars (+ mx 1))
+           ;; Recurse into all subforms (guard against dotted pairs)
+           (let ((results nil)
+                 (rest form))
+             (loop while (consp rest) do
+               (dolist (v (collect-setq-vars-in-body (car rest) bound-vars mx))
+                 (setq results (adjoin v results :test #'name-equal)))
+               (setf rest (cdr rest)))
+             results))))))
 
 (defun vars-mutated-in-lambdas (body-forms let-vars)
   "Find which of LET-VARS are mutated inside a lambda in BODY-FORMS.
@@ -11108,26 +11157,40 @@
              ;; The let semantics (init forms see outer env, all bindings
              ;; created simultaneously) match what the original setq-based
              ;; scheme provided.
+             ;; (var . cell): a FRESH cell symbol per binding.  A name shared
+             ;; by two cells (a LET* rebinding POS, or a nested LET boxing its
+             ;; own POS) made LABELS capture the wrong one by name --
+             ;; quicklisp's PARSE-URLSTRING read an unbound %CELL-POS.
+             (cells (mapcar (lambda (b)
+                              (let ((var (if (consp b) (car b) b)))
+                                (cons var (%mvm-gensym (symbol-name (cell-var-name var))))))
+                            (remove-if-not (lambda (b)
+                                             (member (if (consp b) (car b) b) boxed-vars
+                                                     :test #'name-equal))
+                                           bindings)))
              (cell-bindings
                (mapcar (lambda (b)
                          (let* ((var (if (consp b) (car b) b))
                                 (init (if (consp b) (cadr b) nil)))
-                           `(,(cell-var-name var)
-                             (cons ,(cell-rewrite-form init nil nil) nil))))
+                           `(,(cdr (assoc var cells)) (cons ,init nil))))
                        (remove-if-not (lambda (b)
                                         (member (if (consp b) (car b) b) boxed-vars
                                                 :test #'name-equal))
                                       bindings)))
-             ;; Body references to V become (car %CELL-V); writes become
-             ;; (set-car %CELL-V ...).  Inside lambdas, %CELL-V is now a
-             ;; captured local (free-var in lambda → closure-env entry).
-             (new-body (mapcar (lambda (f) (cell-rewrite-form f boxed-vars nil))
-                               body-stripped))
+             ;; V itself becomes a SYMBOL MACRO for (car %CELL-V) over the
+             ;; body, so every reference reads the cell and every assignment
+             ;; -- (setq V x) is (setf (car %CELL-V) x) -- writes it, INCLUDING
+             ;; the ones a macro produces when it expands later.  The old
+             ;; textual rewrite of the body could not see those: a closure
+             ;; over a variable that a MACROLET / DEFMACRO assigned read a
+             ;; stale cell (quri's URL-DECODE, built on such a macrolet,
+             ;; decoded "a%20b" to "aaaaa").  Inside lambdas, %CELL-V is a
+             ;; captured local as before.
+             (sm (mapcar (lambda (c) `(,(car c) (car ,(cdr c)))) cells))
              (combined-bindings (append non-boxed-bindings cell-bindings)))
         (return-from compile-let
-          (if combined-bindings
-              (compile-form `(let ,combined-bindings ,@new-body) env dest)
-              (compile-form `(progn ,@new-body) env dest))))))
+          (compile-form `(let ,combined-bindings (symbol-macrolet ,sm ,@body-stripped))
+                        env dest)))))
   (check-frame-overflow (length bindings) "let" env)
   (let* ((decl-body body)              ; unstripped: the (declare (type …)) scan below needs it
          (body (strip-declares body))
@@ -11264,25 +11327,31 @@
          (boxed-vars (%boxed-vars-for-let
                       (append init-forms body-stripped) let-vars)))
     (when boxed-vars
-      ;; Walk the bindings in order, replacing each boxed V's slot with
-      ;; %CELL-V → (cons init nil).  Subsequent inits' references to V
-      ;; need to be rewritten to (car %CELL-V); cell-rewrite-form
-      ;; already handles that when given the running boxed-vars list.
-      (let* ((new-bindings
-               (loop for b in bindings
-                     for var = (if (consp b) (car b) b)
-                     for init = (if (consp b) (cadr b) nil)
-                     ;; Rewrite this init using the boxed-vars set.  Earlier
-                     ;; boxed vars in this let* are already cells visible
-                     ;; here; the rewriter turns refs to them into car-of-cell.
-                     for rewritten-init = (cell-rewrite-form init boxed-vars nil)
-                     collect (if (member var boxed-vars :test #'name-equal)
-                                 `(,(cell-var-name var) (cons ,rewritten-init nil))
-                                 `(,var ,rewritten-init))))
-             (new-body (mapcar (lambda (f) (cell-rewrite-form f boxed-vars nil))
-                               body-stripped)))
+      ;; Split at the FIRST boxed binding V: the bindings before it and
+      ;; %CELL-V = (cons init nil) in one LET*, then V as a symbol macro for
+      ;; (car %CELL-V) over the REST -- a LET* of the remaining bindings,
+      ;; whose own compile boxes the next one the same way.  Later inits see
+      ;; V through the symbol macro, as sequential binding requires.  See
+      ;; compile-let for why a symbol macro and not a rewrite of the body.
+      (let* ((pos (position-if (lambda (b)
+                                 (member (if (consp b) (car b) b) boxed-vars
+                                         :test #'name-equal))
+                               bindings))
+             (b (nth pos bindings))
+             (var (if (consp b) (car b) b))
+             (init (if (consp b) (cadr b) nil))
+             (before (subseq bindings 0 pos))
+             (after (nthcdr (1+ pos) bindings))
+             (inner (if after
+                        `(let* ,after ,@body-stripped)
+                        `(progn ,@body-stripped)))
+             ;; A fresh cell symbol: see compile-let.
+             (cell (%mvm-gensym (symbol-name (cell-var-name var)))))
         (return-from compile-let*
-          (compile-form `(let* ,new-bindings ,@new-body) env dest)))))
+          (compile-form `(let* (,@before (,cell (cons ,init nil)))
+                           (symbol-macrolet ((,var (car ,cell)))
+                             ,inner))
+                        env dest)))))
   (check-frame-overflow (length bindings) "let*" env)
   (let* ((decl-body body)               ; unstripped: the (declare (type …)) scan below needs it
          (body (strip-declares body))
@@ -12222,11 +12291,21 @@
                 (when (null bs) (return acc))
                 (setq acc (%collect-free-vars (car bs) new-bound env acc))
                 (setq bs (cdr bs))))))
-         ;; SETQ / PSETQ: read every value form, bind nothing.
+         ;; SETQ / PSETQ: read every value form, bind nothing.  A target that
+         ;; is a SYMBOL MACRO is an assignment to its expansion -- (setq m 5)
+         ;; under (symbol-macrolet ((m (car #:%cell-m))) ...) writes the cell
+         ;; -- so the expansion's variables are free here too.  Skipping
+         ;; them left the cell uncaptured and the closure wrote through a
+         ;; garbage slot (MVM-TYPE-ERROR / memory fault).
          ((or (eq head 'setq) (eq head 'psetq))
           (let ((pairs (cdr form)))
             (loop
               (when (null pairs) (return acc))
+              (let ((place (car pairs)))
+                (when (and place (symbolp place) (not (member place bound)))
+                  (let ((b (env-lookup env place)))
+                    (when (and b (eq (binding-location b) :symbol-macro))
+                      (setq acc (%collect-free-vars (binding-expansion b) bound env acc))))))
               (setq acc (%collect-free-vars (cadr pairs) bound env acc))
               (setq pairs (cddr pairs)))))
          ;; Default: walk every ELEMENT as a form — spine-safe.  The old

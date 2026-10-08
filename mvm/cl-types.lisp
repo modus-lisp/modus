@@ -92,7 +92,19 @@
 
    It used to compute A-B and test the sign bit, which is wrong exactly at the
    special values: inf - inf is a NaN, and x86's default NaN has its SIGN BIT
-   SET, so (< inf inf) answered T; (> inf inf) too."
+   SET, so (< inf inf) answered T; (> inf inf) too.
+
+   FAST PATH: that subtraction is right whenever the difference is NOT a NaN
+   (-0 - +0 is a zero, inf - 1 is inf), so it is kept, and only a NaN
+   difference -- an infinity against itself, or a NaN operand -- takes the
+   bit comparison.  Bits always cost 1.8x on a compare-heavy loop."
+  (let ((d (%float-sub a b)))
+    (if (not (%float-nan-p d))
+        (and (float-negative-p d) (not (%float-zero-p d)))
+        (%float-lt-bits-p a b))))
+
+(defun %float-lt-bits-p (a b)
+  "%FLOAT-LT-P by IEEE bits alone: see there."
   (let ((ah (logand (%float-hi32 a) #xFFFFFFFF)) (al (%float-lo32 a))
         (bh (logand (%float-hi32 b) #xFFFFFFFF)) (bl (%float-lo32 b)))
     (if (or (%float-nan-p a) (%float-nan-p b))
@@ -380,27 +392,37 @@
          (%float-div (%float-sub ep em) (%float-add ep em))))))
 
 (defun %sqrt-f (x)
-  "sqrt of double X (X >= 0) via Newton, after RANGE REDUCTION: scale X by
-   powers of 4 into [1/4, 4) and the root back by the same powers of 2 (both
-   exact), so Newton from 1 converges in a handful of steps.  Newton from
-   y = X, the old start, halves y per step and needs ~log2(X) of them: with 40,
-   (sqrt 1d300) came back 3.9d297.  +-0, +inf and NaN are their own roots."
+  "sqrt of double X (X >= 0) via Newton, after RANGE REDUCTION.  The exponent
+   is read off the IEEE bits and X scaled by 2^-2k into [1, 4) in one exact
+   step, so six Newton steps from (1+m)/2 reach full precision with no
+   compare at all (a compare-terminated loop cost 2.3x).  Exponents past +-60
+   and subnormals take the general path: scale by powers of 4.  Newton from
+   y = X, the original start, halves y per step: with 40 steps (sqrt 1d300)
+   was 3.9d297.  +-0, +inf and NaN are their own roots."
   (cond
-    ((or (%float-zero-p x) (%float-nan-p x) (%float-infinite-p x)) x)
-    (t (let ((m x) (s (%fl 1)) (two (%fl 2)) (four (%fl 4))
-             (quarter (%float-div (%fl 1) (%fl 4)))
-             (half (%float-div (%fl 1) (%fl 2))))
-         (loop (when (%float-lt-p m four) (return nil))
-               (setq m (%float-mul m quarter)) (setq s (%float-mul s two)))
-         (loop (when (not (%float-lt-p m quarter)) (return nil))
-               (setq m (%float-mul m four)) (setq s (%float-mul s half)))
-         (let ((y (%fl 1)) (i 0))
-           (loop
-             (when (> i 12) (return nil))
-             (setq y (%float-mul (%float-add y (%float-div m y)) half))
-             (setq i (+ i 1)))
-           (%float-mul y s))))))
-
+    ((or (%float-zero-p x) (%float-nonfinite-p x)) x)
+    (t
+     (let* ((e (- (logand (ash (%float-hi32 x) -20) 2047) 1023))
+            (half (%float-div (%fl 1) (%fl 2))))
+       (if (and (> e -60) (< e 60))
+           (let* ((k (ash e -1))                         ; floor(e/2)
+                  (p (%fl (ash 1 (abs k))))              ; 2^|k|, exact
+                  (m (if (< k 0) (%float-mul (%float-mul x p) p)
+                         (%float-div (%float-div x p) p)))
+                  (y (%float-mul (%float-add (%fl 1) m) half)))
+             (dotimes (i 6)
+               (setq y (%float-mul (%float-add y (%float-div m y)) half)))
+             (if (< k 0) (%float-div y p) (%float-mul y p)))
+           (let ((m x) (s (%fl 1)) (two (%fl 2)) (four (%fl 4))
+                 (quarter (%float-div (%fl 1) (%fl 4))))
+             (loop (when (%float-lt-p m four) (return nil))
+                   (setq m (%float-mul m quarter)) (setq s (%float-mul s two)))
+             (loop (when (not (%float-lt-p m quarter)) (return nil))
+                   (setq m (%float-mul m four)) (setq s (%float-mul s half)))
+             (let ((y (%float-mul (%float-add (%fl 1) m) half)))
+               (dotimes (i 7)
+                 (setq y (%float-mul (%float-add y (%float-div m y)) half)))
+               (%float-mul y s))))))))
 (defun %asin-f (x)
   "asin of double X for |X| ≤ 1, via atan(x/sqrt(1-x^2)).  For |X|=1
    returns ±π/2 directly."
@@ -3235,10 +3257,13 @@
   "Return T if numeric value A < numeric value B.
    Handles integers, boxed floats (subtag #x60 IEEE or #x32 rational
    form), and tagged ratios (subtag #x33)."
+  ;; BOTH IEEE floats first: the common case pays nothing for the checks below.
+  (when (and (%ieee-float-p a) (%ieee-float-p b))
+    (return-from numeric-value-less-p (%float-lt-p a b)))
   ;; A NON-FINITE float against a non-float real: decided by the float alone,
   ;; before anything below coerces it to a rational.
-  (when (or (and (%ieee-float-p a) (not (%ieee-float-p b)) (%float-nonfinite-p a))
-            (and (%ieee-float-p b) (not (%ieee-float-p a)) (%float-nonfinite-p b)))
+  (when (or (and (%ieee-float-p a) (%float-nonfinite-p a))
+            (and (%ieee-float-p b) (%float-nonfinite-p b)))
     (return-from numeric-value-less-p (%float-vs-real-lt-p a b)))
   ;; IEEE-float vs integer fast path — avoid %ieee-float-to-rat for
   ;; sub-unit-magnitude floats whose rational denominator would be
@@ -3352,10 +3377,6 @@
     (return-from numeric-equal-p
       (and (numeric-equal-p (realpart a) (realpart b))
            (numeric-equal-p (imagpart a) (imagpart b)))))
-  ;; A NON-FINITE float equals no non-float real (and a NaN nothing at all).
-  (when (or (and (%ieee-float-p a) (not (%ieee-float-p b)) (%float-nonfinite-p a))
-            (and (%ieee-float-p b) (not (%ieee-float-p a)) (%float-nonfinite-p b)))
-    (return-from numeric-equal-p nil))
   ;; IEEE-float vs integer fast path — avoid coerce-to-rat for the
   ;; common 0.0/integer 0 case (avoids bignum overflow on small floats).
   (when (and (%ieee-float-p a) (integerp b))
@@ -3387,6 +3408,11 @@
   ;; hanging — same wedge as numeric-value-less-p.
   (when (and (%ieee-float-p a) (%ieee-float-p b))
     (return-from numeric-equal-p (%float-eq-p a b)))
+  ;; A NON-FINITE float equals no non-float real (and a NaN nothing at all);
+  ;; settled before the paths below coerce it to a rational.
+  (when (or (and (%ieee-float-p a) (%float-nonfinite-p a))
+            (and (%ieee-float-p b) (%float-nonfinite-p b)))
+    (return-from numeric-equal-p nil))
   (when (or (%ieee-float-p a) (%ieee-float-p b))
     (return-from numeric-equal-p
       (numeric-equal-p (%coerce-numeric a) (%coerce-numeric b))))

@@ -2127,6 +2127,7 @@
           ;; NIL, so a non-local exit (reader-error) leaving it at NIL is
           ;; harmless — no unwind-protect needed on the discard path.
           (let ((*sharp-labels* nil))
+            (declare (special *sharp-labels*))
             (setq *reader-preserve-ws* nil)
             (let ((result (%read-internal s eof-error-p eof-value recursive-p)))
               (setq *reader-preserve-ws* nil)
@@ -2150,6 +2151,7 @@
       (let ((result (if recursive-p
                         (%read-internal s eof-error-p eof-value recursive-p)
                         (let ((*sharp-labels* nil))
+                          (declare (special *sharp-labels*))
                           (%read-internal s eof-error-p eof-value recursive-p)))))
         (setq *reader-preserve-ws* nil)
         result))))
@@ -2242,6 +2244,7 @@
                            (let ((r (%read-internal s eof-error-p eof-value nil)))
                              (setq *reader-preserve-ws* saved-preserve)
                              r))))
+            (declare (special *sharp-labels*))
             ;; Get position.  CLHS 23.2 read-from-string: the second value
             ;; is the index of the first character not read.  Modus's token
             ;; reader UNREADS whatever char terminated the token — the

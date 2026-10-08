@@ -776,20 +776,7 @@ WITH A REASON.  Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~
 ;;; is filed as task #248 and is fixed the same way: add
 ;;; `(declare (special *X*))' to the LET body.
 (defvar *global-check-let-special-baseline*
-  '(("*SHARP-LABELS*"
-     "#248 FINDING 1 (unfixed, filed) — mvm/cl-reader.lisp READ /
-      READ-PRESERVING-WHITESPACE / READ-FROM-STRING each `(let ((*sharp-labels*
-      nil)) …)' to give the call a fresh #n= label table.  In-image that LET is
-      lexical, so the per-READ reset never happens: %READ-SHARP-DISPATCH and
-      friends read and PUSH onto the GLOBAL table, which therefore accumulates
-      across every read for the life of the image and is never cleared.
-      VERIFIED ON THE BINARY, not inferred — in the shipping x64 CLI:
-        (read-from-string \"#1=(1 2 3)\")  =>  (1 2 3)
-        *sharp-labels*                   =>  ((1 (1 2 3) . :SHARP-RESOLVED))
-        (read-from-string \"#1#\")         =>  (1 2 3)
-      That last one must signal a reader-error: #1# is undefined in a fresh
-      READ.  It resolves through the leaked table instead.")
-    ("*SUPPRESS-LOOP-BLOCK-NIL*"
+  '(("*SUPPRESS-LOOP-BLOCK-NIL*"
      "#248 FINDING 2 (unfixed, filed) — mvm/compiler.lisp COMPILE-COMPOUND's
       %NAMED-LOOP arm binds it so the inner simple-LOOP does not establish its
       own (block nil …) (CLHS 6.1.2.2).  Lexical in-image ⇒ the self-hosted /

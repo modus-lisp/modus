@@ -37,7 +37,8 @@
 
 ;; +0x00 hub address, +0x04 hub port count, +0x60 buttons, +0x64 x, +0x68 y,
 ;; +0x6C wheel (x/y/wheel two's complement u32), +0x70 previous keys (8 bytes),
-;; +0x80 ring head, +0x84 ring tail, +0x100 ring (256 bytes).
+;; +0x80 ring head, +0x84 ring tail, +0x88 held usage, +0x8C next repeat
+;; time, +0x100 ring (256 bytes).
 (defun hid-kbd-buf () (+ (split-dma-base) #x400))
 (defun hid-mouse-buf () (+ (split-dma-base) #x480))
 
@@ -234,6 +235,33 @@
      (char-code (char (if shift "_+{}|~:\"~<>?" "-=[]\\#;'`,./") (- u 45))))
     (t -1)))
 
+;; Key repeat.  The keyboard reports only CHANGES (SET_IDLE 0), so a held key
+;; is one report and then silence: repeat it here, from the poll loop.  The
+;; clock is the DWC2's own (micro)frame counter, HFNUM: 14 bits of 125 us,
+;; wrapping every 2.048 s, compared modulo 2^14.  Not the BCM system timer:
+;; on this board a u32 read of CLO (0x3F003004) returns one live byte under
+;; three constant ones ("tim\x??"), so it cannot time anything.  The newest
+;; key pressed is the one that repeats; a report without it stops the repeat.
+(defun hid-now () (logand (dwc2-read (dwc2-hfnum)) #x3FFF))
+(defun hid-repeat-delay () 4000)              ; 125-us ticks: 500 ms
+(defun hid-repeat-period () 264)              ; ~33 ms, ~30 repeats/s
+(defun hid-time-reached-p (t1)
+  (< (logand (- (hid-now) t1) #x3FFF) #x2000))
+
+(defun hid-key-char (u mods)
+  ;; Character for usage U under modifier byte MODS, or -1.
+  (let ((c (hid-usage-char u (not (zerop (logand mods #x22))))))
+    (if (and (>= c 0) (not (zerop (logand mods #x11))) (>= c 64))
+        (logand c 31)
+        c)))
+
+(defun hid-repeat-tick ()
+  (let ((u (hid-get #x88)))
+    (when (and (> u 0) (hid-time-reached-p (hid-get #x8C)))
+      (let ((c (hid-key-char u (mem-ref (+ (hid-st) #x70) :u8))))
+        (when (>= c 0) (hid-ring-push c)))
+      (hid-put #x8C (logand (+ (hid-now) (hid-repeat-period)) #x3FFF)))))
+
 (defun hid-key-was-down (u)
   (let ((i 2) (r nil))
     (loop
@@ -243,17 +271,22 @@
 
 (defun hid-kbd-report (b)
   ;; Queue the characters of keys newly down in boot report B.
-  (let ((mods (mem-ref b :u8)) (i 2))
-    (let ((shift (not (zerop (logand mods #x22))))
-          (ctrl (not (zerop (logand mods #x11)))))
+  (let ((mods (mem-ref b :u8)) (i 2) (held (hid-get #x88)) (still nil))
+    (progn
       (loop
         (when (> i 7) (return nil))
         (let ((u (mem-ref (+ b i) :u8)))
+          (when (= u held) (setq still t))
           (when (and (> u 3) (not (hid-key-was-down u)))
-            (let ((c (hid-usage-char u shift)))
+            (let ((c (hid-key-char u mods)))
               (when (>= c 0)
-                (hid-ring-push (if (and ctrl (>= c 64)) (logand c 31) c))))))
+                (hid-ring-push c)
+                ;; the newest key repeats, after the initial delay
+                (setq held u) (setq still t)
+                (hid-put #x88 u)
+                (hid-put #x8C (logand (+ (hid-now) (hid-repeat-delay)) #x3FFF))))))
         (setq i (+ i 1)))
+      (when (not still) (hid-put #x88 0))
       (let ((j 0))
         (loop
           (when (> j 7) (return nil))
@@ -272,6 +305,7 @@
   (when (not (hid-ready-p)) (return-from hid-split-poll nil))
   (when (> (hid-poll-dev (hid-kbd) (hid-kbd-buf)) 0)
     (hid-kbd-report (hid-kbd-buf)))
+  (hid-repeat-tick)
   (let ((n (hid-poll-dev (hid-mouse) (hid-mouse-buf))))
     (when (> n 2) (hid-mouse-report (hid-mouse-buf) n)))
   nil)

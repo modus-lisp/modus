@@ -10049,6 +10049,17 @@
     (t
      (let ((op (car form)))
        (cond
+         ;; A BACKQUOTE TEMPLATE is data; only its commas hold code.  Walking
+         ;; the raw template treated its structure as code -- `(let ,b ,body)'
+         ;; looked like a LET whose binding list was a comma struct, and the
+         ;; type error made the build SKIP the whole enclosing DEFUN, every
+         ;; call to which then compiled to a NIL sentinel (GENERATE-LOOP-CODE
+         ;; did, once an FLET in it pushed to a boxed variable).  A boxed
+         ;; variable inside a comma was never rewritten either.  Rewrite the
+         ;; expansion instead, as %COLLECT-FREE-VARS does; compile-form would
+         ;; lower the template to that same code.
+         ((%bq-form-p form)
+          (cell-rewrite-form (expand-backquote (cadr form)) boxed-vars lambda-params))
          ;; (psetq p1 v1 …) / (psetf p1 v1 …) — PARALLEL multi-place: all
          ;; values are evaluated BEFORE any assignment.  We added these to the
          ;; boxed-var detector, so they must be rewritten here too or the
@@ -26174,6 +26185,7 @@
                             ;; that used to fault the recovery path.
                             (format t "  SKIP form#~D ~A: ~A~%"
                                     (1- form-index) *current-source-location* e)
+
                             (setf *function-table* fn-table-before)
                             (setf *pending-flet-ir* nil)
                             nil))))

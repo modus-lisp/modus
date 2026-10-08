@@ -1348,6 +1348,9 @@
                         "*UNUSED-VALUE-FORM*" "*SETQ-VALUE-UNUSED*"
                         "*CURRENT-FUNCTION-NAME*" "*FUNCTION-RETURN-LABEL*"
                         "*UWP-CLEANUPS*" "*LOOP-EXIT-UWP-SEQ*"
+                        ;; The push-depth tracking that lexical exits pop
+                        ;; back to: rebound per compiled function.
+                        "*IR-PUSH-DEPTH*" "*LABEL-PUSH-DEPTHS*"
                         "*ARITH-PUSH-DEPTH*"))
           (setf (gethash (compute-name-hash name) tab) t))
         (setq *clhs-standard-specials-hashes* tab)
@@ -2216,11 +2219,45 @@
 ;;; Immediates are tagged with :imm:
 ;;;   (:imm value)
 
+(defvar *ir-push-depth* 0
+  "Words this function has :PUSHed and not yet :POPed at the point of
+   emission.  Every expression leaves it where it found it, so its value at
+   a label is the depth on every edge that falls into that label.")
+
+(defvar *label-push-depths* nil
+  "(label . depth) for each BLOCK / LOOP exit and TAGBODY tag of this
+   function: the stack depth control must be at when it arrives there.")
+
 (defun emit-ir (op &rest args)
   "Emit an IR instruction to the current buffer"
   (when (and *ddc-trace-nil-callee* (eq op :call) (equal (car args) "NIL"))
     (format t "~&  NIL-CALL built in ~A (nargs ~A)~%" *current-function-name* (cadr args)))
+  (cond ((eq op :push) (setq *ir-push-depth* (+ *ir-push-depth* 1)))
+        ((eq op :pop) (setq *ir-push-depth* (- *ir-push-depth* 1))))
   (push (cons op args) *ir-buffer*))
+
+(defun %note-label-depth (label)
+  "Record that LABEL is reached at the current push depth."
+  (setq *label-push-depths* (cons (cons label *ir-push-depth*) *label-push-depths*))
+  label)
+
+(defun %emit-pop-to-label-depth (label)
+  "Before a lexical :BR to LABEL (RETURN-FROM / RETURN / GO / loop exit):
+   pop whatever this point has pushed beyond LABEL's depth.  A pending call
+   argument, or the six words UNWIND-PROTECT saves before its cleanup, would
+   otherwise stay on the stack, and the code after LABEL would pop them as
+   its own: (list 39 (block b (list 1 (return-from b 65)))) => (1 65), and
+   a RETURN-FROM out of a cleanup handed GCD a saved MV word for its first
+   argument (ANSI MISC.273).  Only the branch pops: the code emitted after
+   it is the fall-through path, so the tracked depth is left as it was."
+  (let ((e (assoc label *label-push-depths*)))
+    (when e
+      (let ((n (- *ir-push-depth* (cdr e))))
+        (when (> n 0)
+          (let ((r (alloc-temp-reg)))
+            (dotimes (i n) (emit-ir :pop r))
+            (free-temp-reg))
+          (setq *ir-push-depth* (+ *ir-push-depth* n)))))))
 
 (defun emit-ir-label (label-id)
   "Emit a label marker in the IR stream"
@@ -13158,7 +13195,7 @@
               (setq *in-loop-catch-wrap* nil)
               (setq *nonlocal-blocks* %nlb-saved)))
           (let* ((loop-label (make-compiler-label))
-                 (exit-label (make-compiler-label))
+                 (exit-label (%note-label-depth (make-compiler-label)))
                  (*loop-exit-label* exit-label)
                  (*loop-exit-uwp-seq* (%uwp-current-seq))
                  (*block-labels*
@@ -15422,6 +15459,7 @@
          (emit-ir :push dest)
          (%emit-uwp-unwind-to *loop-exit-uwp-seq*)
          (emit-ir :pop dest))
+       (%emit-pop-to-label-depth *loop-exit-label*)
        (emit-ir :br *loop-exit-label*))
       ;; Cross-unit BLOCK NIL: we are inside a lambda/flet/labels function
       ;; whose enclosing (block nil …) installed a runtime catch frame
@@ -15540,6 +15578,7 @@
         ;; evaluates, so nothing in between can clobber it.
         (compile-form `(values-list (%%lx-reg ,value-dest)) env value-dest))
       (compile-form value-form env value-dest))
+  (%emit-pop-to-label-depth exit-label)
   (emit-ir :br exit-label))
 
 (defun %walker-macroexpand (form)
@@ -15827,7 +15866,7 @@
         ;; unwind-protect runs that u-p's cleanup (and pops its setjmp
         ;; frame) before the :br — the entry's 4th element is consumed by
         ;; the RETURN-FROM lexical branch / compile-return.
-        (let* ((exit-label (make-compiler-label))
+        (let* ((exit-label (%note-label-depth (make-compiler-label)))
                (*block-labels* (cons (list name exit-label dest
                                            (%uwp-current-seq))
                                      *block-labels*)))
@@ -16052,7 +16091,7 @@
     ;; First pass: collect tags and create labels
     (dolist (item body)
       (when (%tagbody-tag-p item)
-        (push (cons item (cons (make-compiler-label) tb-seq))
+        (push (cons item (cons (%note-label-depth (make-compiler-label)) tb-seq))
               *tagbody-tags*)))
     ;; Second pass: compile
     (let ((rest body))
@@ -16092,6 +16131,7 @@
     ;; entry = (TAG LABEL . TARGET-SEQ).  Run intervening unwind-protect
     ;; cleanups before branching (GO carries no value, so no push/pop).
     (%emit-uwp-unwind-to (cddr entry))
+    (%emit-pop-to-label-depth (cadr entry))
     (emit-ir :br (cadr entry))))
 
 ;;; ============================================================
@@ -24009,6 +24049,8 @@
                              (list (list name return-label +vreg-vr+ 0))
                              nil))
          (*tagbody-tags* nil)
+         (*ir-push-depth* 0)
+         (*label-push-depths* nil)
          ;; NLX-through-unwind-protect: u-ps in an ENCLOSING unit are not
          ;; reachable by a lexical :br from inside this lambda/defun (the
          ;; cross-unit exit goes through the runtime catch/throw path), so
@@ -26115,6 +26157,8 @@
         (*loop-exit-uwp-seq* 0)
         (*block-labels* nil)
         (*tagbody-tags* nil)
+        (*ir-push-depth* 0)
+        (*label-push-depths* nil)
         (*uwp-cleanups* nil)
         (*uwp-seq-counter* 0)
         (*pending-flet-ir* nil)

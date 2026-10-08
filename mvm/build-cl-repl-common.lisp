@@ -389,6 +389,16 @@
     ;; UART.  This is the bare-metal counterpart of lib/cli-toplevel.lisp, which
     ;; the hosted payload supplies and *CLI-BARE-METAL* omits.
     (%rpi-mvm-text "lib/serial-repl.lisp")
+    ;; Single-threaded answers to the SB-THREAD shim's primitives (the shim is
+    ;; boot-evaluated here too; net/hosted-sync.lisp is hosted-only).
+    (%rpi-mvm-text "net/bare-sync.lisp")
+    ;; The Pi's mutex arena: the top of the uncached USB-DMA window, above the
+    ;; HDMI console's state and font.  Zeroed by the kernel prologue.
+    (if *cl-repl-rpi-p*
+        "
+(defun %bare-sync-arena () (values #x111F2000 #x111FF000))
+"
+        "")
     ;; A board net build carries net/usb-hid-split.lisp, which is spliced
     ;; BEFORE this text: its console must be bound HERE, after serial-repl's
     ;; seam defaults, or the defaults win (last-defun-wins).  Read off the
@@ -791,6 +801,9 @@
   ;; which survives a board reset: clear it before the first character, or the
   ;; banner below is drawn into the previous boot's framebuffer.
   (setf (mem-ref #x111F0800 :u32) 0)
+  ;; Same for net/bare-sync.lisp's mutex arena: its cell count and clock.
+  (setf (mem-ref #x111F2000 :u32) 0)
+  (%gc-write64 #x111F2008 0)
   ;; Banner first: proves native code is executing and the UART is alive
   ;; before any runtime init runs.
   (write-string-serial \"MODUS-CL\")

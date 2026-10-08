@@ -1323,7 +1323,10 @@
             (%rpi-hcon-font-text)                (string #\Newline)
             (%rpi-net-text "hdmi-console.lisp")  (string #\Newline)
             (%rpi-net-text "dwc2-split.lisp")    (string #\Newline)
-            (%rpi-net-text "usb-hid-split.lisp") (string #\Newline))))))
+            (%rpi-net-text "usb-hid-split.lisp") (string #\Newline)
+            ;; The boot SD card, read only (SDHOST, adopting U-Boot's setup):
+            ;; the sector source for a pagetree/cabinet store on a partition.
+            (%rpi-net-text "sdhost.lisp")        (string #\Newline))))))
 
 ;; The Zero board net build mirrors the serial console to HDMI: every
 ;; WRITE-CHAR-SERIAL compiled into the image calls net/hdmi-console.lisp's

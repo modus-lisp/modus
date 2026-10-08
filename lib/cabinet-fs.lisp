@@ -160,7 +160,7 @@
                                             a (type-of c))
                                     (finish-output))))
                               0))
-      ((eq op :%serial-byte) (%cabfs-write-byte a b c))
+      ((eq op :write-byte) (%cabfs-write-byte a b c))
       ((eq op :mkdir)  (handler-case (progn (funcall *cf-mkdir* *cabfs* a) 0)
                          (error () 0)))
       ((eq op :unlink) (progn (%cabfs-flush-all) (%cabfs-rcache-drop nil)
@@ -206,3 +206,36 @@
   (setq *cab-call* nil)
   (setq *cab-fds* nil)
   nil)
+
+;;; ---- cabinet on a block device ---------------------------------------------
+;;;
+;;; pagetree's SECTOR-DEVICE is a store on a fixed run of sectors, read and
+;;; written through two functions.  A RAM disk and an SD-card partition are the
+;;; same code path above those two functions, so a filesystem proven on the RAM
+;;; disk is the one that later lives on the card.
+
+(defun %pt-dev-sym (name) (intern name (find-package "PAGETREE.DEVICE")))
+
+(defun cabinet-ram-disk (sectors)
+  "A writable device over a zeroed SECTORS x 512-byte RAM disk."
+  (multiple-value-bind (rd wr)
+      (funcall (symbol-function (%pt-dev-sym "MAKE-RAM-SECTORS")) sectors)
+    (funcall (symbol-function (%pt-dev-sym "MAKE-SECTOR-DEVICE"))
+             :read-sectors rd :write-sectors wr :sectors sectors)))
+
+(defun cabinet-sd-device (partition)
+  "A READ-ONLY device over primary PARTITION (1-4) of the boot SD card
+   (net/sdhost.lisp: SD-PARTITIONS, SD-READ-SECTORS)."
+  (let ((p (assoc partition (funcall (symbol-function 'sd-partitions)))))
+    (unless p (error "sd: no partition ~D on the card" partition))
+    (funcall (symbol-function (%pt-dev-sym "MAKE-SECTOR-DEVICE"))
+             :read-sectors (symbol-function 'sd-read-sectors)
+             :write-sectors nil :base (third p) :sectors (fourth p))))
+
+(defun cabinet-mount-device (device &key format)
+  "Mount the cabinet filesystem on DEVICE (FORMAT T makes a fresh one there)
+   and route CL file I/O to it."
+  (%cabfs-resolve)
+  (cabinet-mount
+   (funcall (symbol-function (%cabfs-sym (if format "FORMAT-FS" "MOUNT")))
+            nil :device device)))

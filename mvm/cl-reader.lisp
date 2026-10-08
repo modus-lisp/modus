@@ -1732,6 +1732,14 @@
         ;; reference inside the form (self-cycle: `#1=(A B . #1#)`) reads
         ;; as the marker; after %read-internal completes we walk the
         ;; result and substitute the marker with the labelled object.
+        ;; Under *READ-SUPPRESS* labels are neither defined nor referenced
+        ;; (CLHS 2.4.8.15/16, 2.2 read-suppress): #N= reads its object and
+        ;; #N# reads as NIL.  They passed the ANSI READ-SUPPRESS.SHARP-SHARP
+        ;; tests only while labels leaked from one READ into the next.
+        ((and (= code 61) *read-suppress*)
+         (%read-internal stream t nil t))
+        ((and (= code 35) *read-suppress*)
+         nil)
         ((= code 61)  ; =
          (when (null arg) (%reader-error "missing label for #="))
          (let ((marker (cons :sharp-label arg)))

@@ -147,9 +147,25 @@
                               (logior (logand pa (- 0 #x200000)) #x9B))
                 1))))))
 
+;; A BAR BELOW 4 GB sits in the boot stub's identity map, where every page except the
+;; shared one carries the C-bit.  An access through an encrypted mapping is an MMIO #VC
+;; (NPF), which the handler does not implement, so the page must be remapped: each 2 MB
+;; leaf covering the BAR becomes uncached (PWT|PCD) and C-less.  The identity map's PDs
+;; are the four pages at 0x12000..0x15FFF (PD = pa>>30, entry = (pa>>21)&511).  A
+;; page that is not a 2 MB leaf is refused rather than split.
+(defun vnet-map-low-mmio (addr len)
+  (let ((pa (logand addr (- 0 #x200000))) (ok 1))
+    (dotimes (i 512 ok)
+      (when (< pa (+ addr len))
+        (let ((e (+ #x12000 (* 4096 (ash pa -30)) (* 8 (logand (ash pa -21) 511)))))
+          (if (zerop (logand (vnet-read64 e) #x80))
+              (setq ok 0)
+              (vnet-write64 e (logior pa #x9B))))
+        (setq pa (+ pa #x200000))))))
+
 (defun vnet-map-mmio (addr len)
   (if (<= (+ addr len) #x100000000)
-      1
+      (vnet-map-low-mmio addr len)
       ;; PML4[0] must point at the PDPT at 0x11000 (present).  Mask the low 12
       ;; bits: the CPU has set ACCESSED (0x20) in it by now, so it reads 0x11023.
       (if (not (= (logand (mem-ref #x10000 :u32) #xFFFFF001) #x11001))

@@ -36,7 +36,7 @@
     ("sha256-bsig1" 1 (x))
     ("sha256-lsig0" 1 (x))
     ("sha256-lsig1" 1 (x))
-    ("sha256-block" 3 (block bo h))
+    ("sha256-block" 4 (block bo h w))
     ("sha256" 1 (msg))
     ("chacha-qr" 5 (s a b c d))
     ("chacha-rotl7" 1 (x))

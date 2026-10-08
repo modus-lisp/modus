@@ -32,17 +32,17 @@
   (format t "reported_tcb ~A~%" (%hex rep #x180 8))
   (format t "measurement ~A~%" (%hex rep #x90 48))
   (let* ((rd (subseq rep #x50 (+ #x50 64)))
-         (want (sha512 hostkey))
+         (want (progn (sha512-init) (sha512 hostkey)))
          (ok (%same-bytes rd want)))
     (format t "report_data == SHA-512(hostkey): ~A~%" ok)
     ok))
 
 ;; STATUS 2026-10-08: the report parse is right (version, policy, VMPL, signer and
-;; measurement agree with Python on a real VPSBG report).  The REPORT_DATA check is
-;; NOT trustworthy yet: SHA-512 in this CLI returns a wrong digest for "abc" and for
-;; 32 bytes (under --eval, JIT on and off), and SHA-256 returns a wrong digest for ""
-;; and "abc".  Until that is fixed, this check reports NIL on a report Python says
-;; is bound.  Open bug, not a verifier bug.
+;; measurement agree with Python on a real VPSBG report).  SHA-256/SHA-512 in
+;; net/crypto.lisp read their round constants K from (e1000-state-base)+#x100/#x200,
+;; which only SHA256-INIT / SHA512-INIT write ("Call sha512-init first!").  Without
+;; that call K is all zero and the digest is SHA-with-K=0 (the 'wrong digests' once
+;; recorded here: sha512("abc") => cbc97649...).  Hence the SHA512-INIT above.
 ;; Driver (run with --load, then --eval):
 ;;   ./modus --load test/snp/verify-report.lisp \
 ;;     --eval '(snp-report-check (%read-file-bytes "REPORT.bin") (%hex-to-bytes "HOSTKEY_HEX"))'

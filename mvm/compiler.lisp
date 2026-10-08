@@ -20730,13 +20730,26 @@
 
 ;; --- Serial Console ---
 
+(defvar *write-char-serial-hook* nil
+  "When a symbol, (WRITE-CHAR-SERIAL c) compiles to a call to it -- a console
+   that mirrors the serial port (net/hdmi-console.lisp's %CONSOLE-WRITE-CHAR on
+   the Zero board build).  The hook's own body keeps the raw trap.  A build-time
+   setting: NIL everywhere but where a build sets it, so every other image is
+   unchanged.")
+
 (defun compile-write-char-serial (args env dest)
   "Compile (write-char-serial char-code) — write character to serial port.
    The argument is a fixnum containing the ASCII code.
-   Uses TRAP #x0300 with the value in V0."
-  (compile-form (car args) env +vreg-v0+)
-  (emit-ir :trap #x0300)
-  (emit-ir :li dest 0))
+   Uses TRAP #x0300 with the value in V0, or calls *WRITE-CHAR-SERIAL-HOOK*."
+  (let ((hook (and (boundp '*write-char-serial-hook*) *write-char-serial-hook*)))
+    (if (and hook
+             (not (and *current-function-name*
+                       (string= *current-function-name* (symbol-name hook)))))
+        (compile-form (list hook (car args)) env dest)
+        (progn
+          (compile-form (car args) env +vreg-v0+)
+          (emit-ir :trap #x0300)
+          (emit-ir :li dest 0)))))
 
 (defun compile-sys-exit (args env dest)
   "Compile (sys-exit code) — exit the process (Linux).

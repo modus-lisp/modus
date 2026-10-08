@@ -166,6 +166,15 @@
     (modus.mvm::check-parses p)
     (%rpi-file-text p)))
 
+(defun %rpi-hcon-font-text ()
+  "HCON-FONT-BYTES for net/hdmi-console.lisp: boot/boot-uefi-x64.lisp's 8x8
+   font (95 glyphs, one little-endian qword each), as 760 row bytes."
+  (let ((bytes nil))
+    (dolist (qw (symbol-value (find-symbol "*FONT-8X8-QWORDS*" :modus.mvm)))
+      (dotimes (i 8) (push (ldb (byte 8 (* 8 i)) qw) bytes)))
+    (assert (= (length bytes) 760))
+    (format nil "(defun hcon-font-bytes () '~S)" (nreverse bytes))))
+
 ;;; ============================================================
 ;;; ARCH SLOTS — bare-metal AArch64 (BCM2837 / BCM2710A1)
 ;;; ============================================================
@@ -387,7 +396,11 @@
     (if (and *cl-repl-rpi-p*
              (equal #+sbcl (sb-ext:posix-getenv "MODUS_NET_BUILD") "1"))
         (concatenate 'string "
-(defun %console-init () (hid-console-init))
+(defun %console-init ()
+  ;; The screen first, so everything after it (the USB-HID line, the banner)
+  ;; shows on it too.  A display failure must not cost the keyboard.
+  (handler-case (hcon-init) (t (c) nil))
+  (hid-console-init))
 (defun %console-read-char () (hid-console-read-char))
 "
           ;; The non-blocking serial check must poll the UART READ-CHAR-SERIAL
@@ -774,6 +787,10 @@
   (if *cl-repl-virt-p*
       *cl-repl-virt-kernel-prologue*
       "
+  ;; The HDMI console's ready word (net/hdmi-console.lisp) is in Device RAM,
+  ;; which survives a board reset: clear it before the first character, or the
+  ;; banner below is drawn into the previous boot's framebuffer.
+  (setf (mem-ref #x111F0800 :u32) 0)
   ;; Banner first: proves native code is executing and the UART is alive
   ;; before any runtime init runs.
   (write-string-serial \"MODUS-CL\")
@@ -1287,8 +1304,19 @@
             ;; (dwc2-split) and the HID driver, which overrides lib/serial-repl's
             ;; %console-init / %console-read-char seams (this text is spliced
             ;; after it), so the REPL reads serial OR the keyboard.
+            ;; HDMI text console: every WRITE-CHAR-SERIAL also draws here
+            ;; (the compiler hook is set below for this build).  Needs
+            ;; hdmi-fb.lisp's mailbox helpers and the generated 8x8 font.
+            (%rpi-hcon-font-text)                (string #\Newline)
+            (%rpi-net-text "hdmi-console.lisp")  (string #\Newline)
             (%rpi-net-text "dwc2-split.lisp")    (string #\Newline)
             (%rpi-net-text "usb-hid-split.lisp") (string #\Newline))))))
+
+;; The Zero board net build mirrors the serial console to HDMI: every
+;; WRITE-CHAR-SERIAL compiled into the image calls net/hdmi-console.lisp's
+;; %CONSOLE-WRITE-CHAR (mvm/compiler.lisp *WRITE-CHAR-SERIAL-HOOK*).
+(when (and *cl-repl-rpi-p* *net-build-p*)
+  (setq modus.mvm::*write-char-serial-hook* 'modus.mvm::%console-write-char))
 
 (defvar *net-source*
   (if *net-build-p*

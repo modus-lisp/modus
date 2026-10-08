@@ -95,7 +95,50 @@
          (sig-bytes (%sv-slice der (+ (second sig-k) 1) (third sig-k)))
          (key-bytes (%sv-slice der (+ (second spki-key-bits) 1) (third spki-key-bits)))
          (alg-oid (%sv-oid-bytes der (first (%sv-children der (second spki-alg) (third spki-alg))))))
-    (list tbs-bytes sig-alg-bytes sig-bytes alg-oid key-bytes)))
+    (let* ((validity (nth (if has-version 4 3) tbs-inner))
+           (vkids (%sv-children der (second validity) (third validity)))
+           (not-before (%sv-time der (first vkids)))
+           (not-after (%sv-time der (second vkids)))
+           (ext-k (car (last tbs-inner)))
+           (exts (if (= (first ext-k) #xa3) (%sv-extensions der ext-k) nil)))
+      (list tbs-bytes sig-alg-bytes sig-bytes alg-oid key-bytes not-before not-after exts))))
+
+;;; ---- validity: UTCTime (0x17) and GeneralizedTime (0x18) to Unix seconds ----
+(defun %sv-days-from-civil (y m d)
+  (let* ((y (if (<= m 2) (- y 1) y))
+         (era (floor y 400))
+         (yoe (- y (* era 400)))
+         (doy (+ (floor (+ (* 153 (if (> m 2) (- m 3) (+ m 9))) 2) 5) (- d 1)))
+         (doe (+ (* yoe 365) (floor yoe 4) (- (floor yoe 100)) doy)))
+    (+ (* era 146097) doe -719468)))
+(defun %sv-time (v tlv)
+  "Unix seconds for a UTCTime or GeneralizedTime element."
+  (let* ((tag (first tlv)) (s (second tlv))
+         (txt (map 'string #'code-char (%sv-slice v s (third tlv))))
+         (num (lambda (a b) (parse-integer txt :start a :end b)))
+         (gen (= tag #x18))
+         (year (if gen (funcall num 0 4)
+                   (let ((yy (funcall num 0 2))) (if (< yy 50) (+ 2000 yy) (+ 1900 yy)))))
+         (o (if gen 4 2)))
+    (+ (* 86400 (%sv-days-from-civil year (funcall num o (+ o 2)) (funcall num (+ o 2) (+ o 4))))
+       (* 3600 (funcall num (+ o 4) (+ o 6)))
+       (* 60 (funcall num (+ o 6) (+ o 8)))
+       (funcall num (+ o 8) (+ o 10)))))
+
+;;; ---- extensions: alist of (oid-bytes . value-bytes), value = the OCTET STRING content ----
+(defun %sv-extensions (v ext-k)
+  (let* ((seqs (%sv-children v (second ext-k) (third ext-k)))
+         (exts (%sv-children v (second (first seqs)) (third (first seqs))))
+         (out nil))
+    (dolist (e exts (nreverse out))
+      (let* ((parts (%sv-children v (second e) (third e)))
+             (oid (%sv-oid-bytes v (first parts)))
+             (oct (car (last parts))))
+        (push (cons oid (%sv-slice v (second oct) (third oct))) out)))))
+(defun %sv-ext (exts oid-list)
+  "The value of the extension whose OID is OID-LIST (a list of byte values), or NIL."
+  (let ((want (coerce oid-list '(vector (unsigned-byte 8)))))
+    (cdr (assoc-if (lambda (k) (%sv-same k want)) exts))))
 
 (defun %sv-rsa-key (key-bytes)
   "The RSAPublicKey inside a BIT STRING payload: (n e)."
@@ -191,6 +234,36 @@
          (pt (%sv-ec-add (%sv-ec-mul u1 (list +gx384+ +gy384+)) (%sv-ec-mul u2 (list qx qy)))))
     (and pt (= (mod (first pt) +n384+) r))))
 
+;;; ---- the report's own fields against the certificates and the policy ----
+(defparameter +sv-oid-hwid+ (list #x2b #x06 #x01 #x04 #x01 #x9c #x78 #x01 #x04))
+(defparameter +sv-oid-tcb+
+  (list (cons (list #x2b #x06 #x01 #x04 #x01 #x9c #x78 #x01 #x03 #x01) #x180)      ; bootloader SPL
+        (cons (list #x2b #x06 #x01 #x04 #x01 #x9c #x78 #x01 #x03 #x02) #x181)      ; TEE SPL
+        (cons (list #x2b #x06 #x01 #x04 #x01 #x9c #x78 #x01 #x03 #x03) #x186)      ; SNP SPL
+        (cons (list #x2b #x06 #x01 #x04 #x01 #x9c #x78 #x01 #x03 #x08) #x187)))    ; microcode SPL
+(defun %sv-ext-int (value)
+  "The INTEGER inside an extension's OCTET STRING content (a DER INTEGER TLV)."
+  (let ((x (%sv-tlv value 0))) (%sv-int-be value (second x) (third x))))
+(defun %sv-check-binding (rep vcek)
+  "T when the report's chip ID (if the report has one), TCB and debug policy agree with VCEK."
+  (let* ((exts (nth 7 vcek))
+         (chip (%sv-slice rep #x1a0 #x1e0))
+         (chip-ok (or (every #'zerop chip)          ; VLEK reports carry no chip ID
+                      (let ((h (%sv-ext exts +sv-oid-hwid+))) (and h (%sv-same h chip)))))
+         (tcb-ok (every (lambda (pair)
+                          (let ((v (%sv-ext exts (car pair))))
+                            (and v (= (%sv-ext-int v) (aref rep (cdr pair))))))
+                        +sv-oid-tcb+))
+         (policy (%sv-int-le rep 8 16))
+         (debug-off (not (logbitp 19 policy))))
+    (and (%sv-check "chip_id matches the certificate (or report is VLEK-scoped)" chip-ok)
+         (%sv-check "reported TCB matches the certificate extensions" tcb-ok)
+         (%sv-check "policy: debug disabled" debug-off))))
+(defun %sv-check-time (cert label)
+  (let* ((now (- (get-universal-time) 2208988800))
+         (ok (and (<= (nth 5 cert) now) (<= now (nth 6 cert)))))
+    (%sv-check (concatenate 'string label " is within its validity period") ok)))
+
 ;;; ---- the whole chain ----
 (defparameter +sv-rsassa-pss-oid+ (list #x2a #x86 #x48 #x86 #xf7 #x0d #x01 #x01 #x0a))
 (defun %sv-is-pss (alg-bytes)
@@ -225,4 +298,6 @@
            (digest (%sv-sha384 (%sv-slice rep 0 #x2a0)))
            (sig-ok (and ec-ok (%sv-ecdsa-verify qx qy digest r s))))
       (setq ok (and (%sv-check "report signed by the VCEK (ECDSA P-384)" sig-ok) ok)))
+    (setq ok (and (%sv-check-time ark "ARK") (%sv-check-time ask "ASK") (%sv-check-time vcek "VCEK/VLEK") ok))
+    (setq ok (and (%sv-check-binding rep vcek) ok))
     ok))

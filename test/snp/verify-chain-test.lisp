@@ -28,3 +28,9 @@
          (good (snp-verify-report rep ark asvk vlek)))
     (format t "EC2 VLEK REPORT: ~A~%" (if good "PASS" "FAIL"))
     good))
+
+;; The fast ECDSA path must agree with the affine reference.
+(defun vc-selftest-fast-ecdsa ()
+  (let ((ok (%sv-jac-selftest)))
+    (format t "FAST ECDSA agrees with the affine reference: ~A~%" (if ok "PASS" "FAIL"))
+    ok))

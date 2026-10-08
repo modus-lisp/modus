@@ -845,6 +845,33 @@
               (- v (ash 1 sh))
               v)))))
 
+(defun %fs-read-u8-bulk (stream seq start end)
+  "READ-SEQUENCE's bulk path: a type-9 file stream of single unsigned bytes into a packed
+   (unsigned-byte 8) SEQ.  Drains the stream's buffer, then -- for a cabinet file -- copies the
+   rest straight out of the file's bytes with one REPLACE.  Returns the index reached; the
+   caller's element loop carries on from there (EOF, or a file that is not a cabinet's).
+
+   READ-SEQUENCE went element by element through READ-BYTE's whole path (stream type,
+   element spec, buffer refill every 4096 bytes): a 1.8 MB clip took 80 s to read on the Pi
+   Zero, which is how long the media player sat before showing a window."
+  (let ((i start))
+    (loop while (and (< i end) (< (%fs-bpos stream) (%fs-blen stream)))
+          do (setf (aref seq i) (%prim-aref (%fs-buf stream) (%fs-bpos stream)))
+             (%fs-set-bpos stream (+ (%fs-bpos stream) 1))
+             (setq i (+ i 1)))
+    (%fs-set-pos stream (+ (%fs-pos stream) (- i start)))
+    (let ((fd (%fs-fd stream)))
+      (when (and (< i end) (>= fd 0) (%cab-fd-p fd))
+        (let* ((path (%cab-fd-path fd)) (pos (%cab-fd-pos fd))
+               (bytes (%cab :read path))
+               (n (min (- end i) (max 0 (- (length bytes) pos)))))
+          (when (> n 0)
+            (replace seq bytes :start1 i :start2 pos :end2 (+ pos n))
+            (%cab-fd-set-pos fd (+ pos n))
+            (%fs-set-pos stream (+ (%fs-pos stream) n))
+            (setq i (+ i n))))))
+    i))
+
 (defun %fs-read-byte-raw (stream eof-error-p eof-value)
   "Read one byte directly from a type-9 file stream's buffer."
   (let ((fd (%fs-fd stream)))

@@ -178,6 +178,12 @@
 ;; SHA-256 hash of byte array msg. Returns 32-byte hash.
 ;; Call sha256-init first!
 (defun sha256 (msg)
+  ;; K lives in memory, not in code: a caller that skipped SHA256-INIT used zero
+  ;; constants and got a silently wrong digest (found 2026-10-08).  Initialise on
+  ;; demand: compare K[0] against its known value, not against zero, because on
+  ;; bare metal this RAM can hold garbage.
+  (unless (= (mem-ref (+ (e1000-state-base) #x100) :u32) #x428a2f98)
+    (sha256-init))
   (let ((msg-len (array-length msg)))
     ;; Compute padded length
     (let ((r (mod (+ msg-len 9) 64)))
@@ -1300,6 +1306,9 @@
 ;; SHA-512 hash of byte array msg. Returns 64-byte hash array.
 ;; Call sha512-init first!
 (defun sha512 (msg)
+  ;; Same as SHA256: K is in memory; initialise on demand (compare to K[0]'s hi word).
+  (unless (= (mem-ref (+ (e1000-state-base) #x200) :u32) #x428a2f98)
+    (sha512-init))
   (let ((msg-len (array-length msg)))
     (let ((r (mod (+ msg-len 17) 128)))
       (let ((total (+ msg-len 17 (if (zerop r) 0 (- 128 r)))))

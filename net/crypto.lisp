@@ -177,6 +177,9 @@
 
 ;; SHA-256 hash of byte array msg. Returns 32-byte hash.
 ;; Call sha256-init first!
+;; BLOCK-WISE: full 64-byte blocks are hashed straight out of MSG; only the final
+;; block (one, or two when the tail plus 0x80 plus the 8-byte length needs it) is built
+;; here.  Memory is O(1) in the message length, so the heap no longer bounds the input.
 (defun sha256 (msg)
   ;; K lives in memory, not in code: a caller that skipped SHA256-INIT used zero
   ;; constants and got a silently wrong digest (found 2026-10-08).  Initialise on
@@ -184,51 +187,43 @@
   ;; bare metal this RAM can hold garbage.
   (unless (= (mem-ref (+ (e1000-state-base) #x100) :u32) #x428a2f98)
     (sha256-init))
-  (let ((msg-len (array-length msg)))
-    ;; Compute padded length
-    (let ((r (mod (+ msg-len 9) 64)))
-      (let ((total (+ msg-len 9 (if (zerop r) 0 (- 64 r)))))
-        ;; Create padded message
-        (let ((padded (make-array total)))
-          ;; Zero padding (make-array doesn't zero on real hardware)
-          (dotimes (i total) (aset padded i 0))
-          ;; Copy message
-          (dotimes (i msg-len)
-            (aset padded i (aref msg i)))
-          ;; Append 0x80
-          (aset padded msg-len #x80)
-          ;; Append the bit length (see below)
-          ;; The FULL bit length, big-endian: bits = msg-len*8 as a 64-bit value,
-          ;; low word at total-4..total-1, high word (msg-len>>29) at total-8..total-5.
-          ;; (The old code wrote only the low word, so messages of 512 MB or more
-          ;; hashed to the wrong digest.)  Constant shifts only: no variable ASH.
-          (let ((bits (* msg-len 8)) (hi (ash msg-len -29)))
-            (aset padded (- total 4) (logand (ash bits -24) #xFF))
-            (aset padded (- total 3) (logand (ash bits -16) #xFF))
-            (aset padded (- total 2) (logand (ash bits -8) #xFF))
-            (aset padded (- total 1) (logand bits #xFF))
-            (aset padded (- total 8) (logand (ash hi -24) #xFF))
-            (aset padded (- total 7) (logand (ash hi -16) #xFF))
-            (aset padded (- total 6) (logand (ash hi -8) #xFF))
-            (aset padded (- total 5) (logand hi #xFF)))
-          ;; Initialize hash state
-          (let ((h (make-array 32)))
-            (buf-write-u32 h 0 #x6a09e667)
-            (buf-write-u32 h 4 #xbb67ae85)
-            (buf-write-u32 h 8 #x3c6ef372)
-            (buf-write-u32 h 12 #xa54ff53a)
-            (buf-write-u32 h 16 #x510e527f)
-            (buf-write-u32 h 20 #x9b05688c)
-            (buf-write-u32 h 24 #x1f83d9ab)
-            (buf-write-u32 h 28 #x5be0cd19)
-            ;; Process each 64-byte block
-            (let ((offset 0))
-              (loop
-                (when (not (< offset total)) (return ()))
-                (sha256-block padded offset h)
-                (setq offset (+ offset 64))))
-            ;; h is already the hash in big-endian byte order
-            h))))))
+  (let* ((msg-len (array-length msg))
+         (full (* 64 (floor msg-len 64)))
+         (rem (- msg-len full))
+         (tlen (if (< rem 56) 64 128))
+         (tail (make-array tlen))
+         (h (make-array 32)))
+    (buf-write-u32 h 0 #x6a09e667)
+    (buf-write-u32 h 4 #xbb67ae85)
+    (buf-write-u32 h 8 #x3c6ef372)
+    (buf-write-u32 h 12 #xa54ff53a)
+    (buf-write-u32 h 16 #x510e527f)
+    (buf-write-u32 h 20 #x9b05688c)
+    (buf-write-u32 h 24 #x1f83d9ab)
+    (buf-write-u32 h 28 #x5be0cd19)
+    ;; Full blocks, read directly from the message.
+    (let ((offset 0))
+      (loop
+        (when (not (< offset full)) (return ()))
+        (sha256-block msg offset h)
+        (setq offset (+ offset 64))))
+    ;; The final block(s): remaining bytes, 0x80, zeros, then the 64-bit bit length
+    ;; big-endian (low word at tlen-4..tlen-1, high word msg-len>>29 at tlen-8..tlen-5).
+    (dotimes (i tlen) (aset tail i 0))
+    (dotimes (i rem) (aset tail i (aref msg (+ full i))))
+    (aset tail rem #x80)
+    (let ((bits (* msg-len 8)) (hi (ash msg-len -29)))
+      (aset tail (- tlen 4) (logand (ash bits -24) #xFF))
+      (aset tail (- tlen 3) (logand (ash bits -16) #xFF))
+      (aset tail (- tlen 2) (logand (ash bits -8) #xFF))
+      (aset tail (- tlen 1) (logand bits #xFF))
+      (aset tail (- tlen 8) (logand (ash hi -24) #xFF))
+      (aset tail (- tlen 7) (logand (ash hi -16) #xFF))
+      (aset tail (- tlen 6) (logand (ash hi -8) #xFF))
+      (aset tail (- tlen 5) (logand hi #xFF)))
+    (sha256-block tail 0 h)
+    (when (= tlen 128) (sha256-block tail 64 h))
+    h))
 
 ;; Test: hash empty message, print first 4 bytes
 ;; Expected: E3B0C442...
@@ -1313,50 +1308,48 @@
 
 ;; SHA-512 hash of byte array msg. Returns 64-byte hash array.
 ;; Call sha512-init first!
+;; BLOCK-WISE, as SHA256: full 128-byte blocks from MSG, the final one or two built here.
 (defun sha512 (msg)
-  ;; Same as SHA256: K is in memory; initialise on demand (compare to K[0]'s hi word).
+  ;; K in memory, initialised on demand, as SHA256 (see above).
   (unless (= (mem-ref (+ (e1000-state-base) #x200) :u32) #x428a2f98)
     (sha512-init))
-  (let ((msg-len (array-length msg)))
-    (let ((r (mod (+ msg-len 17) 128)))
-      (let ((total (+ msg-len 17 (if (zerop r) 0 (- 128 r)))))
-        (let ((padded (make-array total)))
-          ;; Zero padding (make-array doesn't zero on real hardware)
-          (dotimes (i total) (aset padded i 0))
-          (dotimes (i msg-len)
-            (aset padded i (aref msg i)))
-          (aset padded msg-len #x80)
-          ;; Append the bit length as a 128-bit big-endian field (see below)
-          ;; The FULL bit length, big-endian: bits = msg-len*8 as a 64-bit value,
-          ;; low word at total-4..total-1, high word (msg-len>>29) at total-8..total-5.
-          ;; (The old code wrote only the low word, so messages of 512 MB or more
-          ;; hashed to the wrong digest.)  Constant shifts only: no variable ASH.
-          (let ((bits (* msg-len 8)) (hi (ash msg-len -29)))
-            (aset padded (- total 4) (logand (ash bits -24) #xFF))
-            (aset padded (- total 3) (logand (ash bits -16) #xFF))
-            (aset padded (- total 2) (logand (ash bits -8) #xFF))
-            (aset padded (- total 1) (logand bits #xFF))
-            (aset padded (- total 8) (logand (ash hi -24) #xFF))
-            (aset padded (- total 7) (logand (ash hi -16) #xFF))
-            (aset padded (- total 6) (logand (ash hi -8) #xFF))
-            (aset padded (- total 5) (logand hi #xFF)))
-          ;; Initialize hash state (8 u64 values in big-endian byte order)
-          (let ((h (make-array 64)))
-            (buf-write-u32 h 0 #x6a09e667) (buf-write-u32 h 4 #xf3bcc908)
-            (buf-write-u32 h 8 #xbb67ae85) (buf-write-u32 h 12 #x84caa73b)
-            (buf-write-u32 h 16 #x3c6ef372) (buf-write-u32 h 20 #xfe94f82b)
-            (buf-write-u32 h 24 #xa54ff53a) (buf-write-u32 h 28 #x5f1d36f1)
-            (buf-write-u32 h 32 #x510e527f) (buf-write-u32 h 36 #xade682d1)
-            (buf-write-u32 h 40 #x9b05688c) (buf-write-u32 h 44 #x2b3e6c1f)
-            (buf-write-u32 h 48 #x1f83d9ab) (buf-write-u32 h 52 #xfb41bd6b)
-            (buf-write-u32 h 56 #x5be0cd19) (buf-write-u32 h 60 #x137e2179)
-            (let ((w (make-array 640)))
-              (let ((offset 0))
-                (loop
-                  (when (not (< offset total)) (return ()))
-                  (sha512-block padded offset h w)
-                  (setq offset (+ offset 128))))
-              h)))))))
+  (let* ((msg-len (array-length msg))
+         (full (* 128 (floor msg-len 128)))
+         (rem (- msg-len full))
+         (tlen (if (< rem 112) 128 256))
+         (tail (make-array tlen))
+         (h (make-array 64))
+         (w (make-array 640)))
+    (buf-write-u32 h 0 #x6a09e667) (buf-write-u32 h 4 #xf3bcc908)
+    (buf-write-u32 h 8 #xbb67ae85) (buf-write-u32 h 12 #x84caa73b)
+    (buf-write-u32 h 16 #x3c6ef372) (buf-write-u32 h 20 #xfe94f82b)
+    (buf-write-u32 h 24 #xa54ff53a) (buf-write-u32 h 28 #x5f1d36f1)
+    (buf-write-u32 h 32 #x510e527f) (buf-write-u32 h 36 #xade682d1)
+    (buf-write-u32 h 40 #x9b05688c) (buf-write-u32 h 44 #x2b3e6c1f)
+    (buf-write-u32 h 48 #x1f83d9ab) (buf-write-u32 h 52 #xfb41bd6b)
+    (buf-write-u32 h 56 #x5be0cd19) (buf-write-u32 h 60 #x137e2179)
+    (let ((offset 0))
+      (loop
+        (when (not (< offset full)) (return ()))
+        (sha512-block msg offset h w)
+        (setq offset (+ offset 128))))
+    ;; The final block(s).  The 128-bit length field: its upper 64 bits stay zero
+    ;; (from the zero fill); its lower 64 bits are the bit length, as in SHA256.
+    (dotimes (i tlen) (aset tail i 0))
+    (dotimes (i rem) (aset tail i (aref msg (+ full i))))
+    (aset tail rem #x80)
+    (let ((bits (* msg-len 8)) (hi (ash msg-len -29)))
+      (aset tail (- tlen 4) (logand (ash bits -24) #xFF))
+      (aset tail (- tlen 3) (logand (ash bits -16) #xFF))
+      (aset tail (- tlen 2) (logand (ash bits -8) #xFF))
+      (aset tail (- tlen 1) (logand bits #xFF))
+      (aset tail (- tlen 8) (logand (ash hi -24) #xFF))
+      (aset tail (- tlen 7) (logand (ash hi -16) #xFF))
+      (aset tail (- tlen 6) (logand (ash hi -8) #xFF))
+      (aset tail (- tlen 5) (logand hi #xFF)))
+    (sha512-block tail 0 h w)
+    (when (= tlen 256) (sha512-block tail 128 h w))
+    h))
 
 ;; Test: SHA-512 of empty message
 ;; Expected first 4 bytes: CF83E135

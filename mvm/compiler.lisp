@@ -14626,6 +14626,44 @@
        0.0)
       (t (%loop-acc-init-value kind)))))
 
+;; One FOR group's forms for the first pass (FIRSTP) or a later one, in clause
+;; order, and the temp bindings it needs.  A clause record is (AND-P TESTS
+;; ASSIGNS STEPS UFIRST UNEXT), U* being a user FOR = [THEN] form as
+;; (VAR . FORM).  A lone clause steps, takes its user form, tests and assigns;
+;; an AND group (CLHS 6.1.2.1) evaluates every user form into a temp before any
+;; of its variables change, then steps, sets, tests and assigns.
+(defun %loop-emit-group (grp firstp)
+  (if (null (cdr grp))
+      (let* ((c (car grp)) (u (if firstp (nth 4 c) (nth 5 c))))
+        (values (append (if firstp nil (nth 3 c))
+                        (if u (list `(setq ,(car u) ,(cdr u))) nil)
+                        (nth 1 c)
+                        (nth 2 c))
+                nil))
+      (let ((temps nil) (sets nil) (binds nil) (steps nil) (tests nil) (assigns nil))
+        (dolist (c grp)
+          (let ((u (if firstp (nth 4 c) (nth 5 c))))
+            (when u
+              (let ((tmp (%mvm-gensym "ANDSTEP")))
+                (push (list tmp nil) binds)
+                (push `(setq ,tmp ,(cdr u)) temps)
+                (push `(setq ,(car u) ,tmp) sets))))
+          (unless firstp (setq steps (append steps (nth 3 c))))
+          (setq tests (append tests (nth 1 c))
+                assigns (append assigns (nth 2 c))))
+        (values (append (nreverse temps) steps (nreverse sets) tests assigns)
+                binds))))
+
+;; FN over the top-level forms of a LOOP body, and over the forms inside its
+;; first-pass block `(if FIRSTV (progn ...))`, where the first pass's exhaustion
+;; tests live (see GENERATE-LOOP-CODE).
+(defun %loop-map-top (firstv fn forms)
+  (mapcar (lambda (f)
+            (if (and firstv (consp f) (eq (car f) 'if) (eq (cadr f) firstv))
+                `(if ,firstv (progn ,@(mapcar fn (cdr (caddr f)))))
+                (funcall fn f)))
+          forms))
+
 (defun generate-loop-code (state)
   "Generate Lisp code from a parsed loop-state."
   (let* ((iters (loop-state-iterations state))
@@ -14739,9 +14777,9 @@
          (anon-acc (when anon-acc-idx (nth anon-acc-idx accs)))
          (anon-acc-var (when anon-acc-idx (nth anon-acc-idx acc-vars)))
          (bindings nil)
-         (init-stmts nil)
-         (test-forms nil)
-         (step-stmts nil))
+         (pass-first nil)               ; the first-pass block (see below)
+         (pass-next nil)                ; later passes, in clause order
+         (firstv nil))
 
     ;; Bind conditional-INTO accumulator vars (independent of accs list).
     (let ((tails nil))
@@ -14786,11 +14824,16 @@
             (when (%loop-acc-list-kind-p (car acc))
               (push (list (%loop-tail-var av) nil) bindings))))))
 
-    ;; Process iterations.  GRP-START is the STEP-STMTS length at the head of
-    ;; the current AND group, where an AND-linked THEN form is evaluated.
-    (let ((grp-start 0))
+    ;; Process iterations.  Each clause fills its OWN test / per-iteration
+    ;; assignment / step lists (the names are rebound per clause below), plus
+    ;; C-UFIRST / C-UNEXT, a user FOR = [THEN] expression as (VAR . FORM) for
+    ;; the first and the later passes.  The clauses are then emitted IN CLAUSE
+    ;; ORDER (CLHS 6.1.2.1): on each pass a clause steps, tests and assigns
+    ;; before the next clause does -- see the emission after the DOLIST.
+    (let ((clauses nil))
     (dolist (iter iters)
-      (unless (loop-iter-and-p iter) (setq grp-start (length step-stmts)))
+     (let ((test-forms nil) (init-stmts nil) (step-stmts nil)
+           (c-ufirst nil) (c-unext nil))
       (ecase (loop-iter-kind iter)
         (:from
          (let ((var (loop-iter-var iter))
@@ -14870,75 +14913,15 @@
            (push `(setq ,idx (1+ ,idx)) step-stmts)))
 
         (:general
+         ;; FOR var = INIT [THEN STEP].  Assigned at the clause's place in the
+         ;; pass, never as a LET* binding: sequential clauses see the ones
+         ;; before them already stepped (cl-ppcre's `for quant = (quant lexer)
+         ;; for seq = quant then (cond ...)` read a NIL QUANT from a binding).
+         ;; Without THEN, INIT is re-evaluated on every pass.
          (let ((var (loop-iter-var iter)))
-           (if (eq (loop-iter-init-form iter) (loop-iter-step-form iter))
-               ;; No THEN clause: re-evaluate each iteration in init-stmts.
-               ;; This ensures correct ordering when referencing other loop
-               ;; variables (e.g., "for entry in list for name = (first entry)").
-               (progn
-                 (push (list var nil) bindings)
-                 (push `(setq ,var ,(loop-iter-init-form iter)) init-stmts))
-               ;; Has THEN clause: the INIT form runs on the FIRST iteration
-               ;; only, the STEP form at the end of every iteration.
-               ;;
-               ;; The init form MUST be evaluated in INIT-STMTS, not as the
-               ;; LET* binding it used to be.  Sequential FOR clauses see each
-               ;; other's values within one iteration (CLHS 6.1.2.1), and a
-               ;; no-THEN `for q = expr` sibling assigns Q in INIT-STMTS — so a
-               ;; LET* binding for S was evaluated BEFORE Q was ever set and
-               ;; `for q = … for s = q then …` initialised S to NIL.  That is
-               ;; cl-ppcre's parser verbatim:
-               ;;   (loop for quant = (quant lexer)
-               ;;         for seq = quant then (cond …)
-               ;;         while (start-of-subexpr-p lexer)
-               ;;         finally (return seq))
-               ;; A one-token regex takes exactly one iteration, so SEQ never
-               ;; got past its NIL binding, PARSE-STRING answered :VOID for
-               ;; every pattern, and every scanner matched the empty string at
-               ;; position 0 (SCAN "b+" "abbbc" → 0 instead of 1 4 #() #()).
-               ;;
-               ;; INIT-STMTS is safe ground: WHILE/UNTIL land in
-               ;; PRE-BODY-TESTS, which the body assembly places AFTER
-               ;; init-stmts, and TEST-FORMS only ever holds an iterator's own
-               ;; exhaustion test (:IN/:ON/:ACROSS/:FROM/:REPEAT), which can
-               ;; never reference a THEN variable.
-               (let ((firstv (%mvm-gensym "FORTHEN-FIRST")))
-                 (push (list var nil) bindings)
-                 (push (list firstv t) bindings)
-                 (if (loop-iter-and-p iter)
-                     (push `(if ,firstv
-                                (progn (setq ,var ,(loop-iter-init-form iter))
-                                       (setq ,firstv nil)))
-                           init-stmts)
-                     ;; SEQUENTIAL FOR (no AND): the STEP runs here too, in
-                     ;; clause order, on every iteration after the first -- not
-                     ;; at the end of the previous one.  A no-THEN sibling
-                     ;; before it (`for q = (quant lexer)`) is re-assigned in
-                     ;; INIT-STMTS, so a STEP-STMTS step read the OLD q: in
-                     ;; cl-ppcre's `for seq = quant then (cond … seq quant …)`
-                     ;; every regex parsed one token behind ("abc" -> "aab").
-                     ;; CLHS 6.1.2.1: sequential for-as clauses step in order,
-                     ;; each seeing the ones before it already stepped.
-                     (push `(if ,firstv
-                                (progn (setq ,var ,(loop-iter-init-form iter))
-                                       (setq ,firstv nil))
-                                (setq ,var ,(loop-iter-step-form iter)))
-                           init-stmts))
-                 (if (loop-iter-and-p iter)
-                     ;; FOR ... AND v = i THEN s: S sees the group's OLD
-                     ;; values, so evaluate it into a temp BEFORE the group's
-                     ;; first step (STEP-STMTS is reversed: that is position
-                     ;; LEN - GRP-START from the front), assign after.
-                     (let* ((tmp (%mvm-gensym "ANDSTEP"))
-                            (n (- (length step-stmts) grp-start)))
-                       (push (list tmp nil) bindings)
-                       (setq step-stmts
-                             (append (subseq step-stmts 0 n)
-                                     (list `(setq ,tmp ,(loop-iter-step-form iter)))
-                                     (nthcdr n step-stmts)))
-                       (push `(setq ,var ,tmp) step-stmts))
-                     ;; (sequential: stepped in INIT-STMTS above)
-                     nil)))))
+           (push (list var nil) bindings)
+           (setq c-ufirst (cons var (loop-iter-init-form iter))
+                 c-unext (cons var (loop-iter-step-form iter)))))
 
         (:while
          (push `(if (null ,(loop-iter-init-form iter)) (return-from :%loop-exit nil)) test-forms))
@@ -15025,7 +15008,43 @@
            (push (list var nil) bindings)
            (push `(if (null ,lst) (return-from :%loop-exit nil)) test-forms)
            (push `(setq ,var (car ,lst)) init-stmts)
-           (push `(setq ,lst (cdr ,lst)) step-stmts))))))
+           (push `(setq ,lst (cdr ,lst)) step-stmts))))
+      (push (list (loop-iter-and-p iter) (nreverse test-forms)
+                  (nreverse init-stmts) (nreverse step-stmts) c-ufirst c-unext)
+            clauses)))
+    ;; Emit the clauses in order, as MIT LOOP does.  The FIRST pass runs, per
+    ;; clause, its user INIT, its exhaustion test and its assignment, in one
+    ;; block guarded by FIRSTV at the top of the body; every LATER pass runs,
+    ;; per clause, its step, user THEN, test and assignment at the bottom.  So
+    ;; a test fires after the clauses before it have stepped (flexi-streams'
+    ;; `for r = s then (+ (ash r 6) ...) repeat n for o = (read-byte)` stopped
+    ;; one step short when every test ran first) and a step after them (a THEN
+    ;; reading a LATER FOR-FROM variable saw it already stepped).  An AND group
+    ;; steps in parallel: its user forms are evaluated into temps before any of
+    ;; its variables change.  Exits stay top-level forms or sit in the FIRSTV
+    ;; block, where %LOOP-MAP-TOP finds them for the ALWAYS / %NAT rewrites.
+    (let ((groups nil))
+      (dolist (c (nreverse clauses))
+        (if (and (first c) groups)
+            (push c (car groups))
+            (push (list c) groups)))
+      (setq groups (nreverse (mapcar (function reverse) groups)))
+      ;; APPEND, not MAPCAN: a group's lists share each clause's own (the
+      ;; first and later passes hold the same test forms), and splicing them
+      ;; destructively made the body circular.
+      (let ((top nil) (bot nil))
+        (dolist (g groups)
+          (multiple-value-bind (forms temps) (%loop-emit-group g t)
+            (setq top (append top forms))
+            (dolist (tb temps) (push tb bindings)))
+          (multiple-value-bind (forms temps) (%loop-emit-group g nil)
+            (setq bot (append bot forms))
+            (dolist (tb temps) (push tb bindings))))
+        (when top
+          (setq firstv (%mvm-gensym "FIRSTPASS"))
+          (push (list firstv t) bindings)
+          (setq pass-first (list `(if ,firstv (progn (setq ,firstv nil) ,@top)))))
+        (setq pass-next bot))))
 
     ;; Build accumulation body — one chunk per accumulator.
     (let ((acc-body nil)
@@ -15094,8 +15113,7 @@
       ;;   anon-acc-var or nil)
       (let* ((pre-body-tests (loop-state-pre-body-tests state))
              (post-body-tests (loop-state-post-body-tests state))
-             (loop-body (append (nreverse test-forms)
-                                (nreverse init-stmts)
+             (loop-body (append pass-first
                                 ;; WHILE/UNTIL parsed BEFORE body, here
                                 ;; (post-init pre-body) so iter vars are
                                 ;; bound.
@@ -15114,7 +15132,7 @@
                                   (append (nreverse out) chunks))
                                 ;; WHILE/UNTIL parsed AFTER body, here.
                                 post-body-tests
-                                (nreverse step-stmts)))
+                                pass-next))
              (inner (if block-name
                         `(loop (%loop-nonil) ,@loop-body)
                         `(loop ,@loop-body)))
@@ -15129,7 +15147,7 @@
              ;; final (return nil) to (return t).
              (final-test-forms
                (if has-always
-                   (mapcar (lambda (tf)
+                   (%loop-map-top firstv (lambda (tf)
                              (cond
                                ((and (consp tf) (eq (car tf) 'if)
                                      (equal (caddr tf) '(return-from :%loop-exit nil)))
@@ -15150,7 +15168,7 @@
              (%nat-var (%mvm-gensym "NAT"))
              (%bv-var (%mvm-gensym "BV"))
              (test-forms-with-nat
-               (mapcar
+               (%loop-map-top firstv
                 (lambda (tf)
                   (cond
                     ((and (consp tf) (eq (car tf) 'if)

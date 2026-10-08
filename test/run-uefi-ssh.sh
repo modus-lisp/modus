@@ -4,19 +4,27 @@
 # from the serial REPL, and evaluate forms over SSH from the host (OpenSSH).
 #
 #   test/run-uefi-ssh.sh IMAGE.efi [PORT] [FORM ...]    default port 2222, form (+ 1 2)
+#
+#   NIC=...        the -device for the NIC, minus its netdev (default the E1000:
+#                  "e1000,romfile=,rombar=0").  virtio-net, modern-only on a
+#                  PCIe root port the way a q35 KVM host presents it:
+#                    NIC="virtio-net-pci,bus=rp1,romfile=" \
+#                    QEMU_EXTRA="-machine q35 -device pcie-root-port,id=rp1,bus=pcie.0"
+#   QEMU_EXTRA=... extra QEMU arguments, placed BEFORE the NIC (so a bus it names exists).
+#   TMPDIR=dir     where the scratch directory goes (default /tmp).
 set -u
 EFI=${1:?usage: run-uefi-ssh.sh IMAGE.efi [PORT] [FORM ...]}; shift
 PORT=${1:-2222}; [ $# -gt 0 ] && shift; [ $# = 0 ] && set -- "(+ 1 2)" "(list (lisp-implementation-type) (* 6 7))"
 cd "$(dirname "$0")/.."
 OVMF=${OVMF:-/usr/share/OVMF/OVMF_CODE_4M.fd}
-W=$(mktemp -d /tmp/modus-uefi-ssh.XXXXXX); IMG=$W/boot.img; VARS=$W/vars.fd; OUT=${OUT:-$W/serial.txt}; FIFO=$W/fifo
+W=$(mktemp -d ${TMPDIR:-/tmp}/modus-uefi-ssh.XXXXXX); IMG=$W/boot.img; VARS=$W/vars.fd; OUT=${OUT:-$W/serial.txt}; FIFO=$W/fifo
 SZ=$(( ( $(stat -c %s "$EFI") / 1048576 ) + 40 ))
 dd if=/dev/zero of=$IMG bs=1M count=$SZ status=none
 mformat -i $IMG -F :: && mmd -i $IMG ::/EFI && mmd -i $IMG ::/EFI/BOOT && mcopy -i $IMG "$EFI" ::/EFI/BOOT/BOOTX64.EFI || exit 1
 cp /usr/share/OVMF/OVMF_VARS_4M.fd $VARS; mkfifo $FIFO
 timeout ${TIMEOUT:-300} qemu-system-x86_64 -drive if=pflash,format=raw,readonly=on,file=$OVMF -drive if=pflash,format=raw,file=$VARS \
   -drive format=raw,file=$IMG -m ${MEM:-512} -nographic -no-reboot \
-  -device e1000,netdev=net0,romfile=,rombar=0 -netdev user,id=net0,hostfwd=tcp::${PORT}-:22 < $FIFO > $OUT 2>&1 &
+  ${QEMU_EXTRA:-} -device ${NIC:-e1000,romfile=,rombar=0},netdev=net0 -netdev user,id=net0,hostfwd=tcp::${PORT}-:22 < $FIFO > $OUT 2>&1 &
 QP=$!; exec 3>$FIFO
 for i in $(seq 1 1800); do kill -0 $QP 2>/dev/null || { echo "FAIL: QEMU exited"; tail -5 $OUT; exit 1; }; tail -c 4 $OUT 2>/dev/null | grep -q '> $' && break; sleep 0.1; done
 tail -c 4 $OUT | grep -q '> $' || { echo "FAIL: no REPL prompt (serial tail:)"; tr -d '\r' < $OUT | tail -5; kill $QP; exit 1; }

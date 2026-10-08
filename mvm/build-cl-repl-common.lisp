@@ -1222,7 +1222,11 @@
       (if *cl-repl-x64-p*
           (concatenate 'string
             (%rpi-net-text "arch-x86-cl.lisp")     (string #\Newline)
-            (%rpi-net-text "e1000.lisp")           (string #\Newline))
+            (%rpi-net-text "e1000.lisp")           (string #\Newline)
+            ;; virtio-net AFTER e1000: its e1000-probe/send/receive/rx-buf
+            ;; wrappers win (last-defun-wins) and pick virtio when the PCI scan
+            ;; finds one, the E1000 otherwise.
+            (%rpi-net-text "virtio-net.lisp")      (string #\Newline))
       (if *cl-repl-virt-p*
           (concatenate 'string
             ;; QEMU virt: PCI ECAM + E1000.  arch-aarch64-cl.lisp also carries
@@ -2166,6 +2170,7 @@
     (format t "  image      ~8,'0X .. ~8,'0X  (~,2F MB)~%"
             image-lo image-hi (/ image-bytes 1024.0 1024.0))
     (format t "  net/DMA    ~8,'0X .. ~8,'0X  (E1000 rings + state)~%" net-lo net-hi)
+    (format t "  virtio-net 0C1A0000 .. 0C1EA000  (rings + buffers), state 0C400000~%")
     (format t "  scratch    ~8,'0X / ~8,'0X  (cstr / io-buf)~%" scratch-lo #x0FF00000)
     (format t "  heap       ~8,'0X .. ~8,'0X  (MCGC data), meta ~8,'0X~%"
             heap-lo #x1DFFF000 #x1E000000)

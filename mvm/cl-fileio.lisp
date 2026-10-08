@@ -1782,13 +1782,17 @@
   ;; CABINET (#279): existence through the seam — cabinet EXISTS-P answers
   ;; for both files and directories.  A trailing slash (glob "dir/" form)
   ;; is stripped; cabinet paths don't carry one.
+  ;; A trailing slash is the glob's "a DIRECTORY here" (*/), and cabinet's EXISTS
+  ;; answers for files too -- so every file used to match */, and UIOP's
+  ;; DIRECTORY-FILES, which removes what SUBDIRECTORIES finds, listed nothing at
+  ;; all (warp-media's library on a cabinet showed no tracks).  Ask :DIR-P; a
+  ;; cabinet-fs without it errors, which reads as "not a directory".
   (when (%cab-on)
     (return-from %path-openable-p
       (let* ((n (length path))
-             (p (if (and (> n 1) (char= (char path (- n 1)) #\/))
-                    (subseq path 0 (- n 1))
-                    path)))
-        (if (handler-case (%cab :exists p) (t (c) nil)) t nil))))
+             (dirp (and (> n 1) (char= (char path (- n 1)) #\/)))
+             (p (if dirp (subseq path 0 (- n 1)) path)))
+        (if (handler-case (%cab (if dirp :dir-p :exists) p) (t (c) nil)) t nil))))
   (let ((fd (handler-case (%sys-open-rdonly path) (t (c) -1))))
     (if (and fd (>= fd 0))
         (progn (handler-case (%sys-close fd) (t (c) nil)) t)

@@ -178,6 +178,13 @@
       ;; them across a reboot (the FS is in RAM), so a constant is honest
       ;; and avoids a stat round trip per PROBE-FILE.
       ((eq op :mtime)  0)
+      ;; Is A a directory?  DIRECTORY's */ glob asks (EXISTS answers for files too).
+      ((eq op :dir-p) (progn (%cabfs-flush-path a)
+                             (handler-case
+                                 (eq (funcall (symbol-function (%cabfs-sym "FILE-TYPE"))
+                                              *cabfs* a)
+                                     :directory)
+                               (error () nil))))
       (t (error "cabinet-fs: unknown op type=~s name=~s args0=~s"
                 (type-of op)
                 (handler-case (symbol-name op) (error () :NOT-SYM))

@@ -239,3 +239,31 @@
   (cabinet-mount
    (funcall (symbol-function (%cabfs-sym (if format "FORMAT-FS" "MOUNT")))
             nil :device device)))
+
+;;; A RAM disk OUTSIDE the Lisp heap: [BASE, BASE+BYTES) of raw memory the board
+;;; leaves alone (kiln zero uses 0x1B000000..0x1D000000, between the core save
+;;; area and the I/O buffers).  CABINET-RAM-DISK's sectors live in a byte vector,
+;;; so a disk the size of a film would be the size of a film INSIDE the heap and
+;;; copied by every collection.  Sectors move four bytes at a time between the
+;;; raw region and pagetree's packed page buffers (byte K of a u8 vector is at
+;;; word+7+K); BASE and every sector are 4-byte aligned.
+(defun %raw-to-vec (addr vec start n)
+  (let ((d (+ (%val->word vec) 7 start)) (i 0))
+    (loop (when (>= i n) (return vec))
+          (setf (mem-ref (+ d i) :u32) (mem-ref (+ addr i) :u32))
+          (setq i (+ i 4)))))
+
+(defun %vec-to-raw (vec start addr n)
+  (let ((s (+ (%val->word vec) 7 start)) (i 0))
+    (loop (when (>= i n) (return nil))
+          (setf (mem-ref (+ addr i) :u32) (mem-ref (+ s i) :u32))
+          (setq i (+ i 4)))))
+
+(defun cabinet-raw-disk (base bytes)
+  "A writable device over raw memory [BASE, BASE+BYTES), 512-byte sectors."
+  (funcall (symbol-function (%pt-dev-sym "MAKE-SECTOR-DEVICE"))
+           :read-sectors (lambda (lba count buf start)
+                           (%raw-to-vec (+ base (* lba 512)) buf start (* count 512)))
+           :write-sectors (lambda (lba count buf start)
+                            (%vec-to-raw buf start (+ base (* lba 512)) (* count 512)))
+           :sectors (floor bytes 512)))

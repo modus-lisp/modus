@@ -1002,7 +1002,15 @@
       (unless *%runtime-deftype-table*
         (setq *%runtime-deftype-table* (make-hash-table :test 'equal)))
       (%deftype-pkg-put tname name-str entry)
-      (puthash name-str *%runtime-deftype-table* entry)))
+      (puthash name-str *%runtime-deftype-table* entry)
+      (%deftype-warm tname)))
+  tname)
+
+(defun %deftype-warm (tname)
+  "Prepare TNAME's expander where it is defined.  A no-op here; mvm-eval
+   images compile and cache it (mvm-eval.lisp), so that a later expansion on
+   an actor only READS the cache -- an actor may not write shared tables, nor
+   compile."
   tname)
 
 ;;; COMPILER-MACRO per-package side table — same defect, same shape:

@@ -4237,39 +4237,52 @@
                (error "mvm-eval: interp-closure compile failed (params=~S)"
                       (cadr fn)))))))))
 
+(defun %deftype-expander (head entry)
+  "The compiled expander trampoline for deftype HEAD whose registered
+   (params . body) is ENTRY, or :E2IC-FAIL; compiled once per registration
+   and cached by name (a re-registered deftype has a new ENTRY and recompiles)."
+  (let* ((nm (%eval-sym-name head))
+         (hit (if (and nm *e2ic-deftype-cache*)
+                  (gethash nm *e2ic-deftype-cache*)
+                  nil)))
+    (if (and hit (eq (car hit) entry))
+        (cdr hit)
+        (let* ((tramp (%e2ic-compile (car entry) (cdr entry) nil))
+               (val (if tramp tramp (quote :e2ic-fail))))
+          (unless *e2ic-deftype-cache*
+            (setq *e2ic-deftype-cache* (make-hash-table :test (quote equal))))
+          (when nm
+            (puthash nm *e2ic-deftype-cache* (cons entry val)))
+          val))))
+
+(defun %deftype-warm (tname)
+  "OVERRIDE of cl-eval's no-op: compile and cache TNAME's expander now, on the
+   thread that defines it (a load, normally the main thread).  Expanding later
+   on an ACTOR then only reads the cache: compiling there, and storing the
+   actor's trampoline into the shared table, trips the shared-store guard --
+   COERCE to a deftype'd array type inside an operandi turn did exactly that.
+   A deftype whose body cannot be compiled yet still fails at its first use,
+   as before, not at its definition."
+  (let ((entry (%deftype-lookup tname)))
+    (when entry (ignore-errors (%deftype-expander tname entry))))
+  tname)
+
 (defun %expand-deftype (type)
   "OVERRIDE (mvm-eval images; last-defun-wins) of ansi-bridge's engine stub:
    route the deftype body eval through the mvm-eval lambda-body entry, cached
-   per registration (name → (entry . trampoline)).  A deftype body mvm-eval
-   can't compile SIGNALS (the tree-walker is deleted)."
+   per registration (%DEFTYPE-EXPANDER).  A deftype body mvm-eval can't
+   compile SIGNALS (the tree-walker is deleted)."
   (let* ((head (if (consp type) (car type) type))
          (args (if (consp type) (cdr type) nil))
          (entry (%deftype-lookup head)))
-    (cond
-      ((null entry) nil)
-      (t
-       (let* ((nm (%eval-sym-name head))
-              (hit (if (and nm *e2ic-deftype-cache*)
-                       (gethash nm *e2ic-deftype-cache*)
-                       nil)))
-         (if (and hit (eq (car hit) entry))
-             (if (eq (cdr hit) (quote :e2ic-fail))
-                 (progn (%e2ic-bump-fallback)
-                        (error "mvm-eval: deftype expander compile failed (type=~S)"
-                               type))
-                 (%e2ic-apply (cdr hit) args))
-             (let ((tramp (%e2ic-compile (car entry) (cdr entry) nil)))
-               (unless *e2ic-deftype-cache*
-                 (setq *e2ic-deftype-cache*
-                       (make-hash-table :test (quote equal))))
-               (when nm
-                 (puthash nm *e2ic-deftype-cache*
-                          (cons entry (if tramp tramp (quote :e2ic-fail)))))
-               (if tramp
-                   (%e2ic-apply tramp args)
-                   (progn (%e2ic-bump-fallback)
-                          (error "mvm-eval: deftype expander compile failed (type=~S)"
-                                 type))))))))))
+    (if (null entry)
+        nil
+        (let ((tramp (%deftype-expander head entry)))
+          (if (eq tramp (quote :e2ic-fail))
+              (progn (%e2ic-bump-fallback)
+                     (error "mvm-eval: deftype expander compile failed (type=~S)"
+                            type))
+              (%e2ic-apply tramp args))))))
 
 ;;; ============================================================
 ;;; DISASSEMBLE — the real one (overrides cl-eval.lisp's fallback)

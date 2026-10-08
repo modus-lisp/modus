@@ -2729,8 +2729,12 @@
            ;; handed a heap complex object); sqrt of sum of squares.
            (let ((mag (sqrt (+ (* r r) (* i i)))))
              (complex (/ r mag) (/ i mag))))))
+    ;; A float's sign IN ITS OWN FORMAT ((signum -2d0) is -1.0d0, not the
+    ;; single -1.0), and a zero -- either sign -- is returned as itself.
     ((floatp-impl x)
-     (if (< x 0.0) -1.0 (if (> x 0.0) 1.0 0.0)))
+     (cond ((zerop x) x)
+           ((minusp x) (float -1 x))
+           (t (float 1 x))))
     (t (if (< x 0) -1 (if (> x 0) 1 0)))))
 
 (defun float-exponent (x)
@@ -3629,6 +3633,8 @@
   (if extra
       (%program-error "sin requires exactly 1 argument")
       (cond ((and (integerp x) (= x 0)) 0)
+            ;; a float zero is its own sine: (sin -0.0) = -0.0
+            ((and (floatp x) (zerop x)) x)
             (t (%irr-result (%sin-f (%any-to-float x)) x)))))
 
 (defun cos (x &rest extra)
@@ -3641,6 +3647,7 @@
   (if extra
       (%program-error "tan requires exactly 1 argument")
       (cond ((and (integerp x) (= x 0)) 0)
+            ((and (floatp x) (zerop x)) x)
             (t (let* ((xf (%any-to-float x))
                       (r (%trig-reduce-f xf))
                       (sn (%sin-poly-f r))
@@ -3675,17 +3682,7 @@
        (let* ((ya (car args)) (xa (car (cdr args)))
               (yf (%any-to-float ya))             ; CLHS (atan number divisor)
               (xf (%any-to-float xa))             ; number=y, divisor=x
-              (r (cond
-                   ((%float-zero-p xf)
-                    (cond ((float-negative-p yf) (%float-neg (%fpi/2)))
-                          ((%float-zero-p yf) (%fl 0))
-                          (t (%fpi/2))))
-                   ((float-negative-p xf)
-                    (let ((base (%atan-f (%float-div yf xf))))
-                      (if (float-negative-p yf)
-                          (%float-sub base (%fpi))
-                          (%float-add base (%fpi)))))
-                   (t (%atan-f (%float-div yf xf))))))
+              (r (%atan2-f yf xf)))
          (%as-result-float r (%float-result-type ya xa))))
       (t (%program-error "atan requires 1 or 2 arguments")))))
 
@@ -3711,6 +3708,12 @@
   (if extra
       (%program-error "tanh requires exactly 1 argument")
       (cond ((and (integerp x) (= x 0)) 0)
+            ;; a float zero is its own tanh (-0.0 stays -0.0); past |x| = 22
+            ;; tanh is +-1 to double precision, and exp(x)/exp(x) would be
+            ;; inf/inf = NaN.
+            ((and (floatp x) (zerop x)) x)
+            ((and (realp x) (> (abs x) 22))
+             (%irr-result (if (minusp x) (%fl -1) (%fl 1)) x))
             (t (let* ((xf (%any-to-float x))
                       (ep (%exp-f xf))
                       (em (%exp-f (%float-neg xf))))
@@ -3737,7 +3740,13 @@
       (cond
         ((complexp n)
          (let ((r (realpart n)) (i (imagpart n)))
-           (sqrt (+ (* r r) (* i i)))))
+           (if (or (floatp r) (floatp i))
+               ;; FLOAT parts: the overflow-safe magnitude in their format --
+               ;; r*r + i*i is inf for |r| near 1e200, so (abs #C(1d200 1d200))
+               ;; was inf.  RATIONAL parts keep the exact path ((abs #C(3 4)) = 5).
+               (%irr-result (%hypot-f (%any-to-float r) (%any-to-float i))
+                            (if (double-float-p r) r i))
+               (sqrt (+ (* r r) (* i i))))))
         ;; generic-negate-int → %safe-fixnum-negate handles
         ;; MOST-NEGATIVE-FIXNUM (-2^62): plain (- 0 n) WRAPS it back to
         ;; itself (still negative), and the resulting bad "magnitude"
@@ -3757,10 +3766,33 @@
 ;; (when b = 0 and a < 0 this degenerates to the pure-imaginary branch).
 ;; Inputs ar/ai are arbitrary reals; the result parts are floats.  FMT is
 ;; the argument that drives single-vs-double contagion (rational => single).
+(defun %hypot-f (a b)
+  "sqrt(a^2 + b^2) without the intermediate overflow: |a| * sqrt(1 + (b/a)^2)
+   with |a| >= |b|.  The direct form overflowed to inf for |a| near 1e300."
+  (let ((aa (%float-abs a)) (bb (%float-abs b)))
+    (when (%float-lt-p aa bb) (let ((tmp aa)) (setq aa bb) (setq bb tmp)))
+    (cond ((%float-zero-p aa) aa)
+          ((%float-infinite-p aa) aa)
+          (t (let ((r (%float-div bb aa)))
+               (%float-mul aa (%sqrt-f (%float-add (%f-one) (%float-mul r r)))))))))
+
 (defun %complex-sqrt (ar ai fmt)
+  ;; The result's float FORMAT comes from the parts: a complex is never a
+  ;; DOUBLE-FLOAT itself, so passing the complex as FMT made %IRR-RESULT round
+  ;; (sqrt #C(3d0 4d0)) to single-float parts.
+  (when (double-float-p ar) (setq fmt ar))
+  (when (double-float-p ai) (setq fmt ai))
+  ;; A negative REAL (zero imaginary part) has the exact principal root
+  ;; #C(0 sqrt|a|): the general formula below computes (|a| + a)/2, which is
+  ;; inf - inf = NaN for a = -inf.
+  (when (and (%float-zero-p (%any-to-float ai))
+             (float-negative-p (%any-to-float ar)))
+    (return-from %complex-sqrt
+      (complex (%irr-result (%fl 0) fmt)
+               (%irr-result (%sqrt-f (%float-neg (%any-to-float ar))) fmt))))
   (let* ((af (%any-to-float ar))
          (bf (%any-to-float ai))
-         (m  (%sqrt-f (%float-add (%float-mul af af) (%float-mul bf bf))))
+         (m  (%hypot-f af bf))
          (half (%float-div (%f-one) (%fl 2)))
          (rp (%sqrt-f (%float-mul (%float-add m af) half)))
          (ip (%sqrt-f (%float-mul (%float-sub m af) half))))
@@ -3807,15 +3839,11 @@
            ((%float-zero-p n) n)
            ;; Negative float -> pure-imaginary complex, same float format.
            ((float-negative-p n) (%complex-sqrt n 0 n))
-           (t (let ((half (%float-div (%float-from-int 1) (%float-from-int 2)))
-                    (x n))
-                (let ((i 0))
-                  (loop
-                    (when (>= i 8) (return x))
-                    (setq x (%float-mul (%float-add x (%float-div n x)) half))
-                    (setq i (+ i 1))))
-                ;; Preserve the argument's float format (single vs double).
-                (%irr-result x n)))))
+           ;; %SQRT-F (range-reduced Newton).  This arm used to run its own
+           ;; EIGHT Newton steps from y = x, which only converge near 1:
+           ;; (sqrt 1d300) was 3.9d297 and (sqrt +inf) a NaN.  Preserve the
+           ;; argument's float format (single vs double).
+           (t (%irr-result (%sqrt-f n) n))))
         (t 0))))
 
 ;;; ============================================================

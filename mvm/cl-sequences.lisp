@@ -3331,10 +3331,15 @@
 (defun complexp (x) (%complex-p x))
 
 (defun %complex-abs (z)
-  "Magnitude of complex Z = sqrt(realpart^2 + imagpart^2).  Used by the
-   compiler's ABS macro for the complex case (and by abs's defun)."
-  (sqrt (+ (* (realpart z) (realpart z))
-           (* (imagpart z) (imagpart z)))))
+  "Magnitude of complex Z.  Used by the compiler's ABS macro for the complex
+   case.  FLOAT parts go through the overflow-safe %HYPOT-F in their own
+   format -- r*r + i*i is inf for |r| near 1e200, so (abs #C(1d200 1d200)) was
+   inf; RATIONAL parts keep the exact form ((abs #C(3 4)) = 5)."
+  (let ((r (realpart z)) (i (imagpart z)))
+    (if (or (floatp r) (floatp i))
+        (%irr-result (%hypot-f (%any-to-float r) (%any-to-float i))
+                     (if (double-float-p r) r i))
+        (sqrt (+ (* r r) (* i i))))))
 
 ;;; Complex arithmetic.  Use modus's existing rational + / - / * routes
 ;;; so the resulting (real, imag) parts come back in their natural form

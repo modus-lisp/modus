@@ -72,11 +72,53 @@
 (defun %f-one ()  (%fl 1))
 (defun %f-half () (%float-div (%fl 1) (%fl 2)))
 
+(defun %float-nan-p (x)
+  "X (a boxed float) is a NaN, by its IEEE bits: exponent all ones, mantissa
+   non-zero."
+  (let ((h (%float-hi32 x)))
+    (and (= (logand h #x7FF00000) #x7FF00000)
+         (or (/= (logand h #xFFFFF) 0) (/= (%float-lo32 x) 0)))))
+
+(defun %float-nonfinite-p (x)
+  "X (a boxed float) is +-inf or a NaN: exponent all ones."
+  (= (logand (%float-hi32 x) #x7FF00000) #x7FF00000))
+
+(defun %float-mag-lt (h1 l1 h2 l2)
+  (or (< h1 h2) (and (= h1 h2) (< l1 l2))))
+
 (defun %float-lt-p (a b)
-  "True if double A < double B.  Computes A-B and tests its sign bit;
-   if A-B is exactly 0 (not negative) return NIL."
-  (let ((d (%float-sub a b)))
-    (and (float-negative-p d) (not (%float-zero-p d)))))
+  "True if float A < float B, by IEEE ordering on the BITS: a NaN is unordered
+   (NIL against anything), +0 and -0 are equal, otherwise sign then magnitude.
+
+   It used to compute A-B and test the sign bit, which is wrong exactly at the
+   special values: inf - inf is a NaN, and x86's default NaN has its SIGN BIT
+   SET, so (< inf inf) answered T; (> inf inf) too."
+  (let ((ah (logand (%float-hi32 a) #xFFFFFFFF)) (al (%float-lo32 a))
+        (bh (logand (%float-hi32 b) #xFFFFFFFF)) (bl (%float-lo32 b)))
+    (if (or (%float-nan-p a) (%float-nan-p b))
+        nil
+        (let ((am (logand ah #x7FFFFFFF)) (bm (logand bh #x7FFFFFFF)))
+          (if (and (= am 0) (= al 0) (= bm 0) (= bl 0))
+              nil
+              (let ((an (>= ah #x80000000)) (bn (>= bh #x80000000)))
+                (cond ((and an (not bn)) t)
+                      ((and bn (not an)) nil)
+                      (an (%float-mag-lt bm bl am al))
+                      (t (%float-mag-lt am al bm bl)))))))))
+
+(defun %float-eq-p (a b)
+  "Float A = float B under IEEE: never for a NaN, +0 = -0."
+  (and (not (%float-nan-p a)) (not (%float-nan-p b))
+       (not (%float-lt-p a b)) (not (%float-lt-p b a))))
+
+(defun %float-vs-real-lt-p (a b)
+  "A < B where exactly one of A and B is a NON-FINITE float and the other is a
+   finite real: decided by the float alone (inf is above every real, -inf below
+   it, a NaN is unordered).  Coercing an infinity to a rational -- what the
+   mixed path did -- produced garbage: (> inf 1) was NIL."
+  (if (and (%ieee-float-p a) (%float-nonfinite-p a))
+      (and (not (%float-nan-p a)) (float-negative-p a))
+      (and (not (%float-nan-p b)) (not (float-negative-p b)))))
 
 (defun %float-neg (a)
   "IEEE negation: flip the sign, so (- 0.0) is -0.0.  0.0 - a is +0.0 for a
@@ -92,13 +134,46 @@
       (%float-to-integer (%float-sub a (%f-half)))
       (%float-to-integer (%float-add a (%f-half)))))
 
+(defun %pi-scaled ()
+  "floor(pi * 2^1200), parsed from its digits on each call (it is only used on
+   the huge-argument path, and a bignum cached in a global would be a
+   cross-thread publication).  Computed with integer Machin arithmetic and 64
+   guard bits."
+  (parse-integer (concatenate 'string
+    "540934485661682508355949300536164060185122167249521277265160"
+    "528262006997782076478252238227130548078958319262203953058629"
+    "620491445257056469017988138918144964378908033985712239045010"
+    "568613120193817148071813016347992462641862674561949701602995"
+    "054543750710730244484174974230619462016281714871897355607052"
+    "936434780789763998402096671762594430122227987613539111907169"
+    "49")))
+
+(defun %trig-reduce-exact (x)
+  "X (a finite double, |X| >= 2^16) reduced EXACTLY to about [-pi, pi]: X is
+   taken as its exact rational, k = round(X / 2pi) against pi to 1200 bits,
+   and X - 2k*pi converted back to a double.  The double reduction below
+   loses ~|X|*2^-53 to the error in 2pi (1e-10 at 1e6, 1e-2 at 1e15) and past
+   2^62 its integer k is not representable at all: (sin 1d300) was 0 and
+   (cos 1d300) 1.  A double is below 2^1024, so 1200 bits of pi leave the
+   remainder good to ~2^-170."
+  (let* ((p2 (* 2 (%pi-scaled)))                  ; 2pi * 2^1200
+         (xs (* (rational x) (ash 1 1200)))       ; x * 2^1200, exact
+         (k (round xs p2)))
+    (float (/ (- xs (* k p2)) (ash 1 1200)) 1d0)))
+
 (defun %trig-reduce-f (x)
   "Reduce double angle X into approximately [-π, π] by subtracting an
-   integer multiple of 2π.  Returns a double."
-  (let* ((two-pi (%f2pi))
-         ;; n = round(x / 2π)
-         (n (%float-round-to-int (%float-div x two-pi))))
-    (%float-sub x (%float-mul (%fl n) two-pi))))
+   integer multiple of 2π.  Returns a double.  A non-finite X has no
+   reduction: the result is a NaN, so sin/cos/tan of +-inf are NaN, as
+   IEEE non-trapping arithmetic gives (this image's (/ 1.0 0.0) is +inf)."
+  (cond
+    ((%float-nonfinite-p x) (%float-sub x x))
+    ((not (%float-lt-p (%float-abs x) (%fl 65536))) (%trig-reduce-exact x))
+    (t
+     (let* ((two-pi (%f2pi))
+            ;; n = round(x / 2π)
+            (n (%float-round-to-int (%float-div x two-pi))))
+       (%float-sub x (%float-mul (%fl n) two-pi))))))
 
 (defun %sin-poly-f (r)
   "sin(r) for r already reduced to ~[-π,π], via Taylor series in
@@ -261,7 +336,19 @@
              (im (atan (imagpart x) (realpart x))))
         (complex (%irr-result re x) im))))
   (let ((xf (%any-to-float x)))
-    (when (%float-zero-p xf) (return-from log 0))
+    ;; An exact 0 keeps its historic answer.  A FLOAT zero is the IEEE pole --
+    ;; this image does non-trapping IEEE arithmetic ((/ 1.0 0.0) is +inf), so
+    ;; log is consistent with it: (log 0.0) = -inf, (log -0.0) = -inf + pi i,
+    ;; and (log +inf) = +inf (the reduction loop below never ends on inf).
+    (when (%float-zero-p xf)
+      (return-from log
+        (cond ((not (floatp x)) 0)
+              ((float-negative-p xf)
+               (complex (%irr-result (%float-neg (%float-div (%fl 1) (%fl 0))) x)
+                        (%irr-result (%fpi) x)))
+              (t (%irr-result (%float-neg (%float-div (%fl 1) (%fl 0))) x)))))
+    (when (or (%float-infinite-p xf) (%float-nan-p xf))
+      (return-from log (%irr-result xf x)))
     (let ((ln-x (%log-f xf)))
       (%irr-result ln-x x))))
 
@@ -293,14 +380,26 @@
          (%float-div (%float-sub ep em) (%float-add ep em))))))
 
 (defun %sqrt-f (x)
-  "sqrt of double X (X ≥ 0) via Newton: y = (y + x/y)/2."
+  "sqrt of double X (X >= 0) via Newton, after RANGE REDUCTION: scale X by
+   powers of 4 into [1/4, 4) and the root back by the same powers of 2 (both
+   exact), so Newton from 1 converges in a handful of steps.  Newton from
+   y = X, the old start, halves y per step and needs ~log2(X) of them: with 40,
+   (sqrt 1d300) came back 3.9d297.  +-0, +inf and NaN are their own roots."
   (cond
-    ((%float-zero-p x) x)
-    (t (let ((y x) (i 0) (half (%float-div (%fl 1) (%fl 2))))
-         (loop
-           (when (> i 40) (return y))
-           (setq y (%float-mul (%float-add y (%float-div x y)) half))
-           (setq i (+ i 1)))))))
+    ((or (%float-zero-p x) (%float-nan-p x) (%float-infinite-p x)) x)
+    (t (let ((m x) (s (%fl 1)) (two (%fl 2)) (four (%fl 4))
+             (quarter (%float-div (%fl 1) (%fl 4)))
+             (half (%float-div (%fl 1) (%fl 2))))
+         (loop (when (%float-lt-p m four) (return nil))
+               (setq m (%float-mul m quarter)) (setq s (%float-mul s two)))
+         (loop (when (not (%float-lt-p m quarter)) (return nil))
+               (setq m (%float-mul m four)) (setq s (%float-mul s half)))
+         (let ((y (%fl 1)) (i 0))
+           (loop
+             (when (> i 12) (return nil))
+             (setq y (%float-mul (%float-add y (%float-div m y)) half))
+             (setq i (+ i 1)))
+           (%float-mul y s))))))
 
 (defun %asin-f (x)
   "asin of double X for |X| ≤ 1, via atan(x/sqrt(1-x^2)).  For |X|=1
@@ -321,6 +420,9 @@
    atan(x) = 2·atan(x/(1+sqrt(1+x^2))) shrinks |x| < ~0.42 first."
   (let ((ax (%float-abs x)) (one (%f-one)))
     (cond
+      ;; +-0 and NaN are their own arc tangent (the series below loses the
+      ;; sign of -0: atan(-0.0) must be -0.0).
+      ((or (%float-zero-p x) (%float-nan-p x)) x)
       ;; |x| > 1: reduce to reciprocal
       ((%float-lt-p one ax)
        (let ((r (%atan-f (%float-div one ax)))
@@ -358,25 +460,46 @@
     ((and (integerp x) (= x 0)) (%fpi/2))
     (t (%float-sub (%fpi/2) (%asin-f (%any-to-float x))))))
 
+(defun %atan2-signed (neg v)
+  (if neg (%float-neg v) v))
+
+(defun %atan2-f (yf xf)
+  "atan(YF/XF) over all four quadrants, with the IEEE (C99 atan2) answers at
+   the special values -- what ANSI ATAN.IEEE.2 checks:
+     y = +-0:  x > 0 or x = +0  -> y (a signed zero);  x < 0 or x = -0 -> +-pi
+     x = +-0 (y non-zero)       -> +-pi/2
+     y = +-inf: x = +inf -> +-pi/4, x = -inf -> +-3pi/4, else +-pi/2
+     x = +inf (y finite)        -> +-0;   x = -inf -> +-pi
+   with the sign of the result taken from Y throughout, and a NaN in either
+   argument giving a NaN.  The old arms returned +0 for (atan -0.0 +0.0) and
+   +-pi/2 for every zero X, including (atan +0.0 -0.0), whose answer is pi."
+  (let ((yneg (float-negative-p yf))
+        (xneg (float-negative-p xf)))
+    (progn
+      (cond
+        ((%float-nan-p yf) yf)
+        ((%float-nan-p xf) xf)
+        ((%float-zero-p yf)
+         (if xneg (%atan2-signed yneg (%fpi)) yf))
+        ((%float-zero-p xf) (%atan2-signed yneg (%fpi/2)))
+        ((%float-infinite-p yf)
+         (cond ((not (%float-infinite-p xf)) (%atan2-signed yneg (%fpi/2)))
+               (xneg (%atan2-signed yneg (%float-mul (%fl 3) (%float-div (%fpi) (%fl 4)))))
+               (t (%atan2-signed yneg (%float-div (%fpi) (%fl 4))))))
+        ((%float-infinite-p xf)
+         (if xneg (%atan2-signed yneg (%fpi)) (%atan2-signed yneg (%fl 0))))
+        (xneg
+         (let ((base (%atan-f (%float-div yf xf))))
+           (if yneg (%float-sub base (%fpi)) (%float-add base (%fpi)))))
+        (t (%atan-f (%float-div yf xf)))))))
+
 (defun atan (x &optional y)
   "Arc tangent.  One-arg: atan(x).  Two-arg (atan y x): full-quadrant
    angle of the point (x, y) — result in (-π, π]."
   (cond
     (y
-     (let ((yf (%any-to-float x))     ; CLHS (atan number divisor): number=y
-           (xf (%any-to-float y)))    ; divisor=x
-       (cond
-         ((%float-zero-p xf)
-          (cond ((float-negative-p yf) (%float-neg (%fpi/2)))
-                ((%float-zero-p yf) (%fl 0))
-                (t (%fpi/2))))
-         ((float-negative-p xf)
-          ;; x<0: atan(y/x) ± π
-          (let ((base (%atan-f (%float-div yf xf))))
-            (if (float-negative-p yf)
-                (%float-sub base (%fpi))
-                (%float-add base (%fpi)))))
-         (t (%atan-f (%float-div yf xf))))))
+     ;; CLHS (atan number divisor): number = y, divisor = x
+     (%atan2-f (%any-to-float x) (%any-to-float y)))
     ((and (integerp x) (= x 0)) 0)
     (t (%atan-f (%any-to-float x)))))
 
@@ -3112,6 +3235,11 @@
   "Return T if numeric value A < numeric value B.
    Handles integers, boxed floats (subtag #x60 IEEE or #x32 rational
    form), and tagged ratios (subtag #x33)."
+  ;; A NON-FINITE float against a non-float real: decided by the float alone,
+  ;; before anything below coerces it to a rational.
+  (when (or (and (%ieee-float-p a) (not (%ieee-float-p b)) (%float-nonfinite-p a))
+            (and (%ieee-float-p b) (not (%ieee-float-p a)) (%float-nonfinite-p b)))
+    (return-from numeric-value-less-p (%float-vs-real-lt-p a b)))
   ;; IEEE-float vs integer fast path — avoid %ieee-float-to-rat for
   ;; sub-unit-magnitude floats whose rational denominator would be
   ;; ash 1 66+ (overflows modus's 63-bit fixnum, breaks gcd-reduce).
@@ -3224,6 +3352,10 @@
     (return-from numeric-equal-p
       (and (numeric-equal-p (realpart a) (realpart b))
            (numeric-equal-p (imagpart a) (imagpart b)))))
+  ;; A NON-FINITE float equals no non-float real (and a NaN nothing at all).
+  (when (or (and (%ieee-float-p a) (not (%ieee-float-p b)) (%float-nonfinite-p a))
+            (and (%ieee-float-p b) (not (%ieee-float-p a)) (%float-nonfinite-p b)))
+    (return-from numeric-equal-p nil))
   ;; IEEE-float vs integer fast path — avoid coerce-to-rat for the
   ;; common 0.0/integer 0 case (avoids bignum overflow on small floats).
   (when (and (%ieee-float-p a) (integerp b))
@@ -3244,20 +3376,17 @@
   (when (and (fixnump a) (%ieee-float-p b)
              (< a 9007199254740992) (> a -9007199254740992))
     (let ((fa (%float-from-int a)))
-      (return-from numeric-equal-p
-        (not (or (%float-lt-p fa b) (%float-lt-p b fa))))))
+      (return-from numeric-equal-p (%float-eq-p fa b))))
   (when (and (fixnump b) (%ieee-float-p a)
              (< b 9007199254740992) (> b -9007199254740992))
     (let ((fb (%float-from-int b)))
-      (return-from numeric-equal-p
-        (not (or (%float-lt-p a fb) (%float-lt-p fb a))))))
+      (return-from numeric-equal-p (%float-eq-p a fb))))
   ;; BOTH IEEE floats: compare natively (a = b iff neither a<b nor b<a).
   ;; The coerce-to-rat path below cross-multiplies den ≈ 2^52 operands
   ;; (num_a*den_b ≈ 2^104), overflowing fixnums into bignums and
   ;; hanging — same wedge as numeric-value-less-p.
   (when (and (%ieee-float-p a) (%ieee-float-p b))
-    (return-from numeric-equal-p
-      (not (or (%float-lt-p a b) (%float-lt-p b a)))))
+    (return-from numeric-equal-p (%float-eq-p a b)))
   (when (or (%ieee-float-p a) (%ieee-float-p b))
     (return-from numeric-equal-p
       (numeric-equal-p (%coerce-numeric a) (%coerce-numeric b))))

@@ -26085,12 +26085,25 @@
      (let ((thunk-name (format nil "TOPLEVEL-~D" (make-compiler-label))))
        (mvm-compile-function thunk-name nil (list form))))))
 
+(defvar *fail-on-compile-skip* nil
+  "When true, MVM-COMPILE-ALL fails after compiling every form if any form
+   was SKIPPED for a compile error.  The CLI builds set it (build-cli-common):
+   there a skipped form is first-party code, and every call to a function it
+   defined compiles to a NIL sentinel -- GENERATE-LOOP-CODE was skipped that
+   way and every LOOP in the image returned NIL, with the build reporting
+   success.  The ANSI gate runners leave it NIL; their corpus legitimately
+   holds forms this compiler skips.")
+
+(defvar *compile-skip-log* nil
+  "SKIP notes (\"form#N location: error\") of the current MVM-COMPILE-ALL.")
+
 (defun mvm-compile-all (forms &key source-lines)
   "Compile a list of top-level forms into a complete MVM module.
    Returns a compiled-module containing bytecode, function table,
    and constant table.
    SOURCE-LINES: optional vector mapping form index to source line number."
-  (let ((*functions* (make-hash-table :test 'equal))
+  (let ((*compile-skip-log* nil)
+        (*functions* (make-hash-table :test 'equal))
         (*function-table* nil)
         (*constant-table* nil)
         (*label-counter* 0)
@@ -26185,7 +26198,9 @@
                             ;; that used to fault the recovery path.
                             (format t "  SKIP form#~D ~A: ~A~%"
                                     (1- form-index) *current-source-location* e)
-
+                            (push (format nil "form#~D ~A: ~A"
+                                          (1- form-index) *current-source-location* e)
+                                  *compile-skip-log*)
                             (setf *function-table* fn-table-before)
                             (setf *pending-flet-ir* nil)
                             nil))))
@@ -26461,6 +26476,12 @@
                            (if (integerp *compile-bloat-report*)
                                *compile-bloat-report*
                                30)))
+
+      (when (and *fail-on-compile-skip* *compile-skip-log*)
+        (error "~&COMPILE CHECK FAILED: ~D form(s) were SKIPPED for compile errors.~%~
+                Every call to a function they define would compile to a NIL~%~
+                sentinel.~%~{  ~A~%~}"
+               (length *compile-skip-log*) (reverse *compile-skip-log*)))
 
       ;; Build module
       (make-compiled-module

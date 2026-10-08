@@ -2237,6 +2237,13 @@
               *CLI-ARCH-* slot in the wrapper.  Reader output:~%~A"
              skips log)))
 
+;;; The compile-side partner of the read check above: a form the COMPILER skips
+;;; for an error is dropped the same way, and every call to what it defined
+;;; becomes a NIL sentinel.  MVM-COMPILE-ALL fails the build instead, after
+;;; compiling everything, listing every skipped form.  Set here, not in
+;;; BUILD-IMAGE, for the reason the read check gives.
+(setf modus.mvm::*fail-on-compile-skip* t)
+
 ;;; MODUS_DUMP_FULL_SOURCE=<path> — write the assembled blob and STOP, without
 ;;; building an image.  This is the refactor gate: the blob is the ONLY thing a
 ;;; wrapper contributes to the emitted binary, so a wrapper refactor that leaves

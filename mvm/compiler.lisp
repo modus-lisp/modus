@@ -9708,6 +9708,8 @@
          (dolist (v (collect-setq-vars-in-body f bound-vars))
            (setq results (adjoin v results :test #'name-equal))))
        results))
+    ;; QUOTE: data, never assignments -- and never macroexpanded.
+    ((and (symbolp (car form)) (string= (symbol-name (car form)) "QUOTE")) nil)
     ;; A BACKQUOTE TEMPLATE is data with code only in its commas: scan the
     ;; expansion, never the template (whose COND / LET heads with comma
     ;; structs for operands the macro branch below would try to expand).
@@ -9754,8 +9756,13 @@
      ;; returns the CONS (expansion . expanded-p).  MX bounds the expansions
      ;; along one path: some expanders return a fresh copy of their own form
      ;; (a builtin the compiler lowers itself), which would expand forever.
+     ;; The expansion is only ANALYSED here: an expander that fails out of
+     ;; its context -- iterate's clause macros read *LOOP-END*, bound only
+     ;; while an ITER form expands -- must not fail the compile, so on error
+     ;; the form is scanned unexpanded, as before.
      (let ((x (and (< mx 16) (symbolp (car form)) (car form)
-                   (%macroexpand-1-mvm-raw form))))
+                   (handler-case (%macroexpand-1-mvm-raw form)
+                     (error () nil)))))
        (if (and (consp x) (cdr x) (not (eq (car x) form)))
            (collect-setq-vars-in-body (car x) bound-vars (+ mx 1))
            ;; Recurse into all subforms (guard against dotted pairs)

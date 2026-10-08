@@ -197,12 +197,20 @@
             (aset padded i (aref msg i)))
           ;; Append 0x80
           (aset padded msg-len #x80)
-          ;; Append bit length as big-endian u64 at end (high 32 bits = 0)
-          (let ((bits (* msg-len 8)))
+          ;; Append the bit length (see below)
+          ;; The FULL bit length, big-endian: bits = msg-len*8 as a 64-bit value,
+          ;; low word at total-4..total-1, high word (msg-len>>29) at total-8..total-5.
+          ;; (The old code wrote only the low word, so messages of 512 MB or more
+          ;; hashed to the wrong digest.)  Constant shifts only: no variable ASH.
+          (let ((bits (* msg-len 8)) (hi (ash msg-len -29)))
             (aset padded (- total 4) (logand (ash bits -24) #xFF))
             (aset padded (- total 3) (logand (ash bits -16) #xFF))
             (aset padded (- total 2) (logand (ash bits -8) #xFF))
-            (aset padded (- total 1) (logand bits #xFF)))
+            (aset padded (- total 1) (logand bits #xFF))
+            (aset padded (- total 8) (logand (ash hi -24) #xFF))
+            (aset padded (- total 7) (logand (ash hi -16) #xFF))
+            (aset padded (- total 6) (logand (ash hi -8) #xFF))
+            (aset padded (- total 5) (logand hi #xFF)))
           ;; Initialize hash state
           (let ((h (make-array 32)))
             (buf-write-u32 h 0 #x6a09e667)
@@ -1318,12 +1326,20 @@
           (dotimes (i msg-len)
             (aset padded i (aref msg i)))
           (aset padded msg-len #x80)
-          ;; Append bit length as 128-bit big-endian (only low 32 bits used)
-          (let ((bits (* msg-len 8)))
+          ;; Append the bit length as a 128-bit big-endian field (see below)
+          ;; The FULL bit length, big-endian: bits = msg-len*8 as a 64-bit value,
+          ;; low word at total-4..total-1, high word (msg-len>>29) at total-8..total-5.
+          ;; (The old code wrote only the low word, so messages of 512 MB or more
+          ;; hashed to the wrong digest.)  Constant shifts only: no variable ASH.
+          (let ((bits (* msg-len 8)) (hi (ash msg-len -29)))
             (aset padded (- total 4) (logand (ash bits -24) #xFF))
             (aset padded (- total 3) (logand (ash bits -16) #xFF))
             (aset padded (- total 2) (logand (ash bits -8) #xFF))
-            (aset padded (- total 1) (logand bits #xFF)))
+            (aset padded (- total 1) (logand bits #xFF))
+            (aset padded (- total 8) (logand (ash hi -24) #xFF))
+            (aset padded (- total 7) (logand (ash hi -16) #xFF))
+            (aset padded (- total 6) (logand (ash hi -8) #xFF))
+            (aset padded (- total 5) (logand hi #xFF)))
           ;; Initialize hash state (8 u64 values in big-endian byte order)
           (let ((h (make-array 64)))
             (buf-write-u32 h 0 #x6a09e667) (buf-write-u32 h 4 #xf3bcc908)

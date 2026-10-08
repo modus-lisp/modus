@@ -417,3 +417,10 @@ signed, and both controls fail.  Record: `test/snp/records/`.
 - **The measurement is AWS's firmware.**  Proven here: the AMD chain, the
   signature, the REPORT_DATA binding.  Not proven here: that the DDC'd image is
   what runs — that needs our OVMF on a bare SNP host, as the rental kit does.
+
+**And the variable store is not measured either (measured 2026-10-08).**  Two
+AMIs from one snapshot, one with our Secure Boot KEK and db in `--uefi-data`:
+identical launch measurement on every guest, although the vars guest's EFI
+variables provably held our keys (`test/snp/ec2-varstore/RESULT.md`).  So EC2
+SNP cannot attest "only images signed by modus" either; it attests AWS's
+firmware and nothing a customer chooses.

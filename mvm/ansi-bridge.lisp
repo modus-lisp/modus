@@ -2406,11 +2406,21 @@
           (t head)))
       head))
 
+(defun %coerce-expand-type (type)
+  "TYPE with user DEFTYPEs expanded, at the top and in the element type of a
+   (VECTOR / ARRAY / SIMPLE-ARRAY elt ...) spec."
+  (let ((type (%element-type-expand type)))
+    (if (and (consp type) (consp (cdr type))
+             (member (%coerce-canon-head (car type)) '(vector array simple-array)))
+        (list* (car type) (%element-type-expand (cadr type)) (cddr type))
+        type)))
+
 (defun coerce (object result-type)
   "Coerce OBJECT to RESULT-TYPE.  Accepts compound type forms like
    (vector *), (vector * 2), (simple-string 5) — uses the head symbol
    for dispatch (per CLHS, compound array/string subtypes are still
    the same family of result-type)."
+  (setq result-type (%coerce-expand-type result-type))
   (when (%seq-type-u8-p result-type) (return-from coerce (%seq-u8-copy object)))
   (let* ((orig-type result-type)
          ;; Explicit length from a compound array/vector/string spec like
@@ -2447,6 +2457,14 @@
                          (class-name result-type))
                         (t result-type)))
          (result-type (%coerce-canon-head (if (consp result-type) (car result-type) result-type)))
+         ;; (VECTOR CHARACTER) / (SIMPLE-ARRAY CHARACTER (*)) is a string
+         ;; type (CLHS 15.1.2.2): build a string, not a general vector.
+         (result-type (if (and (member result-type '(vector array simple-array))
+                               (consp orig-type) (consp (cdr orig-type))
+                               (member (%coerce-canon-head (cadr orig-type))
+                                       '(character base-char standard-char)))
+                          'simple-string
+                          result-type))
          (%cv
   (cond
     ((eq result-type 'list)
@@ -2782,6 +2800,18 @@
          ((stringp a) (list (array-length a)))
          (t (error "ARRAY-DIMENSIONS: ~S is not an array" a)))))))
 
+(defun %element-type-expand (type)
+  "TYPE with user DEFTYPEs expanded until its head is not one (bounded), so an
+   element type spelled through a DEFTYPE -- flexi-streams' (deftype char* ()
+   'character) -- is classified as what it names.  Standard type names have no
+   DEFTYPE entry and come back unchanged."
+  (let ((n 0))
+    (loop
+      (let ((head (if (consp type) (car type) type)))
+        (if (and head (symbolp head) (< n 64) (%deftype-lookup head))
+            (setq type (%expand-deftype type) n (+ n 1))
+            (return type))))))
+
 (defun upgraded-array-element-type (type &optional environment)
   "Return the upgraded element type Modus actually uses for arrays of TYPE.
    Per CLHS 15.1.2.1: BIT upgrades to BIT, CHARACTER/BASE-CHAR upgrade to
@@ -2789,6 +2819,7 @@
    everything else upgrades to T (Modus stores general elements as tagged
    words)."
   (declare (ignore environment))
+  (setq type (%element-type-expand type))
   (cond
     ;; NIL element type — array that can hold no objects.
     ((null type) nil)
@@ -5201,6 +5232,7 @@
             ((eq k :displaced-index-offset)
              (unless off-set (setq off-set t off v)))))
         (setq rest (cddr rest)))
+      (when etype-set (setq etype (%element-type-expand etype)))
       ;; Allocate + fill the flat data vector.
       ;; :element-type 'character / 'base-char → underlying is a string
       ;; (subtag #x31) so STRINGP / string ops work on the result.
@@ -6374,7 +6406,7 @@
          ((and (or (eq head 'vector) (eq head 'simple-vector)
                    (eq head 'simple-array) (eq head 'array))
                (%mda-p obj))
-          (let ((et   (and (cdr type) (cadr type)))
+          (let ((et   (and (cdr type) (%element-type-expand (cadr type))))
                 (dims (and (cddr type) (caddr type)))
                 (dims-given (and (cddr type) t)))
             (and
@@ -6429,7 +6461,7 @@
           (and (not (or (fixnump obj) (characterp obj) (consp obj) (null obj)))
                (or (= (obj-subtag obj) #x31) (= (obj-subtag obj) #x32)
                    (= (obj-subtag obj) #x11) (= (obj-subtag obj) #x12))
-               (let* ((et (and (cdr type) (cadr type)))
+               (let* ((et (and (cdr type) (%element-type-expand (cadr type))))
                       (sz-given (and (cddr type) t))
                       (sz (and (cddr type) (caddr type)))
                       (is-string  (= (obj-subtag obj) #x31))

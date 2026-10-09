@@ -392,3 +392,35 @@ character streams now decode themselves.  Rule and triage recipe: CLAUDE.md,
    the 42 MB CL image's native code (%RESOLVE-OUTPUT-STREAM) and the stub was
    overwriting live code; the UEFI framebuffer words at 0x600100..0x600150 have
    the same exposure and are still there (the CL image is serial-only).
+
+
+## EC2: the verifier against the real AMD chain (2026-10-08) — PASS
+
+`SNP=1 test/nitro/aws-launch.sh` launches a `c6a` with `--cpu-options
+AmdSevSnp=enabled`.  The guest (Amazon Linux 2023, kernel 6.18) runs at VMPL0
+with `/dev/sev-guest`; the report comes from configfs-tsm with nothing
+installed (`mkdir /sys/kernel/config/tsm/report/X`, write 64 bytes to
+`inblob`, read `outblob` and `auxblob`).  With REPORT_DATA = SHA-512 of the
+guest's SSH host key, `verify-report.py` passes on a report the PSP really
+signed, and both controls fail.  Record: `test/snp/records/`.
+
+**What EC2 taught the tooling, which the stand-in key never could:**
+
+- **EC2 reports are signed by a VLEK, not a VCEK.**  The key-info word at
+  0x48 (bits 4:2) says which: 0 VCEK, 1 VLEK.  A VLEK is AMD's key for the
+  cloud provider, so `chip_id` is all zeros and the per-chip KDS URL is a 404.
+  The VLEK certificate travels with the report in the auxiliary blob's
+  certificate table (24-byte entries: GUID big-endian, offset, length; VLEK
+  GUID a8074bc2-a25a-483e-aae6-39c045a0b8a1).  Its chain is
+  `kdsintf.amd.com/vlek/v1/Milan/cert_chain`: ASVK (`SEV-VLEK-Milan`), then
+  the same ARK-Milan the kit pins.  `kds-fetch.py --aux` handles it now.
+- **The measurement is AWS's firmware.**  Proven here: the AMD chain, the
+  signature, the REPORT_DATA binding.  Not proven here: that the DDC'd image is
+  what runs — that needs our OVMF on a bare SNP host, as the rental kit does.
+
+**And the variable store is not measured either (measured 2026-10-08).**  Two
+AMIs from one snapshot, one with our Secure Boot KEK and db in `--uefi-data`:
+identical launch measurement on every guest, although the vars guest's EFI
+variables provably held our keys (`test/snp/ec2-varstore/RESULT.md`).  So EC2
+SNP cannot attest "only images signed by modus" either; it attests AWS's
+firmware and nothing a customer chooses.

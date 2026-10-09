@@ -440,32 +440,33 @@
                   (sha256-st-set st 0 (w32+ t1 t2)))))))))))
 
 ;; Override sha256-block: use array-based working state
-(defun sha256-block (block bo h)
-  (let ((w (make-array 256)))
-    ;; Expand W[0..15]
-    (dotimes (i 16)
-      (let ((j (+ bo (* i 4))))
-        (w32-wstore w (* i 4) (w32-from-be block j))))
-    ;; Expand W[16..63]
-    (let ((i 16))
-      (loop
-        (when (not (< i 64)) (return ()))
-        (let ((s0 (sha256-lsig0 (w32-wload w (* (- i 15) 4)))))
-          (let ((s1 (sha256-lsig1 (w32-wload w (* (- i 2) 4)))))
-            (let ((w7 (w32-wload w (* (- i 7) 4))))
-              (let ((w16 (w32-wload w (* (- i 16) 4))))
-                (w32-wstore w (* i 4)
-                  (w32+ s1 (w32+ w7 (w32+ s0 w16))))))))
-        (setq i (+ i 1))))
-    ;; Initialize working state from h
-    (let ((st (make-array 32)))
-      (dotimes (i 32) (aset st i (aref h i)))
-      ;; 64 rounds
-      (dotimes (i 64) (sha256-one-round w st i))
-      ;; Add back to hash state
-      (dotimes (idx 8)
-        (let ((off (* idx 4)))
-          (w32-to-be h off (w32+ (w32-from-be h off) (sha256-st-get st idx))))))))
+;; The 64-word schedule is scratch, owned by the caller: one buffer serves a whole hash
+;; (it was allocated once per BLOCK before).  Same shape as SHA512-BLOCK.
+(defun sha256-block (block bo h w)
+  ;; Expand W[0..15]
+  (dotimes (i 16)
+    (let ((j (+ bo (* i 4))))
+      (w32-wstore w (* i 4) (w32-from-be block j))))
+  ;; Expand W[16..63]
+  (let ((i 16))
+    (loop
+      (when (not (< i 64)) (return ()))
+      (let ((s0 (sha256-lsig0 (w32-wload w (* (- i 15) 4)))))
+        (let ((s1 (sha256-lsig1 (w32-wload w (* (- i 2) 4)))))
+          (let ((w7 (w32-wload w (* (- i 7) 4))))
+            (let ((w16 (w32-wload w (* (- i 16) 4))))
+              (w32-wstore w (* i 4)
+                (w32+ s1 (w32+ w7 (w32+ s0 w16))))))))
+      (setq i (+ i 1))))
+  ;; Initialize working state from h
+  (let ((st (make-array 32)))
+    (dotimes (i 32) (aset st i (aref h i)))
+    ;; 64 rounds
+    (dotimes (i 64) (sha256-one-round w st i))
+    ;; Add back to hash state
+    (dotimes (idx 8)
+      (let ((off (* idx 4)))
+        (w32-to-be h off (w32+ (w32-from-be h off) (sha256-st-get st idx)))))))
 
 ;; Print w32 pair as 8 hex chars
 (defun print-w32 (w)
@@ -551,10 +552,10 @@
               (aset h 20 #x9b) (aset h 21 #x05) (aset h 22 #x68) (aset h 23 #x8c)
               (aset h 24 #x1f) (aset h 25 #x83) (aset h 26 #xd9) (aset h 27 #xab)
               (aset h 28 #x5b) (aset h 29 #xe0) (aset h 30 #xcd) (aset h 31 #x19)
-              (let ((offset 0))
+              (let ((offset 0) (w (make-array 256)))
                 (loop
                   (when (not (< offset total)) (return ()))
-                  (sha256-block padded offset h)
+                  (sha256-block padded offset h w)
                   (setq offset (+ offset 64))))
               h)))))))
 

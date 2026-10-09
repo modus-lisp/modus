@@ -598,6 +598,9 @@
       (concatenate 'string
         (string #\Newline)
         (%rpi-mvm-text "lib/fdt.lisp")
+        (string #\Newline)
+        ;; the A53 performance counters (pmu-measure, pmu-start/pmu-read): EL2 only
+        (%rpi-mvm-text "lib/a64-pmu.lisp")
         "
 (defun %cli-getenv (name) (%bootargs-lookup (%fdt-bootargs) name))
 ;;; THE CLOCK ON BARE METAL.  ansi-bridge.lisp's GET-INTERNAL-REAL-TIME and

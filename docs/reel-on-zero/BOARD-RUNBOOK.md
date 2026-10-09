@@ -519,6 +519,23 @@ with `pi5-decode-only.lisp`, never with the MD5 harness's clock.
 
 ### PMU (PMUv3: cycle counter + 6 event counters), `serial-pmu.py`
 
+**RESOLVED 2026-10-09 -- event counters COUNT on metal; use `lib/a64-pmu.lisp`, baked
+into the board image:** `(pmu-measure (lambda () ...))` prints cycles, IPC and six
+events (`:summary`, `:stalls`, `:memory` presets, or names from `(pmu-events)`);
+`pmu-start` / `pmu-read` / `pmu-stop` by hand.  How it was settled: a system-register
+dump from inside Modus (`mrs` stubs, values stored to memory) against the counting
+399-byte payload matched in every PMU-relevant register -- EL2 controls, debug and
+OS-lock state (OSLSR_EL1 = 0xA, the OS Lock is SET in both, so it is not the
+cause), the PMU block, CPUACTLR/CPUECTLR/L2CTLR/L2ECTLR/L2ACTLR; only MAIR, page
+tables and vectors differ -- and the payload's exact sequence run as a stub INSIDE
+Modus counted 0x2D0003, as the payload does, also across ordinary Modus code
+between a start and a read stub (1 M iterations of a Lisp add loop: 29,000,080
+instructions, IPC 1.26).  So the block below was the old helpers' programming
+(PMSELR/PMXEVTYPER selection spread over several calls), not the machine: write
+PMEVTYPERn_EL0 / PMCNTENSET_EL0 directly, NSH set, in one call.  The history below
+is kept for the record.
+
+
 All from EL2 via `%jit-call` stubs (assembled words, return in x0 = VR):
 `pmu-init` sets `PMCR_EL0 = E|C` and `PMCNTENSET_EL0 = cycle`; `pmu-cycles`
 reads `PMCCNTR_EL0`; `(pmu-event-setup n ev)` selects counter n for event ev

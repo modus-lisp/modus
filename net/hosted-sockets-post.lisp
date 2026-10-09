@@ -1006,6 +1006,62 @@
   (let ((a (%sbs-addr-in ip port)))
     (if (zerop a) -12 (syscall3 42 fd a 16))))
 
+;;; UNCONNECTED UDP for the shim: sendto(2) and recvfrom(2) WITH the sender.
+;;; net/hosted-sockets.lisp's UDP-RECVFROM throws the sender away, which is fine
+;;; for one STUN server and useless for a node that serves many peers on one
+;;; socket (a FIPS node: every peer's datagrams arrive on UDP 2121).  One packed
+;;; return, as above: the byte count, with the sender left in this CPU's scratch
+;;; for %SBS-FROM-IP / %SBS-FROM-PORT to read straight after.
+
+(defun %sbs-sendto (fd arr len ip port)
+  "sendto(2): LEN bytes of ARR as ONE datagram to IP:PORT (host-order IP).  The
+   byte count, or -errno; -90 (EMSGSIZE) if it does not fit the staging buffer,
+   because splitting a datagram would change what it means."
+  (if (> len (%sock-io-cap))
+      -90
+      (let ((io (%sock-io-buf)) (i 0))
+        (loop
+          (when (>= i len) (return nil))
+          (setf (mem-ref (+ io i) :u8) (aref arr i))
+          (setq i (+ i 1)))
+        (let ((a (%sbs-addr-in ip port)))
+          (if (zerop a) -12 (syscall6 44 fd io len 0 a 16))))))
+
+(defun %sbs-recvfrom (fd arr max)
+  "recvfrom(2): one datagram into ARR, at most MAX bytes.  The byte count, or
+   -errno.  The sender's sockaddr_in stays in this CPU's scratch."
+  (let ((a (%sbs-scratch)) (want max))
+    (when (> want (%sock-io-cap)) (setq want (%sock-io-cap)))
+    (if (zerop a)
+        -12
+        (progn
+          (%ha-zero a (+ a 24))
+          (setf (mem-ref (+ a 16) :u32) 16)        ; socklen_t, in and out
+          (let ((n (syscall6 45 fd (%sock-io-buf) want 0 a (+ a 16))))
+            (when (> n 0)
+              (let ((io (%sock-io-buf)) (i 0))
+                (loop
+                  (when (>= i n) (return nil))
+                  (aset arr i (mem-ref (+ io i) :u8))
+                  (setq i (+ i 1)))))
+            n)))))
+
+(defun %sbs-from-port ()
+  "The port of the last %SBS-RECVFROM's sender, on this CPU."
+  (let ((a (%sbs-scratch)))
+    (+ (ash (mem-ref (+ a 2) :u8) 8) (mem-ref (+ a 3) :u8))))
+
+(defun %sbs-from-ip ()
+  "The host-order IPv4 address of the last %SBS-RECVFROM's sender, on this CPU."
+  (let ((a (%sbs-scratch)))
+    (+ (* (mem-ref (+ a 4) :u8) 16777216) (* (mem-ref (+ a 5) :u8) 65536)
+       (* (mem-ref (+ a 6) :u8) 256) (mem-ref (+ a 7) :u8))))
+
+(defun %sbs-poll-in (fd ms)
+  "poll(2) FD for input for at most MS milliseconds (-1: no limit).  > 0 ready,
+   0 timed out, < 0 -errno."
+  (socket-wait-readable fd ms))
+
 (defun %sbs-bind-un (fd path)
   (let ((len (%sbs-addr-un path)))
     (if (< len 0) -36 (syscall3 49 fd (%sbs-scratch) len))))

@@ -2295,13 +2295,36 @@
    by its FRAME-ENTER.  x29 sits this many bytes below the frame top, so it is
    the bias every frame offset is converted with.")
 
+(defvar *a64-no-frame-records*)        ; unbound = records on (see A64-FRAME-RECORDS-P)
+
+(defun a64-frame-records-p ()
+  "Give every frame a standard AArch64 FRAME RECORD at x29: [x29] = the caller's
+   x29, [x29+8] = the return address.  x29 is modus's locals base (the bottom of
+   the locals region, see above), so without this nothing at [x29] is a record
+   and no unwinder can walk a modus stack: perf's call graphs came back 96%
+   [unknown].  The record lives in 16 extra bytes BELOW every frame slot (slots
+   are addressed from the frame top, so none of them moves), and costs a MOV and
+   an STP per call.  Every frame's record points at its caller's, so the chain
+   is exactly what perf, gdb and a stack-walking sampler expect.
+
+   A FUNCTION, not a defvar: this file is baked into the image for the runtime
+   JIT, where a defvar's initform never runs (Limitation 7) and a T default
+   would read NIL -- every JIT-compiled frame would break the chain.  On by
+   default everywhere; a host build with MODUS_A64_NO_FRAME_RECORDS=1 binds
+   *A64-NO-FRAME-RECORDS* to compare against."
+  (not (boundp '*a64-no-frame-records*)))
+
+#+sbcl (when (sb-ext:posix-getenv "MODUS_A64_NO_FRAME_RECORDS")
+         (setf (symbol-value '*a64-no-frame-records*) t))
+
 (defun a64-locals-bytes (slots)
   "Locals region for SLOTS frame slots: slot N is at top-64-8N.  The unsized
    frame keeps its 1024 bytes (slots 0..120).  64+8*SLOTS is 16-aligned since
-   SLOTS is a multiple of 8."
-  (if (= slots +frame-legacy-slots+)
-      +a64-locals-frame-size+
-      (+ 64 (* 8 slots))))
+   SLOTS is a multiple of 8.  Plus 16 for the frame record at the bottom."
+  (+ (if (= slots +frame-legacy-slots+)
+         +a64-locals-frame-size+
+         (+ 64 (* 8 slots)))
+     (if (a64-frame-records-p) 16 0)))
 
 (defun a64-fp-off (top-relative-offset)
   "Convert a (negative) frame-top-relative offset to an x29-relative one."
@@ -2498,6 +2521,8 @@
    x27 to survive the inner call."
   ;; Entering a new function: nothing the caller's block knew is true here.
   (a64-slot-cache-flush)
+  ;; The caller's frame pointer, for this frame's record (A64-FRAME-RECORDS-P)
+  (when (a64-frame-records-p) (a64-mov-reg buf +a64-x16+ +a64-x29+))
   ;; Save FP and LR, allocate save area
   (a64-stp-pre buf +a64-x29+ +a64-x30+ +a64-sp+ (- +a64-save-area+))
   ;; Save callee-saved registers (x19-x23, x27)
@@ -2513,7 +2538,9 @@
   ;; Set up frame pointer LAST, at the BOTTOM of the locals region, so every
   ;; local is at a positive (scaled-imm12-encodable) offset from it.
   ;; (Cannot use a64-mov-reg because ORR encodes reg 31 as XZR, not SP)
-  (a64-add-imm buf +a64-x29+ +a64-sp+ 0))
+  (a64-add-imm buf +a64-x29+ +a64-sp+ 0)
+  ;; The frame record: [x29] = caller's x29, [x29+8] = return address
+  (when (a64-frame-records-p) (a64-stp-offset buf +a64-x16+ +a64-x30+ +a64-x29+ 0)))
 
 (defun a64-emit-epilogue (buf)
   "Emit the standard function epilogue:

@@ -3433,25 +3433,43 @@
      nil)
     (t nil)))
 
-;; The PUBLIC comparison operators' slow path (CLHS 12.2: the arguments of
-;; < > <= >= are REALs and of = /= NUMBERs, and anything else signals
-;; TYPE-ERROR).  The helpers above answer NIL for a non-number -- their ~45
-;; internal callers may rely on that, so their contract stays -- which made
-;; (< 5 nil) quietly false.  A library comparing against a constant that was
-;; never initialised then looped forever instead of failing (cl-nostr's
-;; GENERATE-KEYPAIR against secp256k1-fast's *SECP256K1-N*).
-;; compile-compare-2's slow path and the functional < = ... call these; the
-;; fixnum fast path never reaches them, so only bignum/float/ratio compares
-;; pay for the check.
+;; The PUBLIC comparison operators (CLHS 12.2: the arguments of < > <= >= are
+;; REALs and of = /= NUMBERs; anything else signals TYPE-ERROR).  The helpers
+;; above answer NIL for a non-number -- their ~45 internal callers may rely on
+;; that, so their contract stays -- which made (< 5 nil) quietly false: a
+;; library comparing against a constant that was never initialised looped
+;; forever instead of failing (cl-nostr's GENERATE-KEYPAIR against
+;; secp256k1-fast's *SECP256K1-N*, which only SBCL initialised at load).
+;;
+;; TWO STRENGTHS, and why.  The functional operators (#'< under FUNCALL /
+;; APPLY / SORT) and one-argument forms check fully with REALP / NUMBERP.  The
+;; COMPILED two-argument slow path (%CHECKED-*) refuses only NIL and T.  The
+;; runtime itself compares RAW MACHINE WORDS with < in places -- an odd code
+;; address read with (MEM-REF .. :U64) carries a character's tag -- and those
+;; reach this slow path as "non-numbers".  Each such site was already wrong
+;; (the old helpers answered NIL, so the test was dead: FUNCTIONP's code-range
+;; arm, the printer's depth guard); a full check turns each into a signal, and
+;; in the ANSI runner one of them recursed into SIGSEGV at startup.  NIL and T
+;; are exact immediates no raw word ever equals, and NIL is the uninitialised-
+;; variable case that actually bites.  Full checking here waits on an audit of
+;; the runtime's raw-word comparisons.
 (defun %compare-type-error (x type)
   (error 'type-error :datum x :expected-type type))
 (defun %real-arg (x) (if (realp x) x (%compare-type-error x 'real)))
 (defun %number-arg (x) (if (numberp x) x (%compare-type-error x 'number)))
-(defun %checked-lt (a b) (%real-arg a) (%real-arg b) (numeric-value-less-p a b))
-(defun %checked-gt (a b) (%real-arg a) (%real-arg b) (numeric-value-less-p b a))
-(defun %checked-le (a b) (%real-arg a) (%real-arg b) (numeric-<= a b))
-(defun %checked-ge (a b) (%real-arg a) (%real-arg b) (numeric->= a b))
-(defun %checked-eq (a b) (%number-arg a) (%number-arg b) (numeric-equal-p a b))
+(defun %cmp-immediate-check (a b type)
+  (when (or (null a) (eq a t)) (%compare-type-error a type))
+  (when (or (null b) (eq b t)) (%compare-type-error b type)))
+(defun %checked-lt (a b) (%cmp-immediate-check a b 'real) (numeric-value-less-p a b))
+(defun %checked-gt (a b) (%cmp-immediate-check a b 'real) (numeric-value-less-p b a))
+(defun %checked-le (a b) (%cmp-immediate-check a b 'real) (numeric-<= a b))
+(defun %checked-ge (a b) (%cmp-immediate-check a b 'real) (numeric->= a b))
+(defun %checked-eq (a b) (%cmp-immediate-check a b 'number) (numeric-equal-p a b))
+(defun %strict-lt (a b) (%real-arg a) (%real-arg b) (numeric-value-less-p a b))
+(defun %strict-gt (a b) (%real-arg a) (%real-arg b) (numeric-value-less-p b a))
+(defun %strict-le (a b) (%real-arg a) (%real-arg b) (numeric-<= a b))
+(defun %strict-ge (a b) (%real-arg a) (%real-arg b) (numeric->= a b))
+(defun %strict-eq (a b) (%number-arg a) (%number-arg b) (numeric-equal-p a b))
 
 ;; LOOP comparison helpers — fast fixnum path inline, slow numeric path
 ;; for floats/ratios. Used by generate-loop-code so end-tests don't hang

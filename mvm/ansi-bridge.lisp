@@ -22,14 +22,14 @@
         ((null (cdr cs)) (%number-arg (car cs)) t)
         (t (let ((a (car cs)) (rest (cdr cs)))
              (loop (when (null rest) (return t))
-               (unless (%checked-eq a (car rest)) (return nil))
+               (unless (%strict-eq a (car rest)) (return nil))
                (setq rest (cdr rest)))))))
 (defun < (&rest cs)
   (cond ((null cs) t)
         ((null (cdr cs)) (%real-arg (car cs)) t)
         (t (let ((a (car cs)) (rest (cdr cs)))
              (loop (when (null rest) (return t))
-               (unless (%checked-lt a (car rest)) (return nil))
+               (unless (%strict-lt a (car rest)) (return nil))
                (setq a (car rest))
                (setq rest (cdr rest)))))))
 (defun > (&rest cs)
@@ -37,7 +37,7 @@
         ((null (cdr cs)) (%real-arg (car cs)) t)
         (t (let ((a (car cs)) (rest (cdr cs)))
              (loop (when (null rest) (return t))
-               (unless (%checked-gt a (car rest)) (return nil))
+               (unless (%strict-gt a (car rest)) (return nil))
                (setq a (car rest))
                (setq rest (cdr rest)))))))
 (defun <= (&rest cs)
@@ -45,7 +45,7 @@
         ((null (cdr cs)) (%real-arg (car cs)) t)
         (t (let ((a (car cs)) (rest (cdr cs)))
              (loop (when (null rest) (return t))
-               (unless (%checked-le a (car rest)) (return nil))
+               (unless (%strict-le a (car rest)) (return nil))
                (setq a (car rest))
                (setq rest (cdr rest)))))))
 (defun >= (&rest cs)
@@ -53,7 +53,7 @@
         ((null (cdr cs)) (%real-arg (car cs)) t)
         (t (let ((a (car cs)) (rest (cdr cs)))
              (loop (when (null rest) (return t))
-               (unless (%checked-ge a (car rest)) (return nil))
+               (unless (%strict-ge a (car rest)) (return nil))
                (setq a (car rest))
                (setq rest (cdr rest)))))))
 (defun /= (&rest cs)
@@ -1091,6 +1091,12 @@
             (allow-other nil)
             (t (error "parse-integer: bad keyword"))))
         (setq a (cddr a))))
+    ;; The scan below reads raw char codes with %PRIM-AREF, which is right only
+    ;; for a SIMPLE string: a fill-pointer / adjustable one is a header object
+    ;; (%MDA-P) whose own slots are not the characters, and %PRIM-STRINGP says T
+    ;; for it too.  Scan a simple copy -- LENGTH honours the fill pointer, so
+    ;; :START / :END and the returned position mean the same thing.
+    (when (%mda-p string) (setq string (coerce string 'simple-string)))
     (let ((len (length string)))
       (when (null end) (setq end len))
       ;; Skip leading whitespace
@@ -2508,6 +2514,23 @@
             (when (>= i len) (return s))
             (let ((raw (%wrapper-aref object i)))
               (aset s i (if (integerp raw) raw (char-code raw))))
+            (setq i (+ i 1)))))
+       ;; A string that is not SIMPLE -- the header-object arrays a fill-pointer
+       ;; or adjustable MAKE-ARRAY returns, which the CONSP arm above does not
+       ;; cover -- must be COPIED for a SIMPLE- target (CLHS 4.7: COERCE returns
+       ;; an object of RESULT-TYPE).  Returning it unchanged handed back an
+       ;; object whose header said string and whose slots did not hold codes, so
+       ;; compiled CHAR/SCHAR read raw slots and got garbage: seal's UTF8-DECODE
+       ;; ends in exactly this coerce, and every websocket message it decoded
+       ;; parsed as junk.
+       ((and (%mda-p object) (stringp object)
+             (or (eq result-type 'simple-string) (eq result-type 'simple-base-string)))
+        (let* ((len (length object))
+               (s (%make-string-array len))
+               (i 0))
+          (loop
+            (when (>= i len) (return s))
+            (aset s i (char-code (char object i)))
             (setq i (+ i 1)))))
        ((stringp object) object)
        ;; General (non-string-subtag) VECTOR of characters, e.g.

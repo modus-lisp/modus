@@ -3878,8 +3878,14 @@
     ;; The bottom-two-bits mask preserved here for the few odd-nibble
     ;; fn-addrs the pre-tag alignment dodge couldn't avoid.  Once every
     ;; site is audited and all fn-addrs are tagged, this branch can go.
-    ((let* ((base (mem-ref #x10000160 :u64))
-            (end  (mem-ref #x10000168 :u64))
+    ;; The bounds are RAW words: an odd code address carries a non-fixnum tag
+    ;; (low nibble 5 reads as a character), so comparing it with < went to the
+    ;; generic slow path -- which answered NIL for a non-number, so this arm was
+    ;; dead in any image whose code base is odd, and now signals TYPE-ERROR.
+    ;; Clearing bit 0 makes every operand fixnum-shaped; the fast path compares
+    ;; the words directly, which is what this test always meant.
+    ((let* ((base (logand (mem-ref #x10000160 :u64) -2))
+            (end  (logand (mem-ref #x10000168 :u64) -2))
             (xs   (logand x -2)))
        (and (> base 0) (>= xs base) (< xs end))) t)
     ((characterp x) nil)

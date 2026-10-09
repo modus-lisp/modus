@@ -1088,6 +1088,16 @@
   ;; Set default pathname defaults to the ANSI test sandbox directory
   (setq *default-pathname-defaults* \"/home/claude/modus/tmp/ansi-test/sandbox/\")
 
+  ;; Run every global's init thunk, as the shipping CLI does at boot
+  ;; (build-cli-common).  This runner skipped it -- \"not safe\" when defvar
+  ;; thunks still assigned unconditionally; they assign only when unbound now
+  ;; (f8ec62b) -- so every DEFVAR/DEFPARAMETER the setqs below do not name read
+  ;; NIL here and nowhere else: the compiler's frame-overflow limit, the
+  ;; harness's own fork-retry cap, condition-system depths.  A numeric test on
+  ;; one used to be quietly false; comparing NIL now signals TYPE-ERROR, which
+  ;; turned each into a startup failure.  The setqs below still run after it.
+  (handler-case (init-all-globals) (t (c) nil))
+
   ;; Init file I/O scratch buffers (defvar defaults not applied without init-all-globals)
   (setq *cstr-scratch* #x0FE00000)  ; moved below heap base
   (setq *io-buf-addr*  #x0FF00000)  ; moved out of heap semispace 0; see memory note

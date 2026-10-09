@@ -3294,12 +3294,21 @@
                              (eq (obj-subtag seq) #x12)) (%make-f32-vector len))
                        (t (make-array len)))))
         (let ((i 0))
-          (if (%bulk-copy-ok-p result seq)
-              (progn (%bulk-copy result 0 seq start len) result)
+          (cond
+            ;; Byte vectors: %BULK-COPY-OK-P excludes #x11 on purpose (word
+            ;; slots are not bytes), so they fell to the element loop below --
+            ;; a generic AREF/ASET per byte.  pagetree slices every overflow
+            ;; value out of its leaf blob with SUBSEQ: cabinet's WRITE-FILE of a
+            ;; 1.8 MB clip spent 58% of 314 s on the Zero right here.
+            ((%bulk-copy-u8-ok-p result seq)
+             (%bulk-copy-u8 result 0 seq start len) result)
+            ((%bulk-copy-ok-p result seq)
+             (%bulk-copy result 0 seq start len) result)
+            (t
               (loop
                 (when (= i len) (return result))
                 (aset result i (aref seq (+ start i)))
-                (setq i (+ i 1)))))))))
+                (setq i (+ i 1))))))))))
 
 (defun concatenate-strings (s1 s2)
   "Concatenate two strings (arrays of chars)."

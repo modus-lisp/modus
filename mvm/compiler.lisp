@@ -9719,6 +9719,23 @@
        results))
     ;; QUOTE: data, never assignments -- and never macroexpanded.
     ((and (symbolp (car form)) (string= (symbol-name (car form)) "QUOTE")) nil)
+    ;; LET / LET*: a binding is (VAR INIT), not a form -- only INIT is code.
+    ;; Walked as a form, (let* ((macrolet 17)) ...) reached the MACROLET arm
+    ;; below with 17 as its definitions and signalled while COMPILING
+    ;; (ansi-test LET*.15 binds every non-variable CL symbol).
+    ((and (symbolp (car form))
+          (or (string= (symbol-name (car form)) "LET")
+              (string= (symbol-name (car form)) "LET*"))
+          (consp (cdr form)) (listp (cadr form)))
+     (let ((results nil))
+       (dolist (b (cadr form))
+         (when (and (consp b) (consp (cdr b)))
+           (dolist (v (collect-setq-vars-in-body (cadr b) bound-vars mx))
+             (setq results (adjoin v results :test #'name-equal)))))
+       (dolist (f (cddr form))
+         (dolist (v (collect-setq-vars-in-body f bound-vars mx))
+           (setq results (adjoin v results :test #'name-equal))))
+       results))
     ;; A BACKQUOTE TEMPLATE is data with code only in its commas: scan the
     ;; expansion, never the template (whose COND / LET heads with comma
     ;; structs for operands the macro branch below would try to expand).
@@ -9729,7 +9746,7 @@
     ;; is seen through its expansion (quri's URL-DECODE: a closure over CHAR,
     ;; which only a MACROLET'd GOTO assigns, decoded "a%20b" to "aaaaa").
     ((and (symbolp (car form)) (string= (symbol-name (car form)) "MACROLET")
-          (consp (cdr form)))
+          (consp (cdr form)) (listp (cadr form)))
      (let ((saved nil))
        (unwind-protect
             (progn
@@ -9749,7 +9766,7 @@
     ;; SYMBOL-MACROLET: an assignment to a symbol macro whose expansion is a
     ;; watched variable assigns that variable.
     ((and (symbolp (car form)) (string= (symbol-name (car form)) "SYMBOL-MACROLET")
-          (consp (cdr form)))
+          (consp (cdr form)) (listp (cadr form)))
      (let ((results (collect-setq-vars-in-body (cons 'progn (cddr form)) bound-vars mx)))
        (dolist (sm (cadr form))
          (when (and (consp sm) (consp (cdr sm)) (symbolp (cadr sm))

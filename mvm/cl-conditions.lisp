@@ -364,7 +364,12 @@
       ((typep c 'unbound-variable)
        (format stream "The variable ~S is unbound." (slot 'name)) t)
       ((typep c 'undefined-function)
-       (format stream "The function ~S is undefined." (slot 'name)) t)
+       ;; The direct-call path records the NAME as a string.
+       (format stream (if (stringp (slot 'name))
+                          "The function ~A is undefined."
+                          "The function ~S is undefined.")
+               (slot 'name))
+       t)
       ((typep c 'unbound-slot)
        (format stream "The slot ~S is unbound in the object ~S." (slot 'name) (slot 'instance)) t)
       ;; A native fault knows nothing about the operation or its operands:

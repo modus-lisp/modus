@@ -70,7 +70,11 @@
                             (> (length (car nh)) 0)
                             *symbol-function-table*
                             (gethash (car nh) *symbol-function-table*))))
-              (if nfn nfn sym)))))))
+              ;; Still nothing: SYMBOL-FUNCTION's full lookup, which signals
+              ;; UNDEFINED-FUNCTION when there is none.  Returning SYM here
+              ;; made (funcall 'undefined ...) call the symbol itself and
+              ;; fault -- a MEMORY-FAULT-ERROR instead of UNDEFINED-FUNCTION.
+              (if nfn nfn (symbol-function sym))))))))
 
 (defun %sym-name-or-hash (sym)
   "Return (cons NAME-STR HASH) for SYM if it's any flavor of symbol:

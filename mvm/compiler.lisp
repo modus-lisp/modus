@@ -19320,12 +19320,14 @@
     ;; per-call-site growth safe.
     (emit-ir-label slow-label)
     (let ((helper (cond
-                    ((eq branch-op :beq) "NUMERIC-EQUAL-P")
-                    ((eq branch-op :blt) "NUMERIC-VALUE-LESS-P")
-                    ((eq branch-op :bgt) "%NUMERIC-VALUE-GREATER-P")
-                    ((eq branch-op :ble) "NUMERIC-<=")
-                    ((eq branch-op :bge) "NUMERIC->=")
-                    (t                   "NUMERIC-EQUAL-P"))))
+                    ;; the %CHECKED- wrappers (cl-types) signal TYPE-ERROR
+                    ;; for a non-number operand, as CLHS 12.2 requires
+                    ((eq branch-op :beq) "%CHECKED-EQ")
+                    ((eq branch-op :blt) "%CHECKED-LT")
+                    ((eq branch-op :bgt) "%CHECKED-GT")
+                    ((eq branch-op :ble) "%CHECKED-LE")
+                    ((eq branch-op :bge) "%CHECKED-GE")
+                    (t                   "%CHECKED-EQ"))))
       (emit-ir :mov +vreg-v0+ dest)
       (emit-ir :mov +vreg-v1+ a-temp)
       (emit-ir :set-nargs 2)
@@ -19362,7 +19364,8 @@
     ;; operand still signals TYPE-ERROR — `.5` tests rely on that
     ;; (`(loop for x in *universe* when (and (typep x 'real) (not (< x))) …)`).
     ((null (cdr args))
-     (compile-form `(progn ,(car args) t) env dest))
+     (compile-form `(progn (,(if (eq branch-op :beq) '%number-arg '%real-arg) ,(car args)) t)
+                   env dest))
     ;; 2 args: simple comparison
     ((null (cddr args))
      (compile-compare-2 branch-op (car args) (cadr args) env dest))

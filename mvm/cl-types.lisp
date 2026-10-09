@@ -3433,6 +3433,26 @@
      nil)
     (t nil)))
 
+;; The PUBLIC comparison operators' slow path (CLHS 12.2: the arguments of
+;; < > <= >= are REALs and of = /= NUMBERs, and anything else signals
+;; TYPE-ERROR).  The helpers above answer NIL for a non-number -- their ~45
+;; internal callers may rely on that, so their contract stays -- which made
+;; (< 5 nil) quietly false.  A library comparing against a constant that was
+;; never initialised then looped forever instead of failing (cl-nostr's
+;; GENERATE-KEYPAIR against secp256k1-fast's *SECP256K1-N*).
+;; compile-compare-2's slow path and the functional < = ... call these; the
+;; fixnum fast path never reaches them, so only bignum/float/ratio compares
+;; pay for the check.
+(defun %compare-type-error (x type)
+  (error 'type-error :datum x :expected-type type))
+(defun %real-arg (x) (if (realp x) x (%compare-type-error x 'real)))
+(defun %number-arg (x) (if (numberp x) x (%compare-type-error x 'number)))
+(defun %checked-lt (a b) (%real-arg a) (%real-arg b) (numeric-value-less-p a b))
+(defun %checked-gt (a b) (%real-arg a) (%real-arg b) (numeric-value-less-p b a))
+(defun %checked-le (a b) (%real-arg a) (%real-arg b) (numeric-<= a b))
+(defun %checked-ge (a b) (%real-arg a) (%real-arg b) (numeric->= a b))
+(defun %checked-eq (a b) (%number-arg a) (%number-arg b) (numeric-equal-p a b))
+
 ;; LOOP comparison helpers — fast fixnum path inline, slow numeric path
 ;; for floats/ratios. Used by generate-loop-code so end-tests don't hang
 ;; on boxed-float end-forms.

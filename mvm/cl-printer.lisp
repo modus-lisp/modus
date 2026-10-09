@@ -754,7 +754,12 @@
   ;; it the binding below is LEXICAL, every frame reads the global 0 and the
   ;; guard never fires (measured: a 1500-deep list printed straight through).
   (declare (special *%write-depth*))
-  (let ((d *%write-depth*))
+  ;; Before INIT-ALL-GLOBALS runs (boot FORMATs while compiling) the DEFVAR's
+  ;; 0 has not been stored and the variable reads NIL.  That used to make the
+  ;; guard (> NIL limit) -- quietly false, so the guard was off -- and the
+  ;; binding (+ NIL 1).  Now that < > signal TYPE-ERROR for a non-number it
+  ;; was a boot-time signal with no handler; read an unset depth as 0.
+  (let ((d (if (fixnump *%write-depth*) *%write-depth* 0)))
     (when (> d +%write-depth-limit+)
       (error "printer: structure nested deeper than ~D levels -- a circular object printed with *PRINT-CIRCLE* NIL?" +%write-depth-limit+))
     (let ((*%write-depth* (+ d 1)))

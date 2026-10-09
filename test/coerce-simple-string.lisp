@@ -32,6 +32,12 @@
 ;; PARSE-INTEGER on a non-simple string (it read raw slots: PARSE-ERROR)
 (check "parse-integer fill-pointer" (multiple-value-list (parse-integer (build "[12,") :start 1 :end 3)) '(12 3))
 (check "parse-integer junk" (parse-integer (build " 42x") :junk-allowed t) 42)
+;; TYPEP: a string is never an array of a non-character element type
+(check "typep string u8" (typep "abc" '(vector (unsigned-byte 8))) nil)
+(check "typep string simple-array u8" (typep "abc" '(simple-array (unsigned-byte 8) (*))) nil)
+(check "typep string integer" (typep "abc" '(vector integer)) nil)
+(check "typep string character" (typep "abc" '(vector character)) t)
+(check "typep u8 vector u8" (typep (make-array 3 :element-type '(unsigned-byte 8)) '(vector (unsigned-byte 8))) t)
 ;; a target that is not SIMPLE- may keep the object (CLHS: already of the type)
 (check "coerce 'string keeps a string" (equal (coerce (build "xy") 'string) "xy") t)
 (check "simple string unchanged" (let ((s "abc")) (eq (coerce s 'simple-string) s)) t)

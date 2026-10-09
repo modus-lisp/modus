@@ -6546,7 +6546,15 @@
                          ((eq et 'base-char)            is-string)
                          ((eq et 'standard-char)        is-string)
                          ((eq et 'bit)                  is-bitvec)
-                         (t t))))
+                         ;; Any other element type -- (unsigned-byte 8), an
+                         ;; integer type, a DEFTYPE -- is not CHARACTER, so a
+                         ;; STRING never has it.  A general array stays a match:
+                         ;; Modus does not track its element type.  This was
+                         ;; (t t), so (typep "abc" '(vector (unsigned-byte 8)))
+                         ;; was T and code telling octets from text (cl-marmot's
+                         ;; store hex-encodes octets and keeps strings) took a
+                         ;; string for bytes.
+                         (t (not is-string)))))
                  (and et-ok
                       (cond
                         ((not sz-given) t)

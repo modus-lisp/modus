@@ -1921,6 +1921,18 @@
    String hash is CASE-SENSITIVE.  MASK = bucket-count minus one (the
    bucket vector is a power of two in length and GROWS with the table)."
   (cond
+    ;; A string that is not a RAW string -- an adjustable / fill-pointer /
+    ;; displaced one, whose object is an array header -- is hashed by its
+    ;; contents through a simple copy.  The branch below reads RAW slots
+    ;; 0..LENGTH-1 with %PRIM-AREF, which on a header runs past its few slots
+    ;; into whatever follows: ANSI's universe (SIMPLE-BASE-STRING 32) wrapper
+    ;; faulted in GENERIC-MULTIPLY once the eval cache began hashing list keys
+    ;; that contain one (THE.8/9, ELT.ERROR.5).  Equal contents, equal hash.
+    ((and strcmp? (stringp key) (not (and (%prim-stringp key) (not (%mda-p key)))))
+     (let ((c (copy-seq key)))
+       (if (and (%prim-stringp c) (not (%mda-p c)))
+           (%ht-hash c t mask)
+           (%ht-nohash))))
     ((stringp key)
      (if strcmp?
          ;; THE STRING HASH MUST STAY IN FIXNUMS AT THE TARGET'S WIDTH, like the

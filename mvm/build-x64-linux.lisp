@@ -1001,18 +1001,6 @@
   ;; Initialize package system (creates CL, CL-USER, KEYWORD, test packages)
   ;; %init-packages's last step IS %export-standard-cl-symbols.
   (%init-packages)
-  ;; Run every global's init thunk, as the shipping CLI does at boot
-  ;; (build-cli-common).  This runner skipped it -- \"not safe\" when defvar
-  ;; thunks still assigned unconditionally; they assign only when unbound now
-  ;; (f8ec62b) -- so every DEFVAR/DEFPARAMETER the setqs below do not name read
-  ;; NIL here and nowhere else: the compiler's frame-overflow limit, the
-  ;; harness's own fork-retry cap, condition-system depths.  A numeric test on
-  ;; one used to be quietly false; comparing NIL now signals TYPE-ERROR, which
-  ;; turned each into a startup failure.  It runs FIRST, right after the
-  ;; package system exists, so every %INIT- step below (scaffolding, test defs,
-  ;; compiler macros, CLOS, translator, the sandbox path, the setqs) builds on
-  ;; it: run later, an unconditional thunk reset what they had set.
-  (handler-case (init-all-globals) (t (c) nil))
   (%init-ansi-test-scaffolding)   ; test packages + CL-TEST alias: harness images only
 
   ;; Initialize standard streams
@@ -1125,6 +1113,39 @@
   ;; with N=NIL).  Two gensyms hash-collide in symbol-function table.
   (setq *gensym-counter* 0)
   (setq *gentemp-counter* 0)
+  ;; Globals the runtime, the in-image compiler and this harness compare
+  ;; numerically.  This runner does not call INIT-ALL-GLOBALS (it would reset
+  ;; what the %INIT- steps above set up: measured, macro-function / describe /
+  ;; pprint-dispatch tests lost), so these read NIL here and only here, and
+  ;; (> n NIL) used to be quietly false: the compiler's frame-overflow check,
+  ;; *COMPILE-SAFETY*, the JIT cell counters, the harness's fork-retry and
+  ;; no-progress caps were all OFF in the image that measures conformance.
+  ;; Comparing NIL now signals TYPE-ERROR, so run each one's own init thunk
+  ;; (its DEFVAR's initform, not a copy of the value).
+  (|INIT-*LET-BINDING-LIMIT*|)
+  (|INIT-*COMPILE-SAFETY*|)
+  (|INIT-*FUZZ-FUNCALL-NOPS*|)
+  (|INIT-*GV-CACHE-COUNT*|)
+  (|INIT-*JIT-LCELL-NEXT*|)
+  (|INIT-*JIT-LCELL-END*|)
+  (|INIT-*SIGNAL-WALK-DEPTH*|)
+  (|INIT-*WS5-STR-BAKE-MIN*|)
+  (|INIT-*FORK-RETRY-CAP*|)
+  (|INIT-*NO-PROGRESS-CAP*|)
+  (|INIT-*NO-FORK-DEBUG*|)
+  (|INIT-*ARITH-PUSH-DEPTH*|)
+  (|INIT-*IR-PUSH-DEPTH*|)
+  (|INIT-*PROMOTE-LOOP-DEPTH*|)
+  (|INIT-*INLINE-EXPANSIONS*|)
+  (|INIT-*CF-TRACE-I*|)
+  (|INIT-*%CIRC-NEXT*|)
+  (|INIT-*%SYM-COUNT*|)
+  (|INIT-*JIT-BRIDGE-GEN*|)
+  (|INIT-*BACKQUOTE-DEPTH*|)
+  (|INIT-*TEMP-REG-COUNTER*|)
+  (|INIT-*FP-REG-COUNTER*|)
+  (|INIT-*%IRT-COUNTER*|)
+  (|INIT-*%IRUN-COUNTER*|)
 
   ;; WS4-S5b: the JIT gate is a DEFUN (%jit-enabled-p) overridden at build time
   ;; from MODUS_USE_JIT (see the @@USE-JIT-DEFUN@@ substitution after the driver

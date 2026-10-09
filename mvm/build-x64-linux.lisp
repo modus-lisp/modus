@@ -1197,6 +1197,17 @@
   (setq least-negative-short-float    (%round-to-single -1.4d-45))
   (setq least-positive-long-float     5.0d-324)
   (setq least-negative-long-float    -5.0d-324)
+  ;; The NORMALIZED limits were never set here, so they read NIL -- and
+  ;; zerop.8/zerop.9 (#'ZEROP over every float limit) passed only because
+  ;; (zerop NIL) answered NIL instead of signalling.
+  (setq least-positive-normalized-double-float  2.2250738585072014d-308)
+  (setq least-negative-normalized-double-float -2.2250738585072014d-308)
+  (setq least-positive-normalized-long-float    2.2250738585072014d-308)
+  (setq least-negative-normalized-long-float   -2.2250738585072014d-308)
+  (setq least-positive-normalized-single-float (%round-to-single 1.1754944d-38))
+  (setq least-negative-normalized-single-float (%round-to-single -1.1754944d-38))
+  (setq least-positive-normalized-short-float  (%round-to-single 1.1754944d-38))
+  (setq least-negative-normalized-short-float  (%round-to-single -1.1754944d-38))
 
   ;; Standard CL constants the ANSI test auxiliary files reference
   ;; (char-code-limit, call-arguments-limit, *-fixnum). Without these

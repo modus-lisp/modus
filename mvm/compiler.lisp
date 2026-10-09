@@ -3670,7 +3670,14 @@
                                   out))
                            (t (push `((eql ,tmp ',keys) ,@effective-body) out)))))
                      (nreverse out))
-                 (t (%signal-type-error)))))))
+                 (t (%signal-type-error
+                     ,tmp
+                     '(member ,@(let ((ks nil))
+                                  (dolist (cl clauses (nreverse ks))
+                                    (let ((k (car cl)))
+                                      (if (listp k)
+                                          (dolist (x k) (push x ks))
+                                          (push k ks)))))))))))))
 
   ;; DOLIST → LET + LOOP.  Per CLHS body is an implicit tagbody.
   (mvm-define-macro "DOLIST"
@@ -5388,8 +5395,10 @@
                (cond
                  ((null report-opt) nil)
                  ;; (:report (lambda (c s) …)) — opt is a list whose car is lambda
+                 ;; FUNCTION, not QUOTE: a quoted lambda stored the LIST, and
+                 ;; printing the condition funcall'd it -- UNDEFINED-FUNCTION.
                  ((and (consp (car report-opt)) (eq (caar report-opt) 'lambda))
-                  (list 'quote (car report-opt)))
+                  (list 'function (car report-opt)))
                  ;; (:report name) — opt is (name)
                  ((symbolp (car report-opt))
                   (list 'quote (car report-opt)))
@@ -8624,7 +8633,7 @@
                                       (effective-body (or body '(nil))))
                                  `((typep ,tmp ',type) ,@effective-body)))
                              clauses)
-                   (t (%signal-type-error))))
+                   (t (%signal-type-error ,tmp '(or ,@(mapcar (function car) clauses))))))
           env dest)))
 
       ;; CCASE — like CASE but signals TYPE-ERROR on no-match (restartable
@@ -19468,7 +19477,7 @@
   (cond
     ((and (consp arg) (eq (car arg) 'quote)
           (not (null (cadr arg))) (not (consp (cadr arg))))
-     (compile-form '(%signal-type-error) env dest))
+     (compile-form `(%signal-type-error ,arg 'list) env dest))
     (t
      (compile-form arg env dest)
      (compile-cxr-guard-and-deref :car dest env))))
@@ -19479,7 +19488,7 @@
   (cond
     ((and (consp arg) (eq (car arg) 'quote)
           (not (null (cadr arg))) (not (consp (cadr arg))))
-     (compile-form '(%signal-type-error) env dest))
+     (compile-form `(%signal-type-error ,arg 'list) env dest))
     (t
      (compile-form arg env dest)
      (compile-cxr-guard-and-deref :cdr dest env))))
@@ -19493,7 +19502,6 @@
    On unhandled fall-through (handler-case absent and %signal-type-error
    returns NIL) the value left in DEST is NIL — matches the CLHS
    suggestion that error-recovery should yield a defined value."
-  (declare (ignore env))
   (let ((null-label  (make-compiler-label))
         (cons-label  (make-compiler-label))
         (error-label (make-compiler-label))
@@ -19516,10 +19524,9 @@
     ;; longjmps when a handler-case is active; otherwise it returns
     ;; NIL and we fall through to done with dest = NIL.
     (emit-ir-label error-label)
-    ;; mvm-eval bridge nargs — see compile-funcall's NIL-guard.
-    (when *mvm-emit-halves* (emit-ir :set-nargs 0))
-    (emit-ir :call "%SIGNAL-TYPE-ERROR" 0)
-    (emit-ir :mov dest +vreg-vr+)
+    ;; The offending value is in DEST: pass it, and LIST, so the report
+    ;; names them ("The value 5 is not of type LIST.").
+    (compile-form `(%signal-type-error (%%lx-reg ,dest) 'list) env dest)
     (emit-ir-label done-label)
     (free-temp-reg)))
 
@@ -25559,7 +25566,9 @@
             ;; path uses CTOR-SYM (task #241): the user wrote the name in a
             ;; particular package and two packages' structs must not collide.
             (predicate-name :default)
-            (copier-name :default))
+            (copier-name :default)
+            ;; (:PRINT-FUNCTION fn) / (:PRINT-OBJECT fn): (kind . fn), or NIL.
+            (print-option nil))
        ;; Process options
        (dolist (opt options)
          (when (consp opt)
@@ -25579,6 +25588,10 @@
                                           cn
                                           (symbol-name cn)))
                                     nil)))  ; (:conc-name nil) → no prefix
+               ((and (name-eq opt-name "PRINT-FUNCTION") (cdr opt) (cadr opt))
+                (setf print-option (cons :print-function (cadr opt))))
+               ((and (name-eq opt-name "PRINT-OBJECT") (cdr opt) (cadr opt))
+                (setf print-option (cons :print-object (cadr opt))))
                ((name-eq opt-name "INCLUDE")
                 (setf include-parent (cadr opt))
                 (setf include-overrides (cddr opt)))
@@ -26038,6 +26051,24 @@
        ;; AREF/ASET cond entirely — which was already testing %MDA-P (itself
        ;; five type tests plus an OBJ-SUBTAG), CONSP and %PRIM-STRINGP on
        ;; every single slot access.  See GATE-RESULT-244-accessors.md.
+       ;; The printer consults this before printing #S(...).  It was parsed
+       ;; nowhere: a struct with :PRINT-FUNCTION / :PRINT-OBJECT printed
+       ;; #S(...) regardless.
+       ;; A lambda printer becomes a named function, so what is registered is
+       ;; a symbol; at runtime it is registered NOW, at expansion time, as
+       ;; %REGISTER-STRUCT-TYPE is below (generated toplevel calls compile
+       ;; to thunks that do not run).
+       (when print-option
+         (let* ((fn (cdr print-option))
+                (fsym (if (symbolp fn)
+                          fn
+                          (%defstruct-intern (format nil "%PRINT-~A" struct-str)))))
+           (unless (symbolp fn)
+             (push `(defun ,fsym ,@(cdr fn)) forms-to-compile))
+           (when *mvm-eval-runtime-p*
+             (%register-struct-printer struct-name fsym (car print-option)))
+           (push `(%register-struct-printer ',struct-name ',fsym ,(car print-option))
+                 forms-to-compile)))
        (loop for slot in slot-names
              for i from 0
              for slot-read-only in slot-ro
@@ -26048,8 +26079,8 @@
                            (if (= (obj-subtag obj) #x32)
                                (if (>= (%prim-array-length obj) ,min-inst-len)
                                    (%prim-aref obj ,(+ 2 i))
-                                   (%signal-type-error))
-                               (%signal-type-error)))
+                                   (%signal-type-error obj ',struct-name))
+                               (%signal-type-error obj ',struct-name)))
                         forms-to-compile)
                   ;; compile-time record: a call on an argument DECLARED to be
                   ;; this struct reads the slot in place (see compile-call)

@@ -50,7 +50,10 @@
 (defun %cond-reg-slots (entry) (caddr entry))
 (defun %cond-reg-default-initargs (entry) (cadddr entry))
 (defun %cond-reg-report (entry)
-  (let ((rest (cdddr entry)))
+  ;; The FIFTH element: (name parents slot-specs default-initargs report-fn).
+  ;; This read the fourth -- the default-initargs -- so every :REPORT was
+  ;; ignored and every user condition printed as its bare type name.
+  (let ((rest (cddddr entry)))
     (if rest (car rest) nil)))
 
 (defun %define-condition (name parents slot-specs default-initargs report-fn)
@@ -339,20 +342,70 @@
 ;;; --- print-object for conditions ---
 ;;; Conditions print as their type name by default, or using :report fn
 
+(defun %cond-inherited-report (name)
+  "The :REPORT of condition type NAME or, failing that, of its nearest
+   ancestor that has one (CLHS DEFINE-CONDITION: the report is inherited),
+   parents in order, depth first.  NIL when none has one."
+  (let ((entry (%cond-reg-find name)))
+    (when entry
+      (or (%cond-reg-report entry)
+          (let ((found nil))
+            (dolist (p (%cond-reg-parents entry))
+              (unless found (setq found (%cond-inherited-report p))))
+            found)))))
+
+;;; The standard condition types have no :REPORT of their own here, so a
+;;; TYPE-ERROR printed as "TYPE-ERROR" -- which is all an operandi tool error
+;;; told the model.  These are the messages for the most specific standard
+;;; type C belongs to (SBCL's wording); NIL when C is none of them.
+(defun %standard-condition-report (c stream)
+  (flet ((slot (name) (handler-case (%condition-slot c name) (t (e) nil))))
+    (cond
+      ((typep c 'unbound-variable)
+       (format stream "The variable ~S is unbound." (slot 'name)) t)
+      ((typep c 'undefined-function)
+       (format stream "The function ~S is undefined." (slot 'name)) t)
+      ((typep c 'unbound-slot)
+       (format stream "The slot ~S is unbound in the object ~S." (slot 'name) (slot 'instance)) t)
+      ;; A native fault knows nothing about the operation or its operands:
+      ;; say what it is instead of a TYPE-ERROR message with NILs in it.
+      ((typep c 'memory-fault-error)
+       (write-string "Memory fault in compiled code: an operation was applied to an object of the wrong type (no further detail is recorded)." stream) t)
+      ((typep c 'mvm-type-error)
+       (format stream "~A: expected ~A, got ~S" (slot 'operation) (slot 'expected) (slot 'got)) t)
+      ((and (typep c 'type-error) (slot 'expected-type))
+       (format stream "The value ~S is not of type ~S." (slot 'datum) (slot 'expected-type)) t)
+      ((typep c 'arithmetic-error)
+       (format stream "arithmetic error ~A signalled" (symbol-name (%condition-type-name c)))
+       (when (slot 'operation)
+         (format stream "~%Operation was (~S~{ ~S~})." (slot 'operation) (slot 'operands)))
+       t)
+      ((typep c 'end-of-file)
+       (format stream "end of file on ~S" (slot 'stream)) t)
+      ((typep c 'file-error)
+       (format stream "error on file ~S" (slot 'pathname)) t)
+      ((typep c 'package-error)
+       (format stream "package error on ~S" (slot 'package)) t)
+      ((typep c 'print-not-readable)
+       (format stream "~S cannot be printed readably." (slot 'object)) t)
+      (t nil))))
+
 (defun %print-condition (c stream)
   "Print a condition using its :report function or default."
-  (let ((entry (%cond-reg-find (%condition-type-name c))))
-    (let ((report-fn (if entry (%cond-reg-report entry) nil)))
+  (progn
+    (let ((report-fn (%cond-inherited-report (%condition-type-name c))))
       (cond
         ((null report-fn)
          ;; A simple-condition with no :report reports its format control
          ;; applied to its arguments (CLHS SIMPLE-CONDITION); anything else
          ;; prints its type name.
          (let ((fc (handler-case (simple-condition-format-control c) (t (e) nil))))
-           (if fc
-               (apply #'format stream fc
-                      (handler-case (simple-condition-format-arguments c) (t (e) nil)))
-               (write-string (symbol-name (%condition-type-name c)) stream))))
+           (cond
+             (fc (apply #'format stream fc
+                        (handler-case (simple-condition-format-arguments c) (t (e) nil))))
+             ((%standard-condition-report c stream))
+             (t (format stream "Condition ~A was signalled."
+                        (symbol-name (%condition-type-name c)))))))
         ((stringp report-fn)
          ;; String report
          (write-string report-fn stream))
@@ -2705,10 +2758,12 @@
             nil))))
   nil)
 
-(defun %signal-type-error ()
+(defun %signal-type-error (&optional datum (expected-type nil et-p))
   "Runtime helper: signal a TYPE-ERROR condition for handler-case.
    Used when a CL primitive is called with an argument of the wrong
-   type (e.g. negative index to elt, non-list to nthcdr).
+   type (e.g. negative index to elt, non-list to nthcdr).  DATUM and
+   EXPECTED-TYPE, when the caller knows them, fill the condition's slots so
+   its report says which value and which type -- not just TYPE-ERROR.
    See %init-signal-symbols for why we read the symbol from a slot
    instead of `(aset c 0 'type-error)'."
   (if (%sig-reentry-enter)
@@ -2718,7 +2773,9 @@
       (progn (%sig-reentry-leave) nil)
       (let ((c (make-array 2)))
         (aset c 0 *%sig-type-error-sym*)
-        (aset c 1 nil)
+        (aset c 1 (if et-p
+                      (list (cons 'datum datum) (cons 'expected-type expected-type))
+                      nil))
         (setq *current-condition* c)
         (%sig-reentry-leave)
         (if (%error-handler-active-p) (%hc-longjmp) nil))))

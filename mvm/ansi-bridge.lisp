@@ -5711,7 +5711,12 @@
 ;;; output isn't required.
 
 (defun %print-object-default (object stream)
-  (declare (ignore stream))
+  "The standard method: what the printer prints when no user method applies.
+   (It used to print nothing, so a user method's CALL-NEXT-METHOD lost the
+   default output.)"
+  (cond ((%clos-instance-p object) (%print-instance-default object stream))
+        ((%struct-instance-p object) (%print-struct-default object stream nil *print-escape*))
+        (t (%write-obj object stream nil *print-escape*)))
   object)
 
 (defun %dispatch-print-object (args)

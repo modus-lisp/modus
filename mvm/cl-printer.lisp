@@ -935,7 +935,10 @@
       ;; CLOS INSTANCE: the user's PRINT-OBJECT method when one applies,
       ;; else #<CLASS-NAME> -- it used to fall through to the array printer
       ;; and print its raw representation, #(%CLOS-INSTANCE PT 1).
-      ((%clos-instance-p obj)
+      ;; A PATHNAME is a %CLOS-INSTANCE underneath; leave it to the #P arm
+      ;; below unless the user has a PRINT-OBJECT method for it.
+      ((and (%clos-instance-p obj)
+            (or (not (%pathname-obj-p obj)) (%user-print-object-p obj)))
        (if (%user-print-object-p obj)
            (print-object obj stream)
            (%print-instance-default obj stream)))
@@ -1023,7 +1026,9 @@
       ;; Multi-dim array wrapper: (cons 9867654 (cons DIMS FLAT-ARR))
       ((and (consp obj) (eql (car obj) 9867654) (consp (cdr obj)))
        (cond
-         ((not *print-array*)
+         ;; *PRINT-READABLY* wins over *PRINT-ARRAY* (as SBCL): a readable
+         ;; printer must not emit #<Array> (PRINT.ARRAY.0.11, 2.23).
+         ((and (not *print-array*) (not *print-readably*))
           (%print-char 35 stream)
           (%print-char 60 stream)
           (%print-string-raw "Array" stream)
@@ -1038,7 +1043,9 @@
       ;; downstream stringp branch handles it.
       ((%mda-p obj)
        (cond
-         ((not *print-array*)
+         ;; *PRINT-READABLY* wins over *PRINT-ARRAY* (as SBCL): a readable
+         ;; printer must not emit #<Array> (PRINT.ARRAY.0.11, 2.23).
+         ((and (not *print-array*) (not *print-readably*))
           (%print-char 35 stream)
           (%print-char 60 stream)
           (%print-string-raw "Array" stream)
@@ -1158,8 +1165,8 @@
          ;; >= plev, print as "#" with no element walk.  (print-level.3)
          ((and plev (>= (or level 0) plev))
           (%print-char 35 stream))   ; #
-         ((not *print-array*)
-          ;; Print as unreadable
+         ((and (not *print-array*) (not *print-readably*))
+          ;; Print as unreadable (*PRINT-READABLY* wins over *PRINT-ARRAY*)
           (%print-char 35 stream)
           (%print-char 60 stream)
           (%print-string-raw "Array" stream)

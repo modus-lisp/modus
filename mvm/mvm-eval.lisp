@@ -1381,7 +1381,22 @@
    Every call also empties the bridge function cache (*JIT-BRIDGE-GEN*)."
   (setq *jit-bridge-gen* (if (integerp *jit-bridge-gen*) (+ *jit-bridge-gen* 1) 1))
   (let ((h (%jit-fnaddr-thunk-entry name)))
-    (when h (setf (mem-ref (%jit-fnaddr-thunk-cache-slot (cdr h)) :u64) 0))))
+    (when h (setf (mem-ref (%jit-fnaddr-thunk-cache-slot (cdr h)) :u64) 0)))
+  ;; AND NATIVE CALLERS: a LINKAGE CELL held the OLD definition's native code,
+  ;; and only %JIT-INSTALL-NATIVE-FNS ever repointed it -- so a redefinition
+  ;; that is not native (an interpreted DEFUN under hot-only JIT, a
+  ;; (SETF FDEFINITION) of a closure) was invisible to every caller compiled
+  ;; before it: after JIT-EAGER, i.e. in every saved core, cl-fips's
+  ;; (setf (fdefinition 'x) broken) negative controls never reached x, and a
+  ;; live patch had to turn *JIT-HOT-ONLY* off to take.  Point the cell at
+  ;; NAME's late-binding #'NAME thunk, which resolves the current definition
+  ;; at call time; a native install that follows this call (that path calls
+  ;; here first) then repoints the cell straight at the new code.  Only for a
+  ;; name that HAS a cell -- some native caller links through it.
+  (when (and (boundp (quote *jit-linkage-cells*)) *jit-linkage-cells*
+             *jit-lcell-table* (gethash name *jit-lcell-table*))
+    (let ((th (%jit-make-fnaddr-thunk-aarch64 name)))
+      (when th (%jit-lcell-set name th)))))
 
 (defun %jit-fnaddr-thunk-fill-aarch64 (addr name)
   ;; Layout:   0: ldr x16, [pc+88]   cached native target (raw code address)

@@ -412,7 +412,8 @@
                              (let ((ty (car cl)) (body (cdr cl)))
                                (cons (list 'typep g (list 'quote ty)) body)))
                            clauses))
-                 (list (list t (list 'error \"ETYPECASE: no clause matches\")))))))"
+                 (list (list t (list '%signal-type-error g
+                                     (list 'quote (cons 'or (mapcar (function car) clauses))))))))))"
 
     ;; CTYPECASE — like ETYPECASE but a correctable (store-and-retry) error in
     ;; full CL.  Minimally we degrade it to an ETYPECASE-like signal on no
@@ -426,7 +427,8 @@
                              (let ((ty (car cl)) (body (cdr cl)))
                                (cons (list 'typep g (list 'quote ty)) body)))
                            clauses))
-                 (list (list t (list 'error \"CTYPECASE: no clause matches\")))))))"
+                 (list (list t (list '%signal-type-error g
+                                     (list 'quote (cons 'or (mapcar (function car) clauses))))))))))"
 
     ;; DEFINE-MODIFY-MACRO — (define-modify-macro name lambda-list fn [doc]).
     ;; Defines NAME as a macro: (name place a b …) => FN applied to the place's

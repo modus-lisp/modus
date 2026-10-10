@@ -1088,6 +1088,7 @@
   ;; Set default pathname defaults to the ANSI test sandbox directory
   (setq *default-pathname-defaults* \"/home/claude/modus/tmp/ansi-test/sandbox/\")
 
+
   ;; Init file I/O scratch buffers (defvar defaults not applied without init-all-globals)
   (setq *cstr-scratch* #x0FE00000)  ; moved below heap base
   (setq *io-buf-addr*  #x0FF00000)  ; moved out of heap semispace 0; see memory note
@@ -1112,6 +1113,39 @@
   ;; with N=NIL).  Two gensyms hash-collide in symbol-function table.
   (setq *gensym-counter* 0)
   (setq *gentemp-counter* 0)
+  ;; Globals the runtime, the in-image compiler and this harness compare
+  ;; numerically.  This runner does not call INIT-ALL-GLOBALS (it would reset
+  ;; what the %INIT- steps above set up: measured, macro-function / describe /
+  ;; pprint-dispatch tests lost), so these read NIL here and only here, and
+  ;; (> n NIL) used to be quietly false: the compiler's frame-overflow check,
+  ;; *COMPILE-SAFETY*, the JIT cell counters, the harness's fork-retry and
+  ;; no-progress caps were all OFF in the image that measures conformance.
+  ;; Comparing NIL now signals TYPE-ERROR, so run each one's own init thunk
+  ;; (its DEFVAR's initform, not a copy of the value).
+  (|INIT-*LET-BINDING-LIMIT*|)
+  (|INIT-*COMPILE-SAFETY*|)
+  (|INIT-*FUZZ-FUNCALL-NOPS*|)
+  (|INIT-*GV-CACHE-COUNT*|)
+  (|INIT-*JIT-LCELL-NEXT*|)
+  (|INIT-*JIT-LCELL-END*|)
+  (|INIT-*SIGNAL-WALK-DEPTH*|)
+  (|INIT-*WS5-STR-BAKE-MIN*|)
+  (|INIT-*FORK-RETRY-CAP*|)
+  (|INIT-*NO-PROGRESS-CAP*|)
+  (|INIT-*NO-FORK-DEBUG*|)
+  (|INIT-*ARITH-PUSH-DEPTH*|)
+  (|INIT-*IR-PUSH-DEPTH*|)
+  (|INIT-*PROMOTE-LOOP-DEPTH*|)
+  (|INIT-*INLINE-EXPANSIONS*|)
+  (|INIT-*CF-TRACE-I*|)
+  (|INIT-*%CIRC-NEXT*|)
+  (|INIT-*%SYM-COUNT*|)
+  (|INIT-*JIT-BRIDGE-GEN*|)
+  (|INIT-*BACKQUOTE-DEPTH*|)
+  (|INIT-*TEMP-REG-COUNTER*|)
+  (|INIT-*FP-REG-COUNTER*|)
+  (|INIT-*%IRT-COUNTER*|)
+  (|INIT-*%IRUN-COUNTER*|)
 
   ;; WS4-S5b: the JIT gate is a DEFUN (%jit-enabled-p) overridden at build time
   ;; from MODUS_USE_JIT (see the @@USE-JIT-DEFUN@@ substitution after the driver
@@ -1163,6 +1197,17 @@
   (setq least-negative-short-float    (%round-to-single -1.4d-45))
   (setq least-positive-long-float     5.0d-324)
   (setq least-negative-long-float    -5.0d-324)
+  ;; The NORMALIZED limits were never set here, so they read NIL -- and
+  ;; zerop.8/zerop.9 (#'ZEROP over every float limit) passed only because
+  ;; (zerop NIL) answered NIL instead of signalling.
+  (setq least-positive-normalized-double-float  2.2250738585072014d-308)
+  (setq least-negative-normalized-double-float -2.2250738585072014d-308)
+  (setq least-positive-normalized-long-float    2.2250738585072014d-308)
+  (setq least-negative-normalized-long-float   -2.2250738585072014d-308)
+  (setq least-positive-normalized-single-float (%round-to-single 1.1754944d-38))
+  (setq least-negative-normalized-single-float (%round-to-single -1.1754944d-38))
+  (setq least-positive-normalized-short-float  (%round-to-single 1.1754944d-38))
+  (setq least-negative-normalized-short-float  (%round-to-single -1.1754944d-38))
 
   ;; Standard CL constants the ANSI test auxiliary files reference
   ;; (char-code-limit, call-arguments-limit, *-fixnum). Without these

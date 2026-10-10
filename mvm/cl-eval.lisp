@@ -70,7 +70,11 @@
                             (> (length (car nh)) 0)
                             *symbol-function-table*
                             (gethash (car nh) *symbol-function-table*))))
-              (if nfn nfn sym)))))))
+              ;; Still nothing: SYMBOL-FUNCTION's full lookup, which signals
+              ;; UNDEFINED-FUNCTION when there is none.  Returning SYM here
+              ;; made (funcall 'undefined ...) call the symbol itself and
+              ;; fault -- a MEMORY-FAULT-ERROR instead of UNDEFINED-FUNCTION.
+              (if nfn nfn (symbol-function sym))))))))
 
 (defun %sym-name-or-hash (sym)
   "Return (cons NAME-STR HASH) for SYM if it's any flavor of symbol:
@@ -1002,7 +1006,15 @@
       (unless *%runtime-deftype-table*
         (setq *%runtime-deftype-table* (make-hash-table :test 'equal)))
       (%deftype-pkg-put tname name-str entry)
-      (puthash name-str *%runtime-deftype-table* entry)))
+      (puthash name-str *%runtime-deftype-table* entry)
+      (%deftype-warm tname)))
+  tname)
+
+(defun %deftype-warm (tname)
+  "Prepare TNAME's expander where it is defined.  A no-op here; mvm-eval
+   images compile and cache it (mvm-eval.lisp), so that a later expansion on
+   an actor only READS the cache -- an actor may not write shared tables, nor
+   compile."
   tname)
 
 ;;; COMPILER-MACRO per-package side table — same defect, same shape:
@@ -3866,8 +3878,14 @@
     ;; The bottom-two-bits mask preserved here for the few odd-nibble
     ;; fn-addrs the pre-tag alignment dodge couldn't avoid.  Once every
     ;; site is audited and all fn-addrs are tagged, this branch can go.
-    ((let* ((base (mem-ref #x10000160 :u64))
-            (end  (mem-ref #x10000168 :u64))
+    ;; The bounds are RAW words: an odd code address carries a non-fixnum tag
+    ;; (low nibble 5 reads as a character), so comparing it with < went to the
+    ;; generic slow path -- which answered NIL for a non-number, so this arm was
+    ;; dead in any image whose code base is odd, and now signals TYPE-ERROR.
+    ;; Clearing bit 0 makes every operand fixnum-shaped; the fast path compares
+    ;; the words directly, which is what this test always meant.
+    ((let* ((base (logand (mem-ref #x10000160 :u64) -2))
+            (end  (logand (mem-ref #x10000168 :u64) -2))
             (xs   (logand x -2)))
        (and (> base 0) (>= xs base) (< xs end))) t)
     ((characterp x) nil)

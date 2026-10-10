@@ -19,48 +19,49 @@
 ;; would crash on arity mismatch.
 (defun = (&rest cs)
   (cond ((null cs) t)
-        ((null (cdr cs)) t)
+        ((null (cdr cs)) (%number-arg (car cs)) t)
         (t (let ((a (car cs)) (rest (cdr cs)))
              (loop (when (null rest) (return t))
-               (unless (numeric-equal-p a (car rest)) (return nil))
+               (unless (%strict-eq a (car rest)) (return nil))
                (setq rest (cdr rest)))))))
 (defun < (&rest cs)
   (cond ((null cs) t)
-        ((null (cdr cs)) t)
+        ((null (cdr cs)) (%real-arg (car cs)) t)
         (t (let ((a (car cs)) (rest (cdr cs)))
              (loop (when (null rest) (return t))
-               (unless (numeric-value-less-p a (car rest)) (return nil))
+               (unless (%strict-lt a (car rest)) (return nil))
                (setq a (car rest))
                (setq rest (cdr rest)))))))
 (defun > (&rest cs)
   (cond ((null cs) t)
-        ((null (cdr cs)) t)
+        ((null (cdr cs)) (%real-arg (car cs)) t)
         (t (let ((a (car cs)) (rest (cdr cs)))
              (loop (when (null rest) (return t))
-               (unless (numeric-value-less-p (car rest) a) (return nil))
+               (unless (%strict-gt a (car rest)) (return nil))
                (setq a (car rest))
                (setq rest (cdr rest)))))))
 (defun <= (&rest cs)
   (cond ((null cs) t)
-        ((null (cdr cs)) t)
+        ((null (cdr cs)) (%real-arg (car cs)) t)
         (t (let ((a (car cs)) (rest (cdr cs)))
              (loop (when (null rest) (return t))
-               (unless (numeric-<= a (car rest)) (return nil))
+               (unless (%strict-le a (car rest)) (return nil))
                (setq a (car rest))
                (setq rest (cdr rest)))))))
 (defun >= (&rest cs)
   (cond ((null cs) t)
-        ((null (cdr cs)) t)
+        ((null (cdr cs)) (%real-arg (car cs)) t)
         (t (let ((a (car cs)) (rest (cdr cs)))
              (loop (when (null rest) (return t))
-               (unless (numeric->= a (car rest)) (return nil))
+               (unless (%strict-ge a (car rest)) (return nil))
                (setq a (car rest))
                (setq rest (cdr rest)))))))
 (defun /= (&rest cs)
   ;; All-distinct: outer-loop pairs against tail; if any equal, return NIL.
   (cond ((null cs) t)
-        ((null (cdr cs)) t)
+        ((null (cdr cs)) (%number-arg (car cs)) t)
         (t (let ((outer cs))
+             (dolist (x cs) (%number-arg x))
              (loop (when (null (cdr outer)) (return t))
                (let ((a (car outer)) (inner (cdr outer)))
                  (loop (when (null inner) (return nil))
@@ -1090,6 +1091,12 @@
             (allow-other nil)
             (t (error "parse-integer: bad keyword"))))
         (setq a (cddr a))))
+    ;; The scan below reads raw char codes with %PRIM-AREF, which is right only
+    ;; for a SIMPLE string: a fill-pointer / adjustable one is a header object
+    ;; (%MDA-P) whose own slots are not the characters, and %PRIM-STRINGP says T
+    ;; for it too.  Scan a simple copy -- LENGTH honours the fill pointer, so
+    ;; :START / :END and the returned position mean the same thing.
+    (when (%mda-p string) (setq string (coerce string 'simple-string)))
     (let ((len (length string)))
       (when (null end) (setq end len))
       ;; Skip leading whitespace
@@ -2406,11 +2413,21 @@
           (t head)))
       head))
 
+(defun %coerce-expand-type (type)
+  "TYPE with user DEFTYPEs expanded, at the top and in the element type of a
+   (VECTOR / ARRAY / SIMPLE-ARRAY elt ...) spec."
+  (let ((type (%element-type-expand type)))
+    (if (and (consp type) (consp (cdr type))
+             (member (%coerce-canon-head (car type)) '(vector array simple-array)))
+        (list* (car type) (%element-type-expand (cadr type)) (cddr type))
+        type)))
+
 (defun coerce (object result-type)
   "Coerce OBJECT to RESULT-TYPE.  Accepts compound type forms like
    (vector *), (vector * 2), (simple-string 5) — uses the head symbol
    for dispatch (per CLHS, compound array/string subtypes are still
    the same family of result-type)."
+  (setq result-type (%coerce-expand-type result-type))
   (when (%seq-type-u8-p result-type) (return-from coerce (%seq-u8-copy object)))
   (let* ((orig-type result-type)
          ;; Explicit length from a compound array/vector/string spec like
@@ -2447,6 +2464,14 @@
                          (class-name result-type))
                         (t result-type)))
          (result-type (%coerce-canon-head (if (consp result-type) (car result-type) result-type)))
+         ;; (VECTOR CHARACTER) / (SIMPLE-ARRAY CHARACTER (*)) is a string
+         ;; type (CLHS 15.1.2.2): build a string, not a general vector.
+         (result-type (if (and (member result-type '(vector array simple-array))
+                               (consp orig-type) (consp (cdr orig-type))
+                               (member (%coerce-canon-head (cadr orig-type))
+                                       '(character base-char standard-char)))
+                          'simple-string
+                          result-type))
          (%cv
   (cond
     ((eq result-type 'list)
@@ -2489,6 +2514,23 @@
             (when (>= i len) (return s))
             (let ((raw (%wrapper-aref object i)))
               (aset s i (if (integerp raw) raw (char-code raw))))
+            (setq i (+ i 1)))))
+       ;; A string that is not SIMPLE -- the header-object arrays a fill-pointer
+       ;; or adjustable MAKE-ARRAY returns, which the CONSP arm above does not
+       ;; cover -- must be COPIED for a SIMPLE- target (CLHS 4.7: COERCE returns
+       ;; an object of RESULT-TYPE).  Returning it unchanged handed back an
+       ;; object whose header said string and whose slots did not hold codes, so
+       ;; compiled CHAR/SCHAR read raw slots and got garbage: seal's UTF8-DECODE
+       ;; ends in exactly this coerce, and every websocket message it decoded
+       ;; parsed as junk.
+       ((and (%mda-p object) (stringp object)
+             (or (eq result-type 'simple-string) (eq result-type 'simple-base-string)))
+        (let* ((len (length object))
+               (s (%make-string-array len))
+               (i 0))
+          (loop
+            (when (>= i len) (return s))
+            (aset s i (char-code (char object i)))
             (setq i (+ i 1)))))
        ((stringp object) object)
        ;; General (non-string-subtag) VECTOR of characters, e.g.
@@ -2782,6 +2824,18 @@
          ((stringp a) (list (array-length a)))
          (t (error "ARRAY-DIMENSIONS: ~S is not an array" a)))))))
 
+(defun %element-type-expand (type)
+  "TYPE with user DEFTYPEs expanded until its head is not one (bounded), so an
+   element type spelled through a DEFTYPE -- flexi-streams' (deftype char* ()
+   'character) -- is classified as what it names.  Standard type names have no
+   DEFTYPE entry and come back unchanged."
+  (let ((n 0))
+    (loop
+      (let ((head (if (consp type) (car type) type)))
+        (if (and head (symbolp head) (< n 64) (%deftype-lookup head))
+            (setq type (%expand-deftype type) n (+ n 1))
+            (return type))))))
+
 (defun upgraded-array-element-type (type &optional environment)
   "Return the upgraded element type Modus actually uses for arrays of TYPE.
    Per CLHS 15.1.2.1: BIT upgrades to BIT, CHARACTER/BASE-CHAR upgrade to
@@ -2789,6 +2843,7 @@
    everything else upgrades to T (Modus stores general elements as tagged
    words)."
   (declare (ignore environment))
+  (setq type (%element-type-expand type))
   (cond
     ;; NIL element type — array that can hold no objects.
     ((null type) nil)
@@ -5201,6 +5256,7 @@
             ((eq k :displaced-index-offset)
              (unless off-set (setq off-set t off v)))))
         (setq rest (cddr rest)))
+      (when etype-set (setq etype (%element-type-expand etype)))
       ;; Allocate + fill the flat data vector.
       ;; :element-type 'character / 'base-char → underlying is a string
       ;; (subtag #x31) so STRINGP / string ops work on the result.
@@ -5688,7 +5744,12 @@
 ;;; output isn't required.
 
 (defun %print-object-default (object stream)
-  (declare (ignore stream))
+  "The standard method: what the printer prints when no user method applies.
+   (It used to print nothing, so a user method's CALL-NEXT-METHOD lost the
+   default output.)"
+  (cond ((%clos-instance-p object) (%print-instance-default object stream))
+        ((%struct-instance-p object) (%print-struct-default object stream nil *print-escape*))
+        (t (%write-obj object stream nil *print-escape*)))
   object)
 
 (defun %dispatch-print-object (args)
@@ -6383,7 +6444,7 @@
          ((and (or (eq head 'vector) (eq head 'simple-vector)
                    (eq head 'simple-array) (eq head 'array))
                (%mda-p obj))
-          (let ((et   (and (cdr type) (cadr type)))
+          (let ((et   (and (cdr type) (%element-type-expand (cadr type))))
                 (dims (and (cddr type) (caddr type)))
                 (dims-given (and (cddr type) t)))
             (and
@@ -6438,7 +6499,7 @@
           (and (not (or (fixnump obj) (characterp obj) (consp obj) (null obj)))
                (or (= (obj-subtag obj) #x31) (= (obj-subtag obj) #x32)
                    (= (obj-subtag obj) #x11) (= (obj-subtag obj) #x12))
-               (let* ((et (and (cdr type) (cadr type)))
+               (let* ((et (and (cdr type) (%element-type-expand (cadr type))))
                       (sz-given (and (cddr type) t))
                       (sz (and (cddr type) (caddr type)))
                       (is-string  (= (obj-subtag obj) #x31))
@@ -6494,7 +6555,15 @@
                          ((eq et 'base-char)            is-string)
                          ((eq et 'standard-char)        is-string)
                          ((eq et 'bit)                  is-bitvec)
-                         (t t))))
+                         ;; Any other element type -- (unsigned-byte 8), an
+                         ;; integer type, a DEFTYPE -- is not CHARACTER, so a
+                         ;; STRING never has it.  A general array stays a match:
+                         ;; Modus does not track its element type.  This was
+                         ;; (t t), so (typep "abc" '(vector (unsigned-byte 8)))
+                         ;; was T and code telling octets from text (cl-marmot's
+                         ;; store hex-encodes octets and keeps strings) took a
+                         ;; string for bytes.
+                         (t (not is-string)))))
                  (and et-ok
                       (cond
                         ((not sz-given) t)

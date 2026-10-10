@@ -1348,6 +1348,9 @@
                         "*UNUSED-VALUE-FORM*" "*SETQ-VALUE-UNUSED*"
                         "*CURRENT-FUNCTION-NAME*" "*FUNCTION-RETURN-LABEL*"
                         "*UWP-CLEANUPS*" "*LOOP-EXIT-UWP-SEQ*"
+                        ;; The push-depth tracking that lexical exits pop
+                        ;; back to: rebound per compiled function.
+                        "*IR-PUSH-DEPTH*" "*LABEL-PUSH-DEPTHS*"
                         "*ARITH-PUSH-DEPTH*"))
           (setf (gethash (compute-name-hash name) tab) t))
         (setq *clhs-standard-specials-hashes* tab)
@@ -2216,11 +2219,45 @@
 ;;; Immediates are tagged with :imm:
 ;;;   (:imm value)
 
+(defvar *ir-push-depth* 0
+  "Words this function has :PUSHed and not yet :POPed at the point of
+   emission.  Every expression leaves it where it found it, so its value at
+   a label is the depth on every edge that falls into that label.")
+
+(defvar *label-push-depths* nil
+  "(label . depth) for each BLOCK / LOOP exit and TAGBODY tag of this
+   function: the stack depth control must be at when it arrives there.")
+
 (defun emit-ir (op &rest args)
   "Emit an IR instruction to the current buffer"
   (when (and *ddc-trace-nil-callee* (eq op :call) (equal (car args) "NIL"))
     (format t "~&  NIL-CALL built in ~A (nargs ~A)~%" *current-function-name* (cadr args)))
+  (cond ((eq op :push) (setq *ir-push-depth* (+ *ir-push-depth* 1)))
+        ((eq op :pop) (setq *ir-push-depth* (- *ir-push-depth* 1))))
   (push (cons op args) *ir-buffer*))
+
+(defun %note-label-depth (label)
+  "Record that LABEL is reached at the current push depth."
+  (setq *label-push-depths* (cons (cons label *ir-push-depth*) *label-push-depths*))
+  label)
+
+(defun %emit-pop-to-label-depth (label)
+  "Before a lexical :BR to LABEL (RETURN-FROM / RETURN / GO / loop exit):
+   pop whatever this point has pushed beyond LABEL's depth.  A pending call
+   argument, or the six words UNWIND-PROTECT saves before its cleanup, would
+   otherwise stay on the stack, and the code after LABEL would pop them as
+   its own: (list 39 (block b (list 1 (return-from b 65)))) => (1 65), and
+   a RETURN-FROM out of a cleanup handed GCD a saved MV word for its first
+   argument (ANSI MISC.273).  Only the branch pops: the code emitted after
+   it is the fall-through path, so the tracked depth is left as it was."
+  (let ((e (assoc label *label-push-depths*)))
+    (when e
+      (let ((n (- *ir-push-depth* (cdr e))))
+        (when (> n 0)
+          (let ((r (alloc-temp-reg)))
+            (dotimes (i n) (emit-ir :pop r))
+            (free-temp-reg))
+          (setq *ir-push-depth* (+ *ir-push-depth* n)))))))
 
 (defun emit-ir-label (label-id)
   "Emit a label marker in the IR stream"
@@ -3633,7 +3670,14 @@
                                   out))
                            (t (push `((eql ,tmp ',keys) ,@effective-body) out)))))
                      (nreverse out))
-                 (t (%signal-type-error)))))))
+                 (t (%signal-type-error
+                     ,tmp
+                     '(member ,@(let ((ks nil))
+                                  (dolist (cl clauses (nreverse ks))
+                                    (let ((k (car cl)))
+                                      (if (listp k)
+                                          (dolist (x k) (push x ks))
+                                          (push k ks)))))))))))))
 
   ;; DOLIST → LET + LOOP.  Per CLHS body is an implicit tagbody.
   (mvm-define-macro "DOLIST"
@@ -5351,8 +5395,10 @@
                (cond
                  ((null report-opt) nil)
                  ;; (:report (lambda (c s) …)) — opt is a list whose car is lambda
+                 ;; FUNCTION, not QUOTE: a quoted lambda stored the LIST, and
+                 ;; printing the condition funcall'd it -- UNDEFINED-FUNCTION.
                  ((and (consp (car report-opt)) (eq (caar report-opt) 'lambda))
-                  (list 'quote (car report-opt)))
+                  (list 'function (car report-opt)))
                  ;; (:report name) — opt is (name)
                  ((symbolp (car report-opt))
                   (list 'quote (car report-opt)))
@@ -8587,7 +8633,7 @@
                                       (effective-body (or body '(nil))))
                                  `((typep ,tmp ',type) ,@effective-body)))
                              clauses)
-                   (t (%signal-type-error))))
+                   (t (%signal-type-error ,tmp '(or ,@(mapcar (function car) clauses))))))
           env dest)))
 
       ;; CCASE — like CASE but signals TYPE-ERROR on no-match (restartable
@@ -9554,7 +9600,7 @@
   ;; Also handle pre-hashed integer ops
   )
 
-(defun collect-setq-vars-in-body (form bound-vars)
+(defun collect-setq-vars-in-body (form bound-vars &optional (mx 0))
   "Return list of variables (from BOUND-VARS) that are mutated anywhere in FORM
    (via setq/incf/decf), including inside lambdas. BOUND-VARS is a list of variable
    names to watch for."
@@ -9671,15 +9717,88 @@
          (dolist (v (collect-setq-vars-in-body f bound-vars))
            (setq results (adjoin v results :test #'name-equal))))
        results))
+    ;; QUOTE: data, never assignments -- and never macroexpanded.
+    ((and (symbolp (car form)) (string= (symbol-name (car form)) "QUOTE")) nil)
+    ;; LET / LET*: a binding is (VAR INIT), not a form -- only INIT is code.
+    ;; Walked as a form, (let* ((macrolet 17)) ...) reached the MACROLET arm
+    ;; below with 17 as its definitions and signalled while COMPILING
+    ;; (ansi-test LET*.15 binds every non-variable CL symbol).
+    ((and (symbolp (car form))
+          (or (string= (symbol-name (car form)) "LET")
+              (string= (symbol-name (car form)) "LET*"))
+          (consp (cdr form)) (listp (cadr form)))
+     (let ((results nil))
+       (dolist (b (cadr form))
+         (when (and (consp b) (consp (cdr b)))
+           (dolist (v (collect-setq-vars-in-body (cadr b) bound-vars mx))
+             (setq results (adjoin v results :test #'name-equal)))))
+       (dolist (f (cddr form))
+         (dolist (v (collect-setq-vars-in-body f bound-vars mx))
+           (setq results (adjoin v results :test #'name-equal))))
+       results))
+    ;; A BACKQUOTE TEMPLATE is data with code only in its commas: scan the
+    ;; expansion, never the template (whose COND / LET heads with comma
+    ;; structs for operands the macro branch below would try to expand).
+    ((%bq-form-p form)
+     (collect-setq-vars-in-body (expand-backquote (cadr form)) bound-vars mx))
+    ;; MACROLET: walk the body with the local macros installed, exactly as
+    ;; compile-form will compile it, so a local macro that assigns a variable
+    ;; is seen through its expansion (quri's URL-DECODE: a closure over CHAR,
+    ;; which only a MACROLET'd GOTO assigns, decoded "a%20b" to "aaaaa").
+    ((and (symbolp (car form)) (string= (symbol-name (car form)) "MACROLET")
+          (consp (cdr form)) (listp (cadr form)))
+     (let ((saved nil))
+       (unwind-protect
+            (progn
+              (dolist (mdef (cadr form))
+                (when (and (consp mdef) (consp (cdr mdef)))
+                  (let ((mname (normalize-name (car mdef))))
+                    (push (cons mname (gethash mname *macro-table*)) saved)
+                    (mvm-define-macro mname (build-macrolet-expander
+                                             (cadr mdef) (cddr mdef) nil)))))
+              (%mexp-memo-invalidate)
+              (collect-setq-vars-in-body (cons 'progn (cddr form)) bound-vars mx))
+         (%mexp-memo-invalidate)
+         (dolist (sv saved)
+           (if (cdr sv)
+               (setf (gethash (car sv) *macro-table*) (cdr sv))
+               (remhash (car sv) *macro-table*))))))
+    ;; SYMBOL-MACROLET: an assignment to a symbol macro whose expansion is a
+    ;; watched variable assigns that variable.
+    ((and (symbolp (car form)) (string= (symbol-name (car form)) "SYMBOL-MACROLET")
+          (consp (cdr form)) (listp (cadr form)))
+     (let ((results (collect-setq-vars-in-body (cons 'progn (cddr form)) bound-vars mx)))
+       (dolist (sm (cadr form))
+         (when (and (consp sm) (consp (cdr sm)) (symbolp (cadr sm))
+                    (member (cadr sm) bound-vars :test #'name-equal)
+                    (collect-setq-vars-in-body (cons 'progn (cddr form)) (list (car sm)) mx))
+           (setq results (adjoin (cadr sm) results :test #'name-equal))))
+       results))
     (t
-     ;; Recurse into all subforms (guard against dotted pairs)
-     (let ((results nil)
-           (rest form))
-       (loop while (consp rest) do
-         (dolist (v (collect-setq-vars-in-body (car rest) bound-vars))
-           (setq results (adjoin v results :test #'name-equal)))
-         (setf rest (cdr rest)))
-       results))))
+     ;; A MACRO CALL: scan its expansion.  A macro that assigns a variable --
+     ;; (defmacro set-c (v) `(setq c ,v)) -- leaves no SETQ in the source,
+     ;; so the variable was not boxed and every closure over it kept the
+     ;; value it had when the closure was made.  %MACROEXPAND-1-MVM-RAW
+     ;; returns the CONS (expansion . expanded-p).  MX bounds the expansions
+     ;; along one path: some expanders return a fresh copy of their own form
+     ;; (a builtin the compiler lowers itself), which would expand forever.
+     ;; The expansion is only ANALYSED here: an expander that fails out of
+     ;; its context -- iterate's clause macros read *LOOP-END*, bound only
+     ;; while an ITER form expands -- must not fail the compile, so on error
+     ;; the form is scanned unexpanded, as before.
+     (let ((x (and (< mx 16) (symbolp (car form)) (car form)
+                   (handler-case (%macroexpand-1-mvm-raw form)
+                     (error () nil)))))
+       (if (and (consp x) (cdr x) (not (eq (car x) form)))
+           (collect-setq-vars-in-body (car x) bound-vars (+ mx 1))
+           ;; Recurse into all subforms (guard against dotted pairs)
+           (let ((results nil)
+                 (rest form))
+             (loop while (consp rest) do
+               (dolist (v (collect-setq-vars-in-body (car rest) bound-vars mx))
+                 (setq results (adjoin v results :test #'name-equal)))
+               (setf rest (cdr rest)))
+             results))))))
 
 (defun vars-mutated-in-lambdas (body-forms let-vars)
   "Find which of LET-VARS are mutated inside a lambda in BODY-FORMS.
@@ -10049,6 +10168,17 @@
     (t
      (let ((op (car form)))
        (cond
+         ;; A BACKQUOTE TEMPLATE is data; only its commas hold code.  Walking
+         ;; the raw template treated its structure as code -- `(let ,b ,body)'
+         ;; looked like a LET whose binding list was a comma struct, and the
+         ;; type error made the build SKIP the whole enclosing DEFUN, every
+         ;; call to which then compiled to a NIL sentinel (GENERATE-LOOP-CODE
+         ;; did, once an FLET in it pushed to a boxed variable).  A boxed
+         ;; variable inside a comma was never rewritten either.  Rewrite the
+         ;; expansion instead, as %COLLECT-FREE-VARS does; compile-form would
+         ;; lower the template to that same code.
+         ((%bq-form-p form)
+          (cell-rewrite-form (expand-backquote (cadr form)) boxed-vars lambda-params))
          ;; (psetq p1 v1 …) / (psetf p1 v1 …) — PARALLEL multi-place: all
          ;; values are evaluated BEFORE any assignment.  We added these to the
          ;; boxed-var detector, so they must be rewritten here too or the
@@ -11060,26 +11190,40 @@
              ;; The let semantics (init forms see outer env, all bindings
              ;; created simultaneously) match what the original setq-based
              ;; scheme provided.
+             ;; (var . cell): a FRESH cell symbol per binding.  A name shared
+             ;; by two cells (a LET* rebinding POS, or a nested LET boxing its
+             ;; own POS) made LABELS capture the wrong one by name --
+             ;; quicklisp's PARSE-URLSTRING read an unbound %CELL-POS.
+             (cells (mapcar (lambda (b)
+                              (let ((var (if (consp b) (car b) b)))
+                                (cons var (%mvm-gensym (symbol-name (cell-var-name var))))))
+                            (remove-if-not (lambda (b)
+                                             (member (if (consp b) (car b) b) boxed-vars
+                                                     :test #'name-equal))
+                                           bindings)))
              (cell-bindings
                (mapcar (lambda (b)
                          (let* ((var (if (consp b) (car b) b))
                                 (init (if (consp b) (cadr b) nil)))
-                           `(,(cell-var-name var)
-                             (cons ,(cell-rewrite-form init nil nil) nil))))
+                           `(,(cdr (assoc var cells)) (cons ,init nil))))
                        (remove-if-not (lambda (b)
                                         (member (if (consp b) (car b) b) boxed-vars
                                                 :test #'name-equal))
                                       bindings)))
-             ;; Body references to V become (car %CELL-V); writes become
-             ;; (set-car %CELL-V ...).  Inside lambdas, %CELL-V is now a
-             ;; captured local (free-var in lambda → closure-env entry).
-             (new-body (mapcar (lambda (f) (cell-rewrite-form f boxed-vars nil))
-                               body-stripped))
+             ;; V itself becomes a SYMBOL MACRO for (car %CELL-V) over the
+             ;; body, so every reference reads the cell and every assignment
+             ;; -- (setq V x) is (setf (car %CELL-V) x) -- writes it, INCLUDING
+             ;; the ones a macro produces when it expands later.  The old
+             ;; textual rewrite of the body could not see those: a closure
+             ;; over a variable that a MACROLET / DEFMACRO assigned read a
+             ;; stale cell (quri's URL-DECODE, built on such a macrolet,
+             ;; decoded "a%20b" to "aaaaa").  Inside lambdas, %CELL-V is a
+             ;; captured local as before.
+             (sm (mapcar (lambda (c) `(,(car c) (car ,(cdr c)))) cells))
              (combined-bindings (append non-boxed-bindings cell-bindings)))
         (return-from compile-let
-          (if combined-bindings
-              (compile-form `(let ,combined-bindings ,@new-body) env dest)
-              (compile-form `(progn ,@new-body) env dest))))))
+          (compile-form `(let ,combined-bindings (symbol-macrolet ,sm ,@body-stripped))
+                        env dest)))))
   (check-frame-overflow (length bindings) "let" env)
   (let* ((decl-body body)              ; unstripped: the (declare (type …)) scan below needs it
          (body (strip-declares body))
@@ -11216,25 +11360,31 @@
          (boxed-vars (%boxed-vars-for-let
                       (append init-forms body-stripped) let-vars)))
     (when boxed-vars
-      ;; Walk the bindings in order, replacing each boxed V's slot with
-      ;; %CELL-V → (cons init nil).  Subsequent inits' references to V
-      ;; need to be rewritten to (car %CELL-V); cell-rewrite-form
-      ;; already handles that when given the running boxed-vars list.
-      (let* ((new-bindings
-               (loop for b in bindings
-                     for var = (if (consp b) (car b) b)
-                     for init = (if (consp b) (cadr b) nil)
-                     ;; Rewrite this init using the boxed-vars set.  Earlier
-                     ;; boxed vars in this let* are already cells visible
-                     ;; here; the rewriter turns refs to them into car-of-cell.
-                     for rewritten-init = (cell-rewrite-form init boxed-vars nil)
-                     collect (if (member var boxed-vars :test #'name-equal)
-                                 `(,(cell-var-name var) (cons ,rewritten-init nil))
-                                 `(,var ,rewritten-init))))
-             (new-body (mapcar (lambda (f) (cell-rewrite-form f boxed-vars nil))
-                               body-stripped)))
+      ;; Split at the FIRST boxed binding V: the bindings before it and
+      ;; %CELL-V = (cons init nil) in one LET*, then V as a symbol macro for
+      ;; (car %CELL-V) over the REST -- a LET* of the remaining bindings,
+      ;; whose own compile boxes the next one the same way.  Later inits see
+      ;; V through the symbol macro, as sequential binding requires.  See
+      ;; compile-let for why a symbol macro and not a rewrite of the body.
+      (let* ((pos (position-if (lambda (b)
+                                 (member (if (consp b) (car b) b) boxed-vars
+                                         :test #'name-equal))
+                               bindings))
+             (b (nth pos bindings))
+             (var (if (consp b) (car b) b))
+             (init (if (consp b) (cadr b) nil))
+             (before (subseq bindings 0 pos))
+             (after (nthcdr (1+ pos) bindings))
+             (inner (if after
+                        `(let* ,after ,@body-stripped)
+                        `(progn ,@body-stripped)))
+             ;; A fresh cell symbol: see compile-let.
+             (cell (%mvm-gensym (symbol-name (cell-var-name var)))))
         (return-from compile-let*
-          (compile-form `(let* ,new-bindings ,@new-body) env dest)))))
+          (compile-form `(let* (,@before (,cell (cons ,init nil)))
+                           (symbol-macrolet ((,var (car ,cell)))
+                             ,inner))
+                        env dest)))))
   (check-frame-overflow (length bindings) "let*" env)
   (let* ((decl-body body)               ; unstripped: the (declare (type …)) scan below needs it
          (body (strip-declares body))
@@ -12174,11 +12324,21 @@
                 (when (null bs) (return acc))
                 (setq acc (%collect-free-vars (car bs) new-bound env acc))
                 (setq bs (cdr bs))))))
-         ;; SETQ / PSETQ: read every value form, bind nothing.
+         ;; SETQ / PSETQ: read every value form, bind nothing.  A target that
+         ;; is a SYMBOL MACRO is an assignment to its expansion -- (setq m 5)
+         ;; under (symbol-macrolet ((m (car #:%cell-m))) ...) writes the cell
+         ;; -- so the expansion's variables are free here too.  Skipping
+         ;; them left the cell uncaptured and the closure wrote through a
+         ;; garbage slot (MVM-TYPE-ERROR / memory fault).
          ((or (eq head 'setq) (eq head 'psetq))
           (let ((pairs (cdr form)))
             (loop
               (when (null pairs) (return acc))
+              (let ((place (car pairs)))
+                (when (and place (symbolp place) (not (member place bound)))
+                  (let ((b (env-lookup env place)))
+                    (when (and b (eq (binding-location b) :symbol-macro))
+                      (setq acc (%collect-free-vars (binding-expansion b) bound env acc))))))
               (setq acc (%collect-free-vars (cadr pairs) bound env acc))
               (setq pairs (cddr pairs)))))
          ;; Default: walk every ELEMENT as a form — spine-safe.  The old
@@ -13147,7 +13307,7 @@
               (setq *in-loop-catch-wrap* nil)
               (setq *nonlocal-blocks* %nlb-saved)))
           (let* ((loop-label (make-compiler-label))
-                 (exit-label (make-compiler-label))
+                 (exit-label (%note-label-depth (make-compiler-label)))
                  (*loop-exit-label* exit-label)
                  (*loop-exit-uwp-seq* (%uwp-current-seq))
                  (*block-labels*
@@ -14626,6 +14786,44 @@
        0.0)
       (t (%loop-acc-init-value kind)))))
 
+;; One FOR group's forms for the first pass (FIRSTP) or a later one, in clause
+;; order, and the temp bindings it needs.  A clause record is (AND-P TESTS
+;; ASSIGNS STEPS UFIRST UNEXT), U* being a user FOR = [THEN] form as
+;; (VAR . FORM).  A lone clause steps, takes its user form, tests and assigns;
+;; an AND group (CLHS 6.1.2.1) evaluates every user form into a temp before any
+;; of its variables change, then steps, sets, tests and assigns.
+(defun %loop-emit-group (grp firstp)
+  (if (null (cdr grp))
+      (let* ((c (car grp)) (u (if firstp (nth 4 c) (nth 5 c))))
+        (values (append (if firstp nil (nth 3 c))
+                        (if u (list `(setq ,(car u) ,(cdr u))) nil)
+                        (nth 1 c)
+                        (nth 2 c))
+                nil))
+      (let ((temps nil) (sets nil) (binds nil) (steps nil) (tests nil) (assigns nil))
+        (dolist (c grp)
+          (let ((u (if firstp (nth 4 c) (nth 5 c))))
+            (when u
+              (let ((tmp (%mvm-gensym "ANDSTEP")))
+                (push (list tmp nil) binds)
+                (push `(setq ,tmp ,(cdr u)) temps)
+                (push `(setq ,(car u) ,tmp) sets))))
+          (unless firstp (setq steps (append steps (nth 3 c))))
+          (setq tests (append tests (nth 1 c))
+                assigns (append assigns (nth 2 c))))
+        (values (append (nreverse temps) steps (nreverse sets) tests assigns)
+                binds))))
+
+;; FN over the top-level forms of a LOOP body, and over the forms inside its
+;; first-pass block `(if FIRSTV (progn ...))`, where the first pass's exhaustion
+;; tests live (see GENERATE-LOOP-CODE).
+(defun %loop-map-top (firstv fn forms)
+  (mapcar (lambda (f)
+            (if (and firstv (consp f) (eq (car f) 'if) (eq (cadr f) firstv))
+                `(if ,firstv (progn ,@(mapcar fn (cdr (caddr f)))))
+                (funcall fn f)))
+          forms))
+
 (defun generate-loop-code (state)
   "Generate Lisp code from a parsed loop-state."
   (let* ((iters (loop-state-iterations state))
@@ -14739,9 +14937,9 @@
          (anon-acc (when anon-acc-idx (nth anon-acc-idx accs)))
          (anon-acc-var (when anon-acc-idx (nth anon-acc-idx acc-vars)))
          (bindings nil)
-         (init-stmts nil)
-         (test-forms nil)
-         (step-stmts nil))
+         (pass-first nil)               ; the first-pass block (see below)
+         (pass-next nil)                ; later passes, in clause order
+         (firstv nil))
 
     ;; Bind conditional-INTO accumulator vars (independent of accs list).
     (let ((tails nil))
@@ -14786,11 +14984,16 @@
             (when (%loop-acc-list-kind-p (car acc))
               (push (list (%loop-tail-var av) nil) bindings))))))
 
-    ;; Process iterations.  GRP-START is the STEP-STMTS length at the head of
-    ;; the current AND group, where an AND-linked THEN form is evaluated.
-    (let ((grp-start 0))
+    ;; Process iterations.  Each clause fills its OWN test / per-iteration
+    ;; assignment / step lists (the names are rebound per clause below), plus
+    ;; C-UFIRST / C-UNEXT, a user FOR = [THEN] expression as (VAR . FORM) for
+    ;; the first and the later passes.  The clauses are then emitted IN CLAUSE
+    ;; ORDER (CLHS 6.1.2.1): on each pass a clause steps, tests and assigns
+    ;; before the next clause does -- see the emission after the DOLIST.
+    (let ((clauses nil))
     (dolist (iter iters)
-      (unless (loop-iter-and-p iter) (setq grp-start (length step-stmts)))
+     (let ((test-forms nil) (init-stmts nil) (step-stmts nil)
+           (c-ufirst nil) (c-unext nil))
       (ecase (loop-iter-kind iter)
         (:from
          (let ((var (loop-iter-var iter))
@@ -14870,75 +15073,15 @@
            (push `(setq ,idx (1+ ,idx)) step-stmts)))
 
         (:general
+         ;; FOR var = INIT [THEN STEP].  Assigned at the clause's place in the
+         ;; pass, never as a LET* binding: sequential clauses see the ones
+         ;; before them already stepped (cl-ppcre's `for quant = (quant lexer)
+         ;; for seq = quant then (cond ...)` read a NIL QUANT from a binding).
+         ;; Without THEN, INIT is re-evaluated on every pass.
          (let ((var (loop-iter-var iter)))
-           (if (eq (loop-iter-init-form iter) (loop-iter-step-form iter))
-               ;; No THEN clause: re-evaluate each iteration in init-stmts.
-               ;; This ensures correct ordering when referencing other loop
-               ;; variables (e.g., "for entry in list for name = (first entry)").
-               (progn
-                 (push (list var nil) bindings)
-                 (push `(setq ,var ,(loop-iter-init-form iter)) init-stmts))
-               ;; Has THEN clause: the INIT form runs on the FIRST iteration
-               ;; only, the STEP form at the end of every iteration.
-               ;;
-               ;; The init form MUST be evaluated in INIT-STMTS, not as the
-               ;; LET* binding it used to be.  Sequential FOR clauses see each
-               ;; other's values within one iteration (CLHS 6.1.2.1), and a
-               ;; no-THEN `for q = expr` sibling assigns Q in INIT-STMTS — so a
-               ;; LET* binding for S was evaluated BEFORE Q was ever set and
-               ;; `for q = … for s = q then …` initialised S to NIL.  That is
-               ;; cl-ppcre's parser verbatim:
-               ;;   (loop for quant = (quant lexer)
-               ;;         for seq = quant then (cond …)
-               ;;         while (start-of-subexpr-p lexer)
-               ;;         finally (return seq))
-               ;; A one-token regex takes exactly one iteration, so SEQ never
-               ;; got past its NIL binding, PARSE-STRING answered :VOID for
-               ;; every pattern, and every scanner matched the empty string at
-               ;; position 0 (SCAN "b+" "abbbc" → 0 instead of 1 4 #() #()).
-               ;;
-               ;; INIT-STMTS is safe ground: WHILE/UNTIL land in
-               ;; PRE-BODY-TESTS, which the body assembly places AFTER
-               ;; init-stmts, and TEST-FORMS only ever holds an iterator's own
-               ;; exhaustion test (:IN/:ON/:ACROSS/:FROM/:REPEAT), which can
-               ;; never reference a THEN variable.
-               (let ((firstv (%mvm-gensym "FORTHEN-FIRST")))
-                 (push (list var nil) bindings)
-                 (push (list firstv t) bindings)
-                 (if (loop-iter-and-p iter)
-                     (push `(if ,firstv
-                                (progn (setq ,var ,(loop-iter-init-form iter))
-                                       (setq ,firstv nil)))
-                           init-stmts)
-                     ;; SEQUENTIAL FOR (no AND): the STEP runs here too, in
-                     ;; clause order, on every iteration after the first -- not
-                     ;; at the end of the previous one.  A no-THEN sibling
-                     ;; before it (`for q = (quant lexer)`) is re-assigned in
-                     ;; INIT-STMTS, so a STEP-STMTS step read the OLD q: in
-                     ;; cl-ppcre's `for seq = quant then (cond … seq quant …)`
-                     ;; every regex parsed one token behind ("abc" -> "aab").
-                     ;; CLHS 6.1.2.1: sequential for-as clauses step in order,
-                     ;; each seeing the ones before it already stepped.
-                     (push `(if ,firstv
-                                (progn (setq ,var ,(loop-iter-init-form iter))
-                                       (setq ,firstv nil))
-                                (setq ,var ,(loop-iter-step-form iter)))
-                           init-stmts))
-                 (if (loop-iter-and-p iter)
-                     ;; FOR ... AND v = i THEN s: S sees the group's OLD
-                     ;; values, so evaluate it into a temp BEFORE the group's
-                     ;; first step (STEP-STMTS is reversed: that is position
-                     ;; LEN - GRP-START from the front), assign after.
-                     (let* ((tmp (%mvm-gensym "ANDSTEP"))
-                            (n (- (length step-stmts) grp-start)))
-                       (push (list tmp nil) bindings)
-                       (setq step-stmts
-                             (append (subseq step-stmts 0 n)
-                                     (list `(setq ,tmp ,(loop-iter-step-form iter)))
-                                     (nthcdr n step-stmts)))
-                       (push `(setq ,var ,tmp) step-stmts))
-                     ;; (sequential: stepped in INIT-STMTS above)
-                     nil)))))
+           (push (list var nil) bindings)
+           (setq c-ufirst (cons var (loop-iter-init-form iter))
+                 c-unext (cons var (loop-iter-step-form iter)))))
 
         (:while
          (push `(if (null ,(loop-iter-init-form iter)) (return-from :%loop-exit nil)) test-forms))
@@ -15025,7 +15168,43 @@
            (push (list var nil) bindings)
            (push `(if (null ,lst) (return-from :%loop-exit nil)) test-forms)
            (push `(setq ,var (car ,lst)) init-stmts)
-           (push `(setq ,lst (cdr ,lst)) step-stmts))))))
+           (push `(setq ,lst (cdr ,lst)) step-stmts))))
+      (push (list (loop-iter-and-p iter) (nreverse test-forms)
+                  (nreverse init-stmts) (nreverse step-stmts) c-ufirst c-unext)
+            clauses)))
+    ;; Emit the clauses in order, as MIT LOOP does.  The FIRST pass runs, per
+    ;; clause, its user INIT, its exhaustion test and its assignment, in one
+    ;; block guarded by FIRSTV at the top of the body; every LATER pass runs,
+    ;; per clause, its step, user THEN, test and assignment at the bottom.  So
+    ;; a test fires after the clauses before it have stepped (flexi-streams'
+    ;; `for r = s then (+ (ash r 6) ...) repeat n for o = (read-byte)` stopped
+    ;; one step short when every test ran first) and a step after them (a THEN
+    ;; reading a LATER FOR-FROM variable saw it already stepped).  An AND group
+    ;; steps in parallel: its user forms are evaluated into temps before any of
+    ;; its variables change.  Exits stay top-level forms or sit in the FIRSTV
+    ;; block, where %LOOP-MAP-TOP finds them for the ALWAYS / %NAT rewrites.
+    (let ((groups nil))
+      (dolist (c (nreverse clauses))
+        (if (and (first c) groups)
+            (push c (car groups))
+            (push (list c) groups)))
+      (setq groups (nreverse (mapcar (function reverse) groups)))
+      ;; APPEND, not MAPCAN: a group's lists share each clause's own (the
+      ;; first and later passes hold the same test forms), and splicing them
+      ;; destructively made the body circular.
+      (let ((top nil) (bot nil))
+        (dolist (g groups)
+          (multiple-value-bind (forms temps) (%loop-emit-group g t)
+            (setq top (append top forms))
+            (dolist (tb temps) (push tb bindings)))
+          (multiple-value-bind (forms temps) (%loop-emit-group g nil)
+            (setq bot (append bot forms))
+            (dolist (tb temps) (push tb bindings))))
+        (when top
+          (setq firstv (%mvm-gensym "FIRSTPASS"))
+          (push (list firstv t) bindings)
+          (setq pass-first (list `(if ,firstv (progn (setq ,firstv nil) ,@top)))))
+        (setq pass-next bot))))
 
     ;; Build accumulation body — one chunk per accumulator.
     (let ((acc-body nil)
@@ -15094,8 +15273,7 @@
       ;;   anon-acc-var or nil)
       (let* ((pre-body-tests (loop-state-pre-body-tests state))
              (post-body-tests (loop-state-post-body-tests state))
-             (loop-body (append (nreverse test-forms)
-                                (nreverse init-stmts)
+             (loop-body (append pass-first
                                 ;; WHILE/UNTIL parsed BEFORE body, here
                                 ;; (post-init pre-body) so iter vars are
                                 ;; bound.
@@ -15114,7 +15292,7 @@
                                   (append (nreverse out) chunks))
                                 ;; WHILE/UNTIL parsed AFTER body, here.
                                 post-body-tests
-                                (nreverse step-stmts)))
+                                pass-next))
              (inner (if block-name
                         `(loop (%loop-nonil) ,@loop-body)
                         `(loop ,@loop-body)))
@@ -15129,7 +15307,7 @@
              ;; final (return nil) to (return t).
              (final-test-forms
                (if has-always
-                   (mapcar (lambda (tf)
+                   (%loop-map-top firstv (lambda (tf)
                              (cond
                                ((and (consp tf) (eq (car tf) 'if)
                                      (equal (caddr tf) '(return-from :%loop-exit nil)))
@@ -15150,7 +15328,7 @@
              (%nat-var (%mvm-gensym "NAT"))
              (%bv-var (%mvm-gensym "BV"))
              (test-forms-with-nat
-               (mapcar
+               (%loop-map-top firstv
                 (lambda (tf)
                   (cond
                     ((and (consp tf) (eq (car tf) 'if)
@@ -15393,6 +15571,7 @@
          (emit-ir :push dest)
          (%emit-uwp-unwind-to *loop-exit-uwp-seq*)
          (emit-ir :pop dest))
+       (%emit-pop-to-label-depth *loop-exit-label*)
        (emit-ir :br *loop-exit-label*))
       ;; Cross-unit BLOCK NIL: we are inside a lambda/flet/labels function
       ;; whose enclosing (block nil …) installed a runtime catch frame
@@ -15511,6 +15690,7 @@
         ;; evaluates, so nothing in between can clobber it.
         (compile-form `(values-list (%%lx-reg ,value-dest)) env value-dest))
       (compile-form value-form env value-dest))
+  (%emit-pop-to-label-depth exit-label)
   (emit-ir :br exit-label))
 
 (defun %walker-macroexpand (form)
@@ -15798,7 +15978,7 @@
         ;; unwind-protect runs that u-p's cleanup (and pops its setjmp
         ;; frame) before the :br — the entry's 4th element is consumed by
         ;; the RETURN-FROM lexical branch / compile-return.
-        (let* ((exit-label (make-compiler-label))
+        (let* ((exit-label (%note-label-depth (make-compiler-label)))
                (*block-labels* (cons (list name exit-label dest
                                            (%uwp-current-seq))
                                      *block-labels*)))
@@ -16023,7 +16203,7 @@
     ;; First pass: collect tags and create labels
     (dolist (item body)
       (when (%tagbody-tag-p item)
-        (push (cons item (cons (make-compiler-label) tb-seq))
+        (push (cons item (cons (%note-label-depth (make-compiler-label)) tb-seq))
               *tagbody-tags*)))
     ;; Second pass: compile
     (let ((rest body))
@@ -16063,6 +16243,7 @@
     ;; entry = (TAG LABEL . TARGET-SEQ).  Run intervening unwind-protect
     ;; cleanups before branching (GO carries no value, so no push/pop).
     (%emit-uwp-unwind-to (cddr entry))
+    (%emit-pop-to-label-depth (cadr entry))
     (emit-ir :br (cadr entry))))
 
 ;;; ============================================================
@@ -19139,12 +19320,14 @@
     ;; per-call-site growth safe.
     (emit-ir-label slow-label)
     (let ((helper (cond
-                    ((eq branch-op :beq) "NUMERIC-EQUAL-P")
-                    ((eq branch-op :blt) "NUMERIC-VALUE-LESS-P")
-                    ((eq branch-op :bgt) "%NUMERIC-VALUE-GREATER-P")
-                    ((eq branch-op :ble) "NUMERIC-<=")
-                    ((eq branch-op :bge) "NUMERIC->=")
-                    (t                   "NUMERIC-EQUAL-P"))))
+                    ;; the %CHECKED- wrappers (cl-types) signal TYPE-ERROR
+                    ;; for a non-number operand, as CLHS 12.2 requires
+                    ((eq branch-op :beq) "%CHECKED-EQ")
+                    ((eq branch-op :blt) "%CHECKED-LT")
+                    ((eq branch-op :bgt) "%CHECKED-GT")
+                    ((eq branch-op :ble) "%CHECKED-LE")
+                    ((eq branch-op :bge) "%CHECKED-GE")
+                    (t                   "%CHECKED-EQ"))))
       (emit-ir :mov +vreg-v0+ dest)
       (emit-ir :mov +vreg-v1+ a-temp)
       (emit-ir :set-nargs 2)
@@ -19181,7 +19364,8 @@
     ;; operand still signals TYPE-ERROR — `.5` tests rely on that
     ;; (`(loop for x in *universe* when (and (typep x 'real) (not (< x))) …)`).
     ((null (cdr args))
-     (compile-form `(progn ,(car args) t) env dest))
+     (compile-form `(progn (,(if (eq branch-op :beq) '%number-arg '%real-arg) ,(car args)) t)
+                   env dest))
     ;; 2 args: simple comparison
     ((null (cddr args))
      (compile-compare-2 branch-op (car args) (cadr args) env dest))
@@ -19313,7 +19497,7 @@
   (cond
     ((and (consp arg) (eq (car arg) 'quote)
           (not (null (cadr arg))) (not (consp (cadr arg))))
-     (compile-form '(%signal-type-error) env dest))
+     (compile-form `(%signal-type-error ,arg 'list) env dest))
     (t
      (compile-form arg env dest)
      (compile-cxr-guard-and-deref :car dest env))))
@@ -19324,7 +19508,7 @@
   (cond
     ((and (consp arg) (eq (car arg) 'quote)
           (not (null (cadr arg))) (not (consp (cadr arg))))
-     (compile-form '(%signal-type-error) env dest))
+     (compile-form `(%signal-type-error ,arg 'list) env dest))
     (t
      (compile-form arg env dest)
      (compile-cxr-guard-and-deref :cdr dest env))))
@@ -19338,7 +19522,6 @@
    On unhandled fall-through (handler-case absent and %signal-type-error
    returns NIL) the value left in DEST is NIL — matches the CLHS
    suggestion that error-recovery should yield a defined value."
-  (declare (ignore env))
   (let ((null-label  (make-compiler-label))
         (cons-label  (make-compiler-label))
         (error-label (make-compiler-label))
@@ -19361,10 +19544,9 @@
     ;; longjmps when a handler-case is active; otherwise it returns
     ;; NIL and we fall through to done with dest = NIL.
     (emit-ir-label error-label)
-    ;; mvm-eval bridge nargs — see compile-funcall's NIL-guard.
-    (when *mvm-emit-halves* (emit-ir :set-nargs 0))
-    (emit-ir :call "%SIGNAL-TYPE-ERROR" 0)
-    (emit-ir :mov dest +vreg-vr+)
+    ;; The offending value is in DEST: pass it, and LIST, so the report
+    ;; names them ("The value 5 is not of type LIST.").
+    (compile-form `(%signal-type-error (%%lx-reg ,dest) 'list) env dest)
     (emit-ir-label done-label)
     (free-temp-reg)))
 
@@ -23993,6 +24175,8 @@
                              (list (list name return-label +vreg-vr+ 0))
                              nil))
          (*tagbody-tags* nil)
+         (*ir-push-depth* 0)
+         (*label-push-depths* nil)
          ;; NLX-through-unwind-protect: u-ps in an ENCLOSING unit are not
          ;; reachable by a lexical :br from inside this lambda/defun (the
          ;; cross-unit exit goes through the runtime catch/throw path), so
@@ -25415,7 +25599,9 @@
             ;; path uses CTOR-SYM (task #241): the user wrote the name in a
             ;; particular package and two packages' structs must not collide.
             (predicate-name :default)
-            (copier-name :default))
+            (copier-name :default)
+            ;; (:PRINT-FUNCTION fn) / (:PRINT-OBJECT fn): (kind . fn), or NIL.
+            (print-option nil))
        ;; Process options
        (dolist (opt options)
          (when (consp opt)
@@ -25435,6 +25621,10 @@
                                           cn
                                           (symbol-name cn)))
                                     nil)))  ; (:conc-name nil) → no prefix
+               ((and (name-eq opt-name "PRINT-FUNCTION") (cdr opt) (cadr opt))
+                (setf print-option (cons :print-function (cadr opt))))
+               ((and (name-eq opt-name "PRINT-OBJECT") (cdr opt) (cadr opt))
+                (setf print-option (cons :print-object (cadr opt))))
                ((name-eq opt-name "INCLUDE")
                 (setf include-parent (cadr opt))
                 (setf include-overrides (cddr opt)))
@@ -25894,6 +26084,24 @@
        ;; AREF/ASET cond entirely — which was already testing %MDA-P (itself
        ;; five type tests plus an OBJ-SUBTAG), CONSP and %PRIM-STRINGP on
        ;; every single slot access.  See GATE-RESULT-244-accessors.md.
+       ;; The printer consults this before printing #S(...).  It was parsed
+       ;; nowhere: a struct with :PRINT-FUNCTION / :PRINT-OBJECT printed
+       ;; #S(...) regardless.
+       ;; A lambda printer becomes a named function, so what is registered is
+       ;; a symbol; at runtime it is registered NOW, at expansion time, as
+       ;; %REGISTER-STRUCT-TYPE is below (generated toplevel calls compile
+       ;; to thunks that do not run).
+       (when print-option
+         (let* ((fn (cdr print-option))
+                (fsym (if (symbolp fn)
+                          fn
+                          (%defstruct-intern (format nil "%PRINT-~A" struct-str)))))
+           (unless (symbolp fn)
+             (push `(defun ,fsym ,@(cdr fn)) forms-to-compile))
+           (when *mvm-eval-runtime-p*
+             (%register-struct-printer struct-name fsym (car print-option)))
+           (push `(%register-struct-printer ',struct-name ',fsym ,(car print-option))
+                 forms-to-compile)))
        (loop for slot in slot-names
              for i from 0
              for slot-read-only in slot-ro
@@ -25904,8 +26112,8 @@
                            (if (= (obj-subtag obj) #x32)
                                (if (>= (%prim-array-length obj) ,min-inst-len)
                                    (%prim-aref obj ,(+ 2 i))
-                                   (%signal-type-error))
-                               (%signal-type-error)))
+                                   (%signal-type-error obj ',struct-name))
+                               (%signal-type-error obj ',struct-name)))
                         forms-to-compile)
                   ;; compile-time record: a call on an argument DECLARED to be
                   ;; this struct reads the slot in place (see compile-call)
@@ -26069,12 +26277,25 @@
      (let ((thunk-name (format nil "TOPLEVEL-~D" (make-compiler-label))))
        (mvm-compile-function thunk-name nil (list form))))))
 
+(defvar *fail-on-compile-skip* nil
+  "When true, MVM-COMPILE-ALL fails after compiling every form if any form
+   was SKIPPED for a compile error.  The CLI builds set it (build-cli-common):
+   there a skipped form is first-party code, and every call to a function it
+   defined compiles to a NIL sentinel -- GENERATE-LOOP-CODE was skipped that
+   way and every LOOP in the image returned NIL, with the build reporting
+   success.  The ANSI gate runners leave it NIL; their corpus legitimately
+   holds forms this compiler skips.")
+
+(defvar *compile-skip-log* nil
+  "SKIP notes (\"form#N location: error\") of the current MVM-COMPILE-ALL.")
+
 (defun mvm-compile-all (forms &key source-lines)
   "Compile a list of top-level forms into a complete MVM module.
    Returns a compiled-module containing bytecode, function table,
    and constant table.
    SOURCE-LINES: optional vector mapping form index to source line number."
-  (let ((*functions* (make-hash-table :test 'equal))
+  (let ((*compile-skip-log* nil)
+        (*functions* (make-hash-table :test 'equal))
         (*function-table* nil)
         (*constant-table* nil)
         (*label-counter* 0)
@@ -26086,6 +26307,8 @@
         (*loop-exit-uwp-seq* 0)
         (*block-labels* nil)
         (*tagbody-tags* nil)
+        (*ir-push-depth* 0)
+        (*label-push-depths* nil)
         (*uwp-cleanups* nil)
         (*uwp-seq-counter* 0)
         (*pending-flet-ir* nil)
@@ -26169,6 +26392,9 @@
                             ;; that used to fault the recovery path.
                             (format t "  SKIP form#~D ~A: ~A~%"
                                     (1- form-index) *current-source-location* e)
+                            (push (format nil "form#~D ~A: ~A"
+                                          (1- form-index) *current-source-location* e)
+                                  *compile-skip-log*)
                             (setf *function-table* fn-table-before)
                             (setf *pending-flet-ir* nil)
                             nil))))
@@ -26444,6 +26670,12 @@
                            (if (integerp *compile-bloat-report*)
                                *compile-bloat-report*
                                30)))
+
+      (when (and *fail-on-compile-skip* *compile-skip-log*)
+        (error "~&COMPILE CHECK FAILED: ~D form(s) were SKIPPED for compile errors.~%~
+                Every call to a function they define would compile to a NIL~%~
+                sentinel.~%~{  ~A~%~}"
+               (length *compile-skip-log*) (reverse *compile-skip-log*)))
 
       ;; Build module
       (make-compiled-module

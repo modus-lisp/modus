@@ -2225,6 +2225,17 @@
       ((or (eq head 'string) (eq head 'simple-string)
            (eq head 'base-string) (eq head 'simple-base-string))
        (cond
+         ;; A NON-simple string (the header-object array a fill-pointer or
+         ;; adjustable MAKE-ARRAY returns) must be COPIED for a SIMPLE- target:
+         ;; returned unchanged, its header said string while its slots held no
+         ;; codes, so compiled CHAR read garbage.  seal's UTF8-DECODE ends in
+         ;; this coerce, so every websocket message decoded to junk.
+         ((and (%mda-p obj) (stringp obj)
+               (or (eq head 'simple-string) (eq head 'simple-base-string)))
+          (let* ((n (length obj)) (s (%make-string-array n)) (i 0))
+            (loop (when (= i n) (return s))
+              (aset s i (char-code (char obj i)))
+              (setq i (+ i 1)))))
          ((stringp obj) obj)
          ((characterp obj)
           (let ((s (%make-string-array 1)))

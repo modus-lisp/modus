@@ -2,7 +2,12 @@
 # Launch ONE Nitro-Enclaves-capable spot instance for the first modus.eif run.
 #   test/nitro/aws-launch.sh [KEYNAME] [TYPES...]   (defaults: modus-nitro, a list of
 #   Nitro-capable 4-vCPU types).  Tries every (AZ, type) pair in the region for
-#   spot capacity; ON_DEMAND=1 uses on-demand instead.  AWS_REGION picks the
+#   spot capacity; ON_DEMAND=1 uses on-demand instead.
+#   SNP=1 launches an AMD SEV-SNP guest instead of a Nitro Enclaves parent:
+#   c6a/m6a/r6a (Milan) with --cpu-options AmdSevSnp=enabled, on-demand, in a
+#   region that offers it (us-east-2, eu-west-1).  The whole VM is the SNP guest
+#   and /dev/sev-guest answers in it; its launch measurement covers AWS's UEFI
+#   firmware, NOT our image (docs/snp-guest.md, "EC2").  AWS_REGION picks the
 #   region (quiet choices: us-east-2, eu-west-1, us-west-2).
 # Needs: aws cli signed in (aws sts get-caller-identity), region set (AWS_REGION
 # or `aws configure`).  Creates the key pair and a security group (SSH from this
@@ -10,13 +15,19 @@
 # ssh line.  Tear down with:  aws ec2 terminate-instances --instance-ids <id>
 set -euo pipefail
 KEY=${1:-modus-nitro}; shift || true
-TYPES=${*:-m5.xlarge c5.xlarge m6i.xlarge c6i.xlarge m5a.xlarge c5a.xlarge m6a.xlarge r5.xlarge r6i.xlarge}
+if [ -n "${SNP:-}" ]; then
+  TYPES=${*:-c6a.large m6a.large c6a.xlarge m6a.xlarge r6a.large}; ON_DEMAND=1
+  GUEST=(--cpu-options AmdSevSnp=enabled); NAME=modus-snp
+else
+  TYPES=${*:-m5.xlarge c5.xlarge m6i.xlarge c6i.xlarge m5a.xlarge c5a.xlarge m6a.xlarge r5.xlarge r6i.xlarge}
+  GUEST=(--enclave-options Enabled=true); NAME=modus-nitro
+fi
 SG=modus-nitro-ssh; export AWS_REGION=${AWS_REGION:-$(aws configure get region)}
 say() { echo "[aws-launch] $*" >&2; }
 TMPERR=$(mktemp); trap 'rm -f "$TMPERR"' EXIT
 
 # Amazon Linux 2023 x86_64, resolved through SSM so no AMI id is pinned here.
-AMI=$(aws ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query Parameter.Value --output text)
+AMI=${AMI:-$(aws ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query Parameter.Value --output text)}   # AMI=… to launch a specific image
 say "AMI $AMI"
 
 if ! aws ec2 describe-key-pairs --key-names "$KEY" >/dev/null 2>&1; then
@@ -69,9 +80,9 @@ for TYPE in $TYPES; do
     say "trying $TYPE in $AZ ${ON_DEMAND:+(on-demand)}"
     if ID=$(aws ec2 run-instances \
       --image-id "$AMI" --instance-type "$TYPE" --key-name "$KEY" --security-group-ids "$SGID" --subnet-id "$SUBNET" --associate-public-ip-address \
-      --enclave-options Enabled=true ${MARKET[@]+"${MARKET[@]}"} \
+      "${GUEST[@]}" ${MARKET[@]+"${MARKET[@]}"} \
       --block-device-mappings 'DeviceName=/dev/xvda,Ebs={VolumeSize=16,VolumeType=gp3}' \
-      --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=modus-nitro}]' \
+      --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME}]" \
       --query 'Instances[0].InstanceId' --output text 2>"$TMPERR"); then break 2; fi
     grep -q "InsufficientInstanceCapacity\|Unsupported\|not supported in your requested Availability Zone\|MaxSpotInstanceCountExceeded" "$TMPERR" || { cat "$TMPERR" >&2; exit 1; }
   done <<< "$SUBNETS"
@@ -83,12 +94,24 @@ IP=$(aws ec2 describe-instances --instance-ids "$ID" --query 'Reservations[0].In
 cat <<EOT
 instance: $ID
 ssh -i ~/.ssh/$KEY.pem ec2-user@$IP
+$(if [ -n "${SNP:-}" ]; then cat <<'SNPTXT'
+then, on the host (docs/snp-guest.md, "EC2"):
+  ls -l /dev/sev-guest && dmesg | grep -i sev          # the guest device and "SEV-SNP" in the boot log
+  sudo dnf install -y -q gcc make git && curl -sSf https://sh.rustup.rs | sh -s -- -y
+  ~/.cargo/bin/cargo install snpguest                  # AMD's guest tool: report + certificate fetch
+  sudo ~/.cargo/bin/snpguest report report.bin request.bin --random
+  sudo ~/.cargo/bin/snpguest fetch ca pem milan certs && sudo ~/.cargo/bin/snpguest fetch vcek pem milan certs report.bin
+  # bring report.bin + certs/ back and run test/snp/verify-report.py report.bin --vcek certs/vcek.pem --chain certs/ark.pem
+SNPTXT
+else cat <<'NITROTXT'
 then, on the host (docs/nitro-enclaves.md):
   sudo dnf install -y aws-nitro-enclaves-cli aws-nitro-enclaves-cli-devel && sudo usermod -aG ne ec2-user
   sudo sed -i 's/^memory_mib:.*/memory_mib: 3072/; s/^cpu_count:.*/cpu_count: 2/' /etc/nitro_enclaves/allocator.yaml
   sudo systemctl enable --now nitro-enclaves-allocator.service
   # log out and back in for the group, scp modus.eif + test/nitro/*.py up, then
   nitro-cli run-enclave --eif-path modus.eif --memory 3072 --cpu-count 2 --enclave-cid 16 --debug-mode
+NITROTXT
+fi)
 teardown: aws ec2 terminate-instances --instance-ids $ID
 (the modus-nitro VPC/subnet/igw/sg are free to keep; delete by tag Name=modus-nitro if you want them gone)
 EOT

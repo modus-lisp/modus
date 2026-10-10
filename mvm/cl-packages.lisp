@@ -1891,6 +1891,9 @@
    through a tail position corrupted BOOLE's MV count."
   (when (null name-or-hash) (return-from symbol-value nil))
   (when (eq name-or-hash t) (return-from symbol-value t))
+  ;; A keyword is a constant naming itself (it has no table entry).
+  (when (and (not (integerp name-or-hash)) (keywordp name-or-hash))
+    (return-from symbol-value name-or-hash))
   (let ((key (if (integerp name-or-hash)
                  name-or-hash
                  (%sym-global-key name-or-hash))))

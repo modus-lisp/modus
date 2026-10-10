@@ -1732,6 +1732,14 @@
         ;; reference inside the form (self-cycle: `#1=(A B . #1#)`) reads
         ;; as the marker; after %read-internal completes we walk the
         ;; result and substitute the marker with the labelled object.
+        ;; Under *READ-SUPPRESS* labels are neither defined nor referenced
+        ;; (CLHS 2.4.8.15/16, 2.2 read-suppress): #N= reads its object and
+        ;; #N# reads as NIL.  They passed the ANSI READ-SUPPRESS.SHARP-SHARP
+        ;; tests only while labels leaked from one READ into the next.
+        ((and (= code 61) *read-suppress*)
+         (%read-internal stream t nil t))
+        ((and (= code 35) *read-suppress*)
+         nil)
         ((= code 61)  ; =
          (when (null arg) (%reader-error "missing label for #="))
          (let ((marker (cons :sharp-label arg)))
@@ -2127,6 +2135,7 @@
           ;; NIL, so a non-local exit (reader-error) leaving it at NIL is
           ;; harmless — no unwind-protect needed on the discard path.
           (let ((*sharp-labels* nil))
+            (declare (special *sharp-labels*))
             (setq *reader-preserve-ws* nil)
             (let ((result (%read-internal s eof-error-p eof-value recursive-p)))
               (setq *reader-preserve-ws* nil)
@@ -2150,6 +2159,7 @@
       (let ((result (if recursive-p
                         (%read-internal s eof-error-p eof-value recursive-p)
                         (let ((*sharp-labels* nil))
+                          (declare (special *sharp-labels*))
                           (%read-internal s eof-error-p eof-value recursive-p)))))
         (setq *reader-preserve-ws* nil)
         result))))
@@ -2242,6 +2252,7 @@
                            (let ((r (%read-internal s eof-error-p eof-value nil)))
                              (setq *reader-preserve-ws* saved-preserve)
                              r))))
+            (declare (special *sharp-labels*))
             ;; Get position.  CLHS 23.2 read-from-string: the second value
             ;; is the index of the first character not read.  Modus's token
             ;; reader UNREADS whatever char terminated the token — the
@@ -2281,91 +2292,34 @@
 ;;; (%with-standard-io-syntax (lambda () body))
 
 (defun %with-standard-io-syntax (thunk)
-  "Execute THUNK with standard I/O syntax bindings."
-  (let ((saved-package *package*)
-        (saved-readtable *readtable*)
-        (saved-read-base *read-base*)
-        (saved-read-suppress *read-suppress*)
-        (saved-read-eval *read-eval*)
-        (saved-print-base *print-base*)
-        (saved-print-case *print-case*)
-        (saved-print-escape *print-escape*)
-        (saved-print-gensym *print-gensym*)
-        (saved-print-length *print-length*)
-        (saved-print-level *print-level*)
-        (saved-print-readably *print-readably*)
-        (saved-print-array *print-array*)
-        (saved-print-circle *print-circle*)
-        (saved-print-lines *print-lines*)
-        (saved-print-pretty *print-pretty*)
-        (saved-print-radix *print-radix*)
-        (saved-print-right-margin *print-right-margin*)
-        (saved-print-miser-width *print-miser-width*))
-    (setq *package* (find-package "CL-USER"))
-    (setq *readtable* (copy-readtable nil))
-    (setq *read-base* 10)
-    (setq *read-suppress* nil)
-    (setq *read-eval* t)
-    (setq *print-array* t)
-    (setq *print-base* 10)
-    (setq *print-case* :upcase)
-    (setq *print-circle* nil)
-    (setq *print-escape* t)
-    (setq *print-gensym* t)
-    (setq *print-length* nil)
-    (setq *print-level* nil)
-    (setq *print-lines* nil)
-    (setq *print-miser-width* nil)
-    (setq *print-pretty* nil)
-    (setq *print-radix* nil)
-    (setq *print-readably* nil)
-    (setq *print-right-margin* nil)
-    ;; Preserve all return values from THUNK via MULTIPLE-VALUE-PROG1
-    ;; (read-from-string returns 2 values; capturing into single var
-    ;; would lose the position value and break tests using
-    ;; multiple-value-list around the wrap).
-    (multiple-value-prog1
-        (handler-case (funcall thunk)
-          (error (c)
-            (setq *package* saved-package)
-            (setq *readtable* saved-readtable)
-            (setq *read-base* saved-read-base)
-            (setq *read-suppress* saved-read-suppress)
-            (setq *read-eval* saved-read-eval)
-            (setq *print-base* saved-print-base)
-            (setq *print-case* saved-print-case)
-            (setq *print-escape* saved-print-escape)
-            (setq *print-gensym* saved-print-gensym)
-            (setq *print-length* saved-print-length)
-            (setq *print-level* saved-print-level)
-            (setq *print-readably* saved-print-readably)
-            (setq *print-array* saved-print-array)
-            (setq *print-circle* saved-print-circle)
-            (setq *print-lines* saved-print-lines)
-            (setq *print-pretty* saved-print-pretty)
-            (setq *print-radix* saved-print-radix)
-            (setq *print-right-margin* saved-print-right-margin)
-            (setq *print-miser-width* saved-print-miser-width)
-            (error c)))
-      (setq *package* saved-package)
-      (setq *readtable* saved-readtable)
-      (setq *read-base* saved-read-base)
-      (setq *read-suppress* saved-read-suppress)
-      (setq *read-eval* saved-read-eval)
-      (setq *print-base* saved-print-base)
-      (setq *print-case* saved-print-case)
-      (setq *print-escape* saved-print-escape)
-      (setq *print-gensym* saved-print-gensym)
-      (setq *print-length* saved-print-length)
-      (setq *print-level* saved-print-level)
-      (setq *print-readably* saved-print-readably)
-      (setq *print-array* saved-print-array)
-      (setq *print-circle* saved-print-circle)
-      (setq *print-lines* saved-print-lines)
-      (setq *print-pretty* saved-print-pretty)
-      (setq *print-radix* saved-print-radix)
-      (setq *print-right-margin* saved-print-right-margin)
-      (setq *print-miser-width* saved-print-miser-width))))
+  "Execute THUNK with standard I/O syntax (CLHS WITH-STANDARD-IO-SYNTAX).
+   The variables are BOUND, not assigned and restored: they are standard
+   specials, so the LET binds them dynamically -- per thread, undone on
+   every exit, all values of THUNK passed through.  The old SETQ-and-restore
+   rewrote the process-wide values: any other thread printing meanwhile saw
+   them, and on an actor the fresh readtable stored into the global was
+   refused by the shared-store guard (quri's URI-AUTHORITY, so RENDER-URI)."
+  (let ((*package* (find-package "CL-USER"))
+        (*readtable* (copy-readtable nil))
+        (*read-base* 10)
+        (*read-suppress* nil)
+        (*read-eval* t)
+        (*print-array* t)
+        (*print-base* 10)
+        (*print-case* :upcase)
+        (*print-circle* nil)
+        (*print-escape* t)
+        (*print-gensym* t)
+        (*print-length* nil)
+        (*print-level* nil)
+        (*print-lines* nil)
+        (*print-miser-width* nil)
+        (*print-pretty* nil)
+        (*print-radix* nil)
+        (*print-readably* nil)
+        (*print-right-margin* nil))
+    (funcall thunk)))
+
 
 ;; FIND-CLASS lives in cl-conditions.lisp with the real implementation
 ;; that consults %find-clos-class + the built-in class proxy table.

@@ -692,6 +692,60 @@
    can catch an ERROR but not a dead process: PRINT.CONS.RANDOM.2 took shard 26
    with it).")
 
+;;; ------------------------------------------------------------------
+;;; PRINT-OBJECT for instances and structures
+
+(defvar *%struct-printers* nil
+  "(type-name . (kind . function)) for each DEFSTRUCT given a :PRINT-FUNCTION
+   (kind :PRINT-FUNCTION, called with object, stream and depth) or a
+   :PRINT-OBJECT (kind :PRINT-OBJECT, object and stream).")
+
+(defun %register-struct-printer (name fn kind)
+  (setq *%struct-printers*
+        (cons (cons name (cons kind fn))
+              (remove name *%struct-printers* :key (function car))))
+  name)
+
+(defun %struct-printer (name)
+  (cdr (assoc name *%struct-printers*)))
+
+(defun %user-print-object-p (obj)
+  "True when a PRINT-OBJECT method other than the default applies to OBJ."
+  (let ((gf (%find-gf 'print-object)))
+    (and gf (%gf-methods gf)
+         (not (null (%collect-applicable-methods gf (list obj *standard-output*)))))))
+
+(defun %instance-class-name (obj)
+  (let ((c (aref obj 1)))
+    (if (symbolp c) c (class-name c))))
+
+(defun %print-instance-default (obj stream)
+  (%print-char 35 stream) (%print-char 60 stream)          ; #<
+  (%write-obj (%instance-class-name obj) stream nil t)
+  (%print-char 62 stream))                                  ; >
+
+(defun %print-struct-default (obj stream level escape)
+       (%print-char 35 stream)   ; #
+       (%print-char 83 stream)   ; S
+       (%print-char 40 stream)   ; (
+       (let* ((tname (%struct-type-name obj))
+              (desc (%find-struct-type tname))
+              (slots (if desc (%struct-type-desc-slots desc) nil)))
+         (%write-obj tname stream level escape)
+         (let ((i 0) (cur slots))
+           (loop
+             (when (null cur) (return nil))
+             (%print-char 32 stream)   ; space
+             ;; slot keyword — intern :SLOTNAME in the KEYWORD package
+             (let ((kw (intern (symbol-name (car cur)) (find-package "KEYWORD"))))
+               (%write-obj kw stream level escape))
+             (%print-char 32 stream)
+             (%write-obj (aref obj (+ 2 i)) stream
+                         (if (null level) 1 (+ level 1)) escape)
+             (setq i (+ i 1))
+             (setq cur (cdr cur)))))
+  (%print-char 41 stream))  ; )
+
 (defun %write-obj (obj stream level escape)
   "Recursion guard around %WRITE-OBJ-0: an ERROR at +%WRITE-DEPTH-LIMIT+ levels
    instead of a stack overflow.  Every nested element print comes through here."
@@ -700,7 +754,12 @@
   ;; it the binding below is LEXICAL, every frame reads the global 0 and the
   ;; guard never fires (measured: a 1500-deep list printed straight through).
   (declare (special *%write-depth*))
-  (let ((d *%write-depth*))
+  ;; Before INIT-ALL-GLOBALS runs (boot FORMATs while compiling) the DEFVAR's
+  ;; 0 has not been stored and the variable reads NIL.  That used to make the
+  ;; guard (> NIL limit) -- quietly false, so the guard was off -- and the
+  ;; binding (+ NIL 1).  Now that < > signal TYPE-ERROR for a non-number it
+  ;; was a boot-time signal with no handler; read an unset depth as 0.
+  (let ((d (if (fixnump *%write-depth*) *%write-depth* 0)))
     (when (> d +%write-depth-limit+)
       (error "printer: structure nested deeper than ~D levels -- a circular object printed with *PRINT-CIRCLE* NIL?" +%write-depth-limit+))
     (let ((*%write-depth* (+ d 1)))
@@ -878,27 +937,26 @@
       ;; Struct instance — slot-0 = '%struct-instance, slot-1 = type-name,
       ;; user slots from slot-2.  Print #S(TYPE-NAME :SLOT1 v1 :SLOT2 v2 …)
       ;; per CLHS 22.1.3.12.  Detect BEFORE the generic array printer.
+      ;; CLOS INSTANCE: the user's PRINT-OBJECT method when one applies,
+      ;; else #<CLASS-NAME> -- it used to fall through to the array printer
+      ;; and print its raw representation, #(%CLOS-INSTANCE PT 1).
+      ;; A PATHNAME is a %CLOS-INSTANCE underneath; leave it to the #P arm
+      ;; below unless the user has a PRINT-OBJECT method for it.
+      ((and (%clos-instance-p obj)
+            (or (not (%pathname-obj-p obj)) (%user-print-object-p obj)))
+       (if (%user-print-object-p obj)
+           (print-object obj stream)
+           (%print-instance-default obj stream)))
+      ;; Struct instance: a user PRINT-OBJECT method, then the DEFSTRUCT's
+      ;; :PRINT-FUNCTION / :PRINT-OBJECT, else #S(TYPE :SLOT v ...).
       ((%struct-instance-p obj)
-       (%print-char 35 stream)   ; #
-       (%print-char 83 stream)   ; S
-       (%print-char 40 stream)   ; (
-       (let* ((tname (%struct-type-name obj))
-              (desc (%find-struct-type tname))
-              (slots (if desc (%struct-type-desc-slots desc) nil)))
-         (%write-obj tname stream level escape)
-         (let ((i 0) (cur slots))
-           (loop
-             (when (null cur) (return nil))
-             (%print-char 32 stream)   ; space
-             ;; slot keyword — intern :SLOTNAME in the KEYWORD package
-             (let ((kw (intern (symbol-name (car cur)) (find-package "KEYWORD"))))
-               (%write-obj kw stream level escape))
-             (%print-char 32 stream)
-             (%write-obj (aref obj (+ 2 i)) stream
-                         (if (null level) 1 (+ level 1)) escape)
-             (setq i (+ i 1))
-             (setq cur (cdr cur)))))
-       (%print-char 41 stream))  ; )
+       (let ((printer (%struct-printer (%struct-type-name obj))))
+         (cond
+           ((%user-print-object-p obj) (print-object obj stream))
+           ((and printer (eq (car printer) :print-function))
+            (funcall (cdr printer) obj stream (if level level 0)))
+           (printer (funcall (cdr printer) obj stream))
+           (t (%print-struct-default obj stream level escape)))))
       ;; String  (also matches fp-wrapped strings — wrapper-aware stringp
       ;; reports T for them.  Use LENGTH (fill-pointer aware) instead of
       ;; ARRAY-LENGTH so the printed form respects the fp truncation.)
@@ -973,7 +1031,9 @@
       ;; Multi-dim array wrapper: (cons 9867654 (cons DIMS FLAT-ARR))
       ((and (consp obj) (eql (car obj) 9867654) (consp (cdr obj)))
        (cond
-         ((not *print-array*)
+         ;; *PRINT-READABLY* wins over *PRINT-ARRAY* (as SBCL): a readable
+         ;; printer must not emit #<Array> (PRINT.ARRAY.0.11, 2.23).
+         ((and (not *print-array*) (not *print-readably*))
           (%print-char 35 stream)
           (%print-char 60 stream)
           (%print-string-raw "Array" stream)
@@ -988,7 +1048,9 @@
       ;; downstream stringp branch handles it.
       ((%mda-p obj)
        (cond
-         ((not *print-array*)
+         ;; *PRINT-READABLY* wins over *PRINT-ARRAY* (as SBCL): a readable
+         ;; printer must not emit #<Array> (PRINT.ARRAY.0.11, 2.23).
+         ((and (not *print-array*) (not *print-readably*))
           (%print-char 35 stream)
           (%print-char 60 stream)
           (%print-string-raw "Array" stream)
@@ -1108,8 +1170,8 @@
          ;; >= plev, print as "#" with no element walk.  (print-level.3)
          ((and plev (>= (or level 0) plev))
           (%print-char 35 stream))   ; #
-         ((not *print-array*)
-          ;; Print as unreadable
+         ((and (not *print-array*) (not *print-readably*))
+          ;; Print as unreadable (*PRINT-READABLY* wins over *PRINT-ARRAY*)
           (%print-char 35 stream)
           (%print-char 60 stream)
           (%print-string-raw "Array" stream)
@@ -2251,6 +2313,9 @@
       ;; Print type name
       (let ((type-str
              (cond
+               ((%clos-instance-p obj) (symbol-name (%instance-class-name obj)))
+               ((%struct-instance-p obj) (symbol-name (%struct-type-name obj)))
+               ((%condition-p obj) (symbol-name (%condition-type-name obj)))
                ((null obj) "NULL")
                ((eq obj t) "BOOLEAN")
                ((fixnump obj) "FIXNUM")

@@ -7479,7 +7479,13 @@
     (a64-add-imm buf +a64-x9+ +a64-x9+ 15) (a64-lsr-imm buf +a64-x9+ +a64-x9+ 4) (a64-lsl-imm buf +a64-x9+ +a64-x9+ 4) ; align16
     (a64-add-reg buf +a64-x24+ +a64-x26+ +a64-x9+ 0 0)   ; x24 = next object pos (preserved)
     (a64-add-reg buf +a64-x26+ +a64-x23+ +a64-x16+ 0 0)  ; x26 = slot_end = obj+16+count*8
-    (dolist (st (list #x10 #x11 #x12 #x14 #x16 #x30 #x31 #x60 #x64 #x65 #x66))
+    ;; NOT #x30: a BIG bignum is a 2-slot #x30 whose slot 1 POINTS AT its limb
+    ;; array (cl-eval.lisp %MAKE-BB, sentinel -1 in slot 0); skipped as a leaf,
+    ;; that array was never forwarded and the bignum read garbage once its
+    ;; from-space was reused -- natrium's *P25519* after a tarball install on the
+    ;; Pi (INTEGER-LENGTH never returned).  A small bignum's two slots are tagged
+    ;; fixnums, safe to scan.  x64 made the same fix in 9d0790c.
+    (dolist (st (list #x10 #x11 #x12 #x14 #x16 #x31 #x60 #x64 #x65 #x66))
       (a64-cmp-imm buf +a64-x14+ st)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i leafskip :bcond)))
     ;; pointer-bearing: scan slots [x23 .. slot_end=x26)
@@ -7882,8 +7888,8 @@
     ;; cursor zeroed mid-object would scan from address 0.  The
     ;; cons-kind bitmap (@0x10000E40) says whether the granule at the cursor is a
     ;; cons (scan car+cdr) or a headered object (read subtag).  LEAF subtags
-    ;; (string #x10/#x31, u8 #x11, u64 #x14, sap #x16, bignum #x30, floats
-    ;; #x60/#x64/#x65/#x66) carry RAW payload → copy but DO NOT scan their slots
+    ;; (string #x10/#x31, u8 #x11, u64 #x14, sap #x16, floats -- NOT bignum #x30, whose
+    ;; big form points at its limbs; floats #x60/#x64/#x65/#x66) carry RAW payload → copy but DO NOT scan their slots
     ;; as pointers (so a leaf data word aliasing a from-space start is never
     ;; rewritten — the residual gap the word-by-word scan had).  #x61 = mvm-module
     ;; is NOT a leaf (pointer slots) so it is scanned.  Object size mirrors

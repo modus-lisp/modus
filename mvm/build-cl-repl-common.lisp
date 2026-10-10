@@ -1071,8 +1071,11 @@
         *ssh-addr-map-source*                     (string #\Newline)
         (if *cl-repl-x64-p* *ssh-x64-actor-stubs* (%rpi-net-text "actors.lisp")) (string #\Newline)
         (%rpi-net-text "ssh.lisp")                (string #\Newline)
-        ;; :X64 overrides of ssh.lisp: TSC-timed waits, RDRAND-keyed SSH-RANDOM.
-        (if *cl-repl-x64-p* (%rpi-net-text "ssh-x64-cl.lisp") "") (string #\Newline)
+        ;; After ssh.lisp, by last-defun-wins -- :X64: TSC-timed waits and RDRAND for
+        ;; SSH-RANDOM; :RPI: the BCM2835/2837 hardware RNG for SSH-RANDOM.
+        (cond (*cl-repl-x64-p* (%rpi-net-text "ssh-x64-cl.lisp"))
+              (*cl-repl-rpi-p* (%rpi-net-text "hwrng-bcm2835.lisp"))
+              (t "")) (string #\Newline)
         "(defun native-eval (form) (eval form))"  (string #\Newline)
         ;; ssh-handle-connection fix + trace live in net/ssh.lisp.
         ;; FIX: single-threaded server handles ONE connection at a time.  Guard

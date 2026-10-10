@@ -25,13 +25,15 @@
 ;; Load: arch-raspi3b (adapter) + dwc2-device (USB gadget NIC)
 ;; + ip + crypto + ssh + http + overrides
 (defvar *net-source*
-  (format nil "~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%"
+  (format nil "~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%"
           (read-file-text (merge-pathnames "arch-raspi3b.lisp" *net-dir*))
           (read-file-text (merge-pathnames "dwc2-device.lisp" *net-dir*))
           (read-file-text (merge-pathnames "ip.lisp" *net-dir*))
           (read-file-text (merge-pathnames "crypto.lisp" *net-dir*))
           (read-file-text (merge-pathnames "crypto-fast.lisp" *net-dir*))
           (read-file-text (merge-pathnames "ssh.lisp" *net-dir*))
+          ;; after ssh.lisp: the hardware RNG behind SSH-RANDOM (last-defun-wins)
+          (read-file-text (merge-pathnames "hwrng-bcm2835.lisp" *net-dir*))
           (read-file-text (merge-pathnames "http.lisp" *net-dir*))
           (read-file-text (merge-pathnames "http-client.lisp" *net-dir*))))
 
@@ -186,7 +188,7 @@
     (format t "Entry point offset: ~A~%" (kernel-image-entry-point image))
     (format t "Native code size: ~D~%" (length (kernel-image-native-code image)))
     (format t "Boot code size: ~D~%" (length (kernel-image-boot-code image)))
-    (write-kernel-image image "/tmp/piboot/kernel8.img")
+    (write-kernel-image image (or (sb-ext:posix-getenv "MODUS_KERNEL_OUT") "/tmp/piboot/kernel8.img"))  ; MODUS_KERNEL_OUT overrides
     (format t "Done. Deploy with:~%")
     (format t "  sudo /tmp/usbboot/rpiboot -d /tmp/piboot~%")
     (format t "Then configure host networking:~%")

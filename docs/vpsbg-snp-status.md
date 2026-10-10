@@ -58,11 +58,24 @@ in `tmp/vpsbg/2026-10-10/attested-ssh-*`.  What it took, after the first report:
    with RST, then a real one, all retransmitting SYNs once a second): the real
    client's banner after **18.1 s** before, **1.0 s** after.
 
-**Still open, security:** the Pi / aarch64 SSH images still use the generic
-`ssh-random` -- the boot-time ephemeral key from the constant state, later ones
-from a state seeded with the client's address and port.  They need the same
-treatment with their own hardware RNG (BCM2835 RNG).  TCP's initial sequence
-number is the constant 1000 on every connection.
+**The Pi images, the same day.**  The generator now lives in `net/ssh.lisp` for
+every SSH image, keyed through `arch-hw-random-fill`: RDRAND on x64
+(`net/ssh-x64-cl.lisp`), the BCM2835/2837 RNG at `0x3F104000` on the Pi 3 /
+Zero 2 W (`net/hwrng-bcm2835.lisp`, spliced after `ssh.lisp` in the Pi CL image
+and the three legacy Pi SSH builds).  With no hardware RNG it falls back to
+`arch-seed-random` + the cycle counter and prints `SSH:WEAK-RNG`; only the x64
+image inside an SNP guest refuses instead (`ssh-no-hw-rng`).  The Pi's
+`arch-seed-random` was itself a constant (`#x00010203`).  Measured in QEMU
+raspi3b (it models the BCM2835 RNG) on the Pi CL image with SSH autostart: the
+server's boot-time X25519 public key was `217662315` on two boots of the old
+image and `1088448314` / `1800711922` on two boots of the new one, with no
+weak-RNG line.  NOT run on a real Zero 2 W yet (the rig was busy).  The legacy
+images build with unchanged unresolved-function counts; `rpi-ssh` does not
+serve in QEMU before or after (USB CDC enumeration fails: `CDC:E2`), and the
+Zero 2 W gadget images need the hardware.
+
+**Still open, security:** TCP's initial sequence number is the constant 1000
+on every connection.
 
 ## Session 2026-10-10: from "idle in kernel-main" to a verified report
 
@@ -268,8 +281,8 @@ computation exactly (top of this file).
 
 ## Next steps
 
-1. Give the Pi / aarch64 SSH images a real RNG and the per-connection key
-   (see "Still open, security").  Random ISNs.
+1. Run the Pi CL SSH image on the real Zero 2 W (RNG fix verified in QEMU
+   only).  Random ISNs.
 2. Script the measured-boot round (UKI, expected digest, upload, attach, wait
    for the Modus banner, attested client, detach).  Today it is the commands in
    this file's history.  Image 373 is uploaded (auto-removed after two days

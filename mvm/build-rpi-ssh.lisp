@@ -37,6 +37,8 @@
           (read-file-text (merge-pathnames "crypto-fast.lisp" *net-dir*))
           (read-file-text (merge-pathnames "ssh.lisp" *net-dir*))
           (read-file-text (merge-pathnames "aarch64-overrides.lisp" *net-dir*))
+          ;; after ssh.lisp: the hardware RNG behind SSH-RANDOM (last-defun-wins)
+          (read-file-text (merge-pathnames "hwrng-bcm2835.lisp" *net-dir*))
           ;; MUST be last: its e1000-* dispatchers + usb-netdev-hotplug-poll
           ;; win last-defun-wins over the drivers' forwarders and ip.lisp's stub.
           (read-file-text (merge-pathnames "usb-netdev.lisp" *net-dir*))))
@@ -131,7 +133,7 @@
     (format t "Entry point offset: ~A~%" (kernel-image-entry-point image))
     (format t "Native code size: ~D~%" (length (kernel-image-native-code image)))
     (format t "Boot code size: ~D~%" (length (kernel-image-boot-code image)))
-    (write-kernel-image image "/tmp/kernel8-ssh.img")
+    (write-kernel-image image (or (sb-ext:posix-getenv "MODUS_KERNEL_OUT") "/tmp/kernel8-ssh.img"))  ; MODUS_KERNEL_OUT overrides
     (format t "Done. Boot with:~%")
     (format t "  qemu-system-aarch64 -machine raspi3b -kernel /tmp/kernel8-ssh.img \\~%")
     (format t "    -display none -serial stdio \\~%")

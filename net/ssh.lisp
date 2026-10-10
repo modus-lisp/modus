@@ -18,22 +18,87 @@
 ;; +0x650: cli-version(128)  +0x6D0: cli-version-len
 ;; +0x6D4: recv-buf-len      +0x6D8: recv-buf(4096)
 
-;; Simple PRNG (xorshift32)
-;; ssh = per-connection SSH state base
-(defun ssh-random (ssh)
-  (let ((s (mem-ref (+ ssh #x2C) :u32)))
-    (when (zerop s) (setq s 12345))
-    (setq s (logxor s (logand (ash s 13) #xFFFFFFFF)))
-    (setq s (logxor s (ash s -17)))
-    (setq s (logxor s (logand (ash s 5) #xFFFFFFFF)))
-    (setf (mem-ref (+ ssh #x2C) :u32) s)
-    (logand s #xFF)))
+;; ------------------------------------------------------------------
+;; Randomness.  SSH-RANDOM is SHA-512 in counter mode over a 512-bit key.
+;;
+;; It used to be a 32-bit xorshift whose state was the per-connection word
+;; ssh+0x2C, while SSH-SEED-RANDOM wrote its seed to e1000-state+0x62C, which
+;; nothing read; SSH-BOOT zeroes the state, so the generator began at the
+;; constant 12345 on every boot, and the server's X25519 "ephemeral" key made
+;; from it was the same computable value in every image.  (The aarch64/Pi
+;; ARCH-SEED-RANDOM also returned the constant #x00010203.)
+;;
+;; The key comes from ARCH-HW-RANDOM-FILL, which a target with a hardware RNG
+;; overrides AFTER this file (x64 CL: RDRAND, net/ssh-x64-cl.lisp; BCM2835/2837:
+;; net/hwrng-bcm2835.lisp).  Without one the key is mixed from ARCH-SEED-RANDOM
+;; and the cycle counter, which is weak, and the boot says so on serial
+;; (SSH-NO-HW-RNG; the x64 CL image refuses instead inside an SEV-SNP guest,
+;; whose host steers every timer).
+;;
+;; Byte-wide memory and small integers only: this file is also compiled for
+;; 32-bit targets with 30-bit fixnums.  State at e1000-state-base +0x1800:
+;;   +0x00 key (64)   +0x40 block counter   +0x44 pool index (64 = empty)
+;;   +0x48 pool (64)  +0x88 seeded flag
+;; ------------------------------------------------------------------
+(defun arch-hw-random-fill (addr n) 0)       ; 1 = filled N bytes at ADDR from hardware
 
-;; Seed PRNG from arch-specific entropy source
+(defun %drbg-base () (+ (e1000-state-base) #x1800))
+
+(defun %drbg-weak-key (b)
+  (dotimes (i 64)
+    (setf (mem-ref (+ b i) :u8)
+          (logxor (logand (arch-seed-random) 255)
+                  (logxor (logand (rdtsc) 255) (logand (* i 37) 255)))))
+  ;; "SSH:WEAK-RNG" -- no hardware generator on this target
+  (%serial-byte 83) (%serial-byte 83) (%serial-byte 72) (%serial-byte 58)
+  (%serial-byte 87) (%serial-byte 69) (%serial-byte 65) (%serial-byte 75)
+  (%serial-byte 45) (%serial-byte 82) (%serial-byte 78) (%serial-byte 71)
+  (%serial-byte 10))
+
+;; No hardware RNG answered: the weak key, announced.  The x64 CL image
+;; overrides this to refuse instead inside an SEV-SNP guest.
+(defun ssh-no-hw-rng (b) (%drbg-weak-key b))
+
 (defun ssh-seed-random ()
-  (let ((s (arch-seed-random)))
-    (when (zerop s) (setq s 42))
-    (setf (mem-ref (+ (e1000-state-base) #x62C) :u32) s)))
+  (let ((b (%drbg-base)))
+    (when (not (= (arch-hw-random-fill b 64) 1))
+      (ssh-no-hw-rng b))
+    (setf (mem-ref (+ b #x40) :u32) 0)
+    (setf (mem-ref (+ b #x44) :u32) 64)
+    (setf (mem-ref (+ b #x88) :u32) 1)))
+
+;; One 64-byte block: SHA-512(key || counter).  After 2^20 blocks (64 MB) the
+;; key is replaced by SHA-512(key || FF FF FF FF) and the counter restarts, so
+;; the counter stays a small fixnum on every target.
+(defun %drbg-refill (b)
+  (let ((c (mem-ref (+ b #x40) :u32)))
+    (when (>= c 1048576)
+      (let ((rk (make-array 68)))
+        (dotimes (k 64) (aset rk k (mem-ref (+ b k) :u8)))
+        (dotimes (k 4) (aset rk (+ 64 k) 255))
+        (let ((h (sha512 rk))) (dotimes (k 64) (setf (mem-ref (+ b k) :u8) (aref h k)))))
+      (setq c 0))
+    (let ((in (make-array 68)))
+      (dotimes (k 64) (aset in k (mem-ref (+ b k) :u8)))
+      (aset in 64 (logand c 255))
+      (aset in 65 (logand (ash c -8) 255))
+      (aset in 66 (logand (ash c -16) 255))
+      (aset in 67 0)
+      (setf (mem-ref (+ b #x40) :u32) (+ c 1))
+      (let ((h (sha512 in)))
+        (dotimes (k 64) (setf (mem-ref (+ b #x48 k) :u8) (aref h k)))))
+    (setf (mem-ref (+ b #x44) :u32) 0)))
+
+;; A random byte.  SSH is the per-connection state base, kept for the callers.
+(defun ssh-random (ssh)
+  (let ((b (%drbg-base)))
+    (when (not (= (mem-ref (+ b #x88) :u32) 1))
+      (ssh-seed-random))
+    (when (>= (mem-ref (+ b #x44) :u32) 64)
+      (%drbg-refill b))
+    (let ((i (mem-ref (+ b #x44) :u32)))
+      (setf (mem-ref (+ b #x44) :u32) (+ i 1))
+      (mem-ref (+ b #x48 i) :u8))))
 
 ;; Write u32 big-endian into array at offset
 (defun ssh-put-u32 (arr off val)

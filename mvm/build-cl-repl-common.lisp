@@ -1106,6 +1106,9 @@
         (if *cl-repl-x64-p* *ssh-x64-actor-stubs* (%rpi-net-text "actors.lisp")) (string #\Newline)
         (%rpi-net-text "ssh.lisp")                (string #\Newline)
         (%rpi-net-text "aarch64-overrides.lisp")  (string #\Newline)
+        ;; After ssh.lisp, by last-defun-wins -- :RPI: the BCM2835/2837 hardware RNG
+        ;; behind SSH-RANDOM (ARCH-HW-RANDOM-FILL) and natrium's entropy.
+        (if *cl-repl-rpi-p* (%rpi-net-text "hwrng-bcm2835.lisp") "") (string #\Newline)
         "(defun native-eval (form) (eval form))"  (string #\Newline)
         ;; ssh-handle-connection fix + trace live in net/aarch64-overrides.lisp.
         ;; FIX: single-threaded server handles ONE connection at a time.  Guard

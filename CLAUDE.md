@@ -63,7 +63,6 @@ net/            Networking, crypto, USB, actor system
   ne2000.lisp          NE2000 ISA NIC driver (i386)
   http.lisp            HTTP/1.0 server
   http-client.lisp     HTTP client (URL parsing, GET, fetch)
-  aarch64-overrides.lisp   Line editor, buffer reader, SSH I/O overrides
   32bit-overrides.lisp     30-bit fixnum safety overrides (crypto, SSH)
   arch-i386.lisp           i386 NE2000 adapter, NIC state, allocation
   uefi-console.lisp        GOP framebuffer + PS/2 keyboard for UEFI x64
@@ -3792,14 +3791,14 @@ Key globals for translator:
 ## Networking Architecture
 
 Shared source files between QEMU virt (E1000) and RPi (DWC2 CDC-ECM):
-- `ip.lisp`, `crypto.lisp`, `ssh.lisp`, `http.lisp`, `http-client.lisp`, `aarch64-overrides.lisp`
+- `ip.lisp`, `crypto.lisp`, `ssh.lisp`, `http.lisp`, `http-client.lisp`
 
 Per-platform adapters provide: `e1000-send`, `e1000-receive`, `e1000-state-base`, `ssh-ipc-base`, allocation primitives (`make-array`, `aref`, `aset`), and actor address hooks.
 
 Source load order matters — later files override earlier defuns:
 ```
 arch-* → [actors] → NIC driver → ip → crypto → ssh → http → http-client →
-aarch64-overrides → [actors-net-overrides] → [isolated-net]
+[actors-net-overrides] → [isolated-net]
 ```
 
 ## Testing
@@ -3851,7 +3850,7 @@ Connected to the T420 via USB, presenting as composite device: HID keyboard + ma
 - **SSH**: `ssh modus@modulator`
 - **Type at T420 console**: `ssh modus@modulator 'echo "(expr)" | sudo python3 ~/type.py'`
 - **Force reboot T420**: `ssh modus@modulator 'sudo python3 ~/force-reboot.py'` (Ctrl+Alt+Delete — only works if BIOS/OS handles it)
-- **Deploy image**: `scp /tmp/modus-i386-diag-ssh.img modus@modulator:/home/modus/modus.img` (T420 boots from this via mass storage gadget)
+- **Deploy image**: copy an image to `modus@modulator:/home/modus/modus.img` (T420 boots from this via mass storage gadget).  The i386 diag-SSH build that used to produce it (`build-i386-diag-ssh.lisp`) was removed 2026-10-09.
 - **Gadget setup**: `~/setup-gadget.sh` (creates `/dev/hidg0` + mass storage backed by `~/modus.img`)
 - **Boot helper**: `~/boot-helper.py` (sends ESC periodically to help T420 boot menu)
 - **Note**: `(reboot)` from the Modus REPL may fail — if so, retry or physically power-cycle the T420

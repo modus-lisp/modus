@@ -1238,7 +1238,7 @@
                    ;; the CL shell, TCP and vsock listeners, the NSM binding).
                    ;; Nothing listens unless a program calls SSH-SERVE-TCP /
                    ;; -TCP-ON / -VSOCK.  Checked: of their 180 defuns only
-                   ;; RECEIVE collides (aarch64-overrides, which is NOT baked);
+                   ;; RECEIVE collides (ssh.lisp, which hosted-ssh.lisp follows);
                    ;; ssh.lisp's own wait is the SSH-WAIT-DATA seam.
                    (mvm-text "net/crypto.lisp")
                    (string #\Newline)
@@ -1333,6 +1333,12 @@
              (:riscv64 "riscv64") (:riscv32 "riscv32") (:arm32 "armv7l"))))
     (format nil "~%(defun machine-type () ~S)~%(defun machine-version () ~S)~%" m m)))
 
+;; MODUS_LISP_SPIN_AT spin points inside kernel-main (see %LISP-SPIN-FORM in
+;; build-cl-repl-common.lisp, which defines the knob).  Other images that build
+;; through this file have no such helper, and get "".
+(defun %cli-spin (name)
+  (if (fboundp '%lisp-spin-form) (funcall '%lisp-spin-form name) ""))
+
 (defvar *driver-source*
  (concatenate 'string
   ;; ARCH SLOT: sys-exit / halt.  exit_group — the one that ends the PROCESS
@@ -1346,10 +1352,12 @@
   *cli-arch-probe-source*
   "(defun kernel-main ()
 "
+  (%cli-spin "km-entry")
   ;; ARCH SLOT: hardware setup that must precede the FIRST allocation
   ;; (aarch64 zeroes the runtime-metadata BSS slots and reserves the GC
   ;; object-start bitmap here; on x64 the boot preamble already did it).
   *cli-arch-kernel-prologue*
+  (%cli-spin "km-after-prologue")
   ;; SAVE-AND-DIE restore (lib/save-image.lisp).  `modus --core FILE ...' reads
   ;; a heap snapshot IN PLACE OF the boot init below: the snapshot carries every
   ;; table init-symbol-table onward would build, so it must land first, and the
@@ -1377,6 +1385,7 @@
   (%init-packages)
   (%init-streams)
 "
+  (%cli-spin "km-after-tables")
   ;; BARE-METAL SEAM.  %init-streams ends with
   ;;   (setq *error-output* (%make-file-stream-full 2 1))
   ;; — a Linux fd-2 stream.  Writing one char to it runs %fs-write-char ->
@@ -1433,6 +1442,7 @@
 "
       "  (init-all-globals)
 ")
+  (%cli-spin "km-after-globals")
   ;; ARCH SLOT: file-I/O scratch addresses, spliced HERE — after
   ;; (init-all-globals), deliberately.
   ;;
@@ -1559,8 +1569,25 @@
   ;; failure here must never take down a normal boot.  MODUS_NO_ASDF=1 skips.
   (handler-case (%install-asdf-interface) (t (c) nil))
 "
+  (%cli-spin "km-pre-epilogue")
   ;; ARCH SLOT: the toplevel entry / probe program.
   *cli-arch-kernel-epilogue*))
+
+;; MODUS_LISP_SPIN_AFTER="(form)" -- a `(loop)' right after that exact line of
+;; kernel-main: single-form resolution for the spin-point bisect, without a
+;; named point per line.  The line must exist (else the build stops); unset,
+;; *DRIVER-SOURCE* is untouched.
+(let ((v #+sbcl (sb-ext:posix-getenv "MODUS_LISP_SPIN_AFTER") #-sbcl nil))
+  (when (and v (plusp (length v)))
+    (let* ((needle (format nil "  ~A~%" v))
+           (km (search "(defun kernel-main ()" *driver-source*))
+           (pos (and km (search needle *driver-source* :start2 km))))
+      (unless pos (error "MODUS_LISP_SPIN_AFTER: no line ~S in kernel-main" v))
+      (setf *driver-source*
+            (concatenate 'string (subseq *driver-source* 0 (+ pos (length needle)))
+                         "  (loop)
+" (subseq *driver-source* (+ pos (length needle)))))
+      (format t "~&;; Lisp boot: SPIN AFTER ~A~%" v))))
 
 ;;; ============================================================
 ;;; :GENERA compatibility surface (task #237)

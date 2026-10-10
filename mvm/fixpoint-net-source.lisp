@@ -26,8 +26,6 @@
                        (terpri s)
                        (write-string (read-file-text (merge-pathnames "ssh.lisp" net-dir)) s)
                        (terpri s)
-                       (write-string (read-file-text (merge-pathnames "aarch64-overrides.lisp" net-dir)) s)
-                       (terpri s)
                        ;; NIC drivers
                        (write-string (read-file-text (merge-pathnames "ne2000.lisp" net-dir)) s)
                        (terpri s)

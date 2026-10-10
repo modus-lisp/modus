@@ -276,7 +276,6 @@ All drivers in `net/bcm2835-periph.lisp`. Tested on both QEMU raspi3b and real h
 | `ip.lisp` | ~2000 | ARP, IP, TCP, DHCP (shared) |
 | `crypto.lisp` | ~2500 | SHA, ChaCha20, Poly1305, X25519, Ed25519 (shared) |
 | `ssh.lisp` | ~1500 | SSH server (shared) |
-| `aarch64-overrides.lisp` | ~200 | Single-threaded SSH overrides |
 
 ### Build scripts (`mvm/`)
 

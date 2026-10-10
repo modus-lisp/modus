@@ -1,6 +1,6 @@
 ;;;; actors-net-overrides.lisp - Actor-aware overrides for AArch64
 ;;;;
-;;;; Loaded LAST (after aarch64-overrides.lisp) to re-override functions
+;;;; Loaded LAST (after ssh.lisp) to re-override functions
 ;;;; that need actor-aware behavior instead of single-threaded operation.
 ;;;;
 ;;;; Overrides:
@@ -141,7 +141,7 @@
 ;;; net-accept-connection: spawn handler actor
 ;;; ============================================================
 ;;;
-;;; Same TCP handshake as aarch64-overrides version, but spawns a
+;;; Same TCP handshake as the ip.lisp version, but spawns a
 ;;; handler actor instead of calling ssh-connection-handler inline.
 
 (defun net-accept-connection (src-ip src-port dst-port buf)

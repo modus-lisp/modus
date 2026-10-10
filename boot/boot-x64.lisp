@@ -425,6 +425,24 @@
     (mvm-emit-u32 buf (x64-effective-stack-top))
     (mvm-emit-u32 buf 0)              ; high 32 bits
 
+    ;; ZERO THE WHOLE RUNTIME-METADATA PAGE [0x10000000, 0x10001000) first.
+    ;; Hosted, it is ELF BSS and the kernel zero-fills it, and the runtime
+    ;; relies on that ("zero means region 0", the threads gate at 0x10000DB8,
+    ;; the per-CPU mode word, the atomics lock, the TLS self slot, ...).  The
+    ;; stores further down zero an enumerated LIST of its words, which is the
+    ;; trap the RPi image fell into: QEMU hands out zero RAM, nothing else does.
+    ;; Under SEV-SNP it is never zero -- a page the guest has not written
+    ;; through its encrypted mapping decrypts to garbage.  Reproduced under QEMU
+    ;; with a random-poisoned memory backend: the CL image stopped right after
+    ;; its banner, and zeroing this page fixed it (on the VPS the image had gone
+    ;; idle early in kernel-main).  Must precede every store into the page below.
+    ;; mov rdi, 0x10000000 ; mov ecx, 512 ; xor eax, eax ; cld ; rep stosq
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF) (mvm-emit-u32 buf #x10000000) (mvm-emit-u32 buf 0)
+    (mvm-emit-byte buf #xB9) (mvm-emit-u32 buf 512)
+    (mvm-emit-byte buf #x31) (mvm-emit-byte buf #xC0)
+    (mvm-emit-byte buf #xFC)
+    (mvm-emit-byte buf #xF3) (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xAB)
+
     ;; Initialize serial console (COM1 = 0x3F8)
     ;; Disable interrupts
     (mvm-emit-byte buf #x66) (mvm-emit-byte buf #xBA) (mvm-emit-u16 buf #x03F9)
@@ -1201,9 +1219,63 @@
     ;; MODUS_X64_NO_STI=1 (A/B knob): leave IRQs masked for the whole run --
     ;; no PIT tick ever lands on a Lisp stack.  io-delay on the CL image is a
     ;; RAM-read loop and halt is HLT, so nothing needs the timer.
-    (unless (let ((v (sb-ext:posix-getenv "MODUS_X64_NO_STI"))) (and v (string= v "1")))
+    ;; SEV-SNP builds default to NO STI (MODUS_X64_NO_STI=0 forces it on).
+    ;; Measured on the VPS, same image otherwise: with STI the SSH server loop
+    ;; went idle within ~20 s and never answered; without it, it serves.  The
+    ;; hazard that fits (not proven to be the one): every tick's EOI is an OUT,
+    ;; i.e. a #VC through the one shared GHCB, 1000 times a second, and a tick
+    ;; inside a Lisp GHCB request (net/snp-ghcb.lisp: fill fields ... VMGEXIT
+    ;; ... read back) has the handler rewrite that request under it.
+    ;; Hardware randomness for Lisp, now that a CPUID cannot fault under SNP.
+    (emit-x64-rdrand-routine buf)
+    (unless (let ((v (sb-ext:posix-getenv "MODUS_X64_NO_STI")))
+              (if v
+                  (string= v "1")
+                  (and (boundp '*x64-snp-mode*) (symbol-value '*x64-snp-mode*))))
       (mvm-emit-byte buf #xFB)))   ; sti
   )
+
+;;; RDRAND FOR LISP.  There is no RDRAND primitive in the MVM; instead the boot
+;;; writes a 27-byte routine at +X64-RDRAND-ADDR+ and a TAGGED (|3) pointer to it
+;;; at +X64-RDRAND-FN-WORD+, the way the SNP stub publishes its VMGEXIT routine,
+;;; so Lisp calls it with an ordinary FUNCALL.  The routine returns a fixnum of
+;;; 32 random bits, or NIL when RDRAND failed ten times in a row.  The word is
+;;; written 0 when CPUID.1:ECX[30] says there is no RDRAND (a Sandy Bridge, or a
+;;; hypervisor that hides it: an SNP guest must then refuse to make keys).
+(defconstant +x64-rdrand-addr+    #x1D000 "free low RAM above the SNP secrets copy at 0x1C000")
+(defconstant +x64-rdrand-fn-word+ #x1D100)
+(defparameter *x64-rdrand-routine*
+  '(#x51                          ;  0: push rcx
+    #xB9 #x0A #x00 #x00 #x00      ;  1: mov ecx,10
+    #x0F #xC7 #xF0                ;  6: rdrand eax  (zero-extends into rax)
+    #x72 #x0B                     ;  9: jc ok (0x16)
+    #xFF #xC9                     ;  B: dec ecx
+    #x75 #xF7                     ;  D: jnz 6
+    #xB8 #x01 #x00 #xAD #xDE      ;  F: mov eax, NIL
+    #x59 #xC3                     ; 14: pop rcx ; ret
+    #x48 #xD1 #xE0                ; 16: ok: shl rax,1  (tag as a fixnum)
+    #x59 #xC3                     ; 19: pop rcx ; ret
+    #x90))                        ; pad to a whole dword
+(defun emit-x64-rdrand-routine (buf)
+  (flet ((b (&rest xs) (dolist (x xs) (mvm-emit-byte buf x)))
+         (store64-imm (addr imm32)                       ; mov qword [addr32], simm32
+           (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xC7) (mvm-emit-byte buf #x04)
+           (mvm-emit-byte buf #x25) (mvm-emit-u32 buf addr) (mvm-emit-u32 buf imm32)))
+    (b #x53 #x51 #x52)                                   ; push rbx rcx rdx
+    (store64-imm +x64-rdrand-fn-word+ 0)
+    (b #xB8) (mvm-emit-u32 buf 1) (b #x31 #xC9)          ; mov eax,1 ; xor ecx,ecx
+    (b #x0F #xA2)                                        ; cpuid
+    (b #x0F #xBA #xE1 30)                                ; bt ecx,30
+    (let* ((code *x64-rdrand-routine*)
+           (n (ceiling (length code) 4))
+           (body-len (+ (* n 11) 12)))                   ; n x (mov dword [a],imm32) + pointer store
+      (assert (<= body-len 127))
+      (b #x73 body-len)                                  ; jnc skip
+      (dotimes (i n)                                     ; mov dword [addr+4i], 4 code bytes
+        (b #xC7 #x04 #x25) (mvm-emit-u32 buf (+ +x64-rdrand-addr+ (* 4 i)))
+        (dotimes (k 4) (b (or (nth (+ (* 4 i) k) code) #x90))))
+      (store64-imm +x64-rdrand-fn-word+ (logior +x64-rdrand-addr+ 3)))
+    (b #x5A #x59 #x5B)))                                 ; skip: pop rdx rcx rbx
 
 (defun emit-x64-ap-trampoline (buf)
   "Emit AP (Application Processor) startup trampoline for SMP.

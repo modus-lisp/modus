@@ -1,7 +1,7 @@
 #!/bin/bash
 # attested-ssh-client.sh — the REMOTE VERIFIER's side of attested SSH.
 #
-#   test/snp/attested-ssh-client.sh HOST PORT [--vcek CERT.pem] [--measurement HEX]
+#   [KEY=id_ed25519] test/snp/attested-ssh-client.sh HOST PORT [--vcek CERT.pem] [--chain CHAIN.pem] [--measurement HEX]
 #
 # 1. Complete an SSH handshake with the modus server and record the host key it
 #    proved possession of (from OpenSSH itself: the known_hosts line it writes,
@@ -14,12 +14,15 @@
 # Exit 0 = attested; 2 = no report (server said SNP-STATUS ...), 1 = mismatch.
 set -u
 HOST=${1:?}; PORT=${2:?}; shift 2
-W=$(mktemp -d /tmp/attested-ssh.XXXXXX); ASK=$W/askpass.sh; printf '#!/bin/sh\necho x\n' > $ASK; chmod +x $ASK
+W=$(mktemp -d ${TMPDIR:-/tmp}/attested-ssh.XXXXXX)
 cd "$(dirname "$0")/../.."
-raw=$(echo "(snp-attest-ssh)" | SSH_ASKPASS=$ASK SSH_ASKPASS_REQUIRE=force DISPLAY=:0 setsid -w timeout 60 \
-        ssh -p $PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=$W/known_hosts -o LogLevel=ERROR \
-            -o HostKeyAlgorithms=ssh-ed25519 -o PreferredAuthentications=none,password -o NumberOfPasswordPrompts=1 \
-            test@$HOST 2>&1 | tr -d '\r')
+# Key-only auth (KEY, default ~/.ssh/id_ed25519: the key baked in with
+# MODUS_SSH_AUTH_KEY_HEX) and an EXEC request: the server evaluates the form,
+# sends its output, exit-status, EOF and CLOSE.  A shell session would hold the
+# single-threaded server after we hang up.
+raw=$(timeout ${ATTEST_TIMEOUT:-300} ssh -p $PORT -i ${KEY:-$HOME/.ssh/id_ed25519} -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=no -o UserKnownHostsFile=$W/known_hosts -o LogLevel=ERROR \
+            -o HostKeyAlgorithms=ssh-ed25519 test@$HOST "(snp-attest-ssh)" </dev/null 2>&1 | tr -d '\r')
 printf '%s\n' "$raw" > $W/transcript.txt
 # The REPL prompt precedes the first printed line ("modus> SNP-HOSTKEY ..."), so
 # lines are matched by tag, not by line start.

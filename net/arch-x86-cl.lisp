@@ -14,7 +14,8 @@
 ;;;;   - BARs are left where SeaBIOS assigned them (PCI-ASSIGN-BARS is a no-op):
 ;;;;     the boot stub identity-maps the first 4 GB, so the E1000's MMIO BAR
 ;;;;     (typically FEBC0000) is addressable as-is.
-;;;;   - DMA rings + driver state live at 0C000000..0C113000 — DRAM above the
+;;;;   - DMA rings + driver state live at 0C000000..0C113000 (E1000) and
+;;;;     0C1A0000..0C1EA000 (virtio-net; see the block below) — DRAM above the
 ;;;;     image (which loads at 100000 and is ~60 MB) and below the CL image's
 ;;;;     scratch buffers at 0FE00000 / 0FF00000 and the MCGC heap at 10000000;
 ;;;;     the build tail asserts the image never reaches it.
@@ -98,6 +99,29 @@
 (defun fe-scratch-base ()    #x0C060900)
 (defun ssh-conn-base ()      #x0C080000)
 (defun ssh-ipc-base ()       #x0C100000)
+
+;; ============================================================
+;; virtio-net (net/virtio-net.lisp) — used INSTEAD of the E1000 rings when the
+;; PCI scan finds a 1AF4:1041/1000, so the two never DMA at once.
+;;   0C1A0000..0C1EA000  rings + buffers (layout in virtio-net.lisp's header).
+;;     Inside the 2 MB region 0C000000..0C200000 that an SEV-SNP boot maps
+;;     SHARED (C=0) — the device DMAs here — and clear of everything else in
+;;     it: E1000 rings/state 0C000000..0C060900, this map's ssh-conn/ssh-ipc
+;;     0C080000..0C196000 (the SSH build moves them out anyway), and the SNP
+;;     guest-request pages + GHCB at 0C1FD000..0C200000.
+;;   0C400000..0C400100  driver state (BAR/notify addresses, ring cursors).
+;;     PRIVATE memory on purpose: it holds addresses the driver writes
+;;     through, which a host must not be able to edit.  Above the SSH build's
+;;     e1000-state/fe-scratch (0C320000..), below the scratch at 0FE00000.
+;;   00016000, 00017000  two spare page-table pages, used only to map a
+;;     64-bit BAR that firmware put above 4 GB (the boot stub maps 0..4 GB
+;;     with PML4 00010000, PDPT 00011000, PDs 00012000..00015FFF; 00016000 is
+;;     the 7th page that stub already clears, 00017000 the next one, both
+;;     below the IDT at 00018000).
+;; ============================================================
+(defun virtio-net-ring-base ()  #x0C1A0000)
+(defun virtio-net-state-base () #x0C400000)
+(defun virtio-net-pt-page (i)   (if (zerop i) #x16000 #x17000))
 
 ;; ============================================================
 ;; Single-threaded stubs (see arch-aarch64-cl.lisp for why they exist)

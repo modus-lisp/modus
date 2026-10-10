@@ -271,7 +271,14 @@
     (mvm-emit-u64 buf load-addr)      ; p_paddr
     ;; p_filesz: only the LOAD segment; shstrtab/symtab/strtab/shdrs are not loaded
     (mvm-emit-u64 buf (+ header-total raw-len))
-    (mvm-emit-u64 buf (+ header-total raw-len +linux-x64-heap-size+)) ; p_memsz
+    ;; p_memsz: the zero-filled BSS must cover the fixed low window the runtime
+    ;; addresses directly (0x10000000.. : GC metadata, globals, MV buffer, the
+    ;; per-thread window, scratch pages), so the segment runs to 0x20000000.
+    ;; It used to be sized by the HEAP (+ +linux-x64-heap-size+) -- a leftover
+    ;; from when the heap lived in the BSS (06bfebd) -- which made the kernel
+    ;; commit ~1.9 GB at exec: on a 1 GB VM the default overcommit heuristic
+    ;; refuses that, and a refused BSS is a SIGSEGV before our first instruction.
+    (mvm-emit-u64 buf (max (+ header-total raw-len) (- #x20000000 load-addr))) ; p_memsz
     (mvm-emit-u64 buf #x200000)       ; p_align
     ;; ---- Raw image data ----
     (loop for b across raw-bytes do (mvm-emit-byte buf b))
@@ -402,13 +409,17 @@
 
   ;; mmap heap, FIRST at the fixed base with MAP_FIXED_NOREPLACE (0x100000):
   ;; rax=9, rdi=addr, rsi=size, rdx=prot, r10=flags, r8=fd, r9=off.
+  ;; MAP_NORESERVE (0x4000), as SBCL maps its dynamic space: the ~1.9 GB heap is
+  ;; reserved, not committed, so a machine with less RAM than that can run
+  ;; (pages are backed as they are touched).  Without it the kernel's default
+  ;; overcommit heuristic refuses the mapping on a 1 GB VM.
   (let ((hbase (modus.mvm::hosted-layout :heap-base +linux-x64-fixed-heap-base+))
         (abase (modus.mvm::hosted-layout :jit-arena-base +linux-x64-jit-arena-base+)))
     (emit-bytes buf #x48 #xBF) (emit-le64 buf hbase)      ; movabs rdi, fixed heap base
     (emit-bytes buf #x48 #xC7 #xC6)                ; mov rsi, imm32
     (emit-le32 buf +linux-x64-heap-size+)
     (emit-bytes buf #x48 #xC7 #xC2 #x03 #x00 #x00 #x00) ; mov rdx, 3 (PROT_RW)
-    (emit-bytes buf #x49 #xC7 #xC2 #x22 #x00 #x10 #x00) ; mov r10, 0x100022 (PRIV|ANON|FIXED_NOREPLACE)
+    (emit-bytes buf #x49 #xC7 #xC2 #x22 #x40 #x10 #x00) ; mov r10, 0x104022 (PRIV|ANON|NORESERVE|FIXED_NOREPLACE)
     (emit-bytes buf #x49 #xC7 #xC0 #xFF #xFF #xFF #xFF)   ; mov r8, -1
     (emit-bytes buf #x49 #xC7 #xC1 #x00 #x00 #x00 #x00) ; mov r9, 0
     (emit-bytes buf #x48 #xC7 #xC0 #x09 #x00 #x00 #x00) ; mov rax, 9 (SYS_mmap)
@@ -421,11 +432,30 @@
     (emit-bytes buf #x48 #xC7 #xC6)                ; mov rsi, imm32
     (emit-le32 buf +linux-x64-heap-size+)
     (emit-bytes buf #x48 #xC7 #xC2 #x03 #x00 #x00 #x00) ; mov rdx, 3 (PROT_RW)
-    (emit-bytes buf #x49 #xC7 #xC2 #x22 #x00 #x00 #x00) ; mov r10, 0x22 (MAP_PRIV|MAP_ANON)
+    (emit-bytes buf #x49 #xC7 #xC2 #x22 #x40 #x00 #x00) ; mov r10, 0x4022 (MAP_PRIV|MAP_ANON|NORESERVE)
     (emit-bytes buf #x49 #xC7 #xC0 #xFF #xFF #xFF #xFF)   ; mov r8, -1
     (emit-bytes buf #x49 #xC7 #xC1 #x00 #x00 #x00 #x00) ; mov r9, 0
     (emit-bytes buf #x48 #xC7 #xC0 #x09 #x00 #x00 #x00) ; mov rax, 9 (SYS_mmap)
     (emit-bytes buf #x0F #x05)                      ; syscall  (51 bytes from the je)
+    ;; Both paths land here with the heap mapping's result in RAX.  An error is
+    ;; -errno, i.e. unsigned >= -4095: say so and exit_group(1) rather than use
+    ;; it as the heap base (which segfaulted with no message at all).
+    (let* ((msg (append (map 'list #'char-code "modus: cannot map the heap (mmap failed)")
+                        (list 10)))
+           (tail 24)                               ; bytes after the lea, before msg
+           (fail-len (+ 5 7 tail (length msg))))   ; mov edi + lea + tail + msg
+      (when (>= fail-len 128) (error "heap-map failure path too long for a rel8 jb"))
+      (emit-bytes buf #x48 #x3D #x01 #xF0 #xFF #xFF) ; cmp rax, -4095
+      (emit-bytes buf #x72 fail-len)                 ; jb ok (a valid address)
+      (emit-bytes buf #xBF #x02 #x00 #x00 #x00)      ; mov edi, 2 (stderr)
+      (emit-bytes buf #x48 #x8D #x35) (emit-le32 buf tail) ; lea rsi, [rip+tail] = msg
+      (emit-bytes buf #xBA) (emit-le32 buf (length msg)) ; mov edx, len
+      (emit-bytes buf #xB8 #x01 #x00 #x00 #x00)      ; mov eax, 1 (SYS_write)
+      (emit-bytes buf #x0F #x05)                     ; syscall
+      (emit-bytes buf #xBF #x01 #x00 #x00 #x00)      ; mov edi, 1
+      (emit-bytes buf #xB8 #xE7 #x00 #x00 #x00)      ; mov eax, 231 (SYS_exit_group)
+      (emit-bytes buf #x0F #x05)                     ; syscall
+      (dolist (b msg) (emit-bytes buf b)))           ; the message; then ok:
     ;; The JIT exec arena: one fixed RWX MAP_NORESERVE mapping; bump word =
     ;; its base, or 0 if the kernel refused.  RAX (heap base) is parked in RBP,
     ;; which nothing has used yet (kernel-main sets its own frame pointer).

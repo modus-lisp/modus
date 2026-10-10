@@ -291,16 +291,6 @@ sbcl --script mvm/build-uefi-repl.lisp   # build UEFI EFI application
 sudo dd if=/tmp/modus-usb.img of=/dev/sdX bs=1M  # write to USB stick
 ```
 
-### ThinkPad T420 (real hardware, i386)
-
-Boots from USB mass storage via Pi Zero 2W gadget. VGA console + PS/2 keyboard REPL, E1000 82579LM SSH over direct Ethernet to RPi5.
-
-```bash
-sbcl --script mvm/build-i386-diag-ssh.lisp
-scp /tmp/modus-i386-diag-ssh.img modus@modulator:/home/modus/modus.img
-ssh -J modus@modus-pi test@10.0.2.15 "(+ 1 2)"   # → = 3
-```
-
 ### Raspberry Pi Zero 2 W (real hardware)
 
 The Pi Zero 2 W boots via USB (no SD card needed) using rpiboot, with SSH over USB CDC-ECM Ethernet.

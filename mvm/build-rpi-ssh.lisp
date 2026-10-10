@@ -36,7 +36,6 @@
           (read-file-text (merge-pathnames "crypto.lisp" *net-dir*))
           (read-file-text (merge-pathnames "crypto-fast.lisp" *net-dir*))
           (read-file-text (merge-pathnames "ssh.lisp" *net-dir*))
-          (read-file-text (merge-pathnames "aarch64-overrides.lisp" *net-dir*))
           ;; after ssh.lisp: the hardware RNG behind SSH-RANDOM (last-defun-wins)
           (read-file-text (merge-pathnames "hwrng-bcm2835.lisp" *net-dir*))
           ;; MUST be last: its e1000-* dispatchers + usb-netdev-hotplug-poll

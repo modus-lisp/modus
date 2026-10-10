@@ -126,7 +126,7 @@
               0
               (progn (setf (mem-ref (+ ssh #x6D4) :u32) (+ blen n)) 1))))))
 
-;;; ---- host-key material (from net/ip.lisp and net/aarch64-overrides.lisp,
+;;; ---- host-key material (from net/ip.lisp and net/ssh.lisp,
 ;;; which are not baked hosted: they are the IP stack and the NIC poll loop) ----
 (defun ssh-copy-host-key (conn)
   (let ((state (e1000-state-base)) (ssh (conn-ssh conn)))

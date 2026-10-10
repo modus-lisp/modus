@@ -39,8 +39,7 @@
   (format nil "~A~%~A~%~A~%"
           (read-file-text (merge-pathnames "ip.lisp" *net-dir*))
           (read-file-text (merge-pathnames "crypto.lisp" *net-dir*))
-          (read-file-text (merge-pathnames "ssh.lisp" *net-dir*))
-          (read-file-text (merge-pathnames "aarch64-overrides.lisp" *net-dir*))))
+          (read-file-text (merge-pathnames "ssh.lisp" *net-dir*))))
 
 ;;; ============================================================
 ;;; Build bootloader + SSH kernel

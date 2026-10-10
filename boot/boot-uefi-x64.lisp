@@ -164,6 +164,24 @@
   "Set by emit-uefi-entry-stub when *uefi-stub-pad* is on: the image offset of
    the kernel data.  patch-uefi-stub prefers it over the boot-code length.")
 
+;;; SPIN POINTS — MODUS_SNP_SPIN_AT=<name> makes the stub stop at that point in
+;;; a `jmp $' loop instead of continuing, and nowhere else.  On a machine whose
+;;; console nobody can see, the hypervisor's view still answers one question per
+;;; boot: a guest still running at ~100% CPU got there; a guest that stopped
+;;; died earlier.  Names, in boot order: entry pre-ebs post-ebs pre-detect
+;;; post-detect pre-cr3 post-cr3 post-snp-setup post-selftest pre-kernel.
+;;; Unset (and in the in-image compiler, which has no SBCL) nothing is emitted:
+;;; the image is byte-identical.
+(defun %uefi-spin-at ()
+  #+sbcl (let ((v (sb-ext:posix-getenv "MODUS_SNP_SPIN_AT")))
+           (and v (plusp (length v)) (string-downcase v)))
+  #-sbcl nil)
+(defun emit-uefi-spin-point (buf name)
+  (let ((at (%uefi-spin-at)))
+    (when (and at (string= at name))
+      (format t "~&;; UEFI stub: SPIN POINT at ~A~%" name)
+      (mvm-emit-byte buf #xEB) (mvm-emit-byte buf #xFE))))   ; jmp $
+
 (defvar *uefi-lea-patch-pos* nil
   "Position of disp32 in LEA RSI,[RIP+disp32] for kernel data source address.")
 (defvar *uefi-size-patch-pos* nil
@@ -889,6 +907,7 @@
   ;; R14 = BootServices
   (uefi-emit-mov-reg-mem buf +r14+ +r13+ +efi-st-boot-services+)
 
+  (emit-uefi-spin-point buf "entry")
   ;; ---- Diagnostic: print "1" via ConOut (EFI app started) ----
   (emit-uefi-conout-char buf (char-code #\1))
 
@@ -933,6 +952,7 @@
 
       (uefi-emit-call-mem buf +r14+ +efi-bs-get-memory-map+)
 
+      (emit-uefi-spin-point buf "pre-ebs")
       ;; ---- Diagnostic: print "3" via ConOut (about to ExitBootServices) ----
       ;; Note: ConOut call needs R13=SystemTable, which we reload from stack
       ;; Actually R13 was saved as non-volatile, and we haven't changed it
@@ -952,6 +972,7 @@
       ;; On OVMF this typically succeeds on first try.
 
       ;; ---- No more UEFI calls. We own the machine. ----
+      (emit-uefi-spin-point buf "post-ebs")
       ;; CLI
       (mvm-emit-byte buf #xFA)
 
@@ -971,6 +992,9 @@
       (uefi-emit-pop buf r)))
 
   ;; ====== From here: no UEFI, we set up our own world ======
+
+  ;; ---- SEV-SNP: move the secrets page out of the copy's way ----
+  (when *x64-snp-mode* (emit-snp-save-secrets buf))
 
   ;; ---- Copy kernel data to 0x100000 ----
   ;; RSI = source (kernel data within PE image, RIP-relative)
@@ -995,8 +1019,10 @@
     (emit-uefi-font-data buf)
     (emit-uefi-scancode-tables buf))
 
+  (emit-uefi-spin-point buf "pre-detect")
   ;; ---- SEV-SNP: detect, learn the C-bit (boot-uefi-snp.lisp) ----
   (when *x64-snp-mode* (emit-snp-detect buf))
+  (emit-uefi-spin-point buf "post-detect")
 
   ;; ---- Page tables at +x64-page-tables-addr+: identity-map first 4GB ----
   ;; Clear 28KB (7 pages: PML4 + PDPT + 4×PD)
@@ -1052,10 +1078,12 @@
       (mvm-emit-byte buf #x0F) (mvm-emit-byte buf #x85)  ; JNZ rel32
       (mvm-emit-u32 buf (logand rel #xFFFFFFFF))))
 
+  (emit-uefi-spin-point buf "pre-cr3")
   ;; Load CR3 (SNP: the PML4 page is encrypted, so CR3 carries the C-bit too)
   (uefi-emit-mov-reg-imm64 buf +rax+ +x64-page-tables-addr+)
   (when *x64-snp-mode* (emit-snp-or-rax-rbx buf))
   (mvm-emit-byte buf #x0F) (mvm-emit-byte buf #x22) (mvm-emit-byte buf #xD8) ; mov cr3, rax
+  (emit-uefi-spin-point buf "post-cr3")
 
   ;; ---- GDT at 0x600 ----
   (uefi-emit-mov-reg-imm64 buf +rdi+ #x600)
@@ -1117,7 +1145,9 @@
   (mvm-emit-byte buf #x8E) (mvm-emit-byte buf #xE8)  ; mov gs, ax
 
   ;; ---- SEV-SNP: shared region, GHCB, #VC handler + IDT ----
+  (emit-uefi-spin-point buf "pre-snp-setup")
   (when *x64-snp-mode* (emit-snp-post-cr3 buf (uefi-code-selector)))
+  (emit-uefi-spin-point buf "post-snp-setup")
 
   ;; ---- Stack at 0x800000 ----
   (uefi-emit-mov-reg-imm64 buf +rsp+ +x64-stack-top+)
@@ -1131,6 +1161,7 @@
   (emit-x64-out buf #x3FA #xC7)   ; enable FIFO
   ;; SNP :TEST — drive port I/O through the #VC handler (prints VC+wi5)
   (when *x64-snp-mode* (emit-snp-selftest buf))
+  (emit-uefi-spin-point buf "post-selftest")
 
   ;; ---- Runtime registers ----
   ;; R15 = NIL
@@ -1196,6 +1227,7 @@
   (unless *x64-snp-mode*
     (emit-uefi-set-kbd-leds buf 7))  ; bits 0+1+2 = Scroll+Num+Caps
 
+  (emit-uefi-spin-point buf "pre-kernel")
   ;; ---- Jump to kernel at 0x100000 (absolute) ----
   ;; Kernel data was copied to 0x100000 by rep movsb above.
   ;; Must use absolute jump — we're running at UEFI-chosen address.

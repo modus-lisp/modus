@@ -1557,8 +1557,12 @@
     ;; Adjust sign
     (let ((xb (fe-to-bytes x)))
       (let ((x-odd (logand (aref xb 0) 1)))
-        ;; If sign doesn't match, negate x
-        (if sign
+        ;; If sign doesn't match, negate x.  SIGN is the byte's top bit, #x80
+        ;; or 0 -- a NUMBER, so test it with ZEROP.  A bare (if sign ...) only
+        ;; worked where NIL is the word 0; where it is not (every CL image),
+        ;; 0 is true and every even-x point decoded as its negation, which
+        ;; failed every signature check.
+        (if (not (zerop sign))
             (when (zerop x-odd)
               (fe-sub x (fe-from-int 0) x))
             (unless (zerop x-odd)

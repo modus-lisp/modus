@@ -35,8 +35,7 @@
           ;; after ssh.lisp: the hardware RNG behind SSH-RANDOM (last-defun-wins)
           (read-file-text (merge-pathnames "hwrng-bcm2835.lisp" *net-dir*))
           (read-file-text (merge-pathnames "http.lisp" *net-dir*))
-          (read-file-text (merge-pathnames "http-client.lisp" *net-dir*))
-          (read-file-text (merge-pathnames "aarch64-overrides.lisp" *net-dir*))))
+          (read-file-text (merge-pathnames "http-client.lisp" *net-dir*))))
 
 ;;; ============================================================
 ;;; Build Pi Zero 2 W SSH image (DWC2 USB gadget + CDC-ECM)

@@ -665,8 +665,22 @@
       (ip-send dst-ip 6 seg tcp-len)
       (spin-unlock (+ (ssh-ipc-base) #x60430)))))
 
+;; A segment must fit one Ethernet frame: TCP-SEND-SEGMENT-CONN builds it in a
+;; 1480-byte array and hands it to the NIC whole, so a longer payload overran
+;; both (an SSH reply over ~1400 bytes never arrived).  Split at 1360 bytes,
+;; which also stays under the MSS of tunnelled paths.
 (defun tcp-send-conn (cb data len)
-  (tcp-send-segment-conn cb 24 data len))
+  (if (<= len 1360)
+      (tcp-send-segment-conn cb 24 data len)
+      (let ((off 0))
+        (loop
+          (when (>= off len) (return ()))
+          (let ((n (- len off)))
+            (when (> n 1360) (setq n 1360))
+            (let ((chunk (make-array n)))
+              (dotimes (i n) (aset chunk i (aref data (+ off i))))
+              (tcp-send-segment-conn cb 24 chunk n))
+            (setq off (+ off n)))))))
 
 (defun tcp-ack-conn (cb)
   (tcp-send-segment-conn cb 16 (make-array 0) 0))
@@ -690,6 +704,13 @@
       (setq i (+ i 1)))))
 
 (defun net-deliver-data (conn buf pkt-len tcp-flags)
+  ;; RST or FIN from the client of the connection being served: it is gone (or
+  ;; sends nothing more), so the SSH waits stop waiting (SSH-PEER-CLOSED-P).
+  ;; Without this a dead client held the single-threaded server for a whole
+  ;; wait timeout, and SYNs that queued while it booted each became one.
+  (when (and (not (zerop (logand tcp-flags 5)))
+             (eq conn (mem-ref (+ (ssh-ipc-base) #x60448) :u32)))
+    (setf (mem-ref (+ (ssh-ipc-base) #x60458) :u32) 1))
   (let ((cb (conn-base conn))
         (ssh (conn-ssh conn)))
     (let ((ip-total (buf-read-u16-mem buf 16))
@@ -723,13 +744,25 @@
                 ;; Duplicate / out-of-order: re-ACK, do NOT append.
                 (tcp-ack-conn cb))))))))
 
+;; Override net-wait-ack: also deliver piggybacked data from ACK packets
+;; The original discards TCP data, losing the client's SSH version string
+;; when it arrives in the same packet as the ACK.
 (defun net-wait-ack (conn)
   (let ((cb (conn-base conn))
+        ;; Server ISN: net-accept-connection already sent SYN-ACK once, bumping
+        ;; cb+0x010 to ISN+1.  Save ISN so retransmits reuse the SAME seq.
+        (isn (- (mem-ref (+ (conn-base conn) #x010) :u32) 1))
         (acked 0)
         (tries 0))
     (loop
       (when (not (zerop acked)) (return 1))
-      (when (> tries 500) (return 0))
+      (when (> tries 800) (return 0))
+      ;; Retransmit the SYN-ACK (identical seq) if it was lost — the single-
+      ;; threaded server no longer depends on the client's reconnect (which the
+      ;; re-entrancy guard now blocks) to retry the handshake.
+      (when (and (> tries 0) (eq (mod tries 40) 0))
+        (setf (mem-ref (+ cb #x010) :u32) isn)
+        (tcp-send-segment-conn cb 18 (make-array 0) 0))
       (io-delay)
       (let ((pkt-len (e1000-receive)))
         (when (not (zerop pkt-len))
@@ -737,10 +770,23 @@
             (when (eq (mem-ref (+ b2 12) :u8) #x08)
               (when (eq (mem-ref (+ b2 13) :u8) 0)
                 (when (eq (mem-ref (+ b2 23) :u8) 6)
-                  (let ((f2 (mem-ref (+ b2 47) :u8)))
-                    (when (eq (logand f2 #x10) #x10)
+                  (let ((f2 (mem-ref (+ b2 47) :u8))
+                        (mine (eq (buf-read-u16-mem b2 34) (mem-ref (+ cb #x008) :u32))))
+                    ;; An RST from THIS client: it gave up (its SYN was stale).
+                    ;; Stop now; the SSH waits see the flag and return at once.
+                    (when (and mine (not (zerop (logand f2 #x04))))
+                      (setf (mem-ref (+ (ssh-ipc-base) #x60458) :u32) 1)
+                      (setq tries 100000))
+                    ;; Accept ONLY a real ACK (ACK set, SYN clear) from THIS
+                    ;; client -- a SYN retransmit, or another connection's
+                    ;; segment, must not be mistaken for the handshake ACK.
+                    (when (and mine
+                               (eq (logand f2 #x10) #x10)
+                               (zerop (logand f2 #x06)))
                       (setf (mem-ref cb :u32) 2)
-                      (setq acked 1)))))))))
+                      (setq acked 1)
+                      ;; Deliver any piggybacked data
+                      (net-deliver-data conn b2 pkt-len f2)))))))))
       (setq tries (+ tries 1)))))
 
 (defun ssh-copy-host-key (conn)
@@ -760,31 +806,48 @@
         (setq i (+ i 1))))
     (setf (mem-ref (+ ssh #x24) :u32) 1)))
 
+;; Override net-accept-connection for single-threaded operation
+;; Calls ssh-connection-handler directly instead of actor-spawn
 (defun net-accept-connection (src-ip src-port dst-port buf)
   (let ((conn (conn-alloc)))
+    (setf (mem-ref (+ (ssh-ipc-base) #x60458) :u32) 0)   ; peer-closed flag
     (when (not (= conn (- 0 1)))
       (conn-init conn dst-port src-port src-ip)
+      ;; Clear protocol type (uninitialized RAM on real hardware)
+      (setf (mem-ref (+ (conn-base conn) #x1C) :u32) 0)
+      ;; Set protocol type: port 80 → HTTP (1), else SSH (0)
+      (when (eq dst-port 80)
+        (setf (mem-ref (+ (conn-base conn) #x1C) :u32) 1))
       (let ((their-seq (buf-read-u32-mem buf 38)))
         (setf (mem-ref (+ (conn-base conn) #x014) :u32) (+ their-seq 1)))
+      ;; Init recv buffer BEFORE net-wait-ack so piggybacked data works
+      (let ((ssh (conn-ssh conn)))
+        (setf (mem-ref (+ ssh #x6D4) :u32) 0))
       (tcp-send-segment-conn (conn-base conn) 18 (make-array 0) 0)
       (net-wait-ack conn)
       (when (eq (mem-ref (conn-base conn) :u32) 2)
-        (ssh-copy-host-key conn)
-        (let ((ssh (conn-ssh conn)))
-          (setf (mem-ref ssh :u32) 0)
-          (setf (mem-ref (+ ssh #x04) :u32) 0)
-          (setf (mem-ref (+ ssh #x08) :u32) 0)
-          (setf (mem-ref (+ ssh #x0C) :u32) 0)
-          (setf (mem-ref (+ ssh #x10) :u32) 0)
-          (setf (mem-ref (+ ssh #x6D4) :u32) 0)
-          (setf (mem-ref (+ ssh #x28) :u32) 0)
-          (setf (mem-ref (+ ssh #x150) :u32) 0)
-          (setf (mem-ref (+ ssh #x154) :u32) 0)
-          (setf (mem-ref (+ ssh #x2C) :u32)
-                (+ src-port (* src-ip 7))))
-        (setf (mem-ref (+ (+ (ssh-ipc-base) #x60448) (ash conn 3)) :u32) conn)
-        (let ((handler-id (actor-spawn (nfn-lookup (conn-handler-fn conn)))))
-          (setf (mem-ref (+ (conn-base conn) #x018) :u32) handler-id))))))
+        (if (eq (mem-ref (+ (conn-base conn) #x1C) :u32) 1)
+            ;; HTTP: handle directly (no SSH state needed)
+            (http-connection-handler conn)
+            ;; SSH: init state and handle
+            (progn
+              (ssh-copy-host-key conn)
+              (let ((ssh (conn-ssh conn)))
+                (setf (mem-ref ssh :u32) 0)
+                (setf (mem-ref (+ ssh #x04) :u32) 0)
+                (setf (mem-ref (+ ssh #x08) :u32) 0)
+                (setf (mem-ref (+ ssh #x0C) :u32) 0)
+                (setf (mem-ref (+ ssh #x10) :u32) 0)
+                (setf (mem-ref (+ ssh #x28) :u32) 0)
+                (setf (mem-ref (+ ssh #x150) :u32) 0)
+                (setf (mem-ref (+ ssh #x154) :u32) 0)
+                (setf (mem-ref (+ ssh #x2C) :u32)
+                      (+ src-port (* src-ip 7))))
+              (setf (mem-ref (+ (ssh-ipc-base) #x60448) :u32) conn)
+              (ssh-connection-handler conn)
+              ;; The server's X25519 key is pre-computed (slow boards); never
+              ;; let a second connection reuse it.
+              (ssh-refresh-ephemeral)))))))
 
 (defun conn-handler-fn (conn)
   (if (eq conn 0) (hash-of "ssh-handler-0")
@@ -792,13 +855,15 @@
           (if (eq conn 2) (hash-of "ssh-handler-2")
               (hash-of "ssh-handler-3")))))
 
+;; Override ssh-connection-handler for single-threaded operation
 (defun ssh-connection-handler (conn)
   (let ((ssh (conn-ssh conn))
         (cb (conn-base conn)))
     (ssh-handle-connection ssh)
+    ;; Regenerate server ephemeral X25519 key pair for next connection
+    (pre-compute-server-eph ssh)
     (tcp-close-conn cb)
-    (conn-free conn)
-    (actor-exit)))
+    (conn-free conn)))
 
 (defun ssh-handler-0 () (ssh-connection-handler 0))
 (defun ssh-handler-1 () (ssh-connection-handler 1))

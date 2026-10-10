@@ -284,12 +284,15 @@
 ;;; ------------------------------------------------------------------
 
 (defun %fasl-source-heads ()
-  "Toplevel heads always kept as source: their compile registers something."
-  '("DEFMACRO" "DEFINE-COMPILER-MACRO" "DEFINE-SYMBOL-MACRO" "DEFSTRUCT" "DEFTYPE"
-    "DEFSETF" "DEFINE-SETF-EXPANDER" "DEFINE-MODIFY-MACRO" "DECLAIM" "PROCLAIM"
-    "DEFCONSTANT" "DEFVAR" "DEFPARAMETER" "DEFPACKAGE" "IN-PACKAGE" "EVAL-WHEN"
-    "MACROLET" "SYMBOL-MACROLET" "DEFINE-CONDITION" "DEFCLASS" "DEFGENERIC"
-    "DEFMETHOD" "DEFINE-METHOD-COMBINATION" "DEFINE-PACKAGE" "DEFSYSTEM"))
+  "Toplevel heads always kept as source -- the second guard, for compile-time
+   behaviour no registry write announces: DEFPACKAGE's package work,
+   DEFCONSTANT's compile-time EVAL, EVAL-WHEN, DEFSTRUCT's accessor tables,
+   the setf-expander definers, and the macro definers (also tainted).  DEFVAR,
+   DECLAIM, IN-PACKAGE and the CLOS definers are not here: what their compile
+   registers is data (%FASL-EFFECT) or nothing, and the taint catches the rest."
+  '("DEFMACRO" "DEFINE-COMPILER-MACRO" "DEFINE-SYMBOL-MACRO" "DEFSTRUCT"
+    "DEFSETF" "DEFINE-SETF-EXPANDER" "DEFINE-MODIFY-MACRO" "DEFCONSTANT"
+    "DEFPACKAGE" "EVAL-WHEN" "DEFINE-PACKAGE" "DEFSYSTEM"))
 
 (defun %fasl-source-head-p (forms)
   (let ((f (car forms)))
@@ -326,7 +329,8 @@
                  (progn
                    (unless (eql taint0 *fasl-taint*)
                      (%fasl-reject (format nil "compile registered something (~a)" *fasl-taint-who*)))
-                   (when (%fasl-source-head-p forms) (%fasl-reject "definition head"))
+                   (when (%fasl-source-head-p forms)
+                     (%fasl-reject (format nil "definition head ~a" (car (car forms)))))
                    ;; constants: renumber every pool index this bytecode loads,
                    ;; densely, in first-use order
                    (let ((bc2 (copy-seq bc)) (idxs nil) (k 0))
@@ -352,7 +356,8 @@
                        (maphash (lambda (key v) (push (cons key v) lam)) lam-offsets)
                        (let ((rec (list 1 bc2 entry ft-list fn-table rt lam persist-names
                                        (and (or lam-bearing (%mvm-forms-define-methods-p forms)) t)
-                                       consts)))
+                                       consts
+                                       (and (consp *fasl-effects*) (reverse (car *fasl-effects*))))))
                          (%fasl-encode rec)))))
                (error (e) (%fasl-reject (format nil "error while recording: ~a"
                                                 (ignore-errors (princ-to-string e)))))))))
@@ -386,10 +391,23 @@
         (setf (gethash (car p) rt-table) (cdr p))
         (setf (gethash (- (car p)) rt-table) (cons nil 0)))
       (dolist (p lam) (setf (gethash (car p) lam-offsets) (cdr p)))
-      (list bc entry ft-list fn-table rt-table lam-offsets persist lam-bearing))))
+      (list bc entry ft-list fn-table rt-table lam-offsets persist lam-bearing (nth 10 rec)))))
+
+(defun %fasl-apply-effect (e)
+  "Redo one logged compile-time registration (see %FASL-EFFECT)."
+  (let ((k (car e)) (a (cdr e)))
+    (cond ((eq k :special) (%note-runtime-special (car a)))
+          ((eq k :optimize) (%declaim-note-optimize (car a)))
+          ((eq k :declaim-special) (%declaim-note-special (car a)))
+          ((eq k :declaim-inline) (%declaim-note-inline (car a)))
+          ((eq k :declaim-type) (%declaim-note-type (car a)))
+          ((eq k :inline-defun) (%inline-record-defun (car a) (cadr a) (caddr a)))
+          ((eq k :setf-function) (%register-setf-function (car a))))))
 
 (defun %fasl-run-prepared (p)
-  "Called from %MVM-EVAL-FORMS-2 (the marker form): publish and run P."
+  "Called from %MVM-EVAL-FORMS-2 (the marker form): redo the module's logged
+   compile-time registrations, then publish and run it."
+  (dolist (e (nth 8 p)) (%fasl-apply-effect e))
   (%mvm-eval-publish-and-run nil (nth 0 p) (nth 1 p) (nth 2 p) (nth 3 p) (nth 4 p)
                              (nth 5 p) (nth 6 p) (nth 7 p) nil))
 
@@ -541,6 +559,7 @@
          (unwind-protect
               (setq val (multiple-value-list (eval form)))
            (setq outer *fasl-outer*)
+           (setq *fasl-effects* nil)
            (setq *fasl-base* sv-base) (setq *fasl-outer* sv-outer) (setq *fasl-slot* sv-slot))
          ;; exactly one outermost compile, and it recorded: the module IS the form
          (when (and (eql outer 1) (car slot) (consp entry))

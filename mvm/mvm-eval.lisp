@@ -3688,7 +3688,7 @@
                     (eql *fasl-depth* (+ (if (integerp *fasl-base*) *fasl-base* 0) 1))
                     (eql *fasl-outer* 1)
                     *fasl-slot*))
-  (when %fslot (setq *fasl-slot* nil))
+  (when %fslot (setq *fasl-slot* nil) (setq *fasl-effects* (list nil)))
   (setq %ftaint0 *fasl-taint*)
   ;; PERF Round 2 (compile-caching): if these FORMS are cacheable (no side-
   ;; effecting DEF*) and already compiled, re-interpret the cached module and
@@ -3920,7 +3920,8 @@
                     (puthash off lam-offsets (quote :defun)))))
             (when %fslot
               (%fasl-record %fslot forms bc entry ft-list fn-table rt-table lam-offsets
-                            persist-names %lam-bearing %ftaint0))
+                            persist-names %lam-bearing %ftaint0)
+              (setq *fasl-effects* nil))
             (%mvm-eval-publish-and-run forms bc entry ft-list fn-table rt-table
                                        lam-offsets persist-names %lam-bearing %cacheable))
           :no-entry))))

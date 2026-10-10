@@ -1106,6 +1106,17 @@
 ;;; macro, a special, a setf function, an inline definition, a struct accessor,
 ;;; a deftype, a declaim -- bumps this, so a form whose COMPILE registered
 ;;; something is cached as source, never as a module that would skip it.
+;;; Some compile-time registrations are pure DATA -- a special's name hash, a
+;;; declaim form, an inline definition's params and body, a setf-function name.
+;;; Those are not taints: while a form is being compiled for the cache,
+;;; %FASL-EFFECT logs them in *FASL-EFFECTS* (a holder cons, else NIL), the
+;;; cached module carries the log, and a replay applies it before running --
+;;; so a DEFVAR or a DECLAIM can be cached too.
+(defvar *fasl-effects* nil)
+(defun %fasl-effect (kind &rest args)
+  (when (consp *fasl-effects*)
+    (setf (car *fasl-effects*) (cons (cons kind args) (car *fasl-effects*)))))
+
 (defvar *fasl-taint* nil)
 (defvar *fasl-taint-who* nil)
 (defun %fasl-taint (&optional who)
@@ -1254,7 +1265,7 @@
 
 (defun %note-runtime-special (name-hash)
   "Record NAME-HASH as runtime-proclaimed-special (see *runtime-special-names*)."
-  (%fasl-taint "%note-runtime-special")
+  (%fasl-effect :special name-hash)
   (when *mvm-eval-runtime-p*
     (unless *runtime-special-names*
       (setq *runtime-special-names* (make-hash-table :test 'eql)))
@@ -2780,7 +2791,7 @@
 (defun %register-setf-function (name)
   "Record that (defun (setf NAME) …) has been compiled.  Returns the setter
    symbol, or NIL when NAME is not a symbol."
-  (%fasl-taint "%register-setf-function")
+  (%fasl-effect :setf-function name)
   (let ((k (%setf-fn-key name)))
     (when k
       (let ((sym (%setf-fn-setter-symbol name)))
@@ -2942,7 +2953,7 @@
   "Scan a DECLAIM/PROCLAIM form for (OPTIMIZE (SAFETY N)) and record the level.
    Accepts the abbreviated `(optimize safety)' spelling (= level 3) too, and
    ignores every other quality.  Returns nothing useful; called for effect."
-  (%fasl-taint "%declaim-note-optimize")
+  (%fasl-effect :optimize form)
   (dolist (spec (cdr form))
     ;; `(proclaim '(optimize ...))' arrives quoted; unwrap one QUOTE.
     (let ((s (if (and (consp spec) (name-eq (car spec) "QUOTE") (consp (cdr spec)))
@@ -3010,7 +3021,7 @@
    compiles to a no-op, so this compile-time note is the whole effect; it
    used to be missing, and after (declaim (special *x*)) every
    (let ((*x* v)) ...) bound *x* lexically."
-  (%fasl-taint "%declaim-note-special")
+  (%fasl-effect :declaim-special form)
   (dolist (spec (cdr form))
     (let ((s (if (and (consp spec) (name-eq (car spec) "QUOTE") (consp (cdr spec)))
                  (cadr spec)
@@ -3021,7 +3032,7 @@
 
 (defun %declaim-note-inline (form)
   "Record (inline f …) / (notinline f …) specs of a DECLAIM/PROCLAIM form."
-  (%fasl-taint "%declaim-note-inline")
+  (%fasl-effect :declaim-inline form)
   (dolist (spec (cdr form))
     (let ((s (if (and (consp spec) (name-eq (car spec) "QUOTE") (consp (cdr spec)))
                  (cadr spec)
@@ -3052,7 +3063,7 @@
                                        (let ((n (symbol-name p)))
                                          (not (and (> (length n) 0) (char= (char n 0) #\&))))))
                       params))
-      (%fasl-taint "%inline-record-defun")
+      (%fasl-effect :inline-defun name params body)
       (setq *inline-fn-defs*
             (cons (cons k (cons params body))
                   (remove k *inline-fn-defs* :key (function car) :test (function string=)))))))
@@ -3112,7 +3123,7 @@
 
 (defun %declaim-note-type (form)
   "Record (type TYPE v …) specs of a DECLAIM/PROCLAIM form for global variables."
-  (%fasl-taint "%declaim-note-type")
+  (%fasl-effect :declaim-type form)
   (dolist (spec (cdr form))
     (let ((s (if (and (consp spec) (name-eq (car spec) "QUOTE") (consp (cdr spec)))
                  (cadr spec)

@@ -4397,12 +4397,45 @@
         (when (and (>= c 97) (<= c 122))
           (setq c (- c 32)))
         (setq c (logand c 65535))
-        (setq h1 (logand (* (logxor h1 c) 403) 65535))
-        (setq h2 (logand (* (logxor h2 c) 89) 65535)))
+        ;; %FIXNUM-* (raw), as prelude.lisp's version: every product is below
+        ;; 2^25 (16-bit state x 9-bit prime), but plain * cannot prove that, and
+        ;; each character went through GENERIC-MULTIPLY -- this override ran no
+        ;; faster than the allocating one it replaced (1.95 us for an 18-char
+        ;; name on the Pi 5; a native clone with the raw multiply: 0.7 us).
+        (setq h1 (logand (%fixnum-* (logxor h1 c) 403) 65535))
+        (setq h2 (logand (%fixnum-* (logxor h2 c) 89) 65535)))
       (setq i (+ i 1)))
     (let ((combined (logior (ash (logand h1 +name-hash-hi-mask+) +name-hash-shift+)
                             (logand h2 +name-hash-lo-mask+))))
       (if (= combined 0) 1 combined))))
+
+;;; PERF: NORMALIZE-NAME / NAME-EQ in-image.  compiler.lisp's versions hash
+;;; (SYMBOL-NAME SYM), and every symbol already CARRIES that hash in slot 0: a
+;;; CL symbol [hash package name] (%MAKE-CL-SYMBOL stores
+;;; COMPUTE-NAME-HASH of the name), a native MVM symbol or keyword [hash].
+;;; Recovering the name first -- a table lookup, or for a hash the table lacks a
+;;; walk of every package's symbols hashing each -- made NAME-EQ, which the
+;;; compiler's analysis passes call constantly, about 30% of loading kiln-zero
+;;; on the Pi 5 (perf -g).  NIL and T are immediates, not slotted objects.
+(defun normalize-name (sym)
+  (cond
+    ((integerp sym) sym)
+    ((null sym) (compute-name-hash "NIL"))
+    ((eq sym t) (compute-name-hash "T"))
+    ((symbolp sym) (aref sym 0))
+    ((stringp sym) (compute-name-hash sym))
+    (t 0)))
+
+(defun name-eq (sym name-string)
+  (and (symbolp sym)
+       (= (normalize-name sym) (compute-name-hash name-string))))
+
+;;; PERF: the macroexpansion memo's epoch check, in-image.  compiler.lisp's
+;;; host-safe version asks (FBOUNDP '%GC-EPOCH) and FUNCALLs it by name on EVERY
+;;; memo lookup; in the image that is a symbol resolution through
+;;; %SYM-NAME-OR-HASH -> COMPUTE-NAME-HASH each time (3.6% of loading kiln-zero
+;;; on the Pi 5).  %GC-EPOCH always exists here.
+(defun %mexp-memo-epoch () (%gc-epoch))
 
 ;;; PERF: in-image identity key for the macroexpansion memo (compiler.lisp's
 ;;; host stub uses SXHASH).  The tagged word of the form object; entries are

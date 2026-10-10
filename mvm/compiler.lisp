@@ -2379,11 +2379,16 @@
 
 (defun compute-name-hash (name-string)
   "Compute dual-FNV-1a hash for a name string. 60-bit collision-resistant."
-  (let ((name (string-upcase (string name-string)))
+  ;; CHAR-UPCASE per character, not STRING-UPCASE of the whole name: the same
+  ;; hash without allocating a copy of every name hashed.  In the image this is
+  ;; the definition the runtime's own callers reach (%SYM-NAME-OR-HASH,
+  ;; %FIND-PACKAGE-INDEXED, NAME-EQ -- perf -g on the Pi 5), and the copy was
+  ;; ~10% of loading kiln-zero.
+  (let ((name (string name-string))
         ;; low 16 bits of the FNV-1a-32 offset bases — see the docstring
         (h1 #x9DC5) (h2 #xBEEF))
     (loop for c across name
-          do (let ((cc (logand (char-code c) #xFFFF)))
+          do (let ((cc (logand (char-code (char-upcase c)) #xFFFF)))
                (setq h1 (logand (* (logxor h1 cc) 403) #xFFFF))
                (setq h2 (logand (* (logxor h2 cc) 89) #xFFFF))))
     (let ((combined (logior (ash (logand h1 +name-hash-hi-mask+) +name-hash-shift+)
@@ -3223,8 +3228,15 @@
   (let ((old *mexp-memo*)
         (new (make-hash-table :test 'eql)))
     (when old
-      (maphash (lambda (k e) (declare (ignore k))
-                 (setf (gethash (%form-key (car e)) new) e))
+      (maphash (lambda (k e)
+                 (if (eql k -1)
+                     ;; %CLOSURE-MEMO's table, keyed the same way: re-key it too
+                     (let ((tb (make-hash-table :test 'eql)))
+                       (maphash (lambda (k2 e2) (declare (ignore k2))
+                                  (setf (gethash (%form-key (car e2)) tb) e2))
+                                (cdr e))
+                       (setf (gethash -1 new) (cons -1 tb)))
+                     (setf (gethash (%form-key (car e)) new) e)))
                old))
     (setq *mexp-memo* new)))
 (defun %mexp-memo-sync ()
@@ -9800,6 +9812,92 @@
                (setf rest (cdr rest)))
              results))))))
 
+;;; PERF: the closure-capture scans below run once per LET, and each walks
+;;; (and macroexpands) its whole body -- so a LET nested N deep re-walks the
+;;; innermost forms N times.  Both scans can only REPORT from inside a LAMBDA /
+;;; FLET / LABELS, so a subform with none of those after expansion contributes
+;;; nothing to either; %FORM-HAS-CLOSURE-P answers that once per form object
+;;; and the scans skip such subtrees.  It expands exactly as the scans do (one
+;;; step, then -- runtime only -- up to 100 more, through the same
+;;; %CFV-MACROEXPAND memo) and in the same depth-first order, so it never
+;;; expands a form the scans would not, and never in a different order: host
+;;; output (gensym numbering included) is unchanged.  Answers are kept in the
+;;; macroexpansion memo under key -1, so they share its lifetime -- reset per
+;;; toplevel form, dropped whenever a macro table changes, re-keyed after GC.
+(defun %closure-memo ()
+  (%mexp-memo-sync)
+  (let* ((memo (or *mexp-memo* (setq *mexp-memo* (make-hash-table :test 'eql))))
+         (e (gethash -1 memo)))
+    (if e
+        (cdr e)
+        (let ((tb (make-hash-table :test 'eql)))
+          (setf (gethash -1 memo) (cons -1 tb))
+          tb))))
+
+(defun %closure-head-p (op)
+  (or (and (symbolp op)
+           (or (string= (symbol-name op) "LAMBDA")
+               (string= (symbol-name op) "FLET")
+               (string= (symbol-name op) "LABELS")))
+      (and (integerp op)
+           (or (= op 80380232) (= op 445617652) (= op 417505106)))))
+
+(defun %form-has-closure-p (form)
+  "T when FORM, walked and expanded as VARS-MUTATED-IN-LAMBDAS and
+   VARS-READ-IN-LAMBDAS walk it, contains a LAMBDA, FLET or LABELS --
+   i.e. when either scan could find anything in it.  Memoized per form."
+  (if (not (consp form))
+      nil
+      (let* ((tb (%closure-memo))
+             (k (%form-key form))
+             (e (gethash k tb)))
+        (if (and e (eq (car e) form))
+            (cdr e)
+            (let ((r (%form-has-closure-p-1 form)))
+              ;; the walk may have collected: re-fetch the (re-keyed) table
+              (setf (gethash (%form-key form) (%closure-memo)) (cons form r))
+              r)))))
+
+(defun %form-has-closure-p-1 (form)
+  (let ((op (car form)))
+    (cond
+      ((or (and (symbolp op) (string= (symbol-name op) "QUOTE"))
+           (and (integerp op) (= op 338547669)))
+       nil)
+      ;; a quasiquote: VARS-MUTATED-IN-LAMBDAS scans its expansion; at runtime
+      ;; VARS-READ-IN-LAMBDAS walks the raw template too, so look at both
+      ((%bq-form-p form)
+       (or (%form-has-closure-p (expand-backquote (cadr form)))
+           (and *mvm-eval-runtime-p* (%form-has-closure-p-2 form))))
+      (t (%form-has-closure-p-2 form)))))
+
+(defun %form-has-closure-p-2 (form)
+  (let ((mx (%cfv-macroexpand form)))
+    (when mx (setq form mx)))
+  (when *mvm-eval-runtime-p*
+    (let ((steps 0))
+      (loop
+        (when (>= steps 100) (return nil))
+        (let ((mx (%cfv-macroexpand form)))
+          (if mx
+              (progn (setq form mx) (setq steps (+ steps 1)))
+              (return nil))))))
+  (if (not (consp form))
+      nil
+      (let ((op (car form)))
+        (cond
+          ((%closure-head-p op) t)
+          ((or (and (symbolp op) (string= (symbol-name op) "QUOTE"))
+               (and (integerp op) (= op 338547669)))
+           nil)
+          ((and (consp op) (%form-has-closure-p op)) t)
+          (t
+           (let ((rest (cdr form)) (found nil))
+             (loop while (and (consp rest) (not found)) do
+               (when (%form-has-closure-p (car rest)) (setq found t))
+               (setq rest (cdr rest)))
+             found))))))
+
 (defun vars-mutated-in-lambdas (body-forms let-vars)
   "Find which of LET-VARS are mutated inside a lambda in BODY-FORMS.
    Returns a list of variable names that need cell boxing.
@@ -9812,6 +9910,7 @@
   (let ((result nil))
     (labels ((scan (form in-lambda)
                (unless (consp form) (return-from scan))
+               (unless (%form-has-closure-p form) (return-from scan))
                ;; DON'T WALK A QUASIQUOTE TEMPLATE.  Same hazard %COLLECT-FREE-VARS
                ;; documents: `(cond ,@(cdr clauses))' reads as (SB-INT:QUASIQUOTE
                ;; (COND #S(COMMA :EXPR (CDR CLAUSES) :KIND 2))), and the template's
@@ -10037,6 +10136,7 @@
                  (setq result (adjoin v result :test #'name-equal))))
              (scan (form)
                (unless (consp form) (return-from scan))
+               (unless (%form-has-closure-p form) (return-from scan))
                (let ((mx (%cfv-macroexpand form)))
                  (when mx (setq form mx)))
                ;; Keep expanding, as the mutation scan does (runtime only).
@@ -10104,14 +10204,21 @@
    (block nil (flet ((d () (return 42))) (d) 99)) → NIL).  Build-time
    output stays byte-identical with the gate; the runtime-eval side (the
    asdf gauntlet's split-string PARSE-ERROR cluster) gets the fix."
-  (let ((base (vars-mutated-in-lambdas scan-forms let-vars)))
-    (when *mvm-eval-runtime-p*
-      (let ((mut (collect-setq-vars-in-body (cons 'progn scan-forms) let-vars)))
-        (dolist (v (vars-read-in-lambdas scan-forms let-vars))
-          (when (and (member v mut :test #'name-equal)
-                     (not (member v base :test #'name-equal)))
-            (setq base (cons v base))))))
-    base))
+  ;; No closure anywhere in the scope: nothing can need a cell (see
+  ;; %FORM-HAS-CLOSURE-P) -- the common case, and it skips all three walks.
+  (if (not (some #'%form-has-closure-p scan-forms))
+      nil
+      (let ((base (vars-mutated-in-lambdas scan-forms let-vars)))
+        (when *mvm-eval-runtime-p*
+          (let ((reads (vars-read-in-lambdas scan-forms let-vars)))
+            ;; the mutation walk only matters for a var some closure reads
+            (when reads
+              (let ((mut (collect-setq-vars-in-body (cons 'progn scan-forms) let-vars)))
+                (dolist (v reads)
+                  (when (and (member v mut :test #'name-equal)
+                             (not (member v base :test #'name-equal)))
+                    (setq base (cons v base))))))))
+        base)))
 
 (defun cell-var-name (var)
   "Generate the cell variable name for a boxed variable."

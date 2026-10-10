@@ -1086,6 +1086,16 @@
           (concatenate 'string (subseq *ce-cross-source* 0 p) repl
                        (subseq *ce-cross-source* (+ p (length needle)))))))
 
+;;; cross.lisp carries its own COMPUTE-NAME-HASH for the HOST (STRING-UPCASE
+;;; copy, generic arithmetic).  Spliced here it came AFTER mvm-eval.lisp's
+;;; in-image fast version and won by last-defun-wins, so every name hash in
+;;; this image -- FIND-PACKAGE, SYMBOL-NAME, NAME-EQ, the macro table -- allocated
+;;; an upcased string: 17% of compiling kiln-zero on the Pi 5.  Same hash either
+;;; way; rename it out of the way and let mvm-eval's stand.
+(setf *ce-cross-source*
+      (%ce-replace-all *ce-cross-source*
+                       "(defun compute-name-hash " "(defun %cross-host-compute-name-hash "))
+
 ;;; --- linux-x64 boot descriptor: strip the FIRST top-level eval-when assert
 ;;; block, and rename its EMIT-BYTES (def + calls) to %LINUX-BOOT-EMIT-BYTES so
 ;;; it doesn't shadow x64-asm's EMIT-BYTES under last-defun-wins.

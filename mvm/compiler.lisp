@@ -2379,11 +2379,16 @@
 
 (defun compute-name-hash (name-string)
   "Compute dual-FNV-1a hash for a name string. 60-bit collision-resistant."
-  (let ((name (string-upcase (string name-string)))
+  ;; CHAR-UPCASE per character, not STRING-UPCASE of the whole name: the same
+  ;; hash without allocating a copy of every name hashed.  In the image this is
+  ;; the definition the runtime's own callers reach (%SYM-NAME-OR-HASH,
+  ;; %FIND-PACKAGE-INDEXED, NAME-EQ -- perf -g on the Pi 5), and the copy was
+  ;; ~10% of loading kiln-zero.
+  (let ((name (string name-string))
         ;; low 16 bits of the FNV-1a-32 offset bases — see the docstring
         (h1 #x9DC5) (h2 #xBEEF))
     (loop for c across name
-          do (let ((cc (logand (char-code c) #xFFFF)))
+          do (let ((cc (logand (char-code (char-upcase c)) #xFFFF)))
                (setq h1 (logand (* (logxor h1 cc) 403) #xFFFF))
                (setq h2 (logand (* (logxor h2 cc) 89) #xFFFF))))
     (let ((combined (logior (ash (logand h1 +name-hash-hi-mask+) +name-hash-shift+)

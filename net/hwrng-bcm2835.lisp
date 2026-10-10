@@ -44,3 +44,22 @@
               (when (< (+ i k) n)
                 (setf (mem-ref (+ addr i k) :u8) (logand (ash w (* -8 k)) 255))))))
       (setq i (+ i 4)))))
+
+;;; The same words as a fresh (unsigned-byte 8) vector -- the shape natrium's
+;;; *OS-ENTROPY* seam wants (natrium looks this name up in CL-USER and, when it
+;;; is fbound, uses it in place of reading /dev/urandom, which bare metal does
+;;; not have: the OPEN is a Linux syscall, an SVC trap here).  Fails CLOSED: an
+;;; RNG that never fills its FIFO is an error, never a short or zeroed buffer.
+(defun %modus-hardware-entropy (n)
+  (%bcm-rng-init)
+  (let ((out (make-array n :element-type '(unsigned-byte 8) :initial-element 0))
+        (i 0))
+    (loop
+      (when (>= i n) (return out))
+      (let ((w (%bcm-rng-word)))
+        (when (< w 0)
+          (error "modus: the BCM2835 hardware RNG produced no data"))
+        (dotimes (k 4)
+          (when (< (+ i k) n)
+            (setf (aref out (+ i k)) (logand (ash w (* -8 k)) 255)))))
+      (setq i (+ i 4)))))

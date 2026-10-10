@@ -338,9 +338,12 @@
    error in one form is reported but does not abort the whole file."
   (let ((s (make-string-input-stream source-string))
         (eof (list 'eof))
-        (count 0))
+        (count 0)
+        ;; FASL cache (mvm/fasl.lisp): replay this file's modules, or record them
+        (fx (%fasl-open source-string))
+        (read-failed nil))
     (loop
-      (let ((form (handler-case (read s nil eof)
+      (let ((form (handler-case (if fx (%fasl-read fx eof) (read s nil eof))
                     (t (c)
                       ;; A READ error ENDS THE FILE (an EVAL error, below, just
                       ;; prints and continues).  That asymmetry is correct — a
@@ -360,10 +363,13 @@
                       (handler-case (write-object c) (t (c2) (write-string-serial "<err>")))
                       (write-string-serial "  -- REST OF FILE DISCARDED")
                       (write-char-serial 10)
+                      (setq read-failed t)
                       eof))))     ; a read error ends the file
-        (when (eq form eof) (return count))
+        (when (eq form eof)
+          (%fasl-close fx (not read-failed))
+          (return count))
         (handler-case
-            (progn (eval form) (setq count (+ count 1)))
+            (progn (if fx (%fasl-eval fx form) (eval form)) (setq count (+ count 1)))
           (t (c)
             (write-string-serial "  !! form eval error in ")
             (write-string-serial tag) (write-string-serial ": ")

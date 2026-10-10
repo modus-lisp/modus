@@ -776,6 +776,7 @@
 (defun mvm-define-setf-expander (name expander)
   "Register a setf expander for NAME (string, symbol, or hash).
    Dual write: NAME's own package plus the historic bare entry."
+  (%fasl-taint "mvm-define-setf-expander")
   (let ((h (cond ((integerp name) name)
                  ((stringp name) (compute-name-hash name))
                  ((symbolp name) (normalize-name name))
@@ -1101,6 +1102,16 @@
 ;;; native :li-const string-pool path is untouched.
 ;;; (The pool globals *e2-const-pool* / *e2-const-count* live in mvm.lisp —
 ;;; loaded before BOTH this file and interp.lisp in host and image orders.)
+;;; FASL cache taint (mvm/fasl.lisp): every compile-time registry write -- a
+;;; macro, a special, a setf function, an inline definition, a struct accessor,
+;;; a deftype, a declaim -- bumps this, so a form whose COMPILE registered
+;;; something is cached as source, never as a module that would skip it.
+(defvar *fasl-taint* nil)
+(defvar *fasl-taint-who* nil)
+(defun %fasl-taint (&optional who)
+  (setq *fasl-taint-who* who)
+  (setq *fasl-taint* (if (integerp *fasl-taint*) (+ *fasl-taint* 1) 1)))
+
 (defun %e2-const-register (value)
   "Register VALUE in the mvm-eval quote pool; return its index."
   (unless *e2-const-pool*
@@ -1243,6 +1254,7 @@
 
 (defun %note-runtime-special (name-hash)
   "Record NAME-HASH as runtime-proclaimed-special (see *runtime-special-names*)."
+  (%fasl-taint "%note-runtime-special")
   (when *mvm-eval-runtime-p*
     (unless *runtime-special-names*
       (setq *runtime-special-names* (make-hash-table :test 'eql)))
@@ -1252,6 +1264,7 @@
   "PROCLAIM (SPECIAL SYM) at runtime: record SYM in *RUNTIME-SPECIAL-NAMES*.
    Unconditional -- PROCLAIM is a runtime call, not something the compiler
    sees, so it cannot wait for *MVM-EVAL-RUNTIME-P*."
+  (%fasl-taint "%proclaim-special-name")
   (unless *runtime-special-names*
     (setq *runtime-special-names* (make-hash-table :test 'eql)))
   (setf (gethash (normalize-name sym) *runtime-special-names*) t)
@@ -1411,6 +1424,7 @@
 
 (defun %gsm-pkg-put (sym key expansion)
   "Register EXPANSION as SYM's own package's global symbol macro."
+  (%fasl-taint "%gsm-pkg-put")
   (let ((p (%reg-pkg-of sym)))
     (when p
       (unless *global-symbol-macros-pkg*
@@ -2766,6 +2780,7 @@
 (defun %register-setf-function (name)
   "Record that (defun (setf NAME) …) has been compiled.  Returns the setter
    symbol, or NIL when NAME is not a symbol."
+  (%fasl-taint "%register-setf-function")
   (let ((k (%setf-fn-key name)))
     (when k
       (let ((sym (%setf-fn-setter-symbol name)))
@@ -2927,6 +2942,7 @@
   "Scan a DECLAIM/PROCLAIM form for (OPTIMIZE (SAFETY N)) and record the level.
    Accepts the abbreviated `(optimize safety)' spelling (= level 3) too, and
    ignores every other quality.  Returns nothing useful; called for effect."
+  (%fasl-taint "%declaim-note-optimize")
   (dolist (spec (cdr form))
     ;; `(proclaim '(optimize ...))' arrives quoted; unwrap one QUOTE.
     (let ((s (if (and (consp spec) (name-eq (car spec) "QUOTE") (consp (cdr spec)))
@@ -2994,6 +3010,7 @@
    compiles to a no-op, so this compile-time note is the whole effect; it
    used to be missing, and after (declaim (special *x*)) every
    (let ((*x* v)) ...) bound *x* lexically."
+  (%fasl-taint "%declaim-note-special")
   (dolist (spec (cdr form))
     (let ((s (if (and (consp spec) (name-eq (car spec) "QUOTE") (consp (cdr spec)))
                  (cadr spec)
@@ -3004,6 +3021,7 @@
 
 (defun %declaim-note-inline (form)
   "Record (inline f …) / (notinline f …) specs of a DECLAIM/PROCLAIM form."
+  (%fasl-taint "%declaim-note-inline")
   (dolist (spec (cdr form))
     (let ((s (if (and (consp spec) (name-eq (car spec) "QUOTE") (consp (cdr spec)))
                  (cadr spec)
@@ -3034,6 +3052,7 @@
                                        (let ((n (symbol-name p)))
                                          (not (and (> (length n) 0) (char= (char n 0) #\&))))))
                       params))
+      (%fasl-taint "%inline-record-defun")
       (setq *inline-fn-defs*
             (cons (cons k (cons params body))
                   (remove k *inline-fn-defs* :key (function car) :test (function string=)))))))
@@ -3093,6 +3112,7 @@
 
 (defun %declaim-note-type (form)
   "Record (type TYPE v …) specs of a DECLAIM/PROCLAIM form for global variables."
+  (%fasl-taint "%declaim-note-type")
   (dolist (spec (cdr form))
     (let ((s (if (and (consp spec) (name-eq (car spec) "QUOTE") (consp (cdr spec)))
                  (cadr spec)
@@ -3118,6 +3138,7 @@
   "Alist acc-name-hash -> (setter-hash struct-name-string slot-index slot-type).")
 
 (defun %struct-accessor-note (acc-name setter-name struct-str index slot-type)
+  (%fasl-taint "%struct-accessor-note")
   (let ((h (compute-name-hash acc-name)))
     (setq *struct-accessors*
           (cons (list h (compute-name-hash setter-name) struct-str index slot-type)
@@ -3395,6 +3416,7 @@
    A STRING name is also recorded in *MACRO-NAME-TABLE* so a later lookup can
    confirm it; an integer name registers no string and therefore no
    confirmation, which is the pre-existing behaviour."
+  (%fasl-taint "mvm-define-macro")
   (let ((hash (if (integerp name) name (compute-name-hash name))))
     (unless (integerp name)
       (unless *macro-name-table*

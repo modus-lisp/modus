@@ -473,6 +473,7 @@
 (defun %register-struct-type (name parent-name slot-names conc-name)
   "Register (or redefine) struct type NAME.  PARENT-NAME is the :include
    parent (or NIL).  SLOT-NAMES is the EFFECTIVE slot list.  Returns NAME."
+  (%fasl-taint "%register-struct-type")
   (let* ((key (%struct-name-hash name))
          (desc (make-array 5)))
     (aset desc 0 key)

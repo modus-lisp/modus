@@ -846,6 +846,7 @@
    so a 3-arg call here has the FN in `fn` parameter slot but really
    that's the user's ENV, with the real new-value living in (first env).
    Detect that shape and re-route."
+  (%fasl-taint "set-macro-function")
   (cond
     ;; 3-arg setf shape: (set-macro-function sym env new-value).
     ;; Here `fn` is actually the env argument and `(car env)` is the new value.
@@ -1000,6 +1001,7 @@
    DUAL WRITE: the per-package side entry for exact resolution, plus the
    historic bare entry so every lookup that cannot name a package (native
    MVM syms, string heads) keeps resolving exactly as before."
+  (%fasl-taint "%runtime-register-deftype")
   (let ((name-str (%eval-sym-name tname))
         (entry (cons params body)))
     (when name-str
@@ -1048,6 +1050,7 @@
    *compiler-macro-function-table* — the SAME registry the tree-walker's
    DEFINE-COMPILER-MACRO handler writes and COMPILER-MACRO-FUNCTION
    consults.  Returns MNAME per CLHS.  Dual write, as %RUNTIME-REGISTER-DEFTYPE."
+  (%fasl-taint "%runtime-register-compiler-macro")
   (let ((expander (list '%interp-closure params body nil))
         (key (%macro-sym-key mname)))
     (when key

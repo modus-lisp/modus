@@ -232,6 +232,33 @@
 ;; (77cea7c) repaired it; the file is now clean, directly mvm-text-readable.
 (defvar *mvm-eval-canonical-source* (mvm-text "mvm/mvm-eval.lisp"))
 
+;;; The FASL cache (mvm/fasl.lisp), and its COMPILER FINGERPRINT: a hash of the
+;;; sources that decide what bytecode a form compiles to -- the ISA, the
+;;; compiler, mvm-eval, the interpreter and every file that bakes macros or the
+;;; runtime the compiler consults -- plus the cache's format version.  Two images
+;;; whose fingerprints agree may share cached modules (host, QEMU, board); an
+;;; edit to any of these files invalidates every cache entry.  Deliberately NOT
+;;; the whole image: the board image bakes drivers the hosted CLI does not, and
+;;; they do not change what a library compiles to.
+(defvar *fasl-source* (mvm-text "mvm/fasl.lisp"))
+(defvar *fasl-fingerprint-files*
+  '("mvm/mvm.lisp" "mvm/compiler.lisp" "mvm/mvm-eval.lisp" "mvm/fasl.lisp"
+    "mvm/interp.lisp" "mvm/prelude.lisp" "mvm/runtime-cl-macros.lisp"
+    "mvm/cl-sequences.lisp" "mvm/cl-streams.lisp" "mvm/cl-fileio.lisp"
+    "mvm/cl-printer.lisp" "mvm/cl-reader.lisp" "mvm/cl-eval.lisp" "mvm/cl-clos.lisp"
+    "mvm/cl-types.lisp" "mvm/cl-packages.lisp" "mvm/cl-conditions.lisp"
+    "mvm/ansi-bridge.lisp"))
+(defvar *fasl-fingerprint-source*
+  (let ((a 2166136261) (b 3735928559))
+    (dolist (f *fasl-fingerprint-files*)
+      (let ((text (read-file-text (merge-pathnames f *modus-base*))))
+        (loop for c across text
+              for k = (char-code c)
+              do (setf a (logand (* (logxor a k) 16777619) #xFFFFFFFF))
+                 (setf b (logand (* (logxor b (logand (+ k 41) #xFFFF)) 16777619) #xFFFFFFFF)))))
+    (format nil "(defun %fasl-compiler-fingerprint () \"mfasl1-~8,'0x~8,'0x\")~%" a b)))
+(format t "  FASL fingerprint: ~a" *fasl-fingerprint-source*)
+
 ;;; ============================================================
 ;;; WS5 rung 2: OPTIONAL runtime JIT (MODUS_USE_JIT=1)
 ;;; ============================================================
@@ -1889,6 +1916,9 @@
                        *compiler-source* (string #\Newline)
                        *stage2-float-override* (string #\Newline)
                        *opcode-table-init-source* (string #\Newline)
+                       ;; the FASL cache: callable by name (FASL-STATS, FASL-MEM-PUT)
+                       *fasl-source* (string #\Newline)
+                       *fasl-fingerprint-source* (string #\Newline)
                        *mvm-eval-canonical-source* (string #\Newline)
                        ;; WS5 rung 2: register the JIT translator's defuns +
                        ;; quoted symbols in the SFT / sym-name tables so
@@ -2167,6 +2197,11 @@
     *stage2-float-override*
     (string #\Newline)
     *opcode-table-init-source*
+    (string #\Newline)
+    ;; the FASL cache, then its build fingerprint (overrides the default DEFUN)
+    *fasl-source*
+    (string #\Newline)
+    *fasl-fingerprint-source*
     (string #\Newline)
     *mvm-eval-canonical-source*
     (string #\Newline)

@@ -3410,9 +3410,17 @@
       0))
 
 (defun %mvm-eval-forms-1 (forms)
-  (let ((%depth (%eval-lock-acquire)))
+  (let ((%depth (%eval-lock-acquire))
+        ;; FASL cache bookkeeping (mvm/fasl.lisp): nesting depth, and how many
+        ;; OUTERMOST compiles the load loop's current form has made -- a form
+        ;; is cached as a module only when that is exactly one.
+        (%fd (if (integerp *fasl-depth*) *fasl-depth* 0)))
+    (setq *fasl-depth* (+ %fd 1))
+    (when (and (integerp *fasl-outer*) (eql %fd (if (integerp *fasl-base*) *fasl-base* 0)))
+      (setq *fasl-outer* (+ *fasl-outer* 1)))
     (unwind-protect
         (%mvm-eval-forms-2 forms)
+      (setq *fasl-depth* %fd)
       ;; Still holding THIS call's level (the compile did not reach a run
       ;; site: an error, or an early exit) — give it back.
       (when (and (> %depth 0)
@@ -3434,7 +3442,206 @@
          (let ((n (symbol-name (car f))))
            (or (string= n "DEFMETHOD") (string= n "DEFGENERIC"))))))
 
+;;; The second half of a fresh MVM-EVAL-FORMS: publish the module's toplevel
+;;; DEFUNs (trampolines, JIT-EAGER registration), store it in the in-memory
+;;; compile cache, and run it.  A function of its own so a module that did NOT
+;;; come from the compiler -- one replayed from the FASL cache (mvm/fasl.lisp)
+;;; -- goes through exactly the same steps.  FT-LIST is in REVERSE source
+;;; order, as the compiler builds it: (name offset length) per module function.
+(defun %mvm-eval-publish-and-run (forms bc entry ft-list fn-table rt-table
+                                  lam-offsets persist-names %lam-bearing %cacheable)
+            ;; WS3 def persistence: install each top-level user DEFUN as a
+  ;; re-entrant interp trampoline in BOTH global function tables —
+  ;; *symbol-function-table* by NAME (the mvm-eval native-call bridge's
+  ;; %mvm-resolve-runtime-fn key) and *native-sym-function-table* by
+  ;; HASH (symbol-function / funcall key).  The trampoline closes over
+  ;; BC so the module bytecode stays GC-alive; fn-table + lam-offsets
+  ;; are fully built by now; env = NIL (a top-level defun captures
+  ;; nothing).  A later (mvm-eval …) call OR the tree-walker now resolves f.
+  (when persist-names
+    (dolist (e (reverse ft-list))
+      (let ((pn (car e)))
+        (when (member pn persist-names :test (function string=))
+          ;; WS5 #222 REDEFINITION INVALIDATION.  This is the ONLY
+          ;; point at which PN's PREVIOUS binding is still visible —
+          ;; the puthash below overwrites it, and by the time
+          ;; %jit-install-native-fns runs (after the page is built)
+          ;; the old value is already gone.  If the previous binding
+          ;; was NATIVE code (tag nibble 3 — either build-time or a
+          ;; #222 install), some exec page in *jit-page-cache* may
+          ;; have BAKED that address into a `movabs rax, imm64; call
+          ;; rax` site, and re-running that cached page would silently
+          ;; call the SUPERSEDED definition.  Drop the whole page
+          ;; cache so every cached module re-translates and
+          ;; re-relocates against the new definition.
+          ;;
+          ;; This must happen even when the NEW definition ends up
+          ;; being only a trampoline (a const-bearing body, or a
+          ;; module whose relocation failed): the stale cached page
+          ;; still holds the OLD native address and would keep
+          ;; calling it — the first redefinition bug this feature
+          ;; produced (`(defun f …)` twice, then the SAME call form
+          ;; text, returned the second definition's answer for the
+          ;; third definition).  A FIRST definition never invalidates
+          ;; anything: no page can have baked an address for a name
+          ;; that did not previously resolve to native code, so
+          ;; loading a library pays nothing here.
+          (let ((%prev (%mvm-resolve-runtime-fn pn)))
+            (when (and %prev *jit-page-cache*
+                       (eql (logand (%val->word %prev) 15) 3))
+              (clrhash *jit-page-cache*)))
+          ;; JIT-EAGER: remember this module so the DEFUN can be
+          ;; compiled native later without re-evaluating anything.
+          (%jit-register-module persist-names bc entry ft-list
+                                fn-table rt-table lam-offsets)
+          (let ((tramp (%mvm-make-trampoline
+                         bc fn-table rt-table
+                         (cadr e)
+                         nil lam-offsets)))
+            ;; puthash signature is (KEY HT VALUE) — store the
+            ;; trampoline as the VALUE under PN / its name-hash.  (The
+            ;; earlier `(puthash pn tramp <table>)` had HT and VALUE
+            ;; swapped, so the closure was treated as the hash table and
+            ;; nothing was actually stored — every later resolve of PF
+            ;; returned NIL, so the trampoline never ran.)
+            (when (boundp (quote *symbol-function-table*))
+              (%jit-fnaddr-thunk-invalidate pn)
+              (puthash pn *symbol-function-table* tramp))
+            (when (boundp (quote *native-sym-function-table*))
+              (puthash (compute-name-hash pn)
+                       *native-sym-function-table* tramp)))))))
+  ;; PERF Round 2: cache the compiled module for these forms so a
+  ;; later mvm-eval of the same forms skips the whole compile.  bc is a
+  ;; fresh copy (mvm-buffer-used-bytes), safe despite buffer reuse.
+  (when (and %cacheable
+             ;; OFF-MAIN, DO NOT CACHE — the tuple below was
+             ;; allocated in THIS thread's region during the
+             ;; compile, and the cache is region-0-reachable.
+             ;; Measured as EXACTLY the last remaining
+             ;; region-0 -> worker reference after the CL:INTERN
+             ;; lock+copy fix.  See %MVM-ON-MAIN-THREAD-P.
+             (%mvm-on-main-thread-p))
+    (setf (gethash forms *mvm-eval-cache*)
+          ;; WS4-S5b: ft-list inserted at index 2 (see %mvm-eval-run-tuple
+          ;; layout comment).  reverse → source order (fn-table order).
+          (list bc entry (reverse ft-list) fn-table rt-table lam-offsets)))
+  ;; Conditions PROPAGATE (see %mvm-eval-run-tuple): production EVAL
+  ;; must let an error signalled by the form reach the caller's
+  ;; handler-case instead of returning (:interp-err e) as a value.
+  ;; The RESULT is wrapped when it is an in-module #x52 lambda
+  ;; closure (see %mvm-wrap-escaping-result) so `(eval '#'(lambda
+  ;; ...))` hands back a natively-funcallable, per-call-distinct
+  ;; function object.
+  ;; MULTIPLE VALUES propagate — same *mvm-last-mv* + values-list
+  ;; re-emission as %mvm-eval-run-tuple (see the comment there).
+  ;; *e2-active-defun-names* = persist-names for the duration of the
+  ;; run so fmakunbound honors source order vs the pre-run defun
+  ;; installation (see the defvar).  Lexical-save + setq-restore
+  ;; (nested mvm-eval during the run saves/restores its own).
+  ;; THE COMPILE IS OVER: drop the eval lock before running (see
+  ;; THE EVAL LOCK).
+  (%eval-lock-drop-for-run)
+  (let* ((%adn-saved *e2-active-defun-names*)
+         ;; WS5 #203: the re-execution guard, same as in
+         ;; %mvm-eval-run-tuple.  THIS is the site the doubling was
+         ;; measured at (a top-level form calling a runtime-defined
+         ;; function): the old `(t (c) ...interpret...)` answered a
+         ;; condition raised AFTER the form's side effects had already
+         ;; run by re-running the whole form.  Lexical-save +
+         ;; setq-restore, matching %adn-saved directly above.
+         (%jnr-saved *jit-native-ran*)
+         (%jif-saved *jit-infra-fallback*)
+         (%prim (progn
+                  (setq *e2-active-defun-names* persist-names)
+                  (setq *jit-native-ran* nil)
+                  (setq *jit-infra-fallback* nil)
+                  ;; WS4-S5b: JIT when enabled, interpret-fallback on a
+                  ;; SETUP failure (page-build fail / unsupported) or
+                  ;; the MV out-of-range residual — but NOT on a user condition
+                  ;; raised once native code is running.
+                  ;; %jit-active-p honors *jit-inhibit* (Class 3).
+                  ;; RETRY-ON-HOT: with *jit-hot-only* (default T), a
+                  ;; form's FIRST eval (this fresh-compile / cache-MISS
+                  ;; path) INTERPRETS; it is JIT'd only when eval'd AGAIN,
+                  ;; via the cache-HIT run-tuple path above (~2247), which
+                  ;; stays gated on %jit-active-p alone.  One-shot LOAD
+                  ;; forms (never re-eval'd; DEFUNs aren't even cacheable)
+                  ;; thus never pay JIT translation — fast loading — while
+                  ;; repeated forms go native on the second run.
+                  ;;
+                  ;; LAMBDA-BEARING FORMS SKIP RETRY-ON-HOT.  A one-shot
+                  ;; form is not one-shot CODE when it builds a closure
+                  ;; that outlives it: a DEFMETHOD's method function, a
+                  ;; DEFPARAMETER of a lambda, a hook pushed onto a list.
+                  ;; Interpreted, each of those is a trampoline that
+                  ;; re-enters mvm-interpret on EVERY call -- 3 us, against
+                  ;; 0.005 us native -- and no later pass revisits it:
+                  ;; %JIT-EAGER-ALL rebuilds DEFUN modules, and the form
+                  ;; that made the closure never runs again.  Measured on
+                  ;; warp's media player: every method body in the app
+                  ;; interpreted, a generic call 4.5 us, and a 40-row
+                  ;; layout 24 ms a frame.  So a module that compiled a
+                  ;; lambda body is JIT'd on its first run; if the page
+                  ;; cannot be built it interprets exactly as before.
+                  (if (and (%jit-active-p)
+                           (or (not (%jit-hot-only-p))
+                               %lam-bearing
+                               (%mvm-forms-define-methods-p forms)))
+                      (handler-case
+                          (%mvm-eval-jit-run bc entry (reverse ft-list)
+                                          fn-table rt-table lam-offsets nil
+                                          persist-names)
+                        (t (c)
+                           (let ((%ran *jit-native-ran*)
+                                 (%infra *jit-infra-fallback*))
+                             (setq *jit-native-ran* %jnr-saved)
+                             (setq *jit-infra-fallback* %jif-saved)
+                             (if (and %ran (not %infra) (%condition-p c))
+                                 ;; User condition, after side effects
+                                 ;; began → propagate, never re-run.
+                                 (progn
+                                   (setq *e2-active-defun-names* %adn-saved)
+                                   (setq *jit-resignal-count*
+                                         (if *jit-resignal-count*
+                                             (+ 1 *jit-resignal-count*) 1))
+                                   (error c))
+                                 (progn
+                           (when (and %ran (not %infra))
+                             (setq *jit-r-native-escape*
+                                   (if *jit-r-native-escape*
+                                       (+ 1 *jit-r-native-escape*) 1)))
+                           (setq *jit-fallback-count*
+                                 (if *jit-fallback-count* (+ 1 *jit-fallback-count*) 1))
+                           (%mvm-wrap-escaping-result
+                             (mvm-interpret bc :entry-point entry
+                                            :function-table fn-table
+                                            :runtime-table rt-table
+                                            :return-raw nil
+                                            :lambda-offsets lam-offsets)
+                             bc fn-table rt-table lam-offsets))))))
+                      (%mvm-wrap-escaping-result
+                        (mvm-interpret bc :entry-point entry :function-table fn-table
+                                       :runtime-table rt-table :return-raw nil
+                                       :lambda-offsets lam-offsets)
+                        bc fn-table rt-table lam-offsets))))
+         (%mv *mvm-last-mv*)
+         ;; Cleared as soon as latched — see the sibling seam above.
+         (%mvclr (setq *mvm-last-mv* nil)))
+    (setq *e2-active-defun-names* %adn-saved)
+    ;; WS5 #203: restore the guard flags on the SUCCESS path too, or a
+    ;; completed native run leaves *jit-native-ran* set and the NEXT
+    ;; form's handler re-signals a setup failure it should have
+    ;; quietly interpreted.  After %mv is latched, as above.
+    (setq *jit-native-ran* %jnr-saved)
+    (setq *jit-infra-fallback* %jif-saved)
+    (if %mv
+        (if (eql (car %mv) 0)
+            (values)
+            (values-list (cons %prim (cdr %mv))))
+        %prim)))
+
 (defun %mvm-eval-forms-2 (forms)
+  (let ((%fslot nil) (%ftaint0 nil))
   ;; In-image: emit integer literals as fixnum-safe :li-halves (set the GLOBAL,
   ;; not a let-binding — compiled LET of a special may not establish a dynamic
   ;; binding the compiler's compile-integer reads).  Native builds never call
@@ -3469,6 +3676,20 @@
   (unless (and *opcode-table* (> (hash-table-count *opcode-table*) 0))
     (setq *opcode-table* (make-hash-table :test (quote eql)))
     (%populate-opcode-table))
+  ;; FASL cache replay (mvm/fasl.lisp): a module rebuilt from the cache arrives
+  ;; as (%FASL-MODULE-MARKER prepared) and runs with no compile at all.
+  (when (and (consp forms) (null (cdr forms)) (consp (car forms))
+             (eq (car (car forms)) '%fasl-module-marker))
+    (%eval-lock-drop-for-run)
+    (return-from mvm-eval-forms (%fasl-run-prepared (cadr (car forms)))))
+  ;; FASL cache record: the load loop's current form takes its slot at its
+  ;; FIRST outermost compile (nested evals -- macroexpanders -- never do).
+  (setq %fslot (and *fasl-slot*
+                    (eql *fasl-depth* (+ (if (integerp *fasl-base*) *fasl-base* 0) 1))
+                    (eql *fasl-outer* 1)
+                    *fasl-slot*))
+  (when %fslot (setq *fasl-slot* nil))
+  (setq %ftaint0 *fasl-taint*)
   ;; PERF Round 2 (compile-caching): if these FORMS are cacheable (no side-
   ;; effecting DEF*) and already compiled, re-interpret the cached module and
   ;; skip the whole compile pipeline.  Checked BEFORE the big let so a hit pays
@@ -3697,197 +3918,13 @@
                     ;; materialized #'SELF closure's slot-0 is very often 0),
                     ;; which is safe because slot-0 of a #x52 is never DATA.
                     (puthash off lam-offsets (quote :defun)))))
-            ;; WS3 def persistence: install each top-level user DEFUN as a
-            ;; re-entrant interp trampoline in BOTH global function tables —
-            ;; *symbol-function-table* by NAME (the mvm-eval native-call bridge's
-            ;; %mvm-resolve-runtime-fn key) and *native-sym-function-table* by
-            ;; HASH (symbol-function / funcall key).  The trampoline closes over
-            ;; BC so the module bytecode stays GC-alive; fn-table + lam-offsets
-            ;; are fully built by now; env = NIL (a top-level defun captures
-            ;; nothing).  A later (mvm-eval …) call OR the tree-walker now resolves f.
-            (when persist-names
-              (dolist (e all-ir)
-                (let ((pn (string (function-info-name (car e)))))
-                  (when (member pn persist-names :test (function string=))
-                    ;; WS5 #222 REDEFINITION INVALIDATION.  This is the ONLY
-                    ;; point at which PN's PREVIOUS binding is still visible —
-                    ;; the puthash below overwrites it, and by the time
-                    ;; %jit-install-native-fns runs (after the page is built)
-                    ;; the old value is already gone.  If the previous binding
-                    ;; was NATIVE code (tag nibble 3 — either build-time or a
-                    ;; #222 install), some exec page in *jit-page-cache* may
-                    ;; have BAKED that address into a `movabs rax, imm64; call
-                    ;; rax` site, and re-running that cached page would silently
-                    ;; call the SUPERSEDED definition.  Drop the whole page
-                    ;; cache so every cached module re-translates and
-                    ;; re-relocates against the new definition.
-                    ;;
-                    ;; This must happen even when the NEW definition ends up
-                    ;; being only a trampoline (a const-bearing body, or a
-                    ;; module whose relocation failed): the stale cached page
-                    ;; still holds the OLD native address and would keep
-                    ;; calling it — the first redefinition bug this feature
-                    ;; produced (`(defun f …)` twice, then the SAME call form
-                    ;; text, returned the second definition's answer for the
-                    ;; third definition).  A FIRST definition never invalidates
-                    ;; anything: no page can have baked an address for a name
-                    ;; that did not previously resolve to native code, so
-                    ;; loading a library pays nothing here.
-                    (let ((%prev (%mvm-resolve-runtime-fn pn)))
-                      (when (and %prev *jit-page-cache*
-                                 (eql (logand (%val->word %prev) 15) 3))
-                        (clrhash *jit-page-cache*)))
-                    ;; JIT-EAGER: remember this module so the DEFUN can be
-                    ;; compiled native later without re-evaluating anything.
-                    (%jit-register-module persist-names bc entry ft-list
-                                          fn-table rt-table lam-offsets)
-                    (let ((tramp (%mvm-make-trampoline
-                                   bc fn-table rt-table
-                                   (function-info-bytecode-offset (car e))
-                                   nil lam-offsets)))
-                      ;; puthash signature is (KEY HT VALUE) — store the
-                      ;; trampoline as the VALUE under PN / its name-hash.  (The
-                      ;; earlier `(puthash pn tramp <table>)` had HT and VALUE
-                      ;; swapped, so the closure was treated as the hash table and
-                      ;; nothing was actually stored — every later resolve of PF
-                      ;; returned NIL, so the trampoline never ran.)
-                      (when (boundp (quote *symbol-function-table*))
-                        (%jit-fnaddr-thunk-invalidate pn)
-                        (puthash pn *symbol-function-table* tramp))
-                      (when (boundp (quote *native-sym-function-table*))
-                        (puthash (compute-name-hash pn)
-                                 *native-sym-function-table* tramp)))))))
-            ;; PERF Round 2: cache the compiled module for these forms so a
-            ;; later mvm-eval of the same forms skips the whole compile.  bc is a
-            ;; fresh copy (mvm-buffer-used-bytes), safe despite buffer reuse.
-            (when (and %cacheable
-                       ;; OFF-MAIN, DO NOT CACHE — the tuple below was
-                       ;; allocated in THIS thread's region during the
-                       ;; compile, and the cache is region-0-reachable.
-                       ;; Measured as EXACTLY the last remaining
-                       ;; region-0 -> worker reference after the CL:INTERN
-                       ;; lock+copy fix.  See %MVM-ON-MAIN-THREAD-P.
-                       (%mvm-on-main-thread-p))
-              (setf (gethash forms *mvm-eval-cache*)
-                    ;; WS4-S5b: ft-list inserted at index 2 (see %mvm-eval-run-tuple
-                    ;; layout comment).  reverse → source order (fn-table order).
-                    (list bc entry (reverse ft-list) fn-table rt-table lam-offsets)))
-            ;; Conditions PROPAGATE (see %mvm-eval-run-tuple): production EVAL
-            ;; must let an error signalled by the form reach the caller's
-            ;; handler-case instead of returning (:interp-err e) as a value.
-            ;; The RESULT is wrapped when it is an in-module #x52 lambda
-            ;; closure (see %mvm-wrap-escaping-result) so `(eval '#'(lambda
-            ;; ...))` hands back a natively-funcallable, per-call-distinct
-            ;; function object.
-            ;; MULTIPLE VALUES propagate — same *mvm-last-mv* + values-list
-            ;; re-emission as %mvm-eval-run-tuple (see the comment there).
-            ;; *e2-active-defun-names* = persist-names for the duration of the
-            ;; run so fmakunbound honors source order vs the pre-run defun
-            ;; installation (see the defvar).  Lexical-save + setq-restore
-            ;; (nested mvm-eval during the run saves/restores its own).
-            ;; THE COMPILE IS OVER: drop the eval lock before running (see
-            ;; THE EVAL LOCK).
-            (%eval-lock-drop-for-run)
-            (let* ((%adn-saved *e2-active-defun-names*)
-                   ;; WS5 #203: the re-execution guard, same as in
-                   ;; %mvm-eval-run-tuple.  THIS is the site the doubling was
-                   ;; measured at (a top-level form calling a runtime-defined
-                   ;; function): the old `(t (c) ...interpret...)` answered a
-                   ;; condition raised AFTER the form's side effects had already
-                   ;; run by re-running the whole form.  Lexical-save +
-                   ;; setq-restore, matching %adn-saved directly above.
-                   (%jnr-saved *jit-native-ran*)
-                   (%jif-saved *jit-infra-fallback*)
-                   (%prim (progn
-                            (setq *e2-active-defun-names* persist-names)
-                            (setq *jit-native-ran* nil)
-                            (setq *jit-infra-fallback* nil)
-                            ;; WS4-S5b: JIT when enabled, interpret-fallback on a
-                            ;; SETUP failure (page-build fail / unsupported) or
-                            ;; the MV out-of-range residual — but NOT on a user condition
-                            ;; raised once native code is running.
-                            ;; %jit-active-p honors *jit-inhibit* (Class 3).
-                            ;; RETRY-ON-HOT: with *jit-hot-only* (default T), a
-                            ;; form's FIRST eval (this fresh-compile / cache-MISS
-                            ;; path) INTERPRETS; it is JIT'd only when eval'd AGAIN,
-                            ;; via the cache-HIT run-tuple path above (~2247), which
-                            ;; stays gated on %jit-active-p alone.  One-shot LOAD
-                            ;; forms (never re-eval'd; DEFUNs aren't even cacheable)
-                            ;; thus never pay JIT translation — fast loading — while
-                            ;; repeated forms go native on the second run.
-                            ;;
-                            ;; LAMBDA-BEARING FORMS SKIP RETRY-ON-HOT.  A one-shot
-                            ;; form is not one-shot CODE when it builds a closure
-                            ;; that outlives it: a DEFMETHOD's method function, a
-                            ;; DEFPARAMETER of a lambda, a hook pushed onto a list.
-                            ;; Interpreted, each of those is a trampoline that
-                            ;; re-enters mvm-interpret on EVERY call -- 3 us, against
-                            ;; 0.005 us native -- and no later pass revisits it:
-                            ;; %JIT-EAGER-ALL rebuilds DEFUN modules, and the form
-                            ;; that made the closure never runs again.  Measured on
-                            ;; warp's media player: every method body in the app
-                            ;; interpreted, a generic call 4.5 us, and a 40-row
-                            ;; layout 24 ms a frame.  So a module that compiled a
-                            ;; lambda body is JIT'd on its first run; if the page
-                            ;; cannot be built it interprets exactly as before.
-                            (if (and (%jit-active-p)
-                                     (or (not (%jit-hot-only-p))
-                                         %lam-bearing
-                                         (%mvm-forms-define-methods-p forms)))
-                                (handler-case
-                                    (%mvm-eval-jit-run bc entry (reverse ft-list)
-                                                    fn-table rt-table lam-offsets nil
-                                                    persist-names)
-                                  (t (c)
-                                     (let ((%ran *jit-native-ran*)
-                                           (%infra *jit-infra-fallback*))
-                                       (setq *jit-native-ran* %jnr-saved)
-                                       (setq *jit-infra-fallback* %jif-saved)
-                                       (if (and %ran (not %infra) (%condition-p c))
-                                           ;; User condition, after side effects
-                                           ;; began → propagate, never re-run.
-                                           (progn
-                                             (setq *e2-active-defun-names* %adn-saved)
-                                             (setq *jit-resignal-count*
-                                                   (if *jit-resignal-count*
-                                                       (+ 1 *jit-resignal-count*) 1))
-                                             (error c))
-                                           (progn
-                                     (when (and %ran (not %infra))
-                                       (setq *jit-r-native-escape*
-                                             (if *jit-r-native-escape*
-                                                 (+ 1 *jit-r-native-escape*) 1)))
-                                     (setq *jit-fallback-count*
-                                           (if *jit-fallback-count* (+ 1 *jit-fallback-count*) 1))
-                                     (%mvm-wrap-escaping-result
-                                       (mvm-interpret bc :entry-point entry
-                                                      :function-table fn-table
-                                                      :runtime-table rt-table
-                                                      :return-raw nil
-                                                      :lambda-offsets lam-offsets)
-                                       bc fn-table rt-table lam-offsets))))))
-                                (%mvm-wrap-escaping-result
-                                  (mvm-interpret bc :entry-point entry :function-table fn-table
-                                                 :runtime-table rt-table :return-raw nil
-                                                 :lambda-offsets lam-offsets)
-                                  bc fn-table rt-table lam-offsets))))
-                   (%mv *mvm-last-mv*)
-                   ;; Cleared as soon as latched — see the sibling seam above.
-                   (%mvclr (setq *mvm-last-mv* nil)))
-              (setq *e2-active-defun-names* %adn-saved)
-              ;; WS5 #203: restore the guard flags on the SUCCESS path too, or a
-              ;; completed native run leaves *jit-native-ran* set and the NEXT
-              ;; form's handler re-signals a setup failure it should have
-              ;; quietly interpreted.  After %mv is latched, as above.
-              (setq *jit-native-ran* %jnr-saved)
-              (setq *jit-infra-fallback* %jif-saved)
-              (if %mv
-                  (if (eql (car %mv) 0)
-                      (values)
-                      (values-list (cons %prim (cdr %mv))))
-                  %prim)))
+            (when %fslot
+              (%fasl-record %fslot forms bc entry ft-list fn-table rt-table lam-offsets
+                            persist-names %lam-bearing %ftaint0))
+            (%mvm-eval-publish-and-run forms bc entry ft-list fn-table rt-table
+                                       lam-offsets persist-names %lam-bearing %cacheable))
           :no-entry))))
-  )
+  ))
 ;; Single-expression convenience.
 (defun mvm-eval (form) (mvm-eval-forms (list form)))
 

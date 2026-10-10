@@ -5942,8 +5942,13 @@
   (when verbose
     (write-string "; loading from stream" *standard-output*)
     (write-char #\Newline *standard-output*))
-  (let ((eof-marker (cons 'eof nil))
-        (result t))
+  (let* ((eof-marker (cons 'eof nil))
+         (result t)
+         ;; FASL cache (mvm/fasl.lisp): only a FILE's text is cached -- read it
+         ;; whole, then replay or record it form by form.
+         (text (%fasl-stream-text stream))
+         (fx (and text (%fasl-open text)))
+         (read-failed nil))
     (loop
       ;; These T-clauses are the PRACTICAL BOTTOM of the handler-case
       ;; ladder for anything loaded at toplevel: a condition matching no
@@ -5952,7 +5957,7 @@
       ;; define-package and asdf find-system bugs).  Report loudly before
       ;; the unchanged fallback (read error -> fake EOF stops the load;
       ;; eval error -> NIL and continue).  Control flow is unchanged.
-      (let ((form (handler-case (read stream nil eof-marker)
+      (let ((form (handler-case (if fx (%fasl-read fx eof-marker) (read stream nil eof-marker))
                     (t (c)
                        (%report-escaping-condition "load-read-error-stops-load")
                        ;; Record it too: a read error already stops the load,
@@ -5960,10 +5965,13 @@
                        ;; (SBCL exits 1 on a malformed --script).
                        (when *load-abort-on-error*
                          (setq *load-error-condition* c))
+                       (setq read-failed t)
                        eof-marker))))
-        (when (eq form eof-marker) (return t))
+        (when (eq form eof-marker)
+          (%fasl-close fx (not read-failed))
+          (return t))
         (let ((val (handler-case (handler-bind ((warning #'%load-report-warning))
-                                   (eval form))
+                                   (if fx (%fasl-eval fx form) (eval form)))
                      (t (c)
                         (%report-escaping-condition "load-toplevel-form-swallowed")
                         ;; NAME THE FORM.  A swallowed toplevel form that reports

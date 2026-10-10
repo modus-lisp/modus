@@ -618,8 +618,22 @@
       (ip-send dst-ip 6 seg tcp-len)
       (spin-unlock (+ (ssh-ipc-base) #x60430)))))
 
+;; A segment must fit one Ethernet frame: TCP-SEND-SEGMENT-CONN builds it in a
+;; 1480-byte array and hands it to the NIC whole, so a longer payload overran
+;; both (an SSH reply over ~1400 bytes never arrived).  Split at 1360 bytes,
+;; which also stays under the MSS of tunnelled paths.
 (defun tcp-send-conn (cb data len)
-  (tcp-send-segment-conn cb 24 data len))
+  (if (<= len 1360)
+      (tcp-send-segment-conn cb 24 data len)
+      (let ((off 0))
+        (loop
+          (when (>= off len) (return ()))
+          (let ((n (- len off)))
+            (when (> n 1360) (setq n 1360))
+            (let ((chunk (make-array n)))
+              (dotimes (i n) (aset chunk i (aref data (+ off i))))
+              (tcp-send-segment-conn cb 24 chunk n))
+            (setq off (+ off n)))))))
 
 (defun tcp-ack-conn (cb)
   (tcp-send-segment-conn cb 16 (make-array 0) 0))
@@ -643,6 +657,13 @@
       (setq i (+ i 1)))))
 
 (defun net-deliver-data (conn buf pkt-len tcp-flags)
+  ;; RST or FIN from the client of the connection being served: it is gone (or
+  ;; sends nothing more), so the SSH waits stop waiting (SSH-PEER-CLOSED-P).
+  ;; Without this a dead client held the single-threaded server for a whole
+  ;; wait timeout, and SYNs that queued while it booted each became one.
+  (when (and (not (zerop (logand tcp-flags 5)))
+             (eq conn (mem-ref (+ (ssh-ipc-base) #x60448) :u32)))
+    (setf (mem-ref (+ (ssh-ipc-base) #x60458) :u32) 1))
   (let ((cb (conn-base conn))
         (ssh (conn-ssh conn)))
     (let ((ip-total (buf-read-u16-mem buf 16))
@@ -702,11 +723,19 @@
             (when (eq (mem-ref (+ b2 12) :u8) #x08)
               (when (eq (mem-ref (+ b2 13) :u8) 0)
                 (when (eq (mem-ref (+ b2 23) :u8) 6)
-                  (let ((f2 (mem-ref (+ b2 47) :u8)))
-                    ;; Accept ONLY a real ACK (ACK set, SYN clear) — a SYN
-                    ;; retransmit must not be mistaken for the handshake ACK.
-                    (when (and (eq (logand f2 #x10) #x10)
-                               (zerop (logand f2 #x02)))
+                  (let ((f2 (mem-ref (+ b2 47) :u8))
+                        (mine (eq (buf-read-u16-mem b2 34) (mem-ref (+ cb #x008) :u32))))
+                    ;; An RST from THIS client: it gave up (its SYN was stale).
+                    ;; Stop now; the SSH waits see the flag and return at once.
+                    (when (and mine (not (zerop (logand f2 #x04))))
+                      (setf (mem-ref (+ (ssh-ipc-base) #x60458) :u32) 1)
+                      (setq tries 100000))
+                    ;; Accept ONLY a real ACK (ACK set, SYN clear) from THIS
+                    ;; client -- a SYN retransmit, or another connection's
+                    ;; segment, must not be mistaken for the handshake ACK.
+                    (when (and mine
+                               (eq (logand f2 #x10) #x10)
+                               (zerop (logand f2 #x06)))
                       (setf (mem-ref cb :u32) 2)
                       (setq acked 1)
                       ;; Deliver any piggybacked data
@@ -734,6 +763,7 @@
 ;; Calls ssh-connection-handler directly instead of actor-spawn
 (defun net-accept-connection (src-ip src-port dst-port buf)
   (let ((conn (conn-alloc)))
+    (setf (mem-ref (+ (ssh-ipc-base) #x60458) :u32) 0)   ; peer-closed flag
     (when (not (= conn (- 0 1)))
       (conn-init conn dst-port src-port src-ip)
       ;; Clear protocol type (uninitialized RAM on real hardware)
@@ -767,7 +797,10 @@
                 (setf (mem-ref (+ ssh #x2C) :u32)
                       (+ src-port (* src-ip 7))))
               (setf (mem-ref (+ (ssh-ipc-base) #x60448) :u32) conn)
-              (ssh-connection-handler conn)))))))
+              (ssh-connection-handler conn)
+              ;; The server's X25519 key is pre-computed (slow boards); never
+              ;; let a second connection reuse it.
+              (ssh-refresh-ephemeral)))))))
 
 (defun conn-handler-fn (conn)
   (if (eq conn 0) (hash-of "ssh-handler-0")

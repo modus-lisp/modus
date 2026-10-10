@@ -3,7 +3,7 @@
 The goal: boot Modus on VPSBG's SEV-SNP VPS, reach it over key-only SSH, and
 fetch an attestation report whose measurement covers our image.
 
-**Where it stands: done, once, end to end (2026-10-10 02:20 UTC).** Booted
+**Where it stands: attested SSH works end to end (2026-10-10 03:33 UTC); see the next section.  First report: 02:20 UTC.** Booted
 through VPSBG measured boot (UKI image 369, `-kernel`, kernel hashes), Modus
 answered key-only SSH 34 s after the restart, and over that SSH asked the PSP
 for a report with `report_data` = 64 x `09`.  `test/snp/verify-report.py`:
@@ -18,6 +18,51 @@ guest features 0x1, `--append ''`).  The current tree rebuilds that image
 byte-for-byte (`cmp`), given the same `MODUS_SSH_*_KEY_HEX`.  What changed to get
 here is in "Session 2026-10-10" below.  All work is **uncommitted** in
 `~/modus-wt`, branch `virtio-net` (HEAD `30b9327`).
+
+## Attested SSH, end to end (2026-10-10 03:33 UTC)
+
+`test/snp/attested-ssh-client.sh 87.120.37.135 22 --measurement <expected>
+--vcek vcek.pem --chain chain.pem` against UKI image 373, exit 0: the host key
+OpenSSH recorded in the handshake == the key the server printed;
+`report_data` == SHA-512 of it; measurement
+`f29c4eb4...c13205` == `sev-snp-measure` offline; VCEK signature valid and
+chained to ARK-Milan.  The whole report comes back in ONE exec reply.  On that
+boot `(snp-active-p)` = T and `(%hw-random32)` returns RDRAND values.  Evidence
+in `tmp/vpsbg/2026-10-10/attested-ssh-*`.  What it took, after the first report:
+
+8. **TCP segmentation** (`net/ip.lisp`, `tcp-send-conn`): payloads are split
+   at 1360 bytes.  A segment was built in a fixed 1480-byte array and sent as
+   one frame, so any SSH reply over ~1400 bytes overran both and never arrived.
+9. **The server's ephemeral key was a constant.**  `ssh-random` (a 32-bit
+   xorshift) keeps its state at `ssh+0x2C`; `ssh-seed-random` wrote its seed to
+   `e1000-state+0x62C`, which nothing reads, and `ssh-boot` zeroes the state, so
+   the generator began at 12345 on every boot -- and `pre-compute-server-eph`
+   made the X25519 "ephemeral" key from it ONCE and reused it for every
+   connection.  Anyone with the source could compute it and decrypt recorded
+   sessions.  Now: the boot installs an RDRAND routine at `0x1D000` (CPUID
+   checked; a tagged pointer at `0x1D100`, like the SNP VMGEXIT routine), and
+   the x64 CL image's `ssh-random` (`net/ssh-x64-cl.lisp`) is SHA-512 in counter
+   mode over a 512-bit RDRAND key.  Under SNP there is NO fallback (the host
+   drives the PIT and TSC): no RDRAND, no keys.  Off SNP it falls back to
+   PIT/TSC and says so on serial.  And `ssh-refresh-ephemeral` replaces the key
+   after every connection whose key exchange used it (shared code).
+10. **Dead clients.**  The single-threaded server drops SYNs while it serves a
+   connection, so a client that is gone holds everyone else off until a wait
+   expires -- and fix 6 had made those waits ~17 s.  Now an RST or FIN from the
+   client being served ends its waits at once (`ssh-peer-closed-p`, flag at
+   `ssh-ipc+0x60458`; `net-wait-ack` sees the RST too, and accepts only ITS
+   client's ACK), the version wait on x64 is ~2 s (2^32 cycles: a NAT that
+   forgot the mapping eats our SYN-ACK, so no RST ever comes), and frames that
+   queued in the RX ring before the server listened are dropped.  Measured with
+   a fake gateway (stale SYNs during boot, three clients that answer the SYN-ACK
+   with RST, then a real one, all retransmitting SYNs once a second): the real
+   client's banner after **18.1 s** before, **1.0 s** after.
+
+**Still open, security:** the Pi / aarch64 SSH images still use the generic
+`ssh-random` -- the boot-time ephemeral key from the constant state, later ones
+from a state seeded with the client's address and port.  They need the same
+treatment with their own hardware RNG (BCM2835 RNG).  TCP's initial sequence
+number is the constant 1000 on every connection.
 
 ## Session 2026-10-10: from "idle in kernel-main" to a verified report
 
@@ -95,20 +140,13 @@ verified with the matching digest above.
 
 **Open, found on the way:**
 
-* **An SSH reply longer than ~1400 characters never arrives** (2368 hangs, 1400
-  works; reproduced locally).  The report is fetched as six 400-char slices of
-  a global.  Over the real network, after one 1000-char reply the next two
-  replies were empty.
+* ~~An SSH reply longer than ~1400 characters never arrives~~ -- fixed (8).
 * **A shell session holds the server forever**: once authenticated it never
   times out and the TCP layer ignores FIN.  Use `ssh host "(form)"` (an exec
   request: the server sends exit-status/EOF/CLOSE and frees itself).
-* **The SSH server's entropy is the PIT counter** (`arch-seed-random`, port
-  0x40).  Under SNP the hypervisor emulates the PIT, so it chooses the
-  "random" values the server's ephemeral keys come from.  For an attested SSH
-  this must be RDRAND/RDSEED, which the host cannot see or steer.
-* **`report_data` is not yet bound to the host key.**  `verify-report.py`
-  expects SHA-512 of the Ed25519 host public key there; this run passed 64 x
-  `09`.  Binding it is what turns "a report" into "attested SSH".
+* ~~The SSH server's entropy is the PIT counter~~ -- RDRAND on x64 (9).
+* ~~`report_data` is not yet bound to the host key~~ -- `snp-attest-ssh` binds
+  it, and the client checks it (section above).
 * The first `snp-attestation-report` on one boot took more than 60 s, on
   another 2 s.  Not investigated.
 * `(%snp-build-mode)` gives no reply when evaluated over SSH.
@@ -230,18 +268,14 @@ computation exactly (top of this file).
 
 ## Next steps
 
-1. Commit the branch (everything here is uncommitted).
-2. Bind `report_data` to SHA-512 of the SSH host public key, so a client can
-   check the key it is talking to against the report (`verify-report.py
-   --hostkey`); and take the server's entropy from RDRAND/RDSEED.
-3. Fix the long-reply hang in the SSH server, then fetch the report in one go.
-4. Rebuild with the measured-boot UKI flow in a script (make-uki, expected
-   digest, upload, attach, attest, detach); today it is the commands quoted in
-   this file's history.  Image 369 is still uploaded (auto-removed after two
-   days unattached); the server is back on disk boot / Ubuntu.
-
-(Superseded 2026-10-10: the `%init-make-load-form` bisect.  The idle there was
-fix 1/2 above, found by poisoning RAM locally rather than by splitting the call.)
+1. Give the Pi / aarch64 SSH images a real RNG and the per-connection key
+   (see "Still open, security").  Random ISNs.
+2. Script the measured-boot round (UKI, expected digest, upload, attach, wait
+   for the Modus banner, attested client, detach).  Today it is the commands in
+   this file's history.  Image 373 is uploaded (auto-removed after two days
+   unattached); the server is back on disk boot / Ubuntu.
+3. The SSH server serves one connection at a time and drops SYNs meanwhile;
+   clients get in by retransmitting.  Fine for one operator, not for a service.
 
 ## Traps found on the way
 

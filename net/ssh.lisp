@@ -523,7 +523,7 @@
   (let ((got-version 0) (tries 0) (since (ssh-preauth-clock)))
     (loop
       (when (not (zerop got-version)) (return 1))
-      (when (ssh-wait-expired-p tries 50 since) (return 0))
+      (when (ssh-version-wait-expired-p tries since) (return 0))
       ;; Wait for data from net-actor
       (let ((msg (ssh-wait-data ssh)))
         (when (zerop msg) (return 0)))
@@ -708,7 +708,9 @@
   ;; Parse client's ephemeral public key at offset 1 (skip msg type)
   (let ((cli-eph (make-array 32)))
     (dotimes (i 32) (aset cli-eph i (aref kex-init-payload (+ 5 i))))
-    ;; Use pre-computed server ephemeral key pair (from state+0x6C4/0x6E4)
+    ;; Use pre-computed server ephemeral key pair (from state+0x6C4/0x6E4),
+    ;; and mark it spent so SSH-REFRESH-EPHEMERAL replaces it.
+    (setf (mem-ref (+ (ssh-ipc-base) #x6045C) :u32) 1)
     (let ((state (e1000-state-base)))
       (let ((srv-priv (make-array 32)))
         (dotimes (i 32)
@@ -1684,6 +1686,14 @@
         ;; Mark as pre-computed
         (setf (mem-ref (+ state #x6C0) :u32) 1)))))
 
+;; A fresh server ephemeral key for the NEXT connection.  It is pre-computed so
+;; a slow board does not pay for it inside a handshake, but reusing one key for
+;; every connection gives up forward secrecy, so each connection retires it.
+(defun ssh-refresh-ephemeral ()
+  (when (= (mem-ref (+ (ssh-ipc-base) #x6045C) :u32) 1)   ; only if a KEX used it
+    (setf (mem-ref (+ (ssh-ipc-base) #x6045C) :u32) 0)
+    (pre-compute-server-eph (conn-ssh 0))))
+
 ;; Pre-compute X25519 server ephemeral key pair.
 ;; Stores private key at state+0x6C4, public key at state+0x6E4.
 (defun pre-compute-server-eph (ssh)
@@ -1850,6 +1860,7 @@
     (setf (mem-ref flag-addr :u32) 1)
     (loop
       (when (zerop (mem-ref flag-addr :u32)) (return ()))
+      (when (ssh-peer-closed-p) (return ()))
       ;; A connection that has NOT authenticated (ssh+0x10 = 0) is dropped
       ;; once it has been idle for SSH-PREAUTH-EXPIRED-P.  The server is single-
       ;; threaded and the TCP layer records no FIN, so a client that hangs
@@ -1879,7 +1890,11 @@
 ;; clock at the start of the wait.  The default is the count alone (unchanged);
 ;; a target with a usable counter overrides both (the x64 CL image: TSC).
 (defun ssh-preauth-clock () 0)
-(defun ssh-wait-expired-p (count limit since) (> count limit))
+(defun ssh-peer-closed-p () (= (mem-ref (+ (ssh-ipc-base) #x60458) :u32) 1))
+(defun ssh-wait-expired-p (count limit since)
+  (or (ssh-peer-closed-p) (> count limit)))
+;; The wait for the client's version string, the first thing it sends.
+(defun ssh-version-wait-expired-p (count since) (ssh-wait-expired-p count 50 since))
 
 ;; The next packet, waiting as long as SSH-WAIT-EXPIRED-P allows; NIL on timeout.
 (defun ssh-await-packet (ssh)

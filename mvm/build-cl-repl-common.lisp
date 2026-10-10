@@ -1065,25 +1065,14 @@
 (defun actor-init () 0)
 ")
 
-;; :X64 -- SSH waits measured in TSC cycles, not poll counts (net/ssh.lisp,
-;; SSH-WAIT-EXPIRED-P).  A wait still needs its poll count AND 2^35 cycles
-;; (10-17 s at 2-3.5 GHz): on the SNP VPS a native 50000-try poll took ~15 ms
-;; and the server closed every connection right after the client's KEXINIT.
-;; Bare x64 has no counter rate (CNTFRQ is 0 there), hence a cycle budget.
-;; Spliced after ssh.lisp so it wins by last-defun-wins.
-(defvar *ssh-x64-wait-source*
-  "(defun ssh-preauth-clock () (rdtsc))
-(defun ssh-wait-expired-p (count limit since)
-  (and (> count limit) (> (- (rdtsc) since) 34359738368)))
-")
-
 (defvar *ssh-transport-source*
   (if *ssh-build-p*
       (concatenate 'string
         *ssh-addr-map-source*                     (string #\Newline)
         (if *cl-repl-x64-p* *ssh-x64-actor-stubs* (%rpi-net-text "actors.lisp")) (string #\Newline)
         (%rpi-net-text "ssh.lisp")                (string #\Newline)
-        (if *cl-repl-x64-p* *ssh-x64-wait-source* "") (string #\Newline)
+        ;; :X64 overrides of ssh.lisp: TSC-timed waits, RDRAND-keyed SSH-RANDOM.
+        (if *cl-repl-x64-p* (%rpi-net-text "ssh-x64-cl.lisp") "") (string #\Newline)
         "(defun native-eval (form) (eval form))"  (string #\Newline)
         ;; ssh-handle-connection fix + trace live in net/ssh.lisp.
         ;; FIX: single-threaded server handles ONE connection at a time.  Guard
@@ -1207,7 +1196,8 @@
 " (%lisp-spin-form "ssh-keyed") "  (pre-compute-host-sign)
 " (%lisp-spin-form "ssh-signed") "  (pre-compute-server-eph (conn-ssh 0))
   (write-string-serial \"NETUP\") (write-char-serial 10)
-" (%lisp-spin-form "ssh-netup") "  (net-actor-main))")
+" (%lisp-spin-form "ssh-netup") "  (let ((n 0)) (loop (when (or (zerop (e1000-receive)) (> n 2000)) (return ())) (setq n (+ n 1))))
+  (net-actor-main))")
         "(defun ssh-boot ()
   (let ((s (e1000-state-base))) (dotimes (i 1024) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
   (let ((s (ssh-ipc-base))) (dotimes (i 76800) (setf (mem-ref (+ s (* i 8)) :u64) 0)))

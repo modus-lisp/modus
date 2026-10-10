@@ -338,16 +338,22 @@
 ;;; %THR-TRAMPOLINE has already installed its own.  A last-defun-wins override
 ;;; of net/hosted-actors-post.lisp's definition, here because %TLS-INSTALL is
 ;;; defined in this file; the x86-64 arm is that definition verbatim.
+;;;
+;;; AND ON x86-64 TOO (2026-10-10).  Without its own window such a thread shares
+;;; the MAIN thread's multiple-value buffer and handler-frame stack: its
+;;; epilogues store MV counts into main's, so a MULTIPLE-VALUE-BIND on main
+;;; read a secondary value as NIL whenever the two interleaved.  Measured on
+;;; test/hosted-blocking-receive.lisp: main's (FLOOR ms 1000) inside %SLEEP-MS
+;;; got NIL for its remainder -- silent until comparisons began refusing NIL,
+;;; then about one run in three died there.  The block is prepared from this
+;;; thread before arming, as %TLS-PREPARE-BLOCK does for a cloned one.
 (defun %ha-percpu-init-cpu (base cpu)
-  (%layout-if :a64-threads
-    (if (and (> cpu 0) (zerop (%tls-self-base)) (not (zerop (%tls-install cpu))))
-        -1
-        (let ((r (%arch-set-percpu-base base)))
-          (if (zerop r) (percpu-set 16 cpu) 0)
-          r))
-    (let ((r (%arch-set-percpu-base base)))
-      (if (zerop r) (percpu-set 16 cpu) 0)
-      r)))
+  (if (and (> cpu 0) (zerop (%tls-self-base))
+           (progn (%tls-prepare-block cpu) (not (zerop (%tls-install cpu)))))
+      -1
+      (let ((r (%arch-set-percpu-base base)))
+        (if (zerop r) (percpu-set 16 cpu) 0)
+        r)))
 
 ;;; ============================================================
 ;;; CLOCKS

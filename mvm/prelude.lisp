@@ -1246,6 +1246,24 @@
 ;; At 0 we print "..." once and stop. Set to big positive to not bound.
 (defvar *write-object-budget* 0)
 
+(defun %write-bignum-dec (n)
+  "Write integer N (a bignum) in decimal to the serial console."
+  (let ((chunks nil) (m (if (< n 0) (- n) n)))
+    (when (< n 0) (write-char-serial 45))
+    (loop
+      (multiple-value-bind (q r) (floor m 1000000000000000000)
+        (setq chunks (cons r chunks))
+        (setq m q)
+        (when (= m 0) (return nil))))
+    (print-dec (car chunks))
+    (dolist (c (cdr chunks))
+      (let ((d 100000000000000000))           ; zero-pad to 18 digits
+        (loop
+          (when (or (<= d 1) (>= c d)) (return nil))
+          (write-char-serial 48)
+          (setq d (floor d 10))))
+      (print-dec c))))
+
 (defun write-object (obj)
   "Print a Lisp object to serial output (prin1-style).
    Bounded by *write-object-budget* if positive.
@@ -1334,6 +1352,13 @@
             (write-object (aref obj i))
             (setq i (+ i 1))))
         (write-char-serial 41))
+       ((and (not (fixnump obj)) (not (consp obj)) (not (null obj))
+             (= (obj-subtag obj) #x30))
+        ;; Bignum, in decimal: 18-digit chunks by FLOOR, most significant
+        ;; first, the later ones zero-padded.  It printed as #<?48> (48 = #x30,
+        ;; the bignum subtag), so every bignum at the bare REPL looked like a
+        ;; corrupt object -- which is how a real one (a lost limb array) hid.
+        (%write-bignum-dec obj))
        ((characterp obj)
         ;; #\X (print the literal character after a #\ prefix)
         (write-char-serial 35) (write-char-serial 92)

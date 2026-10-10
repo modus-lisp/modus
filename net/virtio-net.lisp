@@ -8,6 +8,11 @@
 ;;;; with no modern capabilities (QEMU disable-modern=on) is reported and
 ;;;; refused, and the E1000 is probed instead.
 ;;;;
+;;;; UNDER SEV-SNP the device's registers are never loaded or stored directly:
+;;;; VNET-DEV-READ / -WRITE ask the hypervisor through the GHCB
+;;;; (net/snp-ghcb.lisp).  The rings and buffers it DMAs are already in the
+;;;; shared (C=0) region (net/arch-x86-cl.lisp).
+;;;;
 ;;;; Same contract as net/e1000.lisp, because net/ip.lisp, http-client.lisp and
 ;;;; the SSH server only ever call these four names:
 ;;;;   e1000-probe     find + initialise a NIC
@@ -102,6 +107,32 @@
   (+ (mem-ref addr :u32) (vnet-hi32 (mem-ref (+ addr 4) :u32))))
 
 ;; ------------------------------------------------------------------
+;; Device registers.  EVERY access to the device's MMIO (common config,
+;; notify, device config) goes through these three, and nothing else does:
+;; driver state, rings and page tables are ordinary memory.  Under SEV-SNP a
+;; plain load or store to a device register is a #VC the stub cannot service,
+;; so there the access is made by the hypervisor through the GHCB
+;; (net/snp-ghcb.lisp, SNP-MMIO-READ / -WRITE).  SIZE is 1, 2 or 4.
+;; ------------------------------------------------------------------
+(defun vnet-dev-read (addr size)
+  (cond ((snp-mmio-p) (snp-mmio-read addr size))
+        ((= size 1) (mem-ref addr :u8))
+        ((= size 2) (mem-ref addr :u16))
+        (t (mem-ref addr :u32))))
+
+(defun vnet-dev-write (addr size v)
+  (cond ((snp-mmio-p) (snp-mmio-write addr size v))
+        ((= size 1) (setf (mem-ref addr :u8) v))
+        ((= size 2) (setf (mem-ref addr :u16) v))
+        (t (setf (mem-ref addr :u32) v))))
+
+;; A 64-bit device field as two 32-bit writes, high half first (virtio 4.1.3.1
+;; allows a driver to write 64-bit fields as two 32-bit halves).
+(defun vnet-dev-write64 (addr v)
+  (vnet-dev-write (+ addr 4) 4 (vnet-hi-of v))
+  (vnet-dev-write addr 4 (logand v #xFFFFFFFF)))
+
+;; ------------------------------------------------------------------
 ;; MMIO above 4 GB.  The boot stub identity-maps exactly the first 4 GB with
 ;; 2 MB pages (PML4 0x10000, PDPT 0x11000, PDs 0x12000-0x15FFF), and OVMF puts
 ;; a 64-bit BAR — which a modern virtio device's is — in its 64-bit window,
@@ -164,6 +195,13 @@
         (setq pa (+ pa #x200000))))))
 
 (defun vnet-map-mmio (addr len)
+  (cond
+    ;; Under SNP the hypervisor makes every register access (VNET-DEV-READ),
+    ;; so the guest needs no mapping of the BAR at all.
+    ((snp-mmio-real-p) 1)
+    (t (vnet-map-mmio-direct addr len))))
+
+(defun vnet-map-mmio-direct (addr len)
   (if (<= (+ addr len) #x100000000)
       (vnet-map-low-mmio addr len)
       ;; PML4[0] must point at the PDPT at 0x11000 (present).  Mask the low 12
@@ -245,29 +283,29 @@
 ;; ------------------------------------------------------------------
 ;; Device bring-up (virtio 1.x, 3.1.1)
 ;; ------------------------------------------------------------------
-(defun vnet-status () (mem-ref (+ (vnet-common) #x14) :u8))
-(defun vnet-set-status (s) (setf (mem-ref (+ (vnet-common) #x14) :u8) s))
+(defun vnet-status () (vnet-dev-read (+ (vnet-common) #x14) 1))
+(defun vnet-set-status (s) (vnet-dev-write (+ (vnet-common) #x14) 1 s))
 
 ;; Program queue Q at DESC/AVAIL/USED; record size and notify address at
 ;; state +SZOFF / +NOFF.  Returns the size used, or 0.
 (defun vnet-setup-queue (q desc avail used szoff noff)
   (let ((c (vnet-common)))
-    (setf (mem-ref (+ c #x16) :u16) q)                ; queue_select
-    (let ((max (mem-ref (+ c #x18) :u16)))            ; queue_size (= device max)
+    (vnet-dev-write (+ c #x16) 2 q)                   ; queue_select
+    (let ((max (vnet-dev-read (+ c #x18) 2)))         ; queue_size (= device max)
       (if (zerop max)
           0
           (let ((qs (if (< max (vnet-qmax)) max (vnet-qmax))))
-            (setf (mem-ref (+ c #x18) :u16) qs)
-            (setf (mem-ref (+ c #x1A) :u16) #xFFFF)   ; queue_msix_vector = NO_VECTOR
-            (vnet-write64 (+ c #x20) desc)            ; queue_desc
-            (vnet-write64 (+ c #x28) avail)           ; queue_driver
-            (vnet-write64 (+ c #x30) used)            ; queue_device
+            (vnet-dev-write (+ c #x18) 2 qs)
+            (vnet-dev-write (+ c #x1A) 2 #xFFFF)      ; queue_msix_vector = NO_VECTOR
+            (vnet-dev-write64 (+ c #x20) desc)        ; queue_desc
+            (vnet-dev-write64 (+ c #x28) avail)       ; queue_driver
+            (vnet-dev-write64 (+ c #x30) used)        ; queue_device
             (setf (mem-ref (vnet-st szoff) :u32) qs)
             (setf (mem-ref (vnet-st noff) :u64)
                   (+ (mem-ref (vnet-st #x10) :u64)
-                     (* (mem-ref (+ c #x1E) :u16)      ; queue_notify_off
+                     (* (vnet-dev-read (+ c #x1E) 2)   ; queue_notify_off
                         (mem-ref (vnet-st #x28) :u32))))
-            (setf (mem-ref (+ c #x1C) :u16) 1)        ; queue_enable
+            (vnet-dev-write (+ c #x1C) 2 1)           ; queue_enable
             qs)))))
 
 (defun vnet-zero (addr n)
@@ -281,6 +319,8 @@
 
 (defun vnet-init ()
   (let ((c (vnet-common)))
+    (when (snp-mmio-p)
+      (write-string-serial "VNET:MMIO via GHCB") (write-char-serial 10))
     ;; 1. reset, and wait for it to read back 0
     (vnet-set-status 0)
     (dotimes (i 100000)
@@ -292,20 +332,20 @@
     ;;    ACCESS_PLATFORM is what an SEV host offers (iommu_platform=on): it
     ;;    means "DMA addresses are platform addresses", which with no IOMMU and
     ;;    rings in the shared region is exactly what this driver hands it.
-    (setf (mem-ref c :u32) 0)
-    (let ((f0 (mem-ref (+ c 4) :u32)))
-      (setf (mem-ref c :u32) 1)
-      (let ((f1 (mem-ref (+ c 4) :u32)))
+    (vnet-dev-write c 4 0)                            ; device_feature_select
+    (let ((f0 (vnet-dev-read (+ c 4) 4)))
+      (vnet-dev-write c 4 1)
+      (let ((f1 (vnet-dev-read (+ c 4) 4)))
         (write-string-serial "VNET:FEAT=") (print-hex32 f1) (print-hex32 f0)
         (write-char-serial 10)
         (if (zerop (logand f1 1))
             (vnet-fail "no VERSION_1")
             (let ((want0 (logand f0 #x20))
                   (want1 (logand f1 3)))
-              (setf (mem-ref (+ c 8) :u32) 0)
-              (setf (mem-ref (+ c #x0C) :u32) want0)
-              (setf (mem-ref (+ c 8) :u32) 1)
-              (setf (mem-ref (+ c #x0C) :u32) want1)
+              (vnet-dev-write (+ c 8) 4 0)            ; driver_feature_select
+              (vnet-dev-write (+ c #x0C) 4 want0)
+              (vnet-dev-write (+ c 8) 4 1)
+              (vnet-dev-write (+ c #x0C) 4 want1)
               ;; 4. FEATURES_OK, and check it stuck
               (vnet-set-status 11)
               (if (zerop (logand (vnet-status) 8))
@@ -313,7 +353,7 @@
                   (vnet-init-queues want0))))))))
 
 (defun vnet-init-queues (want0)
-  (let ((nq (mem-ref (+ (vnet-common) #x12) :u16)))
+  (let ((nq (vnet-dev-read (+ (vnet-common) #x12) 2)))
     (vnet-zero (virtio-net-ring-base) #x6000)
     (if (< nq 2)
         (vnet-fail "fewer than 2 queues")
@@ -350,7 +390,7 @@
                 (setf (mem-ref (vnet-st #x64) :u32) 0)
                 ;; 5. DRIVER_OK, then tell the device the RX buffers are there.
                 (vnet-set-status 15)
-                (setf (mem-ref (mem-ref (vnet-st #x30) :u64) :u16) 0)
+                (vnet-dev-write (mem-ref (vnet-st #x30) :u64) 2 0)
                 (write-string-serial "VNET:Q=") (print-dec rq) (write-char-serial 47)
                 (print-dec tq) (write-string-serial " STATUS=") (print-hex-byte (vnet-status))
                 (write-char-serial 10)
@@ -365,7 +405,7 @@
       (setf (mem-ref (+ state 8 i) :u8)
             (if (or (zerop want0) (zerop dc))
                 (if (= i 0) 2 (if (= i 5) 1 0))
-                (mem-ref (+ dc i) :u8))))
+                (vnet-dev-read (+ dc i) 1))))
     (write-string-serial "MAC:")
     (dotimes (i 6)
       (when (> i 0) (write-char-serial 58))
@@ -407,8 +447,8 @@
 ;; ------------------------------------------------------------------
 ;; Data path
 ;; ------------------------------------------------------------------
-(defun vnet-notify (noff) (setf (mem-ref (mem-ref (vnet-st noff) :u64) :u16)
-                                (if (= noff #x30) 0 1)))
+(defun vnet-notify (noff)
+  (vnet-dev-write (mem-ref (vnet-st noff) :u64) 2 (if (= noff #x30) 0 1)))
 
 ;; Send LEN bytes of BUF.  Waits for the device to consume it, like
 ;; e1000-hw-send.  Returns 1 when the device reported it used, else 0.

@@ -306,6 +306,11 @@
 
     ;; ================= fatal =================
     (sa-label a :fatal)
+    ;; MODUS_SNP_VC_FATAL=spin (diagnostic): spin here instead, so a host that
+    ;; can only see CPU load tells an unhandled #VC (100%) from any other halt.
+    (when (equal #+sbcl (sb-ext:posix-getenv "MODUS_SNP_VC_FATAL") #-sbcl nil "spin")
+      (format t "~&;; SNP #VC handler: fatal path SPINS~%")
+      (sa a #xEB #xFE))
     (ecase mode
       (:snp  ;; GHCB MSR terminate request, then halt
        (sa a #xB9) (sa-u32 a +msr-ghcb+)
@@ -436,6 +441,27 @@
     (let ((bytes (sa-finish a)))
       (loop for b across bytes do (mvm-emit-byte buf b)))))
 
+(defconstant +snp-secrets-copy-addr+ #x1C000
+  "Where EMIT-SNP-SAVE-SECRETS parks the secrets page: free low RAM above the
+   fb words/font page (0x1B000) and below the image.")
+
+(defun emit-snp-save-secrets (buf)
+  "After ExitBootServices and BEFORE the kernel copy to 0x100000: copy the 4 KB
+   secrets page to +SNP-SECRETS-COPY-ADDR+ and point +SNP-SECRETS-ADDR+ at the
+   copy.  OVMF keeps it in its MEMFD at ~0x80D000 (the VPS's e820 shows
+   0x80D000..0x80FFFF reserved), which is inside the range a 47 MB CL image is
+   copied over, so the VMPCK keys were destroyed before Lisp could read them.
+   Nothing when no CC blob was found (secrets = 0).  Clobbers RSI RDI RCX."
+  (let ((a (make-snp-asm)))
+    (sa a #x48 #x8B #x34 #x25) (sa-u32 a +snp-secrets-addr+)                ; mov rsi,[secrets]
+    (sa a #x48 #x85 #xF6) (sa-jcc a :e :end)                                 ; test rsi,rsi ; jz end
+    (sa a #x48 #xC7 #xC7) (sa-u32 a +snp-secrets-copy-addr+)                 ; mov rdi, copy
+    (sa a #xB9) (sa-u32 a 512) (sa a #xFC #xF3 #x48 #xA5)                    ; mov ecx,512 ; cld ; rep movsq
+    (sa a #x48 #xC7 #x04 #x25) (sa-u32 a +snp-secrets-addr+) (sa-u32 a +snp-secrets-copy-addr+) ; mov qword [secrets], copy
+    (sa-label a :end)
+    (let ((bytes (sa-finish a)))
+      (loop for b across bytes do (mvm-emit-byte buf b)))))
+
 (defun emit-snp-load-cbit-rbx (buf)
   "mov rbx, [+snp-cbit-mask-addr+] — the page-table build ORs RBX into every
    table pointer and every 2 MB entry.  Zero when SNP is not active."
@@ -448,15 +474,21 @@
 
 (defun emit-snp-pd-entry-fixup (buf)
   "Inside the PD fill loop, after `mov rax,rdx ; or rax,0x83`:
-     or rax, rbx                 ; C-bit
-     cmp rdx, *snp-shared-base*  ; the one shared 2 MB page
-     jne +3
-     xor rax, rbx                ; ... gets the C-bit taken back out"
-  (emit-snp-or-rax-rbx buf)
-  (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x81) (mvm-emit-byte buf #xFA)
-  (mvm-emit-u32 buf *snp-shared-base*)
-  (mvm-emit-byte buf #x75) (mvm-emit-byte buf #x03)
-  (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x31) (mvm-emit-byte buf #xD8))
+     or rax, rbx                 ; C-bit, on EVERY entry
+   The shared 2 MB page starts out encrypted too.  PVALIDATE works on private
+   memory through a private (C=1) mapping, so the region is rescinded while it
+   is still mapped encrypted, and only after the Page State Change does
+   EMIT-SNP-POST-CR3 rewrite its one PD entry without the C-bit (Linux's order:
+   rescind, PSC, then clear the C-bit).  Mapping it C=0 from the start made the
+   very first PVALIDATE fault, and with the firmware's handlers unusable under
+   our page tables that fault took the whole VM down."
+  (emit-snp-or-rax-rbx buf))
+
+;; The PD entry that maps the shared 2 MB region: four contiguous PDs at
+;; +x64-page-tables-addr+ + 0x2000, one 8-byte entry per 2 MB (the layout the
+;; UEFI stub's fill loop writes; net/virtio-net.lisp reads it the same way).
+(defun snp-shared-pde-addr ()
+  (+ +x64-page-tables-addr+ #x2000 (* 8 (ash *snp-shared-base* -21))))
 
 (defun emit-snp-idt-vector29 (a idt-base code-selector)
   "Into the SNP-ASM A: write IDT entry 29 of the table at IDT-BASE -> the
@@ -485,6 +517,14 @@
       (let ((bytes (sa-finish a)))
         (loop for b across bytes do (mvm-emit-byte buf b))))))
 
+;; A spin point inside the SNP setup (see EMIT-UEFI-SPIN-POINT in
+;; boot-uefi-x64.lisp; same MODUS_SNP_SPIN_AT knob, nothing emitted when unset).
+(defun sa-spin-point (a name)
+  (let ((at (%uefi-spin-at)))
+    (when (and at (string= at name))
+      (format t "~&;; SNP stub: SPIN POINT at ~A~%" name)
+      (sa a #xEB #xFE))))                                    ; jmp $
+
 (defun emit-snp-post-cr3 (buf &optional (code-selector #x08))
   "After CR3/GDT/segments: make the shared region shared, register the GHCB,
    copy the #VC handler into place and load an IDT with vector 29.
@@ -497,12 +537,31 @@
     ;; -- (a) SNP-active only: PSC + GHCB registration
     (sa a #x8B #x04 #x25) (sa-u32 a +snp-active-addr+)         ; mov eax,[active]
     (sa a #x85 #xC0) (sa-jcc a :e :install)                    ; test eax,eax ; jz
-    ;; rsi = page cursor over the shared region
+    ;;   Rescind the whole region with ONE 2 MB PVALIDATE (rax=va rcx=1 rdx=0),
+    ;;   through its still-encrypted mapping.  The firmware usually validated it
+    ;;   as 2 MB; if it was 4 KB the CPU answers FAIL_SIZEMISMATCH (6) and we go
+    ;;   page by page.  Any other non-zero result is fatal.  (CF=1, "no RMP
+    ;;   change", is fine: the page was not validated to begin with.)
+    (sa a #x48 #xC7 #xC0) (sa-u32 a *snp-shared-base*)         ; mov rax, base
+    (sa a #xB9 #x01 #x00 #x00 #x00) (sa a #x31 #xD2)           ; mov ecx,1 ; xor edx,edx
+    (sa a #xF2 #x0F #x01 #xFF)                                 ; pvalidate
+    (sa-spin-point a "post-pvalidate1")
+    (sa a #x83 #xF8 #x06) (sa-jcc a :ne :pv-2m-result)         ; cmp eax,6 (SIZEMISMATCH)
+    (sa a #x48 #xC7 #xC6) (sa-u32 a *snp-shared-base*)         ; mov rsi, base
+    (sa-label a :pv-4k-loop)
+    (sa a #x48 #x89 #xF0) (sa a #x31 #xC9) (sa a #x31 #xD2)    ; rax=rsi rcx=0 rdx=0
+    (sa a #xF2 #x0F #x01 #xFF)                                 ; pvalidate (4K)
+    (sa a #x85 #xC0) (sa-jcc a :ne :fatal)                     ; test eax,eax
+    (sa a #x48 #x81 #xC6) (sa-u32 a #x1000)                    ; add rsi,4096
+    (sa a #x48 #x81 #xFE) (sa-u32 a (+ *snp-shared-base* +snp-shared-size+)) ; cmp rsi,end
+    (sa-jcc a :b :pv-4k-loop)
+    (sa-jmp a :psc-start)
+    (sa-label a :pv-2m-result)
+    (sa a #x85 #xC0) (sa-jcc a :ne :fatal)                     ; 2 MB rescind must succeed
+    (sa-label a :psc-start)
+    ;; rsi = page cursor over the shared region: Page State Change, page by page
     (sa a #x48 #xC7 #xC6) (sa-u32 a *snp-shared-base*)         ; mov rsi, base
     (sa-label a :psc-loop)
-    ;;   PVALIDATE rsi, 4K, rescind:  rax=va rcx=0 rdx=0 ; F2 0F 01 FF
-    (sa a #x48 #x89 #xF0) (sa a #x31 #xC9) (sa a #x31 #xD2)
-    (sa a #xF2 #x0F #x01 #xFF)
     ;;   MSR PSC request: GHCBData = 0x014 | (2 << 52) | gfn<<12
     (sa a #x48 #x89 #xF0)                                      ; mov rax,rsi (4K aligned)
     (sa a #x48 #x83 #xC8 +ghcb-msr-psc-req+)                   ; or rax, 0x14
@@ -512,21 +571,30 @@
     (sa a #xB9) (sa-u32 a +msr-ghcb+) (sa a #x0F #x30)         ; wrmsr
     (sa a #xF3 #x0F #x01 #xD9)                                 ; vmgexit
     (sa a #x0F #x32)                                           ; rdmsr
+    (sa-spin-point a "post-psc1")
     (sa a #x89 #xC1) (sa a #x81 #xE1) (sa-u32 a #xFFF)         ; ecx = eax & 0xFFF
     (sa a #x83 #xF9 +ghcb-msr-psc-resp+) (sa-jcc a :ne :fatal) ; must be 0x015
     (sa a #x85 #xD2) (sa-jcc a :ne :fatal)                     ; error code (hi 32) must be 0
     (sa a #x48 #x81 #xC6) (sa-u32 a #x1000)                    ; add rsi,4096
     (sa a #x48 #x81 #xFE) (sa-u32 a (+ *snp-shared-base* +snp-shared-size+)) ; cmp rsi,end
     (sa-jcc a :b :psc-loop)
+    ;;   Now -- and not before -- map the region shared: its PD entry without
+    ;;   the C-bit, then reload CR3 so no encrypted translation of it survives.
+    (sa a #x48 #xC7 #xC0) (sa-u32 a (logior *snp-shared-base* #x83)) ; mov rax, base|P|RW|PS
+    (sa a #x48 #x89 #x04 #x25) (sa-u32 a (snp-shared-pde-addr))      ; mov [pde], rax
+    (sa a #x0F #x20 #xD8) (sa a #x0F #x22 #xD8)                ; mov rax,cr3 ; mov cr3,rax
+    (sa-spin-point a "post-psc")
     ;;   Register the GHCB GPA
     (sa a #xB9) (sa-u32 a +msr-ghcb+)
     (sa a #xB8) (sa-u32 a (logior (snp-ghcb-addr) +ghcb-msr-reg-gpa-req+))
     (sa a #x31 #xD2) (sa a #x0F #x30) (sa a #xF3 #x0F #x01 #xD9) (sa a #x0F #x32)
     (sa a #x89 #xC1) (sa a #x81 #xE1) (sa-u32 a #xFFF)
     (sa a #x83 #xF9 +ghcb-msr-reg-gpa-resp+) (sa-jcc a :ne :fatal)
+    (sa-spin-point a "post-reg")
     ;;   Zero the (now shared) GHCB page
     (sa a #x48 #xC7 #xC7) (sa-u32 a (snp-ghcb-addr))           ; mov rdi, GHCB
     (sa a #xB9) (sa-u32 a 512) (sa a #x31 #xC0) (sa a #xFC) (sa a #xF3 #x48 #xAB) ; rep stosq
+    (sa-spin-point a "post-ghcb-zero")
     ;;   GHCB MSR = GHCB GPA for the handler's VMGEXITs
     (sa a #xB9) (sa-u32 a +msr-ghcb+) (sa a #xB8) (sa-u32 a (snp-ghcb-addr))
     (sa a #x31 #xD2) (sa a #x0F #x30)
@@ -558,6 +626,7 @@
     (sa a #xC7 #x04 #x25) (sa-u32 a (+ +snp-idtr-addr+ 2)) (sa-u32 a +snp-idt-addr+)
     (sa a #xC7 #x04 #x25) (sa-u32 a (+ +snp-idtr-addr+ 6)) (sa-u32 a 0)
     (sa a #x0F #x01 #x1C #x25) (sa-u32 a +snp-idtr-addr+)                       ; lidt [idtr]
+    (sa-spin-point a "post-lidt")
     ;; ---- the VMGEXIT routine Lisp calls (net/snp-attest.lisp), and the words it reads
     ;;      :snp  F3 0F 01 D9  rep vmmcall ; B8 01 00 AD DE mov eax,NIL ; C3 ret
     ;;      :test              B8 01 00 AD DE mov eax,NIL ; C3 ret   (no SVM on a plain machine)

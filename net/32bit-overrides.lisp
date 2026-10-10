@@ -1,6 +1,6 @@
 ;;;; 32bit-overrides.lisp — 30-bit fixnum safety for 32-bit networking
 ;;;;
-;;;; MUST be loaded LAST (after ip.lisp, ssh.lisp, aarch64-overrides.lisp)
+;;;; MUST be loaded LAST (after ip.lisp and ssh.lisp)
 ;;;; because MVM uses last-defun-wins resolution.
 ;;;;
 ;;;; Problem: (ash byte 24) overflows on i386 when byte >= 64, because the

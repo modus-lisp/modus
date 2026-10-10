@@ -59,7 +59,6 @@ aarch64-isolated|ssh|aarch64/bare/qemu/isolated|/tmp/modus-aarch64-isolated.bin|
 i386-repl|repl|build-i386-repl|/tmp/modus-i386.bin|qemu-system-i386|-m 256 -display none -serial stdio -no-reboot|||i386
 i386-ssh|ssh|i386/bare/qemu/ssh|/tmp/modus-i386-ssh.bin|qemu-system-i386|-m 256 -nographic -no-reboot|-device ne2k_isa,netdev=net0,iobase=0x300,irq=9|DHCP:IP=;120;5|i386
 arm32-repl|repl|build-arm32-repl|/tmp/modus-arm32.bin|qemu-system-arm|-M virt,highmem=off -cpu cortex-a15 -m 256 -nographic|||arm32
-arm32-ssh|ssh|build-arm32-ssh|/tmp/modus-arm32-ssh.bin|qemu-system-arm|-M raspi2b -m 1G -nographic|-device usb-net,netdev=net0|SSH:;180;5|arm32
 rpi-repl|repl|aarch64/bare/rpi/repl|/tmp/kernel8.img|qemu-system-aarch64|-machine raspi3b -display none -serial stdio -semihosting|||rpi
 rpi-ssh|ssh|build-rpi-ssh|/tmp/kernel8-ssh.img|qemu-system-aarch64|-machine raspi3b -display none -serial stdio|-device usb-net,netdev=net0|SSH:;180;15|rpi
 rpi-hid|repl|build-rpi-hid|/tmp/kernel8-hid.img|qemu-system-aarch64|-machine raspi3b -display none -serial stdio -device usb-kbd|||rpi

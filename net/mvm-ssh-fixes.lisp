@@ -8,7 +8,7 @@
 ;;;; Also includes arena-based crypto overrides to prevent heap exhaustion
 ;;;; during Ed25519 operations (fe-pow-sqrt, ed-recover-x generate ~2MB garbage).
 ;;;;
-;;;; Must load AFTER ssh.lisp and aarch64-overrides.lisp (last-defun-wins).
+;;;; Must load AFTER ssh.lisp (last-defun-wins).
 
 ;;; Fixed buf-write-u32: original has (aset buf (+ off N) val) variable-index bug.
 ;;; This is CRITICAL because SHA-256/SHA-512 use buf-write-u32 throughout.

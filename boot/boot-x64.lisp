@@ -425,6 +425,24 @@
     (mvm-emit-u32 buf (x64-effective-stack-top))
     (mvm-emit-u32 buf 0)              ; high 32 bits
 
+    ;; ZERO THE WHOLE RUNTIME-METADATA PAGE [0x10000000, 0x10001000) first.
+    ;; Hosted, it is ELF BSS and the kernel zero-fills it, and the runtime
+    ;; relies on that ("zero means region 0", the threads gate at 0x10000DB8,
+    ;; the per-CPU mode word, the atomics lock, the TLS self slot, ...).  The
+    ;; stores further down zero an enumerated LIST of its words, which is the
+    ;; trap the RPi image fell into: QEMU hands out zero RAM, nothing else does.
+    ;; Under SEV-SNP it is never zero -- a page the guest has not written
+    ;; through its encrypted mapping decrypts to garbage.  Reproduced under QEMU
+    ;; with a random-poisoned memory backend: the CL image stopped right after
+    ;; its banner, and zeroing this page fixed it (on the VPS the image had gone
+    ;; idle early in kernel-main).  Must precede every store into the page below.
+    ;; mov rdi, 0x10000000 ; mov ecx, 512 ; xor eax, eax ; cld ; rep stosq
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF) (mvm-emit-u32 buf #x10000000) (mvm-emit-u32 buf 0)
+    (mvm-emit-byte buf #xB9) (mvm-emit-u32 buf 512)
+    (mvm-emit-byte buf #x31) (mvm-emit-byte buf #xC0)
+    (mvm-emit-byte buf #xFC)
+    (mvm-emit-byte buf #xF3) (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xAB)
+
     ;; Initialize serial console (COM1 = 0x3F8)
     ;; Disable interrupts
     (mvm-emit-byte buf #x66) (mvm-emit-byte buf #xBA) (mvm-emit-u16 buf #x03F9)
@@ -1201,7 +1219,17 @@
     ;; MODUS_X64_NO_STI=1 (A/B knob): leave IRQs masked for the whole run --
     ;; no PIT tick ever lands on a Lisp stack.  io-delay on the CL image is a
     ;; RAM-read loop and halt is HLT, so nothing needs the timer.
-    (unless (let ((v (sb-ext:posix-getenv "MODUS_X64_NO_STI"))) (and v (string= v "1")))
+    ;; SEV-SNP builds default to NO STI (MODUS_X64_NO_STI=0 forces it on).
+    ;; Measured on the VPS, same image otherwise: with STI the SSH server loop
+    ;; went idle within ~20 s and never answered; without it, it serves.  The
+    ;; hazard that fits (not proven to be the one): every tick's EOI is an OUT,
+    ;; i.e. a #VC through the one shared GHCB, 1000 times a second, and a tick
+    ;; inside a Lisp GHCB request (net/snp-ghcb.lisp: fill fields ... VMGEXIT
+    ;; ... read back) has the handler rewrite that request under it.
+    (unless (let ((v (sb-ext:posix-getenv "MODUS_X64_NO_STI")))
+              (if v
+                  (string= v "1")
+                  (and (boundp '*x64-snp-mode*) (symbol-value '*x64-snp-mode*))))
       (mvm-emit-byte buf #xFB)))   ; sti
   )
 

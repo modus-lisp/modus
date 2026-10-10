@@ -2129,7 +2129,13 @@
               ;; runtime (rdtsc) wrecked the interpreter's live registers.
               (emit-bytes buf #x51)            ; push rcx
               (emit-bytes buf #x52)            ; push rdx
-              (emit-bytes buf #x0F #x01 #xF9)  ; RDTSCP (waits for instructions)
+              ;; Hosted: RDTSCP (waits for earlier instructions).  Bare metal:
+              ;; plain RDTSC -- RDTSCP is not on every x86-64 (QEMU's default
+              ;; qemu64 lacks it: #UD), and nothing on bare metal executed this
+              ;; arm until the SSH server's waits became TSC-timed.
+              (if *x64-linux-mode*
+                  (emit-bytes buf #x0F #x01 #xF9)  ; RDTSCP
+                  (emit-bytes buf #x0F #x31))      ; RDTSC
               ;; rax = edx:eax  (both 32-bit writes zero-extend)
               (emit-bytes buf #x48 #xC1 #xE2 #x20)   ; shl rdx, 32
               (emit-bytes buf #x48 #x09 #xD0)        ; or rax, rdx

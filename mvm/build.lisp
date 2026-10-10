@@ -174,16 +174,13 @@
 
     ;; ---------------- bare / t420 (real hardware) ----------------
     ("x64/bare/t420/uefi-repl" :x64    :bare   :t420 :uefi-repl
-     :legacy nil :x64     "/tmp/modus-uefi.efi"            "build-uefi-repl")
-    ("i386/bare/t420/diag-ssh" :i386   :bare   :t420 :diag-ssh
-     :legacy nil :i386    "/tmp/modus-i386-diag-ssh.img"   "build-i386-diag-ssh")))
+     :legacy nil :x64     "/tmp/modus-uefi.efi"            "build-uefi-repl")))
 
 ;;; Payloads that are NOT in the arch × mode × board matrix the project
 ;;; targets (arm32 is a 4th arch; fixpoint is superseded by #210).  Kept
 ;;; reachable so nothing silently disappears, but listed apart.
 (defparameter *outside-matrix*
   '(("arm32/bare/qemu/repl" "build-arm32-repl"  "4th arch — not in the x64/aarch64/i386 matrix")
-    ("arm32/bare/qemu/ssh"  "build-arm32-ssh"   "4th arch — not in the x64/aarch64/i386 matrix")
     ("multi/fixpoint"       "build-fixpoint"    "BROKEN; superseded by #210 cross-arch fixpoint")
     ("aarch64/bare/rpi/uart-bootloader" "build-uart-bootloader" "deploy tool, not an image")
     ("aarch64/bare/rpi/pizero-hdmi"     "build-pizero2w-hdmi"   "board bring-up variant")
@@ -823,12 +820,12 @@
 
 (defparameter *composites*
   `(("x64/bare/qemu/ssh"
-     ;; arch-x86 → e1000 → ip → crypto → ssh → aarch64-overrides →
+     ;; arch-x86 → e1000 → ip → crypto → ssh →
      ;; mvm-ssh-fixes.  mvm-ssh-fixes MUST load last (last-defun-wins): it
      ;; carries the variable-index ASET/AREF workarounds and the arena-based
      ;; fe-pow-sqrt/ed-recover-x.
      :net ("bare-runtime-stubs.lisp" "arch-x86.lisp" "e1000.lisp" "ip.lisp" "crypto.lisp" "ssh.lisp"
-           "aarch64-overrides.lisp" "mvm-ssh-fixes.lisp")
+           "mvm-ssh-fixes.lisp")
      :parts (:net :repl :main)
      ;; #219: no CL array runtime in a net/-only image — see
      ;; *COMPILE-PLAIN-ARRAYS* in compiler.lisp.
@@ -837,8 +834,7 @@
 
     ("aarch64/bare/qemu/ssh"
      :net ("bare-runtime-stubs.lisp" "arch-aarch64.lisp" "e1000.lisp" "ip.lisp" "crypto.lisp"
-           "crypto-fast.lisp" "ssh.lisp" "ssh-profile.lisp"
-           "aarch64-overrides.lisp")
+           "crypto-fast.lisp" "ssh.lisp" "ssh-profile.lisp")
      :parts (:net :repl :main)
      ;; GICv2 + virtual timer init for setup-irq
      :flags (("*AARCH64-SETUP-IRQ-ENABLE*" . t)
@@ -850,7 +846,7 @@
     ("aarch64/bare/qemu/actors"
      :net ("bare-runtime-stubs.lisp" "arch-aarch64.lisp" "actors.lisp" "e1000.lisp" "ip.lisp"
            "crypto.lisp" "crypto-fast.lisp" "ssh.lisp" "http.lisp"
-           "http-client.lisp" "aarch64-overrides.lisp"
+           "http-client.lisp"
            "actors-net-overrides.lisp")
      :parts (:main :net :repl)
      :flags (("*AARCH64-SCHED-LOCK-ADDR*" . #x41200200)
@@ -860,7 +856,7 @@
     ("aarch64/bare/qemu/isolated"
      :net ("bare-runtime-stubs.lisp" "arch-aarch64.lisp" "actors.lisp" "e1000.lisp" "ip.lisp"
            "crypto.lisp" "crypto-fast.lisp" "ssh.lisp" "http.lisp"
-           "http-client.lisp" "aarch64-overrides.lisp"
+           "http-client.lisp"
            "actors-net-overrides.lisp" "isolated-net.lisp")
      :parts (:main :net :repl)
      :flags (("*AARCH64-SCHED-LOCK-ADDR*" . #x41200200)
@@ -872,7 +868,7 @@
      ;; sha512 / chacha20 with (hi16 . lo16) pair arithmetic.
      :net ("bare-runtime-stubs.lisp" "arch-i386.lisp" "ne2000.lisp" "ip.lisp" "crypto.lisp"
            "crypto-32.lisp" "crypto-w32.lisp" "ssh.lisp" "http.lisp"
-           "aarch64-overrides.lisp" "32bit-overrides.lisp"
+           "32bit-overrides.lisp"
            "crypto-32-fast.lisp")
      :parts (:net :repl :main :extra)
      :flags (("*COMPILE-PLAIN-ARRAYS*" . t))

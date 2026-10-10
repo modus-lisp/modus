@@ -452,7 +452,12 @@
   ;; The magic is a HEADER FIELD written with (setf (mem-ref .. :u64) magic),
   ;; i.e. deposited as magic<<1, so read it the same halving way -- NOT the
   ;; bit-exact %gc-read64 the raw cursor uses.
-  (= (mem-ref (%core-addr) :u64) (%core-magic)))
+  ;; EQ, NOT =: with no core there the word is whatever the RAM holds, and on
+  ;; real hardware (and always under SEV-SNP, where unwritten memory decrypts
+  ;; to noise) it can carry a pointer tag; = then dereferenced it as a number
+  ;; object and faulted in %COMPLEX-P before the first prompt.  The magic is a
+  ;; fixnum, so EQ is the exact test and touches nothing.
+  (eq (mem-ref (%core-addr) :u64) (%core-magic)))
 (defun %core-open-in ()
   (%gc-write64 (%core-cursor-slot) (%core-addr))
   (%core-cursor-slot))
@@ -950,6 +955,26 @@
   (error "MODUS_SSH_BUILD=1 is :RPI or :X64 — the :VIRT actor/SSH address map ~
           is not laid out.  See the DIVERGENCE 5 comment in build-cl-repl-common.lisp."))
 
+;; MODUS_SSH_AUTOSTART=1 (with MODUS_SSH_BUILD=1) — start the SSH server from
+;; kernel-main right after the net pipeline, instead of waiting for (ssh-boot) at
+;; the REPL.  The server never returns, so the REPL is not reached.  Used by the
+;; attested-SSH image: nothing is typed at a console that does not exist.
+(defvar *ssh-autostart-p*
+  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_SSH_AUTOSTART")))
+    (and *ssh-build-p* v (string= v "1"))))
+;; MODUS_LISP_SPIN_AT=<name> -- a `(loop)' at that one point of the Lisp boot,
+;; the Lisp-side twin of the UEFI stub's MODUS_SNP_SPIN_AT spin points: on a
+;; machine nobody can see, a guest found spinning at ~100% CPU got there.
+;; Names: pre-pipeline, post-probe (x64 pipeline), pre-ssh, post-ssh-return.
+;; Unset, every insertion is "" and the image is unchanged.
+(defvar *lisp-spin-at*
+  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_LISP_SPIN_AT")))
+    (and v (plusp (length v)) (string-downcase v))))
+(defun %lisp-spin-form (name)
+  (if (equal name *lisp-spin-at*)
+      (progn (format t "~&;; Lisp boot: SPIN POINT at ~A~%" name) "  (loop)
+")
+      ""))
 ;; Crypto source, spliced into *net-source* after ip.lisp.  "" unless SSH build.
 (defvar *crypto-source*
   (if *ssh-build-p*
@@ -1018,14 +1043,12 @@
 ;; NOTE (staged, not yet functional): actor-spawn/nfn-lookup are native-fn-addr
 ;; stubs in the arch adapters; running net-actor-main as a CL/mvm-eval function
 ;; needs them rewired to the CL fn-table — live-REPL work once the NIC is up.
-;; aarch64-overrides.lisp is deliberately OMITTED (its reader conflicts with the
-;; CL reader); the SSH channel→eval wiring is part of that same live work.
-;; SINGLE-THREADED SSH (no actor scheduler): aarch64-overrides.lisp provides the
+;; SINGLE-THREADED SSH (no actor scheduler): ssh.lisp and ip.lisp carry the
 ;; inline net-accept-connection -> ssh-connection-handler -> ssh-handle-connection
 ;; path (sidesteps the actor context-switch), the capture-aware %serial-byte SSH
 ;; output routing needs, and the crypto helpers (pre-compute-server-eph /
-;; -host-sign, ed25519-sign-fast, ssh-random, usb-keepalive).  It loads AFTER
-;; ssh.lisp so its single-threaded defuns win under last-defun-wins.  actors.lisp
+;; -host-sign, ed25519-sign-fast, ssh-random, usb-keepalive) -- formerly
+;; net/aarch64-overrides.lisp, merged into them 2026-10-09.  actors.lisp
 ;; is kept only so ssh.lisp's actor-spawn reference resolves; net-actor-main (the
 ;; poll loop) comes from ip.lisp and yields as a no-op when the actor system is
 ;; uninitialised, so calling it directly IS the single-threaded server.
@@ -1042,15 +1065,27 @@
 (defun actor-init () 0)
 ")
 
+;; :X64 -- SSH waits measured in TSC cycles, not poll counts (net/ssh.lisp,
+;; SSH-WAIT-EXPIRED-P).  A wait still needs its poll count AND 2^35 cycles
+;; (10-17 s at 2-3.5 GHz): on the SNP VPS a native 50000-try poll took ~15 ms
+;; and the server closed every connection right after the client's KEXINIT.
+;; Bare x64 has no counter rate (CNTFRQ is 0 there), hence a cycle budget.
+;; Spliced after ssh.lisp so it wins by last-defun-wins.
+(defvar *ssh-x64-wait-source*
+  "(defun ssh-preauth-clock () (rdtsc))
+(defun ssh-wait-expired-p (count limit since)
+  (and (> count limit) (> (- (rdtsc) since) 34359738368)))
+")
+
 (defvar *ssh-transport-source*
   (if *ssh-build-p*
       (concatenate 'string
         *ssh-addr-map-source*                     (string #\Newline)
         (if *cl-repl-x64-p* *ssh-x64-actor-stubs* (%rpi-net-text "actors.lisp")) (string #\Newline)
         (%rpi-net-text "ssh.lisp")                (string #\Newline)
-        (%rpi-net-text "aarch64-overrides.lisp")  (string #\Newline)
+        (if *cl-repl-x64-p* *ssh-x64-wait-source* "") (string #\Newline)
         "(defun native-eval (form) (eval form))"  (string #\Newline)
-        ;; ssh-handle-connection fix + trace live in net/aarch64-overrides.lisp.
+        ;; ssh-handle-connection fix + trace live in net/ssh.lisp.
         ;; FIX: single-threaded server handles ONE connection at a time.  Guard
         ;; against RE-ENTRANT net-accept-connection: while inside a connection
         ;; (flag ssh-ipc+0x60450 = 1), a reconnect SYN must NOT spawn a nested
@@ -1072,7 +1107,7 @@
           (when (not (= conn (- 0 1)))
             (net-deliver-data conn buf pkt-len tcp-flags))))))"
         (string #\Newline)
-        ;; CL-native exec path: the shared ssh-do-eval-expr (aarch64-overrides)
+        ;; CL-native exec path: the shared ssh-do-eval-expr (net/ssh.lisp)
         ;; calls eval-sexp (the DELETED tree-walker) + buf-read-list (the legacy
         ;; repl-source reader) — neither exists in this image, so exec produced
         ;; no output.  Route the command through the REAL CL stack instead:
@@ -1102,7 +1137,7 @@
             (ssh-send-string ssh arr (+ ol rl 3))))))))"
         (string #\Newline)
         ;; SHELL-path fix (completes the interactive SSH loop): the active
-        ;; ssh-do-eval-expr (net/aarch64-overrides.lisp) used eval-sexp (the
+        ;; ssh-do-eval-expr (net/ssh.lisp) used eval-sexp (the
         ;; DELETED tree-walker) + buf-read-list (the legacy repl-source reader),
         ;; so interactive SSH input evaluated to NOTHING (only the prompt came
         ;; back).  Loaded LAST => wins last-defun-wins.  The edited line is the
@@ -1118,7 +1153,7 @@
           (ssh-eval-line ssh cmd len)))))"
         (string #\Newline)
         ;; INTERACTIVE-shell fix: the stock ssh-handle-channel-data drives bytes
-        ;; through the aarch64-overrides line editor (handle-edit-byte + edit
+        ;; through the ssh.lisp line editor (handle-edit-byte + edit
         ;; state) which does not integrate with this image, so typed/piped input
         ;; never reached eval (only the prompt came back; exec worked because it
         ;; bypasses the editor).  Override it (loaded after ssh.lisp) to
@@ -1159,18 +1194,20 @@
             ;; zeroed and seeded (state +0x600..+0x900 is the SSH-side part of
             ;; e1000-state: key-set flag, PRNG, host key; the NIC/DHCP words below
             ;; it stay).  No USB probe, no static address, no actors.
-            "(defun ssh-boot ()
+            ;; MODUS_LISP_SPIN_AT=ssh-zeroed|ssh-seeded|ssh-keyed|ssh-signed|
+            ;; ssh-netup puts a spin point between the steps (nothing otherwise).
+            (concatenate 'string "(defun ssh-boot ()
   (let ((s (+ (e1000-state-base) #x600))) (dotimes (i 96) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
   (let ((s (ssh-ipc-base))) (dotimes (i 76800) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
   (let ((s (ssh-conn-base))) (dotimes (i 8192) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
   (setf (mem-ref (+ (ssh-ipc-base) #x60438) :u32) 22)
-  (ssh-seed-random)
+" (%lisp-spin-form "ssh-zeroed") "  (ssh-seed-random)
   (ssh-init-strings)
-  (ssh-use-default-key)
-  (pre-compute-host-sign)
-  (pre-compute-server-eph (conn-ssh 0))
+" (%lisp-spin-form "ssh-seeded") "  (ssh-use-default-key)
+" (%lisp-spin-form "ssh-keyed") "  (pre-compute-host-sign)
+" (%lisp-spin-form "ssh-signed") "  (pre-compute-server-eph (conn-ssh 0))
   (write-string-serial \"NETUP\") (write-char-serial 10)
-  (net-actor-main))"
+" (%lisp-spin-form "ssh-netup") "  (net-actor-main))")
         "(defun ssh-boot ()
   (let ((s (e1000-state-base))) (dotimes (i 1024) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
   (let ((s (ssh-ipc-base))) (dotimes (i 76800) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
@@ -1633,15 +1670,70 @@
                         (net-usb-probe) 1)"
       "(cdc-ether-init)"))
 
+;; MODUS_NET_IP + MODUS_NET_GW (dotted quads) -- a STATIC address for the x64
+;; pipeline instead of DHCP.  A provider whose network has no DHCP server
+;; (VPSBG: "networking must be configured statically within the image") never
+;; answers a DISCOVER, so the image never takes its address and nothing answers
+;; ARP for it.  ip.lisp has no netmask -- every frame goes to the gateway's MAC
+;; -- so a /32 with an off-subnet gateway is exactly these two words, stored
+;; the way dhcp-client stores them, which is NOT the same for both:
+;;   +0x18 our address: wire-order BYTES, so the u32 is a + b*2^8 + c*2^16 + d*2^24
+;;   +0x1C the gateway: the NUMBER a*2^24 + b*2^16 + c*2^8 + d (DHCP option 3
+;;         read big-endian; arp-resolve HTONLs it, %net-print-ip-u32 prints it)
+(defun %ipv4-octets (dotted)
+  (let ((parts (loop with start = 0
+                     for dot = (position #\. dotted :start start)
+                     collect (parse-integer dotted :start start :end dot)
+                     while dot do (setq start (1+ dot)))))
+    (assert (and (= (length parts) 4) (every (lambda (b) (<= 0 b 255)) parts)) ()
+            "not a dotted IPv4 address: ~S" dotted)
+    parts))
+(defun %ipv4-le-u32 (dotted)
+  (destructuring-bind (a b c d) (%ipv4-octets dotted) (+ a (* 256 b) (* 65536 c) (* 16777216 d))))
+(defun %ipv4-be-u32 (dotted)
+  (destructuring-bind (a b c d) (%ipv4-octets dotted) (+ (* 16777216 a) (* 65536 b) (* 256 c) d)))
+
+(defvar *net-x64-addr-block*
+  (concatenate 'string
+   (%lisp-spin-form "post-probe")
+  (let ((ip #+sbcl (sb-ext:posix-getenv "MODUS_NET_IP"))
+        (gw #+sbcl (sb-ext:posix-getenv "MODUS_NET_GW")))
+    (if (and ip gw (plusp (length ip)) (plusp (length gw)))
+        (format nil "  (let ((s (e1000-state-base)))
+    (setf (mem-ref (+ s #x18) :u32) ~D)    ; ~A
+    (setf (mem-ref (+ s #x1C) :u32) ~D))   ; gateway ~A
+" (%ipv4-le-u32 ip) ip (%ipv4-be-u32 gw) gw)
+        "  (dotimes (attempt 8)
+    (when (zerop (mem-ref (+ (e1000-state-base) #x18) :u8))
+      (handler-case (dhcp-client) (t (c) nil))))
+"))))
+
+;; An autostart SSH image is a server: it has no library to fetch, and on a
+;; real network the slirp address the fetch targets does not exist, so the
+;; attempt only delays the SSH server.
+(defvar *net-x64-fetch-block*
+  (if *ssh-autostart-p*
+      "          (write-string-serial \"NET-FETCH-SKIPPED\") (write-char-serial 10))))"
+      "          (handler-case (ql-net-setup) (t (c) nil))
+          (net-install-and-call (%net-fetch-url)))))"))
+
 (defvar *net-pipeline-defun-source*
   (if *cl-repl-qemu-p*
-      ";; QEMU user-mode net: slirp answers a DISCOVER in tens of ms, which is more
+      (concatenate 'string ";; QEMU user-mode net: slirp answers a DISCOVER in tens of ms, which is more
 ;; than 2500 of the x86 adapter's io-delays (DHCP:F five times, then the OFFERs
 ;; found queued in the RX ring).  Wait longer per attempt; the count only
 ;; matters when no answer comes.
 (defun dhcp-wait-tries () 250000)
 (defun run-net-pipeline ()
   (write-string-serial \"NET-PIPELINE-START\") (write-char-serial 10)
+  ;; 0. Zero the whole fixed e1000-state block (8 KB: NIC/DHCP/ARP/TCP words,
+  ;;    the Ed25519 constants and their init flag at +0x5D0, fe-scratch at
+  ;;    +0x900, the SSH strings at +0x1000).  It is fixed-address RAM, not BSS:
+  ;;    QEMU hands it over zeroed, real hardware does not, and under SEV-SNP a
+  ;;    never-written page reads as garbage.  ssh-boot later re-zeroes only the
+  ;;    SSH part (+0x600..+0x900), so a garbage +0x5D0 used to skip
+  ;;    ed25519-init and leave the signing constants unset.
+  (let ((s (e1000-state-base))) (dotimes (i 1024) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
   ;; 1. PCI bring-up: assign BARs (no firmware did it), then probe the E1000.
   ;;    e1000-probe prints its own MAC / link diagnostics.
   (handler-case (pci-assign-bars) (t (c) nil))
@@ -1653,10 +1745,7 @@
   ;;    has cycled is answered immediately.  Re-run the client until it has an
   ;;    address (state+0x18) or the attempts run out.  The failing attempts also
   ;;    burn the settle time, so a later one hits the fast path.
-  (dotimes (attempt 8)
-    (when (zerop (mem-ref (+ (e1000-state-base) #x18) :u8))
-      (handler-case (dhcp-client) (t (c) nil))))
-  (let ((state (e1000-state-base)))
+" *net-x64-addr-block* "  (let ((state (e1000-state-base)))
     (write-string-serial \"IP=\")
     (print-dec (mem-ref (+ state #x18) :u8)) (write-char-serial 46)
     (print-dec (mem-ref (+ state #x19) :u8)) (write-char-serial 46)
@@ -1671,10 +1760,9 @@
         (progn
           ;; NIC + DHCP are up: make `ql:quickload' nameable at the REPL, then
           ;; run the baked sha1 self-test (evidence the install path works).
-          (handler-case (ql-net-setup) (t (c) nil))
-          (net-install-and-call (%net-fetch-url)))))
+" *net-x64-fetch-block* "
   (write-string-serial \"NET-PIPELINE-DONE\") (write-char-serial 10))
-"
+")
       (format nil "(defun run-net-pipeline ()
   (write-string-serial \"NET-PIPELINE-START\") (write-char-serial 10)
   ;; 1. DWC2 host controller + USB enumeration + CDC Ethernet.
@@ -1725,10 +1813,19 @@
 
 ;; Spliced into kernel-main.  "" when the flag is off => zero bytes added.
 (defvar *net-pipeline-call*
-  (if (and *net-build-p* (not *net-noauto-p*))
-      "  (handler-case (run-net-pipeline) (t (c) nil))
+  (concatenate 'string
+    (%lisp-spin-form "pre-pipeline")
+    (if (and *net-build-p* (not *net-noauto-p*))
+        "  (handler-case (run-net-pipeline) (t (c) nil))
 "
-      ""))
+        "")
+    (if *ssh-autostart-p*
+        (concatenate 'string
+          (%lisp-spin-form "pre-ssh")
+          "  (handler-case (ssh-boot) (t (c) nil))
+"
+          (%lisp-spin-form "post-ssh-return"))
+        "")))
 
 ;;; BARE-METAL NET SEAM.  build-cli-common splices this right after
 ;;; *STAGE2-TEST-SOURCE* — after the CL runtime, the compiler and mvm-eval so the
@@ -1901,13 +1998,51 @@
         (string #\Newline))
       ""))
 
+;; MODUS_SSH_AUTH_KEY_HEX (32-byte Ed25519 public key, 64 hex) and
+;; MODUS_SSH_HOST_KEY_HEX (32-byte Ed25519 private seed, 64 hex) — a
+;; `ssh-use-default-key' override that installs them instead of the all-zero
+;; default, and sets the auth flag so only the baked key is accepted.  It lands
+;; after ssh.lisp (last-defun-wins), and ssh-boot zeroes the SSH state BEFORE it
+;; calls ssh-use-default-key, so the bake survives the zeroing.
+(defvar *ssh-key-override-source*
+  (let ((auth #+sbcl (sb-ext:posix-getenv "MODUS_SSH_AUTH_KEY_HEX"))
+        (host #+sbcl (sb-ext:posix-getenv "MODUS_SSH_HOST_KEY_HEX")))
+    (if (and *ssh-build-p* auth host (= (length auth) 64) (= (length host) 64))
+        (flet ((bytes-form (hex)
+                 (with-output-to-string (s)
+                   (format s "(let ((k (make-array 32)))")
+                   (dotimes (i 32)
+                     (format s " (aset k ~D #x~2,'0X)" i
+                             (parse-integer hex :start (* i 2) :end (+ (* i 2) 2) :radix 16)))
+                   (format s " k)"))))
+          (format nil "~%(defun ssh-use-default-key ()~%  (ssh-set-host-key ~A)~%  (ssh-mem-store (ssh-auth-key-addr) ~A 32)~%  (setf (mem-ref (+ (e1000-state-base) #x770) :u32) 1))~%"
+                  (bytes-form host) (bytes-form auth)))
+        "")))
+
+;; net/snp-ghcb.lisp -- the GHCB protocol (status block, VMGEXIT, device MMIO
+;; through the hypervisor) -- under both its users: the virtio NIC and SNP
+;; attestation.  First in the net source because the MVM compiler folds
+;; defconstants positionally and snp-attest.lisp uses its +SNP-W-*+ words.
+;; %SNP-BUILD-MODE is the build's *X64-SNP-MODE* as a number (0 plain, 1 :snp,
+;; 2 :test), so a plain image never reads the stub's status block: only an
+;; SNP-mode stub writes it, and bare-metal RAM is not zeroed.
+(defvar *snp-ghcb-source*
+  (let ((mode (and (boundp 'modus.mvm::*x64-snp-mode*) modus.mvm::*x64-snp-mode*)))
+    (if (and *cl-repl-x64-p* (or *net-build-p* mode))
+        (concatenate 'string
+          (format nil "(defun %snp-build-mode () ~D)~%"
+                  (case mode (:snp 1) (:test 2) (t 0)))
+          (%rpi-net-text "snp-ghcb.lisp") (string #\Newline))
+        "")))
+
 (defvar *cli-bare-metal-net-source*
   ;; *cl-repl-jit-region-source* LAST: its %jit-exec-* defuns must come after
   ;; translate-aarch64.lisp's defaults so last-defun-wins picks the :virt DRAM
   ;; window.  Empty string on :rpi, which keeps the translator's own values.
-  (concatenate 'string *net-source* *net-url-source* *net-driver-source*
+  (concatenate 'string *snp-ghcb-source*
+               *net-source* *net-url-source* *net-driver-source*
                *rpi-jit-coinit-override* *cl-repl-jit-region-source*
-               *snp-attest-source*))
+               *snp-attest-source* *ssh-key-override-source*))
 
 ;;; ARCH SLOT: the toplevel entry / probe program.  The hosted CLIs hand off to
 ;;; cli-toplevel here; this image runs the same E2SMOKE self-check the bare ANSI

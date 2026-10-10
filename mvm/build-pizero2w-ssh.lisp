@@ -25,7 +25,7 @@
 ;; Load: arch-raspi3b (adapter) + dwc2-device (USB gadget NIC)
 ;; + ip + crypto + ssh + http + overrides
 (defvar *net-source*
-  (format nil "~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%"
+  (format nil "~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%"
           (read-file-text (merge-pathnames "arch-raspi3b.lisp" *net-dir*))
           (read-file-text (merge-pathnames "dwc2-device.lisp" *net-dir*))
           (read-file-text (merge-pathnames "ip.lisp" *net-dir*))
@@ -33,8 +33,7 @@
           (read-file-text (merge-pathnames "crypto-fast.lisp" *net-dir*))
           (read-file-text (merge-pathnames "ssh.lisp" *net-dir*))
           (read-file-text (merge-pathnames "http.lisp" *net-dir*))
-          (read-file-text (merge-pathnames "http-client.lisp" *net-dir*))
-          (read-file-text (merge-pathnames "aarch64-overrides.lisp" *net-dir*))))
+          (read-file-text (merge-pathnames "http-client.lisp" *net-dir*))))
 
 ;;; ============================================================
 ;;; Build Pi Zero 2 W SSH image (DWC2 USB gadget + CDC-ECM)

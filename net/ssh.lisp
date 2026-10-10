@@ -520,10 +520,10 @@
   ;; without parsing; V_C stayed empty => wrong exchange hash => the client's
   ;; "incorrect signature").  Legacy repl-source images treat word-0 as false,
   ;; which is why this ever appeared to work.
-  (let ((got-version 0) (tries 0))
+  (let ((got-version 0) (tries 0) (since (ssh-preauth-clock)))
     (loop
       (when (not (zerop got-version)) (return 1))
-      (when (> tries 50) (return 0))
+      (when (ssh-wait-expired-p tries 50 since) (return 0))
       ;; Wait for data from net-actor
       (let ((msg (ssh-wait-data ssh)))
         (when (zerop msg) (return 0)))
@@ -922,112 +922,34 @@
     (dotimes (i 32) (aset pk i 0))
     (ssh-set-host-key pk)))
 
-;; Handle a single SSH connection
-;; ssh = per-connection SSH state base
+;; Override ssh-handle-connection for single-threaded AArch64
 (defun ssh-handle-connection (ssh)
   (let ((cb (- ssh #x20)))
-    ;; SSH state initialized in net-accept-connection before handler spawn
-    ;; (must NOT reset here - recv buffer may already have data from net-actor)
-    ;; 1. Version exchange
     (ssh-send-version ssh)
     (when (zerop (ssh-receive-version ssh))
       (return ()))
-    ;; 2. Send KEXINIT
     (let ((kexinit (ssh-build-kexinit ssh)))
       (ssh-send-payload ssh kexinit (array-length kexinit)))
-    ;; 3. Receive client KEXINIT
-    (let ((cli-kex (ssh-receive-packet ssh 100)))
-      (when (zerop cli-kex) (return ()))
+    ;; FIX: ssh-receive-packet returns NIL on timeout; (zerop NIL) does NOT
+    ;; catch it, so (car NIL) faults.  Each wait is SSH-AWAIT-PACKET: a single
+    ;; 50000-try poll was ~15 ms on native x86-64, shorter than a round trip.
+    (let ((cli-kex (ssh-await-packet ssh)))
+      (when (or (null cli-kex) (zerop cli-kex)) (return ()))
       (let ((cli-kex-payload (car cli-kex)))
-        (when (not (eq (aref cli-kex-payload 0) 20)) (return ())) ; must be KEXINIT
-        ;; Store client kexinit for exchange hash (per-connection at cb+0x1F00)
+        (when (not (eq (aref cli-kex-payload 0) 20)) (return ()))
         (ssh-mem-store (+ cb #x1F00) cli-kex-payload (cdr cli-kex))
         (setf (mem-ref (+ ssh #x20) :u32) (cdr cli-kex))
-        ;; 4. Receive KEX_ECDH_INIT
-        (let ((kex-init (ssh-receive-packet ssh 100)))
-          (when (zerop kex-init) (return ()))
+        (let ((kex-init (ssh-await-packet ssh)))
+          (when (or (null kex-init) (zerop kex-init)) (return ()))
           (let ((kex-payload (car kex-init)))
-            (when (not (eq (aref kex-payload 0) 30)) (return ())) ; KEX_ECDH_INIT
-            ;; 5. Handle key exchange
+            (when (not (eq (aref kex-payload 0) 30)) (return ()))
             (ssh-handle-kex ssh kex-payload (cdr kex-init))
-            ;; 6. Send NEWKEYS
             (ssh-send-newkeys ssh)
-            ;; 7. Receive NEWKEYS
-            (let ((nk (ssh-receive-packet ssh 100)))
-              (when (zerop nk) (return ()))
-              (when (not (eq (aref (car nk) 0) 21)) (return ())) ; NEWKEYS
-              ;; 8. Derive keys and enable encryption
+            (let ((nk (ssh-await-packet ssh)))
+              (when (or (null nk) (zerop nk)) (return ()))
+              (when (not (eq (aref (car nk) 0) 21)) (return ()))
               (ssh-derive-keys ssh)
-              ;; 9. Main message loop
-              (let ((running 1))
-                (loop
-                  (when (zerop running) (return ()))
-                  (let ((pkt (ssh-receive-packet ssh 600)))
-                    (when (zerop pkt)
-                      (setq running 0))
-                    (when pkt
-                      (let ((payload (car pkt))
-                            (plen (cdr pkt)))
-                        (let ((msg-type (aref payload 0)))
-                          ;; Dispatch by message type
-                          (if (eq msg-type 5)  ; SERVICE_REQUEST
-                              (let ((svc-len (ssh-get-u32 payload 1))
-                                    (svc (make-array 32)))
-                                (dotimes (i svc-len)
-                                  (aset svc i (aref payload (+ 5 i))))
-                                (ssh-send-service-accept ssh svc svc-len))
-                              (if (eq msg-type 50) ; USERAUTH_REQUEST
-                                  (ssh-handle-userauth ssh payload plen)
-                                  (if (eq msg-type 90) ; CHANNEL_OPEN
-                                      (let ((ctype-len (ssh-get-u32 payload 1)))
-                                        (let ((cli-chan (ssh-get-u32 payload (+ 5 ctype-len))))
-                                          (setf (mem-ref (+ ssh #x18) :u32) cli-chan)
-                                          (setf (mem-ref (+ ssh #x14) :u32) 0) ; our chan
-                                          (ssh-send-channel-confirm ssh cli-chan 0)))
-                                      (if (eq msg-type 98) ; CHANNEL_REQUEST
-                                          (let ((rtype-len (ssh-get-u32 payload 5)))
-                                            (let ((want-reply (aref payload (+ 9 rtype-len))))
-                                              (when (not (zerop want-reply))
-                                                (ssh-send-channel-success ssh
-                                                 (mem-ref (+ ssh #x18) :u32)))
-                                              ;; Check for "shell" (5 bytes starting with 's')
-                                              (when (eq rtype-len 5)
-                                                (when (eq (aref payload 9) 115) ; 's'hell
-                                                  (ssh-send-prompt ssh)))
-                                              ;; Check for "exec" (4 bytes starting with 'e')
-                                              (when (eq rtype-len 4)
-                                                (when (eq (aref payload 9) 101) ; 'e'xec
-                                                  ;; Command string follows after want_reply byte
-                                                  (let ((cmd-len (ssh-get-u32 payload (+ 10 rtype-len))))
-                                                    (let ((cmd (make-array cmd-len))
-                                                          (cmd-off (+ 14 rtype-len)))
-                                                      (dotimes (i cmd-len)
-                                                        (aset cmd i (aref payload (+ cmd-off i))))
-                                                      (ssh-eval-line ssh cmd cmd-len)
-                                                      ;; Send EOF + CLOSE after exec
-                                                      (let ((eof-msg (make-array 5))
-                                                            (cli-chan (mem-ref (+ ssh #x18) :u32)))
-                                                        (aset eof-msg 0 96) ; SSH_MSG_CHANNEL_EOF
-                                                        (ssh-put-u32 eof-msg 1 cli-chan)
-                                                        (ssh-send-payload ssh eof-msg 5)
-                                                        (let ((close-msg (make-array 5)))
-                                                          (aset close-msg 0 97) ; SSH_MSG_CHANNEL_CLOSE
-                                                          (ssh-put-u32 close-msg 1 cli-chan)
-                                                          (ssh-send-payload ssh close-msg 5)))
-                                                      (setq running 0)))))))
-                                          (if (eq msg-type 94) ; CHANNEL_DATA
-                                              (ssh-handle-channel-data ssh payload plen)
-                                              (if (eq msg-type 93) ; WINDOW_ADJUST
-                                                  () ; ignore
-                                                  (if (eq msg-type 96) ; EOF
-                                                      (setq running 0)
-                                                      (if (eq msg-type 97) ; CLOSE
-                                                          (setq running 0)
-                                                          (if (eq msg-type 1) ; DISCONNECT
-                                                              (setq running 0)
-                                                              (if (eq msg-type 2) ; IGNORE
-                                                                  ()
-                                                                  ())))))))))))))))))))))))
+              (ssh-message-loop ssh))))))))
 
 ;; Second pass of publickey auth WITH a baked key: verify the signature over
 ;; the reconstructed RFC 4252 §7 blob, against the (already key-matched) baked
@@ -1241,33 +1163,32 @@
                 (ssh-do-eval-expr ssh))
             ())))))
 
-;; Evaluate s-expression from shared buffer and send result via SSH
+;; Override ssh-do-eval-expr: use buffer reader instead of read-list
 (defun ssh-do-eval-expr (ssh)
   (let ((len (edit-line-len)))
-    (spin-lock (+ (ssh-ipc-base) #x60440))
-    (setf (mem-ref (+ (ssh-ipc-base) #x60448) :u32) (ash (- ssh (+ (ssh-conn-base) #x20)) -14))
-    ;; FIFO: skip '(' at index 0, len already set by Enter handler
+    ;; Set up FIFO read position past '(' and length
     (setf (mem-ref (+ (ssh-ipc-base) #x20) :u32) 1)
-    ;; Suppress serial echo during reader parse (chars already echoed during editing)
-    (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 2)
-    (let ((lst (read-list)))
-      ;; Now enable capture for eval result
-      (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 3)
-      (setf (mem-ref (+ (ssh-ipc-base) #x18) :u32) 0)
-      (let ((result (native-eval lst)))
-        (%serial-byte 10)
-        (%serial-byte 61) (%serial-byte 32)
-        (print-obj result)
-        (%serial-byte 10)
-        (let ((out-len (mem-ref (+ (ssh-ipc-base) #x18) :u32)))
-          (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 0)
-          (setf (mem-ref (+ (ssh-ipc-base) #x24) :u32) 0)
-          (spin-unlock (+ (ssh-ipc-base) #x60440))
-          (when (> out-len 0)
-            (let ((out (make-array out-len)))
-              (dotimes (i out-len)
-                (aset out i (mem-ref (+ (+ (ssh-ipc-base) #x100) i) :u8)))
-              (ssh-send-string ssh out out-len))))))))
+    (setf (mem-ref (+ (ssh-ipc-base) #x24) :u32) len)
+    ;; Parse from line buffer
+    (let ((lst (buf-read-list)))
+      ;; Evaluate
+      (let ((globals (ssh-get-globals)))
+        (let ((result (eval-sexp lst nil globals)))
+          ;; Enable capture for output
+          (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 3)
+          (setf (mem-ref (+ (ssh-ipc-base) #x18) :u32) 0)
+          (%serial-byte 10)
+          (%serial-byte 61) (%serial-byte 32)
+          (ssh-print-sexp result)
+          (%serial-byte 10)
+          ;; Flush captured output
+          (let ((out-len (mem-ref (+ (ssh-ipc-base) #x18) :u32)))
+            (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 0)
+            (when (> out-len 0)
+              (let ((out (make-array out-len)))
+                (dotimes (i out-len)
+                  (aset out i (mem-ref (+ (+ (ssh-ipc-base) #x100) i) :u8)))
+                (ssh-send-string ssh out out-len)))))))))
 
 
 ;; Evaluate command line from SSH exec request
@@ -1396,22 +1317,575 @@
       ;; Store the function address at fixed location 0x395000
       (setf (mem-ref (+ (ssh-ipc-base) #x95000) :u64) (nfn-lookup (hash-of "do-gc"))))))
 
+;; Override ssh-server for single-threaded AArch64
+;; No GC helper, no actor-spawn. Runs network loop directly.
 (defun ssh-server (port)
   (ssh-seed-random)
   (ssh-init-strings)
-  ;; Initialize GC helper BEFORE key generation (ed25519 needs make-array with GC)
-  (init-gc-helper)
+  ;; No GC helper on AArch64 (no native eval at runtime)
   (when (zerop (mem-ref (+ (e1000-state-base) #x624) :u32))
     (ssh-use-default-key))
-  (%serial-byte 83) (%serial-byte 83) (%serial-byte 72)  ; "SSH"
+  (%serial-byte 83) (%serial-byte 83) (%serial-byte 72)
   (%serial-byte 58) (print-dec port) (%serial-byte 10)
-  ;; Store listen port for net-actor
+  ;; Store listen port
   (setf (mem-ref (+ (ssh-ipc-base) #x60438) :u32) port)
-  ;; Clear connection table (4 slots x 16KB)
+  ;; Clear connection table
   (let ((i 0))
     (loop
       (when (>= i 4) (return 0))
       (setf (mem-ref (conn-base i) :u32) 0)
       (setq i (+ i 1))))
-  ;; Spawn network actor (handles all E1000 RX, demuxes TCP)
-  (actor-spawn (nfn-lookup (hash-of "net-actor-main"))))
+  ;; Single-threaded: run network loop directly (never returns)
+  (net-actor-main))
+
+;;; ================================================================
+;;; Single-threaded SSH server: line editor, buffer reader, REPL eval,
+;;; pre-computed crypto, server loop.  Formerly net/aarch64-overrides.lisp,
+;;; which every SSH image loaded right after this file (on x64 too), so it was
+;;; never an override of anything in practice.  Actor images still replace the
+;;; server loop with net/actors-net-overrides.lisp, loaded later.
+;;; ================================================================
+
+;;; ============================================================
+;;; Line editor: handle-edit-byte
+;;; ============================================================
+
+;; Insert a byte into the line buffer at cursor position, shift tail right
+(defun line-insert-byte (b)
+  (let ((len (edit-line-len))
+        (pos (edit-cursor-pos)))
+    (when (< len 250)
+      ;; Shift bytes from pos..len-1 right by one
+      (let ((i len))
+        (loop
+          (when (<= i pos) (return 0))
+          (setf (mem-ref (+ (+ (ssh-ipc-base) #x28) i) :u8)
+                (mem-ref (+ (+ (ssh-ipc-base) #x28) (- i 1)) :u8))
+          (setq i (- i 1))))
+      ;; Insert byte at cursor
+      (setf (mem-ref (+ (+ (ssh-ipc-base) #x28) pos) :u8) b)
+      (edit-set-line-len (+ len 1))
+      (edit-set-cursor-pos (+ pos 1))
+      ;; Echo: print from cursor to end, then move cursor back
+      (%serial-byte b)
+      (let ((i (+ pos 1)))
+        (loop
+          (when (>= i (+ len 1)) (return 0))
+          (%serial-byte (mem-ref (+ (+ (ssh-ipc-base) #x28) i) :u8))
+          (setq i (+ i 1))))
+      ;; Move cursor back to just after inserted char
+      (let ((tail (- len pos)))
+        (when (> tail 0)
+          ;; ESC [ <n> D — cursor left
+          (%serial-byte 27) (%serial-byte 91)
+          (print-dec tail)
+          (%serial-byte 68))))))
+
+;; Delete byte before cursor (backspace)
+(defun line-delete-back ()
+  (let ((pos (edit-cursor-pos)))
+    (when (> pos 0)
+      (let ((len (edit-line-len))
+            (new-pos (- pos 1)))
+        ;; Shift bytes from pos..len-1 left by one
+        (let ((i pos))
+          (loop
+            (when (>= i len) (return 0))
+            (setf (mem-ref (+ (+ (ssh-ipc-base) #x28) (- i 1)) :u8)
+                  (mem-ref (+ (+ (ssh-ipc-base) #x28) i) :u8))
+            (setq i (+ i 1))))
+        (edit-set-line-len (- len 1))
+        (edit-set-cursor-pos new-pos)
+        ;; Erase: move left, reprint tail, space over old last char, reposition
+        (%serial-byte 8)  ; backspace
+        (let ((i new-pos))
+          (loop
+            (when (>= i (- len 1)) (return 0))
+            (%serial-byte (mem-ref (+ (+ (ssh-ipc-base) #x28) i) :u8))
+            (setq i (+ i 1))))
+        (%serial-byte 32)  ; space over old last char
+        ;; Move cursor back
+        (let ((back (- len new-pos)))
+          (when (> back 0)
+            (%serial-byte 27) (%serial-byte 91)
+            (print-dec back)
+            (%serial-byte 68)))))))
+
+;; Process a single byte of input for line editing
+;; Returns: 1 = enter pressed, 2 = ctrl-d, nil = continue
+(defun handle-edit-byte (b)
+  (let ((esc (mem-ref (+ (ssh-ipc-base) #x12810) :u64)))
+    (setf (mem-ref (+ (ssh-ipc-base) #x12A08) :u64) 0)
+    (if (eq esc 1)
+        ;; Got ESC: '[' -> state 2, else reset
+        (if (eq b 91)
+            (setf (mem-ref (+ (ssh-ipc-base) #x12810) :u64) 2)
+            (setf (mem-ref (+ (ssh-ipc-base) #x12810) :u64) 0))
+        (if (eq esc 2)
+            ;; Got ESC[: handle arrow keys or extended sequence
+            (progn
+              (setf (mem-ref (+ (ssh-ipc-base) #x12810) :u64) 0)
+              (if (eq b 67)  ; right arrow
+                  (when (< (edit-cursor-pos) (edit-line-len))
+                    (edit-set-cursor-pos (+ (edit-cursor-pos) 1))
+                    (%serial-byte 27) (%serial-byte 91) (%serial-byte 67))
+                  (when (eq b 68)  ; left arrow
+                    (when (> (edit-cursor-pos) 0)
+                      (edit-set-cursor-pos (- (edit-cursor-pos) 1))
+                      (%serial-byte 27) (%serial-byte 91) (%serial-byte 68)))))
+            (if (> esc 2)
+                ;; Absorb extended escape sequences
+                (if (>= b 64)
+                    (setf (mem-ref (+ (ssh-ipc-base) #x12810) :u64) 0)
+                    (setf (mem-ref (+ (ssh-ipc-base) #x12810) :u64) (+ esc 1)))
+                ;; Normal state (esc=0)
+                (if (eq b 27)
+                    (setf (mem-ref (+ (ssh-ipc-base) #x12810) :u64) 1)
+                    (if (if (eq b 127) 1 (eq b 8))
+                        (line-delete-back)
+                        (if (if (eq b 10) 1 (eq b 13))
+                            ;; Enter
+                            (progn
+                              (setf (mem-ref (+ (ssh-ipc-base) #x24) :u32) (edit-line-len))
+                              (setf (mem-ref (+ (ssh-ipc-base) #x20) :u32) 0)
+                              (setf (mem-ref (+ (ssh-ipc-base) #x12A08) :u64) 1))
+                            (if (eq b 4)
+                                ;; Ctrl-D on empty line
+                                (when (zerop (edit-line-len))
+                                  (setf (mem-ref (+ (ssh-ipc-base) #x12A08) :u64) 2))
+                                (if (eq b 3)
+                                    ;; Ctrl-C: cancel line
+                                    (progn
+                                      (%serial-byte 94) (%serial-byte 67) (%serial-byte 10)
+                                      (edit-set-line-len 0)
+                                      (edit-set-cursor-pos 0)
+                                      (emit-prompt))
+                                    (if (eq b 21)
+                                        ;; Ctrl-U: clear line
+                                        (progn
+                                          (when (> (edit-cursor-pos) 0)
+                                            (%serial-byte 27) (%serial-byte 91)
+                                            (print-dec (edit-cursor-pos))
+                                            (%serial-byte 68))
+                                          (%serial-byte 27) (%serial-byte 91) (%serial-byte 75)
+                                          (edit-set-line-len 0)
+                                          (edit-set-cursor-pos 0))
+                                        ;; Printable character
+                                        (when (> b 31)
+                                          (when (< b 127)
+                                            (line-insert-byte b))))))))))))
+    (mem-ref (+ (ssh-ipc-base) #x12A08) :u64)))
+
+;;; ============================================================
+;;; Buffer-based s-expression reader (reads from line buffer, not UART)
+;;; ============================================================
+
+;; Read position: ssh-ipc-base + 0x20
+;; Line length: ssh-ipc-base + 0x24
+;; Line buffer: ssh-ipc-base + 0x28
+
+(defun buf-read-char ()
+  (let ((pos (mem-ref (+ (ssh-ipc-base) #x20) :u32))
+        (len (mem-ref (+ (ssh-ipc-base) #x24) :u32)))
+    (if (< pos len)
+        (let ((ch (mem-ref (+ (+ (ssh-ipc-base) #x28) pos) :u8)))
+          (setf (mem-ref (+ (ssh-ipc-base) #x20) :u32) (+ pos 1))
+          ch)
+        32)))
+
+(defun buf-peek-char ()
+  (let ((pos (mem-ref (+ (ssh-ipc-base) #x20) :u32))
+        (len (mem-ref (+ (ssh-ipc-base) #x24) :u32)))
+    (if (< pos len)
+        (mem-ref (+ (+ (ssh-ipc-base) #x28) pos) :u8)
+        32)))
+
+(defun buf-is-ws (c)
+  (if (eq c 32) 1 (if (eq c 10) 1 (if (eq c 13) 1 (if (eq c 9) 1 nil)))))
+
+(defun buf-is-delim (c)
+  (if (buf-is-ws c) 1 (if (eq c 41) 1 (if (eq c 40) 1 nil))))
+
+(defun buf-is-digit (c)
+  (if (>= c 48) (if (<= c 57) 1 nil) nil))
+
+(defun buf-skip-ws ()
+  (let ((c (buf-peek-char)))
+    (if (buf-is-ws c)
+        (progn (buf-read-char) (buf-skip-ws))
+        c)))
+
+(defun buf-read-sym-chars ()
+  (let ((c (buf-peek-char)))
+    (if (buf-is-delim c)
+        nil
+        (progn
+          (buf-read-char)
+          (let ((uc (if (>= c 97) (if (<= c 122) (- c 32) c) c)))
+            (cons uc (buf-read-sym-chars)))))))
+
+(defun buf-read-number-rest (acc)
+  (let ((c (buf-peek-char)))
+    (if (buf-is-digit c)
+        (progn
+          (buf-read-char)
+          (let ((d (- c 48)))
+            (let ((newacc (+ (* acc 10) d)))
+              (buf-read-number-rest newacc))))
+        acc)))
+
+(defun buf-read-sexp ()
+  (let ((c (buf-skip-ws)))
+    (if (eq c 40)
+        (progn (buf-read-char) (buf-read-list))
+        (if (eq c 39)
+            (progn
+              (buf-read-char)
+              (let ((val (buf-read-sexp)))
+                (cons (mksym (cons 81 (cons 85 (cons 79 (cons 84 (cons 69 nil))))))
+                      (cons val nil))))
+            (if (buf-is-digit c)
+                (progn
+                  (buf-read-char)
+                  (buf-read-number-rest (- c 48)))
+                (if (eq c 45)
+                    (progn
+                      (buf-read-char)
+                      (let ((c2 (buf-peek-char)))
+                        (if (buf-is-digit c2)
+                            (progn
+                              (buf-read-char)
+                              (- 0 (buf-read-number-rest (- c2 48))))
+                            (let ((rest (buf-read-sym-chars)))
+                              (mksym (cons 45 rest))))))
+                    (progn
+                      (buf-read-char)
+                      (let ((uc (if (>= c 97) (if (<= c 122) (- c 32) c) c)))
+                        (let ((rest (buf-read-sym-chars)))
+                          (let ((name (cons uc rest)))
+                            (if (symbol-eq name (cons 78 (cons 73 (cons 76 nil))))
+                                nil
+                                (if (symbol-eq name (cons 84 nil))
+                                    1
+                                    (mksym name)))))))))))))
+
+(defun buf-read-list ()
+  (let ((c (buf-skip-ws)))
+    (if (eq c 41)
+        (progn (buf-read-char) nil)
+        (if (eq c 46)
+            ;; Dotted pair
+            (progn
+              (buf-read-char)
+              (let ((val (buf-read-sexp)))
+                (buf-skip-ws)
+                (buf-read-char)  ; consume ')'
+                val))
+            (let ((elem (buf-read-sexp)))
+              (cons elem (buf-read-list)))))))
+
+;;; ============================================================
+;;; SSH eval (buffer-based reader + REPL evaluator)
+;;; ============================================================
+
+;; Persistent globals for SSH eval sessions
+;; Stored at ssh-ipc-base + 0x60000
+(defun ssh-get-globals ()
+  (let ((g (mem-ref (+ (ssh-ipc-base) #x60000) :u64)))
+    (if (zerop g)
+        (let ((new-g (cons nil nil)))
+          (setf (mem-ref (+ (ssh-ipc-base) #x60000) :u64) new-g)
+          new-g)
+        g)))
+
+;; Print an s-expression via %serial-byte (capture-aware)
+;; %serial-byte aware decimal print (not write-char-serial like prelude's print-dec)
+(defun ssh-print-dec (n)
+  (if (< n 10)
+      (%serial-byte (+ 48 n))
+      (let ((q (truncate n 10)))
+        (let ((r (- n (* q 10))))
+          (ssh-print-dec q)
+          (%serial-byte (+ 48 r))))))
+
+(defun ssh-print-sexp (x)
+  (if (null x)
+      (progn (%serial-byte 78) (%serial-byte 73) (%serial-byte 76))
+      (if (fixnump x)
+          (if (< x 0)
+              (progn (%serial-byte 45) (ssh-print-dec (- 0 x)))
+              (ssh-print-dec x))
+          (if (consp x)
+              (if (eq (car x) 9999)
+                  ;; Symbol: print name chars
+                  (ssh-print-chars (cdr x))
+                  ;; List
+                  (progn
+                    (%serial-byte 40)
+                    (ssh-print-sexp (car x))
+                    (ssh-print-list-tail (cdr x))))
+              (%serial-byte 63)))))
+
+(defun ssh-print-list-tail (xs)
+  (if (null xs)
+      (%serial-byte 41)
+      (if (consp xs)
+          (if (eq (car xs) 9999)
+              ;; Improper list ending in symbol
+              (progn
+                (%serial-byte 32) (%serial-byte 46) (%serial-byte 32)
+                (ssh-print-chars (cdr xs))
+                (%serial-byte 41))
+              (progn
+                (%serial-byte 32)
+                (ssh-print-sexp (car xs))
+                (ssh-print-list-tail (cdr xs))))
+          (progn
+            (%serial-byte 32) (%serial-byte 46) (%serial-byte 32)
+            (ssh-print-sexp xs)
+            (%serial-byte 41)))))
+
+(defun ssh-print-chars (chars)
+  (when (consp chars)
+    (%serial-byte (car chars))
+    (ssh-print-chars (cdr chars))))
+
+;; Override native-eval to use the REPL interpreter
+(defun native-eval (form)
+  (eval-sexp form nil (ssh-get-globals)))
+
+;;; ============================================================
+;;; Pre-computed crypto (avoid >5s USB polling gap)
+;;; ============================================================
+
+;; Pre-compute Ed25519 host key derivatives for fast signing.
+;; Stores clamped scalar s at state+0x680, prefix at state+0x6A0.
+;; Must be called AFTER ed25519-init and host key setup.
+(defun pre-compute-host-sign ()
+  (let ((state (e1000-state-base)))
+    (sha512-init)
+    ;; Load host private key from state+0x710
+    (let ((privkey (make-array 32)))
+      (dotimes (i 32)
+        (aset privkey i (mem-ref (+ state (+ #x710 i)) :u8)))
+      ;; SHA-512(privkey) → 64-byte hash
+      (let ((hash (sha512 privkey)))
+        ;; Clamp first 32 bytes → scalar s → store at state+0x680
+        (dotimes (i 32)
+          (setf (mem-ref (+ state (+ #x680 i)) :u8) (aref hash i)))
+        (setf (mem-ref (+ state #x680) :u8)
+              (logand (mem-ref (+ state #x680) :u8) #xF8))
+        (let ((b31 (mem-ref (+ state #x69F) :u8)))
+          (setf (mem-ref (+ state #x69F) :u8)
+                (logior (logand b31 #x7F) #x40)))
+        ;; Second 32 bytes → prefix → store at state+0x6A0
+        (dotimes (i 32)
+          (setf (mem-ref (+ state (+ #x6A0 i)) :u8) (aref hash (+ i 32))))
+        ;; Mark as pre-computed
+        (setf (mem-ref (+ state #x6C0) :u32) 1)))))
+
+;; Pre-compute X25519 server ephemeral key pair.
+;; Stores private key at state+0x6C4, public key at state+0x6E4.
+(defun pre-compute-server-eph (ssh)
+  (let ((state (e1000-state-base)))
+    ;; Generate random private key
+    (let ((priv (make-array 32)))
+      (dotimes (i 32) (aset priv i (ssh-random ssh)))
+      ;; Store private key at state+0x6C4
+      (dotimes (i 32)
+        (setf (mem-ref (+ state (+ #x6C4 i)) :u8) (aref priv i)))
+      ;; Compute and store public key at state+0x6E4
+      (let ((pub (x25519-public-key priv)))
+        (dotimes (i 32)
+          (setf (mem-ref (+ state (+ #x6E4 i)) :u8) (aref pub i)))))))
+
+;; Fast Ed25519 sign using pre-computed s, prefix, and host public key.
+;; Saves one ed-base-mult and one SHA-512 compared to ed25519-sign.
+(defun ed25519-sign-fast (message msg-len)
+  (let ((state (e1000-state-base)))
+    ;; Load pre-computed s and prefix
+    (let ((s (make-array 32)))
+      (dotimes (i 32)
+        (aset s i (mem-ref (+ state (+ #x680 i)) :u8)))
+      (let ((prefix (make-array 32)))
+        (dotimes (i 32)
+          (aset prefix i (mem-ref (+ state (+ #x6A0 i)) :u8)))
+        ;; Load pre-computed host public key (a-enc) from state+0x730
+        (let ((a-enc (make-array 32)))
+          (dotimes (i 32)
+            (aset a-enc i (mem-ref (+ state (+ #x730 i)) :u8)))
+          ;; r = SHA-512(prefix || message) mod L
+          (let ((r-input (concat-bytes prefix 32 message msg-len)))
+            (let ((r (ed-reduce-scalar (sha512 r-input))))
+              ;; R = r*B (the one remaining expensive operation)
+              (let ((r-enc (ed-encode-point (ed-base-mult r))))
+                ;; k = SHA-512(R || A || message) mod L
+                (let ((k-input (concat3-bytes r-enc 32 a-enc 32 message msg-len)))
+                  (let ((k (ed-reduce-scalar (sha512 k-input))))
+                    ;; S = (r + k*s) mod L
+                    (let ((ks (ed-scalar-mult-mod-l k s)))
+                      (let ((sig-s (ed-scalar-add r ks)))
+                        (concat-bytes r-enc 32 sig-s 32)))))))))))))
+
+;; USB keep-alive: poll USB to prevent host NETDEV WATCHDOG timeout
+(defun usb-keepalive ()
+  (let ((i 0))
+    (loop
+      (when (>= i 100) (return 0))
+      (io-delay)
+      (let ((pkt-len (e1000-receive)))
+        (when (not (zerop pkt-len))
+          (let ((buf (e1000-rx-buf)))
+            (let ((et-hi (mem-ref (+ buf 12) :u8)))
+              (when (eq et-hi #x08)
+                (let ((et-lo (mem-ref (+ buf 13) :u8)))
+                  (if (eq et-lo #x06)
+                      (let ((arp-op (buf-read-u16-mem buf 20)))
+                        (when (eq arp-op 1) (arp-reply buf)))
+                      (when (eq et-lo 0)
+                        (let ((proto (mem-ref (+ buf 23) :u8)))
+                          (when (eq proto 1) (icmp-handle buf 14)))))))))))
+      (setq i (+ i 1)))))
+
+;;; ============================================================
+;;; Network: the single-threaded server loop
+;;; ============================================================
+
+;; Override receive: process one round of network packets inline
+;; In multi-threaded x86, receive() blocks until an actor message arrives.
+;; In single-threaded AArch64, we poll the E1000 and process one packet.
+(defun receive ()
+  (io-delay)
+  (let ((pkt-len (e1000-receive)))
+    (if (zerop pkt-len)
+        1
+        (let ((buf (e1000-rx-buf)))
+          (let ((et-hi (mem-ref (+ buf 12) :u8))
+                (et-lo (mem-ref (+ buf 13) :u8)))
+            (if (eq et-hi #x08)
+                (if (eq et-lo #x06)
+                    (let ((arp-op (buf-read-u16-mem buf 20)))
+                      (when (eq arp-op 1) (arp-reply buf)))
+                    (when (eq et-lo 0)
+                      (let ((proto (mem-ref (+ buf 23) :u8)))
+                        (if (eq proto 1)
+                            (icmp-handle buf 14)
+                            (when (eq proto 6)
+                              (net-handle-tcp buf pkt-len))))))
+                ()))
+          1))))
+
+;; Message dispatch - flat when chain avoids deep nesting
+(defun ssh-dispatch-msg (ssh payload plen flag-addr)
+  (let ((msg-type (aref payload 0)))
+    (when (eq msg-type 5)
+      (let ((svc-len (ssh-get-u32 payload 1))
+            (svc (make-array 32)))
+        (dotimes (i svc-len)
+          (aset svc i (aref payload (+ 5 i))))
+        (ssh-send-service-accept ssh svc svc-len)))
+    (when (eq msg-type 50)
+      (ssh-handle-userauth ssh payload plen))
+    (when (eq msg-type 90)
+      (let ((ctype-len (ssh-get-u32 payload 1)))
+        (let ((cli-chan (ssh-get-u32 payload (+ 5 ctype-len))))
+          (setf (mem-ref (+ ssh #x18) :u32) cli-chan)
+          (setf (mem-ref (+ ssh #x14) :u32) 0)
+          (ssh-send-channel-confirm ssh cli-chan 0))))
+    (when (eq msg-type 98)
+      (let ((rtype-len (ssh-get-u32 payload 5)))
+        (let ((want-reply (aref payload (+ 9 rtype-len))))
+          (when (not (zerop want-reply))
+            (ssh-send-channel-success ssh
+             (mem-ref (+ ssh #x18) :u32)))
+          ;; "shell" (rtype_len=5, 's'=115) → send prompt, enter interactive
+          (when (eq rtype-len 5)
+            (when (eq (aref payload 9) 115)
+              (ssh-send-prompt ssh)))
+          ;; "exec" (rtype_len=4, 'e'=101) → execute command, send result
+          (when (eq rtype-len 4)
+            (when (eq (aref payload 9) 101)
+              (let ((cmd-off (+ 10 rtype-len)))
+                (let ((cmd-len (ssh-get-u32 payload cmd-off)))
+                  (let ((cmd (make-array cmd-len)))
+                    (dotimes (i cmd-len)
+                      (aset cmd i (aref payload (+ cmd-off 4 i))))
+                    (ssh-eval-line ssh cmd cmd-len)
+                    ;; Send exit-status 0 + EOF + CLOSE after exec
+                    (let ((cli-chan (mem-ref (+ ssh #x18) :u32)))
+                      ;; SSH_MSG_CHANNEL_REQUEST "exit-status" want_reply=0 status=0
+                      (let ((xs (make-array 25)))
+                        (aset xs 0 98)
+                        (ssh-put-u32 xs 1 cli-chan)
+                        (ssh-put-u32 xs 5 11)
+                        (aset xs 9 101) (aset xs 10 120) (aset xs 11 105)
+                        (aset xs 12 116) (aset xs 13 45) (aset xs 14 115)
+                        (aset xs 15 116) (aset xs 16 97) (aset xs 17 116)
+                        (aset xs 18 117) (aset xs 19 115)
+                        (aset xs 20 0)
+                        (ssh-put-u32 xs 21 0)
+                        (ssh-send-payload ssh xs 25))
+                      (let ((eof-msg (make-array 5)))
+                        (aset eof-msg 0 96)
+                        (ssh-put-u32 eof-msg 1 cli-chan)
+                        (ssh-send-payload ssh eof-msg 5))
+                      (let ((close-msg (make-array 5)))
+                        (aset close-msg 0 97)
+                        (ssh-put-u32 close-msg 1 cli-chan)
+                        (ssh-send-payload ssh close-msg 5)))
+                    (setf (mem-ref flag-addr :u32) 0)))))))))
+    (when (eq msg-type 94)
+      (ssh-handle-channel-data ssh payload plen))
+    (when (eq msg-type 97)
+      (setf (mem-ref flag-addr :u32) 0))
+    (when (eq msg-type 1)
+      (setf (mem-ref flag-addr :u32) 0))))
+
+;; Message loop — runs until the client disconnects; an authenticated session
+;; never times out, an unauthenticated one does (see below).
+(defun ssh-message-loop (ssh)
+  (let ((flag-addr (+ (conn-ssh 3) #x700))
+        (idle 0)
+        (since (ssh-preauth-clock)))
+    (setf (mem-ref flag-addr :u32) 1)
+    (loop
+      (when (zerop (mem-ref flag-addr :u32)) (return ()))
+      ;; A connection that has NOT authenticated (ssh+0x10 = 0) is dropped
+      ;; once it has been idle for SSH-PREAUTH-EXPIRED-P.  The server is single-
+      ;; threaded and the TCP layer records no FIN, so a client that hangs
+      ;; up without SSH_MSG_DISCONNECT -- which is what OpenSSH does after a
+      ;; refused publickey login -- otherwise holds the server forever and
+      ;; every later client times out in the banner exchange.  An
+      ;; authenticated session keeps the old never-time-out behaviour.
+      (when (and (zerop (mem-ref (+ ssh #x10) :u32))
+                 (ssh-wait-expired-p idle (ssh-preauth-idle-limit) since))
+        (return ()))
+      ;; Use a reasonable per-poll timeout, but retry on nil (no-data).
+      (let ((pkt (ssh-receive-packet ssh 50000)))
+        (if pkt
+            (progn
+              (setq idle 0)
+              (setq since (ssh-preauth-clock))
+              (ssh-dispatch-msg ssh (car pkt) (cdr pkt) flag-addr))
+            (setq idle (+ idle 1)))))))
+
+;; Empty 50000-try polls before an unauthenticated connection is dropped.
+(defun ssh-preauth-idle-limit () 20)
+;; Every wait for the peer is bounded by a COUNT of polls, and a count is a
+;; time only on a slow CPU: on native x86-64 one 50000-try poll is ~15 ms, so
+;; the handshake gave the client ~15 ms to answer -- less than one Internet
+;; round trip -- and every remote client was dropped right after its KEXINIT.
+;; SSH-WAIT-EXPIRED-P is the one policy: COUNT polls against LIMIT, SINCE = the
+;; clock at the start of the wait.  The default is the count alone (unchanged);
+;; a target with a usable counter overrides both (the x64 CL image: TSC).
+(defun ssh-preauth-clock () 0)
+(defun ssh-wait-expired-p (count limit since) (> count limit))
+
+;; The next packet, waiting as long as SSH-WAIT-EXPIRED-P allows; NIL on timeout.
+(defun ssh-await-packet (ssh)
+  (let ((since (ssh-preauth-clock)) (idle 0) (pkt ()))
+    (loop
+      (setq pkt (ssh-receive-packet ssh 50000))
+      (when pkt (return pkt))
+      (setq idle (+ idle 1))
+      (when (ssh-wait-expired-p idle (ssh-preauth-idle-limit) since) (return ())))))

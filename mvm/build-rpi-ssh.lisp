@@ -26,7 +26,7 @@
 ;; + ip + crypto + ssh + overrides
 ;; Note: e1000.lisp is NOT loaded — cdc-ether.lisp provides the same interface
 (defvar *net-source*
-  (format nil "~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%"
+  (format nil "~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%"
           (read-file-text (merge-pathnames "arch-raspi3b.lisp" *net-dir*))
           (read-file-text (merge-pathnames "dwc2.lisp" *net-dir*))
           (read-file-text (merge-pathnames "usb.lisp" *net-dir*))
@@ -36,7 +36,6 @@
           (read-file-text (merge-pathnames "crypto.lisp" *net-dir*))
           (read-file-text (merge-pathnames "crypto-fast.lisp" *net-dir*))
           (read-file-text (merge-pathnames "ssh.lisp" *net-dir*))
-          (read-file-text (merge-pathnames "aarch64-overrides.lisp" *net-dir*))
           ;; MUST be last: its e1000-* dispatchers + usb-netdev-hotplug-poll
           ;; win last-defun-wins over the drivers' forwarders and ip.lisp's stub.
           (read-file-text (merge-pathnames "usb-netdev.lisp" *net-dir*))))

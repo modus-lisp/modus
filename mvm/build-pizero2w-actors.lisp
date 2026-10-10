@@ -32,10 +32,10 @@
 ;; 6. ssh.lisp                    - SSH server
 ;; 7. http.lisp                   - HTTP/1.0 server (port 80)
 ;; 8. http-client.lisp            - HTTP client
-;; 9. aarch64-overrides.lisp      - line editor, buffer reader, SSH overrides
+;; 9. (ssh.lisp now carries the line editor, buffer reader and server loop)
 ;; 10. actors-net-overrides.lisp  - actor-aware receive/spawn/exit overrides
 (defvar *net-source*
-  (format nil "~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%"
+  (format nil "~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%"
           (read-file-text (merge-pathnames "arch-raspi3b.lisp" *net-dir*))
           (read-file-text (merge-pathnames "actors.lisp" *net-dir*))
           (read-file-text (merge-pathnames "dwc2-device.lisp" *net-dir*))
@@ -45,7 +45,6 @@
           (read-file-text (merge-pathnames "ssh.lisp" *net-dir*))
           (read-file-text (merge-pathnames "http.lisp" *net-dir*))
           (read-file-text (merge-pathnames "http-client.lisp" *net-dir*))
-          (read-file-text (merge-pathnames "aarch64-overrides.lisp" *net-dir*))
           (read-file-text (merge-pathnames "actors-net-overrides.lisp" *net-dir*))))
 
 ;;; ============================================================

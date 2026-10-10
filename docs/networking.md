@@ -29,7 +29,6 @@ Three NIC driver classes cover all platforms: Intel E1000 (PCI Gigabit Ethernet)
 | RPi 3B SSH | `build-rpi-ssh.lisp` | Single-threaded SSH over USB |
 | RPi 3B HID | `build-rpi-hid.lisp` | USB keyboard/mouse/tablet (no networking) |
 | i386 SSH | `build.lisp i386/bare/qemu/ssh` | Single-threaded SSH, 32-bit crypto |
-| ARM32 SSH | `build-arm32-ssh.lisp` | Single-threaded SSH, 32-bit crypto, USB |
 | Pi Zero 2W SSH | `build-pizero2w-ssh.lisp` | Single-threaded SSH, USB gadget |
 | Pi Zero 2W actors | `build-pizero2w-actors.lisp` | Multi-connection SSH, USB gadget |
 | Fixpoint | `build-fixpoint.lisp` | Multi-arch SSH for cross-compilation chain |
@@ -372,7 +371,7 @@ Each platform provides a thin adapter file (~200 lines) in `net/` implementing:
 Source load order determines which `defun` wins (last-defun-wins):
 ```
 arch-* → [actors] → NIC driver → ip → crypto → [crypto-32] → [crypto-w32] →
-ssh → [http] → [http-client] → aarch64-overrides → [actors-net-overrides] →
+ssh → [http] → [http-client] → [actors-net-overrides] →
 [32bit-overrides] → [crypto-fast] → [crypto-32-fast] → [isolated-net]
 ```
 

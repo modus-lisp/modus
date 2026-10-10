@@ -35,7 +35,6 @@ net/
   ip.lisp                ARP, IP, UDP, TCP, DHCP, DNS, ICMP (~1100 lines)
   crypto.lisp            SHA-256, SHA-512, ChaCha20, Poly1305, X25519, Ed25519 (~1900 lines)
   ssh.lisp               SSH server (~1100 lines)
-  aarch64-overrides.lisp Single-threaded overrides for AArch64 (~100 lines)
 ```
 
 ### Arch adapter interface
@@ -117,7 +116,7 @@ On x86, the SSH server uses the actor model: a network actor receives packets an
 
 `read-char-serial` compiles to TRAP #x0301, which the MVM compiler inlines as a PL011 UART read. This is hardwired — it cannot be overridden by `defun`. But SSH input arrives via network packets, not UART.
 
-Solution: `aarch64-overrides.lisp` overrides `ssh-do-eval-expr` with a buffer-based reader:
+Solution: `ssh.lisp`'s `ssh-do-eval-expr` uses a buffer-based reader (formerly in `aarch64-overrides.lisp`):
 1. `handle-edit-byte` accumulates keystrokes into a line buffer at ssh-ipc-base+0x28
 2. On Enter, the line buffer becomes the FIFO for the reader
 3. `buf-read-sexp` / `buf-read-list` parse s-expressions from the buffer

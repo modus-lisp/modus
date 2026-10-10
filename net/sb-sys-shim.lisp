@@ -270,6 +270,16 @@
 (defun sb-sys:fd-stream-p (x) (sb-sys::%fd-stream-p x))
 (defun sb-sys:fd-stream-fd (stream) (%fs-fd stream))
 
+(defun sb-sys:wait-until-fd-usable (fd direction &optional timeout serve-events)
+  "Wait until FD is ready for DIRECTION (:input or :output), at most TIMEOUT
+   seconds (NIL: no limit).  T when ready, NIL on timeout.  Input is poll(2);
+   output is reported ready at once (sockets here block on write instead).
+   SERVE-EVENTS is accepted and ignored -- there is no serve-event loop."
+  serve-events
+  (if (eq direction :output)
+      t
+      (> (%sbs-poll-in fd (if timeout (max 0 (round (* timeout 1000))) -1)) 0)))
+
 (defun sb-sys:make-fd-stream (fd &key input output (element-type 'character)
                                       buffering external-format timeout name)
   "A stream over an existing descriptor.  :BUFFERING, :EXTERNAL-FORMAT,
@@ -566,10 +576,15 @@
 
 (defun sb-bsd-sockets:socket-send (socket buffer length &key address external-format)
   "Write LENGTH bytes (all of BUFFER when NIL) of the (unsigned-byte 8) vector
-   BUFFER; returns the count written.  PARTIAL: ADDRESS (datagram sends) and
-   EXTERNAL-FORMAT are not supported and must be NIL."
+   BUFFER; returns the count written.  ADDRESS, (host port), sends one datagram
+   there (sendto).  PARTIAL: EXTERNAL-FORMAT is not supported and must be NIL."
   external-format
-  (when address (error "sb-bsd-sockets:socket-send: :ADDRESS is not supported on modus."))
+  (when address
+    ;; a datagram to (host port): sendto(2), one datagram or none
+    (let ((n (%sbs-sendto (%socket-fd socket) buffer (or length (length buffer))
+                          (%inet-host-order (car address)) (cadr address))))
+      (when (< n 0) (error 'sb-bsd-sockets:socket-error :errno (- n)))
+      (return-from sb-bsd-sockets:socket-send n)))
   (let ((n (socket-send (%socket-fd socket) buffer (or length (length buffer)))))
     (if (< n 0)
         (error 'sb-bsd-sockets:socket-error :errno (- n))
@@ -578,9 +593,21 @@
 (defun sb-bsd-sockets:socket-receive (socket buffer length &key oob peek waitall element-type)
   "One read(2) of up to LENGTH bytes (BUFFER's length when NIL) into BUFFER,
    or into a fresh (unsigned-byte 8) vector of LENGTH when BUFFER is NIL.
-   Returns (values buffer count nil); count 0 = the peer closed.  PARTIAL: OOB,
+   Returns (values buffer count nil); count 0 = the peer closed.  On a
+   :DATAGRAM socket, one datagram and its sender: (values buffer count address
+   port), as SBCL returns them.  PARTIAL: OOB,
    PEEK, WAITALL and ELEMENT-TYPE are accepted and ignored."
   oob peek waitall element-type
+  (when (eq (%socket-type socket) :datagram)
+    ;; a datagram socket says who sent it: (values buffer count address port),
+    ;; SBCL's contract, the address a 4-element vector
+    (let* ((buf (or buffer (make-array length :element-type '(unsigned-byte 8))))
+           (n (%sbs-recvfrom (%socket-fd socket) buf (or length (length buf)))))
+      (when (< n 0) (error 'sb-bsd-sockets:socket-error :errno (- n)))
+      (let ((ip (%sbs-from-ip)) (port (%sbs-from-port)) (v (make-array 4)))
+        (aset v 0 (logand (ash ip -24) 255)) (aset v 1 (logand (ash ip -16) 255))
+        (aset v 2 (logand (ash ip -8) 255)) (aset v 3 (logand ip 255))
+        (return-from sb-bsd-sockets:socket-receive (values buf n v port)))))
   (let* ((buf (or buffer (make-array length :element-type '(unsigned-byte 8))))
          (n (socket-recv (%socket-fd socket) buf (or length (length buf)))))
     (if (< n 0)

@@ -1532,6 +1532,15 @@
   ;; table co-init + (setq *use-jit* t) when JIT is on.  Wrapped so a JIT-init
   ;; crash can never take down a normal boot.
   (handler-case (%jit-boot-init) (t (c) nil))
+  ;; A CONS IS A CONS from here on.  This image's MAKE-ARRAY builds every
+  ;; non-simple array as the #x34 MDA object, never a CONS wrapper, so a cons
+  ;; shaped like one -- (1073741824 . a-name-string) -- is the user's cons.  It used
+  ;; to be set only in CLI-TOPLEVEL, AFTER the boot-time shims below were
+  ;; evaluated, and through boot STRINGP / VECTORP / LENGTH answered for such a
+  ;; pair as if it were a fill-pointer string (the FASL cache found it: every
+  ;; runtime-call table entry encoded as a string).  The ANSI gate runners, whose
+  ;; rewriter still builds cons wrappers, have their own driver and keep NIL.
+  (setq *%no-cons-array-wrappers* t)
   ;; :GENERA — install the Genera compatibility surface and push the feature.
   ;; MUST come after %install-runtime-cl-macros (the compat source uses
   ;; DOLIST / WHEN / UNLESS / SETF) and before cli-toplevel, so that

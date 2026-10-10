@@ -6449,6 +6449,11 @@
     ((and (not (%mda-p seq)) (eql (obj-subtag seq) #x12))
      (let ((r (%make-f32-vector (length seq))))
        (dotimes (i (length seq) r) (aset r i (aref seq i)))))
+    ;; a SPECIALIZED vector copies to one of the same element type: a byte
+    ;; vector used to come back as a general vector (element type T)
+    ((and (vectorp seq) (not (eq (array-element-type seq) t)))
+     (let ((r (make-array (length seq) :element-type (array-element-type seq))))
+       (dotimes (i (length seq) r) (setf (aref r i) (aref seq i)))))
     (t (let ((r (make-array (length seq))))
          (if (%bulk-copy-ok-p r seq)
              (progn (%bulk-copy r 0 seq 0 (length seq)) r)

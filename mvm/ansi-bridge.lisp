@@ -4972,11 +4972,17 @@
      ;; standard-char for the printing ASCII range, else character.
      (let ((code (char-code obj)))
        (if (and (>= code 32) (< code 127)) 'standard-char 'character)))
-    ;; A fill-pointer / adjustable / displaced string is NOT simple: claiming
-    ;; SIMPLE-BASE-STRING made (coerce x (type-of x)) copy it (COERCE.1).
-    ((stringp obj) (if (simple-string-p obj)
-                       (list 'simple-base-string (length obj))
-                       'base-string))
+    ;; A STRING is a vector of CHARACTER (CLHS 16.1): (SIMPLE-ARRAY CHARACTER (n)),
+    ;; or (VECTOR CHARACTER *) when it has a fill pointer or is adjustable -- not
+    ;; SIMPLE-BASE-STRING for every string, which called a fill-pointer string
+    ;; simple.  The size is * there because TYPEP here measures a vector by its
+    ;; LENGTH (the fill pointer), so a dimension would not round-trip.  Not simple
+    ;; either way: claiming SIMPLE-BASE-STRING made (coerce x (type-of x)) copy
+    ;; a fill-pointer string (COERCE.1).
+    ((stringp obj)
+     (if (simple-string-p obj)
+         (list 'simple-array 'character (list (length obj)))
+         (list 'vector 'character '*)))
     ((%generic-function-p obj) 'standard-generic-function)
     ((functionp obj) 'function)
     ((consp obj) 'cons)
@@ -4988,8 +4994,16 @@
     ;; packed single-float vector (subtag #x12)
     ((and (not (consp obj)) (not (%mda-p obj)) (eql (obj-subtag obj) #x12))
      (list 'simple-array 'single-float (list (length obj))))
-    ((vectorp obj) 'simple-vector)
-    ((arrayp obj) 'array)
+    ;; Other arrays by their ELEMENT TYPE: a byte vector is
+    ;; (SIMPLE-ARRAY (UNSIGNED-BYTE 8) (n)), not SIMPLE-VECTOR (CLHS: a
+    ;; simple-vector holds T).  Non-simple (fill pointer) vectors as for strings.
+    ((vectorp obj)
+     (let ((et (array-element-type obj)))
+       (cond ((array-has-fill-pointer-p obj) (list 'vector et '*))
+             ((eq et t) (list 'simple-vector (length obj)))
+             (t (list 'simple-array et (list (length obj)))))))
+    ((arrayp obj)
+     (list 'simple-array (array-element-type obj) (array-dimensions obj)))
     (t t)))
 
 ;;; SLOT-VALUE — strict 2-arg arity

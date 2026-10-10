@@ -188,6 +188,9 @@
               ;; connected, and not high speed (bit 10): a split device.
               (when (and (not (zerop (logand st 1))) (zerop (logand st #x400)))
                 (hid-setup-port hub p (not (zerop (logand st #x200))))))
+            ;; what boot found is current: clear the change bits it left, so
+            ;; HID-HOTPLUG-TICK reports only what happens from here on
+            (hid-clear-port-changes hub p)
             (setq p (+ p 1)))))))
   (hid-put #x1F0 (hid-magic))
   (list (= (hid-dev-get (hid-kbd) 0) 1) (= (hid-dev-get (hid-mouse) 0) 1)))
@@ -300,9 +303,50 @@
   (when (> n 3)
     (hid-put #x6C (hid-u32 (+ (hid-s32 (hid-get #x6C)) (hid-s8 (mem-ref (+ b 3) :u8)))))))
 
+;;; ---------------------------------------------------------------------------
+;;; Hotplug
+;;; ---------------------------------------------------------------------------
+;;; Boot enumerates what is plugged in; after that the hub's ports are read
+;;; every HID-HOTPLUG-PERIOD from the poll loop.  A port whose C_PORT_CONNECTION
+;;; change bit (wPortChange bit 0, bit 16 here) is set has had a device leave or
+;;; arrive: whatever was recorded on it is dropped, and a full/low-speed device
+;;; now on it is set up exactly as boot does -- after the 100 ms debounce USB 2.0
+;;; 7.1.7.3 gives a connect -- reset by HID-LOCATE and addressed 32+PORT.  A
+;;; scan is one control transfer per hub port to a high-speed hub, so ~1 ms
+;;; every half second.  +0x90 holds the next scan time (HID-NOW ticks).
+
+(defun hid-hotplug-period () 4000)            ; 125-us ticks: 500 ms
+
+(defun hid-port-gone (port)
+  ;; Forget the keyboard / mouse recorded on PORT (it left, or something new
+  ;; replaced it).
+  (when (and (= (hid-dev-get (hid-kbd) 0) 1) (= (hid-dev-get (hid-kbd) #x08) port))
+    (hid-dev-put (hid-kbd) 0 0)
+    (hid-put #x88 0))                           ; no key held any more
+  (when (and (= (hid-dev-get (hid-mouse) 0) 1) (= (hid-dev-get (hid-mouse) #x08) port))
+    (hid-dev-put (hid-mouse) 0 0)
+    (hid-put #x60 0)))                          ; no button held any more
+
+(defun hid-hotplug-tick ()
+  (let ((hub (hid-get #x00)))
+    (when (and (> hub 0) (hid-time-reached-p (hid-get #x90)))
+      (hid-put #x90 (logand (+ (hid-now) (hid-hotplug-period)) #x3FFF))
+      (let ((n (hid-get #x04)) (p 1))
+        (loop
+          (when (> p n) (return nil))
+          (let ((st (hid-port-status hub p)))
+            (when (not (zerop (logand st #x10000)))
+              (hid-clear-port-changes hub p)
+              (hid-port-gone p)
+              (when (and (not (zerop (logand st 1))) (zerop (logand st #x400)))
+                (dwc2-delay-ms 100)
+                (hid-setup-port hub p (not (zerop (logand st #x200)))))))
+          (setq p (+ p 1)))))))
+
 (defun hid-split-poll ()
-  ;; Poll the keyboard and the mouse once each.
+  ;; Poll the keyboard and the mouse once each, and the hub for hotplug.
   (when (not (hid-ready-p)) (return-from hid-split-poll nil))
+  (hid-hotplug-tick)
   (when (> (hid-poll-dev (hid-kbd) (hid-kbd-buf)) 0)
     (hid-kbd-report (hid-kbd-buf)))
   (hid-repeat-tick)
@@ -329,8 +373,9 @@
   ;; Serial first, so a serial-driven session is never held up by the
   ;; keyboard; then the keyboard.  Without a keyboard or mouse this is
   ;; exactly READ-CHAR-SERIAL.
-  (if (or (not (hid-ready-p))
-          (and (zerop (hid-dev-get (hid-kbd) 0)) (zerop (hid-dev-get (hid-mouse) 0))))
+  ;; With a hub, keep polling even when nothing is plugged in yet: that poll is
+  ;; also how a keyboard plugged in later is found (HID-HOTPLUG-TICK).
+  (if (or (not (hid-ready-p)) (zerop (hid-get #x00)))
       (read-char-serial)
       (let ((c -1))
         (loop
